@@ -2,4 +2,3 @@ streamlit
 yfinance
 xlsxwriter
 pandas
-tkinter
