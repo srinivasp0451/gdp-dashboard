@@ -1,16 +1,19 @@
 import streamlit as st
 import requests
-from newspaper import Article
+import lxml.html as lh
 from textblob import TextBlob
 import yfinance as yf
 
-# Function to fetch news article content
+# Function to fetch news article content using lxml.html
 def fetch_news(url):
-    article = Article(url)
-    article.download()
-    article.parse()
-    article.nlp()
-    return article.text
+    try:
+        response = requests.get(url)
+        doc = lh.fromstring(response.content)
+        paragraphs = doc.xpath('//p')
+        news_content = " ".join([p.text_content() for p in paragraphs])
+        return news_content
+    except Exception as e:
+        return f"Error fetching news: {e}"
 
 # Function to perform sentiment analysis
 def analyze_sentiment(text):
