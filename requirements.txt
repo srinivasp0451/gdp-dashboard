@@ -4,4 +4,4 @@ xlsxwriter
 pandas
 plotly
 textblob
-newspaper
+newspaper3k
