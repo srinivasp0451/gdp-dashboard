@@ -6,3 +6,5 @@ plotly
 textblob
 nltk
 selenium
+beautifulsoup4
+requests
