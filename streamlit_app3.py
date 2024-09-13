@@ -1,6 +1,6 @@
 import streamlit as st
 import requests
-from newspaper import Article
+from newspaper3k import Article
 from textblob import TextBlob
 import yfinance as yf
 
