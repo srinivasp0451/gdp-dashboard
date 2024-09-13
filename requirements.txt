@@ -4,5 +4,7 @@ xlsxwriter
 pandas
 plotly
 textblob
+nltk
+pillow
 lxml
 newspaper3k
