@@ -2,3 +2,4 @@ streamlit
 yfinance
 xlsxwriter
 pandas
+plotly
