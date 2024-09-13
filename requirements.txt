@@ -7,4 +7,4 @@ textblob
 nltk
 pillow
 lxml
-newspaper3k
+
