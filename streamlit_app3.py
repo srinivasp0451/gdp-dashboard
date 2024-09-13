@@ -25,7 +25,7 @@ def analyze_sentiment(text):
 def get_market_sentiment(query):
     news_content = fetch_news_from_website(query)
     sentiment = analyze_sentiment(news_content)
-    return sentiment
+    return sentiment, news_content
 
 # Function to get index price and identify support level
 def check_support_level(index_symbol):
@@ -45,9 +45,10 @@ indices = {'Nifty 50': '^NSEI', 'Bank Nifty': '^NSEBANK'}
 # Refresh button
 if st.button("Refresh Sentiment"):
     # Fetch sentiment for Nifty 50
-    sentiment_nifty = get_market_sentiment("Nifty 50")
-    sentiment_banknifty = get_market_sentiment("Bank Nifty")
-
+    sentiment_nifty,nifty_news = get_market_sentiment("Nifty 50")
+    sentiment_banknifty,bn_news = get_market_sentiment("Bank Nifty")
+    st.write('Nifty50 news - ',nifty_news)
+    st.write('Bank nifty news - ',bn_news)
     # Show sentiment analysis result for Nifty 50
     if sentiment_nifty > 0:
         st.success("Nifty 50 sentiment is Bullish (Green)")
