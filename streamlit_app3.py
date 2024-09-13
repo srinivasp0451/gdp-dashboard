@@ -12,6 +12,7 @@ def fetch_news_from_website(query):
         soup = BeautifulSoup(response.text, 'html.parser')
         headlines = soup.find_all('a', class_='eachStory')
         news_content = " ".join([headline.get_text() for headline in headlines[:5]])  # Limit to top 5 headlines
+        st.write('news content', news_content)
         return news_content
     except Exception as e:
         return f"Error fetching news: {e}"
