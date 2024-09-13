@@ -5,6 +5,4 @@ pandas
 plotly
 textblob
 nltk
-pillow
-lxml
-
+selenium
