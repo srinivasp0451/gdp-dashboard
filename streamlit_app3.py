@@ -37,7 +37,7 @@ def check_support_level(index_symbol):
 
 # Streamlit app layout
 st.title("Market Sentiment for Nifty 50 and Bank Nifty")
-st.write("This app fetches news articles and performs sentiment analysis to determine market sentiment. It also checks if the index is at a support level.")
+#st.write("This app fetches news articles and performs sentiment analysis to determine market sentiment. It also checks if the index is at a support level.")
 
 # Index symbols
 indices = {'Nifty 50': '^NSEI', 'Bank Nifty': '^NSEBANK'}
@@ -66,11 +66,11 @@ if st.button("Refresh Sentiment"):
 
     # Check for support levels and show buy signal
     for index_name, index_symbol in indices.items():
-        st.write(f"Checking support level for {index_name}...")
+        #st.write(f"Checking support level for {index_name}...")
         last_price, support_price = check_support_level(index_symbol)
-        st.write(f"{index_name} last close: {last_price}, support level: {support_price}")
+        #st.write(f"{index_name} last close: {last_price}, support level: {support_price}")
         
         if last_price <= support_price:
-            st.success(f"Buy signal for {index_name}: Index is at support level.")
+            st.success(f"Buy signal for {index_name}")
         else:
             st.info(f"No buy signal for {index_name}.")
