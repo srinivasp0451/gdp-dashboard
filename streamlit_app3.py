@@ -7,7 +7,7 @@ import datetime
 # Function to get index data dynamically
 def get_index_data(ticker, interval="1m"):
     try:
-        data = yf.download(ticker, period="1d", interval=interval)
+        data = yf.download(ticker, period="1d")
         return data
     except Exception as e:
         st.error(f"Error fetching index data: {e}")
