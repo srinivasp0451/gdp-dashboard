@@ -3,3 +3,5 @@ yfinance
 xlsxwriter
 pandas
 plotly
+textblob
+newspaper3k
