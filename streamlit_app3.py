@@ -1,6 +1,7 @@
 import requests
 from bs4 import BeautifulSoup
 from textblob import TextBlob
+import streamlit as st
 
 # Function to scrape general market news from Economic Times
 def get_market_news():
@@ -29,16 +30,27 @@ def analyze_sentiment(text):
     else:
         return 'Negative'
 
-# Main function to get news and analyze sentiment
+# Streamlit App
 def main():
-    news = get_market_news()
-    if news:
-        print("Latest Market News Headlines & Sentiment Analysis:")
-        for idx, headline in enumerate(news):
-            sentiment = analyze_sentiment(headline)
-            print(f"{idx + 1}. {headline} - Sentiment: {sentiment}")
-    else:
-        print("No news found.")
+    st.title("Market News Sentiment Analysis")
+
+    # Add a button to scrape the latest news
+    if st.button("Get Latest Market News & Sentiment"):
+        st.write("Fetching latest market news...")
+        news = get_market_news()
+        
+        if news:
+            st.write("## Latest Market News Headlines & Sentiment:")
+            for idx, headline in enumerate(news):
+                sentiment = analyze_sentiment(headline)
+                
+                # Display news headline with corresponding sentiment
+                st.write(f"**{idx + 1}. {headline}**")
+                st.write(f"Sentiment: {sentiment}\n")
+        else:
+            st.write("No news found.")
+    
+    st.write("Click the button above to get the latest market news and sentiment.")
 
 if __name__ == "__main__":
     main()
