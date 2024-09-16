@@ -4,7 +4,7 @@ from textblob import TextBlob
 
 # Function to scrape Nifty 50 news from Economic Times or MoneyControl
 def get_nifty50_news():
-    url = 'https://economictimes.indiatimes.com/markets/nifty-50'
+    url = 'https://economictimes.indiatimes.com/markets/indices/nifty-50'
     headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'}
     
     response = requests.get(url, headers=headers)
