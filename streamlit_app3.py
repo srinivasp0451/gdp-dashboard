@@ -2,6 +2,7 @@ import streamlit as st
 from bs4 import BeautifulSoup as BS
 import requests as req
 from textblob import TextBlob
+import matplotlib.pyplot as plt
 
 # Function to categorize sentiment based on polarity score
 def categorize_sentiment(polarity):
@@ -80,8 +81,19 @@ if news_headlines:
 
     # Display sentiment counts
     st.write("### Sentiment Counts:")
-    for sentiment, count in sentiment_counts.items():
-        st.write(f"{sentiment}: {count}")
+
+    # Create a bar plot
+    fig, ax = plt.subplots()
+    sentiments = list(sentiment_counts.keys())
+    counts = list(sentiment_counts.values())
+    
+    ax.barh(sentiments, counts, color='skyblue')
+    ax.set_xlabel('Count')
+    ax.set_title('Sentiment Counts of Market News')
+    plt.tight_layout()
+    
+    # Show the plot in Streamlit
+    st.pyplot(fig)
 
 else:
     st.write("No news found or failed to fetch news.")
