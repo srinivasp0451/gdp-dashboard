@@ -83,7 +83,7 @@ if news_headlines:
     st.write("### Sentiment Counts:")
 
     # Sort sentiments by count in descending order
-    sorted_sentiments = sorted(sentiment_counts.items(), key=lambda x: x[1], reverse=True)
+    sorted_sentiments = sorted(sentiment_counts.items(), key=lambda x: x[1], reverse=False)
     sentiments, counts = zip(*sorted_sentiments)
 
     # Create a bar plot
