@@ -82,12 +82,19 @@ if news_headlines:
     # Display sentiment counts
     st.write("### Sentiment Counts:")
 
+    # Sort sentiments by count in descending order
+    sorted_sentiments = sorted(sentiment_counts.items(), key=lambda x: x[1], reverse=True)
+    sentiments, counts = zip(*sorted_sentiments)
+
     # Create a bar plot
     fig, ax = plt.subplots()
-    sentiments = list(sentiment_counts.keys())
-    counts = list(sentiment_counts.values())
-    
-    ax.barh(sentiments, counts, color='skyblue')
+    bars = ax.barh(sentiments, counts, color='skyblue')
+
+    # Add count labels on top of bars
+    for bar in bars:
+        width = bar.get_width()
+        ax.text(width + 0.1, bar.get_y() + bar.get_height()/2, f'{width}', va='center')
+
     ax.set_xlabel('Count')
     ax.set_title('Sentiment Counts of Market News')
     plt.tight_layout()
