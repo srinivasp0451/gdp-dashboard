@@ -5,6 +5,6 @@ pandas
 plotly
 textblob
 nltk
-selenium
+matplotlib
 beautifulsoup4
 requests
