@@ -3,23 +3,23 @@ from bs4 import BeautifulSoup as BS
 import requests as req
 from textblob import TextBlob
 
-# Function to categorize overall sentiment based on average polarity score
-def categorize_overall_sentiment(avg_polarity):
-    if avg_polarity > 0.7:
+# Function to categorize sentiment based on polarity score
+def categorize_sentiment(polarity):
+    if polarity > 0.7:
         return "Very Strong Bullish"
-    elif avg_polarity > 0.4:
+    elif polarity > 0.4:
         return "Strong Bullish"
-    elif avg_polarity > 0.1:
+    elif polarity > 0.1:
         return "Medium Bullish"
-    elif avg_polarity > 0.0:
+    elif polarity > 0.0:
         return "Weak Bullish"
-    elif avg_polarity == 0.0:
+    elif polarity == 0.0:
         return "Neutral"
-    elif avg_polarity > -0.1:
+    elif polarity > -0.1:
         return "Weak Bearish"
-    elif avg_polarity > -0.4:
+    elif polarity > -0.4:
         return "Medium Bearish"
-    elif avg_polarity > -0.7:
+    elif polarity > -0.7:
         return "Strong Bearish"
     else:
         return "Very Strong Bearish"
@@ -57,24 +57,31 @@ news_headlines = get_market_news(url)
 if news_headlines:
     st.write("### Latest Market News Headlines:")
 
-    total_polarity = 0
-    num_headlines = 0
+    # Initialize sentiment counts
+    sentiment_counts = {
+        "Very Strong Bullish": 0,
+        "Strong Bullish": 0,
+        "Medium Bullish": 0,
+        "Weak Bullish": 0,
+        "Neutral": 0,
+        "Weak Bearish": 0,
+        "Medium Bearish": 0,
+        "Strong Bearish": 0,
+        "Very Strong Bearish": 0
+    }
 
     for idx, headline in enumerate(news_headlines):
         polarity = analyze_sentiment(headline)
-        sentiment = categorize_overall_sentiment(polarity)
+        sentiment = categorize_sentiment(polarity)
         st.write(f"{idx + 1}. {headline} - Sentiment: {sentiment}")
 
-        # Accumulate total polarity and count the number of headlines
-        total_polarity += polarity
-        num_headlines += 1
+        # Update sentiment counts
+        sentiment_counts[sentiment] += 1
 
-    # Calculate the average polarity and overall sentiment
-    if num_headlines > 0:
-        avg_polarity = total_polarity / num_headlines
-        overall_sentiment = categorize_overall_sentiment(avg_polarity)
-        st.write(f"### Overall Market Sentiment: {overall_sentiment} (Average Polarity: {avg_polarity})")
-    else:
-        st.write("No valid news headlines found.")
+    # Display sentiment counts
+    st.write("### Sentiment Counts:")
+    for sentiment, count in sentiment_counts.items():
+        st.write(f"{sentiment}: {count}")
+
 else:
     st.write("No news found or failed to fetch news.")
