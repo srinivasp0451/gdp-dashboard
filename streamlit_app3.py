@@ -48,16 +48,17 @@ def get_market_news(url):
 
 # Streamlit app
 st.title("Market News Sentiment Analysis")
-from datetime import datetime
+import datetime
 
 # datetime object containing current date and time
-now = datetime.now()
+#now = datetime.now()
  
 #print("now =", now)
 
 # dd/mm/YY H:M:S
-dt_string = now.strftime("%d/%m/%Y %H:%M:%S")
-st.write(dt_string)
+#dt_string = now.strftime("%d/%m/%Y %H:%M:%S")
+st.write(datetime.datetime.now())
+
 
 # URL of the market news website
 url = "https://m.economictimes.com/markets"
