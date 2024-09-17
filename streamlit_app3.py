@@ -49,6 +49,7 @@ def get_market_news(url):
 # Streamlit app
 st.title("Market News Sentiment Analysis")
 import datetime
+import pytz
 
 # datetime object containing current date and time
 #now = datetime.now()
@@ -57,7 +58,7 @@ import datetime
 
 # dd/mm/YY H:M:S
 #dt_string = now.strftime("%d/%m/%Y %H:%M:%S")
-st.write(datetime.datetime.now())
+st.write(datetime.datetime.now(pytz.timezone('Asia/Kolkata')))
 
 
 # URL of the market news website
