@@ -8,3 +8,4 @@ nltk
 matplotlib
 beautifulsoup4
 requests
+talib
