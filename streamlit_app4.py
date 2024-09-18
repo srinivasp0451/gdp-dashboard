@@ -73,7 +73,7 @@ def plot_chart(data, trade_log):
 def main():
     # Fetch 5-minute historical data for NIFTY
     ticker = "^NSEI"  # For Nifty, or use "^NSEBANK" for Bank Nifty
-    data = get_data(ticker, interval='5m', period='1mo')
+    data = get_data(ticker, interval='5m', period='1d')
 
     # Calculate Support and Resistance Levels
     data = calculate_pivot_points(data)
