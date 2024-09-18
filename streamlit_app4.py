@@ -2,7 +2,7 @@ import yfinance as yf
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
-import talib as ta
+import pandas_ta as ta
 
 # Fetch Historical Data for NIFTY or BANK NIFTY
 def get_data(ticker, interval, period):
@@ -18,10 +18,10 @@ def calculate_pivot_points(data):
     data['Support2'] = data['Pivot'] - (data['High'] - data['Low'])
     return data
 
-# Function to Detect Candlestick Patterns
+# Detect candlestick patterns using Pandas TA
 def detect_candlestick_patterns(data):
-    data['Hammer'] = ta.CDLHAMMER(data['Open'], data['High'], data['Low'], data['Close'])
-    data['Engulfing'] = ta.CDLENGULFING(data['Open'], data['High'], data['Low'], data['Close'])
+    data['Hammer'] = ta.cdl_pattern(data, name="hammer")
+    data['Engulfing'] = ta.cdl_pattern(data, name="engulfing")
     return data
 
 # Generate Buy and Sell Signals based on Support, Resistance, and Candlestick Patterns
@@ -92,7 +92,7 @@ def main():
     data = generate_signals(data)
 
     # Backtest the Strategy
-    initial_balance = 10000  # Starting balance in dollars
+    initial_balance = 10000  # Starting balance
     final_balance, trade_log = backtest(data, initial_balance)
 
     print(f"Initial Balance: {initial_balance}")
