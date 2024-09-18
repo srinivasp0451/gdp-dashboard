@@ -8,4 +8,3 @@ nltk
 matplotlib
 beautifulsoup4
 requests
-pandas-ta
