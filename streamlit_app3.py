@@ -142,7 +142,7 @@ elif options == "Market News Sentiment Analysis":
     st.header("Market News Sentiment Analysis")
 
     # Display current date and time
-    st.write(datetime.datetime.now(pytz.timezone('Asia/Kolkata')))
+    st.write(datetime.now(pytz.timezone('Asia/Kolkata')))
 
     # URL of the market news website
     url = "https://m.economictimes.com/markets"
