@@ -20,11 +20,11 @@ def load_data(index, start_date, end_date):
 
 # Function to forecast the next day's value based on similar day patterns
 def similar_day_forecast(data, pattern_length=5):
-    recent_pattern = data[['Returns', 'MA_5', 'MA_10', 'Volatility_5']].iloc[-pattern_length:].values
+    recent_pattern = np.array(data[['Returns', 'MA_5', 'MA_10', 'Volatility_5']].iloc[-pattern_length:].values)
     distances = []
     
     for i in range(len(data) - pattern_length):
-        historical_pattern = data[['Returns', 'MA_5', 'MA_10', 'Volatility_5']].iloc[i:i + pattern_length].values
+        historical_pattern = np.array(data[['Returns', 'MA_5', 'MA_10', 'Volatility_5']].iloc[i:i + pattern_length].values)
         distance = np.linalg.norm(recent_pattern - historical_pattern)
         distances.append(distance)
     
@@ -35,14 +35,12 @@ def similar_day_forecast(data, pattern_length=5):
 
 # Function to calculate error metrics
 def calculate_metrics(actual, forecast):
-    # Convert to numpy arrays for calculations
     actual = np.array(actual)
     forecast = np.array(forecast)
-
     mae = mean_absolute_error(actual, forecast)
     mse = mean_squared_error(actual, forecast)
     rmse = np.sqrt(mse)
-    mape = np.mean(np.abs((actual - forecast) / actual)) * 100 if np.any(actual) else float('inf')  # Avoid division by zero
+    mape = np.mean(np.abs((actual - forecast) / actual)) * 100 if np.any(actual) else float('inf')
     return mae, mse, rmse, mape
 
 # Function to plot actual vs forecast
@@ -75,9 +73,13 @@ if st.button("Forecast"):
         predicted_day = similar_day_forecast(data)
         forecasted_close = predicted_day['Close']
 
+        # Initialize closest_date variable
+        closest_date = None
+
         # Check if end_date exists in data
         if end_date_ts in data.index:
             actual_close = data.loc[end_date_ts, 'Close']
+            closest_date = end_date_ts
         else:
             # Handle missing date by choosing the closest available date using asof()
             closest_date = data.index.asof(end_date_ts)
