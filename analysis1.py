@@ -4,11 +4,6 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 from sklearn.cluster import KMeans
 import numpy as np
-from sklearn.preprocessing import StandardScaler
-from sklearn.metrics import silhouette_score
-
-# Import technical indicators from ta-lib or pandas_ta
-import pandas_ta as ta
 
 # Streamlit App Title
 st.title("Enhanced NIFTY 50 Pre-Open Data Analysis with Clustering Insights")
@@ -20,7 +15,7 @@ if uploaded_file is not None:
     # Load the data
     df = pd.read_csv(uploaded_file)
     
-    # Clean up the column names (fixing issues in headers)
+    # Clean up the column names
     df.columns = ['DateTime', 'Pre Open NIFTY 50', 'NIFTY 50']  # Rename to proper names
     
     # Data Pre-processing
@@ -30,13 +25,13 @@ if uploaded_file is not None:
     # Fill missing values in 'Pre Open NIFTY 50' from 'NIFTY 50'
     df['Pre Open NIFTY 50'].fillna(df['NIFTY 50'], inplace=True)
 
-    # Drop rows where both columns are NaN (just in case)
+    # Drop rows where both columns are NaN
     df.dropna(subset=['Pre Open NIFTY 50'], inplace=True)
 
     # Calculate percentage change (returns)
     df['Returns'] = df['Pre Open NIFTY 50'].pct_change() * 100
 
-    # Fill missing values that arise from pct_change (first row becomes NaN)
+    # Fill missing values in returns
     df['Returns'].fillna(0, inplace=True)
 
     # Calculate moving average (60-second)
@@ -57,7 +52,6 @@ if uploaded_file is not None:
     st.pyplot(fig)
 
     # Volatility Clustering using K-Means
-
     df['Volatility'] = df['Returns'].abs()
 
     # Find the optimal number of clusters using the Elbow Method
@@ -119,18 +113,34 @@ if uploaded_file is not None:
             # Display technical insights
             st.write("---")
         
-        # Technical Indicators: Test Moving Averages, RSI, MACD
+        # Calculate RSI manually
         st.subheader("Technical Indicators Evaluation")
 
-        # Calculate RSI and MACD
-        df['RSI'] = df['Pre Open NIFTY 50'].ta.rsi(length=14)
-        df['MACD'] = df['Pre Open NIFTY 50'].ta.macd(fast=12, slow=26)['MACD_12_26_9']
+        def calculate_rsi(series, period=14):
+            delta = series.diff()
+            gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
+            loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
+            rs = gain / loss
+            rsi = 100 - (100 / (1 + rs))
+            return rsi
 
-        # Indicator Insights: Show for each cluster if RSI or MACD could predict a movement
+        df['RSI'] = calculate_rsi(df['Pre Open NIFTY 50'])
+
+        # Calculate MACD manually
+        def calculate_macd(series):
+            exp1 = series.ewm(span=12, adjust=False).mean()
+            exp2 = series.ewm(span=26, adjust=False).mean()
+            macd = exp1 - exp2
+            signal = macd.ewm(span=9, adjust=False).mean()
+            return macd, signal
+
+        df['MACD'], df['MACD_Signal'] = calculate_macd(df['Pre Open NIFTY 50'])
+
+        # Indicator Insights
         for i in range(k_opt):
             cluster_data = df[df['Cluster'] == i]
             rsi_signal = "Buy" if cluster_data['RSI'].iloc[-1] < 30 else "Sell" if cluster_data['RSI'].iloc[-1] > 70 else "Hold"
-            macd_signal = "Buy" if cluster_data['MACD'].iloc[-1] > 0 else "Sell" if cluster_data['MACD'].iloc[-1] < 0 else "Hold"
+            macd_signal = "Buy" if cluster_data['MACD'].iloc[-1] > cluster_data['MACD_Signal'].iloc[-1] else "Sell" if cluster_data['MACD'].iloc[-1] < cluster_data['MACD_Signal'].iloc[-1] else "Hold"
 
             st.write(f"Cluster {i+1} Indicator Insights:")
             st.write(f" - RSI Suggests: **{rsi_signal}**")
