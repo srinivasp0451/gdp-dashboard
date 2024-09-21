@@ -12,4 +12,3 @@ scipy
 scikit-learn
 statsmodels
 seaborn
-pandas_ta
