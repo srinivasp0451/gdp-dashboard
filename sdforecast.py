@@ -34,12 +34,31 @@ def fetch_data(ticker, start, end):
     return data.dropna()
 
 # Function for similar day forecast
+# Function for similar day forecast
 def similar_day_forecast(data, pattern_length=5):
+    # Extract the recent pattern (last 'pattern_length' rows of selected columns)
     recent_pattern = data[['Returns', 'MA_5', 'MA_10', 'Volatility_5']].iloc[-pattern_length:].values
-    historical_patterns = data[['Returns', 'MA_5', 'MA_10', 'Volatility_5']].rolling(window=pattern_length).apply(lambda x: np.linalg.norm(x - recent_pattern))
-    most_similar_day_idx = historical_patterns.idxmin()
+
+    # Initialize an empty list to store Euclidean distances
+    distances = []
+
+    # Iterate through the historical data (excluding the last 'pattern_length' rows)
+    for i in range(len(data) - pattern_length):
+        # Extract historical pattern
+        historical_pattern = data[['Returns', 'MA_5', 'MA_10', 'Volatility_5']].iloc[i:i + pattern_length].values
+        
+        # Compute the Euclidean distance between recent and historical pattern
+        distance = np.linalg.norm(recent_pattern - historical_pattern)
+        distances.append(distance)
+
+    # Find the index of the most similar historical day
+    most_similar_day_idx = np.argmin(distances)
+    
+    # Get the next day's data after the most similar day
     predicted_day = data.iloc[most_similar_day_idx + pattern_length]
+    
     return predicted_day
+
 
 # Streamlit UI
 st.title("Similar Day Forecast for Index")
