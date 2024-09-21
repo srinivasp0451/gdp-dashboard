@@ -4,9 +4,14 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 from sklearn.cluster import KMeans
 import numpy as np
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import silhouette_score
+
+# Import technical indicators from ta-lib or pandas_ta
+import pandas_ta as ta
 
 # Streamlit App Title
-st.title("Enhanced NIFTY 50 Pre-Open Data Analysis")
+st.title("Enhanced NIFTY 50 Pre-Open Data Analysis with Clustering Insights")
 
 # File uploader
 uploaded_file = st.file_uploader("Upload a CSV file", type=["csv"])
@@ -51,18 +56,40 @@ if uploaded_file is not None:
     ax.set_xlabel('Pre Open NIFTY 50')
     st.pyplot(fig)
 
-    # Volatility Clustering using K-Means with 7 Clusters
+    # Volatility Clustering using K-Means
+
     df['Volatility'] = df['Returns'].abs()
 
-    # Check if there is enough data for clustering
-    kmeans_data = df[['Volatility']].dropna()
-    if len(kmeans_data) > 0:
-        # Apply KMeans clustering
-        kmeans = KMeans(n_clusters=7, random_state=0)
-        df['Cluster'] = kmeans.fit_predict(kmeans_data)
-        
-        # Scatter Plot with Clusters (Volatility) with 7 Clusters
-        st.subheader("Volatility Clustering with 7 Clusters")
+    # Find the optimal number of clusters using the Elbow Method
+    st.subheader("Optimal Clusters - Elbow Method")
+
+    X = df[['Volatility']].dropna()
+    
+    if len(X) > 0:
+        distortions = []
+        K_range = range(2, 10)
+
+        for k in K_range:
+            kmeans_model = KMeans(n_clusters=k, random_state=0).fit(X)
+            distortions.append(kmeans_model.inertia_)
+
+        # Plot Elbow Method
+        fig, ax = plt.subplots(figsize=(10, 6))
+        ax.plot(K_range, distortions, 'bx-')
+        ax.set_xlabel('Number of Clusters (k)')
+        ax.set_ylabel('Distortion')
+        ax.set_title('The Elbow Method showing optimal k')
+        st.pyplot(fig)
+
+        # User selects optimal number of clusters
+        k_opt = st.slider("Select the optimal number of clusters (k)", min_value=2, max_value=10, value=4)
+
+        # Apply KMeans clustering with the selected number of clusters
+        kmeans = KMeans(n_clusters=k_opt, random_state=0)
+        df['Cluster'] = kmeans.fit_predict(X)
+
+        # Scatter Plot with Clusters (Volatility)
+        st.subheader(f"Volatility Clustering with {k_opt} Clusters")
         fig, ax = plt.subplots(figsize=(10, 6))
         scatter = ax.scatter(df.index, df['Volatility'], c=df['Cluster'], cmap='viridis', alpha=0.5)
         ax.set_xlabel('Time')
@@ -70,54 +97,45 @@ if uploaded_file is not None:
         plt.colorbar(scatter, ax=ax, label="Cluster")
         st.pyplot(fig)
 
-        # Display Cluster Insights
-        st.subheader("Cluster Insights")
-        cluster_centers = kmeans.cluster_centers_
-
-        for i in range(7):
+        # Cluster Insights with index levels, times, support/resistance
+        st.subheader("Cluster Insights: Index Levels and Key Zones")
+        
+        for i in range(k_opt):
             cluster_data = df[df['Cluster'] == i]
             mean_volatility = cluster_data['Volatility'].mean()
             mean_price = cluster_data['Pre Open NIFTY 50'].mean()
-            count = len(cluster_data)
+            min_price = cluster_data['Pre Open NIFTY 50'].min()
+            max_price = cluster_data['Pre Open NIFTY 50'].max()
+            support_level = min_price
+            resistance_level = max_price
 
             st.write(f"Cluster {i+1}:")
             st.write(f" - Average Price: {mean_price:.2f}")
             st.write(f" - Average Volatility: {mean_volatility:.2f}%")
-            st.write(f" - Number of Instances: {count}")
-            
-            # Display specific patterns found in this cluster
-            if mean_volatility > df['Volatility'].mean() + df['Volatility'].std():
-                st.write(" - **High volatility cluster**: Market may be reacting to strong events.")
-            else:
-                st.write(" - **Low volatility cluster**: Stable movement, consolidation likely.")
-            
-            st.write("---")
-            
-        # Institutional Buying/Selling Approximation (large volatility spikes)
-        st.subheader("Institutional Buying/Selling Detection")
-        large_volatility = df[df['Volatility'] > df['Volatility'].mean() + df['Volatility'].std()]
-        st.write("Possible Institutional Activity Detected at these Times:")
-        st.dataframe(large_volatility[['Pre Open NIFTY 50', 'Volatility']])
+            st.write(f" - Support Level: {support_level:.2f}")
+            st.write(f" - Resistance Level: {resistance_level:.2f}")
+            st.write(f" - **Key Time of Market Movement:** {cluster_data.index[0]}")
 
-        # Provide Insights on Institutional Activity
-        st.subheader("Insights on Institutional Activity")
-        if len(large_volatility) > 0:
-            st.write(f"There were {len(large_volatility)} instances where high volatility (potential institutional buying/selling) occurred.")
-            st.write("Institutional activity is often indicated by large spikes in volatility. These could represent large orders being executed, potentially signaling market-moving events.")
-        else:
-            st.write("No significant institutional activity detected based on volatility spikes.")
+            # Display technical insights
+            st.write("---")
         
-        # Trade Recommendations Based on Cluster Analysis
-        st.subheader("Trade Recommendations for Next Day")
-        st.write("Based on cluster behavior and observed patterns, here are some recommendations:")
-        
-        # Sample trade recommendations based on cluster insights:
-        high_vol_cluster = df.groupby('Cluster').mean()['Volatility'].idxmax()
-        low_vol_cluster = df.groupby('Cluster').mean()['Volatility'].idxmin()
-        
-        st.write(f" - Clusters with high volatility (e.g., Cluster {high_vol_cluster + 1}) may indicate potential **trend reversal** or market-moving news. Monitor these closely for breakout or breakdown.")
-        st.write(f" - Clusters with low volatility (e.g., Cluster {low_vol_cluster + 1}) typically show **consolidation**; watch for potential breakouts after consolidation periods.")
-        st.write(f" - If institutional activity is detected in a high-volatility cluster, it might suggest **large buying or selling pressure**. Consider trading in the direction of the trend.")
+        # Technical Indicators: Test Moving Averages, RSI, MACD
+        st.subheader("Technical Indicators Evaluation")
+
+        # Calculate RSI and MACD
+        df['RSI'] = df['Pre Open NIFTY 50'].ta.rsi(length=14)
+        df['MACD'] = df['Pre Open NIFTY 50'].ta.macd(fast=12, slow=26)['MACD_12_26_9']
+
+        # Indicator Insights: Show for each cluster if RSI or MACD could predict a movement
+        for i in range(k_opt):
+            cluster_data = df[df['Cluster'] == i]
+            rsi_signal = "Buy" if cluster_data['RSI'].iloc[-1] < 30 else "Sell" if cluster_data['RSI'].iloc[-1] > 70 else "Hold"
+            macd_signal = "Buy" if cluster_data['MACD'].iloc[-1] > 0 else "Sell" if cluster_data['MACD'].iloc[-1] < 0 else "Hold"
+
+            st.write(f"Cluster {i+1} Indicator Insights:")
+            st.write(f" - RSI Suggests: **{rsi_signal}**")
+            st.write(f" - MACD Suggests: **{macd_signal}**")
+            st.write("---")
         
     else:
         st.write("Not enough data for clustering.")
