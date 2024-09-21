@@ -35,10 +35,14 @@ def similar_day_forecast(data, pattern_length=5):
 
 # Function to calculate error metrics
 def calculate_metrics(actual, forecast):
+    # Convert to numpy arrays for calculations
+    actual = np.array(actual)
+    forecast = np.array(forecast)
+
     mae = mean_absolute_error(actual, forecast)
     mse = mean_squared_error(actual, forecast)
     rmse = np.sqrt(mse)
-    mape = np.mean(np.abs((actual - forecast) / actual)) * 100
+    mape = np.mean(np.abs((actual - forecast) / actual)) * 100 if np.any(actual) else float('inf')  # Avoid division by zero
     return mae, mse, rmse, mape
 
 # Function to plot actual vs forecast
