@@ -22,7 +22,10 @@ if uploaded_file is not None:
     df['DateTime'] = pd.to_datetime(df['DateTime'])
     df.set_index('DateTime', inplace=True)
     
-    # Drop any rows with missing values to avoid mismatches
+    # Fill missing values in 'Pre Open NIFTY 50' from 'NIFTY 50'
+    df['Pre Open NIFTY 50'].fillna(df['NIFTY 50'], inplace=True)
+
+    # Drop rows where both columns are NaN (just in case)
     df.dropna(subset=['Pre Open NIFTY 50'], inplace=True)
 
     # Calculate percentage change (returns)
