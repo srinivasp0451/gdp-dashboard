@@ -42,9 +42,21 @@ if uploaded_file is not None:
     # Dropping NaN rows before applying KMeans
     kmeans_data = df[['Volatility']].dropna()
 
-    # Apply KMeans
-    kmeans = KMeans(n_clusters=7, random_state=0)
-    df['Cluster'] = kmeans.fit_predict(kmeans_data)
+    if len(kmeans_data) > 0:
+        # Apply KMeans only if there is enough data
+        kmeans = KMeans(n_clusters=7, random_state=0)
+        df['Cluster'] = kmeans.fit_predict(kmeans_data)
+
+        # Scatter Plot with Clusters (Volatility) with 7 Clusters
+        st.subheader("Volatility Clustering with 7 Clusters")
+        fig, ax = plt.subplots(figsize=(10, 6))
+        scatter = ax.scatter(df.index, df['Volatility'], c=df['Cluster'], cmap='viridis', alpha=0.5)
+        ax.set_xlabel('Time')
+        ax.set_ylabel('Volatility (Returns)')
+        plt.colorbar(scatter, ax=ax, label="Cluster")
+        st.pyplot(fig)
+    else:
+        st.write("Not enough data for clustering.")
 
     # Plot Pre Open NIFTY 50 with moving average
     st.subheader("Pre Open NIFTY 50 with 60-Second Moving Average")
@@ -61,15 +73,6 @@ if uploaded_file is not None:
     fig, ax = plt.subplots(figsize=(10, 6))
     sns.boxplot(df['Pre Open NIFTY 50'], ax=ax)
     ax.set_xlabel('Pre Open NIFTY 50')
-    st.pyplot(fig)
-
-    # Scatter Plot with Clusters (Volatility) with 7 Clusters
-    st.subheader("Volatility Clustering with 7 Clusters")
-    fig, ax = plt.subplots(figsize=(10, 6))
-    scatter = ax.scatter(df.index, df['Volatility'], c=df['Cluster'], cmap='viridis', alpha=0.5)
-    ax.set_xlabel('Time')
-    ax.set_ylabel('Volatility (Returns)')
-    plt.colorbar(scatter, ax=ax, label="Cluster")
     st.pyplot(fig)
 
     # Institutional Buying/Selling Approximation (large volatility spikes)
