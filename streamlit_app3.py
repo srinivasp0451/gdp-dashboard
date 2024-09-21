@@ -116,7 +116,7 @@ if options == "Index Price Prediction":
     }
 
     selected_index = st.selectbox("Select an Index", list(indices.keys()))
-    historical_days = st.slider("Select Number of Historical Days for Analysis", min_value=30, max_value=365, value=100)
+    historical_days = st.slider("Select Number of Historical Days for Analysis", min_value=1, max_value=365, value=100)
     confidence_levels = st.multiselect("Select Confidence Levels", options=[68, 95, 99], default=[68, 95])
 
     if st.button("Predict"):
