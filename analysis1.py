@@ -37,6 +37,22 @@ if uploaded_file is not None:
     # Fill missing values in moving average
     df['MA_60'].fillna(df['Pre Open NIFTY 50'], inplace=True)
 
+    # Display Descriptive Statistics
+    st.subheader("Descriptive Statistics of Pre Open NIFTY 50 Prices")
+    st.write(df['Pre Open NIFTY 50'].describe())
+
+    # Display Descriptive Insights
+    st.subheader("Insights from Descriptive Statistics")
+    min_value = df['Pre Open NIFTY 50'].min()
+    max_value = df['Pre Open NIFTY 50'].max()
+    mean_value = df['Pre Open NIFTY 50'].mean()
+    std_value = df['Pre Open NIFTY 50'].std()
+    
+    st.write(f" - The minimum value of NIFTY 50 in the dataset is {min_value:.2f}")
+    st.write(f" - The maximum value of NIFTY 50 in the dataset is {max_value:.2f}")
+    st.write(f" - The average value (mean) is {mean_value:.2f}")
+    st.write(f" - The standard deviation (volatility) is {std_value:.2f}")
+    
     # Box Plot for Pre Open NIFTY 50
     st.subheader("Box Plot of Pre Open NIFTY 50 Prices")
     fig, ax = plt.subplots(figsize=(10, 6))
@@ -64,6 +80,20 @@ if uploaded_file is not None:
         st.pyplot(fig)
     else:
         st.write("Not enough data for clustering.")
+
+    # Institutional Buying/Selling Approximation (large volatility spikes)
+    st.subheader("Institutional Buying/Selling Detection")
+    large_volatility = df[df['Volatility'] > df['Volatility'].mean() + df['Volatility'].std()]
+    st.write("Possible Institutional Activity Detected at these Times:")
+    st.dataframe(large_volatility[['Pre Open NIFTY 50', 'Volatility']])
+
+    # Provide Insights on Institutional Activity
+    st.subheader("Insights on Institutional Activity")
+    if len(large_volatility) > 0:
+        st.write(f"There were {len(large_volatility)} instances where high volatility (potential institutional buying/selling) occurred.")
+        st.write("Institutional activity is often indicated by large spikes in volatility. These could represent large orders being executed, potentially signaling market-moving events.")
+    else:
+        st.write("No significant institutional activity detected based on volatility spikes.")
     
 else:
     st.write("Please upload a CSV file to begin analysis.")
