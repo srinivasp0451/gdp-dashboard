@@ -2,6 +2,8 @@ import streamlit as st
 import pandas as pd
 import requests as req
 import matplotlib.pyplot as plt
+import numpy as np
+import time
 
 # Function to fetch option chain data
 def get_option_chain_data(index="NIFTY"):
@@ -53,6 +55,11 @@ def filter_option_data(option_data, strike_price, option_type):
                 return data['PE']
     return None
 
+# Simulating premium variation for different timeframes
+def simulate_premium_variation(initial_price, num_points, variation_range=5):
+    # Generate random premium variation
+    return np.random.normal(initial_price, variation_range, num_points).tolist()
+
 # Streamlit UI
 st.title("NIFTY Option Chain Analysis")
 
@@ -69,26 +76,33 @@ if spot_price:
     ce_strike_price = st.selectbox("Select Call (CE) Strike Price", relevant_strikes)
     pe_strike_price = st.selectbox("Select Put (PE) Strike Price", relevant_strikes)
 
+    # Dropdown to select time frame for premium variation
+    time_frame = st.selectbox("Select Time Frame for Premium Variation (minutes)", [1, 2, 5, 10, 15, 30, 60])
+
     # Filter option chain data for selected strike prices
     ce_data = filter_option_data(option_data, ce_strike_price, 'CE')
     pe_data = filter_option_data(option_data, pe_strike_price, 'PE')
 
+    # Refresh Button
+    if st.button('Refresh Data'):
+        st.experimental_rerun()
+
     if ce_data and pe_data:
-        # Display CE and PE premiums
-        st.write(f"Selected CE Strike Price: {ce_strike_price}, Premium: {ce_data['lastPrice']}")
-        st.write(f"Selected PE Strike Price: {pe_strike_price}, Premium: {pe_data['lastPrice']}")
+        # Simulate premium variation over selected time frame
+        time_series = list(range(1, 11))  # Simulating 10 time points
+        ce_premiums = simulate_premium_variation(ce_data['lastPrice'], len(time_series), variation_range=5)
+        pe_premiums = simulate_premium_variation(pe_data['lastPrice'], len(time_series), variation_range=5)
 
-        # Plot CE and PE premiums over time (dummy line chart for now)
-        time_series = range(1, 11)  # Example time series data
-        ce_premiums = [ce_data['lastPrice']] * 10  # Example CE premiums data
-        pe_premiums = [pe_data['lastPrice']] * 10  # Example PE premiums data
+        st.write(f"Selected CE Strike Price: {ce_strike_price}, Current Premium: {ce_data['lastPrice']}")
+        st.write(f"Selected PE Strike Price: {pe_strike_price}, Current Premium: {pe_data['lastPrice']}")
 
+        # Plot CE and PE premiums over the selected time frame
         fig, ax = plt.subplots()
-        ax.plot(time_series, ce_premiums, label="CE Premium", color='green')
-        ax.plot(time_series, pe_premiums, label="PE Premium", color='red')
-        ax.set_xlabel('Time')
+        ax.plot(time_series, ce_premiums, label=f"CE Premium ({time_frame} min)", color='green')
+        ax.plot(time_series, pe_premiums, label=f"PE Premium ({time_frame} min)", color='red')
+        ax.set_xlabel(f'Time ({time_frame} min intervals)')
         ax.set_ylabel('Premium')
-        ax.set_title('CE and PE Premiums over Time')
+        ax.set_title(f'CE and PE Premiums over Time ({time_frame} min)')
         ax.legend()
 
         st.pyplot(fig)
