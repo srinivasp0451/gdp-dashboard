@@ -21,19 +21,31 @@ if uploaded_file is not None:
     df['DateTime'] = pd.to_datetime(df['DateTime'])
     df.set_index('DateTime', inplace=True)
     
-    # Fill or remove any missing data (if necessary)
-    df['Pre Open NIFTY 50'].fillna(method='ffill', inplace=True)
-    
+    # Drop any rows with missing values to avoid mismatches
+    df.dropna(inplace=True)
+
     # Calculate percentage change (returns)
     df['Returns'] = df['Pre Open NIFTY 50'].pct_change() * 100
-    
+
+    # Fill missing values that arise from pct_change (first row becomes NaN)
+    df['Returns'].fillna(0, inplace=True)
+
     # Calculate moving average (60-second)
     df['MA_60'] = df['Pre Open NIFTY 50'].rolling(window=60).mean()
-    
+
+    # Fill missing values in moving average
+    df['MA_60'].fillna(df['Pre Open NIFTY 50'], inplace=True)
+
     # Volatility Clustering using K-Means with 7 Clusters
     df['Volatility'] = df['Returns'].abs()
-    df['Cluster'] = KMeans(n_clusters=7, random_state=0).fit_predict(df[['Volatility']].dropna())
-    
+
+    # Dropping NaN rows before applying KMeans
+    kmeans_data = df[['Volatility']].dropna()
+
+    # Apply KMeans
+    kmeans = KMeans(n_clusters=7, random_state=0)
+    df['Cluster'] = kmeans.fit_predict(kmeans_data)
+
     # Plot Pre Open NIFTY 50 with moving average
     st.subheader("Pre Open NIFTY 50 with 60-Second Moving Average")
     fig, ax = plt.subplots(figsize=(10, 6))
