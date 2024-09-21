@@ -6,18 +6,28 @@ from datetime import date
 from sklearn.metrics import mean_absolute_error, mean_squared_error
 from statsmodels.tsa.arima.model import ARIMA
 import warnings
+import yfinance as yf
 
 # Suppress warnings from statsmodels
 warnings.filterwarnings("ignore")
 
-# Dummy function to load data based on selected index (replace with real data loading code)
+# Function to load data based on selected index from Yahoo Finance
 def load_data(index, start_date, end_date):
-    # Here, you'd normally load data from an API or CSV file
-    dates = pd.date_range(start=start_date, end=end_date, freq='B')  # Business days only
-    data = pd.DataFrame({
-        'Close': np.random.randn(len(dates)) * 100 + 15000,
-    }, index=dates)
-    return data
+    ticker_map = {
+        "NIFTY 50": "^NSEI",
+        "BANK NIFTY": "^NSEBANK",
+        "SENSEX": "^BSESN",
+        "MIDCAP NIFTY": "NIFTY_MID_SELECT.NS",
+        "FINNIFTY": "NIFTY_FIN_SERVICE.NS",
+        "BANKEX": "BSE-BANK.BO"
+    }
+    
+    ticker = ticker_map.get(index)
+    if ticker:
+        data = yf.download(ticker, start=start_date, end=end_date)
+        return data[['Close']].rename(columns={'Close': 'Close'})
+    else:
+        raise ValueError("Index not recognized.")
 
 # Function to fit ARIMA model and forecast the next day
 def arima_forecast(data):
