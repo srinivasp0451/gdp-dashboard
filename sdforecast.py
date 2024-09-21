@@ -93,7 +93,8 @@ if st.button("Run Forecast"):
             forecasted_close = predicted_day['Close']
 
             # Display results and evaluation metrics if forecast is in the past
-            actual_close = data.loc[end_date, 'Close']
+            #actual_close = data.loc[end_date, 'Close']
+            actual_close = data.loc[pd.Timestamp(end_date), 'Close']
             mae, mse, rmse, mape = calculate_metrics([actual_close], [forecasted_close])
             
             # Show the results in a dataframe
