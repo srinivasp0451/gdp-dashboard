@@ -75,8 +75,8 @@ if st.button("Forecast"):
         if end_date_ts in data.index:
             actual_close = data.loc[end_date_ts, 'Close']
         else:
-            # Handle missing date by choosing the closest available date
-            closest_date = data.index[data.index.get_loc(end_date_ts, method='pad')]
+            # Handle missing date by choosing the closest available date using asof()
+            closest_date = data.index.asof(end_date_ts)
             actual_close = data.loc[closest_date, 'Close']
             st.warning(f"No data available for {end_date_ts}. Using closest available date: {closest_date}.")
 
