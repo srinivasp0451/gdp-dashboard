@@ -67,7 +67,8 @@ if st.button("Run Forecast"):
         data = fetch_data(ticker, start=start_date, end=end_date)
 
         # Check if forecast date is in the past or future
-        if end_date < pd.to_datetime('today'):
+        # Convert end_date to pd.Timestamp for comparison
+        if pd.Timestamp(end_date) < pd.Timestamp('today'):
             # Perform forecast on the selected end date
             predicted_day = similar_day_forecast(data)
             forecasted_close = predicted_day['Close']
