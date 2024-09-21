@@ -11,7 +11,6 @@ import yfinance as yf
 # Suppress warnings from statsmodels
 warnings.filterwarnings("ignore")
 
-# Function to load data based on selected index from Yahoo Finance
 def load_data(index, start_date, end_date):
     ticker_map = {
         "NIFTY 50": "^NSEI",
