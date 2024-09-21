@@ -6,7 +6,7 @@ from sklearn.cluster import KMeans
 import numpy as np
 
 # Streamlit App Title
-st.title("NIFTY 50 Pre-Open Data Analysis")
+st.title("Enhanced NIFTY 50 Pre-Open Data Analysis")
 
 # File uploader
 uploaded_file = st.file_uploader("Upload a CSV file", type=["csv"])
@@ -44,18 +44,6 @@ if uploaded_file is not None:
     st.subheader("Descriptive Statistics of Pre Open NIFTY 50 Prices")
     st.write(df['Pre Open NIFTY 50'].describe())
 
-    # Display Descriptive Insights
-    st.subheader("Insights from Descriptive Statistics")
-    min_value = df['Pre Open NIFTY 50'].min()
-    max_value = df['Pre Open NIFTY 50'].max()
-    mean_value = df['Pre Open NIFTY 50'].mean()
-    std_value = df['Pre Open NIFTY 50'].std()
-    
-    st.write(f" - The minimum value of NIFTY 50 in the dataset is {min_value:.2f}")
-    st.write(f" - The maximum value of NIFTY 50 in the dataset is {max_value:.2f}")
-    st.write(f" - The average value (mean) is {mean_value:.2f}")
-    st.write(f" - The standard deviation (volatility) is {std_value:.2f}")
-    
     # Box Plot for Pre Open NIFTY 50
     st.subheader("Box Plot of Pre Open NIFTY 50 Prices")
     fig, ax = plt.subplots(figsize=(10, 6))
@@ -81,22 +69,58 @@ if uploaded_file is not None:
         ax.set_ylabel('Volatility (Returns)')
         plt.colorbar(scatter, ax=ax, label="Cluster")
         st.pyplot(fig)
+
+        # Display Cluster Insights
+        st.subheader("Cluster Insights")
+        cluster_centers = kmeans.cluster_centers_
+
+        for i in range(7):
+            cluster_data = df[df['Cluster'] == i]
+            mean_volatility = cluster_data['Volatility'].mean()
+            mean_price = cluster_data['Pre Open NIFTY 50'].mean()
+            count = len(cluster_data)
+
+            st.write(f"Cluster {i+1}:")
+            st.write(f" - Average Price: {mean_price:.2f}")
+            st.write(f" - Average Volatility: {mean_volatility:.2f}%")
+            st.write(f" - Number of Instances: {count}")
+            
+            # Display specific patterns found in this cluster
+            if mean_volatility > df['Volatility'].mean() + df['Volatility'].std():
+                st.write(" - **High volatility cluster**: Market may be reacting to strong events.")
+            else:
+                st.write(" - **Low volatility cluster**: Stable movement, consolidation likely.")
+            
+            st.write("---")
+            
+        # Institutional Buying/Selling Approximation (large volatility spikes)
+        st.subheader("Institutional Buying/Selling Detection")
+        large_volatility = df[df['Volatility'] > df['Volatility'].mean() + df['Volatility'].std()]
+        st.write("Possible Institutional Activity Detected at these Times:")
+        st.dataframe(large_volatility[['Pre Open NIFTY 50', 'Volatility']])
+
+        # Provide Insights on Institutional Activity
+        st.subheader("Insights on Institutional Activity")
+        if len(large_volatility) > 0:
+            st.write(f"There were {len(large_volatility)} instances where high volatility (potential institutional buying/selling) occurred.")
+            st.write("Institutional activity is often indicated by large spikes in volatility. These could represent large orders being executed, potentially signaling market-moving events.")
+        else:
+            st.write("No significant institutional activity detected based on volatility spikes.")
+        
+        # Trade Recommendations Based on Cluster Analysis
+        st.subheader("Trade Recommendations for Next Day")
+        st.write("Based on cluster behavior and observed patterns, here are some recommendations:")
+        
+        # Sample trade recommendations based on cluster insights:
+        high_vol_cluster = df.groupby('Cluster').mean()['Volatility'].idxmax()
+        low_vol_cluster = df.groupby('Cluster').mean()['Volatility'].idxmin()
+        
+        st.write(f" - Clusters with high volatility (e.g., Cluster {high_vol_cluster + 1}) may indicate potential **trend reversal** or market-moving news. Monitor these closely for breakout or breakdown.")
+        st.write(f" - Clusters with low volatility (e.g., Cluster {low_vol_cluster + 1}) typically show **consolidation**; watch for potential breakouts after consolidation periods.")
+        st.write(f" - If institutional activity is detected in a high-volatility cluster, it might suggest **large buying or selling pressure**. Consider trading in the direction of the trend.")
+        
     else:
         st.write("Not enough data for clustering.")
 
-    # Institutional Buying/Selling Approximation (large volatility spikes)
-    st.subheader("Institutional Buying/Selling Detection")
-    large_volatility = df[df['Volatility'] > df['Volatility'].mean() + df['Volatility'].std()]
-    st.write("Possible Institutional Activity Detected at these Times:")
-    st.dataframe(large_volatility[['Pre Open NIFTY 50', 'Volatility']])
-
-    # Provide Insights on Institutional Activity
-    st.subheader("Insights on Institutional Activity")
-    if len(large_volatility) > 0:
-        st.write(f"There were {len(large_volatility)} instances where high volatility (potential institutional buying/selling) occurred.")
-        st.write("Institutional activity is often indicated by large spikes in volatility. These could represent large orders being executed, potentially signaling market-moving events.")
-    else:
-        st.write("No significant institutional activity detected based on volatility spikes.")
-    
 else:
     st.write("Please upload a CSV file to begin analysis.")
