@@ -126,7 +126,7 @@ if options == "Index Price Prediction":
         if isinstance(result, dict):
             st.write(f"**Current Price:** {result['Current Price']:.2f}")
             st.write(f"**Daily Avg Return:** {result['Daily Avg Return']:.4f}%")
-            #st.write(f"**Daily Std Dev:** {result['Daily Std Dev']:.4f}%")
+            st.write(f"**Daily Std Dev:** {result['Daily Std Dev']:.4f}%")
             st.write(f"**Next Expiry Date:** {result['Next Expiry Date']}")
             st.write(f"**Days to Expiry:** {result['Days to Expiry']}")
             
