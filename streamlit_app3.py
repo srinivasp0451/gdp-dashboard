@@ -60,7 +60,7 @@ def get_next_expiry(current_date):
 
 # Function to predict index price range with confidence intervals for the next business day
 def predict_next_day_range(symbol, historical_days=100, confidence_levels=[68, 95, 99]):
-    end_date = datetime.now()-timedelta(days=1)
+    end_date = datetime.now()
     start_date = end_date - timedelta(days=historical_days)
     data = yf.download(symbol, start=start_date, end=end_date)
 
