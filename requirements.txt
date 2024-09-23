@@ -15,3 +15,4 @@ seaborn
 pytube
 pydub
 SpeechRecognition
+ffmpeg
