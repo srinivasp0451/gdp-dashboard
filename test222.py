@@ -5,6 +5,16 @@ from pytube import YouTube
 from pydub import AudioSegment
 from pydub.utils import which
 
+
+import os
+
+# Check if ffmpeg is installed
+if os.system("ffmpeg -version") != 0:
+    os.system("apt-get update && apt-get install -y ffmpeg")
+
+
+
+
 # Ensure ffmpeg is configured correctly
 AudioSegment.converter = which("ffmpeg")
 
