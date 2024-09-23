@@ -3,6 +3,10 @@ import os
 import speech_recognition as sr
 from pytube import YouTube
 from pydub import AudioSegment
+from pydub.utils import which
+
+# Ensure ffmpeg is configured correctly
+AudioSegment.converter = which("ffmpeg")
 
 # Function to download audio from YouTube video
 def download_audio_from_youtube(url, output_path='audio.mp4'):
