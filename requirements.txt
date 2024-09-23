@@ -14,5 +14,5 @@ statsmodels
 seaborn
 pytube
 pydub
-speech_recognition
+SpeechRecognition
 ffmpeg
