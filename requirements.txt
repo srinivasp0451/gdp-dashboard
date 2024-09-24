@@ -12,3 +12,5 @@ scipy
 scikit-learn
 statsmodels
 seaborn
+youtube-transcript-api
+googletrans==4.0.0-rc1
