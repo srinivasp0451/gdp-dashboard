@@ -1,5 +1,6 @@
 import streamlit as st
 from youtube_transcript_api import YouTubeTranscriptApi
+from youtube_transcript_api._errors import NoTranscriptFound, TranscriptsDisabled
 from urllib.parse import urlparse, parse_qs
 from googletrans import Translator
 
@@ -18,12 +19,18 @@ def get_youtube_transcript(video_id, language_code='en'):
         try:
             # Try to fetch the transcript in the specified language (e.g., English)
             transcript = available_transcripts.find_transcript([language_code])
-        except:
+        except NoTranscriptFound:
             # If the transcript in the specified language isn't available, fetch any available transcript
             st.warning(f"No transcript found for the language '{language_code}'. Fetching auto-generated transcript.")
             transcript = available_transcripts.find_generated_transcript([language_code, 'hi'])  # Fallback to Hindi
         
         return transcript.fetch()
+    except NoTranscriptFound:
+        st.error("No transcript is available for this video.")
+        return None
+    except TranscriptsDisabled:
+        st.error("Transcripts are disabled for this video.")
+        return None
     except Exception as e:
         st.error(f"An error occurred: {e}")
         return None
