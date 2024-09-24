@@ -22,16 +22,31 @@ timeframes = {
     "1 Day": "1d"
 }
 
+support_resistance_methods = {
+    "Min/Max": "minmax",
+    "Moving Average": "ma",
+    "Pivot Points": "pivot"
+}
+
 # Function to calculate support and resistance
-def find_support_resistance(data):
-    support = data['Low'].min()
-    resistance = data['High'].max()
+def calculate_support_resistance(data, method):
+    if method == "minmax":
+        support = data['Low'].min()
+        resistance = data['High'].max()
+    elif method == "ma":
+        support = data['Close'].rolling(window=5).mean().min()
+        resistance = data['Close'].rolling(window=5).mean().max()
+    elif method == "pivot":
+        pivot = (data['High'].max() + data['Low'].min() + data['Close'].iloc[-1]) / 3
+        support = pivot - (data['High'].max() - data['Low'].min())
+        resistance = pivot + (data['High'].max() - data['Low'].min())
     return support, resistance
 
 # Streamlit UI
 st.title("Candlestick Chart with Support and Resistance Analysis")
 selected_index = st.selectbox("Select Index", list(indices.keys()))
 selected_timeframe = st.selectbox("Select Time Frame", list(timeframes.keys()))
+selected_method = st.selectbox("Select Support/Resistance Method", list(support_resistance_methods.keys()))
 
 if st.button("Plot Candlestick"):
     ticker = indices[selected_index]
@@ -49,7 +64,7 @@ if st.button("Plot Candlestick"):
     # Plotting and analysis for each day
     for idx, day_data in enumerate(all_days_data):
         day_data['Date'] = day_data.index
-        support, resistance = find_support_resistance(day_data)
+        support, resistance = calculate_support_resistance(day_data, support_resistance_methods[selected_method])
 
         # Create the candlestick chart
         fig = go.Figure(data=[go.Candlestick(x=day_data.index,
