@@ -12,7 +12,3 @@ scipy
 scikit-learn
 statsmodels
 seaborn
-pytube
-pydub
-SpeechRecognition
-ffmpeg
