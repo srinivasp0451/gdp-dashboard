@@ -34,13 +34,16 @@ def calculate_support_resistance(data, method):
     if method == "minmax":
         support = data['Low'].min()
         resistance = data['High'].max()
+        return support, resistance
     elif method == "ma":
         support = data['Close'].rolling(window=5).mean().min()
         resistance = data['Close'].rolling(window=5).mean().max()
+        return support, resistance
     elif method == "pivot":
         pivot = (data['High'].max() + data['Low'].min() + data['Close'].iloc[-1]) / 3
         support = pivot - (data['High'].max() - data['Low'].min())
         resistance = pivot + (data['High'].max() - data['Low'].min())
+        return support, resistance
     elif method == "fibonacci":
         high = data['High'].max()
         low = data['Low'].min()
@@ -53,7 +56,6 @@ def calculate_support_resistance(data, method):
             "Level 4": low
         }
         return levels
-    return support, resistance
 
 # Streamlit UI
 st.title("Candlestick Chart with Support and Resistance Analysis")
@@ -129,7 +131,7 @@ if st.button("Plot Candlestick"):
 
         # Final analysis using the most recent support and resistance
         st.write("### Trading Psychology and Recommendations")
-        if recent_resistance and recent_support:
+        if selected_method != "fibonacci" and recent_resistance and recent_support:
             st.write(f"**Most Recent Support:** {recent_support:.2f}, **Most Recent Resistance:** {recent_resistance:.2f}")
             st.write(f"**Recommended Strategy:**")
             st.write(f"Consider buying Call options (CE) near the support level of {recent_support:.2f} for potential upside, and buying Put options (PE) near the resistance level of {recent_resistance:.2f} to hedge against downward moves.")
