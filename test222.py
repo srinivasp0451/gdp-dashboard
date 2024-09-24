@@ -71,7 +71,7 @@ if st.button("Plot Candlestick"):
     all_days_data = []
     for i in range(5):
         try:
-            data = yf.download(ticker, period='1d', interval='5m', 
+            data = yf.download(ticker, period='1d', interval=timeframe, 
                                start=pd.Timestamp.now() - pd.Timedelta(days=i + 1), 
                                end=pd.Timestamp.now() - pd.Timedelta(days=i))
             if not data.empty:
@@ -85,55 +85,56 @@ if st.button("Plot Candlestick"):
     if not all_days_data:
         st.error("No valid data was retrieved. Please try again.")
     else:
-        # Analyze only the most recent day's data
-        recent_data = all_days_data[0]  # Most recent day's data
+        # Plotting and analyzing the last 5 days
+        for i, daily_data in enumerate(all_days_data):
+            st.subheader(f"Day {i + 1}: Candlestick Chart and Support/Resistance Analysis")
+            
+            # Calculate support and resistance for each day
+            if selected_method == "fibonacci":
+                fibonacci_levels = calculate_support_resistance(daily_data, support_resistance_methods[selected_method])
+            else:
+                support, resistance = calculate_support_resistance(daily_data, support_resistance_methods[selected_method])
 
-        # Calculate support and resistance for the most recent day
-        if selected_method == "fibonacci":
-            fibonacci_levels = calculate_support_resistance(recent_data, support_resistance_methods[selected_method])
-        else:
-            recent_support, recent_resistance = calculate_support_resistance(recent_data, support_resistance_methods[selected_method])
+            # Create the candlestick chart for the day
+            fig = go.Figure(data=[go.Candlestick(x=daily_data.index,
+                                                 open=daily_data['Open'],
+                                                 high=daily_data['High'],
+                                                 low=daily_data['Low'],
+                                                 close=daily_data['Close'])])
 
-        # Create the candlestick chart for the most recent day
-        fig = go.Figure(data=[go.Candlestick(x=recent_data.index,
-                                             open=recent_data['Open'],
-                                             high=recent_data['High'],
-                                             low=recent_data['Low'],
-                                             close=recent_data['Close'])])
+            # Add support and resistance lines
+            if selected_method == "fibonacci":
+                for level, value in fibonacci_levels.items():
+                    fig.add_trace(go.Scatter(x=daily_data.index, y=[value] * len(daily_data),
+                                             mode='lines', name=level, line=dict(dash='dash')))
+            else:
+                fig.add_trace(go.Scatter(x=daily_data.index, y=[support] * len(daily_data),
+                                         mode='lines', name='Support', line=dict(color='green', dash='dash')))
+                fig.add_trace(go.Scatter(x=daily_data.index, y=[resistance] * len(daily_data),
+                                         mode='lines', name='Resistance', line=dict(color='red', dash='dash')))
 
-        # Add support and resistance lines
-        if selected_method == "fibonacci":
-            for level, value in fibonacci_levels.items():
-                fig.add_trace(go.Scatter(x=recent_data.index, y=[value] * len(recent_data),
-                                         mode='lines', name=level, line=dict(dash='dash')))
-        else:
-            fig.add_trace(go.Scatter(x=recent_data.index, y=[recent_support] * len(recent_data),
-                                     mode='lines', name='Support', line=dict(color='green', dash='dash')))
-            fig.add_trace(go.Scatter(x=recent_data.index, y=[recent_resistance] * len(recent_data),
-                                     mode='lines', name='Resistance', line=dict(color='red', dash='dash')))
+            # Customize layout
+            fig.update_layout(title=f'{selected_index} Candlestick Chart - Day {i + 1}',
+                              xaxis_title='Time',
+                              yaxis_title='Price',
+                              xaxis_rangeslider_visible=False)
 
-        # Customize layout
-        fig.update_layout(title=f'{selected_index} Candlestick Chart - Most Recent Day',
-                          xaxis_title='Time',
-                          yaxis_title='Price',
-                          xaxis_rangeslider_visible=False)
+            # Show plot for each day
+            st.plotly_chart(fig)
 
-        # Show plot for the most recent day
-        st.plotly_chart(fig)
-
-        # Print support and resistance for the most recent day
-        if selected_method == "fibonacci":
-            st.write(f"**Most Recent Day Fibonacci Levels:**")
-            for level, value in fibonacci_levels.items():
-                st.write(f"{level} = {value:.2f}")
-        else:
-            st.write(f"**Most Recent Day Support:** {recent_support:.2f}, **Most Recent Day Resistance:** {recent_resistance:.2f}")
+            # Print support and resistance for each day
+            if selected_method == "fibonacci":
+                st.write(f"**Day {i + 1} Fibonacci Levels:**")
+                for level, value in fibonacci_levels.items():
+                    st.write(f"{level} = {value:.2f}")
+            else:
+                st.write(f"**Day {i + 1} Support:** {support:.2f}, **Day {i + 1} Resistance:** {resistance:.2f}")
 
         # Final analysis using the most recent support and resistance
-        st.write("### Trading Psychology and Recommendations")
-        if selected_method != "fibonacci" and recent_resistance and recent_support:
-            st.write(f"**Most Recent Support:** {recent_support:.2f}, **Most Recent Resistance:** {recent_resistance:.2f}")
+        st.write("### Final Trading Psychology and Recommendations")
+        if selected_method != "fibonacci" and support and resistance:
+            st.write(f"**Most Recent Day Support:** {support:.2f}, **Most Recent Day Resistance:** {resistance:.2f}")
             st.write(f"**Recommended Strategy:**")
-            st.write(f"Consider buying Call options (CE) near the support level of {recent_support:.2f} for potential upside, and buying Put options (PE) near the resistance level of {recent_resistance:.2f} to hedge against downward moves.")
+            st.write(f"Consider buying Call options (CE) near the support level of {support:.2f} for potential upside, and buying Put options (PE) near the resistance level of {resistance:.2f} to hedge against downward moves.")
         else:
             st.write("Market conditions may require further analysis.")
