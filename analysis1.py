@@ -40,6 +40,8 @@ if uploaded_file is not None:
     # Fill missing values in moving average
     df['MA_60'].fillna(df['Pre Open NIFTY 50'], inplace=True)
 
+    st.subheader("Uploaded Data:")
+    st.dataframe(df)
     # Display Descriptive Statistics
     st.subheader("Descriptive Statistics of Pre Open NIFTY 50 Prices")
     st.write(df['Pre Open NIFTY 50'].describe())
