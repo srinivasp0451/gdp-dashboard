@@ -20,13 +20,14 @@ def get_youtube_transcript(youtube_url, language_code='en'):
             # Try to fetch the transcript in the specified language
             transcript = available_transcripts.find_transcript([language_code])
         except:
-            # If the specified language isn't available, fetch any available transcript
-            st.write(f"No transcript found for the language '{language_code}'. Fetching auto-generated transcript.")
-            transcript = available_transcripts.find_generated_transcript([language_code, 'hi'])  # Fallback to Hindi or auto-generated language
+            # If the transcript in the specified language isn't available, fetch any available transcript
+            st.write(f"No transcript found for the language '{language_code}'. Fetching available transcript.")
+            transcript = available_transcripts.find_generated_transcript([language_code, 'hi'])  # Fallback to Hindi or other auto-generated language
 
-        # Get the transcript and return it
+        # Get the translated transcript (if needed) or the original one
         transcript_text = "\n".join([entry['text'] for entry in transcript.fetch()])
         return transcript_text
+
     except Exception as e:
         return f"An error occurred: {e}"
 
@@ -36,10 +37,10 @@ st.title("YouTube Transcript Fetcher")
 # Input for YouTube video URL
 youtube_url = st.text_input("Enter YouTube URL:")
 
-# Select language (default to English)
-language_code = st.selectbox("Select Transcript Language:", ['en', 'hi', 'auto'])
+# Language selection (defaults to English 'en')
+language_code = st.text_input("Enter Language Code (e.g., 'en', 'hi'):", value='en')
 
-# Button to fetch transcript
+# Fetch transcript when button is clicked
 if st.button("Fetch Transcript"):
     if youtube_url:
         transcript = get_youtube_transcript(youtube_url, language_code)
