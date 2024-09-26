@@ -1,8 +1,6 @@
 import streamlit as st
 from youtube_transcript_api import YouTubeTranscriptApi
-from youtube_transcript_api._errors import NoTranscriptFound, TranscriptsDisabled
 from urllib.parse import urlparse, parse_qs
-from googletrans import Translator
 
 # Function to extract the video ID from a YouTube URL
 def extract_video_id(youtube_url):
@@ -11,57 +9,41 @@ def extract_video_id(youtube_url):
     return video_id[0] if video_id else parsed_url.path.split('/')[-1]
 
 # Function to get transcript from a YouTube video, allowing language specification
-def get_youtube_transcript(video_id, language_code='en'):
+def get_youtube_transcript(youtube_url, language_code='en'):
     try:
+        video_id = extract_video_id(youtube_url)
+
         # Fetch the available transcripts for the video
         available_transcripts = YouTubeTranscriptApi.list_transcripts(video_id)
-        
+
         try:
-            # Try to fetch the transcript in the specified language (e.g., English)
+            # Try to fetch the transcript in the specified language
             transcript = available_transcripts.find_transcript([language_code])
-        except NoTranscriptFound:
-            # If the transcript in the specified language isn't available, fetch any available transcript
-            st.warning(f"No transcript found for the language '{language_code}'. Fetching auto-generated transcript.")
-            transcript = available_transcripts.find_generated_transcript([language_code, 'hi'])  # Fallback to Hindi
-        
-        return transcript.fetch()
-    except NoTranscriptFound:
-        st.error("No transcript is available for this video.")
-        return None
-    except TranscriptsDisabled:
-        st.error("Transcripts are disabled for this video.")
-        return None
+        except:
+            # If the specified language isn't available, fetch any available transcript
+            st.write(f"No transcript found for the language '{language_code}'. Fetching auto-generated transcript.")
+            transcript = available_transcripts.find_generated_transcript([language_code, 'hi'])  # Fallback to Hindi or auto-generated language
+
+        # Get the transcript and return it
+        transcript_text = "\n".join([entry['text'] for entry in transcript.fetch()])
+        return transcript_text
     except Exception as e:
-        st.error(f"An error occurred: {e}")
-        return None
+        return f"An error occurred: {e}"
 
-# Function to translate transcript using Google Translator
-def translate_transcript(transcript, src_language='hi', dest_language='en'):
-    translator = Translator()
-    translated_text = []
-    for entry in transcript:
-        translated_text.append(translator.translate(entry['text'], src=src_language, dest=dest_language).text)
-    return translated_text
+# Streamlit app
+st.title("YouTube Transcript Fetcher")
 
-# Streamlit App
-st.title("YouTube Video Transcription and Translation")
+# Input for YouTube video URL
+youtube_url = st.text_input("Enter YouTube URL:")
 
-# Input for YouTube URL
-youtube_url = st.text_input("Enter YouTube URL:", placeholder="https://www.youtube.com/watch?v=example")
+# Select language (default to English)
+language_code = st.selectbox("Select Transcript Language:", ['en', 'hi', 'auto'])
 
-if youtube_url:
-    video_id = extract_video_id(youtube_url)
-    st.write(f"Extracted Video ID: {video_id}")
-
-    # Get Transcript
-    if st.button("Get Transcript"):
-        transcript = get_youtube_transcript(video_id, language_code='hi')  # Try to get Hindi transcript
+# Button to fetch transcript
+if st.button("Fetch Transcript"):
+    if youtube_url:
+        transcript = get_youtube_transcript(youtube_url, language_code)
         if transcript:
-            st.write("Original Transcript in Hindi:")
-            st.write("\n".join([entry['text'] for entry in transcript]))
-
-            # Translate Transcript to English
-            st.write("Translating to English...")
-            translated_transcript = translate_transcript(transcript, src_language='hi', dest_language='en')
-            st.write("Translated Transcript in English:")
-            st.write("\n".join(translated_transcript))
+            st.text_area("Transcript:", transcript, height=400)
+    else:
+        st.write("Please enter a valid YouTube URL.")
