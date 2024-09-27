@@ -18,8 +18,8 @@ def get_available_indices():
     }
 
 # Function to fetch real historical data from Yahoo Finance
-def fetch_index_data(ticker, period="1y"):
-    index_data = yf.download(ticker, period=period)
+def fetch_index_data(ticker, start_date, end_date):
+    index_data = yf.download(ticker, start=start_date, end=end_date)
     index_data.reset_index(inplace=True)
     return index_data
 
@@ -131,8 +131,10 @@ indices = get_available_indices()
 indices["All"] = "All"
 selected_index = st.selectbox("Select Index", list(indices.keys()))
 
-# Input for the period of data
-period = st.text_input("Enter the data period (e.g., '1y', '6mo', '1mo')", "1y")
+# Input for custom date
+prediction_date = st.date_input("Select Prediction Date", datetime.now().date())
+end_date = prediction_date
+start_date = prediction_date - timedelta(days=365)  # Use 1 year of data before the prediction date
 
 # Dropdown for selecting the prediction method dynamically
 methods = {
@@ -159,19 +161,23 @@ if st.button("Predict"):
 
     # Function to generate prediction for all selected options
     def generate_prediction(index_name, method_name, index_data):
-        if method_name == "Monte Carlo Simulation":
-            return monte_carlo_simulation(index_data, num_simulations)
-        elif method_name == "Bayesian Inference":
-            return bayesian_inference(index_data)
-        elif method_name == "Markov Chain":
-            return markov_chain(index_data)
-        elif method_name == "Statistical Confidence Intervals":
-            return statistical_confidence_intervals(index_data, confidence_level)
-        elif method_name == "Option Pricing Model":
-            return option_pricing_model(index_data, risk_free_rate)
-        elif method_name == "Poisson Distribution":
-            return poisson_distribution(index_data, avg_event_rate)
-    
+        try:
+            if method_name == "Monte Carlo Simulation":
+                return monte_carlo_simulation(index_data, num_simulations)
+            elif method_name == "Bayesian Inference":
+                return bayesian_inference(index_data)
+            elif method_name == "Markov Chain":
+                return markov_chain(index_data)
+            elif method_name == "Statistical Confidence Intervals":
+                return statistical_confidence_intervals(index_data, confidence_level)
+            elif method_name == "Option Pricing Model":
+                return option_pricing_model(index_data, risk_free_rate)
+            elif method_name == "Poisson Distribution":
+                return poisson_distribution(index_data, avg_event_rate)
+        except Exception as e:
+            st.warning(f"Error processing {method_name} for {index_name}: {str(e)}")
+            return None
+
     # Process "All" options for indices
     index_names = [selected_index] if selected_index != "All" else list(indices.keys())[:-1]  # exclude "All"
     
@@ -180,41 +186,44 @@ if st.button("Predict"):
 
     # Loop through all index-method combinations
     for index_name in index_names:
-        index_data = fetch_index_data(indices[index_name], period)
+        try:
+            index_data = fetch_index_data(indices[index_name], start_date, end_date)
+        except Exception as e:
+            st.warning(f"Data unavailable for {index_name}: {str(e)}")
+            continue
+        
         for method_name in method_names:
             prediction = generate_prediction(index_name, method_name, index_data)
-            
-            # Get the prediction date, considering business days
-            last_trading_day = index_data['Date'].iloc[-1]
-            prediction_date = get_next_business_day(last_trading_day).strftime('%Y-%m-%d')
-
-            # Determine trend and provide reasons
             last_close_price = index_data['Close'].iloc[-1]
-            if prediction > last_close_price:
-                trend = "Upward"
-                reasons = "Positive momentum observed with increased buying pressure and favorable macroeconomic factors."
-            else:
-                trend = "Downward"
-                reasons = "Negative sentiment due to possible selling pressure or external economic concerns."
+            trend = "Upward" if prediction > last_close_price else "Downward"
+            reasons = "Favorable buying sentiment and market momentum." if trend == "Upward" else "Possible selling pressure and negative sentiment."
 
-            # Append data to the summary
             summary_data.append({
                 "Index": index_name,
                 "Method": method_name,
-                "Prediction Date": prediction_date,
+                "Prediction Date": prediction_date.strftime("%Y-%m-%d"),
                 "Last Close Price": last_close_price,
                 "Predicted Price": prediction,
                 "Trend": trend,
                 "Reasons": reasons
             })
     
-    # Display summary results
-    summary_df = pd.DataFrame(summary_data)
-    st.dataframe(summary_df)
-    
-    # Download button for summary report
-    output = io.BytesIO()
-    with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
-        summary_df.to_excel(writer, sheet_name='Summary', index=False)
-    st.download_button(label="Download Summary", data=output.getvalue(), file_name="index_summary.xlsx")
+    # Display the results in a more readable format
+    st.subheader("Prediction Summary")
+    for entry in summary_data:
+        st.markdown(f"**Index**: {entry['Index']}")
+        st.markdown(f"**Method**: {entry['Method']}")
+        st.markdown(f"**Prediction Date**: {entry['Prediction Date']}")
+        st.markdown(f"**Last Close Price**: {entry['Last Close Price']}")
+        st.markdown(f"**Predicted Price**: {entry['Predicted Price']}")
+        st.markdown(f"**Trend**: {entry['Trend']}")
+        st.markdown(f"**Reasons**: {entry['Reasons']}")
+        st.markdown("---")
 
+    # Download summary as Excel file
+    if summary_data:
+        summary_df = pd.DataFrame(summary_data)
+        output = io.BytesIO()
+        with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
+            summary_df.to_excel(writer, sheet_name='Summary', index=False)
+        st.download_button(label="Download Summary", data=output.getvalue(), file_name="index_summary.xlsx")
