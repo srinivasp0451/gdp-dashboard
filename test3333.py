@@ -4,10 +4,11 @@ import pandas as pd
 import yfinance as yf
 from scipy.stats import norm, poisson
 from datetime import datetime, timedelta
+import io
 
-# Function to dynamically fetch available index symbols from Yahoo Finance or a CSV file
+# Function to dynamically fetch available index symbols from Yahoo Finance
 def get_available_indices():
-    available_indices = {
+    return {
         "Nifty 50": "^NSEI",
         "Midcap Nifty": "NIFTY_MID_SELECT.NS",
         "Bank Nifty": "^NSEBANK",
@@ -15,18 +16,17 @@ def get_available_indices():
         "Sensex": "^BSESN",
         "Bankex": "BSE-BANK.BO"
     }
-    return available_indices
 
-# Function to fetch real historical data from Yahoo Finance dynamically based on selection
+# Function to fetch real historical data from Yahoo Finance
 def fetch_index_data(ticker, period="1y"):
-    index_data = yf.download(ticker, period=period)  # Fetch historical data for the selected period
+    index_data = yf.download(ticker, period=period)
     index_data.reset_index(inplace=True)
     return index_data
 
 # Monte Carlo Simulation for next-day prediction
 def monte_carlo_simulation(index_data, num_simulations):
     last_price = index_data['Close'].iloc[-1]
-    returns = index_data['Close'].pct_change().dropna()  # Daily returns
+    returns = index_data['Close'].pct_change().dropna()
     mean_return = np.mean(returns)
     std_return = np.std(returns)
     
@@ -35,7 +35,7 @@ def monte_carlo_simulation(index_data, num_simulations):
         simulated_price = last_price * np.exp(np.random.normal(mean_return, std_return))
         simulated_prices.append(simulated_price)
     
-    return np.mean(simulated_prices)  # Return the average of all simulated prices
+    return np.mean(simulated_prices)
 
 # Bayesian Inference for next-day prediction
 def bayesian_inference(index_data):
@@ -63,11 +63,11 @@ def markov_chain(index_data):
     
     next_state = np.random.choice([0, 1, 2], p=transition_matrix[current_state])
     if next_state == 0:
-        next_return = -np.abs(np.random.normal(0, 0.01))  # Simulate a negative return
+        next_return = -np.abs(np.random.normal(0, 0.01))
     elif next_state == 1:
-        next_return = np.random.normal(0, 0.01)  # Simulate a neutral return
+        next_return = np.random.normal(0, 0.01)
     else:
-        next_return = np.abs(np.random.normal(0, 0.01))  # Simulate a positive return
+        next_return = np.abs(np.random.normal(0, 0.01))
     
     next_day_price = index_data['Close'].iloc[-1] * (1 + next_return)
     return next_day_price
@@ -78,7 +78,7 @@ def statistical_confidence_intervals(index_data, confidence_level):
     mean_return = np.mean(returns)
     std_return = np.std(returns)
     
-    z_score = norm.ppf(1 - (1 - confidence_level) / 2)  # Calculate Z-score based on confidence level
+    z_score = norm.ppf(1 - (1 - confidence_level) / 2)
     lower_bound = mean_return - z_score * std_return
     upper_bound = mean_return + z_score * std_return
     
@@ -89,26 +89,26 @@ def statistical_confidence_intervals(index_data, confidence_level):
 
 # Option Pricing Model (Black-Scholes) for next-day prediction
 def option_pricing_model(index_data, risk_free_rate, volatility=None):
-    S = index_data['Close'].iloc[-1]  # Current stock price
-    K = S  # Assume strike price = current price
-    T = 1/252  # 1-day to expiry
+    S = index_data['Close'].iloc[-1]
+    K = S
+    T = 1/252
     r = risk_free_rate
     if volatility is None:
         returns = index_data['Close'].pct_change().dropna()
-        volatility = np.std(returns) * np.sqrt(252)  # Annualized volatility
+        volatility = np.std(returns) * np.sqrt(252)
     
     d1 = (np.log(S/K) + (r + (volatility**2)/2) * T) / (volatility * np.sqrt(T))
     d2 = d1 - volatility * np.sqrt(T)
     
     call_price = S * norm.cdf(d1) - K * np.exp(-r * T) * norm.cdf(d2)
     
-    return S + call_price  # Simplified prediction
+    return S + call_price
 
-# Poisson Distribution for rare event prediction (like sudden rallies or drops)
+# Poisson Distribution for rare event prediction
 def poisson_distribution(index_data, avg_event_rate):
     rare_event_count = poisson.rvs(mu=avg_event_rate)
     if rare_event_count > 0:
-        event_magnitude = np.random.uniform(-0.05, 0.05)  # Up to ±5% change
+        event_magnitude = np.random.uniform(-0.05, 0.05)
     else:
         event_magnitude = 0
     
@@ -116,14 +116,22 @@ def poisson_distribution(index_data, avg_event_rate):
     
     return next_day_price
 
+# Adjust date for business days
+def get_next_business_day(start_date):
+    next_day = start_date + timedelta(days=1)
+    while next_day.weekday() >= 5:  # 5=Saturday, 6=Sunday
+        next_day += timedelta(days=1)
+    return next_day
+
 # Streamlit UI
 st.title("Dynamic Index Prediction App")
 
 # Dropdown for selecting the index dynamically
 indices = get_available_indices()
+indices["All"] = "All"
 selected_index = st.selectbox("Select Index", list(indices.keys()))
 
-# Input for the period of data (dynamic input)
+# Input for the period of data
 period = st.text_input("Enter the data period (e.g., '1y', '6mo', '1mo')", "1y")
 
 # Dropdown for selecting the prediction method dynamically
@@ -135,47 +143,78 @@ methods = {
     "Option Pricing Model": option_pricing_model,
     "Poisson Distribution": poisson_distribution
 }
+methods["All"] = "All"
 selected_method = st.selectbox("Select Prediction Method", list(methods.keys()))
 
-# Additional dynamic inputs for specific methods
-if selected_method == "Monte Carlo Simulation":
-    num_simulations = st.number_input("Enter number of simulations", min_value=100, max_value=10000, value=1000)
-elif selected_method == "Statistical Confidence Intervals":
-    confidence_level = st.slider("Select confidence level", min_value=0.8, max_value=0.99, value=0.95)
-elif selected_method == "Option Pricing Model":
-    risk_free_rate = st.number_input("Enter risk-free rate", min_value=0.0, max_value=0.2, value=0.01)
-elif selected_method == "Poisson Distribution":
-    avg_event_rate = st.number_input("Enter average event rate", min_value=0.0, max_value=1.0, value=0.01)
+# Dynamic input fields for specific methods
+num_simulations = st.number_input("Enter number of simulations", min_value=100, max_value=10000, value=1000) if selected_method == "Monte Carlo Simulation" or selected_method == "All" else None
+confidence_level = st.slider("Select confidence level", min_value=0.8, max_value=0.99, value=0.95) if selected_method == "Statistical Confidence Intervals" or selected_method == "All" else None
+risk_free_rate = st.number_input("Enter risk-free rate", min_value=0.0, max_value=0.2, value=0.01) if selected_method == "Option Pricing Model" or selected_method == "All" else None
+avg_event_rate = st.number_input("Enter average event rate", min_value=0.0, max_value=1.0, value=0.01) if selected_method == "Poisson Distribution" or selected_method == "All" else None
 
 # Button to trigger prediction
 if st.button("Predict"):
-    # Fetch data for the selected index dynamically
-    index_data = fetch_index_data(indices[selected_index], period)
+    # Dataframe to store summary results
+    summary_data = []
+
+    # Function to generate prediction for all selected options
+    def generate_prediction(index_name, method_name, index_data):
+        if method_name == "Monte Carlo Simulation":
+            return monte_carlo_simulation(index_data, num_simulations)
+        elif method_name == "Bayesian Inference":
+            return bayesian_inference(index_data)
+        elif method_name == "Markov Chain":
+            return markov_chain(index_data)
+        elif method_name == "Statistical Confidence Intervals":
+            return statistical_confidence_intervals(index_data, confidence_level)
+        elif method_name == "Option Pricing Model":
+            return option_pricing_model(index_data, risk_free_rate)
+        elif method_name == "Poisson Distribution":
+            return poisson_distribution(index_data, avg_event_rate)
     
-    # Based on the selected method, run the prediction dynamically
-    if selected_method == "Monte Carlo Simulation":
-        prediction = monte_carlo_simulation(index_data, num_simulations)
-    elif selected_method == "Bayesian Inference":
-        prediction = bayesian_inference(index_data)
-    elif selected_method == "Markov Chain":
-        prediction = markov_chain(index_data)
-    elif selected_method == "Statistical Confidence Intervals":
-        prediction = statistical_confidence_intervals(index_data, confidence_level)
-    elif selected_method == "Option Pricing Model":
-        prediction = option_pricing_model(index_data, risk_free_rate)
-    elif selected_method == "Poisson Distribution":
-        prediction = poisson_distribution(index_data, avg_event_rate)
+    # Process "All" options for indices
+    index_names = [selected_index] if selected_index != "All" else list(indices.keys())[:-1]  # exclude "All"
+    
+    # Process "All" options for methods
+    method_names = [selected_method] if selected_method != "All" else list(methods.keys())[:-1]  # exclude "All"
 
-    # Get the date for which the prediction is made
-    prediction_date = (index_data['Date'].iloc[-1] + timedelta(days=1)).strftime('%Y-%m-%d')
+    # Loop through all index-method combinations
+    for index_name in index_names:
+        index_data = fetch_index_data(indices[index_name], period)
+        for method_name in method_names:
+            prediction = generate_prediction(index_name, method_name, index_data)
+            
+            # Get the prediction date, considering business days
+            last_trading_day = index_data['Date'].iloc[-1]
+            prediction_date = get_next_business_day(last_trading_day).strftime('%Y-%m-%d')
 
-    # Display the prediction and prediction date
-    st.write(f"The predicted price for {selected_index} on {prediction_date} using {selected_method}: {prediction:.2f}")
+            # Determine trend and provide reasons
+            last_close_price = index_data['Close'].iloc[-1]
+            if prediction > last_close_price:
+                trend = "Upward"
+                reasons = "Positive momentum observed with increased buying pressure and favorable macroeconomic factors."
+            else:
+                trend = "Downward"
+                reasons = "Negative sentiment due to possible selling pressure or external economic concerns."
 
-    # Add insights based on prediction
-    if prediction > index_data['Close'].iloc[-1]:
-        insight = "The model suggests a potential upward movement for the next trading day."
-    else:
-        insight = "The model suggests a potential downward movement for the next trading day."
+            # Append data to the summary
+            summary_data.append({
+                "Index": index_name,
+                "Method": method_name,
+                "Prediction Date": prediction_date,
+                "Last Close Price": last_close_price,
+                "Predicted Price": prediction,
+                "Trend": trend,
+                "Reasons": reasons
+            })
+    
+    # Display summary results
+    summary_df = pd.DataFrame(summary_data)
+    st.dataframe(summary_df)
+    
+    # Download button for summary report
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
+        summary_df.to_excel(writer, sheet_name='Summary', index=False)
+    st.download_button(label="Download Summary", data=output.getvalue(), file_name="index_summary.xlsx")
 
-    st.write(insight)
