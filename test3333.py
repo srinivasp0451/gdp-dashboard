@@ -14,7 +14,8 @@ def get_available_indices():
         "Bank Nifty": "^NSEBANK",
         "Finnifty": "NIFTY_FIN_SERVICE.NS",
         "Sensex": "^BSESN",
-        "Bankex": "BSE-BANK.BO"
+        "Bankex": "BSE-BANK.BO",
+        "All" : "All"
     }
 
 # Function to fetch real historical data from Yahoo Finance with error handling
@@ -154,7 +155,8 @@ methods = {
     "Markov Chain": markov_chain,
     "Statistical Confidence Intervals": statistical_confidence_intervals,
     "Option Pricing Model": option_pricing_model,
-    "Poisson Distribution": poisson_distribution
+    "Poisson Distribution": poisson_distribution,
+    "All" : "All"
 }
 selected_method = st.selectbox("Select Prediction Method", list(methods.keys()), index=len(methods)-1)  # Default to "All"
 
