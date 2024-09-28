@@ -143,14 +143,10 @@ prediction_date = st.date_input("Select Prediction Date", value=datetime.now())
 adjusted_prediction_date = adjust_to_next_trading_day(prediction_date)
 
 # Input for the period of data
-period_days = st.text_input("Select data period in days", value="365") # Replaced slider with text input
+period_days = st.slider("Select data period in days", min_value=30, max_value=365, value=365)
 
 # Calculate start date based on the period
-try:
-    period_days = int(period_days)
-    start_date = adjusted_prediction_date - timedelta(days=period_days)
-except ValueError:
-    st.error("Please enter a valid number of days.")
+start_date = adjusted_prediction_date - timedelta(days=period_days)
 
 # Dropdown for selecting the prediction method dynamically (default to "All")
 methods = {
@@ -181,37 +177,40 @@ if st.button("Predict"):
                 insights.append(f"Using Monte Carlo Simulation, we expect a predicted price of {pred:.2f}. Mean return: {mean_return:.4f}, Standard deviation: {std_return:.4f}.")
             elif method_name == "Bayesian Inference":
                 pred, mean_return, std_return = bayesian_inference(index_data)
-                insights.append(f"Using Bayesian Inference, we expect a predicted price of {pred:.2f}. Mean return: {mean_return:.4f}, Standard deviation: {std_return:.4f}.")
+                insights.append(f"Bayesian Inference suggests a predicted price of {pred:.2f}. Mean return: {mean_return:.4f}, Standard deviation: {std_return:.4f}.")
             elif method_name == "Markov Chain":
                 pred, current_state, next_state = markov_chain(index_data)
-                insights.append(f"Using Markov Chain, we expect a predicted price of {pred:.2f}. Current state: {current_state}, Next state: {next_state}.")
+                state_labels = ['Bearish', 'Neutral', 'Bullish']
+                insights.append(f"Markov Chain model predicts {pred:.2f}. Current state: {state_labels[current_state]}, Next state: {state_labels[next_state]}.")
             elif method_name == "Statistical Confidence Intervals":
-                pred, lower_bound, upper_bound = statistical_confidence_intervals(index_data, confidence_level)
-                insights.append(f"Using Statistical Confidence Intervals, we expect a predicted price of {pred:.2f}. Lower bound: {lower_bound:.4f}, Upper bound: {upper_bound:.4f}.")
+                pred, lower, upper = statistical_confidence_intervals(index_data, confidence_level)
+                insights.append(f"Confidence Interval prediction: {pred:.2f} with range [{lower:.4f}, {upper:.4f}].")
             elif method_name == "Option Pricing Model":
                 pred, volatility = option_pricing_model(index_data, risk_free_rate)
-                insights.append(f"Using Option Pricing Model, we expect a predicted price of {pred:.2f}. Volatility: {volatility:.4f}.")
+                insights.append(f"Option Pricing Model predicts {pred:.2f} with volatility: {volatility:.4f}.")
             elif method_name == "Poisson Distribution":
-                pred, event_magnitude = poisson_distribution(index_data, avg_event_rate)
-                insights.append(f"Using Poisson Distribution, we expect a predicted price of {pred:.2f}. Event magnitude: {event_magnitude:.4f}.")
+                pred, magnitude = poisson_distribution(index_data, avg_event_rate)
+                insights.append(f"Poisson Distribution predicts {pred:.2f} with event magnitude: {magnitude:.4f}.")
         except Exception as e:
-            insights.append(f"Error in {index_name} - {method_name}: {e}")
+            st.warning(f"Failed to predict for {index_name} using {method_name}. Reason: {str(e)}")
     
-    # Fetch data for all indices or selected one
+    # Fetch data for the selected index
     if selected_index == "All":
         for index_name, ticker in indices.items():
-            if ticker != "All":
-                index_data = fetch_index_data(ticker, start_date, adjusted_prediction_date)
-                if index_data is not None:
-                    generate_prediction(index_name, selected_method, index_data)
+            index_data = fetch_index_data(ticker, start_date, adjusted_prediction_date)
+            if index_data is not None:
+                for method_name in methods.keys():
+                    generate_prediction(index_name, method_name, index_data)
     else:
         ticker = indices[selected_index]
         index_data = fetch_index_data(ticker, start_date, adjusted_prediction_date)
         if index_data is not None:
-            generate_prediction(selected_index, selected_method, index_data)
-
-    # Display insights
-    if insights:
-        st.write("### Predictions:")
-        for insight in insights:
-            st.write(insight)
+            if selected_method == "All":
+                for method_name in methods.keys():
+                    generate_prediction(selected_index, method_name, index_data)
+            else:
+                generate_prediction(selected_index, selected_method, index_data)
+    
+    # Display the insights
+    for insight in insights:
+        st.write(insight)
