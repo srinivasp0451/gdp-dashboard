@@ -113,4 +113,4 @@ class Backtest:
 backtest = Backtest(nifty_data)
 backtest.scalping_strategy()
 trades_df = backtest.results()
-st.dataframe("Results:",trades_df)
+st.dataframe(trades_df)
