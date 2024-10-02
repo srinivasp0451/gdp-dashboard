@@ -12,5 +12,4 @@ scipy
 scikit-learn
 statsmodels
 seaborn
-youtube-transcript-api
-pytesseract
+pandas_ta
