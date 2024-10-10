@@ -84,6 +84,6 @@ if st.sidebar.button("Run Strategy"):
             plt.xlabel('Time')
             plt.ylabel('Price')
             plt.legend()
-            st.pyplot(plt)
+            #st.pyplot(plt)
 
 st.sidebar.button("Stop Program", on_click=lambda: st.stop())
