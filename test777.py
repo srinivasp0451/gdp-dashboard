@@ -6,7 +6,7 @@ import time
 import matplotlib.pyplot as plt
 
 # Function to fetch index data
-def fetch_data(ticker='^NSEI', period='1d', interval='1m'):
+def fetch_data(ticker='^NSEI', period='1d', interval='5m'):
     data = yf.download(ticker, period=period, interval=interval)
     return data
 
@@ -37,12 +37,12 @@ def generate_recommendation(data):
     
     if latest['Close'] > latest['Short_MA'] and latest['Short_MA'] > latest['Long_MA'] and latest['RSI'] < 70:
         reason = "Bullish crossover, RSI indicates potential upside."
-        recommendation = f"Buy at index {entry_price:.2f}, target {entry_price + target_points:.2f}, stop loss {entry_price - stop_loss_points:.2f}."
+        recommendation = f"Currently at {latest['Close'].2f}, Buy at index {entry_price:.2f}, target {entry_price + target_points:.2f}, stop loss {entry_price - stop_loss_points:.2f}."
         return recommendation, reason
 
     elif latest['Close'] < latest['Short_MA'] and latest['Short_MA'] < latest['Long_MA'] and latest['RSI'] > 30:
         reason = "Bearish crossover, RSI indicates potential downside."
-        recommendation = f"Sell at index {entry_price:.2f}, target {entry_price - target_points:.2f}, stop loss {entry_price + stop_loss_points:.2f}."
+        recommendation = f"Currently at {latest['Close'].2f}, Sell at index {entry_price:.2f}, target {entry_price - target_points:.2f}, stop loss {entry_price + stop_loss_points:.2f}."
         return recommendation, reason
 
     return "Hold", "No clear signal."
