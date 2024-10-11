@@ -37,12 +37,12 @@ def generate_recommendation(data):
     
     if latest['Close'] > latest['Short_MA'] and latest['Short_MA'] > latest['Long_MA'] and latest['RSI'] < 70:
         reason = "Bullish crossover, RSI indicates potential upside."
-        recommendation = f"Currently at {latest['Close']}, Buy at index {entry_price:.2f}, target {entry_price + target_points:.2f}, stop loss {entry_price - stop_loss_points:.2f}."
+        recommendation = f"Currently at {latest['Close']}, \n\n Buy at index {entry_price:.2f}, target {entry_price + target_points:.2f}, stop loss {entry_price - stop_loss_points:.2f}."
         return recommendation, reason
 
     elif latest['Close'] < latest['Short_MA'] and latest['Short_MA'] < latest['Long_MA'] and latest['RSI'] > 30:
         reason = "Bearish crossover, RSI indicates potential downside."
-        recommendation = f"Currently at {latest['Close']}, Sell at index {entry_price:.2f}, target {entry_price - target_points:.2f}, stop loss {entry_price + stop_loss_points:.2f}."
+        recommendation = f"Currently at {latest['Close']}, \n\n Sell at index {entry_price:.2f}, target {entry_price - target_points:.2f}, stop loss {entry_price + stop_loss_points:.2f}."
         return recommendation, reason
 
     return "Hold", "No clear signal."
