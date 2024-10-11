@@ -58,6 +58,17 @@ index_options = {
     "Midcap Nifty": "^NSEMCAP"
 }
 
+
+#indices = {
+#    "NIFTY 50": "^NSEI",
+#    "BANK NIFTY": "^NSEBANK",
+#    "FIN NIFTY": "NIFTY_FIN_SERVICE.NS",
+#    "MIDCAP NIFTY": "NIFTY_MID_SELECT.NS",
+#    "SENSEX": "^BSESN",
+#    "BANKEX": "BSE-BANK.BO",
+#    "ALL": "ALL"
+#}
+
 selected_index = st.sidebar.selectbox("Choose an index:", list(index_options.keys()))
 ticker = index_options[selected_index]
 
