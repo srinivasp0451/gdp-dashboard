@@ -102,6 +102,15 @@ def analyze_index(ticker):
         buy_signal = True
 
     # Sell conditions
+    #if (last_ema_9 < last_ema_21) and (rsi_value > 70) and (last_close > vwap_value) and (macd_value < signal_value) and (adx_value > 20):
+    #    sell_signal = True
+
+
+    # Buy conditions
+    if (last_ema_9 > last_ema_21) and (rsi_value < 30) and (last_close < vwap_value) and (macd_value > signal_value) and (adx_value > 20):
+        buy_signal = True
+
+    # Sell conditions
     if (last_ema_9 < last_ema_21) and (rsi_value > 70) and (last_close > vwap_value) and (macd_value < signal_value) and (adx_value > 20):
         sell_signal = True
 
