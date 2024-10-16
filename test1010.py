@@ -65,7 +65,6 @@ def backtest(data, stop_loss_pct=0.02, target_pct=0.05, exit_threshold=10):
             )
 
             if exit_condition:
-                # Record exit details
                 exit_price = data['Close'].iloc[i]
                 trades[-1].update({
                     'exit_date': data.index[i],
@@ -94,17 +93,11 @@ def backtest(data, stop_loss_pct=0.02, target_pct=0.05, exit_threshold=10):
                 'logic': 'RSI < 50 and Close < Lower Band + 10 and MACD > Signal Line'
             })
 
-    # Calculate final portfolio value
+    # Final portfolio value calculation
     final_value = cash + (position * data['Close'].iloc[-1]) if position > 0 else cash
 
     total_trades = profit_trades + loss_trades
     accuracy = (profit_trades / total_trades * 100) if total_trades > 0 else 0
-
-    # Debugging outputs
-    print("Final Cash:", cash)
-    print("Open Position Value:", position * data['Close'].iloc[-1] if position > 0 else 0)
-    print("Total Profit:", total_profit)
-    print("Total Loss:", total_loss)
 
     return final_value, trades, profit_trades, loss_trades, total_profit, total_loss, accuracy
 
@@ -156,7 +149,7 @@ def main():
             data = calculate_indicators(data)
             final_value, trades, profit_trades, loss_trades, total_profit, total_loss, accuracy = backtest(data)
 
-            st.write(f"Initial Portfolio Value: 100000")
+            st.write(f"Initial Portfolio Value: {100000:.2f}")  # Directly use initial capital value
             st.write(f"Final Portfolio Value: {final_value:.2f}")
             st.write(f"Total Trades: {profit_trades + loss_trades}")
             st.write(f"Profitable Trades: {profit_trades}")
