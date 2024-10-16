@@ -94,7 +94,7 @@ def backtest(data):
 def live_trading(symbol):
     st.write(f"Starting live trading for {symbol}...")
     while True:
-        data = fetch_recent_minute_data(symbol, datetime.now() - timedelta(days=7), datetime.now())
+        data = fetch_recent_minute_data(symbol)
 
         if not data.empty:
             data = calculate_indicators(data)
@@ -133,7 +133,7 @@ def main():
         end_date = st.date_input("End Date", datetime.now())
 
         if st.button("Run Backtest"):
-            data = fetch_recent_minute_data(symbol, start_date, end_date)
+            data = fetch_recent_minute_data(symbol)
             if data.empty:
                 st.write("No data found for the specified ticker.")
                 return
