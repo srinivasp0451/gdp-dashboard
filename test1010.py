@@ -32,7 +32,7 @@ def calculate_indicators(data):
     return data
 
 # Backtest the strategy with detailed logging
-def backtest(data):
+def backtest(data, stop_loss_pct=0.02, target_pct=0.05):
     initial_capital = 100000
     position = 0
     cash = initial_capital
@@ -52,11 +52,32 @@ def backtest(data):
             position < max_position_size
         )
 
-        exit_condition = (
-            data['RSI'].iloc[i] > 70 or
-            data['Close'].iloc[i] > data['Upper_Band'].iloc[i] or
-            data['MACD'].iloc[i] < data['Signal_Line'].iloc[i]
-        )
+        if position > 0:
+            entry_price = trades[-1]['entry_price']
+            stop_loss_price = entry_price * (1 - stop_loss_pct)
+            target_price = entry_price * (1 + target_pct)
+
+            exit_condition = (
+                data['Close'].iloc[i] <= stop_loss_price or
+                data['Close'].iloc[i] >= target_price or
+                data['MACD'].iloc[i] < data['Signal_Line'].iloc[i]
+            )
+
+            if exit_condition:
+                position -= 1
+                cash += data['Close'].iloc[i]
+                exit_price = data['Close'].iloc[i]
+                trades[-1].update({
+                    'exit_date': data.index[i],
+                    'exit_price': exit_price
+                })
+                profit_loss = exit_price - trades[-1]['entry_price']
+                if profit_loss > 0:
+                    profit_trades += 1
+                    total_profit += profit_loss
+                else:
+                    loss_trades += 1
+                    total_loss += abs(profit_loss)
 
         if entry_condition:
             position += 1
@@ -66,24 +87,6 @@ def backtest(data):
                 'entry_price': data['Close'].iloc[i],
                 'logic': 'RSI < 50 and Close < Lower Band + 10 and MACD > Signal Line'
             })
-
-        elif exit_condition and position > 0:
-            position -= 1
-            cash += data['Close'].iloc[i]
-            exit_price = data['Close'].iloc[i]
-            #st.write("data is ",data.index[i])
-            trades[-1].update({
-                'exit_date': data.index[i],
-                'exit_price': exit_price
-            })
-            #st.write("data is ",trades[-1]['exit_date'])
-            profit_loss = exit_price - trades[-1]['entry_price']
-            if profit_loss > 0:
-                profit_trades += 1
-                total_profit += profit_loss
-            else:
-                loss_trades += 1
-                total_loss += abs(profit_loss)
 
     final_value = cash + (position * data['Close'].iloc[-1]) if position > 0 else cash
 
@@ -131,9 +134,6 @@ def main():
     symbol = st.selectbox("Select Index", ['^NSEI', '^NSEBANK', '^BSESN', '^NSEMDCP', '^NSEBANKEX', '^NSEFIN'])
 
     if option == "Backtesting":
-        #start_date = st.date_input("Start Date", datetime.now() - timedelta(days=30))
-        #end_date = st.date_input("End Date", datetime.now())
-
         if st.button("Run Backtest"):
             data = fetch_recent_minute_data(symbol)
             if data.empty:
@@ -141,9 +141,9 @@ def main():
                 return
 
             data = calculate_indicators(data)
-            final_value, trades, profit_trades, loss_trades, total_profit, total_loss, accuracy = backtest(data)
+            final_value, trades, profit_trades, loss_trades, total_profit, total_loss, accuracy = backtest(data, stop_loss_pct=0.02, target_pct=0.05)
 
-            st.write(f"Initial Portfolio value 100000")
+            st.write(f"Initial Portfolio Value: {initial_capital:.2f}")
             st.write(f"Final Portfolio Value: {final_value:.2f}")
             st.write(f"Total Trades: {profit_trades + loss_trades}")
             st.write(f"Profitable Trades: {profit_trades}")
@@ -152,17 +152,7 @@ def main():
             st.write(f"Total Loss: {total_loss:.2f}")
             st.write(f"Accuracy: {accuracy:.2f}%")
 
-            #for trade in trades:
-                #st.write(trade)
-                #st.write(f"Trade Entry: {trade['entry_date']} at {trade['entry_price']:.2f}, "
-                         #f"Exit: {trade[-1].get('exit_date', 'N/A')} at {trade.get('exit_price', 'N/A'):.2f}, "
-                         #f"Exit: {trade['exit_date']} at trade['exit_price']:.2f, "
-                         #f"Exit: trade["exit_price"]:.2f,"
-                         #"Logic: {trade['logic']}"
-                        #)
-
             for trade in trades:
-                #st.write(trade)
                 exit_date = trade.get('exit_date', 'N/A')
                 exit_price = trade.get('exit_price', 'N/A')
     
@@ -171,7 +161,7 @@ def main():
 
                 st.write(f"Trade Entry: {trade['entry_date']} at {trade['entry_price']:.2f}, "
                          f"Exit: {exit_date} at {exit_price}, "
-                        f"Logic: {trade['logic']}")
+                         f"Logic: {trade['logic']}")
 
     elif option == "Live Trading":
         live_trading(symbol)
