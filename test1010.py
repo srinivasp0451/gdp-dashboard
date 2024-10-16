@@ -26,12 +26,9 @@ def fetch_daily_data(ticker, start_date, end_date):
     return yf.download(ticker, start=start_date, end=end_date)
 
 # Function to run backtesting
-def backtest_strategy(selected_ticker):
-    daily_start_date = '2020-01-01'
-    daily_end_date = '2023-01-01'
-
+def backtest_strategy(selected_ticker, start_date, end_date):
     # Fetch daily historical data
-    daily_data = fetch_daily_data(selected_ticker, daily_start_date, daily_end_date)
+    daily_data = fetch_daily_data(selected_ticker, start_date, end_date)
 
     # Fetch recent minute-level historical data
     recent_minute_data = fetch_recent_minute_data(selected_ticker)
@@ -45,6 +42,9 @@ def backtest_strategy(selected_ticker):
     trades = []
     stop_loss_points = 50  # 50 points stop loss
     target_points = 50  # 50 points target
+
+    if significant_moves.empty:
+        return "No clear signals found."
 
     for i in range(len(significant_moves) - 1):
         entry_price = significant_moves['Close'].iloc[i]
@@ -118,23 +118,30 @@ selected_ticker = tickers[selected_index]
 
 mode = st.radio("Select Mode", ('Live Trading', 'Backtesting'))
 
-if st.button("Run"):
-    if mode == 'Backtesting':
-        trades_df = backtest_strategy(selected_ticker)
-        st.write("Backtesting Results:")
-        st.dataframe(trades_df)
+if mode == 'Backtesting':
+    # Date selection for backtesting
+    start_date = st.date_input("Select Start Date", datetime(2020, 1, 1))
+    end_date = st.date_input("Select End Date", datetime.now())
 
-        # Calculate strategy performance
-        total_trades = len(trades_df)
-        wins = len(trades_df[trades_df['Trade_Result'] == 'Win'])
-        losses = len(trades_df[trades_df['Trade_Result'] == 'Loss'])
-        no_hits = len(trades_df[trades_df['Trade_Result'] == 'No Hit'])
+    if st.button("Run Backtest"):
+        trades_df = backtest_strategy(selected_ticker, start_date, end_date)
+        if isinstance(trades_df, str):  # Check if message string is returned
+            st.write(trades_df)  # Display no clear signals found message
+        else:
+            st.write("Backtesting Results:")
+            st.dataframe(trades_df)
 
-        st.write(f"Total Trades: {total_trades}")
-        st.write(f"Wins: {wins} ({(wins / total_trades * 100) if total_trades > 0 else 0:.2f}%)")
-        st.write(f"Losses: {losses} ({(losses / total_trades * 100) if total_trades > 0 else 0:.2f}%)")
-        st.write(f"No Hit: {no_hits} ({(no_hits / total_trades * 100) if total_trades > 0 else 0:.2f}%)")
+            # Calculate strategy performance
+            total_trades = len(trades_df)
+            wins = len(trades_df[trades_df['Trade_Result'] == 'Win'])
+            losses = len(trades_df[trades_df['Trade_Result'] == 'Loss'])
+            no_hits = len(trades_df[trades_df['Trade_Result'] == 'No Hit'])
 
-    elif mode == 'Live Trading':
-        st.write("Live Trading Mode Activated. Check the console for real-time updates.")
-        live_trading(selected_ticker)
+            st.write(f"Total Trades: {total_trades}")
+            st.write(f"Wins: {wins} ({(wins / total_trades * 100) if total_trades > 0 else 0:.2f}%)")
+            st.write(f"Losses: {losses} ({(losses / total_trades * 100) if total_trades > 0 else 0:.2f}%)")
+            st.write(f"No Hit: {no_hits} ({(no_hits / total_trades * 100) if total_trades > 0 else 0:.2f}%)")
+
+elif mode == 'Live Trading':
+    st.write("Live Trading Mode Activated. Check the console for real-time updates.")
+    live_trading(selected_ticker)
