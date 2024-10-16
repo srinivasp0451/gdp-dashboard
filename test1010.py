@@ -58,23 +58,27 @@ def backtest_strategy(selected_ticker, start_date, end_date):
 
         exit_price = None
         trade_result = None
+        exit_date = None
         for time, row in trade_data.iterrows():
             if row['Close'] >= target_price:
                 exit_price = target_price
+                exit_date = time
                 trade_result = 'Win'
                 break
             elif row['Close'] <= stop_loss_price:
                 exit_price = stop_loss_price
                 trade_result = 'Loss'
+                exit_date = time
                 break
         if trade_result is None:
             exit_price = trade_data['Close'].iloc[-1]
+            exit_date = trade_data.index[-1]
             trade_result = 'No Hit'
 
         trades.append({
             'Entry_Date': entry_date,
             'Entry_Price': entry_price,
-            'Exit_Date': trade_data.index[-1],
+            'Exit_Date': exit_date,
             'Exit_Price': exit_price,
             'Trade_Result': trade_result,
             'Points_Captured': exit_price - entry_price
