@@ -2,7 +2,6 @@ import yfinance as yf
 import pandas as pd
 from datetime import datetime, timedelta
 import streamlit as st
-import time
 
 # Define the tickers for various indices
 tickers = {
@@ -51,6 +50,8 @@ def backtest_strategy(selected_ticker, start_date, end_date):
     for i in range(1, len(daily_data)):
         row = daily_data.iloc[i]
         previous_row = daily_data.iloc[i - 1]
+
+        print(f"Evaluating: {row.name}, Close: {row['Close']}, Lower_BB: {row['Lower_BB']}, Upper_BB: {row['Upper_BB']}, RSI: {row['RSI']}, MACD: {row['MACD']}, MACD_Signal: {row['MACD_Signal']}")
 
         # Buy signal
         if (row['Close'] < row['Lower_BB'] and 
@@ -124,7 +125,6 @@ if mode == 'Backtesting':
         if trades_df.empty:
             st.write("No trades were generated during backtesting.")
         else:
-            # Display trades as a scrollable DataFrame
             st.write("Backtesting Results:")
             st.dataframe(trades_df)
 
@@ -154,4 +154,4 @@ elif mode == 'Live Trading':
 
     if st.session_state.run_live:
         st.write("Live Trading Mode Activated. Check the console for real-time updates.")
-        live_trading(selected_ticker)
+        # Add live trading logic if needed
