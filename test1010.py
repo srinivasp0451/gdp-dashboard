@@ -145,6 +145,7 @@ if mode == 'Backtesting':
 elif mode == 'Live Trading':
     st.write("Live Trading Mode Activated. Check the console for real-time updates.")
     live_trading(selected_ticker)
-# Button to stop live trading
-if st.button("Stop Live Trading"):
-    st.session_state.stop_clicked 
+    # Button to stop live trading
+    if st.button("Stop Live Trading"):
+        st.session_state.stop_clicked 
+
