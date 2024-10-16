@@ -41,43 +41,26 @@ def compute_daily_indicators(df):
     
     return df
 
-# Function to compute indicators for minute data
-def compute_minute_indicators(df):
-    df['EMA_9'] = df['Close'].ewm(span=9, adjust=False).mean()
-    df['EMA_21'] = df['Close'].ewm(span=21, adjust=False).mean()
-
-    # Calculate RSI
-    delta = df['Close'].diff()
-    gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
-    rs = gain / loss
-    df['RSI'] = 100 - (100 / (1 + rs))
-
-    # Calculate MACD
-    df['MACD'] = df['Close'].ewm(span=12, adjust=False).mean() - df['Close'].ewm(span=26, adjust=False).mean()
-    df['MACD_Signal'] = df['MACD'].ewm(span=9, adjust=False).mean()
-
-    # Calculate Bollinger Bands
-    df['Middle_BB'] = df['Close'].rolling(window=20).mean()
-    df['Upper_BB'] = df['Middle_BB'] + (df['Close'].rolling(window=20).std() * 2)
-    df['Lower_BB'] = df['Middle_BB'] - (df['Close'].rolling(window=20).std() * 2)
-
-    return df
-
 # Backtesting function
 def backtest_strategy(selected_ticker, start_date, end_date):
     daily_data = fetch_daily_data(selected_ticker, start_date, end_date)
     daily_data = compute_daily_indicators(daily_data)
-    
+
     trades = []
-    
+
     for i in range(1, len(daily_data)):
         row = daily_data.iloc[i]
         previous_row = daily_data.iloc[i - 1]
 
+        # Logging the values for debugging
+        st.write(f"Date: {row.name}, Close: {row['Close']}, EMA_9: {row['EMA_9']}, "
+                 f"EMA_21: {row['EMA_21']}, RSI: {row['RSI']}, "
+                 f"MACD: {row['MACD']}, MACD_Signal: {row['MACD_Signal']}, "
+                 f"Upper_BB: {row['Upper_BB']}, Lower_BB: {row['Lower_BB']}")
+
         # Buy signal
         if (row['Close'] < row['Lower_BB'] and 
-            row['RSI'] < 30 and 
+            row['RSI'] < 35 and  # Loosened condition
             previous_row['MACD'] < previous_row['MACD_Signal'] and 
             row['MACD'] > row['MACD_Signal']):
             entry_price = row['Close']
@@ -86,7 +69,7 @@ def backtest_strategy(selected_ticker, start_date, end_date):
 
         # Sell signal
         elif (row['Close'] > row['Upper_BB'] and 
-              row['RSI'] > 70 and 
+              row['RSI'] > 65 and  # Loosened condition
               previous_row['MACD'] > previous_row['MACD_Signal'] and 
               row['MACD'] < row['MACD_Signal']):
             entry_price = row['Close']
@@ -110,12 +93,12 @@ def live_trading(selected_ticker):
 
     while run_live:
         recent_data = fetch_recent_minute_data(selected_ticker)
-        recent_data = compute_minute_indicators(recent_data)
+        recent_data = compute_daily_indicators(recent_data)
         current_price = recent_data['Close'].iloc[-1]
 
         # Buy conditions
         if (current_price < recent_data['Lower_BB'].iloc[-1] and 
-            recent_data['RSI'].iloc[-1] < 30 and 
+            recent_data['RSI'].iloc[-1] < 35 and  # Loosened condition
             recent_data['MACD'].iloc[-1] > recent_data['MACD_Signal'].iloc[-1]):
             entry_price = current_price
             entry_date = recent_data.index[-1]
@@ -128,7 +111,7 @@ def live_trading(selected_ticker):
             while run_live:
                 time.sleep(60)  # Wait for the next minute to check exit conditions
                 recent_data = fetch_recent_minute_data(selected_ticker)
-                recent_data = compute_minute_indicators(recent_data)
+                recent_data = compute_daily_indicators(recent_data)
                 latest_price = recent_data['Close'].iloc[-1]
 
                 if latest_price >= target_price:
@@ -140,7 +123,7 @@ def live_trading(selected_ticker):
         
         # Sell conditions
         elif (current_price > recent_data['Upper_BB'].iloc[-1] and 
-              recent_data['RSI'].iloc[-1] > 70 and 
+              recent_data['RSI'].iloc[-1] > 65 and  # Loosened condition
               recent_data['MACD'].iloc[-1] < recent_data['MACD_Signal'].iloc[-1]):
             entry_price = current_price
             entry_date = recent_data.index[-1]
@@ -153,7 +136,7 @@ def live_trading(selected_ticker):
             while run_live:
                 time.sleep(60)  # Wait for the next minute to check exit conditions
                 recent_data = fetch_recent_minute_data(selected_ticker)
-                recent_data = compute_minute_indicators(recent_data)
+                recent_data = compute_daily_indicators(recent_data)
                 latest_price = recent_data['Close'].iloc[-1]
 
                 if latest_price <= target_price:
