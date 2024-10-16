@@ -162,7 +162,7 @@ def main():
                         #)
 
             for trade in trades:
-                st.write(trade)
+                #st.write(trade)
                 exit_date = trade.get('exit_date', 'N/A')
                 exit_price = trade.get('exit_price', 'N/A')
     
