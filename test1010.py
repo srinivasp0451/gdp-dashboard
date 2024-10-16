@@ -71,11 +71,12 @@ def backtest(data):
             position -= 1
             cash += data['Close'].iloc[i]
             exit_price = data['Close'].iloc[i]
-            st.write("data is ---",data.index[i])
+            #st.write("data is ",data.index[i])
             trades[-1].update({
                 'exit_date': data.index[i],
                 'exit_price': exit_price
             })
+            st.write("data is ",trades['exit_date'])
             profit_loss = exit_price - trades[-1]['entry_price']
             if profit_loss > 0:
                 profit_trades += 1
