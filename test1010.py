@@ -6,7 +6,9 @@ import time
 import streamlit as st
 
 # Function to fetch recent 1-minute data for a given ticker
-def fetch_recent_minute_data(ticker, start_date, end_date):
+def fetch_recent_minute_data(ticker):
+    end_date = datetime.now()
+    start_date = end_date - timedelta(days=7)
     return yf.download(ticker, start=start_date, end=end_date, interval='1m')
 
 # Calculate technical indicators
