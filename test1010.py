@@ -141,6 +141,7 @@ def main():
             data = calculate_indicators(data)
             final_value, trades, profit_trades, loss_trades, total_profit, total_loss, accuracy = backtest(data)
 
+            st.write(f"Initial Portfolio value 100000")
             st.write(f"Final Portfolio Value: {final_value:.2f}")
             st.write(f"Total Trades: {profit_trades + loss_trades}")
             st.write(f"Profitable Trades: {profit_trades}")
@@ -152,7 +153,7 @@ def main():
             for trade in trades:
                 st.write(f"Trade Entry: {trade['entry_date']} at {trade['entry_price']:.2f}, "
                          f"Exit: {trade.get('exit_date', 'N/A')} at {trade.get('exit_price', 'N/A'):.2f}, "
-                         "Logic: {trade['logic']}")
+                         )
 
     elif option == "Live Trading":
         live_trading(symbol)
