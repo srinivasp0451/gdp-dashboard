@@ -71,6 +71,7 @@ def backtest(data):
             position -= 1
             cash += data['Close'].iloc[i]
             exit_price = data['Close'].iloc[i]
+            st.write("data is ---",data.index[i])
             trades[-1].update({
                 'exit_date': data.index[i],
                 'exit_price': exit_price
@@ -153,7 +154,8 @@ def main():
             for trade in trades:
                 st.write(f"Trade Entry: {trade['entry_date']} at {trade['entry_price']:.2f}, "
                          #f"Exit: {trade.get('exit_date', 'N/A')} at {trade.get('exit_price', 'N/A'):.2f}, "
-                         f"Exit: {trade['exit_date']} at trade['exit_price']:.2f, "
+                         #f"Exit: {trade['exit_date']} at trade['exit_price']:.2f, "
+                         f"Exit: trade["exit_price"]:.2f,"
                          #"Logic: {trade['logic']}"
                         )
 
