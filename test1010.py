@@ -1,157 +1,144 @@
-import yfinance as yf
 import pandas as pd
+import numpy as np
+import yfinance as yf
 from datetime import datetime, timedelta
 import streamlit as st
+import time
 
-# Define the tickers for various indices
-tickers = {
-    "Nifty 50": '^NSEI',
-    "Bank Nifty": '^NSEBANK',
-    "Fin Nifty": '^NSEFIN',
-    "Midcap Nifty": '^NSEMCAP',
-    "Sensex": '^BSESN',
-    "Bankex": '^NSEBANKEX'
-}
-
-# Function to fetch daily data
-def fetch_daily_data(ticker, start_date, end_date):
-    return yf.download(ticker, start=start_date, end=end_date)
-
-# Function to compute indicators for daily data
-def compute_daily_indicators(df):
-    df['EMA_9'] = df['Close'].ewm(span=9, adjust=False).mean()
-    df['EMA_21'] = df['Close'].ewm(span=21, adjust=False).mean()
-    
-    # Calculate RSI
-    delta = df['Close'].diff()
-    gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
-    rs = gain / loss
-    df['RSI'] = 100 - (100 / (1 + rs))
-    
-    # Calculate MACD
-    df['MACD'] = df['Close'].ewm(span=12, adjust=False).mean() - df['Close'].ewm(span=26, adjust=False).mean()
-    df['MACD_Signal'] = df['MACD'].ewm(span=9, adjust=False).mean()
-    
-    # Calculate Bollinger Bands
-    df['Middle_BB'] = df['Close'].rolling(window=20).mean()
-    df['Upper_BB'] = df['Middle_BB'] + (df['Close'].rolling(window=20).std() * 2)
-    df['Lower_BB'] = df['Middle_BB'] - (df['Close'].rolling(window=20).std() * 2)
-    
-    return df
-
-# Backtesting function
-def backtest_strategy(selected_ticker, start_date, end_date):
-    daily_data = fetch_daily_data(selected_ticker, start_date, end_date)
-    daily_data = compute_daily_indicators(daily_data)
-
-    trades = []
-
-    for i in range(1, len(daily_data)):
-        row = daily_data.iloc[i]
-        previous_row = daily_data.iloc[i - 1]
-
-        print(f"Evaluating: {row.name}, Close: {row['Close']}, Lower_BB: {row['Lower_BB']}, Upper_BB: {row['Upper_BB']}, RSI: {row['RSI']}, MACD: {row['MACD']}, MACD_Signal: {row['MACD_Signal']}")
-
-        # Buy signal
-        if (row['Close'] < row['Lower_BB'] and 
-            row['RSI'] < 35 and 
-            previous_row['MACD'] < previous_row['MACD_Signal'] and 
-            row['MACD'] > row['MACD_Signal']):
-            entry_price = row['Close']
-            entry_date = row.name
-            trades.append({'Entry_Date': entry_date, 'Entry_Price': entry_price, 'Trade_Result': 'Buy', 'Exit_Price': None, 'Exit_Date': None, 'Points': None})
-
-        # Sell signal
-        elif (row['Close'] > row['Upper_BB'] and 
-              row['RSI'] > 65 and 
-              previous_row['MACD'] > previous_row['MACD_Signal'] and 
-              row['MACD'] < row['MACD_Signal']):
-            entry_price = row['Close']
-            entry_date = row.name
-            trades.append({'Entry_Date': entry_date, 'Entry_Price': entry_price, 'Trade_Result': 'Sell', 'Exit_Price': None, 'Exit_Date': None, 'Points': None})
-
-    # Simulate exits for trades
-    for trade in trades:
-        entry_price = trade['Entry_Price']
-        entry_date = trade['Entry_Date']
-        exit_price = None
-        exit_date = None
-
-        recent_data = fetch_recent_minute_data(selected_ticker)
-        target_price = entry_price + 50 if trade['Trade_Result'] == 'Buy' else entry_price - 50
-        stop_loss_price = entry_price - 50 if trade['Trade_Result'] == 'Buy' else entry_price + 50
-        
-        for time_index, row in recent_data.iterrows():
-            if (trade['Trade_Result'] == 'Buy' and row['Close'] >= target_price) or (trade['Trade_Result'] == 'Sell' and row['Close'] <= target_price):
-                exit_price = target_price
-                exit_date = time_index
-                break
-            elif (trade['Trade_Result'] == 'Buy' and row['Close'] <= stop_loss_price) or (trade['Trade_Result'] == 'Sell' and row['Close'] >= stop_loss_price):
-                exit_price = stop_loss_price
-                exit_date = time_index
-                break
-        
-        # Calculate points captured
-        if exit_price is not None:
-            trade['Exit_Price'] = exit_price
-            trade['Exit_Date'] = exit_date
-            trade['Points'] = exit_price - entry_price
-    
-    trades_df = pd.DataFrame(trades)
-    return trades_df
-
-# Function to fetch recent minute-level data
+# Function to fetch recent 1-minute data for a given ticker
 def fetch_recent_minute_data(ticker):
     end_date = datetime.now()
     start_date = end_date - timedelta(days=7)
     return yf.download(ticker, start=start_date, end=end_date, interval='1m')
 
-# Streamlit UI
-st.title("Trading Strategy Application")
+# Calculate technical indicators
+def calculate_indicators(data):
+    data['EMA_12'] = data['Close'].ewm(span=12, adjust=False).mean()
+    data['EMA_26'] = data['Close'].ewm(span=26, adjust=False).mean()
+    delta = data['Close'].diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+    rs = gain / loss
+    data['RSI'] = 100 - (100 / (1 + rs))
+    data['MACD'] = data['EMA_12'] - data['EMA_26']
+    data['Signal_Line'] = data['MACD'].ewm(span=9, adjust=False).mean()
+    data['Middle_Band'] = data['Close'].rolling(window=20).mean()
+    data['Upper_Band'] = data['Middle_Band'] + (data['Close'].rolling(window=20).std() * 2)
+    data['Lower_Band'] = data['Middle_Band'] - (data['Close'].rolling(window=20).std() * 2)
+    return data
 
-selected_index = st.selectbox("Select Index", list(tickers.keys()))
-selected_ticker = tickers[selected_index]
+# Identify multiple support and resistance levels
+def identify_support_resistance(data):
+    data['Support1'] = data['Low'].rolling(window=50).min()
+    data['Resistance1'] = data['High'].rolling(window=50).max()
+    pivots = (data['High'] + data['Low'] + data['Close']) / 3
+    data['Pivot'] = pivots
+    data['Support2'] = 2 * pivots - data['High']
+    data['Resistance2'] = 2 * pivots - data['Low']
+    data['Support3'] = data['Support1'].rolling(window=100).min()
+    data['Resistance3'] = data['Resistance1'].rolling(window=100).max()
+    data['Support4'] = data['Support2'].rolling(window=100).min()
+    data['Resistance4'] = data['Resistance2'].rolling(window=100).max()
+    return data
 
-mode = st.radio("Select Mode", ('Backtesting', 'Live Trading'))
+# Backtest the strategy
+def backtest(data):
+    initial_capital = 100000
+    position = 0
+    cash = initial_capital
+    max_position_size = 10
+    trades = []
+    profit_trades = 0
+    loss_trades = 0
+    total_profit = 0
+    total_loss = 0
 
-if mode == 'Backtesting':
-    start_date = st.date_input("Select Start Date", datetime(2020, 1, 1))
-    end_date = st.date_input("Select End Date", datetime.now())
+    for i in range(1, len(data)):
+        entry_condition = (
+            data['RSI'].iloc[i] < 50 and
+            data['Close'].iloc[i] < data['Lower_Band'].iloc[i] + 10 and
+            data['MACD'].iloc[i] > data['Signal_Line'].iloc[i] and
+            position < max_position_size
+        )
+        exit_condition = (
+            data['RSI'].iloc[i] > 70 or
+            data['Close'].iloc[i] > data['Upper_Band'].iloc[i] or
+            data['MACD'].iloc[i] < data['Signal_Line'].iloc[i]
+        )
 
-    if st.button("Run Backtest"):
-        trades_df = backtest_strategy(selected_ticker, start_date, end_date)
-        
-        if trades_df.empty:
-            st.write("No trades were generated during backtesting.")
-        else:
-            st.write("Backtesting Results:")
-            st.dataframe(trades_df)
+        if entry_condition:
+            position += 1
+            cash -= data['Close'].iloc[i]
+            trades.append({
+                'entry_date': data.index[i],
+                'entry_price': data['Close'].iloc[i],
+                'logic': 'RSI < 50 and Close < Lower Band + 10 and MACD > Signal Line'
+            })
+        elif exit_condition and position > 0:
+            position -= 1
+            cash += data['Close'].iloc[i]
+            exit_price = data['Close'].iloc[i]
+            trades[-1].update({
+                'exit_date': data.index[i],
+                'exit_price': exit_price
+            })
+            profit_loss = exit_price - trades[-1]['entry_price']
+            if profit_loss > 0:
+                profit_trades += 1
+                total_profit += profit_loss
+            else:
+                loss_trades += 1
+                total_loss += abs(profit_loss)
 
-            # Summary of results
-            total_trades = len(trades_df)
-            total_profit = trades_df['Points'].sum() if not trades_df['Points'].isnull().all() else 0
-            total_loss = trades_df['Points'].dropna().where(lambda x: x < 0).sum()
-            total_profitable_trades = len(trades_df[trades_df['Points'] > 0])
-            total_loss_trades = len(trades_df[trades_df['Points'] <= 0])
-            accuracy = (total_profitable_trades / total_trades * 100) if total_trades > 0 else 0
+    final_value = cash + (position * data['Close'].iloc[-1]) if position > 0 else cash
+    return final_value
 
-            st.write("Summary of Results:")
-            st.write(f"Total Trades: {total_trades}")
-            st.write(f"Total Profit: {total_profit:.2f}")
-            st.write(f"Total Loss: {total_loss:.2f}")
-            st.write(f"Total Profitable Trades: {total_profitable_trades}")
-            st.write(f"Total Loss Trades: {total_loss_trades}")
-            st.write(f"Accuracy: {accuracy:.2f}%")
+# Generate live trading signals
+def live_trading(symbol):
+    st.write("Starting live trading recommendations...")
+    while True:
+        data = fetch_recent_minute_data(symbol)
+        if not data.empty:
+            data = calculate_indicators(data)
+            last_row = data.iloc[-1]
+            entry_condition = (
+                last_row['RSI'] < 50 and
+                last_row['Close'] < last_row['Lower_Band'] + 10 and
+                last_row['MACD'] > last_row['Signal_Line']
+            )
+            exit_condition = (
+                last_row['RSI'] > 70 or
+                last_row['Close'] > last_row['Upper_Band'] or
+                last_row['MACD'] < last_row['Signal_Line']
+            )
+            if entry_condition:
+                st.write("Recommendation: Buy")
+            elif exit_condition:
+                st.write("Recommendation: Sell")
+            else:
+                st.write("Recommendation: Hold")
+        time.sleep(60)
 
-elif mode == 'Live Trading':
-    if 'run_live' not in st.session_state:
-        st.session_state.run_live = True
+# Main function
+def main():
+    st.title("Trading Strategy Dashboard")
+    
+    mode = st.radio("Select Mode", ("Backtesting", "Live Trading"))
+    symbol = st.selectbox("Select Index", ['^NSEI', '^NSEBANK', '^BSESN', '^NSEMDCP', '^NSEBANKEX', '^NSEFIN'])
 
-    if st.button("Stop Live Trading"):
-        st.session_state.run_live = False
-        st.write("Live trading has been stopped.")
+    if mode == "Backtesting":
+        data = fetch_recent_minute_data(symbol)
+        if data.empty:
+            st.write("No data found for the specified ticker.")
+            return
 
-    if st.session_state.run_live:
-        st.write("Live Trading Mode Activated. Check the console for real-time updates.")
-        # Add live trading logic if needed
+        data = calculate_indicators(data)
+        data = identify_support_resistance(data)
+        final_value = backtest(data)
+        st.write(f"Final Portfolio Value: {final_value:.2f}")
+
+    elif mode == "Live Trading":
+        live_trading(symbol)
+
+if __name__ == "__main__":
+    main()
