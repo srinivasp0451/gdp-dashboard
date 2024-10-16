@@ -152,8 +152,8 @@ def main():
 
             for trade in trades:
                 st.write(f"Trade Entry: {trade['entry_date']} at {trade['entry_price']:.2f}, "
-                         f"Exit: {trade.get('exit_date', 'N/A')} at {trade.get('exit_price', 'N/A'):.2f}, "
-                         )
+                         #f"Exit: {trade.get('exit_date', 'N/A')} at {trade.get('exit_price', 'N/A'):.2f}, "
+                         "Logic: {trade['logic']}")
 
     elif option == "Live Trading":
         live_trading(symbol)
