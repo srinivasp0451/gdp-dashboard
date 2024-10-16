@@ -129,8 +129,8 @@ def main():
     symbol = st.selectbox("Select Index", ['^NSEI', '^NSEBANK', '^BSESN', '^NSEMDCP', '^NSEBANKEX', '^NSEFIN'])
 
     if option == "Backtesting":
-        start_date = st.date_input("Start Date", datetime.now() - timedelta(days=30))
-        end_date = st.date_input("End Date", datetime.now())
+        #start_date = st.date_input("Start Date", datetime.now() - timedelta(days=30))
+        #end_date = st.date_input("End Date", datetime.now())
 
         if st.button("Run Backtest"):
             data = fetch_recent_minute_data(symbol)
