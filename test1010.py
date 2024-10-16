@@ -1,6 +1,5 @@
 import yfinance as yf
 import pandas as pd
-import matplotlib.pyplot as plt
 from datetime import datetime, timedelta
 import streamlit as st
 import time
@@ -26,7 +25,7 @@ def fetch_daily_data(ticker, start_date, end_date):
     return yf.download(ticker, start=start_date, end=end_date)
 
 # Function to run backtesting
-def backtest_strategy(selected_ticker, start_date, end_date):
+def backtest_strategy(selected_ticker, start_date, end_date, target_points):
     # Fetch daily historical data
     daily_data = fetch_daily_data(selected_ticker, start_date, end_date)
 
@@ -40,8 +39,7 @@ def backtest_strategy(selected_ticker, start_date, end_date):
     significant_moves = daily_data[abs(daily_data['Price_Change']) >= 50]
 
     trades = []
-    stop_loss_points = 50  # 50 points stop loss
-    target_points = 50  # 50 points target
+    stop_loss_points = target_points // 2  # Stop loss is half of the target
 
     if significant_moves.empty:
         return "No clear signals found."
@@ -53,20 +51,29 @@ def backtest_strategy(selected_ticker, start_date, end_date):
             entry_date = entry_date.tz_localize('Asia/Kolkata')
 
         trade_data = recent_minute_data[recent_minute_data.index >= entry_date]
-        target_price = entry_price + target_points
-        stop_loss_price = entry_price - stop_loss_points
+        
+        if significant_moves['Price_Change'].iloc[i] > 0:  # Bullish signal
+            target_price = entry_price + target_points
+            trade_type = 'Buy'
+        else:  # Bearish signal
+            target_price = entry_price - target_points
+            trade_type = 'Sell'
+
+        stop_loss_price = entry_price - stop_loss_points if trade_type == 'Buy' else entry_price + stop_loss_points
 
         exit_price = None
         trade_result = None
+
         for time, row in trade_data.iterrows():
-            if row['Close'] >= target_price:
+            if (trade_type == 'Buy' and row['Close'] >= target_price) or (trade_type == 'Sell' and row['Close'] <= target_price):
                 exit_price = target_price
                 trade_result = 'Win'
                 break
-            elif row['Close'] <= stop_loss_price:
+            elif (trade_type == 'Buy' and row['Close'] <= stop_loss_price) or (trade_type == 'Sell' and row['Close'] >= stop_loss_price):
                 exit_price = stop_loss_price
                 trade_result = 'Loss'
                 break
+
         if trade_result is None:
             exit_price = trade_data['Close'].iloc[-1]
             trade_result = 'No Hit'
@@ -74,6 +81,9 @@ def backtest_strategy(selected_ticker, start_date, end_date):
         trades.append({
             'Entry_Date': entry_date,
             'Entry_Price': entry_price,
+            'Trade_Type': trade_type,
+            'Target_Price': target_price,
+            'Stop_Loss_Price': stop_loss_price,
             'Exit_Date': trade_data.index[-1],
             'Exit_Price': exit_price,
             'Trade_Result': trade_result,
@@ -84,14 +94,15 @@ def backtest_strategy(selected_ticker, start_date, end_date):
     return trades_df
 
 # Function for live trading (simplified version)
-def live_trading(selected_ticker):
-    stop_loss_points = 50  # 50 points stop loss
-    target_points = 50  # 50 points target
+def live_trading(selected_ticker, target_points):
+    stop_loss_points = target_points // 2  # Stop loss is half of the target
     while True:
         recent_minute_data = fetch_recent_minute_data(selected_ticker)
         current_price = recent_minute_data['Close'].iloc[-1]
         entry_price = current_price
         entry_date = recent_minute_data.index[-1]
+
+        # For demonstration, assume a bullish scenario
         target_price = entry_price + target_points
         stop_loss_price = entry_price - stop_loss_points
 
@@ -117,6 +128,7 @@ selected_index = st.selectbox("Select Index", list(tickers.keys()))
 selected_ticker = tickers[selected_index]
 
 mode = st.radio("Select Mode", ('Live Trading', 'Backtesting'))
+target_points = st.number_input("Target Points", min_value=50, value=50)
 
 if mode == 'Backtesting':
     # Date selection for backtesting
@@ -124,7 +136,7 @@ if mode == 'Backtesting':
     end_date = st.date_input("Select End Date", datetime.now())
 
     if st.button("Run Backtest"):
-        trades_df = backtest_strategy(selected_ticker, start_date, end_date)
+        trades_df = backtest_strategy(selected_ticker, start_date, end_date, target_points)
         if isinstance(trades_df, str):  # Check if message string is returned
             st.write(trades_df)  # Display no clear signals found message
         else:
@@ -144,4 +156,4 @@ if mode == 'Backtesting':
 
 elif mode == 'Live Trading':
     st.write("Live Trading Mode Activated. Check the console for real-time updates.")
-    live_trading(selected_ticker)
+    live_trading(selected_ticker, target_points)
