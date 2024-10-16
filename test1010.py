@@ -143,7 +143,7 @@ def main():
             data = calculate_indicators(data)
             final_value, trades, profit_trades, loss_trades, total_profit, total_loss, accuracy = backtest(data, stop_loss_pct=0.02, target_pct=0.05)
 
-            st.write(f"Initial Portfolio Value: {initial_capital:.2f}")
+            st.write(f"Initial Portfolio Value: 100000")
             st.write(f"Final Portfolio Value: {final_value:.2f}")
             st.write(f"Total Trades: {profit_trades + loss_trades}")
             st.write(f"Profitable Trades: {profit_trades}")
