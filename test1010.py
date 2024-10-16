@@ -6,9 +6,7 @@ import time
 import streamlit as st
 
 # Function to fetch recent 1-minute data for a given ticker
-def fetch_recent_minute_data(ticker):
-    end_date = datetime.now()
-    start_date = end_date - timedelta(days=7)
+def fetch_recent_minute_data(ticker, start_date, end_date):
     return yf.download(ticker, start=start_date, end=end_date, interval='1m')
 
 # Calculate technical indicators
@@ -36,7 +34,7 @@ def backtest(data):
     initial_capital = 100000
     position = 0
     cash = initial_capital
-    max_position_size = 10  # Maximum number of contracts or shares
+    max_position_size = 10
 
     trades = []
     profit_trades = 0
@@ -84,13 +82,17 @@ def backtest(data):
                 total_loss += abs(profit_loss)
 
     final_value = cash + (position * data['Close'].iloc[-1]) if position > 0 else cash
-    return final_value, trades, profit_trades, loss_trades, total_profit, total_loss
+
+    total_trades = profit_trades + loss_trades
+    accuracy = (profit_trades / total_trades * 100) if total_trades > 0 else 0
+
+    return final_value, trades, profit_trades, loss_trades, total_profit, total_loss, accuracy
 
 # Generate live trading recommendations
 def live_trading(symbol):
     st.write(f"Starting live trading for {symbol}...")
     while True:
-        data = fetch_recent_minute_data(symbol)
+        data = fetch_recent_minute_data(symbol, datetime.now() - timedelta(days=7), datetime.now())
 
         if not data.empty:
             data = calculate_indicators(data)
@@ -125,25 +127,30 @@ def main():
     symbol = st.selectbox("Select Index", ['^NSEI', '^NSEBANK', '^BSESN', '^NSEMDCP', '^NSEBANKEX', '^NSEFIN'])
 
     if option == "Backtesting":
-        data = fetch_recent_minute_data(symbol)
-        if data.empty:
-            st.write("No data found for the specified ticker.")
-            return
+        start_date = st.date_input("Start Date", datetime.now() - timedelta(days=30))
+        end_date = st.date_input("End Date", datetime.now())
 
-        data = calculate_indicators(data)
-        final_value, trades, profit_trades, loss_trades, total_profit, total_loss = backtest(data)
+        if st.button("Run Backtest"):
+            data = fetch_recent_minute_data(symbol, start_date, end_date)
+            if data.empty:
+                st.write("No data found for the specified ticker.")
+                return
 
-        st.write(f"Final Portfolio Value: {final_value:.2f}")
-        st.write(f"Total Trades: {profit_trades + loss_trades}")
-        st.write(f"Profitable Trades: {profit_trades}")
-        st.write(f"Loss Trades: {loss_trades}")
-        st.write(f"Total Profit: {total_profit:.2f}")
-        st.write(f"Total Loss: {total_loss:.2f}")
+            data = calculate_indicators(data)
+            final_value, trades, profit_trades, loss_trades, total_profit, total_loss, accuracy = backtest(data)
 
-        for trade in trades:
-            st.write(f"Trade Entry: {trade['entry_date']} at {trade['entry_price']:.2f}, "
-                     f"Exit: {trade.get('exit_date', 'N/A')} at {trade.get('exit_price', 'N/A'):.2f}, "
-                     f"Logic: {trade['logic']}")
+            st.write(f"Final Portfolio Value: {final_value:.2f}")
+            st.write(f"Total Trades: {profit_trades + loss_trades}")
+            st.write(f"Profitable Trades: {profit_trades}")
+            st.write(f"Loss Trades: {loss_trades}")
+            st.write(f"Total Profit: {total_profit:.2f}")
+            st.write(f"Total Loss: {total_loss:.2f}")
+            st.write(f"Accuracy: {accuracy:.2f}%")
+
+            for trade in trades:
+                st.write(f"Trade Entry: {trade['entry_date']} at {trade['entry_price']:.2f}, "
+                         f"Exit: {trade.get('exit_date', 'N/A')} at {trade.get('exit_price', 'N/A'):.2f}, "
+                         "Logic: {trade['logic']}")
 
     elif option == "Live Trading":
         live_trading(symbol)
