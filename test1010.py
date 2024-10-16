@@ -1,10 +1,9 @@
 import yfinance as yf
 import pandas as pd
 import numpy as np
-import matplotlib.pyplot as plt
-import streamlit as st
 import talib as ta
 from datetime import datetime, timedelta
+import streamlit as st
 import time
 
 # Define the tickers for various indices
@@ -40,19 +39,21 @@ def backtest_strategy(selected_ticker, start_date, end_date):
         row = daily_data.iloc[i]
         previous_row = daily_data.iloc[i-1]
 
+        # Buy signal
         if (row['Close'] > row['EMA_9'] and row['Close'] < row['Lower_BB'] and 
             row['RSI'] < 30 and previous_row['MACD'] < previous_row['MACD_Signal'] and 
             row['MACD'] > row['MACD_Signal']):
-            # Buy signal
             entry_price = row['Close']
-            trades.append({'Entry_Date': row.name, 'Entry_Price': entry_price, 'Trade_Result': 'Win'})
-        
+            entry_date = row.name
+            trades.append({'Entry_Date': entry_date, 'Entry_Price': entry_price, 'Trade_Result': 'Buy'})
+
+        # Sell signal
         elif (row['Close'] < row['EMA_21'] and row['Close'] > row['Upper_BB'] and 
               row['RSI'] > 70 and previous_row['MACD'] > previous_row['MACD_Signal'] and 
               row['MACD'] < row['MACD_Signal']):
-            # Sell signal
             entry_price = row['Close']
-            trades.append({'Entry_Date': row.name, 'Entry_Price': entry_price, 'Trade_Result': 'Loss'})
+            entry_date = row.name
+            trades.append({'Entry_Date': entry_date, 'Entry_Price': entry_price, 'Trade_Result': 'Sell'})
 
     trades_df = pd.DataFrame(trades)
     return trades_df
@@ -71,6 +72,13 @@ def live_trading(selected_ticker):
     
     while run_live:
         recent_data = fetch_recent_minute_data(selected_ticker)
+        
+        # Ensure the recent data is sufficient
+        if len(recent_data) < 2:
+            st.write("Not enough data for trading.")
+            time.sleep(60)
+            continue
+        
         current_price = recent_data['Close'].iloc[-1]
         
         # Buy conditions
@@ -81,7 +89,21 @@ def live_trading(selected_ticker):
             entry_date = recent_data.index[-1]
             target_price = entry_price + target_points
             stop_loss_price = entry_price - stop_loss_points
+            
             st.write(f"Buy Signal: Entry Price: {entry_price}, Target: {target_price}, Stop Loss: {stop_loss_price}")
+
+            # Exit logic
+            while run_live:
+                time.sleep(60)  # Wait for the next minute to check exit conditions
+                recent_data = fetch_recent_minute_data(selected_ticker)
+                latest_price = recent_data['Close'].iloc[-1]
+
+                if latest_price >= target_price:
+                    st.write(f"Trade Result: Win, Exit Price: {latest_price} on {recent_data.index[-1]}")
+                    break
+                elif latest_price <= stop_loss_price:
+                    st.write(f"Trade Result: Loss, Exit Price: {latest_price} on {recent_data.index[-1]}")
+                    break
         
         # Sell conditions
         elif (current_price < recent_data['EMA_21'].iloc[-1] and 
@@ -91,9 +113,21 @@ def live_trading(selected_ticker):
             entry_date = recent_data.index[-1]
             target_price = entry_price - target_points
             stop_loss_price = entry_price + stop_loss_points
+            
             st.write(f"Sell Signal: Entry Price: {entry_price}, Target: {target_price}, Stop Loss: {stop_loss_price}")
 
-        time.sleep(60)  # Wait for the next minute to check exit conditions
+            # Exit logic
+            while run_live:
+                time.sleep(60)  # Wait for the next minute to check exit conditions
+                recent_data = fetch_recent_minute_data(selected_ticker)
+                latest_price = recent_data['Close'].iloc[-1]
+
+                if latest_price <= target_price:
+                    st.write(f"Trade Result: Win, Exit Price: {latest_price} on {recent_data.index[-1]}")
+                    break
+                elif latest_price >= stop_loss_price:
+                    st.write(f"Trade Result: Loss, Exit Price: {latest_price} on {recent_data.index[-1]}")
+                    break
 
 # Streamlit UI
 st.title("Trading Strategy Application")
@@ -114,8 +148,8 @@ if mode == 'Backtesting':
 
         # Performance metrics
         total_trades = len(trades_df)
-        wins = len(trades_df[trades_df['Trade_Result'] == 'Win'])
-        losses = len(trades_df[trades_df['Trade_Result'] == 'Loss'])
+        wins = len(trades_df[trades_df['Trade_Result'] == 'Buy'])
+        losses = len(trades_df[trades_df['Trade_Result'] == 'Sell'])
 
         st.write(f"Total Trades: {total_trades}")
         st.write(f"Wins: {wins} ({(wins / total_trades * 100) if total_trades > 0 else 0:.2f}%)")
