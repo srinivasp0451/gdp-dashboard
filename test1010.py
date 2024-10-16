@@ -36,7 +36,6 @@ def backtest(data, stop_loss_pct=0.02, target_pct=0.05, exit_threshold=10):
     initial_capital = 100000
     position = 0
     cash = initial_capital
-    max_position_size = 10
 
     trades = []
     profit_trades = 0
@@ -49,9 +48,10 @@ def backtest(data, stop_loss_pct=0.02, target_pct=0.05, exit_threshold=10):
             data['RSI'].iloc[i] < 50 and
             data['Close'].iloc[i] < data['Lower_Band'].iloc[i] + 10 and
             data['MACD'].iloc[i] > data['Signal_Line'].iloc[i] and
-            position < max_position_size
+            position < 10  # Max position size
         )
 
+        # Check for exit conditions if in position
         if position > 0:
             entry_price = trades[-1]['entry_price']
             stop_loss_price = entry_price * (1 - stop_loss_pct)
@@ -65,14 +65,18 @@ def backtest(data, stop_loss_pct=0.02, target_pct=0.05, exit_threshold=10):
             )
 
             if exit_condition:
-                position -= 1
-                cash += data['Close'].iloc[i]
+                # Record exit details
                 exit_price = data['Close'].iloc[i]
                 trades[-1].update({
                     'exit_date': data.index[i],
                     'exit_price': exit_price
                 })
-                profit_loss = exit_price - trades[-1]['entry_price']
+
+                position -= 1
+                cash += exit_price  # Add exit price to cash
+
+                # Calculate profit/loss
+                profit_loss = exit_price - entry_price
                 if profit_loss > 0:
                     profit_trades += 1
                     total_profit += profit_loss
@@ -80,6 +84,7 @@ def backtest(data, stop_loss_pct=0.02, target_pct=0.05, exit_threshold=10):
                     loss_trades += 1
                     total_loss += abs(profit_loss)
 
+        # Check for entry condition
         if entry_condition:
             position += 1
             cash -= data['Close'].iloc[i]
@@ -89,6 +94,7 @@ def backtest(data, stop_loss_pct=0.02, target_pct=0.05, exit_threshold=10):
                 'logic': 'RSI < 50 and Close < Lower Band + 10 and MACD > Signal Line'
             })
 
+    # Calculate final portfolio value
     final_value = cash + (position * data['Close'].iloc[-1]) if position > 0 else cash
 
     total_trades = profit_trades + loss_trades
@@ -142,7 +148,7 @@ def main():
                 return
 
             data = calculate_indicators(data)
-            final_value, trades, profit_trades, loss_trades, total_profit, total_loss, accuracy = backtest(data, stop_loss_pct=0.02, target_pct=0.05, exit_threshold=10)
+            final_value, trades, profit_trades, loss_trades, total_profit, total_loss, accuracy = backtest(data)
 
             st.write(f"Initial Portfolio Value: 100000")
             st.write(f"Final Portfolio Value: {final_value:.2f}")
@@ -156,7 +162,7 @@ def main():
             for trade in trades:
                 exit_date = trade.get('exit_date', 'N/A')
                 exit_price = trade.get('exit_price', 'N/A')
-    
+
                 if exit_price != 'N/A':
                     exit_price = f"{exit_price:.2f}"
 
