@@ -1,7 +1,5 @@
 import yfinance as yf
 import pandas as pd
-import numpy as np
-import talib as ta
 from datetime import datetime, timedelta
 import streamlit as st
 import time
@@ -22,11 +20,13 @@ def fetch_daily_data(ticker, start_date, end_date):
 
 # Function to compute indicators
 def compute_indicators(df):
-    df['EMA_9'] = ta.EMA(df['Close'], timeperiod=9)
-    df['EMA_21'] = ta.EMA(df['Close'], timeperiod=21)
-    df['RSI'] = ta.RSI(df['Close'], timeperiod=14)
-    df['MACD'], df['MACD_Signal'], _ = ta.MACD(df['Close'], fastperiod=12, slowperiod=26, signalperiod=9)
-    df['Upper_BB'], df['Middle_BB'], df['Lower_BB'] = ta.BBANDS(df['Close'], timeperiod=20, nbdevup=2, nbdevdn=2, matype=0)
+    df['EMA_9'] = df['Close'].ewm(span=9, adjust=False).mean()
+    df['EMA_21'] = df['Close'].ewm(span=21, adjust=False).mean()
+    df['RSI'] = (df['Close'].diff(1) > 0).rolling(window=14).mean() / df['Close'].rolling(window=14).mean() * 100
+    df['MACD'] = df['Close'].ewm(span=12, adjust=False).mean() - df['Close'].ewm(span=26, adjust=False).mean()
+    df['MACD_Signal'] = df['MACD'].ewm(span=9, adjust=False).mean()
+    df['Upper_BB'] = df['Close'].rolling(window=20).mean() + (df['Close'].rolling(window=20).std() * 2)
+    df['Lower_BB'] = df['Close'].rolling(window=20).mean() - (df['Close'].rolling(window=20).std() * 2)
     return df
 
 # Backtesting function
@@ -35,6 +35,7 @@ def backtest_strategy(selected_ticker, start_date, end_date):
     daily_data = compute_indicators(daily_data)
 
     trades = []
+    
     for i in range(1, len(daily_data)):
         row = daily_data.iloc[i]
         previous_row = daily_data.iloc[i-1]
@@ -69,18 +70,11 @@ def live_trading(selected_ticker):
     stop_loss_points = 50
     target_points = 50
     run_live = st.session_state.get('run_live', True)
-    
+
     while run_live:
         recent_data = fetch_recent_minute_data(selected_ticker)
-        
-        # Ensure the recent data is sufficient
-        if len(recent_data) < 2:
-            st.write("Not enough data for trading.")
-            time.sleep(60)
-            continue
-        
         current_price = recent_data['Close'].iloc[-1]
-        
+
         # Buy conditions
         if (current_price > recent_data['EMA_9'].iloc[-1] and 
             recent_data['RSI'].iloc[-1] < 30 and 
@@ -148,11 +142,13 @@ if mode == 'Backtesting':
 
         # Performance metrics
         total_trades = len(trades_df)
-        wins = len(trades_df[trades_df['Trade_Result'] == 'Buy'])
-        losses = len(trades_df[trades_df['Trade_Result'] == 'Sell'])
+        wins = len(trades_df[trades_df['Trade_Result'] == 'Buy']) + len(trades_df[trades_df['Trade_Result'] == 'Sell'])
+        losses = total_trades - wins
+
+        accuracy = (wins / total_trades * 100) if total_trades > 0 else 0
 
         st.write(f"Total Trades: {total_trades}")
-        st.write(f"Wins: {wins} ({(wins / total_trades * 100) if total_trades > 0 else 0:.2f}%)")
+        st.write(f"Wins: {wins} ({accuracy:.2f}%)")
         st.write(f"Losses: {losses} ({(losses / total_trades * 100) if total_trades > 0 else 0:.2f}%)")
 
 elif mode == 'Live Trading':
