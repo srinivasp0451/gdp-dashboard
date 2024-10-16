@@ -52,30 +52,51 @@ def backtest_strategy(selected_ticker, start_date, end_date):
         row = daily_data.iloc[i]
         previous_row = daily_data.iloc[i - 1]
 
-        # Logging the values for debugging
-        st.write(f"Date: {row.name}, Close: {row['Close']}, EMA_9: {row['EMA_9']}, "
-                 f"EMA_21: {row['EMA_21']}, RSI: {row['RSI']}, "
-                 f"MACD: {row['MACD']}, MACD_Signal: {row['MACD_Signal']}, "
-                 f"Upper_BB: {row['Upper_BB']}, Lower_BB: {row['Lower_BB']}")
-
         # Buy signal
         if (row['Close'] < row['Lower_BB'] and 
-            row['RSI'] < 35 and  # Loosened condition
+            row['RSI'] < 35 and 
             previous_row['MACD'] < previous_row['MACD_Signal'] and 
             row['MACD'] > row['MACD_Signal']):
             entry_price = row['Close']
             entry_date = row.name
-            trades.append({'Entry_Date': entry_date, 'Entry_Price': entry_price, 'Trade_Result': 'Buy'})
+            trades.append({'Entry_Date': entry_date, 'Entry_Price': entry_price, 'Trade_Result': 'Buy', 'Exit_Price': None, 'Exit_Date': None, 'Points': None})
 
         # Sell signal
         elif (row['Close'] > row['Upper_BB'] and 
-              row['RSI'] > 65 and  # Loosened condition
+              row['RSI'] > 65 and 
               previous_row['MACD'] > previous_row['MACD_Signal'] and 
               row['MACD'] < row['MACD_Signal']):
             entry_price = row['Close']
             entry_date = row.name
-            trades.append({'Entry_Date': entry_date, 'Entry_Price': entry_price, 'Trade_Result': 'Sell'})
+            trades.append({'Entry_Date': entry_date, 'Entry_Price': entry_price, 'Trade_Result': 'Sell', 'Exit_Price': None, 'Exit_Date': None, 'Points': None})
 
+    # Simulate exits for trades
+    for trade in trades:
+        entry_price = trade['Entry_Price']
+        entry_date = trade['Entry_Date']
+        exit_price = None
+        exit_date = None
+
+        recent_data = fetch_recent_minute_data(selected_ticker)
+        target_price = entry_price + 50 if trade['Trade_Result'] == 'Buy' else entry_price - 50
+        stop_loss_price = entry_price - 50 if trade['Trade_Result'] == 'Buy' else entry_price + 50
+        
+        for time_index, row in recent_data.iterrows():
+            if (trade['Trade_Result'] == 'Buy' and row['Close'] >= target_price) or (trade['Trade_Result'] == 'Sell' and row['Close'] <= target_price):
+                exit_price = target_price
+                exit_date = time_index
+                break
+            elif (trade['Trade_Result'] == 'Buy' and row['Close'] <= stop_loss_price) or (trade['Trade_Result'] == 'Sell' and row['Close'] >= stop_loss_price):
+                exit_price = stop_loss_price
+                exit_date = time_index
+                break
+        
+        # Calculate points captured
+        if exit_price is not None:
+            trade['Exit_Price'] = exit_price
+            trade['Exit_Date'] = exit_date
+            trade['Points'] = exit_price - entry_price
+    
     trades_df = pd.DataFrame(trades)
     return trades_df
 
@@ -84,67 +105,6 @@ def fetch_recent_minute_data(ticker):
     end_date = datetime.now()
     start_date = end_date - timedelta(days=7)
     return yf.download(ticker, start=start_date, end=end_date, interval='1m')
-
-# Function for live trading
-def live_trading(selected_ticker):
-    stop_loss_points = 50
-    target_points = 50
-    run_live = st.session_state.get('run_live', True)
-
-    while run_live:
-        recent_data = fetch_recent_minute_data(selected_ticker)
-        recent_data = compute_daily_indicators(recent_data)
-        current_price = recent_data['Close'].iloc[-1]
-
-        # Buy conditions
-        if (current_price < recent_data['Lower_BB'].iloc[-1] and 
-            recent_data['RSI'].iloc[-1] < 35 and  # Loosened condition
-            recent_data['MACD'].iloc[-1] > recent_data['MACD_Signal'].iloc[-1]):
-            entry_price = current_price
-            entry_date = recent_data.index[-1]
-            target_price = entry_price + target_points
-            stop_loss_price = entry_price - stop_loss_points
-            
-            st.write(f"Buy Signal: Entry Price: {entry_price}, Target: {target_price}, Stop Loss: {stop_loss_price}")
-
-            # Exit logic
-            while run_live:
-                time.sleep(60)  # Wait for the next minute to check exit conditions
-                recent_data = fetch_recent_minute_data(selected_ticker)
-                recent_data = compute_daily_indicators(recent_data)
-                latest_price = recent_data['Close'].iloc[-1]
-
-                if latest_price >= target_price:
-                    st.write(f"Trade Result: Win, Exit Price: {latest_price} on {recent_data.index[-1]}")
-                    break
-                elif latest_price <= stop_loss_price:
-                    st.write(f"Trade Result: Loss, Exit Price: {latest_price} on {recent_data.index[-1]}")
-                    break
-        
-        # Sell conditions
-        elif (current_price > recent_data['Upper_BB'].iloc[-1] and 
-              recent_data['RSI'].iloc[-1] > 65 and  # Loosened condition
-              recent_data['MACD'].iloc[-1] < recent_data['MACD_Signal'].iloc[-1]):
-            entry_price = current_price
-            entry_date = recent_data.index[-1]
-            target_price = entry_price - target_points
-            stop_loss_price = entry_price + stop_loss_points
-            
-            st.write(f"Sell Signal: Entry Price: {entry_price}, Target: {target_price}, Stop Loss: {stop_loss_price}")
-
-            # Exit logic
-            while run_live:
-                time.sleep(60)  # Wait for the next minute to check exit conditions
-                recent_data = fetch_recent_minute_data(selected_ticker)
-                recent_data = compute_daily_indicators(recent_data)
-                latest_price = recent_data['Close'].iloc[-1]
-
-                if latest_price <= target_price:
-                    st.write(f"Trade Result: Win, Exit Price: {latest_price} on {recent_data.index[-1]}")
-                    break
-                elif latest_price >= stop_loss_price:
-                    st.write(f"Trade Result: Loss, Exit Price: {latest_price} on {recent_data.index[-1]}")
-                    break
 
 # Streamlit UI
 st.title("Trading Strategy Application")
@@ -160,19 +120,29 @@ if mode == 'Backtesting':
 
     if st.button("Run Backtest"):
         trades_df = backtest_strategy(selected_ticker, start_date, end_date)
-        st.write("Backtesting Results:")
-        st.dataframe(trades_df)
-
-        # Performance metrics
-        total_trades = len(trades_df)
-        wins = len(trades_df[trades_df['Trade_Result'] == 'Buy'])  # Adjust based on your logic
-        losses = len(trades_df[trades_df['Trade_Result'] == 'Sell'])  # Adjust based on your logic
         
-        accuracy = (wins / total_trades * 100) if total_trades > 0 else 0
+        if trades_df.empty:
+            st.write("No trades were generated during backtesting.")
+        else:
+            # Display trades as a scrollable DataFrame
+            st.write("Backtesting Results:")
+            st.dataframe(trades_df)
 
-        st.write(f"Total Trades: {total_trades}")
-        st.write(f"Wins: {wins} ({accuracy:.2f}%)")
-        st.write(f"Losses: {losses} (0.00%)")
+            # Summary of results
+            total_trades = len(trades_df)
+            total_profit = trades_df['Points'].sum() if not trades_df['Points'].isnull().all() else 0
+            total_loss = trades_df['Points'].dropna().where(lambda x: x < 0).sum()
+            total_profitable_trades = len(trades_df[trades_df['Points'] > 0])
+            total_loss_trades = len(trades_df[trades_df['Points'] <= 0])
+            accuracy = (total_profitable_trades / total_trades * 100) if total_trades > 0 else 0
+
+            st.write("Summary of Results:")
+            st.write(f"Total Trades: {total_trades}")
+            st.write(f"Total Profit: {total_profit:.2f}")
+            st.write(f"Total Loss: {total_loss:.2f}")
+            st.write(f"Total Profitable Trades: {total_profitable_trades}")
+            st.write(f"Total Loss Trades: {total_loss_trades}")
+            st.write(f"Accuracy: {accuracy:.2f}%")
 
 elif mode == 'Live Trading':
     if 'run_live' not in st.session_state:
