@@ -76,7 +76,7 @@ def backtest(data):
                 'exit_date': data.index[i],
                 'exit_price': exit_price
             })
-            st.write("data is ",trades[-1]['exit_date'])
+            #st.write("data is ",trades[-1]['exit_date'])
             profit_loss = exit_price - trades[-1]['entry_price']
             if profit_loss > 0:
                 profit_trades += 1
@@ -154,8 +154,8 @@ def main():
 
             for trade in trades:
                 st.write(f"Trade Entry: {trade['entry_date']} at {trade['entry_price']:.2f}, "
-                         #f"Exit: {trade.get('exit_date', 'N/A')} at {trade.get('exit_price', 'N/A'):.2f}, "
-                         #f"Exit: {trade['exit_date']} at trade['exit_price']:.2f, "
+                         #f"Exit: {trade[-1].get('exit_date', 'N/A')} at {trade.get('exit_price', 'N/A'):.2f}, "
+                         f"Exit: {trade[-1]['exit_date']} at trade['exit_price']:.2f, "
                          #f"Exit: trade["exit_price"]:.2f,"
                          #"Logic: {trade['logic']}"
                         )
