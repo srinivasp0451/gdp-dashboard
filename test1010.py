@@ -116,7 +116,7 @@ st.title("Trading Strategy Application")
 selected_index = st.selectbox("Select Index", list(tickers.keys()))
 selected_ticker = tickers[selected_index]
 
-mode = st.radio("Select Mode", ('Live Trading', 'Backtesting'))
+mode = st.radio("Select Mode", ('Backtesting', 'Live Trading' ))
 
 if mode == 'Backtesting':
     # Date selection for backtesting
