@@ -32,7 +32,7 @@ def calculate_indicators(data):
     return data
 
 # Backtest the strategy with detailed logging
-def backtest(data, stop_loss_pct=0.02, target_pct=0.05):
+def backtest(data, stop_loss_pct=0.02, target_pct=0.05, exit_threshold=10):
     initial_capital = 100000
     position = 0
     cash = initial_capital
@@ -60,7 +60,8 @@ def backtest(data, stop_loss_pct=0.02, target_pct=0.05):
             exit_condition = (
                 data['Close'].iloc[i] <= stop_loss_price or
                 data['Close'].iloc[i] >= target_price or
-                data['MACD'].iloc[i] < data['Signal_Line'].iloc[i]
+                data['MACD'].iloc[i] < data['Signal_Line'].iloc[i] or
+                data['Close'].iloc[i] <= entry_price - exit_threshold
             )
 
             if exit_condition:
@@ -141,9 +142,9 @@ def main():
                 return
 
             data = calculate_indicators(data)
-            final_value, trades, profit_trades, loss_trades, total_profit, total_loss, accuracy = backtest(data, stop_loss_pct=0.02, target_pct=0.05)
+            final_value, trades, profit_trades, loss_trades, total_profit, total_loss, accuracy = backtest(data, stop_loss_pct=0.02, target_pct=0.05, exit_threshold=10)
 
-            st.write(f"Initial Portfolio Value: 100000")
+            st.write(f"Initial Portfolio Value: {initial_capital:.2f}")
             st.write(f"Final Portfolio Value: {final_value:.2f}")
             st.write(f"Total Trades: {profit_trades + loss_trades}")
             st.write(f"Profitable Trades: {profit_trades}")
