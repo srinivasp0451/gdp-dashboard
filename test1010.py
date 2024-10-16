@@ -100,6 +100,12 @@ def backtest(data, stop_loss_pct=0.02, target_pct=0.05, exit_threshold=10):
     total_trades = profit_trades + loss_trades
     accuracy = (profit_trades / total_trades * 100) if total_trades > 0 else 0
 
+    # Debugging outputs
+    print("Final Cash:", cash)
+    print("Open Position Value:", position * data['Close'].iloc[-1] if position > 0 else 0)
+    print("Total Profit:", total_profit)
+    print("Total Loss:", total_loss)
+
     return final_value, trades, profit_trades, loss_trades, total_profit, total_loss, accuracy
 
 # Generate live trading recommendations
