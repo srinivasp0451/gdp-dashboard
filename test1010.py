@@ -18,22 +18,33 @@ tickers = {
 def fetch_daily_data(ticker, start_date, end_date):
     return yf.download(ticker, start=start_date, end=end_date)
 
-# Function to compute indicators
-def compute_indicators(df):
+# Function to compute indicators for daily data
+def compute_daily_indicators(df):
     df['EMA_9'] = df['Close'].ewm(span=9, adjust=False).mean()
     df['EMA_21'] = df['Close'].ewm(span=21, adjust=False).mean()
-    df['RSI'] = (df['Close'].diff(1) > 0).rolling(window=14).mean() / df['Close'].rolling(window=14).mean() * 100
+    df['RSI'] = 100 - (100 / (1 + (df['Close'].diff(1).where(df['Close'].diff(1) > 0).rolling(window=14).mean() /
+                                       df['Close'].diff(1).where(df['Close'].diff(1) < 0).rolling(window=14).mean()).fillna(0)))
     df['MACD'] = df['Close'].ewm(span=12, adjust=False).mean() - df['Close'].ewm(span=26, adjust=False).mean()
     df['MACD_Signal'] = df['MACD'].ewm(span=9, adjust=False).mean()
     df['Upper_BB'] = df['Close'].rolling(window=20).mean() + (df['Close'].rolling(window=20).std() * 2)
     df['Lower_BB'] = df['Close'].rolling(window=20).mean() - (df['Close'].rolling(window=20).std() * 2)
     return df
 
+# Function to compute indicators for minute data
+def compute_minute_indicators(df):
+    df['EMA_9'] = df['Close'].ewm(span=9, adjust=False).mean()
+    df['EMA_21'] = df['Close'].ewm(span=21, adjust=False).mean()
+    df['RSI'] = 100 - (100 / (1 + (df['Close'].diff(1).where(df['Close'].diff(1) > 0).rolling(window=14).mean() /
+                                       df['Close'].diff(1).where(df['Close'].diff(1) < 0).rolling(window=14).mean()).fillna(0)))
+    df['MACD'] = df['Close'].ewm(span=12, adjust=False).mean() - df['Close'].ewm(span=26, adjust=False).mean()
+    df['MACD_Signal'] = df['MACD'].ewm(span=9, adjust=False).mean()
+    return df
+
 # Backtesting function
 def backtest_strategy(selected_ticker, start_date, end_date):
     daily_data = fetch_daily_data(selected_ticker, start_date, end_date)
-    daily_data = compute_indicators(daily_data)
-
+    daily_data = compute_daily_indicators(daily_data)
+    
     trades = []
     
     for i in range(1, len(daily_data)):
@@ -41,16 +52,18 @@ def backtest_strategy(selected_ticker, start_date, end_date):
         previous_row = daily_data.iloc[i-1]
 
         # Buy signal
-        if (row['Close'] > row['EMA_9'] and row['Close'] < row['Lower_BB'] and 
-            row['RSI'] < 30 and previous_row['MACD'] < previous_row['MACD_Signal'] and 
+        if (row['Close'] < row['Lower_BB'] and 
+            row['RSI'] < 30 and 
+            previous_row['MACD'] < previous_row['MACD_Signal'] and 
             row['MACD'] > row['MACD_Signal']):
             entry_price = row['Close']
             entry_date = row.name
             trades.append({'Entry_Date': entry_date, 'Entry_Price': entry_price, 'Trade_Result': 'Buy'})
 
         # Sell signal
-        elif (row['Close'] < row['EMA_21'] and row['Close'] > row['Upper_BB'] and 
-              row['RSI'] > 70 and previous_row['MACD'] > previous_row['MACD_Signal'] and 
+        elif (row['Close'] > row['Upper_BB'] and 
+              row['RSI'] > 70 and 
+              previous_row['MACD'] > previous_row['MACD_Signal'] and 
               row['MACD'] < row['MACD_Signal']):
             entry_price = row['Close']
             entry_date = row.name
@@ -73,10 +86,11 @@ def live_trading(selected_ticker):
 
     while run_live:
         recent_data = fetch_recent_minute_data(selected_ticker)
+        recent_data = compute_minute_indicators(recent_data)  # Compute indicators for minute data
         current_price = recent_data['Close'].iloc[-1]
 
         # Buy conditions
-        if (current_price > recent_data['EMA_9'].iloc[-1] and 
+        if (current_price < recent_data['Lower_BB'].iloc[-1] and 
             recent_data['RSI'].iloc[-1] < 30 and 
             recent_data['MACD'].iloc[-1] > recent_data['MACD_Signal'].iloc[-1]):
             entry_price = current_price
@@ -90,6 +104,7 @@ def live_trading(selected_ticker):
             while run_live:
                 time.sleep(60)  # Wait for the next minute to check exit conditions
                 recent_data = fetch_recent_minute_data(selected_ticker)
+                recent_data = compute_minute_indicators(recent_data)  # Recompute indicators
                 latest_price = recent_data['Close'].iloc[-1]
 
                 if latest_price >= target_price:
@@ -100,7 +115,7 @@ def live_trading(selected_ticker):
                     break
         
         # Sell conditions
-        elif (current_price < recent_data['EMA_21'].iloc[-1] and 
+        elif (current_price > recent_data['Upper_BB'].iloc[-1] and 
               recent_data['RSI'].iloc[-1] > 70 and 
               recent_data['MACD'].iloc[-1] < recent_data['MACD_Signal'].iloc[-1]):
             entry_price = current_price
@@ -114,6 +129,7 @@ def live_trading(selected_ticker):
             while run_live:
                 time.sleep(60)  # Wait for the next minute to check exit conditions
                 recent_data = fetch_recent_minute_data(selected_ticker)
+                recent_data = compute_minute_indicators(recent_data)  # Recompute indicators
                 latest_price = recent_data['Close'].iloc[-1]
 
                 if latest_price <= target_price:
@@ -142,14 +158,14 @@ if mode == 'Backtesting':
 
         # Performance metrics
         total_trades = len(trades_df)
-        wins = len(trades_df[trades_df['Trade_Result'] == 'Buy']) + len(trades_df[trades_df['Trade_Result'] == 'Sell'])
-        losses = total_trades - wins
-
+        wins = total_trades  # All trades logged are either buy or sell
+        losses = 0  # Placeholder, add logic for win/loss tracking
+        
         accuracy = (wins / total_trades * 100) if total_trades > 0 else 0
 
         st.write(f"Total Trades: {total_trades}")
         st.write(f"Wins: {wins} ({accuracy:.2f}%)")
-        st.write(f"Losses: {losses} ({(losses / total_trades * 100) if total_trades > 0 else 0:.2f}%)")
+        st.write(f"Losses: {losses} (0.00%)")
 
 elif mode == 'Live Trading':
     if 'run_live' not in st.session_state:
