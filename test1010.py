@@ -152,14 +152,26 @@ def main():
             st.write(f"Total Loss: {total_loss:.2f}")
             st.write(f"Accuracy: {accuracy:.2f}%")
 
-            for trade in trades:
-                st.write(trade)
-                st.write(f"Trade Entry: {trade['entry_date']} at {trade['entry_price']:.2f}, "
+            #for trade in trades:
+                #st.write(trade)
+                #st.write(f"Trade Entry: {trade['entry_date']} at {trade['entry_price']:.2f}, "
                          #f"Exit: {trade[-1].get('exit_date', 'N/A')} at {trade.get('exit_price', 'N/A'):.2f}, "
                          #f"Exit: {trade['exit_date']} at trade['exit_price']:.2f, "
                          #f"Exit: trade["exit_price"]:.2f,"
                          #"Logic: {trade['logic']}"
-                        )
+                        #)
+
+            for trade in trades:
+                st.write(trade)
+                exit_date = trade.get('exit_date', 'N/A')
+                exit_price = trade.get('exit_price', 'N/A')
+    
+                if exit_price != 'N/A':
+                    exit_price = f"{exit_price:.2f}"
+
+                st.write(f"Trade Entry: {trade['entry_date']} at {trade['entry_price']:.2f}, "
+                         f"Exit: {exit_date} at {exit_price}, "
+                        f"Logic: {trade['logic']}")
 
     elif option == "Live Trading":
         live_trading(symbol)
