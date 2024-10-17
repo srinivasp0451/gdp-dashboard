@@ -51,11 +51,13 @@ def generate_recommendation(data):
 st.title("Index Trading Strategy")
 st.sidebar.header("Select Index")
 index_options = {
-    "Nifty 50": "^NSEI",
-    "FinNifty": "^NSEFIN",
     "Bank Nifty": "^NSEBANK",
+    "Nifty 50": "^NSEI",
+    "FinNifty": "NIFTY_FIN_SERVICE.NS",
+    
     "Sensex": "^BSESN",
-    "Midcap Nifty": "^NSEMCAP"
+    "Midcap Nifty": "NIFTY_MID_SELECT.NS",
+    "BANKEX" : "BSE-BANK.BO"
 }
 
 
