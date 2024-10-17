@@ -167,7 +167,8 @@ def main():
 
                 st.write(f"Trade Entry: {trade['entry_date']} at {trade['entry_price']:.2f}, "
                          f"Exit: {exit_date} at {exit_price}, "
-                         f"Logic: {trade['logic']}")
+                         #f"Logic: {trade['logic']}"
+                        )
 
     elif option == "Live Trading":
         live_trading(symbol)
