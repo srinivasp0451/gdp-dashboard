@@ -6,7 +6,7 @@ import time
 import matplotlib.pyplot as plt
 
 # Function to fetch index data
-def fetch_data(ticker='^NSEI', period='1mo', interval='5m'):
+def fetch_data(ticker='^NSEI', period='1d', interval='1m'):
     data = yf.download(ticker, period=period, interval=interval)
     return data
 
