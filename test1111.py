@@ -73,47 +73,40 @@ def backtest_strategy(data, initial_balance=10000, atr_multiplier=1.5, trailing_
             atr = data['ATR'].iloc[i]
             stop_loss = entry_price - (atr_multiplier * atr)
             trailing_take_profit = entry_price + (trailing_take_profit_multiplier * atr)
-            st.write(f"Buy at {entry_price:.2f}, Stop Loss: {stop_loss:.2f}, Take Profit: {trailing_take_profit:.2f}")
+            trade_log.append(f"Buy at {entry_price:.2f}, Stop Loss: {stop_loss:.2f}, Take Profit: {trailing_take_profit:.2f}")
 
         elif position == 'Long':
             current_price = data['Close'].iloc[i]
 
             # Adjust trailing take-profit
             if current_price > trailing_take_profit:
-                trailing_take_profit = current_price  # Adjust the take-profit higher
+                trailing_take_profit = current_price
 
             # Check stop-loss
             if current_price <= stop_loss:
                 balance += current_price - entry_price
-                trade_log.append(current_price - entry_price)
-                st.write(f"Stopped out at {current_price:.2f} | Loss: {current_price - entry_price:.2f}")
+                trade_log.append(f"Stopped out at {current_price:.2f} | Loss: {current_price - entry_price:.2f}")
                 position = None
 
             # Check trailing take-profit
             elif current_price >= trailing_take_profit:
                 balance += trailing_take_profit - entry_price
-                trade_log.append(trailing_take_profit - entry_price)
-                st.write(f"Take Profit at {trailing_take_profit:.2f} | Profit: {trailing_take_profit - entry_price:.2f}")
+                trade_log.append(f"Take Profit at {trailing_take_profit:.2f} | Profit: {trailing_take_profit - entry_price:.2f}")
                 position = None
 
         elif data['Signal'].iloc[i] == 'Sell' and position == 'Long':
             exit_price = data['Close'].iloc[i]
             balance += exit_price - entry_price
-            trade_log.append(exit_price - entry_price)
-            st.write(f"Sell at {exit_price:.2f} | Profit: {exit_price - entry_price:.2f}")
+            trade_log.append(f"Sell at {exit_price:.2f} | Profit: {exit_price - entry_price:.2f}")
             position = None
 
     # Backtesting summary
     num_trades = len(trade_log)
-    num_profit_trades = len([trade for trade in trade_log if trade > 0])
+    num_profit_trades = len([trade for trade in trade_log if 'Profit' in trade])
     num_loss_trades = num_trades - num_profit_trades
     accuracy = (num_profit_trades / num_trades) * 100 if num_trades > 0 else 0
 
-    st.write(f"\nBacktesting Results:\nAccuracy: {accuracy:.2f}%")
-    st.write(f"Total Trades: {num_trades}\nProfitable Trades: {num_profit_trades}\nLoss Trades: {num_loss_trades}")
-    st.write(f"Final Balance: {balance:.2f}")
-
-    return accuracy, num_trades, num_profit_trades, num_loss_trades
+    return accuracy, num_trades, num_profit_trades, num_loss_trades, balance, trade_log
 
 # Live trading recommendations
 def live_trading_recommendations(data):
@@ -139,7 +132,9 @@ def main():
     
     period = st.selectbox("Select Period", ["1mo", "3mo", "6mo", "1y"], index=0)
     interval = st.selectbox("Select Interval", ["1m", "5m", "15m", "1h"], index=1)
-    
+
+    option = st.radio("Choose Option", ("Backtest", "Live Trading"))
+
     if st.button("Run"):
         with st.spinner("Fetching data..."):
             data = fetch_data(selected_symbol, period, interval)
@@ -149,15 +144,19 @@ def main():
             data = calculate_sma(data)
             data = generate_signals(data)
 
-            option = st.radio("Choose Option", ("Backtest", "Live Trading"))
             if option == "Backtest":
-                accuracy, total_trades, profit_trades, loss_trades = backtest_strategy(data)
+                accuracy, total_trades, profit_trades, loss_trades, final_balance, trade_log = backtest_strategy(data)
+                st.write(f"Accuracy: {accuracy:.2f}%")
+                st.write(f"Total Trades: {total_trades}, Profitable Trades: {profit_trades}, Loss Trades: {loss_trades}")
+                st.write(f"Final Balance: {final_balance:.2f}")
+                for log in trade_log:
+                    st.write(log)
             else:
                 latest_price, latest_signal = live_trading_recommendations(data)
                 st.write(f"Latest Price: {latest_price:.2f}, Signal: {latest_signal}")
 
     if st.button("Stop Program"):
-        st.write("Program stopped.")
+        st.write("Stopping the program. Please refresh to reset.")
 
 if __name__ == "__main__":
     main()
