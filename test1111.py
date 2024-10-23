@@ -54,13 +54,15 @@ def calculate_sma(data, window=50):
 def generate_signals(data):
     signals = []
     for i in range(len(data)):
-        if (data['RSI'].iloc[i] < 40 and
-            data['MACD'].iloc[i] > data['Signal_Line'].iloc[i] and
-            data['Close'].iloc[i] > data['SMA_50'].iloc[i]):
+        rsi = data['RSI'].iloc[i]
+        macd = data['MACD'].iloc[i]
+        signal_line = data['Signal_Line'].iloc[i]
+        close_price = data['Close'].iloc[i]
+        sma_50 = data['SMA_50'].iloc[i]
+
+        if (rsi < 40 and macd > signal_line and close_price > sma_50):
             signals.append('Buy')
-        elif (data['RSI'].iloc[i] > 60 and
-              data['MACD'].iloc[i] < data['Signal_Line'].iloc[i] and
-              data['Close'].iloc[i] < data['SMA_50'].iloc[i]):
+        elif (rsi > 60 and macd < signal_line and close_price < sma_50):
             signals.append('Sell')
         else:
             signals.append('Hold')
@@ -116,6 +118,7 @@ def backtest_strategy(data, initial_balance=10000, atr_multiplier=1.5, trailing_
 def main():
     st.title("Trading Strategy App")
 
+    mode_choice = st.selectbox("Choose Mode", ["Backtest", "Live Trading"])
     index_choice = st.selectbox("Select Index", list(index_options.keys()))
     period_choice = st.selectbox("Select Period", ["1mo", "3mo", "6mo", "1y"], index=0)
     interval_choice = st.selectbox("Select Interval", ["1m", "5m", "15m", "30m", "1h"], index=1)
@@ -130,10 +133,15 @@ def main():
         data = calculate_sma(data)
         data = generate_signals(data)
 
-        accuracy, final_balance = backtest_strategy(data)
-        
-        st.write(f"Accuracy: {accuracy:.2f}%")
-        st.write(f"Final Balance: ${final_balance:.2f}")
+        if mode_choice == "Backtest":
+            accuracy, final_balance = backtest_strategy(data)
+            st.write(f"Backtesting Results:")
+            st.write(f"Accuracy: {accuracy:.2f}%")
+            st.write(f"Final Balance: ${final_balance:.2f}")
+        else:
+            latest_signal = data['Signal'].iloc[-1]
+            latest_price = data['Close'].iloc[-1]
+            st.write(f"Latest Price: ${latest_price:.2f}, Signal: {latest_signal}")
 
     if st.button("Stop Program"):
         st.write("Program stopped.")  # Placeholder for stopping logic
