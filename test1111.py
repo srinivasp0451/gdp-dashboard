@@ -130,6 +130,11 @@ def main():
         symbol = index_options[index_choice]
         data = fetch_5min_data(symbol, period_choice, interval_choice)
 
+        # Check if data is fetched
+        if data.empty:
+            st.error("No data fetched. Please check the symbol or parameters.")
+            return
+
         data = calculate_rsi(data)
         data = calculate_macd(data)
         data = calculate_atr(data)
