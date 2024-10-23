@@ -44,13 +44,15 @@ def calculate_sma(data, window=50):
 def generate_signals(data):
     signals = []
     for i in range(len(data)):
-        if (data['RSI'].iloc[i] < 40 and
-            data['MACD'].iloc[i] > data['Signal_Line'].iloc[i] and
-            data['Close'].iloc[i] > data['SMA_50'].iloc[i]):
+        rsi = data['RSI'].iloc[i]
+        macd = data['MACD'].iloc[i]
+        signal_line = data['Signal_Line'].iloc[i]
+        close_price = data['Close'].iloc[i]
+        sma_50 = data['SMA_50'].iloc[i]
+
+        if (rsi < 40) and (macd > signal_line) and (close_price > sma_50):
             signals.append('Buy')
-        elif (data['RSI'].iloc[i] > 60 and
-              data['MACD'].iloc[i] < data['Signal_Line'].iloc[i] and
-              data['Close'].iloc[i] < data['SMA_50'].iloc[i]):
+        elif (rsi > 60) and (macd < signal_line) and (close_price < sma_50):
             signals.append('Sell')
         else:
             signals.append('Hold')
@@ -63,8 +65,6 @@ def backtest_strategy(data, initial_balance=10000, atr_multiplier=1.5, trailing_
     position = None
     entry_price = 0
     trade_log = []
-    stop_loss = 0
-    trailing_take_profit = 0
 
     for i in range(len(data)):
         if data['Signal'].iloc[i] == 'Buy' and position is None:
