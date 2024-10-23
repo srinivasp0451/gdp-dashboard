@@ -22,8 +22,6 @@ def calculate_indicators(data):
     data['RSI'] = 100 - (100 / (1 + rs))
     
     data['Middle_Band'] = data['Close'].rolling(window=20).mean()
-    print("middle band", data['Middle_Band'])
-    print(data["Close"].rolling(window=20).std()*2)
     data['Upper_Band'] = data['Middle_Band'] + (data['Close'].rolling(window=20).std() * 2)
     data['Lower_Band'] = data['Middle_Band'] - (data['Close'].rolling(window=20).std() * 2)
 
