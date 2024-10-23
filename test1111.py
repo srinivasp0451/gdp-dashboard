@@ -12,7 +12,7 @@ index_options = {
     "BANKEX": "BSE-BANK.BO"
 }
 
-# Function to fetch 5-minute interval data
+# Function to fetch data
 def fetch_5min_data(symbol, period='1mo'):
     df = yf.download(symbol, period=period, interval='5m')
     return df
@@ -114,7 +114,9 @@ if st.button("Run Strategy"):
     nifty_bank_data = calculate_sma(nifty_bank_data)
     nifty_bank_data = generate_signals(nifty_bank_data)
 
-    if st.radio("Choose Mode:", ["Backtest", "Live Trading"]) == "Backtest":
+    mode = st.radio("Choose Mode:", ["Backtest", "Live Trading"])
+
+    if mode == "Backtest":
         balance, trade_log = backtest_strategy(nifty_bank_data)
         st.write(f"Final Balance: {balance:.2f}")
         st.write("Trade Log:", trade_log)
@@ -122,6 +124,5 @@ if st.button("Run Strategy"):
         latest_price, latest_signal = live_trading_recommendations(nifty_bank_data)
         st.write(f"Latest Price: {latest_price:.2f}, Signal: {latest_signal}")
 
-    if st.button("Stop"):
-        st.write("Stopping the program...")
-
+if st.button("Stop"):
+    st.write("Stopping the program...")
