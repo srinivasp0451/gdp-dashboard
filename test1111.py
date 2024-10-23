@@ -60,9 +60,12 @@ def generate_signals(data):
         close_price = data['Close'].iloc[i]
         sma_50 = data['SMA_50'].iloc[i]
 
-        if (rsi < 40 and macd > signal_line and close_price > sma_50):
+        buy_signal = (rsi < 40) and (macd > signal_line) and (close_price > sma_50)
+        sell_signal = (rsi > 60) and (macd < signal_line) and (close_price < sma_50)
+
+        if buy_signal:
             signals.append('Buy')
-        elif (rsi > 60 and macd < signal_line and close_price < sma_50):
+        elif sell_signal:
             signals.append('Sell')
         else:
             signals.append('Hold')
