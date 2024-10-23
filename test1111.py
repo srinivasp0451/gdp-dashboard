@@ -44,16 +44,22 @@ def calculate_sma(data, window=50):
 def generate_signals(data):
     signals = []
     for i in range(len(data)):
-        if (data['RSI'].iloc[i] < 40 and
-            data['MACD'].iloc[i] > data['Signal_Line'].iloc[i] and
-            data['Close'].iloc[i] > data['SMA_50'].iloc[i]):
+        rsi = data['RSI'].iloc[i]
+        macd = data['MACD'].iloc[i]
+        signal_line = data['Signal_Line'].iloc[i]
+        close_price = data['Close'].iloc[i]
+        sma_50 = data['SMA_50'].iloc[i]
+
+        buy_condition = (rsi < 40) and (macd > signal_line) and (close_price > sma_50)
+        sell_condition = (rsi > 60) and (macd < signal_line) and (close_price < sma_50)
+
+        if buy_condition:
             signals.append('Buy')
-        elif (data['RSI'].iloc[i] > 60 and
-              data['MACD'].iloc[i] < data['Signal_Line'].iloc[i] and
-              data['Close'].iloc[i] < data['SMA_50'].iloc[i]):
+        elif sell_condition:
             signals.append('Sell')
         else:
             signals.append('Hold')
+
     data['Signal'] = signals
     return data
 
