@@ -1,9 +1,19 @@
-import streamlit as st
 import yfinance as yf
 import pandas as pd
+import streamlit as st
+
+# Define index options
+index_options = {
+    "Bank Nifty": "^NSEBANK",
+    "Nifty 50": "^NSEI",
+    "FinNifty": "NIFTY_FIN_SERVICE.NS",
+    "Sensex": "^BSESN",
+    "Midcap Nifty": "NIFTY_MID_SELECT.NS",
+    "BANKEX": "BSE-BANK.BO"
+}
 
 # Function to fetch data
-def fetch_data(symbol, period, interval):
+def fetch_5min_data(symbol, period, interval):
     df = yf.download(symbol, period=period, interval=interval)
     return df
 
@@ -40,7 +50,7 @@ def calculate_sma(data, window=50):
     data['SMA_50'] = data['Close'].rolling(window=window).mean()
     return data
 
-# Function to generate buy/sell signals
+# Function to generate signals
 def generate_signals(data):
     signals = []
     for i in range(len(data)):
@@ -57,7 +67,7 @@ def generate_signals(data):
     data['Signal'] = signals
     return data
 
-# Backtest strategy
+# Function to backtest strategy
 def backtest_strategy(data, initial_balance=10000, atr_multiplier=1.5, trailing_take_profit_multiplier=3.0):
     balance = initial_balance
     position = None
@@ -77,17 +87,14 @@ def backtest_strategy(data, initial_balance=10000, atr_multiplier=1.5, trailing_
         elif position == 'Long':
             current_price = data['Close'].iloc[i]
 
-            # Adjust trailing take-profit
             if current_price > trailing_take_profit:
                 trailing_take_profit = current_price
 
-            # Check stop-loss
             if current_price <= stop_loss:
                 balance += current_price - entry_price
                 trade_log.append(current_price - entry_price)
                 position = None
 
-            # Check trailing take-profit
             elif current_price >= trailing_take_profit:
                 balance += trailing_take_profit - entry_price
                 trade_log.append(trailing_take_profit - entry_price)
@@ -101,63 +108,35 @@ def backtest_strategy(data, initial_balance=10000, atr_multiplier=1.5, trailing_
 
     num_trades = len(trade_log)
     num_profit_trades = len([trade for trade in trade_log if trade > 0])
-    num_loss_trades = num_trades - num_profit_trades
     accuracy = (num_profit_trades / num_trades) * 100 if num_trades > 0 else 0
 
-    return accuracy, num_trades, num_profit_trades, num_loss_trades, balance
+    return accuracy, balance
 
-# Function for live trading recommendations
-def live_trading_recommendations(data):
-    latest_signal = data['Signal'].iloc[-1]
-    latest_price = data['Close'].iloc[-1]
-    return latest_price, latest_signal
-
-# Main Streamlit app
+# Streamlit app
 def main():
-    st.title("Trading Strategy with Streamlit")
+    st.title("Trading Strategy App")
 
-    index_options = {
-        "Bank Nifty": "^NSEBANK",
-        "Nifty 50": "^NSEI",
-        "FinNifty": "NIFTY_FIN_SERVICE.NS",
-        "Sensex": "^BSESN",
-        "Midcap Nifty": "NIFTY_MID_SELECT.NS",
-        "BANKEX": "BSE-BANK.BO"
-    }
-
-    # Dropdown for selecting the index
-    selected_index = st.selectbox("Select an Index", list(index_options.keys()))
-
-    # Dropdown for selecting period
-    period = st.selectbox("Select Period", ["1mo", "3mo", "6mo", "1y"], index=0)
-
-    # Dropdown for selecting interval
-    interval = st.selectbox("Select Interval", ["1m", "5m", "15m", "30m", "1h", "1d"], index=1)
-
-    # Dropdown for backtesting or live trading
-    trading_choice = st.selectbox("Choose an Option", ["Backtest", "Live Trading"])
+    index_choice = st.selectbox("Select Index", list(index_options.keys()))
+    period_choice = st.selectbox("Select Period", ["1mo", "3mo", "6mo", "1y"], index=0)
+    interval_choice = st.selectbox("Select Interval", ["1m", "5m", "15m", "30m", "1h"], index=1)
 
     if st.button("Run Strategy"):
-        with st.spinner("Fetching data..."):
-            symbol = index_options[selected_index]
-            data = fetch_data(symbol, period, interval)
+        symbol = index_options[index_choice]
+        data = fetch_5min_data(symbol, period_choice, interval_choice)
 
-            # Calculate indicators
-            data = calculate_rsi(data)
-            data = calculate_macd(data)
-            data = calculate_atr(data)
-            data = calculate_sma(data)
+        data = calculate_rsi(data)
+        data = calculate_macd(data)
+        data = calculate_atr(data)
+        data = calculate_sma(data)
+        data = generate_signals(data)
 
-            # Generate signals
-            data = generate_signals(data)
+        accuracy, final_balance = backtest_strategy(data)
+        
+        st.write(f"Accuracy: {accuracy:.2f}%")
+        st.write(f"Final Balance: ${final_balance:.2f}")
 
-            if trading_choice == "Backtest":
-                accuracy, total_trades, profit_trades, loss_trades, final_balance = backtest_strategy(data)
-                st.success(f"Backtesting Results:\nAccuracy: {accuracy:.2f}%\nTotal Trades: {total_trades}\nProfitable Trades: {profit_trades}\nLoss Trades: {loss_trades}\nFinal Balance: {final_balance:.2f}")
-
-            else:  # Live Trading
-                latest_price, latest_signal = live_trading_recommendations(data)
-                st.success(f"Latest Price: {latest_price:.2f}, Signal: {latest_signal}")
+    if st.button("Stop Program"):
+        st.write("Program stopped.")  # Placeholder for stopping logic
 
 if __name__ == "__main__":
     main()
