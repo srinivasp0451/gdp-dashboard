@@ -54,8 +54,9 @@ indices = {
 # Streamlit app
 st.title("Live Indices Breakout Signals")
 
-# Dropdown for backtesting
-backtest_option = st.selectbox("Select an option", ["Live Trading", "Backtesting"])
+# Set default values for dropdowns
+backtest_option = st.selectbox("Select an option", ["Backtesting", "Live Trading"], index=0)
+index_name = st.selectbox("Select an index", list(indices.keys()), index=1)  # Default to Bank Nifty
 
 # Stop button logic
 if 'stop_execution' not in st.session_state:
@@ -66,23 +67,20 @@ if backtest_option == "Live Trading":
     if stop_button:
         st.session_state.stop_execution = True
 
-# Loop through indices and display results
-for index_name, ticker in indices.items():
-    st.subheader(index_name)
-    data = fetch_data(ticker)
+# Fetch data for the selected index
+data = fetch_data(indices[index_name])
 
-    if data is not None:
-        latest_close = data['Close'].iloc[-1]
-        sma20_latest = data['SMA20'].iloc[-1]
-        sma50_latest = data['SMA50'].iloc[-1]
+if data is not None:
+    latest_close = data['Close'].iloc[-1]
+    sma20_latest = data['SMA20'].iloc[-1]
+    sma50_latest = data['SMA50'].iloc[-1]
 
-        if backtest_option == "Live Trading":
-            if st.session_state.stop_execution:
-                st.warning("Execution stopped by user.")
-                break
-
-            breakout_up = latest_close > sma20_latest and latest_close > sma50_latest
-            breakout_down = latest_close < sma20_latest and latest_close < sma50_latest
+    if backtest_option == "Live Trading":
+        if st.session_state.stop_execution:
+            st.warning("Execution stopped by user.")
+        else:
+            breakout_up = (latest_close > sma20_latest) and (latest_close > sma50_latest)
+            breakout_down = (latest_close < sma20_latest) and (latest_close < sma50_latest)
 
             st.write(f"Latest Close Price: {latest_close:.2f}")
             st.write(f"SMA 20: {sma20_latest:.2f}")
@@ -94,15 +92,15 @@ for index_name, ticker in indices.items():
                 st.warning("Potential breakout to the downside detected.")
             else:
                 st.info("No clear breakout signal.")
-        elif backtest_option == "Backtesting":
-            results = backtest(data)
-            st.write(f"Total Trades: {results['total_trades']}")
-            st.write(f"Profit Trades: {results['profit_trades']}")
-            st.write(f"Loss Trades: {results['loss_trades']}")
-            st.write(f"Accuracy: {results['accuracy']:.2f}%")
-            st.write(f"Total Profit Points Captured: {results['total_profit_points']:.2f}")
-    else:
-        st.error("Data not available for this index.")
+    elif backtest_option == "Backtesting":
+        results = backtest(data)
+        st.write(f"Total Trades: {results['total_trades']}")
+        st.write(f"Profit Trades: {results['profit_trades']}")
+        st.write(f"Loss Trades: {results['loss_trades']}")
+        st.write(f"Accuracy: {results['accuracy']:.2f}%")
+        st.write(f"Total Profit Points Captured: {results['total_profit_points']:.2f}")
+else:
+    st.error("Data not available for this index.")
 
 # Run the Streamlit app
 if __name__ == "__main__":
