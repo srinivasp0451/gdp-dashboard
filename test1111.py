@@ -57,6 +57,15 @@ st.title("Live Indices Breakout Signals")
 # Dropdown for backtesting
 backtest_option = st.selectbox("Select an option", ["Live Trading", "Backtesting"])
 
+# Stop button logic
+if 'stop_execution' not in st.session_state:
+    st.session_state.stop_execution = False
+
+if backtest_option == "Live Trading":
+    stop_button = st.button("Stop Execution")
+    if stop_button:
+        st.session_state.stop_execution = True
+
 # Loop through indices and display results
 for index_name, ticker in indices.items():
     st.subheader(index_name)
@@ -67,14 +76,18 @@ for index_name, ticker in indices.items():
         sma20_latest = data['SMA20'].iloc[-1]
         sma50_latest = data['SMA50'].iloc[-1]
 
-        breakout_up = latest_close > sma20_latest and latest_close > sma50_latest
-        breakout_down = latest_close < sma20_latest and latest_close < sma50_latest
-
-        st.write(f"Latest Close Price: {latest_close:.2f}")
-        st.write(f"SMA 20: {sma20_latest:.2f}")
-        st.write(f"SMA 50: {sma50_latest:.2f}")
-
         if backtest_option == "Live Trading":
+            if st.session_state.stop_execution:
+                st.warning("Execution stopped by user.")
+                break
+
+            breakout_up = latest_close > sma20_latest and latest_close > sma50_latest
+            breakout_down = latest_close < sma20_latest and latest_close < sma50_latest
+
+            st.write(f"Latest Close Price: {latest_close:.2f}")
+            st.write(f"SMA 20: {sma20_latest:.2f}")
+            st.write(f"SMA 50: {sma50_latest:.2f}")
+
             if breakout_up:
                 st.success("Potential breakout to the upside detected.")
             elif breakout_down:
