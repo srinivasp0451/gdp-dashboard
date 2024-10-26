@@ -134,7 +134,7 @@ def main():
             live_trades = []
             while True:
                 # Fetch new data for the last hour
-                live_data = fetch_data(symbol, datetime.now() - timedelta(minutes=360), datetime.now(), interval)
+                live_data = fetch_data(symbol, datetime.now() - timedelta(minutes=60), datetime.now(), interval)
                 if len(live_data) < 10:
                     st.error("Not enough data for live trading.")
                     break
