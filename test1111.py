@@ -112,7 +112,7 @@ def main():
     backtest_days = st.number_input("Backtest Days", min_value=1, max_value=90, value=58)  # Default 58
     #interval = st.selectbox("Select Interval", ["1m", "2m", "5m", "10m", "15m", "30m", "60m"], index=2)  # Default 5m
     interval = "5m"
-    stop_loss_points = st.selectbox("Select Stop Loss Points", [5,10, 15, 20,25,30,35,40,45,50], index=3)  # Default 20
+    stop_loss_points = st.selectbox("Select Stop Loss Points", [5,10, 15, 20,25,30,35,40,45,50,55,60,65,70,75,80,85,90,95,100,150,200,250,300,350], index=3)  # Default 20
     mode = st.selectbox("Select Mode", ["Backtest", "Live Trading"], index=0)  # Default Backtest
 
     if st.button("Run Strategy"):
