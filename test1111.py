@@ -18,11 +18,12 @@ def backtest(data):
 
     for i in range(1, len(data)):
         # Entry conditions
-        if data['Close'].iloc[i] > data['SMA20'].iloc[i] and data['Close'].iloc[i-1] <= data['SMA20'].iloc[i-1]:
+        if (data['Close'].iloc[i] > data['SMA20'].iloc[i]) and (data['Close'].iloc[i-1] <= data['SMA20'].iloc[i-1]):
             entry_level = data['Close'].iloc[i]
 
         # Exit conditions
-        if entry_level and (data['Close'].iloc[i] < data['SMA20'].iloc[i] or data['Close'].iloc[i] < data['SMA50'].iloc[i]):
+        if entry_level is not None and (
+            data['Close'].iloc[i] < data['SMA20'].iloc[i] or data['Close'].iloc[i] < data['SMA50'].iloc[i]):
             exit_level = data['Close'].iloc[i]
             trades.append((entry_level, exit_level))
             entry_level = None
