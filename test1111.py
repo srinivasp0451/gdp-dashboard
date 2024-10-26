@@ -130,19 +130,28 @@ def main():
 
     if mode == "Live Trading":
         if st.button("Start Live Trading"):
-            st.write("Live trading started... (simulation)")
+            # Placeholder to store live trades
+            live_trades = []
             while True:
-                # Simulate live trading recommendations
-                live_data = fetch_data(symbol, datetime.now() - timedelta(minutes=60), datetime.now(), interval)
-                live_trades = scalping_strategy(live_data, stop_loss_points)
+                # Fetch new data for the last hour
+                live_data = fetch_data(symbol, datetime.now() - timedelta(minutes=360), datetime.now(), interval)
+                if len(live_data) < 10:
+                    st.error("Not enough data for live trading.")
+                    break
 
-                if live_trades:
-                    for trade in live_trades:
+                new_trades = scalping_strategy(live_data, stop_loss_points)
+                live_trades.extend(new_trades)
+
+                # Display live trade recommendations
+                if new_trades:
+                    for trade in new_trades:
                         st.write(f"Live Recommendation: Buy at {trade['entry_level']} on {trade['entry_date']}")
                         st.write(f"Target Exit: {trade['exit_level']} on {trade['exit_date']} (Points: {trade['points']})")
 
-                time.sleep(60)  # Delay for live simulation
+                # Sleep for a short duration before fetching new data
+                time.sleep(60)  # Delay for 60 seconds
 
+                # Check if user has clicked the stop button
                 if st.button("Stop Live Trading"):
                     st.write("Live trading stopped.")
                     break
