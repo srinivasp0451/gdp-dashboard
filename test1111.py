@@ -106,9 +106,9 @@ def main():
     "Fin Nifty": "^NSEFIN",
     }
 
-    symbol = st.selectbox("Select an index", list(indices.keys()), index=1)  # Default to Bank Nifty
+    #symbol = st.selectbox("Select an index", list(indices.keys()), index=1)  # Default to Bank Nifty
 
-    #symbol = st.selectbox("Select Index", ["^NSEI", "^NSEBANK"], index=1)  # Default is Bank Nifty
+    symbol = st.selectbox("Select Index", ["^NSEI", "^NSEBANK","^NSEFIN","^NSEMDCP","^BSESN" ], index=1)  # Default is Bank Nifty
     backtest_days = st.number_input("Backtest Days", min_value=1, max_value=90, value=58)  # Default 58
     interval = st.selectbox("Select Interval", ["1m", "2m", "5m", "10m", "15m", "30m", "60m"], index=2)  # Default 5m
     stop_loss_points = st.selectbox("Select Stop Loss Points", [10, 15, 20], index=2)  # Default 20
