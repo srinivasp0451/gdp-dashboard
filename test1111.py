@@ -1,108 +1,151 @@
 import streamlit as st
 import yfinance as yf
 import pandas as pd
+import numpy as np
+from datetime import datetime, timedelta
+import time
 
-# Function to fetch and calculate breakout signals
-def fetch_data(ticker):
-    data = yf.download(ticker, period='1mo', interval='5m')
-    if data.empty:
-        return None
-    data['SMA20'] = data['Close'].rolling(window=20).mean()
-    data['SMA50'] = data['Close'].rolling(window=50).mean()
+# Function to fetch market data
+def fetch_data(symbol, start_date, end_date, interval='5m'):
+    data = yf.download(symbol, start=start_date, end=end_date, interval=interval)
     return data
 
-# Backtesting function
-def backtest(data):
+# Calculate moving averages
+def calculate_moving_averages(data, short_window=5, long_window=15):
+    data['EMA_short'] = data['Close'].ewm(span=short_window, adjust=False).mean()
+    data['EMA_long'] = data['Close'].ewm(span=long_window, adjust=False).mean()
+    return data
+
+# Calculate RSI
+def calculate_rsi(data, window=14):
+    delta = data['Close'].diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=window).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=window).mean()
+    rs = gain / loss
+    data['RSI'] = 100 - (100 / (1 + rs))
+    return data
+
+# Define the scalping strategy
+def scalping_strategy(data, stop_loss_points):
+    data = calculate_moving_averages(data)
+    data = calculate_rsi(data)
+
+    data['Signal'] = 0
+    data.loc[(data['EMA_short'] > data['EMA_long']) & (data['RSI'] < 35), 'Signal'] = 1  # Buy signal
+    data.loc[(data['EMA_short'] < data['EMA_long']) & (data['RSI'] > 65), 'Signal'] = -1  # Sell signal
+
     trades = []
-    entry_level = None
+    position = None
 
-    for i in range(1, len(data)):
-        # Entry conditions
-        if (data['Close'].iloc[i] > data['SMA20'].iloc[i]) and (data['Close'].iloc[i-1] <= data['SMA20'].iloc[i-1]):
-            entry_level = data['Close'].iloc[i]
+    for index in range(len(data)):
+        row = data.iloc[index]
+        close_price = row['Close'].item()
+        signal = int(row['Signal'].item())
 
-        # Exit conditions
-        if entry_level is not None and (
-            data['Close'].iloc[i] < data['SMA20'].iloc[i] or data['Close'].iloc[i] < data['SMA50'].iloc[i]):
-            exit_level = data['Close'].iloc[i]
-            trades.append((entry_level, exit_level))
-            entry_level = None
+        # Entry condition
+        if position is None and signal == 1:
+            position = {
+                'entry_price': close_price,
+                'entry_date': row.name,
+                'reason': 'EMA short crossed above EMA long and RSI < 35'
+            }
+            stop_loss = close_price - stop_loss_points
 
-    # Calculate results
+        # Exit condition
+        elif position is not None:
+            close_price_scalar = float(close_price)
+
+            # Adjust stop-loss to lock in profits
+            if close_price_scalar > position['entry_price']:
+                stop_loss = max(stop_loss, close_price_scalar - stop_loss_points)
+
+            if close_price_scalar <= stop_loss or signal == -1:
+                exit_price = close_price
+                points = float(exit_price - position['entry_price'])
+                trades.append({
+                    'entry_level': float(position['entry_price']),
+                    'entry_date': position['entry_date'],
+                    'exit_level': float(exit_price),
+                    'exit_date': row.name,
+                    'reason': 'Hit Stop Loss or Signal to Sell',
+                    'points': points
+                })
+                position = None
+
+    return trades
+
+# Analyze trades
+def analyze_trades(trades):
     total_trades = len(trades)
-    profit_trades = sum(1 for entry, exit in trades if exit > entry)
+    profit_trades = sum(1 for trade in trades if trade['points'] > 0)
     loss_trades = total_trades - profit_trades
-    accuracy = profit_trades / total_trades * 100 if total_trades > 0 else 0
-    total_profit_points = sum(exit - entry for entry, exit in trades)
+    total_profit_points = sum(trade['points'] for trade in trades if trade['points'] > 0)
+    total_loss_points = sum(abs(trade['points']) for trade in trades if trade['points'] < 0)
+    accuracy = (profit_trades / total_trades * 100) if total_trades > 0 else 0
 
     return {
-        "total_trades": total_trades,
-        "profit_trades": profit_trades,
-        "loss_trades": loss_trades,
-        "accuracy": accuracy,
-        "total_profit_points": total_profit_points,
+        'total_trades': total_trades,
+        'profit_trades': profit_trades,
+        'loss_trades': loss_trades,
+        'total_profit_points': total_profit_points,
+        'total_loss_points': total_loss_points,
+        'accuracy': accuracy
     }
 
-# List of indices
-indices = {
-    "Nifty 50": "^NSEI",
-    "Bank Nifty": "^NSEBANK",
-    "Sensex": "^BSESN",
-    "Midcap Nifty": "^NSEMDCP",
-    "Fin Nifty": "^NSEFIN",
-}
+# Main function for Streamlit app
+def main():
+    st.title("Options Scalping Strategy")
+    
+    # User inputs
+    symbol = st.selectbox("Select Index", ["^NSEI", "^NSEBANK"], index=1)  # Default is Bank Nifty
+    backtest_days = st.number_input("Backtest Days", min_value=1, max_value=90, value=58)  # Default 58
+    interval = st.selectbox("Select Interval", ["1m", "2m", "5m", "10m", "15m", "30m", "60m"], index=2)  # Default 5m
+    stop_loss_points = st.selectbox("Select Stop Loss Points", [10, 15, 20], index=2)  # Default 20
+    mode = st.selectbox("Select Mode", ["Backtest", "Live Trading"], index=0)  # Default Backtest
 
-# Streamlit app
-st.title("Live Indices Breakout Signals")
+    if st.button("Run Strategy"):
+        end_date = datetime.now()
+        start_date = end_date - timedelta(days=backtest_days)
 
-# Set default values for dropdowns
-backtest_option = st.selectbox("Select an option", ["Backtesting", "Live Trading"], index=0)
-index_name = st.selectbox("Select an index", list(indices.keys()), index=1)  # Default to Bank Nifty
+        data = fetch_data(symbol, start_date.strftime('%Y-%m-%d'), end_date.strftime('%Y-%m-%d'), interval)
 
-# Stop button logic
-if 'stop_execution' not in st.session_state:
-    st.session_state.stop_execution = False
-
-if backtest_option == "Live Trading":
-    stop_button = st.button("Stop Execution")
-    if stop_button:
-        st.session_state.stop_execution = True
-
-# Fetch data for the selected index
-data = fetch_data(indices[index_name])
-
-if data is not None:
-    latest_close = data['Close'].iloc[-1]
-    sma20_latest = data['SMA20'].iloc[-1]
-    sma50_latest = data['SMA50'].iloc[-1]
-
-    if backtest_option == "Live Trading":
-        if st.session_state.stop_execution:
-            st.warning("Execution stopped by user.")
+        if len(data) < 10:
+            st.error("Not enough data to analyze.")
         else:
-            breakout_up = (latest_close > sma20_latest) and (latest_close > sma50_latest)
-            breakout_down = (latest_close < sma20_latest) and (latest_close < sma50_latest)
+            trades = scalping_strategy(data, stop_loss_points)
+            results = analyze_trades(trades)
 
-            st.write(f"Latest Close Price: {latest_close:.2f}")
-            st.write(f"SMA 20: {sma20_latest:.2f}")
-            st.write(f"SMA 50: {sma50_latest:.2f}")
+            # Display results
+            st.success(f"Total Trades: {results['total_trades']}")
+            st.success(f"Profit Trades: {results['profit_trades']}")
+            st.success(f"Loss Trades: {results['loss_trades']}")
+            st.success(f"Total Profit Points: {results['total_profit_points']}")
+            st.success(f"Total Loss Points: {results['total_loss_points']}")
+            st.success(f"Accuracy: {results['accuracy']:.2f}%")
 
-            if breakout_up:
-                st.success("Potential breakout to the upside detected.")
-            elif breakout_down:
-                st.warning("Potential breakout to the downside detected.")
-            else:
-                st.info("No clear breakout signal.")
-    elif backtest_option == "Backtesting":
-        results = backtest(data)
-        st.write(f"Total Trades: {results['total_trades']}")
-        st.write(f"Profit Trades: {results['profit_trades']}")
-        st.write(f"Loss Trades: {results['loss_trades']}")
-        st.write(f"Accuracy: {results['accuracy']:.2f}%")
-        st.write(f"Total Profit Points Captured: {results['total_profit_points']:.2f}")
-else:
-    st.error("Data not available for this index.")
+            # Print trade logs
+            for trade in trades:
+                st.write(f"Entry Level: {trade['entry_level']} on {trade['entry_date']} (Reason: {trade['reason']})")
+                st.write(f"Exit Level: {trade['exit_level']} on {trade['exit_date']} (Points: {trade['points']})")
 
-# Run the Streamlit app
+    if mode == "Live Trading":
+        if st.button("Start Live Trading"):
+            st.write("Live trading started... (simulation)")
+            while True:
+                # Simulate live trading recommendations
+                live_data = fetch_data(symbol, datetime.now() - timedelta(minutes=60), datetime.now(), interval)
+                live_trades = scalping_strategy(live_data, stop_loss_points)
+
+                if live_trades:
+                    for trade in live_trades:
+                        st.write(f"Live Recommendation: Buy at {trade['entry_level']} on {trade['entry_date']}")
+                        st.write(f"Target Exit: {trade['exit_level']} on {trade['exit_date']} (Points: {trade['points']})")
+
+                time.sleep(60)  # Delay for live simulation
+
+                if st.button("Stop Live Trading"):
+                    st.write("Live trading stopped.")
+                    break
+
 if __name__ == "__main__":
-    st.write("Refresh the page to update data.")
+    main()
