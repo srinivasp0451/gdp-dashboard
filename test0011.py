@@ -2,11 +2,20 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import yfinance as yf
+from datetime import datetime, timedelta
 import time
 
-def backtest(symbol, stop_loss, target):
+def fetch_data(symbol, start_date, end_date, interval):
+    """Fetch historical data from Yahoo Finance."""
+    return yf.download(symbol, start=start_date, end=end_date, interval=interval)
+
+def backtest(symbol, stop_loss, target, backtest_days, interval):
+    # Calculate start and end dates for backtest
+    end_date = datetime.now()
+    start_date = end_date - timedelta(days=backtest_days)
+
     # Fetch historical data
-    data = yf.download(symbol, period='5d', interval='1m')
+    data = fetch_data(symbol, start_date.strftime('%Y-%m-%d'), end_date.strftime('%Y-%m-%d'), interval)
 
     # Ensure the data is properly formatted
     data = data[['Close', 'High', 'Low']]
@@ -141,23 +150,21 @@ def main():
     st.title("Trading Strategy Backtest and Live Recommendations")
     
     # Dropdown for selecting index
-    index_options = {
-        'Nifty50': '^NSEI',
-        'Bank Nifty': '^NSEBANK',
-        'Sensex': '^BSESN'
-    }
-    selected_index = st.selectbox("Select Index:", list(index_options.keys()))
-
+    symbol = st.selectbox("Select Index", ["^NSEI", "^NSEBANK", "^NSEFIN", "^NSEMDCP", "^BSESN"], index=1)  # Default is Bank Nifty
+    backtest_days = st.number_input("Backtest Days", min_value=1, max_value=90, value=58)  # Default 58
+    interval = st.selectbox("Select Interval", ["1m", "2m", "5m", "10m", "15m", "30m", "60m"], index=2)  # Default 5m
+    
     # Dropdown for target and stop loss
     target = st.selectbox("Select Target Points:", [10, 20, 30, 40, 50])
     stop_loss = st.selectbox("Select Stop Loss Points:", [5, 10, 15, 20, 25])
 
-    choice = st.radio("Select an option:", ('Backtest', 'Live Trading Recommendations'))
+    if st.button("Run Strategy"):
+        backtest(symbol, stop_loss, target, backtest_days, interval)
 
-    if choice == 'Backtest':
-        backtest(index_options[selected_index], stop_loss, target)
-    elif choice == 'Live Trading Recommendations':
-        live_trade(index_options[selected_index], stop_loss, target)
+    choice = st.radio("Select an option:", ('Live Trading Recommendations'))
+
+    if choice == 'Live Trading Recommendations':
+        live_trade(symbol, stop_loss, target)
 
 if __name__ == "__main__":
     main()
