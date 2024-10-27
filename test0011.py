@@ -158,12 +158,12 @@ def main():
     target = st.selectbox("Select Target Points:", [10, 20, 30, 40, 50])
     stop_loss = st.selectbox("Select Stop Loss Points:", [5, 10, 15, 20, 25])
 
-    if st.button("Run Strategy"):
-        backtest(symbol, stop_loss, target, backtest_days, interval)
+    choice = st.radio("Select an option:", ('Backtest', 'Live Trading Recommendations'))
 
-    choice = st.radio("Select an option:", ('Live Trading Recommendations'))
-
-    if choice == 'Live Trading Recommendations':
+    if choice == 'Backtest':
+        if st.button("Run Strategy"):
+            backtest(symbol, stop_loss, target, backtest_days, interval)
+    elif choice == 'Live Trading Recommendations':
         live_trade(symbol, stop_loss, target)
 
 if __name__ == "__main__":
