@@ -30,7 +30,7 @@ def backtest(symbol, stop_loss, target):
             continue
         
         # Buy signal
-        if (ema9 > ema15).all() and (close > data['Support'].iloc[i]):
+        if ema9 > ema15 and close > data['Support'].iloc[i]:
             signals.append("Buy")
             entry_price = close
             stop_loss_price = entry_price - stop_loss
@@ -38,7 +38,7 @@ def backtest(symbol, stop_loss, target):
             trades.append({"Type": "Buy", "Entry": entry_price, "Stop Loss": stop_loss_price, "Target": target_price})
 
         # Sell signal
-        elif (ema9 < ema15).all() and (close < data['Resistance'].iloc[i]):
+        elif ema9 < ema15 and close < data['Resistance'].iloc[i]:
             signals.append("Sell")
             entry_price = close
             stop_loss_price = entry_price + stop_loss
@@ -54,7 +54,8 @@ def backtest(symbol, stop_loss, target):
     # Evaluate trades
     for trade in trades:
         entry_price = trade["Entry"]
-        for j in range(data.index.get_loc(data[data['Close'] == entry_price].index[0]) + 1, len(data)):
+        entry_time = data[data['Close'] == entry_price].index[0]
+        for j in range(data.index.get_loc(entry_time) + 1, len(data)):
             close_price = data['Close'].iloc[j]
             if trade["Type"] == "Buy":
                 if close_price >= trade["Target"]:
