@@ -1,124 +1,128 @@
-import streamlit as st
 import pandas as pd
 import numpy as np
 import yfinance as yf
-import time
+import streamlit as st
 
-# Function to perform backtesting
 def backtest(symbol, stop_loss, target):
-    data = yf.download(symbol, period='5d', interval='5m')
+    # Fetch historical data
+    data = yf.download(symbol, period='5d', interval='1m')
     data = data[['Close', 'High', 'Low']]
-    
+
     # Calculate EMAs, support, and resistance
     data['EMA9'] = data['Close'].ewm(span=9, adjust=False).mean()
     data['EMA15'] = data['Close'].ewm(span=15, adjust=False).mean()
     data['Support'] = data['Low'].rolling(window=5).min()
     data['Resistance'] = data['High'].rolling(window=5).max()
 
+    # Trading signals
     signals = []
     trades = []
-    total_profit_points = 0
-    total_loss_points = 0
+    trade_details = []
 
-    for i in range(len(data)):
+    for i in range(1, len(data)):
         close = data['Close'].iloc[i]
         ema9 = data['EMA9'].iloc[i]
         ema15 = data['EMA15'].iloc[i]
-        
-        if pd.isna(close) or pd.isna(ema9) or pd.isna(ema15):
-            signals.append("Hold")
-            continue
-        
+        support = data['Support'].iloc[i]
+        resistance = data['Resistance'].iloc[i]
+
         # Buy signal
-        if ema9 > ema15 and close > data['Support'].iloc[i]:
-            signals.append("Buy")
+        if (ema9 > ema15) and (close > support):
             entry_price = close
             stop_loss_price = entry_price - stop_loss
             target_price = entry_price + target
-            trades.append({"Type": "Buy", "Entry": entry_price, "Stop Loss": stop_loss_price, "Target": target_price})
+            trades.append({"Type": "Buy", "Entry": entry_price, "Stop Loss": stop_loss_price, "Target": target_price, "Entry Time": data.index[i]})
 
         # Sell signal
-        elif ema9 < ema15 and close < data['Resistance'].iloc[i]:
-            signals.append("Sell")
+        elif (ema9 < ema15) and (close < resistance):
             entry_price = close
             stop_loss_price = entry_price + stop_loss
             target_price = entry_price - target
-            trades.append({"Type": "Sell", "Entry": entry_price, "Stop Loss": stop_loss_price, "Target": target_price})
+            trades.append({"Type": "Sell", "Entry": entry_price, "Stop Loss": stop_loss_price, "Target": target_price, "Entry Time": data.index[i]})
 
-        else:
-            signals.append("Hold")
+        signals.append("Hold")
 
-    # Assign signals to DataFrame
-    data['Signal'] = pd.Series(signals, index=data.index[:len(signals)])
+    data['Signal'] = signals
 
     # Evaluate trades
+    total_profit_points = 0
+    total_loss_points = 0
+    profitable_trades = 0
+    loss_trades = 0
+
     for trade in trades:
         entry_price = trade["Entry"]
-        entry_time = data[data['Close'] == entry_price].index[0]
+        entry_time = trade["Entry Time"]
+
         for j in range(data.index.get_loc(entry_time) + 1, len(data)):
             close_price = data['Close'].iloc[j]
             if trade["Type"] == "Buy":
                 if close_price >= trade["Target"]:
-                    total_profit_points += target
+                    points = target
+                    total_profit_points += points
+                    profitable_trades += 1
+                    trade_details.append({"Entry Time": entry_time, "Exit Time": data.index[j], "Entry Price": entry_price, "Exit Price": trade["Target"], "Points": points, "Result": "Profit"})
                     break
                 elif close_price <= trade["Stop Loss"]:
-                    total_loss_points += stop_loss
+                    points = -stop_loss
+                    total_loss_points += -points
+                    loss_trades += 1
+                    trade_details.append({"Entry Time": entry_time, "Exit Time": data.index[j], "Entry Price": entry_price, "Exit Price": trade["Stop Loss"], "Points": points, "Result": "Loss"})
                     break
             elif trade["Type"] == "Sell":
                 if close_price <= trade["Target"]:
-                    total_profit_points += target
+                    points = target
+                    total_profit_points += points
+                    profitable_trades += 1
+                    trade_details.append({"Entry Time": entry_time, "Exit Time": data.index[j], "Entry Price": entry_price, "Exit Price": trade["Target"], "Points": points, "Result": "Profit"})
                     break
                 elif close_price >= trade["Stop Loss"]:
-                    total_loss_points += stop_loss
+                    points = -stop_loss
+                    total_loss_points += -points
+                    loss_trades += 1
+                    trade_details.append({"Entry Time": entry_time, "Exit Time": data.index[j], "Entry Price": entry_price, "Exit Price": trade["Stop Loss"], "Points": points, "Result": "Loss"})
                     break
 
-    # Display results
-    st.write("### Backtest Results:")
-    st.write(f"Total Trades: {len(trades)}")
-    st.write(f"Total Profit Points: {total_profit_points}")
-    st.write(f"Total Loss Points: {total_loss_points}")
-    st.write(f"Net Profit/Loss Points: {total_profit_points - total_loss_points}")
+    # Calculate performance metrics
+    total_trades = profitable_trades + loss_trades
+    accuracy = (profitable_trades / total_trades * 100) if total_trades > 0 else 0
 
-# Function for live trading
-def live_trade(symbol, stop_loss, target):
-    st.write("### Live Trading Recommendations:")
-    live_status = st.empty()  # Placeholder for live trading status
-    stop_live = st.button("Stop Live Trading")
-    
-    while True:
-        data = yf.download(symbol, period='1d', interval='1m')
-        data = data[['Close', 'High', 'Low']]
-        
-        # Calculate EMAs
-        data['EMA9'] = data['Close'].ewm(span=9, adjust=False).mean()
-        data['EMA15'] = data['Close'].ewm(span=15, adjust=False).mean()
+    return {
+        "Total Trades": total_trades,
+        "Profitable Trades": profitable_trades,
+        "Loss Trades": loss_trades,
+        "Accuracy": accuracy,
+        "Total Profit Points": total_profit_points,
+        "Total Loss Points": total_loss_points,
+        "Net Profit/Loss Points": total_profit_points - total_loss_points,
+        "Trade Details": trade_details
+    }
 
-        close = data['Close'].iloc[-1]
-        ema9 = data['EMA9'].iloc[-1]
-        ema15 = data['EMA15'].iloc[-1]
+def main():
+    st.title("Trading Backtest App")
 
-        if ema9 > ema15:
-            live_status.text(f"Recommendation: Buy at {close}")
-        elif ema9 < ema15:
-            live_status.text(f"Recommendation: Sell at {close}")
-        else:
-            live_status.text(f"Recommendation: Hold at {close}")
+    # User inputs
+    symbol = st.selectbox("Select Index", ["^NSEI", "^NSEIBANK"])
+    stop_loss = st.number_input("Stop Loss (Points)", value=10)
+    target = st.number_input("Target (Points)", value=20)
 
-        # Break the loop if Stop Live Trading button is clicked
-        if stop_live:
-            break
+    if st.button("Run Backtest"):
+        results = backtest(symbol, stop_loss, target)
 
-        time.sleep(60)  # Wait for a minute
+        # Display results
+        st.subheader("Backtest Results")
+        st.write(f"Total Trades: {results['Total Trades']}")
+        st.write(f"Profitable Trades: {results['Profitable Trades']}")
+        st.write(f"Loss Trades: {results['Loss Trades']}")
+        st.write(f"Accuracy: {results['Accuracy']:.2f}%")
+        st.write(f"Total Profit Points: {results['Total Profit Points']}")
+        st.write(f"Total Loss Points: {results['Total Loss Points']}")
+        st.write(f"Net Profit/Loss Points: {results['Net Profit/Loss Points']}")
 
-# Streamlit UI
-st.title("Trading Strategy")
-symbol = st.selectbox("Select Index", ["^NSEI", "^NSEBANK", "^NSEFIN", "^NSEMDCP", "^BSESN"], index=1)  
-stop_loss_points = st.selectbox("Select Stop Loss Points", [5, 10, 15, 20, 25, 30, 35, 40, 45, 50], index=3)  
-target_points = 20  # Fixed target points
-mode = st.selectbox("Select Mode", ["Backtest", "Live Trading"], index=0)  
+        # Display trade details
+        st.subheader("Trade Details")
+        for trade in results["Trade Details"]:
+            st.write(f"Entry Time: {trade['Entry Time']}, Exit Time: {trade['Exit Time']}, Entry Price: {trade['Entry Price']}, Exit Price: {trade['Exit Price']}, Points: {trade['Points']}, Result: {trade['Result']}")
 
-if st.button("Run Strategy"):
-    if mode == "Backtest":
-        backtest(symbol, stop_loss_points, target_points)
-    elif mode == "Live Trading":
-        live_trade(symbol, stop_loss_points, target_points)
+if __name__ == "__main__":
+    main()
