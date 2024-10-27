@@ -4,12 +4,7 @@ import numpy as np
 import yfinance as yf
 import time
 
-def backtest():
-    # Parameters
-    symbol = '^NSEI'  # Nifty index ticker
-    stop_loss = 10
-    target = 20
-
+def backtest(symbol, stop_loss, target):
     # Fetch historical data
     data = yf.download(symbol, period='5d', interval='1m')
 
@@ -113,12 +108,9 @@ def backtest():
     st.write("Trade Details:")
     st.write(pd.DataFrame(trade_details))
 
-def live_trade():
+def live_trade(symbol, stop_loss, target):
     st.write("\nLive Trading Recommendations (Simulated):")
-    symbol = '^NSEI'
-    stop_loss = 10
-    target = 20
-
+    
     # Simulated recommendation loop (you would replace this with real-time data)
     while True:
         # Fetch live data
@@ -147,13 +139,25 @@ def live_trade():
 
 def main():
     st.title("Trading Strategy Backtest and Live Recommendations")
-    st.write("Choose an option:")
+    
+    # Dropdown for selecting index
+    index_options = {
+        'Nifty50': '^NSEI',
+        'Bank Nifty': '^NSEBANK',
+        'Sensex': '^BSESN'
+    }
+    selected_index = st.selectbox("Select Index:", list(index_options.keys()))
+
+    # Dropdown for target and stop loss
+    target = st.selectbox("Select Target Points:", [10, 20, 30, 40, 50])
+    stop_loss = st.selectbox("Select Stop Loss Points:", [5, 10, 15, 20, 25])
+
     choice = st.radio("Select an option:", ('Backtest', 'Live Trading Recommendations'))
 
     if choice == 'Backtest':
-        backtest()
+        backtest(index_options[selected_index], stop_loss, target)
     elif choice == 'Live Trading Recommendations':
-        live_trade()
+        live_trade(index_options[selected_index], stop_loss, target)
 
 if __name__ == "__main__":
     main()
