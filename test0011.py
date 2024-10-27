@@ -12,6 +12,8 @@ def backtest():
 
     # Fetch historical data
     data = yf.download(symbol, period='5d', interval='1m')
+
+    # Ensure the data is properly formatted
     data = data[['Close', 'High', 'Low']]
 
     # Calculate EMAs, support, and resistance
@@ -26,117 +28,132 @@ def backtest():
     trade_details = []
 
     for i in range(1, len(data)):
-        close = data['Close'].iloc[i]
-        ema9 = data['EMA9'].iloc[i]
-        ema15 = data['EMA15'].iloc[i]
-        support = data['Support'].iloc[i]
-        resistance = data['Resistance'].iloc[i]
+        try:
+            close = data['Close'].iloc[i].item()
+            ema9 = data['EMA9'].iloc[i].item()
+            ema15 = data['EMA15'].iloc[i].item()
+            support = data['Support'].iloc[i].item()
+            resistance = data['Resistance'].iloc[i].item()
 
-        # Buy signal
-        if (ema9 > ema15) and (close > support):
-            signals.append("Buy")
-            entry_price = close
-            stop_loss_price = entry_price - stop_loss
-            target_price = entry_price + target
-            trades.append({"Type": "Buy", "Entry": entry_price, "Stop Loss": stop_loss_price, "Target": target_price, "Entry Time": data.index[i]})
+            # Buy signal
+            if (ema9 > ema15) and (close > support):
+                signals.append("Buy")
+                entry_price = close
+                stop_loss_price = entry_price - stop_loss
+                target_price = entry_price + target
+                trades.append({"Type": "Buy", "Entry": entry_price, "Stop Loss": stop_loss_price, "Target": target_price, "Entry Time": data.index[i]})
 
-        # Sell signal
-        elif (ema9 < ema15) and (close < resistance):
-            signals.append("Sell")
-            entry_price = close
-            stop_loss_price = entry_price + stop_loss
-            target_price = entry_price - target
-            trades.append({"Type": "Sell", "Entry": entry_price, "Stop Loss": stop_loss_price, "Target": target_price, "Entry Time": data.index[i]})
-        else:
-            signals.append("Hold")
+            # Sell signal
+            elif (ema9 < ema15) and (close < resistance):
+                signals.append("Sell")
+                entry_price = close
+                stop_loss_price = entry_price + stop_loss
+                target_price = entry_price - target
+                trades.append({"Type": "Sell", "Entry": entry_price, "Stop Loss": stop_loss_price, "Target": target_price, "Entry Time": data.index[i]})
+
+            else:
+                signals.append("Hold")
+
+        except Exception as e:
+            print(f"Error at index {i}: {e}")
+
+    while len(signals) < len(data):
+        signals.append("Hold")
 
     data['Signal'] = signals
 
     # Evaluate trades
     total_profit_points = 0
     total_loss_points = 0
+    total_trades = 0
 
     for trade in trades:
         entry_price = trade["Entry"]
         entry_time = trade["Entry Time"]
 
         for j in range(data.index.get_loc(entry_time) + 1, len(data)):
-            close_price = data['Close'].iloc[j]
+            close_price = data['Close'].iloc[j].item()
             if trade["Type"] == "Buy":
                 if close_price >= trade["Target"]:
                     points = target
                     total_profit_points += points
+                    total_trades += 1
                     trade_details.append({"Entry Time": entry_time, "Exit Time": data.index[j], "Entry Price": entry_price, "Exit Price": trade["Target"], "Points": points, "Result": "Profit"})
                     break
                 elif close_price <= trade["Stop Loss"]:
                     points = -stop_loss
                     total_loss_points += -points
+                    total_trades += 1
                     trade_details.append({"Entry Time": entry_time, "Exit Time": data.index[j], "Entry Price": entry_price, "Exit Price": trade["Stop Loss"], "Points": points, "Result": "Loss"})
                     break
             elif trade["Type"] == "Sell":
                 if close_price <= trade["Target"]:
                     points = target
                     total_profit_points += points
+                    total_trades += 1
                     trade_details.append({"Entry Time": entry_time, "Exit Time": data.index[j], "Entry Price": entry_price, "Exit Price": trade["Target"], "Points": points, "Result": "Profit"})
                     break
                 elif close_price >= trade["Stop Loss"]:
                     points = -stop_loss
                     total_loss_points += -points
+                    total_trades += 1
                     trade_details.append({"Entry Time": entry_time, "Exit Time": data.index[j], "Entry Price": entry_price, "Exit Price": trade["Stop Loss"], "Points": points, "Result": "Loss"})
                     break
 
-    return len(trade_details), total_profit_points, total_loss_points, total_profit_points - total_loss_points
+    # Calculate accuracy
+    accuracy = (total_trades - total_loss_points / stop_loss) / total_trades * 100 if total_trades > 0 else 0
+
+    # Display results
+    st.write("\nBacktest Results:")
+    st.write(f"Total Trades: {total_trades}")
+    st.write(f"Total Profit Points: {total_profit_points}")
+    st.write(f"Total Loss Points: {total_loss_points}")
+    st.write(f"Net Profit/Loss Points: {total_profit_points - total_loss_points}")
+    st.write(f"Accuracy: {accuracy:.2f}%")
+    st.write("Trade Details:")
+    st.write(pd.DataFrame(trade_details))
 
 def live_trade():
+    st.write("\nLive Trading Recommendations (Simulated):")
     symbol = '^NSEI'
     stop_loss = 10
     target = 20
 
-    # Placeholder for live trading recommendations
-    close = None
-    recommendation = "Waiting for live data..."
+    # Simulated recommendation loop (you would replace this with real-time data)
+    while True:
+        # Fetch live data
+        data = yf.download(symbol, period='1d', interval='1m')
+        data = data[['Close', 'High', 'Low']]
 
-    # Fetch live data
-    data = yf.download(symbol, period='1d', interval='1m')
-    data = data[['Close', 'High', 'Low']]
-    
-    # Calculate EMAs
-    data['EMA9'] = data['Close'].ewm(span=9, adjust=False).mean()
-    data['EMA15'] = data['Close'].ewm(span=15, adjust=False).mean()
+        # Calculate EMAs
+        data['EMA9'] = data['Close'].ewm(span=9, adjust=False).mean()
+        data['EMA15'] = data['Close'].ewm(span=15, adjust=False).mean()
 
-    close = data['Close'].iloc[-1]
-    ema9 = data['EMA9'].iloc[-1]
-    ema15 = data['EMA15'].iloc[-1]
+        # Latest values
+        close = data['Close'].iloc[-1].item()
+        ema9 = data['EMA9'].iloc[-1].item()
+        ema15 = data['EMA15'].iloc[-1].item()
 
-    # Generate recommendation
-    if ema9 > ema15:
-        recommendation = f"Recommendation: Buy at {close:.2f}"
-    elif ema9 < ema15:
-        recommendation = f"Recommendation: Sell at {close:.2f}"
-    else:
-        recommendation = f"Recommendation: Hold at {close:.2f}"
+        # Generate recommendation
+        if ema9 > ema15:
+            st.write(f"Recommendation: Buy at {close}")
+        elif ema9 < ema15:
+            st.write(f"Recommendation: Sell at {close}")
+        else:
+            st.write(f"Recommendation: Hold at {close}")
 
-    return recommendation
+        # Wait for a minute before fetching new data
+        time.sleep(60)  # Adjust based on your needs
 
 def main():
-    st.title("Trading Strategy Application")
+    st.title("Trading Strategy Backtest and Live Recommendations")
+    st.write("Choose an option:")
+    choice = st.radio("Select an option:", ('Backtest', 'Live Trading Recommendations'))
 
-    option = st.selectbox("Choose an option:", ["Backtest", "Live Trading Recommendations"])
-
-    if option == "Backtest":
-        if st.button("Run Backtest"):
-            trades, total_profit, total_loss, net_profit = backtest()
-            st.write("### Backtest Results")
-            st.write(f"Total Trades: {trades}")
-            st.write(f"Total Profit Points: {total_profit}")
-            st.write(f"Total Loss Points: {total_loss}")
-            st.write(f"Net Profit/Loss Points: {net_profit}")
-
-    elif option == "Live Trading Recommendations":
-        if st.button("Get Live Recommendations"):
-            recommendation = live_trade()
-            st.write("### Live Trading Recommendation")
-            st.write(recommendation)
+    if choice == 'Backtest':
+        backtest()
+    elif choice == 'Live Trading Recommendations':
+        live_trade()
 
 if __name__ == "__main__":
     main()
