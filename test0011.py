@@ -17,23 +17,28 @@ def backtest(symbol, stop_loss, target):
 
     signals = []
     trades = []
-    trade_details = []
-    
-    for i in range(1, len(data)):
-        close = data['Close'].iloc[i].item()
-        ema9 = data['EMA9'].iloc[i].item()
-        ema15 = data['EMA15'].iloc[i].item()
-        support = data['Support'].iloc[i].item()
-        resistance = data['Resistance'].iloc[i].item()
+    total_profit_points = 0
+    total_loss_points = 0
 
-        if (ema9 > ema15) and (close > support):
+    for i in range(len(data)):
+        close = data['Close'].iloc[i]
+        ema9 = data['EMA9'].iloc[i]
+        ema15 = data['EMA15'].iloc[i]
+        
+        if pd.isna(close) or pd.isna(ema9) or pd.isna(ema15):
+            signals.append("Hold")
+            continue
+        
+        # Buy signal
+        if (ema9 > ema15) and (close > data['Support'].iloc[i]):
             signals.append("Buy")
             entry_price = close
             stop_loss_price = entry_price - stop_loss
             target_price = entry_price + target
             trades.append({"Type": "Buy", "Entry": entry_price, "Stop Loss": stop_loss_price, "Target": target_price})
 
-        elif (ema9 < ema15) and (close < resistance):
+        # Sell signal
+        elif (ema9 < ema15) and (close < data['Resistance'].iloc[i]):
             signals.append("Sell")
             entry_price = close
             stop_loss_price = entry_price + stop_loss
@@ -43,14 +48,14 @@ def backtest(symbol, stop_loss, target):
         else:
             signals.append("Hold")
 
-    data['Signal'] = signals
-    total_profit_points = 0
-    total_loss_points = 0
+    # Assign signals to DataFrame
+    data['Signal'] = pd.Series(signals, index=data.index[:len(signals)])
 
+    # Evaluate trades
     for trade in trades:
         entry_price = trade["Entry"]
-        for j in range(i + 1, len(data)):
-            close_price = data['Close'].iloc[j].item()
+        for j in range(data.index.get_loc(data[data['Close'] == entry_price].index[0]) + 1, len(data)):
+            close_price = data['Close'].iloc[j]
             if trade["Type"] == "Buy":
                 if close_price >= trade["Target"]:
                     total_profit_points += target
@@ -66,6 +71,7 @@ def backtest(symbol, stop_loss, target):
                     total_loss_points += stop_loss
                     break
 
+    # Display results
     st.write("### Backtest Results:")
     st.write(f"Total Trades: {len(trades)}")
     st.write(f"Total Profit Points: {total_profit_points}")
@@ -86,9 +92,9 @@ def live_trade(symbol, stop_loss, target):
         data['EMA9'] = data['Close'].ewm(span=9, adjust=False).mean()
         data['EMA15'] = data['Close'].ewm(span=15, adjust=False).mean()
 
-        close = data['Close'].iloc[-1].item()
-        ema9 = data['EMA9'].iloc[-1].item()
-        ema15 = data['EMA15'].iloc[-1].item()
+        close = data['Close'].iloc[-1]
+        ema9 = data['EMA9'].iloc[-1]
+        ema15 = data['EMA15'].iloc[-1]
 
         if ema9 > ema15:
             live_status.text(f"Recommendation: Buy at {close}")
