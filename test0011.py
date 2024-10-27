@@ -15,7 +15,6 @@ def backtest(symbol, stop_loss, target):
     data['Resistance'] = data['High'].rolling(window=5).max()
 
     # Trading signals
-    signals = []
     trades = []
     trade_details = []
 
@@ -39,10 +38,6 @@ def backtest(symbol, stop_loss, target):
             stop_loss_price = entry_price + stop_loss
             target_price = entry_price - target
             trades.append({"Type": "Sell", "Entry": entry_price, "Stop Loss": stop_loss_price, "Target": target_price, "Entry Time": data.index[i]})
-
-        signals.append("Hold")
-
-    data['Signal'] = signals
 
     # Evaluate trades
     total_profit_points = 0
