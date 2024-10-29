@@ -152,8 +152,8 @@ def main():
     # Dropdown for selecting index
     symbol = st.selectbox("Select Index", ["^NSEI", "^NSEBANK", "^NSEFIN", "^NSEMDCP", "^BSESN"], index=1)  # Default is Bank Nifty
     backtest_days = st.number_input("Backtest Days", min_value=1, max_value=90, value=58)  # Default 58
-    interval = st.selectbox("Select Interval", ["1m", "2m", "5m", "10m", "15m", "30m", "60m"], index=2)  # Default 5m
-    
+    #interval = st.selectbox("Select Interval", ["1m", "2m", "5m", "10m", "15m", "30m", "60m"], index=2)  # Default 5m
+    interval ="5min"
     # Dropdown for target and stop loss
     target = st.selectbox("Select Target Points:", [10, 20, 30, 40, 50])
     stop_loss = st.selectbox("Select Stop Loss Points:", [5, 10, 15, 20, 25])
