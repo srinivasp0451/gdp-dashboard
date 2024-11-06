@@ -120,9 +120,9 @@ def live_trading_recommendation(index, stoploss_points):
         prev_sma_10 = prev_data['SMA_10']
         prev_sma_50 = prev_data['SMA_50']
 
-        if current_sma_10 > current_sma_50 and prev_sma_10 <= prev_sma_50:
+        if current_sma_10.values[0] > current_sma_50.values[0] and prev_sma_10.values[0] <= prev_sma_50.values[0]:
             st.write(f"Recommendation: BUY at {current_close} | {datetime.now()}")
-        elif current_sma_10 < current_sma_50 and prev_sma_10 >= prev_sma_50:
+        elif current_sma_10.values[0] < current_sma_50.values[0] and prev_sma_10.values[0] >= prev_sma_50.values[0]:
             st.write(f"Recommendation: SELL at {current_close} | {datetime.now()}")
         else:
             st.write(f"Recommendation: HOLD at {current_close} | {datetime.now()}")
