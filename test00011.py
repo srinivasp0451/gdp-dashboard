@@ -54,7 +54,7 @@ def backtest_strategy(data, stoploss_points):
             entry_price = current_close.values[0]
             entry_time = data.index[i]
             in_position = True
-            st.write(f"Buy Signal at {entry_time} | Price: {entry_price}")
+            #st.write(f"Buy Signal at {entry_time} | Price: {entry_price}")
 
         if in_position:
             stop_loss_level = entry_price - STOPLOSS
