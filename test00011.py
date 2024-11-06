@@ -51,7 +51,7 @@ def backtest_strategy(data, stoploss_points):
         current_close = data['Close'].iloc[i]
 
         if current_sma_10 > current_sma_50 and prev_sma_10 <= prev_sma_50 and not in_position:
-            entry_price = current_close
+            entry_price = current_close.values[0]
             entry_time = data.index[i]
             in_position = True
             st.write(f"Buy Signal at {entry_time} | Price: {entry_price}")
@@ -60,8 +60,8 @@ def backtest_strategy(data, stoploss_points):
             stop_loss_level = entry_price - STOPLOSS
             take_profit_level = entry_price + STOPLOSS
 
-            if current_close <= stop_loss_level or current_close >= take_profit_level:
-                exit_price = current_close
+            if current_close.values[0] <= stop_loss_level or current_close.values[0] >= take_profit_level:
+                exit_price = current_close.values[0]
                 exit_time = data.index[i]
                 profit_loss_points = exit_price - entry_price
 
