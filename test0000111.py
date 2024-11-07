@@ -148,11 +148,11 @@ def main():
     period = st.selectbox("Select Data Period", ["1d", "5d", "1mo", "3mo", "6mo", "1y"])
 
     # User input for timeframe (1 minute, 5 minutes, 1 hour, etc.)
-    timeframe = st.selectbox("Select Timeframe", ["1m", "3m", "5m", "15m", "60m"])
+    timeframe = st.selectbox("Select Timeframe", ["1m", "2m", "5m", "10m", "15m", "60m"])
 
     # User input for EMA short and long periods
-    ema_short_period = st.number_input("Short EMA Period", min_value=1, max_value=50, value=9)
-    ema_long_period = st.number_input("Long EMA Period", min_value=1, max_value=50, value=21)
+    ema_short_period = st.number_input("Short EMA Period", min_value=1, max_value=5000, value=9)
+    ema_long_period = st.number_input("Long EMA Period", min_value=1, max_value=5000, value=21)
 
     # User input to select Backtest or Live Trading mode
     mode = st.radio("Select Mode", ("Backtest", "Live Trading"))
