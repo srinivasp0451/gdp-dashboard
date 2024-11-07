@@ -24,8 +24,8 @@ def apply_strategy(data,ma1,ma2,matype):
         return data
 
     if(matype=="ema"):
-        data['SMA_10'] = df['Close'].ewm(span=ma1, adjust=False).mean()
-        data['SMA_50'] = df['Close'].ewm(span=ma2, adjust=False).mean()
+        data['SMA_10'] = data['Close'].ewm(span=ma1, adjust=False).mean()
+        data['SMA_50'] = data['Close'].ewm(span=ma2, adjust=False).mean()
     else:
         data['SMA_10'] = data['Close'].rolling(window=ma1).mean()  # 10-period SMA
         data['SMA_50'] = data['Close'].rolling(window=ma2).mean()  # 50-period SMA
