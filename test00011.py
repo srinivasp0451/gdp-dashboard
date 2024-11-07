@@ -23,8 +23,8 @@ def apply_strategy(data):
         print("Not enough data to apply strategy (need at least 200 rows).")
         return data
 
-    data['SMA_10'] = data['Close'].rolling(window=100).mean()  # 10-period SMA
-    data['SMA_50'] = data['Close'].rolling(window=200).mean()  # 50-period SMA
+    data['SMA_10'] = data['Close'].rolling(window=9).mean()  # 10-period SMA
+    data['SMA_50'] = data['Close'].rolling(window=15).mean()  # 50-period SMA
     data.dropna(inplace=True)  # Remove NaN values after moving average calculations
     return data
 
