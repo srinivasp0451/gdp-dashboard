@@ -18,13 +18,17 @@ def fetch_data(ticker,period=PERIOD, interval=INTERVAL):
     return data
 
 # Simple Moving Average Crossover strategy for scalping
-def apply_strategy(data,ma1,ma2):
+def apply_strategy(data,ma1,ma2,matype):
     if len(data) < 200:  # Ensure there's enough data for SMA calculation
         print("Not enough data to apply strategy (need at least 200 rows).")
         return data
 
-    data['SMA_10'] = data['Close'].rolling(window=ma1).mean()  # 10-period SMA
-    data['SMA_50'] = data['Close'].rolling(window=ma2).mean()  # 50-period SMA
+    if(matype=="ema"):
+        data['SMA_10'] = df['Close'].ewm(span=ma1, adjust=False).mean()
+        data['SMA_50'] = df['Close'].ewm(span=ma2, adjust=False).mean()
+    else:
+        data['SMA_10'] = data['Close'].rolling(window=ma1).mean()  # 10-period SMA
+        data['SMA_50'] = data['Close'].rolling(window=ma2).mean()  # 50-period SMA
     data.dropna(inplace=True)  # Remove NaN values after moving average calculations
     return data
 
@@ -138,6 +142,7 @@ def main():
     
     # Select the strategy type
     strategy_type = st.selectbox("Select Strategy Type", ["Backtesting", "Live Trading"], index=0)
+    matype = st.selectbox("Select MA Type", ["ema", "sma"], index=1)
 
     # Backtesting settings
     if strategy_type == "Backtesting":
@@ -150,7 +155,7 @@ def main():
         # Button to run backtest
         if st.button("Run Backtest"):
             data = fetch_data(index,period=period, interval=interval)
-            data = apply_strategy(data,ma1,ma2)
+            data = apply_strategy(data,ma1,ma2,matype)
             backtest_strategy(data, stoploss_points)
 
     # Live trading settings
