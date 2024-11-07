@@ -13,8 +13,8 @@ PERIOD = "1mo"  # Default period for backtesting
 INTERVAL = "5m"  # Default interval for backtesting
 
 # Fetch Data for Backtesting or Live
-def fetch_data(period=PERIOD, interval=INTERVAL):
-    data = yf.download(NIFTY50_TICKER, period=period, interval=interval)
+def fetch_data(ticker,period=PERIOD, interval=INTERVAL):
+    data = yf.download(ticker=ticker, period=period, interval=interval)
     return data
 
 # Simple Moving Average Crossover strategy for scalping
@@ -97,7 +97,7 @@ def live_trading_recommendation(index, stoploss_points):
     STOPLOSS = stoploss_points  # Set stop loss based on user input
     
     while True:
-        data = fetch_data(period="5d", interval="5m")  # 5 days, 5-minute intervals
+        data = fetch_data(index,period="5d", interval="5m")  # 5 days, 5-minute intervals
         if len(data) < 2:
             st.write("Not enough data to generate recommendation. Waiting for more data...")
             time.sleep(120)  # Sleep for 2 minutes before trying again
@@ -134,7 +134,7 @@ def main():
     st.title("Stock Strategy Backtesting / Live Trading")
 
     # Select the index
-    index = st.selectbox("Select Index", ["^NSEBANK", "^NSEI", "^BSESN", "^FINNIFTY", "^MIDCAP", "^BANKEX"])
+    index = st.selectbox("Select Index", ["^NSEBANK", "^NSEI", "^BSESN", "^FINNIFTY", "^MIDCAP", "^BANKEX"],index=0)
     
     # Select the strategy type
     strategy_type = st.selectbox("Select Strategy Type", ["Backtesting", "Live Trading"], index=0)
@@ -147,7 +147,7 @@ def main():
 
         # Button to run backtest
         if st.button("Run Backtest"):
-            data = fetch_data(period=period, interval=interval)
+            data = fetch_data(index,period=period, interval=interval)
             data = apply_strategy(data)
             backtest_strategy(data, stoploss_points)
 
