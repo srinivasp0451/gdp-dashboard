@@ -142,7 +142,7 @@ def main():
     # Backtesting settings
     if strategy_type == "Backtesting":
         period = st.selectbox("Select Period", ["1d", "5d", "7d", "1mo", "3mo", "5mo"], index=3)
-        interval = st.selectbox("Select Interval", ["1m", "2m", "3m", "5m", "15m", "30m", "1hr"], index=3)
+        interval = st.selectbox("Select Interval", ["1m", "2m", "5m", "15m", "30m", "60m","1wk"], index=2)
         stoploss_points = st.number_input("Enter Stop Loss (Points)", min_value=1, value=10)
 
         # Button to run backtest
