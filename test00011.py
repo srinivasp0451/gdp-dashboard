@@ -14,7 +14,7 @@ INTERVAL = "5m"  # Default interval for backtesting
 
 # Fetch Data for Backtesting or Live
 def fetch_data(ticker,period=PERIOD, interval=INTERVAL):
-    data = yf.download(ticker=ticker, period=period, interval=interval)
+    data = yf.download(ticker, period=period, interval=interval)
     return data
 
 # Simple Moving Average Crossover strategy for scalping
