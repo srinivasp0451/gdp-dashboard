@@ -53,7 +53,8 @@ def backtest_strategy(df, ema_short_period, ema_long_period, initial_balance=100
     df['EMA_long'] = calculate_ema(df['Close'], ema_long_period)
 
     # Convert the index (timestamps) to IST
-    df.index = pd.to_datetime(df.index).tz_localize('UTC').tz_convert('Asia/Kolkata')
+    #df.index = pd.to_datetime(df.index).tz_localize('UTC').tz_convert('Asia/Kolkata')
+    df.index = df.index.tz_convert('Asia/Kolkata')
 
     # Define Buy and Sell signals based on EMA crossovers
     df['Buy_Signal'] = (df['EMA_short'] > df['EMA_long']) & (df['EMA_short'].shift(1) <= df['EMA_long'].shift(1))
