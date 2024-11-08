@@ -101,7 +101,7 @@ def live_trading_recommendation(index, stoploss_points,ma1,ma2,matype):
     STOPLOSS = stoploss_points  # Set stop loss based on user input
     
     while True:
-        data = fetch_data(index,period="5d", interval="5m")  # 5 days, 5-minute intervals
+        data = fetch_data(index,period="1d", interval="5m")  # 5 days, 5-minute intervals
         if len(data) < 2:
             st.write("Not enough data to generate recommendation. Waiting for more data...")
             time.sleep(120)  # Sleep for 2 minutes before trying again
@@ -114,6 +114,7 @@ def live_trading_recommendation(index, stoploss_points,ma1,ma2,matype):
             time.sleep(120)
             continue
 
+        st.write("before")
         current_data = data.iloc[-1]
         prev_data = data.iloc[-2]
 
