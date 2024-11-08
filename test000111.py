@@ -173,7 +173,7 @@ def main():
         if st.button("stop run"):
             #stop_threads=False
             stop_threads = True
-            t1.join()
+            #t1.join()
         
 
 if __name__ == "__main__":
