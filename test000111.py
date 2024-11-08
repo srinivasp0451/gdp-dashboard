@@ -169,9 +169,11 @@ def main():
         # Button to start live trading
         if st.button("Start Live Trading"):
             st.write("Starting live trading...")
-            threading.Thread(target=live_trading_recommendation, args=(index, stoploss_points,ma1,ma2,matype), daemon=True).start()
+            t1 = threading.Thread(target=live_trading_recommendation, args=(index, stoploss_points,ma1,ma2,matype), daemon=True).start()
         if st.button("stop run"):
-            stop_threads=False
+            #stop_threads=False
+            stop_threads = True
+            t1.join()
         
 
 if __name__ == "__main__":
