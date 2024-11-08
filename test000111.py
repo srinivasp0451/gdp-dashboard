@@ -107,7 +107,7 @@ def live_trading_recommendation(index, stoploss_points):
             time.sleep(120)  # Sleep for 2 minutes before trying again
             continue
 
-        data = apply_strategy(data)
+        data = apply_strategy(data,ma1,ma2,matype)
 
         if len(data) < 2:
             st.write("Not enough data after applying strategy. Waiting for more data...")
@@ -143,15 +143,16 @@ def main():
     # Select the strategy type
     strategy_type = st.selectbox("Select Strategy Type", ["Backtesting", "Live Trading"], index=0)
     matype = st.selectbox("Select MA Type", ["ema", "sma"], index=1)
+    ma1 = st.number_input("Enter MA1",min_value=1,value=100)
+    ma2 = st.number_input("Enter MA2",min_value=1,value=200)
+
 
     # Backtesting settings
     if strategy_type == "Backtesting":
         period = st.selectbox("Select Period", ["1d", "5d", "7d", "1mo", "3mo", "5mo"], index=3)
         interval = st.selectbox("Select Interval", ["1m", "2m", "5m", "15m", "30m", "60m","1wk"], index=2)
         stoploss_points = st.number_input("Enter Stop Loss (Points)", min_value=1, value=10)
-        ma1 = st.number_input("Enter MA1",min_value=1,value=100)
-        ma2 = st.number_input("Enter MA2",min_value=1,value=200)
-
+        
         # Button to run backtest
         if st.button("Run Backtest"):
             data = fetch_data(index,period=period, interval=interval)
