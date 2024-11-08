@@ -123,13 +123,14 @@ def live_trading_recommendation(index, stoploss_points,ma1,ma2,matype):
 
         prev_sma_10 = prev_data['SMA_10']
         prev_sma_50 = prev_data['SMA_50']
+        st.write("hello")
 
         if current_sma_10.values[0] > current_sma_50.values[0] and prev_sma_10.values[0] <= prev_sma_50.values[0]:
-            st.write(f"Recommendation: BUY at {current_close} | {datetime.now()}")
+            st.write(f"Recommendation: BUY at {current_close.values[0]} | {datetime.now()}")
         elif current_sma_10.values[0] < current_sma_50.values[0] and prev_sma_10.values[0] >= prev_sma_50.values[0]:
-            st.write(f"Recommendation: SELL at {current_close} | {datetime.now()}")
+            st.write(f"Recommendation: SELL at {current_close.values[0]} | {datetime.now()}")
         else:
-            st.write(f"Recommendation: HOLD at {current_close} | {datetime.now()}")
+            st.write(f"Recommendation: HOLD at {current_close.values[0]} | {datetime.now()}")
 
         time.sleep(60)  # Sleep for 1 minute before trying again
         global stop_threads
