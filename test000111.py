@@ -96,7 +96,7 @@ def backtest_strategy(data, stoploss_points):
     st.write(f"Accuracy: {accuracy:.2f}%")
 
 # Live Trading Recommendation
-def live_trading_recommendation(index, stoploss_points):
+def live_trading_recommendation(index, stoploss_points,ma1,ma2,matype):
     global STOPLOSS
     STOPLOSS = stoploss_points  # Set stop loss based on user input
     
@@ -166,7 +166,7 @@ def main():
         # Button to start live trading
         if st.button("Start Live Trading"):
             st.write("Starting live trading...")
-            threading.Thread(target=live_trading_recommendation, args=(index, stoploss_points), daemon=True).start()
+            threading.Thread(target=live_trading_recommendation, args=(index, stoploss_points,ma1,ma2,matype), daemon=True).start()
 
 if __name__ == "__main__":
     main()
