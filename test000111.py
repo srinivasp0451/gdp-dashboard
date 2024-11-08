@@ -117,6 +117,7 @@ def live_trading_recommendation(index, stoploss_points,ma1,ma2,matype):
         st.write("before")
         current_data = data.iloc[-1]
         prev_data = data.iloc[-2]
+        st.write(current_data)
 
         current_sma_10 = current_data['SMA_10']
         current_sma_50 = current_data['SMA_50']
