@@ -132,6 +132,9 @@ def live_trading_recommendation(index, stoploss_points,ma1,ma2,matype):
             st.write(f"Recommendation: HOLD at {current_close} | {datetime.now()}")
 
         time.sleep(60)  # Sleep for 1 minute before trying again
+        global stop_threads
+        if stop_threads:
+            break
 
 # Main Streamlit UI
 def main():
@@ -167,6 +170,9 @@ def main():
         if st.button("Start Live Trading"):
             st.write("Starting live trading...")
             threading.Thread(target=live_trading_recommendation, args=(index, stoploss_points,ma1,ma2,matype), daemon=True).start()
+        if st.button("stop run"):
+            stop_threads=false
+        
 
 if __name__ == "__main__":
     main()
