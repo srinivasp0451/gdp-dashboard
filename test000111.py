@@ -8,7 +8,7 @@ import threading
 
 # Constants
 STOPLOSS = 10  # Default stop loss in points
-NIFTY50_TICKER = "^NSEBANK"  # Default Nifty50 index symbol
+#NIFTY50_TICKER = "^NSEBANK"  # Default Nifty50 index symbol
 PERIOD = "1mo"  # Default period for backtesting
 INTERVAL = "5m"  # Default interval for backtesting
 
@@ -155,7 +155,7 @@ def main():
 
     # Backtesting settings
     if strategy_type == "Backtesting":
-        period = st.selectbox("Select Period", ["1d", "5d", "7d", "1mo", "3mo", "5mo"], index=3)
+        period = st.selectbox("Select Period", ["1d", "5d", "1mo", "3mo", "6mo","1y","2y","5y"], index=3)
         interval = st.selectbox("Select Interval", ["1m", "2m", "5m", "15m", "30m", "60m","1wk"], index=2)
         stoploss_points = st.number_input("Enter Stop Loss (Points)", min_value=1, value=10)
         
