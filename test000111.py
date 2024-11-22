@@ -22,6 +22,8 @@ def fetch_data(ticker,period=PERIOD, interval=INTERVAL,n_days=None):
     else:
         # Default fetch with period and interval
         data = yf.download(ticker, period=period, interval=interval)
+    
+    data.index = data.index.tz_localize('UTC').tz_convert('Asia/Kolkata')
     return data
     #data = yf.download(ticker, period=period, interval=interval)
     #return data
