@@ -14,9 +14,9 @@ INTERVAL = "5m"  # Default interval for backtesting
 
 # Fetch Data for Backtesting or Live
 def fetch_data(ticker,period=PERIOD, interval=INTERVAL,n_days=None):
-    if n_days:
+    if n_days is not None:
         end_date = datetime.today()
-        start_date = end_date - timedelta(days=n_days)
+        start_date = end_date - timedelta(days=58)
         # Fetch data using start and end date for the custom n-day interval
         data = yf.download(ticker, start=start_date, end=end_date, interval=interval)
     else:
@@ -172,7 +172,8 @@ def main():
         n_days = None
         if interval == "n_days":
             #n_days = st.number_input("Enter number of days", min_value=1, max_value=365, value=30)
-            n_days=58
+            interval=58
+            st.write("n_days", interval)
 
         # Button to run backtest
         if st.button("Run Backtest"):
