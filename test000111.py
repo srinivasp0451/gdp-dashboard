@@ -1,7 +1,7 @@
 import yfinance as yf
 import numpy as np
 import pandas as pd
-from datetime import datetime, timedelta
+from datetime import datetime
 import time
 import streamlit as st
 import threading
@@ -13,23 +13,9 @@ PERIOD = "1mo"  # Default period for backtesting
 INTERVAL = "5m"  # Default interval for backtesting
 
 # Fetch Data for Backtesting or Live
-def fetch_data(ticker,period=PERIOD, interval=INTERVAL,n_days=None):
-    st.write(n_days)
-    if n_days:
-        end_date = datetime.today()
-        start_date = end_date - timedelta(days=58)
-        # Fetch data using start and end date for the custom n-day interval
-        data = yf.download(ticker, start=start_date, end=end_date, interval=interval)
-    else:
-        # Default fetch with period and interval
-        data = yf.download(ticker, period=period, interval=interval)
-    
-    if interval not in ["15min", "30min"]:
-        data.index = data.index.tz_convert('Asia/Kolkata')
-    
+def fetch_data(ticker,period=PERIOD, interval=INTERVAL):
+    data = yf.download(ticker, period=period, interval=interval)
     return data
-    #data = yf.download(ticker, period=period, interval=interval)
-    #return data
 
 # Simple Moving Average Crossover strategy for scalping
 def apply_strategy(data,ma1,ma2,matype):
@@ -169,18 +155,13 @@ def main():
 
     # Backtesting settings
     if strategy_type == "Backtesting":
-        period = st.selectbox("Select Period", ["1d", "5d", "1mo", "3mo", "6mo","1y","2y","5y","n_days"], index=3)
+        period = st.selectbox("Select Period", ["1d", "5d", "1mo", "3mo", "6mo","1y","2y","5y"], index=3)
         interval = st.selectbox("Select Interval", ["1m", "2m", "5m", "15m", "30m", "60m","1wk"], index=2)
         stoploss_points = st.number_input("Enter Stop Loss (Points)", min_value=1, value=10)
-        n_days = None
-        if period == "n_days":
-            #n_days = st.number_input("Enter number of days", min_value=1, max_value=365, value=30)
-            n_days=58
-            st.write("n_days", n_days)
-
+        
         # Button to run backtest
         if st.button("Run Backtest"):
-            data = fetch_data(index,period=period, interval=interval, n_days=n_days)
+            data = fetch_data(index,period=period, interval=interval)
             data = apply_strategy(data,ma1,ma2,matype)
             backtest_strategy(data, stoploss_points)
 
