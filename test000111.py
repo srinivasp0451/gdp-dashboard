@@ -24,7 +24,7 @@ def fetch_data(ticker,period=PERIOD, interval=INTERVAL,n_days=None):
         # Default fetch with period and interval
         data = yf.download(ticker, period=period, interval=interval)
     
-    data.index = data.index.tz_convert('Asia/Kolkata')
+    data.index = data.index.tz_convert(None)
     return data
     #data = yf.download(ticker, period=period, interval=interval)
     #return data
