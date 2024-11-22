@@ -14,6 +14,7 @@ INTERVAL = "5m"  # Default interval for backtesting
 
 # Fetch Data for Backtesting or Live
 def fetch_data(ticker,period=PERIOD, interval=INTERVAL,n_days=None):
+    st.write(n_days)
     if n_days:
         end_date = datetime.today()
         start_date = end_date - timedelta(days=58)
