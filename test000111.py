@@ -167,11 +167,11 @@ def main():
 
     # Backtesting settings
     if strategy_type == "Backtesting":
-        period = st.selectbox("Select Period", ["1d", "5d", "1mo", "3mo", "6mo","1y","2y","5y"], index=3)
-        interval = st.selectbox("Select Interval", ["1m", "2m", "5m", "15m", "30m", "60m","1wk","n_days"], index=2)
+        period = st.selectbox("Select Period", ["1d", "5d", "1mo", "3mo", "6mo","1y","2y","5y","n_days"], index=3)
+        interval = st.selectbox("Select Interval", ["1m", "2m", "5m", "15m", "30m", "60m","1wk"], index=2)
         stoploss_points = st.number_input("Enter Stop Loss (Points)", min_value=1, value=10)
         n_days = None
-        if interval == "n_days":
+        if period == "n_days":
             #n_days = st.number_input("Enter number of days", min_value=1, max_value=365, value=30)
             n_days=58
             st.write("n_days", n_days)
