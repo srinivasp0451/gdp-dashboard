@@ -27,7 +27,7 @@ def fetch_data(ticker,period=PERIOD, interval=INTERVAL,n_days=None):
     if interval not in ["15min", "30min"]:
         data.index = data.index.tz_convert('Asia/Kolkata')
     else:
-        data.index = data.index.tz.localize("UTC").tz_convert('Asia/Kolkata')
+        data.index = data.index.tz_localize("UTC").tz_convert('Asia/Kolkata')
     return data
     #data = yf.download(ticker, period=period, interval=interval)
     #return data
