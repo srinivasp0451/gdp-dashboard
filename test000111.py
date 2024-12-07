@@ -144,7 +144,7 @@ def main():
     st.title("Stock Strategy Backtesting / Live Trading")
 
     # Select the index
-    index = st.selectbox("Select Index", ["^NSEBANK", "^NSEI", "^BSESN", "NIFTY_FIN_SERVICE.NS", "^NIFTYMIDCAP150", "BSE-BANK.BO"],index=0)
+    index = st.selectbox("Select Index", ["^NSEBANK", "^NSEI", "^BSESN", "NIFTY_FIN_SERVICE.NS", "^NIFTYMIDCAP150.NS", "BSE-BANK.BO"],index=0)
     
     # Select the strategy type
     strategy_type = st.selectbox("Select Strategy Type", ["Backtesting", "Live Trading"], index=0)
