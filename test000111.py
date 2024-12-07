@@ -83,7 +83,7 @@ def backtest_strategy(data, stoploss_points,target, index):
     total_trades = profit_trades + loss_trades
     accuracy = (profit_trades / total_trades) * 100 if total_trades else 0
 
-    st.write("\nBacktest Results for {index}:")
+    st.write(f"\nBacktest Results for {index}:")
     for trade in trades:
         st.write(f"{trade[0]} at {trade[1]} Price: {trade[2]} -> {trade[3]} at {trade[4]} Price: {trade[5]} P/L Points: {trade[6]}")
 
