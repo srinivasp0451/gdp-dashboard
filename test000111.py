@@ -144,7 +144,7 @@ def main():
     st.title("Stock Strategy Backtesting / Live Trading")
 
     # Select the index
-    index = st.selectbox("Select Index", ["^NSEBANK", "^NSEI", "^BSESN", "NIFTY_FIN_SERVICE.NS", "^NSEMDCP50", "BSE-BANK.BO","BTC-USD"],index=0)
+    index = st.selectbox("Select Index", ["^NSEBANK", "^NSEI", "^BSESN", "NIFTY_FIN_SERVICE.NS", "^NSEMDCP50", "BSE-BANK.BO","BTC-USD","Other"],index=0)
     # Variable to store the custom index
     custom_index = index
 
