@@ -145,7 +145,14 @@ def main():
 
     # Select the index
     index = st.selectbox("Select Index", ["^NSEBANK", "^NSEI", "^BSESN", "NIFTY_FIN_SERVICE.NS", "^NSEMDCP50", "BSE-BANK.BO","BTC-USD"],index=0)
-    
+    # Variable to store the custom index
+    custom_index = index
+
+    # If "Other" is selected, show the text input for custom index
+    if index == "Other":
+        custom_index = st.text_input("Enter Custom Index")
+        index = custom_index
+
     # Select the strategy type
     strategy_type = st.selectbox("Select Strategy Type", ["Backtesting", "Live Trading"], index=0)
     matype = st.selectbox("Select MA Type", ["ema", "sma"], index=1)
