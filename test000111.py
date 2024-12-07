@@ -33,7 +33,7 @@ def apply_strategy(data,ma1,ma2,matype):
     return data
 
 # Backtesting Logic
-def backtest_strategy(data, stoploss_points):
+def backtest_strategy(data, stoploss_points,index):
     global STOPLOSS
     STOPLOSS = stoploss_points  # Set stop loss based on user input
     
@@ -83,7 +83,7 @@ def backtest_strategy(data, stoploss_points):
     total_trades = profit_trades + loss_trades
     accuracy = (profit_trades / total_trades) * 100 if total_trades else 0
 
-    st.write("\nBacktest Results:")
+    st.write("\nBacktest Results for {index}:")
     for trade in trades:
         st.write(f"{trade[0]} at {trade[1]} Price: {trade[2]} -> {trade[3]} at {trade[4]} Price: {trade[5]} P/L Points: {trade[6]}")
 
@@ -170,7 +170,7 @@ def main():
         if st.button("Run Backtest"):
             data = fetch_data(index,period=period, interval=interval)
             data = apply_strategy(data,ma1,ma2,matype)
-            backtest_strategy(data, stoploss_points)
+            backtest_strategy(data, stoploss_points, index)
 
     # Live trading settings
     elif strategy_type == "Live Trading":
