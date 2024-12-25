@@ -150,7 +150,14 @@ def main():
     st.title("Trading Strategy Backtest and Live Recommendations")
     
     # Dropdown for selecting index
-    symbol = st.selectbox("Select Index", ["^NSEI", "^NSEBANK", "^NSEFIN", "^NSEMDCP", "^BSESN"], index=1)  # Default is Bank Nifty
+    symbol = st.selectbox("Select Index", ["^NSEI", "^NSEBANK", "^NSEFIN", "^NSEMDCP", "^BSESN","BTC-USD"], index=1)  # Default is Bank Nifty
+    # Variable to store the custom index
+    custom_index = symbol
+
+    # If "Other" is selected, show the text input for custom index
+    if symbol == "Other":
+        custom_index = st.text_input("Enter Custom Index")
+        symbol = custom_index
     backtest_days = st.number_input("Backtest Days", min_value=1, max_value=90, value=58)  # Default 58
     #interval = st.selectbox("Select Interval", ["1m", "2m", "5m", "10m", "15m", "30m", "60m"], index=2)  # Default 5m
     interval ="5min"
