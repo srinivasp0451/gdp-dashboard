@@ -1,17 +1,21 @@
 import streamlit as st
 import yfinance as yf
 import pandas as pd
+from datetime import datetime
 
 # Function to fetch live option chain data for a given index
 def fetch_option_chain(symbol, expiry_date):
-    # Get the option chain for the given symbol and expiry date
-    option_chain = yf.Ticker(symbol).options
-    if expiry_date not in option_chain:
-        st.error(f"Expiry date {expiry_date} not available for {symbol}")
+    try:
+        option_chain = yf.Ticker(symbol).options
+        if expiry_date not in option_chain:
+            st.error(f"Expiry date {expiry_date} not available for {symbol}")
+            return None
+
+        options_data = yf.Ticker(symbol).option_chain(expiry_date)
+        return options_data
+    except Exception as e:
+        st.error(f"Error fetching option chain: {e}")
         return None
-    
-    options_data = yf.Ticker(symbol).option_chain(expiry_date)
-    return options_data
 
 # Function to calculate Iron Condor max profit and max loss
 def iron_condor(strike_low, strike_high, premium_put_sell, premium_put_buy, premium_call_sell, premium_call_buy):
@@ -57,11 +61,11 @@ else:
 # Input for Capital
 capital = st.number_input("Enter your available capital (₹)", min_value=1000, value=100000)
 
-# Get available expiry dates for the selected index
-expiry_date = st.selectbox("Select an expiry date", options=yf.Ticker(symbol).options)
+# Input for manual expiry date selection
+expiry_date = st.date_input("Select an expiry date", min_value=datetime.today())
 
-# Fetch the live option chain data
-option_chain_data = fetch_option_chain(symbol, expiry_date)
+# Fetch the live option chain data for the selected expiry date
+option_chain_data = fetch_option_chain(symbol, str(expiry_date))
 if option_chain_data is None:
     st.stop()
 
