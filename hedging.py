@@ -6,13 +6,9 @@ from datetime import datetime
 # Function to fetch live option chain data for a given index
 def fetch_option_chain(symbol, expiry_date):
     try:
-        option_chain = yf.Ticker(symbol).options
-        if expiry_date not in option_chain:
-            st.error(f"Expiry date {expiry_date} not available for {symbol}")
-            return None
-
-        options_data = yf.Ticker(symbol).option_chain(expiry_date)
-        return options_data
+        ticker = yf.Ticker(symbol)
+        option_chain = ticker.option_chain(expiry_date)
+        return option_chain
     except Exception as e:
         st.error(f"Error fetching option chain: {e}")
         return None
@@ -37,8 +33,11 @@ def covered_call(strike, stock_price, premium_call_sell):
 
 # Function to calculate Quantity of contracts
 def calculate_quantity(capital, max_loss_per_contract):
-    quantity = capital // max_loss_per_contract
-    return quantity
+    if max_loss_per_contract > 0:
+        quantity = capital // max_loss_per_contract
+        return quantity
+    else:
+        return 0
 
 # Streamlit UI
 st.title("Options Strategy Analysis with Real-Time Data")
@@ -47,16 +46,14 @@ st.title("Options Strategy Analysis with Real-Time Data")
 index_choice = st.selectbox("Select an Index", ["Nifty50", "BankNifty", "Sensex", "FinNifty", "MidCapNifty"])
 
 # Set correct symbol for the selected index
-if index_choice == "Nifty50":
-    symbol = "^NSEI"
-elif index_choice == "BankNifty":
-    symbol = "^NSEBANK"
-elif index_choice == "Sensex":
-    symbol = "^BSESN"
-elif index_choice == "FinNifty":
-    symbol = "^NSEFIN"
-else:
-    symbol = "^NSEMDCP"
+index_symbols = {
+    "Nifty50": "^NSEI",
+    "BankNifty": "^NSEBANK",
+    "Sensex": "^BSESN",
+    "FinNifty": "^NSEFIN",
+    "MidCapNifty": "^NSEMDCP"
+}
+symbol = index_symbols.get(index_choice, "^NSEI")
 
 # Input for Capital
 capital = st.number_input("Enter your available capital (₹)", min_value=1000, value=100000)
@@ -73,23 +70,25 @@ if option_chain_data is None:
 st.subheader("Available Option Chain Data")
 st.write(option_chain_data)
 
-# User inputs for strikes and premiums
-strike_low = st.number_input("Enter lower strike price for Iron Condor", min_value=0, value=0)
-strike_high = st.number_input("Enter higher strike price for Iron Condor", min_value=0, value=0)
+# User inputs for strategy and premiums
+strategy_choice = st.selectbox("Select Option Strategy", ["Iron Condor", "Iron Butterfly", "Covered Call"])
+
+# Common for all strategies
 premium_put_sell = st.number_input("Enter premium received for selling put (₹)", min_value=0, value=0)
 premium_put_buy = st.number_input("Enter premium paid for buying put (₹)", min_value=0, value=0)
 premium_call_sell = st.number_input("Enter premium received for selling call (₹)", min_value=0, value=0)
 premium_call_buy = st.number_input("Enter premium paid for buying call (₹)", min_value=0, value=0)
 
-# Strategy selection
-strategy_choice = st.selectbox("Select Option Strategy", ["Iron Condor", "Iron Butterfly", "Covered Call"])
-
-# Calculate max profit and max loss for selected strategy
+# Strategy-specific inputs
 if strategy_choice == "Iron Condor":
+    strike_low = st.number_input("Enter lower strike price for Iron Condor", min_value=0, value=0)
+    strike_high = st.number_input("Enter higher strike price for Iron Condor", min_value=0, value=0)
     max_profit, max_loss = iron_condor(strike_low, strike_high, premium_put_sell, premium_put_buy, premium_call_sell, premium_call_buy)
+
 elif strategy_choice == "Iron Butterfly":
     strike = st.number_input("Enter central strike price for Iron Butterfly", min_value=0, value=0)
     max_profit, max_loss = iron_butterfly(strike, premium_put_sell, premium_call_sell, premium_put_buy, premium_call_buy)
+
 elif strategy_choice == "Covered Call":
     stock_price = yf.Ticker(symbol).history(period="1d")['Close'][0]  # Get the current stock price
     strike = st.number_input("Enter strike price for Covered Call", min_value=0, value=0)
