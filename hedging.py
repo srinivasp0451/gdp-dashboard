@@ -7,6 +7,12 @@ from datetime import datetime
 def fetch_option_chain(symbol, expiry_date):
     try:
         ticker = yf.Ticker(symbol)
+        # Check if the expiry date exists in the available options
+        available_expiries = ticker.options
+        if expiry_date not in available_expiries:
+            st.error(f"Expiration {expiry_date} cannot be found. Available expirations are: {available_expiries}")
+            return None
+        # Fetch option chain for the selected expiry date
         option_chain = ticker.option_chain(expiry_date)
         return option_chain
     except Exception as e:
@@ -58,11 +64,13 @@ symbol = index_symbols.get(index_choice, "^NSEI")
 # Input for Capital
 capital = st.number_input("Enter your available capital (₹)", min_value=1000, value=100000)
 
-# Input for manual expiry date selection
-expiry_date = st.date_input("Select an expiry date", min_value=datetime.today())
+# Fetch available expiry dates for the selected symbol
+ticker = yf.Ticker(symbol)
+available_expiries = ticker.options
+expiry_date = st.selectbox("Select Expiry Date", available_expiries)
 
 # Fetch the live option chain data for the selected expiry date
-option_chain_data = fetch_option_chain(symbol, str(expiry_date))
+option_chain_data = fetch_option_chain(symbol, expiry_date)
 if option_chain_data is None:
     st.stop()
 
