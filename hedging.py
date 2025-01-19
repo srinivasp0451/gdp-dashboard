@@ -3,14 +3,18 @@ import yfinance as yf
 import pandas as pd
 from datetime import datetime
 
-# Function to fetch live option chain data for a given index
-def fetch_option_chain(symbol, expiry_date):
+def fetch_option_chain(symbol, expiry_date=None):
     try:
         ticker = yf.Ticker(symbol)
         available_expiries = ticker.options
-        if expiry_date not in available_expiries:
+        if not available_expiries:
+            st.error(f"No expiration dates available for {symbol}. Please check if the symbol is correct or try later.")
+            return None
+        if expiry_date and expiry_date not in available_expiries:
             st.error(f"Expiration {expiry_date} not found. Available expirations are: {available_expiries}")
             return None
+        elif expiry_date is None:
+            expiry_date = available_expiries[0]  # Use the first available expiry if none specified
         option_chain = ticker.option_chain(expiry_date)
         return option_chain
     except Exception as e:
@@ -47,22 +51,25 @@ st.title("Options Strategy Analysis with Real-Time Data")
 # Select index
 index_choice = st.selectbox("Select an Index", ["Nifty50", "BankNifty", "Sensex", "FinNifty", "MidCapNifty"])
 index_symbols = {
-    "Nifty50": "^NSEI",
-    "BankNifty": "^NSEBANK",
+    "Nifty50": "NIFTY",  # Changed from ^NSEI to NIFTY for testing
+    "BankNifty": "BANKNIFTY",  # Changed from ^NSEBANK to BANKNIFTY
     "Sensex": "^BSESN",
-    "FinNifty": "^NSEFIN",
-    "MidCapNifty": "^NSEMDCP"
+    "FinNifty": "FINNIFTY",  # Assuming this exists, adjust if not
+    "MidCapNifty": "MIDCAPNIFTY"  # Assuming this exists, adjust if not
 }
-symbol = index_symbols.get(index_choice, "^NSEI")
+symbol = index_symbols.get(index_choice, "NIFTY")
 
 # Fetch available expiry dates for the selected symbol
-ticker = yf.Ticker(symbol)
-available_expiries = ticker.options
-expiry_date = st.selectbox("Select Expiry Date", available_expiries)
-
-# Fetch the live option chain data for the selected expiry date
-option_chain_data = fetch_option_chain(symbol, expiry_date)
+option_chain_data = fetch_option_chain(symbol)
 if option_chain_data is None:
+    st.stop()
+
+available_expiries = yf.Ticker(symbol).options
+if available_expiries:
+    expiry_date = st.selectbox("Select Expiry Date", available_expiries)
+    option_chain_data = fetch_option_chain(symbol, expiry_date)
+else:
+    st.error("No options data available for this index. Please choose another index.")
     st.stop()
 
 st.subheader("Available Option Chain Data")
@@ -84,17 +91,30 @@ premiums = {
 
 # Strategy-specific inputs with automatic suggestions
 if strategy_choice == "Iron Condor":
-    strikes = st.slider("Select strike price range for Iron Condor", min_value=0, max_value=10000, value=(1000, 2000))
-    max_profit, max_loss = iron_condor(strikes[0], strikes[1], premiums)
+    if option_chain_data:
+        strikes = [option_chain_data.calls.iloc[0]['strike'], option_chain_data.calls.iloc[-1]['strike']]
+        strikes = st.slider("Select strike price range for Iron Condor", min_value=strikes[0], max_value=strikes[1], value=strikes)
+        max_profit, max_loss = iron_condor(strikes[0], strikes[1], premiums)
+    else:
+        st.error("Unable to fetch strikes for Iron Condor. Please select another strategy.")
+        st.stop()
 
 elif strategy_choice == "Iron Butterfly":
-    strike = st.number_input("Enter central strike price for Iron Butterfly", min_value=0, value=option_chain_data.calls.iloc[len(option_chain_data.calls)//2]['strike'])
-    max_profit, max_loss = iron_butterfly(strike, premiums)
+    if option_chain_data and not option_chain_data.calls.empty:
+        strike = st.number_input("Enter central strike price for Iron Butterfly", min_value=0, value=option_chain_data.calls.iloc[len(option_chain_data.calls)//2]['strike'])
+        max_profit, max_loss = iron_butterfly(strike, premiums)
+    else:
+        st.error("Unable to fetch strikes for Iron Butterfly. Please select another strategy.")
+        st.stop()
 
 elif strategy_choice == "Covered Call":
-    stock_price = yf.Ticker(symbol).history(period="1d")['Close'][0]
-    strike = st.number_input("Enter strike price for Covered Call", min_value=0, value=stock_price)
-    max_profit, max_loss = covered_call(strike, stock_price, premiums['call_sell'])
+    try:
+        stock_price = yf.Ticker(symbol).history(period="1d")['Close'][0]
+        strike = st.number_input("Enter strike price for Covered Call", min_value=0, value=round(stock_price))
+        max_profit, max_loss = covered_call(strike, stock_price, premiums['call_sell'])
+    except Exception as e:
+        st.error(f"Error fetching current stock price: {e}")
+        st.stop()
 
 # Display results
 st.write(f"Max Profit: ₹{max_profit:.2f}")
