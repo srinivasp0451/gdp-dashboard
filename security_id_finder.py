@@ -80,5 +80,6 @@ if st.button("Get ID"):
         # Show the corresponding security ID
         security_id = filtered_df.iloc[0]['SEM_SMST_SECURITY_ID']
         st.write(f"Security ID for Strike Price {strike_price} and Option Type {option_type}: {security_id}")
+        st.dataframe(filtered_df)
     else:
         st.write("No data available for the selected criteria.")
