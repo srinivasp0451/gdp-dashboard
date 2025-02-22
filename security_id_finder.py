@@ -24,17 +24,17 @@ def filter_data(df, selected_index, expiry_date, strike_price, option_type):
     
     # Filter by custom symbol (e.g., 'SENSEX 18 FEB' or 'NIFTY')
     if selected_index == 'Nifty':
-        df = df[df['SEM_CUSTOM_SYMBOL'].str.lower().startswith('nifty', case=False)]
+        df = df[df['SEM_CUSTOM_SYMBOL'].str.lower().str.startswith('nifty')]
     elif selected_index == 'Sensex':
-        df = df[df['SEM_CUSTOM_SYMBOL'].str.lower().startswith('sensex', case=False)]
+        df = df[df['SEM_CUSTOM_SYMBOL'].str.lower().str.startswith('sensex')]
     elif selected_index == 'Bank Nifty':
-        df = df[df['SEM_CUSTOM_SYMBOL'].str.lower().startswith('banknifty', case=False)]
+        df = df[df['SEM_CUSTOM_SYMBOL'].str.lower().str.startswith('banknifty')]
     elif selected_index == 'Fin Nifty':
-        df = df[df['SEM_CUSTOM_SYMBOL'].str.lower().startswith('finnifty', case=False)]
+        df = df[df['SEM_CUSTOM_SYMBOL'].str.lower().str.startswith('finnifty')]
     elif selected_index == 'Midcap Nifty':
-        df = df[df['SEM_CUSTOM_SYMBOL'].str.lower().startswith('midcpnifty', case=False)]
+        df = df[df['SEM_CUSTOM_SYMBOL'].str.lower().str.startswith('midcpnifty')]
     elif selected_index == 'Bankex':
-        df = df[df['SEM_CUSTOM_SYMBOL'].str.lower().startswith('bankex', case=False)]
+        df = df[df['SEM_CUSTOM_SYMBOL'].str.lower().str.startswith('bankex')]
     
     # Convert the SEM_EXPIRY_DATE to datetime format
     df['SEM_EXPIRY_DATE'] = pd.to_datetime(df['SEM_EXPIRY_DATE'], errors='coerce')
