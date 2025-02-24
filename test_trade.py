@@ -303,6 +303,7 @@ if st.button("Start"):
 
             while True:
                 if st.button("Interrupt"):
+                    raise KeyboardInterrupt("Execution interrupted")
                     print("Trading interrupted.")
                     st.write("Trading interrupted")
                     data.disconnect()  # This ensures disconnect when the program is forcefully stopped.
@@ -585,6 +586,7 @@ if st.button("Start"):
 
             while True:
                 if st.button("Interrupt"):
+                    raise KeyboardInterrupt("Execution interrupted")
                     print("Trading interrupted.")
                     st.write("Trading interrupted")
                     data.disconnect()  # This ensures disconnect when the program is forcefully stopped.
