@@ -585,6 +585,17 @@ if st.button("Start"):
             print("Fetching Data for backtesting")
 
             while True:
+                if st.button("Interrupt"):
+                    raise KeyboardInterrupt("Execution interrupted")
+                    print("Trading interrupted.")
+                    st.write("Trading interrupted")
+                    data.disconnect()  # This ensures disconnect when the program is forcefully stopped.
+                    # Unsubscribe instruments which are already active on connection
+                    if selected_index in ['Nifty','BANKNIFTY','FINNIFTY','MIDCPNIFTY']:
+                        market_feed_value = marketfeed.NSE  # Futures and Options segment
+                    else:
+                        market_feed_value = marketfeed.BSE
+                    break
 
                 data.run_forever()
                 response = data.get_data()
@@ -813,23 +824,6 @@ if st.button("Start"):
             unsub_instruments = [(market_feed_value, str(security_id), 16)]
 
             data.unsubscribe_symbols(unsub_instruments)
-
-        if st.button("Interrupt"):
-            raise KeyboardInterrupt("Execution interrupted")
-            print("Trading interrupted.")
-            st.write("Trading interrupted")
-            data.disconnect()  # This ensures disconnect when the program is forcefully stopped.
-            # Unsubscribe instruments which are already active on connection
-            if selected_index in ['Nifty','BANKNIFTY','FINNIFTY','MIDCPNIFTY']:
-                market_feed_value = marketfeed.NSE  # Futures and Options segment
-                unsub_instruments = [(market_feed_value, str(security_id), 16)]
-
-                data.unsubscribe_symbols(unsub_instruments)
-
-            else:
-                unsub_instruments = [(market_feed_value, str(security_id), 16)]
-
-                data.unsubscribe_symbols(unsub_instruments)
 
         # Close Connection
         data.disconnect()
