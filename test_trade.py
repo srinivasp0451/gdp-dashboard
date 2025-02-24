@@ -62,7 +62,7 @@ def insert_trade(index_name, option_type, strike_price, expiry_date, entry_price
     conn.close()
 
 
-create_table()
+#create_table()
 
 # Function to load the CSV data from the URL
 def load_csv_data():
