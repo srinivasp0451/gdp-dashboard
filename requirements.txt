@@ -14,4 +14,4 @@ statsmodels
 seaborn
 dhanhq
 nest-asyncio
-#sqlite3
+sqlite3
