@@ -822,9 +822,14 @@ if st.button("Start"):
             # Unsubscribe instruments which are already active on connection
             if selected_index in ['Nifty','BANKNIFTY','FINNIFTY','MIDCPNIFTY']:
                 market_feed_value = marketfeed.NSE  # Futures and Options segment
+                unsub_instruments = [(market_feed_value, str(security_id), 16)]
+
+                data.unsubscribe_symbols(unsub_instruments)
+
             else:
-                market_feed_value = marketfeed.BSE
-                break
+                unsub_instruments = [(market_feed_value, str(security_id), 16)]
+
+                data.unsubscribe_symbols(unsub_instruments)
 
         # Close Connection
         data.disconnect()
