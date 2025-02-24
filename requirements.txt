@@ -15,4 +15,4 @@ seaborn
 dhanhq
 nest-asyncio
 #sqlite3
-pysqlite
+#pysqlite
