@@ -6,63 +6,71 @@ import datetime
 import sqlite3
 from io import StringIO
 import time
+
 from dhanhq import dhanhq, marketfeed
 import nest_asyncio
 import time
+
+nest_asyncio.apply()
 
 
 security_id = 0
 order_client_id=''
 order_access_token=''
-# Database setup for storing trade details
-def create_table():
-    conn = sqlite3.connect('trade_journal.db')
-    c = conn.cursor()
-    c.execute('''CREATE TABLE IF NOT EXISTS trades (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    index_name TEXT,
-                    option_type TEXT,
-                    strike_price INTEGER,
-                    expiry_date DATE,
-                    entry_price FLOAT,
-                    stop_loss_distance INTEGER,
-                    target_distance INTEGER,
-                    order_status TEXT,
-                    entry_time TIMESTAMP,
-                    exit_time TIMESTAMP,
-                    profit_or_loss FLOAT,
-                    profit_points FLOAT,
-                    loss_points FLOAT,
-                    capital_used FLOAT,
-                    time_spent_in_trade TEXT,
-                    notes TEXT,
-                    day_of_week TEXT,
-                    month_of_year TEXT,
-                    backtest BOOLEAN,
-                    traded_date TEXT,
-                    use_trailing_stop_loss TEXT
-                 )''')
-    conn.commit()
-    conn.close()
+data_client_id=''
+data_access_token=''
+profit_threshold=''
+loss_threshold=''
+market_feed_value = marketfeed.NSE
+# # Database setup for storing trade details
+# def create_table():
+#     conn = sqlite3.connect('trade_journal.db')
+#     c = conn.cursor()
+#     c.execute('''CREATE TABLE IF NOT EXISTS trades (
+#                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+#                     index_name TEXT,
+#                     option_type TEXT,
+#                     strike_price INTEGER,
+#                     expiry_date DATE,
+#                     entry_price FLOAT,
+#                     stop_loss_distance INTEGER,
+#                     target_distance INTEGER,
+#                     order_status TEXT,
+#                     entry_time TIMESTAMP,
+#                     exit_time TIMESTAMP,
+#                     profit_or_loss FLOAT,
+#                     profit_points FLOAT,
+#                     loss_points FLOAT,
+#                     capital_used FLOAT,
+#                     time_spent_in_trade TEXT,
+#                     notes TEXT,
+#                     day_of_week TEXT,
+#                     month_of_year TEXT,
+#                     backtest BOOLEAN,
+#                     traded_date TEXT,
+#                     use_trailing_stop_loss TEXT
+#                  )''')
+#     conn.commit()
+#     conn.close()
 
-# Function to insert trade details into the database
-def insert_trade(index_name, option_type, strike_price, expiry_date, entry_price, stop_loss_distance, target_distance,
-                 order_status, entry_time, exit_time, profit_or_loss, profit_points, loss_points, capital_used,
-                 time_spent_in_trade, notes, day_of_week, month_of_year, backtest,traded_date,use_trailing_stop_loss):
-    conn = sqlite3.connect('trade_journal.db')
-    c = conn.cursor()
-    c.execute('''INSERT INTO trades (index_name, option_type, strike_price, expiry_date, entry_price, stop_loss_distance,
-                                      target_distance, order_status, entry_time, exit_time, profit_or_loss, profit_points,
-                                      loss_points, capital_used, time_spent_in_trade, notes, day_of_week, month_of_year, backtest,traded_date,use_trailing_stop_loss)
-                 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',
-                 (index_name, option_type, strike_price, expiry_date, entry_price, stop_loss_distance, target_distance,
-                  order_status, entry_time, exit_time, profit_or_loss, profit_points, loss_points, capital_used,
-                  time_spent_in_trade, notes, day_of_week, month_of_year, backtest,traded_date,use_trailing_stop_loss))
-    conn.commit()
-    conn.close()
+# # Function to insert trade details into the database
+# def insert_trade(index_name, option_type, strike_price, expiry_date, entry_price, stop_loss_distance, target_distance,
+#                  order_status, entry_time, exit_time, profit_or_loss, profit_points, loss_points, capital_used,
+#                  time_spent_in_trade, notes, day_of_week, month_of_year, backtest,traded_date,use_trailing_stop_loss):
+#     conn = sqlite3.connect('trade_journal.db')
+#     c = conn.cursor()
+#     c.execute('''INSERT INTO trades (index_name, option_type, strike_price, expiry_date, entry_price, stop_loss_distance,
+#                                       target_distance, order_status, entry_time, exit_time, profit_or_loss, profit_points,
+#                                       loss_points, capital_used, time_spent_in_trade, notes, day_of_week, month_of_year, backtest,traded_date,use_trailing_stop_loss)
+#                  VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',
+#                  (index_name, option_type, strike_price, expiry_date, entry_price, stop_loss_distance, target_distance,
+#                   order_status, entry_time, exit_time, profit_or_loss, profit_points, loss_points, capital_used,
+#                   time_spent_in_trade, notes, day_of_week, month_of_year, backtest,traded_date,use_trailing_stop_loss))
+#     conn.commit()
+#     conn.close()
 
 
-#create_table()
+# create_table()
 
 # Function to load the CSV data from the URL
 def load_csv_data():
@@ -111,7 +119,7 @@ def filter_data(df, selected_index, expiry_date, strike_price, option_type):
     return df
 
 # Streamlit UI
-st.title("Algo Trading")
+st.title("Security ID Fetcher for Algo Trading")
 
 # Dropdown to select Nifty or Sensex
 selected_index = st.selectbox("Select Index", ["Nifty", "Sensex","Bank Nifty","Fin Nifty","Midcap Nifty","Bankex"])
@@ -123,33 +131,21 @@ expiry_date = st.date_input("Select Expiry Date", min_value=datetime.date(2025, 
 option_type = st.selectbox("Select Option Type", ["CE", "PE"])
 
 # Dropdown for selecting strike price (you can manually add options or make it dynamic later)
-strike_price = st.number_input("Select Strike Price", min_value=0, step=50)
+strike_price = st.number_input("Select Strike Price", min_value=0, step=50,value=22550)
 
 # Fetch the data from the CSV URL
 df = load_csv_data()
 
-if st.button("Get ID"):
 
-    # Filtered data based on selection
-    filtered_df = filter_data(df, selected_index, expiry_date, strike_price, option_type)
 
-    #print("filtered data will be ",filtered_df)
 
-    # Option chain display
-    if not filtered_df.empty:
-        # Show the corresponding security ID
-        security_id = filtered_df.iloc[0]['SEM_SMST_SECURITY_ID']
-        st.write(f"Security ID for Strike Price {strike_price} and Option Type {option_type}: {security_id}")
-        st.dataframe(filtered_df)
-    else:
-        st.write("No data available for the selected criteria.")
 
 
 # Input fields for Entry Price, Stop Loss, Target, etc.
-entry_price = st.number_input("Entry Price", min_value=0, step=1)
+entry_price = st.number_input("Entry Price", min_value=0, step=1,value=100)
 less_than_or_greater_than = st.selectbox("Select above or below", [">=", "<="])
-stop_loss_distance = st.number_input("Stop Loss Distance", min_value=0, step=1,value=10)
-target_distance = st.number_input("Target Distance", min_value=0, step=1,value=10)
+stop_loss_distance = st.number_input("Stop Loss Distance", min_value=0, step=1,value=5)
+target_distance = st.number_input("Target Distance", min_value=0, step=1,value=5)
 quantity = st.number_input("Quantity", min_value=1, step=1)
 profit_threshold = st.number_input("Profit Threshold", min_value=1, step=1,value=5000)
 loss_threshold = st.number_input("Loss Threshold", min_value=0, step=1,value=500)
@@ -168,7 +164,7 @@ if trade_mode == "Live Trading":
     order_access_token = st.text_input("Access Token (for placing orders)", type="password")
 else:
     data_client_id = "1104779876"
-    data_access_token = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzUxMiJ9.eyJpc3MiOiJkaGFuIiwicGFydG5lcklkIjoiIiwiZXhwIjoxNzQxMDgxMDEzLCJ0b2tlbkNvbnN1bWVyVHlwZSI6IlNFTEYiLCJ3ZWJob29rVXJsIjoiIiwiZGhhbkNsaWVudElkIjoiMTEwNDc3OTg3NiJ9.AjXo7XYfSqoc38AelIa22TNqZV_Doul3RtB_IkhDp7yEmQ69NPCTXotUUg7KmWLYDvWJXjz8ZN5DiULee6xe4w"
+    data_access_token = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzUxMiJ9.eyJpc3MiOiJkaGFuIiwicGFydG5lcklkIjoiIiwiZXhwIjoxNzQyOTcyNjQxLCJ0b2tlbkNvbnN1bWVyVHlwZSI6IlNFTEYiLCJ3ZWJob29rVXJsIjoiIiwiZGhhbkNsaWVudElkIjoiMTEwNDc3OTg3NiJ9.ne1xRu1C1k09QE2xGbmvYziuCK0n9uQ_abXTO-QtPXtcZuucEooui_Njv52oE_PcqLmSJVXXV6GsjlQaJtMRPw"
 
 
 # Display confirmation of selected options
@@ -185,6 +181,22 @@ st.write(f"Stop Loss Distance: {stop_loss_distance}")
 st.write(f"Target Distance: {target_distance}")
 st.write(f"Use Trailing Stop Loss: {use_trailing_stop_loss}")
 st.write(f"Trade Mode: {trade_mode}")
+
+
+# Filtered data based on selection
+filtered_df = filter_data(df, selected_index, expiry_date, strike_price, option_type)
+
+#print("filtered data will be ",filtered_df)
+
+# Option chain display
+if not filtered_df.empty:
+    # Show the corresponding security ID
+    security_id = filtered_df.iloc[0]['SEM_SMST_SECURITY_ID']
+    st.write(f"Security ID for Strike Price {strike_price} and Option Type {option_type}: {security_id}")
+    st.dataframe(filtered_df)
+else:
+    st.write("No data available for the selected criteria.")
+st.write(f"Security id: {security_id}")
 
 # Button to start/stop trading
 # start_button = st.button("Start")
@@ -228,13 +240,9 @@ month_of_year = entry_time.strftime("%B")  # Month of the year (e.g., February)
 traded_date = datetime.datetime.today().date()
 
 # Confirm the configuration before proceeding
-if st.button("Start"):
+if st.button("Start") and security_id:
     if trade_mode == "Live Trading" and order_client_id and order_access_token:
-        from dhanhq import dhanhq, marketfeed
-        import nest_asyncio
-        import time
-
-        nest_asyncio.apply()
+       
 
         # Add your Dhan Client ID and Access Token
 
@@ -302,8 +310,7 @@ if st.button("Start"):
             data = marketfeed.DhanFeed(data_client_id, data_access_token, instruments, version)
 
             while True:
-                if st.button("Interrupt"):
-                    raise KeyboardInterrupt("Execution interrupted")
+                if st.button("Interrupt Live Trade"):
                     print("Trading interrupted.")
                     st.write("Trading interrupted")
                     data.disconnect()  # This ensures disconnect when the program is forcefully stopped.
@@ -312,7 +319,7 @@ if st.button("Start"):
                         market_feed_value = marketfeed.NSE  # Futures and Options segment
                     else:
                         market_feed_value = marketfeed.BSE
-                    break
+                    # break
                
                 data.run_forever()
                 response = data.get_data()
@@ -410,11 +417,11 @@ if st.button("Start"):
                             # loss_points = 0  # Initial loss points
                             # backtest = False  # Default to backtesting,  set to False for live trading
 
-                            #insert_trade(selected_index, option_type, strike_price, expiry_date, entry_price,
-                            #             stop_loss_distance, target_distance,order_status, entry_time,
-                            #             exit_time, profit_or_loss, profit_points, loss_points, capital_used,
-                            #            time_spent_in_trade, notes, day_of_week, month_of_year, backtest,
-                            #            traded_date,use_trailing_stop_loss)
+                            # insert_trade(selected_index, option_type, strike_price, expiry_date, entry_price,
+                            #              stop_loss_distance, target_distance,order_status, entry_time,
+                            #              exit_time, profit_or_loss, profit_points, loss_points, capital_used,
+                            #             time_spent_in_trade, notes, day_of_week, month_of_year, backtest,
+                            #             traded_date,use_trailing_stop_loss)
                            
                             data.disconnect()
                             break
@@ -439,11 +446,11 @@ if st.button("Start"):
                             loss_points = float(ltp) - entry_price  # Initial loss points
                             # backtest = False  # Default to backtesting,  set to False for live trading
 
-                            insert_trade(selected_index, option_type, strike_price, expiry_date, entry_price,
-                                         stop_loss_distance, target_distance,order_status, entry_time,
-                                         exit_time, profit_or_loss, profit_points, loss_points, capital_used,
-                                        time_spent_in_trade, notes, day_of_week, month_of_year, backtest,
-                                        traded_date,use_trailing_stop_loss)
+                            # insert_trade(selected_index, option_type, strike_price, expiry_date, entry_price,
+                            #              stop_loss_distance, target_distance,order_status, entry_time,
+                            #              exit_time, profit_or_loss, profit_points, loss_points, capital_used,
+                            #             time_spent_in_trade, notes, day_of_week, month_of_year, backtest,
+                            #             traded_date,use_trailing_stop_loss)
 
                             data.disconnect()
                             break
@@ -468,11 +475,11 @@ if st.button("Start"):
                             # loss_points = float(ltp) - entry_price  # Initial loss points
                             # backtest = False  # Default to backtesting,  set to False for live trading
 
-                            insert_trade(selected_index, option_type, strike_price, expiry_date, entry_price,
-                                         stop_loss_distance, target_distance,order_status, entry_time,
-                                         exit_time, profit_or_loss, profit_points, loss_points, capital_used,
-                                        time_spent_in_trade, notes, day_of_week, month_of_year, backtest,
-                                        traded_date,use_trailing_stop_loss)
+                            # insert_trade(selected_index, option_type, strike_price, expiry_date, entry_price,
+                            #              stop_loss_distance, target_distance,order_status, entry_time,
+                            #              exit_time, profit_or_loss, profit_points, loss_points, capital_used,
+                            #             time_spent_in_trade, notes, day_of_week, month_of_year, backtest,
+                            #             traded_date,use_trailing_stop_loss)
 
                             data.disconnect()
                             break
@@ -493,11 +500,11 @@ if st.button("Start"):
                             loss_points = float(ltp) - entry_price  # Initial loss points
                             # backtest = False  # Default to backtesting,  set to False for live trading
 
-                            insert_trade(selected_index, option_type, strike_price, expiry_date, entry_price,
-                                         stop_loss_distance, target_distance,order_status, entry_time,
-                                         exit_time, profit_or_loss, profit_points, loss_points, capital_used,
-                                        time_spent_in_trade, notes, day_of_week, month_of_year, backtest,
-                                        traded_date,use_trailing_stop_loss)
+                            # insert_trade(selected_index, option_type, strike_price, expiry_date, entry_price,
+                            #              stop_loss_distance, target_distance,order_status, entry_time,
+                            #              exit_time, profit_or_loss, profit_points, loss_points, capital_used,
+                            #             time_spent_in_trade, notes, day_of_week, month_of_year, backtest,
+                            #             traded_date,use_trailing_stop_loss)
 
                             data.disconnect()
                             break
@@ -566,7 +573,13 @@ if st.button("Start"):
         #security_id = 844230
         profit_threshold = profit_threshold
         loss_threshold = loss_threshold
-        instruments = [(marketfeed.BSE_FNO, str(security_id), marketfeed.Ticker)]  # Ticker Data
+        print(f"profit threshold {profit_threshold}")
+        print(f"loss threshold {loss_threshold}")
+        if selected_index in ['Nifty','BANKNIFTY','FINNIFTY','MIDCPNIFTY']:
+            market_feed_value = marketfeed.NSE_FNO  # Futures and Options segment
+        else:
+            market_feed_value = marketfeed.BSE_FNO
+        instruments = [(market_feed_value, str(security_id), marketfeed.Ticker)]  # Ticker Data
         version = "v2"  # Mention Version and set to latest version 'v2'
 
         # Define order status variables
@@ -575,39 +588,52 @@ if st.button("Start"):
         current_target = entry_price + target_distance  # Initial target based on entry price
 
 
-        # access_token = 'eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzUxMiJ9.eyJpc3MiOiJkaGFuIiwicGFydG5lcklkIjoiIiwiZXhwIjoxNzQxMDgxMDEzLCJ0b2tlbkNvbnN1bWVyVHlwZSI6IlNFTEYiLCJ3ZWJob29rVXJsIjoiIiwiZGhhbkNsaWVudElkIjoiMTEwNDc3OTg3NiJ9.AjXo7XYfSqoc38AelIa22TNqZV_Doul3RtB_IkhDp7yEmQ69NPCTXotUUg7KmWLYDvWJXjz8ZN5DiULee6xe4w'
-        # client_id = '1104779876'
+        data_client_id = "1104779876"
+        data_access_token = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzUxMiJ9.eyJpc3MiOiJkaGFuIiwicGFydG5lcklkIjoiIiwiZXhwIjoxNzQyOTcyNjQxLCJ0b2tlbkNvbnN1bWVyVHlwZSI6IlNFTEYiLCJ3ZWJob29rVXJsIjoiIiwiZGhhbkNsaWVudElkIjoiMTEwNDc3OTg3NiJ9.ne1xRu1C1k09QE2xGbmvYziuCK0n9uQ_abXTO-QtPXtcZuucEooui_Njv52oE_PcqLmSJVXXV6GsjlQaJtMRPw"
+
+
 
         # Main trading loop
         try:
             data = marketfeed.DhanFeed(data_client_id, data_access_token, instruments, version)
             st.write("Fetching Data for backtesting")
-            print("Fetching Data for backtesting")
+            print(f"security id {security_id}")
+           
 
             while True:
-                if st.button("Interrupt"):
-                    raise KeyboardInterrupt("Execution interrupted")
-                    print("Trading interrupted.")
-                    st.write("Trading interrupted")
-                    data.disconnect()  # This ensures disconnect when the program is forcefully stopped.
-                    # Unsubscribe instruments which are already active on connection
-                    if selected_index in ['Nifty','BANKNIFTY','FINNIFTY','MIDCPNIFTY']:
-                        market_feed_value = marketfeed.NSE  # Futures and Options segment
-                    else:
-                        market_feed_value = marketfeed.BSE
-                    break
+                # if st.button("Interrupt"):
+                #     print("Execution interrupted by user. Disconnecting...")
+                #     st.write("Execution interrupted by user. Disconnecting...")
+                   
+                #     # Unsubscribe instruments which are already active on connection
+                #     if selected_index in ['Nifty','BANKNIFTY','FINNIFTY','MIDCPNIFTY']:
+                #         unsub_instruments = [(marketfeed.NSE, str(security_id), 16)]
+
+                #         data.unsubscribe_symbols(unsub_instruments)
+                       
+                #     else:
+                #         unsub_instruments = [(marketfeed.BSE, str(security_id), 16)]
+
+                #         data.unsubscribe_symbols(unsub_instruments)
+
+                #     data.disconnect()  # This ensures disconnect when the program is forcefully stopped.
+                #     # break
 
                 data.run_forever()
                 response = data.get_data()
+                # print(response)
+               
 
                 if 'LTP' in response.keys():
                     ltp = response['LTP']
+                    st.write(f"LTP {ltp}")
                     st.write(f"{selected_index} {strike_price} {option_type} {expiry_date} LTP: {ltp}")
 
                     # Place buy order if LTP reaches the entry price
                     if order_status == "not_placed":
                         if less_than_or_greater_than == ">=":
                             if float(ltp) >= entry_price:
+                                st.write(f"{float(ltp)} >= {entry_price}")
                                 st.write("LTP reached entry price, placing order...")
                                 print("LTP reached entry price, placing order...")
                                 # Place buy order
@@ -693,11 +719,11 @@ if st.button("Start"):
                             # loss_points = 0  # Initial loss points
                             # backtest = False  # Default to backtesting,  set to False for live trading
 
-                            #insert_trade(selected_index, option_type, strike_price, expiry_date, entry_price,
-                            #             stop_loss_distance, target_distance,order_status, entry_time,
-                            #             exit_time, profit_or_loss, profit_points, loss_points, capital_used,
-                            #            time_spent_in_trade, notes, day_of_week, month_of_year, backtest,
-                            #            traded_date,use_trailing_stop_loss)
+                            # insert_trade(selected_index, option_type, strike_price, expiry_date, entry_price,
+                            #              stop_loss_distance, target_distance,order_status, entry_time,
+                            #              exit_time, profit_or_loss, profit_points, loss_points, capital_used,
+                            #             time_spent_in_trade, notes, day_of_week, month_of_year, backtest,
+                            #             traded_date,use_trailing_stop_loss)
                            
                             data.disconnect()
                             break
@@ -722,11 +748,11 @@ if st.button("Start"):
                             loss_points = float(ltp) - entry_price  # Initial loss points
                             # backtest = False  # Default to backtesting,  set to False for live trading
 
-                            #insert_trade(selected_index, option_type, strike_price, expiry_date, entry_price,
-                            #             stop_loss_distance, target_distance,order_status, entry_time,
-                            #             exit_time, profit_or_loss, profit_points, loss_points, capital_used,
-                            #            time_spent_in_trade, notes, day_of_week, month_of_year, backtest,
-                            #            traded_date,use_trailing_stop_loss)
+                            # insert_trade(selected_index, option_type, strike_price, expiry_date, entry_price,
+                            #              stop_loss_distance, target_distance,order_status, entry_time,
+                            #              exit_time, profit_or_loss, profit_points, loss_points, capital_used,
+                            #             time_spent_in_trade, notes, day_of_week, month_of_year, backtest,
+                            #             traded_date,use_trailing_stop_loss)
 
                             data.disconnect()
                             break
@@ -751,15 +777,15 @@ if st.button("Start"):
                             # loss_points = float(ltp) - entry_price  # Initial loss points
                             # backtest = False  # Default to backtesting,  set to False for live trading
 
-                            #insert_trade(selected_index, option_type, strike_price, expiry_date, entry_price,
-                            #             stop_loss_distance, target_distance,order_status, entry_time,
-                            #             exit_time, profit_or_loss, profit_points, loss_points, capital_used,
-                            #            time_spent_in_trade, notes, day_of_week, month_of_year, backtest,
-                            #            traded_date,use_trailing_stop_loss)
+                            # insert_trade(selected_index, option_type, strike_price, expiry_date, entry_price,
+                            #              stop_loss_distance, target_distance,order_status, entry_time,
+                            #              exit_time, profit_or_loss, profit_points, loss_points, capital_used,
+                            #             time_spent_in_trade, notes, day_of_week, month_of_year, backtest,
+                            #             traded_date,use_trailing_stop_loss)
 
                             data.disconnect()
                             break
-                        elif profit_or_loss <= loss_threshold:
+                        elif profit_or_loss <= -loss_threshold:
                             print(f"Loss threshold reached! Exiting trade with loss of {profit_or_loss}.")
                             st.write(f"Loss threshold reached! Exiting trade with loss of {profit_or_loss}.")
                             order_status = "stop_loss_hit"
@@ -776,11 +802,11 @@ if st.button("Start"):
                             loss_points = float(ltp) - entry_price  # Initial loss points
                             # backtest = False  # Default to backtesting,  set to False for live trading
 
-                            #insert_trade(selected_index, option_type, strike_price, expiry_date, entry_price,
-                            #             stop_loss_distance, target_distance,order_status, entry_time,
-                            #             exit_time, profit_or_loss, profit_points, loss_points, capital_used,
-                            #            time_spent_in_trade, notes, day_of_week, month_of_year, backtest,
-                            #            traded_date,use_trailing_stop_loss)
+                            # insert_trade(selected_index, option_type, strike_price, expiry_date, entry_price,
+                            #              stop_loss_distance, target_distance,order_status, entry_time,
+                            #              exit_time, profit_or_loss, profit_points, loss_points, capital_used,
+                            #             time_spent_in_trade, notes, day_of_week, month_of_year, backtest,
+                            #             traded_date,use_trailing_stop_loss)
 
                             data.disconnect()
                             break
@@ -788,42 +814,58 @@ if st.button("Start"):
         except KeyboardInterrupt:
             print("Execution interrupted by user. Disconnecting...")
             st.write("Execution interrupted by user. Disconnecting...")
-            data.disconnect()  # This ensures disconnect when the program is forcefully stopped.
+           
             # Unsubscribe instruments which are already active on connection
             if selected_index in ['Nifty','BANKNIFTY','FINNIFTY','MIDCPNIFTY']:
-                market_feed_value = marketfeed.NSE  # Futures and Options segment
-            else:
-                market_feed_value = marketfeed.BSE
-           
-            unsub_instruments = [(market_feed_value, str(security_id), 16)]
+                unsub_instruments = [(marketfeed.NSE, str(security_id), 16)]
 
-            data.unsubscribe_symbols(unsub_instruments)
+                data.unsubscribe_symbols(unsub_instruments)
+               
+            else:
+                unsub_instruments = [(marketfeed.BSE, str(security_id), 16)]
+
+                data.unsubscribe_symbols(unsub_instruments)
+
+            data.disconnect()  # This ensures disconnect when the program is forcefully stopped.
+           
+           
 
         except Exception as e:
             print(e)
             print("Exception occured")
-            data.disconnect()
-            #Unsubscribe instruments which are already active on connection
-            if selected_index in ['Nifty','BANKNIFTY','FINNIFTY','MIDCPNIFTY']:
-                market_feed_value = marketfeed.NSE  # Futures and Options segment
-            else:
-                market_feed_value = marketfeed.BSE
+            print("Execution interrupted by user. Disconnecting...")
+            st.write("Execution interrupted by user. Disconnecting...")
            
-            unsub_instruments = [(market_feed_value, str(security_id), 16)]
+            # Unsubscribe instruments which are already active on connection
+            if selected_index in ['Nifty','BANKNIFTY','FINNIFTY','MIDCPNIFTY']:
+                unsub_instruments = [(marketfeed.NSE, str(security_id), 16)]
 
-            data.unsubscribe_symbols(unsub_instruments)
+                data.unsubscribe_symbols(unsub_instruments)
+               
+            else:
+                unsub_instruments = [(marketfeed.BSE, str(security_id), 16)]
+
+                data.unsubscribe_symbols(unsub_instruments)
+
+            data.disconnect()  # This ensures disconnect when the program is forcefully stopped.
+           
+           
 
         finally:
-            data.disconnect()
+           
             #Unsubscribe instruments which are already active on connection
             if selected_index in ['Nifty','BANKNIFTY','FINNIFTY','MIDCPNIFTY']:
-                market_feed_value = marketfeed.NSE  # Futures and Options segment
-            else:
-                market_feed_value = marketfeed.BSE
-           
-            unsub_instruments = [(market_feed_value, str(security_id), 16)]
+                unsub_instruments = [(marketfeed.NSE, str(security_id), 16)]
 
-            data.unsubscribe_symbols(unsub_instruments)
+                data.unsubscribe_symbols(unsub_instruments)
+               
+            else:
+                unsub_instruments = [(marketfeed.BSE, str(security_id), 16)]
+
+                data.unsubscribe_symbols(unsub_instruments)
+
+            data.disconnect()
 
         # Close Connection
         data.disconnect()
+
