@@ -119,7 +119,7 @@ def filter_data(df, selected_index, expiry_date, strike_price, option_type):
     return df
 
 # Streamlit UI
-st.title("Security ID Fetcher for Algo Trading")
+st.title("Algo Trading")
 
 # Dropdown to select Nifty or Sensex
 selected_index = st.selectbox("Select Index", ["Nifty", "Sensex","Bank Nifty","Fin Nifty","Midcap Nifty","Bankex"])
