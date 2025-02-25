@@ -626,8 +626,8 @@ if st.button("Start") and security_id:
 
                 if 'LTP' in response.keys():
                     ltp = response['LTP']
-                    st.write(f"LTP {ltp}")
-                    st.write(f"{selected_index} {strike_price} {option_type} {expiry_date} LTP: {ltp}")
+                    #st.write(f"LTP {ltp}")
+                    st.write(f"{selected_index} {strike_price} {option_type}   LTP:   {ltp}")
 
                     # Place buy order if LTP reaches the entry price
                     if order_status == "not_placed":
