@@ -310,16 +310,6 @@ if st.button("Start") and security_id:
             data = marketfeed.DhanFeed(data_client_id, data_access_token, instruments, version)
 
             while True:
-                if st.button("Interrupt Live Trade"):
-                    print("Trading interrupted.")
-                    st.write("Trading interrupted")
-                    data.disconnect()  # This ensures disconnect when the program is forcefully stopped.
-                    # Unsubscribe instruments which are already active on connection
-                    if selected_index in ['Nifty','BANKNIFTY','FINNIFTY','MIDCPNIFTY']:
-                        market_feed_value = marketfeed.NSE  # Futures and Options segment
-                    else:
-                        market_feed_value = marketfeed.BSE
-                    # break
                
                 data.run_forever()
                 response = data.get_data()
