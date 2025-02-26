@@ -306,26 +306,87 @@ if st.button("Start") and security_id:
         # client_id = '1104779876'
 
         # Main trading loop
+        from dhanhq import dhanhq, marketfeed
+        import nest_asyncio
+        import time
+
+        nest_asyncio.apply()
+
+        # Add your Dhan Client ID and Access Token
+
+        # Define trade parameters
+        entry_price = entry_price  # Example entry price for NIFTY 50 23000CE
+        stop_loss_distance = stop_loss_distance  # Trailing stop loss distance (in points)
+        target_distance = target_distance  # Initial target distance (in points)
+        quantity = quantity
+        security_id = security_id  # 75300 PE Example security_id for options
+        #security_id = 844230
+        profit_threshold = profit_threshold
+        loss_threshold = loss_threshold
+        print(f"profit threshold {profit_threshold}")
+        print(f"loss threshold {loss_threshold}")
+        if selected_index in ['Nifty','BANKNIFTY','FINNIFTY','MIDCPNIFTY']:
+            market_feed_value = marketfeed.NSE_FNO  # Futures and Options segment
+        else:
+            market_feed_value = marketfeed.BSE_FNO
+        instruments = [(market_feed_value, str(security_id), marketfeed.Ticker)]  # Ticker Data
+        version = "v2"  # Mention Version and set to latest version 'v2'
+
+        # Define order status variables
+        order_status = "not_placed"  # Can be 'not_placed', 'placed', 'target_hit', 'stop_loss_hit'
+        highest_price = 0  # To track the highest price reached after entry
+        current_target = entry_price + target_distance  # Initial target based on entry price
+
+
+        data_client_id = "1104779876"
+        data_access_token = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzUxMiJ9.eyJpc3MiOiJkaGFuIiwicGFydG5lcklkIjoiIiwiZXhwIjoxNzQyOTcyNjQxLCJ0b2tlbkNvbnN1bWVyVHlwZSI6IlNFTEYiLCJ3ZWJob29rVXJsIjoiIiwiZGhhbkNsaWVudElkIjoiMTEwNDc3OTg3NiJ9.ne1xRu1C1k09QE2xGbmvYziuCK0n9uQ_abXTO-QtPXtcZuucEooui_Njv52oE_PcqLmSJVXXV6GsjlQaJtMRPw"
+
+        # Main trading loop
         try:
             data = marketfeed.DhanFeed(data_client_id, data_access_token, instruments, version)
+            st.write("Fetching Data for live trading")
+            print(f"security id {security_id}")
+           
 
             while True:
-               
+                # if st.button("Interrupt"):
+                #     print("Execution interrupted by user. Disconnecting...")
+                #     st.write("Execution interrupted by user. Disconnecting...")
+                   
+                #     # Unsubscribe instruments which are already active on connection
+                #     if selected_index in ['Nifty','BANKNIFTY','FINNIFTY','MIDCPNIFTY']:
+                #         unsub_instruments = [(marketfeed.NSE, str(security_id), 16)]
+
+                #         data.unsubscribe_symbols(unsub_instruments)
+                       
+                #     else:
+                #         unsub_instruments = [(marketfeed.BSE, str(security_id), 16)]
+
+                #         data.unsubscribe_symbols(unsub_instruments)
+
+                #     data.disconnect()  # This ensures disconnect when the program is forcefully stopped.
+                #     # break
+
                 data.run_forever()
                 response = data.get_data()
+                # print(response)
+               
 
                 if 'LTP' in response.keys():
                     ltp = response['LTP']
-                    st.write(f"{selected_index} {strike_price} {option_type} {expiry_date} LTP: {ltp}")
+                    #st.write(f"LTP {ltp}")
+                    st.write(f"{selected_index} {strike_price} {option_type}   LTP:   {ltp}")
 
                     # Place buy order if LTP reaches the entry price
                     if order_status == "not_placed":
                         if less_than_or_greater_than == ">=":
                             if float(ltp) >= entry_price:
-                                st.write("LTP reached entry price, placing order...")
+                                st.write(f"{float(ltp)} >= {entry_price}")
+                                st.write("LTP reached above entry price, placing order...")
                                 print("LTP reached entry price, placing order...")
                                 # Place buy order
                                 place_order(security_id, quantity, float(ltp), "buy")
+                               
                                 order_status = "placed"
                                 highest_price = float(ltp)  # Set highest price to entry price
                                 print(f"Buy order placed at {ltp}")
@@ -338,14 +399,15 @@ if st.button("Start") and security_id:
                                 # profit_or_loss = 0  # Initial profit/loss is zero
                                 # profit_points = 0  # Initial profit points
                                 # loss_points = 0  # Initial loss points
-                                backtest = False  # Default to backtesting,  set to False for live trading
+                                backtest = True  # Default to backtesting,  set to False for live trading
                                
                         else:
                             if float(ltp) <= entry_price:
                                 st.write("LTP reached entry price or below, placing order...")
                                 print("LTP reached entry price, placing order...")
-                                # Place buy order
+                                # Exit the trade (place a sell order)
                                 place_order(security_id, quantity, float(ltp), "buy")
+                               
                                 order_status = "placed"
                                 highest_price = float(ltp)  # Set highest price to entry price
                                 print(f"Buy order placed at {ltp}")
@@ -394,6 +456,7 @@ if st.button("Start") and security_id:
                             order_status = "target_hit"
                             # Exit the trade (place a sell order)
                             place_order(security_id, quantity, float(ltp), "sell")
+                           
                             print(f"Exited at {ltp}")
                             st.write(f"Exited at {ltp}")
                             print(f"Current Profit/Loss: {profit_or_loss}")
@@ -423,6 +486,7 @@ if st.button("Start") and security_id:
                             order_status = "stop_loss_hit"
                             # Exit the trade (place a sell order)
                             place_order(security_id, quantity, float(ltp), "sell")
+                            
                             print(f"Exited at {ltp}")
                             st.write(f"Exited at {ltp}")
                             print(f"Current Profit/Loss: {profit_or_loss}")
@@ -454,6 +518,7 @@ if st.button("Start") and security_id:
                             order_status = "target_hit"
                             # Exit the trade (place a sell order)
                             place_order(security_id, quantity, float(ltp), "sell")
+                           
                             print(f"Exited at {ltp}")
                             st.write(f"Exited at {ltp}")
 
@@ -473,12 +538,13 @@ if st.button("Start") and security_id:
 
                             data.disconnect()
                             break
-                        elif profit_or_loss <= loss_threshold:
+                        elif profit_or_loss <= -loss_threshold:
                             print(f"Loss threshold reached! Exiting trade with loss of {profit_or_loss}.")
                             st.write(f"Loss threshold reached! Exiting trade with loss of {profit_or_loss}.")
                             order_status = "stop_loss_hit"
                             # Exit the trade (place a sell order)
                             place_order(security_id, quantity, float(ltp), "sell")
+                           
                             print(f"Exited at {ltp}")
                             st.write(f"Exited at {ltp}")
 
@@ -499,48 +565,60 @@ if st.button("Start") and security_id:
                             data.disconnect()
                             break
            
-               
-
         except KeyboardInterrupt:
             print("Execution interrupted by user. Disconnecting...")
             st.write("Execution interrupted by user. Disconnecting...")
-            data.disconnect()  # This ensures disconnect when the program is forcefully stopped.
+           
             # Unsubscribe instruments which are already active on connection
             if selected_index in ['Nifty','BANKNIFTY','FINNIFTY','MIDCPNIFTY']:
-                market_feed_value = marketfeed.NSE  # Futures and Options segment
-            else:
-                market_feed_value = marketfeed.BSE
-           
-            unsub_instruments = [(market_feed_value, str(security_id), 16)]
+                unsub_instruments = [(marketfeed.NSE, str(security_id), 16)]
 
-            data.unsubscribe_symbols(unsub_instruments)
+                data.unsubscribe_symbols(unsub_instruments)
+               
+            else:
+                unsub_instruments = [(marketfeed.BSE, str(security_id), 16)]
+
+                data.unsubscribe_symbols(unsub_instruments)
+
+            data.disconnect()  # This ensures disconnect when the program is forcefully stopped.
+           
+           
 
         except Exception as e:
             print(e)
-            data.disconnect()
-            #Unsubscribe instruments which are already active on connection
-            if selected_index in ['Nifty','BANKNIFTY','FINNIFTY','MIDCPNIFTY']:
-                market_feed_value = marketfeed.NSE  # Futures and Options segment
-            else:
-                market_feed_value = marketfeed.BSE
+            print("Exception occured")
+            print("Execution interrupted by user. Disconnecting...")
+            st.write("Execution interrupted by user. Disconnecting...")
            
-            unsub_instruments = [(market_feed_value, str(security_id), 16)]
+            # Unsubscribe instruments which are already active on connection
+            if selected_index in ['Nifty','BANKNIFTY','FINNIFTY','MIDCPNIFTY']:
+                unsub_instruments = [(marketfeed.NSE, str(security_id), 16)]
 
-            data.unsubscribe_symbols(unsub_instruments)
+                data.unsubscribe_symbols(unsub_instruments)
+               
+            else:
+                unsub_instruments = [(marketfeed.BSE, str(security_id), 16)]
+
+                data.unsubscribe_symbols(unsub_instruments)
+
+            data.disconnect()  # This ensures disconnect when the program is forcefully stopped.
+           
+           
 
         finally:
-            data.disconnect()
+           
             #Unsubscribe instruments which are already active on connection
             if selected_index in ['Nifty','BANKNIFTY','FINNIFTY','MIDCPNIFTY']:
-                market_feed_value = marketfeed.NSE  # Futures and Options segment
+                unsub_instruments = [(marketfeed.NSE, str(security_id), 16)]
+
+                data.unsubscribe_symbols(unsub_instruments)
+               
             else:
-                market_feed_value = marketfeed.BSE
-           
-            unsub_instruments = [(market_feed_value, str(security_id), 16)]
+                unsub_instruments = [(marketfeed.BSE, str(security_id), 16)]
 
-            data.unsubscribe_symbols(unsub_instruments)
+                data.unsubscribe_symbols(unsub_instruments)
 
-
+            data.disconnect()
 
         # Close Connection
         data.disconnect()
@@ -858,4 +936,3 @@ if st.button("Start") and security_id:
 
         # Close Connection
         data.disconnect()
-
