@@ -643,7 +643,7 @@ if st.button("Start") and security_id:
         loss_threshold = loss_threshold
         print(f"profit threshold {profit_threshold}")
         print(f"loss threshold {loss_threshold}")
-        if selected_index in ['Nifty','BANKNIFTY','FINNIFTY','MIDCPNIFTY']:
+        if selected_index in ['Nifty','Bank Nifty','Fin Nifty','Midcap Nifty']:
             market_feed_value = marketfeed.NSE_FNO  # Futures and Options segment
         else:
             market_feed_value = marketfeed.BSE_FNO
