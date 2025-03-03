@@ -238,9 +238,7 @@ notes = "Example trade with simple strategy"  # Notes for the trade
 day_of_week = entry_time.strftime("%A")  # Day of the week (e.g., Monday)
 month_of_year = entry_time.strftime("%B")  # Month of the year (e.g., February)
 traded_date = datetime.datetime.today().date()
-profit_placeholder = st.empty()
-ltp_placeholder = st.empty()
-trailing_placeholder = st.empty()
+
 # Confirm the configuration before proceeding
 if st.button("Start") and security_id:
     if trade_mode == "Live Trading" and order_client_id and order_access_token:
@@ -377,7 +375,7 @@ if st.button("Start") and security_id:
                 if 'LTP' in response.keys():
                     ltp = response['LTP']
                     #st.write(f"LTP {ltp}")
-                    ltp_placeholder(f"{selected_index} {strike_price} {option_type}   LTP:   {ltp}")
+                    st.write(f"{selected_index} {strike_price} {option_type}   LTP:   {ltp}")
 
                     # Place buy order if LTP reaches the entry price
                     if order_status == "not_placed":
@@ -431,7 +429,7 @@ if st.button("Start") and security_id:
                         # Calculate profit/loss based on amount
                         profit_or_loss = (float(ltp) - entry_price) * quantity
                         print(f"Current Profit/Loss: {profit_or_loss}")
-                        profit_placeholder(f"Current Profit/Loss: {profit_or_loss}")
+                        st.write(f"Current Profit/Loss: {profit_or_loss}")
 
                         # Trailing Target: If the price increases, increase the target
                         if float(ltp) >= current_target:
@@ -447,7 +445,7 @@ if st.button("Start") and security_id:
                             # Calculate the trailing stop loss based on the highest price
                             trailing_stop_loss_price = highest_price - stop_loss_distance
                             print(f"Entry price: {entry_price} Trailing Stop Loss at: {trailing_stop_loss_price} highest price: {highest_price} target: {current_target}")
-                            trailing_placeholder(f"Entry price: {entry_price} Trailing Stop Loss at: {trailing_stop_loss_price} highest price: {highest_price} target: {current_target}")
+                            st.write(f"Entry price: {entry_price} Trailing Stop Loss at: {trailing_stop_loss_price} highest price: {highest_price} target: {current_target}")
                         else:
                             trailing_stop_loss_price = stop_loss_distance
 
@@ -697,7 +695,7 @@ if st.button("Start") and security_id:
                 if 'LTP' in response.keys():
                     ltp = response['LTP']
                     #st.write(f"LTP {ltp}")
-                    ltp_placeholder(f"{selected_index} {strike_price} {option_type}   LTP:   {ltp}")
+                    st.write(f"{selected_index} {strike_price} {option_type}   LTP:   {ltp}")
 
                     # Place buy order if LTP reaches the entry price
                     if order_status == "not_placed":
@@ -749,7 +747,7 @@ if st.button("Start") and security_id:
                         # Calculate profit/loss based on amount
                         profit_or_loss = (float(ltp) - entry_price) * quantity
                         print(f"Current Profit/Loss: {profit_or_loss}")
-                        profit_placeholder(f"Current Profit/Loss: {profit_or_loss}")
+                        st.write(f"Current Profit/Loss: {profit_or_loss}")
 
                         # Trailing Target: If the price increases, increase the target
                         if float(ltp) >= current_target:
@@ -765,7 +763,7 @@ if st.button("Start") and security_id:
                             # Calculate the trailing stop loss based on the highest price
                             trailing_stop_loss_price = highest_price - stop_loss_distance
                             print(f"Entry price: {entry_price} Trailing Stop Loss at: {trailing_stop_loss_price} highest price: {highest_price} target: {current_target}")
-                            trailing_placeholder(f"Entry price: {entry_price} Trailing Stop Loss at: {trailing_stop_loss_price} highest price: {highest_price} target: {current_target}")
+                            st.write(f"Entry price: {entry_price} Trailing Stop Loss at: {trailing_stop_loss_price} highest price: {highest_price} target: {current_target}")
                         else:
                             trailing_stop_loss_price = stop_loss_distance
 
