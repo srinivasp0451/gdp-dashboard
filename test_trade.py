@@ -164,7 +164,7 @@ if trade_mode == "Live Trading":
     order_access_token = st.text_input("Access Token (for placing orders)", type="password")
 else:
     data_client_id = "1104779876"
-    data_access_token = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzUxMiJ9.eyJpc3MiOiJkaGFuIiwicGFydG5lcklkIjoiIiwiZXhwIjoxNzQzNjUyMjIwLCJ0b2tlbkNvbnN1bWVyVHlwZSI6IlNFTEYiLCJ3ZWJob29rVXJsIjoiIiwiZGhhbkNsaWVudElkIjoiMTEwNDc3OTg3NiJ9.DmmIjKhtXzZlrj7oIMVM2Eo-lZbEF9Lmu6-4HYzRBt5QS1iRuQCA3-ack-_WXEYjJ6QEwyrKtSkBs1M61ZaJsQ"
+    data_access_token = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzUxMiJ9.eyJpc3MiOiJkaGFuIiwicGFydG5lcklkIjoiIiwiZXhwIjoxNzQyOTcyNjQxLCJ0b2tlbkNvbnN1bWVyVHlwZSI6IlNFTEYiLCJ3ZWJob29rVXJsIjoiIiwiZGhhbkNsaWVudElkIjoiMTEwNDc3OTg3NiJ9.ne1xRu1C1k09QE2xGbmvYziuCK0n9uQ_abXTO-QtPXtcZuucEooui_Njv52oE_PcqLmSJVXXV6GsjlQaJtMRPw"
 
 
 # Display confirmation of selected options
@@ -671,24 +671,7 @@ if st.button("Start") and security_id:
            
 
             while True:
-                # if st.button("Interrupt"):
-                #     print("Execution interrupted by user. Disconnecting...")
-                #     st.write("Execution interrupted by user. Disconnecting...")
-                   
-                #     # Unsubscribe instruments which are already active on connection
-                #     if selected_index in ['Nifty','BANKNIFTY','FINNIFTY','MIDCPNIFTY']:
-                #         unsub_instruments = [(marketfeed.NSE, str(security_id), 16)]
-
-                #         data.unsubscribe_symbols(unsub_instruments)
-                       
-                #     else:
-                #         unsub_instruments = [(marketfeed.BSE, str(security_id), 16)]
-
-                #         data.unsubscribe_symbols(unsub_instruments)
-
-                #     data.disconnect()  # This ensures disconnect when the program is forcefully stopped.
-                #     # break
-
+                
                 data.run_forever()
                 response = data.get_data()
                 # print(response)
