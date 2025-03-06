@@ -251,16 +251,16 @@ if st.button("Start") and security_id:
            
             dhan = dhanhq(client_id=order_client_id,access_token=order_access_token)
             
-            """
-            Place a real-time market order with Dhan API using the official structure.
-            Args:
-                symbol (str): The symbol (e.g., NIFTY or specific option)
-                qty (int): The quantity to buy or sell
-                price (float): The price at which to place the order
-                order_type (str): "buy" or "sell"
-                exchange_segment (str): The exchange segment (default to None, to use NSE_FNO if not provided)
-                product_type (str): The product type (default to None, to use INTRA if not provided)
-            """
+            # """
+            # Place a real-time market order with Dhan API using the official structure.
+            # Args:
+            #     symbol (str): The symbol (e.g., NIFTY or specific option)
+            #     qty (int): The quantity to buy or sell
+            #     price (float): The price at which to place the order
+            #     order_type (str): "buy" or "sell"
+            #     exchange_segment (str): The exchange segment (default to None, to use NSE_FNO if not provided)
+            #     product_type (str): The product type (default to None, to use INTRA if not provided)
+            # """
             # Default values if not provided
             if exchange_segment is None:
                 if selected_index in ["Nifty", "Bank Nifty","Fin Nifty","Midcap Nifty"]:
@@ -540,7 +540,7 @@ if st.button("Start") and security_id:
             st.write("Execution interrupted by user. Disconnecting...")
            
             # Unsubscribe instruments which are already active on connection
-            if selected_index in ['Nifty','BANKNIFTY','FINNIFTY','MIDCPNIFTY']:
+            if selected_index in ["Nifty", "Bank Nifty","Fin Nifty","Midcap Nifty"]:
                 unsub_instruments = [(marketfeed.NSE, str(security_id), 16)]
 
                 data.unsubscribe_symbols(unsub_instruments)
@@ -561,7 +561,7 @@ if st.button("Start") and security_id:
             st.write("Execution interrupted by user. Disconnecting...")
            
             # Unsubscribe instruments which are already active on connection
-            if selected_index in ['Nifty','BANKNIFTY','FINNIFTY','MIDCPNIFTY']:
+            if selected_index in ["Nifty", "Bank Nifty","Fin Nifty","Midcap Nifty"]:
                 unsub_instruments = [(marketfeed.NSE, str(security_id), 16)]
 
                 data.unsubscribe_symbols(unsub_instruments)
@@ -578,7 +578,7 @@ if st.button("Start") and security_id:
         finally:
            
             #Unsubscribe instruments which are already active on connection
-            if selected_index in ['Nifty','BANKNIFTY','FINNIFTY','MIDCPNIFTY']:
+            if selected_index in ["Nifty", "Bank Nifty","Fin Nifty","Midcap Nifty"]:
                 unsub_instruments = [(marketfeed.NSE, str(security_id), 16)]
 
                 data.unsubscribe_symbols(unsub_instruments)
