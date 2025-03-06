@@ -160,8 +160,8 @@ trade_mode = st.selectbox("Select Trade Mode", ["Backtesting", "Live Trading"])
 
 # Inputs for Live Trading (client ID and access token for live trading)
 if trade_mode == "Live Trading":
-    order_client_id = st.text_input("Client ID (for placing orders)", type="password")
-    order_access_token = st.text_input("Access Token (for placing orders)", type="password")
+    order_client_id = st.text_input("Client ID (for placing orders)", type="password",value='22305184')
+    order_access_token = st.text_input("Access Token (for placing orders)", type="password",value='eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzUxMiJ9.eyJpc3MiOiJkaGFuIiwicGFydG5lcklkIjoiIiwiZXhwIjoxNzQzNjcyMTgwLCJ0b2tlbkNvbnN1bWVyVHlwZSI6IlNFTEYiLCJ3ZWJob29rVXJsIjoiIiwiZGhhbkNsaWVudElkIjoiMTEwNDc3OTg3NiJ9.I-Hl-IKVl4dioMwp5Qhl-7duuX7BrIXJIc6v6kuLX7g3zMKcNCeAGFstRrbo2N7vDn2WCmY90YxPbmQsnquhpg')
 else:
     data_client_id = "1104779876"
     data_access_token = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzUxMiJ9.eyJpc3MiOiJkaGFuIiwicGFydG5lcklkIjoiIiwiZXhwIjoxNzQyOTcyNjQxLCJ0b2tlbkNvbnN1bWVyVHlwZSI6IlNFTEYiLCJ3ZWJob29rVXJsIjoiIiwiZGhhbkNsaWVudElkIjoiMTEwNDc3OTg3NiJ9.ne1xRu1C1k09QE2xGbmvYziuCK0n9uQ_abXTO-QtPXtcZuucEooui_Njv52oE_PcqLmSJVXXV6GsjlQaJtMRPw"
@@ -246,30 +246,11 @@ if st.button("Start") and security_id:
     if trade_mode == "Live Trading" and order_client_id and order_access_token:
        
 
-        # Add your Dhan Client ID and Access Token
-
-        # Define trade parameters
-        entry_price = entry_price  # Example entry price for NIFTY 50 23000CE
-        stop_loss_distance = stop_loss_distance  # Trailing stop loss distance (in points)
-        target_distance = target_distance  # Initial target distance (in points)
-        quantity = quantity
-        security_id = security_id  # 75300 PE Example security_id for options
-        #security_id = 844230
-        profit_threshold = profit_threshold
-        loss_threshold = -loss_threshold
-        instruments = [(marketfeed.BSE_FNO, str(security_id), marketfeed.Ticker)]  # Ticker Data
-        version = "v2"  # Mention Version and set to latest version 'v2'
-
-        # Define order status variables
-        order_status = "not_placed"  # Can be 'not_placed', 'placed', 'target_hit', 'stop_loss_hit'
-        highest_price = 0  # To track the highest price reached after entry
-        current_target = entry_price + target_distance  # Initial target based on entry price
-
         # Place order function
         def place_order(symbol, qty, price, order_type="buy", exchange_segment=None, product_type=None):
            
             dhan = dhanhq(client_id=order_client_id,access_token=order_access_token)
-
+            
             """
             Place a real-time market order with Dhan API using the official structure.
             Args:
@@ -282,13 +263,16 @@ if st.button("Start") and security_id:
             """
             # Default values if not provided
             if exchange_segment is None:
-                if selected_index in ['Nifty','BANKNIFTY','FINNIFTY','MIDCPNIFTY']:
+                if selected_index in ["Nifty", "Bank Nifty","Fin Nifty","Midcap Nifty"]:
                     exchange_segment = dhan.NSE_FNO  # Futures and Options segment
                 else:
                     exchange_segment = dhan.BSE_FNO
 
             if product_type is None:
                 product_type = dhan.INTRA  # Intraday product type
+
+            print(f"symbol {symbol} {qty} {price} {order_type} {exchange_segment} {product_type}")
+            print(f"order client id {order_client_id} token {order_access_token}")
 
             # Use Dhan's place_order method for placing orders
             order_data = dhan.place_order(
@@ -327,7 +311,7 @@ if st.button("Start") and security_id:
         loss_threshold = loss_threshold
         print(f"profit threshold {profit_threshold}")
         print(f"loss threshold {loss_threshold}")
-        if selected_index in ['Nifty','BANKNIFTY','FINNIFTY','MIDCPNIFTY']:
+        if selected_index in ["Nifty", "Bank Nifty","Fin Nifty","Midcap Nifty"]:
             market_feed_value = marketfeed.NSE_FNO  # Futures and Options segment
         else:
             market_feed_value = marketfeed.BSE_FNO
@@ -344,31 +328,15 @@ if st.button("Start") and security_id:
         data_access_token = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzUxMiJ9.eyJpc3MiOiJkaGFuIiwicGFydG5lcklkIjoiIiwiZXhwIjoxNzQzNjcyMTgwLCJ0b2tlbkNvbnN1bWVyVHlwZSI6IlNFTEYiLCJ3ZWJob29rVXJsIjoiIiwiZGhhbkNsaWVudElkIjoiMTEwNDc3OTg3NiJ9.I-Hl-IKVl4dioMwp5Qhl-7duuX7BrIXJIc6v6kuLX7g3zMKcNCeAGFstRrbo2N7vDn2WCmY90YxPbmQsnquhpg"
 
         # Main trading loop
+        # Main trading loop
         try:
             data = marketfeed.DhanFeed(data_client_id, data_access_token, instruments, version)
-            st.write("Fetching Data for live trading")
+            st.write("Fetching Data for backtesting")
             print(f"security id {security_id}")
            
 
             while True:
-                # if st.button("Interrupt"):
-                #     print("Execution interrupted by user. Disconnecting...")
-                #     st.write("Execution interrupted by user. Disconnecting...")
-                   
-                #     # Unsubscribe instruments which are already active on connection
-                #     if selected_index in ['Nifty','BANKNIFTY','FINNIFTY','MIDCPNIFTY']:
-                #         unsub_instruments = [(marketfeed.NSE, str(security_id), 16)]
-
-                #         data.unsubscribe_symbols(unsub_instruments)
-                       
-                #     else:
-                #         unsub_instruments = [(marketfeed.BSE, str(security_id), 16)]
-
-                #         data.unsubscribe_symbols(unsub_instruments)
-
-                #     data.disconnect()  # This ensures disconnect when the program is forcefully stopped.
-                #     # break
-
+                
                 data.run_forever()
                 response = data.get_data()
                 # print(response)
@@ -384,10 +352,10 @@ if st.button("Start") and security_id:
                         if less_than_or_greater_than == ">=":
                             if float(ltp) >= entry_price:
                                 st.write(f"{float(ltp)} >= {entry_price}")
-                                st.write("LTP reached above entry price, placing order...")
+                                st.write("LTP reached entry price, placing order...")
                                 print("LTP reached entry price, placing order...")
                                 # Place buy order
-                                place_order(security_id, quantity, float(ltp), "buy")
+                                place_order(str(security_id), quantity, float(ltp), "buy")
                                
                                 order_status = "placed"
                                 highest_price = float(ltp)  # Set highest price to entry price
@@ -407,8 +375,8 @@ if st.button("Start") and security_id:
                             if float(ltp) <= entry_price:
                                 st.write("LTP reached entry price or below, placing order...")
                                 print("LTP reached entry price, placing order...")
-                                # Exit the trade (place a sell order)
-                                place_order(security_id, quantity, float(ltp), "buy")
+                                # Place buy order
+                                place_order(str(security_id), quantity, float(ltp), "buy")
                                
                                 order_status = "placed"
                                 highest_price = float(ltp)  # Set highest price to entry price
@@ -457,7 +425,7 @@ if st.button("Start") and security_id:
                             st.write("Trailing target hit! Exiting trade.")
                             order_status = "target_hit"
                             # Exit the trade (place a sell order)
-                            place_order(security_id, quantity, float(ltp), "sell")
+                            place_order(str(security_id), quantity, float(ltp), "sell")
                            
                             print(f"Exited at {ltp}")
                             st.write(f"Exited at {ltp}")
@@ -487,8 +455,8 @@ if st.button("Start") and security_id:
                             st.write("Trailing stop loss hit! Exiting trade.")
                             order_status = "stop_loss_hit"
                             # Exit the trade (place a sell order)
-                            place_order(security_id, quantity, float(ltp), "sell")
-                            
+                            place_order(str(security_id), quantity, float(ltp), "sell")
+                           
                             print(f"Exited at {ltp}")
                             st.write(f"Exited at {ltp}")
                             print(f"Current Profit/Loss: {profit_or_loss}")
@@ -519,7 +487,7 @@ if st.button("Start") and security_id:
                             st.write(f"Profit threshold reached! Exiting trade with profit of {profit_or_loss}.")
                             order_status = "target_hit"
                             # Exit the trade (place a sell order)
-                            place_order(security_id, quantity, float(ltp), "sell")
+                            place_order(str(security_id), quantity, float(ltp), "sell")
                            
                             print(f"Exited at {ltp}")
                             st.write(f"Exited at {ltp}")
@@ -545,7 +513,7 @@ if st.button("Start") and security_id:
                             st.write(f"Loss threshold reached! Exiting trade with loss of {profit_or_loss}.")
                             order_status = "stop_loss_hit"
                             # Exit the trade (place a sell order)
-                            place_order(security_id, quantity, float(ltp), "sell")
+                            place_order(str(security_id), quantity, float(ltp), "sell")
                            
                             print(f"Exited at {ltp}")
                             st.write(f"Exited at {ltp}")
