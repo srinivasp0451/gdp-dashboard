@@ -285,7 +285,7 @@ if st.button("Start") and security_id:
                 price=price  # Price at which to place the order (0 for market orders)
             )
             print("order is", order_data)
-            st.write(f"Order Details: {order_data})
+            st.write(f"Order Details: {order_data}")
             return order_data
 
 
