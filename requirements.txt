@@ -14,5 +14,6 @@ statsmodels
 seaborn
 dhanhq
 nest-asyncio
+Dhan-Tradehull
 #sqlite3
 #pysqlite
