@@ -307,8 +307,8 @@ def generate_signals(df):
     print(f"condition {old_candle['ema9'] <= old_candle['ema20']}")
 
             
-    #if latest_candle['ema9'] > latest_candle['ema20'] and old_candle['ema9'] <= old_candle['ema20']:
-    if latest_candle['ema9'] > latest_candle['ema20']:
+    if latest_candle['ema9'] > latest_candle['ema20'] and old_candle['ema9'] <= old_candle['ema20']:
+    #if latest_candle['ema9'] > latest_candle['ema20']:
         st.write('EMA Crossovver')
         st.write(f"EMA 1: {latest_candle['ema9']}")
         st.write(f"EMA 2: {latest_candle['ema20']}")
