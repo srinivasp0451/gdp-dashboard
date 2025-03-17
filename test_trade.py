@@ -722,6 +722,7 @@ if st.button("Start") and security_id:
                         else:
                             trailing_stop_loss_price = entry_price-stop_loss_distance
                             current_target = entry_price+target_distance
+                            trailing_placeholder.markdown(f"Entry price: {entry_price} Fixed Stop Loss at: {trailing_stop_loss_price} highest price: {highest_price} target: {current_target}")
 
                         # Check if the price hits the trailing target
                         if float(ltp) >= current_target:
