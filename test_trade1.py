@@ -810,7 +810,7 @@ if st.button("Start") and security_id:
                         if less_than_or_greater_than == ">=":
                             if float(ltp) >= entry_price:
                                 current_time = datetime.datetime.now()
-                                st.write(current_time)
+                                #st.write(current_time)
                                 if current_time.minute % int(timeframe) == 0 and current_time.second == 0:
                                     # Configurable variables
                                     print(tradesymbol)
