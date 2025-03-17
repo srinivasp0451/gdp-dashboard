@@ -809,7 +809,8 @@ if st.button("Start") and security_id:
                     if order_status == "not_placed":
                         if less_than_or_greater_than == ">=":
                             if float(ltp) >= entry_price:
-                                current_time = datetime.now()
+                                current_time = datetime.datetime.now()
+                                st.write(current_time)
                                 if current_time.minute % int(timeframe) == 0 and current_time.second == 0:
                                     # Configurable variables
                                     print(tradesymbol)
@@ -841,7 +842,7 @@ if st.button("Start") and security_id:
                                
                         else:
                             if float(ltp) <= entry_price:
-                                current_time = datetime.now()
+                                current_time = datetime.datetime.now()
                                 if current_time.minute % int(timeframe) == 0 and current_time.second == 0:
                                     # Configurable variables
                                     print(tradesymbol)
