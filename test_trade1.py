@@ -771,7 +771,6 @@ if st.button("Start") and security_id:
 
 
 
-
         # Main trading loop
         try:
             data = marketfeed.DhanFeed(data_client_id, data_access_token, instruments, version)
