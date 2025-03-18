@@ -157,7 +157,7 @@ df = load_csv_data()
 # Input fields for Entry Price, Stop Loss, Target, etc.
 entry_price = st.number_input("Entry Price", min_value=0, step=1,value=1)
 less_than_or_greater_than = st.selectbox("Select above or below", [">=", "<="])
-stop_loss_distance = st.number_input("Stop Loss Distance", min_value=0, step=1,value=5)
+stop_loss_distance = st.number_input("Stop Loss Distance", min_value=0, step=1,value=10)
 target_distance = st.number_input("Target Distance", min_value=0, step=1,value=5)
 quantity = st.number_input("Quantity", min_value=1, step=1, value=20)
 profit_threshold = st.number_input("Profit Threshold", min_value=1, step=1,value=5000)
@@ -165,10 +165,10 @@ loss_threshold = st.number_input("Loss Threshold", min_value=0, step=1,value=500
 timeframe = st.text_input("Time Frame",value=5)
 
 # Dropdown for selecting whether to use trailing stop loss or not
-use_trailing_stop_loss = st.selectbox("Use Trailing Stop Loss?", ["Yes","No"])
+use_trailing_stop_loss = st.selectbox("Use Trailing Stop Loss?", ["No","Yes"])
 
 # Select backtesting or live trading
-trade_mode = st.selectbox("Select Trade Mode", ["Backtesting", "Live Trading"])
+trade_mode = st.selectbox("Select Trade Mode", ["Live Trading","Backtesting"])
 
 
 
