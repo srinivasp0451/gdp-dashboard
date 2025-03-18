@@ -472,6 +472,7 @@ if st.button("Start") and security_id:
                                     print(f"timeframe {timeframe}")
                                     
                                     fetched_df = fetch_data(tradesymbol,exchange,timeframe)
+                                    st.write(f"fetched data:{fetched_df.tail(2)}")
                                     signal = generate_signals(fetched_df)
                                     # st.write("STATUS",signal)
 
@@ -506,6 +507,7 @@ if st.button("Start") and security_id:
                                     print(f"timeframe {timeframe}")
                                     
                                     fetched_df = fetch_data(tradesymbol,exchange,timeframe)
+                                    st.write(f"fetched data:{fetched_df.tail(2)}")
                                     signal = generate_signals(fetched_df)
                                     # st.write("STATUS",signal)
 
@@ -819,6 +821,7 @@ if st.button("Start") and security_id:
                                     print(f"timeframe {timeframe}")
                                     
                                     fetched_df = fetch_data(tradesymbol,exchange,timeframe)
+                                    st.write(f"fetched data:{fetched_df.tail(2)}")
                                     signal = generate_signals(fetched_df)
                                     # st.write("STATUS",signal)
                                     if(signal==True):
@@ -851,6 +854,7 @@ if st.button("Start") and security_id:
                                     print(f"timeframe {timeframe}")
                                     
                                     fetched_df = fetch_data(tradesymbol,exchange,timeframe)
+                                    st.write(f"fetched data:{fetched_df.tail(2)}")
                                     signal = generate_signals(fetched_df)
                                     # st.write("STATUS",signal)
                                     if(signal==True):
