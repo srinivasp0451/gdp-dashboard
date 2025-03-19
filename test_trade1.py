@@ -144,7 +144,7 @@ expiry_date = st.date_input("Select Expiry Date", min_value=datetime.date(2025, 
 option_type = st.selectbox("Select Option Type", ["CE", "PE"])
 
 # Dropdown for selecting strike price (you can manually add options or make it dynamic later)
-strike_price = st.number_input("Select Strike Price", min_value=0, step=50,value=75400)
+strike_price = st.number_input("Select Strike Price", min_value=0, step=50,value=22850)
 
 # Fetch the data from the CSV URL
 df = load_csv_data()
@@ -168,7 +168,7 @@ timeframe = st.text_input("Time Frame",value=5)
 use_trailing_stop_loss = st.selectbox("Use Trailing Stop Loss?", ["No","Yes"])
 
 # Select backtesting or live trading
-trade_mode = st.selectbox("Select Trade Mode", ["Live Trading","Backtesting"])
+trade_mode = st.selectbox("Select Trade Mode", ["Backtesting","Live Trading"])
 
 
 
@@ -271,7 +271,7 @@ trailing_placeholder = st.empty()
 
 # tradingsymbol = 'NIFTY 06 MAR 22000 PUT'
 exchange = 'NFO'
-exchange='BFO'
+#exchange='BFO'
 # timeframe = '5'
 
 # EMA calculation
