@@ -1,4 +1,4 @@
-*************88\\\\\\\\\import streamlit as st
+import streamlit as st
 import pandas as pd
 import requests
 from io import StringIO
@@ -149,6 +149,7 @@ target_distance = st.number_input("Target Distance", min_value=0, step=1,value=1
 quantity = st.number_input("Quantity", min_value=1, step=1, value=75)
 profit_threshold = st.number_input("Profit Threshold", min_value=1, step=1,value=500)
 loss_threshold = st.number_input("Loss Threshold", min_value=0, step=1,value=500)
+profit_threshold_distance = st.number_input("Profit Threshold Distance", min_value=0, step=1,value=300)
 
 # Dropdown for selecting whether to use trailing stop loss or not
 use_trailing_stop_loss = st.selectbox("Use Trailing Stop Loss?", ["Yes","No"])
@@ -242,6 +243,13 @@ profit_placeholder = st.empty()
 ltp_placeholder = st.empty()
 trailing_placeholder = st.empty()
 # Confirm the configuration before proceeding
+
+
+use_trailing_profit_threshold = "Yes"
+highest_profit = 0
+# profit_threshold_distance = 300
+
+
 if st.button("Start") and security_id:
     if trade_mode == "Live Trading" and order_client_id and order_access_token:
        
@@ -324,9 +332,6 @@ if st.button("Start") and security_id:
         highest_price = 0  # To track the highest price reached after entry
         current_target = entry_price + target_distance  # Initial target based on entry price
 
-        use_trailing_profit_threshold = "Yes"
-        highest_profit = 0
-        profit_threshold_distance = 500
 
 
         data_client_id = "1104779876"
@@ -666,9 +671,7 @@ if st.button("Start") and security_id:
         highest_price = 0  # To track the highest price reached after entry
         current_target = entry_price + target_distance  # Initial target based on entry price
 
-        use_trailing_profit_threshold = "Yes"
-        highest_profit = 0
-        profit_threshold_distance = 500
+        
 
 
         data_client_id = "1104779876"
