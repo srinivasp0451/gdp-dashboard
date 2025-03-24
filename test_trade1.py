@@ -144,7 +144,7 @@ expiry_date = st.date_input("Select Expiry Date", min_value=datetime.date(2025, 
 option_type = st.selectbox("Select Option Type", ["CE", "PE"])
 
 # Dropdown for selecting strike price (you can manually add options or make it dynamic later)
-strike_price = st.number_input("Select Strike Price", min_value=0, step=50,value=78400)
+strike_price = st.number_input("Select Strike Price", min_value=0, step=50,value=78900)
 
 # Fetch the data from the CSV URL
 df = load_csv_data()
@@ -157,8 +157,8 @@ df = load_csv_data()
 # Input fields for Entry Price, Stop Loss, Target, etc.
 entry_price = st.number_input("Entry Price", min_value=0, step=1,value=1)
 less_than_or_greater_than = st.selectbox("Select above or below", [">=", "<="])
-stop_loss_distance = st.number_input("Stop Loss Distance", min_value=0, step=1,value=10)
-target_distance = st.number_input("Target Distance", min_value=0, step=1,value=5)
+stop_loss_distance = st.number_input("Stop Loss Distance", min_value=0, step=1,value=5)
+target_distance = st.number_input("Target Distance", min_value=0, step=1,value=3)
 quantity = st.number_input("Quantity", min_value=1, step=1, value=20)
 profit_threshold = st.number_input("Profit Threshold", min_value=1, step=1,value=5000)
 loss_threshold = st.number_input("Loss Threshold", min_value=0, step=1,value=350)
