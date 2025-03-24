@@ -317,7 +317,8 @@ def analyze_momentum():
    
     # Conditions for momentum strategy
     # 1. Volume spike > VOLUME_SPIKE_THRESHOLD
-    volume_spike = (last_tick['volume'] > VOLUME_SPIKE_THRESHOLD * avg_volume)
+    #volume_spike = (last_tick['volume'] > VOLUME_SPIKE_THRESHOLD * avg_volume)
+    volume_spike = (last_tick['volume'] > VOLUME_SPIKE_THRESHOLD / 2)
    
     # 2. Price change > PRICE_CHANGE_THRESHOLD
     price_change = abs(price_change_percentage) > PRICE_CHANGE_THRESHOLD
