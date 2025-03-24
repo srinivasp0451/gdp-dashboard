@@ -144,7 +144,7 @@ expiry_date = st.date_input("Select Expiry Date", min_value=datetime.date(2025, 
 option_type = st.selectbox("Select Option Type", ["CE", "PE"])
 
 # Dropdown for selecting strike price (you can manually add options or make it dynamic later)
-strike_price = st.number_input("Select Strike Price", min_value=0, step=50,value=23250)
+strike_price = st.number_input("Select Strike Price", min_value=0, step=50,value=78400)
 
 # Fetch the data from the CSV URL
 df = load_csv_data()
