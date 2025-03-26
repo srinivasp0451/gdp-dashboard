@@ -161,8 +161,8 @@ stop_loss_distance = st.number_input("Stop Loss Distance", min_value=0, step=1,v
 target_distance = st.number_input("Target Distance", min_value=0, step=1,value=45)
 quantity = st.number_input("Quantity", min_value=1, step=1, value=75)
 profit_threshold = st.number_input("Profit Threshold", min_value=1, step=1,value=5000)
-loss_threshold = st.number_input("Loss Threshold", min_value=0, step=1,value=350)
-timeframe = st.text_input("Time Frame",value=5)
+loss_threshold = st.number_input("Loss Threshold", min_value=0, step=1,value=500)
+timeframe = st.text_input("Time Frame",value=15)
 
 # Dropdown for selecting whether to use trailing stop loss or not
 use_trailing_stop_loss = st.selectbox("Use Trailing Stop Loss?", ["No","Yes"])
