@@ -276,9 +276,24 @@ exchange = 'BFO'
 
 # EMA calculation
 def calculate_ema(df, column, period):
-    # print(f"{period} EMA: {df[column].ewm(span=period, adjust=False).mean()}")
     return df[column].ewm(span=period, adjust=False).mean()
 
+# RSI calculation
+def calculate_rsi(df, column, period=14):
+    delta = df[column].diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
+    rs = gain / loss
+    rsi = 100 - (100 / (1 + rs))
+    return rsi
+
+# ATR calculation
+def calculate_atr(df, period=14):
+    high_low = df['high'] - df['low']
+    high_close = np.abs(df['high'] - df['close'].shift())
+    low_close = np.abs(df['low'] - df['close'].shift())
+    true_range = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+    return true_range.rolling(window=period).mean()
 
 # Fetch historical data
 def fetch_data(tradingsymbol, exchange, timeframe):
@@ -287,39 +302,55 @@ def fetch_data(tradingsymbol, exchange, timeframe):
         exchange=exchange,
         timeframe=timeframe
     )
-# EMA crossover strategy with order execution
+# Options scalping strategy
 def generate_signals(df):
+    # Calculate indicators
+    df['ema5'] = calculate_ema(df, 'close', 5)
+    df['ema13'] = calculate_ema(df, 'close', 13)
+    df['rsi'] = calculate_rsi(df, 'close', 14)
+    df['atr'] = calculate_atr(df, 14)
+    df['avg_volume'] = df['volume'].rolling(window=10).mean()  # 10-period avg volume
 
-    df['ema9'] = calculate_ema(df, 'close', 9)
-    df['ema20'] = calculate_ema(df, 'close', 20)
-
-    # st.write(f"EMA1: {df['ema9']}")
-    # st.write(f"EMA2: {df['ema20']}")
-
-    # print("df::",df)
-
+    # Get latest and previous candles
     old_candle = df.iloc[-2]
     latest_candle = df.iloc[-1]
-    # print(f"Latest Candle :: {latest_candle}")
-    # print(f"Old Candle :: {old_candle}")
-    # print(f"ema 9 {latest_candle['ema9']}")
-    # print(f"ema 9 {latest_candle['ema9']}")
 
-    print(f"condition {latest_candle['ema9'] > latest_candle['ema20']}")
-    print(f"condition {old_candle['ema9'] <= old_candle['ema20']}")
+    # Conditions
+    volume_condition = latest_candle['volume'] > (old_candle['avg_volume'] * 1.5)  # Volume spike
+    volatility_condition = latest_candle['atr'] > df['atr'].rolling(window=10).mean().iloc[-1]  # ATR breakout
 
-            
-    if latest_candle['ema9'] > latest_candle['ema20'] and old_candle['ema9'] <= old_candle['ema20']:
-    #if latest_candle['ema9'] > latest_candle['ema20']:
-        st.write('EMA Crossovver')
-        st.write(f"EMA 1: {latest_candle['ema9']}")
-        st.write(f"EMA 2: {latest_candle['ema20']}")
-        buy_signal =True
-        return buy_signal
-    elif latest_candle['ema9'] < latest_candle['ema20'] and old_candle['ema9']>= old_candle['ema20']:
-        sell_signal =True
-        buy_signal = False
-        return buy_signal
+    # Buy signal: EMA5 crosses above EMA13 + RSI > 50 + volume + volatility
+    buy_condition = (
+        latest_candle['ema5'] > latest_candle['ema13'] and 
+        old_candle['ema5'] <= old_candle['ema13'] and 
+        latest_candle['rsi'] > 50 and 
+        volume_condition and 
+        volatility_condition
+    )
+
+    # Sell signal: EMA5 crosses below EMA13 OR RSI < 40
+    sell_condition = (
+        (latest_candle['ema5'] < latest_candle['ema13'] and 
+         old_candle['ema5'] >= old_candle['ema13']) or 
+        latest_candle['rsi'] < 40
+    )
+
+    # Debugging output
+    print(f"EMA5: {latest_candle['ema5']}, EMA13: {latest_candle['ema13']}")
+    print(f"RSI: {latest_candle['rsi']}")
+    print(f"Volume: {latest_candle['volume']}, Avg Volume: {old_candle['avg_volume']}")
+    print(f"ATR: {latest_candle['atr']}")
+
+    # Signal logic
+    if buy_condition:
+        print("Buy Signal: Momentum Scalping Entry")
+        return "True"
+    elif sell_condition:
+        print("Sell Signal: Momentum Fade or Reversal")
+        return "False"
+    else:
+        print("No Signal")
+        return None
 
     
 
