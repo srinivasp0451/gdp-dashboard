@@ -1105,4 +1105,4 @@ if st.button("Start") and security_id:
             data.disconnect()
 
         # Close Connection
-        data.disconnect()tt
+        data.disconnect()
