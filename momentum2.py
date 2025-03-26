@@ -144,7 +144,7 @@ expiry_date = st.date_input("Select Expiry Date", min_value=datetime.date(2025, 
 option_type = st.selectbox("Select Option Type", ["CE", "PE"])
 
 # Dropdown for selecting strike price (you can manually add options or make it dynamic later)
-strike_price = st.number_input("Select Strike Price", min_value=0, step=50,value=78900)
+strike_price = st.number_input("Select Strike Price", min_value=0, step=50,value=23800)
 
 # Fetch the data from the CSV URL
 df = load_csv_data()
@@ -157,9 +157,9 @@ df = load_csv_data()
 # Input fields for Entry Price, Stop Loss, Target, etc.
 entry_price = st.number_input("Entry Price", min_value=0, step=1,value=1)
 less_than_or_greater_than = st.selectbox("Select above or below", [">=", "<="])
-stop_loss_distance = st.number_input("Stop Loss Distance", min_value=0, step=1,value=5)
-target_distance = st.number_input("Target Distance", min_value=0, step=1,value=3)
-quantity = st.number_input("Quantity", min_value=1, step=1, value=20)
+stop_loss_distance = st.number_input("Stop Loss Distance", min_value=0, step=1,value=30)
+target_distance = st.number_input("Target Distance", min_value=0, step=1,value=45)
+quantity = st.number_input("Quantity", min_value=1, step=1, value=75)
 profit_threshold = st.number_input("Profit Threshold", min_value=1, step=1,value=5000)
 loss_threshold = st.number_input("Loss Threshold", min_value=0, step=1,value=350)
 timeframe = st.text_input("Time Frame",value=5)
@@ -272,56 +272,99 @@ trailing_placeholder = st.empty()
 # tradingsymbol = 'NIFTY 06 MAR 22000 PUT'
 exchange = 'NFO'
 exchange = 'BFO'
+
+if selected_index in ['Nifty','BANKNIFTY','FINNIFTY','MIDCPNIFTY']
+    exchange = 'NFO'  # Futures and Options segment
+else:
+    exchange = 'BFO'
 # timeframe = '5'
 
-# EMA calculation
+import pandas as pd
+import numpy as np
+import streamlit as st
+
+# ----------------------------
+# INDICATOR CALCULATIONS
+# ----------------------------
 def calculate_ema(df, column, period):
-    # print(f"{period} EMA: {df[column].ewm(span=period, adjust=False).mean()}")
     return df[column].ewm(span=period, adjust=False).mean()
 
+def calculate_rsi(df, column, period=14):
+    delta = df[column].diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+    avg_gain = gain.rolling(period).mean()
+    avg_loss = loss.rolling(period).mean()
+    rs = avg_gain / avg_loss
+    return 100 - (100 / (1 + rs))
 
-# Fetch historical data
-def fetch_data(tradingsymbol, exchange, timeframe):
-    return tsl.get_historical_data(
-        tradingsymbol=tradingsymbol,
-        exchange=exchange,
-        timeframe=timeframe
-    )
-# EMA crossover strategy with order execution
+def calculate_macd(df, column, fast=12, slow=26, signal=9):
+    ema_fast = calculate_ema(df, column, fast)
+    ema_slow = calculate_ema(df, column, slow)
+    df['macd'] = ema_fast - ema_slow
+    df['signal'] = calculate_ema(df, 'macd', signal)
+    df['histogram'] = df['macd'] - df['signal']
+    return df
+
+def calculate_supertrend(df, period=7, multiplier=3):
+    hl2 = (df['high'] + df['low']) / 2
+    atr = df['high'].rolling(period).max() - df['low'].rolling(period).min()
+    df['upper_band'] = hl2 + (multiplier * atr)
+    df['lower_band'] = hl2 - (multiplier * atr)
+    df['supertrend'] = np.where(df['close'] > df['upper_band'], 1, 
+                               np.where(df['close'] < df['lower_band'], -1, 0))
+    return df
+
+# ----------------------------
+# SIGNAL GENERATION
+# ----------------------------
 def generate_signals(df):
-
+    # 1. Calculate Indicators
     df['ema9'] = calculate_ema(df, 'close', 9)
     df['ema20'] = calculate_ema(df, 'close', 20)
-
-    # st.write(f"EMA1: {df['ema9']}")
-    # st.write(f"EMA2: {df['ema20']}")
-
-    # print("df::",df)
-
-    old_candle = df.iloc[-2]
-    latest_candle = df.iloc[-1]
-    # print(f"Latest Candle :: {latest_candle}")
-    # print(f"Old Candle :: {old_candle}")
-    # print(f"ema 9 {latest_candle['ema9']}")
-    # print(f"ema 9 {latest_candle['ema9']}")
-
-    print(f"condition {latest_candle['ema9'] > latest_candle['ema20']}")
-    print(f"condition {old_candle['ema9'] <= old_candle['ema20']}")
-
-            
-    if latest_candle['ema9'] > latest_candle['ema20'] and old_candle['ema9'] <= old_candle['ema20']:
-    #if latest_candle['ema9'] > latest_candle['ema20']:
-        st.write('EMA Crossovver')
-        st.write(f"EMA 1: {latest_candle['ema9']}")
-        st.write(f"EMA 2: {latest_candle['ema20']}")
-        buy_signal =True
-        return buy_signal
-    elif latest_candle['ema9'] < latest_candle['ema20'] and old_candle['ema9']>= old_candle['ema20']:
-        sell_signal =True
-        buy_signal = False
-        return buy_signal
-
+    df['rsi'] = calculate_rsi(df, 'close', 14)
+    df = calculate_macd(df, 'close')
+    df = calculate_supertrend(df)
     
+    # 2. Get Latest and Previous Candle
+    latest = df.iloc[-1]
+    previous = df.iloc[-2]
+    
+    # 3. Define Conditions
+    ema_bullish = (latest['ema9'] > latest['ema20']) and (previous['ema9'] <= previous['ema20'])
+    ema_bearish = (latest['ema9'] < latest['ema20']) and (previous['ema9'] >= previous['ema20'])
+    
+    # Momentum Filters (All must be true for entry)
+    momentum_bullish = (
+        (latest['rsi'] > 60) and 
+        (latest['histogram'] > 0) and 
+        (latest['supertrend'] == 1) and 
+        (latest['volume'] > df['volume'].rolling(20).mean().iloc[-1])
+    
+    momentum_bearish = (
+        (latest['rsi'] < 40) and 
+        (latest['histogram'] < 0) and 
+        (latest['supertrend'] == -1) and 
+        (latest['volume'] > df['volume'].rolling(20).mean().iloc[-1])
+    )
+    
+    # 4. Generate Signals
+    if ema_bullish and momentum_bullish:
+        st.write("STRONG BUY SIGNAL (Momentum Confirmed)")
+        st.write(f"EMA9: {latest['ema9']:.2f} > EMA20: {latest['ema20']:.2f}")
+        st.write(f"RSI: {latest['rsi']:.2f}, MACD Hist: {latest['histogram']:.2f}")
+        return True  # Buy Call Option
+    
+    elif ema_bearish and momentum_bearish:
+        st.write("STRONG SELL SIGNAL (Momentum Confirmed)")
+        st.write(f"EMA9: {latest['ema9']:.2f} < EMA20: {latest['ema20']:.2f}")
+        st.write(f"RSI: {latest['rsi']:.2f}, MACD Hist: {latest['histogram']:.2f}")
+        return False  # Buy Put Option
+    
+    else:
+        st.write("No Trade: Weak or Conflicting Signals")
+        return None
+
 
 
 # Confirm the configuration before proceeding
