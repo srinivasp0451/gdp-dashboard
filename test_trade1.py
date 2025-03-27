@@ -459,7 +459,7 @@ if st.button("Start") and security_id:
 
                 data.run_forever()
                 response = data.get_data()
-                # print(response)
+                print(response)
                
 
                 if 'LTP' in response.keys():
