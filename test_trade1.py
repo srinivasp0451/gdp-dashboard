@@ -272,6 +272,12 @@ trailing_placeholder = st.empty()
 # tradingsymbol = 'NIFTY 06 MAR 22000 PUT'
 exchange = 'NFO'
 exchange = 'BFO'
+
+if selected_index in ['Nifty','BANKNIFTY','FINNIFTY','MIDCPNIFTY']:
+    exchange = 'NFO'
+else:
+    exchange = 'BFO'
+    
 # timeframe = '5'
 
 # EMA calculation
