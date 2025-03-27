@@ -2,6 +2,7 @@ streamlit
 yfinance
 xlsxwriter
 pandas
+numpy
 plotly
 textblob
 nltk
