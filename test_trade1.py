@@ -270,8 +270,9 @@ trailing_placeholder = st.empty()
 
 
 # tradingsymbol = 'NIFTY 06 MAR 22000 PUT'
-exchange = 'NFO'
-exchange = 'BFO'
+#exchange = 'NFO'
+#exchange = 'BFO'
+exchange=None
 
 if selected_index in ['Nifty','BANKNIFTY','FINNIFTY','MIDCPNIFTY']:
     exchange = 'NFO'
@@ -295,6 +296,8 @@ def fetch_data(tradingsymbol, exchange, timeframe):
     )
 # EMA crossover strategy with order execution
 def generate_signals(df):
+    if(df):
+      st.write("Got data")
 
     df['ema9'] = calculate_ema(df, 'close', 9)
     df['ema20'] = calculate_ema(df, 'close', 20)
