@@ -296,8 +296,6 @@ def fetch_data(tradingsymbol, exchange, timeframe):
     )
 # EMA crossover strategy with order execution
 def generate_signals(df):
-    if(~df):
-      st.write("No data",df)
 
     df['ema9'] = calculate_ema(df, 'close', 9)
     df['ema20'] = calculate_ema(df, 'close', 20)
