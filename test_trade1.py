@@ -296,6 +296,7 @@ def fetch_data(tradingsymbol, exchange, timeframe):
     )
 # EMA crossover strategy with order execution
 def generate_signals(df):
+    st.write("line1")
 
     df['ema9'] = calculate_ema(df, 'close', 9)
     df['ema20'] = calculate_ema(df, 'close', 20)
@@ -314,6 +315,7 @@ def generate_signals(df):
 
     print(f"condition {latest_candle['ema9'] > latest_candle['ema20']}")
     print(f"condition {old_candle['ema9'] <= old_candle['ema20']}")
+    st.write('conditions checked')
 
             
     if latest_candle['ema9'] > latest_candle['ema20'] and old_candle['ema9'] <= old_candle['ema20']:
@@ -326,6 +328,7 @@ def generate_signals(df):
     elif latest_candle['ema9'] < latest_candle['ema20'] and old_candle['ema9']>= old_candle['ema20']:
         sell_signal =True
         buy_signal = False
+        st.write('condition not satisfied')
         return buy_signal
 
     
