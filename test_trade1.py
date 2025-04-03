@@ -272,13 +272,13 @@ trailing_placeholder = st.empty()
 # tradingsymbol = 'NIFTY 06 MAR 22000 PUT'
 #exchange = 'NFO'
 #exchange = 'BFO'
+exchange = None
+if selected_index in ['Nifty','BANKNIFTY','FINNIFTY','MIDCPNIFTY']:
+   exchange = 'NFO'
+else:
+   exchange = 'BFO'
 
-#if selected_index in ['Nifty','BANKNIFTY','FINNIFTY','MIDCPNIFTY']:
-#    exchange = 'NFO'
-#else:
-#    exchange = 'BFO'
-
-exchange = 'NFO'    
+# exchange = 'NFO'    
 # timeframe = '5'
     
 # timeframe = '5'
@@ -291,15 +291,25 @@ def calculate_ema(df, column, period):
 
 # Fetch historical data
 def fetch_data(tradingsymbol, exchange, timeframe):
-    return tsl.get_historical_data(
-        tradingsymbol=tradingsymbol,
-        exchange=exchange,
-        timeframe=timeframe
-    )
+    retry_attempts = 5  # Number of retry attempts
+    for attempt in range(retry_attempts):
+        try:
+            data = tsl.get_historical_data(tradingsymbol=tradingsymbol,exchange=exchange,timeframe=timeframe)
+            return data
+        except Exception as e:
+            print(f"Attempt {attempt + 1} failed: {e}")
+            if attempt < retry_attempts - 1:
+                print("Retrying...")
+                time.sleep(5)  # Wait before retrying (adjust as necessary)
+            else:
+                print("Max retries reached. Continuing execution with no data.")
+                return None  # Return None or any other default value you prefer
+
+	    
+    
 # EMA crossover strategy with order execution
 def generate_signals(df):
-    st.write("line1")
-
+    
     df['ema9'] = calculate_ema(df, 'close', 9)
     df['ema20'] = calculate_ema(df, 'close', 20)
 
@@ -317,7 +327,7 @@ def generate_signals(df):
 
     print(f"condition {latest_candle['ema9'] > latest_candle['ema20']}")
     print(f"condition {old_candle['ema9'] <= old_candle['ema20']}")
-    st.write('conditions checked')
+    
 
             
     if latest_candle['ema9'] > latest_candle['ema20'] and old_candle['ema9'] <= old_candle['ema20']:
