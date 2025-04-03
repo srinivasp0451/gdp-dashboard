@@ -272,12 +272,14 @@ trailing_placeholder = st.empty()
 # tradingsymbol = 'NIFTY 06 MAR 22000 PUT'
 #exchange = 'NFO'
 #exchange = 'BFO'
-exchange=None
 
-if selected_index in ['Nifty','BANKNIFTY','FINNIFTY','MIDCPNIFTY']:
-    exchange = 'NFO'
-else:
-    exchange = 'BFO'
+#if selected_index in ['Nifty','BANKNIFTY','FINNIFTY','MIDCPNIFTY']:
+#    exchange = 'NFO'
+#else:
+#    exchange = 'BFO'
+
+exchange = 'NFO'    
+# timeframe = '5'
     
 # timeframe = '5'
 
