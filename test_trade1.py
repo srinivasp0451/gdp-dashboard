@@ -14,7 +14,7 @@ import time
 import time
 import datetime
 import pandas as pd
-from Dhan_Tradehull import Tradehull
+from Dhan_Tradehull_V2 import Tradehull
 
 nest_asyncio.apply()
 
