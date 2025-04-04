@@ -409,8 +409,7 @@ if st.button("Start") and security_id:
             return order_data
 
 
-        # access_token = 'eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzUxMiJ9.eyJpc3MiOiJkaGFuIiwicGFydG5lcklkIjoiIiwiZXhwIjoxNzQxMDgxMDEzLCJ0b2tlbkNvbnN1bWVyVHlwZSI6IlNFTEYiLCJ3ZWJob29rVXJsIjoiIiwiZGhhbkNsaWVudElkIjoiMTEwNDc3OTg3NiJ9.AjXo7XYfSqoc38AelIa22TNqZV_Doul3RtB_IkhDp7yEmQ69NPCTXotUUg7KmWLYDvWJXjz8ZN5DiULee6xe4w'
-        # client_id = '1104779876'
+        
 
         # Main trading loop
         from dhanhq import dhanhq, marketfeed
