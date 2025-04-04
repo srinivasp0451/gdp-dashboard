@@ -295,6 +295,8 @@ def fetch_data(tradingsymbol, exchange, timeframe):
     for attempt in range(retry_attempts):
         try:
             data = tsl.get_historical_data(tradingsymbol=tradingsymbol,exchange=exchange,timeframe=timeframe)
+	    if isinstance(data, pd.DataFrame) and data.empty:
+                raise ValueError("Fetched DataFrame is empty.")
             return data
         except Exception as e:
             print(f"Attempt {attempt + 1} failed: {e}")
