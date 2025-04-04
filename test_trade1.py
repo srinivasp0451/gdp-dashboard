@@ -22,7 +22,7 @@ nest_asyncio.apply()
 
 # Initialize client
 client_code = "1104779876"
-token_id = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzUxMiJ9.eyJpc3MiOiJkaGFuIiwicGFydG5lcklkIjoiIiwiZXhwIjoxNzQ2MjYwMTMxLCJ0b2tlbkNvbnN1bWVyVHlwZSI6IlNFTEYiLCJ3ZWJob29rVXJsIjoiIiwiZGhhbkNsaWVudElkIjoiMTEwNDc3OTg3NiJ9.mQqH3aheSfVZg4dOiAcNkoaUMReyfp0D0ImYuNGEK-Bawv0j-YsiXSJ6VRzPrf3bNHQ-NPowljt9_4k2UzO6Zg"
+token_id = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzUxMiJ9.eyJpc3MiOiJkaGFuIiwicGFydG5lcklkIjoiIiwiZXhwIjoxNzQ2MzMyMzE0LCJ0b2tlbkNvbnN1bWVyVHlwZSI6IlNFTEYiLCJ3ZWJob29rVXJsIjoiIiwiZGhhbkNsaWVudElkIjoiMTEwNDc3OTg3NiJ9.Bw-II2yZfD475go4eYKpWtfAbDgDHqeDz9z5A8riVva1jJxaxrHtG1nsylpu3E3sCYhjZe0a18EcuH7cFW24Lg"
 tsl = Tradehull(client_code, token_id)
 
 
@@ -178,7 +178,7 @@ if trade_mode == "Live Trading":
     order_access_token = st.text_input("Access Token (for placing orders)", type="password",value='eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzUxMiJ9.eyJpc3MiOiJkaGFuIiwicGFydG5lcklkIjoiIiwiZXhwIjoxNzQzNjcyMTgwLCJ0b2tlbkNvbnN1bWVyVHlwZSI6IlNFTEYiLCJ3ZWJob29rVXJsIjoiIiwiZGhhbkNsaWVudElkIjoiMTEwNDc3OTg3NiJ9.I-Hl-IKVl4dioMwp5Qhl-7duuX7BrIXJIc6v6kuLX7g3zMKcNCeAGFstRrbo2N7vDn2WCmY90YxPbmQsnquhpg')
 else:
     data_client_id = "1104779876"
-    data_access_token = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzUxMiJ9.eyJpc3MiOiJkaGFuIiwicGFydG5lcklkIjoiIiwiZXhwIjoxNzQ2MjYwMTMxLCJ0b2tlbkNvbnN1bWVyVHlwZSI6IlNFTEYiLCJ3ZWJob29rVXJsIjoiIiwiZGhhbkNsaWVudElkIjoiMTEwNDc3OTg3NiJ9.mQqH3aheSfVZg4dOiAcNkoaUMReyfp0D0ImYuNGEK-Bawv0j-YsiXSJ6VRzPrf3bNHQ-NPowljt9_4k2UzO6Zg"
+    data_access_token = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzUxMiJ9.eyJpc3MiOiJkaGFuIiwicGFydG5lcklkIjoiIiwiZXhwIjoxNzQ2MzMyMzE0LCJ0b2tlbkNvbnN1bWVyVHlwZSI6IlNFTEYiLCJ3ZWJob29rVXJsIjoiIiwiZGhhbkNsaWVudElkIjoiMTEwNDc3OTg3NiJ9.Bw-II2yZfD475go4eYKpWtfAbDgDHqeDz9z5A8riVva1jJxaxrHtG1nsylpu3E3sCYhjZe0a18EcuH7cFW24Lg"
 
 
 
@@ -791,7 +791,7 @@ if st.button("Start") and security_id:
 
 
         data_client_id = "1104779876"
-        data_access_token = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzUxMiJ9.eyJpc3MiOiJkaGFuIiwicGFydG5lcklkIjoiIiwiZXhwIjoxNzQ2MjYwMTMxLCJ0b2tlbkNvbnN1bWVyVHlwZSI6IlNFTEYiLCJ3ZWJob29rVXJsIjoiIiwiZGhhbkNsaWVudElkIjoiMTEwNDc3OTg3NiJ9.mQqH3aheSfVZg4dOiAcNkoaUMReyfp0D0ImYuNGEK-Bawv0j-YsiXSJ6VRzPrf3bNHQ-NPowljt9_4k2UzO6Zg"
+        data_access_token = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzUxMiJ9.eyJpc3MiOiJkaGFuIiwicGFydG5lcklkIjoiIiwiZXhwIjoxNzQ2MzMyMzE0LCJ0b2tlbkNvbnN1bWVyVHlwZSI6IlNFTEYiLCJ3ZWJob29rVXJsIjoiIiwiZGhhbkNsaWVudElkIjoiMTEwNDc3OTg3NiJ9.Bw-II2yZfD475go4eYKpWtfAbDgDHqeDz9z5A8riVva1jJxaxrHtG1nsylpu3E3sCYhjZe0a18EcuH7cFW24Lg"
 
 
 
