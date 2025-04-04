@@ -295,18 +295,17 @@ def fetch_data(tradingsymbol, exchange, timeframe):
     for attempt in range(retry_attempts):
         try:
             data = tsl.get_historical_data(tradingsymbol=tradingsymbol,exchange=exchange,timeframe=timeframe)
-	    if isinstance(data, pd.DataFrame) and data.empty:
-	        raise ValueError("Fetched DataFrame is empty.")
+            if isinstance(data, pd.DataFrame) and data.empty:
+                raise ValueError("Fetched DataFrame is empty.")
             return data
         except Exception as e:
             print(f"Attempt {attempt + 1} failed: {e}")
             if attempt < retry_attempts - 1:
                 print("Retrying...")
-                time.sleep(5)  # Wait before retrying (adjust as necessary)
+                time.sleep(2)  # Wait before retrying (adjust as necessary)
             else:
                 print("Max retries reached. Continuing execution with no data.")
                 return None  # Return None or any other default value you prefer
-
 	    
     
 # EMA crossover strategy with order execution
