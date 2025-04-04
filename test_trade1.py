@@ -306,6 +306,7 @@ def fetch_data(tradingsymbol, exchange, timeframe):
             else:
                 print("Max retries reached. Continuing execution with no data.")
                 return None  # Return None or any other default value you prefer
+
 	    
     
 # EMA crossover strategy with order execution
