@@ -387,6 +387,7 @@ if st.button("Start") and security_id:
                 exchange_segment (str): The exchange segment (default to None, to use NSE_FNO if not provided)
                 product_type (str): The product type (default to None, to use INTRA if not provided)
             """
+	
             # Default values if not provided
             if exchange_segment is None:
                 if selected_index in ['Nifty','BANKNIFTY','FINNIFTY','MIDCPNIFTY']:
@@ -396,10 +397,11 @@ if st.button("Start") and security_id:
 
             if product_type is None:
                 product_type = dhan.INTRA  # Intraday product type
-	    
+
 	    qty = int(qty)  # If qty is a numpy.int64 or similar type
             price = float(price)  # If price is a numpy.float64 or similar type
-
+	    
+	    
 
             # Use Dhan's place_order method for placing orders
             order_data = dhan.place_order(
