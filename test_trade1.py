@@ -135,7 +135,7 @@ def filter_data(df, selected_index, expiry_date, strike_price, option_type):
 st.title("Algo Trading")
 
 # Dropdown to select Nifty or Sensex
-selected_index = st.selectbox("Select Index", ["Nifty","Sensex", "Bank Nifty","Fin Nifty","Midcap Nifty","Bankex"])
+selected_index = st.selectbox("Select Index", ["Nifty","Sensex", "Bank Nifty","Fin Nifty","Midcap Nifty","Bankex"],index=1)
 
 # Calendar widget to select expiry date
 expiry_date = st.date_input("Select Expiry Date", min_value=datetime.date(2025, 1, 1))
@@ -144,7 +144,7 @@ expiry_date = st.date_input("Select Expiry Date", min_value=datetime.date(2025, 
 option_type = st.selectbox("Select Option Type", ["CE", "PE"])
 
 # Dropdown for selecting strike price (you can manually add options or make it dynamic later)
-strike_price = st.number_input("Select Strike Price", min_value=0, step=50,value=23250)
+strike_price = st.number_input("Select Strike Price", min_value=0, step=50,value=74300)
 
 # Fetch the data from the CSV URL
 df = load_csv_data()
@@ -168,7 +168,7 @@ timeframe = st.text_input("Time Frame",value=1)
 use_trailing_stop_loss = st.selectbox("Use Trailing Stop Loss?", ["No","Yes"])
 
 # Select backtesting or live trading
-trade_mode = st.selectbox("Select Trade Mode", ["Live Trading","Backtesting"])
+trade_mode = st.selectbox("Select Trade Mode", ["Live Trading","Backtesting"],index=0)
 
 
 
@@ -295,7 +295,7 @@ def fetch_data(tradingsymbol, exchange, timeframe):
     for attempt in range(retry_attempts):
         try:
             data = tsl.get_historical_data(tradingsymbol=tradingsymbol,exchange=exchange,timeframe=timeframe)
-            if isinstance(data, pd.DataFrame) and data.empty:
+            if isinstance(data, pd.DataFrame) and data.empty or data.shape[0]==0:
                 raise ValueError("Fetched DataFrame is empty.")
             return data
         except Exception as e:
