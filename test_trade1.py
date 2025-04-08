@@ -396,6 +396,10 @@ if st.button("Start") and security_id:
 
             if product_type is None:
                 product_type = dhan.INTRA  # Intraday product type
+	    
+	    qty = int(qty)  # If qty is a numpy.int64 or similar type
+            price = float(price)  # If price is a numpy.float64 or similar type
+
 
             # Use Dhan's place_order method for placing orders
             order_data = dhan.place_order(
