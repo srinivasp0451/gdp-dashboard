@@ -403,7 +403,7 @@ if st.button("Start") and security_id:
 
             # Use Dhan's place_order method for placing orders
             order_data = dhan.place_order(
-                security_id=symbol,  # Security ID of the option (symbol passed as argument)
+                security_id=43859,  # Security ID of the option (symbol passed as argument)
                 exchange_segment=exchange_segment,  # Exchange segment for Futures & Options
                 transaction_type=dhan.BUY if order_type.lower() == "buy" else dhan.SELL,
                 quantity=qty,  # Quantity of the option contracts
