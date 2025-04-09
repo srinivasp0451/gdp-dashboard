@@ -503,7 +503,7 @@ if st.button("Start") and security_id:
                                     st.write(f"fetched data:{fetched_df.tail(2)}")
                                     signal = generate_signals(fetched_df)
                                     st.write("STATUS",signal)
-				    st.write(quantity,float(ltp))
+st.write(quantity,float(ltp),security_id)
 
                                     if(signal==False):
                                         st.write(f"{float(ltp)} >= {entry_price}")
