@@ -409,7 +409,7 @@ if st.button("Start") and security_id:
                 quantity=qty,  # Quantity of the option contracts
                 order_type=dhan.LIMIT,  # Market order
                 product_type=product_type,  # Product type (e.g., INTRA for intraday)
-                price=100  # Price at which to place the order (0 for market orders)
+                price=price  # Price at which to place the order (0 for market orders)
             )
             print("order is", order_data)
             return order_data
