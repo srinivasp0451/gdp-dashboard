@@ -502,7 +502,8 @@ if st.button("Start") and security_id:
                                     fetched_df = fetch_data(tradesymbol,exchange,timeframe)
                                     st.write(f"fetched data:{fetched_df.tail(2)}")
                                     signal = generate_signals(fetched_df)
-                                    # st.write("STATUS",signal)
+                                    st.write("STATUS",signal)
+				    st.write(quantity,float(ltp))
 
                                     if(signal==False):
                                         st.write(f"{float(ltp)} >= {entry_price}")
