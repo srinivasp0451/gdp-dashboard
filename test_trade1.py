@@ -406,10 +406,10 @@ if st.button("Start") and security_id:
                 security_id=symbol,  # Security ID of the option (symbol passed as argument)
                 exchange_segment=exchange_segment,  # Exchange segment for Futures & Options
                 transaction_type=dhan.BUY if order_type.lower() == "buy" else dhan.SELL,
-                quantity=75,  # Quantity of the option contracts
+                quantity=qty,  # Quantity of the option contracts
                 order_type=dhan.LIMIT,  # Market order
                 product_type=product_type,  # Product type (e.g., INTRA for intraday)
-                price=float(price)  # Price at which to place the order (0 for market orders)
+                price=100  # Price at which to place the order (0 for market orders)
             )
             print("order is", order_data)
             return order_data
