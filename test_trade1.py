@@ -504,7 +504,7 @@ if st.button("Start") and security_id:
                                     signal = generate_signals(fetched_df)
                                     # st.write("STATUS",signal)
 
-                                    if(signal==True):
+                                    if(signal==False):
                                         st.write(f"{float(ltp)} >= {entry_price}")
                                         st.write("LTP reached above entry price, placing order...")
                                         print("LTP reached entry price, placing order...")
