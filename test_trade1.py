@@ -341,7 +341,7 @@ def generate_signals(df):
         return buy_signal
     elif latest_candle['ema9'] < latest_candle['ema20'] and old_candle['ema9']>= old_candle['ema20']:
         sell_signal =True
-        buy_signal = False
+        buy_signal = True
         st.write('condition not satisfied')
         return buy_signal
 
