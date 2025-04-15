@@ -407,7 +407,7 @@ if st.button("Start") and security_id:
                 exchange_segment=exchange_segment,  # Exchange segment for Futures & Options
                 transaction_type=dhan.BUY if order_type.lower() == "buy" else dhan.SELL,
                 quantity=qty,  # Quantity of the option contracts
-                order_type=dhan.LIMIT,  # Market order
+                order_type=dhan.MARKET,  # Market order
                 product_type=product_type,  # Product type (e.g., INTRA for intraday)
                 price=price  # Price at which to place the order (0 for market orders)
             )
