@@ -696,11 +696,11 @@ if st.button("Start") and security_id1 and security_id2:
 
     elif trade_mode == "Backtesting":
         from dhanhq import dhanhq, marketfeed
-        # import nest_asyncio
+        import nest_asyncio
         import time
         import threading
 
-        # nest_asyncio.apply()
+        nest_asyncio.apply()
 
         # Add your Dhan Client ID and Access Token
 
