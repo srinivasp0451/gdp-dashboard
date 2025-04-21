@@ -33,7 +33,7 @@ def apply_strategy(data,ma1,ma2,matype):
     return data
 
 # Backtesting Logic
-def backtest_strategy(data, stoploss_points,target, index,use_trail:
+def backtest_strategy(data, stoploss_points,target, index,use_trail):
     global STOPLOSS
     STOPLOSS = stoploss_points  # Set stop loss based on user input
     
