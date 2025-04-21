@@ -61,7 +61,7 @@ def backtest_strategy(data, stoploss_points,target, index,use_trail):
             #st.write(f"Buy Signal at {entry_time} | Price: {entry_price}")
 
         if in_position:
-            if(use_trail ==True):
+            if(use_trail =='Yes'):
                 stop_loss_level = entry_price - STOPLOSS
                 take_profit_level = entry_price + target
             else:
