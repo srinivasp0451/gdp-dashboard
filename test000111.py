@@ -33,7 +33,7 @@ def apply_strategy(data,ma1,ma2,matype):
     return data
 
 # Backtesting Logic
-def backtest_strategy(data, stoploss_points,target, index,use_trail):
+def backtest_strategy(data, stoploss_points,target, index):
     global STOPLOSS
     STOPLOSS = stoploss_points  # Set stop loss based on user input
     
@@ -61,13 +61,8 @@ def backtest_strategy(data, stoploss_points,target, index,use_trail):
             #st.write(f"Buy Signal at {entry_time} | Price: {entry_price}")
 
         if in_position:
-            if(use_trail =='Yes'):
-                stop_loss_level = entry_price - STOPLOSS
-                take_profit_level = entry_price + target
-            else:
-                stop_loss_level = STOPLOSS
-                take_profit_level = target
-            
+            stop_loss_level = entry_price - STOPLOSS
+            take_profit_level = entry_price + target
 
             if current_close.values[0] <= stop_loss_level or current_close.values[0] >= take_profit_level:
                 exit_price = current_close.values[0]
@@ -169,8 +164,6 @@ def main():
     if strategy_type == "Backtesting":
         period = st.selectbox("Select Period", ["1d", "5d", "1mo", "3mo", "6mo","1y","2y","5y"], index=2)
         interval = st.selectbox("Select Interval", ["1m", "2m", "5m", "15m", "30m", "60m","1d","1wk"], index=3)
-        use_trail = st.selectbox("Use trail stop loss", ["Yes","No"], index=0)
-        
         target = st.number_input("Enter Target (Points)", min_value=1, value=10)
         stoploss_points = st.number_input("Enter Stop Loss (Points)", min_value=1, value=10)
         
@@ -178,7 +171,7 @@ def main():
         if st.button("Run Backtest"):
             data = fetch_data(index,period=period, interval=interval)
             data = apply_strategy(data,ma1,ma2,matype)
-            backtest_strategy(data, stoploss_points, target, index,use_trail)
+            backtest_strategy(data, stoploss_points, target, index)
 
     # Live trading settings
     elif strategy_type == "Live Trading":
