@@ -174,7 +174,7 @@ trade_mode = st.selectbox("Select Trade Mode", ["Live Trading","Backtesting"],in
 
 # Inputs for Live Trading (client ID and access token for live trading)
 if trade_mode == "Live Trading":
-    order_client_id = st.text_input("Client ID (for placing orders)", type="password",value='1104779876')
+    order_client_id = st.text_input("Client ID (for placing orders)", type="password",value='22305184')
     order_access_token = st.text_input("Access Token (for placing orders)", type="password",value='eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzUxMiJ9.eyJpc3MiOiJkaGFuIiwicGFydG5lcklkIjoiIiwiZXhwIjoxNzQ2MzQwNzQzLCJ0b2tlbkNvbnN1bWVyVHlwZSI6IlNFTEYiLCJ3ZWJob29rVXJsIjoiIiwiZGhhbkNsaWVudElkIjoiMTEwNDc3OTg3NiJ9.dfxL1pGEwjTX1WIYWpLIPYAvvwXn6KTCUrng295eAvhXDTV2QgnZnKB-HRT9MuZ_n75tJueAaDZsDPinr9p2Mg')
 else:
     data_client_id = "1104779876"
