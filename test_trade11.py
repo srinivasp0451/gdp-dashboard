@@ -103,8 +103,9 @@ df = load_csv_data()
 
 
 # Input fields for Entry Price, Stop Loss, Target, etc.
-entry_price = st.number_input("Entry Price", min_value=0, step=1,value=100)
-less_than_or_greater_than = st.selectbox("Select above or below", [">=", "<="])
+entry_price = 1
+# less_than_or_greater_than = st.selectbox("Select above or below", [">=", "<="])
+less_than_or_greater_than = ">="
 stop_loss_distance = st.number_input("Stop Loss Distance", min_value=0, step=1,value=5)
 target_distance = st.number_input("Target Distance", min_value=0, step=1,value=5)
 quantity = st.number_input("Quantity", min_value=1, step=1, value=20)
