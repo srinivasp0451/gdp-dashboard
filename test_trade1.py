@@ -363,7 +363,7 @@ if st.button("Start") and security_id:
         security_id = security_id  # 75300 PE Example security_id for options
         #security_id = 844230
         profit_threshold = profit_threshold
-        loss_threshold = -loss_threshold
+        loss_threshold = loss_threshold
         instruments = [(marketfeed.BSE_FNO, str(security_id), marketfeed.Ticker)]  # Ticker Data
         version = "v2"  # Mention Version and set to latest version 'v2'
 
@@ -677,7 +677,7 @@ if st.button("Start") and security_id:
 
                             data.disconnect()
                             break
-                        elif profit_or_loss <= -500:
+                        elif profit_or_loss <= -loss_threshold:
                             print(f"Loss threshold reached! Exiting trade with loss of {profit_or_loss}.")
                             st.write(f"Loss threshold reached! Exiting trade with loss of {profit_or_loss}.")
                             order_status = "stop_loss_hit"
