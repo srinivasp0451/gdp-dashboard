@@ -435,7 +435,7 @@ if st.button("Start") and security_id:
         #security_id = 844230
         profit_threshold = profit_threshold
         loss_threshold = loss_threshold
-        print(f"profit threshold {profit_threshold}")
+        profit_or_loss=0
         print(f"loss threshold {loss_threshold}")
         if selected_index in ['Nifty','BANKNIFTY','FINNIFTY','MIDCPNIFTY']:
             market_feed_value = marketfeed.NSE_FNO  # Futures and Options segment
@@ -677,7 +677,7 @@ if st.button("Start") and security_id:
 
                             data.disconnect()
                             break
-                        elif profit_or_loss <= -loss_threshold:
+                        elif profit_or_loss <= -500:
                             print(f"Loss threshold reached! Exiting trade with loss of {profit_or_loss}.")
                             st.write(f"Loss threshold reached! Exiting trade with loss of {profit_or_loss}.")
                             order_status = "stop_loss_hit"
