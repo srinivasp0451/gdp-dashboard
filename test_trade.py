@@ -122,16 +122,16 @@ def filter_data(df, selected_index, expiry_date, strike_price, option_type):
 st.title("Algo Trading")
 
 # Dropdown to select Nifty or Sensex
-selected_index = st.selectbox("Select Index", ["Nifty", "Sensex","Bank Nifty","Fin Nifty","Midcap Nifty","Bankex"])
+selected_index = st.selectbox("Select Index", ["Nifty", "Sensex","Bank Nifty","Fin Nifty","Midcap Nifty","Bankex"],index=0)
 
 # Calendar widget to select expiry date
 expiry_date = st.date_input("Select Expiry Date", min_value=datetime.date(2025, 1, 1))
 
 # Dropdown for Option Type (CE or PE)
-option_type = st.selectbox("Select Option Type", ["CE", "PE"])
+option_type = st.selectbox("Select Option Type", ["CE", "PE"],index=0)
 
 # Dropdown for selecting strike price (you can manually add options or make it dynamic later)
-strike_price = st.number_input("Select Strike Price", min_value=0, step=50,value=22550)
+strike_price = st.number_input("Select Strike Price", min_value=0, step=50,value=24300)
 
 # Fetch the data from the CSV URL
 df = load_csv_data()
@@ -146,7 +146,7 @@ entry_price = st.number_input("Entry Price", min_value=0, step=1,value=100)
 less_than_or_greater_than = st.selectbox("Select above or below", [">=", "<="])
 stop_loss_distance = st.number_input("Stop Loss Distance", min_value=0, step=1,value=5)
 target_distance = st.number_input("Target Distance", min_value=0, step=1,value=5)
-quantity = st.number_input("Quantity", min_value=1, step=1, value=75)
+quantity = st.number_input("Quantity", min_value=1, step=1, value=20)
 profit_threshold = st.number_input("Profit Threshold", min_value=1, step=1,value=1000000)
 loss_threshold = st.number_input("Loss Threshold", min_value=0, step=1,value=500)
 
