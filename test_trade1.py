@@ -340,7 +340,7 @@ def generate_signals(df):
         buy_signal =True
         return buy_signal
     elif latest_candle['ema9'] < latest_candle['ema20'] and old_candle['ema9']>= old_candle['ema20']:
-        sell_signal =True
+        #sell_signal =True
         buy_signal = False
         st.write('condition not satisfied')
         return buy_signal
@@ -493,7 +493,7 @@ if st.button("Start") and security_id:
                         if less_than_or_greater_than == ">=":
                             if float(ltp) >= entry_price:
                                 current_time = datetime.datetime.now()
-                                if current_time.minute % int(timeframe) == 0 and current_time.second == 0:
+                                if current_time.minute % int(timeframe) == 0 and current_time.second == 0 and order_status == "not_placed":
                                     # Configurable variables
                                     print(tradesymbol)
                                     print(f"exchane{exchange}")
