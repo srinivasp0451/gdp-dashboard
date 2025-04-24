@@ -141,10 +141,10 @@ selected_index = st.selectbox("Select Index", ["Nifty","Sensex", "Bank Nifty","F
 expiry_date = st.date_input("Select Expiry Date", min_value=datetime.date(2025, 1, 1))
 
 # Dropdown for Option Type (CE or PE)
-option_type = st.selectbox("Select Option Type", ["CE", "PE"])
+option_type = st.selectbox("Select Option Type", ["CE", "PE"],index=0)
 
 # Dropdown for selecting strike price (you can manually add options or make it dynamic later)
-strike_price = st.number_input("Select Strike Price", min_value=0, step=50,value=24650)
+strike_price = st.number_input("Select Strike Price", min_value=0, step=50,value=24000)
 
 # Fetch the data from the CSV URL
 df = load_csv_data()
@@ -155,8 +155,9 @@ df = load_csv_data()
 
 
 # Input fields for Entry Price, Stop Loss, Target, etc.
-entry_price = st.number_input("Entry Price", min_value=0, step=1,value=1)
-less_than_or_greater_than = st.selectbox("Select above or below", [">=", "<="])
+entry_price = 1
+# less_than_or_greater_than = st.selectbox("Select above or below", [">=", "<="])
+less_than_or_greater_than = '>='
 stop_loss_distance = st.number_input("Stop Loss Distance", min_value=0, step=1,value=5)
 target_distance = st.number_input("Target Distance", min_value=0, step=1,value=3)
 quantity = st.number_input("Quantity", min_value=1, step=1, value=75)
@@ -291,7 +292,7 @@ def calculate_ema(df, column, period):
 
 # Fetch historical data
 def fetch_data(tradingsymbol, exchange, timeframe):
-    retry_attempts = 5  # Number of retry attempts
+    retry_attempts = 10  # Number of retry attempts
     for attempt in range(retry_attempts):
         try:
             data = tsl.get_historical_data(tradingsymbol=tradingsymbol,exchange=exchange,timeframe=timeframe)
@@ -460,23 +461,7 @@ if st.button("Start") and security_id:
            
 
             while True:
-                # if st.button("Interrupt"):
-                #     print("Execution interrupted by user. Disconnecting...")
-                #     st.write("Execution interrupted by user. Disconnecting...")
-                   
-                #     # Unsubscribe instruments which are already active on connection
-                #     if selected_index in ['Nifty','BANKNIFTY','FINNIFTY','MIDCPNIFTY']:
-                #         unsub_instruments = [(marketfeed.NSE, str(security_id), 16)]
-
-                #         data.unsubscribe_symbols(unsub_instruments)
-                       
-                #     else:
-                #         unsub_instruments = [(marketfeed.BSE, str(security_id), 16)]
-
-                #         data.unsubscribe_symbols(unsub_instruments)
-
-                #     data.disconnect()  # This ensures disconnect when the program is forcefully stopped.
-                #     # break
+               
 
                 data.run_forever()
                 response = data.get_data()
@@ -490,75 +475,41 @@ if st.button("Start") and security_id:
 
                     # Place buy order if LTP reaches the entry price
                     if order_status == "not_placed":
-                        if less_than_or_greater_than == ">=":
-                            if float(ltp) >= entry_price:
-                                current_time = datetime.datetime.now()
-                                if current_time.minute % int(timeframe) == 0 and current_time.second == 0 and order_status == "not_placed":
-                                    # Configurable variables
-                                    print(tradesymbol)
-                                    print(f"exchane{exchange}")
-                                    print(f"timeframe {timeframe}")
-                                    
-                                    fetched_df = fetch_data(tradesymbol,exchange,timeframe)
-                                    st.write(f"fetched data:{fetched_df.tail(2)}")
-                                    signal = generate_signals(fetched_df)
-                                    #st.write("STATUS",signal)
+                        
+                        current_time = datetime.datetime.now()
+                        if current_time.minute % int(timeframe) == 0 and current_time.second == 0:
+                            # Configurable variables
+                            print(tradesymbol)
+                            print(f"exchane{exchange}")
+                            print(f"timeframe {timeframe}")
+                            
+                            fetched_df = fetch_data(tradesymbol,exchange,timeframe)
+                            st.write(f"fetched data:{fetched_df.tail(2)}")
+                            signal = generate_signals(fetched_df)
+                            #st.write("STATUS",signal)
 
-                                    if(signal==True):
-                                        st.write(f"{float(ltp)} >= {entry_price}")
-                                        st.write("LTP reached above entry price, placing order...")
-                                        print("LTP reached entry price, placing order...")
-                                        # Place buy order
-                                        place_order(security_id, quantity, float(ltp), "buy")
-                                    
-                                        order_status = "placed"
-                                        highest_price = float(ltp)  # Set highest price to entry price
-                                        print(f"Buy order placed at {ltp}")
-                                        st.write(f"Buy order placed at {ltp}")
-                                        entry_price = float(ltp)
+                            if(signal==True):
+                                st.write(f"{float(ltp)} >= {entry_price}")
+                                st.write("LTP reached above entry price, placing order...")
+                                print("LTP reached entry price, placing order...")
+                                # Place buy order
+                                place_order(security_id, quantity, float(ltp), "buy")
+                            
+                                order_status = "placed"
+                                highest_price = float(ltp)  # Set highest price to entry price
+                                print(f"Buy order placed at {ltp}")
+                                st.write(f"Buy order placed at {ltp}")
+                                entry_price = float(ltp)
 
-                                        # order_status = "not_placed"  # Default order status
-                                        entry_time = datetime.datetime.now()  # Default entry time (current time)
-                                        # exit_time = None  # Exit time will be set later when the trade is closed
-                                        # profit_or_loss = 0  # Initial profit/loss is zero
-                                        # profit_points = 0  # Initial profit points
-                                        # loss_points = 0  # Initial loss points
-                                        backtest = True  # Default to backtesting,  set to False for live trading
+                                # order_status = "not_placed"  # Default order status
+                                entry_time = datetime.datetime.now()  # Default entry time (current time)
+                                # exit_time = None  # Exit time will be set later when the trade is closed
+                                # profit_or_loss = 0  # Initial profit/loss is zero
+                                # profit_points = 0  # Initial profit points
+                                # loss_points = 0  # Initial loss points
+                                backtest = True  # Default to backtesting,  set to False for live trading
                                
-                        else:
-                            if float(ltp) <= entry_price:
-                                current_time = datetime.datetime.now()
-                                if current_time.minute % int(timeframe) == 0 and current_time.second == 0:
-                                    # Configurable variables
-                                    print(tradesymbol)
-                                    print(f"exchane{exchange}")
-                                    print(f"timeframe {timeframe}")
-                                    
-                                    fetched_df = fetch_data(tradesymbol,exchange,timeframe)
-                                    st.write(f"fetched data:{fetched_df.tail(2)}")
-                                    signal = generate_signals(fetched_df)
-                                    # st.write("STATUS",signal)
-
-                                    if(signal==True):
-                                        st.write("LTP reached entry price or below, placing order...")
-                                        print("LTP reached entry price, placing order...")
-                                        # Exit the trade (place a sell order)
-                                        place_order(security_id, quantity, float(ltp), "buy")
-                                    
-                                        order_status = "placed"
-                                        highest_price = float(ltp)  # Set highest price to entry price
-                                        print(f"Buy order placed at {ltp}")
-                                        st.write(f"Buy order placed at {ltp}")
-                                        entry_price = float(ltp)
-
-                                        # order_status = "not_placed"  # Default order status
-                                        entry_time = datetime.datetime.now()  # Default entry time (current time)
-                                        # exit_time = None  # Exit time will be set later when the trade is closed
-                                        # profit_or_loss = 0  # Initial profit/loss is zero
-                                        # profit_points = 0  # Initial profit points
-                                        # loss_points = 0  # Initial loss points
-                                        backtest = False  # Default to backtesting,  set to False for live trading
-
+                        
 
                     # Check if target or stop loss (with trailing) is hit
                     if order_status == "placed":
@@ -704,24 +655,7 @@ if st.button("Start") and security_id:
                             data.disconnect()
                             break
            
-        except KeyboardInterrupt:
-            print("Execution interrupted by user. Disconnecting...")
-            st.write("Execution interrupted by user. Disconnecting...")
-           
-            # Unsubscribe instruments which are already active on connection
-            if selected_index in ['Nifty','BANKNIFTY','FINNIFTY','MIDCPNIFTY']:
-                unsub_instruments = [(marketfeed.NSE, str(security_id), 16)]
-
-                data.unsubscribe_symbols(unsub_instruments)
-               
-            else:
-                unsub_instruments = [(marketfeed.BSE, str(security_id), 16)]
-
-                data.unsubscribe_symbols(unsub_instruments)
-
-            data.disconnect()  # This ensures disconnect when the program is forcefully stopped.
-           
-           
+        
 
         except Exception as e:
             print(e)
@@ -838,72 +772,40 @@ if st.button("Start") and security_id:
 
                     # Place buy order if LTP reaches the entry price
                     if order_status == "not_placed":
-                        if less_than_or_greater_than == ">=":
-                            if float(ltp) >= entry_price:
-                                current_time = datetime.datetime.now()
-                                #st.write(current_time)
-                                if current_time.minute % int(timeframe) == 0 and current_time.second == 0:
-                                    # Configurable variables
-                                    print(tradesymbol)
-                                    print(f"exchane{exchange}")
-                                    print(f"timeframe {timeframe}")
-                                    
-                                    fetched_df = fetch_data(tradesymbol,exchange,timeframe)
-                                    st.write(f"fetched data:{fetched_df.tail(2)}")
-                                    signal = generate_signals(fetched_df)
-                                    # st.write("STATUS",signal)
-                                    if(signal==True):
-                                        st.write(f"{float(ltp)} >= {entry_price}")
-                                        st.write("LTP reached entry price, and ema cross over placing order...")
-                                        print("LTP reached entry price, placing order...")
-                                        # Place buy order
-                                    
-                                        order_status = "placed"
-                                        highest_price = float(ltp)  # Set highest price to entry price
-                                        print(f"Buy order placed at {ltp}")
-                                        st.write(f"Buy order placed at {ltp}")
-                                        entry_price = float(ltp)
+                        
+                        current_time = datetime.datetime.now()
+                        #st.write(current_time)
+                        if current_time.minute % int(timeframe) == 0 and current_time.second == 0:
+                            # Configurable variables
+                            print(tradesymbol)
+                            print(f"exchane{exchange}")
+                            print(f"timeframe {timeframe}")
+                            
+                            fetched_df = fetch_data(tradesymbol,exchange,timeframe)
+                            st.write(f"fetched data:{fetched_df.tail(2)}")
+                            signal = generate_signals(fetched_df)
+                            # st.write("STATUS",signal)
+                            if(signal==True):
+                                st.write(f"{float(ltp)} >= {entry_price}")
+                                st.write("LTP reached entry price, and ema cross over placing order...")
+                                print("LTP reached entry price, placing order...")
+                                # Place buy order
+                            
+                                order_status = "placed"
+                                highest_price = float(ltp)  # Set highest price to entry price
+                                print(f"Buy order placed at {ltp}")
+                                st.write(f"Buy order placed at {ltp}")
+                                entry_price = float(ltp)
 
-                                        # order_status = "not_placed"  # Default order status
-                                        entry_time = datetime.datetime.now()  # Default entry time (current time)
-                                        # exit_time = None  # Exit time will be set later when the trade is closed
-                                        # profit_or_loss = 0  # Initial profit/loss is zero
-                                        # profit_points = 0  # Initial profit points
-                                        # loss_points = 0  # Initial loss points
-                                        backtest = True  # Default to backtesting,  set to False for live trading
+                                # order_status = "not_placed"  # Default order status
+                                entry_time = datetime.datetime.now()  # Default entry time (current time)
+                                # exit_time = None  # Exit time will be set later when the trade is closed
+                                # profit_or_loss = 0  # Initial profit/loss is zero
+                                # profit_points = 0  # Initial profit points
+                                # loss_points = 0  # Initial loss points
+                                backtest = True  # Default to backtesting,  set to False for live trading
                                
-                        else:
-                            if float(ltp) <= entry_price:
-                                current_time = datetime.datetime.now()
-                                if current_time.minute % int(timeframe) == 0 and current_time.second == 0:
-                                    # Configurable variables
-                                    print(tradesymbol)
-                                    print(f"exchane{exchange}")
-                                    print(f"timeframe {timeframe}")
-                                    
-                                    fetched_df = fetch_data(tradesymbol,exchange,timeframe)
-                                    st.write(f"fetched data:{fetched_df.tail(2)}")
-                                    signal = generate_signals(fetched_df)
-                                    # st.write("STATUS",signal)
-                                    if(signal==True):
-                                        st.write("LTP reached entry price or below, and ema cross over placing order...")
-                                        print("LTP reached entry price, placing order...")
-                                        # Place buy order
-                                    
-                                        order_status = "placed"
-                                        highest_price = float(ltp)  # Set highest price to entry price
-                                        print(f"Buy order placed at {ltp}")
-                                        st.write(f"Buy order placed at {ltp}")
-                                        entry_price = float(ltp)
-
-                                        # order_status = "not_placed"  # Default order status
-                                        entry_time = datetime.datetime.now()  # Default entry time (current time)
-                                        # exit_time = None  # Exit time will be set later when the trade is closed
-                                        # profit_or_loss = 0  # Initial profit/loss is zero
-                                        # profit_points = 0  # Initial profit points
-                                        # loss_points = 0  # Initial loss points
-                                        backtest = False  # Default to backtesting,  set to False for live trading
-
+                        
 
                     # Check if target or stop loss (with trailing) is hit
                     if order_status == "placed":
@@ -1045,23 +947,7 @@ if st.button("Start") and security_id:
                             data.disconnect()
                             break
            
-        except KeyboardInterrupt:
-            print("Execution interrupted by user. Disconnecting...")
-            st.write("Execution interrupted by user. Disconnecting...")
-           
-            # Unsubscribe instruments which are already active on connection
-            if selected_index in ['Nifty','BANKNIFTY','FINNIFTY','MIDCPNIFTY']:
-                unsub_instruments = [(marketfeed.NSE, str(security_id), 16)]
-
-                data.unsubscribe_symbols(unsub_instruments)
-               
-            else:
-                unsub_instruments = [(marketfeed.BSE, str(security_id), 16)]
-
-                data.unsubscribe_symbols(unsub_instruments)
-
-            data.disconnect()  # This ensures disconnect when the program is forcefully stopped.
-           
+        
            
 
         except Exception as e:
