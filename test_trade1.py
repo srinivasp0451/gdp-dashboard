@@ -135,7 +135,7 @@ def filter_data(df, selected_index, expiry_date, strike_price, option_type):
 st.title("Algo Trading")
 
 # Dropdown to select Nifty or Sensex
-selected_index = st.selectbox("Select Index", ["Nifty","Sensex", "Bank Nifty","Fin Nifty","Midcap Nifty","Bankex"],index=0)
+selected_index = st.selectbox("Select Index", ["Nifty","Sensex", "Bank Nifty","Fin Nifty","Midcap Nifty","Bankex"],index=1)
 
 # Calendar widget to select expiry date
 expiry_date = st.date_input("Select Expiry Date", min_value=datetime.date(2025, 1, 1))
@@ -144,7 +144,7 @@ expiry_date = st.date_input("Select Expiry Date", min_value=datetime.date(2025, 
 option_type = st.selectbox("Select Option Type", ["CE", "PE"],index=0)
 
 # Dropdown for selecting strike price (you can manually add options or make it dynamic later)
-strike_price = st.number_input("Select Strike Price", min_value=0, step=50,value=24000)
+strike_price = st.number_input("Select Strike Price", min_value=0, step=50,value=76000)
 
 # Fetch the data from the CSV URL
 df = load_csv_data()
