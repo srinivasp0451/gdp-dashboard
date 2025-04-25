@@ -158,9 +158,9 @@ df = load_csv_data()
 entry_price = 1
 # less_than_or_greater_than = st.selectbox("Select above or below", [">=", "<="])
 less_than_or_greater_than = '>='
-stop_loss_distance = st.number_input("Stop Loss Distance", min_value=0, step=1,value=5)
-target_distance = st.number_input("Target Distance", min_value=0, step=1,value=3)
-quantity = st.number_input("Quantity", min_value=1, step=1, value=75)
+stop_loss_distance = st.number_input("Stop Loss Distance", min_value=0, step=1,value=1)
+target_distance = st.number_input("Target Distance", min_value=0, step=1,value=1)
+quantity = st.number_input("Quantity", min_value=1, step=1, value=20)
 profit_threshold = st.number_input("Profit Threshold", min_value=1, step=1,value=5000)
 loss_threshold = st.number_input("Loss Threshold", min_value=0, step=1,value=350)
 timeframe = st.text_input("Time Frame",value=1)
