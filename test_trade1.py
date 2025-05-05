@@ -22,7 +22,7 @@ nest_asyncio.apply()
 
 # Initialize client
 client_code = "1104779876"
-token_id = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzUxMiJ9.eyJpc3MiOiJkaGFuIiwicGFydG5lcklkIjoiIiwiZXhwIjoxNzQ2MzQwNzQzLCJ0b2tlbkNvbnN1bWVyVHlwZSI6IlNFTEYiLCJ3ZWJob29rVXJsIjoiIiwiZGhhbkNsaWVudElkIjoiMTEwNDc3OTg3NiJ9.dfxL1pGEwjTX1WIYWpLIPYAvvwXn6KTCUrng295eAvhXDTV2QgnZnKB-HRT9MuZ_n75tJueAaDZsDPinr9p2Mg"
+token_id = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzUxMiJ9.eyJpc3MiOiJkaGFuIiwicGFydG5lcklkIjoiIiwiZXhwIjoxNzQ4OTk5NTU2LCJ0b2tlbkNvbnN1bWVyVHlwZSI6IlNFTEYiLCJ3ZWJob29rVXJsIjoiIiwiZGhhbkNsaWVudElkIjoiMTEwNDc3OTg3NiJ9.Xuuz1YAxf317M3YEE40pn3Cbz5B8Qly_S-hxutBg-YJL2oY8D4oEWb-d0AB2IbC1NUjF4n9PX9Aqox-OW-njIQ"
 tsl = Tradehull(client_code, token_id)
 
 
@@ -176,10 +176,10 @@ trade_mode = st.selectbox("Select Trade Mode", ["Live Trading","Backtesting"],in
 # Inputs for Live Trading (client ID and access token for live trading)
 if trade_mode == "Live Trading":
     order_client_id = st.text_input("Client ID (for placing orders)", type="password",value='22305184')
-    order_access_token = st.text_input("Access Token (for placing orders)", type="password",value='eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzUxMiJ9.eyJpc3MiOiJkaGFuIiwicGFydG5lcklkIjoiIiwiZXhwIjoxNzQ2MzQwNzQzLCJ0b2tlbkNvbnN1bWVyVHlwZSI6IlNFTEYiLCJ3ZWJob29rVXJsIjoiIiwiZGhhbkNsaWVudElkIjoiMTEwNDc3OTg3NiJ9.dfxL1pGEwjTX1WIYWpLIPYAvvwXn6KTCUrng295eAvhXDTV2QgnZnKB-HRT9MuZ_n75tJueAaDZsDPinr9p2Mg')
+    order_access_token = st.text_input("Access Token (for placing orders)", value="eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzUxMiJ9.eyJpc3MiOiJkaGFuIiwicGFydG5lcklkIjoiIiwiZXhwIjoxNzQ4OTk5NTU2LCJ0b2tlbkNvbnN1bWVyVHlwZSI6IlNFTEYiLCJ3ZWJob29rVXJsIjoiIiwiZGhhbkNsaWVudElkIjoiMTEwNDc3OTg3NiJ9.Xuuz1YAxf317M3YEE40pn3Cbz5B8Qly_S-hxutBg-YJL2oY8D4oEWb-d0AB2IbC1NUjF4n9PX9Aqox-OW-njIQ")
 else:
     data_client_id = "1104779876"
-    data_access_token = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzUxMiJ9.eyJpc3MiOiJkaGFuIiwicGFydG5lcklkIjoiIiwiZXhwIjoxNzQ2MzQwNzQzLCJ0b2tlbkNvbnN1bWVyVHlwZSI6IlNFTEYiLCJ3ZWJob29rVXJsIjoiIiwiZGhhbkNsaWVudElkIjoiMTEwNDc3OTg3NiJ9.dfxL1pGEwjTX1WIYWpLIPYAvvwXn6KTCUrng295eAvhXDTV2QgnZnKB-HRT9MuZ_n75tJueAaDZsDPinr9p2Mg"
+    data_access_token = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzUxMiJ9.eyJpc3MiOiJkaGFuIiwicGFydG5lcklkIjoiIiwiZXhwIjoxNzQ4OTk5NTU2LCJ0b2tlbkNvbnN1bWVyVHlwZSI6IlNFTEYiLCJ3ZWJob29rVXJsIjoiIiwiZGhhbkNsaWVudElkIjoiMTEwNDc3OTg3NiJ9.Xuuz1YAxf317M3YEE40pn3Cbz5B8Qly_S-hxutBg-YJL2oY8D4oEWb-d0AB2IbC1NUjF4n9PX9Aqox-OW-njIQ"
 
 
 
@@ -452,7 +452,7 @@ if st.button("Start") and security_id:
 
 
         data_client_id = "1104779876"
-        data_access_token = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzUxMiJ9.eyJpc3MiOiJkaGFuIiwicGFydG5lcklkIjoiIiwiZXhwIjoxNzQ2MzQwNzQzLCJ0b2tlbkNvbnN1bWVyVHlwZSI6IlNFTEYiLCJ3ZWJob29rVXJsIjoiIiwiZGhhbkNsaWVudElkIjoiMTEwNDc3OTg3NiJ9.dfxL1pGEwjTX1WIYWpLIPYAvvwXn6KTCUrng295eAvhXDTV2QgnZnKB-HRT9MuZ_n75tJueAaDZsDPinr9p2Mg"
+        data_access_token = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzUxMiJ9.eyJpc3MiOiJkaGFuIiwicGFydG5lcklkIjoiIiwiZXhwIjoxNzQ4OTk5NTU2LCJ0b2tlbkNvbnN1bWVyVHlwZSI6IlNFTEYiLCJ3ZWJob29rVXJsIjoiIiwiZGhhbkNsaWVudElkIjoiMTEwNDc3OTg3NiJ9.Xuuz1YAxf317M3YEE40pn3Cbz5B8Qly_S-hxutBg-YJL2oY8D4oEWb-d0AB2IbC1NUjF4n9PX9Aqox-OW-njIQ"
         # Main trading loop
         try:
             data = marketfeed.DhanFeed(data_client_id, data_access_token, instruments, version)
@@ -732,7 +732,7 @@ if st.button("Start") and security_id:
 
 
         data_client_id = "1104779876"
-        data_access_token = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzUxMiJ9.eyJpc3MiOiJkaGFuIiwicGFydG5lcklkIjoiIiwiZXhwIjoxNzQ2MzQwNzQzLCJ0b2tlbkNvbnN1bWVyVHlwZSI6IlNFTEYiLCJ3ZWJob29rVXJsIjoiIiwiZGhhbkNsaWVudElkIjoiMTEwNDc3OTg3NiJ9.dfxL1pGEwjTX1WIYWpLIPYAvvwXn6KTCUrng295eAvhXDTV2QgnZnKB-HRT9MuZ_n75tJueAaDZsDPinr9p2Mg"
+        data_access_token = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzUxMiJ9.eyJpc3MiOiJkaGFuIiwicGFydG5lcklkIjoiIiwiZXhwIjoxNzQ4OTk5NTU2LCJ0b2tlbkNvbnN1bWVyVHlwZSI6IlNFTEYiLCJ3ZWJob29rVXJsIjoiIiwiZGhhbkNsaWVudElkIjoiMTEwNDc3OTg3NiJ9.Xuuz1YAxf317M3YEE40pn3Cbz5B8Qly_S-hxutBg-YJL2oY8D4oEWb-d0AB2IbC1NUjF4n9PX9Aqox-OW-njIQ"
 
 
 
