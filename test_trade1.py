@@ -141,10 +141,10 @@ selected_index = st.selectbox("Select Index", ["Nifty","Sensex", "Bank Nifty","F
 expiry_date = st.date_input("Select Expiry Date", min_value=datetime.date(2025, 1, 1))
 
 # Dropdown for Option Type (CE or PE)
-option_type = st.selectbox("Select Option Type", ["CE", "PE"],index=0)
+option_type = st.selectbox("Select Option Type", ["CE", "PE"],index=1)
 
 # Dropdown for selecting strike price (you can manually add options or make it dynamic later)
-strike_price = st.number_input("Select Strike Price", min_value=0, step=50,value=24400)
+strike_price = st.number_input("Select Strike Price", min_value=0, step=50,value=24500)
 
 # Fetch the data from the CSV URL
 df = load_csv_data()
@@ -158,9 +158,9 @@ df = load_csv_data()
 entry_price = 1
 # less_than_or_greater_than = st.selectbox("Select above or below", [">=", "<="])
 less_than_or_greater_than = '>='
-stop_loss_distance = st.number_input("Stop Loss Distance", min_value=0, step=1,value=1)
-target_distance = st.number_input("Target Distance", min_value=0, step=1,value=2)
-quantity = st.number_input("Quantity", min_value=1, step=1, value=75)
+stop_loss_distance = st.number_input("Stop Loss Distance", min_value=0, step=1,value=10)
+target_distance = st.number_input("Target Distance", min_value=0, step=1,value=10)
+quantity = st.number_input("Quantity", min_value=1, step=1, value=150)
 profit_threshold = st.number_input("Profit Threshold", min_value=1, step=1,value=5000)
 loss_threshold = st.number_input("Loss Threshold", min_value=0, step=1,value=350)
 timeframe = st.text_input("Time Frame",value=1)
@@ -176,10 +176,10 @@ trade_mode = st.selectbox("Select Trade Mode", ["Live Trading","Backtesting"],in
 # Inputs for Live Trading (client ID and access token for live trading)
 if trade_mode == "Live Trading":
     order_client_id = st.text_input("Client ID (for placing orders)", type="password",value='22305184')
-    order_access_token = st.text_input("Access Token (for placing orders)", value="eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzUxMiJ9.eyJpc3MiOiJkaGFuIiwicGFydG5lcklkIjoiIiwiZXhwIjoxNzQ4OTk5NTU2LCJ0b2tlbkNvbnN1bWVyVHlwZSI6IlNFTEYiLCJ3ZWJob29rVXJsIjoiIiwiZGhhbkNsaWVudElkIjoiMTEwNDc3OTg3NiJ9.Xuuz1YAxf317M3YEE40pn3Cbz5B8Qly_S-hxutBg-YJL2oY8D4oEWb-d0AB2IbC1NUjF4n9PX9Aqox-OW-njIQ")
+    order_access_token = st.text_input("Access Token (for placing orders)", type="password",value=token_id)
 else:
     data_client_id = "1104779876"
-    data_access_token = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzUxMiJ9.eyJpc3MiOiJkaGFuIiwicGFydG5lcklkIjoiIiwiZXhwIjoxNzQ4OTk5NTU2LCJ0b2tlbkNvbnN1bWVyVHlwZSI6IlNFTEYiLCJ3ZWJob29rVXJsIjoiIiwiZGhhbkNsaWVudElkIjoiMTEwNDc3OTg3NiJ9.Xuuz1YAxf317M3YEE40pn3Cbz5B8Qly_S-hxutBg-YJL2oY8D4oEWb-d0AB2IbC1NUjF4n9PX9Aqox-OW-njIQ"
+    data_access_token = token_id
 
 
 
@@ -217,7 +217,7 @@ else:
     st.write("No data available for the selected criteria.")
 
 st.write(f"Trade Symbol: {tradesymbol}")
-st.write(f"Timeframe: {timeframe}")
+# st.write(f"Timeframe: {timeframe}")
 st.write(f"Security id: {security_id}")
 
 # Button to start/stop trading
@@ -335,9 +335,9 @@ def generate_signals(df):
             
     if latest_candle['ema9'] > latest_candle['ema20'] and old_candle['ema9'] <= old_candle['ema20']:
     #if latest_candle['ema9'] > latest_candle['ema20']:
-        st.write('EMA Crossovver')
-        st.write(f"EMA 1: {latest_candle['ema9']}")
-        st.write(f"EMA 2: {latest_candle['ema20']}")
+        # st.write('EMA Crossovver')
+        # st.write(f"EMA 1: {latest_candle['ema9']}")
+        # st.write(f"EMA 2: {latest_candle['ema20']}")
         buy_signal =True
         return buy_signal
     elif latest_candle['ema9'] < latest_candle['ema20'] and old_candle['ema9']>= old_candle['ema20']:
@@ -452,7 +452,7 @@ if st.button("Start") and security_id:
 
 
         data_client_id = "1104779876"
-        data_access_token = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzUxMiJ9.eyJpc3MiOiJkaGFuIiwicGFydG5lcklkIjoiIiwiZXhwIjoxNzQ4OTk5NTU2LCJ0b2tlbkNvbnN1bWVyVHlwZSI6IlNFTEYiLCJ3ZWJob29rVXJsIjoiIiwiZGhhbkNsaWVudElkIjoiMTEwNDc3OTg3NiJ9.Xuuz1YAxf317M3YEE40pn3Cbz5B8Qly_S-hxutBg-YJL2oY8D4oEWb-d0AB2IbC1NUjF4n9PX9Aqox-OW-njIQ"
+        data_access_token = token_id
         # Main trading loop
         try:
             data = marketfeed.DhanFeed(data_client_id, data_access_token, instruments, version)
@@ -732,14 +732,14 @@ if st.button("Start") and security_id:
 
 
         data_client_id = "1104779876"
-        data_access_token = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzUxMiJ9.eyJpc3MiOiJkaGFuIiwicGFydG5lcklkIjoiIiwiZXhwIjoxNzQ4OTk5NTU2LCJ0b2tlbkNvbnN1bWVyVHlwZSI6IlNFTEYiLCJ3ZWJob29rVXJsIjoiIiwiZGhhbkNsaWVudElkIjoiMTEwNDc3OTg3NiJ9.Xuuz1YAxf317M3YEE40pn3Cbz5B8Qly_S-hxutBg-YJL2oY8D4oEWb-d0AB2IbC1NUjF4n9PX9Aqox-OW-njIQ"
+        data_access_token = token_id
 
 
 
         # Main trading loop
         try:
             data = marketfeed.DhanFeed(data_client_id, data_access_token, instruments, version)
-            st.write("Fetching Data for backtesting")
+            st.write("Fetching Data for live testing")
             print(f"security id {security_id}")
            
 
@@ -784,12 +784,13 @@ if st.button("Start") and security_id:
                             print(f"timeframe {timeframe}")
                             
                             fetched_df = fetch_data(tradesymbol,exchange,timeframe)
-                            st.write(f"fetched data:{fetched_df.tail(2)}")
+                            # st.write(f"fetched data:{fetched_df.tail(2)}")
                             signal = generate_signals(fetched_df)
                             # st.write("STATUS",signal)
                             if(signal==True):
                                 st.write(f"{float(ltp)} >= {entry_price}")
-                                st.write("LTP reached entry price, and ema cross over placing order...")
+                                # st.write("LTP reached entry price, and ema cross over placing order...")
+                                st.write("LTP reached entry price, placing order...")
                                 print("LTP reached entry price, placing order...")
                                 # Place buy order
                             
