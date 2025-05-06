@@ -123,7 +123,7 @@ def filter_data(df, selected_index, expiry_date, strike_price, option_type):
 st.title("Algo Trading")
 
 # Dropdown to select Nifty or Sensex
-selected_index = st.selectbox("Select Index", ["Nifty", "Sensex","Bank Nifty","Fin Nifty","Midcap Nifty","Bankex"],index=0)
+selected_index = st.selectbox("Select Index", ["Nifty", "Sensex","Bank Nifty","Fin Nifty","Midcap Nifty","Bankex"],index=1)
 
 # Calendar widget to select expiry date
 expiry_date = st.date_input("Select Expiry Date", min_value=datetime.date(2025, 1, 1))
@@ -132,7 +132,7 @@ expiry_date = st.date_input("Select Expiry Date", min_value=datetime.date(2025, 
 option_type = st.selectbox("Select Option Type", ["CE", "PE"],index=0)
 
 # Dropdown for selecting strike price (you can manually add options or make it dynamic later)
-strike_price = st.number_input("Select Strike Price", min_value=0, step=50,value=24300)
+strike_price = st.number_input("Select Strike Price", min_value=0, step=50,value=80900)
 
 # Fetch the data from the CSV URL
 df = load_csv_data()
@@ -143,19 +143,19 @@ df = load_csv_data()
 
 
 # Input fields for Entry Price, Stop Loss, Target, etc.
-entry_price = st.number_input("Entry Price", min_value=0, step=1,value=100)
+entry_price = st.number_input("Entry Price", min_value=0.0, step=.1,format="%.2f",value=1.0)
 less_than_or_greater_than = st.selectbox("Select above or below", [">=", "<="])
-stop_loss_distance = st.number_input("Stop Loss Distance", min_value=0, step=1,value=5)
-target_distance = st.number_input("Target Distance", min_value=0, step=1,value=5)
-quantity = st.number_input("Quantity", min_value=1, step=1, value=20)
-profit_threshold = st.number_input("Profit Threshold", min_value=1, step=1,value=1000000)
-loss_threshold = st.number_input("Loss Threshold", min_value=0, step=1,value=500)
+stop_loss_distance = st.number_input("Stop Loss Distance", min_value=0.0, step=.1,format="%.2f",value=5.0)
+target_distance = st.number_input("Target Distance", min_value=0.0, step=.1,format="%.2f",value=5.0)
+quantity = st.number_input("Quantity", min_value=1, value=20)
+profit_threshold = st.number_input("Profit Threshold", min_value=1.0, step=.1,format="%.2f",value=1000000.0)
+loss_threshold = st.number_input("Loss Threshold", min_value=0.0, step=.1,format="%.2f",value=500.0)
 
 # Dropdown for selecting whether to use trailing stop loss or not
-use_trailing_stop_loss = st.selectbox("Use Trailing Stop Loss?", ["Yes","No"])
+use_trailing_stop_loss = st.selectbox("Use Trailing Stop Loss?", ["Yes","No"],index=1)
 
 # Select backtesting or live trading
-trade_mode = st.selectbox("Select Trade Mode", ["Backtesting", "Live Trading"])
+trade_mode = st.selectbox("Select Trade Mode", ["Backtesting", "Live Trading"],index=0)
 
 
 
@@ -537,23 +537,7 @@ if st.button("Start") and security_id:
                             data.disconnect()
                             break
            
-        except KeyboardInterrupt:
-            print("Execution interrupted by user. Disconnecting...")
-            st.write("Execution interrupted by user. Disconnecting...")
-           
-            # Unsubscribe instruments which are already active on connection
-            if selected_index in ["Nifty", "Bank Nifty","Fin Nifty","Midcap Nifty"]:
-                unsub_instruments = [(marketfeed.NSE, str(security_id), 16)]
-
-                data.unsubscribe_symbols(unsub_instruments)
-               
-            else:
-                unsub_instruments = [(marketfeed.BSE, str(security_id), 16)]
-
-                data.unsubscribe_symbols(unsub_instruments)
-
-            data.disconnect()  # This ensures disconnect when the program is forcefully stopped.
-           
+        
            
 
         except Exception as e:
@@ -854,26 +838,6 @@ if st.button("Start") and security_id:
            
            
 
-        except Exception as e:
-            print(e)
-            print("Exception occured")
-            print("Execution interrupted by user. Disconnecting...")
-            st.write("Execution interrupted by user. Disconnecting...")
-           
-            # Unsubscribe instruments which are already active on connection
-            if selected_index in ['Nifty','BANKNIFTY','FINNIFTY','MIDCPNIFTY']:
-                unsub_instruments = [(marketfeed.NSE, str(security_id), 16)]
-
-                data.unsubscribe_symbols(unsub_instruments)
-               
-            else:
-                unsub_instruments = [(marketfeed.BSE, str(security_id), 16)]
-
-                data.unsubscribe_symbols(unsub_instruments)
-
-            data.disconnect()  # This ensures disconnect when the program is forcefully stopped.
-           
-           
 
         finally:
            
