@@ -15,7 +15,7 @@ import time
 import time
 import datetime
 import pandas as pd
-from Dhan_Tradehull import Tradehull
+
 
 nest_asyncio.apply()
 
@@ -24,7 +24,6 @@ nest_asyncio.apply()
 # Initialize client
 client_code = "1104779876"
 token_id = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzUxMiJ9.eyJpc3MiOiJkaGFuIiwicGFydG5lcklkIjoiIiwiZXhwIjoxNzQ4OTk5NTU2LCJ0b2tlbkNvbnN1bWVyVHlwZSI6IlNFTEYiLCJ3ZWJob29rVXJsIjoiIiwiZGhhbkNsaWVudElkIjoiMTEwNDc3OTg3NiJ9.Xuuz1YAxf317M3YEE40pn3Cbz5B8Qly_S-hxutBg-YJL2oY8D4oEWb-d0AB2IbC1NUjF4n9PX9Aqox-OW-njIQ"
-tsl = Tradehull(client_code, token_id)
 
 
 security_id = 0
