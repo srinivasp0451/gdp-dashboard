@@ -22,7 +22,11 @@ data_access_token=''
 profit_threshold=''
 loss_threshold=''
 market_feed_value = marketfeed.NSE
-token_id = 'eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzUxMiJ9.eyJpc3MiOiJkaGFuIiwicGFydG5lcklkIjoiIiwiZXhwIjoxNzQ4OTk5NTU2LCJ0b2tlbkNvbnN1bWVyVHlwZSI6IlNFTEYiLCJ3ZWJob29rVXJsIjoiIiwiZGhhbkNsaWVudElkIjoiMTEwNDc3OTg3NiJ9.Xuuz1YAxf317M3YEE40pn3Cbz5B8Qly_S-hxutBg-YJL2oY8D4oEWb-d0AB2IbC1NUjF4n9PX9Aqox-OW-njIQ'
+token_id = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzUxMiJ9.eyJpc3MiOiJkaGFuIiwicGFydG5lcklkIjoiIiwiZXhwIjoxNzUxNjIyNDI4LCJ0b2tlbkNvbnN1bWVyVHlwZSI6IlNFTEYiLCJ3ZWJob29rVXJsIjoiIiwiZGhhbkNsaWVudElkIjoiMTEwNDc3OTg3NiJ9.oGm0HBBvsjAcDD8c2lpc9h67BpA2WtXQdkYXH47rnq9FMlme-vzSX5FgKjt_vWbSFFmXqN5Cgb5bO0SU7YwXhw"
+
+
+
+
 # # Database setup for storing trade details
 # def create_table():
 #     conn = sqlite3.connect('trade_journal.db')
