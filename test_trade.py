@@ -26,7 +26,6 @@ token_id = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzUxMiJ9.eyJpc3MiOiJkaGFuIiwicGFydG5lckl
 
 
 
-
 # # Database setup for storing trade details
 # def create_table():
 #     conn = sqlite3.connect('trade_journal.db')
