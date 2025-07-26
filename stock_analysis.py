@@ -607,3 +607,259 @@ def main():
                             st.info(f"**Entry Logic:** {recommendation['entry_logic']}")
                             if recommendation['exit_logic']:
                                 st.warning(f"**Exit Logic:** {recommendation['exit_logic']}")
+                            
+                            # Technical Summary
+                            st.subheader("📈 Technical Summary")
+                            col1, col2 = st.columns(2)
+                            
+                            with col1:
+                                st.write("**Moving Averages:**")
+                                st.write(f"• SMA 50: ₹{recommendation['sma_50']:.2f}")
+                                st.write(f"• SMA 200: ₹{recommendation['sma_200']:.2f}")
+                                trend = "🟢 Uptrend" if recommendation['sma_50'] > recommendation['sma_200'] else "🔴 Downtrend"
+                                st.write(f"• Trend: {trend}")
+                            
+                            with col2:
+                                st.write("**Key Indicators:**")
+                                rsi_status = "🟢 Normal" if 30 <= recommendation['rsi'] <= 70 else "🟡 Extreme"
+                                st.write(f"• RSI Status: {rsi_status}")
+                                vol_status = "🟢 High" if recommendation['volume_ratio'] > 1.2 else "🟡 Normal"
+                                st.write(f"• Volume: {vol_status}")
+                        else:
+                            st.error("❌ Could not fetch data for this stock")
+                else:
+                    st.warning("⚠️ Please enter a stock symbol")
+        
+        # Quick scanner for all Nifty 50
+        st.markdown("---")
+        st.subheader("🔍 Quick Nifty 50 Scanner")
+        
+        if st.button("🚀 Scan All Nifty 50 Stocks", type="secondary"):
+            progress_bar = st.progress(0)
+            results_container = st.empty()
+            
+            scanner_results = []
+            total_stocks = len(screener.nifty50_stocks)
+            
+            for i, stock in enumerate(list(screener.nifty50_stocks.keys())[:10]):  # Limit to first 10 for demo
+                progress_bar.progress((i + 1) / 10)
+                
+                with st.spinner(f"Scanning {stock}..."):
+                    recommendation = screener.get_live_recommendation(stock)
+                    if recommendation:
+                        scanner_results.append(recommendation)
+            
+            progress_bar.empty()
+            
+            # Display scanner results
+            if scanner_results:
+                st.success(f"✅ Scanned {len(scanner_results)} stocks successfully!")
+                
+                # Create DataFrame for display
+                scanner_df = pd.DataFrame([
+                    {
+                        'Stock': r['stock'],
+                        'Price': f"₹{r['current_price']:.2f}",
+                        'Signal': r['recommendation'],
+                        'Score': r['entry_score'],
+                        'Stop Loss': f"₹{r['stop_loss']:.2f}",
+                        'Target': f"₹{r['target']:.2f}",
+                        'RSI': f"{r['rsi']:.1f}",
+                        'Volume': f"{r['volume_ratio']:.2f}x"
+                    }
+                    for r in scanner_results
+                ])
+                
+                # Color code signals
+                def highlight_signals(s):
+                    if 'BUY' in str(s):
+                        return 'background-color: lightgreen'
+                    elif 'SELL' in str(s):
+                        return 'background-color: lightcoral'
+                    else:
+                        return 'background-color: lightyellow'
+                
+                styled_scanner = scanner_df.style.applymap(highlight_signals, subset=['Signal'])
+                st.dataframe(styled_scanner, use_container_width=True)
+                
+                # Download scanner results
+                csv = scanner_df.to_csv(index=False)
+                st.download_button(
+                    label="📥 Download Scanner Results",
+                    data=csv,
+                    file_name=f"nifty50_scanner_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
+                    mime="text/csv"
+                )
+    
+    elif page == "🔍 Portfolio Scanner":
+        st.header("🔍 Portfolio Performance Scanner")
+        
+        # Portfolio input
+        st.subheader("📝 Build Your Portfolio")
+        
+        # Multi-select for stocks
+        selected_stocks = st.multiselect(
+            "Select stocks for portfolio analysis:",
+            options=list(screener.nifty50_stocks.keys()),
+            default=['RELIANCE', 'TCS', 'INFY']
+        )
+        
+        if selected_stocks:
+            col1, col2 = st.columns([1, 1])
+            
+            with col1:
+                initial_capital = st.number_input("Initial Capital (₹):", value=100000, step=10000)
+            
+            with col2:
+                analysis_period = st.selectbox("Analysis Period:", ["1y", "2y", "3y", "5y"], index=1)
+            
+            if st.button("📊 Analyze Portfolio", type="primary"):
+                st.subheader("🎯 Portfolio Analysis Results")
+                
+                portfolio_results = []
+                progress_bar = st.progress(0)
+                
+                for i, stock in enumerate(selected_stocks):
+                    progress_bar.progress((i + 1) / len(selected_stocks))
+                    
+                    with st.spinner(f"Analyzing {stock}..."):
+                        data = screener.fetch_stock_data(stock, period=analysis_period)
+                        if data is not None:
+                            strategy_data = screener.generate_trading_signals(data)
+                            results = screener.advanced_backtest(strategy_data, initial_capital)
+                            
+                            portfolio_results.append({
+                                'Stock': stock,
+                                'Total_Trades': results['total_trades'],
+                                'Win_Rate': results['win_rate'],
+                                'Total_Return': results['total_return'],
+                                'Final_Capital': results['final_capital'],
+                                'Max_Profit': results['max_profit'],
+                                'Max_Loss': results['max_loss'],
+                                'Profit_Factor': results['profit_factor']
+                            })
+                
+                progress_bar.empty()
+                
+                if portfolio_results:
+                    # Portfolio summary
+                    portfolio_df = pd.DataFrame(portfolio_results)
+                    
+                    # Summary metrics
+                    st.subheader("📈 Portfolio Summary")
+                    
+                    col1, col2, col3, col4 = st.columns(4)
+                    
+                    with col1:
+                        avg_return = portfolio_df['Total_Return'].mean()
+                        st.metric("Average Return", f"{avg_return:.2f}%")
+                    
+                    with col2:
+                        avg_win_rate = portfolio_df['Win_Rate'].mean()
+                        st.metric("Average Win Rate", f"{avg_win_rate:.1f}%")
+                    
+                    with col3:
+                        total_trades = portfolio_df['Total_Trades'].sum()
+                        st.metric("Total Trades", total_trades)
+                    
+                    with col4:
+                        best_stock = portfolio_df.loc[portfolio_df['Total_Return'].idxmax(), 'Stock']
+                        st.metric("Best Performer", best_stock)
+                    
+                    # Detailed table
+                    st.subheader("📊 Detailed Portfolio Results")
+                    
+                    # Format for display
+                    display_portfolio = portfolio_df.copy()
+                    display_portfolio['Win_Rate'] = display_portfolio['Win_Rate'].round(1).astype(str) + '%'
+                    display_portfolio['Total_Return'] = display_portfolio['Total_Return'].round(2).astype(str) + '%'
+                    display_portfolio['Final_Capital'] = '₹' + display_portfolio['Final_Capital'].round(0).astype(str)
+                    display_portfolio['Max_Profit'] = '₹' + display_portfolio['Max_Profit'].round(2).astype(str)
+                    display_portfolio['Max_Loss'] = '₹' + display_portfolio['Max_Loss'].round(2).astype(str)
+                    display_portfolio['Profit_Factor'] = display_portfolio['Profit_Factor'].round(2)
+                    
+                    # Color coding for returns
+                    def color_returns(val):
+                        if '%' in str(val):
+                            num_val = float(str(val).replace('%', ''))
+                            return 'color: green' if num_val > 0 else 'color: red' if num_val < 0 else 'color: black'
+                        return 'color: black'
+                    
+                    styled_portfolio = display_portfolio.style.applymap(color_returns, subset=['Total_Return'])
+                    st.dataframe(styled_portfolio, use_container_width=True)
+                    
+                    # Portfolio visualization
+                    st.subheader("📈 Portfolio Performance Visualization")
+                    
+                    # Returns chart
+                    fig_returns = px.bar(
+                        portfolio_df, 
+                        x='Stock', 
+                        y='Total_Return',
+                        title='Stock Returns Comparison',
+                        color='Total_Return',
+                        color_continuous_scale='RdYlGn'
+                    )
+                    st.plotly_chart(fig_returns, use_container_width=True)
+                    
+                    # Win rate vs Returns scatter
+                    fig_scatter = px.scatter(
+                        portfolio_df,
+                        x='Win_Rate',
+                        y='Total_Return',
+                        size='Total_Trades',
+                        hover_name='Stock',
+                        title='Win Rate vs Returns Analysis',
+                        labels={'Win_Rate': 'Win Rate (%)', 'Total_Return': 'Total Return (%)'}
+                    )
+                    st.plotly_chart(fig_scatter, use_container_width=True)
+                    
+                    # Download portfolio results
+                    csv = display_portfolio.to_csv(index=False)
+                    st.download_button(
+                        label="📥 Download Portfolio Analysis",
+                        data=csv,
+                        file_name=f"portfolio_analysis_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
+                        mime="text/csv"
+                    )
+    
+    # Strategy explanation sidebar
+    with st.sidebar:
+        st.markdown("---")
+        st.subheader("🧠 Strategy Logic")
+        
+        st.markdown("""
+        **Entry Conditions (5/7 required):**
+        - Price > 50-day SMA
+        - SMA 50 > SMA 200 (Uptrend)
+        - RSI between 40-65
+        - Volume > 1.2x average
+        - Positive 5-day momentum
+        - Price > Lower Bollinger Band
+        - MACD bullish crossover
+        
+        **Exit Conditions (Any 1):**
+        - Price < 50-day SMA
+        - RSI > 75 (Overbought)
+        - RSI < 30 (Oversold)
+        - Price < Lower Bollinger Band
+        - MACD bearish crossover
+        
+        **Risk Management:**
+        - 2% Stop Loss
+        - 4% Target
+        - 10% position size per trade
+        """)
+        
+        st.markdown("---")
+        st.subheader("📞 Support")
+        st.info("""
+        For technical support or feature requests, 
+        please contact the development team.
+        
+        **Version:** 2.0.0
+        **Last Updated:** 2024
+        """)
+
+if __name__ == "__main__":
+    main()
