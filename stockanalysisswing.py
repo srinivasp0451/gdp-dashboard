@@ -2,16 +2,13 @@ import yfinance as yf
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
-import seaborn as sns
 from datetime import datetime, timedelta
 import warnings
 import time
 from typing import Dict, List, Tuple, Optional
-import ta
 from dataclasses import dataclass
 
 warnings.filterwarnings('ignore')
-plt.style.use('seaborn-v0_8')
 
 @dataclass
 class SwingSignal:
@@ -54,41 +51,65 @@ class SwingTradingCore:
             return None
     
     def calculate_swing_indicators(self, data: pd.DataFrame) -> pd.DataFrame:
-        """Calculate technical indicators for swing trading"""
+        """Calculate technical indicators for swing trading using manual calculations"""
         df = data.copy()
         
         # Moving Averages
-        df['EMA_20'] = ta.trend.ema_indicator(df['Close'], window=20)
-        df['EMA_50'] = ta.trend.ema_indicator(df['Close'], window=50)
-        df['SMA_200'] = ta.trend.sma_indicator(df['Close'], window=200)
+        df['EMA_20'] = self._calculate_ema(df['Close'], 20)
+        df['EMA_50'] = self._calculate_ema(df['Close'], 50)
+        df['SMA_200'] = df['Close'].rolling(window=200).mean()
         
         # RSI
-        df['RSI'] = ta.momentum.rsi(df['Close'], window=14)
+        df['RSI'] = self._calculate_rsi(df['Close'], 14)
         
         # MACD
-        macd = ta.trend.MACD(df['Close'])
-        df['MACD'] = macd.macd()
-        df['MACD_Signal'] = macd.macd_signal()
-        df['MACD_Histogram'] = macd.macd_diff()
+        ema_12 = self._calculate_ema(df['Close'], 12)
+        ema_26 = self._calculate_ema(df['Close'], 26)
+        df['MACD'] = ema_12 - ema_26
+        df['MACD_Signal'] = self._calculate_ema(df['MACD'], 9)
+        df['MACD_Histogram'] = df['MACD'] - df['MACD_Signal']
         
         # Bollinger Bands
-        bb = ta.volatility.BollingerBands(df['Close'], window=20, window_dev=2)
-        df['BB_Upper'] = bb.bollinger_hband()
-        df['BB_Lower'] = bb.bollinger_lband()
-        df['BB_Middle'] = bb.bollinger_mavg()
+        sma_20 = df['Close'].rolling(window=20).mean()
+        std_20 = df['Close'].rolling(window=20).std()
+        df['BB_Upper'] = sma_20 + (std_20 * 2)
+        df['BB_Lower'] = sma_20 - (std_20 * 2)
+        df['BB_Middle'] = sma_20
         
         # Support and Resistance
         df['Resistance'] = df['High'].rolling(window=20).max()
         df['Support'] = df['Low'].rolling(window=20).min()
         
         # Average True Range for volatility
-        df['ATR'] = ta.volatility.average_true_range(df['High'], df['Low'], df['Close'], window=14)
+        df['ATR'] = self._calculate_atr(df['High'], df['Low'], df['Close'], 14)
         
         # Volume indicators
         df['Volume_SMA'] = df['Volume'].rolling(window=20).mean()
         df['Volume_Ratio'] = df['Volume'] / df['Volume_SMA']
         
         return df
+    
+    def _calculate_ema(self, prices: pd.Series, period: int) -> pd.Series:
+        """Calculate Exponential Moving Average"""
+        return prices.ewm(span=period, adjust=False).mean()
+    
+    def _calculate_rsi(self, prices: pd.Series, period: int = 14) -> pd.Series:
+        """Calculate Relative Strength Index"""
+        delta = prices.diff()
+        gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
+        rs = gain / loss
+        rsi = 100 - (100 / (1 + rs))
+        return rsi
+    
+    def _calculate_atr(self, high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14) -> pd.Series:
+        """Calculate Average True Range"""
+        high_low = high - low
+        high_close = np.abs(high - close.shift())
+        low_close = np.abs(low - close.shift())
+        true_range = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+        atr = true_range.rolling(window=period).mean()
+        return atr
     
     def identify_swing_patterns(self, df: pd.DataFrame, symbol: str) -> List[SwingSignal]:
         """Identify swing trading opportunities"""
