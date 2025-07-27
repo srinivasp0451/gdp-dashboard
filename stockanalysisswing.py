@@ -1,7 +1,10 @@
+import streamlit as st
 import yfinance as yf
 import pandas as pd
 import numpy as np
-import matplotlib.pyplot as plt
+import plotly.graph_objects as go
+import plotly.express as px
+from plotly.subplots import make_subplots
 from datetime import datetime, timedelta
 import warnings
 import time
@@ -9,6 +12,14 @@ from typing import Dict, List, Tuple, Optional
 from dataclasses import dataclass
 
 warnings.filterwarnings('ignore')
+
+# Page config
+st.set_page_config(
+    page_title="Swing Trading Analyzer",
+    page_icon="📈",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
 
 @dataclass
 class SwingSignal:
@@ -38,8 +49,9 @@ class SwingTradingCore:
             'HEROMOTOCO.NS', 'EICHERMOT.NS', 'BRITANNIA.NS', 'DIVISLAB.NS', 'ADANIPORTS.NS'
         ]
         
-    def fetch_data(self, symbol: str, period: str = "6mo") -> Optional[pd.DataFrame]:
-        """Fetch stock data with error handling"""
+    @st.cache_data(ttl=300)  # Cache for 5 minutes
+    def fetch_data(_self, symbol: str, period: str = "6mo") -> Optional[pd.DataFrame]:
+        """Fetch stock data with caching"""
         try:
             stock = yf.Ticker(symbol)
             data = stock.history(period=period)
@@ -47,7 +59,7 @@ class SwingTradingCore:
                 return None
             return data
         except Exception as e:
-            print(f"Error fetching data for {symbol}: {e}")
+            st.error(f"Error fetching data for {symbol}: {e}")
             return None
     
     def calculate_swing_indicators(self, data: pd.DataFrame) -> pd.DataFrame:
@@ -295,206 +307,395 @@ class SwingTradingCore:
                 )
         return None
 
-class SwingTradingAnalyzer:
-    """Main application class for swing trading analysis"""
+# Initialize the core analyzer
+@st.cache_resource
+def get_analyzer():
+    return SwingTradingCore()
+
+def create_swing_chart(df: pd.DataFrame, symbol: str, signals: List[SwingSignal] = None):
+    """Create interactive swing trading chart"""
+    fig = make_subplots(
+        rows=4, cols=1,
+        shared_xaxes=True,
+        vertical_spacing=0.03,
+        subplot_titles=('Price & Indicators', 'RSI', 'MACD', 'Volume'),
+        row_width=[0.2, 0.1, 0.1, 0.1]
+    )
     
-    def __init__(self):
-        self.core = SwingTradingCore()
-        self.last_update = None
-        
-    def scan_market(self) -> List[SwingSignal]:
-        """Scan the market for swing trading opportunities"""
-        print("🔍 Scanning market for swing trading opportunities...")
-        print("=" * 60)
-        
-        all_signals = []
-        processed = 0
-        
-        for symbol in self.core.nifty_stocks:
-            try:
-                print(f"Analyzing {symbol}... ({processed + 1}/{len(self.core.nifty_stocks)})")
-                
-                data = self.core.fetch_data(symbol)
-                if data is None:
-                    continue
-                
-                df = self.core.calculate_swing_indicators(data)
-                signals = self.core.identify_swing_patterns(df, symbol)
-                
-                all_signals.extend(signals)
-                processed += 1
-                
-                # Small delay to avoid rate limiting
-                time.sleep(0.1)
-                
-            except Exception as e:
-                print(f"Error analyzing {symbol}: {e}")
-                continue
-        
-        # Sort by expected points (highest first)
-        all_signals.sort(key=lambda x: x.expected_points, reverse=True)
-        
-        print(f"\n✅ Scan completed! Analyzed {processed} stocks")
-        print(f"🎯 Found {len(all_signals)} swing opportunities")
-        
-        self.last_update = datetime.now()
-        return all_signals
+    # Price chart with candlesticks
+    fig.add_trace(go.Candlestick(
+        x=df.index,
+        open=df['Open'],
+        high=df['High'],
+        low=df['Low'],
+        close=df['Close'],
+        name='Price'
+    ), row=1, col=1)
     
-    def display_signals(self, signals: List[SwingSignal]):
-        """Display swing trading signals in a formatted way"""
-        if not signals:
-            print("\n❌ No swing trading opportunities found at the moment")
-            print("💡 Try again later or consider different market conditions")
-            return
-        
-        print(f"\n🚀 TOP SWING TRADING OPPORTUNITIES")
-        print("=" * 80)
-        
-        for i, signal in enumerate(signals[:10], 1):  # Show top 10
-            print(f"\n#{i} 📈 {signal.symbol.replace('.NS', '')}")
-            print(f"   Action: {signal.action}")
-            print(f"   Entry: ₹{signal.entry_price:.2f}")
-            print(f"   Target: ₹{signal.target_price:.2f}")
-            print(f"   Stop Loss: ₹{signal.stop_loss:.2f}")
-            print(f"   Expected Gain: {signal.expected_points:.0f} points")
-            print(f"   Risk:Reward: 1:{signal.risk_reward:.1f}")
-            print(f"   Confidence: {signal.confidence}")
-            print(f"   Timeframe: {signal.timeframe}")
-            print(f"   Reason: {signal.reason}")
-            print("-" * 50)
+    # Moving averages
+    fig.add_trace(go.Scatter(
+        x=df.index, y=df['EMA_20'],
+        line=dict(color='orange', width=2),
+        name='EMA 20'
+    ), row=1, col=1)
     
-    def create_detailed_analysis(self, symbol: str):
-        """Create detailed analysis for a specific stock"""
-        print(f"\n📊 DETAILED ANALYSIS: {symbol}")
-        print("=" * 50)
-        
-        data = self.core.fetch_data(symbol, period="3mo")
-        if data is None:
-            print("❌ Unable to fetch data")
-            return
-        
-        df = self.core.calculate_swing_indicators(data)
-        
-        # Current metrics
-        latest = df.iloc[-1]
-        current_price = latest['Close']
-        
-        print(f"Current Price: ₹{current_price:.2f}")
-        print(f"RSI: {latest['RSI']:.1f}")
-        print(f"EMA 20: ₹{latest['EMA_20']:.2f}")
-        print(f"EMA 50: ₹{latest['EMA_50']:.2f}")
-        print(f"Support: ₹{latest['Support']:.2f}")
-        print(f"Resistance: ₹{latest['Resistance']:.2f}")
-        print(f"Volume Ratio: {latest['Volume_Ratio']:.1f}x")
-        
-        # Plot analysis
-        self._plot_swing_analysis(df, symbol)
+    fig.add_trace(go.Scatter(
+        x=df.index, y=df['EMA_50'],
+        line=dict(color='blue', width=2),
+        name='EMA 50'
+    ), row=1, col=1)
     
-    def _plot_swing_analysis(self, df: pd.DataFrame, symbol: str):
-        """Create comprehensive swing trading chart"""
-        fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(15, 12))
-        
-        # Price chart with indicators
-        ax1.plot(df.index, df['Close'], label='Close Price', linewidth=2)
-        ax1.plot(df.index, df['EMA_20'], label='EMA 20', alpha=0.7)
-        ax1.plot(df.index, df['EMA_50'], label='EMA 50', alpha=0.7)
-        ax1.plot(df.index, df['Support'], label='Support', linestyle='--', alpha=0.5)
-        ax1.plot(df.index, df['Resistance'], label='Resistance', linestyle='--', alpha=0.5)
-        ax1.fill_between(df.index, df['BB_Lower'], df['BB_Upper'], alpha=0.1, label='Bollinger Bands')
-        
-        ax1.set_title(f'{symbol} - Swing Trading Analysis', fontsize=16, fontweight='bold')
-        ax1.legend()
-        ax1.grid(True, alpha=0.3)
-        
-        # RSI
-        ax2.plot(df.index, df['RSI'], color='orange', linewidth=2)
-        ax2.axhline(y=70, color='r', linestyle='--', alpha=0.7, label='Overbought')
-        ax2.axhline(y=30, color='g', linestyle='--', alpha=0.7, label='Oversold')
-        ax2.fill_between(df.index, 30, 70, alpha=0.1)
-        ax2.set_title('RSI (14)', fontweight='bold')
-        ax2.set_ylim(0, 100)
-        ax2.legend()
-        ax2.grid(True, alpha=0.3)
-        
-        # Volume
-        ax3.bar(df.index, df['Volume'], alpha=0.6, color='blue')
-        ax3.plot(df.index, df['Volume_SMA'], color='red', linewidth=2, label='Volume SMA')
-        ax3.set_title('Volume Analysis', fontweight='bold')
-        ax3.legend()
-        ax3.grid(True, alpha=0.3)
-        
-        plt.tight_layout()
-        plt.show()
+    # Bollinger Bands
+    fig.add_trace(go.Scatter(
+        x=df.index, y=df['BB_Upper'],
+        line=dict(color='gray', width=1, dash='dash'),
+        name='BB Upper'
+    ), row=1, col=1)
     
-    def run_live_scanner(self):
-        """Run continuous market scanner"""
-        print("🔴 LIVE SWING TRADING SCANNER")
-        print("=" * 40)
-        print("⏰ Scanning every 5 minutes...")
-        print("📊 Press Ctrl+C to stop")
-        
-        try:
-            while True:
-                signals = self.scan_market()
-                self.display_signals(signals)
-                
-                if signals:
-                    print(f"\n⏰ Last updated: {self.last_update.strftime('%H:%M:%S')}")
-                    print("💰 Top recommendations above target 200-500 points!")
-                
-                print("\n⏳ Next scan in 5 minutes...")
-                print("=" * 60)
-                
-                time.sleep(300)  # 5 minutes
-                
-        except KeyboardInterrupt:
-            print("\n🛑 Scanner stopped by user")
+    fig.add_trace(go.Scatter(
+        x=df.index, y=df['BB_Lower'],
+        line=dict(color='gray', width=1, dash='dash'),
+        name='BB Lower',
+        fill='tonexty',
+        fillcolor='rgba(128,128,128,0.1)'
+    ), row=1, col=1)
+    
+    # Support and Resistance
+    fig.add_trace(go.Scatter(
+        x=df.index, y=df['Support'],
+        line=dict(color='green', width=1, dash='dot'),
+        name='Support'
+    ), row=1, col=1)
+    
+    fig.add_trace(go.Scatter(
+        x=df.index, y=df['Resistance'],
+        line=dict(color='red', width=1, dash='dot'),
+        name='Resistance'
+    ), row=1, col=1)
+    
+    # RSI
+    fig.add_trace(go.Scatter(
+        x=df.index, y=df['RSI'],
+        line=dict(color='orange', width=2),
+        name='RSI'
+    ), row=2, col=1)
+    
+    fig.add_hline(y=70, line_dash="dash", line_color="red", row=2, col=1, annotation_text="Overbought")
+    fig.add_hline(y=30, line_dash="dash", line_color="green", row=2, col=1, annotation_text="Oversold")
+    
+    # MACD
+    fig.add_trace(go.Scatter(
+        x=df.index, y=df['MACD'],
+        line=dict(color='blue', width=2),
+        name='MACD'
+    ), row=3, col=1)
+    
+    fig.add_trace(go.Scatter(
+        x=df.index, y=df['MACD_Signal'],
+        line=dict(color='red', width=2),
+        name='MACD Signal'
+    ), row=3, col=1)
+    
+    fig.add_trace(go.Bar(
+        x=df.index, y=df['MACD_Histogram'],
+        name='MACD Histogram',
+        marker_color='gray'
+    ), row=3, col=1)
+    
+    # Volume
+    fig.add_trace(go.Bar(
+        x=df.index, y=df['Volume'],
+        name='Volume',
+        marker_color='lightblue'
+    ), row=4, col=1)
+    
+    fig.add_trace(go.Scatter(
+        x=df.index, y=df['Volume_SMA'],
+        line=dict(color='red', width=2),
+        name='Volume SMA'
+    ), row=4, col=1)
+    
+    # Add signal markers if provided
+    if signals:
+        for signal in signals:
+            fig.add_trace(go.Scatter(
+                x=[df.index[-1]],
+                y=[signal.entry_price],
+                mode='markers',
+                marker=dict(size=15, color='lime', symbol='triangle-up'),
+                name=f'{signal.action} Signal',
+                text=f'{signal.reason}'
+            ), row=1, col=1)
+    
+    fig.update_layout(
+        title=f'{symbol} - Swing Trading Analysis',
+        xaxis_rangeslider_visible=False,
+        height=800,
+        showlegend=True
+    )
+    
+    return fig
 
 def main():
-    """Main function to run the swing trading analyzer"""
-    analyzer = SwingTradingAnalyzer()
+    """Main Streamlit application"""
     
-    while True:
-        print("\n🎯 SWING TRADING ANALYZER")
-        print("=" * 40)
-        print("1. 🔍 Quick Market Scan")
-        print("2. 📊 Detailed Stock Analysis")
-        print("3. 🔴 Live Scanner (Auto-refresh)")
-        print("4. 📈 Market Overview")
-        print("5. ❌ Exit")
+    # Header
+    st.title("📈 Swing Trading Analyzer")
+    st.markdown("### Target: 200-500 Points Gain | Live Market Scanner")
+    
+    # Sidebar
+    with st.sidebar:
+        st.header("🔧 Controls")
         
-        choice = input("\nSelect option (1-5): ").strip()
+        # Mode selection
+        mode = st.selectbox(
+            "Select Mode",
+            ["Market Scanner", "Individual Analysis", "Live Dashboard"]
+        )
         
-        if choice == "1":
-            signals = analyzer.scan_market()
-            analyzer.display_signals(signals)
-            
-        elif choice == "2":
-            symbol = input("Enter stock symbol (e.g., RELIANCE.NS): ").strip().upper()
-            if not symbol.endswith('.NS'):
-                symbol += '.NS'
-            analyzer.create_detailed_analysis(symbol)
-            
-        elif choice == "3":
-            analyzer.run_live_scanner()
-            
-        elif choice == "4":
-            print("\n📈 NIFTY 50 SWING OPPORTUNITIES")
-            signals = analyzer.scan_market()
-            if signals:
-                high_confidence = [s for s in signals if s.confidence == "High"]
-                print(f"🎯 High Confidence Signals: {len(high_confidence)}")
-                print(f"📊 Total Opportunities: {len(signals)}")
-                print(f"💰 Average Expected Points: {np.mean([s.expected_points for s in signals]):.0f}")
-            
-        elif choice == "5":
-            print("👋 Thank you for using Swing Trading Analyzer!")
-            break
-            
-        else:
-            print("❌ Invalid choice. Please try again.")
+        # Stock selection for individual analysis
+        if mode == "Individual Analysis":
+            analyzer = get_analyzer()
+            selected_stock = st.selectbox(
+                "Select Stock",
+                analyzer.nifty_stocks,
+                format_func=lambda x: x.replace('.NS', '')
+            )
         
-        input("\nPress Enter to continue...")
+        # Filters
+        st.subheader("📊 Filters")
+        min_points = st.slider("Minimum Expected Points", 200, 1000, 200, 50)
+        confidence_filter = st.multiselect(
+            "Confidence Level",
+            ["High", "Medium"],
+            default=["High", "Medium"]
+        )
+        
+        # Auto-refresh for live mode
+        if mode == "Live Dashboard":
+            auto_refresh = st.checkbox("Auto Refresh (30s)", value=False)
+            if auto_refresh:
+                st.rerun()
+    
+    analyzer = get_analyzer()
+    
+    if mode == "Market Scanner":
+        st.header("🔍 Market Scanner Results")
+        
+        if st.button("🚀 Scan Market", type="primary"):
+            with st.spinner("Scanning NIFTY 50 stocks for swing opportunities..."):
+                progress_bar = st.progress(0)
+                status_text = st.empty()
+                
+                all_signals = []
+                
+                for i, symbol in enumerate(analyzer.nifty_stocks):
+                    status_text.text(f"Analyzing {symbol.replace('.NS', '')}...")
+                    progress_bar.progress((i + 1) / len(analyzer.nifty_stocks))
+                    
+                    try:
+                        data = analyzer.fetch_data(symbol)
+                        if data is not None and len(data) > 50:
+                            df = analyzer.calculate_swing_indicators(data)
+                            signals = analyzer.identify_swing_patterns(df, symbol)
+                            
+                            # Apply filters
+                            filtered_signals = [
+                                s for s in signals 
+                                if s.expected_points >= min_points and s.confidence in confidence_filter
+                            ]
+                            all_signals.extend(filtered_signals)
+                    except Exception as e:
+                        continue
+                
+                progress_bar.empty()
+                status_text.empty()
+                
+                # Sort by expected points
+                all_signals.sort(key=lambda x: x.expected_points, reverse=True)
+                
+                if all_signals:
+                    st.success(f"✅ Found {len(all_signals)} swing opportunities!")
+                    
+                    # Display results in cards
+                    for i, signal in enumerate(all_signals[:10]):  # Top 10
+                        with st.container():
+                            col1, col2, col3, col4 = st.columns([2, 2, 2, 2])
+                            
+                            with col1:
+                                confidence_color = "🟢" if signal.confidence == "High" else "🟡"
+                                st.metric(
+                                    f"{confidence_color} {signal.symbol.replace('.NS', '')}",
+                                    f"₹{signal.entry_price:.2f}",
+                                    f"{signal.action}"
+                                )
+                            
+                            with col2:
+                                st.metric(
+                                    "Expected Gain",
+                                    f"{signal.expected_points:.0f} pts",
+                                    f"₹{signal.target_price:.2f}"
+                                )
+                            
+                            with col3:
+                                st.metric(
+                                    "Risk:Reward",
+                                    f"1:{signal.risk_reward:.1f}",
+                                    f"SL: ₹{signal.stop_loss:.2f}"
+                                )
+                            
+                            with col4:
+                                st.metric(
+                                    "Timeframe",
+                                    signal.timeframe,
+                                    signal.confidence
+                                )
+                            
+                            st.caption(f"📝 {signal.reason}")
+                            st.divider()
+                else:
+                    st.warning("❌ No swing opportunities found matching your criteria")
+    
+    elif mode == "Individual Analysis":
+        st.header(f"📊 Detailed Analysis: {selected_stock.replace('.NS', '')}")
+        
+        with st.spinner("Loading stock data and analysis..."):
+            data = analyzer.fetch_data(selected_stock, period="3mo")
+            
+            if data is not None:
+                df = analyzer.calculate_swing_indicators(data)
+                signals = analyzer.identify_swing_patterns(df, selected_stock)
+                
+                # Apply filters
+                filtered_signals = [
+                    s for s in signals 
+                    if s.expected_points >= min_points and s.confidence in confidence_filter
+                ]
+                
+                # Display current metrics
+                latest = df.iloc[-1]
+                
+                col1, col2, col3, col4, col5 = st.columns(5)
+                
+                with col1:
+                    st.metric("Current Price", f"₹{latest['Close']:.2f}")
+                
+                with col2:
+                    rsi_color = "inverse" if latest['RSI'] > 70 or latest['RSI'] < 30 else "normal"
+                    st.metric("RSI", f"{latest['RSI']:.1f}", delta_color=rsi_color)
+                
+                with col3:
+                    st.metric("EMA 20", f"₹{latest['EMA_20']:.2f}")
+                
+                with col4:
+                    st.metric("Volume Ratio", f"{latest['Volume_Ratio']:.1f}x")
+                
+                with col5:
+                    st.metric("ATR", f"₹{latest['ATR']:.2f}")
+                
+                # Display signals
+                if filtered_signals:
+                    st.subheader("🎯 Swing Opportunities")
+                    for signal in filtered_signals:
+                        with st.expander(f"📈 {signal.action} Signal - {signal.expected_points:.0f} points"):
+                            col1, col2 = st.columns(2)
+                            
+                            with col1:
+                                st.write(f"**Entry Price:** ₹{signal.entry_price:.2f}")
+                                st.write(f"**Target Price:** ₹{signal.target_price:.2f}")
+                                st.write(f"**Stop Loss:** ₹{signal.stop_loss:.2f}")
+                            
+                            with col2:
+                                st.write(f"**Expected Points:** {signal.expected_points:.0f}")
+                                st.write(f"**Risk:Reward:** 1:{signal.risk_reward:.1f}")
+                                st.write(f"**Timeframe:** {signal.timeframe}")
+                                st.write(f"**Confidence:** {signal.confidence}")
+                            
+                            st.write(f"**Strategy:** {signal.reason}")
+                
+                # Display chart
+                fig = create_swing_chart(df, selected_stock, filtered_signals)
+                st.plotly_chart(fig, use_container_width=True)
+                
+            else:
+                st.error("Failed to load stock data")
+    
+    elif mode == "Live Dashboard":
+        st.header("🔴 Live Dashboard")
+        st.markdown("*Real-time swing trading opportunities*")
+        
+        # Auto-refresh mechanism
+        placeholder = st.empty()
+        
+        with placeholder.container():
+            with st.spinner("Loading live data..."):
+                all_signals = []
+                
+                # Quick scan of top 20 stocks
+                top_stocks = analyzer.nifty_stocks[:20]
+                
+                for symbol in top_stocks:
+                    try:
+                        data = analyzer.fetch_data(symbol)
+                        if data is not None and len(data) > 50:
+                            df = analyzer.calculate_swing_indicators(data)
+                            signals = analyzer.identify_swing_patterns(df, symbol)
+                            
+                            # Apply filters
+                            filtered_signals = [
+                                s for s in signals 
+                                if s.expected_points >= min_points and s.confidence in confidence_filter
+                            ]
+                            all_signals.extend(filtered_signals)
+                    except Exception:
+                        continue
+                
+                all_signals.sort(key=lambda x: x.expected_points, reverse=True)
+                
+                # Display dashboard
+                col1, col2, col3 = st.columns(3)
+                
+                with col1:
+                    st.metric("Active Signals", len(all_signals))
+                
+                with col2:
+                    high_conf_signals = [s for s in all_signals if s.confidence == "High"]
+                    st.metric("High Confidence", len(high_conf_signals))
+                
+                with col3:
+                    avg_points = np.mean([s.expected_points for s in all_signals]) if all_signals else 0
+                    st.metric("Avg Expected Points", f"{avg_points:.0f}")
+                
+                # Top 5 opportunities
+                if all_signals:
+                    st.subheader("🚀 Top 5 Opportunities")
+                    
+                    for signal in all_signals[:5]:
+                        with st.container():
+                            col1, col2, col3 = st.columns([2, 2, 3])
+                            
+                            with col1:
+                                confidence_emoji = "🟢" if signal.confidence == "High" else "🟡"
+                                st.write(f"**{confidence_emoji} {signal.symbol.replace('.NS', '')}**")
+                                st.write(f"Entry: ₹{signal.entry_price:.2f}")
+                            
+                            with col2:
+                                st.write(f"**{signal.expected_points:.0f} points**")
+                                st.write(f"Target: ₹{signal.target_price:.2f}")
+                            
+                            with col3:
+                                st.write(f"*{signal.reason}*")
+                                st.write(f"RR: 1:{signal.risk_reward:.1f} | {signal.timeframe}")
+                            
+                            st.divider()
+                else:
+                    st.info("⏳ No opportunities found. Market conditions may not be favorable for swing trading.")
+                
+                st.caption(f"Last updated: {datetime.now().strftime('%H:%M:%S')}")
+    
+    # Footer
+    st.markdown("---")
+    st.markdown("**⚠️ Disclaimer:** This is for educational purposes only. Always do your own research before trading.")
 
 if __name__ == "__main__":
     main()
