@@ -1,14 +1,17 @@
-# Advanced Nifty 50 Screener & Swing Trading System (No TA-Lib, No pandas-ta)
+# Advanced Nifty 50 Stock Screener & Swing Trading System
+# No TA-Lib or pandas-ta dependencies
+# Streamlit app with custom indicators, backtest & AI rating
+
 import streamlit as st
 import yfinance as yf
 import numpy as np
 import pandas as pd
-import plotly.graph_objects as go
+import plotly.graph_objs as go
 import matplotlib.pyplot as plt
 import seaborn as sns
 from datetime import datetime, timedelta
 
-###################### CONFIG/TICKERS #########################
+# ==================== CONFIG ======================
 
 NIFTY50 = [
     'ADANIPORTS.NS','APOLLOHOSP.NS','ASIANPAINT.NS','AXISBANK.NS','BAJAJ-AUTO.NS','BAJFINANCE.NS',
@@ -23,52 +26,73 @@ NIFTY50 = [
 START_DATE = (datetime.now() - timedelta(days=365*10)).strftime('%Y-%m-%d')
 END_DATE = datetime.now().strftime('%Y-%m-%d')
 
-###################### INDICATORS ######################
+# Profit target and stop loss points (fixed points, not %)
+PROFIT_TARGET_POINTS = 100  # target profit points
+STOP_LOSS_POINTS = 50       # stop loss points
+
+# Capital and Position Settings
+INITIAL_CAPITAL = 100000
+POSITION_SIZE_PCT = 0.1    # 10% capital per trade
+
+
+# ======================== INDICATORS ===========================
 
 def sma(series, period):
+    """Simple Moving Average"""
     return series.rolling(window=period, min_periods=period).mean()
 
 def rsi(series, period=14):
+    """Relative Strength Index calculation"""
     delta = series.diff()
-    up = delta.where(delta > 0, 0)
-    down = -delta.where(delta < 0, 0)
-    roll_up = up.rolling(period, min_periods=period).mean()
-    roll_down = down.rolling(period, min_periods=period).mean()
-    rs = roll_up / roll_down
-    result = 100 - 100 / (1 + rs)
-    return result
+    gain = delta.where(delta > 0, 0).rolling(window=period, min_periods=period).mean()
+    loss = -delta.where(delta < 0, 0).rolling(window=period, min_periods=period).mean()
+    rs = gain / loss
+    rsi_val = 100 - (100 / (1 + rs))
+    return rsi_val
 
 def macd(series):
+    """MACD and signal line"""
     ema12 = series.ewm(span=12, adjust=False).mean()
     ema26 = series.ewm(span=26, adjust=False).mean()
     macd_line = ema12 - ema26
-    signal = macd_line.ewm(span=9, adjust=False).mean()
-    return macd_line, signal
+    signal_line = macd_line.ewm(span=9, adjust=False).mean()
+    return macd_line, signal_line
 
 def bollinger_bands(series, period=20, n_std=2):
+    """Bollinger Bands"""
     sma_ = series.rolling(window=period, min_periods=period).mean()
     std = series.rolling(window=period, min_periods=period).std()
-    upper = sma_ + n_std * std
-    lower = sma_ - n_std * std
+    upper = sma_ + (n_std * std)
+    lower = sma_ - (n_std * std)
     return lower, sma_, upper
 
 def momentum(series, period):
+    """Momentum percentage over time period"""
     return 100 * (series / series.shift(period) - 1)
 
-###################### FETCH & CACHE DATA ######################
+
+# ======================= DATA FETCH & CACHE =========================
+
 @st.cache_data(show_spinner=False)
 def fetch_history(ticker, start, end):
+    """Fetch historical data for ticker using yfinance"""
     try:
         df = yf.download(ticker, start=start, end=end, progress=False)
+        if df.empty:
+            return None
         df = df.loc[~df.index.duplicated()]
         df = df[['Open','High','Low','Close','Volume']]
         df.index = pd.to_datetime(df.index)
         return df
-    except Exception as e:
+    except Exception:
         return None
 
-###################### FEATURE ENGINEERING ######################
+
+# ======================= FEATURE ENGINEERING =========================
+
 def add_indicators(df):
+    """Calculate all required technical indicators and add to dataframe"""
+    df = df.copy()
     df['SMA20'] = sma(df['Close'], 20)
     df['SMA50'] = sma(df['Close'], 50)
     df['SMA200'] = sma(df['Close'], 200)
@@ -76,307 +100,471 @@ def add_indicators(df):
     df['MACD'], df['MACD_SIGNAL'] = macd(df['Close'])
     df['BB_LOWER'], df['BB_MID'], df['BB_UPPER'] = bollinger_bands(df['Close'], 20, 2)
     df['VOL_MA20'] = sma(df['Volume'], 20)
+    # Correct assignment: single Series to single column
     df['VOLUME_RATIO'] = df['Volume'] / df['VOL_MA20']
     df['MOMENTUM5'] = momentum(df['Close'], 5)
     df['MOMENTUM10'] = momentum(df['Close'], 10)
     return df
 
-######################### SCORING ENGINE ############################
 
-def ai_rating(row):
-    """Returns (score, reasons:str)"""
-    score = 0
-    reasons = []
-    # Technical
-    if row['Close'] > row['SMA50']: score += 1; reasons.append("Price > 50SMA")
-    if row['SMA50'] > row['SMA200']: score += 1; reasons.append("50SMA > 200SMA")
-    if 30 <= row['RSI14'] <= 70: score += 1; reasons.append("RSI between 30-70")
-    if row['VOLUME_RATIO'] > 1.2: score += 1; reasons.append("High Vol")
-    # Momentum
-    if row['MOMENTUM5'] > 2: score += 2; reasons.append("Strong 5D Momentum")
-    elif row['MOMENTUM5'] > 0: score += 1; reasons.append("Mild 5D Momentum")
-    # Entry Match
-    entryconds = get_entry_conditions(row)
-    if sum(entryconds.values()) >= 6: score += 2; reasons.append("6+ Entry Signals")
-    elif sum(entryconds.values()) >= 4: score += 1; reasons.append("4-5 Entry Signals")
-    # Risk-reward: Dummy; For live, should compare ATR/target
-    rr = 4/2 if row['Close']!=0 else 1
-    if rr >= 2: score += 2; reasons.append("Risk/reward ≥2:1")
-    elif rr >= 1.5: score += 1; reasons.append("Risk/reward ≥1.5:1")
-    return min(score, 10), '; '.join(reasons)
+# ====================== TRADING STRATEGY CONDITIONS ====================
 
 def get_entry_conditions(row):
-    """Return dict of bools for the 7 strategy entry criteria."""
+    """Dictionary of entry conditions - 7 boolean criteria"""
     return {
-        'Close > SMA50': row['Close'] > row['SMA50'],
+        'Price > 50SMA': row['Close'] > row['SMA50'],
         '50SMA > 200SMA': row['SMA50'] > row['SMA200'],
-        '40<RSI<65': 40 <= row['RSI14'] <= 65,
-        'Vol > 1.2x avg': row['VOLUME_RATIO'] > 1.2,
-        'Momentum5 > 1%': row['MOMENTUM5'] > 1,
-        'Close > BB_lower': row['Close'] > row['BB_LOWER'],
-        'MACD > Signal': row['MACD'] > row['MACD_SIGNAL'],
+        'RSI between 40-65': 40 <= row['RSI14'] <= 65,
+        'Volume > 1.2x avg': row['VOLUME_RATIO'] > 1.2,
+        '5D Momentum > 1%': row['MOMENTUM5'] > 1,
+        'Price > Lower BB': row['Close'] > row['BB_LOWER'],
+        'MACD > Signal': row['MACD'] > row['MACD_SIGNAL']
     }
 
 def get_exit_conditions(row):
-    """Return dict of bools for the exit criteria."""
+    """Dictionary of exit conditions - any triggers exit"""
     return {
-        'Close < SMA50': row['Close'] < row['SMA50'],
+        'Price < 50SMA': row['Close'] < row['SMA50'],
         'RSI > 75': row['RSI14'] > 75,
         'RSI < 30': row['RSI14'] < 30,
-        'Close < BB_lower': row['Close'] < row['BB_LOWER'],
-        'MACD < Signal': row['MACD'] < row['MACD_SIGNAL'],
+        'Price < Lower BB': row['Close'] < row['BB_LOWER'],
+        'MACD < Signal': row['MACD'] < row['MACD_SIGNAL']
     }
 
-######################### BACKTESTING ##############################
-def backtest(df, capital=100000, position_pct=0.1, sl_pct=0.02, tp_pct=0.04, verbose=False):
-    """Return: trades_df, perf_metrics dict."""
-    trade_log = []
+
+# ======================= AI RATING SYSTEM ===============================
+
+def ai_rating(row):
+    """
+    Calculate AI-powered rating (0-10 scale) with detailed reasons.
+    """
+    score = 0
+    reasons = []
+
+    # Technical Score (4 points)
+    if row['Close'] > row['SMA50']:
+        score += 1
+        reasons.append("Price > 50 SMA")
+    if row['SMA50'] > row['SMA200']:
+        score += 1
+        reasons.append("50 SMA > 200 SMA")
+    if 30 <= row['RSI14'] <= 70:
+        score += 1
+        reasons.append("RSI in (30-70)")
+    if row['VOLUME_RATIO'] > 1.2:
+        score += 1
+        reasons.append("Volume > 1.2x avg")
+
+    # Momentum Score (2 points)
+    if row['MOMENTUM5'] > 2:
+        score += 2
+        reasons.append("Strong Momentum (>2%)")
+    elif row['MOMENTUM5'] > 0:
+        score += 1
+        reasons.append("Moderate Momentum (>0%)")
+
+    # Signal Strength Score (2 points)
+    entry_conditions = get_entry_conditions(row)
+    met = sum(entry_conditions.values())
+    if met >= 6:
+        score += 2
+        reasons.append("6+ Entry conditions met")
+    elif 4 <= met <= 5:
+        score += 1
+        reasons.append("4-5 Entry conditions met")
+
+    # Risk-Reward Score (2 points)
+    # Rough estimate: R:R = 100 target pts / 50 stop loss pts = 2:1
+    rr = PROFIT_TARGET_POINTS / STOP_LOSS_POINTS
+    if rr >= 2:
+        score += 2
+        reasons.append("Risk-Reward ≥ 2:1")
+    elif rr >= 1.5:
+        score += 1
+        reasons.append("Risk-Reward ≥ 1.5:1")
+
+    return min(score, 10), "; ".join(reasons)
+
+
+# ======================= BACKTESTING ENGINE ===============================
+
+def backtest(df, capital=INITIAL_CAPITAL, position_pct=POSITION_SIZE_PCT,
+             sl_points=STOP_LOSS_POINTS, tp_points=PROFIT_TARGET_POINTS, verbose=False):
+    """
+    Backtest using supplied strategy:
+    - Entry: 5 out of 7 conditions met
+    - Exit: Any 1 condition met OR SL/TP hit OR end of data
+    - Positions taken at next day open price
+    - Stop loss and target use fixed points (not %)
+    - Position size = position_pct * cash, units rounded down
+    Returns trade log dataframe and performance metrics dictionary
+    """
+    df = df.copy()
+    trades = []
     position = 0
-    entry_idx = None
-    entry_price = 0
-    trade_capital = 0
+    entry_price = None
+    entry_index = None
     cash = capital
 
-    for idx in range(50, len(df)-1):
-        row = df.iloc[idx]
-        nxt_row = df.iloc[idx+1]
-        conds = get_entry_conditions(row)
-        entry_ok = sum(conds.values()) >= 5
-        if position == 0 and entry_ok:
-            # Open new position (assume at next day's open)
-            entry_idx = idx+1
-            entry_price = df.iloc[entry_idx]['Open']
-            trade_capital = min(cash * position_pct, cash)
-            units = trade_capital // entry_price
-            stop_loss = entry_price * (1-sl_pct)
-            target = entry_price * (1+tp_pct)
-            position = units
-            if verbose: print(f"Open position {entry_idx} at {entry_price:.2f}")
-            continue
+    for i in range(50, len(df) - 1):  # start after max indicator lookback
+        row = df.iloc[i]
+        next_row = df.iloc[i + 1]
 
-        if position > 0:
-            exit = False
+        # Entry logic
+        if position == 0:
+            entries = get_entry_conditions(row)
+            if sum(entries.values()) >= 5:
+                # Calculate position size
+                position_size_cash = cash * position_pct
+                open_price = next_row['Open']
+                units = int(position_size_cash // open_price)
+                if units == 0:
+                    continue
+                position = units
+                entry_price = open_price
+                entry_index = i + 1
+                stop_loss = entry_price - sl_points
+                target = entry_price + tp_points
+                if verbose:
+                    print(f"Entry at {entry_price} on {df.index[entry_index]}, position: {position}")
+                continue
+
+        else:
+            # Exit logic — check exit conditions on next row
+            exit_reasons = get_exit_conditions(next_row)
+
+            # Stop loss or target hit
+            low_next = next_row['Low']
+            high_next = next_row['High']
+
+            exit_signal = any(exit_reasons.values()) or \
+                          (low_next <= stop_loss) or \
+                          (high_next >= target) or \
+                          (i + 2 == len(df))
+
+            # Determine reason
             reason = ""
-            hold_days = idx - entry_idx
-            row_next = nxt_row
-            # Exit logic:
-            if entry_idx and hold_days >= 1:
-                # Exit conditions (on next day's close)
-                ex_conds = get_exit_conditions(row_next)
-                exit = any(ex_conds.values())
-                if exit: reason = "Signal"
-                # Stoploss/target
-                if row_next['Low'] <= stop_loss:
-                    exit = True; reason = "Stop Loss"
-                if row_next['High'] >= target:
-                    exit = True; reason = "Target Hit"
-                # Last day
-                if idx+2 == len(df): exit = True; reason = "EndOfPeriod"
-            # Exit!
-            if exit:
-                exit_price = row_next['Close']
+            if any(exit_reasons.values()):
+                reason = "Exit Signal"
+            if low_next <= stop_loss:
+                reason = "Stop Loss Hit"
+            if high_next >= target:
+                reason = "Target Hit"
+            if (i + 2 == len(df)):
+                reason = "End of Data"
+
+            if exit_signal:
+                exit_price = next_row['Close']
                 pnl = (exit_price - entry_price) * position
                 ret_pct = (exit_price - entry_price) / entry_price * 100
+                trade_days = (df.index[i+1] - df.index[entry_index]).days
                 cash += pnl
-                trade_log.append({
-                    'Entry Date': df.index[entry_idx],
-                    'Exit Date': df.index[idx+1],
+                trades.append({
+                    'Entry Date': df.index[entry_index],
+                    'Exit Date': df.index[i + 1],
                     'Entry Price': entry_price,
                     'Exit Price': exit_price,
+                    'Units': position,
                     'P/L': pnl,
                     'P/L %': ret_pct,
                     'Reason': reason,
-                    'Hold Days': hold_days
+                    'Duration (days)': trade_days
                 })
-                position=0; entry_idx=None; entry_price=0
-                continue
+                if verbose:
+                    print(f"Exit at {exit_price} on {df.index[i+1]} Reason: {reason} PnL: {pnl}")
+                position = 0
+                entry_price = None
+                entry_index = None
 
-    trades = pd.DataFrame(trade_log)
-    # Metrics
-    if not trades.empty:
-        winrate = (trades['P/L'] > 0).mean()*100
-        total_return = (cash-capital)/capital*100
-        perf = dict(
-            Trades=len(trades),
-            WinRate=f"{winrate:.1f}%",
-            TotReturn=f"{total_return:.1f}%",
-            AvgPL=trades['P/L'].mean().round(1) if len(trades)>0 else 0,
-            MaxPL=trades['P/L'].max().round(1),
-            MinPL=trades['P/L'].min().round(1),
-            AvgDur=f"{trades['Hold Days'].mean():.1f}",
-            PF = f"{trades[trades['P/L']>0]['P/L'].sum()/abs(trades[trades['P/L']<0]['P/L'].sum()) if trades[trades['P/L']<0]['P/L'].sum() !=0 else 'N/A'}",
-            FinalCapital=int(cash)
-        )
+    trades_df = pd.DataFrame(trades)
+    # Performance metrics
+    if not trades_df.empty:
+        wins = trades_df[trades_df['P/L'] > 0]
+        losses = trades_df[trades_df['P/L'] <= 0]
+        win_rate = len(wins) / len(trades_df) * 100
+        total_return = (cash - capital) / capital * 100
+        avg_pl = trades_df['P/L'].mean()
+        max_profit = trades_df['P/L'].max()
+        max_loss = trades_df['P/L'].min()
+        avg_duration = trades_df['Duration (days)'].mean()
+        gross_profit = wins['P/L'].sum()
+        gross_loss = losses['P/L'].sum()
+        profit_factor = gross_profit / abs(gross_loss) if gross_loss != 0 else np.nan
+
+        perf = {
+            'Trades': len(trades_df),
+            'Win Rate': f"{win_rate:.1f}%",
+            'Total Return (%)': f"{total_return:.1f}%",
+            'Avg P/L': f"{avg_pl:.2f}",
+            'Max Profit': f"{max_profit:.2f}",
+            'Max Loss': f"{max_loss:.2f}",
+            'Avg Duration (days)': f"{avg_duration:.1f}",
+            'Profit Factor': f"{profit_factor:.2f}",
+            'Final Capital': int(cash)
+        }
     else:
-        perf = dict(Trades=0, WinRate="0%", TotReturn="0%", AvgPL=0, MaxPL=0, MinPL=0, AvgDur=0, PF=0, FinalCapital=int(cash))
-    return trades, perf
+        perf = {
+            'Trades': 0,
+            'Win Rate': "0%",
+            'Total Return (%)': "0%",
+            'Avg P/L': "0",
+            'Max Profit': "0",
+            'Max Loss': "0",
+            'Avg Duration (days)': "0",
+            'Profit Factor': "0",
+            'Final Capital': int(cash)
+        }
+    return trades_df, perf
 
-###################### HEATMAP & VISUALIZATION ###################
+
+# ======================== VISUALIZATIONS =============================
+
 def monthly_returns_heatmap(df):
-    mrets = df['Close'].resample('M').last().pct_change().to_frame('Returns')
+    """Monthly returns heatmap plotted using seaborn"""
+    mrets = df['Close'].resample('M').last().pct_change()
+    mrets = mrets.to_frame('Returns')
     mrets['Year'] = mrets.index.year
     mrets['Month'] = mrets.index.strftime('%b')
     pivot = mrets.pivot(index='Year', columns='Month', values='Returns').fillna(0)
-    # Order months
-    months = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec']
-    pivot = pivot[months]
-    fig, ax = plt.subplots(figsize=(10,5))
-    sns.heatmap(pivot*100, annot=True, fmt=".1f", cmap='RdYlGn', center=0, ax=ax,
-        cbar_kws={'label':'% Return'})
-    ax.set_title("Monthly Returns Heatmap")
-    st.pyplot(fig)
+    months_order = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec']
+    pivot = pivot[months_order]
+
+    plt.figure(figsize=(10, 5))
+    sns.heatmap(pivot*100, annot=True, fmt=".1f", cmap='RdYlGn', center=0, cbar_kws={'label':'% Return'})
+    plt.title("Monthly Returns Heatmap")
+    plt.ylabel("Year")
+    plt.xlabel("Month")
+    st.pyplot(plt)
 
 def quarterly_returns_heatmap(df):
-    qrets = df['Close'].resample('Q').last().pct_change().to_frame('Returns')
+    """Quarterly returns heatmap plotted using seaborn"""
+    qrets = df['Close'].resample('Q').last().pct_change()
+    qrets = qrets.to_frame('Returns')
     qrets['Year'] = qrets.index.year
-    qrets['Q'] = qrets.index.quarter
-    pivot = qrets.pivot(index='Year', columns='Q', values='Returns').fillna(0)
-    fig, ax = plt.subplots(figsize=(6,5))
-    sns.heatmap(pivot*100, annot=True, fmt=".1f", cmap='RdYlGn', center=0, ax=ax,
-        cbar_kws={'label':'% Return'})
-    ax.set_title("Quarterly Returns Heatmap")
-    st.pyplot(fig)
+    qrets['Quarter'] = qrets.index.quarter
+    pivot = qrets.pivot(index='Year', columns='Quarter', values='Returns').fillna(0)
+
+    plt.figure(figsize=(7, 5))
+    sns.heatmap(pivot*100, annot=True, fmt=".1f", cmap='RdYlGn', center=0, cbar_kws={'label':'% Return'})
+    plt.title("Quarterly Returns Heatmap")
+    plt.ylabel("Year")
+    plt.xlabel("Quarter")
+    st.pyplot(plt)
 
 def plot_interactive_chart(df, trades=None):
+    """Interactive candlestick plot with SMAs and trades annotations"""
     fig = go.Figure()
+
+    # Price candlestick
     fig.add_trace(go.Candlestick(
-        x=df.index,open=df['Open'],high=df['High'],low=df['Low'],close=df['Close'],name='Price'))
+        x=df.index, open=df['Open'], high=df['High'], low=df['Low'], close=df['Close'],
+        name='Price'))
+
+    # SMAs
     fig.add_trace(go.Scatter(x=df.index, y=df['SMA20'], line=dict(color='blue', width=1), name='SMA20'))
     fig.add_trace(go.Scatter(x=df.index, y=df['SMA50'], line=dict(color='orange', width=1), name='SMA50'))
     fig.add_trace(go.Scatter(x=df.index, y=df['SMA200'], line=dict(color='green', width=1), name='SMA200'))
+
+    # Entry/Exit trade markers
     if trades is not None and not trades.empty:
         fig.add_trace(go.Scatter(
-            x=trades['Entry Date'], y=trades['Entry Price'], mode='markers', marker=dict(symbol='triangle-up', color='green', size=10), name='Buy'))
+            x=trades['Entry Date'], y=trades['Entry Price'],
+            mode='markers', marker_symbol='triangle-up', marker_color='green',
+            marker_size=10, name='Buy'))
         fig.add_trace(go.Scatter(
-            x=trades['Exit Date'], y=trades['Exit Price'], mode='markers', marker=dict(symbol='triangle-down', color='red', size=10), name='Sell'))
-    fig.update_layout(title='Price Chart', xaxis_title="Date", yaxis_title="Price", height=500)
+            x=trades['Exit Date'], y=trades['Exit Price'],
+            mode='markers', marker_symbol='triangle-down', marker_color='red',
+            marker_size=10, name='Sell'))
+
+    fig.update_layout(title='Price Chart with SMAs and Trades', xaxis_title='Date', yaxis_title='Price', height=550)
     st.plotly_chart(fig, use_container_width=True)
 
 def plot_rsi(df):
+    """RSI plot with overbought and oversold levels"""
     fig = go.Figure()
-    fig.add_trace(go.Scatter(x=df.index, y=df['RSI14'], line=dict(color='purple')))
-    fig.add_hline(y=70, line_dash='dot', line_color='red')
-    fig.add_hline(y=30, line_dash='dot', line_color='green')
-    fig.update_layout(title='RSI (14)', height=200, yaxis_range=[0,100])
+    fig.add_trace(go.Scatter(x=df.index, y=df['RSI14'], line=dict(color='purple'), name='RSI 14'))
+    fig.add_hline(y=70, line_dash='dash', line_color='red', annotation_text='Overbought', annotation_position='top left')
+    fig.add_hline(y=30, line_dash='dash', line_color='green', annotation_text='Oversold', annotation_position='bottom left')
+    fig.update_layout(title='RSI (14)', yaxis_range=[0, 100], height=250)
     st.plotly_chart(fig, use_container_width=True)
 
 def plot_volume(df):
+    """Volume with 20-day moving average"""
     fig = go.Figure()
     fig.add_trace(go.Bar(x=df.index, y=df['Volume'], name='Volume'))
-    fig.add_trace(go.Scatter(x=df.index, y=df['VOL_MA20'], line=dict(color='orange'), name='Vol MA 20'))
-    fig.update_layout(title='Volume', height=200)
+    fig.add_trace(go.Scatter(x=df.index, y=df['VOL_MA20'], line=dict(color='orange', width=2), name='Volume MA 20'))
+    fig.update_layout(title='Volume', height=250)
     st.plotly_chart(fig, use_container_width=True)
 
-########################## UI / MAIN ###########################
+
+# ======================== STREAMLIT APP UI ==============================
+
 st.set_page_config(layout="wide", page_title="Nifty 50 Advanced Stock Screener")
+
 sidebar = st.sidebar
+sidebar.title("Nifty 50 Screener & Swing Trading System")
 
-sidebar.title("Nifty 50 Pro Screener & Swing System")
-
-tab1, tab2, tab3 = st.tabs(["Complete Stock Analysis", "Live Trading Signals", "Portfolio Scanner"])
-
-################ MAIN TAB 1: PER STOCK #######################
-with tab1:
-    st.header("Single Stock - 10 Year Analysis")
-    ticker = st.selectbox("Select stock", NIFTY50, index=0, key="tab1_ticker")
-    df = fetch_history(ticker, START_DATE, END_DATE)
-    if df is None or df.empty:
-        st.warning(f"Failed to fetch data for {ticker}")
-    else:
-        df = add_indicators(df)
-        st.subheader("Monthly Returns Heatmap")
-        monthly_returns_heatmap(df)
-        st.subheader("Quarterly Returns Heatmap")
-        quarterly_returns_heatmap(df)
-        st.subheader("Interactive Chart with Signals")
-        trades, perf = backtest(df.copy())
-        plot_interactive_chart(df, trades)
-        with st.expander("RSI & Volume"):
-            plot_rsi(df)
-            plot_volume(df)
-        st.markdown("**Backtest Performance**")
-        st.write(perf)
-        st.download_button("Download Trade Log", data=trades.to_csv(index=False), file_name=f"{ticker}_trades.csv")
-
-################ MAIN TAB 2: SCANNER #######################
-with tab2:
-    st.header("Scanner & Live Signals – Nifty 50")
-    scan_mode = sidebar.radio("Scan Mode", options=['Quick (10)', 'Full (50)', 'High Rating Only (8+)'], index=1)
-    min_rating = sidebar.slider("Min AI Rating", value=0, min_value=0, max_value=10, step=1)
-    st.write("Scanning stocks. Please wait...")
-    result_rows = []
-    tickers = NIFTY50 if scan_mode != "Quick (10)" else NIFTY50[:10]
-    progress = st.progress(0.0)
-    for i, t in enumerate(tickers):
-        d = fetch_history(t, START_DATE, END_DATE)
-        if d is None or d.empty: continue
-        d = add_indicators(d)
-        row = d.iloc[-1]
-        score, reasons = ai_rating(row)
-        entrymatch = sum(get_entry_conditions(row).values())
-        signal = "ENTRY!" if entrymatch >= 5 else ""
-        result_rows.append({
-            "Stock": t,
-            "Price": row['Close'],
-            "Rating": score,
-            "EntrySignals": entrymatch,
-            "Signal": signal,
-            "VolumeRatio": row['VOLUME_RATIO'],
-            "Mom5": row['MOMENTUM5'],
-            "Reasons": reasons
-        })
-        progress.progress((i+1)/len(tickers))
-    result_df = pd.DataFrame(result_rows)
-    if not result_df.empty:
-        result_df = result_df[result_df['Rating']>=min_rating]
-        result_df = result_df.sort_values(by='Rating', ascending=False)
-        st.dataframe(result_df[['Stock','Price','Rating','Signal','Reasons','VolumeRatio','Mom5']], height=600)
-        st.download_button("Download Scanner Results", data=result_df.to_csv(index=False), file_name="scanner.csv")
-
-################ MAIN TAB 3: COMPARISON / PORTFOLIO ############
-with tab3:
-    st.header("Portfolio & Multi-Stock Scanner")
-    st.markdown("Analyze a portfolio (choose stocks, time period and capital):")
-    selected = st.multiselect("Select stocks", NIFTY50, default=NIFTY50[:5], key="tab3sel")
-    port_cap = st.number_input("Initial Capital", value=100000, min_value=10000, step=10000)
-    summary = []
-    for t in selected:
-        d = fetch_history(t, START_DATE, END_DATE)
-        if d is None or d.empty: continue
-        d = add_indicators(d)
-        trades, perf = backtest(d, port_cap/len(selected))
-        summary.append({'Stock': t, **perf})
-    if summary:
-        portdf = pd.DataFrame(summary)
-        st.dataframe(portdf)
-        fig = go.Figure()
-        fig.add_trace(go.Bar(x=portdf['Stock'], y=portdf['TotReturn'].astype(float), name='TotalReturn'))
-        st.plotly_chart(fig)
-        st.download_button("Download Portfolio Results", data=portdf.to_csv(index=False), file_name="portfolio.csv")
-
-################ SIDEBAR DOCS ############################
-with sidebar.expander("ℹ️ Strategy Logic & Help", expanded=False):
+# Sidebar documentation/help 
+with sidebar.expander("ℹ️ Strategy Logic & Help", expanded=True):
     st.markdown("""
-**System Logic:**  
-- 7 strategy entry conditions, 5 required for actual buy signal  
-- Sophisticated technical & momentum indicators  
-- AI-powered 0-10 rating system (see Scanner)  
-- Advanced backtesting and risk management  
-- Institutional-quality visualizations and export
-
-**Backtest Rules:**  
-- Trade size: 10% of capital; Stoploss 2%, target 4%  
-- Validated—no future data leakage.
-
-**Modules:**  
-- Analysis: per-stock 10-year review, with all signals/visuals  
-- Live Scanner: all Nifty 50, instant table and filter/sort  
-- Portfolio: compare stocks' overall performance on your allocation
-
-**Exports:**  
-- Download logs/tables for review in Excel
+    ### Strategy Logic
+    - **Entry:** 5 of 7 conditions required:
+      - Price > 50 SMA
+      - 50 SMA > 200 SMA
+      - RSI between 40-65
+      - Volume > 1.2x 20-day avg
+      - 5-Day Momentum > 1%
+      - Price above lower Bollinger Band
+      - MACD above Signal Line
+    - **Exit:** Any 1 condition triggers exit:
+      - Price < 50 SMA
+      - RSI > 75 (overbought)
+      - RSI < 30 (oversold)
+      - Price < lower Bollinger Band
+      - MACD below Signal Line
+    - **Risk Management:**
+      - Fixed stop loss: 50 points
+      - Profit target: 100 points
+      - Position size: 10% capital
+    - **AI Rating (0-10):**
+      - Based on technicals, momentum, entry conditions & risk-reward
     """)
 
-######################### END #############################
+# Tabs for main modules
+tab1, tab2, tab3 = st.tabs(["Complete Stock Analysis", "Live Trading Signals", "Portfolio Scanner"])
 
-# Optional for production: requirements.txt includes streamlit, yfinance, numpy, pandas, matplotlib, seaborn, plotly
+######################## TAB 1: Complete Stock Analysis #############################
+with tab1:
+    st.header("Single Stock 10-Year Analysis & Backtesting")
+
+    stock = st.selectbox("Select Stock for Analysis", NIFTY50, index=0)
+
+    df = fetch_history(stock, START_DATE, END_DATE)
+
+    if df is None:
+        st.warning("Failed to fetch data for the selected stock.")
+    else:
+        df = add_indicators(df)
+
+        st.subheader("Monthly Returns Heatmap")
+        monthly_returns_heatmap(df)
+
+        st.subheader("Quarterly Returns Heatmap")
+        quarterly_returns_heatmap(df)
+
+        st.subheader("Backtesting with Strategy")
+
+        trades, perf = backtest(df)
+
+        plot_interactive_chart(df, trades)
+
+        with st.expander("RSI and Volume Charts"):
+            plot_rsi(df)
+            plot_volume(df)
+
+        st.markdown("**Backtest Performance Summary:**")
+        st.table(pd.DataFrame([perf]))
+
+        if not trades.empty:
+            st.markdown("**Trade Log:**")
+            st.dataframe(trades)
+
+            csv_trades = trades.to_csv(index=False).encode('utf-8')
+            st.download_button("Download Trade Log CSV", csv_trades, file_name=f"{stock}_trade_log.csv")
+
+######################## TAB 2: Live Trading Signals & Scanner #############################
+with tab2:
+    st.header("Live Trading Signals & Scanner - Nifty 50")
+
+    scan_mode = st.radio("Select Scan Mode", ['Quick (10 Stocks)', 'Full (50 Stocks)', 'High Rating Only (8+)'], index=1)
+
+    min_rating = st.slider("Minimum AI Rating Filter", min_value=0, max_value=10, value=0, step=1)
+
+    if scan_mode == "Quick (10 Stocks)":
+        tickers = NIFTY50[:10]
+    elif scan_mode == "Full (50 Stocks)":
+        tickers = NIFTY50
+    else:  # High Rating Only
+        tickers = NIFTY50
+
+    st.info("Scanning stocks... This may take some time depending on your internet speed.")
+
+    progress_bar = st.progress(0)
+    results = []
+
+    for idx, ticker in enumerate(tickers):
+        df = fetch_history(ticker, START_DATE, END_DATE)
+        if df is None or df.empty:
+            progress_bar.progress((idx + 1) / len(tickers))
+            continue
+
+        df = add_indicators(df)
+        latest = df.iloc[-1]
+        rating, reasons = ai_rating(latest)
+        entry_signal_count = sum(get_entry_conditions(latest).values())
+        signal = "ENTRY!" if entry_signal_count >= 5 else ""
+
+        if scan_mode == "High Rating Only" and rating < 8:
+            progress_bar.progress((idx + 1) / len(tickers))
+            continue
+
+        results.append({
+            "Stock": ticker,
+            "Price": round(latest['Close'], 2),
+            "AI Rating": rating,
+            "Entry Signals": entry_signal_count,
+            "Signal": signal,
+            "Volume Ratio": round(latest['VOLUME_RATIO'], 2),
+            "5D Momentum (%)": round(latest['MOMENTUM5'], 2),
+            "Reasons": reasons
+        })
+        progress_bar.progress((idx + 1) / len(tickers))
+
+    if results:
+        results_df = pd.DataFrame(results)
+        results_df = results_df[results_df["AI Rating"] >= min_rating]
+        results_df = results_df.sort_values(by="AI Rating", ascending=False)
+        st.dataframe(results_df.style.applymap(
+            lambda v: 'background-color: lightgreen' if (isinstance(v, (int, float)) and v >= 8) else '',
+            subset=["AI Rating"]))
+
+        csv_scanner = results_df.to_csv(index=False).encode('utf-8')
+        st.download_button("Download Scanner Results CSV", csv_scanner, file_name="scanner_results.csv")
+    else:
+        st.info("No stocks matched the criteria.")
+
+######################## TAB 3: Portfolio Scanner & Comparison #############################
+with tab3:
+    st.header("Portfolio Scanner & Multi-Stock Performance Comparison")
+
+    selected_stocks = st.multiselect("Select stocks for portfolio", NIFTY50, default=NIFTY50[:5])
+
+    capital_input = st.number_input("Enter Initial Capital (₹)", min_value=10000, value=INITIAL_CAPITAL, step=10000)
+
+    if st.button("Run Portfolio Backtest") and selected_stocks:
+        st.info("Running backtest for selected portfolio...")
+
+        portfolio_results = []
+        for s in selected_stocks:
+            df = fetch_history(s, START_DATE, END_DATE)
+            if df is None or df.empty:
+                continue
+            df = add_indicators(df)
+            trades, perf = backtest(df, capital=capital_input / len(selected_stocks))
+            perf['Stock'] = s
+            portfolio_results.append(perf)
+
+        if portfolio_results:
+            portdf = pd.DataFrame(portfolio_results)
+            st.table(portdf.set_index('Stock'))
+
+            fig = go.Figure()
+            fig.add_trace(go.Bar(x=portdf['Stock'], y=portdf['Total Return (%)'].astype(float), name='Total Return (%)'))
+            fig.update_layout(title="Portfolio Total Returns (%)", yaxis_title="Return %")
+            st.plotly_chart(fig, use_container_width=True)
+
+            csv_portfolio = portdf.to_csv(index=False).encode('utf-8')
+            st.download_button("Download Portfolio Results CSV", csv_portfolio, file_name="portfolio_results.csv")
+
+# =========================== END OF SCRIPT ==============================
+
