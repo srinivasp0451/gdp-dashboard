@@ -11,6 +11,10 @@ from datetime import datetime, timedelta
 import warnings
 warnings.filterwarnings('ignore')
 
+from curl_cffi import requests
+session = requests.Session(impersonate="chrome")
+#ticker = yf.Ticker('...', session=session)
+
 # Set page config
 st.set_page_config(
     page_title="Nifty50 Swing Trading System",
@@ -48,7 +52,7 @@ class Nifty50SwingTrader:
     def fetch_data(_self, symbol, period='10y'):
         """Fetch historical data for a stock"""
         try:
-            stock = yf.Ticker(symbol)
+            stock = yf.Ticker(symbol,session=session)
             data = stock.history(period=period)
             if data.empty:
                 return None
