@@ -11,9 +11,9 @@ from datetime import datetime, timedelta
 import warnings
 warnings.filterwarnings('ignore')
 
-from curl_cffi import requests
-session = requests.Session(impersonate="chrome")
-#ticker = yf.Ticker('...', session=session)
+import requests
+session = requests.Session()
+session.headers.update({'User-Agent': 'Mozilla/5.0'})
 
 # Set page config
 st.set_page_config(
