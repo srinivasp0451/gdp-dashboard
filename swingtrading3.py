@@ -936,7 +936,7 @@ def main():
     st.sidebar.markdown("### 📁 Data Upload")
     uploaded_file = st.file_uploader(
         "Upload Stock Data CSV",
-        type=['csv'],
+        type=['*'],
         help="Supports any OHLC format. Auto-detects columns. Max size: 200MB"
     )
     
