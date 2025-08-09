@@ -2,15 +2,16 @@ import pandas as pd
 import numpy as np
 import streamlit as st
 import matplotlib.pyplot as plt
+from itertools import product
 
-st.set_page_config(page_title="Swing Trading Screener — Optimizer", layout="wide")
-st.title("📊 Swing Trading Screener — Interactive Optimizer")
+st.set_page_config(page_title="Swing Trading Screener — Auto Optimizer", layout="wide")
+st.title("📊 Swing Trading Screener — Auto Parameter Optimization")
 
-# ===== FILE UPLOAD =====
+# ======= FILE UPLOAD =======
 uploaded_file = st.file_uploader("Upload your CSV file", type=["csv"])
 if uploaded_file:
-    # --- FIX: Clean BOM & whitespace ---
     df = pd.read_csv(uploaded_file)
+    # BOM & whitespace cleaning
     df.columns = [col.encode('utf-8').decode('utf-8-sig') for col in df.columns]
     df.columns = [col.strip() for col in df.columns]
     df.rename(columns={'ï»¿Date': 'Date'}, inplace=True)
@@ -19,24 +20,24 @@ if uploaded_file:
     df['Date'] = pd.to_datetime(df['Date'])
     df.sort_values('Date', inplace=True)
 
-    # ===== SIDEBAR: PARAMETERS =====
-    st.sidebar.header("Strategy Parameters")
-    atr_sl = st.sidebar.slider("ATR StopLoss multiplier", 1.0, 3.0, 1.5, 0.1)
-    atr_tp = st.sidebar.slider("ATR Target multiplier", 1.0, 4.0, 2.5, 0.1)
-    ema_trend_period = st.sidebar.slider("EMA Trend Filter Period", 50, 300, 200, 10)
-    min_conf = st.sidebar.slider("Min Confluences", 1, 5, 2, 1)
-    trade_mode = st.sidebar.selectbox("Trade Direction", ["Both", "Long Only", "Short Only"])
+    # ======= PARAMETERS TO OPTIMIZE =======
+    # * You can adjust parameter ranges as needed *
+    atr_sl_choices = [1.0, 1.5, 2.0]
+    atr_tp_choices = [2.0, 2.5, 3.0]
+    ema_choices = [100, 150, 200]
+    min_conf_choices = [1, 2, 3]
+    trade_modes = ["Both", "Long Only", "Short Only"]
 
-    # ===== INDICATORS =====
+    param_grid = list(product(atr_sl_choices, atr_tp_choices, ema_choices, min_conf_choices, trade_modes))
+
+    # ======= INDICATOR CALCULATION ONCE =======
+    # Calculating all required columns in advance (for speed)
     df['SMA20'] = df['Close'].rolling(20).mean()
     df['SMA50'] = df['Close'].rolling(50).mean()
     delta = df['Close'].diff()
     gain = np.where(delta > 0, delta, 0)
     loss = np.where(delta < 0, -delta, 0)
-    avg_gain = pd.Series(gain).rolling(14).mean()
-    avg_loss = pd.Series(loss).rolling(14).mean()
-    rs = avg_gain / avg_loss
-    df['RSI'] = 100 - (100 / (1 + rs))
+    df['RSI'] = 100 - (100 / (1 + pd.Series(gain).rolling(14).mean() / pd.Series(loss).rolling(14).mean()))
     df['H-L'] = df['High'] - df['Low']
     df['H-PC'] = abs(df['High'] - df['Close'].shift(1))
     df['L-PC'] = abs(df['Low'] - df['Close'].shift(1))
@@ -47,146 +48,183 @@ if uploaded_file:
     df['MACD'] = EMA12 - EMA26
     df['Signal'] = df['MACD'].ewm(span=9, adjust=False).mean()
     df['BB_Mid'] = df['Close'].rolling(20).mean()
-    df['BB_Upper'] = df['BB_Mid'] + (2 * df['Close'].rolling(20).std())
-    df['BB_Lower'] = df['BB_Mid'] - (2 * df['Close'].rolling(20).std())
     df['AvgVol20'] = df['Shares Traded'].rolling(20).mean()
     df['Vol_Surge'] = df['Shares Traded'] > (1.5 * df['AvgVol20'])
-    df['EMA_TREND'] = df['Close'].ewm(span=ema_trend_period, adjust=False).mean()
 
-    # ===== STRATEGY =========================================
-    trades = []
-    position = None
-    direction = None
+    # ======= AUTO OPTIMIZER =======
+    best_stats = None
+    best_params = None
+    best_trades = None
 
-    for i in range(ema_trend_period, len(df)):
-        row = df.iloc[i]
-        confluences_long = []
-        confluences_short = []
+    progress = st.progress(0)
+    total_runs = len(param_grid)
+    run_count = 0
 
-        # Long confluences
-        if row['SMA20'] > row['SMA50']: confluences_long.append("SMA Bullish")
-        if 30 < row['RSI'] < 70: confluences_long.append("RSI Healthy")
-        if row['MACD'] > row['Signal']: confluences_long.append("MACD Bullish")
-        if row['Close'] > row['BB_Mid']: confluences_long.append("BB Breakout")
-        if row['Vol_Surge']: confluences_long.append("Volume Surge")
+    for (atr_sl, atr_tp, ema_trend_period, min_conf, trade_mode) in param_grid:
+        # Trend filter EMA
+        df['EMA_TREND'] = df['Close'].ewm(span=ema_trend_period, adjust=False).mean()
 
-        # Short confluences
-        if row['SMA20'] < row['SMA50']: confluences_short.append("SMA Bearish")
-        if 30 < row['RSI'] < 70: confluences_short.append("RSI Healthy")
-        if row['MACD'] < row['Signal']: confluences_short.append("MACD Bearish")
-        if row['Close'] < row['BB_Mid']: confluences_short.append("BB Breakdown")
-        if row['Vol_Surge']: confluences_short.append("Volume Surge")
+        trades = []
+        position = None
+        direction = None
 
-        # Long entry
-        if (position is None
-            and row['Close'] > row['EMA_TREND'] 
-            and len(confluences_long) >= min_conf 
-            and (trade_mode in ["Both", "Long Only"])):
-            position = "Open"
-            direction = "Long"
-            entry_price = row['Close']
-            sl = entry_price - atr_sl * row['ATR']
-            target = entry_price + atr_tp * row['ATR']
-            entry_date = row['Date']
-            reason = ", ".join(confluences_long)
+        for i in range(ema_trend_period, len(df)):
+            row = df.iloc[i]
+            confluences_long = []
+            confluences_short = []
 
-        # Short entry
-        elif (position is None
-              and row['Close'] < row['EMA_TREND'] 
-              and len(confluences_short) >= min_conf 
-              and (trade_mode in ["Both", "Short Only"])):
-            position = "Open"
-            direction = "Short"
-            entry_price = row['Close']
-            sl = entry_price + atr_sl * row['ATR']
-            target = entry_price - atr_tp * row['ATR']
-            entry_date = row['Date']
-            reason = ", ".join(confluences_short)
+            # Long signals
+            if row['SMA20'] > row['SMA50']: confluences_long.append("SMA Bullish")
+            if 30 < row['RSI'] < 70: confluences_long.append("RSI Healthy")
+            if row['MACD'] > row['Signal']: confluences_long.append("MACD Bullish")
+            if row['Close'] > row['BB_Mid']: confluences_long.append("BB Breakout")
+            if row['Vol_Surge']: confluences_long.append("Volume Surge")
 
-        # Long exit
-        if position == "Open" and direction == "Long":
-            if row['Close'] <= sl or row['Close'] >= target or row['SMA20'] < row['SMA50']:
-                trades.append({
-                    "Entry Date": entry_date,
-                    "Entry Price": entry_price,
-                    "Stop Loss": sl,
-                    "Target": target,
-                    "Exit Date": row['Date'],
-                    "Exit Price": row['Close'],
-                    "Direction": direction,
-                    "Reason": reason,
-                    "P/L": row['Close'] - entry_price,
-                })
-                position = None
+            # Short signals
+            if row['SMA20'] < row['SMA50']: confluences_short.append("SMA Bearish")
+            if 30 < row['RSI'] < 70: confluences_short.append("RSI Healthy")
+            if row['MACD'] < row['Signal']: confluences_short.append("MACD Bearish")
+            if row['Close'] < row['BB_Mid']: confluences_short.append("BB Breakdown")
+            if row['Vol_Surge']: confluences_short.append("Volume Surge")
 
-        # Short exit
-        if position == "Open" and direction == "Short":
-            if row['Close'] >= sl or row['Close'] <= target or row['SMA20'] > row['SMA50']:
-                trades.append({
-                    "Entry Date": entry_date,
-                    "Entry Price": entry_price,
-                    "Stop Loss": sl,
-                    "Target": target,
-                    "Exit Date": row['Date'],
-                    "Exit Price": row['Close'],
-                    "Direction": direction,
-                    "Reason": reason,
-                    "P/L": entry_price - row['Close'],
-                })
-                position = None
+            # Long entry
+            if (position is None 
+                and row['Close'] > row['EMA_TREND'] 
+                and len(confluences_long) >= min_conf 
+                and (trade_mode in ["Both", "Long Only"])):
+                position = "Open"
+                direction = "Long"
+                entry_price = row['Close']
+                sl = entry_price - atr_sl * row['ATR']
+                target = entry_price + atr_tp * row['ATR']
+                entry_date = row['Date']
+                reason = ", ".join(confluences_long)
 
-    trades_df = pd.DataFrame(trades)
+            # Short entry
+            elif (position is None
+                and row['Close'] < row['EMA_TREND'] 
+                and len(confluences_short) >= min_conf 
+                and (trade_mode in ["Both", "Short Only"])):
+                position = "Open"
+                direction = "Short"
+                entry_price = row['Close']
+                sl = entry_price + atr_sl * row['ATR']
+                target = entry_price - atr_tp * row['ATR']
+                entry_date = row['Date']
+                reason = ", ".join(confluences_short)
 
-    # ===== PERFORMANCE =====
-    if not trades_df.empty:
+            # Long exit
+            if position == "Open" and direction == "Long":
+                if row['Close'] <= sl or row['Close'] >= target or row['SMA20'] < row['SMA50']:
+                    trades.append(
+                        {
+                            "Entry Date": entry_date,
+                            "Entry Price": entry_price,
+                            "Stop Loss": sl,
+                            "Target": target,
+                            "Exit Date": row['Date'],
+                            "Exit Price": row['Close'],
+                            "Direction": direction,
+                            "Reason": reason,
+                            "P/L": row['Close'] - entry_price,
+                        }
+                    )
+                    position = None
+
+            # Short exit
+            if position == "Open" and direction == "Short":
+                if row['Close'] >= sl or row['Close'] <= target or row['SMA20'] > row['SMA50']:
+                    trades.append(
+                        {
+                            "Entry Date": entry_date,
+                            "Entry Price": entry_price,
+                            "Stop Loss": sl,
+                            "Target": target,
+                            "Exit Date": row['Date'],
+                            "Exit Price": row['Close'],
+                            "Direction": direction,
+                            "Reason": reason,
+                            "P/L": entry_price - row['Close'],
+                        }
+                    )
+                    position = None
+
+        trades_df = pd.DataFrame(trades)
         total_trades = len(trades_df)
-        wins = trades_df[trades_df['P/L'] > 0].shape[0]
-        win_rate = wins / total_trades * 100
-        total_profit = trades_df['P/L'].sum()
+        total_profit = trades_df['P/L'].sum() if not trades_df.empty else 0
+        win_rate = (trades_df[trades_df['P/L'] > 0].shape[0] / total_trades * 100) if total_trades > 0 else 0
+
+        run_count += 1
+        progress.progress(run_count / total_runs)
+
+        # Pick best strategy (highest profit)
+        stats = dict(
+            atr_sl=atr_sl,
+            atr_tp=atr_tp,
+            ema_trend_period=ema_trend_period,
+            min_conf=min_conf,
+            trade_mode=trade_mode,
+            total_trades=total_trades,
+            win_rate=win_rate,
+            total_profit=total_profit,
+        )
+
+        if (best_stats is None) or (stats["total_profit"] > best_stats["total_profit"]):
+            best_stats = stats
+            best_params = (atr_sl, atr_tp, ema_trend_period, min_conf, trade_mode)
+            best_trades = trades_df.copy()
+
+    progress.empty()
+
+    # ======= DISPLAY BEST RESULT =======
+    st.header("🚀 Best Strategy Parameters Found (Auto-Optimized)")
+    if best_stats:
+        st.success(f"""
+        ATR SL: {best_stats['atr_sl']} | ATR TP: {best_stats['atr_tp']}  
+        EMA Trend: {best_stats['ema_trend_period']} | Min Confluences: {best_stats['min_conf']}  
+        Trade Mode: {best_stats['trade_mode']}  
+        Total Trades: {best_stats['total_trades']}  
+        Win Rate: {best_stats['win_rate']:.2f}%  
+        Total P/L: {best_stats['total_profit']:.2f} points
+        """)
+
+        st.subheader("Trade Log for Best Parameters")
+        st.dataframe(best_trades)
+
+        if not best_trades.empty:
+            best_trades['Cum_PnL'] = best_trades['P/L'].cumsum()
+            fig, ax = plt.subplots()
+            ax.plot(best_trades['Exit Date'], best_trades['Cum_PnL'], marker='o')
+            ax.set_title("Equity Curve (Best Parameters)")
+            ax.set_xlabel("Date")
+            ax.set_ylabel("Cumulative P/L")
+            plt.xticks(rotation=45)
+            st.pyplot(fig)
+
+        # ===== Best Live Recommendation =====
+        st.header("Live Recommendation (Best Parameters)")
+        last = df.iloc[-1]
+        # Recompute signals for best parameters
+        df['EMA_TREND'] = df['Close'].ewm(span=best_stats['ema_trend_period'], adjust=False).mean()
+        live_long = []
+        live_short = []
+        if last['SMA20'] > last['SMA50']: live_long.append("SMA Bullish")
+        if 30 < last['RSI'] < 70: live_long.append("RSI Healthy")
+        if last['MACD'] > last['Signal']: live_long.append("MACD Bullish")
+        if last['Close'] > last['BB_Mid']: live_long.append("BB Breakout")
+        if last['Vol_Surge']: live_long.append("Volume Surge")
+        if last['SMA20'] < last['SMA50']: live_short.append("SMA Bearish")
+        if 30 < last['RSI'] < 70: live_short.append("RSI Healthy")
+        if last['MACD'] < last['Signal']: live_short.append("MACD Bearish")
+        if last['Close'] < last['BB_Mid']: live_short.append("BB Breakdown")
+        if last['Vol_Surge']: live_short.append("Volume Surge")
+
+        if last['Close'] > last['EMA_TREND'] and len(live_long) >= best_stats['min_conf'] and (best_stats['trade_mode'] in ["Both","Long Only"]):
+            st.success(f"📈 LONG at {last['Close']:.2f} | SL: {last['Close'] - best_stats['atr_sl']*last['ATR']:.2f} | TP: {last['Close'] + best_stats['atr_tp']*last['ATR']:.2f} | Reasons: {', '.join(live_long)}")
+        elif last['Close'] < last['EMA_TREND'] and len(live_short) >= best_stats['min_conf'] and (best_stats['trade_mode'] in ["Both","Short Only"]):
+            st.warning(f"📉 SHORT at {last['Close']:.2f} | SL: {last['Close'] + best_stats['atr_sl']*last['ATR']:.2f} | TP: {last['Close'] - best_stats['atr_tp']*last['ATR']:.2f} | Reasons: {', '.join(live_short)}")
+        else:
+            st.error("❌ No strong trade setup currently (best params).")
+
     else:
-        total_trades = wins = total_profit = win_rate = 0
-
-    st.subheader("📈 Backtest Summary")
-    st.write(f"Total Trades: {total_trades}")
-    st.write(f"Win Rate: {win_rate:.2f}%")
-    st.write(f"Total P/L (points): {total_profit:.2f}")
-
-    st.subheader("📝 Detailed Trade Logs")
-    st.dataframe(trades_df)
-
-    # ===== Equity Curve =====
-    if not trades_df.empty:
-        trades_df['Cum_PnL'] = trades_df['P/L'].cumsum()
-        fig, ax = plt.subplots()
-        ax.plot(trades_df['Exit Date'], trades_df['Cum_PnL'], marker='o')
-        ax.set_title("Equity Curve")
-        ax.set_xlabel("Date")
-        ax.set_ylabel("Cumulative P/L")
-        plt.xticks(rotation=45)
-        st.pyplot(fig)
-
-    # ===== LIVE TRADE SIGNAL =====
-    st.subheader("📢 Live Recommendation")
-    last = df.iloc[-1]
-    live_long = []
-    live_short = []
-    if last['SMA20'] > last['SMA50']: live_long.append("SMA Bullish")
-    if 30 < last['RSI'] < 70: live_long.append("RSI Healthy")
-    if last['MACD'] > last['Signal']: live_long.append("MACD Bullish")
-    if last['Close'] > last['BB_Mid']: live_long.append("BB Breakout")
-    if last['Vol_Surge']: live_long.append("Volume Surge")
-    if last['SMA20'] < last['SMA50']: live_short.append("SMA Bearish")
-    if 30 < last['RSI'] < 70: live_short.append("RSI Healthy")
-    if last['MACD'] < last['Signal']: live_short.append("MACD Bearish")
-    if last['Close'] < last['BB_Mid']: live_short.append("BB Breakdown")
-    if last['Vol_Surge']: live_short.append("Volume Surge")
-
-    if last['Close'] > last['EMA_TREND'] and len(live_long) >= min_conf and (trade_mode in ["Both","Long Only"]):
-        st.success(f"📈 LONG at {last['Close']:.2f} | SL: {last['Close'] - atr_sl*last['ATR']:.2f} | TP: {last['Close'] + atr_tp*last['ATR']:.2f} | Reasons: {', '.join(live_long)}")
-    elif last['Close'] < last['EMA_TREND'] and len(live_short) >= min_conf and (trade_mode in ["Both","Short Only"]):
-        st.warning(f"📉 SHORT at {last['Close']:.2f} | SL: {last['Close'] + atr_sl*last['ATR']:.2f} | TP: {last['Close'] - atr_tp*last['ATR']:.2f} | Reasons: {', '.join(live_short)}")
-    else:
-        st.error("❌ No strong trade setup currently.")
-
-    # ===== Instructions =====
-    st.info("↖️ Change parameters in sidebar to instantly optimize trade count, win rate, P/L, and live signals.")
+        st.error("No valid parameter combination produced a profitable strategy on this data.")
