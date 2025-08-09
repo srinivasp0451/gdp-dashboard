@@ -11,7 +11,11 @@ st.title("📊 Swing Trading Strategy Screener with Multi-Confluence Analysis")
 uploaded_file = st.file_uploader("Upload your CSV file", type=["csv"])
 if uploaded_file:
     df = pd.read_csv(uploaded_file)
+
+    # Fix possible BOM issue in first column!
+    df.columns = [col.encode('utf-8').decode('utf-8-sig') for col in df.columns]
     df.columns = [col.strip() for col in df.columns]
+    st.write("Columns:", df.columns.tolist())
     df['Date'] = pd.to_datetime(df['Date'])
     df.sort_values('Date', inplace=True)
 
