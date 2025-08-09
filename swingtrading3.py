@@ -15,6 +15,7 @@ if uploaded_file:
     # Fix possible BOM issue in first column!
     df.columns = [col.encode('utf-8').decode('utf-8-sig') for col in df.columns]
     df.columns = [col.strip() for col in df.columns]
+    df.rename(columns={'oldName1': 'newName1', 'ï»¿Date': 'Date'}, inplace=True)
     st.write("Columns:", df.columns.tolist())
     df['Date'] = pd.to_datetime(df['Date'])
     df.sort_values('Date', inplace=True)
