@@ -64,6 +64,12 @@ if uploaded_file:
     # For original data, 'Close' is day close, but some sources ('ltp') may be last traded price.
     # If both 'Close' and 'ltp' exist, you may want to choose! (Here, we pick whatever maps.)
 
+    # Force numeric conversion for indicators
+    numeric_cols = ['Open', 'High', 'Low', 'Close', 'Shares Traded']
+    for col in numeric_cols:
+        df[col] = pd.to_numeric(df[col], errors='coerce')
+    
+
     # ======= INDICATORS =======
     df_std['SMA20'] = df_std['Close'].rolling(20).mean()
     df_std['SMA50'] = df_std['Close'].rolling(50).mean()
