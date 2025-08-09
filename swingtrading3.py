@@ -11,17 +11,15 @@ uploaded_file = st.file_uploader("Upload your CSV file", type=["csv"])
 if uploaded_file:
     df = pd.read_csv(uploaded_file)
 
-    # --- FIX: Clean BOM + Strip spaces ---
+    # Fix possible BOM issue in first column!
     df.columns = [col.encode('utf-8').decode('utf-8-sig') for col in df.columns]
     df.columns = [col.strip() for col in df.columns]
-    df.rename(columns={'ï»¿Date': 'Date'}, inplace=True)
-
-    st.write("Columns detected:", df.columns.tolist())
-
-    # Ensure Date is datetime
+    df.rename(columns={'oldName1': 'newName1', 'ï»¿Date': 'Date'}, inplace=True)
+    st.write("Columns:", df.columns.tolist())
     df['Date'] = pd.to_datetime(df['Date'])
     df.sort_values('Date', inplace=True)
 
+    
     # ===== INDICATORS =====
     df['SMA20'] = df['Close'].rolling(20).mean()
     df['SMA50'] = df['Close'].rolling(50).mean()
