@@ -179,8 +179,10 @@ def simulate_outcomes_window(df_window, signals, max_holding_days=20):
             exit_price = float(df_window.iloc[idx_close]['Close'])
             exit_date = df_window.iloc[idx_close]['Date']
             pnl = (exit_price - entry_price) if direction == 'Long' else (entry_price - exit_price)
-            if pnl >=0: gross_profit += pnl
-            else: gross_loss += pnl
+            if pnl >=0: 
+                gross_profit += pnl
+            else: 
+                gross_loss += pnl
             hit = 'TimeExit'
 
         trades.append({
