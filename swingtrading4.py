@@ -158,7 +158,11 @@ def simulate_outcomes_window(df_window, signals, max_holding_days=20):
                 if pd.notna(sl) and low <= sl:
                     exit_price = sl; exit_date = date; pnl = exit_price - entry_price; hit = 'SL'; gross_loss += min(0.0,pnl); break
                 if pd.notna(sma20) and pd.notna(sma50) and sma20 < sma50:
-                    exit_price = close; exit_date = date; pnl = exit_price - entry_price; hit = 'Invalidation'; (gross_profit if pnl>=0 else gross_loss) + = 0  # placeholder adjust below
+                    exit_price = close; 
+                    exit_date = date; 
+                    pnl = exit_price - entry_price; 
+                    hit = 'Invalidation'; 
+                    (gross_profit if pnl>=0 else gross_loss) + = 0  # placeholder adjust below
                     # we handle adding profit/loss below to keep consistent types
                     if pnl >=0: gross_profit += pnl
                     else: gross_loss += pnl
