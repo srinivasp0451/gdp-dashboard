@@ -162,7 +162,7 @@ def simulate_outcomes_window(df_window, signals, max_holding_days=20):
                     exit_date = date; 
                     pnl = exit_price - entry_price; 
                     hit = 'Invalidation'; 
-                    (gross_profit if pnl>=0 else gross_loss + = 0)  # placeholder adjust below
+                    (gross_profit if pnl>=0 else gross_loss += 0)  # placeholder adjust below
                     # we handle adding profit/loss below to keep consistent types
                     if pnl >=0: 
                         gross_profit += pnl
