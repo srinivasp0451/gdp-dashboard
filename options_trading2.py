@@ -1,226 +1,251 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-import plotly.graph_objects as go
-from plotly.subplots import make_subplots
-from datetime import datetime, time
 import io
+import plotly.graph_objects as go
+from datetime import datetime, time
+from PIL import Image
 import warnings
 
 warnings.filterwarnings('ignore')
 
-# Page configuration
-st.set_page_config(
-    page_title="Nifty Options Analysis",
-    page_icon="📈",
-    layout="wide",
-    initial_sidebar_state="expanded"
-)
+# -------- SETTINGS --------
+st.set_page_config(page_title="Nifty Options Analysis Dashboard",
+                   page_icon="📈",
+                   layout="wide")
 
+# -------- CLASS --------
 class OptionsAnalyzer:
     def __init__(self):
         self.current_time = datetime.now().time()
-        self.market_hours = (time(9, 15), time(15, 30))
 
     def load_and_clean_data(self, uploaded_file):
-        """Load and parse NSE-style option chain CSV"""
+        """Load NSE-style option chain CSV starting from STRIKE header line."""
         try:
             uploaded_file.seek(0)
             content = uploaded_file.read().decode('utf-8')
             lines = content.strip().split('\n')
-
-            # Find strike price header line (like STRIKE or STRIKE PRICE)
             header_idx = None
             for i, line in enumerate(lines):
                 if 'STRIKE' in line.upper():
                     header_idx = i
                     break
-
             if header_idx is None:
-                st.error("No STRIKE column found — check file")
+                st.error("No STRIKE column found — verify file format.")
                 return None, None
 
             csv_content = '\n'.join(lines[header_idx:])
             df = pd.read_csv(io.StringIO(csv_content))
-
-            # Remove any completely empty columns
             df.dropna(axis=1, how='all', inplace=True)
+            df.columns = [str(c).strip() for c in df.columns]
 
-            st.write(f"✅ CSV loaded with shape: {df.shape}")
-            st.dataframe(df.head(3))
-
-            # Ensure column names are stripped
-            df.columns = df.columns.map(lambda x: str(x).strip())
-
-            calls_df, puts_df = self.parse_options_data(df)
+            calls_df, puts_df = self.parse_nse_chain(df)
             return calls_df, puts_df
-
         except Exception as e:
-            st.error(f"Error loading data: {e}")
+            st.error(f"Error loading file: {e}")
             return None, None
 
-    def parse_options_data(self, df):
-        """Parse NSE option chain where calls are left of strike, puts on right"""
-        try:
-            strike_index = None
-            for i, col in enumerate(df.columns):
-                if 'STRIKE' in col.upper():
-                    strike_index = i
-                    break
-            if strike_index is None:
-                st.error("Strike column not found in parsed data")
-                return pd.DataFrame(), pd.DataFrame()
-
-            calls_data = []
-            puts_data = []
-
-            for _, row in df.iterrows():
-                try:
-                    strike = self.safe_numeric(row.iloc[strike_index])
-                    if strike == 0:
-                        continue
-
-                    # CALLS: columns before STRIKE
-                    call_part = row.iloc[0: strike_index]
-                    # PUTS: columns after STRIKE
-                    put_part = row.iloc[strike_index+1:]
-
-                    # Map CALL part — expecting structure matching NSE order
-                    call_data = {
-                        'strike': strike,
-                        'oi': self.safe_numeric(call_part.iloc[0]),
-                        'chng_oi': self.safe_numeric(call_part.iloc[1]),
-                        'volume': self.safe_numeric(call_part.iloc[2]),
-                        'iv': self.safe_numeric(call_part.iloc[3]),
-                        'ltp': self.safe_numeric(call_part.iloc[4]),
-                        'chng': self.safe_numeric(call_part.iloc[5])
-                    }
-                    if call_data['ltp'] > 0:
-                        calls_data.append(call_data)
-
-                    # Map PUT part — expecting matching structure
-                    put_data = {
-                        'strike': strike,
-                        'bid_qty': self.safe_numeric(put_part.iloc[0]),
-                        'bid': self.safe_numeric(put_part.iloc[1]),
-                        'ask': self.safe_numeric(put_part.iloc[2]),
-                        'ask_qty': self.safe_numeric(put_part.iloc[3]),
-                        'chng': self.safe_numeric(put_part.iloc[4]),
-                        'ltp': self.safe_numeric(put_part.iloc[5]),
-                        'iv': self.safe_numeric(put_part.iloc[6]),
-                        'volume': self.safe_numeric(put_part.iloc[7]),
-                        'chng_oi': self.safe_numeric(put_part.iloc[8]),
-                        'oi': self.safe_numeric(put_part.iloc[9])
-                    }
-                    if put_data['ltp'] > 0:
-                        puts_data.append({
-                            'strike': strike,
-                            'oi': put_data['oi'],
-                            'chng_oi': put_data['chng_oi'],
-                            'volume': put_data['volume'],
-                            'iv': put_data['iv'],
-                            'ltp': put_data['ltp'],
-                            'chng': put_data['chng']
-                        })
-                except:
-                    continue
-
-            calls_df = pd.DataFrame(calls_data)
-            puts_df = pd.DataFrame(puts_data)
-
-            st.write(f"✅ Parsed {len(calls_df)} call rows, {len(puts_df)} put rows")
-            return calls_df, puts_df
-
-        except Exception as e:
-            st.error(f"Error parsing data: {e}")
+    def parse_nse_chain(self, df):
+        """Parse option chain into separate Calls and Puts dataframes."""
+        strike_index = None
+        for i, col in enumerate(df.columns):
+            if 'STRIKE' in col.upper():
+                strike_index = i
+                break
+        if strike_index is None:
             return pd.DataFrame(), pd.DataFrame()
 
-    def safe_numeric(self, value):
-        """Convert to float after removing commas, handle missing"""
+        calls_data, puts_data = [], []
+        for _, row in df.iterrows():
+            try:
+                strike = self.safe_num(row.iloc[strike_index])
+                if strike == 0:
+                    continue
+                call = {
+                    'strike': strike,
+                    'oi': self.safe_num(row.iloc[1]),
+                    'chng_oi': self.safe_num(row.iloc[2]),
+                    'volume': self.safe_num(row.iloc[3]),
+                    'iv': self.safe_num(row.iloc[4]),
+                    'ltp': self.safe_num(row.iloc[5]),
+                    'chng': self.safe_num(row.iloc[6])
+                }
+                put = {
+                    'strike': strike,
+                    'chng': self.safe_num(row.iloc[strike_index+5]),
+                    'ltp': self.safe_num(row.iloc[strike_index+6]),
+                    'iv': self.safe_num(row.iloc[strike_index+7]),
+                    'volume': self.safe_num(row.iloc[strike_index+8]),
+                    'chng_oi': self.safe_num(row.iloc[strike_index+9]),
+                    'oi': self.safe_num(row.iloc[strike_index+10])
+                }
+                if call['ltp'] > 0:
+                    calls_data.append(call)
+                if put['ltp'] > 0:
+                    puts_data.append(put)
+            except:
+                continue
+        return pd.DataFrame(calls_data), pd.DataFrame(puts_data)
+
+    def safe_num(self, val):
         try:
-            if pd.isna(value) or value in ['', '-']:
+            if pd.isna(val) or val in ['', '-']:
                 return 0
-            return float(str(value).replace(',', '').strip())
+            return float(str(val).replace(',', '').strip())
         except:
             return 0
 
     def get_market_phase(self):
-        """Determine current market phase"""
-        c = self.current_time
-        if time(9, 15) <= c <= time(10, 0):
+        if time(9, 15) <= self.current_time <= time(10, 0):
             return 'OPENING'
-        elif time(14, 30) <= c <= time(15, 30):
+        elif time(14, 30) <= self.current_time <= time(15, 30):
             return 'CLOSING'
         else:
             return 'MID_SESSION'
 
-    def create_visualizations(self, calls_df, puts_df, current_spot):
-        """Charts for LTP, OI, Volume and PCR"""
-        fig_ltp = make_subplots(rows=2, cols=1,
-            subplot_titles=('Call LTP', 'Put LTP'), vertical_spacing=0.08)
-        fig_ltp.add_trace(go.Scatter(x=calls_df['strike'], y=calls_df['ltp'],
-            mode='lines+markers', name='Call LTP', line=dict(color='green')), row=1, col=1)
-        fig_ltp.add_trace(go.Scatter(x=puts_df['strike'], y=puts_df['ltp'],
-            mode='lines+markers', name='Put LTP', line=dict(color='red')), row=2, col=1)
-        fig_ltp.add_vline(x=current_spot, line_dash="dash", line_color="blue")
-        fig_ltp.update_layout(height=600, title="Options Premium Analysis")
+    def analyze_signal(self, row, current_spot, option_type):
+        """Generate recommendation for a single row."""
+        strike, ltp, volume, oi, chng_oi, iv = row['strike'], row['ltp'], row['volume'], row['oi'], row['chng_oi'], row['iv']
+        moneyness = ((current_spot - strike) / current_spot * 100) if option_type == 'CALL' else ((strike - current_spot) / current_spot * 100)
 
-        fig_oi = make_subplots(rows=2, cols=2,
-            subplot_titles=('Call OI', 'Put OI', 'Call OI Change', 'Put OI Change'),
-            vertical_spacing=0.1, horizontal_spacing=0.1)
-        fig_oi.add_trace(go.Bar(x=calls_df['strike'], y=calls_df['oi'], name='Call OI'), row=1, col=1)
-        fig_oi.add_trace(go.Bar(x=puts_df['strike'], y=puts_df['oi'], name='Put OI'), row=1, col=2)
-        fig_oi.add_trace(go.Bar(x=calls_df['strike'], y=calls_df['chng_oi'], name='Call OI Chg'), row=2, col=1)
-        fig_oi.add_trace(go.Bar(x=puts_df['strike'], y=puts_df['chng_oi'], name='Put OI Chg'), row=2, col=2)
-        fig_oi.update_layout(height=700, title="Open Interest Analysis")
+        # POP estimation
+        pop = max(5, min(95, 50 + (moneyness * -1 if option_type == 'PUT' else moneyness) * 2 - abs(moneyness) * 0.5))
 
+        # Scoring
+        volume_score = min(100, (volume / 500000) * 100)
+        oi_score = min(100, (oi / 200000) * 100)
+        iv_score = max(0, 100 - abs(iv - 15) * 5)
+        score = (volume_score + oi_score + iv_score) / 3
+
+        # Entry logic
+        entry_cond = []
+        if volume > 100000: entry_cond.append("High Volume")
+        if oi > 100000: entry_cond.append("OI Build-up")
+        if 10 <= iv <= 20: entry_cond.append("Optimal IV")
+        if chng_oi > 5000:
+            entry_cond.append("Positive OI Change" if option_type == 'CALL' else "Negative OI Change")
+
+        # Risk & Targets
+        risk_level = 'LOW' if abs(moneyness) < 1 else 'MEDIUM' if abs(moneyness) < 3 else 'HIGH'
+        target1 = round(ltp * 1.5, 2)
+        target2 = round(ltp * 2, 2)
+        stop_loss = round(ltp * 0.7, 2)
+
+        # Recommendation
+        if score > 75 and len(entry_cond) >= 2:
+            rec = "STRONG BUY"
+        elif score > 60 and len(entry_cond) >= 2:
+            rec = "BUY"
+        elif score > 50 and len(entry_cond) >= 1:
+            rec = "WEAK BUY"
+        else:
+            rec = "AVOID"
+
+        return {
+            'option_type': option_type, 'strike': strike, 'ltp': ltp,
+            'stop_loss': stop_loss, 'target_1': target1, 'target_2': target2,
+            'probability': round(pop, 1), 'recommendation': rec, 'score': score,
+            'risk_level': risk_level, 'entry_conditions': entry_cond
+        }
+
+    def get_recommendations(self, calls_df, puts_df, spot):
+        recs = []
+        for _, r in calls_df.iterrows():
+            recs.append(self.analyze_signal(r, spot, 'CALL'))
+        for _, r in puts_df.iterrows():
+            recs.append(self.analyze_signal(r, spot, 'PUT'))
+        return sorted(recs, key=lambda x: -x['score'])[:10]
+
+    def create_charts(self, calls_df, puts_df, spot):
+        # LTP Chart
+        fig_ltp = go.Figure()
+        fig_ltp.add_trace(go.Scatter(x=calls_df['strike'], y=calls_df['ltp'], name='CALL LTP', line=dict(color='red')))
+        fig_ltp.add_trace(go.Scatter(x=puts_df['strike'], y=puts_df['ltp'], name='PUT LTP', line=dict(color='green')))
+        fig_ltp.add_vline(x=spot, line_dash="dash", line_color="blue")
+        fig_ltp.update_layout(title="Call & Put Premiums", xaxis_title="Strike", yaxis_title="LTP")
+
+        # OI Chart
+        fig_oi = go.Figure()
+        fig_oi.add_trace(go.Bar(x=calls_df['strike'], y=calls_df['oi'], name='Call OI', marker_color='red'))
+        fig_oi.add_trace(go.Bar(x=puts_df['strike'], y=puts_df['oi'], name='Put OI', marker_color='green'))
+        fig_oi.update_layout(barmode='group', title="Open Interest")
+
+        # Change in OI Chart
+        fig_chg_oi = go.Figure()
+        fig_chg_oi.add_trace(go.Bar(x=calls_df['strike'], y=calls_df['chng_oi'], name='Call ΔOI', marker_color='red'))
+        fig_chg_oi.add_trace(go.Bar(x=puts_df['strike'], y=puts_df['chng_oi'], name='Put ΔOI', marker_color='green'))
+        fig_chg_oi.update_layout(barmode='group', title="Change in OI")
+
+        # Volume Chart
         fig_vol = go.Figure()
-        fig_vol.add_trace(go.Bar(x=calls_df['strike'], y=calls_df['volume'], name='Call Vol'))
-        fig_vol.add_trace(go.Bar(x=puts_df['strike'], y=puts_df['volume'], name='Put Vol'))
-        fig_vol.add_vline(x=current_spot, line_dash="dash", line_color="blue")
-        fig_vol.update_layout(title="Volume Analysis", height=400)
+        fig_vol.add_trace(go.Bar(x=calls_df['strike'], y=calls_df['volume'], name='Call Volume', marker_color='red'))
+        fig_vol.add_trace(go.Bar(x=puts_df['strike'], y=puts_df['volume'], name='Put Volume', marker_color='green'))
+        fig_vol.update_layout(barmode='group', title="Volume")
 
-        pcr_oi = puts_df['oi'].sum() / calls_df['oi'].sum() if calls_df['oi'].sum() else 0
-        pcr_vol = puts_df['volume'].sum() / calls_df['volume'].sum() if calls_df['volume'].sum() else 0
-        return fig_ltp, fig_oi, fig_vol, pcr_oi, pcr_vol
+        return fig_ltp, fig_oi, fig_chg_oi, fig_vol
 
-# ---------------- MAIN APP ---------------- #
+# --------- APP ----------
 def main():
-    st.title("🚀 Nifty Options Analysis")
-    analyzer = OptionsAnalyzer()
-    st.sidebar.header("📂 Upload Options Chain CSV")
+    st.title("📊 Nifty Options Chain Analysis & Recommendations")
 
-    uploaded_file = st.sidebar.file_uploader("Upload file", type=['csv'], help="Upload the options chain CSV from NSE")
-    current_spot = st.sidebar.number_input("Current Nifty Spot", min_value=20000, max_value=30000, value=24500, step=1)
+    analyzer = OptionsAnalyzer()
+    uploaded_file = st.sidebar.file_uploader("Upload Option Chain CSV", type=['csv'])
+    screenshot_file = st.sidebar.file_uploader("Upload Index Screenshot (optional)", type=['png', 'jpg', 'jpeg'])
+    spot_price = st.sidebar.number_input("Current Spot Price", min_value=20000, max_value=30000, value=24500, step=1)
 
     if uploaded_file:
         calls_df, puts_df = analyzer.load_and_clean_data(uploaded_file)
         if calls_df is not None and not calls_df.empty:
-            col1, col2, col3 = st.columns(3)
-            with col1: st.metric("Current Spot", f"{current_spot}")
-            with col2: st.metric("Market Phase", analyzer.get_market_phase())
-            with col3: st.metric("PCR OI", f"{(puts_df['oi'].sum() / calls_df['oi'].sum()):.2f}" if calls_df['oi'].sum() else "N/A")
+            fig_ltp, fig_oi, fig_chg_oi, fig_vol = analyzer.create_charts(calls_df, puts_df, spot_price)
 
-            st.markdown("---")
-            fig_ltp, fig_oi, fig_vol, pcr_oi, pcr_vol = analyzer.create_visualizations(calls_df, puts_df, current_spot)
+            # Summary: Option Chain
+            total_call_oi = calls_df['oi'].sum()
+            total_put_oi = puts_df['oi'].sum()
+            pcr_oi = total_put_oi / total_call_oi if total_call_oi else 0
+            sentiment = "Bullish" if pcr_oi > 1 else "Bearish" if pcr_oi < 1 else "Neutral"
+            st.subheader("Summary - Option Chain Insights")
+            st.write(f"**PCR (OI):** {pcr_oi:.2f} → Market Sentiment: **{sentiment}**")
+            st.write(f"- Call OI Concentration: Strike {calls_df.loc[calls_df['oi'].idxmax(), 'strike']}")
+            st.write(f"- Put OI Concentration: Strike {puts_df.loc[puts_df['oi'].idxmax(), 'strike']}")
+            st.write(f"- Highest Call Volume @ {calls_df.loc[calls_df['volume'].idxmax(), 'strike']}")
+            st.write(f"- Highest Put Volume @ {puts_df.loc[puts_df['volume'].idxmax(), 'strike']}")
 
-            mc1, mc2, mc3 = st.columns(3)
-            mc1.metric("PCR (OI)", f"{pcr_oi:.2f}")
-            mc2.metric("PCR (Vol)", f"{pcr_vol:.2f}")
-            mc3.metric("Sentiment", "Bullish" if pcr_oi < 1 else "Bearish")
+            # Chart (image) discussion placeholder
+            if screenshot_file:
+                st.subheader("Uploaded Index Chart")
+                img = Image.open(screenshot_file)
+                st.image(img, caption="Index chart provided by user")
+                st.write("**Manual Observation:** Visual inspection of index trend, support/resistance from chart to be combined with Option Chain view.")
+            else:
+                st.info("No chart uploaded — only Option Chain data is analyzed.")
 
+            # Recommendations
+            recs = analyzer.get_recommendations(calls_df, puts_df, spot_price)
+            st.subheader("🎯 Top Trade Recommendations (Logic-driven)")
+            st.caption("Logic: Score computed from Volume, OI, IV proximity, ΔOI; Entry conditions must be met (High Vol, OI build-up, Optimal IV, Positive ΔOI). Targets/SL from LTP.")
+            for r in recs:
+                st.markdown(f"**{r['recommendation']}** → {r['option_type']} {r['strike']} @ ₹{r['ltp']} | SL ₹{r['stop_loss']} | T1 ₹{r['target_1']} | T2 ₹{r['target_2']} | POP {r['probability']}% | Risk {r['risk_level']}")
+                if r['entry_conditions']:
+                    st.write("Conditions:", ", ".join(r['entry_conditions']))
+                st.progress(int(r['score']))
+
+            # Display charts
             st.plotly_chart(fig_ltp, use_container_width=True)
             st.plotly_chart(fig_oi, use_container_width=True)
+            st.plotly_chart(fig_chg_oi, use_container_width=True)
             st.plotly_chart(fig_vol, use_container_width=True)
 
-            st.markdown("### 📋 Data Tables")
+            # Raw Data
+            st.subheader("Raw Parsed Data")
             t1, t2 = st.tabs(["Calls", "Puts"])
-            with t1: st.dataframe(calls_df)
-            with t2: st.dataframe(puts_df)
+            with t1:
+                st.dataframe(calls_df)
+            with t2:
+                st.dataframe(puts_df)
         else:
-            st.error("Error parsing uploaded file")
+            st.error("Could not parse the CSV.")
     else:
-        st.info("Please upload the latest options chain CSV.")
+        st.info("Please upload the Option Chain CSV to start analysis.")
 
 if __name__ == "__main__":
     main()
