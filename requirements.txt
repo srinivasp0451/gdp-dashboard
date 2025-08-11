@@ -19,4 +19,4 @@ Dhan-Tradehull
 #sqlite3
 #pysqlite
 curl_cffi
-cv2
+opencv-python
