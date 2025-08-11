@@ -1,5 +1,5 @@
 streamlit
-yfinance==0.2.54
+yfinance
 xlsxwriter
 pandas
 numpy
@@ -19,4 +19,3 @@ Dhan-Tradehull
 #sqlite3
 #pysqlite
 curl_cffi
-opencv-python
