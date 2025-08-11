@@ -24,103 +24,207 @@ class OptionsAnalyzer:
     def load_and_clean_data(self, uploaded_file):
         """Load and clean options chain data with error handling"""
         try:
-            # Read CSV with flexible parsing
-            df = pd.read_csv(uploaded_file, encoding='utf-8')
+            # Reset file pointer
+            uploaded_file.seek(0)
             
-            # Handle different CSV formats
-            if df.shape[1] < 20:  # If columns are merged
-                df = pd.read_csv(uploaded_file, sep=',', header=0)
+            # Try different reading methods
+            df = None
+            
+            # Method 1: Standard CSV reading
+            try:
+                df = pd.read_csv(uploaded_file, encoding='utf-8')
+                st.write(f"✅ CSV loaded with shape: {df.shape}")
+            except:
+                uploaded_file.seek(0)
+                try:
+                    df = pd.read_csv(uploaded_file, encoding='latin1')
+                    st.write(f"✅ CSV loaded with latin1 encoding, shape: {df.shape}")
+                except:
+                    uploaded_file.seek(0)
+                    # Method 2: Try with different separator
+                    try:
+                        df = pd.read_csv(uploaded_file, sep=';', encoding='utf-8')
+                        st.write(f"✅ CSV loaded with semicolon separator, shape: {df.shape}")
+                    except:
+                        uploaded_file.seek(0)
+                        # Method 3: Try reading as text first
+                        content = uploaded_file.read().decode('utf-8')
+                        lines = content.strip().split('\n')
+                        
+                        # Find the header line and data
+                        header_idx = 0
+                        for i, line in enumerate(lines):
+                            if 'STRIKE' in line.upper() or 'CALLS' in line.upper():
+                                header_idx = i
+                                break
+                        
+                        # Create DataFrame from lines
+                        import io
+                        csv_content = '\n'.join(lines[header_idx:])
+                        df = pd.read_csv(io.StringIO(csv_content))
+                        st.write(f"✅ CSV loaded from text parsing, shape: {df.shape}")
+            
+            if df is None or df.empty:
+                st.error("Could not read the CSV file. Please check the format.")
+                return None, None
+            
+            # Display first few rows for debugging
+            st.write("**First 3 rows of data:**")
+            st.dataframe(df.head(3))
             
             # Clean column names
             df.columns = df.columns.str.strip()
             
-            # Extract relevant columns (handle different formats)
-            required_cols = ['STRIKE', 'CALLS', 'PUTS']
-            
-            # Try to identify strike column
-            strike_col = None
-            for col in df.columns:
-                if 'STRIKE' in col.upper() or any(x in str(col).upper() for x in ['STRIKE', 'PRICE']):
-                    strike_col = col
-                    break
-            
-            if strike_col is None:
-                # Try to find numeric column that looks like strikes
-                for col in df.columns:
-                    try:
-                        values = pd.to_numeric(df[col], errors='coerce')
-                        if values.notna().sum() > 0 and values.min() > 20000 and values.max() < 30000:
-                            strike_col = col
-                            break
-                    except:
-                        continue
+            # Display column names for debugging
+            st.write(f"**Columns found:** {list(df.columns)}")
             
             # Parse the data based on structure
-            calls_data, puts_data = self.parse_options_data(df, strike_col)
+            calls_data, puts_data = self.parse_options_data(df)
             
             return calls_data, puts_data
             
         except Exception as e:
             st.error(f"Error loading data: {str(e)}")
+            st.write("**Debug info:**")
+            st.write(f"File type: {type(uploaded_file)}")
+            st.write(f"File name: {uploaded_file.name}")
             return None, None
     
-    def parse_options_data(self, df, strike_col):
+    def parse_options_data(self, df):
         """Parse options data from different CSV formats"""
         calls_data = []
         puts_data = []
         
         try:
-            # Method 1: If data is in separate CALLS/PUTS sections
-            if 'CALLS' in df.columns and 'PUTS' in df.columns:
-                # Process row by row
-                for idx, row in df.iterrows():
-                    try:
-                        strike = pd.to_numeric(row[strike_col] if strike_col else row.iloc[11], errors='coerce')
-                        if pd.isna(strike):
-                            continue
-                            
-                        # Extract call data (left side)
-                        call_oi = pd.to_numeric(str(row.iloc[0]).replace(',', ''), errors='coerce') or 0
-                        call_chng_oi = pd.to_numeric(str(row.iloc[1]).replace(',', ''), errors='coerce') or 0
-                        call_volume = pd.to_numeric(str(row.iloc[2]).replace(',', ''), errors='coerce') or 0
-                        call_iv = pd.to_numeric(row.iloc[3], errors='coerce') or 0
-                        call_ltp = pd.to_numeric(str(row.iloc[4]).replace(',', ''), errors='coerce') or 0
-                        call_chng = pd.to_numeric(row.iloc[5], errors='coerce') or 0
-                        
-                        # Extract put data (right side)
-                        put_oi = pd.to_numeric(str(row.iloc[-2]).replace(',', ''), errors='coerce') or 0
-                        put_chng_oi = pd.to_numeric(str(row.iloc[-3]).replace(',', ''), errors='coerce') or 0
-                        put_volume = pd.to_numeric(str(row.iloc[-4]).replace(',', ''), errors='coerce') or 0
-                        put_iv = pd.to_numeric(row.iloc[-5], errors='coerce') or 0
-                        put_ltp = pd.to_numeric(str(row.iloc[-6]).replace(',', ''), errors='coerce') or 0
-                        put_chng = pd.to_numeric(row.iloc[-7], errors='coerce') or 0
-                        
-                        calls_data.append({
-                            'strike': strike, 'oi': call_oi, 'chng_oi': call_chng_oi,
-                            'volume': call_volume, 'iv': call_iv, 'ltp': call_ltp, 'chng': call_chng
-                        })
-                        
-                        puts_data.append({
-                            'strike': strike, 'oi': put_oi, 'chng_oi': put_chng_oi,
-                            'volume': put_volume, 'iv': put_iv, 'ltp': put_ltp, 'chng': put_chng
-                        })
-                        
-                    except Exception as e:
+            st.write("**Starting data parsing...**")
+            
+            # Find the strike column (should contain values like 22600, 22650, etc.)
+            strike_col_idx = None
+            for i, col in enumerate(df.columns):
+                try:
+                    # Convert column to numeric and check for strike-like values
+                    values = pd.to_numeric(df[col], errors='coerce').dropna()
+                    if len(values) > 0:
+                        min_val, max_val = values.min(), values.max()
+                        if 20000 <= min_val <= 30000 and 20000 <= max_val <= 30000:
+                            strike_col_idx = i
+                            st.write(f"✅ Strike column found at index {i}: {col}")
+                            break
+                except:
+                    continue
+            
+            if strike_col_idx is None:
+                # Try to find column with name containing 'STRIKE'
+                for i, col in enumerate(df.columns):
+                    if 'STRIKE' in str(col).upper():
+                        strike_col_idx = i
+                        st.write(f"✅ Strike column found by name at index {i}: {col}")
+                        break
+            
+            if strike_col_idx is None:
+                st.error("Could not identify strike price column")
+                return pd.DataFrame(), pd.DataFrame()
+            
+            # Based on your CSV format, the structure appears to be:
+            # Columns 0-10: CALLS data, Column 11: STRIKE, Columns 12-22: PUTS data
+            
+            total_cols = len(df.columns)
+            st.write(f"Total columns: {total_cols}, Strike column at: {strike_col_idx}")
+            
+            # Process each row
+            for idx, row in df.iterrows():
+                try:
+                    # Get strike price
+                    strike = pd.to_numeric(row.iloc[strike_col_idx], errors='coerce')
+                    if pd.isna(strike) or strike == 0:
                         continue
+                    
+                    # Parse CALLS data (left side of strike)
+                    if strike_col_idx > 0:
+                        try:
+                            # Typical order: OI, CHNG_OI, VOLUME, IV, LTP, CHNG, BID_QTY, BID, ASK, ASK_QTY
+                            call_oi = self.safe_numeric(row.iloc[0])
+                            call_chng_oi = self.safe_numeric(row.iloc[1])  
+                            call_volume = self.safe_numeric(row.iloc[2])
+                            call_iv = self.safe_numeric(row.iloc[3])
+                            call_ltp = self.safe_numeric(row.iloc[4])
+                            call_chng = self.safe_numeric(row.iloc[5]) if strike_col_idx > 5 else 0
+                            
+                            if call_ltp > 0:  # Only add if LTP exists
+                                calls_data.append({
+                                    'strike': strike,
+                                    'oi': call_oi,
+                                    'chng_oi': call_chng_oi,
+                                    'volume': call_volume,
+                                    'iv': call_iv,
+                                    'ltp': call_ltp,
+                                    'chng': call_chng
+                                })
+                        except Exception as e:
+                            st.write(f"Error parsing calls for strike {strike}: {e}")
+                    
+                    # Parse PUTS data (right side of strike)
+                    if strike_col_idx < total_cols - 1:
+                        try:
+                            # PUTS data starts after strike column
+                            puts_start = strike_col_idx + 1
+                            
+                            # Try to extract put data
+                            if puts_start + 5 < total_cols:
+                                put_oi = self.safe_numeric(row.iloc[puts_start + 10]) if puts_start + 10 < total_cols else self.safe_numeric(row.iloc[-1])
+                                put_chng_oi = self.safe_numeric(row.iloc[puts_start + 9]) if puts_start + 9 < total_cols else self.safe_numeric(row.iloc[-2])
+                                put_volume = self.safe_numeric(row.iloc[puts_start + 8]) if puts_start + 8 < total_cols else self.safe_numeric(row.iloc[-3])
+                                put_iv = self.safe_numeric(row.iloc[puts_start + 7]) if puts_start + 7 < total_cols else self.safe_numeric(row.iloc[-4])
+                                put_ltp = self.safe_numeric(row.iloc[puts_start + 6]) if puts_start + 6 < total_cols else self.safe_numeric(row.iloc[-5])
+                                put_chng = self.safe_numeric(row.iloc[puts_start + 5]) if puts_start + 5 < total_cols else self.safe_numeric(row.iloc[-6])
+                                
+                                if put_ltp > 0:  # Only add if LTP exists
+                                    puts_data.append({
+                                        'strike': strike,
+                                        'oi': put_oi,
+                                        'chng_oi': put_chng_oi,
+                                        'volume': put_volume,
+                                        'iv': put_iv,
+                                        'ltp': put_ltp,
+                                        'chng': put_chng
+                                    })
+                        except Exception as e:
+                            st.write(f"Error parsing puts for strike {strike}: {e}")
+                            
+                except Exception as e:
+                    continue
             
             # Convert to DataFrames
-            calls_df = pd.DataFrame(calls_data).dropna(subset=['strike'])
-            puts_df = pd.DataFrame(puts_data).dropna(subset=['strike'])
+            calls_df = pd.DataFrame(calls_data)
+            puts_df = pd.DataFrame(puts_data)
             
-            # Remove rows with zero LTP (likely empty)
-            calls_df = calls_df[calls_df['ltp'] > 0]
-            puts_df = puts_df[puts_df['ltp'] > 0]
+            st.write(f"✅ Parsed {len(calls_df)} call options and {len(puts_df)} put options")
+            
+            # Display sample data
+            if not calls_df.empty:
+                st.write("**Sample Call Options:**")
+                st.dataframe(calls_df.head(3))
+            
+            if not puts_df.empty:
+                st.write("**Sample Put Options:**")
+                st.dataframe(puts_df.head(3))
             
             return calls_df, puts_df
             
         except Exception as e:
             st.error(f"Error parsing options data: {str(e)}")
             return pd.DataFrame(), pd.DataFrame()
+    
+    def safe_numeric(self, value):
+        """Safely convert value to numeric, handling commas and invalid data"""
+        try:
+            if pd.isna(value) or value == '' or value == '-':
+                return 0
+            # Remove commas and convert to float
+            clean_value = str(value).replace(',', '').replace('"', '').strip()
+            return float(clean_value) if clean_value != '' else 0
+        except:
+            return 0
     
     def calculate_probabilities(self, df, current_spot, option_type='call'):
         """Calculate probability of profit using Black-Scholes approximation"""
@@ -292,7 +396,61 @@ class OptionsAnalyzer:
             'risk_level': 'LOW' if abs(moneyness) < 1 else 'MEDIUM' if abs(moneyness) < 3 else 'HIGH'
         }
     
-    def get_market_phase(self):
+    def create_sample_data(self):
+        """Create sample data based on the uploaded document"""
+        # Sample data extracted from your CSV
+        calls_data = [
+            {'strike': 24000, 'oi': 7773, 'chng_oi': -490, 'volume': 28334, 'iv': 14.89, 'ltp': 551.80, 'chng': 124.75},
+            {'strike': 24050, 'oi': 316, 'chng_oi': 19, 'volume': 2296, 'iv': 12.71, 'ltp': 496.00, 'chng': 111.45},
+            {'strike': 24100, 'oi': 1764, 'chng_oi': 331, 'volume': 17876, 'iv': 13.76, 'ltp': 453.90, 'chng': 111.95},
+            {'strike': 24150, 'oi': 930, 'chng_oi': 194, 'volume': 15757, 'iv': 13.65, 'ltp': 408.15, 'chng': 110.85},
+            {'strike': 24200, 'oi': 7908, 'chng_oi': 1478, 'volume': 127077, 'iv': 13.40, 'ltp': 362.65, 'chng': 100.05},
+            {'strike': 24250, 'oi': 2356, 'chng_oi': 410, 'volume': 90086, 'iv': 13.02, 'ltp': 318.35, 'chng': 92.45},
+            {'strike': 24300, 'oi': 20186, 'chng_oi': 2532, 'volume': 563836, 'iv': 12.92, 'ltp': 275.65, 'chng': 82.60},
+            {'strike': 24350, 'oi': 15825, 'chng_oi': 1565, 'volume': 741989, 'iv': 12.65, 'ltp': 235.25, 'chng': 73.75},
+            {'strike': 24400, 'oi': 66342, 'chng_oi': 7589, 'volume': 2570834, 'iv': 12.42, 'ltp': 197.45, 'chng': 60.95},
+            {'strike': 24450, 'oi': 58308, 'chng_oi': 12395, 'volume': 2119322, 'iv': 12.23, 'ltp': 163.00, 'chng': 50.70},
+            {'strike': 24500, 'oi': 179988, 'chng_oi': 32574, 'volume': 3231326, 'iv': 12.09, 'ltp': 131.45, 'chng': 40.80},
+            {'strike': 24550, 'oi': 80136, 'chng_oi': 29150, 'volume': 1452173, 'iv': 12.09, 'ltp': 104.15, 'chng': 30.80},
+            {'strike': 24600, 'oi': 141779, 'chng_oi': 2461, 'volume': 1952996, 'iv': 12.06, 'ltp': 82.20, 'chng': 23.35},
+            {'strike': 24650, 'oi': 55622, 'chng_oi': 8648, 'volume': 964499, 'iv': 12.17, 'ltp': 63.00, 'chng': 16.10},
+            {'strike': 24700, 'oi': 107374, 'chng_oi': 2382, 'volume': 1293020, 'iv': 12.22, 'ltp': 48.15, 'chng': 11.10},
+            {'strike': 24750, 'oi': 48415, 'chng_oi': 9905, 'volume': 746369, 'iv': 12.30, 'ltp': 35.95, 'chng': 6.65},
+            {'strike': 24800, 'oi': 107819, 'chng_oi': 2985, 'volume': 1081317, 'iv': 12.43, 'ltp': 26.85, 'chng': 3.85},
+            {'strike': 24850, 'oi': 39820, 'chng_oi': 5508, 'volume': 537632, 'iv': 12.61, 'ltp': 20.00, 'chng': 1.80},
+            {'strike': 24900, 'oi': 84509, 'chng_oi': 4714, 'volume': 726360, 'iv': 12.79, 'ltp': 14.45, 'chng': 0.15},
+            {'strike': 24950, 'oi': 34699, 'chng_oi': 583, 'volume': 434233, 'iv': 13.01, 'ltp': 10.95, 'chng': -0.60},
+            {'strike': 25000, 'oi': 165009, 'chng_oi': -592, 'volume': 949617, 'iv': 13.28, 'ltp': 8.15, 'chng': -1.35},
+        ]
+        
+        puts_data = [
+            {'strike': 24000, 'oi': 16950, 'chng_oi': 51415, 'volume': 1072766, 'iv': 15.94, 'ltp': 8.95, 'chng': -17.45},
+            {'strike': 24050, 'oi': 16800, 'chng_oi': 13175, 'volume': 453551, 'iv': 15.46, 'ltp': 10.90, 'chng': -21.20},
+            {'strike': 24100, 'oi': 9075, 'chng_oi': 22226, 'volume': 815541, 'iv': 14.97, 'ltp': 13.30, 'chng': -25.55},
+            {'strike': 24150, 'oi': 7425, 'chng_oi': 22132, 'volume': 607644, 'iv': 14.46, 'ltp': 16.45, 'chng': -32.00},
+            {'strike': 24200, 'oi': 1275, 'chng_oi': 41627, 'volume': 1180144, 'iv': 14.12, 'ltp': 20.75, 'chng': -38.20},
+            {'strike': 24250, 'oi': 2175, 'chng_oi': 28432, 'volume': 814589, 'iv': 13.70, 'ltp': 26.30, 'chng': -46.05},
+            {'strike': 24300, 'oi': 4950, 'chng_oi': 42074, 'volume': 1712849, 'iv': 13.45, 'ltp': 33.85, 'chng': -54.70},
+            {'strike': 24350, 'oi': 675, 'chng_oi': 49544, 'volume': 1571658, 'iv': 13.07, 'ltp': 43.10, 'chng': -63.50},
+            {'strike': 24400, 'oi': 1650, 'chng_oi': 113457, 'volume': 3117448, 'iv': 12.83, 'ltp': 55.60, 'chng': -71.85},
+            {'strike': 24450, 'oi': 1050, 'chng_oi': 66731, 'volume': 1697127, 'iv': 12.61, 'ltp': 70.20, 'chng': -81.75},
+            {'strike': 24500, 'oi': 3150, 'chng_oi': 84614, 'volume': 1791956, 'iv': 12.45, 'ltp': 88.90, 'chng': -92.65},
+            {'strike': 24550, 'oi': 1200, 'chng_oi': 20328, 'volume': 397028, 'iv': 12.42, 'ltp': 112.20, 'chng': -102.00},
+            {'strike': 24600, 'oi': 525, 'chng_oi': 13128, 'volume': 424063, 'iv': 12.41, 'ltp': 139.20, 'chng': -110.95},
+            {'strike': 24650, 'oi': 600, 'chng_oi': 2624, 'volume': 78232, 'iv': 12.53, 'ltp': 171.00, 'chng': -118.65},
+            {'strike': 24700, 'oi': 75, 'chng_oi': 3427, 'volume': 122032, 'iv': 12.57, 'ltp': 205.75, 'chng': -121.75},
+            {'strike': 24750, 'oi': 225, 'chng_oi': 1192, 'volume': 19365, 'iv': 12.82, 'ltp': 244.50, 'chng': -131.10},
+            {'strike': 24800, 'oi': 225, 'chng_oi': -149, 'volume': 34501, 'iv': 13.09, 'ltp': 284.00, 'chng': -131.15},
+            {'strike': 24850, 'oi': 75, 'chng_oi': 168, 'volume': 3152, 'iv': 13.12, 'ltp': 328.45, 'chng': -135.15},
+            {'strike': 24900, 'oi': 75, 'chng_oi': -617, 'volume': 5806, 'iv': 13.50, 'ltp': 371.95, 'chng': -138.25},
+            {'strike': 24950, 'oi': 225, 'chng_oi': 61, 'volume': 484, 'iv': 14.98, 'ltp': 422.65, 'chng': -137.65},
+            {'strike': 25000, 'oi': 450, 'chng_oi': -405, 'volume': 8092, 'iv': 14.40, 'ltp': 466.20, 'chng': -136.20},
+        ]
+        
+        calls_df = pd.DataFrame(calls_data)
+        puts_df = pd.DataFrame(puts_data)
+        
+        return calls_df, puts_df
         """Determine current market phase"""
         current = self.current_time
         if time(9, 15) <= current <= time(10, 0):
@@ -408,12 +566,35 @@ def main():
     # Sidebar
     st.sidebar.header("📊 Data Input")
     
-    # File upload
-    uploaded_file = st.sidebar.file_uploader(
-        "Upload Options Chain CSV", 
-        type=['csv'],
-        help="Upload the latest Nifty options chain data"
+    # Data input method selection
+    input_method = st.sidebar.radio(
+        "Choose Data Input Method:",
+        ["Upload CSV File", "Use Sample Data", "Manual Entry"]
     )
+    
+    calls_df, puts_df = None, None
+    
+    if input_method == "Upload CSV File":
+        # File upload
+        uploaded_file = st.sidebar.file_uploader(
+            "Upload Options Chain CSV", 
+            type=['csv'],
+            help="Upload the latest Nifty options chain data"
+        )
+        
+        if uploaded_file is not None:
+            # Load data
+            with st.spinner("Loading and analyzing data..."):
+                calls_df, puts_df = analyzer.load_and_clean_data(uploaded_file)
+    
+    elif input_method == "Use Sample Data":
+        # Use the data from the document
+        st.sidebar.info("Using sample data from your uploaded document")
+        calls_df, puts_df = analyzer.create_sample_data()
+    
+    elif input_method == "Manual Entry":
+        st.sidebar.info("Manual entry feature - coming soon!")
+        st.sidebar.markdown("For now, please use CSV upload or sample data.")
     
     # Manual current spot input
     current_spot = st.sidebar.number_input(
@@ -423,12 +604,8 @@ def main():
         help="Enter current Nifty spot price"
     )
     
-    if uploaded_file is not None:
-        # Load data
-        with st.spinner("Loading and analyzing data..."):
-            calls_df, puts_df = analyzer.load_and_clean_data(uploaded_file)
-        
-        if calls_df is not None and puts_df is not None and not calls_df.empty:
+    
+    if calls_df is not None and puts_df is not None and not calls_df.empty:
             
             # Market Overview
             col1, col2, col3, col4 = st.columns(4)
