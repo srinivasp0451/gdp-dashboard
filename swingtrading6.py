@@ -1,14 +1,11 @@
-# streamlit_swing_final_with_confidence.py
+# app.py
 """
-Auto-Optimized Swing Trading Dashboard — Final (with readable logic & per-trade confidence)
-
-- Keeps the same two-stage optimized backtest engine (confluences) you approved.
-- Adds sidebar dropdown (All/Long/Short) and file upload.
-- Backtest trades table + Live recommendation table (newest-first) with:
-    - readable logic text containing actual indicator values,
-    - confluence count (matched / total),
-    - per-trade confidence % computed from historical trades with same confluence count,
-    - BUY rows green / SELL rows red (pandas Styler).
+Final Streamlit trading dashboard (auto-optimized, confluences, long/short/all)
+- Sidebar: Upload + Trade type (All/Long/Short) + Evaluations
+- Tabs: Backtest Results | Live Recommendations
+- Backtest uses the advanced two-stage optimizer + confluence rules (same engine you approved)
+- Both Backtest and Live recommendations include human readable logic, SL/Target reason,
+  confluence counts, dynamic confidence, and color-coded BUY/SELL rows.
 """
 
 import re
@@ -21,18 +18,19 @@ import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
 from datetime import datetime
+import io
 
-st.set_page_config(layout="wide", page_title="Auto-Optimized Swing — Final (Confidence)", initial_sidebar_state="expanded")
+st.set_page_config(layout="wide", page_title="Swing Trading Dashboard (Final)", initial_sidebar_state="expanded")
 
-# -----------------------------
-# Robust loader / normalization
-# -----------------------------
+# -------------------------
+# Utility: robust loader
+# -------------------------
 def _clean_name(s: str) -> str:
-    s = str(s).lower().strip()
+    s = str(s or "").lower().strip()
     return re.sub(r'[^a-z0-9]', '', s)
 
-
 def detect_and_prepare(df_raw: pd.DataFrame) -> Tuple[pd.DataFrame, dict]:
+    """Detect OHLCV/date columns (fuzzy), coerce numeric, return prepared df and mapping."""
     df = df_raw.copy()
     orig_cols = list(df.columns)
     cleaned_map = {_clean_name(c): c for c in orig_cols}
@@ -44,18 +42,18 @@ def detect_and_prepare(df_raw: pd.DataFrame) -> Tuple[pd.DataFrame, dict]:
     vol_cands = ["volume", "vol", "quantity", "tradedqty"]
     date_cands = ["date", "datetime", "timestamp", "time"]
 
-    def find(orig_candidate_list):
-        for cand in orig_candidate_list:
+    def find(cands):
+        for cand in cands:
             key = _clean_name(cand)
             if key in cleaned_map:
                 return cleaned_map[key]
         for k, v in cleaned_map.items():
-            for cand in orig_candidate_list:
+            for cand in cands:
                 if _clean_name(cand) in k:
                     return v
         for orig in orig_cols:
             low = str(orig).lower().replace(' ', '')
-            for cand in orig_candidate_list:
+            for cand in cands:
                 if cand in low:
                     return orig
         return None
@@ -69,7 +67,7 @@ def detect_and_prepare(df_raw: pd.DataFrame) -> Tuple[pd.DataFrame, dict]:
         "date": find(date_cands)
     }
 
-    # set date index if available
+    # try set date index
     if col_map["date"] and col_map["date"] in df.columns:
         try:
             df[col_map["date"]] = pd.to_datetime(df[col_map["date"]], errors="coerce")
@@ -97,7 +95,7 @@ def detect_and_prepare(df_raw: pd.DataFrame) -> Tuple[pd.DataFrame, dict]:
     prepared = pd.DataFrame(index=df.index)
     for canon in ["open", "high", "low", "close", "volume"]:
         orig = col_map.get(canon)
-        if orig is not None and orig in df.columns:
+        if orig and orig in df.columns:
             prepared[canon] = to_numeric_series(df[orig])
         else:
             prepared[canon] = np.nan
@@ -119,42 +117,47 @@ def detect_and_prepare(df_raw: pd.DataFrame) -> Tuple[pd.DataFrame, dict]:
     prepared.sort_index(inplace=True)
     return prepared, col_map
 
-
-# -----------------------------
-# Indicators & Confluences
-# -----------------------------
-def add_indicators(df: pd.DataFrame, params: dict) -> pd.DataFrame:
+# -------------------------
+# Indicators & confluences
+# -------------------------
+def add_indicators(df: pd.DataFrame, params: Dict[str, Any]) -> pd.DataFrame:
     df = df.copy()
-    for c in ["open", "high", "low", "close", "volume"]:
+    for c in ["open","high","low","close","volume"]:
         if c not in df.columns:
             df[c] = np.nan
 
+    # EMAs / MAs
     df["ema9"] = df["close"].ewm(span=9, adjust=False).mean()
     df["ema21"] = df["close"].ewm(span=21, adjust=False).mean()
     df["ma_short"] = df["close"].rolling(params["short_ma"], min_periods=1).mean()
     df["ma_long"] = df["close"].rolling(params["long_ma"], min_periods=1).mean()
 
+    # RSI
+    per = params.get("rsi_period", 14)
     delta = df["close"].diff()
     up = delta.clip(lower=0)
     down = -delta.clip(upper=0)
-    ma_up = up.ewm(alpha=1 / params.get("rsi_period", 14), adjust=False).mean()
-    ma_down = down.ewm(alpha=1 / params.get("rsi_period", 14), adjust=False).mean()
+    ma_up = up.ewm(alpha=1/per, adjust=False).mean()
+    ma_down = down.ewm(alpha=1/per, adjust=False).mean()
     rs = ma_up / ma_down.replace(0, np.nan)
     df["rsi"] = 100 - (100 / (1 + rs))
     df["rsi"].fillna(50, inplace=True)
 
+    # MACD + hist
     macd_fast = df["close"].ewm(span=12, adjust=False).mean()
     macd_slow = df["close"].ewm(span=26, adjust=False).mean()
     df["macd"] = macd_fast - macd_slow
     df["macd_signal"] = df["macd"].ewm(span=9, adjust=False).mean()
     df["macd_hist"] = df["macd"] - df["macd_signal"]
 
+    # ATR
     tr1 = df["high"] - df["low"]
     tr2 = (df["high"] - df["close"].shift()).abs()
     tr3 = (df["low"] - df["close"].shift()).abs()
     tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
     df["atr"] = tr.rolling(params.get("atr_period", 14), min_periods=1).mean()
 
+    # ADX simplified
     plus_dm = df["high"].diff()
     minus_dm = -df["low"].diff()
     plus_dm[plus_dm < 0] = 0
@@ -165,6 +168,7 @@ def add_indicators(df: pd.DataFrame, params: dict) -> pd.DataFrame:
     dx = (abs(plus_di - minus_di) / (plus_di + minus_di).replace(0, np.nan)) * 100
     df["adx"] = dx.rolling(14, min_periods=1).mean()
 
+    # Bollinger Bands
     bb_mid = df["close"].rolling(params.get("bb_period", 20), min_periods=1).mean()
     bb_std = df["close"].rolling(params.get("bb_period", 20), min_periods=1).std().fillna(0)
     df["bb_mid"] = bb_mid
@@ -172,35 +176,82 @@ def add_indicators(df: pd.DataFrame, params: dict) -> pd.DataFrame:
     df["bb_lower"] = bb_mid - params.get("bb_k", 2) * bb_std
 
     df["vol_avg"] = df["volume"].rolling(params.get("vol_period", 20), min_periods=1).mean()
-
     return df
 
-
-def evaluate_confluences(row, params, direction="long") -> Dict[str, bool]:
-    confs = {}
-    confs["ma_cross_long"] = (row["ma_short"] > row["ma_long"])
-    confs["ema_trend_long"] = (row["ema9"] > row["ema21"])
-    confs["bb_breakout_long"] = (row["close"] > row["bb_upper"])
-    confs["macd_hist_rising_long"] = (row["macd_hist"] > 0 and row["macd_hist"] > row.get("_macd_hist_prev", 0))
-    confs["vol_spike"] = (row["volume"] >= params["vol_spike_mult"] * row["vol_avg"]) if (not np.isnan(row.get("vol_avg", np.nan))) else False
-    confs["atr_ok"] = (row["atr"] >= params.get("atr_min", 0))
-
-    if direction == "short":
+def evaluate_confluences_for_direction(row: pd.Series, params: Dict[str,Any], direction: str="long") -> Dict[str,bool]:
+    # returns dictionary of confluence boolean flags specific to direction
+    if direction == "long":
         confs = {
-            "ma_cross_short": (row["ma_short"] < row["ma_long"]),
-            "ema_trend_short": (row["ema9"] < row["ema21"]),
-            "bb_breakout_short": (row["close"] < row["bb_lower"]),
-            "macd_hist_rising_short": (row["macd_hist"] < 0 and row["macd_hist"] < row.get("_macd_hist_prev", 0)),
-            "vol_spike": confs["vol_spike"],
-            "atr_ok": confs["atr_ok"]
+            "ma_cross": row["ma_short"] > row["ma_long"],
+            "ema_trend": row["ema9"] > row["ema21"],
+            "bb_breakout": row["close"] > row["bb_upper"],
+            "macd_hist_rising": (row["macd_hist"] > 0 and row["macd_hist"] > row.get("_macd_hist_prev", 0)),
+            "vol_spike": (row["volume"] >= params.get("vol_spike_mult", 1.5) * row.get("vol_avg", 0)) if not isnan(row.get("vol_avg", np.nan)) else False,
+            "atr_ok": row.get("atr", 0) >= params.get("atr_min", 0)
+        }
+    else:
+        confs = {
+            "ma_cross": row["ma_short"] < row["ma_long"],
+            "ema_trend": row["ema9"] < row["ema21"],
+            "bb_breakout": row["close"] < row["bb_lower"],
+            "macd_hist_rising": (row["macd_hist"] < 0 and row["macd_hist"] < row.get("_macd_hist_prev", 0)),
+            "vol_spike": (row["volume"] >= params.get("vol_spike_mult", 1.5) * row.get("vol_avg", 0)) if not isnan(row.get("vol_avg", np.nan)) else False,
+            "atr_ok": row.get("atr", 0) >= params.get("atr_min", 0)
         }
     return confs
 
+# -------------------------
+# Backtester (long/short/all)
+# -------------------------
+def compute_sl_target_reasons(entry_price: float, row: pd.Series, params: Dict[str,Any], direction: str):
+    """Return (sl_value, sl_reason_text, target_value, target_reason_text, adjusted_flag)"""
+    adjusted = False
+    # default use ATR-based SL if configured, else percentage
+    if params.get("use_atr_sl", False):
+        atr = float(row.get("atr", 0.0) or 0.0)
+        sl = (entry_price - atr * params.get("atr_mult",1.5)) if direction=="long" else (entry_price + atr * params.get("atr_mult",1.5))
+        sl_reason = f"SL = Entry {'−' if direction=='long' else '+'} ATR×{params.get('atr_mult',1.5)} = {entry_price:.2f} {'−' if direction=='long' else '+'} ({atr:.3f}×{params.get('atr_mult',1.5)})"
+    else:
+        sl = (entry_price * (1 - params.get("sl_pct",1.5)/100)) if direction=="long" else (entry_price * (1 + params.get("sl_pct",1.5)/100))
+        sl_reason = f"SL = Entry {'−' if direction=='long' else '+'} {params.get('sl_pct',1.5)}% = {sl:.2f}"
 
-# -----------------------------
-# Backtester with confluence tagging (supports long/short/all)
-# -----------------------------
-def backtest_with_confluences(df_raw: pd.DataFrame, params: dict, trade_type: str = "Long") -> Tuple[pd.DataFrame, dict]:
+    # target: either fixed percent or ATR-mult
+    if params.get("target_atr", False):
+        atr = float(row.get("atr", 0.0) or 0.0)
+        target = (entry_price + atr * params.get("target_atr_mult",1.5)) if direction=="long" else (entry_price - atr * params.get("target_atr_mult",1.5))
+        target_reason = f"Target = Entry {'+' if direction=='long' else '−'} ATR×{params.get('target_atr_mult',1.5)} = {entry_price:.2f} {'+' if direction=='long' else '−'} ({atr:.3f}×{params.get('target_atr_mult',1.5)})"
+    else:
+        target = (entry_price * (1 + params.get("target_pct",2.0)/100)) if direction=="long" else (entry_price * (1 - params.get("target_pct",2.0)/100))
+        target_reason = f"Target = Entry {'+' if direction=='long' else '−'} {params.get('target_pct',2.0)}% = {target:.2f}"
+
+    # Safety checks: ensure SL & target are on correct sides of entry; if not, fix and mark adjusted
+    if direction == "long":
+        if sl >= entry_price:
+            # force below
+            atr = float(row.get("atr", 0.0) or 0.0)
+            sl = entry_price - abs(atr * params.get("atr_mult",1.5))
+            sl_reason += " (adjusted)"
+            adjusted = True
+        if target <= entry_price:
+            atr = float(row.get("atr", 0.0) or 0.0)
+            target = entry_price + abs(atr * params.get("target_atr_mult", params.get("atr_mult",1.5)))
+            target_reason += " (adjusted)"
+            adjusted = True
+    else:
+        if sl <= entry_price:
+            atr = float(row.get("atr", 0.0) or 0.0)
+            sl = entry_price + abs(atr * params.get("atr_mult",1.5))
+            sl_reason += " (adjusted)"
+            adjusted = True
+        if target >= entry_price:
+            atr = float(row.get("atr", 0.0) or 0.0)
+            target = entry_price - abs(atr * params.get("target_atr_mult", params.get("atr_mult",1.5)))
+            target_reason += " (adjusted)"
+            adjusted = True
+
+    return float(sl), sl_reason, float(target), target_reason, adjusted
+
+def backtest_with_confluences(df_raw: pd.DataFrame, params: Dict[str,Any], trade_type: str="Long") -> Tuple[pd.DataFrame, dict]:
     prepared, meta = detect_and_prepare(df_raw)
     if prepared is None:
         raise ValueError(f"Failed to detect OHLC columns. Mapping attempt: {meta['col_map']}. Original columns: {meta['original_columns']}")
@@ -208,92 +259,75 @@ def backtest_with_confluences(df_raw: pd.DataFrame, params: dict, trade_type: st
     df = add_indicators(prepared, params)
     trades = []
     position = None
-
     df["_macd_hist_prev"] = df["macd_hist"].shift(1).fillna(0)
 
     for i in range(1, len(df)):
         row = df.iloc[i]
 
-        long_allowed = trade_type in ("Long", "All")
-        short_allowed = trade_type in ("Short", "All")
-
-        confs_long = evaluate_confluences(row, params, direction="long") if long_allowed else {}
-        confs_short = evaluate_confluences(row, params, direction="short") if short_allowed else {}
+        long_allowed = trade_type in ("Long","All")
+        short_allowed = trade_type in ("Short","All")
 
         if position is None:
-            enter_long = False
-            enter_short = False
+            enter_long=False; enter_short=False
+            confs_long = evaluate_confluences_for_direction(row, params, "long") if long_allowed else {}
+            confs_short = evaluate_confluences_for_direction(row, params, "short") if short_allowed else {}
+
+            # evaluate rule_mode
+            def decide(confs):
+                if params["rule_mode"] == "strict":
+                    return all([confs.get(k, False) for k in params["confluence_list"]])
+                else:
+                    hits = sum([1 for k in params["confluence_list"] if confs.get(k, False)])
+                    return hits >= params.get("any_k", 2)
 
             if long_allowed:
-                if params["rule_mode"] == "strict":
-                    # require all defined confluences to be True (match keys from confluence_list with _long suffix)
-                    enter_long = all(confs_long.get(k if k.endswith("_long") else k + "_long", False) for k in params["confluence_list"])
-                else:
-                    hits = sum(1 for k in params["confluence_list"] if confs_long.get(k if k.endswith("_long") else k + "_long", False))
-                    enter_long = hits >= params.get("any_k", 2)
-
+                enter_long = decide(confs_long)
             if short_allowed:
-                if params["rule_mode"] == "strict":
-                    enter_short = all(confs_short.get(k if k.endswith("_short") else k + "_short", False) for k in params["confluence_list"])
-                else:
-                    hits_s = sum(1 for k in params["confluence_list"] if confs_short.get(k if k.endswith("_short") else k + "_short", False))
-                    enter_short = hits_s >= params.get("any_k", 2)
+                enter_short = decide(confs_short)
 
+            # if both, choose by number of confluences
             if enter_long or enter_short:
                 long_hits = sum(1 for v in confs_long.values() if v) if long_allowed else 0
                 short_hits = sum(1 for v in confs_short.values() if v) if short_allowed else 0
 
                 if enter_long and (not enter_short or long_hits >= short_hits):
-                    entry_price = row["open"]
-                    sl_price = (row["close"] - row["atr"] * params["atr_mult"]) if params["use_atr_sl"] else entry_price * (1 - params["sl_pct"] / 100)
-                    target_price = entry_price * (1 + params["target_pct"] / 100) if not params.get("target_atr", False) else entry_price + row["atr"] * params.get("target_atr_mult", 1.5)
+                    direction = "BUY"
+                    entry_price = float(row["open"])
+                    sl, sl_reason, target, target_reason, adjusted = compute_sl_target_reasons(entry_price, row, params, "long")
                     position = {
-                        "direction": "BUY",
-                        "entry_index": row.name,
-                        "entry_price": float(entry_price),
-                        "sl": float(sl_price),
-                        "target": float(target_price),
-                        "hold_days": 0,
-                        "confluences": confs_long,
-                        "confluence_count": long_hits,
-                        "total_confluences": len([k for k in confs_long.keys() if not k.startswith("vol_spike") or True])
+                        "direction":"BUY","entry_index":row.name,"entry_price":entry_price,
+                        "sl":sl,"target":target,"hold_days":0,"confluences":confs_long,
+                        "sl_reason":sl_reason,"target_reason":target_reason,"adjusted":adjusted
                     }
                 else:
-                    entry_price = row["open"]
-                    sl_price = (row["close"] + row["atr"] * params["atr_mult"]) if params["use_atr_sl"] else entry_price * (1 + params["sl_pct"] / 100)
-                    target_price = entry_price * (1 - params["target_pct"] / 100) if not params.get("target_atr", False) else entry_price - row["atr"] * params.get("target_atr_mult", 1.5)
+                    direction = "SELL"
+                    entry_price = float(row["open"])
+                    sl, sl_reason, target, target_reason, adjusted = compute_sl_target_reasons(entry_price, row, params, "short")
                     position = {
-                        "direction": "SELL",
-                        "entry_index": row.name,
-                        "entry_price": float(entry_price),
-                        "sl": float(sl_price),
-                        "target": float(target_price),
-                        "hold_days": 0,
-                        "confluences": confs_short,
-                        "confluence_count": short_hits,
-                        "total_confluences": len([k for k in confs_short.keys() if not k.startswith("vol_spike") or True])
+                        "direction":"SELL","entry_index":row.name,"entry_price":entry_price,
+                        "sl":sl,"target":target,"hold_days":0,"confluences":confs_short,
+                        "sl_reason":sl_reason,"target_reason":target_reason,"adjusted":adjusted
                     }
 
         else:
             position["hold_days"] += 1
-            exit_price = None
-            reason = None
-            if position["direction"] == "BUY":
+            exit_price=None; reason=None
+            if position["direction"]=="BUY":
                 if row["high"] >= position["target"]:
-                    exit_price = position["target"]; reason = "Target"
+                    exit_price = position["target"]; reason="Target"
                 elif row["low"] <= position["sl"]:
-                    exit_price = position["sl"]; reason = "StopLoss"
+                    exit_price = position["sl"]; reason="StopLoss"
             else:
                 if row["low"] <= position["target"]:
-                    exit_price = position["target"]; reason = "Target"
+                    exit_price = position["target"]; reason="Target"
                 elif row["high"] >= position["sl"]:
-                    exit_price = position["sl"]; reason = "StopLoss"
+                    exit_price = position["sl"]; reason="StopLoss"
 
-            if position["hold_days"] >= params["max_hold"]:
-                exit_price = row["close"]; reason = "MaxHold"
+            if position["hold_days"] >= params.get("max_hold",5) and exit_price is None:
+                exit_price = row["close"]; reason="MaxHold"
 
             if exit_price is not None:
-                pnl = (exit_price - position["entry_price"]) if position["direction"] == "BUY" else (position["entry_price"] - exit_price)
+                pnl = (exit_price - position["entry_price"]) if position["direction"]=="BUY" else (position["entry_price"] - exit_price)
                 trades.append({
                     "entry_date": position["entry_index"],
                     "exit_date": row.name,
@@ -304,14 +338,16 @@ def backtest_with_confluences(df_raw: pd.DataFrame, params: dict, trade_type: st
                     "hold_days": position["hold_days"],
                     "reason": reason,
                     "confluences": position["confluences"],
-                    "confluence_count": position.get("confluence_count", 0),
-                    "total_confluences": position.get("total_confluences", 0)
+                    "sl_reason": position.get("sl_reason",""),
+                    "target_reason": position.get("target_reason",""),
+                    "adjusted": position.get("adjusted", False)
                 })
                 position = None
 
+    # close open
     if position is not None:
         last = df.iloc[-1]
-        pnl = (last["close"] - position["entry_price"]) if position["direction"] == "BUY" else (position["entry_price"] - last["close"])
+        pnl = (last["close"] - position["entry_price"]) if position["direction"]=="BUY" else (position["entry_price"] - last["close"])
         trades.append({
             "entry_date": position["entry_index"],
             "exit_date": last.name,
@@ -322,84 +358,78 @@ def backtest_with_confluences(df_raw: pd.DataFrame, params: dict, trade_type: st
             "hold_days": position["hold_days"],
             "reason": "EOD",
             "confluences": position["confluences"],
-            "confluence_count": position.get("confluence_count", 0),
-            "total_confluences": position.get("total_confluences", 0)
+            "sl_reason": position.get("sl_reason",""),
+            "target_reason": position.get("target_reason",""),
+            "adjusted": position.get("adjusted", False)
         })
 
     trades_df = pd.DataFrame(trades)
-    metrics = {"net_pnl": 0.0, "n_trades": 0, "win_rate": 0.0, "avg_win": 0.0, "avg_loss": 0.0, "avg_hold": 0.0, "trades_per_100bars": 0.0}
+    metrics = {"net_pnl":0.0,"n_trades":0,"win_rate":0.0,"avg_win":0.0,"avg_loss":0.0,"avg_hold":0.0,"trades_per_100bars":0.0}
     if not trades_df.empty:
         metrics["net_pnl"] = trades_df["pnl"].sum()
         metrics["n_trades"] = len(trades_df)
-        metrics["win_rate"] = (trades_df["pnl"] > 0).mean()
-        metrics["avg_win"] = trades_df[trades_df["pnl"] > 0]["pnl"].mean() if (trades_df["pnl"] > 0).any() else 0.0
-        metrics["avg_loss"] = trades_df[trades_df["pnl"] <= 0]["pnl"].mean() if (trades_df["pnl"] <= 0).any() else 0.0
+        metrics["win_rate"] = (trades_df["pnl"]>0).mean()
+        metrics["avg_win"] = trades_df[trades_df["pnl"]>0]["pnl"].mean() if (trades_df["pnl"]>0).any() else 0.0
+        metrics["avg_loss"] = trades_df[trades_df["pnl"]<=0]["pnl"].mean() if (trades_df["pnl"]<=0).any() else 0.0
         metrics["avg_hold"] = trades_df["hold_days"].mean()
-        metrics["trades_per_100bars"] = metrics["n_trades"] / max(1, len(prepared)) * 100
+        metrics["trades_per_100bars"] = metrics["n_trades"]/max(1,len(prepared))*100
 
     return trades_df, metrics
 
-
-# -----------------------------
-# Optimizer (2-stage)
-# -----------------------------
-def scoring_fn(metrics: dict, min_trades: int = 4) -> float:
-    score = float(metrics.get("net_pnl", 0.0))
-    win = float(metrics.get("win_rate", 0.0))
-    trades = int(metrics.get("n_trades", 0))
+# -------------------------
+# Optimizer (two-stage random + hill-climb)
+# -------------------------
+def scoring_fn(metrics: dict, min_trades: int=4) -> float:
+    score = float(metrics.get("net_pnl",0.0))
+    win = float(metrics.get("win_rate",0.0))
+    trades = int(metrics.get("n_trades",0))
     if trades < min_trades:
         score *= 0.4
     score *= (1.0 + win)
-    avg_abs = abs(metrics.get("avg_win", 0.0)) + abs(metrics.get("avg_loss", 0.0))
+    avg_abs = abs(metrics.get("avg_win",0.0)) + abs(metrics.get("avg_loss",0.0))
     if avg_abs < 0.01:
         score *= 0.8
     return score
 
-
-def random_search_stage(df_raw, search_space: dict, evals: int, seed: int = 42, trade_type: str = "Long") -> List[dict]:
+def random_search_stage(df_raw: pd.DataFrame, search_space: Dict[str,Any], evals:int, seed:int=42, trade_type:str="Long") -> List[dict]:
     random.seed(seed)
-    results = []
+    results=[]
     for _ in range(evals):
-        params = {k: random.choice(v) for k, v in search_space.items() if isinstance(v, list)}
-        params["rsi_period"] = search_space.get("rsi_period", [14])[0]
-        params["confluence_list"] = search_space.get("confluence_list", [["ma_cross", "ema_trend", "macd_hist_rising", "vol_spike", "bb_breakout", "atr_ok"]])[0]
-        params["rule_mode"] = random.choice(search_space.get("rule_mode", ["strict", "any_k"]))
-        if params["rule_mode"] == "any_k":
-            params["any_k"] = random.randint(2, max(2, len(params["confluence_list"])))
+        params = {k: random.choice(v) for k,v in search_space.items() if isinstance(v,list)}
+        params["rsi_period"] = search_space.get("rsi_period",[14])[0]
+        params["confluence_list"] = search_space.get("confluence_list", [["ma_cross","ema_trend","macd_hist_rising","vol_spike","bb_breakout","atr_ok"]])[0]
+        params["rule_mode"] = random.choice(search_space.get("rule_mode",["strict","any_k"]))
+        if params["rule_mode"]=="any_k":
+            params["any_k"] = random.randint(2,max(2,len(params["confluence_list"])))
         try:
             trades_df, metrics = backtest_with_confluences(df_raw, params, trade_type=trade_type)
-            score = scoring_fn(metrics, min_trades=search_space.get("min_trades", 4))
-            results.append({"params": params, "metrics": metrics, "score": score, "trades_df": trades_df})
+            score = scoring_fn(metrics, min_trades=search_space.get("min_trades",4))
+            results.append({"params":params,"metrics":metrics,"score":score,"trades_df":trades_df})
         except Exception:
             continue
     return results
 
-
-def hill_climb_neighbors(base_params: dict, search_space: dict) -> List[dict]:
-    neighbors = []
-    def pick_close(option_list, value):
-        if value not in option_list:
-            return random.choice(option_list)
-        idx = option_list.index(value)
-        choices = [option_list[max(0, idx - 1)], option_list[min(len(option_list) - 1, idx + 1)]]
-        return random.choice(choices)
-
+def hill_climb_neighbors(base_params:dict, search_space:dict) -> List[dict]:
+    neighbors=[]
+    def pick_close(opts, val):
+        if val not in opts:
+            return random.choice(opts)
+        idx = opts.index(val)
+        return opts[max(0, idx-1)] if random.random()<0.5 else opts[min(len(opts)-1, idx+1)]
     for _ in range(15):
-        neighbor = base_params.copy()
-        for key, space in search_space.items():
-            if not isinstance(space, list):
-                continue
-            if key in neighbor:
-                neighbor[key] = pick_close(space, neighbor[key])
+        n=base_params.copy()
+        for k,space in search_space.items():
+            if not isinstance(space,list): continue
+            if k in n:
+                n[k] = pick_close(space, n[k])
             else:
-                neighbor[key] = random.choice(space)
-        if neighbor.get("rule_mode") == "any_k" and "any_k" not in neighbor:
-            neighbor["any_k"] = random.randint(2, max(2, len(neighbor.get("confluence_list", []))))
-        neighbors.append(neighbor)
+                n[k] = random.choice(space)
+        if n.get("rule_mode")=="any_k" and "any_k" not in n:
+            n["any_k"] = random.randint(2, max(2, len(n.get("confluence_list",[]))))
+        neighbors.append(n)
     return neighbors
 
-
-def two_stage_optimize(df_raw: pd.DataFrame, search_space: dict, stage_a_eval: int = 120, seed: int = 42, trade_type: str = "Long") -> Tuple[dict, List[dict]]:
+def two_stage_optimize(df_raw:pd.DataFrame, search_space:dict, stage_a_eval:int=120, seed:int=42, trade_type:str="Long"):
     stage_a_results = random_search_stage(df_raw, search_space, evals=stage_a_eval, seed=seed, trade_type=trade_type)
     if not stage_a_results:
         raise RuntimeError("Stage A found no valid parameter sets.")
@@ -407,24 +437,23 @@ def two_stage_optimize(df_raw: pd.DataFrame, search_space: dict, stage_a_eval: i
     best = top_k[0]
     all_candidates = stage_a_results.copy()
     for entry in top_k:
-        base_params = entry["params"]
-        neighbors = hill_climb_neighbors(base_params, search_space)
+        base = entry["params"]
+        neighbors = hill_climb_neighbors(base, search_space)
         for n in neighbors:
             try:
                 trades_df, metrics = backtest_with_confluences(df_raw, n, trade_type=trade_type)
-                score = scoring_fn(metrics, min_trades=search_space.get("min_trades", 4))
-                all_candidates.append({"params": n, "metrics": metrics, "score": score, "trades_df": trades_df})
+                score = scoring_fn(metrics, min_trades=search_space.get("min_trades",4))
+                all_candidates.append({"params":n,"metrics":metrics,"score":score,"trades_df":trades_df})
                 if score > best["score"]:
-                    best = {"params": n, "metrics": metrics, "score": score, "trades_df": trades_df}
+                    best = {"params":n,"metrics":metrics,"score":score,"trades_df":trades_df}
             except Exception:
                 continue
     return best, all_candidates
 
-
-# -----------------------------
-# Plot helpers & UI helpers
-# -----------------------------
-def plot_price_with_trades(prepared_df: pd.DataFrame, trades_df: pd.DataFrame, params: dict):
+# -------------------------
+# Plot & rendering helpers
+# -------------------------
+def plot_price_with_trades(prepared_df:pd.DataFrame, trades_df:pd.DataFrame, params:dict):
     df = add_indicators(prepared_df, params)
     fig = go.Figure()
     fig.add_trace(go.Scatter(x=df.index, y=df["close"], mode="lines", name="Close", line=dict(width=1.5)))
@@ -447,79 +476,120 @@ def plot_price_with_trades(prepared_df: pd.DataFrame, trades_df: pd.DataFrame, p
     fig.update_layout(template="plotly_dark", height=650, title="Price & Trades")
     return fig
 
+def trades_to_display_df(trades_df:pd.DataFrame):
+    if trades_df is None or trades_df.empty:
+        return pd.DataFrame()
+    df = trades_df.copy()
+    df["entry_date"] = pd.to_datetime(df["entry_date"])
+    df["exit_date"] = pd.to_datetime(df["exit_date"])
+    # create readable logic & confluence count & confidence placeholder (filled later)
+    def confluence_summary(cdict):
+        if not isinstance(cdict, dict): return ""
+        return ", ".join([k for k,v in cdict.items() if v])
+    df["confluence_count"] = df["confluences"].apply(lambda x: sum(1 for v in x.values()) if isinstance(x, dict) else 0)
+    df["confluence_total"] = df["confluences"].apply(lambda x: len(x) if isinstance(x, dict) else 0)
+    df["confluences_text"] = df["confluences"].apply(confluence_summary)
+    df["logic"] = df.apply(lambda r: readable_logic_from_row(r), axis=1)
+    # add target/sl reasons columns already present
+    return df
 
-def build_readable_logic(row, params, direction):
-    """
-    Create a human-readable logic string containing actual indicator values for the given row.
-    Example: 'EMA9(1520.4)>EMA21(1508.3); MA20(1510.2)>MA50(1500.6); ATR=12.4; RSI=56.2; MACD_hist=0.45'
-    """
-    parts = []
-    try:
-        if direction == "BUY":
-            parts.append(f"EMA9={row['ema9']:.2f} > EMA21={row['ema21']:.2f}" if not np.isnan(row['ema9']) and not np.isnan(row['ema21']) else "")
-            parts.append(f"MA{params['short_ma']}={row['ma_short']:.2f} > MA{params['long_ma']}={row['ma_long']:.2f}" if not np.isnan(row['ma_short']) and not np.isnan(row['ma_long']) else "")
-            parts.append(f"ATR={row['atr']:.2f}")
-            parts.append(f"RSI={row['rsi']:.1f}")
-            parts.append(f"MACD_hist={row['macd_hist']:.4f}")
-            parts.append(f"Close={row['close']:.2f}")
+def readable_logic_from_row(row):
+    # Build a human-friendly logic string with key indicator values
+    # We may not have indicator snapshot in the trade row, so produce best-effort
+    confs = row.get("confluences", {})
+    parts=[]
+    if isinstance(confs, dict):
+        if row["direction"]=="BUY":
+            # attempt to include values from confluences if included
+            for k in ["ma_cross","ema_trend","macd_hist_rising","bb_breakout","vol_spike","atr_ok"]:
+                if confs.get(k):
+                    parts.append(k.replace("_"," ").title())
         else:
-            parts.append(f"EMA9={row['ema9']:.2f} < EMA21={row['ema21']:.2f}" if not np.isnan(row['ema9']) and not np.isnan(row['ema21']) else "")
-            parts.append(f"MA{params['short_ma']}={row['ma_short']:.2f} < MA{params['long_ma']}={row['ma_long']:.2f}" if not np.isnan(row['ma_short']) and not np.isnan(row['ma_long']) else "")
-            parts.append(f"ATR={row['atr']:.2f}")
-            parts.append(f"RSI={row['rsi']:.1f}")
-            parts.append(f"MACD_hist={row['macd_hist']:.4f}")
-            parts.append(f"Close={row['close']:.2f}")
-    except Exception:
-        pass
-    parts = [p for p in parts if p]
+            for k in ["ma_cross","ema_trend","macd_hist_rising","bb_breakout","vol_spike","atr_ok"]:
+                if confs.get(k):
+                    parts.append(k.replace("_"," ").title())
     return "; ".join(parts)
 
+def style_trades_df_for_display(df_display:pd.DataFrame):
+    if df_display.empty:
+        return df_display
+    # select and rename columns for display
+    disp = df_display.copy()
+    disp["Date"] = disp["entry_date"].dt.strftime("%Y-%m-%d %H:%M")
+    disp["Direction"] = disp["direction"]
+    disp["Entry"] = disp["entry_price"].map(lambda x: f"{x:.2f}")
+    disp["Target"] = disp["exit_price"].map(lambda x: f"{x:.2f}")
+    disp["SL"] = (disp["entry_price"] - disp["pnl"]).map(lambda x: f"{x:.2f}")  # approximate original sl (entry - pnl for BUY) - keep original sl_reason column too
+    disp["PnL"] = disp["pnl"].map(lambda x: f"{x:.2f}")
+    disp["Hold"] = disp["hold_days"]
+    disp["Confs"] = disp["confluence_count"].astype(str) + "/" + disp["confluence_total"].astype(str)
+    disp["Logic"] = disp["logic"]
+    disp["Target Reason"] = disp["target_reason"]
+    disp["SL Reason"] = disp["sl_reason"]
+    disp["Confidence"] = disp.get("confidence_pct", None)
+    # order columns
+    order = ["Date","Direction","Entry","Target","SL","Target Reason","SL Reason","Confs","Logic","Confidence","PnL","Hold"]
+    disp = disp[order]
+    # styling via pandas Styler -> green/red rows
+    def highlight_row(row):
+        color = ""
+        if row["Direction"] == "BUY":
+            color = "background-color: #0a6b2f; color: white;"
+        else:
+            color = "background-color: #8b0b0b; color: white;"
+        return [color if col in ["Direction","Entry","Target","SL","Target Reason","SL Reason","Confs","Logic","Confidence","PnL","Hold","Date"] else "" for col in row.index]
+    sty = disp.style
+    # apply per-row coloring on Direction column; use apply to whole
+    def row_style(r):
+        return ["background-color: #0a6b2f; color: white;" if r["Direction"]=="BUY" and c!='Date' else
+                "background-color: #8b0b0b; color: white;" if r["Direction"]=="SELL" and c!='Date' else ""
+                for c in r.index]
+    try:
+        sty = sty.apply(lambda r: row_style(r), axis=1)
+    except Exception:
+        pass
+    return sty
 
-def compute_confidence_for_live(trades_df: pd.DataFrame, matched_count: int):
-    """
-    Confidence: proportion of historical trades (from trades_df) that had exactly matched_count confluence matches and were winners.
-    If insufficient historical samples (<3), fallback to overall win_rate.
-    Returns percentage (0-100).
-    """
+# -------------------------
+# Confidence helper
+# -------------------------
+def dynamic_confidence_for_live(trades_df:pd.DataFrame, live_direction:str, confluence_count:int):
+    """Compute confidence% as win rate of past trades that match direction and same confluence_count.
+    Fallback to overall win rate if no match."""
     if trades_df is None or trades_df.empty:
         return 0.0
-    # use confluence_count field from historical trades
-    if "confluence_count" in trades_df.columns:
-        same = trades_df[trades_df["confluence_count"] == matched_count]
-        if len(same) >= 3:
-            return float((same["pnl"] > 0).mean() * 100)
-    # fallback to overall win rate
-    return float((trades_df["pnl"] > 0).mean() * 100) if not trades_df.empty else 0.0
+    df = trades_df.copy()
+    df["con_count"] = df["confluences"].apply(lambda x: sum(1 for v in x.values()) if isinstance(x, dict) else 0)
+    subset = df[(df["direction"]==live_direction) & (df["con_count"]==confluence_count)]
+    if not subset.empty:
+        return float((subset["pnl"]>0).mean() * 100)
+    else:
+        # fallback to overall direction win rate
+        subs2 = df[df["direction"]==live_direction]
+        if not subs2.empty:
+            return float((subs2["pnl"]>0).mean() * 100)
+    # final fallback
+    return float((df["pnl"]>0).mean() * 100) if not df.empty else 0.0
 
-
-def style_trade_rows(df_display: pd.DataFrame):
-    """
-    Return a pandas Styler that colors rows green for BUY and red for SELL.
-    """
-    def row_color(row):
-        return ["background-color: #093; color: white; font-weight:600" if row["Signal"] == "BUY"
-                else "background-color: #900; color:white; font-weight:600" if row["Signal"] == "SELL"
-                else "" for _ in row]
-    return df_display.style.apply(row_color, axis=1)
-
-
-# -----------------------------
-# Streamlit UI (sidebar + main)
-# -----------------------------
-st.title("🚀 Auto-Optimized Swing Trading Dashboard — Final (Per-Trade Confidence & Readable Logic)")
+# -------------------------
+# Sidebar and main UI
+# -------------------------
+st.title("🚀 Swing Trading Dashboard — Final (Auto-optimize & Confluences)")
 
 with st.sidebar:
-    st.header("Upload & Controls")
-    uploaded = st.file_uploader("Upload OHLC CSV / XLSX", type=["csv", "xlsx"])
-    trade_type = st.selectbox("Trade type", ["All", "Long", "Short"])
-    stage_a_eval = st.number_input("Stage A evaluations", min_value=20, max_value=1000, value=180, step=20)
-    run_opt = st.button("Run Two-Stage Optimize & Backtest")
+    st.header("Controls")
+    uploaded = st.file_uploader("Upload OHLC CSV or XLSX", type=["csv","xlsx"])
+    trade_type = st.selectbox("Trade Type", ["All","Long","Short"], index=1)
+    stage_a_eval = st.number_input("Stage A evaluations (random search)", min_value=20, max_value=1000, value=180, step=20)
+    run_opt = st.button("Run Optimize & Backtest")
+    st.markdown("---")
+    st.caption("Notes: Optimizer auto-selects EMA/ATR/etc. parameters. Live confidence uses similar historical trades.")
 
 if uploaded is None:
-    st.info("Upload your OHLC CSV/XLSX in the sidebar to begin.")
+    st.info("Upload a file to start (use your previously working CSV).")
     st.stop()
 
-# read file robustly
+# read file
 try:
     if uploaded.name.lower().endswith(".xlsx"):
         df_raw = pd.read_excel(uploaded)
@@ -529,48 +599,45 @@ except Exception as e:
     st.error(f"Failed to read file: {e}")
     st.stop()
 
-st.markdown("**Raw columns detected:**")
+st.markdown("**Detected columns (raw):**")
 st.write(list(df_raw.columns))
 
 prepared, meta = detect_and_prepare(df_raw)
 if prepared is None:
     st.error("Uploaded file doesn't contain usable OHLC data after normalization.")
-    st.markdown("Mapping attempted:")
-    st.json(meta["col_map"])
-    st.markdown("Original columns:")
-    st.write(meta["original_columns"])
+    st.json(meta)
     st.stop()
 
-st.success(f"Loaded {len(prepared)} rows — date index? {isinstance(prepared.index, pd.DatetimeIndex)}")
-st.markdown("### Column mapping (canonical -> original)")
+st.success(f"Loaded {len(prepared)} rows — Date index? {isinstance(prepared.index, pd.DatetimeIndex)}")
+st.markdown("### Column mapping")
 st.json(meta)
 
-# default search space (same as before)
+# search space (same as before)
 default_search_space = {
-    "short_ma": list(range(5, 31, 1)),
-    "long_ma": list(range(20, 121, 5)),
-    "rsi_entry": [20, 25, 30, 35, 40],
-    "target_pct": [0.8, 1.0, 1.5, 2.0, 3.0],
-    "sl_pct": [0.5, 1.0, 1.5, 2.0, 3.0],
-    "atr_mult": [0.8, 1.0, 1.5, 2.0],
+    "short_ma": list(range(5,31,1)),
+    "long_ma": list(range(20,121,5)),
+    "rsi_entry": [20,25,30,35,40],
+    "target_pct": [0.8,1.0,1.5,2.0,3.0],
+    "sl_pct": [0.5,1.0,1.5,2.0,3.0],
+    "atr_mult": [0.8,1.0,1.5,2.0],
     "use_atr_sl": [True, False],
     "target_atr": [False, True],
-    "target_atr_mult": [1.0, 1.5, 2.0],
-    "max_hold": [3, 5, 7, 10],
+    "target_atr_mult": [1.0,1.5,2.0],
+    "max_hold": [3,5,7,10],
     "rsi_period": [14],
-    "bb_period": [14, 20],
+    "bb_period": [14,20],
     "bb_k": [2],
-    "vol_period": [10, 20],
-    "vol_spike_mult": [1.2, 1.5, 2.0],
+    "vol_period": [10,20],
+    "vol_spike_mult": [1.2,1.5,2.0],
     "atr_period": [14],
-    "adx_min": [10, 12, 15, 20],
-    "confluence_list": [["ma_cross", "ema_trend", "macd_hist_rising", "vol_spike", "bb_breakout", "atr_ok"]],
-    "rule_mode": ["strict", "any_k"],
+    "adx_min": [10,12,15,20],
+    "confluence_list": [["ma_cross","ema_trend","macd_hist_rising","vol_spike","bb_breakout","atr_ok"]],
+    "rule_mode": ["strict","any_k"],
     "min_trades": 4
 }
 
 if not run_opt:
-    st.info("Set evaluations and click 'Run Two-Stage Optimize & Backtest' in the sidebar when ready.")
+    st.info("Set evaluation count and click 'Run Optimize & Backtest' in the sidebar.")
     st.stop()
 
 with st.spinner("Running optimizer (Stage A random search + Stage B hill-climb)..."):
@@ -580,115 +647,152 @@ with st.spinner("Running optimizer (Stage A random search + Stage B hill-climb).
         st.error(f"Optimizer failed: {e}")
         st.stop()
 
-st.markdown("## ✅ Best candidate (auto-selected)")
-st.json({"params": best_candidate["params"], "metrics": best_candidate["metrics"], "score": best_candidate["score"]})
+st.markdown("## ✅ Best candidate & its metrics")
+st.json({"params": best_candidate["params"], "metrics": best_candidate["metrics"], "score": round(best_candidate["score"],3)})
 
 best_params = best_candidate["params"]
 trades_df, metrics = backtest_with_confluences(df_raw, best_params, trade_type=trade_type)
 
-# Top metrics
-c1, c2, c3, c4, c5 = st.columns(5)
+# fill trades DataFrame with readable fields & confidence placeholders
+display_df = trades_to_display_df(trades_df)
+# compute confidence for each historical trade (confidence not used for backtest rows, but show same metric)
+if not trades_df.empty:
+    display_df["confidence_pct"] = display_df.apply(lambda r: dynamic_confidence_for_live(trades_df, r["direction"], r["confluence_count"]) , axis=1)
+else:
+    display_df["confidence_pct"] = 0.0
+
+# Metrics cards (cleaner look)
+c1,c2,c3,c4,c5 = st.columns(5)
 c1.metric("Net PnL", f"{metrics['net_pnl']:.2f}")
 c2.metric("Trades", f"{metrics['n_trades']}")
 c3.metric("Win Rate", f"{metrics['win_rate']*100:.1f}%")
 c4.metric("Avg Hold (bars)", f"{metrics['avg_hold']:.2f}")
 c5.metric("Trades / 100 bars", f"{metrics['trades_per_100bars']:.2f}")
 
-# Tabs
-tab1, tab2, tab3 = st.tabs(["Chart", "Trades & Confluences", "Optimizer Top Picks"])
+# Tabs: Backtest Results & Live Recommendations
+tab1, tab2 = st.tabs(["Backtest Results", "Live Recommendations"])
 
 with tab1:
-    st.markdown("### Price chart with entries/exits")
-    plot_fig = plot_price_with_trades(prepared, trades_df, best_params)
-    st.plotly_chart(plot_fig, use_container_width=True)
-
-    st.markdown("### Latest Recommendations (newest first)")
-
-    # Build live rec based on last bar and calculate readable logic / confluences matched
-    df_ind = add_indicators(prepared, best_params)
-    df_ind["_macd_hist_prev"] = df_ind["macd_hist"].shift(1).fillna(0)
-    latest = df_ind.iloc[-1]
-
-    # Evaluate both directions
-    confs_long = evaluate_confluences(latest, best_params, direction="long")
-    confs_short = evaluate_confluences(latest, best_params, direction="short")
-    # Count matched confluences based on confluence_list
-    total_confs = len(best_params.get("confluence_list", []))
-    matched_long = sum(1 for k in best_params["confluence_list"] if confs_long.get(k if k.endswith("_long") else k + "_long", False))
-    matched_short = sum(1 for k in best_params["confluence_list"] if confs_short.get(k if k.endswith("_short") else k + "_short", False))
-
-    # Decide present live signals
-    live_signals = []
-    if trade_type in ("Long", "All"):
-        if (best_params["rule_mode"] == "strict" and matched_long == total_confs) or (best_params["rule_mode"] == "any_k" and matched_long >= best_params.get("any_k", 2)):
-            # build a live-buy recommendation
-            entry = float(latest["open"])
-            sl = float((latest["close"] - latest["atr"] * best_params["atr_mult"]) if best_params["use_atr_sl"] else latest["close"] * (1 - best_params["sl_pct"] / 100))
-            target = float(latest["close"] * (1 + best_params["target_pct"] / 100)) if not best_params.get("target_atr", False) else float(latest["close"] + latest["atr"] * best_params.get("target_atr_mult", 1.5))
-            # compute per-trade confidence: historical trades with same confluence_count
-            conf_pct = compute_confidence_for_live(trades_df, matched_long)
-            logic_text = build_readable_logic(latest, best_params, "BUY")
-            live_signals.append({
-                "Date": latest.name,
-                "Signal": "BUY",
-                "Entry": entry,
-                "Target": target,
-                "SL": sl,
-                "ConfluencesMatched": f"{matched_long}/{total_confs}",
-                "ConfidencePct": round(conf_pct, 1),
-                "Logic": logic_text
-            })
-
-    if trade_type in ("Short", "All"):
-        if (best_params["rule_mode"] == "strict" and matched_short == total_confs) or (best_params["rule_mode"] == "any_k" and matched_short >= best_params.get("any_k", 2)):
-            entry = float(latest["open"])
-            sl = float((latest["close"] + latest["atr"] * best_params["atr_mult"]) if best_params["use_atr_sl"] else latest["close"] * (1 + best_params["sl_pct"] / 100))
-            target = float(latest["close"] * (1 - best_params["target_pct"] / 100)) if not best_params.get("target_atr", False) else float(latest["close"] - latest["atr"] * best_params.get("target_atr_mult", 1.5))
-            conf_pct = compute_confidence_for_live(trades_df, matched_short)
-            logic_text = build_readable_logic(latest, best_params, "SELL")
-            live_signals.append({
-                "Date": latest.name,
-                "Signal": "SELL",
-                "Entry": entry,
-                "Target": target,
-                "SL": sl,
-                "ConfluencesMatched": f"{matched_short}/{total_confs}",
-                "ConfidencePct": round(conf_pct, 1),
-                "Logic": logic_text
-            })
-
-    # Display live signals as a styled DataFrame
-    if not live_signals:
-        st.info("No live recommendation on the last bar with optimized params.")
+    st.markdown("### Backtest trades (newest first)")
+    if trades_df is None or trades_df.empty:
+        st.info("No trades generated with optimized params.")
     else:
-        live_df = pd.DataFrame(live_signals).sort_values("Date", ascending=False).reset_index(drop=True)
-        # style rows
-        st.subheader("Live Recommendation")
-        st.write("Confidence is computed from historical trades with the same confluence count; fallback to overall win-rate if insufficient history.")
-        sty = style_trade_rows(live_df.rename(columns={"Signal": "Signal"}))
-        st.dataframe(sty, use_container_width=True)
+        # prepare display table, include confluence count, reason columns
+        df_disp = display_df.copy().sort_values("entry_date", ascending=False)
+        # show columns of interest and add confidence column
+        df_for_table = df_disp[[
+            "entry_date","direction","entry_price","exit_price","pnl","hold_days",
+            "confluence_count","confluence_total","confluences_text","target_reason","sl_reason","adjusted","confidence_pct"
+        ]].rename(columns={
+            "entry_date":"Date","direction":"Direction","entry_price":"Entry",
+            "exit_price":"Exit","pnl":"PnL","hold_days":"Hold",
+            "confluence_count":"ConfsMatched","confluence_total":"ConfsTotal",
+            "confluences_text":"Confluences","target_reason":"Target Reason","sl_reason":"SL Reason",
+            "adjusted":"Adjusted","confidence_pct":"ConfidencePct"
+        })
+        # make readable full reason text already included
+        # CSV download
+        csv_bytes = trades_df.to_csv(index=False).encode('utf-8')
+        st.download_button("Download backtest trades (CSV)", data=csv_bytes, file_name="backtest_trades.csv", mime="text/csv")
+
+        # style & display using pandas Styler and HTML (to colour rows)
+        def highlight_dir(row):
+            if row["Direction"]=="BUY":
+                return ["background-color: #0a6b2f; color: white;" for _ in row]
+            else:
+                return ["background-color: #8b0b0b; color: white;" for _ in row]
+        try:
+            styled = df_for_table.style.format({
+                "Entry":"{:.2f}","Exit":"{:.2f}","PnL":"{:.2f}","ConfidencePct":"{:.1f}"
+            }).apply(highlight_dir, axis=1)
+            st.dataframe(df_for_table)  # show plain table so it's interactive
+            st.markdown("**Detailed (styled) view:**")
+            st.write(styled.to_html(), unsafe_allow_html=True)
+        except Exception:
+            st.dataframe(df_for_table)
 
 with tab2:
-    st.markdown("### Trades (descending) with confluence tags")
-    if trades_df.empty:
-        st.write("No trades generated with optimized params.")
+    st.markdown("### Live recommendation(s) (using optimized params)")
+    # Generate live recommendation by checking last bar's confluences and selecting a trade if rules match
+    prepared_df, _ = detect_and_prepare(df_raw)
+    df_ind = add_indicators(prepared_df, best_params)
+    last = df_ind.iloc[-1]
+    prev = df_ind.iloc[-2]
+    last["_macd_hist_prev"] = prev["macd_hist"]
+    confs_long = evaluate_confluences_for_direction(last, best_params, "long")
+    confs_short = evaluate_confluences_for_direction(last, best_params, "short")
+
+    # evaluate entry conditions
+    def decide_now(confs, params):
+        if params["rule_mode"]=="strict":
+            return all([confs.get(k,False) for k in params["confluence_list"]])
+        else:
+            hits = sum([1 for k in params["confluence_list"] if confs.get(k,False)])
+            return hits >= params.get("any_k",2)
+
+    now_long = decide_now(confs_long, best_params) if trade_type in ("Long","All") else False
+    now_short = decide_now(confs_short, best_params) if trade_type in ("Short","All") else False
+
+    recs = []
+    if now_long or now_short:
+        # choose stronger (more confluence hits)
+        long_hits = sum(1 for v in confs_long.values() if v)
+        short_hits = sum(1 for v in confs_short.values() if v)
+        if now_long and (not now_short or long_hits>=short_hits):
+            direction="BUY"; confs=confs_long
+            entry_price = float(last["open"])
+            sl, sl_reason, target, target_reason, adjusted = compute_sl_target_reasons(entry_price, last, best_params, "long")
+        else:
+            direction="SELL"; confs=confs_short
+            entry_price = float(last["open"])
+            sl, sl_reason, target, target_reason, adjusted = compute_sl_target_reasons(entry_price, last, best_params, "short")
+
+        con_count = sum(1 for v in confs.values() if v)
+        con_total = len(confs)
+        # dynamic confidence based on similar past trades
+        conf_pct = dynamic_confidence_for_live(trades_df, direction, con_count)
+        logic_text = []
+        if "ma_cross" in confs and confs.get("ma_cross"): logic_text.append(f"MA{best_params['short_ma']}>{best_params['long_ma']}" if direction=="BUY" else f"MA{best_params['short_ma']}<{best_params['long_ma']}")
+        if "ema_trend" in confs and confs.get("ema_trend"): logic_text.append(f"EMA9>{'EMA21' if direction=='BUY' else 'EMA21'}")
+        if "macd_hist_rising" in confs and confs.get("macd_hist_rising"): logic_text.append(f"MACD hist {'>0 rising' if direction=='BUY' else '<0 falling'}")
+        if "bb_breakout" in confs and confs.get("bb_breakout"): logic_text.append("BB breakout")
+        if "vol_spike" in confs and confs.get("vol_spike"): logic_text.append(f"Vol >= {best_params.get('vol_spike_mult',1.5)}×avg")
+        if "atr_ok" in confs and confs.get("atr_ok"): logic_text.append(f"ATR {last.get('atr',np.nan):.3f}>=min")
+
+        rec = {
+            "date": last.name,
+            "direction": direction,
+            "entry": round(entry_price,2),
+            "target": round(target,2),
+            "sl": round(sl,2),
+            "target_reason": target_reason,
+            "sl_reason": sl_reason,
+            "confs_matched": f"{con_count}/{con_total}",
+            "logic": "; ".join(logic_text),
+            "confidence_pct": round(conf_pct,1),
+            "adjusted": adjusted
+        }
+        recs.append(rec)
+
+    if not recs:
+        st.info("No live recommendation on the latest bar with optimized params.")
     else:
-        display = trades_df.sort_values("entry_date", ascending=False).reset_index(drop=True)
-        def confluence_summary(cdict):
-            return ", ".join([k for k, v in cdict.items() if v]) if isinstance(cdict, dict) else ""
-        if "confluences" in display.columns:
-            display["confs"] = display["confluences"].apply(lambda x: confluence_summary(x) if isinstance(x, dict) else "")
-            display = display.rename(columns={"direction": "Signal", "entry_price": "Entry", "exit_price": "Exit", "pnl": "PnL", "hold_days": "Hold"})
-            # keep columns order
-            display = display[["entry_date", "Signal", "Entry", "Exit", "PnL", "Hold", "confluence_count", "confs", "reason"]]
-            display = display.rename(columns={"entry_date": "EntryDate", "confluence_count": "ConfluenceCount", "confs": "Confluences", "reason": "ExitReason"})
-        st.dataframe(display)
+        # show recommendation in a nice table (newest first)
+        rec_df = pd.DataFrame(recs).sort_values("date", ascending=False)
+        # add styling and display
+        def color_row(r):
+            return ["background-color: #0a6b2f; color:white;" if r["direction"]=="BUY" else "background-color: #8b0b0b; color:white;" for _ in r.index]
+        try:
+            rec_df_display = rec_df[["date","direction","entry","target","sl","target_reason","sl_reason","confs_matched","logic","confidence_pct","adjusted"]].rename(columns={
+                "date":"Date","direction":"Signal","entry":"Entry","target":"Target","sl":"SL","target_reason":"Target Reason","sl_reason":"SL Reason",
+                "confs_matched":"Confluences","logic":"Logic","confidence_pct":"ConfidencePct","adjusted":"Adjusted"
+            })
+            st.dataframe(rec_df_display)
+            # styled HTML view
+            styled = rec_df_display.style.apply(lambda r: ["background-color: #0a6b2f; color:white;" if r["Signal"]=="BUY" else "background-color: #8b0b0b; color:white;" for _ in r.index], axis=1)
+            st.markdown("**Styled recommendation view:**")
+            st.write(styled.to_html(), unsafe_allow_html=True)
+        except Exception:
+            st.dataframe(rec_df)
 
-with tab3:
-    st.markdown("### Top optimizer picks (by score) — top 8")
-    top_sorted = sorted(all_candidates, key=lambda x: x["score"], reverse=True)[:8]
-    for i, t in enumerate(top_sorted, 1):
-        st.markdown(f"**#{i} — score {t['score']:.2f}**")
-        st.json({"params": t["params"], "metrics": t["metrics"]})
-
-st.balloons()
+st.success("Done — optimizer finished and recommendations generated.")
