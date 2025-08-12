@@ -324,7 +324,7 @@ st.title("📊 Auto-Optimized Swing Dashboard — Robust Loader Fix")
 
 st.markdown("Upload your OHLC CSV (or XLSX). This version will automatically detect columns like `LTP`, `Last`, `Close Price`, `close.1` etc.")
 
-uploaded = st.file_uploader("Upload file", type=["csv", "xlsx"])
+uploaded = st.file_uploader("Upload file", type=["csv", "xls","xlsx"])
 if uploaded is None:
     st.info("Upload a file to continue.")
     st.stop()
