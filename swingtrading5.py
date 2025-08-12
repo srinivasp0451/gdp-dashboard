@@ -1,7 +1,6 @@
 # streamlit_swing_strategy.py
-# Enhanced Streamlit app: Swing trading strategy backtester + live signal recommender (long only)
-# Added indicators: MACD, ATR-based SL, ADX
-# Usage: streamlit run streamlit_swing_strategy.py
+# Swing trading backtester & live recommender (long only)
+# Handles any OHLC column name case variations
 
 import streamlit as st
 import pandas as pd
@@ -14,14 +13,16 @@ st.set_page_config(layout="wide", page_title="Swing Trading Backtester & Live Re
 # ------------------ Utility indicators ------------------
 def compute_indicators(df, short=20, long=50, rsi_period=14):
     df = df.copy()
-    df.rename(columns={c.capitalize(): c.capitalize() for c in df.columns}, inplace=True)
+
+    # Normalize column names to lowercase for consistent handling
+    df.columns = [c.strip().lower() for c in df.columns]
 
     # Moving Averages
-    df['ma_short'] = df['Close'].rolling(short, min_periods=1).mean()
-    df['ma_long'] = df['Close'].rolling(long, min_periods=1).mean()
+    df['ma_short'] = df['close'].rolling(short, min_periods=1).mean()
+    df['ma_long'] = df['close'].rolling(long, min_periods=1).mean()
 
     # RSI
-    delta = df['Close'].diff()
+    delta = df['close'].diff()
     up = delta.clip(lower=0)
     down = -delta.clip(upper=0)
     ma_up = up.ewm(alpha=1/rsi_period, adjust=False).mean()
@@ -31,21 +32,21 @@ def compute_indicators(df, short=20, long=50, rsi_period=14):
     df['rsi'].fillna(50, inplace=True)
 
     # MACD
-    exp1 = df['Close'].ewm(span=12, adjust=False).mean()
-    exp2 = df['Close'].ewm(span=26, adjust=False).mean()
+    exp1 = df['close'].ewm(span=12, adjust=False).mean()
+    exp2 = df['close'].ewm(span=26, adjust=False).mean()
     df['macd'] = exp1 - exp2
     df['signal'] = df['macd'].ewm(span=9, adjust=False).mean()
 
     # ATR
-    tr1 = df['High'] - df['Low']
-    tr2 = abs(df['High'] - df['Close'].shift())
-    tr3 = abs(df['Low'] - df['Close'].shift())
+    tr1 = df['high'] - df['low']
+    tr2 = abs(df['high'] - df['close'].shift())
+    tr3 = abs(df['low'] - df['close'].shift())
     tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
     df['atr'] = tr.rolling(14).mean()
 
     # ADX
-    plus_dm = df['High'].diff()
-    minus_dm = df['Low'].diff()
+    plus_dm = df['high'].diff()
+    minus_dm = df['low'].diff()
     plus_dm[plus_dm < 0] = 0
     minus_dm[minus_dm > 0] = 0
     tr_smooth = tr.rolling(14).sum()
@@ -80,8 +81,8 @@ def backtest_strategy(df, params):
             adx_cond = row['adx'] >= 20
 
             if ma_cond and rsi_cond and macd_cond and adx_cond:
-                atr_sl = row['Close'] - (row['atr'] * params['atr_mult'])
-                entry_price = row['Open']
+                atr_sl = row['close'] - (row['atr'] * params['atr_mult'])
+                entry_price = row['open']
                 position = {
                     'entry_date': row.name,
                     'entry_price': entry_price,
@@ -93,7 +94,7 @@ def backtest_strategy(df, params):
             position['hold_days'] += 1
 
             # Exit conditions
-            if row['High'] >= position['target']:
+            if row['high'] >= position['target']:
                 trades.append({
                     **position,
                     'exit_date': row.name,
@@ -103,7 +104,7 @@ def backtest_strategy(df, params):
                 })
                 position = None
 
-            elif row['Low'] <= position['sl']:
+            elif row['low'] <= position['sl']:
                 trades.append({
                     **position,
                     'exit_date': row.name,
@@ -117,8 +118,8 @@ def backtest_strategy(df, params):
                 trades.append({
                     **position,
                     'exit_date': row.name,
-                    'exit_price': row['Close'],
-                    'pnl': row['Close'] - position['entry_price'],
+                    'exit_price': row['close'],
+                    'pnl': row['close'] - position['entry_price'],
                     'reason': 'MaxHold'
                 })
                 position = None
@@ -132,8 +133,34 @@ def backtest_strategy(df, params):
     return trades_df, metrics
 
 
+# ------------------ Live Recommender ------------------
+def live_recommendation(df, params):
+    df = compute_indicators(df, short=params['short_ma'], long=params['long_ma'])
+    latest = df.iloc[-1]
+    prev = df.iloc[-2]
+
+    ma_cond = prev['ma_short'] <= prev['ma_long'] and latest['ma_short'] > latest['ma_long']
+    rsi_cond = latest['rsi'] <= params['rsi_entry']
+    macd_cond = latest['macd'] > latest['signal']
+    adx_cond = latest['adx'] >= 20
+
+    if ma_cond and rsi_cond and macd_cond and adx_cond:
+        atr_sl = latest['close'] - (latest['atr'] * params['atr_mult'])
+        sl = atr_sl if params['use_atr_sl'] else latest['close'] * (1 - params['sl_pct'] / 100)
+        target = latest['close'] * (1 + params['target_pct'] / 100)
+        return {
+            'date': latest.name,
+            'entry_price': latest['close'],
+            'target': target,
+            'sl': sl,
+            'confidence': 'High',
+            'logic': 'MA cross + RSI + MACD + ADX confirmation'
+        }
+    return None
+
+
 # ------------------ UI ------------------
-st.title("Swing Trading Backtester & Live Recommender (Enhanced)")
+st.title("📈 Swing Trading Backtester & Live Recommender (Long Only)")
 
 uploaded = st.file_uploader("Upload OHLC CSV", type=['csv'])
 
@@ -150,31 +177,41 @@ if uploaded:
     use_atr_sl = st.checkbox('Use ATR-based SL', value=False)
     atr_mult = st.number_input('ATR SL Multiplier', 0.5, 5.0, 1.5)
 
-    if st.button('Run Backtest'):
-        params = {
-            'short_ma': short_ma,
-            'long_ma': long_ma,
-            'rsi_entry': rsi_entry,
-            'target_pct': target_pct,
-            'sl_pct': sl_pct,
-            'max_hold': max_hold,
-            'rsi_period': 14,
-            'use_atr_sl': use_atr_sl,
-            'atr_mult': atr_mult
-        }
-        trades_df, metrics = backtest_strategy(df, params)
+    params = {
+        'short_ma': short_ma,
+        'long_ma': long_ma,
+        'rsi_entry': rsi_entry,
+        'target_pct': target_pct,
+        'sl_pct': sl_pct,
+        'max_hold': max_hold,
+        'rsi_period': 14,
+        'use_atr_sl': use_atr_sl,
+        'atr_mult': atr_mult
+    }
 
-        st.subheader('Metrics')
-        st.write(metrics)
+    col1, col2 = st.columns(2)
 
-        st.subheader('Trades')
-        st.dataframe(trades_df)
+    with col1:
+        if st.button('Run Backtest'):
+            trades_df, metrics = backtest_strategy(df, params)
+            st.subheader('Metrics')
+            st.write(metrics)
+            st.subheader('Trades')
+            st.dataframe(trades_df)
 
-        st.subheader('Chart')
-        df_ind = compute_indicators(df, short=short_ma, long=long_ma)
-        fig, ax = plt.subplots(figsize=(10, 4))
-        ax.plot(df_ind['Close'], label='Close')
-        ax.plot(df_ind['ma_short'], label=f'MA{short_ma}')
-        ax.plot(df_ind['ma_long'], label=f'MA{long_ma}')
-        ax.legend()
-        st.pyplot(fig)
+            df_ind = compute_indicators(df, short=short_ma, long=long_ma)
+            fig, ax = plt.subplots(figsize=(10, 4))
+            ax.plot(df_ind['close'], label='Close')
+            ax.plot(df_ind['ma_short'], label=f'MA{short_ma}')
+            ax.plot(df_ind['ma_long'], label=f'MA{long_ma}')
+            ax.legend()
+            st.pyplot(fig)
+
+    with col2:
+        if st.button('Check Live Recommendation'):
+            rec = live_recommendation(df, params)
+            if rec:
+                st.success(f"Buy Signal on {rec['date'].date()}")
+                st.write(rec)
+            else:
+                st.info("No Buy Signal Today.")
