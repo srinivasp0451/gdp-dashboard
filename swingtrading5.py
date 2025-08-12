@@ -1,33 +1,40 @@
-streamlit_swing_strategy.py
+#streamlit_swing_strategy.py
 
-Streamlit app: Swing trading strategy backtester + live signal recommender (long only)
+#Streamlit app: Swing trading strategy backtester + live signal recommender (long only)
 
-Usage: streamlit run streamlit_swing_strategy.py
+#Usage: streamlit run streamlit_swing_strategy.py
 
-import streamlit as st import pandas as pd import numpy as np import matplotlib.pyplot as plt from datetime import timedelta
+import streamlit as st 
+import pandas as pd 
+import numpy as np 
+import matplotlib.pyplot as plt 
+from datetime import timedelta
 
 st.set_page_config(layout="wide", page_title="Swing Trading Backtester & Live Recommender")
 
------------------- Utility indicators ------------------
+#------------------ Utility indicators ------------------
 
-@st.cache_data def compute_indicators(df, short=20, long=50, rsi_period=14): df = df.copy() df['close'] = df['Close'] if 'Close' in df.columns else df['close'] df['open']  = df['Open']  if 'Open'  in df.columns else df['open'] df['high']  = df['High']  if 'High'  in df.columns else df['high'] df['low']   = df['Low']   if 'Low'   in df.columns else df['low'] df['volume'] = df['Volume'] if 'Volume' in df.columns else (df['volume'] if 'volume' in df.columns else 0)
+@st.cache_data 
+def compute_indicators(df, short=20, long=50, rsi_period=14): 
+    df = df.copy() 
+    df['close'] = df['Close'] if 'Close' in df.columns else df['close'] df['open']  = df['Open']  if 'Open'  in df.columns else df['open'] df['high']  = df['High']  if 'High'  in df.columns else df['high'] df['low']   = df['Low']   if 'Low'   in df.columns else df['low'] df['volume'] = df['Volume'] if 'Volume' in df.columns else (df['volume'] if 'volume' in df.columns else 0)
 
-df['ma_short'] = df['close'].rolling(short, min_periods=1).mean()
-df['ma_long']  = df['close'].rolling(long,  min_periods=1).mean()
+    df['ma_short'] = df['close'].rolling(short, min_periods=1).mean()
+    df['ma_long']  = df['close'].rolling(long,  min_periods=1).mean()
 
-# RSI implementation
-delta = df['close'].diff()
-up = delta.clip(lower=0)
-down = -1 * delta.clip(upper=0)
-ma_up = up.ewm(alpha=1/rsi_period, adjust=False).mean()
-ma_down = down.ewm(alpha=1/rsi_period, adjust=False).mean()
-rs = ma_up / (ma_down.replace(0, np.nan))
-df['rsi'] = 100 - (100 / (1 + rs))
-df['rsi'].fillna(50, inplace=True)
+    # RSI implementation
+    delta = df['close'].diff()
+    up = delta.clip(lower=0)
+    down = -1 * delta.clip(upper=0)
+    ma_up = up.ewm(alpha=1/rsi_period, adjust=False).mean()
+    ma_down = down.ewm(alpha=1/rsi_period, adjust=False).mean()
+    rs = ma_up / (ma_down.replace(0, np.nan))
+    df['rsi'] = 100 - (100 / (1 + rs))
+    df['rsi'].fillna(50, inplace=True)
 
-return df
+    return df
 
------------------- Backtester ------------------
+#------------------ Backtester ------------------
 
 def backtest_strategy(df, params): # params: dict with short_ma, long_ma, rsi_entry, target_pct, sl_pct, max_hold df = compute_indicators(df, short=params['short_ma'], long=params['long_ma'], rsi_period=params.get('rsi_period',14)) trades = [] position = None
 
@@ -129,7 +136,7 @@ else:
 
 return trades_df, metrics
 
------------------- Optimizer ------------------
+#------------------ Optimizer ------------------
 
 def optimize_params(df, search_space, max_evals=50): # search_space: dict of lists; we'll run random search sampling combinations import random best = None results = [] all_combinations = [] for _ in range(max_evals): params = {k: random.choice(v) for k, v in search_space.items()} trades, metrics = backtest_strategy(df, params) results.append((params, metrics)) if best is None or metrics['net_pnl'] > best[1]['net_pnl']: best = (params, metrics) return best, results
 
