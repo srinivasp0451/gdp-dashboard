@@ -1,6 +1,6 @@
 # streamlit_swing_strategy.py
 # Swing trading backtester & live recommender (long only)
-# Handles any OHLC column name case variations
+# Handles any OHLC column name case variations and numeric conversion issues
 
 import streamlit as st
 import pandas as pd
@@ -9,12 +9,11 @@ import matplotlib.pyplot as plt
 
 st.set_page_config(layout="wide", page_title="Swing Trading Backtester & Live Recommender")
 
-
 # ------------------ Utility indicators ------------------
 def compute_indicators(df, short=20, long=50, rsi_period=14):
     df = df.copy()
 
-    # Normalize column names to lowercase for consistent handling
+    # Normalize column names
     df.columns = [c.strip().lower() for c in df.columns]
 
     # Moving Averages
@@ -74,7 +73,6 @@ def backtest_strategy(df, params):
         prev = df.iloc[i - 1]
 
         if position is None:
-            # Entry conditions
             ma_cond = prev['ma_short'] <= prev['ma_long'] and row['ma_short'] > row['ma_long']
             rsi_cond = row['rsi'] <= params['rsi_entry']
             macd_cond = row['macd'] > row['signal']
@@ -92,8 +90,6 @@ def backtest_strategy(df, params):
                 }
         else:
             position['hold_days'] += 1
-
-            # Exit conditions
             if row['high'] >= position['target']:
                 trades.append({
                     **position,
@@ -103,7 +99,6 @@ def backtest_strategy(df, params):
                     'reason': 'Target'
                 })
                 position = None
-
             elif row['low'] <= position['sl']:
                 trades.append({
                     **position,
@@ -113,7 +108,6 @@ def backtest_strategy(df, params):
                     'reason': 'StopLoss'
                 })
                 position = None
-
             elif position['hold_days'] >= params['max_hold']:
                 trades.append({
                     **position,
@@ -165,9 +159,27 @@ st.title("📈 Swing Trading Backtester & Live Recommender (Long Only)")
 uploaded = st.file_uploader("Upload OHLC CSV", type=['csv'])
 
 if uploaded:
-    df = pd.read_csv(uploaded, parse_dates=True, index_col=0)
+    df = pd.read_csv(uploaded)
+
+    # Normalize column names
+    df.columns = [c.strip().lower() for c in df.columns]
+
+    # Force numeric conversion
+    for col in ['open', 'high', 'low', 'close', 'volume']:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+
+    # Drop bad rows
+    df.dropna(subset=['open', 'high', 'low', 'close'], inplace=True)
+
+    # If date column exists, set as index
+    if 'date' in df.columns:
+        df['date'] = pd.to_datetime(df['date'], errors='coerce')
+        df.set_index('date', inplace=True)
+
     st.dataframe(df.tail())
 
+    # Strategy parameters
     short_ma = st.number_input('Short MA', 5, 50, 20)
     long_ma = st.number_input('Long MA', 10, 200, 50)
     rsi_entry = st.slider('RSI Entry <=', 10, 60, 40)
