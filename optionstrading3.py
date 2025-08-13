@@ -32,44 +32,58 @@ def load_data(uploaded_file, debug_mode=False):
         
         # Read file based on type
         if uploaded_file.name.endswith('.csv'):
-            raw_data = pd.read_csv(uploaded_file)
+            # Read without skipping rows to inspect
+            raw_data = pd.read_csv(uploaded_file, header=None)
             if debug_mode:
                 st.write("📝 Raw CSV data shape:", raw_data.shape)
-                st.write("🔍 First 2 rows of raw CSV data:")
-                st.dataframe(raw_data.head(2))
-            data = pd.read_csv(uploaded_file, skiprows=1)
+                st.write("🔍 First 3 rows of raw CSV data:")
+                st.dataframe(raw_data.head(3))
+            
+            # Check if we need to skip 2 rows
+            if len(raw_data.columns) > 20:
+                data = pd.read_csv(uploaded_file, skiprows=2, header=None)
+                if debug_mode:
+                    st.write("🛠️ Skipping 2 rows due to header complexity")
+            else:
+                data = pd.read_csv(uploaded_file, skiprows=1, header=None)
+                
         elif uploaded_file.name.endswith('.xlsx'):
-            raw_data = pd.read_excel(uploaded_file)
+            # Read without skipping rows to inspect
+            raw_data = pd.read_excel(uploaded_file, header=None)
             if debug_mode:
                 st.write("📝 Raw Excel data shape:", raw_data.shape)
-                st.write("🔍 First 2 rows of raw Excel data:")
-                st.dataframe(raw_data.head(2))
-            data = pd.read_excel(uploaded_file, skiprows=1)
+                st.write("🔍 First 3 rows of raw Excel data:")
+                st.dataframe(raw_data.head(3))
+            
+            # Check if we need to skip 2 rows
+            if len(raw_data.columns) > 20:
+                data = pd.read_excel(uploaded_file, skiprows=2, header=None)
+                if debug_mode:
+                    st.write("🛠️ Skipping 2 rows due to header complexity")
+            else:
+                data = pd.read_excel(uploaded_file, skiprows=1, header=None)
         else:
             st.error("Unsupported file format. Please upload CSV or Excel file.")
             st.stop()
             
         # Log processed data
         if debug_mode:
-            st.write("🛠️ Processed data shape (after skiprows=1):", data.shape)
-            st.write("🔍 First 2 rows of processed data:")
-            st.dataframe(data.head(2))
-            st.write("📊 Data columns:", data.columns.tolist())
+            st.write("🛠️ Processed data shape:", data.shape)
+            st.write("🔍 First 3 rows of processed data:")
+            st.dataframe(data.head(3))
         
-        # Handle column count mismatch
-        expected_columns = 21
-        if len(data.columns) != expected_columns:
+        # Handle column count - we expect 21 columns
+        if len(data.columns) != 21:
             if debug_mode:
-                st.warning(f"⚠️ Column count mismatch: Expected {expected_columns} columns, found {len(data.columns)}")
+                st.warning(f"⚠️ Column count mismatch: Expected 21 columns, found {len(data.columns)}")
             
-            # Try to align columns
-            if len(data.columns) > expected_columns:
-                # Take first expected_columns columns
-                data = data.iloc[:, :expected_columns]
+            # If we have exactly 23 columns, take columns 1-21
+            if len(data.columns) == 23:
+                data = data.iloc[:, 1:22]
                 if debug_mode:
-                    st.write(f"🔧 Trimmed to first {expected_columns} columns")
+                    st.write("🔧 Selected columns 1-21 from 23-column structure")
             else:
-                st.error(f"Column count mismatch: Expected {expected_columns} columns, found {len(data.columns)}. Please check file format.")
+                st.error(f"Column count mismatch: Expected 21 columns, found {len(data.columns)}. Please check file format.")
                 st.stop()
         
         # Clean column names
@@ -85,13 +99,15 @@ def load_data(uploaded_file, debug_mode=False):
         
         # Convert to numeric and clean
         for col in data.columns:
-            if data[col].dtype == object:
-                if debug_mode:
-                    st.write(f"🔢 Converting column {col} to numeric")
+            if debug_mode:
+                st.write(f"🔢 Converting column {col}")
                 
-                # Clean string values
+            # Clean string values
+            if data[col].dtype == object:
                 data[col] = data[col].astype(str).str.replace(',', '').str.replace('"', '')
-                data[col] = pd.to_numeric(data[col], errors='coerce')
+            
+            # Convert to numeric
+            data[col] = pd.to_numeric(data[col], errors='coerce')
         
         # Calculate straddle premium
         data['straddle_premium'] = data['calls_ltp'] + data['puts_ltp']
@@ -105,7 +121,8 @@ def load_data(uploaded_file, debug_mode=False):
         return data
     except Exception as e:
         st.error(f"❌ Error processing file: {str(e)}")
-        st.exception(e)
+        if debug_mode:
+            st.exception(e)
         st.stop()
 
 if uploaded_file:
@@ -140,16 +157,22 @@ if uploaded_file:
     
     with col1:
         st.subheader("Market Summary")
-        st.markdown(f"""
+        
+        # Get key metrics
+        max_put_oi = df.loc[df['puts_oi'].idxmax()] if not df.empty else None
+        max_call_oi = df.loc[df['calls_oi'].idxmax()] if not df.empty else None
+        
+        summary_text = f"""
         - **Spot Price**: ~₹{atm_strike:,.0f} (derived from ATM options)
         - **ATM Strike**: {atm_strike:,.0f} (where CALL and PUT prices are closest)
         - **Key Observations**:
-            - Bullish bias with strong support at {atm_strike:,.0f} 
-            - Resistance building at {atm_strike+100:,.0f}
-            - Implied Volatility (IV) skew: Puts > Calls at ATM
+            - Strongest support at {max_put_oi['strike'] if max_put_oi else 'N/A'} ({max_put_oi['puts_oi']/100000:,.1f}L put OI)
+            - Strongest resistance at {max_call_oi['strike'] if max_call_oi else 'N/A'} ({max_call_oi['calls_oi']/100000:,.1f}L call OI)
+            - Implied Volatility (IV) skew: Puts ({df[df['strike'] == atm_strike]['puts_iv'].values[0]:.1f}%) > Calls ({df[df['strike'] == atm_strike]['calls_iv'].values[0]:.1f}%)
             - Expected daily move: ±{atm_strike * 0.16 * (1/365)**0.5:.0f} points (1 standard deviation)
         - **Sentiment**: Neutral-to-bullish with protective hedging
-        """)
+        """
+        st.markdown(summary_text)
     
     # Straddle Premium Chart
     with col2:
@@ -277,13 +300,13 @@ if uploaded_file:
         # Find best opportunities
         call_opportunities = filtered_df[
             (filtered_df['calls_chng_oi'] > 0) & 
-            (filtered_df['calls_iv'] < 30) &
+            (filtered_df['calls_iv'] < 50) &
             (filtered_df['calls_ltp'] > 0)
         ].sort_values('calls_chng_oi', ascending=False).head(3)
         
         put_opportunities = filtered_df[
             (filtered_df['puts_chng_oi'] > 0) & 
-            (filtered_df['puts_iv'] < 40) &
+            (filtered_df['puts_iv'] < 50) &
             (filtered_df['puts_ltp'] > 0)
         ].sort_values('puts_chng_oi', ascending=False).head(1)
         
@@ -297,7 +320,7 @@ if uploaded_file:
                 chng_oi = call_opportunities.iloc[0]['calls_chng_oi']
                 
                 st.markdown(f"""
-                ### 🟢 {strike:,.0f} CALL (OTM)
+                ### 🟢 {strike:,.0f} CALL
                 **Probability of Profit**: 40%  
                 **Entry**: ₹{ltp*0.97:.2f}-{ltp:.2f}  
                 **Target**: ₹{ltp*2:.2f} (100% profit)  
@@ -305,12 +328,13 @@ if uploaded_file:
                 **RR Ratio**: 1:2  
                 
                 **Logic**:  
-                - Premium: ₹{ltp:.2f} (low IV: {iv:.1f}%)  
+                - Premium: ₹{ltp:.2f} (IV: {iv:.1f}%)  
                 - OI increased by {chng_oi:,.0f} contracts  
-                - Expected daily move can hit target  
-                - Strong support at {atm_strike:,.0f}  
+                - Near strong support/resistance level  
                 """)
                 st.progress(40)
+            else:
+                st.warning("No call opportunities found")
         
         with rec_col2:
             if len(call_opportunities) > 1:
@@ -320,7 +344,7 @@ if uploaded_file:
                 volume = call_opportunities.iloc[1]['calls_volume']
                 
                 st.markdown(f"""
-                ### 🟡 {strike:,.0f} CALL (ATM/Near)
+                ### 🟡 {strike:,.0f} CALL
                 **Probability of Profit**: 50%  
                 **Entry**: ₹{ltp*0.98:.2f}-{ltp:.2f}  
                 **Target**: ₹{ltp*2:.2f} (100% profit)  
@@ -328,10 +352,9 @@ if uploaded_file:
                 **RR Ratio**: 1:2  
                 
                 **Logic**:  
-                - Good sensitivity to price moves  
+                - Good price sensitivity  
                 - High volume ({volume:,.0f} contracts)  
-                - Break-even has 50% probability  
-                - IV: {iv:.1f}%  
+                - IV: {iv:.1f}% (reasonable)  
                 """)
                 st.progress(50)
             elif not put_opportunities.empty:
@@ -341,7 +364,7 @@ if uploaded_file:
                 oi = put_opportunities.iloc[0]['puts_oi']
                 
                 st.markdown(f"""
-                ### 🔵 {strike:,.0f} PUT (Hedge)
+                ### 🔵 {strike:,.0f} PUT
                 **Probability of Profit**: 30%  
                 **Entry**: ₹{ltp:.2f}  
                 **Target**: ₹{ltp*2:.2f} (100% profit)  
@@ -349,11 +372,12 @@ if uploaded_file:
                 
                 **Logic**:  
                 - Protective hedge against downside  
-                - Strong support level ({oi/100000:.1f}L OI)  
-                - Use with calls for risk management  
+                - Strong OI support ({oi/100000:.1f}L contracts)  
                 - IV: {iv:.1f}%  
                 """)
                 st.progress(30)
+            else:
+                st.warning("No secondary opportunities found")
         
         with rec_col3:
             if len(call_opportunities) > 2:
@@ -363,7 +387,7 @@ if uploaded_file:
                 chng_oi = call_opportunities.iloc[2]['calls_chng_oi']
                 
                 st.markdown(f"""
-                ### 🟠 {strike:,.0f} CALL (OTM)
+                ### 🟠 {strike:,.0f} CALL
                 **Probability of Profit**: 35%  
                 **Entry**: ₹{ltp*0.96:.2f}-{ltp:.2f}  
                 **Target**: ₹{ltp*2:.2f} (100% profit)  
@@ -371,10 +395,9 @@ if uploaded_file:
                 **RR Ratio**: 1:2  
                 
                 **Logic**:  
-                - Very cheap premium: ₹{ltp:.2f}  
+                - Cheap premium: ₹{ltp:.2f}  
                 - OI increased by {chng_oi:,.0f} contracts  
-                - IV: {iv:.1f}% (below market average)  
-                - High leverage potential  
+                - IV: {iv:.1f}% (below average)  
                 """)
                 st.progress(35)
             elif not put_opportunities.empty:
@@ -384,7 +407,7 @@ if uploaded_file:
                 oi = put_opportunities.iloc[0]['puts_oi']
                 
                 st.markdown(f"""
-                ### 🔵 {strike:,.0f} PUT (Hedge)
+                ### 🔵 {strike:,.0f} PUT
                 **Probability of Profit**: 30%  
                 **Entry**: ₹{ltp:.2f}  
                 **Target**: ₹{ltp*2:.2f} (100% profit)  
@@ -392,43 +415,55 @@ if uploaded_file:
                 
                 **Logic**:  
                 - Protective hedge against downside  
-                - Strong support level ({oi/100000:.1f}L OI)  
-                - Use with calls for risk management  
+                - Strong OI support ({oi/100000:.1f}L contracts)  
                 - IV: {iv:.1f}%  
                 """)
                 st.progress(30)
+            else:
+                st.warning("No tertiary opportunities found")
     else:
         st.warning("No trading opportunities found in selected range")
     
     # Key Insights
     st.subheader("💡 Trading Insights")
-    st.markdown(f"""
-    1. **Market Positioning**: 
-       - Institutional traders are positioned at {atm_strike:,.0f} strike
-       - Resistance building at {atm_strike+100:,.0f}
     
-    2. **Volatility Analysis**:
-       - Put IV > Call IV at ATM indicates hedging
-       - Lower call IV makes bullish strategies attractive
-    
-    3. **Probability Assessment**:
-       - 55-60% chance of closing above {atm_strike:,.0f}
-       - 35-40% chance of hitting {atm_strike+100:,.0f} in next session
-       - <5% probability of dropping below {atm_strike-200:,.0f}
-    
-    4. **Execution Tips**:
-       - Enter calls if market holds above {atm_strike:,.0f} at 11:30 AM
-       - Use bracket orders for defined risk management
-       - Exit positions if volatility drops >10% intraday
-    """)
+    if not df.empty:
+        max_put = df.loc[df['puts_oi'].idxmax()]
+        max_call = df.loc[df['calls_oi'].idxmax()]
+        max_vol_call = df.loc[df['calls_volume'].idxmax()]
+        max_vol_put = df.loc[df['puts_volume'].idxmax()]
+        
+        insights = f"""
+        1. **Market Positioning**: 
+           - Strongest support at {max_put['strike']:,.0f} ({max_put['puts_oi']/100000:,.1f}L put OI)
+           - Strongest resistance at {max_call['strike']:,.0f} ({max_call['calls_oi']/100000:,.1f}L call OI)
+        
+        2. **Volume Activity**:
+           - Most active CALL: {max_vol_call['strike']:,.0f} ({max_vol_call['calls_volume']:,.0f} contracts)
+           - Most active PUT: {max_vol_put['strike']:,.0f} ({max_vol_put['puts_volume']:,.0f} contracts)
+        
+        3. **Probability Assessment**:
+           - 55-60% chance of closing above {atm_strike:,.0f}
+           - 35-40% chance of hitting {atm_strike+100:,.0f} in next session
+           - <5% probability of dropping below {atm_strike-200:,.0f}
+        
+        4. **Execution Tips**:
+           - Enter calls if market holds above {atm_strike:,.0f} at 11:30 AM
+           - Use bracket orders for defined risk management
+           - Exit positions if volatility drops >10% intraday
+        """
+        st.markdown(insights)
+    else:
+        st.warning("No insights available - data empty")
     
     # Data Table
     st.subheader("📈 Raw Option Chain Data")
-    st.dataframe(df.style.background_gradient(subset=['straddle_pct_change'], 
-                                            cmap='RdYlGn', 
-                                            vmin=-5, 
-                                            vmax=5), 
-                height=400)
+    st.dataframe(df.head(50).style.format("{:,.2f}").background_gradient(
+        subset=['straddle_pct_change'], 
+        cmap='RdYlGn', 
+        vmin=-5, 
+        vmax=5
+    ), height=600)
 
 # How to Use
 st.sidebar.header("How to Use This App")
