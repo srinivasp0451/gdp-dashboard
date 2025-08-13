@@ -1,481 +1,417 @@
+# nifty_option_chain_friend.py
+# Streamlit app: friendly, long-only option-chain guide (NIFTY)
+# Features:
+# - Reads NSE option chain CSV in standard "CALLS ... STRIKE ... PUTS" table format (like NSE site download).
+# - Human-readable summary: ATM, OI walls, max-pain proxy, key build-ups & volumes.
+# - Long-only recommendations (no shorting): clear Entry, Target, SL, Probability (proxy), and simple logic.
+# - Straddles premium per strike with % change colored (green up / red down).
+# - OI & ΔOI charts (bars go up; negative ΔOI shows below zero only if truly negative).
+# - Volume bars per strike (CE & PE).
+# - Payoff chart at expiry for buying any strike (CALL or PUT).
+# - “Coach mode” to guide you like a friend.
+
 import streamlit as st
 import pandas as pd
 import numpy as np
-import matplotlib.pyplot as plt
-import seaborn as sns
-from matplotlib.colors import LinearSegmentedColormap
-import io
+import csv, io
+import plotly.express as px
+import plotly.graph_objects as go
 
-# Configure page
-st.set_page_config(layout="wide", page_title="NIFTY Option Chain Analysis")
-st.title("📊 NIFTY Option Chain Analysis")
-st.caption("Professional Options Trading Dashboard | Data-Driven Insights")
+st.set_page_config(page_title="NIFTY Option Chain — Friendly Long-Only Guide", layout="wide")
+st.title("🧭 NIFTY Option Chain — Your Friendly Long-Only Guide")
 
-# File uploader
-uploaded_file = st.sidebar.file_uploader("Upload Option Chain Data", 
-                                        type=["csv", "xlsx"],
-                                        help="Upload CSV or Excel file with option chain data")
+with st.sidebar:
+    st.markdown("## Coach Mode")
+    st.write(
+        "I’ll guide you step-by-step:\n"
+        "1) Upload option chain CSV (same format as NSE table download).\n"
+        "2) I’ll detect ATM, OI walls, and build a clear summary.\n"
+        "3) I’ll propose long-only buys with Entry / Target / SL and a POP (probability proxy).\n"
+        "4) Use the charts to confirm the move and manage risk.\n"
+        "5) Use the payoff chart before you hit Buy.\n"
+    )
+    risk = st.radio("Your risk comfort", ["Conservative", "Balanced", "Aggressive"], index=1)
+    st.caption("Affects the default Target/SL multiples used below.")
+    st.divider()
+    st.markdown("**Pro tips:**")
+    st.markdown(
+        "- Prefer strikes near ATM for quick scalps.\n"
+        "- Enter **with momentum** (price moving in your direction).\n"
+        "- Respect **SL**. Small loss > big regret.\n"
+        "- If flat / chop → avoid overtrading; time decay hurts buyers."
+    )
 
-# Debug mode
-debug_mode = st.sidebar.checkbox("Enable Debug Mode", value=False)
+def parse_nse_option_chain(file) -> pd.DataFrame:
+    """
+    Parse the NSE-like option-chain CSV:
+    Row0: headers with 'CALLS', 'STRIKE', 'PUTS' (sometimes)
+    Row1: actual column names
+    Data: rows start at index 2
+    """
+    txt = file.getvalue().decode("utf-8", "ignore")
+    reader = csv.reader(io.StringIO(txt))
+    rows = [r for r in reader if any(str(c).strip() for c in r)]
+    if len(rows) < 3:
+        raise ValueError("This file doesn't look like an NSE option-chain table.")
 
-# Load and preprocess data
-def load_data(uploaded_file, debug_mode=False):
-    if uploaded_file is None:
-        st.warning("Please upload a file to proceed")
-        st.stop()
-    
-    try:
-        # Log file info
-        if debug_mode:
-            st.write(f"📂 Uploaded file: {uploaded_file.name} ({uploaded_file.size/1024:.2f} KB)")
-        
-        # Read file based on type
-        if uploaded_file.name.endswith('.csv'):
-            # Read without skipping rows to inspect
-            raw_data = pd.read_csv(uploaded_file, header=None)
-            if debug_mode:
-                st.write("📝 Raw CSV data shape:", raw_data.shape)
-                st.write("🔍 First 3 rows of raw CSV data:")
-                st.dataframe(raw_data.head(3))
-            
-            # Check if we need to skip 2 rows
-            if len(raw_data.columns) > 20:
-                data = pd.read_csv(uploaded_file, skiprows=2, header=None)
-                if debug_mode:
-                    st.write("🛠️ Skipping 2 rows due to header complexity")
-            else:
-                data = pd.read_csv(uploaded_file, skiprows=1, header=None)
-                
-        elif uploaded_file.name.endswith('.xlsx'):
-            # Read without skipping rows to inspect
-            raw_data = pd.read_excel(uploaded_file, header=None)
-            if debug_mode:
-                st.write("📝 Raw Excel data shape:", raw_data.shape)
-                st.write("🔍 First 3 rows of raw Excel data:")
-                st.dataframe(raw_data.head(3))
-            
-            # Check if we need to skip 2 rows
-            if len(raw_data.columns) > 20:
-                data = pd.read_excel(uploaded_file, skiprows=2, header=None)
-                if debug_mode:
-                    st.write("🛠️ Skipping 2 rows due to header complexity")
-            else:
-                data = pd.read_excel(uploaded_file, skiprows=1, header=None)
-        else:
-            st.error("Unsupported file format. Please upload CSV or Excel file.")
-            st.stop()
-            
-        # Log processed data
-        if debug_mode:
-            st.write("🛠️ Processed data shape:", data.shape)
-            st.write("🔍 First 3 rows of processed data:")
-            st.dataframe(data.head(3))
-        
-        # Handle column count - we expect 21 columns
-        if len(data.columns) != 21:
-            if debug_mode:
-                st.warning(f"⚠️ Column count mismatch: Expected 21 columns, found {len(data.columns)}")
-            
-            # If we have exactly 23 columns, take columns 1-21
-            if len(data.columns) == 23:
-                data = data.iloc[:, 1:22]
-                if debug_mode:
-                    st.write("🔧 Selected columns 1-21 from 23-column structure")
-            else:
-                st.error(f"Column count mismatch: Expected 21 columns, found {len(data.columns)}. Please check file format.")
-                st.stop()
-        
-        # Clean column names
-        data.columns = [
-            'calls_oi', 'calls_chng_oi', 'calls_volume', 'calls_iv', 'calls_ltp', 'calls_chng',
-            'calls_bid_qty', 'calls_bid', 'calls_ask', 'calls_ask_qty', 'strike',
-            'puts_bid_qty', 'puts_bid', 'puts_ask', 'puts_ask_qty', 'puts_chng',
-            'puts_ltp', 'puts_iv', 'puts_volume', 'puts_chng_oi', 'puts_oi'
-        ]
-        
-        if debug_mode:
-            st.write("🧹 Cleaned column names:", data.columns.tolist())
-        
-        # Convert to numeric and clean
-        for col in data.columns:
-            if debug_mode:
-                st.write(f"🔢 Converting column {col}")
-                
-            # Clean string values
-            if data[col].dtype == object:
-                data[col] = data[col].astype(str).str.replace(',', '').str.replace('"', '')
-            
-            # Convert to numeric
-            data[col] = pd.to_numeric(data[col], errors='coerce')
-        
-        # Calculate straddle premium
-        data['straddle_premium'] = data['calls_ltp'] + data['puts_ltp']
-        data['straddle_pct_change'] = data['straddle_premium'].pct_change() * 100
-        
-        if debug_mode:
-            st.write("✅ Data processing completed successfully")
-            st.write("🔍 Processed data sample:")
-            st.dataframe(data.head(3))
-        
-        return data
-    except Exception as e:
-        st.error(f"❌ Error processing file: {str(e)}")
-        if debug_mode:
-            st.exception(e)
-        st.stop()
+    header = rows[1]
+    data_rows = rows[2:]
+    df = pd.DataFrame(data_rows, columns=header)
 
-if uploaded_file:
-    df = load_data(uploaded_file, debug_mode)
-    
-    # Sidebar filters
-    st.sidebar.header("Filters")
-    min_strike = st.sidebar.slider("Minimum Strike Price", 
-                                  min_value=int(df['strike'].min()), 
-                                  max_value=int(df['strike'].max()), 
-                                  value=int(df['strike'].min()))
-    max_strike = st.sidebar.slider("Maximum Strike Price", 
-                                  min_value=int(df['strike'].min()), 
-                                  max_value=int(df['strike'].max()), 
-                                  value=int(df['strike'].max()))
-    
-    filtered_df = df[(df['strike'] >= min_strike) & (df['strike'] <= max_strike)]
-    
-    # Find ATM strike (where difference between call and put prices is smallest)
-    df['price_diff'] = abs(df['calls_ltp'] - df['puts_ltp'])
-    if not df.empty:
-        atm_strike = df.loc[df['price_diff'].idxmin(), 'strike']
+    # Build prefixed columns to avoid collisions
+    call_cols = ['OI','CHNG IN OI','VOLUME','IV','LTP','CHNG','BID QTY','BID','ASK','ASK QTY']
+    put_cols  = ['BID QTY','BID','ASK','ASK QTY','CHNG','LTP','IV','VOLUME','CHNG IN OI','OI']
+    cols = list(df.columns)
+    if 'STRIKE' not in cols:
+        # Sometimes strike may be lowercase or with stray space
+        # Attempt to locate the strike column by name
+        strike_idx = None
+        for i, c in enumerate(cols):
+            if c.strip().lower() == 'strike':
+                strike_idx = i
+                break
+        if strike_idx is None:
+            raise ValueError("Couldn't find STRIKE column in header row.")
     else:
-        atm_strike = 25000
-        st.warning("Couldn't determine ATM strike, using default 25,000")
-    
-    if debug_mode:
-        st.write(f"🎯 ATM Strike: {atm_strike}")
-    
-    # Main columns
-    col1, col2 = st.columns([1, 1])
-    
-    with col1:
-        st.subheader("Market Summary")
-        
-        # Get key metrics
-        max_put_oi = df.loc[df['puts_oi'].idxmax()] if not df.empty else None
-        max_call_oi = df.loc[df['calls_oi'].idxmax()] if not df.empty else None
-        
-        summary_text = f"""
-        - **Spot Price**: ~₹{atm_strike:,.0f} (derived from ATM options)
-        - **ATM Strike**: {atm_strike:,.0f} (where CALL and PUT prices are closest)
-        - **Key Observations**:
-            - Strongest support at {max_put_oi['strike'] if max_put_oi else 'N/A'} ({max_put_oi['puts_oi']/100000:,.1f}L put OI)
-            - Strongest resistance at {max_call_oi['strike'] if max_call_oi else 'N/A'} ({max_call_oi['calls_oi']/100000:,.1f}L call OI)
-            - Implied Volatility (IV) skew: Puts ({df[df['strike'] == atm_strike]['puts_iv'].values[0]:.1f}%) > Calls ({df[df['strike'] == atm_strike]['calls_iv'].values[0]:.1f}%)
-            - Expected daily move: ±{atm_strike * 0.16 * (1/365)**0.5:.0f} points (1 standard deviation)
-        - **Sentiment**: Neutral-to-bullish with protective hedging
-        """
-        st.markdown(summary_text)
-    
-    # Straddle Premium Chart
-    with col2:
-        st.subheader("Straddle Premium Analysis")
-        
-        if not filtered_df.empty:
-            # Create color mapping for percentage change
-            cmap = LinearSegmentedColormap.from_list('rg', ["red", "white", "green"], N=256)
-            norm = plt.Normalize(filtered_df['straddle_pct_change'].min() - 1, 
-                                filtered_df['straddle_pct_change'].max() + 1)
-            colors = [cmap(norm(value)) for value in filtered_df['straddle_pct_change']]
-            
-            fig, ax = plt.subplots(figsize=(10, 4))
-            bars = ax.bar(filtered_df['strike'].astype(str), 
-                         filtered_df['straddle_premium'], 
-                         color=colors)
-            
-            # Add value labels
-            for bar in bars:
-                height = bar.get_height()
-                ax.text(bar.get_x() + bar.get_width()/2., height + 5,
-                        f'{height:.2f}', ha='center', va='bottom', fontsize=8)
-            
-            plt.title('Straddle Premium by Strike Price', fontsize=14)
-            plt.xlabel('Strike Price', fontsize=12)
-            plt.ylabel('Premium (₹)', fontsize=12)
-            plt.xticks(rotation=90, fontsize=8)
-            plt.grid(axis='y', linestyle='--', alpha=0.7)
-            
-            # Create colorbar
-            sm = plt.cm.ScalarMappable(cmap=cmap, norm=norm)
-            sm.set_array([])
-            cbar = plt.colorbar(sm, ax=ax)
-            cbar.set_label('% Change', fontsize=10)
-            
-            st.pyplot(fig)
-            st.caption("Green = Increase | Red = Decrease | Color intensity shows percentage change")
-        else:
-            st.warning("No data available for selected strike range")
-    
-    # OI Analysis Charts
-    st.subheader("Open Interest Analysis")
-    oi_col1, oi_col2 = st.columns(2)
-    
-    with oi_col1:
-        st.markdown("**CALL Options OI/Change**")
-        
-        if not filtered_df.empty:
-            fig, ax = plt.subplots(figsize=(10, 4))
-            ax.bar(filtered_df['strike'].astype(str), filtered_df['calls_oi'], 
-                  color='skyblue', label='Open Interest')
-            ax.bar(filtered_df['strike'].astype(str), filtered_df['calls_chng_oi'], 
-                  color=np.where(filtered_df['calls_chng_oi'] > 0, 'green', 'red'),
-                  label='Change in OI')
-            plt.title('CALL Open Interest', fontsize=14)
-            plt.xlabel('Strike Price', fontsize=12)
-            plt.ylabel('Contracts', fontsize=12)
-            plt.xticks(rotation=90, fontsize=8)
-            plt.grid(axis='y', linestyle='--', alpha=0.7)
-            plt.legend()
-            st.pyplot(fig)
-        else:
-            st.warning("No data available")
-    
-    with oi_col2:
-        st.markdown("**PUT Options OI/Change**")
-        
-        if not filtered_df.empty:
-            fig, ax = plt.subplots(figsize=(10, 4))
-            ax.bar(filtered_df['strike'].astype(str), filtered_df['puts_oi'], 
-                  color='lightcoral', label='Open Interest')
-            ax.bar(filtered_df['strike'].astype(str), filtered_df['puts_chng_oi'], 
-                  color=np.where(filtered_df['puts_chng_oi'] > 0, 'green', 'red'),
-                  label='Change in OI')
-            plt.title('PUT Open Interest', fontsize=14)
-            plt.xlabel('Strike Price', fontsize=12)
-            plt.ylabel('Contracts', fontsize=12)
-            plt.xticks(rotation=90, fontsize=8)
-            plt.grid(axis='y', linestyle='--', alpha=0.7)
-            plt.legend()
-            st.pyplot(fig)
-        else:
-            st.warning("No data available")
-    
-    # Volume Analysis
-    st.subheader("Trading Volume Analysis")
-    vol_col1, vol_col2 = st.columns(2)
-    
-    with vol_col1:
-        st.markdown("**CALL Volume**")
-        
-        if not filtered_df.empty:
-            fig, ax = plt.subplots(figsize=(10, 4))
-            ax.bar(filtered_df['strike'].astype(str), filtered_df['calls_volume'], 
-                  color='royalblue')
-            plt.title('CALL Trading Volume', fontsize=14)
-            plt.xlabel('Strike Price', fontsize=12)
-            plt.ylabel('Contracts', fontsize=12)
-            plt.xticks(rotation=90, fontsize=8)
-            plt.grid(axis='y', linestyle='--', alpha=0.7)
-            st.pyplot(fig)
-        else:
-            st.warning("No data available")
-    
-    with vol_col2:
-        st.markdown("**PUT Volume**")
-        
-        if not filtered_df.empty:
-            fig, ax = plt.subplots(figsize=(10, 4))
-            ax.bar(filtered_df['strike'].astype(str), filtered_df['puts_volume'], 
-                  color='indianred')
-            plt.title('PUT Trading Volume', fontsize=14)
-            plt.xlabel('Strike Price', fontsize=12)
-            plt.ylabel('Contracts', fontsize=12)
-            plt.xticks(rotation=90, fontsize=8)
-            plt.grid(axis='y', linestyle='--', alpha=0.7)
-            st.pyplot(fig)
-        else:
-            st.warning("No data available")
-    
-    # Trade Recommendations
-    st.subheader("🔥 Best Buying Opportunities")
-    
-    if not filtered_df.empty:
-        # Find best opportunities
-        call_opportunities = filtered_df[
-            (filtered_df['calls_chng_oi'] > 0) & 
-            (filtered_df['calls_iv'] < 50) &
-            (filtered_df['calls_ltp'] > 0)
-        ].sort_values('calls_chng_oi', ascending=False).head(3)
-        
-        put_opportunities = filtered_df[
-            (filtered_df['puts_chng_oi'] > 0) & 
-            (filtered_df['puts_iv'] < 50) &
-            (filtered_df['puts_ltp'] > 0)
-        ].sort_values('puts_chng_oi', ascending=False).head(1)
-        
-        rec_col1, rec_col2, rec_col3 = st.columns(3)
-        
-        with rec_col1:
-            if not call_opportunities.empty:
-                strike = call_opportunities.iloc[0]['strike']
-                ltp = call_opportunities.iloc[0]['calls_ltp']
-                iv = call_opportunities.iloc[0]['calls_iv']
-                chng_oi = call_opportunities.iloc[0]['calls_chng_oi']
-                
-                st.markdown(f"""
-                ### 🟢 {strike:,.0f} CALL
-                **Probability of Profit**: 40%  
-                **Entry**: ₹{ltp*0.97:.2f}-{ltp:.2f}  
-                **Target**: ₹{ltp*2:.2f} (100% profit)  
-                **Stop Loss**: ₹{ltp*0.5:.2f}  
-                **RR Ratio**: 1:2  
-                
-                **Logic**:  
-                - Premium: ₹{ltp:.2f} (IV: {iv:.1f}%)  
-                - OI increased by {chng_oi:,.0f} contracts  
-                - Near strong support/resistance level  
-                """)
-                st.progress(40)
-            else:
-                st.warning("No call opportunities found")
-        
-        with rec_col2:
-            if len(call_opportunities) > 1:
-                strike = call_opportunities.iloc[1]['strike']
-                ltp = call_opportunities.iloc[1]['calls_ltp']
-                iv = call_opportunities.iloc[1]['calls_iv']
-                volume = call_opportunities.iloc[1]['calls_volume']
-                
-                st.markdown(f"""
-                ### 🟡 {strike:,.0f} CALL
-                **Probability of Profit**: 50%  
-                **Entry**: ₹{ltp*0.98:.2f}-{ltp:.2f}  
-                **Target**: ₹{ltp*2:.2f} (100% profit)  
-                **Stop Loss**: ₹{ltp*0.5:.2f}  
-                **RR Ratio**: 1:2  
-                
-                **Logic**:  
-                - Good price sensitivity  
-                - High volume ({volume:,.0f} contracts)  
-                - IV: {iv:.1f}% (reasonable)  
-                """)
-                st.progress(50)
-            elif not put_opportunities.empty:
-                strike = put_opportunities.iloc[0]['strike']
-                ltp = put_opportunities.iloc[0]['puts_ltp']
-                iv = put_opportunities.iloc[0]['puts_iv']
-                oi = put_opportunities.iloc[0]['puts_oi']
-                
-                st.markdown(f"""
-                ### 🔵 {strike:,.0f} PUT
-                **Probability of Profit**: 30%  
-                **Entry**: ₹{ltp:.2f}  
-                **Target**: ₹{ltp*2:.2f} (100% profit)  
-                **Stop Loss**: ₹{ltp*0.5:.2f}  
-                
-                **Logic**:  
-                - Protective hedge against downside  
-                - Strong OI support ({oi/100000:.1f}L contracts)  
-                - IV: {iv:.1f}%  
-                """)
-                st.progress(30)
-            else:
-                st.warning("No secondary opportunities found")
-        
-        with rec_col3:
-            if len(call_opportunities) > 2:
-                strike = call_opportunities.iloc[2]['strike']
-                ltp = call_opportunities.iloc[2]['calls_ltp']
-                iv = call_opportunities.iloc[2]['calls_iv']
-                chng_oi = call_opportunities.iloc[2]['calls_chng_oi']
-                
-                st.markdown(f"""
-                ### 🟠 {strike:,.0f} CALL
-                **Probability of Profit**: 35%  
-                **Entry**: ₹{ltp*0.96:.2f}-{ltp:.2f}  
-                **Target**: ₹{ltp*2:.2f} (100% profit)  
-                **Stop Loss**: ₹{ltp*0.5:.2f}  
-                **RR Ratio**: 1:2  
-                
-                **Logic**:  
-                - Cheap premium: ₹{ltp:.2f}  
-                - OI increased by {chng_oi:,.0f} contracts  
-                - IV: {iv:.1f}% (below average)  
-                """)
-                st.progress(35)
-            elif not put_opportunities.empty:
-                strike = put_opportunities.iloc[0]['strike']
-                ltp = put_opportunities.iloc[0]['puts_ltp']
-                iv = put_opportunities.iloc[0]['puts_iv']
-                oi = put_opportunities.iloc[0]['puts_oi']
-                
-                st.markdown(f"""
-                ### 🔵 {strike:,.0f} PUT
-                **Probability of Profit**: 30%  
-                **Entry**: ₹{ltp:.2f}  
-                **Target**: ₹{ltp*2:.2f} (100% profit)  
-                **Stop Loss**: ₹{ltp*0.5:.2f}  
-                
-                **Logic**:  
-                - Protective hedge against downside  
-                - Strong OI support ({oi/100000:.1f}L contracts)  
-                - IV: {iv:.1f}%  
-                """)
-                st.progress(30)
-            else:
-                st.warning("No tertiary opportunities found")
-    else:
-        st.warning("No trading opportunities found in selected range")
-    
-    # Key Insights
-    st.subheader("💡 Trading Insights")
-    
-    if not df.empty:
-        max_put = df.loc[df['puts_oi'].idxmax()]
-        max_call = df.loc[df['calls_oi'].idxmax()]
-        max_vol_call = df.loc[df['calls_volume'].idxmax()]
-        max_vol_put = df.loc[df['puts_volume'].idxmax()]
-        
-        insights = f"""
-        1. **Market Positioning**: 
-           - Strongest support at {max_put['strike']:,.0f} ({max_put['puts_oi']/100000:,.1f}L put OI)
-           - Strongest resistance at {max_call['strike']:,.0f} ({max_call['calls_oi']/100000:,.1f}L call OI)
-        
-        2. **Volume Activity**:
-           - Most active CALL: {max_vol_call['strike']:,.0f} ({max_vol_call['calls_volume']:,.0f} contracts)
-           - Most active PUT: {max_vol_put['strike']:,.0f} ({max_vol_put['puts_volume']:,.0f} contracts)
-        
-        3. **Probability Assessment**:
-           - 55-60% chance of closing above {atm_strike:,.0f}
-           - 35-40% chance of hitting {atm_strike+100:,.0f} in next session
-           - <5% probability of dropping below {atm_strike-200:,.0f}
-        
-        4. **Execution Tips**:
-           - Enter calls if market holds above {atm_strike:,.0f} at 11:30 AM
-           - Use bracket orders for defined risk management
-           - Exit positions if volatility drops >10% intraday
-        """
-        st.markdown(insights)
-    else:
-        st.warning("No insights available - data empty")
-    
-    # Data Table
-    st.subheader("📈 Raw Option Chain Data")
-    st.dataframe(df.head(50).style.format("{:,.2f}").background_gradient(
-        subset=['straddle_pct_change'], 
-        cmap='RdYlGn', 
-        vmin=-5, 
-        vmax=5
-    ), height=600)
+        strike_idx = cols.index('STRIKE')
 
-# How to Use
-st.sidebar.header("How to Use This App")
-st.sidebar.markdown("""
-1. Upload your option chain file (CSV or Excel)
-2. Adjust strike range using sliders
-3. Review straddle premium heatmap
-4. Analyze OI and volume patterns
-5. Consider recommended trades with probabilities
-6. Check raw data for specific strikes
-""")
-st.sidebar.info("Note: Probabilities based on IV, OI distribution, and historical patterns")
+    new_cols = []
+    seen_put = 0
+    for i, c in enumerate(cols):
+        if i == strike_idx:
+            new_cols.append('strike')
+        elif c in call_cols and i < strike_idx:
+            new_cols.append(f"C_{c.lower().replace(' ', '_')}")
+        elif c in put_cols and i > strike_idx:
+            new_cols.append(f"P_{put_cols[seen_put].lower().replace(' ', '_')}")
+            seen_put += 1
+        else:
+            new_cols.append(c.lower().replace(' ', '_'))
+    df.columns = [c.lower() for c in new_cols]
 
-# Footer
-st.caption("Disclaimer: This is for educational purposes only. Trading involves substantial risk.")
+    def to_num(x):
+        s = str(x).strip().replace(',', '')
+        if s in ['', '-', '—', 'nan', 'None']:
+            return np.nan
+        try:
+            return float(s)
+        except:
+            return np.nan
+
+    for c in df.columns:
+        if c == 'strike':
+            df[c] = df[c].apply(to_num).astype(float)
+        elif c.startswith('c_') or c.startswith('p_'):
+            df[c] = df[c].apply(to_num)
+
+    df = df[~df['strike'].isna()].copy()
+    df.sort_values('strike', inplace=True)
+    df.reset_index(drop=True, inplace=True)
+    return df
+
+def pop_proxy_distance(df: pd.DataFrame) -> pd.Series:
+    """
+    Probability-of-profit proxy:
+    - If no greeks, estimate ITM probability via distance to ATM normalized by ATM straddle premium.
+    - This is a **heuristic** (ballpark only).
+    """
+    df = df.copy()
+    df['abs_cp_diff'] = (df['c_ltp'] - df['p_ltp']).abs()
+    if df['abs_cp_diff'].isna().all():
+        return pd.Series([np.nan] * len(df), index=df.index)
+
+    atm_row = df.loc[df['abs_cp_diff'].idxmin()]
+    atm_strike = atm_row['strike']
+    atm_sp = (atm_row['c_ltp'] or 0) + (atm_row['p_ltp'] or 0)
+    if pd.isna(atm_sp) or atm_sp <= 0:
+        return pd.Series([np.nan] * len(df), index=df.index)
+
+    def score(s):
+        dist = abs(s - atm_strike)
+        # simple exponential decay: center ~60%, decays with distance
+        return float(max(5, min(90, 50 * np.exp(-dist / max(1.0, atm_sp)) + 10)))
+
+    return df['strike'].apply(score)
+
+def pick_multipliers(risk_mode: str):
+    if risk_mode == "Conservative":
+        return 1.10, 0.93  # +10% target, -7% SL
+    if risk_mode == "Aggressive":
+        return 1.25, 0.90  # +25% target, -10% SL
+    return 1.15, 0.92      # Balanced default
+
+def friendly_logic_text(side, strike, coi, vol, dltp, near_level):
+    tip = (
+        f"**{side} {int(strike)}** because we see **fresh interest** (ΔOI≈{coi:.0f}) "
+        f"with **solid volume** ({vol:.0f}) and **price uptick** (ΔLTP≈{dltp:.2f}). "
+    )
+    if near_level:
+        tip += f"It’s also near the **key level {near_level}**, so small moves can expand premium quickly. "
+    tip += "Enter **with momentum** (price moving your way), avoid chop, and respect the SL."
+    return tip
+
+st.markdown("### 1) Upload your NSE option chain CSV")
+uploaded = st.file_uploader("Drop the CSV (same structure as NSE option chain table).", type=["csv"])
+
+if not uploaded:
+    st.info("Waiting for a CSV… Tip: Download from NSE option chain and upload here.")
+    st.stop()
+
+# Parse file
+try:
+    df = parse_nse_option_chain(uploaded)
+except Exception as e:
+    st.error(f"Could not parse your file: {e}")
+    st.stop()
+
+# Derived metrics
+df['straddle_premium'] = df['c_ltp'].fillna(0) + df['p_ltp'].fillna(0)
+df['straddle_change']  = df['c_chng'].fillna(0) + df['p_chng'].fillna(0)
+df['straddle_pct']     = np.where(df['straddle_premium'] > 0,
+                                  df['straddle_change'] / df['straddle_premium'] * 100,
+                                  np.nan)
+
+df['total_oi']        = df['c_oi'].fillna(0) + df['p_oi'].fillna(0)
+df['total_oi_change'] = df['c_chng_in_oi'].fillna(0) + df['p_chng_in_oi'].fillna(0)
+df['total_volume']    = df['c_volume'].fillna(0) + df['p_volume'].fillna(0)
+
+# ATM estimate
+df['abs_cp_diff'] = (df['c_ltp'] - df['p_ltp']).abs()
+atm_row = df.loc[df['abs_cp_diff'].idxmin()] if not df['abs_cp_diff'].isna().all() else None
+atm_strike = int(atm_row['strike']) if atm_row is not None else None
+
+# OI walls & max-pain proxy
+call_oi_wall = int(df.loc[df['c_oi'].idxmax(), 'strike']) if df['c_oi'].notna().any() else None
+put_oi_wall  = int(df.loc[df['p_oi'].idxmax(), 'strike']) if df['p_oi'].notna().any() else None
+max_oi_strike = int(df.loc[df['total_oi'].idxmax(), 'strike']) if df['total_oi'].notna().any() else None
+
+# POP proxy (we use the same for both sides if no greeks)
+df['pop_proxy'] = pop_proxy_distance(df)
+
+# ======= SUMMARY (friendly) =======
+st.markdown("### 2) What’s happening (plain English)")
+
+colA, colB, colC = st.columns(3)
+colA.metric("ATM strike (approx)", f"{atm_strike}" if atm_strike else "—")
+colB.metric("Call OI wall (resistance)", f"{call_oi_wall}" if call_oi_wall else "—")
+colC.metric("Put OI wall (support)", f"{put_oi_wall}" if put_oi_wall else "—")
+
+st.caption("Max-pain proxy (highest combined OI) often acts like a magnet near expiry.")
+st.metric("Max combined OI (proxy)", f"{max_oi_strike}" if max_oi_strike else "—")
+
+# Top ΔOI and Volume hotspots
+hot_call = df.sort_values('c_chng_in_oi', ascending=False).head(3)[['strike','c_chng_in_oi','c_oi','c_volume','c_ltp']]
+hot_put  = df.sort_values('p_chng_in_oi', ascending=False).head(3)[['strike','p_chng_in_oi','p_oi','p_volume','p_ltp']]
+vol_call = df.sort_values('c_volume', ascending=False).head(3)[['strike','c_volume','c_ltp','c_chng','c_chng_in_oi']]
+vol_put  = df.sort_values('p_volume', ascending=False).head(3)[['strike','p_volume','p_ltp','p_chng','p_chng_in_oi']]
+
+c1, c2 = st.columns(2)
+with c1:
+    st.markdown("**Call: biggest fresh build (ΔOI)**")
+    st.dataframe(hot_call, use_container_width=True)
+with c2:
+    st.markdown("**Put: biggest fresh build (ΔOI)**")
+    st.dataframe(hot_put, use_container_width=True)
+
+c3, c4 = st.columns(2)
+with c3:
+    st.markdown("**Call: heaviest volume**")
+    st.dataframe(vol_call, use_container_width=True)
+with c4:
+    st.markdown("**Put: heaviest volume**")
+    st.dataframe(vol_put, use_container_width=True)
+
+st.info(
+    "Takeaway: Calls cluster near resistance (writers defend), Puts near support (writers defend). "
+    "For **buyers**, near-ATM momentum bursts give the best odds for quick gains."
+)
+
+# ======= RECOMMENDATIONS (long-only) =======
+st.markdown("### 3) Long-only opportunities (friend-style guidance)")
+
+# Thresholds from quartiles (adaptive to your file)
+def qsafe(s, q, default=0):
+    s = s.dropna()
+    return float(np.nanpercentile(s, q)) if len(s) else default
+
+q_c_oi   = qsafe(df['c_chng_in_oi'], 75, 0)
+q_c_vol  = qsafe(df['c_volume'], 75, 0)
+q_p_oi   = qsafe(df['p_chng_in_oi'], 75, 0)
+q_p_vol  = qsafe(df['p_volume'], 75, 0)
+
+long_call_pool = df[(df['c_chng_in_oi'] >= q_c_oi) & (df['c_volume'] >= q_c_vol) & (df['c_chng'] >= 0)].copy()
+long_put_pool  = df[(df['p_chng_in_oi'] >= q_p_oi) & (df['p_volume'] >= q_p_vol) & (df['p_chng'] >= 0)].copy()
+
+# If too strict, fallback to positive ΔOI & volume > 0
+if long_call_pool.empty:
+    lc = df[(df['c_chng_in_oi'] > 0) & (df['c_volume'] > 0)].copy()
+    lc['score'] = lc['c_chng_in_oi'].rank(pct=True)*0.6 + lc['c_volume'].rank(pct=True)*0.4
+    long_call_pool = lc.sort_values('score', ascending=False).head(5)
+
+if long_put_pool.empty:
+    lp = df[(df['p_chng_in_oi'] > 0) & (df['p_volume'] > 0)].copy()
+    lp['score'] = lp['p_chng_in_oi'].rank(pct=True)*0.6 + lp['p_volume'].rank(pct=True)*0.4
+    long_put_pool = lp.sort_values('score', ascending=False).head(5)
+
+t_mult, sl_mult = pick_multipliers(risk)
+
+def make_reco_rows(sub: pd.DataFrame, side: str):
+    rows = []
+    for _, r in sub.iterrows():
+        if side == 'CALL':
+            ltp, dltp, iv, vol, coi = r['c_ltp'], r['c_chng'], r['c_iv'], r['c_volume'], r['c_chng_in_oi']
+            pop = r['pop_proxy']
+        else:
+            ltp, dltp, iv, vol, coi = r['p_ltp'], r['p_chng'], r['p_iv'], r['p_volume'], r['p_chng_in_oi']
+            pop = r['pop_proxy']
+        if pd.isna(ltp) or ltp <= 0:
+            continue
+        entry  = round(ltp, 2)
+        target = round(ltp * t_mult, 2)
+        sl     = round(ltp * sl_mult, 2)
+        near_key = None
+        if atm_strike and abs(r['strike'] - atm_strike) <= 50:
+            near_key = f"ATM {atm_strike}"
+        elif call_oi_wall and abs(r['strike'] - call_oi_wall) <= 50:
+            near_key = f"Call OI wall {call_oi_wall}"
+        elif put_oi_wall and abs(r['strike'] - put_oi_wall) <= 50:
+            near_key = f"Put OI wall {put_oi_wall}"
+        logic_txt = friendly_logic_text(side, r['strike'], coi or 0, vol or 0, dltp or 0, near_key)
+        rows.append({
+            "Strike": int(r['strike']),
+            "Type": side,
+            "Entry": entry,
+            "Target": target,
+            "StopLoss": sl,
+            "POP(Proxy)%": round(pop, 1) if pd.notna(pop) else None,
+            "LTP": round(ltp, 2),
+            "ΔLTP": round(dltp, 2) if pd.notna(dltp) else None,
+            "IV": round(iv, 2) if pd.notna(iv) else None,
+            "Volume": int(vol) if pd.notna(vol) else None,
+            "ΔOI": int(coi) if pd.notna(coi) else None,
+            "Why (human)": logic_txt
+        })
+    return rows
+
+call_recos = make_reco_rows(long_call_pool, "CALL")
+put_recos  = make_reco_rows(long_put_pool, "PUT")
+
+# Show top 3 each by POP then Volume then ΔOI
+def rank_recos(recos):
+    if not recos: return []
+    dfR = pd.DataFrame(recos)
+    # Some POP may be None; fill for sorting
+    dfR['_pop'] = dfR['POP(Proxy)%'].fillna(-1)
+    dfR['_vol'] = dfR['Volume'].fillna(0)
+    dfR['_oi']  = dfR['ΔOI'].fillna(0)
+    dfR = dfR.sort_values(by=['_pop','_vol','_oi'], ascending=[False, False, False]).head(3)
+    return dfR.drop(columns=['_pop','_vol','_oi'])
+
+colL, colR = st.columns(2)
+with colL:
+    st.subheader("Buy CALL — top picks")
+    df_call = rank_recos(call_recos)
+    if len(df_call):
+        st.dataframe(df_call, use_container_width=True)
+    else:
+        st.info("No strong call setups by the current heuristics.")
+with colR:
+    st.subheader("Buy PUT — top picks")
+    df_put = rank_recos(put_recos)
+    if len(df_put):
+        st.dataframe(df_put, use_container_width=True)
+    else:
+        st.info("No strong put setups by the current heuristics.")
+
+st.caption("POP is a **rough** probability proxy derived from ATM distance and straddle premium. Use it as guidance, not a guarantee.")
+
+# ======= STRADDLES PREMIUM (chart + % colored) =======
+st.markdown("### 4) Straddles premium by strike (with % change)")
+
+# Table with colored % (green up / red down)
+str_tbl = df[['strike','c_ltp','p_ltp','straddle_premium','straddle_change','straddle_pct']].copy()
+styler = (
+    str_tbl.style
+    .format({'c_ltp':'{:.2f}','p_ltp':'{:.2f}','straddle_premium':'{:.2f}','straddle_change':'{:.2f}','straddle_pct':'{:.2f}'})
+    .apply(lambda s: [
+        'background-color: #e6ffed' if (pd.notna(v) and v>0) else (
+        'background-color: #ffecec' if (pd.notna(v) and v<0) else '')
+        for v in s
+    ], subset=['straddle_pct'])
+)
+st.dataframe(styler, use_container_width=True)
+
+# Bar chart of straddle premiums per strike
+fig_str = px.bar(
+    df, x="strike", y="straddle_premium",
+    title="Straddle Premium per Strike",
+    labels={"strike":"Strike", "straddle_premium":"CE+PE LTP"}
+)
+st.plotly_chart(fig_str, use_container_width=True)
+
+# ======= OI & CHANGE IN OI (always upward; negative only if truly negative) =======
+st.markdown("### 5) OI and Change in OI")
+
+# OI are non-negative — bars point upward
+fig_oi = go.Figure()
+fig_oi.add_bar(x=df['strike'], y=df['c_oi'], name='Call OI')
+fig_oi.add_bar(x=df['strike'], y=df['p_oi'], name='Put OI')
+fig_oi.update_layout(barmode='group', title="Open Interest (upward bars)", xaxis_title="Strike", yaxis_title="OI")
+st.plotly_chart(fig_oi, use_container_width=True)
+
+# ΔOI can be negative — allow below zero only when it's negative
+fig_doi = go.Figure()
+fig_doi.add_bar(x=df['strike'], y=df['c_chng_in_oi'], name='Call ΔOI')
+fig_doi.add_bar(x=df['strike'], y=df['p_chng_in_oi'], name='Put ΔOI')
+fig_doi.update_layout(barmode='group', title="Change in OI (negative shown only if actual decrease)", xaxis_title="Strike", yaxis_title="ΔOI")
+st.plotly_chart(fig_doi, use_container_width=True)
+
+# ======= VOLUME (separate bars per strike) =======
+st.markdown("### 6) Volume per strike (CE & PE)")
+fig_vol = go.Figure()
+fig_vol.add_bar(x=df['strike'], y=df['c_volume'], name='Call Volume')
+fig_vol.add_bar(x=df['strike'], y=df['p_volume'], name='Put Volume')
+fig_vol.update_layout(barmode='group', title="Volume per Strike", xaxis_title="Strike", yaxis_title="Contracts")
+st.plotly_chart(fig_vol, use_container_width=True)
+
+# ======= PAYOFF CHART (Buy a strike) =======
+st.markdown("### 7) Payoff at Expiry — for buyers")
+
+colP1, colP2, colP3 = st.columns(3)
+opt_side = colP1.selectbox("Option Type", ["CALL","PUT"])
+strike_sel = colP2.selectbox("Strike", df['strike'].astype(int).tolist())
+if opt_side == "CALL":
+    premium = float(df.loc[df['strike']==strike_sel, 'c_ltp'].values[0])
+else:
+    premium = float(df.loc[df['strike']==strike_sel, 'p_ltp'].values[0])
+
+qty = colP3.number_input("Quantity (lots or units)", min_value=1, value=1, step=1)
+spot_center = int(df['strike'].median())
+spot_center = st.number_input("Spot range center", value=spot_center, step=50)
+
+rng = np.arange(spot_center - 1000, spot_center + 1001, 50)
+
+if opt_side == "CALL":
+    intrinsic = np.maximum(rng - strike_sel, 0)
+else:
+    intrinsic = np.maximum(strike_sel - rng, 0)
+payoff = (intrinsic - premium) * qty
+
+fig_pay = px.line(x=rng, y=payoff, labels={'x':'Spot at Expiry', 'y':'Payoff'}, title=f"Payoff — Buy {opt_side} {strike_sel} @ {premium:.2f}")
+fig_pay.add_hline(y=0, line_dash="dash")
+st.plotly_chart(fig_pay, use_container_width=True)
+
+breakeven = strike_sel + premium if opt_side == "CALL" else strike_sel - premium
+st.success(f"**Breakeven**: {breakeven:.2f} | **Max Loss**: {premium*qty:.2f} | **Max Gain**: unlimited (CALL) / up to {strike_sel}−0−premium (PUT)")
+
+# ======= FINAL FRIENDLY REMARKS =======
+st.divider()
+st.markdown("#### Friend’s checklist before you buy")
+st.markdown(
+    "- 🔍 Is price **moving in your direction now**? (Don’t buy during chop.)\n"
+    "- 🧱 Are we **near ATM/support/resistance**? (Closer = quicker premium reaction.)\n"
+    "- 🔊 Do **ΔOI and Volume** support the move?\n"
+    "- 🧮 Are you comfortable with **Target / SL**? (Adjust via sidebar risk mode.)\n"
+    "- ⏳ Remember **theta**—time decay hurts buyers in slow markets.\n"
+)
+st.caption("This tool is educational and not financial advice. Trade thoughtfully, manage risk, and size positions responsibly.")
