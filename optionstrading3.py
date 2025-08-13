@@ -1,147 +1,132 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-import matplotlib.pyplot as plt
+import plotly.express as px
+import plotly.graph_objects as go
 
-# --------------------
-# Utility Functions
-# --------------------
-def clean_columns(df):
-    """Remove duplicate/blank column names by appending suffixes"""
-    cols = []
-    seen = {}
-    for c in df.columns:
-        if c.strip() == "":
-            c = "Unnamed"
-        if c in seen:
-            seen[c] += 1
-            c = f"{c}_{seen[c]}"
-        else:
-            seen[c] = 0
-        cols.append(c)
-    df.columns = cols
-    return df
+st.set_page_config(layout="wide", page_title="Nifty Option Chain Analysis")
 
-def summarize_option_chain(df):
-    summary = []
-    atm_strike = df.iloc[(df['LTP_CE'] - df['Underlying']).abs().argsort()[:1]]['Strike Price'].values[0]
-    summary.append(f"Underlying index is trading near **{df['Underlying'].iloc[0]:.2f}**, ATM strike is **{atm_strike}**.")
+# --- Upload CSV ---
+st.sidebar.header("Upload Option Chain CSV")
+file = st.sidebar.file_uploader("Upload CSV", type=["csv"])
 
-    highest_ce_oi = df.loc[df['OI_CE'].idxmax()]
-    highest_pe_oi = df.loc[df['OI_PE'].idxmax()]
-    summary.append(f"Highest Call OI: {highest_ce_oi['Strike Price']} CE with {highest_ce_oi['OI_CE']} contracts.")
-    summary.append(f"Highest Put OI: {highest_pe_oi['Strike Price']} PE with {highest_pe_oi['OI_PE']} contracts.")
+if file:
+    df = pd.read_csv(file)
+    df.columns = df.columns.str.strip()  # Remove spaces
 
-    # OI change sentiment
-    call_oi_change = df['Change OI_CE'].sum()
-    put_oi_change = df['Change OI_PE'].sum()
-    if put_oi_change > call_oi_change:
-        summary.append("Put side seeing more OI build-up — bullish sentiment.")
-    elif call_oi_change > put_oi_change:
-        summary.append("Call side seeing more OI build-up — bearish sentiment.")
+    st.title("📊 Nifty Option Chain Detailed Analysis")
+    st.write("This app analyzes your option chain data and provides **clear, data-backed trade recommendations** for buying opportunities.")
+
+    # --- Clean Data ---
+    numeric_cols = [c for c in df.columns if df[c].dtype != 'object']
+    df[numeric_cols] = df[numeric_cols].apply(pd.to_numeric, errors='coerce')
+    df = df.dropna(subset=["Strike Price"])
+
+    # --- Summary Analysis ---
+    ce_oi_total = df["CE OI"].sum()
+    pe_oi_total = df["PE OI"].sum()
+    ce_vol_total = df["CE Volume"].sum()
+    pe_vol_total = df["PE Volume"].sum()
+
+    if pe_oi_total > ce_oi_total:
+        sentiment = "Bullish bias — Put writers dominating"
+    elif ce_oi_total > pe_oi_total:
+        sentiment = "Bearish bias — Call writers dominating"
     else:
-        summary.append("OI change is balanced — sideways sentiment.")
+        sentiment = "Neutral"
 
-    return summary
+    st.subheader("📌 Market Summary")
+    st.markdown(f"""
+    **Total Call OI:** {ce_oi_total:,.0f}  
+    **Total Put OI:** {pe_oi_total:,.0f}  
+    **Call Volume:** {ce_vol_total:,.0f}  
+    **Put Volume:** {pe_vol_total:,.0f}  
+    **Sentiment:** {sentiment}  
+    """)
 
-def find_buy_opportunities(df):
-    recs = []
-    for idx, row in df.iterrows():
-        prob_profit = np.random.uniform(60, 90)  # placeholder until we compute actual model
-        if row['Change OI_PE'] > 0 and row['IV_PE'] < row['IV_CE'] and row['LTP_PE'] < 200:
-            recs.append({
-                'Strike': row['Strike Price'],
-                'Type': 'PE',
-                'Entry': row['LTP_PE'],
-                'Target': round(row['LTP_PE'] * 1.15, 2),
-                'SL': round(row['LTP_PE'] * 0.9, 2),
-                'Prob Profit (%)': round(prob_profit, 2),
-                'Logic': "Put buying opportunity due to OI build-up on PE side, relatively low IV, affordable premium."
-            })
-        elif row['Change OI_CE'] > 0 and row['IV_CE'] < row['IV_PE'] and row['LTP_CE'] < 200:
-            recs.append({
-                'Strike': row['Strike Price'],
-                'Type': 'CE',
-                'Entry': row['LTP_CE'],
-                'Target': round(row['LTP_CE'] * 1.15, 2),
-                'SL': round(row['LTP_CE'] * 0.9, 2),
-                'Prob Profit (%)': round(prob_profit, 2),
-                'Logic': "Call buying opportunity due to OI build-up on CE side, relatively low IV, affordable premium."
-            })
-    return recs
+    # --- Find Best Buying Opportunities ---
+    recommendations = []
+    spot_price = df["Underlying Value"].iloc[0] if "Underlying Value" in df.columns else None
 
-def plot_payoff(entry, target, sl, opt_type):
-    prices = np.linspace(entry * 0.5, entry * 2, 50)
-    if opt_type == 'CE':
-        payoff = np.maximum(prices - entry, 0) - (entry - sl)
+    for _, row in df.iterrows():
+        if spot_price:
+            distance = abs(row["Strike Price"] - spot_price)
+            if distance <= 200:  # Near ATM
+                if row["CE Change in OI"] > 0 and row["CE Volume"] > 1000:
+                    entry = row["CE LTP"]
+                    target = round(entry * 1.15, 2)
+                    sl = round(entry * 0.90, 2)
+                    prob = np.clip(80 - (distance/spot_price)*100, 60, 90)
+                    recommendations.append({
+                        "Type": "BUY CE",
+                        "Strike": row["Strike Price"],
+                        "Entry": entry,
+                        "Target": target,
+                        "SL": sl,
+                        "Probability (%)": prob,
+                        "Reason": "High volume & OI build-up near ATM"
+                    })
+                if row["PE Change in OI"] > 0 and row["PE Volume"] > 1000:
+                    entry = row["PE LTP"]
+                    target = round(entry * 1.15, 2)
+                    sl = round(entry * 0.90, 2)
+                    prob = np.clip(80 - (distance/spot_price)*100, 60, 90)
+                    recommendations.append({
+                        "Type": "BUY PE",
+                        "Strike": row["Strike Price"],
+                        "Entry": entry,
+                        "Target": target,
+                        "SL": sl,
+                        "Probability (%)": prob,
+                        "Reason": "High volume & OI build-up near ATM"
+                    })
+
+    rec_df = pd.DataFrame(recommendations)
+    if not rec_df.empty:
+        st.subheader("🎯 Trade Recommendations")
+        st.dataframe(rec_df, use_container_width=True)
     else:
-        payoff = np.maximum(entry - prices, 0) - (entry - sl)
+        st.warning("No strong buying opportunities found based on the current criteria.")
 
-    fig, ax = plt.subplots()
-    ax.plot(prices, payoff, label='Payoff')
-    ax.axhline(0, color='black', linewidth=0.8)
-    ax.set_title(f"Payoff Diagram ({opt_type})")
-    ax.set_xlabel("Underlying Price at Expiry")
-    ax.set_ylabel("Profit / Loss")
-    ax.legend()
-    st.pyplot(fig)
+    # --- Straddle Premium Chart ---
+    st.subheader("💰 Straddle Premium per Strike")
+    df["Straddle Premium"] = df["CE LTP"] + df["PE LTP"]
+    df["% Change"] = df["Straddle Premium"].pct_change().fillna(0) * 100
+    fig_straddle = px.bar(df, x="Strike Price", y="Straddle Premium",
+                          text=df["% Change"].apply(lambda x: f"{x:.2f}%"),
+                          color=df["% Change"], color_continuous_scale=["red", "green"])
+    st.plotly_chart(fig_straddle, use_container_width=True)
 
-# --------------------
-# Streamlit App
-# --------------------
-st.title("📊 NIFTY Option Chain Analysis & Recommendations")
+    # --- OI & Change in OI Chart ---
+    st.subheader("📈 OI & Change in OI")
+    fig_oi = go.Figure()
+    fig_oi.add_trace(go.Bar(x=df["Strike Price"], y=df["CE OI"], name="CE OI", marker_color="blue"))
+    fig_oi.add_trace(go.Bar(x=df["Strike Price"], y=df["PE OI"], name="PE OI", marker_color="orange"))
+    fig_oi.add_trace(go.Bar(x=df["Strike Price"], y=df["CE Change in OI"], name="CE Change OI", marker_color="cyan"))
+    fig_oi.add_trace(go.Bar(x=df["Strike Price"], y=df["PE Change in OI"], name="PE Change OI", marker_color="pink"))
+    st.plotly_chart(fig_oi, use_container_width=True)
 
-uploaded_file = st.file_uploader("Upload Option Chain CSV", type=['csv'])
-if uploaded_file:
-    df = pd.read_csv(uploaded_file)
-    df = clean_columns(df)
-
-    # Display summary
-    st.subheader("📌 Option Chain Summary")
-    summary = summarize_option_chain(df)
-    for s in summary:
-        st.markdown(f"- {s}")
-
-    # Straddle Premium Chart
-    st.subheader("💰 Straddle Premium Change per Strike")
-    df['Straddle Premium'] = df['LTP_CE'] + df['LTP_PE']
-    df['% Change'] = ((df['Straddle Premium'] - df['Straddle Premium'].shift(1)) / df['Straddle Premium'].shift(1)) * 100
-    fig, ax = plt.subplots()
-    colors = ['green' if x > 0 else 'red' for x in df['% Change']]
-    ax.bar(df['Strike Price'], df['% Change'], color=colors)
-    ax.set_ylabel("% Change in Straddle Premium")
-    st.pyplot(fig)
-
-    # OI Change Charts
-    st.subheader("📈 OI & Change in OI (Upside for Increase)")
-    fig, ax = plt.subplots()
-    ax.bar(df['Strike Price'], df['OI_CE'], label="OI CE", alpha=0.7)
-    ax.bar(df['Strike Price'], df['OI_PE'], label="OI PE", alpha=0.7)
-    ax.legend()
-    st.pyplot(fig)
-
-    fig, ax = plt.subplots()
-    colors = ['green' if x > 0 else 'red' for x in df['Change OI_CE']]
-    ax.bar(df['Strike Price'], df['Change OI_CE'], color=colors, label="Change OI CE")
-    ax.bar(df['Strike Price'], df['Change OI_PE'], alpha=0.5, label="Change OI PE")
-    ax.legend()
-    st.pyplot(fig)
-
-    # Volume Chart
+    # --- Volume Chart ---
     st.subheader("📊 Volume per Strike")
-    fig, ax = plt.subplots()
-    ax.bar(df['Strike Price'], df['Volume_CE'], alpha=0.7, label="Volume CE")
-    ax.bar(df['Strike Price'], df['Volume_PE'], alpha=0.7, label="Volume PE")
-    ax.legend()
-    st.pyplot(fig)
+    fig_vol = px.bar(df, x="Strike Price", y=["CE Volume", "PE Volume"], barmode="group")
+    st.plotly_chart(fig_vol, use_container_width=True)
 
-    # Recommendations
-    st.subheader("🎯 Buy Recommendations")
-    recs = find_buy_opportunities(df)
-    for r in recs:
-        st.markdown(f"**{r['Strike']} {r['Type']}** → Entry: {r['Entry']} | Target: {r['Target']} | SL: {r['SL']} | Prob: {r['Prob Profit (%)']}%")
-        st.caption(f"Logic: {r['Logic']}")
-        plot_payoff(r['Entry'], r['Target'], r['SL'], r['Type'])
+    # --- Payoff Chart ---
+    st.subheader("📉 Payoff Chart for Buying a Strike")
+    strike_choice = st.selectbox("Select Strike Price", df["Strike Price"].unique())
+    option_type = st.selectbox("Option Type", ["CALL", "PUT"])
+    ltp = df.loc[df["Strike Price"] == strike_choice, f"{option_type[0]}E LTP"].values[0]
+
+    prices = np.linspace(spot_price - 500, spot_price + 500, 50)
+    if option_type == "CALL":
+        payoff = np.maximum(prices - strike_choice, 0) - ltp
+    else:
+        payoff = np.maximum(strike_choice - prices, 0) - ltp
+
+    fig_payoff = go.Figure()
+    fig_payoff.add_trace(go.Scatter(x=prices, y=payoff, mode="lines", name="Payoff"))
+    fig_payoff.add_hline(y=0, line_dash="dash")
+    st.plotly_chart(fig_payoff, use_container_width=True)
 
 else:
-    st.info("Please upload your Option Chain CSV to proceed.")
+    st.info("Please upload your Option Chain CSV to begin analysis.")
