@@ -133,7 +133,7 @@ def clean_numeric_value(value):
         return 0
 
 def parse_options_csv(uploaded_file):
-    """Parse the NSE options chain CSV format with proper column mapping"""
+    """Parse the NSE options chain CSV format - enhanced for specific format"""
     try:
         # Read the CSV
         uploaded_file.seek(0)
@@ -154,83 +154,161 @@ def parse_options_csv(uploaded_file):
             st.error("Could not decode the file")
             return None
         
-        # Remove the first row if it contains useless headers like "CALLS" and "PUTS"
-        if len(df) > 1:
-            first_row_str = str(df.iloc[0].values).upper()
-            if 'CALLS' in first_row_str or 'PUTS' in first_row_str:
-                df = df.drop(df.index[0]).reset_index(drop=True)
-                st.info("🧹 Removed header row containing 'CALLS/PUTS'")
+        st.write("🔍 **RAW CSV DEBUG INFO:**")
+        st.write(f"Original shape: {df.shape}")
+        st.write(f"Original columns: {list(df.columns)}")
         
-        # Display original structure for debugging
-        st.write("📋 **Original CSV Structure After Cleaning:**")
-        st.write(f"Columns: {list(df.columns)}")
-        st.write(f"Shape: {df.shape}")
-        st.write("Sample rows:")
-        st.write(df.head(5))
+        # Show first few rows completely raw
+        st.write("Raw first 3 rows:")
+        for i in range(min(3, len(df))):
+            st.write(f"Row {i}: {df.iloc[i].values}")
         
-        # Based on your sample data, map the columns correctly:
-        # CALLS: OI(1), CHNG IN OI(2), VOLUME(3), IV(4), LTP(5), CHNG(6), BID QTY(7), BID(8), ASK(9), ASK QTY(10)
-        # STRIKE(11)
-        # PUTS: BID QTY(12), BID(13), ASK(14), ASK QTY(15), CHNG(16), LTP(17), IV(18), VOLUME(19), CHNG IN OI(20), OI(21)
+        # Remove header rows that contain "CALLS" or "PUTS" 
+        rows_to_drop = []
+        for i in range(min(3, len(df))):
+            row_str = ' '.join([str(val) for val in df.iloc[i].values]).upper()
+            if 'CALLS' in row_str or 'PUTS' in row_str or 'OI' in row_str:
+                rows_to_drop.append(i)
+                st.write(f"🗑️ Marking row {i} for deletion (header): {row_str[:100]}")
         
-        # Find the STRIKE column (should contain values like 22,600.00)
+        if rows_to_drop:
+            df = df.drop(df.index[rows_to_drop]).reset_index(drop=True)
+            st.write(f"✂️ Removed {len(rows_to_drop)} header rows")
+            st.write(f"New shape: {df.shape}")
+        
+        if len(df) == 0:
+            st.error("No data rows remaining after header removal")
+            return None
+        
+        # Show cleaned data
+        st.write("Cleaned first 3 rows:")
+        for i in range(min(3, len(df))):
+            st.write(f"Row {i}: {df.iloc[i].values}")
+        
+        # Enhanced strike detection - look for values like 22,600.00 or 22600
         strike_col = None
         strike_idx = None
         
+        st.write("🔍 **SEARCHING FOR STRIKE COLUMN:**")
+        
         for i, col in enumerate(df.columns):
             try:
-                # Test if this column contains strike-like values
-                sample_vals = df[col].dropna().head(10)
-                valid_strikes = 0
+                st.write(f"\n📊 Testing column {i}: '{col}'")
                 
-                for val in sample_vals:
-                    cleaned_val = clean_numeric_value(val)
-                    if 22000 <= cleaned_val <= 27000:  # Your data range
-                        valid_strikes += 1
+                # Get non-null values from this column
+                col_values = df[col].dropna()
+                st.write(f"Non-null values count: {len(col_values)}")
                 
-                if valid_strikes >= 3:  # Found multiple valid strikes
+                if len(col_values) == 0:
+                    st.write("❌ No data in this column")
+                    continue
+                
+                # Show sample values
+                sample_vals = col_values.head(5).tolist()
+                st.write(f"Sample values: {sample_vals}")
+                
+                # Test each value for strike-like characteristics
+                strike_candidates = []
+                for j, val in enumerate(col_values.head(10)):
+                    try:
+                        # Enhanced cleaning for strike values
+                        val_str = str(val).strip()
+                        
+                        # Remove common formatting
+                        cleaned = re.sub(r'[",\s₹]', '', val_str)
+                        
+                        # Try to convert to float
+                        if cleaned and cleaned != '-' and cleaned != 'nan':
+                            num_val = float(cleaned)
+                            st.write(f"  Value '{val}' -> '{cleaned}' -> {num_val}")
+                            
+                            # Check if it's in strike range (Nifty strikes are typically 22000-27000)
+                            if 22000 <= num_val <= 27000:
+                                strike_candidates.append(num_val)
+                                st.write(f"    ✅ Valid strike: {num_val}")
+                        else:
+                            st.write(f"  Value '{val}' -> invalid after cleaning")
+                            
+                    except Exception as e:
+                        st.write(f"  Error with value '{val}': {e}")
+                
+                st.write(f"Strike candidates found: {len(strike_candidates)} -> {strike_candidates[:5]}")
+                
+                # If we found multiple valid strikes, this is our column
+                if len(strike_candidates) >= 3:
                     strike_col = col
                     strike_idx = i
-                    st.write(f"✅ Found STRIKE column: '{col}' at index {i}")
+                    st.success(f"✅ FOUND STRIKE COLUMN: '{col}' at index {i}")
+                    st.write(f"Sample strikes: {sorted(strike_candidates)[:10]}")
                     break
                     
             except Exception as e:
+                st.write(f"❌ Error processing column {i} '{col}': {e}")
                 continue
         
         if strike_col is None:
-            st.error("❌ Could not find STRIKE column")
-            return None
+            st.error("❌ STRIKE COLUMN NOT FOUND")
+            
+            # Show manual debugging info
+            st.write("🔧 **MANUAL DEBUG - All column contents:**")
+            for i, col in enumerate(df.columns):
+                try:
+                    sample_data = df[col].dropna().head(3).tolist()
+                    st.write(f"Column {i} '{col}': {sample_data}")
+                except:
+                    st.write(f"Column {i} '{col}': Error reading data")
+            
+            # Let user select manually
+            st.write("**🛠️ Manual Selection Required:**")
+            col_options = [f"{i}: {col}" for i, col in enumerate(df.columns)]
+            selected_option = st.selectbox(
+                "Select the column containing strike prices (like 22600, 22650, etc.):",
+                options=col_options,
+                help="Look for the column with numerical values around 22000-27000"
+            )
+            
+            if selected_option:
+                selected_idx = int(selected_option.split(':')[0])
+                strike_col = df.columns[selected_idx]
+                strike_idx = selected_idx
+                st.write(f"✅ Using selected column: '{strike_col}' at index {strike_idx}")
+            else:
+                st.stop()
         
-        st.write(f"📊 Strike column: {strike_col} (index: {strike_idx})")
-        st.write(f"Total columns: {len(df.columns)}")
+        # Now process the data with the identified strike column
+        st.write(f"📊 **PROCESSING DATA WITH STRIKE COLUMN: '{strike_col}' (index {strike_idx})**")
         
-        # Process the data based on known structure
         processed_data = []
+        total_cols = len(df.columns)
         
         for idx, row in df.iterrows():
             try:
-                strike = clean_numeric_value(row[strike_col])
+                # Extract strike price
+                strike_val = row[strike_col]
+                strike = clean_numeric_value(strike_val)
+                
                 if strike == 0 or strike < 22000 or strike > 27000:
                     continue
                 
-                # Based on your structure, extract data using column indices
-                row_vals = row.values
+                # Get all row values
+                row_vals = [clean_numeric_value(val) for val in row.values]
                 
-                # CALLS data (left of strike column)
-                ce_oi = clean_numeric_value(row_vals[strike_idx - 10]) if strike_idx >= 10 else 0  # OI
-                ce_oi_change = clean_numeric_value(row_vals[strike_idx - 9]) if strike_idx >= 9 else 0  # CHNG IN OI
-                ce_volume = clean_numeric_value(row_vals[strike_idx - 8]) if strike_idx >= 8 else 0  # VOLUME
-                ce_iv = clean_numeric_value(row_vals[strike_idx - 7]) if strike_idx >= 7 else 0  # IV
-                ce_ltp = clean_numeric_value(row_vals[strike_idx - 6]) if strike_idx >= 6 else 0  # LTP
-                ce_chng = clean_numeric_value(row_vals[strike_idx - 5]) if strike_idx >= 5 else 0  # CHNG
+                # Extract CALLS data (left of strike) - based on your format
+                # Your format: CALLS data is in positions 0-9 relative to strike
+                ce_oi = row_vals[strike_idx - 10] if strike_idx >= 10 else 0
+                ce_oi_change = row_vals[strike_idx - 9] if strike_idx >= 9 else 0
+                ce_volume = row_vals[strike_idx - 8] if strike_idx >= 8 else 0
+                ce_iv = row_vals[strike_idx - 7] if strike_idx >= 7 else 0
+                ce_ltp = row_vals[strike_idx - 6] if strike_idx >= 6 else 0
+                ce_chng = row_vals[strike_idx - 5] if strike_idx >= 5 else 0
                 
-                # PUTS data (right of strike column)  
-                pe_oi = clean_numeric_value(row_vals[strike_idx + 10]) if strike_idx + 10 < len(row_vals) else 0  # OI
-                pe_oi_change = clean_numeric_value(row_vals[strike_idx + 9]) if strike_idx + 9 < len(row_vals) else 0  # CHNG IN OI
-                pe_volume = clean_numeric_value(row_vals[strike_idx + 8]) if strike_idx + 8 < len(row_vals) else 0  # VOLUME
-                pe_iv = clean_numeric_value(row_vals[strike_idx + 7]) if strike_idx + 7 < len(row_vals) else 0  # IV
-                pe_ltp = clean_numeric_value(row_vals[strike_idx + 6]) if strike_idx + 6 < len(row_vals) else 0  # LTP
-                pe_chng = clean_numeric_value(row_vals[strike_idx + 5]) if strike_idx + 5 < len(row_vals) else 0  # CHNG
+                # Extract PUTS data (right of strike) - based on your format  
+                pe_oi = row_vals[strike_idx + 10] if strike_idx + 10 < total_cols else 0
+                pe_oi_change = row_vals[strike_idx + 9] if strike_idx + 9 < total_cols else 0
+                pe_volume = row_vals[strike_idx + 8] if strike_idx + 8 < total_cols else 0
+                pe_iv = row_vals[strike_idx + 7] if strike_idx + 7 < total_cols else 0
+                pe_ltp = row_vals[strike_idx + 6] if strike_idx + 6 < total_cols else 0
+                pe_chng = row_vals[strike_idx + 5] if strike_idx + 5 < total_cols else 0
                 
                 processed_data.append({
                     'STRIKE': strike,
@@ -248,53 +326,50 @@ def parse_options_csv(uploaded_file):
                     'PE_CHNG': pe_chng
                 })
                 
-                # Debug first few rows
-                if len(processed_data) <= 3:
-                    st.write(f"Row {idx}: Strike={strike}, CE_LTP={ce_ltp}, PE_LTP={pe_ltp}, CE_OI={ce_oi}, PE_OI={pe_oi}")
+                # Show first few processed rows
+                if len(processed_data) <= 5:
+                    st.write(f"✅ Row {idx}: Strike={strike}, CE_LTP={ce_ltp}, PE_LTP={pe_ltp}, CE_OI={ce_oi}, PE_OI={pe_oi}")
                 
             except Exception as e:
-                st.write(f"Error processing row {idx}: {e}")
+                st.write(f"❌ Error processing row {idx}: {e}")
                 continue
         
         if not processed_data:
-            st.error("❌ Could not extract valid options data")
+            st.error("❌ No valid data could be extracted")
             return None
         
         result_df = pd.DataFrame(processed_data)
         result_df = result_df.sort_values('STRIKE').reset_index(drop=True)
         
-        # Accurate spot price estimation using intrinsic value method
-        # For calls: if LTP > intrinsic value, then strike < spot
-        # For puts: if LTP > intrinsic value, then strike > spot
-        
-        # Find ATM by looking at where CE and PE premiums are most balanced
-        result_df['PREMIUM_RATIO'] = result_df['CE_LTP'] / (result_df['PE_LTP'] + 0.01)  # Avoid division by zero
-        result_df['DISTANCE_FROM_1'] = abs(result_df['PREMIUM_RATIO'] - 1)
-        atm_idx = result_df['DISTANCE_FROM_1'].idxmin()
-        
-        spot_estimate = result_df.loc[atm_idx, 'STRIKE']
-        
-        # Secondary validation using total premium (straddle should be minimum near ATM)
+        # Calculate spot price using multiple methods
+        result_df['PREMIUM_RATIO'] = result_df['CE_LTP'] / (result_df['PE_LTP'] + 0.01)
         result_df['TOTAL_PREMIUM'] = result_df['CE_LTP'] + result_df['PE_LTP']
-        min_straddle_strike = result_df.loc[result_df['TOTAL_PREMIUM'].idxmin(), 'STRIKE']
         
-        # Use average of both methods for better accuracy
-        spot_estimate = (spot_estimate + min_straddle_strike) / 2
+        # Method 1: Where CE/PE ratio is closest to 1
+        atm_idx1 = abs(result_df['PREMIUM_RATIO'] - 1).idxmin()
+        spot1 = result_df.loc[atm_idx1, 'STRIKE']
         
-        # Ensure spot is within reasonable range
-        if spot_estimate < 22000 or spot_estimate > 27000:
-            spot_estimate = result_df['STRIKE'].median()
+        # Method 2: Minimum straddle premium
+        atm_idx2 = result_df['TOTAL_PREMIUM'].idxmin()
+        spot2 = result_df.loc[atm_idx2, 'STRIKE']
         
-        st.success(f"✅ Successfully parsed {len(result_df)} strikes")
-        st.success(f"🎯 Estimated Current Nifty Spot: {spot_estimate:.0f}")
-        st.write("📊 Sample processed data:")
-        st.write(result_df[['STRIKE', 'CE_LTP', 'CE_OI', 'PE_LTP', 'PE_OI']].head(8))
+        # Average both methods
+        spot_estimate = (spot1 + spot2) / 2
+        
+        st.success(f"🎉 Successfully processed {len(result_df)} option strikes!")
+        st.success(f"🎯 Estimated Nifty Spot Price: {spot_estimate:.0f}")
+        st.write(f"📊 Strike range: {result_df['STRIKE'].min():.0f} to {result_df['STRIKE'].max():.0f}")
+        
+        # Show sample of final data
+        st.write("📋 **Final processed data sample:**")
+        display_df = result_df[['STRIKE', 'CE_LTP', 'CE_OI', 'PE_LTP', 'PE_OI', 'TOTAL_PREMIUM']].head(10)
+        st.dataframe(display_df)
         
         return result_df, spot_estimate
         
     except Exception as e:
-        st.error(f"Error parsing CSV: {str(e)}")
-        st.write("Error details:", str(e))
+        st.error(f"💥 Critical error in CSV processing: {str(e)}")
+        st.write(f"Error details: {e}")
         return None
 
 def create_sample_data():
