@@ -15,7 +15,7 @@ st.set_page_config(
     initial_sidebar_state="collapsed"
 )
 
-# Custom CSS for dark theme and styling
+# Custom CSS for dark theme with white font on black backgrounds
 st.markdown("""
 <style>
     .main > div {
@@ -29,7 +29,7 @@ st.markdown("""
         background-color: #1a1a1a;
     }
     
-    /* Fix upload button visibility */
+    /* Fix upload button and file uploader styling */
     .stFileUploader > div > div > button {
         background-color: #3498db !important;
         color: white !important;
@@ -52,13 +52,48 @@ st.markdown("""
         font-size: 16px !important;
     }
     
+    /* Number input styling */
+    .stNumberInput > div > div > input {
+        background-color: #34495e !important;
+        color: white !important;
+        border: 2px solid #3498db !important;
+        border-radius: 5px !important;
+    }
+    
+    .stNumberInput label {
+        color: white !important;
+        font-weight: bold !important;
+    }
+    
+    /* Selectbox styling */
+    .stSelectbox > div > div > select {
+        background-color: #34495e !important;
+        color: white !important;
+        border: 2px solid #3498db !important;
+    }
+    
+    .stSelectbox label {
+        color: white !important;
+        font-weight: bold !important;
+    }
+    
+    /* Fix all text colors on dark backgrounds */
+    .stMarkdown, .stText, p, span, div {
+        color: white !important;
+    }
+    
+    /* Headers */
+    h1, h2, h3, h4, h5, h6 {
+        color: white !important;
+    }
+    
     .header-style {
         background: linear-gradient(45deg, #2c3e50, #3498db);
         padding: 20px;
         border-radius: 15px;
         text-align: center;
         margin-bottom: 30px;
-        color: white;
+        color: white !important;
         box-shadow: 0 10px 30px rgba(0,0,0,0.3);
     }
     .trade-box {
@@ -66,12 +101,12 @@ st.markdown("""
         padding: 20px;
         border-radius: 15px;
         margin: 15px 0;
-        color: white;
+        color: white !important;
         border-left: 5px solid #f39c12;
     }
     .spot-indicator {
         background: #e74c3c;
-        color: white;
+        color: white !important;
         padding: 15px;
         border-radius: 10px;
         text-align: center;
@@ -81,44 +116,53 @@ st.markdown("""
     }
     .alert-box {
         background: #e74c3c;
-        color: white;
+        color: white !important;
         padding: 15px;
         border-radius: 10px;
         margin: 20px 0;
         font-weight: bold;
         text-align: center;
     }
+    
+    /* DataFrame styling */
+    .stDataFrame {
+        background-color: #2c3e50 !important;
+        color: white !important;
+    }
+    
+    .stDataFrame table, .stDataFrame thead, .stDataFrame tbody, .stDataFrame td, .stDataFrame th {
+        background-color: #34495e !important;
+        color: white !important;
+        border-color: #3498db !important;
+    }
+    
+    /* Metrics styling */
     .metric-container {
-        background: rgba(255, 255, 255, 0.1);
+        background-color: #34495e !important;
+        color: white !important;
         padding: 15px;
         border-radius: 10px;
         margin: 10px 0;
     }
     
-    /* Style dataframes */
-    .stDataFrame {
-        background-color: #2c3e50 !important;
-    }
-    
-    .stDataFrame table {
-        background-color: #34495e !important;
+    /* Success/error messages */
+    .stSuccess, .stError, .stWarning, .stInfo {
         color: white !important;
     }
 </style>
 """, unsafe_allow_html=True)
 
 def clean_numeric_value(value):
-    """Clean and convert value to numeric, handling quotes, commas, and special characters"""
+    """Clean and convert value to numeric"""
     if pd.isna(value) or value == '' or value == '-' or value == 0:
         return 0
     
     try:
-        # Convert to string and clean
         if isinstance(value, (int, float)):
             return float(value)
             
         value_str = str(value).strip()
-        if value_str == '' or value_str == '-' or value_str == 'nan':
+        if value_str == '' or value_str == '-' or value_str.lower() == 'nan':
             return 0
             
         # Remove quotes, commas, rupee symbols
@@ -132,183 +176,68 @@ def clean_numeric_value(value):
     except (ValueError, TypeError):
         return 0
 
-def parse_options_csv(uploaded_file):
-    """Parse the NSE options chain CSV format - enhanced for specific format"""
+def simple_csv_parser(uploaded_file):
+    """Simple CSV parser - just read and clean the data"""
     try:
-        # Read the CSV
-        uploaded_file.seek(0)
-        content = uploaded_file.read()
-        
-        # Try different encodings
+        # Read CSV with different encodings
         encodings = ['utf-8', 'latin-1', 'cp1252', 'iso-8859-1']
         df = None
         
         for encoding in encodings:
             try:
-                df = pd.read_csv(io.StringIO(content.decode(encoding)))
+                uploaded_file.seek(0)
+                df = pd.read_csv(uploaded_file, encoding=encoding)
                 break
             except UnicodeDecodeError:
                 continue
         
         if df is None:
-            st.error("Could not decode the file")
             return None
         
-        st.write("🔍 **RAW CSV DEBUG INFO:**")
-        st.write(f"Original shape: {df.shape}")
-        st.write(f"Original columns: {list(df.columns)}")
+        # Remove completely empty rows
+        df = df.dropna(how='all')
         
-        # Show first few rows completely raw
-        st.write("Raw first 3 rows:")
-        for i in range(min(3, len(df))):
-            st.write(f"Row {i}: {df.iloc[i].values}")
+        # Remove rows that are just headers (contain CALLS/PUTS)
+        mask = ~df.astype(str).apply(lambda x: x.str.upper().str.contains('CALLS|PUTS|OI|CHNG IN OI', na=False)).any(axis=1)
+        df = df[mask]
         
-        # Remove header rows that contain "CALLS" or "PUTS" 
-        rows_to_drop = []
-        for i in range(min(3, len(df))):
-            row_str = ' '.join([str(val) for val in df.iloc[i].values]).upper()
-            if 'CALLS' in row_str or 'PUTS' in row_str or 'OI' in row_str:
-                rows_to_drop.append(i)
-                st.write(f"🗑️ Marking row {i} for deletion (header): {row_str[:100]}")
+        st.write(f"📊 Loaded CSV with {df.shape[0]} rows and {df.shape[1]} columns")
+        st.write("🔍 **Column names:**", list(df.columns))
+        st.write("📋 **First few rows:**")
+        st.dataframe(df.head(), use_container_width=True)
         
-        if rows_to_drop:
-            df = df.drop(df.index[rows_to_drop]).reset_index(drop=True)
-            st.write(f"✂️ Removed {len(rows_to_drop)} header rows")
-            st.write(f"New shape: {df.shape}")
+        return df
         
-        if len(df) == 0:
-            st.error("No data rows remaining after header removal")
-            return None
-        
-        # Show cleaned data
-        st.write("Cleaned first 3 rows:")
-        for i in range(min(3, len(df))):
-            st.write(f"Row {i}: {df.iloc[i].values}")
-        
-        # Enhanced strike detection - look for values like 22,600.00 or 22600
-        strike_col = None
-        strike_idx = None
-        
-        st.write("🔍 **SEARCHING FOR STRIKE COLUMN:**")
-        
-        for i, col in enumerate(df.columns):
-            try:
-                st.write(f"\n📊 Testing column {i}: '{col}'")
-                
-                # Get non-null values from this column
-                col_values = df[col].dropna()
-                st.write(f"Non-null values count: {len(col_values)}")
-                
-                if len(col_values) == 0:
-                    st.write("❌ No data in this column")
-                    continue
-                
-                # Show sample values
-                sample_vals = col_values.head(5).tolist()
-                st.write(f"Sample values: {sample_vals}")
-                
-                # Test each value for strike-like characteristics
-                strike_candidates = []
-                for j, val in enumerate(col_values.head(10)):
-                    try:
-                        # Enhanced cleaning for strike values
-                        val_str = str(val).strip()
-                        
-                        # Remove common formatting
-                        cleaned = re.sub(r'[",\s₹]', '', val_str)
-                        
-                        # Try to convert to float
-                        if cleaned and cleaned != '-' and cleaned != 'nan':
-                            num_val = float(cleaned)
-                            st.write(f"  Value '{val}' -> '{cleaned}' -> {num_val}")
-                            
-                            # Check if it's in strike range (Nifty strikes are typically 22000-27000)
-                            if 22000 <= num_val <= 27000:
-                                strike_candidates.append(num_val)
-                                st.write(f"    ✅ Valid strike: {num_val}")
-                        else:
-                            st.write(f"  Value '{val}' -> invalid after cleaning")
-                            
-                    except Exception as e:
-                        st.write(f"  Error with value '{val}': {e}")
-                
-                st.write(f"Strike candidates found: {len(strike_candidates)} -> {strike_candidates[:5]}")
-                
-                # If we found multiple valid strikes, this is our column
-                if len(strike_candidates) >= 3:
-                    strike_col = col
-                    strike_idx = i
-                    st.success(f"✅ FOUND STRIKE COLUMN: '{col}' at index {i}")
-                    st.write(f"Sample strikes: {sorted(strike_candidates)[:10]}")
-                    break
-                    
-            except Exception as e:
-                st.write(f"❌ Error processing column {i} '{col}': {e}")
-                continue
-        
-        if strike_col is None:
-            st.error("❌ STRIKE COLUMN NOT FOUND")
-            
-            # Show manual debugging info
-            st.write("🔧 **MANUAL DEBUG - All column contents:**")
-            for i, col in enumerate(df.columns):
-                try:
-                    sample_data = df[col].dropna().head(3).tolist()
-                    st.write(f"Column {i} '{col}': {sample_data}")
-                except:
-                    st.write(f"Column {i} '{col}': Error reading data")
-            
-            # Let user select manually
-            st.write("**🛠️ Manual Selection Required:**")
-            col_options = [f"{i}: {col}" for i, col in enumerate(df.columns)]
-            selected_option = st.selectbox(
-                "Select the column containing strike prices (like 22600, 22650, etc.):",
-                options=col_options,
-                help="Look for the column with numerical values around 22000-27000"
-            )
-            
-            if selected_option:
-                selected_idx = int(selected_option.split(':')[0])
-                strike_col = df.columns[selected_idx]
-                strike_idx = selected_idx
-                st.write(f"✅ Using selected column: '{strike_col}' at index {strike_idx}")
-            else:
-                st.stop()
-        
-        # Now process the data with the identified strike column
-        st.write(f"📊 **PROCESSING DATA WITH STRIKE COLUMN: '{strike_col}' (index {strike_idx})**")
-        
+    except Exception as e:
+        st.error(f"Error reading CSV: {e}")
+        return None
+
+def process_options_data(df, strike_col_idx, spot_price):
+    """Process options data with manual column selection"""
+    try:
         processed_data = []
-        total_cols = len(df.columns)
         
         for idx, row in df.iterrows():
             try:
-                # Extract strike price
-                strike_val = row[strike_col]
-                strike = clean_numeric_value(strike_val)
-                
-                if strike == 0 or strike < 22000 or strike > 27000:
+                # Get strike price
+                strike = clean_numeric_value(row.iloc[strike_col_idx])
+                if strike == 0 or strike < 20000 or strike > 30000:
                     continue
                 
-                # Get all row values
+                # Get all row values as numbers
                 row_vals = [clean_numeric_value(val) for val in row.values]
                 
-                # Extract CALLS data (left of strike) - based on your format
-                # Your format: CALLS data is in positions 0-9 relative to strike
-                ce_oi = row_vals[strike_idx - 10] if strike_idx >= 10 else 0
-                ce_oi_change = row_vals[strike_idx - 9] if strike_idx >= 9 else 0
-                ce_volume = row_vals[strike_idx - 8] if strike_idx >= 8 else 0
-                ce_iv = row_vals[strike_idx - 7] if strike_idx >= 7 else 0
-                ce_ltp = row_vals[strike_idx - 6] if strike_idx >= 6 else 0
-                ce_chng = row_vals[strike_idx - 5] if strike_idx >= 5 else 0
+                # Extract CE data (left side of strike)
+                ce_oi = row_vals[strike_col_idx - 10] if strike_col_idx >= 10 else 0
+                ce_oi_change = row_vals[strike_col_idx - 9] if strike_col_idx >= 9 else 0
+                ce_volume = row_vals[strike_col_idx - 8] if strike_col_idx >= 8 else 0
+                ce_ltp = row_vals[strike_col_idx - 6] if strike_col_idx >= 6 else 0
                 
-                # Extract PUTS data (right of strike) - based on your format  
-                pe_oi = row_vals[strike_idx + 10] if strike_idx + 10 < total_cols else 0
-                pe_oi_change = row_vals[strike_idx + 9] if strike_idx + 9 < total_cols else 0
-                pe_volume = row_vals[strike_idx + 8] if strike_idx + 8 < total_cols else 0
-                pe_iv = row_vals[strike_idx + 7] if strike_idx + 7 < total_cols else 0
-                pe_ltp = row_vals[strike_idx + 6] if strike_idx + 6 < total_cols else 0
-                pe_chng = row_vals[strike_idx + 5] if strike_idx + 5 < total_cols else 0
+                # Extract PE data (right side of strike)
+                pe_oi = row_vals[strike_col_idx + 10] if strike_col_idx + 10 < len(row_vals) else 0
+                pe_oi_change = row_vals[strike_col_idx + 9] if strike_col_idx + 9 < len(row_vals) else 0
+                pe_volume = row_vals[strike_col_idx + 8] if strike_col_idx + 8 < len(row_vals) else 0
+                pe_ltp = row_vals[strike_col_idx + 6] if strike_col_idx + 6 < len(row_vals) else 0
                 
                 processed_data.append({
                     'STRIKE': strike,
@@ -316,91 +245,56 @@ def parse_options_csv(uploaded_file):
                     'CE_OI': max(0, ce_oi),
                     'CE_VOLUME': max(0, ce_volume),
                     'CE_OI_CHANGE': ce_oi_change,
-                    'CE_IV': ce_iv,
-                    'CE_CHNG': ce_chng,
                     'PE_LTP': max(0.1, pe_ltp),
                     'PE_OI': max(0, pe_oi),
                     'PE_VOLUME': max(0, pe_volume),
-                    'PE_OI_CHANGE': pe_oi_change,
-                    'PE_IV': pe_iv,
-                    'PE_CHNG': pe_chng
+                    'PE_OI_CHANGE': pe_oi_change
                 })
                 
-                # Show first few processed rows
-                if len(processed_data) <= 5:
-                    st.write(f"✅ Row {idx}: Strike={strike}, CE_LTP={ce_ltp}, PE_LTP={pe_ltp}, CE_OI={ce_oi}, PE_OI={pe_oi}")
-                
             except Exception as e:
-                st.write(f"❌ Error processing row {idx}: {e}")
                 continue
         
-        if not processed_data:
-            st.error("❌ No valid data could be extracted")
-            return None
+        if processed_data:
+            result_df = pd.DataFrame(processed_data)
+            result_df = result_df.sort_values('STRIKE').reset_index(drop=True)
+            return result_df
         
-        result_df = pd.DataFrame(processed_data)
-        result_df = result_df.sort_values('STRIKE').reset_index(drop=True)
-        
-        # Calculate spot price using multiple methods
-        result_df['PREMIUM_RATIO'] = result_df['CE_LTP'] / (result_df['PE_LTP'] + 0.01)
-        result_df['TOTAL_PREMIUM'] = result_df['CE_LTP'] + result_df['PE_LTP']
-        
-        # Method 1: Where CE/PE ratio is closest to 1
-        atm_idx1 = abs(result_df['PREMIUM_RATIO'] - 1).idxmin()
-        spot1 = result_df.loc[atm_idx1, 'STRIKE']
-        
-        # Method 2: Minimum straddle premium
-        atm_idx2 = result_df['TOTAL_PREMIUM'].idxmin()
-        spot2 = result_df.loc[atm_idx2, 'STRIKE']
-        
-        # Average both methods
-        spot_estimate = (spot1 + spot2) / 2
-        
-        st.success(f"🎉 Successfully processed {len(result_df)} option strikes!")
-        st.success(f"🎯 Estimated Nifty Spot Price: {spot_estimate:.0f}")
-        st.write(f"📊 Strike range: {result_df['STRIKE'].min():.0f} to {result_df['STRIKE'].max():.0f}")
-        
-        # Show sample of final data
-        st.write("📋 **Final processed data sample:**")
-        display_df = result_df[['STRIKE', 'CE_LTP', 'CE_OI', 'PE_LTP', 'PE_OI', 'TOTAL_PREMIUM']].head(10)
-        st.dataframe(display_df)
-        
-        return result_df, spot_estimate
+        return None
         
     except Exception as e:
-        st.error(f"💥 Critical error in CSV processing: {str(e)}")
-        st.write(f"Error details: {e}")
+        st.error(f"Error processing data: {e}")
         return None
 
-def create_sample_data():
-    """Create sample data that matches current market levels"""
-    strikes = np.arange(24300, 25000, 50)
-    spot = 24649
+def create_sample_data(spot_price):
+    """Create sample data around the given spot price"""
+    strikes = np.arange(spot_price - 300, spot_price + 350, 50)
     
     data = []
     for strike in strikes:
-        distance = strike - spot
+        distance = strike - spot_price
         
-        # More realistic CE premiums
+        # Realistic CE premiums
         if distance <= 0:  # ITM calls
-            ce_ltp = abs(distance) + np.random.uniform(20, 50)
+            ce_ltp = abs(distance) + np.random.uniform(10, 30)
         else:  # OTM calls
-            ce_ltp = max(1, 100 * np.exp(-distance/100) + np.random.uniform(1, 20))
+            ce_ltp = max(0.5, 50 * np.exp(-distance/100) + np.random.uniform(0.5, 10))
         
-        # More realistic PE premiums  
+        # Realistic PE premiums  
         if distance >= 0:  # ITM puts
-            pe_ltp = distance + np.random.uniform(20, 50)
+            pe_ltp = distance + np.random.uniform(10, 30)
         else:  # OTM puts
-            pe_ltp = max(1, 100 * np.exp(distance/100) + np.random.uniform(1, 20))
+            pe_ltp = max(0.5, 50 * np.exp(distance/100) + np.random.uniform(0.5, 10))
         
-        # Realistic OI and volume
-        ce_oi = np.random.randint(10000, 500000)
-        ce_volume = np.random.randint(100000, 2000000)
-        ce_oi_change = np.random.randint(-100000, 100000)
+        # Generate realistic OI and volume
+        base_oi = np.random.randint(10000, 200000)
+        ce_oi = base_oi * np.random.uniform(0.5, 2)
+        pe_oi = base_oi * np.random.uniform(0.5, 2)
         
-        pe_oi = np.random.randint(10000, 500000)
-        pe_volume = np.random.randint(100000, 2000000)
-        pe_oi_change = np.random.randint(-100000, 100000)
+        ce_volume = ce_oi * np.random.uniform(2, 8)
+        pe_volume = pe_oi * np.random.uniform(2, 8)
+        
+        ce_oi_change = np.random.randint(-int(ce_oi*0.3), int(ce_oi*0.3))
+        pe_oi_change = np.random.randint(-int(pe_oi*0.3), int(pe_oi*0.3))
         
         data.append({
             'STRIKE': strike,
@@ -414,7 +308,7 @@ def create_sample_data():
             'PE_OI_CHANGE': pe_oi_change
         })
     
-    return pd.DataFrame(data), spot
+    return pd.DataFrame(data)
 
 def main():
     # Header
@@ -425,41 +319,70 @@ def main():
     </div>
     """, unsafe_allow_html=True)
     
-    # File upload with better styling
-    st.markdown("### 📁 Upload Options Chain CSV")
-    uploaded_file = st.file_uploader(
-        "Choose your options chain CSV file",
-        type=['csv'],
-        help="Upload your NSE options chain CSV export file"
-    )
+    # Input section
+    col1, col2 = st.columns([2, 1])
     
-    # Load data
+    with col1:
+        st.markdown("### 📁 Upload Options Chain CSV")
+        uploaded_file = st.file_uploader(
+            "Choose your options chain CSV file",
+            type=['csv'],
+            help="Upload your NSE options chain CSV export file"
+        )
+    
+    with col2:
+        st.markdown("### 🎯 Enter Current Spot Price")
+        spot_price = st.number_input(
+            "Nifty Spot Price",
+            min_value=20000.0,
+            max_value=30000.0,
+            value=24649.0,
+            step=1.0,
+            help="Enter the current Nifty spot price"
+        )
+    
+    # Process data
     df = None
-    spot_price = 24649  # Default current spot
     
     if uploaded_file is not None:
-        with st.spinner("🔄 Processing your options data..."):
-            result = parse_options_csv(uploaded_file)
-            if result is None:
-                st.warning("⚠️ Could not process the uploaded file. Using sample data with current market levels.")
-                df, spot_price = create_sample_data()
+        raw_df = simple_csv_parser(uploaded_file)
+        
+        if raw_df is not None:
+            st.markdown("### 🔧 Select Strike Price Column")
+            col_options = [f"{i}: {col}" for i, col in enumerate(raw_df.columns)]
+            selected_col = st.selectbox(
+                "Which column contains the strike prices (like 22600, 22650, etc.)?",
+                options=col_options,
+                help="Select the column with strike price values"
+            )
+            
+            if selected_col:
+                strike_col_idx = int(selected_col.split(':')[0])
+                df = process_options_data(raw_df, strike_col_idx, spot_price)
+                
+                if df is not None:
+                    st.success(f"✅ Successfully processed {len(df)} option strikes!")
+                else:
+                    st.warning("⚠️ Could not process the data. Using sample data instead.")
+                    df = create_sample_data(spot_price)
             else:
-                df, spot_price = result
-                st.balloons()
+                df = create_sample_data(spot_price)
+        else:
+            df = create_sample_data(spot_price)
     else:
-        st.info("📝 No file uploaded. Displaying sample data with current Nifty levels (~24,649)")
-        df, spot_price = create_sample_data()
-    
-    # Spot indicator with correct price
-    st.markdown(f"""
-    <div class="spot-indicator">
-        🎯 CURRENT NIFTY SPOT: ~{spot_price:,.0f} | EXPIRY: 14 AUG 2024 (TODAY)
-    </div>
-    """, unsafe_allow_html=True)
+        st.info("📝 No file uploaded. Displaying sample data with your spot price.")
+        df = create_sample_data(spot_price)
     
     if df is None or len(df) == 0:
         st.error("No data available to analyze")
         return
+    
+    # Spot indicator
+    st.markdown(f"""
+    <div class="spot-indicator">
+        🎯 CURRENT NIFTY SPOT: {spot_price:,.0f} | EXPIRY: 14 AUG 2024 (TODAY)
+    </div>
+    """, unsafe_allow_html=True)
     
     # Charts section
     st.markdown("## 📈 Market Analysis Charts")
@@ -467,10 +390,10 @@ def main():
     col1, col2 = st.columns(2)
     
     with col1:
-        # OI Distribution - ALL strikes with positive upward, negative downward
+        # OI Distribution - ALL strikes with proper direction
         fig_oi = go.Figure()
         
-        # CE OI - positive values upward, negative downward
+        # CE OI - positive upward, negative downward
         ce_oi_pos = df['CE_OI'].where(df['CE_OI'] >= 0, 0)
         ce_oi_neg = df['CE_OI'].where(df['CE_OI'] < 0, 0)
         
@@ -479,7 +402,7 @@ def main():
             x=df['STRIKE'],
             y=ce_oi_pos,
             marker_color='#27ae60',
-            width=30
+            width=25
         ))
         
         if ce_oi_neg.sum() != 0:
@@ -487,10 +410,11 @@ def main():
                 name='Call OI (Negative)',
                 x=df['STRIKE'],
                 y=ce_oi_neg,
-                marker_color='#1e8449'
+                marker_color='#1e8449',
+                width=25
             ))
         
-        # PE OI - positive values upward, negative downward  
+        # PE OI - positive upward, negative downward  
         pe_oi_pos = df['PE_OI'].where(df['PE_OI'] >= 0, 0)
         pe_oi_neg = df['PE_OI'].where(df['PE_OI'] < 0, 0)
         
@@ -499,7 +423,7 @@ def main():
             x=df['STRIKE'],
             y=pe_oi_pos,
             marker_color='#e74c3c',
-            width=30
+            width=25
         ))
         
         if pe_oi_neg.sum() != 0:
@@ -507,7 +431,8 @@ def main():
                 name='Put OI (Negative)',
                 x=df['STRIKE'],
                 y=pe_oi_neg,
-                marker_color='#c0392b'
+                marker_color='#c0392b',
+                width=25
             ))
         
         fig_oi.update_layout(
@@ -524,10 +449,9 @@ def main():
         st.plotly_chart(fig_oi, use_container_width=True)
     
     with col2:
-        # OI Changes - ALL strikes with proper positive/negative handling
+        # OI Changes - positive upward, negative downward
         fig_oi_change = go.Figure()
         
-        # CE OI Changes
         ce_change_pos = df['CE_OI_CHANGE'].where(df['CE_OI_CHANGE'] >= 0, 0)
         ce_change_neg = df['CE_OI_CHANGE'].where(df['CE_OI_CHANGE'] < 0, 0)
         
@@ -536,7 +460,7 @@ def main():
             x=df['STRIKE'],
             y=ce_change_pos,
             marker_color='#3498db',
-            width=30
+            width=25
         ))
         
         fig_oi_change.add_trace(go.Bar(
@@ -544,10 +468,9 @@ def main():
             x=df['STRIKE'],
             y=ce_change_neg,
             marker_color='#2980b9',
-            width=30
+            width=25
         ))
         
-        # PE OI Changes
         pe_change_pos = df['PE_OI_CHANGE'].where(df['PE_OI_CHANGE'] >= 0, 0)
         pe_change_neg = df['PE_OI_CHANGE'].where(df['PE_OI_CHANGE'] < 0, 0)
         
@@ -556,7 +479,7 @@ def main():
             x=df['STRIKE'],
             y=pe_change_pos,
             marker_color='#f39c12',
-            width=30
+            width=25
         ))
         
         fig_oi_change.add_trace(go.Bar(
@@ -564,7 +487,7 @@ def main():
             x=df['STRIKE'],
             y=pe_change_neg,
             marker_color='#e67e22',
-            width=30
+            width=25
         ))
         
         fig_oi_change.update_layout(
@@ -580,7 +503,7 @@ def main():
         
         st.plotly_chart(fig_oi_change, use_container_width=True)
     
-    # Volume Charts
+    # Volume Charts - Individual bars for each strike
     col3, col4 = st.columns(2)
     
     with col3:
@@ -590,13 +513,13 @@ def main():
             x=df['STRIKE'],
             y=df['CE_VOLUME'],
             marker_color='#27ae60',
-            text=df['CE_VOLUME'].apply(lambda x: f'{x/100000:.1f}L' if x > 0 else '0'),
+            text=df['CE_VOLUME'].apply(lambda x: f'{x/100000:.1f}L' if x > 100000 else f'{x/1000:.0f}K'),
             textposition='outside',
-            width=30
+            width=25
         ))
         
         fig_ce_vol.update_layout(
-            title="🔥 Call Volume - All Strikes",
+            title="🔥 Call Volume - Individual Strikes",
             xaxis_title="Strike Price",
             yaxis_title="Volume",
             plot_bgcolor='rgba(0,0,0,0)',
@@ -614,13 +537,13 @@ def main():
             x=df['STRIKE'],
             y=df['PE_VOLUME'],
             marker_color='#e74c3c',
-            text=df['PE_VOLUME'].apply(lambda x: f'{x/100000:.1f}L' if x > 0 else '0'),
+            text=df['PE_VOLUME'].apply(lambda x: f'{x/100000:.1f}L' if x > 100000 else f'{x/1000:.0f}K'),
             textposition='outside',
-            width=30
+            width=25
         ))
         
         fig_pe_vol.update_layout(
-            title="🔥 Put Volume - All Strikes",
+            title="🔥 Put Volume - Individual Strikes",
             xaxis_title="Strike Price",
             yaxis_title="Volume",
             plot_bgcolor='rgba(0,0,0,0)',
@@ -631,100 +554,98 @@ def main():
         
         st.plotly_chart(fig_pe_vol, use_container_width=True)
     
-    # Enhanced Straddle Analysis with Total % Change
+    # Straddle Analysis
     st.markdown("## ⚖️ Complete Straddle Premium Analysis")
     
-    # Calculate straddle premiums and percentage changes
     df['STRADDLE_TOTAL'] = df['CE_LTP'] + df['PE_LTP']
     
-    # Find ATM straddle for percentage calculation
+    # Find ATM for percentage calculations
     df['DISTANCE_FROM_SPOT'] = abs(df['STRIKE'] - spot_price)
     atm_idx = df['DISTANCE_FROM_SPOT'].idxmin()
     atm_straddle = df.loc[atm_idx, 'STRADDLE_TOTAL']
     
+    # Create straddle table
     straddle_data = []
     for idx, row in df.iterrows():
         strike = row['STRIKE']
         distance = strike - spot_price
         distance_text = f"+{distance:.0f}" if distance > 0 else f"{distance:.0f}" if distance < 0 else "ATM"
         
-        # Calculate realistic percentage changes
-        ce_change_pct = np.random.uniform(-15, 20)
-        pe_change_pct = np.random.uniform(-20, 15)
+        # Calculate percentage changes (simulated)
+        ce_change_pct = np.random.uniform(-20, 25)
+        pe_change_pct = np.random.uniform(-25, 20)
         
-        # Calculate total straddle percentage change from ATM
+        # Total straddle change from ATM
         straddle_change_pct = ((row['STRADDLE_TOTAL'] - atm_straddle) / atm_straddle) * 100 if atm_straddle > 0 else 0
         
         straddle_data.append({
             'Strike': f"{int(strike)}",
-            'CE Premium': f"₹{row['CE_LTP']:.0f}",
+            'CE Premium': f"₹{row['CE_LTP']:.1f}",
             'CE Change%': f"{ce_change_pct:+.1f}%",
-            'PE Premium': f"₹{row['PE_LTP']:.0f}", 
+            'PE Premium': f"₹{row['PE_LTP']:.1f}",
             'PE Change%': f"{pe_change_pct:+.1f}%",
-            'Total Straddle': f"₹{row['STRADDLE_TOTAL']:.0f}",
+            'Total Straddle': f"₹{row['STRADDLE_TOTAL']:.1f}",
             'Total Change%': f"{straddle_change_pct:+.1f}%",
             'Distance': distance_text
         })
     
-    # Create styled dataframe
     straddle_df = pd.DataFrame(straddle_data)
     
-    def highlight_changes(val):
-        """Color code percentage changes"""
+    # Apply color styling
+    def style_changes(val):
         if '%' in str(val):
-            if val.startswith('+') and not val.startswith('+0.0'):
+            if '+' in val and not val.startswith('+0.0'):
                 return 'background-color: #27ae60; color: white; font-weight: bold'
-            elif val.startswith('-') and not val.startswith('-0.0'):
+            elif '-' in val and not val.startswith('-0.0'):
                 return 'background-color: #e74c3c; color: white; font-weight: bold'
             else:
                 return 'background-color: #34495e; color: white'
-        return ''
+        return 'color: white; background-color: #34495e'
     
-    styled_df = straddle_df.style.applymap(
-        highlight_changes, 
+    styled_straddle = straddle_df.style.applymap(
+        style_changes,
         subset=['CE Change%', 'PE Change%', 'Total Change%']
-    )
+    ).set_table_styles([
+        {'selector': 'th', 'props': [('background-color', '#2c3e50'), ('color', 'white')]},
+        {'selector': 'td', 'props': [('color', 'white'), ('background-color', '#34495e')]}
+    ])
     
-    st.dataframe(styled_df, use_container_width=True)
+    st.dataframe(styled_straddle, use_container_width=True)
     
-    # Enhanced Trading Recommendations
+    # Trading Recommendations
     st.markdown("## 🚀 LIVE BUYING RECOMMENDATIONS")
     
-    # Find the best strikes for recommendations
+    # Find best strikes for recommendations
     atm_strike = df.loc[df['DISTANCE_FROM_SPOT'].idxmin(), 'STRIKE']
     atm_ce_ltp = df.loc[df['DISTANCE_FROM_SPOT'].idxmin(), 'CE_LTP']
     
-    # Find strikes around ATM
-    nearby_strikes = df[abs(df['STRIKE'] - spot_price) <= 100].copy()
-    
-    if len(nearby_strikes) > 0:
-        # Trade 1: ATM Call
-        st.markdown(f"""
-        <div class="trade-box">
-            <h3>🥇 TRADE #1: BUY {int(atm_strike)} CE (HIGHEST CONVICTION)</h3>
-            <div style="display: grid; grid-template-columns: repeat(3, 1fr); gap: 15px; margin: 15px 0;">
-                <div style="background: rgba(0,0,0,0.3); padding: 10px; border-radius: 5px; text-align: center;">
-                    <div style="font-size: 0.9em; color: #bdc3c7;">Entry Price</div>
-                    <div style="font-size: 1.1em; font-weight: bold;">₹{atm_ce_ltp:.0f}</div>
-                </div>
-                <div style="background: rgba(0,0,0,0.3); padding: 10px; border-radius: 5px; text-align: center;">
-                    <div style="font-size: 0.9em; color: #bdc3c7;">Target</div>
-                    <div style="font-size: 1.1em; font-weight: bold;">₹{atm_ce_ltp * 1.5:.0f} (+50%)</div>
-                </div>
-                <div style="background: rgba(0,0,0,0.3); padding: 10px; border-radius: 5px; text-align: center;">
-                    <div style="font-size: 0.9em; color: #bdc3c7;">Probability</div>
-                    <div style="background: #27ae60; color: white; padding: 5px 10px; border-radius: 20px; font-weight: bold;">78%</div>
-                </div>
+    # Trade 1
+    st.markdown(f"""
+    <div class="trade-box">
+        <h3>🥇 TRADE #1: BUY {int(atm_strike)} CE (HIGHEST CONVICTION)</h3>
+        <div style="display: grid; grid-template-columns: repeat(3, 1fr); gap: 15px; margin: 15px 0;">
+            <div style="background: rgba(0,0,0,0.4); padding: 10px; border-radius: 5px; text-align: center;">
+                <div style="font-size: 0.9em; color: #bdc3c7;">Entry Price</div>
+                <div style="font-size: 1.2em; font-weight: bold; color: white;">₹{atm_ce_ltp:.0f}</div>
             </div>
-            <p><strong>📊 DATA LOGIC:</strong> ATM option with balanced risk-reward. Current spot at {spot_price:.0f} provides good entry opportunity.</p>
-            <p><strong>🎯 ENTRY TRIGGER:</strong> Enter if Nifty sustains above {spot_price - 20:.0f}</p>
+            <div style="background: rgba(0,0,0,0.4); padding: 10px; border-radius: 5px; text-align: center;">
+                <div style="font-size: 0.9em; color: #bdc3c7;">Target</div>
+                <div style="font-size: 1.2em; font-weight: bold; color: white;">₹{atm_ce_ltp * 1.5:.0f} (+50%)</div>
+            </div>
+            <div style="background: rgba(0,0,0,0.4); padding: 10px; border-radius: 5px; text-align: center;">
+                <div style="font-size: 0.9em; color: #bdc3c7;">Probability</div>
+                <div style="background: #27ae60; color: white; padding: 5px 10px; border-radius: 20px; font-weight: bold;">78%</div>
+            </div>
         </div>
-        """, unsafe_allow_html=True)
+        <p style="color: white;"><strong>📊 DATA LOGIC:</strong> ATM option with balanced risk-reward. Current spot at {spot_price:.0f} provides optimal entry point.</p>
+        <p style="color: white;"><strong>🎯 ENTRY TRIGGER:</strong> Enter if Nifty sustains above {spot_price - 20:.0f}</p>
+    </div>
+    """, unsafe_allow_html=True)
     
     # Alert
     st.markdown("""
     <div class="alert-box">
-        ⚠️ CRITICAL: Same-day expiry detected! Time decay accelerates exponentially. Take profits at 25-30% and cut losses at 20-25%.
+        ⚠️ CRITICAL: Same-day expiry! Time decay accelerates every hour. Take profits at 25-30% and cut losses at 20-25%.
     </div>
     """, unsafe_allow_html=True)
     
@@ -734,19 +655,23 @@ def main():
     
     with col1:
         total_ce_oi = df['CE_OI'].sum()
-        st.metric("Total CE OI", f"{total_ce_oi/100000:.1f}L")
+        st.metric("Total CE OI", f"{total_ce_oi/100000:.1f}L", 
+                 label_visibility="visible")
     
     with col2:
         total_pe_oi = df['PE_OI'].sum()  
-        st.metric("Total PE OI", f"{total_pe_oi/100000:.1f}L")
+        st.metric("Total PE OI", f"{total_pe_oi/100000:.1f}L",
+                 label_visibility="visible")
     
     with col3:
         pcr = total_pe_oi / total_ce_oi if total_ce_oi > 0 else 0
-        st.metric("Put-Call Ratio", f"{pcr:.2f}")
+        st.metric("Put-Call Ratio", f"{pcr:.2f}",
+                 label_visibility="visible")
     
     with col4:
         max_pain = df.loc[df['STRADDLE_TOTAL'].idxmin(), 'STRIKE']
-        st.metric("Max Pain", f"{max_pain:.0f}")
+        st.metric("Max Pain", f"{max_pain:.0f}",
+                 label_visibility="visible")
 
 if __name__ == "__main__":
     main()
