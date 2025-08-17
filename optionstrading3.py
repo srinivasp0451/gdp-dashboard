@@ -1,561 +1,466 @@
 import streamlit as st
 import pandas as pd
-import plotly.graph_objects as go
-import plotly.express as px
-from plotly.subplots import make_subplots
 import numpy as np
-import io
+import plotly.express as px
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+import seaborn as sns
+import matplotlib.pyplot as plt
+from scipy.stats import norm
+import warnings
+warnings.filterwarnings('ignore')
 
-# Set page config
+# Page configuration
 st.set_page_config(
-    page_title="Nifty Options Live Analysis",
+    page_title="Bank Nifty Options Chain Analyzer",
     page_icon="📊",
     layout="wide",
-    initial_sidebar_state="collapsed"
+    initial_sidebar_state="expanded"
 )
 
-# Custom CSS for dark theme and styling
-st.markdown("""
-<style>
-    .main > div {
-        padding: 1rem;
-    }
-    .stApp {
-        background-color: #1a1a1a;
-        color: white;
-    }
-    .css-1d391kg {
-        background-color: #1a1a1a;
-    }
-    .header-style {
-        background: linear-gradient(45deg, #2c3e50, #3498db);
-        padding: 20px;
-        border-radius: 15px;
-        text-align: center;
-        margin-bottom: 30px;
-        color: white;
-        box-shadow: 0 10px 30px rgba(0,0,0,0.3);
-    }
-    .trade-box {
-        background: linear-gradient(135deg, #27ae60, #2ecc71);
-        padding: 20px;
-        border-radius: 15px;
-        margin: 15px 0;
-        color: white;
-        border-left: 5px solid #f39c12;
-    }
-    .spot-indicator {
-        background: #e74c3c;
-        color: white;
-        padding: 15px;
-        border-radius: 10px;
-        text-align: center;
-        margin: 20px 0;
-        font-size: 1.2em;
-        font-weight: bold;
-    }
-    .alert-box {
-        background: #e74c3c;
-        color: white;
-        padding: 15px;
-        border-radius: 10px;
-        margin: 20px 0;
-        font-weight: bold;
-        text-align: center;
-    }
-    .metric-container {
-        background: rgba(255, 255, 255, 0.1);
-        padding: 15px;
-        border-radius: 10px;
-        margin: 10px 0;
-    }
-</style>
-""", unsafe_allow_html=True)
+st.title("🏦 Bank Nifty Options Chain Analysis Dashboard")
+st.markdown("---")
 
-def safe_convert_to_numeric(value):
-    """Safely convert value to numeric, handling various formats"""
-    if pd.isna(value) or value == '' or value == '-':
-        return 0
-    
-    try:
-        # Remove quotes and commas
-        if isinstance(value, str):
-            value = value.replace('"', '').replace(',', '').replace('₹', '').strip()
-        
-        # Try to convert to float
-        return float(value)
-    except (ValueError, TypeError):
-        return 0
+# Sidebar for file uploads
+st.sidebar.header("📁 Upload Options Data")
+uploaded_files = []
 
-def clean_column_data(df, column):
-    """Clean and convert column data safely"""
-    if column not in df.columns:
-        return pd.Series([0] * len(df))
-    
-    return df[column].apply(safe_convert_to_numeric)
+file1 = st.sidebar.file_uploader("Upload Options Chain Data 1", type=['csv'])
+file2 = st.sidebar.file_uploader("Upload Options Chain Data 2 (Optional)", type=['csv'])
 
-def load_and_process_data(uploaded_file):
-    """Load and process the options chain data with error handling"""
-    try:
-        # Try different encodings
-        encodings = ['utf-8', 'latin-1', 'cp1252', 'iso-8859-1']
-        df = None
-        
-        for encoding in encodings:
-            try:
-                uploaded_file.seek(0)
-                df = pd.read_csv(uploaded_file, encoding=encoding)
-                break
-            except UnicodeDecodeError:
-                continue
-        
-        if df is None:
-            st.error("Could not read the file with any standard encoding")
-            return None
-        
-        # Debug: Show original columns
-        st.write("Original columns:", df.columns.tolist())
-        
-        # Try to identify key columns by pattern matching
-        columns_map = {}
-        
-        # Look for STRIKE column
-        strike_candidates = [col for col in df.columns if 'STRIKE' in str(col).upper()]
-        if strike_candidates:
-            columns_map['STRIKE'] = strike_candidates[0]
-        else:
-            # Try to find numeric column that looks like strike prices
-            numeric_cols = df.select_dtypes(include=[np.number]).columns
-            for col in numeric_cols:
-                sample_values = df[col].dropna()
-                if len(sample_values) > 0:
-                    avg_val = sample_values.mean()
-                    if 20000 <= avg_val <= 30000:  # Typical Nifty range
-                        columns_map['STRIKE'] = col
-                        break
-        
-        # Look for other important columns
-        for col in df.columns:
-            col_upper = str(col).upper()
-            if 'LTP' in col_upper and 'CALL' not in col_upper and 'PUT' not in col_upper:
-                if 'CE' not in columns_map:
-                    columns_map['CE_LTP'] = col
-                elif 'PE' not in columns_map:
-                    columns_map['PE_LTP'] = col
-            elif 'OI' in col_upper and 'CHNG' not in col_upper:
-                if 'CE_OI' not in columns_map:
-                    columns_map['CE_OI'] = col
-                elif 'PE_OI' not in columns_map:
-                    columns_map['PE_OI'] = col
-            elif 'VOLUME' in col_upper:
-                if 'CE_VOLUME' not in columns_map:
-                    columns_map['CE_VOLUME'] = col
-                elif 'PE_VOLUME' not in columns_map:
-                    columns_map['PE_VOLUME'] = col
-            elif 'CHNG IN OI' in col_upper or 'OI_CHANGE' in col_upper:
-                if 'CE_OI_CHANGE' not in columns_map:
-                    columns_map['CE_OI_CHANGE'] = col
-                elif 'PE_OI_CHANGE' not in columns_map:
-                    columns_map['PE_OI_CHANGE'] = col
-        
-        # If we can't find the mapped columns, try positional approach
-        if 'STRIKE' not in columns_map and len(df.columns) > 10:
-            # Assume standard NSE format - STRIKE is usually around middle
-            middle_idx = len(df.columns) // 2
-            columns_map['STRIKE'] = df.columns[middle_idx]
-        
-        # Create processed dataframe
-        processed_data = []
-        
-        for idx, row in df.iterrows():
-            try:
-                # Extract strike price
-                strike_col = columns_map.get('STRIKE', df.columns[0])
-                strike = safe_convert_to_numeric(row[strike_col])
-                
-                if strike == 0 or strike < 15000 or strike > 35000:
-                    continue
-                
-                # Extract other values with fallbacks
-                row_data = {'STRIKE': strike}
-                
-                # Try to extract data from available columns
-                for i, col in enumerate(df.columns):
-                    val = safe_convert_to_numeric(row[col])
-                    row_data[f'COL_{i}'] = val
-                
-                processed_data.append(row_data)
-                
-            except Exception as e:
-                continue
-        
-        if not processed_data:
-            st.error("Could not extract valid strike price data")
-            return None
-        
-        result_df = pd.DataFrame(processed_data)
-        
-        # Sort by strike price
-        result_df = result_df.sort_values('STRIKE').reset_index(drop=True)
-        
-        # Estimate spot price from the data
-        strikes = result_df['STRIKE'].values
-        spot_estimate = np.median(strikes)
-        
-        return result_df, spot_estimate, columns_map
-        
-    except Exception as e:
-        st.error(f"Error processing file: {str(e)}")
-        return None
+if file1:
+    uploaded_files.append(file1)
+if file2:
+    uploaded_files.append(file2)
 
-def create_sample_data():
-    """Create sample data for demonstration"""
-    strikes = np.arange(24200, 24700, 50)
-    spot = 24360
+def load_and_clean_data(file):
+    """Load and clean options chain data"""
+    df = pd.read_csv(file)
     
-    data = []
-    for strike in strikes:
-        # Simulate realistic option data
-        distance = abs(strike - spot)
-        
-        # CE data
-        ce_ltp = max(1, spot - strike + np.random.normal(0, 20)) if strike <= spot else max(1, np.random.exponential(50))
-        ce_oi = np.random.randint(10000, 200000)
-        ce_volume = np.random.randint(50000, 1000000)
-        ce_oi_change = np.random.randint(-50000, 50000)
-        
-        # PE data  
-        pe_ltp = max(1, strike - spot + np.random.normal(0, 20)) if strike >= spot else max(1, np.random.exponential(50))
-        pe_oi = np.random.randint(10000, 200000)
-        pe_volume = np.random.randint(50000, 1000000)
-        pe_oi_change = np.random.randint(-50000, 50000)
-        
-        data.append({
-            'STRIKE': strike,
-            'CE_LTP': ce_ltp,
-            'CE_OI': ce_oi,
-            'CE_VOLUME': ce_volume,
-            'CE_OI_CHANGE': ce_oi_change,
-            'PE_LTP': pe_ltp,
-            'PE_OI': pe_oi,
-            'PE_VOLUME': pe_volume,
-            'PE_OI_CHANGE': pe_oi_change
-        })
+    # Remove summary rows
+    df = df[~df['strike_price'].astype(str).str.contains('Total|ITM|OTM', na=False)]
     
-    return pd.DataFrame(data), spot
+    # Convert to numeric
+    numeric_cols = ['calls_oi', 'calls_ltp', 'strike_price', 'puts_ltp', 'puts_oi']
+    for col in numeric_cols:
+        df[col] = pd.to_numeric(df[col], errors='coerce')
+    
+    # Fill NaN values with 0
+    df = df.fillna(0)
+    
+    return df
 
-def main():
-    # Header
-    st.markdown("""
-    <div class="header-style">
-        <h1>📊 NIFTY OPTIONS LIVE ANALYSIS - 14 AUG 2024</h1>
-        <p>Complete Buying Opportunities Dashboard with Data-Backed Recommendations</p>
-    </div>
-    """, unsafe_allow_html=True)
+def calculate_option_metrics(df):
+    """Calculate advanced option metrics"""
+    df = df.copy()
     
-    # File upload
-    uploaded_file = st.file_uploader(
-        "Upload Options Chain CSV", 
-        type=['csv'],
-        help="Upload your options chain CSV file"
+    # PCR (Put Call Ratio)
+    df['pcr_oi'] = df['puts_oi'] / (df['calls_oi'] + 1)  # Adding 1 to avoid division by zero
+    df['pcr_volume'] = df['puts_ltp'] / (df['calls_ltp'] + 0.01)
+    
+    # Total OI
+    df['total_oi'] = df['calls_oi'] + df['puts_oi']
+    
+    # OI Concentration
+    total_calls_oi = df['calls_oi'].sum()
+    total_puts_oi = df['puts_oi'].sum()
+    df['calls_oi_pct'] = (df['calls_oi'] / total_calls_oi) * 100
+    df['puts_oi_pct'] = (df['puts_oi'] / total_puts_oi) * 100
+    
+    # Identify ATM strike (closest to current price based on LTP patterns)
+    # ATM is typically where Call and Put premiums are closest
+    df['call_put_diff'] = abs(df['calls_ltp'] - df['puts_ltp'])
+    atm_strike = df.loc[df['call_put_diff'].idxmin(), 'strike_price']
+    
+    # ITM/OTM classification
+    df['option_type'] = np.where(
+        df['strike_price'] < atm_strike, 'ITM_CALL_OTM_PUT',
+        np.where(df['strike_price'] > atm_strike, 'OTM_CALL_ITM_PUT', 'ATM')
     )
     
-    # Load data
-    if uploaded_file is not None:
-        result = load_and_process_data(uploaded_file)
-        if result is None:
-            st.error("Could not process the uploaded file. Using sample data instead.")
-            df, spot_price = create_sample_data()
-        else:
-            df, spot_price, columns_map = result
-            st.success(f"Successfully loaded data with {len(df)} strikes")
-    else:
-        st.info("Upload a CSV file or view with sample data")
-        df, spot_price = create_sample_data()
+    # Support and Resistance levels based on OI
+    df['support_strength'] = df['puts_oi'] / df['puts_oi'].max()
+    df['resistance_strength'] = df['calls_oi'] / df['calls_oi'].max()
     
-    # Spot indicator
-    st.markdown(f"""
-    <div class="spot-indicator">
-        🎯 CURRENT NIFTY SPOT: ~{spot_price:,.0f} | EXPIRY: 14 AUG 2024 (TODAY)
-    </div>
-    """, unsafe_allow_html=True)
-    
-    # Ensure required columns exist
-    required_cols = ['CE_LTP', 'CE_OI', 'CE_VOLUME', 'CE_OI_CHANGE', 
-                     'PE_LTP', 'PE_OI', 'PE_VOLUME', 'PE_OI_CHANGE']
-    
-    for col in required_cols:
-        if col not in df.columns:
-            # Try to map from available columns or create dummy data
-            if 'COL_' in str(df.columns):
-                # Use positional mapping for standard NSE format
-                col_mapping = {
-                    'CE_LTP': 'COL_5', 'CE_OI': 'COL_1', 'CE_VOLUME': 'COL_3', 'CE_OI_CHANGE': 'COL_2',
-                    'PE_LTP': 'COL_17', 'PE_OI': 'COL_21', 'PE_VOLUME': 'COL_19', 'PE_OI_CHANGE': 'COL_20'
-                }
-                if col_mapping.get(col) in df.columns:
-                    df[col] = df[col_mapping[col]]
-                else:
-                    df[col] = np.random.randint(1, 1000, len(df))
-            else:
-                df[col] = np.random.randint(1, 1000, len(df))
-    
-    # Filter data around spot (7 strikes above and below)
-    spot_idx = df.iloc[(df['STRIKE'] - spot_price).abs().argsort()[:1]].index[0]
-    start_idx = max(0, spot_idx - 7)
-    end_idx = min(len(df), spot_idx + 8)
-    df_filtered = df.iloc[start_idx:end_idx].copy()
-    
-    # Charts section
-    st.markdown("## 📈 Market Analysis Charts")
-    
-    # Create two columns for charts
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        # OI Distribution Chart (bars upward)
-        fig_oi = go.Figure()
-        
-        fig_oi.add_trace(go.Bar(
-            name='Call OI',
-            x=df_filtered['STRIKE'],
-            y=df_filtered['CE_OI'],
-            marker_color='#27ae60',
-            offsetgroup=1
-        ))
-        
-        fig_oi.add_trace(go.Bar(
-            name='Put OI',
-            x=df_filtered['STRIKE'],
-            y=df_filtered['PE_OI'],
-            marker_color='#e74c3c',
-            offsetgroup=2
-        ))
-        
-        fig_oi.update_layout(
-            title="📈 OI Distribution - Calls vs Puts",
-            xaxis_title="Strike Price",
-            yaxis_title="Open Interest",
-            barmode='group',
-            plot_bgcolor='rgba(0,0,0,0)',
-            paper_bgcolor='rgba(0,0,0,0)',
-            font_color='white',
-            title_font_size=16
-        )
-        
-        st.plotly_chart(fig_oi, use_container_width=True)
-    
-    with col2:
-        # OI Changes Chart (negative values downward)
-        fig_oi_change = go.Figure()
-        
-        # Separate positive and negative changes
-        ce_oi_pos = df_filtered['CE_OI_CHANGE'].where(df_filtered['CE_OI_CHANGE'] >= 0, 0)
-        ce_oi_neg = df_filtered['CE_OI_CHANGE'].where(df_filtered['CE_OI_CHANGE'] < 0, 0)
-        pe_oi_pos = df_filtered['PE_OI_CHANGE'].where(df_filtered['PE_OI_CHANGE'] >= 0, 0)
-        pe_oi_neg = df_filtered['PE_OI_CHANGE'].where(df_filtered['PE_OI_CHANGE'] < 0, 0)
-        
-        fig_oi_change.add_trace(go.Bar(
-            name='Call OI Change (+)',
-            x=df_filtered['STRIKE'],
-            y=ce_oi_pos,
-            marker_color='#3498db',
-            offsetgroup=1
-        ))
-        
-        fig_oi_change.add_trace(go.Bar(
-            name='Call OI Change (-)',
-            x=df_filtered['STRIKE'],
-            y=ce_oi_neg,
-            marker_color='#2980b9',
-            offsetgroup=1
-        ))
-        
-        fig_oi_change.add_trace(go.Bar(
-            name='Put OI Change (+)',
-            x=df_filtered['STRIKE'],
-            y=pe_oi_pos,
-            marker_color='#f39c12',
-            offsetgroup=2
-        ))
-        
-        fig_oi_change.add_trace(go.Bar(
-            name='Put OI Change (-)',
-            x=df_filtered['STRIKE'],
-            y=pe_oi_neg,
-            marker_color='#e67e22',
-            offsetgroup=2
-        ))
-        
-        fig_oi_change.update_layout(
-            title="📊 OI Changes - Fresh Positions",
-            xaxis_title="Strike Price",
-            yaxis_title="OI Change",
-            barmode='group',
-            plot_bgcolor='rgba(0,0,0,0)',
-            paper_bgcolor='rgba(0,0,0,0)',
-            font_color='white',
-            title_font_size=16
-        )
-        
-        st.plotly_chart(fig_oi_change, use_container_width=True)
-    
-    # Volume Charts - Individual for each strike
-    col3, col4 = st.columns(2)
-    
-    with col3:
-        # Call Volume
-        fig_ce_vol = go.Figure()
-        
-        fig_ce_vol.add_trace(go.Bar(
-            name='Call Volume',
-            x=df_filtered['STRIKE'],
-            y=df_filtered['CE_VOLUME'],
-            marker_color='#27ae60',
-            text=df_filtered['CE_VOLUME'].apply(lambda x: f'{x/100000:.1f}L'),
-            textposition='outside'
-        ))
-        
-        fig_ce_vol.update_layout(
-            title="🔥 Call Volume Analysis",
-            xaxis_title="Strike Price",
-            yaxis_title="Volume",
-            plot_bgcolor='rgba(0,0,0,0)',
-            paper_bgcolor='rgba(0,0,0,0)',
-            font_color='white',
-            title_font_size=16
-        )
-        
-        st.plotly_chart(fig_ce_vol, use_container_width=True)
-    
-    with col4:
-        # Put Volume
-        fig_pe_vol = go.Figure()
-        
-        fig_pe_vol.add_trace(go.Bar(
-            name='Put Volume',
-            x=df_filtered['STRIKE'],
-            y=df_filtered['PE_VOLUME'],
-            marker_color='#e74c3c',
-            text=df_filtered['PE_VOLUME'].apply(lambda x: f'{x/100000:.1f}L'),
-            textposition='outside'
-        ))
-        
-        fig_pe_vol.update_layout(
-            title="🔥 Put Volume Analysis",
-            xaxis_title="Strike Price",
-            yaxis_title="Volume",
-            plot_bgcolor='rgba(0,0,0,0)',
-            paper_bgcolor='rgba(0,0,0,0)',
-            font_color='white',
-            title_font_size=16
-        )
-        
-        st.plotly_chart(fig_pe_vol, use_container_width=True)
-    
-    # Straddle Analysis
-    st.markdown("## ⚖️ Straddle Premium Analysis")
-    
-    # Calculate straddle premiums and changes
-    df_filtered['STRADDLE'] = df_filtered['CE_LTP'] + df_filtered['PE_LTP']
-    
-    # Create straddle table with individual CE/PE premiums
-    straddle_data = []
-    for _, row in df_filtered.iterrows():
-        strike = row['STRIKE']
-        distance = abs(strike - spot_price)
-        distance_text = f"+{distance}" if strike > spot_price else f"-{distance}" if strike < spot_price else "ATM"
-        
-        # Calculate percentage changes (simulated for demo)
-        ce_change_pct = np.random.uniform(-10, 15)
-        pe_change_pct = np.random.uniform(-15, 10)
-        
-        straddle_data.append({
-            'Strike': int(strike),
-            'CE Premium': f"₹{row['CE_LTP']:.0f}",
-            'CE Change%': f"{ce_change_pct:+.1f}%",
-            'PE Premium': f"₹{row['PE_LTP']:.0f}",
-            'PE Change%': f"{pe_change_pct:+.1f}%",
-            'Total Straddle': f"₹{row['STRADDLE']:.0f}",
-            'Distance': distance_text
-        })
-    
-    # Display straddle table
-    straddle_df = pd.DataFrame(straddle_data)
-    
-    def color_change(val):
-        if '+' in val and val != '+0.0%':
-            return 'color: #27ae60'
-        elif '-' in val and val != '-0.0%':
-            return 'color: #e74c3c'
-        else:
-            return 'color: white'
-    
-    styled_straddle = straddle_df.style.applymap(color_change, subset=['CE Change%', 'PE Change%'])
-    st.dataframe(styled_straddle, use_container_width=True)
-    
-    # Trading Recommendations
-    st.markdown("## 🚀 LIVE BUYING RECOMMENDATIONS")
-    
-    # Find optimal strikes for recommendations
-    atm_strike = df_filtered.iloc[(df_filtered['STRIKE'] - spot_price).abs().argsort()[:1]]['STRIKE'].iloc[0]
-    
-    # Trade 1: ATM Call
-    st.markdown("""
-    <div class="trade-box">
-        <h3>🥇 TRADE #1: BUY {0} CE (HIGHEST CONVICTION)</h3>
-        <div style="display: grid; grid-template-columns: repeat(3, 1fr); gap: 15px; margin: 15px 0;">
-            <div style="background: rgba(0,0,0,0.3); padding: 10px; border-radius: 5px; text-align: center;">
-                <div style="font-size: 0.9em; color: #bdc3c7;">Entry Price</div>
-                <div style="font-size: 1.1em; font-weight: bold;">₹{1:.0f}</div>
-            </div>
-            <div style="background: rgba(0,0,0,0.3); padding: 10px; border-radius: 5px; text-align: center;">
-                <div style="font-size: 0.9em; color: #bdc3c7;">Target</div>
-                <div style="font-size: 1.1em; font-weight: bold;">₹{2:.0f} (+{3:.0f}%)</div>
-            </div>
-            <div style="background: rgba(0,0,0,0.3); padding: 10px; border-radius: 5px; text-align: center;">
-                <div style="font-size: 0.9em; color: #bdc3c7;">Probability</div>
-                <div style="background: #27ae60; color: white; padding: 5px 10px; border-radius: 20px; font-weight: bold;">78%</div>
-            </div>
-        </div>
-        <p><strong>📊 DATA LOGIC:</strong> High volume/OI ratio indicates fresh institutional buying. Optimal risk-reward setup.</p>
-        <p><strong>🎯 ENTRY TRIGGER:</strong> Enter if Nifty > {4:.0f}</p>
-    </div>
-    """.format(
-        int(atm_strike),
-        df_filtered[df_filtered['STRIKE'] == atm_strike]['CE_LTP'].iloc[0],
-        df_filtered[df_filtered['STRIKE'] == atm_strike]['CE_LTP'].iloc[0] * 1.4,
-        40,
-        spot_price - 10
-    ), unsafe_allow_html=True)
-    
-    # Alert box
-    st.markdown("""
-    <div class="alert-box">
-        ⚠️ CRITICAL: With same-day expiry, time decay accelerates every hour. Take profits quickly and cut losses faster!
-    </div>
-    """, unsafe_allow_html=True)
-    
-    # Key metrics
-    st.markdown("## 📊 Key Market Metrics")
-    
-    col1, col2, col3, col4 = st.columns(4)
-    
-    with col1:
-        total_ce_oi = df_filtered['CE_OI'].sum()
-        st.metric("Total CE OI", f"{total_ce_oi/100000:.1f}L")
-    
-    with col2:
-        total_pe_oi = df_filtered['PE_OI'].sum()
-        st.metric("Total PE OI", f"{total_pe_oi/100000:.1f}L")
-    
-    with col3:
-        pcr = total_pe_oi / total_ce_oi if total_ce_oi > 0 else 0
-        st.metric("Put-Call Ratio", f"{pcr:.2f}")
-    
-    with col4:
-        max_pain = df_filtered.loc[df_filtered['STRADDLE'].idxmin(), 'STRIKE']
-        st.metric("Max Pain", f"{max_pain:.0f}")
+    return df, atm_strike
 
-if __name__ == "__main__":
-    main()
+def identify_trading_opportunities(df, atm_strike):
+    """Identify potential trading opportunities"""
+    opportunities = []
+    
+    # 1. High OI Put Strikes (Support Levels)
+    high_put_oi = df[df['puts_oi'] > df['puts_oi'].quantile(0.8)].copy()
+    for _, row in high_put_oi.iterrows():
+        if row['strike_price'] < atm_strike:
+            prob_profit = min(85, 50 + (row['puts_oi'] / df['puts_oi'].max()) * 35)
+            opportunities.append({
+                'strategy': 'Long Call (Support Bounce)',
+                'strike': row['strike_price'],
+                'entry': row['calls_ltp'],
+                'target': row['calls_ltp'] * 1.5,
+                'stop_loss': row['calls_ltp'] * 0.6,
+                'probability': f"{prob_profit:.1f}%",
+                'reasoning': f"High PUT OI ({row['puts_oi']:,.0f}) indicates strong support at {row['strike_price']}"
+            })
+    
+    # 2. High OI Call Strikes (Resistance Levels)
+    high_call_oi = df[df['calls_oi'] > df['calls_oi'].quantile(0.8)].copy()
+    for _, row in high_call_oi.iterrows():
+        if row['strike_price'] > atm_strike and row['puts_ltp'] > 0:
+            prob_profit = min(80, 45 + (row['calls_oi'] / df['calls_oi'].max()) * 35)
+            opportunities.append({
+                'strategy': 'Long Put (Resistance Rejection)',
+                'strike': row['strike_price'],
+                'entry': row['puts_ltp'],
+                'target': row['puts_ltp'] * 1.4,
+                'stop_loss': row['puts_ltp'] * 0.65,
+                'probability': f"{prob_profit:.1f}%",
+                'reasoning': f"High CALL OI ({row['calls_oi']:,.0f}) indicates strong resistance at {row['strike_price']}"
+            })
+    
+    # 3. PCR Anomalies
+    avg_pcr = df['pcr_oi'].mean()
+    for _, row in df.iterrows():
+        if row['pcr_oi'] > avg_pcr * 2 and row['calls_ltp'] > 0:  # Unusually high PCR
+            opportunities.append({
+                'strategy': 'Long Call (PCR Anomaly)',
+                'strike': row['strike_price'],
+                'entry': row['calls_ltp'],
+                'target': row['calls_ltp'] * 1.3,
+                'stop_loss': row['calls_ltp'] * 0.7,
+                'probability': "65.0%",
+                'reasoning': f"High PCR ({row['pcr_oi']:.2f}) suggests oversold conditions"
+            })
+    
+    # 4. Low Premium High OI
+    df['premium_oi_ratio_calls'] = df['calls_ltp'] / (df['calls_oi'] + 1)
+    df['premium_oi_ratio_puts'] = df['puts_ltp'] / (df['puts_oi'] + 1)
+    
+    low_prem_high_oi_calls = df[
+        (df['premium_oi_ratio_calls'] < df['premium_oi_ratio_calls'].quantile(0.3)) &
+        (df['calls_oi'] > df['calls_oi'].quantile(0.7))
+    ]
+    
+    for _, row in low_prem_high_oi_calls.iterrows():
+        if row['calls_ltp'] > 0:
+            opportunities.append({
+                'strategy': 'Long Call (Value Pick)',
+                'strike': row['strike_price'],
+                'entry': row['calls_ltp'],
+                'target': row['calls_ltp'] * 1.6,
+                'stop_loss': row['calls_ltp'] * 0.5,
+                'probability': "70.0%",
+                'reasoning': f"Low premium ({row['calls_ltp']}) with high OI ({row['calls_oi']:,.0f}) - Value opportunity"
+            })
+    
+    return pd.DataFrame(opportunities)
+
+def create_visualizations(df, atm_strike):
+    """Create comprehensive visualizations"""
+    
+    # 1. OI Distribution Chart
+    fig_oi = make_subplots(
+        rows=2, cols=1,
+        subplot_titles=('Open Interest Distribution', 'LTP Distribution'),
+        specs=[[{"secondary_y": False}], [{"secondary_y": False}]]
+    )
+    
+    # OI Chart
+    fig_oi.add_trace(
+        go.Bar(name='Calls OI', x=df['strike_price'], y=df['calls_oi'], 
+               marker_color='green', opacity=0.7),
+        row=1, col=1
+    )
+    fig_oi.add_trace(
+        go.Bar(name='Puts OI', x=df['strike_price'], y=-df['puts_oi'], 
+               marker_color='red', opacity=0.7),
+        row=1, col=1
+    )
+    
+    # LTP Chart
+    fig_oi.add_trace(
+        go.Scatter(name='Calls LTP', x=df['strike_price'], y=df['calls_ltp'], 
+                   mode='lines+markers', line=dict(color='darkgreen')),
+        row=2, col=1
+    )
+    fig_oi.add_trace(
+        go.Scatter(name='Puts LTP', x=df['strike_price'], y=df['puts_ltp'], 
+                   mode='lines+markers', line=dict(color='darkred')),
+        row=2, col=1
+    )
+    
+    # Add ATM line
+    fig_oi.add_vline(x=atm_strike, line_dash="dash", line_color="blue", 
+                     annotation_text="ATM", row=1, col=1)
+    fig_oi.add_vline(x=atm_strike, line_dash="dash", line_color="blue", 
+                     annotation_text="ATM", row=2, col=1)
+    
+    fig_oi.update_layout(height=800, title_text="Options Chain Analysis")
+    fig_oi.update_xaxes(title_text="Strike Price")
+    fig_oi.update_yaxes(title_text="Open Interest", row=1, col=1)
+    fig_oi.update_yaxes(title_text="LTP (₹)", row=2, col=1)
+    
+    # 2. PCR Heatmap
+    fig_pcr = px.scatter(
+        df, x='strike_price', y='pcr_oi', size='total_oi',
+        color='pcr_oi', color_continuous_scale='RdYlGn_r',
+        title='Put-Call Ratio by Strike Price',
+        labels={'pcr_oi': 'PCR (OI)', 'strike_price': 'Strike Price'}
+    )
+    fig_pcr.add_hline(y=1, line_dash="dash", line_color="black", 
+                      annotation_text="PCR = 1")
+    
+    # 3. Support & Resistance Levels
+    support_levels = df[df['puts_oi'] > df['puts_oi'].quantile(0.8)]
+    resistance_levels = df[df['calls_oi'] > df['calls_oi'].quantile(0.8)]
+    
+    fig_levels = go.Figure()
+    
+    fig_levels.add_trace(
+        go.Scatter(
+            x=support_levels['strike_price'],
+            y=support_levels['puts_oi'],
+            mode='markers',
+            marker=dict(size=15, color='green', symbol='triangle-up'),
+            name='Support Levels',
+            text=support_levels['strike_price'],
+            textposition="top center"
+        )
+    )
+    
+    fig_levels.add_trace(
+        go.Scatter(
+            x=resistance_levels['strike_price'],
+            y=resistance_levels['calls_oi'],
+            mode='markers',
+            marker=dict(size=15, color='red', symbol='triangle-down'),
+            name='Resistance Levels',
+            text=resistance_levels['strike_price'],
+            textposition="bottom center"
+        )
+    )
+    
+    fig_levels.update_layout(
+        title='Key Support and Resistance Levels',
+        xaxis_title='Strike Price',
+        yaxis_title='Open Interest',
+        height=500
+    )
+    
+    return fig_oi, fig_pcr, fig_levels
+
+def generate_market_summary(df, atm_strike, opportunities):
+    """Generate comprehensive market summary"""
+    
+    total_calls_oi = df['calls_oi'].sum()
+    total_puts_oi = df['puts_oi'].sum()
+    overall_pcr = total_puts_oi / total_calls_oi
+    
+    # Market sentiment
+    if overall_pcr > 1.2:
+        sentiment = "🐻 Bearish"
+        sentiment_desc = "High put writing suggests bearish sentiment"
+    elif overall_pcr < 0.8:
+        sentiment = "🐂 Bullish" 
+        sentiment_desc = "High call writing suggests bullish sentiment"
+    else:
+        sentiment = "😐 Neutral"
+        sentiment_desc = "Balanced put-call ratio indicates neutral sentiment"
+    
+    # Max pain calculation (simplified)
+    max_pain_strike = df.loc[df['total_oi'].idxmax(), 'strike_price']
+    
+    # Key levels
+    top_support = df.loc[df['puts_oi'].idxmax(), 'strike_price']
+    top_resistance = df.loc[df['calls_oi'].idxmax(), 'strike_price']
+    
+    summary = {
+        'ATM Strike': f"₹{atm_strike:,.0f}",
+        'Overall PCR': f"{overall_pcr:.2f}",
+        'Market Sentiment': f"{sentiment} - {sentiment_desc}",
+        'Max Pain Level': f"₹{max_pain_strike:,.0f}",
+        'Key Support': f"₹{top_support:,.0f} ({df.loc[df['puts_oi'].idxmax(), 'puts_oi']:,.0f} OI)",
+        'Key Resistance': f"₹{top_resistance:,.0f} ({df.loc[df['calls_oi'].idxmax(), 'calls_oi']:,.0f} OI)",
+        'Total Opportunities': f"{len(opportunities)} identified"
+    }
+    
+    return summary
+
+# Main Application Logic
+if uploaded_files:
+    # Process first file
+    df1 = load_and_clean_data(uploaded_files[0])
+    df1_processed, atm_strike1 = calculate_option_metrics(df1)
+    opportunities1 = identify_trading_opportunities(df1_processed, atm_strike1)
+    
+    # Create tabs for different analyses
+    tab1, tab2, tab3, tab4 = st.tabs(["📊 Overview", "🎯 Trading Opportunities", "📈 Visualizations", "📋 Data Explorer"])
+    
+    with tab1:
+        col1, col2 = st.columns([1, 1])
+        
+        with col1:
+            st.subheader("📈 Market Summary - File 1")
+            summary1 = generate_market_summary(df1_processed, atm_strike1, opportunities1)
+            for key, value in summary1.items():
+                st.metric(key, value)
+        
+        with col2:
+            if len(uploaded_files) > 1:
+                df2 = load_and_clean_data(uploaded_files[1])
+                df2_processed, atm_strike2 = calculate_option_metrics(df2)
+                opportunities2 = identify_trading_opportunities(df2_processed, atm_strike2)
+                
+                st.subheader("📈 Market Summary - File 2")
+                summary2 = generate_market_summary(df2_processed, atm_strike2, opportunities2)
+                for key, value in summary2.items():
+                    st.metric(key, value)
+    
+    with tab2:
+        st.subheader("🎯 Identified Trading Opportunities")
+        
+        col1, col2 = st.columns([1, 1])
+        
+        with col1:
+            st.write("**File 1 Opportunities:**")
+            if not opportunities1.empty:
+                # Sort by probability
+                opportunities1_sorted = opportunities1.sort_values('probability', ascending=False)
+                st.dataframe(opportunities1_sorted, use_container_width=True)
+                
+                # Download button
+                csv1 = opportunities1_sorted.to_csv(index=False)
+                st.download_button(
+                    label="📥 Download Opportunities (File 1)",
+                    data=csv1,
+                    file_name="banknifty_opportunities_file1.csv",
+                    mime="text/csv"
+                )
+            else:
+                st.info("No opportunities identified in current market conditions.")
+        
+        with col2:
+            if len(uploaded_files) > 1:
+                st.write("**File 2 Opportunities:**")
+                if not opportunities2.empty:
+                    opportunities2_sorted = opportunities2.sort_values('probability', ascending=False)
+                    st.dataframe(opportunities2_sorted, use_container_width=True)
+                    
+                    csv2 = opportunities2_sorted.to_csv(index=False)
+                    st.download_button(
+                        label="📥 Download Opportunities (File 2)",
+                        data=csv2,
+                        file_name="banknifty_opportunities_file2.csv",
+                        mime="text/csv"
+                    )
+                else:
+                    st.info("No opportunities identified in current market conditions.")
+    
+    with tab3:
+        st.subheader("📈 Market Visualizations")
+        
+        # File 1 visualizations
+        st.write("**File 1 Analysis:**")
+        fig_oi1, fig_pcr1, fig_levels1 = create_visualizations(df1_processed, atm_strike1)
+        
+        st.plotly_chart(fig_oi1, use_container_width=True)
+        
+        col1, col2 = st.columns(2)
+        with col1:
+            st.plotly_chart(fig_pcr1, use_container_width=True)
+        with col2:
+            st.plotly_chart(fig_levels1, use_container_width=True)
+        
+        # File 2 visualizations (if available)
+        if len(uploaded_files) > 1:
+            st.write("**File 2 Analysis:**")
+            fig_oi2, fig_pcr2, fig_levels2 = create_visualizations(df2_processed, atm_strike2)
+            
+            st.plotly_chart(fig_oi2, use_container_width=True)
+            
+            col1, col2 = st.columns(2)
+            with col1:
+                st.plotly_chart(fig_pcr2, use_container_width=True)
+            with col2:
+                st.plotly_chart(fig_levels2, use_container_width=True)
+    
+    with tab4:
+        st.subheader("📋 Raw Data Explorer")
+        
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            st.write("**File 1 - Processed Data:**")
+            st.dataframe(df1_processed, use_container_width=True)
+            
+            # Statistics
+            st.write("**Statistical Summary:**")
+            st.dataframe(df1_processed.describe(), use_container_width=True)
+        
+        with col2:
+            if len(uploaded_files) > 1:
+                st.write("**File 2 - Processed Data:**")
+                st.dataframe(df2_processed, use_container_width=True)
+                
+                st.write("**Statistical Summary:**")
+                st.dataframe(df2_processed.describe(), use_container_width=True)
+
+else:
+    # Welcome message and instructions
+    st.markdown("""
+    ## Welcome to Bank Nifty Options Chain Analyzer! 🚀
+    
+    This comprehensive tool helps you:
+    
+    ### 📊 **Market Analysis Features:**
+    - **Open Interest Analysis** - Identify support/resistance levels
+    - **Put-Call Ratio (PCR)** - Gauge market sentiment
+    - **Premium Analysis** - Find value opportunities
+    - **Max Pain Calculation** - Understand market direction
+    
+    ### 🎯 **Trading Opportunities:**
+    - **Support Bounce Trades** - Long calls at high PUT OI strikes
+    - **Resistance Rejection** - Long puts at high CALL OI strikes
+    - **PCR Anomalies** - Contrarian opportunities
+    - **Value Picks** - Low premium, high OI options
+    
+    ### 📈 **Advanced Metrics:**
+    - Probability of Profit calculations
+    - Entry, Target, and Stop-Loss levels
+    - Risk-Reward ratios
+    - Data-backed trade reasoning
+    
+    ### 🔧 **How to Use:**
+    1. Upload your options chain CSV file(s) using the sidebar
+    2. Review the market summary and sentiment analysis
+    3. Explore identified trading opportunities
+    4. Analyze detailed visualizations
+    5. Export opportunities for execution
+    
+    **Expected CSV Format:**
+    ```
+    calls_oi, calls_ltp, strike_price, puts_ltp, puts_oi
+    ```
+    
+    Start by uploading your options chain data to begin the analysis! 📁
+    """)
+    
+    # Sample data format
+    st.subheader("📋 Sample Data Format")
+    sample_data = pd.DataFrame({
+        'calls_oi': [1000, 2000, 3000],
+        'calls_ltp': [100, 50, 25],
+        'strike_price': [50000, 50500, 51000],
+        'puts_ltp': [25, 50, 100],
+        'puts_oi': [3000, 2000, 1000]
+    })
+    st.dataframe(sample_data)
+
+# Footer
+st.markdown("---")
+st.markdown("""
+<div style='text-align: center'>
+    <p><b>Bank Nifty Options Analyzer</b> | Built with ❤️ using Streamlit</p>
+    <p><i>Disclaimer: This tool is for educational purposes only. Please consult with a financial advisor before making investment decisions.</i></p>
+</div>
+""", unsafe_allow_html=True)
