@@ -25,8 +25,8 @@ st.markdown("---")
 st.sidebar.header("📁 Upload Options Data")
 uploaded_files = []
 
-file1 = st.sidebar.file_uploader("Upload Options Chain Data 1", type=['csv'])
-file2 = st.sidebar.file_uploader("Upload Options Chain Data 2 (Optional)", type=['csv'])
+file1 = st.sidebar.file_uploader("📊 Upload LTP Data (calls_oi, calls_ltp, strike_price, puts_ltp, puts_oi)", type=['csv'], key="ltp_data")
+file2 = st.sidebar.file_uploader("📈 Upload Greeks Data (Optional - delta, gamma, theta, vega, etc.)", type=['csv'], key="greeks_data")
 
 if file1:
     uploaded_files.append(file1)
@@ -155,47 +155,52 @@ def identify_trading_opportunities(df, atm_strike):
     
     return pd.DataFrame(opportunities)
 
-def create_visualizations(df, atm_strike):
+def create_visualizations(df, atm_strike, file_suffix=""):
     """Create comprehensive visualizations"""
     
-    # 1. OI Distribution Chart
+    # 1. OI Distribution Chart (Side by Side)
     fig_oi = make_subplots(
         rows=2, cols=1,
         subplot_titles=('Open Interest Distribution', 'LTP Distribution'),
         specs=[[{"secondary_y": False}], [{"secondary_y": False}]]
     )
     
-    # OI Chart
+    # OI Chart - Both calls and puts on same side (positive values)
     fig_oi.add_trace(
         go.Bar(name='Calls OI', x=df['strike_price'], y=df['calls_oi'], 
-               marker_color='green', opacity=0.7),
+               marker_color='rgba(0, 255, 0, 0.7)', opacity=0.8),
         row=1, col=1
     )
     fig_oi.add_trace(
-        go.Bar(name='Puts OI', x=df['strike_price'], y=-df['puts_oi'], 
-               marker_color='red', opacity=0.7),
+        go.Bar(name='Puts OI', x=df['strike_price'], y=df['puts_oi'], 
+               marker_color='rgba(255, 0, 0, 0.7)', opacity=0.8),
         row=1, col=1
     )
     
     # LTP Chart
     fig_oi.add_trace(
         go.Scatter(name='Calls LTP', x=df['strike_price'], y=df['calls_ltp'], 
-                   mode='lines+markers', line=dict(color='darkgreen')),
+                   mode='lines+markers', line=dict(color='darkgreen', width=2),
+                   marker=dict(size=6)),
         row=2, col=1
     )
     fig_oi.add_trace(
         go.Scatter(name='Puts LTP', x=df['strike_price'], y=df['puts_ltp'], 
-                   mode='lines+markers', line=dict(color='darkred')),
+                   mode='lines+markers', line=dict(color='darkred', width=2),
+                   marker=dict(size=6)),
         row=2, col=1
     )
     
     # Add ATM line
-    fig_oi.add_vline(x=atm_strike, line_dash="dash", line_color="blue", 
-                     annotation_text="ATM", row=1, col=1)
-    fig_oi.add_vline(x=atm_strike, line_dash="dash", line_color="blue", 
-                     annotation_text="ATM", row=2, col=1)
+    fig_oi.add_vline(x=atm_strike, line_dash="dash", line_color="blue", line_width=2,
+                     annotation_text="ATM", annotation_position="top")
     
-    fig_oi.update_layout(height=800, title_text="Options Chain Analysis")
+    fig_oi.update_layout(
+        height=800, 
+        title_text=f"Options Chain Analysis {file_suffix}",
+        showlegend=True,
+        barmode='group'  # Side by side bars
+    )
     fig_oi.update_xaxes(title_text="Strike Price")
     fig_oi.update_yaxes(title_text="Open Interest", row=1, col=1)
     fig_oi.update_yaxes(title_text="LTP (₹)", row=2, col=1)
@@ -204,11 +209,13 @@ def create_visualizations(df, atm_strike):
     fig_pcr = px.scatter(
         df, x='strike_price', y='pcr_oi', size='total_oi',
         color='pcr_oi', color_continuous_scale='RdYlGn_r',
-        title='Put-Call Ratio by Strike Price',
-        labels={'pcr_oi': 'PCR (OI)', 'strike_price': 'Strike Price'}
+        title=f'Put-Call Ratio by Strike Price {file_suffix}',
+        labels={'pcr_oi': 'PCR (OI)', 'strike_price': 'Strike Price'},
+        hover_data=['calls_oi', 'puts_oi', 'total_oi']
     )
-    fig_pcr.add_hline(y=1, line_dash="dash", line_color="black", 
+    fig_pcr.add_hline(y=1, line_dash="dash", line_color="black", line_width=2,
                       annotation_text="PCR = 1")
+    fig_pcr.update_layout(height=500)
     
     # 3. Support & Resistance Levels
     support_levels = df[df['puts_oi'] > df['puts_oi'].quantile(0.8)]
@@ -216,38 +223,85 @@ def create_visualizations(df, atm_strike):
     
     fig_levels = go.Figure()
     
+    # Combined chart showing both support and resistance
     fig_levels.add_trace(
-        go.Scatter(
+        go.Bar(
+            name='Support (Put OI)',
             x=support_levels['strike_price'],
             y=support_levels['puts_oi'],
-            mode='markers',
-            marker=dict(size=15, color='green', symbol='triangle-up'),
-            name='Support Levels',
+            marker_color='rgba(0, 255, 0, 0.7)',
             text=support_levels['strike_price'],
-            textposition="top center"
+            textposition='outside'
         )
     )
     
     fig_levels.add_trace(
-        go.Scatter(
+        go.Bar(
+            name='Resistance (Call OI)',
             x=resistance_levels['strike_price'],
             y=resistance_levels['calls_oi'],
-            mode='markers',
-            marker=dict(size=15, color='red', symbol='triangle-down'),
-            name='Resistance Levels',
+            marker_color='rgba(255, 0, 0, 0.7)',
             text=resistance_levels['strike_price'],
-            textposition="bottom center"
+            textposition='outside'
         )
     )
     
+    # Add ATM line
+    fig_levels.add_vline(x=atm_strike, line_dash="dash", line_color="blue", line_width=2,
+                        annotation_text="ATM")
+    
     fig_levels.update_layout(
-        title='Key Support and Resistance Levels',
+        title=f'Key Support and Resistance Levels {file_suffix}',
         xaxis_title='Strike Price',
         yaxis_title='Open Interest',
+        height=500,
+        barmode='group'
+    )
+    
+    # 4. OI Change Analysis (if we have comparative data)
+    fig_oi_change = go.Figure()
+    
+    # Calculate percentage of total OI for better visualization
+    total_oi = df['total_oi'].sum()
+    df_viz = df.copy()
+    df_viz['calls_oi_pct'] = (df_viz['calls_oi'] / total_oi) * 100
+    df_viz['puts_oi_pct'] = (df_viz['puts_oi'] / total_oi) * 100
+    
+    fig_oi_change.add_trace(
+        go.Scatter(
+            x=df_viz['strike_price'],
+            y=df_viz['calls_oi_pct'],
+            mode='lines+markers',
+            name='Calls OI %',
+            line=dict(color='green', width=3),
+            marker=dict(size=8),
+            fill='tonexty'
+        )
+    )
+    
+    fig_oi_change.add_trace(
+        go.Scatter(
+            x=df_viz['strike_price'],
+            y=df_viz['puts_oi_pct'],
+            mode='lines+markers',
+            name='Puts OI %',
+            line=dict(color='red', width=3),
+            marker=dict(size=8),
+            fill='tozeroy'
+        )
+    )
+    
+    fig_oi_change.add_vline(x=atm_strike, line_dash="dash", line_color="blue", line_width=2,
+                           annotation_text="ATM")
+    
+    fig_oi_change.update_layout(
+        title=f'OI Distribution (% of Total) {file_suffix}',
+        xaxis_title='Strike Price',
+        yaxis_title='OI Percentage (%)',
         height=500
     )
     
-    return fig_oi, fig_pcr, fig_levels
+    return fig_oi, fig_pcr, fig_levels, fig_oi_change
 
 def generate_market_summary(df, atm_strike, opportunities):
     """Generate comprehensive market summary"""
@@ -300,7 +354,7 @@ if uploaded_files:
         col1, col2 = st.columns([1, 1])
         
         with col1:
-            st.subheader("📈 Market Summary - File 1")
+            st.subheader("📊 Market Summary - LTP Data")
             summary1 = generate_market_summary(df1_processed, atm_strike1, opportunities1)
             for key, value in summary1.items():
                 st.metric(key, value)
@@ -311,7 +365,7 @@ if uploaded_files:
                 df2_processed, atm_strike2 = calculate_option_metrics(df2)
                 opportunities2 = identify_trading_opportunities(df2_processed, atm_strike2)
                 
-                st.subheader("📈 Market Summary - File 2")
+                st.subheader("📈 Market Summary - Greeks Data")
                 summary2 = generate_market_summary(df2_processed, atm_strike2, opportunities2)
                 for key, value in summary2.items():
                     st.metric(key, value)
@@ -322,7 +376,7 @@ if uploaded_files:
         col1, col2 = st.columns([1, 1])
         
         with col1:
-            st.write("**File 1 Opportunities:**")
+            st.write("**📊 LTP Data Opportunities:**")
             if not opportunities1.empty:
                 # Sort by probability
                 opportunities1_sorted = opportunities1.sort_values('probability', ascending=False)
@@ -331,27 +385,29 @@ if uploaded_files:
                 # Download button
                 csv1 = opportunities1_sorted.to_csv(index=False)
                 st.download_button(
-                    label="📥 Download Opportunities (File 1)",
+                    label="📥 Download LTP Opportunities",
                     data=csv1,
-                    file_name="banknifty_opportunities_file1.csv",
-                    mime="text/csv"
+                    file_name="banknifty_ltp_opportunities.csv",
+                    mime="text/csv",
+                    key="download_ltp_opps"
                 )
             else:
                 st.info("No opportunities identified in current market conditions.")
         
         with col2:
             if len(uploaded_files) > 1:
-                st.write("**File 2 Opportunities:**")
+                st.write("**📈 Greeks Data Opportunities:**")
                 if not opportunities2.empty:
                     opportunities2_sorted = opportunities2.sort_values('probability', ascending=False)
                     st.dataframe(opportunities2_sorted, use_container_width=True)
                     
                     csv2 = opportunities2_sorted.to_csv(index=False)
                     st.download_button(
-                        label="📥 Download Opportunities (File 2)",
+                        label="📥 Download Greeks Opportunities",
                         data=csv2,
-                        file_name="banknifty_opportunities_file2.csv",
-                        mime="text/csv"
+                        file_name="banknifty_greeks_opportunities.csv",
+                        mime="text/csv",
+                        key="download_greeks_opps"
                     )
                 else:
                     st.info("No opportunities identified in current market conditions.")
@@ -360,29 +416,34 @@ if uploaded_files:
         st.subheader("📈 Market Visualizations")
         
         # File 1 visualizations
-        st.write("**File 1 Analysis:**")
-        fig_oi1, fig_pcr1, fig_levels1 = create_visualizations(df1_processed, atm_strike1)
+        st.write("**📊 LTP Data Analysis:**")
+        fig_oi1, fig_pcr1, fig_levels1, fig_oi_change1 = create_visualizations(df1_processed, atm_strike1, "(LTP Data)")
         
-        st.plotly_chart(fig_oi1, use_container_width=True)
+        st.plotly_chart(fig_oi1, use_container_width=True, key="oi_chart_file1")
         
         col1, col2 = st.columns(2)
         with col1:
-            st.plotly_chart(fig_pcr1, use_container_width=True)
+            st.plotly_chart(fig_pcr1, use_container_width=True, key="pcr_chart_file1")
         with col2:
-            st.plotly_chart(fig_levels1, use_container_width=True)
+            st.plotly_chart(fig_levels1, use_container_width=True, key="levels_chart_file1")
+        
+        # Additional OI Change chart
+        st.plotly_chart(fig_oi_change1, use_container_width=True, key="oi_change_file1")
         
         # File 2 visualizations (if available)
         if len(uploaded_files) > 1:
-            st.write("**File 2 Analysis:**")
-            fig_oi2, fig_pcr2, fig_levels2 = create_visualizations(df2_processed, atm_strike2)
+            st.write("**📈 Greeks Data Analysis:**")
+            fig_oi2, fig_pcr2, fig_levels2, fig_oi_change2 = create_visualizations(df2_processed, atm_strike2, "(Greeks Data)")
             
-            st.plotly_chart(fig_oi2, use_container_width=True)
+            st.plotly_chart(fig_oi2, use_container_width=True, key="oi_chart_file2")
             
             col1, col2 = st.columns(2)
             with col1:
-                st.plotly_chart(fig_pcr2, use_container_width=True)
+                st.plotly_chart(fig_pcr2, use_container_width=True, key="pcr_chart_file2")
             with col2:
-                st.plotly_chart(fig_levels2, use_container_width=True)
+                st.plotly_chart(fig_levels2, use_container_width=True, key="levels_chart_file2")
+            
+            st.plotly_chart(fig_oi_change2, use_container_width=True, key="oi_change_file2")
     
     with tab4:
         st.subheader("📋 Raw Data Explorer")
@@ -390,7 +451,7 @@ if uploaded_files:
         col1, col2 = st.columns(2)
         
         with col1:
-            st.write("**File 1 - Processed Data:**")
+            st.write("**📊 LTP Data - Processed:**")
             st.dataframe(df1_processed, use_container_width=True)
             
             # Statistics
@@ -399,7 +460,7 @@ if uploaded_files:
         
         with col2:
             if len(uploaded_files) > 1:
-                st.write("**File 2 - Processed Data:**")
+                st.write("**📈 Greeks Data - Processed:**")
                 st.dataframe(df2_processed, use_container_width=True)
                 
                 st.write("**Statistical Summary:**")
