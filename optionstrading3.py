@@ -2,92 +2,52 @@ import streamlit as st
 import pandas as pd
 import matplotlib.pyplot as plt
 
-# Streamlit app setup
+# ---------------- Streamlit App Setup ----------------
 st.set_page_config(page_title="BankNifty Option Chain Analysis", layout="wide")
 st.title("📊 BankNifty Option Chain with Greeks & Trade Recommendations")
 
-# File upload
-uploaded_file = st.file_uploader("Upload BankNifty Option Chain CSV", type=["csv"])
+# ---------------- File Upload Section ----------------
+st.sidebar.header("Upload Files")
 
-# Configurable ATM window
-atm_window = st.number_input("Select ±N Strikes around ATM", min_value=5, max_value=30, value=15, step=1)
+file1 = st.sidebar.file_uploader("Upload Option Chain File (with c_ltp & p_ltp)", type=["csv"])
+file2 = st.sidebar.file_uploader("Upload Greeks / PLOI File", type=["csv"])
 
-if uploaded_file is not None:
-    # Load CSV
-    df = pd.read_csv(uploaded_file)
+if file1 is not None and file2 is not None:
+    df1 = pd.read_csv(file1)
+    df2 = pd.read_csv(file2)
 
-    # Standardize column names
-    df.columns = df.columns.str.strip().str.lower().str.replace(" ", "").str.replace("_", "")
-
-    # Ensure strike column exists
-    if "strikeprice" not in df.columns:
-        st.error("CSV must have a 'strikePrice' (or similar) column!")
-        st.stop()
-
-    # Show cleaned data
-    st.subheader("📑 Cleaned Option Chain Data")
-    st.dataframe(df.head(20))
-
-    # Detect ATM (closest strike to LTP)
-    if "c_ltp" in df.columns and "p_ltp" in df.columns:
-        df["atm_diff"] = (df["c_ltp"] - df["p_ltp"]).abs()
-        atm_strike = df.loc[df["atm_diff"].idxmin(), "strikeprice"]
+    # Validate strikePrice column
+    if 'strikePrice' not in df1.columns or 'strikePrice' not in df2.columns:
+        st.error("❌ Both files must have a 'strikePrice' column to merge.")
+    elif 'c_ltp' not in df1.columns or 'p_ltp' not in df1.columns:
+        st.error("❌ Option chain file must contain 'c_ltp' and 'p_ltp' columns for ATM detection.")
     else:
-        st.error("CSV must contain 'c_ltp' and 'p_ltp' columns for ATM detection.")
-        st.stop()
+        # Merge on strikePrice
+        df = pd.merge(df1, df2, on="strikePrice", how="inner")
 
-    st.write(f"**Detected ATM Strike:** {atm_strike}")
+        st.success("✅ Files uploaded and merged successfully!")
+        st.write("### Merged Data Preview")
+        st.dataframe(df.head(20))
 
-    # Filter relevant strikes (± atm_window)
-    strikes = df["strikeprice"].unique()
-    strikes.sort()
-    filtered = df[(df["strikeprice"] >= atm_strike - atm_window*100) &
-                  (df["strikeprice"] <= atm_strike + atm_window*100)]
+        # Example ATM Detection
+        df['atm_diff'] = (df['c_ltp'] - df['p_ltp']).abs()
+        atm_strike = df.loc[df['atm_diff'].idxmin(), 'strikePrice']
+        st.info(f"ATM Strike Detected: **{atm_strike}**")
 
-    st.subheader("📌 Filtered Option Chain (±N strikes)")
-    st.dataframe(filtered)
+        # ---------------- Data Exploration ----------------
+        st.subheader("Exploratory Data Analysis")
 
-    # Summaries
-    st.subheader("📊 OI, Change in OI & Volume")
-    fig, ax = plt.subplots(figsize=(12, 6))
+        numeric_cols = df.select_dtypes(include='number').columns.tolist()
+        if numeric_cols:
+            selected_col = st.selectbox("Select a column to visualize", numeric_cols)
+            fig, ax = plt.subplots()
+            ax.plot(df['strikePrice'], df[selected_col], marker='o')
+            ax.set_xlabel("Strike Price")
+            ax.set_ylabel(selected_col)
+            ax.set_title(f"{selected_col} vs Strike Price")
+            st.pyplot(fig)
+        else:
+            st.warning("⚠ No numeric columns found for plotting.")
 
-    if "c_oi" in filtered.columns and "p_oi" in filtered.columns:
-        ax.bar(filtered["strikeprice"], filtered["c_oi"], alpha=0.5, label="CE OI", color="blue")
-        ax.bar(filtered["strikeprice"], -filtered["p_oi"], alpha=0.5, label="PE OI", color="red")
-
-    ax.set_xlabel("Strike Price")
-    ax.set_ylabel("Open Interest")
-    ax.set_title("Open Interest (CE vs PE)")
-    ax.legend()
-    st.pyplot(fig)
-
-    # Trade Recommendation Logic
-    st.subheader("🎯 Trade Recommendations")
-
-    recs = []
-    for _, row in filtered.iterrows():
-        if "c_oi" in row and "c_chnginoi" in row and "c_iv" in row:
-            if row["c_oi"] > 50000 and row["c_chnginoi"] > 10000 and row["c_iv"] < 20:
-                recs.append({
-                    "Strike": row["strikeprice"],
-                    "Type": "CE",
-                    "Entry": row.get("c_ltp", None),
-                    "Target": round(row.get("c_ltp", 0) * 1.15, 2),
-                    "SL": round(row.get("c_ltp", 0) * 0.9, 2),
-                    "Reason": "High OI + OI Buildup + Low IV"
-                })
-        if "p_oi" in row and "p_chnginoi" in row and "p_iv" in row:
-            if row["p_oi"] > 50000 and row["p_chnginoi"] > 10000 and row["p_iv"] < 20:
-                recs.append({
-                    "Strike": row["strikeprice"],
-                    "Type": "PE",
-                    "Entry": row.get("p_ltp", None),
-                    "Target": round(row.get("p_ltp", 0) * 1.15, 2),
-                    "SL": round(row.get("p_ltp", 0) * 0.9, 2),
-                    "Reason": "High OI + OI Buildup + Low IV"
-                })
-
-    if recs:
-        st.write(pd.DataFrame(recs))
-    else:
-        st.info("No strong trade opportunities found based on filters.")
+else:
+    st.warning("⚠ Please upload **both files** to proceed.")
