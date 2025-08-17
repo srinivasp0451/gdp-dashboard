@@ -341,6 +341,12 @@ if uploaded_files:
     df1_processed, atm_strike1 = calculate_option_metrics(df1, spot_price)
     opportunities1 = identify_trading_opportunities(df1_processed, atm_strike1, spot_price)
     
+    # Process second file if available
+    if len(uploaded_files) > 1:
+        df2 = load_and_clean_data(uploaded_files[1])
+        df2_processed, atm_strike2 = calculate_option_metrics(df2, spot_price)
+        opportunities2 = identify_trading_opportunities(df2_processed, atm_strike2, spot_price)
+    
     # Create tabs for different analyses
     tab1, tab2, tab3, tab4, tab5 = st.tabs(["📊 Overview", "📝 Summary", "🎯 Trading Opportunities", "📈 Visualizations", "📋 Data Explorer"])
     
