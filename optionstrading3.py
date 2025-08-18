@@ -232,125 +232,140 @@ def identify_top_trading_opportunities(df, atm_strike, spot_price=55000):
     return pd.DataFrame(opportunities)
 
 def create_comprehensive_visualizations(df, atm_strike, spot_price, file_suffix=""):
-    """Create focused, essential visualizations"""
+    """Create focused, essential visualizations with proper OI analysis"""
     
-    # 1. MAIN OI & PRICE CHART
-    fig_main = make_subplots(
-        rows=3, cols=1,
-        subplot_titles=(
-            'Open Interest Distribution - Support & Resistance Levels', 
-            'Option Premiums (LTP) - Entry Price Reference',
-            'OI Changes - Market Sentiment Shifts'
-        ),
-        specs=[[{"secondary_y": False}], [{"secondary_y": False}], [{"secondary_y": False}]],
-        vertical_spacing=0.12
+    # 1. OI DISTRIBUTION CHART
+    fig_oi = go.Figure()
+    
+    fig_oi.add_trace(
+        go.Bar(
+            name='CALL OI',
+            x=df['strike_price'],
+            y=df['calls_oi'],
+            text=[f"CE: {int(oi):,}" for oi in df['calls_oi']],
+            textposition='outside',
+            textfont=dict(size=8),
+            marker_color='rgba(34, 139, 34, 0.7)',
+            hovertemplate='<b>Strike:</b> %{x}<br><b>CALL OI:</b> %{y:,}<extra></extra>'
+        )
     )
     
-    # Row 1: OI Distribution
-    fig_main.add_trace(
-        go.Bar(name='PUT OI (Support)', x=df['strike_price'], y=df['puts_oi'], 
-               marker_color='rgba(255, 99, 71, 0.7)', opacity=0.8),
-        row=1, col=1
-    )
-    fig_main.add_trace(
-        go.Bar(name='CALL OI (Resistance)', x=df['strike_price'], y=df['calls_oi'], 
-               marker_color='rgba(60, 179, 113, 0.7)', opacity=0.8),
-        row=1, col=1
-    )
-    
-    # Row 2: Premiums
-    fig_main.add_trace(
-        go.Scatter(name='CALL Premium', x=df['strike_price'], y=df['calls_ltp'], 
-                   mode='lines+markers', line=dict(color='green', width=3),
-                   marker=dict(size=6)),
-        row=2, col=1
-    )
-    fig_main.add_trace(
-        go.Scatter(name='PUT Premium', x=df['strike_price'], y=df['puts_ltp'], 
-                   mode='lines+markers', line=dict(color='red', width=3),
-                   marker=dict(size=6)),
-        row=2, col=1
+    fig_oi.add_trace(
+        go.Bar(
+            name='PUT OI',
+            x=df['strike_price'],
+            y=-df['puts_oi'],  # Negative for mirror effect
+            text=[f"PE: {int(oi):,}" for oi in df['puts_oi']],
+            textposition='outside',
+            textfont=dict(size=8),
+            marker_color='rgba(220, 20, 60, 0.7)',
+            hovertemplate='<b>Strike:</b> %{x}<br><b>PUT OI:</b> %{customdata:,}<extra></extra>',
+            customdata=df['puts_oi']
+        )
     )
     
-    # Row 3: OI Changes
-    fig_main.add_trace(
-        go.Bar(name='CALL OI Change', x=df['strike_price'], y=df['calls_oi_change'], 
-               marker_color=np.where(df['calls_oi_change'] > 0, 'lightgreen', 'lightcoral')),
-        row=3, col=1
-    )
-    fig_main.add_trace(
-        go.Bar(name='PUT OI Change', x=df['strike_price'], y=df['puts_oi_change'], 
-               marker_color=np.where(df['puts_oi_change'] > 0, 'lightblue', 'orange')),
-        row=3, col=1
-    )
+    # Add reference lines
+    fig_oi.add_vline(x=atm_strike, line_dash="dash", line_color="blue", line_width=2,
+                     annotation_text="ATM", annotation_position="top")
+    fig_oi.add_vline(x=spot_price, line_dash="solid", line_color="purple", line_width=3,
+                     annotation_text=f"Spot: ₹{spot_price:,}", annotation_position="top")
     
-    # Add key reference lines
-    for row in [1, 2, 3]:
-        fig_main.add_vline(x=atm_strike, line_dash="dash", line_color="blue", line_width=2, row=row, col=1)
-        fig_main.add_vline(x=spot_price, line_dash="solid", line_color="purple", line_width=3, row=row, col=1)
-    
-    # Add annotations
-    fig_main.add_annotation(x=spot_price, y=df['calls_oi'].max() * 0.8, 
-                           text=f"SPOT: ₹{spot_price:,}", showarrow=True, 
-                           arrowhead=2, arrowcolor="purple", row=1, col=1)
-    
-    fig_main.update_layout(
-        height=900,
-        title_text=f"Bank Nifty Options Chain Complete Analysis {file_suffix}",
+    fig_oi.update_layout(
+        title=f'Open Interest Distribution - CALL vs PUT Positioning {file_suffix}',
+        xaxis_title='Strike Price',
+        yaxis_title='Open Interest (CALL +ve, PUT -ve)',
+        height=600,
         showlegend=True
     )
-    fig_main.update_xaxes(title_text="Strike Price", row=3, col=1)
     
-    # 2. SUPPORT & RESISTANCE LEVELS
-    support_levels = df[df['puts_oi'] > df['puts_oi'].quantile(0.8)]
-    resistance_levels = df[df['calls_oi'] > df['calls_oi'].quantile(0.8)]
+    # 2. VOLUME PROXY ANALYSIS
+    fig_vol = go.Figure()
     
-    fig_levels = go.Figure()
+    # Calculate volume proxy
+    df['call_volume_proxy'] = df['calls_ltp'] * df['calls_oi'] / 1000
+    df['put_volume_proxy'] = df['puts_ltp'] * df['puts_oi'] / 1000
     
-    fig_levels.add_trace(
-        go.Scatter(
-            name='Support Levels',
-            x=support_levels['strike_price'],
-            y=support_levels['puts_oi'],
-            mode='markers+text',
-            marker=dict(size=15, color='red', symbol='triangle-up'),
-            text=support_levels['strike_price'].astype(str),
-            textposition='top center',
-            textfont=dict(size=10, color='darkred')
+    fig_vol.add_trace(
+        go.Bar(
+            name='CALL Volume Proxy',
+            x=df['strike_price'],
+            y=df['call_volume_proxy'],
+            text=[f"CE Vol: {vol:.0f}K" for vol in df['call_volume_proxy']],
+            textposition='outside',
+            textfont=dict(size=8),
+            marker_color='rgba(50, 205, 50, 0.7)',
+            hovertemplate='<b>Strike:</b> %{x}<br><b>CALL Volume Proxy:</b> %{y:.0f}K<extra></extra>'
         )
     )
     
-    fig_levels.add_trace(
-        go.Scatter(
-            name='Resistance Levels',
-            x=resistance_levels['strike_price'],
-            y=resistance_levels['calls_oi'],
-            mode='markers+text',
-            marker=dict(size=15, color='green', symbol='triangle-down'),
-            text=resistance_levels['strike_price'].astype(str),
-            textposition='bottom center',
-            textfont=dict(size=10, color='darkgreen')
+    fig_vol.add_trace(
+        go.Bar(
+            name='PUT Volume Proxy',
+            x=df['strike_price'],
+            y=-df['put_volume_proxy'],  # Negative for mirror
+            text=[f"PE Vol: {vol:.0f}K" for vol in df['put_volume_proxy']],
+            textposition='outside',
+            textfont=dict(size=8),
+            marker_color='rgba(255, 69, 0, 0.7)',
+            hovertemplate='<b>Strike:</b> %{x}<br><b>PUT Volume Proxy:</b> %{customdata:.0f}K<extra></extra>',
+            customdata=df['put_volume_proxy']
         )
     )
     
-    # Add current price zone
-    fig_levels.add_vrect(
-        x0=spot_price-100, x1=spot_price+100,
-        fillcolor="yellow", opacity=0.3,
-        annotation_text="Current Price Zone", annotation_position="top left"
-    )
+    fig_vol.add_vline(x=spot_price, line_dash="solid", line_color="purple", line_width=2,
+                      annotation_text="Spot", annotation_position="top")
     
-    fig_levels.update_layout(
-        title=f'Key Support & Resistance Levels - Trading Zones {file_suffix}',
+    fig_vol.update_layout(
+        title=f'Volume Analysis - Trading Activity Distribution {file_suffix}',
         xaxis_title='Strike Price',
-        yaxis_title='Open Interest',
-        height=500
+        yaxis_title='Volume Proxy (₹ Crores)',
+        height=600
     )
     
-    return fig_main, fig_levels
+    # 3. OI CHANGE ANALYSIS
+    fig_change = go.Figure()
+    
+    fig_change.add_trace(
+        go.Bar(
+            name='CALL OI Change',
+            x=df['strike_price'],
+            y=df['calls_oi_change'],
+            text=[f"CE Δ: {change:+,}" for change in df['calls_oi_change']],
+            textposition='outside',
+            textfont=dict(size=8),
+            marker_color=np.where(df['calls_oi_change'] > 0, 'lightgreen', 'lightcoral'),
+            hovertemplate='<b>Strike:</b> %{x}<br><b>CALL OI Change:</b> %{y:+,}<extra></extra>'
+        )
+    )
+    
+    fig_change.add_trace(
+        go.Bar(
+            name='PUT OI Change',
+            x=df['strike_price'],
+            y=-df['puts_oi_change'],  # Negative for mirror
+            text=[f"PE Δ: {change:+,}" for change in df['puts_oi_change']],
+            textposition='outside',
+            textfont=dict(size=8),
+            marker_color=np.where(df['puts_oi_change'] > 0, 'lightblue', 'orange'),
+            hovertemplate='<b>Strike:</b> %{x}<br><b>PUT OI Change:</b> %{customdata:+,}<extra></extra>',
+            customdata=df['puts_oi_change']
+        )
+    )
+    
+    fig_change.add_vline(x=spot_price, line_dash="solid", line_color="purple", line_width=2,
+                         annotation_text="Spot", annotation_position="top")
+    
+    fig_change.update_layout(
+        title=f'Open Interest Changes - Fresh Money Flow {file_suffix}',
+        xaxis_title='Strike Price', 
+        yaxis_title='OI Change (CALL +ve, PUT -ve)',
+        height=600
+    )
+    
+    return fig_oi, fig_vol, fig_change
 
 def generate_comprehensive_market_summary(df, atm_strike, spot_price, opportunities, data_type="LTP"):
-    """Generate detailed 500-word market summary for child-like understanding"""
+    """Generate detailed 500-word market summary with corrected OI interpretation"""
     
     total_calls_oi = df['calls_oi'].sum()
     total_puts_oi = df['puts_oi'].sum()
@@ -382,45 +397,59 @@ def generate_comprehensive_market_summary(df, atm_strike, spot_price, opportunit
     # Sentiment analysis
     if overall_pcr > 1.3:
         sentiment = "extremely bearish"
-        sentiment_explanation = "Much more put buying than call buying suggests traders expect prices to fall significantly."
+        sentiment_explanation = "Much more put activity than call activity suggests strong bearish sentiment among traders."
     elif overall_pcr > 1.1:
         sentiment = "bearish"
-        sentiment_explanation = "More put buying than call buying suggests traders expect prices to decline."
+        sentiment_explanation = "More put activity than call activity suggests bearish sentiment prevails."
     elif overall_pcr < 0.7:
         sentiment = "bullish"
-        sentiment_explanation = "More call buying than put buying suggests traders expect prices to rise."
+        sentiment_explanation = "More call activity than put activity suggests bullish sentiment dominates."
     else:
         sentiment = "balanced"
-        sentiment_explanation = "Equal interest in both calls and puts suggests uncertainty about direction."
+        sentiment_explanation = "Balanced put-call activity suggests mixed sentiment and uncertainty about direction."
     
     summary = f"""
     **🎯 What's Happening in Bank Nifty Options Right Now?**
     
-    Think of the options market like a battlefield where two armies are fighting - the BULLS (who want prices to go up) and the BEARS (who want prices to fall). Right now, Bank Nifty is trading at ₹{spot_price:,}, and the market sentiment is **{sentiment}**.
+    Think of the options market like a tug-of-war between BULLS (who want prices to go up) and BEARS (who want prices to fall). Right now, Bank Nifty is trading at ₹{spot_price:,}, and the overall market sentiment appears **{sentiment}**.
     
     **📍 Current Market Position:**
-    The market is currently {bias_explanation}, showing a **{bias}** stance. The "middle ground" (ATM) is at ₹{atm_strike:,}, which acts like a neutral zone. When prices move far from this middle ground, they tend to get pulled back like a rubber band.
+    The market is currently {bias_explanation}, showing a **{bias}** stance. The "middle ground" (ATM) is at ₹{atm_strike:,}, which acts like a neutral zone. When prices move far from this level, they often experience gravitational pull back toward it.
     
-    **🛡️ Support & Resistance - The Market's Safety Nets:**
+    **🔍 Understanding Open Interest (The Real Story):**
     
-    The strongest **SUPPORT level** (where buyers step in to prevent further fall) is at ₹{max_put_oi_strike:,}, which is {abs(support_distance):.1f}% {"below" if support_distance > 0 else "above"} current price. This level has {df.loc[df['puts_oi'].idxmax(), 'puts_oi']:,} put contracts, meaning many traders believe prices won't fall below this level.
+    **IMPORTANT:** High Open Interest doesn't predict price direction - it shows where option sellers (smart money) have positioned themselves. These levels act as **magnets** because:
     
-    The strongest **RESISTANCE level** (where sellers step in to prevent further rise) is at ₹{max_call_oi_strike:,}, which is {resistance_distance:.1f}% {"above" if resistance_distance > 0 else "below"} current price. This level has {df.loc[df['calls_oi'].idxmax(), 'calls_oi']:,} call contracts, suggesting many believe prices will struggle to rise above this point.
+    - **High CALL OI at ₹{max_call_oi_strike:,}**: ({df.loc[df['calls_oi'].idxmax(), 'calls_oi']:,} contracts) - This creates a **resistance ceiling**. Option sellers here profit if price stays below this level, so they'll defend it aggressively.
+    
+    - **High PUT OI at ₹{max_put_oi_strike:,}**: ({df.loc[df['puts_oi'].idxmax(), 'puts_oi']:,} contracts) - This forms a **support floor**. Option sellers profit if price stays above this level, creating buying pressure when price approaches.
+    
+    **📊 The Open Interest Logic:**
+    When price approaches high OI strikes, option sellers face potential losses. To hedge their positions, they buy/sell the underlying, creating price reactions:
+    - Near high CALL OI → Selling pressure (resistance)
+    - Near high PUT OI → Buying pressure (support)
     
     **💡 The Put-Call Ratio Story:**
-    The PCR (Put-Call Ratio) is {overall_pcr:.2f}. {sentiment_explanation} When this ratio is above 1.2, it usually means the market is oversold and due for a bounce. When it's below 0.8, the market might be overbought and due for a correction.
+    The PCR is {overall_pcr:.2f}. {sentiment_explanation} Extreme PCR readings (>1.3 or <0.7) often signal sentiment exhaustion and potential reversals, as the crowd is usually wrong at extremes.
     
     **🎪 Max Pain Theory:**
-    The "Max Pain" level is at ₹{max_pain_strike:,} - this is where option sellers (the house) make maximum profit. Prices often gravitate toward this level, especially on expiry days, as it causes maximum loss to option buyers.
+    The "Max Pain" level is at ₹{max_pain_strike:,} - this is where option sellers make maximum profit and buyers face maximum loss. Prices often gravitate toward this level, especially near expiry, due to delta hedging by market makers.
     
-    **⚡ Trading Opportunities Identified:**
-    Our analysis has identified {len(opportunities)} high-probability trading setups based on institutional positioning and technical levels. These range from support bounce plays to resistance rejection strategies, each with specific entry, exit, and risk management levels.
+    **⚡ Volume vs Open Interest:**
+    - **Volume** = Today's trading activity (fresh interest)  
+    - **Open Interest** = Total outstanding positions (cumulative bets)
+    - Rising OI + Rising Price = Strong bullish move (new money backing the trend)
+    - Rising OI + Falling Price = Strong bearish move (new selling pressure)
+    - Falling OI = Position unwinding (trend may reverse)
     
-    **🚨 Risk Warning:**
-    Options are like melting ice cubes - they lose value every day due to time decay. The closer to expiry, the faster they melt. Only trade with money you can afford to lose, and always have a stop-loss plan.
+    **📈 Trading Opportunities:**
+    Our analysis identified {len(opportunities)} high-probability setups based on OI concentrations and technical levels. These focus on trading the reactions at high OI strikes rather than predicting absolute direction.
     
-    **📈 Bottom Line:**
-    The current setup suggests {bias} momentum with {sentiment} sentiment. Smart money is positioned around key levels of ₹{max_put_oi_strike:,} (support) and ₹{max_call_oi_strike:,} (resistance). Trade the bounces and rejections at these levels for maximum probability of success.
+    **🚨 Critical Risk Warning:**
+    Options are wasting assets - they lose value every day (time decay). The closer to expiry, the faster the decay. Never risk more than you can afford to lose, and always have predetermined exit strategies.
+    
+    **📊 Bottom Line:**
+    Current setup shows {bias} price momentum with {sentiment} sentiment. Smart money positioning suggests key battle zones at ₹{max_put_oi_strike:,} (support) and ₹{max_call_oi_strike:,} (resistance). Trade the bounces and rejections at these levels, not absolute directional bets.
     """
     
     return summary.strip()
@@ -581,22 +610,43 @@ if uploaded_files:
                 st.info("📈 Upload Greeks data for additional opportunities")
     
     with tab4:
-        st.subheader("📊 Market Visualizations")
+        st.subheader("📊 Market Visualizations & Analysis")
         
-        # Main charts for LTP data
-        st.write("**📊 LTP Data Charts:**")
-        fig_main1, fig_levels1 = create_comprehensive_visualizations(df1_processed, atm_strike1, spot_price, "(LTP)")
+        # Create the three separate charts
+        fig_oi, fig_vol, fig_change = create_comprehensive_visualizations(df1_processed, atm_strike1, spot_price, "(LTP)")
         
-        st.plotly_chart(fig_main1, use_container_width=True)
-        st.plotly_chart(fig_levels1, use_container_width=True)
+        # Chart 1: Open Interest Distribution
+        st.plotly_chart(fig_oi, use_container_width=True)
+        st.markdown("""
+        **📊 Open Interest (OI) Distribution Analysis:**
         
-        # Greeks data charts if available
+        This chart shows where big institutions and traders have positioned their bets. CALL OI (green bars above) represents bearish positions by sellers who believe price won't rise above those strikes. PUT OI (red bars below) shows bearish positions by sellers who think price won't fall below those levels. High OI doesn't predict direction - it shows where option sellers are positioned. These levels often act as magnets, with prices gravitating toward high OI strikes due to hedging activities. The mirror effect helps visualize the battle between bulls and bears at each strike level.
+        """)
+        
+        # Chart 2: Volume Analysis  
+        st.plotly_chart(fig_vol, use_container_width=True)
+        st.markdown("""
+        **💹 Volume Proxy Analysis:**
+        
+        Volume represents actual trading activity and money flow. This chart uses premium × OI as a proxy for volume since real volume data isn't always available. High volume at specific strikes indicates active interest and potential support/resistance. Unlike OI which shows cumulative positions, volume shows current session activity. Green bars (CALL volume) above indicate bullish trading activity, while red bars (PUT volume) below show bearish activity. Volume spikes often precede significant price moves and help confirm the strength of support/resistance levels identified through OI analysis.
+        """)
+        
+        # Chart 3: OI Changes
+        st.plotly_chart(fig_change, use_container_width=True) 
+        st.markdown("""
+        **📈 Open Interest Changes - Fresh Money Flow:**
+        
+        OI changes reveal fresh positions and institutional sentiment. Positive CALL OI change (light green) means new CALL writing (bearish) or buying (bullish) - direction depends on price action. Positive PUT OI change (light blue) indicates new PUT positions. The key insight: rising OI with rising prices suggests bullish momentum, while rising OI with falling prices indicates bearish pressure. Decreasing OI (red/orange) shows position unwinding. This chart helps identify where smart money is flowing and whether current moves have institutional backing or are retail-driven.
+        """)
+        
         if len(uploaded_files) > 1:
+            st.write("---")
             st.write("**📈 Greeks Data Charts:**")
-            fig_main2, fig_levels2 = create_comprehensive_visualizations(df2_processed, atm_strike2, spot_price, "(Greeks)")
+            fig_oi2, fig_vol2, fig_change2 = create_comprehensive_visualizations(df2_processed, atm_strike2, spot_price, "(Greeks)")
             
-            st.plotly_chart(fig_main2, use_container_width=True)
-            st.plotly_chart(fig_levels2, use_container_width=True)
+            st.plotly_chart(fig_oi2, use_container_width=True)
+            st.plotly_chart(fig_vol2, use_container_width=True)
+            st.plotly_chart(fig_change2, use_container_width=True)
         
         # Data tables
         st.subheader("📋 Raw Data")
