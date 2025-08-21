@@ -2,8 +2,6 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import itertools
-import matplotlib.pyplot as plt
-from io import StringIO
 
 # ==========================
 # Utility Functions
@@ -12,6 +10,11 @@ from io import StringIO
 def clean_columns(df):
     df.columns = df.columns.str.strip().str.lower().str.replace(" ", "_")
     df = df.loc[:, ~df.columns.duplicated()]
+
+    # Ensure numeric conversion for OHLCV
+    for col in ['open','high','low','close','volume']:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors='coerce')
     return df
 
 # Indicators (manual, no TA-Lib)
@@ -79,28 +82,27 @@ def ADX(df, period=14):
 # ==========================
 
 def generate_signals(df, params):
-    # Example: SMA crossover + RSI filter + MACD confirmation + Vol confirmation
     df['sma_fast'] = SMA(df['close'], params['sma_fast'])
     df['sma_slow'] = SMA(df['close'], params['sma_slow'])
     df['rsi'] = RSI(df['close'], params['rsi'])
-    df['macd'], df['signal'] = MACD(df['close'])
+    df['macd'], df['signal_line'] = MACD(df['close'])
     df['obv'] = OBV(df)
     df['adx'] = ADX(df)
 
     df['signal'] = 0
     if params['trade_type'] == "Long":
-        df.loc[(df['sma_fast'] > df['sma_slow']) & 
-               (df['rsi'] < params['rsi_buy']) & 
-               (df['macd'] > df['signal']) & 
+        df.loc[(df['sma_fast'] > df['sma_slow']) &
+               (df['rsi'] < params['rsi_buy']) &
+               (df['macd'] > df['signal_line']) &
                (df['adx'] > 20), 'signal'] = 1
-        df.loc[(df['sma_fast'] < df['sma_slow']) & 
+        df.loc[(df['sma_fast'] < df['sma_slow']) &
                (df['rsi'] > params['rsi_sell']), 'signal'] = -1
     else:  # Short
-        df.loc[(df['sma_fast'] < df['sma_slow']) & 
-               (df['rsi'] > params['rsi_sell']) & 
-               (df['macd'] < df['signal']) & 
+        df.loc[(df['sma_fast'] < df['sma_slow']) &
+               (df['rsi'] > params['rsi_sell']) &
+               (df['macd'] < df['signal_line']) &
                (df['adx'] > 20), 'signal'] = -1
-        df.loc[(df['sma_fast'] > df['sma_slow']) & 
+        df.loc[(df['sma_fast'] > df['sma_slow']) &
                (df['rsi'] < params['rsi_buy']), 'signal'] = 1
 
     df['position'] = df['signal'].shift().fillna(0)
@@ -144,6 +146,7 @@ st.title("Infosys Swing Trading Strategy Optimizer")
 
 uploaded = st.file_uploader("Upload Infosys CSV/Excel", type=["csv", "xlsx"])
 trade_type = st.selectbox("Select Trade Type", ["Long", "Short"])
+sort_order = st.radio("Sort Data Order", ["Oldest → Newest (Correct for Backtest)", "Newest → Oldest (Check Only)"])
 
 if uploaded:
     if uploaded.name.endswith("csv"):
@@ -154,9 +157,17 @@ if uploaded:
     df = clean_columns(df)
     required = ['date','open','high','low','close','volume']
     for col in required:
-        if col not in df.columns: st.error(f"Missing column: {col}")
+        if col not in df.columns:
+            st.error(f"Missing column: {col}")
+            st.stop()
+
     df['date'] = pd.to_datetime(df['date'], errors='coerce')
-    df = df.sort_values('date').dropna().reset_index(drop=True)
+    if sort_order == "Oldest → Newest (Correct for Backtest)":
+        df = df.sort_values('date', ascending=True)
+    else:
+        df = df.sort_values('date', ascending=False)
+
+    df = df.dropna(subset=['open','high','low','close','volume']).reset_index(drop=True)
 
     # Optimize
     best = optimize(df, trade_type)
