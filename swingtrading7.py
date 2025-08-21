@@ -1,241 +1,258 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-import matplotlib.pyplot as plt
 import itertools
-import warnings
-warnings.filterwarnings("ignore")
+import matplotlib.pyplot as plt
+import os
 
-##############################
-# LOAD AND CLEAN DATA
-##############################
-def load_data(file):
-    if file.name.endswith("csv"):
-        df = pd.read_csv(file)
-    else:
-        df = pd.read_excel(file)
-    df = df.copy()
-    # Handle flexible column names
-    rename_map = {}
-    for col in df.columns:
-        c = col.strip().lower()
-        if "date" in c: rename_map[col] = "Date"
-        elif "open" in c: rename_map[col] = "Open"
-        elif "high" in c: rename_map[col] = "High"
-        elif "low" in c: rename_map[col] = "Low"
-        elif "close" in c: rename_map[col] = "Close"
-        elif "volume" in c: rename_map[col] = "Volume"
-    df = df.rename(columns=rename_map)
+# -----------------------------
+# Utility Helpers
+# -----------------------------
 
-    df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
-    df = df.sort_values("Date").dropna()
-    df.reset_index(drop=True, inplace=True)
+def clean_columns(df):
+    """Standardize and deduplicate column names"""
+    df.columns = df.columns.str.strip().str.lower()
+    df = df.loc[:, ~df.columns.duplicated()]
+    col_map = {
+        'date': 'date', 'timestamp': 'date',
+        'open': 'open', 'high': 'high', 'low': 'low',
+        'close': 'close', 'adj close': 'close', 'ltp': 'close',
+        'volume': 'volume', 'shares': 'volume'
+    }
+    df.rename(columns={c: col_map.get(c, c) for c in df.columns}, inplace=True)
     return df
 
-##############################
-# INDICATORS (MANUAL)
-##############################
-def SMA(series, period):
-    return series.rolling(period).mean()
+def load_data(uploaded_file):
+    ext = os.path.splitext(uploaded_file.name)[1]
+    if ext in [".xls", ".xlsx"]:
+        df = pd.read_excel(uploaded_file)
+    else:
+        df = pd.read_csv(uploaded_file)
+
+    df = clean_columns(df)
+    if 'date' in df.columns:
+        df['date'] = pd.to_datetime(df['date'], errors='coerce', dayfirst=True)
+        df = df.dropna(subset=['date'])
+        df = df.sort_values('date')
+        df.set_index('date', inplace=True)
+    numeric_cols = ['open','high','low','close','volume']
+    for c in numeric_cols:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors='coerce')
+    df = df.dropna(subset=['close'])
+    return df
+
+# -----------------------------
+# Technical Indicators (Manual)
+# -----------------------------
+
+def SMA(series, period): return series.rolling(period).mean()
 
 def EMA(series, period):
     return series.ewm(span=period, adjust=False).mean()
 
 def RSI(series, period=14):
     delta = series.diff()
-    gain = (delta.clip(lower=0)).ewm(alpha=1/period, adjust=False).mean()
-    loss = (-delta.clip(upper=0)).ewm(alpha=1/period, adjust=False).mean()
-    rs = gain / loss
+    up, down = delta.clip(lower=0), -delta.clip(upper=0)
+    rs = up.rolling(period).mean() / down.rolling(period).mean()
     return 100 - (100 / (1 + rs))
 
 def MACD(series, fast=12, slow=26, signal=9):
-    macd_line = EMA(series, fast) - EMA(series, slow)
-    signal_line = EMA(macd_line, signal)
-    hist = macd_line - signal_line
-    return macd_line, signal_line, hist
+    fast_ema, slow_ema = EMA(series, fast), EMA(series, slow)
+    macd = fast_ema - slow_ema
+    signal_line = EMA(macd, signal)
+    hist = macd - signal_line
+    return macd, signal_line, hist
 
-def Bollinger(series, period=20, stddev=2):
-    mid = series.rolling(period).mean()
+def Bollinger(series, period=20, std_factor=2):
+    sma = SMA(series, period)
     std = series.rolling(period).std()
-    upper = mid + stddev * std
-    lower = mid - stddev * std
-    return upper, mid, lower
+    return sma + std_factor*std, sma, sma - std_factor*std
 
 def ATR(df, period=14):
-    hl = df["High"] - df["Low"]
-    hc = (df["High"] - df["Close"].shift()).abs()
-    lc = (df["Low"] - df["Close"].shift()).abs()
-    tr = pd.concat([hl, hc, lc], axis=1).max(axis=1)
-    return tr.rolling(period).mean()
+    high_low = df['high'] - df['low']
+    high_close = (df['high'] - df['close'].shift()).abs()
+    low_close = (df['low'] - df['close'].shift()).abs()
+    tr = high_low.combine(high_close, max).combine(low_close, max)
+    return SMA(tr, period)
 
-def Stochastic(df, k=14, d=3):
-    low_min = df["Low"].rolling(k).min()
-    high_max = df["High"].rolling(k).max()
-    k_percent = 100 * (df["Close"] - low_min) / (high_max - low_min)
-    d_percent = k_percent.rolling(d).mean()
-    return k_percent, d_percent
+def Stochastic(df, k_period=14, d_period=3):
+    low_min = df['low'].rolling(k_period).min()
+    high_max = df['high'].rolling(k_period).max()
+    k = 100 * (df['close'] - low_min) / (high_max - low_min)
+    d = k.rolling(d_period).mean()
+    return k, d
 
 def CCI(df, period=20):
-    tp = (df["High"] + df["Low"] + df["Close"]) / 3
-    ma = tp.rolling(period).mean()
-    md = (tp - ma).abs().rolling(period).mean()
-    cci = (tp - ma) / (0.015 * md)
-    return cci
+    tp = (df['high']+df['low']+df['close'])/3
+    sma = SMA(tp, period)
+    mad = (tp - sma).abs().rolling(period).mean()
+    return (tp - sma) / (0.015 * mad)
 
 def OBV(df):
-    obv = [0]
-    for i in range(1, len(df)):
-        if df["Close"].iloc[i] > df["Close"].iloc[i-1]:
-            obv.append(obv[-1] + df["Volume"].iloc[i])
-        elif df["Close"].iloc[i] < df["Close"].iloc[i-1]:
-            obv.append(obv[-1] - df["Volume"].iloc[i])
+    obv = (np.sign(df['close'].diff()) * df['volume']).fillna(0).cumsum()
+    return obv
+
+def MFI(df, period=14):
+    tp = (df['high']+df['low']+df['close'])/3
+    mf = tp * df['volume']
+    pos, neg = [], []
+    for i in range(1,len(df)):
+        if tp.iloc[i] > tp.iloc[i-1]:
+            pos.append(mf.iloc[i]); neg.append(0)
         else:
-            obv.append(obv[-1])
-    return pd.Series(obv, index=df.index)
+            pos.append(0); neg.append(mf.iloc[i])
+    pos, neg = pd.Series([0]+pos,index=df.index), pd.Series(+neg,index=df.index)
+    mr = pos.rolling(period).sum() / neg.rolling(period).sum()
+    return 100 - 100/(1+mr)
 
-##############################
-# STRATEGY BACKTEST
-##############################
-def backtest(df, params):
-    trades = []
-    position = 0
-    entry_price, sl, target = 0, 0, 0
-    returns = []
-    
-    # Rules
-    for i in range(max(params["ema_fast"], params["ema_slow"]), len(df)):
-        price = df["Close"].iloc[i]
-        signal = 0
+def ADX(df, period=14):
+    plus_dm = df['high'].diff()
+    minus_dm = df['low'].diff() * -1
+    plus_dm[plus_dm<0]=0; minus_dm[minus_dm<0]=0
+    atr = ATR(df,period)
+    plus_di = 100*(plus_dm.ewm(alpha=1/period).mean()/atr)
+    minus_di = 100*(minus_dm.ewm(alpha=1/period).mean()/atr)
+    dx = (abs(plus_di-minus_di)/(plus_di+minus_di))*100
+    return dx.ewm(alpha=1/period).mean()
 
-        # ===== ENTRY LOGIC based on hybrid indicators =====
-        if position == 0:
-            trend_up = df["EMA_fast"].iloc[i] > df["EMA_slow"].iloc[i]
-            rsi = df["RSI"].iloc[i]
-            close = df["Close"].iloc[i]
+# -----------------------------
+# Feature Engineering
+# -----------------------------
 
-            if trend_up and rsi < params["rsi_buy"] and close < df["BB_lower"].iloc[i]:
-                signal = 1   # Long entry
-                entry_price = price
-                sl = entry_price * (1 - params["sl"])
-                target = entry_price * (1 + params["tp"])
-                position = 1
-                trades.append({"EntryDate": df["Date"].iloc[i],
-                               "Type": "LONG", "Entry": entry_price})
-            elif not trend_up and rsi > params["rsi_sell"] and close > df["BB_upper"].iloc[i]:
-                signal = -1  # Short entry
-                entry_price = price
-                sl = entry_price * (1 + params["sl"])
-                target = entry_price * (1 - params["tp"])
-                position = -1
-                trades.append({"EntryDate": df["Date"].iloc[i],
-                               "Type": "SHORT", "Entry": entry_price})
+def add_indicators(df):
+    df['sma50'] = SMA(df['close'],50)
+    df['ema20'] = EMA(df['close'],20)
+    df['ema200'] = EMA(df['close'],200)
+    df['rsi14'] = RSI(df['close'],14)
+    bb_up, bb_mid, bb_low = Bollinger(df['close'])
+    df['bb_up'],df['bb_mid'],df['bb_low'] = bb_up,bb_mid,bb_low
+    df['atr14'] = ATR(df,14)
+    macd,macd_sig,macd_hist=MACD(df['close'])
+    df['macd'],df['macd_sig'],df['macd_hist']=macd,macd_sig,macd_hist
+    k,d = Stochastic(df); df['stoch_k'],df['stoch_d']=k,d
+    df['cci20']=CCI(df,20)
+    df['obv']=OBV(df)
+    df['mfi14']=MFI(df)
+    df['adx14']=ADX(df)
+    return df
 
-        elif position == 1:  # Manage Long
-            if price <= sl or price >= target or price >= df["BB_mid"].iloc[i]:
-                pnl = price - entry_price
-                trades[-1].update({"ExitDate": df["Date"].iloc[i],
-                                   "Exit": price, "PnL": pnl})
-                returns.append(pnl/entry_price)
-                position = 0
+# -----------------------------
+# Strategy Backtesting
+# -----------------------------
 
-        elif position == -1: # Manage Short
-            if price >= sl or price <= target or price <= df["BB_mid"].iloc[i]:
-                pnl = entry_price - price
-                trades[-1].update({"ExitDate": df["Date"].iloc[i],
-                                   "Exit": price, "PnL": pnl})
-                returns.append(pnl/entry_price)
-                position = 0
+def generate_signals(df, params):
+    df = df.copy()
+    df['signal']=0
 
-    return trades, np.mean(returns) if returns else 0, np.sum(returns) if returns else 0
+    # Hybrid conditions
+    if params['trend']=='ema':
+        df['trend_flag']=np.where(df['ema20']>df['ema200'],1,-1)
+    else:
+        df['trend_flag']=np.where(df['sma50']>df['ema200'],1,-1)
 
-##############################
-# OPTIMIZATION
-##############################
-def optimize_strategy(df):
-    # Indicator calculations
-    df["EMA_fast"] = EMA(df["Close"], 20)
-    df["EMA_slow"] = EMA(df["Close"], 200)
-    df["RSI"] = RSI(df["Close"], 14)
-    df["BB_upper"], df["BB_mid"], df["BB_lower"] = Bollinger(df["Close"])
-    df["ATR"] = ATR(df)
-    df["OBV"] = OBV(df)
-    df["CCI"] = CCI(df)
+    for i in range(len(df)):
+        if df['trend_flag'].iloc[i]==1 and df['rsi14'].iloc[i]<params['rsi_buy'] and df['close'].iloc[i]<df['bb_low'].iloc[i]:
+            df.at[df.index[i],'signal']=1
+        elif df['trend_flag'].iloc[i]==-1 and df['rsi14'].iloc[i]>params['rsi_sell'] and df['close'].iloc[i]>df['bb_up'].iloc[i]:
+            df.at[df.index[i],'signal']=-1
 
-    # Parameter grid
-    param_grid = {
-        "ema_fast": [10, 20, 50],
-        "ema_slow": [100, 150, 200],
-        "rsi_buy": [25, 30, 35],
-        "rsi_sell": [65, 70, 75],
-        "sl": [0.01, 0.02],
-        "tp": [0.02, 0.03, 0.05]
+    return df
+
+def backtest(df, params, sl_factor=1.0, tp_factor=2.0):
+    df = generate_signals(df,params)
+    trades=[]; pos=0; entry=0
+    for i in range(1,len(df)-1):
+        if pos==0 and df['signal'].iloc[i]!=0:
+            pos=df['signal'].iloc[i]
+            entry=df['open'].iloc[i+1]
+            trades.append({"date":df.index[i],"type":"LONG" if pos==1 else "SHORT","entry":entry})
+        elif pos!=0:
+            sl = entry*(1-pos*sl_factor*0.01)
+            tp = entry*(1+pos*tp_factor*0.01)
+            price=df['close'].iloc[i]
+            hit_exit=False
+            if (pos==1 and (df['low'].iloc[i]<=sl or df['high'].iloc[i]>=tp)):
+                exitp=tp if df['high'].iloc[i]>=tp else sl
+                hit_exit=True
+            elif (pos==-1 and (df['high'].iloc[i]>=sl or df['low'].iloc[i]<=tp)):
+                exitp=tp if df['low'].iloc[i]<=tp else sl
+                hit_exit=True
+            elif (pos==1 and df['close'].iloc[i]>=df['bb_mid'].iloc[i]) or (pos==-1 and df['close'].iloc[i]<=df['bb_mid'].iloc[i]):
+                exitp=price; hit_exit=True
+            if hit_exit:
+                trades[-1].update({"exit":exitp,"exit_date":df.index[i],"pnl":(exitp-entry)*pos})
+                pos=0
+    return trades
+
+def evaluate_trades(trades):
+    if not trades: return {"Total Trades":0},pd.DataFrame()
+    df=pd.DataFrame(trades)
+    df['return%']=df['pnl']/df['entry']*100
+    winrate=(df['pnl']>0).mean()*100
+    return {
+        "Total Trades":len(df),
+        "Win %":round(winrate,2),
+        "Total Return %":round(df['return%'].sum(),2),
+        "Avg Return %":round(df['return%'].mean(),2),
+        "Profit Factor":round(df[df.pnl>0]['pnl'].sum()/abs(df[df.pnl<0]['pnl'].sum()),2) if any(df['pnl']<0) else np.inf
+    },df
+
+# -----------------------------
+# Streamlit App
+# -----------------------------
+
+st.title("📊 Ultra-Robust Strategy Optimizer & Live Signal App")
+
+file=st.file_uploader("Upload Stock file (CSV/Excel)",type=["csv","xls","xlsx"])
+if file:
+    df=load_data(file)
+    df=add_indicators(df)
+
+    # Parameter Grid
+    grid={
+        'rsi_buy':[20,25,30,35],
+        'rsi_sell':[65,70,75,80],
+        'trend':['ema','sma']
     }
 
-    best_return = -1e9
-    best_trades = []
-    best_params = None
+    best_score=-1;best_params=None;best_trades=[]
+    for rsi_b,rsi_s,tr in itertools.product(grid['rsi_buy'],grid['rsi_sell'],grid['trend']):
+        params={'rsi_buy':rsi_b,'rsi_sell':rsi_s,'trend':tr}
+        trades=backtest(df,params)
+        stats,_=evaluate_trades(trades)
+        score=stats.get('Total Return %',-999)
+        if score>best_score:
+            best_score=score;best_params=params;best_trades=trades;best_stats=stats
 
-    for ema_f, ema_s, rsi_b, rsi_s, sl, tp in itertools.product(
-        param_grid["ema_fast"], param_grid["ema_slow"],
-        param_grid["rsi_buy"], param_grid["rsi_sell"],
-        param_grid["sl"], param_grid["tp"]):
-
-        params = {"ema_fast": ema_f, "ema_slow": ema_s,
-                  "rsi_buy": rsi_b, "rsi_sell": rsi_s,
-                  "sl": sl, "tp": tp}
-
-        trades, avg_ret, total_ret = backtest(df, params)
-        if total_ret > best_return:
-            best_return = total_ret
-            best_trades = trades
-            best_params = params
-
-    return best_trades, best_params, best_return
-
-##############################
-# STREAMLIT UI
-##############################
-st.title("📊 Ultra-Robust Swing Trading Strategy Optimizer")
-file = st.file_uploader("Upload CSV or Excel (OHLCV format)", type=["csv","xlsx"])
-
-if file:
-    df = load_data(file)
-    st.write("✅ Data Loaded:", df.head())
-
-    trades, best_params, best_return = optimize_strategy(df)
-    st.subheader("Best Strategy Parameters")
+    st.subheader("Best Parameters Found")
     st.json(best_params)
+    st.subheader("Backtest Performance")
+    st.json(best_stats)
+    st.write(pd.DataFrame(best_trades))
 
-    st.subheader("Backtest Trades")
-    st.write(pd.DataFrame(trades))
+    # Live Recommendation from last candle
+    last_df=generate_signals(df,best_params)
+    last_signal=last_df['signal'].iloc[-1]
+    live_msg="No trade setup right now."
+    live_rec={}
+    if last_signal!=0:
+        entry=df['close'].iloc[-1]
+        sl=entry*(1-last_signal*0.01)
+        tp=entry*(1+last_signal*0.02)
+        direction="BUY (LONG)" if last_signal==1 else "SELL (SHORT)"
+        live_rec={"Direction":direction,"Entry":entry,"SL":sl,"TP":tp,"Prob(Win%)":best_stats['Win %']}
+        live_msg=f"Recommendation: {direction} at {entry} with SL {sl}, TP {tp}. Historical win probability {best_stats['Win %']}%."
 
-    st.subheader("Performance")
-    st.write(f"Total Backtest Return: {round(best_return*100,2)} %")
+    st.subheader("Live Recommendation")
+    st.write(live_msg)
+    st.json(live_rec)
 
-    # Live Recommendation using last candle
-    last_row = df.iloc[-1]
-    signal_df = pd.DataFrame([last_row])
-    signal_df["EMA_fast"] = EMA(df["Close"], best_params["ema_fast"]).iloc[-1]
-    signal_df["EMA_slow"] = EMA(df["Close"], best_params["ema_slow"]).iloc[-1]
-    signal_df["RSI"] = RSI(df["Close"],14).iloc[-1]
-    signal_df["BB_upper"], signal_df["BB_mid"], signal_df["BB_lower"] = Bollinger(df["Close"])
-    signal_df["BB_upper"] = signal_df["BB_upper"].iloc[-1]
-    signal_df["BB_mid"] = signal_df["BB_mid"].iloc[-1]
-    signal_df["BB_lower"] = signal_df["BB_lower"].iloc[-1]
-
-    live_signal = None
-    entry_price = last_row["Close"]
-    if signal_df["EMA_fast"].iloc[0] > signal_df["EMA_slow"].iloc and signal_df["RSI"].iloc < best_params["rsi_buy"] and entry_price < signal_df["BB_lower"].iloc:
-        live_signal = "BUY"
-        sl = entry_price*(1-best_params["sl"])
-        tp = entry_price*(1+best_params["tp"])
-    elif signal_df["EMA_fast"].iloc < signal_df["EMA_slow"].iloc and signal_df["RSI"].iloc > best_params["rsi_sell"] and entry_price > signal_df["BB_upper"].iloc:
-        live_signal = "SELL"
-        sl = entry_price*(1+best_params["sl"])
-        tp = entry_price*(1-best_params["tp"])
-
-    st.subheader("Live Recommendation (Based on Last Candle Close)")
-    if live_signal:
-        st.write(f"Signal: **{live_signal}** | Entry: {entry_price:.2f} | SL: {sl:.2f} | Target: {tp:.2f}")
-    else:
-        st.write("No trade signal today.")
+    # Human-readable summary
+    st.subheader("📘 Summary")
+    summary=f"Over the past year, the optimizer tested multiple indicator combinations and found the best swing-trading parameters {best_params}. "\
+            f"Backtesting produced {best_stats['Total Trades']} trades with {best_stats['Win %']}% accuracy and "\
+            f"a total return of {best_stats['Total Return %']}%. The system adapts to both up and down trends. "\
+            f"Currently, based on the last candle, {live_msg if live_signal!=0 else 'there is no active trade setup'}. "\
+            "This strategy uses a mix of EMA trend filter, RSI oversold/overbought levels, and Bollinger band mean reversion for robust swing trades."
+    st.write(summary)
