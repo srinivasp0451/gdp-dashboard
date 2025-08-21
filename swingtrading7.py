@@ -553,7 +553,7 @@ col1, col2, col3 = st.columns(3)
 with col1:
     trade_side = st.selectbox("Trade Direction", ["long", "short", "long_short"])
 with col2:
-    opt_method = st.selectbox("Optimization Method", ["Exhaustive Grid", "Randomized Search"])
+    opt_method = st.selectbox("Optimization Method", ["Exhaustive Grid", "Randomized Search"],index=1)
 with col3:
     iters = st.number_input("Randomized iterations (if selected)", min_value=50, max_value=2000, value=400, step=50)
 
