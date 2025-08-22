@@ -546,7 +546,7 @@ def live_recommendation(df_feat: pd.DataFrame, params: dict, trade_side: str, ba
 # ----------------- UI --------------------
 # =========================================
 st.set_page_config(page_title="Ultra-Robust Swing Strategy Optimizer", layout="wide")
-st.title("📈 Ultra-Robust Swing Strategy (Manual Indicators, No Leakage)")
+st.title("📈 Swing Strategy")
 
 uploaded = st.file_uploader("Upload CSV/Excel with Date, Open, High, Low, Close, Volume", type=["csv", "xlsx"])
 col1, col2, col3 = st.columns(3)
