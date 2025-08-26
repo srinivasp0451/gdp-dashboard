@@ -1,568 +1,520 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-import matplotlib.pyplot as plt
-import seaborn as sns
 import plotly.graph_objects as go
 import plotly.express as px
-from datetime import datetime, timedelta
-from sklearn.model_selection import ParameterGrid, ParameterSampler
-from sklearn.preprocessing import StandardScaler
+from plotly.subplots import make_subplots
 import warnings
+from datetime import datetime, timedelta
+from sklearn.model_selection import ParameterGrid
+import random
+from scipy.optimize import differential_evolution
+import seaborn as sns
+import matplotlib.pyplot as plt
+
 warnings.filterwarnings('ignore')
 
-# Set page config
-st.set_page_config(
-    page_title="Stock Trading Recommendation System",
-    page_icon="📈",
-    layout="wide"
-)
-
 class TechnicalIndicators:
-    """Calculate technical indicators manually"""
+    """Custom technical indicators calculated manually"""
     
     @staticmethod
-    def sma(data, window):
-        return data.rolling(window=window).mean()
+    def sma(data, period):
+        return data.rolling(window=period).mean()
     
     @staticmethod
-    def ema(data, window):
-        return data.ewm(span=window).mean()
+    def ema(data, period):
+        multiplier = 2 / (period + 1)
+        ema = data.copy()
+        for i in range(1, len(data)):
+            if pd.notna(ema.iloc[i-1]):
+                ema.iloc[i] = (data.iloc[i] * multiplier) + (ema.iloc[i-1] * (1 - multiplier))
+        return ema
     
     @staticmethod
-    def rsi(data, window=14):
+    def rsi(data, period=14):
         delta = data.diff()
-        gain = (delta.where(delta > 0, 0)).rolling(window=window).mean()
-        loss = (-delta.where(delta < 0, 0)).rolling(window=window).mean()
-        rs = gain / loss
-        return 100 - (100 / (1 + rs))
+        gain = delta.where(delta > 0, 0)
+        loss = -delta.where(delta < 0, 0)
+        avg_gain = gain.rolling(window=period).mean()
+        avg_loss = loss.rolling(window=period).mean()
+        rs = avg_gain / avg_loss
+        rsi = 100 - (100 / (1 + rs))
+        return rsi
     
     @staticmethod
     def macd(data, fast=12, slow=26, signal=9):
         ema_fast = TechnicalIndicators.ema(data, fast)
         ema_slow = TechnicalIndicators.ema(data, slow)
-        macd = ema_fast - ema_slow
-        macd_signal = TechnicalIndicators.ema(macd, signal)
-        histogram = macd - macd_signal
-        return macd, macd_signal, histogram
+        macd_line = ema_fast - ema_slow
+        signal_line = TechnicalIndicators.ema(macd_line, signal)
+        histogram = macd_line - signal_line
+        return macd_line, signal_line, histogram
     
     @staticmethod
-    def bollinger_bands(data, window=20, std_dev=2):
-        sma = TechnicalIndicators.sma(data, window)
-        std = data.rolling(window=window).std()
+    def bollinger_bands(data, period=20, std_dev=2):
+        sma = TechnicalIndicators.sma(data, period)
+        std = data.rolling(window=period).std()
         upper = sma + (std * std_dev)
         lower = sma - (std * std_dev)
         return upper, sma, lower
     
     @staticmethod
-    def stochastic(high, low, close, k_window=14, d_window=3):
-        lowest_low = low.rolling(window=k_window).min()
-        highest_high = high.rolling(window=k_window).max()
+    def stochastic(high, low, close, k_period=14, d_period=3):
+        lowest_low = low.rolling(window=k_period).min()
+        highest_high = high.rolling(window=k_period).max()
         k_percent = 100 * ((close - lowest_low) / (highest_high - lowest_low))
-        d_percent = k_percent.rolling(window=d_window).mean()
+        d_percent = k_percent.rolling(window=d_period).mean()
         return k_percent, d_percent
     
     @staticmethod
-    def atr(high, low, close, window=14):
+    def williams_r(high, low, close, period=14):
+        highest_high = high.rolling(window=period).max()
+        lowest_low = low.rolling(window=period).min()
+        wr = -100 * ((highest_high - close) / (highest_high - lowest_low))
+        return wr
+    
+    @staticmethod
+    def cci(high, low, close, period=20):
+        tp = (high + low + close) / 3
+        sma_tp = tp.rolling(window=period).mean()
+        mean_dev = tp.rolling(window=period).apply(lambda x: np.mean(np.abs(x - x.mean())))
+        cci = (tp - sma_tp) / (0.015 * mean_dev)
+        return cci
+    
+    @staticmethod
+    def atr(high, low, close, period=14):
         tr1 = high - low
         tr2 = abs(high - close.shift())
         tr3 = abs(low - close.shift())
         tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-        return tr.rolling(window=window).mean()
+        atr = tr.rolling(window=period).mean()
+        return atr
     
     @staticmethod
-    def williams_r(high, low, close, window=14):
-        highest_high = high.rolling(window=window).max()
-        lowest_low = low.rolling(window=window).min()
-        return -100 * ((highest_high - close) / (highest_high - lowest_low))
+    def adx(high, low, close, period=14):
+        plus_dm = high.diff()
+        minus_dm = low.diff()
+        plus_dm[plus_dm < 0] = 0
+        minus_dm[minus_dm > 0] = 0
+        minus_dm = abs(minus_dm)
+        
+        tr = TechnicalIndicators.atr(high, low, close, 1)
+        plus_di = 100 * (plus_dm.rolling(period).mean() / tr.rolling(period).mean())
+        minus_di = 100 * (minus_dm.rolling(period).mean() / tr.rolling(period).mean())
+        
+        dx = 100 * abs(plus_di - minus_di) / (plus_di + minus_di)
+        adx = dx.rolling(period).mean()
+        return adx, plus_di, minus_di
     
     @staticmethod
-    def momentum(data, window=10):
-        return data.pct_change(window) * 100
-    
-    @staticmethod
-    def cci(high, low, close, window=20):
-        tp = (high + low + close) / 3
-        sma_tp = tp.rolling(window=window).mean()
-        mad = tp.rolling(window=window).apply(lambda x: np.mean(np.abs(x - x.mean())))
-        return (tp - sma_tp) / (0.015 * mad)
-    
-    @staticmethod
-    def obv(close, volume):
-        obv = np.where(close > close.shift(1), volume, np.where(close < close.shift(1), -volume, 0))
-        return pd.Series(obv, index=close.index).cumsum()
+    def momentum(data, period=10):
+        return data.diff(period)
 
-class DataProcessor:
-    """Handle data processing and column mapping"""
-    
-    @staticmethod
-    def map_columns(df):
-        """Map different column name variations to standard names"""
-        column_mapping = {
-            'open': ['open', 'open price', 'price open', 'o'],
-            'high': ['high', 'high price', 'price high', 'h'],
-            'low': ['low', 'low price', 'price low', 'l'],
-            'close': ['close', 'close price', 'price close', 'c'],
-            'volume': ['volume', 'vol', 'v', 'trading volume']
+class SwingTradingStrategy:
+    def __init__(self, df, parameters):
+        self.df = df.copy()
+        self.params = parameters
+        self.signals = None
+        self.indicators = {}
+        
+    def calculate_indicators(self):
+        """Calculate all technical indicators"""
+        close = self.df['close']
+        high = self.df['high']
+        low = self.df['low']
+        volume = self.df['volume']
+        
+        # Moving Averages
+        self.indicators['sma_fast'] = TechnicalIndicators.sma(close, self.params['sma_fast'])
+        self.indicators['sma_slow'] = TechnicalIndicators.sma(close, self.params['sma_slow'])
+        self.indicators['ema_fast'] = TechnicalIndicators.ema(close, self.params['ema_fast'])
+        self.indicators['ema_slow'] = TechnicalIndicators.ema(close, self.params['ema_slow'])
+        
+        # Oscillators
+        self.indicators['rsi'] = TechnicalIndicators.rsi(close, self.params['rsi_period'])
+        macd, signal, histogram = TechnicalIndicators.macd(close, self.params['macd_fast'], 
+                                                         self.params['macd_slow'], self.params['macd_signal'])
+        self.indicators['macd'] = macd
+        self.indicators['macd_signal'] = signal
+        self.indicators['macd_histogram'] = histogram
+        
+        # Bollinger Bands
+        bb_upper, bb_middle, bb_lower = TechnicalIndicators.bollinger_bands(close, self.params['bb_period'])
+        self.indicators['bb_upper'] = bb_upper
+        self.indicators['bb_middle'] = bb_middle
+        self.indicators['bb_lower'] = bb_lower
+        
+        # Stochastic
+        k_percent, d_percent = TechnicalIndicators.stochastic(high, low, close, self.params['stoch_k'])
+        self.indicators['stoch_k'] = k_percent
+        self.indicators['stoch_d'] = d_percent
+        
+        # Other indicators
+        self.indicators['williams_r'] = TechnicalIndicators.williams_r(high, low, close, self.params['williams_period'])
+        self.indicators['cci'] = TechnicalIndicators.cci(high, low, close, self.params['cci_period'])
+        self.indicators['atr'] = TechnicalIndicators.atr(high, low, close, self.params['atr_period'])
+        adx, plus_di, minus_di = TechnicalIndicators.adx(high, low, close, self.params['adx_period'])
+        self.indicators['adx'] = adx
+        self.indicators['plus_di'] = plus_di
+        self.indicators['minus_di'] = minus_di
+        self.indicators['momentum'] = TechnicalIndicators.momentum(close, self.params['momentum_period'])
+        
+    def generate_signals(self, trade_type='both'):
+        """Generate trading signals based on multiple indicators"""
+        self.calculate_indicators()
+        
+        signals = pd.DataFrame(index=self.df.index)
+        signals['price'] = self.df['close']
+        signals['signal'] = 0
+        signals['strength'] = 0
+        
+        # Long signals
+        long_conditions = [
+            self.indicators['sma_fast'] > self.indicators['sma_slow'],
+            self.indicators['ema_fast'] > self.indicators['ema_slow'],
+            self.indicators['rsi'] < self.params['rsi_oversold'],
+            self.indicators['macd'] > self.indicators['macd_signal'],
+            self.df['close'] < self.indicators['bb_lower'],
+            self.indicators['stoch_k'] < self.params['stoch_oversold'],
+            self.indicators['williams_r'] < -80,
+            self.indicators['cci'] < -100,
+            self.indicators['plus_di'] > self.indicators['minus_di'],
+            self.indicators['momentum'] > 0
+        ]
+        
+        # Short signals
+        short_conditions = [
+            self.indicators['sma_fast'] < self.indicators['sma_slow'],
+            self.indicators['ema_fast'] < self.indicators['ema_slow'],
+            self.indicators['rsi'] > self.params['rsi_overbought'],
+            self.indicators['macd'] < self.indicators['macd_signal'],
+            self.df['close'] > self.indicators['bb_upper'],
+            self.indicators['stoch_k'] > self.params['stoch_overbought'],
+            self.indicators['williams_r'] > -20,
+            self.indicators['cci'] > 100,
+            self.indicators['plus_di'] < self.indicators['minus_di'],
+            self.indicators['momentum'] < 0
+        ]
+        
+        # Calculate signal strength
+        long_strength = sum([cond.astype(int) for cond in long_conditions])
+        short_strength = sum([cond.astype(int) for cond in short_conditions])
+        
+        # Generate signals based on trade type
+        if trade_type in ['long', 'both']:
+            long_signal = (long_strength >= self.params['min_conditions']) & (self.indicators['adx'] > 25)
+            signals.loc[long_signal, 'signal'] = 1
+            signals.loc[long_signal, 'strength'] = long_strength[long_signal]
+        
+        if trade_type in ['short', 'both']:
+            short_signal = (short_strength >= self.params['min_conditions']) & (self.indicators['adx'] > 25)
+            signals.loc[short_signal, 'signal'] = -1
+            signals.loc[short_signal, 'strength'] = short_strength[short_signal]
+        
+        # Calculate targets and stop losses
+        atr = self.indicators['atr']
+        signals['target'] = np.where(signals['signal'] == 1, 
+                                   signals['price'] + (atr * self.params['target_atr_multiplier']),
+                                   np.where(signals['signal'] == -1,
+                                          signals['price'] - (atr * self.params['target_atr_multiplier']),
+                                          np.nan))
+        
+        signals['stop_loss'] = np.where(signals['signal'] == 1,
+                                      signals['price'] - (atr * self.params['sl_atr_multiplier']),
+                                      np.where(signals['signal'] == -1,
+                                             signals['price'] + (atr * self.params['sl_atr_multiplier']),
+                                             np.nan))
+        
+        # Calculate probability based on strength and ADX
+        signals['probability'] = np.where(signals['signal'] != 0,
+                                        (signals['strength'] / 10 * 0.6) + (self.indicators['adx'] / 100 * 0.4),
+                                        np.nan)
+        
+        self.signals = signals
+        return signals
+
+class BacktestEngine:
+    def __init__(self, df, signals, initial_capital=100000):
+        self.df = df
+        self.signals = signals
+        self.initial_capital = initial_capital
+        self.results = []
+        
+    def run_backtest(self):
+        """Run comprehensive backtest"""
+        capital = self.initial_capital
+        position = 0
+        entry_price = 0
+        entry_date = None
+        target = 0
+        stop_loss = 0
+        trades = []
+        
+        for i in range(len(self.df)):
+            current_price = self.df.iloc[i]['close']
+            current_date = self.df.index[i]
+            
+            # Check for new signals
+            if self.signals.iloc[i]['signal'] != 0 and position == 0:
+                position = self.signals.iloc[i]['signal']
+                entry_price = current_price
+                entry_date = current_date
+                target = self.signals.iloc[i]['target']
+                stop_loss = self.signals.iloc[i]['stop_loss']
+                
+            # Check exit conditions
+            elif position != 0:
+                exit_triggered = False
+                exit_reason = ""
+                exit_price = current_price
+                
+                if position == 1:  # Long position
+                    if current_price >= target:
+                        exit_triggered = True
+                        exit_reason = "Target Hit"
+                        exit_price = target
+                    elif current_price <= stop_loss:
+                        exit_triggered = True
+                        exit_reason = "Stop Loss Hit"
+                        exit_price = stop_loss
+                        
+                elif position == -1:  # Short position
+                    if current_price <= target:
+                        exit_triggered = True
+                        exit_reason = "Target Hit"
+                        exit_price = target
+                    elif current_price >= stop_loss:
+                        exit_triggered = True
+                        exit_reason = "Stop Loss Hit"
+                        exit_price = stop_loss
+                
+                if exit_triggered:
+                    pnl = (exit_price - entry_price) * position
+                    pnl_pct = (pnl / entry_price) * 100
+                    
+                    trade = {
+                        'entry_date': entry_date,
+                        'exit_date': current_date,
+                        'entry_price': entry_price,
+                        'exit_price': exit_price,
+                        'target': target,
+                        'stop_loss': stop_loss,
+                        'signal': 'Long' if position == 1 else 'Short',
+                        'pnl': pnl,
+                        'pnl_pct': pnl_pct,
+                        'exit_reason': exit_reason,
+                        'hold_days': (current_date - entry_date).days,
+                        'probability': self.signals.loc[entry_date, 'probability'] if entry_date in self.signals.index else 0
+                    }
+                    trades.append(trade)
+                    
+                    capital += pnl
+                    position = 0
+        
+        return trades, capital
+
+class TradingApp:
+    def __init__(self):
+        self.df = None
+        self.processed_df = None
+        self.default_params = {
+            'sma_fast': 10, 'sma_slow': 20, 'ema_fast': 12, 'ema_slow': 26,
+            'rsi_period': 14, 'rsi_oversold': 30, 'rsi_overbought': 70,
+            'macd_fast': 12, 'macd_slow': 26, 'macd_signal': 9,
+            'bb_period': 20, 'stoch_k': 14, 'stoch_oversold': 20, 'stoch_overbought': 80,
+            'williams_period': 14, 'cci_period': 20, 'atr_period': 14, 'adx_period': 14,
+            'momentum_period': 10, 'min_conditions': 6, 'target_atr_multiplier': 2.0,
+            'sl_atr_multiplier': 1.0
         }
         
-        mapped_df = df.copy()
-        column_names = [col.lower().strip() for col in df.columns]
+    def map_columns(self, df):
+        """Map uploaded columns to standard format"""
+        columns = df.columns.str.lower()
+        column_mapping = {}
         
-        for standard_name, variations in column_mapping.items():
-            for col_name in column_names:
+        # Define possible variations for each required column
+        mappings = {
+            'open': ['open', 'open_price', 'openPrice', 'o'],
+            'high': ['high', 'high_price', 'highPrice', 'h'],
+            'low': ['low', 'low_price', 'lowPrice', 'l'],
+            'close': ['close', 'close_price', 'closePrice', 'c'],
+            'volume': ['volume', 'vol', 'v']
+        }
+        
+        for standard_name, variations in mappings.items():
+            for col in columns:
                 for variation in variations:
-                    if variation in col_name:
-                        original_col = df.columns[column_names.index(col_name)]
-                        mapped_df = mapped_df.rename(columns={original_col: standard_name})
+                    if variation.lower() in col.lower():
+                        column_mapping[df.columns[columns.get_loc(col)]] = standard_name
                         break
-                if standard_name in mapped_df.columns:
+                if standard_name in column_mapping.values():
                     break
         
-        return mapped_df
-    
-    @staticmethod
-    def validate_data(df):
-        """Validate required columns exist"""
-        required_cols = ['open', 'high', 'low', 'close']
-        missing_cols = [col for col in required_cols if col not in df.columns]
+        # Rename columns
+        df_mapped = df.rename(columns=column_mapping)
+        
+        # Ensure we have required columns
+        required_cols = ['open', 'high', 'low', 'close', 'volume']
+        missing_cols = [col for col in required_cols if col not in df_mapped.columns]
         
         if missing_cols:
             st.error(f"Missing required columns: {missing_cols}")
-            return False
-        return True
-    
-    @staticmethod
-    def process_data(df, end_date=None):
-        """Process and sort data"""
-        # Ensure datetime index
-        if 'date' in df.columns:
-            df['date'] = pd.to_datetime(df['date'])
-            df = df.set_index('date')
-        elif not isinstance(df.index, pd.DatetimeIndex):
-            df.index = pd.to_datetime(df.index)
-        
-        # Sort by date
-        df = df.sort_index()
-        
-        # Filter by end date if provided
-        if end_date:
-            df = df[df.index <= end_date]
-        
-        return df
-
-class StrategyOptimizer:
-    """Optimize trading strategy parameters"""
-    
-    def __init__(self, data, trade_type='both'):
-        self.data = data
-        self.trade_type = trade_type
-        
-    def get_parameter_space(self):
-        """Define parameter space for optimization"""
-        param_space = {
-            'rsi_window': [10, 14, 21],
-            'rsi_oversold': [20, 25, 30],
-            'rsi_overbought': [70, 75, 80],
-            'macd_fast': [8, 12, 16],
-            'macd_slow': [21, 26, 31],
-            'bb_window': [15, 20, 25],
-            'bb_std': [1.5, 2.0, 2.5],
-            'stoch_k': [10, 14, 18],
-            'atr_window': [10, 14, 20],
-            'momentum_window': [8, 10, 12],
-            'volume_ma': [10, 20, 30],
-            'stop_loss_atr': [1.5, 2.0, 2.5],
-            'take_profit_atr': [2.0, 3.0, 4.0]
-        }
-        return param_space
-    
-    def calculate_indicators(self, params):
-        """Calculate all indicators with given parameters"""
-        df = self.data.copy()
-        
-        # Price-based indicators
-        df['rsi'] = TechnicalIndicators.rsi(df['close'], params['rsi_window'])
-        df['sma_20'] = TechnicalIndicators.sma(df['close'], 20)
-        df['ema_12'] = TechnicalIndicators.ema(df['close'], 12)
-        df['ema_26'] = TechnicalIndicators.ema(df['close'], 26)
-        
-        # MACD
-        macd, macd_signal, macd_hist = TechnicalIndicators.macd(
-            df['close'], params['macd_fast'], params['macd_slow']
-        )
-        df['macd'] = macd
-        df['macd_signal'] = macd_signal
-        df['macd_histogram'] = macd_hist
-        
-        # Bollinger Bands
-        bb_upper, bb_middle, bb_lower = TechnicalIndicators.bollinger_bands(
-            df['close'], params['bb_window'], params['bb_std']
-        )
-        df['bb_upper'] = bb_upper
-        df['bb_lower'] = bb_lower
-        df['bb_middle'] = bb_middle
-        
-        # Stochastic
-        stoch_k, stoch_d = TechnicalIndicators.stochastic(
-            df['high'], df['low'], df['close'], params['stoch_k']
-        )
-        df['stoch_k'] = stoch_k
-        df['stoch_d'] = stoch_d
-        
-        # ATR for volatility
-        df['atr'] = TechnicalIndicators.atr(
-            df['high'], df['low'], df['close'], params['atr_window']
-        )
-        
-        # Williams %R
-        df['williams_r'] = TechnicalIndicators.williams_r(
-            df['high'], df['low'], df['close'], 14
-        )
-        
-        # Momentum
-        df['momentum'] = TechnicalIndicators.momentum(
-            df['close'], params['momentum_window']
-        )
-        
-        # CCI
-        df['cci'] = TechnicalIndicators.cci(df['high'], df['low'], df['close'])
-        
-        # Volume indicators
-        if 'volume' in df.columns:
-            df['volume_ma'] = TechnicalIndicators.sma(df['volume'], params['volume_ma'])
-            df['obv'] = TechnicalIndicators.obv(df['close'], df['volume'])
-        
-        return df
-    
-    def generate_signals(self, df, params):
-        """Generate buy/sell signals based on indicators"""
-        signals = pd.DataFrame(index=df.index)
-        signals['position'] = 0
-        signals['entry_reason'] = ''
-        signals['probability'] = 0.0
-        
-        # Long signals
-        long_conditions = []
-        long_reasons = []
-        
-        # RSI oversold
-        if df['rsi'].iloc[-1] < params['rsi_oversold']:
-            long_conditions.append(True)
-            long_reasons.append(f"RSI oversold ({df['rsi'].iloc[-1]:.1f})")
-        
-        # MACD bullish crossover
-        if (df['macd'].iloc[-1] > df['macd_signal'].iloc[-1] and 
-            df['macd'].iloc[-2] <= df['macd_signal'].iloc[-2]):
-            long_conditions.append(True)
-            long_reasons.append("MACD bullish crossover")
-        
-        # Price near lower Bollinger Band
-        if df['close'].iloc[-1] < df['bb_lower'].iloc[-1] * 1.02:
-            long_conditions.append(True)
-            long_reasons.append("Price near lower BB")
-        
-        # Stochastic oversold
-        if df['stoch_k'].iloc[-1] < 20:
-            long_conditions.append(True)
-            long_reasons.append(f"Stochastic oversold ({df['stoch_k'].iloc[-1]:.1f})")
-        
-        # Williams %R oversold
-        if df['williams_r'].iloc[-1] < -80:
-            long_conditions.append(True)
-            long_reasons.append("Williams %R oversold")
-        
-        # Short signals
-        short_conditions = []
-        short_reasons = []
-        
-        # RSI overbought
-        if df['rsi'].iloc[-1] > params['rsi_overbought']:
-            short_conditions.append(True)
-            short_reasons.append(f"RSI overbought ({df['rsi'].iloc[-1]:.1f})")
-        
-        # MACD bearish crossover
-        if (df['macd'].iloc[-1] < df['macd_signal'].iloc[-1] and 
-            df['macd'].iloc[-2] >= df['macd_signal'].iloc[-2]):
-            short_conditions.append(True)
-            short_reasons.append("MACD bearish crossover")
-        
-        # Price near upper Bollinger Band
-        if df['close'].iloc[-1] > df['bb_upper'].iloc[-1] * 0.98:
-            short_conditions.append(True)
-            short_reasons.append("Price near upper BB")
-        
-        # Stochastic overbought
-        if df['stoch_k'].iloc[-1] > 80:
-            short_conditions.append(True)
-            short_reasons.append(f"Stochastic overbought ({df['stoch_k'].iloc[-1]:.1f})")
-        
-        # Williams %R overbought
-        if df['williams_r'].iloc[-1] > -20:
-            short_conditions.append(True)
-            short_reasons.append("Williams %R overbought")
-        
-        # Generate final signals
-        if self.trade_type in ['long', 'both'] and len(long_conditions) >= 2:
-            signals.iloc[-1, signals.columns.get_loc('position')] = 1
-            signals.iloc[-1, signals.columns.get_loc('entry_reason')] = '; '.join(long_reasons)
-            signals.iloc[-1, signals.columns.get_loc('probability')] = min(0.9, len(long_conditions) * 0.15)
-        
-        if self.trade_type in ['short', 'both'] and len(short_conditions) >= 2:
-            signals.iloc[-1, signals.columns.get_loc('position')] = -1
-            signals.iloc[-1, signals.columns.get_loc('entry_reason')] = '; '.join(short_reasons)
-            signals.iloc[-1, signals.columns.get_loc('probability')] = min(0.9, len(short_conditions) * 0.15)
-        
-        return signals
-    
-    def backtest_strategy(self, params):
-        """Backtest strategy with given parameters"""
-        df = self.calculate_indicators(params)
-        
-        trades = []
-        current_position = 0
-        entry_price = 0
-        entry_date = None
-        stop_loss = 0
-        take_profit = 0
-        
-        for i in range(50, len(df)):  # Start after warm-up period
-            row = df.iloc[i]
-            prev_row = df.iloc[i-1]
+            return None
             
-            # Generate signals
-            signals = self.generate_signals(df.iloc[:i+1], params)
-            signal = signals['position'].iloc[-1]
-            
-            # Close existing position
-            if current_position != 0:
-                # Check stop loss and take profit
-                current_price = row['close']
-                exit_triggered = False
-                exit_reason = ""
-                
-                if current_position == 1:  # Long position
-                    if current_price <= stop_loss:
-                        exit_triggered = True
-                        exit_reason = "Stop Loss"
-                    elif current_price >= take_profit:
-                        exit_triggered = True
-                        exit_reason = "Take Profit"
-                    elif signal == -1:
-                        exit_triggered = True
-                        exit_reason = "Signal Reversal"
-                
-                elif current_position == -1:  # Short position
-                    if current_price >= stop_loss:
-                        exit_triggered = True
-                        exit_reason = "Stop Loss"
-                    elif current_price <= take_profit:
-                        exit_triggered = True
-                        exit_reason = "Take Profit"
-                    elif signal == 1:
-                        exit_triggered = True
-                        exit_reason = "Signal Reversal"
-                
-                if exit_triggered:
-                    # Calculate PnL
-                    if current_position == 1:
-                        pnl = (current_price - entry_price) / entry_price * 100
-                    else:
-                        pnl = (entry_price - current_price) / entry_price * 100
-                    
-                    # Record trade
-                    trades.append({
-                        'entry_date': entry_date,
-                        'exit_date': row.name,
-                        'position': current_position,
-                        'entry_price': entry_price,
-                        'exit_price': current_price,
-                        'stop_loss': stop_loss,
-                        'take_profit': take_profit,
-                        'pnl': pnl,
-                        'exit_reason': exit_reason,
-                        'hold_days': (row.name - entry_date).days
-                    })
-                    
-                    current_position = 0
-            
-            # Open new position
-            if current_position == 0 and signal != 0:
-                if (self.trade_type == 'long' and signal == 1) or \
-                   (self.trade_type == 'short' and signal == -1) or \
-                   (self.trade_type == 'both'):
-                    
-                    current_position = signal
-                    entry_price = row['close']
-                    entry_date = row.name
-                    atr_value = row['atr']
-                    
-                    if signal == 1:  # Long
-                        stop_loss = entry_price - (atr_value * params['stop_loss_atr'])
-                        take_profit = entry_price + (atr_value * params['take_profit_atr'])
-                    else:  # Short
-                        stop_loss = entry_price + (atr_value * params['stop_loss_atr'])
-                        take_profit = entry_price - (atr_value * params['take_profit_atr'])
-        
-        return trades
+        return df_mapped[required_cols]
     
-    def calculate_performance(self, trades):
-        """Calculate performance metrics"""
-        if not trades:
-            return {
-                'total_return': 0,
-                'num_trades': 0,
-                'win_rate': 0,
-                'avg_win': 0,
-                'avg_loss': 0,
-                'profit_factor': 0,
-                'max_drawdown': 0,
-                'sharpe_ratio': 0
-            }
+    def perform_eda(self, df):
+        """Perform exploratory data analysis"""
+        st.subheader("📊 Exploratory Data Analysis")
         
-        df_trades = pd.DataFrame(trades)
+        # Basic statistics
+        col1, col2 = st.columns(2)
         
-        total_return = df_trades['pnl'].sum()
-        num_trades = len(trades)
+        with col1:
+            st.write("**Dataset Overview:**")
+            st.write(f"• Total Records: {len(df):,}")
+            st.write(f"• Date Range: {df.index.min().strftime('%Y-%m-%d')} to {df.index.max().strftime('%Y-%m-%d')}")
+            st.write(f"• Max Price: ${df['close'].max():.2f}")
+            st.write(f"• Min Price: ${df['close'].min():.2f}")
+            st.write(f"• Price Range: ${df['close'].max() - df['close'].min():.2f}")
         
-        winning_trades = df_trades[df_trades['pnl'] > 0]
-        losing_trades = df_trades[df_trades['pnl'] < 0]
+        with col2:
+            st.write("**Price Statistics:**")
+            st.dataframe(df[['open', 'high', 'low', 'close', 'volume']].describe())
         
-        win_rate = len(winning_trades) / num_trades if num_trades > 0 else 0
-        avg_win = winning_trades['pnl'].mean() if len(winning_trades) > 0 else 0
-        avg_loss = losing_trades['pnl'].mean() if len(losing_trades) > 0 else 0
+        # Price chart
+        fig = go.Figure(data=go.Candlestick(x=df.index,
+                                          open=df['open'],
+                                          high=df['high'],
+                                          low=df['low'],
+                                          close=df['close']))
+        fig.update_layout(title="Price Chart", xaxis_title="Date", yaxis_title="Price")
+        st.plotly_chart(fig, use_container_width=True)
         
-        gross_profit = winning_trades['pnl'].sum() if len(winning_trades) > 0 else 0
-        gross_loss = abs(losing_trades['pnl'].sum()) if len(losing_trades) > 0 else 0
-        profit_factor = gross_profit / gross_loss if gross_loss > 0 else float('inf')
-        
-        # Calculate drawdown
-        cumulative_pnl = df_trades['pnl'].cumsum()
-        running_max = cumulative_pnl.expanding().max()
-        drawdown = (cumulative_pnl - running_max) / running_max * 100
-        max_drawdown = abs(drawdown.min()) if len(drawdown) > 0 else 0
-        
-        # Sharpe ratio (simplified)
-        returns_std = df_trades['pnl'].std() if len(df_trades) > 1 else 0
-        sharpe_ratio = (df_trades['pnl'].mean() / returns_std) if returns_std > 0 else 0
-        
-        return {
-            'total_return': total_return,
-            'num_trades': num_trades,
-            'win_rate': win_rate * 100,
-            'winning_trades': len(winning_trades),
-            'losing_trades': len(losing_trades),
-            'avg_win': avg_win,
-            'avg_loss': avg_loss,
-            'profit_factor': profit_factor,
-            'max_drawdown': max_drawdown,
-            'sharpe_ratio': sharpe_ratio,
-            'avg_hold_days': df_trades['hold_days'].mean()
-        }
+        # Returns heatmap (if data spans more than 1 year)
+        if (df.index.max() - df.index.min()).days > 365:
+            st.write("**Monthly Returns Heatmap:**")
+            df['returns'] = df['close'].pct_change()
+            df['year'] = df.index.year
+            df['month'] = df.index.month
+            
+            monthly_returns = df.groupby(['year', 'month'])['returns'].sum().unstack()
+            
+            fig, ax = plt.subplots(figsize=(12, 8))
+            sns.heatmap(monthly_returns * 100, annot=True, fmt='.1f', cmap='RdYlGn', center=0, ax=ax)
+            ax.set_title('Monthly Returns Heatmap (%)')
+            st.pyplot(fig)
     
-    def optimize(self, search_type='random', n_iter=100):
+    def generate_summary(self, df, phase="data"):
+        """Generate human-readable summary"""
+        if phase == "data":
+            days = (df.index.max() - df.index.min()).days
+            total_return = ((df['close'].iloc[-1] / df['close'].iloc[0]) - 1) * 100
+            volatility = df['close'].pct_change().std() * np.sqrt(252) * 100
+            avg_volume = df['volume'].mean()
+            
+            summary = f"""
+            📈 **Stock Data Analysis Summary:**
+            
+            The dataset spans {days} days with prices ranging from ${df['close'].min():.2f} to ${df['close'].max():.2f}. 
+            The overall return during this period was {total_return:.1f}%, indicating {'strong growth' if total_return > 20 else 'moderate growth' if total_return > 0 else 'decline'}. 
+            The annualized volatility of {volatility:.1f}% suggests {'high' if volatility > 30 else 'moderate' if volatility > 15 else 'low'} risk levels.
+            Average daily volume of {avg_volume:,.0f} shares indicates {'strong' if avg_volume > 1000000 else 'moderate'} liquidity.
+            
+            **Opportunities:** {'Swing trading opportunities exist due to high volatility' if volatility > 20 else 'Trend following strategies may work better due to lower volatility'}.
+            The current trend appears {'bullish' if df['close'].iloc[-1] > df['close'].iloc[-20] else 'bearish'} based on recent price action.
+            """
+            return summary
+        
+        elif phase == "backtest":
+            return "Backtest analysis completed with detailed trade-by-trade results."
+    
+    def optimize_strategy(self, df, optimization_type='random', trade_type='both'):
         """Optimize strategy parameters"""
-        param_space = self.get_parameter_space()
+        st.write("🔍 **Optimizing Strategy Parameters...**")
         
-        if search_type == 'grid':
-            param_combinations = list(ParameterGrid(param_space))
+        # Parameter ranges for optimization
+        param_ranges = {
+            'sma_fast': [5, 10, 15, 20],
+            'sma_slow': [20, 30, 50],
+            'rsi_period': [10, 14, 20],
+            'rsi_oversold': [20, 25, 30, 35],
+            'rsi_overbought': [65, 70, 75, 80],
+            'min_conditions': [4, 5, 6, 7],
+            'target_atr_multiplier': [1.5, 2.0, 2.5, 3.0],
+            'sl_atr_multiplier': [0.5, 1.0, 1.5]
+        }
+        
+        best_params = self.default_params.copy()
+        best_score = -np.inf
+        
+        # Generate parameter combinations
+        if optimization_type == 'grid':
+            param_combinations = list(ParameterGrid(param_ranges))[:50]  # Limit for demo
         else:  # random search
-            param_combinations = list(ParameterSampler(param_space, n_iter=n_iter, random_state=42))
-        
-        best_params = None
-        best_performance = -float('inf')
-        best_trades = []
+            param_combinations = []
+            for _ in range(30):  # 30 random combinations
+                params = self.default_params.copy()
+                for param, values in param_ranges.items():
+                    params[param] = random.choice(values)
+                param_combinations.append(params)
         
         progress_bar = st.progress(0)
-        status_text = st.empty()
         
         for i, params in enumerate(param_combinations):
-            if i % max(1, len(param_combinations) // 20) == 0:
-                progress_bar.progress(i / len(param_combinations))
-                status_text.text(f"Optimizing... {i}/{len(param_combinations)}")
+            # Merge with default params
+            test_params = self.default_params.copy()
+            test_params.update(params)
             
             try:
-                trades = self.backtest_strategy(params)
-                performance = self.calculate_performance(trades)
+                # Create strategy and generate signals
+                strategy = SwingTradingStrategy(df, test_params)
+                signals = strategy.generate_signals(trade_type)
                 
-                # Score based on total return and other factors
-                score = (performance['total_return'] + 
-                        performance['win_rate'] * 0.1 + 
-                        performance['profit_factor'] * 10 -
-                        performance['max_drawdown'] * 0.1)
+                # Run backtest
+                backtest = BacktestEngine(df, signals)
+                trades, final_capital = backtest.run_backtest()
                 
-                if score > best_performance:
-                    best_performance = score
-                    best_params = params
-                    best_trades = trades
+                if trades:
+                    # Calculate metrics
+                    total_return = ((final_capital / 100000) - 1) * 100
+                    winning_trades = len([t for t in trades if t['pnl'] > 0])
+                    total_trades = len(trades)
+                    win_rate = winning_trades / total_trades if total_trades > 0 else 0
                     
+                    # Score based on return and win rate
+                    score = total_return * 0.7 + win_rate * 100 * 0.3
+                    
+                    if score > best_score:
+                        best_score = score
+                        best_params = test_params.copy()
+                        
             except Exception as e:
                 continue
+                
+            progress_bar.progress((i + 1) / len(param_combinations))
         
-        progress_bar.progress(1.0)
-        status_text.text("Optimization complete!")
-        
-        return best_params, best_trades
+        return best_params, best_score
 
 def main():
-    st.title("🚀 Advanced Stock Trading Recommendation System")
-    st.markdown("Upload your stock data and get AI-powered trading recommendations with backtesting")
+    st.set_page_config(page_title="Advanced Swing Trading System", layout="wide")
     
-    # Sidebar for parameters
-    st.sidebar.header("Configuration")
+    st.title("📈 Advanced Swing Trading Analysis System")
+    st.markdown("---")
+    
+    app = TradingApp()
     
     # File upload
-    uploaded_file = st.file_uploader(
-        "Upload Stock Data (CSV/Excel)", 
-        type=['csv', 'xlsx', 'xls'],
-        help="Upload file with OHLCV data"
-    )
+    uploaded_file = st.file_uploader("Upload Stock Data (CSV)", type=['csv'])
     
     if uploaded_file is not None:
         try:
-            # Load data
-            if uploaded_file.name.endswith('.csv'):
-                raw_df = pd.read_csv(uploaded_file)
-            else:
-                raw_df = pd.read_excel(uploaded_file)
+            # Read and process data
+            df = pd.read_csv(uploaded_file)
             
-            st.success(f"✅ Data loaded successfully! Shape: {raw_df.shape}")
+            st.success(f"✅ File uploaded successfully! Shape: {df.shape}")
             
-            # Map columns
-            df = DataProcessor.map_columns(raw_df)
-            
-            # Validate data
-            if not DataProcessor.validate_data(df):
-                return
-            
-            # Display column mapping
-            st.subheader("📊 Column Mapping")
-            col1, col2 = st.columns(2)
-            with col1:
-                st.write("**Original Columns:**")
-                st.write(list(raw_df.columns))
-            with col2:
-                st.write("**Mapped Columns:**")
-                st.write(list(df.columns))
-            
-            # Process data
-            df = DataProcessor.process_data(df)
-            
-            # Display basic info
-            st.subheader("📈 Data Overview")
-            col1, col2, col3, col4 = st.columns(4)
-            
-            with col1:
-                st.metric("Total Records", len(df))
-            with col2:
-                st.metric("Date Range", f"{df.index.min().strftime('%Y-%m-%d')} to {df.index.max().strftime('%Y-%m-%d')}")
-            with col3:
-                st.metric("Max Price", f"${float(df['high'].max()):.2f}")
-            with col4:
-                st.metric("Min Price", f"${float(df['low'].min()):.2f}")
-            
-            # Display data sample
-            st.subheader("📋 Data Sample")
+            # Display first and last 5 rows
             col1, col2 = st.columns(2)
             with col1:
                 st.write("**First 5 rows:**")
@@ -571,422 +523,337 @@ def main():
                 st.write("**Last 5 rows:**")
                 st.dataframe(df.tail())
             
-            # Plot raw data
-            st.subheader("📊 Price Chart")
-            fig = go.Figure()
-            fig.add_trace(go.Candlestick(
-                x=df.index,
-                open=df['open'],
-                high=df['high'],
-                low=df['low'],
-                close=df['close'],
-                name="OHLC"
-            ))
-            fig.update_layout(
-                title="Stock Price Chart",
-                yaxis_title="Price ($)",
-                xaxis_title="Date",
-                height=500
-            )
-            st.plotly_chart(fig, use_container_width=True)
+            # Map columns
+            processed_df = app.map_columns(df)
+            if processed_df is None:
+                return
             
-            # Exploratory Data Analysis
-            if len(df) > 365:  # More than 1 year of data
-                st.subheader("🔍 Exploratory Data Analysis")
-                
-                # Calculate returns
-                df['returns'] = df['close'].pct_change()
-                df['year'] = df.index.year
-                df['month'] = df.index.month
-                
-                # Monthly returns heatmap
-                monthly_returns = df.groupby(['year', 'month'])['returns'].sum().unstack()
-                
-                fig, ax = plt.subplots(figsize=(12, 8))
-                sns.heatmap(monthly_returns * 100, annot=True, fmt='.1f', 
-                           cmap='RdYlBu_r', center=0, ax=ax)
-                ax.set_title('Monthly Returns Heatmap (%)')
-                st.pyplot(fig)
-                
-                # Summary statistics
-                col1, col2 = st.columns(2)
-                with col1:
-                    st.write("**Return Statistics:**")
-                    stats = df['returns'].describe()
-                    st.dataframe(stats)
-                
-                with col2:
-                    st.write("**Volatility Analysis:**")
-                    volatility_30d = df['returns'].rolling(30).std() * np.sqrt(252) * 100
-                    st.metric("30-day Volatility", f"{volatility_30d.iloc[-1]:.1f}%")
-                    st.metric("Annual Volatility", f"{df['returns'].std() * np.sqrt(252) * 100:.1f}%")
+            # Try to parse date index
+            if 'date' in df.columns.str.lower() or df.index.name and 'date' in str(df.index.name).lower():
+                try:
+                    date_col = [col for col in df.columns if 'date' in col.lower()][0]
+                    processed_df.index = pd.to_datetime(df[date_col])
+                except:
+                    processed_df.index = pd.to_datetime(df.index)
+            else:
+                processed_df.index = pd.to_datetime(df.index)
             
-            # Configuration options
-            st.sidebar.subheader("Trading Parameters")
+            # Sort by date to prevent data leakage
+            processed_df = processed_df.sort_index()
+            
+            st.success("✅ Data successfully mapped and sorted!")
+            
+            # Show date range
+            st.info(f"📅 Data Range: {processed_df.index.min().strftime('%Y-%m-%d')} to {processed_df.index.max().strftime('%Y-%m-%d')}")
             
             # End date selection
-            end_date = st.sidebar.date_input(
+            end_date = st.date_input(
                 "Select End Date for Analysis",
-                value=df.index.max().date(),
-                min_value=df.index.min().date(),
-                max_value=df.index.max().date()
+                value=processed_df.index.max().date(),
+                min_value=processed_df.index.min().date(),
+                max_value=processed_df.index.max().date()
             )
             
-            # Trade type
-            trade_type = st.sidebar.selectbox(
-                "Trade Type",
-                ['both', 'long', 'short']
-            )
+            # Filter data up to end date
+            analysis_df = processed_df[processed_df.index.date <= end_date].copy()
             
-            # Optimization method
-            search_type = st.sidebar.selectbox(
-                "Optimization Method",
-                ['random', 'grid'],
-                index=0
-            )
+            # Trading parameters
+            col1, col2 = st.columns(2)
+            with col1:
+                trade_type = st.selectbox("Trade Type", ["both", "long", "short"])
+            with col2:
+                optimization_type = st.selectbox("Optimization Method", ["random", "grid"])
             
-            if st.sidebar.button("🚀 Generate Recommendations", type="primary"):
-                # Filter data by end date
-                analysis_df = df[df.index <= pd.to_datetime(end_date)]
+            if st.button("🚀 Run Analysis"):
                 
-                if len(analysis_df) < 100:
-                    st.error("Need at least 100 data points for analysis")
-                    return
+                # EDA
+                app.perform_eda(analysis_df)
                 
-                # Generate summary
-                st.subheader("📝 Data Summary")
-                current_price = float(analysis_df['close'].iloc[-1])
-                prev_price = float(analysis_df['close'].iloc[-2])
-                price_change = (current_price - prev_price) / prev_price * 100
-                min_price = float(analysis_df['low'].min())
-                max_price = float(analysis_df['high'].max())
-                avg_volume = float(analysis_df.get('volume', pd.Series([0])).mean()) if 'volume' in analysis_df.columns else 0
-                volatility = float(analysis_df['close'].std() / analysis_df['close'].mean()) if len(analysis_df) > 1 else 0
+                # Data summary
+                st.markdown(app.generate_summary(analysis_df, "data"))
                 
-                summary_text = f"""
-                The stock data shows a current price of ${current_price:.2f} with a recent change of {price_change:.2f}%. 
-                The stock has traded between ${min_price:.2f} and ${max_price:.2f} in the analyzed period.
-                Average daily volume is {avg_volume:,.0f} shares.
-                The stock shows {'high' if volatility > 0.02 else 'moderate'} volatility.
-                Recent price action suggests {'bullish' if price_change > 0 else 'bearish'} momentum in the short term.
-                Technical analysis indicates potential {'swing trading' if volatility > 0.015 else 'trend following'} opportunities.
-                """
+                # Optimize strategy
+                with st.spinner("Optimizing strategy..."):
+                    best_params, best_score = app.optimize_strategy(analysis_df, optimization_type, trade_type)
                 
-                st.write(summary_text)
+                st.success(f"✅ Optimization completed! Best Score: {best_score:.2f}")
                 
-                # Initialize optimizer
-                optimizer = StrategyOptimizer(analysis_df, trade_type)
+                # Display best parameters
+                st.subheader("🎯 Optimized Strategy Parameters")
+                param_cols = st.columns(4)
+                for i, (param, value) in enumerate(best_params.items()):
+                    with param_cols[i % 4]:
+                        st.metric(param.replace('_', ' ').title(), f"{value}")
                 
-                # Run optimization
-                st.subheader("⚡ Strategy Optimization")
-                with st.spinner("Optimizing strategy parameters..."):
-                    best_params, best_trades = optimizer.optimize(search_type, n_iter=50)
+                # Generate signals with best parameters
+                strategy = SwingTradingStrategy(analysis_df, best_params)
+                signals = strategy.generate_signals(trade_type)
                 
-                if best_params is None:
-                    st.error("Optimization failed. Try different parameters.")
-                    return
-                
-                # Display best strategy
-                st.subheader("🏆 Best Strategy Parameters")
-                col1, col2 = st.columns(2)
-                
-                with col1:
-                    for key, value in list(best_params.items())[:len(best_params)//2]:
-                        st.metric(key.replace('_', ' ').title(), f"{value}")
-                
-                with col2:
-                    for key, value in list(best_params.items())[len(best_params)//2:]:
-                        st.metric(key.replace('_', ' ').title(), f"{value}")
-                
-                # Calculate performance
-                performance = optimizer.calculate_performance(best_trades)
+                # Run backtest
+                backtest = BacktestEngine(analysis_df, signals)
+                trades, final_capital = backtest.run_backtest()
                 
                 # Display backtest results
                 st.subheader("📊 Backtest Results")
                 
-                col1, col2, col3, col4 = st.columns(4)
-                with col1:
-                    st.metric("Total Return", f"{float(performance['total_return']):.2f}%")
-                    st.metric("Number of Trades", int(performance['num_trades']))
-                
-                with col2:
-                    st.metric("Win Rate", f"{float(performance['win_rate']):.1f}%")
-                    st.metric("Winning Trades", int(performance['winning_trades']))
-                
-                with col3:
-                    st.metric("Average Win", f"{float(performance['avg_win']):.2f}%")
-                    st.metric("Losing Trades", int(performance['losing_trades']))
-                
-                with col4:
-                    st.metric("Average Loss", f"{float(performance['avg_loss']):.2f}%")
-                    st.metric("Profit Factor", f"{float(performance['profit_factor']):.2f}")
-                
-                # Additional metrics
-                col1, col2, col3 = st.columns(3)
-                with col1:
-                    st.metric("Max Drawdown", f"{float(performance['max_drawdown']):.2f}%")
-                with col2:
-                    st.metric("Sharpe Ratio", f"{float(performance['sharpe_ratio']):.2f}")
-                with col3:
-                    st.metric("Avg Hold Days", f"{float(performance['avg_hold_days']):.1f}")
-                
-                # Trade details
-                if best_trades:
+                if trades:
+                    trades_df = pd.DataFrame(trades)
+                    
+                    # Summary metrics
+                    total_return = ((final_capital / 100000) - 1) * 100
+                    winning_trades = len([t for t in trades if t['pnl'] > 0])
+                    losing_trades = len([t for t in trades if t['pnl'] < 0])
+                    win_rate = (winning_trades / len(trades)) * 100
+                    avg_hold_days = trades_df['hold_days'].mean()
+                    
+                    # Buy and hold comparison
+                    buy_hold_return = ((analysis_df['close'].iloc[-1] / analysis_df['close'].iloc[0]) - 1) * 100
+                    
+                    metrics_cols = st.columns(5)
+                    with metrics_cols[0]:
+                        st.metric("Total Return", f"{total_return:.2f}%")
+                    with metrics_cols[1]:
+                        st.metric("Win Rate", f"{win_rate:.1f}%")
+                    with metrics_cols[2]:
+                        st.metric("Total Trades", len(trades))
+                    with metrics_cols[3]:
+                        st.metric("Avg Hold Days", f"{avg_hold_days:.1f}")
+                    with metrics_cols[4]:
+                        st.metric("vs Buy & Hold", f"{total_return - buy_hold_return:+.2f}%")
+                    
+                    # Detailed trades
                     st.subheader("📋 Trade Details")
-                    trades_df = pd.DataFrame(best_trades)
-                    trades_df['entry_date'] = pd.to_datetime(trades_df['entry_date']).dt.strftime('%Y-%m-%d')
-                    trades_df['exit_date'] = pd.to_datetime(trades_df['exit_date']).dt.strftime('%Y-%m-%d')
-                    trades_df['position'] = trades_df['position'].map({1: 'Long', -1: 'Short'})
                     
-                    # Format columns
-                    display_trades = trades_df[['entry_date', 'exit_date', 'position', 
-                                              'entry_price', 'exit_price', 'stop_loss', 
-                                              'take_profit', 'pnl', 'exit_reason', 'hold_days']]
-                    
-                    display_trades.columns = ['Entry Date', 'Exit Date', 'Position', 
-                                            'Entry Price', 'Exit Price', 'Stop Loss',
-                                            'Take Profit', 'P&L (%)', 'Exit Reason', 'Hold Days']
-                    
-                    # Format numeric columns
-                    numeric_cols = ['Entry Price', 'Exit Price', 'Stop Loss', 'Take Profit']
-                    for col in numeric_cols:
+                    # Format trades for display
+                    display_trades = trades_df.copy()
+                    for col in ['entry_price', 'exit_price', 'target', 'stop_loss']:
                         display_trades[col] = display_trades[col].round(2)
-                    display_trades['P&L (%)'] = display_trades['P&L (%)'].round(2)
+                    display_trades['pnl'] = display_trades['pnl'].round(2)
+                    display_trades['pnl_pct'] = display_trades['pnl_pct'].round(2)
+                    display_trades['probability'] = (display_trades['probability'] * 100).round(1)
                     
                     st.dataframe(display_trades, use_container_width=True)
-                
-                # Generate live recommendation
-                st.subheader("🎯 Live Recommendation")
-                
-                # Use full data for live recommendation
-                live_df = optimizer.calculate_indicators(best_params)
-                live_signals = optimizer.generate_signals(live_df, best_params)
-                
-                current_signal = int(live_signals['position'].iloc[-1])
-                current_reason = str(live_signals['entry_reason'].iloc[-1])
-                current_probability = float(live_signals['probability'].iloc[-1])
-                
-                if current_signal != 0:
-                    # Calculate levels
-                    current_price = float(live_df['close'].iloc[-1])
-                    current_atr = float(live_df['atr'].iloc[-1])
                     
-                    if current_signal == 1:  # Long
-                        position_type = "🟢 LONG"
-                        stop_loss = current_price - (current_atr * best_params['stop_loss_atr'])
-                        take_profit = current_price + (current_atr * best_params['take_profit_atr'])
-                    else:  # Short
-                        position_type = "🔴 SHORT"
-                        stop_loss = current_price + (current_atr * best_params['stop_loss_atr'])
-                        take_profit = current_price - (current_atr * best_params['take_profit_atr'])
+                    # Live recommendation
+                    st.subheader("🎯 Live Recommendation")
                     
-                    # Calculate risk-reward ratio
-                    if current_signal == 1:
-                        risk = current_price - stop_loss
-                        reward = take_profit - current_price
-                    else:
-                        risk = stop_loss - current_price
-                        reward = current_price - take_profit
+                    # Get latest signal
+                    latest_signals = signals[signals['signal'] != 0].tail(5)
+                    current_price = analysis_df['close'].iloc[-1]
+                    current_date = analysis_df.index[-1]
                     
-                    risk_reward = reward / risk if risk > 0 else 0
-                    
-                    # Display recommendation
-                    col1, col2 = st.columns(2)
-                    
-                    with col1:
-                        st.success(f"**{position_type} SIGNAL DETECTED**")
-                        st.metric("Entry Price", f"${current_price:.2f}")
-                        st.metric("Stop Loss", f"${stop_loss:.2f}")
-                        st.metric("Take Profit", f"${take_profit:.2f}")
-                        st.metric("Risk/Reward Ratio", f"1:{risk_reward:.2f}")
-                    
-                    with col2:
-                        st.metric("Probability of Profit", f"{current_probability*100:.1f}%")
-                        st.metric("Entry Date/Time", f"{live_df.index[-1].strftime('%Y-%m-%d %H:%M')}")
+                    # Check if there's a current signal
+                    if len(latest_signals) > 0:
+                        latest_signal = latest_signals.iloc[-1]
+                        signal_date = latest_signals.index[-1]
                         
-                        # Next trading day
-                        next_day = live_df.index[-1] + pd.Timedelta(days=1)
-                        while next_day.weekday() > 4:  # Skip weekends
-                            next_day += pd.Timedelta(days=1)
-                        st.metric("Recommended Entry Date", next_day.strftime('%Y-%m-%d'))
+                        # Calculate future date for next trading day
+                        next_trading_day = current_date + timedelta(days=1)
+                        while next_trading_day.weekday() > 4:  # Skip weekends
+                            next_trading_day += timedelta(days=1)
                         
-                        # Position size calculation (2% risk)
-                        account_risk = 0.02  # 2% risk
-                        if current_signal == 1:
-                            price_risk = current_price - stop_loss
+                        st.info(f"📅 **Latest Signal Date:** {signal_date.strftime('%Y-%m-%d %H:%M')}")
+                        
+                        if latest_signal['signal'] == 1:
+                            st.success("📈 **LONG Signal Detected**")
+                            signal_type = "LONG"
                         else:
-                            price_risk = stop_loss - current_price
+                            st.error("📉 **SHORT Signal Detected**")
+                            signal_type = "SHORT"
                         
-                        position_size_pct = (account_risk / (price_risk / current_price)) * 100 if price_risk > 0 else 0
-                        st.metric("Suggested Position Size", f"{min(position_size_pct, 10):.1f}% of capital")
+                        # Display recommendation details
+                        rec_cols = st.columns(4)
+                        with rec_cols[0]:
+                            st.metric("Entry Price", f"${latest_signal['price']:.2f}")
+                        with rec_cols[1]:
+                            st.metric("Target", f"${latest_signal['target']:.2f}")
+                        with rec_cols[2]:
+                            st.metric("Stop Loss", f"${latest_signal['stop_loss']:.2f}")
+                        with rec_cols[3]:
+                            st.metric("Win Probability", f"{latest_signal['probability']*100:.1f}%")
+                        
+                        # Risk-Reward calculation
+                        if signal_type == "LONG":
+                            risk = latest_signal['price'] - latest_signal['stop_loss']
+                            reward = latest_signal['target'] - latest_signal['price']
+                        else:
+                            risk = latest_signal['stop_loss'] - latest_signal['price']
+                            reward = latest_signal['price'] - latest_signal['target']
+                        
+                        risk_reward_ratio = reward / risk if risk > 0 else 0
+                        
+                        st.info(f"""
+                        **📊 Trade Analysis:**
+                        - **Signal Strength:** {latest_signal['strength']}/10 indicators confirm
+                        - **Risk-Reward Ratio:** 1:{risk_reward_ratio:.2f}
+                        - **Expected Next Trading Day:** {next_trading_day.strftime('%Y-%m-%d')}
+                        
+                        **🧠 Logic & Reasoning:**
+                        This {signal_type} signal is generated based on {int(latest_signal['strength'])} out of 10 technical indicators aligning, 
+                        including trend analysis, momentum, and volatility measures. The ATR-based stop loss and target 
+                        provide a systematic risk management approach. Historical probability suggests a {latest_signal['probability']*100:.1f}% 
+                        chance of reaching the target before hitting the stop loss.
+                        """)
                     
-                    st.write(f"**Entry Logic:** {current_reason}")
+                    else:
+                        st.warning("⚠️ No recent trading signals detected. Market may be in consolidation.")
                     
-                    # Technical analysis summary
-                    st.write("**Technical Analysis:**")
-                    rsi_current = float(live_df['rsi'].iloc[-1])
-                    macd_current = float(live_df['macd'].iloc[-1])
-                    macd_signal_current = float(live_df['macd_signal'].iloc[-1])
-                    bb_upper_current = float(live_df['bb_upper'].iloc[-1])
-                    bb_lower_current = float(live_df['bb_lower'].iloc[-1])
-                    bb_position = (current_price - bb_lower_current) / (bb_upper_current - bb_lower_current)
+                    # Strategy Summary
+                    st.subheader("📝 Strategy & Backtest Summary")
                     
-                    analysis_text = f"""
-                    - RSI: {rsi_current:.1f} ({'Oversold' if rsi_current < 30 else 'Overbought' if rsi_current > 70 else 'Neutral'})
-                    - MACD: {macd_current:.3f} ({'Above signal' if macd_current > macd_signal_current else 'Below signal'})
-                    - Bollinger Bands: {bb_position:.1%} position ({'Lower band area' if bb_position < 0.2 else 'Upper band area' if bb_position > 0.8 else 'Middle range'})
-                    - Volatility (ATR): ${current_atr:.2f}
+                    backtest_summary = f"""
+                    **🎯 Strategy Performance Analysis:**
+                    
+                    The optimized swing trading strategy achieved a {total_return:.1f}% return compared to {buy_hold_return:.1f}% 
+                    for buy-and-hold, representing a {'significant outperformance' if total_return > buy_hold_return * 1.7 else 'moderate outperformance' if total_return > buy_hold_return else 'underperformance'} 
+                    of {total_return - buy_hold_return:+.1f} percentage points.
+                    
+                    **📊 Key Metrics:**
+                    - **Win Rate:** {win_rate:.1f}% ({winning_trades} wins, {losing_trades} losses)
+                    - **Average Hold Time:** {avg_hold_days:.1f} days
+                    - **Total Trades:** {len(trades)} trades executed
+                    - **Risk Management:** ATR-based stops with {best_params['target_atr_multiplier']}x target and {best_params['sl_atr_multiplier']}x stop loss
+                    
+                    **🚀 Live Trading Recommendations:**
+                    Monitor for signals that meet {best_params['min_conditions']}/10 indicator confirmations with ADX > 25 for trend strength. 
+                    The strategy works best in trending markets and may generate false signals during sideways consolidation. 
+                    Always respect the calculated stop loss levels and position size according to your risk tolerance.
+                    
+                    **⚡ Strategy Optimization:**
+                    Using {optimization_type} search, the system identified optimal parameters focusing on {trade_type} trades. 
+                    The strategy combines trend-following (moving averages), momentum (RSI, MACD), and volatility (Bollinger Bands, ATR) 
+                    indicators for robust signal generation.
                     """
-                    st.write(analysis_text)
                     
-                else:
-                    st.info("🔍 **NO SIGNAL** - Wait for better entry opportunity")
-                    st.write("Current market conditions do not meet the strategy criteria for entry.")
+                    st.markdown(backtest_summary)
                     
-                    # Show current levels anyway
-                    current_price = float(live_df['close'].iloc[-1])
-                    rsi_current = float(live_df['rsi'].iloc[-1])
+                    # Performance Chart
+                    st.subheader("📈 Strategy Performance Visualization")
                     
-                    col1, col2 = st.columns(2)
-                    with col1:
-                        st.metric("Current Price", f"${current_price:.2f}")
-                        st.metric("Current RSI", f"{rsi_current:.1f}")
-                    with col2:
-                        st.metric("MACD", f"{float(live_df['macd'].iloc[-1]):.3f}")
-                        st.metric("Stochastic %K", f"{float(live_df['stoch_k'].iloc[-1]):.1f}")
-                
-                # Strategy summary
-                st.subheader("📈 Strategy Summary")
-                
-                # Calculate buy and hold return for comparison
-                buy_hold_return = ((float(analysis_df['close'].iloc[-1]) - float(analysis_df['close'].iloc[0])) / float(analysis_df['close'].iloc[0])) * 100
-                
-                strategy_summary = f"""
-                **Backtest Analysis Summary:**
-                The optimized strategy generated a total return of {float(performance['total_return']):.2f}% compared to buy-and-hold return of {buy_hold_return:.2f}%.
-                The strategy executed {int(performance['num_trades'])} trades with a win rate of {float(performance['win_rate']):.1f}%.
-                
-                **Strategy Performance:**
-                - {'Outperformed' if float(performance['total_return']) > buy_hold_return else 'Underperformed'} buy-and-hold by {abs(float(performance['total_return']) - buy_hold_return):.2f}%
-                - Average holding period: {float(performance['avg_hold_days']):.1f} days
-                - Risk-adjusted returns (Sharpe): {float(performance['sharpe_ratio']):.2f}
-                - Maximum drawdown: {float(performance['max_drawdown']):.2f}%
-                
-                **Live Trading Recommendation:**
-                {'A ' + ('LONG' if current_signal == 1 else 'SHORT') + ' position is recommended' if current_signal != 0 else 'Wait for better entry conditions'}.
-                {'The strategy shows ' + str(int(current_probability*100)) + '% probability of profit based on current technical indicators.' if current_signal != 0 else 'Monitor key levels and wait for signal confirmation.'}
-                
-                **Risk Management:**
-                - Use stop-loss orders at calculated levels
-                - Position size should not exceed 2-5% risk per trade
-                - Monitor market conditions and adjust if needed
-                - Consider market volatility and news events
-                """
-                
-                st.write(strategy_summary)
-                
-                # Performance chart
-                if best_trades:
-                    st.subheader("📊 Equity Curve")
+                    # Create cumulative returns chart
+                    equity_curve = [100000]  # Starting capital
+                    dates = [analysis_df.index[0]]
                     
-                    trades_df = pd.DataFrame(best_trades)
-                    trades_df['cumulative_pnl'] = trades_df['pnl'].cumsum()
+                    for trade in trades:
+                        equity_curve.append(equity_curve[-1] + trade['pnl'])
+                        dates.append(trade['exit_date'])
+                    
+                    # Buy and hold equity curve
+                    buy_hold_equity = []
+                    for date in analysis_df.index:
+                        if date <= dates[-1] if dates else analysis_df.index[-1]:
+                            price_ratio = analysis_df.loc[date, 'close'] / analysis_df.iloc[0]['close']
+                            buy_hold_equity.append(100000 * price_ratio)
                     
                     fig = go.Figure()
+                    
+                    # Strategy performance
                     fig.add_trace(go.Scatter(
-                        x=trades_df['exit_date'],
-                        y=trades_df['cumulative_pnl'],
-                        mode='lines+markers',
-                        name='Strategy Return',
+                        x=dates[:len(equity_curve)],
+                        y=equity_curve,
+                        mode='lines',
+                        name='Strategy',
                         line=dict(color='green', width=2)
                     ))
                     
+                    # Buy and hold performance
+                    fig.add_trace(go.Scatter(
+                        x=analysis_df.index[:len(buy_hold_equity)],
+                        y=buy_hold_equity,
+                        mode='lines',
+                        name='Buy & Hold',
+                        line=dict(color='blue', width=2)
+                    ))
+                    
                     fig.update_layout(
-                        title="Strategy Equity Curve",
+                        title="Strategy vs Buy & Hold Performance",
                         xaxis_title="Date",
-                        yaxis_title="Cumulative Return (%)",
-                        height=400
+                        yaxis_title="Portfolio Value ($)",
+                        hovermode='x unified'
                     )
                     
                     st.plotly_chart(fig, use_container_width=True)
-                
-                # Download results
-                if best_trades:
-                    st.subheader("💾 Download Results")
                     
-                    # Prepare download data
-                    results_summary = {
-                        'Strategy Parameters': best_params,
-                        'Performance Metrics': performance,
-                        'Live Recommendation': {
-                            'Signal': 'Long' if current_signal == 1 else 'Short' if current_signal == -1 else 'No Signal',
-                            'Entry Price': f"${live_df['close'].iloc[-1]:.2f}" if current_signal != 0 else 'N/A',
-                            'Stop Loss': f"${stop_loss:.2f}" if current_signal != 0 else 'N/A',
-                            'Take Profit': f"${take_profit:.2f}" if current_signal != 0 else 'N/A',
-                            'Probability': f"{current_probability*100:.1f}%" if current_signal != 0 else 'N/A',
-                            'Reason': current_reason if current_signal != 0 else 'No signal conditions met'
-                        }
-                    }
+                    # Entry/Exit points on price chart
+                    fig_trades = go.Figure()
                     
-                    # Convert trades to CSV
-                    trades_csv = pd.DataFrame(best_trades).to_csv(index=False)
+                    # Price chart
+                    fig_trades.add_trace(go.Candlestick(
+                        x=analysis_df.index,
+                        open=analysis_df['open'],
+                        high=analysis_df['high'],
+                        low=analysis_df['low'],
+                        close=analysis_df['close'],
+                        name='Price'
+                    ))
                     
-                    col1, col2 = st.columns(2)
-                    with col1:
-                        st.download_button(
-                            label="📥 Download Trade History (CSV)",
-                            data=trades_csv,
-                            file_name=f"trade_history_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-                            mime="text/csv"
+                    # Add entry points
+                    entry_dates = [trade['entry_date'] for trade in trades]
+                    entry_prices = [trade['entry_price'] for trade in trades]
+                    entry_colors = ['green' if trade['signal'] == 'Long' else 'red' for trade in trades]
+                    
+                    fig_trades.add_trace(go.Scatter(
+                        x=entry_dates,
+                        y=entry_prices,
+                        mode='markers',
+                        name='Entry Points',
+                        marker=dict(
+                            size=10,
+                            color=entry_colors,
+                            symbol='triangle-up',
+                            line=dict(width=2, color='white')
                         )
+                    ))
                     
-                    with col2:
-                        import json
-                        results_json = json.dumps(results_summary, indent=2, default=str)
-                        st.download_button(
-                            label="📥 Download Strategy Report (JSON)",
-                            data=results_json,
-                            file_name=f"strategy_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
-                            mime="application/json"
+                    # Add exit points
+                    exit_dates = [trade['exit_date'] for trade in trades]
+                    exit_prices = [trade['exit_price'] for trade in trades]
+                    
+                    fig_trades.add_trace(go.Scatter(
+                        x=exit_dates,
+                        y=exit_prices,
+                        mode='markers',
+                        name='Exit Points',
+                        marker=dict(
+                            size=8,
+                            color='orange',
+                            symbol='triangle-down',
+                            line=dict(width=2, color='white')
                         )
-                
+                    ))
+                    
+                    fig_trades.update_layout(
+                        title="Trading Signals on Price Chart",
+                        xaxis_title="Date",
+                        yaxis_title="Price ($)",
+                        hovermode='x unified'
+                    )
+                    
+                    st.plotly_chart(fig_trades, use_container_width=True)
+                    
+                else:
+                    st.warning("⚠️ No trades generated with current parameters. Try adjusting the strategy settings.")
+                    
+                    # Still show live recommendation attempt
+                    st.subheader("🎯 Live Market Analysis")
+                    current_price = analysis_df['close'].iloc[-1]
+                    prev_price = analysis_df['close'].iloc[-2]
+                    price_change = ((current_price / prev_price) - 1) * 100
+                    
+                    st.info(f"""
+                    **📊 Current Market Status:**
+                    - **Latest Price:** ${current_price:.2f}
+                    - **Daily Change:** {price_change:+.2f}%
+                    - **Status:** No clear swing trading signals detected
+                    
+                    **💡 Recommendation:** 
+                    Wait for stronger directional momentum or consider adjusting strategy parameters 
+                    for more sensitive signal detection.
+                    """)
+        
         except Exception as e:
-            st.error(f"Error processing data: {str(e)}")
-            st.error("Please check your data format and try again.")
-    
-    else:
-        # Instructions
-        st.info("👆 Please upload a CSV or Excel file with stock data to get started")
-        
-        st.markdown("""
-        ### 📝 Data Format Requirements:
-        
-        Your file should contain columns with OHLCV data. The system will automatically detect and map column names like:
-        - **Open**: 'open', 'open price', 'price open', 'o'
-        - **High**: 'high', 'high price', 'price high', 'h'  
-        - **Low**: 'low', 'low price', 'price low', 'l'
-        - **Close**: 'close', 'close price', 'price close', 'c'
-        - **Volume**: 'volume', 'vol', 'v', 'trading volume' (optional)
-        
-        ### 🚀 Features:
-        
-        ✅ **Automated Analysis**: Upload and get instant recommendations  
-        ✅ **10+ Technical Indicators**: RSI, MACD, Bollinger Bands, Stochastic, ATR, Williams %R, Momentum, CCI, OBV  
-        ✅ **Strategy Optimization**: Grid search or Random search for best parameters  
-        ✅ **Risk Management**: Automatic stop-loss and take-profit calculations  
-        ✅ **Backtesting**: Historical performance analysis with detailed trade log  
-        ✅ **Live Recommendations**: Real-time entry signals with probability scores  
-        ✅ **Visual Analytics**: Interactive charts and performance metrics  
-        ✅ **Export Results**: Download trade history and strategy reports  
-        
-        ### 📊 Example Data Structure:
-        ```
-        Date       | Open  | High  | Low   | Close | Volume
-        2024-01-01 | 100.0 | 102.5 | 99.5  | 101.2 | 1000000
-        2024-01-02 | 101.2 | 103.0 | 100.8 | 102.1 | 1200000
-        ...
-        ```
-        """)
+            st.error(f"❌ Error processing file: {str(e)}")
+            st.info("Please ensure your CSV file contains price data with columns like: Date, Open, High, Low, Close, Volume")
 
 if __name__ == "__main__":
     main()
