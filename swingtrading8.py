@@ -445,8 +445,8 @@ def main():
         col1, col2, col3, col4 = st.columns(4)
         col1.metric("Start Date", min_date.strftime("%Y-%m-%d"))
         col2.metric("End Date", max_date.strftime("%Y-%m-%d"))
-        col3.metric("Min Price", f"${min_price:.2f}")
-        col4.metric("Max Price", f"${max_price:.2f}")
+        #col3.metric("Min Price", f"${min_price:.2f}")
+        #col4.metric("Max Price", f"${max_price:.2f}")
         
         # Plot raw data
         st.subheader("Price Chart")
