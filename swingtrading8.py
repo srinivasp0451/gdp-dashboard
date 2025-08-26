@@ -8,8 +8,8 @@ import seaborn as sns
 import matplotlib.pyplot as plt
 from datetime import datetime, timedelta
 from sklearn.model_selection import ParameterSampler
-from scipy.optimize import differential_evolution
 import warnings
+import random
 warnings.filterwarnings('ignore')
 
 class TechnicalIndicators:
@@ -242,13 +242,17 @@ class TradingStrategy:
         base_prob = 0.6
         
         # Adjust based on trend strength
-        if signal_type == 'long':
-            trend_strength = (df['adx'] / 50).clip(0, 1)
+        if len(df) > 0:
+            if 'adx' in df.columns:
+                trend_strength = (df['adx'].iloc[0] / 50) if not pd.isna(df['adx'].iloc[0]) else 0
+                trend_strength = max(0, min(1, trend_strength))
+            else:
+                trend_strength = 0
         else:
-            trend_strength = (df['adx'] / 50).clip(0, 1)
+            trend_strength = 0
         
         probability = base_prob + (trend_strength * 0.2)
-        return probability.iloc[0] if len(probability) > 0 else base_prob
+        return probability
     
     def backtest_strategy(self, params, signal_type='both', end_date=None):
         """Backtest the trading strategy"""
@@ -346,7 +350,7 @@ def map_columns(df):
     
     return column_mapping
 
-def optimize_parameters(strategy, signal_type, search_type='random', n_trials=100):
+def optimize_parameters(strategy, signal_type, search_type='random', n_trials=50):
     """Optimize strategy parameters using random or grid search"""
     
     # Parameter space
@@ -376,10 +380,6 @@ def optimize_parameters(strategy, signal_type, search_type='random', n_trials=10
     best_return = -np.inf
     best_params = None
     results = []
-    
-    if search_type == 'grid':
-        # Simplified grid search (subset of combinations)
-        n_trials = min(n_trials, 50)  # Limit for performance
     
     # Generate parameter combinations
     param_list = list(ParameterSampler(param_space, n_iter=n_trials, random_state=42))
@@ -424,7 +424,7 @@ def optimize_parameters(strategy, signal_type, search_type='random', n_trials=10
             continue
         
         progress_bar.progress((i + 1) / len(param_list))
-        status_text.text(f'Optimizing... {i+1}/{len(param_list)} trials completed')
+        status_text.text('Optimizing... {}/{} trials completed'.format(i+1, len(param_list)))
     
     progress_bar.empty()
     status_text.empty()
@@ -444,7 +444,7 @@ if uploaded_file is not None:
     # Read data
     try:
         df = pd.read_csv(uploaded_file)
-        st.success(f"Data uploaded successfully! Shape: {df.shape}")
+        st.success("Data uploaded successfully! Shape: {}".format(df.shape))
         
         # Column mapping
         column_mapping = map_columns(df)
@@ -472,7 +472,7 @@ if uploaded_file is not None:
         required_cols = ['open', 'high', 'low', 'close', 'volume']
         missing_cols = [col for col in required_cols if col not in df_mapped.columns]
         if missing_cols:
-            st.error(f"Missing required columns: {missing_cols}")
+            st.error("Missing required columns: {}".format(missing_cols))
             st.stop()
         
         # Display basic info
@@ -492,9 +492,9 @@ if uploaded_file is not None:
         with col2:
             st.metric("Max Date", df_mapped.index.max().strftime('%Y-%m-%d'))
         with col3:
-            st.metric("Min Price", f"${df_mapped['close'].min():.2f}")
+            st.metric("Min Price", "${:.2f}".format(df_mapped['close'].min()))
         with col4:
-            st.metric("Max Price", f"${df_mapped['close'].max():.2f}")
+            st.metric("Max Price", "${:.2f}".format(df_mapped['close'].max()))
         
         # Plot raw data
         st.subheader("📈 Raw Price Data")
@@ -548,16 +548,16 @@ if uploaded_file is not None:
         volatility = df_mapped['close'].pct_change().std() * np.sqrt(252) * 100
         avg_volume = df_mapped['volume'].mean()
         
-        summary_text = f"""
+        summary_text = """
         Based on the uploaded stock data analysis:
         
-        The stock shows a total return of {total_return:.2f}% over the analyzed period with an annualized volatility of {volatility:.2f}%. 
-        The average daily trading volume is {avg_volume:,.0f} shares. The price has ranged from ${df_mapped['close'].min():.2f} to ${df_mapped['close'].max():.2f}.
+        The stock shows a total return of {:.2f}% over the analyzed period with an annualized volatility of {:.2f}%. 
+        The average daily trading volume is {:,.0f} shares. The price has ranged from ${:.2f} to ${:.2f}.
         
         Key opportunities identified include potential swing trading setups based on technical indicators. The data quality appears suitable for 
         automated trading strategy development. The system will analyze multiple technical indicators to identify optimal entry and exit points 
         with calculated risk-reward ratios for both long and short positions.
-        """
+        """.format(total_return, volatility, avg_volume, df_mapped['close'].min(), df_mapped['close'].max())
         
         st.write(summary_text)
         
@@ -604,11 +604,11 @@ if uploaded_file is not None:
                         with col1:
                             st.metric("Total Trades", total_trades)
                         with col2:
-                            st.metric("Win Rate", f"{win_rate:.1f}%")
+                            st.metric("Win Rate", "{:.1f}%".format(win_rate))
                         with col3:
-                            st.metric("Total Return", f"{total_return:.2f}%")
+                            st.metric("Total Return", "{:.2f}%".format(total_return))
                         with col4:
-                            st.metric("Avg Hold Days", f"{avg_hold_duration:.1f}")
+                            st.metric("Avg Hold Days", "{:.1f}".format(avg_hold_duration))
                         
                         col1, col2, col3 = st.columns(3)
                         with col1:
@@ -616,7 +616,7 @@ if uploaded_file is not None:
                         with col2:
                             st.metric("Losing Trades", losing_trades)
                         with col3:
-                            st.metric("Buy & Hold Return", f"{buy_hold_return:.2f}%")
+                            st.metric("Buy & Hold Return", "{:.2f}%".format(buy_hold_return))
                         
                         # Detailed trades table
                         st.subheader("📋 Trade Details")
@@ -641,8 +641,6 @@ if uploaded_file is not None:
                         
                         # Check current market conditions
                         current_data = latest_indicators.iloc[-1]
-                        
-                        # Generate recommendation based on current conditions
                         current_price = current_data['close']
                         
                         # Check for potential signals based on current conditions
@@ -679,13 +677,13 @@ if uploaded_file is not None:
                             target_price = current_price * (1 + best_params['target_pct'])
                             stop_loss = current_price * (1 - best_params['stop_loss_pct'])
                             probability = 0.6 + (long_score / 10)
-                            reason = f"Long signal: MA bullish ({long_score}/4 indicators positive), RSI: {current_data['rsi']:.1f}, MACD above signal"
+                            reason = "Long signal: MA bullish ({}/4 indicators positive), RSI: {:.1f}, MACD above signal".format(long_score, current_data['rsi'])
                         elif signal_type == 'short' or (signal_type == 'both' and short_score > long_score):
                             signal_direction = 'SHORT'
                             target_price = current_price * (1 - best_params['target_pct'])
                             stop_loss = current_price * (1 + best_params['stop_loss_pct'])
                             probability = 0.6 + (short_score / 10)
-                            reason = f"Short signal: MA bearish ({short_score}/4 indicators negative), RSI: {current_data['rsi']:.1f}, MACD below signal"
+                            reason = "Short signal: MA bearish ({}/4 indicators negative), RSI: {:.1f}, MACD below signal".format(short_score, current_data['rsi'])
                         else:
                             signal_direction = 'HOLD'
                             target_price = current_price
@@ -696,10 +694,10 @@ if uploaded_file is not None:
                         recommendation = {
                             'date': next_date.strftime('%Y-%m-%d'),
                             'signal': signal_direction,
-                            'entry_price': f"${current_price:.2f}",
-                            'target_price': f"${target_price:.2f}",
-                            'stop_loss': f"${stop_loss:.2f}",
-                            'probability': f"{probability:.1%}",
+                            'entry_price': "${:.2f}".format(current_price),
+                            'target_price': "${:.2f}".format(target_price),
+                            'stop_loss': "${:.2f}".format(stop_loss),
+                            'probability': "{:.1%}".format(probability),
                             'reason': reason
                         }
                         
@@ -719,37 +717,48 @@ if uploaded_file is not None:
                         else:
                             performance_status = "⚠️ NEEDS IMPROVEMENT"
                         
-                        summary_text = f"""
+                        summary_text = """
                         **Backtest Analysis Summary:**
                         
-                        The optimized trading strategy generated {total_trades} trades over the backtesting period with a {win_rate:.1f}% success rate.
-                        The strategy achieved a total return of {total_return:.2f}% compared to a buy-and-hold return of {buy_hold_return:.2f}%.
+                        The optimized trading strategy generated {} trades over the backtesting period with a {:.1f}% success rate.
+                        The strategy achieved a total return of {:.2f}% compared to a buy-and-hold return of {:.2f}%.
                         
-                        **Performance Rating:** {performance_status}
-                        **Strategy Improvement:** {performance_improvement:.1f}% vs buy-and-hold
+                        **Performance Rating:** {}
+                        **Strategy Improvement:** {:.1f}% vs buy-and-hold
                         
                         **Key Strategy Components:**
-                        - Moving Average crossovers (SMA: {best_params['sma_short']}/{best_params['sma_long']}, EMA: {best_params['ema_short']}/{best_params['ema_long']})
-                        - RSI momentum filter ({best_params['rsi_window']}-period)
-                        - MACD trend confirmation ({best_params['macd_fast']}/{best_params['macd_slow']}/{best_params['macd_signal']})
+                        - Moving Average crossovers (SMA: {}/{}, EMA: {}/{})
+                        - RSI momentum filter ({}-period)
+                        - MACD trend confirmation ({}/{}/{})
                         - Bollinger Bands volatility filter
                         - Multiple oscillator confirmations
                         
                         **Risk Management:**
-                        - Target: {best_params['target_pct']*100:.1f}% profit
-                        - Stop Loss: {best_params['stop_loss_pct']*100:.1f}% risk
-                        - Average holding period: {avg_hold_duration:.1f} days
+                        - Target: {:.1f}% profit
+                        - Stop Loss: {:.1f}% risk
+                        - Average holding period: {:.1f} days
                         
                         **Live Trading Recommendation:**
-                        Current market conditions suggest a {recommendation['signal']} position with {recommendation['probability']} probability of success.
-                        The recommendation is based on confluence of multiple technical indicators showing {reason.split(':')[1] if ':' in reason else 'mixed signals'}.
+                        Current market conditions suggest a {} position with {} probability of success.
+                        The recommendation is based on confluence of multiple technical indicators.
                         
                         **Next Steps:**
-                        1. Monitor the recommended entry level: {recommendation['entry_price']}
-                        2. Set target at: {recommendation['target_price']}
-                        3. Place stop loss at: {recommendation['stop_loss']}
+                        1. Monitor the recommended entry level: {}
+                        2. Set target at: {}
+                        3. Place stop loss at: {}
                         4. Review and adjust position size based on risk tolerance
-                        """
+                        """.format(
+                            total_trades, win_rate, total_return, buy_hold_return,
+                            performance_status, performance_improvement,
+                            best_params['sma_short'], best_params['sma_long'],
+                            best_params['ema_short'], best_params['ema_long'],
+                            best_params['rsi_window'],
+                            best_params['macd_fast'], best_params['macd_slow'], best_params['macd_signal'],
+                            best_params['target_pct']*100, best_params['stop_loss_pct']*100,
+                            avg_hold_duration,
+                            recommendation['signal'], recommendation['probability'],
+                            recommendation['entry_price'], recommendation['target_price'], recommendation['stop_loss']
+                        )
                         
                         st.write(summary_text)
                         
@@ -772,12 +781,12 @@ if uploaded_file is not None:
                         )
                         fig.add_trace(
                             go.Scatter(x=indicators_df.index, y=indicators_df['sma_short'], 
-                                     name=f'SMA {best_params["sma_short"]}', line=dict(color='blue')),
+                                     name='SMA {}'.format(best_params["sma_short"]), line=dict(color='blue')),
                             row=1, col=1
                         )
                         fig.add_trace(
                             go.Scatter(x=indicators_df.index, y=indicators_df['sma_long'], 
-                                     name=f'SMA {best_params["sma_long"]}', line=dict(color='red')),
+                                     name='SMA {}'.format(best_params["sma_long"]), line=dict(color='red')),
                             row=1, col=1
                         )
                         
@@ -788,14 +797,14 @@ if uploaded_file is not None:
                             fig.add_trace(
                                 go.Scatter(x=[trade['entry_date']], y=[trade['entry_price']], 
                                          mode='markers', marker=dict(color=color, size=10, symbol='triangle-up'),
-                                         name=f'{trade["signal_type"].title()} Entry', showlegend=False),
+                                         name='{} Entry'.format(trade["signal_type"].title()), showlegend=False),
                                 row=1, col=1
                             )
                             # Exit points
                             fig.add_trace(
                                 go.Scatter(x=[trade['exit_date']], y=[trade['exit_price']], 
                                          mode='markers', marker=dict(color=color, size=10, symbol='triangle-down'),
-                                         name=f'{trade["signal_type"].title()} Exit', showlegend=False),
+                                         name='{} Exit'.format(trade["signal_type"].title()), showlegend=False),
                                 row=1, col=1
                             )
                         
@@ -861,7 +870,7 @@ if uploaded_file is not None:
                     st.error("Optimization failed. Please check your data and try again.")
                     
     except Exception as e:
-        st.error(f"Error processing file: {str(e)}")
+        st.error("Error processing file: {}".format(str(e)))
         st.write("Please ensure your CSV file contains the required columns: Open, High, Low, Close, Volume, and Date")
 
 else:
