@@ -557,9 +557,9 @@ def main():
             with col2:
                 st.metric("Date Range", f"{df.index.min().strftime('%Y-%m-%d')} to {df.index.max().strftime('%Y-%m-%d')}")
             with col3:
-                st.metric("Max Price", f"${df['high'].max():.2f}")
+                st.metric("Max Price", f"${float(df['high'].max()):.2f}")
             with col4:
-                st.metric("Min Price", f"${df['low'].min():.2f}")
+                st.metric("Min Price", f"${float(df['low'].min()):.2f}")
             
             # Display data sample
             st.subheader("📋 Data Sample")
@@ -655,16 +655,21 @@ def main():
                 
                 # Generate summary
                 st.subheader("📝 Data Summary")
-                current_price = analysis_df['close'].iloc[-1]
-                price_change = (current_price - analysis_df['close'].iloc[-2]) / analysis_df['close'].iloc[-2] * 100
+                current_price = float(analysis_df['close'].iloc[-1])
+                prev_price = float(analysis_df['close'].iloc[-2])
+                price_change = (current_price - prev_price) / prev_price * 100
+                min_price = float(analysis_df['low'].min())
+                max_price = float(analysis_df['high'].max())
+                avg_volume = float(analysis_df.get('volume', pd.Series([0])).mean()) if 'volume' in analysis_df.columns else 0
+                volatility = float(analysis_df['close'].std() / analysis_df['close'].mean()) if len(analysis_df) > 1 else 0
                 
                 summary_text = f"""
                 The stock data shows a current price of ${current_price:.2f} with a recent change of {price_change:.2f}%. 
-                The stock has traded between ${analysis_df['low'].min():.2f} and ${analysis_df['high'].max():.2f} in the analyzed period.
-                Average daily volume is {analysis_df.get('volume', pd.Series([0])).mean():,.0f} shares.
-                The stock shows {'high' if analysis_df['close'].std()/analysis_df['close'].mean() > 0.02 else 'moderate'} volatility.
+                The stock has traded between ${min_price:.2f} and ${max_price:.2f} in the analyzed period.
+                Average daily volume is {avg_volume:,.0f} shares.
+                The stock shows {'high' if volatility > 0.02 else 'moderate'} volatility.
                 Recent price action suggests {'bullish' if price_change > 0 else 'bearish'} momentum in the short term.
-                Technical analysis indicates potential {'swing trading' if analysis_df['close'].std()/analysis_df['close'].mean() > 0.015 else 'trend following'} opportunities.
+                Technical analysis indicates potential {'swing trading' if volatility > 0.015 else 'trend following'} opportunities.
                 """
                 
                 st.write(summary_text)
@@ -701,29 +706,29 @@ def main():
                 
                 col1, col2, col3, col4 = st.columns(4)
                 with col1:
-                    st.metric("Total Return", f"{performance['total_return']:.2f}%")
-                    st.metric("Number of Trades", performance['num_trades'])
+                    st.metric("Total Return", f"{float(performance['total_return']):.2f}%")
+                    st.metric("Number of Trades", int(performance['num_trades']))
                 
                 with col2:
-                    st.metric("Win Rate", f"{performance['win_rate']:.1f}%")
-                    st.metric("Winning Trades", performance['winning_trades'])
+                    st.metric("Win Rate", f"{float(performance['win_rate']):.1f}%")
+                    st.metric("Winning Trades", int(performance['winning_trades']))
                 
                 with col3:
-                    st.metric("Average Win", f"{performance['avg_win']:.2f}%")
-                    st.metric("Losing Trades", performance['losing_trades'])
+                    st.metric("Average Win", f"{float(performance['avg_win']):.2f}%")
+                    st.metric("Losing Trades", int(performance['losing_trades']))
                 
                 with col4:
-                    st.metric("Average Loss", f"{performance['avg_loss']:.2f}%")
-                    st.metric("Profit Factor", f"{performance['profit_factor']:.2f}")
+                    st.metric("Average Loss", f"{float(performance['avg_loss']):.2f}%")
+                    st.metric("Profit Factor", f"{float(performance['profit_factor']):.2f}")
                 
                 # Additional metrics
                 col1, col2, col3 = st.columns(3)
                 with col1:
-                    st.metric("Max Drawdown", f"{performance['max_drawdown']:.2f}%")
+                    st.metric("Max Drawdown", f"{float(performance['max_drawdown']):.2f}%")
                 with col2:
-                    st.metric("Sharpe Ratio", f"{performance['sharpe_ratio']:.2f}")
+                    st.metric("Sharpe Ratio", f"{float(performance['sharpe_ratio']):.2f}")
                 with col3:
-                    st.metric("Avg Hold Days", f"{performance['avg_hold_days']:.1f}")
+                    st.metric("Avg Hold Days", f"{float(performance['avg_hold_days']):.1f}")
                 
                 # Trade details
                 if best_trades:
@@ -757,14 +762,14 @@ def main():
                 live_df = optimizer.calculate_indicators(best_params)
                 live_signals = optimizer.generate_signals(live_df, best_params)
                 
-                current_signal = live_signals['position'].iloc[-1]
-                current_reason = live_signals['entry_reason'].iloc[-1]
-                current_probability = live_signals['probability'].iloc[-1]
+                current_signal = int(live_signals['position'].iloc[-1])
+                current_reason = str(live_signals['entry_reason'].iloc[-1])
+                current_probability = float(live_signals['probability'].iloc[-1])
                 
                 if current_signal != 0:
                     # Calculate levels
-                    current_price = live_df['close'].iloc[-1]
-                    current_atr = live_df['atr'].iloc[-1]
+                    current_price = float(live_df['close'].iloc[-1])
+                    current_atr = float(live_df['atr'].iloc[-1])
                     
                     if current_signal == 1:  # Long
                         position_type = "🟢 LONG"
@@ -819,13 +824,16 @@ def main():
                     
                     # Technical analysis summary
                     st.write("**Technical Analysis:**")
-                    rsi_current = live_df['rsi'].iloc[-1]
-                    macd_current = live_df['macd'].iloc[-1]
-                    bb_position = (current_price - live_df['bb_lower'].iloc[-1]) / (live_df['bb_upper'].iloc[-1] - live_df['bb_lower'].iloc[-1])
+                    rsi_current = float(live_df['rsi'].iloc[-1])
+                    macd_current = float(live_df['macd'].iloc[-1])
+                    macd_signal_current = float(live_df['macd_signal'].iloc[-1])
+                    bb_upper_current = float(live_df['bb_upper'].iloc[-1])
+                    bb_lower_current = float(live_df['bb_lower'].iloc[-1])
+                    bb_position = (current_price - bb_lower_current) / (bb_upper_current - bb_lower_current)
                     
                     analysis_text = f"""
                     - RSI: {rsi_current:.1f} ({'Oversold' if rsi_current < 30 else 'Overbought' if rsi_current > 70 else 'Neutral'})
-                    - MACD: {macd_current:.3f} ({'Above signal' if macd_current > live_df['macd_signal'].iloc[-1] else 'Below signal'})
+                    - MACD: {macd_current:.3f} ({'Above signal' if macd_current > macd_signal_current else 'Below signal'})
                     - Bollinger Bands: {bb_position:.1%} position ({'Lower band area' if bb_position < 0.2 else 'Upper band area' if bb_position > 0.8 else 'Middle range'})
                     - Volatility (ATR): ${current_atr:.2f}
                     """
@@ -836,33 +844,33 @@ def main():
                     st.write("Current market conditions do not meet the strategy criteria for entry.")
                     
                     # Show current levels anyway
-                    current_price = live_df['close'].iloc[-1]
-                    rsi_current = live_df['rsi'].iloc[-1]
+                    current_price = float(live_df['close'].iloc[-1])
+                    rsi_current = float(live_df['rsi'].iloc[-1])
                     
                     col1, col2 = st.columns(2)
                     with col1:
                         st.metric("Current Price", f"${current_price:.2f}")
                         st.metric("Current RSI", f"{rsi_current:.1f}")
                     with col2:
-                        st.metric("MACD", f"{live_df['macd'].iloc[-1]:.3f}")
-                        st.metric("Stochastic %K", f"{live_df['stoch_k'].iloc[-1]:.1f}")
+                        st.metric("MACD", f"{float(live_df['macd'].iloc[-1]):.3f}")
+                        st.metric("Stochastic %K", f"{float(live_df['stoch_k'].iloc[-1]):.1f}")
                 
                 # Strategy summary
                 st.subheader("📈 Strategy Summary")
                 
                 # Calculate buy and hold return for comparison
-                buy_hold_return = ((analysis_df['close'].iloc[-1] - analysis_df['close'].iloc[0]) / analysis_df['close'].iloc[0]) * 100
+                buy_hold_return = ((float(analysis_df['close'].iloc[-1]) - float(analysis_df['close'].iloc[0])) / float(analysis_df['close'].iloc[0])) * 100
                 
                 strategy_summary = f"""
                 **Backtest Analysis Summary:**
-                The optimized strategy generated a total return of {performance['total_return']:.2f}% compared to buy-and-hold return of {buy_hold_return:.2f}%.
-                The strategy executed {performance['num_trades']} trades with a win rate of {performance['win_rate']:.1f}%.
+                The optimized strategy generated a total return of {float(performance['total_return']):.2f}% compared to buy-and-hold return of {buy_hold_return:.2f}%.
+                The strategy executed {int(performance['num_trades'])} trades with a win rate of {float(performance['win_rate']):.1f}%.
                 
                 **Strategy Performance:**
-                - {'Outperformed' if performance['total_return'] > buy_hold_return else 'Underperformed'} buy-and-hold by {abs(performance['total_return'] - buy_hold_return):.2f}%
-                - Average holding period: {performance['avg_hold_days']:.1f} days
-                - Risk-adjusted returns (Sharpe): {performance['sharpe_ratio']:.2f}
-                - Maximum drawdown: {performance['max_drawdown']:.2f}%
+                - {'Outperformed' if float(performance['total_return']) > buy_hold_return else 'Underperformed'} buy-and-hold by {abs(float(performance['total_return']) - buy_hold_return):.2f}%
+                - Average holding period: {float(performance['avg_hold_days']):.1f} days
+                - Risk-adjusted returns (Sharpe): {float(performance['sharpe_ratio']):.2f}
+                - Maximum drawdown: {float(performance['max_drawdown']):.2f}%
                 
                 **Live Trading Recommendation:**
                 {'A ' + ('LONG' if current_signal == 1 else 'SHORT') + ' position is recommended' if current_signal != 0 else 'Wait for better entry conditions'}.
