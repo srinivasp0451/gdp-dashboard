@@ -554,10 +554,10 @@ def main():
             st.metric("Min Date", df['date'].min().strftime('%Y-%m-%d'))
         with col2:
             st.metric("Max Date", df['date'].max().strftime('%Y-%m-%d'))
-        with col3:
-            st.metric("Min Price", f"${df['close'].min():.2f}")
-        with col4:
-            st.metric("Max Price", f"${df['close'].max():.2f}")
+        #with col3:
+        #    st.metric("Min Price", f"${df['close'].min():.2f}")
+        #with col4:
+        #    st.metric("Max Price", f"${df['close'].max():.2f}")
         
         # Plot raw data
         st.subheader("📈 Price Chart")
