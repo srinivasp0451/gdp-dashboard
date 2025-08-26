@@ -8,8 +8,6 @@ from sklearn.model_selection import ParameterGrid, ParameterSampler
 
 st.set_page_config(page_title='Swing Trade Recommendations', layout='wide')
 
-# --- Utility Functions ---
-
 def map_columns(cols):
     col_map = {}
     for c in cols:
@@ -73,8 +71,7 @@ def calc_stoch(high, low, close, k_period=14, d_period=3):
     return stoch_k, stoch_d
 
 def calc_indicators(df, col_map):
-    # Convert numeric columns safely
-    numeric_cols = [col_map[k] for k in ['open','high','low','close','volume'] if k in col_map]
+    numeric_cols = [col_map[k] for k in ['open', 'high', 'low', 'close', 'volume'] if k in col_map]
     df = convert_to_float(df, numeric_cols)
 
     close = df[col_map['close']]
@@ -86,15 +83,17 @@ def calc_indicators(df, col_map):
     df['macd'] = df['ema_12'] - df['ema_26']
     df['macd_signal'] = df['macd'].ewm(span=9, adjust=False).mean()
     df['rsi_14'] = calc_rsi(close, 14)
-    df['bb_mid'] = close.rolling(window=20).mean()
-    df['bb_std'] = close.rolling(window=20).std()
-    df['bb_upper'] = df['bb_mid'] + 2*df['bb_std']
-    df['bb_lower'] = df['bb_mid'] - 2*df['bb_std']
+    df['bb_mid'] = close.rolling(20).mean()
+    df['bb_std'] = close.rolling(20).std()
+    df['bb_upper'] = df['bb_mid'] + 2 * df['bb_std']
+    df['bb_lower'] = df['bb_mid'] - 2 * df['bb_std']
     df['atr_14'] = calc_atr(high, low, close, 14)
     df['adx_14'] = calc_adx(high, low, close, 14)
-    df['willr_14'] = ((high.rolling(14).max() - close) / (high.rolling(14).max() - low.rolling(14).min())) * -100
+    df['willr_14'] = ((high.rolling(14).max() - close) /
+                      (high.rolling(14).max() - low.rolling(14).min())) * -100
     df['stoch_k'], df['stoch_d'] = calc_stoch(high, low, close, 14, 3)
-    df['cci_14'] = ((close - (high.rolling(14).max() + low.rolling(14).min() + close.rolling(14).mean()) / 3) / (0.015 * close.rolling(14).std()))
+    df['cci_14'] = ((close - (high.rolling(14).max() + low.rolling(14).min() + close.rolling(14).mean()) / 3) /
+                    (0.015 * close.rolling(14).std()))
     df['roc_10'] = close.pct_change(periods=10)
     df['sma_20'] = close.rolling(20).mean()
     return df
@@ -131,8 +130,10 @@ def signal_gen(row, params, side):
     elif side == 'short' and short_cond:
         return -1
     elif side == 'both':
-        if long_cond: return 1
-        elif short_cond: return -1
+        if long_cond:
+            return 1
+        elif short_cond:
+            return -1
     return 0
 
 def reason_gen(row, side):
@@ -163,18 +164,19 @@ def backtest(df, params, side, col_map, risk_pct=0.02):
         signal = signal_gen(row, params, side)
 
         if in_trade:
+            last_close = row[col_map['close']]
             if trade['side'] == 'long':
-                if row[col_map['close']] >= trade['target'] or row[col_map['close']] <= trade['sl']:
+                if last_close >= trade['target'] or last_close <= trade['sl']:
                     trade['exit'] = row[col_map['date']]
-                    trade['exit_price'] = row[col_map['close']]
+                    trade['exit_price'] = last_close
                     trade['pnl'] = trade['exit_price'] - trade['entry_price']
                     trade['duration'] = (trade['exit'] - trade['entry']).days
                     trades.append(trade)
                     in_trade = False
-            elif trade['side'] == 'short':
-                if row[col_map['close']] <= trade['target'] or row[col_map['close']] >= trade['sl']:
+            else:
+                if last_close <= trade['target'] or last_close >= trade['sl']:
                     trade['exit'] = row[col_map['date']]
-                    trade['exit_price'] = row[col_map['close']]
+                    trade['exit_price'] = last_close
                     trade['pnl'] = trade['entry_price'] - trade['exit_price']
                     trade['duration'] = (trade['exit'] - trade['entry']).days
                     trades.append(trade)
@@ -237,11 +239,11 @@ def summary_text(df, trades):
             f"Strategy shows {'strong' if acc > 0.6 else 'moderate'} edge versus buy-and-hold.")
 
 def live_recommendation(df, params, col_map, side):
-    last_row = df.iloc[-1]
-    signal = signal_gen(last_row, params, side)
+    row = df.iloc[-1]
+    signal = signal_gen(row, params, side)
 
-    entry = last_row[col_map['date']] + timedelta(days=1)
-    price = last_row[col_map['close']]
+    entry = row[col_map['date']] + timedelta(days=1)
+    price = row[col_map['close']]
     risk_pct = 0.02
 
     if signal == 1:
@@ -251,7 +253,7 @@ def live_recommendation(df, params, col_map, side):
             'side': 'long',
             'target': price * (1 + risk_pct),
             'sl': price * (1 - risk_pct),
-            'reason': reason_gen(last_row, 'long'),
+            'reason': reason_gen(row, 'long'),
             'probability': 0.7
         }
     elif signal == -1:
@@ -261,7 +263,7 @@ def live_recommendation(df, params, col_map, side):
             'side': 'short',
             'target': price * (1 - risk_pct),
             'sl': price * (1 + risk_pct),
-            'reason': reason_gen(last_row, 'short'),
+            'reason': reason_gen(row, 'short'),
             'probability': 0.7
         }
     else:
@@ -273,29 +275,23 @@ def live_recommendation(df, params, col_map, side):
         }
 
 # --- Streamlit UI ---
+
 st.title("Swing Trading Live Recommendations and Backtest")
 
 uploaded_file = st.file_uploader("Upload OHLC(V) data CSV or XLSX", type=["csv", "xlsx"])
 
 if uploaded_file:
-    try:
-        if uploaded_file.name.endswith(".csv"):
-            df = pd.read_csv(uploaded_file)
-        else:
-            df = pd.read_excel(uploaded_file)
-    except Exception as e:
-        st.error(f"File reading error: {e}")
-        st.stop()
+    if uploaded_file.name.endswith('.csv'):
+        df = pd.read_csv(uploaded_file)
+    else:
+        df = pd.read_excel(uploaded_file)
 
     col_map = map_columns(df.columns)
     if 'date' not in col_map:
         st.error("Date column not found.")
         st.stop()
 
-    try:
-        df[col_map['date']] = pd.to_datetime(df[col_map['date']], errors='coerce')
-    except Exception:
-        df[col_map['date']] = pd.to_datetime(df[col_map['date']], errors='coerce')
+    df[col_map['date']] = pd.to_datetime(df[col_map['date']], errors='coerce')
 
     df = df.dropna(subset=[col_map['date']])
     df = df.sort_values(by=col_map['date']).reset_index(drop=True)
@@ -316,7 +312,6 @@ if uploaded_file:
     ax.set_ylabel("Price")
     st.pyplot(fig)
 
-    # EDA and Heatmap
     df['year'] = df[col_map['date']].dt.year
     df['month'] = df[col_map['date']].dt.month
     returns = df[col_map['close']].pct_change().groupby([df['year'], df['month']]).sum().unstack()
@@ -330,7 +325,6 @@ if uploaded_file:
         f"Summary: Data covers {df['year'].min()} to {df['year'].max()} with {len(df)} records. Volatility: {np.round(df[col_map['close']].std(),2)}."
     )
 
-    # UI options
     end_date = st.date_input("Select End Date for Backtest & Live Recommendation", value=df[col_map['date']].max())
     side = st.selectbox("Select Position Side", ["long", "short", "both"])
     opt_method = st.radio("Optimization Method", ["random", "grid"], index=0)
@@ -376,8 +370,8 @@ if uploaded_file:
 
         st.write("### Recommendation Summary")
         st.markdown(
-            f"Backtest generated {len(trades)} trades with total profit {trades['pnl'].sum() if not trades.empty else 0:.2f}. "
-            f"Strategy outperformed buy-and-hold with accuracy {(trades['pnl'] > 0).mean() if len(trades) > 0 else 0:.2%}. "
+            f"Backtest generated {len(trades)} trades with total profit {trades['pnl'].sum():.2f}. "
+            f"Strategy outperformed buy-and-hold with accuracy {(trades['pnl'] > 0).mean():.2%}. "
             "Follow live signals for best chances of profitable swing trades using robust optimized indicators."
         )
     else:
@@ -385,4 +379,3 @@ if uploaded_file:
 
 else:
     st.info("Please upload an OHLCV data file (CSV or XLSX format) containing Date, Open, High, Low, Close, Volume columns.")
-
