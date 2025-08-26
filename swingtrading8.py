@@ -329,36 +329,81 @@ class TradingApp:
         
     def map_columns(self, df):
         """Map uploaded columns to standard format"""
-        columns = df.columns.str.lower()
+        st.write("**Original columns found:**", list(df.columns))
+        
         column_mapping = {}
         
-        # Define possible variations for each required column
+        # Define possible variations for each required column (more comprehensive)
         mappings = {
-            'open': ['open', 'open_price', 'openPrice', 'o'],
-            'high': ['high', 'high_price', 'highPrice', 'h'],
-            'low': ['low', 'low_price', 'lowPrice', 'l'],
-            'close': ['close', 'close_price', 'closePrice', 'c'],
-            'volume': ['volume', 'vol', 'v']
+            'open': ['open', 'open_price', 'openprice', 'o', 'opening', 'opening_price'],
+            'high': ['high', 'high_price', 'highprice', 'h', 'hi', 'high_value'],
+            'low': ['low', 'low_price', 'lowprice', 'l', 'lo', 'low_value'],
+            'close': ['close', 'close_price', 'closeprice', 'c', 'closing', 'closing_price', 'adj_close', 'adjclose', 'adj close'],
+            'volume': ['volume', 'vol', 'v', 'volumes', 'trade_volume', 'trading_volume']
         }
         
+        # Find matching columns
         for standard_name, variations in mappings.items():
-            for col in columns:
+            found = False
+            for original_col in df.columns:
+                original_lower = original_col.lower().strip()
                 for variation in variations:
-                    if variation.lower() in col.lower():
-                        column_mapping[df.columns[columns.get_loc(col)]] = standard_name
+                    if variation.lower() in original_lower or original_lower in variation.lower():
+                        column_mapping[original_col] = standard_name
+                        found = True
                         break
-                if standard_name in column_mapping.values():
+                if found:
                     break
+        
+        st.write("**Column mapping detected:**", column_mapping)
         
         # Rename columns
         df_mapped = df.rename(columns=column_mapping)
         
-        # Ensure we have required columns
+        # Check for required columns
         required_cols = ['open', 'high', 'low', 'close', 'volume']
+        available_cols = [col for col in required_cols if col in df_mapped.columns]
         missing_cols = [col for col in required_cols if col not in df_mapped.columns]
         
+        st.write("**Available columns after mapping:**", available_cols)
+        
         if missing_cols:
-            st.error(f"Missing required columns: {missing_cols}")
+            st.error(f"❌ Missing required columns: {missing_cols}")
+            st.write("**Available columns in your file:**", list(df.columns))
+            st.write("**Please ensure your CSV contains these columns (any case/naming):**")
+            st.write("- Open price (open, Open, OPEN, open_price, etc.)")
+            st.write("- High price (high, High, HIGH, high_price, etc.)")  
+            st.write("- Low price (low, Low, LOW, low_price, etc.)")
+            st.write("- Close price (close, Close, CLOSE, close_price, adj_close, etc.)")
+            st.write("- Volume (volume, Volume, VOLUME, vol, etc.)")
+            
+            # Try manual column selection
+            st.subheader("🔧 Manual Column Mapping")
+            st.write("Please manually select which columns correspond to each price field:")
+            
+            manual_mapping = {}
+            cols = st.columns(5)
+            
+            with cols[0]:
+                manual_mapping['open'] = st.selectbox("Select OPEN column:", [''] + list(df.columns))
+            with cols[1]:
+                manual_mapping['high'] = st.selectbox("Select HIGH column:", [''] + list(df.columns))
+            with cols[2]:
+                manual_mapping['low'] = st.selectbox("Select LOW column:", [''] + list(df.columns))
+            with cols[3]:
+                manual_mapping['close'] = st.selectbox("Select CLOSE column:", [''] + list(df.columns))
+            with cols[4]:
+                manual_mapping['volume'] = st.selectbox("Select VOLUME column:", [''] + list(df.columns))
+            
+            if st.button("Apply Manual Mapping"):
+                reverse_mapping = {v: k for k, v in manual_mapping.items() if v}
+                if len(reverse_mapping) >= 4:  # At least OHLC
+                    df_mapped = df.rename(columns=reverse_mapping)
+                    missing_cols = [col for col in required_cols if col not in df_mapped.columns]
+                    if not missing_cols:
+                        st.success("✅ Manual mapping successful!")
+                        return df_mapped[available_cols if 'volume' not in df_mapped.columns else required_cols]
+                
             return None
             
         return df_mapped[required_cols]
@@ -529,33 +574,98 @@ def main():
                 return
             
             # Try to parse date index
-            if 'date' in df.columns.str.lower() or df.index.name and 'date' in str(df.index.name).lower():
+            date_column_found = False
+            
+            # Look for date column in various ways
+            date_candidates = []
+            for col in df.columns:
+                if any(word in col.lower() for word in ['date', 'time', 'timestamp', 'datetime']):
+                    date_candidates.append(col)
+            
+            if date_candidates:
                 try:
-                    date_col = [col for col in df.columns if 'date' in col.lower()][0]
+                    date_col = date_candidates[0]
                     processed_df.index = pd.to_datetime(df[date_col])
-                except:
-                    processed_df.index = pd.to_datetime(df.index)
-            else:
-                processed_df.index = pd.to_datetime(df.index)
+                    date_column_found = True
+                    st.success(f"✅ Using '{date_col}' as date column")
+                except Exception as e:
+                    st.warning(f"⚠️ Could not parse date column '{date_col}': {str(e)}")
+            
+            # Try to parse index as date
+            if not date_column_found:
+                try:
+                    processed_df.index = pd.to_datetime(processed_df.index)
+                    st.info("ℹ️ Using row index as date (assuming it contains dates)")
+                except Exception as e:
+                    st.warning("⚠️ Could not parse index as dates, using sequential numbering")
+                    processed_df.index = pd.RangeIndex(len(processed_df))
+            
+            # Validate data types
+            numeric_cols = ['open', 'high', 'low', 'close', 'volume']
+            for col in numeric_cols:
+                if col in processed_df.columns:
+                    try:
+                        processed_df[col] = pd.to_numeric(processed_df[col], errors='coerce')
+                    except Exception as e:
+                        st.warning(f"⚠️ Could not convert {col} to numeric: {str(e)}")
+            
+            # Remove rows with NaN values
+            initial_rows = len(processed_df)
+            processed_df = processed_df.dropna()
+            final_rows = len(processed_df)
+            
+            if initial_rows != final_rows:
+                st.info(f"ℹ️ Removed {initial_rows - final_rows} rows with missing data")
+            
+            if len(processed_df) < 100:
+                st.error("❌ Insufficient data for analysis. Need at least 100 rows.")
+                return
             
             # Sort by date to prevent data leakage
             processed_df = processed_df.sort_index()
             
-            st.success("✅ Data successfully mapped and sorted!")
+            # Show basic info about processed data
+            st.subheader("📋 Data Processing Summary")
+            info_cols = st.columns(4)
+            with info_cols[0]:
+                st.metric("Total Rows", len(processed_df))
+            with info_cols[1]:
+                st.metric("Columns", len(processed_df.columns))
+            with info_cols[2]:
+                st.metric("Date Range", f"{(processed_df.index.max() - processed_df.index.min()).days} days")
+            with info_cols[3]:
+                st.metric("Data Quality", f"{(1 - processed_df.isnull().sum().sum() / (len(processed_df) * len(processed_df.columns))):.1%}")
             
-            # Show date range
-            st.info(f"📅 Data Range: {processed_df.index.min().strftime('%Y-%m-%d')} to {processed_df.index.max().strftime('%Y-%m-%d')}")
+            # Show sample of processed data
+            st.write("**Processed Data Sample:**")
+            st.dataframe(processed_df.head(3))
             
-            # End date selection
+            # End date selection with better validation
+            min_date = processed_df.index.min().date() if hasattr(processed_df.index.min(), 'date') else processed_df.index.min()
+            max_date = processed_df.index.max().date() if hasattr(processed_df.index.max(), 'date') else processed_df.index.max()
+            
             end_date = st.date_input(
                 "Select End Date for Analysis",
-                value=processed_df.index.max().date(),
-                min_value=processed_df.index.min().date(),
-                max_value=processed_df.index.max().date()
+                value=max_date,
+                min_value=min_date,
+                max_value=max_date,
+                help="Choose end date to test strategy on historical data"
             )
             
             # Filter data up to end date
-            analysis_df = processed_df[processed_df.index.date <= end_date].copy()
+            if hasattr(processed_df.index, 'date'):
+                analysis_df = processed_df[processed_df.index.date <= end_date].copy()
+            else:
+                # Handle case where index is not datetime
+                try:
+                    analysis_df = processed_df.iloc[:int(len(processed_df) * 0.8)].copy()  # Use 80% of data as fallback
+                    st.info("ℹ️ Using 80% of data for analysis (date filtering not available)")
+                except:
+                    analysis_df = processed_df.copy()
+            
+            if len(analysis_df) < 50:
+                st.error("❌ Insufficient data for the selected date range. Please select a later end date.")
+                return
             
             # Trading parameters
             col1, col2 = st.columns(2)
