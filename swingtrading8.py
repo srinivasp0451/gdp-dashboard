@@ -42,8 +42,8 @@ def RSI(series, n=14):
     delta = series.diff()
     gain = np.where(delta > 0, delta, 0)
     loss = np.where(delta < 0, -delta, 0)
-    gain_ema = pd.Series(gain).ewm(span=n, adjust=False).mean()
-    loss_ema = pd.Series(loss).ewm(span=n, adjust=False).mean()
+    gain_ema = pd.Series(gain, index=series.index).ewm(span=n, adjust=False).mean()
+    loss_ema = pd.Series(loss, index=series.index).ewm(span=n, adjust=False).mean()
     rs = gain_ema / (loss_ema + 1e-10)
     return 100 - (100 / (1 + rs))
 
@@ -100,7 +100,6 @@ def OBV(df):
 # Strategy & Backtest
 # -------------------------------
 def generate_signals(df, params):
-    # Apply indicators
     df['SMA'] = SMA(df['Close'], params['sma'])
     df['EMA'] = EMA(df['Close'], params['ema'])
     df['RSI'] = RSI(df['Close'], params['rsi'])
@@ -114,16 +113,13 @@ def generate_signals(df, params):
 
     signals = []
     for i in range(len(df)):
-        reason = []
         if i == 0: 
             signals.append(None)
             continue
         if df['RSI'].iloc[i] < 30 and df['Close'].iloc[i] < df['BB_low'].iloc[i]:
             signals.append("BUY")
-            reason.append("Oversold with Bollinger support")
         elif df['RSI'].iloc[i] > 70 and df['Close'].iloc[i] > df['BB_up'].iloc[i]:
             signals.append("SELL")
-            reason.append("Overbought with Bollinger resistance")
         else:
             signals.append(None)
     df['Signal'] = signals
@@ -133,7 +129,7 @@ def backtest(df, params, side="both"):
     df = generate_signals(df.copy(), params)
     trades = []
     position = None
-    entry_price, entry_date, signal_reason = None, None, None
+    entry_price, entry_date = None, None
     atr_mult = 1.5
 
     for i in range(len(df)):
@@ -160,7 +156,6 @@ def backtest(df, params, side="both"):
                 trades.append({"EntryDate":entry_date,"EntryPrice":entry_price,"Type":"Short",
                                "Target":target,"SL":sl,"Reason":"RSI/Bollinger Sell Signal"})
         elif position is not None:
-            # exit on opposite signal
             if (position=="long" and sig=="SELL") or (position=="short" and sig=="BUY"):
                 exit_price = price
                 exit_date = date
@@ -218,8 +213,7 @@ There were {summary['PositiveTrades']} profitable trades and {summary['LossTrade
 resulting in a net PnL of {summary['TotalPnL']:.2f}. 
 The analysis suggests potential swing opportunities when RSI crosses oversold/overbought zones in 
 conjunction with Bollinger bands. Risk management with ATR-based stop-loss and targets is recommended. 
-Optimized indicator parameters provide a strategy that aims to outperform simple buy-and-hold by a large margin, 
-highlighting that disciplined swing trading could yield better returns than passive investing."""
+Optimized indicator parameters provide a strategy that aims to outperform simple buy-and-hold by a large margin."""
     return text
 
 # -------------------------------
@@ -234,7 +228,7 @@ if file:
     else:
         df = pd.read_excel(file)
 
-    # Column mapping
+    # Column mapping & cleaning
     mapping = map_columns(df)
     df = df.rename(columns={
         mapping["open"]:"Open",
@@ -243,11 +237,22 @@ if file:
         mapping["close"]:"Close",
         mapping["volume"]:"Volume"
     })
-    if 'Date' not in df.columns:
-        df['Date'] = pd.to_datetime(df.index)
-    else:
-        df['Date'] = pd.to_datetime(df['Date'])
 
+    # Convert to numeric
+    for col in ["Open","High","Low","Close","Volume"]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col].astype(str).str.replace(",","").str.strip(), errors="coerce")
+
+    # Parse date
+    if 'Date' not in df.columns:
+        df['Date'] = pd.to_datetime(df.index, errors="coerce")
+    else:
+        df['Date'] = pd.to_datetime(df['Date'], errors="coerce")
+
+    # Drop missing
+    df = df.dropna(subset=["Date","Close"]).reset_index(drop=True)
+
+    # Sort ascending
     df = df.sort_values("Date").reset_index(drop=True)
 
     st.subheader("Raw Data Preview")
@@ -262,10 +267,11 @@ if file:
     df['Year'] = df['Date'].dt.year
     df['Month'] = df['Date'].dt.month
     df['Return'] = df['Close'].pct_change()
-    pivot = df.pivot_table(values="Return", index="Year", columns="Month", aggfunc="mean")
-    fig, ax = plt.subplots()
-    sns.heatmap(pivot, annot=True, fmt=".2%", cmap="RdYlGn", ax=ax)
-    st.pyplot(fig)
+    if len(df['Year'].unique()) > 1:
+        pivot = df.pivot_table(values="Return", index="Year", columns="Month", aggfunc="mean")
+        fig, ax = plt.subplots()
+        sns.heatmap(pivot, annot=True, fmt=".2%", cmap="RdYlGn", ax=ax)
+        st.pyplot(fig)
 
     # End date selection
     end_date = st.date_input("Select End Date for Backtest", df['Date'].max())
@@ -293,6 +299,7 @@ if file:
     df_live = generate_signals(df.copy(), best_params)
     last_signal = df_live['Signal'].iloc[-1]
     if last_signal:
-        st.success(f"Recommendation for {last_date.date()}: {last_signal} at {last_price:.2f}")
+        st.success(f"Recommendation for {last_date.date()}: {last_signal} at {last_price:.2f} "
+                   f"(Confidence: {summary['Accuracy']:.1f}%)")
     else:
         st.info(f"No clear recommendation for {last_date.date()}")
