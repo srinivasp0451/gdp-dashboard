@@ -27,11 +27,20 @@ class TechnicalIndicators:
     
     @staticmethod
     def rsi(data, period=14):
+        st.write(f"🔢 Calculating RSI with period {period}")
+        st.write(f"RSI input data type: {data.dtype}")
+        st.write(f"RSI input sample: {data.head().tolist()}")
+        
         delta = data.diff()
         gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
         loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
-        rs = gain / loss
-        return 100 - (100 / (1 + rs))
+        
+        # Handle division by zero
+        rs = gain / loss.replace(0, np.nan)
+        rsi_result = 100 - (100 / (1 + rs))
+        
+        st.write(f"RSI calculated successfully. Sample values: {rsi_result.dropna().head().tolist()}")
+        return rsi_result
     
     @staticmethod
     def bollinger_bands(data, period=20, std=2):
@@ -52,25 +61,50 @@ class TechnicalIndicators:
     
     @staticmethod
     def stochastic(high, low, close, k_period=14, d_period=3):
+        st.write(f"📊 Calculating Stochastic with K={k_period}, D={d_period}")
+        
         lowest_low = low.rolling(window=k_period).min()
         highest_high = high.rolling(window=k_period).max()
-        k_percent = 100 * ((close - lowest_low) / (highest_high - lowest_low))
+        
+        # Handle division by zero
+        range_diff = highest_high - lowest_low
+        range_diff = range_diff.replace(0, np.nan)
+        
+        k_percent = 100 * ((close - lowest_low) / range_diff)
         d_percent = k_percent.rolling(window=d_period).mean()
+        
+        st.write(f"Stochastic calculated. K sample: {k_percent.dropna().head().tolist()}")
         return k_percent, d_percent
     
     @staticmethod
     def williams_r(high, low, close, period=14):
+        st.write(f"📈 Calculating Williams %R with period {period}")
+        
         highest_high = high.rolling(window=period).max()
         lowest_low = low.rolling(window=period).min()
-        wr = -100 * (highest_high - close) / (highest_high - lowest_low)
+        
+        # Handle division by zero
+        range_diff = highest_high - lowest_low
+        range_diff = range_diff.replace(0, np.nan)
+        
+        wr = -100 * (highest_high - close) / range_diff
+        
+        st.write(f"Williams %R calculated. Sample: {wr.dropna().head().tolist()}")
         return wr
     
     @staticmethod
     def cci(high, low, close, period=20):
+        st.write(f"🎯 Calculating CCI with period {period}")
+        
         tp = (high + low + close) / 3
         sma_tp = tp.rolling(window=period).mean()
         mad = tp.rolling(window=period).apply(lambda x: np.mean(np.abs(x - x.mean())))
-        cci = (tp - sma_tp) / (0.015 * mad)
+        
+        # Handle division by zero
+        mad_nonzero = mad.replace(0, np.nan)
+        cci = (tp - sma_tp) / (0.015 * mad_nonzero)
+        
+        st.write(f"CCI calculated. Sample: {cci.dropna().head().tolist()}")
         return cci
     
     @staticmethod
@@ -83,6 +117,8 @@ class TechnicalIndicators:
     
     @staticmethod
     def adx(high, low, close, period=14):
+        st.write(f"📊 Calculating ADX with period {period}")
+        
         plus_dm = high.diff()
         minus_dm = low.diff()
         plus_dm[plus_dm < 0] = 0
@@ -95,12 +131,19 @@ class TechnicalIndicators:
         tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
         
         atr = tr.rolling(window=period).mean()
-        plus_di = 100 * (plus_dm.rolling(window=period).mean() / atr)
-        minus_di = 100 * (minus_dm.rolling(window=period).mean() / atr)
         
-        dx = 100 * abs(plus_di - minus_di) / (plus_di + minus_di)
+        # Handle division by zero
+        atr_nonzero = atr.replace(0, np.nan)
+        plus_di = 100 * (plus_dm.rolling(window=period).mean() / atr_nonzero)
+        minus_di = 100 * (minus_dm.rolling(window=period).mean() / atr_nonzero)
+        
+        # Handle division by zero for DX calculation
+        di_sum = plus_di + minus_di
+        di_sum_nonzero = di_sum.replace(0, np.nan)
+        dx = 100 * abs(plus_di - minus_di) / di_sum_nonzero
         adx = dx.rolling(window=period).mean()
         
+        st.write(f"ADX calculated. Sample ADX: {adx.dropna().head().tolist()}")
         return adx, plus_di, minus_di
 
 class SwingTradingStrategy:
@@ -108,37 +151,75 @@ class SwingTradingStrategy:
         self.indicators = TechnicalIndicators()
         
     def calculate_all_indicators(self, df, params):
+        st.write("🔄 **Starting indicator calculations...**")
+        st.write(f"DataFrame shape: {df.shape}")
+        st.write(f"DataFrame columns: {list(df.columns)}")
+        
         df = df.copy()
         
-        # Moving Averages
-        df['SMA_fast'] = self.indicators.sma(df['close'], params['sma_fast'])
-        df['SMA_slow'] = self.indicators.sma(df['close'], params['sma_slow'])
-        df['EMA_fast'] = self.indicators.ema(df['close'], params['ema_fast'])
-        df['EMA_slow'] = self.indicators.ema(df['close'], params['ema_slow'])
+        # Ensure all price columns are numeric
+        price_cols = ['open', 'high', 'low', 'close', 'volume']
+        for col in price_cols:
+            if col in df.columns:
+                st.write(f"Checking data type for {col}: {df[col].dtype}")
+                if df[col].dtype == 'object':
+                    st.write(f"Converting {col} to numeric...")
+                    df[col] = pd.to_numeric(df[col], errors='coerce')
+                    st.write(f"After conversion {col} dtype: {df[col].dtype}")
         
-        # Oscillators
-        df['RSI'] = self.indicators.rsi(df['close'], params['rsi_period'])
-        df['Stoch_K'], df['Stoch_D'] = self.indicators.stochastic(
-            df['high'], df['low'], df['close'], params['stoch_k'], params['stoch_d'])
-        df['Williams_R'] = self.indicators.williams_r(
-            df['high'], df['low'], df['close'], params['williams_period'])
-        df['CCI'] = self.indicators.cci(
-            df['high'], df['low'], df['close'], params['cci_period'])
-        
-        # MACD
-        df['MACD'], df['MACD_Signal'], df['MACD_Histogram'] = self.indicators.macd(
-            df['close'], params['macd_fast'], params['macd_slow'], params['macd_signal'])
-        
-        # Bollinger Bands
-        df['BB_Upper'], df['BB_Middle'], df['BB_Lower'] = self.indicators.bollinger_bands(
-            df['close'], params['bb_period'], params['bb_std'])
-        
-        # Volatility and Trend
-        df['ATR'] = self.indicators.atr(df['high'], df['low'], df['close'], params['atr_period'])
-        df['ADX'], df['DI_Plus'], df['DI_Minus'] = self.indicators.adx(
-            df['high'], df['low'], df['close'], params['adx_period'])
-        
-        return df
+        try:
+            # Moving Averages
+            st.write("📈 Calculating Moving Averages...")
+            df['SMA_fast'] = self.indicators.sma(df['close'], params['sma_fast'])
+            df['SMA_slow'] = self.indicators.sma(df['close'], params['sma_slow'])
+            df['EMA_fast'] = self.indicators.ema(df['close'], params['ema_fast'])
+            df['EMA_slow'] = self.indicators.ema(df['close'], params['ema_slow'])
+            
+            # Oscillators
+            st.write("🌊 Calculating Oscillators...")
+            df['RSI'] = self.indicators.rsi(df['close'], params['rsi_period'])
+            df['Stoch_K'], df['Stoch_D'] = self.indicators.stochastic(
+                df['high'], df['low'], df['close'], params['stoch_k'], params['stoch_d'])
+            df['Williams_R'] = self.indicators.williams_r(
+                df['high'], df['low'], df['close'], params['williams_period'])
+            df['CCI'] = self.indicators.cci(
+                df['high'], df['low'], df['close'], params['cci_period'])
+            
+            # MACD
+            st.write("📊 Calculating MACD...")
+            df['MACD'], df['MACD_Signal'], df['MACD_Histogram'] = self.indicators.macd(
+                df['close'], params['macd_fast'], params['macd_slow'], params['macd_signal'])
+            
+            # Bollinger Bands
+            st.write("📏 Calculating Bollinger Bands...")
+            df['BB_Upper'], df['BB_Middle'], df['BB_Lower'] = self.indicators.bollinger_bands(
+                df['close'], params['bb_period'], params['bb_std'])
+            
+            # Volatility and Trend
+            st.write("📈 Calculating ATR and ADX...")
+            df['ATR'] = self.indicators.atr(df['high'], df['low'], df['close'], params['atr_period'])
+            df['ADX'], df['DI_Plus'], df['DI_Minus'] = self.indicators.adx(
+                df['high'], df['low'], df['close'], params['adx_period'])
+            
+            st.write("✅ All indicators calculated successfully!")
+            st.write(f"Final DataFrame shape: {df.shape}")
+            
+            # Check for any remaining NaN or infinity values
+            for col in df.columns:
+                if df[col].dtype in ['float64', 'int64']:
+                    nan_count = df[col].isna().sum()
+                    inf_count = np.isinf(df[col]).sum()
+                    if nan_count > 0 or inf_count > 0:
+                        st.write(f"⚠️ {col}: {nan_count} NaN, {inf_count} infinite values")
+            
+            return df
+            
+        except Exception as e:
+            st.error(f"❌ Error calculating indicators: {str(e)}")
+            st.write(f"Error details: {type(e).__name__}")
+            import traceback
+            st.write(f"Traceback: {traceback.format_exc()}")
+            raise
     
     def generate_signals(self, df, params, direction='both'):
         df = self.calculate_all_indicators(df, params)
@@ -191,6 +272,11 @@ class BacktestEngine:
         self.initial_capital = initial_capital
         
     def run_backtest(self, df, strategy_params, direction='both'):
+        st.write(f"🚀 **Starting backtest...**")
+        st.write(f"Backtest data shape: {df.shape}")
+        st.write(f"Direction: {direction}")
+        st.write(f"Initial capital: ${self.initial_capital:,}")
+        
         results = []
         capital = self.initial_capital
         position = 0
@@ -198,125 +284,199 @@ class BacktestEngine:
         entry_date = None
         trades = []
         
+        # Ensure we have signals
+        if 'signal' not in df.columns:
+            st.error("❌ No signal column found in DataFrame")
+            return [], capital
+        
+        signal_counts = df['signal'].value_counts()
+        st.write(f"Signal distribution: {dict(signal_counts)}")
+        
         for i in range(1, len(df)):
-            current_row = df.iloc[i]
-            prev_row = df.iloc[i-1]
+            try:
+                current_row = df.iloc[i]
+                prev_row = df.iloc[i-1]
+                
+                # Entry logic
+                if position == 0 and current_row['signal'] != 0:
+                    position = int(current_row['signal'])  # Ensure integer
+                    entry_price = float(current_row['close'])  # Ensure float
+                    entry_date = current_row['date']
+                    
+                    # Calculate targets and stop loss
+                    atr = float(current_row['ATR']) if not pd.isna(current_row['ATR']) else entry_price * 0.02
+                    
+                    if position == 1:  # Long
+                        target = entry_price * (1 + strategy_params['long_target_pct'] / 100)
+                        stop_loss = entry_price * (1 - strategy_params['long_sl_pct'] / 100)
+                    else:  # Short
+                        target = entry_price * (1 - strategy_params['short_target_pct'] / 100)
+                        stop_loss = entry_price * (1 + strategy_params['short_sl_pct'] / 100)
+                    
+                    trade_info = {
+                        'entry_date': entry_date,
+                        'entry_price': entry_price,
+                        'position': position,
+                        'target': target,
+                        'stop_loss': stop_loss,
+                        'atr': atr
+                    }
+                    
+                    if i % 50 == 0:  # Log every 50th entry
+                        st.write(f"Entry at index {i}: {position} position at ${entry_price:.2f}")
+                
+                # Exit logic
+                elif position != 0:
+                    exit_triggered = False
+                    exit_reason = ""
+                    exit_price = float(current_row['close'])
+                    
+                    current_high = float(current_row['high'])
+                    current_low = float(current_row['low'])
+                    
+                    if position == 1:  # Long position
+                        if current_high >= target:
+                            exit_price = target
+                            exit_reason = "Target Hit"
+                            exit_triggered = True
+                        elif current_low <= stop_loss:
+                            exit_price = stop_loss
+                            exit_reason = "Stop Loss Hit"
+                            exit_triggered = True
+                        elif current_row['signal'] == -1:
+                            exit_reason = "Signal Reversal"
+                            exit_triggered = True
+                    
+                    elif position == -1:  # Short position
+                        if current_low <= target:
+                            exit_price = target
+                            exit_reason = "Target Hit"
+                            exit_triggered = True
+                        elif current_high >= stop_loss:
+                            exit_price = stop_loss
+                            exit_reason = "Stop Loss Hit"
+                            exit_triggered = True
+                        elif current_row['signal'] == 1:
+                            exit_reason = "Signal Reversal"
+                            exit_triggered = True
+                    
+                    if exit_triggered:
+                        # Calculate PnL
+                        if position == 1:
+                            pnl = (exit_price - entry_price) / entry_price
+                        else:
+                            pnl = (entry_price - exit_price) / entry_price
+                        
+                        capital = capital * (1 + pnl)
+                        hold_days = (current_row['date'] - entry_date).days
+                        
+                        trade_info.update({
+                            'exit_date': current_row['date'],
+                            'exit_price': exit_price,
+                            'exit_reason': exit_reason,
+                            'pnl_pct': pnl * 100,
+                            'capital': capital,
+                            'hold_days': hold_days
+                        })
+                        
+                        trades.append(trade_info)
+                        position = 0
+                        
+                        if len(trades) % 10 == 0:  # Log every 10th trade
+                            st.write(f"Trade #{len(trades)}: {exit_reason}, PnL: {pnl*100:.2f}%")
             
-            # Entry logic
-            if position == 0 and current_row['signal'] != 0:
-                position = current_row['signal']
-                entry_price = current_row['close']
-                entry_date = current_row['date']
-                
-                # Calculate targets and stop loss
-                atr = current_row['ATR']
-                if position == 1:  # Long
-                    target = entry_price * (1 + strategy_params['long_target_pct'] / 100)
-                    stop_loss = entry_price * (1 - strategy_params['long_sl_pct'] / 100)
-                else:  # Short
-                    target = entry_price * (1 - strategy_params['short_target_pct'] / 100)
-                    stop_loss = entry_price * (1 + strategy_params['short_sl_pct'] / 100)
-                
-                trade_info = {
-                    'entry_date': entry_date,
-                    'entry_price': entry_price,
-                    'position': position,
-                    'target': target,
-                    'stop_loss': stop_loss,
-                    'atr': atr
-                }
-                
-            # Exit logic
-            elif position != 0:
-                exit_triggered = False
-                exit_reason = ""
-                exit_price = current_row['close']
-                
-                if position == 1:  # Long position
-                    if current_row['high'] >= target:
-                        exit_price = target
-                        exit_reason = "Target Hit"
-                        exit_triggered = True
-                    elif current_row['low'] <= stop_loss:
-                        exit_price = stop_loss
-                        exit_reason = "Stop Loss Hit"
-                        exit_triggered = True
-                    elif current_row['signal'] == -1:
-                        exit_reason = "Signal Reversal"
-                        exit_triggered = True
-                
-                elif position == -1:  # Short position
-                    if current_row['low'] <= target:
-                        exit_price = target
-                        exit_reason = "Target Hit"
-                        exit_triggered = True
-                    elif current_row['high'] >= stop_loss:
-                        exit_price = stop_loss
-                        exit_reason = "Stop Loss Hit"
-                        exit_triggered = True
-                    elif current_row['signal'] == 1:
-                        exit_reason = "Signal Reversal"
-                        exit_triggered = True
-                
-                if exit_triggered:
-                    # Calculate PnL
-                    if position == 1:
-                        pnl = (exit_price - entry_price) / entry_price
-                    else:
-                        pnl = (entry_price - exit_price) / entry_price
-                    
-                    capital = capital * (1 + pnl)
-                    hold_days = (current_row['date'] - entry_date).days
-                    
-                    trade_info.update({
-                        'exit_date': current_row['date'],
-                        'exit_price': exit_price,
-                        'exit_reason': exit_reason,
-                        'pnl_pct': pnl * 100,
-                        'capital': capital,
-                        'hold_days': hold_days
-                    })
-                    
-                    trades.append(trade_info)
-                    position = 0
+            except Exception as e:
+                st.write(f"❌ Error at index {i}: {str(e)}")
+                continue
+        
+        st.write(f"✅ Backtest completed!")
+        st.write(f"Total trades executed: {len(trades)}")
+        st.write(f"Final capital: ${capital:,.2f}")
         
         return trades, capital
     
     def calculate_metrics(self, trades, df):
+        st.write(f"📊 **Calculating performance metrics...**")
+        st.write(f"Number of trades: {len(trades)}")
+        
         if not trades:
+            st.write("⚠️ No trades to analyze")
             return {}
         
-        total_trades = len(trades)
-        winning_trades = [t for t in trades if t['pnl_pct'] > 0]
-        losing_trades = [t for t in trades if t['pnl_pct'] < 0]
+        try:
+            total_trades = len(trades)
+            winning_trades = [t for t in trades if t['pnl_pct'] > 0]
+            losing_trades = [t for t in trades if t['pnl_pct'] < 0]
+            
+            win_rate = len(winning_trades) / total_trades * 100 if total_trades > 0 else 0
+            avg_win = np.mean([t['pnl_pct'] for t in winning_trades]) if winning_trades else 0
+            avg_loss = np.mean([t['pnl_pct'] for t in losing_trades]) if losing_trades else 0
+            
+            total_return = (trades[-1]['capital'] / 100000 - 1) * 100
+            
+            # Buy and hold return - ensure numeric calculation
+            first_price = float(df['close'].iloc[0])
+            last_price = float(df['close'].iloc[-1])
+            buy_hold_return = (last_price / first_price - 1) * 100
+            
+            # Average holding period
+            avg_hold_days = np.mean([t['hold_days'] for t in trades])
+            
+            # Profit factor calculation
+            if losing_trades and avg_loss != 0:
+                profit_factor = abs((avg_win * len(winning_trades)) / (avg_loss * len(losing_trades)))
+            else:
+                profit_factor = float('inf')
+            
+            metrics = {
+                'total_trades': total_trades,
+                'winning_trades': len(winning_trades),
+                'losing_trades': len(losing_trades),
+                'win_rate': win_rate,
+                'avg_win': avg_win,
+                'avg_loss': avg_loss,
+                'total_return': total_return,
+                'buy_hold_return': buy_hold_return,
+                'avg_hold_days': avg_hold_days,
+                'profit_factor': profit_factor
+            }
+            
+            st.write(f"✅ Metrics calculated: Win rate: {win_rate:.1f}%, Total return: {total_return:.2f}%")
+            return metrics
+            
+        except Exception as e:
+            st.error(f"❌ Error calculating metrics: {str(e)}")
+            import traceback
+            st.write(f"Traceback: {traceback.format_exc()}")
+            return {}
+
+def clean_numeric_data(value):
+    """Clean and convert numeric data to float"""
+    if pd.isna(value) or value == '':
+        return np.nan
+    
+    if isinstance(value, (int, float)):
+        return float(value)
+    
+    if isinstance(value, str):
+        # Remove commas, spaces, and other non-numeric characters except decimal point
+        cleaned = str(value).replace(',', '').replace(' ', '').strip()
+        # Remove currency symbols and percentage signs
+        cleaned = cleaned.replace('$', '').replace('%', '').replace('₹', '').replace('€', '')
         
-        win_rate = len(winning_trades) / total_trades * 100
-        avg_win = np.mean([t['pnl_pct'] for t in winning_trades]) if winning_trades else 0
-        avg_loss = np.mean([t['pnl_pct'] for t in losing_trades]) if losing_trades else 0
-        
-        total_return = (trades[-1]['capital'] / 100000 - 1) * 100
-        
-        # Buy and hold return
-        buy_hold_return = (df['close'].iloc[-1] / df['close'].iloc[0] - 1) * 100
-        
-        # Average holding period
-        avg_hold_days = np.mean([t['hold_days'] for t in trades])
-        
-        return {
-            'total_trades': total_trades,
-            'winning_trades': len(winning_trades),
-            'losing_trades': len(losing_trades),
-            'win_rate': win_rate,
-            'avg_win': avg_win,
-            'avg_loss': avg_loss,
-            'total_return': total_return,
-            'buy_hold_return': buy_hold_return,
-            'avg_hold_days': avg_hold_days,
-            'profit_factor': abs(avg_win * len(winning_trades) / (avg_loss * len(losing_trades))) if losing_trades else float('inf')
-        }
+        try:
+            return float(cleaned)
+        except ValueError:
+            st.write(f"⚠️ Warning: Could not convert '{value}' to float")
+            return np.nan
+    
+    return np.nan
 
 def map_columns(df):
-    """Map various column names to standardized format"""
+    """Map various column names to standardized format and clean data"""
+    st.write("🔍 **Starting column mapping process...**")
+    st.write(f"Original columns: {list(df.columns)}")
+    
     column_mapping = {}
     
     for col in df.columns:
@@ -335,11 +495,37 @@ def map_columns(df):
         elif 'date' in col_lower or 'time' in col_lower or col_lower in ['timestamp', 'datetime']:
             column_mapping[col] = 'date'
     
+    st.write(f"Column mapping: {column_mapping}")
+    
     df_renamed = df.rename(columns=column_mapping)
+    st.write(f"Columns after mapping: {list(df_renamed.columns)}")
+    
+    # Clean numeric columns
+    numeric_cols = ['open', 'high', 'low', 'close', 'volume']
+    for col in numeric_cols:
+        if col in df_renamed.columns:
+            st.write(f"🧹 Cleaning numeric data in column: {col}")
+            st.write(f"Sample original values in {col}: {df_renamed[col].head().tolist()}")
+            
+            df_renamed[col] = df_renamed[col].apply(clean_numeric_data)
+            
+            st.write(f"Sample cleaned values in {col}: {df_renamed[col].head().tolist()}")
+            st.write(f"Data type after cleaning {col}: {df_renamed[col].dtype}")
+            
+            # Check for NaN values
+            nan_count = df_renamed[col].isna().sum()
+            if nan_count > 0:
+                st.write(f"⚠️ Warning: {nan_count} NaN values found in {col}")
+    
     return df_renamed
 
 def optimize_strategy(df, direction, search_type, n_iterations=50):
     """Optimize strategy parameters using grid search or random search"""
+    
+    st.write(f"🔧 **Starting optimization with {search_type}...**")
+    st.write(f"Data shape for optimization: {df.shape}")
+    st.write(f"Direction: {direction}")
+    st.write(f"Iterations: {n_iterations}")
     
     param_ranges = {
         'sma_fast': [5, 10, 15, 20],
@@ -377,12 +563,82 @@ def optimize_strategy(df, direction, search_type, n_iterations=50):
     best_return = -float('inf')
     best_params = None
     best_metrics = None
+    successful_tests = 0
+    failed_tests = 0
     
     if search_type == "Grid Search":
+        st.write("🔍 Starting Grid Search...")
         # Reduced parameter space for grid search
         reduced_ranges = {k: v[:2] for k, v in param_ranges.items()}
         param_combinations = list(product(*reduced_ranges.values()))
         random.shuffle(param_combinations)
+        param_combinations = param_combinations[:n_iterations]
+        
+        for i, params_tuple in enumerate(param_combinations):
+            if i % 10 == 0:  # Progress update every 10 iterations
+                st.write(f"Progress: {i}/{len(param_combinations)} combinations tested")
+            
+            params = dict(zip(reduced_ranges.keys(), params_tuple))
+            
+            try:
+                st.write(f"Testing parameters: {params}")
+                df_with_signals = strategy.generate_signals(df, params, direction.lower())
+                trades, final_capital = backtest.run_backtest(df_with_signals, params, direction.lower())
+                
+                if trades:
+                    metrics = backtest.calculate_metrics(trades, df_with_signals)
+                    successful_tests += 1
+                    st.write(f"✅ Test successful. Return: {metrics['total_return']:.2f}%")
+                    
+                    if metrics['total_return'] > best_return:
+                        best_return = metrics['total_return']
+                        best_params = params
+                        best_metrics = metrics
+                        st.write(f"🏆 New best strategy found! Return: {best_return:.2f}%")
+                else:
+                    st.write("⚠️ No trades generated")
+            except Exception as e:
+                failed_tests += 1
+                st.write(f"❌ Test failed: {str(e)}")
+                continue
+    
+    else:  # Random Search
+        st.write("🎲 Starting Random Search...")
+        for i in range(n_iterations):
+            if i % 10 == 0:  # Progress update every 10 iterations
+                st.write(f"Progress: {i}/{n_iterations} iterations completed")
+            
+            params = {k: random.choice(v) for k, v in param_ranges.items()}
+            
+            # Ensure logical constraints
+            if params['sma_fast'] >= params['sma_slow']:
+                params['sma_slow'] = params['sma_fast'] + 10
+            if params['ema_fast'] >= params['ema_slow']:
+                params['ema_slow'] = params['ema_fast'] + 10
+            
+            try:
+                df_with_signals = strategy.generate_signals(df, params, direction.lower())
+                trades, final_capital = backtest.run_backtest(df_with_signals, params, direction.lower())
+                
+                if trades:
+                    metrics = backtest.calculate_metrics(trades, df_with_signals)
+                    successful_tests += 1
+                    
+                    if metrics['total_return'] > best_return:
+                        best_return = metrics['total_return']
+                        best_params = params
+                        best_metrics = metrics
+                        st.write(f"🏆 New best strategy! Iteration {i+1}, Return: {best_return:.2f}%")
+            except Exception as e:
+                failed_tests += 1
+                continue
+    
+    st.write(f"🎯 **Optimization completed!**")
+    st.write(f"Successful tests: {successful_tests}")
+    st.write(f"Failed tests: {failed_tests}")
+    st.write(f"Best return found: {best_return:.2f}%" if best_return != -float('inf') else "No profitable strategy found")
+    
+    return best_params, best_metrics(param_combinations)
         param_combinations = param_combinations[:n_iterations]
         
         for params_tuple in param_combinations:
@@ -545,8 +801,36 @@ def main():
             return
         
         # Convert date column and sort
-        df['date'] = pd.to_datetime(df['date'])
+        st.write("📅 **Processing date column...**")
+        st.write(f"Date column before processing: {df['date'].dtype}")
+        st.write(f"Sample date values: {df['date'].head().tolist()}")
+        
+        try:
+            df['date'] = pd.to_datetime(df['date'])
+            st.write("✅ Date column converted successfully")
+        except Exception as e:
+            st.error(f"❌ Error converting date column: {e}")
+            return
+        
         df = df.sort_values('date').reset_index(drop=True)
+        st.write(f"📊 Data sorted by date. Shape: {df.shape}")
+        
+        # Remove rows with NaN values in critical columns
+        before_dropna = len(df)
+        df = df.dropna(subset=['open', 'high', 'low', 'close'])
+        after_dropna = len(df)
+        if before_dropna != after_dropna:
+            st.write(f"🧹 Removed {before_dropna - after_dropna} rows with missing price data")
+        
+        # Ensure no negative or zero prices
+        price_cols = ['open', 'high', 'low', 'close']
+        for col in price_cols:
+            negative_count = (df[col] <= 0).sum()
+            if negative_count > 0:
+                st.write(f"⚠️ Warning: {negative_count} non-positive values in {col}")
+                df = df[df[col] > 0]  # Remove non-positive prices
+        
+        st.write(f"✅ Final cleaned data shape: {df.shape}")
         
         # Data statistics
         col1, col2, col3, col4 = st.columns(4)
@@ -554,10 +838,10 @@ def main():
             st.metric("Min Date", df['date'].min().strftime('%Y-%m-%d'))
         with col2:
             st.metric("Max Date", df['date'].max().strftime('%Y-%m-%d'))
-        #with col3:
-        #    st.metric("Min Price", f"${df['close'].min():.2f}")
-        #with col4:
-        #    st.metric("Max Price", f"${df['close'].max():.2f}")
+        with col3:
+            st.metric("Min Price", f"${df['close'].min():.2f}")
+        with col4:
+            st.metric("Max Price", f"${df['close'].max():.2f}")
         
         # Plot raw data
         st.subheader("📈 Price Chart")
