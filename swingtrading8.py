@@ -916,8 +916,11 @@ def main():
             with st.spinner("Optimizing strategy parameters..."):
                 
                 # Optimize strategy
-                best_params, best_metrics = optimize_strategy(
+                optimization_result = optimize_strategy(
                     backtest_df, direction, search_type, n_iterations=100)
+                
+                best_params = optimization_result['best_params']
+                best_metrics = optimization_result['best_metrics']
                 
                 if best_params is None:
                     st.error("No profitable strategy found. Try different parameters or data.")
