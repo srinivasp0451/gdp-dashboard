@@ -172,7 +172,7 @@ def main():
             data = fetch_data(index,period=period, interval=interval)
             data = apply_strategy(data,ma1,ma2,matype)
             temp = data.reset_index()
-            temp.columns =['Date','Close','High,'Low','Open','Volume']
+            temp.columns =['Date','Close','High','Low','Open','Volume']
             st.dataframe(temp)
             backtest_strategy(data, stoploss_points, target, index)
 
