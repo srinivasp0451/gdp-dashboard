@@ -171,6 +171,7 @@ def main():
         if st.button("Run Backtest"):
             data = fetch_data(index,period=period, interval=interval)
             data = apply_strategy(data,ma1,ma2,matype)
+            st.dataframe(data)
             backtest_strategy(data, stoploss_points, target, index)
 
     # Live trading settings
