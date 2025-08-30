@@ -22,15 +22,6 @@ def read_any(uploaded_file):
 
 def clean_columns(df):
     df = df.copy()
-    if "prev. close" in df.columns:
-        df = df.drop('prev. close',axis=1)
-
-    if "prev.close" in df.columns:
-        df = df.drop('prev.close',axis=1)
-    if "prevclose" in df.columns:
-        df = df.drop('prevclose',axis=1)
-    if "PREV. CLOSE" in df.columns:
-        df = df.drop('PREV. CLOSE',axis=1)
     
 
     df.columns = (df.columns.astype(str)
@@ -45,6 +36,9 @@ def remove_commas(df):
     df = df.copy()
     for c in df.columns:
         st.write(f'column: {c}')
+        if "prevclose" in df.columns:
+            df = df.drop('prevclose',axis=1)
+            continue
         if df[c].dtype == object:
             df[c] = df[c].astype(str).str.replace(",", "", regex=False)
     return df
@@ -56,19 +50,6 @@ if not uploaded:
 
 try:
     df_raw = read_any(uploaded)
-    st.write(df_raw.columns)
-    if "prev. close" in df_raw.columns:
-        df_raw = df_raw.drop('prev. close',axis=1)
-
-    if "prev.close" in df_raw.columns:
-        df_raw = df_raw.drop('prev.close',axis=1)
-    if "prevclose" in df_raw.columns:
-        df_raw = df_raw.drop('prevclose',axis=1)
-    if "PREV. CLOSE" in df_raw.columns:
-        df_raw = df_raw.drop('PREV. CLOSE',axis=1)
-    st.write(df_raw.columns)
-    
-        
 except Exception as e:
     st.error(f"Could not read file: {e}")
     st.stop()
