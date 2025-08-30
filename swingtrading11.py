@@ -22,6 +22,12 @@ def read_any(uploaded_file):
 
 def clean_columns(df):
     df = df.copy()
+    if "prev. close" in df.columns:
+        df = df.drop('prev. close',axis=1)
+
+    if "prev.close" in df.columns:
+        df = df.drop('prev.close',axis=1)
+
     df.columns = (df.columns.astype(str)
                   .str.strip()
                   .str.lower()
