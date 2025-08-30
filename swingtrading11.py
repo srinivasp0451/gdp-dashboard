@@ -53,8 +53,8 @@ try:
         df_raw = df_raw.drop('prev.close',axis=1)
     if "prevclose" in df_raw.columns:
         df_raw = df_raw.drop('prevclose',axis=1)
-    if "PREV.CLOSE" in df_raw.columns:
-        df_raw = df_raw.drop('PREV.CLOSE',axis=1)
+    if "PREV. CLOSE" in df_raw.columns:
+        df_raw = df_raw.drop('PREV. CLOSE',axis=1)
     st.write(df_raw.columns)
     
         
