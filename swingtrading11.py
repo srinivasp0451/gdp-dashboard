@@ -22,14 +22,6 @@ def read_any(uploaded_file):
 
 def clean_columns(df):
     df = df.copy()
-    if "prev. close" in df.columns:
-        df = df.drop('prev. close',axis=1)
-
-    if "prev.close" in df.columns:
-        df = df.drop('prev.close',axis=1)
-    if "prevclose" in df.columns:
-        df = df.drop('prevclose',axis=1)
-        
 
     df.columns = (df.columns.astype(str)
                   .str.strip()
@@ -53,6 +45,14 @@ if not uploaded:
 
 try:
     df_raw = read_any(uploaded)
+    if "prev. close" in df_raw.columns:
+        df_raw = df_raw.drop('prev. close',axis=1)
+
+    if "prev.close" in df_raw.columns:
+        df_raw = df_raw.drop('prev.close',axis=1)
+    if "prevclose" in df_raw.columns:
+        df_raw = df_raw.drop('prevclose',axis=1)
+        
 except Exception as e:
     st.error(f"Could not read file: {e}")
     st.stop()
