@@ -27,6 +27,9 @@ def clean_columns(df):
 
     if "prev.close" in df.columns:
         df = df.drop('prev.close',axis=1)
+    if "prevclose" in df.columns:
+        df = df.drop('prevclose',axis=1)
+        
 
     df.columns = (df.columns.astype(str)
                   .str.strip()
