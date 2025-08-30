@@ -22,8 +22,6 @@ def read_any(uploaded_file):
 
 def clean_columns(df):
     df = df.copy()
-    
-
     df.columns = (df.columns.astype(str)
                   .str.strip()
                   .str.lower()
@@ -35,10 +33,6 @@ def clean_columns(df):
 def remove_commas(df):
     df = df.copy()
     for c in df.columns:
-        st.write(f'column: {c}')
-        if "prevclose" in df.columns:
-            df = df.drop('prevclose',axis=1)
-            continue
         if df[c].dtype == object:
             df[c] = df[c].astype(str).str.replace(",", "", regex=False)
     return df
