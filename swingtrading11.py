@@ -45,6 +45,7 @@ if not uploaded:
 
 try:
     df_raw = read_any(uploaded)
+    st.write(df.columns)
     if "prev. close" in df_raw.columns:
         df_raw = df_raw.drop('prev. close',axis=1)
 
