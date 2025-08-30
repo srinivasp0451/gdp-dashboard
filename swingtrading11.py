@@ -44,6 +44,7 @@ def clean_columns(df):
 def remove_commas(df):
     df = df.copy()
     for c in df.columns:
+        st.write(f'column: {c}')
         if df[c].dtype == object:
             df[c] = df[c].astype(str).str.replace(",", "", regex=False)
     return df
