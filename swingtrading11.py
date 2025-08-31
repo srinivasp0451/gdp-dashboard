@@ -55,7 +55,7 @@ st.write("Normalized columns:", list(df.columns))
 
 cols = list(df.columns)
 cols = [s for s in cols if 'prev. close' not in s.lower()]
-
+st.write(f'cols are::',cols)
 def find_col(cols, patterns):
     for c in cols:
         for p in patterns:
