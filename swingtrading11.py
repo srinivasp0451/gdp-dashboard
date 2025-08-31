@@ -68,7 +68,7 @@ date_col   = find_col(cols, ["date", "datetime", "timestamp", "time"])
 open_col   = find_col(cols, ["open", "openprice"])
 high_col   = find_col(cols, ["high", "highprice","h"])
 low_col    = find_col(cols, ["low","lowprice"])
-close_col  = find_col(cols, ["close", "adjclose", "last", "ltp", "settle"])
+close_col  = find_col(cols, ["close", "adjclose", "settle"])
 volume_col = find_col(cols, ["volume", "vol", "qty", "turnover"])
 
 st.markdown("**Detected columns**")
