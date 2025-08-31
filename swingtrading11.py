@@ -54,6 +54,8 @@ st.success(f"Loaded {uploaded.name} — shape {df.shape}")
 st.write("Normalized columns:", list(df.columns))
 
 cols = list(df.columns)
+cols = [s for s in cols if 'prev. close' not in s.lower()]
+
 def find_col(cols, patterns):
     for c in cols:
         for p in patterns:
