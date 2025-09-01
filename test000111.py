@@ -155,9 +155,9 @@ def main():
 
     # Select the strategy type
     strategy_type = st.selectbox("Select Strategy Type", ["Backtesting", "Live Trading"], index=0)
-    matype = st.selectbox("Select MA Type", ["ema", "sma"], index=1)
-    ma1 = st.number_input("Enter MA1",min_value=1,value=100)
-    ma2 = st.number_input("Enter MA2",min_value=1,value=200)
+    matype = st.selectbox("Select MA Type", ["ema", "sma"], index=0)
+    ma1 = st.number_input("Enter MA1",min_value=1,value=9)
+    ma2 = st.number_input("Enter MA2",min_value=1,value=20)
 
 
     # Backtesting settings
