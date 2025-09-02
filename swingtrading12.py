@@ -62,9 +62,9 @@ def find_col(cols, patterns):
     return None
 
 date_col   = find_col(cols, ["date", "datetime", "timestamp", "time"])
-open_col   = find_col(cols, ["open", "openprice", "o"])
-high_col   = find_col(cols, ["high", "h"])
-low_col    = find_col(cols, ["low", "l"])
+open_col   = find_col(cols, ["open", "openprice"])
+high_col   = find_col(cols, ["high"])
+low_col    = find_col(cols, ["low"])
 close_col  = find_col(cols, ["close", "adjclose", "last", "ltp", "settle"])
 volume_col = find_col(cols, ["volume", "vol", "qty", "turnover"])
 
