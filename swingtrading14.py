@@ -461,7 +461,7 @@ def optimize_parameters(df, base_params, n_iter, target_acc, target_points, side
 st.title("Backtester with Confluence + Accuracy Target")
 st.markdown("Upload OHLCV CSV (Date,Open,High,Low,Close,Volume). The app will run a randomized search to find parameters that reach user-specified accuracy% (probability of profit) and strategy returns.")
 
-uploaded_file = st.file_uploader("Upload CSV", type=['csv'])
+uploaded_file = st.file_uploader("Upload CSV", type=['csv','xlsx'])
 side = st.selectbox("Trade Side", options=["Both","Long","Short"], index=0)
 random_iters = st.number_input("Random iterations (1-2000)", min_value=1, max_value=2000, value=200, step=1)
 expected_returns = st.number_input("Expected strategy returns (total points)", value=0.0, step=1.0, format="%.2f")
@@ -471,11 +471,24 @@ run_btn = st.button("Run Backtest & Optimize")
 if uploaded_file is not None and run_btn:
     with st.spinner("Reading data and running optimization..."):
         try:
-            raw = pd.read_csv(uploaded_file)
+            if str(uploaded_file).lower().endswith('.xlsx') or hasattr(uploaded_file, 'getvalue') and ('xls' in uploaded_file.name.lower()):
+                raw = pd.read_excel(uploaded_file)
+            else:
+                raw = pd.read_csv(uploaded_file)
             df = normalize_df(raw)
         except Exception as e:
             st.error(f"Failed to read/normalize file: {e}")
             st.stop()
+
+        # show uploaded top/bottom 5 rows
+        st.subheader("Uploaded file sample")
+        try:
+            st.write(f"Rows: {raw.shape[0]} Columns: {raw.shape[1]}")
+            st.dataframe(raw.head(5))
+            st.subheader("Uploaded file - bottom 5 rows")
+            st.dataframe(raw.tail(5))
+        except Exception:
+            pass
 
         # base params (defaults)
         base_params = {
@@ -512,20 +525,34 @@ if uploaded_file is not None and run_btn:
             st.subheader("Bottom 5 trades (by Points)")
             st.dataframe(best_trades_display.nsmallest(5, 'Points'))
 
-            # Heatmap: monthly returns pivot table (Year x Month)
+            # Heatmap: monthly returns pivot table (Year x Month) - show percent returns
             best_trades_display['Exit Date'] = pd.to_datetime(best_trades_display['Exit Date'])
             best_trades_display['Year'] = best_trades_display['Exit Date'].dt.year
             best_trades_display['Month'] = best_trades_display['Exit Date'].dt.month
-            pivot = best_trades_display.pivot_table(index='Year', columns='Month', values='Points', aggfunc='sum', fill_value=0)
+            monthly_points = best_trades_display.groupby(['Year','Month'])['Points'].sum().reset_index()
+
+            # month start price from original df
+            month_start = df['Close'].resample('MS').first().reset_index()
+            month_start['Year'] = month_start['Date'].dt.year
+            month_start['Month'] = month_start['Date'].dt.month
+            month_start = month_start.rename(columns={'Close':'Month_Start_Close'})
+
+            monthly = monthly_points.merge(month_start[['Year','Month','Month_Start_Close']], on=['Year','Month'], how='left')
+            # if missing month_start_close, fallback to average close
+            avg_close = df['Close'].mean()
+            monthly['Month_Start_Close'] = monthly['Month_Start_Close'].fillna(avg_close)
+            monthly['Pct_Return'] = (monthly['Points'] / monthly['Month_Start_Close']) * 100.0
+
+            pivot_pct = monthly.pivot(index='Year', columns='Month', values='Pct_Return').fillna(0)
             # ensure months 1..12 present
             for m in range(1,13):
-                if m not in pivot.columns:
-                    pivot[m] = 0
-            pivot = pivot.reindex(sorted(pivot.columns), axis=1)
+                if m not in pivot_pct.columns:
+                    pivot_pct[m] = 0
+            pivot_pct = pivot_pct.reindex(sorted(pivot_pct.columns), axis=1)
 
-            st.subheader("Monthly returns heatmap (Year vs Month)")
-            fig, ax = plt.subplots(figsize=(10, max(2, 0.6*len(pivot.index)+1)))
-            sns.heatmap(pivot, annot=True, fmt='.1f', linewidths=0.5, ax=ax)
+            st.subheader("Monthly % returns heatmap (Year vs Month)")
+            fig, ax = plt.subplots(figsize=(10, max(2, 0.6*len(pivot_pct.index)+1)))
+            sns.heatmap(pivot_pct, annot=True, fmt='.2f', linewidths=0.5, ax=ax)
             ax.set_ylabel('Year')
             ax.set_xlabel('Month')
             st.pyplot(fig)
@@ -536,19 +563,100 @@ if uploaded_file is not None and run_btn:
         # live recommendation (latest bar) using best params
         latest_sig_df = generate_confluence_signals(df, best_params, side)
         latest_row = latest_sig_df.iloc[-1]
-        st.subheader("Latest live recommendation (based on best params)")
-        rec = {
-            'Date': latest_sig_df.index[-1],
-            'Signal': int(latest_row['Signal']),
-            'Indicators': latest_row['indicators_long'] if latest_row['Signal']==1 else latest_row['indicators_short'],
-            'Confluences': int(latest_row['total_votes'])
+
+        # human friendly signal
+        sig_val = int(latest_row['Signal'])
+        sig_text = "Buy" if sig_val == 1 else ("Sell" if sig_val == -1 else "No Signal")
+
+        # compute entry/target/sl for live rec (we use last close as proxy for next open)
+        atr_val = latest_row.get(f"atr_{best_params['atr_period']}", np.nan)
+        entry_price_est = float(latest_row['Close'])
+        if sig_val == 1:
+            target_price = entry_price_est + best_params['target_atr_mult'] * atr_val
+            sl_price = entry_price_est - best_params['sl_atr_mult'] * atr_val
+            indicators_list = latest_row['indicators_long']
+        elif sig_val == -1:
+            target_price = entry_price_est - best_params['target_atr_mult'] * atr_val
+            sl_price = entry_price_est + best_params['sl_atr_mult'] * atr_val
+            indicators_list = latest_row['indicators_short']
+        else:
+            target_price = np.nan
+            sl_price = np.nan
+            indicators_list = []
+
+        primary = choose_primary_indicator(indicators_list)
+        confluences = int(latest_row.get('total_votes', 0))
+        prob_of_profit = (best_summary.get('prob_of_profit', np.nan) * 100.0) if isinstance(best_summary, dict) else np.nan
+
+        # build a short, human-readable reason/logic string
+        def explain_indicator(it):
+            if it.startswith('EMA'):
+                return f"{it}: short-term EMA above/below long-term EMA -> momentum signal"
+            if it.startswith('SMA'):
+                return f"{it}: SMA crossover indicating trend bias"
+            if 'MACD' in it:
+                return "MACD+: histogram >0 indicates bullish momentum; MACD- indicates bearish"
+            if it.startswith('RSI'):
+                return "RSI extreme indicates overbought/oversold"
+            if 'BB' in it:
+                return "BB band touch suggests mean-reversion/extreme"
+            if 'VWMA' in it or 'VWAP' in it:
+                return "Price vs VWMA indicates trade direction with volume support"
+            if 'OBV' in it:
+                return "OBV rising/falling shows accumulation/distribution"
+            if it == 'VOL_SPIKE':
+                return "Volume spike with price direction — increased conviction"
+            if it.startswith('MOM'):
+                return "Momentum positive/negative"
+            if it == 'STOCH':
+                return "Stochastic crossover in extreme zones"
+            if 'ADX' in it:
+                return "ADX indicates trend strength and direction via DI lines"
+            if 'CCI' in it:
+                return "CCI in extremes suggests momentum reversal/continuation"
+            return it
+
+        reasons = [explain_indicator(ii) for ii in indicators_list]
+        reason_text = (f"Primary: {primary}. ") + ("; ".join(reasons) if reasons else "No strong indicator explanation.")
+
+        indicator_values = {
+            'sma_fast': latest_row.get(f"sma_{best_params['sma_fast']}", np.nan),
+            'sma_slow': latest_row.get(f"sma_{best_params['sma_slow']}", np.nan),
+            'ema_fast': latest_row.get(f"ema_{best_params['ema_fast']}", np.nan),
+            'ema_slow': latest_row.get(f"ema_{best_params['ema_slow']}", np.nan),
+            'macd_hist': latest_row.get('macd_hist', np.nan),
+            f"rsi_{best_params['rsi_period']}": latest_row.get(f"rsi_{best_params['rsi_period']}", np.nan),
+            'bb_upper': latest_row.get('bb_upper', np.nan),
+            'bb_lower': latest_row.get('bb_lower', np.nan),
+            'obv': latest_row.get('obv', np.nan),
+            'vwma': latest_row.get('vwma', np.nan),
+            'cci': latest_row.get('cci', np.nan),
+            'vol': latest_row.get('Volume', np.nan),
+            'vol_sma': latest_row.get('vol_sma', np.nan),
+            f"atr_{best_params['atr_period']}": latest_row.get(f"atr_{best_params['atr_period']}", np.nan)
         }
-        st.write(rec)
+
+        st.subheader("Latest live recommendation (based on best params)")
+        st.markdown(f"**Date:** {latest_sig_df.index[-1].strftime('%Y-%m-%d')}")
+        st.markdown(f"**Signal:** {sig_text}")
+        st.markdown(f"**Estimated Entry (proxy = last close):** {entry_price_est:.2f}")
+        st.markdown(f"**Target:** {target_price:.2f}  |  **Stop-loss:** {sl_price:.2f}")
+        st.markdown(f"**Confluences (votes):** {confluences}  |  **Primary indicator:** {primary}")
+        st.markdown(f"**Probability of profit (backtested):** {prob_of_profit:.2f}%")
+        st.markdown("**Indicators that voted:**")
+        st.write(indicators_list)
+        st.markdown("**Reason / Logic (brief):**")
+        st.write(reason_text)
+
+        st.subheader("Latest indicator values (key ones)")
+        ind_df = pd.DataFrame([indicator_values]).T.reset_index()
+        ind_df.columns = ['Indicator', 'Value']
+        st.dataframe(ind_df)
 
         st.success("Done")
 
 else:
-    st.info("Upload a CSV and click 'Run Backtest & Optimize' to start.")
+    st.info("Upload a CSV/XLSX and click 'Run Backtest & Optimize' to start.")
 
 
 # ------------------- End -------------------
