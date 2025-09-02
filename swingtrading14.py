@@ -14,15 +14,15 @@ def normalize_df(df):
     cols = {c.lower(): c for c in df.columns}
     mapping = {}
     for key, orig in cols.items():
-        if key in ("open", "o"):
+        if key in ("open"):
             mapping[orig] = "Open"
-        if key in ("high", "h"):
+        if key in ("high"):
             mapping[orig] = "High"
-        if key in ("low", "l"):
+        if key in ("low"):
             mapping[orig] = "Low"
-        if key in ("close", "c", "price"):
+        if key in ("close"):
             mapping[orig] = "Close"
-        if key in ("volume", "vol", "v"):
+        if key in ("volume", "vol"):
             mapping[orig] = "Volume"
         if key in ("date", "datetime", "time"):
             mapping[orig] = "Date"
