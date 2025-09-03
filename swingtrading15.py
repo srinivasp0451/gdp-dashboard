@@ -35,7 +35,7 @@ def normalize_df(df):
         df["Volume"] = 0
     # parse date
     if "Date" in df.columns:
-        df["Date"] = pd.to_datetime(df["Date"])
+        df["Date"] = pd.to_datetime(df["Date"]).dt.tz_localize(None)
         df = df.set_index("Date").sort_index()
     else:
         df.index = pd.to_datetime(df.index)
@@ -283,7 +283,7 @@ def generate_confluence_signals(df_local, params, side="Both"):
     result['Signal'] = sig_series
     return result
 
-# ------------------- Backtester (keeps original logic, adds Primary Indicator) -------------------
+# ------------------- Backtester (entry executed at SAME bar close) -------------------
 
 def choose_primary_indicator(indicators_list):
     # priority for display if multiple indicators exist
@@ -296,6 +296,10 @@ def choose_primary_indicator(indicators_list):
 
 
 def backtest_point_strategy(df_signals, params):
+    """
+    Modified backtester: ENTRY is executed at the SAME bar's Close (no next-bar open used).
+    Exits are still checked on subsequent bars (their H/L/Close) — that's not lookahead relative to entry.
+    """
     trades = []
     in_pos = False
     pos_side = 0
@@ -310,20 +314,20 @@ def backtest_point_strategy(df_signals, params):
     last_price = df_signals['Close'].iloc[-1]
     buy_hold_points = last_price - first_price
 
-    # iterate rows in order - keep iteration to len-1 to allow intraday next-row exit checks
+    # iterate rows in order -- we use i from 0..n-2 because exits look at future rows
     for i in range(len(df_signals)-1):
         row = df_signals.iloc[i]
         next_row = df_signals.iloc[i+1]
         sig = row['Signal']
 
-        # ENTRY: use current/last candle CLOSE instead of next open (user requested)
+        # ENTRY: when not in position and signal on THIS bar -> enter at THIS bar's Close (no future open used)
         if (not in_pos) and sig != 0:
             entry_date = row.name
             entry_price = row['Close']
             pos_side = sig
             atr_val = row.get(f"atr_{params['atr_period']}", np.nan)
             if np.isnan(atr_val) or atr_val == 0:
-                atr_val = df_signals[f"atr_{params['atr_period']}"] .median() or 1.0
+                atr_val = df_signals[f"atr_{params['atr_period']}"].median() or 1.0
             if pos_side == 1:
                 target = entry_price + params['target_atr_mult'] * atr_val
                 sl = entry_price - params['sl_atr_mult'] * atr_val
@@ -344,7 +348,7 @@ def backtest_point_strategy(df_signals, params):
             in_pos = True
             continue
 
-        # EXIT checks still use next_row intraday range (safe and standard) - no lookahead in signal generation
+        # If in position, check exits on next_row (future after entry)
         if in_pos:
             h = next_row['High']; l = next_row['Low']; closep = next_row['Close']
             exit_price = None; exit_date = None; reason = None
@@ -462,12 +466,12 @@ def optimize_parameters(df, base_params, n_iter, target_acc, target_points, side
 
 # ------------------- Streamlit App -------------------
 
-st.title("Backtester with Confluence + Accuracy Target")
+st.title("Backtester with Confluence + Accuracy Target (Entry on Close)")
 st.markdown("Upload OHLCV CSV/XLSX (Date,Open,High,Low,Close,Volume). The app will run a randomized search to find parameters that reach user-specified accuracy% (probability of profit) and strategy returns.
 
-Changes: entries are executed at the LAST CANDLE CLOSE (not next open). You can also restrict the dataset by selecting a last date from the dropdown (start date remains the data minimum).")
+**Note:** Entry is executed at the same bar's Close (no next-bar Open is used). Use the End Date selector below to restrict the data used for optimization/backtest.")
 
-uploaded_file = st.file_uploader("Upload CSV/XLSX", type=['csv','xlsx'])
+uploaded_file = st.file_uploader("Upload CSV or XLSX", type=['csv','xlsx'])
 side = st.selectbox("Trade Side", options=["Both","Long","Short"], index=0)
 random_iters = st.number_input("Random iterations (1-2000)", min_value=1, max_value=2000, value=200, step=1)
 expected_returns = st.number_input("Expected strategy returns (total points)", value=0.0, step=1.0, format="%.2f")
@@ -475,40 +479,36 @@ expected_accuracy_pct = st.number_input("Expected accuracy % (probability of pro
 run_btn = st.button("Run Backtest & Optimize")
 
 if uploaded_file is not None:
-    # read and normalize immediately so we can let the user pick last-date
     try:
-        if hasattr(uploaded_file, 'name') and uploaded_file.name.lower().endswith(('.xls', '.xlsx')):
+        if str(uploaded_file).lower().endswith('.xlsx') or hasattr(uploaded_file, 'getvalue') and ('xls' in uploaded_file.name.lower()):
             raw = pd.read_excel(uploaded_file)
         else:
             raw = pd.read_csv(uploaded_file)
-        df_full = normalize_df(raw)
+        df = normalize_df(raw)
     except Exception as e:
         st.error(f"Failed to read/normalize file: {e}")
         st.stop()
 
-    # show uploaded top/bottom 5 rows
-    st.subheader("Uploaded file sample")
-    try:
-        st.write(f"Rows: {raw.shape[0]} Columns: {raw.shape[1]}")
-        st.dataframe(raw.head(5))
-        st.subheader("Uploaded file - bottom 5 rows")
-        st.dataframe(raw.tail(5))
-    except Exception:
-        pass
-
-    # Dropdown to select last date (start date is min date of data)
-    date_options = df_full.index.strftime('%Y-%m-%d').tolist()
-    if len(date_options) == 0:
-        st.error('No dates found in uploaded data')
-        st.stop()
-    selected_date_str = st.selectbox("Select last date to include (start date stays as min date)", options=date_options, index=len(date_options)-1)
-    selected_date = pd.to_datetime(selected_date_str)
-
-    # subset data up to selected_date
-    df = df_full.loc[:selected_date].copy()
+    # allow user to select End Date (last date). Start date remains min date of data
+    available_dates = [d.strftime('%Y-%m-%d') for d in df.index.unique()]
+    default_idx = len(available_dates) - 1
+    selected_end_str = st.selectbox("Select last date for backtest (start = min date)", options=available_dates, index=default_idx)
+    selected_end_dt = pd.to_datetime(selected_end_str)
+    # restrict data up to selected end date (inclusive)
+    df = df.loc[:selected_end_dt].copy()
 
     if run_btn:
-        with st.spinner("Running optimization on selected date range..."):
+        with st.spinner("Running optimization on data up to selected end date..."):
+            # show uploaded top/bottom 5 rows (original uploaded file)
+            st.subheader("Uploaded file sample")
+            try:
+                st.write(f"Uploaded rows: {raw.shape[0]} Columns: {raw.shape[1]}")
+                st.dataframe(raw.head(5))
+                st.subheader("Uploaded file - bottom 5 rows")
+                st.dataframe(raw.tail(5))
+            except Exception:
+                pass
+
             # base params (defaults)
             base_params = {
                 'sma_fast': 10, 'sma_slow': 50,
@@ -526,7 +526,6 @@ if uploaded_file is not None:
             best_params, best_summary, best_trades, perfect = optimize_parameters(df, base_params, int(random_iters), target_acc, target_points, side)
 
             st.subheader("Optimization Result")
-            st.write("Selected data range: ", df.index.min().strftime('%Y-%m-%d'), "to", df.index.max().strftime('%Y-%m-%d'))
             st.write("Target accuracy:", expected_accuracy_pct, "% ; Target points:", target_points)
             st.write("Perfect match found:" , perfect)
             st.json(best_params)
@@ -551,7 +550,7 @@ if uploaded_file is not None:
                 best_trades_display['Month'] = best_trades_display['Exit Date'].dt.month
                 monthly_points = best_trades_display.groupby(['Year','Month'])['Points'].sum().reset_index()
 
-                # month start price from original df subset
+                # month start price from original df (restricted to selected end date)
                 month_start = df['Close'].resample('MS').first().reset_index()
                 month_start['Year'] = month_start['Date'].dt.year
                 month_start['Month'] = month_start['Date'].dt.month
@@ -580,7 +579,7 @@ if uploaded_file is not None:
                 st.subheader("All trades (best candidate)")
                 st.dataframe(best_trades_display)
 
-            # live recommendation (latest bar in the selected range) using best params
+            # live recommendation (based on selected end date)
             latest_sig_df = generate_confluence_signals(df, best_params, side)
             latest_row = latest_sig_df.iloc[-1]
 
@@ -588,9 +587,9 @@ if uploaded_file is not None:
             sig_val = int(latest_row['Signal'])
             sig_text = "Buy" if sig_val == 1 else ("Sell" if sig_val == -1 else "No Signal")
 
-            # ENTRY for live rec now uses the last candle CLOSE (as requested)
-            atr_val = latest_row.get(f"atr_{best_params['atr_period']}", np.nan)
+            # ENTRY is at last candle Close (selected_end_dt). We do NOT use next bar open for entry.
             entry_price_est = float(latest_row['Close'])
+            atr_val = latest_row.get(f"atr_{best_params['atr_period']}", np.nan)
             if sig_val == 1:
                 target_price = entry_price_est + best_params['target_atr_mult'] * atr_val
                 sl_price = entry_price_est - best_params['sl_atr_mult'] * atr_val
@@ -656,10 +655,10 @@ if uploaded_file is not None:
                 f"atr_{best_params['atr_period']}": latest_row.get(f"atr_{best_params['atr_period']}", np.nan)
             }
 
-            st.subheader("Latest live recommendation (based on best params and selected date range)")
-            st.markdown(f"**Date:** {latest_sig_df.index[-1].strftime('%Y-%m-%d')}")
+            st.subheader("Latest live recommendation (based on best params & selected end date)")
+            st.markdown(f"**Date (end date used):** {selected_end_str}")
             st.markdown(f"**Signal:** {sig_text}")
-            st.markdown(f"**Entry (LAST candle close):** {entry_price_est:.2f}")
+            st.markdown(f"**Entry (at bar Close):** {entry_price_est:.2f}")
             st.markdown(f"**Target:** {target_price:.2f}  |  **Stop-loss:** {sl_price:.2f}")
             st.markdown(f"**Confluences (votes):** {confluences}  |  **Primary indicator:** {primary}")
             st.markdown(f"**Probability of profit (backtested):** {prob_of_profit:.2f}%")
@@ -675,8 +674,11 @@ if uploaded_file is not None:
 
             st.success("Done")
 
+    else:
+        st.info("Select an End Date (defaults to max date), then click 'Run Backtest & Optimize' to start.")
+
 else:
-    st.info("Upload a CSV/XLSX to see date selector. After selecting last date, click 'Run Backtest & Optimize' to start.")
+    st.info("Upload a CSV/XLSX to begin.")
 
 
 # ------------------- End -------------------
