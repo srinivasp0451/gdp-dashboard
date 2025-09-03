@@ -467,7 +467,7 @@ def optimize_parameters(df, base_params, n_iter, target_acc, target_points, side
 # ------------------- Streamlit App -------------------
 
 st.title("Backtester with Confluence + Accuracy Target (Entry on Close)")
-st.markdown("Upload OHLCV CSV/XLSX (Date,Open,High,Low,Close,Volume). The app will run a randomized search to find parameters that reach user-specified accuracy% (probability of profit) and strategy returns.
+st.markdown("Upload OHLCV CSV/XLSX Date,Open,High,Low,Close,Volume. The app will run a randomized search to find parameters that reach user-specified accuracy% probability of profit and strategy returns.")
 
 **Note:** Entry is executed at the same bar's Close (no next-bar Open is used). Use the End Date selector below to restrict the data used for optimization/backtest.")
 
