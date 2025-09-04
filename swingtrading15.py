@@ -14,15 +14,15 @@ def normalize_df(df):
     cols = {c.lower(): c for c in df.columns}
     mapping = {}
     for key, orig in cols.items():
-        if key in ("open"):
+        if key in ("open", "o"):
             mapping[orig] = "Open"
-        if key in ("high"):
+        if key in ("high", "h"):
             mapping[orig] = "High"
-        if key in ("low"):
+        if key in ("low", "l"):
             mapping[orig] = "Low"
-        if key in ("close"):
+        if key in ("close", "c", "price"):
             mapping[orig] = "Close"
-        if key in ("volume", "vol"):
+        if key in ("volume", "vol", "v"):
             mapping[orig] = "Volume"
         if key in ("date", "datetime", "time"):
             mapping[orig] = "Date"
@@ -35,10 +35,10 @@ def normalize_df(df):
         df["Volume"] = 0
     # parse date
     if "Date" in df.columns:
-        df["Date"] = pd.to_datetime(df["Date"]) 
+        df["Date"] = pd.to_datetime(df["Date"]).dt.tz_localize(None)
         df = df.set_index("Date").sort_index()
     else:
-        df.index = pd.to_datetime(df.index)
+        df.index = pd.to_datetime(df.index).tz_localize(None)
         df = df.sort_index()
     # make sure numeric
     for col in ["Open","High","Low","Close","Volume"]:
@@ -283,7 +283,7 @@ def generate_confluence_signals(df_local, params, side="Both"):
     result['Signal'] = sig_series
     return result
 
-# ------------------- Backtester (close-based, no future intraday) -------------------
+# ------------------- Backtester (modified: entries on same-bar close; exits evaluated on subsequent bars) -------------------
 
 def choose_primary_indicator(indicators_list):
     # priority for display if multiple indicators exist
@@ -297,11 +297,11 @@ def choose_primary_indicator(indicators_list):
 
 def backtest_point_strategy(df_signals, params):
     """
-    Close-based backtester (no next-bar open usage).
-    - Entry executed at the same bar's Close (no future data used for entry).
-    - Exits are evaluated on subsequent bars' Close only (first close that crosses target/SL or opposite signal).
-    Returns: (summary, trades_df)
+    Backtester updated to:
+      - Execute entries at the **same bar's Close** where the Signal appears (no next-bar open used).
+      - Exits are evaluated on **subsequent bars'** OHLC (standard backtest). This avoids using future data for entry decisions.
     """
+
     trades = []
     in_pos = False
     pos_side = 0
@@ -311,79 +311,44 @@ def backtest_point_strategy(df_signals, params):
     target = None
     sl = None
 
-    # buy & hold baseline (points) using available (possibly truncated) series
+    # buy & hold baseline (points)
     first_price = df_signals['Close'].iloc[0]
     last_price = df_signals['Close'].iloc[-1]
     buy_hold_points = last_price - first_price
 
-    # iterate rows in chronological order
-    for i in range(len(df_signals)):
+    n = len(df_signals)
+    for i in range(n):
         row = df_signals.iloc[i]
         sig = row['Signal']
 
-        # If not in position and there's a signal -> enter at the same day's Close (no future data)
-        if (not in_pos) and sig != 0:
-            entry_date = row.name
-            entry_price = row['Close'] if not pd.isna(row['Close']) else row['Open']
-            pos_side = sig  # 1 long, -1 short
-
-            # set sl/target based on ATR computed up to current bar
-            atr_val = row.get(f"atr_{params['atr_period']}", np.nan)
-            if np.isnan(atr_val) or atr_val == 0:
-                atr_val = df_signals[f"atr_{params['atr_period']}"] .median() or 1.0
-            if pos_side == 1:
-                target = entry_price + params['target_atr_mult'] * atr_val
-                sl = entry_price - params['sl_atr_mult'] * atr_val
-            else:
-                target = entry_price - params['target_atr_mult'] * atr_val
-                sl = entry_price + params['sl_atr_mult'] * atr_val
-
-            indicators = (row['indicators_long'] if pos_side==1 else row['indicators_short'])
-            primary = choose_primary_indicator(indicators)
-
-            entry_details = {
-                "Entry Date": entry_date,
-                "Entry Price": entry_price,
-                "Side": "Long" if pos_side==1 else "Short",
-                "Indicators": indicators,
-                "Primary Indicator": primary,
-                "Confluences": row['total_votes']
-            }
-            in_pos = True
-            # continue to next bar to evaluate exits based on future closes (which is allowed in a forward walk)
-            continue
-
-        # If in position, check exit conditions using current bar's Close only (no intraday highs/lows)
+        # 1) If currently in position -> check exits using THIS row (which is a future bar relative to entry)
         if in_pos:
-            closep = row['Close']
-            exit_price = None
-            reason = None
+            h = row['High']; l = row['Low']; closep = row['Close']
+            exit_price = None; reason = None
 
             if pos_side == 1:
-                # close-based exit: first close at/above target -> exit at target, first close at/below SL -> exit at SL
-                if not pd.isna(closep) and closep >= target:
+                if not pd.isna(h) and h >= target:
                     exit_price = target
-                    reason = "Target hit (close)"
-                elif not pd.isna(closep) and closep <= sl:
+                    reason = "Target hit"
+                elif not pd.isna(l) and l <= sl:
                     exit_price = sl
-                    reason = "Stopped (close)"
-                # opposite signal at close
-                elif row['Signal'] == -1 and row['total_votes'] >= params['min_confluence']:
+                    reason = "Stopped"
+                elif sig == -1 and row['total_votes'] >= params['min_confluence']:
                     exit_price = closep
-                    reason = "Opposite signal (close)"
+                    reason = "Opposite signal"
             else:  # short
-                if not pd.isna(closep) and closep <= target:
+                if not pd.isna(l) and l <= target:
                     exit_price = target
-                    reason = "Target hit (close)"
-                elif not pd.isna(closep) and closep >= sl:
+                    reason = "Target hit"
+                elif not pd.isna(h) and h >= sl:
                     exit_price = sl
-                    reason = "Stopped (close)"
-                elif row['Signal'] == 1 and row['total_votes'] >= params['min_confluence']:
+                    reason = "Stopped"
+                elif sig == 1 and row['total_votes'] >= params['min_confluence']:
                     exit_price = closep
-                    reason = "Opposite signal (close)"
+                    reason = "Opposite signal"
 
-            # final day fallback: if last day and still in_pos, exit at close
-            if i == (len(df_signals)-1) and in_pos and exit_price is None:
+            # final day fallback: if last row and still in_pos, exit at close
+            if i == (n-1) and in_pos and exit_price is None:
                 exit_price = closep
                 reason = "End of data"
 
@@ -407,14 +372,42 @@ def backtest_point_strategy(df_signals, params):
                 target = None
                 sl = None
 
-    # Aggregate results
+        # 2) If not in position -> enter using THIS row's Close (no future data used for entry)
+        if (not in_pos) and sig != 0:
+            entry_date = row.name
+            entry_price = row['Close'] if not pd.isna(row['Close']) else row['Open']
+            pos_side = sig  # 1 long, -1 short
+            # set sl/target based on ATR
+            atr_val = row.get(f"atr_{params['atr_period']}", np.nan)
+            if np.isnan(atr_val) or atr_val == 0:
+                atr_val = df_signals[f"atr_{params['atr_period']}"].median() or 1.0
+            if pos_side == 1:
+                target = entry_price + params['target_atr_mult'] * atr_val
+                sl = entry_price - params['sl_atr_mult'] * atr_val
+            else:
+                target = entry_price - params['target_atr_mult'] * atr_val
+                sl = entry_price + params['sl_atr_mult'] * atr_val
+
+            indicators = (row['indicators_long'] if pos_side==1 else row['indicators_short'])
+            primary = choose_primary_indicator(indicators)
+
+            entry_details = {
+                "Entry Date": entry_date, "Entry Price": entry_price,
+                "Side": "Long" if pos_side==1 else "Short",
+                "Indicators": indicators,
+                "Primary Indicator": primary,
+                "Confluences": row['total_votes']
+            }
+            in_pos = True
+            # we do not check exits on the same bar where we entered (entry executed at close)
+            continue
+
     trades_df = pd.DataFrame(trades)
     total_points = trades_df['Points'].sum() if not trades_df.empty else 0.0
     num_trades = len(trades_df)
     wins = (trades_df['Points'] > 0).sum() if not trades_df.empty else 0
     prob_of_profit = (wins / num_trades) if num_trades>0 else 0.0
 
-    # percent_return relative to buy-hold points (guard divide by zero)
     percent_vs_buyhold = (total_points / (abs(buy_hold_points)+1e-9)) * 100 if abs(buy_hold_points) > 0 else np.nan
 
     summary = {
@@ -477,8 +470,9 @@ def optimize_parameters(df, base_params, n_iter, target_acc, target_points, side
 
 # ------------------- Streamlit App -------------------
 
-st.title("Backtester with Confluence + Accuracy Target")
-st.markdown("Upload OHLCV CSV/XLSX (Date,Open,High,Low,Close,Volume). The app will run a randomized search to find parameters that reach user-specified accuracy% (probability of profit) and strategy returns.")
+st.title("Backtester with Confluence + Accuracy Target (Entry on Candle Close)")
+st.markdown("Upload OHLCV CSV/XLSX (Date,Open,High,Low,Close,Volume).
+This version executes entries at the same candle's **Close** where the Signal appears (no next-bar open). Use the 'Select last date' dropdown to restrict the dataset up to a chosen date (start date is the min date of uploaded data).")
 
 uploaded_file = st.file_uploader("Upload CSV/XLSX", type=['csv','xlsx'])
 side = st.selectbox("Trade Side", options=["Both","Long","Short"], index=0)
@@ -487,208 +481,206 @@ expected_returns = st.number_input("Expected strategy returns (total points)", v
 expected_accuracy_pct = st.number_input("Expected accuracy % (probability of profit, e.g. 70)", min_value=0.0, max_value=100.0, value=60.0, step=0.5)
 run_btn = st.button("Run Backtest & Optimize")
 
-if uploaded_file is not None and run_btn:
-    with st.spinner("Reading data and running optimization..."):
-        try:
-            if str(uploaded_file).lower().endswith('.xlsx') or (hasattr(uploaded_file, 'name') and uploaded_file.name.lower().endswith(('.xls','.xlsx'))):
-                raw = pd.read_excel(uploaded_file)
+if uploaded_file is not None:
+    try:
+        if str(uploaded_file).lower().endswith('.xlsx') or hasattr(uploaded_file, 'getvalue') and ('xls' in uploaded_file.name.lower()):
+            raw = pd.read_excel(uploaded_file)
+        else:
+            raw = pd.read_csv(uploaded_file)
+        df_full = normalize_df(raw)
+    except Exception as e:
+        st.error(f"Failed to read/normalize file: {e}")
+        st.stop()
+
+    # show uploaded top/bottom 5 rows
+    st.subheader("Uploaded file sample")
+    try:
+        st.write(f"Rows: {raw.shape[0]} Columns: {raw.shape[1]}")
+        st.dataframe(raw.head(5))
+        st.subheader("Uploaded file - bottom 5 rows")
+        st.dataframe(raw.tail(5))
+    except Exception:
+        pass
+
+    # Dropdown: select last date (start date is min date)
+    min_date = df_full.index.min().date()
+    max_date = df_full.index.max().date()
+    st.markdown(f"**Data range:** {min_date} to {max_date}")
+    unique_dates = sorted({d.date() for d in df_full.index})
+    selected_last_date = st.selectbox("Select last date (restrict data up to this date)", options=unique_dates, index=len(unique_dates)-1, format_func=lambda x: x.strftime('%Y-%m-%d'))
+
+    # slice dataframe up to selected date (inclusive)
+    df = df_full.loc[:pd.to_datetime(selected_last_date)]
+
+    if run_btn:
+        with st.spinner("Running optimization on restricted dataset..."):
+            # base params (defaults)
+            base_params = {
+                'sma_fast': 10, 'sma_slow': 50,
+                'ema_fast': 9, 'ema_slow': 21,
+                'macd_signal': 9, 'rsi_period': 14, 'mom_period': 10,
+                'stoch_period': 14, 'cci_period': 20, 'adx_period': 14,
+                'atr_period': 14, 'target_atr_mult': 1.5, 'sl_atr_mult': 1.0,
+                'min_confluence': 3, 'vol_multiplier': 1.5,
+                'vwma_period': 14, 'vol_sma_period': 20
+            }
+
+            target_acc = expected_accuracy_pct/100.0
+            target_points = expected_returns
+
+            best_params, best_summary, best_trades, perfect = optimize_parameters(df, base_params, int(random_iters), target_acc, target_points, side)
+
+            st.subheader("Optimization Result")
+            st.write("Target accuracy:", expected_accuracy_pct, "% ; Target points:", target_points)
+            st.write("Perfect match found:" , perfect)
+            st.json(best_params)
+
+            st.subheader("Summary (best candidate)")
+            st.write(best_summary)
+
+            if best_trades is None or best_trades.empty:
+                st.info("No trades found with best parameters.")
             else:
-                raw = pd.read_csv(uploaded_file)
-            df = normalize_df(raw)
-        except Exception as e:
-            st.error(f"Failed to read/normalize file: {e}")
-            st.stop()
+                # preserve format + show Primary Indicator column
+                best_trades_display = best_trades.copy()
+                # Top 5 & Bottom 5
+                st.subheader("Top 5 trades (by Points)")
+                st.dataframe(best_trades_display.nlargest(5, 'Points'))
+                st.subheader("Bottom 5 trades (by Points)")
+                st.dataframe(best_trades_display.nsmallest(5, 'Points'))
 
-        # show uploaded top/bottom 5 rows
-        st.subheader("Uploaded file sample")
-        try:
-            st.write(f"Rows: {raw.shape[0]} Columns: {raw.shape[1]}")
-            st.dataframe(raw.head(5))
-            st.subheader("Uploaded file - bottom 5 rows")
-            st.dataframe(raw.tail(5))
-        except Exception:
-            pass
+                # Heatmap: monthly returns pivot table (Year x Month) - show percent returns
+                best_trades_display['Exit Date'] = pd.to_datetime(best_trades_display['Exit Date'])
+                best_trades_display['Year'] = best_trades_display['Exit Date'].dt.year
+                best_trades_display['Month'] = best_trades_display['Exit Date'].dt.month
+                monthly_points = best_trades_display.groupby(['Year','Month'])['Points'].sum().reset_index()
 
-        # --- New: allow user to restrict data upto a chosen last date ---
-        min_date = df.index.min().date()
-        max_date = df.index.max().date()
-        st.subheader("Data range selection")
-        st.write(f"Available data range: {min_date} to {max_date}")
-        last_date_selected = st.date_input(
-            "Select last date to use for backtest (start date will be the earliest date of your data)",
-            value=max_date, min_value=min_date, max_value=max_date
-        )
-        # truncate dataframe up to selected last date (inclusive)
-        df = df.loc[:pd.to_datetime(last_date_selected)].copy()
-        st.write(f"Using data from {df.index.min().date()} to {df.index.max().date()} ({len(df)} rows)")
+                # month start price from restricted df
+                month_start = df['Close'].resample('MS').first().reset_index()
+                month_start['Year'] = month_start['Date'].dt.year
+                month_start['Month'] = month_start['Date'].dt.month
+                month_start = month_start.rename(columns={'Close':'Month_Start_Close'})
 
-        # base params (defaults)
-        base_params = {
-            'sma_fast': 10, 'sma_slow': 50,
-            'ema_fast': 9, 'ema_slow': 21,
-            'macd_signal': 9, 'rsi_period': 14, 'mom_period': 10,
-            'stoch_period': 14, 'cci_period': 20, 'adx_period': 14,
-            'atr_period': 14, 'target_atr_mult': 1.5, 'sl_atr_mult': 1.0,
-            'min_confluence': 3, 'vol_multiplier': 1.5,
-            'vwma_period': 14, 'vol_sma_period': 20
-        }
+                monthly = monthly_points.merge(month_start[['Year','Month','Month_Start_Close']], on=['Year','Month'], how='left')
+                # if missing month_start_close, fallback to average close
+                avg_close = df['Close'].mean()
+                monthly['Month_Start_Close'] = monthly['Month_Start_Close'].fillna(avg_close)
+                monthly['Pct_Return'] = (monthly['Points'] / monthly['Month_Start_Close']) * 100.0
 
-        target_acc = expected_accuracy_pct/100.0
-        target_points = expected_returns
+                pivot_pct = monthly.pivot(index='Year', columns='Month', values='Pct_Return').fillna(0)
+                # ensure months 1..12 present
+                for m in range(1,13):
+                    if m not in pivot_pct.columns:
+                        pivot_pct[m] = 0
+                pivot_pct = pivot_pct.reindex(sorted(pivot_pct.columns), axis=1)
 
-        best_params, best_summary, best_trades, perfect = optimize_parameters(df, base_params, int(random_iters), target_acc, target_points, side)
+                st.subheader("Monthly % returns heatmap (Year vs Month)")
+                fig, ax = plt.subplots(figsize=(10, max(2, 0.6*len(pivot_pct.index)+1)))
+                sns.heatmap(pivot_pct, annot=True, fmt='.2f', linewidths=0.5, ax=ax)
+                ax.set_ylabel('Year')
+                ax.set_xlabel('Month')
+                st.pyplot(fig)
 
-        st.subheader("Optimization Result")
-        st.write("Target accuracy:", expected_accuracy_pct, "% ; Target points:", target_points)
-        st.write("Perfect match found:" , perfect)
-        st.json(best_params)
+                st.subheader("All trades (best candidate)")
+                st.dataframe(best_trades_display)
 
-        st.subheader("Summary (best candidate)")
-        st.write(best_summary)
+            # live recommendation (latest bar in restricted df) using best params
+            latest_sig_df = generate_confluence_signals(df, best_params, side)
+            latest_row = latest_sig_df.iloc[-1]
 
-        if best_trades is None or best_trades.empty:
-            st.info("No trades found with best parameters.")
-        else:
-            # preserve format + show Primary Indicator column
-            best_trades_display = best_trades.copy()
-            # Top 5 & Bottom 5
-            st.subheader("Top 5 trades (by Points)")
-            st.dataframe(best_trades_display.nlargest(5, 'Points'))
-            st.subheader("Bottom 5 trades (by Points)")
-            st.dataframe(best_trades_display.nsmallest(5, 'Points'))
+            # human friendly signal
+            sig_val = int(latest_row['Signal'])
+            sig_text = "Buy" if sig_val == 1 else ("Sell" if sig_val == -1 else "No Signal")
 
-            # Heatmap: monthly returns pivot table (Year x Month) - show percent returns
-            best_trades_display['Exit Date'] = pd.to_datetime(best_trades_display['Exit Date'])
-            best_trades_display['Year'] = best_trades_display['Exit Date'].dt.year
-            best_trades_display['Month'] = best_trades_display['Exit Date'].dt.month
-            monthly_points = best_trades_display.groupby(['Year','Month'])['Points'].sum().reset_index()
+            # compute entry/target/sl for live rec (entry executed at last available candle close)
+            atr_val = latest_row.get(f"atr_{best_params['atr_period']}", np.nan)
+            entry_price_est = float(latest_row['Close'])
+            if sig_val == 1:
+                target_price = entry_price_est + best_params['target_atr_mult'] * atr_val
+                sl_price = entry_price_est - best_params['sl_atr_mult'] * atr_val
+                indicators_list = latest_row['indicators_long']
+            elif sig_val == -1:
+                target_price = entry_price_est - best_params['target_atr_mult'] * atr_val
+                sl_price = entry_price_est + best_params['sl_atr_mult'] * atr_val
+                indicators_list = latest_row['indicators_short']
+            else:
+                target_price = np.nan
+                sl_price = np.nan
+                indicators_list = []
 
-            # month start price from (truncated) df
-            month_start = df['Close'].resample('MS').first().reset_index()
-            month_start['Year'] = month_start['Date'].dt.year
-            month_start['Month'] = month_start['Date'].dt.month
-            month_start = month_start.rename(columns={'Close':'Month_Start_Close'})
+            primary = choose_primary_indicator(indicators_list)
+            confluences = int(latest_row.get('total_votes', 0))
+            prob_of_profit = (best_summary.get('prob_of_profit', np.nan) * 100.0) if isinstance(best_summary, dict) else np.nan
 
-            monthly = monthly_points.merge(month_start[['Year','Month','Month_Start_Close']], on=['Year','Month'], how='left')
-            # if missing month_start_close, fallback to average close
-            avg_close = df['Close'].mean()
-            monthly['Month_Start_Close'] = monthly['Month_Start_Close'].fillna(avg_close)
-            monthly['Pct_Return'] = (monthly['Points'] / monthly['Month_Start_Close']) * 100.0
+            # build a short, human-readable reason/logic string
+            def explain_indicator(it):
+                if it.startswith('EMA'):
+                    return f"{it}: short-term EMA above/below long-term EMA -> momentum signal"
+                if it.startswith('SMA'):
+                    return f"{it}: SMA crossover indicating trend bias"
+                if 'MACD' in it:
+                    return "MACD+: histogram >0 indicates bullish momentum; MACD- indicates bearish"
+                if it.startswith('RSI'):
+                    return "RSI extreme indicates overbought/oversold"
+                if 'BB' in it:
+                    return "BB band touch suggests mean-reversion/extreme"
+                if 'VWMA' in it or 'VWAP' in it:
+                    return "Price vs VWMA indicates trade direction with volume support"
+                if 'OBV' in it:
+                    return "OBV rising/falling shows accumulation/distribution"
+                if it == 'VOL_SPIKE':
+                    return "Volume spike with price direction — increased conviction"
+                if it.startswith('MOM'):
+                    return "Momentum positive/negative"
+                if it == 'STOCH':
+                    return "Stochastic crossover in extreme zones"
+                if 'ADX' in it:
+                    return "ADX indicates trend strength and direction via DI lines"
+                if 'CCI' in it:
+                    return "CCI in extremes suggests momentum reversal/continuation"
+                return it
 
-            pivot_pct = monthly.pivot(index='Year', columns='Month', values='Pct_Return').fillna(0)
-            # ensure months 1..12 present
-            for m in range(1,13):
-                if m not in pivot_pct.columns:
-                    pivot_pct[m] = 0
-            pivot_pct = pivot_pct.reindex(sorted(pivot_pct.columns), axis=1)
+            reasons = [explain_indicator(ii) for ii in indicators_list]
+            reason_text = (f"Primary: {primary}. ") + ("; ".join(reasons) if reasons else "No strong indicator explanation.")
 
-            st.subheader("Monthly % returns heatmap (Year vs Month)")
-            fig, ax = plt.subplots(figsize=(10, max(2, 0.6*len(pivot_pct.index)+1)))
-            sns.heatmap(pivot_pct, annot=True, fmt='.2f', linewidths=0.5, ax=ax)
-            ax.set_ylabel('Year')
-            ax.set_xlabel('Month')
-            st.pyplot(fig)
+            indicator_values = {
+                'sma_fast': latest_row.get(f"sma_{best_params['sma_fast']}", np.nan),
+                'sma_slow': latest_row.get(f"sma_{best_params['sma_slow']}", np.nan),
+                'ema_fast': latest_row.get(f"ema_{best_params['ema_fast']}", np.nan),
+                'ema_slow': latest_row.get(f"ema_{best_params['ema_slow']}", np.nan),
+                'macd_hist': latest_row.get('macd_hist', np.nan),
+                f"rsi_{best_params['rsi_period']}": latest_row.get(f"rsi_{best_params['rsi_period']}", np.nan),
+                'bb_upper': latest_row.get('bb_upper', np.nan),
+                'bb_lower': latest_row.get('bb_lower', np.nan),
+                'obv': latest_row.get('obv', np.nan),
+                'vwma': latest_row.get('vwma', np.nan),
+                'cci': latest_row.get('cci', np.nan),
+                'vol': latest_row.get('Volume', np.nan),
+                'vol_sma': latest_row.get('vol_sma', np.nan),
+                f"atr_{best_params['atr_period']}": latest_row.get(f"atr_{best_params['atr_period']}", np.nan)
+            }
 
-            st.subheader("All trades (best candidate)")
-            st.dataframe(best_trades_display)
+            st.subheader("Latest live recommendation (based on best params)")
+            st.markdown(f"**Date (last available):** {latest_sig_df.index[-1].strftime('%Y-%m-%d')}")
+            st.markdown(f"**Signal:** {sig_text}")
+            st.markdown(f"**Entry (executed at candle close):** {entry_price_est:.2f}")
+            st.markdown(f"**Target:** {target_price:.2f}  |  **Stop-loss:** {sl_price:.2f}")
+            st.markdown(f"**Confluences (votes):** {confluences}  |  **Primary indicator:** {primary}")
+            st.markdown(f"**Probability of profit (backtested):** {prob_of_profit:.2f}%")
+            st.markdown("**Indicators that voted:**")
+            st.write(indicators_list)
+            st.markdown("**Reason / Logic (brief):**")
+            st.write(reason_text)
 
-        # live recommendation (latest bar from truncated data) using best params
-        latest_sig_df = generate_confluence_signals(df, best_params, side)
-        latest_row = latest_sig_df.iloc[-1]
+            st.subheader("Latest indicator values (key ones)")
+            ind_df = pd.DataFrame([indicator_values]).T.reset_index()
+            ind_df.columns = ['Indicator', 'Value']
+            st.dataframe(ind_df)
 
-        # human friendly signal
-        sig_val = int(latest_row['Signal'])
-        sig_text = "Buy" if sig_val == 1 else ("Sell" if sig_val == -1 else "No Signal")
-
-        # compute entry/target/sl for live rec (we use last close as entry per user request)
-        atr_val = latest_row.get(f"atr_{best_params['atr_period']}", np.nan)
-        entry_price_est = float(latest_row['Close'])
-        if sig_val == 1:
-            target_price = entry_price_est + best_params['target_atr_mult'] * atr_val
-            sl_price = entry_price_est - best_params['sl_atr_mult'] * atr_val
-            indicators_list = latest_row['indicators_long']
-        elif sig_val == -1:
-            target_price = entry_price_est - best_params['target_atr_mult'] * atr_val
-            sl_price = entry_price_est + best_params['sl_atr_mult'] * atr_val
-            indicators_list = latest_row['indicators_short']
-        else:
-            target_price = np.nan
-            sl_price = np.nan
-            indicators_list = []
-
-        primary = choose_primary_indicator(indicators_list)
-        confluences = int(latest_row.get('total_votes', 0))
-        prob_of_profit = (best_summary.get('prob_of_profit', np.nan) * 100.0) if isinstance(best_summary, dict) else np.nan
-
-        # build a short, human-readable reason/logic string
-        def explain_indicator(it):
-            if it.startswith('EMA'):
-                return f"{it}: short-term EMA above/below long-term EMA -> momentum signal"
-            if it.startswith('SMA'):
-                return f"{it}: SMA crossover indicating trend bias"
-            if 'MACD' in it:
-                return "MACD+: histogram >0 indicates bullish momentum; MACD- indicates bearish"
-            if it.startswith('RSI'):
-                return "RSI extreme indicates overbought/oversold"
-            if 'BB' in it:
-                return "BB band touch suggests mean-reversion/extreme"
-            if 'VWMA' in it or 'VWAP' in it:
-                return "Price vs VWMA indicates trade direction with volume support"
-            if 'OBV' in it:
-                return "OBV rising/falling shows accumulation/distribution"
-            if it == 'VOL_SPIKE':
-                return "Volume spike with price direction — increased conviction"
-            if it.startswith('MOM'):
-                return "Momentum positive/negative"
-            if it == 'STOCH':
-                return "Stochastic crossover in extreme zones"
-            if 'ADX' in it:
-                return "ADX indicates trend strength and direction via DI lines"
-            if 'CCI' in it:
-                return "CCI in extremes suggests momentum reversal/continuation"
-            return it
-
-        reasons = [explain_indicator(ii) for ii in indicators_list]
-        reason_text = (f"Primary: {primary}. ") + ("; ".join(reasons) if reasons else "No strong indicator explanation.")
-
-        indicator_values = {
-            'sma_fast': latest_row.get(f"sma_{best_params['sma_fast']}", np.nan),
-            'sma_slow': latest_row.get(f"sma_{best_params['sma_slow']}", np.nan),
-            'ema_fast': latest_row.get(f"ema_{best_params['ema_fast']}", np.nan),
-            'ema_slow': latest_row.get(f"ema_{best_params['ema_slow']}", np.nan),
-            'macd_hist': latest_row.get('macd_hist', np.nan),
-            f"rsi_{best_params['rsi_period']}": latest_row.get(f"rsi_{best_params['rsi_period']}", np.nan),
-            'bb_upper': latest_row.get('bb_upper', np.nan),
-            'bb_lower': latest_row.get('bb_lower', np.nan),
-            'obv': latest_row.get('obv', np.nan),
-            'vwma': latest_row.get('vwma', np.nan),
-            'cci': latest_row.get('cci', np.nan),
-            'vol': latest_row.get('Volume', np.nan),
-            'vol_sma': latest_row.get('vol_sma', np.nan),
-            f"atr_{best_params['atr_period']}": latest_row.get(f"atr_{best_params['atr_period']}", np.nan)
-        }
-
-        st.subheader("Latest live recommendation (based on best params)")
-        st.markdown(f"**Date:** {latest_sig_df.index[-1].strftime('%Y-%m-%d')}")
-        st.markdown(f"**Signal:** {sig_text}")
-        st.markdown(f"**Entry (at close):** {entry_price_est:.2f}")
-        st.markdown(f"**Target:** {target_price:.2f}  |  **Stop-loss:** {sl_price:.2f}")
-        st.markdown(f"**Confluences (votes):** {confluences}  |  **Primary indicator:** {primary}")
-        st.markdown(f"**Probability of profit (backtested):** {prob_of_profit:.2f}%")
-        st.markdown("**Indicators that voted:**")
-        st.write(indicators_list)
-        st.markdown("**Reason / Logic (brief):**")
-        st.write(reason_text)
-
-        st.subheader("Latest indicator values (key ones)")
-        ind_df = pd.DataFrame([indicator_values]).T.reset_index()
-        ind_df.columns = ['Indicator', 'Value']
-        st.dataframe(ind_df)
-
-        st.success("Done")
+            st.success("Done")
 
 else:
-    st.info("Upload a CSV/XLSX and click 'Run Backtest & Optimize' to start.")
+    st.info("Upload a CSV/XLSX to start. After upload you can choose the 'Select last date' and then click 'Run Backtest & Optimize'.")
 
 
 # ------------------- End -------------------
