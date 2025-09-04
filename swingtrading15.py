@@ -35,7 +35,7 @@ def normalize_df(df):
         df["Volume"] = 0
     # parse date
     if "Date" in df.columns:
-        df["Date"] = pd.to_datetime(df["Date"]).dt.tz_localize(None)
+        df["Date"] = pd.to_datetime(df["Date"]) 
         df = df.set_index("Date").sort_index()
     else:
         df.index = pd.to_datetime(df.index)
@@ -283,7 +283,7 @@ def generate_confluence_signals(df_local, params, side="Both"):
     result['Signal'] = sig_series
     return result
 
-# ------------------- Backtester (entry executed at SAME bar close) -------------------
+# ------------------- Backtester (close-based, no future intraday) -------------------
 
 def choose_primary_indicator(indicators_list):
     # priority for display if multiple indicators exist
@@ -296,36 +296,38 @@ def choose_primary_indicator(indicators_list):
 
 
 def backtest_point_strategy(df_signals, params):
-    """Entry/decision on the **same bar close** (no next-bar open). Exits are evaluated from the *next* bar onward (target/SL/opposite),
-    and if still open by the last available bar, we mark-to-market at the last bar close. No look-ahead is used for entries.
-    Returns: (summary_dict, trades_df)
+    """
+    Close-based backtester (no next-bar open usage).
+    - Entry executed at the same bar's Close (no future data used for entry).
+    - Exits are evaluated on subsequent bars' Close only (first close that crosses target/SL or opposite signal).
+    Returns: (summary, trades_df)
     """
     trades = []
     in_pos = False
     pos_side = 0
     entry_price = None
+    entry_date = None
     entry_details = None
     target = None
     sl = None
 
-    # buy & hold baseline (points)
+    # buy & hold baseline (points) using available (possibly truncated) series
     first_price = df_signals['Close'].iloc[0]
     last_price = df_signals['Close'].iloc[-1]
     buy_hold_points = last_price - first_price
 
-    # iterate up to the penultimate row so we can look at next_row for exits only
-    for i in range(len(df_signals) - 1):
+    # iterate rows in chronological order
+    for i in range(len(df_signals)):
         row = df_signals.iloc[i]
-        next_row = df_signals.iloc[i + 1]
-        sig = int(row['Signal'])
+        sig = row['Signal']
 
-        # ENTRY at **current bar close** (no future/next bar data)
+        # If not in position and there's a signal -> enter at the same day's Close (no future data)
         if (not in_pos) and sig != 0:
             entry_date = row.name
-            entry_price = float(row['Close'])
+            entry_price = row['Close'] if not pd.isna(row['Close']) else row['Open']
             pos_side = sig  # 1 long, -1 short
 
-            # set sl/target based on current-bar ATR
+            # set sl/target based on ATR computed up to current bar
             atr_val = row.get(f"atr_{params['atr_period']}", np.nan)
             if np.isnan(atr_val) or atr_val == 0:
                 atr_val = df_signals[f"atr_{params['atr_period']}"] .median() or 1.0
@@ -336,61 +338,64 @@ def backtest_point_strategy(df_signals, params):
                 target = entry_price - params['target_atr_mult'] * atr_val
                 sl = entry_price + params['sl_atr_mult'] * atr_val
 
-            # capture indicators at entry
-            indicators = (row['indicators_long'] if pos_side == 1 else row['indicators_short'])
+            indicators = (row['indicators_long'] if pos_side==1 else row['indicators_short'])
             primary = choose_primary_indicator(indicators)
 
             entry_details = {
                 "Entry Date": entry_date,
                 "Entry Price": entry_price,
-                "Side": "Long" if pos_side == 1 else "Short",
+                "Side": "Long" if pos_side==1 else "Short",
                 "Indicators": indicators,
                 "Primary Indicator": primary,
-                "Confluences": int(row['total_votes'])
+                "Confluences": row['total_votes']
             }
             in_pos = True
+            # continue to next bar to evaluate exits based on future closes (which is allowed in a forward walk)
             continue
 
-        # If in position, evaluate exits on the **next** bar (i+1) range/close (this is not look-ahead for the entry bar)
+        # If in position, check exit conditions using current bar's Close only (no intraday highs/lows)
         if in_pos:
-            h = next_row['High']; l = next_row['Low']; closep = next_row['Close']
-            exit_price = None; reason = None
+            closep = row['Close']
+            exit_price = None
+            reason = None
 
             if pos_side == 1:
-                if not pd.isna(h) and h >= target:
+                # close-based exit: first close at/above target -> exit at target, first close at/below SL -> exit at SL
+                if not pd.isna(closep) and closep >= target:
                     exit_price = target
-                    reason = "Target hit"
-                elif not pd.isna(l) and l <= sl:
+                    reason = "Target hit (close)"
+                elif not pd.isna(closep) and closep <= sl:
                     exit_price = sl
-                    reason = "Stopped"
-                elif next_row['Signal'] == -1 and next_row['total_votes'] >= params['min_confluence']:
+                    reason = "Stopped (close)"
+                # opposite signal at close
+                elif row['Signal'] == -1 and row['total_votes'] >= params['min_confluence']:
                     exit_price = closep
-                    reason = "Opposite signal"
-            else:
-                if not pd.isna(l) and l <= target:
+                    reason = "Opposite signal (close)"
+            else:  # short
+                if not pd.isna(closep) and closep <= target:
                     exit_price = target
-                    reason = "Target hit"
-                elif not pd.isna(h) and h >= sl:
+                    reason = "Target hit (close)"
+                elif not pd.isna(closep) and closep >= sl:
                     exit_price = sl
-                    reason = "Stopped"
-                elif next_row['Signal'] == 1 and next_row['total_votes'] >= params['min_confluence']:
+                    reason = "Stopped (close)"
+                elif row['Signal'] == 1 and row['total_votes'] >= params['min_confluence']:
                     exit_price = closep
-                    reason = "Opposite signal"
+                    reason = "Opposite signal (close)"
 
-            # final bar fallback: if we're on the penultimate index and still in_pos with no exit, exit at **last bar close**
-            if (i + 1) == (len(df_signals) - 1) and in_pos and exit_price is None:
+            # final day fallback: if last day and still in_pos, exit at close
+            if i == (len(df_signals)-1) and in_pos and exit_price is None:
                 exit_price = closep
                 reason = "End of data"
 
             if exit_price is not None:
-                exit_date = next_row.name
+                exit_date = row.name
                 points = (exit_price - entry_price) if pos_side == 1 else (entry_price - exit_price)
                 trades.append({
                     **entry_details,
                     "Exit Date": exit_date,
-                    "Exit Price": float(exit_price),
+                    "Exit Price": exit_price,
                     "Reason Exit": reason,
-                    "Points": float(points),
+                    "Points": points,
                     "Hold Days": (pd.to_datetime(exit_date).date() - pd.to_datetime(entry_details['Entry Date']).date()).days
                 })
 
@@ -402,21 +407,23 @@ def backtest_point_strategy(df_signals, params):
                 target = None
                 sl = None
 
+    # Aggregate results
     trades_df = pd.DataFrame(trades)
     total_points = trades_df['Points'].sum() if not trades_df.empty else 0.0
     num_trades = len(trades_df)
     wins = (trades_df['Points'] > 0).sum() if not trades_df.empty else 0
-    prob_of_profit = (wins / num_trades) if num_trades > 0 else 0.0
+    prob_of_profit = (wins / num_trades) if num_trades>0 else 0.0
 
-    percent_vs_buyhold = (total_points / (abs(buy_hold_points) + 1e-9)) * 100 if abs(buy_hold_points) > 0 else np.nan
+    # percent_return relative to buy-hold points (guard divide by zero)
+    percent_vs_buyhold = (total_points / (abs(buy_hold_points)+1e-9)) * 100 if abs(buy_hold_points) > 0 else np.nan
 
     summary = {
-        'total_points': float(total_points),
-        'num_trades': int(num_trades),
-        'wins': int(wins),
-        'prob_of_profit': float(prob_of_profit),
-        'buy_hold_points': float(buy_hold_points),
-        'pct_vs_buyhold': float(percent_vs_buyhold) if not np.isnan(percent_vs_buyhold) else np.nan
+        'total_points': total_points,
+        'num_trades': num_trades,
+        'wins': wins,
+        'prob_of_profit': prob_of_profit,
+        'buy_hold_points': buy_hold_points,
+        'pct_vs_buyhold': percent_vs_buyhold
     }
     return summary, trades_df
 
@@ -471,19 +478,19 @@ def optimize_parameters(df, base_params, n_iter, target_acc, target_points, side
 # ------------------- Streamlit App -------------------
 
 st.title("Backtester with Confluence + Accuracy Target")
-st.markdown("Upload OHLCV CSV (Date,Open,High,Low,Close,Volume). The app will run a randomized search to find parameters that reach user-specified accuracy% (probability of profit) and strategy returns.")
+st.markdown("Upload OHLCV CSV/XLSX (Date,Open,High,Low,Close,Volume). The app will run a randomized search to find parameters that reach user-specified accuracy% (probability of profit) and strategy returns.")
 
-uploaded_file = st.file_uploader("Upload CSV", type=['csv','xlsx'])
+uploaded_file = st.file_uploader("Upload CSV/XLSX", type=['csv','xlsx'])
 side = st.selectbox("Trade Side", options=["Both","Long","Short"], index=0)
 random_iters = st.number_input("Random iterations (1-2000)", min_value=1, max_value=2000, value=200, step=1)
-expected_returns = st.number_input("Expected strategy returns (total points)", value=150000.0, step=1.0, format="%.2f")
-expected_accuracy_pct = st.number_input("Expected accuracy % (probability of profit, e.g. 70)", min_value=0.0, max_value=100.0, value=100.0, step=0.5)
+expected_returns = st.number_input("Expected strategy returns (total points)", value=0.0, step=1.0, format="%.2f")
+expected_accuracy_pct = st.number_input("Expected accuracy % (probability of profit, e.g. 70)", min_value=0.0, max_value=100.0, value=60.0, step=0.5)
 run_btn = st.button("Run Backtest & Optimize")
 
 if uploaded_file is not None and run_btn:
     with st.spinner("Reading data and running optimization..."):
         try:
-            if str(uploaded_file).lower().endswith('.xlsx') or (hasattr(uploaded_file, 'name') and uploaded_file.name.lower().endswith(('.xlsx','.xls'))):
+            if str(uploaded_file).lower().endswith('.xlsx') or (hasattr(uploaded_file, 'name') and uploaded_file.name.lower().endswith(('.xls','.xlsx'))):
                 raw = pd.read_excel(uploaded_file)
             else:
                 raw = pd.read_csv(uploaded_file)
@@ -502,16 +509,18 @@ if uploaded_file is not None and run_btn:
         except Exception:
             pass
 
-        # --------- New: restrict data up to a selected 'last date' (start date = min date) ---------
-        all_dates = df.index.to_series().dt.strftime('%Y-%m-%d').tolist()
-        min_date = df.index.min()
-        max_date = df.index.max()
-        st.markdown(f"**Start date (min in data):** {min_date.strftime('%Y-%m-%d')}")
-        sel_date_str = st.selectbox("Backtest up to (last date)", options=all_dates, index=len(all_dates)-1)
-        sel_date = pd.to_datetime(sel_date_str)
-        df_cut = df.loc[:sel_date]
-        if df_cut.shape[0] < 50:
-            st.warning("Very few rows after date restriction; results may be unstable.")
+        # --- New: allow user to restrict data upto a chosen last date ---
+        min_date = df.index.min().date()
+        max_date = df.index.max().date()
+        st.subheader("Data range selection")
+        st.write(f"Available data range: {min_date} to {max_date}")
+        last_date_selected = st.date_input(
+            "Select last date to use for backtest (start date will be the earliest date of your data)",
+            value=max_date, min_value=min_date, max_value=max_date
+        )
+        # truncate dataframe up to selected last date (inclusive)
+        df = df.loc[:pd.to_datetime(last_date_selected)].copy()
+        st.write(f"Using data from {df.index.min().date()} to {df.index.max().date()} ({len(df)} rows)")
 
         # base params (defaults)
         base_params = {
@@ -521,20 +530,15 @@ if uploaded_file is not None and run_btn:
             'stoch_period': 14, 'cci_period': 20, 'adx_period': 14,
             'atr_period': 14, 'target_atr_mult': 1.5, 'sl_atr_mult': 1.0,
             'min_confluence': 3, 'vol_multiplier': 1.5,
-            'vwma_period': 14, 'vol_sma_period': 20,
-            'rsi_oversold': 35, 'rsi_overbought': 65,
-            'adx_threshold': 20,
-            'stoch_oversold': 30, 'stoch_overbought': 70,
-            'bb_mult': 2
+            'vwma_period': 14, 'vol_sma_period': 20
         }
 
-        target_acc = expected_accuracy_pct / 100.0
+        target_acc = expected_accuracy_pct/100.0
         target_points = expected_returns
 
-        best_params, best_summary, best_trades, perfect = optimize_parameters(df_cut, base_params, int(random_iters), target_acc, target_points, side)
+        best_params, best_summary, best_trades, perfect = optimize_parameters(df, base_params, int(random_iters), target_acc, target_points, side)
 
         st.subheader("Optimization Result")
-        st.write("Backtest up to:", sel_date.strftime('%Y-%m-%d'))
         st.write("Target accuracy:", expected_accuracy_pct, "% ; Target points:", target_points)
         st.write("Perfect match found:" , perfect)
         st.json(best_params)
@@ -545,30 +549,34 @@ if uploaded_file is not None and run_btn:
         if best_trades is None or best_trades.empty:
             st.info("No trades found with best parameters.")
         else:
+            # preserve format + show Primary Indicator column
             best_trades_display = best_trades.copy()
+            # Top 5 & Bottom 5
             st.subheader("Top 5 trades (by Points)")
             st.dataframe(best_trades_display.nlargest(5, 'Points'))
             st.subheader("Bottom 5 trades (by Points)")
             st.dataframe(best_trades_display.nsmallest(5, 'Points'))
 
-            # Heatmap: monthly % returns (Year x Month)
+            # Heatmap: monthly returns pivot table (Year x Month) - show percent returns
             best_trades_display['Exit Date'] = pd.to_datetime(best_trades_display['Exit Date'])
             best_trades_display['Year'] = best_trades_display['Exit Date'].dt.year
             best_trades_display['Month'] = best_trades_display['Exit Date'].dt.month
             monthly_points = best_trades_display.groupby(['Year','Month'])['Points'].sum().reset_index()
 
-            # month start price from **filtered** df
-            month_start = df_cut['Close'].resample('MS').first().reset_index()
+            # month start price from (truncated) df
+            month_start = df['Close'].resample('MS').first().reset_index()
             month_start['Year'] = month_start['Date'].dt.year
             month_start['Month'] = month_start['Date'].dt.month
             month_start = month_start.rename(columns={'Close':'Month_Start_Close'})
 
             monthly = monthly_points.merge(month_start[['Year','Month','Month_Start_Close']], on=['Year','Month'], how='left')
-            avg_close = df_cut['Close'].mean()
+            # if missing month_start_close, fallback to average close
+            avg_close = df['Close'].mean()
             monthly['Month_Start_Close'] = monthly['Month_Start_Close'].fillna(avg_close)
             monthly['Pct_Return'] = (monthly['Points'] / monthly['Month_Start_Close']) * 100.0
 
             pivot_pct = monthly.pivot(index='Year', columns='Month', values='Pct_Return').fillna(0)
+            # ensure months 1..12 present
             for m in range(1,13):
                 if m not in pivot_pct.columns:
                     pivot_pct[m] = 0
@@ -584,14 +592,15 @@ if uploaded_file is not None and run_btn:
             st.subheader("All trades (best candidate)")
             st.dataframe(best_trades_display)
 
-        # live recommendation (as of selected last date) using best params
-        latest_sig_df = generate_confluence_signals(df_cut, best_params, side)
+        # live recommendation (latest bar from truncated data) using best params
+        latest_sig_df = generate_confluence_signals(df, best_params, side)
         latest_row = latest_sig_df.iloc[-1]
 
+        # human friendly signal
         sig_val = int(latest_row['Signal'])
         sig_text = "Buy" if sig_val == 1 else ("Sell" if sig_val == -1 else "No Signal")
 
-        # ENTRY/levels computed on **last candle close** (no future data)
+        # compute entry/target/sl for live rec (we use last close as entry per user request)
         atr_val = latest_row.get(f"atr_{best_params['atr_period']}", np.nan)
         entry_price_est = float(latest_row['Close'])
         if sig_val == 1:
@@ -611,6 +620,7 @@ if uploaded_file is not None and run_btn:
         confluences = int(latest_row.get('total_votes', 0))
         prob_of_profit = (best_summary.get('prob_of_profit', np.nan) * 100.0) if isinstance(best_summary, dict) else np.nan
 
+        # build a short, human-readable reason/logic string
         def explain_indicator(it):
             if it.startswith('EMA'):
                 return f"{it}: short-term EMA above/below long-term EMA -> momentum signal"
@@ -659,9 +669,9 @@ if uploaded_file is not None and run_btn:
         }
 
         st.subheader("Latest live recommendation (based on best params)")
-        st.markdown(f"**As of Date:** {latest_sig_df.index[-1].strftime('%Y-%m-%d')} (data restricted up to this date)")
+        st.markdown(f"**Date:** {latest_sig_df.index[-1].strftime('%Y-%m-%d')}")
         st.markdown(f"**Signal:** {sig_text}")
-        st.markdown(f"**Entry (last candle close):** {entry_price_est:.2f}")
+        st.markdown(f"**Entry (at close):** {entry_price_est:.2f}")
         st.markdown(f"**Target:** {target_price:.2f}  |  **Stop-loss:** {sl_price:.2f}")
         st.markdown(f"**Confluences (votes):** {confluences}  |  **Primary indicator:** {primary}")
         st.markdown(f"**Probability of profit (backtested):** {prob_of_profit:.2f}%")
