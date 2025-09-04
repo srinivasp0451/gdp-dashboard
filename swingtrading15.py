@@ -491,8 +491,8 @@ def optimize_parameters(df, base_params, n_iter, target_acc, target_points, side
 # ------------------- Streamlit App -------------------
 
 st.title("Backtester with Confluence + Accuracy Target (Entry on Candle Close)")
-st.markdown("Upload OHLCV CSV/XLSX (Date,Open,High,Low,Close,Volume).
-This version executes entries at the same candle's **Close** where the Signal appears (no next-bar open). Use the 'Select last date' dropdown to restrict the dataset up to a chosen date (start date is the min date of uploaded data).")
+st.markdown("Upload OHLCV CSV/XLSX Date,Open,High,Low,Close,Volume")
+#This version executes entries at the same candle's **Close** where the Signal appears (no next-bar open). Use the 'Select last date' dropdown to restrict the dataset up to a chosen date (start date is the min date of uploaded data).")
 
 uploaded_file = st.file_uploader("Upload CSV/XLSX", type=['csv','xlsx'])
 side = st.selectbox("Trade Side", options=["Both","Long","Short"], index=0)
