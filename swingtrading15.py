@@ -27,28 +27,44 @@ def normalize_df(df):
         if key in ("date", "datetime", "time"):
             mapping[orig] = "Date"
     df = df.rename(columns=mapping)
+
     # ensure required cols
     for required in ["Open","High","Low","Close"]:
         if required not in df.columns:
             raise ValueError(f"Missing required column: {required}")
+
     if "Volume" not in df.columns:
         df["Volume"] = 0
+
     # parse date
     if "Date" in df.columns:
-        df["Date"] = pd.to_datetime(df["Date"]).dt.tz_localize(None)
+        # try flexible parsing then drop timezone
+        df["Date"] = pd.to_datetime(df["Date"], errors='coerce')
+        if df["Date"].isna().any():
+            # try parsing with dayfirst fallback
+            df["Date"] = pd.to_datetime(df["Date"].astype(str), dayfirst=False, errors='coerce')
+        df = df.dropna(subset=["Date"]).copy()
+        df["Date"] = df["Date"].dt.tz_localize(None)
         df = df.set_index("Date").sort_index()
     else:
-        df.index = pd.to_datetime(df.index).tz_localize(None)
-        df = df.sort_index()
-    # make sure numeric
+        # ensure index is datetime
+        df = df.copy()
+        df.index = pd.to_datetime(df.index, errors='coerce')
+        df = df.dropna(axis=0, subset=[df.index.name]).sort_index()
+
+    # Clean numeric columns: remove common thousands separators/spaces then convert
     for col in ["Open","High","Low","Close","Volume"]:
-        df[col] = pd.to_numeric(df[col], errors="coerce")
+        # convert to string, remove commas/spaces, then numeric
+        df[col] = df[col].astype(str).str.replace(',', '').str.replace(' ', '')
+        df[col] = pd.to_numeric(df[col], errors='coerce')
+
     return df
 
 # ------------------- Technical Indicators (causal) -------------------
 
 def compute_indicators(df, params):
     """Compute indicators required by signal generator. All calculations are causal (use only past/current data).
+    Important: do not overwrite or fill price columns — only fill indicator columns when necessary.
     Returns a DataFrame with indicator columns appended.
     """
     df = df.copy()
@@ -134,8 +150,12 @@ def compute_indicators(df, params):
     df['pdi'] = plus_di
     df['mdi'] = minus_di
 
-    # clean up
-    df = df.fillna(method='ffill').fillna(method='bfill')
+    # Important: fill only indicator columns, do NOT fill/overwrite price columns
+    price_cols = ['Open', 'High', 'Low', 'Close', 'Volume']
+    indicator_cols = [c for c in df.columns if c not in price_cols]
+    if indicator_cols:
+        df[indicator_cols] = df[indicator_cols].fillna(method='ffill').fillna(method='bfill')
+
     return df
 
 # ------------------- Signal Generation (confluence voting) -------------------
@@ -298,7 +318,7 @@ def choose_primary_indicator(indicators_list):
 def backtest_point_strategy(df_signals, params):
     """
     Backtester updated to:
-      - Execute entries at the **same bar's Close** where the Signal appears (no next-bar open used).
+      - Execute entries at the **same bar's Close** where the Signal appears (no next-bar open).
       - Exits are evaluated on **subsequent bars'** OHLC (standard backtest). This avoids using future data for entry decisions.
     """
 
@@ -471,14 +491,14 @@ def optimize_parameters(df, base_params, n_iter, target_acc, target_points, side
 # ------------------- Streamlit App -------------------
 
 st.title("Backtester with Confluence + Accuracy Target (Entry on Candle Close)")
-st.markdown("Upload OHLCV CSV/XLSX Date,Open,High,Low,Close,Volume")
-#This version executes entries at the same candle's **Close** where the Signal appears (no next-bar open). Use the 'Select last date' dropdown to restrict the dataset up to a chosen date (start date is the min date of uploaded data).")
+st.markdown("Upload OHLCV CSV/XLSX (Date,Open,High,Low,Close,Volume).
+This version executes entries at the same candle's **Close** where the Signal appears (no next-bar open). Use the 'Select last date' dropdown to restrict the dataset up to a chosen date (start date is the min date of uploaded data).")
 
 uploaded_file = st.file_uploader("Upload CSV/XLSX", type=['csv','xlsx'])
 side = st.selectbox("Trade Side", options=["Both","Long","Short"], index=0)
 random_iters = st.number_input("Random iterations (1-2000)", min_value=1, max_value=2000, value=200, step=1)
-expected_returns = st.number_input("Expected strategy returns (total points)", value=0.0, step=1.0, format="%.2f")
-expected_accuracy_pct = st.number_input("Expected accuracy % (probability of profit, e.g. 70)", min_value=0.0, max_value=100.0, value=60.0, step=0.5)
+expected_returns = st.number_input("Expected strategy returns (total points)", value=150000.0, step=1.0, format="%.2f")
+expected_accuracy_pct = st.number_input("Expected accuracy % (probability of profit, e.g. 70)", min_value=0.0, max_value=100.0, value=100.0, step=0.5)
 run_btn = st.button("Run Backtest & Optimize")
 
 if uploaded_file is not None:
@@ -492,13 +512,22 @@ if uploaded_file is not None:
         st.error(f"Failed to read/normalize file: {e}")
         st.stop()
 
-    # show uploaded top/bottom 5 rows
-    st.subheader("Uploaded file sample")
+    # show uploaded top/bottom 5 rows (raw)
+    st.subheader("Uploaded file sample (raw)")
     try:
         st.write(f"Rows: {raw.shape[0]} Columns: {raw.shape[1]}")
         st.dataframe(raw.head(5))
-        st.subheader("Uploaded file - bottom 5 rows")
+        st.subheader("Uploaded file - bottom 5 rows (raw)")
         st.dataframe(raw.tail(5))
+    except Exception:
+        pass
+
+    # show normalized dataframe tail so user can verify last candle values used
+    st.subheader("Normalized (used) data - last 5 rows")
+    try:
+        st.dataframe(df_full.tail(5))
+        st.write("Last normalized close:", df_full['Close'].iloc[-1])
+        st.write("Last normalized index:", df_full.index[-1])
     except Exception:
         pass
 
@@ -510,7 +539,7 @@ if uploaded_file is not None:
     selected_last_date = st.selectbox("Select last date (restrict data up to this date)", options=unique_dates, index=len(unique_dates)-1, format_func=lambda x: x.strftime('%Y-%m-%d'))
 
     # slice dataframe up to selected date (inclusive)
-    df = df_full.loc[:pd.to_datetime(selected_last_date)]
+    df = df_full[df_full.index.date <= selected_last_date]
 
     if run_btn:
         with st.spinner("Running optimization on restricted dataset..."):
@@ -588,6 +617,10 @@ if uploaded_file is not None:
             latest_sig_df = generate_confluence_signals(df, best_params, side)
             latest_row = latest_sig_df.iloc[-1]
 
+            # show latest_sig_df tail for debugging
+            st.subheader("Signal DataFrame - last 5 rows (debug)")
+            st.dataframe(latest_sig_df.tail(5))
+
             # human friendly signal
             sig_val = int(latest_row['Signal'])
             sig_text = "Buy" if sig_val == 1 else ("Sell" if sig_val == -1 else "No Signal")
@@ -595,6 +628,11 @@ if uploaded_file is not None:
             # compute entry/target/sl for live rec (entry executed at last available candle close)
             atr_val = latest_row.get(f"atr_{best_params['atr_period']}", np.nan)
             entry_price_est = float(latest_row['Close'])
+
+            # verify actual last close in sliced df
+            actual_last_close = float(df['Close'].iloc[-1])
+            actual_last_idx = df.index[-1]
+
             if sig_val == 1:
                 target_price = entry_price_est + best_params['target_atr_mult'] * atr_val
                 sl_price = entry_price_est - best_params['sl_atr_mult'] * atr_val
@@ -661,7 +699,7 @@ if uploaded_file is not None:
             }
 
             st.subheader("Latest live recommendation (based on best params)")
-            st.markdown(f"**Date (last available):** {latest_sig_df.index[-1].strftime('%Y-%m-%d')}")
+            st.markdown(f"**Date (last available used):** {latest_sig_df.index[-1].strftime('%Y-%m-%d %H:%M:%S')}")
             st.markdown(f"**Signal:** {sig_text}")
             st.markdown(f"**Entry (executed at candle close):** {entry_price_est:.2f}")
             st.markdown(f"**Target:** {target_price:.2f}  |  **Stop-loss:** {sl_price:.2f}")
@@ -676,6 +714,24 @@ if uploaded_file is not None:
             ind_df = pd.DataFrame([indicator_values]).T.reset_index()
             ind_df.columns = ['Indicator', 'Value']
             st.dataframe(ind_df)
+
+            # If there's any mismatch between the entry price computed and the actual last close used, show debug info
+            if not np.isclose(entry_price_est, actual_last_close, atol=1e-8):
+                st.warning("Detected discrepancy between entry price (from signal DataFrame) and actual last Close in the sliced data.")
+                st.write(f"entry_price_est (signal df close): {entry_price_est}")
+                st.write(f"actual_last_close (sliced df close): {actual_last_close}  at index {actual_last_idx}")
+                st.info("Shown below: raw uploaded last rows and normalized data used for calculations.")
+                st.subheader("Raw uploaded - last 5 rows")
+                try:
+                    st.dataframe(raw.tail(5))
+                except Exception:
+                    pass
+                st.subheader("Normalized (used) - last 10 rows")
+                st.dataframe(df_full.tail(10))
+                st.subheader("Signal DF - last 10 rows")
+                st.dataframe(latest_sig_df.tail(10))
+
+                st.error("Possible causes: (1) 'Close' column had non-numeric formatting (commas, currency symbols) and got coerced or filled; (2) duplicate/misaligned timestamps causing latest row in signal DF not to match raw file last row; (3) the dataset slice used by optimizer/backtest is different from uploaded file. The app attempted to clean commas/spaces automatically; please inspect the three tables above to identify the mismatch. If values show commas or unexpected formats, remove them from the source file or let me know and I can add more aggressive cleaning.")
 
             st.success("Done")
 
