@@ -1,3 +1,4 @@
+# app.py
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -7,7 +8,6 @@ import random
 from datetime import datetime
 
 # ------------------- Helpers / Normalization -------------------
-
 def normalize_df(df):
     # normalize common column names to Open/High/Low/Close/Volume/Date
     cols = {c.lower(): c for c in df.columns}
@@ -61,7 +61,6 @@ def normalize_df(df):
     return df
 
 # ------------------- Technical Indicators (causal) -------------------
-
 def compute_indicators(df, params):
     """Compute indicators required by signal generator. All calculations are causal (use only past/current data).
     Important: do not overwrite price columns — only fill indicator columns when necessary.
@@ -158,35 +157,43 @@ def compute_indicators(df, params):
 
     return df
 
-# ------------------- Candlestick & Leading Signals -------------------
-
+# ------------------- Candlestick & Advanced Leading Signals -------------------
 def detect_candlestick_patterns(df, i):
-    # returns list of detected patterns for row i (uses only current and past rows)
+    """Returns list of detected single/multi-bar candlestick patterns up to index i.
+       Uses only current and past rows (no future data).
+    """
     patterns = []
+    n = len(df)
+    if i < 0 or i >= n:
+        return patterns
     row = df.iloc[i]
     prev = df.iloc[i-1] if i-1 >= 0 else None
-
+    prev2 = df.iloc[i-2] if i-2 >= 0 else None
+    # simple variables
     O = row['Open']; H = row['High']; L = row['Low']; C = row['Close']
     body = abs(C - O)
     lower_shadow = min(O, C) - L
     upper_shadow = H - max(O, C)
+    rng = max(H - L, 1e-9)
 
-    # Bullish/Bearish Engulfing (simple)
+    # Doji
+    if body <= 0.1 * rng:
+        patterns.append('DOJI')
+
+    # Engulfing
     if prev is not None:
         if (prev['Close'] < prev['Open']) and (C > O) and (C >= prev['Open']) and (O <= prev['Close']):
             patterns.append('BULL_ENGULF')
         if (prev['Close'] > prev['Open']) and (C < O) and (C <= prev['Open']) and (O >= prev['Close']):
             patterns.append('BEAR_ENGULF')
 
-    # Hammer / Hanging man
+    # Hammer / Hanging man / Shooting star / Inverted hammer
     if body > 0:
         if lower_shadow >= 2 * body and upper_shadow <= 0.5 * body:
-            # bullish hammer if close above open
             if C > O:
                 patterns.append('HAMMER')
             else:
                 patterns.append('HANGING_MAN')
-        # Shooting star / Inverted hammer
         if upper_shadow >= 2 * body and lower_shadow <= 0.5 * body:
             if C < O:
                 patterns.append('SHOOTING_STAR')
@@ -198,16 +205,88 @@ def detect_candlestick_patterns(df, i):
         if (H < prev['High']) and (L > prev['Low']):
             patterns.append('INSIDE_BAR')
 
+    # 3-bar patterns (Morning/Evening Star) simplified
+    if prev is not None and prev2 is not None:
+        O1, C1 = prev2['Open'], prev2['Close']
+        O2, C2 = prev['Open'], prev['Close']
+        O3, C3 = row['Open'], row['Close']
+        body1 = abs(C1 - O1)
+        body2 = abs(C2 - O2)
+        body3 = abs(C3 - O3)
+        # Morning Star (bearish -> small -> bullish)
+        if (C1 < O1) and (body2 <= 0.6 * body1) and (C3 > O3) and (C3 > (O1 + C1) / 2):
+            patterns.append('MORNING_STAR')
+        # Evening Star (bullish -> small -> bearish)
+        if (C1 > O1) and (body2 <= 0.6 * body1) and (C3 < O3) and (C3 < (O1 + C1) / 2):
+            patterns.append('EVENING_STAR')
+
+    # Three White Soldiers / Three Black Crows
+    if i >= 2:
+        c0, c1, c2 = df['Close'].iloc[i-2:i+1]
+        o0, o1, o2 = df['Open'].iloc[i-2:i+1]
+        if (c0 < c1 < c2) and (o1 > c0) and (o2 > c1):
+            patterns.append('THREE_WHITE')
+        if (c0 > c1 > c2) and (o1 < c0) and (o2 < c1):
+            patterns.append('THREE_BLACK')
+
     return patterns
 
-# ------------------- Signal Generation (confluence voting) -------------------
+def find_last_n_peaks(prices, upto_i, n=2):
+    """Find last n peak positions (iloc positions < upto_i). Returns list oldest->newest (positions)."""
+    peaks = []
+    for j in range(upto_i-1, 0, -1):
+        try:
+            if prices.iloc[j] > prices.iloc[j-1] and prices.iloc[j] > prices.iloc[j+1]:
+                peaks.append(j)
+                if len(peaks) >= n:
+                    break
+        except Exception:
+            continue
+    return peaks[::-1]  # oldest -> newest
 
-def generate_confluence_signals(df_local, params, side="Both", signal_mode="Both"):
+def find_last_n_troughs(prices, upto_i, n=2):
+    troughs = []
+    for j in range(upto_i-1, 0, -1):
+        try:
+            if prices.iloc[j] < prices.iloc[j-1] and prices.iloc[j] < prices.iloc[j+1]:
+                troughs.append(j)
+                if len(troughs) >= n:
+                    break
+        except Exception:
+            continue
+    return troughs[::-1]
+
+def detect_divergences(df, i, rsi_col):
+    """Detect simple RSI divergences using last two peaks/troughs prior to index i.
+       Returns list like ['DIV_BULL'] or ['DIV_BEAR'] or [].
+    """
+    res = []
+    prices = df['Close']
+    rsi = df[rsi_col]
+    # peaks -> bearish divergence
+    peaks = find_last_n_peaks(prices, i, n=2)
+    if len(peaks) == 2:
+        p0, p1 = peaks
+        # price makes higher high but RSI lower high
+        if prices.iloc[p1] > prices.iloc[p0] and rsi.iloc[p1] < rsi.iloc[p0]:
+            res.append('DIV_BEAR')
+    # troughs -> bullish divergence
+    troughs = find_last_n_troughs(prices, i, n=2)
+    if len(troughs) == 2:
+        t0, t1 = troughs
+        if prices.iloc[t1] < prices.iloc[t0] and rsi.iloc[t1] > rsi.iloc[t0]:
+            res.append('DIV_BULL')
+    return res
+
+# ------------------- Signal Generation (confluence voting) -------------------
+def generate_confluence_signals(df_local, params, side="Both", signal_mode="Both", advanced_leading=True):
     df_calc = compute_indicators(df_local, params)
     votes = []
     sig_series = pd.Series(0, index=df_calc.index)
 
-    leading_prefixes = ('BULL_ENGULF','BEAR_ENGULF','HAMMER','HANGING_MAN','SHOOTING_STAR','INVERTED_HAMMER','INSIDE_BAR','VOL_SPIKE','BREAK_HI','BREAK_LO')
+    leading_prefixes = ('BULL_ENGULF','BEAR_ENGULF','HAMMER','HANGING_MAN','SHOOTING_STAR','INVERTED_HAMMER',
+                        'INSIDE_BAR','VOL_SPIKE','BREAK_HI','BREAK_LO','DOJI','MORNING_STAR','EVENING_STAR',
+                        'THREE_WHITE','THREE_BLACK','DIV_BULL','DIV_BEAR','RVOL','IMBAL_BULL','IMBAL_BEAR')
 
     for idx in df_calc.index:
         row = df_calc.loc[idx]
@@ -318,13 +397,11 @@ def generate_confluence_signals(df_local, params, side="Both", signal_mode="Both
         patterns = detect_candlestick_patterns(df_calc, i)
         for p in patterns:
             # map patterns to long/short votes
-            if p in ('BULL_ENGULF','HAMMER','INVERTED_HAMMER'):
+            if p in ('BULL_ENGULF','HAMMER','INVERTED_HAMMER','MORNING_STAR','THREE_WHITE'):
                 indicators_that_long.append(p)
-            if p in ('BEAR_ENGULF','HANGING_MAN','SHOOTING_STAR'):
+            if p in ('BEAR_ENGULF','HANGING_MAN','SHOOTING_STAR','EVENING_STAR','THREE_BLACK'):
                 indicators_that_short.append(p)
-            if p == 'INSIDE_BAR':
-                # inside bar alone is neutral; only counts if breakout beyond prior high/low occurs later
-                pass
+            # INSIDE_BAR left neutral; do not append automatically
 
         # Breakout above past N highs (leading)
         lookback = params.get('breakout_lookback', 10)
@@ -336,6 +413,38 @@ def generate_confluence_signals(df_local, params, side="Both", signal_mode="Both
                     indicators_that_long.append(f'BREAK_HI_{lookback}')
                 if row['Close'] < prev_lows.min():
                     indicators_that_short.append(f'BREAK_LO_{lookback}')
+
+        # ----------------- Advanced leading signals (optional) -----------------
+        if advanced_leading:
+            # RVOL (relative volume)
+            if not np.isnan(row.get('vol_sma', np.nan)) and row['vol_sma'] > 0:
+                rv = row['Volume'] / (row['vol_sma'] + 1e-9)
+                if rv >= params.get('rvol_threshold', 2.0):
+                    # bullish if close up, bearish if close down
+                    if row['Close'] > row['Open']:
+                        indicators_that_long.append('RVOL')
+                    elif row['Close'] < row['Open']:
+                        indicators_that_short.append('RVOL')
+
+            # Order-flow style imbalance (close near high/low + volume)
+            rng = row['High'] - row['Low'] if (row['High'] - row['Low']) != 0 else 1e-9
+            close_near_high = (row['High'] - row['Close']) / rng < 0.2
+            close_near_low = (row['Close'] - row['Low']) / rng < 0.2
+            if row['Volume'] > row.get('vol_sma', 0) * 1.2:
+                if close_near_high:
+                    indicators_that_long.append('IMBAL_BULL')
+                if close_near_low:
+                    indicators_that_short.append('IMBAL_BEAR')
+
+            # RSI divergence
+            rsi_col = f"rsi_{params['rsi_period']}"
+            if rsi_col in df_calc.columns:
+                divs = detect_divergences(df_calc, i, rsi_col)
+                for d in divs:
+                    if d == 'DIV_BULL':
+                        indicators_that_long.append(d)
+                    if d == 'DIV_BEAR':
+                        indicators_that_short.append(d)
 
         # ---- filter indicator lists based on user-selected signal_mode ----
         def is_leading(ind):
@@ -384,10 +493,10 @@ def generate_confluence_signals(df_local, params, side="Both", signal_mode="Both
     return result
 
 # ------------------- Backtester (entries on same-bar close; exits on subsequent bars) -------------------
-
 def choose_primary_indicator(indicators_list):
     # priority for display if multiple indicators exist (leading patterns first)
-    priority = ['BULL_ENGULF','BEAR_ENGULF','HAMMER','SHOOTING_STAR','VOL_SPIKE','BREAK_HI','BREAK_LO',
+    priority = ['BULL_ENGULF','BEAR_ENGULF','MORNING_STAR','EVENING_STAR','HAMMER','SHOOTING_STAR',
+                'RVOL','IMBAL_BULL','IMBAL_BEAR','DIV_BULL','DIV_BEAR','VOL_SPIKE','BREAK_HI','BREAK_LO',
                 'EMA','SMA','MACD','RSI','BB','VWMA','OBV','MOM','STOCH','ADX','CCI']
     for p in priority:
         for it in indicators_list:
@@ -395,14 +504,12 @@ def choose_primary_indicator(indicators_list):
                 return it
     return indicators_list[0] if indicators_list else ''
 
-
 def backtest_point_strategy(df_signals, params):
     """
     Backtester updated to:
-      - Execute entries at the same candle's Close where the Signal appears (no next-bar open).
+      - Execute entries at the same bar's Close where the Signal appears (no next-bar open).
       - Exits are evaluated on subsequent bars' OHLC (no exit on the same bar as entry).
     """
-
     trades = []
     in_pos = False
     pos_side = 0
@@ -522,7 +629,6 @@ def backtest_point_strategy(df_signals, params):
     return summary, trades_df
 
 # ------------------- Parameter optimization (random search) -------------------
-
 def sample_random_params(base):
     p = base.copy()
     # sample sensible ranges
@@ -542,10 +648,10 @@ def sample_random_params(base):
     p['min_confluence'] = random.randint(1,6)
     p['vol_multiplier'] = round(random.uniform(1.0,3.0),2)
     p['breakout_lookback'] = random.choice([5,10,20])
+    p['rvol_threshold'] = round(random.uniform(1.5,3.0),2)
     return p
 
-
-def optimize_parameters(df, base_params, n_iter, target_acc, target_points, side, signal_mode='Both', progress_bar=None, status_text=None):
+def optimize_parameters(df, base_params, n_iter, target_acc, target_points, side, signal_mode='Both', advanced_leading=True, progress_bar=None, status_text=None):
     best = None
     best_score = None
     results = []
@@ -553,7 +659,7 @@ def optimize_parameters(df, base_params, n_iter, target_acc, target_points, side
     for i in range(n_iter):
         p = sample_random_params(base_params)
         try:
-            df_sig = generate_confluence_signals(df, p, side, signal_mode)
+            df_sig = generate_confluence_signals(df, p, side, signal_mode, advanced_leading)
             summary, trades = backtest_point_strategy(df_sig, p)
         except Exception:
             # update progress and continue
@@ -581,14 +687,18 @@ def optimize_parameters(df, base_params, n_iter, target_acc, target_points, side
     return best[0], best[1], best[2], False
 
 # ------------------- Streamlit App -------------------
-
-st.title("Backtester with Confluence + Leading Signals (selectable mode)")
-st.markdown("Upload OHLCV CSV/XLSX Date,Open,High,Low,Close,Volume")
-#This upgraded version allows choosing `Lagging`, `Price Action`, or `Both` as the source of signals, adds leading signals (candlesticks/volume/breakouts), and shows a progress bar during optimization. Entries are executed at candle Close (no lookahead).")
+st.title("Backtester with Confluence + Advanced Leading Signals")
+st.markdown(
+    "Upload OHLCV CSV/XLSX (Date,Open,High,Low,Close,Volume).\n"
+    "Choose signal source: Lagging, Price Action (leading), or Both. "
+    "Toggle Advanced Leading Signals to enable divergence/RVOL/imbalances. "
+    "Entries execute at candle Close (no future lookahead)."
+)
 
 uploaded_file = st.file_uploader("Upload CSV/XLSX", type=['csv','xlsx'])
 side = st.selectbox("Trade Side", options=["Both","Long","Short"], index=0)
 signal_mode = st.selectbox("Signal source/mode", options=["Lagging","Price Action","Both"], index=2)
+advanced_leading = st.checkbox("Use advanced leading signals (divergence/RVOL/imbalance)", value=True)
 random_iters = st.number_input("Random iterations (1-2000)", min_value=1, max_value=2000, value=200, step=1)
 expected_returns = st.number_input("Expected strategy returns (total points)", value=0.0, step=1.0, format="%.2f")
 expected_accuracy_pct = st.number_input("Expected accuracy % (probability of profit, e.g. 70)", min_value=0.0, max_value=100.0, value=60.0, step=0.5)
@@ -648,13 +758,17 @@ if uploaded_file is not None:
                 'atr_period': 14, 'target_atr_mult': 1.5, 'sl_atr_mult': 1.0,
                 'min_confluence': 3, 'vol_multiplier': 1.5,
                 'vwma_period': 14, 'vol_sma_period': 20,
-                'breakout_lookback': 10
+                'breakout_lookback': 10, 'rvol_threshold': 2.0
             }
 
             target_acc = expected_accuracy_pct/100.0
             target_points = expected_returns
 
-            best_params, best_summary, best_trades, perfect = optimize_parameters(df, base_params, int(random_iters), target_acc, target_points, side, signal_mode=signal_mode, progress_bar=progress_bar, status_text=status_text)
+            best_params, best_summary, best_trades, perfect = optimize_parameters(
+                df, base_params, int(random_iters), target_acc, target_points, side,
+                signal_mode=signal_mode, advanced_leading=advanced_leading,
+                progress_bar=progress_bar, status_text=status_text
+            )
 
             # ensure progress shows 100%
             progress_bar.progress(100)
@@ -662,6 +776,7 @@ if uploaded_file is not None:
 
             st.subheader("Optimization Result")
             st.write("Signal source:", signal_mode)
+            st.write("Advanced leading enabled:", advanced_leading)
             st.write("Target accuracy:", expected_accuracy_pct, "% ; Target points:", target_points)
             st.write("Perfect match found:" , perfect)
             st.json(best_params)
@@ -716,7 +831,7 @@ if uploaded_file is not None:
                 st.dataframe(best_trades_display)
 
             # live recommendation (latest bar in restricted df) using best params
-            latest_sig_df = generate_confluence_signals(df, best_params, side, signal_mode)
+            latest_sig_df = generate_confluence_signals(df, best_params, side, signal_mode, advanced_leading)
             latest_row = latest_sig_df.iloc[-1]
 
             # show latest_sig_df tail for debugging
@@ -770,6 +885,12 @@ if uploaded_file is not None:
                     return "OBV rising/falling shows accumulation/distribution"
                 if it == 'VOL_SPIKE':
                     return "Volume spike with price direction — increased conviction"
+                if it == 'RVOL':
+                    return "Relative volume spike (RVOL) — unusual activity"
+                if it == 'IMBAL_BULL':
+                    return "Close near high + volume: bullish imbalance"
+                if it == 'IMBAL_BEAR':
+                    return "Close near low + volume: bearish imbalance"
                 if it == 'BULL_ENGULF':
                     return "Bullish engulfing: current bullish candle engulfs previous bearish candle (early reversal)"
                 if it == 'BEAR_ENGULF':
@@ -780,10 +901,18 @@ if uploaded_file is not None:
                     return "Hanging man: same shape as hammer but after an up-move — bearish warning"
                 if it == 'SHOOTING_STAR':
                     return "Shooting star: long upper shadow after up-move — bearish reversal signal"
+                if it == 'MORNING_STAR':
+                    return "Morning Star: 3-bar bullish reversal pattern"
+                if it == 'EVENING_STAR':
+                    return "Evening Star: 3-bar bearish reversal pattern"
                 if it.startswith('BREAK_HI'):
                     return "Break above recent highs — early breakout signal"
                 if it.startswith('BREAK_LO'):
                     return "Break below recent lows — early breakdown signal"
+                if it == 'DIV_BULL':
+                    return "Bullish divergence (price lower low, RSI higher low)"
+                if it == 'DIV_BEAR':
+                    return "Bearish divergence (price higher high, RSI lower high)"
                 if 'STOCH' in it:
                     return "Stochastic crossover in extreme zones"
                 if 'CCI' in it:
@@ -849,6 +978,5 @@ if uploaded_file is not None:
 
 else:
     st.info("Upload a CSV/XLSX to start. After upload you can choose the 'Select last date' and then click 'Run Backtest & Optimize'.")
-
 
 # ------------------- End -------------------
