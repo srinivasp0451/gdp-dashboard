@@ -13,13 +13,14 @@ def normalize_df(df):
     cols = {c.lower(): c for c in df.columns}
     mapping = {}
     for key, orig in cols.items():
-        if key in ("open"):
+        # Updated mapping as requested (robustly using tuples)
+        if key in ("open",):
             mapping[orig] = "Open"
-        if key in ("high"):
+        if key in ("high",):
             mapping[orig] = "High"
-        if key in ("low"):
+        if key in ("low",):
             mapping[orig] = "Low"
-        if key in ("close"):
+        if key in ("close",):
             mapping[orig] = "Close"
         if key in ("volume", "vol"):
             mapping[orig] = "Volume"
@@ -201,10 +202,12 @@ def detect_candlestick_patterns(df, i):
 
 # ------------------- Signal Generation (confluence voting) -------------------
 
-def generate_confluence_signals(df_local, params, side="Both"):
+def generate_confluence_signals(df_local, params, side="Both", signal_mode="Both"):
     df_calc = compute_indicators(df_local, params)
     votes = []
     sig_series = pd.Series(0, index=df_calc.index)
+
+    leading_prefixes = ('BULL_ENGULF','BEAR_ENGULF','HAMMER','HANGING_MAN','SHOOTING_STAR','INVERTED_HAMMER','INSIDE_BAR','VOL_SPIKE','BREAK_HI','BREAK_LO')
 
     for idx in df_calc.index:
         row = df_calc.loc[idx]
@@ -334,7 +337,19 @@ def generate_confluence_signals(df_local, params, side="Both"):
                 if row['Close'] < prev_lows.min():
                     indicators_that_short.append(f'BREAK_LO_{lookback}')
 
-        # count confluences (leading + lagging combined)
+        # ---- filter indicator lists based on user-selected signal_mode ----
+        def is_leading(ind):
+            return any(ind.startswith(p) for p in leading_prefixes)
+
+        if signal_mode == 'Lagging':
+            indicators_that_long = [x for x in indicators_that_long if not is_leading(x)]
+            indicators_that_short = [x for x in indicators_that_short if not is_leading(x)]
+        elif signal_mode == 'Price Action':
+            indicators_that_long = [x for x in indicators_that_long if is_leading(x)]
+            indicators_that_short = [x for x in indicators_that_short if is_leading(x)]
+        # else 'Both' -> keep all
+
+        # count confluences (leading + lagging combined or filtered)
         long_votes = len(set(indicators_that_long))
         short_votes = len(set(indicators_that_short))
         total_votes = max(long_votes, short_votes)
@@ -386,7 +401,6 @@ def backtest_point_strategy(df_signals, params):
     Backtester updated to:
       - Execute entries at the same candle's Close where the Signal appears (no next-bar open).
       - Exits are evaluated on subsequent bars' OHLC (no exit on the same bar as entry).
-      - This avoids using future data for entry decisions while allowing exits to be realistic.
     """
 
     trades = []
@@ -531,7 +545,7 @@ def sample_random_params(base):
     return p
 
 
-def optimize_parameters(df, base_params, n_iter, target_acc, target_points, side):
+def optimize_parameters(df, base_params, n_iter, target_acc, target_points, side, signal_mode='Both', progress_bar=None, status_text=None):
     best = None
     best_score = None
     results = []
@@ -539,9 +553,14 @@ def optimize_parameters(df, base_params, n_iter, target_acc, target_points, side
     for i in range(n_iter):
         p = sample_random_params(base_params)
         try:
-            df_sig = generate_confluence_signals(df, p, side)
+            df_sig = generate_confluence_signals(df, p, side, signal_mode)
             summary, trades = backtest_point_strategy(df_sig, p)
         except Exception:
+            # update progress and continue
+            if progress_bar:
+                progress_bar.progress(int((i+1)/n_iter*100))
+            if status_text:
+                status_text.text(f"Iteration {i+1}/{n_iter} (error)" )
             continue
         prob = summary['prob_of_profit']
         # compute score based on abs diff in accuracy and prefer higher total_points
@@ -550,6 +569,11 @@ def optimize_parameters(df, base_params, n_iter, target_acc, target_points, side
         if best is None or score < best_score:
             best = (p, summary, trades)
             best_score = score
+        # update progress
+        if progress_bar:
+            progress_bar.progress(int((i+1)/n_iter*100))
+        if status_text:
+            status_text.text(f"Iteration {i+1}/{n_iter}")
         # early stop if meets both targets
         if prob >= target_frac and summary['total_points'] >= target_points:
             return p, summary, trades, True
@@ -558,12 +582,13 @@ def optimize_parameters(df, base_params, n_iter, target_acc, target_points, side
 
 # ------------------- Streamlit App -------------------
 
-st.title("Backtester with Confluence + Leading Signals")
+st.title("Backtester with Confluence + Leading Signals (selectable mode)")
 st.markdown("Upload OHLCV CSV/XLSX Date,Open,High,Low,Close,Volume")
-#This upgraded version adds candlestick price-action patterns and volume/breakout leading signals into the confluence engine while keeping your original lagging indicators. Entries are executed at the same candle Close (no future lookahead). Use the 'Select last date' dropdown to restrict dataset up to that date (inclusive).")
+#This upgraded version allows choosing `Lagging`, `Price Action`, or `Both` as the source of signals, adds leading signals (candlesticks/volume/breakouts), and shows a progress bar during optimization. Entries are executed at candle Close (no lookahead).")
 
 uploaded_file = st.file_uploader("Upload CSV/XLSX", type=['csv','xlsx'])
 side = st.selectbox("Trade Side", options=["Both","Long","Short"], index=0)
+signal_mode = st.selectbox("Signal source/mode", options=["Lagging","Price Action","Both"], index=2)
 random_iters = st.number_input("Random iterations (1-2000)", min_value=1, max_value=2000, value=200, step=1)
 expected_returns = st.number_input("Expected strategy returns (total points)", value=0.0, step=1.0, format="%.2f")
 expected_accuracy_pct = st.number_input("Expected accuracy % (probability of profit, e.g. 70)", min_value=0.0, max_value=100.0, value=60.0, step=0.5)
@@ -610,6 +635,9 @@ if uploaded_file is not None:
     df = df_full[df_full.index.date <= selected_last_date]
 
     if run_btn:
+        # create progress UI
+        progress_bar = st.progress(0)
+        status_text = st.empty()
         with st.spinner("Running optimization on restricted dataset..."):
             # base params (defaults)
             base_params = {
@@ -626,9 +654,14 @@ if uploaded_file is not None:
             target_acc = expected_accuracy_pct/100.0
             target_points = expected_returns
 
-            best_params, best_summary, best_trades, perfect = optimize_parameters(df, base_params, int(random_iters), target_acc, target_points, side)
+            best_params, best_summary, best_trades, perfect = optimize_parameters(df, base_params, int(random_iters), target_acc, target_points, side, signal_mode=signal_mode, progress_bar=progress_bar, status_text=status_text)
+
+            # ensure progress shows 100%
+            progress_bar.progress(100)
+            status_text.text("Optimization completed")
 
             st.subheader("Optimization Result")
+            st.write("Signal source:", signal_mode)
             st.write("Target accuracy:", expected_accuracy_pct, "% ; Target points:", target_points)
             st.write("Perfect match found:" , perfect)
             st.json(best_params)
@@ -683,7 +716,7 @@ if uploaded_file is not None:
                 st.dataframe(best_trades_display)
 
             # live recommendation (latest bar in restricted df) using best params
-            latest_sig_df = generate_confluence_signals(df, best_params, side)
+            latest_sig_df = generate_confluence_signals(df, best_params, side, signal_mode)
             latest_row = latest_sig_df.iloc[-1]
 
             # show latest_sig_df tail for debugging
