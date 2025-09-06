@@ -1074,8 +1074,8 @@ side = st.selectbox("Trade Side", options=["Both","Long","Short"], index=0)
 signal_mode = st.selectbox("Signal source/mode", options=["Lagging","Price Action","Both"], index=2)
 advanced_leading = st.checkbox("Use advanced leading signals (divergence/RVOL/imbalance and advanced chart patterns)", value=True)
 random_iters = st.number_input("Random iterations (1-2000)", min_value=1, max_value=2000, value=200, step=1)
-expected_returns = st.number_input("Expected strategy returns (total points)", value=0.0, step=1.0, format="%.2f")
-expected_accuracy_pct = st.number_input("Expected accuracy % (probability of profit, e.g. 70)", min_value=0.0, max_value=100.0, value=60.0, step=0.5)
+expected_returns = st.number_input("Expected strategy returns (total points)", value=2000.0, step=1.0, format="%.2f")
+expected_accuracy_pct = st.number_input("Expected accuracy % (probability of profit, e.g. 70)", min_value=0.0, max_value=100.0, value=70.0, step=0.5)
 
 if uploaded_file is not None:
     try:
