@@ -579,7 +579,7 @@ st.title("🚀 Swing Trading Dashboard — Final (Auto-optimize & Confluences)")
 with st.sidebar:
     st.header("Controls")
     uploaded = st.file_uploader("Upload OHLC CSV or XLSX", type=["csv","xlsx"])
-    trade_type = st.selectbox("Trade Type", ["All","Long","Short"], index=1)
+    trade_type = st.selectbox("Trade Type", ["All","Long","Short"], index=0)
     stage_a_eval = st.number_input("Stage A evaluations (random search)", min_value=20, max_value=1000, value=250, step=20)
     run_opt = st.button("Run Optimize & Backtest")
     st.markdown("---")
