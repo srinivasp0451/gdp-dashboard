@@ -14,7 +14,6 @@ st.set_page_config(page_title="Swing Trading Recommender", layout="wide")
 
 def infer_columns(df):
     """Robust inference of common OHLCV and date column names using tokenized matching.
-    Avoids brittle substring checks like single-letter 'o' inside words (e.g. 'low').
     Returns mapping for keys: date, open, high, low, close, volume (original column names or None).
     """
     mapping = {"date": None, "open": None, "high": None, "low": None, "close": None, "volume": None}
@@ -31,7 +30,7 @@ def infer_columns(df):
             continue
 
         # Open
-        if mapping['open'] is None and ("open" in token_set or low.strip() in ("o","op","openprice")):
+        if mapping['open'] is None and ("open" in token_set or low.strip() in ("op","openprice")):
             mapping['open'] = col
             continue
 
@@ -71,8 +70,8 @@ def infer_columns(df):
 
 
 def standardize_df(df):
-    """Map columns, parse dates, sort ascending and return dataframe with standard column names.
-    Ensures the returned DataFrame always has ['Date','Open','High','Low','Close','Volume'].
+    """Map columns, parse dates, sort ascending and return (dataframe, mapping).
+    Ensures the returned DataFrame always has ['Date','Open','High','Low','Close','Volume'] and Date is tz-aware in IST.
     """
     orig_cols = df.columns.tolist()
     mapping = infer_columns(df)
@@ -86,6 +85,18 @@ def standardize_df(df):
         # try common fallback formats
         df['Date'] = pd.to_datetime(df[mapping['date']], format='%d-%m-%Y', errors='coerce')
     df = df.dropna(subset=['Date']).reset_index(drop=True)
+
+    # ensure all datetimes are timezone-aware and converted to Asia/Kolkata
+    try:
+        if df['Date'].dt.tz is None:
+            # naive datetimes -> assume they are in Asia/Kolkata (user timezone)
+            df['Date'] = df['Date'].dt.tz_localize('Asia/Kolkata')
+        else:
+            # convert aware datetimes to Asia/Kolkata
+            df['Date'] = df['Date'].dt.tz_convert('Asia/Kolkata')
+    except Exception:
+        # last resort: convert via pandas.Timestamp
+        df['Date'] = pd.to_datetime(df['Date']).dt.tz_localize('Asia/Kolkata')
 
     # rename mapped OHLCV columns to standard names (only where detected)
     renames = {}
@@ -101,9 +112,8 @@ def standardize_df(df):
         if possible_price_cols:
             df = df.rename(columns={possible_price_cols[0]: 'Close'})
 
-    # create default numeric OHLC if not present (best effort, avoid hardcoding)
+    # create default numeric OHLC if not present (best effort)
     if 'Close' not in df.columns:
-        # try second column after Date
         candidates = [c for c in df.columns if c != 'Date']
         if candidates:
             df['Close'] = pd.to_numeric(df[candidates[0]], errors='coerce')
@@ -130,7 +140,7 @@ def standardize_df(df):
     # sort by date ascending to avoid future leakage
     df = df.sort_values('Date').reset_index(drop=True)
 
-    return df
+    return df, mapping
 
 
 # ------------------------- Price action helpers ---------------------------
@@ -183,6 +193,47 @@ def detect_double_top_bottom(ph, pl, price, tol=0.01, min_bars_between=3):
     return patterns
 
 
+def detect_head_shoulders(ph, tol=0.03, min_spacing=3, max_spacing=60):
+    patterns = []
+    # look for three pivot highs where middle is head
+    for i in range(len(ph)-2):
+        l_idx, l_price = ph[i]
+        m_idx, m_price = ph[i+1]
+        r_idx, r_price = ph[i+2]
+        if (m_idx - l_idx >= min_spacing and r_idx - m_idx >= min_spacing and m_idx - l_idx <= max_spacing and r_idx - m_idx <= max_spacing):
+            # head must be higher than shoulders within tolerance
+            shoulders_avg = (l_price + r_price) / 2
+            if m_price > shoulders_avg and abs(l_price - r_price) <= tol * shoulders_avg:
+                patterns.append(('head_and_shoulders', l_idx, m_idx, r_idx, l_price, m_price, r_price))
+    return patterns
+
+
+def detect_engulfing(df):
+    patterns = []
+    for i in range(1, len(df)):
+        prev_o = df.loc[i-1, 'Open']
+        prev_c = df.loc[i-1, 'Close']
+        o = df.loc[i, 'Open']
+        c = df.loc[i, 'Close']
+        # bullish engulfing: prev red, current green and current body engulfs prev body
+        if prev_c < prev_o and c > o and (c - o) > (prev_o - prev_c):
+            patterns.append(('bullish_engulfing', i-1, i))
+        # bearish engulfing
+        if prev_c > prev_o and c < o and (o - c) > (prev_c - prev_o):
+            patterns.append(('bearish_engulfing', i-1, i))
+    return patterns
+
+
+def get_trend_slope_from_pivots(pivots):
+    if len(pivots) < 2:
+        return 0
+    xs = np.array([p[0] for p in pivots]).reshape(-1, 1)
+    ys = np.array([p[1] for p in pivots])
+    A = np.vstack([xs.T[0], np.ones(len(xs))]).T
+    m, c = np.linalg.lstsq(A, ys, rcond=None)[0]
+    return m
+
+
 def build_zones(levels, width_pct=0.005):
     zones = []
     for lv in levels:
@@ -202,12 +253,15 @@ def generate_signals(df, params):
     ph, pl = get_pivots(price, left=params['pivot_window'], right=params['pivot_window'])
     ph_prices = [p for _, p in ph]
     pl_prices = [p for _, p in pl]
+
     resistances = cluster_levels(ph_prices, tol=params['cluster_tol'])
     supports = cluster_levels(pl_prices, tol=params['cluster_tol'])
     sup_zones = build_zones(supports, width_pct=params['zone_width'])
     res_zones = build_zones(resistances, width_pct=params['zone_width'])
 
     patterns = detect_double_top_bottom(ph, pl, price.values, tol=params['pattern_tol'], min_bars_between=params['min_bars_between'])
+    hs_patterns = detect_head_shoulders(ph, tol=params.get('hs_tol',0.03), min_spacing=params.get('min_bars_between',3))
+    engulf = detect_engulfing(df)
 
     signals = []
     reasons = []
@@ -221,6 +275,8 @@ def generate_signals(df, params):
         sig = 0
         reason = []
         close = df.loc[i, 'Close']
+
+        # patterns
         for p in patterns:
             kind = p[0]
             idx1 = p[1]
@@ -232,6 +288,30 @@ def generate_signals(df, params):
                 if kind == 'double_top' and ('short' in params['allowed_dirs']):
                     sig = -1
                     reason.append(f"double_top between {idx1} and {idx2}")
+
+        # head and shoulders
+        for h in hs_patterns:
+            _, l_idx, m_idx, r_idx, l_p, m_p, r_p = h[0], h[1], h[2], h[3], h[4], h[5], h[6] if len(h) >= 7 else (None,None,None)
+            # The above unpack is defensive; pattern tuple defined earlier
+            # if head completed recently, consider short
+            if m_idx <= i and i - m_idx <= params['pattern_lookahead']:
+                sig = -1
+                reason.append(f"head_and_shoulders around {m_idx}")
+
+        # engulfing
+        for e in engulf:
+            kind = e[0]
+            prev_idx = e[1]
+            cur_idx = e[2]
+            if cur_idx <= i and i - cur_idx <= params['pattern_lookahead']:
+                if kind == 'bullish_engulfing' and ('long' in params['allowed_dirs']):
+                    sig = 1
+                    reason.append('bullish_engulfing')
+                if kind == 'bearish_engulfing' and ('short' in params['allowed_dirs']):
+                    sig = -1
+                    reason.append('bearish_engulfing')
+
+        # support/resistance zones
         for z in sup_zones:
             if in_zone(close, z) and ('long' in params['allowed_dirs']):
                 sig = 1
@@ -241,6 +321,7 @@ def generate_signals(df, params):
                 sig = -1
                 reason.append(f"near_resistance_zone {round((z[0]+z[1])/2,2)}")
 
+        # breakout logic
         look = params['breakout_lookback']
         if i > look:
             recent_high = df.loc[i-look:i-1, 'High'].max()
@@ -252,6 +333,7 @@ def generate_signals(df, params):
                 sig = -1
                 reason.append(f"breakdown_below_{recent_low:.2f}")
 
+        # wick/liquidity traps
         high = df.loc[i, 'High']
         low = df.loc[i, 'Low']
         openp = df.loc[i, 'Open']
@@ -273,7 +355,7 @@ def generate_signals(df, params):
     df_signals = df.copy()
     df_signals['signal'] = signals
     df_signals['reason'] = reasons
-    return df_signals, {'supports': supports, 'resistances': resistances, 'patterns': patterns}
+    return df_signals, {'supports': supports, 'resistances': resistances, 'patterns': patterns, 'hs': hs_patterns, 'engulf': engulf}
 
 
 def backtest_signals(df_signals, params):
@@ -325,6 +407,7 @@ def backtest_signals(df_signals, params):
             exit_reason = 'time_exit'
 
         pnl = (exit_price - entry_price) / entry_price if sig == 1 else (entry_price - exit_price) / entry_price
+        pnl_points = (exit_price - entry_price) if sig == 1 else (entry_price - exit_price)
         trades.append({
             'entry_idx': entry_idx,
             'exit_idx': exit_idx,
@@ -334,6 +417,7 @@ def backtest_signals(df_signals, params):
             'entry_price': entry_price,
             'exit_price': exit_price,
             'pnl': pnl,
+            'pnl_points': pnl_points,
             'hold_days': (df_signals.loc[exit_idx, 'Date'] - df_signals.loc[entry_idx, 'Date']).days,
             'reason': df_signals.loc[i, 'reason'] or exit_reason
         })
@@ -346,7 +430,8 @@ def backtest_signals(df_signals, params):
             'negative_trades': 0,
             'accuracy': 0,
             'total_pnl_pct': 0,
-            'avg_pnl_pct': 0
+            'avg_pnl_pct': 0,
+            'total_points': 0
         }
     else:
         stats = {
@@ -356,7 +441,8 @@ def backtest_signals(df_signals, params):
             'accuracy': (trades_df['pnl'] > 0).mean(),
             'total_pnl_pct': trades_df['pnl'].sum() * 100,
             'avg_pnl_pct': trades_df['pnl'].mean() * 100,
-            'avg_hold_days': trades_df['hold_days'].mean()
+            'avg_hold_days': trades_df['hold_days'].mean(),
+            'total_points': trades_df['pnl_points'].sum()
         }
     return trades_df, stats
 
@@ -418,11 +504,11 @@ def find_best_strategy(df_train, search_type='random', random_iters=50, grid=Non
             'wick_factor': 1.5,
             'volume_factor': 1.5,
             'pattern_lookahead': 5,
+            'hs_tol': 0.03,
             'allowed_dirs': allowed_dirs
         }
         df_signals, _ = generate_signals(df_train, params)
         trades_df, stats = backtest_signals(df_signals, params)
-        # require minimum trades
         if stats['total_trades'] < min_trades:
             metric = -np.inf
         else:
@@ -433,7 +519,6 @@ def find_best_strategy(df_train, search_type='random', random_iters=50, grid=Non
             best_metric = metric
             best = {'params': params, 'trades': trades_df, 'stats': stats}
 
-        # progress callback (percent)
         if progress_callback is not None:
             try:
                 progress_callback(tried, total)
@@ -491,19 +576,29 @@ def app():
 
     # preprocess
     try:
-        df = standardize_df(raw)
+        df, mapping = standardize_df(raw)
     except Exception as e:
         st.error(f'Error mapping columns: {e}')
         return
 
+    st.subheader('Mapped columns (detected)')
+    st.json(mapping)
+
     st.subheader('Data preview')
+    # display dates in IST human readable
+    df_display = df.copy()
+    try:
+        df_display['Date'] = df_display['Date'].dt.tz_convert('Asia/Kolkata').dt.strftime('%Y-%m-%d %H:%M:%S %Z')
+    except Exception:
+        df_display['Date'] = df_display['Date'].dt.strftime('%Y-%m-%d %H:%M:%S')
+
     c1, c2 = st.columns([1,1])
     with c1:
         st.write('Top 5 rows')
-        st.dataframe(df.head())
+        st.dataframe(df_display.head())
     with c2:
         st.write('Bottom 5 rows')
-        st.dataframe(df.tail())
+        st.dataframe(df_display.tail())
 
     st.write('Date range: ', df['Date'].min(), 'to', df['Date'].max())
     st.write('Price range (Close):', df['Close'].min(), 'to', df['Close'].max())
@@ -521,7 +616,17 @@ def app():
     max_date = df['Date'].max()
     min_date = df['Date'].min()
     user_end = st.date_input('Select end date for backtest (data after end date will be excluded)', value=max_date.date(), min_value=min_date.date(), max_value=max_date.date())
+    # make end_dt timezone-aware in Asia/Kolkata
     end_dt = pd.to_datetime(user_end)
+    end_dt = pd.Timestamp(end_dt)
+    if end_dt.tzinfo is None:
+        end_dt = end_dt.tz_localize('Asia/Kolkata')
+    else:
+        end_dt = end_dt.tz_convert('Asia/Kolkata')
+
+    # include whole day till 23:59:59 to be intuitive
+    end_dt = end_dt + pd.Timedelta(days=1) - pd.Timedelta(seconds=1)
+
     df_train = df[df['Date'] <= end_dt].reset_index(drop=True)
     st.write(f'Data used for backtest: {len(df_train)} rows up to {end_dt.date()}')
 
@@ -588,11 +693,36 @@ def app():
             st.json(best['params'])
             st.write('Backtest stats:')
             st.json(best['stats'])
+
+            trades_df = best['trades'].copy()
+            # format trade times to IST strings for display
+            if not trades_df.empty:
+                trades_df['entry_time'] = trades_df['entry_time'].dt.tz_convert('Asia/Kolkata').dt.strftime('%Y-%m-%d %H:%M:%S %Z')
+                trades_df['exit_time'] = trades_df['exit_time'].dt.tz_convert('Asia/Kolkata').dt.strftime('%Y-%m-%d %H:%M:%S %Z')
+
             st.write('Sample trades (first 100)')
-            st.dataframe(best['trades'].head(100))
+            st.dataframe(trades_df.head(100))
+
+            # buy and hold comparison (points)
+            if len(df_train) >= 2:
+                buy_hold_points = df_train['Close'].iloc[-1] - df_train['Close'].iloc[0]
+                buy_hold_return_pct = (df_train['Close'].iloc[-1] / df_train['Close'].iloc[0] - 1) * 100
+            else:
+                buy_hold_points = 0
+                buy_hold_return_pct = 0
+
+            strategy_points = best['stats'].get('total_points', 0)
+            if buy_hold_points != 0:
+                pct_more_points = (strategy_points - buy_hold_points) / abs(buy_hold_points) * 100
+            else:
+                pct_more_points = np.nan
+
+            st.metric('Buy and hold points', f"{buy_hold_points:.2f}")
+            st.metric('Strategy total points', f"{strategy_points:.2f}")
+            st.write(f"Strategy gave {pct_more_points:.2f}% more points vs buy-and-hold (NaN if buy-and-hold points = 0)")
 
             df_full_signals, meta = generate_signals(df_train, best['params'])
-            trades_df, stats = backtest_signals(df_full_signals, best['params'])
+            trades_df2, stats = backtest_signals(df_full_signals, best['params'])
             rec = generate_live_recommendation(df_full_signals, best['params'], target_points=target_points, backtest_stats=best['stats'])
 
             st.subheader('Live Recommendation (based on last closed candle)')
@@ -602,7 +732,7 @@ def app():
                 st.json(rec)
 
             st.subheader('Backtest Summary (human readable)')
-            st.write(backtest_human_readable(best['stats'], best['params']))
+            st.write(backtest_human_readable(best['stats'], best['params'], buy_hold_points))
 
 
 # --------------------------- Helper outputs ------------------------------
@@ -646,7 +776,6 @@ def generate_live_recommendation(df_signals, params, target_points=50, backtest_
     if unit_risk <= 0:
         qty = 0
     else:
-        # heuristic: number of units to try to capture target_points (not financial advice)
         qty = max(1, int(target_points // unit_risk))
 
     rec = {
@@ -664,12 +793,14 @@ def generate_live_recommendation(df_signals, params, target_points=50, backtest_
     return rec
 
 
-def backtest_human_readable(stats, params):
+def backtest_human_readable(stats, params, buy_hold_points=None):
     if stats['total_trades'] == 0:
         return 'No trades executed in backtest with these parameters.'
     s = (f"Backtest performed with sl {params['sl_pct']*100:.2f}% and tp {params['tp_pct']*100:.2f}%. "
          f"Total trades: {stats['total_trades']}. Winning trades: {stats['positive_trades']} ({stats['accuracy']*100:.2f}% win rate). "
-         f"Total return from signals (sum of trade returns): {stats['total_pnl_pct']:.2f}% ." )
+         f"Total return from signals (sum of trade returns): {stats['total_pnl_pct']:.2f}% . ")
+    if buy_hold_points is not None:
+        s += f"Buy-and-hold points during period: {buy_hold_points:.2f}. Strategy total points: {stats.get('total_points',0):.2f}."
     return s
 
 
