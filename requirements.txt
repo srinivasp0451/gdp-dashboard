@@ -19,3 +19,5 @@ Dhan-Tradehull
 #sqlite3
 #pysqlite
 curl_cffi
+openpyxl
+mplfinance
