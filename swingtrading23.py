@@ -663,7 +663,7 @@ def plot_candles_with_overlays(df, signals_df, meta, trades_df=None, title='Pric
 
 def app():
     st.title("Swing Trading Recommender — Live + Walk-Forward + Visuals")
-    st.markdown("Features: yfinance fetch, robust strategy, walk-forward CV, visual overlays, live recommendation (same logic as backtest).
+    st.markdown("Features: yfinance fetch, robust strategy, walk-forward CV, visual overlays, live recommendation (same logic as backtest)")
 
 Note: install `yfinance` and `mplfinance` before running: `pip install yfinance mplfinance`.")
 
