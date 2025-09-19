@@ -1,60 +1,38 @@
 # streamlit_swing_trader.py
 # Robust Swing Trading + "Smart Trading" Facility
+# Now uses file upload + column mapping (no yfinance) and includes a Live Recommendation
 # No use of pandas_ta or talib. All indicators implemented from scratch.
-# Requirements: streamlit, yfinance, pandas, numpy, matplotlib
+# Requirements: streamlit, pandas, numpy, matplotlib, openpyxl (if using xlsx)
 # Run: streamlit run streamlit_swing_trader.py
 
 import streamlit as st
-import yfinance as yf
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
-from datetime import timedelta
+from datetime import datetime
 
-st.set_page_config(layout="wide", page_title="Robust Swing Trader (No TA-Lib)")
+st.set_page_config(layout="wide", page_title="Robust Swing Trader (File Upload)")
 
-st.title("Robust Swing Trading + Smart Trading Facility (India-focused)")
+st.title("Robust Swing Trading + Smart Trading Facility — File Upload + Live Recommendation")
 st.markdown(
     """
-    This Streamlit app implements a robust swing-trading framework (trend + mean-reversion hybrid) **without** pandas_ta or talib.
-    It also includes "smart" signals that attempt to identify: **momentum about to start**, **big-player entries**, and **high-volume support/resistance zones** (volume profile HVNs).
+    Upload your OHLCV file (CSV or Excel). Map the columns and run the strategy.
 
-    **Notes / disclaimers**: This is an algorithmic template for research & backtesting. No guarantees. Always forward-test on small capital or paper trade.
+    This version preserves the original logic (trend + pullback + squeeze/momentum + big-player detection)
+    but replaces `yfinance` with a file uploader and adds a **Live Recommendation** panel based on the latest bar.
+
+    **Notes**: This is a research/backtest/live-readiness template. Forward-test before trading real capital.
     """
 )
 
 # ------------------------------
-# Sidebar: user inputs
+# Sidebar: user inputs + file upload
 # ------------------------------
 with st.sidebar:
-    st.header("Strategy Inputs")
-    ticker_default = st.selectbox(
-        "Choose ticker / index (examples)",
-        (
-            "^NSEI",
-            "^NSEBANK",
-            "RELIANCE.NS",
-            "TCS.NS",
-            "HDFCBANK.NS",
-            "INFY.NS",
-            "ICICIBANK.NS",
-            "KOTAKBANK.NS",
-            "LT.NS",
-            "AXISBANK.NS",
-            "HDFC.NS",
-            "SBIN.NS",
-            "Other...",
-        ),
-    )
-    if ticker_default == "Other...":
-        ticker = st.text_input("Enter custom ticker (Yahoo format)", value="RELIANCE.NS")
-    else:
-        ticker = ticker_default
-
-    interval = st.selectbox("Interval (yfinance)", ("1d", "60m", "30m", "15m", "5m"))
-    period = st.selectbox("Period to fetch", ("6mo", "1y", "2y", "3mo"))
-
+    st.header("Inputs")
+    uploaded_file = st.file_uploader("Upload CSV / Excel with OHLCV data (Date/Time, Open, High, Low, Close, Volume)", type=["csv", "xls", "xlsx"])    
     st.markdown("---")
+
     st.subheader("Strategy Params")
     risk_percent = st.number_input("Risk per trade (% of capital)", value=1.0, min_value=0.1, max_value=10.0, step=0.1)
     starting_capital = st.number_input("Starting capital (INR)", value=100000.0, step=1000.0)
@@ -62,14 +40,40 @@ with st.sidebar:
     spike_mult = st.number_input("Volume spike multiplier (big-player detector)", value=3.0, step=0.1)
     atr_mult_sl = st.number_input("Stop-loss ATR multiplier", value=2.0, step=0.1)
     rr_target = st.number_input("Target R:R (e.g., 2 means 2R)", value=2.0, step=0.1)
+    show_indicators = st.checkbox("Show indicators on chart", value=True)
 
     st.markdown("---")
-    st.write("Data / Misc")
-    show_indicators = st.checkbox("Show indicators on chart", value=True)
-    run_backtest = st.button("Fetch & Run Backtest")
+    st.write("Once uploaded & mapped, click 'Compute & Run' to compute signals and backtest.")
+    run_backtest = st.button("Compute & Run")
+    st.write("")
 
 # ------------------------------
-# Utility indicator functions
+# Helpers: auto-detect & read file
+# ------------------------------
+
+def guess_column(cols, candidates):
+    cols_l = [c.lower() for c in cols]
+    for cand in candidates:
+        for i, c in enumerate(cols_l):
+            if cand.lower() == c:
+                return cols[i]
+    # fuzzy
+    for cand in candidates:
+        for i, c in enumerate(cols_l):
+            if cand.lower() in c:
+                return cols[i]
+    return None
+
+
+def load_uploaded_file(uploaded_file):
+    if uploaded_file.name.endswith('.csv'):
+        df = pd.read_csv(uploaded_file)
+    else:
+        df = pd.read_excel(uploaded_file)
+    return df
+
+# ------------------------------
+# Indicator implementations (same as before)
 # ------------------------------
 
 def ema(series, span):
@@ -80,7 +84,6 @@ def rsi(series, period=14):
     delta = series.diff()
     up = delta.clip(lower=0)
     down = -delta.clip(upper=0)
-    # Wilder's EMA
     ma_up = up.ewm(alpha=1 / period, adjust=False).mean()
     ma_down = down.ewm(alpha=1 / period, adjust=False).mean()
     rs = ma_up / ma_down
@@ -109,17 +112,15 @@ def bollinger_bands(series, window=20, n_std=2):
 
 
 def vwap(df):
-    # daily VWAP (works across index with multi-day data)
     tp = (df['High'] + df['Low'] + df['Close']) / 3
     vol = df['Volume']
-    df = df.copy()
-    df['typ_vol'] = tp * vol
-    # compute VWAP per day
-    df['date'] = df.index.normalize()
-    df['cum_tp_vol'] = df.groupby('date')['typ_vol'].cumsum()
-    df['cum_vol'] = df.groupby('date')['Volume'].cumsum()
-    df['vwap'] = df['cum_tp_vol'] / df['cum_vol']
-    return df['vwap']
+    df2 = df.copy()
+    df2['typ_vol'] = tp * vol
+    df2['date_only'] = df2.index.normalize()
+    df2['cum_tp_vol'] = df2.groupby('date_only')['typ_vol'].cumsum()
+    df2['cum_vol'] = df2.groupby('date_only')['Volume'].cumsum()
+    df2['vwap'] = df2['cum_tp_vol'] / df2['cum_vol']
+    return df2['vwap']
 
 
 def obv(df):
@@ -136,29 +137,30 @@ def obv(df):
 
 
 def vpt(df):
-    # Volume Price Trend
     pct = df['Close'].pct_change().fillna(0)
     vpt = (pct * df['Volume']).cumsum()
     return vpt
 
-# Volume profile (simple bin based)
+
 def volume_profile(df, bins=24):
     prices = df['Close']
     vols = df['Volume']
     low = prices.min()
     high = prices.max()
-    bin_edges = np.linspace(low, high, bins + 1)
-    inds = np.digitize(prices, bin_edges) - 1
+    if high == low:
+        edges = np.linspace(low - 1, high + 1, bins + 1)
+    else:
+        edges = np.linspace(low, high, bins + 1)
+    inds = np.digitize(prices, edges) - 1
     vol_by_bin = np.zeros(bins)
     for i, v in zip(inds, vols):
         if 0 <= i < bins:
             vol_by_bin[i] += v
-    # top bins descending
     top_idx = np.argsort(vol_by_bin)[-5:][::-1]
-    zones = [(bin_edges[i], bin_edges[i + 1], vol_by_bin[i]) for i in top_idx]
-    return zones, bin_edges, vol_by_bin
+    zones = [(edges[i], edges[i + 1], vol_by_bin[i]) for i in top_idx]
+    return zones, edges, vol_by_bin
 
-# Pivot detection (simple center rolling window)
+
 def pivots(df, window=5):
     highs = df['High']
     lows = df['Low']
@@ -167,7 +169,7 @@ def pivots(df, window=5):
     return ph.dropna(), pl.dropna()
 
 # ------------------------------
-# Signal generation and 'smart' detectors
+# Compute indicators and signals (vectorized to avoid ambiguous Series checks)
 # ------------------------------
 
 def compute_indicators(df):
@@ -181,7 +183,6 @@ def compute_indicators(df):
     df['bb_upper'] = bb_upper
     df['bb_lower'] = bb_lower
     df['bb_width'] = bb_width
-    # Keltner for squeeze-like detection
     tp = (df['High'] + df['Low'] + df['Close']) / 3
     df['kc_mid'] = tp.ewm(span=20, adjust=False).mean()
     df['kc_upper'] = df['kc_mid'] + 1.5 * df['atr14']
@@ -190,92 +191,58 @@ def compute_indicators(df):
     df['obv'] = obv(df)
     df['vpt'] = vpt(df)
     df['vol_ma20'] = df['Volume'].rolling(20).mean()
-    # Squeeze detection: BB width less than KC width => squeeze on
     df['squeeze_on'] = (df['bb_width'] < (df['kc_upper'] - df['kc_lower']))
     return df
 
 
 def generate_signals(df, spike_mult=3.0, atr_mult_sl=2.0, rr_target=2.0):
     df = df.copy()
-    signals = []
+    # Rolling baseline for BB width
+    bb_w_ma = df['bb_width'].rolling(20).mean()
+    # Squeeze release and momentum
+    df['squeeze_release'] = df['squeeze_on'].shift(1).fillna(False) & (df['bb_width'] > bb_w_ma * 1.5)
+    df['vol_pickup'] = df['Volume'] > 1.2 * df['vol_ma20']
+    df['momentum_imminent'] = df['squeeze_release'] & df['vol_pickup']
+    # Big player detection
+    df['vol_spike'] = df['Volume'] > spike_mult * df['vol_ma20']
+    df['strong_move'] = (df['Close'] - df['Close'].shift(1)).abs() > 0.8 * df['atr14']
+    df['big_player'] = df['vol_spike'] & df['strong_move']
+    # Trend and pullback conditions
+    df['above_ema200'] = df['Close'] > df['ema200']
+    df['below_ema200'] = df['Close'] < df['ema200']
+    df['to_ema20_pullback_long'] = df['Close'] <= df['ema20']
+    df['to_ema20_pullback_short'] = df['Close'] >= df['ema20']
+    df['rsi_rise'] = df['rsi14'] > df['rsi14'].shift(1)
+    df['close_up'] = df['Close'] > df['Open']
+    df['close_down'] = df['Close'] < df['Open']
+    long_cond = (
+        df['above_ema200'] & df['to_ema20_pullback_long'] & (df['rsi14'] > 45) & df['rsi_rise'] & df['close_up']
+    )
+    short_cond = (
+        df['below_ema200'] & df['to_ema20_pullback_short'] & (df['rsi14'] < 55) & (~df['rsi_rise']) & df['close_down']
+    )
+    extra_ok = df['momentum_imminent'] | (~df['squeeze_on']) | (df['Volume'] > df['vol_ma20'] * 0.6)
     df['signal'] = 0
     df['signal_reason'] = ''
-    df['momentum_imminent'] = False
-    df['big_player'] = False
-
-    # Determine bollinger width increase baseline
-    bb_w_ma = df['bb_width'].rolling(20).mean()
-
-    in_signal = False
-
-    for i in range(201, len(df) - 1):  # start after ema200 stabilizes
-        row = df.iloc[i]
-        prev = df.iloc[i - 1]
-
-        # Momentum imminent: squeeze release + volume pickup + bb width expansion
-        squeeze_release = prev['squeeze_on'] and (row['bb_width'] > max(1e-9, bb_w_ma.iloc[i - 1]) * 1.5)
-        vol_pickup = row['Volume'] > 1.2 * row['vol_ma20'] if not np.isnan(row['vol_ma20']) else False
-        momentum_flag = squeeze_release and vol_pickup
-        if momentum_flag:
-            df.at[row.name, 'momentum_imminent'] = True
-
-        # Detect big player entry: big volume spike & directional move
-        vol_spike = (row['Volume'] > spike_mult * row['vol_ma20']) if not np.isnan(row['vol_ma20']) else False
-        strong_move = abs(row['Close'] - prev['Close']) > 0.8 * row['atr14'] if not np.isnan(row['atr14']) else False
-        if vol_spike and strong_move:
-            df.at[row.name, 'big_player'] = True
-
-        # LONG condition (trend + pullback + confirmation)
-        long_cond = (
-            (row['Close'] > row['ema200'])
-            and (row['Close'] <= row['ema20'])
-            and (row['rsi14'] > 45)
-            and (row['rsi14'] > prev['rsi14'])
-            and (row['Close'] > row['Open'])
-        )
-
-        # SHORT condition
-        short_cond = (
-            (row['Close'] < row['ema200'])
-            and (row['Close'] >= row['ema20'])
-            and (row['rsi14'] < 55)
-            and (row['rsi14'] < prev['rsi14'])
-            and (row['Close'] < row['Open'])
-        )
-
-        reason = []
-        if long_cond:
-            reason.append('Trend+Pullback to EMA20')
-        if short_cond:
-            reason.append('Trend+Pullback to EMA20')
-
-        # prefer trades with momentum or big_player entries, but allow without if conditions strict
-        if long_cond and (momentum_flag or not row['squeeze_on'] or row['Volume'] > row['vol_ma20'] * 0.6):
-            df.at[row.name, 'signal'] = 1
-            df.at[row.name, 'signal_reason'] = "; ".join(reason)
-        elif short_cond and (momentum_flag or not row['squeeze_on'] or row['Volume'] > row['vol_ma20'] * 0.6):
-            df.at[row.name, 'signal'] = -1
-            df.at[row.name, 'signal_reason'] = "; ".join(reason)
-
+    df.loc[long_cond & extra_ok, 'signal'] = 1
+    df.loc[short_cond & extra_ok, 'signal'] = -1
+    df.loc[long_cond & extra_ok, 'signal_reason'] = 'Trend+Pullback to EMA20'
+    df.loc[short_cond & extra_ok, 'signal_reason'] = 'Trend+Pullback to EMA20'
     return df
 
 # ------------------------------
-# Backtest engine (simple discrete trades)
+# Backtest engine (unchanged core logic)
 # ------------------------------
 
 def backtest(df, capital=100000, risk_pct=1.0, max_hold=20, atr_mult=2.0, rr_target=2.0):
     trades = []
     cash = capital
     equity_curve = [capital]
-    current_idx = 0
-
     for i in range(len(df)):
         if df['signal'].iat[i] == 0:
             equity_curve.append(equity_curve[-1])
             continue
-
         sig = int(df['signal'].iat[i])
-        # entry at next bar open if available
         if i + 1 >= len(df):
             break
         entry_idx = i + 1
@@ -283,7 +250,6 @@ def backtest(df, capital=100000, risk_pct=1.0, max_hold=20, atr_mult=2.0, rr_tar
         atr = df['atr14'].iat[entry_idx] if not np.isnan(df['atr14'].iat[entry_idx]) else 0
         if atr == 0:
             atr = df['Close'].diff().abs().rolling(14).mean().iat[entry_idx]
-
         if sig == 1:
             stop = entry_price - atr_mult * atr
             if stop <= 0:
@@ -294,11 +260,9 @@ def backtest(df, capital=100000, risk_pct=1.0, max_hold=20, atr_mult=2.0, rr_tar
             risk_amount = capital * (risk_pct / 100.0)
             qty = max(1, int(risk_amount / risk_per_share))
             target = entry_price + rr_target * (entry_price - stop)
-
             exit_price = None
             exit_idx = None
             for j in range(entry_idx, min(len(df), entry_idx + max_hold)):
-                # check intrabar hits using High/Low
                 if df['Low'].iat[j] <= stop:
                     exit_price = stop
                     exit_idx = j
@@ -308,10 +272,8 @@ def backtest(df, capital=100000, risk_pct=1.0, max_hold=20, atr_mult=2.0, rr_tar
                     exit_idx = j
                     break
             if exit_price is None:
-                # exit at close of last bar
                 exit_idx = min(len(df) - 1, entry_idx + max_hold - 1)
                 exit_price = df['Close'].iat[exit_idx]
-
             profit = (exit_price - entry_price) * qty
             pct_return_on_cap = profit / capital
             cash += profit
@@ -326,7 +288,6 @@ def backtest(df, capital=100000, risk_pct=1.0, max_hold=20, atr_mult=2.0, rr_tar
                 'pnl_pct': pct_return_on_cap,
             })
             equity_curve.append(cash)
-
         elif sig == -1:
             stop = entry_price + atr_mult * atr
             risk_per_share = stop - entry_price
@@ -335,7 +296,6 @@ def backtest(df, capital=100000, risk_pct=1.0, max_hold=20, atr_mult=2.0, rr_tar
             risk_amount = capital * (risk_pct / 100.0)
             qty = max(1, int(risk_amount / risk_per_share))
             target = entry_price - rr_target * (stop - entry_price)
-
             exit_price = None
             exit_idx = None
             for j in range(entry_idx, min(len(df), entry_idx + max_hold)):
@@ -350,8 +310,6 @@ def backtest(df, capital=100000, risk_pct=1.0, max_hold=20, atr_mult=2.0, rr_tar
             if exit_price is None:
                 exit_idx = min(len(df) - 1, entry_idx + max_hold - 1)
                 exit_price = df['Close'].iat[exit_idx]
-
-            # for shorts PnL is reversed
             profit = (entry_price - exit_price) * qty
             pct_return_on_cap = profit / capital
             cash += profit
@@ -366,136 +324,230 @@ def backtest(df, capital=100000, risk_pct=1.0, max_hold=20, atr_mult=2.0, rr_tar
                 'pnl_pct': pct_return_on_cap,
             })
             equity_curve.append(cash)
-
     trades_df = pd.DataFrame(trades)
-    equity = pd.Series(equity_curve[:len(df) + 1], index=list(df.index[: len(equity_curve) - 1]) + [df.index[-1]])
+    # build equity series aligned to df index (simple)
+    equity_index = list(df.index[:len(equity_curve)])
+    equity = pd.Series(equity_curve, index=equity_index)
     return trades_df, equity
 
 # ------------------------------
-# Main: fetch data, compute, show
+# Main app logic: file upload, mapping, compute, backtest, live recommendation
 # ------------------------------
 
-if run_backtest:
-    with st.spinner("Fetching data and calculating indicators..."):
-        try:
-            df = yf.download(ticker, period=period, interval=interval, progress=False)
-        except Exception as e:
-            st.error(f"Failed to download data: {e}")
-            st.stop()
-
-        if df is None or df.empty:
-            st.error("No data returned for this ticker / interval. Try different ticker or shorter period (for intraday intervals).")
-            st.stop()
-
-        df.index = pd.to_datetime(df.index)
-        df = df[['Open', 'High', 'Low', 'Close', 'Volume']]
-
-        df = compute_indicators(df)
-        df = generate_signals(df, spike_mult=spike_mult, atr_mult_sl=atr_mult_sl, rr_target=rr_target)
-
-        # compute volume profile zones
-        zones, edges, vol_by_bin = volume_profile(df, bins=24)
-
-        st.success("Data fetched and indicators computed.")
-
-    # Show summary metrics
-    st.subheader(f"{ticker} — Data & Smart Signals Summary")
-    col1, col2 = st.columns([2, 1])
-    with col1:
-        st.write(df.tail(10))
-    with col2:
-        st.write("Top volume-price zones (HVNs):")
-        for z in zones:
-            st.write(f"{z[0]:.2f} to {z[1]:.2f} — volume: {int(z[2])}")
-
-    # chart
-    st.subheader("Price chart (indicators + signals)")
-    fig, ax = plt.subplots(figsize=(14, 5))
-    ax.plot(df.index, df['Close'], label='Close')
-    if show_indicators:
-        ax.plot(df.index, df['ema20'], label='EMA20', linewidth=0.8)
-        ax.plot(df.index, df['ema200'], label='EMA200', linewidth=0.8)
-        ax.plot(df.index, df['bb_upper'], label='BB Upper', linewidth=0.5, alpha=0.6)
-        ax.plot(df.index, df['bb_lower'], label='BB Lower', linewidth=0.5, alpha=0.6)
-        ax.plot(df.index, df['vwap'], label='VWAP', linewidth=0.8)
-
-    # mark signals
-    longs = df[df['signal'] == 1]
-    shorts = df[df['signal'] == -1]
-    ax.scatter(longs.index, longs['Close'], marker='^', color='green', s=60, label='Long Signal')
-    ax.scatter(shorts.index, shorts['Close'], marker='v', color='red', s=60, label='Short Signal')
-
-    # mark big player volumes
-    bigp = df[df['big_player']]
-    ax.scatter(bigp.index, bigp['Close'], marker='o', facecolors='none', edgecolors='black', s=80, label='Big-player vol')
-
-    ax.legend(loc='upper left')
-    ax.set_title(f"{ticker} — Close with indicators & signals")
-    ax.set_xlabel('Time')
-    ax.set_ylabel('Price')
-    st.pyplot(fig)
-
-    # volume profile bar
-    st.subheader("Volume Profile (approx)")
-    fig2, ax2 = plt.subplots(figsize=(4, 6))
-    bins_center = (edges[:-1] + edges[1:]) / 2
-    ax2.barh(bins_center, vol_by_bin)
-    ax2.set_xlabel('Volume')
-    ax2.set_ylabel('Price')
-    st.pyplot(fig2)
-
-    # trades & backtest
-    st.subheader("Backtest (simple discrete trades)")
-    trades_df, equity = backtest(df, capital=starting_capital, risk_pct=risk_percent, max_hold=max_hold_bars, atr_mult=atr_mult_sl, rr_target=rr_target)
-
-    if trades_df.empty:
-        st.warning("No trades generated with these parameters. Consider loosening conditions or changing timeframe.")
-    else:
-        st.write(trades_df)
-        total_pnl = trades_df['pnl'].sum()
-        wins = trades_df[trades_df['pnl'] > 0]
-        losses = trades_df[trades_df['pnl'] <= 0]
-        win_rate = len(wins) / len(trades_df) if len(trades_df) > 0 else 0
-        avg_win = wins['pnl'].mean() if not wins.empty else 0
-        avg_loss = losses['pnl'].mean() if not losses.empty else 0
-        expectancy = (win_rate * avg_win + (1 - win_rate) * avg_loss)
-
-        st.metric("Total P&L (INR)", f"{total_pnl:.2f}")
-        st.metric("Trades", f"{len(trades_df)}")
-        st.metric("Win Rate", f"{win_rate * 100:.2f}%")
-        st.metric("Expectancy (INR per trade)", f"{expectancy:.2f}")
-
-        # equity curve
-        st.subheader("Equity Curve")
-        fig3, ax3 = plt.subplots(figsize=(10, 4))
-        equity.plot(ax=ax3)
-        ax3.set_ylabel('Equity (INR)')
-        st.pyplot(fig3)
-
-    # additional smart indicators panel
-    st.subheader("Smart Trading Insights (what to watch)")
-    insights = []
-    recent = df.iloc[-30:]
-    if recent['momentum_imminent'].any():
-        insights.append("Momentum signals detected recently (squeeze release + vol pickup). Watch for directional breakout.")
-    if recent['big_player'].any():
-        insights.append("Big-player volume spikes observed recently — these often precede extended moves or mark liquidity events.")
-    # zone insights
-    if zones:
-        top_zone = zones[0]
-        insights.append(f"Top high-volume price area near {top_zone[0]:.2f} to {top_zone[1]:.2f}. Treat as strong support/resistance.")
-
-    if len(insights) == 0:
-        st.write("No immediate smart signals flagged in the recent window. Continue monitoring squeeze/volume.")
-    else:
-        for it in insights:
-            st.info(it)
-
-    st.markdown("---")
-    st.write("**How to use this template**: Tweak indicators (EMA lengths, ATR multipliers, volume spike multiplier) and timeframe. Always forward-test and monitor slippage / transaction costs.")
-    st.write("If you want I can help further: add option/futures position sizing, hook to a broker API, or refine the big-player detector to use exchange OI / block trade data (requires additional data source).")
-
+if uploaded_file is None:
+    st.info("Please upload a CSV or Excel file with OHLCV data in the sidebar.")
 else:
-    st.info("Set parameters in the sidebar and click 'Fetch & Run Backtest' to compute signals and run the simple backtest.")
+    try:
+        raw = load_uploaded_file(uploaded_file)
+    except Exception as e:
+        st.error(f"Failed to read uploaded file: {e}")
+        st.stop()
+
+    st.subheader("File preview (first 10 rows)")
+    st.write(raw.head(10))
+
+    # Attempt to guess columns
+    cols = list(raw.columns)
+    guessed_date = guess_column(cols, ["date", "datetime", "timestamp", "time"])
+    guessed_open = guess_column(cols, ["open", "opn"])
+    guessed_high = guess_column(cols, ["high", "hi"])
+    guessed_low = guess_column(cols, ["low", "lo"])
+    guessed_close = guess_column(cols, ["close", "adj close", "last"])
+    guessed_vol = guess_column(cols, ["volume", "vol"])
+
+    st.subheader("Map columns")
+    c1, c2 = st.columns(2)
+    with c1:
+        date_col = st.selectbox("Date/Time column", options=[None] + cols, index=cols.index(guessed_date) + 1 if guessed_date in cols else 0)
+        open_col = st.selectbox("Open column", options=[None] + cols, index=cols.index(guessed_open) + 1 if guessed_open in cols else 0)
+        high_col = st.selectbox("High column", options=[None] + cols, index=cols.index(guessed_high) + 1 if guessed_high in cols else 0)
+    with c2:
+        low_col = st.selectbox("Low column", options=[None] + cols, index=cols.index(guessed_low) + 1 if guessed_low in cols else 0)
+        close_col = st.selectbox("Close column", options=[None] + cols, index=cols.index(guessed_close) + 1 if guessed_close in cols else 0)
+        vol_col = st.selectbox("Volume column", options=[None] + cols, index=cols.index(guessed_vol) + 1 if guessed_vol in cols else 0)
+
+    st.markdown("**Parsing options**")
+    date_format = st.text_input("Date format (optional, strptime style). Leave blank to auto-parse.", value="")
+    timezone = st.text_input("Timezone (for display only, optional)", value="")
+
+    if not date_col or not open_col or not high_col or not low_col or not close_col:
+        st.warning("Please map at least Date, Open, High, Low and Close columns.")
+        st.stop()
+
+    # Build dataframe with required columns
+    working = raw[[date_col, open_col, high_col, low_col, close_col]].copy()
+    if vol_col:
+        working['Volume'] = raw[vol_col].fillna(0)
+    else:
+        working['Volume'] = 0
+
+    # parse date
+    try:
+        if date_format.strip() == "":
+            working[date_col] = pd.to_datetime(working[date_col], infer_datetime_format=True, errors='coerce')
+        else:
+            working[date_col] = pd.to_datetime(working[date_col], format=date_format, errors='coerce')
+    except Exception as e:
+        st.error(f"Failed to parse date column: {e}")
+        st.stop()
+
+    if working[date_col].isnull().any():
+        st.warning("Some date values could not be parsed and will be dropped.")
+        working = working.dropna(subset=[date_col])
+
+    working = working.rename(columns={
+        date_col: 'DateTime',
+        open_col: 'Open',
+        high_col: 'High',
+        low_col: 'Low',
+        close_col: 'Close'
+    })
+    working = working[['DateTime', 'Open', 'High', 'Low', 'Close', 'Volume']]
+    working = working.sort_values('DateTime').set_index('DateTime')
+
+    df = working.copy()
+
+    if run_backtest:
+        with st.spinner("Computing indicators and signals..."):
+            df = compute_indicators(df)
+            df = generate_signals(df, spike_mult=spike_mult, atr_mult_sl=atr_mult_sl, rr_target=rr_target)
+            zones, edges, vol_by_bin = volume_profile(df, bins=24)
+        st.success("Indicators & signals computed.")
+
+        st.subheader("Latest data (last 10 rows)")
+        st.write(df.tail(10))
+
+        # Price chart
+        st.subheader("Price chart (indicators + signals)")
+        fig, ax = plt.subplots(figsize=(14, 5))
+        ax.plot(df.index, df['Close'], label='Close')
+        if show_indicators:
+            ax.plot(df.index, df['ema20'], label='EMA20', linewidth=0.8)
+            ax.plot(df.index, df['ema200'], label='EMA200', linewidth=0.8)
+            ax.plot(df.index, df['bb_upper'], label='BB Upper', linewidth=0.5, alpha=0.6)
+            ax.plot(df.index, df['bb_lower'], label='BB Lower', linewidth=0.5, alpha=0.6)
+            ax.plot(df.index, df['vwap'], label='VWAP', linewidth=0.8)
+        longs = df[df['signal'] == 1]
+        shorts = df[df['signal'] == -1]
+        ax.scatter(longs.index, longs['Close'], marker='^', color='green', s=60, label='Long Signal')
+        ax.scatter(shorts.index, shorts['Close'], marker='v', color='red', s=60, label='Short Signal')
+        bigp = df[df['big_player']]
+        ax.scatter(bigp.index, bigp['Close'], marker='o', facecolors='none', edgecolors='black', s=80, label='Big-player vol')
+        ax.legend(loc='upper left')
+        ax.set_title(f"Price with indicators & signals")
+        ax.set_xlabel('Time')
+        ax.set_ylabel('Price')
+        st.pyplot(fig)
+
+        # volume profile
+        st.subheader("Volume Profile (approx)")
+        fig2, ax2 = plt.subplots(figsize=(4, 6))
+        bins_center = (edges[:-1] + edges[1:]) / 2
+        ax2.barh(bins_center, vol_by_bin)
+        ax2.set_xlabel('Volume')
+        ax2.set_ylabel('Price')
+        st.pyplot(fig2)
+
+        # backtest
+        st.subheader("Backtest (simple discrete trades)")
+        trades_df, equity = backtest(df, capital=starting_capital, risk_pct=risk_percent, max_hold=max_hold_bars, atr_mult=atr_mult_sl, rr_target=rr_target)
+        if trades_df.empty:
+            st.warning("No trades generated with these parameters. Consider loosening conditions or changing timeframe/data sampling.")
+        else:
+            st.write(trades_df)
+            total_pnl = trades_df['pnl'].sum()
+            wins = trades_df[trades_df['pnl'] > 0]
+            losses = trades_df[trades_df['pnl'] <= 0]
+            win_rate = len(wins) / len(trades_df) if len(trades_df) > 0 else 0
+            avg_win = wins['pnl'].mean() if not wins.empty else 0
+            avg_loss = losses['pnl'].mean() if not losses.empty else 0
+            expectancy = (win_rate * avg_win + (1 - win_rate) * avg_loss)
+            st.metric("Total P&L (INR)", f"{total_pnl:.2f}")
+            st.metric("Trades", f"{len(trades_df)}")
+            st.metric("Win Rate", f"{win_rate * 100:.2f}%")
+            st.metric("Expectancy (INR per trade)", f"{expectancy:.2f}")
+            st.subheader("Equity Curve")
+            fig3, ax3 = plt.subplots(figsize=(10, 4))
+            equity.plot(ax=ax3)
+            ax3.set_ylabel('Equity (INR)')
+            st.pyplot(fig3)
+
+        # Smart insights
+        st.subheader("Smart Trading Insights (recent)")
+        insights = []
+        recent = df.iloc[-30:]
+        if recent['momentum_imminent'].any():
+            insights.append("Momentum signals detected recently (squeeze release + vol pickup). Watch for directional breakout.")
+        if recent['big_player'].any():
+            insights.append("Big-player volume spikes observed recently — these often precede extended moves or mark liquidity events.")
+        if zones:
+            top_zone = zones[0]
+            insights.append(f"Top high-volume price area near {top_zone[0]:.2f} to {top_zone[1]:.2f}. Treat as strong support/resistance.")
+        if len(insights) == 0:
+            st.write("No immediate smart signals flagged in the recent window. Continue monitoring squeeze/volume.")
+        else:
+            for it in insights:
+                st.info(it)
+
+        st.markdown("---")
+        st.subheader("Live Recommendation (based on latest bar)")
+        if st.button("Get Live Recommendation"):
+            last = df.iloc[-1]
+            reasons = []
+            score = 0.0
+            # trend
+            if last['above_ema200']:
+                reasons.append('Trend: LONG (Close > EMA200)')
+                score += 0.4
+            elif last['below_ema200']:
+                reasons.append('Trend: SHORT (Close < EMA200)')
+                score += 0.4
+            else:
+                reasons.append('Trend: Neutral')
+            # pullback
+            if last['to_ema20_pullback_long'] and last['above_ema200']:
+                reasons.append('Price near/below EMA20 (pullback) — possible entry on bounce')
+                score += 0.15
+            if last['to_ema20_pullback_short'] and last['below_ema200']:
+                reasons.append('Price near/above EMA20 (pullback) — possible short on rejection')
+                score += 0.15
+            # momentum / big player
+            if last['momentum_imminent']:
+                reasons.append('Momentum imminent (squeeze release + vol pickup)')
+                score += 0.2
+            if last['big_player']:
+                reasons.append('Big-player volume spike detected')
+                score += 0.2
+            # volume
+            if last['Volume'] > last['vol_ma20']:
+                reasons.append('Volume above 20-period average')
+                score += 0.1
+            # cap score at 1.0
+            conf = min(score, 1.0)
+            # determine recommendation
+            rec = 'HOLD'
+            if last['signal'] == 1:
+                rec = 'BUY'
+            elif last['signal'] == -1:
+                rec = 'SELL'
+            else:
+                # infer from trend + momentum
+                if last['above_ema200'] and (last['momentum_imminent'] or last['big_player']):
+                    rec = 'WATCH/CONSIDER BUY'
+                elif last['below_ema200'] and (last['momentum_imminent'] or last['big_player']):
+                    rec = 'WATCH/CONSIDER SELL'
+            # show
+            st.success(f"Recommendation: {rec} — Confidence: {conf*100:.0f}%")
+            st.write("Reasons:")
+            for r in reasons:
+                st.write(f"- {r}")
+
+        st.write("
+---
+")
+        st.write("**How to use**: Upload a fresh CSV/Excel (intraday or daily), map the columns, click 'Compute & Run'. Use 'Get Live Recommendation' to evaluate the latest bar. Tune the parameters in the sidebar to your universe/timeframe.")
+
+    else:
+        st.info("Map columns and click 'Compute & Run' in the sidebar to compute indicators, signals, and run backtest.")
 
 # EOF
