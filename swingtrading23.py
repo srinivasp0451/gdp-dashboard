@@ -10,7 +10,15 @@ from datetime import datetime
 import random
 import itertools
 
-st.set_page_config(page_title="Swing Trading Recommender — Live + WFCV + Visuals", layout="wide")
+st.set_page_config(page_title="Swing Trading Recommender — Live + WFCV + Visuals (Fixed)", layout="wide")
+
+# ---------------------------- Session defaults ---------------------------
+if 'fetched_df' not in st.session_state:
+    st.session_state['fetched_df'] = None
+if 'raw_source' not in st.session_state:
+    st.session_state['raw_source'] = None
+if 'best_strategy' not in st.session_state:
+    st.session_state['best_strategy'] = None
 
 # -------------------- Helper: column mapping & standardize -----------------
 
@@ -38,7 +46,7 @@ def infer_columns(df):
         if mapping['volume'] is None and any(t in token_set for t in ("volume","vol","qty","quantity","tradevolume")):
             mapping['volume'] = col
             continue
-    # fallback
+    # fallback date detection
     if mapping['date'] is None:
         for col in df.columns:
             try:
@@ -98,20 +106,13 @@ def standardize_df_from_file(raw):
 
 
 def standardize_df_from_yf(df):
-    # yfinance returns DatetimeIndex
     d = df.copy()
     if isinstance(d.index, pd.DatetimeIndex):
         d = d.reset_index().rename(columns={'index':'Date'})
-    # yfinance may have 'Adj Close' column
-    if 'Adj Close' in d.columns and 'Close' in d.columns:
-        # prefer Adj Close for returns but keep Close for price levels
-        pass
-    # ensure columns
     for col in ['Open','High','Low','Close','Volume']:
         if col not in d.columns:
             d[col] = np.nan
     d['Date'] = pd.to_datetime(d['Date'], errors='coerce')
-    # convert tz to IST
     try:
         if d['Date'].dt.tz is None:
             d['Date'] = d['Date'].dt.tz_localize('UTC').dt.tz_convert('Asia/Kolkata')
@@ -119,7 +120,6 @@ def standardize_df_from_yf(df):
             d['Date'] = d['Date'].dt.tz_convert('Asia/Kolkata')
     except Exception:
         d['Date'] = pd.to_datetime(d['Date']).dt.tz_localize('UTC').dt.tz_convert('Asia/Kolkata')
-    # numeric
     for col in ['Open','High','Low','Close','Volume']:
         d[col] = pd.to_numeric(d[col], errors='coerce')
     d = d[['Date','Open','High','Low','Close','Volume']]
@@ -133,7 +133,6 @@ def standardize_df_from_yf(df):
 def ema(series, span):
     return series.ewm(span=span, adjust=False).mean()
 
-
 def rsi(series, period=14):
     delta = series.diff()
     gain = delta.clip(lower=0)
@@ -142,7 +141,6 @@ def rsi(series, period=14):
     avg_loss = loss.ewm(alpha=1/period, adjust=False).mean()
     rs = avg_gain / (avg_loss + 1e-9)
     return 100 - (100 / (1 + rs))
-
 
 def atr(df, n=14):
     high = df['High']
@@ -187,11 +185,8 @@ def cluster_levels(levels, tol=0.01):
 
 
 def detect_basic_patterns(df, ph, pl, params):
-    # returns list of detected patterns (simple heuristics)
     patterns = []
     price = df['Close'].values
-    # double/triple, head&shoulders, engulfing, triangle/pennant (simple)
-    # double top/bottom
     for i in range(len(ph)-1):
         idx1, p1 = ph[i]
         idx2, p2 = ph[i+1]
@@ -202,7 +197,6 @@ def detect_basic_patterns(df, ph, pl, params):
         idx2, p2 = pl[i+1]
         if idx2 - idx1 >= params['min_bars_between'] and abs(p1 - p2) <= params['pattern_tol'] * ((p1 + p2)/2):
             patterns.append(('double_bottom', idx1, idx2, p1))
-    # head & shoulders (PH-based)
     for i in range(len(ph)-2):
         l_idx, l_p = ph[i]
         m_idx, m_p = ph[i+1]
@@ -211,15 +205,12 @@ def detect_basic_patterns(df, ph, pl, params):
             shoulders = (l_p + r_p) / 2
             if m_p > shoulders and abs(l_p - r_p) <= params.get('hs_tol',0.03) * shoulders:
                 patterns.append(('head_and_shoulders', l_idx, m_idx, r_idx))
-    # engulfing
     for i in range(1, len(df)):
         po = df.loc[i-1,'Open']; pc = df.loc[i-1,'Close']; o = df.loc[i,'Open']; c = df.loc[i,'Close']
         if pc < po and c > o and (c - o) > (po - pc):
             patterns.append(('bullish_engulf', i-1, i))
         if pc > po and c < o and (o - c) > (pc - po):
             patterns.append(('bearish_engulf', i-1, i))
-    # triangles/pennants - simplified: look for contracting range in recent pivots
-    # cup & handle simplified: large rounded bottom followed by small consolidation
     return patterns
 
 
@@ -243,7 +234,6 @@ def generate_signals_and_meta(df, params):
 
     patterns = detect_basic_patterns(df, ph, pl, params)
 
-    # scoring: pattern weight + trend + momentum + volume + ATR
     weights = params.get('weights') or {
         'double_top': -3.0, 'double_bottom': 3.0,
         'head_and_shoulders': -4.0, 'bullish_engulf': 2.0, 'bearish_engulf': -2.0
@@ -253,7 +243,6 @@ def generate_signals_and_meta(df, params):
     reasons = ['']*len(df)
     vol_med = df['Volume'].median() if not df['Volume'].isnull().all() else 0
 
-    # build index->patterns map
     pat_map = {}
     for p in patterns:
         end = p[2] if len(p)>=3 else p[1]
@@ -272,7 +261,7 @@ def generate_signals_and_meta(df, params):
             score += 0.5; fired.append('trend_long')
         else:
             score -= 0.5; fired.append('trend_short')
-        # rsi momentum
+        # rsi
         if df.loc[i,'rsi'] > 55:
             score += 0.5; fired.append('rsi_long')
         if df.loc[i,'rsi'] < 45:
@@ -288,7 +277,6 @@ def generate_signals_and_meta(df, params):
         if min(c,o) - l > params['wick_factor']*body:
             score += 1.0; fired.append('lower_wick')
 
-        # threshold
         thr = params['signal_threshold']
         sig = 0
         if score >= thr and 'long' in params['allowed_dirs']:
@@ -326,7 +314,6 @@ def backtest(df_signals, params):
         exit_price=None; exit_idx=None; exit_reason=None
         for j in range(entry_idx, min(L, entry_idx+params['max_hold']+1)):
             day_high = df_signals.loc[j,'High']; day_low = df_signals.loc[j,'Low']
-            # conservative: SL first
             if sig==1:
                 if day_low <= sl:
                     exit_price=sl; exit_idx=j; exit_reason='sl'; break
@@ -353,105 +340,84 @@ def backtest(df_signals, params):
     return trades_df, stats
 
 
-# ------------------------ walk-forward CV --------------------------------
-
-def walk_forward_cv(df, train_days=365*2, test_days=90, step_days=90, search_iters=100, params_base=None):
-    # returns list of stats for each window
-    stats_list = []
-    start = df['Date'].min()
-    end = df['Date'].max()
-    cur_train_start = start
-    while True:
-        train_end = cur_train_start + pd.Timedelta(days=train_days)
-        test_end = train_end + pd.Timedelta(days=test_days)
-        if test_end > end:
-            break
-        df_train = df[(df['Date']>=cur_train_start)&(df['Date']<=train_end)].reset_index(drop=True)
-        df_test = df[(df['Date']>train_end)&(df['Date']<=test_end)].reset_index(drop=True)
-        if len(df_train)<50 or len(df_test)<10:
-            cur_train_start += pd.Timedelta(days=step_days)
-            continue
-        # optimize on train with fewer iterations
-        best, _ = find_best_on_train(df_train, search_iters=search_iters, params_base=params_base)
-        if best is None:
-            cur_train_start += pd.Timedelta(days=step_days)
-            continue
-        # test
-        df_signals_test, meta = generate_signals_and_meta(df_test, best['params'])
-        trades_test, stats_test = backtest(df_signals_test, best['params'])
-        stats_list.append({'train_period':(cur_train_start,train_end),'test_period':(train_end+pd.Timedelta(seconds=1), test_end),'train_stats':best['stats'],'test_stats':stats_test,'best_params':best['params']})
-        cur_train_start += pd.Timedelta(days=step_days)
-    return stats_list
-
-
-def find_best_on_train(df_train, search_iters=80, params_base=None):
-    # simple random search optimized for accuracy
-    best=None; best_metric=-np.inf; tried=0
-    for _ in range(search_iters):
-        s = {'pivot_window':random.choice([2,3,4]),'cluster_tol':random.choice([0.003,0.005,0.01]),'zone_width':random.choice([0.003,0.005]),'sl_pct':random.choice([0.005,0.01]),'tp_pct':random.choice([0.01,0.02]),'max_hold':random.choice([3,5,7]),'breakout_lookback':random.choice([3,5]),'pattern_tol':random.choice([0.01,0.02]),'min_bars_between':random.choice([2,3]),'signal_threshold':random.choice([2.5,3.0]),'use_target_points':False,'target_points':None,'allowed_dirs':['long','short'],'volume_factor':1.2,'wick_factor':1.5}
-        params = s
-        df_signals, meta = generate_signals_and_meta(df_train, params)
-        trades, stats = backtest(df_signals, params)
-        tried+=1
-        if stats['total_trades']<3:
-            continue
-        metric = stats['accuracy']
-        if metric>best_metric:
-            best_metric=metric; best={'params':params,'stats':stats,'trades':trades}
-    return best, tried
-
-
 # --------------------- Visualization helpers ----------------------------
 
 def plot_with_overlays(df, meta, trades=None, title='Price with overlays'):
-    # prepare mpf plot
     df_plot = df.copy()
     df_plot = df_plot.set_index('Date')
-    df_plot.index = pd.DatetimeIndex(df_plot.index)  # mpf requires naive or tz-aware? it handles tz-aware
-    addplots = []
-    # mark support/resistance zones as hlines
+    # prepare hlines and colors
     hlines = []
+    colors = []
     for s in meta.get('supports', []):
-        hlines.append(s)
+        hlines.append(s); colors.append('green')
     for r in meta.get('resistances', []):
-        hlines.append(r)
-    apdict = dict()
-    if hlines:
-        apdict['hlines'] = dict(hlines=hlines, colors=['green' if i in meta.get('supports',[]) else 'red' for i in hlines], linewidths=1, alpha=0.3)
-    # markers for trades
+        # avoid duplicate
+        if r not in meta.get('supports',[]):
+            hlines.append(r); colors.append('red')
+    hlines_dict = {'hlines': hlines, 'colors': colors, 'linewidths': 1, 'alpha':0.6} if hlines else None
+
+    # create entry/exit markers aligned to df_plot index
+    addplots = []
     if trades is not None and not trades.empty:
-        buys = trades[trades['direction']=='long']
-        sells = trades[trades['direction']=='short']
-        if not buys.empty:
-            buy_scatter = mpf.make_addplot(pd.Series([np.nan]*len(df_plot), index=df_plot.index))
-            # instead of precise scatter use vertical lines at indices
-        # we will use mpf.plot with hlines only for clarity
-    fig, axlist = mpf.plot(df_plot, type='candle', style='charles', title=title, returnfig=True, hlines=apdict.get('hlines'))
-    return fig
+        entries = pd.Series(np.nan, index=df_plot.index)
+        exits = pd.Series(np.nan, index=df_plot.index)
+        # map trade times to nearest index in df_plot
+        for _,t in trades.iterrows():
+            try:
+                et = t['entry_time']
+                xt = t['exit_time']
+                # find nearest index (by date)
+                nearest_entry_idx = df_plot.index.get_indexer([et], method='nearest')[0]
+                nearest_exit_idx = df_plot.index.get_indexer([xt], method='nearest')[0]
+                if nearest_entry_idx >= 0 and nearest_entry_idx < len(df_plot):
+                    entries.iloc[nearest_entry_idx] = t['entry_price']
+                if nearest_exit_idx >= 0 and nearest_exit_idx < len(df_plot):
+                    exits.iloc[nearest_exit_idx] = t['exit_price']
+            except Exception:
+                continue
+        if entries.notna().any():
+            addplots.append(mpf.make_addplot(entries, type='scatter', markersize=50, marker='^'))
+        if exits.notna().any():
+            addplots.append(mpf.make_addplot(exits, type='scatter', markersize=50, marker='v'))
+
+    try:
+        fig, axlist = mpf.plot(df_plot, type='candle', style='charles', title=title, returnfig=True, addplot=addplots, hlines=hlines_dict)
+        return fig
+    except Exception as e:
+        # fallback: simple close-line plot
+        fig, ax = plt.subplots(figsize=(12,6))
+        ax.plot(df_plot.index, df_plot['Close'])
+        ax.set_title(title)
+        for lvl in hlines:
+            ax.axhline(lvl, color='green' if lvl in meta.get('supports',[]) else 'red', alpha=0.4)
+        return fig
 
 
 # ---------------------------- Streamlit app ------------------------------
 
 def app():
-    st.title('Swing Trading Recommender — Live + Walk-forward + Visuals')
-    st.markdown('This upgraded app fetches data from yfinance (Nifty50 dropdown or manual ticker), runs robust price-action strategy backtests, walk-forward CV, and shows live recommendations using the exact same logic as backtest.')
+    st.title('Swing Trading Recommender — Fixed (Fetch + Optimize)')
+    st.markdown('This version fixes the TypeError seen in the heatmap and adds a separate **Fetch data** button (to avoid yfinance rate limits). The live recommendation uses identical logic as the backtester.')
 
-    # Sidebar controls
+    # Sidebar: data source and controls
     with st.sidebar:
         st.header('Data source')
         source = st.radio('Choose source', ['Nifty50 dropdown (yfinance)','Upload file'])
-        # a reasonably complete Nifty50 ticker list (as of 2025) with .NS suffix for yfinance
-        nifty50 = ['RELIANCE.NS','TCS.NS','HDFCBANK.NS','INFY.NS','HDFC.NS','ICICIBANK.NS','KOTAKBANK.NS','SBIN.NS','LT.NS','AXISBANK.NS','BHARTIARTL.NS','ITC.NS','HINDUNILVR.NS','BAJFINANCE.NS','MARUTI.NS','ASIANPAINT.NS','WIPRO.NS','ONGC.NS','TATAMOTORS.NS','TATASTEEL.NS','JSWSTEEL.NS','HCLTECH.NS','NESTLEIND.NS','SUNPHARMA.NS','ULTRACEMCO.NS','POWERGRID.NS','TECHM.NS','BPCL.NS','NTPC.NS','COALINDIA.NS','ADANIENT.NS','ADANIPORTS.NS','DIVISLAB.NS','BRITANNIA.NS','GRASIM.NS','HINDALCO.NS','EICHERMOT.NS','SBILIFE.NS','BPCL.NS','TITAN.NS','DRREDDY.NS','INDUSINDBK.NS','M&M.NS','HDFCLIFE.NS','BAJAJFINSV.NS','SHREECEM.NS','CIPLA.NS','ONGC.NS']
+        nifty50 = ['RELIANCE.NS','TCS.NS','HDFCBANK.NS','INFY.NS','HDFC.NS','ICICIBANK.NS','KOTAKBANK.NS','SBIN.NS','LT.NS','AXISBANK.NS']
         if source.startswith('Nifty'):
-            ticker = st.selectbox('Select ticker', nifty50+['Other'])
-            if ticker == 'Other':
-                ticker = st.text_input('Enter ticker (yfinance format, e.g. AAPL or RELIANCE.NS)', value='')
-            timeframe = st.selectbox('Timeframe / Interval', ['1d','1wk','1mo','60m','30m'])
+            ticker_choice = st.selectbox('Select ticker', nifty50 + ['Other'])
+            if ticker_choice == 'Other':
+                ticker = st.text_input('Enter ticker (yfinance format, e.g. RELIANCE.NS or AAPL)', value='RELIANCE.NS')
+            else:
+                ticker = ticker_choice
+            timeframe = st.selectbox('Interval', ['1d','1wk','1mo','60m','30m'])
             period = st.selectbox('Period', ['6mo','1y','2y','5y','max'])
+            st.markdown('Click **Fetch data** to download from yfinance (avoids automatic repeated fetches and rate limits).')
         else:
             upload = st.file_uploader('Upload CSV/Excel', type=['csv','xlsx','xls'])
-            timeframe = st.selectbox('Timeframe / Interval (ignored for file)', ['1d'])
-            period = st.selectbox('Period (ignored for file)', ['all'])
+            ticker = None
+            timeframe = '1d'
+            period = 'all'
         st.markdown('---')
         st.header('Strategy & Optimization')
         side_opt = st.selectbox('Side', ['both','long','short'])
@@ -461,52 +427,56 @@ def app():
         min_trades = st.number_input('Min trades for strategy', min_value=1, max_value=200, value=5)
         use_points = st.checkbox('Use absolute target points in backtest & live', value=False)
         target_points = st.number_input('Target points (if using points)', min_value=1, value=50)
-        precision_mode = st.checkbox('Precision mode (makes signals rarer but more precise)', value=True)
-        run_wf = st.checkbox('Run Walk-Forward CV (slower)', value=False)
+        precision_mode = st.checkbox('Precision mode (rarer but more precise)', value=True)
+        run_wf = st.checkbox('Enable Walk-Forward CV (slower)', value=False)
         st.markdown('Optional position sizing')
         capital = st.number_input('Capital (0 = off)', min_value=0, value=0)
         risk_pct = st.number_input('Risk % per trade', min_value=0.1, max_value=10.0, value=1.0)
         st.markdown('Heatmap colors')
-        heat_cmap = st.selectbox('Heatmap colormap', ['coolwarm','RdYlGn','viridis','bwr'])
+        heat_cmap = st.selectbox('Heatmap colormap', ['RdYlGn','coolwarm','viridis','bwr'])
 
-    # Load data
-    df = None
-    mapping = None
+    # Fetch data button (for yfinance) or process upload
     if source.startswith('Nifty'):
-        if not ticker:
-            st.warning('Enter a ticker')
-            return
-        with st.spinner(f'Downloading {ticker}...'):
+        if st.button('Fetch data'):
+            st.info('Fetching data — yfinance rate limits may apply. If you hit rate-limit, wait a minute or use a smaller period.')
             try:
                 raw = yf.download(tickers=ticker, period=period, interval=timeframe, progress=False)
             except Exception as e:
                 st.error(f'Failed to download: {e}')
                 return
-        if raw is None or raw.empty:
-            st.error('No data from yfinance — try a different ticker/period/interval')
-            return
-        df = standardize_df_from_yf(raw)
-        mapping = {'source':'yfinance','ticker':ticker}
+            if raw is None or raw.empty:
+                st.error('No data returned by yfinance. Try another interval/period or ticker.')
+                return
+            df_fetched = standardize_df_from_yf(raw)
+            st.session_state['fetched_df'] = df_fetched
+            st.session_state['raw_source'] = {'source':'yfinance','ticker':ticker,'period':period,'interval':timeframe}
+            st.success(f'Data fetched: {len(df_fetched)} rows')
     else:
-        if 'upload' not in locals() or upload is None:
-            st.info('Upload a file to proceed')
-            return
-        try:
-            if upload.name.endswith('.csv'):
-                raw = pd.read_csv(upload)
-            else:
-                raw = pd.read_excel(upload)
-        except Exception as e:
-            st.error(f'Failed to read file: {e}'); return
-        try:
-            df, mapping = standardize_df_from_file(raw)
-        except Exception as e:
-            st.error(f'Error mapping file: {e}'); return
+        # file upload path
+        if 'upload' in locals() and upload is not None:
+            try:
+                if upload.name.endswith('.csv'):
+                    raw = pd.read_csv(upload)
+                else:
+                    raw = pd.read_excel(upload)
+            except Exception as e:
+                st.error(f'Failed to read file: {e}')
+                return
+            try:
+                df_fetched, mapping = standardize_df_from_file(raw)
+            except Exception as e:
+                st.error(f'Error mapping file: {e}'); return
+            st.session_state['fetched_df'] = df_fetched
+            st.session_state['raw_source'] = {'source':'file','name':upload.name}
+            st.success(f'File processed: {len(df_fetched)} rows')
 
-    st.subheader('Mapped columns / source')
-    st.json(mapping)
+    # show fetched data preview
+    if st.session_state['fetched_df'] is None:
+        st.info('No data loaded yet. Use Fetch data or upload a file.')
+        return
 
-    # display preview with IST strings
+    df = st.session_state['fetched_df']
+    st.subheader('Data preview (IST times)')
     df_display = df.copy()
     try:
         df_display['Date'] = df_display['Date'].dt.tz_convert('Asia/Kolkata').dt.strftime('%Y-%m-%d %H:%M:%S %Z')
@@ -521,45 +491,59 @@ def app():
         st.dataframe(df_display.tail())
 
     st.write('Date range:', df['Date'].min(), 'to', df['Date'].max())
-    st.write('Close range:', df['Close'].min(), 'to', df['Close'].max())
 
-    # heatmap of returns (year vs month) with chosen cmap
+    # heatmap of returns (safe conversion to numeric 2D array)
     st.subheader('Year vs Month returns heatmap')
     df['returns'] = df['Close'].pct_change()
     df['year'] = df['Date'].dt.year
     df['month'] = df['Date'].dt.month
     heat = df.pivot_table(values='returns', index='year', columns='month', aggfunc=lambda x: (x+1.0).prod()-1) * 100
-    fig_h, axh = plt.subplots(figsize=(10, max(3, 0.5*len(heat.index))))
-    im = axh.imshow(heat.fillna(0).values, aspect='auto', cmap=heat_cmap)
-    axh.set_xticks(range(len(heat.columns))); axh.set_xticklabels(heat.columns)
-    axh.set_yticks(range(len(heat.index))); axh.set_yticklabels(heat.index)
-    for (j,i), val in np.ndenumerate(heat.fillna(0).values):
-        axh.text(i, j, f"{val:.2f}%", ha='center', va='center', fontsize=8, color='black')
-    fig_h.colorbar(im, ax=axh)
-    st.pyplot(fig_h)
+    if heat.empty:
+        st.warning('Not enough data to build heatmap')
+    else:
+        try:
+            heat_vals = np.asarray(heat.fillna(0).astype(float).values)
+            fig_h, axh = plt.subplots(figsize=(10, max(3, 0.5*len(heat.index))))
+            cmap = plt.get_cmap(heat_cmap)
+            im = axh.imshow(heat_vals, aspect='auto', cmap=cmap, interpolation='nearest')
+            axh.set_xticks(range(len(heat.columns))); axh.set_xticklabels([str(x) for x in heat.columns])
+            axh.set_yticks(range(len(heat.index))); axh.set_yticklabels([str(x) for x in heat.index])
+            # annotated text with readable contrast
+            norm = plt.Normalize(np.nanmin(heat_vals), np.nanmax(heat_vals))
+            for (j,i), val in np.ndenumerate(heat_vals):
+                rgba = cmap(norm(val))
+                luminance = 0.299*rgba[0] + 0.587*rgba[1] + 0.114*rgba[2]
+                txt_color = 'white' if luminance < 0.5 else 'black'
+                axh.text(i, j, f"{val:.2f}%", ha='center', va='center', fontsize=8, color=txt_color)
+            fig_h.colorbar(im, ax=axh)
+            st.pyplot(fig_h)
+        except Exception as e:
+            st.warning('Heatmap plotting failed — showing table instead: ' + str(e))
+            st.dataframe(heat * 100)
 
-    # set up params
+    # prepare base params
     base_params = {'pivot_window':3,'cluster_tol':0.005,'zone_width':0.005,'sl_pct':0.01,'tp_pct':0.02,'max_hold':5,'breakout_lookback':5,'pattern_tol':0.02,'min_bars_between':3,'signal_threshold':3.0,'allowed_dirs':[],'use_target_points':use_points,'target_points':target_points,'volume_factor':1.2,'wick_factor':1.5}
     if side_opt in ['both','long']:
         base_params['allowed_dirs'].append('long')
     if side_opt in ['both','short']:
         base_params['allowed_dirs'].append('short')
-    base_params['precision_mode'] = precision_mode
 
-    # optimization
+    # optimization control: Run Optimization button
     st.subheader('Optimization (find best strategy)')
-    if st.button('Run Optimization'):
-        progress = st.progress(0)
-        status = st.empty()
-        best=None; tried=0
+    run_opt = st.button('Run Optimization (use fetched data)')
+    if run_opt:
         samples = []
-        if search_type=='random':
+        if search_type == 'random':
             samples = sample_random_params(random_iters, None)
         else:
-            samples = list(grid_params(grid if 'grid' in locals() and grid is not None else {'pivot_window':[3]}))
+            # small grid default if none provided
+            grid = {'pivot_window':[3],'sl_pct':[0.01],'tp_pct':[0.02]}
+            samples = list(grid_params(grid))
         total = len(samples)
-        for idx,s in enumerate(samples):
-            tried +=1
+        progress = st.progress(0)
+        status = st.empty()
+        best = None
+        for i,s in enumerate(samples):
             params = base_params.copy(); params.update(s)
             df_signals, meta = generate_signals_and_meta(df, params)
             trades, stats = backtest(df_signals, params)
@@ -571,13 +555,14 @@ def app():
                     metric += 1000
             if best is None or metric > best.get('metric', -np.inf):
                 best = {'params':params,'trades':trades,'stats':stats,'meta':meta,'metric':metric}
-            progress.progress(int((idx+1)/total*100))
-            status.text(f"Progress: {(idx+1)}/{total}")
+            progress.progress(int((i+1)/total*100))
+            status.text(f'Progress: {i+1}/{total}')
         progress.progress(100)
         status.success('Optimization finished')
         if best is None:
             st.warning('No suitable strategy found')
         else:
+            st.session_state['best_strategy'] = best
             st.write('Best params:'); st.json(best['params'])
             st.write('Backtest stats:'); st.json(best['stats'])
             trades_df = best['trades']
@@ -585,26 +570,9 @@ def app():
                 trades_df['entry_time'] = trades_df['entry_time'].dt.tz_convert('Asia/Kolkata').dt.strftime('%Y-%m-%d %H:%M:%S %Z')
                 trades_df['exit_time'] = trades_df['exit_time'].dt.tz_convert('Asia/Kolkata').dt.strftime('%Y-%m-%d %H:%M:%S %Z')
             st.write('Sample trades'); st.dataframe(trades_df.head(50))
-            # buy and hold
-            if len(df)>=2:
-                bh_pts = df['Close'].iloc[-1]-df['Close'].iloc[0]
-                bh_ret = (df['Close'].iloc[-1]/df['Close'].iloc[0]-1)*100
-            else:
-                bh_pts=0; bh_ret=0
-            st.metric('Buy&Hold points',f"{bh_pts:.2f}")
-            st.metric('Strategy total points', f"{best['stats'].get('total_points',0):.2f}")
-            st.write('Patterns detected counts:')
-            pat_counts = {}
-            for p in best['meta']['patterns']:
-                pat_counts[p] = pat_counts.get(p,0)+1
-            st.json(pat_counts)
 
-            # store best in session
-            st.session_state['best_strategy'] = best
-
-    # walk-forward
+    # Walk-forward CV
     if run_wf:
-        st.subheader('Walk-forward CV')
         if st.button('Run Walk-Forward CV'):
             with st.spinner('Running walk-forward...'):
                 wf_stats = walk_forward_cv(df, train_days=365*2, test_days=90, step_days=90, search_iters=60, params_base=base_params)
@@ -614,46 +582,41 @@ def app():
                     st.write('Train accuracy:', w['train_stats']['accuracy'])
                     st.write('Test accuracy:', w['test_stats']['accuracy'])
 
-    # live recommendation using same backtest logic
+    # Live recommendation (use best if exists)
     st.subheader('Live recommendation (same logic as backtest)')
     if st.button('Generate Live Recommendation'):
-        # use best strategy if available, otherwise base
         strategy = st.session_state.get('best_strategy')
         if strategy is not None:
             params = strategy['params']
         else:
             params = base_params
-        # make sure use_target_points matches user choice
         params['use_target_points'] = use_points
         params['target_points'] = target_points if use_points else None
         df_signals, meta = generate_signals_and_meta(df, params)
         trades_bt, stats_bt = backtest(df_signals, params)
-        # last closed candle signal
         last_sig_row = df_signals.iloc[-1]
         sig = int(last_sig_row['signal'])
         if sig==0:
-            st.write('No signal on last candle (live).')
+            st.write('No signal on last closed candle.')
         else:
-            # entry is next open - cannot know; show recommended entry as next_open_estimate = last_close
-            next_open_estimate = df_signals['Close'].iloc[-1]
+            next_open_est = float(df_signals['Close'].iloc[-1])
             if params['use_target_points'] and params.get('target_points'):
-                tp = next_open_estimate + params['target_points'] if sig==1 else next_open_estimate - params['target_points']
+                tp = next_open_est + params['target_points'] if sig==1 else next_open_est - params['target_points']
             else:
-                tp = next_open_estimate*(1+params['tp_pct']) if sig==1 else next_open_estimate*(1-params['tp_pct'])
-            sl = next_open_estimate*(1-params['sl_pct']) if sig==1 else next_open_estimate*(1+params['sl_pct'])
-            unit_risk = abs(next_open_estimate - sl)
+                tp = next_open_est*(1+params['tp_pct']) if sig==1 else next_open_est*(1-params['tp_pct'])
+            sl = next_open_est*(1-params['sl_pct']) if sig==1 else next_open_est*(1+params['sl_pct'])
+            unit_risk = abs(next_open_est - sl)
             suggested_units = None
             if capital>0 and unit_risk>0:
                 suggested_units = int((capital*(risk_pct/100.0))//unit_risk)
-            rec = {'direction': 'long' if sig==1 else 'short','entry_next_open_est':round(float(next_open_estimate),4),'stop_loss':round(float(sl),4),'target':round(float(tp),4),'reason': last_sig_row['reason'],'probability_of_profit': stats_bt.get('accuracy',None),'suggested_units': suggested_units}
+            rec = {'direction': 'long' if sig==1 else 'short','entry_next_open_est':round(next_open_est,4),'stop_loss':round(sl,4),'target':round(tp,4),'reason': last_sig_row['reason'],'probability_of_profit': stats_bt.get('accuracy',None),'suggested_units': suggested_units}
             st.json(rec)
-            # also display what the backtest would have done if this signal occurred earlier
-            st.write('Backtest stats for strategy used:'); st.json(stats_bt)
+            st.write('Strategy backtest stats:'); st.json(stats_bt)
 
-    # visualization of last N candles with overlays
+    # Chart with overlays
     st.subheader('Chart with overlays (last 200 bars)')
-    if 'best_strategy' in st.session_state:
-        best = st.session_state['best_strategy']
+    best = st.session_state.get('best_strategy')
+    if best is not None:
         params = best['params']
         df_signals, meta = generate_signals_and_meta(df, params)
         trades_df = best['trades']
@@ -661,9 +624,9 @@ def app():
         params = base_params
         df_signals, meta = generate_signals_and_meta(df, params)
         trades_df = pd.DataFrame()
-    N = 200
+    N = min(200, len(df))
     df_plot = df.tail(N).reset_index(drop=True)
-    fig = plot_with_overlays(df_plot, meta, trades=trades_df, title=f"{ticker if 'ticker' in locals() else 'TICKER'} — last {N} bars")
+    fig = plot_with_overlays(df_plot, meta, trades=trades_df, title=f"{st.session_state.get('raw_source',{}).get('ticker','TICKER')} — last {N} bars")
     st.pyplot(fig)
 
 
