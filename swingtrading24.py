@@ -542,9 +542,7 @@ else:
             for r in reasons:
                 st.write(f"- {r}")
 
-        st.write("
----
-")
+        st.write("---")
         st.write("**How to use**: Upload a fresh CSV/Excel (intraday or daily), map the columns, click 'Compute & Run'. Use 'Get Live Recommendation' to evaluate the latest bar. Tune the parameters in the sidebar to your universe/timeframe.")
 
     else:
