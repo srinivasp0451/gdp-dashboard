@@ -665,7 +665,7 @@ def app():
     st.title("Swing Trading Recommender — Live + Walk-Forward + Visuals")
     st.markdown("Features: yfinance fetch, robust strategy, walk-forward CV, visual overlays, live recommendation (same logic as backtest)")
 
-Note: install `yfinance` and `mplfinance` before running: `pip install yfinance mplfinance`.")
+    #Note: install `yfinance` and `mplfinance` before running: `pip install yfinance mplfinance`.")
 
     # Sidebar controls
     with st.sidebar:
