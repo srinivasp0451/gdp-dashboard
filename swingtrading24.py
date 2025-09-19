@@ -1,31 +1,27 @@
 # streamlit_swing_trader.py
-# Robust Swing Trading + Smart Trading Facility — File Upload + Live Recommendation + Detailed Backtest Trade Log
-# No pandas_ta / talib. All indicators implemented from scratch.
-# Requirements: streamlit, pandas, numpy, matplotlib, openpyxl (if using xlsx)
+# Robust Swing Trading + Smart Trading Facility — File Upload + Live Recommendation + Detailed Backtest Journal
+# No pandas_ta or talib. Indicators implemented from scratch.
+# Requirements: streamlit, pandas, numpy, matplotlib, openpyxl
 # Run: streamlit run streamlit_swing_trader.py
 
 import streamlit as st
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
-from datetime import datetime
 
-st.set_page_config(layout="wide", page_title="Robust Swing Trader — Trade Log & Live")
+st.set_page_config(layout="wide", page_title="Robust Swing Trader (File Upload)")
 
-st.title("Robust Swing Trading + Smart Trading Facility — File Upload + Live Recommendation + Trade Journal")
+st.title("Robust Swing Trading + Smart Trading Facility — File Upload + Live Recommendation")
 st.markdown(
     """
-    Upload OHLCV file (CSV/Excel), map columns, and run the strategy. This version adds:
-      - Detailed trade log (entry/exit/time/qty/SL/TP/reason/confidence)
-      - Summary statistics (total trades, wins, losses, accuracy, points, P&L, expectancy, max drawdown)
-      - Live recommendation that returns a structured "trade object" (entry, target, SL, qty, confidence)
+    Upload OHLCV data (CSV / Excel). Map columns, compute indicators and signals, run a detailed backtest and get live trade suggestions that match backtest trade structure.
 
-    The core strategy logic (trend + pullback + squeeze/momentum + big-player detection) is preserved.
+    The backtester now records a full trade journal (entry, target, stop, qty, exit, pnl, points, reason, confidence) and computes summary stats.
     """
 )
 
 # ------------------------------
-# Sidebar: user inputs + file upload
+# Sidebar
 # ------------------------------
 with st.sidebar:
     st.header("Inputs")
@@ -42,11 +38,10 @@ with st.sidebar:
     show_indicators = st.checkbox("Show indicators on chart", value=True)
 
     st.markdown("---")
-    st.write("After upload & mapping click 'Compute & Run'")
     run_backtest = st.button("Compute & Run")
 
 # ------------------------------
-# Helpers: auto-detect & read file
+# Helpers
 # ------------------------------
 
 def guess_column(cols, candidates):
@@ -55,7 +50,6 @@ def guess_column(cols, candidates):
         for i, c in enumerate(cols_l):
             if cand.lower() == c:
                 return cols[i]
-    # fuzzy
     for cand in candidates:
         for i, c in enumerate(cols_l):
             if cand.lower() in c:
@@ -71,7 +65,7 @@ def load_uploaded_file(uploaded_file):
     return df
 
 # ------------------------------
-# Indicators (implementations)
+# Indicators
 # ------------------------------
 
 def ema(series, span):
@@ -159,8 +153,7 @@ def volume_profile(df, bins=24):
     return zones, edges, vol_by_bin
 
 # ------------------------------
-# Compute indicators and signals (vectorized)
-# Also compute a confidence score per row for probability-of-profit
+# Compute indicators and signals
 # ------------------------------
 
 def compute_indicators(df):
@@ -183,30 +176,18 @@ def compute_indicators(df):
     df['vpt'] = vpt(df)
     df['vol_ma20'] = df['Volume'].rolling(20).mean()
     df['squeeze_on'] = (df['bb_width'] < (df['kc_upper'] - df['kc_lower']))
-
-    # Confidence score components (simple weighted heuristic)
-    # weight: trend (0.4), momentum (0.2), big_player (0.2), volume (0.2)
-    df['trend_score'] = np.where(df['Close'] > df['ema200'], 1.0, np.where(df['Close'] < df['ema200'], -1.0, 0.0))
-    # momentum: squeeze release + bb expansion
-    bb_w_ma = df['bb_width'].rolling(20).mean()
-    df['squeeze_release'] = df['squeeze_on'].shift(1).fillna(False) & (df['bb_width'] > bb_w_ma * 1.5)
-    df['vol_pickup'] = df['Volume'] > 1.2 * df['vol_ma20']
-    df['momentum_flag'] = (df['squeeze_release'] & df['vol_pickup']).astype(int)
-    df['big_player'] = ((df['Volume'] > spike_mult * df['vol_ma20']) & ((df['Close'] - df['Close'].shift(1)).abs() > 0.8 * df['atr14'])).astype(int)
-    df['vol_sig'] = (df['Volume'] > df['vol_ma20']).astype(int)
-
-    # normalize trend_score to positive-only for confidence calculation per direction
-    df['conf_trend'] = np.where(df['trend_score'] > 0, 1.0, np.where(df['trend_score'] < 0, 1.0, 0.0))
-    # raw confidence (0..1)
-    df['conf_raw'] = (0.4 * df['conf_trend'] + 0.2 * df['momentum_flag'] + 0.2 * df['big_player'] + 0.2 * df['vol_sig'])
-    df['conf_raw'] = df['conf_raw'].clip(0, 1)
-
     return df
 
 
-def generate_signals(df):
+def generate_signals(df, spike_mult=3.0, atr_mult_sl=2.0, rr_target=2.0):
     df = df.copy()
-    # trend and pullback
+    bb_w_ma = df['bb_width'].rolling(20).mean()
+    df['squeeze_release'] = df['squeeze_on'].shift(1).fillna(False) & (df['bb_width'] > bb_w_ma * 1.5)
+    df['vol_pickup'] = df['Volume'] > 1.2 * df['vol_ma20']
+    df['momentum_imminent'] = df['squeeze_release'] & df['vol_pickup']
+    df['vol_spike'] = df['Volume'] > spike_mult * df['vol_ma20']
+    df['strong_move'] = (df['Close'] - df['Close'].shift(1)).abs() > 0.8 * df['atr14']
+    df['big_player'] = df['vol_spike'] & df['strong_move']
     df['above_ema200'] = df['Close'] > df['ema200']
     df['below_ema200'] = df['Close'] < df['ema200']
     df['to_ema20_pullback_long'] = df['Close'] <= df['ema20']
@@ -214,29 +195,23 @@ def generate_signals(df):
     df['rsi_rise'] = df['rsi14'] > df['rsi14'].shift(1)
     df['close_up'] = df['Close'] > df['Open']
     df['close_down'] = df['Close'] < df['Open']
-
     long_cond = (
         df['above_ema200'] & df['to_ema20_pullback_long'] & (df['rsi14'] > 45) & df['rsi_rise'] & df['close_up']
     )
     short_cond = (
         df['below_ema200'] & df['to_ema20_pullback_short'] & (df['rsi14'] < 55) & (~df['rsi_rise']) & df['close_down']
     )
-
-    extra_ok = df['momentum_flag'].astype(bool) | (~df['squeeze_on']) | (df['Volume'] > df['vol_ma20'] * 0.6)
-
+    extra_ok = df['momentum_imminent'] | (~df['squeeze_on']) | (df['Volume'] > df['vol_ma20'] * 0.6)
     df['signal'] = 0
     df['signal_reason'] = ''
     df.loc[long_cond & extra_ok, 'signal'] = 1
     df.loc[short_cond & extra_ok, 'signal'] = -1
     df.loc[long_cond & extra_ok, 'signal_reason'] = 'Trend+Pullback to EMA20'
     df.loc[short_cond & extra_ok, 'signal_reason'] = 'Trend+Pullback to EMA20'
-
-    # attach confidence
-    df['confidence'] = df['conf_raw']
     return df
 
 # ------------------------------
-# Backtest engine that builds a detailed trade log
+# Detailed backtest with trade journal
 # ------------------------------
 
 def backtest(df, capital=100000, risk_pct=1.0, max_hold=20, atr_mult=2.0, rr_target=2.0):
@@ -244,26 +219,41 @@ def backtest(df, capital=100000, risk_pct=1.0, max_hold=20, atr_mult=2.0, rr_tar
     cash = capital
     equity_curve = [capital]
 
-    for i in range(len(df)):
-        # always append equity after processing bar i (initial equity already present at index 0)
-        # but we append later after potential trade profit so for alignment we append current cash now
-        equity_curve.append(cash)
+    def entry_confidence_at(idx):
+        row = df.iloc[idx]
+        score = 0.0
+        if row.get('above_ema200', False):
+            score += 0.4
+        elif row.get('below_ema200', False):
+            score += 0.4
+        if row.get('to_ema20_pullback_long', False) and row.get('above_ema200', False):
+            score += 0.15
+        if row.get('to_ema20_pullback_short', False) and row.get('below_ema200', False):
+            score += 0.15
+        if row.get('momentum_imminent', False):
+            score += 0.2
+        if row.get('big_player', False):
+            score += 0.2
+        if row.get('Volume', 0) > row.get('vol_ma20', 0):
+            score += 0.1
+        return min(score, 1.0)
 
+    for i in range(len(df)):
+        equity_curve.append(equity_curve[-1])
         sig = int(df['signal'].iat[i])
         if sig == 0:
             continue
         if i + 1 >= len(df):
-            # no next bar to enter
             continue
-
         entry_idx = i + 1
-        entry_time = df.index[entry_idx]
         entry_price = df['Open'].iat[entry_idx]
         atr_val = df['atr14'].iat[entry_idx] if not np.isnan(df['atr14'].iat[entry_idx]) else 0
         if atr_val == 0:
             atr_val = df['Close'].diff().abs().rolling(14).mean().iat[entry_idx]
 
-        # compute stop and target depending on side
+        conf = entry_confidence_at(i)
+        reason = df['signal_reason'].iat[i] if 'signal_reason' in df.columns else ''
+
         if sig == 1:
             stop = entry_price - atr_mult * atr_val
             if stop <= 0:
@@ -275,42 +265,44 @@ def backtest(df, capital=100000, risk_pct=1.0, max_hold=20, atr_mult=2.0, rr_tar
             qty = max(1, int(risk_amount / risk_per_share))
             target = entry_price + rr_target * (entry_price - stop)
 
-            # scan forward for hit
             exit_price = None
             exit_idx = None
+            exit_reason = ''
             for j in range(entry_idx, min(len(df), entry_idx + max_hold)):
                 if df['Low'].iat[j] <= stop:
                     exit_price = stop
                     exit_idx = j
+                    exit_reason = 'SL'
                     break
                 elif df['High'].iat[j] >= target:
                     exit_price = target
                     exit_idx = j
+                    exit_reason = 'TP'
                     break
             if exit_price is None:
                 exit_idx = min(len(df) - 1, entry_idx + max_hold - 1)
                 exit_price = df['Close'].iat[exit_idx]
+                exit_reason = 'TimeExit'
 
             pnl = (exit_price - entry_price) * qty
-            points = (exit_price - entry_price)
+            pnl_points = (exit_price - entry_price)
             cash += pnl
             trades.append({
-                'entry_time': entry_time,
+                'entry_time': df.index[entry_idx],
                 'exit_time': df.index[exit_idx],
                 'side': 'LONG',
                 'entry': entry_price,
                 'target': target,
                 'stop': stop,
-                'exit': exit_price,
                 'qty': qty,
+                'exit': exit_price,
                 'pnl': pnl,
-                'points': points,
-                'pnl_pct': pnl / capital if capital != 0 else 0,
-                'reason': df['signal_reason'].iat[i],
-                'confidence': float(df['confidence'].iat[i]),
-                'win': pnl > 0
+                'pnl_points': pnl_points,
+                'pnl_pct_of_capital': pnl / capital if capital != 0 else 0,
+                'reason': reason,
+                'exit_reason': exit_reason,
+                'confidence': conf
             })
-            # update latest appended equity to reflect trade outcome
             equity_curve[-1] = cash
 
         elif sig == -1:
@@ -324,41 +316,45 @@ def backtest(df, capital=100000, risk_pct=1.0, max_hold=20, atr_mult=2.0, rr_tar
 
             exit_price = None
             exit_idx = None
+            exit_reason = ''
             for j in range(entry_idx, min(len(df), entry_idx + max_hold)):
                 if df['High'].iat[j] >= stop:
                     exit_price = stop
                     exit_idx = j
+                    exit_reason = 'SL'
                     break
                 elif df['Low'].iat[j] <= target:
                     exit_price = target
                     exit_idx = j
+                    exit_reason = 'TP'
                     break
             if exit_price is None:
                 exit_idx = min(len(df) - 1, entry_idx + max_hold - 1)
                 exit_price = df['Close'].iat[exit_idx]
+                exit_reason = 'TimeExit'
 
             pnl = (entry_price - exit_price) * qty
-            points = (entry_price - exit_price)
+            pnl_points = (entry_price - exit_price)
             cash += pnl
             trades.append({
-                'entry_time': entry_time,
+                'entry_time': df.index[entry_idx],
                 'exit_time': df.index[exit_idx],
                 'side': 'SHORT',
                 'entry': entry_price,
                 'target': target,
                 'stop': stop,
-                'exit': exit_price,
                 'qty': qty,
+                'exit': exit_price,
                 'pnl': pnl,
-                'points': points,
-                'pnl_pct': pnl / capital if capital != 0 else 0,
-                'reason': df['signal_reason'].iat[i],
-                'confidence': float(df['confidence'].iat[i]),
-                'win': pnl > 0
+                'pnl_points': pnl_points,
+                'pnl_pct_of_capital': pnl / capital if capital != 0 else 0,
+                'reason': reason,
+                'exit_reason': exit_reason,
+                'confidence': conf
             })
             equity_curve[-1] = cash
 
-    # Align equity series length with df.index
+    # Align equity series with df index
     if len(equity_curve) == len(df) + 1:
         equity_series = pd.Series(equity_curve[1:], index=df.index)
     elif len(equity_curve) == len(df):
@@ -367,269 +363,278 @@ def backtest(df, capital=100000, risk_pct=1.0, max_hold=20, atr_mult=2.0, rr_tar
         equity_series = pd.Series(equity_curve[-len(df):], index=df.index)
 
     trades_df = pd.DataFrame(trades)
-
-    # Summary statistics
+    # Summary
     if not trades_df.empty:
+        trades_df['win'] = trades_df['pnl'] > 0
         total_trades = len(trades_df)
-        wins = trades_df[trades_df['win']]
-        losses = trades_df[~trades_df['win']]
-        win_rate = len(wins) / total_trades if total_trades > 0 else 0
-        net_pnl = trades_df['pnl'].sum()
-        total_points = trades_df['points'].sum()
-        avg_win = wins['pnl'].mean() if not wins.empty else 0
-        avg_loss = losses['pnl'].mean() if not losses.empty else 0
-        expectancy = (win_rate * avg_win + (1 - win_rate) * avg_loss)
-        # max drawdown from equity_series
-        peak = equity_series.cummax()
-        drawdown = (equity_series - peak) / peak
+        wins = trades_df['win'].sum()
+        losses = total_trades - wins
+        win_rate = wins / total_trades if total_trades > 0 else 0
+        total_pnl = trades_df['pnl'].sum()
+        total_points = trades_df['pnl_points'].sum()
+        avg_pnl = trades_df['pnl'].mean()
+        avg_points = trades_df['pnl_points'].mean()
+        cum_max = equity_series.cummax()
+        drawdown = (equity_series - cum_max) / cum_max
         max_dd = drawdown.min()
+        expectancy = ((trades_df.loc[trades_df['win'], 'pnl'].mean() if wins>0 else 0) * win_rate + (trades_df.loc[~trades_df['win'], 'pnl'].mean() if losses>0 else 0) * (1 - win_rate)) if total_trades>0 else 0
+        trades_df.attrs['summary'] = {
+            'total_trades': int(total_trades),
+            'wins': int(wins),
+            'losses': int(losses),
+            'win_rate': float(win_rate),
+            'total_pnl': float(total_pnl),
+            'total_points': float(total_points),
+            'avg_pnl': float(avg_pnl),
+            'avg_points': float(avg_points),
+            'max_drawdown': float(max_dd),
+            'expectancy': float(expectancy)
+        }
     else:
-        total_trades = 0
-        win_rate = 0
-        net_pnl = 0
-        total_points = 0
-        expectancy = 0
-        max_dd = 0
+        trades_df.attrs['summary'] = {}
 
-    stats = {
-        'total_trades': total_trades,
-        'wins': len(wins) if not trades_df.empty else 0,
-        'losses': len(losses) if not trades_df.empty else 0,
-        'win_rate': win_rate,
-        'net_pnl': net_pnl,
-        'total_points': total_points,
-        'expectancy': expectancy,
-        'max_drawdown': max_dd
-    }
-
-    return trades_df, equity_series, stats
+    return trades_df, equity_series
 
 # ------------------------------
-# Build live trade suggestion (same format as backtest trades)
-# Uses last closed candle as basis; entry is set to last Close (you can change to next open)
-# ------------------------------
-
-def build_live_trade(last_row, capital, risk_pct, atr_mult, rr_target):
-    # last_row is a Series (last closed candle)
-    side = int(last_row.get('signal', 0))
-    if side == 0:
-        return None
-    entry_price = float(last_row['Close'])  # using last close as current price/entry basis
-    atr_val = float(last_row.get('atr14', 0))
-    if atr_val == 0:
-        atr_val = np.nan
-    if side == 1:
-        stop = entry_price - atr_mult * atr_val if not np.isnan(atr_val) else entry_price * 0.98
-        risk_per_share = entry_price - stop
-        qty = max(1, int((capital * (risk_pct / 100.0)) / risk_per_share)) if risk_per_share > 0 else 1
-        target = entry_price + rr_target * (entry_price - stop)
-        reason = last_row.get('signal_reason', '')
-    else:
-        stop = entry_price + atr_mult * atr_val if not np.isnan(atr_val) else entry_price * 1.02
-        risk_per_share = stop - entry_price
-        qty = max(1, int((capital * (risk_pct / 100.0)) / risk_per_share)) if risk_per_share > 0 else 1
-        target = entry_price - rr_target * (stop - entry_price)
-        reason = last_row.get('signal_reason', '')
-
-    conf = float(last_row.get('confidence', 0.0))
-
-    trade = {
-        'side': 'LONG' if side == 1 else 'SHORT',
-        'entry_time': last_row.name,
-        'entry': entry_price,
-        'target': target,
-        'stop': stop,
-        'qty': qty,
-        'reason': reason,
-        'confidence': conf
-    }
-    return trade
-
-# ------------------------------
-# Main: file upload, mapping, compute, backtest, live recommendation
+# Main app flow
 # ------------------------------
 
 if uploaded_file is None:
     st.info("Please upload a CSV or Excel file with OHLCV data in the sidebar.")
+    st.stop()
+
+try:
+    raw = load_uploaded_file(uploaded_file)
+except Exception as e:
+    st.error(f"Failed to read uploaded file: {e}")
+    st.stop()
+
+st.subheader("File preview (first 10 rows)")
+st.write(raw.head(10))
+
+cols = list(raw.columns)
+guessed_date = guess_column(cols, ["date", "datetime", "timestamp", "time"]) 
+guessed_open = guess_column(cols, ["open", "opn"]) 
+guessed_high = guess_column(cols, ["high", "hi"]) 
+guessed_low = guess_column(cols, ["low", "lo"]) 
+guessed_close = guess_column(cols, ["close", "adj close", "last"]) 
+guessed_vol = guess_column(cols, ["volume", "vol"]) 
+
+st.subheader("Map columns")
+col1, col2 = st.columns(2)
+with col1:
+    date_col = st.selectbox("Date/Time column", options=[None] + cols, index=cols.index(guessed_date)+1 if guessed_date in cols else 0)
+    open_col = st.selectbox("Open column", options=[None] + cols, index=cols.index(guessed_open)+1 if guessed_open in cols else 0)
+    high_col = st.selectbox("High column", options=[None] + cols, index=cols.index(guessed_high)+1 if guessed_high in cols else 0)
+with col2:
+    low_col = st.selectbox("Low column", options=[None] + cols, index=cols.index(guessed_low)+1 if guessed_low in cols else 0)
+    close_col = st.selectbox("Close column", options=[None] + cols, index=cols.index(guessed_close)+1 if guessed_close in cols else 0)
+    vol_col = st.selectbox("Volume column", options=[None] + cols, index=cols.index(guessed_vol)+1 if guessed_vol in cols else 0)
+
+if not date_col or not open_col or not high_col or not low_col or not close_col:
+    st.warning("Please map Date, Open, High, Low and Close columns.")
+    st.stop()
+
+working = raw[[date_col, open_col, high_col, low_col, close_col]].copy()
+if vol_col:
+    working['Volume'] = raw[vol_col].fillna(0)
 else:
-    try:
-        raw = load_uploaded_file(uploaded_file)
-    except Exception as e:
-        st.error(f"Failed to read uploaded file: {e}")
-        st.stop()
+    working['Volume'] = 0
 
-    st.subheader("File preview (first 10 rows)")
-    st.write(raw.head(10))
+# parse date
+try:
+    working[date_col] = pd.to_datetime(working[date_col], infer_datetime_format=True, errors='coerce')
+except Exception as e:
+    st.error(f"Failed to parse date column: {e}")
+    st.stop()
 
-    cols = list(raw.columns)
-    guessed_date = guess_column(cols, ["date", "datetime", "timestamp", "time"])
-    guessed_open = guess_column(cols, ["open", "opn"])
-    guessed_high = guess_column(cols, ["high", "hi"])
-    guessed_low = guess_column(cols, ["low", "lo"])
-    guessed_close = guess_column(cols, ["close", "adj close", "last"])
-    guessed_vol = guess_column(cols, ["volume", "vol"])
+if working[date_col].isnull().any():
+    st.warning("Some date values could not be parsed and will be dropped.")
+    working = working.dropna(subset=[date_col])
 
-    st.subheader("Map columns")
-    c1, c2 = st.columns(2)
-    with c1:
-        date_col = st.selectbox("Date/Time column", options=[None] + cols, index=cols.index(guessed_date) + 1 if guessed_date in cols else 0)
-        open_col = st.selectbox("Open column", options=[None] + cols, index=cols.index(guessed_open) + 1 if guessed_open in cols else 0)
-        high_col = st.selectbox("High column", options=[None] + cols, index=cols.index(guessed_high) + 1 if guessed_high in cols else 0)
-    with c2:
-        low_col = st.selectbox("Low column", options=[None] + cols, index=cols.index(guessed_low) + 1 if guessed_low in cols else 0)
-        close_col = st.selectbox("Close column", options=[None] + cols, index=cols.index(guessed_close) + 1 if guessed_close in cols else 0)
-        vol_col = st.selectbox("Volume column", options=[None] + cols, index=cols.index(guessed_vol) + 1 if guessed_vol in cols else 0)
+working = working.rename(columns={date_col: 'DateTime', open_col: 'Open', high_col: 'High', low_col: 'Low', close_col: 'Close'})
+working = working[['DateTime', 'Open', 'High', 'Low', 'Close', 'Volume']]
+working = working.sort_values('DateTime').set_index('DateTime')
 
-    date_format = st.text_input("Date format (optional, strptime style). Leave blank to auto-parse.", value="")
+df = working.copy()
 
-    if not date_col or not open_col or not high_col or not low_col or not close_col:
-        st.warning("Please map at least Date, Open, High, Low and Close columns.")
-        st.stop()
+if run_backtest:
+    with st.spinner("Computing indicators and signals..."):
+        df = compute_indicators(df)
+        df = generate_signals(df, spike_mult=spike_mult, atr_mult_sl=atr_mult_sl, rr_target=rr_target)
+        zones, edges, vol_by_bin = volume_profile(df, bins=24)
+    st.success("Indicators & signals computed.")
 
-    working = raw[[date_col, open_col, high_col, low_col, close_col]].copy()
-    if vol_col:
-        working['Volume'] = raw[vol_col].fillna(0)
+    st.subheader("Latest data (last 10 rows)")
+    st.write(df.tail(10))
+
+    # chart
+    st.subheader("Price chart (indicators + signals)")
+    fig, ax = plt.subplots(figsize=(14, 5))
+    ax.plot(df.index, df['Close'], label='Close')
+    if show_indicators:
+        ax.plot(df.index, df['ema20'], label='EMA20', linewidth=0.8)
+        ax.plot(df.index, df['ema200'], label='EMA200', linewidth=0.8)
+        ax.plot(df.index, df['bb_upper'], label='BB Upper', linewidth=0.5, alpha=0.6)
+        ax.plot(df.index, df['bb_lower'], label='BB Lower', linewidth=0.5, alpha=0.6)
+        ax.plot(df.index, df['vwap'], label='VWAP', linewidth=0.8)
+    longs = df[df['signal'] == 1]
+    shorts = df[df['signal'] == -1]
+    ax.scatter(longs.index, longs['Close'], marker='^', color='green', s=60, label='Long Signal')
+    ax.scatter(shorts.index, shorts['Close'], marker='v', color='red', s=60, label='Short Signal')
+    bigp = df[df['big_player']]
+    ax.scatter(bigp.index, bigp['Close'], marker='o', facecolors='none', edgecolors='black', s=80, label='Big-player vol')
+    ax.legend(loc='upper left')
+    ax.set_title(f"Price with indicators & signals")
+    ax.set_xlabel('Time')
+    ax.set_ylabel('Price')
+    st.pyplot(fig)
+
+    # volume profile
+    st.subheader("Volume Profile (approx)")
+    fig2, ax2 = plt.subplots(figsize=(4, 6))
+    bins_center = (edges[:-1] + edges[1:]) / 2
+    ax2.barh(bins_center, vol_by_bin)
+    ax2.set_xlabel('Volume')
+    ax2.set_ylabel('Price')
+    st.pyplot(fig2)
+
+    # backtest
+    st.subheader("Backtest (detailed trade journal)")
+    trades_df, equity = backtest(df, capital=starting_capital, risk_pct=risk_percent, max_hold=max_hold_bars, atr_mult=atr_mult_sl, rr_target=rr_target)
+
+    if trades_df.empty:
+        st.warning("No trades generated with these parameters. Consider loosening conditions or changing timeframe/data sampling.")
     else:
-        working['Volume'] = 0
+        # store trades in session for live PoP estimation
+        st.session_state['last_backtest_trades'] = trades_df
 
-    try:
-        if date_format.strip() == "":
-            working[date_col] = pd.to_datetime(working[date_col], infer_datetime_format=True, errors='coerce')
+        # show trade journal
+        st.write(trades_df[['entry_time','exit_time','side','entry','target','stop','qty','exit','pnl','pnl_points','reason','exit_reason','confidence']].sort_values(by='entry_time', ascending=False))
+
+        # summary metrics
+        summary = trades_df.attrs.get('summary', {})
+        st.metric("Total Trades", summary.get('total_trades', 0))
+        st.metric("Win Rate", f"{summary.get('win_rate', 0)*100:.2f}%")
+        st.metric("Total P&L (INR)", f"{summary.get('total_pnl', 0):.2f}")
+        st.metric("Total Points", f"{summary.get('total_points', 0):.2f}")
+        st.metric("Max Drawdown", f"{summary.get('max_drawdown', 0)*100:.2f}%")
+        st.metric("Expectancy (avg P&L)", f"{summary.get('expectancy', 0):.2f}")
+
+        # equity chart
+        st.subheader("Equity Curve")
+        fig3, ax3 = plt.subplots(figsize=(10, 4))
+        equity.plot(ax=ax3)
+        ax3.set_ylabel('Equity (INR)')
+        st.pyplot(fig3)
+
+    # smart insights
+    st.subheader("Smart Trading Insights (recent)")
+    insights = []
+    recent = df.iloc[-30:]
+    if recent['momentum_imminent'].any():
+        insights.append("Momentum signals detected recently (squeeze release + vol pickup). Watch for directional breakout.")
+    if recent['big_player'].any():
+        insights.append("Big-player volume spikes observed recently — these often precede extended moves or mark liquidity events.")
+    if zones:
+        top_zone = zones[0]
+        insights.append(f"Top high-volume price area near {top_zone[0]:.2f} to {top_zone[1]:.2f}. Treat as strong support/resistance.")
+    if len(insights) == 0:
+        st.write("No immediate smart signals flagged in the recent window. Continue monitoring squeeze/volume.")
+    else:
+        for it in insights:
+            st.info(it)
+
+    st.markdown("---")
+    st.subheader("Live Recommendation (based on last closed candle)")
+    if st.button("Get Live Recommendation"):
+        last_idx = len(df) - 1
+        last = df.iloc[last_idx].copy()
+        # compute confidence
+        conf = 0.0
+        if last.get('above_ema200', False):
+            conf += 0.4
+        elif last.get('below_ema200', False):
+            conf += 0.4
+        if last.get('to_ema20_pullback_long', False) and last.get('above_ema200', False):
+            conf += 0.15
+        if last.get('to_ema20_pullback_short', False) and last.get('below_ema200', False):
+            conf += 0.15
+        if last.get('momentum_imminent', False):
+            conf += 0.2
+        if last.get('big_player', False):
+            conf += 0.2
+        if last.get('Volume', 0) > last.get('vol_ma20', 0):
+            conf += 0.1
+        conf = min(conf, 1.0)
+
+        # build suggested trade structure
+        suggested = {
+            'side': 'HOLD',
+            'entry_time': df.index[last_idx],
+            'entry': last['Close'],
+            'stop': None,
+            'target': None,
+            'qty': 0,
+            'confidence': conf,
+            'reason': last.get('signal_reason', '')
+        }
+        # determine side
+        if int(last.get('signal', 0)) == 1:
+            side = 1
+        elif int(last.get('signal', 0)) == -1:
+            side = -1
         else:
-            working[date_col] = pd.to_datetime(working[date_col], format=date_format, errors='coerce')
-    except Exception as e:
-        st.error(f"Failed to parse date column: {e}")
-        st.stop()
-
-    if working[date_col].isnull().any():
-        st.warning("Some date values could not be parsed and will be dropped.")
-        working = working.dropna(subset=[date_col])
-
-    working = working.rename(columns={
-        date_col: 'DateTime',
-        open_col: 'Open',
-        high_col: 'High',
-        low_col: 'Low',
-        close_col: 'Close'
-    })
-    working = working[['DateTime', 'Open', 'High', 'Low', 'Close', 'Volume']]
-    working = working.sort_values('DateTime').set_index('DateTime')
-
-    df = working.copy()
-
-    if run_backtest:
-        with st.spinner("Computing indicators and signals..."):
-            df = compute_indicators(df)
-            df = generate_signals(df)
-            zones, edges, vol_by_bin = volume_profile(df, bins=24)
-        st.success("Indicators & signals computed.")
-
-        st.subheader("Latest data (last 10 rows)")
-        st.write(df.tail(10))
-
-        # Price chart
-        st.subheader("Price chart (indicators + signals)")
-        fig, ax = plt.subplots(figsize=(14, 5))
-        ax.plot(df.index, df['Close'], label='Close')
-        if show_indicators:
-            ax.plot(df.index, df['ema20'], label='EMA20', linewidth=0.8)
-            ax.plot(df.index, df['ema200'], label='EMA200', linewidth=0.8)
-            ax.plot(df.index, df['bb_upper'], label='BB Upper', linewidth=0.5, alpha=0.6)
-            ax.plot(df.index, df['bb_lower'], label='BB Lower', linewidth=0.5, alpha=0.6)
-            ax.plot(df.index, df['vwap'], label='VWAP', linewidth=0.8)
-        longs = df[df['signal'] == 1]
-        shorts = df[df['signal'] == -1]
-        ax.scatter(longs.index, longs['Close'], marker='^', color='green', s=60, label='Long Signal')
-        ax.scatter(shorts.index, shorts['Close'], marker='v', color='red', s=60, label='Short Signal')
-        bigp = df[df['big_player'] == 1]
-        ax.scatter(bigp.index, bigp['Close'], marker='o', facecolors='none', edgecolors='black', s=80, label='Big-player vol')
-        ax.legend(loc='upper left')
-        ax.set_title(f"Price with indicators & signals")
-        ax.set_xlabel('Time')
-        ax.set_ylabel('Price')
-        st.pyplot(fig)
-
-        # volume profile
-        st.subheader("Volume Profile (approx)")
-        fig2, ax2 = plt.subplots(figsize=(4, 6))
-        bins_center = (edges[:-1] + edges[1:]) / 2
-        ax2.barh(bins_center, vol_by_bin)
-        ax2.set_xlabel('Volume')
-        ax2.set_ylabel('Price')
-        st.pyplot(fig2)
-
-        # backtest
-        st.subheader("Backtest (detailed trade log)")
-        trades_df, equity, stats = backtest(df, capital=starting_capital, risk_pct=risk_percent, max_hold=max_hold_bars, atr_mult=atr_mult_sl, rr_target=rr_target)
-
-        if trades_df.empty:
-            st.warning("No trades generated with these parameters. Consider loosening conditions or changing timeframe/data sampling.")
-        else:
-            # Show trade log with relevant columns
-            display_cols = ['entry_time','exit_time','side','entry','target','stop','exit','qty','points','pnl','pnl_pct','reason','confidence','win']
-            st.dataframe(trades_df[display_cols].sort_values('entry_time').reset_index(drop=True))
-
-            st.subheader("Summary statistics")
-            st.write(f"Total trades: {stats['total_trades']}")
-            st.write(f"Wins: {stats['wins']}, Losses: {stats['losses']}")
-            st.write(f"Win rate: {stats['win_rate']*100:.2f}%")
-            st.write(f"Net P&L (INR): {stats['net_pnl']:.2f}")
-            st.write(f"Total points: {stats['total_points']:.2f}")
-            st.write(f"Expectancy (avg pnl per trade): {stats['expectancy']:.2f}")
-            st.write(f"Max drawdown (fraction): {stats['max_drawdown']:.2%}")
-
-            # equity curve
-            st.subheader("Equity Curve")
-            fig3, ax3 = plt.subplots(figsize=(10, 4))
-            equity.plot(ax=ax3)
-            ax3.set_ylabel('Equity (INR)')
-            st.pyplot(fig3)
-
-            # export
-            st.markdown("**Export trade log**")
-            csv = trades_df.to_csv(index=False).encode()
-            st.download_button(label="Download trades CSV", data=csv, file_name='trade_log.csv', mime='text/csv')
-
-        # Smart insights
-        st.subheader("Smart Trading Insights (recent)")
-        insights = []
-        recent = df.iloc[-30:]
-        if recent['momentum_flag'].any():
-            insights.append("Momentum signals detected recently (squeeze release + vol pickup). Watch for directional breakout.")
-        if recent['big_player'].any():
-            insights.append("Big-player volume spikes observed recently — these often precede extended moves or mark liquidity events.")
-        if zones:
-            top_zone = zones[0]
-            insights.append(f"Top high-volume price area near {top_zone[0]:.2f} to {top_zone[1]:.2f}. Treat as strong support/resistance.")
-        if len(insights) == 0:
-            st.write("No immediate smart signals flagged in the recent window. Continue monitoring squeeze/volume.")
-        else:
-            for it in insights:
-                st.info(it)
-
-        st.markdown("---")
-        st.subheader("Live Recommendation (structured trade-like output)")
-        if st.button("Get Live Recommendation"):
-            last = df.iloc[-1]
-            live_trade = build_live_trade(last, capital=starting_capital, risk_pct=risk_percent, atr_mult=atr_mult_sl, rr_target=rr_target)
-            if live_trade is None:
-                st.warning("No actionable signal on the last candle.")
+            if last.get('above_ema200', False):
+                side = 1
+            elif last.get('below_ema200', False):
+                side = -1
             else:
-                st.success(f"Live suggestion — {live_trade['side']} — Confidence: {live_trade['confidence']*100:.0f}%")
-                st.write("Entry time:", live_trade['entry_time'])
-                st.write("Entry price:", live_trade['entry'])
-                st.write("Target:", live_trade['target'])
-                st.write("Stop:", live_trade['stop'])
-                st.write("Qty (by risk%):", live_trade['qty'])
-                st.write("Reason:", live_trade['reason'])
-                # offer to export as CSV-like single-row for quick order entry
-                live_df = pd.DataFrame([live_trade])
-                st.download_button(label="Download live trade (CSV)", data=live_df.to_csv(index=False).encode(), file_name='live_trade.csv', mime='text/csv')
+                side = 0
 
-        st.write("---")
-        st.write("**How to use**: Upload your intraday/daily data, map columns, click Compute & Run. Use Download buttons to export trades or live suggestion for manual order entry or broker integration.")
+        if side == 1:
+            suggested['side'] = 'BUY'
+            entry_price = last['Close']
+            atrval = last.get('atr14', 0)
+            if atrval == 0:
+                atrval = df['Close'].diff().abs().rolling(14).mean().iat[last_idx]
+            stop = entry_price - atr_mult_sl * atrval
+            if stop <= 0:
+                stop = entry_price * 0.98
+            target = entry_price + rr_target * (entry_price - stop)
+            risk_per_share = entry_price - stop
+            risk_amount = starting_capital * (risk_percent / 100.0)
+            qty = max(1, int(risk_amount / risk_per_share)) if risk_per_share>0 else 1
+            suggested.update({'entry': entry_price, 'stop': stop, 'target': target, 'qty': qty})
+        elif side == -1:
+            suggested['side'] = 'SELL'
+            entry_price = last['Close']
+            atrval = last.get('atr14', 0)
+            if atrval == 0:
+                atrval = df['Close'].diff().abs().rolling(14).mean().iat[last_idx]
+            stop = entry_price + atr_mult_sl * atrval
+            target = entry_price - rr_target * (stop - entry_price)
+            risk_per_share = stop - entry_price
+            risk_amount = starting_capital * (risk_percent / 100.0)
+            qty = max(1, int(risk_amount / risk_per_share)) if risk_per_share>0 else 1
+            suggested.update({'entry': entry_price, 'stop': stop, 'target': target, 'qty': qty})
 
-    else:
-        st.info("Map columns and click 'Compute & Run' in the sidebar to compute indicators, signals, and run backtest.")
+        # estimate PoP from backtest stored in session
+        pop = None
+        back_trades = st.session_state.get('last_backtest_trades', None)
+        if back_trades is not None and not back_trades.empty:
+            pop = back_trades.attrs.get('summary', {}).get('win_rate', None)
+
+        st.subheader('Live Trade Suggestion (structured)')
+        st.write(pd.DataFrame([suggested]))
+        st.success(f"Suggested: {suggested['side']} — Confidence: {conf*100:.0f}% — Estimated PoP: {((pop*100) if pop is not None else 'N/A')}%")
+        st.write('Reason:', suggested['reason'])
+        if pop is not None:
+            st.info(f"Backtest Win Rate (used as PoP estimate): {pop*100:.2f}%")
+
+    st.markdown("---")
+    st.write("**How to use**: Upload data, map columns, click 'Compute & Run'. Use the detailed trade journal for review and 'Get Live Recommendation' to get a structured trade suggestion consistent with backtest rules.")
+else:
+    st.info("Map columns and click 'Compute & Run' in the sidebar to compute indicators, signals, and run backtest.")
 
 # EOF
