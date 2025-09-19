@@ -3,7 +3,6 @@ import yfinance as yf
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
-from datetime import date, timedelta
 
 # -----------------------------
 # Indicator Functions
@@ -13,10 +12,10 @@ def ema(series, period=20):
 
 def rsi(series, period=14):
     delta = series.diff()
-    gain = np.where(delta > 0, delta, 0)
-    loss = np.where(delta < 0, -delta, 0)
-    avg_gain = pd.Series(gain).rolling(period).mean()
-    avg_loss = pd.Series(loss).rolling(period).mean()
+    gain = delta.where(delta > 0, 0.0)
+    loss = -delta.where(delta < 0, 0.0)
+    avg_gain = gain.rolling(period).mean()
+    avg_loss = loss.rolling(period).mean()
     rs = avg_gain / avg_loss
     return 100 - (100 / (1 + rs))
 
@@ -29,8 +28,8 @@ def bollinger_bands(series, period=20, std=2):
 
 def atr(data, period=14):
     data['H-L'] = data['High'] - data['Low']
-    data['H-PC'] = abs(data['High'] - data['Close'].shift(1))
-    data['L-PC'] = abs(data['Low'] - data['Close'].shift(1))
+    data['H-PC'] = (data['High'] - data['Close'].shift(1)).abs()
+    data['L-PC'] = (data['Low'] - data['Close'].shift(1)).abs()
     tr = data[['H-L','H-PC','L-PC']].max(axis=1)
     return tr.rolling(period).mean()
 
@@ -78,24 +77,26 @@ def generate_signals(data):
 def backtest(data, capital=100000, risk_per_trade=0.01):
     balance = capital
     equity_curve = []
-    trades = []
     position = None
     entry_price = 0
+    qty = 0
 
     for i in range(len(data)):
         row = data.iloc[i]
 
         if row['Signal'] == "BUY":
             sl = row['Close'] - 2 * row['ATR']
-            qty = (balance * risk_per_trade) // (row['Close'] - sl)
-            entry_price = row['Close']
-            position = "LONG"
+            if sl > 0:
+                qty = (balance * risk_per_trade) // (row['Close'] - sl)
+                entry_price = row['Close']
+                position = "LONG"
 
         elif row['Signal'] == "SELL":
             sl = row['Close'] + 2 * row['ATR']
-            qty = (balance * risk_per_trade) // (sl - row['Close'])
-            entry_price = row['Close']
-            position = "SHORT"
+            if sl > 0:
+                qty = (balance * risk_per_trade) // (sl - row['Close'])
+                entry_price = row['Close']
+                position = "SHORT"
 
         if position == "LONG":
             pnl = (row['Close'] - entry_price) * qty
@@ -115,7 +116,6 @@ def backtest(data, capital=100000, risk_per_trade=0.01):
 # -----------------------------
 st.title("📈 Swing Trading Strategy - India Market")
 
-# Select ticker
 tickers = {
     "NIFTY 50": "^NSEI",
     "BANK NIFTY": "^NSEBANK",
@@ -132,22 +132,34 @@ if choice == "Other":
 else:
     ticker = tickers[choice]
 
-period = st.selectbox("Select Period", ["6mo","1y","2y","5y","max"])
-interval = st.selectbox("Select Interval", ["1d","1h","30m","15m"])
+# Valid periods & intervals
+period_options = ["1d","5d","1mo","3mo","6mo","1y","2y","3y","5y","10y","ytd","max"]
+interval_options = ["1m","2m","5m","15m","30m","60m","90m","1h","1d","5d","1wk","1mo","3mo"]
 
-# Fetch data
-data = yf.download(ticker, period=period, interval=interval)
+period = st.selectbox("Select Period", period_options, index=5)
+interval = st.selectbox("Select Interval", interval_options, index=8)
+
+# Data fetch with error handling
+try:
+    data = yf.download(ticker, period=period, interval=interval)
+    if data.empty:
+        st.error("⚠️ No data available. Try another period/interval combination.")
+        st.stop()
+except Exception as e:
+    st.error(f"❌ Error fetching data: {e}")
+    st.stop()
+
+# Strategy + Backtest
 data = data.dropna()
-
-# Generate signals + backtest
 data = generate_signals(data)
 data = backtest(data)
 
-# Show last signal
+# Show latest signal
 st.subheader("📢 Latest Signal")
-st.write(f"**{ticker}** → {data['Signal'].dropna().iloc[-1] if data['Signal'].dropna().any() else 'No Signal'}")
+latest_signal = data['Signal'].dropna().iloc[-1] if data['Signal'].dropna().any() else "No Signal"
+st.write(f"**{ticker}** → {latest_signal}")
 
-# Plot chart
+# Plot price & signals
 fig, ax = plt.subplots(figsize=(12,6))
 ax.plot(data.index, data['Close'], label="Close Price", color="blue")
 ax.plot(data.index, data['EMA20'], label="EMA20", color="orange")
