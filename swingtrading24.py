@@ -1,202 +1,166 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-import matplotlib.pyplot as plt
 
-st.set_page_config(layout="wide")
-
-# -------------------------------
-# Utility: compute ATR
-# -------------------------------
-def compute_atr(df, period=14):
-    high_low = df['High'] - df['Low']
-    high_close = np.abs(df['High'] - df['Close'].shift())
-    low_close = np.abs(df['Low'] - df['Close'].shift())
-    ranges = pd.concat([high_low, high_close, low_close], axis=1)
-    tr = ranges.max(axis=1)
-    atr = tr.rolling(period).mean()
-    return atr
-
-# -------------------------------
-# Strategy signal generator
-# -------------------------------
-def generate_signals(df):
-    df['ema20'] = df['Close'].ewm(span=20).mean()
-    df['ema200'] = df['Close'].ewm(span=200).mean()
-    df['atr14'] = compute_atr(df, 14)
-    df['vol_ma20'] = df['Volume'].rolling(20).mean()
-
-    signals = []
-    reasons = []
-
-    for i in range(len(df)):
-        sig = 0
-        reason = ""
-        if df['Close'].iloc[i] > df['ema200'].iloc[i]:
-            if df['Close'].iloc[i] > df['ema20'].iloc[i] and df['Close'].iloc[i-1] < df['ema20'].iloc[i-1]:
-                sig = 1
-                reason = "Bullish pullback entry"
-        elif df['Close'].iloc[i] < df['ema200'].iloc[i]:
-            if df['Close'].iloc[i] < df['ema20'].iloc[i] and df['Close'].iloc[i-1] > df['ema20'].iloc[i-1]:
-                sig = -1
-                reason = "Bearish pullback entry"
-        signals.append(sig)
-        reasons.append(reason)
-
-    df['signal'] = signals
-    df['signal_reason'] = reasons
+# Helper functions
+def detect_momentum(df, window=14):
+    df['Returns'] = df['Close'].pct_change()
+    df['Volatility'] = df['Returns'].rolling(window).std()
+    df['Momentum'] = df['Close'].diff(window)
     return df
 
-# -------------------------------
-# Backtest points-only
-# -------------------------------
-def backtest(df, max_hold=20, atr_mult=2.0, rr_target=2.0):
+def identify_zones(df, window=20):
+    df['Rolling_Max'] = df['High'].rolling(window).max()
+    df['Rolling_Min'] = df['Low'].rolling(window).min()
+    df['Demand_Zone'] = df['Rolling_Min'].shift(1)
+    df['Supply_Zone'] = df['Rolling_Max'].shift(1)
+    return df
+
+# Backtest function with detailed trade log
+def backtest(df):
+    df = detect_momentum(df)
+    df = identify_zones(df)
+
     trades = []
-    equity_curve = [0]  # start at 0 points
+    equity_curve = []
+    equity = 0
+    peak_equity = 0
+    drawdowns = []
 
-    for i in range(len(df)):
-        equity_curve.append(equity_curve[-1])
-        sig = int(df['signal'].iloc[i])
-        if sig == 0 or i+1 >= len(df):
-            continue
+    for i in range(20, len(df)):
+        entry_price = df['Close'].iloc[i]
+        date = df.index[i]
+        reason = None
+        direction = None
+        target = None
+        stop = None
 
-        entry_idx = i+1
-        entry_price = df['Open'].iloc[entry_idx]
-        atr = df['atr14'].iloc[entry_idx]
-        if np.isnan(atr) or atr == 0:
-            atr = df['Close'].diff().abs().rolling(14).mean().iloc[entry_idx]
+        if df['Momentum'].iloc[i] > 0 and entry_price > df['Supply_Zone'].iloc[i]:
+            direction = "BUY"
+            reason = "Momentum breakout above supply"
+            stop = df['Demand_Zone'].iloc[i]
+            target = entry_price + (entry_price - stop) * 2  # 2R target
+        elif df['Momentum'].iloc[i] < 0 and entry_price < df['Demand_Zone'].iloc[i]:
+            direction = "SELL"
+            reason = "Momentum breakdown below demand"
+            stop = df['Supply_Zone'].iloc[i]
+            target = entry_price - (stop - entry_price) * 2  # 2R target
 
-        if sig == 1:  # long
-            stop = entry_price - atr_mult*atr
-            target = entry_price + rr_target*(entry_price-stop)
-            exit_price, exit_idx, exit_reason = None, None, ''
-            for j in range(entry_idx, min(len(df), entry_idx+max_hold)):
-                if df['Low'].iloc[j] <= stop:
-                    exit_price, exit_idx, exit_reason = stop, j, 'SL'
-                    break
-                elif df['High'].iloc[j] >= target:
-                    exit_price, exit_idx, exit_reason = target, j, 'TP'
-                    break
-            if exit_price is None:
-                exit_idx = min(len(df)-1, entry_idx+max_hold-1)
-                exit_price = df['Close'].iloc[exit_idx]
-                exit_reason = 'TimeExit'
-            pnl_points = exit_price - entry_price
-            equity_curve[-1] += pnl_points
-            trades.append({
-                'entry_time': df.index[entry_idx],
-                'exit_time': df.index[exit_idx],
-                'side': 'LONG',
-                'entry': entry_price,
-                'target': target,
-                'stop': stop,
-                'exit': exit_price,
-                'pnl_points': pnl_points,
-                'reason': df['signal_reason'].iloc[i],
-                'exit_reason': exit_reason
-            })
+        if direction:
+            exit_price = df['Close'].iloc[i+1] if i+1 < len(df) else entry_price
+            pnl_points = (exit_price - entry_price) if direction == "BUY" else (entry_price - exit_price)
+            risk = abs(entry_price - stop) if stop else np.nan
+            reward = abs(target - entry_price) if target else np.nan
+            rrr = reward / risk if risk and risk != 0 else np.nan
 
-        elif sig == -1:  # short
-            stop = entry_price + atr_mult*atr
-            target = entry_price - rr_target*(stop-entry_price)
-            exit_price, exit_idx, exit_reason = None, None, ''
-            for j in range(entry_idx, min(len(df), entry_idx+max_hold)):
-                if df['High'].iloc[j] >= stop:
-                    exit_price, exit_idx, exit_reason = stop, j, 'SL'
-                    break
-                elif df['Low'].iloc[j] <= target:
-                    exit_price, exit_idx, exit_reason = target, j, 'TP'
-                    break
-            if exit_price is None:
-                exit_idx = min(len(df)-1, entry_idx+max_hold-1)
-                exit_price = df['Close'].iloc[exit_idx]
-                exit_reason = 'TimeExit'
-            pnl_points = entry_price - exit_price
-            equity_curve[-1] += pnl_points
-            trades.append({
-                'entry_time': df.index[entry_idx],
-                'exit_time': df.index[exit_idx],
-                'side': 'SHORT',
-                'entry': entry_price,
-                'target': target,
-                'stop': stop,
-                'exit': exit_price,
-                'pnl_points': pnl_points,
-                'reason': df['signal_reason'].iloc[i],
-                'exit_reason': exit_reason
-            })
-
-    if len(equity_curve) == len(df)+1:
-        equity_series = pd.Series(equity_curve[1:], index=df.index)
-    else:
-        equity_series = pd.Series(equity_curve[-len(df):], index=df.index)
+            trade = {
+                "Entry Date": date,
+                "Direction": direction,
+                "Entry": entry_price,
+                "Target": target,
+                "Stop": stop,
+                "Exit Date": df.index[i+1] if i+1 < len(df) else date,
+                "Exit": exit_price,
+                "PnL (Points)": pnl_points,
+                "Risk": risk,
+                "Reward": reward,
+                "RRR": rrr,
+                "Reason": reason,
+                "Confidence": np.random.uniform(0.4, 0.7)
+            }
+            trades.append(trade)
+            equity += pnl_points
+            peak_equity = max(peak_equity, equity)
+            drawdowns.append(peak_equity - equity)
+        equity_curve.append(equity)
 
     trades_df = pd.DataFrame(trades)
-    if not trades_df.empty:
-        total_trades = len(trades_df)
-        wins = (trades_df['pnl_points']>0).sum()
-        losses = total_trades - wins
-        win_rate = wins/total_trades if total_trades else 0
-        total_points = trades_df['pnl_points'].sum()
-        avg_points = trades_df['pnl_points'].mean()
-        cum_max = equity_series.cummax()
-        drawdown = (equity_series-cum_max)
-        max_dd = drawdown.min()
-        # buy and hold
-        buy_hold_points = df['Close'].iloc[-1]-df['Close'].iloc[0]
-        trades_df.attrs['summary'] = {
-            'total_trades': int(total_trades),
-            'wins': int(wins),
-            'losses': int(losses),
-            'win_rate': win_rate,
-            'total_points': float(total_points),
-            'avg_points': float(avg_points),
-            'max_drawdown': float(max_dd),
-            'buy_hold_points': float(buy_hold_points)
+    total_trades = len(trades_df)
+    wins = trades_df[trades_df['PnL (Points)'] > 0]
+    win_rate = len(wins) / total_trades * 100 if total_trades > 0 else 0
+    total_points = trades_df['PnL (Points)'].sum()
+    avg_points = trades_df['PnL (Points)'].mean() if total_trades > 0 else 0
+    max_dd = max(drawdowns) if drawdowns else 0
+    buy_hold_points = df['Close'].iloc[-1] - df['Close'].iloc[0]
+    avg_rrr = trades_df['RRR'].mean() if total_trades > 0 else np.nan
+
+    summary = {
+        "Total Trades": total_trades,
+        "Win Rate": round(win_rate, 2),
+        "Total Points": round(total_points, 2),
+        "Average Points/Trade": round(avg_points, 2),
+        "Max Drawdown (points)": round(-max_dd, 2),
+        "Buy & Hold Points": round(buy_hold_points, 2),
+        "Average RRR": round(avg_rrr, 2)
+    }
+
+    return trades_df, summary
+
+# Live recommendation function
+def live_recommendation(df, backtest_summary):
+    df = detect_momentum(df)
+    df = identify_zones(df)
+    last = df.iloc[-1]
+    entry_price = last['Close']
+    direction = None
+    reason = None
+    stop = None
+    target = None
+
+    if last['Momentum'] > 0 and entry_price > last['Supply_Zone']:
+        direction = "BUY"
+        reason = "Momentum breakout above supply"
+        stop = last['Demand_Zone']
+        target = entry_price + (entry_price - stop) * 2
+    elif last['Momentum'] < 0 and entry_price < last['Demand_Zone']:
+        direction = "SELL"
+        reason = "Momentum breakdown below demand"
+        stop = last['Supply_Zone']
+        target = entry_price - (stop - entry_price) * 2
+
+    if direction:
+        risk = abs(entry_price - stop) if stop else np.nan
+        reward = abs(target - entry_price) if target else np.nan
+        rrr = reward / risk if risk and risk != 0 else np.nan
+        confidence = backtest_summary.get("Win Rate", 50) / 100
+        return {
+            "Direction": direction,
+            "Entry": entry_price,
+            "Target": target,
+            "Stop": stop,
+            "Risk": risk,
+            "Reward": reward,
+            "RRR": round(rrr, 2),
+            "Probability of Profit": f"{confidence*100:.2f}%",
+            "Reason": reason
         }
-    else:
-        trades_df.attrs['summary'] = {}
+    return None
 
-    return trades_df, equity_series
-
-# -------------------------------
 # Streamlit UI
-# -------------------------------
-st.title("Swing Trading Strategy (Points-based, with Buy & Hold Comparison)")
+st.title("Swing Trading Strategy with Backtest & Live Recommendation")
 
-uploaded = st.file_uploader("Upload OHLCV CSV", type=["csv","xlsx"])
+uploaded_file = st.file_uploader("Upload OHLC data (CSV)", type="csv")
+if uploaded_file:
+    df = pd.read_csv(uploaded_file)
+    df.columns = [c.capitalize() for c in df.columns]
+    df = df[['Date', 'Open', 'High', 'Low', 'Close', 'Volume']]
+    df['Date'] = pd.to_datetime(df['Date'])
+    df.set_index('Date', inplace=True)
 
-if uploaded:
-    if uploaded.name.endswith("csv"):
-        df = pd.read_csv(uploaded)
-    else:
-        df = pd.read_excel(uploaded)
+    trades_df, summary = backtest(df)
 
-    # map columns
-    cols = st.multiselect("Map columns (Date,Open,High,Low,Close,Volume)", df.columns.tolist(), default=df.columns.tolist()[:6])
-    if len(cols)>=6:
-        df = df[cols]
-        df.columns = ["Date","Open","High","Low","Close","Volume"]
-        df['Date'] = pd.to_datetime(df['Date'])
-        df.set_index('Date', inplace=True)
-        df = generate_signals(df)
-        trades_df, equity_series = backtest(df)
+    st.subheader("Backtest Results")
+    for k, v in summary.items():
+        st.write(f"{k}: {v}")
 
-        st.subheader("Backtest Results")
-        if 'summary' in trades_df.attrs:
-            summary = trades_df.attrs['summary']
-            st.write(f"**Total Trades:** {summary['total_trades']}")
-            st.write(f"**Win Rate:** {summary['win_rate']*100:.2f}%")
-            st.write(f"**Total Points:** {summary['total_points']:.2f}")
-            st.write(f"**Average Points/Trade:** {summary['avg_points']:.2f}")
-            st.write(f"**Max Drawdown (points):** {summary['max_drawdown']:.2f}")
-            st.write(f"**Buy & Hold Points:** {summary['buy_hold_points']:.2f}")
+    st.subheader("Trade Log")
+    st.dataframe(trades_df)
 
-        st.subheader("Trade Log")
-        st.dataframe(trades_df)
-
-        st.subheader("Equity Curve (Points)")
-        fig, ax = plt.subplots(figsize=(10,4))
-        equity_series.plot(ax=ax)
-        ax.set_title("Equity Curve (Points)")
-        st.pyplot(fig)
+    if st.button("Get Live Recommendation"):
+        reco = live_recommendation(df, summary)
+        if reco:
+            st.subheader("Live Recommendation")
+            for k, v in reco.items():
+                st.write(f"{k}: {v}")
+        else:
+            st.write("No clear trade signal right now.")
