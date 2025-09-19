@@ -670,7 +670,7 @@ def app():
     # Sidebar controls
     with st.sidebar:
         st.header('Data source')
-        source = st.selectbox('Data source', ['yfinance', 'upload file'])
+        source = st.selectbox('Data source', ['yfinance', 'upload file'],index=1)
         if source == 'yfinance':
             # Nifty50 sample tickers (NSE) hardcoded; user can choose 'Other' to type manually
             nifty50 = [
