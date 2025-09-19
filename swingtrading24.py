@@ -2,200 +2,79 @@ import streamlit as st
 import yfinance as yf
 import pandas as pd
 import numpy as np
-import matplotlib.pyplot as plt
+import datetime
 
-# -----------------------------
-# Indicator Functions
-# -----------------------------
-def ema(series, period=20):
-    return series.ewm(span=period, adjust=False).mean()
+# -----------------------
+# Moving Average Strategy
+# -----------------------
+def moving_average_strategy(df, short_window=20, long_window=50):
+    df['SMA20'] = df['Close'].rolling(window=short_window).mean()
+    df['SMA50'] = df['Close'].rolling(window=long_window).mean()
 
-def rsi(series, period=14):
-    delta = series.diff()
-    gain = delta.where(delta > 0, 0.0)
-    loss = -delta.where(delta < 0, 0.0)
-    avg_gain = gain.rolling(period).mean()
-    avg_loss = loss.rolling(period).mean()
-    rs = avg_gain / avg_loss
-    return 100 - (100 / (1 + rs))
+    df['Signal'] = 0
+    df.loc[df['SMA20'] > df['SMA50'], 'Signal'] = 1
+    df.loc[df['SMA20'] < df['SMA50'], 'Signal'] = -1
 
-def bollinger_bands(series, period=20, std=2):
-    ma = series.rolling(period).mean()
-    std_dev = series.rolling(period).std()
-    upper = ma + std * std_dev
-    lower = ma - std * std_dev
-    return ma, upper, lower
+    df['Return'] = df['Close'].pct_change()
+    df['Strategy_Return'] = df['Signal'].shift(1) * df['Return']
+    return df
 
-def atr(data, period=14):
-    data['H-L'] = data['High'] - data['Low']
-    data['H-PC'] = (data['High'] - data['Close'].shift(1)).abs()
-    data['L-PC'] = (data['Low'] - data['Close'].shift(1)).abs()
-    tr = data[['H-L','H-PC','L-PC']].max(axis=1)
-    return tr.rolling(period).mean()
+def backtest_performance(df):
+    cum_returns = (1 + df['Return']).cumprod()
+    cum_strategy = (1 + df['Strategy_Return']).cumprod()
+    return cum_returns, cum_strategy
 
-# -----------------------------
-# Strategy Logic
-# -----------------------------
-def generate_signals(data):
-    data['EMA20'] = ema(data['Close'], 20)
-    data['EMA200'] = ema(data['Close'], 200)
-    data['RSI'] = rsi(data['Close'])
-    data['BB_Mid'], data['BB_Upper'], data['BB_Lower'] = bollinger_bands(data['Close'])
-    data['ATR'] = atr(data)
+def live_signal(df):
+    latest = df.iloc[-1]  # pick last row
+    if latest['SMA20'] > latest['SMA50']:
+        return "BUY 📈 (Bullish)", "green"
+    elif latest['SMA20'] < latest['SMA50']:
+        return "SELL 📉 (Bearish)", "red"
+    else:
+        return "HOLD 🤝 (Neutral)", "gray"
 
-    signals = []
-    position = None
+# -----------------------
+# Streamlit App
+# -----------------------
+st.title("📊 Swing Trading Strategy (SMA Crossover)")
 
-    for i in range(len(data)):
-        row = data.iloc[i]
+# Ticker selection
+tickers = ["RELIANCE.NS", "TCS.NS", "INFY.NS", "HDFCBANK.NS", "ICICIBANK.NS", "^NSEI", "^BSESN"]
+ticker = st.selectbox("Select Stock/Index", tickers + ["Other"])
+if ticker == "Other":
+    ticker = st.text_input("Enter Ticker Symbol (e.g. SBIN.NS)", "SBIN.NS")
 
-        if pd.isna(row['EMA20']) or pd.isna(row['EMA200']) or pd.isna(row['RSI']) or pd.isna(row['ATR']):
-            signals.append(None)
-            continue
-
-        close = float(row['Close'])
-        ema20 = float(row['EMA20'])
-        ema200 = float(row['EMA200'])
-        rsi_val = float(row['RSI'])
-
-        if close > ema200 and close <= ema20 and rsi_val > 45:
-            if position != "LONG":
-                signals.append("BUY")
-                position = "LONG"
-            else:
-                signals.append(None)
-
-        elif close < ema200 and close >= ema20 and rsi_val < 55:
-            if position != "SHORT":
-                signals.append("SELL")
-                position = "SHORT"
-            else:
-                signals.append(None)
-
-        else:
-            signals.append(None)
-
-    data['Signal'] = signals
-    return data
-
-# -----------------------------
-# Backtest
-# -----------------------------
-def backtest(data, capital=100000, risk_per_trade=0.01):
-    balance = capital
-    equity_curve = []
-    trades = []
-    position = None
-    entry_price = 0
-    qty = 0
-
-    for i in range(len(data)):
-        row = data.iloc[i]
-
-        if row['Signal'] == "BUY":
-            sl = row['Close'] - 2 * row['ATR']
-            if sl > 0:
-                qty = max(1, int((balance * risk_per_trade) // (row['Close'] - sl)))
-                entry_price = row['Close']
-                position = "LONG"
-
-        elif row['Signal'] == "SELL":
-            sl = row['Close'] + 2 * row['ATR']
-            if sl > 0:
-                qty = max(1, int((balance * risk_per_trade) // (sl - row['Close'])))
-                entry_price = row['Close']
-                position = "SHORT"
-
-        if position == "LONG":
-            pnl = (row['Close'] - entry_price) * qty
-        elif position == "SHORT":
-            pnl = (entry_price - row['Close']) * qty
-        else:
-            pnl = 0
-
-        equity_curve.append(capital + pnl)
-
-    data['Equity'] = equity_curve
-    return data
-
-# -----------------------------
-# Performance Metrics
-# -----------------------------
-def performance_metrics(data, capital=100000):
-    returns = data['Equity'].pct_change().dropna()
-    total_return = (data['Equity'].iloc[-1] / capital - 1) * 100
-    cagr = ((data['Equity'].iloc[-1] / capital) ** (252/len(data))) - 1 if len(data) > 0 else 0
-    sharpe = (returns.mean() / returns.std()) * np.sqrt(252) if returns.std() != 0 else 0
-    drawdown = (data['Equity'] / data['Equity'].cummax() - 1).min() * 100
-    return {
-        "Total Return %": round(total_return, 2),
-        "CAGR %": round(cagr*100, 2),
-        "Sharpe Ratio": round(sharpe, 2),
-        "Max Drawdown %": round(drawdown, 2)
-    }
-
-# -----------------------------
-# Streamlit UI
-# -----------------------------
-st.title("📈 Swing Trading Strategy - India Market")
-
-tickers = {
-    "NIFTY 50": "^NSEI",
-    "BANK NIFTY": "^NSEBANK",
-    "FIN NIFTY": "NIFTY_FIN_SERVICE.NS",
-    "SENSEX": "^BSESN",
-    "RELIANCE": "RELIANCE.NS",
-    "INFY": "INFY.NS",
-    "TCS": "TCS.NS",
-    "HDFC BANK": "HDFCBANK.NS"
+# Timeframe selection
+timeframe_map = {
+    "1 Minute": ("1m", "5d"), "3 Minutes": ("3m", "5d"), "5 Minutes": ("5m", "30d"),
+    "10 Minutes": ("10m", "60d"), "15 Minutes": ("15m", "60d"), "30 Minutes": ("30m", "60d"),
+    "1 Hour": ("60m", "730d"), "4 Hours": ("1h", "730d"),
+    "1 Day": ("1d", "10y"), "1 Week": ("1wk", "10y"), "1 Month": ("1mo", "10y")
 }
-choice = st.selectbox("Select Ticker", list(tickers.keys()) + ["Other"])
-if choice == "Other":
-    ticker = st.text_input("Enter Yahoo Ticker (e.g. SBIN.NS)", "SBIN.NS")
-else:
-    ticker = tickers[choice]
+timeframe = st.selectbox("Select Timeframe", list(timeframe_map.keys()))
+interval, period = timeframe_map[timeframe]
 
-period_options = ["1d","5d","1mo","3mo","6mo","1y","2y","3y","5y","10y","ytd","max"]
-interval_options = ["1m","2m","5m","15m","30m","60m","90m","1h","1d","5d","1wk","1mo","3mo"]
-
-period = st.selectbox("Select Period", period_options, index=5)
-interval = st.selectbox("Select Interval", interval_options, index=8)
-
+# Fetch data
 try:
-    data = yf.download(ticker, period=period, interval=interval)
-    if data.empty:
-        st.error("⚠️ No data available. Try another period/interval combination.")
-        st.stop()
+    df = yf.download(ticker, period=period, interval=interval)
+    df.dropna(inplace=True)
+
+    if df.empty:
+        st.error("No data fetched. Try different ticker or timeframe.")
+    else:
+        df = moving_average_strategy(df)
+        cum_returns, cum_strategy = backtest_performance(df)
+
+        # Show backtest chart
+        st.subheader("📈 Backtest Performance")
+        st.line_chart(pd.DataFrame({"Buy & Hold": cum_returns, "Strategy": cum_strategy}))
+
+        # Show live recommendation
+        signal, color = live_signal(df)
+        st.subheader("🚦 Live Recommendation")
+        st.markdown(f"<h3 style='color:{color}'>{signal}</h3>", unsafe_allow_html=True)
+
+        st.dataframe(df.tail(10))  # show last 10 rows for reference
+
 except Exception as e:
     st.error(f"Error fetching or processing data: {e}")
-    st.stop()
-
-data = data.dropna()
-data = generate_signals(data)
-data = backtest(data)
-
-# Live recommendation
-st.subheader("📢 Live Recommendation")
-latest_signal = data['Signal'].dropna().iloc[-1] if data['Signal'].dropna().any() else "No Signal"
-st.write(f"**{ticker}** → {latest_signal}")
-
-# Performance metrics
-st.subheader("📊 Performance Metrics (Backtest)")
-metrics = performance_metrics(data)
-st.json(metrics)
-
-# Price & signals chart
-fig, ax = plt.subplots(figsize=(12,6))
-ax.plot(data.index, data['Close'], label="Close Price", color="blue")
-ax.plot(data.index, data['EMA20'], label="EMA20", color="orange")
-ax.plot(data.index, data['EMA200'], label="EMA200", color="red")
-ax.scatter(data.index[data['Signal']=="BUY"], data['Close'][data['Signal']=="BUY"], marker="^", color="green", label="Buy", s=100)
-ax.scatter(data.index[data['Signal']=="SELL"], data['Close'][data['Signal']=="SELL"], marker="v", color="red", label="Sell", s=100)
-ax.legend()
-st.pyplot(fig)
-
-# Equity curve
-st.subheader("💰 Equity Curve")
-fig2, ax2 = plt.subplots(figsize=(12,4))
-ax2.plot(data.index, data['Equity'], color="purple")
-st.pyplot(fig2)
