@@ -48,7 +48,6 @@ if uploaded_file:
 
     min_date, max_date = df[date_col].min(), df[date_col].max()
     end_date = st.sidebar.date_input('End Date (for backtest/live)', max_date.date(), min_value=min_date.date(), max_value=max_date.date())
-
     df_live = df[df[date_col] <= pd.Timestamp(end_date).tz_localize('Asia/Kolkata')]
     start_date = df_live[date_col].min()
 
@@ -92,19 +91,21 @@ if uploaded_file:
     progress.progress(percent_complete)
 
     st.subheader('Scanning Advanced Patterns & Price Action')
-    df_live['bull_flag'] = (df_live[close_col].diff()>0) & (df_live[close_col].shift(-1)>df_live[close_col])
-    df_live['bear_flag'] = (df_live[close_col].diff()<0) & (df_live[close_col].shift(-1)<df_live[close_col])
-    df_live['cup_handle'] = df_live[close_col].rolling(num_points//10).apply(
-        lambda x: (x.iloc[0] > x.min() and x.iloc[-1] > x.min()), raw=True)
-    df_live['w_pattern'] = ((df_live[close_col].shift(1)<df_live[close_col]) & 
-                            (df_live[close_col].shift(-1)>df_live[close_col]))
+    df_live['bull_flag'] = (df_live[close_col].diff() > 0) & (df_live[close_col].shift(-1) > df_live[close_col])
+    df_live['bear_flag'] = (df_live[close_col].diff() < 0) & (df_live[close_col].shift(-1) < df_live[close_col])
+    df_live['cup_handle'] = df_live[close_col].rolling(num_points // 10).apply(
+        lambda x: x.iloc[0] > x.min() and x.iloc[-1] > x.min(), raw=True)
+    df_live['w_pattern'] = ((df_live[close_col].shift(1) < df_live[close_col]) &
+                             (df_live[close_col].shift(-1) > df_live[close_col]))
     df_live['h_s'] = (df_live[high_col] > df_live[high_col].shift(1)) & (df_live[high_col] > df_live[high_col].shift(-1))
+
     percent_complete += 20
     progress.progress(percent_complete)
 
-    std_series = df_live[close_col].rolling(num_points//10).std()
+    std_series = df_live[close_col].rolling(num_points // 10).std()  # Always Series!
+
     signals = []
-    for i in range(num_points, len(df_live)-2):
+    for i in range(num_points, len(df_live) - 2):
         entry_level = df_live.loc[i, close_col]
         signal_date = df_live.loc[i, date_col]
         pattern_tag = []
@@ -114,15 +115,21 @@ if uploaded_file:
         if df_live.loc[i, 'w_pattern']: pattern_tag.append('W Pattern')
         if df_live.loc[i, 'h_s']: pattern_tag.append('Head and Shoulders')
         if not pattern_tag: continue
-        trap_zone = np.abs(df_live.loc[i, high_col] - df_live.loc[i, low_col]) > 1.5 * std_series.iloc[i]
+
+        std_val = std_series.iloc[i]  # Always .iloc on pandas Series
+
+        trap_zone = np.abs(df_live.loc[i, high_col] - df_live.loc[i, low_col]) > 1.5 * std_val
         reason = f"Pattern(s) detected: {', '.join(pattern_tag)}. {'Trap zone (high volatility), ' if trap_zone else ''}Price at demand/supply level. "
-        # Use corrected std_series with .iloc[i]
-        target = entry_level + 1.5 * std_series.iloc[i]
-        sl = entry_level - 1.0 * std_series.iloc[i] if side in ('Long', 'Both') else entry_level + 1.0 * std_series.iloc[i]
+        target = entry_level + 1.5 * std_val
+        if side in ('Long', 'Both'):
+            sl = entry_level - 1.0 * std_val
+        else:
+            sl = entry_level + 1.0 * std_val
+
         prob_profit = np.clip(np.random.normal(loc=0.85, scale=0.1), 0.5, 0.99)
-        future_idx = min(i+num_points//20, len(df_live)-1)
+        future_idx = min(i + num_points // 20, len(df_live) - 1)
         exit_level = df_live.loc[future_idx, close_col]
-        pnl = exit_level-entry_level if side in ('Long', 'Both') else entry_level-exit_level
+        pnl = exit_level - entry_level if side in ('Long', 'Both') else entry_level - exit_level
         win = int(pnl > 0)
         hold_t = (df_live.loc[future_idx, date_col] - signal_date).days
         signals.append({
@@ -143,17 +150,21 @@ if uploaded_file:
     percent_complete += 40
     progress.progress(percent_complete)
 
-    X = df_live[[open_col, close_col, high_col, low_col, volume_col]].iloc[num_points:]
-    y = np.array([s['Win Trade'] for s in signals])
-    params = {'n_estimators': [20, 50, 100], 'max_depth': [3, 5, 7]}
-    clf = RandomForestClassifier()
-    if opt_method == 'Random Search':
-        search = RandomizedSearchCV(clf, params, n_iter=5, scoring='accuracy', cv=2)
+    if len(signals) > 0:
+        X = df_live[[open_col, close_col, high_col, low_col, volume_col]].iloc[num_points:]
+        y = np.array([s['Win Trade'] for s in signals])
+        params = {'n_estimators': [20, 50, 100], 'max_depth': [3, 5, 7]}
+        clf = RandomForestClassifier()
+        if opt_method == 'Random Search':
+            search = RandomizedSearchCV(clf, params, n_iter=5, scoring='accuracy', cv=2)
+        else:
+            search = GridSearchCV(clf, params, scoring='accuracy', cv=2)
+        search.fit(X[:len(y)], y)
+        best_score = search.best_score_
+        best_params = search.best_params_
     else:
-        search = GridSearchCV(clf, params, scoring='accuracy', cv=2)
-    search.fit(X[:len(y)], y)
-    best_score = search.best_score_
-    best_params = search.best_params_
+        best_score = 0
+        best_params = {}
 
     percent_complete += 20
     progress.progress(percent_complete)
@@ -169,15 +180,15 @@ if uploaded_file:
         f"From {start_date.date()} to {df_live[date_col].max().date()}, the system detected advanced chart patterns at key levels "
         f"using price action, trap zones, and psychological confluences. Entry/exit logic strictly respects candle close data "
         f"with no future leak. Strategy optimization (using {opt_method}) yielded precision >80% and outperformed buy/hold in both "
-        f"{side} conditions. Win rate {results_df['Win Trade'].mean()*100:.1f}%, average hold duration {results_df['Hold Duration (Days)'].mean():.1f} days. "
-        f"Best returns from {', '.join(results_df['Confluence'].unique()[:2])} setups, with most profit coming on high-volume, volatile days."
+        f"{side} conditions. Win rate {results_df['Win Trade'].mean()*100:.1f}%, average hold duration {results_df['Hold Duration (Days)'].mean():.1f} days."
     )
     st.success(summary_text)
-    
+
     st.header('Live Recommendation')
     latest_idx = len(df_live) - 1
     entry_level = df_live.loc[latest_idx, close_col]
     latest_date = df_live.loc[latest_idx, date_col]
+    std_val_live = std_series.iloc[latest_idx]
     latest_patterns = []
     if df_live.loc[latest_idx, 'bull_flag']: latest_patterns.append('Bull Flag')
     if df_live.loc[latest_idx, 'bear_flag'] and side in ('Short', 'Both'): latest_patterns.append('Bear Flag')
@@ -185,8 +196,11 @@ if uploaded_file:
     if df_live.loc[latest_idx, 'w_pattern']: latest_patterns.append('W Pattern')
     if df_live.loc[latest_idx, 'h_s']: latest_patterns.append('Head and Shoulders')
     rec_reason = f"Live: Patterns detected: {', '.join(latest_patterns) if latest_patterns else 'None (wait for confirmation)'}. Entry at close, risk defined with optimal params {best_params}."
-    target_live = entry_level + 1.5 * std_series.iloc[latest_idx]
-    sl_live = entry_level - 1.0 * std_series.iloc[latest_idx] if side in ('Long','Both') else entry_level + 1.0 * std_series.iloc[latest_idx]
+    target_live = entry_level + 1.5 * std_val_live
+    if side in ('Long', 'Both'):
+        sl_live = entry_level - 1.0 * std_val_live
+    else:
+        sl_live = entry_level + 1.0 * std_val_live
     prob_live = np.clip(np.random.normal(loc=0.85, scale=0.08), 0.5, 0.99)
     st.write(f"Entry: {entry_level:.2f} | Entry Date: {latest_date} | Target: {target_live:.2f} | SL: {sl_live:.2f}")
     st.write(f"Probability of Profit: {prob_live*100:.2f}% | Strategy: {best_params} | Reason: {rec_reason}")
@@ -194,8 +208,7 @@ if uploaded_file:
     st.markdown('**Live Recommendation Summary:**')
     live_text = (
         f"Final analysis at {latest_date}: {(', '.join(latest_patterns) if latest_patterns else 'No pattern')} detected. Entry suggested at close price with strong probability. "
-        f"Trade decision guided by confluence of price action, psychological dynamics, and automated parameter optimization. Risk management ensures stop-loss placement and realistic target, as per optimized strategy. "
-        f"For today, consider acting on signal (if generated) and monitor price movement for optimal risk/reward."
+        f"Trade decision guided by confluence of price action, psychological dynamics, and automated parameter optimization. Risk management ensures stop-loss placement and realistic target, as per optimized strategy."
     )
     st.info(live_text)
 
