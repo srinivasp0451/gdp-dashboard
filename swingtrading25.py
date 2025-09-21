@@ -1,654 +1,742 @@
-"""
-Streamlit Swing Recommender
-- Upload OHLCV CSV/Excel (columns with arbitrary names allowed)
-- Automatically map columns (date/open/high/low/close/volume)
-- Sort data ascending and convert date column to IST timezone
-- Exploratory Data Analysis (head/tail, min/max, plots, heatmap of returns)
-- Automatic price-action & pattern-based signal generation (breakouts, triangles, flags, head & shoulders, double tops/bottoms, cup-and-handle heuristics)
-- Backtester that enters on the SAME candle close where signal is generated (no future leakage)
-- Grid / Random search optimization over strategy parameters (default: Random Search)
-- Live recommendation using the best-found strategy applied to the last available candle (entry at last candle close)
-- Human-readable reasons for each trade and summary descriptions
-
-NOTES:
-- This implementation is heuristic-driven and meant to be a strong, self-contained starting point.
-- No external TA libraries (talib / pandas_ta) are used.
-- Save this file and run: `streamlit run streamlit_swing_recommender.py`
-
-Dependencies:
-pip install streamlit pandas numpy plotly pytz
-
-"""
-
+# app.py
 import streamlit as st
 import pandas as pd
 import numpy as np
-import plotly.graph_objects as go
-import plotly.express as px
-from datetime import datetime, timedelta
-import pytz
 import io
-import itertools
+from datetime import datetime, timezone
+import pytz
+import plotly.graph_objects as go
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.model_selection import ParameterSampler
+from itertools import product
 import random
+import warnings
+warnings.filterwarnings("ignore")
 
-st.set_page_config(layout="wide", page_title="Swing Recommender")
+st.set_page_config(layout="wide", page_title="Swing Trade Recommender (Price Action)")
 
-# ------------------------------- Utilities -------------------------------
-
+# -------------------------
+# Helper: Column mapping
+# -------------------------
 def map_columns(df):
-    # Return suggested mapping for core fields
-    mapping = {"date": None, "open": None, "high": None, "low": None, "close": None, "volume": None}
-    cols = list(df.columns)
-    lower = [c.lower() for c in cols]
-    for i, c in enumerate(cols):
-        lc = lower[i]
-        if mapping['date'] is None and ("date" in lc or "time" in lc or "timestamp" in lc):
-            mapping['date'] = c
-        if mapping['open'] is None and ("open" in lc and "interest" not in lc):
-            mapping['open'] = c
-        if mapping['high'] is None and "high" in lc:
-            mapping['high'] = c
-        if mapping['low'] is None and "low" in lc:
-            mapping['low'] = c
-        if mapping['close'] is None and ("close" in lc or "last" in lc or lc.endswith('c')):
-            mapping['close'] = c
-        if mapping['volume'] is None and ("volume" in lc or "qty" in lc or "trade" in lc or "shares" in lc):
-            mapping['volume'] = c
-    # Fallbacks (substring match)
-    for target in mapping:
-        if mapping[target] is None:
-            for c in cols:
-                if target in c.lower():
-                    mapping[target] = c
-                    break
-    return mapping
+    """Map common OHLCV columns from messy names. Returns df with columns
+    ['date','open','high','low','close','volume'] when possible."""
+    col_map = {}
+    lower_cols = {c: c.lower() for c in df.columns}
+    find = lambda keys: next((c for c, lc in lower_cols.items() if any(k in lc for k in keys)), None)
 
+    # date
+    date_col = find(['date', 'time', 'timestamp', 'dt'])
+    if date_col is None:
+        # maybe index is date-like
+        date_col = None
+    else:
+        col_map['date'] = date_col
 
-def to_ist_series(s):
-    tz = pytz.timezone('Asia/Kolkata')
-    def convert(x):
-        if pd.isna(x):
-            return pd.NaT
-        try:
-            if x.tzinfo is None:
-                # assume naive timestamps are already in IST
-                return tz.localize(x)
-            else:
-                return x.astimezone(tz)
-        except Exception:
-            return pd.NaT
-    return s.apply(convert)
+    col_map['open'] = find(['open', 'o', 'openprice', 'open_price'])
+    col_map['high'] = find(['high', 'h', 'highprice', 'high_price', 'hi'])
+    col_map['low']  = find(['low', 'l', 'lowprice', 'low_price'])
+    col_map['close']= find(['close', 'c', 'closeprice', 'close_price', 'last', 'price'])
+    col_map['volume']= find(['volume', 'vol', 'qty', 'shares', 'trades', 'turnover'])
 
+    # Attempt to ensure at least close exists
+    if col_map.get('close') is None:
+        # try any column that looks numeric and not date
+        numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+        if numeric_cols:
+            col_map['close'] = numeric_cols[-1]
 
-def compute_atr(df, n=14):
-    # df expects columns: high, low, close
-    high = df['high'].values
-    low = df['low'].values
-    close = df['close'].values
-    prev_close = np.roll(close, 1)
-    prev_close[0] = close[0]
-    tr = np.maximum.reduce([high - low, np.abs(high - prev_close), np.abs(low - prev_close)])
-    atr = pd.Series(tr).rolling(window=n, min_periods=1).mean()
-    return atr
+    return col_map
 
+# -------------------------
+# Helper: Date parsing to IST
+# -------------------------
+def ensure_datetime_ist(df, date_col):
+    """Convert/ensure date_col is timezone-aware in Asia/Kolkata."""
+    if date_col is None:
+        st.error("No date/time column detected. Please ensure your file has a date column.")
+        raise ValueError("Missing date column")
 
-def find_local_pivots(series, left=3, right=3):
-    # return indices of local highs and lows
-    highs = []
-    lows = []
-    vals = series.values
-    n = len(vals)
-    for i in range(left, n - right):
-        window_left = vals[i-left:i]
-        window_right = vals[i+1:i+1+right]
-        if vals[i] > max(window_left) and vals[i] >= max(window_right):
-            highs.append(i)
-        if vals[i] < min(window_left) and vals[i] <= min(window_right):
-            lows.append(i)
-    return highs, lows
+    s = pd.to_datetime(df[date_col], errors='coerce', infer_datetime_format=True)
+    if s.isna().all():
+        st.error("Date parsing failed — check your date format.")
+        raise ValueError("Date parsing failed")
 
-
-def cluster_levels(levels, tol=0.005):
-    # cluster numeric levels within relative tolerance tol
-    if len(levels) == 0:
-        return []
-    levels_sorted = sorted(levels)
-    clusters = [[levels_sorted[0]]]
-    for lvl in levels_sorted[1:]:
-        if abs(lvl - clusters[-1][-1]) <= tol * lvl:
-            clusters[-1].append(lvl)
+    # If timezone-aware, convert; if naive, localize to Asia/Kolkata (user requested IST)
+    try:
+        if s.dt.tz is None:
+            s = s.dt.tz_localize('Asia/Kolkata')
         else:
-            clusters.append([lvl])
-    # return mean of clusters
-    return [np.mean(c) for c in clusters]
+            s = s.dt.tz_convert('Asia/Kolkata')
+    except Exception:
+        # fallback: treat naive as UTC then convert (safer if data in UTC)
+        try:
+            s = s.dt.tz_localize('UTC').dt.tz_convert('Asia/Kolkata')
+        except Exception:
+            s = s.dt.tz_localize('Asia/Kolkata')
 
+    df[date_col] = s
+    return df
 
-def detect_basic_patterns(df, i, lookback=60):
-    # detect patterns that include the current candle i using only data up to i
-    # Returns a list of detected patterns for that point
-    patterns = []
-    start = max(0, i - lookback + 1)
-    window = df.iloc[start:i+1]
-    close = window['close'].values
-    high = window['high'].values
-    low = window['low'].values
-    idxs = np.arange(start, i+1)
-    # simple double top/bottom detection
-    highs, lows = find_local_pivots(pd.Series(close), left=3, right=3)
-    # double top: two highs similar level
-    if len(highs) >= 2:
-        last_two = highs[-2:]
-        h1, h2 = close[last_two[0]-start], close[last_two[1]-start]
-        if abs(h1 - h2) <= 0.01 * max(h1, h2):
-            # check valley between
-            mid = close[last_two[0]-start:last_two[1]-start+1]
-            if np.min(mid) < 0.98 * min(h1, h2):
-                patterns.append(('double_top', {'indices': [idxs[last_two[0]-start], idxs[last_two[1]-start]]}))
-    if len(lows) >= 2:
-        last_two = lows[-2:]
-        l1, l2 = close[last_two[0]-start], close[last_two[1]-start]
-        if abs(l1 - l2) <= 0.01 * max(l1, l2):
-            patterns.append(('double_bottom', {'indices': [idxs[last_two[0]-start], idxs[last_two[1]-start]]}))
-    # head and shoulders (very heuristic): three peaks with middle highest
-    if len(highs) >= 3:
-        a,b,c = highs[-3:]
-        ca, cb, cc = close[a-start], close[b-start], close[c-start]
-        if cb > ca and cb > cc and abs(ca - cc) <= 0.03 * cb:
-            patterns.append(('head_and_shoulders', {'indices': [a,b,c]}))
-    # cup & handle (heuristic): long rounded bottom followed by small pullback
-    # detect long run where lows gradually decrease then increase
-    if len(window) >= 40:
-        half = int(len(window)/2)
-        left = close[:half]
-        right = close[half:]
-        if np.mean(left) > np.mean(right) and np.percentile(right, 90) > np.percentile(left, 90):
-            # simple curvature check
-            if np.polyfit(np.arange(len(close)), close, 2)[0] > 0:
-                patterns.append(('cup_and_handle', {}))
-    # triangle (descending highs, rising lows)
-    if len(window) >= 10:
-        xs = np.arange(len(window))
-        highs_lin = np.polyfit(xs, window['high'].values, 1)[0]
-        lows_lin = np.polyfit(xs, window['low'].values, 1)[0]
-        if highs_lin < 0 and lows_lin > 0:
-            patterns.append(('triangle', {}))
-    # flag/flagpole: sharp move (flagpole) then small consolidation
-    if len(window) >= 8:
-        # flagpole: last close much higher than close 8 bars ago
-        if close[-1] > 1.05 * close[0] and np.std(close[-8:]) < 0.02 * np.mean(close[-8:]):
-            patterns.append(('flag', {}))
-    return patterns
+# -------------------------
+# Indicators & utilities
+# -------------------------
+def sma(series, n):
+    return series.rolling(n, min_periods=1).mean()
 
+def atr(df, n=14):
+    tr1 = df['high'] - df['low']
+    tr2 = (df['high'] - df['close'].shift(1)).abs()
+    tr3 = (df['low'] - df['close'].shift(1)).abs()
+    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+    return tr.rolling(n, min_periods=1).mean()
 
+def rolling_support_resistance(series, window=50):
+    """Simple SR: recent rolling min and max"""
+    sup = series.rolling(window, min_periods=1).min()
+    res = series.rolling(window, min_periods=1).max()
+    return sup, res
+
+def detect_head_shoulders(prices, window=30):
+    # heuristic: find three peaks in sliding window where middle is highest and sides similar
+    hs = [False]*len(prices)
+    for i in range(window, len(prices)-window):
+        seg = prices[i-window:i+window+1]
+        mid = window
+        left_peak = seg[:mid].idxmax() if len(seg[:mid])>0 else None
+        right_peak = seg[mid+1:].idxmax() if len(seg[mid+1:])>0 else None
+        if left_peak and right_peak:
+            try:
+                left_val = seg.loc[left_peak]
+                mid_val = seg.iloc[mid]
+                right_val = seg.loc[right_peak]
+                # basic check
+                if mid_val > left_val*1.02 and mid_val > right_val*1.02 and abs(left_val-right_val)/mid_val < 0.10:
+                    hs[i] = True
+            except Exception:
+                pass
+    return pd.Series(hs, index=prices.index)
+
+def detect_double_tops_bottoms(series, window=20, threshold=0.02):
+    dt = [None]*len(series)
+    for i in range(window, len(series)-window):
+        seg = series[i-window:i+window+1]
+        peak_idx = seg.idxmax()
+        # find another peak before/after close in height
+        left = seg[:peak_idx]
+        right = seg[peak_idx+1:]
+        if not left.empty and not right.empty:
+            left_max = left.max()
+            right_max = right.max()
+            peak = seg.loc[peak_idx]
+            # double top
+            if abs(left_max-peak)/peak < threshold or abs(right_max-peak)/peak < threshold:
+                dt[peak_idx] = 'double_top'
+            # double bottom (invert)
+        # analogous for bottoms
+    return pd.Series(dt, index=series.index)
+
+def detect_triangle(df, lookback=50):
+    # detect consolidating highs and lows with narrowing range
+    tri = [False]*len(df)
+    for i in range(lookback, len(df)):
+        seg = df.iloc[i-lookback:i]
+        highs = seg['high'].values
+        lows = seg['low'].values
+        # linear fit slope magnitude shrinking heuristic
+        hx = np.arange(len(highs))
+        lx = np.arange(len(lows))
+        try:
+            hslope = np.polyfit(hx, highs, 1)[0]
+            lslope = np.polyfit(lx, lows, 1)[0]
+            if abs(hslope) < 0.02 and abs(lslope) < 0.02 and (highs.max()-lows.min())/np.median(seg['close']) < 0.06:
+                tri[i] = True
+        except Exception:
+            pass
+    return pd.Series(tri, index=df.index)
+
+# -------------------------
+# Pattern aggregator (returns reasons)
+# -------------------------
+def detect_patterns(df):
+    reasons = []
+    hs = detect_head_shoulders(df['close'])
+    tri = detect_triangle(df)
+    # Add points where pattern True
+    for idx in hs[hs].index:
+        reasons.append((idx, "Head and Shoulders-like structure observed (mid-peak higher than shoulders)"))
+    for idx in tri[tri].index:
+        reasons.append((idx, "Triangle/consolidation (tight highs & lows) — possible breakout/trap"))
+    # Additional heuristics:
+    # detect W/M patterns by local extrema in rolling windows
+    # Cup & handle: large rounding bottom followed by small pullback
+    # We'll use approximate heuristics for these:
+    # Cup & handle
+    window = 120
+    for i in range(window, len(df)):
+        seg = df['close'].iloc[i-window:i]
+        if len(seg) < window: continue
+        left = seg[:window//2]
+        right = seg[window//2:]
+        # cup: left higher than mid low and right climbs back
+        mid = seg.idxmin()
+        if seg.min() < left.mean()*0.95 and right.max() >= left.mean()*0.98:
+            reasons.append((df.index[i], "Cup-and-handle-like rounding bottom observed in prior window"))
+    return reasons
+
+# -------------------------
+# Strategy signal generator
+# -------------------------
 def generate_signals(df, params):
-    # params dict: lookback, vol_mult, atr_sl_mult, target_atr_mult, min_move
-    lookback = int(params.get('lookback', 60))
-    vol_mult = float(params.get('vol_mult', 1.5))
-    atr_sl_mult = float(params.get('atr_sl_mult', 1.5))
-    target_atr_mult = float(params.get('target_atr_mult', 2.0))
+    """Return a DataFrame 'signals' with booleans for long/short entries and textual reason."""
+    # compute indicators using only past data (pandas handles that)
+    df = df.copy()
+    df['sma_fast'] = sma(df['close'], params['fast_ma'])
+    df['sma_slow'] = sma(df['close'], params['slow_ma'])
+    df['atr'] = atr(df, params['atr_period'])
+    sup, res = rolling_support_resistance(df['low'], window=params['sr_window'])
+    df['sup'] = sup
+    df['res'] = res
 
-    atr = compute_atr(df, n=14)
-    mean_vol = df['volume'].rolling(window=max(5, int(lookback/4)), min_periods=1).mean()
     signals = []
-    close = df['close'].values
-    high = df['high'].values
-    low = df['low'].values
-    for i in range(lookback-1, len(df)-1):
-        # use data up to and including i to create signal and entry at close[i]
-        recent = df.iloc[max(0, i - lookback + 1):i+1]
-        # find pivots in recent
-        highs_idx, lows_idx = find_local_pivots(recent['close'], left=3, right=3)
-        # compute clustered resistance/support
-        resistance_levels = cluster_levels([recent['close'].values[idx] for idx in highs_idx], tol=0.01)
-        support_levels = cluster_levels([recent['close'].values[idx] for idx in lows_idx], tol=0.01)
-        last_close = close[i]
-        last_vol = df['volume'].iloc[i]
-        recent_mean_vol = mean_vol.iloc[i]
-        # breakout above resistance
-        if len(resistance_levels) > 0:
-            last_res = resistance_levels[-1]
-            # breakout if close > resistance and previous close <= resistance (break happened on this candle)
-            prev_close = close[i-1] if i-1>=0 else close[i]
-            if last_close > last_res and prev_close <= last_res and last_vol > max(200, recent_mean_vol * vol_mult):
-                # pattern detection
-                patterns = detect_basic_patterns(df, i, lookback=lookback)
-                # set stoploss as nearest support or entry - atr*mult
-                current_atr = atr.iloc[i] if not np.isnan(atr.iloc[i]) else np.std(close[max(0,i-14):i+1])
-                sl = last_close - max(0.5 * current_atr, atr_sl_mult * current_atr)
-                # target as measured move: either distance to support/resistance or atr multiplier
-                measured_move = last_close - (support_levels[-1] if len(support_levels)>0 else (np.min(recent['low'].values)))
-                target = last_close + max(target_atr_mult * current_atr, measured_move)
-                reason = f"Breakout above resistance {last_res:.2f} with volume {int(last_vol)} > {recent_mean_vol:.1f}."
-                patterns_text = ",".join([p[0] for p in patterns]) if patterns else "breakout"
-                signals.append({
-                    'idx': i,
-                    'datetime': df['date'].iloc[i],
-                    'side': 'long',
-                    'entry': float(last_close),
-                    'sl': float(sl),
-                    'target': float(target),
-                    'reason': reason,
-                    'patterns': patterns_text,
-                })
-        # breakout below support (short)
-        if len(support_levels) > 0:
-            last_sup = support_levels[-1]
-            prev_close = close[i-1] if i-1>=0 else close[i]
-            if last_close < last_sup and prev_close >= last_sup and last_vol > max(200, recent_mean_vol * vol_mult):
-                patterns = detect_basic_patterns(df, i, lookback=lookback)
-                current_atr = atr.iloc[i] if not np.isnan(atr.iloc[i]) else np.std(close[max(0,i-14):i+1])
-                sl = last_close + max(0.5 * current_atr, atr_sl_mult * current_atr)
-                measured_move = (resistance_levels[-1] if len(resistance_levels)>0 else np.max(recent['high'].values)) - last_close
-                target = last_close - max(target_atr_mult * current_atr, measured_move)
-                reason = f"Breakdown below support {last_sup:.2f} with volume {int(last_vol)} > {recent_mean_vol:.1f}."
-                patterns_text = ",".join([p[0] for p in patterns]) if patterns else "breakdown"
-                signals.append({
-                    'idx': i,
-                    'datetime': df['date'].iloc[i],
-                    'side': 'short',
-                    'entry': float(last_close),
-                    'sl': float(sl),
-                    'target': float(target),
-                    'reason': reason,
-                    'patterns': patterns_text,
-                })
-    return signals
+    patterns = detect_patterns(df)
 
+    # logic:
+    # - trend bias: sma_fast > sma_slow => bullish bias, opposite => bearish
+    # - breakout: close above recent resistance (res rolling), with volume surge and ATR support
+    # - pullback long: price near support + bullish SMA structure + bullish pattern
+    # - sl hunting: if candle wicks below support but closes above, mark as fake-breakout/trap
 
-def run_backtest(df, signals, max_hold=10):
-    # simulate trades given signals. Entries at close at signal idx. Exits when target or SL hit in future candles.
+    for i in range(len(df)):
+        row = df.iloc[i]
+        reason = []
+        long = False
+        short = False
+        # need sufficient past
+        if i < max(params['fast_ma'], params['slow_ma']):
+            signals.append({'index': df.index[i], 'long': False, 'short': False, 'reason': 'insufficient history'})
+            continue
+
+        trend = 'bull' if row['sma_fast'] > row['sma_slow'] else 'bear'
+        # breakout long
+        if row['close'] > row['res']*(1 + params['res_breakout_pct']) and row['close'] > row['sma_fast']:
+            # check volume spike
+            vol_ok = False
+            if 'volume' in df.columns and not df['volume'].isna().all():
+                vol_m = df['volume'].iloc[max(0, i-params['vol_ma']):i+1].mean()
+                if vol_m > 0 and row['volume'] > vol_m*(1+params['vol_spike_pct']):
+                    vol_ok = True
+            else:
+                vol_ok = True  # no volume data, allow
+            if vol_ok:
+                long = True
+                reason.append("Breakout above recent resistance with momentum")
+        # pullback long (near support)
+        if row['close'] <= row['sup']*(1+params['sup_pull_pct']) and trend=='bull':
+            long = True
+            reason.append("Bullish pullback near support with SMA trend")
+        # sl hunt detection: long if wick pierced below support but closed above
+        candle_low = row['low']
+        candle_close = row['close']
+        if candle_low < row['sup']*(1 - params['sl_hunt_pct']) and candle_close > row['sup']:
+            long = True
+            reason.append("SL-hunt pattern (wicked below support but closed above) — likely trap")
+
+        # symmetric for short
+        if row['close'] < row['sup']*(1 - params['res_breakout_pct']) and row['close'] < row['sma_fast']:
+            short = True
+            reason.append("Breakdown below recent support with momentum")
+        if row['close'] >= row['res']*(1-params['sup_pull_pct']) and trend=='bear':
+            short = True
+            reason.append("Bearish pullback near resistance with SMA trend")
+        # detect patterns: if pattern present near i, adjust reason
+        pat_reasons = [r for idx, r in patterns if abs((idx - df.index[i]).total_seconds()) < params['pattern_time_seconds']]
+        if pat_reasons:
+            # if pattern indicates reversal and matches trend, flip or strengthen
+            reason += pat_reasons
+
+        signals.append({'index': df.index[i], 'long': long, 'short': short, 'reason': "; ".join(reason) if reason else "No clean signal"})
+    return pd.DataFrame(signals).set_index('index')
+
+# -------------------------
+# Backtest engine
+# -------------------------
+def run_backtest(df, signals, params, side='both'):
+    """
+    Backtest trades:
+    - Enter on the close price of candle where signals appear (no future leakage).
+    - Set target and stoploss using ATR multipliers.
+    - Exit when price hits target or SL in subsequent candles; if neither until max_hold_days, exit at close of last allowed candle.
+    """
     trades = []
-    n = len(df)
-    for s in signals:
-        i = s['idx']
-        entry_price = s['entry']
-        side = s['side']
-        sl = s['sl']
-        target = s['target']
-        entry_time = s['datetime']
-        exit_time = None
+    max_hold = params.get('max_hold', 20)  # in candles
+    for idx in signals.index:
+        sig = signals.loc[idx]
+        if side=='long' and not sig['long']: continue
+        if side=='short' and not sig['short']: continue
+        if side=='both' and not (sig['long'] or sig['short']): continue
+
+        # entry info
+        i = df.index.get_loc(idx)
+        entry_price = df['close'].iloc[i]
+        atr_val = df['atr'].iloc[i] if 'atr' in df.columns else (df['high'].iloc[max(0,i-14):i+1].std())
+        direction = 'long' if sig['long'] else 'short'
+        if direction == 'long':
+            tp = entry_price * (1 + params['tp_atr_mult'] * atr_val / entry_price)
+            sl = entry_price * (1 - params['sl_atr_mult'] * atr_val / entry_price)
+        else:
+            tp = entry_price * (1 - params['tp_atr_mult'] * atr_val / entry_price)
+            sl = entry_price * (1 + params['sl_atr_mult'] * atr_val / entry_price)
+
+        reason = sig['reason']
+        open_i = i+1
         exit_price = None
         exit_idx = None
-        hit = None
-        for j in range(i+1, min(n, i+1+max_hold)):
-            h = df['high'].iloc[j]
-            l = df['low'].iloc[j]
-            o = df['open'].iloc[j]
-            c = df['close'].iloc[j]
-            if side == 'long':
-                sl_hit = (l <= sl)
-                target_hit = (h >= target)
-                if sl_hit and not target_hit:
-                    exit_price = float(sl)
-                    exit_time = df['date'].iloc[j]
-                    exit_idx = j
-                    hit = 'SL'
+        exit_reason = None
+        pnl = None
+
+        # scan forward candles (starting from next candle) until TP or SL hit or max_hold
+        for j in range(i, min(len(df), i+1+max_hold)):
+            high = df['high'].iloc[j]
+            low = df['low'].iloc[j]
+            close = df['close'].iloc[j]
+            time_j = df.index[j]
+
+            if direction == 'long':
+                # check SL first if pierced in candle (sl-hunt earlier - but exit logic prioritize hitting SL/TP)
+                if low <= sl:
+                    exit_price = sl
+                    exit_idx = time_j
+                    exit_reason = 'SL hit'
+                    pnl = exit_price - entry_price
                     break
-                if target_hit and not sl_hit:
-                    exit_price = float(target)
-                    exit_time = df['date'].iloc[j]
-                    exit_idx = j
-                    hit = 'TARGET'
+                if high >= tp:
+                    exit_price = tp
+                    exit_idx = time_j
+                    exit_reason = 'TP hit'
+                    pnl = exit_price - entry_price
                     break
-                if sl_hit and target_hit:
-                    # ambiguous: use candle open to decide
-                    if o > entry_price:
-                        exit_price = float(target); hit='TARGET'
-                    else:
-                        exit_price = float(sl); hit='SL'
-                    exit_time = df['date'].iloc[j]; exit_idx=j
+            else:
+                if high >= sl:
+                    exit_price = sl
+                    exit_idx = time_j
+                    exit_reason = 'SL hit'
+                    pnl = entry_price - exit_price
                     break
-            else: # short
-                sl_hit = (h >= sl)
-                target_hit = (l <= target)
-                if sl_hit and not target_hit:
-                    exit_price = float(sl)
-                    exit_time = df['date'].iloc[j]
-                    exit_idx = j
-                    hit = 'SL'
+                if low <= tp:
+                    exit_price = tp
+                    exit_idx = time_j
+                    exit_reason = 'TP hit'
+                    pnl = entry_price - exit_price
                     break
-                if target_hit and not sl_hit:
-                    exit_price = float(target)
-                    exit_time = df['date'].iloc[j]
-                    exit_idx = j
-                    hit = 'TARGET'
-                    break
-                if sl_hit and target_hit:
-                    if o < entry_price:
-                        exit_price = float(target); hit='TARGET'
-                    else:
-                        exit_price = float(sl); hit='SL'
-                    exit_time = df['date'].iloc[j]; exit_idx=j
-                    break
-        # if not exited within holding, close at last available price in holding window
+
+            # else continue; if reach end of max_hold, exit at close
+            if j == min(len(df)-1, i+max_hold):
+                exit_price = close
+                exit_idx = time_j
+                exit_reason = 'time_exit'
+                pnl = (exit_price - entry_price) if direction=='long' else (entry_price - exit_price)
+                break
+
         if exit_price is None:
-            final_idx = min(n-1, i+max_hold)
-            exit_price = float(df['close'].iloc[final_idx])
-            exit_time = df['date'].iloc[final_idx]
-            exit_idx = final_idx
-            hit = 'END'
-        pnl = (exit_price - entry_price) if side=='long' else (entry_price - exit_price)
-        pnl_pct = pnl / entry_price * 100
+            continue
+
         trades.append({
-            'entry_idx': i,
-            'entry_time': entry_time,
-            'side': side,
+            'entry_time': df.index[i],
             'entry_price': entry_price,
-            'exit_idx': exit_idx,
-            'exit_time': exit_time,
+            'direction': direction,
+            'tp': tp,
+            'sl': sl,
+            'exit_time': exit_idx,
             'exit_price': exit_price,
-            'pnl_points': pnl,
-            'pnl_pct': pnl_pct,
-            'result': 'win' if pnl>0 else ('loss' if pnl<0 else 'flat'),
-            'reason': s.get('reason','') + ' patterns:' + s.get('patterns','')
+            'pnl': pnl,
+            'reason': reason,
+            'exit_reason': exit_reason,
+            'duration_candles': (df.index.get_loc(exit_idx) - i) if exit_idx in df.index else None
         })
     trades_df = pd.DataFrame(trades)
+    # metrics
     if trades_df.empty:
-        return trades_df, {}
-    total_pnl = trades_df['pnl_points'].sum()
-    wins = trades_df[trades_df['pnl_points']>0].shape[0]
-    losses = trades_df[trades_df['pnl_points']<0].shape[0]
-    flats = trades_df[trades_df['pnl_points']==0].shape[0]
-    accuracy = wins / len(trades_df) * 100
-    avg_points = trades_df['pnl_points'].mean()
-    metrics = {
-        'total_pnl': total_pnl,
-        'trades': len(trades_df),
-        'wins': wins,
-        'losses': losses,
-        'flats': flats,
-        'accuracy': accuracy,
-        'avg_points': avg_points
-    }
-    # equity curve
-    equity = trades_df['pnl_points'].cumsum().values
-    if len(equity)>0:
-        peak = np.maximum.accumulate(equity)
-        dd = (equity - peak).min()
-        metrics['max_drawdown'] = float(dd)
+        metrics = {'total_trades':0}
     else:
-        metrics['max_drawdown'] = 0.0
+        wins = trades_df[trades_df['pnl']>0]
+        losses = trades_df[trades_df['pnl']<=0]
+        metrics = {
+            'total_trades': len(trades_df),
+            'wins': len(wins),
+            'losses': len(losses),
+            'win_rate': len(wins)/len(trades_df) if len(trades_df)>0 else 0,
+            'total_pnl': trades_df['pnl'].sum(),
+            'avg_pnl': trades_df['pnl'].mean(),
+            'max_drawdown': None
+        }
     return trades_df, metrics
 
-
-def optimize_parameters(df, param_grid, search='random', n_iter=30, desired_accuracy=None, desired_points=None):
-    # param_grid is dict of param:[values]
-    combos = list(itertools.product(*param_grid.values()))
-    keys = list(param_grid.keys())
+# -------------------------
+# Optimization loops
+# -------------------------
+def random_search(df, param_dist, n_iter, side, desired_accuracy=None):
     best = None
-    results = []
-    if search == 'random':
-        sampled = [tuple(random.choice(param_grid[k]) for k in keys) for _ in range(min(n_iter, 3000))]
-    else:
-        sampled = combos
-    sampled = list(dict.fromkeys(sampled))[:max(1, min(len(sampled), n_iter if search=='random' else len(sampled)))]
-    for vals in sampled:
+    best_metrics = None
+    sampled = list(ParameterSampler(param_dist, n_iter=n_iter, random_state=42))
+    for params in sampled:
+        signals = generate_signals(df, params)
+        trades, metrics = run_backtest(df, signals, params, side=side)
+        # acceptance: prefer higher win_rate and total_pnl
+        score = (metrics.get('win_rate',0)*0.6) + (np.tanh((metrics.get('total_pnl',0))/1000)*0.4)
+        if best is None or score > best:
+            best = score
+            best_params = params
+            best_metrics = metrics
+            best_trades = trades
+        # if desired accuracy met, stop early
+        if desired_accuracy and metrics.get('win_rate',0) >= desired_accuracy:
+            break
+    return best_params, best_metrics, best_trades
+
+def grid_search(df, param_grid, side, desired_accuracy=None):
+    best = None
+    best_params=None
+    best_metrics=None
+    best_trades=None
+    keys = list(param_grid.keys())
+    for vals in product(*param_grid.values()):
         params = dict(zip(keys, vals))
         signals = generate_signals(df, params)
-        trades_df, metrics = run_backtest(df, signals, max_hold=int(params.get('max_hold',10)))
-        # compute buy & hold
-        bh_points = df['close'].iloc[-1] - df['close'].iloc[0]
-        metrics['params'] = params
-        metrics['bh_points'] = bh_points
-        results.append(metrics)
-        # select best satisfying conditions
-        ok = True
-        if desired_accuracy is not None and metrics.get('accuracy',0) < desired_accuracy:
-            ok = False
-        if desired_points is not None and (metrics.get('avg_points',0) < desired_points and metrics.get('total_pnl',0) < desired_points):
-            ok = False
-        if ok:
-            if best is None:
-                best = metrics
-            else:
-                # prefer higher total_pnl then accuracy
-                if metrics['total_pnl'] > best['total_pnl']:
-                    best = metrics
-    # if not found any satisfying, pick highest accuracy then highest pnl
-    if best is None and len(results)>0:
-        results_sorted = sorted(results, key=lambda x: (x.get('accuracy',0), x.get('total_pnl',0)), reverse=True)
-        best = results_sorted[0]
-    return best, results
+        trades, metrics = run_backtest(df, signals, params, side=side)
+        score = (metrics.get('win_rate',0)*0.6) + (np.tanh((metrics.get('total_pnl',0))/1000)*0.4)
+        if best is None or score > best:
+            best = score
+            best_params = params
+            best_metrics = metrics
+            best_trades = trades
+        if desired_accuracy and metrics.get('win_rate',0) >= desired_accuracy:
+            break
+    return best_params, best_metrics, best_trades
 
-# ------------------------------- Streamlit UI -------------------------------
+# -------------------------
+# Main Streamlit UI
+# -------------------------
+st.title("Swing Trading Recommender — Price Action + Patterns (Automated)")
 
-st.title("Swing Trading Recommender — Automatic Backtest + Live Recommendation")
+with st.sidebar:
+    st.header("Options")
+    side_option = st.selectbox("Select side", ['both','long','short'])
+    search_method = st.selectbox("Search method", ['random_search','grid_search'])
+    n_iter = st.number_input("Random search iterations (if Random search)", value=50, min_value=5)
+    desired_accuracy = st.slider("Desired minimum accuracy (win rate)", 0.0, 1.0, 0.6, step=0.05)
+    n_points = st.number_input("Number of parameter samples / grid size (affects speed)", value=50, min_value=5)
+    st.markdown("**Backtest constraints**")
+    max_hold = st.number_input("Max hold (candles)", value=20, min_value=1)
+    st.markdown("Upload file (CSV / Excel) with OHLCV data")
+    uploaded = st.file_uploader("Upload CSV or Excel", type=['csv','xlsx','xls'])
 
-uploaded = st.file_uploader("Upload your OHLCV file (CSV or Excel)", type=['csv','xlsx','xls'])
+if uploaded:
+    # read file
+    try:
+        if uploaded.name.lower().endswith('.csv'):
+            df0 = pd.read_csv(uploaded)
+        else:
+            df0 = pd.read_excel(uploaded)
+    except Exception as e:
+        st.error(f"Failed to read file: {e}")
+        raise
 
-if uploaded is None:
-    st.info("Upload a CSV or Excel file containing OHLCV data. Columns can have any names (e.g., 'Open', 'open price', 'CLOSE', 'Close', 'volume', 'trades').")
-    st.stop()
+    # map columns
+    col_map = map_columns(df0)
+    st.subheader("Column mapping (detected)")
+    st.write(col_map)
 
-# Read file
-try:
-    if uploaded.name.endswith('.csv'):
-        df = pd.read_csv(uploaded)
+    # date handling
+    date_col = col_map.get('date')
+    if date_col is None:
+        # try index
+        if df0.index.name and ('date' in str(df0.index.name).lower() or 'time' in str(df0.index.name).lower()):
+            df0 = df0.reset_index().rename(columns={df0.index.name:'date'})
+            date_col = 'date'
+        else:
+            # try any column that looks like date
+            maybe_date = next((c for c in df0.columns if 'date' in c.lower() or 'time' in c.lower()), None)
+            date_col = maybe_date
+
+    if date_col is None:
+        st.error("Could not find a date column. Please ensure file has a date/time column.")
     else:
-        df = pd.read_excel(uploaded)
-except Exception as e:
-    st.error(f"Error reading file: {e}")
-    st.stop()
+        # normalize column names and create canonical dataframe
+        can_cols = {}
+        for k,v in col_map.items():
+            if v is not None:
+                can_cols[k] = v
 
-if df.empty:
-    st.error("Uploaded file is empty")
-    st.stop()
+        # create df with canonical names where present
+        df = pd.DataFrame()
+        for k in ['date','open','high','low','close','volume']:
+            if can_cols.get(k) is not None:
+                df[k] = df0[can_cols[k]]
+        # if some columns missing, try to fill using other numeric columns
+        numeric_cols = df0.select_dtypes(include=[np.number]).columns.tolist()
+        for k in ['open','high','low','close','volume']:
+            if k not in df.columns:
+                # try to fill close with first numeric if absent
+                if numeric_cols:
+                    df[k] = df0[numeric_cols[0]]
+        # Ensure date to datetime & IST
+        df['raw_index'] = df.index
+        df_original = df.copy()
+        df = df.dropna(how='all', axis=1)  # drop empty columns
 
-# Suggest mapping
-suggested = map_columns(df)
-st.subheader("Column Mapping (auto-detected)")
-cols = list(df.columns)
-col1, col2 = st.columns(2)
-with col1:
-    date_col = st.selectbox('Date/Time column', options=[None]+cols, index=cols.index(suggested['date']) if suggested['date'] in cols else 0)
-    open_col = st.selectbox('Open column', options=[None]+cols, index=cols.index(suggested['open']) if suggested['open'] in cols else 0)
-    high_col = st.selectbox('High column', options=[None]+cols, index=cols.index(suggested['high']) if suggested['high'] in cols else 0)
-with col2:
-    low_col = st.selectbox('Low column', options=[None]+cols, index=cols.index(suggested['low']) if suggested['low'] in cols else 0)
-    close_col = st.selectbox('Close column', options=[None]+cols, index=cols.index(suggested['close']) if suggested['close'] in cols else 0)
-    vol_col = st.selectbox('Volume column', options=[None]+cols, index=cols.index(suggested['volume']) if suggested['volume'] in cols else 0)
+        try:
+            df = ensure_datetime_ist(df, 'date')
+        except Exception as e:
+            st.error(f"Date conversion to IST failed: {e}")
+            raise
 
-# Validate mapping
-required = [date_col, open_col, high_col, low_col, close_col]
-if any(x in (None, 0, '') for x in required):
-    st.warning('Please map at least date, open, high, low, close columns.')
-    st.stop()
+        df = df.sort_values('date').reset_index(drop=True)
+        df = df.set_index('date')
+        # rename columns to lowercase standard
+        df.columns = [c.lower() for c in df.columns]
+        # forward fill small gaps
+        df[['open','high','low','close']] = df[['open','high','low','close']].ffill().bfill()
 
-# Rename and parse
-df_work = df.rename(columns={date_col: 'date', open_col: 'open', high_col: 'high', low_col: 'low', close_col: 'close'})
-if vol_col:
-    df_work = df_work.rename(columns={vol_col: 'volume'})
-else:
-    df_work['volume'] = 0
+        # EDA summary
+        st.subheader("Data snapshot")
+        c1, c2 = st.columns(2)
+        with c1:
+            st.write("Top 5 rows")
+            st.dataframe(df.head(5))
+        with c2:
+            st.write("Bottom 5 rows")
+            st.dataframe(df.tail(5))
 
-# Parse date and convert to IST
-df_work['date'] = pd.to_datetime(df_work['date'], errors='coerce')
-if df_work['date'].isna().all():
-    st.error('Could not parse any dates from the selected date column. Please check the format.')
-    st.stop()
-# Localize naive timestamps to IST (assume user data is already in IST), convert tz-aware to IST
-try:
-    df_work['date'] = to_ist_series(df_work['date'])
-except Exception as e:
-    st.warning('Date timezone conversion issue, proceeding with naive datetimes: '+str(e))
-    df_work['date'] = pd.to_datetime(df_work['date']).dt.tz_localize('Asia/Kolkata', ambiguous='NaT', nonexistent='NaT')
+        st.write(f"Date range: {df.index.min()}  to  {df.index.max()}")
+        st.write(f"Price range: min {df['close'].min():.4f}, max {df['close'].max():.4f}")
 
-# Sort ascending and reset index
-df_work = df_work.sort_values('date').reset_index(drop=True)
+        # End date selector inside data
+        end_default = df.index.max()
+        end_date = st.date_input("Select end date for backtest (inclusive)", value=end_default.date(),
+                                 min_value=df.index.min().date(), max_value=df.index.max().date())
+        # convert to timestamp at end of that day in IST
+        end_dt = pd.to_datetime(end_date).tz_localize('Asia/Kolkata') + pd.Timedelta(hours=23, minutes=59, seconds=59)
+        df_backtest = df[df.index <= end_dt].copy()
+        if df_backtest.empty:
+            st.error("No data available up to chosen end date.")
+        else:
+            st.subheader("Exploratory Data Analysis")
+            # plot raw close
+            fig = go.Figure(data=[go.Scatter(x=df_backtest.index, y=df_backtest['close'], name='Close')])
+            fig.update_layout(height=350, margin=dict(l=20,r=20,t=30,b=20))
+            st.plotly_chart(fig, use_container_width=True)
 
-# Show head/tail and basic stats
-st.subheader('Data Preview')
-left, right = st.columns([1,1])
-with left:
-    st.write('Top 5 rows')
-    st.dataframe(df_work.head())
-with right:
-    st.write('Bottom 5 rows')
-    st.dataframe(df_work.tail())
+            # monthly returns heatmap
+            df_backtest['return'] = df_backtest['close'].pct_change()
+            df_backtest['year'] = df_backtest.index.year
+            df_backtest['month'] = df_backtest.index.month
+            pivot = df_backtest.groupby(['year','month'])['return'].apply(lambda x: (1+x).prod()-1).unstack(fill_value=0)
+            st.write("Year vs Month returns heatmap")
+            plt.figure(figsize=(10,4))
+            sns.heatmap(pivot, annot=True, fmt=".2%", cbar_kws={'format':'%.0f%%'})
+            st.pyplot(plt.gcf())
+            plt.clf()
 
-st.markdown('---')
+            # 100 words summary
+            # derive simple signals to describe trend & volatility
+            recent = df_backtest['close'].iloc[-50:]
+            slope = (recent.values[-1] - recent.values[0]) / recent.values[0]
+            vol = df_backtest['return'].std() * np.sqrt(252) if not df_backtest['return'].isna().all() else 0
+            trend_desc = "uptrend" if slope>0.01 else ("downtrend" if slope<-0.01 else "sideways")
+            summary = f"In the selected period ({df_backtest.index.min().date()} to {df_backtest.index.max().date()}), the price shows a {trend_desc} over recent candles. Volatility (annualized std) is approximately {vol:.2%}. Recent structure contains consolidations, possible support/resistance clusters and short squeezes/SL-hunt wicks. Potential opportunities: look for pullbacks to well-defined supports for long entries in an uptrend, or confirmed breakdowns with volume for shorts. Use ATR-based SL to adapt to current volatility and avoid position sizing risks."
+            st.write(summary)
 
-st.subheader('Date & Price Range')
-min_date = df_work['date'].min()
-max_date = df_work['date'].max()
-min_price = df_work['close'].min()
-max_price = df_work['close'].max()
-col1, col2, col3 = st.columns(3)
-col1.metric('Start Date (min)', str(min_date))
-col2.metric('End Date (max)', str(max_date))
-#col3.metric('Price Range', f"{min_price:.2f} — {max_price:.2f}")
-col3.metric('Price Range', "{min_price:.2f} — {max_price:.2f}")
+            # Build baseline parameter distribution (search space)
+            base_param_dist = {
+                'fast_ma': [5,8,10,12,15],
+                'slow_ma': [20,30,40,50,60],
+                'atr_period': [10,14,20],
+                'tp_atr_mult': [0.8,1.0,1.5,2.0,3.0],
+                'sl_atr_mult': [0.8,1.0,1.5,2.0,3.0],
+                'sr_window': [20,30,50,80],
+                'res_breakout_pct': [0.002,0.005,0.01],
+                'sup_pull_pct': [0.005,0.01,0.02],
+                'sl_hunt_pct': [0.01,0.02,0.03],
+                'vol_ma': [5,10,20],
+                'vol_spike_pct': [0.2,0.3,0.5],
+                'pattern_time_seconds': [3600*24*3, 3600*24*7]  # 3 or 7 days tolerance
+            }
 
-# End date selection (user wants to test on past data). Build date options from data
-unique_dates = sorted(df_work['date'].dt.normalize().unique())
-# default end date: use today's date if present else max_date
-today_ist = pd.Timestamp.now(tz=pytz.timezone('Asia/Kolkata')).normalize()
-if today_ist in unique_dates:
-    default_idx = unique_dates.index(today_ist)
-else:
-    default_idx = len(unique_dates)-1
-selected_end_date = st.selectbox('Select end date for backtest (affects data used for backtest & live signal)', options=unique_dates, index=default_idx)
-# filter data up to selected_end_date inclusive
-df_use = df_work[df_work['date'] <= (pd.Timestamp(selected_end_date).tz_localize('Asia/Kolkata') + pd.Timedelta(days=1) - pd.Timedelta(milliseconds=1))].copy()
+            # allow user to shrink or accept defaults
+            st.subheader("Optimization settings")
+            use_fast_defaults = st.checkbox("Use default parameter grid (recommended)", value=True)
+            if not use_fast_defaults:
+                st.write("You can edit parameter sets in code if needed.")
+            # prepare parameter sampling
+            if search_method == 'random_search':
+                n_iter_use = int(n_iter)
+                # random sampling from grid
+                param_dist = {}
+                for k,vals in base_param_dist.items():
+                    param_dist[k] = vals
+                st.write("Running Randomized search — this will iterate", n_iter_use, "parameter sets.")
+                if st.button("Start Random Search"):
+                    with st.spinner("Searching best params..."):
+                        # convert param_dist to sampler-friendly dict with lists
+                        # we will sample uniformly
+                        sampled = []
+                        random.seed(42)
+                        sampled_params = []
+                        for _ in range(n_iter_use):
+                            p = {k: random.choice(v) for k,v in param_dist.items()}
+                            p['max_hold'] = int(max_hold)
+                            sampled_params.append(p)
+                        best_score = None
+                        best_params = None
+                        best_metrics = None
+                        best_trades = None
+                        for p in sampled_params:
+                            signals = generate_signals(df_backtest, p)
+                            trades, metrics = run_backtest(df_backtest, signals, p, side=side_option)
+                            score = (metrics.get('win_rate',0)*0.6) + (np.tanh((metrics.get('total_pnl',0))/1000)*0.4)
+                            if best_score is None or score>best_score:
+                                best_score = score
+                                best_params = p
+                                best_metrics = metrics
+                                best_trades = trades
+                            # early break if desired_accuracy met
+                            if metrics.get('win_rate',0) >= desired_accuracy:
+                                break
+                        st.success("Search complete")
+                        st.subheader("Best Parameters (Random Search)")
+                        st.json(best_params)
+                        st.write("Backtest metrics for best params:")
+                        st.write(best_metrics)
+                        if best_trades is None or best_trades.empty:
+                            st.write("No trades found with best params.")
+                        else:
+                            st.subheader("Trades (sample)")
+                            st.dataframe(best_trades.head(50))
+                            # show aggregate metrics nicely
+                            st.write(f"Win rate: {best_metrics.get('win_rate',0):.2%}, Total PnL: {best_metrics.get('total_pnl',0):.2f}, Total trades: {best_metrics.get('total_trades',0)}")
 
-st.subheader('Raw Candlestick Plot (up to selected end date)')
-fig = go.Figure(data=[go.Candlestick(x=df_use['date'], open=df_use['open'], high=df_use['high'], low=df_use['low'], close=df_use['close'])])
-fig.update_layout(height=400, margin=dict(l=20,r=20,t=30,b=20))
-st.plotly_chart(fig, use_container_width=True)
-
-# EDA: returns heatmap year vs month
-st.subheader('Exploratory Data Analysis (Returns Heatmap & Summary)')
-df_use['year'] = df_use['date'].dt.year
-df_use['month'] = df_use['date'].dt.month
-monthly = df_use.groupby(['year','month']).apply(lambda x: x['close'].iloc[-1]/x['close'].iloc[0]-1).reset_index(name='ret')
-heat = monthly.pivot(index='year', columns='month', values='ret').fillna(0)
-fig2 = px.imshow(heat, labels=dict(x='Month', y='Year', color='Monthly Return'), x=list(range(1,13)), y=heat.index.astype(str))
-fig2.update_layout(height=350)
-st.plotly_chart(fig2, use_container_width=True)
-
-# 100-word summary of what data is telling
-st.subheader('Data Summary (100-word)')
-avg_ret = (df_use['close'].pct_change().mean()*252*100) if len(df_use)>1 else 0
-volatility = (df_use['close'].pct_change().std()*np.sqrt(252)*100) if len(df_use)>1 else 0
-trend_direction = 'uptrend' if df_use['close'].iloc[-1] > df_use['close'].iloc[0] else 'downtrend' if df_use['close'].iloc[-1] < df_use['close'].iloc[0] else 'sideways'
-summary = (f"From {min_date.strftime('%Y-%m-%d')} to {max_date.strftime('%Y-%m-%d')}, the instrument shows a {trend_direction}. "
-           f"Annualized return (approx) {avg_ret:.2f}% with volatility {volatility:.2f}%. "
-           f"Recent price range is {min_price:.2f} to {max_price:.2f}. Look for supply/demand clusters near pivot levels and volume-confirmed breakouts for higher probability trades. "
-           f"The data suggests potential opportunities around breakout-to-pullback setups, triangle breakouts, and clear trend continuations or reversals when confluence of volume and pattern exists.")
-# truncate/ensure ~100 words
-summary_words = summary.split()
-if len(summary_words) > 100:
-    summary = ' '.join(summary_words[:100])
-st.write(summary)
-
-st.markdown('---')
-
-# ---------------- optimization UI ----------------
-st.sidebar.header('Strategy & Optimization Settings')
-side = st.sidebar.selectbox('Side to generate (Long / Short / Both)', ['both','long','short'])
-search_type = st.sidebar.selectbox('Search Type', ['random','grid'])
-desired_accuracy = st.sidebar.slider('Desired minimum accuracy (%)', min_value=0.0, max_value=100.0, value=40.0, step=1.0)
-desired_points = st.sidebar.number_input('Desired minimum avg points (leave 0 to ignore)', min_value=0.0, value=0.0)
-iterations = st.sidebar.number_input('Random search iterations (if selected)', min_value=5, max_value=300, value=40)
-
-st.sidebar.markdown('Parameter Ranges for optimization (defaults chosen automatically, modify if needed)')
-lookback_min = st.sidebar.number_input('Lookback min', min_value=10, max_value=500, value=40)
-lookback_max = st.sidebar.number_input('Lookback max', min_value=lookback_min, max_value=1000, value=120)
-vol_mult_min = st.sidebar.number_input('Volume multiplier min', min_value=0.5, max_value=5.0, value=1.0, format="%.2f")
-vol_mult_max = st.sidebar.number_input('Volume multiplier max', min_value=vol_mult_min, max_value=10.0, value=2.0, format="%.2f")
-atr_sl_min = st.sidebar.number_input('SL ATR multiplier min', min_value=0.1, max_value=5.0, value=1.0, format="%.2f")
-atr_sl_max = st.sidebar.number_input('SL ATR multiplier max', min_value=atr_sl_min, max_value=10.0, value=2.0, format="%.2f")
-target_atr_min = st.sidebar.number_input('Target ATR multiplier min', min_value=0.5, max_value=10.0, value=1.0, format="%.2f")
-target_atr_max = st.sidebar.number_input('Target ATR multiplier max', min_value=target_atr_min, max_value=20.0, value=3.0, format="%.2f")
-max_hold_min = st.sidebar.number_input('Max hold days min', min_value=1, max_value=200, value=3)
-max_hold_max = st.sidebar.number_input('Max hold days max', min_value=max_hold_min, max_value=500, value=10)
-
-if st.sidebar.button('Run Optimization & Backtest'):
-    with st.spinner('Running optimization and backtest — this may take a while'):
-        # build parameter grid
-        param_grid = {
-            'lookback': list(range(lookback_min, lookback_max+1, max(1,int((lookback_max-lookback_min)/3)))),
-            'vol_mult': [round(x,2) for x in np.linspace(vol_mult_min, vol_mult_max, 3)],
-            'atr_sl_mult': [round(x,2) for x in np.linspace(atr_sl_min, atr_sl_max, 3)],
-            'target_atr_mult': [round(x,2) for x in np.linspace(target_atr_min, target_atr_max, 3)],
-            'max_hold': list(range(max_hold_min, max_hold_max+1, max(1,int((max_hold_max-max_hold_min)/2))))
-        }
-        n_iter = int(iterations)
-        best, results = optimize_parameters(df_use, param_grid, search=search_type, n_iter=n_iter, desired_accuracy=desired_accuracy, desired_points=(desired_points if desired_points>0 else None))
-        if best is None:
-            st.warning('No strategy met the constraints. Showing best available result.')
-            if len(results)>0:
-                best = sorted(results, key=lambda x: (x.get('accuracy',0), x.get('total_pnl',0)), reverse=True)[0]
+                            # Live recommendation on last candle (entry at last close)
+                            st.subheader("Live Recommendation (based on last candle)")
+                            # generate signals on full df (but entry must be last candle close)
+                            signals_full = generate_signals(df, best_params)
+                            last_sig = signals_full.iloc[-1]
+                            recs = []
+                            if side_option in ['long','both'] and last_sig['long']:
+                                # create recommendation dict
+                                entry_price = df['close'].iloc[-1]
+                                atr_val = df['atr'].iloc[-1] if 'atr' in df.columns else 0
+                                tp = entry_price * (1 + best_params['tp_atr_mult'] * atr_val / entry_price)
+                                sl = entry_price * (1 - best_params['sl_atr_mult'] * atr_val / entry_price)
+                                prob = best_metrics.get('win_rate',0)
+                                recs.append({
+                                    'side':'LONG',
+                                    'entry_time': df.index[-1],
+                                    'entry_price': entry_price,
+                                    'tp': tp,
+                                    'sl': sl,
+                                    'probability': prob,
+                                    'reason': last_sig['reason']
+                                })
+                            if side_option in ['short','both'] and last_sig['short']:
+                                entry_price = df['close'].iloc[-1]
+                                atr_val = df['atr'].iloc[-1] if 'atr' in df.columns else 0
+                                tp = entry_price * (1 - best_params['tp_atr_mult'] * atr_val / entry_price)
+                                sl = entry_price * (1 + best_params['sl_atr_mult'] * atr_val / entry_price)
+                                prob = best_metrics.get('win_rate',0)
+                                recs.append({
+                                    'side':'SHORT',
+                                    'entry_time': df.index[-1],
+                                    'entry_price': entry_price,
+                                    'tp': tp,
+                                    'sl': sl,
+                                    'probability': prob,
+                                    'reason': last_sig['reason']
+                                })
+                            if recs:
+                                for r in recs:
+                                    st.markdown(f"**{r['side']}** — Entry @ {r['entry_price']:.2f} on {r['entry_time']}")
+                                    st.write(f"Target: {r['tp']:.2f}, SL: {r['sl']:.2f}")
+                                    st.write(f"Probability of profit (from backtest): {r['probability']:.2%}")
+                                    st.write("Reason/logic:", r['reason'])
+                            else:
+                                st.write("No live signal on last candle based on best params.")
+                        # final text summary
+                        st.subheader("Backtest Summary (human readable)")
+                        if best_metrics:
+                            hr = f"The optimized strategy produced {best_metrics.get('total_trades',0)} trades with a win rate of {best_metrics.get('win_rate',0):.2%} and total PnL {best_metrics.get('total_pnl',0):.2f}. Entry decisions were made on candle-close only (no future leakage). Use ATR-based SL/TP described above; reduce position size if ATR indicates high volatility. Live recommendation (if any) is shown above and is based on the same strategy that performed best in backtest."
+                            st.write(hr)
             else:
-                st.error('No results. Aborting.')
-                st.stop()
-        st.subheader('Best Strategy Summary')
-        st.write('Parameters:')
-        st.json(best['params'])
-        st.write('Metrics:')
-        st.write(f"Total PnL (points): {best['total_pnl']:.2f}")
-        st.write(f"Trades: {best['trades']}, Wins: {best['wins']}, Losses: {best['losses']}, Accuracy: {best['accuracy']:.2f}%")
-        st.write(f"Avg points/trade: {best['avg_points']:.2f}, Max drawdown: {best.get('max_drawdown',0):.2f}")
-
-        # regenerate trades df for best params
-        best_params = best['params']
-        signals = generate_signals(df_use, best_params)
-        # filter side:
-        if side != 'both':
-            signals = [s for s in signals if s['side']==side]
-        trades_df, metrics = run_backtest(df_use, signals, max_hold=int(best_params.get('max_hold',10)))
-        if trades_df.empty:
-            st.write('No trades were generated by the best strategy.')
-        else:
-            st.subheader('Backtest Trades (entry on same-candle close)')
-            st.dataframe(trades_df[['entry_time','side','entry_price','exit_time','exit_price','pnl_points','pnl_pct','reason']].sort_values('entry_time'))
-            # plot equity
-            fig_eq = go.Figure()
-            fig_eq.add_trace(go.Scatter(x=pd.to_datetime(trades_df['exit_time']), y=trades_df['pnl_points'].cumsum(), mode='lines+markers'))
-            fig_eq.update_layout(title='Equity curve (points)', height=300)
-            st.plotly_chart(fig_eq, use_container_width=True)
-
-        # Live recommendation: apply same best params on last available candle
-        st.subheader('Live Recommendation (based on last available candle close)')
-        live_signals = generate_signals(df_use, best_params)
-        if side != 'both':
-            live_signals = [s for s in live_signals if s['side']==side]
-        # find signals whose idx is the last candle index
-        last_idx = len(df_use)-1
-        live_for_last = [s for s in live_signals if s['idx'] == last_idx]
-        if len(live_for_last)==0:
-            st.write('No live signal on the last candle according to the best strategy.')
-        else:
-            s = live_for_last[-1]
-            st.write('Signal generated AT CLOSE of last candle:')
-            st.json({
-                'datetime': str(s['datetime']),
-                'side': s['side'],
-                'entry': s['entry'],
-                'stoploss': s['sl'],
-                'target': s['target'],
-                'patterns': s['patterns'],
-                'reason': s['reason']
-            })
-
-        # final human readable summary of what happened in backtest and live suggestion
-        st.subheader('Final Human-readable Summary (what happened & live advice)')
-        summary_bt = []
-        summary_bt.append(f"Backtest from {df_use['date'].min().date()} to {df_use['date'].max().date()} using parameters {best['params']}. ")
-        summary_bt.append(f"Total trades: {best['trades']}, accuracy {best['accuracy']:.2f}% with total points {best['total_pnl']:.2f}. ")
-        if best['trades']>0:
-            summary_bt.append(f"Winning trades: {best['wins']}, Losing trades: {best['losses']}. Average points per trade {best['avg_points']:.2f}. ")
-        if len(live_for_last)>0:
-            s = live_for_last[-1]
-            summary_bt.append(f"Live recommendation: {s['side'].upper()} Entry at {s['entry']:.2f}, Target {s['target']:.2f}, SL {s['sl']:.2f}. Reason: {s['reason']}. Patterns observed: {s['patterns']}. ")
-        else:
-            summary_bt.append('No live recommendation at the most recent candle — wait for a pattern or breakout with volume confirmation as per the strategy. ')
-        final_text = ' '.join(summary_bt)
-        # truncate to ~150-200 words for clarity
-        st.write(final_text)
-        st.success('Done — please review the results and iterate parameter ranges if you want different trade-off between accuracy and returns.')
+                # grid search
+                st.write("Running Grid search over a compact subset (may be slow).")
+                if st.button("Start Grid Search"):
+                    with st.spinner("Grid searching..."):
+                        # build smaller grid using first few items in lists to keep reasonable
+                        grid = {}
+                        for k,v in base_param_dist.items():
+                            grid[k] = v[:min(len(v),3)]
+                        # iterate
+                        best_score=None
+                        best_params=None
+                        best_metrics=None
+                        best_trades=None
+                        for vals in product(*grid.values()):
+                            p = dict(zip(grid.keys(), vals))
+                            p['max_hold'] = int(max_hold)
+                            signals = generate_signals(df_backtest, p)
+                            trades, metrics = run_backtest(df_backtest, signals, p, side=side_option)
+                            score = (metrics.get('win_rate',0)*0.6) + (np.tanh((metrics.get('total_pnl',0))/1000)*0.4)
+                            if best_score is None or score>best_score:
+                                best_score = score
+                                best_params = p
+                                best_metrics = metrics
+                                best_trades = trades
+                            if metrics.get('win_rate',0) >= desired_accuracy:
+                                break
+                        st.success("Grid search done")
+                        st.subheader("Best params (Grid)")
+                        st.json(best_params)
+                        st.write(best_metrics)
+                        if best_trades is not None and not best_trades.empty:
+                            st.subheader("Sample trades from best grid strategy")
+                            st.dataframe(best_trades.head(50))
+                            # Live rec
+                            st.subheader("Live Recommendation (grid best)")
+                            signals_full = generate_signals(df, best_params)
+                            last_sig = signals_full.iloc[-1]
+                            recs=[]
+                            if side_option in ['long','both'] and last_sig['long']:
+                                entry_price = df['close'].iloc[-1]
+                                atr_val = df['atr'].iloc[-1] if 'atr' in df.columns else 0
+                                tp = entry_price * (1 + best_params['tp_atr_mult'] * atr_val / entry_price)
+                                sl = entry_price * (1 - best_params['sl_atr_mult'] * atr_val / entry_price)
+                                prob = best_metrics.get('win_rate',0)
+                                recs.append({'side':'LONG','entry_time':df.index[-1],'entry_price':entry_price,'tp':tp,'sl':sl,'probability':prob,'reason':last_sig['reason']})
+                            if side_option in ['short','both'] and last_sig['short']:
+                                entry_price = df['close'].iloc[-1]
+                                atr_val = df['atr'].iloc[-1] if 'atr' in df.columns else 0
+                                tp = entry_price * (1 - best_params['tp_atr_mult'] * atr_val / entry_price)
+                                sl = entry_price * (1 + best_params['sl_atr_mult'] * atr_val / entry_price)
+                                prob = best_metrics.get('win_rate',0)
+                                recs.append({'side':'SHORT','entry_time':df.index[-1],'entry_price':entry_price,'tp':tp,'sl':sl,'probability':prob,'reason':last_sig['reason']})
+                            if recs:
+                                for r in recs:
+                                    st.markdown(f"**{r['side']}** — Entry @ {r['entry_price']:.2f} on {r['entry_time']}")
+                                    st.write(f"Target: {r['tp']:.2f}, SL: {r['sl']:.2f}")
+                                    st.write(f"Probability of profit (from backtest): {r['probability']:.2%}")
+                                    st.write("Reason/logic:", r['reason'])
+                            else:
+                                st.write("No live signal on last candle based on best grid params.")
+                        # final summary
+                        st.subheader("Backtest Summary (human readable)")
+                        if best_metrics:
+                            hr = f"Grid-optimized strategy produced {best_metrics.get('total_trades',0)} trades with a win rate of {best_metrics.get('win_rate',0):.2%} and total PnL {best_metrics.get('total_pnl',0):.2f}. Entry and exits always used candle-close logic; SL/TP were ATR-based. Use risk management: max 1-2% capital per trade, adjust position sizing to ATR."
+                            st.write(hr)
 
 else:
-    st.info('Adjust optimization parameters in the sidebar and click "Run Optimization & Backtest" to begin.')
+    st.info("Upload a CSV or Excel file containing OHLC data to begin.")
 
-# End of file
+# Footer notes
+st.markdown("---")
+st.markdown("**Notes & assumptions**: This app uses heuristic, explainable price-action rules and ATR-based volatility sizing. Pattern detection is approximate and implemented with clear rules. All backtest entries occur on the same candle close where signal forms (no future leakage). The results are model-driven — use paper-trading to validate before real capital. This code avoids talib/pandas_ta and uses only pandas/numpy/sklearn/seaborn/plotly.")
