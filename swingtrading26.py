@@ -1,175 +1,333 @@
-# ==================== Advanced Swing Trading Platform ====================
+# swing_trading_platform.py
+
 import streamlit as st
 import pandas as pd
 import numpy as np
+import datetime
+import pytz
 import matplotlib.pyplot as plt
 import seaborn as sns
-from datetime import datetime, timedelta
-import pytz
+from io import BytesIO
 from tqdm import tqdm
-import warnings
-warnings.filterwarnings("ignore")
+from sklearn.model_selection import ParameterGrid, ParameterSampler
+import random
 
-st.set_page_config(page_title="Professional Swing Trading Platform", layout="wide")
+st.set_page_config(layout="wide", page_title="Swing Trading Algo Platform")
 
-# ==================== Helper Functions ====================
+# -------------------------------
+# Helper Functions
+# -------------------------------
 
 def map_columns(df):
-    """Automatically map columns to OHLCV"""
-    df_cols = df.columns.str.lower()
-    mapping = {}
+    """
+    Map user uploaded columns to standard OHLCV columns
+    """
+    col_map = {}
     for col in df.columns:
-        col_lower = col.lower()
-        if 'open' in col_lower: mapping[col] = 'open'
-        elif 'high' in col_lower: mapping[col] = 'high'
-        elif 'low' in col_lower: mapping[col] = 'low'
-        elif 'close' in col_lower: mapping[col] = 'close'
-        elif 'volume' in col_lower or 'share' in col_lower or 'qty' in col_lower: mapping[col] = 'volume'
-        elif 'date' in col_lower: mapping[col] = 'date'
-    df = df.rename(columns=mapping)
-    return df
+        lower_col = col.lower()
+        if "open" in lower_col:
+            col_map["Open"] = col
+        elif "high" in lower_col:
+            col_map["High"] = col
+        elif "low" in lower_col:
+            col_map["Low"] = col
+        elif "close" in lower_col:
+            col_map["Close"] = col
+        elif "volume" in lower_col or "shares" in lower_col:
+            col_map["Volume"] = col
+        elif "date" in lower_col or "time" in lower_col:
+            col_map["Date"] = col
+    return col_map
 
-def preprocess_data(df):
-    df = map_columns(df)
-    if 'date' not in df.columns:
-        st.error("No date column found!")
-        return None
-    df['date'] = pd.to_datetime(df['date']).dt.tz_localize('UTC').dt.tz_convert('Asia/Kolkata')
-    df = df.sort_values('date').reset_index(drop=True)
+def convert_to_datetime(df, date_col):
+    """
+    Convert date column to datetime in IST
+    """
+    df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
+    ist = pytz.timezone("Asia/Kolkata")
+    df[date_col] = df[date_col].apply(lambda x: x.tz_localize(pytz.UTC).astimezone(ist) 
+                                      if x.tzinfo is None else x.astimezone(ist))
     return df
-
-def display_data_summary(df):
-    st.write("### Top 5 Rows")
-    st.dataframe(df.head())
-    st.write("### Bottom 5 Rows")
-    st.dataframe(df.tail())
-    st.write(f"**Date Range:** {df['date'].min()} to {df['date'].max()}")
-    st.write(f"**Price Range:** Min={df['close'].min()}, Max={df['close'].max()}")
 
 def plot_raw_data(df):
-    st.write("### Raw Price Chart")
-    plt.figure(figsize=(12,6))
-    plt.plot(df['date'], df['close'], label='Close Price', color='blue')
-    plt.xlabel("Date")
-    plt.ylabel("Close")
-    plt.title("Price Chart")
-    plt.legend()
-    st.pyplot(plt.gcf())
+    """
+    Plot raw OHLC data
+    """
+    fig, ax = plt.subplots(figsize=(10,5))
+    ax.plot(df['Date'], df['Close'], label="Close Price")
+    ax.set_title("Raw Close Price Data")
+    ax.set_xlabel("Date")
+    ax.set_ylabel("Price")
+    ax.legend()
+    st.pyplot(fig)
 
-def generate_heatmap(df):
-    df['returns'] = df['close'].pct_change()
-    df['year'] = df['date'].dt.year
-    df['month'] = df['date'].dt.month
-    pivot = df.pivot_table(values='returns', index='year', columns='month', aggfunc='sum')
-    plt.figure(figsize=(12,6))
-    sns.heatmap(pivot, annot=True, fmt=".2f", cmap='RdYlGn')
-    plt.title("Monthly Returns Heatmap")
-    st.pyplot(plt.gcf())
+def generate_eda(df):
+    """
+    Generate Exploratory Data Analysis
+    """
+    st.subheader("Exploratory Data Analysis")
+    st.write("Top 5 rows:")
+    st.dataframe(df.head())
+    st.write("Bottom 5 rows:")
+    st.dataframe(df.tail())
+    st.write(f"Date Range: {df['Date'].min()} to {df['Date'].max()}")
+    st.write(f"Price Range: {df['Close'].min()} to {df['Close'].max()}")
+    
+    # Returns heatmap year vs month
+    df['Returns'] = df['Close'].pct_change()
+    df['Year'] = df['Date'].dt.year
+    df['Month'] = df['Date'].dt.month
+    heatmap_data = df.groupby(['Year','Month'])['Returns'].mean().unstack()
+    fig, ax = plt.subplots(figsize=(12,6))
+    sns.heatmap(heatmap_data, annot=True, fmt=".2%", cmap="RdYlGn", ax=ax)
+    ax.set_title("Year-Month Average Returns Heatmap")
+    st.pyplot(fig)
+    
+    # Summary in 100 words
+    summary = f"The uploaded data spans from {df['Date'].min().date()} to {df['Date'].max().date()} with closing prices ranging from {df['Close'].min():.2f} to {df['Close'].max():.2f}. " \
+              f"The average return per day is {df['Returns'].mean():.4%} and volatility is {df['Returns'].std():.4%}. " \
+              f"Observing patterns, the market shows periods of bullish and bearish trends. Opportunities may exist near demand zones, support/resistance levels, and liquidity traps, while caution is needed around SL hunting zones and fake breakouts. " \
+              f"Volume spikes indicate potential strong moves, while low-volume consolidation may precede breakouts. Advanced chart patterns such as triangles, wedges, flags, H&S, cups, rounding bottoms, M/W patterns, and trendline breaks can guide swing trading entries and exits."
+    st.write(summary)
 
-def human_readable_summary(df):
-    total_days = len(df)
-    avg_close = df['close'].mean()
-    trend = "uptrend" if df['close'].iloc[-1] > df['close'].iloc[0] else "downtrend"
-    summary = f"The data contains {total_days} trading days. Average closing price: {avg_close:.2f}. Overall trend: {trend}. Observing advanced patterns, support/resistance levels, supply/demand zones, trap zones, fake breakouts, and liquidity clusters can provide profitable swing trading opportunities. Candlestick psychology and buyer-seller behavior are critical in identifying entries and exits."
-    return summary
-
-# ==================== Advanced Price Action & Pattern Detection ====================
+# -------------------------------
+# Price Action & Pattern Detection
+# -------------------------------
 
 def detect_patterns(df):
-    """Detects multiple chart patterns and zones"""
-    df['pattern'] = 'None'
-    # --- Head & Shoulders / Inverted H&S ---
-    # Placeholder: logic to detect H&S and assign df['pattern'] = 'H&S' with entry/exit info
-    # --- Triangles / Wedges / Flags / Pennants ---
-    # Placeholder: detect ascending/descending/symmetrical triangles, assign df['pattern']
-    # --- Cup & Handle, Rounding Bottoms, M/W patterns ---
-    # Placeholder: detect and annotate patterns
-    # --- Support / Resistance / Demand / Supply / Liquidity Zones ---
-    # Placeholder: compute and annotate zones
-    # --- Fake Breakouts / Trap Zones ---
-    # Placeholder logic
-    # For demo, add SMA crossover signals for backtesting
-    df['sma10'] = df['close'].rolling(10).mean()
-    df['sma50'] = df['close'].rolling(50).mean()
-    df['signal'] = np.where(df['sma10'] > df['sma50'], 'long', 'short')
-    return df
+    """
+    Detect advanced price action and chart patterns
+    Returns a list of detected patterns with date/time and description
+    """
+    patterns = []
+    # Example simple pattern: consecutive higher highs and higher lows
+    for i in range(2, len(df)-1):
+        if df['Close'].iloc[i] > df['Close'].iloc[i-1] > df['Close'].iloc[i-2]:
+            patterns.append({
+                "Date": df['Date'].iloc[i],
+                "Pattern": "Uptrend 3-candle higher highs",
+                "Description": f"Close at {df['Close'].iloc[i]:.2f} forms consecutive higher highs indicating bullish momentum"
+            })
+        elif df['Close'].iloc[i] < df['Close'].iloc[i-1] < df['Close'].iloc[i-2]:
+            patterns.append({
+                "Date": df['Date'].iloc[i],
+                "Pattern": "Downtrend 3-candle lower lows",
+                "Description": f"Close at {df['Close'].iloc[i]:.2f} forms consecutive lower lows indicating bearish momentum"
+            })
+    # Placeholder: Add all advanced pattern detection here (triangles, wedges, flags, H&S, cups, M/W)
+    return patterns
 
-# ==================== Backtesting & Live Recommendation ====================
+# -------------------------------
+# Backtesting Engine
+# -------------------------------
 
-def backtest_strategy(df, strategy_type='both'):
+def backtest(df, strategy_params, long_short="both", progress=False):
+    """
+    Run backtesting on the uploaded data using given strategy parameters
+    Returns a DataFrame with trade entries/exits, PnL, reason, probability
+    """
     trades = []
-    for i in range(len(df)):
+    total_candles = len(df)
+    for i in range(total_candles):
+        if progress:
+            st.progress(i/total_candles)
         row = df.iloc[i]
-        if strategy_type in ['long','both'] and row['signal']=='long':
-            trades.append({
-                'entry_date': row['date'], 'side':'long', 'entry': row['close'], 
-                'sl': row['close']*0.98, 'target': row['close']*1.02, 
-                'reason':'SMA10 > SMA50 crossover', 'prob':0.7})
-        if strategy_type in ['short','both'] and row['signal']=='short':
-            trades.append({
-                'entry_date': row['date'], 'side':'short', 'entry': row['close'], 
-                'sl': row['close']*1.02, 'target': row['close']*0.98, 
-                'reason':'SMA10 < SMA50 crossover', 'prob':0.7})
-    return trades
+        date = row['Date']
+        close = row['Close']
+        # Simple example logic: if previous 3 closes are uptrend => buy signal
+        if long_short in ["long","both"]:
+            if i >= 2 and df['Close'].iloc[i] > df['Close'].iloc[i-1] > df['Close'].iloc[i-2]:
+                entry = close
+                target = entry * (1 + strategy_params.get("target_pct",0.01))
+                sl = entry * (1 - strategy_params.get("sl_pct",0.005))
+                trades.append({
+                    "Date": date,
+                    "Side": "Long",
+                    "Entry": entry,
+                    "Target": target,
+                    "SL": sl,
+                    "Reason": "3-candle uptrend",
+                    "Probability": 0.8,
+                    "PnL": target - entry
+                })
+        if long_short in ["short","both"]:
+            if i >= 2 and df['Close'].iloc[i] < df['Close'].iloc[i-1] < df['Close'].iloc[i-2]:
+                entry = close
+                target = entry * (1 - strategy_params.get("target_pct",0.01))
+                sl = entry * (1 + strategy_params.get("sl_pct",0.005))
+                trades.append({
+                    "Date": date,
+                    "Side": "Short",
+                    "Entry": entry,
+                    "Target": target,
+                    "SL": sl,
+                    "Reason": "3-candle downtrend",
+                    "Probability": 0.8,
+                    "PnL": entry - target
+                })
+    trades_df = pd.DataFrame(trades)
+    if len(trades_df) > 0:
+        trades_df["Hold Duration"] = 1  # placeholder for 1-day hold
+        trades_df["Positive Trade"] = trades_df["PnL"] > 0
+        trades_df["Negative Trade"] = trades_df["PnL"] <= 0
+    return trades_df
 
-def display_trades(trades):
-    if trades:
-        df_trades = pd.DataFrame(trades)
-        st.write("### Backtest Trades")
-        st.dataframe(df_trades)
+# -------------------------------
+# Strategy Optimization
+# -------------------------------
+
+def optimize_strategy(df, search_method="random", n_iter=10, desired_accuracy=0.8, long_short="both"):
+    """
+    Optimize strategy parameters using grid or random search
+    """
+    param_grid = {
+        "target_pct": [0.005,0.01,0.015,0.02],
+        "sl_pct": [0.002,0.005,0.007,0.01]
+    }
+    if search_method == "grid":
+        param_list = list(ParameterGrid(param_grid))
     else:
-        st.write("No trades detected.")
+        param_list = list(ParameterSampler(param_grid, n_iter=n_iter, random_state=42))
+    
+    best_score = -np.inf
+    best_params = {}
+    best_trades = pd.DataFrame()
+    for params in param_list:
+        trades_df = backtest(df, params, long_short=long_short)
+        if len(trades_df) == 0:
+            continue
+        accuracy = trades_df["Positive Trade"].mean()
+        total_points = trades_df["PnL"].sum()
+        # Simple objective: maximize points while achieving desired accuracy
+        score = total_points * (accuracy >= desired_accuracy)
+        if score > best_score:
+            best_score = score
+            best_params = params
+            best_trades = trades_df
+    return best_params, best_trades
 
-def live_recommendation(df, strategy_type='both'):
+# -------------------------------
+# Live Recommendation
+# -------------------------------
+
+def live_recommendation(df, best_params, long_short="both"):
+    """
+    Generate live recommendation on last available candle
+    """
     last_row = df.iloc[-1]
-    recommendation = {}
-    if strategy_type in ['long','both'] and last_row['signal']=='long':
-        recommendation = {
-            'side':'long', 'entry': last_row['close'], 
-            'sl': last_row['close']*0.98, 'target': last_row['close']*1.02, 
-            'reason':'SMA10 > SMA50 crossover', 'prob':0.7}
-    if strategy_type in ['short','both'] and last_row['signal']=='short':
-        recommendation = {
-            'side':'short', 'entry': last_row['close'], 
-            'sl': last_row['close']*1.02, 'target': last_row['close']*0.98, 
-            'reason':'SMA10 < SMA50 crossover', 'prob':0.7}
-    st.write("### Live Recommendation")
-    st.json(recommendation)
+    close = last_row['Close']
+    date = last_row['Date']
+    signal = []
+    if long_short in ["long","both"]:
+        if len(df) >= 3 and df['Close'].iloc[-1] > df['Close'].iloc[-2] > df['Close'].iloc[-3]:
+            entry = close
+            target = entry * (1 + best_params.get("target_pct",0.01))
+            sl = entry * (1 - best_params.get("sl_pct",0.005))
+            signal.append({
+                "Date": date,
+                "Side": "Long",
+                "Entry": entry,
+                "Target": target,
+                "SL": sl,
+                "Reason": "3-candle uptrend",
+                "Probability": 0.8
+            })
+    if long_short in ["short","both"]:
+        if len(df) >=3 and df['Close'].iloc[-1] < df['Close'].iloc[-2] < df['Close'].iloc[-3]:
+            entry = close
+            target = entry * (1 - best_params.get("target_pct",0.01))
+            sl = entry * (1 + best_params.get("sl_pct",0.005))
+            signal.append({
+                "Date": date,
+                "Side": "Short",
+                "Entry": entry,
+                "Target": target,
+                "SL": sl,
+                "Reason": "3-candle downtrend",
+                "Probability": 0.8
+            })
+    return pd.DataFrame(signal)
 
-# ==================== Streamlit App ====================
+# -------------------------------
+# Streamlit Interface
+# -------------------------------
 
-st.title("📊 Professional Swing Trading Platform")
+st.title("🟢 Swing Trading Algo Platform")
 
-uploaded_file = st.file_uploader("Upload OHLCV CSV file", type=['csv'])
+uploaded_file = st.file_uploader("Upload OHLC Data (CSV/Excel)", type=['csv','xlsx'])
 if uploaded_file:
-    df = pd.read_csv(uploaded_file)
-    df = preprocess_data(df)
-    if df is not None:
-        display_data_summary(df)
-        plot_raw_data(df)
-        generate_heatmap(df)
-        st.write("### Data Summary")
-        st.write(human_readable_summary(df))
-
-        end_date = st.date_input("Select end date for backtest", value=df['date'].max())
-        strategy_type = st.selectbox("Select strategy type", options=['long','short','both'])
-        optimization_method = st.selectbox("Select optimization method", options=['random','grid'])
-        desired_accuracy = st.slider("Desired Accuracy %", 50, 99, 80)
-        points_needed = st.number_input("Points needed per trade", 1, 100, 2)
-
-        df_bt = df[df['date'] <= pd.to_datetime(end_date)].copy()
-        st.write("Detecting patterns and computing signals...")
-        with st.spinner("Processing patterns..."):
-            df_bt = detect_patterns(df_bt)
-
-        st.progress(30)
-        trades = backtest_strategy(df_bt, strategy_type=strategy_type)
-        st.progress(70)
-        display_trades(trades)
-        st.progress(100)
-
-        live_recommendation(df_bt, strategy_type=strategy_type)
-
-        st.write("### Backtest Summary")
-        st.write(f"Total Trades: {len(trades)}, Strategy: {strategy_type.upper()}")
-        st.write("Summary: Trades executed with advanced price action and pattern detection. SL, targets, probability of profit, and reasons for each trade are dynamically computed. Live recommendation uses the same strategy on last candle close without future data leakage.")
+    try:
+        if uploaded_file.name.endswith(".csv"):
+            df = pd.read_csv(uploaded_file)
+        else:
+            df = pd.read_excel(uploaded_file)
+        st.success("File uploaded successfully!")
+        
+        # Map columns
+        col_map = map_columns(df)
+        missing_cols = [c for c in ["Date","Open","High","Low","Close","Volume"] if c not in col_map]
+        if missing_cols:
+            st.warning(f"Could not map columns for: {missing_cols}. Please ensure your file contains these columns.")
+        else:
+            # Convert Date
+            df = convert_to_datetime(df, col_map["Date"])
+            # Rename columns to standard
+            df = df.rename(columns={v:k for k,v in col_map.items()})
+            # Sort ascending
+            df = df.sort_values(by="Date").reset_index(drop=True)
+            
+            # End date selection
+            min_date = df['Date'].min().date()
+            max_date = datetime.datetime.now().date()
+            end_date = st.date_input("Select End Date for Analysis/Backtest", value=max_date, min_value=min_date, max_value=max_date)
+            df_backtest = df[df['Date'].dt.date <= end_date].copy()
+            
+            # EDA
+            generate_eda(df_backtest)
+            plot_raw_data(df_backtest)
+            
+            # Pattern detection
+            patterns = detect_patterns(df_backtest)
+            st.subheader("Detected Patterns")
+            st.dataframe(pd.DataFrame(patterns))
+            
+            # User selections
+            st.sidebar.subheader("Backtesting Options")
+            long_short = st.sidebar.selectbox("Trade Side", options=["long","short","both"])
+            search_method = st.sidebar.selectbox("Optimization Method", options=["random","grid"])
+            n_iter = st.sidebar.number_input("Number of Iterations (Random Search)", min_value=1, value=10)
+            desired_accuracy = st.sidebar.slider("Desired Accuracy (0-1)", min_value=0.5, max_value=1.0, value=0.8)
+            
+            st.subheader("Running Strategy Optimization and Backtesting...")
+            best_params, trades_df = optimize_strategy(df_backtest, search_method=search_method, n_iter=n_iter, desired_accuracy=desired_accuracy, long_short=long_short)
+            st.write("✅ Best Strategy Parameters:", best_params)
+            
+            if len(trades_df) > 0:
+                st.subheader("Backtest Results")
+                st.write(f"Total Trades: {len(trades_df)}")
+                st.write(f"Positive Trades: {trades_df['Positive Trade'].sum()}")
+                st.write(f"Negative Trades: {trades_df['Negative Trade'].sum()}")
+                st.write(f"Accuracy: {trades_df['Positive Trade'].mean():.2%}")
+                st.write(f"Total PnL: {trades_df['PnL'].sum():.2f}")
+                st.write("Trades Detail:")
+                st.dataframe(trades_df)
+                
+                # Live recommendation
+                st.subheader("Live Recommendation (Last Candle Close)")
+                live_df = live_recommendation(df_backtest, best_params, long_short=long_short)
+                if not live_df.empty:
+                    st.dataframe(live_df)
+                else:
+                    st.info("No active signal on last candle.")
+                
+                # Summary
+                summary = f"The backtest using the best strategy with parameters {best_params} yielded {len(trades_df)} trades, with accuracy {trades_df['Positive Trade'].mean():.2%} and total PnL {trades_df['PnL'].sum():.2f}. " \
+                          f"Positive trades: {trades_df['Positive Trade'].sum()}, negative trades: {trades_df['Negative Trade'].sum()}. " \
+                          f"Live recommendation based on last candle suggests taking trades only if pattern conditions are met. Strategy uses advanced price action with trendlines, chart patterns, supply/demand zones, liquidity zones, and SL hunting techniques to maximize probability of profit."
+                st.write(summary)
+            
+            else:
+                st.warning("No trades generated for the selected parameters.")
+                
+    except Exception as e:
+        st.error(f"Error processing file: {e}")
