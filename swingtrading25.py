@@ -59,6 +59,27 @@ class StockAnalyzer:
         self.strategy_params = {}
         self.best_strategy = None
         
+    def ensure_timezone_compatibility(self, date_value, reference_series):
+        """Ensure timezone compatibility between date_value and reference_series"""
+        try:
+            # Convert date_value to pandas Timestamp
+            target_date = pd.Timestamp(date_value)
+            
+            # Get timezone info from reference series
+            if hasattr(reference_series.iloc[0], 'tz') and reference_series.iloc[0].tz is not None:
+                ref_tz = reference_series.iloc[0].tz
+                
+                # Make target_date timezone-aware to match reference
+                if target_date.tz is None:
+                    target_date = target_date.tz_localize(ref_tz)
+                else:
+                    target_date = target_date.tz_convert(ref_tz)
+            
+            return target_date
+        except Exception as e:
+            st.error(f"Timezone conversion error: {e}")
+            return None
+        
     def map_columns(self, df):
         """Intelligently map column names to standard format"""
         column_mapping = {}
@@ -94,21 +115,48 @@ class StockAnalyzer:
     def preprocess_data(self, df, end_date=None):
         """Preprocess the stock data"""
         # Convert date column to datetime with IST timezone
-        df['Date'] = pd.to_datetime(df['Date'])
-        
-        # Convert to IST timezone
-        ist = pytz.timezone('Asia/Kolkata')
-        if df['Date'].dt.tz is None:
-            df['Date'] = df['Date'].dt.tz_localize('UTC').dt.tz_convert(ist)
-        else:
-            df['Date'] = df['Date'].dt.tz_convert(ist)
+        try:
+            df['Date'] = pd.to_datetime(df['Date'])
+            
+            # Convert to IST timezone
+            ist = pytz.timezone('Asia/Kolkata')
+            if df['Date'].dt.tz is None:
+                # If timezone-naive, first localize to UTC then convert to IST
+                df['Date'] = df['Date'].dt.tz_localize('UTC').dt.tz_convert(ist)
+            else:
+                # If already timezone-aware, convert to IST
+                df['Date'] = df['Date'].dt.tz_convert(ist)
+        except Exception as e:
+            # Fallback: try different date formats
+            try:
+                df['Date'] = pd.to_datetime(df['Date'], format='%Y-%m-%d')
+                ist = pytz.timezone('Asia/Kolkata')
+                df['Date'] = df['Date'].dt.tz_localize(ist)
+            except:
+                try:
+                    df['Date'] = pd.to_datetime(df['Date'], infer_datetime_format=True)
+                    ist = pytz.timezone('Asia/Kolkata')
+                    if df['Date'].dt.tz is None:
+                        df['Date'] = df['Date'].dt.tz_localize(ist)
+                    else:
+                        df['Date'] = df['Date'].dt.tz_convert(ist)
+                except Exception as final_e:
+                    st.error(f"Error converting dates: {final_e}")
+                    return None
         
         # Sort by date ascending (no future data leakage)
         df = df.sort_values('Date').reset_index(drop=True)
         
         # Filter by end date if provided
         if end_date:
-            df = df[df['Date'] <= end_date]
+            try:
+                end_date_tz = self.ensure_timezone_compatibility(end_date, df['Date'])
+                if end_date_tz is not None:
+                    df = df[df['Date'] <= end_date_tz]
+            except Exception as e:
+                st.error(f"Error filtering by date: {e}")
+                # Continue without date filtering
+                pass
         
         # Calculate technical indicators
         df = self.calculate_indicators(df)
@@ -609,7 +657,18 @@ class StockAnalyzer:
             else:  # Active position exists, check for exit
                 # Find the next candle data for exit checking
                 signal_date = signal['Date']
-                future_data = df[df['Date'] > position['entry_date']].head(20)  # Look ahead 20 candles max
+                
+                # Ensure timezone compatibility for date comparison
+                try:
+                    if hasattr(signal_date, 'tz') and signal_date.tz is not None:
+                        # Signal date is timezone-aware, ensure df dates match
+                        future_data = df[df['Date'] > signal_date].head(20)
+                    else:
+                        # Handle timezone-naive comparison
+                        future_data = df[df['Date'] > pd.Timestamp(signal_date)].head(20)
+                except Exception as e:
+                    # Fallback: use position entry date for filtering
+                    future_data = df[df['Date'] > position['entry_date']].head(20)
                 
                 if len(future_data) > 0:
                     exit_found = False
@@ -946,20 +1005,23 @@ def main():
                 
                 if st.sidebar.button("🚀 Run Analysis", type="primary"):
                     
-                    # Process data
-                    processed_df = analyzer.preprocess_data(mapped_df, pd.Timestamp(end_date))
-                    
-                    if processed_df is not None and len(processed_df) > 100:
-                        analyzer.data = processed_df
+                    try:
+                        # Process data
+                        with st.spinner("🔄 Processing data..."):
+                            processed_df = analyzer.preprocess_data(mapped_df, pd.Timestamp(end_date))
                         
-                        # Main content area
-                        tab1, tab2, tab3, tab4, tab5 = st.tabs([
-                            "📊 Data Overview", 
-                            "🔍 EDA & Patterns", 
-                            "⚡ Strategy Optimization", 
-                            "📈 Backtest Results", 
-                            "🎯 Live Recommendation"
-                        ])
+                        if processed_df is not None and len(processed_df) > 100:
+                            analyzer.data = processed_df
+                            st.success("✅ Data processed successfully!")
+                            
+                            # Main content area
+                            tab1, tab2, tab3, tab4, tab5 = st.tabs([
+                                "📊 Data Overview", 
+                                "🔍 EDA & Patterns", 
+                                "⚡ Strategy Optimization", 
+                                "📈 Backtest Results", 
+                                "🎯 Live Recommendation"
+                            ])
                         
                         with tab1:
                             st.header("📊 Data Overview")
