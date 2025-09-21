@@ -1,5 +1,5 @@
 # Streamlit Swing Recommender
-# Single-file Streamlit app that: 
+# Single-file Streamlit app that:
 # - accepts OHLCV-like CSV/Excel with arbitrary column names
 # - maps columns automatically (open/high/low/close/volume/date)
 # - sorts data ascending and converts date column to IST timezone
@@ -25,10 +25,15 @@ from itertools import product
 import random
 import json
 
+# --- Small fix added early to avoid NameError for calendar_month_name (used later in heatmap) ---
+import calendar
+def calendar_month_name(m):
+    return calendar.month_abbr[m]
+# --------------------------------------------------------------------------------------------
+
 st.set_page_config(layout="wide", page_title="Swing Recommender")
 
 # ---------- Utilities ----------
-
 def assume_and_map_columns(df: pd.DataFrame):
     # Create mapping to standard names using substring rules
     col_map = {c: c for c in df.columns}
@@ -79,7 +84,6 @@ def assume_and_map_columns(df: pd.DataFrame):
     df = df.rename(columns=col_map)
     return df, col_map
 
-
 def parse_dates_and_set_ist(df: pd.DataFrame, date_col='date'):
     if date_col not in df.columns:
         # try index
@@ -104,7 +108,6 @@ def parse_dates_and_set_ist(df: pd.DataFrame, date_col='date'):
         df['date'] = df['date'].apply(lambda x: x.tz_localize('Asia/Kolkata') if x.tzinfo is None else x.astimezone(pytz.timezone('Asia/Kolkata')))
     return df
 
-
 def ensure_ohlcv(df: pd.DataFrame):
     # Ensure open/high/low/close/volume columns exist. If not, try to fill with close
     if 'close' not in df.columns:
@@ -125,13 +128,11 @@ def ensure_ohlcv(df: pd.DataFrame):
     df = df.dropna(subset=['close'])
     return df
 
-
 def rolling_support_resistance(df, lookback=20):
     # Rolling support (min low) and resistance (max high)
     df['rolling_min_low'] = df['low'].rolling(window=lookback, min_periods=1).min()
     df['rolling_max_high'] = df['high'].rolling(window=lookback, min_periods=1).max()
     return df
-
 
 def detect_local_peaks(series, window=5, kind='max'):
     # naive local peak detection without scipy
@@ -149,7 +150,6 @@ def detect_local_peaks(series, window=5, kind='max'):
                 idxs.append(i)
     return idxs
 
-
 def detect_double_top_bottom(df, tolerance=0.02, separation=5):
     peaks = detect_local_peaks(df['high'], window=3, kind='max')
     troughs = detect_local_peaks(df['low'], window=3, kind='min')
@@ -166,7 +166,6 @@ def detect_double_top_bottom(df, tolerance=0.02, separation=5):
                 double_bottoms.append((troughs[i], troughs[j]))
     return double_tops, double_bottoms
 
-
 def detect_head_shoulders(df):
     # very naive heuristic: three peaks with middle the highest
     peaks = detect_local_peaks(df['high'], window=4, kind='max')
@@ -179,7 +178,6 @@ def detect_head_shoulders(df):
                 if abs(df['high'].iloc[a] - df['high'].iloc[c]) / df['high'].iloc[b] < 0.06:
                     patterns.append((a,b,c))
     return patterns
-
 
 def detect_cup_handle(df, lookback=100):
     # naive attempt: find long rounded bottom then small consolidation
@@ -201,7 +199,6 @@ def detect_cup_handle(df, lookback=100):
     return patterns
 
 # ---------- Strategy and Backtesting ----------
-
 def generate_signals(df, params, side='both'):
     # params: lookback, vol_mul, threshold_pct, risk_reward, min_hold, max_hold
     lookback = int(params.get('lookback', 20))
@@ -309,7 +306,6 @@ def generate_signals(df, params, side='both'):
     trades_df = pd.DataFrame(trades)
     return trades_df
 
-
 def evaluate_backtest(trades_df):
     if trades_df.empty:
         return None
@@ -333,7 +329,6 @@ def evaluate_backtest(trades_df):
         'avg_hold': avg_hold,
         'max_drawdown': dd
     }
-
 
 def run_search(df, side, search_type, n_iter, grid_params, desired_accuracy, target_points, progress_callback=None):
     # grid_params is dict of lists
@@ -377,7 +372,6 @@ def run_search(df, side, search_type, n_iter, grid_params, desired_accuracy, tar
     return best
 
 # ---------- Streamlit App ----------
-
 st.title('Swing Trading Recommender — Automated')
 st.markdown('Upload OHLCV data (CSV or Excel). Column names can be arbitrary; the app will map them.')
 
@@ -447,6 +441,7 @@ if uploaded_file is not None:
 
     # EDA: returns heatmap
     st.subheader('EDA — Year vs Month Returns Heatmap')
+    # calendar_month_name is defined up top so no NameError will occur
     df_mapped['year'] = df_mapped['date'].dt.year
     df_mapped['month'] = df_mapped['date'].dt.month
     df_mapped['ret'] = df_mapped['close'].pct_change()
@@ -514,19 +509,19 @@ if uploaded_file is not None:
             # Live recommendation on last candle from the cut data (use same strategy)
             st.subheader('Live recommendation (based on last available candle in selected period)')
             last_row = df_cut.iloc[-1]
-            live_trades = generate_signals(df_cut.tail(10).reset_index(drop=True), best['params'], side=mode_side)
             # For live recommendation, evaluate using best params on the full cut data but only consider signal at last index
-            lr_signal = None
-            # We'll compute whether last candle meets entry criteria
             temp_trades = generate_signals(df_cut, best['params'], side=mode_side)
-            # find any trade whose entry_index corresponds to last candle index
             if not temp_trades.empty:
                 is_live = temp_trades[temp_trades['entry_index']==(len(df_cut)-1)]
                 if not is_live.empty:
                     rec = is_live.iloc[-1]
-                    # probability as win_rate for same side
                     prob = best['stats']['win_rate'] if best['stats'] else 0
-                    st.write(f"Recommendation: {rec['side'].upper()} — ENTRY at {rec['entry_price']:.4f} (close of last candle) — SL {rec['entry_price'] - (rec['entry_price'] - rec['exit_price']) if rec['side']=='long' else rec['entry_price'] + (rec['exit_price'] - rec['entry_price']):.4f} — TARGET {rec['exit_price']:.4f}")
+                    # compute SL shown in readable way (logic depends on side)
+                    if rec['side']=='long':
+                        suggested_sl = rec['entry_price'] - (rec['entry_price'] - rec['exit_price']) if rec['entry_price']>rec['exit_price'] else rec['entry_price']*0.99
+                    else:
+                        suggested_sl = rec['entry_price'] + (rec['exit_price'] - rec['entry_price']) if rec['exit_price']>rec['entry_price'] else rec['entry_price']*1.01
+                    st.write(f"Recommendation: {rec['side'].upper()} — ENTRY at {rec['entry_price']:.4f} (close of last candle) — SL {suggested_sl:.4f} — TARGET {rec['exit_price']:.4f}")
                     st.write(f"Probability of profit (win rate from backtest): {prob:.2%}")
                     st.write('Reason/Logic: ' + rec['reason'])
                 else:
@@ -553,20 +548,12 @@ if uploaded_file is not None:
 
             st.success('Optimization & backtest completed.')
 
-
 # ---------- Helper functions not defined earlier ----------
-
-import calendar
-
-def calendar_month_name(m):
-    return calendar.month_abbr[m]
-
-
 def generate_summary_text(df):
     # approx 100-word human-friendly summary
     last = df['close'].iloc[-1]
-    mean_ret = df['ret'].mean()
-    vol = df['ret'].std()
+    mean_ret = df['ret'].mean() if 'ret' in df.columns else df['close'].pct_change().mean()
+    vol = df['ret'].std() if 'ret' in df.columns else df['close'].pct_change().std()
     period_days = (df['date'].iloc[-1] - df['date'].iloc[0]).days
     trend = 'bullish' if last > df['close'].rolling(window=min(200,len(df))).mean().iloc[-1] else 'bearish'
     opp = 'opportunities for mean-reversion near recent support and breakout trades near resistance' if vol>0.01 else 'range-bound scalping and mean-reversion'
@@ -576,7 +563,6 @@ def generate_summary_text(df):
     if len(words) > 100:
         return ' '.join(words[:100])
     return txt
-
 
 def generate_backtest_summary(stats, params):
     if stats is None:
