@@ -496,7 +496,8 @@ max_price = df_work['close'].max()
 col1, col2, col3 = st.columns(3)
 col1.metric('Start Date (min)', str(min_date))
 col2.metric('End Date (max)', str(max_date))
-col3.metric('Price Range', f"{min_price:.2f} — {max_price:.2f}")
+#col3.metric('Price Range', f"{min_price:.2f} — {max_price:.2f}")
+col3.metric('Price Range')
 
 # End date selection (user wants to test on past data). Build date options from data
 unique_dates = sorted(df_work['date'].dt.normalize().unique())
