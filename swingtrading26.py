@@ -1,5 +1,5 @@
 # Streamlit Swing Recommender
-# Single-file Streamlit app that:
+# Single-file Streamlit app that: 
 # - accepts OHLCV-like CSV/Excel with arbitrary column names
 # - maps columns automatically (open/high/low/close/volume/date)
 # - sorts data ascending and converts date column to IST timezone
@@ -24,16 +24,12 @@ import plotly.graph_objects as go
 from itertools import product
 import random
 import json
-
-# --- Small fix added early to avoid NameError for calendar_month_name (used later in heatmap) ---
 import calendar
-def calendar_month_name(m):
-    return calendar.month_abbr[m]
-# --------------------------------------------------------------------------------------------
 
 st.set_page_config(layout="wide", page_title="Swing Recommender")
 
 # ---------- Utilities ----------
+
 def assume_and_map_columns(df: pd.DataFrame):
     # Create mapping to standard names using substring rules
     col_map = {c: c for c in df.columns}
@@ -84,6 +80,7 @@ def assume_and_map_columns(df: pd.DataFrame):
     df = df.rename(columns=col_map)
     return df, col_map
 
+
 def parse_dates_and_set_ist(df: pd.DataFrame, date_col='date'):
     if date_col not in df.columns:
         # try index
@@ -99,14 +96,26 @@ def parse_dates_and_set_ist(df: pd.DataFrame, date_col='date'):
     df = df.dropna(subset=['date']).copy()
     # If timezone-naive, localize to Asia/Kolkata (IST)
     try:
+        # Pandas may have tz-aware datetime; handle carefully
         if df['date'].dt.tz is None:
             df['date'] = df['date'].dt.tz_localize('Asia/Kolkata')
         else:
             df['date'] = df['date'].dt.tz_convert('Asia/Kolkata')
     except Exception:
-        # Some pandas versions don't allow dt.tz check on Series with mixed tz
-        df['date'] = df['date'].apply(lambda x: x.tz_localize('Asia/Kolkata') if x.tzinfo is None else x.astimezone(pytz.timezone('Asia/Kolkata')))
+        # Fallback for mixed tz / older pandas
+        def _ensure_tz(x):
+            if x is None:
+                return x
+            if getattr(x, 'tzinfo', None) is None:
+                try:
+                    return x.tz_localize('Asia/Kolkata')
+                except Exception:
+                    return pd.Timestamp(x).tz_localize('Asia/Kolkata')
+            else:
+                return x.astimezone(pytz.timezone('Asia/Kolkata'))
+        df['date'] = df['date'].apply(_ensure_tz)
     return df
+
 
 def ensure_ohlcv(df: pd.DataFrame):
     # Ensure open/high/low/close/volume columns exist. If not, try to fill with close
@@ -128,11 +137,13 @@ def ensure_ohlcv(df: pd.DataFrame):
     df = df.dropna(subset=['close'])
     return df
 
+
 def rolling_support_resistance(df, lookback=20):
     # Rolling support (min low) and resistance (max high)
     df['rolling_min_low'] = df['low'].rolling(window=lookback, min_periods=1).min()
     df['rolling_max_high'] = df['high'].rolling(window=lookback, min_periods=1).max()
     return df
+
 
 def detect_local_peaks(series, window=5, kind='max'):
     # naive local peak detection without scipy
@@ -150,6 +161,7 @@ def detect_local_peaks(series, window=5, kind='max'):
                 idxs.append(i)
     return idxs
 
+
 def detect_double_top_bottom(df, tolerance=0.02, separation=5):
     peaks = detect_local_peaks(df['high'], window=3, kind='max')
     troughs = detect_local_peaks(df['low'], window=3, kind='min')
@@ -166,6 +178,7 @@ def detect_double_top_bottom(df, tolerance=0.02, separation=5):
                 double_bottoms.append((troughs[i], troughs[j]))
     return double_tops, double_bottoms
 
+
 def detect_head_shoulders(df):
     # very naive heuristic: three peaks with middle the highest
     peaks = detect_local_peaks(df['high'], window=4, kind='max')
@@ -178,6 +191,7 @@ def detect_head_shoulders(df):
                 if abs(df['high'].iloc[a] - df['high'].iloc[c]) / df['high'].iloc[b] < 0.06:
                     patterns.append((a,b,c))
     return patterns
+
 
 def detect_cup_handle(df, lookback=100):
     # naive attempt: find long rounded bottom then small consolidation
@@ -199,6 +213,7 @@ def detect_cup_handle(df, lookback=100):
     return patterns
 
 # ---------- Strategy and Backtesting ----------
+
 def generate_signals(df, params, side='both'):
     # params: lookback, vol_mul, threshold_pct, risk_reward, min_hold, max_hold
     lookback = int(params.get('lookback', 20))
@@ -306,6 +321,7 @@ def generate_signals(df, params, side='both'):
     trades_df = pd.DataFrame(trades)
     return trades_df
 
+
 def evaluate_backtest(trades_df):
     if trades_df.empty:
         return None
@@ -329,6 +345,7 @@ def evaluate_backtest(trades_df):
         'avg_hold': avg_hold,
         'max_drawdown': dd
     }
+
 
 def run_search(df, side, search_type, n_iter, grid_params, desired_accuracy, target_points, progress_callback=None):
     # grid_params is dict of lists
@@ -368,12 +385,56 @@ def run_search(df, side, search_type, n_iter, grid_params, desired_accuracy, tar
         if best is None or score>best['score']:
             best = {'params':p, 'score':score, 'stats':stats, 'trades':trades}
         if progress_callback:
-            progress_callback(int((idx+1)/total*100))
+            try:
+                progress_callback(int((idx+1)/total*100))
+            except Exception:
+                pass
     return best
 
+# ---------- Helper functions used in main UI (defined before use) ----------
+
+def calendar_month_name(m):
+    # safe formatting for month numbers or names
+    try:
+        m_int = int(m)
+        return calendar.month_abbr[m_int]
+    except Exception:
+        return str(m)
+
+
+def generate_summary_text(df):
+    # approx 100-word human-friendly summary
+    last = df['close'].iloc[-1]
+    mean_ret = df['ret'].mean() if 'ret' in df.columns else df['close'].pct_change().mean()
+    vol = df['ret'].std() if 'ret' in df.columns else df['close'].pct_change().std()
+    period_days = (df['date'].iloc[-1] - df['date'].iloc[0]).days
+    try:
+        long_window = min(200,len(df))
+        ma_long = df['close'].rolling(window=long_window).mean().iloc[-1]
+        trend = 'bullish' if last > ma_long else 'bearish'
+    except Exception:
+        trend = 'sideways'
+    opp = 'opportunities for mean-reversion near recent support and breakout trades near resistance' if vol>0.01 else 'range-bound scalping and mean-reversion'
+    txt = f"Over {period_days} days the instrument shows an average daily return of {mean_ret:.4%} with volatility {vol:.4%}. The longer-term trend is {trend}. Current price is {last:.2f}. Based on recent price-action, there are {opp}. Volume spikes often coincide with directional moves, suggesting follow-through trade potential. Traders should combine zone-based stops with disciplined risk management, keeping reward-to-risk favourable. Backtesting and optimization below will find parameter sets to try to capture these moves while avoiding look-ahead bias."
+    # try to keep near 100 words by rough trimming
+    words = txt.split()
+    if len(words) > 100:
+        return ' '.join(words[:100])
+    return txt
+
+
+def generate_backtest_summary(stats, params):
+    if stats is None:
+        return 'No trades were generated by the strategy.'
+    s = f"Backtest results: Total trades {stats['total_trades']}, Wins {stats['wins']}, Losses {stats['losses']}, Win rate {stats['win_rate']:.2%}. Total PnL {stats['total_pnl']:.2f}. Average PnL per trade {stats['avg_pnl']:.2f}. Max drawdown {stats['max_drawdown']:.2f}. Strategy parameters used: lookback {params.get('lookback')}, vol multiplier {params.get('vol_mul')}, threshold {params.get('threshold')}, risk_reward {params.get('risk_reward')}.
+"
+    s += "Recommendation for live: Follow identical rules; only take entries at candle close (no future data). Use position sizing so that potential loss per trade <= 1-2% of capital. Prefer trades where backtest showed positive edge."
+    return s
+
 # ---------- Streamlit App ----------
+
 st.title('Swing Trading Recommender — Automated')
-st.markdown('Upload OHLCV data (CSV or Excel). Column names can be arbitrary; the app will map them.')
+st.markdown('Upload OHLCV data (CSV or Excel). Column names can be arbitrary; the app will try to map them.')
 
 uploaded_file = st.file_uploader('Upload CSV/Excel', type=['csv','xlsx','xls'])
 
@@ -441,7 +502,6 @@ if uploaded_file is not None:
 
     # EDA: returns heatmap
     st.subheader('EDA — Year vs Month Returns Heatmap')
-    # calendar_month_name is defined up top so no NameError will occur
     df_mapped['year'] = df_mapped['date'].dt.year
     df_mapped['month'] = df_mapped['date'].dt.month
     df_mapped['ret'] = df_mapped['close'].pct_change()
@@ -509,19 +569,19 @@ if uploaded_file is not None:
             # Live recommendation on last candle from the cut data (use same strategy)
             st.subheader('Live recommendation (based on last available candle in selected period)')
             last_row = df_cut.iloc[-1]
+            live_trades = generate_signals(df_cut.tail(10).reset_index(drop=True), best['params'], side=mode_side)
             # For live recommendation, evaluate using best params on the full cut data but only consider signal at last index
+            lr_signal = None
+            # We'll compute whether last candle meets entry criteria
             temp_trades = generate_signals(df_cut, best['params'], side=mode_side)
+            # find any trade whose entry_index corresponds to last candle index
             if not temp_trades.empty:
                 is_live = temp_trades[temp_trades['entry_index']==(len(df_cut)-1)]
                 if not is_live.empty:
                     rec = is_live.iloc[-1]
+                    # probability as win_rate for same side
                     prob = best['stats']['win_rate'] if best['stats'] else 0
-                    # compute SL shown in readable way (logic depends on side)
-                    if rec['side']=='long':
-                        suggested_sl = rec['entry_price'] - (rec['entry_price'] - rec['exit_price']) if rec['entry_price']>rec['exit_price'] else rec['entry_price']*0.99
-                    else:
-                        suggested_sl = rec['entry_price'] + (rec['exit_price'] - rec['entry_price']) if rec['exit_price']>rec['entry_price'] else rec['entry_price']*1.01
-                    st.write(f"Recommendation: {rec['side'].upper()} — ENTRY at {rec['entry_price']:.4f} (close of last candle) — SL {suggested_sl:.4f} — TARGET {rec['exit_price']:.4f}")
+                    st.write(f"Recommendation: {rec['side'].upper()} — ENTRY at {rec['entry_price']:.4f} (close of last candle) — SL {rec['entry_price'] - (rec['entry_price'] - rec['exit_price']) if rec['side']=='long' else rec['entry_price'] + (rec['exit_price'] - rec['entry_price']):.4f} — TARGET {rec['exit_price']:.4f}")
                     st.write(f"Probability of profit (win rate from backtest): {prob:.2%}")
                     st.write('Reason/Logic: ' + rec['reason'])
                 else:
@@ -547,28 +607,5 @@ if uploaded_file is not None:
                 st.write('No common patterns detected with current heuristic rules.')
 
             st.success('Optimization & backtest completed.')
-
-# ---------- Helper functions not defined earlier ----------
-def generate_summary_text(df):
-    # approx 100-word human-friendly summary
-    last = df['close'].iloc[-1]
-    mean_ret = df['ret'].mean() if 'ret' in df.columns else df['close'].pct_change().mean()
-    vol = df['ret'].std() if 'ret' in df.columns else df['close'].pct_change().std()
-    period_days = (df['date'].iloc[-1] - df['date'].iloc[0]).days
-    trend = 'bullish' if last > df['close'].rolling(window=min(200,len(df))).mean().iloc[-1] else 'bearish'
-    opp = 'opportunities for mean-reversion near recent support and breakout trades near resistance' if vol>0.01 else 'range-bound scalping and mean-reversion'
-    txt = f"Over {period_days} days the instrument shows an average daily return of {mean_ret:.4%} with volatility {vol:.4%}. The longer-term trend is {trend}. Current price is {last:.2f}. Based on recent price-action, there are {opp}. Volume spikes often coincide with directional moves, suggesting follow-through trade potential. Traders should combine zone-based stops with disciplined risk management, keeping reward-to-risk favourable. Backtesting and optimization below will find parameter sets to try to capture these moves while avoiding look-ahead bias."
-    # try to keep near 100 words by rough trimming
-    words = txt.split()
-    if len(words) > 100:
-        return ' '.join(words[:100])
-    return txt
-
-def generate_backtest_summary(stats, params):
-    if stats is None:
-        return 'No trades were generated by the strategy.'
-    s = f"Backtest results: Total trades {stats['total_trades']}, Wins {stats['wins']}, Losses {stats['losses']}, Win rate {stats['win_rate']:.2%}. Total PnL {stats['total_pnl']:.2f}. Average PnL per trade {stats['avg_pnl']:.2f}. Max drawdown {stats['max_drawdown']:.2f}. Strategy parameters used: lookback {params.get('lookback')}, vol multiplier {params.get('vol_mul')}, threshold {params.get('threshold')}, risk_reward {params.get('risk_reward')}.\n"
-    s += "Recommendation for live: Follow identical rules; only take entries at candle close (no future data). Use position sizing so that potential loss per trade <= 1-2% of capital. Prefer trades where backtest showed positive edge."
-    return s
 
 # End of script
