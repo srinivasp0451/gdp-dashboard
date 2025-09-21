@@ -1,27 +1,24 @@
-# streamlit_app.py
+# streamlit_swing_fixed.py
 import streamlit as st
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
 import matplotlib.pyplot as plt
 import seaborn as sns
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 import pytz
 import random
 from itertools import product
-from math import isnan
 
-st.set_page_config(page_title="Swing Trading Recommender", layout="wide", initial_sidebar_state="expanded")
+st.set_page_config(page_title="Swing Trading Recommender — Fixed", layout="wide")
 
 # ---------------------------
 # Utilities: column mapping, timezone, basic indicators
 # ---------------------------
 def map_columns(df):
-    # Lowercase columns for matching
-    cols = {c: c.lower() for c in df.columns}
+    cols_lower = {c: c.lower() for c in df.columns}
     df_col_lower = {c.lower(): c for c in df.columns}
     mapping = {}
-    # heuristics
     def find_candidate(key_words):
         for k, orig in df_col_lower.items():
             for kw in key_words:
@@ -29,56 +26,49 @@ def map_columns(df):
                     return orig
         return None
 
-    mapping['date'] = find_candidate(['date', 'time', 'timestamp', 'dt'])
-    mapping['open'] = find_candidate(['open', 'o', 'openprice', 'open_price'])
-    mapping['high'] = find_candidate(['high', 'h', 'highprice', 'high_price'])
-    mapping['low']  = find_candidate(['low', 'l', 'lowprice', 'low_price'])
-    mapping['close'] = find_candidate(['close', 'c', 'closeprice', 'close_price', 'last'])
-    mapping['volume'] = find_candidate(['volume', 'vol', 'quantity', 'qty', 'shares', 'turnover'])
+    mapping['date'] = find_candidate(['date','time','timestamp','dt'])
+    mapping['open']  = find_candidate(['open','o','openprice','open_price'])
+    mapping['high']  = find_candidate(['high','h','highprice','high_price'])
+    mapping['low']   = find_candidate(['low','l','lowprice','low_price'])
+    mapping['close'] = find_candidate(['close','c','closeprice','close_price','last','price'])
+    mapping['volume']= find_candidate(['volume','vol','quantity','qty','shares','turnover'])
 
-    # If any missing, try substring fuzzy approach
-    for k in ['date','open','high','low','close','volume']:
-        if mapping.get(k) is None:
-            for orig in df.columns:
-                if k in orig.lower():
-                    mapping[k] = orig
-                    break
-
-    # as last resort try first 6 columns by position
+    # last-resort fallbacks by position
     cols_list = list(df.columns)
-    fallback = {'date':0, 'open':1, 'high':2, 'low':3, 'close':4}
-    for k,v in fallback.items():
-        if mapping.get(k) is None and len(cols_list) > v:
-            mapping[k] = cols_list[v]
+    fallback = {'date':0,'open':1,'high':2,'low':3,'close':4,'volume':5}
+    for k, pos in fallback.items():
+        if mapping.get(k) is None and len(cols_list) > pos:
+            mapping[k] = cols_list[pos]
 
-    # return mapping and mapped df
     mapped = pd.DataFrame()
     for k in ['date','open','high','low','close','volume']:
-        if mapping.get(k) is not None:
+        if mapping.get(k) in df.columns:
             mapped[k] = df[mapping[k]]
         else:
             mapped[k] = np.nan
     return mapped, mapping
 
-def convert_to_datetime_index(df, date_col='date', ist=True):
-    # Try parse date, handle tz-aware and naive
-    s = pd.to_datetime(df[date_col], errors='coerce', infer_datetime_format=True)
-    # if all NaT, try other parsing
+def convert_to_datetime_index(df, date_col_values):
+    """
+    date_col_values: Series (original date column)
+    returns df with index localized to Asia/Kolkata if possible
+    """
+    s = pd.to_datetime(date_col_values, errors='coerce', infer_datetime_format=True)
+    # if entirely NaT try fallback parsing
     if s.isna().all():
-        s = pd.to_datetime(df[date_col].astype(str), errors='coerce')
-    # if tz-aware, convert to IST
+        s = pd.to_datetime(date_col_values.astype(str), errors='coerce')
+    # handle tz-aware vs naive: attempt to preserve tz if present else assume UTC then convert to IST
     try:
-        if s.dt.tz is None:
-            # naive -> assume it's in local timezone or UTC? we'll treat naive as UTC then convert to IST
-            s = s.dt.tz_localize('UTC', ambiguous='NaT', nonexistent='shift_forward')
+        if getattr(s.dt, 'tz', None) is None:
+            s = s.dt.tz_localize('UTC', ambiguous='NaT', nonexistent='NaT')
         s = s.dt.tz_convert('Asia/Kolkata')
     except Exception:
-        # If still fails, attempt to localize to Asia/Kolkata
+        # fallback: naive -> localize to Asia/Kolkata
         try:
             s = s.dt.tz_localize('Asia/Kolkata')
         except Exception:
-            # fallback: leave naive
-            s = pd.to_datetime(df[date_col], errors='coerce')
+            # last resort: naive timezone-unaware index
+            s = pd.to_datetime(s)
     df = df.copy()
     df['date_ist'] = s
     df = df.set_index('date_ist')
@@ -90,290 +80,256 @@ def clean_numeric_columns(df):
             df[col] = pd.to_numeric(df[col], errors='coerce')
     return df
 
+def compute_true_atr(df, period=14):
+    # True Range
+    prev_close = df['close'].shift(1)
+    tr1 = df['high'] - df['low']
+    tr2 = (df['high'] - prev_close).abs()
+    tr3 = (df['low'] - prev_close).abs()
+    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+    atr = tr.rolling(period, min_periods=1).mean()
+    return atr.fillna(method='bfill')
+
 def add_basic_indicators(df):
-    # Simple moving average and returns for features
+    df = df.copy()
     df['ret'] = df['close'].pct_change().fillna(0)
-    df['rsi14'] = compute_rsi(df['close'], 14)
     df['sma20'] = df['close'].rolling(20, min_periods=1).mean()
     df['sma50'] = df['close'].rolling(50, min_periods=1).mean()
     df['vol_ma20'] = df['volume'].rolling(20, min_periods=1).mean()
+    df['atr14'] = compute_true_atr(df, period=14)
     return df
 
-def compute_rsi(series, period=14):
-    delta = series.diff()
-    up = delta.clip(lower=0)
-    down = -1 * delta.clip(upper=0)
-    ma_up = up.rolling(period, min_periods=1).mean()
-    ma_down = down.rolling(period, min_periods=1).mean()
-    rs = ma_up / (ma_down + 1e-9)
-    rsi = 100 - (100 / (1 + rs))
-    return rsi.fillna(50)
+# ---------------------------
+# Pattern detectors (causal: only use data up to candle i)
+# return positions (integer indices) of signals
+# ---------------------------
 
-# ---------------------------
-# Pattern detectors (heuristic)
-# ---------------------------
-def detect_double_top_bottom(df, lookback=30, tolerance=0.02):
-    signals = []
-    # Search windows for double tops/bottoms
-    for i in range(lookback, len(df)-1):
-        window = df['close'].iloc[i-lookback:i]
+def detect_double_top_bottom_pos(df_close, lookback=30, tolerance=0.02):
+    pos_list = []
+    L = len(df_close)
+    for i in range(lookback, L):
+        # window includes current candle (up to i)
+        window = df_close.iloc[i-lookback+1:i+1]  # inclusive of i
         peak = window.max()
         trough = window.min()
-        cur = df['close'].iloc[i]
-        # double top: two peaks similar and drop
-        # heuristic: if recent two peaks within tolerance and subsequent drop > x
-        peaks = window[window > (peak*(1-tolerance))]
-        if len(peaks) >= 2 and cur < peak*(1 - 0.01):
-            signals.append(('double_top', df.index[i]))
-        bottoms = window[window < (trough*(1+tolerance))]
-        if len(bottoms) >= 2 and cur > trough*(1 + 0.01):
-            signals.append(('double_bottom', df.index[i]))
-    return signals
+        # count peaks near peak value
+        near_peaks = window[window >= peak*(1 - tolerance)]
+        if len(near_peaks) >= 2:
+            # ensure after second peak there's a drop compared to peak
+            if df_close.iloc[i] < peak*(1 - 0.005):
+                pos_list.append((i, 'double_top'))
+        near_bottoms = window[window <= trough*(1 + tolerance)]
+        if len(near_bottoms) >= 2:
+            if df_close.iloc[i] > trough*(1 + 0.005):
+                pos_list.append((i, 'double_bottom'))
+    return pos_list
 
-def detect_head_shoulders(df, lookback=60):
-    signals = []
-    # Very heuristic: look for left shoulder, head (higher), right shoulder (approx equal to left)
-    for i in range(lookback, len(df)-1):
-        window = df['close'].iloc[i-lookback:i]
+def detect_head_shoulder_pos(df_close, lookback=60):
+    pos_list = []
+    L = len(df_close)
+    for i in range(lookback, L):
+        window = df_close.iloc[i-lookback+1:i+1]
         if len(window) < 10:
             continue
-        peaks = window[window==window.max()]
-        if peaks.empty:
+        # heuristic: head significantly higher than shoulders
+        peak_val = window.max()
+        peak_idx = window.idxmax()
+        # split relative to peak
+        pre = window[:window.index.get_loc(peak_idx)]
+        post = window[window.index.get_loc(peak_idx)+1:]
+        if len(pre) < 2 or len(post) < 2:
             continue
-        head_idx = peaks.index[0]
-        # approximate shoulders
-        left = window.loc[:head_idx]
-        right = window.loc[head_idx:]
-        if len(left) < 3 or len(right) < 3:
-            continue
-        leftpeak = left.max()
-        rightpeak = right.max()
-        head = window.max()
-        # check shoulders are lower than head and similar to each other
-        if leftpeak < head and rightpeak < head and abs(leftpeak - rightpeak)/max(leftpeak, rightpeak+1e-9) < 0.08:
-            signals.append(('head_shoulder', df.index[i]))
-    return signals
+        left_peak = pre.max()
+        right_peak = post.max() if not post.empty else -999999
+        if left_peak < peak_val and right_peak < peak_val and abs(left_peak-right_peak)/max(left_peak, right_peak+1e-9) < 0.12:
+            pos_list.append((i, 'head_shoulder'))
+    return pos_list
 
-def detect_triangle(df, lookback=50, thresh=0.02):
-    signals = []
-    for i in range(lookback, len(df)-1):
-        window = df['close'].iloc[i-lookback:i]
+def detect_triangle_pos(df_close, lookback=50):
+    pos_list = []
+    L = len(df_close)
+    for i in range(lookback, L):
+        window = df_close.iloc[i-lookback+1:i+1]
         x = np.arange(len(window))
-        # fit lines to highs and lows
-        highs = window.rolling(5).max().dropna()
-        lows = window.rolling(5).min().dropna()
-        if len(highs) < 10 or len(lows) < 10:
+        highs = window.rolling(5, min_periods=1).max().dropna()
+        lows = window.rolling(5, min_periods=1).min().dropna()
+        if len(highs) < 8 or len(lows) < 8:
             continue
-        # linear fit
         try:
-            m_high, b_high = np.polyfit(x[-len(highs):], highs.values, 1)
-            m_low, b_low = np.polyfit(x[-len(lows):], lows.values, 1)
-            # if slopes converge (one negative, one positive or different signs) -> triangle
-            if m_high * m_low < 0 or (abs(m_high) < 0.001 and abs(m_low) > 0.001):
-                signals.append(('triangle_or_wedge', df.index[i]))
+            m_high, _ = np.polyfit(x[-len(highs):], highs.values, 1)
+            m_low, _ = np.polyfit(x[-len(lows):], lows.values, 1)
+            if m_high * m_low < 0 or (abs(m_high) < 0.0005 and abs(m_low) > 0.0005):
+                pos_list.append((i, 'triangle_or_wedge'))
         except Exception:
             continue
-    return signals
+    return pos_list
 
-def detect_cup_handle(df, lookback=200):
-    signals = []
-    # Very rough detect: a rounded bottom followed by small pullback
-    for i in range(lookback, len(df)-1):
-        window = df['close'].iloc[i-lookback:i]
+def detect_cup_handle_pos(df_close, lookback=200):
+    pos_list = []
+    L = len(df_close)
+    for i in range(lookback, L):
+        window = df_close.iloc[i-lookback+1:i+1]
         left = window[:len(window)//2]
         right = window[len(window)//2:]
-        if left.mean() > left.min() and right.mean() > right.min():
-            # curvature check
-            if (left.max() > left.median()) and (right.max() > right.median()):
-                # detect small handle formation at end: slight dip
-                if window.iloc[-1] < window.iloc[-5] * 1.03:
-                    signals.append(('cup_handle', df.index[i]))
-    return signals
+        if len(left)==0 or len(right)==0:
+            continue
+        # a very rough curvature heuristic
+        if left.min() < left.mean() and right.min() < right.mean():
+            # small handle (final dip)
+            if window.iloc[-1] < window.iloc[-5] * 1.03:
+                pos_list.append((i, 'cup_handle'))
+    return pos_list
 
-# You can add more detectors similarly...
-def aggregate_pattern_signals(df):
+def aggregate_patterns_positions(df):
+    c = df['close']
     sigs = []
-    sigs += detect_double_top_bottom(df)
-    sigs += detect_head_shoulders(df)
-    sigs += detect_triangle(df)
-    sigs += detect_cup_handle(df)
-    # Deduplicate by index
-    result = {}
-    for name, idx in sigs:
-        result.setdefault(idx, []).append(name)
-    # convert to list of tuples
-    agg = [(idx, list(set(names))) for idx, names in result.items()]
-    return agg
+    sigs += detect_double_top_bottom_pos(c, lookback=30)
+    sigs += detect_head_shoulder_pos(c, lookback=60)
+    sigs += detect_triangle_pos(c, lookback=50)
+    sigs += detect_cup_handle_pos(c, lookback=200)
+    # aggregate per integer position
+    agg = {}
+    for pos, name in sigs:
+        agg.setdefault(pos, []).append(name)
+    return agg  # keys: integer pos -> list names
 
 # ---------------------------
-# Price action helpers
+# Candle psych helpers (causal)
 # ---------------------------
-def detect_support_resistance(df, n=10):
-    # Simple pivot-based support/resistance
-    supports = []
-    resistances = []
-    for i in range(n, len(df)-n):
-        window = df['low'].iloc[i-n:i+n+1]
-        if df['low'].iloc[i] == window.min():
-            supports.append((df.index[i], df['low'].iloc[i]))
-        wh = df['high'].iloc[i]
-        window_h = df['high'].iloc[i-n:i+n+1]
-        if wh == window_h.max():
-            resistances.append((df.index[i], wh))
-    return supports, resistances
-
-def detect_volume_spikes(df, mult=2):
-    spikes = df['volume'] > df['vol_ma20'] * mult
-    return df[spikes]
-
-def is_fake_breakout(df, idx, lookback=10):
-    # heuristic: breakout above resistance but volume not supportive and quickly reverses
-    i = df.index.get_loc(idx)
-    if i+1 >= len(df): return False
-    # compare close of next 3 candles
-    window = df['close'].iloc[max(0, i-lookback):i+4]
-    # fake if after breakout, price re-enters previous range within 3 candles
-    if window.max() - window.min() == 0:
-        return False
-    recent = df['close'].iloc[i+1:i+4]
-    if recent.empty:
-        return False
-    # if price falls back > 0.5% immediately -> fake
-    if (recent < df['close'].iloc[i] * 0.995).any():
-        return True
-    return False
-
-# ---------------------------
-# Backtester
-# ---------------------------
-def generate_signals(df, params):
-    """
-    params: dict of parameters used to generate signals.
-    We'll use pattern detections, trend confluence and volume to create long/short signals.
-    """
-    signals = []  # each: dict with idx, signal_type, reason, prob
-    pattern_list = aggregate_pattern_signals(df)
-    pattern_dict = {idx: pats for idx, pats in pattern_list}
-    supports, resistances = detect_support_resistance(df, n=params.get('sr_lookback',10))
-    vol_spikes = detect_volume_spikes(df, mult=params.get('vol_mult',2))
-    # trend
-    df['trend'] = np.where(df['sma20'] > df['sma50'], 1, -1)
-
-    for i in range(len(df)-1):
-        dt = df.index[i]
-        price = df['close'].iloc[i]
-        reason_parts = []
-        prob = 0.5
-        side = None
-        # pattern vote
-        if dt in pattern_dict:
-            pats = pattern_dict[dt]
-            if any('double_top' in p or 'head_shoulder' in p for p in pats):
-                side = 'short'
-                reason_parts.append("Reversal pattern detected: " + ",".join(pats))
-                prob += 0.15
-            elif any('double_bottom' in p or 'cup_handle' in p or 'triangle' in p or 'w' in ",".join(pats) for p in pats):
-                side = 'long'
-                reason_parts.append("Continuation/reversal pattern: " + ",".join(pats))
-                prob += 0.12
-            else:
-                # triangle/wedge ambiguous -> trend decides
-                if df['trend'].iloc[i] > 0:
-                    side = 'long'
-                    prob += 0.07
-                    reason_parts.append("Triangle/Wedge in uptrend")
-                else:
-                    side = 'short'
-                    prob += 0.07
-                    reason_parts.append("Triangle/Wedge in downtrend")
-
-        # Volume confluence
-        if dt in vol_spikes.index:
-            prob += 0.08
-            reason_parts.append("Volume spike")
-
-        # candlestick psychology: long if bullish engulfing or hammer
-        if is_bullish_bearish_candle(df, i):
-            typ = is_bullish_bearish_candle(df, i)
-            if typ == 'bull':
-                side = side or 'long'
-                prob += 0.05
-                reason_parts.append("Bullish candle pattern")
-            elif typ == 'bear':
-                side = side or 'short'
-                prob += 0.05
-                reason_parts.append("Bearish candle pattern")
-
-        # trend confluence
-        if df['trend'].iloc[i] == 1:
-            prob += 0.03
-            reason_parts.append("Trend SMA20>50")
-        else:
-            prob -= 0.01
-
-        # Final threshold
-        if prob >= params.get('min_prob', 0.55):
-            signals.append({
-                'index': dt,
-                'pos': i,
-                'side': side if side else 'long',
-                'price': price,
-                'reason': "; ".join(reason_parts) if reason_parts else "Pattern/price action",
-                'prob': min(prob, 0.95)
-            })
-    return signals
-
-def is_bullish_bearish_candle(df, i):
-    # Simple candlestick psychology detection
-    o = df['open'].iloc[i]
-    c = df['close'].iloc[i]
-    h = df['high'].iloc[i]
-    l = df['low'].iloc[i]
-    body = abs(c-o)
-    total = h-l + 1e-9
+def is_bullish_bearish_candle_causal(df, pos):
+    # use only data at pos and previous candle
+    if pos < 0 or pos >= len(df):
+        return None
+    o = df['open'].iloc[pos]; c = df['close'].iloc[pos]; h = df['high'].iloc[pos]; l = df['low'].iloc[pos]
+    body = abs(c-o); total = max(h-l, 1e-9)
     # hammer
-    if (body/total) < 0.3 and (c - l) / total > 0.5 and c > o:
+    if (body/total) < 0.35 and (c - l)/total > 0.45 and c > o:
         return 'bull'
-    # bearish hammer (inverse)
-    if (body/total) < 0.3 and (h - c) / total > 0.5 and c < o:
+    if (body/total) < 0.35 and (h - c)/total > 0.45 and c < o:
         return 'bear'
-    # engulfing
-    if i > 0:
-        prev_o = df['open'].iloc[i-1]
-        prev_c = df['close'].iloc[i-1]
+    if pos > 0:
+        prev_o = df['open'].iloc[pos-1]; prev_c = df['close'].iloc[pos-1]
         if c > o and prev_c < prev_o and (c - o) > (prev_o - prev_c):
             return 'bull'
         if c < o and prev_c > prev_o and (o - c) > (prev_c - prev_o):
             return 'bear'
     return None
 
-def backtest_with_params(df, params, mode='both', end_date=None):
+# ---------------------------
+# Signal generation (causal)
+# ---------------------------
+def generate_signals(df, params):
     """
-    Strict no-future leakage: iterate row by row; when signal occurs at index i,
-    entry = close of i; exit as per TP/SL or hold days/close rules.
+    Use only data up to candle i to decide if a signal is present at i (entry on close i).
+    Returns list of signals with 'pos' integer, side, price (close@pos), reason, prob
     """
     df = df.copy()
-    n = len(df)
+    # indicators already present (sma20, sma50, vol_ma20, atr14)
+    # use shifted versions where needed to avoid peeking: e.g., vol_ma20_shift = vol_ma20.shift(0) is okay because vol_ma20 uses past+current
+    pattern_dict = aggregate_patterns_positions(df)
+    signals = []
+    L = len(df)
+    for i in range(0, L):
+        reason_parts = []
+        prob = 0.45  # baseline low
+        side = None
+        price = df['close'].iloc[i]
+        # pattern vote
+        if i in pattern_dict:
+            pats = pattern_dict[i]
+            if any('double_top' in p or 'head_shoulder' in p for p in pats):
+                side = 'short'; reason_parts.append("Reversal pattern: "+",".join(pats)); prob += 0.18
+            elif any('double_bottom' in p or 'cup_handle' in p for p in pats):
+                side = 'long'; reason_parts.append("Reversal/accumulation: "+",".join(pats)); prob += 0.15
+            else:
+                # triangle/wedge, use trend
+                if df['sma20'].iloc[i] > df['sma50'].iloc[i]:
+                    side = 'long'; reason_parts.append("Triangle in uptrend"); prob += 0.07
+                else:
+                    side = 'short'; reason_parts.append("Triangle in downtrend"); prob += 0.07
+
+        # volume: use previous vol_ma20 (conservative)
+        vol_ma_prev = df['vol_ma20'].iloc[i-1] if i-1>=0 else df['vol_ma20'].iloc[i]
+        if df['volume'].iloc[i] > (vol_ma_prev * params.get('vol_mult', 2.0)):
+            prob += 0.06
+            reason_parts.append("Volume spike vs prior 20")
+
+        # candle psychology (causal)
+        cb = is_bullish_bearish_candle_causal(df, i)
+        if cb == 'bull':
+            prob += 0.04
+            reason_parts.append("Bullish candle shape")
+            side = side or 'long'
+        elif cb == 'bear':
+            prob += 0.04
+            reason_parts.append("Bearish candle shape")
+            side = side or 'short'
+
+        # trend SMA confluence (current candle)
+        if df['sma20'].iloc[i] > df['sma50'].iloc[i]:
+            prob += 0.02
+            reason_parts.append("SMA20>50")
+        else:
+            prob -= 0.01
+
+        # final threshold
+        if prob >= params.get('min_prob', 0.55):
+            signals.append({
+                'pos': i,
+                'index': df.index[i],
+                'side': side if side else 'long',
+                'price': price,
+                'reason': "; ".join(reason_parts) if reason_parts else "Pattern/price action",
+                'prob': round(min(prob, 0.95), 3)
+            })
+    # deduplicate by pos (keep highest prob if duplicates)
+    sig_by_pos = {}
+    for s in signals:
+        p = s['pos']
+        if p not in sig_by_pos or s['prob'] > sig_by_pos[p]['prob']:
+            sig_by_pos[p] = s
+    final = [sig_by_pos[p] for p in sorted(sig_by_pos.keys())]
+    return final
+
+# ---------------------------
+# Backtester (strict no future leak)
+# ---------------------------
+def backtest_with_params(df, params, mode='both', end_pos=None):
+    """
+    df: must be sorted ascending.
+    end_pos: integer index position (inclusive). If None use full df.
+    Entries happen at close of signal candle (pos). Exits are searched in subsequent candles using intrabar high/low. 
+    If both TP and SL touched within the same candle, use heuristic based on that candle's open to decide sequence; conservative fallback: SL first.
+    """
+    df = df.copy().reset_index(drop=False)
+    # compute ATR if missing
+    if 'atr14' not in df.columns:
+        df['atr14'] = compute_true_atr(df.set_index('date_ist'), period=14).values
+    signals = generate_signals(df.set_index('date_ist'), params)
     trades = []
-    signals = generate_signals(df, params)
-    taken_until = -1
+    taken_until_pos = -1
+    L = len(df)
+    last_allowed_pos = end_pos if end_pos is not None else L-1
+
     for sig in signals:
-        i = sig['pos']
-        if i <= taken_until:
+        pos = int(sig['pos'])
+        if pos <= taken_until_pos:
             continue
-        if end_date is not None and df.index[i] > end_date:
+        if pos > last_allowed_pos:
             continue
         side = sig['side']
         if mode == 'long' and side != 'long':
             continue
         if mode == 'short' and side != 'short':
             continue
-        entry_price = df['close'].iloc[i]  # entry on close of signal candle
-        entry_time = df.index[i]
-        # SL and TP logic: use ATR-like width or percent
-        atr = df['high'].rolling(14).max().iloc[i] - df['low'].rolling(14).min().iloc[i]
-        sl_dist = max(params.get('sl_pct', 0.02) * entry_price, params.get('sl_atr_mult', 0.5) * (atr if not np.isnan(atr) else entry_price*0.02))
-        tp_dist = max(params.get('tp_ratio', 2.0) * sl_dist, params.get('min_points', 0.01)*entry_price)
+        entry_price = float(df.at[pos, 'close'])
+        entry_time = df.at[pos, 'date_ist']
+        # sl and tp based on ATR + pct constraints
+        atr = float(df.at[pos, 'atr14']) if not pd.isna(df.at[pos, 'atr14']) else max(0.01*entry_price, 1.0)
+        sl_pct = float(params.get('sl_pct', 0.02))
+        sl_atr_mult = float(params.get('sl_atr_mult', 0.5))
+        sl_dist = max(sl_pct * entry_price, sl_atr_mult * atr)
+        tp_dist = max(float(params.get('tp_ratio', 2.0)) * sl_dist, float(params.get('min_points', 0.01)) * entry_price)
         if side == 'long':
             sl = entry_price - sl_dist
             tp = entry_price + tp_dist
@@ -381,167 +337,174 @@ def backtest_with_params(df, params, mode='both', end_date=None):
             sl = entry_price + sl_dist
             tp = entry_price - tp_dist
 
-        # Walk forward to find exit (no future leak): check next candles
-        exit_price = None
-        exit_time = None
-        exit_reason = None
-        # max hold days in candles
-        max_hold = params.get('max_hold', 20)
-        for j in range(i+1, min(n, i+1+max_hold)):
-            high = df['high'].iloc[j]
-            low = df['low'].iloc[j]
-            close = df['close'].iloc[j]
-            t = df.index[j]
-            # check TP/SL
+        # Walk forward candles from next candle to find first breach
+        exit_price = None; exit_time = None; exit_reason = None; exit_pos = None
+        max_hold = int(params.get('max_hold', 20))
+        for j in range(pos+1, min(L, pos+1+max_hold)):
+            high = float(df.at[j,'high']); low = float(df.at[j,'low']); open_j = float(df.at[j,'open']); close_j = float(df.at[j,'close'])
+            # For LONG
             if side == 'long':
-                if low <= sl:
-                    exit_price = sl
-                    exit_time = t
-                    exit_reason = 'SL'
+                tp_hit = high >= tp
+                sl_hit = low <= sl
+                if tp_hit and sl_hit:
+                    # both hit in same candle. infer which hit first using open price if possible
+                    if open_j >= tp:
+                        exit_price = tp; exit_reason = 'TP_same_candle_via_open'
+                    elif open_j <= sl:
+                        exit_price = sl; exit_reason = 'SL_same_candle_via_open'
+                    else:
+                        # conservative assume SL first
+                        exit_price = sl; exit_reason = 'SL_same_candle_conservative'
+                    exit_time = df.at[j, 'date_ist']; exit_pos = j
                     break
-                if high >= tp:
-                    exit_price = tp
-                    exit_time = t
-                    exit_reason = 'TP'
+                elif tp_hit:
+                    exit_price = tp; exit_reason = 'TP'
+                    exit_time = df.at[j, 'date_ist']; exit_pos = j
                     break
-            else:
-                if high >= sl:
-                    exit_price = sl
-                    exit_time = t
-                    exit_reason = 'SL'
+                elif sl_hit:
+                    exit_price = sl; exit_reason = 'SL'
+                    exit_time = df.at[j, 'date_ist']; exit_pos = j
                     break
-                if low <= tp:
-                    exit_price = tp
-                    exit_time = t
-                    exit_reason = 'TP'
+            else:  # SHORT
+                tp_hit = low <= tp
+                sl_hit = high >= sl
+                if tp_hit and sl_hit:
+                    if open_j <= tp:
+                        exit_price = tp; exit_reason = 'TP_same_candle_via_open'
+                    elif open_j >= sl:
+                        exit_price = sl; exit_reason = 'SL_same_candle_via_open'
+                    else:
+                        exit_price = sl; exit_reason = 'SL_same_candle_conservative'
+                    exit_time = df.at[j, 'date_ist']; exit_pos = j
                     break
+                elif tp_hit:
+                    exit_price = tp; exit_reason = 'TP'
+                    exit_time = df.at[j, 'date_ist']; exit_pos = j
+                    break
+                elif sl_hit:
+                    exit_price = sl; exit_reason = 'SL'
+                    exit_time = df.at[j, 'date_ist']; exit_pos = j
+                    break
+        # If nothing hit, exit at close after max_hold or at last_allowed_pos whichever is earlier
         if exit_price is None:
-            # exit at close of last available or at end of backtest horizon
-            exit_price = df['close'].iloc[min(i+max_hold, n-1)]
-            exit_time = df.index[min(i+max_hold, n-1)]
+            final_pos = min(pos+max_hold, last_allowed_pos)
+            exit_price = float(df.at[final_pos, 'close'])
+            exit_time = df.at[final_pos, 'date_ist']
             exit_reason = 'TIMEOUT'
+            exit_pos = final_pos
 
+        # pnl sign correct
         pnl = (exit_price - entry_price) if side == 'long' else (entry_price - exit_price)
-        points = pnl
         trades.append({
+            'entry_pos': pos, 'exit_pos': exit_pos,
             'entry_time': entry_time, 'exit_time': exit_time,
             'side': side, 'entry': entry_price, 'exit': exit_price,
-            'tp': tp, 'sl': sl, 'reason': sig['reason'],
-            'exit_reason': exit_reason, 'prob': sig['prob'],
-            'pnl': pnl, 'points': points, 'duration': (exit_time - entry_time)
+            'tp': tp, 'sl': sl, 'reason': sig.get('reason',''),
+            'exit_reason': exit_reason, 'prob': sig.get('prob', 0.5),
+            'pnl': pnl, 'duration_candles': exit_pos - pos
         })
-        # avoid overlapping trades: set taken_until to j
-        taken_until = df.index.get_loc(exit_time) if exit_time in df.index else i+1
-    # compute metrics
-    df_tr = pd.DataFrame(trades)
-    if df_tr.empty:
-        metrics = {
-            'net_pnl': 0, 'total_trades': 0, 'win_rate':0, 'avg_points':0,
-            'positive_trades':0, 'negative_trades':0
-        }
+        taken_until_pos = exit_pos
+
+    tr_df = pd.DataFrame(trades)
+    if tr_df.empty:
+        metrics = {'net_pnl':0.0, 'total_trades':0, 'win_rate':0.0, 'avg_points':0.0, 'positive_trades':0, 'negative_trades':0}
     else:
-        net = df_tr['pnl'].sum()
-        total = len(df_tr)
-        pos = (df_tr['pnl'] > 0).sum()
-        neg = (df_tr['pnl'] <= 0).sum()
-        win_rate = pos/total if total>0 else 0
-        avg = df_tr['pnl'].mean()
-        metrics = {'net_pnl': net, 'total_trades': total, 'win_rate': win_rate,
-                   'avg_points': avg, 'positive_trades': pos, 'negative_trades': neg}
-    return trades, metrics
+        net = tr_df['pnl'].sum()
+        total = len(tr_df)
+        pos_count = (tr_df['pnl'] > 0).sum()
+        neg_count = (tr_df['pnl'] <= 0).sum()
+        win_rate = pos_count / total if total>0 else 0.0
+        avg_pts = tr_df['pnl'].mean()
+        metrics = {'net_pnl': float(net), 'total_trades': int(total), 'win_rate': float(win_rate),
+                   'avg_points': float(avg_pts), 'positive_trades': int(pos_count), 'negative_trades': int(neg_count)}
+    return tr_df, metrics
 
 # ---------------------------
-# Optimization engines: random search & grid search
+# Optimization
 # ---------------------------
-def random_search(df, param_space, n_iter, mode, end_date, target_accuracy=0.6, min_points=0.0, progress_bar=None):
-    best = None
-    best_score = -1e9
-    results = []
+def random_search(df, param_space, n_iter, mode, end_pos, target_accuracy=0.6, min_points=0.0, prog=None):
+    best = None; best_score = -1e12; results=[]
     for it in range(n_iter):
         params = {}
         for k, v in param_space.items():
             if isinstance(v, list):
                 params[k] = random.choice(v)
-            elif isinstance(v, tuple) and len(v) == 2:
+            elif isinstance(v, tuple) and len(v)==2:
                 params[k] = random.uniform(v[0], v[1])
             else:
                 params[k] = v
-        trades, metrics = backtest_with_params(df, params, mode=mode, end_date=end_date)
-        # scoring: prefer higher net_pnl but penalize low win rate below target_accuracy
-        score = metrics.get('net_pnl',0) + 1000 * (metrics.get('win_rate',0) - target_accuracy)
-        # penalize too few points
+        trades, metrics = backtest_with_params(df, params, mode=mode, end_pos=end_pos)
+        score = metrics.get('net_pnl',0) + 1000*(metrics.get('win_rate',0) - target_accuracy)
         if metrics.get('avg_points',0) < min_points:
             score -= abs(min_points - metrics.get('avg_points',0)) * 100
         results.append((params, metrics, trades, score))
         if score > best_score:
             best_score = score
             best = (params, metrics, trades)
-        if progress_bar:
-            progress_bar.progress(int((it+1)/n_iter*100))
+        if prog:
+            prog.progress(int((it+1)/n_iter*100))
     return best, results
 
-def grid_search(df, param_grid, mode, end_date, target_accuracy=0.6, min_points=0.0, progress_bar=None):
+def grid_search(df, param_grid, mode, end_pos, target_accuracy=0.6, min_points=0.0, prog=None):
     keys = list(param_grid.keys())
     combos = list(product(*(param_grid[k] for k in keys)))
-    best = None
-    best_score = -1e9
-    results = []
+    best=None; best_score=-1e12; results=[]
     for idx, combo in enumerate(combos):
-        params = {k: combo[i] for i,k in enumerate(keys)}
-        trades, metrics = backtest_with_params(df, params, mode=mode, end_date=end_date)
-        score = metrics.get('net_pnl',0) + 1000 * (metrics.get('win_rate',0) - target_accuracy)
+        params = {keys[i]: combo[i] for i in range(len(keys))}
+        trades, metrics = backtest_with_params(df, params, mode=mode, end_pos=end_pos)
+        score = metrics.get('net_pnl',0) + 1000*(metrics.get('win_rate',0) - target_accuracy)
         if metrics.get('avg_points',0) < min_points:
             score -= abs(min_points - metrics.get('avg_points',0)) * 100
         results.append((params, metrics, trades, score))
         if score > best_score:
             best_score = score
             best = (params, metrics, trades)
-        if progress_bar:
-            progress_bar.progress(int((idx+1)/len(combos)*100))
+        if prog:
+            prog.progress(int((idx+1)/len(combos)*100))
     return best, results
 
 # ---------------------------
-# Presentation / Summaries
+# Presentation helpers
 # ---------------------------
 def human_summary(df):
-    # 100-word approx summary of the stock data
-    period_days = (df.index.max() - df.index.min()).days if not df.empty else 0
-    mean_return = df['ret'].mean() * 252 if 'ret' in df else 0
-    vol = df['ret'].std() * np.sqrt(252) if 'ret' in df else 0
-    up = (df['ret']>0).mean() if 'ret' in df else 0
-    s = f"This dataset spans {period_days} days from {df.index.min()} to {df.index.max()}. The annualized mean return is approximately {mean_return:.2%} with volatility around {vol:.2%}. Positive-return days account for {up:.1%} of the sample. Price structure shows SMA20 vs SMA50 trend: currently {'bullish' if df['sma20'].iloc[-1] > df['sma50'].iloc[-1] else 'bearish'}. Volume patterns and price action will be used to detect supply/demand, breakouts and traps. The system will search for tradeable chart patterns and optimize entry/SL/targets to aim for higher returns than buy-and-hold while controlling risk."
+    if df.empty:
+        return "No data."
+    period_days = (df.index.max() - df.index.min()).days
+    mean_return = df['ret'].mean() * 252
+    vol = df['ret'].std() * np.sqrt(252)
+    up = (df['ret']>0).mean()
+    trend = 'bullish' if df['sma20'].iloc[-1] > df['sma50'].iloc[-1] else 'bearish'
+    s = (f"This dataset spans {period_days} days from {df.index.min()} to {df.index.max()}. "
+         f"Annualized mean return ~{mean_return:.2%} with volatility ~{vol:.2%}. "
+         f"Positive days {up:.1%}. Current structure: {trend}. "
+         "System will detect patterns, supply/demand, and optimize entries with strict no-future-leak rules.")
     return s
 
-def trade_reason_text(trade):
-    # Compose human readable reason
-    txt = f"{trade['side'].upper()} entry at {trade['entry']:.2f} on {trade['entry_time']}.\n"
-    txt += f"Exit at {trade['exit']:.2f} on {trade['exit_time']} due to {trade['exit_reason']}. "
-    txt += f"TP {trade['tp']:.2f}, SL {trade['sl']:.2f}. P&L: {trade['pnl']:.2f}.\n"
-    txt += f"Logic: {trade['reason']}. Estimated probability: {trade['prob']:.2f}."
-    return txt
+def trade_reason_text(tr):
+    return (f"{tr['side'].upper()} entry {tr['entry']:.2f} @ {tr['entry_time']} -> exit {tr['exit']:.2f} @ {tr['exit_time']} "
+            f"({tr['exit_reason']}). TP {tr['tp']:.2f} SL {tr['sl']:.2f}. PnL {tr['pnl']:.4f}. Logic: {tr['reason']}. Prob {tr['prob']}")
 
 # ---------------------------
 # Streamlit UI
 # ---------------------------
-st.title("Swing Trading Recommender (Automated Backtest + Live Recommendation)")
-st.sidebar.header("Upload & Settings")
+st.title("Swing Trading Recommender — FIXED (No lookahead; entry on candle close)")
 
+st.sidebar.header("Upload & Settings")
 uploaded_file = st.sidebar.file_uploader("Upload OHLCV CSV or Excel", type=['csv','xlsx','xls'])
 mode = st.sidebar.selectbox("Direction", ['both','long','short'])
 search_method = st.sidebar.selectbox("Optimization Method", ['random_search','grid_search'])
-n_iter = st.sidebar.number_input("Random search iterations", min_value=5, max_value=2000, value=50, step=5)
-grid_iters = st.sidebar.number_input("Grid search max combos (for safety)", min_value=1, max_value=1000, value=200)
-desired_accuracy = st.sidebar.slider("Desired minimum win rate (0-1)", 0.0, 1.0, 0.65)
-min_points = st.sidebar.number_input("Minimum average points per trade (fraction of price, e.g., 0.01)", value=0.005, step=0.001, format="%.4f")
-progress_bar = st.sidebar.empty()
+n_iter = st.sidebar.number_input("Random search iterations", min_value=5, max_value=2000, value=60, step=5)
+grid_limit = st.sidebar.number_input("Grid combos limit", min_value=1, max_value=2000, value=300)
+desired_accuracy = st.sidebar.slider("Target minimum win rate", 0.0, 1.0, 0.65)
+min_points = st.sidebar.number_input("Min average points/trade (fraction)", value=0.005, step=0.001, format="%.4f")
 
 if uploaded_file is None:
-    st.info("Upload your historical OHLCV file (CSV or Excel). Column names can be anything — the app will map common names.")
+    st.info("Upload OHLCV file (CSV / Excel). The app will map columns automatically.")
     st.stop()
 
-# read the file
+# read file
 try:
-    if uploaded_file.name.endswith('.csv'):
+    if uploaded_file.name.lower().endswith('.csv'):
         df_raw = pd.read_csv(uploaded_file)
     else:
         df_raw = pd.read_excel(uploaded_file)
@@ -549,207 +512,157 @@ except Exception as e:
     st.error(f"Failed to read file: {e}")
     st.stop()
 
-# Map columns
 mapped_df, mapping = map_columns(df_raw)
-mapped_df = clean_numeric_columns(mapped_df)
-# copy original date column to maintain for timezone parsing
 mapped_df['date_orig'] = df_raw[mapping.get('date')] if mapping.get('date') in df_raw.columns else df_raw.iloc[:,0]
-# convert date and set IST index
+mapped_df = clean_numeric_columns(mapped_df)
+
+# convert to datetime index IST
 try:
-    df_timeindexed = convert_to_datetime_index(mapped_df, date_col='date_orig')
+    df_idxed = convert_to_datetime_index(mapped_df, mapped_df['date_orig'])
 except Exception as e:
-    st.warning("Date parsing had issues - attempting simple parse.")
+    st.warning("Date parsing trouble: attempting simpler parse.")
     mapped_df['date_orig'] = pd.to_datetime(mapped_df['date_orig'], errors='coerce')
-    df_timeindexed = mapped_df.set_index('date_orig')
+    df_idxed = mapped_df.set_index('date_orig')
+df_idxed = df_idxed.sort_index(ascending=True)
+df_idxed = clean_numeric_columns(df_idxed)
+df_idxed = add_basic_indicators(df_idxed)
 
-df_timeindexed = df_timeindexed.sort_index(ascending=True)
-df_timeindexed = clean_numeric_columns(df_timeindexed)
-df_timeindexed = add_basic_indicators(df_timeindexed)
-
-# top/bottom rows, min/max dates and prices
-col1, col2 = st.columns([1,2])
+st.subheader("Data Preview & Mapping")
+col1, col2 = st.columns([1,1])
 with col1:
-    st.subheader("Data Preview")
     st.write("Detected mapping:", mapping)
-    st.write("Top 5 rows")
-    st.write(df_timeindexed.head(5))
-    st.write("Bottom 5 rows")
-    st.write(df_timeindexed.tail(5))
+    st.write("Top 5:")
+    st.write(df_idxed.head(5))
 with col2:
-    st.subheader("Summary stats")
-    st.write("Date range:", df_timeindexed.index.min(), "to", df_timeindexed.index.max())
-    st.write("Price min/max:", df_timeindexed['close'].min(), df_timeindexed['close'].max())
+    st.write("Bottom 5:")
+    st.write(df_idxed.tail(5))
+st.write("Date range:", df_idxed.index.min(), "to", df_idxed.index.max())
+st.write("Price min/max:", df_idxed['close'].min(), df_idxed['close'].max())
 
-# End date selection for backtest horizon
-default_end = df_timeindexed.index.max()
-end_date = st.sidebar.date_input("Select simulation end date (inclusive)", value=default_end.date(), min_value=df_timeindexed.index.min().date(), max_value=df_timeindexed.index.max().date())
-# convert chosen date to timestamp at end of day IST
+# end-date control (user can simulate backtest stopping at a date)
+end_default = df_idxed.index.max()
+end_date = st.sidebar.date_input("Select backtest end date (inclusive)", value=end_default.date(), min_value=df_idxed.index.min().date(), max_value=df_idxed.index.max().date())
 end_dt = pd.to_datetime(str(end_date)).tz_localize('Asia/Kolkata') + pd.Timedelta(days=1) - pd.Timedelta(seconds=1)
+# convert end_dt to position index
+end_pos = df_idxed.reset_index().index[df_idxed.reset_index()['date_ist'] <= end_dt][-1] if not df_idxed.reset_index()[df_idxed.reset_index()['date_ist'] <= end_dt].empty else len(df_idxed)-1
 
-# EDA: raw plot and heatmap of returns Year vs Month
-st.subheader("Raw Candlestick Chart (last 300 candles)")
-last_n = st.slider("Candles to show", min_value=50, max_value=min(2000, len(df_timeindexed)), value=min(300, len(df_timeindexed)))
-plot_df = df_timeindexed.iloc[-last_n:].reset_index()
-fig = go.Figure(data=[go.Candlestick(x=plot_df['date_ist'],
-                open=plot_df['open'], high=plot_df['high'],
-                low=plot_df['low'], close=plot_df['close'])])
+st.subheader("Candlestick (last N candles)")
+last_n = st.slider("Candles to show", 50, min(2000, len(df_idxed)), value=min(300, len(df_idxed)))
+plot_df = df_idxed.iloc[-last_n:].reset_index()
+fig = go.Figure(data=[go.Candlestick(x=plot_df['date_ist'], open=plot_df['open'], high=plot_df['high'], low=plot_df['low'], close=plot_df['close'])])
 fig.update_layout(height=450, margin=dict(l=10,r=10,t=30,b=10))
 st.plotly_chart(fig, use_container_width=True)
 
-st.subheader("Returns Heatmap (Year vs Month)")
-df_timeindexed['year'] = df_timeindexed.index.year
-df_timeindexed['month'] = df_timeindexed.index.month
-monthly = df_timeindexed.groupby(['year','month'])['ret'].sum().unstack(level=0).fillna(0).T
+st.subheader("Returns heatmap (Year vs Month)")
+df_idxed['year'] = df_idxed.index.year
+df_idxed['month'] = df_idxed.index.month
+monthly = df_idxed.groupby(['year','month'])['ret'].sum().unstack(level=0).fillna(0).T
 fig2, ax2 = plt.subplots(figsize=(10,3))
 sns.heatmap(monthly, annot=True, fmt=".2f", cmap='RdYlGn', ax=ax2)
 st.pyplot(fig2)
 
-st.subheader("100-word Summary of Data")
-st.write(human_summary(df_timeindexed))
+st.subheader("100-word summary")
+st.write(human_summary(df_idxed))
 
-# Prepare parameter space for optimization (user could later expand or we can auto tune)
-st.sidebar.header("Optimization Parameter Ranges")
-# defaults
+# parameter search space
+st.sidebar.header("Optimizer parameter ranges")
 param_space = {
-    'sl_pct': (0.005, 0.05),           # percent SL of price when random; for grid we'll sample set
-    'sl_atr_mult': (0.2, 1.5),
-    'tp_ratio': (1.0, 4.0),
-    'min_prob': (0.52, 0.7),
-    'vol_mult': [1.5, 2.0, 2.5, 3.0],
+    'sl_pct': (0.004, 0.04),
+    'sl_atr_mult': (0.2, 1.2),
+    'tp_ratio': (1.0, 3.5),
+    'min_prob': (0.52, 0.8),
+    'vol_mult': [1.5, 2.0, 2.5],
     'sr_lookback': [5,10,20],
-    'max_hold': [5, 10, 20, 40],
+    'max_hold': [5,10,20,40],
     'min_points': (min_points, min_points+0.02)
 }
+st.sidebar.write("Default ranges set. Random search samples continuous ranges; grid discretizes.")
 
-st.info("Default parameter ranges are set. The optimizer will sample these ranges. Grid search will enumerate small grids; random search samples.")
+run_button = st.button("Run Optimization & Backtest")
+progress_placeholder = st.sidebar.empty()
 
-# Create progress bar
-global_progress = st.progress(0)
-
-# Run optimization
-st.subheader("Optimizer & Backtest")
-run_opt = st.button("Run Optimization & Backtest (this may take time)")
-best_result = None
-
-if run_opt:
-    progress_bar = st.sidebar.progress(0)
+if run_button:
+    prog = progress_placeholder.progress(0)
     if search_method == 'random_search':
-        # random search
-        best, results = random_search(df_timeindexed, param_space, n_iter=n_iter, mode=mode, end_date=end_dt, target_accuracy=desired_accuracy, min_points=min_points, progress_bar=progress_bar)
+        best, results = random_search(df_idxed, param_space, n_iter, mode, end_pos=end_pos, target_accuracy=desired_accuracy, min_points=min_points, prog=prog)
     else:
-        # build grid (coerce continuous ranges into small discrete for safety)
+        # discretize continuous ranges into 3 points each
         param_grid = {}
         for k,v in param_space.items():
             if isinstance(v, tuple) and len(v)==2:
-                # sample 3 points between
-                param_grid[k] = np.linspace(v[0], v[1], num=3).tolist()
+                param_grid[k] = list(np.linspace(v[0], v[1], 3))
             elif isinstance(v, list):
                 param_grid[k] = v
             else:
                 param_grid[k] = [v]
-        # safety: limit combos
         combos = 1
-        for k in param_grid:
-            combos *= len(param_grid[k])
-        if combos > grid_iters:
-            st.warning(f"Grid combos ({combos}) exceed your limit ({grid_iters}). Reduce grid size or increase limit.")
-            progress_bar.empty()
+        for k in param_grid: combos *= len(param_grid[k])
+        if combos > grid_limit:
+            st.error(f"Grid combos {combos} exceeds limit {grid_limit}. Reduce grid or increase limit.")
+            prog.empty()
             st.stop()
-        best, results = grid_search(df_timeindexed, param_grid, mode=mode, end_date=end_dt, target_accuracy=desired_accuracy, min_points=min_points, progress_bar=progress_bar)
+        best, results = grid_search(df_idxed, param_grid, mode, end_pos=end_pos, target_accuracy=desired_accuracy, min_points=min_points, prog=prog)
+    prog.empty()
+    if not best:
+        st.warning("No valid strategy found.")
+        st.stop()
+    best_params, best_metrics, best_trades = best
+    st.success("Optimization completed — best strategy selected")
+    st.subheader("Best parameters")
+    st.json(best_params)
+    st.subheader("Backtest metrics")
+    st.metric("Net PnL (price units)", f"{best_metrics.get('net_pnl',0):.4f}")
+    st.metric("Total trades", best_metrics.get('total_trades',0))
+    st.metric("Win rate", f"{best_metrics.get('win_rate',0):.2%}")
+    st.metric("Avg points/trade", f"{best_metrics.get('avg_points',0):.6f}")
 
-    progress_bar.empty()
-    if best is None:
-        st.warning("No strategy found with given constraints.")
+    if not best_trades.empty:
+        st.subheader("Trade log (most recent 200)")
+        display_df = best_trades[['entry_time','exit_time','side','entry','exit','tp','sl','pnl','exit_reason','reason','prob','duration_candles']].sort_values('entry_time')
+        st.dataframe(display_df.tail(200))
+        st.subheader("Trade explanations (last 20)")
+        for idx, tr in display_df.tail(20).iterrows():
+            st.markdown(f"**Trade {idx+1}** — {tr['side'].upper()} | Entry {tr['entry']:.2f} | Exit {tr['exit']:.2f} | PnL {tr['pnl']:.4f}")
+            st.write(trade_reason_text(tr))
     else:
-        best_params, best_metrics, best_trades = best
-        st.success("Found best strategy!")
-        st.write("Best Parameters:")
-        st.json(best_params)
-        st.write("Best Metrics:")
-        st.json(best_metrics)
-        st.subheader("Backtest Trade Log (most recent 200)")
-        if isinstance(best_trades, list) and len(best_trades)>0:
-            df_tr = pd.DataFrame(best_trades)
-            # show details for each trade including reasons
-            st.dataframe(df_tr[['entry_time','exit_time','side','entry','exit','tp','sl','pnl','exit_reason','reason','prob']].sort_values('entry_time').tail(200))
-            # show human readable reasons for last 20 trades
-            st.subheader("Trade Explanations (last 20)")
-            for idx, row in df_tr.tail(20).iterrows():
-                st.markdown(f"**Trade {idx+1}** — {row['side'].upper()} | Entry: {row['entry']:.2f} | Exit: {row['exit']:.2f} | PnL: {row['pnl']:.2f}")
-                st.write(trade_reason_text(row))
+        st.write("No trades executed with these parameters.")
+
+    st.subheader("Backtest narrative")
+    st.write((f"Backtest until {end_dt} yielded net PnL {best_metrics.get('net_pnl',0):.4f} across {best_metrics.get('total_trades',0)} trades. "
+              f"Win rate {best_metrics.get('win_rate',0):.2%}. Strategy params: {best_params}. "
+              "Entries are always on the close of the signal candle; exits respect intrabar TP/SL using high/low and conservative same-candle handling."))
+
+    st.subheader("Live recommendation (based on last candle close & best strategy)")
+    # find signal at last candle position if exists
+    last_pos = len(df_idxed)-1
+    # generate signals on full df but we will pick the one with pos == last_pos
+    live_signals = generate_signals(df_idxed, best_params)
+    cand = None
+    for s in reversed(live_signals):
+        if s['pos'] == last_pos:
+            cand = s; break
+    if cand is None:
+        # pick latest signal before last but not after end_pos
+        recent = [s for s in live_signals if s['pos'] <= last_pos]
+        cand = recent[-1] if recent else None
+
+    if cand is None:
+        st.info("No live signal found in recent data using best strategy.")
+    else:
+        entry_price = float(df_idxed['close'].iloc[last_pos])
+        atr = float(df_idxed['atr14'].iloc[last_pos]) if 'atr14' in df_idxed.columns else 0.0
+        sl_dist = max(best_params.get('sl_pct',0.02)*entry_price, best_params.get('sl_atr_mult',0.5)*atr)
+        tp_dist = max(best_params.get('tp_ratio',2.0)*sl_dist, best_params.get('min_points',0.01)*entry_price)
+        if cand['side']=='long':
+            sl = entry_price - sl_dist; tp = entry_price + tp_dist
         else:
-            st.write("No trades executed with the best parameters.")
-
-        # Aggregate metrics
-        st.subheader("Aggregate Backtest Metrics")
-        st.metric("Net P&L (points)", value=f"{best_metrics.get('net_pnl',0):.2f}")
-        st.metric("Total Trades", value=best_metrics.get('total_trades',0))
-        st.metric("Win Rate", value=f"{best_metrics.get('win_rate',0):.2%}")
-        st.metric("Avg Points/Trade", value=f"{best_metrics.get('avg_points',0):.4f}")
-
-        st.subheader("Backtest Written Summary")
-        summary_lines = []
-        summary_lines.append(f"Backtest ran until {end_dt}. Net PnL: {best_metrics.get('net_pnl',0):.2f} points across {best_metrics.get('total_trades',0)} trades with a win rate of {best_metrics.get('win_rate',0):.2%}.")
-        summary_lines.append(f"Strategy used parameters: {best_params}. Average points per trade: {best_metrics.get('avg_points',0):.4f}.")
-        summary_lines.append("Recommendations for live: follow same rules. Enter on close of signal candle. Use SL and TP as optimized. Monitor volume spikes & pattern confluence for higher probability.")
-        st.write(" ".join(summary_lines))
-
-        # Live recommendation using best params and last candle close
-        st.subheader("Live Recommendation (based on last available candle close)")
-        live_params = best_params
-        live_signals = generate_signals(df_timeindexed.tail(200), live_params)
-        # we want signals that occur at the last candle index
-        if len(live_signals) == 0:
-            st.info("No live signal in recent candles using best strategy.")
-        else:
-            # find the latest signal at last candle index
-            last_idx = df_timeindexed.index[-1]
-            candidate = None
-            # prefer signal exactly on last candle (entry on its close)
-            for s in live_signals[::-1]:
-                if s['index'] == last_idx:
-                    candidate = s
-                    break
-            if candidate is None:
-                # pick the latest signal before last candle but not after end_dt
-                candidate = live_signals[-1]
-            # Compose live trade structure using same exit rules as backtest but applied forward
-            fake_trades, _ = backtest_with_params(df_timeindexed.tail(500), live_params, mode=mode, end_date=None)
-            # We want the entry that matches candidate
-            # Build live recommendation from candidate heuristics:
-            entry_price = df_timeindexed['close'].iloc[-1]
-            # Compute SL/TP like backtester
-            atr = df_timeindexed['high'].rolling(14).max().iloc[-1] - df_timeindexed['low'].rolling(14).min().iloc[-1]
-            sl_dist = max(live_params.get('sl_pct', 0.02) * entry_price, live_params.get('sl_atr_mult', 0.5) * (atr if not np.isnan(atr) else entry_price*0.02))
-            tp_dist = max(live_params.get('tp_ratio', 2.0) * sl_dist, live_params.get('min_points', 0.01)*entry_price)
-            side = candidate['side']
-            if side == 'long':
-                sl = entry_price - sl_dist
-                tp = entry_price + tp_dist
-            else:
-                sl = entry_price + sl_dist
-                tp = entry_price - tp_dist
-            prob = candidate.get('prob', 0.55)
-            st.markdown(f"**{side.upper()}** entry at **{entry_price:.2f}** (on close of last candle {last_idx}).")
-            st.markdown(f"- Target (TP): **{tp:.2f}**")
-            st.markdown(f"- Stop Loss (SL): **{sl:.2f}**")
-            st.markdown(f"- Estimated Probability of Profit: **{prob:.2%}** (heuristic from pattern/volume/trend confluence)")
-            st.markdown(f"- Reason/Logic: {candidate.get('reason')}")
-            st.markdown("**Note**: Enter on close of the last candle. The system follows strict no-future leakage rules (entry price is candle close).")
-            # Add psychology summary
-            st.subheader("Candlestick & Market Psychology (Live)")
-            psych = []
-            if df_timeindexed['sma20'].iloc[-1] > df_timeindexed['sma50'].iloc[-1]:
-                psych.append("Short-term trend is bullish (SMA20 > SMA50). Buyers are in control on moving averages.")
-            else:
-                psych.append("Short-term trend is bearish (SMA20 < SMA50). Sellers are dominant on moving averages.")
-            if df_timeindexed['volume'].iloc[-1] > df_timeindexed['vol_ma20'].iloc[-1]*1.5:
-                psych.append("Recent volume is higher than 20-period average — higher participation (confirming move).")
-            if is_bullish_bearish_candle(df_timeindexed, len(df_timeindexed)-1) == 'bull':
-                psych.append("Last candle shows bullish psychology (hammer/engulfing).")
-            elif is_bullish_bearish_candle(df_timeindexed, len(df_timeindexed)-1) == 'bear':
-                psych.append("Last candle shows bearish psychology (inversion/engulfing).")
-            st.write("\n".join(psych))
+            sl = entry_price + sl_dist; tp = entry_price - tp_dist
+        st.markdown(f"**{cand['side'].upper()}** entry at **{entry_price:.4f}** (close of last candle)")
+        st.markdown(f"- Target (TP): **{tp:.4f}**")
+        st.markdown(f"- Stop Loss (SL): **{sl:.4f}**")
+        st.markdown(f"- Reason: {cand['reason']}")
+        st.markdown(f"- Estimated prob: {cand['prob']:.2%}")
+        st.markdown("**Strict rule**: enter on close of the last candle. No use of next candle open.")
 
 st.sidebar.markdown("---")
-st.sidebar.write("Developed: Automated swing trading framework. Entries happen on close candle; optimization supports random/grid search. Extend detectors as needed.")
+st.sidebar.write("Fixes included: causal pattern detection, ATR-based SL, intrabar handling, deduplication, and conservative same-candle rules.")
