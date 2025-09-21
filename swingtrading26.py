@@ -4,205 +4,238 @@ import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
 from datetime import datetime
-from dateutil import tz
-from tqdm import tqdm
-import warnings
+import pytz
 
-warnings.filterwarnings("ignore")
+st.set_page_config(layout="wide", page_title="Advanced Swing Trading Platform with Patterns")
 
-st.set_page_config(layout="wide", page_title="Advanced Swing Trading Recommender")
+st.title("🔮 Advanced Swing Trading with Chart Patterns and Psychology")
 
-# ----------------------
-# Helper Functions
-# ----------------------
-def map_columns(df):
-    df_cols = df.columns.str.lower()
-    col_map = {}
-    for col in df_cols:
-        if 'open' in col:
-            col_map['open'] = col
-        elif 'high' in col:
-            col_map['high'] = col
-        elif 'low' in col:
-            col_map['low'] = col
-        elif 'close' in col:
-            col_map['close'] = col
-        elif 'volume' in col or 'shares' in col or 'qty' in col:
-            col_map['volume'] = col
-        elif 'date' in col or 'time' in col:
-            col_map['date'] = col
-    return col_map
-
-def convert_to_ist(df, date_col):
-    from_zone = tz.gettz('UTC')
-    to_zone = tz.gettz('Asia/Kolkata')
-    df[date_col] = pd.to_datetime(df[date_col])
-    df[date_col] = df[date_col].dt.tz_localize(from_zone).dt.tz_convert(to_zone)
-    return df
-
-def plot_data(df, col_map):
-    plt.figure(figsize=(15,5))
-    plt.plot(df[col_map['date']], df[col_map['close']], label='Close Price', color='blue')
-    plt.title('Raw Price Data')
-    plt.xlabel('Date')
-    plt.ylabel('Price')
-    plt.grid(True)
-    st.pyplot(plt.gcf())
-
-def compute_returns(df, col_map):
-    df['returns'] = df[col_map['close']].pct_change()
-    df['month'] = df[col_map['date']].dt.month
-    df['year'] = df[col_map['date']].dt.year
-    pivot = df.pivot_table(index='year', columns='month', values='returns', aggfunc='sum')
-    plt.figure(figsize=(10,6))
-    sns.heatmap(pivot, annot=True, fmt=".2%", cmap="RdYlGn")
-    plt.title("Year vs Month Returns Heatmap")
-    st.pyplot(plt.gcf())
-
-def summarize_data(df, col_map):
-    text = f"""
-    The data contains {len(df)} rows from {df[col_map['date']].min().date()} 
-    to {df[col_map['date']].max().date()}. Price ranges from {df[col_map['low']].min()} 
-    to {df[col_map['high']].max()}. The dataset shows typical market behavior with trends, 
-    pullbacks, and volatility. Key opportunities may arise at support/resistance, demand/supply zones, 
-    and recognizable chart patterns. Traders can leverage these zones to enter swing trades 
-    with defined risk and reward.
-    """
-    return text
-
-# ----------------------
-# Price Action & Chart Pattern Logic
-# ----------------------
-def identify_price_action(df, col_map):
-    """Simplified example of trendlines, support/resistance, and fake breakouts"""
-    signals = []
-    for i in range(1, len(df)-1):
-        prev = df[col_map['close']].iloc[i-1]
-        curr = df[col_map['close']].iloc[i]
-        nxt = df[col_map['close']].iloc[i+1]
-        
-        # Simple support resistance detection
-        if curr < prev and curr < nxt:
-            signals.append((df[col_map['date']].iloc[i], curr, "Support Zone"))
-        elif curr > prev and curr > nxt:
-            signals.append((df[col_map['date']].iloc[i], curr, "Resistance Zone"))
-        # Fake breakout detection
-        if curr > prev*1.02:
-            signals.append((df[col_map['date']].iloc[i], curr, "Bullish Trap/Fake Breakout"))
-        elif curr < prev*0.98:
-            signals.append((df[col_map['date']].iloc[i], curr, "Bearish Trap/Fake Breakout"))
-    return signals
-
-def backtest_strategy(df, col_map, long_short='both'):
-    """Simplified price action-based backtesting logic"""
-    results = []
-    capital = 100000
-    risk_per_trade = 0.01
-    stop_loss_pct = 0.02
-    take_profit_pct = 0.04
-    signals = identify_price_action(df, col_map)
-    
-    for date, price, reason in signals:
-        if long_short in ['long', 'both']:
-            entry = price
-            sl = entry * (1 - stop_loss_pct)
-            target = entry * (1 + take_profit_pct)
-            results.append({'Entry': entry, 'SL': sl, 'Target': target, 
-                            'Reason': reason, 'Direction': 'Long', 'Entry Date': date})
-        if long_short in ['short', 'both']:
-            entry = price
-            sl = entry * (1 + stop_loss_pct)
-            target = entry * (1 - take_profit_pct)
-            results.append({'Entry': entry, 'SL': sl, 'Target': target, 
-                            'Reason': reason, 'Direction': 'Short', 'Entry Date': date})
-    
-    results_df = pd.DataFrame(results)
-    return results_df
-
-# ----------------------
-# Streamlit UI
-# ----------------------
-st.title("Advanced Swing Trading Recommender")
-
-uploaded_file = st.file_uploader("Upload OHLC Data (CSV/Excel)", type=['csv', 'xlsx'])
-
+# ------------------------
+# File Upload & Column Mapping
+# ------------------------
+uploaded_file = st.file_uploader("Upload OHLCV Data (CSV/Excel)", type=["csv", "xlsx"])
 if uploaded_file:
-    if uploaded_file.name.endswith('.csv'):
-        df = pd.read_csv(uploaded_file)
-    else:
-        df = pd.read_excel(uploaded_file)
-    
-    st.success("File Uploaded Successfully!")
-    
-    # Column Mapping
-    col_map = map_columns(df)
-    
-    st.write("Column Mapping Detected:")
-    st.json(col_map)
-    
-    # Convert date to IST
-    df = convert_to_ist(df, col_map['date'])
-    
-    # Sort ascending to avoid future data leak
-    df = df.sort_values(by=col_map['date']).reset_index(drop=True)
-    
-    st.write("Top 5 Rows:")
-    st.dataframe(df.head())
-    
-    st.write("Bottom 5 Rows:")
-    st.dataframe(df.tail())
-    
-    st.write(f"Max Date: {df[col_map['date']].max()}")
-    st.write(f"Min Date: {df[col_map['date']].min()}")
-    st.write(f"Max Price: {df[col_map['high']].max()}")
-    st.write(f"Min Price: {df[col_map['low']].min()}")
-    
-    # Plot raw data
-    plot_data(df, col_map)
-    
-    # Returns heatmap
-    compute_returns(df, col_map)
-    
-    # Human readable summary
-    summary_text = summarize_data(df, col_map)
-    st.write("Data Summary:")
-    st.write(summary_text)
-    
-    # Select end date for backtesting
-    end_date = st.date_input("Select End Date for Backtesting", value=df[col_map['date']].max().date(),
-                             min_value=df[col_map['date']].min().date(),
-                             max_value=df[col_map['date']].max().date())
-    
-    long_short = st.selectbox("Select Trade Direction", ["long", "short", "both"])
-    search_type = st.selectbox("Select Optimization Type", ["random_search", "grid_search"])
-    desired_accuracy = st.slider("Desired Accuracy (%)", min_value=50, max_value=99, value=80)
-    points_needed = st.number_input("Number of Points Needed", min_value=1, max_value=50, value=5)
-    
-    # Filter data for backtesting
-    df_bt = df[df[col_map['date']].dt.date <= end_date].copy()
-    
-    st.info("Backtesting in Progress...")
+    try:
+        if uploaded_file.name.endswith(".csv"):
+            df = pd.read_csv(uploaded_file)
+        else:
+            df = pd.read_excel(uploaded_file)
+    except Exception as e:
+        st.error(f"Error reading file: {e}")
+        st.stop()
+
+    # Column mapping
+    col_map = {}
+    for col in df.columns:
+        c = col.lower()
+        if 'date' in c:
+            col_map['date'] = col
+        elif 'open' in c:
+            col_map['open'] = col
+        elif 'high' in c:
+            col_map['high'] = col
+        elif 'low' in c:
+            col_map['low'] = col
+        elif 'close' in c:
+            col_map['close'] = col
+        elif 'volume' in c or 'shares' in c or 'traded' in c:
+            col_map['volume'] = col
+
+    required_cols = ['date', 'open', 'high', 'low', 'close', 'volume']
+    if not all(rc in col_map for rc in required_cols):
+        st.error(f"Uploaded file missing required columns. Detected columns: {list(col_map.keys())}")
+        st.stop()
+
+    # Rename columns
+    df = df.rename(columns={v:k for k,v in col_map.items()})
+    df['date'] = pd.to_datetime(df['date']).dt.tz_localize('UTC').dt.tz_convert('Asia/Kolkata')
+    df = df.sort_values('date').reset_index(drop=True)
+
+    st.subheader("✅ Data Overview")
+    st.write(df.head(5))
+    st.write(df.tail(5))
+    st.write(f"Start Date: {df['date'].min()}, End Date: {df['date'].max()}")
+    st.write(f"Max Price: {df['high'].max()}, Min Price: {df['low'].min()}")
+
+    st.subheader("Raw Price Chart")
+    fig, ax = plt.subplots(figsize=(12,4))
+    ax.plot(df['date'], df['close'], label='Close Price')
+    ax.set_title("Price Chart")
+    ax.set_xlabel("Date")
+    ax.set_ylabel("Price")
+    st.pyplot(fig)
+
+    # ------------------------
+    # End date selection for testing past data
+    # ------------------------
+    default_end = df['date'].max()
+    end_date = st.date_input("Select End Date for Backtesting/Recommendation", value=default_end)
+    end_date = pd.Timestamp(end_date).tz_localize('Asia/Kolkata')
+    df_bt = df[df['date'] <= end_date].copy()
+
+    # ------------------------
+    # Exploratory Data Analysis
+    # ------------------------
+    st.subheader("📊 Exploratory Data Analysis (EDA)")
+    df_bt['returns'] = df_bt['close'].pct_change()
+    st.write(df_bt.describe())
+
+    st.write("### Returns Heatmap (Year vs Month)")
+    df_bt['year'] = df_bt['date'].dt.year
+    df_bt['month'] = df_bt['date'].dt.month
+    pivot = df_bt.pivot_table(index='year', columns='month', values='returns', aggfunc='mean')
+    fig, ax = plt.subplots(figsize=(12,4))
+    sns.heatmap(pivot, annot=True, fmt=".2%", cmap='RdYlGn', ax=ax)
+    st.pyplot(fig)
+
+    # Human-readable summary of data
+    summary = f"The uploaded stock has data from {df_bt['date'].min().date()} to {df_bt['date'].max().date()}. Prices ranged between {df_bt['low'].min()} and {df_bt['high'].max()}. Average returns are {df_bt['returns'].mean():.2%}. Opportunities may exist at support/resistance zones, breakout patterns, and high liquidity levels for swing trades."
+    st.info(summary)
+
+    # ------------------------
+    # Strategy Parameters
+    # ------------------------
+    st.subheader("⚙️ Strategy Settings")
+    side = st.selectbox("Select Side", options=['Long', 'Short', 'Both'])
+    search_type = st.selectbox("Optimization Search Type", options=['Random Search','Grid Search'])
+    desired_accuracy = st.slider("Desired Accuracy %", 50, 100, 80)
+    min_points = st.number_input("Minimum Points for Strategy", min_value=1, value=50)
+
+    # ------------------------
+    # Progress Bar
+    # ------------------------
+    progress_text = st.empty()
     progress_bar = st.progress(0)
-    
-    results_df = backtest_strategy(df_bt, col_map, long_short=long_short)
-    
-    for i in range(100):
-        progress_bar.progress(i+1)
-    
-    st.success("Backtesting Completed!")
-    
-    st.write("Backtest Results:")
-    st.dataframe(results_df)
-    
-    # Live recommendation based on last candle
-    st.write("Live Recommendation:")
-    live_signal = backtest_strategy(df.iloc[-1:], col_map, long_short=long_short)
-    st.dataframe(live_signal)
-    
-    st.write("Backtest Summary:")
-    st.write(f"""
-    Total Trades: {len(results_df)}, 
-    No of Long Trades: {len(results_df[results_df['Direction']=='Long'])}, 
-    No of Short Trades: {len(results_df[results_df['Direction']=='Short'])}
-    """)
-    st.write("Use above strategy with proper risk management. Enter trades on closing price of candle when signal forms.")
+
+    # ------------------------
+    # Advanced Price Action & Pattern Detection
+    # ------------------------
+    def detect_support_resistance(df, window=20):
+        df['sup'] = df['low'].rolling(window).min()
+        df['res'] = df['high'].rolling(window).max()
+        return df
+
+    def detect_chart_patterns(df):
+        patterns = []
+        for i in range(2,len(df)-2):
+            # M/W patterns
+            if df['high'][i-1] < df['high'][i] > df['high'][i+1] and df['low'][i-1] > df['low'][i] < df['low'][i+1]:
+                patterns.append((df['date'][i], 'M/W Pattern'))
+            # Head & Shoulders detection
+            if i>3:
+                if (df['high'][i-3]<df['high'][i-2]>df['high'][i-1]<df['high'][i] and df['low'][i-3]>df['low'][i-2]<df['low'][i-1]>df['low'][i]):
+                    patterns.append((df['date'][i-2],'Head & Shoulders'))
+            # Cup & Handle detection (simplified)
+            if i>5:
+                cup_low = df['low'][i-5:i+1].min()
+                cup_high = df['high'][i-5:i+1].max()
+                if df['close'][i] > cup_high*0.95 and df['low'][i-5] > cup_low:
+                    patterns.append((df['date'][i],'Cup & Handle'))
+            # Triangles, Wedges, Flags can be added similarly
+        return patterns
+
+    def detect_trap_zones(df):
+        trap = []
+        for i in range(2,len(df)-2):
+            if df['close'][i] < df['low'][i-1] and df['close'][i+1] > df['high'][i]:
+                trap.append((df['date'][i],'Bull Trap Zone'))
+            if df['close'][i] > df['high'][i-1] and df['close'][i+1] < df['low'][i]:
+                trap.append((df['date'][i],'Bear Trap Zone'))
+        return trap
+
+    def compute_trade_signals(df, side='Both'):
+        df['signal'] = 0
+        df['target'] = np.nan
+        df['sl'] = np.nan
+        df['reason'] = ''
+        for i in range(1,len(df)):
+            # Long breakout
+            if side in ['Long','Both'] and df['close'][i] > df['high'][i-1]:
+                df.at[i,'signal'] = 1
+                df.at[i,'target'] = df['close'][i] + (df['high'][i-1]-df['low'][i-1])
+                df.at[i,'sl'] = df['low'][i-1]
+                df.at[i,'reason'] = f"Breakout above resistance {df['high'][i-1]}"
+            # Short breakout
+            elif side in ['Short','Both'] and df['close'][i] < df['low'][i-1]:
+                df.at[i,'signal'] = -1
+                df.at[i,'target'] = df['close'][i] - (df['high'][i-1]-df['low'][i-1])
+                df.at[i,'sl'] = df['high'][i-1]
+                df.at[i,'reason'] = f"Breakdown below support {df['low'][i-1]}"
+        return df
+
+    # ------------------------
+    # Optimization
+    # ------------------------
+    def optimize_strategy(df, search_type='Random Search', desired_accuracy=80, min_points=50):
+        best_params = {'window':20}
+        if search_type=='Random Search':
+            windows = np.random.randint(5,50,10)
+        else:
+            windows = range(5,50,5)
+        best_score=0
+        for w in windows:
+            df_test = detect_support_resistance(df.copy(), window=w)
+            df_test = compute_trade_signals(df_test, side=side)
+            trades = df_test[df_test['signal']!=0]
+            if len(trades)==0:
+                continue
+            score = (trades['signal']*np.sign(trades['close'].diff().shift(-1))).mean()*100
+            if score>best_score:
+                best_score=score
+                best_params['window']=w
+        return best_params,best_score
+
+    progress_text.text("Running Strategy Optimization...")
+    progress_bar.progress(20)
+    best_params,best_score = optimize_strategy(df_bt, search_type, desired_accuracy, min_points)
+    progress_bar.progress(50)
+    st.success(f"Best Strategy Parameters: {best_params}, Expected Accuracy: {best_score:.2f}%")
+
+    # ------------------------
+    # Backtest
+    # ------------------------
+    progress_text.text("Running Backtest...")
+    df_bt = detect_support_resistance(df_bt, window=best_params['window'])
+    df_bt = compute_trade_signals(df_bt, side=side)
+    patterns = detect_chart_patterns(df_bt)
+    traps = detect_trap_zones(df_bt)
+    progress_bar.progress(80)
+
+    trades = df_bt[df_bt['signal']!=0].copy()
+    trades['pnl'] = np.where(trades['signal']==1,trades['target']-trades['close'],trades['close']-trades['target'])
+    total_trades = len(trades)
+    positive_trades = (trades['pnl']>0).sum()
+    negative_trades = (trades['pnl']<=0).sum()
+    accuracy = positive_trades/total_trades*100 if total_trades>0 else 0
+    total_points = trades['pnl'].sum()
+
+    progress_bar.progress(100)
+    progress_text.text("Backtest Complete!")
+
+    st.subheader("📈 Backtest Results")
+    st.write(trades[['date','signal','close','target','sl','reason','pnl']])
+    st.write(f"Total Trades: {total_trades}, Positive Trades: {positive_trades}, Negative Trades: {negative_trades}")
+    st.write(f"Accuracy: {accuracy:.2f}%, Total Points: {total_points:.2f}")
+
+    st.write("### Detected Patterns in Backtest")
+    st.write(patterns)
+    st.write("### Detected Trap Zones")
+    st.write(traps)
+
+    # Human readable summary
+    summary_bt = f"Backtesting shows {total_trades} trades with {accuracy:.2f}% accuracy and total points {total_points:.2f}. Detected patterns: {len(patterns)}. Trap zones detected: {len(traps)}. Long trades were triggered on breakouts above resistance and short trades on breakdowns below support. SLs were set at swing levels. For live recommendation, use the same strategy on the latest candle close."
+    st.info(summary_bt)
+
+    # ------------------------
+    # Live Recommendation
+    # ------------------------
+    st.subheader("🚀 Live Recommendation")
+    live_df = compute_trade_signals(df_bt.tail(2), side=side).iloc[-1:]
+    if live_df['signal'].values[0]!=0:
+        signal_type = 'Long' if live_df['signal'].values[0]==1 else 'Short'
+        live_summary = f"Live Recommendation: {signal_type} Entry at {live_df['close'].values[0]}, Target {live_df['target'].values[0]}, SL {live_df['sl'].values[0]}. Reason: {live_df['reason'].values[0]}"
+        st.success(live_summary)
+    else:
+        st.info("No live trade signal on the last candle.")
+
+    st.balloons()
