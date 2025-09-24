@@ -258,35 +258,38 @@ class SwingTradingStrategy:
         # Get support/resistance levels
         support_levels, resistance_levels, _, _ = self.ta.find_support_resistance()
         
-        # Identify patterns
-        patterns = self.ta.identify_chart_patterns()
-        
-        for i in range(50, len(self.data)):
+        # More selective signal generation to reduce noise
+        for i in range(50, len(self.data) - 1):  # Don't trade on last candle
             current_price = self.data.iloc[i]['close']
             current_rsi = rsi.iloc[i] if not pd.isna(rsi.iloc[i]) else 50
             current_volume = self.data.iloc[i]['volume']
             avg_volume = self.data.iloc[i-20:i]['volume'].mean()
             
-            # Long signals
+            # Price momentum
+            price_momentum = (current_price - self.data.iloc[i-5]['close']) / self.data.iloc[i-5]['close'] * 100
+            
+            # Long signals - More strict conditions
             if trade_type in ['long', 'both']:
                 long_conditions = [
                     current_rsi < self.params['rsi_oversold'],
                     sma_short.iloc[i] > sma_long.iloc[i],
-                    current_price > bb_lower.iloc[i],
-                    current_volume > avg_volume * 1.2,
-                    macd.iloc[i] > macd_signal.iloc[i]
+                    current_price > bb_lower.iloc[i] and current_price < bb_middle.iloc[i],
+                    current_volume > avg_volume * 1.5,  # Higher volume requirement
+                    macd.iloc[i] > macd_signal.iloc[i],
+                    price_momentum > -2  # Not falling too fast
                 ]
                 
                 # Support level check
-                near_support = any(abs(current_price - level) / current_price < 0.02 for level in support_levels[-5:])
+                near_support = any(abs(current_price - level) / current_price < 0.015 for level in support_levels[-3:])
                 
-                if sum(long_conditions) >= 3 or near_support:
+                # More strict entry - need at least 4 conditions + support OR 5 conditions
+                if (sum(long_conditions) >= 4 and near_support) or sum(long_conditions) >= 5:
                     entry_price = current_price
                     stop_loss = entry_price * (1 - self.params['stop_loss_pct'] / 100)
                     target = entry_price * (1 + self.params['target_pct'] / 100)
                     
                     # Calculate probability based on conditions met
-                    probability = min(0.95, 0.5 + (sum(long_conditions) * 0.1))
+                    probability = min(0.90, 0.6 + (sum(long_conditions) * 0.05))
                     
                     logic = self.generate_entry_logic(long_conditions, near_support, 'long', current_rsi, current_volume, avg_volume)
                     
@@ -302,25 +305,27 @@ class SwingTradingStrategy:
                         'volume_ratio': current_volume / avg_volume
                     })
             
-            # Short signals
+            # Short signals - More strict conditions
             if trade_type in ['short', 'both']:
                 short_conditions = [
                     current_rsi > self.params['rsi_overbought'],
                     sma_short.iloc[i] < sma_long.iloc[i],
-                    current_price < bb_upper.iloc[i],
-                    current_volume > avg_volume * 1.2,
-                    macd.iloc[i] < macd_signal.iloc[i]
+                    current_price < bb_upper.iloc[i] and current_price > bb_middle.iloc[i],
+                    current_volume > avg_volume * 1.5,  # Higher volume requirement
+                    macd.iloc[i] < macd_signal.iloc[i],
+                    price_momentum < 2  # Not rising too fast
                 ]
                 
                 # Resistance level check
-                near_resistance = any(abs(current_price - level) / current_price < 0.02 for level in resistance_levels[-5:])
+                near_resistance = any(abs(current_price - level) / current_price < 0.015 for level in resistance_levels[-3:])
                 
-                if sum(short_conditions) >= 3 or near_resistance:
+                # More strict entry - need at least 4 conditions + resistance OR 5 conditions
+                if (sum(short_conditions) >= 4 and near_resistance) or sum(short_conditions) >= 5:
                     entry_price = current_price
                     stop_loss = entry_price * (1 + self.params['stop_loss_pct'] / 100)
                     target = entry_price * (1 - self.params['target_pct'] / 100)
                     
-                    probability = min(0.95, 0.5 + (sum(short_conditions) * 0.1))
+                    probability = min(0.90, 0.6 + (sum(short_conditions) * 0.05))
                     
                     logic = self.generate_entry_logic(short_conditions, near_resistance, 'short', current_rsi, current_volume, avg_volume)
                     
@@ -377,15 +382,15 @@ class StrategyOptimizer:
     
     def optimize(self, trade_type='both', n_iter=100, target_accuracy=0.85):
         param_grid = {
-            'rsi_period': [10, 12, 14, 16, 18, 20],
-            'rsi_oversold': [25, 30, 35, 40],
-            'rsi_overbought': [60, 65, 70, 75],
-            'sma_short': [5, 8, 10, 12, 15],
-            'sma_long': [15, 20, 25, 30],
-            'bb_period': [15, 20, 25, 30],
-            'bb_std': [1.5, 2.0, 2.5, 3.0],
-            'stop_loss_pct': [1.0, 1.5, 2.0, 2.5, 3.0],
-            'target_pct': [2.0, 3.0, 4.0, 5.0, 6.0]
+            'rsi_period': [12, 14, 16, 18, 21],
+            'rsi_oversold': [25, 30, 35],
+            'rsi_overbought': [65, 70, 75],
+            'sma_short': [8, 10, 12, 15],
+            'sma_long': [20, 25, 30, 35],
+            'bb_period': [18, 20, 22, 25],
+            'bb_std': [1.8, 2.0, 2.2, 2.5],
+            'stop_loss_pct': [1.5, 2.0, 2.5],
+            'target_pct': [3.0, 4.0, 5.0, 6.0]
         }
         
         best_params = None
@@ -399,67 +404,69 @@ class StrategyOptimizer:
         progress_bar = st.progress(0)
         status_text = st.empty()
         
-        iterations = n_iter if self.search_type == 'random' else min(1000, n_iter)
+        iterations = n_iter
         tested_combinations = set()
         
         for i in range(iterations):
             # Generate parameters
-            if self.search_type == 'random':
-                # Avoid duplicate combinations
-                attempts = 0
-                while attempts < 10:
-                    params = {}
-                    for key, values in param_grid.items():
-                        params[key] = np.random.choice(values)
-                    
-                    param_key = tuple(sorted(params.items()))
-                    if param_key not in tested_combinations:
-                        tested_combinations.add(param_key)
-                        break
-                    attempts += 1
+            attempts = 0
+            while attempts < 10:
+                params = {}
+                for key, values in param_grid.items():
+                    params[key] = np.random.choice(values)
                 
-                if attempts >= 10:  # If can't find unique combination, use random
-                    params = {}
-                    for key, values in param_grid.items():
-                        params[key] = np.random.choice(values)
-            else:
-                # Grid search implementation would go here
-                params = self.get_grid_params(param_grid, i)
+                param_key = tuple(sorted(params.items()))
+                if param_key not in tested_combinations:
+                    tested_combinations.add(param_key)
+                    break
+                attempts += 1
+            
+            if attempts >= 10:  # If can't find unique combination, use random
+                params = {}
+                for key, values in param_grid.items():
+                    params[key] = np.random.choice(values)
             
             # Ensure logical parameter relationships
             if params['sma_short'] >= params['sma_long']:
-                params['sma_long'] = params['sma_short'] + 5
+                params['sma_long'] = params['sma_short'] + 10
             
             if params['target_pct'] <= params['stop_loss_pct']:
                 params['target_pct'] = params['stop_loss_pct'] * 2
             
             if params['rsi_oversold'] >= params['rsi_overbought']:
-                params['rsi_overbought'] = params['rsi_oversold'] + 20
+                params['rsi_overbought'] = params['rsi_oversold'] + 25
             
             # Test strategy
             strategy = SwingTradingStrategy(self.data, params)
             signals = strategy.generate_signals(trade_type)
             
-            if len(signals) > 0:
+            if len(signals) >= 10:  # Need minimum trades for meaningful results
                 backtest_results = self.backtest_strategy(signals, self.data)
                 
-                # Calculate score based on accuracy, returns, and number of trades
-                if backtest_results['total_trades'] >= 5:
-                    accuracy_score = min(backtest_results['accuracy'] / 100, 1.0)
-                    return_score = max(0, min(backtest_results['total_return'] / 50, 1.0))  # Normalize to 50% max
-                    trade_count_score = min(backtest_results['total_trades'] / 30, 1.0)  # Normalize to 30 trades
+                # Calculate score prioritizing profitability and accuracy
+                if backtest_results['total_trades'] >= 10:
+                    # Profitability is key
+                    return_score = max(0, min(backtest_results['total_return'] / 20, 1.0))  # Normalize to 20% target
+                    accuracy_score = backtest_results['accuracy'] / 100
+                    trade_quality = min(backtest_results['positive_trades'] / 20, 1.0)  # Quality over quantity
                     
-                    # Weighted score prioritizing accuracy as requested
-                    score = (accuracy_score * 0.6 + return_score * 0.25 + trade_count_score * 0.15)
+                    # Penalize negative returns heavily
+                    if backtest_results['total_return'] < 0:
+                        return_score = -abs(backtest_results['total_return']) / 50  # Heavy penalty
+                    
+                    # Weighted score prioritizing returns and accuracy
+                    score = (return_score * 0.5 + accuracy_score * 0.3 + trade_quality * 0.2)
                     
                     # Track best found regardless of target accuracy
-                    if score > best_found_score:
+                    if score > best_found_score and backtest_results['total_return'] > 0:
                         best_found_score = score
                         best_found_params = params
                         best_found_results = backtest_results
                     
-                    # Strong accuracy filter - only accept if meets target
-                    if backtest_results['accuracy'] >= target_accuracy and score > best_score:
+                    # Target accuracy filter
+                    if (backtest_results['accuracy'] >= target_accuracy and 
+                        backtest_results['total_return'] > 0 and 
+                        score > best_score):
                         best_score = score
                         best_params = params
                         best_results = backtest_results
@@ -469,7 +476,8 @@ class StrategyOptimizer:
             progress_bar.progress(progress)
             
             current_best_accuracy = best_results['accuracy'] if best_results else (best_found_results['accuracy'] if best_found_results else 0)
-            status_text.text(f"Optimizing... {i+1}/{iterations} iterations completed | Best Accuracy: {current_best_accuracy:.1f}% | Target: {target_accuracy:.1f}%")
+            current_best_return = best_results['total_return'] if best_results else (best_found_results['total_return'] if best_found_results else 0)
+            status_text.text(f"Optimizing... {i+1}/{iterations} | Best: {current_best_accuracy:.1f}% acc, {current_best_return:.1f}% return | Target: {target_accuracy:.1f}%")
         
         progress_bar.empty()
         status_text.empty()
@@ -510,14 +518,15 @@ class StrategyOptimizer:
             
             entry_idx = entry_idx[0]
             
-            # Look for exit within next 20 days
+            # Look for exit within next 15 days (reduced from 20 for faster exits)
             exit_price = None
             exit_date = None
+            exit_time = None
             exit_reason = None
             points_gained = 0
             points_lost = 0
             
-            for j in range(entry_idx + 1, min(entry_idx + 21, len(data))):
+            for j in range(entry_idx + 1, min(entry_idx + 16, len(data))):
                 current_high = data.iloc[j]['high']
                 current_low = data.iloc[j]['low']
                 current_close = data.iloc[j]['close']
@@ -527,12 +536,14 @@ class StrategyOptimizer:
                     if current_low <= stop_loss:
                         exit_price = stop_loss
                         exit_date = current_date
+                        exit_time = current_date.strftime('%H:%M:%S')
                         exit_reason = 'Stop Loss'
                         points_lost = entry_price - exit_price
                         break
                     elif current_high >= target:
                         exit_price = target
                         exit_date = current_date
+                        exit_time = current_date.strftime('%H:%M:%S')
                         exit_reason = 'Target'
                         points_gained = exit_price - entry_price
                         break
@@ -540,21 +551,24 @@ class StrategyOptimizer:
                     if current_high >= stop_loss:
                         exit_price = stop_loss
                         exit_date = current_date
+                        exit_time = current_date.strftime('%H:%M:%S')
                         exit_reason = 'Stop Loss'
                         points_lost = exit_price - entry_price
                         break
                     elif current_low <= target:
                         exit_price = target
                         exit_date = current_date
+                        exit_time = current_date.strftime('%H:%M:%S')
                         exit_reason = 'Target'
                         points_gained = entry_price - exit_price
                         break
             
             # If no exit found, use last available price
             if exit_price is None:
-                exit_idx = min(entry_idx + 20, len(data) - 1)
+                exit_idx = min(entry_idx + 15, len(data) - 1)
                 exit_price = data.iloc[exit_idx]['close']
                 exit_date = data.iloc[exit_idx]['date']
+                exit_time = exit_date.strftime('%H:%M:%S')
                 exit_reason = 'Time Exit'
                 
                 if trade_type == 'long':
@@ -576,16 +590,20 @@ class StrategyOptimizer:
             
             trades.append({
                 'entry_date': entry_date,
+                'entry_time': entry_date.strftime('%H:%M:%S'),
                 'exit_date': exit_date,
+                'exit_time': exit_time,
                 'entry_price': entry_price,
                 'exit_price': exit_price,
                 'type': trade_type,
                 'pnl_pct': pnl_pct,
+                'pnl_points': points_gained - points_lost,
                 'points_gained': points_gained,
                 'points_lost': points_lost,
                 'net_points': points_gained - points_lost,
                 'exit_reason': exit_reason,
                 'duration_days': (exit_date - entry_date).days,
+                'duration_hours': (exit_date - entry_date).total_seconds() / 3600,
                 'logic': signal['logic']
             })
         
@@ -613,12 +631,38 @@ class StrategyOptimizer:
         start_price = data.iloc[0]['close']
         end_price = data.iloc[-1]['close']
         buy_hold_return = (end_price - start_price) / start_price * 100
+        buy_hold_points = end_price - start_price
+        
+        # Calculate additional metrics
+        winning_trades = [t for t in trades if t['pnl_pct'] > 0]
+        losing_trades = [t for t in trades if t['pnl_pct'] <= 0]
+        
+        avg_win = np.mean([t['pnl_pct'] for t in winning_trades]) if winning_trades else 0
+        avg_loss = np.mean([t['pnl_pct'] for t in losing_trades]) if losing_trades else 0
+        
+        profit_factor = abs(sum(t['pnl_pct'] for t in winning_trades) / sum(t['pnl_pct'] for t in losing_trades)) if losing_trades and sum(t['pnl_pct'] for t in losing_trades) != 0 else float('inf')
         
         return {
             'trades': trades,
             'total_trades': total_trades,
             'positive_trades': positive_trades,
             'negative_trades': total_trades - positive_trades,
+            'accuracy': accuracy,
+            'precision': precision,
+            'total_return': total_return,
+            'avg_return_per_trade': avg_return_per_trade,
+            'avg_duration': np.mean([t['duration_days'] for t in trades]),
+            'avg_duration_hours': np.mean([t['duration_hours'] for t in trades]),
+            'total_points_gained': total_points_gained,
+            'total_points_lost': total_points_lost,
+            'net_points': net_points,
+            'buy_hold_return': buy_hold_return,
+            'buy_hold_points': buy_hold_points,
+            'strategy_vs_buy_hold': total_return - buy_hold_return,
+            'avg_win': avg_win,
+            'avg_loss': avg_loss,
+            'profit_factor': profit_factor if profit_factor != float('inf') else 999
+        }
             'accuracy': accuracy,
             'precision': precision,
             'total_return': total_return,
@@ -1132,10 +1176,10 @@ def main():
         # Number of iterations option
         n_iterations = st.sidebar.slider(
             "Optimization Iterations",
-            min_value=5,
-            max_value=5000,
+            min_value=50,
+            max_value=500,
             value=100,
-            step=10,
+            step=50,
             help="More iterations = better optimization but slower"
         )
         
@@ -1209,13 +1253,14 @@ def main():
                     if 'precision' in best_results:
                         st.metric("Precision", f"{best_results['precision']:.1f}%")
                     st.metric("Total Return", f"{best_results['total_return']:.2f}%")
-                    st.metric("Total Trades", best_results['total_trades'])
-                    st.metric("Win Rate", f"{(best_results['positive_trades']/best_results['total_trades']*100):.1f}%")
+                    st.metric("Positive Trades", f"{best_results['positive_trades']}")
+                    st.metric("Negative Trades", f"{best_results['negative_trades']}")
                     
                     # Add buy and hold comparison
                     st.markdown("**vs Buy & Hold:**")
                     if 'buy_hold_return' in best_results:
                         st.metric("Buy & Hold Return", f"{best_results['buy_hold_return']:.2f}%")
+                        st.metric("Buy & Hold Points", f"{best_results.get('buy_hold_points', 0):.1f}")
                         st.metric("Strategy Outperformance", f"{best_results['strategy_vs_buy_hold']:.2f}%")
                     
                     # Add points summary
@@ -1224,6 +1269,13 @@ def main():
                         st.metric("Total Points Gained", f"{best_results['total_points_gained']:.1f}")
                         st.metric("Total Points Lost", f"{best_results['total_points_lost']:.1f}")
                         st.metric("Net Points", f"{best_results['net_points']:.1f}")
+                    
+                    # Add performance metrics
+                    st.markdown("**Performance Metrics:**")
+                    if 'avg_win' in best_results:
+                        st.metric("Avg Win %", f"{best_results['avg_win']:.2f}%")
+                        st.metric("Avg Loss %", f"{best_results['avg_loss']:.2f}%")
+                        st.metric("Profit Factor", f"{best_results.get('profit_factor', 0):.2f}")
                 
                 # Store results in session state
                 st.session_state['best_params'] = best_params
@@ -1259,12 +1311,14 @@ def main():
                     st.metric("Precision", f"{best_results['precision']:.1f}%")
                 st.metric("Total Return", f"{best_results['total_return']:.2f}%")
                 st.metric("Total Trades", best_results['total_trades'])
-                st.metric("Win Rate", f"{(best_results['positive_trades']/best_results['total_trades']*100):.1f}%")
+                st.metric("Positive Trades", f"{best_results['positive_trades']}")
+                st.metric("Negative Trades", f"{best_results['negative_trades']}")
                 
                 # Add buy and hold comparison
                 st.markdown("**vs Buy & Hold:**")
                 if 'buy_hold_return' in best_results:
                     st.metric("Buy & Hold Return", f"{best_results['buy_hold_return']:.2f}%")
+                    st.metric("Buy & Hold Points", f"{best_results.get('buy_hold_points', 0):.1f}")
                     st.metric("Strategy Outperformance", f"{best_results['strategy_vs_buy_hold']:.2f}%")
                 
                 # Add points summary
@@ -1273,6 +1327,13 @@ def main():
                     st.metric("Total Points Gained", f"{best_results['total_points_gained']:.1f}")
                     st.metric("Total Points Lost", f"{best_results['total_points_lost']:.1f}")
                     st.metric("Net Points", f"{best_results['net_points']:.1f}")
+                
+                # Add performance metrics
+                st.markdown("**Performance Metrics:**")
+                if 'avg_win' in best_results:
+                    st.metric("Avg Win %", f"{best_results['avg_win']:.2f}%")
+                    st.metric("Avg Loss %", f"{best_results['avg_loss']:.2f}%")
+                    st.metric("Profit Factor", f"{best_results.get('profit_factor', 0):.2f}")
             
             # Detailed backtest results
             st.subheader("📊 Backtest Results")
@@ -1312,15 +1373,26 @@ def main():
                 display_trades['entry_price'] = display_trades['entry_price'].round(2)
                 display_trades['exit_price'] = display_trades['exit_price'].round(2)
                 
-                # Add points columns if they exist
+                # Add time and points columns if they exist
+                if 'entry_time' in display_trades.columns:
+                    display_trades['entry_time'] = display_trades['entry_time']
+                    display_trades['exit_time'] = display_trades['exit_time']
+                
                 if 'points_gained' in display_trades.columns:
                     display_trades['points_gained'] = display_trades['points_gained'].round(2)
                     display_trades['points_lost'] = display_trades['points_lost'].round(2)
                     display_trades['net_points'] = display_trades['net_points'].round(2)
                 
+                if 'pnl_points' in display_trades.columns:
+                    display_trades['pnl_points'] = display_trades['pnl_points'].round(2)
+                
+                if 'duration_hours' in display_trades.columns:
+                    display_trades['duration_hours'] = display_trades['duration_hours'].round(1)
+                
                 # Reorder columns for better display
-                column_order = ['entry_date', 'exit_date', 'type', 'entry_price', 'exit_price', 
-                              'pnl_pct', 'exit_reason', 'duration_days']
+                column_order = ['entry_date', 'entry_time', 'exit_date', 'exit_time', 'type', 
+                              'entry_price', 'exit_price', 'pnl_pct', 'pnl_points', 'exit_reason', 
+                              'duration_days', 'duration_hours']
                 
                 if 'points_gained' in display_trades.columns:
                     column_order.extend(['points_gained', 'points_lost', 'net_points'])
