@@ -396,14 +396,29 @@ class StrategyOptimizer:
         progress_bar = st.progress(0)
         status_text = st.empty()
         
-        iterations = n_iter if self.search_type == 'random' else np.prod([len(v) for v in param_grid.values()])
+        iterations = n_iter if self.search_type == 'random' else min(1000, n_iter)
+        tested_combinations = set()
         
-        for i in range(min(iterations, n_iter)):
-            # Generate random parameters
+        for i in range(iterations):
+            # Generate parameters
             if self.search_type == 'random':
-                params = {}
-                for key, values in param_grid.items():
-                    params[key] = np.random.choice(values)
+                # Avoid duplicate combinations
+                attempts = 0
+                while attempts < 10:
+                    params = {}
+                    for key, values in param_grid.items():
+                        params[key] = np.random.choice(values)
+                    
+                    param_key = tuple(sorted(params.items()))
+                    if param_key not in tested_combinations:
+                        tested_combinations.add(param_key)
+                        break
+                    attempts += 1
+                
+                if attempts >= 10:  # If can't find unique combination, use random
+                    params = {}
+                    for key, values in param_grid.items():
+                        params[key] = np.random.choice(values)
             else:
                 # Grid search implementation would go here
                 params = self.get_grid_params(param_grid, i)
@@ -415,6 +430,9 @@ class StrategyOptimizer:
             if params['target_pct'] <= params['stop_loss_pct']:
                 params['target_pct'] = params['stop_loss_pct'] * 2
             
+            if params['rsi_oversold'] >= params['rsi_overbought']:
+                params['rsi_overbought'] = params['rsi_oversold'] + 20
+            
             # Test strategy
             strategy = SwingTradingStrategy(self.data, params)
             signals = strategy.generate_signals(trade_type)
@@ -424,21 +442,23 @@ class StrategyOptimizer:
                 
                 # Calculate score based on accuracy, returns, and number of trades
                 if backtest_results['total_trades'] >= 5:
-                    score = (
-                        backtest_results['accuracy'] * 0.4 +
-                        min(backtest_results['total_return'] / 100, 1) * 0.3 +
-                        min(backtest_results['total_trades'] / 50, 1) * 0.3
-                    )
+                    accuracy_score = min(backtest_results['accuracy'] / 100, 1.0)
+                    return_score = max(0, min(backtest_results['total_return'] / 50, 1.0))  # Normalize to 50% max
+                    trade_count_score = min(backtest_results['total_trades'] / 30, 1.0)  # Normalize to 30 trades
                     
-                    if score > best_score and backtest_results['accuracy'] >= target_accuracy/100:
+                    # Weighted score prioritizing accuracy as requested
+                    score = (accuracy_score * 0.6 + return_score * 0.25 + trade_count_score * 0.15)
+                    
+                    # Strong accuracy filter - only accept if meets target
+                    if backtest_results['accuracy'] >= target_accuracy and score > best_score:
                         best_score = score
                         best_params = params
                         best_results = backtest_results
             
             # Update progress
-            progress = (i + 1) / min(iterations, n_iter)
+            progress = (i + 1) / iterations
             progress_bar.progress(progress)
-            status_text.text(f"Optimizing... {i+1}/{min(iterations, n_iter)} iterations completed")
+            status_text.text(f"Optimizing... {i+1}/{iterations} iterations completed | Best Accuracy: {best_results['accuracy']:.1f}% | Target: {target_accuracy:.1f}%" if best_results else f"Optimizing... {i+1}/{iterations} iterations completed | Searching for {target_accuracy:.1f}%+ accuracy")
         
         progress_bar.empty()
         status_text.empty()
@@ -479,6 +499,8 @@ class StrategyOptimizer:
             exit_price = None
             exit_date = None
             exit_reason = None
+            points_gained = 0
+            points_lost = 0
             
             for j in range(entry_idx + 1, min(entry_idx + 21, len(data))):
                 current_high = data.iloc[j]['high']
@@ -491,22 +513,26 @@ class StrategyOptimizer:
                         exit_price = stop_loss
                         exit_date = current_date
                         exit_reason = 'Stop Loss'
+                        points_lost = entry_price - exit_price
                         break
                     elif current_high >= target:
                         exit_price = target
                         exit_date = current_date
                         exit_reason = 'Target'
+                        points_gained = exit_price - entry_price
                         break
                 else:  # short
                     if current_high >= stop_loss:
                         exit_price = stop_loss
                         exit_date = current_date
                         exit_reason = 'Stop Loss'
+                        points_lost = exit_price - entry_price
                         break
                     elif current_low <= target:
                         exit_price = target
                         exit_date = current_date
                         exit_reason = 'Target'
+                        points_gained = entry_price - exit_price
                         break
             
             # If no exit found, use last available price
@@ -515,6 +541,17 @@ class StrategyOptimizer:
                 exit_price = data.iloc[exit_idx]['close']
                 exit_date = data.iloc[exit_idx]['date']
                 exit_reason = 'Time Exit'
+                
+                if trade_type == 'long':
+                    if exit_price > entry_price:
+                        points_gained = exit_price - entry_price
+                    else:
+                        points_lost = entry_price - exit_price
+                else:
+                    if exit_price < entry_price:
+                        points_gained = entry_price - exit_price
+                    else:
+                        points_lost = exit_price - entry_price
             
             # Calculate PnL
             if trade_type == 'long':
@@ -529,6 +566,9 @@ class StrategyOptimizer:
                 'exit_price': exit_price,
                 'type': trade_type,
                 'pnl_pct': pnl_pct,
+                'points_gained': points_gained,
+                'points_lost': points_lost,
+                'net_points': points_gained - points_lost,
                 'exit_reason': exit_reason,
                 'duration_days': (exit_date - entry_date).days,
                 'logic': signal['logic']
@@ -543,6 +583,14 @@ class StrategyOptimizer:
         accuracy = positive_trades / total_trades * 100
         total_return = sum(t['pnl_pct'] for t in trades)
         avg_return_per_trade = total_return / total_trades
+        total_points_gained = sum(t['points_gained'] for t in trades)
+        total_points_lost = sum(t['points_lost'] for t in trades)
+        net_points = total_points_gained - total_points_lost
+        
+        # Calculate Buy and Hold return for comparison
+        start_price = data.iloc[0]['close']
+        end_price = data.iloc[-1]['close']
+        buy_hold_return = (end_price - start_price) / start_price * 100
         
         return {
             'trades': trades,
@@ -552,7 +600,12 @@ class StrategyOptimizer:
             'accuracy': accuracy,
             'total_return': total_return,
             'avg_return_per_trade': avg_return_per_trade,
-            'avg_duration': np.mean([t['duration_days'] for t in trades])
+            'avg_duration': np.mean([t['duration_days'] for t in trades]),
+            'total_points_gained': total_points_gained,
+            'total_points_lost': total_points_lost,
+            'net_points': net_points,
+            'buy_hold_return': buy_hold_return,
+            'strategy_vs_buy_hold': total_return - buy_hold_return
         }
 
 def load_data_from_file(uploaded_file):
@@ -659,11 +712,7 @@ def fetch_yfinance_data(symbol, period, interval):
             '5min': '5m',
             '15min': '15m',
             '1hour': '1h',
-            '1day': '1d',
-            '1mon': '1mo',
-            '1year':'1y',
-            '5year':'5y',
-            '10year':'10y' 
+            '1day': '1d'
         }
         
         yf_interval = interval_mapping.get(interval, '1d')
@@ -887,6 +936,12 @@ def main():
     st.markdown('<h1 class="main-header">🚀 Advanced Swing Trading Platform</h1>', unsafe_allow_html=True)
     st.markdown("---")
     
+    # Initialize session state
+    if 'data' not in st.session_state:
+        st.session_state['data'] = None
+    if 'analysis_complete' not in st.session_state:
+        st.session_state['analysis_complete'] = False
+    
     # Sidebar
     st.sidebar.title("📊 Trading Configuration")
     
@@ -896,7 +951,7 @@ def main():
         ["Upload File", "Yahoo Finance"]
     )
     
-    data = None
+    data = st.session_state.get('data', None)
     
     if data_source == "Upload File":
         uploaded_file = st.sidebar.file_uploader(
@@ -924,6 +979,7 @@ def main():
                     
                     if data is not None:
                         st.sidebar.success("✅ Data loaded successfully!")
+                        st.session_state['data'] = data
     
     else:  # Yahoo Finance
         col1, col2 = st.sidebar.columns(2)
@@ -938,7 +994,7 @@ def main():
         with col2:
             period = st.selectbox(
                 "Period",
-                ["1d", "5d", "1mo", "3mo", "6mo", "1y", "2y", "5y"],
+                ["1d", "5d", "1mo", "3mo", "6mo", "1y", "2y", "3y", "5y", "10y", "15y", "max"],
                 index=5
             )
         
@@ -954,6 +1010,21 @@ def main():
                 
                 if data is not None:
                     st.sidebar.success("✅ Data fetched successfully!")
+                    # Store data in session state to prevent disappearing
+                    st.session_state['data'] = data
+                    st.session_state['data_source'] = 'yfinance'
+    
+    # Update data reference
+    data = st.session_state.get('data', None)_source'] = 'yfinance'_source'] = 'yfinance'
+                    st.experimental_rerun()
+    
+    # Check session state for data
+    if 'data' in st.session_state and data is None:
+        data = st.session_state['data']
+    
+    # Always show sidebar options regardless of data state
+    st.sidebar.markdown("---")
+    st.sidebar.subheader("⚙️ Trading Parameters")
     
     if data is not None:
         # Display basic data info
@@ -998,10 +1069,50 @@ def main():
         raw_chart = create_candlestick_chart(data, title="Raw Stock Data")
         st.plotly_chart(raw_chart, use_container_width=True)
         
-        # Trading Configuration
-        st.sidebar.markdown("---")
-        st.sidebar.subheader("⚙️ Trading Parameters")
+    if data is not None:
+        # Display basic data info
+        st.subheader("📈 Data Overview")
         
+        col1, col2, col3, col4 = st.columns(4)
+        
+        with col1:
+            st.metric("Total Records", len(data))
+        with col2:
+            st.metric("Date Range", f"{data['date'].min().strftime('%Y-%m-%d')}")
+        with col3:
+            st.metric("To", f"{data['date'].max().strftime('%Y-%m-%d')}")
+        with col4:
+            st.metric("Current Price", f"{data['close'].iloc[-1]:.2f}")
+        
+        # Display top and bottom 5 rows
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            st.write("**First 5 Rows:**")
+            st.dataframe(data.head())
+        
+        with col2:
+            st.write("**Last 5 Rows:**")
+            st.dataframe(data.tail())
+        
+        # Price range
+        col1, col2, col3, col4 = st.columns(4)
+        
+        with col1:
+            st.metric("Min Price", f"{data['close'].min():.2f}")
+        with col2:
+            st.metric("Max Price", f"{data['close'].max():.2f}")
+        with col3:
+            st.metric("Avg Volume", f"{data['volume'].mean():,.0f}")
+        with col4:
+            st.metric("Max Volume", f"{data['volume'].max():,.0f}")
+        
+        # Raw data plot
+        st.subheader("📊 Raw Data Visualization")
+        raw_chart = create_candlestick_chart(data, title="Raw Stock Data")
+        st.plotly_chart(raw_chart, use_container_width=True)
+        
+        # Trading Configuration (always show after data is loaded)
         # End date selection for backtesting
         max_date = data['date'].max().date()
         min_date = data['date'].min().date()
@@ -1012,9 +1123,6 @@ def main():
             min_value=min_date,
             max_value=max_date
         )
-        
-        # Filter data up to end date
-        analysis_data = data[data['date'].dt.date <= end_date].copy()
         
         # Trade type selection
         trade_type = st.sidebar.selectbox(
@@ -1046,6 +1154,19 @@ def main():
             step=5
         )
         
+        # Number of iterations option
+        n_iterations = st.sidebar.slider(
+            "Optimization Iterations",
+            min_value=50,
+            max_value=500,
+            value=100,
+            step=50,
+            help="More iterations = better optimization but slower"
+        )
+        
+        # Filter data up to end date
+        analysis_data = data[data['date'].dt.date <= end_date].copy()
+        
         # EDA Section
         st.subheader("🔍 Exploratory Data Analysis")
         
@@ -1063,19 +1184,75 @@ def main():
         
         # Run Analysis Button
         if st.sidebar.button("🚀 Run Analysis", type="primary"):
+            st.session_state['analysis_complete'] = False  # Reset analysis state
+            
             st.subheader("🔧 Strategy Optimization")
             
             with st.spinner("Optimizing strategy parameters..."):
                 optimizer = StrategyOptimizer(analysis_data, optimization_type)
                 best_params, best_results, best_score = optimizer.optimize(
                     trade_type=trade_type,
-                    n_iter=100,
+                    n_iter=n_iterations,
                     target_accuracy=target_accuracy
                 )
             
             if best_params is None:
-                st.error("Could not find optimal parameters with the given constraints.")
-                st.stop()
+                st.error(f"❌ Could not find optimal parameters with {target_accuracy}% accuracy target.")
+                st.info("💡 Try lowering the target accuracy or increasing the number of iterations.")
+                
+                # Show alternative message
+                st.warning("🔄 Consider adjusting parameters:")
+                st.write("• Lower target accuracy to 70-80%")
+                st.write("• Increase iterations to 200-500") 
+                st.write("• Try different trade direction")
+                st.write("• Check if data has sufficient volatility")
+                
+                # Still show some basic analysis
+                st.subheader("📊 Basic Analysis (Without Optimization)")
+                
+                # Run with default parameters
+                default_params = {
+                    'rsi_period': 14,
+                    'rsi_oversold': 30,
+                    'rsi_overbought': 70,
+                    'sma_short': 10,
+                    'sma_long': 20,
+                    'bb_period': 20,
+                    'bb_std': 2,
+                    'stop_loss_pct': 2.0,
+                    'target_pct': 4.0
+                }
+                
+                strategy = SwingTradingStrategy(analysis_data, default_params)
+                signals = strategy.generate_signals(trade_type)
+                
+                if signals:
+                    backtest_results = optimizer.backtest_strategy(signals, analysis_data)
+                    
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        st.write("**Default Strategy Results:**")
+                        st.metric("Accuracy", f"{backtest_results['accuracy']:.1f}%")
+                        st.metric("Total Trades", backtest_results['total_trades'])
+                    
+                    with col2:
+                        st.metric("Total Return", f"{backtest_results['total_return']:.2f}%")
+                        if 'buy_hold_return' in backtest_results:
+                            st.metric("Buy & Hold", f"{backtest_results['buy_hold_return']:.2f}%")
+                
+                return  # Exit early if optimization failed
+            
+            # Store results in session state
+            st.session_state['best_params'] = best_params
+            st.session_state['best_results'] = best_results
+            st.session_state['analysis_data'] = analysis_data
+            st.session_state['analysis_complete'] = True
+        
+        # Show results if analysis is complete
+        if st.session_state.get('analysis_complete', False):
+            best_params = st.session_state['best_params']
+            best_results = st.session_state['best_results']
+            analysis_data = st.session_state['analysis_data']
             
             # Display best strategy
             st.success("✅ Optimization Complete!")
@@ -1093,6 +1270,19 @@ def main():
                 st.metric("Total Return", f"{best_results['total_return']:.2f}%")
                 st.metric("Total Trades", best_results['total_trades'])
                 st.metric("Win Rate", f"{(best_results['positive_trades']/best_results['total_trades']*100):.1f}%")
+                
+                # Add buy and hold comparison
+                st.markdown("**vs Buy & Hold:**")
+                if 'buy_hold_return' in best_results:
+                    st.metric("Buy & Hold Return", f"{best_results['buy_hold_return']:.2f}%")
+                    st.metric("Strategy Outperformance", f"{best_results['strategy_vs_buy_hold']:.2f}%")
+                
+                # Add points summary
+                st.markdown("**Points Analysis:**")
+                if 'total_points_gained' in best_results:
+                    st.metric("Total Points Gained", f"{best_results['total_points_gained']:.1f}")
+                    st.metric("Total Points Lost", f"{best_results['total_points_lost']:.1f}")
+                    st.metric("Net Points", f"{best_results['net_points']:.1f}")
             
             # Detailed backtest results
             st.subheader("📊 Backtest Results")
@@ -1132,6 +1322,25 @@ def main():
                 display_trades['entry_price'] = display_trades['entry_price'].round(2)
                 display_trades['exit_price'] = display_trades['exit_price'].round(2)
                 
+                # Add points columns if they exist
+                if 'points_gained' in display_trades.columns:
+                    display_trades['points_gained'] = display_trades['points_gained'].round(2)
+                    display_trades['points_lost'] = display_trades['points_lost'].round(2)
+                    display_trades['net_points'] = display_trades['net_points'].round(2)
+                
+                # Reorder columns for better display
+                column_order = ['entry_date', 'exit_date', 'type', 'entry_price', 'exit_price', 
+                              'pnl_pct', 'exit_reason', 'duration_days']
+                
+                if 'points_gained' in display_trades.columns:
+                    column_order.extend(['points_gained', 'points_lost', 'net_points'])
+                
+                column_order.append('logic')
+                
+                # Only include existing columns
+                existing_columns = [col for col in column_order if col in display_trades.columns]
+                display_trades = display_trades[existing_columns]
+                
                 st.dataframe(display_trades, use_container_width=True)
             
             # Generate signals for visualization
@@ -1143,6 +1352,164 @@ def main():
             signals_chart = create_candlestick_chart(
                 analysis_data, 
                 all_signals[:20],  # Show first 20 signals for clarity
+                "Strategy Signals on Price Chart"
+            )
+            st.plotly_chart(signals_chart, use_container_width=True)
+            
+            # Live Recommendation
+            st.subheader("🎯 Live Trading Recommendation")
+            
+            # Get current recommendation using full dataset
+            current_data = data.copy()
+            live_strategy = SwingTradingStrategy(current_data, best_params)
+            live_signals = live_strategy.generate_signals(trade_type)
+            
+            if live_signals:
+                latest_signal = live_signals[-1]  # Get most recent signal
+                
+                # Check if signal is recent (within last 5 candles)
+                last_date = current_data['date'].max()
+                signal_date = latest_signal['date']
+                
+                if (last_date - signal_date).days <= 5:
+                    signal_color = "🟢" if latest_signal['type'] == 'long' else "🔴"
+                    
+                    st.markdown(f"""
+                    ### {signal_color} **{latest_signal['type'].upper()} SIGNAL**
+                    
+                    **📅 Date:** {latest_signal['date'].strftime('%Y-%m-%d %H:%M:%S')}
+                    
+                    **💰 Entry Price:** ₹{latest_signal['entry_price']:.2f}
+                    
+                    **🎯 Target:** ₹{latest_signal['target']:.2f}
+                    
+                    **🛑 Stop Loss:** ₹{latest_signal['stop_loss']:.2f}
+                    
+                    **📊 Probability:** {latest_signal['probability']*100:.1f}%
+                    
+                    **🧠 Logic:** {latest_signal['logic']}
+                    
+                    **📈 RSI:** {latest_signal['rsi']:.1f}
+                    
+                    **📊 Volume Ratio:** {latest_signal['volume_ratio']:.1f}x
+                    """)
+                    
+                    # Risk-Reward Analysis
+                    if latest_signal['type'] == 'long':
+                        risk = latest_signal['entry_price'] - latest_signal['stop_loss']
+                        reward = latest_signal['target'] - latest_signal['entry_price']
+                    else:
+                        risk = latest_signal['stop_loss'] - latest_signal['entry_price']
+                        reward = latest_signal['entry_price'] - latest_signal['target']
+                    
+                    risk_reward = reward / risk if risk > 0 else 0
+                    
+                    st.markdown(f"""
+                    **⚖️ Risk-Reward Ratio:** {risk_reward:.2f}:1
+                    
+                    **💡 Risk:** ₹{risk:.2f} per share
+                    
+                    **🎁 Potential Reward:** ₹{reward:.2f} per share
+                    """)
+                
+                else:
+                    st.info("No recent signals. Current market conditions do not meet entry criteria.")
+            else:
+                st.info("No signals generated. Market conditions do not currently favor entry.")
+            
+            # Continue with rest of analysis...
+            # Pattern Recognition Summary
+            st.subheader("📊 Technical Analysis Summary")
+            
+            ta = TechnicalAnalysis(current_data)
+            patterns = ta.identify_chart_patterns()
+            pivots = ta.calculate_pivot_points()
+            
+            if patterns:
+                st.write("**Identified Chart Patterns:**")
+                for pattern in patterns[-5:]:  # Show last 5 patterns
+                    st.write(f"• {pattern['pattern']} ({pattern['type']}) - {pattern['date'].strftime('%Y-%m-%d')} at ₹{pattern['price']:.2f}")
+            
+            # Market Structure Analysis
+            trend = ta.identify_trend()
+            support_levels, resistance_levels, _, _ = ta.find_support_resistance()
+            
+            st.markdown(f"""
+            **📊 Market Structure:**
+            - **Current Trend:** {trend}
+            - **Key Support Levels:** {', '.join([f'₹{level:.2f}' for level in support_levels[-3:]])}
+            - **Key Resistance Levels:** {', '.join([f'₹{level:.2f}' for level in resistance_levels[-3:]])}
+            - **Recent Pivot Points:** {len(pivots[-10:])} identified in recent data
+            """)
+            
+            # Final Summary
+            st.subheader("📝 Trading Summary & Recommendations")
+            
+            backtest_summary = f"""
+            **Backtest Analysis Complete:**
+            
+            Our advanced swing trading algorithm analyzed {len(analysis_data)} data points and identified 
+            {best_results['total_trades']} trading opportunities with {best_results['accuracy']:.1f}% accuracy.
+            The strategy generated {best_results['total_return']:.2f}% total returns with an average 
+            holding period of {best_results['avg_duration']:.1f} days per trade.
+            
+            **Strategy vs Buy & Hold:**
+            {'✅ Strategy OUTPERFORMED buy & hold by ' + str(abs(best_results.get('strategy_vs_buy_hold', 0))) + '%' 
+             if best_results.get('strategy_vs_buy_hold', 0) > 0 
+             else '❌ Strategy UNDERPERFORMED buy & hold by ' + str(abs(best_results.get('strategy_vs_buy_hold', 0))) + '%'}
+            
+            **Strategy Details:**
+            - RSI levels: {best_params['rsi_oversold']}-{best_params['rsi_overbought']}
+            - Moving averages: {best_params['sma_short']}/{best_params['sma_long']}
+            - Risk management: {best_params['stop_loss_pct']:.1f}% stop loss, {best_params['target_pct']:.1f}% target
+            
+            **Live Trading Recommendations:**
+            Based on current market conditions and the optimized strategy parameters, 
+            {'continue monitoring for entry opportunities' if not live_signals or (last_date - live_signals[-1]['date']).days > 5 
+            else f'consider the {live_signals[-1]["type"]} position with strict risk management'}.
+            
+            Always maintain position sizing according to your risk tolerance and never risk more than 
+            2% of your capital per trade. Market conditions can change rapidly, so continuous monitoring 
+            is essential for successful swing trading.
+            """
+            
+            st.markdown(backtest_summary)
+            
+            # Buyer/Seller Psychology
+            st.subheader("🧠 Market Psychology Analysis")
+            
+            current_rsi = ta.calculate_rsi().iloc[-1]
+            recent_volume = current_data['volume'].iloc[-5:].mean()
+            avg_volume = current_data['volume'].mean()
+            price_change_5d = ((current_data['close'].iloc[-1] - current_data['close'].iloc[-5]) / current_data['close'].iloc[-5]) * 100
+            
+            psychology_summary = f"""
+            **Current Market Sentiment:**
+            
+            RSI at {current_rsi:.1f} suggests {'overbought conditions - sellers may step in' if current_rsi > 70 
+            else 'oversold conditions - buyers may emerge' if current_rsi < 30 
+            else 'neutral momentum - waiting for directional bias'}.
+            
+            Recent volume activity ({recent_volume/avg_volume:.1f}x average) indicates 
+            {'strong institutional interest' if recent_volume/avg_volume > 1.2 
+            else 'moderate participation' if recent_volume/avg_volume > 0.8 
+            else 'low participation - lack of conviction'}.
+            
+            The {price_change_5d:.1f}% price move over the last 5 sessions reflects 
+            {'bullish sentiment with buyers in control' if price_change_5d > 2
+            else 'bearish sentiment with sellers dominating' if price_change_5d < -2
+            else 'indecision between buyers and sellers'}.
+            
+            **Trading Psychology Insights:**
+            {'Fear-based selling may create opportunities for patient buyers' if current_rsi < 30
+            else 'Greed-driven buying may create shorting opportunities' if current_rsi > 70
+            else 'Market in equilibrium - wait for clear directional move'}.
+            """
+            
+            st.markdown(psychology_summary)
+    
+    else:
+        st.info("👆 Please upload a data file or fetch data from Yahoo Finance to get started.")_signals[:20],  # Show first 20 signals for clarity
                 "Strategy Signals on Price Chart"
             )
             st.plotly_chart(signals_chart, use_container_width=True)
