@@ -1508,156 +1508,155 @@ def main():
             st.markdown(psychology_summary)
     
     else:
-        st.info("👆 Please upload a data file or fetch data from Yahoo Finance to get started.")_signals[:20],  # Show first 20 signals for clarity
-                "Strategy Signals on Price Chart"
-            )
-            st.plotly_chart(signals_chart, use_container_width=True)
+        st.info("👆 Please upload a data file or fetch data from Yahoo Finance to get started.")  # Show first 20 signals for clarity
+               
+        st.plotly_chart(signals_chart, use_container_width=True)
+        
+        # Live Recommendation
+        st.subheader("🎯 Live Trading Recommendation")
+        
+        # Get current recommendation
+        current_data = data.copy()  # Use full dataset for live recommendation
+        live_strategy = SwingTradingStrategy(current_data, best_params)
+        live_signals = live_strategy.generate_signals(trade_type)
+        
+        if live_signals:
+            latest_signal = live_signals[-1]  # Get most recent signal
             
-            # Live Recommendation
-            st.subheader("🎯 Live Trading Recommendation")
+            # Check if signal is recent (within last 5 candles)
+            last_date = current_data['date'].max()
+            signal_date = latest_signal['date']
             
-            # Get current recommendation
-            current_data = data.copy()  # Use full dataset for live recommendation
-            live_strategy = SwingTradingStrategy(current_data, best_params)
-            live_signals = live_strategy.generate_signals(trade_type)
-            
-            if live_signals:
-                latest_signal = live_signals[-1]  # Get most recent signal
+            if (last_date - signal_date).days <= 5:
+                signal_color = "🟢" if latest_signal['type'] == 'long' else "🔴"
                 
-                # Check if signal is recent (within last 5 candles)
-                last_date = current_data['date'].max()
-                signal_date = latest_signal['date']
+                st.markdown(f"""
+                ### {signal_color} **{latest_signal['type'].upper()} SIGNAL**
                 
-                if (last_date - signal_date).days <= 5:
-                    signal_color = "🟢" if latest_signal['type'] == 'long' else "🔴"
-                    
-                    st.markdown(f"""
-                    ### {signal_color} **{latest_signal['type'].upper()} SIGNAL**
-                    
-                    **📅 Date:** {latest_signal['date'].strftime('%Y-%m-%d %H:%M:%S')}
-                    
-                    **💰 Entry Price:** ₹{latest_signal['entry_price']:.2f}
-                    
-                    **🎯 Target:** ₹{latest_signal['target']:.2f}
-                    
-                    **🛑 Stop Loss:** ₹{latest_signal['stop_loss']:.2f}
-                    
-                    **📊 Probability:** {latest_signal['probability']*100:.1f}%
-                    
-                    **🧠 Logic:** {latest_signal['logic']}
-                    
-                    **📈 RSI:** {latest_signal['rsi']:.1f}
-                    
-                    **📊 Volume Ratio:** {latest_signal['volume_ratio']:.1f}x
-                    """)
-                    
-                    # Risk-Reward Analysis
-                    if latest_signal['type'] == 'long':
-                        risk = latest_signal['entry_price'] - latest_signal['stop_loss']
-                        reward = latest_signal['target'] - latest_signal['entry_price']
-                    else:
-                        risk = latest_signal['stop_loss'] - latest_signal['entry_price']
-                        reward = latest_signal['entry_price'] - latest_signal['target']
-                    
-                    risk_reward = reward / risk if risk > 0 else 0
-                    
-                    st.markdown(f"""
-                    **⚖️ Risk-Reward Ratio:** {risk_reward:.2f}:1
-                    
-                    **💡 Risk:** ₹{risk:.2f} per share
-                    
-                    **🎁 Potential Reward:** ₹{reward:.2f} per share
-                    """)
+                **📅 Date:** {latest_signal['date'].strftime('%Y-%m-%d %H:%M:%S')}
                 
+                **💰 Entry Price:** ₹{latest_signal['entry_price']:.2f}
+                
+                **🎯 Target:** ₹{latest_signal['target']:.2f}
+                
+                **🛑 Stop Loss:** ₹{latest_signal['stop_loss']:.2f}
+                
+                **📊 Probability:** {latest_signal['probability']*100:.1f}%
+                
+                **🧠 Logic:** {latest_signal['logic']}
+                
+                **📈 RSI:** {latest_signal['rsi']:.1f}
+                
+                **📊 Volume Ratio:** {latest_signal['volume_ratio']:.1f}x
+                """)
+                
+                # Risk-Reward Analysis
+                if latest_signal['type'] == 'long':
+                    risk = latest_signal['entry_price'] - latest_signal['stop_loss']
+                    reward = latest_signal['target'] - latest_signal['entry_price']
                 else:
-                    st.info("No recent signals. Current market conditions do not meet entry criteria.")
+                    risk = latest_signal['stop_loss'] - latest_signal['entry_price']
+                    reward = latest_signal['entry_price'] - latest_signal['target']
+                
+                risk_reward = reward / risk if risk > 0 else 0
+                
+                st.markdown(f"""
+                **⚖️ Risk-Reward Ratio:** {risk_reward:.2f}:1
+                
+                **💡 Risk:** ₹{risk:.2f} per share
+                
+                **🎁 Potential Reward:** ₹{reward:.2f} per share
+                """)
+            
             else:
-                st.info("No signals generated. Market conditions do not currently favor entry.")
-            
-            # Pattern Recognition Summary
-            st.subheader("📊 Technical Analysis Summary")
-            
-            ta = TechnicalAnalysis(current_data)
-            patterns = ta.identify_chart_patterns()
-            pivots = ta.calculate_pivot_points()
-            
-            if patterns:
-                st.write("**Identified Chart Patterns:**")
-                for pattern in patterns[-5:]:  # Show last 5 patterns
-                    st.write(f"• {pattern['pattern']} ({pattern['type']}) - {pattern['date'].strftime('%Y-%m-%d')} at ₹{pattern['price']:.2f}")
-            
-            # Market Structure Analysis
-            trend = ta.identify_trend()
-            support_levels, resistance_levels, _, _ = ta.find_support_resistance()
-            
-            st.markdown(f"""
-            **📊 Market Structure:**
-            - **Current Trend:** {trend}
-            - **Key Support Levels:** {', '.join([f'₹{level:.2f}' for level in support_levels[-3:]])}
-            - **Key Resistance Levels:** {', '.join([f'₹{level:.2f}' for level in resistance_levels[-3:]])}
-            - **Recent Pivot Points:** {len(pivots[-10:])} identified in recent data
-            """)
-            
-            # Final Summary
-            st.subheader("📝 Trading Summary & Recommendations")
-            
-            backtest_summary = f"""
-            **Backtest Analysis Complete:**
-            
-            Our advanced swing trading algorithm analyzed {len(analysis_data)} data points and identified 
-            {best_results['total_trades']} trading opportunities with {best_results['accuracy']:.1f}% accuracy.
-            The strategy generated {best_results['total_return']:.2f}% total returns with an average 
-            holding period of {best_results['avg_duration']:.1f} days per trade.
-            
-            **Strategy Details:**
-            - RSI levels: {best_params['rsi_oversold']}-{best_params['rsi_overbought']}
-            - Moving averages: {best_params['sma_short']}/{best_params['sma_long']}
-            - Risk management: {best_params['stop_loss_pct']:.1f}% stop loss, {best_params['target_pct']:.1f}% target
-            
-            **Live Trading Recommendations:**
-            Based on current market conditions and the optimized strategy parameters, 
-            {'continue monitoring for entry opportunities' if not live_signals or (last_date - live_signals[-1]['date']).days > 5 
-            else f'consider the {live_signals[-1]["type"]} position with strict risk management'}.
-            
-            Always maintain position sizing according to your risk tolerance and never risk more than 
-            2% of your capital per trade. Market conditions can change rapidly, so continuous monitoring 
-            is essential for successful swing trading.
-            """
-            
-            st.markdown(backtest_summary)
-            
-            # Buyer/Seller Psychology
-            st.subheader("🧠 Market Psychology Analysis")
-            
-            current_rsi = ta.calculate_rsi().iloc[-1]
-            recent_volume = current_data['volume'].iloc[-5:].mean()
-            avg_volume = current_data['volume'].mean()
-            price_change_5d = ((current_data['close'].iloc[-1] - current_data['close'].iloc[-5]) / current_data['close'].iloc[-5]) * 100
-            
-            psychology_summary = f"""
-            **Current Market Sentiment:**
-            
-            RSI at {current_rsi:.1f} suggests {'overbought conditions - sellers may step in' if current_rsi > 70 
-            else 'oversold conditions - buyers may emerge' if current_rsi < 30 
-            else 'neutral momentum - waiting for directional bias'}.
-            
-            Recent volume activity ({recent_volume/avg_volume:.1f}x average) indicates 
-            {'strong institutional interest' if recent_volume/avg_volume > 1.2 
-            else 'moderate participation' if recent_volume/avg_volume > 0.8 
-            else 'low participation - lack of conviction'}.
-            
-            The {price_change_5d:.1f}% price move over the last 5 sessions reflects 
-            {'bullish sentiment with buyers in control' if price_change_5d > 2
-            else 'bearish sentiment with sellers dominating' if price_change_5d < -2
-            else 'indecision between buyers and sellers'}.
-            
-            **Trading Psychology Insights:**
-            {'Fear-based selling may create opportunities for patient buyers' if current_rsi < 30
-            else 'Greed-driven buying may create shorting opportunities' if current_rsi > 70
-            else 'Market in equilibrium - wait for clear directional move'}.
-            """
-            
-            st.markdown(psychology_summary)
+                st.info("No recent signals. Current market conditions do not meet entry criteria.")
+        else:
+            st.info("No signals generated. Market conditions do not currently favor entry.")
+        
+        # Pattern Recognition Summary
+        st.subheader("📊 Technical Analysis Summary")
+        
+        ta = TechnicalAnalysis(current_data)
+        patterns = ta.identify_chart_patterns()
+        pivots = ta.calculate_pivot_points()
+        
+        if patterns:
+            st.write("**Identified Chart Patterns:**")
+            for pattern in patterns[-5:]:  # Show last 5 patterns
+                st.write(f"• {pattern['pattern']} ({pattern['type']}) - {pattern['date'].strftime('%Y-%m-%d')} at ₹{pattern['price']:.2f}")
+        
+        # Market Structure Analysis
+        trend = ta.identify_trend()
+        support_levels, resistance_levels, _, _ = ta.find_support_resistance()
+        
+        st.markdown(f"""
+        **📊 Market Structure:**
+        - **Current Trend:** {trend}
+        - **Key Support Levels:** {', '.join([f'₹{level:.2f}' for level in support_levels[-3:]])}
+        - **Key Resistance Levels:** {', '.join([f'₹{level:.2f}' for level in resistance_levels[-3:]])}
+        - **Recent Pivot Points:** {len(pivots[-10:])} identified in recent data
+        """)
+        
+        # Final Summary
+        st.subheader("📝 Trading Summary & Recommendations")
+        
+        backtest_summary = f"""
+        **Backtest Analysis Complete:**
+        
+        Our advanced swing trading algorithm analyzed {len(analysis_data)} data points and identified 
+        {best_results['total_trades']} trading opportunities with {best_results['accuracy']:.1f}% accuracy.
+        The strategy generated {best_results['total_return']:.2f}% total returns with an average 
+        holding period of {best_results['avg_duration']:.1f} days per trade.
+        
+        **Strategy Details:**
+        - RSI levels: {best_params['rsi_oversold']}-{best_params['rsi_overbought']}
+        - Moving averages: {best_params['sma_short']}/{best_params['sma_long']}
+        - Risk management: {best_params['stop_loss_pct']:.1f}% stop loss, {best_params['target_pct']:.1f}% target
+        
+        **Live Trading Recommendations:**
+        Based on current market conditions and the optimized strategy parameters, 
+        {'continue monitoring for entry opportunities' if not live_signals or (last_date - live_signals[-1]['date']).days > 5 
+        else f'consider the {live_signals[-1]["type"]} position with strict risk management'}.
+        
+        Always maintain position sizing according to your risk tolerance and never risk more than 
+        2% of your capital per trade. Market conditions can change rapidly, so continuous monitoring 
+        is essential for successful swing trading.
+        """
+        
+        st.markdown(backtest_summary)
+        
+        # Buyer/Seller Psychology
+        st.subheader("🧠 Market Psychology Analysis")
+        
+        current_rsi = ta.calculate_rsi().iloc[-1]
+        recent_volume = current_data['volume'].iloc[-5:].mean()
+        avg_volume = current_data['volume'].mean()
+        price_change_5d = ((current_data['close'].iloc[-1] - current_data['close'].iloc[-5]) / current_data['close'].iloc[-5]) * 100
+        
+        psychology_summary = f"""
+        **Current Market Sentiment:**
+        
+        RSI at {current_rsi:.1f} suggests {'overbought conditions - sellers may step in' if current_rsi > 70 
+        else 'oversold conditions - buyers may emerge' if current_rsi < 30 
+        else 'neutral momentum - waiting for directional bias'}.
+        
+        Recent volume activity ({recent_volume/avg_volume:.1f}x average) indicates 
+        {'strong institutional interest' if recent_volume/avg_volume > 1.2 
+        else 'moderate participation' if recent_volume/avg_volume > 0.8 
+        else 'low participation - lack of conviction'}.
+        
+        The {price_change_5d:.1f}% price move over the last 5 sessions reflects 
+        {'bullish sentiment with buyers in control' if price_change_5d > 2
+        else 'bearish sentiment with sellers dominating' if price_change_5d < -2
+        else 'indecision between buyers and sellers'}.
+        
+        **Trading Psychology Insights:**
+        {'Fear-based selling may create opportunities for patient buyers' if current_rsi < 30
+        else 'Greed-driven buying may create shorting opportunities' if current_rsi > 70
+        else 'Market in equilibrium - wait for clear directional move'}.
+        """
+        
+        st.markdown(psychology_summary)
 
 if __name__ == "__main__":
     main()
