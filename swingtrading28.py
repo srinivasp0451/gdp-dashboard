@@ -1135,7 +1135,7 @@ def main():
             min_value=50,
             max_value=500,
             value=100,
-            step=50,
+            step=10,
             help="More iterations = better optimization but slower"
         )
         
