@@ -391,6 +391,9 @@ class StrategyOptimizer:
         best_params = None
         best_score = 0
         best_results = None
+        best_found_params = None  # Track best found regardless of target
+        best_found_results = None
+        best_found_score = 0
         
         # Progress bar
         progress_bar = st.progress(0)
@@ -449,6 +452,12 @@ class StrategyOptimizer:
                     # Weighted score prioritizing accuracy as requested
                     score = (accuracy_score * 0.6 + return_score * 0.25 + trade_count_score * 0.15)
                     
+                    # Track best found regardless of target accuracy
+                    if score > best_found_score:
+                        best_found_score = score
+                        best_found_params = params
+                        best_found_results = backtest_results
+                    
                     # Strong accuracy filter - only accept if meets target
                     if backtest_results['accuracy'] >= target_accuracy and score > best_score:
                         best_score = score
@@ -458,12 +467,18 @@ class StrategyOptimizer:
             # Update progress
             progress = (i + 1) / iterations
             progress_bar.progress(progress)
-            status_text.text(f"Optimizing... {i+1}/{iterations} iterations completed | Best Accuracy: {best_results['accuracy']:.1f}% | Target: {target_accuracy:.1f}%" if best_results else f"Optimizing... {i+1}/{iterations} iterations completed | Searching for {target_accuracy:.1f}%+ accuracy")
+            
+            current_best_accuracy = best_results['accuracy'] if best_results else (best_found_results['accuracy'] if best_found_results else 0)
+            status_text.text(f"Optimizing... {i+1}/{iterations} iterations completed | Best Accuracy: {current_best_accuracy:.1f}% | Target: {target_accuracy:.1f}%")
         
         progress_bar.empty()
         status_text.empty()
         
-        return best_params, best_results, best_score
+        # Return target results if found, otherwise return best found
+        if best_params is not None:
+            return best_params, best_results, best_score
+        else:
+            return best_found_params, best_found_results, best_found_score
     
     def get_grid_params(self, param_grid, index):
         # Simple grid search implementation
@@ -581,6 +596,13 @@ class StrategyOptimizer:
         total_trades = len(trades)
         positive_trades = sum(1 for t in trades if t['pnl_pct'] > 0)
         accuracy = positive_trades / total_trades * 100
+        
+        # Calculate precision (positive predictive value)
+        # For trading: precision = profitable trades / total predicted profitable trades
+        # We'll use a threshold - trades with >1% return are considered "good predictions"
+        good_predictions = sum(1 for t in trades if t['pnl_pct'] > 1.0)
+        precision = (good_predictions / total_trades * 100) if total_trades > 0 else 0
+        
         total_return = sum(t['pnl_pct'] for t in trades)
         avg_return_per_trade = total_return / total_trades
         total_points_gained = sum(t['points_gained'] for t in trades)
@@ -598,6 +620,7 @@ class StrategyOptimizer:
             'positive_trades': positive_trades,
             'negative_trades': total_trades - positive_trades,
             'accuracy': accuracy,
+            'precision': precision,
             'total_return': total_return,
             'avg_return_per_trade': avg_return_per_trade,
             'avg_duration': np.mean([t['duration_days'] for t in trades]),
@@ -1159,55 +1182,68 @@ def main():
                 st.write("• Try different trade direction")
                 st.write("• Check if data has sufficient volatility")
                 
-                # Still show some basic analysis
-                st.subheader("📊 Basic Analysis (Without Optimization)")
-                
-                # Run with default parameters
-                default_params = {
-                    'rsi_period': 14,
-                    'rsi_oversold': 30,
-                    'rsi_overbought': 70,
-                    'sma_short': 10,
-                    'sma_long': 20,
-                    'bb_period': 20,
-                    'bb_std': 2,
-                    'stop_loss_pct': 2.0,
-                    'target_pct': 4.0
-                }
-                
-                strategy = SwingTradingStrategy(analysis_data, default_params)
-                signals = strategy.generate_signals(trade_type)
-                
-                if signals:
-                    backtest_results = optimizer.backtest_strategy(signals, analysis_data)
-                    
-                    col1, col2 = st.columns(2)
-                    with col1:
-                        st.write("**Default Strategy Results:**")
-                        st.metric("Accuracy", f"{backtest_results['accuracy']:.1f}%")
-                        st.metric("Total Trades", backtest_results['total_trades'])
-                    
-                    with col2:
-                        st.metric("Total Return", f"{backtest_results['total_return']:.2f}%")
-                        if 'buy_hold_return' in backtest_results:
-                            st.metric("Buy & Hold", f"{backtest_results['buy_hold_return']:.2f}%")
-                
-                return  # Exit early if optimization failed
+                # Exit early if no results found at all
+                if best_results is None:
+                    return
             
-            # Store results in session state
-            st.session_state['best_params'] = best_params
-            st.session_state['best_results'] = best_results
-            st.session_state['analysis_data'] = analysis_data
-            st.session_state['analysis_complete'] = True
+            # Check if we found target accuracy or just best available
+            target_met = best_results['accuracy'] >= target_accuracy if best_results else False
+            
+            if target_met:
+                st.success("✅ Target Accuracy Achieved!")
+            else:
+                st.warning(f"⚠️ Target accuracy of {target_accuracy}% not found. Showing best results found:")
+            
+            # Display best strategy (whether target met or not)
+            if best_results is not None:
+                col1, col2 = st.columns(2)
+                
+                with col1:
+                    st.markdown("**Best Strategy Parameters:**")
+                    for key, value in best_params.items():
+                        st.write(f"• {key}: {value}")
+                
+                with col2:
+                    st.markdown("**Strategy Performance:**")
+                    st.metric("Accuracy", f"{best_results['accuracy']:.1f}%")
+                    if 'precision' in best_results:
+                        st.metric("Precision", f"{best_results['precision']:.1f}%")
+                    st.metric("Total Return", f"{best_results['total_return']:.2f}%")
+                    st.metric("Total Trades", best_results['total_trades'])
+                    st.metric("Win Rate", f"{(best_results['positive_trades']/best_results['total_trades']*100):.1f}%")
+                    
+                    # Add buy and hold comparison
+                    st.markdown("**vs Buy & Hold:**")
+                    if 'buy_hold_return' in best_results:
+                        st.metric("Buy & Hold Return", f"{best_results['buy_hold_return']:.2f}%")
+                        st.metric("Strategy Outperformance", f"{best_results['strategy_vs_buy_hold']:.2f}%")
+                    
+                    # Add points summary
+                    st.markdown("**Points Analysis:**")
+                    if 'total_points_gained' in best_results:
+                        st.metric("Total Points Gained", f"{best_results['total_points_gained']:.1f}")
+                        st.metric("Total Points Lost", f"{best_results['total_points_lost']:.1f}")
+                        st.metric("Net Points", f"{best_results['net_points']:.1f}")
+                
+                # Store results in session state
+                st.session_state['best_params'] = best_params
+                st.session_state['best_results'] = best_results
+                st.session_state['analysis_data'] = analysis_data
+                st.session_state['analysis_complete'] = True
+                st.session_state['target_met'] = target_met
         
         # Show results if analysis is complete
         if st.session_state.get('analysis_complete', False):
             best_params = st.session_state['best_params']
             best_results = st.session_state['best_results']
             analysis_data = st.session_state['analysis_data']
+            target_met = st.session_state.get('target_met', True)
             
-            # Display best strategy
-            st.success("✅ Optimization Complete!")
+            # Display status based on whether target was met
+            if target_met:
+                st.success("✅ Optimization Complete - Target Accuracy Achieved!")
+            else:
+                st.warning("⚠️ Optimization Complete - Showing Best Results Found (Target accuracy not achieved)")
             
             col1, col2 = st.columns(2)
             
@@ -1219,6 +1255,8 @@ def main():
             with col2:
                 st.markdown("**Strategy Performance:**")
                 st.metric("Accuracy", f"{best_results['accuracy']:.1f}%")
+                if 'precision' in best_results:
+                    st.metric("Precision", f"{best_results['precision']:.1f}%")
                 st.metric("Total Return", f"{best_results['total_return']:.2f}%")
                 st.metric("Total Trades", best_results['total_trades'])
                 st.metric("Win Rate", f"{(best_results['positive_trades']/best_results['total_trades']*100):.1f}%")
