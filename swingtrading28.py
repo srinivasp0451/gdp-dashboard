@@ -1015,8 +1015,7 @@ def main():
                     st.session_state['data_source'] = 'yfinance'
     
     # Update data reference
-    data = st.session_state.get('data', None)_source'] = 'yfinance'_source'] = 'yfinance'
-                    st.experimental_rerun()
+    data = st.session_state.get('data', None)
     
     # Check session state for data
     if 'data' in st.session_state and data is None:
