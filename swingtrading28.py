@@ -663,17 +663,6 @@ class StrategyOptimizer:
             'avg_loss': avg_loss,
             'profit_factor': profit_factor if profit_factor != float('inf') else 999
         }
-            'accuracy': accuracy,
-            'precision': precision,
-            'total_return': total_return,
-            'avg_return_per_trade': avg_return_per_trade,
-            'avg_duration': np.mean([t['duration_days'] for t in trades]),
-            'total_points_gained': total_points_gained,
-            'total_points_lost': total_points_lost,
-            'net_points': net_points,
-            'buy_hold_return': buy_hold_return,
-            'strategy_vs_buy_hold': total_return - buy_hold_return
-        }
 
 def load_data_from_file(uploaded_file):
     """Load and process uploaded data file"""
