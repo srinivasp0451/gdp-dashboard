@@ -1510,7 +1510,7 @@ def main():
     else:
         st.info("👆 Please upload a data file or fetch data from Yahoo Finance to get started.")  # Show first 20 signals for clarity
                
-        st.plotly_chart(signals_chart, use_container_width=True)
+        # st.plotly_chart(signals_chart, use_container_width=True)
         
         # Live Recommendation
         st.subheader("🎯 Live Trading Recommendation")
