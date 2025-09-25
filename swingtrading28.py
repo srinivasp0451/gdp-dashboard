@@ -1165,10 +1165,10 @@ def main():
         # Number of iterations option
         n_iterations = st.sidebar.slider(
             "Optimization Iterations",
-            min_value=50,
-            max_value=500,
-            value=100,
-            step=50,
+            min_value=5,
+            max_value=5000,
+            value=20,
+            step=5,
             help="More iterations = better optimization but slower"
         )
         
