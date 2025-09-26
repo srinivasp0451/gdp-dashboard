@@ -294,10 +294,49 @@ def load_data(symbol, period="2y", interval="1d"):
     try:
         ticker = yf.Ticker(symbol)
         df = ticker.history(period=period, interval=interval)
+        
+        if df.empty:
+            st.error(f"No data found for {symbol}")
+            return None
+            
+        # Reset index to get Date as a column
         df = df.reset_index()
+        
+        # Handle different column structures from yfinance
+        if 'Datetime' in df.columns:
+            df['Date'] = df['Datetime']
+            df = df.drop('Datetime', axis=1)
+        
+        # Ensure we have the required columns
+        required_columns = ['Open', 'High', 'Low', 'Close', 'Volume']
+        available_columns = [col for col in required_columns if col in df.columns]
+        
+        if len(available_columns) < 5:
+            st.error(f"Missing required columns. Available: {list(df.columns)}")
+            return None
+        
+        # Select only the columns we need
+        df = df[['Date'] + available_columns].copy()
+        
+        # Rename columns to standard format
         df.columns = ['Date', 'Open', 'High', 'Low', 'Close', 'Volume']
+        
+        # Set Date as index
         df.set_index('Date', inplace=True)
+        
+        # Ensure numeric types
+        for col in ['Open', 'High', 'Low', 'Close', 'Volume']:
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+        
+        # Remove any rows with NaN values
+        df = df.dropna()
+        
+        if df.empty:
+            st.error(f"No valid data found for {symbol}")
+            return None
+            
         return df
+        
     except Exception as e:
         st.error(f"Error loading data for {symbol}: {str(e)}")
         return None
@@ -408,6 +447,18 @@ def main():
     st.title("🚀 VMA-Elite Trading System")
     st.markdown("Advanced Non-Lagging Swing Trading Strategy with Live Recommendations")
     
+    # Initialize session state
+    if 'data_loaded' not in st.session_state:
+        st.session_state.data_loaded = False
+    if 'df' not in st.session_state:
+        st.session_state.df = None
+    if 'last_symbol' not in st.session_state:
+        st.session_state.last_symbol = ""
+    if 'last_period' not in st.session_state:
+        st.session_state.last_period = ""
+    if 'last_interval' not in st.session_state:
+        st.session_state.last_interval = ""
+    
     # Sidebar
     st.sidebar.title("⚙️ Configuration")
     
@@ -426,6 +477,71 @@ def main():
     period = st.sidebar.selectbox("Period", ["1mo", "3mo", "6mo", "1y", "2y", "5y"], index=4)
     interval = st.sidebar.selectbox("Interval", ["1d", "1wk", "1mo"], index=0)
     
+    # Add CSV upload option
+    st.sidebar.subheader("📁 Upload Data")
+    uploaded_file = st.sidebar.file_uploader("Choose CSV file", type="csv")
+    
+    if uploaded_file is not None:
+        try:
+            df_uploaded = pd.read_csv(uploaded_file)
+            
+            # Try to identify date column
+            date_columns = [col for col in df_uploaded.columns if 'date' in col.lower() or 'time' in col.lower()]
+            if date_columns:
+                df_uploaded[date_columns[0]] = pd.to_datetime(df_uploaded[date_columns[0]])
+                df_uploaded = df_uploaded.set_index(date_columns[0])
+            
+            # Standardize column names
+            column_mapping = {}
+            for col in df_uploaded.columns:
+                col_lower = col.lower()
+                if 'open' in col_lower:
+                    column_mapping[col] = 'Open'
+                elif 'high' in col_lower:
+                    column_mapping[col] = 'High'
+                elif 'low' in col_lower:
+                    column_mapping[col] = 'Low'
+                elif 'close' in col_lower:
+                    column_mapping[col] = 'Close'
+                elif 'volume' in col_lower:
+                    column_mapping[col] = 'Volume'
+            
+            df_uploaded = df_uploaded.rename(columns=column_mapping)
+            
+            # Check if we have required columns
+            required_cols = ['Open', 'High', 'Low', 'Close', 'Volume']
+            if all(col in df_uploaded.columns for col in required_cols):
+                st.session_state.df = df_uploaded[required_cols]
+                st.session_state.data_loaded = True
+                st.session_state.last_symbol = "CSV_DATA"
+                st.sidebar.success(f"✅ CSV loaded: {len(df_uploaded)} rows")
+            else:
+                st.sidebar.error(f"❌ CSV missing columns. Found: {list(df_uploaded.columns)}")
+                
+        except Exception as e:
+            st.sidebar.error(f"❌ Error reading CSV: {str(e)}")
+    
+    # Fetch data button
+    fetch_button = st.sidebar.button("🔄 Fetch Data", type="primary", use_container_width=True)
+    
+    # Check if we need to fetch new data
+    data_params_changed = (
+        symbol != st.session_state.last_symbol or 
+        period != st.session_state.last_period or 
+        interval != st.session_state.last_interval
+    )
+    
+    # Data status indicator
+    if st.session_state.data_loaded and not data_params_changed:
+        st.sidebar.success(f"✅ Data loaded for {st.session_state.last_symbol}")
+        st.sidebar.info(f"📅 Period: {st.session_state.last_period} | Interval: {st.session_state.last_interval}")
+        if st.session_state.df is not None:
+            st.sidebar.info(f"📊 Data points: {len(st.session_state.df)}")
+    elif data_params_changed and st.session_state.data_loaded:
+        st.sidebar.warning("⚠️ Parameters changed. Click 'Fetch Data' to update.")
+    else:
+        st.sidebar.info("👆 Click 'Fetch Data' to load market data")
+    
     # Mode selection
     mode = st.sidebar.radio("Mode", ["📊 Backtesting", "🎯 Live Analysis"])
     
@@ -439,15 +555,29 @@ def main():
         max_risk_percent=max_risk_percent
     )
     
-    # Load data
-    with st.spinner(f"Loading {symbol} data..."):
-        df = load_data(symbol, period, interval)
+    # Handle data fetching
+    if fetch_button or (not st.session_state.data_loaded and symbol):
+        with st.spinner(f"Loading {symbol} data..."):
+            df = load_data(symbol, period, interval)
+            
+            if df is not None and not df.empty:
+                st.session_state.df = df
+                st.session_state.data_loaded = True
+                st.session_state.last_symbol = symbol
+                st.session_state.last_period = period
+                st.session_state.last_interval = interval
+                st.success(f"✅ Successfully loaded {len(df)} data points for {symbol}")
+            else:
+                st.session_state.data_loaded = False
+                st.error("❌ Failed to load data. Please check the symbol and try again.")
+                return
     
-    if df is None or df.empty:
-        st.error("Failed to load data. Please check the symbol and try again.")
+    # Check if data is available
+    if not st.session_state.data_loaded or st.session_state.df is None or st.session_state.df.empty:
+        st.info("👆 Please configure your settings and click 'Fetch Data' to begin analysis.")
         return
     
-    st.success(f"Loaded {len(df)} data points for {symbol}")
+    df = st.session_state.df
     
     # Main content based on mode
     if mode == "📊 Backtesting":
@@ -498,8 +628,8 @@ def main():
             
             # Format trades for display
             display_trades = trades_df.copy()
-            display_trades['Entry Date'] = display_trades['entry_date'].dt.strftime('%Y-%m-%d')
-            display_trades['Exit Date'] = display_trades['exit_date'].dt.strftime('%Y-%m-%d')
+            display_trades['Entry Date'] = pd.to_datetime(display_trades['entry_date']).dt.strftime('%Y-%m-%d')
+            display_trades['Exit Date'] = pd.to_datetime(display_trades['exit_date']).dt.strftime('%Y-%m-%d')
             display_trades['Entry Price'] = display_trades['entry_price'].round(2)
             display_trades['Exit Price'] = display_trades['exit_price'].round(2)
             display_trades['P&L'] = display_trades['pnl'].round(2)
@@ -513,8 +643,15 @@ def main():
             columns_to_show = ['Entry Date', 'Type', 'Entry Price', 'Exit Price', 'P&L', 
                              'Elite Score', 'Probability %', 'Reason', 'Exit Reason']
             
+            # Add color coding for P&L
+            def highlight_pnl(row):
+                color = 'background-color: rgba(34, 197, 94, 0.3)' if row['P&L'] > 0 else 'background-color: rgba(239, 68, 68, 0.3)'
+                return [color if col == 'P&L' else '' for col in row.index]
+            
+            styled_df = display_trades[columns_to_show].style.apply(highlight_pnl, axis=1)
+            
             st.dataframe(
-                display_trades[columns_to_show],
+                styled_df,
                 use_container_width=True,
                 height=400
             )
@@ -609,7 +746,7 @@ def main():
                     st.write("**Signal Quality:**")
                     st.write(f"- Elite Score: {latest_long['Elite_Score']:.3f}")
                     st.write(f"- Probability of Profit: {min(0.95, latest_long['Elite_Score'] * 1.2)*100:.1f}%")
-                    st.write(f"- Signal Date: {latest_long.name.strftime('%Y-%m-%d %H:%M')}")
+                    st.write(f"- Signal Date: {latest_long.name.strftime('%Y-%m-%d')}")
                     
                 st.write("**Entry Reason:**")
                 st.write(strategy.get_entry_reason(latest_long, 'LONG'))
@@ -630,7 +767,7 @@ def main():
                     st.write("**Signal Quality:**")
                     st.write(f"- Elite Score: {latest_short['Elite_Score']:.3f}")
                     st.write(f"- Probability of Profit: {min(0.95, latest_short['Elite_Score'] * 1.2)*100:.1f}%")
-                    st.write(f"- Signal Date: {latest_short.name.strftime('%Y-%m-%d %H:%M')}")
+                    st.write(f"- Signal Date: {latest_short.name.strftime('%Y-%m-%d')}")
                     
                 st.write("**Entry Reason:**")
                 st.write(strategy.get_entry_reason(latest_short, 'SHORT'))
