@@ -43,6 +43,12 @@ class VMAEliteStrategy:
         df['ROC_Fast'] = df['Close'].pct_change(periods=self.momentum_length // 2) * 100
         df['ROC_Slow'] = df['Close'].pct_change(periods=self.momentum_length) * 100
         df['Momentum_Acceleration'] = df['ROC_Fast'] - df['ROC_Slow']
+        
+        # Fill NaN values with 0
+        df['ROC_Fast'] = df['ROC_Fast'].fillna(0)
+        df['ROC_Slow'] = df['ROC_Slow'].fillna(0)
+        df['Momentum_Acceleration'] = df['Momentum_Acceleration'].fillna(0)
+        
         return df
     
     def calculate_volume_analysis(self, df):
@@ -51,6 +57,13 @@ class VMAEliteStrategy:
         df['Volume_Ratio'] = df['Volume'] / df['Volume_MA']
         df['Price_Change'] = np.abs(df['Close'].diff())
         df['Volume_Price_Thrust'] = (df['Volume_Ratio'] * df['Price_Change'] / df['Close']) * 10000
+        
+        # Fill NaN values with 0
+        df['Volume_MA'] = df['Volume_MA'].fillna(0)
+        df['Volume_Ratio'] = df['Volume_Ratio'].fillna(1.0)
+        df['Price_Change'] = df['Price_Change'].fillna(0)
+        df['Volume_Price_Thrust'] = df['Volume_Price_Thrust'].fillna(0)
+        
         return df
     
     def calculate_support_resistance(self, df):
@@ -88,22 +101,38 @@ class VMAEliteStrategy:
     def generate_signals(self, df):
         """Generate VMA-Elite trading signals"""
         # Calculate VPT average
-        df['VPT_Average'] = df['Volume_Price_Thrust'].rolling(window=20).mean()
+        df['VPT_Average'] = df['Volume_Price_Thrust'].rolling(window=20).mean().fillna(0)
         
-        # Signal conditions
-        df['Bullish_Thrust'] = ((df['Volume_Price_Thrust'] > df['VPT_Average'] * self.sensitivity) &
-                               (df['Momentum_Acceleration'] > 0) &
-                               (df['Close'] > df['Mid_Range']) &
-                               (df['Elite_Score'] > 0.6))
+        # Signal conditions - ensure all boolean operations
+        bullish_conditions = [
+            df['Volume_Price_Thrust'] > (df['VPT_Average'] * self.sensitivity),
+            df['Momentum_Acceleration'] > 0,
+            df['Close'] > df['Mid_Range'],
+            df['Elite_Score'] > 0.6
+        ]
         
-        df['Bearish_Thrust'] = ((df['Volume_Price_Thrust'] > df['VPT_Average'] * self.sensitivity) &
-                              (df['Momentum_Acceleration'] < 0) &
-                              (df['Close'] < df['Mid_Range']) &
-                              (df['Elite_Score'] > 0.6))
+        bearish_conditions = [
+            df['Volume_Price_Thrust'] > (df['VPT_Average'] * self.sensitivity),
+            df['Momentum_Acceleration'] < 0,
+            df['Close'] < df['Mid_Range'],
+            df['Elite_Score'] > 0.6
+        ]
+        
+        # Combine conditions
+        df['Bullish_Thrust'] = pd.Series(True, index=df.index)
+        for condition in bullish_conditions:
+            df['Bullish_Thrust'] = df['Bullish_Thrust'] & condition.fillna(False)
+        
+        df['Bearish_Thrust'] = pd.Series(True, index=df.index)
+        for condition in bearish_conditions:
+            df['Bearish_Thrust'] = df['Bearish_Thrust'] & condition.fillna(False)
         
         # Entry signals (non-repainting)
-        df['Long_Signal'] = (df['Bullish_Thrust'] & ~df['Bullish_Thrust'].shift(1) & (df['Structure_Score'] > 0))
-        df['Short_Signal'] = (df['Bearish_Thrust'] & ~df['Bearish_Thrust'].shift(1) & (df['Structure_Score'] < 0))
+        prev_bullish = df['Bullish_Thrust'].shift(1).fillna(False)
+        prev_bearish = df['Bearish_Thrust'].shift(1).fillna(False)
+        
+        df['Long_Signal'] = (df['Bullish_Thrust'] & ~prev_bullish & (df['Structure_Score'] > 0))
+        df['Short_Signal'] = (df['Bearish_Thrust'] & ~prev_bearish & (df['Structure_Score'] < 0))
         
         # Calculate stop loss and targets
         df['Long_SL'] = df['Low'] - (df['ATR'] * 1.5)
