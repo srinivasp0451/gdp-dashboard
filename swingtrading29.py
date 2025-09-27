@@ -414,7 +414,7 @@ class AdvancedTradingStrategy:
         
         trades = []
         balance = initial_balance
-        current_trade =         return {
+        return {
             'total_trades': len(trades_df),
             'winning_trades': len(winning_trades),
             'losing_trades': len(losing_trades),
@@ -433,7 +433,7 @@ class AdvancedTradingStrategy:
             'buy_hold_return': buy_hold_return,
             'buy_hold_points': buy_hold_points,
             'strategy_vs_buyhold_pct': total_return - buy_hold_return,
-            'strategy_vs_buyhold_points': total_points - buy_hold_points
+            'strategy_vs_buyhold_points': total_points - buy_hold_points 
         }
 
 class StrategyOptimizer:
