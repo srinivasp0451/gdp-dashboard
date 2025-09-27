@@ -1856,8 +1856,7 @@ def main():
         
         with col1:
             return_color = "normal" if performance['total_return'] > 0 else "inverse"
-            st.metric(
-                "Total
+            st.metric("Total returns", performance['total_return'])
         
         # Buy and hold comparison
         buy_hold_return = (df['Close'].iloc[-1] - df['Close'].iloc[0]) / df['Close'].iloc[0] * 100
