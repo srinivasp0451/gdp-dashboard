@@ -76,7 +76,10 @@ for train_idx, test_idx in splits.split(X):
     df.loc[test_idx,'Pred'] = model.predict(X.iloc[test_idx])
     df.loc[test_idx,'Prob'] = model.predict_proba(X.iloc[test_idx]).max(axis=1)
     fold_num += 1
-    progress_bar.progress(fold_num*25)
+    #progress_bar.progress(fold_num*25)
+    # Calculate progress % safely
+    progress_pct = int((fold_num / total_folds) * 100)
+    progress_bar.progress(min(progress_pct, 100))  # never exceed 100
 
 # ----------------------------- #
 # Backtest Simulation
