@@ -1,4 +1,4 @@
-# app_updated.py
+# hpm2_streamlit.py
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -6,202 +6,162 @@ import yfinance as yf
 from datetime import datetime, timedelta
 import matplotlib.pyplot as plt
 import time
-import functools
+import itertools
+import warnings
+warnings.filterwarnings("ignore")
 
-st.set_page_config(layout="wide", page_title="ABM+Squeeze Swing Algo (Updated)")
+st.set_page_config(layout="wide", page_title="HPM 2.0 — Hybrid Predictive Momentum")
+
+st.title("HPM 2.0 — Hybrid Predictive Momentum (Universal)")
 
 # ---------------------------
-# Utilities & caching
+# Helper: safe yfinance download (cached)
 # ---------------------------
-@st.cache_data(ttl=300)
-def download_data_yf_safe(ticker, interval="1d", start=None, end=None, period=None):
-    """
-    Safe wrapper around yfinance download:
-      - prefer start/end when provided (more control)
-      - otherwise use period
-      - always reset index and ensure Date is datetime
-      - returns standardized columns Date, Open, High, Low, Close, Volume
-    """
-    # choose method
+@st.cache_data(ttl=600)
+def download_yf(ticker, interval="1d", start=None, end=None, period=None):
     try:
-        if start is not None or end is not None:
-            data = yf.download(ticker, start=start, end=end, interval=interval, progress=False)
+        if start or end:
+            df = yf.download(ticker, start=start, end=end, interval=interval, progress=False)
         else:
-            # safe usage of period. yfinance supports 'max' for long history (subject to ticker availability)
-            data = yf.download(ticker, period=period or "2y", interval=interval, progress=False)
+            df = yf.download(ticker, period=period or "2y", interval=interval, progress=False)
     except Exception as e:
         raise e
-
-    if data is None or data.empty:
+    if df is None or df.empty:
         return pd.DataFrame()
-    # ensure columns exist
-    for col in ['Open','High','Low','Close']:
-        if col not in data.columns:
+    df = df.reset_index()
+    # standardize
+    if 'Date' not in df.columns and 'Datetime' in df.columns:
+        df.rename(columns={'Datetime':'Date'}, inplace=True)
+    df['Date'] = pd.to_datetime(df['Date'])
+    for c in ['Open','High','Low','Close']:
+        if c not in df.columns:
             return pd.DataFrame()
-
-    data = data.reset_index()
-    # standardize column name for Date
-    if 'Date' not in data.columns and 'Datetime' in data.columns:
-        data.rename(columns={'Datetime':'Date'}, inplace=True)
-    data['Date'] = pd.to_datetime(data['Date'])
-    # ensure numeric
-    data[['Open','High','Low','Close']] = data[['Open','High','Low','Close']].apply(pd.to_numeric, errors='coerce')
-    # Volume may be missing or zero on some indices; keep as-is
-    if 'Volume' not in data.columns:
-        data['Volume'] = 0
-    # drop rows with NaNs in price columns
-    data = data.dropna(subset=['Open','High','Low','Close']).reset_index(drop=True)
-    return data[['Date','Open','High','Low','Close','Volume']]
+    if 'Volume' not in df.columns:
+        df['Volume'] = 0
+    df = df[['Date','Open','High','Low','Close','Volume']].dropna().reset_index(drop=True)
+    return df
 
 # ---------------------------
-# Indicators
+# Indicators: squeeze, momentum, regime
 # ---------------------------
-def compute_indicators(df, atr_period=14, ema_fast=8, rsi_period=7, bb_n=20, bb_k=2, kc_n=20, kc_mult=1.5):
-    """
-    Computes:
-     - ATR
-     - EMA_fast
-     - RSI (fast)
-     - Momentum (3 bar)
-     - Prev high/low for breakout baseline
-     - Bollinger Bands & Keltner (squeeze)
-    Careful about alignment: operate on same dataframe indices.
-    """
+def compute_hpm_indicators(df, bb_n=20, bb_k=2, kc_n=20, kc_mult=1.5, ema_regime=200, atr_n=14):
     df = df.copy().reset_index(drop=True)
-    # True range
+    df['Date'] = pd.to_datetime(df['Date'])
+    # ATR (rolling)
     prev_close = df['Close'].shift(1)
     tr1 = df['High'] - df['Low']
     tr2 = (df['High'] - prev_close).abs()
     tr3 = (df['Low'] - prev_close).abs()
     tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-    df['ATR'] = tr.rolling(atr_period, min_periods=1).mean()
-
-    df['EMA_fast'] = df['Close'].ewm(span=ema_fast, adjust=False).mean()
-
-    # RSI (fast, EWMA)
-    delta = df['Close'].diff()
-    up = delta.clip(lower=0)
-    down = -1 * delta.clip(upper=0)
-    ma_up = up.ewm(alpha=1/rsi_period, adjust=False).mean()
-    ma_down = down.ewm(alpha=1/rsi_period, adjust=False).mean()
-    rs = ma_up / (ma_down + 1e-9)
-    df['RSI_fast'] = 100 - (100 / (1 + rs))
-
-    df['mom3'] = df['Close'].pct_change(3)
-
-    df['prev_high_n'] = df['High'].rolling(20).max().shift(1)
-    df['prev_low_n'] = df['Low'].rolling(20).min().shift(1)
+    df['ATR'] = tr.rolling(atr_n, min_periods=1).mean()
 
     # Bollinger Bands
     ma = df['Close'].rolling(bb_n).mean()
     std = df['Close'].rolling(bb_n).std()
-    df['bb_upper'] = ma + bb_k * std
-    df['bb_lower'] = ma - bb_k * std
-    df['bb_width'] = (df['bb_upper'] - df['bb_lower']) / ma
+    df['BB_up'] = ma + bb_k * std
+    df['BB_dn'] = ma - bb_k * std
+    df['BB_width'] = (df['BB_up'] - df['BB_dn']) / ma
 
-    # Keltner Channels (EMA + ATR)
+    # Keltner
     ema_kc = df['Close'].ewm(span=kc_n, adjust=False).mean()
-    df['kc_upper'] = ema_kc + kc_mult * df['ATR']
-    df['kc_lower'] = ema_kc - kc_mult * df['ATR']
-    df['kc_width'] = (df['kc_upper'] - df['kc_lower']) / ema_kc
+    df['KC_up'] = ema_kc + kc_mult * df['ATR']
+    df['KC_dn'] = ema_kc - kc_mult * df['ATR']
+    df['KC_width'] = (df['KC_up'] - df['KC_dn']) / ema_kc
 
-    # Squeeze detection: when BB width < KC width -> squeeze (contraction)
-    df['squeeze'] = df['bb_width'] < df['kc_width']
+    # Squeeze: BB narrower than KC (contraction)
+    df['squeeze'] = df['BB_width'] < df['KC_width']
 
-    # volume spike
+    # Momentum: short-term momentum (non-lagging)
+    df['mom_3'] = df['Close'].pct_change(3)
+    df['mom_5'] = df['Close'].pct_change(5)
+    df['mom_accel'] = df['mom_3'] - df['mom_5']  # acceleration
+
+    # Volume pressure (if available)
     if 'Volume' in df.columns:
-        df['vol_ma'] = df['Volume'].rolling(20).mean().fillna(0)
-        df['vol_spike'] = df['Volume'] > (1.5 * df['vol_ma'])
+        df['vol_ma20'] = df['Volume'].rolling(20).mean().fillna(0)
+        df['vol_spike'] = df['Volume'] > 1.5 * df['vol_ma20']
     else:
         df['vol_spike'] = False
 
+    # Regime filter: long-term EMA direction
+    df['EMA_regime'] = df['Close'].ewm(span=ema_regime, adjust=False).mean()
+    df['regime'] = np.where(df['Close'] >= df['EMA_regime'], 1, -1)
+
     return df
 
 # ---------------------------
-# Signal generation (setup + trigger)
+# Signal generator: setup + trigger (last-close based)
 # ---------------------------
-def generate_signals_setup_trigger(df, atr_multiplier=0.8, rsi_threshold=55, min_mom=0.0015):
-    """
-    Two-stage system:
-      - Setup: squeeze detected (contraction). We mark a 'setup' so user can see early.
-      - Trigger (actual trade signal, executed at CLOSE of trigger bar): breakout from prior 20 high/low + ATR
-      - Attempt to be earlier by also creating 'aggressive trigger' if close crosses mid of prior-range + rising momentum.
-    Returns df with columns: setup (bool), signal (1 long, -1 short, 0 none), reason
-    """
+def generate_hpm_signals(df, atr_mul=0.8, rsi_thresh=55, min_mom=0.002):
     df = df.copy().reset_index(drop=True)
     df['setup'] = False
     df['signal'] = 0
-    df['reason'] = ''
-    # mark setup when squeeze True and not previously in squeeze
-    df['squeeze_start'] = (~df['squeeze'].shift(1).fillna(False)) & df['squeeze']
-    # mark setup as recent squeeze (we'll mark setup if squeeze happened within last 10 bars)
+    df['reason'] = ""
+    # Mark setup when squeeze seen in last N bars (early warning)
     for i in range(len(df)):
-        if df.loc[max(0, i-10):i, 'squeeze'].any():
-            df.at[i, 'setup'] = True
+        lookback = 12
+        if i - lookback < 0:
+            window = df.loc[:i,'squeeze']
+        else:
+            window = df.loc[i-lookback:i,'squeeze']
+        if window.any():
+            df.at[i,'setup'] = True
 
+    # Trigger: breakout beyond prior 20-bar high/low + ATR + momentum acceleration + regime alignment
+    df['prev_high20'] = df['High'].rolling(20).max().shift(1)
+    df['prev_low20'] = df['Low'].rolling(20).min().shift(1)
     for i in range(len(df)):
-        row = df.loc[i]
-        # skip if insufficient history
-        if pd.isna(row['prev_high_n']) or pd.isna(row['ATR']):
+        r = df.loc[i]
+        if pd.isna(r['prev_high20']) or pd.isna(r['ATR']):
             continue
-
-        # strict breakout trigger
-        if (row['Close'] > row['prev_high_n'] + atr_multiplier * row['ATR'] and
-            row['RSI_fast'] >= rsi_threshold and
-            row['mom3'] >= min_mom):
-            df.at[i, 'signal'] = 1
-            df.at[i, 'reason'] = f"Breakout long: close>{row['prev_high_n']:.3f}+{atr_multiplier:.2f}*ATR; RSI {row['RSI_fast']:.1f}"
+        # Long trigger: price closes above prev_high + atr_mul*ATR, momentum accel positive, regime bullish
+        if (r['Close'] > r['prev_high20'] + atr_mul * r['ATR'] and
+            r['mom_accel'] > min_mom and
+            r['regime'] == 1):
+            df.at[i,'signal'] = 1
+            df.at[i,'reason'] = f"Long trigger: breakout + accel + regime"
             continue
-
-        # aggressive long: cross above prev_high - 0.5*ATR while squeeze previously present + rising mom
-        if (row['Close'] > row['prev_high_n'] - 0.5 * row['ATR'] and
-            df.loc[max(0, i-5):i, 'squeeze'].any() and
-            row['mom3'] > (min_mom/2) and
-            row['RSI_fast'] > (rsi_threshold - 5)):
-            df.at[i, 'signal'] = 1
-            df.at[i, 'reason'] = "Aggressive long trigger (early)"
+        # Aggressive early long: close above prev_high - 0.4*ATR if setup present and mom positive
+        if (r['Close'] > r['prev_high20'] - 0.4 * r['ATR'] and
+            r['setup'] and r['mom_3']>0 and r['regime']==1):
+            df.at[i,'signal'] = 1
+            df.at[i,'reason'] = f"Aggressive Early Long (setup present)"
             continue
-
-        # short triggers symmetrical
-        if (row['Close'] < row['prev_low_n'] - atr_multiplier * row['ATR'] and
-            row['RSI_fast'] <= (100 - rsi_threshold) and
-            row['mom3'] <= -min_mom):
-            df.at[i, 'signal'] = -1
-            df.at[i, 'reason'] = f"Breakout short"
+        # Short symmetrical
+        if (r['Close'] < r['prev_low20'] - atr_mul * r['ATR'] and
+            r['mom_accel'] < -min_mom and
+            r['regime'] == -1):
+            df.at[i,'signal'] = -1
+            df.at[i,'reason'] = f"Short trigger"
             continue
-
-        if (row['Close'] < row['prev_low_n'] + 0.5 * row['ATR'] and
-            df.loc[max(0, i-5):i, 'squeeze'].any() and
-            row['mom3'] < -(min_mom/2) and
-            row['RSI_fast'] < (100 - rsi_threshold + 5)):
-            df.at[i, 'signal'] = -1
-            df.at[i, 'reason'] = "Aggressive short trigger (early)"
+        if (r['Close'] < r['prev_low20'] + 0.4 * r['ATR'] and
+            r['setup'] and r['mom_3']<0 and r['regime'] == -1):
+            df.at[i,'signal'] = -1
+            df.at[i,'reason'] = f"Aggressive Early Short (setup present)"
             continue
-
     return df
 
 # ---------------------------
-# Backtester (last-close entries)
+# Backtester: last-close entry, ATR-based target/sl, EMA momentum exit, max holding
 # ---------------------------
-def backtest_last_close(df, target_atr=2.0, sl_atr=1.0, max_holding_bars=14, capital=100000):
+def backtest_last_close(df, target_atr=2.0, sl_atr=1.0, max_hold=14, capital=100000):
     df = df.copy().reset_index(drop=True)
     trades = []
     pos = None
     for i in range(len(df)):
-        row = df.loc[i]
-        if pos is None and row['signal'] != 0:
-            # open position at close (last-close entry)
+        r = df.loc[i]
+        if pos is None and r['signal'] != 0:
+            # open at close (last-close entry)
             pos = {
                 'entry_idx': i,
-                'entry_datetime': row['Date'],
-                'entry_price': row['Close'],
-                'side': 'LONG' if row['signal']==1 else 'SHORT',
-                'atr': row['ATR'],
-                'entry_reason': row['reason']
+                'entry_date': r['Date'],
+                'entry_price': r['Close'],
+                'side': 'LONG' if r['signal']==1 else 'SHORT',
+                'atr': r['ATR'],
+                'entry_reason': r['reason']
             }
-            if pos['atr'] <= 0 or pd.isna(pos['atr']):
+            if pos['atr'] <= 0 or np.isnan(pos['atr']):
                 pos['atr'] = 1e-6
-            # set target/sl
             if pos['side']=='LONG':
                 pos['target'] = pos['entry_price'] + target_atr * pos['atr']
                 pos['sl'] = pos['entry_price'] - sl_atr * pos['atr']
@@ -210,45 +170,42 @@ def backtest_last_close(df, target_atr=2.0, sl_atr=1.0, max_holding_bars=14, cap
                 pos['sl'] = pos['entry_price'] + sl_atr * pos['atr']
             continue
 
-        # manage open
         if pos is not None:
-            price = row['Close']
+            price = r['Close']
             exited = False
             exit_price = price
             exit_reason = None
             holding = i - pos['entry_idx']
-
-            # check target/sl using CLOSE-based criteria
+            # check target/sl
             if pos['side']=='LONG':
                 if price >= pos['target']:
                     exit_price = pos['target']; exit_reason = 'Target Hit'; exited=True
                 elif price <= pos['sl']:
                     exit_price = pos['sl']; exit_reason = 'SL Hit'; exited=True
-                elif price < row['EMA_fast']:
-                    exit_price = price; exit_reason = 'Momentum Reversal (EMA)'; exited=True
+                elif price < r['EMA_regime']:  # momentum reversal vs long-term EMA
+                    exit_price = price; exit_reason = 'EMA Reversal'; exited=True
             else:
                 if price <= pos['target']:
                     exit_price = pos['target']; exit_reason = 'Target Hit'; exited=True
                 elif price >= pos['sl']:
                     exit_price = pos['sl']; exit_reason = 'SL Hit'; exited=True
-                elif price > row['EMA_fast']:
-                    exit_price = price; exit_reason = 'Momentum Reversal (EMA)'; exited=True
-
-            if not exited and holding >= max_holding_bars:
-                exit_price = price; exit_reason='Max Holding'; exited=True
-
+                elif price > r['EMA_regime']:
+                    exit_price = price; exit_reason = 'EMA Reversal'; exited=True
+            # forced exit
+            if not exited and holding >= max_hold:
+                exit_price = price; exit_reason = 'Max Hold'; exited=True
             # exit on opposite signal
-            if not exited and row['signal'] != 0:
-                if (pos['side']=='LONG' and row['signal'] == -1) or (pos['side']=='SHORT' and row['signal']==1):
+            if not exited and r['signal'] != 0:
+                if (pos['side']=='LONG' and r['signal']==-1) or (pos['side']=='SHORT' and r['signal']==1):
                     exit_price = price; exit_reason='Opposite Signal'; exited=True
 
             if exited:
                 pnl = (exit_price - pos['entry_price']) if pos['side']=='LONG' else (pos['entry_price'] - exit_price)
-                pnl_pct = pnl / pos['entry_price'] * 100
+                pnl_pct = (pnl / pos['entry_price']) * 100
                 trades.append({
-                    'entry_datetime': pos['entry_datetime'],
+                    'entry_date': pos['entry_date'],
                     'entry_price': pos['entry_price'],
-                    'exit_datetime': row['Date'],
+                    'exit_date': r['Date'],
                     'exit_price': exit_price,
                     'side': pos['side'],
                     'target': pos['target'],
@@ -260,255 +217,318 @@ def backtest_last_close(df, target_atr=2.0, sl_atr=1.0, max_holding_bars=14, cap
                     'exit_reason': exit_reason
                 })
                 pos = None
-
     trades_df = pd.DataFrame(trades)
-    # summary stats
     if trades_df.empty:
-        summary = {'total_trades':0,'positive_trades':0,'negative_trades':0,'accuracy':0.0,'total_pnl':0.0,'total_pnl_pct':0.0,'total_points_strategy':0.0,'total_points_buy_hold':0.0}
+        summary = {'total_trades':0,'positive_trades':0,'negative_trades':0,'accuracy':0.0,'total_pnl':0.0,'total_pnl_pct':0.0,'strategy_points':0.0,'bh_points':0.0}
     else:
         pos_ct = (trades_df['pnl']>0).sum()
         neg_ct = (trades_df['pnl']<=0).sum()
         total_pnl = trades_df['pnl'].sum()
-        buy_hold = df['Close'].iloc[-1] - df['Close'].iloc[0]
+        buyhold = df['Close'].iloc[-1] - df['Close'].iloc[0]
         summary = {
-            'total_trades': len(trades_df),
+            'total_trades': int(len(trades_df)),
             'positive_trades': int(pos_ct),
             'negative_trades': int(neg_ct),
             'accuracy': float(pos_ct / len(trades_df)),
             'total_pnl': float(total_pnl),
-            'total_pnl_pct': float((total_pnl / capital) * 100),
-            'total_points_strategy': float(trades_df['pnl'].sum()),
-            'total_points_buy_hold': float(buy_hold)
+            'total_pnl_pct': float((total_pnl / float(capital)) * 100),
+            'strategy_points': float(trades_df['pnl'].sum()),
+            'bh_points': float(buyhold)
         }
     return trades_df, summary
 
 # ---------------------------
-# Heatmaps: monthly and yearly returns
+# Walk-forward cross validation:
+# - Split the time series into N folds (chronological)
+# - For each fold: use earlier portion as 'train' to tune a small param grid, then test on next chunk (OOS)
+# - Collect OOS metrics across folds
 # ---------------------------
-def returns_heatmaps(df):
+def walk_forward_validation(df, n_splits=5, param_grid=None, train_frac=0.6):
+    df = df.copy().reset_index(drop=True)
+    if param_grid is None:
+        param_grid = {
+            'atr_mul': [0.6, 0.8, 1.0],
+            'target_atr': [1.5, 2.0, 2.5],
+            'sl_atr': [0.8, 1.0, 1.2],
+            'max_hold': [8, 12, 18]
+        }
+    # create list of parameter combinations
+    keys = list(param_grid.keys())
+    combos = [dict(zip(keys, v)) for v in itertools.product(*(param_grid[k] for k in keys))]
+    n = len(df)
+    if n < 50:
+        return pd.DataFrame(), {}
+    # create chronological folds: for n_splits, define train_end and test ranges
+    fold_size = n // (n_splits + 1)  # leave last chunk maybe
+    results = []
+    for k in range(n_splits):
+        train_end = (k+1) * fold_size
+        test_start = train_end
+        test_end = min(test_start + fold_size, n)
+        train_df = df.iloc[:train_end].copy()
+        test_df = df.iloc[test_start:test_end].copy()
+        if len(train_df) < 30 or len(test_df) < 10:
+            continue
+        # tune on train: brute force small grid, pick param with best total_pnl on train
+        best = None
+        best_metric = -np.inf
+        for c in combos:
+            # compute indicators & signals using train params where relevant
+            train_ind = compute_hpm_indicators(train_df)
+            train_sig = generate_hpm_signals(train_ind, atr_mul=c['atr_mul'], min_mom=0.0015)
+            tr_trades, tr_summary = backtest_last_close(train_sig, target_atr=c['target_atr'], sl_atr=c['sl_atr'], max_hold=c['max_hold'])
+            metric = tr_summary['total_pnl'] if tr_summary['total_pnl'] is not None else -99999
+            if metric > best_metric:
+                best_metric = metric
+                best = c
+        # test with best params on test_df
+        test_ind = compute_hpm_indicators(test_df)
+        test_sig = generate_hpm_signals(test_ind, atr_mul=best['atr_mul'], min_mom=0.0015)
+        test_trades, test_summary = backtest_last_close(test_sig, target_atr=best['target_atr'], sl_atr=best['sl_atr'], max_hold=best['max_hold'])
+        results.append({
+            'fold': k+1,
+            'train_end_idx': train_end,
+            'test_start_idx': test_start,
+            'test_end_idx': test_end,
+            'best_params': best,
+            'train_metric': best_metric,
+            'test_total_pnl': test_summary['total_pnl'],
+            'test_accuracy': test_summary['accuracy'],
+            'test_trades': test_summary['total_trades']
+        })
+    results_df = pd.DataFrame(results)
+    # aggregate summary
+    if results_df.empty:
+        agg = {}
+    else:
+        agg = {
+            'folds': len(results_df),
+            'avg_test_pnl': float(results_df['test_total_pnl'].mean()),
+            'avg_test_accuracy': float(results_df['test_accuracy'].mean())
+        }
+    return results_df, agg
+
+# ---------------------------
+# Heatmaps helper
+# ---------------------------
+def monthly_yearly_heatmap(df):
     df = df.copy().reset_index(drop=True)
     df['Date'] = pd.to_datetime(df['Date'])
-    df['Year'] = df['Date'].dt.year
-    df['Month'] = df['Date'].dt.month
-    # monthly returns: pct change month-end close
     month_close = df.set_index('Date').resample('M')['Close'].last().reset_index()
     month_close['Year'] = month_close['Date'].dt.year
     month_close['Month'] = month_close['Date'].dt.month
     month_close['ret'] = month_close['Close'].pct_change() * 100
-    pivot_m = month_close.pivot(index='Year', columns='Month', values='ret')
-    # yearly returns
+    pivot_month = month_close.pivot(index='Year', columns='Month', values='ret')
     year_close = df.set_index('Date').resample('Y')['Close'].last().reset_index()
     year_close['ret'] = year_close['Close'].pct_change() * 100
-    pivot_y = year_close[['Date','ret']].set_index(year_close['Date'].dt.year)['ret']
-    return pivot_m, pivot_y
+    pivot_year = year_close[['Date','ret']].set_index(year_close['Date'].dt.year)['ret']
+    return pivot_month, pivot_year
 
 # ---------------------------
-# UI & flow
+# UI: Inputs & fetch control
 # ---------------------------
-st.title("ABM + Squeeze Swing Algo — Updated")
-
-# left panel: input
-left, right = st.columns([1,2])
-with left:
-    st.subheader("Data selection")
-    ticker = st.text_input("Ticker (yfinance)", value="^NSEI")
-    use_csv = st.checkbox("Upload CSV instead of yfinance", value=False)
-    uploaded_file = st.file_uploader("Upload OHLCV CSV", type=['csv']) if use_csv else None
-
-    interval = st.selectbox("Interval", options=["1d","60m","15m"], index=0)
-    # advanced: allow start/end or period
-    use_dates = st.checkbox("Use start/end dates (preferred for very long history)", value=False)
+with st.sidebar:
+    st.header("Data & Parameters")
+    source = st.selectbox("Data source", ["yfinance", "CSV upload"])
+    interval = st.selectbox("Interval", ["1d","60m","15m"], index=0)
+    ticker = st.text_input("Ticker (for yfinance)", value="^NSEI")
+    use_dates = st.checkbox("Use Start/End dates (prefer for long history)", value=True)
     if use_dates:
-        start_date = st.date_input("Start date", value=datetime.now().date() - timedelta(days=365*5))
-        end_date = st.date_input("End date", value=datetime.now().date())
-        start = start_date.strftime("%Y-%m-%d")
-        end = (datetime.combine(end_date, datetime.max.time())).strftime("%Y-%m-%d")
-        period = None
+        start = st.date_input("Start date", value=datetime.now().date() - timedelta(days=365*5))
+        end = st.date_input("End date", value=datetime.now().date())
+        start_s = start.strftime("%Y-%m-%d"); end_s = end.strftime("%Y-%m-%d")
     else:
-        period = st.selectbox("Period (yfinance)", options=["6mo","1y","2y","5y","10y","max"], index=1)
-        start = end = None
+        period = st.selectbox("Period (yfinance)", ["1y","2y","5y","10y","max"], index=1)
+        start_s = end_s = None
+    uploaded = st.file_uploader("Upload CSV (Date, Open, High, Low, Close, Volume)", type=['csv']) if source=='CSV upload' else None
 
-    st.markdown("**Strategy params**")
-    atr_p = st.number_input("ATR period", value=14, min_value=1)
-    atr_multiplier = st.number_input("Break ATR multiplier", value=0.8, step=0.1)
-    target_atr = st.number_input("Target (x ATR)", value=2.0, step=0.1)
-    sl_atr = st.number_input("SL (x ATR)", value=1.0, step=0.1)
-    rsi_threshold = st.number_input("RSI threshold (fast)", value=55)
-    max_hold = st.number_input("Max holding bars", value=10, min_value=1)
-    capital = st.number_input("Capital (for % calc)", value=100000)
+    st.markdown("### Strategy base params")
+    bb_n = st.number_input("BB/KC window (n)", value=20, min_value=5)
+    kc_mult = st.number_input("KC ATR multiplier", value=1.5)
+    atr_n = st.number_input("ATR period", value=14, min_value=1)
+    ema_regime = st.number_input("EMA regime length", value=200, min_value=20)
+    # backtest params
+    target_atr_def = st.number_input("Default Target (xATR)", value=2.0, step=0.1)
+    sl_atr_def = st.number_input("Default SL (xATR)", value=1.0, step=0.1)
+    max_hold = st.number_input("Max holding bars", value=12, min_value=1)
+    capital = st.number_input("Capital (for %)", value=100000)
+    # walk-forward params
+    st.markdown("### Walk-forward")
+    wf_splits = st.slider("WF splits (folds)", 3, 8, value=4)
+    run_fetch = st.button("Fetch Data & Run (safe single click)")
 
-    # fetch control (important to avoid rate limits)
-    if 'fetched' not in st.session_state:
-        st.session_state.fetched = False
-    fetch_button = st.button("Fetch Data (safe, single-click)")
+# session state storage for fetched data
+if 'raw_df' not in st.session_state:
+    st.session_state.raw_df = pd.DataFrame()
+    st.session_state.last_fetch_ts = None
 
-    # optional: user wants to force refresh
-    force_refresh = st.checkbox("Force refresh cached data", value=False)
-
-with right:
-    st.subheader("Results")
-    results_area = st.empty()
-
-# Data loading controlled by Fetch button (prevents auto requests)
-data_df = pd.DataFrame()
-if fetch_button:
-    st.session_state.fetched = True
+if run_fetch:
     try:
-        if use_csv and uploaded_file is not None:
-            raw = pd.read_csv(uploaded_file)
-            # attempt to standardize
-            cols_lower = {c.lower(): c for c in raw.columns}
-            # map common names
-            mapping = {}
-            for need in ['date','open','high','low','close','volume']:
-                if need in cols_lower:
-                    mapping[cols_lower[need]] = need.capitalize()
-            raw = raw.rename(columns=mapping)
+        if source == 'yfinance':
+            raw = download_yf(ticker, interval=interval, start=start_s, end=end_s, period=None)
+        else:
+            if uploaded is None:
+                st.error("Please upload CSV")
+                st.stop()
+            raw = pd.read_csv(uploaded)
             if 'Date' not in raw.columns and 'date' in raw.columns:
                 raw.rename(columns={'date':'Date'}, inplace=True)
             raw['Date'] = pd.to_datetime(raw['Date'])
-            # try to ensure column names exist
+            # ensure required columns
             for c in ['Open','High','Low','Close']:
                 if c not in raw.columns:
-                    st.error(f"CSV missing required column: {c}")
+                    st.error(f"CSV missing column: {c}")
                     st.stop()
-            raw = raw[['Date','Open','High','Low','Close'] + ([ 'Volume' ] if 'Volume' in raw.columns else [])]
-            data_df = raw.copy().reset_index(drop=True)
+            if 'Volume' not in raw.columns:
+                raw['Volume'] = 0
+            raw = raw[['Date','Open','High','Low','Close','Volume']].dropna().reset_index(drop=True)
+        if raw.empty:
+            st.error("No data returned. Check ticker/period or CSV format.")
         else:
-            # small sleep to be kind to yfinance & avoid bursts
-            time.sleep(0.5)
-            data_df = download_data_yf_safe(ticker, interval=interval, start=start, end=end, period=period)
-            if data_df.empty:
-                st.error("No data returned from yfinance for this ticker/interval/period. Try a different period or upload CSV.")
-                st.session_state.fetched = False
+            st.session_state.raw_df = raw.copy()
+            st.session_state.last_fetch_ts = datetime.now().isoformat()
     except Exception as e:
-        st.session_state.fetched = False
-        st.error(f"Data download failed: {e}")
+        st.error(f"Data fetch failed: {e}")
 
-# If previously fetched, keep cached version
-if st.session_state.get('fetched', False) and data_df.empty:
-    # try to load from cache function (download_data_yf_safe caches by args) by calling with same args if available
-    try:
-        # attempt silent fetch via cache if possible (won't run network if cached)
-        data_df = download_data_yf_safe(ticker, interval=interval, start=start, end=end, period=period)
-    except:
-        pass
+# If data present in session, use it
+data = st.session_state.raw_df.copy()
+if data.empty:
+    st.info("No data loaded. Click 'Fetch Data & Run' after setting inputs, or upload CSV.")
+    st.stop()
 
-if not data_df.empty:
-    # compute indicators & signals
-    df_ind = compute_indicators(data_df, atr_period=int(atr_p), ema_fast=8, rsi_period=7)
-    df_sig = generate_signals_setup_trigger(df_ind, atr_multiplier=float(atr_multiplier), rsi_threshold=float(rsi_threshold), min_mom=0.0015)
+# ---------------------------
+# Compute indicators & signals
+# ---------------------------
+with st.spinner("Computing indicators and signals..."):
+    df_ind = compute_hpm_indicators(data, bb_n=bb_n, bb_k=2, kc_n=bb_n, kc_mult=kc_mult, ema_regime=ema_regime, atr_n=atr_n)
+    df_sig = generate_hpm_signals(df_ind, atr_mul=0.8, min_mom=0.0015)
 
-    # backtest and live recommendation (simultaneous)
-    trades_df, summary = backtest_last_close(df_sig, target_atr=float(target_atr), sl_atr=float(sl_atr), max_holding_bars=int(max_hold), capital=float(capital))
+# ---------------------------
+# Run backtest on full data with default params
+# ---------------------------
+with st.spinner("Running backtest..."):
+    trades_all, summary_all = backtest_last_close(df_sig, target_atr=target_atr_def, sl_atr=sl_atr_def, max_hold=max_hold, capital=capital)
 
-    # Live rec based on last close (no further button)
-    last = df_sig.iloc[-1]
-    live_reco = None
-    if last['signal'] != 0:
-        side = 'LONG' if last['signal']==1 else 'SHORT'
-        entry = last['Close']
-        atr = last['ATR'] if last['ATR']>0 else 1e-6
-        target = entry + target_atr * atr if side=='LONG' else entry - target_atr * atr
-        sl = entry - sl_atr * atr if side=='LONG' else entry + sl_atr * atr
-        # simple estimator: use historical backtest accuracy
-        prob = summary['accuracy'] if summary['total_trades']>0 else 0.0
-        live_reco = {
-            'entry_date_time': last['Date'],
-            'side': side,
-            'levels': float(entry),
-            'target': float(target),
-            'sl': float(sl),
-            'reason_of_entry': last['reason'],
-            'probability_of_profit': f"{prob*100:.1f}%"
-        }
+# ---------------------------
+# Walk-forward validation
+# ---------------------------
+with st.spinner("Running walk-forward validation (may take a moment)..."):
+    param_grid = {
+        'atr_mul': [0.6, 0.8, 1.0],
+        'target_atr': [1.5, 2.0, 2.5],
+        'sl_atr': [0.8, 1.0, 1.2],
+        'max_hold': [8, 12, 18]
+    }
+    wf_df, wf_agg = walk_forward_validation(df_ind, n_splits=wf_splits, param_grid=param_grid)
 
-    # Produce heatmaps
-    pivot_monthly, pivot_yearly = returns_heatmaps(data_df)
+# ---------------------------
+# Heatmaps
+# ---------------------------
+pivot_month, pivot_year = monthly_yearly_heatmap(data)
 
-    # Display results nicely
-    with results_area.container():
-        st.markdown("### Backtest Summary")
-        st.write(f"- Total trades: **{summary['total_trades']}**")
-        st.write(f"- Positive trades: **{summary['positive_trades']}**, Negative trades: **{summary['negative_trades']}**")
-        st.write(f"- Accuracy: **{summary['accuracy']*100:.2f}%**")
-        st.write(f"- Total PnL (points): **{summary['total_points_strategy']:.2f}**")
-        st.write(f"- Total PnL (% of capital): **{summary['total_pnl_pct']:.4f}%**")
-        st.write(f"- Buy & Hold points (first->last): **{summary['total_points_buy_hold']:.2f}**")
+# ---------------------------
+# UI: display results
+# ---------------------------
+# Top row: summaries + live recommendation
+col1, col2, col3 = st.columns([1.2,1,1])
+with col1:
+    st.subheader("Backtest Summary (full history)")
+    st.metric("Total trades", summary_all['total_trades'])
+    st.metric("Positive trades", summary_all['positive_trades'])
+    st.metric("Negative trades", summary_all['negative_trades'])
+    st.metric("Accuracy", f"{summary_all['accuracy']*100:.2f}%")
+with col2:
+    st.subheader("PnL & Comparison")
+    st.write(f"- Strategy total PnL (points): **{summary_all['strategy_points']:.2f}**")
+    st.write(f"- Strategy PnL (% of capital): **{summary_all['total_pnl_pct']:.4f}%**")
+    st.write(f"- Buy & Hold (first->last points): **{summary_all['bh_points']:.2f}**")
+with col3:
+    st.subheader("Walk-Forward Summary")
+    if wf_df.empty:
+        st.write("Not enough data for WF or no folds produced.")
+    else:
+        st.write(f"- WF folds: {wf_agg.get('folds',0)}")
+        st.write(f"- Avg OOS pnl per fold: {wf_agg.get('avg_test_pnl',0):.2f}")
+        st.write(f"- Avg OOS accuracy: {wf_agg.get('avg_test_accuracy',0)*100 if wf_agg else 0:.2f}%")
 
-        st.markdown("### Trades (each row = last-close entry & exit)")
-        if trades_df.empty:
-            st.info("No trades generated with current parameters.")
-        else:
-            # add fields required by you
-            trades_display = trades_df.copy()
-            trades_display['entry_date_time'] = trades_display['entry_datetime']
-            trades_display['levels'] = trades_display['entry_price']
-            trades_display['total_pnl'] = trades_display['pnl']
-            trades_display['total_pnl_percentage'] = trades_display['pnl_pct']
-            trades_display = trades_display[['entry_date_time','levels','target','sl','total_pnl','total_pnl_percentage','entry_reason','exit_reason','holding_bars','side']]
-            st.data_editor(trades_display, use_container_width=True)
-
-        st.markdown("### Live Recommendation (based on last close)")
-        if live_reco is None:
-            st.info("No signal on last close.")
-        else:
-            st.json(live_reco)
-
-        st.markdown("### Squeeze (Setup) Alerts — earliest warning before trigger")
-        # show last few bars with setup True
-        setups = df_sig.loc[df_sig['setup'] | (df_sig['squeeze_start']) , ['Date','Close','squeeze','squeeze_start','signal','reason']].tail(20)
-        if setups.empty:
-            st.write("No recent setups detected.")
-        else:
-            st.dataframe(setups)
-
-        st.markdown("### Price Chart with EMA_fast & signals")
-        fig, ax = plt.subplots(figsize=(12,5))
-        ax.plot(df_sig['Date'], df_sig['Close'], label='Close')
-        ax.plot(df_sig['Date'], df_sig['EMA_fast'], label='EMA_fast', linewidth=0.9)
-        # plot setup bars
-        ax.scatter(df_sig.loc[df_sig['squeeze_start'],'Date'], df_sig.loc[df_sig['squeeze_start'],'Close'], marker='v', label='Squeeze Start', s=40)
-        # plot signals
-        ax.scatter(df_sig.loc[df_sig['signal']==1,'Date'], df_sig.loc[df_sig['signal']==1,'Close'], marker='^', label='Long Trigger', s=50)
-        ax.scatter(df_sig.loc[df_sig['signal']==-1,'Date'], df_sig.loc[df_sig['signal']==-1,'Close'], marker='v', label='Short Trigger', s=50)
-        ax.set_title(f"{ticker} Price & Signals")
-        ax.legend()
-        st.pyplot(fig)
-
-        st.markdown("### Monthly Returns Heatmap")
-        if not pivot_monthly.empty:
-            fig2, ax2 = plt.subplots(figsize=(10,4))
-            # heatmap via imshow; keep labels
-            im = ax2.imshow(pivot_monthly.fillna(0).values, aspect='auto', cmap='RdYlGn', vmin=-20, vmax=20)
-            ax2.set_yticks(np.arange(pivot_monthly.shape[0])); ax2.set_yticklabels(pivot_monthly.index)
-            ax2.set_xticks(np.arange(12)); ax2.set_xticklabels([1,2,3,4,5,6,7,8,9,10,11,12])
-            ax2.set_title("Monthly returns (%)")
-            plt.colorbar(im, ax=ax2, label='%')
-            st.pyplot(fig2)
-        else:
-            st.write("Not enough data for monthly heatmap.")
-
-        st.markdown("### Yearly Returns")
-        if not pivot_yearly.empty:
-            st.dataframe(pivot_yearly.rename('Yearly % Return').to_frame())
-        else:
-            st.write("Not enough data for yearly returns.")
-
-        st.markdown("---")
-        st.markdown("""
-        **Notes / fixes made**
-        - Fixed the yfinance alignment error by ensuring we work on the same index and computing TR via aligned shifts and per-row max.
-        - Data fetch is only executed when you press **Fetch Data**. This reduces yfinance calls and prevents accidental rate limits.
-        - `st.session_state` preserves fetched data & UI state so results don't vanish after clicks.
-        - Added squeeze (setup) detection so you get advanced warnings before breakouts; an "aggressive trigger" attempts earlier detection (still last-close entry).
-        - Live recommendation is shown immediately after data fetch/backtest (no extra button).
-        - CSV upload fallback for very long history or alternative data sources.
-        - Monthly & yearly heatmaps added.
-        - Long/Short side is shown per trade.
-        """)
-
+# Live recommendation
+st.subheader("Live Recommendation (last close)")
+last = df_sig.iloc[-1]
+if last['signal'] == 0:
+    st.info("No signal on last close.")
 else:
-    st.info("Click **Fetch Data** to download data from yfinance or upload CSV. This prevents repeated automatic calls and reduces the chance of yfinance rate-limits.")
+    side = 'LONG' if last['signal']==1 else 'SHORT'
+    entry = float(last['Close'])
+    atr = last['ATR'] if last['ATR']>0 else 1e-6
+    target = entry + target_atr_def * atr if side=='LONG' else entry - target_atr_def * atr
+    sl = entry - sl_atr_def * atr if side=='LONG' else entry + sl_atr_def * atr
+    # simple probability from historical accuracy
+    prob = summary_all['accuracy'] if summary_all['total_trades']>0 else 0.0
+    st.json({
+        'entry_date_time': str(last['Date']),
+        'side': side,
+        'levels': entry,
+        'target': float(target),
+        'sl': float(sl),
+        'reason_of_entry': last['reason'],
+        'probability_of_profit': f"{prob*100:.1f}%"
+    })
 
-st.sidebar.markdown("## Tips")
+# Chart with entry/exit markers
+st.subheader("Price chart with signals")
+fig, ax = plt.subplots(figsize=(12,5))
+ax.plot(df_sig['Date'], df_sig['Close'], label='Close')
+ax.plot(df_sig['Date'], df_sig['EMA_regime'], label=f'EMA_regime({ema_regime})', linewidth=0.8)
+ax.scatter(df_sig.loc[df_sig['signal']==1,'Date'], df_sig.loc[df_sig['signal']==1,'Close'], marker='^', label='Long Trigger', s=40)
+ax.scatter(df_sig.loc[df_sig['signal']==-1,'Date'], df_sig.loc[df_sig['signal']==-1,'Close'], marker='v', label='Short Trigger', s=40)
+ax.set_title(f"{ticker} — Price & Signals")
+ax.legend()
+st.pyplot(fig)
+
+# Show top 5 / bottom 5 trades
+st.subheader("Top 5 / Bottom 5 trades")
+if trades_all.empty:
+    st.info("No trades generated.")
+else:
+    top5 = trades_all.sort_values(by='pnl', ascending=False).head(5)
+    bot5 = trades_all.sort_values(by='pnl', ascending=True).head(5)
+    c1, c2 = st.columns(2)
+    with c1:
+        st.write("Top 5 profitable trades")
+        st.dataframe(top5, height=220, use_container_width=True)
+    with c2:
+        st.write("Bottom 5 losing trades")
+        st.dataframe(bot5, height=220, use_container_width=True)
+
+# Full trade log (scrollable)
+st.subheader("Full Trade Log (scrollable)")
+if trades_all.empty:
+    st.write("No trades to display.")
+else:
+    st.dataframe(trades_all.reset_index(drop=True), height=300, use_container_width=True)
+
+# Original raw data display (scrollable)
+st.subheader("Original Price Data (scrollable)")
+st.dataframe(data.reset_index(drop=True), height=300, use_container_width=True)
+
+# Heatmaps
+st.subheader("Monthly Returns Heatmap")
+if not pivot_month.empty:
+    fig2, ax2 = plt.subplots(figsize=(10,4))
+    im = ax2.imshow(pivot_month.fillna(0).values, aspect='auto', cmap='RdYlGn', vmin=-30, vmax=30)
+    ax2.set_yticks(np.arange(pivot_month.shape[0])); ax2.set_yticklabels(pivot_month.index)
+    ax2.set_xticks(np.arange(12)); ax2.set_xticklabels([1,2,3,4,5,6,7,8,9,10,11,12])
+    ax2.set_title("Monthly returns (%)")
+    plt.colorbar(im, ax=ax2)
+    st.pyplot(fig2)
+else:
+    st.write("Not enough data for monthly heatmap.")
+
+st.subheader("Yearly Returns")
+if not pivot_year.empty:
+    st.dataframe(pivot_year.rename("Yearly % Return").to_frame(), use_container_width=True)
+else:
+    st.write("Not enough data for yearly returns.")
+
+# Diagnostics / notes
+st.markdown("---")
