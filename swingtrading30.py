@@ -8,15 +8,12 @@ import seaborn as sns
 
 st.set_page_config(layout="wide")
 
-# ----------------------------- #
-# Utility functions
-# ----------------------------- #
+# ---------------- Utility Functions ---------------- #
 def load_data(upload_file):
     df = pd.read_csv(upload_file)
     df['Date'] = pd.to_datetime(df['Date'])
     df = df.sort_values('Date').reset_index(drop=True)
     if 'Volume' not in df.columns or df['Volume'].sum() == 0:
-        # surrogate volume
         df['Volume'] = df['Close'].pct_change().abs()*100000
     return df
 
@@ -35,11 +32,14 @@ def add_features(df, ema_short=10, ema_long=50, atr_period=14, rsi_period=14):
     df.fillna(0, inplace=True)
     return df
 
-def generate_labels(df, horizon=5, up_pct=1.0, down_pct=1.0):
+def generate_labels(df, horizon=5, top_pct=0.1):
     df['Future_Close'] = df['Close'].shift(-horizon)
-    df['Return'] = ((df['Future_Close'] - df['Close']) / df['Close'])*100
-    df['Label'] = np.where(df['Return']>=up_pct,1,
-                           np.where(df['Return']<=-down_pct,-1,0))
+    df['Return'] = (df['Future_Close'] - df['Close']) / df['Close']
+    # Percentile-based labeling
+    up_thresh = df['Return'].quantile(1-top_pct)
+    down_thresh = df['Return'].quantile(top_pct)
+    df['Label'] = np.where(df['Return']>=up_thresh,1,
+                           np.where(df['Return']<=down_thresh,-1,0))
     df.drop(['Future_Close','Return'],axis=1,inplace=True)
     return df
 
@@ -50,31 +50,32 @@ def prepare_features_labels(df):
 
 def walkforward_split(X, y, n_splits=4):
     tscv = TimeSeriesSplit(n_splits=n_splits)
-    splits = list(tscv.split(X))
-    return splits
+    return list(tscv.split(X))
 
-def backtest_model(df, preds, horizon=5, atr_multiplier=1.5):
+def backtest_model(df, preds, probs, horizon=5, atr_multiplier=1.5, min_prob=0.6):
     trades = []
     for i in range(len(df)-horizon):
+        if abs(preds[i])!=1 or probs[i]<min_prob:
+            continue
         row = df.iloc[i]
-        if preds[i]==1:
-            entry = row['Close']
-            sl = entry - atr_multiplier*row['ATR']
-            target = entry + atr_multiplier*row['ATR']
+        side = 'Long' if preds[i]==1 else 'Short'
+        entry = row['Close']
+        atr_val = row['ATR'] * atr_multiplier
+        if side=='Long':
+            sl = entry - atr_val
+            target = entry + atr_val
             exit_price = min(df['Low'].iloc[i:i+horizon].min(), sl)
             exit_price = target if df['High'].iloc[i:i+horizon].max()>=target else exit_price
             pnl = exit_price - entry
-            trades.append({'Date':row['Date'], 'Side':'Long','Entry':entry,'Target':target,
-                           'SL':sl,'Exit':exit_price,'PnL':pnl,'Reason':'Signal'})
-        elif preds[i]==-1:
-            entry = row['Close']
-            sl = entry + atr_multiplier*row['ATR']
-            target = entry - atr_multiplier*row['ATR']
+        else:
+            sl = entry + atr_val
+            target = entry - atr_val
             exit_price = max(df['High'].iloc[i:i+horizon].max(), sl)
             exit_price = target if df['Low'].iloc[i:i+horizon].min()<=target else exit_price
             pnl = entry - exit_price
-            trades.append({'Date':row['Date'], 'Side':'Short','Entry':entry,'Target':target,
-                           'SL':sl,'Exit':exit_price,'PnL':pnl,'Reason':'Signal'})
+        trades.append({'Date':row['Date'], 'Side':side,'Entry':entry,'Target':target,
+                       'SL':sl,'Exit':exit_price,'PnL':pnl,'Reason':'High-Prob Signal',
+                       'Prob':probs[i]})
     trades_df = pd.DataFrame(trades)
     return trades_df
 
@@ -110,63 +111,68 @@ def plot_heatmap(df):
     axes[1].set_yticklabels(yearly.index.astype(str))
     st.pyplot(fig)
 
-# ----------------------------- #
-# Streamlit UI
-# ----------------------------- #
-st.title("Professional Swing Trading Backtest & Live Signals")
+# ---------------- Streamlit UI ---------------- #
+st.title("High-Probability Swing Trading Backtest & Signals")
 
 st.sidebar.header("Input Options")
-upload_file = st.sidebar.file_uploader("Upload CSV file", type=["csv"])
+upload_file = st.sidebar.file_uploader("Upload CSV", type=["csv"])
 horizon = st.sidebar.number_input("Prediction Horizon (bars)", value=5, min_value=1)
-run_btn = st.sidebar.button("Run Backtest + Live Recommendation")
+top_pct = st.sidebar.slider("Top/Bottom Percentile for Labeling", 0.01,0.2,value=0.1)
+run_btn = st.sidebar.button("Run Backtest + Live Signals")
 
 if run_btn and upload_file:
     progress_bar = st.progress(0)
+    
     st.info("Step 1/5: Loading data...")
     df = load_data(upload_file)
     progress_bar.progress(10)
-
+    
     st.info("Step 2/5: Feature engineering...")
     df = add_features(df)
     progress_bar.progress(30)
-
-    st.info("Step 3/5: Label generation...")
-    df = generate_labels(df,horizon=horizon)
+    
+    st.info("Step 3/5: Generating labels...")
+    df = generate_labels(df,horizon=horizon,top_pct=top_pct)
     progress_bar.progress(40)
-
+    
     st.info("Step 4/5: Walkforward training & prediction...")
     X, y = prepare_features_labels(df)
     splits = walkforward_split(X,y)
     preds = np.zeros(len(df))
+    probs = np.zeros(len(df))
     fold_num = 1
     for train_idx, test_idx in splits:
         st.info(f"Training fold {fold_num}/{len(splits)}")
         model = RandomForestClassifier(n_estimators=100,class_weight='balanced',random_state=42)
         model.fit(X[train_idx],y[train_idx])
-        preds[test_idx] = model.predict(X[test_idx])
-        fold_num += 1
+        fold_pred = model.predict(X[test_idx])
+        fold_prob = model.predict_proba(X[test_idx]).max(axis=1)
+        preds[test_idx] = fold_pred
+        probs[test_idx] = fold_prob
+        fold_num +=1
     df['Pred'] = preds
+    df['Prob'] = probs
     progress_bar.progress(70)
-
-    st.info("Step 5/5: Backtesting...")
-    trades_df = backtest_model(df, preds, horizon=horizon)
+    
+    st.info("Step 5/5: Backtesting high-probability signals...")
+    trades_df = backtest_model(df,preds,probs,horizon=horizon,min_prob=0.6)
     summary = summarize_backtest(trades_df, df)
     progress_bar.progress(100)
     st.success("Completed!")
-
+    
     # ---------------- UI Display ---------------- #
     st.subheader("Backtest Summary")
     for k,v in summary.items():
         st.write(f"{k}: {v}")
-
-    st.subheader("Backtest Trades (Top 5 / Bottom 5)")
-    st.dataframe(pd.concat([trades_df.head(), trades_df.tail()]))
-
-    st.subheader("Full Trades Data")
+    
+    st.subheader("Top 5 / Bottom 5 Trades")
+    st.dataframe(pd.concat([trades_df.head(),trades_df.tail()]))
+    
+    st.subheader("Full Trades Table")
     st.dataframe(trades_df)
-
+    
     st.subheader("Original Data")
     st.dataframe(df)
-
+    
     st.subheader("Monthly & Yearly Return Heatmaps")
     plot_heatmap(df)
