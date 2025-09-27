@@ -1,5 +1,3 @@
-# streamlit_swing_trading_app.py
-
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -9,213 +7,185 @@ from sklearn.model_selection import TimeSeriesSplit
 from sklearn.metrics import accuracy_score
 import matplotlib.pyplot as plt
 import seaborn as sns
-from datetime import datetime
+import datetime
 
-st.set_page_config(page_title="Universal Swing Trading App", layout="wide")
+# ------------------ UTILITY FUNCTIONS ------------------
 
-# ---------------------- UTILITY FUNCTIONS ----------------------
+def download_data(ticker, period="5y", interval="1d"):
+    try:
+        df = yf.download(ticker, period=period, interval=interval)
+        df.reset_index(inplace=True)
+        if 'Volume' not in df.columns or df['Volume'].sum() == 0:
+            df['Volume'] = df['Close'].pct_change().abs() * 100000  # surrogate volume
+        return df
+    except Exception as e:
+        st.error(f"Error fetching data: {e}")
+        return pd.DataFrame()
 
-@st.cache_data
-def fetch_data_yf(ticker, period="5y", interval="1d"):
-    df = yf.download(ticker, period=period, interval=interval)
-    df.reset_index(inplace=True)
-    df['Volume'] = df['Volume'].replace(0, np.nan)  # handle zero volumes
-    return df
-
-def calculate_features(df, ema_short=10, ema_long=50, atr_window=14, rsi_window=14):
-    df = df.copy()
-    
-    # EMA
+def generate_features(df, ema_short=10, ema_long=50, atr_period=14, rsi_period=14):
     df['EMA_short'] = df['Close'].ewm(span=ema_short, adjust=False).mean()
     df['EMA_long'] = df['Close'].ewm(span=ema_long, adjust=False).mean()
-    
-    # ATR
-    df['H-L'] = df['High'] - df['Low']
-    df['H-PC'] = abs(df['High'] - df['Close'].shift(1))
-    df['L-PC'] = abs(df['Low'] - df['Close'].shift(1))
-    df['TR'] = df[['H-L','H-PC','L-PC']].max(axis=1)
-    df['ATR'] = df['TR'].rolling(atr_window).mean()
-    
-    # RSI
+    df['ATR'] = df['High'].rolling(atr_period).max() - df['Low'].rolling(atr_period).min()
     delta = df['Close'].diff()
-    gain = delta.where(delta>0,0)
-    loss = -delta.where(delta<0,0)
-    avg_gain = gain.rolling(rsi_window).mean()
-    avg_loss = loss.rolling(rsi_window).mean()
-    rs = avg_gain / avg_loss
-    df['RSI'] = 100 - (100/(1+rs))
-    
-    # Momentum
-    df['Momentum'] = df['Close'].pct_change(periods=1)
-    
-    df.fillna(0,inplace=True)
-    return df
-
-def label_data(df, horizon=5, pct_thr=0.02):
-    df = df.copy()
-    df['future_close'] = df['Close'].shift(-horizon)
-    df['pct_change'] = (df['future_close'] - df['Close']) / df['Close']
-    df['label'] = 0
-    df.loc[df['pct_change'] >= pct_thr, 'label'] = 1
-    df.loc[df['pct_change'] <= -pct_thr, 'label'] = -1
+    gain = delta.clip(lower=0)
+    loss = -1 * delta.clip(upper=0)
+    avg_gain = gain.rolling(rsi_period).mean()
+    avg_loss = loss.rolling(rsi_period).mean()
+    rs = avg_gain / (avg_loss + 1e-9)
+    df['RSI'] = 100 - (100 / (1 + rs))
+    df['Momentum'] = df['Close'].pct_change() * 100
     df.dropna(inplace=True)
     return df
 
-def backtest_model(df, features, n_splits=4, capital=100000):
-    X = df[features].values
-    y = df['label'].values
-    tscv = TimeSeriesSplit(n_splits=n_splits)
-    trades = []
-    oos_pnls = []
-    oos_accs = []
-    fold = 1
-    total_steps = n_splits
-    progress_bar = st.progress(0)
-    for train_index, test_index in tscv.split(X):
-        st.write(f"Walkforward fold {fold}/{total_steps}")
-        X_train, X_test = X[train_index], X[test_index]
-        y_train, y_test = y[train_index], y[test_index]
-        
-        model = RandomForestClassifier(n_estimators=100, random_state=42, class_weight='balanced')
-        model.fit(X_train, y_train)
-        y_pred = model.predict(X_test)
-        
-        accuracy = accuracy_score(y_test, y_pred)
-        oos_accs.append(accuracy)
-        
-        df_test = df.iloc[test_index].copy()
-        df_test['pred'] = y_pred
-        
-        # Simulate trades
-        for idx, row in df_test.iterrows():
-            if row['pred'] == 0: continue
-            entry = row['Close']
-            sl = entry * 0.99 if row['pred']==1 else entry * 1.01
-            target = entry * 1.02 if row['pred']==1 else entry * 0.98
-            exit_price = target if row['pred']==1 else sl
-            pnl = (exit_price - entry) if row['pred']==1 else (entry - exit_price)
-            trades.append({'Date': row['Date'], 'Signal': 'Long' if row['pred']==1 else 'Short',
-                           'Entry': entry, 'Target': target, 'SL': sl, 'PnL': pnl,
-                           'Reason': 'Model prediction', 'Probability': max(model.predict_proba([row[features].values])[0])})
-        
-        oos_pnls.append(sum([t['PnL'] for t in trades]))
-        fold +=1
-        progress_bar.progress(int(fold/total_steps*100))
-    return trades, oos_pnls, oos_accs
+def label_data(df, horizon=3, percentile=20):
+    df['Future_Return'] = df['Close'].shift(-horizon) / df['Close'] - 1
+    up_thr = np.percentile(df['Future_Return'], 100 - percentile)
+    down_thr = np.percentile(df['Future_Return'], percentile)
+    df['Label'] = 0
+    df.loc[df['Future_Return'] >= up_thr, 'Label'] = 1
+    df.loc[df['Future_Return'] <= down_thr, 'Label'] = -1
+    df.dropna(inplace=True)
+    return df
 
-def generate_heatmaps(df):
-    df['YearMonth'] = df['Date'].dt.to_period('M')
-    monthly_returns = df.groupby('YearMonth')['Close'].last().pct_change().fillna(0)
-    df['Year'] = df['Date'].dt.year
-    yearly_returns = df.groupby('Year')['Close'].last().pct_change().fillna(0)
-    return monthly_returns, yearly_returns
+def optimize_params(df):
+    # simple grid search over EMA_short/long
+    best_acc = -1
+    best_params = {'ema_short':10, 'ema_long':50, 'atr_period':14, 'rsi_period':14}
+    for ema_s in [5,10,15]:
+        for ema_l in [30,50,100]:
+            for atr_p in [10,14,20]:
+                for rsi_p in [10,14,20]:
+                    df_feat = generate_features(df.copy(), ema_s, ema_l, atr_p, rsi_p)
+                    df_lab = label_data(df_feat)
+                    if len(df_lab) < 50:
+                        continue
+                    X = df_lab[['EMA_short','EMA_long','ATR','RSI','Momentum']]
+                    y = df_lab['Label']
+                    model = RandomForestClassifier(n_estimators=50)
+                    tscv = TimeSeriesSplit(n_splits=3)
+                    accs = []
+                    for train_idx, test_idx in tscv.split(X):
+                        model.fit(X.iloc[train_idx], y.iloc[train_idx])
+                        pred = model.predict(X.iloc[test_idx])
+                        accs.append(accuracy_score(y.iloc[test_idx], pred))
+                    avg_acc = np.mean(accs)
+                    if avg_acc > best_acc:
+                        best_acc = avg_acc
+                        best_params = {'ema_short':ema_s, 'ema_long':ema_l, 'atr_period':atr_p, 'rsi_period':rsi_p}
+    return best_params
 
-# ---------------------- STREAMLIT UI ----------------------
+def run_backtest(df, params, horizon=3):
+    df_feat = generate_features(df.copy(), **params)
+    df_lab = label_data(df_feat, horizon=horizon)
+    X = df_lab[['EMA_short','EMA_long','ATR','RSI','Momentum']]
+    y = df_lab['Label']
+    model = RandomForestClassifier(n_estimators=100)
+    tscv = TimeSeriesSplit(n_splits=4)
+    all_trades = []
+    fold_count = 1
+    fold_summary = []
 
-st.title("🔥 Universal Swing Trading App")
+    for train_idx, test_idx in tscv.split(X):
+        model.fit(X.iloc[train_idx], y.iloc[train_idx])
+        test_df = df_lab.iloc[test_idx].copy()
+        test_df['Pred'] = model.predict(X.iloc[test_idx])
+        pnl = 0
+        trades = []
+        for idx, row in test_df.iterrows():
+            if row['Pred'] != 0:
+                entry = row['Close']
+                if row['Pred'] == 1:
+                    target = entry * 1.01  # +1% target
+                    sl = entry * 0.995     # -0.5% stop
+                else:
+                    target = entry * 0.99  # -1% target
+                    sl = entry * 1.005     # +0.5% stop
+                exit_price = row['Close'].shift(-horizon)
+                trade_pnl = (exit_price - entry) if row['Pred']==1 else (entry - exit_price)
+                trades.append({
+                    'Date': row['Date'], 'Side': 'Long' if row['Pred']==1 else 'Short',
+                    'Entry': entry, 'Target': target, 'SL': sl,
+                    'Exit': exit_price, 'PnL': trade_pnl
+                })
+                pnl += trade_pnl
+        all_trades.extend(trades)
+        fold_summary.append({'Fold':fold_count, 'PnL':pnl, 'Accuracy':accuracy_score(test_df['Label'], test_df['Pred'])})
+        fold_count += 1
+    trades_df = pd.DataFrame(all_trades)
+    return trades_df, fold_summary
 
-# Data Input
-st.sidebar.header("Data Input")
-data_option = st.sidebar.radio("Select data source:", ["Upload CSV/Excel", "YFinance"])
-if data_option=="Upload CSV/Excel":
-    uploaded_file = st.sidebar.file_uploader("Upload CSV/Excel", type=["csv","xlsx"])
+def plot_heatmap(trades_df, title="Monthly Returns Heatmap"):
+    trades_df['Month'] = pd.to_datetime(trades_df['Date']).dt.to_period('M')
+    monthly = trades_df.groupby('Month')['PnL'].sum().reset_index()
+    heatmap_data = monthly.pivot_table(values='PnL', index=monthly['Month'].dt.year,
+                                       columns=monthly['Month'].dt.month, fill_value=0)
+    plt.figure(figsize=(12,4))
+    sns.heatmap(heatmap_data, annot=True, fmt=".2f", cmap='RdYlGn', cbar_kws={'label':'PnL'})
+    plt.title(title)
+    st.pyplot(plt.gcf())
+
+# ------------------ STREAMLIT UI ------------------
+
+st.set_page_config(page_title="Universal Swing Algo", layout="wide")
+st.title("Universal Swing Trading Algo System")
+
+st.sidebar.header("Data Options")
+data_source = st.sidebar.radio("Data source:", ['Upload CSV/Excel', 'YFinance Ticker'])
+if data_source == 'Upload CSV/Excel':
+    uploaded_file = st.sidebar.file_uploader("Upload file", type=['csv','xlsx'])
     if uploaded_file is not None:
         if uploaded_file.name.endswith('.csv'):
             df = pd.read_csv(uploaded_file)
         else:
             df = pd.read_excel(uploaded_file)
-        df['Date'] = pd.to_datetime(df['Date'])
-else:
-    ticker = st.sidebar.text_input("YFinance Ticker (e.g., ^NSEI)", value="^NSEI")
-    df = fetch_data_yf(ticker)
-    df['Date'] = pd.to_datetime(df['Date'])
+elif data_source == 'YFinance Ticker':
+    ticker = st.sidebar.text_input("Ticker (e.g., ^NSEI)", value="^NSEI")
+    period = st.sidebar.selectbox("Period", ['1y','2y','5y','10y'])
+    interval = st.sidebar.selectbox("Interval", ['1d','1wk','1mo'])
+    df = download_data(ticker, period=period, interval=interval)
 
-st.write("### Original Data (scrollable)")
-st.dataframe(df, use_container_width=True)
+if 'df' in locals() and not df.empty:
+    st.subheader("Original Data")
+    st.dataframe(df.head(5).append(df.tail(5)), height=250)
 
-# Feature Engineering and Labeling
-st.sidebar.header("Model & Feature Options")
-atr_window = st.sidebar.number_input("ATR Window", value=14, min_value=5,max_value=50)
-ema_short = st.sidebar.number_input("EMA Short", value=10)
-ema_long = st.sidebar.number_input("EMA Long", value=50)
-rsi_window = st.sidebar.number_input("RSI Window", value=14)
-horizon = st.sidebar.number_input("Label Horizon (bars)", value=5)
-pct_thr = st.sidebar.number_input("Label % Threshold", value=2.0)/100
+    if st.button("Run Swing Algo"):
+        progress_bar = st.progress(0)
+        stage = st.empty()
 
-df_feat = calculate_features(df, ema_short, ema_long, atr_window, rsi_window)
-df_label = label_data(df_feat, horizon, pct_thr)
+        stage.text("Optimizing Parameters...")
+        best_params = optimize_params(df)
+        progress_bar.progress(25)
 
-# Features for model
-features = ['EMA_short','EMA_long','ATR','RSI','Momentum']
+        stage.text("Running Backtest + Walkforward...")
+        trades_df, fold_summary = run_backtest(df, best_params)
+        progress_bar.progress(75)
 
-if st.button("Run Swing Strategy"):
-    st.info("Running Walkforward Backtest & Live Signals...")
-    trades, oos_pnls, oos_accs = backtest_model(df_label, features)
-    
-    # Backtest Summary
-    total_trades = len(trades)
-    positive_trades = len([t for t in trades if t['PnL']>0])
-    negative_trades = len([t for t in trades if t['PnL']<=0])
-    accuracy = round(positive_trades/total_trades*100,2) if total_trades>0 else 0
-    total_pnl = sum([t['PnL'] for t in trades])
-    total_pnl_pct = round(total_pnl/100000*100,4)
-    buy_hold = df_label['Close'].iloc[-1] - df_label['Close'].iloc[0]
-    
-    st.subheader("Backtest Summary")
-    st.write(f"Total trades: {total_trades}")
-    st.write(f"Positive trades: {positive_trades}")
-    st.write(f"Negative trades: {negative_trades}")
-    st.write(f"Accuracy: {accuracy}%")
-    st.write(f"Strategy total PnL (points): {round(total_pnl,2)}")
-    st.write(f"Strategy PnL (% of capital): {total_pnl_pct}%")
-    st.write(f"Buy & Hold (first->last points): {round(buy_hold,2)}")
-    
-    # Walkforward Summary
-    st.subheader("Walkforward Summary")
-    st.write(f"WF folds: {len(oos_pnls)}")
-    st.write(f"Avg OOS pnl per fold: {round(np.mean(oos_pnls),2)}")
-    st.write(f"Avg OOS accuracy: {round(np.mean(oos_accs)*100,2)}%")
-    
-    # Trades Table
-    st.subheader("Trade Details")
-    trades_df = pd.DataFrame(trades)
-    st.write("Top 5 trades")
-    st.dataframe(trades_df.head())
-    st.write("Bottom 5 trades")
-    st.dataframe(trades_df.tail())
-    st.write("Full trades (scrollable)")
-    st.dataframe(trades_df, use_container_width=True)
-    
-    # Heatmaps
-    monthly_returns, yearly_returns = generate_heatmaps(df_label)
-    st.subheader("Monthly Returns Heatmap")
-    fig, ax = plt.subplots(figsize=(10,4))
-    sns.heatmap(monthly_returns.values.reshape(-1,1), annot=True, fmt=".2%", cmap="RdYlGn", ax=ax)
-    st.pyplot(fig)
-    
-    st.subheader("Yearly Returns Heatmap")
-    fig2, ax2 = plt.subplots(figsize=(10,4))
-    sns.heatmap(yearly_returns.values.reshape(-1,1), annot=True, fmt=".2%", cmap="RdYlGn", ax=ax2)
-    st.pyplot(fig2)
-    
-    # Live Recommendation
-    st.subheader("Live Recommendation (Last Candle)")
-    last_row = df_label.iloc[-1]
-    X_live = last_row[features].values.reshape(1,-1)
-    model = RandomForestClassifier(n_estimators=100, random_state=42, class_weight='balanced')
-    model.fit(df_label[features], df_label['label'])
-    pred = model.predict(X_live)[0]
-    prob = max(model.predict_proba(X_live)[0])
-    entry = last_row['Close']
-    target = entry*1.02 if pred==1 else entry*0.98
-    sl = entry*0.99 if pred==1 else entry*1.01
-    signal = "Long" if pred==1 else "Short" if pred==-1 else "No Signal"
-    st.write({
-        "Date": last_row['Date'],
-        "Signal": signal,
-        "Entry": round(entry,2),
-        "Target": round(target,2),
-        "SL": round(sl,2),
-        "Reason": "Model prediction",
-        "Probability": round(prob*100,2)
-    })
+        stage.text("Generating Results & Heatmap...")
+        st.subheader("Trade Results")
+        st.dataframe(trades_df, height=400)
+
+        st.subheader("Walkforward Summary")
+        st.table(fold_summary)
+
+        st.subheader("Monthly PnL Heatmap")
+        plot_heatmap(trades_df)
+
+        # Backtest summary
+        total_trades = len(trades_df)
+        positive_trades = len(trades_df[trades_df['PnL']>0])
+        negative_trades = len(trades_df[trades_df['PnL']<=0])
+        accuracy = positive_trades/total_trades*100 if total_trades>0 else 0
+        total_pnl = trades_df['PnL'].sum()
+        total_pnl_pct = total_pnl/df['Close'].iloc[0]*100
+
+        st.subheader("Backtest Summary")
+        st.write(f"Total trades: {total_trades}")
+        st.write(f"Positive trades: {positive_trades}")
+        st.write(f"Negative trades: {negative_trades}")
+        st.write(f"Accuracy: {accuracy:.2f}%")
+        st.write(f"Strategy total PnL (points): {total_pnl:.2f}")
+        st.write(f"Strategy PnL (% of capital): {total_pnl_pct:.4f}%")
+        st.write(f"Buy & Hold (first->last points): {df['Close'].iloc[-1]-df['Close'].iloc[0]:.2f}")
+
+        progress_bar.progress(100)
+        stage.text("Completed ✅")
