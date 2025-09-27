@@ -65,6 +65,7 @@ y = df['Label']
 # Walkforward Prediction
 # ----------------------------- #
 splits = TimeSeriesSplit(n_splits=4)
+total_folds = len(splits)
 df['Pred'] = 0
 df['Prob'] = 0.0
 fold_num = 1
