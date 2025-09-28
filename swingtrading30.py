@@ -1,178 +1,303 @@
+"""
+Streamlit app: Psychological Momentum Swing Strategy
+- Fetch data via yfinance or upload CSV
+- Compute PsychMomentum + Liquidity Sweep signals
+- Backtest (entry at signal-bar close) and show trade-by-trade results
+- Live recommendation uses last-candle close
+
+How to run:
+1. pip install streamlit yfinance pandas numpy matplotlib
+2. streamlit run psych_swing_streamlit.py
+
+Notes:
+- No TA-lib dependency (pure pandas/numpy)
+- Strategy is illustrative; backtesting on your data is strongly recommended.
+"""
+
 import streamlit as st
 import pandas as pd
 import numpy as np
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.model_selection import TimeSeriesSplit
+import yfinance as yf
 import matplotlib.pyplot as plt
-import seaborn as sns
+from datetime import datetime, timedelta
 
-st.set_page_config(layout="wide")
+st.set_page_config(page_title="Psych Swing Strategy", layout="wide")
 
-# ---------------- Utility Functions ---------------- #
-def load_data(upload_file):
-    df = pd.read_csv(upload_file)
-    df['Date'] = pd.to_datetime(df['Date'])
-    df = df.sort_values('Date').reset_index(drop=True)
-    if 'Volume' not in df.columns or df['Volume'].sum() == 0:
-        df['Volume'] = df['Close'].pct_change().abs()*100000
+# ---------- Utilities ----------
+@st.cache_data
+def fetch_data_yf(ticker, period="2y", interval="1d"):
+    t = yf.Ticker(ticker)
+    df = t.history(period=period, interval=interval, auto_adjust=False)
+    if df.empty:
+        raise ValueError("No data fetched for %s" % ticker)
+    df = df.rename_axis('datetime').reset_index()
+    df['datetime'] = pd.to_datetime(df['datetime'])
+    df.columns = [c.capitalize() for c in df.columns]
     return df
 
-def add_features(df, ema_short=10, ema_long=50, atr_period=14, rsi_period=14):
-    df['EMA_short'] = df['Close'].ewm(span=ema_short, adjust=False).mean()
-    df['EMA_long'] = df['Close'].ewm(span=ema_long, adjust=False).mean()
-    df['TR'] = df['High'] - df['Low']
-    df['ATR'] = df['TR'].rolling(atr_period).mean()
-    delta = df['Close'].diff()
-    gain = np.where(delta>0, delta, 0)
-    loss = np.where(delta<0, -delta, 0)
-    avg_gain = pd.Series(gain).rolling(rsi_period).mean()
-    avg_loss = pd.Series(loss).rolling(rsi_period).mean()
-    rs = avg_gain / avg_loss
-    df['RSI'] = 100 - (100 / (1 + rs))
-    df.fillna(0, inplace=True)
+
+def compute_indicators(df, params):
+    df = df.copy()
+    # Rolling return
+    n = params['momentum_lookback']
+    df['rtn'] = df['Close'] / df['Close'].shift(n) - 1
+    # ATR simple
+    high_low = df['High'] - df['Low']
+    high_close = np.abs(df['High'] - df['Close'].shift(1))
+    low_close = np.abs(df['Low'] - df['Close'].shift(1))
+    tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+    df['atr'] = tr.rolling(params['atr_lookback']).mean().fillna(method='bfill')
+    # Volume zscore
+    df['vol_z'] = (df['Volume'] - df['Volume'].rolling(params['vol_lookback']).mean()) / (df['Volume'].rolling(params['vol_lookback']).std()+1e-9)
+    # Candle strength
+    df['candle_strength'] = (df['Close'] - df['Open']) / (df['High'] - df['Low'] + 1e-9)
+    # Psych Score: weighted
+    df['pscore_raw'] = (df['rtn'].fillna(0) / (df['rtn'].rolling(params['momentum_lookback']).std()+1e-9)) * params['w_rtn'] \
+                       + df['vol_z'].fillna(0) * params['w_vol'] \
+                       + df['candle_strength'].fillna(0) * params['w_candle']
+    # Normalize score
+    df['pscore'] = (df['pscore_raw'] - df['pscore_raw'].rolling(params['pscore_norm']).mean()) / (df['pscore_raw'].rolling(params['pscore_norm']).std()+1e-9)
+
+    # Liquidity sweep detection: last candle extended lower than recent lows but closed back up (long sweep)
+    lookback = params['sweep_lookback']
+    df['sweep_long'] = False
+    df['sweep_short'] = False
+    for i in range(lookback, len(df)):
+        window = df.loc[i-lookback:i-1]
+        prev_low = window['Low'].min()
+        prev_high = window['High'].max()
+        cur = df.loc[i]
+        prev = df.loc[i-1]
+        # Long sweep: previous candle pierced below prev_low but closed near/above prev range
+        if prev['Low'] < prev_low and prev['Close'] > prev['Open'] and prev['Close'] > (window['Close'].mean()):
+            df.at[i, 'sweep_long'] = True
+        # Short sweep: previous candle pierced above prev_high but closed near/below prev range
+        if prev['High'] > prev_high and prev['Close'] < prev['Open'] and prev['Close'] < (window['Close'].mean()):
+            df.at[i, 'sweep_short'] = True
+
     return df
 
-def generate_labels(df, horizon=5, top_pct=0.1):
-    df['Future_Close'] = df['Close'].shift(-horizon)
-    df['Return'] = (df['Future_Close'] - df['Close']) / df['Close']
-    # Percentile-based labeling
-    up_thresh = df['Return'].quantile(1-top_pct)
-    down_thresh = df['Return'].quantile(top_pct)
-    df['Label'] = np.where(df['Return']>=up_thresh,1,
-                           np.where(df['Return']<=down_thresh,-1,0))
-    df.drop(['Future_Close','Return'],axis=1,inplace=True)
-    return df
 
-def prepare_features_labels(df):
-    X = df[['Close','Open','High','Low','Volume','EMA_short','EMA_long','ATR','RSI']].values
-    y = df['Label'].values
-    return X, y
-
-def walkforward_split(X, y, n_splits=4):
-    tscv = TimeSeriesSplit(n_splits=n_splits)
-    return list(tscv.split(X))
-
-def backtest_model(df, preds, probs, horizon=5, atr_multiplier=1.5, min_prob=0.6):
+def backtest(df, params, capital=10000, risk_per_trade=0.01, verbose=False):
+    df = df.copy().reset_index(drop=True)
     trades = []
-    for i in range(len(df)-horizon):
-        if abs(preds[i])!=1 or probs[i]<min_prob:
-            continue
-        row = df.iloc[i]
-        side = 'Long' if preds[i]==1 else 'Short'
-        entry = row['Close']
-        atr_val = row['ATR'] * atr_multiplier
-        if side=='Long':
-            sl = entry - atr_val
-            target = entry + atr_val
-            exit_price = min(df['Low'].iloc[i:i+horizon].min(), sl)
-            exit_price = target if df['High'].iloc[i:i+horizon].max()>=target else exit_price
-            pnl = exit_price - entry
-        else:
-            sl = entry + atr_val
-            target = entry - atr_val
-            exit_price = max(df['High'].iloc[i:i+horizon].max(), sl)
-            exit_price = target if df['Low'].iloc[i:i+horizon].min()<=target else exit_price
-            pnl = entry - exit_price
-        trades.append({'Date':row['Date'], 'Side':side,'Entry':entry,'Target':target,
-                       'SL':sl,'Exit':exit_price,'PnL':pnl,'Reason':'High-Prob Signal',
-                       'Prob':probs[i]})
+    eq = capital
+    peak = capital
+    equity_curve = []
+
+    for i in range(params['start_index'], len(df)-1):
+        row = df.loc[i]
+        # Long signal
+        if row['pscore'] > params['pscore_entry'] and (row['sweep_long'] or row['Close'] > df['Close'].rolling(params['consolidation']).max().iloc[i-1]):
+            entry_price = row['Close']
+            sl = min(df['Low'].rolling(params['stop_lookback']).min().iloc[i-1], entry_price - params['min_stop_buffer'] * row['atr'])
+            # Ensure SL < entry
+            sl = min(sl, entry_price - 0.001)
+            risk_per_share = entry_price - sl
+            if risk_per_share <= 0:
+                continue
+            risk_amount = eq * risk_per_trade
+            qty = max(1, int(risk_amount / (risk_per_share)))
+            target = entry_price + params['reward_ratio'] * risk_per_share
+            # Simulate forward
+            hit = None
+            exit_price = None
+            exit_idx = None
+            for j in range(i+1, min(len(df), i+params['max_holding'])):
+                low = df.loc[j, 'Low']
+                high = df.loc[j, 'High']
+                if low <= sl:
+                    hit = 'SL'
+                    exit_price = sl
+                    exit_idx = j
+                    break
+                if high >= target:
+                    hit = 'TP'
+                    exit_price = target
+                    exit_idx = j
+                    break
+            if hit is None:
+                # Exit on close of last allowed holding
+                exit_idx = min(len(df)-1, i+params['max_holding'])
+                exit_price = df.loc[exit_idx, 'Close']
+                hit = 'TimeExit'
+            pnl = (exit_price - entry_price) * qty
+            eq += pnl
+            peak = max(peak, eq)
+            dd = (peak - eq) / peak
+            trades.append({
+                'entry_idx': i,
+                'entry_dt': row['datetime'],
+                'entry_price': entry_price,
+                'target': target,
+                'stop': sl,
+                'exit_idx': exit_idx,
+                'exit_dt': df.loc[exit_idx, 'datetime'],
+                'exit_price': exit_price,
+                'pnl': pnl,
+                'trade_type': 'LONG',
+                'reason_entry': 'PsychMomentum+Sweep/Breakout',
+                'reason_exit': hit,
+                'pscore': row['pscore']
+            })
+        # Short signal (mirror)
+        if row['pscore'] < -params['pscore_entry'] and (row['sweep_short'] or row['Close'] < df['Close'].rolling(params['consolidation']).min().iloc[i-1]):
+            entry_price = row['Close']
+            sl = max(df['High'].rolling(params['stop_lookback']).max().iloc[i-1], entry_price + params['min_stop_buffer'] * row['atr'])
+            sl = max(sl, entry_price + 0.001)
+            risk_per_share = sl - entry_price
+            if risk_per_share <= 0:
+                continue
+            risk_amount = eq * risk_per_trade
+            qty = max(1, int(risk_amount / (risk_per_share)))
+            target = entry_price - params['reward_ratio'] * risk_per_share
+            hit = None
+            exit_price = None
+            exit_idx = None
+            for j in range(i+1, min(len(df), i+params['max_holding'])):
+                low = df.loc[j, 'Low']
+                high = df.loc[j, 'High']
+                if high >= sl:
+                    hit = 'SL'
+                    exit_price = sl
+                    exit_idx = j
+                    break
+                if low <= target:
+                    hit = 'TP'
+                    exit_price = target
+                    exit_idx = j
+                    break
+            if hit is None:
+                exit_idx = min(len(df)-1, i+params['max_holding'])
+                exit_price = df.loc[exit_idx, 'Close']
+                hit = 'TimeExit'
+            pnl = (entry_price - exit_price) * qty
+            eq += pnl
+            peak = max(peak, eq)
+            dd = (peak - eq) / peak
+            trades.append({
+                'entry_idx': i,
+                'entry_dt': row['datetime'],
+                'entry_price': entry_price,
+                'target': target,
+                'stop': sl,
+                'exit_idx': exit_idx,
+                'exit_dt': df.loc[exit_idx, 'datetime'],
+                'exit_price': exit_price,
+                'pnl': pnl,
+                'trade_type': 'SHORT',
+                'reason_entry': 'PsychMomentum+Sweep/Breakout',
+                'reason_exit': hit,
+                'pscore': row['pscore']
+            })
+        equity_curve.append(eq)
+
     trades_df = pd.DataFrame(trades)
-    return trades_df
+    if trades_df.empty:
+        return trades_df, pd.Series(equity_curve)
+    # Compute statistics
+    trades_df['win'] = trades_df['pnl'] > 0
+    total = len(trades_df)
+    wins = trades_df['win'].sum()
+    winrate = wins / total
+    gross_profit = trades_df[trades_df['pnl']>0]['pnl'].sum()
+    gross_loss = trades_df[trades_df['pnl']<=0]['pnl'].sum()
+    avg_win = trades_df[trades_df['pnl']>0]['pnl'].mean() if wins>0 else 0
+    avg_loss = trades_df[trades_df['pnl']<=0]['pnl'].mean() if (total-wins)>0 else 0
 
-def summarize_backtest(trades_df, df):
-    total_trades = len(trades_df)
-    pos_trades = len(trades_df[trades_df['PnL']>0])
-    neg_trades = total_trades - pos_trades
-    acc = (pos_trades/total_trades*100) if total_trades>0 else 0
-    total_pnl = trades_df['PnL'].sum()
-    buy_hold = df['Close'].iloc[-1] - df['Close'].iloc[0]
-    summary = {'Total trades': total_trades,
-               'Positive trades': pos_trades,
-               'Negative trades': neg_trades,
-               'Accuracy': acc,
-               'Strategy total PnL (points)': total_pnl,
-               'Strategy PnL (% capital)': total_pnl/1000,
-               'Buy & Hold points': buy_hold}
-    return summary
+    stats = {
+        'total_trades': total,
+        'wins': int(wins),
+        'winrate': winrate,
+        'gross_profit': gross_profit,
+        'gross_loss': gross_loss,
+        'avg_win': avg_win,
+        'avg_loss': avg_loss,
+        'final_equity': eq
+    }
+    return trades_df, pd.Series(equity_curve), stats
 
-def plot_heatmap(df):
-    df['Month'] = df['Date'].dt.to_period('M')
-    df['Year'] = df['Date'].dt.to_period('Y')
-    monthly = df.groupby('Month')['Close'].last().pct_change().fillna(0)*100
-    yearly = df.groupby('Year')['Close'].last().pct_change().fillna(0)*100
-    fig, axes = plt.subplots(1,2,figsize=(14,4))
-    sns.heatmap(monthly.values.reshape(-1,1), annot=True, fmt=".2f", cmap='RdYlGn', ax=axes[0])
-    axes[0].set_title('Monthly Returns (%)')
-    axes[0].set_yticks(range(len(monthly)))
-    axes[0].set_yticklabels(monthly.index.astype(str))
-    sns.heatmap(yearly.values.reshape(-1,1), annot=True, fmt=".2f", cmap='RdYlGn', ax=axes[1])
-    axes[1].set_title('Yearly Returns (%)')
-    axes[1].set_yticks(range(len(yearly)))
-    axes[1].set_yticklabels(yearly.index.astype(str))
-    st.pyplot(fig)
+# ---------- Default params ----------
+DEFAULT_PARAMS = {
+    'momentum_lookback': 3,
+    'atr_lookback': 14,
+    'vol_lookback': 20,
+    'pscore_norm': 50,
+    'w_rtn': 1.0,
+    'w_vol': 0.6,
+    'w_candle': 0.6,
+    'sweep_lookback': 10,
+    'pscore_entry': 1.2,
+    'consolidation': 20,
+    'stop_lookback': 5,
+    'min_stop_buffer': 0.5,
+    'reward_ratio': 2.5,
+    'max_holding': 20,
+    'start_index': 60
+}
 
-# ---------------- Streamlit UI ---------------- #
-st.title("High-Probability Swing Trading Backtest & Signals")
+# ---------- UI ----------
+st.title("PsychSwing — Psychology-based Swing Strategy")
+st.markdown("""
+This strategy detects **psychological momentum** + **liquidity sweeps (stop-hunts)** and enters at the close of the signal candle.
+It is designed as a framework — tweak parameters on your market/instrument.
+""")
 
-st.sidebar.header("Input Options")
-upload_file = st.sidebar.file_uploader("Upload CSV", type=["csv"])
-horizon = st.sidebar.number_input("Prediction Horizon (bars)", value=5, min_value=1)
-top_pct = st.sidebar.slider("Top/Bottom Percentile for Labeling", 0.01,0.2,value=0.1)
-run_btn = st.sidebar.button("Run Backtest + Live Signals")
+with st.sidebar:
+    st.header("Data & Params")
+    ticker = st.text_input("Ticker (yfinance)", value="SPY")
+    period = st.selectbox("Period (yfinance)", options=["6mo","1y","2y","5y","10y"], index=2)
+    interval = st.selectbox("Interval", options=["1d","1wk","1mo"], index=0)
+    # strategy params
+    p = DEFAULT_PARAMS.copy()
+    p['pscore_entry'] = st.slider("Psych score threshold", 0.5, 3.0, float(p['pscore_entry']), step=0.1)
+    p['reward_ratio'] = st.slider("Reward ratio (Target/Risk)", 1.0, 5.0, float(p['reward_ratio']), step=0.1)
+    p['risk_per_trade'] = st.slider("Risk per trade (fraction of capital)", 0.005, 0.05, 0.01, step=0.005)
+    capital = st.number_input("Starting capital", value=10000)
+    run_btn = st.button("Fetch & Run Backtest")
 
-if run_btn and upload_file:
-    progress_bar = st.progress(0)
-    
-    st.info("Step 1/5: Loading data...")
-    df = load_data(upload_file)
-    progress_bar.progress(10)
-    
-    st.info("Step 2/5: Feature engineering...")
-    df = add_features(df)
-    progress_bar.progress(30)
-    
-    st.info("Step 3/5: Generating labels...")
-    df = generate_labels(df,horizon=horizon,top_pct=top_pct)
-    progress_bar.progress(40)
-    
-    st.info("Step 4/5: Walkforward training & prediction...")
-    X, y = prepare_features_labels(df)
-    splits = walkforward_split(X,y)
-    preds = np.zeros(len(df))
-    probs = np.zeros(len(df))
-    fold_num = 1
-    for train_idx, test_idx in splits:
-        st.info(f"Training fold {fold_num}/{len(splits)}")
-        model = RandomForestClassifier(n_estimators=100,class_weight='balanced',random_state=42)
-        model.fit(X[train_idx],y[train_idx])
-        fold_pred = model.predict(X[test_idx])
-        fold_prob = model.predict_proba(X[test_idx]).max(axis=1)
-        preds[test_idx] = fold_pred
-        probs[test_idx] = fold_prob
-        fold_num +=1
-    df['Pred'] = preds
-    df['Prob'] = probs
-    progress_bar.progress(70)
-    
-    st.info("Step 5/5: Backtesting high-probability signals...")
-    trades_df = backtest_model(df,preds,probs,horizon=horizon,min_prob=0.6)
-    summary = summarize_backtest(trades_df, df)
-    progress_bar.progress(100)
-    st.success("Completed!")
-    
-    # ---------------- UI Display ---------------- #
-    st.subheader("Backtest Summary")
-    for k,v in summary.items():
-        st.write(f"{k}: {v}")
-    
-    st.subheader("Top 5 / Bottom 5 Trades")
-    st.dataframe(pd.concat([trades_df.head(),trades_df.tail()]))
-    
-    st.subheader("Full Trades Table")
-    st.dataframe(trades_df)
-    
-    st.subheader("Original Data")
-    st.dataframe(df)
-    
-    st.subheader("Monthly & Yearly Return Heatmaps")
-    plot_heatmap(df)
+if run_btn:
+    try:
+        df = fetch_data_yf(ticker, period=period, interval=interval)
+        st.write(f"Fetched {len(df)} rows for {ticker}")
+        df = compute_indicators(df, p)
+        trades_df, eq_series, stats = backtest(df, p, capital=capital, risk_per_trade=p['risk_per_trade'])
+        if trades_df.empty:
+            st.warning("No trades found with current parameters — try lowering threshold or changing instrument/timeframe.")
+        else:
+            st.subheader("Backtest Summary")
+            st.write(stats)
+            st.subheader("Trade Log")
+            st.dataframe(trades_df[['entry_dt','entry_price','target','stop','exit_dt','exit_price','pnl','trade_type','reason_entry','reason_exit']])
+
+            # Equity curve
+            fig, ax = plt.subplots()
+            ax.plot(eq_series)
+            ax.set_title('Equity Curve')
+            ax.set_ylabel('Equity')
+            st.pyplot(fig)
+
+            # Live signal (last candle close)
+            last_row = df.iloc[-1]
+            st.subheader("Live Recommendation (last candle close)")
+            if last_row['pscore'] > p['pscore_entry']:
+                entry = last_row['Close']
+                sl = min(df['Low'].rolling(p['stop_lookback']).min().iloc[-2], entry - p['min_stop_buffer'] * last_row['atr'])
+                target = entry + p['reward_ratio'] * (entry-sl)
+                reason = 'PsychMomentum+' + ('Sweep' if last_row['sweep_long'] else 'Breakout')
+                st.success(f"LONG: Entry@{entry:.2f} Target@{target:.2f} SL@{sl:.2f} — Reason: {reason}")
+            elif last_row['pscore'] < -p['pscore_entry']:
+                entry = last_row['Close']
+                sl = max(df['High'].rolling(p['stop_lookback']).max().iloc[-2], entry + p['min_stop_buffer'] * last_row['atr'])
+                target = entry - p['reward_ratio'] * (sl-entry)
+                reason = 'PsychMomentum+' + ('Sweep' if last_row['sweep_short'] else 'Breakout')
+                st.error(f"SHORT: Entry@{entry:.2f} Target@{target:.2f} SL@{sl:.2f} — Reason: {reason}")
+            else:
+                st.info("No strong signal on last candle.")
+
+            st.markdown("### How to use this app\n- Tweak thresholds to fit your instrument/timeframe.\n- Backtest on large out-of-sample periods before trading live.\n- This is a framework — no guarantees. Always use proper risk management.")
+
+    except Exception as e:
+        st.error(str(e))
+
+st.markdown("---\n**References & notes:** This app pulls data via yfinance (open-source helper) and uses price+volume+psychology-based rules such as liquidity sweeps/stop-hunts to detect possible big moves. Test thoroughly before trading live.")
