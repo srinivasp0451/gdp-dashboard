@@ -744,6 +744,7 @@ def main():
         return
     
     df = st.session_state.df
+    st.dataframe(df)
     
     # Initialize strategy
     strategy = TradingStrategy(
