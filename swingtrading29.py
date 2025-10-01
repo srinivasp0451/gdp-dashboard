@@ -659,7 +659,7 @@ def main():
         period = st.sidebar.selectbox("Period:", 
                                      ['1d','5d',"1mo", "3mo", "6mo", "1y", "2y", "5y",'10y','15y','20y','30y'], index=2)
         interval = st.sidebar.selectbox("Interval:", 
-                                       ["1m", "5m", '10m',"15m", "30m", "1h",'4h', "1d",'1wk'], index=5)
+                                       ["1m", "5m", '10m',"15m", "30m", "1h",'4h', "1d",'1wk'], index=3)
     
     # Strategy parameters
     st.sidebar.subheader("⚙️ Parameters")
