@@ -179,13 +179,38 @@ class AITradingAgent:
         if df.empty:
             raise ValueError(f"No data found for {symbol}")
         
+        # Standardize column names
         df.columns = [col.lower() for col in df.columns]
         
+        # Handle volume
         if 'volume' not in df.columns or df['volume'].sum() == 0:
             df['volume'] = 0
         
+        # Reset index to get date as column
         df = df.reset_index()
+        
+        # Standardize column names again after reset
         df.columns = [col.lower() for col in df.columns]
+        
+        # Ensure we have a date column
+        if 'date' not in df.columns and 'datetime' not in df.columns:
+            # Find the datetime column (usually first column after reset_index)
+            for col in df.columns:
+                if pd.api.types.is_datetime64_any_dtype(df[col]):
+                    df.rename(columns={col: 'date'}, inplace=True)
+                    break
+        
+        # If still no date column, use index
+        if 'date' not in df.columns and 'datetime' not in df.columns:
+            df['date'] = df.index
+        
+        # Standardize to 'date' column name
+        if 'datetime' in df.columns and 'date' not in df.columns:
+            df.rename(columns={'datetime': 'date'}, inplace=True)
+        
+        # Ensure date is datetime type
+        if 'date' in df.columns:
+            df['date'] = pd.to_datetime(df['date'])
         
         return df
     
@@ -227,7 +252,7 @@ class AITradingAgent:
         df['volume_sma'] = self.ta.sma(volume, 20)
         df['volume_ratio'] = volume / (df['volume_sma'] + 1e-10)
         
-        return df.replace([np.inf, -np.inf], np.nan).fillna(method='ffill').fillna(method='bfill')
+        return df.replace([np.inf, -np.inf], np.nan).ffill().bfill()
     
     def create_ml_features(self, df: pd.DataFrame) -> pd.DataFrame:
         """Create ML features"""
@@ -253,7 +278,7 @@ class AITradingAgent:
         features['stoch_k'] = df['stoch_k']
         features['volume_ratio'] = df['volume_ratio']
         
-        return features.replace([np.inf, -np.inf], np.nan).fillna(method='ffill').fillna(0)
+        return features.replace([np.inf, -np.inf], np.nan).ffill().fillna(0)
     
     def train_ml_model(self, df: pd.DataFrame, lookforward: int = 5):
         """Train ML model"""
@@ -334,7 +359,17 @@ class AITradingAgent:
         
         latest = df.iloc[-1]
         current_price = latest['close']
-        current_date = latest['date'] if 'date' in latest else datetime.now()
+        
+        # Get current date safely
+        try:
+            if 'date' in latest.index:
+                current_date = pd.to_datetime(latest['date'])
+            elif 'datetime' in latest.index:
+                current_date = pd.to_datetime(latest['datetime'])
+            else:
+                current_date = datetime.now()
+        except:
+            current_date = datetime.now()
         
         reasons = []
         bull_score = 0
@@ -470,6 +505,43 @@ class AITradingAgent:
         if self.positions:
             for sym in list(self.positions.keys()):
                 last_price = test_data.iloc[-1]['close']
+                
+                # Safe date extraction
+                try:
+                    if 'date' in test_data.columns:
+                        last_date = pd.to_datetime(test_data.iloc[-1]['date'])
+                    elif 'datetime' in test_data.columns:
+                        last_date = pd.to_datetime(test_data.iloc[-1]['datetime'])
+                    else:
+                        last_date = datetime.now()
+                except:
+                    last_date = datetime.now()
+                
+                close_signal = TradeSignal(
+                    symbol=sym, action='SELL', signal_strength=1.0,
+                    confidence=1.0, entry_price=last_price,
+                    stop_loss=0, take_profit=0, position_size=0,
+                    timestamp=datetime.now(), strategy_type='SWING',
+                    reasons=["End of backtest"], entry_date=last_date
+                )
+                self.close_position(close_signal, sym, detailed_trades)
+        
+        return detailed_trades.iloc[train_size:].copy()
+        detailed_trades = []
+        
+        for i in range(50, len(test_data)):
+            window_df = test_data.iloc[max(0, i-200):i+1].copy()
+            signal = self.generate_live_signal(window_df, symbol)
+            
+            if signal.action == 'BUY':
+                self.execute_trade(signal, detailed_trades)
+            elif signal.action == 'SELL' and symbol in self.positions:
+                self.close_position(signal, symbol, detailed_trades)
+        
+        # Close remaining positions
+        if self.positions:
+            for sym in list(self.positions.keys()):
+                last_price = test_data.iloc[-1]['close']
                 last_date = test_data.iloc[-1]['date'] if 'date' in test_data.iloc[-1] else datetime.now()
                 close_signal = TradeSignal(
                     symbol=sym, action='SELL', signal_strength=1.0,
@@ -506,9 +578,20 @@ class AITradingAgent:
             pnl_points = signal.entry_price - position['entry_price']
             pnl_percent = (pnl_points / position['entry_price']) * 100
             
+            # Safe date handling
+            try:
+                entry_date = pd.to_datetime(position['entry_date'])
+            except:
+                entry_date = position['entry_date']
+            
+            try:
+                exit_date = pd.to_datetime(signal.entry_date)
+            except:
+                exit_date = signal.entry_date
+            
             detailed_trades.append({
-                'Entry Date': position['entry_date'],
-                'Exit Date': signal.entry_date,
+                'Entry Date': entry_date,
+                'Exit Date': exit_date,
                 'Symbol': symbol,
                 'Action': 'BUY → SELL',
                 'Entry Price': position['entry_price'],
@@ -785,19 +868,25 @@ else:
                     display_df['PnL Points'] = display_df['PnL Points'].apply(lambda x: f"{x:.2f}")
                 
                 # Style the dataframe
-                def highlight_pnl(row):
-                    pnl_str = row['PnL %']
-                    pnl_val = float(pnl_str.replace('%', ''))
-                    
-                    if pnl_val > 0:
-                        return ['background-color: #d4edda'] * len(row)
-                    elif pnl_val < 0:
-                        return ['background-color: #f8d7da'] * len(row)
-                    else:
-                        return [''] * len(row)
+                def highlight_pnl(val):
+                    """Color code based on PnL"""
+                    if isinstance(val, str) and '%' in val:
+                        try:
+                            pnl_val = float(val.replace('%', ''))
+                            if pnl_val > 0:
+                                return 'background-color: #d4edda'
+                            elif pnl_val < 0:
+                                return 'background-color: #f8d7da'
+                        except:
+                            pass
+                    return ''
                 
-                styled_df = display_df.style.apply(highlight_pnl, axis=1)
-                st.dataframe(styled_df, use_container_width=True, height=400)
+                # Apply styling to PnL column
+                if 'PnL %' in display_df.columns:
+                    styled_df = display_df.style.applymap(highlight_pnl, subset=['PnL %'])
+                    st.dataframe(styled_df, use_container_width=True, height=400)
+                else:
+                    st.dataframe(display_df, use_container_width=True, height=400)
                 
                 # Download button
                 csv = trades_df.to_csv(index=False)
@@ -817,23 +906,29 @@ else:
                 with col1:
                     # PnL histogram
                     st.markdown("#### PnL Distribution")
-                    pnl_data = trades_df['PnL %'].values
-                    
-                    hist_df = pd.DataFrame({
-                        'PnL %': pnl_data,
-                        'Count': 1
-                    })
-                    
-                    st.bar_chart(hist_df.set_index('PnL %'))
+                    try:
+                        pnl_data = trades_df['PnL %'].values
+                        
+                        # Create bins for histogram
+                        hist_df = pd.DataFrame({
+                            'PnL %': pnl_data
+                        })
+                        
+                        st.bar_chart(hist_df)
+                    except Exception as e:
+                        st.warning(f"Could not display PnL distribution: {e}")
                 
                 with col2:
                     # Win/Loss pie chart
                     st.markdown("#### Win/Loss Ratio")
-                    pie_data = pd.DataFrame({
-                        'Type': ['Winning', 'Losing'],
-                        'Count': [len(winning_trades), len(losing_trades)]
-                    })
-                    st.bar_chart(pie_data.set_index('Type'))
+                    try:
+                        pie_data = pd.DataFrame({
+                            'Type': ['Winning', 'Losing'],
+                            'Count': [len(winning_trades), len(losing_trades)]
+                        })
+                        st.bar_chart(pie_data.set_index('Type'))
+                    except Exception as e:
+                        st.warning(f"Could not display win/loss chart: {e}")
                 
                 # Best and worst trades
                 st.markdown("---")
@@ -841,27 +936,45 @@ else:
                 
                 with col1:
                     st.markdown("### 🏆 Best Trade")
-                    best_trade = trades_df.loc[trades_df['PnL %'].idxmax()]
-                    st.success(f"""
-                    **Entry:** {best_trade['Entry Date']}  
-                    **Exit:** {best_trade['Exit Date']}  
-                    **Entry Price:** {best_trade['Entry Price']}  
-                    **Exit Price:** {best_trade['Exit Price']}  
-                    **PnL:** {best_trade['PnL Points']} points ({best_trade['PnL %']})  
-                    **Reason:** {best_trade['Reasons']}
-                    """)
+                    try:
+                        best_idx = trades_df['PnL %'].idxmax()
+                        best_trade = trades_df.loc[best_idx]
+                        
+                        # Format dates for display
+                        entry_display = pd.to_datetime(best_trade['Entry Date']).strftime('%Y-%m-%d %H:%M') if pd.notnull(best_trade['Entry Date']) else 'N/A'
+                        exit_display = pd.to_datetime(best_trade['Exit Date']).strftime('%Y-%m-%d %H:%M') if pd.notnull(best_trade['Exit Date']) else 'N/A'
+                        
+                        st.success(f"""
+                        **Entry:** {entry_display}  
+                        **Exit:** {exit_display}  
+                        **Entry Price:** ${best_trade['Entry Price']:.2f}  
+                        **Exit Price:** ${best_trade['Exit Price']:.2f}  
+                        **PnL:** {best_trade['PnL Points']:.2f} points ({best_trade['PnL %']:.2f}%)  
+                        **Reason:** {best_trade['Reasons']}
+                        """)
+                    except Exception as e:
+                        st.warning(f"Could not display best trade: {e}")
                 
                 with col2:
                     st.markdown("### 💔 Worst Trade")
-                    worst_trade = trades_df.loc[trades_df['PnL %'].idxmin()]
-                    st.error(f"""
-                    **Entry:** {worst_trade['Entry Date']}  
-                    **Exit:** {worst_trade['Exit Date']}  
-                    **Entry Price:** {worst_trade['Entry Price']}  
-                    **Exit Price:** {worst_trade['Exit Price']}  
-                    **PnL:** {worst_trade['PnL Points']} points ({worst_trade['PnL %']})  
-                    **Reason:** {worst_trade['Reasons']}
-                    """)
+                    try:
+                        worst_idx = trades_df['PnL %'].idxmin()
+                        worst_trade = trades_df.loc[worst_idx]
+                        
+                        # Format dates for display
+                        entry_display = pd.to_datetime(worst_trade['Entry Date']).strftime('%Y-%m-%d %H:%M') if pd.notnull(worst_trade['Entry Date']) else 'N/A'
+                        exit_display = pd.to_datetime(worst_trade['Exit Date']).strftime('%Y-%m-%d %H:%M') if pd.notnull(worst_trade['Exit Date']) else 'N/A'
+                        
+                        st.error(f"""
+                        **Entry:** {entry_display}  
+                        **Exit:** {exit_display}  
+                        **Entry Price:** ${worst_trade['Entry Price']:.2f}  
+                        **Exit Price:** ${worst_trade['Exit Price']:.2f}  
+                        **PnL:** {worst_trade['PnL Points']:.2f} points ({worst_trade['PnL %']:.2f}%)  
+                        **Reason:** {worst_trade['Reasons']}
+                        """)
+                    except Exception as e:
+                        st.warning(f"Could not display worst trade: {e}")
             else:
                 st.warning("No trades were executed during the backtest period.")
     
@@ -871,45 +984,115 @@ else:
         
         df = st.session_state.df
         
+        # Handle date column properly
+        if 'date' in df.columns:
+            date_col = 'date'
+        elif 'datetime' in df.columns:
+            date_col = 'datetime'
+        else:
+            date_col = df.index.name if df.index.name else None
+            if date_col is None:
+                df = df.reset_index()
+                date_col = df.columns[0]
+        
+        # Ensure date column is datetime
+        if date_col and date_col in df.columns:
+            df[date_col] = pd.to_datetime(df[date_col])
+            start_date = df[date_col].iloc[0]
+            end_date = df[date_col].iloc[-1]
+        else:
+            start_date = "N/A"
+            end_date = "N/A"
+        
         # Basic info
         col1, col2, col3, col4 = st.columns(4)
         with col1:
             st.metric("Total Candles", len(df))
         with col2:
-            st.metric("Start Date", df['date'].iloc[0].strftime('%Y-%m-%d'))
+            if isinstance(start_date, pd.Timestamp):
+                st.metric("Start Date", start_date.strftime('%Y-%m-%d'))
+            else:
+                st.metric("Start Date", str(start_date))
         with col3:
-            st.metric("End Date", df['date'].iloc[-1].strftime('%Y-%m-%d'))
+            if isinstance(end_date, pd.Timestamp):
+                st.metric("End Date", end_date.strftime('%Y-%m-%d'))
+            else:
+                st.metric("End Date", str(end_date))
         with col4:
             current_price = df['close'].iloc[-1]
             st.metric("Current Price", f"${current_price:.2f}")
         
         st.markdown("---")
         
+        # Original Raw Data
+        st.markdown("### 📊 Original Raw Data")
+        st.markdown("*Complete dataset as fetched from Yahoo Finance*")
+        
+        # Display full original dataframe
+        st.dataframe(df, use_container_width=True, height=400)
+        
+        # Download button for raw data
+        csv_raw = df.to_csv(index=False)
+        st.download_button(
+            label="📥 Download Raw Data (CSV)",
+            data=csv_raw,
+            file_name=f"{symbol}_raw_data_{datetime.now().strftime('%Y%m%d')}.csv",
+            mime="text/csv"
+        )
+        
+        st.markdown("---")
+        
         # Price chart
         st.markdown("### 📈 Price Chart")
-        chart_data = df.set_index('date')[['close']]
-        st.line_chart(chart_data)
+        try:
+            if date_col and date_col in df.columns:
+                chart_data = df.set_index(date_col)[['close']]
+            else:
+                chart_data = df[['close']]
+            st.line_chart(chart_data)
+        except Exception as e:
+            st.warning(f"Could not display chart: {e}")
+            st.line_chart(df['close'])
         
         # Volume chart
-        if df['volume'].sum() > 0:
+        if 'volume' in df.columns and df['volume'].sum() > 0:
             st.markdown("### 📊 Volume Chart")
-            volume_data = df.set_index('date')[['volume']]
-            st.bar_chart(volume_data)
+            try:
+                if date_col and date_col in df.columns:
+                    volume_data = df.set_index(date_col)[['volume']]
+                else:
+                    volume_data = df[['volume']]
+                st.bar_chart(volume_data)
+            except Exception as e:
+                st.warning(f"Could not display volume chart: {e}")
+                st.bar_chart(df['volume'])
+        
+        st.markdown("---")
         
         # Recent data
-        st.markdown("### 📋 Recent Data (Last 10 candles)")
-        recent_df = df.tail(10).copy()
+        st.markdown("### 📋 Recent Data (Last 20 candles)")
+        recent_df = df.tail(20).copy()
         
         # Format for display
-        display_cols = ['date', 'open', 'high', 'low', 'close', 'volume']
-        recent_display = recent_df[display_cols].copy()
+        available_cols = [col for col in [date_col, 'open', 'high', 'low', 'close', 'volume'] if col in recent_df.columns]
+        recent_display = recent_df[available_cols].copy()
         
+        # Format prices
         for col in ['open', 'high', 'low', 'close']:
-            recent_display[col] = recent_display[col].apply(lambda x: f"${x:.2f}")
+            if col in recent_display.columns:
+                recent_display[col] = recent_display[col].apply(lambda x: f"${x:.2f}" if pd.notnull(x) else "N/A")
         
-        recent_display['volume'] = recent_display['volume'].apply(lambda x: f"{int(x):,}")
+        # Format volume
+        if 'volume' in recent_display.columns:
+            recent_display['volume'] = recent_display['volume'].apply(lambda x: f"{int(x):,}" if pd.notnull(x) and x > 0 else "0")
+        
+        # Format date
+        if date_col and date_col in recent_display.columns:
+            recent_display[date_col] = pd.to_datetime(recent_display[date_col]).dt.strftime('%Y-%m-%d %H:%M')
         
         st.dataframe(recent_display, use_container_width=True)
+        
+        st.markdown("---")
         
         # Statistics
         st.markdown("### 📊 Statistics")
@@ -923,8 +1106,11 @@ else:
             volatility = df['close'].pct_change().std() * 100
             st.metric("Volatility", f"{volatility:.2f}%")
         with col4:
-            avg_volume = df['volume'].mean()
-            st.metric("Avg Volume", f"{int(avg_volume):,}")
+            if 'volume' in df.columns:
+                avg_volume = df['volume'].mean()
+                st.metric("Avg Volume", f"{int(avg_volume):,}" if avg_volume > 0 else "N/A")
+            else:
+                st.metric("Avg Volume", "N/A")
 
 # Footer
 st.markdown("---")
