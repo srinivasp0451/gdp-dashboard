@@ -487,7 +487,11 @@ class AITradingAgent:
         self.train_ml_model(train_data)
         
         if self.ml_model is None:
-            return []
+            return {
+                'trades': [],
+                'agent': self,
+                'test_data': df
+            }
         
         test_data = df.iloc[train_size:].copy()
         detailed_trades = []
@@ -526,7 +530,191 @@ class AITradingAgent:
                 )
                 self.close_position(close_signal, sym, detailed_trades)
         
-        return detailed_trades.iloc[train_size:].copy()
+        return {
+            'trades': detailed_trades,
+            'agent': self,
+            'test_data': test_data
+        }
+    
+    def optimize_strategy(self, df: pd.DataFrame, symbol: str, target_accuracy: float = 0.75):
+        """Optimize strategy parameters to achieve target accuracy"""
+        
+        best_accuracy = 0
+        best_params = {}
+        optimization_results = []
+        
+        # Parameter ranges to test
+        rsi_thresholds = [(30, 70), (25, 75), (20, 80)]
+        adx_thresholds = [20, 25, 30]
+        ml_confidence_levels = [0.55, 0.60, 0.65, 0.70]
+        min_bull_scores = [4, 5, 6]
+        
+        st.info(f"🔍 Testing {len(rsi_thresholds) * len(adx_thresholds) * len(ml_confidence_levels) * len(min_bull_scores)} parameter combinations...")
+        
+        progress_bar = st.progress(0)
+        total_combinations = len(rsi_thresholds) * len(adx_thresholds) * len(ml_confidence_levels) * len(min_bull_scores)
+        current = 0
+        
+        for rsi_range in rsi_thresholds:
+            for adx_thresh in adx_thresholds:
+                for ml_conf in ml_confidence_levels:
+                    for min_score in min_bull_scores:
+                        
+                        # Update progress
+                        current += 1
+                        progress_bar.progress(current / total_combinations)
+                        
+                        # Create new agent with these parameters
+                        test_agent = AITradingAgent(
+                            initial_capital=self.initial_capital,
+                            risk_per_trade=self.risk_per_trade
+                        )
+                        
+                        # Store parameters for this test
+                        test_agent.rsi_low = rsi_range[0]
+                        test_agent.rsi_high = rsi_range[1]
+                        test_agent.adx_threshold = adx_thresh
+                        test_agent.ml_confidence = ml_conf
+                        test_agent.min_bull_score = min_score
+                        
+                        # Run backtest with these parameters
+                        train_size = int(len(df) * 0.7)
+                        train_data = df.iloc[:train_size].copy()
+                        test_data = df.iloc[train_size:].copy()
+                        
+                        test_agent.train_ml_model(train_data)
+                        
+                        if test_agent.ml_model is None:
+                            continue
+                        
+                        trades = []
+                        for i in range(50, len(test_data)):
+                            window_df = test_data.iloc[max(0, i-200):i+1].copy()
+                            signal = test_agent.generate_live_signal_optimized(
+                                window_df, symbol, rsi_range, adx_thresh, ml_conf, min_score
+                            )
+                            
+                            if signal.action == 'BUY':
+                                test_agent.execute_trade(signal, trades)
+                            elif signal.action == 'SELL' and symbol in test_agent.positions:
+                                test_agent.close_position(signal, symbol, trades)
+                        
+                        # Calculate accuracy
+                        if len(trades) > 0:
+                            trades_df = pd.DataFrame(trades)
+                            winning_trades = trades_df[trades_df['PnL %'] > 0]
+                            accuracy = len(winning_trades) / len(trades_df)
+                            
+                            result = {
+                                'RSI Range': f"{rsi_range[0]}-{rsi_range[1]}",
+                                'ADX Threshold': adx_thresh,
+                                'ML Confidence': ml_conf,
+                                'Min Bull Score': min_score,
+                                'Accuracy': accuracy * 100,
+                                'Total Trades': len(trades_df),
+                                'Win Rate': accuracy * 100
+                            }
+                            
+                            optimization_results.append(result)
+                            
+                            if accuracy > best_accuracy:
+                                best_accuracy = accuracy
+                                best_params = {
+                                    'rsi_range': rsi_range,
+                                    'adx_threshold': adx_thresh,
+                                    'ml_confidence': ml_conf,
+                                    'min_bull_score': min_score
+                                }
+        
+        progress_bar.empty()
+        
+        return best_accuracy, best_params, optimization_results
+    
+    def generate_live_signal_optimized(self, df: pd.DataFrame, symbol: str, 
+                                       rsi_range: tuple, adx_thresh: float, 
+                                       ml_conf: float, min_score: int) -> TradeSignal:
+        """Generate signal with optimized parameters"""
+        if self.ml_model is None:
+            self.train_ml_model(df)
+        
+        df = self.calculate_technical_indicators(df)
+        features_df = self.create_ml_features(df)
+        
+        latest_features = features_df.iloc[-1:].values
+        latest_scaled = self.scaler.transform(latest_features)
+        
+        ml_proba = self.ml_model.predict_proba(latest_scaled)[0]
+        ml_confidence = ml_proba[1]
+        
+        latest = df.iloc[-1]
+        current_price = latest['close']
+        
+        try:
+            if 'date' in latest.index:
+                current_date = pd.to_datetime(latest['date'])
+            elif 'datetime' in latest.index:
+                current_date = pd.to_datetime(latest['datetime'])
+            else:
+                current_date = datetime.now()
+        except:
+            current_date = datetime.now()
+        
+        reasons = []
+        bull_score = 0
+        
+        # Optimized conditions
+        if rsi_range[0] < latest['rsi'] < rsi_range[1]:
+            bull_score += 1
+            reasons.append(f"RSI in range ({latest['rsi']:.1f})")
+        
+        if latest['macd'] > latest['macd_signal']:
+            bull_score += 1
+            reasons.append("MACD bullish")
+        
+        if latest['close'] > latest['sma_20']:
+            bull_score += 1
+            reasons.append("Price > SMA20")
+        
+        if latest['close'] > latest['sma_50']:
+            bull_score += 1
+            reasons.append("Price > SMA50")
+        
+        if latest['adx'] > adx_thresh:
+            bull_score += 1
+            reasons.append(f"ADX > {adx_thresh}")
+        
+        if latest['stoch_k'] > latest['stoch_d']:
+            bull_score += 1
+            reasons.append("Stoch bullish")
+        
+        if ml_confidence > ml_conf:
+            bull_score += 2
+            reasons.append(f"ML conf > {ml_conf}")
+        
+        atr = latest['atr']
+        
+        if bull_score >= min_score:
+            stop_loss = current_price - (2 * atr)
+            take_profit = current_price + (3 * atr)
+            position_size = self.calculate_position_size(current_price, stop_loss)
+            
+            return TradeSignal(
+                symbol=symbol, action='BUY',
+                signal_strength=bull_score/8, confidence=ml_confidence,
+                entry_price=current_price, stop_loss=stop_loss,
+                take_profit=take_profit, position_size=position_size,
+                timestamp=datetime.now(), strategy_type='SWING',
+                reasons=reasons, entry_date=current_date
+            )
+        else:
+            return TradeSignal(
+                symbol=symbol, action='HOLD',
+                signal_strength=0.5, confidence=0.5,
+                entry_price=current_price, stop_loss=0,
+                take_profit=0, position_size=0,
+                timestamp=datetime.now(), strategy_type='SWING',
+                reasons=["Below minimum score"], entry_date=current_date
+            ).iloc[train_size:].copy()
         detailed_trades = []
         
         for i in range(50, len(test_data)):
