@@ -332,10 +332,10 @@ if st.sidebar.button("Run Analysis", type="primary"):
             with col2:
                 st.metric("Max Date", data.index.max().strftime('%Y-%m-%d'))
             with col3:
-                st.metric("Min Close", f"{data['Close'].min():.2f}")
-                #st.metric("min close",f"
+                #st.metric("Min Close", f"{data['Close'].min():.2f}")
+                st.metric("min close",f"{data['Close']})
             with col4:
-                st.metric("Max Close", f"{data['Close'].max():.2f}")
+                st.metric("Max Close", f"{data['Close']}")
             
             # Calculate indicators
             data['RSI'] = calculate_rsi(data, rsi_period)
