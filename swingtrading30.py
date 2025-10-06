@@ -78,7 +78,17 @@ def fetch_data(ticker, period, interval):
         data = yf.download(ticker, period=period, interval=interval, progress=False)
         if data.empty:
             return None
+        
+        # Handle multi-index columns if present
+        if isinstance(data.columns, pd.MultiIndex):
+            data.columns = data.columns.droplevel(1)
+        
+        # Ensure data is sorted
         data = data.sort_index(ascending=True)
+        
+        # Remove any rows with NaN values
+        data = data.dropna()
+        
         return data
     except Exception as e:
         st.error(f"Error fetching data: {str(e)}")
@@ -332,10 +342,9 @@ if st.sidebar.button("Run Analysis", type="primary"):
             with col2:
                 st.metric("Max Date", data.index.max().strftime('%Y-%m-%d'))
             with col3:
-                #st.metric("Min Close", f"{data['Close'].min():.2f}")
-                st.metric("min close",f"{data['Close']}")
+                st.metric("Min Close", f"${data['Close'].min():.2f}")
             with col4:
-                st.metric("Max Close", f"{data['Close']}")
+                st.metric("Max Close", f"${data['Close'].max():.2f}")
             
             # Calculate indicators
             data['RSI'] = calculate_rsi(data, rsi_period)
@@ -405,8 +414,19 @@ if st.sidebar.button("Run Analysis", type="primary"):
                 if len(signals_df) > 0:
                     last_signal = signals_df.iloc[-1]
                     
-                    if last_signal['Exit Date'] == data.index[-1] or \
-                       (data.index[-1] - last_signal['Entry Date']).days < 5:
+                    # Check if signal is recent
+                    last_entry_date = pd.to_datetime(last_signal['Entry Date'])
+                    last_data_date = data.index[-1]
+                    
+                    # Convert to timezone-naive for comparison if needed
+                    if hasattr(last_entry_date, 'tz') and last_entry_date.tz is not None:
+                        last_entry_date = last_entry_date.tz_localize(None)
+                    if hasattr(last_data_date, 'tz') and last_data_date.tz is not None:
+                        last_data_date = last_data_date.tz_localize(None)
+                    
+                    days_diff = (last_data_date - last_entry_date).days
+                    
+                    if days_diff <= 5:
                         st.info("📢 Active Signal")
                         
                         col1, col2, col3 = st.columns(3)
