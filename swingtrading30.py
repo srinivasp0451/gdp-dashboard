@@ -333,7 +333,7 @@ if st.sidebar.button("Run Analysis", type="primary"):
                 st.metric("Max Date", data.index.max().strftime('%Y-%m-%d'))
             with col3:
                 #st.metric("Min Close", f"{data['Close'].min():.2f}")
-                st.metric("min close",f"{data['Close']})
+                st.metric("min close",f"{data['Close']}")
             with col4:
                 st.metric("Max Close", f"{data['Close']}")
             
