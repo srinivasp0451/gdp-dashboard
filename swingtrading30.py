@@ -356,8 +356,8 @@ def optimize_strategy(data):
     rsi_periods = [10, 12, 14, 16, 18, 20]
     rsi_oversolds = [25, 30, 35]
     rsi_overboughts = [65, 70, 75]
-    min_div_bars = [3, 5, 7, 10]
-    risk_rewards = [2.0, 2.5, 3.0, 3.5]
+    min_div_bars = [3, 5, ]
+    risk_rewards = [2.0, 2.5]
     swing_orders = [4, 5, 6, 7]
     
     optimization_progress = st.progress(0)
