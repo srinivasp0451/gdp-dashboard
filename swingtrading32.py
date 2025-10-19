@@ -307,7 +307,7 @@ with st.sidebar:
         "1 Hour": "1h", "2 Hours": "2h", "4 Hours": "4h",
         "1 Day": "1d", "5 Days": "5d", "1 Week": "1wk", "1 Month": "1mo"
     }
-    interval = st.selectbox("Interval", list(interval_options.keys()), index=8)
+    interval = st.selectbox("Interval", list(interval_options.keys()), index=9)
     
     # Period selection
     period_options = {
