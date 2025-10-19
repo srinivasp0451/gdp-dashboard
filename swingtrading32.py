@@ -40,6 +40,15 @@ def calculate_rsi(data, period=14):
     rsi = 100 - (100 / (1 + rs))
     return rsi
 
+# Flatten multi-index DataFrame
+def flatten_dataframe(df):
+    """Flatten multi-index columns from yfinance"""
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = ['_'.join(col).strip('_') if isinstance(col, tuple) else col for col in df.columns]
+    # If columns still have ticker names, remove them
+    df.columns = [col.split('_')[-1] if '_' in str(col) else col for col in df.columns]
+    return df
+
 # Fetch data with caching mechanism
 @st.cache_data(ttl=300)  # Cache for 5 minutes
 def fetch_data_cached(ticker, period, interval):
@@ -54,8 +63,15 @@ def fetch_data_cached(ticker, period, interval):
                 return st.session_state.cached_data[cache_key]
     
     try:
-        data = yf.download(ticker, period=period, interval=interval, progress=False)
+        data = yf.download(ticker, period=period, interval=interval, progress=False, auto_adjust=False)
         if not data.empty:
+            # Flatten multi-index columns
+            data = flatten_dataframe(data)
+            # Ensure we have the required columns
+            required_cols = ['Open', 'High', 'Low', 'Close', 'Volume']
+            if not all(col in data.columns for col in required_cols):
+                st.error(f"Missing required columns for {ticker}")
+                return None
             st.session_state.cached_data[cache_key] = data
             st.session_state.last_fetch_time[cache_key] = current_time
             return data
@@ -68,10 +84,20 @@ def fetch_data_cached(ticker, period, interval):
 def analyze_divergence(price_data, rsi_data):
     divergences = []
     
+    # Ensure we have pandas Series
+    if isinstance(price_data, np.ndarray):
+        price_data = pd.Series(price_data)
+    if isinstance(rsi_data, np.ndarray):
+        rsi_data = pd.Series(rsi_data)
+    
+    # Remove NaN values
+    price_data = price_data.dropna()
+    rsi_data = rsi_data.dropna()
+    
     # Price trend (last 20 periods)
-    if len(price_data) >= 20:
-        price_trend = "rising" if price_data[-1] > price_data[-20] else "falling"
-        rsi_trend = "rising" if rsi_data[-1] > rsi_data[-20] else "falling"
+    if len(price_data) >= 20 and len(rsi_data) >= 20:
+        price_trend = "rising" if price_data.iloc[-1] > price_data.iloc[-20] else "falling"
+        rsi_trend = "rising" if rsi_data.iloc[-1] > rsi_data.iloc[-20] else "falling"
         
         if price_trend == "rising" and rsi_trend == "falling":
             divergences.append("bearish divergence detected (price up, RSI down)")
@@ -79,11 +105,12 @@ def analyze_divergence(price_data, rsi_data):
             divergences.append("bullish divergence detected (price down, RSI up)")
     
     # RSI levels
-    current_rsi = rsi_data[-1]
-    if current_rsi > 70:
-        divergences.append(f"overbought (RSI: {current_rsi:.1f})")
-    elif current_rsi < 30:
-        divergences.append(f"oversold (RSI: {current_rsi:.1f})")
+    if len(rsi_data) > 0:
+        current_rsi = rsi_data.iloc[-1]
+        if current_rsi > 70:
+            divergences.append(f"overbought (RSI: {current_rsi:.1f})")
+        elif current_rsi < 30:
+            divergences.append(f"oversold (RSI: {current_rsi:.1f})")
     
     return divergences
 
@@ -91,14 +118,37 @@ def analyze_divergence(price_data, rsi_data):
 def generate_summary(ticker1, ticker2, ratio_data, rsi_ratio, price1_data, rsi1, price2_data, rsi2):
     summary_parts = []
     
+    # Convert to pandas Series if needed
+    if isinstance(ratio_data, np.ndarray):
+        ratio_data = pd.Series(ratio_data)
+    if isinstance(price1_data, np.ndarray):
+        price1_data = pd.Series(price1_data)
+    if isinstance(price2_data, np.ndarray):
+        price2_data = pd.Series(price2_data)
+    if isinstance(rsi_ratio, np.ndarray):
+        rsi_ratio = pd.Series(rsi_ratio)
+    if isinstance(rsi1, np.ndarray):
+        rsi1 = pd.Series(rsi1)
+    if isinstance(rsi2, np.ndarray):
+        rsi2 = pd.Series(rsi2)
+    
+    # Remove NaN values
+    ratio_data = ratio_data.dropna()
+    price1_data = price1_data.dropna()
+    price2_data = price2_data.dropna()
+    rsi_ratio = rsi_ratio.dropna()
+    rsi1 = rsi1.dropna()
+    rsi2 = rsi2.dropna()
+    
     # Ratio trend
-    ratio_change = ((ratio_data[-1] - ratio_data[-20]) / ratio_data[-20] * 100) if len(ratio_data) >= 20 else 0
-    if ratio_change > 5:
-        summary_parts.append(f"{ticker1} is outperforming {ticker2} by {ratio_change:.1f}%")
-    elif ratio_change < -5:
-        summary_parts.append(f"{ticker2} is outperforming {ticker1} by {abs(ratio_change):.1f}%")
-    else:
-        summary_parts.append(f"Ratio relatively stable")
+    if len(ratio_data) >= 20:
+        ratio_change = ((ratio_data.iloc[-1] - ratio_data.iloc[-20]) / ratio_data.iloc[-20] * 100)
+        if ratio_change > 5:
+            summary_parts.append(f"{ticker1} is outperforming {ticker2} by {ratio_change:.1f}%")
+        elif ratio_change < -5:
+            summary_parts.append(f"{ticker2} is outperforming {ticker1} by {abs(ratio_change):.1f}%")
+        else:
+            summary_parts.append(f"Ratio relatively stable")
     
     # Divergence analysis
     div1 = analyze_divergence(price1_data, rsi1)
@@ -329,8 +379,8 @@ if st.session_state.analysis_done:
             
             # Summary
             summary = generate_summary(
-                ticker1, ticker2, ratio_data.values, rsi_ratio.values,
-                data1['Close'].values, rsi1.values, data2['Close'].values, rsi2.values
+                ticker1, ticker2, ratio_data, rsi_ratio,
+                data1['Close'], rsi1, data2['Close'], rsi2
             )
             
             st.info(f"**💡 Summary:** {summary}")
