@@ -40,15 +40,6 @@ def calculate_rsi(data, period=14):
     rsi = 100 - (100 / (1 + rs))
     return rsi
 
-# Flatten multi-index DataFrame
-def flatten_dataframe(df):
-    """Flatten multi-index columns from yfinance"""
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = ['_'.join(col).strip('_') if isinstance(col, tuple) else col for col in df.columns]
-    # If columns still have ticker names, remove them
-    df.columns = [col.split('_')[-1] if '_' in str(col) else col for col in df.columns]
-    return df
-
 # Fetch data with caching mechanism
 @st.cache_data(ttl=300)  # Cache for 5 minutes
 def fetch_data_cached(ticker, period, interval):
@@ -63,21 +54,35 @@ def fetch_data_cached(ticker, period, interval):
                 return st.session_state.cached_data[cache_key]
     
     try:
-        data = yf.download(ticker, period=period, interval=interval, progress=False, auto_adjust=False)
-        if not data.empty:
-            # Flatten multi-index columns
-            data = flatten_dataframe(data)
-            # Ensure we have the required columns
-            required_cols = ['Open', 'High', 'Low', 'Close', 'Volume']
-            if not all(col in data.columns for col in required_cols):
-                st.error(f"Missing required columns for {ticker}")
-                return None
-            st.session_state.cached_data[cache_key] = data
-            st.session_state.last_fetch_time[cache_key] = current_time
-            return data
-        return None
+        data = yf.download(ticker, period=period, interval=interval, progress=False)
+        
+        if data.empty:
+            return None
+        
+        # Handle multi-index columns
+        if isinstance(data.columns, pd.MultiIndex):
+            # For single ticker, just take the first level
+            data.columns = data.columns.get_level_values(0)
+        
+        # Make sure column names are proper strings
+        data.columns = [str(col).strip() for col in data.columns]
+        
+        # Verify required columns exist
+        required_cols = ['Open', 'High', 'Low', 'Close']
+        missing = [col for col in required_cols if col not in data.columns]
+        
+        if missing:
+            st.error(f"Missing columns for {ticker}: {missing}. Available: {list(data.columns)}")
+            return None
+        
+        st.session_state.cached_data[cache_key] = data
+        st.session_state.last_fetch_time[cache_key] = current_time
+        return data
+        
     except Exception as e:
         st.error(f"Error fetching data for {ticker}: {str(e)}")
+        import traceback
+        st.error(traceback.format_exc())
         return None
 
 # Analyze divergence
