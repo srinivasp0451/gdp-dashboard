@@ -75,8 +75,27 @@ def fetch_data(ticker, period, interval):
     """Fetch data from yfinance with caching"""
     try:
         data = yf.download(ticker, period=period, interval=interval, progress=False)
-        if data.empty:
+        
+        # Handle empty data
+        if data is None or len(data) == 0:
             return None
+        
+        # Flatten multi-index columns if present
+        if isinstance(data.columns, pd.MultiIndex):
+            data.columns = data.columns.get_level_values(0)
+        
+        # Ensure we have the required columns
+        required_cols = ['Open', 'High', 'Low', 'Close', 'Volume']
+        if not all(col in data.columns for col in required_cols):
+            st.error(f"Missing required columns. Available: {list(data.columns)}")
+            return None
+        
+        # Reset index to ensure datetime index
+        data.index = pd.to_datetime(data.index)
+        
+        # Remove any duplicate columns
+        data = data.loc[:, ~data.columns.duplicated()]
+        
         return data
     except Exception as e:
         st.error(f"Error fetching data: {str(e)}")
@@ -84,27 +103,44 @@ def fetch_data(ticker, period, interval):
 
 def calculate_rsi(data, period=14):
     """Calculate RSI indicator"""
-    delta = data['Close'].diff()
+    close_prices = data['Close']
+    delta = close_prices.diff()
     gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
     loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
-    rs = gain / loss
+    
+    # Avoid division by zero
+    rs = gain / loss.replace(0, np.nan)
     rsi = 100 - (100 / (1 + rs))
-    return rsi
+    return rsi.fillna(50)  # Fill NaN with neutral value
 
 def detect_divergence(price, rsi, window=20):
     """Detect RSI divergence"""
     divergences = []
+    
+    # Ensure we have enough data
+    if len(price) < window + 5:
+        return divergences
+    
     for i in range(window, len(price)):
         price_slice = price.iloc[i-window:i]
         rsi_slice = rsi.iloc[i-window:i]
         
+        # Skip if any NaN values
+        if price_slice.isna().any() or rsi_slice.isna().any():
+            continue
+        
+        current_price = price.iloc[i]
+        current_rsi = rsi.iloc[i]
+        
         # Bullish divergence: price lower low, RSI higher low
-        if price.iloc[i] < price_slice.min() and rsi.iloc[i] > rsi_slice.min():
-            divergences.append(('Bullish', i, price.iloc[i], rsi.iloc[i]))
+        if current_price <= price_slice.min() and current_rsi >= rsi_slice.min():
+            if current_price < price_slice.min() or current_rsi > rsi_slice.min():
+                divergences.append(('Bullish', i, current_price, current_rsi))
         
         # Bearish divergence: price higher high, RSI lower high
-        if price.iloc[i] > price_slice.max() and rsi.iloc[i] < rsi_slice.max():
-            divergences.append(('Bearish', i, price.iloc[i], rsi.iloc[i]))
+        if current_price >= price_slice.max() and current_rsi <= rsi_slice.max():
+            if current_price > price_slice.max() or current_rsi < rsi_slice.max():
+                divergences.append(('Bearish', i, current_price, current_rsi))
     
     return divergences
 
@@ -195,6 +231,9 @@ def create_returns_heatmap(df):
     df_returns['DayOfWeek'] = df_returns.index.day_name()
     df_returns['Month'] = df_returns.index.month_name()
     
+    # Remove NaN values
+    df_returns = df_returns.dropna(subset=['Returns'])
+    
     pivot_table = df_returns.pivot_table(
         values='Returns',
         index='DayOfWeek',
@@ -202,8 +241,11 @@ def create_returns_heatmap(df):
         aggfunc='mean'
     )
     
+    # Reorder days
     day_order = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday']
-    pivot_table = pivot_table.reindex([d for d in day_order if d in pivot_table.index])
+    available_days = [d for d in day_order if d in pivot_table.index]
+    if available_days:
+        pivot_table = pivot_table.reindex(available_days)
     
     fig = px.imshow(
         pivot_table,
