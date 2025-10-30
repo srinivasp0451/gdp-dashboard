@@ -452,11 +452,14 @@ def analyze_ratio(df1, df2, ticker1_name, ticker2_name, bins=20):
     combined['Change'] = combined['Ratio'].diff()
     combined['Direction'] = combined['Change'].apply(lambda x: 'Up' if x > 0 else 'Down' if x < 0 else 'Neutral')
     
-    comparison_df = combined[['Price1', 'Price2', 'Ratio']].copy()
-    comparison_df.columns = [f'{ticker1_name} Close', f'{ticker2_name} Close', 'Ratio']
-    comparison_df[f'{ticker1_name} Change %'] = comparison_df[f'{ticker1_name} Close'].pct_change() * 100
-    comparison_df[f'{ticker2_name} Change %'] = comparison_df[f'{ticker2_name} Close'].pct_change() * 100
-    comparison_df['Ratio Change %'] = comparison_df['Ratio'].pct_change() * 100
+    # Create comparison dataframe
+    comparison_df = pd.DataFrame(index=combined.index)
+    comparison_df[f'{ticker1_name}_Close'] = combined['Price1'].values
+    comparison_df[f'{ticker2_name}_Close'] = combined['Price2'].values
+    comparison_df['Ratio'] = combined['Ratio'].values
+    comparison_df[f'{ticker1_name}_Change_Pct'] = comparison_df[f'{ticker1_name}_Close'].pct_change() * 100
+    comparison_df[f'{ticker2_name}_Change_Pct'] = comparison_df[f'{ticker2_name}_Close'].pct_change() * 100
+    comparison_df['Ratio_Change_Pct'] = comparison_df['Ratio'].pct_change() * 100
     
     return comparison_df
 
