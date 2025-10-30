@@ -850,7 +850,7 @@ st.markdown("""
     <p>Data provided by Yahoo Finance. Past performance does not guarantee future results.</p>
 </div>
 """, unsafe_allow_html=True)
-        st.metric("High", f"{df['High'].max():.2f}")
+    st.metric("High", f"{df['High'].max():.2f}")
     with col3:
         st.metric("Low", f"{df['Low'].min():.2f}")
     with col4:
