@@ -850,73 +850,73 @@ st.markdown("""
     <p>Data provided by Yahoo Finance. Past performance does not guarantee future results.</p>
 </div>
 """, unsafe_allow_html=True)
-    st.metric("High", f"{df['High'].max():.2f}")
-    with col3:
-        st.metric("Low", f"{df['Low'].min():.2f}")
-    with col4:
-        st.metric("RSI", f"{df['RSI'].iloc[-1]:.1f}")
-    with col5:
-        st.metric("Volume", f"{df['Volume'].iloc[-1]:,.0f}")
+st.metric("High", f"{df['High'].max():.2f}")
+with col3:
+    st.metric("Low", f"{df['Low'].min():.2f}")
+with col4:
+    st.metric("RSI", f"{df['RSI'].iloc[-1]:.1f}")
+with col5:
+    st.metric("Volume", f"{df['Volume'].iloc[-1]:,.0f}")
     
-    st.markdown("---")
+st.markdown("---")
     
-    # Candlestick Chart
-    st.subheader("📊 Price Action")
-    candle_fig = create_candlestick_chart(df, ticker_name, show_line_chart, theme)
-    st.plotly_chart(candle_fig, use_container_width=True)
+# Candlestick Chart
+st.subheader("📊 Price Action")
+candle_fig = create_candlestick_chart(df, ticker_name, show_line_chart, theme)
+st.plotly_chart(candle_fig, use_container_width=True)
     
-    price_insight = generate_insights(df, df['RSI'], divergences, fib_levels)
-    st.info(f"**Insight:** {price_insight}")
+price_insight = generate_insights(df, df['RSI'], divergences, fib_levels)
+st.info(f"**Insight:** {price_insight}")
     
-    # Price comparison table
-    price_comparison = df[['Open', 'High', 'Low', 'Close', 'Volume']].tail(20).copy()
-    st.dataframe(price_comparison.style.format({
-        'Open': '{:.2f}',
-        'High': '{:.2f}',
-        'Low': '{:.2f}',
-        'Close': '{:.2f}',
-        'Volume': '{:,.0f}'
-    }), use_container_width=True, height=300)
+# Price comparison table
+price_comparison = df[['Open', 'High', 'Low', 'Close', 'Volume']].tail(20).copy()
+st.dataframe(price_comparison.style.format({
+    'Open': '{:.2f}',
+    'High': '{:.2f}',
+    'Low': '{:.2f}',
+    'Close': '{:.2f}',
+    'Volume': '{:,.0f}'
+}), use_container_width=True, height=300)
     
-    # RSI Chart
-    st.subheader("📈 RSI Indicator & Divergences")
-    rsi_fig = create_rsi_chart(df, df['RSI'], divergences, theme)
-    st.plotly_chart(rsi_fig, use_container_width=True)
+# RSI Chart
+st.subheader("📈 RSI Indicator & Divergences")
+rsi_fig = create_rsi_chart(df, df['RSI'], divergences, theme)
+st.plotly_chart(rsi_fig, use_container_width=True)
     
-    if divergences:
-        div_text = f"Found {len(divergences)} divergence(s). "
-        bullish_count = sum(1 for d in divergences if d[0] == 'Bullish')
-        bearish_count = len(divergences) - bullish_count
-        prediction = "Bullish trend expected" if bullish_count > bearish_count else "Bearish trend expected"
-        st.success(f"**Prediction:** {div_text}{prediction} based on divergence analysis.")
-    else:
-        st.warning("**Prediction:** No significant divergences detected. Monitor for confirmation signals.")
+if divergences:
+    div_text = f"Found {len(divergences)} divergence(s). "
+    bullish_count = sum(1 for d in divergences if d[0] == 'Bullish')
+    bearish_count = len(divergences) - bullish_count
+    prediction = "Bullish trend expected" if bullish_count > bearish_count else "Bearish trend expected"
+    st.success(f"**Prediction:** {div_text}{prediction} based on divergence analysis.")
+else:
+    st.warning("**Prediction:** No significant divergences detected. Monitor for confirmation signals.")
     
-    # Divergences table
-    if divergences:
-        div_df = pd.DataFrame(divergences, columns=['Type', 'Date', 'Price'])
-        st.dataframe(div_df, use_container_width=True)
+# Divergences table
+if divergences:
+    div_df = pd.DataFrame(divergences, columns=['Type', 'Date', 'Price'])
+    st.dataframe(div_df, use_container_width=True)
     
-    # Fibonacci Levels
-    st.subheader("🎯 Fibonacci Retracement Levels")
-    fib_fig = create_fibonacci_chart(df, fib_levels, ticker_name, theme)
-    st.plotly_chart(fib_fig, use_container_width=True)
+# Fibonacci Levels
+st.subheader("🎯 Fibonacci Retracement Levels")
+fib_fig = create_fibonacci_chart(df, fib_levels, ticker_name, theme)
+st.plotly_chart(fib_fig, use_container_width=True)
     
-    fib_insight = f"Key support at {fib_levels['61.8%']:.2f} and resistance at {fib_levels['23.6%']:.2f}. "
-    current_price = df['Close'].iloc[-1]
-    if current_price < fib_levels['50%']:
-        fib_insight += "Price below 50% level suggests bearish momentum."
-    else:
-        fib_insight += "Price above 50% level indicates bullish strength."
-    st.info(f"**Insight:** {fib_insight}")
+fib_insight = f"Key support at {fib_levels['61.8%']:.2f} and resistance at {fib_levels['23.6%']:.2f}. "
+current_price = df['Close'].iloc[-1]
+if current_price < fib_levels['50%']:
+    fib_insight += "Price below 50% level suggests bearish momentum."
+else:
+    fib_insight += "Price above 50% level indicates bullish strength."
+st.info(f"**Insight:** {fib_insight}")
     
-    # Fibonacci levels table
-    fib_df = pd.DataFrame(list(fib_levels.items()), columns=['Level', 'Price'])
-    fib_df['Distance from Current'] = ((fib_df['Price'] - current_price) / current_price * 100)
-    st.dataframe(fib_df.style.format({
-        'Price': '{:.2f}',
-        'Distance from Current': '{:.2f}%'
-    }), use_container_width=True)
+# Fibonacci levels table
+fib_df = pd.DataFrame(list(fib_levels.items()), columns=['Level', 'Price'])
+fib_df['Distance from Current'] = ((fib_df['Price'] - current_price) / current_price * 100)
+st.dataframe(fib_df.style.format({
+    'Price': '{:.2f}',
+    'Distance from Current': '{:.2f}%'
+}), use_container_width=True)
     
     # Returns Heatmap
     st.subheader("🔥 Returns Heatmap")
