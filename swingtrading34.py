@@ -65,7 +65,7 @@ PREDEFINED_TICKERS = {
 
 # Functions
 def flatten_multiindex_dataframe(df):
-    """Flatten multi-index dataframe from yfinance"""
+    """Flatten multi-index dataframe from yfinance and remove timezone"""
     if isinstance(df.columns, pd.MultiIndex):
         # For multi-ticker downloads, take the first ticker
         df.columns = df.columns.get_level_values(0)
@@ -73,8 +73,14 @@ def flatten_multiindex_dataframe(df):
     # Reset index to make date a column, then set it back
     df = df.reset_index()
     if 'Date' in df.columns:
+        # Remove timezone if present
+        if df['Date'].dtype == 'datetime64[ns, UTC]' or hasattr(df['Date'].dtype, 'tz'):
+            df['Date'] = df['Date'].dt.tz_localize(None)
         df.set_index('Date', inplace=True)
     elif 'Datetime' in df.columns:
+        # Remove timezone if present
+        if df['Datetime'].dtype == 'datetime64[ns, UTC]' or hasattr(df['Datetime'].dtype, 'tz'):
+            df['Datetime'] = df['Datetime'].dt.tz_localize(None)
         df.set_index('Datetime', inplace=True)
     
     return df
@@ -409,6 +415,13 @@ def calculate_daily_stats(df):
     return stats_df[['Open', 'High', 'Low', 'Close', 'Volume', 
                      'Daily_Change', 'Daily_Return_%', 'Points_Moved', 'Range_%']].dropna()
 
+def prepare_df_for_excel(df):
+    """Prepare dataframe for Excel export by removing timezone from index"""
+    df_copy = df.copy()
+    if hasattr(df_copy.index, 'tz') and df_copy.index.tz is not None:
+        df_copy.index = df_copy.index.tz_localize(None)
+    return df_copy
+
 # Sidebar
 st.sidebar.title("🚀 Algo Trading Dashboard")
 st.sidebar.markdown("---")
@@ -546,9 +559,134 @@ if st.session_state.data_fetched and st.session_state.df is not None:
         change_val = ((df['Close'].iloc[-1] - df['Close'].iloc[-2]) / df['Close'].iloc[-2] * 100) if len(df) >= 2 else 0
         st.metric("Current Price", f"{df['Close'].iloc[-1]:.2f}", f"{change_val:.2f}%")
     with col2:
+        st.metric("High", f"{df['High'].max():.2f}")
+    with col3:
+        st.metric("Low", f"{df['Low'].min():.2f}")
+    with col4:
+        st.metric("RSI", f"{df['RSI'].iloc[-1]:.1f}")
+    with col5:
+        st.metric("Volume", f"{df['Volume'].iloc[-1]:,.0f}")
+    
+    st.markdown("---")
+    
+    # Candlestick Chart
+    st.subheader("📊 Price Action")
+    candle_fig = create_candlestick_chart(df, ticker_name, show_line_chart, theme)
+    st.plotly_chart(candle_fig, use_container_width=True)
+    
+    price_insight = generate_insights(df, df['RSI'], divergences, fib_levels)
+    st.info(f"**Insight:** {price_insight}")
+    
+    # Price comparison table
+    price_comparison = df[['Open', 'High', 'Low', 'Close', 'Volume']].tail(20).copy()
+    st.dataframe(price_comparison.style.format({
+        'Open': '{:.2f}',
+        'High': '{:.2f}',
+        'Low': '{:.2f}',
+        'Close': '{:.2f}',
+        'Volume': '{:,.0f}'
+    }), use_container_width=True, height=300)
+    
+    # RSI Chart
+    st.subheader("📈 RSI Indicator & Divergences")
+    rsi_fig = create_rsi_chart(df, df['RSI'], divergences, theme)
+    st.plotly_chart(rsi_fig, use_container_width=True)
+    
+    if divergences:
+        div_text = f"Found {len(divergences)} divergence(s). "
+        bullish_count = sum(1 for d in divergences if d[0] == 'Bullish')
+        bearish_count = len(divergences) - bullish_count
+        prediction = "Bullish trend expected" if bullish_count > bearish_count else "Bearish trend expected"
+        st.success(f"**Prediction:** {div_text}{prediction} based on divergence analysis.")
+    else:
+        st.warning("**Prediction:** No significant divergences detected. Monitor for confirmation signals.")
+    
+    # Divergences table
+    if divergences:
+        div_df = pd.DataFrame(divergences, columns=['Type', 'Date', 'Price'])
+        st.dataframe(div_df, use_container_width=True)
+    
+    # Fibonacci Levels
+    st.subheader("🎯 Fibonacci Retracement Levels")
+    fib_fig = create_fibonacci_chart(df, fib_levels, ticker_name, theme)
+    st.plotly_chart(fib_fig, use_container_width=True)
+    
+    fib_insight = f"Key support at {fib_levels['61.8%']:.2f} and resistance at {fib_levels['23.6%']:.2f}. "
+    current_price = df['Close'].iloc[-1]
+    if current_price < fib_levels['50%']:
+        fib_insight += "Price below 50% level suggests bearish momentum."
+    else:
+        fib_insight += "Price above 50% level indicates bullish strength."
+    st.info(f"**Insight:** {fib_insight}")
+    
+    # Fibonacci levels table
+    fib_df = pd.DataFrame(list(fib_levels.items()), columns=['Level', 'Price'])
+    fib_df['Distance from Current'] = ((fib_df['Price'] - current_price) / current_price * 100)
+    st.dataframe(fib_df.style.format({
+        'Price': '{:.2f}',
+        'Distance from Current': '{:.2f}%'
+    }), use_container_width=True)
+    
+    # Returns Heatmap
+    st.subheader("🔥 Returns Heatmap")
+    heatmap_fig, pivot_data = create_returns_heatmap(df, heatmap_type, theme)
+    st.plotly_chart(heatmap_fig, use_container_width=True)
+    
+    # Heatmap statistics
+    positive_cells = (pivot_data.values > 0).sum()
+    negative_cells = (pivot_data.values < 0).sum()
+    avg_return = pivot_data.values.flatten()
+    avg_return = avg_return[~np.isnan(avg_return)].mean()
+    st.info(f"**Insight:** {positive_cells} positive periods vs {negative_cells} negative periods. "
+            f"Average return: {avg_return:.1f}%.")
+    
+    # Heatmap data table
+    st.dataframe(pivot_data.style.background_gradient(cmap='RdYlGn').format('{:.1f}'),
+                use_container_width=True, height=300)
+    
+    # Daily Statistics Table
+    st.subheader("📋 Daily Statistics & Performance")
+    
+    # Color coding for returns
+    def color_negative_red(val):
+        if isinstance(val, (int, float)) and not pd.isna(val):
+            color = '#00ff88' if val > 0 else '#ff3366' if val < 0 else 'white'
+            return f'color: {color}'
+        return ''
+    
+    styled_stats = daily_stats.tail(50).style.applymap(
+        color_negative_red, 
+        subset=['Daily_Change', 'Daily_Return_%']
+    ).format({
+        'Open': '{:.2f}',
+        'High': '{:.2f}',
+        'Low': '{:.2f}',
+        'Close': '{:.2f}',
+        'Volume': '{:,.0f}',
+        'Daily_Change': '{:.2f}',
+        'Daily_Return_%': '{:.2f}%',
+        'Points_Moved': '{:.2f}',
+        'Range_%': '{:.2f}%'
+    })
+    
+    st.dataframe(styled_stats, use_container_width=True, height=400)
+    
+    # Export options
+    col1, col2 = st.columns(2)
+    with col1:
+        csv = daily_stats.to_csv(index=True).encode('utf-8')
+        st.download_button(
+            label="📥 Download CSV",
+            data=csv,
+            file_name=f'{ticker_name}_data.csv',
+            mime='text/csv',
+        )
+    
+    with col2:
         buffer = io.BytesIO()
         with pd.ExcelWriter(buffer, engine='xlsxwriter') as writer:
-            daily_stats.to_excel(writer, sheet_name='Data')
+            daily_stats_export = prepare_df_for_excel(daily_stats)
+            daily_stats_export.to_excel(writer, sheet_name='Data')
         st.download_button(
             label="📥 Download Excel",
             data=buffer.getvalue(),
@@ -637,8 +775,9 @@ if st.session_state.data_fetched and st.session_state.df is not None:
         with col2:
             ratio_buffer = io.BytesIO()
             with pd.ExcelWriter(ratio_buffer, engine='xlsxwriter') as writer:
-                comparison_df.to_excel(writer, sheet_name='Ratio Analysis')
-                bin_analysis.to_excel(writer, sheet_name='Bin Analysis')
+                comparison_export = prepare_df_for_excel(comparison_df)
+                comparison_export.to_excel(writer, sheet_name='Ratio Analysis')
+                bin_analysis.to_excel(writer, sheet_name='Bin Analysis', index=False)
             st.download_button(
                 label="📥 Download Ratio Excel",
                 data=ratio_buffer.getvalue(),
@@ -688,6 +827,7 @@ if st.session_state.data_fetched and st.session_state.df is not None:
     
     # Calculate confluence
     signals = []
+    recent_change = 0
     
     # RSI signal
     current_rsi = df['RSI'].iloc[-1]
@@ -815,9 +955,9 @@ if st.session_state.data_fetched and st.session_state.df is not None:
     with col1:
         st.metric("Win Rate", f"{win_rate:.1f}%", f"{positive_days}/{total_days} days")
     with col2:
-        st.metric("Avg Gain", f"{avg_gain:.2f}%", "On up days")
+        st.metric("Avg Gain", f"{avg_gain:.2f}%" if not pd.isna(avg_gain) else "N/A", "On up days")
     with col3:
-        st.metric("Avg Loss", f"{avg_loss:.2f}%", "On down days")
+        st.metric("Avg Loss", f"{avg_loss:.2f}%" if not pd.isna(avg_loss) else "N/A", "On down days")
     
     # Risk-Reward ratio
     if not pd.isna(avg_loss) and avg_loss != 0:
@@ -850,128 +990,3 @@ st.markdown("""
     <p>Data provided by Yahoo Finance. Past performance does not guarantee future results.</p>
 </div>
 """, unsafe_allow_html=True)
-st.metric("High", f"{df['High'].max():.2f}")
-with col3:
-    st.metric("Low", f"{df['Low'].min():.2f}")
-with col4:
-    st.metric("RSI", f"{df['RSI'].iloc[-1]:.1f}")
-with col5:
-    st.metric("Volume", f"{df['Volume'].iloc[-1]:,.0f}")
-    
-st.markdown("---")
-    
-# Candlestick Chart
-st.subheader("📊 Price Action")
-candle_fig = create_candlestick_chart(df, ticker_name, show_line_chart, theme)
-st.plotly_chart(candle_fig, use_container_width=True)
-    
-price_insight = generate_insights(df, df['RSI'], divergences, fib_levels)
-st.info(f"**Insight:** {price_insight}")
-    
-# Price comparison table
-price_comparison = df[['Open', 'High', 'Low', 'Close', 'Volume']].tail(20).copy()
-st.dataframe(price_comparison.style.format({
-    'Open': '{:.2f}',
-    'High': '{:.2f}',
-    'Low': '{:.2f}',
-    'Close': '{:.2f}',
-    'Volume': '{:,.0f}'
-}), use_container_width=True, height=300)
-    
-# RSI Chart
-st.subheader("📈 RSI Indicator & Divergences")
-rsi_fig = create_rsi_chart(df, df['RSI'], divergences, theme)
-st.plotly_chart(rsi_fig, use_container_width=True)
-    
-if divergences:
-    div_text = f"Found {len(divergences)} divergence(s). "
-    bullish_count = sum(1 for d in divergences if d[0] == 'Bullish')
-    bearish_count = len(divergences) - bullish_count
-    prediction = "Bullish trend expected" if bullish_count > bearish_count else "Bearish trend expected"
-    st.success(f"**Prediction:** {div_text}{prediction} based on divergence analysis.")
-else:
-    st.warning("**Prediction:** No significant divergences detected. Monitor for confirmation signals.")
-    
-# Divergences table
-if divergences:
-    div_df = pd.DataFrame(divergences, columns=['Type', 'Date', 'Price'])
-    st.dataframe(div_df, use_container_width=True)
-    
-# Fibonacci Levels
-st.subheader("🎯 Fibonacci Retracement Levels")
-fib_fig = create_fibonacci_chart(df, fib_levels, ticker_name, theme)
-st.plotly_chart(fib_fig, use_container_width=True)
-    
-fib_insight = f"Key support at {fib_levels['61.8%']:.2f} and resistance at {fib_levels['23.6%']:.2f}. "
-current_price = df['Close'].iloc[-1]
-if current_price < fib_levels['50%']:
-    fib_insight += "Price below 50% level suggests bearish momentum."
-else:
-    fib_insight += "Price above 50% level indicates bullish strength."
-st.info(f"**Insight:** {fib_insight}")
-    
-# Fibonacci levels table
-fib_df = pd.DataFrame(list(fib_levels.items()), columns=['Level', 'Price'])
-fib_df['Distance from Current'] = ((fib_df['Price'] - current_price) / current_price * 100)
-st.dataframe(fib_df.style.format({
-    'Price': '{:.2f}',
-    'Distance from Current': '{:.2f}%'
-}), use_container_width=True)
-    
-# Returns Heatmap
-st.subheader("🔥 Returns Heatmap")
-heatmap_fig, pivot_data = create_returns_heatmap(df, heatmap_type, theme)
-st.plotly_chart(heatmap_fig, use_container_width=True)
-    
-# Heatmap statistics
-positive_cells = (pivot_data.values > 0).sum()
-negative_cells = (pivot_data.values < 0).sum()
-avg_return = pivot_data.values.flatten()
-avg_return = avg_return[~np.isnan(avg_return)].mean()
-st.info(f"**Insight:** {positive_cells} positive periods vs {negative_cells} negative periods. "
-        f"Average return: {avg_return:.1f}%.")
-    
-# Heatmap data table
-st.dataframe(pivot_data.style.background_gradient(cmap='RdYlGn').format('{:.1f}'),
-            use_container_width=True, height=300)
-    
-# Daily Statistics Table
-st.subheader("📋 Daily Statistics & Performance")
-    
-# Color coding for returns
-def color_negative_red(val):
-    if isinstance(val, (int, float)) and not pd.isna(val):
-        color = '#00ff88' if val > 0 else '#ff3366' if val < 0 else 'white'
-        return f'color: {color}'
-    return ''
-    
-styled_stats = daily_stats.tail(50).style.applymap(
-    color_negative_red, 
-    subset=['Daily_Change', 'Daily_Return_%']
-).format({
-    'Open': '{:.2f}',
-    'High': '{:.2f}',
-    'Low': '{:.2f}',
-    'Close': '{:.2f}',
-    'Volume': '{:,.0f}',
-    'Daily_Change': '{:.2f}',
-    'Daily_Return_%': '{:.2f}%',
-    'Points_Moved': '{:.2f}',
-    'Range_%': '{:.2f}%'
-})
-    
-st.dataframe(styled_stats, use_container_width=True, height=400)
-    
-# Export options
-col1, col2 = st.columns(2)
-with col1:
-    csv = daily_stats.to_csv(index=True).encode('utf-8')
-    st.download_button(
-        label="📥 Download CSV",
-        data=csv,
-        file_name=f'{ticker_name}_data.csv',
-        mime='text/csv',
-    )
-    
-with col2:
-    st.write("hello world")
