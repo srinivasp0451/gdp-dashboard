@@ -67,18 +67,14 @@ PREDEFINED_TICKERS = {
 def flatten_multiindex_dataframe(df):
     """Flatten multi-index dataframe from yfinance and remove timezone"""
     if isinstance(df.columns, pd.MultiIndex):
-        # For multi-ticker downloads, take the first ticker
         df.columns = df.columns.get_level_values(0)
     
-    # Reset index to make date a column, then set it back
     df = df.reset_index()
     if 'Date' in df.columns:
-        # Remove timezone if present
         if df['Date'].dtype == 'datetime64[ns, UTC]' or hasattr(df['Date'].dtype, 'tz'):
             df['Date'] = df['Date'].dt.tz_localize(None)
         df.set_index('Date', inplace=True)
     elif 'Datetime' in df.columns:
-        # Remove timezone if present
         if df['Datetime'].dtype == 'datetime64[ns, UTC]' or hasattr(df['Datetime'].dtype, 'tz'):
             df['Datetime'] = df['Datetime'].dt.tz_localize(None)
         df.set_index('Datetime', inplace=True)
@@ -90,8 +86,6 @@ def calculate_rsi(data, period=14):
     delta = data.diff()
     gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
     loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
-    
-    # Avoid division by zero
     rs = gain / loss.replace(0, np.nan)
     rsi = 100 - (100 / (1 + rs))
     return rsi.fillna(50)
@@ -99,19 +93,16 @@ def calculate_rsi(data, period=14):
 def find_divergences(prices, rsi, window=5):
     """Find RSI divergences"""
     divergences = []
-    
     if len(prices) < window * 2:
         return divergences
     
     for i in range(window, len(prices) - window):
         try:
-            # Bullish divergence: price makes lower low, RSI makes higher low
             price_min = prices.iloc[i-window:i+window].min()
             if prices.iloc[i] == price_min and prices.iloc[i] < prices.iloc[i-window]:
                 if rsi.iloc[i] > rsi.iloc[i-window]:
                     divergences.append(('Bullish', prices.index[i], prices.iloc[i]))
             
-            # Bearish divergence: price makes higher high, RSI makes lower high
             price_max = prices.iloc[i-window:i+window].max()
             if prices.iloc[i] == price_max and prices.iloc[i] > prices.iloc[i-window]:
                 if rsi.iloc[i] < rsi.iloc[i-window]:
@@ -138,271 +129,306 @@ def calculate_fibonacci_levels(df):
     }
     return levels
 
-def create_candlestick_chart(df, ticker_name, show_line=False, theme='plotly_dark'):
-    """Create interactive candlestick chart"""
-    fig = go.Figure()
+def create_synchronized_charts(df, rsi, ticker_name, ratio_df=None, ratio_ticker_name=None, show_line=False, theme='plotly_dark'):
+    """Create synchronized charts - Price, RSI, and optionally Ratio"""
+    rows = 3 if ratio_df is not None else 2
+    row_heights = [0.5, 0.25, 0.25] if ratio_df is not None else [0.7, 0.3]
     
+    fig = make_subplots(
+        rows=rows, cols=1,
+        shared_xaxes=True,
+        vertical_spacing=0.03,
+        row_heights=row_heights,
+        subplot_titles=(f'{ticker_name} Price Chart', 'RSI Indicator', 'Ratio Chart' if ratio_df is not None else '')
+    )
+    
+    # Price chart
     if show_line:
         fig.add_trace(go.Scatter(
-            x=df.index,
-            y=df['Close'],
-            mode='lines',
-            name='Close Price',
+            x=df.index, y=df['Close'],
+            mode='lines', name='Close Price',
             line=dict(color='#00d4ff', width=2)
-        ))
+        ), row=1, col=1)
     else:
         fig.add_trace(go.Candlestick(
             x=df.index,
-            open=df['Open'],
-            high=df['High'],
-            low=df['Low'],
-            close=df['Close'],
+            open=df['Open'], high=df['High'],
+            low=df['Low'], close=df['Close'],
             name=ticker_name,
             increasing_line_color='#00ff88',
             decreasing_line_color='#ff3366'
-        ))
+        ), row=1, col=1)
+    
+    # RSI chart
+    fig.add_trace(go.Scatter(
+        x=df.index, y=rsi,
+        mode='lines', name='RSI',
+        line=dict(color='#ffa500', width=2)
+    ), row=2, col=1)
+    
+    fig.add_hline(y=70, line_dash="dash", line_color="red", row=2, col=1)
+    fig.add_hline(y=30, line_dash="dash", line_color="green", row=2, col=1)
+    fig.add_hline(y=50, line_dash="dot", line_color="gray", row=2, col=1)
+    
+    # Ratio chart if provided
+    if ratio_df is not None:
+        ratio = df['Close'] / ratio_df['Close']
+        fig.add_trace(go.Scatter(
+            x=ratio.index, y=ratio,
+            mode='lines', name=f'{ticker_name}/{ratio_ticker_name}',
+            line=dict(color='#00ffff', width=2)
+        ), row=3, col=1)
+        
+        fig.update_yaxes(title_text="Ratio", row=3, col=1)
+    
+    fig.update_xaxes(title_text="Date", row=rows, col=1)
+    fig.update_yaxes(title_text="Price", row=1, col=1)
+    fig.update_yaxes(title_text="RSI", row=2, col=1)
     
     fig.update_layout(
-        title=f'{ticker_name} Price Chart',
-        yaxis_title='Price',
-        xaxis_title='Date',
         template=theme,
-        height=600,
+        height=900,
         hovermode='x unified',
+        showlegend=True,
         xaxis_rangeslider_visible=False
     )
     
     return fig
 
-def create_rsi_chart(df, rsi, divergences, theme='plotly_dark'):
-    """Create RSI chart with divergences"""
-    fig = go.Figure()
+def validate_predictions(df, rsi, divergences, fib_levels, lookback=10):
+    """Validate prediction accuracy based on historical signals"""
+    validation_results = {
+        'rsi_overbought': {'correct': 0, 'total': 0},
+        'rsi_oversold': {'correct': 0, 'total': 0},
+        'bullish_div': {'correct': 0, 'total': 0},
+        'bearish_div': {'correct': 0, 'total': 0},
+        'fib_support': {'correct': 0, 'total': 0},
+        'fib_resistance': {'correct': 0, 'total': 0}
+    }
     
-    fig.add_trace(go.Scatter(
-        x=df.index,
-        y=rsi,
-        mode='lines',
-        name='RSI',
-        line=dict(color='#ffa500', width=2)
-    ))
+    # Validate RSI signals
+    for i in range(len(df) - lookback):
+        if i < lookback:
+            continue
+            
+        current_rsi = rsi.iloc[i]
+        future_price = df['Close'].iloc[i + lookback]
+        current_price = df['Close'].iloc[i]
+        
+        # RSI Overbought
+        if current_rsi > 70:
+            validation_results['rsi_overbought']['total'] += 1
+            if future_price < current_price:
+                validation_results['rsi_overbought']['correct'] += 1
+        
+        # RSI Oversold
+        if current_rsi < 30:
+            validation_results['rsi_oversold']['total'] += 1
+            if future_price > current_price:
+                validation_results['rsi_oversold']['correct'] += 1
     
-    # Add overbought/oversold lines
-    fig.add_hline(y=70, line_dash="dash", line_color="red", annotation_text="Overbought (70)")
-    fig.add_hline(y=30, line_dash="dash", line_color="green", annotation_text="Oversold (30)")
-    fig.add_hline(y=50, line_dash="dot", line_color="gray", annotation_text="Neutral (50)")
-    
-    # Add divergence markers
+    # Validate divergences
     for div_type, date, price in divergences:
-        color = 'green' if div_type == 'Bullish' else 'red'
         try:
-            rsi_value = rsi.loc[date]
-            fig.add_trace(go.Scatter(
-                x=[date],
-                y=[rsi_value],
-                mode='markers',
-                name=f'{div_type} Divergence',
-                marker=dict(size=15, color=color, symbol='star'),
-                showlegend=True
-            ))
+            idx = df.index.get_loc(date)
+            if idx + lookback < len(df):
+                future_price = df['Close'].iloc[idx + lookback]
+                
+                if div_type == 'Bullish':
+                    validation_results['bullish_div']['total'] += 1
+                    if future_price > price:
+                        validation_results['bullish_div']['correct'] += 1
+                else:
+                    validation_results['bearish_div']['total'] += 1
+                    if future_price < price:
+                        validation_results['bearish_div']['correct'] += 1
         except:
             continue
     
-    fig.update_layout(
-        title='RSI Indicator with Divergences',
-        yaxis_title='RSI Value',
-        xaxis_title='Date',
-        template=theme,
-        height=400,
-        hovermode='x unified'
-    )
+    # Validate Fibonacci levels
+    current_price = df['Close'].iloc[-1]
+    fib_50 = fib_levels['50%']
     
-    return fig
-
-def create_fibonacci_chart(df, fib_levels, ticker_name, theme='plotly_dark'):
-    """Create price chart with Fibonacci levels"""
-    fig = go.Figure()
-    
-    fig.add_trace(go.Candlestick(
-        x=df.index,
-        open=df['Open'],
-        high=df['High'],
-        low=df['Low'],
-        close=df['Close'],
-        name=ticker_name,
-        increasing_line_color='#00ff88',
-        decreasing_line_color='#ff3366'
-    ))
-    
-    colors = ['#ff0000', '#ff8800', '#ffff00', '#00ff00', '#00ffff', '#0088ff', '#0000ff']
-    for (level, price), color in zip(fib_levels.items(), colors):
-        fig.add_hline(
-            y=price,
-            line_dash="dash",
-            line_color=color,
-            annotation_text=f"Fib {level}: {price:.2f}",
-            annotation_position="right"
-        )
-    
-    fig.update_layout(
-        title=f'{ticker_name} with Fibonacci Retracement Levels',
-        yaxis_title='Price',
-        xaxis_title='Date',
-        template=theme,
-        height=600,
-        hovermode='x unified',
-        xaxis_rangeslider_visible=False
-    )
-    
-    return fig
-
-def create_returns_heatmap(df, heatmap_type='monthly_yearly', theme='plotly_dark'):
-    """Create returns heatmap based on type"""
-    df_copy = df.copy()
-    df_copy['Returns'] = df_copy['Close'].pct_change() * 100
-    
-    if heatmap_type == 'monthly_yearly':
-        df_copy['Year'] = df_copy.index.year
-        df_copy['Month'] = df_copy.index.month
-        pivot_table = df_copy.pivot_table(values='Returns', index='Month', columns='Year', aggfunc='sum')
-        month_names = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
-        pivot_table.index = [month_names[i-1] if i <= 12 else str(i) for i in pivot_table.index]
-        title = 'Monthly Returns by Year (%)'
-        x_label, y_label = 'Year', 'Month'
+    for i in range(len(df) - lookback):
+        if i < lookback:
+            continue
         
-    elif heatmap_type == 'daily_monthly':
-        df_copy['Month'] = df_copy.index.to_period('M').astype(str)
-        df_copy['Day'] = df_copy.index.day
-        pivot_table = df_copy.pivot_table(values='Returns', index='Day', columns='Month', aggfunc='sum')
-        title = 'Daily Returns by Month (%)'
-        x_label, y_label = 'Month', 'Day'
+        price_at_i = df['Close'].iloc[i]
+        future_price = df['Close'].iloc[i + lookback]
         
-    elif heatmap_type == 'quarterly_yearly':
-        df_copy['Year'] = df_copy.index.year
-        df_copy['Quarter'] = df_copy.index.quarter
-        pivot_table = df_copy.pivot_table(values='Returns', index='Quarter', columns='Year', aggfunc='sum')
-        pivot_table.index = [f'Q{i}' for i in pivot_table.index]
-        title = 'Quarterly Returns by Year (%)'
-        x_label, y_label = 'Year', 'Quarter'
+        # Below Fib 50% (support test)
+        if price_at_i < fib_50 * 1.02 and price_at_i > fib_50 * 0.98:
+            validation_results['fib_support']['total'] += 1
+            if future_price > price_at_i:
+                validation_results['fib_support']['correct'] += 1
         
-    elif heatmap_type == 'weekly_yearly':
-        df_copy['Year'] = df_copy.index.year
-        df_copy['Week'] = df_copy.index.isocalendar().week
-        pivot_table = df_copy.pivot_table(values='Returns', index='Week', columns='Year', aggfunc='sum')
-        title = 'Weekly Returns by Year (%)'
-        x_label, y_label = 'Year', 'Week'
+        # Above Fib 50% (resistance test)
+        fib_23 = fib_levels['23.6%']
+        if price_at_i < fib_23 * 1.02 and price_at_i > fib_23 * 0.98:
+            validation_results['fib_resistance']['total'] += 1
+            if future_price < price_at_i:
+                validation_results['fib_resistance']['correct'] += 1
     
-    # Calculate proper aspect ratio for square cells
-    n_rows, n_cols = pivot_table.shape
-    cell_size = 40
-    height = max(400, n_rows * cell_size)
-    
-    fig = go.Figure(data=go.Heatmap(
-        z=pivot_table.values,
-        x=pivot_table.columns,
-        y=pivot_table.index,
-        colorscale='RdYlGn',
-        text=np.round(pivot_table.values, 1),
-        texttemplate='%{text}%',
-        textfont={"size": 10},
-        colorbar=dict(title="Returns %"),
-        xgap=3,
-        ygap=3
-    ))
-    
-    fig.update_layout(
-        title=title,
-        xaxis_title=x_label,
-        yaxis_title=y_label,
-        template=theme,
-        height=height,
-        xaxis=dict(side='bottom'),
-        yaxis=dict(autorange='reversed')
-    )
-    
-    return fig, pivot_table
+    return validation_results
 
-def analyze_ratio(df1, df2, ticker1_name, ticker2_name, bins=20, theme='plotly_dark'):
-    """Analyze ratio between two tickers"""
-    # Align dataframes
-    combined = pd.DataFrame({
-        'Price1': df1['Close'],
-        'Price2': df2['Close']
-    }).dropna()
+def analyze_ratio_ranges(comparison_df, bins=20):
+    """Analyze ratio ranges and categorize returns as High/Medium/Low"""
+    ratio_data = comparison_df.copy()
+    ratio_data['Future_Return'] = ratio_data['Ratio'].shift(-5).pct_change(5) * 100
+    ratio_data = ratio_data.dropna()
     
-    combined['Ratio'] = combined['Price1'] / combined['Price2']
-    combined['Change'] = combined['Ratio'].diff()
-    combined['Direction'] = combined['Change'].apply(lambda x: 'Up' if x > 0 else 'Down' if x < 0 else 'Neutral')
+    if len(ratio_data) == 0:
+        return None
     
     # Create bins
-    combined['Ratio_Bin'] = pd.cut(combined['Ratio'], bins=bins)
+    ratio_data['Ratio_Bin'] = pd.cut(ratio_data['Ratio'], bins=bins)
     
-    # Analyze each bin
-    bin_analysis = combined.groupby('Ratio_Bin', observed=True).agg({
-        'Direction': lambda x: (x == 'Up').sum() / len(x) * 100 if len(x) > 0 else 0,
-        'Ratio': ['count', 'mean'],
-        'Price1': 'mean',
-        'Price2': 'mean'
-    })
+    # Analyze returns in each bin
+    bin_stats = ratio_data.groupby('Ratio_Bin', observed=True).agg({
+        'Future_Return': ['mean', 'std', 'count']
+    }).round(2)
     
-    bin_analysis.columns = ['Up_Percentage', 'Count', 'Avg_Ratio', 'Avg_Price1', 'Avg_Price2']
-    bin_analysis['Down_Percentage'] = 100 - bin_analysis['Up_Percentage']
-    bin_analysis['Bin_Range'] = bin_analysis.index.astype(str)
-    bin_analysis = bin_analysis.reset_index(drop=True)
+    bin_stats.columns = ['Avg_Return', 'Std_Dev', 'Count']
+    bin_stats = bin_stats.reset_index()
+    bin_stats['Ratio_Range'] = bin_stats['Ratio_Bin'].astype(str)
     
-    # Create ratio chart
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(
-        x=combined.index,
-        y=combined['Ratio'],
-        mode='lines',
-        name='Ratio',
-        line=dict(color='#00d4ff', width=2),
-        hovertemplate='Date: %{x}<br>Ratio: %{y:.4f}<extra></extra>'
-    ))
+    # Categorize into High/Medium/Low
+    returns = bin_stats['Avg_Return'].values
+    if len(returns) > 0:
+        high_threshold = np.percentile(returns[~np.isnan(returns)], 75)
+        low_threshold = np.percentile(returns[~np.isnan(returns)], 25)
+        
+        def categorize(val):
+            if pd.isna(val):
+                return 'Unknown'
+            if val >= high_threshold:
+                return 'High Return'
+            elif val <= low_threshold:
+                return 'Low Return'
+            else:
+                return 'Medium Return'
+        
+        bin_stats['Category'] = bin_stats['Avg_Return'].apply(categorize)
+    else:
+        bin_stats['Category'] = 'Unknown'
     
-    fig.update_layout(
-        title=f'{ticker1_name} / {ticker2_name} Ratio Chart',
-        yaxis_title='Ratio',
-        xaxis_title='Date',
-        template=theme,
-        height=500,
-        hovermode='x unified'
-    )
-    
-    # Comparison table
-    comparison_df = combined[['Price1', 'Price2', 'Ratio']].copy()
-    comparison_df.columns = [f'{ticker1_name} Close', f'{ticker2_name} Close', 'Ratio']
-    comparison_df[f'{ticker1_name} Change %'] = comparison_df[f'{ticker1_name} Close'].pct_change() * 100
-    comparison_df[f'{ticker2_name} Change %'] = comparison_df[f'{ticker2_name} Close'].pct_change() * 100
-    comparison_df['Ratio Change %'] = comparison_df['Ratio'].pct_change() * 100
-    
-    return fig, bin_analysis, comparison_df
+    return bin_stats
 
-def generate_insights(df, rsi, divergences, fib_levels):
-    """Generate human-readable insights"""
-    insights = []
+def create_summary_insights(df, rsi, divergences, fib_levels, validation_results, ratio_stats=None):
+    """Create comprehensive summary of all insights"""
+    summary = {
+        'price_analysis': {},
+        'rsi_analysis': {},
+        'divergence_analysis': {},
+        'fibonacci_analysis': {},
+        'prediction_accuracy': {},
+        'ratio_analysis': {}
+    }
     
-    # Price trend
-    if len(df) >= 5:
-        recent_change = ((df['Close'].iloc[-1] - df['Close'].iloc[-5]) / df['Close'].iloc[-5]) * 100
-        trend = "uptrend" if recent_change > 0 else "downtrend"
-        insights.append(f"Price is in {trend} with {abs(recent_change):.2f}% change over last 5 periods.")
+    # Price Analysis
+    current_price = df['Close'].iloc[-1]
+    price_range = df['Close'].max() - df['Close'].min()
+    price_position = (current_price - df['Close'].min()) / price_range * 100
     
-    # RSI analysis
+    if price_position > 75:
+        price_level = "High"
+    elif price_position > 25:
+        price_level = "Medium"
+    else:
+        price_level = "Low"
+    
+    summary['price_analysis'] = {
+        'current': current_price,
+        'range': price_range,
+        'position': price_position,
+        'level': price_level,
+        'interpretation': f"Price is in the {price_level.lower()} range ({price_position:.1f}% of historical range)"
+    }
+    
+    # RSI Analysis
     current_rsi = rsi.iloc[-1]
     if current_rsi > 70:
-        insights.append(f"RSI at {current_rsi:.1f} indicates overbought conditions - potential reversal.")
-    elif current_rsi < 30:
-        insights.append(f"RSI at {current_rsi:.1f} shows oversold conditions - potential bounce expected.")
+        rsi_level = "High (Overbought)"
+    elif current_rsi > 50:
+        rsi_level = "Medium-High"
+    elif current_rsi > 30:
+        rsi_level = "Medium"
     else:
-        insights.append(f"RSI at {current_rsi:.1f} is neutral - no extreme conditions.")
+        rsi_level = "Low (Oversold)"
     
-    # Divergences
-    if divergences:
-        last_div = divergences[-1]
-        insights.append(f"Latest {last_div[0]} divergence detected - {last_div[0].lower()} signal confirmed.")
+    summary['rsi_analysis'] = {
+        'current': current_rsi,
+        'level': rsi_level,
+        'interpretation': f"RSI is {rsi_level} suggesting " + 
+                         ("potential reversal down" if current_rsi > 70 else
+                          "potential bounce up" if current_rsi < 30 else
+                          "neutral momentum")
+    }
     
-    return " ".join(insights)
+    # Divergence Analysis
+    bullish_divs = sum(1 for d in divergences if d[0] == 'Bullish')
+    bearish_divs = sum(1 for d in divergences if d[0] == 'Bearish')
+    
+    summary['divergence_analysis'] = {
+        'bullish_count': bullish_divs,
+        'bearish_count': bearish_divs,
+        'interpretation': f"Found {bullish_divs} bullish and {bearish_divs} bearish divergences. " +
+                         ("Bullish bias" if bullish_divs > bearish_divs else
+                          "Bearish bias" if bearish_divs > bullish_divs else
+                          "Neutral")
+    }
+    
+    # Fibonacci Analysis
+    fib_50 = fib_levels['50%']
+    if current_price > fib_levels['23.6%']:
+        fib_level = "High (Above 23.6%)"
+    elif current_price > fib_50:
+        fib_level = "Medium-High (Above 50%)"
+    elif current_price > fib_levels['61.8%']:
+        fib_level = "Medium-Low (Above 61.8%)"
+    else:
+        fib_level = "Low (Below 61.8%)"
+    
+    summary['fibonacci_analysis'] = {
+        'level': fib_level,
+        'support': fib_levels['61.8%'],
+        'resistance': fib_levels['23.6%'],
+        'interpretation': f"Price is {fib_level}, key support at {fib_levels['61.8%']:.2f}"
+    }
+    
+    # Prediction Accuracy
+    for key, val in validation_results.items():
+        if val['total'] > 0:
+            accuracy = (val['correct'] / val['total']) * 100
+            summary['prediction_accuracy'][key] = {
+                'accuracy': accuracy,
+                'correct': val['correct'],
+                'total': val['total']
+            }
+    
+    # Ratio Analysis
+    if ratio_stats is not None:
+        high_return_bins = ratio_stats[ratio_stats['Category'] == 'High Return']
+        medium_return_bins = ratio_stats[ratio_stats['Category'] == 'Medium Return']
+        low_return_bins = ratio_stats[ratio_stats['Category'] == 'Low Return']
+        
+        summary['ratio_analysis'] = {
+            'high_return_ranges': high_return_bins['Ratio_Range'].tolist(),
+            'medium_return_ranges': medium_return_bins['Ratio_Range'].tolist(),
+            'low_return_ranges': low_return_bins['Ratio_Range'].tolist(),
+            'high_avg': high_return_bins['Avg_Return'].mean() if len(high_return_bins) > 0 else 0,
+            'medium_avg': medium_return_bins['Avg_Return'].mean() if len(medium_return_bins) > 0 else 0,
+            'low_avg': low_return_bins['Avg_Return'].mean() if len(low_return_bins) > 0 else 0
+        }
+    
+    return summary
+
+def prepare_df_for_excel(df):
+    """Prepare dataframe for Excel export by removing timezone from index"""
+    df_copy = df.copy()
+    if hasattr(df_copy.index, 'tz') and df_copy.index.tz is not None:
+        df_copy.index = df_copy.index.tz_localize(None)
+    return df_copy
 
 def calculate_daily_stats(df):
     """Calculate daily statistics"""
@@ -415,12 +441,24 @@ def calculate_daily_stats(df):
     return stats_df[['Open', 'High', 'Low', 'Close', 'Volume', 
                      'Daily_Change', 'Daily_Return_%', 'Points_Moved', 'Range_%']].dropna()
 
-def prepare_df_for_excel(df):
-    """Prepare dataframe for Excel export by removing timezone from index"""
-    df_copy = df.copy()
-    if hasattr(df_copy.index, 'tz') and df_copy.index.tz is not None:
-        df_copy.index = df_copy.index.tz_localize(None)
-    return df_copy
+def analyze_ratio(df1, df2, ticker1_name, ticker2_name, bins=20):
+    """Analyze ratio between two tickers"""
+    combined = pd.DataFrame({
+        'Price1': df1['Close'],
+        'Price2': df2['Close']
+    }).dropna()
+    
+    combined['Ratio'] = combined['Price1'] / combined['Price2']
+    combined['Change'] = combined['Ratio'].diff()
+    combined['Direction'] = combined['Change'].apply(lambda x: 'Up' if x > 0 else 'Down' if x < 0 else 'Neutral')
+    
+    comparison_df = combined[['Price1', 'Price2', 'Ratio']].copy()
+    comparison_df.columns = [f'{ticker1_name} Close', f'{ticker2_name} Close', 'Ratio']
+    comparison_df[f'{ticker1_name} Change %'] = comparison_df[f'{ticker1_name} Close'].pct_change() * 100
+    comparison_df[f'{ticker2_name} Change %'] = comparison_df[f'{ticker2_name} Close'].pct_change() * 100
+    comparison_df['Ratio Change %'] = comparison_df['Ratio'].pct_change() * 100
+    
+    return comparison_df
 
 # Sidebar
 st.sidebar.title("🚀 Algo Trading Dashboard")
@@ -431,23 +469,10 @@ st.sidebar.subheader("🎨 Theme")
 theme_choice = st.sidebar.radio("Select Theme", ["Dark", "Light"], horizontal=True)
 st.session_state.theme = 'plotly_dark' if theme_choice == 'Dark' else 'plotly_white'
 
-# Apply custom CSS based on theme
 if theme_choice == 'Dark':
-    st.markdown("""
-    <style>
-        .stApp {
-            background-color: #0e1117;
-        }
-    </style>
-    """, unsafe_allow_html=True)
+    st.markdown('<style>.stApp {background-color: #0e1117;}</style>', unsafe_allow_html=True)
 else:
-    st.markdown("""
-    <style>
-        .stApp {
-            background-color: #ffffff;
-        }
-    </style>
-    """, unsafe_allow_html=True)
+    st.markdown('<style>.stApp {background-color: #ffffff;}</style>', unsafe_allow_html=True)
 
 st.sidebar.markdown("---")
 
@@ -465,33 +490,14 @@ else:
 
 # Timeframe and Period
 st.sidebar.subheader("⏰ Time Settings")
-interval = st.sidebar.selectbox(
-    "Interval",
-    ["1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h", "1d", "5d", "1wk", "1mo", "3mo"]
-)
-
-period = st.sidebar.selectbox(
-    "Period",
-    ["1d", "5d", "1mo", "3mo", "6mo", "1y", "2y", "5y", "10y", "max"]
-)
+interval = st.sidebar.selectbox("Interval", ["1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h", "1d", "5d", "1wk", "1mo", "3mo"])
+period = st.sidebar.selectbox("Period", ["1d", "5d", "1mo", "3mo", "6mo", "1y", "2y", "5y", "10y", "max"])
 
 # Chart options
 st.sidebar.subheader("📈 Chart Options")
 show_line_chart = st.sidebar.checkbox("Show Line Chart", value=False)
 rsi_period = st.sidebar.slider("RSI Period", 5, 30, 14)
-
-# Heatmap options
-st.sidebar.subheader("🔥 Heatmap Type")
-heatmap_type = st.sidebar.selectbox(
-    "Select Heatmap",
-    ["monthly_yearly", "daily_monthly", "quarterly_yearly", "weekly_yearly"],
-    format_func=lambda x: {
-        'monthly_yearly': 'Month vs Year',
-        'daily_monthly': 'Day vs Month',
-        'quarterly_yearly': 'Quarter vs Year',
-        'weekly_yearly': 'Week vs Year'
-    }[x]
-)
+lookback_period = st.sidebar.slider("Prediction Validation Lookback", 5, 30, 10)
 
 # Ratio Analysis
 st.sidebar.subheader("📊 Ratio Analysis")
@@ -517,20 +523,16 @@ st.markdown("---")
 if fetch_button:
     with st.spinner("Fetching data from yfinance..."):
         try:
-            # Fetch main ticker data
             data = yf.download(ticker, period=period, interval=interval, progress=False)
             
             if data.empty:
                 st.error(f"No data found for ticker: {ticker}")
             else:
-                # Flatten multi-index dataframe
                 data = flatten_multiindex_dataframe(data)
-                
                 st.session_state.df = data
                 st.session_state.ticker_symbol = ticker
                 st.session_state.data_fetched = True
                 
-                # Fetch ratio ticker if enabled
                 if enable_ratio:
                     ratio_data = yf.download(ratio_ticker, period=period, interval=interval, progress=False)
                     ratio_data = flatten_multiindex_dataframe(ratio_data)
@@ -553,6 +555,19 @@ if st.session_state.data_fetched and st.session_state.df is not None:
     fib_levels = calculate_fibonacci_levels(df)
     daily_stats = calculate_daily_stats(df)
     
+    # Validate predictions
+    validation_results = validate_predictions(df, df['RSI'], divergences, fib_levels, lookback_period)
+    
+    # Ratio analysis if enabled
+    ratio_stats = None
+    comparison_df = None
+    if enable_ratio and 'ratio_df' in st.session_state:
+        comparison_df = analyze_ratio(df, st.session_state.ratio_df, ticker_name, st.session_state.ratio_ticker, ratio_bins)
+        ratio_stats = analyze_ratio_ranges(comparison_df, ratio_bins)
+    
+    # Generate comprehensive summary
+    summary = create_summary_insights(df, df['RSI'], divergences, fib_levels, validation_results, ratio_stats)
+    
     # Key Metrics
     col1, col2, col3, col4, col5 = st.columns(5)
     with col1:
@@ -569,85 +584,233 @@ if st.session_state.data_fetched and st.session_state.df is not None:
     
     st.markdown("---")
     
-    # Candlestick Chart
-    st.subheader("📊 Price Action")
-    candle_fig = create_candlestick_chart(df, ticker_name, show_line_chart, theme)
-    st.plotly_chart(candle_fig, use_container_width=True)
+    # Synchronized Charts
+    st.subheader("📊 Synchronized Charts (Price + RSI + Ratio)")
+    sync_fig = create_synchronized_charts(
+        df, df['RSI'], ticker_name,
+        st.session_state.ratio_df if enable_ratio and 'ratio_df' in st.session_state else None,
+        st.session_state.ratio_ticker if enable_ratio and 'ratio_df' in st.session_state else None,
+        show_line_chart, theme
+    )
+    st.plotly_chart(sync_fig, use_container_width=True)
     
-    price_insight = generate_insights(df, df['RSI'], divergences, fib_levels)
-    st.info(f"**Insight:** {price_insight}")
+    st.info(f"**💡 Tip:** Hover over any chart to see synchronized values across all charts!")
     
-    # Price comparison table
-    price_comparison = df[['Open', 'High', 'Low', 'Close', 'Volume']].tail(20).copy()
-    st.dataframe(price_comparison.style.format({
-        'Open': '{:.2f}',
-        'High': '{:.2f}',
-        'Low': '{:.2f}',
-        'Close': '{:.2f}',
-        'Volume': '{:,.0f}'
-    }), use_container_width=True, height=300)
+    st.markdown("---")
     
-    # RSI Chart
-    st.subheader("📈 RSI Indicator & Divergences")
-    rsi_fig = create_rsi_chart(df, df['RSI'], divergences, theme)
-    st.plotly_chart(rsi_fig, use_container_width=True)
+    # COMPREHENSIVE SUMMARY
+    st.header("📊 COMPREHENSIVE INSIGHTS SUMMARY")
     
-    if divergences:
-        div_text = f"Found {len(divergences)} divergence(s). "
-        bullish_count = sum(1 for d in divergences if d[0] == 'Bullish')
-        bearish_count = len(divergences) - bullish_count
-        prediction = "Bullish trend expected" if bullish_count > bearish_count else "Bearish trend expected"
-        st.success(f"**Prediction:** {div_text}{prediction} based on divergence analysis.")
+    # Price Analysis Summary
+    st.subheader("💰 Price Analysis")
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.metric("Price Level", summary['price_analysis']['level'])
+    with col2:
+        st.metric("Position in Range", f"{summary['price_analysis']['position']:.1f}%")
+    with col3:
+        st.metric("Range", f"{summary['price_analysis']['range']:.2f}")
+    st.info(summary['price_analysis']['interpretation'])
+    
+    # RSI Analysis Summary
+    st.subheader("📈 RSI Analysis")
+    col1, col2 = st.columns(2)
+    with col1:
+        st.metric("RSI Level", summary['rsi_analysis']['level'])
+    with col2:
+        st.metric("RSI Value", f"{summary['rsi_analysis']['current']:.1f}")
+    st.info(summary['rsi_analysis']['interpretation'])
+    
+    # Divergence Summary
+    st.subheader("🔄 Divergence Analysis")
+    col1, col2 = st.columns(2)
+    with col1:
+        st.metric("Bullish Divergences", summary['divergence_analysis']['bullish_count'])
+    with col2:
+        st.metric("Bearish Divergences", summary['divergence_analysis']['bearish_count'])
+    st.info(summary['divergence_analysis']['interpretation'])
+    
+    # Fibonacci Summary
+    st.subheader("🎯 Fibonacci Analysis")
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.metric("Level", summary['fibonacci_analysis']['level'])
+    with col2:
+        st.metric("Support", f"{summary['fibonacci_analysis']['support']:.2f}")
+    with col3:
+        st.metric("Resistance", f"{summary['fibonacci_analysis']['resistance']:.2f}")
+    st.info(summary['fibonacci_analysis']['interpretation'])
+    
+    # PREDICTION ACCURACY
+    st.markdown("---")
+    st.header("🎯 PREDICTION ACCURACY VALIDATION")
+    st.markdown(f"**Analysis Period:** Last {lookback_period} periods for each signal")
+    
+    accuracy_data = []
+    for key, val in summary['prediction_accuracy'].items():
+        signal_name = key.replace('_', ' ').title()
+        accuracy_data.append({
+            'Signal Type': signal_name,
+            'Accuracy %': f"{val['accuracy']:.1f}%",
+            'Correct Predictions': val['correct'],
+            'Total Signals': val['total'],
+            'Status': '✅ High' if val['accuracy'] >= 70 else '⚠️ Medium' if val['accuracy'] >= 50 else '❌ Low'
+        })
+    
+    if accuracy_data:
+        accuracy_df = pd.DataFrame(accuracy_data)
+        st.dataframe(accuracy_df, use_container_width=True, hide_index=True)
+        
+        # Overall accuracy
+        total_correct = sum(v['correct'] for v in summary['prediction_accuracy'].values())
+        total_signals = sum(v['total'] for v in summary['prediction_accuracy'].values())
+        overall_accuracy = (total_correct / total_signals * 100) if total_signals > 0 else 0
+        
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            st.metric("Overall Accuracy", f"{overall_accuracy:.1f}%")
+        with col2:
+            st.metric("Total Correct", total_correct)
+        with col3:
+            st.metric("Total Signals", total_signals)
+        
+        if overall_accuracy >= 70:
+            st.success(f"✅ **HIGH CONFIDENCE**: Historical predictions have {overall_accuracy:.1f}% accuracy. Signals are reliable!")
+        elif overall_accuracy >= 50:
+            st.warning(f"⚠️ **MEDIUM CONFIDENCE**: Historical predictions have {overall_accuracy:.1f}% accuracy. Use with caution.")
+        else:
+            st.error(f"❌ **LOW CONFIDENCE**: Historical predictions have {overall_accuracy:.1f}% accuracy. Signals may be unreliable.")
     else:
-        st.warning("**Prediction:** No significant divergences detected. Monitor for confirmation signals.")
+        st.info("Not enough historical data to validate predictions.")
     
-    # Divergences table
-    if divergences:
-        div_df = pd.DataFrame(divergences, columns=['Type', 'Date', 'Price'])
-        st.dataframe(div_df, use_container_width=True)
+    # RATIO ANALYSIS SUMMARY
+    if ratio_stats is not None and enable_ratio:
+        st.markdown("---")
+        st.header("⚖️ RATIO ANALYSIS SUMMARY")
+        
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            st.markdown("### 🟢 HIGH RETURN RANGES")
+            st.metric("Avg Return", f"{summary['ratio_analysis']['high_avg']:.2f}%")
+            if summary['ratio_analysis']['high_return_ranges']:
+                for rng in summary['ratio_analysis']['high_return_ranges'][:3]:
+                    st.text(f"📍 {rng}")
+            else:
+                st.text("No high return ranges")
+        
+        with col2:
+            st.markdown("### 🟡 MEDIUM RETURN RANGES")
+            st.metric("Avg Return", f"{summary['ratio_analysis']['medium_avg']:.2f}%")
+            if summary['ratio_analysis']['medium_return_ranges']:
+                for rng in summary['ratio_analysis']['medium_return_ranges'][:3]:
+                    st.text(f"📍 {rng}")
+            else:
+                st.text("No medium return ranges")
+        
+        with col3:
+            st.markdown("### 🔴 LOW RETURN RANGES")
+            st.metric("Avg Return", f"{summary['ratio_analysis']['low_avg']:.2f}%")
+            if summary['ratio_analysis']['low_return_ranges']:
+                for rng in summary['ratio_analysis']['low_return_ranges'][:3]:
+                    st.text(f"📍 {rng}")
+            else:
+                st.text("No low return ranges")
+        
+        # Current ratio position
+        current_ratio = comparison_df['Ratio'].iloc[-1]
+        st.markdown("### 📊 Current Ratio Position")
+        
+        # Find which category current ratio falls into
+        current_category = "Unknown"
+        if ratio_stats is not None:
+            for _, row in ratio_stats.iterrows():
+                try:
+                    range_str = row['Ratio_Range']
+                    if '(' in range_str and ')' in range_str:
+                        range_clean = range_str.strip('()[]')
+                        parts = range_clean.split(',')
+                        if len(parts) == 2:
+                            low = float(parts[0].strip())
+                            high = float(parts[1].strip())
+                            if low <= current_ratio <= high:
+                                current_category = row['Category']
+                                break
+                except:
+                    continue
+        
+        if current_category == "High Return":
+            st.success(f"✅ Current ratio {current_ratio:.4f} is in HIGH RETURN range. Historically favorable for gains!")
+        elif current_category == "Medium Return":
+            st.info(f"⚠️ Current ratio {current_ratio:.4f} is in MEDIUM RETURN range. Moderate opportunity.")
+        elif current_category == "Low Return":
+            st.warning(f"❌ Current ratio {current_ratio:.4f} is in LOW RETURN range. Historically unfavorable.")
+        else:
+            st.info(f"Current ratio: {current_ratio:.4f}")
+        
+        # Detailed ratio table
+        st.subheader("📋 Detailed Ratio Range Analysis")
+        if ratio_stats is not None:
+            ratio_display = ratio_stats[['Ratio_Range', 'Avg_Return', 'Std_Dev', 'Count', 'Category']].copy()
+            
+            def color_category(val):
+                if val == 'High Return':
+                    return 'background-color: #00ff8844; color: #00ff88'
+                elif val == 'Low Return':
+                    return 'background-color: #ff336644; color: #ff3366'
+                elif val == 'Medium Return':
+                    return 'background-color: #ffaa0044; color: #ffaa00'
+                return ''
+            
+            styled_ratio = ratio_display.style.applymap(color_category, subset=['Category']).format({
+                'Avg_Return': '{:.2f}%',
+                'Std_Dev': '{:.2f}',
+                'Count': '{:.0f}'
+            })
+            
+            st.dataframe(styled_ratio, use_container_width=True, height=400)
     
-    # Fibonacci Levels
+    st.markdown("---")
+    
+    # Fibonacci Levels Table
     st.subheader("🎯 Fibonacci Retracement Levels")
-    fib_fig = create_fibonacci_chart(df, fib_levels, ticker_name, theme)
-    st.plotly_chart(fib_fig, use_container_width=True)
-    
-    fib_insight = f"Key support at {fib_levels['61.8%']:.2f} and resistance at {fib_levels['23.6%']:.2f}. "
-    current_price = df['Close'].iloc[-1]
-    if current_price < fib_levels['50%']:
-        fib_insight += "Price below 50% level suggests bearish momentum."
-    else:
-        fib_insight += "Price above 50% level indicates bullish strength."
-    st.info(f"**Insight:** {fib_insight}")
-    
-    # Fibonacci levels table
     fib_df = pd.DataFrame(list(fib_levels.items()), columns=['Level', 'Price'])
+    current_price = df['Close'].iloc[-1]
     fib_df['Distance from Current'] = ((fib_df['Price'] - current_price) / current_price * 100)
+    fib_df['Status'] = fib_df['Distance from Current'].apply(
+        lambda x: 'Support ⬇️' if x < -1 else 'Resistance ⬆️' if x > 1 else 'Current Level 🎯'
+    )
     st.dataframe(fib_df.style.format({
         'Price': '{:.2f}',
         'Distance from Current': '{:.2f}%'
     }), use_container_width=True)
     
-    # Returns Heatmap
-    st.subheader("🔥 Returns Heatmap")
-    heatmap_fig, pivot_data = create_returns_heatmap(df, heatmap_type, theme)
-    st.plotly_chart(heatmap_fig, use_container_width=True)
-    
-    # Heatmap statistics
-    positive_cells = (pivot_data.values > 0).sum()
-    negative_cells = (pivot_data.values < 0).sum()
-    avg_return = pivot_data.values.flatten()
-    avg_return = avg_return[~np.isnan(avg_return)].mean()
-    st.info(f"**Insight:** {positive_cells} positive periods vs {negative_cells} negative periods. "
-            f"Average return: {avg_return:.1f}%.")
-    
-    # Heatmap data table
-    st.dataframe(pivot_data.style.background_gradient(cmap='RdYlGn').format('{:.1f}'),
-                use_container_width=True, height=300)
+    # Divergences Table
+    if divergences:
+        st.subheader("🔄 Detected Divergences")
+        div_df = pd.DataFrame(divergences, columns=['Type', 'Date', 'Price'])
+        
+        # Add validation for each divergence if possible
+        div_df['Validated'] = '⏳ Pending'
+        for idx, row in div_df.iterrows():
+            try:
+                div_date = row['Date']
+                div_idx = df.index.get_loc(div_date)
+                if div_idx + lookback_period < len(df):
+                    future_price = df['Close'].iloc[div_idx + lookback_period]
+                    current_div_price = row['Price']
+                    
+                    if row['Type'] == 'Bullish':
+                        div_df.at[idx, 'Validated'] = '✅ Success' if future_price > current_div_price else '❌ Failed'
+                    else:
+                        div_df.at[idx, 'Validated'] = '✅ Success' if future_price < current_div_price else '❌ Failed'
+            except:
+                continue
+        
+        st.dataframe(div_df, use_container_width=True, hide_index=True)
     
     # Daily Statistics Table
     st.subheader("📋 Daily Statistics & Performance")
     
-    # Color coding for returns
     def color_negative_red(val):
         if isinstance(val, (int, float)) and not pd.isna(val):
             color = '#00ff88' if val > 0 else '#ff3366' if val < 0 else 'white'
@@ -672,11 +835,13 @@ if st.session_state.data_fetched and st.session_state.df is not None:
     st.dataframe(styled_stats, use_container_width=True, height=400)
     
     # Export options
-    col1, col2 = st.columns(2)
+    st.subheader("📥 Export Data")
+    col1, col2, col3 = st.columns(3)
+    
     with col1:
         csv = daily_stats.to_csv(index=True).encode('utf-8')
         st.download_button(
-            label="📥 Download CSV",
+            label="📥 Download Price Data CSV",
             data=csv,
             file_name=f'{ticker_name}_data.csv',
             mime='text/csv',
@@ -686,264 +851,38 @@ if st.session_state.data_fetched and st.session_state.df is not None:
         buffer = io.BytesIO()
         with pd.ExcelWriter(buffer, engine='xlsxwriter') as writer:
             daily_stats_export = prepare_df_for_excel(daily_stats)
-            daily_stats_export.to_excel(writer, sheet_name='Data')
+            daily_stats_export.to_excel(writer, sheet_name='Price Data')
+            
+            # Add summary sheet
+            summary_df = pd.DataFrame([
+                ['Price Level', summary['price_analysis']['level']],
+                ['RSI Level', summary['rsi_analysis']['level']],
+                ['Overall Accuracy', f"{overall_accuracy:.1f}%"],
+                ['Total Divergences', len(divergences)]
+            ], columns=['Metric', 'Value'])
+            summary_df.to_excel(writer, sheet_name='Summary', index=False)
+            
         st.download_button(
-            label="📥 Download Excel",
+            label="📥 Download Full Report Excel",
             data=buffer.getvalue(),
-            file_name=f'{ticker_name}_data.xlsx',
+            file_name=f'{ticker_name}_report.xlsx',
             mime='application/vnd.ms-excel'
         )
     
-    # Ratio Analysis
-    if enable_ratio and 'ratio_df' in st.session_state:
-        st.markdown("---")
-        st.subheader(f"⚖️ Ratio Analysis: {ticker_name} / {st.session_state.ratio_ticker}")
-        
-        ratio_fig, bin_analysis, comparison_df = analyze_ratio(
-            df, 
-            st.session_state.ratio_df, 
-            ticker_name, 
-            st.session_state.ratio_ticker,
-            ratio_bins,
-            theme
-        )
-        
-        st.plotly_chart(ratio_fig, use_container_width=True)
-        
-        # Ratio insights
-        current_ratio = comparison_df['Ratio'].iloc[-1]
-        ratio_mean = comparison_df['Ratio'].mean()
-        ratio_std = comparison_df['Ratio'].std()
-        ratio_insight = f"Current ratio: {current_ratio:.4f} vs historical mean: {ratio_mean:.4f} (±{ratio_std:.4f}). "
-        
-        if current_ratio > ratio_mean + ratio_std:
-            ratio_insight += f"{ticker_name} is relatively expensive compared to {st.session_state.ratio_ticker}. Potential mean reversion downward."
-        elif current_ratio < ratio_mean - ratio_std:
-            ratio_insight += f"{ticker_name} is relatively cheap compared to {st.session_state.ratio_ticker}. Potential mean reversion upward."
-        else:
-            ratio_insight += "Ratio is near historical average. No extreme divergence detected."
-        st.info(f"**Insight:** {ratio_insight}")
-        
-        st.subheader("📊 Ratio Bin Analysis")
-        st.markdown("**This table shows historical behavior in different ratio ranges:**")
-        
-        # Format bin analysis for better readability
-        bin_display = bin_analysis[['Bin_Range', 'Count', 'Avg_Ratio', 'Up_Percentage', 'Down_Percentage', 'Avg_Price1', 'Avg_Price2']].copy()
-        bin_display.columns = ['Ratio Range', 'Occurrences', 'Avg Ratio', 'Up %', 'Down %', f'Avg {ticker_name}', f'Avg {st.session_state.ratio_ticker}']
-        
-        st.dataframe(
-            bin_display.style.background_gradient(cmap='RdYlGn', subset=['Up %']).format({
-                'Avg Ratio': '{:.4f}',
-                'Up %': '{:.1f}%',
-                'Down %': '{:.1f}%',
-                f'Avg {ticker_name}': '{:.2f}',
-                f'Avg {st.session_state.ratio_ticker}': '{:.2f}'
-            }),
-            use_container_width=True,
-            height=400
-        )
-        
-        st.subheader("📋 Detailed Price Comparison")
-        st.markdown(f"**Comparison of {ticker_name} vs {st.session_state.ratio_ticker} with ratio calculations:**")
-        
-        # Display last 50 rows of comparison
-        comparison_display = comparison_df.tail(50).style.format({
-            f'{ticker_name} Close': '{:.2f}',
-            f'{st.session_state.ratio_ticker} Close': '{:.2f}',
-            'Ratio': '{:.4f}',
-            f'{ticker_name} Change %': '{:.2f}%',
-            f'{st.session_state.ratio_ticker} Change %': '{:.2f}%',
-            'Ratio Change %': '{:.2f}%'
-        }).applymap(
-            color_negative_red,
-            subset=[f'{ticker_name} Change %', f'{st.session_state.ratio_ticker} Change %', 'Ratio Change %']
-        )
-        
-        st.dataframe(comparison_display, use_container_width=True, height=400)
-        
-        # Ratio comparison export
-        col1, col2 = st.columns(2)
-        with col1:
+    with col3:
+        if comparison_df is not None:
             ratio_csv = comparison_df.to_csv(index=True).encode('utf-8')
             st.download_button(
                 label="📥 Download Ratio CSV",
                 data=ratio_csv,
-                file_name=f'{ticker_name}_{st.session_state.ratio_ticker}_ratio.csv',
+                file_name=f'{ticker_name}_ratio.csv',
                 mime='text/csv',
             )
-        
-        with col2:
-            ratio_buffer = io.BytesIO()
-            with pd.ExcelWriter(ratio_buffer, engine='xlsxwriter') as writer:
-                comparison_export = prepare_df_for_excel(comparison_df)
-                comparison_export.to_excel(writer, sheet_name='Ratio Analysis')
-                bin_analysis.to_excel(writer, sheet_name='Bin Analysis', index=False)
-            st.download_button(
-                label="📥 Download Ratio Excel",
-                data=ratio_buffer.getvalue(),
-                file_name=f'{ticker_name}_{st.session_state.ratio_ticker}_ratio.xlsx',
-                mime='application/vnd.ms-excel'
-            )
-        
-        # Ratio prediction based on bins
-        st.markdown("**Historical Pattern Analysis:**")
-        
-        # Find which bin current ratio falls into
-        current_bin = None
-        for idx, row in bin_display.iterrows():
-            try:
-                range_str = row['Ratio Range']
-                # Parse the range string
-                if '(' in range_str and ')' in range_str:
-                    range_clean = range_str.strip('()[]')
-                    parts = range_clean.split(',')
-                    if len(parts) == 2:
-                        low = float(parts[0].strip())
-                        high = float(parts[1].strip())
-                        if low <= current_ratio <= high:
-                            current_bin = row
-                            break
-            except:
-                continue
-        
-        if current_bin is not None:
-            up_pct = current_bin['Up %']
-            down_pct = current_bin['Down %']
-            occurrences = current_bin['Occurrences']
-            
-            if up_pct > 60:
-                prediction_text = f"📈 **Bullish Signal**: Historically, when ratio was in this range, price moved up {up_pct:.1f}% of the time ({int(occurrences)} occurrences)."
-                st.success(prediction_text)
-            elif down_pct > 60:
-                prediction_text = f"📉 **Bearish Signal**: Historically, when ratio was in this range, price moved down {down_pct:.1f}% of the time ({int(occurrences)} occurrences)."
-                st.error(prediction_text)
-            else:
-                prediction_text = f"⚖️ **Neutral Signal**: Historical data shows mixed signals - Up: {up_pct:.1f}%, Down: {down_pct:.1f}% ({int(occurrences)} occurrences)."
-                st.warning(prediction_text)
     
-    # Overall Market View
+    # Historical Performance
     st.markdown("---")
-    st.subheader("🎯 Overall Market View")
+    st.header("📊 Historical Pattern-Based Prediction")
     
-    # Calculate confluence
-    signals = []
-    recent_change = 0
-    
-    # RSI signal
-    current_rsi = df['RSI'].iloc[-1]
-    if current_rsi > 70:
-        signals.append(("RSI", "Bearish", "Overbought", f"RSI: {current_rsi:.1f}"))
-    elif current_rsi < 30:
-        signals.append(("RSI", "Bullish", "Oversold", f"RSI: {current_rsi:.1f}"))
-    else:
-        signals.append(("RSI", "Neutral", "Mid-range", f"RSI: {current_rsi:.1f}"))
-    
-    # Divergence signal
-    if divergences:
-        last_div = divergences[-1][0]
-        signals.append(("Divergence", last_div, f"{last_div} divergence", f"Latest: {last_div}"))
-    else:
-        signals.append(("Divergence", "Neutral", "No divergence", "None detected"))
-    
-    # Price vs Fibonacci
-    current_price = df['Close'].iloc[-1]
-    if current_price > fib_levels['50%']:
-        fib_distance = ((current_price - fib_levels['50%']) / fib_levels['50%'] * 100)
-        signals.append(("Fibonacci", "Bullish", "Above 50% level", f"+{fib_distance:.2f}% from 50%"))
-    else:
-        fib_distance = ((fib_levels['50%'] - current_price) / fib_levels['50%'] * 100)
-        signals.append(("Fibonacci", "Bearish", "Below 50% level", f"-{fib_distance:.2f}% from 50%"))
-    
-    # Trend
-    if len(df) >= 5:
-        recent_change = ((df['Close'].iloc[-1] - df['Close'].iloc[-5]) / df['Close'].iloc[-5]) * 100
-        if recent_change > 2:
-            signals.append(("Short-term Trend", "Bullish", "Uptrend", f"+{recent_change:.2f}%"))
-        elif recent_change < -2:
-            signals.append(("Short-term Trend", "Bearish", "Downtrend", f"{recent_change:.2f}%"))
-        else:
-            signals.append(("Short-term Trend", "Neutral", "Sideways", f"{recent_change:.2f}%"))
-    
-    # Volume analysis
-    avg_volume = df['Volume'].tail(20).mean()
-    current_volume = df['Volume'].iloc[-1]
-    volume_ratio = (current_volume / avg_volume) if avg_volume > 0 else 1
-    
-    if volume_ratio > 1.5:
-        signals.append(("Volume", "Strong", "Above average", f"{volume_ratio:.2f}x avg"))
-    elif volume_ratio < 0.5:
-        signals.append(("Volume", "Weak", "Below average", f"{volume_ratio:.2f}x avg"))
-    else:
-        signals.append(("Volume", "Normal", "Average range", f"{volume_ratio:.2f}x avg"))
-    
-    # Volatility (using ATR-like calculation)
-    df['TR'] = df[['High', 'Low', 'Close']].apply(lambda x: max(x['High'] - x['Low'], 
-                                                                  abs(x['High'] - x['Close']), 
-                                                                  abs(x['Low'] - x['Close'])), axis=1)
-    current_volatility = df['TR'].tail(14).mean()
-    avg_volatility = df['TR'].mean()
-    
-    if current_volatility > avg_volatility * 1.5:
-        signals.append(("Volatility", "High", "Elevated", f"{(current_volatility/avg_volatility):.2f}x avg"))
-    elif current_volatility < avg_volatility * 0.5:
-        signals.append(("Volatility", "Low", "Compressed", f"{(current_volatility/avg_volatility):.2f}x avg"))
-    else:
-        signals.append(("Volatility", "Normal", "Average", f"{(current_volatility/avg_volatility):.2f}x avg"))
-    
-    # Display signals
-    signal_df = pd.DataFrame(signals, columns=['Indicator', 'Signal', 'Status', 'Details'])
-    
-    # Color code the signals
-    def color_signals(val):
-        if val == 'Bullish':
-            return 'background-color: #00ff8844; color: #00ff88'
-        elif val == 'Bearish':
-            return 'background-color: #ff336644; color: #ff3366'
-        elif val == 'Neutral':
-            return 'background-color: #ffaa0044; color: #ffaa00'
-        elif val == 'Strong':
-            return 'background-color: #00ff8844; color: #00ff88'
-        elif val == 'Weak':
-            return 'background-color: #ff336644; color: #ff3366'
-        return ''
-    
-    styled_signals = signal_df.style.applymap(color_signals, subset=['Signal'])
-    st.dataframe(styled_signals, use_container_width=True, hide_index=True)
-    
-    # Final verdict
-    bullish_signals = sum(1 for s in signals if s[1] == "Bullish" or s[1] == "Strong")
-    bearish_signals = sum(1 for s in signals if s[1] == "Bearish" or s[1] == "Weak")
-    neutral_signals = sum(1 for s in signals if s[1] == "Neutral" or s[1] == "Normal")
-    
-    st.markdown("### 🎲 Final Market Prediction")
-    
-    total_signals = len(signals)
-    bullish_pct = (bullish_signals / total_signals) * 100
-    bearish_pct = (bearish_signals / total_signals) * 100
-    
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        st.metric("Bullish Signals", f"{bullish_signals}/{total_signals}", f"{bullish_pct:.0f}%")
-    with col2:
-        st.metric("Bearish Signals", f"{bearish_signals}/{total_signals}", f"{bearish_pct:.0f}%")
-    with col3:
-        st.metric("Neutral Signals", f"{neutral_signals}/{total_signals}", f"{(neutral_signals/total_signals)*100:.0f}%")
-    
-    if bullish_signals > bearish_signals + 1:
-        st.success(f"✅ **STRONG BULLISH CONFLUENCE** - {bullish_signals} bullish signals suggest upward momentum. Consider long positions with proper risk management.")
-    elif bullish_signals > bearish_signals:
-        st.success(f"✅ **BULLISH BIAS** - {bullish_signals} bullish vs {bearish_signals} bearish signals. Cautiously bullish stance recommended.")
-    elif bearish_signals > bullish_signals + 1:
-        st.error(f"⚠️ **STRONG BEARISH CONFLUENCE** - {bearish_signals} bearish signals indicate downward pressure. Consider short positions or protective stops.")
-    elif bearish_signals > bullish_signals:
-        st.error(f"⚠️ **BEARISH BIAS** - {bearish_signals} bearish vs {bullish_signals} bullish signals. Cautiously bearish stance recommended.")
-    else:
-        st.warning(f"⚖️ **NEUTRAL/MIXED SIGNALS** - Equal signals ({bullish_signals} bullish, {bearish_signals} bearish). Wait for clearer direction or trade range-bound.")
-    
-    # Historical performance prediction
-    st.markdown("### 📊 Historical Pattern-Based Prediction")
-    
-    # Calculate win rate
     positive_days = (daily_stats['Daily_Return_%'] > 0).sum()
     total_days = len(daily_stats)
     win_rate = (positive_days / total_days) * 100 if total_days > 0 else 0
@@ -951,18 +890,19 @@ if st.session_state.data_fetched and st.session_state.df is not None:
     avg_gain = daily_stats[daily_stats['Daily_Return_%'] > 0]['Daily_Return_%'].mean()
     avg_loss = daily_stats[daily_stats['Daily_Return_%'] < 0]['Daily_Return_%'].mean()
     
-    col1, col2, col3 = st.columns(3)
+    col1, col2, col3, col4 = st.columns(4)
     with col1:
         st.metric("Win Rate", f"{win_rate:.1f}%", f"{positive_days}/{total_days} days")
     with col2:
         st.metric("Avg Gain", f"{avg_gain:.2f}%" if not pd.isna(avg_gain) else "N/A", "On up days")
     with col3:
         st.metric("Avg Loss", f"{avg_loss:.2f}%" if not pd.isna(avg_loss) else "N/A", "On down days")
-    
-    # Risk-Reward ratio
-    if not pd.isna(avg_loss) and avg_loss != 0:
-        risk_reward = abs(avg_gain / avg_loss)
-        st.info(f"**Risk-Reward Ratio:** {risk_reward:.2f}:1 - Historical average gain is {risk_reward:.2f}x the average loss.")
+    with col4:
+        if not pd.isna(avg_loss) and avg_loss != 0:
+            risk_reward = abs(avg_gain / avg_loss)
+            st.metric("Risk-Reward", f"{risk_reward:.2f}:1")
+        else:
+            st.metric("Risk-Reward", "N/A")
     
     # Expected value
     if not pd.isna(avg_gain) and not pd.isna(avg_loss):
@@ -972,6 +912,86 @@ if st.session_state.data_fetched and st.session_state.df is not None:
         else:
             st.warning(f"**Negative Expected Value:** {expected_value:.2f}% per period. Exercise caution.")
     
+    # Final Trading Recommendation
+    st.markdown("---")
+    st.header("🎯 FINAL TRADING RECOMMENDATION")
+    
+    # Calculate overall score
+    score = 0
+    max_score = 0
+    
+    # RSI score
+    max_score += 1
+    if df['RSI'].iloc[-1] < 30:
+        score += 1
+    elif df['RSI'].iloc[-1] > 70:
+        score -= 1
+    
+    # Divergence score
+    max_score += 1
+    if summary['divergence_analysis']['bullish_count'] > summary['divergence_analysis']['bearish_count']:
+        score += 1
+    elif summary['divergence_analysis']['bearish_count'] > summary['divergence_analysis']['bullish_count']:
+        score -= 1
+    
+    # Fibonacci score
+    max_score += 1
+    if current_price > fib_levels['50%']:
+        score += 1
+    else:
+        score -= 1
+    
+    # Accuracy score
+    max_score += 1
+    if overall_accuracy >= 70:
+        score += 1
+    elif overall_accuracy < 50:
+        score -= 0.5
+    
+    # Win rate score
+    max_score += 1
+    if win_rate > 55:
+        score += 1
+    elif win_rate < 45:
+        score -= 1
+    
+    recommendation_pct = (score / max_score) * 100 if max_score > 0 else 50
+    
+    col1, col2 = st.columns(2)
+    with col1:
+        st.metric("Recommendation Score", f"{recommendation_pct:.0f}/100")
+    with col2:
+        st.metric("Confidence Level", 
+                 "High" if overall_accuracy >= 70 else "Medium" if overall_accuracy >= 50 else "Low")
+    
+    if recommendation_pct >= 70:
+        st.success(f"""
+        ✅ **STRONG BUY SIGNAL**
+        - Multiple bullish indicators aligned
+        - High historical accuracy ({overall_accuracy:.1f}%)
+        - Positive risk-reward ratio
+        - Consider entering long positions with proper risk management
+        """)
+    elif recommendation_pct >= 40:
+        st.info(f"""
+        ⚖️ **NEUTRAL/HOLD SIGNAL**
+        - Mixed signals from different indicators
+        - Moderate accuracy ({overall_accuracy:.1f}%)
+        - Wait for stronger confirmation
+        - Consider range-bound trading strategies
+        """)
+    else:
+        st.error(f"""
+        ⚠️ **CAUTION/SELL SIGNAL**
+        - Multiple bearish indicators present
+        - Accuracy: {overall_accuracy:.1f}%
+        - Consider protective stops or short positions
+        - Risk management is critical
+        """)
+    
+    st.markdown("---")
+    st.info("💡 **Disclaimer**: This analysis is for educational purposes only. Always conduct your own research and consider consulting with financial advisors before making investment decisions.")
+
 else:
     st.info("👈 Please select your parameters and click 'Fetch Data & Analyze' to begin.")
     
