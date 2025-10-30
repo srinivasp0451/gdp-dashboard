@@ -918,59 +918,60 @@ st.dataframe(fib_df.style.format({
     'Distance from Current': '{:.2f}%'
 }), use_container_width=True)
     
-    # Returns Heatmap
-    st.subheader("🔥 Returns Heatmap")
-    heatmap_fig, pivot_data = create_returns_heatmap(df, heatmap_type, theme)
-    st.plotly_chart(heatmap_fig, use_container_width=True)
+# Returns Heatmap
+st.subheader("🔥 Returns Heatmap")
+heatmap_fig, pivot_data = create_returns_heatmap(df, heatmap_type, theme)
+st.plotly_chart(heatmap_fig, use_container_width=True)
     
-    # Heatmap statistics
-    positive_cells = (pivot_data.values > 0).sum()
-    negative_cells = (pivot_data.values < 0).sum()
-    avg_return = pivot_data.values.flatten()
-    avg_return = avg_return[~np.isnan(avg_return)].mean()
-    st.info(f"**Insight:** {positive_cells} positive periods vs {negative_cells} negative periods. "
-            f"Average return: {avg_return:.1f}%.")
+# Heatmap statistics
+positive_cells = (pivot_data.values > 0).sum()
+negative_cells = (pivot_data.values < 0).sum()
+avg_return = pivot_data.values.flatten()
+avg_return = avg_return[~np.isnan(avg_return)].mean()
+st.info(f"**Insight:** {positive_cells} positive periods vs {negative_cells} negative periods. "
+        f"Average return: {avg_return:.1f}%.")
     
-    # Heatmap data table
-    st.dataframe(pivot_data.style.background_gradient(cmap='RdYlGn').format('{:.1f}'),
-                use_container_width=True, height=300)
+# Heatmap data table
+st.dataframe(pivot_data.style.background_gradient(cmap='RdYlGn').format('{:.1f}'),
+            use_container_width=True, height=300)
     
-    # Daily Statistics Table
-    st.subheader("📋 Daily Statistics & Performance")
+# Daily Statistics Table
+st.subheader("📋 Daily Statistics & Performance")
     
-    # Color coding for returns
-    def color_negative_red(val):
-        if isinstance(val, (int, float)) and not pd.isna(val):
-            color = '#00ff88' if val > 0 else '#ff3366' if val < 0 else 'white'
-            return f'color: {color}'
-        return ''
+# Color coding for returns
+def color_negative_red(val):
+    if isinstance(val, (int, float)) and not pd.isna(val):
+        color = '#00ff88' if val > 0 else '#ff3366' if val < 0 else 'white'
+        return f'color: {color}'
+    return ''
     
-    styled_stats = daily_stats.tail(50).style.applymap(
-        color_negative_red, 
-        subset=['Daily_Change', 'Daily_Return_%']
-    ).format({
-        'Open': '{:.2f}',
-        'High': '{:.2f}',
-        'Low': '{:.2f}',
-        'Close': '{:.2f}',
-        'Volume': '{:,.0f}',
-        'Daily_Change': '{:.2f}',
-        'Daily_Return_%': '{:.2f}%',
-        'Points_Moved': '{:.2f}',
-        'Range_%': '{:.2f}%'
-    })
+styled_stats = daily_stats.tail(50).style.applymap(
+    color_negative_red, 
+    subset=['Daily_Change', 'Daily_Return_%']
+).format({
+    'Open': '{:.2f}',
+    'High': '{:.2f}',
+    'Low': '{:.2f}',
+    'Close': '{:.2f}',
+    'Volume': '{:,.0f}',
+    'Daily_Change': '{:.2f}',
+    'Daily_Return_%': '{:.2f}%',
+    'Points_Moved': '{:.2f}',
+    'Range_%': '{:.2f}%'
+})
     
-    st.dataframe(styled_stats, use_container_width=True, height=400)
+st.dataframe(styled_stats, use_container_width=True, height=400)
     
-    # Export options
-    col1, col2 = st.columns(2)
-    with col1:
-        csv = daily_stats.to_csv(index=True).encode('utf-8')
-        st.download_button(
-            label="📥 Download CSV",
-            data=csv,
-            file_name=f'{ticker_name}_data.csv',
-            mime='text/csv',
-        )
+# Export options
+col1, col2 = st.columns(2)
+with col1:
+    csv = daily_stats.to_csv(index=True).encode('utf-8')
+    st.download_button(
+        label="📥 Download CSV",
+        data=csv,
+        file_name=f'{ticker_name}_data.csv',
+        mime='text/csv',
+    )
     
-    with col2:
+with col2:
+    st.write("hello world")
