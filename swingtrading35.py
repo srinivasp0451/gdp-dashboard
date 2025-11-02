@@ -2,335 +2,268 @@ import streamlit as st
 import yfinance as yf
 import pandas as pd
 import numpy as np
-import plotly.graph_objects as go
+import plotly.graph_objs as go
 from plotly.subplots import make_subplots
 from datetime import datetime, timedelta
 import pytz
-import io
 
-st.set_page_config(layout="wide", page_title="Algo Trader Dashboard")
-
-# ----------------------- Helper functions -----------------------
-INTERVAL_MAP = {
-    "1m": "1m","2m":"2m","3m":"3m","5m":"5m","10m":"10m","15m":"15m",
-    "30m":"30m","60m":"60m","90m":"90m","120m":"120m","4h":"240m",
-    "1d":"1d","5d":"5d","1wk":"1wk","1mo":"1mo","3mo":"3mo",
+# Instrument configuration & mapping
+default_tickers = {
+    "Nifty50": "^NSEI",
+    "Sensex": "^BSESN",
+    "BankNifty": "^NSEBANK",
+    "Midcap Nifty": "^NSEMDCP50",
+    "BTC": "BTC-USD",
+    "ETH": "ETH-USD",
+    "Solana": "SOL-USD",
+    "USDINR": "USDINR=X",
+    "EURINR": "EURINR=X",
+    "GBPINR": "GBPINR=X",
+    "JPYINR": "JPYINR=X",
+    "GOLD (INR)": "GOLDINR=X",
+    "GOLD (USD)": "GC=F",
+    "SILVER (INR)": "SILVERINR=X",
+    "SILVER (USD)": "SI=F",
+    "COPPER (INR)": "COPPERINR=X",
+    "COPPER (USD)": "HG=F"
+}
+# Add top Indian stocks if needed
+top_indian_stocks = {
+    "RELIANCE": "RELIANCE.NS",
+    "TCS": "TCS.NS",
+    "INFY": "INFY.NS",
+    "ICICIBANK": "ICICIBANK.NS",
+    "HDFC": "HDFCBANK.NS",
 }
 
-# Flatten multiindex columns from yfinance
-def flatten_df(df: pd.DataFrame) -> pd.DataFrame:
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = ["_" .join([str(c) for c in col if str(c) != '']) for col in df.columns]
-    return df
+# Merge for UI
+all_tickers = {**default_tickers, **top_indian_stocks}
+period_options = [
+    "1m", "3m", "5m", "10m", "15m", "30m", "1h", "2h", "4h",
+    "1d", "5d", "7d", "1mo", "3mo", "6mo", "1y", "2y", "3y", "5y", 
+    "6y", "10y", "15y", "20y", "25y", "30y"
+]
+interval_options = [
+    "1m", "2m", "5m", "15m", "30m", "60m", "90m", "1h", "1d", "5d", "1wk", "1mo", "3mo"
+]
+# -------------------------------------------------------------------
 
-# Make datetimes timezone-naive in IST for Excel
-IST = pytz.timezone('Asia/Kolkata')
+st.set_page_config(page_title="Algo Trader Dashboard", layout="wide")
+st.title('🦾 Pro-Grade Algo Trader Dashboard')
 
-def to_ist_naive(idx: pd.DatetimeIndex) -> pd.DatetimeIndex:
-    if idx.tz is None:
-        localized = idx.tz_localize(pytz.UTC).tz_convert(IST)
-    else:
-        localized = idx.tz_convert(IST)
-    return localized.tz_localize(None)
-
-# RSI implementation
-def compute_rsi(series: pd.Series, period: int = 14) -> pd.Series:
-    delta = series.diff()
-    up = delta.clip(lower=0)
-    down = -1 * delta.clip(upper=0)
-    ma_up = up.ewm(com=period-1, adjust=False).mean()
-    ma_down = down.ewm(com=period-1, adjust=False).mean()
-    rs = ma_up / (ma_down.replace(0, np.nan))
-    rsi = 100 - (100 / (1 + rs))
-    return rsi.fillna(50)
-
-# Simple moving average
-def sma(series: pd.Series, window: int):
-    return series.rolling(window).mean()
-
-# MACD
-def macd(series: pd.Series, fast=12, slow=26, signal=9):
-    ema_fast = series.ewm(span=fast, adjust=False).mean()
-    ema_slow = series.ewm(span=slow, adjust=False).mean()
-    macd_line = ema_fast - ema_slow
-    sig = macd_line.ewm(span=signal, adjust=False).mean()
-    hist = macd_line - sig
-    return macd_line, sig, hist
-
-# Fibonacci levels
-def fibonacci_levels(high, low):
-    diff = high - low
-    levels = {
-        '0.0': high,
-        '0.236': high - 0.236*diff,
-        '0.382': high - 0.382*diff,
-        '0.5': high - 0.5*diff,
-        '0.618': high - 0.618*diff,
-        '1.0': low
-    }
-    return levels
-
-# Simple prediction engine: naive pattern-based
-def simple_prediction(df: pd.DataFrame):
-    # returns a short text prediction and confidence
-    if df.empty:
-        return "No data", 0.0
-    rsi = compute_rsi(df['Close'])
-    last_rsi = rsi.iloc[-1]
-    ma50 = sma(df['Close'],50).iloc[-1] if len(df)>=50 else np.nan
-    ma200 = sma(df['Close'],200).iloc[-1] if len(df)>=200 else np.nan
-    price = df['Close'].iloc[-1]
-    conf = 0.3
-    text = "Neutral"
-    if last_rsi < 30 and price > ma50:
-        text = "Potential rebound (bullish)"
-        conf = 0.5
-    elif last_rsi > 70 and price < ma50:
-        text = "Potential pullback (bearish)"
-        conf = 0.5
-    elif ma50>ma200:
-        text = "Bullish trend (MA50>MA200)"
-        conf = 0.6
-    elif ma50<ma200:
-        text = "Bearish trend (MA50<MA200)"
-        conf = 0.6
-    return text, conf
-
-# Backtest simple predictions: check next N bars moved in predicted direction
-def validate_predictions(df: pd.DataFrame, predictions: list, lookahead=5):
-    # predictions: list of (index, direction) direction: 'bull'/'bear'
-    results = []
-    for idx, direction in predictions:
-        try:
-            pos = df.index.get_loc(idx)
-        except KeyError:
-            continue
-        end_pos = min(pos+lookahead, len(df)-1)
-        future_close = df['Close'].iloc[end_pos]
-        start = df['Close'].iloc[pos]
-        moved_up = future_close > start
-        success = (moved_up and direction=='bull') or (not moved_up and direction=='bear')
-        results.append(success)
-    if len(results)==0:
-        return 0,0
-    return sum(results), len(results)
-
-# Heatmap generation
-def generate_heatmap(df: pd.DataFrame, freq='M'):
-    if df.empty:
-        return pd.DataFrame()
-    df2 = df['Close'].copy()
-    df2 = df2.resample('D').ffill()
-    df2.index = to_ist_naive(df2.index)
-    df2 = df2.to_frame()
-    df2['year'] = df2.index.year
-    df2['month'] = df2.index.month
-    pivot = df2.groupby(['year','month']).last().unstack(level=0)['Close']
-    # pivot columns are years
-    return pivot
-
-# Points change table
-def points_table(df: pd.DataFrame, periods=['1d','5d','1mo']):
-    out = {}
-    now = df.index[-1]
-    for p in periods:
-        try:
-            if p.endswith('d'):
-                days = int(p[:-1])
-                past = now - pd.Timedelta(days=days)
-            elif p.endswith('mo'):
-                months = int(p[:-2])
-                past = now - pd.DateOffset(months=months)
-            else:
-                past = now - pd.Timedelta(days=1)
-            past_idx = df.index.asof(past)
-            if pd.isna(past_idx):
-                continue
-            change = df['Close'].iloc[-1] - df.loc[past_idx]['Close']
-            pct = change / df.loc[past_idx]['Close'] * 100
-            out[p] = (change, pct)
-        except Exception:
-            continue
-    t = pd.DataFrame.from_dict({k: {'Points': v[0], 'Pct': v[1]} for k,v in out.items()}, orient='index')
-    return t
-
-# ----------------------- Streamlit UI -----------------------
-st.title("Algo Trader — Multi-Asset Streamlit Dashboard")
-
-# Sidebar controls
-with st.sidebar:
-    st.header("Controls")
-    theme = st.checkbox("Dark theme", value=False)
-    symbol = st.text_input("Ticker or symbol (yfinance)", value="^NSEI")
-    timeframe = st.selectbox("Interval", options=['1m','2m','3m','5m','10m','15m','30m','60m','90m','120m','1d','5d','1wk','1mo','3mo'], index=10)
-    period = st.selectbox("Period (yfinance period)", options=['1d','5d','1mo','3mo','6mo','1y','2y','5y','10y','max'], index=1)
-    bins = st.slider("Number of bins (ratio charts)", min_value=5, max_value=80, value=20)
-    fetch = st.button("Fetch data")
-
-# Keep UI visible after click by storing in session state
-if 'df' not in st.session_state:
-    st.session_state.df = pd.DataFrame()
-
-if fetch:
-    with st.spinner("Fetching data — respecting rate limits..."):
-        try:
-            # yfinance sometimes refuses 1m for long periods; use period mapping
-            df = yf.download(tickers=symbol, interval=timeframe, period=period, progress=False, threads=False)
-            df = flatten_df(df)
-            # Ensure required columns exist
-            for c in ['Open','High','Low','Close','Volume']:
-                if c not in df.columns:
-                    # try lower-case
-                    if c.lower() in df.columns:
-                        df[c] = df[c.lower()]
-            df.dropna(subset=['Close'], inplace=True)
-            st.session_state.df = df
-            st.success("Data fetched — {} rows".format(len(df)))
-        except Exception as e:
-            st.error(f"Failed to fetch data: {e}")
-
-if not st.session_state.df.empty:
-    df = st.session_state.df.copy()
-    # Ensure datetime index timezone to IST naive
-    df.index = pd.to_datetime(df.index)
-    df.index = to_ist_naive(df.index)
-
-    # Calculations
-    df['RSI'] = compute_rsi(df['Close'])
-    df['SMA50'] = sma(df['Close'],50)
-    df['SMA200'] = sma(df['Close'],200)
-    df['MACD'], df['MACD_SIG'], df['MACD_HIST'] = macd(df['Close'])
-
-    # Points/returns table
-    pts_tbl = points_table(df, periods=['1d','5d','1mo','3mo'])
-
-    # Layout: main charts
-    col1, col2 = st.columns([3,1])
-    with col1:
-        st.subheader(f"{symbol} — Candlestick")
-        fig = make_subplots(rows=3, cols=1, shared_xaxes=True, row_heights=[0.6,0.2,0.2])
-        fig.add_trace(go.Candlestick(x=df.index, open=df['Open'], high=df['High'], low=df['Low'], close=df['Close'], name='Candles'), row=1, col=1)
-        fig.add_trace(go.Scatter(x=df.index, y=df['SMA50'], name='SMA50'), row=1, col=1)
-        fig.add_trace(go.Scatter(x=df.index, y=df['SMA200'], name='SMA200'), row=1, col=1)
-        # RSI
-        fig.add_trace(go.Scatter(x=df.index, y=df['RSI'], name='RSI'), row=2, col=1)
-        fig.add_hline(y=70, line_dash='dash', row=2, col=1)
-        fig.add_hline(y=30, line_dash='dash', row=2, col=1)
-        # MACD
-        fig.add_trace(go.Bar(x=df.index, y=df['MACD_HIST'], name='MACD Hist'), row=3, col=1)
-        fig.update_layout(height=900, xaxis_rangeslider_visible=False)
-        st.plotly_chart(fig, use_container_width=True)
-
-        # Fibonacci on visible range (last 200 bars)
-        window = df['Close'].iloc[-200:]
-        fibs = fibonacci_levels(window.max(), window.min())
-        st.markdown("**Fibonacci levels (last 200 bars)**")
-        st.write(fibs)
-
-        # Prediction and insight
-        pred_text, conf = simple_prediction(df)
-        st.markdown(f"**Prediction:** {pred_text} — confidence {conf:.0%}")
-        insight = f"{symbol} last close {df['Close'].iloc[-1]:.2f}. RSI {df['RSI'].iloc[-1]:.1f}. SMA50 {df['SMA50'].iloc[-1]:.2f if not np.isnan(df['SMA50'].iloc[-1]) else 'n/a'}. {pred_text}."
-        st.info(insight)
-
-        # Dataframe view and export
-        st.subheader("Chart Data")
-        st.dataframe(df.tail(500))
-        # Export buttons
-        to_csv = df.copy()
-        to_csv.index = to_ist_naive(to_csv.index)
-        csv = to_csv.to_csv(index=True)
-        st.download_button("Download CSV", csv, file_name=f"{symbol.replace('^','')}_{timeframe}.csv")
-
-        # Excel export - remove timezone
-        excel_buffer = io.BytesIO()
-        to_xls = to_csv.copy()
-        to_xls.index = pd.to_datetime(to_xls.index)
-        try:
-            with pd.ExcelWriter(excel_buffer, engine='xlsxwriter') as writer:
-                to_xls.to_excel(writer, sheet_name='data')
-            st.download_button("Download Excel", data=excel_buffer.getvalue(), file_name=f"{symbol}_{timeframe}.xlsx")
-        except Exception as e:
-            st.warning(f"Excel export skipped: {e}")
-
-    with col2:
-        st.subheader("Quick Stats & Heatmaps")
-        st.table(pts_tbl.style.format({"Points":"{:.2f}","Pct":"{:.2f}%"}))
-
-        st.markdown("---")
-        st.markdown("**Monthly Heatmap (Year vs Month)**")
-        heat = generate_heatmap(df)
-        if not heat.empty:
-            st.dataframe(heat.round(1))
-        else:
-            st.write("No heatmap data")
-
-    # Ratio chart example: ratio to USDINR if available
-    st.subheader("Ratio Chart")
-    base = df['Close']
-    # allow user to pick comparison symbol
-    comp_symbol = st.text_input("Comparison symbol (for ratio)", value="USDINR=X")
-    if st.button("Fetch comparison and compute ratio"):
-        comp = yf.download(tickers=comp_symbol, interval=timeframe, period=period, progress=False, threads=False)
-        comp = flatten_df(comp)
-        if 'Close' in comp.columns:
-            comp.index = pd.to_datetime(comp.index)
-            comp.index = to_ist_naive(comp.index)
-            # align
-            merged = pd.merge_asof(df[['Close']].reset_index().rename(columns={'index':'Datetime'}),
-                                   comp[['Close']].reset_index().rename(columns={'index':'Datetime'}), on='Datetime')
-            merged.set_index('Datetime', inplace=True)
-            merged.dropna(inplace=True)
-            merged['Ratio'] = merged['Close_x'] / merged['Close_y']
-            # bin ratio
-            merged['bin'] = pd.cut(merged['Ratio'], bins=bins)
-            # show ratio chart
-            figr = make_subplots(rows=2, cols=1, shared_xaxes=True, row_heights=[0.7,0.3])
-            figr.add_trace(go.Scatter(x=merged.index, y=merged['Ratio'], name='Ratio'), row=1, col=1)
-            figr.add_trace(go.Scatter(x=merged.index, y=merged['Close_x'], name=f'{symbol} Close'), row=2, col=1)
-            figr.add_trace(go.Scatter(x=merged.index, y=merged['Close_y'], name=f'{comp_symbol} Close'), row=2, col=1)
-            st.plotly_chart(figr, use_container_width=True)
-            # bin stats
-            bin_stats = merged.groupby('bin').apply(lambda g: pd.Series({'mean_return': (g['Close_x'].pct_change().mean()*252), 'count': len(g)}))
-            st.dataframe(bin_stats.sort_values('count', ascending=False).head(50))
-        else:
-            st.error("Comparison symbol did not return Close prices")
-
-    # Validation/backtest area
-    st.subheader("Prediction Validation")
-    # simplistic validation: generate signals when RSI crosses extreme
-    signals = []
-    rsi = df['RSI']
-    for i in range(1, len(rsi)):
-        if rsi.iloc[i-1] < 30 and rsi.iloc[i] >=30:
-            signals.append((df.index[i], 'bull'))
-        if rsi.iloc[i-1] > 70 and rsi.iloc[i] <=70:
-            signals.append((df.index[i], 'bear'))
-    succ, total = validate_predictions(df, signals, lookahead=5)
-    st.write(f"Validated signals success: {succ}/{total} — accuracy: {(succ/total*100) if total>0 else 0:.1f}%")
-
-    # Heatmap options
-    st.subheader("Advanced Heatmaps")
-    hm_opt = st.radio("Heatmap type", options=['Year vs Month','Day vs Month','Quarter vs Year','Week vs Year'])
-    if hm_opt == 'Year vs Month':
-        hm = generate_heatmap(df)
-        if not hm.empty:
-            st.dataframe(hm.round(1))
-    else:
-        st.info("Other heatmap types are available in next versions")
-
-    # Synchronized charts: place symbol, RSI, ratio one above another (already stacked in subplot)
-    st.markdown("---")
-    st.write("**Summary of insights (auto-generated)**")
-    insights = []
-    insights.append(f"Range (last): {df['Close'].min():.2f} - {df['Close'].max():.2f}")
-    insights.append(f"RSI last: {df['RSI'].iloc[-1]:.1f}")
-    insights.append(f"Momentum: MACD hist last {df['MACD_HIST'].iloc[-1]:.4f}")
-    st.write("\n".join(insights))
-
+# Theme selector
+dark_mode = st.sidebar.checkbox("Dark Theme", value=True)
+if dark_mode:
+    st.markdown("<style>body{background-color: #222;color: #fff;}</style>", unsafe_allow_html=True)
 else:
-    st.info("Click 'Fetch data' to get started. This avoids auto-fetch and reduces yfinance rate limits.")
+    st.markdown("<style>body{background-color: #f9f9f9;color: #222;}</style>", unsafe_allow_html=True)
 
-# Footer
-st.markdown("---")
-st.caption("Notes: This app uses simple heuristics for predictions. Backtest/validate before trading. Timezones converted to IST for display and exports.")
+# Instrument selection UI
+st.sidebar.header("Instrument & Timeframe Selection")
+selected_symbols = st.sidebar.multiselect("Select Instruments", list(all_tickers.keys()), default=list(all_tickers.keys())[:5])
+custom_ticker = st.sidebar.text_input("Custom Ticker (Yahoo format)", "")
+period = st.sidebar.selectbox("Select Period", period_options, index=period_options.index("1mo"))
+interval = st.sidebar.selectbox("Select Interval", interval_options, index=interval_options.index("5m"))
+num_bins = st.sidebar.slider("Ratio Chart Bins", 5, 30, 10)
+export_fmt = st.sidebar.radio("Export format", ["CSV", "Excel"])
+
+# Fetch trigger button (no auto-fetch!)
+fetch_button = st.button("Fetch & Analyze Data")
+
+def fetch_yfinance(ticker, period, interval):
+    # yfinance sometimes produces multiindex, timezone-aware datetimes, and rate limit errors. Handle them!
+    try:
+        df = yf.download(ticker, period=period, interval=interval, progress=False)
+        if df.empty:
+            st.warning(f"No data fetched for {ticker}")
+            return None
+        # Flatten multiindex
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = [' '.join(col).strip() for col in df.columns.values]
+        df.reset_index(inplace=True)
+        # Convert all dates to IST, make timezone unaware (for Excel export)
+        if 'Datetime' in df.columns:
+            df['Datetime'] = df['Datetime'].dt.tz_convert("Asia/Kolkata").dt.tz_localize(None)
+        elif 'Date' in df.columns:
+            df['Date'] = pd.to_datetime(df['Date']).dt.tz_localize("Asia/Kolkata").dt.tz_localize(None)
+        elif 'index' in df.columns:
+            df['index'] = pd.to_datetime(df['index']).dt.tz_localize("Asia/Kolkata").dt.tz_localize(None)
+        elif 'Open' in df.columns:  # last fallback
+            if isinstance(df.iloc[0,0], pd.Timestamp):
+                df[df.columns[0]] = pd.to_datetime(df[df.columns[0]]).dt.tz_convert('Asia/Kolkata').dt.tz_localize(None)
+        df.dropna(axis=1, how='all', inplace=True)
+        return df
+    except Exception as e:
+        st.error(f"Error fetching {ticker}: {e}")
+        return None
+
+# Core analysis and charting logic starts below
+def analyze_and_plot(df, symbol, ratio_df=None):
+    # Calculate percentage change, color-code up/down
+    df['Change'] = df['Close'].diff()
+    df['Change %'] = df['Close'].pct_change() * 100
+    df['Up/Down'] = np.where(df['Change'] > 0, 'Up', 'Down')
+
+    # Candlestick and line chart
+    fig_candlestick = go.Figure()
+    fig_candlestick.add_trace(go.Candlestick(
+        x=df[df.columns[0]], open=df['Open'],
+        high=df['High'], low=df['Low'], close=df['Close'],
+        increasing_line_color='green', decreasing_line_color='red'
+    ))
+    fig_candlestick.update_layout(
+        title=f"{symbol} Candlestick ({period}, {interval})",
+        xaxis_rangeslider_visible=True,
+        template='plotly_dark' if dark_mode else 'plotly_white'
+    )
+    # Add trendlines for up/down
+    min_idx, max_idx = df['Close'].idxmin(), df['Close'].idxmax()
+    fig_candlestick.add_trace(go.Scatter(
+        x=[df[df.columns[0]].iloc[min_idx], df[df.columns[0]].iloc[max_idx]],
+        y=[df['Close'].iloc[min_idx], df['Close'].iloc[max_idx]],
+        mode='lines',
+        line=dict(color='blue', dash='dot'),
+        name='Trendline'
+    ))
+    # Calculate RSI natively
+    delta = df['Close'].diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+    RS = gain / loss
+    df['RSI'] = 100 - (100 / (1 + RS))
+    # RSI divergence logic: bullish if RSI rising, close falling; bearish if opposite
+    divergence = []
+    for i in range(1, len(df)):
+        if df['RSI'].iloc[i] > df['RSI'].iloc[i-1] and df['Close'].iloc[i] < df['Close'].iloc[i-1]:
+            divergence.append('Bullish')
+        elif df['RSI'].iloc[i] < df['RSI'].iloc[i-1] and df['Close'].iloc[i] > df['Close'].iloc[i-1]:
+            divergence.append('Bearish')
+        else:
+            divergence.append('None')
+    df['RSI Divergence'] = ['None'] + divergence
+
+    # Ratio chart if ratio_df is provided
+    if ratio_df is not None:
+        ratio_series = df['Close'] / ratio_df['Close']
+        bins = pd.cut(ratio_series, bins=num_bins)
+        ratio_return = df['Close'].groupby(bins).apply(lambda x: x.pct_change().mean())
+        # Plot ratio histogram
+        fig_ratio = go.Figure([go.Bar(x=ratio_return.index.astype(str), y=ratio_return.values, marker_color='purple')])
+        fig_ratio.update_layout(title=f"Ratio Chart: {symbol} / {ratio_df['Symbol'][0]}", template='plotly_dark' if dark_mode else 'plotly_white', xaxis_title="Ratio Bin", yaxis_title="Avg Return (%)")
+        st.plotly_chart(fig_ratio, use_container_width=True)
+        # Comparison table
+        comp_df = pd.DataFrame({
+            "Date": df[df.columns[0]],
+            f"{symbol} Close": df['Close'],
+            f"{ratio_df['Symbol'][0]} Close": ratio_df['Close'],
+            "Ratio": ratio_series
+        })
+        st.dataframe(comp_df, height=200)
+    # Fibonacci levels plotting
+    min_price, max_price = df['Close'].min(), df['Close'].max()
+    diff = max_price - min_price
+    fib_levels = [0, 0.236, 0.382, 0.5, 0.618, 0.786, 1]
+    fib_vals = [min_price + l * diff for l in fib_levels]
+    for lvl, val in zip(fib_levels, fib_vals):
+        fig_candlestick.add_hline(y=val, line_dash="dash", annotation_text=f"Fib {lvl:.3f} ({val:.2f})", annotation_position="top left")
+    # RSI line chart
+    fig_rsi = go.Figure()
+    fig_rsi.add_trace(go.Scatter(x=df[df.columns[0]], y=df['RSI'], mode='lines', name='RSI', line=dict(color='orange')))
+    fig_rsi.update_layout(title=f"{symbol} RSI", template='plotly_dark' if dark_mode else 'plotly_white')
+
+    # Synchronized cursors: limitation in Streamlit, but present charts stacked for visual sync
+    st.plotly_chart(fig_candlestick, use_container_width=True)
+    st.plotly_chart(fig_rsi, use_container_width=True)
+
+    # Points Up/Down summary (color table)
+    summary_df = df[[df.columns[0], 'Close', 'Change', 'Change %', 'Up/Down', 'RSI', 'RSI Divergence']].copy()
+    st.dataframe(summary_df.style.apply(lambda x: ['background-color: #2ecc40' if v == 'Up' else 'background-color: #ff4136' for v in x['Up/Down']], axis=1), height=300)
+
+    # Heatmap of returns (day vs month, year vs month, quarter vs year)
+    returns_df = df.copy()
+    returns_df['Year'] = returns_df[df.columns[0]].dt.year
+    returns_df['Month'] = returns_df[df.columns[0]].dt.month
+    returns_df['Day'] = returns_df[df.columns[0]].dt.day
+    returns_df['Quarter'] = returns_df[df.columns[0]].dt.quarter
+    returns_df['Week'] = returns_df[df.columns[0]].dt.isocalendar().week
+    pivot_month_day = returns_df.pivot_table(index='Day', columns='Month', values='Change %', aggfunc="mean").round(1)
+    pivot_year_month = returns_df.pivot_table(index='Year', columns='Month', values='Change %', aggfunc="mean").round(1)
+    pivot_quarter_year = returns_df.pivot_table(index='Quarter', columns='Year', values='Change %', aggfunc="mean").round(1)
+    pivot_week_year = returns_df.pivot_table(index='Week', columns='Year', values='Change %', aggfunc="mean").round(1)
+    for pivot, label in zip(
+        [pivot_month_day, pivot_year_month, pivot_quarter_year, pivot_week_year],
+        ["Day vs Month", "Year vs Month", "Quarter vs Year", "Week vs Year"]
+    ):
+        st.write(f"Heatmap: {label}")
+        st.dataframe(pivot.style.background_gradient(cmap="coolwarm"), height=150)
+
+    # Export data options
+    if export_fmt == "CSV":
+        st.download_button(f"Download {symbol} Data (CSV)", data=summary_df.to_csv(index=False), file_name=f"{symbol}_data.csv")
+    else:
+        summary_df.to_excel("temp.xlsx", index=False)  # Save to disk
+        with open("temp.xlsx", "rb") as f:
+            st.download_button(f"Download {symbol} Data (Excel)", data=f, file_name=f"{symbol}_data.xlsx")
+
+    # Auto insights (layman, 50 words)
+    last_change_pct = df['Change %'].iloc[-1]
+    insight = f"{symbol}: Latest move is {'up' if last_change_pct > 0 else 'down'}, with {last_change_pct:.2f}% return in last period. RSI at {df['RSI'].iloc[-1]:.1f}. Fibonacci resistance at {max(fib_vals):.2f}, support at {min(fib_vals):.2f}. Observed {'bullish' if last_change_pct>0 else 'bearish'} confluence."
+    st.info(insight)
+
+    # Prediction based on RSI/Fibonacci/Trend
+    pred = "bullish" if df['RSI'].iloc[-1] > 60 and last_change_pct > 0 else "bearish" if df['RSI'].iloc[-1] < 40 and last_change_pct < 0 else "sideways"
+    st.markdown(f"Prediction: **{pred.upper()}** move expected based on last RSI, trend, and retracement.")
+
+# ------------------------------------------------
+
+# Prediction validation storage
+if "prediction_history" not in st.session_state:
+    st.session_state["prediction_history"] = []
+if "pred_accuracy" not in st.session_state:
+    st.session_state["pred_accuracy"] = []
+
+if fetch_button:
+    # Aggregated fetch logic (all tickers)
+    symbols_to_fetch = selected_symbols.copy()
+    if custom_ticker:
+        symbols_to_fetch.append(custom_ticker)
+    for symbol in symbols_to_fetch:
+        ticker = all_tickers.get(symbol, symbol)
+        df = fetch_yfinance(ticker, period, interval)
+        if df is not None and "Close" in df.columns:
+            df['Symbol'] = symbol
+            st.markdown(f"### {symbol} Analysis")
+            # For ratio chart: use next ticker
+            ratio_df = None
+            if len(symbols_to_fetch) >= 2 and symbol == symbols_to_fetch[0]:
+                next_ticker = all_tickers.get(symbols_to_fetch[1], symbols_to_fetch[1])
+                ratio_df = fetch_yfinance(next_ticker, period, interval)
+                if ratio_df is not None and "Close" in ratio_df.columns:
+                    ratio_df['Symbol'] = symbols_to_fetch[1]
+            analyze_and_plot(df, symbol, ratio_df=ratio_df)
+            # Prediction accuracy logic
+            pred = "bullish" if df['RSI'].iloc[-1] > 60 and df['Change %'].iloc[-1] > 0 else "bearish" if df['RSI'].iloc[-1] < 40 and df['Change %'].iloc[-1] < 0 else "sideways"
+            actual_move = "bullish" if df['Change %'].iloc[-1] > 0 else "bearish" if df['Change %'].iloc[-1] < 0 else "sideways"
+            st.session_state["prediction_history"].append((symbol, pred, actual_move, df[df.columns[0]].iloc[-1]))
+    # Accuracy summary table
+    pred_df = pd.DataFrame(st.session_state["prediction_history"], columns=["Symbol", "Predicted", "Actual", "Datetime"])
+    pred_df['Hit/Miss'] = pred_df['Predicted'] == pred_df['Actual']
+    acc = (pred_df['Hit/Miss'].sum() / len(pred_df)) * 100 if len(pred_df)>0 else 0
+    st.markdown("### Prediction Accuracy Summary")
+    st.dataframe(pred_df, height=200)
+    st.success(f"Prediction accuracy to date: {acc:.2f}%")
+
+    # Layman summary for all instruments
+    instruments_summary = []
+    for symbol in symbols_to_fetch:
+        ticker = all_tickers.get(symbol, symbol)
+        df = fetch_yfinance(ticker, period, interval)
+        if df is not None and "Close" in df.columns:
+            last_chg = df['Change %'].iloc[-1]
+            min_r, max_r = df['Close'].min(), df['Close'].max()
+            rsi = df['RSI'].iloc[-1]
+            summary = f"{symbol}: Last close {df['Close'].iloc[-1]:.2f}, change {last_chg:.2f}%, RSI {rsi:.2f}, Range {min_r:.2f}-{max_r:.2f}"
+            instruments_summary.append(summary)
+    st.markdown("#### All Instruments Summary")
+    for summ in instruments_summary:
+        st.write(summ)
