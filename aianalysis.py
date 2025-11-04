@@ -258,7 +258,9 @@ if fetch_btn:
             # Basic stats
             latest = df.iloc[-1]
             prev = df.iloc[-2] if len(df) >= 2 else latest
-            change_pct = float(((latest['Close'] - prev['Close']) / prev['Close']) * 100) if prev['Close'] != 0 else 0.0
+            prev_close = float(prev['Close'])
+            latest_close = float(latest['Close'])
+            change_pct = ((latest_close - prev_close) / prev_close * 100) if prev_close != 0 else 0.0
 
             # Zones and levels
             sr_levels = support_resistance_from_levels(df['Close'], n_levels=6)
