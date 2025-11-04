@@ -20,6 +20,7 @@ st.sidebar.header("📌 Input Parameters")
 ticker = st.sidebar.text_input("Enter Ticker Symbol", value="^NSEI", help="Example: ^NSEI, ^NSEBANK, BTC-USD, AAPL, USDINR=X")
 period = st.sidebar.selectbox("Select Period", ["1d", "5d", "1mo", "3mo", "6mo", "1y", "2y", "5y", "max"], index=1)
 interval = st.sidebar.selectbox("Select Time Interval", ["1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h", "1d", "5d", "1wk", "1mo"], index=3)
+n = st.sidebar.number_input("Enter number", value=20)
 
 # Groq API config
 GROQ_API_KEY = "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"
@@ -47,8 +48,8 @@ def fetch_data(ticker, period, interval, retries=3, delay=2):
 # ------------------------------
 # AI Summary Function (Groq)
 # ------------------------------
-def analyze_market(df, ticker, interval, api_key):
-    df = df.tail(20).copy()
+def analyze_market(df, ticker, interval, api_key, n=20):
+    df = df.tail(n).copy()
 
     # Convert timezone to IST
     if not df.empty:
@@ -102,11 +103,11 @@ if st.sidebar.button("🔍 Analyze Market", use_container_width=True):
                 st.success(f"✅ Successfully fetched {ticker} data ({period}, {interval})")
 
                 # Display recent data
-                st.subheader("📈 Latest 20 Data Points (IST)")
-                st.dataframe(df.tail(20), use_container_width=True)
+                st.subheader(f"📈 Latest {n} Data Points (IST)")
+                st.dataframe(df.tail(n), use_container_width=True)
 
                 # Get AI summary
-                ai_summary = analyze_market(df, ticker, interval, GROQ_API_KEY)
+                ai_summary = analyze_market(df, ticker, interval, GROQ_API_KEY,n)
                 st.subheader("🤖 AI Market Summary")
                 st.write(ai_summary)
             else:
