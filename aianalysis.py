@@ -333,7 +333,7 @@ if fetch_btn:
                     if abs(p['change_pct']) > 0.7:
                         r.append(f"Last interval move {p['change_pct']:.2f}% — notable momentum.")
                 if p['avg_vol'] and p['high_vol_zone'][0] is not None:
-                    r.append(f"High volume zone between {p['high_vol_zone'][0]} and {p['high_vol_zone'][1']}" if p['high_vol_zone'][0] is not None else "")
+                    r.append(f"High volume zone between {p['high_vol_zone'][0]} and {p['high_vol_zone'][1]}" if p['high_vol_zone'][0] is not None else "")
                 # simplify
                 return {"momentum_notes": [x for x in r if x]}
 
