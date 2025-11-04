@@ -233,8 +233,10 @@ with st.sidebar:
     interval = st.selectbox("Interval", options=ALLOWED_INTERVALS, index=4)
     rows_to_analyze = st.number_input("Rows to analyze (last N candles)", min_value=5, max_value=500, value=60)
     show_chart = st.checkbox("Show interactive chart", value=True)
-    api_key_input = st.text_input("Groq API key", value=GROQ_API_KEY)
-    model_input = st.text_input("LLaMA model id", value=MODEL)
+    # api_key_input = st.text_input("Groq API key", value=GROQ_API_KEY)
+    api_key_input = GROQ_API_KEY
+    # model_input = st.text_input("LLaMA model id", value=MODEL)
+    model_input = MODEL
     st.markdown("---")
     st.write("⚠️ Notes:")
     st.write("- Data is fetched from Yahoo Finance only when you click **Fetch & Run**.")
