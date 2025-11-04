@@ -92,7 +92,7 @@ Data:
 # ------------------------------
 # Main Execution (on Button Click)
 # ------------------------------
-if st.button("🔍 Analyze Market", use_container_width=True):
+if st.sidebar.button("🔍 Analyze Market", use_container_width=True):
     if not GROQ_API_KEY:
         st.error("Please provide Groq API key.")
     else:
