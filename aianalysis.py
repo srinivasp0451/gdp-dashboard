@@ -22,7 +22,7 @@ period = st.sidebar.selectbox("Select Period", ["1d", "5d", "1mo", "3mo", "6mo",
 interval = st.sidebar.selectbox("Select Time Interval", ["1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h", "1d", "5d", "1wk", "1mo"], index=3)
 
 # Groq API config
-GROQ_API_KEY = st.sidebar.text_input("Groq API Key", type="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")
+GROQ_API_KEY = "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"
 MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"  # ✅ Updated working model
 
 if not GROQ_API_KEY:
