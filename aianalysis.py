@@ -229,6 +229,7 @@ if fetch_btn:
         except Exception as e:
             st.error(f"Error fetching data: {e}")
             raw_df = pd.DataFrame()
+            raw_df.reset_index(inplace=True)
 
         if raw_df.empty:
             st.error("No data returned. Try a different ticker/period/interval.")
