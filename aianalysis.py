@@ -265,7 +265,15 @@ if fetch_btn:
             # Zones and levels
             sr_levels = support_resistance_from_levels(df['Close'], n_levels=6)
             fibs = fibonacci_levels(df.tail(min(len(df), 200)))  # fibonacci on last 200 candles
-            high_vol_zone = df.sort_values('Volume', ascending=False).head(max(1,int(len(df)*0.05)))
+            df = df[~df.index.duplicated(keep='first')]
+            df = df.reset_index(drop=False)
+            high_vol_zone = pd.DataFrame()
+            # Handle missing or zero volume gracefully
+            if 'Volume' not in df.columns or df['Volume'].sum() == 0:
+                high_vol_zone = pd.DataFrame()
+            else:
+                high_vol_zone = df.sort_values('Volume', ascending=False).head(max(1, int(len(df) * 0.05)))
+            # high_vol_zone = df.sort_values('Volume', ascending=False).head(max(1,int(len(df)*0.05)))
             avg_vol = float(df['Volume'].tail(50).mean()) if 'Volume' in df.columns else None
             hv_low = float(high_vol_zone['Low'].min()) if not high_vol_zone.empty else None
             hv_high = float(high_vol_zone['High'].max()) if not high_vol_zone.empty else None
