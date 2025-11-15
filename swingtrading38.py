@@ -16,6 +16,9 @@ def fetch_data(ticker, period, interval):
         if data.empty:
             st.error(f"No data found for {ticker} with period {period} and interval {interval}.")
             return None
+        # Flatten columns if multi-index
+        if isinstance(data.columns, pd.MultiIndex):
+            data.columns = data.columns.get_level_values(1)
         # Convert timezone to IST
         ist = pytz.timezone('Asia/Kolkata')
         data.index = data.index.tz_convert(ist) if data.index.tz else data.index.tz_localize('UTC').tz_convert(ist)
@@ -58,7 +61,7 @@ def detect_opening_range(data):
     patterns = []
     opening_data = data.between_time('09:15', '09:18')
     if not opening_data.empty:
-        if all(opening_data['Points Change'] > 0) or all(opening_data['Points Change'] < 0):
+        if (opening_data['Points Change'] > 0).all() or (opening_data['Points Change'] < 0).all():
             patterns.append(f"Opening range 9:15-9:18 single direction rally at {opening_data.index[0].date()}")
     return patterns
 
@@ -228,11 +231,14 @@ if st.session_state.data is not None:
     
     # Export
     st.subheader("Export Data")
-    csv = data.to_csv(index=True)
+    export_columns = ['Open', 'High', 'Low', 'Close', 'Volume']
+    export_data = data[export_columns]
+    
+    csv = export_data.to_csv(index=True)
     st.download_button("Download CSV", csv, f"{ticker}_data.csv", "text/csv")
     
     output = BytesIO()
     with pd.ExcelWriter(output, engine='openpyxl', datetime_format='YYYY-MM-DD HH:MM:SS') as writer:
-        data.to_excel(writer, index=True)
+        export_data.to_excel(writer, index=True)
     excel_data = output.getvalue()
     st.download_button("Download Excel", excel_data, f"{ticker}_data.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
