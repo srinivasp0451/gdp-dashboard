@@ -695,13 +695,13 @@ if st.session_state.analysis_done and st.session_state.data is not None:
                 """)
             else:
                 st.warning("Insufficient data for comprehensive forecast. Need more historical patterns.")['next_move'].mean()
-                    median_next_move = similar_df['next_move'].median()
-                    up_count = (similar_df['next_move'] > 0).sum()
-                    down_count = (similar_df['next_move'] < 0).sum()
+                median_next_move = similar_df['next_move'].median()
+                up_count = (similar_df['next_move'] > 0).sum()
+                down_count = (similar_df['next_move'] < 0).sum()
                     
-                    st.metric("Predicted Next Move (Avg)", f"{avg_next_move:+.2f} points")
-                    st.metric("Predicted Next Move (Median)", f"{median_next_move:+.2f} points")
-                    st.metric("Historical Outcome", f"{up_count} Up | {down_count} Down")
+                st.metric("Predicted Next Move (Avg)", f"{avg_next_move:+.2f} points")
+                st.metric("Predicted Next Move (Median)", f"{median_next_move:+.2f} points")
+                st.metric("Historical Outcome", f"{up_count} Up | {down_count} Down")
             else:
                 st.info("No highly similar patterns found in historical data.")
             
