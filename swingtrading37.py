@@ -9,7 +9,7 @@ import io
 from collections import Counter
 
 # Page configuration
-st.set_page_config(page_title="Advanced Trading Dashboard", layout="wide", initial_sidebar_collapsed=False)
+st.set_page_config(page_title="Advanced Trading Dashboard", layout="wide", initial_sidebar_state=False)
 
 # Custom CSS for better UI
 st.markdown("""
