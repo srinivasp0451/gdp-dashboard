@@ -702,8 +702,8 @@ if st.session_state.analysis_done and st.session_state.data is not None:
                 st.metric("Predicted Next Move (Avg)", f"{avg_next_move:+.2f} points")
                 st.metric("Predicted Next Move (Median)", f"{median_next_move:+.2f} points")
                 st.metric("Historical Outcome", f"{up_count} Up | {down_count} Down")
-            else:
-                st.info("No highly similar patterns found in historical data.")
+            #else:
+            #   st.info("No highly similar patterns found in historical data.")
             
             # Key Insights Summary
             st.markdown("---")
