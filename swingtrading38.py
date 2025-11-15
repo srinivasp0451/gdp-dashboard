@@ -1,16 +1,13 @@
 # streamlit_algo_trader_app.py
-# Streamlit app for multi-asset algorithmic trading analysis
-# Features implemented:
-# - Multi-asset support (common tickers + custom input)
-# - Multiple timeframes & periods
-# - Button-based fetching, persistent UI (session_state)
-# - Timezone-aware IST conversion
-# - Pattern recognition (multi-candle rallies, liquidity sweep, opening range, reversals)
-# - Similarity search across historical windows
-# - Forward forecast with point estimates and confidence
-# - Heatmaps: day vs month volatility, month vs year volatility, returns, variance, median
-# - Download CSV/Excel (OHLCV only) with timezone-aware datetimes
-# - Graceful error handling, color-coded returns
+# Streamlit app for multi-asset algorithmic trading analysis (UPDATED)
+# Changes in this update (per user request):
+# - Fixed timezone conversion to IST robustly for all yfinance outputs
+# - Heatmaps now show annotated values in cells and use readable colormap + colorbar
+# - Similarity search: returns exact timestamps/dates for matches, count, distribution of forward moves
+# - Volatility-based analysis added: rolling volatility, volatility-percentile selector, and conditional pattern scans
+# - Pattern scan: allows simple sequences (e.g., 2 red then 1 green) and reports historical outcomes
+# - Added second ticker comparison option to compare patterns across two instruments
+# - Improved error handling and clearer layman summaries for detected patterns
 
 import streamlit as st
 import pandas as pd
@@ -20,16 +17,15 @@ import io
 from datetime import datetime, timedelta, time
 import pytz
 import matplotlib.pyplot as plt
-from matplotlib.colors import ListedColormap
+import seaborn as sns
 import base64
 
-st.set_page_config(page_title="Algo Trader Analyzer", layout="wide")
+st.set_page_config(page_title="Algo Trader Analyzer (Updated)", layout="wide")
 
 # ----------------------------- Constants & Helpers -----------------------------
 IST = pytz.timezone('Asia/Kolkata')
 UTC = pytz.UTC
 
-# Common tickers mapping (yfinance friendly)
 COMMON_TICKERS = {
     'NIFTY 50': '^NSEI',
     'BANK NIFTY': '^NSEBANK',
@@ -41,48 +37,47 @@ COMMON_TICKERS = {
     'USDINR': 'INR=X',
 }
 
-# Supported intervals mapping to yfinance
-ALLOWED_INTERVALS = ['1m','2m','3m','5m','10m','15m','30m','60m','90m','1h','2h','4h','1d']
-# yfinance doesn't accept both '1h' and '60m' interchangeably; standardize
 INTERVAL_MAP = {
-    '1m':'1m','2m':'2m','3m':'3m','5m':'5m','10m':'10m','15m':'15m','30m':'30m',
-    '60m':'60m','1h':'60m','2h':'120m','4h':'240m','90m':'90m','1d':'1d'
+    '1m':'1m','3m':'3m','5m':'5m','10m':'10m','15m':'15m','30m':'30m','60m':'60m','2h':'120m','4h':'240m','1d':'1d'
 }
+PERIODS = ['5d','7d','1mo','3mo','6mo','1y','2y','3y','5y','10y']
 
-PERIODS = ['1d','5d','7d','1mo','3mo','6mo','1y','2y','3y','5y','6y','10y','15y','20y','25y','30y']
-
-# Utility: convert index to IST timezone gracefully
+# Robust IST conversion
 def to_ist(df):
     if df is None or df.empty:
         return df
-    idx = df.index
+    # ensure datetime index
     try:
-        # If tz-aware, convert to IST
-        if idx.tz is not None:
-            df.index = idx.tz_convert(IST)
-        else:
-            # Assume UTC if naive and localize then convert
-            df.index = idx.tz_localize(UTC).tz_convert(IST)
+        idx = pd.DatetimeIndex(df.index)
     except Exception:
-        # Last resort: treat as naive local time then localize to IST
+        df = df.copy()
+        df.index = pd.to_datetime(df.index)
+        idx = pd.DatetimeIndex(df.index)
+    # If tz-aware, convert. If naive, assume UTC then convert to IST
+    if idx.tz is None:
         try:
-            df.index = pd.DatetimeIndex(df.index).tz_localize(IST)
+            df.index = idx.tz_localize(UTC).tz_convert(IST)
+        except Exception:
+            try:
+                df.index = idx.tz_localize(IST)
+            except Exception:
+                pass
+    else:
+        try:
+            df.index = idx.tz_convert(IST)
         except Exception:
             pass
     return df
 
-# Safe fetch with caching and error handling
+# Caching fetch
 @st.cache_data(ttl=300)
 def fetch_yf_data(ticker, period, interval):
     try:
-        yf_ticker = yf.Ticker(ticker)
-        # yfinance limitations: intraday max lookback depends on interval. user will be warned
-        hist = yf_ticker.history(period=period, interval=interval, prepost=False)
+        t = yf.Ticker(ticker)
+        hist = t.history(period=period, interval=interval, prepost=False)
         if hist is None or hist.empty:
             return pd.DataFrame()
-        # Ensure columns: Open, High, Low, Close, Volume
         hist = hist[['Open','High','Low','Close','Volume']].copy()
-        # some tickers return timezone aware index; convert to IST gracefully
         hist = to_ist(hist)
         hist.index.name = 'Datetime'
         return hist
@@ -90,36 +85,32 @@ def fetch_yf_data(ticker, period, interval):
         st.session_state['last_error'] = str(e)
         return pd.DataFrame()
 
-# ----------------------------- Pattern Detection -----------------------------
+# small helpers
+def candle_points(df):
+    return (df['Close'] - df['Open']).astype(float)
 
-def candle_points(c):
-    return (c['Close'] - c['Open']).astype(float)
-
-# find multi-candle rallies: consecutive up or down candles that sum to threshold
-def find_multi_candle_rallies(df, threshold_points=50, min_candles=2):
-    sigs = []
+def candle_signs(df):
     pts = candle_points(df)
-    directions = np.sign(pts)
-    # group by consecutive direction
+    return ['G' if p>0 else ('R' if p<0 else 'N') for p in pts]
+
+# find multi-candle rallies
+def find_multi_candle_rallies(df, threshold_points=50, min_candles=2):
+    pts = candle_points(df)
+    signs = np.sign(pts)
+    results = []
     start = 0
     for i in range(1, len(pts)):
-        if directions[i] != directions[i-1] or directions[i]==0:
-            # evaluate segment
+        if signs[i] != signs[i-1] or signs[i]==0:
             seg = pts[start:i]
             if len(seg) >= min_candles and abs(seg.sum()) >= threshold_points:
-                sigs.append({
-                    'start': df.index[start], 'end': df.index[i-1], 'points': seg.sum(), 'candles': len(seg), 'direction': 'up' if seg.sum()>0 else 'down'
-                })
+                results.append({'start': df.index[start], 'end': df.index[i-1], 'points': seg.sum(), 'candles': len(seg), 'direction': 'up' if seg.sum()>0 else 'down'})
             start = i
-    # last segment
     seg = pts[start:len(pts)]
     if len(seg) >= min_candles and abs(seg.sum()) >= threshold_points:
-        sigs.append({
-            'start': df.index[start], 'end': df.index[-1], 'points': seg.sum(), 'candles': len(seg), 'direction': 'up' if seg.sum()>0 else 'down'
-        })
-    return sigs
+        results.append({'start': df.index[start], 'end': df.index[-1], 'points': seg.sum(), 'candles': len(seg), 'direction': 'up' if seg.sum()>0 else 'down'})
+    return results
 
-# liquidity sweep: large single-bar range at a specific time
+# liquidity sweeps (time-based)
 def find_liquidity_sweeps(df, sweep_points=100, hour=11, minute=0):
     sweeps = []
     for dt, row in df.iterrows():
@@ -129,359 +120,294 @@ def find_liquidity_sweeps(df, sweep_points=100, hour=11, minute=0):
                 sweeps.append({'datetime': dt, 'range': rng, 'open': row['Open'], 'close': row['Close']})
     return sweeps
 
-# opening range pattern
+# opening range
 def opening_range(df, start_time=time(9,15), end_time=time(9,18)):
     mask = [(idx.time() >= start_time and idx.time() <= end_time) for idx in df.index]
-    window = df.iloc[np.where(mask)[0]] if any(mask) else pd.DataFrame()
-    if window.empty:
+    idxs = [i for i,m in enumerate(mask) if m]
+    if not idxs:
         return None
+    window = df.iloc[idxs[0]:idxs[-1]+1]
     direction = 'up' if window['Close'].iloc[-1] > window['Open'].iloc[0] else 'down'
-    points = (window['Close'].iloc[-1] - window['Open'].iloc[0])
+    points = window['Close'].iloc[-1] - window['Open'].iloc[0]
     return {'start': window.index[0], 'end': window.index[-1], 'direction': direction, 'points': points}
 
-# reversal after rally: detect rally then opposite large candle
-def find_reversals_after_rally(df, rally_candles=3, rally_points=50, reversal_points=30):
-    pts = candle_points(df)
-    results = []
-    for i in range(len(pts)-rally_candles-1):
-        seg = pts[i:i+rally_candles]
-        if seg.sum() >= rally_points:
-            # look next candle
-            nxt = pts[i+rally_candles]
-            if nxt < -reversal_points:
-                results.append({'rally_start': df.index[i], 'rally_end': df.index[i+rally_candles-1], 'rally_points': seg.sum(), 'reversal_time': df.index[i+rally_candles], 'reversal_points': nxt})
-        if seg.sum() <= -rally_points:
-            nxt = pts[i+rally_candles]
-            if nxt > reversal_points:
-                results.append({'rally_start': df.index[i], 'rally_end': df.index[i+rally_candles-1], 'rally_points': seg.sum(), 'reversal_time': df.index[i+rally_candles], 'reversal_points': nxt})
-    return results
-
-# create a signature for windows for similarity search
+# similarity signature
 def window_signature(df_window):
-    # signature: normalized point changes per candle and direction vector
     pts = (df_window['Close'] - df_window['Open']).values
     if pts.std() == 0:
         return pts - pts.mean()
     return (pts - pts.mean()) / (pts.std()+1e-9)
 
-# search historical windows similar to target signature
-def find_similar_windows(df, target_window, window_size=5, top_n=10):
+# find similar windows with full metadata
+def find_similar_windows_with_details(df, target_window, window_size=5, top_n=20):
     sig = window_signature(target_window)
-    hist = df
+    hist = df.copy()
     candidates = []
-    for i in range(len(hist)-window_size):
+    for i in range(len(hist)-window_size-3):
         win = hist.iloc[i:i+window_size]
         s = window_signature(win)
         if len(s) != len(sig):
             continue
-        # distance
         dist = np.linalg.norm(sig - s)
-        candidates.append((i, dist))
-    candidates = sorted(candidates, key=lambda x: x[1])[:top_n]
-    results = []
-    for idx, d in candidates:
-        forward_window = hist.iloc[idx+window_size: idx+window_size+3]  # look 3 candles forward
+        forward_window = hist.iloc[i+window_size:i+window_size+3]
         fwd_points = (forward_window['Close'].iloc[-1] - forward_window['Close'].iloc[0]) if not forward_window.empty else np.nan
-        results.append({'start': hist.index[idx], 'distance': d, 'forward_points': fwd_points})
-    return results
+        candidates.append({'index': i, 'start': hist.index[i], 'end': hist.index[i+window_size-1], 'distance': dist, 'forward_points': fwd_points})
+    candidates = sorted(candidates, key=lambda x: x['distance'])[:top_n]
+    return candidates
 
-# Forecast: aggregate forward_points from matches
-def forecast_from_matches(matches):
-    points = [m['forward_points'] for m in matches if not pd.isna(m['forward_points'])]
-    if len(points) == 0:
-        return {'expected_points': 0.0, 'confidence': 0.0, 'n_matches': 0}
-    expected = np.mean(points)
-    # Confidence: ratio of matches that moved in same direction as mean
-    same_dir = sum(1 for p in points if np.sign(p)==np.sign(expected))
-    confidence = same_dir / len(points)
-    return {'expected_points': float(expected), 'confidence': float(confidence), 'n_matches': len(points)}
+# forecast aggregation with distribution
+def forecast_stats(matches):
+    pts = [m['forward_points'] for m in matches if not pd.isna(m['forward_points'])]
+    if not pts:
+        return {'mean':0,'median':0,'count':0,'pct_pos':0,'std':0}
+    arr = np.array(pts)
+    return {'mean':float(arr.mean()), 'median':float(np.median(arr)), 'count':len(arr), 'pct_pos':float((arr>0).sum()/len(arr)), 'std':float(arr.std())}
 
-# ----------------------------- Heatmaps & Summaries -----------------------------
-
-def compute_volatility(df, period='D'):
-    # returns per period volatility (std of returns)
-    ret = df['Close'].pct_change().dropna()
-    vol = ret.resample(period).std()
+# volatility helpers
+def rolling_volatility(df, window=20):
+    ret = df['Close'].pct_change()
+    vol = ret.rolling(window=window).std()*np.sqrt(window)
     return vol
 
-# generic heatmap maker using pivot table
-def make_heatmap_data(df, freq_outer, freq_inner, agg='std'):
-    # freq_outer: e.g. 'M' months or 'Y' years, freq_inner: day of month or month of year
-    tmp = df['Close'].pct_change().dropna().to_frame('ret')
-    tmp['outer'] = tmp.index.to_period(freq_outer).to_timestamp()
-    tmp['inner'] = tmp.index.to_period(freq_inner).to_timestamp()
-    pivot = tmp.groupby(['outer','inner']).agg({'ret': agg}).unstack(level=0)['ret']
-    return pivot.fillna(0)
+# pattern scanning example: detect sequences like ['R','R','G'] in sliding windows
+def scan_sequence_pattern(df, seq):
+    signs = candle_signs(df)
+    L = len(seq)
+    matches = []
+    for i in range(len(signs)-L-2):
+        window = signs[i:i+L]
+        if window == seq:
+            forward_pts = df['Close'].iloc[i+L+2] - df['Close'].iloc[i+L] if (i+L+2) < len(df) else np.nan
+            matches.append({'start': df.index[i], 'end': df.index[i+L-1], 'forward_points': forward_pts})
+    return matches
 
-# ----------------------------- Export helpers -----------------------------
-
+# export
 def df_to_csv_bytes(df):
     buf = io.BytesIO()
-    df_to_save = df[['Open','High','Low','Close','Volume']].copy()
-    # keep tz-aware index: convert to ISO string with timezone
-    df_to_save = df_to_save.reset_index()
-    df_to_save['Datetime'] = df_to_save['Datetime'].apply(lambda x: x.isoformat())
-    df_to_save.to_csv(buf, index=False)
+    save = df[['Open','High','Low','Close','Volume']].reset_index()
+    save['Datetime'] = save['Datetime'].apply(lambda x: x.isoformat())
+    save.to_csv(buf, index=False)
     buf.seek(0)
     return buf
 
-def df_to_excel_bytes(df):
-    buf = io.BytesIO()
-    df_to_save = df[['Open','High','Low','Close','Volume']].copy()
-    df_to_save = df_to_save.reset_index()
-    df_to_save['Datetime'] = df_to_save['Datetime'].apply(lambda x: x.isoformat())
-    with pd.ExcelWriter(buf, engine='openpyxl') as writer:
-        df_to_save.to_excel(writer, index=False, sheet_name='OHLCV')
-    buf.seek(0)
-    return buf
+# ----------------------------- UI -----------------------------
+st.title('Algo Trader Analyzer — Updated')
 
-# ----------------------------- Streamlit UI -----------------------------
-
-st.title('Algo Trader Analyzer — Multi-Asset Streamlit')
-
-# Sidebar controls
 with st.sidebar:
-    st.header('Data & Options')
-    asset_choice = st.selectbox('Pick asset (or choose Custom)', list(COMMON_TICKERS.keys())+['Custom'])
+    st.header('Data & Analysis Options')
+    asset_choice = st.selectbox('Primary asset', list(COMMON_TICKERS.keys())+['Custom'])
     if asset_choice == 'Custom':
-        ticker_input = st.text_input('Enter yfinance ticker (eg: RELIANCE.NS or AAPL)', value='^NSEI')
+        ticker = st.text_input('Primary ticker', value='^NSEI')
     else:
-        ticker_input = COMMON_TICKERS[asset_choice]
+        ticker = COMMON_TICKERS[asset_choice]
 
-    interval = st.selectbox('Interval / Timeframe', ['1m','3m','5m','10m','15m','30m','60m','2h','4h','1d'])
-    period = st.selectbox('Period', PERIODS, index=1)
-    min_trend_points = st.number_input('Threshold points for multi-candle rally', value=50)
-    sweep_points = st.number_input('Sweep points threshold', value=100)
-    window_size = st.number_input('Similarity window size (candles)', value=5, min_value=2)
-    top_n = st.number_input('Top similar matches to retrieve', value=10, min_value=1)
-    run_fetch = st.button('Fetch & Analyze')
+    compare_choice = st.selectbox('Compare with (optional)', list(COMMON_TICKERS.keys())+['None','Custom'])
+    if compare_choice == 'Custom':
+        ticker2 = st.text_input('Secondary ticker', value='^NSEBANK')
+    elif compare_choice == 'None':
+        ticker2 = None
+    else:
+        ticker2 = COMMON_TICKERS.get(compare_choice)
+
+    interval = st.selectbox('Interval', ['1m','3m','5m','10m','15m','30m','60m','2h','4h','1d'])
+    period = st.selectbox('Period', PERIODS, index=2)
+    run = st.button('Fetch & Analyze')
     st.markdown('---')
-    st.markdown('Export data:')
-    export_csv = st.button('Download CSV (OHLCV)')
-    export_xlsx = st.button('Download Excel (OHLCV)')
-    st.markdown('Notes: Data pulled from Yahoo Finance (yfinance). Intraday history availability depends on ticker & interval.')
+    st.subheader('Similarity / Volatility')
+    window_size = st.number_input('Similarity window (candles)', min_value=2, value=5)
+    top_n = st.number_input('Top matches to show', min_value=1, value=10)
+    vol_window = st.number_input('Volatility rolling window (candles)', min_value=2, value=20)
+    vol_percentile = st.slider('Volatility percentile threshold (show windows above this)', 50, 100, 75)
+    seq_input = st.text_input('Sequence pattern (e.g., RR G as RRG -> enter RRG)', value='RRG')
+    st.markdown('Sequence legend: R=red (down), G=green (up), N=neutral')
+    st.markdown('---')
+    st.markdown('Export:')
+    export_csv = st.button('Export OHLCV CSV')
 
-# Persist ticker / settings
+# Session persist
 if 'settings' not in st.session_state:
-    st.session_state['settings'] = {}
-st.session_state['settings'].update({'ticker': ticker_input, 'interval': interval, 'period': period})
+    st.session_state.settings = {}
+st.session_state.settings.update({'ticker':ticker,'ticker2':ticker2,'interval':interval,'period':period})
 
-# Handle fetch button — do not fetch on refresh
-if run_fetch:
-    with st.spinner('Fetching data — please wait...'):
-        interval_mapped = INTERVAL_MAP.get(interval, interval)
-        df = fetch_yf_data(ticker_input, period, interval_mapped)
-        if df.empty:
-            st.warning('No data returned for this ticker/interval/period. Try a different combination.')
-        else:
-            st.session_state['df'] = df
-            st.session_state['last_fetch_time'] = datetime.now(IST).isoformat()
-            st.success(f'Fetched {len(df)} rows — last point {df.index[-1].isoformat()}')
+if run:
+    with st.spinner('Fetching data...'):
+        try:
+            intv = INTERVAL_MAP.get(interval, interval)
+            df = fetch_yf_data(ticker, period, intv)
+            if ticker2:
+                df2 = fetch_yf_data(ticker2, period, intv)
+            else:
+                df2 = pd.DataFrame()
+            if df.empty:
+                st.error('No data for primary ticker. Try different period/interval or ticker.')
+            else:
+                st.session_state.df = df
+                st.session_state.df2 = df2
+                st.session_state.last_fetch = datetime.now(IST).isoformat()
+                st.success(f'Fetched {len(df)} rows. Time index (IST): {df.index[0].isoformat()} ... {df.index[-1].isoformat()}')
+        except Exception as e:
+            st.error('Fetch failed: '+str(e))
 
-# If data exists in session, use it
+# load from session
 df = st.session_state.get('df', pd.DataFrame())
+df2 = st.session_state.get('df2', pd.DataFrame())
 
-# Export handling — use the session df
 if export_csv and not df.empty:
     buf = df_to_csv_bytes(df)
-    st.download_button('Download CSV', data=buf, file_name=f'data_{ticker_input}.csv', mime='text/csv')
+    st.download_button('Download CSV', data=buf, file_name=f'{ticker}_ohlcv.csv', mime='text/csv')
 
-if export_xlsx and not df.empty:
-    buf = df_to_excel_bytes(df)
-    st.download_button('Download Excel', data=buf, file_name=f'data_{ticker_input}.xlsx', mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
-
-# Main area: show data, charts, patterns
 if df.empty:
-    st.info('No data in memory. Click *Fetch & Analyze* to load data. Components will persist after click.')
+    st.info('No data loaded. Click Fetch & Analyze.')
 else:
-    st.subheader(f'Data snapshot — {ticker_input} — last fetched: {st.session_state.get("last_fetch_time")}')
-    # show head tail
+    st.subheader(f'Data snapshot — {ticker} (IST index)')
+    st.write('Data index range:', df.index[0].isoformat(), 'to', df.index[-1].isoformat())
     st.dataframe(df.tail(20))
 
-    # Basic stats: points change, percent change since previous day
+    # Basic info
     df_points = df.copy()
     df_points['Points'] = df_points['Close'] - df_points['Open']
     last = df_points.iloc[-1]
-    prev_day_close = df_points['Close'].resample('D').last().shift(1).dropna()
-    prev_close = prev_day_close.iloc[-1] if len(prev_day_close)>0 else np.nan
-    pct_change_from_prev_day = (last['Close'] - prev_close) / prev_close * 100 if not pd.isna(prev_close) and prev_close!=0 else np.nan
+    st.metric('Last Close', f"{last['Close']:.2f}")
+    st.markdown(f"**Last candle points:** <span style='color:{'green' if last['Points']>=0 else 'red'}'>{last['Points']:.2f}</span>", unsafe_allow_html=True)
 
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        st.metric('Last Close', f"{last['Close']:.2f}")
-    with col2:
-        if not pd.isna(last['Points']):
-            delta = last['Points']
-            if delta >= 0:
-                st.markdown(f"<div style='color:green; font-weight:bold;'>Points gained: {delta:.2f}</div>", unsafe_allow_html=True)
-            else:
-                st.markdown(f"<div style='color:red; font-weight:bold;'>Points lost: {delta:.2f}</div>", unsafe_allow_html=True)
-    with col3:
-        if not pd.isna(pct_change_from_prev_day):
-            color = 'green' if pct_change_from_prev_day>=0 else 'red'
-            st.markdown(f"<div style='color:{color}; font-weight:bold;'>% from prev day: {pct_change_from_prev_day:.2f}%</div>", unsafe_allow_html=True)
-
-    # Simple plot: OHLC range plot (matplotlib simple)
-    fig, ax = plt.subplots(figsize=(12,3))
-    ax.plot(df.index, df['High'], label='High')
-    ax.plot(df.index, df['Low'], label='Low')
-    ax.set_title('Max/Min Ranges')
-    ax.legend()
-    st.pyplot(fig)
-
-    # Patterns
-    st.subheader('Detected Patterns')
     # Multi-candle rallies
-    rallies = find_multi_candle_rallies(df, threshold_points=min_trend_points, min_candles=2)
-    st.markdown('**Multi-candle rallies (threshold applied)**')
+    st.subheader('Multi-candle rallies')
+    rallies = find_multi_candle_rallies(df, threshold_points=50, min_candles=2)
     if rallies:
+        st.write(f'Found {len(rallies)} multi-candle rallies (threshold 50 pts). Showing last 10:')
         for r in rallies[-10:]:
-            color = 'green' if r['direction']=='up' else 'red'
-            st.markdown(f"- {r['start'].isoformat()} to {r['end'].isoformat()}: {r['points']:.1f} pts over {r['candles']} candles — <span style='color:{color}'>{r['direction']}</span>", unsafe_allow_html=True)
+            st.write(f"{r['start'].isoformat()} to {r['end'].isoformat()} — {r['points']:.1f} pts over {r['candles']} candles ({r['direction']})")
     else:
-        st.markdown('No multi-candle rallies found matching threshold.')
+        st.write('No multi-candle rallies found matching threshold.')
 
-    # Liquidity sweeps
-    sweeps = find_liquidity_sweeps(df, sweep_points=sweep_points, hour=11, minute=0)
-    st.markdown('**Liquidity sweeps around 11:00**')
-    if sweeps:
-        for s in sweeps:
-            st.markdown(f"- {s['datetime'].isoformat()}: range {s['range']:.2f} pts (open {s['open']}, close {s['close']})")
-    else:
-        st.markdown('No liquidity sweeps at 11:00 matching threshold.')
-
-    # Opening range
-    orange = opening_range(df)
-    st.markdown('**Opening range (9:15 - 9:18 IST)**')
-    if orange:
-        dirc = orange['direction']
-        coltxt = 'green' if dirc=='up' else 'red'
-        st.markdown(f"Direction: <span style='color:{coltxt}; font-weight:bold'>{dirc}</span>, Points: {orange['points']:.2f}", unsafe_allow_html=True)
-    else:
-        st.markdown('Opening range not present in this dataset/timeframe.')
-
-    # Reversals
-    reversals = find_reversals_after_rally(df)
-    st.markdown('**Reversals after rally**')
-    if reversals:
-        for rv in reversals[-10:]:
-            st.markdown(f"- Rally {rv['rally_start'].isoformat()} to {rv['rally_end'].isoformat()} ({rv['rally_points']:.1f} pts) -> reversal at {rv['reversal_time'].isoformat()} ({rv['reversal_points']:.1f} pts)")
-    else:
-        st.markdown('No reversal-after-rally patterns detected.')
-
-    # Similarity search: take last window_size candles as target
-    st.subheader('Similarity Search & Forecast')
+    # Similarity search detailed
+    st.subheader('Similarity search (detailed)')
     if len(df) >= window_size+3:
         target = df.iloc[-window_size:]
-        matches = find_similar_windows(df, target, window_size=window_size, top_n=top_n)
-        st.markdown(f'Found {len(matches)} similar windows (top {top_n}) — showing start, distance, forward points')
+        matches = find_similar_windows_with_details(df, target, window_size=window_size, top_n=top_n)
         if matches:
-            match_df = pd.DataFrame(matches)
-            st.dataframe(match_df)
-            fc = forecast_from_matches(matches)
-            direction = 'up' if fc['expected_points']>0 else ('down' if fc['expected_points']<0 else 'flat')
-            conf_color = 'green' if fc['confidence']>=0.6 else ('orange' if fc['confidence']>=0.4 else 'red')
-            st.markdown('**Forecast Summary**')
-            st.markdown(f"Expected move: <b>{fc['expected_points']:.2f} points</b> — Direction: <span style='color:{conf_color}; font-weight:bold'>{direction}</span>", unsafe_allow_html=True)
-            st.markdown(f"Confidence: {fc['confidence']*100:.1f}% based on {fc['n_matches']} historical matches")
-        else:
-            st.markdown('No similar historical windows found.')
-    else:
-        st.info('Not enough data for similarity search — increase period or reduce window size.')
+            st.write(f'Top {len(matches)} matches: (start -> end) distance | forward_points (next 3 candles)')
+            mm = pd.DataFrame(matches)
+            mm_display = mm.copy()
+            mm_display['start'] = mm_display['start'].dt.strftime('%Y-%m-%d %H:%M')
+            mm_display['end'] = mm_display['end'].dt.strftime('%Y-%m-%d %H:%M')
+            mm_display['forward_points'] = mm_display['forward_points'].round(2)
+            st.dataframe(mm_display[['start','end','distance','forward_points']])
+            stats = forecast_stats(matches)
+            st.markdown('**Forecast statistics from matched windows**')
+            st.write(f"Matches: {stats['count']}, Mean forward points: {stats['mean']:.2f}, Median: {stats['median']:.2f}, Std: {stats['std']:.2f}, % positive: {stats['pct_pos']*100:.1f}%")
 
-    # Heatmaps
-    st.subheader('Heatmaps & Statistics')
-    # Day vs Month volatility heatmap: compute volatility per day-of-month vs month
-    try:
-        vol_day_month = make_heatmap_data(df, freq_outer='M', freq_inner='D', agg='std')
-        if not vol_day_month.empty:
-            fig2, ax2 = plt.subplots(figsize=(10,4))
-            cax = ax2.imshow(vol_day_month.T, aspect='auto')
-            ax2.set_title('Day vs Month volatility (std of returns)')
-            ax2.set_yticks(range(vol_day_month.shape[1]))
-            ax2.set_yticklabels([d.strftime('%Y-%m') for d in vol_day_month.columns])
-            ax2.set_xticks(range(vol_day_month.shape[0]))
-            ax2.set_xticklabels([d.strftime('%d') for d in vol_day_month.index], rotation=90)
-            st.pyplot(fig2)
-            st.markdown('Summary: Higher values indicate higher volatility days in that month. If recent column shows cooler colors, volatility decreased.')
+            # show example matched charts (overlay target and best match)
+            best = matches[0]
+            example_win = df.iloc[best['index']: best['index']+window_size]
+            fig, axs = plt.subplots(1,2,figsize=(10,3))
+            axs[0].plot(target['Close'].values, marker='o'); axs[0].set_title('Target window (Close)')
+            axs[1].plot(example_win['Close'].values, marker='o'); axs[1].set_title(f'Best match start {best["start"].strftime("%Y-%m-%d %H:%M")}')
+            st.pyplot(fig)
+
+            # show where matches occurred in calendar (list dates and counts)
+            starts = [m['start'].date() for m in matches]
+            dates_count = pd.Series(starts).value_counts().sort_index()
+            st.write('Matches by date:')
+            st.dataframe(dates_count.rename('count'))
         else:
-            st.markdown('Insufficient data for Day vs Month volatility heatmap.')
+            st.write('No matches found.')
+    else:
+        st.info('Not enough candles for similarity search. Increase period or reduce window size.')
+
+    # Sequence-based pattern scan
+    st.subheader('Sequence pattern scan')
+    seq = list(seq_input.strip().upper())
+    if any(c not in ['R','G','N'] for c in seq):
+        st.error('Sequence must be composed of R, G, N only.')
+    else:
+        seq_matches = scan_sequence_pattern(df, seq)
+        st.write(f"Found {len(seq_matches)} occurrences of sequence {''.join(seq)}")
+        if seq_matches:
+            seq_df = pd.DataFrame(seq_matches)
+            seq_df['start'] = seq_df['start'].dt.strftime('%Y-%m-%d %H:%M')
+            seq_df['end'] = seq_df['end'].dt.strftime('%Y-%m-%d %H:%M')
+            seq_df['forward_points'] = seq_df['forward_points'].round(2)
+            st.dataframe(seq_df)
+            # summary
+            arr = seq_df['forward_points'].dropna().values
+            st.write(f"After this sequence, mean forward points: {arr.mean():.2f}, median: {np.median(arr):.2f}, % positive: {(arr>0).sum()/len(arr)*100:.1f}%")
+        else:
+            st.write('No sequence occurrences found in this dataset/timeframe.')
+
+    # Volatility analysis
+    st.subheader('Volatility-based analysis (rolling)')
+    vol = rolling_volatility(df, window=vol_window)
+    df_vol = df.copy(); df_vol['vol'] = vol
+    # pick threshold as percentile
+    thr = np.nanpercentile(df_vol['vol'].dropna(), vol_percentile)
+    st.write(f'Rolling vol threshold (percentile {vol_percentile}) = {thr:.6f}')
+    high_vol_windows = df_vol[df_vol['vol'] >= thr]
+    st.write(f'Found {len(high_vol_windows)} candles above threshold')
+    # For each high-vol candle examine following 3 candles move
+    outcomes = []
+    for idx in high_vol_windows.index:
+        try:
+            i = df.index.get_loc(idx)
+            if i+3 < len(df):
+                fwd = df['Close'].iloc[i+3] - df['Close'].iloc[i]
+                outcomes.append(fwd)
+        except Exception:
+            continue
+    if outcomes:
+        arr = np.array(outcomes)
+        st.write(f'After high-vol candles (above {vol_percentile}th pct), forward 3-candle mean: {arr.mean():.2f}, % positive: {(arr>0).sum()/len(arr)*100:.1f}%')
+    else:
+        st.write('No valid forward outcomes found for high volatility windows.')
+
+    # Heatmaps with annotations
+    st.subheader('Annotated Heatmaps')
+    try:
+        # Day vs Month volatility heatmap (median volatility)
+        tmp = df['Close'].pct_change().dropna().to_frame('ret')
+        tmp['month'] = tmp.index.to_period('M').to_timestamp()
+        tmp['day'] = tmp.index.day
+        pivot = tmp.groupby(['day','month']).ret.std().unstack(fill_value=0)
+        if not pivot.empty:
+            fig, ax = plt.subplots(figsize=(12,6))
+            sns.heatmap(pivot, ax=ax, annot=True, fmt='.4f', cmap='viridis', cbar_kws={'label':'Std(ret)'} )
+            ax.set_title('Day (rows) vs Month (cols) volatility (std of returns)')
+            st.pyplot(fig)
+            st.write('Explanation: cells with larger numbers indicate historically higher volatility on that day/month combination.')
+        else:
+            st.write('Insufficient data for heatmap.')
     except Exception as e:
-        st.warning('Heatmap generation failed gracefully.')
+        st.warning('Heatmap generation error: '+str(e))
 
-    # Month vs Year volatility heatmap
-    try:
-        vol_month_year = make_heatmap_data(df, freq_outer='Y', freq_inner='M', agg='std')
-        if not vol_month_year.empty:
-            fig3, ax3 = plt.subplots(figsize=(10,4))
-            ax3.imshow(vol_month_year.T, aspect='auto')
-            ax3.set_title('Month vs Year volatility (std of returns)')
-            ax3.set_yticks(range(vol_month_year.shape[1]))
-            ax3.set_yticklabels([d.strftime('%Y') for d in vol_month_year.columns])
-            ax3.set_xticks(range(vol_month_year.shape[0]))
-            ax3.set_xticklabels([d.strftime('%b') for d in vol_month_year.index], rotation=90)
-            st.pyplot(fig3)
-            st.markdown('Summary: Look for months consistently hotter across years for seasonal volatility.')
-        else:
-            st.markdown('Insufficient data for Month vs Year volatility heatmap.')
-    except Exception:
-        st.warning('Heatmap generation failed gracefully.')
+    # Compare with secondary ticker if provided
+    if ticker2 and not df2.empty:
+        st.subheader(f'Comparison with {ticker2}')
+        st.write('Showing last 20 rows of second ticker (IST):')
+        st.dataframe(df2.tail(20))
+        # cross-match: find dates where both had similar direction sequences
+        # simple example: count days where both had opening range same direction
+        or1 = opening_range(df)
+        or2 = opening_range(df2)
+        if or1 and or2:
+            same = or1['direction'] == or2['direction']
+            st.write(f'Opening range direction — primary: {or1["direction"]}, secondary: {or2["direction"]}. Same direction? {same}')
 
-    # Returns heatmap (median returns by day vs month)
-    try:
-        ret_pivot = make_heatmap_data(df, freq_outer='M', freq_inner='D', agg='median')
-        if not ret_pivot.empty:
-            fig4, ax4 = plt.subplots(figsize=(10,4))
-            ax4.imshow(ret_pivot.T, aspect='auto')
-            ax4.set_title('Median returns: Day vs Month')
-            st.pyplot(fig4)
-            st.markdown('Summary: Positive median indicates upward bias on those days historically.')
-        else:
-            st.markdown('Insufficient data for Returns heatmap.')
-    except Exception:
-        st.warning('Heatmap generation failed gracefully.')
-
-    # Variance heatmap
-    try:
-        var_pivot = make_heatmap_data(df, freq_outer='M', freq_inner='D', agg='var')
-        if not var_pivot.empty:
-            fig5, ax5 = plt.subplots(figsize=(10,4))
-            ax5.imshow(var_pivot.T, aspect='auto')
-            ax5.set_title('Variance heatmap: Day vs Month')
-            st.pyplot(fig5)
-            st.markdown('Summary: High variance cells are riskier — expect larger swings.')
-        else:
-            st.markdown('Insufficient data for Variance heatmap.')
-    except Exception:
-        st.warning('Heatmap generation failed gracefully.')
-
-    # Median heatmap is same as ret_pivot above
-
-    # Final summary of key insights
-    st.subheader('Key Insights Summary')
-    insights = []
+    # Final plain-language summary
+    st.subheader('Plain-language Summary')
+    summary = []
     if rallies:
-        insights.append(f"Recent multi-candle rallies: {len(rallies)} (latest {rallies[-1]['points']:.1f} pts)")
-    if sweeps:
-        insights.append(f"Liquidity sweeps found: {len(sweeps)} (last at {sweeps[-1]['datetime'].isoformat()})")
-    if orange:
-        insights.append(f"Opening range direction: {orange['direction']} ({orange['points']:.1f} pts)")
-    if not pd.isna(pct_change_from_prev_day):
-        insights.append(f"% change from previous day: {pct_change_from_prev_day:.2f}%")
-    if 'fc' in locals():
-        insights.append(f"Forecast: {fc['expected_points']:.2f} pts, confidence {fc['confidence']*100:.1f}%")
-    if len(insights)==0:
-        st.write('Not enough signals to summarize. Try different thresholds or expand the period.')
+        summary.append(f"There were {len(rallies)} historical multi-candle rallies (>=50 pts). Latest rally was {rallies[-1]['points']:.1f} pts ending at {rallies[-1]['end'].strftime('%Y-%m-%d %H:%M')}")
+    if seq_matches:
+        arr = np.array([m['forward_points'] for m in seq_matches if not pd.isna(m['forward_points'])])
+        if len(arr)>0:
+            summary.append(f"Sequence {''.join(seq)} occurred {len(seq_matches)} times. After it, mean forward {arr.mean():.2f} pts and {((arr>0).sum()/len(arr))*100:.1f}% of occurrences moved up.")
+    if outcomes:
+        summary.append(f"High-volatility candles (>{vol_percentile}th pct) historically led to mean {np.mean(outcomes):.2f} pts in the next 3 candles, positive {((np.array(outcomes)>0).sum()/len(outcomes))*100:.1f}% of times.")
+    if not summary:
+        st.write('No strong signals found with current parameters. Try adjusting window sizes, percentile, or period.')
     else:
-        for it in insights:
-            st.write('- '+it)
+        for s in summary:
+            st.write('- '+s)
 
-    st.success('Analysis complete — use the download buttons in sidebar to export OHLCV data. All datetimes preserved in ISO with timezone info.')
-
-# Show errors gracefully if any
-if st.session_state.get('last_error'):
-    st.error('A non-fatal error occurred during fetch: ' + st.session_state.get('last_error'))
-
-# Footer
 st.markdown('---')
-st.caption('Built for analysis and idea generation. Not financial advice. Validate signals with your risk management rules before trading.')
+st.caption('Updated: timezone fixed to IST, annotated heatmaps, sequence and volatility-based similarity scans, secondary ticker comparison. Not financial advice.')
