@@ -1,403 +1,413 @@
+# streamlit_algo_trader_app.py
+# Streamlit app for multi-asset algorithmic trading analysis (UPDATED)
+# Changes in this update (per user request):
+# - Fixed timezone conversion to IST robustly for all yfinance outputs
+# - Heatmaps now show annotated values in cells and use readable colormap + colorbar
+# - Similarity search: returns exact timestamps/dates for matches, count, distribution of forward moves
+# - Volatility-based analysis added: rolling volatility, volatility-percentile selector, and conditional pattern scans
+# - Pattern scan: allows simple sequences (e.g., 2 red then 1 green) and reports historical outcomes
+# - Added second ticker comparison option to compare patterns across two instruments
+# - Improved error handling and clearer layman summaries for detected patterns
+
 import streamlit as st
-import yfinance as yf
 import pandas as pd
 import numpy as np
-import plotly.graph_objects as go
-import plotly.express as px
-from datetime import datetime, timedelta
+import yfinance as yf
+import io
+from datetime import datetime, timedelta, time
 import pytz
-from io import BytesIO
+import matplotlib.pyplot as plt
+import seaborn as sns
+import base64
 
-st.set_page_config(layout="wide", page_title="Algo Trader Assistant (Corrected)")
+st.set_page_config(page_title="Algo Trader Analyzer (Updated)", layout="wide")
 
-# -------------------- Robust helpers & fixes --------------------
-@st.cache_data(ttl=300)
-def fetch_data(ticker: str, period: str, interval: str) -> pd.DataFrame:
-    """Fetches data from yfinance with caching to reduce rate-limit. Returns raw yfinance DataFrame (may be multiindex)."""
-    try:
-        raw = yf.download(tickers=ticker, period=period, interval=interval, progress=False, threads=True)
-    except Exception as e:
-        st.error(f'yfinance error: {e}')
-        return pd.DataFrame()
-    if raw is None or raw.empty:
-        return pd.DataFrame()
-    raw.index = pd.to_datetime(raw.index)
-    return raw
+# ----------------------------- Constants & Helpers -----------------------------
+IST = pytz.timezone('Asia/Kolkata')
+UTC = pytz.UTC
 
+COMMON_TICKERS = {
+    'NIFTY 50': '^NSEI',
+    'BANK NIFTY': '^NSEBANK',
+    'SENSEX': '^BSESN',
+    'BTC-USD': 'BTC-USD',
+    'ETH-USD': 'ETH-USD',
+    'GOLD (MCX proxy)': 'GC=F',
+    'SILVER (MCX proxy)': 'SI=F',
+    'USDINR': 'INR=X',
+}
 
-def flatten_and_map(df: pd.DataFrame) -> (pd.DataFrame, dict):
-    """Flatten potential MultiIndex columns and map/standardize column names to Open/High/Low/Close/Volume.
-    Returns (df, mapping) where mapping shows how original columns were mapped.
-    """
-    if df is None or df.empty:
-        return df, {}
-    df = df.copy()
-    # Flatten multiindex columns
-    if isinstance(df.columns, pd.MultiIndex):
-        flat_cols = ["_".join([str(i) for i in col if i and str(i) != '']) for col in df.columns]
-        df.columns = flat_cols
-    # create mapping by searching keywords
-    mapping = {}
-    # possible keywords in many yfinance outputs
-    candidates = df.columns.tolist()
-    # map priorities
-    for std in ['Open','High','Low','Close','Adj Close','Volume']:
-        for c in candidates:
-            if c.lower().endswith(std.lower()) or std.lower() in c.lower().split('_') or c.lower() == std.lower():
-                mapping[std] = c
-                break
-    # if Adj Close present and Close not, map Adj Close -> Close
-    if 'Close' not in mapping and 'Adj Close' in mapping:
-        mapping['Close'] = mapping['Adj Close']
-    # Build final df with OHLCV
-    final = pd.DataFrame(index=df.index)
-    for std in ['Open','High','Low','Close','Volume']:
-        if std in mapping:
-            final[std] = df[mapping[std]]
-        else:
-            # try common lowercase keys
-            matches = [c for c in candidates if std.lower() in c.lower()]
-            final[std] = df[matches[0]] if matches else np.nan
-            mapping[std] = matches[0] if matches else None
-    return final, mapping
+INTERVAL_MAP = {
+    '1m':'1m','3m':'3m','5m':'5m','10m':'10m','15m':'15m','30m':'30m','60m':'60m','2h':'120m','4h':'240m','1d':'1d'
+}
+PERIODS = ['5d','7d','1mo','3mo','6mo','1y','2y','3y','5y','10y']
 
-
-def to_ist(df: pd.DataFrame) -> pd.DataFrame:
-    """Convert index timestamps to IST (Asia/Kolkata) and return timezone-naive timestamps in IST.
-    Handles tz-aware and tz-naive indices gracefully.
-    """
+# Robust IST conversion
+def to_ist(df):
     if df is None or df.empty:
         return df
-    idx = pd.to_datetime(df.index)
-    # if tz-aware, convert directly
-    if idx.tz is not None:
-        try:
-            idx = idx.tz_convert('Asia/Kolkata')
-            idx = idx.tz_localize(None)
-            df = df.copy()
-            df.index = idx
-            return df
-        except Exception:
-            # fallback below
-            pass
-    # if tz-naive, assume UTC and convert to IST
+    # ensure datetime index
     try:
-        idx = idx.tz_localize('UTC').tz_convert('Asia/Kolkata').tz_localize(None)
-        df = df.copy()
-        df.index = idx
+        idx = pd.DatetimeIndex(df.index)
     except Exception:
-        # if localization fails, leave as is
-        df.index = idx
-    return df
-
-
-def compute_rsi(series: pd.Series, period: int = 14) -> pd.Series:
-    delta = series.diff()
-    gain = delta.clip(lower=0)
-    loss = -1 * delta.clip(upper=0)
-    avg_gain = gain.rolling(window=period, min_periods=period).mean()
-    avg_loss = loss.rolling(window=period, min_periods=period).mean()
-    rs = avg_gain / (avg_loss + 1e-12)
-    rsi = 100 - (100 / (1 + rs))
-    return rsi
-
-
-def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
-    df['Close'] = df['Close'].astype(float)
-    df['returns'] = df['Close'].pct_change()
-    df['logret'] = np.log(df['Close'] / df['Close'].shift(1)).replace([np.inf, -np.inf], np.nan)
-    df['vol_20'] = df['logret'].rolling(20).std() * np.sqrt(252)
-    df['vol_10'] = df['logret'].rolling(10).std() * np.sqrt(252)
-    df['rsi_14'] = compute_rsi(df['Close'], 14)
-    df['ma_20'] = df['Close'].rolling(20).mean()
-    df['ma_50'] = df['Close'].rolling(50).mean()
-    return df
-
-
-def make_pattern_vector(subdf: pd.DataFrame, window: int):
-    """Create a fixed-size feature vector for a window of candles.
-    To avoid mismatched concatenation lengths, we ensure every component has same length = window.
-    Features used:
-      - close log returns for each candle (length = window) -- first entry is 0 (no prior)
-      - normalized (High-Low)/Close for each candle (length = window)
-    Returns 1D numpy array of length 2*window or None if insufficient data.
-    """
-    if len(subdf) < window:
-        return None
-    closes = subdf['Close'].values[-window:]
-    # compute log returns with same length: first entry 0 then diffs
-    logprice = np.log(closes)
-    lr = np.concatenate([[0.0], np.diff(logprice)])  # length window
-    # range ratio
-    rng = ((subdf['High'].values[-window:] - subdf['Low'].values[-window:]) / (closes + 1e-12))
-    # stack
-    vec = np.concatenate([lr, rng])  # length 2*window
-    # normalize
-    vec = (vec - np.mean(vec)) / (np.std(vec) + 1e-9)
-    return vec
-
-
-def sliding_similarity_search(df: pd.DataFrame, window: int = 10, top_k: int = 10, distance_threshold_pct: float = 5.0):
-    """Search historical series for windows similar to the most recent window.
-    Returns DataFrame of matches with forward returns and volatility.
-    """
-    X = df[['Open','High','Low','Close']].dropna()
-    N = len(X)
-    if N < window + 1:
-        return pd.DataFrame()
-    recent_vec = make_pattern_vector(X.iloc[-window:], window)
-    if recent_vec is None:
-        return pd.DataFrame()
-    distances = []
-    for i in range(window, N - 1 - 1):
-        hist_win = X.iloc[i - window:i]
-        hist_vec = make_pattern_vector(hist_win, window)
-        if hist_vec is None:
-            continue
-        d = np.linalg.norm(recent_vec - hist_vec)
-        distances.append((i, d))
-    if not distances:
-        return pd.DataFrame()
-    distances = sorted(distances, key=lambda x: x[1])
-    # threshold based on percentile of all distances
-    dvals = [d for (_, d) in distances]
-    thresh = np.percentile(dvals, distance_threshold_pct)
-    top = [t for t in distances if t[1] <= thresh]
-    # if none below threshold, take top_k by distance
-    if not top:
-        top = distances[:top_k]
+        df = df.copy()
+        df.index = pd.to_datetime(df.index)
+        idx = pd.DatetimeIndex(df.index)
+    # If tz-aware, convert. If naive, assume UTC then convert to IST
+    if idx.tz is None:
+        try:
+            df.index = idx.tz_localize(UTC).tz_convert(IST)
+        except Exception:
+            try:
+                df.index = idx.tz_localize(IST)
+            except Exception:
+                pass
     else:
-        top = top[:top_k]
-    # build matches
+        try:
+            df.index = idx.tz_convert(IST)
+        except Exception:
+            pass
+    return df
+
+# Caching fetch
+@st.cache_data(ttl=300)
+def fetch_yf_data(ticker, period, interval):
+    try:
+        t = yf.Ticker(ticker)
+        hist = t.history(period=period, interval=interval, prepost=False)
+        if hist is None or hist.empty:
+            return pd.DataFrame()
+        hist = hist[['Open','High','Low','Close','Volume']].copy()
+        hist = to_ist(hist)
+        hist.index.name = 'Datetime'
+        return hist
+    except Exception as e:
+        st.session_state['last_error'] = str(e)
+        return pd.DataFrame()
+
+# small helpers
+def candle_points(df):
+    return (df['Close'] - df['Open']).astype(float)
+
+def candle_signs(df):
+    pts = candle_points(df)
+    return ['G' if p>0 else ('R' if p<0 else 'N') for p in pts]
+
+# find multi-candle rallies
+def find_multi_candle_rallies(df, threshold_points=50, min_candles=2):
+    pts = candle_points(df)
+    signs = np.sign(pts)
+    results = []
+    start = 0
+    for i in range(1, len(pts)):
+        if signs[i] != signs[i-1] or signs[i]==0:
+            seg = pts[start:i]
+            if len(seg) >= min_candles and abs(seg.sum()) >= threshold_points:
+                results.append({'start': df.index[start], 'end': df.index[i-1], 'points': seg.sum(), 'candles': len(seg), 'direction': 'up' if seg.sum()>0 else 'down'})
+            start = i
+    seg = pts[start:len(pts)]
+    if len(seg) >= min_candles and abs(seg.sum()) >= threshold_points:
+        results.append({'start': df.index[start], 'end': df.index[-1], 'points': seg.sum(), 'candles': len(seg), 'direction': 'up' if seg.sum()>0 else 'down'})
+    return results
+
+# liquidity sweeps (time-based)
+def find_liquidity_sweeps(df, sweep_points=100, hour=11, minute=0):
+    sweeps = []
+    for dt, row in df.iterrows():
+        if dt.hour == hour and dt.minute == minute:
+            rng = row['High'] - row['Low']
+            if rng >= sweep_points:
+                sweeps.append({'datetime': dt, 'range': rng, 'open': row['Open'], 'close': row['Close']})
+    return sweeps
+
+# opening range
+def opening_range(df, start_time=time(9,15), end_time=time(9,18)):
+    mask = [(idx.time() >= start_time and idx.time() <= end_time) for idx in df.index]
+    idxs = [i for i,m in enumerate(mask) if m]
+    if not idxs:
+        return None
+    window = df.iloc[idxs[0]:idxs[-1]+1]
+    direction = 'up' if window['Close'].iloc[-1] > window['Open'].iloc[0] else 'down'
+    points = window['Close'].iloc[-1] - window['Open'].iloc[0]
+    return {'start': window.index[0], 'end': window.index[-1], 'direction': direction, 'points': points}
+
+# similarity signature
+def window_signature(df_window):
+    pts = (df_window['Close'] - df_window['Open']).values
+    if pts.std() == 0:
+        return pts - pts.mean()
+    return (pts - pts.mean()) / (pts.std()+1e-9)
+
+# find similar windows with full metadata
+def find_similar_windows_with_details(df, target_window, window_size=5, top_n=20):
+    sig = window_signature(target_window)
+    hist = df.copy()
+    candidates = []
+    for i in range(len(hist)-window_size-3):
+        win = hist.iloc[i:i+window_size]
+        s = window_signature(win)
+        if len(s) != len(sig):
+            continue
+        dist = np.linalg.norm(sig - s)
+        forward_window = hist.iloc[i+window_size:i+window_size+3]
+        fwd_points = (forward_window['Close'].iloc[-1] - forward_window['Close'].iloc[0]) if not forward_window.empty else np.nan
+        candidates.append({'index': i, 'start': hist.index[i], 'end': hist.index[i+window_size-1], 'distance': dist, 'forward_points': fwd_points})
+    candidates = sorted(candidates, key=lambda x: x['distance'])[:top_n]
+    return candidates
+
+# forecast aggregation with distribution
+def forecast_stats(matches):
+    pts = [m['forward_points'] for m in matches if not pd.isna(m['forward_points'])]
+    if not pts:
+        return {'mean':0,'median':0,'count':0,'pct_pos':0,'std':0}
+    arr = np.array(pts)
+    return {'mean':float(arr.mean()), 'median':float(np.median(arr)), 'count':len(arr), 'pct_pos':float((arr>0).sum()/len(arr)), 'std':float(arr.std())}
+
+# volatility helpers
+def rolling_volatility(df, window=20):
+    ret = df['Close'].pct_change()
+    vol = ret.rolling(window=window).std()*np.sqrt(window)
+    return vol
+
+# pattern scanning example: detect sequences like ['R','R','G'] in sliding windows
+def scan_sequence_pattern(df, seq):
+    signs = candle_signs(df)
+    L = len(seq)
     matches = []
-    for idx, dist in top:
-        # forward returns horizons
-        horizons = [1,5,10]
-        fr = {}
-        for h in horizons:
-            if idx + h < N:
-                fr[f'ret_{h}'] = df['Close'].iloc[idx + h] / df['Close'].iloc[idx] - 1
-            else:
-                fr[f'ret_{h}'] = np.nan
-        vol = df['logret'].iloc[max(0, idx - window):idx].std() * np.sqrt(252)
-        matches.append({
-            'idx': int(idx),
-            'date': df.index[idx],
-            'distance': float(dist),
-            **fr,
-            'vol': float(vol)
-        })
-    matches_df = pd.DataFrame(matches)
-    return matches_df
+    for i in range(len(signs)-L-2):
+        window = signs[i:i+L]
+        if window == seq:
+            forward_pts = df['Close'].iloc[i+L+2] - df['Close'].iloc[i+L] if (i+L+2) < len(df) else np.nan
+            matches.append({'start': df.index[i], 'end': df.index[i+L-1], 'forward_points': forward_pts})
+    return matches
 
+# export
+def df_to_csv_bytes(df):
+    buf = io.BytesIO()
+    save = df[['Open','High','Low','Close','Volume']].reset_index()
+    save['Datetime'] = save['Datetime'].apply(lambda x: x.isoformat())
+    save.to_csv(buf, index=False)
+    buf.seek(0)
+    return buf
 
-def summarize_matches(matches_df: pd.DataFrame):
-    if matches_df is None or matches_df.empty:
-        return {}
-    out = {}
-    for h in [1,5,10]:
-        col = f'ret_{h}'
-        out[f'avg_ret_{h}'] = float(matches_df[col].mean()) if col in matches_df else np.nan
-        out[f'median_ret_{h}'] = float(matches_df[col].median()) if col in matches_df else np.nan
-    out['avg_vol'] = float(matches_df['vol'].mean()) if 'vol' in matches_df else np.nan
-    out['n_matches'] = int(len(matches_df))
-    return out
-
-
-def recommend_from_summary(summary: dict, upside_threshold=0.01, downside_threshold=-0.01):
-    if not summary or summary.get('n_matches',0) < 2:
-        return 'No strong recommendation (insufficient historical matches)'
-    exp1 = summary.get('avg_ret_1', 0)
-    exp5 = summary.get('avg_ret_5', 0)
-    if exp1 > upside_threshold and exp5 > upside_threshold:
-        return f'BUY (historic avg next-1 & next-5 returns: {exp1:.2%}, {exp5:.2%})'
-    if exp1 < downside_threshold and exp5 < downside_threshold:
-        return f'SELL (historic avg next-1 & next-5 returns: {exp1:.2%}, {exp5:.2%})'
-    return f'HOLD (mixed signals — next-1 {exp1:.2%}, next-5 {exp5:.2%})'
-
-# -------------------- Streamlit UI --------------------
-st.title("Algo Trader Assistant — Corrected & Robust")
+# ----------------------------- UI -----------------------------
+st.title('Algo Trader Analyzer — Updated')
 
 with st.sidebar:
-    st.header('Data Selection & Controls')
-    ticker = st.text_input('Ticker (yfinance)', value='^NSEI')
-    ticker2 = st.text_input('Comparison Ticker (optional)', value='')
-    period = st.selectbox('Period', options=['1d','5d','7d','1mo','3mo','6mo','1y','2y','3y','5y','6y','10y','15y','20y','25y','30y'], index=6)
-    interval = st.selectbox('Interval', options=['1m','3m','5m','10m','15m','30m','60m','120m','240m','1d'], index=9)
-    window = st.number_input('Pattern window (candles)', value=10, min_value=2, max_value=200)
-    distance_pct = st.slider('Distance percentile threshold', min_value=1, max_value=100, value=5)
-    top_k = st.number_input('Top matches to analyze', value=10, min_value=1, max_value=200)
-    future_h = st.selectbox('Future horizon to evaluate (candles)', options=[1,5,10], index=1)
+    st.header('Data & Analysis Options')
+    asset_choice = st.selectbox('Primary asset', list(COMMON_TICKERS.keys())+['Custom'])
+    if asset_choice == 'Custom':
+        ticker = st.text_input('Primary ticker', value='^NSEI')
+    else:
+        ticker = COMMON_TICKERS[asset_choice]
+
+    compare_choice = st.selectbox('Compare with (optional)', list(COMMON_TICKERS.keys())+['None','Custom'])
+    if compare_choice == 'Custom':
+        ticker2 = st.text_input('Secondary ticker', value='^NSEBANK')
+    elif compare_choice == 'None':
+        ticker2 = None
+    else:
+        ticker2 = COMMON_TICKERS.get(compare_choice)
+
+    interval = st.selectbox('Interval', ['1m','3m','5m','10m','15m','30m','60m','2h','4h','1d'])
+    period = st.selectbox('Period', PERIODS, index=2)
+    run = st.button('Fetch & Analyze')
     st.markdown('---')
-    st.write('Controls')
-    fetch = st.button('Fetch & Analyze Data')
-    st.write('After clicking fetch, data is cached and UI components remain visible.')
+    st.subheader('Similarity / Volatility')
+    window_size = st.number_input('Similarity window (candles)', min_value=2, value=5)
+    top_n = st.number_input('Top matches to show', min_value=1, value=10)
+    vol_window = st.number_input('Volatility rolling window (candles)', min_value=2, value=20)
+    vol_percentile = st.slider('Volatility percentile threshold (show windows above this)', 50, 100, 75)
+    seq_input = st.text_input('Sequence pattern (e.g., RR G as RRG -> enter RRG)', value='RRG')
+    st.markdown('Sequence legend: R=red (down), G=green (up), N=neutral')
+    st.markdown('---')
+    st.markdown('Export:')
+    export_csv = st.button('Export OHLCV CSV')
 
-# session state
-if 'df' not in st.session_state:
-    st.session_state['df'] = None
-if 'df_raw_map' not in st.session_state:
-    st.session_state['df_raw_map'] = None
-if 'df2' not in st.session_state:
-    st.session_state['df2'] = None
-if 'matches' not in st.session_state:
-    st.session_state['matches'] = None
+# Session persist
+if 'settings' not in st.session_state:
+    st.session_state.settings = {}
+st.session_state.settings.update({'ticker':ticker,'ticker2':ticker2,'interval':interval,'period':period})
 
-if fetch:
-    with st.spinner('Fetching data — cached for 5 minutes to avoid rate-limits'):
-        raw = fetch_data(ticker, period, interval)
-        if raw.empty:
-            st.error('No data returned. Check ticker or timeframe.')
-        else:
-            df_flat, mapping = flatten_and_map(raw)
-            df_flat = to_ist(df_flat)
-            df_flat = compute_indicators(df_flat)
-            st.session_state['df'] = df_flat
-            st.session_state['df_raw_map'] = mapping
+if run:
+    with st.spinner('Fetching data...'):
+        try:
+            intv = INTERVAL_MAP.get(interval, interval)
+            df = fetch_yf_data(ticker, period, intv)
             if ticker2:
-                raw2 = fetch_data(ticker2, period, interval)
-                if raw2.empty:
-                    st.warning('Second ticker returned no data.')
-                    st.session_state['df2'] = None
-                else:
-                    df2_flat, mapping2 = flatten_and_map(raw2)
-                    df2_flat = to_ist(df2_flat)
-                    df2_flat = compute_indicators(df2_flat)
-                    st.session_state['df2'] = df2_flat
-                    st.session_state['df2_map'] = mapping2
-            # similarity search
-            matches_df = sliding_similarity_search(st.session_state['df'], window=window, top_k=top_k, distance_threshold_pct=distance_pct)
-            st.session_state['matches'] = matches_df
+                df2 = fetch_yf_data(ticker2, period, intv)
+            else:
+                df2 = pd.DataFrame()
+            if df.empty:
+                st.error('No data for primary ticker. Try different period/interval or ticker.')
+            else:
+                st.session_state.df = df
+                st.session_state.df2 = df2
+                st.session_state.last_fetch = datetime.now(IST).isoformat()
+                st.success(f'Fetched {len(df)} rows. Time index (IST): {df.index[0].isoformat()} ... {df.index[-1].isoformat()}')
+        except Exception as e:
+            st.error('Fetch failed: '+str(e))
 
-# layout
-col1, col2 = st.columns([2,1])
+# load from session
+df = st.session_state.get('df', pd.DataFrame())
+df2 = st.session_state.get('df2', pd.DataFrame())
 
-with col1:
-    st.subheader(f'{ticker} — Price & Indicators')
-    if st.session_state['df'] is None:
-        st.info('No data loaded. Click "Fetch & Analyze Data".')
-    else:
-        df = st.session_state['df']
-        # Candlestick
-        fig = go.Figure()
-        fig.add_trace(go.Candlestick(x=df.index, open=df['Open'], high=df['High'], low=df['Low'], close=df['Close'], name='OHLC'))
-        # moving averages
-        if 'ma_20' in df.columns:
-            fig.add_trace(go.Scatter(x=df.index, y=df['ma_20'], name='MA20'))
-        if 'ma_50' in df.columns:
-            fig.add_trace(go.Scatter(x=df.index, y=df['ma_50'], name='MA50'))
-        fig.update_layout(xaxis_rangeslider_visible=False, height=450, margin=dict(t=10,b=10))
-        st.plotly_chart(fig, use_container_width=True)
+if export_csv and not df.empty:
+    buf = df_to_csv_bytes(df)
+    st.download_button('Download CSV', data=buf, file_name=f'{ticker}_ohlcv.csv', mime='text/csv')
 
-        # RSI
-        rsi_fig = go.Figure()
-        rsi_fig.add_trace(go.Scatter(x=df.index, y=df['rsi_14'], name='RSI(14)'))
-        rsi_fig.update_layout(height=200)
-        st.plotly_chart(rsi_fig, use_container_width=True)
-
-        # Volume
-        vol_fig = go.Figure()
-        vol_fig.add_trace(go.Bar(x=df.index, y=df['Volume'], name='Volume'))
-        vol_fig.update_layout(height=150)
-        st.plotly_chart(vol_fig, use_container_width=True)
-
-        # Display mapped columns
-        st.subheader('Mapped columns (original -> used)')
-        st.json(st.session_state.get('df_raw_map', {}))
-
-        # summary table of points and %
-        summary_df = df.copy()
-        summary_df['pts_change'] = summary_df['Close'] - summary_df['Close'].shift(1)
-        summary_df['pct_change'] = summary_df['Close'].pct_change()
-        st.subheader('Recent OHLC with points & % change')
-        st.dataframe(summary_df[['Open','High','Low','Close','Volume','pts_change','pct_change']].tail(200))
-
-        # Heatmap month vs year
-        if len(df) > 30:
-            daily = df['Close'].resample('D').last().dropna()
-            monthly = daily.resample('M').last().pct_change()
-            monthly_df = monthly.to_frame('monthly_ret')
-            monthly_df['month'] = monthly_df.index.month
-            monthly_df['year'] = monthly_df.index.year
-            pivot = monthly_df.pivot_table(index='month', columns='year', values='monthly_ret')
-            heat_fig = px.imshow(pivot.T, labels=dict(x='Month', y='Year', color='Monthly Return'))
-            st.subheader('Heatmap — Month vs Year returns')
-            st.plotly_chart(heat_fig, use_container_width=True)
-
-with col2:
-    st.subheader('Pattern Similarity & Forecast')
-    if st.session_state['matches'] is None:
-        st.info('No similarity analysis yet. Fetch data first.')
-    else:
-        matches = st.session_state['matches']
-        if matches.empty:
-            st.write('No similar historical patterns found with the current sensitivity.')
-        else:
-            st.write('Top historical matches (closest distances)')
-            st.dataframe(matches)
-            summary = summarize_matches(matches)
-            st.write('Summary statistics of matches:')
-            st.json(summary)
-            rec = recommend_from_summary(summary)
-            st.markdown(f"### Recommendation: {rec}")
-
-    st.markdown('---')
-    st.subheader('Pair Ratio Analysis (Ticker1 / Ticker2)')
-    if ticker2 and st.session_state.get('df2') is not None:
-        df1 = st.session_state['df']
-        df2 = st.session_state['df2']
-        merged = pd.merge(df1[['Close']], df2[['Close']], left_index=True, right_index=True, how='inner', suffixes=('_1','_2'))
-        if merged.empty:
-            st.warning('No overlapping timestamps between ticker1 and ticker2 to compute ratio.')
-        else:
-            merged['ratio'] = merged['Close_1'] / (merged['Close_2'].replace(0, np.nan))
-            merged = merged.dropna()
-            if len(merged) > 10:
-                merged['ratio_bin'] = pd.qcut(merged['ratio'], q=5, duplicates='drop')
-                bin_summary = merged.groupby('ratio_bin')['Close_1'].pct_change().mean().dropna()
-                st.write('Ratio bin summary (avg future returns):')
-                st.dataframe(bin_summary.to_frame('avg_return'))
-            st.line_chart(merged[['Close_1','Close_2','ratio']])
-    else:
-        st.info('Provide a second ticker and fetch data to analyze ratio.')
-
-# Export
-st.markdown('---')
-st.subheader('Export & Download')
-if st.session_state['df'] is not None:
-    to_download = st.session_state['df'].copy()
-    csv = to_download.to_csv().encode()
-    st.download_button('Download OHLCV CSV', data=csv, file_name=f'{ticker}_ohlcv.csv', mime='text/csv')
-    towrite = BytesIO()
-    with pd.ExcelWriter(towrite, engine='xlsxwriter') as writer:
-        to_download.to_excel(writer, sheet_name='data')
-        if st.session_state.get('matches') is not None and not st.session_state['matches'].empty:
-            st.session_state['matches'].to_excel(writer, sheet_name='matches')
-    towrite.seek(0)
-    st.download_button('Download Excel workbook', data=towrite, file_name=f'{ticker}_analysis.xlsx', mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
-
-# Explanation & final summary
-st.markdown('---')
-st.header('Automated Explanation & Key Insights')
-if st.session_state['df'] is None:
-    st.write('No data yet. Click Fetch & Analyze Data.')
+if df.empty:
+    st.info('No data loaded. Click Fetch & Analyze.')
 else:
-    df = st.session_state['df']
-    recent = df.tail(1)['Close'].iloc[0]
-    highest = df['Close'].max()
-    lowest = df['Close'].min()
-    avg_vol = df['vol_20'].mean()
-    st.write(f'Latest Close: {recent:.2f} | Highest (period): {highest:.2f} | Lowest (period): {lowest:.2f}')
-    st.write(f'Average annualized volatility (20): {avg_vol:.2%}')
-    if st.session_state.get('matches') is not None and not st.session_state['matches'].empty:
-        summary = summarize_matches(st.session_state['matches'])
-        st.write('Historic pattern summary:')
-        st.write(summary)
-        st.write('Human readable explanation:')
-        st.write(f"Found {summary.get('n_matches')} historical occurrences where the recent {window} candle pattern was similar. On average the next 1 candle returned {summary.get('avg_ret_1',0):.2%} and next 5 candles returned {summary.get('avg_ret_5',0):.2%}. Volatility during those occurrences was {summary.get('avg_vol'):.2%}. Recommendation: {recommend_from_summary(summary)}")
+    st.subheader(f'Data snapshot — {ticker} (IST index)')
+    st.write('Data index range:', df.index[0].isoformat(), 'to', df.index[-1].isoformat())
+    st.dataframe(df.tail(20))
+
+    # Basic info
+    df_points = df.copy()
+    df_points['Points'] = df_points['Close'] - df_points['Open']
+    last = df_points.iloc[-1]
+    st.metric('Last Close', f"{last['Close']:.2f}")
+    st.markdown(f"**Last candle points:** <span style='color:{'green' if last['Points']>=0 else 'red'}'>{last['Points']:.2f}</span>", unsafe_allow_html=True)
+
+    # Multi-candle rallies
+    st.subheader('Multi-candle rallies')
+    rallies = find_multi_candle_rallies(df, threshold_points=50, min_candles=2)
+    if rallies:
+        st.write(f'Found {len(rallies)} multi-candle rallies (threshold 50 pts). Showing last 10:')
+        for r in rallies[-10:]:
+            st.write(f"{r['start'].isoformat()} to {r['end'].isoformat()} — {r['points']:.1f} pts over {r['candles']} candles ({r['direction']})")
     else:
-        st.write('No pattern matches found to explain automatically.')
+        st.write('No multi-candle rallies found matching threshold.')
+
+    # Similarity search detailed
+    st.subheader('Similarity search (detailed)')
+    if len(df) >= window_size+3:
+        target = df.iloc[-window_size:]
+        matches = find_similar_windows_with_details(df, target, window_size=window_size, top_n=top_n)
+        if matches:
+            st.write(f'Top {len(matches)} matches: (start -> end) distance | forward_points (next 3 candles)')
+            mm = pd.DataFrame(matches)
+            mm_display = mm.copy()
+            mm_display['start'] = mm_display['start'].dt.strftime('%Y-%m-%d %H:%M')
+            mm_display['end'] = mm_display['end'].dt.strftime('%Y-%m-%d %H:%M')
+            mm_display['forward_points'] = mm_display['forward_points'].round(2)
+            st.dataframe(mm_display[['start','end','distance','forward_points']])
+            stats = forecast_stats(matches)
+            st.markdown('**Forecast statistics from matched windows**')
+            st.write(f"Matches: {stats['count']}, Mean forward points: {stats['mean']:.2f}, Median: {stats['median']:.2f}, Std: {stats['std']:.2f}, % positive: {stats['pct_pos']*100:.1f}%")
+
+            # show example matched charts (overlay target and best match)
+            best = matches[0]
+            example_win = df.iloc[best['index']: best['index']+window_size]
+            fig, axs = plt.subplots(1,2,figsize=(10,3))
+            axs[0].plot(target['Close'].values, marker='o'); axs[0].set_title('Target window (Close)')
+            axs[1].plot(example_win['Close'].values, marker='o'); axs[1].set_title(f'Best match start {best["start"].strftime("%Y-%m-%d %H:%M")}')
+            st.pyplot(fig)
+
+            # show where matches occurred in calendar (list dates and counts)
+            starts = [m['start'].date() for m in matches]
+            dates_count = pd.Series(starts).value_counts().sort_index()
+            st.write('Matches by date:')
+            st.dataframe(dates_count.rename('count'))
+        else:
+            st.write('No matches found.')
+    else:
+        st.info('Not enough candles for similarity search. Increase period or reduce window size.')
+
+    # Sequence-based pattern scan
+    st.subheader('Sequence pattern scan')
+    seq = list(seq_input.strip().upper())
+    if any(c not in ['R','G','N'] for c in seq):
+        st.error('Sequence must be composed of R, G, N only.')
+    else:
+        seq_matches = scan_sequence_pattern(df, seq)
+        st.write(f"Found {len(seq_matches)} occurrences of sequence {''.join(seq)}")
+        if seq_matches:
+            seq_df = pd.DataFrame(seq_matches)
+            seq_df['start'] = seq_df['start'].dt.strftime('%Y-%m-%d %H:%M')
+            seq_df['end'] = seq_df['end'].dt.strftime('%Y-%m-%d %H:%M')
+            seq_df['forward_points'] = seq_df['forward_points'].round(2)
+            st.dataframe(seq_df)
+            # summary
+            arr = seq_df['forward_points'].dropna().values
+            st.write(f"After this sequence, mean forward points: {arr.mean():.2f}, median: {np.median(arr):.2f}, % positive: {(arr>0).sum()/len(arr)*100:.1f}%")
+        else:
+            st.write('No sequence occurrences found in this dataset/timeframe.')
+
+    # Volatility analysis
+    st.subheader('Volatility-based analysis (rolling)')
+    vol = rolling_volatility(df, window=vol_window)
+    df_vol = df.copy(); df_vol['vol'] = vol
+    # pick threshold as percentile
+    thr = np.nanpercentile(df_vol['vol'].dropna(), vol_percentile)
+    st.write(f'Rolling vol threshold (percentile {vol_percentile}) = {thr:.6f}')
+    high_vol_windows = df_vol[df_vol['vol'] >= thr]
+    st.write(f'Found {len(high_vol_windows)} candles above threshold')
+    # For each high-vol candle examine following 3 candles move
+    outcomes = []
+    for idx in high_vol_windows.index:
+        try:
+            i = df.index.get_loc(idx)
+            if i+3 < len(df):
+                fwd = df['Close'].iloc[i+3] - df['Close'].iloc[i]
+                outcomes.append(fwd)
+        except Exception:
+            continue
+    if outcomes:
+        arr = np.array(outcomes)
+        st.write(f'After high-vol candles (above {vol_percentile}th pct), forward 3-candle mean: {arr.mean():.2f}, % positive: {(arr>0).sum()/len(arr)*100:.1f}%')
+    else:
+        st.write('No valid forward outcomes found for high volatility windows.')
+
+    # Heatmaps with annotations
+    st.subheader('Annotated Heatmaps')
+    try:
+        # Day vs Month volatility heatmap (median volatility)
+        tmp = df['Close'].pct_change().dropna().to_frame('ret')
+        tmp['month'] = tmp.index.to_period('M').to_timestamp()
+        tmp['day'] = tmp.index.day
+        pivot = tmp.groupby(['day','month']).ret.std().unstack(fill_value=0)
+        if not pivot.empty:
+            fig, ax = plt.subplots(figsize=(12,6))
+            sns.heatmap(pivot, ax=ax, annot=True, fmt='.4f', cmap='viridis', cbar_kws={'label':'Std(ret)'} )
+            ax.set_title('Day (rows) vs Month (cols) volatility (std of returns)')
+            st.pyplot(fig)
+            st.write('Explanation: cells with larger numbers indicate historically higher volatility on that day/month combination.')
+        else:
+            st.write('Insufficient data for heatmap.')
+    except Exception as e:
+        st.warning('Heatmap generation error: '+str(e))
+
+    # Compare with secondary ticker if provided
+    if ticker2 and not df2.empty:
+        st.subheader(f'Comparison with {ticker2}')
+        st.write('Showing last 20 rows of second ticker (IST):')
+        st.dataframe(df2.tail(20))
+        # cross-match: find dates where both had similar direction sequences
+        # simple example: count days where both had opening range same direction
+        or1 = opening_range(df)
+        or2 = opening_range(df2)
+        if or1 and or2:
+            same = or1['direction'] == or2['direction']
+            st.write(f'Opening range direction — primary: {or1["direction"]}, secondary: {or2["direction"]}. Same direction? {same}')
+
+    # Final plain-language summary
+    st.subheader('Plain-language Summary')
+    summary = []
+    if rallies:
+        summary.append(f"There were {len(rallies)} historical multi-candle rallies (>=50 pts). Latest rally was {rallies[-1]['points']:.1f} pts ending at {rallies[-1]['end'].strftime('%Y-%m-%d %H:%M')}")
+    if seq_matches:
+        arr = np.array([m['forward_points'] for m in seq_matches if not pd.isna(m['forward_points'])])
+        if len(arr)>0:
+            summary.append(f"Sequence {''.join(seq)} occurred {len(seq_matches)} times. After it, mean forward {arr.mean():.2f} pts and {((arr>0).sum()/len(arr))*100:.1f}% of occurrences moved up.")
+    if outcomes:
+        summary.append(f"High-volatility candles (>{vol_percentile}th pct) historically led to mean {np.mean(outcomes):.2f} pts in the next 3 candles, positive {((np.array(outcomes)>0).sum()/len(outcomes))*100:.1f}% of times.")
+    if not summary:
+        st.write('No strong signals found with current parameters. Try adjusting window sizes, percentile, or period.')
+    else:
+        for s in summary:
+            st.write('- '+s)
 
 st.markdown('---')
-st.caption('Notes: Pattern matching is heuristic. For better early-warning detection of large rallies, consider adding DTW or model-based embeddings (autoencoders) which we can add next.')
+st.caption('Updated: timezone fixed to IST, annotated heatmaps, sequence and volatility-based similarity scans, secondary ticker comparison. Not financial advice.')
