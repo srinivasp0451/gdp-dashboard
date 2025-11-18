@@ -179,7 +179,7 @@ if st.session_state.data_fetched:
         
         metric_col1, metric_col2, metric_col3 = st.columns(3)
         metric_col1.metric("Latest Price", f"{float(latest_price1):.2f}")
-        metric_col2.metric("Change", f"{change1:.2f}", f"{pct_change1:.2f}%")
+        metric_col2.metric("Change", f"{float(change1:.2f})", f"{float(pct_change1):.2f}%")
         metric_col3.metric("RSI", f"{rsi1.iloc[-1]:.2f}")
         
         # Basic stats table
@@ -199,8 +199,8 @@ if st.session_state.data_fetched:
         pct_change2 = (change2 / prev_price2) * 100
         
         metric_col1, metric_col2, metric_col3 = st.columns(3)
-        metric_col1.metric("Latest Price", f"{latest_price2:.2f}")
-        metric_col2.metric("Change", f"{change2:.2f}", f"{pct_change2:.2f}%")
+        metric_col1.metric("Latest Price", f"{float(latest_price2):.2f}")
+        metric_col2.metric("Change", f"{float(change2):.2f}", f"{float(pct_change2):.2f}%")
         metric_col3.metric("RSI", f"{rsi2.iloc[-1]:.2f}")
         
         # Basic stats table
@@ -234,8 +234,8 @@ if st.session_state.data_fetched:
     std_ratio = ratio.std()
     
     col1, col2, col3 = st.columns(3)
-    col1.metric("Current Ratio", f"{current_ratio:.4f}")
-    col2.metric("Mean Ratio", f"{mean_ratio:.4f}")
+    col1.metric("Current Ratio", f"{float(current_ratio):.4f}")
+    col2.metric("Mean Ratio", f"{float(mean_ratio):.4f}")
     col3.metric("Std Dev", f"{std_ratio:.4f}")
     
     # Find historical rallies in ratio
@@ -263,7 +263,7 @@ if st.session_state.data_fetched:
         # Pattern comparison
         st.write(f"""
         **📌 Key Insight:** Historical data shows {len(rallies)} significant ratio movements (>{rally_threshold*100:.2f}%). 
-        The current ratio of {current_ratio:.4f} is {'above' if current_ratio > mean_ratio else 'below'} the mean ({mean_ratio:.4f}), 
+        The current ratio of {float(current_ratio):.4f} is {'above' if current_ratio > mean_ratio else 'below'} the mean ({mean_ratio:.4f}), 
         suggesting potential {'reversion to mean' if abs(current_ratio - mean_ratio) > std_ratio else 'stability'}.
         """)
     
