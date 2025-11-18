@@ -194,7 +194,7 @@ if st.session_state.data_fetched:
 
     # Calculate ratio
     ratio = data1['Close'] / data2['Close']
-    ratio_df = pd.DataFrame({'Ratio': ratio})
+    ratio_df = pd.DataFrame({'Ratio': [ratio]})
 
     # Calculate RSI
     rsi1 = calculate_rsi(data1['Close'])
