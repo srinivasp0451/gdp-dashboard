@@ -178,7 +178,7 @@ if st.session_state.data_fetched:
         pct_change1 = (change1 / prev_price1) * 100
         
         metric_col1, metric_col2, metric_col3 = st.columns(3)
-        metric_col1.metric("Latest Price", f"{latest_price1.2f}")
+        metric_col1.metric("Latest Price", f"{float(latest_price1):.2f}")
         metric_col2.metric("Change", f"{change1:.2f}", f"{pct_change1:.2f}%")
         metric_col3.metric("RSI", f"{rsi1.iloc[-1]:.2f}")
         
