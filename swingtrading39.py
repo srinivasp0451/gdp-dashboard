@@ -688,7 +688,7 @@ if st.session_state.data_fetched:
             
             # Detailed explanation
             st.write(f"""
-            **📌 Key Insight - Historical Ratio Rally Analysis:**
+            ** Key Insight - Historical Ratio Rally Analysis:**
             
             Historical data shows **{len(rallies)} significant ratio movements** (>{rally_threshold*100:.2f}%).
             
