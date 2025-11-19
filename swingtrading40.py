@@ -838,31 +838,3 @@ else:
         mime="text/csv",
     )
     
-else:
-    st.info("👆 Configure your analysis parameters in the sidebar and click 'Fetch Data & Analyze' to begin!")
-    
-    st.markdown("""
-    ### 🎯 Features:
-    
-    1. **Multi-Asset Analysis** - Analyze any two assets and their ratio
-    2. **Pattern Recognition** - Greedy algorithm finds similar historical patterns
-    3. **Mean Reversion Detection** - Identifies extreme price deviations
-    4. **Ratio Bin Analysis** - Discovers which price ratios correlate with moves
-    5. **Volatility Regime Analysis** - Different strategies for different volatility levels
-    6. **RSI Multi-Timeframe** - Overbought/oversold conditions
-    7. **Similarity Scoring** - Finds historical patterns matching current market
-    8. **AI Recommendation** - Combines all signals for BUY/SELL/HOLD decision
-    9. **Interactive Charts** - Candlesticks, RSI, Volume, Ratio analysis
-    10. **Heatmaps** - Visualize best times/days for returns
-    
-    ### 📊 How It Works:
-    
-    The algorithm uses multiple techniques to find patterns that "work everytime":
-    - **Change-based correlation** instead of absolute prices
-    - **Binning analysis** for ratio and volatility regimes  
-    - **Mean reversion** detection using z-scores
-    - **Pattern similarity** matching using returns correlation
-    - **Multi-factor scoring** combining all signals
-    
-    All predictions are based on historical pattern recognition with confidence scores!
-    """)
