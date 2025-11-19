@@ -368,6 +368,329 @@ if st.session_state.data_fetched:
     fig.add_hline(y=30, line_dash="dash", line_color="green", row=4, col=1)
     
     # Volume
+    if not np.all(volume1_aligned == 0):
+        fig.add_trace(go.Bar(x=common_index, y=volume1_aligned, name='Volume', marker_color='lightblue'), row=5, col=1)
+    
+    fig.update_layout(height=1400, showlegend=True, title_text="Complete Market Analysis")
+    fig.update_xaxes(rangeslider_visible=False)
+    
+    st.plotly_chart(fig, use_container_width=True)
+    
+    st.markdown("""
+    **Chart Analysis:**
+    - **Price Action:** Candlestick patterns show market structure and trends
+    - **Ratio:** Relative strength between two assets - rising ratio = Ticker1 outperforming
+    - **RSI:** >70 = Overbought (potential reversal), <30 = Oversold (potential bounce)
+    - **Volume:** Confirms price moves - high volume = strong conviction
+    """)
+    
+    # Heatmaps
+    st.header("🔥 Returns & Volatility Heatmaps")
+    
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        try:
+            df1_returns = pd.Series(returns1, index=df1.index).dropna()
+            if len(df1_returns) > 0 and hasattr(df1_returns.index, 'hour'):
+                df1_returns_pivot = df1_returns.groupby([df1_returns.index.hour, df1_returns.index.dayofweek]).mean().unstack()
+                
+                if not df1_returns_pivot.empty:
+                    fig_heat1 = px.imshow(
+                        df1_returns_pivot,
+                        labels=dict(x="Day of Week", y="Hour", color="Return %"),
+                        x=['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'],
+                        color_continuous_scale='RdYlGn',
+                        title=f'{ticker1_type} Returns Heatmap',
+                        text_auto='.2f'
+                    )
+                    fig_heat1.update_traces(textfont_color='white')
+                    st.plotly_chart(fig_heat1, use_container_width=True)
+        except Exception as e:
+            st.info(f"Heatmap for {ticker1_type}: Not enough data")
+    
+    with col2:
+        try:
+            df2_returns = pd.Series(returns2, index=df2.index).dropna()
+            if len(df2_returns) > 0 and hasattr(df2_returns.index, 'hour'):
+                df2_returns_pivot = df2_returns.groupby([df2_returns.index.hour, df2_returns.index.dayofweek]).mean().unstack()
+                
+                if not df2_returns_pivot.empty:
+                    fig_heat2 = px.imshow(
+                        df2_returns_pivot,
+                        labels=dict(x="Day of Week", y="Hour", color="Return %"),
+                        x=['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'],
+                        color_continuous_scale='RdYlGn',
+                        title=f'{ticker2_type} Returns Heatmap',
+                        text_auto='.2f'
+                    )
+                    fig_heat2.update_traces(textfont_color='white')
+                    st.plotly_chart(fig_heat2, use_container_width=True)
+        except Exception as e:
+            st.info(f"Heatmap for {ticker2_type}: Not enough data")
+    
+    # Final Recommendation
+    st.header("🎯 AI-Powered Final Recommendation")
+    
+    # Scoring system
+    score = 0
+    reasons = []
+    
+    latest = analysis_df.iloc[-1]
+    
+    # RSI analysis
+    if latest['RSI1'] < 30:
+        score += 2
+        reasons.append("✅ RSI oversold (<30) - bounce potential")
+    elif latest['RSI1'] > 70:
+        score -= 2
+        reasons.append("⚠️ RSI overbought (>70) - correction risk")
+    
+    # Distribution-based analysis
+    if dist_ticker1:
+        current_z = (dist_ticker1['current_value'] - dist_ticker1['mean']) / dist_ticker1['std']
+        if current_z < -2:
+            score += 2
+            reasons.append(f"✅ Extreme oversold (Z={current_z:.2f}) - mean reversion expected")
+        elif current_z > 2:
+            score -= 2
+            reasons.append(f"⚠️ Extreme overbought (Z={current_z:.2f}) - correction expected")
+        
+        # Probability-based scoring
+        if dist_ticker1['prob_positive'] > 60:
+            score += 1
+            reasons.append(f"✅ High probability of positive move ({dist_ticker1['prob_positive']:.1f}%)")
+        elif dist_ticker1['prob_positive'] < 40:
+            score -= 1
+            reasons.append(f"⚠️ Low probability of positive move ({dist_ticker1['prob_positive']:.1f}%)")
+    
+    # Mean reversion
+    try:
+        current_zscore = analysis_df.iloc[-1]['Price_Zscore']
+        if abs(current_zscore) > 2:
+            score += 1 if current_zscore < 0 else -1
+            reasons.append(f"✅ Mean reversion signal (Z={current_zscore:.2f})")
+    except:
+        pass
+    
+    # Pattern similarity
+    try:
+        if similarities and len(similarity_df) > 0:
+            avg_future_return = similarity_df['Future_5Period_Return'].mean()
+            if avg_future_return > 0.5:
+                score += 2
+                reasons.append(f"✅ Similar patterns suggest +{avg_future_return:.2f}% move")
+            elif avg_future_return < -0.5:
+                score -= 2
+                reasons.append(f"⚠️ Similar patterns suggest {avg_future_return:.2f}% decline")
+    except:
+        pass
+    
+    # Ratio analysis
+    try:
+        if 'avg_return1' in locals() and avg_return1 > 1:
+            score += 1
+            reasons.append(f"✅ Current ratio bin historically bullish (+{avg_return1:.2f}%)")
+        elif 'avg_return1' in locals() and avg_return1 < -1:
+            score -= 1
+            reasons.append(f"⚠️ Current ratio bin historically bearish ({avg_return1:.2f}%)")
+    except:
+        pass
+    
+    # Volatility regime
+    try:
+        if 'current_vol_bin' in locals() and current_vol_bin in ['VH', 'H']:
+            reasons.append("🌡️ High volatility - wider stops recommended")
+    except:
+        pass
+    
+    # Final signal
+    if score >= 3:
+        signal = "🟢 STRONG BUY"
+        color = "green"
+        recommendation = "Strong bullish setup with multiple positive factors. Consider BUYING on dips with tight stops."
+    elif score >= 1:
+        signal = "🟡 BUY"
+        color = "lightgreen"
+        recommendation = "Bullish bias but wait for confirmation. Consider small positions with defined risk."
+    elif score <= -3:
+        signal = "🔴 STRONG SELL"
+        color = "red"
+        recommendation = "Strong bearish setup with multiple negative factors. Consider SELLING or shorting with proper risk management."
+    elif score <= -1:
+        signal = "🟠 SELL"
+        color = "orange"
+        recommendation = "Bearish bias. Reduce exposure or wait for better entry points."
+    else:
+        signal = "⚪ HOLD"
+        color = "gray"
+        recommendation = "Mixed signals. HOLD current positions and wait for clearer direction."
+    
+    st.markdown(f"### <span style='color:{color}; font-size:32px;'>{signal}</span>", unsafe_allow_html=True)
+    
+    st.markdown("**Analysis Summary:**")
+    for reason in reasons:
+        st.markdown(f"- {reason}")
+    
+    # Calculate targets
+    if dist_ticker1:
+        expected_return = dist_ticker1['mean']
+        stop_loss_pct = 2 * dist_ticker1['std']
+        target_pct = abs(expected_return) + dist_ticker1['std']
+    else:
+        expected_return = 0
+        stop_loss_pct = 2
+        target_pct = 3
+    
+    current_price = latest['Ticker1_Price']
+    stop_loss = current_price * (1 - stop_loss_pct/100) if score > 0 else current_price * (1 + stop_loss_pct/100)
+    target = current_price * (1 + target_pct/100) if score > 0 else current_price * (1 - target_pct/100)
+    
+    st.markdown(f"""
+    **Confidence Score:** {abs(score)}/10
+    
+    **Professional Recommendation:**
+    {recommendation}
+    
+    **Risk Management:**
+    - **Current Price:** ₹{current_price:.2f}
+    - **Stop Loss:** ₹{stop_loss:.2f} ({stop_loss_pct:.2f}% from entry)
+    - **Take Profit Target:** ₹{target:.2f} ({target_pct:.2f}% from entry)
+    - **Risk/Reward Ratio:** 1:{target_pct/stop_loss_pct:.2f}
+    
+    **Distribution Insights:**
+    {f"Expected move based on normal distribution: {expected_return:.2f}% ± {dist_ticker1['std']:.2f}%" if dist_ticker1 else "N/A"}
+    
+    **Position Sizing:**
+    - Risk per trade: 1-2% of capital
+    - {f"If risking ₹10,000, position size = ₹{10000/(stop_loss_pct/100):.0f}" if stop_loss_pct > 0 else "Calculate based on stop loss"}
+    """)
+    
+    # Additional Bell Curve Insights
+    st.markdown("### 🔔 Key Distribution Insights")
+    
+    if dist_ticker1:
+        st.markdown(f"""
+        **What the Bell Curve Tells Us:**
+        1. **Mean ({dist_ticker1['mean']:.3f}%)**: This is the "center of gravity" - price tends to gravitate here
+        2. **Current Position ({dist_ticker1['current_percentile']:.1f} percentile)**: You're in the {'top' if dist_ticker1['current_percentile'] > 50 else 'bottom'} half of the distribution
+        3. **Probability Edge**: {dist_ticker1['prob_positive']:.1f}% chance of positive move based on historical distribution
+        4. **Extreme Events**: {dist_ticker1['prob_extreme_positive']:.1f}% chance of +2σ move, {dist_ticker1['prob_extreme_negative']:.1f}% chance of -2σ move
+        
+        **Trading Strategy Based on Distribution:**
+        {f"- **Mean Reversion Play**: Price is {abs(current_z):.1f}σ from mean - expect {dist_ticker1['std']:.2f}% move toward {dist_ticker1['mean']:.3f}%" if abs(current_z) > 1.5 else
+         f"- **Trend Following**: Price near mean - wait for breakout above {dist_ticker1['mean'] + dist_ticker1['std']:.3f}% or below {dist_ticker1['mean'] - dist_ticker1['std']:.3f}%"}
+        """)
+    
+    # Summary Table
+    st.markdown("### 📊 Complete Analysis Summary")
+    
+    summary_data = {
+        'Metric': ['Current Price', 'RSI', 'Z-Score', 'Volatility Regime', 'Signal', 'Confidence'],
+        'Ticker 1': [
+            f"₹{latest['Ticker1_Price']:.2f}",
+            f"{latest['RSI1']:.2f}",
+            f"{current_zscore:.2f}" if 'current_zscore' in locals() else "N/A",
+            current_vol_bin if 'current_vol_bin' in locals() else "N/A",
+            signal,
+            f"{abs(score)}/10"
+        ]
+    }
+    
+    if dist_ticker1:
+        summary_data['Distribution Mean'] = [
+            f"{dist_ticker1['mean']:.3f}%",
+            "-",
+            "-",
+            "-",
+            "-",
+            f"{dist_ticker1['prob_positive']:.1f}%"
+        ]
+    
+    summary_table = pd.DataFrame(summary_data)
+    st.dataframe(summary_table, use_container_width=True)
+    
+    # Download CSV
+    st.header("📥 Download Data")
+    
+    csv_df = pd.DataFrame({
+        'DateTime': [dt.strftime('%Y-%m-%d %H:%M:%S IST') for dt in common_index],
+        'Open': open1_aligned,
+        'High': high1_aligned,
+        'Low': low1_aligned,
+        'Close': close1_aligned,
+        'Volume': volume1_aligned
+    })
+    
+    csv = csv_df.to_csv(index=False).encode('utf-8')
+    st.download_button(
+        label="📥 Download Ticker 1 OHLCV CSV",
+        data=csv,
+        file_name=f"{ticker1}_{timeframe}_{period}.csv",
+        mime="text/csv",
+    )
+    
+    # Download analysis CSV
+    analysis_csv = analysis_df.to_csv(index=False).encode('utf-8')
+    st.download_button(
+        label="📥 Download Complete Analysis CSV",
+        data=analysis_csv,
+        file_name=f"analysis_{ticker1}_{ticker2}_{timeframe}_{period}.csv",
+        mime="text/csv",
+    )
+    
+else:
+    st.info("👆 Configure your analysis parameters in the sidebar and click 'Fetch Data & Analyze' to begin!")
+    
+    st.markdown("""
+    ### 🎯 Features:
+    
+    1. **Multi-Asset Analysis** - Analyze any two assets and their ratio
+    2. **Bell Curve Distribution** - Normal distribution analysis for probabilistic forecasting
+    3. **Pattern Recognition** - Greedy algorithm finds similar historical patterns
+    4. **Mean Reversion Detection** - Identifies extreme price deviations
+    5. **Ratio Bin Analysis** - Discovers which price ratios correlate with moves
+    6. **Volatility Regime Analysis** - Different strategies for different volatility levels
+    7. **RSI Multi-Timeframe** - Overbought/oversold conditions
+    8. **Similarity Scoring** - Finds historical patterns matching current market
+    9. **AI Recommendation** - Combines all signals for BUY/SELL/HOLD decision
+    10. **Interactive Charts** - Candlesticks, RSI, Volume, Ratio analysis
+    11. **Heatmaps** - Visualize best times/days for returns
+    
+    ### 🔔 Bell Curve Analysis (NEW!):
+    
+    The app now includes **Normal Distribution Analysis** which:
+    - Fits historical returns to a bell curve (normal distribution)
+    - Calculates mean (μ) and standard deviation (σ)
+    - Shows current position relative to historical distribution
+    - Provides probabilistic forecasts:
+      - Probability of positive move
+      - Probability of extreme moves (±2σ)
+      - Expected range with 68% and 95% confidence
+    - Identifies overbought/oversold based on z-scores
+    - Gives mean reversion signals when price is >2σ from mean
+    
+    **How it works:**
+    - ~68% of returns fall within ±1σ of mean
+    - ~95% of returns fall within ±2σ of mean
+    - If current return is >2σ: EXTREME and likely to revert
+    - The bell curve predicts future moves based on probability
+    
+    ### 📊 How Pattern Recognition Works:
+    
+    The algorithm uses multiple techniques to find patterns:
+    - **Change-based correlation** instead of absolute prices
+    - **Binning analysis** for ratio and volatility regimes  
+    - **Mean reversion** detection using z-scores
+    - **Pattern similarity** matching using returns correlation
+    - **Distribution analysis** for probabilistic edge
+    - **Multi-factor scoring** combining all signals
+    
+    All predictions are based on historical pattern recognition with confidence scores!
+    """)
+ line_color="green", row=4, col=1)
+    
+    # Volume
     if not df1_aligned['Volume'].eq(0).all():
         fig.add_trace(go.Bar(x=df1_aligned.index, y=df1_aligned['Volume'], name='Volume', marker_color='lightblue'), row=5, col=1)
     
