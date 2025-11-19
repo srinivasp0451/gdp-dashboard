@@ -688,7 +688,7 @@ else:
     
     All predictions are based on historical pattern recognition with confidence scores!
     """)
- line_color="green", row=4, col=1)
+    #line_color="green", row=4, col=1)
     
     # Volume
     if not df1_aligned['Volume'].eq(0).all():
