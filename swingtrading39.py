@@ -690,7 +690,7 @@ if st.session_state.data_fetched:
             st.write(f"""
             ** Key Insight - Historical Ratio Rally Analysis:**
             
-            Historical data shows **{len(rallies)} significant ratio movements** (>{rally_threshold*100:.2f}%).
+            Historical data shows **{float(len(rallies))} significant ratio movements** (>{float(rally_threshold*100):.2f}%).
             
             **Current Market Status:**
             - Current Ratio: **{current_ratio:.4f}**
