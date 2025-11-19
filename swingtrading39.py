@@ -20,7 +20,386 @@ def convert_to_ist(df):
     """Convert datetime to IST and handle timezone awareness"""
     try:
         ist = pytz.timezone('Asia/Kolkata')
-        if df.index.tz is None:
+        if df.index.tz is     
+    # Detailed volatility-based rally analysis
+    st.subheader("🎯 Volatility-Based Rally Analysis")
+    
+    # Find periods of high volatility and subsequent rallies
+    vol_ratio_high = vol_ratio[vol_ratio > vol_ratio.quantile(0.75)].dropna()
+    
+    if len(vol_ratio_high) > 0:
+        vol_rally_analysis = []
+        for idx in vol_ratio_high.index[-5:]:
+            idx_loc = ratio.index.get_loc(idx)
+            if idx_loc < len(ratio) - 10:
+                # Look at next 10 periods after high volatility
+                future_idx = min(idx_loc + 10, len(ratio) - 1)
+                
+                vol_at_time = float(vol_ratio.loc[idx])
+                ratio_at_time = float(ratio.iloc[idx_loc])
+                ratio_future = float(ratio.iloc[future_idx])
+                ratio_change_pts = ratio_future - ratio_at_time
+                ratio_change_pct = (ratio_change_pts / ratio_at_time) * 100
+                
+                price1_at_time = float(data1['Close'].iloc[idx_loc])
+                price2_at_time = float(data2['Close'].iloc[idx_loc])
+                price1_future = float(data1['Close'].iloc[future_idx])
+                price2_future = float(data2['Close'].iloc[future_idx])
+                
+                price1_change_pts = price1_future - price1_at_time
+                price1_change_pct = (price1_change_pts / price1_at_time) * 100
+                price2_change_pts = price2_future - price2_at_time
+                price2_change_pct = (price2_change_pts / price2_at_time) * 100
+                
+                vol_rally_analysis.append({
+                    'DateTime_IST': str(idx),
+                    'Volatility_%': vol_at_time,
+                    f'{ticker1_name}_Price': price1_at_time,
+                    f'{ticker2_name}_Price': price2_at_time,
+                    'Ratio': ratio_at_time,
+                    f'{ticker1_name}_Rally_Pts': price1_change_pts,
+                    f'{ticker1_name}_Rally_%': price1_change_pct,
+                    f'{ticker2_name}_Rally_Pts': price2_change_pts,
+                    f'{ticker2_name}_Rally_%': price2_change_pct,
+                    'Ratio_Change_Pts': ratio_change_pts,
+                    'Ratio_Change_%': ratio_change_pct
+                })
+        
+        if vol_rally_analysis:
+            vol_rally_df = pd.DataFrame(vol_rally_analysis)
+            st.dataframe(vol_rally_df.style.background_gradient(subset=['Ratio_Change_%', f'{ticker1_name}_Rally_%'], cmap='RdYlGn'), 
+                        use_container_width=True)
+            
+            # Detailed explanation
+            avg_ratio_rally = vol_rally_df['Ratio_Change_%'].mean()
+            avg_t1_rally = vol_rally_df[f'{ticker1_name}_Rally_%'].mean()
+            
+            st.write(f"""
+            **📌 Historical High Volatility Rally Pattern:**
+            
+            **Key Historical Events:**
+            
+            Most recent high volatility period: **{vol_rally_df.iloc[-1]['DateTime_IST']}**
+            - Volatility was at: **{vol_rally_df.iloc[-1]['Volatility_%']:.2f}%**
+            - {ticker1_name} was at: **{vol_rally_df.iloc[-1][f'{ticker1_name}_Price']:.2f}**
+            - {ticker2_name} was at: **{vol_rally_df.iloc[-1][f'{ticker2_name}_Price']:.2f}**
+            - Ratio was at: **{vol_rally_df.iloc[-1]['Ratio']:.4f}**
+            
+            **What Happened Next (10 periods later):**
+            - {ticker1_name} moved: **{vol_rally_df.iloc[-1][f'{ticker1_name}_Rally_Pts']:.2f} points** (**{vol_rally_df.iloc[-1][f'{ticker1_name}_Rally_%']:.2f}%**)
+            - {ticker2_name} moved: **{vol_rally_df.iloc[-1][f'{ticker2_name}_Rally_Pts']:.2f} points** (**{vol_rally_df.iloc[-1][f'{ticker2_name}_Rally_%']:.2f}%**)
+            - Ratio moved: **{vol_rally_df.iloc[-1]['Ratio_Change_Pts']:.4f} points** (**{vol_rally_df.iloc[-1]['Ratio_Change_%']:.2f}%**)
+            
+            **Average Pattern Across All High Volatility Events:**
+            - Average {ticker1_name} move: **{avg_t1_rally:.2f}%**
+            - Average Ratio move: **{avg_ratio_rally:.2f}%**
+            
+            **Current Market Status vs Historical Pattern:**
+            - Current volatility: **{vol_ratio_current:.2f}%** vs Historical high vol avg: **{vol_ratio_high.mean():.2f}%**
+            - Current {ticker1_name}: **{latest_price1:.2f}**
+            - Current Ratio: **{current_ratio:.4f}**
+            
+            **Expected Scenario:**
+            {f'🚀 If pattern repeats, expect {ticker1_name} to move approximately **{abs(latest_price1 * avg_t1_rally / 100):.2f} points** (**{avg_t1_rally:.2f}%**) in next 10 periods' if vol_ratio_current > vol_ratio.quantile(0.7) else '📊 Current volatility is moderate. Major moves less likely unless volatility increases'}
+            
+            **Trading Implication:**
+            {f'⚠️ HIGH VOLATILITY - Expect large swings. Reduce position size or use wider stops' if vol_ratio_current > vol_ratio.quantile(0.75) else '✅ NORMAL VOLATILITY - Standard position sizing appropriate'}
+            """)
+    
+    # ============= SECTION 7: VOLATILITY BINNING =============
+    st.header("📊 7. Volatility Binning Analysis")
+    
+    try:
+        vol_binned = points_data.dropna().copy()
+        if len(vol_binned) >= 5 and vol_binned[f'Vol% {ticker1_name}'].nunique() >= 5:
+            vol_binned[f'Vol_Bin'] = pd.qcut(vol_binned[f'Vol% {ticker1_name}'], q=5, labels=['Very Low', 'Low', 'Medium', 'High', 'Very High'], duplicates='drop')
+            
+            vol_analysis = vol_binned.groupby(f'Vol_Bin').agg({
+                f'Points {ticker1_name}': ['mean', 'std', 'sum', 'count'],
+                f'Points {ticker2_name}': ['mean', 'std', 'sum'],
+                'Points Ratio': ['mean', 'std', 'sum'],
+                f'% Change {ticker1_name}': ['mean'],
+                f'% Change {ticker2_name}': ['mean'],
+                '% Change Ratio': ['mean']
+            }).round(4)
+            
+            st.dataframe(vol_analysis.style.background_gradient(cmap='coolwarm'), use_container_width=True)
+            
+            st.write("""
+            **📌 Volatility Binning Insights:**
+            
+            This table categorizes market periods by volatility levels and shows typical price movements in each category.
+            
+            **Key Observations:**
+            - **Very High Volatility**: Large absolute point movements (both up and down)
+            - **Very Low Volatility**: Small movements, consolidation phase
+            - **Medium Volatility**: Normal trading conditions
+            
+            **How to Use:**
+            1. Check current volatility level
+            2. Review typical movements in that volatility bin
+            3. Adjust position sizing: smaller in high vol, larger in low vol
+            4. Set stop losses based on typical movements in current volatility regime
+            """)
+    except Exception as e:
+        st.warning(f"Unable to create volatility bins: {str(e)}")
+    
+    # ============= SECTION 8: RETURNS HEATMAPS =============
+    st.header("🔥 8. Returns Heatmaps")
+    
+    returns1_daily = data1['Close'].pct_change() * 100
+    returns2_daily = data2['Close'].pct_change() * 100
+    ratio_returns_daily = ratio.pct_change() * 100
+    
+    if len(data1) >= 50:
+        try:
+            # Create properly labeled heatmaps
+            st.subheader(f"{ticker1_name} Returns Heatmap")
+            returns1_recent = returns1_daily.tail(50).values
+            n_rows = len(returns1_recent) // 10
+            if n_rows > 0:
+                returns1_matrix = returns1_recent[:n_rows*10].reshape(n_rows, 10)
+                fig1 = go.Figure(data=go.Heatmap(
+                    z=returns1_matrix, 
+                    colorscale='RdYlGn', 
+                    zmid=0,
+                    text=np.round(returns1_matrix, 2),
+                    texttemplate='%{text}%',
+                    textfont={"size": 8},
+                    colorbar=dict(title="Return %")
+                ))
+                fig1.update_layout(
+                    title=f'{ticker1_name} Returns Pattern (% Change)',
+                    xaxis_title='Period',
+                    yaxis_title='Week',
+                    height=400
+                )
+                st.plotly_chart(fig1, use_container_width=True)
+            
+            st.subheader(f"{ticker2_name} Returns Heatmap")
+            returns2_recent = returns2_daily.tail(50).values
+            if n_rows > 0:
+                returns2_matrix = returns2_recent[:n_rows*10].reshape(n_rows, 10)
+                fig2 = go.Figure(data=go.Heatmap(
+                    z=returns2_matrix, 
+                    colorscale='RdYlGn', 
+                    zmid=0,
+                    text=np.round(returns2_matrix, 2),
+                    texttemplate='%{text}%',
+                    textfont={"size": 8},
+                    colorbar=dict(title="Return %")
+                ))
+                fig2.update_layout(
+                    title=f'{ticker2_name} Returns Pattern (% Change)',
+                    xaxis_title='Period',
+                    yaxis_title='Week',
+                    height=400
+                )
+                st.plotly_chart(fig2, use_container_width=True)
+            
+            st.subheader("Ratio Returns Heatmap")
+            ratio_returns_recent = ratio_returns_daily.tail(50).values
+            if n_rows > 0:
+                ratio_returns_matrix = ratio_returns_recent[:n_rows*10].reshape(n_rows, 10)
+                fig3 = go.Figure(data=go.Heatmap(
+                    z=ratio_returns_matrix, 
+                    colorscale='RdYlGn', 
+                    zmid=0,
+                    text=np.round(ratio_returns_matrix, 2),
+                    texttemplate='%{text}%',
+                    textfont={"size": 8},
+                    colorbar=dict(title="Return %")
+                ))
+                fig3.update_layout(
+                    title='Ratio Returns Pattern (% Change)',
+                    xaxis_title='Period',
+                    yaxis_title='Week',
+                    height=400
+                )
+                st.plotly_chart(fig3, use_container_width=True)
+            
+            # Calculate insights
+            positive_returns1 = (returns1_daily > 0).sum()
+            negative_returns1 = (returns1_daily < 0).sum()
+            avg_positive1 = returns1_daily[returns1_daily > 0].mean()
+            avg_negative1 = returns1_daily[returns1_daily < 0].mean()
+            
+            st.write(f"""
+            **📌 Returns Heatmap Insights:**
+            
+            **{ticker1_name} Pattern Analysis:**
+            - Positive return periods: **{positive_returns1}** (Avg: **{avg_positive1:.2f}%**)
+            - Negative return periods: **{negative_returns1}** (Avg: **{avg_negative1:.2f}%**)
+            - Win rate: **{(positive_returns1 / (positive_returns1 + negative_returns1) * 100):.1f}%**
+            
+            **Visual Pattern Recognition:**
+            - 🟢 **Green clusters**: Periods of sustained gains - optimal for trend following
+            - 🔴 **Red clusters**: Drawdown periods - time for defensive positioning
+            - 🟡 **Mixed patterns**: Choppy market - range-bound strategies
+            
+            **Current Market Context:**
+            - Latest return: **{returns1_daily.iloc[-1]:.2f}%**
+            - Last 5 periods avg: **{returns1_daily.tail(5).mean():.2f}%**
+            
+            **Trading Opportunity:**
+            {f'✅ Recent green pattern suggests momentum - Consider LONG positions' if returns1_daily.tail(5).mean() > 1 else '⚠️ Recent red/mixed pattern suggests caution - Wait for confirmation' if returns1_daily.tail(5).mean() < -1 else '➖ Neutral pattern - No clear directional bias'}
+            """)
+        except Exception as e:
+            st.info(f"Not enough data points for heatmap visualization: {str(e)}")
+    
+    # ============= SECTION 9: PATTERN SIMILARITY =============
+    st.header("🔍 9. Pattern Similarity Detection & Forecast")
+    
+    similarities1 = find_pattern_similarity(data1['Close'], window=min(20, len(data1)//4))
+    similarities2 = find_pattern_similarity(data2['Close'], window=min(20, len(data2)//4))
+    similarities_ratio = find_pattern_similarity(ratio, window=min(20, len(ratio)//4))
+    
+    if similarities1:
+        st.subheader(f"🎯 {ticker1_name} Similar Patterns & Forecast")
+        sim_data1 = []
+        for sim in similarities1:
+            sim_data1.append({
+                'DateTime_IST': str(sim['date']),
+                'Price_Then': sim['price_at_pattern'],
+                'Correlation': sim['correlation'],
+                'Future_Price': sim['future_price'],
+                'Future_Points': sim['future_points'],
+                'Future_%': sim['future_return_pct']
+            })
+        
+        sim_df1 = pd.DataFrame(sim_data1)
+        st.dataframe(sim_df1.style.background_gradient(subset=['Correlation', 'Future_%'], cmap='RdYlGn'), use_container_width=True)
+        
+        avg_future_pts = sim_df1['Future_Points'].mean()
+        avg_future_pct = sim_df1['Future_%'].mean()
+        forecast_price1 = latest_price1 + avg_future_pts
+        
+        st.write(f"""
+        **📌 {ticker1_name} Pattern-Based Forecast:**
+        
+        **Historical Similar Patterns Found: {len(similarities1)}**
+        
+        **Most Similar Pattern (Highest Correlation):**
+        - Occurred on: **{sim_df1.iloc[0]['DateTime_IST']}** IST
+        - Price then: **{sim_df1.iloc[0]['Price_Then']:.2f}**
+        - Correlation: **{sim_df1.iloc[0]['Correlation']*100:.1f}%**
+        - What happened next: Moved **{sim_df1.iloc[0]['Future_Points']:.2f} points** (**{sim_df1.iloc[0]['Future_%']:.2f}%**)
+        - Price reached: **{sim_df1.iloc[0]['Future_Price']:.2f}**
+        
+        **Average Across All Similar Patterns:**
+        - Average move: **{avg_future_pts:.2f} points** (**{avg_future_pct:.2f}%**)
+        - Historical dates: {', '.join([str(sim_df1.iloc[i]['DateTime_IST']) for i in range(min(3, len(sim_df1)))])}
+        
+        **FORECAST for Current Market:**
+        - Current {ticker1_name} price: **{latest_price1:.2f}**
+        - Expected target: **{forecast_price1:.2f}**
+        - Expected move: **{avg_future_pts:+.2f} points** (**{avg_future_pct:+.2f}%**)
+        - Confidence: **{sim_df1['Correlation'].mean()*100:.1f}%** (based on pattern correlation)
+        
+        **Interpretation:**
+        {f'🚀 Strong BULLISH forecast - Historical similar patterns showed **{avg_future_pct:.2f}%** gains averaging **{avg_future_pts:.2f} points**' if avg_future_pct > 2 else f'🔴 BEARISH forecast - Historical patterns suggest **{avg_future_pct:.2f}%** decline (**{avg_future_pts:.2f} points**)' if avg_future_pct < -2 else f'➖ NEUTRAL forecast - Expect sideways movement around current levels'}
+        """)
+    
+    if similarities_ratio:
+        st.subheader("🎯 Ratio Similar Patterns & Forecast")
+        sim_data_ratio = []
+        for sim in similarities_ratio:
+            sim_data_ratio.append({
+                'DateTime_IST': str(sim['date']),
+                'Ratio_Then': sim['price_at_pattern'],
+                'Correlation': sim['correlation'],
+                'Future_Ratio': sim['future_price'],
+                'Future_Points': sim['future_points'],
+                'Future_%': sim['future_return_pct']
+            })
+        
+        sim_df_ratio = pd.DataFrame(sim_data_ratio)
+        st.dataframe(sim_df_ratio.style.background_gradient(subset=['Correlation', 'Future_%'], cmap='RdYlGn'), use_container_width=True)
+        
+        avg_ratio_pts = sim_df_ratio['Future_Points'].mean()
+        avg_ratio_pct = sim_df_ratio['Future_%'].mean()
+        forecast_ratio = current_ratio + avg_ratio_pts
+        
+        st.write(f"""
+        **📌 Ratio Pattern-Based Forecast:**
+        
+        **Historical Similar Ratio Patterns Found: {len(similarities_ratio)}**
+        
+        **Most Similar Pattern:**
+        - Occurred on: **{sim_df_ratio.iloc[0]['DateTime_IST']}** IST
+        - Ratio then: **{sim_df_ratio.iloc[0]['Ratio_Then']:.4f}**
+        - Correlation: **{sim_df_ratio.iloc[0]['Correlation']*100:.1f}%**
+        - What happened: Moved **{sim_df_ratio.iloc[0]['Future_Points']:.4f} points** (**{sim_df_ratio.iloc[0]['Future_%']:.2f}%**)
+        
+        **Average Pattern Outcome:**
+        - Average move: **{avg_ratio_pts:.4f} points** (**{avg_ratio_pct:.2f}%**)
+        
+        **FORECAST for Current Ratio:**
+        - Current ratio: **{current_ratio:.4f}**
+        - Expected ratio: **{forecast_ratio:.4f}**
+        - Expected move: **{avg_ratio_pts:+.4f} points** (**{avg_ratio_pct:+.2f}%**)
+        
+        **What This Means:**
+        {f'✅ {ticker1_name} expected to OUTPERFORM {ticker2_name} by **{avg_ratio_pct:.2f}%**' if avg_ratio_pct > 1 else f'⚠️ {ticker2_name} expected to OUTPERFORM {ticker1_name} by **{abs(avg_ratio_pct):.2f}%**' if avg_ratio_pct < -1 else f'➖ Both assets expected to move in tandem'}
+        
+        **Trading Strategy:**
+        {f'📈 BUY {ticker1_name}, SELL/SHORT {ticker2_name} (pairs trade)' if avg_ratio_pct > 2 else f'📉 SELL/SHORT {ticker1_name}, BUY {ticker2_name} (pairs trade)' if avg_ratio_pct < -2 else '➖ No clear pairs trading opportunity'}
+        """)
+    
+    # ============= SECTION 10: VOLATILITY HEATMAPS =============
+    st.header("🌡️ 10. Volatility Heatmaps")
+    
+    if len(vol1.dropna()) >= 25:
+        try:
+            vol1_recent = vol1.dropna().tail(50).values
+            n_rows_vol = len(vol1_recent) // 10
+            if n_rows_vol > 0:
+                vol1_matrix = vol1_recent[:n_rows_vol*10].reshape(n_rows_vol, 10)
+                fig_vol1 = go.Figure(data=go.Heatmap(
+                    z=vol1_matrix, 
+                    colorscale='Reds',
+                    text=np.round(vol1_matrix, 2),
+                    texttemplate='%{text}%',
+                    textfont={"size": 8},
+                    colorbar=dict(title="Vol %")
+                ))
+                fig_vol1.update_layout(
+                    title=f'{ticker1_name} Volatility Heatmap (%)',
+                    xaxis_title='Period',
+                    yaxis_title='Week',
+                    height=400
+                )
+                st.plotly_chart(fig_vol1, use_container_width=True)
+            
+            vol2_recent = vol2.dropna().tail(50).values
+            if n_rows_vol > 0 and len(vol2_recent) >= n_rows_vol * 10:
+                vol2_matrix = vol2_recent[:n_rows_vol*10].reshape(n_rows_vol, 10)
+                fig_vol2 = go.Figure(data=go.Heatmap(
+                    z=vol2_matrix, 
+                    colorscale='Reds',
+                    text=np.round(vol2_matrix, 2),
+                    texttemplate='%{text}%',
+                    textfont={"size": 8},
+                    colorbar=dict(title="Vol %")
+                ))
+                fig_vol2.update_layout(
+                    title=f'{ticker2_name} Volatility Heatmap (%)',
+                    xaxis_title='Period',
+                    yaxis_title='Week',
+                    height=400
+                )
+                st.plotly_chart(fig_vol2, use_container_width=True)
+            
+            st.write(f"""
+            **📌 Volatility Heatmap Insights:**
+            
+            **Volatility Pattern Analysis:**
+            - 🔴 **Dark Red zones**: High volatility (**>{vol1.quantile(0.75):.2f}%**) - Periods of uncertainty, large price swings
+            - 🟠 **Orange zones**: Moderate volatility - Normal market conditions  
+            - ⚪ **Light zones**: Low volatility (**<{vol1.quantile(0.25):.2f}%**) - Consolidation, potential breakout setup
+            
+            **Current Volatility Status:**
+            - {ticker1_name}: **{vol1_current:.2f}%** - {:
             df.index = df.index.tz_localize('UTC').tz_convert(ist)
         else:
             df.index = df.index.tz_convert(ist)
@@ -28,6 +407,11 @@ def convert_to_ist(df):
     except:
         pass
     return df
+
+def align_data(data1, data2):
+    """Align two dataframes by common index"""
+    common_index = data1.index.intersection(data2.index)
+    return data1.loc[common_index], data2.loc[common_index]
 
 def calculate_rsi(data, period=14):
     """Calculate RSI indicator"""
@@ -41,29 +425,37 @@ def calculate_rsi(data, period=14):
 def calculate_volatility(data, window=14):
     """Calculate rolling volatility"""
     returns = data.pct_change()
-    volatility = returns.rolling(window=window).std() * np.sqrt(252)
+    volatility = returns.rolling(window=window).std() * np.sqrt(252) * 100  # As percentage
     return volatility
 
 def find_pattern_similarity(data, window=20, top_n=5):
-    """Find similar patterns in historical data"""
+    """Find similar patterns based on normalized percentage changes"""
     if len(data) < window * 2:
         return []
     
-    current_pattern = data.iloc[-window:].values
+    # Use percentage changes for scale-invariant comparison
+    pct_changes = data.pct_change().fillna(0)
+    current_pattern = pct_changes.iloc[-window:].values
     current_pattern_norm = (current_pattern - current_pattern.mean()) / (current_pattern.std() + 1e-8)
     
     similarities = []
     for i in range(window, len(data) - window):
-        historical_pattern = data.iloc[i-window:i].values
+        historical_pattern = pct_changes.iloc[i-window:i].values
         historical_pattern_norm = (historical_pattern - historical_pattern.mean()) / (historical_pattern.std() + 1e-8)
         
         correlation = np.corrcoef(current_pattern_norm, historical_pattern_norm)[0, 1]
-        if not np.isnan(correlation):
+        if not np.isnan(correlation) and correlation > 0.7:  # Only strong correlations
+            future_points = float(data.iloc[i+window] - data.iloc[i])
+            future_pct = (future_points / float(data.iloc[i])) * 100
+            
             similarities.append({
                 'index': i,
                 'date': data.index[i],
                 'correlation': correlation,
-                'future_return': (data.iloc[i+window] - data.iloc[i]) / data.iloc[i] * 100 if i+window < len(data) else 0
+                'price_at_pattern': float(data.iloc[i]),
+                'future_price': float(data.iloc[i+window]) if i+window < len(data) else float(data.iloc[i]),
+                'future_points': future_points,
+                'future_return_pct': future_pct
             })
     
     similarities.sort(key=lambda x: x['correlation'], reverse=True)
@@ -134,9 +526,18 @@ if fetch_button:
             data1 = convert_to_ist(data1)
             data2 = convert_to_ist(data2)
             
+            # Align data by common timestamps
+            data1, data2 = align_data(data1, data2)
+            
             # Ensure data is sorted
             data1 = data1.sort_index()
             data2 = data2.sort_index()
+            
+            # Check if Volume exists, if not add zeros
+            if 'Volume' not in data1.columns:
+                data1['Volume'] = 0
+            if 'Volume' not in data2.columns:
+                data2['Volume'] = 0
             
             # Store in session state
             st.session_state.data1 = data1
@@ -194,12 +595,13 @@ if st.session_state.data_fetched:
         metric_col3.metric("RSI", f"{rsi1_current:.2f}")
         
         # Basic stats table
-        stats1 = pd.DataFrame({
-            'DateTime': data1.index[-10:].astype(str),
-            'Close': data1['Close'].iloc[-10:].values,
-            'Change': data1['Close'].iloc[-10:].diff().values,
-            '% Change': (data1['Close'].iloc[-10:].pct_change() * 100).values
-        })
+        stats1_data = {
+            'DateTime': [str(dt) for dt in data1.index[-10:]],
+            'Close': [float(x) for x in data1['Close'].iloc[-10:].values],
+            'Change': [float(x) if not pd.isna(x) else 0.0 for x in data1['Close'].iloc[-10:].diff().values],
+            '% Change': [float(x) if not pd.isna(x) else 0.0 for x in (data1['Close'].iloc[-10:].pct_change() * 100).values]
+        }
+        stats1 = pd.DataFrame(stats1_data)
         st.dataframe(stats1.style.background_gradient(subset=['Change', '% Change'], cmap='RdYlGn'), use_container_width=True)
     
     with col2:
@@ -216,25 +618,29 @@ if st.session_state.data_fetched:
         metric_col3.metric("RSI", f"{rsi2_current:.2f}")
         
         # Basic stats table
-        stats2 = pd.DataFrame({
-            'DateTime': data2.index[-10:].astype(str),
-            'Close': data2['Close'].iloc[-10:].values,
-            'Change': data2['Close'].iloc[-10:].diff().values,
-            '% Change': (data2['Close'].iloc[-10:].pct_change() * 100).values
-        })
+        stats2_data = {
+            'DateTime': [str(dt) for dt in data2.index[-10:]],
+            'Close': [float(x) for x in data2['Close'].iloc[-10:].values],
+            'Change': [float(x) if not pd.isna(x) else 0.0 for x in data2['Close'].iloc[-10:].diff().values],
+            '% Change': [float(x) if not pd.isna(x) else 0.0 for x in (data2['Close'].iloc[-10:].pct_change() * 100).values]
+        }
+        stats2 = pd.DataFrame(stats2_data)
         st.dataframe(stats2.style.background_gradient(subset=['Change', '% Change'], cmap='RdYlGn'), use_container_width=True)
     
     # ============= SECTION 2: RATIO ANALYSIS =============
     st.header("🔀 2. Ratio Analysis")
     
+    # Ensure all arrays have same length
+    min_len = min(len(data1), len(data2), len(ratio), len(rsi1), len(rsi2), len(rsi_ratio))
+    
     ratio_analysis = pd.DataFrame({
-        'DateTime': data1.index.astype(str),
-        f'{ticker1_name} Price': data1['Close'].values,
-        f'{ticker2_name} Price': data2['Close'].values,
-        'Ratio': ratio.values,
-        f'RSI {ticker1_name}': rsi1.values,
-        f'RSI {ticker2_name}': rsi2.values,
-        'RSI Ratio': rsi_ratio.values
+        'DateTime': [str(dt) for dt in data1.index[-min_len:]],
+        f'{ticker1_name} Price': [float(x) for x in data1['Close'].iloc[-min_len:].values],
+        f'{ticker2_name} Price': [float(x) for x in data2['Close'].iloc[-min_len:].values],
+        'Ratio': [float(x) for x in ratio.iloc[-min_len:].values],
+        f'RSI {ticker1_name}': [float(x) if not pd.isna(x) else 50.0 for x in rsi1.iloc[-min_len:].values],
+        f'RSI {ticker2_name}': [float(x) if not pd.isna(x) else 50.0 for x in rsi2.iloc[-min_len:].values],
+        'RSI Ratio': [float(x) if not pd.isna(x) else 50.0 for x in rsi_ratio.iloc[-min_len:].values]
     })
     
     st.dataframe(ratio_analysis.tail(20).style.background_gradient(subset=['Ratio', 'RSI Ratio'], cmap='viridis'), use_container_width=True)
@@ -261,52 +667,94 @@ if st.session_state.data_fetched:
         for idx in rallies.index[-5:]:
             idx_loc = ratio.index.get_loc(idx)
             if idx_loc < len(ratio) - 1:
-                future_change = (float(ratio.iloc[idx_loc+1]) - float(ratio.iloc[idx_loc])) / float(ratio.iloc[idx_loc]) * 100
+                ratio_before = float(ratio.iloc[idx_loc])
+                ratio_after = float(ratio.iloc[idx_loc+1])
+                future_change_pts = ratio_after - ratio_before
+                future_change_pct = (future_change_pts / ratio_before) * 100
+                
                 rally_data.append({
-                    'DateTime': str(idx),
-                    'Ratio Value': float(ratio.loc[idx]),
+                    'DateTime_IST': str(idx),
+                    'Ratio Value': ratio_before,
                     'Change %': float(rallies.loc[idx]) * 100,
-                    'Next Period Change %': future_change
+                    'Next Period Pts': future_change_pts,
+                    'Next Period %': future_change_pct,
+                    f'{ticker1_name} Price': float(data1['Close'].loc[idx]),
+                    f'{ticker2_name} Price': float(data2['Close'].loc[idx])
                 })
         
         if rally_data:
             rally_df = pd.DataFrame(rally_data)
-            st.dataframe(rally_df.style.background_gradient(subset=['Change %'], cmap='Greens'), use_container_width=True)
+            st.dataframe(rally_df.style.background_gradient(subset=['Change %', 'Next Period %'], cmap='Greens'), use_container_width=True)
             
-            # Pattern comparison
+            # Detailed explanation
             st.write(f"""
-            **📌 Key Insight:** Historical data shows {len(rallies)} significant ratio movements (>{rally_threshold*100:.2f}%). 
-            The current ratio of {current_ratio:.4f} is {'above' if current_ratio > mean_ratio else 'below'} the mean ({mean_ratio:.4f}), 
-            suggesting potential {'reversion to mean' if abs(current_ratio - mean_ratio) > std_ratio else 'stability'}.
+            **📌 Key Insight - Historical Ratio Rally Analysis:**
+            
+            Historical data shows **{len(rallies)} significant ratio movements** (>{rally_threshold*100:.2f}%).
+            
+            **Current Market Status:**
+            - Current Ratio: **{current_ratio:.4f}**
+            - Mean Ratio: **{mean_ratio:.4f}**
+            - The ratio is currently **{abs((current_ratio - mean_ratio) / mean_ratio * 100):.2f}%** {'above' if current_ratio > mean_ratio else 'below'} the historical mean
+            - Current {ticker1_name} price: **{latest_price1:.2f}** ({change1:+.2f} pts, {pct_change1:+.2f}%)
+            - Current {ticker2_name} price: **{latest_price2:.2f}** ({change2:+.2f} pts, {pct_change2:+.2f}%)
+            
+            **Historical Rally Pattern:**
+            The most recent strong rally occurred on **{rally_df.iloc[-1]['DateTime_IST']}** when:
+            - Ratio was at **{rally_df.iloc[-1]['Ratio Value']:.4f}**
+            - {ticker1_name} was at **{rally_df.iloc[-1][f'{ticker1_name} Price']:.2f}**
+            - {ticker2_name} was at **{rally_df.iloc[-1][f'{ticker2_name} Price']:.2f}**
+            - Rally magnitude: **{rally_df.iloc[-1]['Change %']:.2f}%**
+            - After rally, moved **{rally_df.iloc[-1]['Next Period Pts']:.4f} points** (**{rally_df.iloc[-1]['Next Period %']:.2f}%**)
+            
+            **Market Implication:**
+            {'⚠️ CAUTION: Ratio approaching historical high - potential mean reversion expected' if current_ratio > mean_ratio + std_ratio else '✅ OPPORTUNITY: Ratio below mean - potential upside in ' + ticker1_name + ' relative to ' + ticker2_name}
             """)
     
     # ============= SECTION 3: RATIO BINNING ANALYSIS =============
     st.header("📊 3. Ratio Binning & Rally Analysis")
     
-    # Create ratio bins
     try:
         ratio_clean = ratio.dropna()
         if len(ratio_clean) >= 10:
-            ratio_bins = pd.qcut(ratio_clean, q=10, duplicates='drop')
-            ratio_binned = pd.DataFrame({
-                'DateTime': ratio_clean.index.astype(str),
+            ratio_bins = pd.qcut(ratio_clean, q=10, duplicates='drop', labels=False)
+            ratio_binned_df = pd.DataFrame({
                 'Ratio': ratio_clean.values,
                 'Bin': ratio_bins
-            })
+            }, index=ratio_clean.index)
             
-            # Calculate rally points in each bin
-            ratio_binned['Forward_Return'] = ratio_clean.pct_change().shift(-1) * 100
-            bin_analysis = ratio_binned.groupby('Bin').agg({
-                'Forward_Return': ['mean', 'std', 'count'],
+            # Calculate forward returns
+            ratio_binned_df['Forward_Return_%'] = ratio_clean.pct_change().shift(-1) * 100
+            ratio_binned_df['Forward_Points'] = ratio_clean.diff().shift(-1)
+            
+            bin_analysis = ratio_binned_df.groupby('Bin').agg({
+                'Forward_Return_%': ['mean', 'std', 'count'],
+                'Forward_Points': ['mean', 'sum'],
                 'Ratio': ['min', 'max', 'mean']
             }).round(4)
             
             st.dataframe(bin_analysis.style.background_gradient(cmap='RdYlGn'), use_container_width=True)
             
-            st.write("""
-            **📌 Bin Analysis Insights:** This table shows the average forward returns for each ratio bin. 
-            Bins with consistently positive forward returns indicate strong buying opportunities, 
-            while negative returns suggest caution or shorting opportunities.
+            # Find current bin
+            current_bin = pd.qcut([current_ratio], q=10, labels=False, duplicates='drop')[0] if current_ratio >= ratio_clean.min() and current_ratio <= ratio_clean.max() else None
+            
+            st.write(f"""
+            **📌 Bin Analysis Insights:**
+            
+            This table divides the ratio into 10 equal bins and shows average forward movement in each bin.
+            
+            **Current Position:**
+            - Current ratio **{current_ratio:.4f}** falls in Bin **{current_bin if current_bin is not None else 'N/A'}**
+            - Historical forward return in this bin: **{float(bin_analysis.loc[current_bin, ('Forward_Return_%', 'mean')]):.2f}%** if current_bin is not None else 'N/A'
+            - Historical forward points in this bin: **{float(bin_analysis.loc[current_bin, ('Forward_Points', 'mean')]):.4f}** if current_bin is not None else 'N/A'
+            
+            **Key Observations:**
+            - **Best performing bins** (highest forward returns) indicate optimal buying zones
+            - **Worst performing bins** suggest profit-taking or shorting opportunities
+            - Bins with positive mean returns and low std suggest consistent profitable patterns
+            
+            **Actionable Insight:**
+            {'✅ Current bin shows positive historical returns - Consider LONG position' if current_bin is not None and float(bin_analysis.loc[current_bin, ('Forward_Return_%', 'mean')]) > 0 else '⚠️ Current bin shows negative historical returns - Consider CAUTION or SHORT position'}
             """)
     except Exception as e:
         st.warning(f"Unable to create bins: {str(e)}")
@@ -373,18 +821,18 @@ if st.session_state.data_fetched:
     st.header("💾 5. Export Data")
     
     export_data = pd.DataFrame({
-        'DateTime_IST': data1.index.astype(str),
-        f'{ticker1_name}_Open': data1['Open'].values,
-        f'{ticker1_name}_High': data1['High'].values,
-        f'{ticker1_name}_Low': data1['Low'].values,
-        f'{ticker1_name}_Close': data1['Close'].values,
-        f'{ticker1_name}_Volume': data1['Volume'].values,
-        f'{ticker2_name}_Open': data2['Open'].values,
-        f'{ticker2_name}_High': data2['High'].values,
-        f'{ticker2_name}_Low': data2['Low'].values,
-        f'{ticker2_name}_Close': data2['Close'].values,
-        f'{ticker2_name}_Volume': data2['Volume'].values,
-        'Ratio': ratio.values
+        'DateTime_IST': [str(dt) for dt in data1.index],
+        f'{ticker1_name}_Open': [float(x) for x in data1['Open'].values],
+        f'{ticker1_name}_High': [float(x) for x in data1['High'].values],
+        f'{ticker1_name}_Low': [float(x) for x in data1['Low'].values],
+        f'{ticker1_name}_Close': [float(x) for x in data1['Close'].values],
+        f'{ticker1_name}_Volume': [float(x) for x in data1['Volume'].values],
+        f'{ticker2_name}_Open': [float(x) for x in data2['Open'].values],
+        f'{ticker2_name}_High': [float(x) for x in data2['High'].values],
+        f'{ticker2_name}_Low': [float(x) for x in data2['Low'].values],
+        f'{ticker2_name}_Close': [float(x) for x in data2['Close'].values],
+        f'{ticker2_name}_Volume': [float(x) for x in data2['Volume'].values],
+        'Ratio': [float(x) for x in ratio.values]
     })
     
     col1, col2 = st.columns(2)
@@ -397,23 +845,26 @@ if st.session_state.data_fetched:
     # ============= SECTION 6: VOLATILITY ANALYSIS =============
     st.header("📊 6. Volatility & Points Analysis")
     
+    # Ensure consistent lengths
+    points_len = min(len(data1), len(data2), len(ratio), len(vol1), len(vol2), len(vol_ratio))
+    
     points_data = pd.DataFrame({
-        'DateTime_IST': data1.index.astype(str),
-        f'{ticker1_name} Price': data1['Close'].values,
-        f'{ticker2_name} Price': data2['Close'].values,
-        'Ratio': ratio.values,
-        f'Vol {ticker1_name}': vol1.values,
-        f'Vol {ticker2_name}': vol2.values,
-        'Vol Ratio': vol_ratio.values,
-        f'Points {ticker1_name}': data1['Close'].diff().values,
-        f'Points {ticker2_name}': data2['Close'].diff().values,
-        'Points Ratio': ratio.diff().values,
-        f'% Change {ticker1_name}': (data1['Close'].pct_change() * 100).values,
-        f'% Change {ticker2_name}': (data2['Close'].pct_change() * 100).values,
-        '% Change Ratio': (ratio.pct_change() * 100).values
+        'DateTime_IST': [str(dt) for dt in data1.index[-points_len:]],
+        f'{ticker1_name} Price': [float(x) for x in data1['Close'].iloc[-points_len:].values],
+        f'{ticker2_name} Price': [float(x) for x in data2['Close'].iloc[-points_len:].values],
+        'Ratio': [float(x) for x in ratio.iloc[-points_len:].values],
+        f'Vol% {ticker1_name}': [float(x) if not pd.isna(x) else 0.0 for x in vol1.iloc[-points_len:].values],
+        f'Vol% {ticker2_name}': [float(x) if not pd.isna(x) else 0.0 for x in vol2.iloc[-points_len:].values],
+        'Vol% Ratio': [float(x) if not pd.isna(x) else 0.0 for x in vol_ratio.iloc[-points_len:].values],
+        f'Points {ticker1_name}': [float(x) if not pd.isna(x) else 0.0 for x in data1['Close'].iloc[-points_len:].diff().values],
+        f'Points {ticker2_name}': [float(x) if not pd.isna(x) else 0.0 for x in data2['Close'].iloc[-points_len:].diff().values],
+        'Points Ratio': [float(x) if not pd.isna(x) else 0.0 for x in ratio.iloc[-points_len:].diff().values],
+        f'% Change {ticker1_name}': [float(x) if not pd.isna(x) else 0.0 for x in (data1['Close'].iloc[-points_len:].pct_change() * 100).values],
+        f'% Change {ticker2_name}': [float(x) if not pd.isna(x) else 0.0 for x in (data2['Close'].iloc[-points_len:].pct_change() * 100).values],
+        '% Change Ratio': [float(x) if not pd.isna(x) else 0.0 for x in (ratio.iloc[-points_len:].pct_change() * 100).values]
     })
     
-    st.dataframe(points_data.tail(20).style.background_gradient(subset=[f'Points {ticker1_name}', f'Points {ticker2_name}'], cmap='RdYlGn'), 
+    st.dataframe(points_data.tail(20).style.background_gradient(subset=[f'Points {ticker1_name}', f'Points {ticker2_name}', 'Points Ratio'], cmap='RdYlGn'), 
                 use_container_width=True)
     
     vol1_current = float(vol1.iloc[-1]) if not pd.isna(vol1.iloc[-1]) else 0.0
@@ -421,550 +872,18 @@ if st.session_state.data_fetched:
     vol_ratio_current = float(vol_ratio.iloc[-1]) if not pd.isna(vol_ratio.iloc[-1]) else 0.0
     
     st.write(f"""
-    **📌 Volatility Insights:** 
-    - Current {ticker1_name} volatility: {vol1_current:.4f} (annualized)
-    - Current {ticker2_name} volatility: {vol2_current:.4f} (annualized)
-    - Current Ratio volatility: {vol_ratio_current:.4f} (annualized)
-    - Higher volatility indicates higher risk but also potential for larger moves.
+    **📌 Volatility & Movement Insights:** 
+    
+    **Current Volatility (Annualized %):**
+    - {ticker1_name}: **{vol1_current:.2f}%** (annualized)
+    - {ticker2_name}: **{vol2_current:.2f}%** (annualized)
+    - Ratio: **{vol_ratio_current:.2f}%** (annualized)
+    
+    **Recent Movement (Latest Period):**
+    - {ticker1_name}: **{points_data.iloc[-1][f'Points {ticker1_name}']:.2f} points** (**{points_data.iloc[-1][f'% Change {ticker1_name}']:.2f}%**)
+    - {ticker2_name}: **{points_data.iloc[-1][f'Points {ticker2_name}']:.2f} points** (**{points_data.iloc[-1][f'% Change {ticker2_name}']:.2f}%**)
+    - Ratio: **{points_data.iloc[-1]['Points Ratio']:.4f} points** (**{points_data.iloc[-1]['% Change Ratio']:.2f}%**)
+    
+    **Interpretation:**
+    Higher volatility indicates higher risk but also potential for larger moves. Use volatility to size positions appropriately.
     """)
-    
-    # ============= SECTION 7: VOLATILITY BINNING =============
-    st.header("📊 7. Volatility Binning Analysis")
-    
-    try:
-        vol_binned = points_data.dropna().copy()
-        if len(vol_binned) >= 5 and vol_binned[f'Vol {ticker1_name}'].nunique() >= 5:
-            vol_binned[f'Vol_Bin_{ticker1_name}'] = pd.qcut(vol_binned[f'Vol {ticker1_name}'], q=5, labels=['Very Low', 'Low', 'Medium', 'High', 'Very High'], duplicates='drop')
-            
-            vol_analysis = vol_binned.groupby(f'Vol_Bin_{ticker1_name}').agg({
-                f'Points {ticker1_name}': ['mean', 'std', 'sum'],
-                f'Points {ticker2_name}': ['mean', 'std', 'sum'],
-                'Points Ratio': ['mean', 'std', 'sum']
-            }).round(4)
-            
-            st.dataframe(vol_analysis.style.background_gradient(cmap='coolwarm'), use_container_width=True)
-            
-            st.write("""
-            **📌 Volatility Binning Insights:** This shows how price movements correlate with volatility levels.
-            High volatility periods typically see larger point movements (both up and down), while low volatility
-            indicates consolidation phases. Use this to adjust position sizing and risk management.
-            """)
-    except Exception as e:
-        st.warning(f"Unable to create volatility bins: {str(e)}")
-    
-    # ============= SECTION 8: RETURNS HEATMAPS =============
-    st.header("🔥 8. Returns Heatmaps")
-    
-    returns1_daily = data1['Close'].pct_change() * 100
-    returns2_daily = data2['Close'].pct_change() * 100
-    ratio_returns_daily = ratio.pct_change() * 100
-    
-    if len(data1) >= 50:
-        try:
-            st.subheader(f"{ticker1_name} Returns Heatmap")
-            returns1_matrix = returns1_daily.tail(50).values.reshape(-1, 5)
-            fig1 = go.Figure(data=go.Heatmap(z=returns1_matrix, colorscale='RdYlGn', zmid=0))
-            fig1.update_layout(title=f'{ticker1_name} Returns Pattern', height=400)
-            st.plotly_chart(fig1, use_container_width=True)
-            
-            st.subheader(f"{ticker2_name} Returns Heatmap")
-            returns2_matrix = returns2_daily.tail(50).values.reshape(-1, 5)
-            fig2 = go.Figure(data=go.Heatmap(z=returns2_matrix, colorscale='RdYlGn', zmid=0))
-            fig2.update_layout(title=f'{ticker2_name} Returns Pattern', height=400)
-            st.plotly_chart(fig2, use_container_width=True)
-            
-            st.subheader("Ratio Returns Heatmap")
-            ratio_returns_matrix = ratio_returns_daily.tail(50).values.reshape(-1, 5)
-            fig3 = go.Figure(data=go.Heatmap(z=ratio_returns_matrix, colorscale='RdYlGn', zmid=0))
-            fig3.update_layout(title='Ratio Returns Pattern', height=400)
-            st.plotly_chart(fig3, use_container_width=True)
-            
-            st.write("""
-            **📌 Returns Heatmap Insights:** Green zones indicate positive returns, red indicates losses.
-            Look for clusters of green for potential buy zones and clusters of red for selling opportunities.
-            Current market positioning relative to these patterns can guide entry/exit decisions.
-            """)
-        except:
-            st.info("Not enough data points for heatmap visualization.")
-    
-    # ============= SECTION 9: PATTERN SIMILARITY =============
-    st.header("🔍 9. Pattern Similarity Detection")
-    
-    similarities1 = find_pattern_similarity(data1['Close'], window=min(20, len(data1)//4))
-    similarities2 = find_pattern_similarity(data2['Close'], window=min(20, len(data2)//4))
-    similarities_ratio = find_pattern_similarity(ratio, window=min(20, len(ratio)//4))
-    
-    if similarities1:
-        st.subheader(f"{ticker1_name} Similar Patterns")
-        sim_df1 = pd.DataFrame(similarities1)
-        sim_df1['date'] = pd.to_datetime(sim_df1['date']).dt.strftime('%Y-%m-%d %H:%M')
-        st.dataframe(sim_df1.style.background_gradient(subset=['correlation', 'future_return'], cmap='RdYlGn'), use_container_width=True)
-        
-        avg_future_return = float(sim_df1['future_return'].mean())
-        st.write(f"""
-        **📌 {ticker1_name} Pattern Analysis:** Found {len(similarities1)} similar historical patterns.
-        Average future return after similar patterns: {avg_future_return:.2f}%.
-        Historical dates: {', '.join([str(d) for d in sim_df1['date'].head(3)])}
-        """)
-    
-    if similarities_ratio:
-        st.subheader("Ratio Similar Patterns")
-        sim_df_ratio = pd.DataFrame(similarities_ratio)
-        sim_df_ratio['date'] = pd.to_datetime(sim_df_ratio['date']).dt.strftime('%Y-%m-%d %H:%M')
-        st.dataframe(sim_df_ratio.style.background_gradient(subset=['correlation', 'future_return'], cmap='RdYlGn'), use_container_width=True)
-        
-        avg_future_return_ratio = float(sim_df_ratio['future_return'].mean())
-        st.write(f"""
-        **📌 Ratio Pattern Analysis:** Based on {len(similarities_ratio)} similar patterns,
-        the ratio showed an average movement of {avg_future_return_ratio:.2f}% following similar setups.
-        Most similar period: {sim_df_ratio.iloc[0]['date']} with {float(sim_df_ratio.iloc[0]['correlation'])*100:.2f}% correlation.
-        """)
-    
-    # ============= SECTION 10: VOLATILITY HEATMAPS =============
-    st.header("🌡️ 10. Volatility Heatmaps")
-    
-    if len(vol1.dropna()) >= 25:
-        try:
-            vol1_matrix = vol1.dropna().tail(50).values.reshape(-1, 5) if len(vol1.dropna()) >= 50 else vol1.dropna().values.reshape(-1, 5)[:5]
-            fig_vol1 = go.Figure(data=go.Heatmap(z=vol1_matrix, colorscale='Reds'))
-            fig_vol1.update_layout(title=f'{ticker1_name} Volatility Heatmap', height=400)
-            st.plotly_chart(fig_vol1, use_container_width=True)
-            
-            vol2_matrix = vol2.dropna().tail(50).values.reshape(-1, 5) if len(vol2.dropna()) >= 50 else vol2.dropna().values.reshape(-1, 5)[:5]
-            fig_vol2 = go.Figure(data=go.Heatmap(z=vol2_matrix, colorscale='Reds'))
-            fig_vol2.update_layout(title=f'{ticker2_name} Volatility Heatmap', height=400)
-            st.plotly_chart(fig_vol2, use_container_width=True)
-            
-            st.write("""
-            **📌 Volatility Heatmap Insights:** Dark red zones indicate high volatility periods - these are
-            periods of uncertainty and potential large moves. Lighter zones show consolidation.
-            Trade smaller sizes during high volatility and look for breakouts during consolidation.
-            """)
-        except:
-            st.info("Not enough data for volatility heatmap.")
-    
-    # ============= SECTION 11: PRICE ACTION SIMILARITY & FORECAST =============
-    st.header("🎯 11. Price Action Forecast")
-    
-    if similarities1 and similarities_ratio:
-        st.subheader("Forecast Based on Historical Similarity")
-        
-        current_price1 = float(data1['Close'].iloc[-1])
-        current_price2 = float(data2['Close'].iloc[-1])
-        current_ratio_val = float(ratio.iloc[-1])
-        
-        # Calculate average outcomes from similar patterns
-        forecast_change1 = float(sim_df1['future_return'].mean())
-        forecast_price1 = current_price1 * (1 + forecast_change1/100)
-        forecast_points1 = forecast_price1 - current_price1
-        
-        forecast_change_ratio = float(sim_df_ratio['future_return'].mean())
-        
-        col1, col2, col3 = st.columns(3)
-        col1.metric(f"{ticker1_name} Forecast", f"{forecast_price1:.2f}", f"{forecast_points1:.2f} pts ({forecast_change1:.2f}%)")
-        col2.metric("Current Ratio", f"{current_ratio_val:.4f}")
-        col3.metric("Forecast Ratio Move", f"{forecast_change_ratio:.2f}%")
-        
-        last_datetime = data1.index[-1].strftime('%Y-%m-%d %H:%M:%S')
-        first_sim_date = sim_df1.iloc[0]['date']
-        first_sim_corr = float(sim_df1.iloc[0]['correlation'])
-        first_sim_return = float(sim_df1.iloc[0]['future_return'])
-        
-        st.write(f"""
-        **📌 Forecast Analysis (IST: {last_datetime}):**
-        
-        Based on {len(similarities1)} similar historical patterns, the market shows:
-        - {ticker1_name} expected to move {forecast_points1:.2f} points ({forecast_change1:.2f}%)
-        - Ratio expected to move {forecast_change_ratio:.2f}%
-        - Confidence: {first_sim_corr*100:.2f}% average correlation
-        
-        **Historical Reference:**
-        Most similar pattern occurred on {first_sim_date} IST,
-        which was followed by a {first_sim_return:.2f}% move.
-        """)
-    
-    # ============= SECTION 12: REVERSAL FORECASTING =============
-    st.header("🔄 12. Reversal Detection & Forecasting")
-    
-    try:
-        # Detect historical reversals
-        peaks_idx = argrelextrema(data1['Close'].values, np.greater, order=5)[0]
-        troughs_idx = argrelextrema(data1['Close'].values, np.less, order=5)[0]
-        
-        if len(peaks_idx) > 0 and len(troughs_idx) > 0:
-            reversal_data = []
-            for peak_idx in peaks_idx[-5:]:
-                if peak_idx > 20 and peak_idx < len(data1) - 5:
-                    prior_troughs = troughs_idx[troughs_idx < peak_idx]
-                    if len(prior_troughs) > 0:
-                        trough_idx = prior_troughs[-1]
-                        rally_points = float(data1['Close'].iloc[peak_idx] - data1['Close'].iloc[trough_idx])
-                        rally_pct = (rally_points / float(data1['Close'].iloc[trough_idx])) * 100
-                        
-                        reversal_points = float(data1['Close'].iloc[peak_idx+5] - data1['Close'].iloc[peak_idx])
-                        reversal_pct = (reversal_points / float(data1['Close'].iloc[peak_idx])) * 100
-                        
-                        reversal_data.append({
-                            'Peak_DateTime_IST': data1.index[peak_idx].strftime('%Y-%m-%d %H:%M'),
-                            'Peak_Price': float(data1['Close'].iloc[peak_idx]),
-                            'Rally_Points': rally_points,
-                            'Rally_%': rally_pct,
-                            'Reversal_Points': reversal_points,
-                            'Reversal_%': reversal_pct,
-                            'RSI_at_Peak': float(rsi1.iloc[peak_idx]) if not pd.isna(rsi1.iloc[peak_idx]) else 50.0
-                        })
-            
-            if reversal_data:
-                reversal_df = pd.DataFrame(reversal_data)
-                st.dataframe(reversal_df.style.background_gradient(subset=['Rally_%', 'Reversal_%'], cmap='RdYlGn'), 
-                            use_container_width=True)
-                
-                # Current market position analysis
-                recent_low_idx = data1['Close'].iloc[-20:].idxmin()
-                recent_low = float(data1['Close'].loc[recent_low_idx])
-                current_rally_points = current_price1 - recent_low
-                current_rally_pct = (current_rally_points / recent_low) * 100
-                
-                avg_rally_before_reversal = float(reversal_df['Rally_%'].mean())
-                avg_reversal = float(reversal_df['Reversal_%'].mean())
-                avg_rsi_at_peak = float(reversal_df['RSI_at_Peak'].mean())
-                
-                st.write(f"""
-                **📌 Reversal Analysis (Current Time IST: {last_datetime}):**
-                
-                **Historical Pattern:**
-                - Average rally before reversal: {avg_rally_before_reversal:.2f}% ({float(reversal_df['Rally_Points'].mean()):.2f} points)
-                - Average reversal magnitude: {avg_reversal:.2f}% ({float(reversal_df['Reversal_Points'].mean()):.2f} points)
-                - Typical RSI at reversal: {avg_rsi_at_peak:.2f}
-                
-                **Current Market Setup:**
-                - Current price: {current_price1:.2f}
-                - Rally from recent low ({recent_low_idx.strftime('%Y-%m-%d %H:%M')} IST): {current_rally_points:.2f} points ({current_rally_pct:.2f}%)
-                - Current RSI: {rsi1_current:.2f}
-                - Current {ticker1_name}/{ticker2_name} Ratio: {current_ratio_val:.4f}
-                
-                **⚠️ Reversal Warning:**
-                """)
-                
-                if current_rally_pct >= avg_rally_before_reversal * 0.8:
-                    st.warning(f"""
-                    🚨 Market has rallied {current_rally_pct:.2f}%, approaching historical reversal threshold 
-                    of {avg_rally_before_reversal:.2f}%. Consider taking profits or tightening stops.
-                    Expected reversal could be {avg_reversal:.2f}% ({abs(avg_reversal * current_price1 / 100):.2f} points).
-                    """)
-                else:
-                    st.success(f"""
-                    ✅ Current rally of {current_rally_pct:.2f}% is still below typical reversal point.
-                    Historical data suggests room for {avg_rally_before_reversal - current_rally_pct:.2f}% more upside
-                    before reversal risk increases significantly.
-                    """)
-        
-        # Ratio reversal analysis
-        st.subheader("Ratio Reversal Patterns")
-        ratio_peaks_idx = argrelextrema(ratio.values, np.greater, order=5)[0]
-        ratio_troughs_idx = argrelextrema(ratio.values, np.less, order=5)[0]
-        
-        if len(ratio_peaks_idx) > 0:
-            ratio_reversal_data = []
-            for peak_idx in ratio_peaks_idx[-5:]:
-                if peak_idx > 10 and peak_idx < len(ratio) - 5:
-                    prior_troughs = ratio_troughs_idx[ratio_troughs_idx < peak_idx]
-                    if len(prior_troughs) > 0:
-                        trough_idx = prior_troughs[-1]
-                        ratio_rally = float(ratio.iloc[peak_idx] - ratio.iloc[trough_idx])
-                        ratio_rally_pct = (ratio_rally / float(ratio.iloc[trough_idx])) * 100
-                        
-                        ratio_reversal_data.append({
-                            'DateTime_IST': ratio.index[peak_idx].strftime('%Y-%m-%d %H:%M'),
-                            'Ratio_Peak': float(ratio.iloc[peak_idx]),
-                            'Rally_%': ratio_rally_pct,
-                            f'{ticker1_name}_Price': float(data1['Close'].iloc[peak_idx]),
-                            f'{ticker2_name}_Price': float(data2['Close'].iloc[peak_idx])
-                        })
-            
-            if ratio_reversal_data:
-                ratio_rev_df = pd.DataFrame(ratio_reversal_data)
-                st.dataframe(ratio_rev_df.style.background_gradient(subset=['Rally_%'], cmap='coolwarm'), 
-                            use_container_width=True)
-    except Exception as e:
-        st.info(f"Reversal analysis requires more data points: {str(e)}")
-    
-    # ============= SECTION 13: ULTIMATE RECOMMENDATION =============
-    st.header("🎯 13. Ultimate Trading Recommendation")
-    
-    st.subheader("📊 Comprehensive Analysis Summary")
-    
-    # Calculate recommendation score
-    recommendation_score = 0
-    reasons = []
-    
-    # 1. RSI Analysis
-    if rsi1_current < 30:
-        recommendation_score += 2
-        reasons.append(f"✅ {ticker1_name} RSI ({rsi1_current:.2f}) is oversold - Strong BUY signal")
-    elif rsi1_current > 70:
-        recommendation_score -= 2
-        reasons.append(f"⚠️ {ticker1_name} RSI ({rsi1_current:.2f}) is overbought - SELL signal")
-    else:
-        recommendation_score += 0
-        reasons.append(f"➖ {ticker1_name} RSI ({rsi1_current:.2f}) is neutral")
-    
-    # 2. Ratio Analysis
-    ratio_zscore = (current_ratio_val - mean_ratio) / std_ratio
-    if ratio_zscore < -1:
-        recommendation_score += 1.5
-        reasons.append(f"✅ Ratio ({current_ratio_val:.4f}) is {abs(ratio_zscore):.2f} std below mean - {ticker1_name} undervalued vs {ticker2_name}")
-    elif ratio_zscore > 1:
-        recommendation_score -= 1.5
-        reasons.append(f"⚠️ Ratio ({current_ratio_val:.4f}) is {ratio_zscore:.2f} std above mean - {ticker1_name} overvalued vs {ticker2_name}")
-    
-    # 3. Pattern Similarity
-    if similarities1:
-        if forecast_change1 > 2:
-            recommendation_score += 2
-            reasons.append(f"✅ Historical patterns suggest {forecast_change1:.2f}% upside")
-        elif forecast_change1 < -2:
-            recommendation_score -= 2
-            reasons.append(f"⚠️ Historical patterns suggest {forecast_change1:.2f}% downside")
-    
-    # 4. Volatility
-    avg_vol = float(vol1.mean())
-    if vol1_current > avg_vol * 1.5:
-        recommendation_score -= 1
-        reasons.append(f"⚠️ High volatility ({vol1_current:.4f}) - Exercise caution, reduce position size")
-    elif vol1_current < avg_vol * 0.7:
-        recommendation_score += 0.5
-        reasons.append(f"✅ Low volatility ({vol1_current:.4f}) - Favorable for entry")
-    
-    # 5. Reversal Risk
-    if 'reversal_df' in locals() and len(reversal_df) > 0:
-        if current_rally_pct >= avg_rally_before_reversal * 0.8:
-            recommendation_score -= 2
-            reasons.append(f"⚠️ HIGH REVERSAL RISK: Rally at {current_rally_pct:.2f}% vs historical avg {avg_rally_before_reversal:.2f}%")
-        elif current_rally_pct < avg_rally_before_reversal * 0.5:
-            recommendation_score += 1
-            reasons.append(f"✅ Low reversal risk: Rally at {current_rally_pct:.2f}% with room to {avg_rally_before_reversal:.2f}%")
-    
-    # 6. Momentum
-    recent_change = float(data1['Close'].pct_change(5).iloc[-1] * 100)
-    if recent_change > 3:
-        recommendation_score += 1
-        reasons.append(f"✅ Strong positive momentum: +{recent_change:.2f}% over last 5 periods")
-    elif recent_change < -3:
-        recommendation_score -= 1
-        reasons.append(f"⚠️ Negative momentum: {recent_change:.2f}% over last 5 periods")
-    
-    # Final Recommendation
-    st.markdown("---")
-    col1, col2, col3 = st.columns([1, 2, 1])
-    
-    with col2:
-        if recommendation_score >= 4:
-            st.success("### 🚀 STRONG BUY")
-            action = "STRONG BUY"
-        elif recommendation_score >= 2:
-            st.success("### ✅ BUY")
-            action = "BUY"
-        elif recommendation_score >= 0:
-            st.info("### ➖ HOLD/NEUTRAL")
-            action = "HOLD"
-        elif recommendation_score >= -2:
-            st.warning("### ⚠️ SELL")
-            action = "SELL"
-        else:
-            st.error("### 🔴 STRONG SELL")
-            action = "STRONG SELL"
-        
-        st.metric("Recommendation Score", f"{recommendation_score:.1f}/10")
-    
-    st.markdown("---")
-    
-    # Detailed recommendation
-    st.subheader("📋 Detailed Recommendation Breakdown")
-    
-    for reason in reasons:
-        st.write(reason)
-    
-    st.markdown("---")
-    
-    # Quantitative targets
-    st.subheader("🎯 Price Targets & Risk Management")
-    
-    if similarities1:
-        col1, col2, col3 = st.columns(3)
-        
-        with col1:
-            st.metric(
-                label=f"Target Price ({ticker1_name})",
-                value=f"{forecast_price1:.2f}",
-                delta=f"{forecast_points1:.2f} pts ({forecast_change1:.2f}%)"
-            )
-        
-        with col2:
-            # Calculate stop loss (2 standard deviations)
-            stop_loss = current_price1 - (2 * float(data1['Close'].std()))
-            st.metric(
-                label="Suggested Stop Loss",
-                value=f"{stop_loss:.2f}",
-                delta=f"-{current_price1 - stop_loss:.2f} pts ({-((current_price1 - stop_loss)/current_price1)*100:.2f}%)"
-            )
-        
-        with col3:
-            # Risk-reward ratio
-            risk = current_price1 - stop_loss
-            reward = forecast_price1 - current_price1
-            rr_ratio = reward / risk if risk > 0 else 0
-            st.metric(
-                label="Risk-Reward Ratio",
-                value=f"{rr_ratio:.2f}:1"
-            )
-    
-    st.markdown("---")
-    
-    # Summary box
-    st.subheader("📌 Executive Summary")
-    summary_text = f"""
-    **Analysis Timestamp:** {last_datetime} IST
-    
-    **Current Market Status:**
-    - {ticker1_name}: {current_price1:.2f} ({pct_change1:+.2f}%)
-    - {ticker2_name}: {current_price2:.2f} ({pct_change2:+.2f}%)
-    - Ratio: {current_ratio_val:.4f}
-    
-    **Recommendation:** {action}
-    **Confidence Score:** {recommendation_score:.1f}/10
-    
-    **Key Points:**
-    """
-    
-    for i, reason in enumerate(reasons[:5], 1):
-        summary_text += f"\n{i}. {reason}"
-    
-    if similarities1:
-        summary_text += f"""
-        
-        **Expected Move:**
-        - {ticker1_name}: {forecast_points1:+.2f} points ({forecast_change1:+.2f}%)
-        - Target: {forecast_price1:.2f}
-        - Stop Loss: {stop_loss:.2f}
-        - Risk-Reward: {rr_ratio:.2f}:1
-        """
-    
-    summary_text += f"""
-    
-    **⚠️ Disclaimer:** This analysis is based on historical patterns and statistical models. 
-    Past performance does not guarantee future results. Always do your own research and consider 
-    your risk tolerance before making trading decisions.
-    """
-    
-    st.info(summary_text)
-    
-    # Additional insights
-    st.markdown("---")
-    st.subheader("💡 Additional Insights")
-    
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        st.write("**Volume Analysis:**")
-        avg_volume1 = float(data1['Volume'].mean())
-        current_volume1 = float(data1['Volume'].iloc[-1])
-        volume_ratio = current_volume1 / avg_volume1
-        
-        if volume_ratio > 1.5:
-            st.write(f"🔊 High volume: {current_volume1:,.0f} ({volume_ratio:.1f}x avg) - Strong conviction")
-        elif volume_ratio < 0.5:
-            st.write(f"🔉 Low volume: {current_volume1:,.0f} ({volume_ratio:.1f}x avg) - Weak conviction")
-        else:
-            st.write(f"🔈 Normal volume: {current_volume1:,.0f} ({volume_ratio:.1f}x avg)")
-    
-    with col2:
-        st.write("**Market Correlation:**")
-        correlation = float(data1['Close'].corr(data2['Close']))
-        st.write(f"Correlation between {ticker1_name} and {ticker2_name}: {correlation:.2f}")
-        
-        if abs(correlation) > 0.8:
-            st.write("📊 Strong correlation - Markets moving together")
-        elif abs(correlation) < 0.3:
-            st.write("📊 Weak correlation - Independent movements")
-    
-    st.markdown("---")
-    st.caption(f"Analysis completed at {datetime.now(pytz.timezone('Asia/Kolkata')).strftime('%Y-%m-%d %H:%M:%S')} IST")
-    st.caption("⚠️ This tool is for educational purposes only. Not financial advice.")
-
-else:
-    st.info("👆 Configure your analysis parameters in the sidebar and click 'Fetch Data & Analyze' to begin.")
-    
-    # Display example/help section
-    with st.expander("📖 How to Use This Dashboard"):
-        st.write("""
-        ### Features:
-        
-        1. **Multi-Asset Support**: Analyze Nifty50, BankNifty, Sensex, Crypto, Commodities, Forex, and custom stocks
-        2. **Multiple Timeframes**: From 1-minute to weekly data
-        3. **Ratio Analysis**: Compare two assets and find trading opportunities
-        4. **Pattern Detection**: AI-powered similarity matching with historical data
-        5. **Reversal Forecasting**: Identify potential market reversals before they happen
-        6. **RSI & Volatility**: Complete technical analysis with actionable insights
-        7. **Heatmaps**: Visual representation of returns and volatility patterns
-        8. **Data Export**: Download analysis results in CSV format
-        9. **Ultimate Recommendation**: AI-powered trading signals with risk management
-        
-        ### Quick Start:
-        
-        1. Select two tickers from the sidebar (e.g., Nifty 50 vs Bank Nifty)
-        2. Choose your timeframe and period
-        3. Click "Fetch Data & Analyze"
-        4. Review the comprehensive analysis and recommendations
-        
-        ### Tips:
-        
-        - Use longer periods (1y+) for reliable pattern detection
-        - Compare correlated assets for ratio trading opportunities
-        - Pay attention to reversal warnings when RSI is extreme
-        - Consider risk-reward ratios before entering trades
-        - Use stop losses as suggested by the analysis
-        
-        **⚠️ Important**: This tool respects yfinance API rate limits by fetching data only when you click the button.
-        """)
-    
-    with st.expander("🎓 Understanding the Analysis"):
-        st.write("""
-        ### Key Metrics Explained:
-        
-        **RSI (Relative Strength Index)**
-        - Below 30: Oversold (potential buy)
-        - Above 70: Overbought (potential sell)
-        - 30-70: Neutral zone
-        
-        **Ratio Analysis**
-        - Compares relative strength of two assets
-        - High ratio: Asset 1 outperforming Asset 2
-        - Low ratio: Asset 2 outperforming Asset 1
-        - Mean reversion opportunities when ratio is extreme
-        
-        **Volatility**
-        - High volatility: Large price swings, higher risk
-        - Low volatility: Consolidation, potential breakout
-        - Annualized for comparison across timeframes
-        
-        **Pattern Similarity**
-        - Uses correlation to find similar historical periods
-        - Shows what happened after similar patterns
-        - Higher correlation = more reliable forecast
-        
-        **Reversal Detection**
-        - Identifies historical rally exhaustion points
-        - Warns when current rally approaches historical limits
-        - Helps with profit-taking decisions
-        
-        **Recommendation Score**
-        - Combines all metrics into single score (-10 to +10)
-        - Positive scores suggest buying
-        - Negative scores suggest selling/caution
-        - Based on multiple confirmation signals
-        """)
-
-st.sidebar.markdown("---")
-st.sidebar.info("💡 Tip: Data is cached to respect API limits. Use the Fetch button to refresh.")
-st.sidebar.caption("Powered by yfinance & Streamlit")
