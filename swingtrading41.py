@@ -482,6 +482,419 @@ if st.session_state.data_fetched and st.session_state.ticker1_data is not None:
         
         st.markdown("---")
         
+        # Statistical Hypothesis Testing Section
+        st.header("📊 Statistical Hypothesis Testing - Market Direction Forecast")
+        
+        st.markdown("""
+        ### Question: Will the market move UP, DOWN, or remain NEUTRAL?
+        
+        We'll use statistical hypothesis testing to answer this question with **95% confidence (α = 0.05)**.
+        """)
+        
+        try:
+            from scipy import stats
+            
+            returns = data1['Close'].pct_change().dropna()
+            returns_points = data1['Close'].diff().dropna()
+            
+            if len(returns) > 30:
+                # Test 1: Will market move UP?
+                st.subheader("📈 Test 1: Upward Movement Hypothesis")
+                
+                st.markdown("""
+                **Null Hypothesis (H₀):** The market will NOT move up (mean return ≤ 0)  
+                **Alternative Hypothesis (H₁):** The market WILL move up (mean return > 0)  
+                **Significance Level:** α = 0.05 (95% confidence)
+                """)
+                
+                # One-sample t-test (one-tailed, right)
+                t_stat_up, p_value_up_two = stats.ttest_1samp(returns, 0)
+                p_value_up = p_value_up_two / 2 if t_stat_up > 0 else 1 - (p_value_up_two / 2)
+                
+                mean_return = returns.mean() * 100
+                std_return = returns.std() * 100
+                
+                col1, col2, col3 = st.columns(3)
+                with col1:
+                    st.metric("Mean Return", f"{mean_return:.3f}%")
+                with col2:
+                    st.metric("T-Statistic", f"{t_stat_up:.3f}")
+                with col3:
+                    st.metric("P-Value", f"{p_value_up:.4f}")
+                
+                if p_value_up < 0.05:
+                    st.success(f"""
+                    ✅ **REJECT NULL HYPOTHESIS** (p = {p_value_up:.4f} < 0.05)
+                    
+                    **Statistical Conclusion:** With 95% confidence, we can conclude that the market is **LIKELY TO MOVE UP**.
+                    
+                    **Evidence:** 
+                    - Mean return of {mean_return:.3f}% is statistically significant
+                    - T-statistic of {t_stat_up:.3f} indicates upward bias
+                    - Only {p_value_up*100:.2f}% probability this is due to chance
+                    - Based on {len(returns)} observations over {interval}/{period}
+                    
+                    **Forecast:** **BULLISH** - Statistical evidence supports upward price movement
+                    """)
+                else:
+                    st.warning(f"""
+                    ❌ **FAIL TO REJECT NULL HYPOTHESIS** (p = {p_value_up:.4f} ≥ 0.05)
+                    
+                    **Statistical Conclusion:** Insufficient evidence to conclude market will move up.
+                    
+                    **Evidence:**
+                    - Mean return of {mean_return:.3f}% is NOT statistically significant
+                    - {p_value_up*100:.2f}% probability the observed pattern is due to chance
+                    - Cannot confidently predict upward movement
+                    """)
+                
+                st.markdown("---")
+                
+                # Test 2: Will market move DOWN?
+                st.subheader("📉 Test 2: Downward Movement Hypothesis")
+                
+                st.markdown("""
+                **Null Hypothesis (H₀):** The market will NOT move down (mean return ≥ 0)  
+                **Alternative Hypothesis (H₁):** The market WILL move down (mean return < 0)  
+                **Significance Level:** α = 0.05 (95% confidence)
+                """)
+                
+                # One-sample t-test (one-tailed, left)
+                p_value_down = p_value_up_two / 2 if t_stat_up < 0 else 1 - (p_value_up_two / 2)
+                
+                col1, col2, col3 = st.columns(3)
+                with col1:
+                    st.metric("Mean Return", f"{mean_return:.3f}%")
+                with col2:
+                    st.metric("T-Statistic", f"{t_stat_up:.3f}")
+                with col3:
+                    st.metric("P-Value", f"{p_value_down:.4f}")
+                
+                if p_value_down < 0.05:
+                    st.error(f"""
+                    ✅ **REJECT NULL HYPOTHESIS** (p = {p_value_down:.4f} < 0.05)
+                    
+                    **Statistical Conclusion:** With 95% confidence, we can conclude that the market is **LIKELY TO MOVE DOWN**.
+                    
+                    **Evidence:**
+                    - Mean return of {mean_return:.3f}% is statistically significant (negative)
+                    - T-statistic of {t_stat_up:.3f} indicates downward bias
+                    - Only {p_value_down*100:.2f}% probability this is due to chance
+                    - Based on {len(returns)} observations over {interval}/{period}
+                    
+                    **Forecast:** **BEARISH** - Statistical evidence supports downward price movement
+                    """)
+                else:
+                    st.warning(f"""
+                    ❌ **FAIL TO REJECT NULL HYPOTHESIS** (p = {p_value_down:.4f} ≥ 0.05)
+                    
+                    **Statistical Conclusion:** Insufficient evidence to conclude market will move down.
+                    
+                    **Evidence:**
+                    - Mean return of {mean_return:.3f}% is NOT statistically significant
+                    - {p_value_down*100:.2f}% probability the observed pattern is due to chance
+                    - Cannot confidently predict downward movement
+                    """)
+                
+                st.markdown("---")
+                
+                # Test 3: Will market remain NEUTRAL?
+                st.subheader("⚖️ Test 3: Neutral/Sideways Movement Hypothesis")
+                
+                st.markdown("""
+                **Null Hypothesis (H₀):** The market IS in neutral range (mean return = 0)  
+                **Alternative Hypothesis (H₁):** The market is NOT neutral (mean return ≠ 0)  
+                **Significance Level:** α = 0.05 (95% confidence)
+                """)
+                
+                # Two-tailed t-test
+                p_value_neutral = p_value_up_two
+                
+                col1, col2, col3 = st.columns(3)
+                with col1:
+                    st.metric("Mean Return", f"{mean_return:.3f}%")
+                with col2:
+                    st.metric("T-Statistic", f"{t_stat_up:.3f}")
+                with col3:
+                    st.metric("P-Value", f"{p_value_neutral:.4f}")
+                
+                if p_value_neutral >= 0.05:
+                    st.info(f"""
+                    ✅ **FAIL TO REJECT NULL HYPOTHESIS** (p = {p_value_neutral:.4f} ≥ 0.05)
+                    
+                    **Statistical Conclusion:** With 95% confidence, we can conclude that the market is **LIKELY TO REMAIN NEUTRAL**.
+                    
+                    **Evidence:**
+                    - Mean return of {mean_return:.3f}% is NOT significantly different from zero
+                    - {p_value_neutral*100:.2f}% probability supports neutral/sideways movement
+                    - No strong directional bias detected
+                    - Based on {len(returns)} observations over {interval}/{period}
+                    
+                    **Forecast:** **NEUTRAL/SIDEWAYS** - Market likely to consolidate in current range
+                    """)
+                else:
+                    st.warning(f"""
+                    ❌ **REJECT NULL HYPOTHESIS** (p = {p_value_neutral:.4f} < 0.05)
+                    
+                    **Statistical Conclusion:** The market is NOT neutral - it has a directional bias.
+                    
+                    **Evidence:**
+                    - Mean return of {mean_return:.3f}% is statistically different from zero
+                    - Only {p_value_neutral*100:.2f}% probability this is neutral movement
+                    - Directional trend detected (see Tests 1 & 2 for direction)
+                    """)
+                
+                st.markdown("---")
+                
+                # Final Statistical Summary
+                st.subheader("🎯 Final Statistical Verdict")
+                
+                # Determine the strongest signal
+                if p_value_up < 0.05 and p_value_up < p_value_down:
+                    verdict = "📈 **STATISTICAL FORECAST: UPWARD MOVEMENT**"
+                    verdict_color = "success"
+                    confidence_pct = (1 - p_value_up) * 100
+                    direction = "UP"
+                    expected_move = mean_return
+                elif p_value_down < 0.05 and p_value_down < p_value_up:
+                    verdict = "📉 **STATISTICAL FORECAST: DOWNWARD MOVEMENT**"
+                    verdict_color = "error"
+                    confidence_pct = (1 - p_value_down) * 100
+                    direction = "DOWN"
+                    expected_move = mean_return
+                elif p_value_neutral >= 0.05:
+                    verdict = "⚖️ **STATISTICAL FORECAST: NEUTRAL/SIDEWAYS**"
+                    verdict_color = "info"
+                    confidence_pct = p_value_neutral * 100
+                    direction = "SIDEWAYS"
+                    expected_move = 0
+                else:
+                    verdict = "🟡 **STATISTICAL FORECAST: INCONCLUSIVE**"
+                    verdict_color = "warning"
+                    confidence_pct = 50
+                    direction = "UNCERTAIN"
+                    expected_move = mean_return
+                
+                st.markdown(f"""
+                <div style="background: linear-gradient(135deg, #11998e 0%, #38ef7d 100%); 
+                            padding: 2rem; border-radius: 1rem; color: white; margin: 1rem 0;">
+                    <h2 style="color: white; margin: 0;">{verdict}</h2>
+                    <p style="font-size: 1.2rem; margin: 0.5rem 0;">Statistical Confidence: <strong>{confidence_pct:.1f}%</strong></p>
+                    <p style="margin: 0;">Based on {len(returns)} observations from {interval}/{period} timeframe</p>
+                </div>
+                """, unsafe_allow_html=True)
+                
+                st.markdown(f"""
+                **Comprehensive Statistical Analysis:**
+                
+                **Methodology:**
+                - Sample Size: {len(returns)} returns
+                - Timeframe: {interval} interval over {period} period
+                - Statistical Test: One-sample t-test
+                - Confidence Level: 95% (α = 0.05)
+                
+                **Test Results:**
+                1. **Upward Movement:** p-value = {p_value_up:.4f} {'✓ Significant' if p_value_up < 0.05 else '✗ Not Significant'}
+                2. **Downward Movement:** p-value = {p_value_down:.4f} {'✓ Significant' if p_value_down < 0.05 else '✗ Not Significant'}
+                3. **Neutral Movement:** p-value = {p_value_neutral:.4f} {'✓ Significant' if p_value_neutral >= 0.05 else '✗ Not Significant'}
+                
+                **Statistical Interpretation:**
+                - Mean Return: {mean_return:.3f}% per period
+                - Standard Deviation: {std_return:.3f}%
+                - T-Statistic: {t_stat_up:.3f}
+                - Direction Indicated: **{direction}**
+                
+                **Probability Interpretation:**
+                - P < 0.05: Strong evidence (< 5% chance result is random)
+                - P < 0.01: Very strong evidence (< 1% chance result is random)
+                - P ≥ 0.05: Weak evidence (≥ 5% chance result is random)
+                
+                **Trading Implication:**
+                {
+                    f"The statistical evidence strongly supports **{direction}** movement. Expected return per period: {expected_move:.2f}%. This aligns with a confidence level of {confidence_pct:.1f}%."
+                    if confidence_pct > 90
+                    else f"The statistical evidence moderately supports **{direction}** movement. Expected return per period: {expected_move:.2f}%. Exercise caution as confidence is {confidence_pct:.1f}%."
+                    if confidence_pct > 70
+                    else f"The statistical evidence is weak. Market direction is **{direction}** but with low confidence ({confidence_pct:.1f}%). Consider waiting for clearer signals."
+                }
+                
+                **Risk Disclaimer:** Past statistical patterns do not guarantee future results. Always use proper risk management and position sizing.
+                """)
+                
+            else:
+                st.warning("Insufficient data points for reliable statistical testing. Need at least 30 observations.")
+                
+        except ImportError:
+            st.error("scipy library required for statistical testing. Install with: pip install scipy")
+        except Exception as e:
+            st.error(f"Error in statistical analysis: {str(e)}")
+        
+        st.markdown("---")
+        
+        # Multi-Timeframe Analysis for Ticker 2 (if ratio enabled)
+        if include_ratio and data2 is not None and not data2.empty:
+            st.header(f"📈 Multi-Timeframe Analysis - {ticker2}")
+            
+            analysis_results_t2 = []
+            
+            with st.spinner(f"Performing multi-timeframe analysis for {ticker2}..."):
+                progress_bar = st.progress(0)
+                for idx, (tf_interval, tf_period) in enumerate(timeframes):
+                    try:
+                        tf_data = fetch_data_with_delay(ticker2, tf_interval, tf_period, delay=api_delay)
+                        if not tf_data.empty:
+                            result = analyze_timeframe(tf_data, f"{tf_interval}/{tf_period}")
+                            if result:
+                                analysis_results_t2.append(result)
+                    except Exception as e:
+                        st.warning(f"Skipped {tf_interval}/{tf_period}: {str(e)}")
+                    
+                    progress_bar.progress((idx + 1) / len(timeframes))
+            
+            if analysis_results_t2:
+                mtf_df_t2 = pd.DataFrame(analysis_results_t2)
+                st.dataframe(mtf_df_t2, use_container_width=True, height=500)
+                
+                # Key Insights for Ticker 2
+                st.subheader(f"🔍 {ticker2} Multi-Timeframe Summary")
+                
+                up_trends_t2 = sum(1 for r in analysis_results_t2 if r['Trend'] == 'Up')
+                down_trends_t2 = len(analysis_results_t2) - up_trends_t2
+                
+                try:
+                    avg_rsi_t2 = np.mean([float(r['RSI']) for r in analysis_results_t2 if r['RSI'] != 'N/A'])
+                except:
+                    avg_rsi_t2 = 50
+                
+                col1, col2, col3, col4 = st.columns(4)
+                with col1:
+                    st.metric("Bullish Timeframes", f"{up_trends_t2}/{len(analysis_results_t2)}")
+                with col2:
+                    st.metric("Bearish Timeframes", f"{down_trends_t2}/{len(analysis_results_t2)}")
+                with col3:
+                    st.metric("Average RSI", safe_format_number(avg_rsi_t2))
+                with col4:
+                    overall_bias_t2 = "🟢 BULLISH" if up_trends_t2 > down_trends_t2 else "🔴 BEARISH" if down_trends_t2 > up_trends_t2 else "🟡 NEUTRAL"
+                    st.metric("Overall Bias", overall_bias_t2)
+                
+                current_price_2 = float(data2['Close'].iloc[-1])
+                first_price_2 = float(data2['Close'].iloc[0])
+                pct_change_2 = safe_percentage(current_price_2, first_price_2)
+                
+                st.info(f"""
+                **{ticker2} Analysis Summary:**
+                
+                Based on {len(analysis_results_t2)} timeframes, {ticker2} shows {'**strong bullish momentum**' if up_trends_t2 > down_trends_t2 * 1.5 else '**moderate bullish bias**' if up_trends_t2 > down_trends_t2 else '**strong bearish pressure**' if down_trends_t2 > up_trends_t2 * 1.5 else '**moderate bearish bias**' if down_trends_t2 > up_trends_t2 else '**consolidation pattern**'}.
+                
+                - Current Price: {safe_format_number(current_price_2)}
+                - Price Change: {safe_format_number(pct_change_2)}%
+                - RSI Indicator: {'Oversold - potential bounce' if avg_rsi_t2 < 30 else 'Overbought - potential pullback' if avg_rsi_t2 > 70 else 'Neutral - no extreme conditions'}
+                """)
+        
+        st.markdown("---")
+        
+        # Ratio Bins Analysis (if ratio enabled)
+        if include_ratio and data2 is not None and not data2.empty:
+            st.header("📊 Ratio Bins Analysis")
+            
+            try:
+                min_len = min(len(data1), len(data2))
+                data1_aligned = data1.iloc[:min_len].copy()
+                data2_aligned = data2.iloc[:min_len].copy()
+                ratio_data = data1_aligned['Close'] / data2_aligned['Close']
+                
+                # Create ratio bins
+                ratio_clean = ratio_data.dropna()
+                if len(ratio_clean) > 5:
+                    ratio_bins_cat = pd.qcut(ratio_clean, q=5, labels=False, duplicates='drop')
+                    bin_edges = pd.qcut(ratio_clean, q=5, retbins=True, duplicates='drop')[1]
+                    
+                    # Create labels with ranges
+                    bin_labels = []
+                    for i in range(len(bin_edges)-1):
+                        label = f"{bin_edges[i]:.4f}-{bin_edges[i+1]:.4f}"
+                        bin_labels.append(label)
+                    
+                    # Map to descriptive names
+                    ratio_descriptions = ['Very Low', 'Low', 'Medium', 'High', 'Very High']
+                    ratio_bin_names = [f"{ratio_descriptions[i]} ({bin_labels[i]})" for i in range(len(bin_labels))]
+                    ratio_bins = pd.Series([ratio_bin_names[int(x)] if not pd.isna(x) else 'Unknown' for x in ratio_bins_cat], 
+                                        index=ratio_clean.index)
+                    
+                    # Calculate returns for both tickers in aligned data
+                    t1_returns_points = data1_aligned['Close'].diff()
+                    t1_returns_pct = data1_aligned['Close'].pct_change() * 100
+                    t2_returns_points = data2_aligned['Close'].diff()
+                    t2_returns_pct = data2_aligned['Close'].pct_change() * 100
+                    
+                    # Align all data
+                    start_idx = len(ratio_clean) - len(ratio_bins)
+                    
+                    ratio_analysis = pd.DataFrame({
+                        'DateTime (IST)': ratio_clean.index[start_idx:].strftime('%Y-%m-%d %H:%M:%S'),
+                        'Ratio Bin': ratio_bins.values[start_idx:],
+                        'Ratio Value': ratio_clean.values[start_idx:],
+                        'T1 Returns (Points)': t1_returns_points.iloc[start_idx:].values,
+                        'T1 Returns (%)': t1_returns_pct.iloc[start_idx:].values,
+                        'T2 Returns (Points)': t2_returns_points.iloc[start_idx:].values,
+                        'T2 Returns (%)': t2_returns_pct.iloc[start_idx:].values
+                    })
+                    
+                    st.dataframe(ratio_analysis.tail(50), use_container_width=True, height=400)
+                    
+                    # Ratio statistics
+                    st.subheader("📈 Ratio Statistics & Insights")
+                    
+                    col1, col2, col3, col4 = st.columns(4)
+                    with col1:
+                        st.metric("Highest Ratio", f"{ratio_clean.max():.4f}")
+                    with col2:
+                        st.metric("Lowest Ratio", f"{ratio_clean.min():.4f}")
+                    with col3:
+                        st.metric("Mean Ratio", f"{ratio_clean.mean():.4f}")
+                    with col4:
+                        st.metric("Current Ratio", f"{ratio_clean.iloc[-1]:.4f}")
+                    
+                    current_ratio_bin = ratio_bins.iloc[-1] if len(ratio_bins) > 0 else 'Unknown'
+                    st.success(f"📊 **Current Ratio Regime:** {current_ratio_bin}")
+                    
+                    # Bin-specific analysis
+                    bin_stats = ratio_analysis.groupby('Ratio Bin').agg({
+                        'T1 Returns (Points)': ['mean', 'std', 'count'],
+                        'T1 Returns (%)': ['mean', 'std'],
+                        'T2 Returns (Points)': ['mean', 'std'],
+                        'T2 Returns (%)': ['mean', 'std']
+                    }).round(3)
+                    
+                    st.subheader("📊 Performance by Ratio Regime")
+                    st.dataframe(bin_stats, use_container_width=True)
+                    
+                    st.info(f"""
+                    **Comprehensive Ratio Analysis:**
+                    
+                    **Historical Context:**
+                    - Ratio has ranged from {ratio_clean.min():.4f} to {ratio_clean.max():.4f}
+                    - Average ratio: {ratio_clean.mean():.4f}
+                    - Current ratio: {ratio_clean.iloc[-1]:.4f} ({'above' if ratio_clean.iloc[-1] > ratio_clean.mean() else 'below'} average)
+                    
+                    **Current Ratio Regime:** {current_ratio_bin}
+                    - This regime has occurred {len(ratio_analysis[ratio_analysis['Ratio Bin'] == current_ratio_bin])} times historically
+                    
+                    **Performance in Current Regime:**
+                    - Avg {ticker1} return: {ratio_analysis[ratio_analysis['Ratio Bin'] == current_ratio_bin]['T1 Returns (%)'].mean():.2f}%
+                    - Avg {ticker2} return: {ratio_analysis[ratio_analysis['Ratio Bin'] == current_ratio_bin]['T2 Returns (%)'].mean():.2f}%
+                    
+                    **Forecast:** When ratio is {'high' if 'High' in current_ratio_bin else 'low' if 'Low' in current_ratio_bin else 'medium'}, 
+                    {ticker1} {'typically underperforms - consider shorting T1 or buying T2' if 'High' in current_ratio_bin 
+                    else 'typically outperforms - consider buying T1 or shorting T2' if 'Low' in current_ratio_bin 
+                    else 'shows balanced performance relative to ' + ticker2}
+                    """)
+                    
+            except Exception as e:
+                st.warning(f"Ratio bins analysis: {str(e)}")
+        
+        st.markdown("---")
+        
         # Ratio Analysis Section (Only if enabled)
         if include_ratio and data2 is not None and not data2.empty:
             st.header("📊 Ratio Analysis")
@@ -1154,27 +1567,47 @@ if st.session_state.data_fetched and st.session_state.ticker1_data is not None:
         st.header("🎯 FINAL TRADING RECOMMENDATION")
         
         try:
+            # Initialize variables with defaults
+            current_z = 0
+            current_z_points = 0
+            
+            # Calculate Z-score if data available
+            try:
+                returns_points = data1['Close'].diff().dropna()
+                if len(returns_points) > 0:
+                    mu_points = returns_points.mean()
+                    sigma_points = returns_points.std()
+                    z_returns_points = (returns_points - mu_points) / sigma_points
+                    current_z = z_returns_points.iloc[-1] if len(z_returns_points) > 0 else 0
+                    current_z_points = current_z
+            except:
+                pass
+            
             # Gather all signals
             signals = []
             signal_weights = []
             
             # 1. Multi-timeframe trend signal
-            if 'up_trends' in locals() and 'down_trends' in locals():
+            if 'up_trends' in locals() and 'down_trends' in locals() and 'analysis_results' in locals() and len(analysis_results) > 0:
                 trend_signal = 1 if up_trends > down_trends else -1 if down_trends > up_trends else 0
                 signals.append(trend_signal)
                 signal_weights.append(0.3)
+            else:
+                trend_signal = 0
             
             # 2. RSI signal
             if 'avg_rsi' in locals():
                 rsi_signal = -1 if avg_rsi > 70 else 1 if avg_rsi < 30 else 0
                 signals.append(rsi_signal)
                 signal_weights.append(0.2)
+            else:
+                rsi_signal = 0
+                avg_rsi = 50
             
             # 3. Z-Score signal
-            if 'current_z' in locals():
-                z_signal = -1 if current_z > 2 else 1 if current_z < -2 else 0
-                signals.append(z_signal)
-                signal_weights.append(0.2)
+            z_signal = -1 if current_z > 2 else 1 if current_z < -2 else 0
+            signals.append(z_signal)
+            signal_weights.append(0.2)
             
             # 4. EMA alignment
             current_price = float(data1['Close'].iloc[-1])
@@ -1234,7 +1667,7 @@ if st.session_state.data_fetched and st.session_state.ticker1_data is not None:
                 sl = current_price
                 risk_reward = 0
             
-            # Display recommendation in a prominent box
+            # Display recommendation
             st.markdown(f"""
             <div style="background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); 
                         padding: 2rem; border-radius: 1rem; color: white; margin: 1rem 0;">
@@ -1265,9 +1698,10 @@ if st.session_state.data_fetched and st.session_state.ticker1_data is not None:
             
             with col2:
                 st.subheader("📊 Signal Breakdown")
+                trend_count = f"{up_trends}/{len(analysis_results)}" if 'up_trends' in locals() and 'analysis_results' in locals() else "N/A"
                 st.markdown(f"""
                 **Component Signals:**
-                1. Multi-Timeframe Trend: {'🟢 Bullish' if up_trends > down_trends else '🔴 Bearish' if down_trends > up_trends else '🟡 Neutral'} ({up_trends}/{len(analysis_results)})
+                1. Multi-Timeframe Trend: {'🟢 Bullish' if trend_signal > 0 else '🔴 Bearish' if trend_signal < 0 else '🟡 Neutral'} ({trend_count})
                 2. RSI Indicator: {'🟢 Oversold' if avg_rsi < 30 else '🔴 Overbought' if avg_rsi > 70 else '🟡 Neutral'} ({safe_format_number(avg_rsi)})
                 3. Z-Score: {'🔴 Extreme High' if current_z > 2 else '🟢 Extreme Low' if current_z < -2 else '🟡 Normal'} ({safe_format_number(current_z, 2)})
                 4. EMA Alignment: {'🟢 Bullish' if ema_signal > 0 else '🔴 Bearish' if ema_signal < 0 else '🟡 Mixed'}
@@ -1297,12 +1731,13 @@ if st.session_state.data_fetched and st.session_state.ticker1_data is not None:
             """)
             
             st.subheader("📝 Trading Rationale")
+            pct_change_1 = safe_percentage(current_price, float(data1['Close'].iloc[0]))
             st.info(f"""
             **Why This Signal:**
             
             The algorithmic analysis across multiple timeframes and indicators suggests {action.lower()} based on:
             
-            1. **Trend Alignment:** {up_trends} out of {len(analysis_results)} timeframes show upward momentum
+            1. **Trend Alignment:** {trend_count} timeframes analyzed
             2. **Mean Reversion:** Z-score of {safe_format_number(current_z, 2)} indicates {'extreme conditions likely to reverse' if abs(current_z) > 2 else 'normal market conditions'}
             3. **Momentum:** RSI at {safe_format_number(avg_rsi)} shows {'oversold conditions' if avg_rsi < 30 else 'overbought conditions' if avg_rsi > 70 else 'neutral momentum'}
             4. **Technical Structure:** Price {'above' if current_price > ema_20_val else 'below'} key EMAs suggests {'bullish' if current_price > ema_20_val else 'bearish'} bias
@@ -1317,6 +1752,8 @@ if st.session_state.data_fetched and st.session_state.ticker1_data is not None:
             
         except Exception as e:
             st.error(f"Error generating recommendation: {str(e)}")
+            import traceback
+            st.code(traceback.format_exc())
         
         st.markdown("---")
         
