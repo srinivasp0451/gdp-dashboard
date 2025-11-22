@@ -137,13 +137,23 @@ def fetch_data_with_delay(ticker, interval, period, delay=1.5):
     """Fetch data with delay to respect API limits"""
     time.sleep(delay)
     try:
-        data = yf.download(ticker, interval=interval, period=period, progress=False, show_errors=False)
+        # Use Ticker object for more reliable data fetching
+        ticker_obj = yf.Ticker(ticker)
+        data = ticker_obj.history(interval=interval, period=period)
+        
         if not data.empty:
             data = convert_to_ist(data)
         return data
     except Exception as e:
-        st.error(f"Error fetching {ticker} for {interval}/{period}: {str(e)}")
-        return pd.DataFrame()
+        # Fallback to download method
+        try:
+            data = yf.download(ticker, interval=interval, period=period, progress=False)
+            if not data.empty:
+                data = convert_to_ist(data)
+            return data
+        except Exception as e2:
+            st.error(f"Error fetching {ticker} for {interval}/{period}: {str(e2)}")
+            return pd.DataFrame()
 
 def analyze_timeframe(data, timeframe_name):
     """Analyze a single timeframe with comprehensive metrics"""
