@@ -487,17 +487,22 @@ if st.session_state.data_fetched and st.session_state.ticker1_data is not None:
             st.header("📊 Ratio Analysis")
             
             try:
+                # Align data to same length
+                min_len = min(len(data1), len(data2))
+                data1_aligned = data1.iloc[:min_len].copy()
+                data2_aligned = data2.iloc[:min_len].copy()
+                
                 # Calculate Ratio
-                ratio_data = data1['Close'] / data2['Close']
+                ratio_data = data1_aligned['Close'] / data2_aligned['Close']
                 
                 # Create comparison table
                 ratio_df = pd.DataFrame({
-                    'DateTime (IST)': data1.index.strftime('%Y-%m-%d %H:%M:%S'),
-                    'Ticker1 Price': data1['Close'].values,
-                    'Ticker2 Price': data2['Close'].values,
+                    'DateTime (IST)': data1_aligned.index.strftime('%Y-%m-%d %H:%M:%S'),
+                    'Ticker1 Price': data1_aligned['Close'].values,
+                    'Ticker2 Price': data2_aligned['Close'].values,
                     'Ratio': ratio_data.values,
-                    'RSI Ticker1': calculate_rsi(data1['Close']).values,
-                    'RSI Ticker2': calculate_rsi(data2['Close']).values,
+                    'RSI Ticker1': calculate_rsi(data1_aligned['Close']).values,
+                    'RSI Ticker2': calculate_rsi(data2_aligned['Close']).values,
                     'RSI Ratio': calculate_rsi(ratio_data).values
                 })
                 
@@ -601,55 +606,226 @@ if st.session_state.data_fetched and st.session_state.ticker1_data is not None:
             returns = data1['Close'].pct_change()
             volatility = returns.rolling(window=min(20, len(returns))).std() * np.sqrt(252) * 100
             
-            # Create bins
-            vol_bins = pd.qcut(volatility.dropna(), q=min(5, len(volatility.dropna())), labels=['Very Low', 'Low', 'Medium', 'High', 'Very High'], duplicates='drop')
-            
-            vol_analysis = pd.DataFrame({
-                'DateTime (IST)': data1.index[len(data1) - len(vol_bins):].strftime('%Y-%m-%d %H:%M:%S'),
-                'Volatility Bin': vol_bins.values,
-                'Returns (Points)': data1['Close'].diff().iloc[len(data1) - len(vol_bins):].values,
-                'Returns (%)': (returns.iloc[len(data1) - len(vol_bins):].values * 100)
-            })
-            
-            st.dataframe(vol_analysis.tail(30), use_container_width=True, height=300)
-            
-            current_vol_bin = vol_bins.iloc[-1] if len(vol_bins) > 0 else 'Unknown'
-            st.success(f"📊 **Current Volatility Regime:** {current_vol_bin}")
-            
-            # Volatility insights
-            avg_return_by_vol = vol_analysis.groupby('Volatility Bin')['Returns (%)'].mean()
-            st.write("**Average Returns by Volatility Regime:**")
-            st.bar_chart(avg_return_by_vol)
-            
+            # Create bins with explicit boundaries
+            vol_clean = volatility.dropna()
+            if len(vol_clean) > 5:
+                vol_bins_cat = pd.qcut(vol_clean, q=5, labels=False, duplicates='drop')
+                bin_edges = pd.qcut(vol_clean, q=5, retbins=True, duplicates='drop')[1]
+                
+                # Create labels with ranges
+                bin_labels = []
+                for i in range(len(bin_edges)-1):
+                    label = f"{bin_edges[i]:.2f}-{bin_edges[i+1]:.2f}"
+                    bin_labels.append(label)
+                
+                # Map to descriptive names with ranges
+                vol_descriptions = ['Very Low', 'Low', 'Medium', 'High', 'Very High']
+                vol_bin_names = [f"{vol_descriptions[i]} ({bin_labels[i]})" for i in range(len(bin_labels))]
+                vol_bins = pd.Series([vol_bin_names[int(x)] if not pd.isna(x) else 'Unknown' for x in vol_bins_cat], 
+                                    index=vol_clean.index)
+                
+                # Calculate price ranges for each volatility bin
+                start_idx = len(data1) - len(vol_bins)
+                price_data = data1['Close'].iloc[start_idx:]
+                
+                vol_analysis = pd.DataFrame({
+                    'DateTime (IST)': data1.index[start_idx:].strftime('%Y-%m-%d %H:%M:%S'),
+                    'Volatility Bin': vol_bins.values,
+                    'Volatility %': vol_clean.values,
+                    'Price': price_data.values,
+                    'Returns (Points)': data1['Close'].diff().iloc[start_idx:].values,
+                    'Returns (%)': (returns.iloc[start_idx:].values * 100)
+                })
+                
+                st.dataframe(vol_analysis.tail(50), use_container_width=True, height=400)
+                
+                # Statistical Summary
+                st.subheader("📈 Volatility Statistics & Insights")
+                
+                col1, col2, col3, col4 = st.columns(4)
+                with col1:
+                    st.metric("Highest Volatility", f"{vol_clean.max():.2f}%")
+                with col2:
+                    st.metric("Lowest Volatility", f"{vol_clean.min():.2f}%")
+                with col3:
+                    st.metric("Mean Volatility", f"{vol_clean.mean():.2f}%")
+                with col4:
+                    current_vol = vol_clean.iloc[-1]
+                    st.metric("Current Volatility", f"{current_vol:.2f}%")
+                
+                # Returns statistics
+                returns_points = data1['Close'].diff().dropna()
+                returns_pct = returns.dropna() * 100
+                
+                col1, col2, col3, col4 = st.columns(4)
+                with col1:
+                    st.metric("Max Return (Points)", f"{returns_points.max():.2f}")
+                with col2:
+                    st.metric("Min Return (Points)", f"{returns_points.min():.2f}")
+                with col3:
+                    st.metric("Mean Return (%)", f"{returns_pct.mean():.3f}%")
+                with col4:
+                    st.metric("Current Return (%)", f"{returns_pct.iloc[-1]:.2f}%")
+                
+                # Determine current bin
+                current_vol_bin = vol_bins.iloc[-1] if len(vol_bins) > 0 else 'Unknown'
+                
+                # Bin-specific analysis
+                vol_analysis_copy = vol_analysis.copy()
+                bin_stats = vol_analysis_copy.groupby('Volatility Bin').agg({
+                    'Returns (Points)': ['mean', 'std', 'min', 'max', 'count'],
+                    'Returns (%)': ['mean', 'std']
+                }).round(3)
+                
+                st.success(f"📊 **Current Volatility Regime:** {current_vol_bin}")
+                
+                st.info(f"""
+                **Comprehensive Volatility Analysis:**
+                
+                **Historical Context:**
+                - Volatility has ranged from {vol_clean.min():.2f}% to {vol_clean.max():.2f}%
+                - Average volatility: {vol_clean.mean():.2f}%
+                - Current volatility: {current_vol:.2f}% ({'above' if current_vol > vol_clean.mean() else 'below'} average)
+                
+                **Returns Analysis:**
+                - Largest gain: {returns_points.max():.2f} points ({returns_pct.max():.2f}%)
+                - Largest loss: {returns_points.min():.2f} points ({returns_pct.min():.2f}%)
+                - Average return: {returns_pct.mean():.3f}% per period
+                
+                **Current Market Status:**
+                - Current bin: **{current_vol_bin}**
+                - This volatility regime has occurred {len(vol_analysis[vol_analysis['Volatility Bin'] == current_vol_bin])} times in history
+                
+                **Forecast Based on Historical Bin Performance:**
+                When volatility is in the **{current_vol_bin.split('(')[0].strip()}** regime:
+                - Average return: {vol_analysis_copy[vol_analysis_copy['Volatility Bin'] == current_vol_bin]['Returns (%)'].mean():.2f}%
+                - Typical range: {vol_analysis_copy[vol_analysis_copy['Volatility Bin'] == current_vol_bin]['Returns (Points)'].min():.2f} to {vol_analysis_copy[vol_analysis_copy['Volatility Bin'] == current_vol_bin]['Returns (Points)'].max():.2f} points
+                
+                **Prediction:** {'Higher volatility suggests larger price swings expected - trade with wider stops' if current_vol > vol_clean.mean() else 'Lower volatility suggests smaller moves - tighter stops appropriate'}
+                """)
+                
+                # Bin performance table
+                st.subheader("📊 Performance by Volatility Regime")
+                st.dataframe(bin_stats, use_container_width=True)
+                
+            else:
+                st.warning("Insufficient data for volatility binning analysis")
+                
         except Exception as e:
             st.warning(f"Volatility analysis requires more data points: {str(e)}")
         
         st.markdown("---")
         
         # Pattern Recognition
-        st.header("🔍 Pattern Recognition & Historical Similarities")
+        st.header("🔍 Advanced Pattern Recognition & Historical Similarities")
         
         try:
             patterns = detect_patterns(data1, threshold=pattern_threshold)
             
             if patterns:
                 pattern_df = pd.DataFrame(patterns)
-                pattern_df['DateTime'] = pattern_df['DateTime'].astype(str)
+                pattern_df['DateTime'] = pattern_df['DateTime'].dt.strftime('%Y-%m-%d %H:%M:%S')
                 
-                st.dataframe(pattern_df, use_container_width=True, height=300)
+                st.dataframe(pattern_df, use_container_width=True, height=400)
                 
+                # Pattern statistics
+                total_patterns = len(patterns)
+                up_moves = sum(1 for p in patterns if 'Up' in p['Direction'])
+                down_moves = total_patterns - up_moves
+                vol_bursts = sum(1 for p in patterns if '✓' in p['Volatility_Burst'])
+                volume_spikes = sum(1 for p in patterns if '✓' in p['Volume_Spike'])
+                rsi_divs = sum(1 for p in patterns if '✓' in p['RSI_Divergence'])
+                ema_crosses = sum(1 for p in patterns if '✓' in p['EMA_Crossover'])
+                breakouts = sum(1 for p in patterns if '✓' in p['Support/Resistance_Break'])
+                
+                col1, col2, col3, col4 = st.columns(4)
+                with col1:
+                    st.metric("Total Patterns", total_patterns)
+                    st.metric("Upward Moves", f"{up_moves} ({up_moves/total_patterns*100:.1f}%)")
+                with col2:
+                    st.metric("Volatility Bursts", f"{vol_bursts} ({vol_bursts/total_patterns*100:.1f}%)")
+                    st.metric("Volume Spikes", f"{volume_spikes} ({volume_spikes/total_patterns*100:.1f}%)")
+                with col3:
+                    st.metric("RSI Divergences", f"{rsi_divs} ({rsi_divs/total_patterns*100:.1f}%)")
+                    st.metric("EMA Crossovers", f"{ema_crosses} ({ema_crosses/total_patterns*100:.1f}%)")
+                with col4:
+                    st.metric("Breakouts", f"{breakouts} ({breakouts/total_patterns*100:.1f}%)")
+                
+                # Calculate average characteristics
+                avg_move = np.mean([abs(p['Move (Points)']) for p in patterns])
+                avg_move_pct = np.mean([abs(p['Move (%)']) for p in patterns])
+                
+                st.subheader("📊 Pattern Analysis Insights")
                 st.info(f"""
-                **Pattern Analysis:**
-                - Detected {len(patterns)} significant movements (>{pattern_threshold} points)
-                - Volatility bursts preceded {sum(1 for p in patterns if p['Volatility_Burst'])} moves
-                - RSI divergences detected in {sum(1 for p in patterns if p['RSI_Divergence'])} cases
+                **Historical Pattern Summary:**
                 
-                **Current Market Context:** Monitoring for similar pre-move patterns...
+                **Move Characteristics:**
+                - Detected {total_patterns} significant moves (>{pattern_threshold} points threshold)
+                - Average move size: {avg_move:.2f} points ({avg_move_pct:.2f}%)
+                - Direction bias: {up_moves} up vs {down_moves} down moves
+                
+                **Pre-Move Indicators (Before Significant Moves):**
+                - Volatility bursts preceded {vol_bursts}/{total_patterns} moves ({vol_bursts/total_patterns*100:.1f}%)
+                - Volume spikes preceded {volume_spikes}/{total_patterns} moves ({volume_spikes/total_patterns*100:.1f}%)
+                - RSI divergences detected in {rsi_divs}/{total_patterns} cases ({rsi_divs/total_patterns*100:.1f}%)
+                - EMA crossovers preceded {ema_crosses}/{total_patterns} moves ({ema_crosses/total_patterns*100:.1f}%)
+                - Support/Resistance breakouts in {breakouts}/{total_patterns} cases ({breakouts/total_patterns*100:.1f}%)
+                
+                **Key Findings:**
+                - {'Volatility bursts are strong predictor of upcoming moves' if vol_bursts/total_patterns > 0.6 else 'Volatility bursts show moderate correlation with moves' if vol_bursts/total_patterns > 0.3 else 'Volatility bursts are weak predictor'}
+                - {'RSI divergence is reliable signal' if rsi_divs/total_patterns > 0.5 else 'RSI divergence shows moderate reliability' if rsi_divs/total_patterns > 0.25 else 'RSI divergence is less reliable in this timeframe'}
+                - {'Volume confirmation is important' if volume_spikes/total_patterns > 0.4 else 'Volume shows mixed signals'}
                 """)
+                
+                # Current market similarity check
+                st.subheader("🎯 Current Market Pattern Similarity")
+                
+                current_close = data1['Close'].values
+                if len(current_close) >= 10:
+                    # Analyze last 10 candles
+                    recent_vol = data1['Close'].iloc[-10:].std()
+                    overall_vol = data1['Close'].std()
+                    recent_vol_burst = recent_vol > overall_vol * 1.5
+                    
+                    recent_rsi = calculate_rsi(data1['Close'])
+                    current_rsi = float(recent_rsi.iloc[-1]) if len(recent_rsi) > 0 else 50
+                    
+                    recent_moves = [current_close[i] - current_close[i-1] for i in range(-10, 0)]
+                    consecutive_up = sum(1 for m in recent_moves if m > 0)
+                    consecutive_down = sum(1 for m in recent_moves if m < 0)
+                    
+                    warnings = []
+                    if recent_vol_burst:
+                        warnings.append("⚠️ **Volatility Burst Detected** - Historical data shows this precedes major moves")
+                    if current_rsi > 70:
+                        warnings.append("⚠️ **Overbought RSI** - Potential divergence setup for downward move")
+                    elif current_rsi < 30:
+                        warnings.append("⚠️ **Oversold RSI** - Potential divergence setup for upward move")
+                    if consecutive_up >= 5:
+                        warnings.append("⚠️ **Extended Rally** - 5+ consecutive up candles, exhaustion possible")
+                    elif consecutive_down >= 5:
+                        warnings.append("⚠️ **Extended Decline** - 5+ consecutive down candles, reversal possible")
+                    
+                    if warnings:
+                        for warning in warnings:
+                            st.warning(warning)
+                    else:
+                        st.success("✓ No immediate warning patterns detected in current market structure")
+                    
+                    st.info(f"""
+                    **Current Market Analysis:**
+                    - Recent volatility: {recent_vol:.2f} ({'elevated' if recent_vol_burst else 'normal'})
+                    - Current RSI: {current_rsi:.1f}
+                    - Last 10 candles: {consecutive_up} up, {consecutive_down} down
+                    - Pattern similarity: {'High' if recent_vol_burst or abs(current_rsi - 50) > 20 else 'Moderate' if abs(current_rsi - 50) > 10 else 'Low'} alignment with pre-move patterns
+                    
+                    **Forecast:** Based on historical patterns, {'significant move likely within next few periods' if recent_vol_burst and (current_rsi > 65 or current_rsi < 35) else 'moderate probability of directional move' if recent_vol_burst or abs(current_rsi - 50) > 15 else 'consolidation likely to continue'}
+                    """)
+                
             else:
-                st.info("No significant patterns detected in current timeframe. Consider lowering threshold or using longer period.")
+                st.info(f"No significant patterns detected with current threshold ({pattern_threshold} points). Consider lowering threshold or using longer period for more pattern data.")
         except Exception as e:
-            st.warning(f"Pattern recognition requires more data: {str(e)}")
+            st.warning(f"Pattern recognition analysis: {str(e)}")
         
         st.markdown("---")
         
@@ -770,34 +946,85 @@ if st.session_state.data_fetched and st.session_state.ticker1_data is not None:
         
         st.markdown("---")
         
-        # Returns Distribution
-        st.header("📊 Statistical Distribution Analysis")
+        # Returns Distribution with Bell Curve
+        st.header("📊 Statistical Distribution Analysis with Normal Distribution")
         
         try:
             returns_points = data1['Close'].diff().dropna()
             returns_pct = data1['Close'].pct_change().dropna() * 100
             
+            # Create histograms with normal distribution overlay
             fig_dist = make_subplots(
-                rows=1, cols=2,
-                subplot_titles=('Returns Distribution (Points)', 'Returns Distribution (%)'),
+                rows=2, cols=1,
+                subplot_titles=('Returns Distribution (Points) with Normal Curve', 
+                               'Returns Distribution (%) with Normal Curve'),
+                vertical_spacing=0.15
             )
             
-            fig_dist.add_trace(go.Histogram(x=returns_points, nbinsx=50, name='Points', 
-                                           marker_color='blue'), row=1, col=1)
-            fig_dist.add_trace(go.Histogram(x=returns_pct, nbinsx=50, name='Percentage', 
-                                           marker_color='green'), row=1, col=2)
+            # Points distribution
+            fig_dist.add_trace(go.Histogram(x=returns_points, nbinsx=50, name='Actual Returns', 
+                                           marker_color='blue', opacity=0.7, histnorm='probability density'), 
+                              row=1, col=1)
             
-            fig_dist.update_layout(height=400, showlegend=False)
+            # Fit normal distribution
+            mu_points = returns_points.mean()
+            sigma_points = returns_points.std()
+            x_points = np.linspace(returns_points.min(), returns_points.max(), 100)
+            normal_points = (1/(sigma_points * np.sqrt(2 * np.pi))) * np.exp(-0.5*((x_points - mu_points)/sigma_points)**2)
+            
+            fig_dist.add_trace(go.Scatter(x=x_points, y=normal_points, mode='lines',
+                                         name='Normal Distribution', line=dict(color='red', width=3)),
+                              row=1, col=1)
+            
+            # Percentage distribution
+            fig_dist.add_trace(go.Histogram(x=returns_pct, nbinsx=50, name='Actual Returns %', 
+                                           marker_color='green', opacity=0.7, histnorm='probability density'), 
+                              row=2, col=1)
+            
+            mu_pct = returns_pct.mean()
+            sigma_pct = returns_pct.std()
+            x_pct = np.linspace(returns_pct.min(), returns_pct.max(), 100)
+            normal_pct = (1/(sigma_pct * np.sqrt(2 * np.pi))) * np.exp(-0.5*((x_pct - mu_pct)/sigma_pct)**2)
+            
+            fig_dist.add_trace(go.Scatter(x=x_pct, y=normal_pct, mode='lines',
+                                         name='Normal Distribution', line=dict(color='red', width=3)),
+                              row=2, col=1)
+            
+            fig_dist.update_layout(height=800, showlegend=True)
+            fig_dist.update_xaxes(title_text="Returns (Points)", row=1, col=1)
+            fig_dist.update_xaxes(title_text="Returns (%)", row=2, col=1)
+            fig_dist.update_yaxes(title_text="Probability Density", row=1, col=1)
+            fig_dist.update_yaxes(title_text="Probability Density", row=2, col=1)
+            
             st.plotly_chart(fig_dist, use_container_width=True)
             
-            # Z-Score Analysis
-            st.subheader("📈 Z-Score Statistical Analysis")
+            # Statistical insights
+            st.subheader("📈 Distribution Analysis Summary")
             
-            z_returns_points = (returns_points - returns_points.mean()) / returns_points.std()
-            z_returns_pct = (returns_pct - returns_pct.mean()) / returns_pct.std()
+            col1, col2, col3, col4 = st.columns(4)
+            with col1:
+                st.metric("Mean (Points)", safe_format_number(mu_points, 3))
+                st.metric("Std Dev (Points)", safe_format_number(sigma_points, 3))
+            with col2:
+                st.metric("Mean (%)", safe_format_number(mu_pct, 3))
+                st.metric("Std Dev (%)", safe_format_number(sigma_pct, 3))
+            with col3:
+                skew_points = returns_points.skew()
+                st.metric("Skewness", safe_format_number(skew_points, 3))
+                st.metric("Interpretation", "Right Tail" if skew_points > 0 else "Left Tail")
+            with col4:
+                kurt_points = returns_points.kurtosis()
+                st.metric("Kurtosis", safe_format_number(kurt_points, 3))
+                st.metric("Interpretation", "Fat Tails" if kurt_points > 0 else "Thin Tails")
+            
+            # Z-Score Analysis
+            st.subheader("📊 Z-Score Statistical Analysis")
+            
+            z_returns_points = (returns_points - mu_points) / sigma_points
+            z_returns_pct = (returns_pct - mu_pct) / sigma_pct
             
             z_df = pd.DataFrame({
-                'DateTime (IST)': data1.index[1:].strftime('%Y-%m-%d %H:%M:%S')[:len(z_returns_points)],
+                'DateTime (IST)': data1.index[1:len(z_returns_points)+1].strftime('%Y-%m-%d %H:%M:%S'),
                 'Returns (Points)': returns_points.values,
                 'Z-Score (Points)': z_returns_points.values,
                 'Returns (%)': returns_pct.values,
@@ -806,41 +1033,120 @@ if st.session_state.data_fetched and st.session_state.ticker1_data is not None:
             
             st.dataframe(z_df.tail(30), use_container_width=True, height=300)
             
-            current_z = z_returns_points.iloc[-1] if len(z_returns_points) > 0 else 0
+            current_z_points = z_returns_points.iloc[-1] if len(z_returns_points) > 0 else 0
+            current_z_pct = z_returns_pct.iloc[-1] if len(z_returns_pct) > 0 else 0
             
-            col1, col2, col3 = st.columns(3)
+            col1, col2, col3, col4 = st.columns(4)
             with col1:
-                st.metric("Current Z-Score", safe_format_number(current_z, 3))
+                st.metric("Current Z-Score (Points)", safe_format_number(current_z_points, 3))
             with col2:
-                interpretation = "🔴 Extreme High" if current_z > 2 else "🟢 Extreme Low" if current_z < -2 else "🟡 Normal"
-                st.metric("Interpretation", interpretation)
+                st.metric("Current Z-Score (%)", safe_format_number(current_z_pct, 3))
             with col3:
-                forecast = "Reversal Down" if current_z > 2 else "Reversal Up" if current_z < -2 else "Continue Trend"
-                st.metric("Forecast", forecast)
+                percentile = (1 + np.tanh(current_z_points/2)) * 50
+                st.metric("Percentile Rank", f"{percentile:.1f}%")
+            with col4:
+                interpretation = "🔴 Extreme High" if abs(current_z_points) > 2 else "🟡 Moderate" if abs(current_z_points) > 1 else "🟢 Normal"
+                st.metric("Signal", interpretation)
             
             st.info(f"""
-            **Z-Score Interpretation Guide:**
-            - **Z > 2.0:** Price movement is extremely high (99th percentile) - expect mean reversion downward
-            - **Z < -2.0:** Price movement is extremely low (1st percentile) - expect mean reversion upward
-            - **-1 < Z < 1:** Normal price behavior (68% of data falls here)
+            **Comprehensive Z-Score Analysis:**
             
-            **Current Analysis:** Z-Score is {safe_format_number(current_z, 2)}, suggesting the recent price movement is {'extremely high and likely to reverse' if current_z > 2 else 'extremely low and likely to bounce' if current_z < -2 else 'within normal ranges'}
+            **Understanding Normal Distribution (Bell Curve):**
+            - **68% of data** falls within ±1 standard deviation (Z-score: -1 to +1)
+            - **95% of data** falls within ±2 standard deviations (Z-score: -2 to +2)
+            - **99.7% of data** falls within ±3 standard deviations (Z-score: -3 to +3)
+            
+            **Current Position:**
+            - Current Z-Score: **{safe_format_number(current_z_points, 2)}** (Points) | **{safe_format_number(current_z_pct, 2)}** (%)
+            - This places current return at **{percentile:.1f}th percentile**
+            - Interpretation: {
+                'Price movement is EXTREMELY unusual (>95th percentile) - strong mean reversion expected' if abs(current_z_points) > 2 
+                else 'Price movement is somewhat unusual (68-95th percentile) - moderate reversion possible' if abs(current_z_points) > 1 
+                else 'Price movement is NORMAL (within 68% range) - no extreme signals'
+            }
+            
+            **Statistical Insights:**
+            - Mean return: {safe_format_number(mu_points, 2)} points ({safe_format_number(mu_pct, 3)}%)
+            - Standard deviation: {safe_format_number(sigma_points, 2)} points ({safe_format_number(sigma_pct, 3)}%)
+            - Skewness: {safe_format_number(skew_points, 2)} ({'positive (upside bias)' if skew_points > 0 else 'negative (downside bias)'})
+            - Kurtosis: {safe_format_number(kurt_points, 2)} ({'fat tails - more extreme moves than normal' if kurt_points > 0 else 'thin tails - fewer extreme moves'})
+            
+            **Probabilistic Forecast:**
+            Based on normal distribution:
+            - **68% probability** next move will be between {safe_format_number(mu_points - sigma_points, 1)} and {safe_format_number(mu_points + sigma_points, 1)} points
+            - **95% probability** next move will be between {safe_format_number(mu_points - 2*sigma_points, 1)} and {safe_format_number(mu_points + 2*sigma_points, 1)} points
+            
+            **Trading Implication:**
+            {
+                f'Current extreme reading (Z={safe_format_number(current_z_points, 2)}) suggests HIGH PROBABILITY of reversal. ' + 
+                ('Consider SELLING/SHORTING as price likely to revert downward' if current_z_points > 2 else 'Consider BUYING as price likely to revert upward' if current_z_points < -2 else '')
+                if abs(current_z_points) > 2
+                else f'Current moderate reading suggests price within normal range. Continue monitoring for extreme signals.'
+            }
             """)
+            
+            # Bell curve visualization with zones
+            fig_bell = go.Figure()
+            
+            x_range = np.linspace(-4, 4, 1000)
+            y_range = (1/np.sqrt(2*np.pi)) * np.exp(-0.5*x_range**2)
+            
+            fig_bell.add_trace(go.Scatter(x=x_range, y=y_range, fill='tozeroy',
+                                         name='Normal Distribution', line=dict(color='blue')))
+            
+            # Color zones
+            fig_bell.add_vrect(x0=-1, x1=1, fillcolor="green", opacity=0.2, 
+                              annotation_text="68% (Normal)", annotation_position="top left")
+            fig_bell.add_vrect(x0=-2, x1=-1, fillcolor="yellow", opacity=0.2,
+                              annotation_text="95% Range", annotation_position="top left")
+            fig_bell.add_vrect(x0=1, x1=2, fillcolor="yellow", opacity=0.2)
+            fig_bell.add_vrect(x0=-4, x1=-2, fillcolor="red", opacity=0.2,
+                              annotation_text="Extreme", annotation_position="top left")
+            fig_bell.add_vrect(x0=2, x1=4, fillcolor="red", opacity=0.2)
+            
+            # Mark current position
+            current_y = (1/np.sqrt(2*np.pi)) * np.exp(-0.5*current_z_points**2)
+            fig_bell.add_trace(go.Scatter(x=[current_z_points], y=[current_y], mode='markers',
+                                         marker=dict(size=15, color='red'),
+                                         name=f'Current Position (Z={current_z_points:.2f})'))
+            
+            fig_bell.update_layout(
+                title="Bell Curve with Current Position",
+                xaxis_title="Z-Score (Standard Deviations from Mean)",
+                yaxis_title="Probability Density",
+                height=500
+            )
+            
+            st.plotly_chart(fig_bell, use_container_width=True)
             
             # Ratio Z-Score (if applicable)
             if include_ratio and data2 is not None and not data2.empty:
-                ratio_data = data1['Close'] / data2['Close']
+                min_len = min(len(data1), len(data2))
+                ratio_data = (data1['Close'].iloc[:min_len] / data2['Close'].iloc[:min_len])
                 ratio_returns = ratio_data.diff().dropna()
-                z_ratio = (ratio_returns - ratio_returns.mean()) / ratio_returns.std()
                 
-                st.subheader("📊 Ratio Z-Score Analysis")
-                current_z_ratio = z_ratio.iloc[-1] if len(z_ratio) > 0 else 0
-                st.metric("Ratio Z-Score", safe_format_number(current_z_ratio, 3))
-                
-                st.write(f"**Ratio Signal:** {'Ratio extremely high - T1 overvalued vs T2' if current_z_ratio > 2 else 'Ratio extremely low - T1 undervalued vs T2' if current_z_ratio < -2 else 'Ratio in normal range'}")
+                if len(ratio_returns) > 0:
+                    z_ratio = (ratio_returns - ratio_returns.mean()) / ratio_returns.std()
+                    
+                    st.subheader("📊 Ratio Z-Score Analysis")
+                    current_z_ratio = z_ratio.iloc[-1] if len(z_ratio) > 0 else 0
+                    
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        st.metric("Ratio Z-Score", safe_format_number(current_z_ratio, 3))
+                    with col2:
+                        ratio_signal = "🔴 T1 Overvalued" if current_z_ratio > 2 else "🟢 T1 Undervalued" if current_z_ratio < -2 else "🟡 Normal"
+                        st.metric("Ratio Signal", ratio_signal)
+                    
+                    st.write(f"""
+                    **Ratio Interpretation:** Z-score of {safe_format_number(current_z_ratio, 2)} indicates that {ticker1} is 
+                    {'significantly overpriced relative to ' + ticker2 + ' - consider selling T1 or buying T2' if current_z_ratio > 2 
+                    else 'significantly underpriced relative to ' + ticker2 + ' - consider buying T1 or selling T2' if current_z_ratio < -2 
+                    else 'fairly priced relative to ' + ticker2}
+                    """)
         
         except Exception as e:
-            st.warning(f"Statistical analysis requires more data points: {str(e)}")
+            st.warning(f"Statistical analysis: {str(e)}")
         
         st.markdown("---")
         
