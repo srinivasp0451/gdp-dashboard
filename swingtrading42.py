@@ -504,8 +504,7 @@ if res:
         else:
             strength='Hold'
 
-        st.markdown(f"**Signal:** {strength}  
-                    **Combined Score:** {round(combined,3)}")
+        st.markdown(f"**Signal:** {strength}  **Combined Score:** {round(combined,3)}")
         # Risk management
         atr_val = latest['ATR14'] if 'ATR14' in latest else df1['ATR14'].iloc[-1]
         entry = latest['Close']
