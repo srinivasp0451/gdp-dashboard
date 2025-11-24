@@ -1219,16 +1219,11 @@ def main():
         )
         comp = rec["Components"]
         st.markdown(
-            f"- Multi-timeframe trend signal: {comp['MTFTrendSignal']} (30% weight)
-"
-            f"- RSI signal: {comp['RSISignal']} (20% weight)
-"
-            f"- Z-score signal: {comp['ZScoreSignal']} (20% weight)
-"
-            f"- EMA alignment signal: {comp['EMAAlignSignal']} (30% weight)
-"
-            f"- Combined weighted score: {comp['WeightedScore']:.3f}",
-        )
+            f"- Multi-timeframe trend signal: {comp['MTFTrendSignal']} (30% weight)"
+            f"- RSI signal: {comp['RSISignal']} (20% weight)"
+            f"- Z-score signal: {comp['ZScoreSignal']} (20% weight)"
+            f"- EMA alignment signal: {comp['EMAAlignSignal']} (30% weight)"
+            f"- Combined weighted score: {comp['WeightedScore']:.3f}")
 
         st.markdown(
             "The final action intentionally resolves conflicting signals by weighting faster intraday timeframes "
