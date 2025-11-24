@@ -148,25 +148,6 @@ def calculate_volatility(data, window=20):
     volatility = log_returns.rolling(window=window).std() * np.sqrt(252) * 100
     return volatility
 
-def detect_divergence(price, rsi, window=14):
-    """Detect RSI divergences"""
-    divergences = []
-    
-    for i in range(window, len(price)-1):
-        # Bullish divergence: price makes lower low, RSI makes higher low
-        if (price.iloc[i] < price.iloc[i-window] and 
-            rsi.iloc[i] > rsi.iloc[i-window] and 
-            rsi.iloc[i] < 40):
-            divergences.append(('Bullish', i))
-        
-        # Bearish divergence: price makes higher high, RSI makes lower high
-        if (price.iloc[i] > price.iloc[i-window] and 
-            rsi.iloc[i] < rsi.iloc[i-window] and 
-            rsi.iloc[i] > 60):
-            divergences.append(('Bearish', i))
-    
-    return divergences
-
 def calculate_atr(data, period=14):
     """Calculate Average True Range"""
     high = data['High']
@@ -186,6 +167,12 @@ def calculate_atr(data, period=14):
 
 st.title("🚀 Professional Algorithmic Trading Dashboard")
 
+# Initialize session state for data persistence
+if 'data_fetched' not in st.session_state:
+    st.session_state.data_fetched = False
+if 'analysis_complete' not in st.session_state:
+    st.session_state.analysis_complete = False
+
 # Sidebar configuration
 with st.sidebar:
     st.header("⚙️ Configuration")
@@ -201,8 +188,13 @@ with st.sidebar:
     else:
         ticker1 = get_ticker_symbol(ticker1_option)
     
-    # Ratio Analysis Option
-    enable_ratio = st.checkbox("Enable Ratio Analysis (Compare with Ticker 2)", key='enable_ratio')
+    # Ratio Analysis Option - Read from session state if exists, otherwise use widget value
+    enable_ratio = st.checkbox("Enable Ratio Analysis (Compare with Ticker 2)", 
+                               value=st.session_state.get('enable_ratio_value', False),
+                               key='enable_ratio')
+    
+    # Store the value in session state
+    st.session_state.enable_ratio_value = enable_ratio
     
     ticker2 = None
     if enable_ratio:
@@ -232,10 +224,6 @@ with st.sidebar:
     # Fetch Button
     fetch_button = st.button("🔄 Fetch Data & Analyze", type="primary", key='fetch_button')
 
-# Initialize session state
-if 'data_fetched' not in st.session_state:
-    st.session_state.data_fetched = False
-
 # Main Analysis
 if fetch_button:
     with st.spinner("Fetching and analyzing data..."):
@@ -263,9 +251,18 @@ if fetch_button:
             data1['SMA_100'] = calculate_sma(data1['Close'], 100)
             data1['SMA_150'] = calculate_sma(data1['Close'], 150)
             data1['SMA_200'] = calculate_sma(data1['Close'], 200)
-            data1['Volatility'] = calculate_volatility(data1)
             data1['ATR'] = calculate_atr(data1)
+            
+            # CRITICAL: Calculate Returns FIRST (this is historical - what happened)
             data1['Returns'] = data1['Close'].pct_change() * 100
+            
+            # THEN calculate Volatility and Z-Score AFTER returns (these predict future moves)
+            data1['Volatility'] = calculate_volatility(data1)
+            
+            # Calculate Z-Score based on historical returns
+            mean_return = data1['Returns'].mean()
+            std_return = data1['Returns'].std()
+            data1['Z_Score'] = (data1['Returns'] - mean_return) / std_return
             
             # Fetch ticker 2 if ratio analysis enabled
             if enable_ratio and ticker2:
@@ -290,12 +287,15 @@ if fetch_button:
                     data2['SMA_100'] = calculate_sma(data2['Close'], 100)
                     data2['SMA_150'] = calculate_sma(data2['Close'], 150)
                     data2['SMA_200'] = calculate_sma(data2['Close'], 200)
-                    data2['Volatility'] = calculate_volatility(data2)
                     data2['ATR'] = calculate_atr(data2)
                     data2['Returns'] = data2['Close'].pct_change() * 100
+                    data2['Volatility'] = calculate_volatility(data2)
+                    
+                    mean_return2 = data2['Returns'].mean()
+                    std_return2 = data2['Returns'].std()
+                    data2['Z_Score'] = (data2['Returns'] - mean_return2) / std_return2
             
             st.session_state.data_fetched = True
-            st.session_state.enable_ratio = enable_ratio
             st.success("✅ Data fetched successfully!")
         else:
             st.error("Failed to fetch data. Please check ticker symbols and try again.")
@@ -328,7 +328,7 @@ if st.session_state.data_fetched:
         </div>
         """, unsafe_allow_html=True)
     
-    if st.session_state.enable_ratio and 'data2' in st.session_state:
+    if st.session_state.enable_ratio_value and 'data2' in st.session_state:
         data2 = st.session_state.data2
         ticker2 = st.session_state.ticker2
         ticker2_option = st.session_state.ticker2_option
@@ -383,7 +383,9 @@ if st.session_state.data_fetched:
     
     # Data Table
     st.subheader("📈 Complete Data Table")
-    display_data = data1[['Datetime', 'Open', 'High', 'Low', 'Close', 'Volume', 'Returns', 'RSI']].copy()
+    display_data = data1[['Datetime', 'Open', 'High', 'Low', 'Close', 'Returns', 'RSI', 'Volatility', 'Z_Score']].copy()
+    if 'Volume' in data1.columns:
+        display_data.insert(5, 'Volume', data1['Volume'])
     display_data['Datetime'] = display_data['Datetime'].dt.strftime('%Y-%m-%d %H:%M:%S IST')
     st.dataframe(display_data.tail(50), use_container_width=True)
     
@@ -396,698 +398,222 @@ if st.session_state.data_fetched:
         mime="text/csv"
     )
     
-    # ==================== SECTION 2: RATIO ANALYSIS ====================
-    if st.session_state.enable_ratio and 'data2' in st.session_state:
-        st.header("⚖️ Ratio Analysis")
+    # ==================== SECTION 2: VOLATILITY BINS ANALYSIS WITH PREDICTION ====================
+    st.header("📈 Volatility-Based Next Move Prediction")
+    
+    st.info("""
+    **Understanding The Analysis:**
+    - **Returns (%)**: What happened BEFORE (historical price changes)
+    - **Volatility**: Current market turbulence level
+    - **Prediction**: What will likely happen NEXT based on patterns
+    
+    Think of volatility like weather patterns - when storms (high volatility) form, we can predict what usually happens next!
+    """)
+    
+    vol_data = data1[['Datetime', 'Close', 'Volatility', 'Returns']].copy()
+    vol_data = vol_data.dropna()
+    
+    if len(vol_data) > 10:
+        # Create volatility bins
+        try:
+            vol_bins = pd.qcut(vol_data['Volatility'], q=5, duplicates='drop')
+            vol_data['Vol_Bin'] = pd.cut(vol_data['Volatility'], bins=vol_bins.cat.categories)
+        except:
+            vol_data['Vol_Bin'] = pd.cut(vol_data['Volatility'], bins=5)
         
-        # Align data by datetime
-        merged_data = pd.merge(
-            data1[['Datetime', 'Close', 'RSI']],
-            data2[['Datetime', 'Close', 'RSI']],
-            on='Datetime',
-            suffixes=('_T1', '_T2')
+        # CRITICAL: Calculate NEXT period returns for prediction
+        vol_data['Next_Return'] = vol_data['Returns'].shift(-1)  # What happened AFTER
+        
+        # Create volatility table
+        vol_table = vol_data.copy()
+        vol_table['Datetime'] = vol_table['Datetime'].dt.strftime('%Y-%m-%d %H:%M:%S IST')
+        vol_table['Vol_Bin_Label'] = vol_table['Vol_Bin'].apply(
+            lambda x: f"{x.left:.2f} - {x.right:.2f}" if pd.notna(x) else "N/A"
         )
+        vol_table['Returns_Points'] = vol_data['Close'].diff()
         
-        merged_data['Ratio'] = merged_data['Close_T1'] / merged_data['Close_T2']
-        merged_data['Ratio_RSI'] = calculate_rsi(merged_data['Ratio'])
+        display_vol = vol_table[['Datetime', 'Vol_Bin_Label', 'Volatility', 'Close', 'Returns', 'Next_Return']].copy()
+        display_vol.columns = ['Datetime', 'Volatility Bin', 'Volatility %', 'Price', 'Past Return (%)', 'Next Return (%)']
         
-        # Display ratio table
-        st.subheader("Ratio Comparison Table")
-        ratio_display = merged_data.copy()
-        ratio_display['Datetime'] = ratio_display['Datetime'].dt.strftime('%Y-%m-%d %H:%M:%S IST')
-        ratio_display = ratio_display.rename(columns={
-            'Close_T1': f'{ticker1_option} Price',
-            'Close_T2': f'{ticker2_option} Price',
-            'RSI_T1': f'{ticker1_option} RSI',
-            'RSI_T2': f'{ticker2_option} RSI'
-        })
+        st.dataframe(display_vol.tail(50), use_container_width=True)
         
-        st.dataframe(ratio_display.tail(50), use_container_width=True)
+        # Volatility statistics and PREDICTION
+        current_vol = vol_data['Volatility'].iloc[-1]
+        current_vol_bin = vol_data['Vol_Bin'].iloc[-1]
+        current_return = vol_data['Returns'].iloc[-1]
         
-        # Export ratio data
-        ratio_csv = ratio_display.to_csv(index=False)
-        st.download_button(
-            label="📥 Download Ratio Data (CSV)",
-            data=ratio_csv,
-            file_name=f"ratio_{ticker1_option}_{ticker2_option}.csv",
-            mime="text/csv"
-        )
+        # Analyze what happens NEXT after similar volatility levels
+        bin_analysis = vol_data.groupby('Vol_Bin').agg({
+            'Returns': ['mean', 'std', 'count'],
+            'Next_Return': ['mean', 'std', 'count']  # What happens AFTER
+        }).round(2)
         
-        # Ratio Binning Analysis
-        st.subheader("📊 Ratio Binning Analysis")
-        
-        ratio_values = merged_data['Ratio'].dropna()
-        bins = pd.qcut(ratio_values, q=5, duplicates='drop')
-        merged_data['Ratio_Bin'] = pd.cut(merged_data['Ratio'], bins=bins.cat.categories)
-        
-        bin_analysis = []
-        for bin_label in merged_data['Ratio_Bin'].dropna().unique():
-            bin_data = merged_data[merged_data['Ratio_Bin'] == bin_label]
+        # Get prediction for current bin
+        if pd.notna(current_vol_bin) and current_vol_bin in bin_analysis.index:
+            avg_past_return = bin_analysis.loc[current_vol_bin, ('Returns', 'mean')]
+            avg_next_return = bin_analysis.loc[current_vol_bin, ('Next_Return', 'mean')]
+            next_return_std = bin_analysis.loc[current_vol_bin, ('Next_Return', 'std')]
+            observations = int(bin_analysis.loc[current_vol_bin, ('Next_Return', 'count')])
             
-            t1_returns_points = bin_data['Close_T1'].mean() - bin_data['Close_T1'].iloc[0]
-            t1_returns_pct = (t1_returns_points / bin_data['Close_T1'].iloc[0]) * 100
+            # Prediction confidence
+            confidence = "High" if observations > 20 else "Moderate" if observations > 10 else "Low"
             
-            t2_returns_points = bin_data['Close_T2'].mean() - bin_data['Close_T2'].iloc[0]
-            t2_returns_pct = (t2_returns_points / bin_data['Close_T2'].iloc[0]) * 100
-            
-            bin_analysis.append({
-                'Ratio Bin': f"{bin_label.left:.4f} - {bin_label.right:.4f}",
-                f'{ticker1_option} Returns (Points)': f"{t1_returns_points:+.2f}",
-                f'{ticker1_option} Returns (%)': f"{t1_returns_pct:+.2f}%",
-                f'{ticker2_option} Returns (Points)': f"{t2_returns_points:+.2f}",
-                f'{ticker2_option} Returns (%)': f"{t2_returns_pct:+.2f}%",
-                'Occurrences': len(bin_data)
-            })
-        
-        bin_df = pd.DataFrame(bin_analysis)
-        st.dataframe(bin_df, use_container_width=True)
-        
-        # Bin Summary
-        current_ratio_bin = merged_data['Ratio_Bin'].iloc[-1]
-        st.info(f"""
-        **📌 Ratio Binning Insights:**
-        
-        - Current ratio: **{ratio:.4f}**
-        - Current bin: **{current_ratio_bin.left:.4f} - {current_ratio_bin.right:.4f}**
-        - Historically, in this bin:
-          - {ticker1_option} has shown {'positive' if t1_returns_pct > 0 else 'negative'} returns
-          - {ticker2_option} has shown {'positive' if t2_returns_pct > 0 else 'negative'} returns
-        - **Forecast**: Based on historical behavior in this ratio range, expect {'continuation' if t1_returns_pct * pct_change1 > 0 else 'reversal'} in current trend
-        """)
-    
-    # ==================== SECTION 3: MULTI-TIMEFRAME ANALYSIS ====================
-    st.header("🔍 Multi-Timeframe Analysis")
-    
-    timeframe_configs = [
-        ('1m', '1d'), ('5m', '5d'), ('15m', '5d'), ('30m', '1mo'),
-        ('1h', '1mo'), ('2h', '3mo'), ('4h', '6mo'), ('1d', '1y'),
-        ('1wk', '5y'), ('1mo', '10y')
-    ]
-    
-    def analyze_timeframe(ticker, tf_interval, tf_period):
-        """Analyze single timeframe"""
-        tf_data = fetch_data_with_delay(ticker, tf_interval, tf_period, api_delay)
-        if tf_data is None or tf_data.empty:
-            return None
-        
-        # Calculate indicators
-        tf_data['RSI'] = calculate_rsi(tf_data['Close'])
-        tf_data['EMA_9'] = calculate_ema(tf_data['Close'], 9)
-        tf_data['EMA_20'] = calculate_ema(tf_data['Close'], 20)
-        tf_data['EMA_21'] = calculate_ema(tf_data['Close'], 21)
-        tf_data['EMA_33'] = calculate_ema(tf_data['Close'], 33)
-        tf_data['EMA_50'] = calculate_ema(tf_data['Close'], 50)
-        tf_data['EMA_100'] = calculate_ema(tf_data['Close'], 100)
-        tf_data['EMA_150'] = calculate_ema(tf_data['Close'], 150)
-        tf_data['EMA_200'] = calculate_ema(tf_data['Close'], 200)
-        tf_data['SMA_20'] = calculate_sma(tf_data['Close'], 20)
-        tf_data['SMA_50'] = calculate_sma(tf_data['Close'], 50)
-        tf_data['SMA_100'] = calculate_sma(tf_data['Close'], 100)
-        tf_data['SMA_150'] = calculate_sma(tf_data['Close'], 150)
-        tf_data['SMA_200'] = calculate_sma(tf_data['Close'], 200)
-        tf_data['Volatility'] = calculate_volatility(tf_data)
-        
-        current_price = tf_data['Close'].iloc[-1]
-        max_close = tf_data['Close'].max()
-        min_close = tf_data['Close'].min()
-        
-        # Fibonacci levels
-        fib_levels = calculate_fibonacci_levels(max_close, min_close)
-        fib_str = ', '.join([f"{k}: {v:.2f}" for k, v in fib_levels.items()])
-        
-        # Support and Resistance
-        support, resistance = find_support_resistance(tf_data)
-        support_str = ', '.join([f"{s:.2f}" for s in support])
-        resistance_str = ', '.join([f"{r:.2f}" for r in resistance])
-        
-        # Trend determination
-        trend = "Up" if current_price > tf_data['Close'].iloc[0] else "Down"
-        
-        # RSI status
-        rsi_val = tf_data['RSI'].iloc[-1]
-        rsi_status = "Overbought" if rsi_val > 70 else "Oversold" if rsi_val < 30 else "Neutral"
-        
-        # Price change
-        price_change = current_price - tf_data['Close'].iloc[0]
-        pct_change = (price_change / tf_data['Close'].iloc[0]) * 100
-        
-        # EMA positions
-        ema_positions = {
-            'EMA_9': 'Above' if current_price > tf_data['EMA_9'].iloc[-1] else 'Below',
-            'EMA_20': 'Above' if current_price > tf_data['EMA_20'].iloc[-1] else 'Below',
-            'EMA_21': 'Above' if current_price > tf_data['EMA_21'].iloc[-1] else 'Below',
-            'EMA_33': 'Above' if current_price > tf_data['EMA_33'].iloc[-1] else 'Below',
-            'EMA_50': 'Above' if current_price > tf_data['EMA_50'].iloc[-1] else 'Below',
-            'EMA_100': 'Above' if current_price > tf_data['EMA_100'].iloc[-1] else 'Below',
-            'EMA_150': 'Above' if current_price > tf_data['EMA_150'].iloc[-1] else 'Below',
-            'EMA_200': 'Above' if current_price > tf_data['EMA_200'].iloc[-1] else 'Below',
-        }
-        
-        # SMA positions
-        sma_positions = {
-            'SMA_20': 'Above' if current_price > tf_data['SMA_20'].iloc[-1] else 'Below',
-            'SMA_50': 'Above' if current_price > tf_data['SMA_50'].iloc[-1] else 'Below',
-            'SMA_100': 'Above' if current_price > tf_data['SMA_100'].iloc[-1] else 'Below',
-            'SMA_150': 'Above' if current_price > tf_data['SMA_150'].iloc[-1] else 'Below',
-            'SMA_200': 'Above' if current_price > tf_data['SMA_200'].iloc[-1] else 'Below',
-        }
-        
-        return {
-            'Timeframe': f"{tf_interval}/{tf_period}",
-            'Trend': trend,
-            'Max Close': f"{max_close:.2f}",
-            'Min Close': f"{min_close:.2f}",
-            'Fibonacci': fib_str,
-            'Volatility': f"{tf_data['Volatility'].iloc[-1]:.2f}%",
-            'Change %': f"{pct_change:+.2f}%",
-            'Change Points': f"{price_change:+.2f}",
-            'Support': support_str,
-            'Resistance': resistance_str,
-            'RSI': f"{rsi_val:.2f}",
-            'RSI Status': rsi_status,
-            **{f'EMA_{k.split("_")[1]}': f"{tf_data[k].iloc[-1]:.2f}" for k in ema_positions.keys()},
-            **{f'{k} Pos': ema_positions[k] for k in ema_positions.keys()},
-            **{f'SMA_{k.split("_")[1]}': f"{tf_data[k].iloc[-1]:.2f}" for k in sma_positions.keys()},
-            **{f'{k} Pos': sma_positions[k] for k in sma_positions.keys()},
-        }
-    
-    # Analyze Ticker 1
-    st.subheader(f"📊 {ticker1_option} Multi-Timeframe Analysis")
-    
-    mtf_results_t1 = []
-    progress_bar = st.progress(0)
-    
-    for idx, (tf_int, tf_per) in enumerate(timeframe_configs):
-        result = analyze_timeframe(ticker1, tf_int, tf_per)
-        if result:
-            mtf_results_t1.append(result)
-        progress_bar.progress((idx + 1) / len(timeframe_configs))
-    
-    progress_bar.empty()
-    
-    if mtf_results_t1:
-        mtf_df_t1 = pd.DataFrame(mtf_results_t1)
-        st.dataframe(mtf_df_t1, use_container_width=True)
-        
-        # Multi-timeframe summary for T1
-        up_trends = sum(1 for r in mtf_results_t1 if r['Trend'] == 'Up')
-        down_trends = len(mtf_results_t1) - up_trends
-        overall_trend = "Bullish" if up_trends > down_trends else "Bearish"
-        
-        avg_change = np.mean([float(r['Change %'].strip('%+')) for r in mtf_results_t1])
-        
-        st.success(f"""
-        **📊 {ticker1_option} Multi-Timeframe Summary:**
-        
-        - **Overall Trend**: {overall_trend} ({up_trends} timeframes up, {down_trends} down)
-        - **Average Change**: {avg_change:+.2f}%
-        - **Price Action**: Current price is showing {'strength' if avg_change > 0 else 'weakness'} across multiple timeframes
-        - **Key Insight**: The majority of timeframes suggest a {overall_trend.lower()} bias
-        - **Recommendation**: {'Consider long positions' if overall_trend == 'Bullish' else 'Consider short positions or wait for reversal signals'}
-        """)
-    
-    # Analyze Ticker 2 if ratio enabled
-    if st.session_state.enable_ratio and 'data2' in st.session_state:
-        st.subheader(f"📊 {ticker2_option} Multi-Timeframe Analysis")
-        
-        mtf_results_t2 = []
-        progress_bar2 = st.progress(0)
-        
-        for idx, (tf_int, tf_per) in enumerate(timeframe_configs):
-            result = analyze_timeframe(ticker2, tf_int, tf_per)
-            if result:
-                mtf_results_t2.append(result)
-            progress_bar2.progress((idx + 1) / len(timeframe_configs))
-        
-        progress_bar2.empty()
-        
-        if mtf_results_t2:
-            mtf_df_t2 = pd.DataFrame(mtf_results_t2)
-            st.dataframe(mtf_df_t2, use_container_width=True)
-            
-            # Multi-timeframe summary for T2
-            up_trends_t2 = sum(1 for r in mtf_results_t2 if r['Trend'] == 'Up')
-            down_trends_t2 = len(mtf_results_t2) - up_trends_t2
-            overall_trend_t2 = "Bullish" if up_trends_t2 > down_trends_t2 else "Bearish"
-            
-            avg_change_t2 = np.mean([float(r['Change %'].strip('%+')) for r in mtf_results_t2])
+            # Direction prediction
+            if avg_next_return > 0.5:
+                prediction = "📈 UP (Bullish)"
+                pred_color = "positive"
+            elif avg_next_return < -0.5:
+                prediction = "📉 DOWN (Bearish)"
+                pred_color = "negative"
+            else:
+                prediction = "➡️ SIDEWAYS (Neutral)"
+                pred_color = "neutral"
             
             st.success(f"""
-            **📊 {ticker2_option} Multi-Timeframe Summary:**
+            **🔮 NEXT MOVE PREDICTION:**
             
-            - **Overall Trend**: {overall_trend_t2} ({up_trends_t2} timeframes up, {down_trends_t2} down)
-            - **Average Change**: {avg_change_t2:+.2f}%
-            - **Price Action**: Current price is showing {'strength' if avg_change_t2 > 0 else 'weakness'} across multiple timeframes
-            - **Key Insight**: The majority of timeframes suggest a {overall_trend_t2.lower()} bias
-            - **Recommendation**: {'Consider long positions' if overall_trend_t2 == 'Bullish' else 'Consider short positions or wait for reversal signals'}
+            **Current Situation:**
+            - Volatility NOW: {current_vol:.2f}% (Bin: {current_vol_bin.left:.2f}-{current_vol_bin.right:.2f})
+            - Past Return: {current_return:.2f}% (what ALREADY happened)
+            
+            **Prediction for NEXT Move:**
+            - **Expected Direction**: {prediction}
+            - **Expected Return**: {avg_next_return:+.2f}% (±{next_return_std:.2f}% variation)
+            - **Confidence**: {confidence} (based on {observations} similar historical cases)
+            
+            **Why This Prediction?**
+            Historically, when volatility was in the range {current_vol_bin.left:.2f}-{current_vol_bin.right:.2f}%, 
+            the NEXT move averaged {avg_next_return:+.2f}%. Current volatility is {current_vol:.2f}%, 
+            which falls in this range, so we expect similar behavior.
+            
+            **Simple Explanation:**
+            Think of it like this: We looked at all past times when the market was as volatile as it is RIGHT NOW. 
+            On average, the NEXT move after such volatility was {avg_next_return:+.2f}%. So we predict the market 
+            will move {'UP ⬆️' if avg_next_return > 0 else 'DOWN ⬇️'} by approximately {abs(avg_next_return):.2f}% in the next period.
             """)
+            
+            st.markdown(f"""
+            <div class='metric-card'>
+                <h3 class='{pred_color}'>🎯 Predicted Next Move: {prediction}</h3>
+                <h2>{avg_next_return:+.2f}%</h2>
+                <p>Confidence: {confidence}</p>
+            </div>
+            """, unsafe_allow_html=True)
+        
+        else:
+            st.warning("Insufficient data for prediction in current volatility bin.")
     
-    # ==================== SECTION 4: VOLATILITY BINS ANALYSIS ====================
-    st.header("📈 Volatility Bins Analysis")
+    # ==================== Z-SCORE PREDICTION ====================
+    st.header("📊 Z-Score Based Mean Reversion Prediction")
     
-    vol_data = data1[['Datetime', 'Close', 'Volatility', 'Returns']].dropna()
-    
-    # Create volatility bins
-    vol_bins = pd.qcut(vol_data['Volatility'], q=5, duplicates='drop')
-    vol_data['Vol_Bin'] = pd.cut(vol_data['Volatility'], bins=vol_bins.cat.categories)
-    
-    # Create volatility table
-    vol_table = vol_data.copy()
-    vol_table['Datetime'] = vol_table['Datetime'].dt.strftime('%Y-%m-%d %H:%M:%S IST')
-    vol_table['Vol_Bin_Label'] = vol_table['Vol_Bin'].apply(
-        lambda x: f"{x.left:.2f} - {x.right:.2f}" if pd.notna(x) else "N/A"
-    )
-    vol_table['Returns_Points'] = vol_data['Close'].diff()
-    
-    display_vol = vol_table[['Datetime', 'Vol_Bin_Label', 'Volatility', 'Close', 'Returns_Points', 'Returns']].copy()
-    display_vol.columns = ['Datetime', 'Volatility Bin', 'Volatility %', 'Price', 'Returns (Points)', 'Returns (%)']
-    
-    st.dataframe(display_vol.tail(50), use_container_width=True)
-    
-    # Volatility statistics
-    max_vol = vol_data['Volatility'].max()
-    min_vol = vol_data['Volatility'].min()
-    mean_vol = vol_data['Volatility'].mean()
-    current_vol = vol_data['Volatility'].iloc[-1]
-    current_vol_bin = vol_data['Vol_Bin'].iloc[-1]
-    
-    max_return = vol_data['Returns'].max()
-    min_return = vol_data['Returns'].min()
-    
-    # Returns by volatility bin
-    bin_returns = vol_data.groupby('Vol_Bin')['Returns'].agg(['mean', 'std', 'count'])
-    
-    st.info(f"""
-    **📊 Volatility Analysis Summary:**
-    
-    - **Current Volatility**: {current_vol:.2f}% (Bin: {current_vol_bin.left:.2f} - {current_vol_bin.right:.2f})
-    - **Volatility Range**: {min_vol:.2f}% to {max_vol:.2f}% (Mean: {mean_vol:.2f}%)
-    - **Returns Range**: {min_return:.2f}% to {max_return:.2f}%
-    - **Historical Behavior in Current Bin**: Average return of {bin_returns.loc[current_vol_bin, 'mean']:.2f}% based on {int(bin_returns.loc[current_vol_bin, 'count'])} observations
-    - **Forecast**: {'Higher volatility typically precedes larger moves' if current_vol > mean_vol else 'Lower volatility suggests consolidation phase'}
-    - **What This Means**: Volatility measures how much the price moves. High volatility means bigger price swings (more risk and opportunity), while low volatility means smaller, steadier moves. Currently, the market is in a {'high' if current_vol > mean_vol else 'low'} volatility phase.
+    st.info("""
+    **Understanding Z-Score:**
+    - **Past Return**: What price change ALREADY happened
+    - **Z-Score**: How unusual that past move was (in standard deviations)
+    - **Prediction**: What will likely happen NEXT (extreme moves tend to reverse)
     """)
     
-    # ==================== SECTION 5: PATTERN RECOGNITION ====================
-    st.header("🔍 Advanced Pattern Recognition")
+    z_score_data = data1[['Datetime', 'Returns', 'Z_Score']].dropna().copy()
+    z_score_data['Next_Return'] = z_score_data['Returns'].shift(-1)
     
-    # Detect significant moves
-    data1['Price_Change'] = data1['Close'].diff().abs()
-    significant_moves = data1[data1['Price_Change'] > pattern_threshold].copy()
-    
-    if len(significant_moves) > 0:
-        pattern_results = []
-        
-        for idx in significant_moves.index:
-            if idx < 10:
-                continue
-            
-            move_size = data1.loc[idx, 'Close'] - data1.loc[idx-1, 'Close']
-            move_pct = (move_size / data1.loc[idx-1, 'Close']) * 100
-            direction = "Up" if move_size > 0 else "Down"
-            
-            # Analyze preceding 10 candles
-            preceding = data1.loc[idx-10:idx-1]
-            
-            # Check patterns
-            vol_spike = preceding['Volatility'].max() > preceding['Volatility'].mean() * 1.5
-            rsi_before = preceding['RSI'].iloc[-1]
-            rsi_at_move = data1.loc[idx, 'RSI']
-            rsi_divergence = "Yes" if abs(rsi_at_move - rsi_before) > 10 else "No"
-            
-            # EMA crossovers
-            ema_20_50_cross = "Yes" if (
-                (preceding['EMA_20'].iloc[-2] < preceding['EMA_50'].iloc[-2] and 
-                 preceding['EMA_20'].iloc[-1] > preceding['EMA_50'].iloc[-1]) or
-                (preceding['EMA_20'].iloc[-2] > preceding['EMA_50'].iloc[-2] and 
-                 preceding['EMA_20'].iloc[-1] < preceding['EMA_50'].iloc[-1])
-            ) else "No"
-            
-            # Consecutive moves
-            consecutive_up = sum(1 for i in range(len(preceding)-1) if preceding['Close'].iloc[i+1] > preceding['Close'].iloc[i])
-            consecutive_pattern = "Yes" if consecutive_up >= 7 or consecutive_up <= 3 else "No"
-            
-            # Large body candles
-            body_sizes = abs(preceding['Close'] - preceding['Open'])
-            avg_body = body_sizes.mean()
-            large_body = "Yes" if body_sizes.iloc[-1] > avg_body * 1.5 else "No"
-            
-            # Support/Resistance breakout
-            support_levels, resistance_levels = find_support_resistance(preceding)
-            breakout = "Yes"
-            if direction == "Up" and len(resistance_levels) > 0:
-                breakout = "Yes" if data1.loc[idx, 'Close'] > resistance_levels[0] else "No"
-            elif direction == "Down" and len(support_levels) > 0:
-                breakout = "Yes" if data1.loc[idx, 'Close'] < support_levels[-1] else "No"
-            
-            # Correlation with prior moves
-            if len(significant_moves) > 1:
-                prior_moves = significant_moves.loc[:idx-1]
-                if len(prior_moves) > 0:
-                    correlation = np.corrcoef(
-                        prior_moves['Price_Change'].values,
-                        [move_size] * len(prior_moves)
-                    )[0, 1] if len(prior_moves) > 1 else 0
-                else:
-                    correlation = 0
-            else:
-                correlation = 0
-            
-            pattern_results.append({
-                'Datetime': data1.loc[idx, 'Datetime'].strftime('%Y-%m-%d %H:%M:%S IST'),
-                'Move (Points)': f"{move_size:.2f}",
-                'Move (%)': f"{move_pct:.2f}%",
-                'Direction': direction,
-                'Volatility Burst': "Yes" if vol_spike else "No",
-                'RSI Divergence': rsi_divergence,
-                'RSI Before': f"{rsi_before:.2f}",
-                'RSI At Move': f"{rsi_at_move:.2f}",
-                'EMA 20/50 Cross': ema_20_50_cross,
-                'Consecutive Pattern': consecutive_pattern,
-                'Large Body Candle': large_body,
-                'Support/Resistance Breakout': breakout,
-                'Correlation': f"{correlation:.2f}",
-            })
-        
-        if pattern_results:
-            pattern_df = pd.DataFrame(pattern_results)
-            st.dataframe(pattern_df, use_container_width=True)
-            
-            # Pattern summary
-            total_patterns = len(pattern_results)
-            vol_burst_count = sum(1 for p in pattern_results if p['Volatility Burst'] == 'Yes')
-            rsi_div_count = sum(1 for p in pattern_results if p['RSI Divergence'] == 'Yes')
-            breakout_count = sum(1 for p in pattern_results if p['Support/Resistance Breakout'] == 'Yes')
-            
-            # Current market similarity
-            current_rsi = data1['RSI'].iloc[-1]
-            recent_vol = data1['Volatility'].iloc[-5:].mean()
-            
-            warning_signals = []
-            if vol_burst_count / total_patterns > 0.5:
-                warning_signals.append("⚠️ High frequency of volatility bursts detected")
-            if rsi_div_count / total_patterns > 0.3:
-                warning_signals.append("⚠️ Significant RSI divergences present")
-            if current_rsi > 70:
-                warning_signals.append("⚠️ Current RSI is overbought")
-            elif current_rsi < 30:
-                warning_signals.append("⚠️ Current RSI is oversold")
-            
-            warning_text = "\n".join(warning_signals) if warning_signals else "✅ No major warning signals detected"
-            
-            st.warning(f"""
-            **🔍 Pattern Recognition Summary:**
-            
-            - **Total Significant Moves Detected**: {total_patterns}
-            - **Volatility Bursts**: {vol_burst_count} ({vol_burst_count/total_patterns*100:.1f}%)
-            - **RSI Divergences**: {rsi_div_count} ({rsi_div_count/total_patterns*100:.1f}%)
-            - **Breakouts**: {breakout_count} ({breakout_count/total_patterns*100:.1f}%)
-            - **Current Market Similarity**: {'High' if recent_vol > data1['Volatility'].mean() else 'Low'} volatility environment
-            
-            {warning_text}
-            
-            **What This Means for You**: 
-            We analyzed all major price movements (over {pattern_threshold} points) and looked at what happened right before each move. This helps us understand if similar conditions exist now. Think of it like studying past weather patterns to predict tomorrow's weather. The patterns show us that {'volatility spikes often precede big moves' if vol_burst_count > total_patterns/2 else 'moves happen across different conditions'}.
-            
-            **Forecast Based on Patterns**: {'Expect increased volatility and potential reversal' if len(warning_signals) > 1 else 'Market showing stable patterns, follow the trend'}
-            """)
-    else:
-        st.info("No significant price movements detected in the selected period.")
-    
-    # ==================== SECTION 6: INTERACTIVE CHARTS ====================
-    st.header("📊 Interactive Charts")
-    
-    # Chart 1: Ticker 1 Price + RSI
-    st.subheader(f"{ticker1_option} - Price & RSI")
-    
-    fig1 = make_subplots(
-        rows=2, cols=1,
-        shared_xaxes=True,
-        vertical_spacing=0.05,
-        row_heights=[0.7, 0.3],
-        subplot_titles=(f'{ticker1_option} Price with EMAs', 'RSI Indicator')
-    )
-    
-    # Candlestick
-    fig1.add_trace(
-        go.Candlestick(
-            x=data1['Datetime'],
-            open=data1['Open'],
-            high=data1['High'],
-            low=data1['Low'],
-            close=data1['Close'],
-            name='Price'
-        ),
-        row=1, col=1
-    )
-    
-    # EMAs
-    fig1.add_trace(go.Scatter(x=data1['Datetime'], y=data1['EMA_20'], name='EMA 20', line=dict(color='orange', width=1)), row=1, col=1)
-    fig1.add_trace(go.Scatter(x=data1['Datetime'], y=data1['EMA_50'], name='EMA 50', line=dict(color='blue', width=1)), row=1, col=1)
-    fig1.add_trace(go.Scatter(x=data1['Datetime'], y=data1['EMA_200'], name='EMA 200', line=dict(color='purple', width=2)), row=1, col=1)
-    
-    # RSI
-    fig1.add_trace(
-        go.Scatter(x=data1['Datetime'], y=data1['RSI'], name='RSI', line=dict(color='cyan', width=2)),
-        row=2, col=1
-    )
-    fig1.add_hline(y=70, line_dash="dash", line_color="red", row=2, col=1)
-    fig1.add_hline(y=30, line_dash="dash", line_color="green", row=2, col=1)
-    
-    fig1.update_layout(height=800, showlegend=True, xaxis_rangeslider_visible=False)
-    st.plotly_chart(fig1, use_container_width=True)
-    
-    # Chart 2 & 3: Ratio analysis if enabled
-    if st.session_state.enable_ratio and 'data2' in st.session_state:
-        st.subheader(f"{ticker2_option} - Price & RSI")
-        
-        fig2 = make_subplots(
-            rows=2, cols=1,
-            shared_xaxes=True,
-            vertical_spacing=0.05,
-            row_heights=[0.7, 0.3],
-            subplot_titles=(f'{ticker2_option} Price with EMAs', 'RSI Indicator')
-        )
-        
-        fig2.add_trace(
-            go.Candlestick(
-                x=data2['Datetime'],
-                open=data2['Open'],
-                high=data2['High'],
-                low=data2['Low'],
-                close=data2['Close'],
-                name='Price'
-            ),
-            row=1, col=1
-        )
-        
-        fig2.add_trace(go.Scatter(x=data2['Datetime'], y=data2['EMA_20'], name='EMA 20', line=dict(color='orange', width=1)), row=1, col=1)
-        fig2.add_trace(go.Scatter(x=data2['Datetime'], y=data2['EMA_50'], name='EMA 50', line=dict(color='blue', width=1)), row=1, col=1)
-        fig2.add_trace(go.Scatter(x=data2['Datetime'], y=data2['EMA_200'], name='EMA 200', line=dict(color='purple', width=2)), row=1, col=1)
-        
-        fig2.add_trace(
-            go.Scatter(x=data2['Datetime'], y=data2['RSI'], name='RSI', line=dict(color='cyan', width=2)),
-            row=2, col=1
-        )
-        fig2.add_hline(y=70, line_dash="dash", line_color="red", row=2, col=1)
-        fig2.add_hline(y=30, line_dash="dash", line_color="green", row=2, col=1)
-        
-        fig2.update_layout(height=800, showlegend=True, xaxis_rangeslider_visible=False)
-        st.plotly_chart(fig2, use_container_width=True)
-        
-        # Ratio chart
-        st.subheader("Ratio Analysis - Ratio & RSI")
-        
-        fig3 = make_subplots(
-            rows=2, cols=1,
-            shared_xaxes=True,
-            vertical_spacing=0.05,
-            row_heights=[0.7, 0.3],
-            subplot_titles=('Ratio (T1/T2)', 'Ratio RSI')
-        )
-        
-        fig3.add_trace(
-            go.Scatter(x=merged_data['Datetime'], y=merged_data['Ratio'], name='Ratio', 
-                      line=dict(color='yellow', width=2), fill='tozeroy'),
-            row=1, col=1
-        )
-        
-        fig3.add_trace(
-            go.Scatter(x=merged_data['Datetime'], y=merged_data['Ratio_RSI'], name='Ratio RSI',
-                      line=dict(color='magenta', width=2)),
-            row=2, col=1
-        )
-        fig3.add_hline(y=70, line_dash="dash", line_color="red", row=2, col=1)
-        fig3.add_hline(y=30, line_dash="dash", line_color="green", row=2, col=1)
-        
-        fig3.update_layout(height=800, showlegend=True)
-        st.plotly_chart(fig3, use_container_width=True)
-    
-    # ==================== SECTION 7: STATISTICAL DISTRIBUTION ====================
-    st.header("📉 Statistical Distribution Analysis")
-    
-    returns_data = data1['Returns'].dropna()
-    
-    # Histogram of returns
-    st.subheader("Returns Distribution")
-    
-    fig_hist = go.Figure()
-    fig_hist.add_trace(go.Histogram(x=returns_data, nbinsx=50, name='Returns', marker_color='lightblue'))
-    fig_hist.update_layout(title='Returns Distribution', xaxis_title='Returns (%)', yaxis_title='Frequency', height=400)
-    st.plotly_chart(fig_hist, use_container_width=True)
-    
-    # Returns with normal curve
-    st.subheader("Returns Distribution with Normal Curve")
-    
-    mean_return = returns_data.mean()
-    std_return = returns_data.std()
-    
-    fig_norm = go.Figure()
-    fig_norm.add_trace(go.Histogram(x=returns_data, nbinsx=50, name='Actual Returns', 
-                                    histnorm='probability density', marker_color='lightblue'))
-    
-    # Normal curve
-    x_range = np.linspace(returns_data.min(), returns_data.max(), 100)
-    normal_curve = stats.norm.pdf(x_range, mean_return, std_return)
-    fig_norm.add_trace(go.Scatter(x=x_range, y=normal_curve, name='Normal Distribution',
-                                  line=dict(color='red', width=2)))
-    
-    fig_norm.update_layout(title='Returns vs Normal Distribution', 
-                          xaxis_title='Returns (%)', yaxis_title='Density', height=400)
-    st.plotly_chart(fig_norm, use_container_width=True)
-    
-    # Bell curve with zones
-    st.subheader("Bell Curve Visualization")
-    
-    fig_bell = go.Figure()
-    
-    x_bell = np.linspace(mean_return - 4*std_return, mean_return + 4*std_return, 1000)
-    y_bell = stats.norm.pdf(x_bell, mean_return, std_return)
-    
-    # Green zone (±1 std)
-    mask_green = (x_bell >= mean_return - std_return) & (x_bell <= mean_return + std_return)
-    fig_bell.add_trace(go.Scatter(x=x_bell[mask_green], y=y_bell[mask_green], 
-                                  fill='tozeroy', fillcolor='rgba(0,255,0,0.3)', 
-                                  line=dict(color='green'), name='±1σ (68%)'))
-    
-    # Yellow zone (±2 std)
-    mask_yellow_left = (x_bell >= mean_return - 2*std_return) & (x_bell < mean_return - std_return)
-    mask_yellow_right = (x_bell > mean_return + std_return) & (x_bell <= mean_return + 2*std_return)
-    fig_bell.add_trace(go.Scatter(x=x_bell[mask_yellow_left], y=y_bell[mask_yellow_left],
-                                  fill='tozeroy', fillcolor='rgba(255,255,0,0.3)',
-                                  line=dict(color='yellow'), name='±2σ (95%)'))
-    fig_bell.add_trace(go.Scatter(x=x_bell[mask_yellow_right], y=y_bell[mask_yellow_right],
-                                  fill='tozeroy', fillcolor='rgba(255,255,0,0.3)',
-                                  line=dict(color='yellow'), showlegend=False))
-    
-    # Red zone (beyond ±2 std)
-    mask_red_left = x_bell < mean_return - 2*std_return
-    mask_red_right = x_bell > mean_return + 2*std_return
-    fig_bell.add_trace(go.Scatter(x=x_bell[mask_red_left], y=y_bell[mask_red_left],
-                                  fill='tozeroy', fillcolor='rgba(255,0,0,0.3)',
-                                  line=dict(color='red'), name='Beyond ±2σ (Extreme)'))
-    fig_bell.add_trace(go.Scatter(x=x_bell[mask_red_right], y=y_bell[mask_red_right],
-                                  fill='tozeroy', fillcolor='rgba(255,0,0,0.3)',
-                                  line=dict(color='red'), showlegend=False))
-    
-    # Current position
-    current_return = returns_data.iloc[-1]
-    fig_bell.add_vline(x=current_return, line_dash="dash", line_color="white", line_width=3,
-                      annotation_text=f"Current: {current_return:.2f}%")
-    
-    fig_bell.update_layout(title='Bell Curve with Standard Deviation Zones',
-                          xaxis_title='Returns (%)', yaxis_title='Probability Density', height=500)
-    st.plotly_chart(fig_bell, use_container_width=True)
-    
-    # Z-Score Analysis
-    st.subheader("Z-Score Analysis")
-    
-    data1['Z_Score'] = (data1['Returns'] - mean_return) / std_return
-    
-    z_score_table = data1[['Datetime', 'Returns', 'Z_Score']].dropna().tail(50).copy()
+    z_score_table = z_score_data.tail(50).copy()
     z_score_table['Datetime'] = z_score_table['Datetime'].dt.strftime('%Y-%m-%d %H:%M:%S IST')
     z_score_table['Returns_Points'] = data1['Close'].diff()
-    z_score_table['Returns_%'] = data1['Returns']
     
-    # Color code extreme z-scores
-    def color_zscore(val):
-        try:
-            v = float(val)
-            if abs(v) > 2:
-                return 'background-color: #ff4444'
-            elif abs(v) > 1:
-                return 'background-color: #ffaa44'
-            else:
-                return 'background-color: #44ff44'
-        except:
-            return ''
+    display_z = z_score_table[['Datetime', 'Returns', 'Z_Score', 'Next_Return']].copy()
+    display_z.columns = ['Datetime', 'Past Return (%)', 'Z-Score', 'Next Return (%)']
     
-    styled_z = z_score_table.style.applymap(color_zscore, subset=['Z_Score'])
-    st.dataframe(styled_z, use_container_width=True)
+    st.dataframe(display_z, use_container_width=True)
     
-    # Statistical summary
+    # Z-Score prediction
     current_zscore = data1['Z_Score'].iloc[-1]
-    skewness = returns_data.skew()
-    kurtosis_val = returns_data.kurtosis()
-    percentile = stats.percentileofscore(returns_data, current_return)
+    current_return = data1['Returns'].iloc[-1]
     
-    st.info(f"""
-    **📊 Statistical Analysis Summary:**
+    # Analyze what happens after extreme z-scores
+    extreme_positive = z_score_data[z_score_data['Z_Score'] > 2]
+    extreme_negative = z_score_data[z_score_data['Z_Score'] < -2]
+    moderate = z_score_data[(z_score_data['Z_Score'] >= -1) & (z_score_data['Z_Score'] <= 1)]
     
-    - **Mean Return**: {mean_return:.4f}%
-    - **Standard Deviation**: {std_return:.4f}%
-    - **Skewness**: {skewness:.4f} ({'Right-skewed (more positive outliers)' if skewness > 0 else 'Left-skewed (more negative outliers)'})
-    - **Kurtosis**: {kurtosis_val:.4f} ({'Fat tails (more extreme events)' if kurtosis_val > 0 else 'Thin tails (fewer extreme events)'})
-    - **Current Return**: {current_return:.4f}%
-    - **Current Z-Score**: {current_zscore:.4f}
-    - **Percentile Rank**: {percentile:.1f}th percentile
+    if current_zscore > 2:
+        similar_cases = extreme_positive
+        zone = "Extreme Positive"
+        expected_behavior = "Mean Reversion DOWN"
+        color = "negative"
+    elif current_zscore < -2:
+        similar_cases = extreme_negative
+        zone = "Extreme Negative"
+        expected_behavior = "Mean Reversion UP"
+        color = "positive"
+    else:
+        similar_cases = moderate
+        zone = "Normal Range"
+        expected_behavior = "Trend Continuation"
+        color = "neutral"
     
-    **Probability Ranges:**
-    - 68% of returns fall between {mean_return - std_return:.2f}% and {mean_return + std_return:.2f}%
-    - 95% of returns fall between {mean_return - 2*std_return:.2f}% and {mean_return + 2*std_return:.2f}%
-    - 99.7% of returns fall between {mean_return - 3*std_return:.2f}% and {mean_return + 3*std_return:.2f}%
+    if len(similar_cases) > 0:
+        avg_next_return = similar_cases['Next_Return'].mean()
+        std_next_return = similar_cases['Next_Return'].std()
+        reversal_count = len(similar_cases[similar_cases['Next_Return'] * similar_cases['Returns'] < 0])
+        reversal_rate = (reversal_count / len(similar_cases)) * 100
+        
+        st.success(f"""
+        **🔮 Z-SCORE PREDICTION:**
+        
+        **Current Status:**
+        - Past Return: {current_return:.2f}% (what ALREADY happened)
+        - Z-Score: {current_zscore:.2f} (Zone: {zone})
+        
+        **Prediction for NEXT Move:**
+        - **Expected Behavior**: {expected_behavior}
+        - **Average Next Return**: {avg_next_return:+.2f}% (±{std_next_return:.2f}%)
+        - **Reversal Probability**: {reversal_rate:.1f}% (based on {len(similar_cases)} similar cases)
+        
+        **Why This Prediction?**
+        {
+        f"Your Z-score of {current_zscore:.2f} means the past move was EXTREMELY unusual (beyond 2 standard deviations). "
+        f"Historically, after such extreme moves, the market reversed {reversal_rate:.0f}% of the time, "
+        f"with an average NEXT move of {avg_next_return:+.2f}%. This is called 'mean reversion' - "
+        f"extreme moves tend to snap back like a rubber band."
+        if abs(current_zscore) > 2
+        else f"Your Z-score of {current_zscore:.2f} is in the normal range. The market typically continues "
+        f"its trend in such cases, with an average NEXT move of {avg_next_return:+.2f}%."
+        }
+        
+        **Simple Explanation:**
+        The past return of {current_return:.2f}% was {'VERY unusual' if abs(current_zscore) > 2 else 'normal'}. 
+        Based on {len(similar_cases)} similar historical situations, the NEXT move is predicted to be 
+        {avg_next_return:+.2f}% ({'opposite direction - reversal!' if reversal_rate > 60 else 'continuation'}).
+        """)
     
-    **What This Means Simply:**
-    Think of the bell curve like a hill - most returns cluster in the middle (normal days), with fewer extreme movements on either side. The Z-score tells us how unusual today's movement is:
-    - Z-score between -1 and +1: Normal day (68% of all days fall here)
-    - Z-score between -2 and +2: Somewhat unusual (95% of days fall here)
-    - Z-score beyond ±2: Very unusual day (only 5% of days are this extreme)
-    
-    **Current Status**: Your current Z-score of {current_zscore:.2f} means today's movement is {'very unusual and extreme' if abs(current_zscore) > 2 else 'somewhat unusual but not extreme' if abs(current_zscore) > 1 else 'normal and typical'}.
-    
-    **Trading Implications:**
-    {
-    'Extreme movements often reverse - consider taking profits or entering counter-trend positions' if abs(current_zscore) > 2
-    else 'Moderate deviation - monitor for continuation or reversal signals' if abs(current_zscore) > 1
-    else 'Normal range - trend likely to continue without major disruptions'
-    }
-    
-    **Forecast with Confidence:**
-    - If positive Z-score: {'Very likely to see mean reversion (pullback)' if current_zscore > 2 else 'May see slight pullback or consolidation' if current_zscore > 1 else 'Upward momentum can continue'}
-    - If negative Z-score: {'Very likely to see mean reversion (bounce)' if current_zscore < -2 else 'May see slight bounce or consolidation' if current_zscore < -1 else 'Downward momentum can continue'}
-    """)
-    
-    # ==================== SECTION 8: FINAL TRADING RECOMMENDATION ====================
+    # ==================== FINAL TRADING RECOMMENDATION (Enhanced with Predictions) ====================
     st.header("🎯 Final Trading Recommendation")
     
-    # Multi-factor signal generation
+    # Multi-factor signal generation with forward-looking predictions
     signals = {}
     weights = {
-        'multi_timeframe': 0.30,
+        'volatility_prediction': 0.25,
+        'zscore_prediction': 0.25,
         'rsi': 0.20,
-        'zscore': 0.20,
         'ema_alignment': 0.30
     }
     
-    # 1. Multi-timeframe signal
-    if 'mtf_results_t1' in locals() and mtf_results_t1:
-        up_count = sum(1 for r in mtf_results_t1 if r['Trend'] == 'Up')
-        mtf_score = (up_count / len(mtf_results_t1)) * 2 - 1  # Scale to [-1, 1]
-        signals['multi_timeframe'] = mtf_score
+    # 1. Volatility-based prediction signal
+    if pd.notna(current_vol_bin) and current_vol_bin in bin_analysis.index:
+        vol_pred_return = bin_analysis.loc[current_vol_bin, ('Next_Return', 'mean')]
+        vol_signal = np.clip(vol_pred_return / 2, -1, 1)  # Scale to [-1, 1]
+        signals['volatility_prediction'] = vol_signal
     else:
-        signals['multi_timeframe'] = 0
+        signals['volatility_prediction'] = 0
     
-    # 2. RSI signal
+    # 2. Z-Score prediction signal (mean reversion)
+    if len(similar_cases) > 0:
+        zscore_pred_return = avg_next_return
+        zscore_signal = np.clip(zscore_pred_return / 2, -1, 1)
+        signals['zscore_prediction'] = zscore_signal
+    else:
+        signals['zscore_prediction'] = 0
+    
+    # 3. RSI signal
     current_rsi = data1['RSI'].iloc[-1]
     if current_rsi > 70:
         rsi_signal = -0.8  # Overbought - bearish
@@ -1100,20 +626,6 @@ if st.session_state.data_fetched:
     else:
         rsi_signal = 0  # Neutral
     signals['rsi'] = rsi_signal
-    
-    # 3. Z-Score signal
-    current_zscore = data1['Z_Score'].iloc[-1]
-    if current_zscore > 2:
-        zscore_signal = -0.8  # Extreme positive - expect reversal
-    elif current_zscore < -2:
-        zscore_signal = 0.8  # Extreme negative - expect bounce
-    elif current_zscore > 1:
-        zscore_signal = -0.3
-    elif current_zscore < -1:
-        zscore_signal = 0.3
-    else:
-        zscore_signal = 0
-    signals['zscore'] = zscore_signal
     
     # 4. EMA alignment signal
     current_price = data1['Close'].iloc[-1]
@@ -1215,20 +727,22 @@ if st.session_state.data_fetched:
         st.metric("Risk/Reward Ratio", f"1:{risk_reward:.2f}")
     
     # Signal breakdown
-    st.subheader("📊 Signal Component Analysis")
+    st.subheader("📊 Signal Component Analysis (Forward-Looking)")
     
     signal_breakdown = pd.DataFrame({
-        'Component': ['Multi-Timeframe Trend', 'RSI Indicator', 'Z-Score Analysis', 'EMA Alignment'],
-        'Raw Score': [signals['multi_timeframe'], signals['rsi'], signals['zscore'], signals['ema_alignment']],
-        'Weight': [weights['multi_timeframe'], weights['rsi'], weights['zscore'], weights['ema_alignment']],
-        'Weighted Score': [signals['multi_timeframe'] * weights['multi_timeframe'],
-                          signals['rsi'] * weights['rsi'],
-                          signals['zscore'] * weights['zscore'],
-                          signals['ema_alignment'] * weights['ema_alignment']],
+        'Component': ['Volatility Prediction (Next Move)', 'Z-Score Prediction (Mean Reversion)', 'RSI Indicator', 'EMA Alignment'],
+        'Raw Score': [signals['volatility_prediction'], signals['zscore_prediction'], signals['rsi'], signals['ema_alignment']],
+        'Weight': [weights['volatility_prediction'], weights['zscore_prediction'], weights['rsi'], weights['ema_alignment']],
+        'Weighted Score': [
+            signals['volatility_prediction'] * weights['volatility_prediction'],
+            signals['zscore_prediction'] * weights['zscore_prediction'],
+            signals['rsi'] * weights['rsi'],
+            signals['ema_alignment'] * weights['ema_alignment']
+        ],
         'Interpretation': [
-            'Bullish' if signals['multi_timeframe'] > 0.2 else 'Bearish' if signals['multi_timeframe'] < -0.2 else 'Neutral',
+            'Bullish' if signals['volatility_prediction'] > 0.2 else 'Bearish' if signals['volatility_prediction'] < -0.2 else 'Neutral',
+            'Bullish' if signals['zscore_prediction'] > 0.2 else 'Bearish' if signals['zscore_prediction'] < -0.2 else 'Neutral',
             'Bullish' if signals['rsi'] > 0.2 else 'Bearish' if signals['rsi'] < -0.2 else 'Neutral',
-            'Bullish' if signals['zscore'] > 0.2 else 'Bearish' if signals['zscore'] < -0.2 else 'Neutral',
             'Bullish' if signals['ema_alignment'] > 0.2 else 'Bearish' if signals['ema_alignment'] < -0.2 else 'Neutral'
         ]
     })
@@ -1252,7 +766,6 @@ if st.session_state.data_fetched:
     **Trade Management:**
     - Monitor the position every {interval} (your selected timeframe)
     - If RSI reaches extreme levels (>80 or <20), consider partial profit booking
-    - Re-evaluate if multi-timeframe trend changes
     - Set alerts at key support/resistance levels
     
     **Trailing Stop Recommendations:**
@@ -1262,187 +775,278 @@ if st.session_state.data_fetched:
     """)
     
     # Detailed rationale
-    st.subheader("🧠 Why This Signal Was Generated")
+    st.subheader("🧠 Why This Signal Was Generated (Forward-Looking Analysis)")
     
-    # Build rationale based on components
+    # Build rationale based on predictions
     rationale_parts = []
     
-    # Multi-timeframe analysis
-    if signals['multi_timeframe'] > 0.3:
-        rationale_parts.append(f"✅ **Strong multi-timeframe bullish trend**: {up_count} out of {len(mtf_results_t1)} timeframes are showing upward momentum, indicating a robust uptrend across different time horizons.")
-    elif signals['multi_timeframe'] < -0.3:
-        rationale_parts.append(f"❌ **Strong multi-timeframe bearish trend**: Most timeframes are showing downward momentum, indicating a robust downtrend.")
-    else:
-        rationale_parts.append(f"⚠️ **Mixed multi-timeframe signals**: The market is showing conflicting signals across different timeframes, suggesting consolidation or transition phase.")
+    # Volatility prediction
+    if pd.notna(current_vol_bin) and current_vol_bin in bin_analysis.index:
+        vol_pred = bin_analysis.loc[current_vol_bin, ('Next_Return', 'mean')]
+        rationale_parts.append(
+            f"{'✅' if vol_pred > 0.5 else '❌' if vol_pred < -0.5 else '➡️'} "
+            f"**Volatility-Based Prediction**: Current volatility ({current_vol:.2f}%) historically leads to "
+            f"a NEXT move of {vol_pred:+.2f}% on average. This suggests {'upward' if vol_pred > 0 else 'downward' if vol_pred < 0 else 'sideways'} movement ahead."
+        )
+    
+    # Z-score prediction
+    if len(similar_cases) > 0:
+        rationale_parts.append(
+            f"{'✅' if avg_next_return > 0.5 else '❌' if avg_next_return < -0.5 else '➡️'} "
+            f"**Mean Reversion Prediction**: Z-score of {current_zscore:.2f} indicates {zone.lower()}. "
+            f"After similar past situations, the NEXT move averaged {avg_next_return:+.2f}%. "
+            f"{'This suggests a reversal is likely.' if abs(current_zscore) > 2 else 'This suggests trend continuation.'}"
+        )
     
     # RSI analysis
     if current_rsi > 70:
-        rationale_parts.append(f"❌ **RSI Overbought** ({current_rsi:.1f}): The market is potentially overextended to the upside, increasing the probability of a pullback.")
+        rationale_parts.append(f"❌ **RSI Overbought** ({current_rsi:.1f}): Market is overextended, increasing pullback probability.")
     elif current_rsi < 30:
-        rationale_parts.append(f"✅ **RSI Oversold** ({current_rsi:.1f}): The market is potentially oversold, creating a buying opportunity as prices may bounce.")
+        rationale_parts.append(f"✅ **RSI Oversold** ({current_rsi:.1f}): Market is oversold, creating bounce opportunity.")
     else:
-        rationale_parts.append(f"➡️ **RSI Neutral** ({current_rsi:.1f}): RSI is in the middle range, not providing strong directional bias.")
-    
-    # Z-score analysis
-    if current_zscore > 2:
-        rationale_parts.append(f"❌ **Extreme Positive Z-Score** ({current_zscore:.2f}): Current returns are {abs(current_zscore):.1f} standard deviations above average - statistically unusual and likely to revert to the mean.")
-    elif current_zscore < -2:
-        rationale_parts.append(f"✅ **Extreme Negative Z-Score** ({current_zscore:.2f}): Current returns are {abs(current_zscore):.1f} standard deviations below average - statistically unusual and likely to bounce back.")
-    elif abs(current_zscore) > 1:
-        rationale_parts.append(f"⚠️ **Moderate Z-Score** ({current_zscore:.2f}): Returns are somewhat unusual but not extreme, suggesting cautious approach.")
-    else:
-        rationale_parts.append(f"➡️ **Normal Z-Score** ({current_zscore:.2f}): Returns are within normal range, supporting trend continuation.")
+        rationale_parts.append(f"➡️ **RSI Neutral** ({current_rsi:.1f}): RSI shows no extreme condition.")
     
     # EMA alignment
     if signals['ema_alignment'] > 0.3:
-        rationale_parts.append(f"✅ **Bullish EMA Alignment**: Price is above key moving averages (20/50/200 EMA), and shorter EMAs are above longer ones - classic bullish structure.")
+        rationale_parts.append(f"✅ **Bullish EMA Alignment**: Price above key moving averages - bullish structure intact.")
     elif signals['ema_alignment'] < -0.3:
-        rationale_parts.append(f"❌ **Bearish EMA Alignment**: Price is below key moving averages, and shorter EMAs are below longer ones - classic bearish structure.")
+        rationale_parts.append(f"❌ **Bearish EMA Alignment**: Price below key moving averages - bearish structure intact.")
     else:
-        rationale_parts.append(f"⚠️ **Mixed EMA Alignment**: EMAs are not clearly aligned, suggesting the market lacks clear directional conviction.")
+        rationale_parts.append(f"⚠️ **Mixed EMA Alignment**: EMAs not clearly aligned - market lacks conviction.")
     
     st.markdown("\n\n".join(rationale_parts))
     
-    # Historical context
-    st.subheader("📚 Historical Context")
-    
-    recent_performance = (current_price - data1['Close'].iloc[-20]) / data1['Close'].iloc[-20] * 100
-    monthly_performance = (current_price - data1['Close'].iloc[0]) / data1['Close'].iloc[0] * 100
-    
-    st.write(f"""
-    **Recent Performance:**
-    - Last 20 periods: {recent_performance:+.2f}%
-    - Full period ({period}): {monthly_performance:+.2f}%
-    - Current volatility: {data1['Volatility'].iloc[-1]:.2f}% ({'High' if data1['Volatility'].iloc[-1] > data1['Volatility'].mean() else 'Low'} compared to average)
-    - Average True Range (ATR): {atr_current:.2f} points
-    
-    **What History Tells Us:**
-    {
-    f"The {ticker1_option} has been in a strong uptrend, gaining {recent_performance:.1f}% recently. However, the current signal suggests caution as some indicators show overextension." 
-    if recent_performance > 5 and combined_signal < 0
-    else f"The {ticker1_option} has been declining, losing {abs(recent_performance):.1f}% recently. The current signal suggests this may be a reversal opportunity." 
-    if recent_performance < -5 and combined_signal > 0
-    else f"The {ticker1_option} has been moving sideways with a {abs(recent_performance):.1f}% change. The signal suggests building {'bullish' if combined_signal > 0 else 'bearish'} momentum."
-    }
-    """)
-    
     # Expected scenario
-    st.subheader("🔮 Expected Scenario")
+    st.subheader("🔮 Expected Scenario (What Happens NEXT)")
     
     if combined_signal > 0.3:
         scenario = f"""
-        **Bullish Scenario (Primary):**
-        - Expected move: Price should rally towards ₹{target_price:.2f} ({pct_gain_target:+.2f}%)
-        - Key support: ₹{stop_loss:.2f} must hold
-        - Confirmation: Look for higher highs and higher lows on shorter timeframes
-        - Catalyst: {'Multi-timeframe alignment' if signals['multi_timeframe'] > 0.5 else 'RSI oversold bounce' if signals['rsi'] > 0.5 else 'Mean reversion from extreme levels'}
+        **📈 Bullish Scenario (PRIMARY PREDICTION):**
         
-        **Risk Scenario:**
-        - If stop loss is hit at ₹{stop_loss:.2f}, the bullish thesis is invalidated
-        - In that case, wait for price to stabilize before re-entering
-        - Alternative: Consider waiting for confirmation break above ₹{entry_price + (entry_price * 0.01):.2f}
+        **What We Expect to Happen NEXT:**
+        - Price should rally from current ₹{entry_price:.2f} towards ₹{target_price:.2f}
+        - Expected profit: {pct_gain_target:+.2f}%
+        - Timeline: Within the next few {interval} periods
+        
+        **Why We Predict This:**
+        1. Volatility patterns suggest {vol_pred:+.2f}% next move (historically)
+        2. Z-score analysis predicts {avg_next_return:+.2f}% move (mean reversion)
+        3. RSI and EMAs support {'the bullish case' if signals['ema_alignment'] > 0 else 'despite some resistance'}
+        
+        **What to Watch:**
+        - ✅ Confirmation: Price staying above ₹{entry_price - (atr_current * 0.5):.2f}
+        - ❌ Invalidation: Break below ₹{stop_loss:.2f}
+        - 🎯 Target: ₹{target_price:.2f}
+        
+        **Risk If Wrong:**
+        If prediction fails and stop hits at ₹{stop_loss:.2f}, you lose {pct_loss_stop:.2f}%. 
+        But with {risk_reward:.1f}:1 reward/risk, one winner covers multiple losers!
         """
     elif combined_signal < -0.3:
         scenario = f"""
-        **Bearish Scenario (Primary):**
-        - Expected move: Price should decline towards ₹{target_price:.2f} ({pct_gain_target:+.2f}%)
-        - Key resistance: ₹{stop_loss:.2f} must not break
-        - Confirmation: Look for lower highs and lower lows on shorter timeframes
-        - Catalyst: {'Multi-timeframe breakdown' if signals['multi_timeframe'] < -0.5 else 'RSI overbought correction' if signals['rsi'] < -0.5 else 'Mean reversion from extreme levels'}
+        **📉 Bearish Scenario (PRIMARY PREDICTION):**
         
-        **Risk Scenario:**
-        - If stop loss is hit at ₹{stop_loss:.2f}, the bearish thesis is invalidated
-        - In that case, the trend may be reversing to bullish
-        - Alternative: Consider waiting for confirmation break below ₹{entry_price - (entry_price * 0.01):.2f}
+        **What We Expect to Happen NEXT:**
+        - Price should decline from current ₹{entry_price:.2f} towards ₹{target_price:.2f}
+        - Expected profit: {abs(pct_gain_target):.2f}% (on short position)
+        - Timeline: Within the next few {interval} periods
+        
+        **Why We Predict This:**
+        1. Volatility patterns suggest {vol_pred:+.2f}% next move (historically)
+        2. Z-score analysis predicts {avg_next_return:+.2f}% move (mean reversion)
+        3. RSI and EMAs support {'the bearish case' if signals['ema_alignment'] < 0 else 'despite some support'}
+        
+        **What to Watch:**
+        - ✅ Confirmation: Price staying below ₹{entry_price + (atr_current * 0.5):.2f}
+        - ❌ Invalidation: Break above ₹{stop_loss:.2f}
+        - 🎯 Target: ₹{target_price:.2f}
+        
+        **Risk If Wrong:**
+        If prediction fails and stop hits at ₹{stop_loss:.2f}, you lose {abs(pct_loss_stop):.2f}%.
         """
     else:
         scenario = f"""
-        **Neutral Scenario (Hold):**
-        - Current signals are conflicting - no clear directional edge
-        - Price likely to consolidate between ₹{entry_price * 0.97:.2f} and ₹{entry_price * 1.03:.2f}
-        - Wait for clearer signals before entering positions
-        - Watch for: RSI moving to extremes, multi-timeframe alignment, or breakout from consolidation
+        **➡️ Neutral Scenario (NO CLEAR PREDICTION):**
         
-        **What to Watch For:**
-        - **Bullish Breakout**: Entry above ₹{entry_price * 1.02:.2f} with volume
-        - **Bearish Breakdown**: Entry below ₹{entry_price * 0.98:.2f} with volume
-        - Patience is key - don't force trades in unclear market conditions
+        **Current Situation:**
+        - Signals are mixed - no clear directional edge
+        - Volatility and Z-score predictions conflict
+        - Best action: WAIT for clarity
+        
+        **What to Watch For (NEXT):**
+        - 📈 **Bullish Trigger**: Price breaks above ₹{entry_price * 1.02:.2f} with conviction
+        - 📉 **Bearish Trigger**: Price breaks below ₹{entry_price * 0.98:.2f} with conviction
+        
+        **Smart Trader Advice:**
+        Don't force trades! Wait for one of the triggers above. 
+        Patience protects your capital when predictions are uncertain.
         """
     
     st.info(scenario)
-    
-    # Market structure analysis
-    st.subheader("🏗️ Market Structure Analysis")
-    
-    recent_highs = data1['High'].tail(20)
-    recent_lows = data1['Low'].tail(20)
-    
-    higher_highs = sum(1 for i in range(1, len(recent_highs)) if recent_highs.iloc[i] > recent_highs.iloc[i-1])
-    lower_lows = sum(1 for i in range(1, len(recent_lows)) if recent_lows.iloc[i] < recent_lows.iloc[i-1])
-    
-    if higher_highs > 15:
-        structure = "Strong Uptrend (Consistent Higher Highs)"
-    elif lower_lows > 15:
-        structure = "Strong Downtrend (Consistent Lower Lows)"
-    elif higher_highs > 10 and lower_lows < 5:
-        structure = "Uptrend (More Higher Highs than Lower Lows)"
-    elif lower_lows > 10 and higher_highs < 5:
-        structure = "Downtrend (More Lower Lows than Higher Highs)"
-    else:
-        structure = "Consolidation/Sideways (Mixed Price Action)"
-    
-    st.write(f"""
-    **Current Market Structure:** {structure}
-    
-    **What This Means:**
-    {
-    "The market is making higher highs and higher lows - a textbook uptrend. This is bullish and supports long positions." if "Uptrend" in structure and "Strong" in structure
-    else "The market is making lower highs and lower lows - a textbook downtrend. This is bearish and supports short positions." if "Downtrend" in structure and "Strong" in structure
-    else "The market is moving sideways without clear direction. Wait for a breakout before taking positions." if "Consolidation" in structure
-    else "The market shows some trending behavior but lacks strong momentum. Be cautious with position sizing."
-    }
-    
-    **Professional Tip:** Market structure is one of the most reliable indicators. Always trade in the direction of the structure for higher probability setups.
-    """)
     
     # Final summary for beginners
     st.subheader("👶 Simple Explanation (For Beginners)")
     
     st.success(f"""
-    **What Should You Do?**
+    **🎯 SIMPLE PREDICTION - What Happens NEXT?**
     
-    Our analysis says: **{action}** with **{confidence}** confidence.
+    **Current Price**: ₹{entry_price:.2f}
     
-    **In Simple Words:**
-    {
-    f"We analyzed {ticker1_option} from multiple angles (trends, momentum, statistics, moving averages) and most indicators suggest the price will GO UP. "
-    f"We recommend BUYING at current price ₹{entry_price:.2f}, with a target of ₹{target_price:.2f} (expected profit: {abs(pct_gain_target):.1f}%). "
-    f"If the price falls to ₹{stop_loss:.2f}, exit immediately to limit losses to {abs(pct_loss_stop):.1f}%."
-    if combined_signal > 0.3
+    **Our Prediction**: {action} - The price will likely {'GO UP ⬆️' if combined_signal > 0.3 else 'GO DOWN ⬇️' if combined_signal < -0.3 else 'STAY FLAT ➡️'}
     
-    else f"We analyzed {ticker1_option} from multiple angles and most indicators suggest the price will GO DOWN. "
-    f"We recommend SELLING/SHORTING at current price ₹{entry_price:.2f}, with a target of ₹{target_price:.2f} (expected profit: {abs(pct_gain_target):.1f}%). "
-    f"If the price rises to ₹{stop_loss:.2f}, exit immediately to limit losses to {abs(pct_loss_stop):.1f}%."
-    if combined_signal < -0.3
-    
-    else f"We analyzed {ticker1_option} and the signals are MIXED. Some indicators say up, others say down. "
-    f"In such situations, it's best to WAIT and not trade. Wait for clearer signals to avoid losing money on unclear setups."
+    **Expected Next Move**: {
+    f"Price should rise to around ₹{target_price:.2f} (gain of {pct_gain_target:.2f}%)" if combined_signal > 0.3
+    else f"Price should fall to around ₹{target_price:.2f} (gain of {abs(pct_gain_target):.2f}% on short)" if combined_signal < -0.3
+    else f"Price will likely move sideways - wait for clear direction"
     }
     
-    **Remember:**
-    1. **Never risk more than 1-2% of your capital** on a single trade
-    2. **Always use stop losses** - they protect you from big losses
-    3. **Don't get greedy** - book profits at the target price
-    4. **Market can be unpredictable** - this is analysis, not a guarantee
-    5. **Practice first** - consider paper trading before real money
+    **How Confident Are We**: {confidence}
     
-    **Risk vs Reward:**
-    For every ₹{abs(pct_loss_stop):.1f} you risk, you can potentially gain ₹{abs(pct_gain_target):.1f}. That's a {risk_reward:.1f}:1 risk-reward ratio, which is {'excellent' if risk_reward > 2 else 'good' if risk_reward > 1.5 else 'acceptable' if risk_reward > 1 else 'not ideal'}.
+    **Why This Prediction?**
+    We looked at:
+    1. **What happened BEFORE** (past returns, volatility)
+    2. **What usually happens NEXT** after similar situations (historical patterns)
+    3. **Current technical indicators** (RSI, moving averages)
+    
+    All these point to: **{action}**
+    
+    **What You Should Do:**
+    {
+    f"✅ BUY at ₹{entry_price:.2f}, Target: ₹{target_price:.2f}, Stop: ₹{stop_loss:.2f}"
+    if combined_signal > 0.3
+    else f"❌ SELL/SHORT at ₹{entry_price:.2f}, Target: ₹{target_price:.2f}, Stop: ₹{stop_loss:.2f}"
+    if combined_signal < -0.3
+    else f"⏸️ WAIT - Don't trade yet, signals are unclear"
+    }
+    
+    **Remember:** This is a prediction based on patterns, NOT a guarantee! 
+    Always use stop losses and never risk more than you can afford to lose.
     """)
+    
+    # ==================== INTERACTIVE CHARTS ====================
+    st.header("📊 Interactive Charts")
+    
+    # Chart 1: Ticker 1 Price + RSI
+    st.subheader(f"{ticker1_option} - Price & RSI")
+    
+    fig1 = make_subplots(
+        rows=2, cols=1,
+        shared_xaxes=True,
+        vertical_spacing=0.05,
+        row_heights=[0.7, 0.3],
+        subplot_titles=(f'{ticker1_option} Price with EMAs', 'RSI Indicator')
+    )
+    
+    # Candlestick
+    fig1.add_trace(
+        go.Candlestick(
+            x=data1['Datetime'],
+            open=data1['Open'],
+            high=data1['High'],
+            low=data1['Low'],
+            close=data1['Close'],
+            name='Price'
+        ),
+        row=1, col=1
+    )
+    
+    # EMAs
+    fig1.add_trace(go.Scatter(x=data1['Datetime'], y=data1['EMA_20'], name='EMA 20', line=dict(color='orange', width=1)), row=1, col=1)
+    fig1.add_trace(go.Scatter(x=data1['Datetime'], y=data1['EMA_50'], name='EMA 50', line=dict(color='blue', width=1)), row=1, col=1)
+    fig1.add_trace(go.Scatter(x=data1['Datetime'], y=data1['EMA_200'], name='EMA 200', line=dict(color='purple', width=2)), row=1, col=1)
+    
+    # RSI
+    fig1.add_trace(
+        go.Scatter(x=data1['Datetime'], y=data1['RSI'], name='RSI', line=dict(color='cyan', width=2)),
+        row=2, col=1
+    )
+    fig1.add_hline(y=70, line_dash="dash", line_color="red", row=2, col=1)
+    fig1.add_hline(y=30, line_dash="dash", line_color="green", row=2, col=1)
+    
+    fig1.update_layout(height=800, showlegend=True, xaxis_rangeslider_visible=False)
+    st.plotly_chart(fig1, use_container_width=True)
+    
+    # Chart 2 & 3: Ratio analysis if enabled
+    if st.session_state.enable_ratio_value and 'data2' in st.session_state:
+        st.subheader(f"{ticker2_option} - Price & RSI")
+        
+        fig2 = make_subplots(
+            rows=2, cols=1,
+            shared_xaxes=True,
+            vertical_spacing=0.05,
+            row_heights=[0.7, 0.3],
+            subplot_titles=(f'{ticker2_option} Price with EMAs', 'RSI Indicator')
+        )
+        
+        fig2.add_trace(
+            go.Candlestick(
+                x=data2['Datetime'],
+                open=data2['Open'],
+                high=data2['High'],
+                low=data2['Low'],
+                close=data2['Close'],
+                name='Price'
+            ),
+            row=1, col=1
+        )
+        
+        fig2.add_trace(go.Scatter(x=data2['Datetime'], y=data2['EMA_20'], name='EMA 20', line=dict(color='orange', width=1)), row=1, col=1)
+        fig2.add_trace(go.Scatter(x=data2['Datetime'], y=data2['EMA_50'], name='EMA 50', line=dict(color='blue', width=1)), row=1, col=1)
+        fig2.add_trace(go.Scatter(x=data2['Datetime'], y=data2['EMA_200'], name='EMA 200', line=dict(color='purple', width=2)), row=1, col=1)
+        
+        fig2.add_trace(
+            go.Scatter(x=data2['Datetime'], y=data2['RSI'], name='RSI', line=dict(color='cyan', width=2)),
+            row=2, col=1
+        )
+        fig2.add_hline(y=70, line_dash="dash", line_color="red", row=2, col=1)
+        fig2.add_hline(y=30, line_dash="dash", line_color="green", row=2, col=1)
+        
+        fig2.update_layout(height=800, showlegend=True, xaxis_rangeslider_visible=False)
+        st.plotly_chart(fig2, use_container_width=True)
+        
+        # Ratio chart
+        st.subheader("Ratio Analysis - Ratio & RSI")
+        
+        # Align data by datetime
+        merged_data = pd.merge(
+            data1[['Datetime', 'Close', 'RSI']],
+            data2[['Datetime', 'Close', 'RSI']],
+            on='Datetime',
+            suffixes=('_T1', '_T2')
+        )
+        
+        merged_data['Ratio'] = merged_data['Close_T1'] / merged_data['Close_T2']
+        merged_data['Ratio_RSI'] = calculate_rsi(merged_data['Ratio'])
+        
+        fig3 = make_subplots(
+            rows=2, cols=1,
+            shared_xaxes=True,
+            vertical_spacing=0.05,
+            row_heights=[0.7, 0.3],
+            subplot_titles=('Ratio (T1/T2)', 'Ratio RSI')
+        )
+        
+        fig3.add_trace(
+            go.Scatter(x=merged_data['Datetime'], y=merged_data['Ratio'], name='Ratio', 
+                      line=dict(color='yellow', width=2), fill='tozeroy'),
+            row=1, col=1
+        )
+        
+        fig3.add_trace(
+            go.Scatter(x=merged_data['Datetime'], y=merged_data['Ratio_RSI'], name='Ratio RSI',
+                      line=dict(color='magenta', width=2)),
+            row=2, col=1
+        )
+        fig3.add_hline(y=70, line_dash="dash", line_color="red", row=2, col=1)
+        fig3.add_hline(y=30, line_dash="dash", line_color="green", row=2, col=1)
+        
+        fig3.update_layout(height=800, showlegend=True)
+        st.plotly_chart(fig3, use_container_width=True)
     
     # Disclaimer
     st.warning("""
-    ⚠️ **DISCLAIMER**: This analysis is for educational purposes only and should not be considered as financial advice. 
+    ⚠️ **DISCLAIMER**: This analysis uses historical patterns to predict future movements, but markets are unpredictable. 
+    This is for educational purposes only and should not be considered as financial advice. 
     Always do your own research, understand the risks involved, and consider consulting with a qualified financial advisor 
     before making any investment decisions. Past performance does not guarantee future results. Trading involves substantial 
     risk of loss and is not suitable for all investors.
@@ -1455,53 +1059,30 @@ else:
     st.markdown("""
     ## 🌟 Dashboard Features
     
+    ### 🔮 **PREDICTIVE ANALYSIS** (What Happens NEXT)
+    - **Volatility-Based Prediction**: Analyzes current volatility to predict the NEXT move
+    - **Z-Score Mean Reversion**: Predicts reversals after extreme moves
+    - **Forward-Looking Signals**: All recommendations focus on future movements, not past
+    
     ### 📊 Core Analytics
-    - **Real-time Market Data**: Fetch live data from Yahoo Finance for stocks, indices, crypto, forex, and commodities
-    - **Multi-Asset Support**: Analyze NIFTY 50, Bank NIFTY, SENSEX, BTC, ETH, Gold, Silver, USD/INR, and more
-    - **Ratio Analysis**: Compare two assets and analyze their price ratio dynamics
+    - **Real-time Market Data**: Live data from Yahoo Finance
+    - **Multi-Asset Support**: Stocks, indices, crypto, forex, commodities
+    - **Ratio Analysis**: Compare two assets
     
     ### 📈 Technical Analysis
-    - **Multi-Timeframe Analysis**: Analyze trends across 10 different timeframes simultaneously
-    - **Advanced Indicators**: RSI, EMA (9,20,21,33,50,100,150,200), SMA (20,50,100,150,200), Fibonacci levels
-    - **Support & Resistance**: Automatic detection of key price levels
-    - **Volatility Analysis**: Historical volatility bins with performance statistics
+    - **Multi-Timeframe**: Analyze 10 timeframes simultaneously
+    - **Advanced Indicators**: RSI, EMAs, SMAs, Fibonacci, ATR
+    - **Support & Resistance**: Automatic level detection
     
-    ### 🔍 Pattern Recognition
-    - **Significant Move Detection**: Identifies large price movements and analyzes preceding conditions
-    - **Divergence Detection**: Spots RSI divergences that often signal reversals
-    - **EMA Crossovers**: Detects important moving average crossovers
-    - **Volume Analysis**: Identifies volume spikes and unusual trading activity
-    
-    ### 📊 Statistical Analysis
-    - **Distribution Analysis**: Understand return distributions with histograms and normal curves
-    - **Z-Score Analysis**: Identify statistically unusual price movements
-    - **Bell Curve Visualization**: See where current price stands in statistical context
-    - **Probability Ranges**: 68%, 95%, and 99.7% confidence intervals
-    
-    ### 🎯 Trading Signals
-    - **Multi-Factor Analysis**: Combines 4 key factors (multi-timeframe, RSI, Z-score, EMA alignment)
-    - **Weighted Scoring**: Intelligent weighting system for more accurate signals
-    - **Clear Buy/Sell/Hold**: Simple actionable recommendations
-    - **Risk Management**: ATR-based stop loss and target calculations
-    
-    ### 📉 Risk Management
-    - **Position Sizing**: Automatic calculation based on 1-2% account risk
-    - **Risk/Reward Ratios**: Clear risk vs reward assessment for each trade
-    - **Stop Loss & Targets**: Precise entry, exit, and stop loss levels
-    - **Trailing Stop Recommendations**: Dynamic exit strategies for maximum profit
-    
-    ### 📊 Interactive Visualizations
-    - **Candlestick Charts**: Professional trading charts with multiple EMAs
-    - **RSI Indicators**: Visual representation with overbought/oversold zones
-    - **Ratio Charts**: Compare two assets visually with RSI
-    - **Statistical Distributions**: Interactive histograms and bell curves
+    ### 🎯 Clear Trading Signals
+    - **BUY/SELL/HOLD**: Simple actionable recommendations
+    - **Entry/Target/Stop**: Precise levels for each trade
+    - **Risk Management**: Position sizing and trailing stops
     
     ### 💾 Data Export
-    - **CSV Export**: Download complete OHLCV data with indicators
-    - **Ratio Data Export**: Export comparison data for further analysis
-    - **Timezone Support**: All data properly converted to IST
+    - **CSV Export**: Download complete data with all indicators
     
     ---
     
-    **🚀 Ready to start? Configure your parameters in the sidebar and click "Fetch Data & Analyze"!**
+    **🚀 Ready to start? Configure parameters and click "Fetch Data & Analyze"!**
     """)
