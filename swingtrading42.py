@@ -1,630 +1,539 @@
 """
-Streamlit Algo Trading Dashboard
-Single-file Streamlit app implementing: data fetching (yfinance), multi-timeframe analysis,
-technical indicators (manually computed), ratio analysis, volatility bins, pattern detection,
-statistical distribution, z-score analysis, and multi-factor trading recommendation.
+Professional Algo Trading Dashboard - Streamlit App
+Single-file Streamlit application implementing:
+- Multi-asset, multi-timeframe data fetching via yfinance
+- Manual calculation of indicators (EMA, SMA, RSI, ATR, VWAP, Fibonacci)
+- Ratio analysis, volatility bins, z-score analysis
+- Pattern detection (basic set) and multi-timeframe summary
+- Interactive Plotly charts stacked vertically
+- CSV/Excel export, IST timezone handling
+- Caching, progress bars, configurable API delay, button-based fetch
 
 Notes:
-- No use of talib or pandas_ta
-- All datetimes converted to IST
-- Button-based fetching, configurable delays
-- Session state persists results
-- Exports to CSV/Excel
-
-Run: streamlit run streamlit_algo_dashboard.py
+- No talib or pandas_ta used. Indicators computed manually.
+- This is a comprehensive, production-oriented starting point. You can extend pattern recognition rules and UI as needed.
 """
 
 import streamlit as st
 import yfinance as yf
 import pandas as pd
 import numpy as np
-from datetime import datetime, timedelta
-import time
+from datetime import datetime, timedelta, timezone
 import pytz
-from scipy import stats
+import time
+from scipy.stats import skew, kurtosis
 import io
 import base64
-import math
-import plotly.graph_objs as go
-import plotly.express as px
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 
-# -----------------------------
-# Configuration / Utilities
-# -----------------------------
-st.set_page_config(page_title="Algo Trading Dashboard", layout="wide")
+# --------------------- Helper functions ---------------------
 
 IST = pytz.timezone('Asia/Kolkata')
 
-DEFAULT_DELAY = 1.8  # seconds between API calls
+st.set_page_config(page_title="Professional Algo Trading Dashboard", layout="wide")
 
-# Supported tickers (examples) - user can enter custom yfinance ticker
-PRESET_TICKERS = {
-    'NIFTY 50': '^NSEI',
-    'BANK NIFTY': '^NSEBANK',
-    'SENSEX': '^BSESN',
-    'BTC-USD': 'BTC-USD',
-    'ETH-USD': 'ETH-USD',
-    'GOLD': 'GC=F',
-    'SILVER': 'SI=F',
-    'USDINR': 'INR=X'
-}
+# ---------- Indicator implementations (manual) ----------
 
-# Helper: ensure session state keys
-if 'data' not in st.session_state:
-    st.session_state['data'] = {}
-
-# -----------------------------
-# Helper functions: timezones
-# -----------------------------
-
-def to_ist(dt: pd.DatetimeIndex) -> pd.DatetimeIndex:
-    """Convert timezone-aware or naive index to IST timezone."""
-    if isinstance(dt, pd.DatetimeIndex):
-        if dt.tz is None:
-            # assume UTC coming from yfinance
-            dt = dt.tz_localize('UTC')
-        return dt.tz_convert(IST)
-    else:
-        return pd.to_datetime(dt).tz_localize('UTC').tz_convert(IST)
-
-# -----------------------------
-# Data fetching and normalization
-# -----------------------------
-
-def clean_yf_df(df: pd.DataFrame) -> pd.DataFrame:
-    """Reset multiindex, keep Datetime, Open, High, Low, Close, Volume, adjust tz to IST."""
-    # yfinance sometimes returns multi-index columns; flatten
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = [' '.join(col).strip() for col in df.columns.values]
-    df = df.rename(columns=lambda x: x.strip())
-
-    # Common column names mapping
-    colmap = {}
-    for c in df.columns:
-        lc = c.lower()
-        if 'open' in lc and 'adj' not in lc:
-            colmap[c] = 'Open'
-        if 'high' in lc:
-            colmap[c] = 'High'
-        if 'low' in lc:
-            colmap[c] = 'Low'
-        if ('close' in lc and 'adj' not in lc) or lc == 'close':
-            colmap[c] = 'Close'
-        if 'volume' in lc:
-            colmap[c] = 'Volume'
-    df = df.rename(columns=colmap)
-
-    # keep required columns
-    keep = [c for c in ['Open','High','Low','Close','Volume'] if c in df.columns]
-    df = df[keep].copy()
-
-    # Ensure datetime index
-    if not isinstance(df.index, pd.DatetimeIndex):
-        df.index = pd.to_datetime(df.index)
-
-    df.index = to_ist(df.index)
-    df.index.name = 'DateTime'
-    df = df.reset_index()
-    return df
-
-@st.cache_data(ttl=300)
-def fetch_yf(ticker, interval, period, delay=DEFAULT_DELAY):
-    """Fetch data using yfinance with a delay. Returns cleaned dataframe."""
-    # yfinance accepts period like '1mo' and interval like '5m'
-    time.sleep(delay)
+def safe_div(a, b):
     try:
-        raw = yf.download(tickers=ticker, interval=interval, period=period, progress=False, threads=False)
-    except Exception as e:
-        st.error(f"yfinance download error: {e}")
-        raise
-    if raw is None or raw.empty:
-        return pd.DataFrame()
-    return clean_yf_df(raw)
+        return a / b
+    except Exception:
+        return np.nan
 
-# -----------------------------
-# Indicators (manual implementations)
-# -----------------------------
 
-def sma(series: pd.Series, period: int) -> pd.Series:
-    return series.rolling(period, min_periods=1).mean()
+def sma(series, period):
+    return series.rolling(window=period, min_periods=1).mean()
 
-def ema(series: pd.Series, period: int) -> pd.Series:
-    # manual EMA using pandas ewm
+
+def ema(series, period):
     return series.ewm(span=period, adjust=False).mean()
 
-def rsi(series: pd.Series, period: int = 14) -> pd.Series:
+
+def rsi(series, period=14):
     delta = series.diff()
     up = delta.clip(lower=0)
     down = -1 * delta.clip(upper=0)
-    ma_up = up.rolling(period, min_periods=period).mean()
-    ma_down = down.rolling(period, min_periods=period).mean()
-    rs = ma_up / (ma_down.replace(0, np.nan))
+    ma_up = up.rolling(window=period, min_periods=period).mean()
+    ma_down = down.rolling(window=period, min_periods=period).mean()
+    rs = ma_up / ma_down
     rsi = 100 - (100 / (1 + rs))
-    rsi = rsi.fillna(50)
     return rsi
 
-def atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
+
+def atr(df, period=14):
     high = df['High']
     low = df['Low']
     close = df['Close']
-    tr1 = high - low
-    tr2 = (high - close.shift()).abs()
-    tr3 = (low - close.shift()).abs()
-    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+    prev_close = close.shift(1)
+    tr = pd.concat([high - low, (high - prev_close).abs(), (low - prev_close).abs()], axis=1).max(axis=1)
     return tr.rolling(window=period, min_periods=1).mean()
 
-# -----------------------------
-# Fibonacci levels
-# -----------------------------
 
-def fibonacci_levels(high, low):
+def vwap(df):
+    # vwap uses price * volume cumulatively / volume cumulatively
+    pv = (df['Close'] * df['Volume']).cumsum()
+    v = df['Volume'].cumsum()
+    return pv / v
+
+
+def zscore(series):
+    return (series - series.mean()) / series.std(ddof=0)
+
+
+def fib_levels(high, low):
     diff = high - low
-    levels = {
-        '0.0%': high,
+    return {
+        '0%': high,
         '23.6%': high - 0.236 * diff,
         '38.2%': high - 0.382 * diff,
-        '50.0%': high - 0.5 * diff,
+        '50%': high - 0.5 * diff,
         '61.8%': high - 0.618 * diff,
         '100%': low
     }
-    return levels
 
-# -----------------------------
-# Support/Resistance (simple pivot and rolling)
-# -----------------------------
+# ---------- Timeframe mapping and utilities ----------
 
-def support_resistance_levels(df: pd.DataFrame, lookback=20, num_levels=3):
-    highs = df['High'].rolling(window=lookback).max()
-    lows = df['Low'].rolling(window=lookback).min()
-    latest_high = highs.iloc[-1]
-    latest_low = lows.iloc[-1]
-    # return equally spaced levels between low and high
-    levels = {}
-    for i in range(1, num_levels+1):
-        levels[f'Resistance_{i}'] = latest_high - (i-1) * (latest_high - latest_low) / num_levels
-        levels[f'Support_{i}'] = latest_low + (i-1) * (latest_high - latest_low) / num_levels
-    return levels
+TF_MAP = {
+    '1m': {'interval': '1m', 'default_period': '7d'},
+    '3m': {'interval': '3m', 'default_period': '7d'},
+    '5m': {'interval': '5m', 'default_period': '1mo'},
+    '10m': {'interval': '10m', 'default_period': '1mo'},
+    '15m': {'interval': '15m', 'default_period': '1mo'},
+    '30m': {'interval': '30m', 'default_period': '2mo'},
+    '1h': {'interval': '60m', 'default_period': '3mo'},
+    '2h': {'interval': '120m', 'default_period': '6mo'},
+    '4h': {'interval': '240m', 'default_period': '1y'},
+    '1d': {'interval': '1d', 'default_period': '5y'},
+}
 
-# -----------------------------
-# Volatility bins
-# -----------------------------
+PERIOD_CHOICES = ['1d','5d','7d','1mo','3mo','6mo','1y','2y','3y','5y','6y','10y','15y','20y','25y','30y']
 
-def compute_volatility(df: pd.DataFrame, window=14):
-    # volatility as rolling std of returns * sqrt(periodicity)
-    returns = df['Close'].pct_change()
-    vol = returns.rolling(window).std() * math.sqrt(window)
-    return vol
+# ---------- Fetching function with caching ----------
 
-def assign_bins(values, bins=5):
-    # create equal-frequency bins
+@st.cache_data(show_spinner=False)
+def fetch_yfinance(ticker, interval='1d', period='1mo'):
+    """Fetch data from yfinance and normalize dataframe."""
     try:
-        labels = [f'Bin_{i+1}' for i in range(bins)]
-        return pd.qcut(values, q=bins, labels=labels, duplicates='drop')
-    except Exception:
-        return pd.Series(['Bin_1'] * len(values), index=values.index)
-
-# -----------------------------
-# Pattern detection (simplified rules)
-# -----------------------------
-
-def detect_patterns(df: pd.DataFrame, move_threshold=30):
-    """Detect simple patterns preceding large moves."""
-    patterns = []
-    df = df.copy()
-    df['ReturnPts'] = df['Close'].diff()
-    df['ReturnPct'] = df['Close'].pct_change() * 100
-    for i in range(10, len(df)):
-        move = df['ReturnPts'].iloc[i]
-        if abs(move) >= move_threshold:
-            window = df.iloc[i-10:i]
-            pat = {
-                'DateTime': df['DateTime'].iloc[i],
-                'MovePts': move,
-                'MovePct': df['ReturnPct'].iloc[i],
-                'Direction': 'Up' if move>0 else 'Down',
-                'VolBurst': window['High'].max() - window['Low'].min(),
-                'VolSpike': window['Volume'].max() if 'Volume' in window else np.nan,
-                'RSI_before': float(rsi(window['Close']).iloc[-2]),
-                'RSI_at': float(rsi(df['Close']).iloc[i])
-            }
-            patterns.append(pat)
-    return pd.DataFrame(patterns)
-
-# -----------------------------
-# Z-score and distribution
-# -----------------------------
-
-def zscore(series):
-    return (series - series.mean()) / series.std()
-
-# -----------------------------
-# Multi-timeframe aggregation
-# -----------------------------
-
-def aggregate_timeframes(ticker, base_interval, timeframe_map, period_map, delay):
-    """Fetch multiple timeframes and compute summary table."""
-    rows = []
-    total = len(timeframe_map)
-    prog = st.progress(0)
-    for idx, (label, interval) in enumerate(timeframe_map.items()):
-        period = period_map.get(label)
-        df = fetch_yf(ticker, interval=interval, period=period, delay=delay)
+        df = yf.download(tickers=ticker, interval=interval, period=period, progress=False, threads=False)
         if df.empty:
-            rows.append({'Timeframe': label, 'Error': 'No data'})
-            prog.progress((idx+1)/total)
-            continue
-        close = df['Close']
-        trend = 'Up' if close.iloc[-1] > close.iloc[0] else 'Down'
-        maxc = close.max()
-        minc = close.min()
-        fibs = fibonacci_levels(maxc, minc)
-        vol = compute_volatility(df).iloc[-1]
-        pctchg = (close.iloc[-1] - close.iloc[0]) / close.iloc[0] * 100
-        emalist = {f'EMA_{p}': float(ema(close, p).iloc[-1]) for p in [9,20,21,33,50,100,150,200]}
-        smalist = {f'SMA_{p}': float(sma(close, p).iloc[-1]) for p in [20,50,100,150,200]}
-        rsi_val = float(rsi(close).iloc[-1])
-        row = {
-            'Timeframe': label,
-            'Trend': trend,
-            'MaxClose': maxc,
-            'MinClose': minc,
-            'Volatility': vol,
-            'PctChange': pctchg,
-            'RSI': rsi_val,
-            **fibs,
-            **emalist,
-            **smalist
+            return pd.DataFrame()
+        df = df.reset_index()
+        # yfinance sometimes returns MultiIndex columns for some tickers; keep only standard OHLCV
+        # Ensure column names are normalized
+        df.columns = [c if not isinstance(c, tuple) else c[1] for c in df.columns]
+        expected = ['Datetime','Date','Open','High','Low','Close','Adj Close','Volume']
+        # Prefer 'Datetime' or 'Date' column as datetime
+        if 'Datetime' in df.columns:
+            df.rename(columns={'Datetime':'DateTime'}, inplace=True)
+        elif 'Date' in df.columns:
+            df.rename(columns={'Date':'DateTime'}, inplace=True)
+        else:
+            # sometimes index was date
+            df['DateTime'] = pd.to_datetime(df.iloc[:,0])
+        df['DateTime'] = pd.to_datetime(df['DateTime'])
+        # convert to IST
+        if df['DateTime'].dt.tz is None:
+            df['DateTime'] = df['DateTime'].dt.tz_localize('UTC').dt.tz_convert(IST)
+        else:
+            df['DateTime'] = df['DateTime'].dt.tz_convert(IST)
+        # Keep only OHLCV
+        keep_cols = [c for c in ['DateTime','Open','High','Low','Close','Volume'] if c in df.columns]
+        df = df[keep_cols]
+        df = df.sort_values('DateTime').reset_index(drop=True)
+        return df
+    except Exception as e:
+        st.error(f"Error fetching {ticker}: {e}")
+        return pd.DataFrame()
+
+# ---------- Utility for delay and progress ----------
+
+def fetch_with_delay(ticker, interval, period, delay_seconds):
+    time.sleep(delay_seconds)
+    return fetch_yfinance(ticker, interval=interval, period=period)
+
+# ---------- Ratio and binning helpers ----------
+
+def create_ratio(df1, df2):
+    df = pd.DataFrame()
+    df['DateTime'] = df1['DateTime']
+    df['Price1'] = df1['Close'].values
+    df['Price2'] = df2['Close'].values
+    df['Ratio'] = df['Price1'] / df['Price2']
+    return df
+
+
+def create_bins(series, n_bins=5):
+    bins = pd.qcut(series, q=n_bins, duplicates='drop')
+    bin_ranges = bins.unique().categories if hasattr(bins, 'unique') else pd.Series(bins).unique()
+    return bins
+
+# ---------- Pattern recognition (basic rules) ----------
+
+def detect_patterns(df, move_threshold_points=30):
+    results = []
+    close = df['Close']
+    rsi_series = rsi(close)
+    ema20 = ema(close, 20)
+    ema50 = ema(close, 50)
+
+    for i in range(1, len(df)):
+        move = (close.iloc[i] - close.iloc[i-1])
+        move_pct = move / close.iloc[i-1] * 100
+        entry = {
+            'DateTime': df['DateTime'].iloc[i],
+            'MovePoints': move,
+            'MovePct': move_pct,
+            'Direction': 'Up' if move>0 else 'Down',
+            'LargeBody': abs((df['Close'].iloc[i] - df['Open'].iloc[i])) > (df['High'].iloc[i] - df['Low'].iloc[i]) * 0.6 if all(col in df.columns for col in ['Open','High','Low']) else False,
+            'VolumeSpike': False,
+            'RSI_before': np.nan,
+            'RSI_now': rsi_series.iloc[i] if i < len(rsi_series) else np.nan,
+            'EMA20_cross_EMA50': (ema20.iloc[i] > ema50.iloc[i]) and (ema20.iloc[i-1] <= ema50.iloc[i-1]) if i>0 else False
         }
-        rows.append(row)
-        prog.progress((idx+1)/total)
-    prog.empty()
-    return pd.DataFrame(rows)
+        # detect volume spike if column exists
+        if 'Volume' in df.columns and i>1:
+            vol = df['Volume']
+            if vol.iloc[i] > vol.iloc[max(0,i-10):i].mean() * 2.0:
+                entry['VolumeSpike'] = True
+        # RSI before
+        if i-1 >= 0:
+            entry['RSI_before'] = rsi_series.iloc[i-1] if i-1 < len(rsi_series) else np.nan
+        # mark big move
+        entry['IsSignificant'] = abs(move) >= move_threshold_points
+        results.append(entry)
+    return pd.DataFrame(results)
 
-# -----------------------------
-# Signal generation (weights)
-# -----------------------------
+# ---------- Statistical summaries ----------
 
-def generate_signal(mtf_df, rsi_val, zscore_val):
-    """Combine weights per spec: MTF trend 30%, RSI 20%, Zscore 20%, EMA alignment 30%"""
-    score = 0.0
-    # MTF trend: count Up vs Down
-    up_count = (mtf_df['Trend'] == 'Up').sum()
-    down_count = (mtf_df['Trend'] == 'Down').sum()
-    mtf_score = (up_count - down_count) / max(1, len(mtf_df))  # -1..1
-    score += 0.3 * mtf_score
-    # RSI: neutral around 50; higher suggests overbought -> negative for buy
-    rsi_score = (50 - rsi_val) / 50  # positive when RSI<50
-    score += 0.2 * rsi_score
-    # Z-score: negative means price below mean -> positive for buy
-    z_score_component = (-zscore_val if not np.isnan(zscore_val) else 0)
-    score += 0.2 * z_score_component
-    # EMA alignment: measure how many EMAs are below price
-    ema_cols = [c for c in mtf_df.columns if c.startswith('EMA_')]
-    ema_align = 0
-    if ema_cols:
-        latest = mtf_df.iloc[0]  # choose highest timeframe row
-        price = latest.get('MaxClose', None) or latest.get('MinClose', None)
-        if price is not None:
-            below = sum([1 for c in ema_cols if latest[c] < price])
-            ema_align = (below / len(ema_cols)) * 2 - 1  # -1..1
-    score += 0.3 * ema_align
-    # Map score to recommendation
-    if score > 0.5:
-        rec = 'Strong Buy'
-    elif score > 0.1:
-        rec = 'Buy'
-    elif score < -0.5:
-        rec = 'Strong Sell'
-    elif score < -0.1:
-        rec = 'Sell'
-    else:
-        rec = 'Neutral'
-    return {'score': score, 'recommendation': rec}
+def stats_summary(series):
+    return {
+        'mean': series.mean(),
+        'std': series.std(ddof=0),
+        'skew': skew(series.dropna()),
+        'kurtosis': kurtosis(series.dropna())
+    }
 
-# -----------------------------
-# CSV / Excel export
-# -----------------------------
+# ---------- Exports ----------
 
-def to_excel(df):
+def to_excel_bytes(df):
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
         df.to_excel(writer, index=False, sheet_name='data')
-        writer.save()
-    processed_data = output.getvalue()
-    return processed_data
+    return output.getvalue()
 
-# -----------------------------
-# UI: Inputs
-# -----------------------------
+# --------------------- Streamlit UI ---------------------
 
 st.title('Professional Algo Trading Dashboard')
-st.markdown('''
-This app fetches market data from yfinance, computes indicators manually, performs multi-timeframe
-analysis, ratio analysis, volatility bins, pattern detection, distribution and Z-score analysis,
-and produces a weighted trading recommendation.
-''')
 
-col1, col2, col3 = st.columns([3,2,2])
-with col1:
-    ticker1 = st.selectbox('Ticker 1 (or enter custom)', options=list(PRESET_TICKERS.keys()) + ['Custom'], index=0)
-    if ticker1 == 'Custom':
-        t1_input = st.text_input('Enter yfinance ticker for Ticker 1', value='^NSEI')
-        ticker1_sym = t1_input.strip()
-    else:
-        ticker1_sym = PRESET_TICKERS[ticker1]
-with col2:
-    ratio_enabled = st.checkbox('Enable Ratio Analysis (Ticker 2)', value=False)
-    if ratio_enabled:
-        ticker2 = st.selectbox('Ticker 2 (or enter custom)', options=list(PRESET_TICKERS.keys()) + ['Custom'], index=1)
-        if ticker2 == 'Custom':
-            t2_input = st.text_input('Enter yfinance ticker for Ticker 2', value='INR=X')
-            ticker2_sym = t2_input.strip()
-        else:
-            ticker2_sym = PRESET_TICKERS[ticker2]
-    else:
-        ticker2_sym = None
-with col3:
-    interval = st.selectbox('Interval', ['1m','3m','5m','10m','15m','30m','60m','120m','240m','1d'], index=4)
-    period = st.selectbox('Period', ['1d','5d','7d','1mo','3mo','6mo','1y','2y','3y','5y'], index=3)
-    delay = st.slider('API delay between calls (s)', min_value=0.5, max_value=5.0, value=DEFAULT_DELAY, step=0.1)
+# Sidebar configuration
+with st.sidebar:
+    st.header('Data & Fetch Settings')
+    ticker1 = st.text_input('Ticker 1 (yfinance)', value='^NSEI')
+    enable_ratio = st.checkbox('Enable Ratio Analysis (Ticker 2)?')
+    ticker2 = st.text_input('Ticker 2 (yfinance)', value='^NSEBANK' if enable_ratio else '') if enable_ratio else ''
+    interval = st.selectbox('Interval', options=list(TF_MAP.keys()), index=2)
+    period = st.selectbox('Period', options=PERIOD_CHOICES, index=3)
+    api_delay = st.slider('API delay between calls (seconds)', min_value=0.0, max_value=5.0, value=1.5, step=0.1)
+    move_threshold = st.number_input('Significant move threshold (points)', value=30)
+    st.markdown('---')
+    st.markdown('Export / Display options')
+    show_raw = st.checkbox('Show raw OHLCV data', value=False)
+    st.markdown('---')
 
-col4, col5 = st.columns([1,3])
-with col4:
-    fetch_btn = st.button('Fetch Data & Analyze')
-    download_all_csv = st.button('Export Latest Data')
-with col5:
-    move_threshold = st.number_input('Pattern detect move threshold (points)', value=30)
-    z_window = st.number_input('Z-score window (returns)', value=50)
+# session state for results
+if 'results' not in st.session_state:
+    st.session_state['results'] = {}
 
-# -----------------------------
-# Main operation
-# -----------------------------
+# Fetch button triggers heavy processing
+if st.button('Fetch Data & Analyze'):
+    st.info('Fetching data — please do not click again. Progress bars will show status.')
+    progress = st.progress(0)
+    try:
+        # Fetch ticker1
+        progress.progress(5)
+        df1 = fetch_with_delay(ticker1, TF_MAP[interval]['interval'], period, api_delay)
+        if df1.empty:
+            st.error(f'No data for {ticker1}. Try different ticker or timeframe.')
+            st.stop()
+        progress.progress(20)
 
-if fetch_btn:
-    # Fetch ticker1
-    with st.spinner('Fetching Ticker 1 data...'):
+        df2 = None
+        if enable_ratio and ticker2:
+            progress.progress(25)
+            df2 = fetch_with_delay(ticker2, TF_MAP[interval]['interval'], period, api_delay)
+            if df2.empty:
+                st.warning(f'No data for {ticker2}. Disabling ratio analysis.')
+                enable_ratio = False
+            progress.progress(40)
+
+        # calculate indicators for df1
+        progress.progress(45)
+        df1['SMA20'] = sma(df1['Close'], 20)
+        df1['SMA50'] = sma(df1['Close'], 50)
+        df1['EMA9'] = ema(df1['Close'], 9)
+        df1['EMA20'] = ema(df1['Close'], 20)
+        df1['EMA50'] = ema(df1['Close'], 50)
+        df1['EMA200'] = ema(df1['Close'], 200)
+        df1['RSI14'] = rsi(df1['Close'], 14)
+        df1['ATR14'] = atr(df1, 14)
         try:
-            df1 = fetch_yf(ticker1_sym, interval=interval, period=period, delay=delay)
-        except Exception as e:
-            st.error(f'Error fetching ticker1: {e}')
-            df1 = pd.DataFrame()
-    if df1.empty:
-        st.error('Ticker 1 returned no data. Check ticker or try different interval/period.')
-    else:
-        st.session_state['data']['ticker1'] = df1
+            df1['VWAP'] = vwap(df1)
+        except Exception:
+            df1['VWAP'] = np.nan
+        progress.progress(60)
 
-    # Fetch ticker2 if enabled
-    if ratio_enabled and ticker2_sym:
-        with st.spinner('Fetching Ticker 2 data...'):
+        if enable_ratio and df2 is not None:
+            df2['SMA20'] = sma(df2['Close'], 20)
+            df2['SMA50'] = sma(df2['Close'], 50)
+            df2['EMA9'] = ema(df2['Close'], 9)
+            df2['EMA20'] = ema(df2['Close'], 20)
+            df2['EMA50'] = ema(df2['Close'], 50)
+            df2['EMA200'] = ema(df2['Close'], 200)
+            df2['RSI14'] = rsi(df2['Close'], 14)
+            df2['ATR14'] = atr(df2, 14)
             try:
-                df2 = fetch_yf(ticker2_sym, interval=interval, period=period, delay=delay)
-            except Exception as e:
-                st.error(f'Error fetching ticker2: {e}')
-                df2 = pd.DataFrame()
-        if df2.empty:
-            st.warning('Ticker 2 returned no data. Ratio analysis disabled.')
-            st.session_state['data'].pop('ticker2', None)
-            ratio_enabled = False
-            ticker2_sym = None
-        else:
-            st.session_state['data']['ticker2'] = df2
+                df2['VWAP'] = vwap(df2)
+            except Exception:
+                df2['VWAP'] = np.nan
+            progress.progress(70)
 
-    # Now compute indicators for each
-    if 'ticker1' in st.session_state['data']:
-        df = st.session_state['data']['ticker1']
-        df['RSI'] = rsi(df['Close'])
-        for p in [9,20,21,33,50,100,150,200]:
-            df[f'EMA_{p}'] = ema(df['Close'], p)
-        for p in [20,50,100,150,200]:
-            df[f'SMA_{p}'] = sma(df['Close'], p)
-        df['ATR_14'] = atr(df, 14)
-        df['Volatility'] = compute_volatility(df)
-        st.session_state['data']['ticker1'] = df
+        # Ratio dataframe
+        ratio_df = None
+        if enable_ratio and df2 is not None:
+            # align lengths — resample or inner join on DateTime
+            merged = pd.merge_asof(df1[['DateTime','Close']].rename(columns={'Close':'Close1'}),
+                                   df2[['DateTime','Close']].rename(columns={'Close':'Close2'}),
+                                   on='DateTime', direction='nearest', tolerance=pd.Timedelta("1h"))
+            merged.dropna(inplace=True)
+            ratio_df = pd.DataFrame()
+            ratio_df['DateTime'] = merged['DateTime']
+            ratio_df['Price1'] = merged['Close1']
+            ratio_df['Price2'] = merged['Close2']
+            ratio_df['Ratio'] = ratio_df['Price1'] / ratio_df['Price2']
+            ratio_df['RatioReturns'] = ratio_df['Ratio'].pct_change()
+            ratio_df['RSI_Ratio'] = rsi(ratio_df['Ratio'].fillna(method='ffill'), 14)
+            progress.progress(78)
 
-    if ratio_enabled and 'ticker2' in st.session_state['data']:
-        df = st.session_state['data']['ticker2']
-        df['RSI'] = rsi(df['Close'])
-        for p in [9,20,21,33,50,100,150,200]:
-            df[f'EMA_{p}'] = ema(df['Close'], p)
-        for p in [20,50,100,150,200]:
-            df[f'SMA_{p}'] = sma(df['Close'], p)
-        df['ATR_14'] = atr(df, 14)
-        df['Volatility'] = compute_volatility(df)
-        st.session_state['data']['ticker2'] = df
+        # Multi-timeframe summary (quick approximation using current df1/df2)
+        mt_cols = ['Timeframe','Trend','MaxClose','MinClose','Fib_Levels','Volatility','PctChange','PointsChange','RSI','RSI_status']
+        mt_rows = []
+        # We'll compute for a pre-defined set based on user request
+        multi_tf_requested = [
+            ('1m','7d'),('5m','1mo'),('15m','1mo'),('30m','2mo'),('1h','3mo'),('2h','6mo'),('4h','1y'),('1d','5y')
+        ]
+        ix = 80
+        for tf, pr in multi_tf_requested:
+            progress.progress(ix)
+            raw = fetch_yfinance(ticker1, interval=TF_MAP.get(tf, {'interval':tf})['interval'], period=pr)
+            if raw.empty:
+                continue
+            maxc = raw['Close'].max()
+            minc = raw['Close'].min()
+            fib = fib_levels(maxc, minc)
+            vol = raw['Close'].pct_change().std() * 100
+            pctchg = (raw['Close'].iloc[-1] - raw['Close'].iloc[0]) / raw['Close'].iloc[0] * 100
+            points = raw['Close'].iloc[-1] - raw['Close'].iloc[0]
+            rsi_val = rsi(raw['Close']).iloc[-1]
+            rsi_status = 'Neutral'
+            if rsi_val <= 30:
+                rsi_status = 'Oversold'
+            elif rsi_val >= 70:
+                rsi_status = 'Overbought'
+            trend = 'Up' if pctchg>0 else 'Down' if pctchg<0 else 'Neutral'
+            mt_rows.append({
+                'Timeframe': tf,
+                'Trend': trend,
+                'MaxClose': maxc,
+                'MinClose': minc,
+                'Fib_Levels': fib,
+                'Volatility': vol,
+                'PctChange': pctchg,
+                'PointsChange': points,
+                'RSI': rsi_val,
+                'RSI_status': rsi_status
+            })
+            ix += 2
+        progress.progress(92)
 
-    st.success('Data fetched and indicators computed.')
+        # Volatility bins
+        returns = df1['Close'].pct_change().fillna(0)
+        vol_series = returns.rolling(window=20, min_periods=1).std() * 100
+        vol_df = pd.DataFrame({'DateTime':df1['DateTime'], 'VolPct': vol_series, 'Price': df1['Close']})
+        vol_df['Bin'] = pd.qcut(vol_df['VolPct'].fillna(0)+1e-9, 5, labels=False, duplicates='drop')
+        progress.progress(95)
 
-# Export
-if download_all_csv:
-    if 'ticker1' not in st.session_state['data']:
-        st.warning('No data to export. Fetch data first.')
-    else:
-        buf = io.BytesIO()
-        writer = pd.ExcelWriter(buf, engine='xlsxwriter')
-        st.session_state['data']['ticker1'].to_excel(writer, sheet_name='ticker1', index=False)
-        if 'ticker2' in st.session_state['data']:
-            st.session_state['data']['ticker2'].to_excel(writer, sheet_name='ticker2', index=False)
-        writer.save()
-        st.download_button('Download Excel', data=buf.getvalue(), file_name='market_data.xlsx', mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+        # Pattern detection
+        patterns = detect_patterns(df1, move_threshold_points=move_threshold)
+        progress.progress(98)
 
-# -----------------------------
-# Display: Basic metrics
-# -----------------------------
-if 'ticker1' in st.session_state['data']:
-    df1 = st.session_state['data']['ticker1']
-    latest = df1.iloc[-1]
-    prev = df1.iloc[0]
+        # Statistical distribution & z-score
+        returns_points = df1['Close'].diff().fillna(0)
+        stats = stats_summary(returns_points)
+        zscores = zscore(returns_points.fillna(0))
+        z_df = pd.DataFrame({'DateTime':df1['DateTime'], 'ReturnsPoints': returns_points, 'ZScore': zscores})
 
-    colA, colB, colC = st.columns(3)
-    with colA:
-        st.metric('Ticker 1 Price', f"{latest['Close']:.2f}", delta=f"{((latest['Close']/prev['Close']-1)*100):.2f}%")
-    if 'ticker2' in st.session_state['data']:
-        df2 = st.session_state['data']['ticker2']
-        latest2 = df2.iloc[-1]
-        prev2 = df2.iloc[0]
-        with colB:
-            st.metric('Ticker 2 Price', f"{latest2['Close']:.2f}", delta=f"{((latest2['Close']/prev2['Close']-1)*100):.2f}%")
-        with colC:
-            ratio_val = latest['Close'] / latest2['Close'] if latest2['Close'] != 0 else np.nan
-            st.metric('Ratio (T1/T2)', f"{ratio_val:.4f}")
-    else:
-        with colB:
-            st.write('')
-        with colC:
-            st.write('')
+        # Save in session
+        st.session_state['results'] = {
+            'df1': df1,
+            'df2': df2,
+            'ratio_df': ratio_df,
+            'mt_rows': mt_rows,
+            'vol_df': vol_df,
+            'patterns': patterns,
+            'z_df': z_df,
+            'stats': stats
+        }
+        progress.progress(100)
+        st.success('Analysis complete! Scroll down to view results.')
+    except Exception as e:
+        st.error(f'Unexpected error during analysis: {e}')
 
-# -----------------------------
-# Ratio analysis
-# -----------------------------
-if ratio_enabled and 'ticker1' in st.session_state['data'] and 'ticker2' in st.session_state['data']:
-    st.subheader('Ratio Analysis')
-    df1 = st.session_state['data']['ticker1'].set_index('DateTime')
-    df2 = st.session_state['data']['ticker2'].set_index('DateTime')
-    # align by index
-    merged = pd.concat([df1['Close'], df2['Close']], axis=1, join='inner')
-    merged.columns = ['T1_Close','T2_Close']
-    merged = merged.dropna()
-    merged['Ratio'] = merged['T1_Close'] / merged['T2_Close']
-    merged['RSI_T1'] = rsi(merged['T1_Close'])
-    merged['RSI_T2'] = rsi(merged['T2_Close'])
-    merged['RSI_Ratio'] = rsi(merged['Ratio'])
-    merged = merged.reset_index()
+# --------------------- Display Section ---------------------
 
-    # Ratio bins
-    merged['Ratio_Bin'] = assign_bins(merged['Ratio'], bins=5)
-    st.dataframe(merged.head(200))
+res = st.session_state.get('results', None)
+if res:
+    df1 = res['df1']
+    df2 = res.get('df2')
+    ratio_df = res.get('ratio_df')
 
-    # Binning summary
-    bin_summary = merged.groupby('Ratio_Bin').agg(
-        T1_Return_Pts=('T1_Close', lambda x: x.iloc[-1] - x.iloc[0]),
-        T1_Return_Pct=('T1_Close', lambda x: (x.iloc[-1]/x.iloc[0]-1)*100),
-        T2_Return_Pts=('T2_Close', lambda x: x.iloc[-1] - x.iloc[0]),
-        T2_Return_Pct=('T2_Close', lambda x: (x.iloc[-1]/x.iloc[0]-1)*100),
-        Count=('Ratio', 'count')
-    ).reset_index()
-    st.table(bin_summary)
-    csv = merged.to_csv(index=False).encode('utf-8')
-    st.download_button('Export Ratio CSV', data=csv, file_name='ratio_analysis.csv', mime='text/csv')
+    st.header('Market Overview')
+    c1, c2, c3 = st.columns([2,2,6])
+    with c1:
+        last_price = df1['Close'].iloc[-1]
+        prev = df1['Close'].iloc[-2] if len(df1)>1 else last_price
+        pct = (last_price-prev)/prev*100 if prev!=0 else 0
+        st.metric(label=f'{ticker1} Last Price', value=round(last_price,2), delta=f"{round(pct,2)}%")
+    with c2:
+        if df2 is not None:
+            last_price2 = df2['Close'].iloc[-1]
+            prev2 = df2['Close'].iloc[-2] if len(df2)>1 else last_price2
+            pct2 = (last_price2-prev2)/prev2*100 if prev2!=0 else 0
+            st.metric(label=f'{ticker2} Last Price', value=round(last_price2,2), delta=f"{round(pct2,2)}%")
+    with c3:
+        st.write('Key Stats')
+        st.write(res['stats'])
 
-# -----------------------------
-# Multi-timeframe analysis
-# -----------------------------
-if 'ticker1' in st.session_state['data']:
-    st.subheader('Multi-Timeframe Analysis (Ticker 1)')
-    # timeframe mapping: label -> interval
-    timeframe_map = {
-        '1m/1d': '1m',
-        '5m/5d': '5m',
-        '15m/5d': '15m',
-        '30m/1mo': '30m',
-        '1h/1mo': '60m',
-        '2h/3mo': '120m',
-        '4h/6mo': '240m',
-        '1d/1y': '1d',
-        '1w/5y': '1wk',
-        '1mo/10y': '1mo'
-    }
-    period_map = {
-        '1m/1d':'1d','5m/5d':'5d','15m/5d':'5d','30m/1mo':'1mo','1h/1mo':'1mo','2h/3mo':'3mo','4h/6mo':'6mo','1d/1y':'1y','1w/5y':'5y','1mo/10y':'10y'
-    }
-    if st.button('Run Multi-Timeframe Analysis for Ticker 1'):
-        mtf_df = aggregate_timeframes(ticker1_sym, interval, timeframe_map, period_map, delay)
-        st.dataframe(mtf_df)
-        st.session_state['data']['mtf1'] = mtf_df
+    if show_raw:
+        st.subheader('Raw OHLCV - Ticker 1')
+        st.dataframe(df1)
+        if df2 is not None:
+            st.subheader('Raw OHLCV - Ticker 2')
+            st.dataframe(df2)
 
-# -----------------------------
-# Volatility bins
-# -----------------------------
-if 'ticker1' in st.session_state['data']:
-    st.subheader('Volatility Bins (Ticker 1)')
-    df = st.session_state['data']['ticker1']
-    df = df.set_index('DateTime')
-    df['VolatilityVal'] = compute_volatility(df)
-    df['VolBin'] = assign_bins(df['VolatilityVal'], bins=5)
-    vol_summary = df.groupby('VolBin').agg(
-        VolMean=('VolatilityVal','mean'),
-        MaxReturnPts=('Close', lambda x: x.diff().max()),
-        MinReturnPts=('Close', lambda x: x.diff().min()),
-        Count=('Close','count')
-    ).reset_index()
-    st.table(vol_summary)
+    # Ratio analysis
+    if ratio_df is not None:
+        st.header('Ratio Analysis')
+        st.dataframe(ratio_df.head(200))
+        # Binning explicit ranges
+        n_bins = 5
+        ratio_df['Bin'] = pd.qcut(ratio_df['Ratio'], q=n_bins, duplicates='drop')
+        bin_summary = ratio_df.groupby('Bin').agg({'Price1':['mean','last'], 'Price2':['mean','last'], 'Ratio':['mean','count']})
+        st.subheader('Ratio Bins Summary')
+        st.dataframe(bin_summary)
+        csv = ratio_df.to_csv(index=False).encode('utf-8')
+        st.download_button('Download Ratio CSV', data=csv, file_name=f'ratio_{ticker1}_{ticker2}.csv')
 
-# -----------------------------
-# Pattern recognition
-# -----------------------------
-if 'ticker1' in st.session_state['data']:
-    st.subheader('Pattern Recognition (Ticker 1)')
-    df = st.session_state['data']['ticker1']
-    pat_df = detect_patterns(df, move_threshold=move_threshold)
-    if not pat_df.empty:
-        st.write(f"Detected {len(pat_df)} moves above threshold")
-        st.dataframe(pat_df)
-    else:
-        st.write('No significant patterns detected for the given threshold.')
+        # Charts for ratio (stacked vertically)
+        st.subheader('Ratio Charts')
+        fig = make_subplots(rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.03)
+        # Price1
+        fig.add_trace(go.Candlestick(x=df1['DateTime'], open=df1['Open'], high=df1['High'], low=df1['Low'], close=df1['Close'], name=f'{ticker1}'), row=1, col=1)
+        fig.add_trace(go.Scatter(x=df1['DateTime'], y=df1['EMA20'], name='EMA20'), row=1, col=1)
+        # Price2
+        fig.add_trace(go.Candlestick(x=df2['DateTime'], open=df2['Open'], high=df2['High'], low=df2['Low'], close=df2['Close'], name=f'{ticker2}'), row=2, col=1)
+        fig.add_trace(go.Scatter(x=df2['DateTime'], y=df2['EMA20'], name='EMA20'), row=2, col=1)
+        # Ratio
+        fig.add_trace(go.Scatter(x=ratio_df['DateTime'], y=ratio_df['Ratio'], name='Ratio'), row=3, col=1)
+        fig.update_layout(height=900)
+        st.plotly_chart(fig, use_container_width=True)
 
-# -----------------------------
-# Charts
-# -----------------------------
-if 'ticker1' in st.session_state['data']:
-    st.subheader('Interactive Charts')
-    df = st.session_state['data']['ticker1']
-    fig = go.Figure()
-    fig.add_trace(go.Candlestick(x=df['DateTime'], open=df['Open'], high=df['High'], low=df['Low'], close=df['Close'], name='Price'))
+    # Single ticker charts
+    st.header('Price & Indicators - Ticker 1')
+    fig2 = make_subplots(rows=2, cols=1, shared_xaxes=True, row_heights=[0.7,0.3])
+    fig2.add_trace(go.Candlestick(x=df1['DateTime'], open=df1['Open'], high=df1['High'], low=df1['Low'], close=df1['Close'], name=f'{ticker1}'), row=1, col=1)
     # EMA overlays
-    for p in [20,50,200]:
-        if f'EMA_{p}' in df.columns:
-            fig.add_trace(go.Scatter(x=df['DateTime'], y=df[f'EMA_{p}'], name=f'EMA {p}'))
-    fig.update_layout(height=450)
-    st.plotly_chart(fig, use_container_width=True)
+    fig2.add_trace(go.Scatter(x=df1['DateTime'], y=df1['EMA20'], name='EMA20', opacity=0.8), row=1, col=1)
+    fig2.add_trace(go.Scatter(x=df1['DateTime'], y=df1['EMA50'], name='EMA50', opacity=0.8), row=1, col=1)
     # RSI
-    rfig = go.Figure()
-    rfig.add_trace(go.Scatter(x=df['DateTime'], y=df['RSI'], name='RSI'))
-    rfig.update_layout(height=200)
-    st.plotly_chart(rfig, use_container_width=True)
+    fig2.add_trace(go.Scatter(x=df1['DateTime'], y=df1['RSI14'], name='RSI14'), row=2, col=1)
+    fig2.update_layout(height=700)
+    st.plotly_chart(fig2, use_container_width=True)
 
-# -----------------------------
-# Distribution & Z-score
-# -----------------------------
-if 'ticker1' in st.session_state['data']:
-    st.subheader('Statistical Distribution & Z-score')
-    df = st.session_state['data']['ticker1']
-    df['Returns'] = df['Close'].pct_change()
-    returns = df['Returns'].dropna()
-    mu = returns.mean()
-    sd = returns.std()
-    skew = stats.skew(returns.dropna())
-    kurt = stats.kurtosis(returns.dropna())
-    st.write(f'Mean: {mu:.6f}, Std: {sd:.6f}, Skewness: {skew:.4f}, Kurtosis: {kurt:.4f}')
-    # Histogram
-    hist_fig = px.histogram(returns, nbins=80, marginal='box', title='Returns Distribution')
-    st.plotly_chart(hist_fig, use_container_width=True)
-    # Z-score table
-    df['ZScore'] = zscore(df['Close'].pct_change().fillna(0)).rolling(z_window, min_periods=1).mean()
-    ztable = df[['DateTime','Returns','ZScore']].tail(200)
-    st.dataframe(ztable)
+    # Multi-timeframe table
+    st.header('Multi-timeframe Analysis (Ticker 1)')
+    mt_df = pd.DataFrame(res['mt_rows'])
+    st.dataframe(mt_df)
 
-# -----------------------------
-# Final recommendation
-# -----------------------------
-if 'mtf1' in st.session_state['data'] and 'ticker1' in st.session_state['data']:
-    st.subheader('Final Trading Recommendation (Ticker 1)')
-    mtf_df = st.session_state['data']['mtf1']
-    df = st.session_state['data']['ticker1']
-    rsi_val = float(df['RSI'].iloc[-1])
-    recent_returns = df['Close'].pct_change().dropna().tail(z_window)
-    z_val = float(zscore(recent_returns).iloc[-1]) if not recent_returns.empty else 0
-    sig = generate_signal(mtf_df, rsi_val, z_val)
-    st.metric('Signal', sig['recommendation'], delta=f"Score: {sig['score']:.3f}")
-    # Position sizing example
-    st.write('Position Sizing (example):')
-    capital = st.number_input('Trading Capital (INR)', value=20000)
-    risk_pct = st.number_input('Risk per trade (%)', value=1.0)
-    atr_val = float(df['ATR_14'].iloc[-1]) if 'ATR_14' in df.columns else 0
-    if atr_val>0:
-        stop_loss = df['Close'].iloc[-1] - atr_val * 1.5 if sig['recommendation'] in ['Buy','Strong Buy'] else df['Close'].iloc[-1] + atr_val * 1.5
-        rr = abs(( (df['Close'].iloc[-1] - stop_loss) / (atr_val if atr_val!=0 else 1)))
-        size = (capital * (risk_pct/100)) / abs(df['Close'].iloc[-1] - stop_loss) if abs(df['Close'].iloc[-1] - stop_loss)>0 else 0
-        st.write(f"Entry: {df['Close'].iloc[-1]:.2f}, Stop: {stop_loss:.2f}, Position size: {size:.2f} units, ATR: {atr_val:.4f}")
+    # Volatility bins
+    st.header('Volatility Bins')
+    st.dataframe(res['vol_df'].head(200))
 
-st.markdown('---')
-st.caption('This is a comprehensive example app. For production use, further hardening, backtesting, and risk controls are required.')
+    # Pattern detection
+    st.header('Pattern Detection Summary')
+    st.write('Total significant patterns found:', len(res['patterns'][res['patterns']['IsSignificant']==True]))
+    st.dataframe(res['patterns'].head(200))
+
+    # Statistical distribution and Z-score
+    st.header('Statistical Distribution & Z-Score')
+    col1, col2 = st.columns(2)
+    with col1:
+        st.write('Return stats:')
+        st.json(res['stats'])
+    with col2:
+        st.write('Z-score head:')
+        st.dataframe(res['z_df'].head(200))
+
+    # Final trading recommendation (basic multi-factor aggregator)
+    st.header('Final Trading Recommendation')
+    # multi-factor scoring based on latest values
+    try:
+        latest = df1.iloc[-1]
+        tf_score = 1 if mt_df.iloc[0]['Trend']=='Up' else -1
+        rsi_val = latest['RSI14']
+        rsi_score = 1 if rsi_val < 40 else -1 if rsi_val>60 else 0
+        z = res['z_df']['ZScore'].iloc[-1]
+        z_score = 1 if abs(z)>1 else 0
+        ema_align = 1 if (latest['EMA20']>latest['EMA50']>latest['EMA200']) else -1
+        combined = 0.3*tf_score + 0.2*rsi_score + 0.2*z_score + 0.3*ema_align
+        strength = 'Neutral'
+        if combined>0.3:
+            strength='Buy'
+        elif combined<-0.3:
+            strength='Sell'
+        else:
+            strength='Hold'
+
+        st.markdown(f"**Signal:** {strength}  
+                    **Combined Score:** {round(combined,3)}")
+        # Risk management
+        atr_val = latest['ATR14'] if 'ATR14' in latest else df1['ATR14'].iloc[-1]
+        entry = latest['Close']
+        target = entry + 2*atr_val if strength=='Buy' else entry - 2*atr_val if strength=='Sell' else np.nan
+        stop = entry - 1*atr_val if strength=='Buy' else entry + 1*atr_val if strength=='Sell' else np.nan
+        rr = abs((target-entry)/ (entry-stop)) if (not np.isnan(target) and not np.isnan(stop) and (entry-stop)!=0) else np.nan
+        st.write({'Entry':entry, 'Target':target, 'Stop':stop, 'RR':rr})
+    except Exception as e:
+        st.write('Could not compute final recommendation:', e)
+
+    # Exports
+    st.subheader('Export Data')
+    if st.button('Export Ticker1 to Excel'):
+        towrite = to_excel_bytes(df1)
+        st.download_button('Download Excel', data=towrite, file_name=f'{ticker1}_data.xlsx')
+    if df2 is not None and st.button('Export Ticker2 to Excel'):
+        towrite = to_excel_bytes(df2)
+        st.download_button('Download Excel', data=towrite, file_name=f'{ticker2}_data.xlsx')
+
+    st.markdown('---')
+    st.caption('End of analysis. Extend pattern rules and tweak weights for your strategy.')
+else:
+    st.info('Click "Fetch Data & Analyze" to run analysis. Results persist in session state.')
+
+# --------------------- End of App ---------------------
+
+# Developer notes (not displayed):
+# - Extend pattern detection for divergence, liquidity sweeps, smart-money footprints.
+# - Add hypothesis testing and p-value calculations where required.
+# - Add more robust multi-timeframe aggregation using resampling and proper alignment.
+# - Consider streaming websocket for live LTP but keep fetch button for API rate safety.
