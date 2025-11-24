@@ -205,21 +205,44 @@ def create_ratio_binning_analysis(df1, df2, df_ratio):
     try:
         st.subheader("📊 Ratio Binning Analysis")
         
+        # Ensure all dataframes have same length
+        min_len = min(len(df1), len(df2), len(df_ratio))
+        df1 = df1.iloc[:min_len].reset_index(drop=True)
+        df2 = df2.iloc[:min_len].reset_index(drop=True)
+        df_ratio = df_ratio.iloc[:min_len].reset_index(drop=True)
+        
         # Create bins
         ratio_values = df_ratio['Ratio'].dropna()
-        bins = pd.qcut(ratio_values, q=5, duplicates='drop')
-        df_ratio['Ratio_Bin'] = pd.qcut(df_ratio['Ratio'], q=5, duplicates='drop', labels=False)
+        
+        if len(ratio_values) < 5:
+            st.warning("Not enough data points for ratio binning analysis")
+            return
+        
+        # Create bins with error handling
+        try:
+            df_ratio['Ratio_Bin'] = pd.qcut(df_ratio['Ratio'], q=5, duplicates='drop', labels=False)
+        except:
+            # If qcut fails, use cut instead
+            df_ratio['Ratio_Bin'] = pd.cut(df_ratio['Ratio'], bins=5, labels=False)
+        
+        # Calculate returns - ensure same length
+        df1_close = pd.Series(df1['Close'].values[:min_len])
+        df2_close = pd.Series(df2['Close'].values[:min_len])
         
         # Merge with price data
         analysis_df = df_ratio.copy()
-        analysis_df['Ticker1_Return'] = df1['Close'].pct_change()
-        analysis_df['Ticker2_Return'] = df2['Close'].pct_change()
+        analysis_df['Ticker1_Return'] = df1_close.pct_change()
+        analysis_df['Ticker2_Return'] = df2_close.pct_change()
         
         # Calculate statistics per bin
         bin_stats = []
         for bin_num in sorted(analysis_df['Ratio_Bin'].dropna().unique()):
             bin_data = analysis_df[analysis_df['Ratio_Bin'] == bin_num]
-            bin_range = f"{bin_data['Ratio'].min():.2f} - {bin_data['Ratio'].max():.2f}"
+            
+            if len(bin_data) == 0:
+                continue
+                
+            bin_range = f"{bin_data['Ratio'].min():.4f} - {bin_data['Ratio'].max():.4f}"
             
             bin_stats.append({
                 'Bin': f"Bin {int(bin_num)+1} ({bin_range})",
@@ -228,6 +251,10 @@ def create_ratio_binning_analysis(df1, df2, df_ratio):
                 'Count': len(bin_data)
             })
         
+        if not bin_stats:
+            st.warning("Could not generate bin statistics")
+            return
+            
         bin_df = pd.DataFrame(bin_stats)
         
         # Style the dataframe
@@ -242,20 +269,25 @@ def create_ratio_binning_analysis(df1, df2, df_ratio):
         
         # Current bin analysis
         current_ratio = df_ratio['Ratio'].iloc[-1]
-        current_bin = analysis_df[analysis_df['Ratio'].notna()].iloc[-1]['Ratio_Bin']
+        current_bin_val = analysis_df[analysis_df['Ratio'].notna()].iloc[-1]['Ratio_Bin']
         
-        st.markdown(f"""
-        **Current Ratio: {current_ratio:.4f}**
-        
-        **Current Bin: Bin {int(current_bin)+1}**
-        
-        **Insight:** Based on historical data, when ratio is in this range, 
-        Ticker 1 typically shows {bin_df.iloc[int(current_bin)]['Ticker1_Avg_Return_%']:.2f}% return 
-        and Ticker 2 shows {bin_df.iloc[int(current_bin)]['Ticker2_Avg_Return_%']:.2f}% return.
-        """)
+        if pd.notna(current_bin_val):
+            current_bin = int(current_bin_val)
+            
+            st.markdown(f"""
+            **Current Ratio: {current_ratio:.4f}**
+            
+            **Current Bin: Bin {current_bin+1}**
+            
+            **Insight:** Based on historical data, when ratio is in this range, 
+            Ticker 1 typically shows {bin_df.iloc[current_bin]['Ticker1_Avg_Return_%']:.2f}% return 
+            and Ticker 2 shows {bin_df.iloc[current_bin]['Ticker2_Avg_Return_%']:.2f}% return.
+            """)
         
     except Exception as e:
         st.error(f"Error in ratio binning: {str(e)}")
+        import traceback
+        st.code(traceback.format_exc())
 
 def create_multi_timeframe_analysis(ticker, ticker_name):
     """Create comprehensive multi-timeframe analysis"""
@@ -1112,10 +1144,10 @@ def main():
             st.session_state.enable_ratio = enable_ratio
             st.success("✅ Data fetched successfully!")
     
-    # Display Analysis if data is fetched
+            # Display Analysis if data is fetched
     if st.session_state.data_fetched and st.session_state.df1 is not None:
-        df1 = st.session_state.df1
-        df2 = st.session_state.df2
+        df1 = st.session_state.df1.copy()
+        df2 = st.session_state.df2.copy() if st.session_state.df2 is not None else None
         ticker1_name = st.session_state.ticker1_name
         ticker2_name = st.session_state.ticker2_name
         enable_ratio = st.session_state.enable_ratio
@@ -1123,7 +1155,10 @@ def main():
         # Basic Statistics
         st.header("📊 Market Overview")
         
-        col1, col2, col3, col4 = st.columns(4)
+        if enable_ratio and df2 is not None:
+            col1, col2, col3, col4 = st.columns(4)
+        else:
+            col1, col2, col3, col4 = st.columns(4)
         
         with col1:
             current_price1 = df1['Close'].iloc[-1]
@@ -1149,6 +1184,11 @@ def main():
                     value=f"₹{current_price2:.2f}",
                     delta=f"{change2:.2f} ({change_pct2:.2f}%)"
                 )
+            else:
+                st.metric(
+                    label="Period Start Price",
+                    value=f"₹{prev_price1:.2f}"
+                )
         
         with col3:
             if enable_ratio and df2 is not None:
@@ -1157,12 +1197,25 @@ def main():
                     label="Current Ratio",
                     value=f"{ratio:.4f}"
                 )
+            else:
+                high_price = df1['High'].max()
+                st.metric(
+                    label="Period High",
+                    value=f"₹{high_price:.2f}"
+                )
         
         with col4:
-            st.metric(
-                label="Data Points",
-                value=len(df1)
-            )
+            if enable_ratio and df2 is not None:
+                st.metric(
+                    label="Data Points",
+                    value=len(df1)
+                )
+            else:
+                low_price = df1['Low'].min()
+                st.metric(
+                    label="Period Low",
+                    value=f"₹{low_price:.2f}"
+                )
         
         # Data Table
         st.subheader("📋 Price Data")
@@ -1188,24 +1241,40 @@ def main():
         if enable_ratio and df2 is not None:
             st.header("📊 Ratio Analysis")
             
-            # Align dataframes
-            df1_aligned = df1.set_index('Datetime')
-            df2_aligned = df2.set_index('Datetime')
+            # Align dataframes by finding common dates
+            df1_copy = df1.copy()
+            df2_copy = df2.copy()
+            
+            # Ensure both have Datetime column
+            if 'Datetime' not in df1_copy.columns:
+                df1_copy['Datetime'] = df1_copy.index
+            if 'Datetime' not in df2_copy.columns:
+                df2_copy['Datetime'] = df2_copy.index
+            
+            # Merge on datetime
+            merged = pd.merge(df1_copy[['Datetime', 'Close']], 
+                            df2_copy[['Datetime', 'Close']], 
+                            on='Datetime', 
+                            suffixes=('_T1', '_T2'))
             
             # Create ratio dataframe
             ratio_df = pd.DataFrame()
-            ratio_df['Datetime'] = df1['Datetime']
-            ratio_df['Ticker1_Price'] = df1['Close'].values
-            ratio_df['Ticker2_Price'] = df2['Close'].values
+            ratio_df['Datetime'] = merged['Datetime']
+            ratio_df['Ticker1_Price'] = merged['Close_T1']
+            ratio_df['Ticker2_Price'] = merged['Close_T2']
             ratio_df['Ratio'] = ratio_df['Ticker1_Price'] / ratio_df['Ticker2_Price']
-            ratio_df['RSI_Ticker1'] = calculate_rsi(df1['Close']).values
-            ratio_df['RSI_Ticker2'] = calculate_rsi(df2['Close']).values
-            ratio_df['RSI_Ratio'] = calculate_rsi(ratio_df['Ratio'])
+            
+            # Calculate RSI for aligned data
+            ratio_df['RSI_Ticker1'] = calculate_rsi(pd.Series(ratio_df['Ticker1_Price'].values))
+            ratio_df['RSI_Ticker2'] = calculate_rsi(pd.Series(ratio_df['Ticker2_Price'].values))
+            ratio_df['RSI_Ratio'] = calculate_rsi(pd.Series(ratio_df['Ratio'].values))
             
             st.dataframe(ratio_df.tail(20), use_container_width=True)
             
-            # Ratio Binning Analysis
-            create_ratio_binning_analysis(df1, df2, ratio_df)
+            # Ratio Binning Analysis - pass aligned dataframes
+            df1_aligned = df1_copy[df1_copy['Datetime'].isin(merged['Datetime'])].reset_index(drop=True)
+            df2_aligned = df2_copy[df2_copy['Datetime'].isin(merged['Datetime'])].reset_index(drop=True)
+            create_ratio_binning_analysis(df1_aligned, df2_aligned, ratio_df)
         
         # Multi-Timeframe Analysis
         st.header("🔍 Multi-Timeframe Analysis")
@@ -1242,20 +1311,23 @@ def main():
         if enable_ratio and df2 is not None:
             create_statistical_distribution(df2, ticker2_name)
         
-        # Final Trading Recommendation
+        # Trading Signals with proper column handling
         st.header("🎯 Trading Signals")
         
         # Generate recommendations for both tickers
-        col1, col2 = st.columns(2) if enable_ratio and df2 is not None else st.columns(1)
-        
-        with col1:
-            st.markdown(f"### {ticker1_name} Recommendation")
-            generate_final_recommendation(df1, ticker1_name)
-        
         if enable_ratio and df2 is not None:
-            with col2:
+            col_left, col_right = st.columns(2)
+            
+            with col_left:
+                st.markdown(f"### {ticker1_name} Recommendation")
+                generate_final_recommendation(df1, ticker1_name)
+            
+            with col_right:
                 st.markdown(f"### {ticker2_name} Recommendation")
                 generate_final_recommendation(df2, ticker2_name)
+        else:
+            st.markdown(f"### {ticker1_name} Recommendation")
+            generate_final_recommendation(df1, ticker1_name)
         
         # Unified Recommendation Section
         st.markdown("---")
