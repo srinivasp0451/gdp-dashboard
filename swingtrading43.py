@@ -136,6 +136,14 @@ def fetch_data_with_retry(ticker, period, interval, max_retries=3, delay=2):
             time.sleep(delay)  # Rate limiting
             data = yf.download(ticker, period=period, interval=interval, progress=False)
             if not data.empty:
+                # Flatten multi-index columns if present
+                if isinstance(data.columns, pd.MultiIndex):
+                    data.columns = data.columns.get_level_values(0)
+                
+                # Ensure standard column names
+                data.columns = [col.strip().title() for col in data.columns]
+                
+                # Convert to IST
                 return convert_to_ist(data)
             else:
                 st.warning(f"No data returned for {ticker} (Attempt {attempt + 1})")
@@ -1050,4 +1058,4 @@ if st.session_state.data_fetched and st.session_state.df1 is not None:
         <li>Current Return: {current_return:.2f}%</li>
         <li>Z-Score: {current_z:.2f}</li>
         <li>Percentile Rank: {percentile:.1f}%</li>
-        <li>Position: {'<span class="red-text">Extreme (>2σ)</span>' if abs(current_z) > 2 else '<span class="yellow-text">Moderate (1-2σ)</span>' if abs(current_z) > 1 else '<span class="green-text">Normal (±1σ)</span>'}</li>""")
+        <li>Position: {'<span class="red-text">Extreme (>2σ)</span>' if abs(current_z) > 2 else '<span class="yellow-text">Moderate (1-2σ)</span>' if abs(current_z) > 1 else '<span class="green-text">Normal (±1σ)</span>'}</li> """)
