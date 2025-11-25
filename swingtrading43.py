@@ -1058,4 +1058,4 @@ if st.session_state.data_fetched and st.session_state.df1 is not None:
         <li>Current Return: {current_return:.2f}%</li>
         <li>Z-Score: {current_z:.2f}</li>
         <li>Percentile Rank: {percentile:.1f}%</li>
-        <li>Position: {'<span class="red-text">Extreme (>2σ)</span>' if abs(current_z) > 2 else '<span class="yellow-text">Moderate (1-2σ)</span>' if abs(current_z) > 1 else '<span class="green-text">Normal (±1σ)</span>'}</li> """)
+        <li>Position: {'<span class="red-text">Extreme (>2σ)</span>' if abs(current_z) > 2 else '<span class="yellow-text">Moderate (1-2σ)</span>' if abs(current_z) > 1 else '<span class="green-text">Normal (±1σ)</span>'}</li>""")
