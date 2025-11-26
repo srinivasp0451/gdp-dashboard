@@ -31,7 +31,7 @@ st.markdown("""
     .yellow-text {color: #ffaa00; font-weight: bold;}
     .info-box {
         background-color: #e8f4f8;
-        padding: 1rem;
+        padding: 1.5rem;
         border-radius: 0.5rem;
         border-left: 4px solid #1f77b4;
         margin: 1rem 0;
@@ -272,17 +272,8 @@ if st.session_state.data_fetched and st.session_state.df1 is not None:
         df2['RSI'] = calculate_rsi(df2['Close'])
         df2['EMA9'] = calculate_ema(df2['Close'], 9)
         df2['EMA20'] = calculate_ema(df2['Close'], 20)
-        df2['EMA21'] = calculate_ema(df2['Close'], 21)
-        df2['EMA33'] = calculate_ema(df2['Close'], 33)
         df2['EMA50'] = calculate_ema(df2['Close'], 50)
-        df2['EMA100'] = calculate_ema(df2['Close'], 100)
-        df2['EMA150'] = calculate_ema(df2['Close'], 150)
         df2['EMA200'] = calculate_ema(df2['Close'], 200)
-        df2['SMA20'] = calculate_sma(df2['Close'], 20)
-        df2['SMA50'] = calculate_sma(df2['Close'], 50)
-        df2['SMA100'] = calculate_sma(df2['Close'], 100)
-        df2['SMA150'] = calculate_sma(df2['Close'], 150)
-        df2['SMA200'] = calculate_sma(df2['Close'], 200)
         df2['Volatility'] = calculate_volatility(df2['Close'])
         df2['Returns'] = df2['Close'].pct_change() * 100
         df2['Returns_Points'] = df2['Close'].diff()
@@ -300,12 +291,10 @@ if st.session_state.data_fetched and st.session_state.df1 is not None:
     change_pct1 = (change1 / prev_price1) * 100
     
     with col1:
-        color1 = "green" if change1 >= 0 else "red"
         st.metric(
             f"{ticker1} Price",
             f"₹{current_price1:.2f}",
-            f"{change1:+.2f} ({change_pct1:+.2f}%)",
-            delta_color="normal"
+            f"{change1:+.2f} ({change_pct1:+.2f}%)"
         )
     
     if df2 is not None and not df2.empty:
@@ -315,35 +304,21 @@ if st.session_state.data_fetched and st.session_state.df1 is not None:
         change_pct2 = (change2 / prev_price2) * 100
         
         with col2:
-            color2 = "green" if change2 >= 0 else "red"
             st.metric(
                 f"{ticker2} Price",
                 f"₹{current_price2:.2f}",
-                f"{change2:+.2f} ({change_pct2:+.2f}%)",
-                delta_color="normal"
+                f"{change2:+.2f} ({change_pct2:+.2f}%)"
             )
         
         with col3:
             ratio = current_price1 / current_price2
-            st.metric(
-                "Current Ratio",
-                f"{ratio:.4f}",
-                "T1/T2"
-            )
+            st.metric("Current Ratio", f"{ratio:.4f}", "T1/T2")
         
         with col4:
-            st.metric(
-                "Data Points",
-                len(df1),
-                f"{interval} interval"
-            )
+            st.metric("Data Points", len(df1), f"{interval} interval")
     else:
         with col2:
-            st.metric(
-                "Data Points",
-                len(df1),
-                f"{interval} interval"
-            )
+            st.metric("Data Points", len(df1), f"{interval} interval")
         with col3:
             rsi_current = df1['RSI'].iloc[-1]
             rsi_status = "Overbought" if rsi_current > 70 else "Oversold" if rsi_current < 30 else "Neutral"
@@ -353,342 +328,7 @@ if st.session_state.data_fetched and st.session_state.df1 is not None:
     st.subheader("📋 Recent Price Data")
     display_df1 = df1[['Open', 'High', 'Low', 'Close', 'Volume', 'Returns', 'Returns_Points', 'RSI']].tail(20).copy()
     display_df1.index = display_df1.index.strftime('%Y-%m-%d %H:%M:%S')
-    st.dataframe(display_df1.style.format({
-        'Open': '{:.2f}',
-        'High': '{:.2f}',
-        'Low': '{:.2f}',
-        'Close': '{:.2f}',
-        'Volume': '{:,.0f}',
-        'Returns': '{:+.2f}%',
-        'Returns_Points': '{:+.2f}',
-        'RSI': '{:.2f}'
-    }), use_container_width=True)
-    
-    # ===========================================
-    # SECTION 3: RATIO ANALYSIS
-    # ===========================================
-    if enable_ratio and df2 is not None and not df2.empty:
-        st.header("⚖️ Ratio Analysis")
-        
-        # Align dataframes
-        df_ratio = pd.DataFrame()
-        df_ratio['Ticker1_Price'] = df1['Close']
-        df_ratio['Ticker2_Price'] = df2['Close']
-        df_ratio['Ratio'] = df_ratio['Ticker1_Price'] / df_ratio['Ticker2_Price']
-        df_ratio['RSI_T1'] = df1['RSI']
-        df_ratio['RSI_T2'] = df2['RSI']
-        df_ratio['RSI_Ratio'] = calculate_rsi(df_ratio['Ratio'])
-        df_ratio = df_ratio.dropna()
-        
-        # Display Ratio Table
-        st.subheader("📊 Ratio Comparison Table")
-        display_ratio = df_ratio.tail(20).copy()
-        display_ratio.index = display_ratio.index.strftime('%Y-%m-%d %H:%M:%S')
-        st.dataframe(display_ratio.style.format({
-            'Ticker1_Price': '{:.2f}',
-            'Ticker2_Price': '{:.2f}',
-            'Ratio': '{:.4f}',
-            'RSI_T1': '{:.2f}',
-            'RSI_T2': '{:.2f}',
-            'RSI_Ratio': '{:.2f}'
-        }), use_container_width=True)
-        
-        # Export functionality
-        csv = df_ratio.to_csv()
-        st.download_button(
-            label="📥 Download Ratio Data (CSV)",
-            data=csv,
-            file_name=f"ratio_analysis_{ticker1}_{ticker2}_{get_ist_time().strftime('%Y%m%d')}.csv",
-            mime="text/csv"
-        )
-        
-        # Ratio Binning Analysis
-        st.subheader("📊 Ratio Binning Analysis")
-        
-        df_ratio['Ratio_Bin'] = pd.qcut(df_ratio['Ratio'], q=num_bins, duplicates='drop')
-        df_ratio['T1_Returns'] = df1['Returns']
-        df_ratio['T2_Returns'] = df2['Returns']
-        df_ratio['T1_Returns_Points'] = df1['Returns_Points']
-        df_ratio['T2_Returns_Points'] = df2['Returns_Points']
-        
-        # Calculate next candle returns
-        for i in [1, 2, 3, 4, 5]:
-            df_ratio[f'T1_Next_{i}_Returns'] = df_ratio['T1_Returns'].shift(-i)
-            df_ratio[f'T2_Next_{i}_Returns'] = df_ratio['T2_Returns'].shift(-i)
-            df_ratio[f'T1_Next_{i}_Points'] = df_ratio['T1_Returns_Points'].shift(-i)
-            df_ratio[f'T2_Next_{i}_Points'] = df_ratio['T2_Returns_Points'].shift(-i)
-        
-        bin_analysis = df_ratio.groupby('Ratio_Bin').agg({
-            'T1_Returns': ['mean', 'std', 'count'],
-            'T2_Returns': ['mean', 'std', 'count'],
-            'T1_Returns_Points': ['mean', 'std'],
-            'T2_Returns_Points': ['mean', 'std'],
-            'T1_Next_1_Returns': 'mean',
-            'T1_Next_2_Returns': 'mean',
-            'T1_Next_3_Returns': 'mean',
-            'T1_Next_4_Returns': 'mean',
-            'T1_Next_5_Returns': 'mean',
-            'T2_Next_1_Returns': 'mean',
-            'T2_Next_2_Returns': 'mean',
-            'T2_Next_3_Returns': 'mean',
-            'T2_Next_4_Returns': 'mean',
-            'T2_Next_5_Returns': 'mean'
-        }).round(2)
-        
-        st.dataframe(bin_analysis, use_container_width=True)
-        
-        # Current bin analysis
-        current_ratio = df_ratio['Ratio'].iloc[-1]
-        current_bin = df_ratio['Ratio_Bin'].iloc[-1]
-        
-        st.markdown(f"""
-        <div class="info-box">
-        <h4>📍 Current Ratio Bin: {current_bin}</h4>
-        <p><strong>Current Ratio:</strong> {current_ratio:.4f}</p>
-        <p><strong>Historical Performance in This Bin:</strong></p>
-        <ul>
-            <li>{ticker1} Average Return: {bin_analysis.loc[current_bin, ('T1_Returns', 'mean')]:.2f}% ({bin_analysis.loc[current_bin, ('T1_Returns_Points', 'mean')]:+.2f} points)</li>
-            <li>{ticker2} Average Return: {bin_analysis.loc[current_bin, ('T2_Returns', 'mean')]:.2f}% ({bin_analysis.loc[current_bin, ('T2_Returns_Points', 'mean')]:+.2f} points)</li>
-            <li>Occurrences in this bin: {int(bin_analysis.loc[current_bin, ('T1_Returns', 'count')])}</li>
-        </ul>
-        <p><strong>Forecast:</strong> Based on historical patterns, when the ratio is in this range, {ticker1} tends to move {bin_analysis.loc[current_bin, ('T1_Returns', 'mean')]:+.2f}% while {ticker2} tends to move {bin_analysis.loc[current_bin, ('T2_Returns', 'mean')]:+.2f}%.</p>
-        </div>
-        """, unsafe_allow_html=True)
-    
-    # ===========================================
-    # SECTION 4: MULTI-TIMEFRAME ANALYSIS
-    # ===========================================
-    st.header("🕐 Multi-Timeframe Analysis")
-    
-    timeframes = [
-        ("1m", "1d"), ("5m", "5d"), ("15m", "5d"), ("30m", "1mo"),
-        ("1h", "1mo"), ("2h", "3mo"), ("4h", "6mo"), ("1d", "1y"),
-        ("1wk", "5y"), ("1mo", "10y")
-    ]
-    
-    def analyze_timeframe(ticker_symbol, interval_tf, period_tf):
-        """Analyze a single timeframe"""
-        df_tf = fetch_data_with_retry(ticker_symbol, period_tf, interval_tf, delay=api_delay)
-        if df_tf.empty:
-            return None
-        
-        df_tf['RSI'] = calculate_rsi(df_tf['Close'])
-        df_tf['EMA9'] = calculate_ema(df_tf['Close'], 9)
-        df_tf['EMA20'] = calculate_ema(df_tf['Close'], 20)
-        df_tf['EMA21'] = calculate_ema(df_tf['Close'], 21)
-        df_tf['EMA33'] = calculate_ema(df_tf['Close'], 33)
-        df_tf['EMA50'] = calculate_ema(df_tf['Close'], 50)
-        df_tf['EMA100'] = calculate_ema(df_tf['Close'], 100)
-        df_tf['EMA150'] = calculate_ema(df_tf['Close'], 150)
-        df_tf['EMA200'] = calculate_ema(df_tf['Close'], 200)
-        df_tf['SMA20'] = calculate_sma(df_tf['Close'], 20)
-        df_tf['SMA50'] = calculate_sma(df_tf['Close'], 50)
-        df_tf['SMA100'] = calculate_sma(df_tf['Close'], 100)
-        df_tf['SMA150'] = calculate_sma(df_tf['Close'], 150)
-        df_tf['SMA200'] = calculate_sma(df_tf['Close'], 200)
-        df_tf['Volatility'] = calculate_volatility(df_tf['Close'])
-        
-        current_price = df_tf['Close'].iloc[-1]
-        max_price = df_tf['High'].max()
-        min_price = df_tf['Low'].min()
-        
-        fib_levels = calculate_fibonacci_levels(max_price, min_price)
-        support, resistance = find_support_resistance(df_tf['Close'])
-        
-        # Trend determination
-        if current_price > df_tf['EMA20'].iloc[-1] and df_tf['EMA20'].iloc[-1] > df_tf['EMA50'].iloc[-1]:
-            trend = "Up"
-        elif current_price < df_tf['EMA20'].iloc[-1] and df_tf['EMA20'].iloc[-1] < df_tf['EMA50'].iloc[-1]:
-            trend = "Down"
-        else:
-            trend = "Sideways"
-        
-        # RSI status
-        rsi_val = df_tf['RSI'].iloc[-1]
-        if rsi_val > 70:
-            rsi_status = "Overbought"
-        elif rsi_val < 30:
-            rsi_status = "Oversold"
-        else:
-            rsi_status = "Neutral"
-        
-        change = current_price - df_tf['Close'].iloc[0]
-        change_pct = (change / df_tf['Close'].iloc[0]) * 100
-        
-        return {
-            'Timeframe': f"{interval_tf}/{period_tf}",
-            'Trend': trend,
-            'Max_Close': max_price,
-            'Min_Close': min_price,
-            'Fib_0': fib_levels['0.0%'],
-            'Fib_236': fib_levels['23.6%'],
-            'Fib_382': fib_levels['38.2%'],
-            'Fib_50': fib_levels['50.0%'],
-            'Fib_618': fib_levels['61.8%'],
-            'Fib_786': fib_levels['78.6%'],
-            'Fib_100': fib_levels['100.0%'],
-            'Volatility': df_tf['Volatility'].iloc[-1],
-            'Change_%': change_pct,
-            'Change_Points': change,
-            'Support_1': support[0] if len(support) > 0 else np.nan,
-            'Support_2': support[1] if len(support) > 1 else np.nan,
-            'Support_3': support[2] if len(support) > 2 else np.nan,
-            'Resistance_1': resistance[0] if len(resistance) > 0 else np.nan,
-            'Resistance_2': resistance[1] if len(resistance) > 1 else np.nan,
-            'Resistance_3': resistance[2] if len(resistance) > 2 else np.nan,
-            'RSI': rsi_val,
-            'RSI_Status': rsi_status,
-            'EMA9': df_tf['EMA9'].iloc[-1],
-            'EMA20': df_tf['EMA20'].iloc[-1],
-            'EMA21': df_tf['EMA21'].iloc[-1],
-            'EMA33': df_tf['EMA33'].iloc[-1],
-            'EMA50': df_tf['EMA50'].iloc[-1],
-            'EMA100': df_tf['EMA100'].iloc[-1],
-            'EMA150': df_tf['EMA150'].iloc[-1],
-            'EMA200': df_tf['EMA200'].iloc[-1],
-            'Price_vs_EMA9': 'Above' if current_price > df_tf['EMA9'].iloc[-1] else 'Below',
-            'Price_vs_EMA20': 'Above' if current_price > df_tf['EMA20'].iloc[-1] else 'Below',
-            'Price_vs_EMA50': 'Above' if current_price > df_tf['EMA50'].iloc[-1] else 'Below',
-            'Price_vs_EMA100': 'Above' if current_price > df_tf['EMA100'].iloc[-1] else 'Below',
-            'Price_vs_EMA200': 'Above' if current_price > df_tf['EMA200'].iloc[-1] else 'Below',
-            'SMA20': df_tf['SMA20'].iloc[-1],
-            'SMA50': df_tf['SMA50'].iloc[-1],
-            'SMA100': df_tf['SMA100'].iloc[-1],
-            'SMA150': df_tf['SMA150'].iloc[-1],
-            'SMA200': df_tf['SMA200'].iloc[-1],
-            'Price_vs_SMA20': 'Above' if current_price > df_tf['SMA20'].iloc[-1] else 'Below',
-            'Price_vs_SMA50': 'Above' if current_price > df_tf['SMA50'].iloc[-1] else 'Below',
-            'Price_vs_SMA100': 'Above' if current_price > df_tf['SMA100'].iloc[-1] else 'Below',
-            'Price_vs_SMA200': 'Above' if current_price > df_tf['SMA200'].iloc[-1] else 'Below'
-        }
-    
-    # Analyze Ticker 1
-    st.subheader(f"📈 {ticker1} Multi-Timeframe Analysis")
-    with st.spinner(f"Analyzing {ticker1} across multiple timeframes..."):
-        mtf_results1 = []
-        for tf in timeframes:
-            result = analyze_timeframe(ticker1_symbol, tf[0], tf[1])
-            if result:
-                mtf_results1.append(result)
-        
-        if mtf_results1:
-            df_mtf1 = pd.DataFrame(mtf_results1)
-            st.dataframe(df_mtf1.style.format({
-                'Max_Close': '{:.2f}',
-                'Min_Close': '{:.2f}',
-                'Fib_0': '{:.2f}',
-                'Fib_236': '{:.2f}',
-                'Fib_382': '{:.2f}',
-                'Fib_50': '{:.2f}',
-                'Fib_618': '{:.2f}',
-                'Fib_786': '{:.2f}',
-                'Fib_100': '{:.2f}',
-                'Volatility': '{:.2f}%',
-                'Change_%': '{:+.2f}%',
-                'Change_Points': '{:+.2f}',
-                'RSI': '{:.2f}',
-                'EMA9': '{:.2f}',
-                'EMA20': '{:.2f}',
-                'EMA50': '{:.2f}',
-                'EMA200': '{:.2f}',
-                'SMA20': '{:.2f}',
-                'SMA50': '{:.2f}',
-                'SMA200': '{:.2f}'
-            }), use_container_width=True)
-            
-            # Summary for Ticker 1
-            st.markdown(f"""
-            <div class="info-box">
-            <h4>📊 {ticker1} Multi-Timeframe Summary</h4>
-            <p><strong>Overall Trend Assessment:</strong></p>
-            <ul>
-                <li>Bullish Timeframes: {sum(1 for r in mtf_results1 if r['Trend'] == 'Up')}/{len(mtf_results1)}</li>
-                <li>Bearish Timeframes: {sum(1 for r in mtf_results1 if r['Trend'] == 'Down')}/{len(mtf_results1)}</li>
-                <li>Average RSI across timeframes: {np.mean([r['RSI'] for r in mtf_results1]):.2f}</li>
-                <li>Overbought timeframes: {sum(1 for r in mtf_results1 if r['RSI_Status'] == 'Overbought')}/{len(mtf_results1)}</li>
-                <li>Oversold timeframes: {sum(1 for r in mtf_results1 if r['RSI_Status'] == 'Oversold')}/{len(mtf_results1)}</li>
-            </ul>
-            <p><strong>Key Insights:</strong> {'Strong bullish momentum across multiple timeframes. Price consistently above key EMAs.' if sum(1 for r in mtf_results1 if r['Trend'] == 'Up') > len(mtf_results1)/2 else 'Bearish pressure evident. Price struggling below moving averages.' if sum(1 for r in mtf_results1 if r['Trend'] == 'Down') > len(mtf_results1)/2 else 'Mixed signals. Market in consolidation phase.'}</p>
-            <p><strong>Forecast:</strong> {'Upward momentum likely to continue if price holds above EMA20 support.' if sum(1 for r in mtf_results1 if r['Trend'] == 'Up') > len(mtf_results1)/2 else 'Downward pressure may persist. Watch for support at key levels.' if sum(1 for r in mtf_results1 if r['Trend'] == 'Down') > len(mtf_results1)/2 else 'Sideways movement expected. Breakout direction will determine trend.'}</p>
-            </div>
-            """, unsafe_allow_html=True)
-    
-    # Analyze Ticker 2 if enabled
-    if enable_ratio and df2 is not None:
-        st.subheader(f"📈 {ticker2} Multi-Timeframe Analysis")
-        with st.spinner(f"Analyzing {ticker2} across multiple timeframes..."):
-            mtf_results2 = []
-            for tf in timeframes:
-                result = analyze_timeframe(ticker2_symbol, tf[0], tf[1])
-                if result:
-                    mtf_results2.append(result)
-            
-            if mtf_results2:
-                df_mtf2 = pd.DataFrame(mtf_results2)
-                st.dataframe(df_mtf2.style.format({
-                    'Max_Close': '{:.2f}',
-                    'Min_Close': '{:.2f}',
-                    'Volatility': '{:.2f}%',
-                    'Change_%': '{:+.2f}%',
-                    'Change_Points': '{:+.2f}',
-                    'RSI': '{:.2f}'
-                }), use_container_width=True)
-                
-                # Summary for Ticker 2
-                st.markdown(f"""
-                <div class="info-box">
-                <h4>📊 {ticker2} Multi-Timeframe Summary</h4>
-                <p><strong>Overall Trend Assessment:</strong></p>
-                <ul>
-                    <li>Bullish Timeframes: {sum(1 for r in mtf_results2 if r['Trend'] == 'Up')}/{len(mtf_results2)}</li>
-                    <li>Bearish Timeframes: {sum(1 for r in mtf_results2 if r['Trend'] == 'Down')}/{len(mtf_results2)}</li>
-                    <li>Average RSI across timeframes: {np.mean([r['RSI'] for r in mtf_results2]):.2f}</li>
-                </ul>
-                </div>
-                """, unsafe_allow_html=True)
-    
-    # ===========================================
-    # SECTION 5: VOLATILITY BINS ANALYSIS
-    # ===========================================
-    st.header("📊 Volatility Bins Analysis")
-    
-    df_vol = df1[['Close', 'Volatility', 'Returns', 'Returns_Points']].copy().dropna()
-    df_vol['Volatility_Bin'] = pd.qcut(df_vol['Volatility'], q=num_bins, duplicates='drop')
-    
-    vol_bin_analysis = df_vol.groupby('Volatility_Bin').agg({
-        'Returns': ['mean', 'std', 'min', 'max', 'count'],
-        'Returns_Points': ['mean', 'std', 'min', 'max'],
-        'Volatility': ['mean', 'min', 'max']
-    }).round(2)
-    
-    st.dataframe(vol_bin_analysis, use_container_width=True)
-    
-    # Current volatility analysis
-    current_vol = df_vol['Volatility'].iloc[-1]
-    current_vol_bin = df_vol['Volatility_Bin'].iloc[-1]
-    
-    st.markdown(f"""
-    <div class="info-box">
-    <h4>📍 Current Volatility Analysis</h4>
-    <p><strong>Current Volatility:</strong> {current_vol:.2f}%</p>
-    <p><strong>Current Bin:</strong> {current_vol_bin}</p>
-    <p><strong>Statistical Summary:</strong></p>
-    <ul>
-        <li>Highest Volatility: {df_vol['Volatility'].max():.2f}%</li>
-        <li>Lowest Volatility: {df_vol['Volatility'].min():.2f}%</li>
-        <li>Mean Volatility: {df_vol['Volatility'].mean():.2f}%</li>
-        <li>Max Return in Dataset: {df_vol['Returns_Points'].max():.2f} points ({df_vol['Returns'].max():.2f}%)</li>
-        <li>Min Return in Dataset: {df_vol['Returns_Points'].min():.2f} points ({df_vol['Returns'].min():.2f}%)</li>
-    </ul>
-    <p><strong>Historical Performance in Current Volatility Bin:</strong></p>
-    <ul>
-        <li>Average Return: {vol_bin_analysis.loc[current_vol_bin, ('Returns_Points', 'mean')]:.2f} points ({vol_bin_analysis.loc[current_vol_bin, ('Returns', 'mean')]:.2f}%)</li>
-        <li>Volatility Range: {vol_bin_analysis.loc[current_vol_bin, ('Volatility', 'min')]:.2f}% - {vol_bin_analysis.loc[current_vol_bin, ('Volatility', 'max')]:.2f}%</li>
-        <li>Occurrences: {int(vol_bin_analysis.loc[current_vol_bin, ('Returns', 'count')])}</li>
-    </ul>
-    <p><strong>Forecast:</strong> {'High volatility suggests larger price movements ahead. Expect increased risk and opportunity.' if current_vol > df_vol['Volatility'].quantile(0.75) else 'Low volatility indicates stable price action. Smaller moves expected.' if current_vol < df_vol['Volatility'].quantile(0.25) else 'Moderate volatility. Normal price behavior expected.'}</p>
-    </div>
-    """, unsafe_allow_html=True)
+    st.dataframe(display_df1, use_container_width=True)
     
     # ===========================================
     # SECTION 6: ADVANCED PATTERN RECOGNITION
@@ -720,10 +360,11 @@ if st.session_state.data_fetched and st.session_state.df1 is not None:
             # RSI divergence
             rsi_before = lookback['RSI'].iloc[0]
             rsi_at_move = move_candle['RSI']
+            
+            divergence = "No"
             price_change = (lookback['Close'].iloc[-1] - lookback['Close'].iloc[0]) / lookback['Close'].iloc[0] * 100
             rsi_change = rsi_at_move - rsi_before
             
-            divergence = "No"
             if price_change > 2 and rsi_change < -5:
                 divergence = "Bearish"
             elif price_change < -2 and rsi_change > 5:
@@ -756,7 +397,7 @@ if st.session_state.data_fetched and st.session_state.df1 is not None:
             consecutive_up = (lookback['Returns_Points'] > 0).rolling(3).sum().max() >= 3
             consecutive_down = (lookback['Returns_Points'] < 0).rolling(3).sum().max() >= 3
             
-            # Correlation with prior moves
+            # Correlation
             correlation = 0
             if len(lookback) > 5:
                 correlation = lookback['Returns'].corr(lookback['Returns'].shift(1))
@@ -783,13 +424,7 @@ if st.session_state.data_fetched and st.session_state.df1 is not None:
     
     if pattern_results:
         df_pattern_results = pd.DataFrame(pattern_results)
-        st.dataframe(df_pattern_results.style.format({
-            'Move_Points': '{:+.2f}',
-            'Move_%': '{:+.2f}%',
-            'RSI_Before': '{:.2f}',
-            'RSI_At_Move': '{:.2f}',
-            'Correlation': '{:.2f}'
-        }), use_container_width=True)
+        st.dataframe(df_pattern_results, use_container_width=True)
         
         # Pattern Summary
         total_patterns = len(pattern_results)
@@ -797,265 +432,491 @@ if st.session_state.data_fetched and st.session_state.df1 is not None:
         volume_spike_count = sum(1 for p in pattern_results if p['Volume_Spike'] == 'Yes')
         divergence_count = sum(1 for p in pattern_results if p['RSI_Divergence'] != 'No')
         
-        st.markdown(f"""
-        <div class="info-box">
-        <h4>🎯 Pattern Detection Summary</h4>
-        <p><strong>Total Significant Moves Detected:</strong> {total_patterns}</p>
-        <p><strong>Pattern Frequency:</strong></p>
-        <ul>
-            <li>Volatility Bursts: {vol_burst_count}/{total_patterns} ({vol_burst_count/total_patterns*100:.1f}%)</li>
-            <li>Volume Spikes: {volume_spike_count}/{total_patterns} ({volume_spike_count/total_patterns*100:.1f}%)</li>
-            <li>RSI Divergences: {divergence_count}/{total_patterns} ({divergence_count/total_patterns*100:.1f}%)</li>
-        </ul>
-        <p><strong>Current Market Analysis:</strong></p>
-        <ul>
-            <li>Recent Volatility: {df1['Volatility'].iloc[-5:].mean():.2f}% (5-period avg)</li>
-            <li>Current RSI: {df1['RSI'].iloc[-1]:.2f}</li>
-            <li>Price vs EMA20: {df1['Close'].iloc[-1] - df1['EMA20'].iloc[-1]:.2f} points</li>
-        </ul>
-        <p><strong>Warning Signals:</strong> {'⚠️ High volatility and RSI divergence detected - Exercise caution!' if df1['Volatility'].iloc[-1] > df1['Volatility'].quantile(0.8) and abs(df1['RSI'].iloc[-1] - 50) > 20 else '✅ Normal market conditions'}</p>
-        </div>
-        """, unsafe_allow_html=True)
+        st.write(f"**🎯 Pattern Detection Summary**")
+        st.write(f"- Total Significant Moves Detected: **{total_patterns}**")
+        st.write(f"- Volatility Bursts: **{vol_burst_count}/{total_patterns}** ({vol_burst_count/total_patterns*100:.1f}%)")
+        st.write(f"- Volume Spikes: **{volume_spike_count}/{total_patterns}** ({volume_spike_count/total_patterns*100:.1f}%)")
+        st.write(f"- RSI Divergences: **{divergence_count}/{total_patterns}** ({divergence_count/total_patterns*100:.1f}%)")
     else:
         st.info("No significant patterns detected with current threshold. Try lowering the threshold.")
     
     # ===========================================
-    # SECTION 7: INTERACTIVE CHARTS
+    # SECTION 9: FINAL TRADING RECOMMENDATION
     # ===========================================
-    st.header("📈 Interactive Charts")
+    st.header("🎯 AI-Powered Trading Recommendation")
     
-    # Chart 1: Ticker 1 Price + RSI
-    st.subheader(f"📊 {ticker1} - Price Action & RSI")
+    # Gather all analysis data
+    current_price = df1['Close'].iloc[-1]
+    current_rsi = df1['RSI'].iloc[-1]
+    current_vol = df1['Volatility'].iloc[-1]
+    ema20 = df1['EMA20'].iloc[-1]
+    ema50 = df1['EMA50'].iloc[-1]
+    ema200 = df1['EMA200'].iloc[-1]
     
-    fig1 = make_subplots(
-        rows=2, cols=1,
-        shared_xaxes=True,
-        vertical_spacing=0.03,
-        row_heights=[0.7, 0.3],
-        subplot_titles=(f'{ticker1} Price with EMAs', 'RSI Indicator')
-    )
+    # Support and Resistance
+    support_levels, resistance_levels = find_support_resistance(df1['Close'])
     
-    # Candlestick
-    fig1.add_trace(go.Candlestick(
-        x=df1.index,
-        open=df1['Open'],
-        high=df1['High'],
-        low=df1['Low'],
-        close=df1['Close'],
-        name='Price'
-    ), row=1, col=1)
+    # Fibonacci levels
+    fib_levels = calculate_fibonacci_levels(df1['High'].max(), df1['Low'].min())
     
-    # EMAs
-    fig1.add_trace(go.Scatter(x=df1.index, y=df1['EMA20'], name='EMA20', line=dict(color='orange', width=1)), row=1, col=1)
-    fig1.add_trace(go.Scatter(x=df1.index, y=df1['EMA50'], name='EMA50', line=dict(color='blue', width=1)), row=1, col=1)
-    fig1.add_trace(go.Scatter(x=df1.index, y=df1['EMA200'], name='EMA200', line=dict(color='red', width=1)), row=1, col=1)
+    # Price action analysis
+    last_5_candles = df1.tail(5)
+    bullish_candles = int((last_5_candles['Close'] > last_5_candles['Open']).sum())
+    bearish_candles = 5 - bullish_candles
     
-    # RSI
-    fig1.add_trace(go.Scatter(x=df1.index, y=df1['RSI'], name='RSI', line=dict(color='purple')), row=2, col=1)
-    fig1.add_hline(y=70, line_dash="dash", line_color="red", row=2, col=1)
-    fig1.add_hline(y=30, line_dash="dash", line_color="green", row=2, col=1)
+    # Volume analysis
+    volume_increasing = False
+    if 'Volume' in df1.columns and not df1['Volume'].empty:
+        vol_mean = df1['Volume'].tail(20).mean()
+        vol_current = df1['Volume'].iloc[-1]
+        if vol_mean > 0 and vol_current > 0:
+            volume_increasing = vol_current > vol_mean * 1.5
     
-    fig1.update_layout(height=700, showlegend=True, xaxis_rangeslider_visible=False)
-    fig1.update_yaxes(title_text="Price", row=1, col=1)
-    fig1.update_yaxes(title_text="RSI", row=2, col=1)
+    # EMA alignment
+    emas_aligned_bullish = ema20 > ema50 > ema200
+    emas_aligned_bearish = ema20 < ema50 < ema200
     
-    st.plotly_chart(fig1, use_container_width=True)
+    # Price position
+    above_ema20 = current_price > ema20
+    above_ema50 = current_price > ema50
     
-    # Chart 2 & 3: Ticker 2 and Ratio (if enabled)
-    if enable_ratio and df2 is not None:
-        st.subheader(f"📊 {ticker2} - Price Action & RSI")
-        
-        fig2 = make_subplots(
-            rows=2, cols=1,
-            shared_xaxes=True,
-            vertical_spacing=0.03,
-            row_heights=[0.7, 0.3],
-            subplot_titles=(f'{ticker2} Price with EMAs', 'RSI Indicator')
-        )
-        
-        fig2.add_trace(go.Candlestick(
-            x=df2.index,
-            open=df2['Open'],
-            high=df2['High'],
-            low=df2['Low'],
-            close=df2['Close'],
-            name='Price'
-        ), row=1, col=1)
-        
-        fig2.add_trace(go.Scatter(x=df2.index, y=df2['EMA20'], name='EMA20', line=dict(color='orange', width=1)), row=1, col=1)
-        fig2.add_trace(go.Scatter(x=df2.index, y=df2['EMA50'], name='EMA50', line=dict(color='blue', width=1)), row=1, col=1)
-        fig2.add_trace(go.Scatter(x=df2.index, y=df2['EMA200'], name='EMA200', line=dict(color='red', width=1)), row=1, col=1)
-        
-        fig2.add_trace(go.Scatter(x=df2.index, y=df2['RSI'], name='RSI', line=dict(color='purple')), row=2, col=1)
-        fig2.add_hline(y=70, line_dash="dash", line_color="red", row=2, col=1)
-        fig2.add_hline(y=30, line_dash="dash", line_color="green", row=2, col=1)
-        
-        fig2.update_layout(height=700, showlegend=True, xaxis_rangeslider_visible=False)
-        fig2.update_yaxes(title_text="Price", row=1, col=1)
-        fig2.update_yaxes(title_text="RSI", row=2, col=1)
-        
-        st.plotly_chart(fig2, use_container_width=True)
-        
-        # Ratio Chart
-        st.subheader(f"📊 Ratio ({ticker1}/{ticker2}) & RSI")
-        
-        fig3 = make_subplots(
-            rows=2, cols=1,
-            shared_xaxes=True,
-            vertical_spacing=0.03,
-            row_heights=[0.7, 0.3],
-            subplot_titles=('Ratio Value', 'Ratio RSI')
-        )
-        
-        fig3.add_trace(go.Scatter(x=df_ratio.index, y=df_ratio['Ratio'], name='Ratio', line=dict(color='teal', width=2)), row=1, col=1)
-        fig3.add_trace(go.Scatter(x=df_ratio.index, y=df_ratio['RSI_Ratio'], name='Ratio RSI', line=dict(color='purple')), row=2, col=1)
-        fig3.add_hline(y=70, line_dash="dash", line_color="red", row=2, col=1)
-        fig3.add_hline(y=30, line_dash="dash", line_color="green", row=2, col=1)
-        
-        fig3.update_layout(height=700, showlegend=True)
-        fig3.update_yaxes(title_text="Ratio", row=1, col=1)
-        fig3.update_yaxes(title_text="RSI", row=2, col=1)
-        
-        st.plotly_chart(fig3, use_container_width=True)
+    # RSI conditions
+    rsi_oversold = current_rsi < 30
+    rsi_overbought = current_rsi > 70
     
-    # ===========================================
-    # SECTION 8: STATISTICAL DISTRIBUTION ANALYSIS
-    # ===========================================
-    st.header("📊 Statistical Distribution Analysis")
+    # Divergence check
+    divergence_signal = detect_divergence(df1['Close'].tail(10), df1['RSI'].tail(10))
     
-    returns_data = df1['Returns'].dropna()
+    # Historical pattern accuracy
+    if pattern_results:
+        successful_patterns = sum(1 for p in pattern_results if 
+                                 (p['Direction'] == 'Up' and p['RSI_At_Move'] < 50) or
+                                 (p['Direction'] == 'Down' and p['RSI_At_Move'] > 50))
+        pattern_accuracy = (successful_patterns / len(pattern_results)) * 100
+    else:
+        successful_patterns = 0
+        pattern_accuracy = 0
     
-    col1, col2 = st.columns(2)
+    # Calculate signal strength
+    signal_strength = 0
+    signals_list = []
+    
+    # Bullish signals
+    if above_ema20:
+        signal_strength += 1
+        signals_list.append("✅ Price above EMA20")
+    if above_ema50:
+        signal_strength += 1
+        signals_list.append("✅ Price above EMA50")
+    if emas_aligned_bullish:
+        signal_strength += 2
+        signals_list.append("✅ EMAs aligned bullish")
+    if rsi_oversold:
+        signal_strength += 2
+        signals_list.append("✅ RSI oversold - bounce opportunity")
+    if divergence_signal == "Bullish Divergence":
+        signal_strength += 2
+        signals_list.append("✅ Bullish RSI divergence detected")
+    if volume_increasing and bullish_candles > 3:
+        signal_strength += 2
+        signals_list.append("✅ Volume breakout with bullish momentum")
+    
+    # Bearish signals
+    if not above_ema20:
+        signal_strength -= 1
+        signals_list.append("❌ Price below EMA20")
+    if not above_ema50:
+        signal_strength -= 1
+        signals_list.append("❌ Price below EMA50")
+    if emas_aligned_bearish:
+        signal_strength -= 2
+        signals_list.append("❌ EMAs aligned bearish")
+    if rsi_overbought:
+        signal_strength -= 2
+        signals_list.append("❌ RSI overbought - correction likely")
+    if divergence_signal == "Bearish Divergence":
+        signal_strength -= 2
+        signals_list.append("❌ Bearish RSI divergence detected")
+    
+    # Determine recommendation
+    if signal_strength >= 4:
+        recommendation = "🟢 STRONG BUY"
+        confidence = "High"
+    elif signal_strength >= 2:
+        recommendation = "🟢 BUY"
+        confidence = "Moderate"
+    elif signal_strength <= -4:
+        recommendation = "🔴 STRONG SELL"
+        confidence = "High"
+    elif signal_strength <= -2:
+        recommendation = "🔴 SELL"
+        confidence = "Moderate"
+    else:
+        recommendation = "🟡 HOLD / WAIT"
+        confidence = "Low"
+    
+    # Calculate entry, stop loss, and targets
+    if signal_strength > 0:  # Bullish scenario
+        entry_price = current_price
+        pullback_entry = ema20 if current_price > ema20 else current_price * 0.98
+        
+        if support_levels:
+            stop_loss = min(support_levels)
+        else:
+            stop_loss = entry_price * 0.98
+        
+        if resistance_levels:
+            target1 = resistance_levels[0] if len(resistance_levels) > 0 else entry_price * 1.02
+            target2 = resistance_levels[1] if len(resistance_levels) > 1 else entry_price * 1.04
+            target3 = resistance_levels[2] if len(resistance_levels) > 2 else entry_price * 1.06
+        else:
+            target1 = entry_price * 1.02
+            target2 = entry_price * 1.04
+            target3 = entry_price * 1.06
+        
+        trailing_stop = "Move to breakeven after Target 1. Trail below EMA20."
+        
+    else:  # Bearish scenario
+        entry_price = current_price
+        pullback_entry = ema20 if current_price < ema20 else current_price * 1.02
+        
+        if resistance_levels:
+            stop_loss = max(resistance_levels)
+        else:
+            stop_loss = entry_price * 1.02
+        
+        if support_levels:
+            target1 = support_levels[0] if len(support_levels) > 0 else entry_price * 0.98
+            target2 = support_levels[1] if len(support_levels) > 1 else entry_price * 0.96
+            target3 = support_levels[2] if len(support_levels) > 2 else entry_price * 0.94
+        else:
+            target1 = entry_price * 0.98
+            target2 = entry_price * 0.96
+            target3 = entry_price * 0.94
+        
+        trailing_stop = "Move to breakeven after Target 1. Trail above EMA20."
+    
+    # Risk-reward ratio
+    risk = abs(entry_price - stop_loss)
+    reward = abs(target1 - entry_price)
+    risk_reward = reward / risk if risk > 0 else 0
+    
+    # Display recommendation
+    st.subheader(f"{recommendation}")
+    st.write(f"**Confidence Level:** {confidence}")
+    st.write(f"**Signal Strength:** {signal_strength}/10")
+    
+    # Trading Plan
+    st.subheader("📋 Detailed Trading Plan")
+    
+    col1, col2, col3 = st.columns(3)
     
     with col1:
-        # Returns Histogram
-        fig_hist1 = go.Figure()
-        fig_hist1.add_trace(go.Histogram(
-            x=returns_data,
-            nbinsx=50,
-            name='Returns Distribution',
-            marker_color='lightblue'
-        ))
-        fig_hist1.update_layout(
-            title='Returns Distribution',
-            xaxis_title='Returns (%)',
-            yaxis_title='Frequency',
-            height=400
-        )
-        st.plotly_chart(fig_hist1, use_container_width=True)
+        st.write("**🎯 Entry Strategy**")
+        st.write(f"- Primary Entry: ₹{entry_price:.2f}")
+        st.write(f"- Optimal Entry: ₹{pullback_entry:.2f}")
+        st.write(f"- Risk per trade: 1-2% of capital")
     
     with col2:
-        # Returns with Normal Curve
-        fig_hist2 = go.Figure()
-        fig_hist2.add_trace(go.Histogram(
-            x=returns_data,
-            nbinsx=50,
-            name='Returns',
-            marker_color='lightblue',
-            histnorm='probability density'
-        ))
+        st.write("**🛑 Risk Management**")
+        st.write(f"- Stop Loss: ₹{stop_loss:.2f}")
+        st.write(f"- Risk: ₹{risk:.2f} ({(risk/entry_price)*100:.2f}%)")
+        st.write(f"- Risk:Reward: 1:{risk_reward:.2f}")
+    
+    with col3:
+        st.write("**🎯 Profit Targets**")
+        st.write(f"- Target 1: ₹{target1:.2f} (Book 30%)")
+        st.write(f"- Target 2: ₹{target2:.2f} (Book 40%)")
+        st.write(f"- Target 3: ₹{target3:.2f} (Book 30%)")
+        st.write(f"- Trail: {trailing_stop}")
+    
+    # Key Levels
+    st.subheader("📊 Key Technical Levels")
+    st.write(f"**Support Levels:** {', '.join([f'₹{s:.2f}' for s in support_levels]) if support_levels else 'Not detected'}")
+    st.write(f"**Resistance Levels:** {', '.join([f'₹{r:.2f}' for r in resistance_levels]) if resistance_levels else 'Not detected'}")
+    st.write(f"**Fibonacci 50%:** ₹{fib_levels['50.0%']:.2f}")
+    st.write(f"**Fibonacci 61.8%:** ₹{fib_levels['61.8%']:.2f}")
+    st.write(f"**EMA20:** ₹{ema20:.2f}")
+    st.write(f"**EMA50:** ₹{ema50:.2f}")
+    st.write(f"**EMA200:** ₹{ema200:.2f}")
+    
+    # Signal Summary
+    st.subheader("📊 Signal Summary")
+    for signal in signals_list:
+        st.write(signal)
+    
+    # Detailed Reasoning
+    st.subheader("🧠 Detailed Analysis & Reasoning")
+    
+    st.write("**Technical Setup:**")
+    if above_ema20 and above_ema50:
+        st.write(f"Strong bullish structure with price at ₹{current_price:.2f} trading above key EMAs (EMA20: ₹{ema20:.2f}, EMA50: ₹{ema50:.2f})")
+    elif not above_ema20 and not above_ema50:
+        st.write(f"Bearish structure with price at ₹{current_price:.2f} below key EMAs (EMA20: ₹{ema20:.2f}, EMA50: ₹{ema50:.2f})")
+    else:
+        st.write(f"Mixed structure. Price at ₹{current_price:.2f} testing critical levels")
+    
+    st.write("")
+    st.write("**Momentum Analysis:**")
+    st.write(f"RSI at {current_rsi:.2f} - ", end="")
+    if rsi_oversold:
+        st.write("Oversold conditions indicate high probability bounce")
+    elif rsi_overbought:
+        st.write("Overbought conditions suggest correction expected")
+    else:
+        st.write("Neutral zone indicates trend continuation likely")
+    
+    if divergence_signal != "No Divergence":
+        st.write(f"⚠️ **{divergence_signal}** detected - strong reversal signal")
+    
+    st.write("")
+    st.write("**Price Action:**")
+    st.write(f"Last 5 candles show {bullish_candles} bullish vs {bearish_candles} bearish")
+    if bullish_candles >= 4:
+        st.write("Strong bullish momentum building")
+    elif bearish_candles >= 4:
+        st.write("Selling pressure evident")
+    
+    st.write("")
+    st.write("**Volatility Context:**")
+    st.write(f"Current volatility at {current_vol:.2f}% - ", end="")
+    if current_vol > df1['Volatility'].quantile(0.75):
+        st.write("Elevated (expect larger swings, adjust position size)")
+    else:
+        st.write("Normal (standard position sizing applicable)")
+    
+    # ===========================================
+    # COMPREHENSIVE BACKTESTING RESULTS
+    # ===========================================
+    st.header("📈 Comprehensive Backtesting Results")
+    
+    if pattern_results and len(pattern_results) > 0:
         
-        # Normal curve overlay
-        mu, std = returns_data.mean(), returns_data.std()
-        x_range = np.linspace(returns_data.min(), returns_data.max(), 100)
-        normal_curve = stats.norm.pdf(x_range, mu, std)
-        fig_hist2.add_trace(go.Scatter(
-            x=x_range,
-            y=normal_curve,
-            name='Normal Distribution',
-            line=dict(color='red', width=2)
-        ))
+        # Calculate detailed statistics
+        up_moves = [p for p in pattern_results if p['Direction'] == 'Up']
+        down_moves = [p for p in pattern_results if p['Direction'] == 'Down']
         
-        fig_hist2.update_layout(
-            title='Returns with Normal Curve Overlay',
-            xaxis_title='Returns (%)',
-            yaxis_title='Density',
-            height=400
-        )
-        st.plotly_chart(fig_hist2, use_container_width=True)
-    
-    # Bell Curve Visualization with Zones
-    st.subheader("🔔 Normal Distribution Analysis with Color Zones")
-    
-    fig_bell = go.Figure()
-    
-    x_range = np.linspace(mu - 4*std, mu + 4*std, 1000)
-    y_range = stats.norm.pdf(x_range, mu, std)
-    
-    # Color zones
-    # Green zone: ±1 std dev (68%)
-    green_mask = (x_range >= mu - std) & (x_range <= mu + std)
-    # Yellow zone: ±2 std dev (95%)
-    yellow_mask = ((x_range >= mu - 2*std) & (x_range < mu - std)) | ((x_range > mu + std) & (x_range <= mu + 2*std))
-    # Red zone: beyond ±2 std dev
-    red_mask = (x_range < mu - 2*std) | (x_range > mu + 2*std)
-    
-    fig_bell.add_trace(go.Scatter(x=x_range[green_mask], y=y_range[green_mask], 
-                                   fill='tozeroy', fillcolor='rgba(0, 255, 0, 0.3)',
-                                   line=dict(color='green'), name='±1σ (68%)'))
-    fig_bell.add_trace(go.Scatter(x=x_range[yellow_mask], y=y_range[yellow_mask],
-                                   fill='tozeroy', fillcolor='rgba(255, 255, 0, 0.3)',
-                                   line=dict(color='orange'), name='±2σ (95%)'))
-    fig_bell.add_trace(go.Scatter(x=x_range[red_mask], y=y_range[red_mask],
-                                   fill='tozeroy', fillcolor='rgba(255, 0, 0, 0.3)',
-                                   line=dict(color='red'), name='Beyond ±2σ'))
-    
-    # Current position marker
-    current_return = df1['Returns'].iloc[-1]
-    current_y = stats.norm.pdf(current_return, mu, std)
-    fig_bell.add_trace(go.Scatter(x=[current_return], y=[current_y],
-                                   mode='markers', marker=dict(size=15, color='black'),
-                                   name='Current Position'))
-    
-    fig_bell.update_layout(
-        title='Normal Distribution with Color-Coded Zones',
-        xaxis_title='Returns (%)',
-        yaxis_title='Probability Density',
-        height=500
-    )
-    st.plotly_chart(fig_bell, use_container_width=True)
-    
-    # Z-Score Analysis
-    st.subheader("📊 Z-Score Analysis")
-    
-    df1['Z_Score'] = (df1['Returns'] - mu) / std
-    
-    z_score_df = df1[['Returns', 'Returns_Points', 'Z_Score']].tail(30).copy()
-    z_score_df.index = z_score_df.index.strftime('%Y-%m-%d %H:%M:%S')
-    
-    def highlight_z_score(val):
-        if abs(val) > 2:
-            return 'background-color: #ffcccc'
-        elif abs(val) > 1:
-            return 'background-color: #ffffcc'
+        # Volatility burst correlation
+        vol_burst_moves = [p for p in pattern_results if p['Volatility_Burst'] == 'Yes']
+        vol_burst_success = sum(1 for p in vol_burst_moves if 
+                               (p['Direction'] == 'Up' and p['RSI_At_Move'] < 50) or
+                               (p['Direction'] == 'Down' and p['RSI_At_Move'] > 50))
+        vol_burst_accuracy = (vol_burst_success / len(vol_burst_moves) * 100) if vol_burst_moves else 0
+        
+        # RSI divergence correlation
+        divergence_moves = [p for p in pattern_results if p['RSI_Divergence'] != 'No']
+        div_success = sum(1 for p in divergence_moves if 
+                         (p['Direction'] == 'Up' and p['RSI_Divergence'] == 'Bullish') or
+                         (p['Direction'] == 'Down' and p['RSI_Divergence'] == 'Bearish'))
+        div_accuracy = (div_success / len(divergence_moves) * 100) if divergence_moves else 0
+        
+        # EMA crossover correlation
+        ema_cross_moves = [p for p in pattern_results if p['EMA_20/50_Cross'] == 'Yes']
+        ema_success = sum(1 for p in ema_cross_moves if abs(p['Move_Points']) > pattern_threshold * 0.8)
+        ema_accuracy = (ema_success / len(ema_cross_moves) * 100) if ema_cross_moves else 0
+        
+        # Current market similarity score
+        current_pattern_score = 0
+        current_volatility = df1['Volatility'].iloc[-1]
+        
+        if current_volatility > df1['Volatility'].quantile(0.75):
+            current_pattern_score += 2
+        
+        if divergence_signal != "No Divergence":
+            current_pattern_score += 3
+        
+        if volume_increasing:
+            current_pattern_score += 2
+        
+        # Find most similar historical patterns
+        similar_patterns = []
+        for p in pattern_results:
+            similarity = 0
+            if abs(p['RSI_At_Move'] - current_rsi) < 10:
+                similarity += 3
+            if p['Volatility_Burst'] == 'Yes' and current_volatility > df1['Volatility'].quantile(0.75):
+                similarity += 2
+            if p['RSI_Divergence'] == divergence_signal:
+                similarity += 3
+            
+            if similarity > 4:
+                similar_patterns.append((p, similarity))
+        
+        similar_patterns.sort(key=lambda x: x[1], reverse=True)
+        
+        # Display Overall Statistics
+        st.subheader("📊 Overall Statistics")
+        col1, col2, col3, col4 = st.columns(4)
+        
+        with col1:
+            st.metric("Total Patterns", len(pattern_results))
+        with col2:
+            st.metric("Successful", successful_patterns)
+        with col3:
+            st.metric("Accuracy", f"{pattern_accuracy:.1f}%")
+        with col4:
+            avg_move = np.mean([p['Move_Points'] for p in pattern_results])
+            st.metric("Avg Move", f"{avg_move:+.2f} pts")
+        
+        st.write("")
+        st.write(f"**Direction Distribution:**")
+        st.write(f"- Upward Moves: {len(up_moves)} ({len(up_moves)/len(pattern_results)*100:.1f}%)")
+        st.write(f"- Downward Moves: {len(down_moves)} ({len(down_moves)/len(pattern_results)*100:.1f}%)")
+        
+        # Pattern-Specific Accuracy
+        st.subheader("🎯 Pattern-Specific Performance")
+        
+        col1, col2, col3 = st.columns(3)
+        
+        with col1:
+            st.metric(
+                "Volatility Burst",
+                f"{vol_burst_accuracy:.1f}%",
+                f"{len(vol_burst_moves)} patterns"
+            )
+        
+        with col2:
+            st.metric(
+                "RSI Divergence",
+                f"{div_accuracy:.1f}%",
+                f"{len(divergence_moves)} patterns"
+            )
+        
+        with col3:
+            st.metric(
+                "EMA Crossover",
+                f"{ema_accuracy:.1f}%",
+                f"{len(ema_cross_moves)} patterns"
+            )
+        
+        # Current Market Similarity
+        st.subheader("🔍 Current Market Similarity Analysis")
+        
+        st.write(f"**Pattern Match Score:** {current_pattern_score}/10")
+        st.write(f"**Similar Historical Setups Found:** {len(similar_patterns)}")
+        
+        if similar_patterns:
+            top_5 = similar_patterns[:5]
+            avg_similar_move = np.mean([p[0]['Move_Points'] for p in top_5])
+            st.write(f"**Average Move in Similar Setups:** {avg_similar_move:+.2f} points")
+            
+            direction_consistency = sum(1 for p in top_5 if np.sign(p[0]['Move_Points']) == np.sign(avg_similar_move))
+            st.write(f"**Direction Consistency:** {direction_consistency}/{len(top_5)}")
+        
+        # Optimization Insights
+        st.subheader("💡 Optimization Insights")
+        
+        if vol_burst_accuracy > pattern_accuracy:
+            improvement = vol_burst_accuracy - pattern_accuracy
+            current_vol_status = "HIGH" if current_volatility > df1['Volatility'].quantile(0.75) else "NORMAL"
+            st.write(f"✅ Volatility burst patterns show **{improvement:.1f}%** higher accuracy")
+            st.write(f"   Current volatility is **{current_vol_status}**")
+        
+        if div_accuracy > pattern_accuracy:
+            improvement = div_accuracy - pattern_accuracy
+            st.write(f"✅ RSI divergence patterns show **{improvement:.1f}%** higher accuracy")
+            st.write(f"   Current divergence: **{divergence_signal}**")
+        
+        if ema_accuracy > pattern_accuracy:
+            improvement = ema_accuracy - pattern_accuracy
+            st.write(f"✅ EMA crossover patterns show **{improvement:.1f}%** higher accuracy")
+        
+        # Recommendation Confidence
+        st.subheader("🎯 Recommendation Confidence")
+        
+        confidence_score = pattern_accuracy
+        
+        if current_pattern_score >= 6:
+            confidence_score += 15
+            st.success("🟢 **HIGH CONFIDENCE:** Current market setup closely matches historically successful patterns")
+        elif current_pattern_score >= 4:
+            confidence_score += 10
+            st.warning("🟡 **MODERATE CONFIDENCE:** Current setup shows some similarity to historical patterns")
         else:
-            return 'background-color: #ccffcc'
+            confidence_score += 5
+            st.info("🟠 **LOWER CONFIDENCE:** Current setup is unique. Exercise caution")
+        
+        st.write(f"**Adjusted Confidence Score:** {min(confidence_score, 95):.1f}%")
+        
+        # Most Similar Historical Setups
+        if similar_patterns:
+            st.subheader("📜 Most Similar Historical Setups")
+            
+            for i, (pattern, sim_score) in enumerate(similar_patterns[:5], 1):
+                direction_emoji = "📈" if pattern['Direction'] == 'Up' else "📉"
+                st.write(f"{i}. {direction_emoji} **{pattern['DateTime']}**: Moved **{pattern['Move_Points']:+.2f}** points ({pattern['Move_%']:+.2f}%) - Similarity: **{sim_score}/10**")
+        
+        # Expected Outcome
+        st.subheader("🔮 Expected Outcome Based on History")
+        
+        if similar_patterns and len(similar_patterns) >= 3:
+            expected_direction = "UP" if avg_similar_move > 0 else "DOWN"
+            expected_magnitude = abs(avg_similar_move)
+            confidence_pct = (sum(1 for p in similar_patterns[:5] if np.sign(p[0]['Move_Points']) == np.sign(avg_similar_move)) / min(len(similar_patterns), 5)) * 100
+            
+            st.success(f"Based on **{len(similar_patterns)}** similar historical patterns, expect a **{expected_direction}** move of approximately **{expected_magnitude:.2f} points** with **{confidence_pct:.0f}%** directional confidence")
+        else:
+            st.info("Insufficient similar patterns for precise prediction. Rely on technical analysis and risk management")
+        
+        # Detailed Pattern Performance Table
+        st.subheader("📋 Detailed Pattern Performance Table")
+        
+        backtest_df = pd.DataFrame(pattern_results)
+        backtest_df['Success'] = backtest_df.apply(
+            lambda x: 'Yes' if (x['Direction'] == 'Up' and x['RSI_At_Move'] < 50) or 
+                              (x['Direction'] == 'Down' and x['RSI_At_Move'] > 50) else 'No',
+            axis=1
+        )
+        
+        st.dataframe(backtest_df, use_container_width=True)
+        
+    else:
+        st.warning("⚠️ No significant patterns detected for backtesting. Lower the pattern threshold in settings to detect more patterns")
     
-    st.dataframe(z_score_df.style.format({
-        'Returns': '{:+.2f}%',
-        'Returns_Points': '{:+.2f}',
-        'Z_Score': '{:.2f}'
-    }).applymap(highlight_z_score, subset=['Z_Score']), use_container_width=True)
+    # Final Notes
+    st.markdown("---")
+    st.subheader("⚠️ Important Notes")
+    st.write("- This is an algorithmic recommendation based on technical analysis - not financial advice")
+    st.write("- Always manage risk and never risk more than 1-2% of capital per trade")
+    st.write("- Market conditions can change rapidly - stay nimble and follow your trading plan")
+    st.write("- Use stop losses religiously - they are your insurance against catastrophic loss")
+    st.write("- Consider broader market context and news events before executing")
+    st.write("- Paper trade this strategy first to validate its effectiveness for your style")
+
+else:
+    # Show welcome message when no data
+    st.info("👆 Configure your analysis parameters in the sidebar and click 'Fetch Data' to begin")
     
-    # Statistical Summary
-    current_z = df1['Z_Score'].iloc[-1]
-    percentile = stats.norm.cdf(current_z) * 100
-    skewness = returns_data.skew()
-    kurtosis = returns_data.kurtosis()
+    st.markdown("""
+    ## 🎯 Welcome to the Professional Algo Trading Dashboard
     
-    st.markdown(f"""
-    <div class="info-box">
-    <h4>📈 Statistical Summary</h4>
-    <p><strong>Distribution Characteristics:</strong></p>
-    <ul>
-        <li>Mean Return: {mu:.2f}%</li>
-        <li>Standard Deviation: {std:.2f}%</li>
-        <li>Skewness: {skewness:.2f} {'(Right-tailed)' if skewness > 0 else '(Left-tailed)' if skewness < 0 else '(Symmetric)'}</li>
-        <li>Kurtosis: {kurtosis:.2f} {'(Fat-tailed)' if kurtosis > 0 else '(Thin-tailed)'}</li>
-    </ul>
-    <p><strong>Current Position:</strong></p>
-    <ul>
-        <li>Current Return: {current_return:.2f}%</li>
-        <li>Z-Score: {current_z:.2f}</li>
-        <li>Percentile Rank: {percentile:.1f}%</li>
-        <li>Position: {'<span class="red-text">Extreme (>2σ)</span>' if abs(current_z) > 2 else '<span class="yellow-text">Moderate (1-2σ)</span>' if abs(current_z) > 1 else '<span class="green-text">Normal (±1σ)</span>'}</li>""")
+    This comprehensive trading platform provides:
+    
+    - ✅ **Multi-Asset Support**: Analyze stocks, indices, crypto, commodities, and forex
+    - ✅ **Multi-Timeframe Analysis**: From 1-minute to monthly charts
+    - ✅ **Advanced Indicators**: RSI, EMAs, SMAs, Fibonacci, Support/Resistance
+    - ✅ **Pattern Recognition**: Detect 10+ technical patterns automatically
+    - ✅ **Statistical Analysis**: Z-scores, distributions, volatility bins
+    - ✅ **AI-Powered Recommendations**: Get actionable BUY/SELL/HOLD signals
+    - ✅ **Comprehensive Backtesting**: Historical pattern performance analysis
+    - ✅ **Risk Management**: Calculated entry, stop-loss, and target levels
+    
+    ### 🚀 Getting Started
+    
+    1. Select your ticker(s) from the sidebar
+    2. Choose timeframe and period
+    3. Optionally enable ratio analysis for pair trading
+    4. Click "Fetch Data" to load and analyze
+    5. Review the comprehensive analysis and trading recommendation
+    
+    **Ready to start? Configure your settings and fetch data!**
+    """)
+
+# Footer
+st.markdown("---")
+st.markdown("""
+<div style="text-align: center; color: #666;">
+    <p>Professional Algo Trading Dashboard v1.0 | Built with Streamlit & Python</p>
+    <p>⚠️ For Educational Purposes Only - Not Financial Advice</p>
+</div>
+""", unsafe_allow_html=True)
