@@ -4,7 +4,7 @@ import pandas as pd
 import numpy as np
 import time
 import plotly.graph_objects as go
-from scipy.stats import norm, skew, kurtosis
+from scipy.stats import norm, skew, kurtosis # Imported but not fully used for brevity
 
 # --- CONFIG ---
 st.set_page_config(
@@ -79,20 +79,22 @@ def apply_leading_indicators(df):
     df['ATR'] = calculate_atr(df, window=ATR_WINDOW)
     df['Volatility_Pct'] = df['Close'].pct_change().rolling(window=20).std() * 100
     
-    # New Leading Indicator: Keltner Channels
     df = calculate_keltner_channels(df, window=ATR_WINDOW, multiplier=KC_MULTIPLIER)
     
     return df
 
 @st.cache_data(ttl=3600)
 def fetch_and_process_data(ticker, interval, period, sleep_sec):
-    """Fetches yfinance data with rate limiting, flattens MultiIndex, and converts to IST."""
+    """
+    Fetches yfinance data. Removed st.toast/st.error to avoid CacheReplayClosureError.
+    Returns: (DataFrame, status) where status is True (success), False (no data), or an error string.
+    """
     try:
         time.sleep(sleep_sec) 
         df = yf.download(ticker, interval=interval, period=period, progress=False)
         
         if df.empty:
-            return pd.DataFrame()
+            return pd.DataFrame(), False 
 
         # Gracefully flatten MultiIndex DataFrame
         if isinstance(df.columns, pd.MultiIndex):
@@ -104,15 +106,14 @@ def fetch_and_process_data(ticker, interval, period, sleep_sec):
             df.index = df.index.tz_convert(IST_TIMEZONE)
             
         df = apply_leading_indicators(df)
-        st.toast(f"✅ Data for {ticker} fetched and processed.")
-        return df
+        
+        return df, True
 
     except Exception as e:
-        st.error(f"An error occurred fetching data for {ticker}: {e}")
-        return pd.DataFrame()
+        return pd.DataFrame(), f"An error occurred: {e}"
         
 def extract_scalar(value):
-    """Ensures the value is a scalar, handling potential Pandas Series or NumPy arrays."""
+    """Ensures the value is a scalar."""
     if isinstance(value, pd.Series):
         if not value.empty and len(value) == 1:
             return value.item()
@@ -123,7 +124,6 @@ def extract_scalar(value):
         return np.nan
     return value
 
-# --- FIX: Re-insert calculate_basic_metrics to resolve NameError ---
 def calculate_basic_metrics(df, label, interval):
     """Calculates current price, change, and points gained/lost."""
     if df.empty or len(df) < 2:
@@ -146,10 +146,8 @@ def calculate_basic_metrics(df, label, interval):
               delta_color="normal")
     
     return current_price, points_change
-# --- END FIX ---
 
-
-# --- REINSERTED DEPENDENT FUNCTIONS ---
+# --- ADVANCED ANALYSIS MODULES ---
 
 def get_fibonacci_levels(df):
     """Calculates high/low and returns simple Fibonacci retracement levels (Leading S/R)."""
@@ -276,9 +274,6 @@ def perform_value_at_risk(df, ticker_label):
          st.info("Current price not available for VaR price calculation.")
          return
 
-    mu = extract_scalar(returns.mean())
-    sigma = extract_scalar(returns.std())
-    
     VaR_95_hist = extract_scalar(returns.quantile(0.05))
     VaR_99_hist = extract_scalar(returns.quantile(0.01))
 
@@ -306,7 +301,7 @@ def generate_candlestick_chart(df, ticker_label):
                                  low=df['Low'], close=df['Close'],
                                  name='Candles'))
     
-    # --- Keltner Channels ---
+    # Keltner Channels
     if 'KC_Upper' in df.columns:
         fig.add_trace(go.Scatter(x=df.index, y=df['KC_Upper'], line=dict(color='red', width=1), name='KC Upper', opacity=0.8))
         fig.add_trace(go.Scatter(x=df.index, y=df['KC_Lower'], line=dict(color='green', width=1), name='KC Lower', opacity=0.8))
@@ -342,7 +337,6 @@ def generate_candlestick_chart(df, ticker_label):
 def run_backtest(df, ticker_label, current_price):
     """
     Runs a backtest on the algorithm using Keltner Channel and VaR rules.
-    
     Entry: Price closes outside KC AND RSI showing momentum confirmation.
     SL: 99% VaR price equivalent (Symmetrical for Short).
     TP: Price hits opposite KC_Middle line.
@@ -369,7 +363,6 @@ def run_backtest(df, ticker_label, current_price):
     entry_price = 0
     trade_type = None # 'Long' or 'Short'
     
-    # Simplified divergence check for backtesting: use RSI level crossing 50
     # RSI > 50 suggests Bullish Momentum/Confirmation; RSI < 50 suggests Bearish Momentum/Confirmation
     df_test['RSI_Signal'] = np.where(df_test['RSI'] > 50, 1, -1) 
     
@@ -380,16 +373,14 @@ def run_backtest(df, ticker_label, current_price):
         if in_trade:
             # VaR Stop Loss Price Calculation
             if trade_type == 'Long':
-                # VaR is typically negative. (1 + VaR_99_hist) will be < 1, resulting in SL price below entry.
                 sl_price = entry_price * (1 + VaR_99_hist) 
             else: # Short
-                # Symmetrical VaR for short.
                 sl_price = entry_price * (1 - VaR_99_hist) 
 
             # SL Check 
             if (trade_type == 'Long' and current_close < sl_price) or \
                (trade_type == 'Short' and current_close > sl_price):
-                exit_price = sl_price # Exit at SL price
+                exit_price = sl_price 
                 points = (exit_price - entry_price) if trade_type == 'Long' else (entry_price - exit_price)
                 trades.append({'Entry': entry_price, 'Exit': exit_price, 'Type': trade_type, 
                                'Points': points, 'Result': 'Loss (SL)'})
@@ -439,7 +430,6 @@ def run_backtest(df, ticker_label, current_price):
     
     total_points = extract_scalar(trade_df['Points'].sum())
     
-    # Calculate Total Return based on the sum of percentage returns for each trade
     trade_df['Return_Pct'] = trade_df.apply(
         lambda row: (row['Exit'] - row['Entry']) / row['Entry'] if row['Type'] == 'Long' else (row['Entry'] - row['Exit']) / row['Entry'], axis=1
     )
@@ -501,12 +491,28 @@ def main_dashboard():
         if st.button("🚀 Fetch/Refresh Data"):
             st.session_state.data_fetched = False
             
-            with st.spinner(f"Fetching data for {ticker1}...") :
-                st.session_state.df1 = fetch_and_process_data(ticker1, interval, period, 0.1)
+            # --- Fetch Ticker 1 (Handling Streamlit calls outside the cached function) ---
+            with st.spinner(f"Fetching data for {ticker1}..."):
+                st.session_state.df1, status1 = fetch_and_process_data(ticker1, interval, period, 0.1)
                 
+            if status1 is True:
+                st.toast(f"✅ Data for {ticker1} fetched and processed.")
+            elif status1 is False:
+                st.error(f"No data available for {ticker1}. Check ticker/period.")
+            else: # status1 is an error string
+                st.error(f"Error fetching {ticker1}: {status1}")
+
+            # --- Fetch Ticker 2 (if enabled) ---
             if enable_ratio and ticker2:
-                with st.spinner(f"Fetching data for {ticker2} (waiting {sleep_sec}s)...") :
-                    st.session_state.df2 = fetch_and_process_data(ticker2, interval, period, sleep_sec)
+                with st.spinner(f"Fetching data for {ticker2} (waiting {sleep_sec}s)..."):
+                    st.session_state.df2, status2 = fetch_and_process_data(ticker2, interval, period, sleep_sec)
+                    
+                if status2 is True:
+                    st.toast(f"✅ Data for {ticker2} fetched and processed.")
+                elif status2 is False:
+                    st.error(f"No data available for {ticker2}. Check ticker/period.")
+                else: # status2 is an error string
+                    st.error(f"Error fetching {ticker2}: {status2}")
             
             st.session_state.data_fetched = True
             st.rerun()
@@ -518,7 +524,6 @@ def main_dashboard():
         st.header("📈 Current Market Metrics")
         col1, col2, col3 = st.columns(3)
         
-        # This is where the NameError occurred previously
         with col1:
             price1, points1 = calculate_basic_metrics(st.session_state.df1, ticker1, interval)
         
