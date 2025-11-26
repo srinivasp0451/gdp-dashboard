@@ -20,7 +20,7 @@ WINDOW = 252
 ENTRY_Z_SCORE = 2.0
 EXIT_Z_SCORE = 0.5 
 
-# --- UTILITY FUNCTIONS (Unchanged) ---
+# --- UTILITY FUNCTIONS ---
 
 def convert_to_ist(data):
     """Converts the DataFrame index to IST/Asia/Kolkata timezone."""
@@ -33,7 +33,7 @@ def convert_to_ist(data):
         pass 
     return data
 
-# --- DATA FETCHING WITH RETRY LOGIC (Unchanged) ---
+# --- DATA FETCHING WITH RETRY LOGIC ---
 
 def fetch_data_with_retry(ticker, period, interval='1d', max_retries=3, delay=3):
     """Fetch data with retry logic and error handling to bypass rate limits."""
@@ -63,7 +63,7 @@ def fetch_data_with_retry(ticker, period, interval='1d', max_retries=3, delay=3)
                 
     return pd.DataFrame() 
 
-# --- INTEGRATED FETCH AND PREPARE (Unchanged) ---
+# --- INTEGRATED FETCH AND PREPARE ---
 
 @st.cache_data(ttl=3600)
 def fetch_and_prepare_data(ticker_a, ticker_b, period):
@@ -96,35 +96,35 @@ def fetch_and_prepare_data(ticker_a, ticker_b, period):
         
     return df, None
 
-# --- TRADING LOGIC WITH BULLETPROOF BETA FUNCTION ---
+# --- TRADING LOGIC WITH INDEX ERROR FIX ---
 
 def get_beta(series):
     """
     Calculates the hedge ratio (Beta) using OLS or NumPy least squares.
-    FIX: Ensures a single scalar is always returned to prevent the ValueError.
+    FIX: Explicitly checks and reshapes the array dimension to prevent IndexError.
     """
-    if series.size < 2: # Need at least two points to run regression
+    if series.size < 2: 
         return np.nan
         
-    # Since raw=True, 'series' is a NumPy array: column 0 is A (y), column 1 is B (X)
+    # NEW FIX: Dimension check for IndexError (too many indices)
+    if series.ndim == 1 or series.shape[1] != 2:
+        return np.nan
+
+    # Now we safely access the columns (A and B)
     y = series[:, 0]
-    X = series[:, 1]
+    X_var = series[:, 1]
     
-    # 1. Prepare X: Add constant (intercept) to X for OLS
-    X = add_constant(X, prepend=False) 
+    X = add_constant(X_var, prepend=False) 
     
     try:
-        # Try OLS (preferred as it provides statistical context, though slow)
+        # Try OLS (preferred)
         model = OLS(y, X).fit()
         return model.params[0] 
         
     except Exception:
-        # Fallback to NumPy's least squares (lstsq) if OLS fails, as it's more robust
+        # Fallback to NumPy's least squares (lstsq)
         try:
-            # lstsq returns (coefficients, residuals, rank, singular_values)
-            # The coefficient for the X variable (Beta) is the first element
             coefficients, _, _, _ = np.linalg.lstsq(X, y, rcond=None)
-            # The coefficient for X (B) is the first element, the constant is the second
             return float(coefficients[0])
             
         except Exception:
@@ -133,7 +133,6 @@ def get_beta(series):
 def calculate_spread_and_zscore(df):
     """Calculates the spread and Z-Score using a rolling window."""
 
-    # We keep raw=True to ensure the rolling application returns a single column.
     df['Beta'] = df[['A', 'B']].rolling(WINDOW).apply(get_beta, raw=True).shift(1)
     df.dropna(subset=['Beta'], inplace=True)
     
