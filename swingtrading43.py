@@ -33,7 +33,7 @@ for key in ['data_fetched', 'df1', 'df2', 'ticker1', 'ticker2', 'interval', 'per
         else:
             st.session_state[key] = None
 
-# --- UTILITY FUNCTIONS (Pandas-Only Indicators) ---
+# --- UTILITY FUNCTIONS ---
 
 def calculate_sma(data_series, window):
     """Calculates Simple Moving Average (SMA)."""
@@ -92,11 +92,24 @@ def fetch_and_process_data(ticker, interval, period, sleep_sec):
     except Exception as e:
         st.error(f"An error occurred fetching data for {ticker}: {e}")
         return pd.DataFrame()
+        
+def extract_scalar(value):
+    """Ensures the value is a scalar, handling potential Series of length 1."""
+    if isinstance(value, pd.Series):
+        if not value.empty and len(value) == 1:
+            return value.item()
+        return np.nan
+    return value
 
 def get_fibonacci_levels(df):
     """Calculates high/low and returns simple Fibonacci retracement levels."""
-    high = df['High'].max()
-    low = df['Low'].min()
+    # FIX: Ensure max/min returns are scalars using extract_scalar
+    high = extract_scalar(df['High'].max())
+    low = extract_scalar(df['Low'].min())
+    
+    if pd.isna(high) or pd.isna(low):
+         return {lvl: np.nan for lvl in ['0.0%', '23.6%', '38.2%', '50.0%', '61.8%', '78.6%', '100%']}
+         
     diff = high - low
     
     levels = {
@@ -110,20 +123,12 @@ def get_fibonacci_levels(df):
     }
     return levels
 
-def extract_scalar(value):
-    """Ensures the value is a scalar, handling potential Series of length 1."""
-    if isinstance(value, pd.Series):
-        if not value.empty and len(value) == 1:
-            return value.item()
-        return np.nan
-    return value
-
 def calculate_basic_metrics(df, label, interval):
     """Calculates current price, change, and points gained/lost."""
     if df.empty or len(df) < 2:
         return None, None
     
-    # Extract scalars to prevent TypeError
+    # FIX: Extract scalars to prevent TypeError
     current_price = extract_scalar(df['Close'].iloc[-1])
     prev_close = extract_scalar(df['Close'].iloc[-2])
     
@@ -133,7 +138,6 @@ def calculate_basic_metrics(df, label, interval):
     points_change = current_price - prev_close
     percent_change = (points_change / prev_close) * 100
     
-    # Line 130 fix applied implicitly by ensuring inputs are scalars
     delta_str = f"{points_change:+.2f} pts ({percent_change:+.2f}%)"
     
     st.metric(label=f"Current Price ({label} / {interval})", 
@@ -164,6 +168,7 @@ def perform_mtfa(df, ticker_label):
     data = []
     
     for ma in [20, 50, 200]:
+        # FIX: Ensure scalar value extraction
         ma_value = extract_scalar(last_row[f'EMA_{ma}'])
         position = get_ma_position(current_close, ma_value)
         
@@ -175,6 +180,7 @@ def perform_mtfa(df, ticker_label):
             'Trend Proxy': 'Up' if ma_value < current_close else 'Down'
         })
     
+    # FIX: Ensure scalar value extraction
     rsi_value = extract_scalar(last_row['RSI'])
     
     data.append({
@@ -199,7 +205,8 @@ def perform_mtfa(df, ticker_label):
     st.dataframe(mtfa_df.style.applymap(color_status, subset=['Price vs. Indicator', 'Trend Proxy']), use_container_width=True, hide_index=True)
     
     fibo_levels = get_fibonacci_levels(df)
-    st.markdown(f"**Key 50% Fibonacci Level:** `{fibo_levels['50.0%']:.2f}`")
+    # FIX: Line 202 is now safe because get_fibonacci_levels returns scalar values
+    st.markdown(f"**Key 50% Fibonacci Level:** `{fibo_levels['50.0%']:.2f}`") 
     st.info("📚 Summary: True MTFA requires resampling data across multiple intervals.")
 
 def perform_ratio_analysis(df1, df2):
@@ -215,7 +222,7 @@ def perform_ratio_analysis(df1, df2):
         st.warning("No overlapping data found for ratio calculation.")
         return
 
-    # Extract scalars for summary metrics
+    # FIX: Extract scalars for summary metrics
     ratio_mean = extract_scalar(df_combined['Ratio'].mean())
     ratio_std = extract_scalar(df_combined['Ratio'].std())
     current_ratio = extract_scalar(df_combined['Ratio'].iloc[-1])
@@ -247,7 +254,7 @@ def perform_statistical_analysis(df, ticker_label):
         st.info("Cannot calculate returns distribution.")
         return
         
-    # Extract scalars for summary metrics
+    # FIX: Extract scalars for summary metrics
     mu = extract_scalar(returns.mean())
     sigma = extract_scalar(returns.std())
     
@@ -271,7 +278,7 @@ def perform_statistical_analysis(df, ticker_label):
     fig.add_trace(go.Scatter(x=x_axis * 100, y=pdf, mode='lines', name='Normal Distribution', line=dict(color='blue')))
     
     if not np.isnan(current_z):
-        current_return = returns.iloc[-1] * 100
+        current_return = extract_scalar(returns.iloc[-1]) * 100
         fig.add_vline(x=current_return, line_width=2, line_dash="dash", line_color="red", name="Current Position")
     
     fig.update_layout(title='Returns Distribution with Normal Curve',
@@ -312,7 +319,6 @@ def main_dashboard():
     st.title("🎛️ Professional Algo Trading Dashboard")
     st.markdown("---")
     
-    # --- 1. Data Fetching & Management (Sidebar) ---
     with st.sidebar:
         st.header("⚙️ Data & Config")
         
@@ -353,13 +359,11 @@ def main_dashboard():
                     st.session_state.df2 = fetch_and_process_data(ticker2, interval, period, sleep_sec)
             
             st.session_state.data_fetched = True
-            # FIX: Use st.rerun()
             st.rerun()
             
     # --- Main Content ---
     if st.session_state.data_fetched and not st.session_state.df1.empty:
         
-        # --- 2. Basic Statistics Display ---
         st.header("📈 Current Market Metrics")
         col1, col2, col3 = st.columns(3)
         
@@ -450,4 +454,4 @@ def main_dashboard():
 # --- EXECUTE ---
 if __name__ == "__main__":
     main_dashboard()
-
+                    
