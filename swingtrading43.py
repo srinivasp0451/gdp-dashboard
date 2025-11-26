@@ -33,7 +33,7 @@ for key in ['data_fetched', 'df1', 'df2', 'ticker1', 'ticker2', 'interval', 'per
         else:
             st.session_state[key] = None
 
-# --- UTILITY FUNCTIONS ---
+# --- CORE UTILITY FUNCTIONS ---
 
 def calculate_sma(data_series, window):
     """Calculates Simple Moving Average (SMA)."""
@@ -94,9 +94,16 @@ def fetch_and_process_data(ticker, interval, period, sleep_sec):
         return pd.DataFrame()
         
 def extract_scalar(value):
-    """Ensures the value is a scalar, handling potential Series of length 1."""
+    """
+    Ensures the value is a scalar, handling potential Pandas Series or 
+    NumPy arrays of length 1, preventing format string errors.
+    """
     if isinstance(value, pd.Series):
         if not value.empty and len(value) == 1:
+            return value.item()
+        return np.nan
+    elif isinstance(value, np.ndarray):
+        if value.size == 1:
             return value.item()
         return np.nan
     return value
@@ -168,7 +175,6 @@ def perform_mtfa(df, ticker_label):
     data = []
     
     for ma in [20, 50, 200]:
-        # FIX: Ensure scalar value extraction
         ma_value = extract_scalar(last_row[f'EMA_{ma}'])
         position = get_ma_position(current_close, ma_value)
         
@@ -180,7 +186,6 @@ def perform_mtfa(df, ticker_label):
             'Trend Proxy': 'Up' if ma_value < current_close else 'Down'
         })
     
-    # FIX: Ensure scalar value extraction
     rsi_value = extract_scalar(last_row['RSI'])
     
     data.append({
@@ -205,7 +210,6 @@ def perform_mtfa(df, ticker_label):
     st.dataframe(mtfa_df.style.applymap(color_status, subset=['Price vs. Indicator', 'Trend Proxy']), use_container_width=True, hide_index=True)
     
     fibo_levels = get_fibonacci_levels(df)
-    # FIX: Line 202 is now safe because get_fibonacci_levels returns scalar values
     st.markdown(f"**Key 50% Fibonacci Level:** `{fibo_levels['50.0%']:.2f}`") 
     st.info("📚 Summary: True MTFA requires resampling data across multiple intervals.")
 
@@ -254,12 +258,13 @@ def perform_statistical_analysis(df, ticker_label):
         st.info("Cannot calculate returns distribution.")
         return
         
-    # FIX: Extract scalars for summary metrics
+    # FIX: Ensure scalars when calculating mean/std from returns
     mu = extract_scalar(returns.mean())
     sigma = extract_scalar(returns.std())
     
     z_scores = (returns - mu) / sigma
     
+    # FIX: Ensure scalars when calculating skew/kurtosis (scipy functions can return numpy arrays)
     skewness = extract_scalar(skew(returns))
     kurt = extract_scalar(kurtosis(returns))
     current_z = extract_scalar(z_scores.iloc[-1]) if not z_scores.empty else np.nan
