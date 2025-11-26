@@ -20,7 +20,8 @@ WINDOW = 252
 ENTRY_Z_SCORE = 2.0
 EXIT_Z_SCORE = 0.5 
 
-# --- UTILITY FUNCTION FOR TIMEZONE (Required by fetch_data_with_retry) ---
+# --- UTILITY FUNCTIONS ---
+
 def convert_to_ist(data):
     """Converts the DataFrame index to IST/Asia/Kolkata timezone."""
     try:
@@ -30,35 +31,30 @@ def convert_to_ist(data):
         else:
             # Convert directly if timezone aware
             data.index = data.index.tz_convert(IST_TIMEZONE)
-    except Exception as e:
-        # Handle cases where index conversion fails (e.g., if index isn't DatetimeIndex)
-        st.warning(f"Timezone conversion failed: {e}. Keeping original index.")
+    except Exception:
+        # Pass silently if conversion fails
+        pass 
     return data
 
-# --- DATA FETCHING WITH RETRY LOGIC (User-Provided & Enhanced) ---
+# --- DATA FETCHING WITH RETRY LOGIC ---
 
 def fetch_data_with_retry(ticker, period, interval='1d', max_retries=3, delay=3):
     """Fetch data with retry logic and error handling to bypass rate limits."""
     
-    # We enforce '1d' interval here as the Pairs Trading Strategy is typically done on daily data
-    # to avoid complex intraday data gaps and calculation load.
-    
     for attempt in range(max_retries):
         try:
-            # Rate limiting delay
             time.sleep(delay)  
-            
             data = yf.download(ticker, period=period, interval=interval, progress=False)
             
             if not data.empty:
-                # 1. Flatten multi-index columns if present (common issue with yfinance)
+                # 1. Flatten multi-index columns
                 if isinstance(data.columns, pd.MultiIndex):
                     data.columns = data.columns.get_level_values(0)
                 
-                # 2. Ensure standard column names (e.g., 'adj close' -> 'Adj Close')
+                # 2. Ensure standard column names
                 data.columns = [col.strip().title() for col in data.columns]
                 
-                # 3. Convert to IST (if required by the context)
+                # 3. Convert to IST
                 return convert_to_ist(data)
             else:
                 st.warning(f"No data returned for {ticker} (Attempt {attempt + 1}).")
@@ -66,22 +62,20 @@ def fetch_data_with_retry(ticker, period, interval='1d', max_retries=3, delay=3)
         except Exception as e:
             if attempt < max_retries - 1:
                 st.warning(f"Attempt {attempt + 1} failed for {ticker}: {str(e)}. Retrying in {delay * (attempt + 2)}s...")
-                time.sleep(delay * (attempt + 2)) # Exponential backoff
+                time.sleep(delay * (attempt + 2)) 
             else:
                 st.error(f"Failed to fetch data for {ticker} after {max_retries} attempts.")
                 return pd.DataFrame()
                 
-    return pd.DataFrame() # Should only be reached if all attempts fail
+    return pd.DataFrame() 
 
-# --- INTEGRATED FETCH AND PREPARE (Replacing the old function) ---
+# --- INTEGRATED FETCH AND PREPARE ---
 
 @st.cache_data(ttl=3600)
 def fetch_and_prepare_data(ticker_a, ticker_b, period):
     """Fetches, cleans, and merges data using the robust retry mechanism."""
     
-    # Fetch Data A
     data_a_raw = fetch_data_with_retry(ticker_a, period, interval='1d')
-    # Fetch Data B
     data_b_raw = fetch_data_with_retry(ticker_b, period, interval='1d')
 
     if data_a_raw.empty or data_b_raw.empty:
@@ -91,41 +85,48 @@ def fetch_and_prepare_data(ticker_a, ticker_b, period):
         if 'Adj Close' in data.columns:
             return data['Adj Close']
         elif 'Close' in data.columns:
-            st.warning(f"Using 'Close' price for {ticker_name} as 'Adj Close' is unavailable.")
             return data['Close']
         else:
             return None
 
-    # Extract required price series using the new column names (Title Case)
     data_a = extract_price_series(data_a_raw, ticker_a)
     data_b = extract_price_series(data_b_raw, ticker_b)
 
     if data_a is None or data_b is None:
         return pd.DataFrame(), "Price column (Adj Close or Close) not found in fetched data."
 
-    # Combine, align index, and drop missing data
     df = pd.DataFrame({'A': data_a, 'B': data_b}).dropna()
     
     if len(df) < WINDOW:
-        return pd.DataFrame(), f"Insufficient overlapping data (need > {WINDOW} points, got {len(df)})."
+        return pd.DataFrame(), f"Insufficient overlapping data (need > {WINDOW} points, got {len(df)}). Reduce the Lookback Window or increase the Data Period."
         
     return df, None
 
-# --- TRADING LOGIC (Unchanged and Correct) ---
+# --- TRADING LOGIC WITH KEYERROR FIX ---
+
+def get_beta(series):
+    """Calculates the hedge ratio (Beta) using Ordinary Least Squares (OLS)."""
+    # FIX for KeyError: 'A' -> Defensive access using .loc 
+    # and ensuring the series is not empty before regression.
+    if series.empty:
+        return np.nan
+        
+    try:
+        # Accessing columns 'A' and 'B' from the passed rolling slice
+        y = series.loc[:, 'A']
+        X = series.loc[:, 'B']
+        
+        X = add_constant(X, prepend=False) 
+        model = OLS(y, X).fit()
+        return model.params[0] 
+    except Exception:
+         return np.nan
 
 def calculate_spread_and_zscore(df):
-    """Calculates the hedge ratio, spread, and Z-Score using a rolling window."""
-    
-    def get_beta(series):
-        y = series['A']
-        X = series['B']
-        X = add_constant(X, prepend=False) 
-        try:
-            model = OLS(y, X).fit()
-            return model.params[0] 
-        except:
-             return np.nan
+    """Calculates the spread and Z-Score using a rolling window."""
 
+    # We apply the rolling function to the entire DataFrame slice df[['A', 'B']]
+    # This guarantees the 'A' and 'B' columns exist in the slice passed to get_beta.
     df['Beta'] = df[['A', 'B']].rolling(WINDOW).apply(get_beta, raw=False).shift(1)
     df.dropna(subset=['Beta'], inplace=True)
     
@@ -196,7 +197,7 @@ def display_results(df_final):
 # --- MAIN EXECUTION ---
 def main_pairs_dashboard():
     st.title("🤝 Professional Pairs Trading Strategy (Z-Score Mean Reversion)")
-    st.markdown("This version uses **Retry Logic** to handle rate limits and data failures.")
+    st.markdown("This version uses **Retry Logic** and **Defensive Programming** for high reliability.")
 
     if 'run_backtest' not in st.session_state:
         st.session_state.run_backtest = False
