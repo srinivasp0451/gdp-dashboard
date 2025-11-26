@@ -110,7 +110,6 @@ def extract_scalar(value):
 
 def get_fibonacci_levels(df):
     """Calculates high/low and returns simple Fibonacci retracement levels."""
-    # FIX: Ensure max/min returns are scalars using extract_scalar
     high = extract_scalar(df['High'].max())
     low = extract_scalar(df['Low'].min())
     
@@ -135,7 +134,6 @@ def calculate_basic_metrics(df, label, interval):
     if df.empty or len(df) < 2:
         return None, None
     
-    # FIX: Extract scalars to prevent TypeError
     current_price = extract_scalar(df['Close'].iloc[-1])
     prev_close = extract_scalar(df['Close'].iloc[-2])
     
@@ -226,7 +224,6 @@ def perform_ratio_analysis(df1, df2):
         st.warning("No overlapping data found for ratio calculation.")
         return
 
-    # FIX: Extract scalars for summary metrics
     ratio_mean = extract_scalar(df_combined['Ratio'].mean())
     ratio_std = extract_scalar(df_combined['Ratio'].std())
     current_ratio = extract_scalar(df_combined['Ratio'].iloc[-1])
@@ -258,13 +255,11 @@ def perform_statistical_analysis(df, ticker_label):
         st.info("Cannot calculate returns distribution.")
         return
         
-    # FIX: Ensure scalars when calculating mean/std from returns
     mu = extract_scalar(returns.mean())
     sigma = extract_scalar(returns.std())
     
     z_scores = (returns - mu) / sigma
     
-    # FIX: Ensure scalars when calculating skew/kurtosis (scipy functions can return numpy arrays)
     skewness = extract_scalar(skew(returns))
     kurt = extract_scalar(kurtosis(returns))
     current_z = extract_scalar(z_scores.iloc[-1]) if not z_scores.empty else np.nan
@@ -275,7 +270,6 @@ def perform_statistical_analysis(df, ticker_label):
     * **Current Z-Score**: `{current_z:.2f}` (Percentile: {norm.cdf(current_z)*100:.2f}th)
     """)
     
-    # Plot Bell Curve (Visualization)
     x_axis = np.arange(mu - 4 * sigma, mu + 4 * sigma, sigma / 100)
     pdf = norm.pdf(x_axis, mu, sigma)
 
@@ -289,6 +283,7 @@ def perform_statistical_analysis(df, ticker_label):
     fig.update_layout(title='Returns Distribution with Normal Curve',
                       xaxis_title='Returns (%)', yaxis_title='Probability Density')
     st.plotly_chart(fig, use_container_width=True)
+# [attachment_0](attachment)
 
 def generate_candlestick_chart(df, ticker_label, show_ratio=False):
     """Generates the interactive Candlestick Chart with EMAs and RSI."""
@@ -317,7 +312,60 @@ def generate_candlestick_chart(df, ticker_label, show_ratio=False):
     
     st.plotly_chart(fig, use_container_width=True)
     st.plotly_chart(fig_rsi, use_container_width=True)
+# 
 
+def monte_carlo_forecast(df, ticker, num_simulations=100, forecast_days=30):
+    """
+    Performs Monte Carlo Simulation for price forecasting.
+    This works best with '1d' or '1wk' interval data.
+    """
+    if df.empty or len(df) < 5:
+        st.warning("Insufficient data for Monte Carlo Simulation.")
+        return None, None
+    
+    returns = df['Close'].pct_change().dropna()
+    last_price = extract_scalar(df['Close'].iloc[-1])
+    
+    # Geometric Brownian Motion Parameters
+    mu = extract_scalar(returns.mean())
+    sigma = extract_scalar(returns.std())
+    
+    # Prepare simulation data structure
+    sim_data = np.zeros([forecast_days, num_simulations])
+    sim_data[0] = last_price
+    
+    # Run simulation
+    for t in range(1, forecast_days):
+        # Brownian motion component: change in price depends on mu, sigma, and a random term
+        sim_data[t] = sim_data[t - 1] * np.exp((mu - 0.5 * sigma**2) + sigma * np.random.normal(0, 1, num_simulations))
+
+    # Calculate VaR and expected prices
+    final_prices = sim_data[-1, :]
+    
+    results = {
+        '95% Lower Confidence (VaR)': np.percentile(final_prices, 5),
+        '50% Expected Price': np.percentile(final_prices, 50),
+        '95% Upper Confidence': np.percentile(final_prices, 95)
+    }
+
+    # Plot simulation paths
+    fig = go.Figure()
+    for i in range(num_simulations):
+        fig.add_trace(go.Scatter(y=sim_data[:, i], mode='lines', 
+                                 line=dict(width=1), opacity=0.15, 
+                                 showlegend=False))
+    
+    # Add final confidence levels
+    for percentile, color in [(5, 'red'), (50, 'blue'), (95, 'green')]:
+        fig.add_hline(y=np.percentile(final_prices, percentile), line_dash="dash", line_color=color, annotation_text=f"{percentile}% ({np.percentile(final_prices, percentile):.2f})")
+    
+    fig.update_layout(title=f'Monte Carlo Forecast for {ticker} ({forecast_days} periods)',
+                      xaxis_title=f"Time Steps ({st.session_state.interval})", 
+                      yaxis_title="Price")
+
+    st.plotly_chart(fig, use_container_width=True)
+    return results, last_price
+# 
 
 # --- MAIN LAYOUT FUNCTION ---
 def main_dashboard():
@@ -428,27 +476,60 @@ def main_dashboard():
         with tab_recommendation:
             st.header("🎯 FINAL TRADING RECOMMENDATION")
             
-            st.subheader("🔍 Pattern & Volatility Inputs (To be expanded)")
-            st.warning("⚠️ Advanced Pattern Recognition (Liquidity Sweeps, Divergences) and Volatility Bin analysis are logic-intensive and require further implementation.")
-            st.markdown("---")
+            st.subheader(f"🔮 Monte Carlo Forecasting ({ticker1})")
+            
+            # --- Monte Carlo Inputs ---
+            col_mc1, col_mc2 = st.columns(2)
+            num_simulations = col_mc1.slider("Number of Simulations", 50, 500, 250, 50)
+            forecast_periods = col_mc2.slider(f"Forecast Periods ({interval})", 5, 100, 30, 5)
 
-            st.subheader(f"Synthesis for {ticker1}")
-            st.markdown("""
-            **Based on current analysis:**
-            * **RSI (14):** Currently **Neutral (e.g., 55)**.
-            * **EMA Position:** Price is **Above** the EMA 20 but **Below** the EMA 200.
-            * **Statistical:** Current Z-Score is **within 1 $\sigma$** of the mean (Low Volatility/Normal Market).
-            * **Key Level:** Price is currently challenging the **50% Fibonacci retracement level**.
+            # Run and display MC simulation
+            mc_results, current_price = monte_carlo_forecast(st.session_state.df1, ticker1, num_simulations, forecast_periods)
+
+            st.markdown("---")
             
-            ## Recommendation: **NEUTRAL / WATCH FOR BREAKOUT**
-            * **Logic:** The market is consolidating near a major **Fibonacci/EMA** confluence. A clear breakout or rejection is needed.
-            * **Risk Management (Illustrative):**
-                * **Entry (Aggressive Breakout):** Above XXX
-                * **SL (Protection):** YYY (Below nearest support / $2 \times$ ATR)
-                * **Target 1:** ZZZ (Next Resistance)
+            st.subheader(f"Synthesis & Trade Signal for {ticker1}")
             
-            * **Backtested Accuracy:** The last 5 similar consolidations resulted in a **Breakout (60% accuracy)**.
-            """)
+            if mc_results and not pd.isna(current_price):
+                upper_bound = mc_results['95% Upper Confidence']
+                lower_bound = mc_results['95% Lower Confidence (VaR)']
+                
+                # Determine signal based on current price relative to MC bounds and 20 EMA
+                ema_20 = extract_scalar(st.session_state.df1['EMA_20'].iloc[-1])
+                
+                if current_price > upper_bound and current_price > ema_20:
+                     signal = "**STRONG BUY**"
+                     logic = f"Price is above the 95% MC Upper Bound and trending strongly above EMA 20. Target potential is the upper bound."
+                elif current_price < lower_bound and current_price < ema_20:
+                     signal = "**STRONG SELL**"
+                     logic = f"Price is below the 95% MC Lower Bound (VaR) and trending strongly below EMA 20. Potential downside to the lower bound."
+                elif current_price > ema_20 and mc_results['50% Expected Price'] > current_price:
+                    signal = "**BUY (Weak)**"
+                    logic = "Price is above EMA 20 and the 50% MC expectation is positive, suggesting mild upside momentum."
+                else:
+                    signal = "**NEUTRAL / WATCH**"
+                    logic = "The market is consolidating or lacks clear probabilistic direction (50% MC expectation is close to current price)."
+                
+                st.markdown(f"**Current Price:** `{current_price:,.2f}` | **50% MC Expectation:** `{mc_results['50% Expected Price']:.2f}`")
+
+                st.markdown(f"## Final Recommendation: {signal}")
+                st.info(f"**Logic Summary:** {logic}")
+                
+                # Illustrative Risk Management based on MC and technicals
+                st.markdown("""
+                ### Risk Management (Illustrative)
+                * **Entry (Target):** Based on breaking nearest Fib resistance/support.
+                * **Stop Loss (Protection):** Set SL $2 \times$ ATR below nearest support (using 95% VaR as a proxy).
+                """)
+
+                # Display MC summary table
+                mc_table = pd.DataFrame(mc_results.items(), columns=['Metric', 'Price'])
+                mc_table['Price'] = mc_table['Price'].apply(lambda x: f"{x:,.2f}")
+                st.dataframe(mc_table, use_container_width=True, hide_index=True)
+            else:
+                 st.info("Monte Carlo results are not available or current price is missing. Check your data interval and period.")
+            
+            st.markdown("---")
 
     elif st.session_state.data_fetched and st.session_state.df1.empty:
         st.error(f"No valid data to display for {st.session_state.ticker1}. Please check the ticker symbol, period, and interval.")
@@ -459,4 +540,3 @@ def main_dashboard():
 # --- EXECUTE ---
 if __name__ == "__main__":
     main_dashboard()
-                    
