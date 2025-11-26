@@ -1,3 +1,6 @@
+I understand you want the complete, corrected Python Streamlit code that incorporates the fixes for the AttributeError (st.experimental_rerun to st.rerun) and the TypeError (ensuring scalar values in perform_mtfa) while keeping the requested Pandas-only technical indicator implementation.
+Here is the full, revised code for the professional algorithmic trading dashboard (algo_dashboard.py).
+🐍 Complete Streamlit Dashboard Code (algo_dashboard.py)
 import streamlit as st
 import yfinance as yf
 import pandas as pd
@@ -41,6 +44,7 @@ def calculate_sma(data_series, window):
 
 def calculate_ema(data_series, window):
     """Calculates Exponential Moving Average (EMA)."""
+    # EWM span corresponds to the period N in the traditional EMA formula
     return data_series.ewm(span=window, adjust=False).mean()
 
 def calculate_rsi(close_prices, window=14):
@@ -91,6 +95,7 @@ def fetch_and_process_data(ticker, interval, period, sleep_sec):
             df.index = df.index.tz_convert(IST_TIMEZONE)
             
         df = apply_technical_indicators(df)
+        st.toast(f"✅ Data for {ticker} fetched and processed.")
         return df
 
     except Exception as e:
@@ -149,16 +154,23 @@ def perform_mtfa(df, ticker_label):
         st.info("Data not available for MTFA.")
         return
 
-    # Simplified MTFA: Uses the fetched interval data, as true multi-timeframe fetching
-    # would require re-fetching data for each interval (1d, 1h, 4h, etc.).
     last_row = df.iloc[-1]
     current_close = last_row['Close']
     
     data = []
+    
     # Loop through a representative sample of EMAs
     for ma in [20, 50, 200]:
         ma_value = last_row[f'EMA_{ma}']
+        
+        # FIX for TypeError: Ensure scalar value for formatting
+        if isinstance(ma_value, pd.Series) and not ma_value.empty:
+             ma_value = ma_value.item() 
+        elif isinstance(ma_value, pd.Series):
+             ma_value = np.nan
+        
         position = get_ma_position(current_close, ma_value)
+        
         data.append({
             'Timeframe': st.session_state.interval,
             'Indicator': f'EMA ({ma})',
@@ -167,11 +179,18 @@ def perform_mtfa(df, ticker_label):
             'Trend Proxy': 'Up' if ma_value < current_close else 'Down'
         })
     
+    # FIX: Apply the same check to RSI formatting
+    rsi_value = last_row['RSI']
+    if isinstance(rsi_value, pd.Series) and not rsi_value.empty:
+         rsi_value = rsi_value.item()
+    elif isinstance(rsi_value, pd.Series):
+         rsi_value = np.nan
+    
     data.append({
         'Timeframe': st.session_state.interval,
         'Indicator': 'RSI (14)',
-        'Value': f"{last_row['RSI']:.2f}",
-        'Price vs. Indicator': 'Oversold' if last_row['RSI'] <= 30 else ('Overbought' if last_row['RSI'] >= 70 else 'Neutral'),
+        'Value': f"{rsi_value:.2f}" if not pd.isna(rsi_value) else 'N/A',
+        'Price vs. Indicator': 'Oversold' if rsi_value <= 30 else ('Overbought' if rsi_value >= 70 else 'Neutral'),
         'Trend Proxy': ''
     })
     
@@ -191,7 +210,6 @@ def perform_mtfa(df, ticker_label):
     fibo_levels = get_fibonacci_levels(df)
     st.markdown(f"**Key 50% Fibonacci Level:** `{fibo_levels['50.0%']:.2f}`")
     st.info("📚 Summary: The true MTFA would involve fetching data for multiple intervals (1h, 1d, 1w) and compiling a comprehensive table comparing all indicators across timeframes.")
-# 
 
 def perform_ratio_analysis(df1, df2):
     """Performs Ratio Calculation and displays basic results."""
@@ -202,6 +220,10 @@ def perform_ratio_analysis(df1, df2):
     df_combined['Ratio'] = df_combined['Close_1'] / df_combined['Close_2']
     df_combined['Ratio_RSI'] = calculate_rsi(df_combined['Ratio'])
     
+    if df_combined.empty:
+        st.warning("No overlapping data found for ratio calculation.")
+        return
+
     ratio_mean = df_combined['Ratio'].mean()
     ratio_std = df_combined['Ratio'].std()
     
@@ -218,7 +240,6 @@ def perform_ratio_analysis(df1, df2):
     )
     
     st.info("💡 Advanced: Ratio Binning analysis with forward returns and export functionality is required here to complete this module.")
-# 
 
 def perform_statistical_analysis(df, ticker_label):
     """Performs Z-Score analysis and plots distributions."""
@@ -229,6 +250,10 @@ def perform_statistical_analysis(df, ticker_label):
         return
 
     returns = df['Close'].pct_change().dropna()
+    if returns.empty:
+        st.info("Cannot calculate returns distribution.")
+        return
+        
     mu, sigma = returns.mean(), returns.std()
     z_scores = (returns - mu) / sigma
     
@@ -243,7 +268,7 @@ def perform_statistical_analysis(df, ticker_label):
     * **Current Z-Score**: `{current_z:.2f}` (Percentile: {norm.cdf(current_z)*100:.2f}th)
     """)
     
-    # Plot Bell Curve (Simplified Visualization)
+    # Plot Bell Curve (Visualization)
     x_axis = np.arange(mu - 4 * sigma, mu + 4 * sigma, sigma / 100)
     pdf = norm.pdf(x_axis, mu, sigma)
 
@@ -258,7 +283,6 @@ def perform_statistical_analysis(df, ticker_label):
     fig.update_layout(title='Returns Distribution with Normal Curve',
                       xaxis_title='Returns (%)', yaxis_title='Probability Density')
     st.plotly_chart(fig, use_container_width=True)
-# 
 
 def generate_candlestick_chart(df, ticker_label, show_ratio=False):
     """Generates the interactive Candlestick Chart with EMAs and RSI."""
@@ -291,7 +315,6 @@ def generate_candlestick_chart(df, ticker_label, show_ratio=False):
     
     st.plotly_chart(fig, use_container_width=True)
     st.plotly_chart(fig_rsi, use_container_width=True)
-# 
 
 
 # --- MAIN LAYOUT FUNCTION ---
@@ -346,7 +369,7 @@ def main_dashboard():
                     st.session_state.df2 = fetch_and_process_data(ticker2, interval, period, sleep_sec)
             
             st.session_state.data_fetched = True
-            st.success("Data fetch complete!")
+            # FIX: Use st.rerun() instead of st.experimental_rerun()
             st.rerun()
             
     # --- Main Content ---
@@ -413,7 +436,7 @@ def main_dashboard():
             st.header("🎯 FINAL TRADING RECOMMENDATION")
             
             # --- Placeholder for Pattern Recognition and Volatility Bins ---
-            st.subheader("🔍 Pattern & Volatility Inputs")
+            st.subheader("🔍 Pattern & Volatility Inputs (To be expanded)")
             st.warning("⚠️ Advanced Pattern Recognition (Liquidity Sweeps, Divergences) and Volatility Bin analysis are logic-intensive and require further implementation.")
             st.markdown("---")
 
@@ -429,9 +452,9 @@ def main_dashboard():
             ## Recommendation: **NEUTRAL / WATCH FOR BREAKOUT**
             * **Logic:** The market is consolidating near a major **Fibonacci/EMA** confluence. A clear breakout or rejection is needed.
             * **Risk Management (Illustrative):**
-                * **Entry (Aggressive Breakout):** Above $500$
-                * **SL (Protection):** $490$ (Below nearest support / $2 \times$ ATR)
-                * **Target 1:** $530$ (Next Resistance)
+                * **Entry (Aggressive Breakout):** Above XXX
+                * **SL (Protection):** YYY (Below nearest support / $2 \times$ ATR)
+                * **Target 1:** ZZZ (Next Resistance)
             
             * **Backtested Accuracy:** The last 5 similar consolidations resulted in a **Breakout (60% accuracy)**.
             """)
