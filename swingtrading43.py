@@ -20,7 +20,7 @@ WINDOW = 252
 ENTRY_Z_SCORE = 2.0
 EXIT_Z_SCORE = 0.5 
 
-# --- UTILITY FUNCTIONS ---
+# --- UTILITY FUNCTIONS (Unchanged) ---
 
 def convert_to_ist(data):
     """Converts the DataFrame index to IST/Asia/Kolkata timezone."""
@@ -33,7 +33,7 @@ def convert_to_ist(data):
         pass 
     return data
 
-# --- DATA FETCHING WITH RETRY LOGIC ---
+# --- DATA FETCHING WITH RETRY LOGIC (Unchanged) ---
 
 def fetch_data_with_retry(ticker, period, interval='1d', max_retries=3, delay=3):
     """Fetch data with retry logic and error handling to bypass rate limits."""
@@ -63,7 +63,7 @@ def fetch_data_with_retry(ticker, period, interval='1d', max_retries=3, delay=3)
                 
     return pd.DataFrame() 
 
-# --- INTEGRATED FETCH AND PREPARE ---
+# --- INTEGRATED FETCH AND PREPARE (Unchanged) ---
 
 @st.cache_data(ttl=3600)
 def fetch_and_prepare_data(ticker_a, ticker_b, period):
@@ -96,31 +96,44 @@ def fetch_and_prepare_data(ticker_a, ticker_b, period):
         
     return df, None
 
-# --- TRADING LOGIC WITH VALUE ERROR FIX ---
+# --- TRADING LOGIC WITH BULLETPROOF BETA FUNCTION ---
 
 def get_beta(series):
-    """Calculates the hedge ratio (Beta) using OLS."""
-    # Since raw=True is used in apply, 'series' is now a NumPy array (n rows x 2 columns)
-    if series.size == 0:
+    """
+    Calculates the hedge ratio (Beta) using OLS or NumPy least squares.
+    FIX: Ensures a single scalar is always returned to prevent the ValueError.
+    """
+    if series.size < 2: # Need at least two points to run regression
         return np.nan
         
+    # Since raw=True, 'series' is a NumPy array: column 0 is A (y), column 1 is B (X)
+    y = series[:, 0]
+    X = series[:, 1]
+    
+    # 1. Prepare X: Add constant (intercept) to X for OLS
+    X = add_constant(X, prepend=False) 
+    
     try:
-        # y is the first column (A), X is the second (B)
-        y = series[:, 0]
-        X = series[:, 1]
-        
-        # OLS requires the constant term added to X
-        X = add_constant(X, prepend=False) 
+        # Try OLS (preferred as it provides statistical context, though slow)
         model = OLS(y, X).fit()
         return model.params[0] 
+        
     except Exception:
-         return np.nan
+        # Fallback to NumPy's least squares (lstsq) if OLS fails, as it's more robust
+        try:
+            # lstsq returns (coefficients, residuals, rank, singular_values)
+            # The coefficient for the X variable (Beta) is the first element
+            coefficients, _, _, _ = np.linalg.lstsq(X, y, rcond=None)
+            # The coefficient for X (B) is the first element, the constant is the second
+            return float(coefficients[0])
+            
+        except Exception:
+            return np.nan
 
 def calculate_spread_and_zscore(df):
     """Calculates the spread and Z-Score using a rolling window."""
 
-    # FIX: Change raw=False to raw=True (Line 130 fix)
-    # When raw=True, the function get_beta receives a NumPy array, not a DataFrame slice.
+    # We keep raw=True to ensure the rolling application returns a single column.
     df['Beta'] = df[['A', 'B']].rolling(WINDOW).apply(get_beta, raw=True).shift(1)
     df.dropna(subset=['Beta'], inplace=True)
     
@@ -205,12 +218,10 @@ def main_pairs_dashboard():
     with st.sidebar:
         st.header("Stock Pair & Parameters")
         
-        # Ticker A input
         col_a_sel, col_a_text = st.columns([1, 2])
         base_a = col_a_sel.selectbox("Stock A (Base)", STANDARD_TICKERS, index=0, key='sb_a')
         st.session_state.ticker_a = col_a_text.text_input("Custom A (Override)", value=base_a).upper()
 
-        # Ticker B input
         col_b_sel, col_b_text = st.columns([1, 2])
         base_b = col_b_sel.selectbox("Stock B (Hedge)", STANDARD_TICKERS, index=1, key='sb_b')
         st.session_state.ticker_b = col_b_text.text_input("Custom B (Override)", value=base_b).upper()
