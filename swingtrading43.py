@@ -41,7 +41,6 @@ def calculate_sma(data_series, window):
 
 def calculate_ema(data_series, window):
     """Calculates Exponential Moving Average (EMA)."""
-    # EWM span corresponds to the period N in the traditional EMA formula
     return data_series.ewm(span=window, adjust=False).mean()
 
 def calculate_rsi(close_prices, window=14):
@@ -62,15 +61,11 @@ def apply_technical_indicators(df):
     if df.empty:
         return df
     
-    # --- Moving Averages (SMA & EMA) ---
     for window in MA_WINDOWS:
         df[f'EMA_{window}'] = calculate_ema(df['Close'], window)
         df[f'SMA_{window}'] = calculate_sma(df['Close'], window)
         
-    # --- Momentum (RSI) ---
     df['RSI'] = calculate_rsi(df['Close'], window=RSI_WINDOW)
-    
-    # --- Volatility Proxy (Standard Deviation) ---
     df['Volatility_Pct'] = df['Close'].pct_change().rolling(window=20).std() * 100
     
     return df
@@ -85,7 +80,6 @@ def fetch_and_process_data(ticker, interval, period, sleep_sec):
         if df.empty:
             return pd.DataFrame()
 
-        # Timezone Handling: Convert to IST
         if df.index.tz is None:
             df.index = df.index.tz_localize('UTC').tz_convert(IST_TIMEZONE)
         else:
@@ -116,17 +110,30 @@ def get_fibonacci_levels(df):
     }
     return levels
 
+def extract_scalar(value):
+    """Ensures the value is a scalar, handling potential Series of length 1."""
+    if isinstance(value, pd.Series):
+        if not value.empty and len(value) == 1:
+            return value.item()
+        return np.nan
+    return value
+
 def calculate_basic_metrics(df, label, interval):
     """Calculates current price, change, and points gained/lost."""
     if df.empty or len(df) < 2:
         return None, None
     
-    current_price = df['Close'].iloc[-1]
-    prev_close = df['Close'].iloc[-2]
+    # Extract scalars to prevent TypeError
+    current_price = extract_scalar(df['Close'].iloc[-1])
+    prev_close = extract_scalar(df['Close'].iloc[-2])
     
+    if pd.isna(current_price) or pd.isna(prev_close):
+        return None, None
+
     points_change = current_price - prev_close
     percent_change = (points_change / prev_close) * 100
     
+    # Line 130 fix applied implicitly by ensuring inputs are scalars
     delta_str = f"{points_change:+.2f} pts ({percent_change:+.2f}%)"
     
     st.metric(label=f"Current Price ({label} / {interval})", 
@@ -152,20 +159,12 @@ def perform_mtfa(df, ticker_label):
         return
 
     last_row = df.iloc[-1]
-    current_close = last_row['Close']
+    current_close = extract_scalar(last_row['Close'])
     
     data = []
     
-    # Loop through a representative sample of EMAs
     for ma in [20, 50, 200]:
-        ma_value = last_row[f'EMA_{ma}']
-        
-        # FIX for TypeError: Ensure scalar value for formatting
-        if isinstance(ma_value, pd.Series) and not ma_value.empty:
-             ma_value = ma_value.item() 
-        elif isinstance(ma_value, pd.Series):
-             ma_value = np.nan
-        
+        ma_value = extract_scalar(last_row[f'EMA_{ma}'])
         position = get_ma_position(current_close, ma_value)
         
         data.append({
@@ -176,12 +175,7 @@ def perform_mtfa(df, ticker_label):
             'Trend Proxy': 'Up' if ma_value < current_close else 'Down'
         })
     
-    # FIX: Apply the same check to RSI formatting
-    rsi_value = last_row['RSI']
-    if isinstance(rsi_value, pd.Series) and not rsi_value.empty:
-         rsi_value = rsi_value.item()
-    elif isinstance(rsi_value, pd.Series):
-         rsi_value = np.nan
+    rsi_value = extract_scalar(last_row['RSI'])
     
     data.append({
         'Timeframe': st.session_state.interval,
@@ -206,7 +200,7 @@ def perform_mtfa(df, ticker_label):
     
     fibo_levels = get_fibonacci_levels(df)
     st.markdown(f"**Key 50% Fibonacci Level:** `{fibo_levels['50.0%']:.2f}`")
-    st.info("📚 Summary: The true MTFA would involve fetching data for multiple intervals (1h, 1d, 1w) and compiling a comprehensive table comparing all indicators across timeframes.")
+    st.info("📚 Summary: True MTFA requires resampling data across multiple intervals.")
 
 def perform_ratio_analysis(df1, df2):
     """Performs Ratio Calculation and displays basic results."""
@@ -221,13 +215,15 @@ def perform_ratio_analysis(df1, df2):
         st.warning("No overlapping data found for ratio calculation.")
         return
 
-    ratio_mean = df_combined['Ratio'].mean()
-    ratio_std = df_combined['Ratio'].std()
+    # Extract scalars for summary metrics
+    ratio_mean = extract_scalar(df_combined['Ratio'].mean())
+    ratio_std = extract_scalar(df_combined['Ratio'].std())
+    current_ratio = extract_scalar(df_combined['Ratio'].iloc[-1])
     
     st.markdown(f"""
     * **Mean Ratio:** `{ratio_mean:.4f}`
     * **Std Dev:** `{ratio_std:.4f}`
-    * **Current Ratio:** `{df_combined['Ratio'].iloc[-1]:.4f}`
+    * **Current Ratio:** `{current_ratio:.4f}`
     """)
     
     st.dataframe(
@@ -251,13 +247,15 @@ def perform_statistical_analysis(df, ticker_label):
         st.info("Cannot calculate returns distribution.")
         return
         
-    mu, sigma = returns.mean(), returns.std()
+    # Extract scalars for summary metrics
+    mu = extract_scalar(returns.mean())
+    sigma = extract_scalar(returns.std())
+    
     z_scores = (returns - mu) / sigma
     
-    # Summary Metrics
-    skewness = skew(returns)
-    kurt = kurtosis(returns)
-    current_z = z_scores.iloc[-1] if not z_scores.empty else np.nan
+    skewness = extract_scalar(skew(returns))
+    kurt = extract_scalar(kurtosis(returns))
+    current_z = extract_scalar(z_scores.iloc[-1]) if not z_scores.empty else np.nan
     
     st.markdown(f"""
     * **Mean Return ($\mu$)**: {mu * 100:.4f}%, **Std Dev ($\sigma$)**: {sigma * 100:.4f}%
@@ -272,7 +270,6 @@ def perform_statistical_analysis(df, ticker_label):
     fig = go.Figure()
     fig.add_trace(go.Scatter(x=x_axis * 100, y=pdf, mode='lines', name='Normal Distribution', line=dict(color='blue')))
     
-    # Highlight current Z-Score position
     if not np.isnan(current_z):
         current_return = returns.iloc[-1] * 100
         fig.add_vline(x=current_return, line_width=2, line_dash="dash", line_color="red", name="Current Position")
@@ -287,26 +284,22 @@ def generate_candlestick_chart(df, ticker_label, show_ratio=False):
         st.warning(f"No data to chart for {ticker_label}.")
         return
 
-    # Main Candlestick figure
     fig = go.Figure()
     fig.add_trace(go.Candlestick(x=df.index,
                                  open=df['Open'], high=df['High'],
                                  low=df['Low'], close=df['Close'],
                                  name='Candles'))
     
-    # EMA Overlays (20, 50, 200)
     for window in [20, 50, 200]:
         fig.add_trace(go.Scatter(x=df.index, y=df[f'EMA_{window}'], mode='lines', 
                                  name=f'EMA {window}', opacity=0.7))
 
-    # RSI Subplot
     fig_rsi = go.Figure()
     fig_rsi.add_trace(go.Scatter(x=df.index, y=df['RSI'], name='RSI', line=dict(color='purple')))
     fig_rsi.add_hline(y=70, line_dash="dash", line_color="red", name="Overbought")
     fig_rsi.add_hline(y=30, line_dash="dash", line_color="green", name="Oversold")
     fig_rsi.update_layout(height=200, title='Relative Strength Index (RSI)', yaxis_range=[0, 100])
 
-    # Final Layout
     fig.update_layout(title=f'{ticker_label} Price Chart ({st.session_state.interval})', 
                       xaxis_rangeslider_visible=False)
     
@@ -323,24 +316,20 @@ def main_dashboard():
     with st.sidebar:
         st.header("⚙️ Data & Config")
         
-        # Ticker 1 Setup
         col_t1, col_c1 = st.columns(2)
         ticker1_symbol = col_t1.selectbox("Ticker 1 Symbol", STANDARD_TICKERS, index=0)
         custom_ticker1 = col_c1.text_input("Custom Ticker 1 (Override)", value="")
         ticker1 = custom_ticker1.upper() if custom_ticker1 else ticker1_symbol
         st.session_state.ticker1 = ticker1
         
-        # Timeframe & Period
         col_i, col_p = st.columns(2)
         interval = col_i.selectbox("Timeframe", TIME_INTERVALS, index=4)
         period = col_p.selectbox("Period", PERIODS, index=2)
         st.session_state.interval = interval
         st.session_state.period = period
         
-        # Ratio Analysis Toggle
         enable_ratio = st.checkbox("Enable Ratio Analysis", value=False)
         
-        # Ticker 2 Setup (Conditional)
         ticker2 = None
         if enable_ratio:
             st.subheader("Ticker 2 (Ratio Basis)")
@@ -350,11 +339,9 @@ def main_dashboard():
             ticker2 = custom_ticker2.upper() if custom_ticker2 else ticker2_symbol
             st.session_state.ticker2 = ticker2
         
-        # API Config
         sleep_sec = st.slider("API Delay (seconds)", 0.5, 5.0, 2.5, 0.5)
         st.info(f"API Rate Limit Delay: {sleep_sec}s")
         
-        # Data Fetch Button
         if st.button("🚀 Fetch/Refresh Data"):
             st.session_state.data_fetched = False
             
@@ -366,7 +353,7 @@ def main_dashboard():
                     st.session_state.df2 = fetch_and_process_data(ticker2, interval, period, sleep_sec)
             
             st.session_state.data_fetched = True
-            # FIX: Use st.rerun() instead of st.experimental_rerun()
+            # FIX: Use st.rerun()
             st.rerun()
             
     # --- Main Content ---
@@ -384,7 +371,7 @@ def main_dashboard():
                 price2, points2 = calculate_basic_metrics(st.session_state.df2, ticker2, interval)
             
             with col3:
-                ratio = price1 / price2 if price1 and price2 else np.nan
+                ratio = price1 / price2 if price1 and price2 and not pd.isna(price1) and not pd.isna(price2) else np.nan
                 st.metric(label="Current Ratio (T1/T2)", value=f"{ratio:,.4f}" if not np.isnan(ratio) else "N/A")
         
         st.markdown("---")
@@ -432,12 +419,10 @@ def main_dashboard():
         with tab_recommendation:
             st.header("🎯 FINAL TRADING RECOMMENDATION")
             
-            # --- Placeholder for Pattern Recognition and Volatility Bins ---
             st.subheader("🔍 Pattern & Volatility Inputs (To be expanded)")
             st.warning("⚠️ Advanced Pattern Recognition (Liquidity Sweeps, Divergences) and Volatility Bin analysis are logic-intensive and require further implementation.")
             st.markdown("---")
 
-            # --- Final Recommendation Synthesis ---
             st.subheader(f"Synthesis for {ticker1}")
             st.markdown("""
             **Based on current analysis:**
