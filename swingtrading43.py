@@ -26,13 +26,10 @@ def convert_to_ist(data):
     """Converts the DataFrame index to IST/Asia/Kolkata timezone."""
     try:
         if data.index.tz is None:
-            # Assume data is UTC if timezone naive, then localize and convert
             data.index = data.index.tz_localize('UTC').tz_convert(IST_TIMEZONE)
         else:
-            # Convert directly if timezone aware
             data.index = data.index.tz_convert(IST_TIMEZONE)
     except Exception:
-        # Pass silently if conversion fails
         pass 
     return data
 
@@ -47,14 +44,11 @@ def fetch_data_with_retry(ticker, period, interval='1d', max_retries=3, delay=3)
             data = yf.download(ticker, period=period, interval=interval, progress=False)
             
             if not data.empty:
-                # 1. Flatten multi-index columns
                 if isinstance(data.columns, pd.MultiIndex):
                     data.columns = data.columns.get_level_values(0)
                 
-                # 2. Ensure standard column names
                 data.columns = [col.strip().title() for col in data.columns]
                 
-                # 3. Convert to IST
                 return convert_to_ist(data)
             else:
                 st.warning(f"No data returned for {ticker} (Attempt {attempt + 1}).")
@@ -102,20 +96,20 @@ def fetch_and_prepare_data(ticker_a, ticker_b, period):
         
     return df, None
 
-# --- TRADING LOGIC WITH KEYERROR FIX ---
+# --- TRADING LOGIC WITH VALUE ERROR FIX ---
 
 def get_beta(series):
-    """Calculates the hedge ratio (Beta) using Ordinary Least Squares (OLS)."""
-    # FIX for KeyError: 'A' -> Defensive access using .loc 
-    # and ensuring the series is not empty before regression.
-    if series.empty:
+    """Calculates the hedge ratio (Beta) using OLS."""
+    # Since raw=True is used in apply, 'series' is now a NumPy array (n rows x 2 columns)
+    if series.size == 0:
         return np.nan
         
     try:
-        # Accessing columns 'A' and 'B' from the passed rolling slice
-        y = series.loc[:, 'A']
-        X = series.loc[:, 'B']
+        # y is the first column (A), X is the second (B)
+        y = series[:, 0]
+        X = series[:, 1]
         
+        # OLS requires the constant term added to X
         X = add_constant(X, prepend=False) 
         model = OLS(y, X).fit()
         return model.params[0] 
@@ -125,9 +119,9 @@ def get_beta(series):
 def calculate_spread_and_zscore(df):
     """Calculates the spread and Z-Score using a rolling window."""
 
-    # We apply the rolling function to the entire DataFrame slice df[['A', 'B']]
-    # This guarantees the 'A' and 'B' columns exist in the slice passed to get_beta.
-    df['Beta'] = df[['A', 'B']].rolling(WINDOW).apply(get_beta, raw=False).shift(1)
+    # FIX: Change raw=False to raw=True (Line 130 fix)
+    # When raw=True, the function get_beta receives a NumPy array, not a DataFrame slice.
+    df['Beta'] = df[['A', 'B']].rolling(WINDOW).apply(get_beta, raw=True).shift(1)
     df.dropna(subset=['Beta'], inplace=True)
     
     df['Spread'] = df['A'] - df['Beta'] * df['B']
@@ -197,7 +191,7 @@ def display_results(df_final):
 # --- MAIN EXECUTION ---
 def main_pairs_dashboard():
     st.title("🤝 Professional Pairs Trading Strategy (Z-Score Mean Reversion)")
-    st.markdown("This version uses **Retry Logic** and **Defensive Programming** for high reliability.")
+    st.markdown("This highly resilient version uses **Retry Logic** and **Defensive Programming**.")
 
     if 'run_backtest' not in st.session_state:
         st.session_state.run_backtest = False
