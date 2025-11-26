@@ -123,6 +123,34 @@ def extract_scalar(value):
         return np.nan
     return value
 
+# --- FIX: Re-insert calculate_basic_metrics to resolve NameError ---
+def calculate_basic_metrics(df, label, interval):
+    """Calculates current price, change, and points gained/lost."""
+    if df.empty or len(df) < 2:
+        return None, None
+    
+    current_price = extract_scalar(df['Close'].iloc[-1])
+    prev_close = extract_scalar(df['Close'].iloc[-2])
+    
+    if pd.isna(current_price) or pd.isna(prev_close):
+        return None, None
+
+    points_change = current_price - prev_close
+    percent_change = (points_change / prev_close) * 100
+    
+    delta_str = f"{points_change:+.2f} pts ({percent_change:+.2f}%)"
+    
+    st.metric(label=f"Current Price ({label} / {interval})", 
+              value=f"{current_price:,.2f}", 
+              delta=delta_str,
+              delta_color="normal")
+    
+    return current_price, points_change
+# --- END FIX ---
+
+
+# --- REINSERTED DEPENDENT FUNCTIONS ---
+
 def get_fibonacci_levels(df):
     """Calculates high/low and returns simple Fibonacci retracement levels (Leading S/R)."""
     high = extract_scalar(df['High'].max())
@@ -146,21 +174,17 @@ def get_fibonacci_levels(df):
 
 def detect_rsi_divergence(df, lookback=40):
     """Simple check for recent divergence: price Higher Highs with RSI Lower Highs (Bearish)"""
-    # Logic simplified for integration; full implementation is complex.
-    
     close = df['Close'].iloc[-lookback:]
     rsi = df['RSI'].iloc[-lookback:]
     
     if len(close) < 5 or close.isnull().any() or rsi.isnull().any():
         return "N/A (Insufficient Data)"
         
-    # Check for Bearish Divergence (Price HH, RSI LH)
     price_highs = close[close == close.rolling(window=5, center=True).max()].dropna()
     if len(price_highs) >= 2 and price_highs.iloc[-1] > price_highs.iloc[-2]:
         if rsi[price_highs.index[-1]] < rsi[price_highs.index[-2]]:
             return f"⚠️ **BEARISH DIVERGENCE** (Price HH/RSI LH)"
     
-    # Check for Bullish Divergence (Price LL, RSI HL)
     price_lows = close[close == close.rolling(window=5, center=True).min()].dropna()
     if len(price_lows) >= 2 and price_lows.iloc[-1] < price_lows.iloc[-2]:
         if rsi[price_lows.index[-1]] > rsi[price_lows.index[-2]]:
@@ -168,139 +192,108 @@ def detect_rsi_divergence(df, lookback=40):
 
     return "No Recent Divergence Detected"
 
-# --- BACKTESTING MODULE ---
+def perform_leading_analysis(df, ticker_label):
+    """Focuses on Volatility, Fibonacci and Momentum Divergence."""
+    st.subheader(f"⚡ Leading Analysis: {ticker_label}")
+    if df.empty:
+        st.info("Data not available for Leading Analysis.")
+        return
 
-def run_backtest(df, ticker_label, current_price):
-    """
-    Runs a backtest on the algorithm using Keltner Channel and VaR rules.
+    last_row = df.iloc[-1]
+    current_close = extract_scalar(last_row['Close'])
     
-    Entry: Price closes outside KC AND Divergence is present.
-    SL: 99% VaR price equivalent.
-    TP: Price hits opposite KC_Middle line.
-    """
-    st.subheader(f"📊 Algorithm Backtest Results ({ticker_label})")
+    atr_value = extract_scalar(last_row['ATR'])
+    volatility_pct = extract_scalar(last_row['Volatility_Pct'])
     
-    df_test = df.copy().dropna()
+    st.markdown(f"""
+    * **Current ATR ({ATR_WINDOW} periods):** `{atr_value:,.2f}` (Risk Proxy)
+    * **Rolling Volatility (20 periods):** `{volatility_pct:.2f}%` (Market Energy)
+    """)
     
-    if len(df_test) < ATR_WINDOW + 2:
-        st.warning("Insufficient data for backtesting after dropping NaNs (need > 22 periods).")
-        return None
+    fibo_levels = get_fibonacci_levels(df)
+    st.markdown(f"**Key 50% Fibonacci Level:** `{fibo_levels['50.0%']:.2f}`")
+    
+    proximity = abs(current_close - fibo_levels['50.0%']) / atr_value if atr_value > 0 else np.inf
+    
+    if proximity <= 1.5 and atr_value > 0:
+        st.warning(f"Price is within 1.5 ATR of the 50% Fibonacci level ({fibo_levels['50.0%']:.2f}). **Expect a Decision Point.**")
+    elif current_close > fibo_levels['50.0%']:
+        st.success("Price is trading above the 50% Fibonacci Retracement.")
+    else:
+        st.error("Price is trading below the 50% Fibonacci Retracement.")
 
-    # Calculate 99% VaR (for Stop Loss) over the entire backtest period
-    returns = df_test['Close'].pct_change().dropna()
+    divergence = detect_rsi_divergence(df, lookback=40)
+    st.markdown(f"**RSI Divergence Check:** {divergence}")
+    
+    st.info("💡 Summary: Trading decisions should focus on confluence between Divergence signals and price action around Fibonacci/ATR levels.")
+
+def perform_ratio_analysis(df1, df2):
+    """Performs Ratio Calculation and displays basic results."""
+    st.subheader("⚖️ Ratio Analysis (Cointegration Check)")
+    
+    df_combined = pd.concat([df1['Close'], df2['Close']], axis=1).dropna()
+    df_combined.columns = ['Close_1', 'Close_2']
+    df_combined['Ratio'] = df_combined['Close_1'] / df_combined['Close_2']
+    df_combined['Ratio_RSI'] = calculate_rsi(df_combined['Ratio'])
+    
+    if df_combined.empty:
+        st.warning("No overlapping data found for ratio calculation.")
+        return
+
+    ratio_mean = extract_scalar(df_combined['Ratio'].mean())
+    ratio_std = extract_scalar(df_combined['Ratio'].std())
+    current_ratio = extract_scalar(df_combined['Ratio'].iloc[-1])
+    
+    st.markdown(f"""
+    * **Mean Ratio:** `{ratio_mean:.4f}`
+    * **Std Dev:** `{ratio_std:.4f}`
+    * **Current Ratio:** `{current_ratio:.4f}`
+    """)
+    
+    st.dataframe(
+        df_combined[['Ratio', 'Ratio_RSI']].tail(10), 
+        use_container_width=True, 
+        column_config={"__index__": st.column_config.DatetimeColumn("DateTime (IST)")}
+    )
+    
+    st.info("💡 Advanced: Ratio trading is a leading strategy. When the Ratio RSI is extreme (e.g., < 10 or > 90), the pair is statistically likely to mean-revert.")
+
+def perform_value_at_risk(df, ticker_label):
+    """Calculates Value at Risk (VaR) and Conditional VaR (CVaR)."""
+    st.subheader(f"📉 Value at Risk (VaR) Analysis ({ticker_label})")
+    
+    if len(df) < 2:
+        st.info("Insufficient data for VaR analysis.")
+        return
+
+    returns = df['Close'].pct_change().dropna()
     if returns.empty:
-        st.warning("Cannot calculate returns for VaR.")
-        return None
+        st.info("Cannot calculate returns distribution.")
+        return
         
+    current_price = extract_scalar(df['Close'].iloc[-1])
+    if pd.isna(current_price):
+         st.info("Current price not available for VaR price calculation.")
+         return
+
+    mu = extract_scalar(returns.mean())
+    sigma = extract_scalar(returns.std())
+    
+    VaR_95_hist = extract_scalar(returns.quantile(0.05))
     VaR_99_hist = extract_scalar(returns.quantile(0.01))
-    
-    # --- Backtest Core Logic Setup ---
-    trades = []
-    in_trade = False
-    entry_price = 0
-    trade_type = None # 'Long' or 'Short'
-    
-    # Iterate through data, starting after indicators have populated
-    start_index = df_test['ATR'].first_valid_index()
-    if start_index is None:
-        st.warning("Indicators did not populate correctly.")
-        return None
-        
-    start_loc = df_test.index.get_loc(start_index)
-    
-    # Simplified divergence check for backtesting: use RSI level crossing 50
-    df_test['RSI_Signal'] = np.where(df_test['RSI'] > 50, 1, -1) 
-    
-    for i in range(start_loc, len(df_test)):
-        current_close = df_test['Close'].iloc[i]
-        
-        # Calculate VaR Stop Loss for the current position
-        if in_trade:
-            # Use the calculated VaR percentage
-            if trade_type == 'Long':
-                sl_price = entry_price * (1 + VaR_99_hist) # VaR is negative, so adding VaR is reducing the entry price
-            else: # Short
-                sl_price = entry_price * (1 - VaR_99_hist) # Symmetrical level above entry
 
-        # 1. Trade Exit Check (SL or TP)
-        if in_trade:
-            # SL Check (Price breaches the VaR stop loss)
-            if (trade_type == 'Long' and current_close < sl_price) or \
-               (trade_type == 'Short' and current_close > sl_price):
-                exit_price = sl_price # Exit at SL price
-                points = (exit_price - entry_price) if trade_type == 'Long' else (entry_price - exit_price)
-                trades.append({'Entry': entry_price, 'Exit': exit_price, 'Type': trade_type, 
-                               'Points': points, 'Result': 'Loss (SL)'})
-                in_trade = False
-                continue
-
-            # TP Check (Price hits the opposite KC_Middle)
-            tp_price = df_test['KC_Middle'].iloc[i]
-            if (trade_type == 'Long' and current_close < tp_price) or \
-               (trade_type == 'Short' and current_close > tp_price):
-                exit_price = current_close # Exit at current close (simplified TP)
-                points = (exit_price - entry_price) if trade_type == 'Long' else (entry_price - exit_price)
-                trades.append({'Entry': entry_price, 'Exit': exit_price, 'Type': trade_type, 
-                               'Points': points, 'Result': 'Profit (TP)' if points > 0 else 'Loss (TP)'})
-                in_trade = False
-                continue
-        
-        # 2. Trade Entry Check (Only enter if not currently in a trade)
-        if not in_trade:
-            upper = df_test['KC_Upper'].iloc[i]
-            lower = df_test['KC_Lower'].iloc[i]
-            rsi_signal = df_test['RSI_Signal'].iloc[i]
-
-            # Long Entry: Close below KC_Lower AND RSI showing positive momentum (proxy for Bullish Divergence)
-            if current_close < lower and rsi_signal > 0:
-                in_trade = True
-                entry_price = current_close
-                trade_type = 'Long'
-
-            # Short Entry: Close above KC_Upper AND RSI showing negative momentum (proxy for Bearish Divergence)
-            elif current_close > upper and rsi_signal < 0:
-                in_trade = True
-                entry_price = current_close
-                trade_type = 'Short'
+    CVaR_95 = extract_scalar(returns[returns <= VaR_95_hist].mean()) if not pd.isna(VaR_95_hist) else np.nan
     
-    # --- Summarize Results ---
-    if not trades:
-        st.info("No trades were generated by the Keltner/VaR algorithm in this period.")
-        return None
-
-    trade_df = pd.DataFrame(trades)
+    st.markdown(f"""
+    **Current Price:** `{current_price:,.2f}`
     
-    # Calculate Metrics
-    total_trades = len(trade_df)
-    profitable_trades = len(trade_df[trade_df['Points'] > 0])
-    losing_trades = total_trades - profitable_trades
-    accuracy = (profitable_trades / total_trades) * 100
+    * **95% VaR (Historical):** `{VaR_95_hist*100:.3f}%` | Price Equivalent: `{current_price * (1 + VaR_95_hist):.2f}`
+    * **99% VaR (Historical):** `{VaR_99_hist*100:.3f}%` | Price Equivalent: `{current_price * (1 + VaR_99_hist):.2f}`
+    * **Conditional VaR (CVaR) 95%:** `{CVaR_95*100:.3f}%` (Expected loss if VaR is breached)
+    """)
     
-    total_points = extract_scalar(trade_df['Points'].sum())
-    total_percent = (total_points / entry_price) * 100 if total_trades > 0 else 0
+    st.warning("⚠️ VaR provides a **leading risk boundary**. The 99% VaR price equivalent is a strong candidate for a **Stop Loss** level, as it represents a 1% chance of being breached.")
     
-    # Final Result Dictionary
-    results = {
-        'Total Trades': total_trades,
-        'Profit Trades': profitable_trades,
-        'Loss Trades': losing_trades,
-        'Accuracy': f"{accuracy:.2f}%",
-        'Total Points Gained/Lost': f"{total_points:,.2f}",
-        'Total Return (%)': f"{total_percent:.2f}%"
-    }
-
-    # Display results in a clear table
-    st.markdown("### 📈 Performance Metrics")
-    st.table(pd.DataFrame(list(results.items()), columns=['Metric', 'Value']))
-
-    st.markdown("### 📜 Trade Log Sample")
-    st.dataframe(trade_df.tail(10), use_container_width=True)
-    
-    return results
-
-# --- Visualization and Display Functions (omitted for brevity, assume updated) ---
-# ... (calculate_basic_metrics, perform_leading_analysis, perform_value_at_risk remain the same)
-
 def generate_candlestick_chart(df, ticker_label):
     """Generates the interactive Candlestick Chart with KC, ATR and RSI."""
     if df.empty:
@@ -329,7 +322,8 @@ def generate_candlestick_chart(df, ticker_label):
     
     st.plotly_chart(fig, use_container_width=True)
     
-    # RSI Subplot (unchanged)
+    
+    # RSI Subplot
     fig_rsi = go.Figure()
     fig_rsi.add_trace(go.Scatter(x=df.index, y=df['RSI'], name='RSI', line=dict(color='purple')))
     fig_rsi.add_hline(y=70, line_dash="dash", line_color="red", name="Overbought")
@@ -337,13 +331,137 @@ def generate_candlestick_chart(df, ticker_label):
     fig_rsi.update_layout(height=200, title='Relative Strength Index (RSI)', yaxis_range=[0, 100])
     st.plotly_chart(fig_rsi, use_container_width=True)
     
-    # ATR Subplot (unchanged)
+    # ATR Subplot
     fig_atr = go.Figure()
     fig_atr.add_trace(go.Scatter(x=df.index, y=df['ATR'], name=f'ATR ({ATR_WINDOW})', line=dict(color='orange')))
     fig_atr.update_layout(height=200, title='Average True Range (ATR)')
     st.plotly_chart(fig_atr, use_container_width=True)
-    
 
+# --- BACKTESTING MODULE ---
+
+def run_backtest(df, ticker_label, current_price):
+    """
+    Runs a backtest on the algorithm using Keltner Channel and VaR rules.
+    
+    Entry: Price closes outside KC AND RSI showing momentum confirmation.
+    SL: 99% VaR price equivalent (Symmetrical for Short).
+    TP: Price hits opposite KC_Middle line.
+    """
+    st.subheader(f"📊 Algorithm Backtest Results ({ticker_label})")
+    
+    df_test = df.copy().dropna(subset=['KC_Upper', 'KC_Lower', 'RSI'])
+    
+    if len(df_test) < ATR_WINDOW + 2:
+        st.warning("Insufficient data for backtesting after dropping NaNs (need > 22 periods).")
+        return None
+
+    # Calculate 99% VaR (for Stop Loss) over the entire backtest period
+    returns = df_test['Close'].pct_change().dropna()
+    if returns.empty:
+        st.warning("Cannot calculate returns for VaR.")
+        return None
+        
+    VaR_99_hist = extract_scalar(returns.quantile(0.01))
+    
+    # --- Backtest Core Logic Setup ---
+    trades = []
+    in_trade = False
+    entry_price = 0
+    trade_type = None # 'Long' or 'Short'
+    
+    # Simplified divergence check for backtesting: use RSI level crossing 50
+    # RSI > 50 suggests Bullish Momentum/Confirmation; RSI < 50 suggests Bearish Momentum/Confirmation
+    df_test['RSI_Signal'] = np.where(df_test['RSI'] > 50, 1, -1) 
+    
+    for i in range(len(df_test)):
+        current_close = df_test['Close'].iloc[i]
+        
+        # 1. Trade Exit Check (SL or TP)
+        if in_trade:
+            # VaR Stop Loss Price Calculation
+            if trade_type == 'Long':
+                # VaR is typically negative. (1 + VaR_99_hist) will be < 1, resulting in SL price below entry.
+                sl_price = entry_price * (1 + VaR_99_hist) 
+            else: # Short
+                # Symmetrical VaR for short.
+                sl_price = entry_price * (1 - VaR_99_hist) 
+
+            # SL Check 
+            if (trade_type == 'Long' and current_close < sl_price) or \
+               (trade_type == 'Short' and current_close > sl_price):
+                exit_price = sl_price # Exit at SL price
+                points = (exit_price - entry_price) if trade_type == 'Long' else (entry_price - exit_price)
+                trades.append({'Entry': entry_price, 'Exit': exit_price, 'Type': trade_type, 
+                               'Points': points, 'Result': 'Loss (SL)'})
+                in_trade = False
+                continue
+
+            # TP Check (Price hits the opposite KC_Middle line)
+            tp_price = df_test['KC_Middle'].iloc[i]
+            if (trade_type == 'Long' and current_close > tp_price) or \
+               (trade_type == 'Short' and current_close < tp_price):
+                exit_price = current_close 
+                points = (exit_price - entry_price) if trade_type == 'Long' else (entry_price - exit_price)
+                trades.append({'Entry': entry_price, 'Exit': exit_price, 'Type': trade_type, 
+                               'Points': points, 'Result': 'Profit (TP)' if points > 0 else 'Loss (TP)'})
+                in_trade = False
+                continue
+        
+        # 2. Trade Entry Check (Only enter if not currently in a trade)
+        if not in_trade:
+            upper = df_test['KC_Upper'].iloc[i]
+            lower = df_test['KC_Lower'].iloc[i]
+            rsi_signal = df_test['RSI_Signal'].iloc[i]
+
+            # Long Entry: Close below KC_Lower (extreme) AND RSI showing momentum confirmation
+            if current_close < lower and rsi_signal == 1:
+                in_trade = True
+                entry_price = current_close
+                trade_type = 'Long'
+
+            # Short Entry: Close above KC_Upper (extreme) AND RSI showing momentum confirmation
+            elif current_close > upper and rsi_signal == -1:
+                in_trade = True
+                entry_price = current_close
+                trade_type = 'Short'
+    
+    # --- Summarize Results ---
+    if not trades:
+        st.info("No trades were generated by the Keltner/VaR algorithm in this period.")
+        return None
+
+    trade_df = pd.DataFrame(trades)
+    
+    total_trades = len(trade_df)
+    profitable_trades = len(trade_df[trade_df['Points'] > 0])
+    losing_trades = total_trades - profitable_trades
+    accuracy = (profitable_trades / total_trades) * 100
+    
+    total_points = extract_scalar(trade_df['Points'].sum())
+    
+    # Calculate Total Return based on the sum of percentage returns for each trade
+    trade_df['Return_Pct'] = trade_df.apply(
+        lambda row: (row['Exit'] - row['Entry']) / row['Entry'] if row['Type'] == 'Long' else (row['Entry'] - row['Exit']) / row['Entry'], axis=1
+    )
+    total_percent = trade_df['Return_Pct'].sum() * 100
+    
+    # Final Result Dictionary
+    results = {
+        'Total Trades': total_trades,
+        'Profit Trades': profitable_trades,
+        'Loss Trades': losing_trades,
+        'Accuracy': f"{accuracy:.2f}%",
+        'Total Points Gained/Lost': f"{total_points:,.2f}",
+        'Total Return (%)': f"{total_percent:.2f}%"
+    }
+
+    st.markdown("### 📈 Performance Metrics")
+    st.table(pd.DataFrame(list(results.items()), columns=['Metric', 'Value']))
+
+    st.markdown("### 📜 Trade Log Sample")
+    st.dataframe(trade_df.tail(10), use_container_width=True)
+    
+    return results
 
 # --- MAIN LAYOUT FUNCTION ---
 def main_dashboard():
@@ -400,6 +518,7 @@ def main_dashboard():
         st.header("📈 Current Market Metrics")
         col1, col2, col3 = st.columns(3)
         
+        # This is where the NameError occurred previously
         with col1:
             price1, points1 = calculate_basic_metrics(st.session_state.df1, ticker1, interval)
         
@@ -438,7 +557,6 @@ def main_dashboard():
         with tab_leading_analysis:
             col_l1, col_l2 = st.columns(2)
             with col_l1:
-                # Assuming perform_leading_analysis is available from the last valid response
                 perform_leading_analysis(st.session_state.df1, ticker1)
             
             if enable_ratio and not st.session_state.df2.empty:
@@ -446,12 +564,10 @@ def main_dashboard():
                     perform_leading_analysis(st.session_state.df2, ticker2)
                 
                 st.markdown("---")
-                # Assuming perform_ratio_analysis is available from the last valid response
                 perform_ratio_analysis(st.session_state.df1, st.session_state.df2)
 
 
         with tab_var:
-            # Assuming perform_value_at_risk is available from the last valid response
             perform_value_at_risk(st.session_state.df1, ticker1)
             if enable_ratio and not st.session_state.df2.empty:
                 st.markdown("---")
