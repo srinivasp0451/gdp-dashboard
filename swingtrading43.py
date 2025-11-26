@@ -2,714 +2,178 @@ import streamlit as st
 import yfinance as yf
 import pandas as pd
 import numpy as np
-import time
+from statsmodels.api import OLS, add_constant # Used for Cointegration/Beta
 import plotly.graph_objects as go
 
 # --- CONFIG ---
 st.set_page_config(
-    page_title="Algo Dashboard with Backtesting & MTC",
-    layout="wide",
-    initial_sidebar_state="expanded"
+    page_title="Pairs Trading (Z-Score) Backtest",
+    layout="wide"
 )
 
-# --- GLOBAL CONSTANTS ---
-STANDARD_TICKERS = [
-    "^NSEI", "^BANKNIFTY", "^BSESN", "BTC-USD", "ETH-USD", "GC=F", "SI=F", "INR=X"
-]
-TIME_INTERVALS = ["1m", "5m", "15m", "30m", "1h", "1d", "1wk", "1mo"]
-PERIODS = ["1d", "5d", "1mo", "6mo", "1y", "5y", "10y"]
-IST_TIMEZONE = 'Asia/Kolkata' 
-ATR_WINDOW = 20 
-RSI_WINDOW = 14
-KC_MULTIPLIER = 2.0 
-
-# --- SESSION STATE INITIALIZATION ---
-for key in ['data_fetched', 'df1', 'df2', 'ticker1', 'ticker2', 'interval', 'period', 'mt_interval', 'df_mt']:
-    if key not in st.session_state:
-        if key.startswith('df'):
-            st.session_state[key] = pd.DataFrame()
-        elif key == 'data_fetched':
-            st.session_state[key] = False
-        else:
-            st.session_state[key] = None
-
-# --- CORE UTILITY FUNCTIONS ---
-
-def calculate_ema(data_series, window):
-    """Calculates Exponential Moving Average (EMA)."""
-    return data_series.ewm(span=window, adjust=False).mean()
-
-def calculate_rsi(close_prices, window=14):
-    """Calculates Relative Strength Index (RSI)."""
-    delta = close_prices.diff()
-    gain = delta.where(delta > 0, 0)
-    loss = -delta.where(delta < 0, 0) 
-    avg_gain = gain.ewm(span=window, adjust=False, min_periods=window).mean()
-    avg_loss = loss.ewm(span=window, adjust=False, min_periods=window).mean()
-    rs = avg_gain / avg_loss.replace(0, np.nan) 
-    rsi = 100 - (100 / (1 + rs))
-    return rsi
-
-def calculate_atr(df, window=14):
-    """Calculates Average True Range (ATR)."""
-    high_low = df['High'] - df['Low']
-    high_close = np.abs(df['High'] - df['Close'].shift())
-    low_close = np.abs(df['Low'] - df['Close'].shift())
-    tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
-    atr = tr.ewm(span=window, adjust=False, min_periods=window).mean()
-    return atr
-
-def calculate_keltner_channels(df, window=20, multiplier=2.0):
-    """Calculates Keltner Channels (KC)."""
-    df['KC_Middle'] = calculate_ema(df['Close'], window)
-    df['KC_ATR'] = calculate_atr(df, window)
-    df['KC_Upper'] = df['KC_Middle'] + multiplier * df['KC_ATR']
-    df['KC_Lower'] = df['KC_Middle'] - multiplier * df['KC_ATR']
-    return df
-
-def apply_leading_indicators(df):
-    """Applies leading and relevant non-lagging indicators."""
-    if df.empty:
-        return df
-    
-    df['RSI'] = calculate_rsi(df['Close'], window=RSI_WINDOW)
-    df['ATR'] = calculate_atr(df, window=ATR_WINDOW)
-    df['Volatility_Pct'] = df['Close'].pct_change().rolling(window=20).std() * 100
-    
-    df = calculate_keltner_channels(df, window=ATR_WINDOW, multiplier=KC_MULTIPLIER)
-    
-    return df
+# --- HYPERPARAMETERS ---
+TICKER_A = 'XLE' # Energy Sector ETF (Stock A)
+TICKER_B = 'XOM' # Exxon Mobil (Stock B)
+PERIOD = '5y'    # Lookback period for yfinance data
+WINDOW = 252     # Rolling window for calculating Z-Score (approx 1 trading year)
+ENTRY_Z_SCORE = 2.0
+EXIT_Z_SCORE = 0.5 
 
 @st.cache_data(ttl=3600)
-def fetch_and_process_data(ticker, interval, period, sleep_sec):
-    """
-    Fetches yfinance data.
-    Returns: (DataFrame, status) where status is True (success), False (no data), or an error string.
-    """
+def fetch_and_prepare_data(ticker_a, ticker_b, period):
+    """Fetches and merges data for the two stocks."""
     try:
-        time.sleep(sleep_sec) 
-        df = yf.download(ticker, interval=interval, period=period, progress=False)
+        data_a = yf.download(ticker_a, period=period, progress=False)['Adj Close']
+        data_b = yf.download(ticker_b, period=period, progress=False)['Adj Close']
         
-        if df.empty:
-            return pd.DataFrame(), False 
-
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = [col[0] for col in df.columns] 
+        df = pd.DataFrame({'A': data_a, 'B': data_b}).dropna()
+        if df.empty or len(df) < WINDOW:
+            return pd.DataFrame(), f"Insufficient data (need > {WINDOW} points)."
             
-        if df.index.tz is None:
-            df.index = df.index.tz_localize('UTC').tz_convert(IST_TIMEZONE)
-        else:
-            df.index = df.index.tz_convert(IST_TIMEZONE)
-            
-        df = apply_leading_indicators(df)
-        
-        return df, True
-
+        return df, None
     except Exception as e:
-        return pd.DataFrame(), f"An error occurred: {e}"
-        
-def extract_scalar(value):
-    """Ensures the value is a scalar."""
-    if isinstance(value, pd.Series):
-        if not value.empty and len(value) == 1:
-            return value.item()
-        return np.nan
-    elif isinstance(value, np.ndarray):
-        if value.size == 1:
-            return value.item()
-        return np.nan
-    return value
+        return pd.DataFrame(), f"Error fetching data: {e}"
 
-def calculate_basic_metrics(df, label, interval):
-    """Calculates current price, change, and points gained/lost."""
-    if df.empty or len(df) < 2:
-        return None, None
+def calculate_spread_and_zscore(df):
+    """Calculates the hedge ratio, spread, and Z-Score using a rolling window."""
     
-    current_price = extract_scalar(df['Close'].iloc[-1])
-    prev_close = extract_scalar(df['Close'].iloc[-2])
-    
-    if pd.isna(current_price) or pd.isna(prev_close):
-        return None, None
+    # 1. Rolling Hedge Ratio (Beta) Calculation using OLS
+    def get_beta(series):
+        # Rolling regression of A on B
+        y = series['A']
+        X = series['B']
+        X = add_constant(X, prepend=False)
+        model = OLS(y, X).fit()
+        return model.params[0] # The slope (beta/hedge ratio)
 
-    points_change = current_price - prev_close
-    percent_change = (points_change / prev_close) * 100
+    # Apply OLS over a rolling window to get the time-varying hedge ratio
+    df['Beta'] = df[['A', 'B']].rolling(WINDOW).apply(get_beta, raw=False).shift(1)
+    df.dropna(subset=['Beta'], inplace=True)
     
-    delta_str = f"{points_change:+.2f} pts ({percent_change:+.2f}%)"
+    # 2. Calculate the Stationary Spread
+    df['Spread'] = df['A'] - df['Beta'] * df['B']
     
-    # Use st.columns to avoid cache-related Streamlit warning if used inside a cached function
-    # NOTE: In main_dashboard, this is called outside the main cache, so it's fine.
-    st.metric(label=f"Current Price ({label} / {interval})", 
-              value=f"{current_price:,.2f}", 
-              delta=delta_str,
-              delta_color="normal")
+    # 3. Calculate Rolling Z-Score
+    df['Mean_Spread'] = df['Spread'].rolling(WINDOW).mean().shift(1)
+    df['Std_Spread'] = df['Spread'].rolling(WINDOW).std().shift(1)
     
-    return current_price, points_change
+    df['Z_Score'] = (df['Spread'] - df['Mean_Spread']) / df['Std_Spread']
+    df.dropna(subset=['Z_Score'], inplace=True)
 
-# --- ADVANCED ANALYSIS MODULES ---
+    return df
 
-def get_fibonacci_levels(df):
-    """Calculates high/low and returns simple Fibonacci retracement levels (Leading S/R)."""
-    high = extract_scalar(df['High'].max())
-    low = extract_scalar(df['Low'].min())
+def run_pairs_backtest(df):
+    """Executes the Z-Score strategy backtest."""
+    df['Signal'] = 0  # 0: Hold/Neutral, 1: Long Spread, -1: Short Spread
     
-    if pd.isna(high) or pd.isna(low):
-         return {lvl: np.nan for lvl in ['0.0%', '23.6%', '38.2%', '50.0%', '61.8%', '78.6%', '100%']}
-         
-    diff = high - low
+    # Strategy Logic
+    df.loc[df['Z_Score'] >= ENTRY_Z_SCORE, 'Signal'] = -1  # Short Spread (Sell A, Buy B)
+    df.loc[df['Z_Score'] <= -ENTRY_Z_SCORE, 'Signal'] = 1   # Long Spread (Buy A, Sell B)
     
-    levels = {
-        '0.0% (Resistance)': high,
-        '23.6%': high - 0.236 * diff,
-        '38.2%': high - 0.382 * diff,
-        '50.0%': high - 0.500 * diff,
-        '61.8%': high - 0.618 * diff,
-        '78.6%': high - 0.786 * diff,
-        '100% (Support)': low
-    }
-    return levels
-
-def detect_rsi_divergence(df, lookback=40):
-    """Simple check for recent divergence."""
-    close = df['Close'].iloc[-lookback:]
-    rsi = df['RSI'].iloc[-lookback:]
+    # Exit/Close Trade Logic: If the Z-Score is between -EXIT_Z_SCORE and +EXIT_Z_SCORE
+    df.loc[df['Z_Score'].abs() <= EXIT_Z_SCORE, 'Signal'] = 0
     
-    if len(close) < 5 or close.isnull().any() or rsi.isnull().any():
-        return "No Recent Divergence Detected"
-        
-    price_highs = close[close == close.rolling(window=5, center=True).max()].dropna()
-    if len(price_highs) >= 2 and price_highs.iloc[-1] > price_highs.iloc[-2]:
-        if rsi[price_highs.index[-1]] < rsi[price_highs.index[-2]]:
-            return f"⚠️ **BEARISH DIVERGENCE** (Price HH/RSI LH)"
+    # Ensure positions are maintained until an exit or opposite entry signal
+    df['Position'] = df['Signal'].replace(to_replace=0, method='ffill').fillna(0)
     
-    price_lows = close[close == close.rolling(window=5, center=True).min()].dropna()
-    if len(price_lows) >= 2 and price_lows.iloc[-1] < price_lows.iloc[-2]:
-        if rsi[price_lows.index[-1]] > rsi[price_lows.index[-2]]:
-            return f"✅ **BULLISH DIVERGENCE** (Price LL/RSI HL)"
-
-    return "No Recent Divergence Detected"
-
-def get_kc_divergence_signal(df):
-    """Generates the primary signal based on KC/Divergence logic."""
-    if df.empty:
-        return "NEUTRAL", "Insufficient data."
-
-    last_row = df.iloc[-1]
-    current_price = extract_scalar(last_row['Close'])
-    kc_upper = extract_scalar(last_row['KC_Upper'])
-    kc_lower = extract_scalar(last_row['KC_Lower'])
-    kc_middle = extract_scalar(last_row['KC_Middle'])
+    # 4. Calculate P&L (based on the stationary portfolio Spread)
+    df['Daily_Spread_Change'] = df['Spread'].diff()
+    df['P_L'] = df['Position'].shift(1) * df['Daily_Spread_Change']
+    df['Cumulative_P_L'] = df['P_L'].cumsum().fillna(0)
     
-    divergence_signal = detect_rsi_divergence(df)
+    return df
 
-    # 1. Strong Reversal Signal (KC Extreme + Divergence)
-    if current_price < kc_lower and "BULLISH DIVERGENCE" in divergence_signal:
-        return "STRONG BUY", "Price below KC Lower with Bullish Divergence (High-Prob Reversal)."
-    elif current_price > kc_upper and "BEARISH DIVERGENCE" in divergence_signal:
-        return "STRONG SELL", "Price above KC Upper with Bearish Divergence (High-Prob Reversal)."
+def display_results(df_final):
+    """Displays key metrics and chart using Streamlit."""
     
-    # 2. Mild Trend Following Signal
-    elif current_price > kc_middle and "DIVERGENCE" not in divergence_signal:
-        return "MILD BUY", "Price above KC Middle (EMA), suggesting upward bias."
-    elif current_price < kc_middle and "DIVERGENCE" not in divergence_signal:
-        return "MILD SELL", "Price below KC Middle (EMA), suggesting downward bias."
+    total_return = df_final['Cumulative_P_L'].iloc[-1]
+    sharpe_ratio = np.sqrt(WINDOW) * df_final['P_L'].mean() / df_final['P_L'].std()
+
+    # Calculate Trade Metrics (simplified as the strategy trades the spread)
+    trades_df = df_final[df_final['Position'].diff() != 0].copy()
+    total_trades = len(trades_df[trades_df['Position'] != 0])
     
-    # 3. Neutral/Watch
-    else:
-        return "NEUTRAL", "Consolidation within Keltner Channels or ambiguous Divergence."
-
-# --- CHARTING MODULE ---
-
-def generate_candlestick_chart(df, ticker_label):
-    """Generates the interactive Candlestick Chart with KC, ATR and RSI."""
-    if df.empty:
-        st.warning(f"No data to chart for {ticker_label}.")
-        return
-
+    st.markdown("---")
+    st.markdown("### 📊 Backtest Performance Summary")
+    
+    col1, col2, col3 = st.columns(3)
+    col1.metric("Total P&L (USD)", f"${total_return:,.2f}")
+    col2.metric("Annualized Sharpe Ratio", f"{sharpe_ratio:.2f}", help="Sharpe Ratio > 1.0 is considered good.")
+    col3.metric("Trade Signals Generated", f"{total_trades}")
+    
+    # --- Charting the Z-Score and Trades ---
+    st.markdown("### 📉 Z-Score and Trading Signals")
     fig = go.Figure()
-    fig.add_trace(go.Candlestick(x=df.index,
-                                 open=df['Open'], high=df['High'],
-                                 low=df['Low'], close=df['Close'],
-                                 name='Candles'))
+    fig.add_trace(go.Scatter(x=df_final.index, y=df_final['Z_Score'], name='Z-Score', line=dict(color='blue', width=2)))
     
-    # Keltner Channels
-    if 'KC_Upper' in df.columns:
-        fig.add_trace(go.Scatter(x=df.index, y=df['KC_Upper'], line=dict(color='red', width=1), name='KC Upper', opacity=0.8))
-        fig.add_trace(go.Scatter(x=df.index, y=df['KC_Lower'], line=dict(color='green', width=1), name='KC Lower', opacity=0.8))
-        fig.add_trace(go.Scatter(x=df.index, y=df['KC_Middle'], line=dict(color='orange', width=1, dash='dot'), name='KC Middle (EMA)', opacity=0.6))
+    # Add Entry/Exit Lines
+    fig.add_hline(y=ENTRY_Z_SCORE, line_dash="dash", line_color="red", annotation_text="Short Entry / Mean Exit")
+    fig.add_hline(y=-ENTRY_Z_SCORE, line_dash="dash", line_color="green", annotation_text="Long Entry / Mean Exit")
+    fig.add_hline(y=EXIT_Z_SCORE, line_dash="dot", line_color="gray")
+    fig.add_hline(y=-EXIT_Z_SCORE, line_dash="dot", line_color="gray")
     
-    # Fibonacci Levels
-    fibo = get_fibonacci_levels(df)
-    if not pd.isna(fibo['50.0%']):
-        fig.add_hline(y=fibo['50.0%'], line_dash="dash", line_color="purple", annotation_text="50% Fib", opacity=0.5)
+    # Highlight Long/Short Positions on the Z-Score Chart
+    fig.add_trace(go.Scatter(x=df_final[df_final['Position'] == 1].index, 
+                             y=df_final[df_final['Position'] == 1]['Z_Score'], 
+                             mode='markers', marker=dict(symbol='triangle-up', size=8, color='green'), 
+                             name='Long Spread Entry'))
+    fig.add_trace(go.Scatter(x=df_final[df_final['Position'] == -1].index, 
+                             y=df_final[df_final['Position'] == -1]['Z_Score'], 
+                             mode='markers', marker=dict(symbol='triangle-down', size=8, color='red'), 
+                             name='Short Spread Entry'))
 
-    fig.update_layout(title=f'{ticker_label} Price Chart (KC/Fib Focus)', 
-                      xaxis_rangeslider_visible=False)
-    
+    fig.update_layout(title=f'{TICKER_A} / {TICKER_B} Pairs Trading Z-Score',
+                      yaxis_title='Z-Score', xaxis_title='Date', height=500)
     st.plotly_chart(fig, use_container_width=True)
     
-    
-    # RSI Subplot
-    fig_rsi = go.Figure()
-    fig_rsi.add_trace(go.Scatter(x=df.index, y=df['RSI'], name='RSI', line=dict(color='purple')))
-    fig_rsi.add_hline(y=70, line_dash="dash", line_color="red", name="Overbought")
-    fig_rsi.add_hline(y=30, line_dash="dash", line_color="green", name="Oversold")
-    fig_rsi.update_layout(height=200, title='Relative Strength Index (RSI)', yaxis_range=[0, 100])
-    st.plotly_chart(fig_rsi, use_container_width=True)
-    
-    # ATR Subplot
-    fig_atr = go.Figure()
-    fig_atr.add_trace(go.Scatter(x=df.index, y=df['ATR'], name=f'ATR ({ATR_WINDOW})', line=dict(color='orange')))
-    fig_atr.update_layout(height=200, title='Average True Range (ATR)')
-    st.plotly_chart(fig_atr, use_container_width=True)
 
-# --- BACKTESTING MODULE ---
+    # --- P&L Chart ---
+    st.markdown("### 💰 Cumulative Profit and Loss")
+    fig_pl = go.Figure()
+    fig_pl.add_trace(go.Scatter(x=df_final.index, y=df_final['Cumulative_P_L'], fill='tozeroy', name='Cumulative P&L'))
+    fig_pl.update_layout(title='Strategy Equity Curve', yaxis_title='Cumulative P&L', xaxis_title='Date', height=300)
+    st.plotly_chart(fig_pl, use_container_width=True)
 
-def run_backtest(df, ticker_label, current_price):
-    """
-    Runs a backtest and formats results based on user request (Accuracy, Points, P/L Trades, % Return).
-    """
-    st.subheader(f"📊 Strategy Backtest Results ({ticker_label})")
-    
-    df_test = df.copy().dropna(subset=['KC_Upper', 'KC_Lower', 'RSI'])
-    
-    if len(df_test) < ATR_WINDOW + 2:
-        st.warning("Insufficient data for backtesting after dropping NaNs.")
-        return None
+# --- MAIN EXECUTION ---
+st.title("🤝 Professional Pairs Trading Strategy (Z-Score Mean Reversion)")
+st.markdown("This strategy exploits the stationary relationship (Cointegration) between two related assets.")
 
-    returns = df_test['Close'].pct_change().dropna()
-    if returns.empty:
-        st.warning("Cannot calculate returns for VaR.")
-        return None
-        
-    VaR_99_hist = extract_scalar(returns.quantile(0.01))
+with st.sidebar:
+    st.header("Stock Pair & Parameters")
+    ticker_a = st.text_input("Stock A (Base)", value=TICKER_A).upper()
+    ticker_b = st.text_input("Stock B (Hedge)", value=TICKER_B).upper()
+    period = st.selectbox("Data Period", PERIODS, index=5)
     
-    trades = []
-    in_trade = False
-    entry_price = 0
-    trade_type = None 
-    entry_date = None
+    window = st.number_input("Lookback Window (Days)", min_value=10, value=WINDOW, step=10, 
+                             help="The historical period used to calculate the Mean and Std Dev.")
+    entry_z_score = st.slider("Entry Z-Score (Volatility Threshold)", 1.5, 3.0, ENTRY_Z_SCORE, 0.1)
+    exit_z_score = st.slider("Exit Z-Score (Mean Reversion Point)", 0.0, 1.0, EXIT_Z_SCORE, 0.1)
     
-    df_test['RSI_Signal'] = np.where(df_test['RSI'] > 50, 1, -1) 
-    
-    for i in range(len(df_test)):
-        current_close = df_test['Close'].iloc[i]
-        current_date = df_test.index[i]
-        
-        # 1. Trade Exit Check (SL or TP)
-        if in_trade:
-            # VaR Stop Loss Price Calculation
-            sl_price = entry_price * (1 + VaR_99_hist) if trade_type == 'Long' else entry_price * (1 - VaR_99_hist)
-
-            # SL Check 
-            if (trade_type == 'Long' and current_close < sl_price) or \
-               (trade_type == 'Short' and current_close > sl_price):
-                exit_price = sl_price 
-                points = (exit_price - entry_price) if trade_type == 'Long' else (entry_price - exit_price)
-                trades.append({'Entry_Date': entry_date, 'Exit_Date': current_date, 'Entry': entry_price, 'Exit': exit_price, 'Type': trade_type, 
-                               'Points': points, 'Result': 'Loss (SL)'})
-                in_trade = False
-                continue
-
-            # TP Check (Price hits the opposite KC_Middle line)
-            tp_price = df_test['KC_Middle'].iloc[i]
-            if (trade_type == 'Long' and current_close > tp_price) or \
-               (trade_type == 'Short' and current_close < tp_price):
-                exit_price = current_close 
-                points = (exit_price - entry_price) if trade_type == 'Long' else (entry_price - exit_price)
-                trades.append({'Entry_Date': entry_date, 'Exit_Date': current_date, 'Entry': entry_price, 'Exit': exit_price, 'Type': trade_type, 
-                               'Points': points, 'Result': 'Profit (TP)' if points > 0 else 'Loss (TP)'})
-                in_trade = False
-                continue
-        
-        # 2. Trade Entry Check
-        if not in_trade:
-            upper = df_test['KC_Upper'].iloc[i]
-            lower = df_test['KC_Lower'].iloc[i]
-            rsi_signal = df_test['RSI_Signal'].iloc[i]
-
-            # Long Entry
-            if current_close < lower and rsi_signal == 1:
-                in_trade = True
-                entry_price = current_close
-                trade_type = 'Long'
-                entry_date = current_date
-
-            # Short Entry
-            elif current_close > upper and rsi_signal == -1:
-                in_trade = True
-                entry_price = current_close
-                trade_type = 'Short'
-                entry_date = current_date
-    
-    # --- Summarize Results ---
-    if not trades:
-        st.info("No trades were generated by the Keltner/VaR algorithm in this period.")
-        # Explicitly return to avoid rendering tables if no trades exist
-        return None
-
-    trade_df = pd.DataFrame(trades)
-    
-    # Calculate Metrics 
-    trade_df['Is_Profit'] = trade_df['Points'] > 0
-    
-    total_trades = len(trade_df)
-    profitable_trades = trade_df['Is_Profit'].sum()
-    losing_trades = total_trades - profitable_trades
-    accuracy = (profitable_trades / total_trades) * 100
-    
-    total_points = extract_scalar(trade_df['Points'].sum())
-    
-    trade_df['Return_Pct'] = trade_df.apply(
-        lambda row: (row['Exit'] - row['Entry']) / row['Entry'] if row['Type'] == 'Long' else (row['Entry'] - row['Exit']) / row['Entry'], axis=1
-    )
-    total_percent = trade_df['Return_Pct'].sum() * 100
-    
-    # Final Result Dictionary
-    results = {
-        'Total Trades': total_trades,
-        'Profit Trades': profitable_trades,
-        'Loss Trades': losing_trades,
-        'Accuracy': f"{accuracy:.2f}%",
-        'Total Points Gained/Lost': f"{total_points:,.2f}",
-        'Total Return (%)': f"{total_percent:.2f}%"
-    }
-
-    st.markdown("### 📈 Performance Metrics (Backtest)")
-    st.table(pd.DataFrame(list(results.items()), columns=['Metric', 'Value']))
-
-    st.markdown("### 📜 Trade Log Sample")
-    # Displaying the trade log directly in the UI
-    st.dataframe(
-        trade_df[['Entry_Date', 'Exit_Date', 'Type', 'Entry', 'Exit', 'Points', 'Return_Pct', 'Result']].tail(10), 
-        use_container_width=True,
-        column_config={
-            "Entry_Date": st.column_config.DatetimeColumn("Entry Date", format="YYYY-MM-DD HH:mm"),
-            "Exit_Date": st.column_config.DatetimeColumn("Exit Date", format="YYYY-MM-DD HH:mm"),
-            "Return_Pct": st.column_config.NumberColumn("Return (%)", format="%.2f%%")
-        }
-    )
-    
-    return results
-
-# --- Main Layout Function ---
-
-def perform_leading_analysis(df, ticker_label):
-    """Focuses on Volatility, Fibonacci and Momentum Divergence."""
-    st.subheader(f"⚡ Leading Analysis: {ticker_label}")
-    if df.empty:
-        st.info("Data not available for Leading Analysis.")
-        return
-
-    last_row = df.iloc[-1]
-    current_close = extract_scalar(last_row['Close'])
-    
-    atr_value = extract_scalar(last_row['ATR'])
-    volatility_pct = extract_scalar(last_row['Volatility_Pct'])
-    
-    st.markdown(f"""
-    * **Current ATR ({ATR_WINDOW} periods):** `{atr_value:,.2f}` (Risk Proxy)
-    * **Rolling Volatility (20 periods):** `{volatility_pct:.2f}%` (Market Energy)
-    """)
-    
-    fibo_levels = get_fibonacci_levels(df)
-    st.markdown(f"**Key 50% Fibonacci Level:** `{fibo_levels['50.0%']:.2f}`")
-    
-    proximity = abs(current_close - fibo_levels['50.0%']) / atr_value if atr_value > 0 else np.inf
-    
-    if proximity <= 1.5 and atr_value > 0:
-        st.warning(f"Price is within 1.5 ATR of the 50% Fibonacci level ({fibo_levels['50.0%']:.2f}). **Expect a Decision Point.**")
-    elif current_close > fibo_levels['50.0%']:
-        st.success("Price is trading above the 50% Fibonacci Retracement.")
-    else:
-        st.error("Price is trading below the 50% Fibonacci Retracement.")
-
-    divergence = detect_rsi_divergence(df, lookback=40)
-    st.markdown(f"**RSI Divergence Check:** {divergence}")
-    
-    st.info("💡 Summary: Trading decisions should focus on confluence between Divergence signals and price action around Fibonacci/ATR levels.")
-
-def perform_ratio_analysis(df1, df2):
-    """Performs Ratio Calculation and displays basic results."""
-    st.subheader("⚖️ Ratio Analysis (Cointegration Check)")
-    
-    df_combined = pd.concat([df1['Close'], df2['Close']], axis=1).dropna()
-    df_combined.columns = ['Close_1', 'Close_2']
-    df_combined['Ratio'] = df_combined['Close_1'] / df_combined['Close_2']
-    df_combined['Ratio_RSI'] = calculate_rsi(df_combined['Ratio'])
-    
-    if df_combined.empty:
-        st.warning("No overlapping data found for ratio calculation.")
-        return
-
-    ratio_mean = extract_scalar(df_combined['Ratio'].mean())
-    ratio_std = extract_scalar(df_combined['Ratio'].std())
-    current_ratio = extract_scalar(df_combined['Ratio'].iloc[-1])
-    
-    st.markdown(f"""
-    * **Mean Ratio:** `{ratio_mean:.4f}`
-    * **Std Dev:** `{ratio_std:.4f}`
-    * **Current Ratio:** `{current_ratio:.4f}`
-    """)
-    
-    st.info("💡 Advanced: Ratio trading is a leading strategy. When the Ratio RSI is extreme (e.g., < 10 or > 90), the pair is statistically likely to mean-revert.")
-
-def perform_value_at_risk(df, ticker_label):
-    """Calculates Value at Risk (VaR) and Conditional VaR (CVaR)."""
-    st.subheader(f"📉 Value at Risk (VaR) Analysis ({ticker_label})")
-    
-    if len(df) < 2:
-        st.info("Insufficient data for VaR analysis.")
-        return
-
-    returns = df['Close'].pct_change().dropna()
-    if returns.empty:
-        st.info("Cannot calculate returns distribution.")
-        return
-        
-    current_price = extract_scalar(df['Close'].iloc[-1])
-    if pd.isna(current_price):
-         st.info("Current price not available for VaR price calculation.")
-         return
-
-    VaR_95_hist = extract_scalar(returns.quantile(0.05))
-    VaR_99_hist = extract_scalar(returns.quantile(0.01))
-
-    CVaR_95 = extract_scalar(returns[returns <= VaR_95_hist].mean()) if not pd.isna(VaR_95_hist) else np.nan
-    
-    st.markdown(f"""
-    **Current Price:** `{current_price:,.2f}`
-    
-    * **95% VaR (Historical):** `{VaR_95_hist*100:.3f}%` | Price Equivalent: `{current_price * (1 + VaR_95_hist):.2f}`
-    * **99% VaR (Historical):** `{VaR_99_hist*100:.3f}%` | Price Equivalent: `{current_price * (1 + VaR_99_hist):.2f}`
-    * **Conditional VaR (CVaR) 95%:** `{CVaR_95*100:.3f}%` (Expected loss if VaR is breached)
-    """)
-    
-    st.warning("⚠️ VaR provides a **leading risk boundary**. The 99% VaR price equivalent is a strong candidate for a **Stop Loss** level, as it represents a 1% chance of being breached.")
-
-
-def main_dashboard():
-    st.title("🎛️ Algo Dashboard with Keltner Channel & Backtesting")
-    st.markdown("---")
-    
-    # --- 1. Data Fetching & Management (Sidebar) ---
-    with st.sidebar:
-        st.header("⚙️ Data & Config")
-        
-        col_t1, col_c1 = st.columns(2)
-        ticker1_symbol = col_t1.selectbox("Ticker 1 Symbol", STANDARD_TICKERS, index=0)
-        custom_ticker1 = col_c1.text_input("Custom Ticker 1 (Override)", value="")
-        ticker1 = custom_ticker1.upper() if custom_ticker1 else ticker1_symbol
-        st.session_state.ticker1 = ticker1
-        
-        # --- Timeframe Selection ---
-        col_i, col_p = st.columns(2)
-        interval = col_i.selectbox("Timeframe (Short-Term / Entry)", TIME_INTERVALS, index=4, help="Select the timeframe for the chart and entry signal (e.g., 1h).")
-        period = col_p.selectbox("Data Period", PERIODS, index=2)
-        st.session_state.interval = interval
+    if st.button("🚀 Run Backtest"):
+        st.session_state.run_backtest = True
+        st.session_state.ticker_a = ticker_a
+        st.session_state.ticker_b = ticker_b
         st.session_state.period = period
-        
-        # New: Mid-Term Timeframe for Confluence
-        st_interval_index = TIME_INTERVALS.index(interval)
-        # Default MT is the next longer timeframe, ensuring it's not the same.
-        default_mt_index = min(st_interval_index + 1, len(TIME_INTERVALS) - 1)
-        st.session_state.mt_interval = st.selectbox("Mid-Term Timeframe (Trend Filter)", TIME_INTERVALS, index=default_mt_index, help="Select a longer timeframe (e.g., 1d if Entry is 1h) for trend filtering.")
-        
-        enable_ratio = st.checkbox("Enable Ratio Analysis", value=False)
-        
-        ticker2 = None
-        if enable_ratio:
-            st.subheader("Ticker 2 (Ratio Basis)")
-            col_t2, col_c2 = st.columns(2)
-            ticker2_symbol = col_t2.selectbox("Ticker 2 Symbol", STANDARD_TICKERS, index=1)
-            custom_ticker2 = col_c2.text_input("Custom Ticker 2 (Override)", value="")
-            ticker2 = custom_ticker2.upper() if custom_ticker2 else ticker2_symbol
-            st.session_state.ticker2 = ticker2
-        
-        sleep_sec = st.slider("API Delay (seconds)", 0.5, 5.0, 2.5, 0.5)
-        
-        if st.button("🚀 Fetch/Refresh Data"):
-            st.session_state.data_fetched = False
-            
-            # Fetch Short-Term Data (for Chart/Entry/Backtest)
-            with st.spinner(f"Fetching Short-Term data for {ticker1}..."):
-                st.session_state.df1, status1 = fetch_and_process_data(ticker1, interval, period, 0.1)
-            
-            if status1 is True:
-                st.toast(f"✅ ST data for {ticker1} fetched.")
-            elif status1 is False:
-                st.error(f"No ST data available for {ticker1}. Check ticker/period.")
-            else: 
-                st.error(f"Error fetching {ticker1} ST: {status1}")
+        st.session_state.window = window
+        st.session_state.entry_z_score = entry_z_score
+        st.session_state.exit_z_score = exit_z_score
 
-            # Fetch Mid-Term Data (for MTC)
-            with st.spinner(f"Fetching Mid-Term data for {ticker1}...") :
-                st.session_state.df_mt, status_mt = fetch_and_process_data(ticker1, st.session_state.mt_interval, period, 0.1)
-            
-            if status_mt is True:
-                st.toast(f"✅ MT data for {ticker1} fetched.")
-            elif status_mt is False:
-                st.warning(f"No MT data available for {ticker1}. Cannot perform MTC.")
-                st.session_state.df_mt = pd.DataFrame()
-            else: 
-                st.error(f"Error fetching {ticker1} MT: {status_mt}")
+if 'run_backtest' in st.session_state and st.session_state.run_backtest:
+    
+    df_raw, error = fetch_and_prepare_data(st.session_state.ticker_a, st.session_state.ticker_b, st.session_state.period)
 
-            # Fetch Ticker 2 (if enabled)
-            if enable_ratio and ticker2:
-                with st.spinner(f"Fetching Ticker 2 data (waiting {sleep_sec}s)..."):
-                    st.session_state.df2, status2 = fetch_and_process_data(ticker2, interval, period, sleep_sec)
-                    
-                if status2 is True:
-                    st.toast(f"✅ Data for {ticker2} fetched.")
-                elif status2 is False:
-                    st.error(f"No data available for {ticker2}.")
-                else: 
-                    st.error(f"Error fetching {ticker2}: {status2}")
+    if error:
+        st.error(error)
+    elif not df_raw.empty:
+        with st.spinner("Calculating Rolling Beta and Z-Scores..."):
+            df_spread = calculate_spread_and_zscore(df_raw.copy())
             
-            st.session_state.data_fetched = True
-            st.rerun()
-            
-    # --- Main Content ---
-    if st.session_state.data_fetched and not st.session_state.df1.empty:
-        
-        # --- 2. Basic Statistics Display ---
-        st.header("📈 Current Market Metrics")
-        col1, col2, col3 = st.columns(3)
-        
-        with col1:
-            price1, points1 = calculate_basic_metrics(st.session_state.df1, ticker1, interval)
-        
-        if enable_ratio and not st.session_state.df2.empty:
-            with col2:
-                price2, points2 = calculate_basic_metrics(st.session_state.df2, ticker2, interval)
-            
-            with col3:
-                ratio = price1 / price2 if price1 and price2 and not pd.isna(price1) and not pd.isna(price2) else np.nan
-                st.metric(label="Current Ratio (T1/T2)", value=f"{ratio:,.4f}" if not np.isnan(ratio) else "N/A")
-        
-        st.markdown("---")
-        st.subheader("Raw Data Sample")
-        st.dataframe(
-            st.session_state.df1[['Open', 'High', 'Low', 'Close', 'RSI', 'ATR', 'KC_Upper']].tail(5), 
-            use_container_width=True,
-            column_config={"__index__": st.column_config.DatetimeColumn("DateTime (IST)")}
-        )
-        st.markdown("---")
-        
-        # --- 3. Tabbed Layout for Advanced Analysis ---
-        tab_charts, tab_leading_analysis, tab_var, tab_recommendation = st.tabs([
-            "📊 Interactive Charts", 
-            "⚡ Leading Analysis", 
-            "📉 Value at Risk (VaR)", 
-            "🎯 Final Recommendation"
-        ])
-        
-        with tab_charts:
-            generate_candlestick_chart(st.session_state.df1, ticker1)
-            if enable_ratio and not st.session_state.df2.empty:
-                st.markdown("---")
-                generate_candlestick_chart(st.session_state.df2, ticker2)
+        with st.spinner("Running Strategy Backtest and P&L Calculation..."):
+            df_final = run_pairs_backtest(df_spread)
 
-        with tab_leading_analysis:
-            col_l1, col_l2 = st.columns(2)
-            with col_l1:
-                perform_leading_analysis(st.session_state.df1, ticker1)
-            
-            if enable_ratio and not st.session_state.df2.empty:
-                with col_l2:
-                    perform_leading_analysis(st.session_state.df2, ticker2)
-                
-                st.markdown("---")
-                perform_ratio_analysis(st.session_state.df1, st.session_state.df2)
+        display_results(df_final)
+    
+    st.session_state.run_backtest = False # Prevent endless loop if button isn't pressed
+else:
+    st.info("Select your parameters in the sidebar and click 'Run Backtest' to execute the strategy.")
 
-
-        with tab_var:
-            perform_value_at_risk(st.session_state.df1, ticker1)
-            if enable_ratio and not st.session_state.df2.empty:
-                st.markdown("---")
-                perform_value_at_risk(st.session_state.df2, ticker2)
-
-        with tab_recommendation:
-            st.header("🎯 FINAL TRADING RECOMMENDATION")
-            
-            # --- BACKTESTING EXECUTION (The key section) ---
-            backtest_results = run_backtest(st.session_state.df1, ticker1, price1)
-            st.markdown("---")
-            
-            st.subheader(f"Synthesis & Multi-Timeframe Confluence (MTC)")
-            
-            # 1. Get Short-Term (ST) Signal (Entry Signal)
-            st_signal, st_logic = get_kc_divergence_signal(st.session_state.df1)
-            
-            # 2. Get Mid-Term (MT) Signal (Trend Filter)
-            if not st.session_state.df_mt.empty:
-                mt_signal, _ = get_kc_divergence_signal(st.session_state.df_mt)
-            else:
-                mt_signal = "NEUTRAL"
-
-            # 3. Determine Final Confluence and Signal
-            
-            final_signal = st_signal
-            final_logic = st_logic
-            confidence = "LOW"
-
-            if st_signal.endswith("BUY") and mt_signal.endswith("BUY"):
-                final_signal = "**HIGH CONFIDENCE BUY**"
-                final_logic += f" MTC Confirmed: Mid-Term ({st.session_state.mt_interval}) signal is also BUY. This alignment provides a high-probability trade setup."
-                confidence = "HIGH"
-            elif st_signal.endswith("SELL") and mt_signal.endswith("SELL"):
-                final_signal = "**HIGH CONFIDENCE SELL**"
-                final_logic += f" MTC Confirmed: Mid-Term ({st.session_state.mt_interval}) signal is also SELL. This alignment provides a high-probability trade setup."
-                confidence = "HIGH"
-            elif st_signal == "NEUTRAL":
-                final_signal = "**NEUTRAL / WATCH**"
-                final_logic = st_logic
-                confidence = "LOW"
-            else:
-                 # Conflicting signals
-                 final_signal = f"**{st_signal} (DIVERGENT)**"
-                 final_logic = f"Signal is conflicting: Short-Term is {st_signal} but Mid-Term ({st.session_state.mt_interval}) is {mt_signal}. **Avoid Trading.** The trend filter does not support the entry signal."
-                 confidence = "MEDIUM"
-
-
-            st.markdown(f"### ⏱️ Confluence Check (ST: {st.session_state.interval} vs MT: {st.session_state.mt_interval})")
-            st.table(pd.DataFrame({
-                'Timeframe': [f"Short-Term ({st.session_state.interval})", f"Mid-Term ({st.session_state.mt_interval})", "FINAL"],
-                'Signal': [st_signal, mt_signal, final_signal],
-                'Confidence': ["Entry", "Trend Filter", confidence]
-            }))
-            
-            st.markdown(f"## Final Recommendation: {final_signal}")
-            st.info(f"**Logic:** {final_logic}")
-            
-            # Risk Management (VaR)
-            returns = st.session_state.df1['Close'].pct_change().dropna()
-            VaR_99_hist = extract_scalar(returns.quantile(0.01))
-            current_price = extract_scalar(st.session_state.df1['Close'].iloc[-1])
-            last_row = st.session_state.df1.iloc[-1]
-            
-            st.markdown("""
-            ### Risk Management (VaR Based)
-            """)
-            if not pd.isna(current_price) and not pd.isna(VaR_99_hist) and "HIGH CONFIDENCE" in final_signal:
-                VaR_99_price_long = current_price * (1 + VaR_99_hist)
-                VaR_99_price_short = current_price * (1 - VaR_99_hist)
-
-                if "BUY" in final_signal:
-                    st.markdown(f"* **Recommended Stop Loss (99% VaR Price):** **`{VaR_99_price_long:.2f}`**")
-                    st.markdown(f"* **Recommended Take Profit (KC Middle Target):** **`{extract_scalar(last_row['KC_Middle']):.2f}`** (Target the mean reversion)")
-                elif "SELL" in final_signal:
-                     st.markdown(f"* **Recommended Stop Loss (Symmetrical VaR Price):** **`{VaR_99_price_short:.2f}`**")
-                     st.markdown(f"* **Recommended Take Profit (KC Middle Target):** **`{extract_scalar(last_row['KC_Middle']):.2f}`** (Target the mean reversion)")
-            else:
-                 st.markdown("* **Risk Management:** Decision point requires market confirmation or signals conflict. **No Confident Trade Setup.**")
-
-
-    elif st.session_state.data_fetched and st.session_state.df1.empty:
-        st.error(f"No valid data to display for {st.session_state.ticker1}. Please check the ticker symbol, period, and interval.")
-
-    else:
-        st.info("Configure your tickers and click 'Fetch/Refresh Data' in the sidebar to begin professional analysis.")
-        
-# --- EXECUTE ---
-if __name__ == "__main__":
-    main_dashboard()
