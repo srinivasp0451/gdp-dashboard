@@ -2,270 +2,483 @@ import streamlit as st
 import yfinance as yf
 import pandas as pd
 import numpy as np
-from statsmodels.api import OLS, add_constant
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+from datetime import datetime, timedelta
+import pytz
 import time
+from scipy import stats
 
-# --- GLOBAL CONSTANTS ---
-STANDARD_TICKERS = [
-    "AAPL", "MSFT", "KO", "PEP", "TCS.NS", "INFY.NS"
-]
-PERIODS = ["1d", "5d", "1mo", "6mo", "1y", "5y", "10y"]
-IST_TIMEZONE = 'Asia/Kolkata' 
+# Page configuration
+st.set_page_config(page_title="Pairs Trading Strategy", layout="wide", initial_sidebar_state="expanded")
 
-# --- HYPERPARAMETERS ---
-TICKER_A = 'AAPL' 
-TICKER_B = 'MSFT' 
-WINDOW = 252     
-ENTRY_Z_SCORE = 2.0
-EXIT_Z_SCORE = 0.5 
+# IST Timezone
+IST = pytz.timezone('Asia/Kolkata')
 
-# --- UTILITY FUNCTIONS ---
+# Asset mappings
+ASSET_MAPPINGS = {
+    'NIFTY 50': '^NSEI',
+    'Bank NIFTY': '^NSEBANK',
+    'SENSEX': '^BSESN',
+    'BTC-USD': 'BTC-USD',
+    'ETH-USD': 'ETH-USD',
+    'Gold': 'GC=F',
+    'Silver': 'SI=F',
+    'USD/INR': 'INR=X',
+    'EUR/USD': 'EURUSD=X',
+    'GBP/USD': 'GBPUSD=X',
+    'USD/JPY': 'JPY=X',
+}
 
-def convert_to_ist(data):
-    """Converts the DataFrame index to IST/Asia/Kolkata timezone."""
+TIMEFRAME_MAPPING = {
+    '1m': '1m', '3m': '3m', '5m': '5m', '10m': '10m', 
+    '15m': '15m', '30m': '30m', '1h': '1h', '2h': '2h', 
+    '4h': '4h', '1d': '1d'
+}
+
+PERIOD_MAPPING = {
+    '1d': '1d', '5d': '5d', '7d': '7d', '1mo': '1mo',
+    '3mo': '3mo', '6mo': '6mo', '1y': '1y', '2y': '2y',
+    '3y': '3y', '5y': '5y', '6y': '6y', '10y': '10y',
+    '15y': '15y', '20y': '20y', '25y': '25y', '30y': '30y'
+}
+
+def convert_to_ist(df):
+    """Convert DataFrame index to IST timezone"""
     try:
-        if data.index.tz is None:
-            data.index = data.index.tz_localize('UTC').tz_convert(IST_TIMEZONE)
+        if df.index.tz is None:
+            df.index = df.index.tz_localize('UTC').tz_convert(IST)
         else:
-            data.index = data.index.tz_convert(IST_TIMEZONE)
-    except Exception:
-        pass 
-    return data
+            df.index = df.index.tz_convert(IST)
+    except:
+        pass
+    return df
 
-# --- DATA FETCHING WITH RETRY LOGIC ---
-
-def fetch_data_with_retry(ticker, period, interval='1d', max_retries=3, delay=3):
-    """Fetch data with retry logic and error handling to bypass rate limits."""
-    
-    for attempt in range(max_retries):
-        try:
-            time.sleep(delay)  
-            data = yf.download(ticker, period=period, interval=interval, progress=False)
-            
-            if not data.empty:
-                if isinstance(data.columns, pd.MultiIndex):
-                    data.columns = data.columns.get_level_values(0)
-                
-                data.columns = [col.strip().title() for col in data.columns]
-                
-                return convert_to_ist(data)
-            else:
-                st.warning(f"No data returned for {ticker} (Attempt {attempt + 1}).")
-        
-        except Exception as e:
-            if attempt < max_retries - 1:
-                st.warning(f"Attempt {attempt + 1} failed for {ticker}: {str(e)}. Retrying in {delay * (attempt + 2)}s...")
-                time.sleep(delay * (attempt + 2)) 
-            else:
-                st.error(f"Failed to fetch data for {ticker} after {max_retries} attempts.")
-                return pd.DataFrame()
-                
-    return pd.DataFrame() 
-
-# --- INTEGRATED FETCH AND PREPARE ---
-
-@st.cache_data(ttl=3600)
-def fetch_and_prepare_data(ticker_a, ticker_b, period):
-    """Fetches, cleans, and merges data using the robust retry mechanism."""
-    
-    data_a_raw = fetch_data_with_retry(ticker_a, period, interval='1d')
-    data_b_raw = fetch_data_with_retry(ticker_b, period, interval='1d')
-
-    if data_a_raw.empty or data_b_raw.empty:
-        return pd.DataFrame(), f"Could not fetch valid data for one or both tickers ({ticker_a}, {ticker_b})."
-
-    def extract_price_series(data, ticker_name):
-        if 'Adj Close' in data.columns:
-            return data['Adj Close']
-        elif 'Close' in data.columns:
-            return data['Close']
-        else:
+def fetch_data(ticker, period, interval, delay=2):
+    """Fetch data with rate limiting"""
+    try:
+        time.sleep(delay)
+        data = yf.download(ticker, period=period, interval=interval, progress=False)
+        if data.empty:
             return None
+        data = convert_to_ist(data)
+        return data
+    except Exception as e:
+        st.error(f"Error fetching {ticker}: {str(e)}")
+        return None
 
-    data_a = extract_price_series(data_a_raw, ticker_a)
-    data_b = extract_price_series(data_b_raw, ticker_b)
-
-    if data_a is None or data_b is None:
-        return pd.DataFrame(), "Price column (Adj Close or Close) not found in fetched data."
-
-    df = pd.DataFrame({'A': data_a, 'B': data_b}).dropna()
+def calculate_spread(asset1_prices, asset2_prices):
+    """Calculate spread and hedge ratio using linear regression"""
+    # Remove any NaN values
+    valid_idx = ~(np.isnan(asset1_prices) | np.isnan(asset2_prices))
+    x = asset2_prices[valid_idx].values.reshape(-1, 1)
+    y = asset1_prices[valid_idx].values
     
-    if len(df) < WINDOW:
-        return pd.DataFrame(), f"Insufficient overlapping data (need > {WINDOW} points, got {len(df)}). Reduce the Lookback Window or increase the Data Period."
+    # Linear regression
+    slope, intercept, r_value, p_value, std_err = stats.linregress(asset2_prices[valid_idx], asset1_prices[valid_idx])
+    
+    # Calculate spread
+    spread = asset1_prices - (slope * asset2_prices + intercept)
+    
+    return spread, slope, intercept, r_value**2
+
+def calculate_zscore(spread, window=20):
+    """Calculate rolling z-score"""
+    mean = spread.rolling(window=window).mean()
+    std = spread.rolling(window=window).std()
+    zscore = (spread - mean) / std
+    return zscore, mean, std
+
+def generate_signals(zscore, entry_threshold=2.0, exit_threshold=0.5):
+    """Generate trading signals based on z-score"""
+    signals = pd.DataFrame(index=zscore.index)
+    signals['zscore'] = zscore
+    signals['position'] = 0
+    
+    # Entry signals
+    signals.loc[zscore > entry_threshold, 'position'] = -1  # Short spread
+    signals.loc[zscore < -entry_threshold, 'position'] = 1   # Long spread
+    
+    # Exit signals
+    signals.loc[(zscore < exit_threshold) & (zscore > -exit_threshold), 'position'] = 0
+    
+    # Generate trade signals
+    signals['signal'] = signals['position'].diff()
+    
+    return signals
+
+def calculate_trade_metrics(asset1_price, asset2_price, hedge_ratio, current_zscore, entry_zscore, position_type):
+    """Calculate entry, target, and stop loss levels"""
+    metrics = {}
+    
+    if position_type == 'LONG_SPREAD':
+        # Long Asset1, Short Asset2
+        metrics['action_asset1'] = 'BUY'
+        metrics['action_asset2'] = 'SELL'
+        metrics['entry_asset1'] = asset1_price
+        metrics['entry_asset2'] = asset2_price
+        metrics['target_zscore'] = 0  # Mean reversion target
+        metrics['stop_zscore'] = entry_zscore - 0.5  # Further divergence
         
-    return df, None
+    elif position_type == 'SHORT_SPREAD':
+        # Short Asset1, Long Asset2
+        metrics['action_asset1'] = 'SELL'
+        metrics['action_asset2'] = 'BUY'
+        metrics['entry_asset1'] = asset1_price
+        metrics['entry_asset2'] = asset2_price
+        metrics['target_zscore'] = 0  # Mean reversion target
+        metrics['stop_zscore'] = entry_zscore + 0.5  # Further divergence
+    
+    metrics['hedge_ratio'] = hedge_ratio
+    metrics['current_zscore'] = current_zscore
+    metrics['entry_zscore'] = entry_zscore
+    
+    return metrics
 
-# --- TRADING LOGIC WITH INDEX ERROR FIX ---
+# Streamlit UI
+st.title("📊 Pairs Trading Strategy - Z-Score Mean Reversion")
+st.markdown("---")
 
-def get_beta(series):
-    """
-    Calculates the hedge ratio (Beta) using OLS or NumPy least squares.
-    FIX: Explicitly checks and reshapes the array dimension to prevent IndexError.
-    """
-    if series.size < 2: 
-        return np.nan
-        
-    # NEW FIX: Dimension check for IndexError (too many indices)
-    if series.ndim == 1 or series.shape[1] != 2:
-        return np.nan
-
-    # Now we safely access the columns (A and B)
-    y = series[:, 0]
-    X_var = series[:, 1]
+# Sidebar configuration
+with st.sidebar:
+    st.header("⚙️ Configuration")
     
-    X = add_constant(X_var, prepend=False) 
+    # Asset 1 Selection
+    st.subheader("Asset 1")
+    asset1_type = st.radio("Select Asset 1 Type:", ["Preset Assets", "Custom Ticker"], key='asset1_type')
     
-    try:
-        # Try OLS (preferred)
-        model = OLS(y, X).fit()
-        return model.params[0] 
-        
-    except Exception:
-        # Fallback to NumPy's least squares (lstsq)
-        try:
-            coefficients, _, _, _ = np.linalg.lstsq(X, y, rcond=None)
-            return float(coefficients[0])
-            
-        except Exception:
-            return np.nan
-
-def calculate_spread_and_zscore(df):
-    """Calculates the spread and Z-Score using a rolling window."""
-
-    df['Beta'] = df[['A', 'B']].rolling(WINDOW).apply(get_beta, raw=True).shift(1)
-    df.dropna(subset=['Beta'], inplace=True)
-    
-    df['Spread'] = df['A'] - df['Beta'] * df['B']
-    
-    df['Mean_Spread'] = df['Spread'].rolling(WINDOW).mean().shift(1)
-    df['Std_Spread'] = df['Spread'].rolling(WINDOW).std().shift(1)
-    
-    df['Z_Score'] = (df['Spread'] - df['Mean_Spread']) / df['Std_Spread']
-    df.dropna(subset=['Z_Score', 'Spread'], inplace=True)
-
-    return df
-
-def run_pairs_backtest(df, entry_z, exit_z):
-    """Executes the Z-Score strategy backtest."""
-    df['Signal'] = 0  
-    
-    df.loc[df['Z_Score'] >= entry_z, 'Signal'] = -1  
-    df.loc[df['Z_Score'] <= -entry_z, 'Signal'] = 1   
-    
-    df.loc[df['Z_Score'].abs() <= exit_z, 'Signal'] = 0
-    
-    df['Position'] = df['Signal'].replace(to_replace=0, method='ffill').fillna(0)
-    
-    df['Daily_Spread_Change'] = df['Spread'].diff()
-    df['P_L'] = df['Position'].shift(1) * df['Daily_Spread_Change']
-    df['Cumulative_P_L'] = df['P_L'].cumsum().fillna(0)
-    
-    return df
-
-def display_results(df_final):
-    """Displays key metrics and chart using Streamlit."""
-    
-    total_return = df_final['Cumulative_P_L'].iloc[-1]
-    sharpe_ratio = np.sqrt(WINDOW) * df_final['P_L'].mean() / df_final['P_L'].std() if df_final['P_L'].std() != 0 else 0
-    trades_df = df_final[df_final['Position'].diff() != 0].copy()
-    entry_count = (trades_df['Position'] != 0).sum()
+    if asset1_type == "Preset Assets":
+        asset1_name = st.selectbox("Choose Asset 1:", list(ASSET_MAPPINGS.keys()), key='asset1_preset')
+        asset1_ticker = ASSET_MAPPINGS[asset1_name]
+    else:
+        asset1_ticker = st.text_input("Enter Asset 1 Ticker:", value="AAPL", key='asset1_custom')
+        asset1_name = asset1_ticker
     
     st.markdown("---")
-    st.markdown("### 📊 Backtest Performance Summary")
     
-    col1, col2, col3 = st.columns(3)
-    col1.metric("Total P&L (USD)", f"${total_return:,.2f}")
-    col2.metric("Annualized Sharpe Ratio", f"{sharpe_ratio:.2f}")
-    col3.metric("Trade Entries", f"{entry_count}")
+    # Asset 2 Selection
+    st.subheader("Asset 2")
+    asset2_type = st.radio("Select Asset 2 Type:", ["Preset Assets", "Custom Ticker"], key='asset2_type')
     
+    if asset2_type == "Preset Assets":
+        asset2_name = st.selectbox("Choose Asset 2:", list(ASSET_MAPPINGS.keys()), key='asset2_preset', index=1)
+        asset2_ticker = ASSET_MAPPINGS[asset2_name]
+    else:
+        asset2_ticker = st.text_input("Enter Asset 2 Ticker:", value="MSFT", key='asset2_custom')
+        asset2_name = asset2_ticker
+    
+    st.markdown("---")
+    
+    # Timeframe settings
+    st.subheader("📅 Timeframe Settings")
+    period = st.selectbox("Period:", list(PERIOD_MAPPING.keys()), index=6)
+    interval = st.selectbox("Interval:", list(TIMEFRAME_MAPPING.keys()), index=9)
+    
+    st.markdown("---")
+    
+    # Strategy parameters
+    st.subheader("🎯 Strategy Parameters")
+    zscore_window = st.slider("Z-Score Window:", 10, 100, 20, 5)
+    entry_threshold = st.slider("Entry Threshold (Z-Score):", 1.0, 3.0, 2.0, 0.1)
+    exit_threshold = st.slider("Exit Threshold (Z-Score):", 0.1, 1.0, 0.5, 0.1)
+    
+    st.markdown("---")
+    
+    # API settings
+    st.subheader("🔧 API Settings")
+    api_delay = st.slider("API Delay (seconds):", 1.0, 5.0, 2.0, 0.5)
+    
+    st.markdown("---")
+    
+    # Fetch data button
+    fetch_button = st.button("🚀 Fetch Data & Analyze", type="primary", use_container_width=True)
 
-    st.markdown("### 📉 Z-Score and Trading Signals")
-    
-    y_min = df_final['Z_Score'].min() - 0.5
-    y_max = df_final['Z_Score'].max() + 0.5
-
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(x=df_final.index, y=df_final['Z_Score'], name='Z-Score', line=dict(color='blue', width=2)))
-    
-    # Entry/Exit Lines
-    fig.add_hline(y=st.session_state.entry_z_score, line_dash="dash", line_color="red", annotation_text="Short Entry", opacity=0.8)
-    fig.add_hline(y=-st.session_state.entry_z_score, line_dash="dash", line_color="green", annotation_text="Long Entry", opacity=0.8)
-    fig.add_hline(y=st.session_state.exit_z_score, line_dash="dot", line_color="gray", annotation_text="Exit", opacity=0.5)
-    fig.add_hline(y=-st.session_state.exit_z_score, line_dash="dot", line_color="gray", opacity=0.5)
-    
-    fig.update_layout(title=f'{st.session_state.ticker_a} / {st.session_state.ticker_b} Pairs Trading Z-Score',
-                      yaxis_title='Z-Score', xaxis_title='Date', height=500,
-                      yaxis_range=[y_min, y_max])
-    st.plotly_chart(fig, use_container_width=True)
-    
-
-# --- MAIN EXECUTION ---
-def main_pairs_dashboard():
-    st.title("🤝 Professional Pairs Trading Strategy (Z-Score Mean Reversion)")
-    st.markdown("This highly resilient version uses **Retry Logic** and **Defensive Programming**.")
-
-    if 'run_backtest' not in st.session_state:
-        st.session_state.run_backtest = False
-        st.session_state.ticker_a = TICKER_A
-        st.session_state.ticker_b = TICKER_B
-        st.session_state.period = PERIODS[5] 
-        st.session_state.window = WINDOW
-        st.session_state.entry_z_score = ENTRY_Z_SCORE
-        st.session_state.exit_z_score = EXIT_Z_SCORE
+# Main content area
+if fetch_button:
+    with st.spinner("Fetching data..."):
+        # Fetch data for both assets
+        data1 = fetch_data(asset1_ticker, PERIOD_MAPPING[period], TIMEFRAME_MAPPING[interval], api_delay)
+        data2 = fetch_data(asset2_ticker, PERIOD_MAPPING[period], TIMEFRAME_MAPPING[interval], api_delay)
         
-    with st.sidebar:
-        st.header("Stock Pair & Parameters")
-        
-        col_a_sel, col_a_text = st.columns([1, 2])
-        base_a = col_a_sel.selectbox("Stock A (Base)", STANDARD_TICKERS, index=0, key='sb_a')
-        st.session_state.ticker_a = col_a_text.text_input("Custom A (Override)", value=base_a).upper()
-
-        col_b_sel, col_b_text = st.columns([1, 2])
-        base_b = col_b_sel.selectbox("Stock B (Hedge)", STANDARD_TICKERS, index=1, key='sb_b')
-        st.session_state.ticker_b = col_b_text.text_input("Custom B (Override)", value=base_b).upper()
-
-        st.session_state.period = st.selectbox("Data Period", PERIODS, index=5)
-        
-        st.session_state.window = st.number_input("Lookback Window (Days)", min_value=30, value=WINDOW, step=10)
-        st.session_state.entry_z_score = st.slider("Entry Z-Score (Threshold)", 1.5, 3.5, ENTRY_Z_SCORE, 0.1)
-        st.session_state.exit_z_score = st.slider("Exit Z-Score (Mean Reversion)", 0.0, 1.0, EXIT_Z_SCORE, 0.1)
-        
-        if st.button("🚀 Run Backtest"):
-            st.session_state.run_backtest = True
-            st.rerun()
-
-    if st.session_state.run_backtest:
-        
-        df_raw, error = fetch_and_prepare_data(
-            st.session_state.ticker_a, 
-            st.session_state.ticker_b, 
-            st.session_state.period
-        )
-
-        if error:
-            st.error(error)
-        elif not df_raw.empty:
+        if data1 is not None and data2 is not None and not data1.empty and not data2.empty:
+            st.success("✅ Data fetched successfully!")
             
-            with st.status(f"Running backtest for {st.session_state.ticker_a} / {st.session_state.ticker_b}...", expanded=True) as status:
-                st.write("1. Calculating Rolling Beta and Spread...")
-                df_spread = calculate_spread_and_zscore(df_raw.copy())
-                
-                st.write("2. Calculating Z-Score and generating signals...")
-                df_final = run_pairs_backtest(df_spread, st.session_state.entry_z_score, st.session_state.exit_z_score)
-                
-                st.write("3. Compiling results and generating charts...")
-                time.sleep(1) 
-                status.update(label="✅ Backtest Complete!", state="complete", expanded=False)
-
-            display_results(df_final)
+            # Align data by index
+            common_index = data1.index.intersection(data2.index)
+            data1 = data1.loc[common_index]
+            data2 = data2.loc[common_index]
+            
+            # Use Close prices
+            asset1_prices = data1['Close']
+            asset2_prices = data2['Close']
+            
+            # Calculate spread and hedge ratio
+            spread, hedge_ratio, intercept, r_squared = calculate_spread(asset1_prices, asset2_prices)
+            
+            # Calculate z-score
+            zscore, spread_mean, spread_std = calculate_zscore(spread, window=zscore_window)
+            
+            # Generate signals
+            signals = generate_signals(zscore, entry_threshold, exit_threshold)
+            
+            # Current values
+            current_asset1 = asset1_prices.iloc[-1]
+            current_asset2 = asset2_prices.iloc[-1]
+            current_spread = spread.iloc[-1]
+            current_zscore = zscore.iloc[-1]
+            
+            # Display key metrics
+            col1, col2, col3, col4, col5 = st.columns(5)
+            
+            with col1:
+                st.metric(f"{asset1_name}", f"${current_asset1:.2f}")
+            
+            with col2:
+                st.metric(f"{asset2_name}", f"${current_asset2:.2f}")
+            
+            with col3:
+                st.metric("Hedge Ratio", f"{hedge_ratio:.4f}")
+            
+            with col4:
+                st.metric("R² (Correlation)", f"{r_squared:.4f}")
+            
+            with col5:
+                zscore_color = "inverse" if abs(current_zscore) > entry_threshold else "off"
+                st.metric("Current Z-Score", f"{current_zscore:.2f}", delta_color=zscore_color)
             
             st.markdown("---")
-            st.subheader("Statistical Data Sample (Z-Score & Spread)")
-            st.dataframe(df_final[['A', 'B', 'Beta', 'Spread', 'Z_Score', 'Position', 'P_L']].tail(10), use_container_width=True)
+            
+            # Trading Signal Summary
+            st.header("📈 Trading Signal Summary")
+            
+            if abs(current_zscore) > entry_threshold:
+                if current_zscore > entry_threshold:
+                    position_type = 'SHORT_SPREAD'
+                    signal_type = "🔴 SHORT SPREAD"
+                    signal_color = "red"
+                    explanation = f"""
+                    **Spread is overextended (Z-Score: {current_zscore:.2f})**
+                    
+                    The spread between {asset1_name} and {asset2_name} is currently {current_zscore:.2f} standard deviations 
+                    above its mean. This suggests {asset1_name} is relatively expensive compared to {asset2_name}.
+                    
+                    **Strategy:** Short the spread by selling {asset1_name} and buying {asset2_name}, expecting mean reversion.
+                    """
+                else:
+                    position_type = 'LONG_SPREAD'
+                    signal_type = "🟢 LONG SPREAD"
+                    signal_color = "green"
+                    explanation = f"""
+                    **Spread is underextended (Z-Score: {current_zscore:.2f})**
+                    
+                    The spread between {asset1_name} and {asset2_name} is currently {abs(current_zscore):.2f} standard deviations 
+                    below its mean. This suggests {asset1_name} is relatively cheap compared to {asset2_name}.
+                    
+                    **Strategy:** Long the spread by buying {asset1_name} and selling {asset2_name}, expecting mean reversion.
+                    """
+                
+                # Calculate trade metrics
+                trade_metrics = calculate_trade_metrics(
+                    current_asset1, current_asset2, hedge_ratio, 
+                    current_zscore, current_zscore, position_type
+                )
+                
+                st.markdown(f"### {signal_type}")
+                st.info(explanation)
+                
+                # Trade Details
+                col1, col2 = st.columns(2)
+                
+                with col1:
+                    st.markdown("### 📍 Entry Targets")
+                    st.markdown(f"""
+                    **{asset1_name}:**
+                    - Action: **{trade_metrics['action_asset1']}**
+                    - Entry Price: **${trade_metrics['entry_asset1']:.2f}**
+                    - Quantity Ratio: **1.00 unit**
+                    
+                    **{asset2_name}:**
+                    - Action: **{trade_metrics['action_asset2']}**
+                    - Entry Price: **${trade_metrics['entry_asset2']:.2f}**
+                    - Quantity Ratio: **{abs(hedge_ratio):.4f} units**
+                    """)
+                
+                with col2:
+                    st.markdown("### 🎯 Exit Targets & Stop Loss")
+                    st.markdown(f"""
+                    **Target (Mean Reversion):**
+                    - Target Z-Score: **{trade_metrics['target_zscore']:.2f}**
+                    - Exit when spread returns to mean
+                    
+                    **Stop Loss:**
+                    - Stop Z-Score: **{trade_metrics['stop_zscore']:.2f}**
+                    - Exit if spread diverges further
+                    
+                    **Current Status:**
+                    - Entry Z-Score: **{trade_metrics['entry_zscore']:.2f}**
+                    - Current Z-Score: **{trade_metrics['current_zscore']:.2f}**
+                    """)
+                
+                st.markdown("---")
+                
+                # Risk Management Notes
+                st.markdown("### ⚠️ Risk Management Notes")
+                st.warning(f"""
+                **Position Sizing:** 
+                - For every 1 unit of {asset1_name}, trade {abs(hedge_ratio):.4f} units of {asset2_name}
+                - This maintains dollar neutrality based on historical correlation
+                
+                **Exit Strategy:**
+                - Take profit when Z-Score reaches {exit_threshold:.2f} (mean reversion)
+                - Cut losses if Z-Score moves to {trade_metrics['stop_zscore']:.2f} (further divergence)
+                
+                **Important:** Monitor correlation (R²: {r_squared:.4f}). Correlations can break down, especially during market stress.
+                """)
+                
+            else:
+                st.info(f"""
+                ### ⏸️ No Trading Signal
+                
+                **Current Z-Score: {current_zscore:.2f}**
+                
+                The spread is within {exit_threshold} standard deviations of its mean, indicating no significant 
+                trading opportunity at this time. Wait for Z-Score to exceed ±{entry_threshold:.2f} for entry signals.
+                
+                **Spread Status:** Within normal range - Monitor for opportunities
+                """)
+            
+            st.markdown("---")
+            
+            # Visualizations
+            st.header("📊 Analysis Charts")
+            
+            # Create subplots
+            fig = make_subplots(
+                rows=4, cols=1,
+                subplot_titles=(
+                    f'{asset1_name} vs {asset2_name} Prices',
+                    'Spread Over Time',
+                    'Z-Score with Entry/Exit Levels',
+                    'Trading Signals'
+                ),
+                vertical_spacing=0.08,
+                row_heights=[0.25, 0.25, 0.25, 0.25]
+            )
+            
+            # Plot 1: Price comparison
+            fig.add_trace(
+                go.Scatter(x=data1.index, y=asset1_prices, name=asset1_name, line=dict(color='blue')),
+                row=1, col=1
+            )
+            fig.add_trace(
+                go.Scatter(x=data2.index, y=asset2_prices, name=asset2_name, line=dict(color='orange'), yaxis='y2'),
+                row=1, col=1
+            )
+            
+            # Plot 2: Spread
+            fig.add_trace(
+                go.Scatter(x=spread.index, y=spread, name='Spread', line=dict(color='purple')),
+                row=2, col=1
+            )
+            fig.add_trace(
+                go.Scatter(x=spread_mean.index, y=spread_mean, name='Mean', line=dict(color='gray', dash='dash')),
+                row=2, col=1
+            )
+            
+            # Plot 3: Z-Score
+            fig.add_trace(
+                go.Scatter(x=zscore.index, y=zscore, name='Z-Score', line=dict(color='green')),
+                row=3, col=1
+            )
+            fig.add_hline(y=entry_threshold, line_dash="dash", line_color="red", row=3, col=1)
+            fig.add_hline(y=-entry_threshold, line_dash="dash", line_color="red", row=3, col=1)
+            fig.add_hline(y=exit_threshold, line_dash="dash", line_color="yellow", row=3, col=1)
+            fig.add_hline(y=-exit_threshold, line_dash="dash", line_color="yellow", row=3, col=1)
+            fig.add_hline(y=0, line_dash="solid", line_color="gray", row=3, col=1)
+            
+            # Plot 4: Signals
+            fig.add_trace(
+                go.Scatter(x=signals.index, y=signals['position'], name='Position', 
+                          line=dict(color='black'), mode='lines'),
+                row=4, col=1
+            )
+            
+            # Update layout
+            fig.update_layout(
+                height=1400,
+                showlegend=True,
+                hovermode='x unified',
+                template='plotly_white'
+            )
+            
+            fig.update_xaxes(title_text="Date", row=4, col=1)
+            fig.update_yaxes(title_text="Price", row=1, col=1)
+            fig.update_yaxes(title_text="Spread", row=2, col=1)
+            fig.update_yaxes(title_text="Z-Score", row=3, col=1)
+            fig.update_yaxes(title_text="Position", row=4, col=1)
+            
+            st.plotly_chart(fig, use_container_width=True)
+            
+            # Statistical Summary
+            st.header("📈 Statistical Summary")
+            
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                st.markdown("### Spread Statistics")
+                st.dataframe({
+                    'Metric': ['Mean', 'Std Dev', 'Current Value', 'Min', 'Max'],
+                    'Value': [
+                        f"{spread.mean():.4f}",
+                        f"{spread.std():.4f}",
+                        f"{current_spread:.4f}",
+                        f"{spread.min():.4f}",
+                        f"{spread.max():.4f}"
+                    ]
+                })
+            
+            with col2:
+                st.markdown("### Z-Score Statistics")
+                st.dataframe({
+                    'Metric': ['Mean', 'Std Dev', 'Current Value', 'Min', 'Max'],
+                    'Value': [
+                        f"{zscore.mean():.4f}",
+                        f"{zscore.std():.4f}",
+                        f"{current_zscore:.4f}",
+                        f"{zscore.min():.4f}",
+                        f"{zscore.max():.4f}"
+                    ]
+                })
+            
+        else:
+            st.error("❌ Failed to fetch data. Please check ticker symbols and try again.")
 
-    else:
-        st.info("The tickers are defaulted to **AAPL/MSFT**. Click **'Run Backtest'** to begin.")
-        
-if __name__ == "__main__":
-    main_pairs_dashboard()
+else:
+    # Welcome message
+    st.info("""
+    ### 👋 Welcome to Pairs Trading Strategy Application
+    
+    This application implements a **Z-Score Mean Reversion** strategy for pairs trading.
+    
+    **How it works:**
+    1. Select two correlated assets from the sidebar
+    2. Configure timeframe and strategy parameters
+    3. Click "Fetch Data & Analyze" to see trading signals
+    
+    **Strategy Logic:**
+    - Calculates the spread between two assets using linear regression
+    - Monitors z-score of the spread (standard deviations from mean)
+    - Generates signals when spread is overextended
+    - Profits from mean reversion when spread normalizes
+    
+    **Configure your parameters in the sidebar and click the button to begin!**
+    """)
+
+# Footer
+st.markdown("---")
+st.markdown("""
+<div style='text-align: center; color: gray;'>
+    <p>Pairs Trading Strategy - Z-Score Mean Reversion | Built with Streamlit</p>
+    <p style='font-size: 0.8em;'>⚠️ This is for educational purposes only. Always do your own research before trading.</p>
+</div>
+""", unsafe_allow_html=True)
