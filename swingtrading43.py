@@ -11,69 +11,111 @@ STANDARD_TICKERS = [
     "AAPL", "MSFT", "KO", "PEP", "TCS.NS", "INFY.NS"
 ]
 PERIODS = ["1d", "5d", "1mo", "6mo", "1y", "5y", "10y"]
+IST_TIMEZONE = 'Asia/Kolkata' 
 
-# --- HYPERPARAMETERS (Set to the most reliable US tickers) ---
-TICKER_A = 'AAPL' # Apple Inc.
-TICKER_B = 'MSFT' # Microsoft Corp.
+# --- HYPERPARAMETERS ---
+TICKER_A = 'AAPL' 
+TICKER_B = 'MSFT' 
 WINDOW = 252     
 ENTRY_Z_SCORE = 2.0
 EXIT_Z_SCORE = 0.5 
 
-# --- CORE DATA FETCHING ---
+# --- UTILITY FUNCTION FOR TIMEZONE (Required by fetch_data_with_retry) ---
+def convert_to_ist(data):
+    """Converts the DataFrame index to IST/Asia/Kolkata timezone."""
+    try:
+        if data.index.tz is None:
+            # Assume data is UTC if timezone naive, then localize and convert
+            data.index = data.index.tz_localize('UTC').tz_convert(IST_TIMEZONE)
+        else:
+            # Convert directly if timezone aware
+            data.index = data.index.tz_convert(IST_TIMEZONE)
+    except Exception as e:
+        # Handle cases where index conversion fails (e.g., if index isn't DatetimeIndex)
+        st.warning(f"Timezone conversion failed: {e}. Keeping original index.")
+    return data
 
-def get_price_series(ticker, period):
-    """
-    Fetches data and handles column selection robustly ('Adj Close' -> 'Close').
-    Returns a proper pandas Series or None.
-    """
-    # Fetch data (using 1d interval by default for reliability with long periods)
-    data = yf.download(ticker, period=period, interval='1d', progress=False)
+# --- DATA FETCHING WITH RETRY LOGIC (User-Provided & Enhanced) ---
+
+def fetch_data_with_retry(ticker, period, interval='1d', max_retries=3, delay=3):
+    """Fetch data with retry logic and error handling to bypass rate limits."""
     
-    if data.empty:
-        return None
+    # We enforce '1d' interval here as the Pairs Trading Strategy is typically done on daily data
+    # to avoid complex intraday data gaps and calculation load.
     
-    # Select the price column
-    if 'Adj Close' in data.columns:
-        price_series = data['Adj Close']
-    elif 'Close' in data.columns:
-        price_series = data['Close']
-    else:
-        return None
+    for attempt in range(max_retries):
+        try:
+            # Rate limiting delay
+            time.sleep(delay)  
+            
+            data = yf.download(ticker, period=period, interval=interval, progress=False)
+            
+            if not data.empty:
+                # 1. Flatten multi-index columns if present (common issue with yfinance)
+                if isinstance(data.columns, pd.MultiIndex):
+                    data.columns = data.columns.get_level_values(0)
+                
+                # 2. Ensure standard column names (e.g., 'adj close' -> 'Adj Close')
+                data.columns = [col.strip().title() for col in data.columns]
+                
+                # 3. Convert to IST (if required by the context)
+                return convert_to_ist(data)
+            else:
+                st.warning(f"No data returned for {ticker} (Attempt {attempt + 1}).")
         
-    # Ensure it's a series and drop any leading NaNs
-    if isinstance(price_series, pd.Series):
-        return price_series.dropna()
-    else:
-        return None
+        except Exception as e:
+            if attempt < max_retries - 1:
+                st.warning(f"Attempt {attempt + 1} failed for {ticker}: {str(e)}. Retrying in {delay * (attempt + 2)}s...")
+                time.sleep(delay * (attempt + 2)) # Exponential backoff
+            else:
+                st.error(f"Failed to fetch data for {ticker} after {max_retries} attempts.")
+                return pd.DataFrame()
+                
+    return pd.DataFrame() # Should only be reached if all attempts fail
+
+# --- INTEGRATED FETCH AND PREPARE (Replacing the old function) ---
 
 @st.cache_data(ttl=3600)
 def fetch_and_prepare_data(ticker_a, ticker_b, period):
-    """Fetches and merges data for the two stocks."""
-    try:
-        data_a = get_price_series(ticker_a, period)
-        data_b = get_price_series(ticker_b, period)
-        
-        if data_a is None or data_b is None:
-            # If data is None, the ticker was invalid or fetch failed.
-            return pd.DataFrame(), f"Could not fetch valid price data for {ticker_a} or {ticker_b}. Check ticker spelling/suffix and connection."
+    """Fetches, cleans, and merges data using the robust retry mechanism."""
+    
+    # Fetch Data A
+    data_a_raw = fetch_data_with_retry(ticker_a, period, interval='1d')
+    # Fetch Data B
+    data_b_raw = fetch_data_with_retry(ticker_b, period, interval='1d')
 
-        # Combine and rename columns, aligning the index
-        df = pd.DataFrame({'A': data_a, 'B': data_b}).dropna()
-        
-        if df.empty or len(df) < WINDOW:
-            return pd.DataFrame(), f"Insufficient overlapping data (need > {WINDOW} points after dropping NaNs)."
-            
-        return df, None
-        
-    except Exception as e:
-        return pd.DataFrame(), f"Error during final data assembly: {e}"
+    if data_a_raw.empty or data_b_raw.empty:
+        return pd.DataFrame(), f"Could not fetch valid data for one or both tickers ({ticker_a}, {ticker_b})."
 
-# --- CORE TRADING LOGIC ---
+    def extract_price_series(data, ticker_name):
+        if 'Adj Close' in data.columns:
+            return data['Adj Close']
+        elif 'Close' in data.columns:
+            st.warning(f"Using 'Close' price for {ticker_name} as 'Adj Close' is unavailable.")
+            return data['Close']
+        else:
+            return None
+
+    # Extract required price series using the new column names (Title Case)
+    data_a = extract_price_series(data_a_raw, ticker_a)
+    data_b = extract_price_series(data_b_raw, ticker_b)
+
+    if data_a is None or data_b is None:
+        return pd.DataFrame(), "Price column (Adj Close or Close) not found in fetched data."
+
+    # Combine, align index, and drop missing data
+    df = pd.DataFrame({'A': data_a, 'B': data_b}).dropna()
+    
+    if len(df) < WINDOW:
+        return pd.DataFrame(), f"Insufficient overlapping data (need > {WINDOW} points, got {len(df)})."
+        
+    return df, None
+
+# --- TRADING LOGIC (Unchanged and Correct) ---
 
 def calculate_spread_and_zscore(df):
     """Calculates the hedge ratio, spread, and Z-Score using a rolling window."""
     
-    # 1. Rolling Hedge Ratio (Beta) Calculation using OLS
     def get_beta(series):
         y = series['A']
         X = series['B']
@@ -87,10 +129,8 @@ def calculate_spread_and_zscore(df):
     df['Beta'] = df[['A', 'B']].rolling(WINDOW).apply(get_beta, raw=False).shift(1)
     df.dropna(subset=['Beta'], inplace=True)
     
-    # 2. Calculate the Stationary Spread
     df['Spread'] = df['A'] - df['Beta'] * df['B']
     
-    # 3. Calculate Rolling Z-Score
     df['Mean_Spread'] = df['Spread'].rolling(WINDOW).mean().shift(1)
     df['Std_Spread'] = df['Spread'].rolling(WINDOW).std().shift(1)
     
@@ -103,17 +143,13 @@ def run_pairs_backtest(df, entry_z, exit_z):
     """Executes the Z-Score strategy backtest."""
     df['Signal'] = 0  
     
-    # Generate entry signals
-    df.loc[df['Z_Score'] >= entry_z, 'Signal'] = -1  # Short Spread (Sell A, Buy B)
-    df.loc[df['Z_Score'] <= -entry_z, 'Signal'] = 1   # Long Spread (Buy A, Sell B)
+    df.loc[df['Z_Score'] >= entry_z, 'Signal'] = -1  
+    df.loc[df['Z_Score'] <= -entry_z, 'Signal'] = 1   
     
-    # Exit signals
     df.loc[df['Z_Score'].abs() <= exit_z, 'Signal'] = 0
     
-    # Position tracking
     df['Position'] = df['Signal'].replace(to_replace=0, method='ffill').fillna(0)
     
-    # Calculate P&L 
     df['Daily_Spread_Change'] = df['Spread'].diff()
     df['P_L'] = df['Position'].shift(1) * df['Daily_Spread_Change']
     df['Cumulative_P_L'] = df['P_L'].cumsum().fillna(0)
@@ -160,9 +196,8 @@ def display_results(df_final):
 # --- MAIN EXECUTION ---
 def main_pairs_dashboard():
     st.title("🤝 Professional Pairs Trading Strategy (Z-Score Mean Reversion)")
-    st.markdown("Trading the **Z-Score** of the spread between two cointegrated assets.")
+    st.markdown("This version uses **Retry Logic** to handle rate limits and data failures.")
 
-    # --- Session State Initialization ---
     if 'run_backtest' not in st.session_state:
         st.session_state.run_backtest = False
         st.session_state.ticker_a = TICKER_A
@@ -187,8 +222,7 @@ def main_pairs_dashboard():
 
         st.session_state.period = st.selectbox("Data Period", PERIODS, index=5)
         
-        st.session_state.window = st.number_input("Lookback Window (Days)", min_value=30, value=WINDOW, step=10, 
-                                                 help="252 is approx. 1 trading year.")
+        st.session_state.window = st.number_input("Lookback Window (Days)", min_value=30, value=WINDOW, step=10)
         st.session_state.entry_z_score = st.slider("Entry Z-Score (Threshold)", 1.5, 3.5, ENTRY_Z_SCORE, 0.1)
         st.session_state.exit_z_score = st.slider("Exit Z-Score (Mean Reversion)", 0.0, 1.0, EXIT_Z_SCORE, 0.1)
         
@@ -208,9 +242,8 @@ def main_pairs_dashboard():
             st.error(error)
         elif not df_raw.empty:
             
-            # --- Analysis Execution ---
             with st.status(f"Running backtest for {st.session_state.ticker_a} / {st.session_state.ticker_b}...", expanded=True) as status:
-                st.write("1. Calculating Rolling Beta (Hedge Ratio) and Spread...")
+                st.write("1. Calculating Rolling Beta and Spread...")
                 df_spread = calculate_spread_and_zscore(df_raw.copy())
                 
                 st.write("2. Calculating Z-Score and generating signals...")
@@ -227,7 +260,7 @@ def main_pairs_dashboard():
             st.dataframe(df_final[['A', 'B', 'Beta', 'Spread', 'Z_Score', 'Position', 'P_L']].tail(10), use_container_width=True)
 
     else:
-        st.info("The tickers are defaulted to **AAPL/MSFT** for maximum reliability. Click **'Run Backtest'** to begin.")
+        st.info("The tickers are defaulted to **AAPL/MSFT**. Click **'Run Backtest'** to begin.")
         
 if __name__ == "__main__":
     main_pairs_dashboard()
