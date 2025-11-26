@@ -215,7 +215,7 @@ def get_kc_divergence_signal(df):
     else:
         return "NEUTRAL", "Consolidation within Keltner Channels or ambiguous Divergence."
 
-# --- CHARTING MODULE (FIXED) ---
+# --- CHARTING MODULE ---
 
 def generate_candlestick_chart(df, ticker_label):
     """Generates the interactive Candlestick Chart with KC, ATR and RSI."""
@@ -260,13 +260,13 @@ def generate_candlestick_chart(df, ticker_label):
     fig_atr.update_layout(height=200, title='Average True Range (ATR)')
     st.plotly_chart(fig_atr, use_container_width=True)
 
-# --- BACKTESTING MODULE (CORRECTED) ---
+# --- BACKTESTING MODULE ---
 
 def run_backtest(df, ticker_label, current_price):
     """
     Runs a backtest and formats results based on user request (Accuracy, Points, P/L Trades, % Return).
     """
-    st.subheader(f"📊 Algorithm Backtest Results ({ticker_label})")
+    st.subheader(f"📊 Strategy Backtest Results ({ticker_label})")
     
     df_test = df.copy().dropna(subset=['KC_Upper', 'KC_Lower', 'RSI'])
     
@@ -285,11 +285,13 @@ def run_backtest(df, ticker_label, current_price):
     in_trade = False
     entry_price = 0
     trade_type = None 
+    entry_date = None
     
     df_test['RSI_Signal'] = np.where(df_test['RSI'] > 50, 1, -1) 
     
     for i in range(len(df_test)):
         current_close = df_test['Close'].iloc[i]
+        current_date = df_test.index[i]
         
         # 1. Trade Exit Check (SL or TP)
         if in_trade:
@@ -301,7 +303,7 @@ def run_backtest(df, ticker_label, current_price):
                (trade_type == 'Short' and current_close > sl_price):
                 exit_price = sl_price 
                 points = (exit_price - entry_price) if trade_type == 'Long' else (entry_price - exit_price)
-                trades.append({'Entry': entry_price, 'Exit': exit_price, 'Type': trade_type, 
+                trades.append({'Entry_Date': entry_date, 'Exit_Date': current_date, 'Entry': entry_price, 'Exit': exit_price, 'Type': trade_type, 
                                'Points': points, 'Result': 'Loss (SL)'})
                 in_trade = False
                 continue
@@ -312,7 +314,7 @@ def run_backtest(df, ticker_label, current_price):
                (trade_type == 'Short' and current_close < tp_price):
                 exit_price = current_close 
                 points = (exit_price - entry_price) if trade_type == 'Long' else (entry_price - exit_price)
-                trades.append({'Entry': entry_price, 'Exit': exit_price, 'Type': trade_type, 
+                trades.append({'Entry_Date': entry_date, 'Exit_Date': current_date, 'Entry': entry_price, 'Exit': exit_price, 'Type': trade_type, 
                                'Points': points, 'Result': 'Profit (TP)' if points > 0 else 'Loss (TP)'})
                 in_trade = False
                 continue
@@ -328,12 +330,14 @@ def run_backtest(df, ticker_label, current_price):
                 in_trade = True
                 entry_price = current_close
                 trade_type = 'Long'
+                entry_date = current_date
 
             # Short Entry
             elif current_close > upper and rsi_signal == -1:
                 in_trade = True
                 entry_price = current_close
                 trade_type = 'Short'
+                entry_date = current_date
     
     # --- Summarize Results ---
     if not trades:
@@ -369,10 +373,21 @@ def run_backtest(df, ticker_label, current_price):
 
     st.markdown("### 📈 Performance Metrics (Backtest)")
     st.table(pd.DataFrame(list(results.items()), columns=['Metric', 'Value']))
+
+    st.markdown("### 📜 Trade Log Sample")
+    st.dataframe(
+        trade_df[['Entry_Date', 'Exit_Date', 'Type', 'Entry', 'Exit', 'Points', 'Return_Pct', 'Result']].tail(10), 
+        use_container_width=True,
+        column_config={
+            "Entry_Date": st.column_config.DatetimeColumn("Entry Date", format="YYYY-MM-DD HH:mm"),
+            "Exit_Date": st.column_config.DatetimeColumn("Exit Date", format="YYYY-MM-DD HH:mm"),
+            "Return_Pct": st.column_config.NumberColumn("Return (%)", format="%.2f%%")
+        }
+    )
     
     return results
 
-# --- Main Layout Function - (Restored functions for Leading Analysis, VaR, etc., are assumed present here) ---
+# --- Main Layout Function - (All other support functions assumed present) ---
 
 def perform_leading_analysis(df, ticker_label):
     """Focuses on Volatility, Fibonacci and Momentum Divergence."""
@@ -431,12 +446,6 @@ def perform_ratio_analysis(df1, df2):
     * **Std Dev:** `{ratio_std:.4f}`
     * **Current Ratio:** `{current_ratio:.4f}`
     """)
-    
-    st.dataframe(
-        df_combined[['Ratio', 'Ratio_RSI']].tail(10), 
-        use_container_width=True, 
-        column_config={"__index__": st.column_config.DatetimeColumn("DateTime (IST)")}
-    )
     
     st.info("💡 Advanced: Ratio trading is a leading strategy. When the Ratio RSI is extreme (e.g., < 10 or > 90), the pair is statistically likely to mean-revert.")
 
@@ -497,7 +506,6 @@ def main_dashboard():
         
         # New: Mid-Term Timeframe for Confluence
         st_interval_index = TIME_INTERVALS.index(interval)
-        # Default MT is the next longer timeframe, ensuring it's not the same.
         default_mt_index = min(st_interval_index + 1, len(TIME_INTERVALS) - 1)
         st.session_state.mt_interval = st.selectbox("Mid-Term Timeframe (Trend Filter)", TIME_INTERVALS, index=default_mt_index, help="Select a longer timeframe (e.g., 1d if Entry is 1h) for trend filtering.")
         
@@ -618,7 +626,7 @@ def main_dashboard():
         with tab_recommendation:
             st.header("🎯 FINAL TRADING RECOMMENDATION")
             
-            # --- BACKTESTING EXECUTION ---
+            # --- BACKTESTING EXECUTION (This is where the results are rendered) ---
             backtest_results = run_backtest(st.session_state.df1, ticker1, price1)
             st.markdown("---")
             
