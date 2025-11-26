@@ -63,21 +63,15 @@ def apply_leading_indicators(df):
     if df.empty:
         return df
     
-    # 1. Momentum Divergence (RSI)
     df['RSI'] = calculate_rsi(df['Close'], window=RSI_WINDOW)
-    
-    # 2. Volatility (ATR) - Leading measure of market energy/risk
     df['ATR'] = calculate_atr(df, window=ATR_WINDOW)
-    
-    # 3. Liquidity Proxy (Volume)
-    # The VIX proxy for stocks/crypto/forex based on rolling volatility is kept
     df['Volatility_Pct'] = df['Close'].pct_change().rolling(window=20).std() * 100
     
     return df
 
 @st.cache_data(ttl=3600)
 def fetch_and_process_data(ticker, interval, period, sleep_sec):
-    """Fetches yfinance data with rate limiting and converts to IST."""
+    """Fetches yfinance data with rate limiting, flattens MultiIndex, and converts to IST."""
     try:
         time.sleep(sleep_sec) 
         df = yf.download(ticker, interval=interval, period=period, progress=False)
@@ -85,6 +79,14 @@ def fetch_and_process_data(ticker, interval, period, sleep_sec):
         if df.empty:
             return pd.DataFrame()
 
+        # --- FIX: Gracefully flatten MultiIndex DataFrame ---
+        if isinstance(df.columns, pd.MultiIndex):
+            # Select the main price data columns (e.g., ('Close', 'TICKER'))
+            # We assume the columns are ['Open', 'High', 'Low', 'Close', 'Volume']
+            df.columns = [col[0] for col in df.columns] 
+            # If the ticker symbol is used as the first level index, this flattens it.
+        # --- END FIX ---
+            
         if df.index.tz is None:
             df.index = df.index.tz_localize('UTC').tz_convert(IST_TIMEZONE)
         else:
@@ -99,7 +101,10 @@ def fetch_and_process_data(ticker, interval, period, sleep_sec):
         return pd.DataFrame()
         
 def extract_scalar(value):
-    """Ensures the value is a scalar, handling Series/NumPy arrays."""
+    """
+    Ensures the value is a scalar, handling potential Pandas Series or 
+    NumPy arrays of length 1, preventing format string errors.
+    """
     if isinstance(value, pd.Series):
         if not value.empty and len(value) == 1:
             return value.item()
@@ -112,8 +117,11 @@ def extract_scalar(value):
 
 def get_fibonacci_levels(df):
     """Calculates high/low and returns simple Fibonacci retracement levels (Leading S/R)."""
+    
+    # --- FIX: Ensure max/min operations return scalar values to avoid Ambiguous Series Error ---
     high = extract_scalar(df['High'].max())
     low = extract_scalar(df['Low'].min())
+    # --- END FIX ---
     
     if pd.isna(high) or pd.isna(low):
          return {lvl: np.nan for lvl in ['0.0%', '23.6%', '38.2%', '50.0%', '61.8%', '78.6%', '100%']}
@@ -223,7 +231,7 @@ def perform_leading_analysis(df, ticker_label):
     st.markdown(f"**Key 50% Fibonacci Level:** `{fibo_levels['50.0%']:.2f}`")
     
     # Determine proximity to 50% level
-    proximity = abs(current_close - fibo_levels['50.0%']) / atr_value
+    proximity = abs(current_close - fibo_levels['50.0%']) / atr_value if atr_value > 0 else np.inf
     
     if proximity <= 1.5 and atr_value > 0:
         st.warning(f"Price is within 1.5 ATR of the 50% Fibonacci level ({fibo_levels['50.0%']:.2f}). **Expect a Decision Point.**")
@@ -237,7 +245,6 @@ def perform_leading_analysis(df, ticker_label):
     st.markdown(f"**RSI Divergence Check:** {divergence}")
     
     st.info("💡 Summary: Trading decisions should focus on confluence between Divergence signals and price action around Fibonacci/ATR levels.")
-    
 
 
 def perform_ratio_analysis(df1, df2):
@@ -284,7 +291,11 @@ def perform_value_at_risk(df, ticker_label):
         st.info("Cannot calculate returns distribution.")
         return
         
-    # Statistical parameters
+    current_price = extract_scalar(df['Close'].iloc[-1])
+    if pd.isna(current_price):
+         st.info("Current price not available for VaR price calculation.")
+         return
+
     mu = extract_scalar(returns.mean())
     sigma = extract_scalar(returns.std())
     
@@ -292,18 +303,14 @@ def perform_value_at_risk(df, ticker_label):
     VaR_95_hist = extract_scalar(returns.quantile(0.05)) # Worst 5% loss
     VaR_99_hist = extract_scalar(returns.quantile(0.01)) # Worst 1% loss
 
-    # 2. Parametric VaR (assuming Normal Distribution)
-    VaR_95_param = norm.ppf(0.05, mu, sigma)
-    VaR_99_param = norm.ppf(0.01, mu, sigma)
-    
-    # 3. Conditional VaR (Expected Shortfall) - Average of the worst losses
-    CVaR_95 = extract_scalar(returns[returns <= VaR_95_hist].mean())
+    # 2. Conditional VaR (Expected Shortfall) - Average of the worst losses
+    CVaR_95 = extract_scalar(returns[returns <= VaR_95_hist].mean()) if not pd.isna(VaR_95_hist) else np.nan
     
     st.markdown(f"""
-    **Current Price:** `{extract_scalar(df['Close'].iloc[-1]):,.2f}`
+    **Current Price:** `{current_price:,.2f}`
     
-    * **95% VaR (Historical):** `{VaR_95_hist*100:.3f}%` | Price Equivalent: `{extract_scalar(df['Close'].iloc[-1]) * (1 + VaR_95_hist):.2f}`
-    * **99% VaR (Historical):** `{VaR_99_hist*100:.3f}%` | Price Equivalent: `{extract_scalar(df['Close'].iloc[-1]) * (1 + VaR_99_hist):.2f}`
+    * **95% VaR (Historical):** `{VaR_95_hist*100:.3f}%` | Price Equivalent: `{current_price * (1 + VaR_95_hist):.2f}`
+    * **99% VaR (Historical):** `{VaR_99_hist*100:.3f}%` | Price Equivalent: `{current_price * (1 + VaR_99_hist):.2f}`
     * **Conditional VaR (CVaR) 95%:** `{CVaR_95*100:.3f}%` (Expected loss if VaR is breached)
     """)
     
@@ -324,9 +331,14 @@ def generate_candlestick_chart(df, ticker_label):
     
     # Fibonacci Levels
     fibo = get_fibonacci_levels(df)
-    fig.add_hline(y=fibo['50.0%'], line_dash="dash", line_color="orange", annotation_text="50% Fib")
-    fig.add_hline(y=fibo['100% (Support)'], line_dash="dash", line_color="green", annotation_text="100% Support")
-    fig.add_hline(y=fibo['0.0% (Resistance)'], line_dash="dash", line_color="red", annotation_text="0% Resistance")
+    
+    # Check if fibo levels are valid before adding lines
+    if not pd.isna(fibo['50.0%']):
+        fig.add_hline(y=fibo['50.0%'], line_dash="dash", line_color="orange", annotation_text="50% Fib")
+    if not pd.isna(fibo['100% (Support)']):
+        fig.add_hline(y=fibo['100% (Support)'], line_dash="dash", line_color="green", annotation_text="100% Support")
+    if not pd.isna(fibo['0.0% (Resistance)']):
+        fig.add_hline(y=fibo['0.0% (Resistance)'], line_dash="dash", line_color="red", annotation_text="0% Resistance")
 
 
     # RSI Subplot
@@ -452,7 +464,8 @@ def main_dashboard():
                 st.markdown("---")
                 perform_ratio_analysis(st.session_state.df1, st.session_state.df2)
             else:
-                col_l1.empty() # Clear second column if ratio is disabled
+                # If ratio is disabled, ensure the column layout is handled gracefully
+                pass
 
 
         with tab_var:
@@ -468,22 +481,24 @@ def main_dashboard():
             st.subheader(f"Synthesis for {ticker1}")
             
             current_price = extract_scalar(st.session_state.df1['Close'].iloc[-1])
-            fibo_50 = get_fibonacci_levels(st.session_state.df1)['50.0%']
+            fibo_levels = get_fibonacci_levels(st.session_state.df1)
+            fibo_50 = fibo_levels['50.0%']
             divergence_signal = detect_rsi_divergence(st.session_state.df1)
             
-            if "BULLISH DIVERGENCE" in divergence_signal and current_price < fibo_50:
-                 signal = "**STRONG BUY (Divergence at Support)**"
-                 logic = "Bullish RSI Divergence detected, suggesting momentum is turning up while price is below the 50% Fibonacci level (potential support entry)."
-            elif "BEARISH DIVERGENCE" in divergence_signal and current_price > fibo_50:
-                 signal = "**STRONG SELL (Divergence at Resistance)**"
-                 logic = "Bearish RSI Divergence detected, suggesting momentum is turning down while price is above the 50% Fibonacci level (potential resistance entry)."
-            elif current_price > fibo_50:
-                signal = "**BUY (Above Key Fib)**"
-                logic = "No divergence, but price holding strongly above the 50% Fibonacci level. Look for a break of the 0% resistance."
-            else:
-                 signal = "**NEUTRAL / WATCH**"
-                 logic = "Price is consolidating near the 50% Fibonacci or no clear leading signal (Divergence) is present."
+            signal = "**NEUTRAL / WATCH**"
+            logic = "Price is consolidating near the 50% Fibonacci or no clear leading signal (Divergence) is present."
 
+            if not pd.isna(current_price) and not pd.isna(fibo_50):
+                if "BULLISH DIVERGENCE" in divergence_signal and current_price < fibo_50:
+                    signal = "**STRONG BUY (Divergence at Support)**"
+                    logic = "Bullish RSI Divergence detected, suggesting momentum is turning up while price is below the 50% Fibonacci level (potential support entry)."
+                elif "BEARISH DIVERGENCE" in divergence_signal and current_price > fibo_50:
+                    signal = "**STRONG SELL (Divergence at Resistance)**"
+                    logic = "Bearish RSI Divergence detected, suggesting momentum is turning down while price is above the 50% Fibonacci level (potential resistance entry)."
+                elif current_price > fibo_50:
+                    signal = "**BUY (Above Key Fib)**"
+                    logic = "No divergence, but price holding strongly above the 50% Fibonacci level. Look for a break of the 0% resistance."
+                
             st.markdown(f"**Key Price/Indicator Confluence:**")
             st.markdown(f"* **RSI Divergence:** {divergence_signal}")
             st.markdown(f"* **50% Fibonacci Level:** `{fibo_50:.2f}`")
@@ -494,17 +509,22 @@ def main_dashboard():
             # Risk Management based on VaR
             returns = st.session_state.df1['Close'].pct_change().dropna()
             VaR_99_hist = extract_scalar(returns.quantile(0.01))
-            VaR_99_price = current_price * (1 + VaR_99_hist) if not pd.isna(VaR_99_hist) else "N/A"
             
             st.markdown("""
             ### Risk Management (VaR Based)
             """)
-            if signal.startswith("**BUY"):
-                st.markdown(f"* **Recommended Stop Loss (99% VaR Price):** **`{VaR_99_price:.2f}`** (Set SL below this price to manage extreme risk.)")
-            elif signal.startswith("**SELL"):
-                 st.markdown(f"* **Recommended Stop Loss (Symmetrical VaR Price):** **`{(current_price * (1 - VaR_99_hist)):.2f}`** (Symmetrical level for short position protection.)")
+            if not pd.isna(current_price) and not pd.isna(VaR_99_hist):
+                VaR_99_price_long = current_price * (1 + VaR_99_hist)
+                VaR_99_price_short = current_price * (1 - VaR_99_hist) # Symmetrical for short position
+
+                if signal.startswith("**BUY"):
+                    st.markdown(f"* **Recommended Stop Loss (99% VaR Price):** **`{VaR_99_price_long:.2f}`** (Set SL below this price to manage extreme risk.)")
+                elif signal.startswith("**SELL"):
+                     st.markdown(f"* **Recommended Stop Loss (Symmetrical VaR Price):** **`{VaR_99_price_short:.2f}`** (Symmetrical level for short position protection.)")
+                else:
+                    st.markdown("* **Risk Management:** Decision point requires market confirmation.")
             else:
-                st.markdown("* **Risk Management:** Decision point requires market confirmation.")
+                 st.markdown("* **Risk Management:** VaR levels cannot be calculated due to insufficient historical returns data.")
 
 
     elif st.session_state.data_fetched and st.session_state.df1.empty:
