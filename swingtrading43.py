@@ -15,7 +15,7 @@ PERIODS = ["1d", "5d", "1mo", "6mo", "1y", "5y", "10y"]
 IST_TIMEZONE = 'Asia/Kolkata' 
 
 # --- HYPERPARAMETERS ---
-TICKER_A = 'KO' # Coca-Cola
+TICKER_A = 'KO' # Coca-Cola (Suggested reliable pair)
 TICKER_B = 'PEP' # PepsiCo
 WINDOW = 252     # Rolling window for calculating Z-Score (approx 1 trading year)
 ENTRY_Z_SCORE = 2.0
@@ -23,35 +23,44 @@ EXIT_Z_SCORE = 0.5
 
 # --- CORE FUNCTIONS ---
 
+def get_price_series(ticker, period):
+    """
+    Fetches data and ensures a time-series Series is returned, 
+    handling the 'Adj Close' column selection robustly.
+    """
+    # Fetch data
+    data = yf.download(ticker, period=period, progress=False)
+    
+    if data.empty:
+        return None
+    
+    # Identify the target column ('Adj Close' or 'Close')
+    if 'Adj Close' in data.columns:
+        price_series = data['Adj Close']
+    elif 'Close' in data.columns:
+        # Use 'Close' as a fallback if 'Adj Close' is missing (e.g., for short intervals)
+        price_series = data['Close']
+    else:
+        # No usable price data found
+        return None
+        
+    # Ensure the result is a pandas Series with an index. This fixes the 'scalar values' error.
+    if isinstance(price_series, pd.Series):
+        return price_series.dropna()
+    else:
+        return None
+
 @st.cache_data(ttl=3600)
 def fetch_and_prepare_data(ticker_a, ticker_b, period):
-    """
-    Fetches and merges data for the two stocks, handling the 'Adj Close' error 
-    by falling back to 'Close'.
-    """
-    def get_price_series(ticker):
-        # Fetch data
-        data = yf.download(ticker, period=period, progress=False)
-        if data.empty:
-            return None
-        
-        # FIX: Try 'Adj Close' first, if missing, use 'Close'
-        if 'Adj Close' in data.columns:
-            return data['Adj Close']
-        elif 'Close' in data.columns:
-            st.warning(f"Using 'Close' price for {ticker} as 'Adj Close' is unavailable.")
-            return data['Close']
-        else:
-            return None
-
+    """Fetches and merges data for the two stocks."""
     try:
-        data_a = get_price_series(ticker_a)
-        data_b = get_price_series(ticker_b)
+        data_a = get_price_series(ticker_a, period)
+        data_b = get_price_series(ticker_b, period)
         
         if data_a is None or data_b is None:
             return pd.DataFrame(), "Could not fetch valid price data for one or both tickers."
 
-        # Combine and rename columns
+        # Combine and rename columns, ensuring the index is aligned (fixing the scalar error indirectly)
         df = pd.DataFrame({'A': data_a, 'B': data_b}).dropna()
         
         if df.empty or len(df) < WINDOW:
@@ -60,6 +69,7 @@ def fetch_and_prepare_data(ticker_a, ticker_b, period):
         return df, None
         
     except Exception as e:
+        # Catch any unexpected errors during the DataFrame creation
         return pd.DataFrame(), f"Error during data processing: {e}"
 
 def calculate_spread_and_zscore(df):
@@ -67,13 +77,11 @@ def calculate_spread_and_zscore(df):
     
     # 1. Rolling Hedge Ratio (Beta) Calculation using OLS
     def get_beta(series):
-        # Rolling regression of A on B
         y = series['A']
         X = series['B']
         X = add_constant(X, prepend=False) 
         try:
             model = OLS(y, X).fit()
-            # The hedge ratio is the coefficient of B (index 0 if we prepend constant)
             return model.params[0] 
         except:
              return np.nan
@@ -109,6 +117,7 @@ def run_pairs_backtest(df, entry_z, exit_z):
     
     # 4. Calculate P&L 
     df['Daily_Spread_Change'] = df['Spread'].diff()
+    # P&L = Previous Day's Position * Today's change in Spread value
     df['P_L'] = df['Position'].shift(1) * df['Daily_Spread_Change']
     df['Cumulative_P_L'] = df['P_L'].cumsum().fillna(0)
     
@@ -117,28 +126,13 @@ def run_pairs_backtest(df, entry_z, exit_z):
 def display_results(df_final):
     """Displays key metrics and chart using Streamlit."""
     
-    # --- Performance Metrics ---
     total_return = df_final['Cumulative_P_L'].iloc[-1]
     
     # Annualized Sharpe Ratio 
     sharpe_ratio = np.sqrt(WINDOW) * df_final['P_L'].mean() / df_final['P_L'].std() if df_final['P_L'].std() != 0 else 0
 
-    # Trade Metrics 
     trades_df = df_final[df_final['Position'].diff() != 0].copy()
     entry_count = (trades_df['Position'] != 0).sum()
-    
-    # Simplified Win Rate calculation based on completed trades
-    trade_profits = trades_df[(trades_df['Position'] == 0) & (trades_df['Position'].shift(1) != 0)]
-    
-    if not trade_profits.empty:
-        completed_trades = len(trade_profits)
-        # Note: P_L in trade_profits is the final P&L of the *day the trade exited*.
-        # For true trade P&L, you would need to calculate the difference between the Spread at Entry and the Spread at Exit.
-        # We'll use the final P_L column difference for a simple approximation here.
-        win_rate = 0 # Cannot accurately calculate win rate with this simplified P&L method
-    else:
-        completed_trades = 0
-
     
     st.markdown("---")
     st.markdown("### 📊 Backtest Performance Summary")
@@ -157,11 +151,9 @@ def display_results(df_final):
     fig = go.Figure()
     fig.add_trace(go.Scatter(x=df_final.index, y=df_final['Z_Score'], name='Z-Score', line=dict(color='blue', width=2)))
     
-    # Entry Lines
+    # Entry/Exit Lines
     fig.add_hline(y=st.session_state.entry_z_score, line_dash="dash", line_color="red", annotation_text="Short Entry", opacity=0.8)
     fig.add_hline(y=-st.session_state.entry_z_score, line_dash="dash", line_color="green", annotation_text="Long Entry", opacity=0.8)
-    
-    # Exit Lines
     fig.add_hline(y=st.session_state.exit_z_score, line_dash="dot", line_color="gray", annotation_text="Exit", opacity=0.5)
     fig.add_hline(y=-st.session_state.exit_z_score, line_dash="dot", line_color="gray", opacity=0.5)
     
@@ -199,7 +191,7 @@ def main_pairs_dashboard():
         st.session_state.run_backtest = False
         st.session_state.ticker_a = TICKER_A
         st.session_state.ticker_b = TICKER_B
-        st.session_state.period = PERIODS[5] # Default to 5y
+        st.session_state.period = PERIODS[5] 
         st.session_state.window = WINDOW
         st.session_state.entry_z_score = ENTRY_Z_SCORE
         st.session_state.exit_z_score = EXIT_Z_SCORE
@@ -207,13 +199,15 @@ def main_pairs_dashboard():
     with st.sidebar:
         st.header("Stock Pair & Parameters")
         
-        # Ticker A input with standard suggestions
+        # Ticker A input
         col_a_sel, col_a_text = st.columns([1, 2])
+        # Default index set to KO (index 2)
         base_a = col_a_sel.selectbox("Stock A (Base)", STANDARD_TICKERS, index=2, key='sb_a')
         st.session_state.ticker_a = col_a_text.text_input("Custom A (Override)", value=base_a).upper()
 
-        # Ticker B input with standard suggestions
+        # Ticker B input
         col_b_sel, col_b_text = st.columns([1, 2])
+        # Default index set to PEP (index 3)
         base_b = col_b_sel.selectbox("Stock B (Hedge)", STANDARD_TICKERS, index=3, key='sb_b')
         st.session_state.ticker_b = col_b_text.text_input("Custom B (Override)", value=base_b).upper()
 
@@ -261,7 +255,7 @@ def main_pairs_dashboard():
             st.dataframe(df_final[['A', 'B', 'Beta', 'Spread', 'Z_Score', 'Position', 'P_L']].tail(10), use_container_width=True)
 
     else:
-        st.info("Select your stock pair and parameters in the sidebar and click **'Run Backtest'** to begin.")
+        st.info("Select your stock pair (e.g., KO/PEP) and parameters in the sidebar and click **'Run Backtest'** to begin.")
         
 if __name__ == "__main__":
     main_pairs_dashboard()
