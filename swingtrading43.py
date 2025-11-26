@@ -69,6 +69,12 @@ def fetch_data(ticker, period, interval, delay=2):
 
 def calculate_spread(asset1_prices, asset2_prices):
     """Calculate spread and hedge ratio using linear regression"""
+    # Ensure we're working with Series
+    if isinstance(asset1_prices, pd.DataFrame):
+        asset1_prices = asset1_prices.squeeze()
+    if isinstance(asset2_prices, pd.DataFrame):
+        asset2_prices = asset2_prices.squeeze()
+    
     # Remove any NaN values
     valid_idx = ~(np.isnan(asset1_prices) | np.isnan(asset2_prices))
     x = asset2_prices[valid_idx].values.reshape(-1, 1)
@@ -86,6 +92,13 @@ def calculate_zscore(spread, window=20):
     """Calculate rolling z-score"""
     mean = spread.rolling(window=window).mean()
     std = spread.rolling(window=window).std()
+    # Ensure zscore is a Series, not DataFrame
+    if isinstance(spread, pd.DataFrame):
+        spread = spread.squeeze()
+    if isinstance(mean, pd.DataFrame):
+        mean = mean.squeeze()
+    if isinstance(std, pd.DataFrame):
+        std = std.squeeze()
     zscore = (spread - mean) / std
     return zscore, mean, std
 
@@ -209,8 +222,15 @@ if fetch_button:
             data2 = data2.loc[common_index]
             
             # Use Close prices
-            asset1_prices = data1['Close']
-            asset2_prices = data2['Close']
+            if isinstance(data1['Close'], pd.DataFrame):
+                asset1_prices = data1['Close'].squeeze()
+            else:
+                asset1_prices = data1['Close']
+            
+            if isinstance(data2['Close'], pd.DataFrame):
+                asset2_prices = data2['Close'].squeeze()
+            else:
+                asset2_prices = data2['Close']
             
             # Calculate spread and hedge ratio
             spread, hedge_ratio, intercept, r_squared = calculate_spread(asset1_prices, asset2_prices)
