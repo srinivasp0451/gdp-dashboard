@@ -347,7 +347,7 @@ def main_dashboard():
             
             st.session_state.data_fetched = True
             st.success("Data fetch complete!")
-            st.experimental_rerun()
+            st.rerun()
             
     # --- Main Content ---
     if st.session_state.data_fetched and not st.session_state.df1.empty:
