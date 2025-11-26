@@ -6,45 +6,41 @@ from statsmodels.api import OLS, add_constant
 import plotly.graph_objects as go
 import time
 
-# --- GLOBAL CONSTANTS (Necessary for Streamlit inputs) ---
+# --- GLOBAL CONSTANTS ---
 STANDARD_TICKERS = [
-    "XLE", "XOM", "KO", "PEP", "TCS.NS", "INFY.NS"
+    "AAPL", "MSFT", "KO", "PEP", "TCS.NS", "INFY.NS"
 ]
-TIME_INTERVALS = ["1m", "5m", "15m", "30m", "1h", "1d", "1wk", "1mo"]
 PERIODS = ["1d", "5d", "1mo", "6mo", "1y", "5y", "10y"]
-IST_TIMEZONE = 'Asia/Kolkata' 
 
-# --- HYPERPARAMETERS ---
-TICKER_A = 'KO' # Coca-Cola (Suggested reliable pair)
-TICKER_B = 'PEP' # PepsiCo
-WINDOW = 252     # Rolling window for calculating Z-Score (approx 1 trading year)
+# --- HYPERPARAMETERS (Set to the most reliable US tickers) ---
+TICKER_A = 'AAPL' # Apple Inc.
+TICKER_B = 'MSFT' # Microsoft Corp.
+WINDOW = 252     
 ENTRY_Z_SCORE = 2.0
 EXIT_Z_SCORE = 0.5 
 
-# --- CORE FUNCTIONS ---
+# --- CORE DATA FETCHING ---
 
 def get_price_series(ticker, period):
     """
-    Fetches data and ensures a time-series Series is returned, 
-    handling the 'Adj Close' column selection robustly.
+    Fetches data and handles column selection robustly ('Adj Close' -> 'Close').
+    Returns a proper pandas Series or None.
     """
-    # Fetch data
-    data = yf.download(ticker, period=period, progress=False)
+    # Fetch data (using 1d interval by default for reliability with long periods)
+    data = yf.download(ticker, period=period, interval='1d', progress=False)
     
     if data.empty:
         return None
     
-    # Identify the target column ('Adj Close' or 'Close')
+    # Select the price column
     if 'Adj Close' in data.columns:
         price_series = data['Adj Close']
     elif 'Close' in data.columns:
-        # Use 'Close' as a fallback if 'Adj Close' is missing (e.g., for short intervals)
         price_series = data['Close']
     else:
-        # No usable price data found
         return None
         
-    # Ensure the result is a pandas Series with an index. This fixes the 'scalar values' error.
+    # Ensure it's a series and drop any leading NaNs
     if isinstance(price_series, pd.Series):
         return price_series.dropna()
     else:
@@ -58,9 +54,10 @@ def fetch_and_prepare_data(ticker_a, ticker_b, period):
         data_b = get_price_series(ticker_b, period)
         
         if data_a is None or data_b is None:
-            return pd.DataFrame(), "Could not fetch valid price data for one or both tickers."
+            # If data is None, the ticker was invalid or fetch failed.
+            return pd.DataFrame(), f"Could not fetch valid price data for {ticker_a} or {ticker_b}. Check ticker spelling/suffix and connection."
 
-        # Combine and rename columns, ensuring the index is aligned (fixing the scalar error indirectly)
+        # Combine and rename columns, aligning the index
         df = pd.DataFrame({'A': data_a, 'B': data_b}).dropna()
         
         if df.empty or len(df) < WINDOW:
@@ -69,8 +66,9 @@ def fetch_and_prepare_data(ticker_a, ticker_b, period):
         return df, None
         
     except Exception as e:
-        # Catch any unexpected errors during the DataFrame creation
-        return pd.DataFrame(), f"Error during data processing: {e}"
+        return pd.DataFrame(), f"Error during final data assembly: {e}"
+
+# --- CORE TRADING LOGIC ---
 
 def calculate_spread_and_zscore(df):
     """Calculates the hedge ratio, spread, and Z-Score using a rolling window."""
@@ -105,19 +103,18 @@ def run_pairs_backtest(df, entry_z, exit_z):
     """Executes the Z-Score strategy backtest."""
     df['Signal'] = 0  
     
-    # Strategy Logic: Generate entry signals based on the Z-Score
+    # Generate entry signals
     df.loc[df['Z_Score'] >= entry_z, 'Signal'] = -1  # Short Spread (Sell A, Buy B)
     df.loc[df['Z_Score'] <= -entry_z, 'Signal'] = 1   # Long Spread (Buy A, Sell B)
     
-    # Exit/Close Trade Logic: If the Z-Score is between -EXIT_Z_SCORE and +EXIT_Z_SCORE
+    # Exit signals
     df.loc[df['Z_Score'].abs() <= exit_z, 'Signal'] = 0
     
-    # Position tracking: Forward-fill the last signal to maintain the position
+    # Position tracking
     df['Position'] = df['Signal'].replace(to_replace=0, method='ffill').fillna(0)
     
-    # 4. Calculate P&L 
+    # Calculate P&L 
     df['Daily_Spread_Change'] = df['Spread'].diff()
-    # P&L = Previous Day's Position * Today's change in Spread value
     df['P_L'] = df['Position'].shift(1) * df['Daily_Spread_Change']
     df['Cumulative_P_L'] = df['P_L'].cumsum().fillna(0)
     
@@ -127,10 +124,7 @@ def display_results(df_final):
     """Displays key metrics and chart using Streamlit."""
     
     total_return = df_final['Cumulative_P_L'].iloc[-1]
-    
-    # Annualized Sharpe Ratio 
     sharpe_ratio = np.sqrt(WINDOW) * df_final['P_L'].mean() / df_final['P_L'].std() if df_final['P_L'].std() != 0 else 0
-
     trades_df = df_final[df_final['Position'].diff() != 0].copy()
     entry_count = (trades_df['Position'] != 0).sum()
     
@@ -141,8 +135,8 @@ def display_results(df_final):
     col1.metric("Total P&L (USD)", f"${total_return:,.2f}")
     col2.metric("Annualized Sharpe Ratio", f"{sharpe_ratio:.2f}")
     col3.metric("Trade Entries", f"{entry_count}")
+    
 
-    # --- Charting the Z-Score and Trades ---
     st.markdown("### 📉 Z-Score and Trading Signals")
     
     y_min = df_final['Z_Score'].min() - 0.5
@@ -157,34 +151,16 @@ def display_results(df_final):
     fig.add_hline(y=st.session_state.exit_z_score, line_dash="dot", line_color="gray", annotation_text="Exit", opacity=0.5)
     fig.add_hline(y=-st.session_state.exit_z_score, line_dash="dot", line_color="gray", opacity=0.5)
     
-    # Highlight Long/Short Positions in the background
-    long_dates = df_final[df_final['Position'] == 1].index
-    short_dates = df_final[df_final['Position'] == -1].index
-    
-    if not long_dates.empty:
-        fig.add_vrect(x0=long_dates.min(), x1=long_dates.max(), fillcolor="green", opacity=0.1, layer="below", line_width=0, name="Long Spread")
-    if not short_dates.empty:
-        fig.add_vrect(x0=short_dates.min(), x1=short_dates.max(), fillcolor="red", opacity=0.1, layer="below", line_width=0, name="Short Spread")
-
     fig.update_layout(title=f'{st.session_state.ticker_a} / {st.session_state.ticker_b} Pairs Trading Z-Score',
                       yaxis_title='Z-Score', xaxis_title='Date', height=500,
                       yaxis_range=[y_min, y_max])
     st.plotly_chart(fig, use_container_width=True)
     
 
-    # --- P&L Chart ---
-    st.markdown("### 💰 Cumulative Profit and Loss")
-    fig_pl = go.Figure()
-    fig_pl.add_trace(go.Scatter(x=df_final.index, y=df_final['Cumulative_P_L'], fill='tozeroy', 
-                                line=dict(color='darkblue'), name='Equity Curve'))
-    fig_pl.update_layout(title='Strategy Equity Curve', yaxis_title='Cumulative P&L', 
-                         xaxis_title='Date', height=300)
-    st.plotly_chart(fig_pl, use_container_width=True)
-
 # --- MAIN EXECUTION ---
 def main_pairs_dashboard():
     st.title("🤝 Professional Pairs Trading Strategy (Z-Score Mean Reversion)")
-    st.markdown("This strategy exploits the **stationary relationship (Cointegration)** between two related assets by trading the **Z-Score** of their spread.")
+    st.markdown("Trading the **Z-Score** of the spread between two cointegrated assets.")
 
     # --- Session State Initialization ---
     if 'run_backtest' not in st.session_state:
@@ -201,24 +177,20 @@ def main_pairs_dashboard():
         
         # Ticker A input
         col_a_sel, col_a_text = st.columns([1, 2])
-        # Default index set to KO (index 2)
-        base_a = col_a_sel.selectbox("Stock A (Base)", STANDARD_TICKERS, index=2, key='sb_a')
+        base_a = col_a_sel.selectbox("Stock A (Base)", STANDARD_TICKERS, index=0, key='sb_a')
         st.session_state.ticker_a = col_a_text.text_input("Custom A (Override)", value=base_a).upper()
 
         # Ticker B input
         col_b_sel, col_b_text = st.columns([1, 2])
-        # Default index set to PEP (index 3)
-        base_b = col_b_sel.selectbox("Stock B (Hedge)", STANDARD_TICKERS, index=3, key='sb_b')
+        base_b = col_b_sel.selectbox("Stock B (Hedge)", STANDARD_TICKERS, index=1, key='sb_b')
         st.session_state.ticker_b = col_b_text.text_input("Custom B (Override)", value=base_b).upper()
 
         st.session_state.period = st.selectbox("Data Period", PERIODS, index=5)
         
         st.session_state.window = st.number_input("Lookback Window (Days)", min_value=30, value=WINDOW, step=10, 
-                                                 help="The number of past days used to calculate the rolling Mean and Std Dev. (252 ≈ 1 year)")
-        st.session_state.entry_z_score = st.slider("Entry Z-Score (Threshold)", 1.5, 3.5, ENTRY_Z_SCORE, 0.1, 
-                                                  help="Enter when the Z-Score is above this magnitude.")
-        st.session_state.exit_z_score = st.slider("Exit Z-Score (Mean Reversion)", 0.0, 1.0, EXIT_Z_SCORE, 0.1, 
-                                                 help="Exit when the Z-Score returns to this magnitude near zero.")
+                                                 help="252 is approx. 1 trading year.")
+        st.session_state.entry_z_score = st.slider("Entry Z-Score (Threshold)", 1.5, 3.5, ENTRY_Z_SCORE, 0.1)
+        st.session_state.exit_z_score = st.slider("Exit Z-Score (Mean Reversion)", 0.0, 1.0, EXIT_Z_SCORE, 0.1)
         
         if st.button("🚀 Run Backtest"):
             st.session_state.run_backtest = True
@@ -238,10 +210,10 @@ def main_pairs_dashboard():
             
             # --- Analysis Execution ---
             with st.status(f"Running backtest for {st.session_state.ticker_a} / {st.session_state.ticker_b}...", expanded=True) as status:
-                st.write("1. Calculating Rolling Beta (Hedge Ratio) using OLS...")
+                st.write("1. Calculating Rolling Beta (Hedge Ratio) and Spread...")
                 df_spread = calculate_spread_and_zscore(df_raw.copy())
                 
-                st.write("2. Calculating Z-Score and generating entry/exit signals...")
+                st.write("2. Calculating Z-Score and generating signals...")
                 df_final = run_pairs_backtest(df_spread, st.session_state.entry_z_score, st.session_state.exit_z_score)
                 
                 st.write("3. Compiling results and generating charts...")
@@ -255,7 +227,7 @@ def main_pairs_dashboard():
             st.dataframe(df_final[['A', 'B', 'Beta', 'Spread', 'Z_Score', 'Position', 'P_L']].tail(10), use_container_width=True)
 
     else:
-        st.info("Select your stock pair (e.g., KO/PEP) and parameters in the sidebar and click **'Run Backtest'** to begin.")
+        st.info("The tickers are defaulted to **AAPL/MSFT** for maximum reliability. Click **'Run Backtest'** to begin.")
         
 if __name__ == "__main__":
     main_pairs_dashboard()
