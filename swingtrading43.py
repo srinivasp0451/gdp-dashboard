@@ -658,13 +658,14 @@ if st.session_state.data_fetched and st.session_state.df1 is not None:
     
     st.write("")
     st.write("**Momentum Analysis:**")
-    st.write(f"RSI at {current_rsi:.2f} - ", end="")
+    rsi_text = f"RSI at {current_rsi:.2f} - "
     if rsi_oversold:
-        st.write("Oversold conditions indicate high probability bounce")
+        rsi_text += "Oversold conditions indicate high probability bounce"
     elif rsi_overbought:
-        st.write("Overbought conditions suggest correction expected")
+        rsi_text += "Overbought conditions suggest correction expected"
     else:
-        st.write("Neutral zone indicates trend continuation likely")
+        rsi_text += "Neutral zone indicates trend continuation likely"
+    st.write(rsi_text)
     
     if divergence_signal != "No Divergence":
         st.write(f"⚠️ **{divergence_signal}** detected - strong reversal signal")
@@ -679,11 +680,12 @@ if st.session_state.data_fetched and st.session_state.df1 is not None:
     
     st.write("")
     st.write("**Volatility Context:**")
-    st.write(f"Current volatility at {current_vol:.2f}% - ", end="")
+    vol_text = f"Current volatility at {current_vol:.2f}% - "
     if current_vol > df1['Volatility'].quantile(0.75):
-        st.write("Elevated (expect larger swings, adjust position size)")
+        vol_text += "Elevated (expect larger swings, adjust position size)"
     else:
-        st.write("Normal (standard position sizing applicable)")
+        vol_text += "Normal (standard position sizing applicable)"
+    st.write(vol_text)
     
     # ===========================================
     # COMPREHENSIVE BACKTESTING RESULTS
