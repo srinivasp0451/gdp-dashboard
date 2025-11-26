@@ -8,7 +8,7 @@ from scipy.stats import norm, skew, kurtosis
 
 # --- CONFIG ---
 st.set_page_config(
-    page_title="Pro Algo Trading Dashboard",
+    page_title="Leading Indicator Algo Dashboard",
     layout="wide",
     initial_sidebar_state="expanded"
 )
@@ -20,7 +20,7 @@ STANDARD_TICKERS = [
 TIME_INTERVALS = ["1m", "5m", "15m", "30m", "1h", "1d", "1wk", "1mo"]
 PERIODS = ["1d", "5d", "1mo", "6mo", "1y", "5y", "10y"]
 IST_TIMEZONE = 'Asia/Kolkata' 
-MA_WINDOWS = [9, 20, 21, 33, 50, 100, 150, 200]
+ATR_WINDOW = 14
 RSI_WINDOW = 14
 
 # --- SESSION STATE INITIALIZATION ---
@@ -35,16 +35,8 @@ for key in ['data_fetched', 'df1', 'df2', 'ticker1', 'ticker2', 'interval', 'per
 
 # --- CORE UTILITY FUNCTIONS ---
 
-def calculate_sma(data_series, window):
-    """Calculates Simple Moving Average (SMA)."""
-    return data_series.rolling(window=window).mean()
-
-def calculate_ema(data_series, window):
-    """Calculates Exponential Moving Average (EMA)."""
-    return data_series.ewm(span=window, adjust=False).mean()
-
 def calculate_rsi(close_prices, window=14):
-    """Calculates Relative Strength Index (RSI) using Pandas EWM."""
+    """Calculates Relative Strength Index (RSI). Considered leading for divergences."""
     delta = close_prices.diff()
     gain = delta.where(delta > 0, 0)
     loss = -delta.where(delta < 0, 0) 
@@ -56,16 +48,29 @@ def calculate_rsi(close_prices, window=14):
     rsi = 100 - (100 / (1 + rs))
     return rsi
 
-def apply_technical_indicators(df):
-    """Applies comprehensive technical indicators using ONLY Pandas and NumPy."""
+def calculate_atr(df, window=14):
+    """Calculates Average True Range (ATR) - Leading volatility measure."""
+    high_low = df['High'] - df['Low']
+    high_close = np.abs(df['High'] - df['Close'].shift())
+    low_close = np.abs(df['Low'] - df['Close'].shift())
+    tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+    # ATR is typically an SMA or EMA of the TR. We use EWMA (like Wilder's method).
+    atr = tr.ewm(span=window, adjust=False, min_periods=window).mean()
+    return atr
+
+def apply_leading_indicators(df):
+    """Applies leading and relevant non-lagging indicators."""
     if df.empty:
         return df
     
-    for window in MA_WINDOWS:
-        df[f'EMA_{window}'] = calculate_ema(df['Close'], window)
-        df[f'SMA_{window}'] = calculate_sma(df['Close'], window)
-        
+    # 1. Momentum Divergence (RSI)
     df['RSI'] = calculate_rsi(df['Close'], window=RSI_WINDOW)
+    
+    # 2. Volatility (ATR) - Leading measure of market energy/risk
+    df['ATR'] = calculate_atr(df, window=ATR_WINDOW)
+    
+    # 3. Liquidity Proxy (Volume)
+    # The VIX proxy for stocks/crypto/forex based on rolling volatility is kept
     df['Volatility_Pct'] = df['Close'].pct_change().rolling(window=20).std() * 100
     
     return df
@@ -85,7 +90,7 @@ def fetch_and_process_data(ticker, interval, period, sleep_sec):
         else:
             df.index = df.index.tz_convert(IST_TIMEZONE)
             
-        df = apply_technical_indicators(df)
+        df = apply_leading_indicators(df)
         st.toast(f"✅ Data for {ticker} fetched and processed.")
         return df
 
@@ -94,10 +99,7 @@ def fetch_and_process_data(ticker, interval, period, sleep_sec):
         return pd.DataFrame()
         
 def extract_scalar(value):
-    """
-    Ensures the value is a scalar, handling potential Pandas Series or 
-    NumPy arrays of length 1, preventing format string errors.
-    """
+    """Ensures the value is a scalar, handling Series/NumPy arrays."""
     if isinstance(value, pd.Series):
         if not value.empty and len(value) == 1:
             return value.item()
@@ -109,7 +111,7 @@ def extract_scalar(value):
     return value
 
 def get_fibonacci_levels(df):
-    """Calculates high/low and returns simple Fibonacci retracement levels."""
+    """Calculates high/low and returns simple Fibonacci retracement levels (Leading S/R)."""
     high = extract_scalar(df['High'].max())
     low = extract_scalar(df['Low'].min())
     
@@ -154,62 +156,89 @@ def calculate_basic_metrics(df, label, interval):
 
 # --- ADVANCED ANALYSIS MODULES ---
 
-def get_ma_position(close, ma_value):
-    """Determines if Price is Above/Below an MA."""
-    if pd.isna(ma_value):
-        return 'N/A'
-    return 'Above' if close > ma_value else 'Below'
+def detect_rsi_divergence(df, lookback=20):
+    """Simple check for recent divergence: price Higher Highs with RSI Lower Highs (Bearish)"""
+    
+    close = df['Close'].iloc[-lookback:]
+    rsi = df['RSI'].iloc[-lookback:]
+    
+    if len(close) < 5 or close.isnull().any() or rsi.isnull().any():
+        return "N/A (Insufficient Data)"
+        
+    # Check for Bearish Divergence (Price HH, RSI LH)
+    # Simplified check: Find the last significant peak/trough
+    
+    # 1. Price Highs
+    price_highs = close[close == close.rolling(window=5, center=True).max()].dropna()
+    if len(price_highs) >= 2:
+        latest_price = price_highs.iloc[-1]
+        prev_price = price_highs.iloc[-2]
+        
+        if latest_price > prev_price:  # Price Higher High (HH)
+            # Check corresponding RSI values
+            latest_rsi = rsi[price_highs.index[-1]]
+            prev_rsi = rsi[price_highs.index[-2]]
+            
+            if latest_rsi < prev_rsi: # RSI Lower High (LH)
+                return f"⚠️ **BEARISH DIVERGENCE** (Price HH/RSI LH @ {latest_price:.2f})"
+    
+    # Check for Bullish Divergence (Price LL, RSI HL)
+    price_lows = close[close == close.rolling(window=5, center=True).min()].dropna()
+    if len(price_lows) >= 2:
+        latest_price = price_lows.iloc[-1]
+        prev_price = price_lows.iloc[-2]
+        
+        if latest_price < prev_price:  # Price Lower Low (LL)
+            # Check corresponding RSI values
+            latest_rsi = rsi[price_lows.index[-1]]
+            prev_rsi = rsi[price_lows.index[-2]]
+            
+            if latest_rsi > prev_rsi: # RSI Higher Low (HL)
+                return f"✅ **BULLISH DIVERGENCE** (Price LL/RSI HL @ {latest_price:.2f})"
 
-def perform_mtfa(df, ticker_label):
-    """Generates the Multi-Timeframe Analysis table (simplified)."""
-    st.subheader(f"🕰️ MTFA Summary: {ticker_label}")
+    return "No Recent Divergence Detected"
+
+
+def perform_leading_analysis(df, ticker_label):
+    """Focuses on Volatility, Fibonacci and Momentum Divergence."""
+    st.subheader(f"⚡ Leading Analysis: {ticker_label}")
     if df.empty:
-        st.info("Data not available for MTFA.")
+        st.info("Data not available for Leading Analysis.")
         return
 
     last_row = df.iloc[-1]
     current_close = extract_scalar(last_row['Close'])
     
-    data = []
+    # 1. Volatility (ATR)
+    atr_value = extract_scalar(last_row['ATR'])
+    volatility_pct = extract_scalar(last_row['Volatility_Pct'])
     
-    for ma in [20, 50, 200]:
-        ma_value = extract_scalar(last_row[f'EMA_{ma}'])
-        position = get_ma_position(current_close, ma_value)
-        
-        data.append({
-            'Timeframe': st.session_state.interval,
-            'Indicator': f'EMA ({ma})',
-            'Value': f"{ma_value:,.2f}" if not pd.isna(ma_value) else 'N/A',
-            'Price vs. Indicator': position,
-            'Trend Proxy': 'Up' if ma_value < current_close else 'Down'
-        })
+    st.markdown(f"""
+    * **Current ATR ({ATR_WINDOW} periods):** `{atr_value:,.2f}` (Risk Proxy)
+    * **Rolling Volatility (20 periods):** `{volatility_pct:.2f}%` (Market Energy)
+    """)
     
-    rsi_value = extract_scalar(last_row['RSI'])
-    
-    data.append({
-        'Timeframe': st.session_state.interval,
-        'Indicator': 'RSI (14)',
-        'Value': f"{rsi_value:.2f}" if not pd.isna(rsi_value) else 'N/A',
-        'Price vs. Indicator': 'Oversold' if rsi_value <= 30 else ('Overbought' if rsi_value >= 70 else 'Neutral'),
-        'Trend Proxy': ''
-    })
-    
-    mtfa_df = pd.DataFrame(data)
-
-    def color_status(val):
-        if val in ['Above', 'Up', 'Neutral']:
-            return 'color: green'
-        if val in ['Below', 'Down', 'Oversold']:
-            return 'color: red'
-        if val in ['Overbought']:
-            return 'color: orange'
-        return None
-
-    st.dataframe(mtfa_df.style.applymap(color_status, subset=['Price vs. Indicator', 'Trend Proxy']), use_container_width=True, hide_index=True)
-    
+    # 2. Fibonacci Support/Resistance
     fibo_levels = get_fibonacci_levels(df)
-    st.markdown(f"**Key 50% Fibonacci Level:** `{fibo_levels['50.0%']:.2f}`") 
-    st.info("📚 Summary: True MTFA requires resampling data across multiple intervals.")
+    st.markdown(f"**Key 50% Fibonacci Level:** `{fibo_levels['50.0%']:.2f}`")
+    
+    # Determine proximity to 50% level
+    proximity = abs(current_close - fibo_levels['50.0%']) / atr_value
+    
+    if proximity <= 1.5 and atr_value > 0:
+        st.warning(f"Price is within 1.5 ATR of the 50% Fibonacci level ({fibo_levels['50.0%']:.2f}). **Expect a Decision Point.**")
+    elif current_close > fibo_levels['50.0%']:
+        st.success("Price is trading above the 50% Fibonacci Retracement.")
+    else:
+        st.error("Price is trading below the 50% Fibonacci Retracement.")
+
+    # 3. Momentum Divergence
+    divergence = detect_rsi_divergence(df, lookback=40)
+    st.markdown(f"**RSI Divergence Check:** {divergence}")
+    
+    st.info("💡 Summary: Trading decisions should focus on confluence between Divergence signals and price action around Fibonacci/ATR levels.")
+    
+
 
 def perform_ratio_analysis(df1, df2):
     """Performs Ratio Calculation and displays basic results."""
@@ -240,14 +269,14 @@ def perform_ratio_analysis(df1, df2):
         column_config={"__index__": st.column_config.DatetimeColumn("DateTime (IST)")}
     )
     
-    st.info("💡 Advanced: Ratio Binning analysis with forward returns and export functionality is required here to complete this module.")
+    st.info("💡 Advanced: Ratio trading is a leading strategy. When the Ratio RSI is extreme (e.g., < 10 or > 90), the pair is statistically likely to mean-revert.")
 
-def perform_statistical_analysis(df, ticker_label):
-    """Performs Z-Score analysis and plots distributions."""
-    st.subheader(f"🔔 Statistical Distribution ({ticker_label})")
+def perform_value_at_risk(df, ticker_label):
+    """Calculates Value at Risk (VaR) and Conditional VaR (CVaR)."""
+    st.subheader(f"📉 Value at Risk (VaR) Analysis ({ticker_label})")
     
     if len(df) < 2:
-        st.info("Insufficient data for statistical analysis.")
+        st.info("Insufficient data for VaR analysis.")
         return
 
     returns = df['Close'].pct_change().dropna()
@@ -255,38 +284,34 @@ def perform_statistical_analysis(df, ticker_label):
         st.info("Cannot calculate returns distribution.")
         return
         
+    # Statistical parameters
     mu = extract_scalar(returns.mean())
     sigma = extract_scalar(returns.std())
     
-    z_scores = (returns - mu) / sigma
+    # 1. Historical VaR (Non-parametric)
+    VaR_95_hist = extract_scalar(returns.quantile(0.05)) # Worst 5% loss
+    VaR_99_hist = extract_scalar(returns.quantile(0.01)) # Worst 1% loss
+
+    # 2. Parametric VaR (assuming Normal Distribution)
+    VaR_95_param = norm.ppf(0.05, mu, sigma)
+    VaR_99_param = norm.ppf(0.01, mu, sigma)
     
-    skewness = extract_scalar(skew(returns))
-    kurt = extract_scalar(kurtosis(returns))
-    current_z = extract_scalar(z_scores.iloc[-1]) if not z_scores.empty else np.nan
+    # 3. Conditional VaR (Expected Shortfall) - Average of the worst losses
+    CVaR_95 = extract_scalar(returns[returns <= VaR_95_hist].mean())
     
     st.markdown(f"""
-    * **Mean Return ($\mu$)**: {mu * 100:.4f}%, **Std Dev ($\sigma$)**: {sigma * 100:.4f}%
-    * **Skewness**: {skewness:.2f}, **Kurtosis (Excess)**: {kurt:.2f}
-    * **Current Z-Score**: `{current_z:.2f}` (Percentile: {norm.cdf(current_z)*100:.2f}th)
+    **Current Price:** `{extract_scalar(df['Close'].iloc[-1]):,.2f}`
+    
+    * **95% VaR (Historical):** `{VaR_95_hist*100:.3f}%` | Price Equivalent: `{extract_scalar(df['Close'].iloc[-1]) * (1 + VaR_95_hist):.2f}`
+    * **99% VaR (Historical):** `{VaR_99_hist*100:.3f}%` | Price Equivalent: `{extract_scalar(df['Close'].iloc[-1]) * (1 + VaR_99_hist):.2f}`
+    * **Conditional VaR (CVaR) 95%:** `{CVaR_95*100:.3f}%` (Expected loss if VaR is breached)
     """)
     
-    x_axis = np.arange(mu - 4 * sigma, mu + 4 * sigma, sigma / 100)
-    pdf = norm.pdf(x_axis, mu, sigma)
+    st.warning("⚠️ VaR provides a **leading risk boundary**. The 99% VaR price equivalent is a strong candidate for a **Stop Loss** level, as it represents a 1% chance of being breached.")
 
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(x=x_axis * 100, y=pdf, mode='lines', name='Normal Distribution', line=dict(color='blue')))
-    
-    if not np.isnan(current_z):
-        current_return = extract_scalar(returns.iloc[-1]) * 100
-        fig.add_vline(x=current_return, line_width=2, line_dash="dash", line_color="red", name="Current Position")
-    
-    fig.update_layout(title='Returns Distribution with Normal Curve',
-                      xaxis_title='Returns (%)', yaxis_title='Probability Density')
-    st.plotly_chart(fig, use_container_width=True)
-# [attachment_0](attachment)
 
-def generate_candlestick_chart(df, ticker_label, show_ratio=False):
-    """Generates the interactive Candlestick Chart with EMAs and RSI."""
+def generate_candlestick_chart(df, ticker_label):
+    """Generates the interactive Candlestick Chart with ATR and RSI."""
     if df.empty:
         st.warning(f"No data to chart for {ticker_label}.")
         return
@@ -297,81 +322,40 @@ def generate_candlestick_chart(df, ticker_label, show_ratio=False):
                                  low=df['Low'], close=df['Close'],
                                  name='Candles'))
     
-    for window in [20, 50, 200]:
-        fig.add_trace(go.Scatter(x=df.index, y=df[f'EMA_{window}'], mode='lines', 
-                                 name=f'EMA {window}', opacity=0.7))
+    # Fibonacci Levels
+    fibo = get_fibonacci_levels(df)
+    fig.add_hline(y=fibo['50.0%'], line_dash="dash", line_color="orange", annotation_text="50% Fib")
+    fig.add_hline(y=fibo['100% (Support)'], line_dash="dash", line_color="green", annotation_text="100% Support")
+    fig.add_hline(y=fibo['0.0% (Resistance)'], line_dash="dash", line_color="red", annotation_text="0% Resistance")
 
+
+    # RSI Subplot
     fig_rsi = go.Figure()
     fig_rsi.add_trace(go.Scatter(x=df.index, y=df['RSI'], name='RSI', line=dict(color='purple')))
     fig_rsi.add_hline(y=70, line_dash="dash", line_color="red", name="Overbought")
     fig_rsi.add_hline(y=30, line_dash="dash", line_color="green", name="Oversold")
     fig_rsi.update_layout(height=200, title='Relative Strength Index (RSI)', yaxis_range=[0, 100])
 
-    fig.update_layout(title=f'{ticker_label} Price Chart ({st.session_state.interval})', 
+    # ATR Subplot
+    fig_atr = go.Figure()
+    fig_atr.add_trace(go.Scatter(x=df.index, y=df['ATR'], name=f'ATR ({ATR_WINDOW})', line=dict(color='orange')))
+    fig_atr.update_layout(height=200, title='Average True Range (ATR)')
+
+
+    fig.update_layout(title=f'{ticker_label} Price Chart (Fibonacci/ATR Focus)', 
                       xaxis_rangeslider_visible=False)
     
     st.plotly_chart(fig, use_container_width=True)
     st.plotly_chart(fig_rsi, use_container_width=True)
-# 
+    st.plotly_chart(fig_atr, use_container_width=True)
 
-def monte_carlo_forecast(df, ticker, num_simulations=100, forecast_days=30):
-    """
-    Performs Monte Carlo Simulation for price forecasting.
-    This works best with '1d' or '1wk' interval data.
-    """
-    if df.empty or len(df) < 5:
-        st.warning("Insufficient data for Monte Carlo Simulation.")
-        return None, None
-    
-    returns = df['Close'].pct_change().dropna()
-    last_price = extract_scalar(df['Close'].iloc[-1])
-    
-    # Geometric Brownian Motion Parameters
-    mu = extract_scalar(returns.mean())
-    sigma = extract_scalar(returns.std())
-    
-    # Prepare simulation data structure
-    sim_data = np.zeros([forecast_days, num_simulations])
-    sim_data[0] = last_price
-    
-    # Run simulation
-    for t in range(1, forecast_days):
-        # Brownian motion component: change in price depends on mu, sigma, and a random term
-        sim_data[t] = sim_data[t - 1] * np.exp((mu - 0.5 * sigma**2) + sigma * np.random.normal(0, 1, num_simulations))
-
-    # Calculate VaR and expected prices
-    final_prices = sim_data[-1, :]
-    
-    results = {
-        '95% Lower Confidence (VaR)': np.percentile(final_prices, 5),
-        '50% Expected Price': np.percentile(final_prices, 50),
-        '95% Upper Confidence': np.percentile(final_prices, 95)
-    }
-
-    # Plot simulation paths
-    fig = go.Figure()
-    for i in range(num_simulations):
-        fig.add_trace(go.Scatter(y=sim_data[:, i], mode='lines', 
-                                 line=dict(width=1), opacity=0.15, 
-                                 showlegend=False))
-    
-    # Add final confidence levels
-    for percentile, color in [(5, 'red'), (50, 'blue'), (95, 'green')]:
-        fig.add_hline(y=np.percentile(final_prices, percentile), line_dash="dash", line_color=color, annotation_text=f"{percentile}% ({np.percentile(final_prices, percentile):.2f})")
-    
-    fig.update_layout(title=f'Monte Carlo Forecast for {ticker} ({forecast_days} periods)',
-                      xaxis_title=f"Time Steps ({st.session_state.interval})", 
-                      yaxis_title="Price")
-
-    st.plotly_chart(fig, use_container_width=True)
-    return results, last_price
-# 
 
 # --- MAIN LAYOUT FUNCTION ---
 def main_dashboard():
-    st.title("🎛️ Professional Algo Trading Dashboard")
+    st.title("🎛️ Leading Indicator Algo Trading Dashboard")
     st.markdown("---")
     
+    # --- 1. Data Fetching & Management (Sidebar) ---
     with st.sidebar:
         st.header("⚙️ Data & Config")
         
@@ -417,6 +401,7 @@ def main_dashboard():
     # --- Main Content ---
     if st.session_state.data_fetched and not st.session_state.df1.empty:
         
+        # --- 2. Basic Statistics Display ---
         st.header("📈 Current Market Metrics")
         col1, col2, col3 = st.columns(3)
         
@@ -434,7 +419,7 @@ def main_dashboard():
         st.markdown("---")
         st.subheader("Raw Data Sample")
         st.dataframe(
-            st.session_state.df1[['Open', 'High', 'Low', 'Close', 'RSI', 'EMA_50']].tail(5), 
+            st.session_state.df1[['Open', 'High', 'Low', 'Close', 'RSI', 'ATR']].tail(5), 
             use_container_width=True,
             column_config={"__index__": st.column_config.DatetimeColumn("DateTime (IST)")}
         )
@@ -442,10 +427,10 @@ def main_dashboard():
 
 
         # --- 3. Tabbed Layout for Advanced Analysis ---
-        tab_charts, tab_mtfa, tab_stats, tab_recommendation = st.tabs([
-            "📊 Interactive Charts", 
-            "🕰️ MTFA & Ratio", 
-            "🔔 Statistical (Z-Score)", 
+        tab_charts, tab_leading_analysis, tab_var, tab_recommendation = st.tabs([
+            "📊 Interactive Charts (Fib/ATR)", 
+            "⚡ Leading Analysis", 
+            "📉 Value at Risk (VaR)", 
             "🎯 Final Recommendation"
         ])
         
@@ -455,81 +440,72 @@ def main_dashboard():
                 st.markdown("---")
                 generate_candlestick_chart(st.session_state.df2, ticker2)
 
-        with tab_mtfa:
-            col_mtfa1, col_mtfa2 = st.columns(2)
-            with col_mtfa1:
-                perform_mtfa(st.session_state.df1, ticker1)
+        with tab_leading_analysis:
+            col_l1, col_l2 = st.columns(2)
+            with col_l1:
+                perform_leading_analysis(st.session_state.df1, ticker1)
             
             if enable_ratio and not st.session_state.df2.empty:
-                with col_mtfa2:
-                    perform_mtfa(st.session_state.df2, ticker2)
+                with col_l2:
+                    perform_leading_analysis(st.session_state.df2, ticker2)
                 
                 st.markdown("---")
                 perform_ratio_analysis(st.session_state.df1, st.session_state.df2)
+            else:
+                col_l1.empty() # Clear second column if ratio is disabled
 
-        with tab_stats:
-            perform_statistical_analysis(st.session_state.df1, ticker1)
+
+        with tab_var:
+            perform_value_at_risk(st.session_state.df1, ticker1)
             if enable_ratio and not st.session_state.df2.empty:
                 st.markdown("---")
-                perform_statistical_analysis(st.session_state.df2, ticker2)
+                perform_value_at_risk(st.session_state.df2, ticker2)
 
         with tab_recommendation:
             st.header("🎯 FINAL TRADING RECOMMENDATION")
             
-            st.subheader(f"🔮 Monte Carlo Forecasting ({ticker1})")
+            # --- Synthesis based on Leading Indicators and VaR ---
+            st.subheader(f"Synthesis for {ticker1}")
             
-            # --- Monte Carlo Inputs ---
-            col_mc1, col_mc2 = st.columns(2)
-            num_simulations = col_mc1.slider("Number of Simulations", 50, 500, 250, 50)
-            forecast_periods = col_mc2.slider(f"Forecast Periods ({interval})", 5, 100, 30, 5)
-
-            # Run and display MC simulation
-            mc_results, current_price = monte_carlo_forecast(st.session_state.df1, ticker1, num_simulations, forecast_periods)
-
-            st.markdown("---")
+            current_price = extract_scalar(st.session_state.df1['Close'].iloc[-1])
+            fibo_50 = get_fibonacci_levels(st.session_state.df1)['50.0%']
+            divergence_signal = detect_rsi_divergence(st.session_state.df1)
             
-            st.subheader(f"Synthesis & Trade Signal for {ticker1}")
-            
-            if mc_results and not pd.isna(current_price):
-                upper_bound = mc_results['95% Upper Confidence']
-                lower_bound = mc_results['95% Lower Confidence (VaR)']
-                
-                # Determine signal based on current price relative to MC bounds and 20 EMA
-                ema_20 = extract_scalar(st.session_state.df1['EMA_20'].iloc[-1])
-                
-                if current_price > upper_bound and current_price > ema_20:
-                     signal = "**STRONG BUY**"
-                     logic = f"Price is above the 95% MC Upper Bound and trending strongly above EMA 20. Target potential is the upper bound."
-                elif current_price < lower_bound and current_price < ema_20:
-                     signal = "**STRONG SELL**"
-                     logic = f"Price is below the 95% MC Lower Bound (VaR) and trending strongly below EMA 20. Potential downside to the lower bound."
-                elif current_price > ema_20 and mc_results['50% Expected Price'] > current_price:
-                    signal = "**BUY (Weak)**"
-                    logic = "Price is above EMA 20 and the 50% MC expectation is positive, suggesting mild upside momentum."
-                else:
-                    signal = "**NEUTRAL / WATCH**"
-                    logic = "The market is consolidating or lacks clear probabilistic direction (50% MC expectation is close to current price)."
-                
-                st.markdown(f"**Current Price:** `{current_price:,.2f}` | **50% MC Expectation:** `{mc_results['50% Expected Price']:.2f}`")
-
-                st.markdown(f"## Final Recommendation: {signal}")
-                st.info(f"**Logic Summary:** {logic}")
-                
-                # Illustrative Risk Management based on MC and technicals
-                st.markdown("""
-                ### Risk Management (Illustrative)
-                * **Entry (Target):** Based on breaking nearest Fib resistance/support.
-                * **Stop Loss (Protection):** Set SL $2 \times$ ATR below nearest support (using 95% VaR as a proxy).
-                """)
-
-                # Display MC summary table
-                mc_table = pd.DataFrame(mc_results.items(), columns=['Metric', 'Price'])
-                mc_table['Price'] = mc_table['Price'].apply(lambda x: f"{x:,.2f}")
-                st.dataframe(mc_table, use_container_width=True, hide_index=True)
+            if "BULLISH DIVERGENCE" in divergence_signal and current_price < fibo_50:
+                 signal = "**STRONG BUY (Divergence at Support)**"
+                 logic = "Bullish RSI Divergence detected, suggesting momentum is turning up while price is below the 50% Fibonacci level (potential support entry)."
+            elif "BEARISH DIVERGENCE" in divergence_signal and current_price > fibo_50:
+                 signal = "**STRONG SELL (Divergence at Resistance)**"
+                 logic = "Bearish RSI Divergence detected, suggesting momentum is turning down while price is above the 50% Fibonacci level (potential resistance entry)."
+            elif current_price > fibo_50:
+                signal = "**BUY (Above Key Fib)**"
+                logic = "No divergence, but price holding strongly above the 50% Fibonacci level. Look for a break of the 0% resistance."
             else:
-                 st.info("Monte Carlo results are not available or current price is missing. Check your data interval and period.")
+                 signal = "**NEUTRAL / WATCH**"
+                 logic = "Price is consolidating near the 50% Fibonacci or no clear leading signal (Divergence) is present."
+
+            st.markdown(f"**Key Price/Indicator Confluence:**")
+            st.markdown(f"* **RSI Divergence:** {divergence_signal}")
+            st.markdown(f"* **50% Fibonacci Level:** `{fibo_50:.2f}`")
             
-            st.markdown("---")
+            st.markdown(f"## Final Recommendation: {signal}")
+            st.info(f"**Logic:** {logic}")
+            
+            # Risk Management based on VaR
+            returns = st.session_state.df1['Close'].pct_change().dropna()
+            VaR_99_hist = extract_scalar(returns.quantile(0.01))
+            VaR_99_price = current_price * (1 + VaR_99_hist) if not pd.isna(VaR_99_hist) else "N/A"
+            
+            st.markdown("""
+            ### Risk Management (VaR Based)
+            """)
+            if signal.startswith("**BUY"):
+                st.markdown(f"* **Recommended Stop Loss (99% VaR Price):** **`{VaR_99_price:.2f}`** (Set SL below this price to manage extreme risk.)")
+            elif signal.startswith("**SELL"):
+                 st.markdown(f"* **Recommended Stop Loss (Symmetrical VaR Price):** **`{(current_price * (1 - VaR_99_hist)):.2f}`** (Symmetrical level for short position protection.)")
+            else:
+                st.markdown("* **Risk Management:** Decision point requires market confirmation.")
+
 
     elif st.session_state.data_fetched and st.session_state.df1.empty:
         st.error(f"No valid data to display for {st.session_state.ticker1}. Please check the ticker symbol, period, and interval.")
