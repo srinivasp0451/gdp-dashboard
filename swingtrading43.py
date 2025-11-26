@@ -24,7 +24,7 @@ RSI_WINDOW = 14
 KC_MULTIPLIER = 2.0 
 
 # --- SESSION STATE INITIALIZATION ---
-for key in ['data_fetched', 'df1', 'df2', 'ticker1', 'ticker2', 'interval', 'period']:
+for key in ['data_fetched', 'df1', 'df2', 'ticker1', 'ticker2', 'interval', 'period', 'mt_interval', 'df_mt']:
     if key not in st.session_state:
         if key.startswith('df'):
             st.session_state[key] = pd.DataFrame()
@@ -143,6 +143,8 @@ def calculate_basic_metrics(df, label, interval):
     
     return current_price, points_change
 
+# --- ADVANCED ANALYSIS MODULES ---
+
 def get_fibonacci_levels(df):
     """Calculates high/low and returns simple Fibonacci retracement levels (Leading S/R)."""
     high = extract_scalar(df['High'].max())
@@ -213,12 +215,56 @@ def get_kc_divergence_signal(df):
     else:
         return "NEUTRAL", "Consolidation within Keltner Channels or ambiguous Divergence."
 
+# --- CHARTING MODULE (FIXED) ---
+
+def generate_candlestick_chart(df, ticker_label):
+    """Generates the interactive Candlestick Chart with KC, ATR and RSI."""
+    if df.empty:
+        st.warning(f"No data to chart for {ticker_label}.")
+        return
+
+    fig = go.Figure()
+    fig.add_trace(go.Candlestick(x=df.index,
+                                 open=df['Open'], high=df['High'],
+                                 low=df['Low'], close=df['Close'],
+                                 name='Candles'))
+    
+    # Keltner Channels
+    if 'KC_Upper' in df.columns:
+        fig.add_trace(go.Scatter(x=df.index, y=df['KC_Upper'], line=dict(color='red', width=1), name='KC Upper', opacity=0.8))
+        fig.add_trace(go.Scatter(x=df.index, y=df['KC_Lower'], line=dict(color='green', width=1), name='KC Lower', opacity=0.8))
+        fig.add_trace(go.Scatter(x=df.index, y=df['KC_Middle'], line=dict(color='orange', width=1, dash='dot'), name='KC Middle (EMA)', opacity=0.6))
+    
+    # Fibonacci Levels
+    fibo = get_fibonacci_levels(df)
+    if not pd.isna(fibo['50.0%']):
+        fig.add_hline(y=fibo['50.0%'], line_dash="dash", line_color="purple", annotation_text="50% Fib", opacity=0.5)
+
+    fig.update_layout(title=f'{ticker_label} Price Chart (KC/Fib Focus)', 
+                      xaxis_rangeslider_visible=False)
+    
+    st.plotly_chart(fig, use_container_width=True)
+    
+    
+    # RSI Subplot
+    fig_rsi = go.Figure()
+    fig_rsi.add_trace(go.Scatter(x=df.index, y=df['RSI'], name='RSI', line=dict(color='purple')))
+    fig_rsi.add_hline(y=70, line_dash="dash", line_color="red", name="Overbought")
+    fig_rsi.add_hline(y=30, line_dash="dash", line_color="green", name="Oversold")
+    fig_rsi.update_layout(height=200, title='Relative Strength Index (RSI)', yaxis_range=[0, 100])
+    st.plotly_chart(fig_rsi, use_container_width=True)
+    
+    # ATR Subplot
+    fig_atr = go.Figure()
+    fig_atr.add_trace(go.Scatter(x=df.index, y=df['ATR'], name=f'ATR ({ATR_WINDOW})', line=dict(color='orange')))
+    fig_atr.update_layout(height=200, title='Average True Range (ATR)')
+    st.plotly_chart(fig_atr, use_container_width=True)
 
 # --- BACKTESTING MODULE (CORRECTED) ---
 
 def run_backtest(df, ticker_label, current_price):
     """
-    Runs a backtest and formats results based on user request.
+    Runs a backtest and formats results based on user request (Accuracy, Points, P/L Trades, % Return).
     """
     st.subheader(f"📊 Algorithm Backtest Results ({ticker_label})")
     
@@ -296,7 +342,7 @@ def run_backtest(df, ticker_label, current_price):
 
     trade_df = pd.DataFrame(trades)
     
-    # Calculate Metrics - ACCURACY, POINTS, PERCENTAGE, PROFIT/LOSS TRADES
+    # Calculate Metrics 
     trade_df['Is_Profit'] = trade_df['Points'] > 0
     
     total_trades = len(trade_df)
@@ -306,7 +352,6 @@ def run_backtest(df, ticker_label, current_price):
     
     total_points = extract_scalar(trade_df['Points'].sum())
     
-    # Calculate Total Return Percentage
     trade_df['Return_Pct'] = trade_df.apply(
         lambda row: (row['Exit'] - row['Entry']) / row['Entry'] if row['Type'] == 'Long' else (row['Entry'] - row['Exit']) / row['Entry'], axis=1
     )
@@ -325,10 +370,110 @@ def run_backtest(df, ticker_label, current_price):
     st.markdown("### 📈 Performance Metrics (Backtest)")
     st.table(pd.DataFrame(list(results.items()), columns=['Metric', 'Value']))
     
-    # Returning the structure for explicit verification
     return results
 
-# --- MAIN LAYOUT FUNCTION ---
+# --- Main Layout Function - (Restored functions for Leading Analysis, VaR, etc., are assumed present here) ---
+
+def perform_leading_analysis(df, ticker_label):
+    """Focuses on Volatility, Fibonacci and Momentum Divergence."""
+    st.subheader(f"⚡ Leading Analysis: {ticker_label}")
+    if df.empty:
+        st.info("Data not available for Leading Analysis.")
+        return
+
+    last_row = df.iloc[-1]
+    current_close = extract_scalar(last_row['Close'])
+    
+    atr_value = extract_scalar(last_row['ATR'])
+    volatility_pct = extract_scalar(last_row['Volatility_Pct'])
+    
+    st.markdown(f"""
+    * **Current ATR ({ATR_WINDOW} periods):** `{atr_value:,.2f}` (Risk Proxy)
+    * **Rolling Volatility (20 periods):** `{volatility_pct:.2f}%` (Market Energy)
+    """)
+    
+    fibo_levels = get_fibonacci_levels(df)
+    st.markdown(f"**Key 50% Fibonacci Level:** `{fibo_levels['50.0%']:.2f}`")
+    
+    proximity = abs(current_close - fibo_levels['50.0%']) / atr_value if atr_value > 0 else np.inf
+    
+    if proximity <= 1.5 and atr_value > 0:
+        st.warning(f"Price is within 1.5 ATR of the 50% Fibonacci level ({fibo_levels['50.0%']:.2f}). **Expect a Decision Point.**")
+    elif current_close > fibo_levels['50.0%']:
+        st.success("Price is trading above the 50% Fibonacci Retracement.")
+    else:
+        st.error("Price is trading below the 50% Fibonacci Retracement.")
+
+    divergence = detect_rsi_divergence(df, lookback=40)
+    st.markdown(f"**RSI Divergence Check:** {divergence}")
+    
+    st.info("💡 Summary: Trading decisions should focus on confluence between Divergence signals and price action around Fibonacci/ATR levels.")
+
+def perform_ratio_analysis(df1, df2):
+    """Performs Ratio Calculation and displays basic results."""
+    st.subheader("⚖️ Ratio Analysis (Cointegration Check)")
+    
+    df_combined = pd.concat([df1['Close'], df2['Close']], axis=1).dropna()
+    df_combined.columns = ['Close_1', 'Close_2']
+    df_combined['Ratio'] = df_combined['Close_1'] / df_combined['Close_2']
+    df_combined['Ratio_RSI'] = calculate_rsi(df_combined['Ratio'])
+    
+    if df_combined.empty:
+        st.warning("No overlapping data found for ratio calculation.")
+        return
+
+    ratio_mean = extract_scalar(df_combined['Ratio'].mean())
+    ratio_std = extract_scalar(df_combined['Ratio'].std())
+    current_ratio = extract_scalar(df_combined['Ratio'].iloc[-1])
+    
+    st.markdown(f"""
+    * **Mean Ratio:** `{ratio_mean:.4f}`
+    * **Std Dev:** `{ratio_std:.4f}`
+    * **Current Ratio:** `{current_ratio:.4f}`
+    """)
+    
+    st.dataframe(
+        df_combined[['Ratio', 'Ratio_RSI']].tail(10), 
+        use_container_width=True, 
+        column_config={"__index__": st.column_config.DatetimeColumn("DateTime (IST)")}
+    )
+    
+    st.info("💡 Advanced: Ratio trading is a leading strategy. When the Ratio RSI is extreme (e.g., < 10 or > 90), the pair is statistically likely to mean-revert.")
+
+def perform_value_at_risk(df, ticker_label):
+    """Calculates Value at Risk (VaR) and Conditional VaR (CVaR)."""
+    st.subheader(f"📉 Value at Risk (VaR) Analysis ({ticker_label})")
+    
+    if len(df) < 2:
+        st.info("Insufficient data for VaR analysis.")
+        return
+
+    returns = df['Close'].pct_change().dropna()
+    if returns.empty:
+        st.info("Cannot calculate returns distribution.")
+        return
+        
+    current_price = extract_scalar(df['Close'].iloc[-1])
+    if pd.isna(current_price):
+         st.info("Current price not available for VaR price calculation.")
+         return
+
+    VaR_95_hist = extract_scalar(returns.quantile(0.05))
+    VaR_99_hist = extract_scalar(returns.quantile(0.01))
+
+    CVaR_95 = extract_scalar(returns[returns <= VaR_95_hist].mean()) if not pd.isna(VaR_95_hist) else np.nan
+    
+    st.markdown(f"""
+    **Current Price:** `{current_price:,.2f}`
+    
+    * **95% VaR (Historical):** `{VaR_95_hist*100:.3f}%` | Price Equivalent: `{current_price * (1 + VaR_95_hist):.2f}`
+    * **99% VaR (Historical):** `{VaR_99_hist*100:.3f}%` | Price Equivalent: `{current_price * (1 + VaR_99_hist):.2f}`
+    * **Conditional VaR (CVaR) 95%:** `{CVaR_95*100:.3f}%` (Expected loss if VaR is breached)
+    """)
+    
+    st.warning("⚠️ VaR provides a **leading risk boundary**. The 99% VaR price equivalent is a strong candidate for a **Stop Loss** level, as it represents a 1% chance of being breached.")
+
+
 def main_dashboard():
     st.title("🎛️ Algo Dashboard with Keltner Channel & Backtesting")
     st.markdown("---")
@@ -352,6 +497,7 @@ def main_dashboard():
         
         # New: Mid-Term Timeframe for Confluence
         st_interval_index = TIME_INTERVALS.index(interval)
+        # Default MT is the next longer timeframe, ensuring it's not the same.
         default_mt_index = min(st_interval_index + 1, len(TIME_INTERVALS) - 1)
         st.session_state.mt_interval = st.selectbox("Mid-Term Timeframe (Trend Filter)", TIME_INTERVALS, index=default_mt_index, help="Select a longer timeframe (e.g., 1d if Entry is 1h) for trend filtering.")
         
@@ -378,7 +524,7 @@ def main_dashboard():
             if status1 is True:
                 st.toast(f"✅ ST data for {ticker1} fetched.")
             elif status1 is False:
-                st.error(f"No ST data available for {ticker1}.")
+                st.error(f"No ST data available for {ticker1}. Check ticker/period.")
             else: 
                 st.error(f"Error fetching {ticker1} ST: {status1}")
 
@@ -412,6 +558,7 @@ def main_dashboard():
     # --- Main Content ---
     if st.session_state.data_fetched and not st.session_state.df1.empty:
         
+        # --- 2. Basic Statistics Display ---
         st.header("📈 Current Market Metrics")
         col1, col2, col3 = st.columns(3)
         
@@ -427,7 +574,15 @@ def main_dashboard():
                 st.metric(label="Current Ratio (T1/T2)", value=f"{ratio:,.4f}" if not np.isnan(ratio) else "N/A")
         
         st.markdown("---")
+        st.subheader("Raw Data Sample")
+        st.dataframe(
+            st.session_state.df1[['Open', 'High', 'Low', 'Close', 'RSI', 'ATR', 'KC_Upper']].tail(5), 
+            use_container_width=True,
+            column_config={"__index__": st.column_config.DatetimeColumn("DateTime (IST)")}
+        )
+        st.markdown("---")
         
+        # --- 3. Tabbed Layout for Advanced Analysis ---
         tab_charts, tab_leading_analysis, tab_var, tab_recommendation = st.tabs([
             "📊 Interactive Charts", 
             "⚡ Leading Analysis", 
@@ -437,7 +592,28 @@ def main_dashboard():
         
         with tab_charts:
             generate_candlestick_chart(st.session_state.df1, ticker1)
-        # ... (other tabs remain the same or assume functionality) ...
+            if enable_ratio and not st.session_state.df2.empty:
+                st.markdown("---")
+                generate_candlestick_chart(st.session_state.df2, ticker2)
+
+        with tab_leading_analysis:
+            col_l1, col_l2 = st.columns(2)
+            with col_l1:
+                perform_leading_analysis(st.session_state.df1, ticker1)
+            
+            if enable_ratio and not st.session_state.df2.empty:
+                with col_l2:
+                    perform_leading_analysis(st.session_state.df2, ticker2)
+                
+                st.markdown("---")
+                perform_ratio_analysis(st.session_state.df1, st.session_state.df2)
+
+
+        with tab_var:
+            perform_value_at_risk(st.session_state.df1, ticker1)
+            if enable_ratio and not st.session_state.df2.empty:
+                st.markdown("---")
+                perform_value_at_risk(st.session_state.df2, ticker2)
 
         with tab_recommendation:
             st.header("🎯 FINAL TRADING RECOMMENDATION")
@@ -465,11 +641,11 @@ def main_dashboard():
 
             if st_signal.endswith("BUY") and mt_signal.endswith("BUY"):
                 final_signal = "**HIGH CONFIDENCE BUY**"
-                final_logic += f" MTC Confirmed: Mid-Term ({st.session_state.mt_interval}) signal is also BUY."
+                final_logic += f" MTC Confirmed: Mid-Term ({st.session_state.mt_interval}) signal is also BUY. This alignment provides a high-probability trade setup."
                 confidence = "HIGH"
             elif st_signal.endswith("SELL") and mt_signal.endswith("SELL"):
                 final_signal = "**HIGH CONFIDENCE SELL**"
-                final_logic += f" MTC Confirmed: Mid-Term ({st.session_state.mt_interval}) signal is also SELL."
+                final_logic += f" MTC Confirmed: Mid-Term ({st.session_state.mt_interval}) signal is also SELL. This alignment provides a high-probability trade setup."
                 confidence = "HIGH"
             elif st_signal == "NEUTRAL":
                 final_signal = "**NEUTRAL / WATCH**"
@@ -478,7 +654,7 @@ def main_dashboard():
             else:
                  # Conflicting signals
                  final_signal = f"**{st_signal} (DIVERGENT)**"
-                 final_logic = f"Signal is conflicting: Short-Term is {st_signal} but Mid-Term ({st.session_state.mt_interval}) is {mt_signal}. **Avoid Trading.**"
+                 final_logic = f"Signal is conflicting: Short-Term is {st_signal} but Mid-Term ({st.session_state.mt_interval}) is {mt_signal}. **Avoid Trading.** The trend filter does not support the entry signal."
                  confidence = "MEDIUM"
 
 
