@@ -187,6 +187,7 @@ def detect_divergence(df, lookback=DIVERGENCE_LOOKBACK):
         recent_low = swing_lows['Close'].iloc[-1]
         previous_low = swing_lows['Close'].iloc[-2]
         
+        # Use the correct RSI column name
         recent_low_rsi = swing_lows[f'RSI_{RSI_PERIOD}'].iloc[-1]
         previous_low_rsi = swing_lows[f'RSI_{RSI_PERIOD}'].iloc[-2]
         
@@ -198,6 +199,7 @@ def detect_divergence(df, lookback=DIVERGENCE_LOOKBACK):
         recent_high = swing_highs['Close'].iloc[-1]
         previous_high = swing_highs['Close'].iloc[-2]
         
+        # Use the correct RSI column name
         recent_high_rsi = swing_highs[f'RSI_{RSI_PERIOD}'].iloc[-1]
         previous_high_rsi = swing_highs[f'RSI_{RSI_PERIOD}'].iloc[-2]
         
@@ -431,7 +433,6 @@ def main():
         df = calculate_indicators(df)
         
         # Prepare display data
-        # IMPORTANT: display_df has the column names renamed for better presentation.
         display_df, styled_df = prepare_display_df(df, ticker, interval)
         
         # Get latest values for recommendation (Uses df with unformatted column names: EMA_50, RSI_14)
@@ -440,7 +441,7 @@ def main():
         # --- DISPLAY: FINAL RECOMMENDATION ---
         st.header(f"📈 Current Market Recommendation for {ticker} ({interval})")
         
-        # FIX: Pass the 'df' (with unformatted indicator columns) to get_recommendation
+        # Pass the 'df' (with unformatted indicator columns) to get_recommendation
         signal, reason, entry, sl, t1 = get_recommendation(df, divergence_info)
         
         col_sig, col_rec = st.columns([1, 3])
@@ -465,18 +466,21 @@ def main():
         # --- DISPLAY: INTERACTIVE CHART (Candlestick + EMA + RSI) ---
         st.header("Interactive Price Chart and Indicators")
         
-        # Candlestick Chart (Uses df with unformatted columns: Date, Close, EMA_50)
-        fig = go.Figure(data=[
+        # Candlestick Chart (Fixed Plotly structure)
+        fig = go.Figure()
+        fig.add_trace(
             go.Candlestick(
                 x=df['Date'],
                 open=df['Open'], high=df['High'], low=df['Low'], close=df['Close'],
                 name='Price (OHLC)'
-            ),
+            )
+        )
+        fig.add_trace(
             go.Scatter(
                 x=df['Date'], y=df[f'EMA_{EMA_PERIOD}'], line=dict(color='orange', width=2),
                 name=f'EMA ({EMA_PERIOD})'
             )
-        ])
+        )
         
         fig.update_layout(
             xaxis_rangeslider_visible=False,
@@ -484,14 +488,17 @@ def main():
             yaxis_title='Price',
         )
 
-        # RSI Subplot (Uses df with unformatted columns: Date, RSI_14)
-        fig_rsi = go.Figure(data=[
-            go.Scatter(x=df['Date'], y=df[f'RSI_{RSI_PERIOD}'], line=dict(color='purple', width=1), name=f'RSI ({RSI_PERIOD})'),
-            go.Layout(yaxis_range=[0, 100])
-        ])
+        # RSI Subplot (Fixed Plotly structure)
+        fig_rsi = go.Figure()
+        fig_rsi.add_trace(
+            go.Scatter(x=df['Date'], y=df[f'RSI_{RSI_PERIOD}'], line=dict(color='purple', width=1), name=f'RSI ({RSI_PERIOD})')
+        )
+        
+        # Use update_layout to set the y-axis range correctly
+        fig_rsi.update_layout(yaxis_range=[0, 100], title=f'RSI ({RSI_PERIOD}) Momentum Indicator', yaxis_title='RSI Value')
+
         fig_rsi.add_hline(y=70, line_dash="dash", line_color="red", annotation_text="Overbought (70)")
         fig_rsi.add_hline(y=30, line_dash="dash", line_color="green", annotation_text="Oversold (30)")
-        fig_rsi.update_layout(title=f'RSI ({RSI_PERIOD}) Momentum Indicator', yaxis_title='RSI Value')
 
         st.plotly_chart(fig, use_container_width=True)
         st.plotly_chart(fig_rsi, use_container_width=True)
