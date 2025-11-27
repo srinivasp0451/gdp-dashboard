@@ -31,8 +31,11 @@ DIVERGENCE_LOOKBACK = 20  # Lookback period in candles for divergence checks
 
 @st.cache_data(ttl=600)  # Cache data for 10 minutes to handle API rate limits
 def fetch_data(ticker, period, interval):
-    """Fetches data from yfinance and applies necessary cleaning and timezone conversion."""
-    st.info(f"Fetching data for {ticker} over {period} using {interval} interval. This data is cached for 10 minutes to respect API limits.")
+    """
+    Fetches data from yfinance and applies necessary cleaning and timezone conversion.
+    Includes comprehensive debugging logs.
+    """
+    st.info(f"Fetching data for {ticker} over {period} using {interval} interval. This data is cached for 10 minutes.")
     
     try:
         # Use yf.download for more robust data access
@@ -40,7 +43,7 @@ def fetch_data(ticker, period, interval):
             ticker,
             period=period,
             interval=interval,
-            auto_adjust=True, # Auto adjust true means no separate Adj Close column
+            auto_adjust=True, # Auto adjust true typically merges Adj Close into Close
             prepost=False,
             threads=True,
             proxy=None
@@ -49,6 +52,14 @@ def fetch_data(ticker, period, interval):
         if df.empty:
             st.error(f"No data found for the provided ticker: {ticker}. Please check the ticker symbol.")
             return None
+        
+        # --- DEBUG LOGGING 1: Raw Data Structure ---
+        st.subheader("--- DEBUG 1: Raw Data from yfinance ---")
+        st.info("Initial DataFrame columns (may be a MultiIndex):")
+        st.code(df.columns.tolist())
+        st.info("Initial DataFrame Head:")
+        st.code(df.head().to_string())
+
 
         # 1. Flatten Multi-Index DataFrame (Required)
         df = df.reset_index()
@@ -58,12 +69,21 @@ def fetch_data(ticker, period, interval):
         df.columns = [str(col).upper().replace(' ', '_') for col in df.columns]
         
         # Map standardized names back to required application names
+        # IMPORTANT: 'ADJ_CLOSE' is mapped to 'Close' as a fallback/redundancy
         column_map = {
             'DATETIME': 'Date', 'DATE': 'Date', 
             'OPEN': 'Open', 'HIGH': 'High', 'LOW': 'Low', 
-            'CLOSE': 'Close', 'VOLUME': 'Volume'
+            'CLOSE': 'Close', 'ADJ_CLOSE': 'Close', 'VOLUME': 'Volume'
         }
-        df = df.rename(columns=column_map)
+        
+        # Only rename columns that actually exist in the DataFrame
+        df = df.rename(columns={k: v for k, v in column_map.items() if k in df.columns})
+        
+        # --- DEBUG LOGGING 2: After Column Standardization ---
+        st.subheader("--- DEBUG 2: After Standardization/Renaming ---")
+        st.info("Current DataFrame columns:")
+        st.code(df.columns.tolist())
+
         
         # Check if 'Close' column exists after mapping
         if 'Close' not in df.columns:
@@ -73,27 +93,30 @@ def fetch_data(ticker, period, interval):
         # 3. Timezone Handling: Convert to IST (Asia/Kolkata) (Required)
         # Check if 'Date' column exists and is datetime
         if 'Date' in df.columns:
-            # Convert 'Date' to datetime object if it's not already
-            if df['Date'].dtype != 'datetime64[ns]' and df['Date'].dtype != 'object':
+            # Attempt to ensure 'Date' is datetime
+            try:
                 df['Date'] = pd.to_datetime(df['Date'])
-
-            # Handle localization and conversion to IST
-            if df['Date'].dt.tz is None:
-                # Assume raw timestamps from yfinance are UTC and localize/convert to IST
-                df['Date'] = df['Date'].dt.tz_localize('UTC').dt.tz_convert('Asia/Kolkata')
-            else: 
-                # Already timezone aware (convert to IST if it's not)
-                df['Date'] = df['Date'].dt.tz_convert('Asia/Kolkata')
+            except Exception as e:
+                st.warning(f"Failed to convert 'Date' column to datetime: {e}")
+                
+            if pd.api.types.is_datetime64_any_dtype(df['Date']):
+                # Handle localization and conversion to IST
+                if df['Date'].dt.tz is None:
+                    # Assume raw timestamps from yfinance are UTC and localize/convert to IST
+                    df['Date'] = df['Date'].dt.tz_localize('UTC').dt.tz_convert('Asia/Kolkata')
+                else: 
+                    # Already timezone aware (convert to IST if it's not)
+                    df['Date'] = df['Date'].dt.tz_convert('Asia/Kolkata')
         
-        # 4. Handle Zero Volume for Indices (Replace 0 with 1 for stability in calculations, but keep actual volume for display)
-        # Volume is only used for display, so we don't need to change the data itself, but ensure it's present.
+        # 4. Ensure Volume is present
         if 'Volume' not in df.columns:
-            df['Volume'] = 0 # If the data fetch fails to find Volume (e.g., specific index)
+            df['Volume'] = 0 # Safety measure for indices that lack volume data
 
+        st.success("Data fetch and standardization successful. Proceeding to analysis.")
         return df
     
     except Exception as e:
-        st.error(f"Error fetching data: {e}")
+        st.error(f"FATAL ERROR during data fetch or processing: {e}")
         return None
 
 # --- 3. MANUAL TECHNICAL INDICATOR CALCULATIONS ---
@@ -184,8 +207,6 @@ def prepare_display_df(df, ticker, interval):
     
     # 2. % of Points Gained/Lost from Previous Day Close (Requires 1d data or finding the previous day's close)
     # We use the previous candle's close for simplicity in intraday/non-daily views.
-    # For a true "Previous Day Close," we would need to fetch daily data separately, but using
-    # the previous candle's close is more consistent with the selected interval.
     display_df['%_Change_from_Prev'] = (display_df['Points_Gained_Lost'] / display_df['Prev_Close']) * 100
     
     # Drop first row which has NaN for the shift
@@ -386,125 +407,127 @@ def main():
 
         df = fetch_data(ticker, period, interval)
         
-        if df is not None and not df.empty:
-            
-            # --- CALCULATIONS ---
-            df = calculate_indicators(df)
-            
-            # Prepare display data
-            display_df, styled_df = prepare_display_df(df, ticker, interval)
-            
-            # Get latest values for recommendation
-            divergence_info = detect_divergence(df)
-            
-            # --- DISPLAY: FINAL RECOMMENDATION ---
-            st.header(f"📈 Current Market Recommendation for {ticker} ({interval})")
-            
-            signal, reason, entry, sl, t1 = get_recommendation(display_df, divergence_info)
-            
-            col_sig, col_rec = st.columns([1, 3])
-            
-            with col_sig:
-                if "BUY" in signal:
-                    st.success(f"**Recommendation:** {signal}")
-                elif "SELL" in signal:
-                    st.error(f"**Recommendation:** {signal}")
-                else:
-                    st.warning(f"**Recommendation:** {signal}")
-            
-            with col_rec:
-                st.markdown(f"**The Logic (Plain English):** {reason}")
-            
-            st.subheader("Actionable Trading Plan (Entry, SL, Target)")
-            st.markdown(f"- **Entry Point:** {entry}")
-            st.markdown(f"- **Stop Loss (SL):** {sl}")
-            st.markdown(f"- **Target 1 (T1):** {t1}")
+        # Guard clause to stop execution if data is missing
+        if df is None or df.empty:
+            return
+        
+        # --- CALCULATIONS ---
+        df = calculate_indicators(df)
+        
+        # Prepare display data
+        display_df, styled_df = prepare_display_df(df, ticker, interval)
+        
+        # Get latest values for recommendation
+        divergence_info = detect_divergence(df)
+        
+        # --- DISPLAY: FINAL RECOMMENDATION ---
+        st.header(f"📈 Current Market Recommendation for {ticker} ({interval})")
+        
+        signal, reason, entry, sl, t1 = get_recommendation(display_df, divergence_info)
+        
+        col_sig, col_rec = st.columns([1, 3])
+        
+        with col_sig:
+            if "BUY" in signal:
+                st.success(f"**Recommendation:** {signal}")
+            elif "SELL" in signal:
+                st.error(f"**Recommendation:** {signal}")
+            else:
+                st.warning(f"**Recommendation:** {signal}")
+        
+        with col_rec:
+            st.markdown(f"**The Logic (Plain English):** {reason}")
+        
+        st.subheader("Actionable Trading Plan (Entry, SL, Target)")
+        st.markdown(f"- **Entry Point:** {entry}")
+        st.markdown(f"- **Stop Loss (SL):** {sl}")
+        st.markdown(f"- **Target 1 (T1):** {t1}")
 
-            
-            # --- DISPLAY: INTERACTIVE CHART (Candlestick + EMA + RSI) ---
-            st.header("Interactive Price Chart and Indicators")
-            
-            # Candlestick Chart
-            fig = go.Figure(data=[
-                go.Candlestick(
-                    x=df['Date'],
-                    open=df['Open'], high=df['High'], low=df['Low'], close=df['Close'],
-                    name='Price (OHLC)'
-                ),
-                go.Scatter(
-                    x=df['Date'], y=df[f'EMA_{EMA_PERIOD}'], line=dict(color='orange', width=2),
-                    name=f'EMA ({EMA_PERIOD})'
-                )
-            ])
-            
-            fig.update_layout(
-                xaxis_rangeslider_visible=False,
-                title=f'{ticker} Price Action with {EMA_PERIOD}-EMA',
-                yaxis_title='Price',
+        
+        # --- DISPLAY: INTERACTIVE CHART (Candlestick + EMA + RSI) ---
+        st.header("Interactive Price Chart and Indicators")
+        
+        # Candlestick Chart
+        fig = go.Figure(data=[
+            go.Candlestick(
+                x=df['Date'],
+                open=df['Open'], high=df['High'], low=df['Low'], close=df['Close'],
+                name='Price (OHLC)'
+            ),
+            go.Scatter(
+                x=df['Date'], y=df[f'EMA_{EMA_PERIOD}'], line=dict(color='orange', width=2),
+                name=f'EMA ({EMA_PERIOD})'
             )
+        ])
+        
+        fig.update_layout(
+            xaxis_rangeslider_visible=False,
+            title=f'{ticker} Price Action with {EMA_PERIOD}-EMA',
+            yaxis_title='Price',
+        )
 
-            # RSI Subplot
-            fig_rsi = go.Figure(data=[
-                go.Scatter(x=df['Date'], y=df[f'RSI_{RSI_PERIOD}'], line=dict(color='purple', width=1), name=f'RSI ({RSI_PERIOD})'),
-                go.Layout(yaxis_range=[0, 100])
-            ])
-            fig_rsi.add_hline(y=70, line_dash="dash", line_color="red", annotation_text="Overbought (70)")
-            fig_rsi.add_hline(y=30, line_dash="dash", line_color="green", annotation_text="Oversold (30)")
-            fig_rsi.update_layout(title=f'RSI ({RSI_PERIOD}) Momentum Indicator', yaxis_title='RSI Value')
+        # RSI Subplot
+        fig_rsi = go.Figure(data=[
+            go.Scatter(x=df['Date'], y=df[f'RSI_{RSI_PERIOD}'], line=dict(color='purple', width=1), name=f'RSI ({RSI_PERIOD})'),
+            go.Layout(yaxis_range=[0, 100])
+        ])
+        fig_rsi.add_hline(y=70, line_dash="dash", line_color="red", annotation_text="Overbought (70)")
+        fig_rsi.add_hline(y=30, line_dash="dash", line_color="green", annotation_text="Oversold (30)")
+        fig_rsi.update_layout(title=f'RSI ({RSI_PERIOD}) Momentum Indicator', yaxis_title='RSI Value')
 
-            st.plotly_chart(fig, use_container_width=True)
-            st.plotly_chart(fig_rsi, use_container_width=True)
+        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig_rsi, use_container_width=True)
 
-            
-            # --- DISPLAY: HEATMAPS ---
-            st.header("Historical Returns Heatmap (Structure Analysis)")
-            st.markdown(
-                """
-                These heatmaps show the average percentage return for different time periods. 
-                They help a common man understand which days or months have historically been strongest (Green) or weakest (Red).
-                """
-            )
-            plot_returns_heatmap(display_df, ticker)
+        
+        # --- DISPLAY: HEATMAPS ---
+        st.header("Historical Returns Heatmap (Structure Analysis)")
+        st.markdown(
+            """
+            These heatmaps show the average percentage return for different time periods. 
+            They help a common man understand which days or months have historically been strongest (Green) or weakest (Red).
+            """
+        )
+        plot_returns_heatmap(display_df, ticker)
 
-            # --- DISPLAY: DATA TABLE ---
-            st.header("Raw OHLCV and Indicator Data")
-            st.markdown(
-                """
-                This table shows the raw price data and calculated indicators. The 'Points Gained/Lost' 
-                and '% Change' columns use colors to quickly show the momentum of the last candle/period 
-                compared to the one before it.
-                """
-            )
-            st.dataframe(styled_df, use_container_width=True, height=350)
+        # --- DISPLAY: DATA TABLE ---
+        st.header("Raw OHLCV and Indicator Data")
+        st.markdown(
+            """
+            This table shows the raw price data and calculated indicators. The 'Points Gained/Lost' 
+            and '% Change' columns use colors to quickly show the momentum of the last candle/period 
+            compared to the one before it.
+            """
+        )
+        st.dataframe(styled_df, use_container_width=True, height=350)
 
-            # --- EXPORT FUNCTIONALITY ---
-            st.header("Data Export")
-            
-            # Remove the styler columns for clean export
-            export_df = display_df.drop(columns=['Points Gained/Lost (Prev. Candle)', '% Change (Prev. Candle)'])
-            
-            # Ensure Timestamp (IST) is converted to a simple string format for CSV/Excel compatibility
-            export_df['Timestamp (IST)'] = export_df['Timestamp (IST)'].dt.strftime('%Y-%m-%d %H:%M:%S %Z')
-            
-            # Export to CSV
-            csv = export_df.to_csv(index=False).encode('utf-8')
-            st.download_button(
-                label="Export Data to CSV",
-                data=csv,
-                file_name=f'{ticker}_{period}_{interval}_data.csv',
-                mime='text/csv',
-            )
-            
-            # Export to Excel (using io.BytesIO for in-memory file)
-            excel_buffer = io.BytesIO()
-            export_df.to_excel(excel_buffer, index=False, sheet_name='Trading Data')
-            excel_buffer.seek(0)
-            st.download_button(
-                label="Export Data to Excel",
-                data=excel_buffer,
-                file_name=f'{ticker}_{period}_{interval}_data.xlsx',
-                mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-            )
+        # --- EXPORT FUNCTIONALITY ---
+        st.header("Data Export")
+        
+        # Remove the styler columns for clean export
+        export_df = display_df.drop(columns=['Points Gained/Lost (Prev. Candle)', '% Change (Prev. Candle)'])
+        
+        # Ensure Timestamp (IST) is converted to a simple string format for CSV/Excel compatibility
+        export_df['Timestamp (IST)'] = export_df['Timestamp (IST)'].dt.strftime('%Y-%m-%d %H:%M:%S %Z')
+        
+        # Export to CSV
+        csv = export_df.to_csv(index=False).encode('utf-8')
+        st.download_button(
+            label="Export Data to CSV",
+            data=csv,
+            file_name=f'{ticker}_{period}_{interval}_data.csv',
+            mime='text/csv',
+        )
+        
+        # Export to Excel (using io.BytesIO for in-memory file)
+        excel_buffer = io.BytesIO()
+        export_df.to_excel(excel_buffer, index=False, sheet_name='Trading Data')
+        excel_buffer.seek(0)
+        st.download_button(
+            label="Export Data to Excel",
+            data=excel_buffer,
+            file_name=f'{ticker}_{period}_{interval}_data.xlsx',
+            mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        )
 
 if __name__ == "__main__":
     main()
