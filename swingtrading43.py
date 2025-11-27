@@ -136,6 +136,8 @@ def calculate_basic_metrics(df, label, interval):
     
     delta_str = f"{points_change:+.2f} pts ({percent_change:+.2f}%)"
     
+    # Use st.columns to avoid cache-related Streamlit warning if used inside a cached function
+    # NOTE: In main_dashboard, this is called outside the main cache, so it's fine.
     st.metric(label=f"Current Price ({label} / {interval})", 
               value=f"{current_price:,.2f}", 
               delta=delta_str,
@@ -265,8 +267,6 @@ def generate_candlestick_chart(df, ticker_label):
 def run_backtest(df, ticker_label, current_price):
     """
     Runs a backtest and formats results based on user request (Accuracy, Points, P/L Trades, % Return).
-    
-    ***FIXED: TP is now the opposite KC band (Upper/Lower) for better Risk/Reward.***
     """
     st.subheader(f"📊 Strategy Backtest Results ({ticker_label})")
     
@@ -281,7 +281,7 @@ def run_backtest(df, ticker_label, current_price):
         st.warning("Cannot calculate returns for VaR.")
         return None
         
-    VaR_99_hist = extract_scalar(returns.quantile(0.01)) # Typically negative
+    VaR_99_hist = extract_scalar(returns.quantile(0.01))
     
     trades = []
     in_trade = False
@@ -295,21 +295,12 @@ def run_backtest(df, ticker_label, current_price):
         current_close = df_test['Close'].iloc[i]
         current_date = df_test.index[i]
         
-        # Get the KC bands for both exit and potential entry
-        upper = df_test['KC_Upper'].iloc[i]
-        lower = df_test['KC_Lower'].iloc[i]
-        
         # 1. Trade Exit Check (SL or TP)
         if in_trade:
-            # VaR Stop Loss Price Calculation (Emergency Exit)
-            # VaR_99_hist is usually a negative percentage (e.g., -0.01). 
-            # For Long: Entry * (1 - 0.01) = lower price (SL)
-            # For Short: Entry * (1 + 0.01) = higher price (SL)
+            # VaR Stop Loss Price Calculation
             sl_price = entry_price * (1 + VaR_99_hist) if trade_type == 'Long' else entry_price * (1 - VaR_99_hist)
 
-            # --- FIXED TP/SL LOGIC ---
-
-            # SL Check (Price hits VaR Stop Loss)
+            # SL Check 
             if (trade_type == 'Long' and current_close < sl_price) or \
                (trade_type == 'Short' and current_close > sl_price):
                 exit_price = sl_price 
@@ -319,39 +310,31 @@ def run_backtest(df, ticker_label, current_price):
                 in_trade = False
                 continue
 
-            # TP Check (Price hits the opposite KC band)
-            # Long TP: Current close hits KC_Upper
-            if trade_type == 'Long' and current_close >= upper:
+            # TP Check (Price hits the opposite KC_Middle line)
+            tp_price = df_test['KC_Middle'].iloc[i]
+            if (trade_type == 'Long' and current_close > tp_price) or \
+               (trade_type == 'Short' and current_close < tp_price):
                 exit_price = current_close 
-                points = exit_price - entry_price
+                points = (exit_price - entry_price) if trade_type == 'Long' else (entry_price - exit_price)
                 trades.append({'Entry_Date': entry_date, 'Exit_Date': current_date, 'Entry': entry_price, 'Exit': exit_price, 'Type': trade_type, 
-                               'Points': points, 'Result': 'Profit (KC_Upper)' if points > 0 else 'Loss (KC_Upper)'})
+                               'Points': points, 'Result': 'Profit (TP)' if points > 0 else 'Loss (TP)'})
                 in_trade = False
                 continue
-            
-            # Short TP: Current close hits KC_Lower
-            elif trade_type == 'Short' and current_close <= lower:
-                exit_price = current_close 
-                points = entry_price - exit_price
-                trades.append({'Entry_Date': entry_date, 'Exit_Date': current_date, 'Entry': entry_price, 'Exit': exit_price, 'Type': trade_type, 
-                               'Points': points, 'Result': 'Profit (KC_Lower)' if points > 0 else 'Loss (KC_Lower)'})
-                in_trade = False
-                continue
-            
-            # --- END FIXED TP/SL LOGIC ---
         
         # 2. Trade Entry Check
         if not in_trade:
+            upper = df_test['KC_Upper'].iloc[i]
+            lower = df_test['KC_Lower'].iloc[i]
             rsi_signal = df_test['RSI_Signal'].iloc[i]
 
-            # Long Entry (Extreme low + Bullish RSI bias)
+            # Long Entry
             if current_close < lower and rsi_signal == 1:
                 in_trade = True
                 entry_price = current_close
                 trade_type = 'Long'
                 entry_date = current_date
 
-            # Short Entry (Extreme high + Bearish RSI bias)
+            # Short Entry
             elif current_close > upper and rsi_signal == -1:
                 in_trade = True
                 entry_price = current_close
@@ -361,6 +344,7 @@ def run_backtest(df, ticker_label, current_price):
     # --- Summarize Results ---
     if not trades:
         st.info("No trades were generated by the Keltner/VaR algorithm in this period.")
+        # Explicitly return to avoid rendering tables if no trades exist
         return None
 
     trade_df = pd.DataFrame(trades)
@@ -496,7 +480,7 @@ def perform_value_at_risk(df, ticker_label):
     **Current Price:** `{current_price:,.2f}`
     
     * **95% VaR (Historical):** `{VaR_95_hist*100:.3f}%` | Price Equivalent: `{current_price * (1 + VaR_95_hist):.2f}`
-    * **99% VaR (Historical):** `{VaR_99_hist*100:.3f}%` | Price Equivalent (Long SL): `{current_price * (1 + VaR_99_hist):.2f}`
+    * **99% VaR (Historical):** `{VaR_99_hist*100:.3f}%` | Price Equivalent: `{current_price * (1 + VaR_99_hist):.2f}`
     * **Conditional VaR (CVaR) 95%:** `{CVaR_95*100:.3f}%` (Expected loss if VaR is breached)
     """)
     
@@ -513,120 +497,219 @@ def main_dashboard():
         
         col_t1, col_c1 = st.columns(2)
         ticker1_symbol = col_t1.selectbox("Ticker 1 Symbol", STANDARD_TICKERS, index=0)
-        custom_ticker1 = col_c1.text_input("Custom Ticker 1 (Override)", value=st.session_state.get('ticker1', ''))
+        custom_ticker1 = col_c1.text_input("Custom Ticker 1 (Override)", value="")
+        ticker1 = custom_ticker1.upper() if custom_ticker1 else ticker1_symbol
+        st.session_state.ticker1 = ticker1
         
-        ticker2_symbol = st.selectbox("Ticker 2 Symbol (Ratio Analysis)", STANDARD_TICKERS, index=1)
-        
-        interval = st.selectbox("Interval", TIME_INTERVALS, index=4) # Default 1h
-        period = st.selectbox("Historical Period", PERIODS, index=4) # Default 1y
-        
-        # Update session state for future use
-        st.session_state.ticker1 = custom_ticker1 if custom_ticker1 else ticker1_symbol
-        st.session_state.ticker2 = ticker2_symbol
+        # --- Timeframe Selection ---
+        col_i, col_p = st.columns(2)
+        interval = col_i.selectbox("Timeframe (Short-Term / Entry)", TIME_INTERVALS, index=4, help="Select the timeframe for the chart and entry signal (e.g., 1h).")
+        period = col_p.selectbox("Data Period", PERIODS, index=2)
         st.session_state.interval = interval
         st.session_state.period = period
         
-        if st.button("Fetch & Run Analysis"):
+        # New: Mid-Term Timeframe for Confluence
+        st_interval_index = TIME_INTERVALS.index(interval)
+        # Default MT is the next longer timeframe, ensuring it's not the same.
+        default_mt_index = min(st_interval_index + 1, len(TIME_INTERVALS) - 1)
+        st.session_state.mt_interval = st.selectbox("Mid-Term Timeframe (Trend Filter)", TIME_INTERVALS, index=default_mt_index, help="Select a longer timeframe (e.g., 1d if Entry is 1h) for trend filtering.")
+        
+        enable_ratio = st.checkbox("Enable Ratio Analysis", value=False)
+        
+        ticker2 = None
+        if enable_ratio:
+            st.subheader("Ticker 2 (Ratio Basis)")
+            col_t2, col_c2 = st.columns(2)
+            ticker2_symbol = col_t2.selectbox("Ticker 2 Symbol", STANDARD_TICKERS, index=1)
+            custom_ticker2 = col_c2.text_input("Custom Ticker 2 (Override)", value="")
+            ticker2 = custom_ticker2.upper() if custom_ticker2 else ticker2_symbol
+            st.session_state.ticker2 = ticker2
+        
+        sleep_sec = st.slider("API Delay (seconds)", 0.5, 5.0, 2.5, 0.5)
+        
+        if st.button("🚀 Fetch/Refresh Data"):
             st.session_state.data_fetched = False
-            with st.spinner(f"Fetching data for {st.session_state.ticker1} and {st.session_state.ticker2}..."):
-                # Fetch Ticker 1
-                df1, status1 = fetch_and_process_data(st.session_state.ticker1, st.session_state.interval, st.session_state.period, 1)
-                st.session_state.df1 = df1
-                
-                # Fetch Ticker 2
-                df2, status2 = fetch_and_process_data(st.session_state.ticker2, st.session_state.interval, st.session_state.period, 0)
-                st.session_state.df2 = df2
-                
-                if status1 is True and status2 is True:
-                    st.session_state.data_fetched = True
-                    st.success("Data fetched and processed successfully!")
-                else:
-                    st.error(f"Data fetch error T1: {status1 if status1 is not True else 'OK'}. T2: {status2 if status2 is not True else 'OK'}")
-                    st.session_state.data_fetched = False
+            
+            # Fetch Short-Term Data (for Chart/Entry/Backtest)
+            with st.spinner(f"Fetching Short-Term data for {ticker1}..."):
+                st.session_state.df1, status1 = fetch_and_process_data(ticker1, interval, period, 0.1)
+            
+            if status1 is True:
+                st.toast(f"✅ ST data for {ticker1} fetched.")
+            elif status1 is False:
+                st.error(f"No ST data available for {ticker1}. Check ticker/period.")
+            else: 
+                st.error(f"Error fetching {ticker1} ST: {status1}")
+
+            # Fetch Mid-Term Data (for MTC)
+            with st.spinner(f"Fetching Mid-Term data for {ticker1}...") :
+                st.session_state.df_mt, status_mt = fetch_and_process_data(ticker1, st.session_state.mt_interval, period, 0.1)
+            
+            if status_mt is True:
+                st.toast(f"✅ MT data for {ticker1} fetched.")
+            elif status_mt is False:
+                st.warning(f"No MT data available for {ticker1}. Cannot perform MTC.")
+                st.session_state.df_mt = pd.DataFrame()
+            else: 
+                st.error(f"Error fetching {ticker1} MT: {status_mt}")
+
+            # Fetch Ticker 2 (if enabled)
+            if enable_ratio and ticker2:
+                with st.spinner(f"Fetching Ticker 2 data (waiting {sleep_sec}s)..."):
+                    st.session_state.df2, status2 = fetch_and_process_data(ticker2, interval, period, sleep_sec)
                     
+                if status2 is True:
+                    st.toast(f"✅ Data for {ticker2} fetched.")
+                elif status2 is False:
+                    st.error(f"No data available for {ticker2}.")
+                else: 
+                    st.error(f"Error fetching {ticker2}: {status2}")
+            
+            st.session_state.data_fetched = True
+            st.rerun()
+            
+    # --- Main Content ---
+    if st.session_state.data_fetched and not st.session_state.df1.empty:
+        
+        # --- 2. Basic Statistics Display ---
+        st.header("📈 Current Market Metrics")
+        col1, col2, col3 = st.columns(3)
+        
+        with col1:
+            price1, points1 = calculate_basic_metrics(st.session_state.df1, ticker1, interval)
+        
+        if enable_ratio and not st.session_state.df2.empty:
+            with col2:
+                price2, points2 = calculate_basic_metrics(st.session_state.df2, ticker2, interval)
+            
+            with col3:
+                ratio = price1 / price2 if price1 and price2 and not pd.isna(price1) and not pd.isna(price2) else np.nan
+                st.metric(label="Current Ratio (T1/T2)", value=f"{ratio:,.4f}" if not np.isnan(ratio) else "N/A")
+        
         st.markdown("---")
-        st.header("Multi-Timeframe (MTF)")
-        st.session_state.mt_interval = st.selectbox("MTF Interval (e.g., Higher Timeframe)", ["1d", "1wk", "1mo"], index=0)
+        st.subheader("Raw Data Sample")
+        st.dataframe(
+            st.session_state.df1[['Open', 'High', 'Low', 'Close', 'RSI', 'ATR', 'KC_Upper']].tail(5), 
+            use_container_width=True,
+            column_config={"__index__": st.column_config.DatetimeColumn("DateTime (IST)")}
+        )
+        st.markdown("---")
         
-        if st.button("Fetch MTF Data"):
-             with st.spinner(f"Fetching MTF data for {st.session_state.ticker1} at {st.session_state.mt_interval}..."):
-                df_mt, status_mt = fetch_and_process_data(st.session_state.ticker1, st.session_state.mt_interval, st.session_state.period, 0)
-                st.session_state.df_mt = df_mt
-                if status_mt is not True:
-                     st.error(f"MTF Data fetch error: {status_mt}")
-                else:
-                    st.success("MTF data fetched.")
-                    
-    # --- 2. Main Dashboard Content ---
-    if not st.session_state.data_fetched and st.session_state.df1.empty:
-        st.info("Please select tickers and click 'Fetch & Run Analysis' in the sidebar to begin.")
-        return
-
-    # A. Current Metrics & Signal
-    col_metrics, col_signal = st.columns([1, 1])
-    
-    current_price, _ = calculate_basic_metrics(st.session_state.df1, st.session_state.ticker1, st.session_state.interval)
-    signal, reason = get_kc_divergence_signal(st.session_state.df1)
-    
-    with col_signal:
-        st.markdown("### 🎯 **Primary Trading Signal**")
-        if "STRONG" in signal:
-            st.markdown(f"## {signal}", unsafe_allow_html=True)
-        else:
-            st.markdown(f"### {signal}")
-        st.info(reason)
-
-    # B. Charting
-    st.markdown("---")
-    generate_candlestick_chart(st.session_state.df1, st.session_state.ticker1)
-    
-    # C. Advanced Analysis (Tabs)
-    st.markdown("---")
-    tab_backtest, tab_leading, tab_risk, tab_ratio, tab_mtf = st.tabs([
-        "📊 Backtesting", 
-        "⚡ Leading Indicators", 
-        "📉 Risk (VaR)", 
-        "⚖️ Ratio Analysis", 
-        "🕰️ MTF Analysis"
-    ])
-    
-    with tab_backtest:
-        if current_price:
-            run_backtest(st.session_state.df1, st.session_state.ticker1, current_price)
-        else:
-            st.warning("Cannot run backtest: Current price data is missing.")
-
-    with tab_leading:
-        perform_leading_analysis(st.session_state.df1, st.session_state.ticker1)
+        # --- 3. Tabbed Layout for Advanced Analysis ---
+        tab_charts, tab_leading_analysis, tab_var, tab_recommendation = st.tabs([
+            "📊 Interactive Charts", 
+            "⚡ Leading Analysis", 
+            "📉 Value at Risk (VaR)", 
+            "🎯 Final Recommendation"
+        ])
         
-    with tab_risk:
-        perform_value_at_risk(st.session_state.df1, st.session_state.ticker1)
+        with tab_charts:
+            generate_candlestick_chart(st.session_state.df1, ticker1)
+            if enable_ratio and not st.session_state.df2.empty:
+                st.markdown("---")
+                generate_candlestick_chart(st.session_state.df2, ticker2)
 
-    with tab_ratio:
-        if st.session_state.df2.empty:
-            st.info(f"Data for Ticker 2 ({st.session_state.ticker2}) is not available. Please ensure it was fetched successfully.")
-        else:
-            perform_ratio_analysis(st.session_state.df1, st.session_state.df2)
+        with tab_leading_analysis:
+            col_l1, col_l2 = st.columns(2)
+            with col_l1:
+                perform_leading_analysis(st.session_state.df1, ticker1)
+            
+            if enable_ratio and not st.session_state.df2.empty:
+                with col_l2:
+                    perform_leading_analysis(st.session_state.df2, ticker2)
+                
+                st.markdown("---")
+                perform_ratio_analysis(st.session_state.df1, st.session_state.df2)
 
-    with tab_mtf:
-        if st.session_state.df_mt.empty:
-            st.info("Please fetch MTF data in the sidebar first.")
-        else:
-            st.subheader(f"🕰️ MTF Check ({st.session_state.ticker1} on {st.session_state.mt_interval})")
+
+        with tab_var:
+            perform_value_at_risk(st.session_state.df1, ticker1)
+            if enable_ratio and not st.session_state.df2.empty:
+                st.markdown("---")
+                perform_value_at_risk(st.session_state.df2, ticker2)
+
+        with tab_recommendation:
+            st.header("🎯 FINAL TRADING RECOMMENDATION")
             
-            mtf_signal, mtf_reason = get_kc_divergence_signal(st.session_state.df_mt)
+            # --- BACKTESTING EXECUTION (The key section) ---
+            backtest_results = run_backtest(st.session_state.df1, ticker1, price1)
+            st.markdown("---")
             
-            # Display current MTF metric (if available)
+            st.subheader(f"Synthesis & Multi-Timeframe Confluence (MTC)")
+            
+            # 1. Get Short-Term (ST) Signal (Entry Signal)
+            st_signal, st_logic = get_kc_divergence_signal(st.session_state.df1)
+            
+            # 2. Get Mid-Term (MT) Signal (Trend Filter)
             if not st.session_state.df_mt.empty:
-                calculate_basic_metrics(st.session_state.df_mt, st.session_state.ticker1, st.session_state.mt_interval)
-            
-            st.markdown(f"**Higher Timeframe Signal:** {mtf_signal}")
-            st.info(f"Reason: {mtf_reason}")
-            
-            if mtf_signal == signal:
-                st.success("✅ **CONFLUENCE DETECTED!** The lower and higher timeframes agree on the primary signal.")
+                mt_signal, _ = get_kc_divergence_signal(st.session_state.df_mt)
             else:
-                st.warning("⚠️ **DIVERGENCE DETECTED!** The lower timeframe signal contradicts the higher timeframe signal. Trade with caution.")
+                mt_signal = "NEUTRAL"
 
+            # 3. Determine Final Confluence and Signal
+            
+            final_signal = st_signal
+            final_logic = st_logic
+            confidence = "LOW"
+
+            if st_signal.endswith("BUY") and mt_signal.endswith("BUY"):
+                final_signal = "**HIGH CONFIDENCE BUY**"
+                final_logic += f" MTC Confirmed: Mid-Term ({st.session_state.mt_interval}) signal is also BUY. This alignment provides a high-probability trade setup."
+                confidence = "HIGH"
+            elif st_signal.endswith("SELL") and mt_signal.endswith("SELL"):
+                final_signal = "**HIGH CONFIDENCE SELL**"
+                final_logic += f" MTC Confirmed: Mid-Term ({st.session_state.mt_interval}) signal is also SELL. This alignment provides a high-probability trade setup."
+                confidence = "HIGH"
+            elif st_signal == "NEUTRAL":
+                final_signal = "**NEUTRAL / WATCH**"
+                final_logic = st_logic
+                confidence = "LOW"
+            else:
+                 # Conflicting signals
+                 final_signal = f"**{st_signal} (DIVERGENT)**"
+                 final_logic = f"Signal is conflicting: Short-Term is {st_signal} but Mid-Term ({st.session_state.mt_interval}) is {mt_signal}. **Avoid Trading.** The trend filter does not support the entry signal."
+                 confidence = "MEDIUM"
+
+
+            st.markdown(f"### ⏱️ Confluence Check (ST: {st.session_state.interval} vs MT: {st.session_state.mt_interval})")
+            st.table(pd.DataFrame({
+                'Timeframe': [f"Short-Term ({st.session_state.interval})", f"Mid-Term ({st.session_state.mt_interval})", "FINAL"],
+                'Signal': [st_signal, mt_signal, final_signal],
+                'Confidence': ["Entry", "Trend Filter", confidence]
+            }))
+            
+            st.markdown(f"## Final Recommendation: {final_signal}")
+            st.info(f"**Logic:** {final_logic}")
+            
+            # Risk Management (VaR)
+            returns = st.session_state.df1['Close'].pct_change().dropna()
+            VaR_99_hist = extract_scalar(returns.quantile(0.01))
+            current_price = extract_scalar(st.session_state.df1['Close'].iloc[-1])
+            last_row = st.session_state.df1.iloc[-1]
+            
+            st.markdown("""
+            ### Risk Management (VaR Based)
+            """)
+            if not pd.isna(current_price) and not pd.isna(VaR_99_hist) and "HIGH CONFIDENCE" in final_signal:
+                VaR_99_price_long = current_price * (1 + VaR_99_hist)
+                VaR_99_price_short = current_price * (1 - VaR_99_hist)
+
+                if "BUY" in final_signal:
+                    st.markdown(f"* **Recommended Stop Loss (99% VaR Price):** **`{VaR_99_price_long:.2f}`**")
+                    st.markdown(f"* **Recommended Take Profit (KC Middle Target):** **`{extract_scalar(last_row['KC_Middle']):.2f}`** (Target the mean reversion)")
+                elif "SELL" in final_signal:
+                     st.markdown(f"* **Recommended Stop Loss (Symmetrical VaR Price):** **`{VaR_99_price_short:.2f}`**")
+                     st.markdown(f"* **Recommended Take Profit (KC Middle Target):** **`{extract_scalar(last_row['KC_Middle']):.2f}`** (Target the mean reversion)")
+            else:
+                 st.markdown("* **Risk Management:** Decision point requires market confirmation or signals conflict. **No Confident Trade Setup.**")
+
+
+    elif st.session_state.data_fetched and st.session_state.df1.empty:
+        st.error(f"No valid data to display for {st.session_state.ticker1}. Please check the ticker symbol, period, and interval.")
+
+    else:
+        st.info("Configure your tickers and click 'Fetch/Refresh Data' in the sidebar to begin professional analysis.")
+        
+# --- EXECUTE ---
 if __name__ == "__main__":
     main_dashboard()
