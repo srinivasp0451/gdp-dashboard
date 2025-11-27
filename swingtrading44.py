@@ -71,7 +71,9 @@ def fetch_data(ticker, period, interval):
         # For analysis and display, we keep it as is, but add a check.
         
         # Rename columns to standard simple names
-        df.columns = [col.replace(' ', '_') for col in df.columns]
+        # FIX: Ensure column names are converted to strings before calling replace, 
+        # which addresses the "'tuple' object has no attribute 'replace'" error.
+        df.columns = [str(col).replace(' ', '_') for col in df.columns]
 
         return df
     
@@ -103,7 +105,8 @@ def calculate_indicators(df, rsi_period=RSI_PERIOD, ema_period=EMA_PERIOD):
     avg_loss = loss.ewm(span=rsi_period, adjust=False).mean()
     
     # 4. Calculate Relative Strength (RS)
-    rs = avg_gain / avg_loss
+    # Check for division by zero (avg_loss = 0)
+    rs = np.where(avg_loss == 0, np.inf, avg_gain / avg_loss)
     
     # 5. Calculate RSI
     df[f'RSI_{rsi_period}'] = 100 - (100 / (1 + rs))
@@ -118,18 +121,15 @@ def detect_divergence(df, lookback=DIVERGENCE_LOOKBACK):
     NOTE: True divergence detection requires complex swing-point identification.
     This implementation uses a simplified check of the most recent price/RSI points.
     """
-    latest = df.iloc[-1]
     
     # Check for the last 5 swing points in the lookback window
     recent_data = df.tail(lookback).copy()
     
     # Simplified swing points: look for 2 recent highs/lows
-    last_close = recent_data['Close'].iloc[-1]
-    last_rsi = recent_data[f'RSI_{RSI_PERIOD}'].iloc[-1]
     
     # Find the previous swing point (2nd to last major extreme)
-    swing_lows = recent_data[(recent_data['Close'] < recent_data['Close'].shift(1)) & (recent_data['Close'] < recent_data['Close'].shift(-1))]
-    swing_highs = recent_data[(recent_data['Close'] > recent_data['Close'].shift(1)) & (recent_data['Close'] > recent_data['Close'].shift(-1))]
+    swing_lows = recent_data[(recent_data['Close'] < recent_data['Close'].shift(1)) & (recent_data['Close'] < recent_data['Close'].shift(-1))].iloc[:-1] # Exclude latest possible point
+    swing_highs = recent_data[(recent_data['Close'] > recent_data['Close'].shift(1)) & (recent_data['Close'] > recent_data['Close'].shift(-1))].iloc[:-1] # Exclude latest possible point
     
     # Bullish Divergence check (Lower Low in Price, Higher Low in RSI)
     if len(swing_lows) >= 2:
@@ -139,7 +139,7 @@ def detect_divergence(df, lookback=DIVERGENCE_LOOKBACK):
         recent_low_rsi = swing_lows[f'RSI_{RSI_PERIOD}'].iloc[-1]
         previous_low_rsi = swing_lows[f'RSI_{RSI_PERIOD}'].iloc[-2]
         
-        if (recent_low < previous_low) and (recent_low_rsi > previous_low_rsi) and (recent_low_rsi < 30):
+        if (recent_low < previous_low) and (recent_low_rsi > previous_low_rsi) and (recent_low_rsi < 40): # Added 40 threshold for better signal
             return "Bullish Divergence (Reversal Up)", previous_low, recent_low
             
     # Bearish Divergence check (Higher High in Price, Lower High in RSI)
@@ -150,7 +150,7 @@ def detect_divergence(df, lookback=DIVERGENCE_LOOKBACK):
         recent_high_rsi = swing_highs[f'RSI_{RSI_PERIOD}'].iloc[-1]
         previous_high_rsi = swing_highs[f'RSI_{RSI_PERIOD}'].iloc[-2]
         
-        if (recent_high > previous_high) and (recent_high_rsi < previous_high_rsi) and (recent_high_rsi > 70):
+        if (recent_high > previous_high) and (recent_high_rsi < previous_high_rsi) and (recent_high_rsi > 60): # Added 60 threshold for better signal
             return "Bearish Divergence (Reversal Down)", previous_high, recent_high
             
     return "No Divergence Detected", None, None
@@ -272,24 +272,24 @@ def get_recommendation(df, divergence_info):
         # Confirmation check: Price must be crossing above EMA
         if close > ema:
             signal = "BUY"
-            entry = f"Enter a long position (Buy) if the price closes above {close:.2f}."
-            sl = f"Place Stop Loss (SL) below the recent swing low at {c_point:.2f}."
-            t1 = f"Target 1 (T1) could be the last major high or a 1:2 Risk-Reward ratio."
+            entry = f"Enter a long position (Buy) at the current closing price of {close:.2f} or on a pullback."
+            sl = f"Place Stop Loss (SL) below the recent swing low at {c_point:.2f}. This is the point where the bullish structure would be broken."
+            t1 = f"Target 1 (T1) could be the last major high or a minimum 1:2 Risk-Reward ratio from the entry point. Start by aiming for the previous high at {p_point:.2f}."
             reason = (
                 f"**STRONG BUY SIGNAL (RSI Divergence):** The price made a lower low ({c_point:.2f}) but the market momentum (RSI) made a higher low. "
-                f"This means sellers are exhausted. The price is currently above the {EMA_PERIOD}-period EMA ({ema:.2f}), confirming the start of an uptrend. "
+                f"This means sellers are likely exhausted. The price is currently above the {EMA_PERIOD}-period EMA ({ema:.2f}), confirming the start of an uptrend. "
                 "The current market structure suggests a potential strong reversal to the upside."
             )
     elif divergence.startswith("Bearish Divergence"):
         # Confirmation check: Price must be crossing below EMA
         if close < ema:
             signal = "SELL"
-            entry = f"Enter a short position (Sell/Short) if the price closes below {close:.2f}."
-            sl = f"Place Stop Loss (SL) above the recent swing high at {c_point:.2f}."
-            t1 = f"Target 1 (T1) could be the last major low or a 1:2 Risk-Reward ratio."
+            entry = f"Enter a short position (Sell/Short) at the current closing price of {close:.2f} or on a rally."
+            sl = f"Place Stop Loss (SL) above the recent swing high at {c_point:.2f}. This is the point where the bearish structure would be broken."
+            t1 = f"Target 1 (T1) could be the last major low or a minimum 1:2 Risk-Reward ratio from the entry point. Start by aiming for the previous low at {p_point:.2f}."
             reason = (
                 f"**STRONG SELL SIGNAL (RSI Divergence):** The price made a higher high ({c_point:.2f}) but the market momentum (RSI) made a lower high. "
-                f"This means buyers are exhausted. The price is currently below the {EMA_PERIOD}-period EMA ({ema:.2f}), confirming the start of a downtrend. "
+                f"This means buyers are likely exhausted. The price is currently below the {EMA_PERIOD}-period EMA ({ema:.2f}), confirming the start of a downtrend. "
                 "The current market structure suggests a potential strong reversal to the downside."
             )
     
@@ -298,26 +298,28 @@ def get_recommendation(df, divergence_info):
         if close > ema and rsi < 70:
             signal = "BUY (Trend Following)"
             entry = f"Enter a long position (Buy) on a small dip towards the EMA ({ema:.2f})."
-            sl = f"Place Stop Loss (SL) below the {EMA_PERIOD}-period EMA at {ema:.2f}."
-            t1 = "Target 1 (T1) should be set based on the previous swing high."
+            sl = f"Place Stop Loss (SL) below the {EMA_PERIOD}-period EMA at {ema:.2f}. This helps protect profit if the trend reverses."
+            t1 = "Target 1 (T1) should be set based on the previous swing high, aiming for a favorable Risk-Reward ratio (e.g., 1:1.5 or 1:2)."
             reason = (
-                f"**MILD BUY SIGNAL:** The price ({close:.2f}) is trading above the **{EMA_PERIOD}-period EMA** ({ema:.2f}), indicating a healthy short-term uptrend. "
-                f"The **RSI is currently {rsi:.2f}** (not yet overbought), suggesting room for further upward movement. The market structure is bullish."
+                f"**MILD BUY SIGNAL:** The price ({close:.2f}) is trading clearly above the **{EMA_PERIOD}-period EMA** ({ema:.2f}), indicating a healthy short-term uptrend. "
+                f"The **RSI is currently {rsi:.2f}** (not yet overbought), suggesting room for further upward movement. The market structure is bullish (higher highs and higher lows)."
             )
         elif close < ema and rsi > 30:
             signal = "SELL (Trend Following)"
             entry = f"Enter a short position (Sell) on a small rally towards the EMA ({ema:.2f})."
-            sl = f"Place Stop Loss (SL) above the {EMA_PERIOD}-period EMA at {ema:.2f}."
-            t1 = "Target 1 (T1) should be set based on the previous swing low."
+            sl = f"Place Stop Loss (SL) above the {EMA_PERIOD}-period EMA at {ema:.2f}. This helps protect against a reversal."
+            t1 = "Target 1 (T1) should be set based on the previous swing low, aiming for a favorable Risk-Reward ratio."
             reason = (
-                f"**MILD SELL SIGNAL:** The price ({close:.2f}) is trading below the **{EMA_PERIOD}-period EMA** ({ema:.2f}), indicating a strong short-term downtrend. "
-                f"The **RSI is currently {rsi:.2f}** (not yet oversold), suggesting room for further downward movement. The market structure is bearish."
+                f"**MILD SELL SIGNAL:** The price ({close:.2f}) is trading clearly below the **{EMA_PERIOD}-period EMA** ({ema:.2f}), indicating a strong short-term downtrend. "
+                f"The **RSI is currently {rsi:.2f}** (not yet oversold), suggesting room for further downward movement. The market structure is bearish (lower highs and lower lows)."
             )
         else: # Neutral/Overbought/Oversold but not confirming
             if rsi >= 70 and close > ema:
-                reason = f"**CAUTION (Overbought):** Price is in a strong uptrend (above EMA), but RSI is high at {rsi:.2f}. Expect a minor pullback or consolidation soon."
+                reason = f"**CAUTION (Overbought):** Price is in a strong uptrend (above EMA), but RSI is high at {rsi:.2f}. Expect a minor pullback or consolidation soon. It's best to **HOLD** existing positions and wait for a clear entry."
             elif rsi <= 30 and close < ema:
-                reason = f"**CAUTION (Oversold):** Price is in a strong downtrend (below EMA), but RSI is low at {rsi:.2f}. Expect a minor bounce or consolidation soon."
+                reason = f"**CAUTION (Oversold):** Price is in a strong downtrend (below EMA), but RSI is low at {rsi:.2f}. Expect a minor bounce or consolidation soon. It's best to **HOLD** existing positions and wait for a clear entry."
+            
+            signal = "HOLD"
     
     return signal, reason, entry, sl, t1
 
@@ -350,9 +352,16 @@ def main():
     # Filter out very long periods for intraday intervals
     available_periods = list(PERIOD_MAP.keys())
     if interval in ['1m', '3m', '5m', '10m', '15m', '30m', '1h', '2h', '4h']:
-        available_periods = [p for p in available_periods if PERIOD_MAP[p] not in ['10y', '15y', '20y', '25y', '30y']]
+        # yfinance limits intraday data period to 60 days
+        available_periods = [p for p in available_periods if PERIOD_MAP[p] in ['1d', '5d', '7d', '1mo', '3mo']]
     
-    period_key = st.sidebar.selectbox("Select Lookback Period", available_periods, index=available_periods.index('6 Months'))
+    # Set default period index based on interval type
+    default_period_index = available_periods.index('6 Months') if '6 Months' in available_periods else 0
+    if interval in ['1m', '3m', '5m', '10m', '15m', '30m', '1h']:
+        default_period_index = available_periods.index('7 Days') if '7 Days' in available_periods else 0
+
+
+    period_key = st.sidebar.selectbox("Select Lookback Period", available_periods, index=default_period_index)
     period = PERIOD_MAP[period_key]
 
     if st.sidebar.button("Analyze Market"):
