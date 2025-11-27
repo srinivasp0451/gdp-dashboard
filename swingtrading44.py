@@ -53,13 +53,10 @@ def fetch_data(ticker, period, interval):
             st.error(f"No data found for the provided ticker: {ticker}. Please check the ticker symbol.")
             return None
         
-        # --- DEBUG LOGGING 1: Raw Data Structure ---
-        st.subheader("--- DEBUG 1: Raw Data from yfinance ---")
-        st.info("Initial DataFrame columns (may be a MultiIndex):")
-        st.code(df.columns.tolist())
-        st.info("Initial DataFrame Head:")
-        st.code(df.head().to_string())
-
+        # --- DEBUG LOGGING: Raw Data Structure ---
+        # (Kept brief to avoid cluttering UI unless needed)
+        # st.subheader("--- DEBUG: Raw Data ---")
+        # st.code(df.columns.tolist())
 
         # 1. Flatten Multi-Index DataFrame (Required)
         df = df.reset_index()
@@ -92,11 +89,6 @@ def fetch_data(ticker, period, interval):
         # Only rename columns that actually exist in the DataFrame
         df = df.rename(columns={k: v for k, v in column_map.items() if k in df.columns})
         
-        # --- DEBUG LOGGING 2: After Column Standardization ---
-        st.subheader("--- DEBUG 2: After Standardization/Renaming ---")
-        st.info("Current DataFrame columns:")
-        st.code(df.columns.tolist())
-
         
         # Check if 'Close' column exists after mapping
         if 'Close' not in df.columns:
@@ -125,7 +117,7 @@ def fetch_data(ticker, period, interval):
         if 'Volume' not in df.columns:
             df['Volume'] = 0 # Safety measure for indices that lack volume data
 
-        st.success("Data fetch and standardization successful. Proceeding to analysis.")
+        st.success("Data fetch successful.")
         return df
     
     except Exception as e:
@@ -270,8 +262,19 @@ def plot_returns_heatmap(df, title):
     df['DayOfWeek'] = df['Timestamp (IST)'].dt.day_name().str[:3] # Mon, Tue, etc.
 
     # Option 1: Month vs Year Heatmap (Average Monthly Return)
+    # This pivots the data to have Years as Columns and Months as Rows
     monthly_returns = df.groupby(['Year', 'Month'])['Return'].mean().unstack(level='Year')
-    monthly_returns.index = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
+    
+    # FIX: Use a map to rename index instead of hardcoded list to avoid length mismatch
+    month_map = {
+        1: 'Jan', 2: 'Feb', 3: 'Mar', 4: 'Apr', 5: 'May', 6: 'Jun',
+        7: 'Jul', 8: 'Aug', 9: 'Sep', 10: 'Oct', 11: 'Nov', 12: 'Dec'
+    }
+    monthly_returns.index = monthly_returns.index.map(month_map)
+    
+    # Ensure standard order even if some months are missing
+    standard_order = [m for m in ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'] if m in monthly_returns.index]
+    monthly_returns = monthly_returns.reindex(standard_order)
     
     fig_month = px.imshow(
         monthly_returns,
@@ -285,9 +288,14 @@ def plot_returns_heatmap(df, title):
 
     # Option 2: Day of Week vs Month Heatmap (Average Daily Return)
     daily_returns_monthly = df.groupby(['DayOfWeek', 'Month'])['Return'].mean().unstack(level='Month')
-    # Reorder columns to calendar months
-    daily_returns_monthly = daily_returns_monthly[[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]]
-    daily_returns_monthly.columns = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
+    
+    # Reorder columns to calendar months (1-12) if they exist
+    existing_months = sorted(daily_returns_monthly.columns)
+    daily_returns_monthly = daily_returns_monthly[existing_months]
+    
+    # Rename columns using the map
+    daily_returns_monthly.columns = [month_map.get(m, m) for m in daily_returns_monthly.columns]
+    
     # Reorder rows to standard week
     daily_returns_monthly = daily_returns_monthly.reindex(['Mon', 'Tue', 'Wed', 'Thu', 'Fri'])
     
@@ -433,6 +441,7 @@ def main():
         df = calculate_indicators(df)
         
         # Prepare display data
+        # IMPORTANT: display_df has the column names renamed for better presentation.
         display_df, styled_df = prepare_display_df(df, ticker, interval)
         
         # Get latest values for recommendation (Uses df with unformatted column names: EMA_50, RSI_14)
@@ -441,7 +450,7 @@ def main():
         # --- DISPLAY: FINAL RECOMMENDATION ---
         st.header(f"📈 Current Market Recommendation for {ticker} ({interval})")
         
-        # Pass the 'df' (with unformatted indicator columns) to get_recommendation
+        # FIX: Pass the 'df' (with unformatted indicator columns) to get_recommendation
         signal, reason, entry, sl, t1 = get_recommendation(df, divergence_info)
         
         col_sig, col_rec = st.columns([1, 3])
@@ -557,3 +566,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
