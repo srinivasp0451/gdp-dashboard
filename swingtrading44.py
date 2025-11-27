@@ -212,7 +212,8 @@ def prepare_display_df(df, ticker, interval):
     """Prepares the final DataFrame for display with calculated metrics and formatting."""
     
     display_df = df.copy()
-    display_df = display_df.rename(columns={'Close': f'{ticker}_Close'})
+    # Temporarily rename 'Close' for intra-function calculations
+    display_df = display_df.rename(columns={'Close': f'{ticker}_Close'}) 
     
     # 1. Points Gained/Lost from Previous Timeframe (Close vs Previous Close)
     display_df['Prev_Close'] = display_df[f'{ticker}_Close'].shift(1)
@@ -230,10 +231,11 @@ def prepare_display_df(df, ticker, interval):
         'Date', 'Open', 'High', 'Low', f'{ticker}_Close', 'Volume', 
         'Points_Gained_Lost', '%_Change_from_Prev', f'EMA_{EMA_PERIOD}', f'RSI_{RSI_PERIOD}'
     ]]
+    # Final column renaming for user display
     display_df.columns = [
         'Timestamp (IST)', 'Open', 'High', 'Low', 'Close', 'Volume', 
         'Points Gained/Lost (Prev. Candle)', '% Change (Prev. Candle)', 
-        f'EMA ({EMA_PERIOD})', f'RSI ({RSI_PERIOD})'
+        f'EMA ({EMA_PERIOD})', f'RSI ({RSI_PERIOD})' # Indicator columns renamed for display
     ]
     
     # Apply conditional formatting for the Streamlit table
@@ -303,6 +305,7 @@ def plot_returns_heatmap(df, title):
 def get_recommendation(df, divergence_info):
     """Generates a simple, human-readable recommendation based on indicators."""
     
+    # df is the DataFrame with indicator columns named 'EMA_50' and 'RSI_14'
     latest_data = df.iloc[-1]
     close = latest_data['Close']
     ema = latest_data[f'EMA_{EMA_PERIOD}']
@@ -428,15 +431,17 @@ def main():
         df = calculate_indicators(df)
         
         # Prepare display data
+        # IMPORTANT: display_df has the column names renamed for better presentation.
         display_df, styled_df = prepare_display_df(df, ticker, interval)
         
-        # Get latest values for recommendation
+        # Get latest values for recommendation (Uses df with unformatted column names: EMA_50, RSI_14)
         divergence_info = detect_divergence(df)
         
         # --- DISPLAY: FINAL RECOMMENDATION ---
         st.header(f"📈 Current Market Recommendation for {ticker} ({interval})")
         
-        signal, reason, entry, sl, t1 = get_recommendation(display_df, divergence_info)
+        # FIX: Pass the 'df' (with unformatted indicator columns) to get_recommendation
+        signal, reason, entry, sl, t1 = get_recommendation(df, divergence_info)
         
         col_sig, col_rec = st.columns([1, 3])
         
@@ -460,7 +465,7 @@ def main():
         # --- DISPLAY: INTERACTIVE CHART (Candlestick + EMA + RSI) ---
         st.header("Interactive Price Chart and Indicators")
         
-        # Candlestick Chart
+        # Candlestick Chart (Uses df with unformatted columns: Date, Close, EMA_50)
         fig = go.Figure(data=[
             go.Candlestick(
                 x=df['Date'],
@@ -479,7 +484,7 @@ def main():
             yaxis_title='Price',
         )
 
-        # RSI Subplot
+        # RSI Subplot (Uses df with unformatted columns: Date, RSI_14)
         fig_rsi = go.Figure(data=[
             go.Scatter(x=df['Date'], y=df[f'RSI_{RSI_PERIOD}'], line=dict(color='purple', width=1), name=f'RSI ({RSI_PERIOD})'),
             go.Layout(yaxis_range=[0, 100])
@@ -500,6 +505,7 @@ def main():
             They help a common man understand which days or months have historically been strongest (Green) or weakest (Red).
             """
         )
+        # plot_returns_heatmap uses display_df which has the required 'Timestamp (IST)' and 'Close' columns
         plot_returns_heatmap(display_df, ticker)
 
         # --- DISPLAY: DATA TABLE ---
@@ -544,4 +550,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
