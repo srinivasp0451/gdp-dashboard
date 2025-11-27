@@ -40,7 +40,7 @@ def fetch_data(ticker, period, interval):
             ticker,
             period=period,
             interval=interval,
-            auto_adjust=True,
+            auto_adjust=True, # Auto adjust true means no separate Adj Close column
             prepost=False,
             threads=True,
             proxy=None
@@ -53,27 +53,42 @@ def fetch_data(ticker, period, interval):
         # 1. Flatten Multi-Index DataFrame (Required)
         df = df.reset_index()
         
-        # 2. Timezone Handling: Convert to IST (Asia/Kolkata) (Required)
-        if 'Datetime' in df.columns:
-            df = df.rename(columns={'Datetime': 'Date'})
+        # 2. Standardize column names (FIX for KeyError: 'Close')
+        # Convert all column names to uppercase strings for consistent mapping
+        df.columns = [str(col).upper().replace(' ', '_') for col in df.columns]
         
-        # Make the 'Date' column timezone aware and convert to IST
-        # If the column is not already timezone aware (common for 1d, 1w data)
-        if df['Date'].dtype == 'datetime64[ns]':
-            df['Date'] = df['Date'].dt.tz_localize('UTC').dt.tz_convert('Asia/Kolkata')
-        elif df['Date'].dtype == 'object':
-             # Attempt to parse and localize if it's an object/string
-            df['Date'] = pd.to_datetime(df['Date']).dt.tz_localize('UTC').dt.tz_convert('Asia/Kolkata')
-        else: # Likely already timezone aware (Intraday data)
-            df['Date'] = df['Date'].dt.tz_convert('Asia/Kolkata')
+        # Map standardized names back to required application names
+        column_map = {
+            'DATETIME': 'Date', 'DATE': 'Date', 
+            'OPEN': 'Open', 'HIGH': 'High', 'LOW': 'Low', 
+            'CLOSE': 'Close', 'VOLUME': 'Volume'
+        }
+        df = df.rename(columns=column_map)
         
-        # 3. Handle Zero Volume for Indices (Replace 0 with 1 for stability, but mostly check before division)
-        # For analysis and display, we keep it as is, but add a check.
+        # Check if 'Close' column exists after mapping
+        if 'Close' not in df.columns:
+             st.error("Could not find the 'Close' price column in the fetched data. Data structure might be unusual.")
+             return None
+
+        # 3. Timezone Handling: Convert to IST (Asia/Kolkata) (Required)
+        # Check if 'Date' column exists and is datetime
+        if 'Date' in df.columns:
+            # Convert 'Date' to datetime object if it's not already
+            if df['Date'].dtype != 'datetime64[ns]' and df['Date'].dtype != 'object':
+                df['Date'] = pd.to_datetime(df['Date'])
+
+            # Handle localization and conversion to IST
+            if df['Date'].dt.tz is None:
+                # Assume raw timestamps from yfinance are UTC and localize/convert to IST
+                df['Date'] = df['Date'].dt.tz_localize('UTC').dt.tz_convert('Asia/Kolkata')
+            else: 
+                # Already timezone aware (convert to IST if it's not)
+                df['Date'] = df['Date'].dt.tz_convert('Asia/Kolkata')
         
-        # Rename columns to standard simple names
-        # FIX: Ensure column names are converted to strings before calling replace, 
-        # which addresses the "'tuple' object has no attribute 'replace'" error.
-        df.columns = [str(col).replace(' ', '_') for col in df.columns]
+        # 4. Handle Zero Volume for Indices (Replace 0 with 1 for stability in calculations, but keep actual volume for display)
+        # Volume is only used for display, so we don't need to change the data itself, but ensure it's present.
+        if 'Volume' not in df.columns:
+            df['Volume'] = 0 # If the data fetch fails to find Volume (e.g., specific index)
 
         return df
     
@@ -356,9 +371,9 @@ def main():
         available_periods = [p for p in available_periods if PERIOD_MAP[p] in ['1d', '5d', '7d', '1mo', '3mo']]
     
     # Set default period index based on interval type
-    default_period_index = available_periods.index('6 Months') if '6 Months' in available_periods else 0
-    if interval in ['1m', '3m', '5m', '10m', '15m', '30m', '1h']:
-        default_period_index = available_periods.index('7 Days') if '7 Days' in available_periods else 0
+    default_period_index = available_periods.index('6 Months') if '6 Months' in available_periods and '6 Months' in PERIOD_MAP else 0
+    if interval in ['1m', '3m', '5m', '10m', '15m', '30m', '1h', '2h', '4h']:
+        default_period_index = available_periods.index('7 Days') if '7 Days' in available_periods and '7 Days' in PERIOD_MAP else 0
 
 
     period_key = st.sidebar.selectbox("Select Lookback Period", available_periods, index=default_period_index)
