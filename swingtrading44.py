@@ -65,8 +65,21 @@ def fetch_data(ticker, period, interval):
         df = df.reset_index()
         
         # 2. Standardize column names (FIX for KeyError: 'Close')
-        # Convert all column names to uppercase strings for consistent mapping
-        df.columns = [str(col).upper().replace(' ', '_') for col in df.columns]
+        # Robustly handle MultiIndex columns returned by yf.download when only one ticker is passed.
+        new_columns = []
+        for col in df.columns:
+            # If the column is a tuple (MultiIndex structure)
+            if isinstance(col, tuple):
+                # We take the first element, which is the field name (e.g., 'Close', 'Open')
+                name = str(col[0])
+            else:
+                # If it's already a simple string (like 'Date' or 'Datetime')
+                name = str(col)
+
+            # Apply standardization: uppercase and replace spaces with underscores
+            new_columns.append(name.upper().replace(' ', '_'))
+            
+        df.columns = new_columns
         
         # Map standardized names back to required application names
         # IMPORTANT: 'ADJ_CLOSE' is mapped to 'Close' as a fallback/redundancy
