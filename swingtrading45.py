@@ -144,8 +144,7 @@ class NewsAgent:
             score = 0
             for n in news[:5]:
                 st.write('n is:::',n['content']['title'])
-                score +=
-self.vader.polarity_scores(n['content']['title'])['compound']
+                score += self.vader.polarity_scores(n['content']['title'])['compound']
 
             avg_score = score / 5
             sentiment = "NEUTRAL"
