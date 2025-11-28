@@ -188,10 +188,8 @@ class ProfessionalExecutionAgent:
         reasons = []
 
         # Trend Alignment (+1)
-        if trend == "BULLISH": score += 1; reasons.append(f"Major
-Trend ({t1}) is Up")
-        if trend == "BEARISH": score -= 1; reasons.append(f"Major
-Trend ({t1}) is Down")
+        if trend == "BULLISH": score += 1; reasons.append(f"Major Trend ({t1}) is Up")
+        if trend == "BEARISH": score -= 1; reasons.append(f"Major Trend ({t1}) is Down")
 
         # Psychology Score (+/- 2 or 3) -> High Weight
         score += psych_report['score']
@@ -207,10 +205,8 @@ Trend ({t1}) is Down")
             reasons.append("Caution: Market is Euphoric/Overextended.")
 
         # News Filter
-        if news_score < -0.2: score -= 2; reasons.append("News
-Sentiment is Very Negative.")
-        if news_score > 0.2: score += 1; reasons.append("News
-Sentiment is Positive.")
+        if news_score < -0.2: score -= 2; reasons.append("News Sentiment is Very Negative.")
+        if news_score > 0.2: score += 1; reasons.append("News Sentiment is Positive.")
 
         # --- FINAL ACTION ---
         action = "WAIT"
@@ -236,15 +232,12 @@ Sentiment is Positive.")
         atr = entry_last['ATR']
         if np.isnan(atr): atr = entry_last['Close'] * 0.01
 
-        # Pro Risk Management: Tighter stops if entering against trend
-(Counter-trend)
+        # Pro Risk Management: Tighter stops if entering against trend (Counter-trend)
         sl_mult = 1.5 if (trend == "BULLISH" and "BUY" in action) else 1.0
 
         entry_p = entry_last['Close']
-        sl = entry_p - (atr * sl_mult) if "BUY" in action else entry_p
-+ (atr * sl_mult)
-        tp = entry_p + (atr * sl_mult * 2) if "BUY" in action else
-entry_p - (atr * sl_mult * 2)
+        sl = entry_p - (atr * sl_mult) if "BUY" in action else entry_p + (atr * sl_mult)
+        tp = entry_p + (atr * sl_mult * 2) if "BUY" in action else entry_p - (atr * sl_mult * 2)
 
         return {
             "action": action,
@@ -262,8 +255,7 @@ def main():
 
     col1, col2 = st.columns(2)
     ticker = col1.text_input("Ticker", "BTC-USD")
-    style = col2.selectbox("Style", ["Scalper", "Day Trader", "Swing
-Trader"], index=1)
+    style = col2.selectbox("Style", ["Scalper", "Day Trader", "Swing Trader"], index=1)
 
     if st.button("🧠 Analyze Like a Pro"):
         am = AssetManager(ticker)
@@ -327,9 +319,7 @@ Trader"], index=1)
 
             # Chart with Traps
             st.subheader(f"Price Action Analysis ({tfs[2]})")
-            fig = go.Figure(data=[go.Candlestick(x=entry_df['Date'],
-open=entry_df['Open'], high=entry_df['High'], low=entry_df['Low'],
-close=entry_df['Close'])])
+            fig = go.Figure(data=[go.Candlestick(x=entry_df['Date'], open=entry_df['Open'], high=entry_df['High'], low=entry_df['Low'], close=entry_df['Close'])])
             fig.update_layout(height=400, xaxis_rangeslider_visible=False)
             st.plotly_chart(fig, use_container_width=True)
 
