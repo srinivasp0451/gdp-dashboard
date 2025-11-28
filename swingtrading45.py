@@ -110,8 +110,7 @@ interval=tf, progress=False, auto_adjust=True)
                 df = df.reset_index()
                 df.columns = [str(c[0]).upper() if isinstance(c,
 tuple) else str(c).upper() for c in df.columns]
-                map_cols =
-{'DATETIME':'Date','DATE':'Date','CLOSE':'Close','OPEN':'Open','HIGH':'High','LOW':'Low','VOLUME':'Volume'}
+                map_cols = {'DATETIME':'Date','DATE':'Date','CLOSE':'Close','OPEN':'Open','HIGH':'High','LOW':'Low','VOLUME':'Volume'}
                 df = df.rename(columns={k:v for k,v in
 map_cols.items() if k in df.columns})
 
