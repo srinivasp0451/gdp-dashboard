@@ -1890,6 +1890,304 @@ class RatioAnalyzer:
         
         return adx
 
+class VolumeAnalyzer:
+    """Volume Analysis for confirmation"""
+    
+    @staticmethod
+    def analyze_volume(df: pd.DataFrame) -> Dict:
+        """Analyze volume patterns and trends"""
+        
+        if 'Volume' not in df.columns or df['Volume'].sum() == 0:
+            return {
+                'available': False,
+                'interpretation': 'Volume data not available for this instrument',
+                'volume_trend': 'N/A',
+                'volume_score': 0
+            }
+        
+        latest = df.iloc[-1]
+        volume_sma = df['Volume'].rolling(window=20).mean().iloc[-1]
+        volume_ratio = latest['Volume'] / volume_sma if volume_sma > 0 else 1
+        
+        # Volume trend (increasing or decreasing)
+        recent_volume = df['Volume'].iloc[-10:].mean()
+        older_volume = df['Volume'].iloc[-20:-10].mean()
+        volume_trend_pct = ((recent_volume - older_volume) / older_volume * 100) if older_volume > 0 else 0
+        
+        # Price-Volume relationship
+        price_change = ((latest['Close'] - df['Close'].iloc[-2]) / df['Close'].iloc[-2]) * 100
+        
+        # Determine volume trend
+        if volume_trend_pct > 20:
+            volume_trend = "INCREASING"
+        elif volume_trend_pct < -20:
+            volume_trend = "DECREASING"
+        else:
+            volume_trend = "STABLE"
+        
+        # Volume score (contribution to signal)
+        volume_score = 0
+        interpretation = ""
+        
+        if volume_ratio > 1.5 and price_change > 0:
+            volume_score = 1.5
+            interpretation = f"BULLISH CONFIRMATION: High volume ({volume_ratio:.2f}x average) on up move. Strong buying pressure."
+        elif volume_ratio > 1.5 and price_change < 0:
+            volume_score = -1.5
+            interpretation = f"BEARISH CONFIRMATION: High volume ({volume_ratio:.2f}x average) on down move. Strong selling pressure."
+        elif volume_ratio < 0.5:
+            volume_score = -0.5
+            interpretation = f"LOW CONVICTION: Volume ({volume_ratio:.2f}x average) below normal. Move lacks conviction."
+        else:
+            interpretation = f"NORMAL VOLUME: Volume ({volume_ratio:.2f}x average) near average. No special signal."
+        
+        interpretation += f" Volume trend is {volume_trend} ({volume_trend_pct:+.1f}%)."
+        
+        return {
+            'available': True,
+            'volume_ratio': volume_ratio,
+            'volume_trend': volume_trend,
+            'volume_trend_pct': volume_trend_pct,
+            'interpretation': interpretation,
+            'volume_score': volume_score
+        }
+
+
+class PatternReliabilityAnalyzer:
+    """Analyzes which patterns/indicators the market is following most reliably"""
+    
+    @staticmethod
+    def analyze_pattern_reliability(df: pd.DataFrame) -> Dict:
+        """Test reliability of different patterns over recent history"""
+        
+        if len(df) < 100:
+            return {
+                'most_reliable': 'INSUFFICIENT_DATA',
+                'reliability_scores': {},
+                'recommendations': []
+            }
+        
+        reliability_scores = {}
+        
+        # Test Elliott Wave reliability
+        elliott_score = PatternReliabilityAnalyzer._test_elliott_wave_reliability(df)
+        reliability_scores['Elliott Wave'] = elliott_score
+        
+        # Test Fibonacci reliability
+        fib_score = PatternReliabilityAnalyzer._test_fibonacci_reliability(df)
+        reliability_scores['Fibonacci'] = fib_score
+        
+        # Test Support/Resistance reliability
+        sr_score = PatternReliabilityAnalyzer._test_support_resistance_reliability(df)
+        reliability_scores['Support/Resistance'] = sr_score
+        
+        # Test Moving Average reliability
+        ma_score = PatternReliabilityAnalyzer._test_moving_average_reliability(df)
+        reliability_scores['Moving Averages'] = ma_score
+        
+        # Test RSI reliability
+        rsi_score = PatternReliabilityAnalyzer._test_rsi_reliability(df)
+        reliability_scores['RSI'] = rsi_score
+        
+        # Test MACD reliability
+        macd_score = PatternReliabilityAnalyzer._test_macd_reliability(df)
+        reliability_scores['MACD'] = macd_score
+        
+        # Find most reliable pattern
+        most_reliable = max(reliability_scores, key=reliability_scores.get)
+        
+        # Generate recommendations based on reliability
+        recommendations = []
+        for pattern, score in sorted(reliability_scores.items(), key=lambda x: x[1], reverse=True):
+            if score > 70:
+                recommendations.append(f"✅ {pattern}: HIGHLY RELIABLE ({score:.1f}%) - Primary indicator")
+            elif score > 55:
+                recommendations.append(f"⚠️ {pattern}: MODERATELY RELIABLE ({score:.1f}%) - Use with confirmation")
+            else:
+                recommendations.append(f"❌ {pattern}: UNRELIABLE ({score:.1f}%) - Ignore or use cautiously")
+        
+        return {
+            'most_reliable': most_reliable,
+            'reliability_scores': reliability_scores,
+            'recommendations': recommendations
+        }
+    
+    @staticmethod
+    def _test_elliott_wave_reliability(df: pd.DataFrame) -> float:
+        """Test how well Elliott Wave predictions worked historically"""
+        
+        correct_predictions = 0
+        total_predictions = 0
+        
+        for i in range(50, len(df) - 10, 5):
+            window_df = df.iloc[:i]
+            elliott = ElliottWaveAnalyzer.detect_elliott_wave(window_df)
+            
+            if elliott['confidence'] > 60:
+                action_bias = elliott.get('action_bias', 'HOLD')
+                future_price = df['Close'].iloc[i+10]
+                current_price = df['Close'].iloc[i]
+                
+                if action_bias == 'BUY' and future_price > current_price:
+                    correct_predictions += 1
+                elif action_bias == 'SELL' and future_price < current_price:
+                    correct_predictions += 1
+                
+                total_predictions += 1
+        
+        return (correct_predictions / total_predictions * 100) if total_predictions > 0 else 50
+    
+    @staticmethod
+    def _test_fibonacci_reliability(df: pd.DataFrame) -> float:
+        """Test how well Fibonacci levels acted as support/resistance"""
+        
+        bounces_at_fib = 0
+        total_tests = 0
+        
+        for i in range(50, len(df) - 5, 5):
+            window_df = df.iloc[:i]
+            fib = FibonacciAnalyzer.calculate_fibonacci_levels(window_df)
+            
+            current_price = df['Close'].iloc[i]
+            
+            # Check if price bounced from nearby Fibonacci level
+            for level_name, level_value in fib['levels'].items():
+                if abs(current_price - level_value) / current_price < 0.01:  # Within 1%
+                    # Check if price bounced in next 5 periods
+                    future_prices = df['Close'].iloc[i+1:i+6]
+                    
+                    if fib['trend'] == 'UPTREND' and level_value < current_price:
+                        # Support test
+                        if future_prices.max() > current_price:
+                            bounces_at_fib += 1
+                    elif fib['trend'] == 'DOWNTREND' and level_value > current_price:
+                        # Resistance test
+                        if future_prices.min() < current_price:
+                            bounces_at_fib += 1
+                    
+                    total_tests += 1
+                    break
+        
+        return (bounces_at_fib / total_tests * 100) if total_tests > 0 else 50
+    
+    @staticmethod
+    def _test_support_resistance_reliability(df: pd.DataFrame) -> float:
+        """Test how well S/R levels held"""
+        
+        holds = 0
+        tests = 0
+        
+        for i in range(50, len(df) - 5, 5):
+            window_df = df.iloc[:i]
+            sr = SupportResistanceAnalyzer.find_strong_levels(window_df)
+            
+            current_price = df['Close'].iloc[i]
+            support = sr['support']
+            resistance = sr['resistance']
+            
+            # Test support
+            if abs(current_price - support) / current_price < 0.015:
+                future_low = df['Low'].iloc[i+1:i+6].min()
+                if future_low >= support * 0.98:  # Held within 2%
+                    holds += 1
+                tests += 1
+            
+            # Test resistance
+            if abs(current_price - resistance) / current_price < 0.015:
+                future_high = df['High'].iloc[i+1:i+6].max()
+                if future_high <= resistance * 1.02:  # Held within 2%
+                    holds += 1
+                tests += 1
+        
+        return (holds / tests * 100) if tests > 0 else 50
+    
+    @staticmethod
+    def _test_moving_average_reliability(df: pd.DataFrame) -> float:
+        """Test MA crossover reliability"""
+        
+        correct_signals = 0
+        total_signals = 0
+        
+        for i in range(50, len(df) - 10):
+            if pd.notna(df['SMA_20'].iloc[i]) and pd.notna(df['SMA_50'].iloc[i]):
+                prev_diff = df['SMA_20'].iloc[i-1] - df['SMA_50'].iloc[i-1]
+                curr_diff = df['SMA_20'].iloc[i] - df['SMA_50'].iloc[i]
+                
+                # Bullish crossover
+                if prev_diff <= 0 and curr_diff > 0:
+                    future_price = df['Close'].iloc[i+10]
+                    current_price = df['Close'].iloc[i]
+                    if future_price > current_price:
+                        correct_signals += 1
+                    total_signals += 1
+                
+                # Bearish crossover
+                elif prev_diff >= 0 and curr_diff < 0:
+                    future_price = df['Close'].iloc[i+10]
+                    current_price = df['Close'].iloc[i]
+                    if future_price < current_price:
+                        correct_signals += 1
+                    total_signals += 1
+        
+        return (correct_signals / total_signals * 100) if total_signals > 0 else 50
+    
+    @staticmethod
+    def _test_rsi_reliability(df: pd.DataFrame) -> float:
+        """Test RSI signal reliability"""
+        
+        correct_signals = 0
+        total_signals = 0
+        
+        for i in range(50, len(df) - 10):
+            rsi = df['RSI'].iloc[i]
+            
+            if rsi < 30:  # Oversold
+                future_price = df['Close'].iloc[i+10]
+                current_price = df['Close'].iloc[i]
+                if future_price > current_price:
+                    correct_signals += 1
+                total_signals += 1
+            
+            elif rsi > 70:  # Overbought
+                future_price = df['Close'].iloc[i+10]
+                current_price = df['Close'].iloc[i]
+                if future_price < current_price:
+                    correct_signals += 1
+                total_signals += 1
+        
+        return (correct_signals / total_signals * 100) if total_signals > 0 else 50
+    
+    @staticmethod
+    def _test_macd_reliability(df: pd.DataFrame) -> float:
+        """Test MACD crossover reliability"""
+        
+        correct_signals = 0
+        total_signals = 0
+        
+        for i in range(50, len(df) - 10):
+            if pd.notna(df['MACD'].iloc[i]) and pd.notna(df['MACD_Signal'].iloc[i]):
+                prev_diff = df['MACD'].iloc[i-1] - df['MACD_Signal'].iloc[i-1]
+                curr_diff = df['MACD'].iloc[i] - df['MACD_Signal'].iloc[i]
+                
+                # Bullish crossover
+                if prev_diff <= 0 and curr_diff > 0:
+                    future_price = df['Close'].iloc[i+10]
+                    current_price = df['Close'].iloc[i]
+                    if future_price > current_price:
+                        correct_signals += 1
+                    total_signals += 1
+                
+                # Bearish crossover
+                elif prev_diff >= 0 and curr_diff < 0:
+                    future_price = df['Close'].iloc[i+10]
+                    current_price = df['Close'].iloc[i]
+                    if future_price < current_price:
+                        correct_signals += 1
+                    total_signals += 1
+        
+        return (correct_signals / total_signals * 100) if total_signals > 0 else 50
+
+
 class StrategyEngine:
     """Multi-Strategy Trading Engine"""
     
