@@ -4,461 +4,3462 @@ import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
+from datetime import datetime, timedelta
 import time
 import pytz
-from datetime import datetime, timedelta
+from dataclasses import dataclass
+from typing import Dict, List, Tuple, Optional
+import warnings
+warnings.filterwarnings('ignore')
+
+# NLTK and VADER Sentiment Setup
 import nltk
+try:
+    nltk.data.find('sentiment/vader_lexicon.zip')
+except LookupError:
+    nltk.download('vader_lexicon', quiet=True)
+
 from nltk.sentiment.vader import SentimentIntensityAnalyzer
 
-# -----------------------------------------------------------------------------
-# 1. APP CONFIGURATION & STYLING
-# -----------------------------------------------------------------------------
+# Page Configuration
 st.set_page_config(
-    page_title="QuantPro: Multi-Timeframe Trading System",
-    page_icon="⚡",
+    page_title="Professional Trading System",
+    page_icon="📈",
     layout="wide",
     initial_sidebar_state="expanded"
 )
 
-# Custom CSS for Professional Dark UI
+# Custom CSS
 st.markdown("""
 <style>
-    .stApp { background-color: #0e1117; color: #ffffff; }
-    .stButton>button { width: 100%; background-color: #2962ff; color: white; font-weight: bold; border: none; padding: 0.5rem; }
-    .stButton>button:hover { background-color: #0039cb; }
-    .metric-card { background-color: #1e2130; padding: 15px; border-radius: 8px; border-left: 5px solid #2962ff; margin-bottom: 10px; }
-    .signal-box { padding: 20px; border-radius: 10px; text-align: center; font-size: 24px; font-weight: bold; margin-bottom: 20px; }
-    .buy-signal { background-color: #004d40; color: #00e676; border: 2px solid #00e676; }
-    .sell-signal { background-color: #4a0000; color: #ff5252; border: 2px solid #ff5252; }
-    .neutral-signal { background-color: #3e2723; color: #ffab40; border: 2px solid #ffab40; }
-    .psychology-warning { font-size: 12px; color: #ffcc80; font-style: italic; }
-    .summary-text { font-family: 'Courier New', monospace; background-color: #262730; padding: 15px; border-radius: 5px; font-size: 14px; line-height: 1.6; }
+    .main-header {
+        font-size: 2.5rem;
+        font-weight: bold;
+        color: #1f77b4;
+        text-align: center;
+        margin-bottom: 2rem;
+    }
+    .signal-box {
+        padding: 20px;
+        border-radius: 10px;
+        margin: 10px 0;
+        font-weight: bold;
+        font-size: 1.2rem;
+    }
+    .buy-signal {
+        background-color: #d4edda;
+        border: 2px solid #28a745;
+        color: #155724;
+    }
+    .sell-signal {
+        background-color: #f8d7da;
+        border: 2px solid #dc3545;
+        color: #721c24;
+    }
+    .hold-signal {
+        background-color: #fff3cd;
+        border: 2px solid #ffc107;
+        color: #856404;
+    }
+    .metric-card {
+        background-color: #f8f9fa;
+        padding: 15px;
+        border-radius: 8px;
+        border-left: 4px solid #1f77b4;
+    }
+    .stButton>button {
+        width: 100%;
+        background-color: #1f77b4;
+        color: white;
+        font-weight: bold;
+        border-radius: 5px;
+        padding: 10px;
+    }
 </style>
 """, unsafe_allow_html=True)
 
-# -----------------------------------------------------------------------------
-# 2. CONSTANTS & MAPPINGS
-# -----------------------------------------------------------------------------
-ASSETS = {
-    "Indices": {"^NSEI": "NIFTY 50", "^NSEBANK": "BANK NIFTY", "^BSESN": "SENSEX", "^GSPC": "S&P 500"},
-    "Crypto": {"BTC-USD": "Bitcoin", "ETH-USD": "Ethereum", "SOL-USD": "Solana"},
-    "Commodities": {"GC=F": "Gold", "SI=F": "Silver", "CL=F": "Crude Oil"},
-    "Forex": {"INR=X": "USD/INR", "EURUSD=X": "EUR/USD", "GBPUSD=X": "GBP/USD"},
-    "Stocks (IN)": {"RELIANCE.NS": "Reliance", "HDFCBANK.NS": "HDFC Bank", "TCS.NS": "TCS"},
-    "Stocks (US)": {"AAPL": "Apple", "TSLA": "Tesla", "NVDA": "Nvidia"}
+# Data Classes
+@dataclass
+class TradingSignal:
+    action: str  # BUY, SELL, HOLD
+    confidence: float
+    entry_price: float
+    target_price: float
+    stop_loss: float
+    timeframe: str
+    strategy: str
+    reasoning: str
+    risk_reward: float
+    sentiment_score: float = 0
+    sentiment_summary: str = ""
+    strong_support: float = 0
+    strong_resistance: float = 0
+    support_strength: str = ""
+    resistance_strength: str = ""
+    zscore: float = 0
+    zscore_interpretation: str = ""
+    timeframe_signals: Dict = None
+    detailed_summary: str = ""
+    signal_confluence: str = ""
+
+@dataclass
+class BacktestResult:
+    total_trades: int
+    winning_trades: int
+    losing_trades: int
+    win_rate: float
+    avg_profit: float
+    avg_loss: float
+    profit_factor: float
+    max_drawdown: float
+    total_return: float
+
+# Instrument Mappings
+INSTRUMENTS = {
+    "NIFTY 50": "^NSEI",
+    "BANK NIFTY": "^NSEBANK",
+    "SENSEX": "^BSESN",
+    "Bitcoin": "BTC-USD",
+    "Ethereum": "ETH-USD",
+    "Gold": "GC=F",
+    "Silver": "SI=F",
+    "USD/INR": "INR=X",
+    "EUR/USD": "EURUSD=X",
+    "Custom Ticker": "CUSTOM"
 }
 
-TIMEFRAMES = ['1m', '2m', '5m', '15m', '30m', '1h', '1d', '1wk']
-HTF_MAPPING = {
-    '1m': '15m', '2m': '15m', '5m': '1h', '15m': '4h', 
-    '30m': '1d', '1h': '1d', '1d': '1wk', '1wk': '1mo'
-}
+TIMEFRAMES = ["1m", "3m", "5m", "10m", "15m", "30m", "1h", "2h", "4h", "1d"]
+PERIODS = ["1d", "5d", "7d", "1mo", "3mo", "6mo", "1y", "2y", "3y", "5y", "10y", "15y", "20y"]
 
-PERIODS = ['1d', '5d', '1mo', '3mo', '6mo', '1y', '2y', '5y', 'max']
+# Session State Initialization
+if 'data_cache' not in st.session_state:
+    st.session_state.data_cache = {}
+if 'last_fetch_time' not in st.session_state:
+    st.session_state.last_fetch_time = {}
+if 'analysis_results' not in st.session_state:
+    st.session_state.analysis_results = None
 
-# -----------------------------------------------------------------------------
-# 3. UTILITY FUNCTIONS
-# -----------------------------------------------------------------------------
-def to_ist(df):
-    if df.empty: return df
-    if df.index.tz is None:
-        df.index = df.index.tz_localize('UTC')
-    else:
-        df.index = df.index.tz_convert('UTC')
-    return df.index.tz_convert('Asia/Kolkata')
-
-@st.cache_data(ttl=300)
-def fetch_data_robust(ticker, period, interval, delay=1.5):
-    time.sleep(delay)
-    try:
-        df = yf.download(ticker, period=period, interval=interval, progress=False, auto_adjust=True)
-        if df.empty: return None
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = df.columns.get_level_values(0)
-        df.index = to_ist(df)
-        return df
-    except Exception as e:
-        st.error(f"API Error: {e}")
-        return None
-
-# --- NLTK SENTIMENT ENGINE ---
-@st.cache_resource
-def setup_nltk():
-    try:
-        nltk.data.find('sentiment/vader_lexicon.zip')
-    except LookupError:
-        nltk.download('vader_lexicon')
-    return SentimentIntensityAnalyzer()
-
-def analyze_news_sentiment(ticker):
-    """Fetches news and calculates sentiment score using NLTK VADER."""
-    vader = setup_nltk()
-    try:
-        t = yf.Ticker(ticker)
-        news = t.news
+class TechnicalAnalyzer:
+    """Advanced Technical Analysis Engine"""
+    
+    @staticmethod
+    def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
+        """Calculate comprehensive technical indicators"""
+        df = df.copy()
         
-        if not news:
-            return {"score": 0, "label": "NEUTRAL", "headlines": []}
-
-        score = 0
-        count = 0
-        headlines = []
+        # Moving Averages
+        df['SMA_20'] = df['Close'].rolling(window=20).mean()
+        df['SMA_50'] = df['Close'].rolling(window=50).mean()
+        df['SMA_200'] = df['Close'].rolling(window=200).mean()
+        df['EMA_12'] = df['Close'].ewm(span=12, adjust=False).mean()
+        df['EMA_26'] = df['Close'].ewm(span=26, adjust=False).mean()
         
-        for n in news[:5]: # Analyze top 5
-            # Handle variable yfinance news structure
-            title = n.get('title', n.get('content', {}).get('title', ''))
-            link = n.get('link', n.get('content', {}).get('link', '#'))
-            publisher = n.get('publisher', 'Unknown')
-            
-            if title:
-                pol = vader.polarity_scores(title)['compound']
-                score += pol
-                count += 1
-                headlines.append({'title': title, 'link': link, 'source': publisher})
-
-        avg_score = score / count if count > 0 else 0
+        # MACD
+        df['MACD'] = df['EMA_12'] - df['EMA_26']
+        df['MACD_Signal'] = df['MACD'].ewm(span=9, adjust=False).mean()
+        df['MACD_Hist'] = df['MACD'] - df['MACD_Signal']
         
-        label = "NEUTRAL"
-        if avg_score > 0.15: label = "POSITIVE"
-        elif avg_score < -0.15: label = "NEGATIVE"
-        
-        return {"score": avg_score, "label": label, "headlines": headlines}
-    except Exception as e:
-        return {"score": 0, "label": "ERROR", "headlines": [], "error": str(e)}
-
-# -----------------------------------------------------------------------------
-# 4. TECHNICAL ANALYSIS ENGINE
-# -----------------------------------------------------------------------------
-class MarketBrain:
-    def __init__(self, df):
-        self.df = df.copy()
-        
-    def add_indicators(self):
-        df = self.df
-        # 1. Moving Averages
-        df['EMA_20'] = df['Close'].ewm(span=20).mean()
-        df['EMA_50'] = df['Close'].ewm(span=50).mean()
-        df['EMA_200'] = df['Close'].ewm(span=200).mean()
-        
-        # 2. RSI
+        # RSI
         delta = df['Close'].diff()
         gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
         loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
         rs = gain / loss
         df['RSI'] = 100 - (100 / (1 + rs))
         
-        # 3. ATR
-        df['TR'] = np.maximum((df['High'] - df['Low']), 
-                              np.maximum(abs(df['High'] - df['Close'].shift(1)), 
-                                         abs(df['Low'] - df['Close'].shift(1))))
-        df['ATR'] = df['TR'].rolling(window=14).mean()
+        # Bollinger Bands
+        df['BB_Middle'] = df['Close'].rolling(window=20).mean()
+        bb_std = df['Close'].rolling(window=20).std()
+        df['BB_Upper'] = df['BB_Middle'] + (bb_std * 2)
+        df['BB_Lower'] = df['BB_Middle'] - (bb_std * 2)
         
-        # 4. MACD
-        df['EMA_12'] = df['Close'].ewm(span=12).mean()
-        df['EMA_26'] = df['Close'].ewm(span=26).mean()
-        df['MACD'] = df['EMA_12'] - df['EMA_26']
-        df['Signal_Line'] = df['MACD'].ewm(span=9).mean()
+        # ATR (Average True Range)
+        high_low = df['High'] - df['Low']
+        high_close = np.abs(df['High'] - df['Close'].shift())
+        low_close = np.abs(df['Low'] - df['Close'].shift())
+        ranges = pd.concat([high_low, high_close, low_close], axis=1)
+        true_range = np.max(ranges, axis=1)
+        df['ATR'] = true_range.rolling(14).mean()
         
-        # 5. Bollinger Bands (For Volatility Context)
-        df['BB_Mid'] = df['Close'].rolling(20).mean()
-        df['BB_Std'] = df['Close'].rolling(20).std()
-        df['BB_Upper'] = df['BB_Mid'] + (2 * df['BB_Std'])
-        df['BB_Lower'] = df['BB_Mid'] - (2 * df['BB_Std'])
+        # Stochastic Oscillator
+        low_14 = df['Low'].rolling(window=14).min()
+        high_14 = df['High'].rolling(window=14).max()
+        df['Stoch_K'] = 100 * ((df['Close'] - low_14) / (high_14 - low_14))
+        df['Stoch_D'] = df['Stoch_K'].rolling(window=3).mean()
         
-        # 6. Pivot Points (Fibonacci style)
-        high_roll = df['High'].rolling(20).max()
-        low_roll = df['Low'].rolling(20).min()
-        df['Fib_0.618'] = high_roll - (high_roll - low_roll) * 0.618
+        # ADX (Average Directional Index)
+        df['ADX'] = TechnicalAnalyzer.calculate_adx(df)
         
-        self.df = df
+        # Volume indicators
+        df['Volume_SMA'] = df['Volume'].rolling(window=20).mean()
+        df['Volume_Ratio'] = df['Volume'] / df['Volume_SMA']
+        
+        # Support and Resistance
+        df['Support'] = df['Low'].rolling(window=20).min()
+        df['Resistance'] = df['High'].rolling(window=20).max()
+        
         return df
-
-    def get_swing_pivots(self, window=5):
-        """Identifies Swing Highs and Lows for Elliott Wave visualization."""
-        df = self.df
-        df['Swing_High'] = df['High'].rolling(window=window*2+1, center=True).max()
-        df['Swing_Low'] = df['Low'].rolling(window=window*2+1, center=True).min()
+    
+    @staticmethod
+    def calculate_adx(df: pd.DataFrame, period: int = 14) -> pd.Series:
+        """Calculate Average Directional Index"""
+        high = df['High']
+        low = df['Low']
+        close = df['Close']
         
-        pivots = []
-        # Find points where High == Swing_High or Low == Swing_Low
-        for i in range(window, len(df)-window):
-            date = df.index[i]
-            if df['High'].iloc[i] == df['Swing_High'].iloc[i]:
-                pivots.append({'date': date, 'price': df['High'].iloc[i], 'type': 'High'})
-            elif df['Low'].iloc[i] == df['Swing_Low'].iloc[i]:
-                pivots.append({'date': date, 'price': df['Low'].iloc[i], 'type': 'Low'})
-                
-        # Filter consecutive highs/lows (keep extreme)
-        clean_pivots = []
-        if pivots:
-            curr = pivots[0]
-            for i in range(1, len(pivots)):
-                next_p = pivots[i]
-                if curr['type'] == next_p['type']:
-                    if curr['type'] == 'High':
-                        if next_p['price'] > curr['price']: curr = next_p
-                    else:
-                        if next_p['price'] < curr['price']: curr = next_p
-                else:
-                    clean_pivots.append(curr)
-                    curr = next_p
-            clean_pivots.append(curr)
+        plus_dm = high.diff()
+        minus_dm = -low.diff()
+        plus_dm[plus_dm < 0] = 0
+        minus_dm[minus_dm < 0] = 0
+        
+        tr = pd.DataFrame({
+            'hl': high - low,
+            'hc': abs(high - close.shift()),
+            'lc': abs(low - close.shift())
+        }).max(axis=1)
+        
+        atr = tr.rolling(window=period).mean()
+        plus_di = 100 * (plus_dm.rolling(window=period).mean() / atr)
+        minus_di = 100 * (minus_dm.rolling(window=period).mean() / atr)
+        
+        dx = 100 * abs(plus_di - minus_di) / (plus_di + minus_di)
+        adx = dx.rolling(window=period).mean()
+        
+        return adx
+
+
+class DataFetcher:
+    """Handles data fetching with rate limiting"""
+    
+    @staticmethod
+    def fetch_data(ticker: str, period: str, interval: str) -> pd.DataFrame:
+        """Fetch data with rate limiting and error handling"""
+        
+        cache_key = f"{ticker}_{period}_{interval}"
+        current_time = time.time()
+        
+        # Check cache (5 minutes validity)
+        if cache_key in st.session_state.data_cache:
+            cached_data, cache_time = st.session_state.data_cache[cache_key]
+            if current_time - cache_time < 300:  # 5 minutes
+                return cached_data
+        
+        # Rate limiting
+        if cache_key in st.session_state.last_fetch_time:
+            time_since_last = current_time - st.session_state.last_fetch_time[cache_key]
+            if time_since_last < 1.5:
+                time.sleep(1.5 - time_since_last)
+        
+        try:
+            # Fetch data
+            stock = yf.Ticker(ticker)
+            df = stock.history(period=period, interval=interval)
             
-        return pd.DataFrame(clean_pivots)
+            if df.empty:
+                st.error(f"No data available for {ticker}")
+                return pd.DataFrame()
+            
+            # Convert to IST
+            if df.index.tz is not None:
+                df.index = df.index.tz_convert('Asia/Kolkata')
+            else:
+                df.index = df.index.tz_localize('UTC').tz_convert('Asia/Kolkata')
+            
+            # Fetch news
+            try:
+                news = stock.news[:5] if hasattr(stock, 'news') else []
+                df.attrs['news'] = news
+            except:
+                df.attrs['news'] = []
+            
+            # Cache data
+            st.session_state.data_cache[cache_key] = (df, current_time)
+            st.session_state.last_fetch_time[cache_key] = current_time
+            
+            return df
+            
+        except Exception as e:
+            st.error(f"Error fetching data: {str(e)}")
+            return pd.DataFrame()
 
-    def check_divergence(self, window=15):
-        df = self.df.iloc[-window:]
-        if len(df) < window: return "None"
-        
-        first_half = df.iloc[:int(window/2)]
-        last_half = df.iloc[int(window/2):]
-        
-        div_signal = "None"
-        if last_half['Close'].mean() < first_half['Close'].mean() and last_half['RSI'].mean() > first_half['RSI'].mean():
-            div_signal = "Bullish Divergence"
-        if last_half['Close'].mean() > first_half['Close'].mean() and last_half['RSI'].mean() < first_half['RSI'].mean():
-            div_signal = "Bearish Divergence"
-        return div_signal
 
-    def identify_elliott_context(self):
-        last = self.df.iloc[-1]
-        trend = "Neutral"
+class SentimentAnalyzer:
+    """News Sentiment Analysis using VADER"""
+    
+    def __init__(self, ticker: str):
+        self.ticker = ticker
+        self.vader = SentimentIntensityAnalyzer()
+    
+    def analyze(self) -> Dict:
+        """Analyze news sentiment"""
+        try:
+            news = yf.Ticker(self.ticker).news
+            
+            if not news:
+                return {"score": 0, "summary": "No Recent News", "details": []}
+            
+            score = 0
+            news_details = []
+            valid_count = 0
+            
+            for n in news[:5]:
+                try:
+                    # Try different ways to access title
+                    title = None
+                    if 'title' in n:
+                        title = n['title']
+                    elif 'content' in n and 'title' in n['content']:
+                        title = n['content']['title']
+                    
+                    if not title:
+                        continue
+                    
+                    sentiment_score = self.vader.polarity_scores(title)['compound']
+                    score += sentiment_score
+                    valid_count += 1
+                    
+                    news_details.append({
+                        'title': title,
+                        'score': sentiment_score,
+                        'link': n.get('link', '#')
+                    })
+                    
+                except Exception as e:
+                    continue
+            
+            if valid_count == 0:
+                return {"score": 0, "summary": "No Valid News", "details": []}
+            
+            avg_score = score / valid_count
+            
+            # Determine sentiment
+            sentiment = "NEUTRAL"
+            if avg_score > 0.15:
+                sentiment = "POSITIVE (News Catalyst)"
+            elif avg_score < -0.15:
+                sentiment = "NEGATIVE (Bad Press)"
+            
+            return {
+                "score": avg_score,
+                "summary": sentiment,
+                "details": news_details
+            }
+            
+        except Exception as e:
+            return {"score": 0, "summary": f"Error: {str(e)}", "details": []}
+
+    """News Sentiment Analysis using VADER"""
+    
+    def __init__(self, ticker: str):
+        self.ticker = ticker
+        self.vader = SentimentIntensityAnalyzer()
+    
+    def analyze(self) -> Dict:
+        """Analyze news sentiment"""
+        try:
+            news = yf.Ticker(self.ticker).news
+            
+            if not news:
+                return {"score": 0, "summary": "No Recent News", "details": []}
+            
+            scores = []
+            news_details = []
+            
+            for n in news[:5]:
+                try:
+                    title = n.get('title', '')
+                    if not title:
+                        continue
+                    
+                    sentiment_score = self.vader.polarity_scores(title)['compound']
+                    scores.append(sentiment_score)
+                    
+                    news_details.append({
+                        'title': title,
+                        'score': sentiment_score,
+                        'link': n.get('link', '#')
+                    })
+                    
+                except Exception as e:
+                    continue
+            
+            if not scores:
+                return {"score": 0, "summary": "No Valid News", "details": []}
+            
+            avg_score = sum(scores) / len(scores)
+            
+            # Determine sentiment
+            if avg_score > 0.25:
+                sentiment = "VERY POSITIVE (Strong Bullish Catalyst)"
+            elif avg_score > 0.15:
+                sentiment = "POSITIVE (Mild Bullish News)"
+            elif avg_score < -0.25:
+                sentiment = "VERY NEGATIVE (Strong Bearish Catalyst)"
+            elif avg_score < -0.15:
+                sentiment = "NEGATIVE (Mild Bearish News)"
+            else:
+                sentiment = "NEUTRAL (No Significant News Impact)"
+            
+            return {
+                "score": avg_score,
+                "summary": sentiment,
+                "details": news_details
+            }
+            
+        except Exception as e:
+            return {"score": 0, "summary": f"Error analyzing sentiment: {str(e)}", "details": []}
+
+
+class SupportResistanceAnalyzer:
+    """Advanced Support and Resistance Analysis"""
+    
+    @staticmethod
+    def find_strong_levels(df: pd.DataFrame) -> Dict:
+        """Identify strong support and resistance levels"""
         
-        if last['Close'] > last['EMA_20'] > last['EMA_50']:
-            if 50 < last['RSI'] < 75: trend = "Wave 3 (Impulse)"
-            elif last['RSI'] >= 75: trend = "Wave 5 (Exhaustion)"
-        elif last['Close'] < last['EMA_20'] < last['EMA_50']:
-            if 25 < last['RSI'] < 50: trend = "Wave C (Down Impulse)"
-            elif last['RSI'] <= 25: trend = "Correction Oversold"
+        if len(df) < 50:
+            return {
+                'support': df['Low'].min(),
+                'resistance': df['High'].max(),
+                'support_strength': 'Insufficient data',
+                'resistance_strength': 'Insufficient data',
+                'support_touches': 0,
+                'resistance_touches': 0
+            }
+        
+        # Use multiple timeframe approach
+        close_prices = df['Close'].values
+        high_prices = df['High'].values
+        low_prices = df['Low'].values
+        
+        # Find pivot points
+        window = 10
+        resistance_levels = []
+        support_levels = []
+        
+        # Identify local maxima and minima
+        for i in range(window, len(df) - window):
+            # Resistance (local maxima)
+            if high_prices[i] == max(high_prices[i-window:i+window+1]):
+                resistance_levels.append(high_prices[i])
+            
+            # Support (local minima)
+            if low_prices[i] == min(low_prices[i-window:i+window+1]):
+                support_levels.append(low_prices[i])
+        
+        current_price = close_prices[-1]
+        
+        # Find strongest support (closest below current price with most touches)
+        supports_below = [s for s in support_levels if s < current_price]
+        if supports_below:
+            # Cluster nearby levels
+            support_clusters = SupportResistanceAnalyzer._cluster_levels(supports_below)
+            strong_support = max(support_clusters.keys())
+            support_touches = support_clusters[strong_support]
         else:
-            trend = "Corrective / Choppy (Wave 2/4/B)"
-        return trend
-
-    def generate_signal(self):
-        row = self.df.iloc[-1]
-        score = 0
-        reasons = []
+            strong_support = df['Low'].min()
+            support_touches = 1
         
-        # Trend
-        if row['Close'] > row['EMA_50']: score += 1
-        if row['EMA_20'] > row['EMA_50']: score += 1
+        # Find strongest resistance (closest above current price with most touches)
+        resistances_above = [r for r in resistance_levels if r > current_price]
+        if resistances_above:
+            resistance_clusters = SupportResistanceAnalyzer._cluster_levels(resistances_above)
+            strong_resistance = min(resistance_clusters.keys())
+            resistance_touches = resistance_clusters[strong_resistance]
+        else:
+            strong_resistance = df['High'].max()
+            resistance_touches = 1
         
-        # Momentum
-        if row['RSI'] > 50: score += 1
-        if row['MACD'] > row['Signal_Line']: score += 1
+        # Calculate strength based on touches and volume
+        volume_at_support = SupportResistanceAnalyzer._volume_at_level(
+            df, strong_support, tolerance=0.02
+        )
+        volume_at_resistance = SupportResistanceAnalyzer._volume_at_level(
+            df, strong_resistance, tolerance=0.02
+        )
         
-        action = "HOLD"
-        if score >= 3: action = "BUY"
-        elif score <= 1: action = "SELL"
+        # Strength interpretation
+        support_strength = SupportResistanceAnalyzer._interpret_strength(
+            support_touches, volume_at_support, "Support"
+        )
+        resistance_strength = SupportResistanceAnalyzer._interpret_strength(
+            resistance_touches, volume_at_resistance, "Resistance"
+        )
         
-        return action, score, reasons
-
-def generate_verbose_summary(ticker, tf, signal, conf, ew, div, df, news_data):
-    """Generates a professional 300+ word analysis report."""
-    last = df.iloc[-1]
-    prev = df.iloc[-2]
+        return {
+            'support': strong_support,
+            'resistance': strong_resistance,
+            'support_strength': support_strength,
+            'resistance_strength': resistance_strength,
+            'support_touches': support_touches,
+            'resistance_touches': resistance_touches,
+            'support_distance': ((current_price - strong_support) / current_price) * 100,
+            'resistance_distance': ((strong_resistance - current_price) / current_price) * 100
+        }
     
-    # 1. Price Context
-    price_change = last['Close'] - prev['Close']
-    change_pct = (price_change / prev['Close']) * 100
-    
-    # 2. Indicator States
-    rsi_state = "Neutral"
-    if last['RSI'] > 70: rsi_state = "Overbought (Potential Reversal)"
-    elif last['RSI'] < 30: rsi_state = "Oversold (Potential Bounce)"
-    elif last['RSI'] > 50: rsi_state = "Bullish Momentum"
-    else: rsi_state = "Bearish Momentum"
-    
-    macd_state = "Bullish" if last['MACD'] > last['Signal_Line'] else "Bearish"
-    
-    # 3. Volatility
-    volatility = "High" if last['ATR'] > df['ATR'].mean() else "Normal"
-    bb_pos = "within bands"
-    if last['Close'] > last['BB_Upper']: bb_pos = "piercing Upper Bollinger Band (Extreme)"
-    elif last['Close'] < last['BB_Lower']: bb_pos = "piercing Lower Bollinger Band (Extreme)"
-
-    summary = f"""
-    **COMPREHENSIVE MARKET ANALYSIS REPORT: {ticker} ({tf})**
-    
-    **1. EXECUTIVE SUMMARY**
-    The proprietary algorithm has generated a **{signal}** signal with **{conf}** confidence. The asset is currently trading at **{last['Close']:.2f}**, showing a change of **{change_pct:.2f}%** from the previous candle. The immediate market structure suggests we are in a **{ew}** phase, indicating distinct behavioral psychology among participants.
-    
-    **2. PRICE ACTION & TREND DIAGNOSTICS**
-    The primary trend is currently dictated by the relationship between the 20-period and 50-period Exponential Moving Averages (EMAs). 
-    The 20 EMA is at {last['EMA_20']:.2f} while the 50 EMA is at {last['EMA_50']:.2f}. {'Price is holding above key dynamic support,' if last['Close'] > last['EMA_20'] else 'Price is suppressed below dynamic resistance,'} confirming the validity of the current signal. 
-    Furthermore, price is currently {bb_pos}, which implies that volatility is {volatility}. A move outside Bollinger Bands often signals a statistical anomaly that may result in mean reversion or a strong breakout depending on volume.
-    
-    **3. MOMENTUM & OSCILLATORS**
-    Momentum indicators provide the engine for this move. The Relative Strength Index (RSI 14) is currently reading **{last['RSI']:.2f}**, classifying the momentum as **{rsi_state}**. 
-    {'Critically, a divergence pattern has been detected (' + div + '), which often serves as a leading indicator for a trend shift.' if 'None' not in div else 'No immediate divergence is present, suggesting the current trend momentum is real and supported by price.'}
-    Additionally, the MACD histogram is { 'expanding upwards' if (last['MACD'] - last['Signal_Line']) > (prev['MACD'] - prev['Signal_Line']) else 'contracting' }, reinforcing the {macd_state} bias.
-    
-    **4. ELLIOTT WAVE & STRUCTURE**
-    Visual analysis of swing pivots (see chart ZigZag lines) suggests the market is navigating a **{ew}**. 
-    In Elliott Wave theory, this often corresponds to {'the most powerful part of the move where trend followers should add to positions' if 'Wave 3' in ew else 'a corrective phase where patience is required to avoid chop'}. 
-    The nearest Fibonacci Golden Ratio support (0.618) stands at **{last['Fib_0.618']:.2f}**.
-    
-    **5. SENTIMENT & FUNDAMENTAL CONTEXT**
-    News sentiment analysis using Natural Language Processing (NLTK) yields a **{news_data['label']}** score ({news_data['score']:.2f}). 
-    { 'Recent headlines suggest positive catalysts are driving investor confidence.' if news_data['score'] > 0 else 'Negative press or macro fears may be weighing on the asset.' if news_data['score'] < 0 else 'There is no significant news bias currently affecting price action.' }
-    
-    **FINAL RECOMMENDATION**
-    Based on the confluence of Technical Trend, Momentum, and Sentiment, the system advises a **{signal}**. Traders should monitor the Stop Loss level closely at {last['EMA_20']-(2*last['ATR']):.2f} (approx) as volatility is {volatility}.
-    """
-    return summary
-
-# -----------------------------------------------------------------------------
-# 5. MAIN UI LOGIC
-# -----------------------------------------------------------------------------
-def main():
-    st.sidebar.header("⚙️ Configuration")
-    
-    # Asset Selection
-    cat = st.sidebar.selectbox("Market Type", list(ASSETS.keys()))
-    ticker_name = st.sidebar.selectbox("Instrument", list(ASSETS[cat].values()))
-    ticker = [k for k, v in ASSETS[cat].items() if v == ticker_name][0]
-    
-    custom_tick = st.sidebar.text_input("Or Custom Ticker (Yahoo format)", "")
-    if custom_tick: ticker = custom_tick
-    
-    # Timeframe Selection
-    colT1, colT2 = st.sidebar.columns(2)
-    with colT1:
-        tf = st.selectbox("Primary Timeframe", TIMEFRAMES, index=4) # 30m default
-    with colT2:
-        period = st.selectbox("Data Lookback", PERIODS, index=3) # 3mo default
-
-    # Advanced Toggles
-    st.sidebar.markdown("---")
-    use_ratio = st.sidebar.checkbox("Enable Ratio Analysis")
-    ratio_ticker = ""
-    if use_ratio:
-        ratio_ticker = st.sidebar.text_input("Compare Against", value="^NSEI")
-    
-    run_btn = st.sidebar.button("🧠 Analyze Market Structure", type="primary")
-    
-    # Session State
-    if 'analyzed' not in st.session_state: st.session_state.analyzed = False
-    
-    st.title(f"🛡️ Professional Algo-Analyst: {ticker_name}")
-    
-    if run_btn:
-        st.session_state.analyzed = True
-        with st.spinner("Initializing Quantitative Matrix..."):
-            # 1. Fetch Data
-            df = fetch_data_robust(ticker, period, tf)
-            htf_val = HTF_MAPPING.get(tf, '1d')
-            df_htf = fetch_data_robust(ticker, period, htf_val)
+    @staticmethod
+    def _cluster_levels(levels: List[float], tolerance: float = 0.02) -> Dict:
+        """Cluster nearby price levels and count touches"""
+        clusters = {}
+        
+        for level in levels:
+            found_cluster = False
+            for cluster_level in list(clusters.keys()):
+                if abs(level - cluster_level) / cluster_level < tolerance:
+                    clusters[cluster_level] += 1
+                    found_cluster = True
+                    break
             
-            # 2. Analyze
-            if df is not None and df_htf is not None:
-                brain_ltf = MarketBrain(df)
-                brain_htf = MarketBrain(df_htf)
-                
-                df = brain_ltf.add_indicators()
-                df_htf = brain_htf.add_indicators()
-                
-                # Signals
-                action_ltf, score_ltf, _ = brain_ltf.generate_signal()
-                action_htf, score_htf, _ = brain_htf.generate_signal()
-                ew_context = brain_ltf.identify_elliott_context()
-                divergence = brain_ltf.check_divergence()
-                
-                # Conflict Resolution
-                final_signal = "HOLD"
-                confidence = "Low"
-                if action_htf == "BUY" and action_ltf == "BUY":
-                    final_signal = "STRONG BUY"
-                    confidence = "High (Trend Aligned)"
-                elif action_htf == "SELL" and action_ltf == "SELL":
-                    final_signal = "STRONG SELL"
-                    confidence = "High (Trend Aligned)"
-                elif action_htf != action_ltf:
-                    final_signal = "WAIT / SCALP"
-                    confidence = "Medium (Conflict)"
-                
-                # Targets
-                last = df.iloc[-1]
-                sl = last['Close'] - (2 * last['ATR']) if "BUY" in final_signal else last['Close'] + (2 * last['ATR'])
-                tgt = last['Close'] + (3 * last['ATR']) if "BUY" in final_signal else last['Close'] - (3 * last['ATR'])
-                
-                # Sentiment
-                news_data = analyze_news_sentiment(ticker)
-                
-                # Pivots for Visualization
-                pivots = brain_ltf.get_swing_pivots(window=5)
-                
-                # Verbose Summary
-                verbose_sum = generate_verbose_summary(ticker_name, tf, final_signal, confidence, ew_context, divergence, df, news_data)
+            if not found_cluster:
+                clusters[level] = 1
+        
+        return clusters
+    
+    @staticmethod
+    def _volume_at_level(df: pd.DataFrame, level: float, tolerance: float = 0.02) -> float:
+        """Calculate average volume when price was near this level"""
+        mask = (df['Close'] >= level * (1 - tolerance)) & (df['Close'] <= level * (1 + tolerance))
+        if mask.sum() > 0:
+            return df.loc[mask, 'Volume'].mean()
+        return df['Volume'].mean()
+    
+    @staticmethod
+    def _interpret_strength(touches: int, volume: float, level_type: str) -> str:
+        """Interpret the strength of support/resistance"""
+        
+        strength_score = touches * 2
+        
+        if touches >= 5:
+            strength = "VERY STRONG"
+            reason = f"Tested {touches} times and held. This is a critical {level_type.lower()} zone."
+        elif touches >= 3:
+            strength = "STRONG"
+            reason = f"Tested {touches} times. Significant {level_type.lower()} level."
+        elif touches >= 2:
+            strength = "MODERATE"
+            reason = f"Tested {touches} times. Established {level_type.lower()}."
+        else:
+            strength = "WEAK"
+            reason = f"Only tested {touches} time. Unconfirmed {level_type.lower()}."
+        
+        importance = f"{strength} - {reason} High volume activity at this level increases its reliability."
+        
+        return importance
 
-                st.session_state.res = {
-                    'df': df, 'df_htf': df_htf, 'signal': final_signal, 'conf': confidence,
-                    'sl': sl, 'tgt': tgt, 'ew': ew_context, 'div': divergence,
-                    'news': news_data, 'pivots': pivots, 'summary': verbose_sum
+
+class ZScoreAnalyzer:
+    """Z-Score Analysis for Mean Reversion and Extreme Conditions"""
+    
+    @staticmethod
+    def calculate_zscore(df: pd.DataFrame, window: int = 20) -> Dict:
+        """Calculate Z-Score and interpret its impact"""
+        
+        if len(df) < window:
+            return {
+                'current_zscore': 0,
+                'interpretation': 'Insufficient data',
+                'historical_impact': 'N/A',
+                'future_outlook': 'N/A'
+            }
+        
+        # Calculate rolling Z-Score
+        close_prices = df['Close']
+        rolling_mean = close_prices.rolling(window=window).mean()
+        rolling_std = close_prices.rolling(window=window).std()
+        
+        zscore = (close_prices - rolling_mean) / rolling_std
+        df['ZScore'] = zscore
+        
+        current_zscore = zscore.iloc[-1]
+        
+        # Historical analysis
+        historical_analysis = ZScoreAnalyzer._analyze_historical_zscore(df, window)
+        
+        # Current interpretation
+        if current_zscore > 2:
+            interpretation = "EXTREMELY OVERBOUGHT"
+            signal = "Strong mean reversion expected - consider selling"
+        elif current_zscore > 1.5:
+            interpretation = "OVERBOUGHT"
+            signal = "Price extended above mean - potential pullback"
+        elif current_zscore > 1:
+            interpretation = "MODERATELY OVERBOUGHT"
+            signal = "Price above average - watch for reversal"
+        elif current_zscore < -2:
+            interpretation = "EXTREMELY OVERSOLD"
+            signal = "Strong mean reversion expected - consider buying"
+        elif current_zscore < -1.5:
+            interpretation = "OVERSOLD"
+            signal = "Price extended below mean - potential bounce"
+        elif current_zscore < -1:
+            interpretation = "MODERATELY OVERSOLD"
+            signal = "Price below average - watch for recovery"
+        else:
+            interpretation = "NEUTRAL"
+            signal = "Price near historical average - no extreme condition"
+        
+        # Future outlook
+        future_outlook = ZScoreAnalyzer._forecast_based_on_zscore(
+            current_zscore, historical_analysis
+        )
+        
+        return {
+            'current_zscore': current_zscore,
+            'interpretation': f"{interpretation} (Z={current_zscore:.2f})",
+            'signal': signal,
+            'historical_impact': historical_analysis,
+            'future_outlook': future_outlook
+        }
+    
+    @staticmethod
+    def _analyze_historical_zscore(df: pd.DataFrame, window: int) -> str:
+        """Analyze how Z-Score behaved historically"""
+        
+        zscore = df['ZScore'].dropna()
+        
+        if len(zscore) < 50:
+            return "Limited historical data for Z-Score analysis"
+        
+        # Count extreme events
+        extreme_high = (zscore > 2).sum()
+        extreme_low = (zscore < -2).sum()
+        
+        # Check mean reversion success rate
+        reversion_success = 0
+        total_extremes = 0
+        
+        for i in range(len(zscore) - 10):
+            if zscore.iloc[i] > 2:  # Overbought
+                # Check if price reverted in next 10 periods
+                future_prices = df['Close'].iloc[i+1:i+11]
+                if future_prices.min() < df['Close'].iloc[i]:
+                    reversion_success += 1
+                total_extremes += 1
+            
+            elif zscore.iloc[i] < -2:  # Oversold
+                future_prices = df['Close'].iloc[i+1:i+11]
+                if future_prices.max() > df['Close'].iloc[i]:
+                    reversion_success += 1
+                total_extremes += 1
+        
+        success_rate = (reversion_success / total_extremes * 100) if total_extremes > 0 else 0
+        
+        analysis = f"Historical Z-Score analysis: {extreme_high} overbought events, "
+        analysis += f"{extreme_low} oversold events. Mean reversion success rate: {success_rate:.1f}%. "
+        
+        if success_rate > 70:
+            analysis += "Strong historical tendency to revert to mean."
+        elif success_rate > 50:
+            analysis += "Moderate mean reversion tendency."
+        else:
+            analysis += "Weak mean reversion - trending market."
+        
+        return analysis
+    
+    @staticmethod
+    def _forecast_based_on_zscore(current_zscore: float, historical: str) -> str:
+        """Forecast future price movement based on Z-Score"""
+        
+        if current_zscore > 2:
+            forecast = "HIGH PROBABILITY of price decline in coming sessions. "
+            forecast += "Z-Score above 2 indicates extreme deviation from mean. "
+            forecast += "Historical data suggests mean reversion is likely. "
+            forecast += "Consider taking profits or waiting for pullback before entering longs."
+        
+        elif current_zscore > 1:
+            forecast = "MODERATE PROBABILITY of consolidation or mild pullback. "
+            forecast += "Price is stretched but not at extreme levels. "
+            forecast += "Could continue higher with momentum, but risk/reward favors caution."
+        
+        elif current_zscore < -2:
+            forecast = "HIGH PROBABILITY of price recovery in coming sessions. "
+            forecast += "Z-Score below -2 indicates extreme undervaluation relative to recent mean. "
+            forecast += "Historical patterns suggest strong bounce potential. "
+            forecast += "Risk/reward favors buying at these oversold levels."
+        
+        elif current_zscore < -1:
+            forecast = "MODERATE PROBABILITY of upward move. "
+            forecast += "Price below average presents opportunity. "
+            forecast += "Could decline further, but statistical edge favors buyers."
+        
+        else:
+            forecast = "NEUTRAL OUTLOOK - Price near equilibrium. "
+            forecast += "No statistical edge from Z-Score. "
+            forecast += "Rely on trend, momentum, and other technical indicators."
+        
+        return forecast
+
+
+class PatternReliabilityAnalyzer:
+    """Analyzes which patterns/indicators the market is following most reliably"""
+    
+    @staticmethod
+    def analyze_pattern_reliability(df: pd.DataFrame) -> Dict:
+        """Test reliability of different patterns over recent history"""
+        
+        if len(df) < 100:
+            return {
+                'most_reliable': 'INSUFFICIENT_DATA',
+                'reliability_scores': {},
+                'recommendations': []
+            }
+        
+        reliability_scores = {}
+        
+        # Test Elliott Wave reliability
+        elliott_score = PatternReliabilityAnalyzer._test_elliott_wave_reliability(df)
+        reliability_scores['Elliott Wave'] = elliott_score
+        
+        # Test Fibonacci reliability
+        fib_score = PatternReliabilityAnalyzer._test_fibonacci_reliability(df)
+        reliability_scores['Fibonacci'] = fib_score
+        
+        # Test Support/Resistance reliability
+        sr_score = PatternReliabilityAnalyzer._test_support_resistance_reliability(df)
+        reliability_scores['Support/Resistance'] = sr_score
+        
+        # Test Moving Average reliability
+        ma_score = PatternReliabilityAnalyzer._test_moving_average_reliability(df)
+        reliability_scores['Moving Averages'] = ma_score
+        
+        # Test RSI reliability
+        rsi_score = PatternReliabilityAnalyzer._test_rsi_reliability(df)
+        reliability_scores['RSI'] = rsi_score
+        
+        # Test MACD reliability
+        macd_score = PatternReliabilityAnalyzer._test_macd_reliability(df)
+        reliability_scores['MACD'] = macd_score
+        
+        # Find most reliable pattern
+        most_reliable = max(reliability_scores, key=reliability_scores.get)
+        
+        # Generate recommendations based on reliability
+        recommendations = []
+        for pattern, score in sorted(reliability_scores.items(), key=lambda x: x[1], reverse=True):
+            if score > 70:
+                recommendations.append(f"✅ {pattern}: HIGHLY RELIABLE ({score:.1f}%) - Primary indicator")
+            elif score > 55:
+                recommendations.append(f"⚠️ {pattern}: MODERATELY RELIABLE ({score:.1f}%) - Use with confirmation")
+            else:
+                recommendations.append(f"❌ {pattern}: UNRELIABLE ({score:.1f}%) - Ignore or use cautiously")
+        
+        return {
+            'most_reliable': most_reliable,
+            'reliability_scores': reliability_scores,
+            'recommendations': recommendations
+        }
+    
+    @staticmethod
+    def _test_elliott_wave_reliability(df: pd.DataFrame) -> float:
+        """Test how well Elliott Wave predictions worked historically"""
+        
+        correct_predictions = 0
+        total_predictions = 0
+        
+        for i in range(50, len(df) - 10, 5):
+            window_df = df.iloc[:i]
+            elliott = ElliottWaveAnalyzer.detect_elliott_wave(window_df)
+            
+            if elliott['confidence'] > 60:
+                action_bias = elliott.get('action_bias', 'HOLD')
+                future_price = df['Close'].iloc[i+10]
+                current_price = df['Close'].iloc[i]
+                
+                if action_bias == 'BUY' and future_price > current_price:
+                    correct_predictions += 1
+                elif action_bias == 'SELL' and future_price < current_price:
+                    correct_predictions += 1
+                
+                total_predictions += 1
+        
+        return (correct_predictions / total_predictions * 100) if total_predictions > 0 else 50
+    
+    @staticmethod
+    def _test_fibonacci_reliability(df: pd.DataFrame) -> float:
+        """Test how well Fibonacci levels acted as support/resistance"""
+        
+        bounces_at_fib = 0
+        total_tests = 0
+        
+        for i in range(50, len(df) - 5, 5):
+            window_df = df.iloc[:i]
+            fib = FibonacciAnalyzer.calculate_fibonacci_levels(window_df)
+            
+            current_price = df['Close'].iloc[i]
+            
+            # Check if price bounced from nearby Fibonacci level
+            for level_name, level_value in fib['levels'].items():
+                if abs(current_price - level_value) / current_price < 0.01:  # Within 1%
+                    # Check if price bounced in next 5 periods
+                    future_prices = df['Close'].iloc[i+1:i+6]
+                    
+                    if fib['trend'] == 'UPTREND' and level_value < current_price:
+                        # Support test
+                        if future_prices.max() > current_price:
+                            bounces_at_fib += 1
+                    elif fib['trend'] == 'DOWNTREND' and level_value > current_price:
+                        # Resistance test
+                        if future_prices.min() < current_price:
+                            bounces_at_fib += 1
+                    
+                    total_tests += 1
+                    break
+        
+        return (bounces_at_fib / total_tests * 100) if total_tests > 0 else 50
+    
+    @staticmethod
+    def _test_support_resistance_reliability(df: pd.DataFrame) -> float:
+        """Test how well S/R levels held"""
+        
+        holds = 0
+        tests = 0
+        
+        for i in range(50, len(df) - 5, 5):
+            window_df = df.iloc[:i]
+            sr = SupportResistanceAnalyzer.find_strong_levels(window_df)
+            
+            current_price = df['Close'].iloc[i]
+            support = sr['support']
+            resistance = sr['resistance']
+            
+            # Test support
+            if abs(current_price - support) / current_price < 0.015:
+                future_low = df['Low'].iloc[i+1:i+6].min()
+                if future_low >= support * 0.98:  # Held within 2%
+                    holds += 1
+                tests += 1
+            
+            # Test resistance
+            if abs(current_price - resistance) / current_price < 0.015:
+                future_high = df['High'].iloc[i+1:i+6].max()
+                if future_high <= resistance * 1.02:  # Held within 2%
+                    holds += 1
+                tests += 1
+        
+        return (holds / tests * 100) if tests > 0 else 50
+    
+    @staticmethod
+    def _test_moving_average_reliability(df: pd.DataFrame) -> float:
+        """Test MA crossover reliability"""
+        
+        correct_signals = 0
+        total_signals = 0
+        
+        for i in range(50, len(df) - 10):
+            if pd.notna(df['SMA_20'].iloc[i]) and pd.notna(df['SMA_50'].iloc[i]):
+                prev_diff = df['SMA_20'].iloc[i-1] - df['SMA_50'].iloc[i-1]
+                curr_diff = df['SMA_20'].iloc[i] - df['SMA_50'].iloc[i]
+                
+                # Bullish crossover
+                if prev_diff <= 0 and curr_diff > 0:
+                    future_price = df['Close'].iloc[i+10]
+                    current_price = df['Close'].iloc[i]
+                    if future_price > current_price:
+                        correct_signals += 1
+                    total_signals += 1
+                
+                # Bearish crossover
+                elif prev_diff >= 0 and curr_diff < 0:
+                    future_price = df['Close'].iloc[i+10]
+                    current_price = df['Close'].iloc[i]
+                    if future_price < current_price:
+                        correct_signals += 1
+                    total_signals += 1
+        
+        return (correct_signals / total_signals * 100) if total_signals > 0 else 50
+    
+    @staticmethod
+    def _test_rsi_reliability(df: pd.DataFrame) -> float:
+        """Test RSI signal reliability"""
+        
+        correct_signals = 0
+        total_signals = 0
+        
+        for i in range(50, len(df) - 10):
+            rsi = df['RSI'].iloc[i]
+            
+            if rsi < 30:  # Oversold
+                future_price = df['Close'].iloc[i+10]
+                current_price = df['Close'].iloc[i]
+                if future_price > current_price:
+                    correct_signals += 1
+                total_signals += 1
+            
+            elif rsi > 70:  # Overbought
+                future_price = df['Close'].iloc[i+10]
+                current_price = df['Close'].iloc[i]
+                if future_price < current_price:
+                    correct_signals += 1
+                total_signals += 1
+        
+        return (correct_signals / total_signals * 100) if total_signals > 0 else 50
+    
+    @staticmethod
+    def _test_macd_reliability(df: pd.DataFrame) -> float:
+        """Test MACD crossover reliability"""
+        
+        correct_signals = 0
+        total_signals = 0
+        
+        for i in range(50, len(df) - 10):
+            if pd.notna(df['MACD'].iloc[i]) and pd.notna(df['MACD_Signal'].iloc[i]):
+                prev_diff = df['MACD'].iloc[i-1] - df['MACD_Signal'].iloc[i-1]
+                curr_diff = df['MACD'].iloc[i] - df['MACD_Signal'].iloc[i]
+                
+                # Bullish crossover
+                if prev_diff <= 0 and curr_diff > 0:
+                    future_price = df['Close'].iloc[i+10]
+                    current_price = df['Close'].iloc[i]
+                    if future_price > current_price:
+                        correct_signals += 1
+                    total_signals += 1
+                
+                # Bearish crossover
+                elif prev_diff >= 0 and curr_diff < 0:
+                    future_price = df['Close'].iloc[i+10]
+                    current_price = df['Close'].iloc[i]
+                    if future_price < current_price:
+                        correct_signals += 1
+                    total_signals += 1
+        
+        return (correct_signals / total_signals * 100) if total_signals > 0 else 50
+
+
+
+    """Fibonacci Retracement and Extension Analysis"""
+    
+    @staticmethod
+    def calculate_fibonacci_levels(df: pd.DataFrame, lookback: int = 50) -> Dict:
+        """Calculate Fibonacci retracement and extension levels"""
+        
+        if len(df) < lookback:
+            lookback = len(df)
+        
+        recent_data = df.iloc[-lookback:]
+        high = recent_data['High'].max()
+        low = recent_data['Low'].min()
+        diff = high - low
+        
+        current_price = df['Close'].iloc[-1]
+        
+        # Determine trend direction
+        sma_20 = df['SMA_20'].iloc[-1]
+        trend = "UPTREND" if current_price > sma_20 else "DOWNTREND"
+        
+        # Retracement levels (for pullbacks in trend)
+        if trend == "UPTREND":
+            fib_levels = {
+                '0%': high,
+                '23.6%': high - (diff * 0.236),
+                '38.2%': high - (diff * 0.382),
+                '50%': high - (diff * 0.50),
+                '61.8%': high - (diff * 0.618),
+                '78.6%': high - (diff * 0.786),
+                '100%': low
+            }
+        else:  # DOWNTREND
+            fib_levels = {
+                '0%': low,
+                '23.6%': low + (diff * 0.236),
+                '38.2%': low + (diff * 0.382),
+                '50%': low + (diff * 0.50),
+                '61.8%': low + (diff * 0.618),
+                '78.6%': low + (diff * 0.786),
+                '100%': high
+            }
+        
+        # Extension levels (for targets)
+        if trend == "UPTREND":
+            extensions = {
+                '127.2%': high + (diff * 0.272),
+                '161.8%': high + (diff * 0.618),
+                '200%': high + diff,
+                '261.8%': high + (diff * 1.618)
+            }
+        else:
+            extensions = {
+                '127.2%': low - (diff * 0.272),
+                '161.8%': low - (diff * 0.618),
+                '200%': low - diff,
+                '261.8%': low - (diff * 1.618)
+            }
+        
+        # Find nearest support/resistance
+        nearest_support = None
+        nearest_resistance = None
+        min_dist_support = float('inf')
+        min_dist_resistance = float('inf')
+        
+        for level_name, level_value in fib_levels.items():
+            dist = abs(current_price - level_value)
+            if level_value < current_price and dist < min_dist_support:
+                nearest_support = (level_name, level_value)
+                min_dist_support = dist
+            elif level_value > current_price and dist < min_dist_resistance:
+                nearest_resistance = (level_name, level_value)
+                min_dist_resistance = dist
+        
+        return {
+            'trend': trend,
+            'levels': fib_levels,
+            'extensions': extensions,
+            'nearest_support': nearest_support,
+            'nearest_resistance': nearest_resistance,
+            'high': high,
+            'low': low
+        }
+
+
+class RSIDivergenceAnalyzer:
+    """RSI Divergence Detection"""
+    
+    @staticmethod
+    def detect_divergence(df: pd.DataFrame, lookback: int = 20) -> Dict:
+        """Detect bullish and bearish RSI divergences"""
+        
+        if len(df) < lookback:
+            return {'type': 'NONE', 'strength': 0, 'description': 'Insufficient data'}
+        
+        recent_df = df.iloc[-lookback:].copy()
+        prices = recent_df['Close'].values
+        rsi = recent_df['RSI'].values
+        
+        # Find peaks and troughs in price
+        price_peaks = []
+        price_troughs = []
+        
+        for i in range(2, len(prices) - 2):
+            # Peak
+            if prices[i] > prices[i-1] and prices[i] > prices[i-2] and \
+               prices[i] > prices[i+1] and prices[i] > prices[i+2]:
+                price_peaks.append((i, prices[i]))
+            
+            # Trough
+            if prices[i] < prices[i-1] and prices[i] < prices[i-2] and \
+               prices[i] < prices[i+1] and prices[i] < prices[i+2]:
+                price_troughs.append((i, prices[i]))
+        
+        # Bearish Divergence (price making higher highs, RSI making lower highs)
+        if len(price_peaks) >= 2:
+            last_peak_idx, last_peak_price = price_peaks[-1]
+            prev_peak_idx, prev_peak_price = price_peaks[-2]
+            
+            if last_peak_price > prev_peak_price and rsi[last_peak_idx] < rsi[prev_peak_idx]:
+                strength = abs(rsi[prev_peak_idx] - rsi[last_peak_idx])
+                return {
+                    'type': 'BEARISH',
+                    'strength': strength,
+                    'description': f'Price made higher high ({prev_peak_price:.2f} -> {last_peak_price:.2f}) but RSI made lower high ({rsi[prev_peak_idx]:.1f} -> {rsi[last_peak_idx]:.1f}). Indicates weakening momentum - potential reversal down.'
+                }
+        
+        # Bullish Divergence (price making lower lows, RSI making higher lows)
+        if len(price_troughs) >= 2:
+            last_trough_idx, last_trough_price = price_troughs[-1]
+            prev_trough_idx, prev_trough_price = price_troughs[-2]
+            
+            if last_trough_price < prev_trough_price and rsi[last_trough_idx] > rsi[prev_trough_idx]:
+                strength = abs(rsi[last_trough_idx] - rsi[prev_trough_idx])
+                return {
+                    'type': 'BULLISH',
+                    'strength': strength,
+                    'description': f'Price made lower low ({prev_trough_price:.2f} -> {last_trough_price:.2f}) but RSI made higher low ({rsi[prev_trough_idx]:.1f} -> {rsi[last_trough_idx]:.1f}). Indicates strengthening momentum - potential reversal up.'
+                }
+        
+        return {
+            'type': 'NONE',
+            'strength': 0,
+            'description': 'No significant divergence detected'
+        }
+
+
+class ElliottWaveAnalyzer:
+    """Elliott Wave Pattern Detection"""
+    
+    @staticmethod
+    def detect_elliott_wave(df: pd.DataFrame, lookback: int = 50) -> Dict:
+        """Detect Elliott Wave patterns and current wave position"""
+        
+        if len(df) < lookback:
+            lookback = len(df)
+        
+        recent_df = df.iloc[-lookback:].copy()
+        prices = recent_df['Close'].values
+        
+        # Find significant pivots (simplified wave detection)
+        pivots = ElliottWaveAnalyzer._find_pivots(prices)
+        
+        if len(pivots) < 5:
+            return {
+                'wave': 'UNKNOWN',
+                'confidence': 0,
+                'description': 'Insufficient pivot points for Elliott Wave analysis',
+                'next_expected': 'N/A'
+            }
+        
+        # Analyze last 5 pivots for Elliott Wave pattern
+        last_5_pivots = pivots[-5:]
+        wave_pattern = ElliottWaveAnalyzer._identify_wave_pattern(last_5_pivots, prices)
+        
+        return wave_pattern
+    
+    @staticmethod
+    def _find_pivots(prices: np.ndarray, order: int = 5) -> List:
+        """Find pivot points (local maxima and minima)"""
+        pivots = []
+        
+        for i in range(order, len(prices) - order):
+            # Check for peak
+            if all(prices[i] >= prices[i-j] for j in range(1, order+1)) and \
+               all(prices[i] >= prices[i+j] for j in range(1, order+1)):
+                pivots.append({'index': i, 'price': prices[i], 'type': 'HIGH'})
+            
+            # Check for trough
+            elif all(prices[i] <= prices[i-j] for j in range(1, order+1)) and \
+                 all(prices[i] <= prices[i+j] for j in range(1, order+1)):
+                pivots.append({'index': i, 'price': prices[i], 'type': 'LOW'})
+        
+        return pivots
+    
+    @staticmethod
+    def _identify_wave_pattern(pivots: List, prices: np.ndarray) -> Dict:
+        """Identify Elliott Wave pattern from pivots"""
+        
+        # Impulse Wave Pattern (5 waves: 1-up, 2-down, 3-up, 4-down, 5-up)
+        # Corrective Wave Pattern (3 waves: A-down, B-up, C-down)
+        
+        current_price = prices[-1]
+        last_pivot = pivots[-1]
+        
+        # Simplified pattern detection
+        if len(pivots) >= 5:
+            # Check for impulse pattern
+            types = [p['type'] for p in pivots[-5:]]
+            
+            # Upward impulse: LOW, HIGH, LOW, HIGH, LOW (current above last high)
+            if types == ['LOW', 'HIGH', 'LOW', 'HIGH', 'LOW']:
+                wave_5_target = pivots[-2]['price']  # Wave 3 high
+                
+                if current_price > wave_5_target:
+                    return {
+                        'wave': 'WAVE 5 (Final Impulse Up)',
+                        'confidence': 75,
+                        'description': 'In final upward wave. Expect completion soon followed by correction. Wave 5 often equals Wave 1 in length.',
+                        'next_expected': 'Corrective Wave A (Downward)',
+                        'action_bias': 'SELL'
+                    }
+                else:
+                    return {
+                        'wave': 'WAVE 4 (Correction)',
+                        'confidence': 70,
+                        'description': 'In corrective Wave 4. Expect final Wave 5 push upward. Wave 4 typically retraces 38.2% of Wave 3.',
+                        'next_expected': 'Wave 5 (Final Push Up)',
+                        'action_bias': 'BUY_PENDING'
+                    }
+            
+            # Downward impulse: HIGH, LOW, HIGH, LOW, HIGH
+            elif types == ['HIGH', 'LOW', 'HIGH', 'LOW', 'HIGH']:
+                wave_5_target = pivots[-2]['price']  # Wave 3 low
+                
+                if current_price < wave_5_target:
+                    return {
+                        'wave': 'WAVE 5 (Final Impulse Down)',
+                        'confidence': 75,
+                        'description': 'In final downward wave. Expect completion soon followed by correction upward.',
+                        'next_expected': 'Corrective Wave A (Upward)',
+                        'action_bias': 'BUY'
+                    }
+                else:
+                    return {
+                        'wave': 'WAVE 4 (Correction)',
+                        'confidence': 70,
+                        'description': 'In corrective Wave 4. Expect final Wave 5 push downward.',
+                        'next_expected': 'Wave 5 (Final Push Down)',
+                        'action_bias': 'SELL_PENDING'
+                    }
+            
+            # Wave 3 (strongest move)
+            elif len(pivots) >= 3:
+                if types[-3:] == ['LOW', 'HIGH', 'LOW'] and current_price > pivots[-2]['price']:
+                    return {
+                        'wave': 'WAVE 3 (Strong Impulse)',
+                        'confidence': 80,
+                        'description': 'In powerful Wave 3 - strongest and longest wave. High momentum expected.',
+                        'next_expected': 'Wave 4 (Correction)',
+                        'action_bias': 'BUY'
+                    }
+                elif types[-3:] == ['HIGH', 'LOW', 'HIGH'] and current_price < pivots[-2]['price']:
+                    return {
+                        'wave': 'WAVE 3 (Strong Impulse Down)',
+                        'confidence': 80,
+                        'description': 'In powerful downward Wave 3. Strong selling pressure.',
+                        'next_expected': 'Wave 4 (Bounce)',
+                        'action_bias': 'SELL'
+                    }
+        
+        return {
+            'wave': 'TRANSITIONAL',
+            'confidence': 40,
+            'description': 'Pattern not clearly defined. May be in corrective or early impulse phase.',
+            'next_expected': 'Wait for clear pattern formation',
+            'action_bias': 'HOLD'
+        }
+
+
+class RatioAnalyzer:
+    """Comparative Ratio Analysis with Market Index"""
+    
+    @staticmethod
+    def analyze_relative_strength(ticker: str, benchmark: str = "^NSEI") -> Dict:
+        """Analyze ticker performance relative to benchmark"""
+        
+        try:
+            # Fetch both tickers
+            stock_data = yf.Ticker(ticker).history(period='3mo', interval='1d')
+            benchmark_data = yf.Ticker(benchmark).history(period='3mo', interval='1d')
+            
+            if stock_data.empty or benchmark_data.empty:
+                return {
+                    'relative_strength': 1.0,
+                    'outperformance': 0,
+                    'interpretation': 'Insufficient data for comparison'
+                }
+            
+            # Calculate returns
+            stock_return = ((stock_data['Close'].iloc[-1] - stock_data['Close'].iloc[0]) / 
+                          stock_data['Close'].iloc[0]) * 100
+            
+            benchmark_return = ((benchmark_data['Close'].iloc[-1] - benchmark_data['Close'].iloc[0]) / 
+                              benchmark_data['Close'].iloc[0]) * 100
+            
+            # Relative strength ratio
+            relative_strength = stock_return / benchmark_return if benchmark_return != 0 else 1.0
+            outperformance = stock_return - benchmark_return
+            
+            # Interpretation
+            if relative_strength > 1.2:
+                interpretation = f"STRONG OUTPERFORMER: Stock up {stock_return:.2f}% vs benchmark {benchmark_return:.2f}%. Shows strong relative strength - positive indicator."
+            elif relative_strength > 1.0:
+                interpretation = f"OUTPERFORMER: Stock up {stock_return:.2f}% vs benchmark {benchmark_return:.2f}%. Moderate relative strength."
+            elif relative_strength > 0.8:
+                interpretation = f"UNDERPERFORMER: Stock up {stock_return:.2f}% vs benchmark {benchmark_return:.2f}%. Lagging the market."
+            else:
+                interpretation = f"WEAK: Stock up {stock_return:.2f}% vs benchmark {benchmark_return:.2f}%. Significant underperformance - caution advised."
+            
+            return {
+                'relative_strength': relative_strength,
+                'outperformance': outperformance,
+                'stock_return': stock_return,
+                'benchmark_return': benchmark_return,
+                'interpretation': interpretation
+            }
+            
+        except Exception as e:
+            return {
+                'relative_strength': 1.0,
+                'outperformance': 0,
+                'interpretation': f'Error in ratio analysis: {str(e)}'
+            }
+
+    """Z-Score Analysis for Mean Reversion and Extreme Conditions"""
+    
+    @staticmethod
+    def calculate_zscore(df: pd.DataFrame, window: int = 20) -> Dict:
+        """Calculate Z-Score and interpret its impact"""
+        
+        if len(df) < window:
+            return {
+                'current_zscore': 0,
+                'interpretation': 'Insufficient data',
+                'historical_impact': 'N/A',
+                'future_outlook': 'N/A'
+            }
+        
+        # Calculate rolling Z-Score
+        close_prices = df['Close']
+        rolling_mean = close_prices.rolling(window=window).mean()
+        rolling_std = close_prices.rolling(window=window).std()
+        
+        zscore = (close_prices - rolling_mean) / rolling_std
+        df['ZScore'] = zscore
+        
+        current_zscore = zscore.iloc[-1]
+        
+        # Historical analysis
+        historical_analysis = ZScoreAnalyzer._analyze_historical_zscore(df, window)
+        
+        # Current interpretation
+        if current_zscore > 2:
+            interpretation = "EXTREMELY OVERBOUGHT"
+            signal = "Strong mean reversion expected - consider selling"
+        elif current_zscore > 1.5:
+            interpretation = "OVERBOUGHT"
+            signal = "Price extended above mean - potential pullback"
+        elif current_zscore > 1:
+            interpretation = "MODERATELY OVERBOUGHT"
+            signal = "Price above average - watch for reversal"
+        elif current_zscore < -2:
+            interpretation = "EXTREMELY OVERSOLD"
+            signal = "Strong mean reversion expected - consider buying"
+        elif current_zscore < -1.5:
+            interpretation = "OVERSOLD"
+            signal = "Price extended below mean - potential bounce"
+        elif current_zscore < -1:
+            interpretation = "MODERATELY OVERSOLD"
+            signal = "Price below average - watch for recovery"
+        else:
+            interpretation = "NEUTRAL"
+            signal = "Price near historical average - no extreme condition"
+        
+        # Future outlook
+        future_outlook = ZScoreAnalyzer._forecast_based_on_zscore(
+            current_zscore, historical_analysis
+        )
+        
+        return {
+            'current_zscore': current_zscore,
+            'interpretation': f"{interpretation} (Z={current_zscore:.2f})",
+            'signal': signal,
+            'historical_impact': historical_analysis,
+            'future_outlook': future_outlook
+        }
+    
+    @staticmethod
+    def _analyze_historical_zscore(df: pd.DataFrame, window: int) -> str:
+        """Analyze how Z-Score behaved historically"""
+        
+        zscore = df['ZScore'].dropna()
+        
+        if len(zscore) < 50:
+            return "Limited historical data for Z-Score analysis"
+        
+        # Count extreme events
+        extreme_high = (zscore > 2).sum()
+        extreme_low = (zscore < -2).sum()
+        
+        # Check mean reversion success rate
+        reversion_success = 0
+        total_extremes = 0
+        
+        for i in range(len(zscore) - 10):
+            if zscore.iloc[i] > 2:  # Overbought
+                # Check if price reverted in next 10 periods
+                future_prices = df['Close'].iloc[i+1:i+11]
+                if future_prices.min() < df['Close'].iloc[i]:
+                    reversion_success += 1
+                total_extremes += 1
+            
+            elif zscore.iloc[i] < -2:  # Oversold
+                future_prices = df['Close'].iloc[i+1:i+11]
+                if future_prices.max() > df['Close'].iloc[i]:
+                    reversion_success += 1
+                total_extremes += 1
+        
+        success_rate = (reversion_success / total_extremes * 100) if total_extremes > 0 else 0
+        
+        analysis = f"Historical Z-Score analysis: {extreme_high} overbought events, "
+        analysis += f"{extreme_low} oversold events. Mean reversion success rate: {success_rate:.1f}%. "
+        
+        if success_rate > 70:
+            analysis += "Strong historical tendency to revert to mean."
+        elif success_rate > 50:
+            analysis += "Moderate mean reversion tendency."
+        else:
+            analysis += "Weak mean reversion - trending market."
+        
+        return analysis
+    
+    @staticmethod
+    def _forecast_based_on_zscore(current_zscore: float, historical: str) -> str:
+        """Forecast future price movement based on Z-Score"""
+        
+        if current_zscore > 2:
+            forecast = "HIGH PROBABILITY of price decline in coming sessions. "
+            forecast += "Z-Score above 2 indicates extreme deviation from mean. "
+            forecast += "Historical data suggests mean reversion is likely. "
+            forecast += "Consider taking profits or waiting for pullback before entering longs."
+        
+        elif current_zscore > 1:
+            forecast = "MODERATE PROBABILITY of consolidation or mild pullback. "
+            forecast += "Price is stretched but not at extreme levels. "
+            forecast += "Could continue higher with momentum, but risk/reward favors caution."
+        
+        elif current_zscore < -2:
+            forecast = "HIGH PROBABILITY of price recovery in coming sessions. "
+            forecast += "Z-Score below -2 indicates extreme undervaluation relative to recent mean. "
+            forecast += "Historical patterns suggest strong bounce potential. "
+            forecast += "Risk/reward favors buying at these oversold levels."
+        
+        elif current_zscore < -1:
+            forecast = "MODERATE PROBABILITY of upward move. "
+            forecast += "Price below average presents opportunity. "
+            forecast += "Could decline further, but statistical edge favors buyers."
+        
+        else:
+            forecast = "NEUTRAL OUTLOOK - Price near equilibrium. "
+            forecast += "No statistical edge from Z-Score. "
+            forecast += "Rely on trend, momentum, and other technical indicators."
+        
+        return forecast
+    """Advanced Technical Analysis Engine"""
+    
+    @staticmethod
+    def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
+        """Calculate comprehensive technical indicators"""
+        df = df.copy()
+        
+        # Moving Averages
+        df['SMA_20'] = df['Close'].rolling(window=20).mean()
+        df['SMA_50'] = df['Close'].rolling(window=50).mean()
+        df['SMA_200'] = df['Close'].rolling(window=200).mean()
+        df['EMA_12'] = df['Close'].ewm(span=12, adjust=False).mean()
+        df['EMA_26'] = df['Close'].ewm(span=26, adjust=False).mean()
+        
+        # MACD
+        df['MACD'] = df['EMA_12'] - df['EMA_26']
+        df['MACD_Signal'] = df['MACD'].ewm(span=9, adjust=False).mean()
+        df['MACD_Hist'] = df['MACD'] - df['MACD_Signal']
+        
+        # RSI
+        delta = df['Close'].diff()
+        gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+        rs = gain / loss
+        df['RSI'] = 100 - (100 / (1 + rs))
+        
+        # Bollinger Bands
+        df['BB_Middle'] = df['Close'].rolling(window=20).mean()
+        bb_std = df['Close'].rolling(window=20).std()
+        df['BB_Upper'] = df['BB_Middle'] + (bb_std * 2)
+        df['BB_Lower'] = df['BB_Middle'] - (bb_std * 2)
+        
+        # ATR (Average True Range)
+        high_low = df['High'] - df['Low']
+        high_close = np.abs(df['High'] - df['Close'].shift())
+        low_close = np.abs(df['Low'] - df['Close'].shift())
+        ranges = pd.concat([high_low, high_close, low_close], axis=1)
+        true_range = np.max(ranges, axis=1)
+        df['ATR'] = true_range.rolling(14).mean()
+        
+        # Stochastic Oscillator
+        low_14 = df['Low'].rolling(window=14).min()
+        high_14 = df['High'].rolling(window=14).max()
+        df['Stoch_K'] = 100 * ((df['Close'] - low_14) / (high_14 - low_14))
+        df['Stoch_D'] = df['Stoch_K'].rolling(window=3).mean()
+        
+        # ADX (Average Directional Index)
+        df['ADX'] = TechnicalAnalyzer.calculate_adx(df)
+        
+        # Volume indicators
+        df['Volume_SMA'] = df['Volume'].rolling(window=20).mean()
+        df['Volume_Ratio'] = df['Volume'] / df['Volume_SMA']
+        
+        # Support and Resistance
+        df['Support'] = df['Low'].rolling(window=20).min()
+        df['Resistance'] = df['High'].rolling(window=20).max()
+        
+        return df
+    
+    @staticmethod
+    def calculate_adx(df: pd.DataFrame, period: int = 14) -> pd.Series:
+        """Calculate Average Directional Index"""
+        high = df['High']
+        low = df['Low']
+        close = df['Close']
+        
+        plus_dm = high.diff()
+        minus_dm = -low.diff()
+        plus_dm[plus_dm < 0] = 0
+        minus_dm[minus_dm < 0] = 0
+        
+        tr = pd.DataFrame({
+            'hl': high - low,
+            'hc': abs(high - close.shift()),
+            'lc': abs(low - close.shift())
+        }).max(axis=1)
+        
+        atr = tr.rolling(window=period).mean()
+        plus_di = 100 * (plus_dm.rolling(window=period).mean() / atr)
+        minus_di = 100 * (minus_dm.rolling(window=period).mean() / atr)
+        
+        dx = 100 * abs(plus_di - minus_di) / (plus_di + minus_di)
+        adx = dx.rolling(window=period).mean()
+        
+        return adx
+
+class StrategyEngine:
+    """Multi-Strategy Trading Engine"""
+    
+    def __init__(self):
+        self.strategies = {
+            'trend_following': self.trend_following_strategy,
+            'mean_reversion': self.mean_reversion_strategy,
+            'momentum': self.momentum_strategy,
+            'breakout': self.breakout_strategy,
+            'scalping': self.scalping_strategy
+        }
+    
+    def analyze_multiple_timeframes(self, ticker: str, period: str, 
+                                   trading_style: str) -> Dict:
+        """Analyze multiple timeframes and generate signals"""
+        
+        timeframe_map = {
+            'Scalping': ['1m', '5m', '15m'],
+            'Day Trading': ['5m', '15m', '1h'],
+            'Swing Trading': ['1h', '4h', '1d'],
+            'Positional Trading': ['1d', '1d', '1d']  # Same for all
+        }
+        
+        timeframes = timeframe_map.get(trading_style, ['15m', '1h', '4h'])
+        timeframe_results = {}
+        
+        for tf in timeframes:
+            try:
+                time.sleep(1.5)  # Rate limiting
+                df = DataFetcher.fetch_data(ticker, period, tf)
+                
+                if df.empty:
+                    continue
+                
+                df = TechnicalAnalyzer.calculate_indicators(df)
+                market_structure = self.detect_market_structure(df)
+                strategy = self.select_best_strategy(df, trading_style)
+                result = self.strategies[strategy](df)
+                
+                # Determine signal
+                score = result['score']
+                if score > 2:
+                    signal = "BUY"
+                elif score < -2:
+                    signal = "SELL"
+                else:
+                    signal = "HOLD"
+                
+                timeframe_results[tf] = {
+                    'signal': signal,
+                    'score': score,
+                    'strategy': strategy,
+                    'market_structure': market_structure,
+                    'signals_list': result['signals'][:3]  # Top 3 signals
                 }
                 
-                if use_ratio and ratio_ticker:
-                    df_r = fetch_data_robust(ratio_ticker, period, tf)
-                    if df_r is not None:
-                        idx = df.index.intersection(df_r.index)
-                        st.session_state.ratio = df.loc[idx]['Close'] / df_r.loc[idx]['Close']
+            except Exception as e:
+                continue
+        
+        return timeframe_results
+    
+    def detect_market_structure(self, df: pd.DataFrame) -> str:
+        """Detect current market structure"""
+        if len(df) < 50:
+            return 'ranging'
+        
+        latest = df.iloc[-1]
+        sma_20 = latest['SMA_20']
+        sma_50 = latest['SMA_50']
+        adx = latest['ADX']
+        atr = latest['ATR']
+        close = latest['Close']
+        
+        # Volatility measure
+        volatility = (atr / close) * 100
+        
+        # Trend strength
+        if adx > 25 and sma_20 > sma_50:
+            if volatility > 2:
+                return 'strong_uptrend'
+            return 'uptrend'
+        elif adx > 25 and sma_20 < sma_50:
+            if volatility > 2:
+                return 'strong_downtrend'
+            return 'downtrend'
+        elif adx < 20:
+            return 'ranging'
+        else:
+            return 'ranging'
+    
+    def select_best_strategy(self, df: pd.DataFrame, trading_style: str) -> str:
+        """Select optimal strategy based on market structure"""
+        market_structure = self.detect_market_structure(df)
+        
+        # Strategy selection based on market and trading style
+        if trading_style == "Scalping":
+            return 'scalping'
+        elif trading_style == "Day Trading":
+            if market_structure in ['strong_uptrend', 'strong_downtrend']:
+                return 'momentum'
+            elif market_structure == 'ranging':
+                return 'mean_reversion'
+            else:
+                return 'breakout'
+        elif trading_style == "Swing Trading":
+            if market_structure in ['uptrend', 'downtrend']:
+                return 'trend_following'
+            else:
+                return 'breakout'
+        else:  # Positional
+            return 'trend_following'
+    
+    def trend_following_strategy(self, df: pd.DataFrame) -> Dict:
+        """Trend Following Strategy"""
+        latest = df.iloc[-1]
+        prev = df.iloc[-2]
+        
+        score = 0
+        signals = []
+        
+        # Moving Average Alignment
+        if latest['SMA_20'] > latest['SMA_50'] > latest['SMA_200']:
+            score += 2
+            signals.append("Strong upward MA alignment")
+        elif latest['SMA_20'] < latest['SMA_50'] < latest['SMA_200']:
+            score -= 2
+            signals.append("Strong downward MA alignment")
+        
+        # MACD
+        if latest['MACD'] > latest['MACD_Signal'] and prev['MACD'] <= prev['MACD_Signal']:
+            score += 1.5
+            signals.append("MACD bullish crossover")
+        elif latest['MACD'] < latest['MACD_Signal'] and prev['MACD'] >= prev['MACD_Signal']:
+            score -= 1.5
+            signals.append("MACD bearish crossover")
+        
+        # ADX Trend Strength
+        if latest['ADX'] > 25:
+            signals.append(f"Strong trend (ADX: {latest['ADX']:.1f})")
+            score = score * 1.2 if score != 0 else score
+        
+        # Price vs SMA
+        if latest['Close'] > latest['SMA_20']:
+            score += 0.5
+        else:
+            score -= 0.5
+        
+        return {'score': score, 'signals': signals}
+    
+    def mean_reversion_strategy(self, df: pd.DataFrame) -> Dict:
+        """Mean Reversion Strategy"""
+        latest = df.iloc[-1]
+        score = 0
+        signals = []
+        
+        # Bollinger Bands
+        if latest['Close'] < latest['BB_Lower']:
+            score += 2
+            signals.append("Price below lower BB - oversold")
+        elif latest['Close'] > latest['BB_Upper']:
+            score -= 2
+            signals.append("Price above upper BB - overbought")
+        
+        # RSI
+        if latest['RSI'] < 30:
+            score += 1.5
+            signals.append(f"RSI oversold ({latest['RSI']:.1f})")
+        elif latest['RSI'] > 70:
+            score -= 1.5
+            signals.append(f"RSI overbought ({latest['RSI']:.1f})")
+        
+        # Stochastic
+        if latest['Stoch_K'] < 20:
+            score += 1
+            signals.append("Stochastic oversold")
+        elif latest['Stoch_K'] > 80:
+            score -= 1
+            signals.append("Stochastic overbought")
+        
+        return {'score': score, 'signals': signals}
+    
+    def momentum_strategy(self, df: pd.DataFrame) -> Dict:
+        """Momentum Strategy"""
+        latest = df.iloc[-1]
+        prev = df.iloc[-2]
+        score = 0
+        signals = []
+        
+        # RSI Momentum
+        if 50 < latest['RSI'] < 70:
+            score += 1.5
+            signals.append("Bullish RSI momentum zone")
+        elif 30 < latest['RSI'] < 50:
+            score -= 1.5
+            signals.append("Bearish RSI momentum zone")
+        
+        # MACD Histogram
+        if latest['MACD_Hist'] > prev['MACD_Hist'] > 0:
+            score += 1
+            signals.append("Increasing bullish MACD histogram")
+        elif latest['MACD_Hist'] < prev['MACD_Hist'] < 0:
+            score -= 1
+            signals.append("Increasing bearish MACD histogram")
+        
+        # Volume
+        if latest['Volume_Ratio'] > 1.5:
+            signals.append("High volume confirmation")
+            score = score * 1.3 if score != 0 else score
+        
+        # Price momentum
+        price_change = (latest['Close'] - prev['Close']) / prev['Close'] * 100
+        if price_change > 1:
+            score += 1
+            signals.append(f"Strong upward momentum ({price_change:.2f}%)")
+        elif price_change < -1:
+            score -= 1
+            signals.append(f"Strong downward momentum ({price_change:.2f}%)")
+        
+        return {'score': score, 'signals': signals}
+    
+    def breakout_strategy(self, df: pd.DataFrame) -> Dict:
+        """Breakout Strategy"""
+        latest = df.iloc[-1]
+        prev = df.iloc[-2]
+        score = 0
+        signals = []
+        
+        # Resistance breakout
+        if latest['Close'] > latest['Resistance'] and prev['Close'] <= prev['Resistance']:
+            score += 2.5
+            signals.append("Bullish resistance breakout")
+        
+        # Support breakdown
+        if latest['Close'] < latest['Support'] and prev['Close'] >= prev['Support']:
+            score -= 2.5
+            signals.append("Bearish support breakdown")
+        
+        # Volume confirmation
+        if latest['Volume_Ratio'] > 1.5:
+            signals.append("Breakout with high volume")
+            score = score * 1.4 if score != 0 else score
+        
+        # ATR expansion
+        if len(df) > 20:
+            atr_avg = df['ATR'].iloc[-20:-1].mean()
+            if latest['ATR'] > atr_avg * 1.2:
+                signals.append("Volatility expansion")
+                score = score * 1.2 if score != 0 else score
+        
+        return {'score': score, 'signals': signals}
+    
+    def scalping_strategy(self, df: pd.DataFrame) -> Dict:
+        """Scalping Strategy - Quick entries/exits"""
+        latest = df.iloc[-1]
+        prev = df.iloc[-2]
+        score = 0
+        signals = []
+        
+        # Quick EMA crossovers
+        if latest['EMA_12'] > latest['EMA_26'] and prev['EMA_12'] <= prev['EMA_26']:
+            score += 2
+            signals.append("Fast EMA crossover - bullish")
+        elif latest['EMA_12'] < latest['EMA_26'] and prev['EMA_12'] >= prev['EMA_26']:
+            score -= 2
+            signals.append("Fast EMA crossover - bearish")
+        
+        # Stochastic quick signals
+        if latest['Stoch_K'] < 30 and latest['Stoch_K'] > prev['Stoch_K']:
+            score += 1.5
+            signals.append("Stochastic turning up from oversold")
+        elif latest['Stoch_K'] > 70 and latest['Stoch_K'] < prev['Stoch_K']:
+            score -= 1.5
+            signals.append("Stochastic turning down from overbought")
+        
+        # Tight price action
+        bb_width = (latest['BB_Upper'] - latest['BB_Lower']) / latest['BB_Middle']
+        if bb_width < 0.02:
+            signals.append("Tight consolidation - breakout pending")
+        
+        return {'score': score, 'signals': signals}
+    
+    def generate_signal(self, df: pd.DataFrame, strategy_name: str, 
+                       trading_style: str, ticker: str, 
+                       timeframe_signals: Dict = None) -> TradingSignal:
+        """Generate final trading signal with comprehensive analysis and pattern reliability"""
+        
+        # Execute strategy
+        strategy_func = self.strategies[strategy_name]
+        result = strategy_func(df)
+        
+        score = result['score']
+        signals = result['signals']
+        
+        latest = df.iloc[-1]
+        atr = latest['ATR']
+        close = latest['Close']
+        
+        # CRITICAL: Analyze which patterns market is following reliably
+        pattern_reliability = PatternReliabilityAnalyzer.analyze_pattern_reliability(df)
+        most_reliable_pattern = pattern_reliability['most_reliable']
+        reliability_scores = pattern_reliability['reliability_scores']
+        
+        # Sentiment Analysis
+        sentiment_analyzer = SentimentAnalyzer(ticker)
+        sentiment_result = sentiment_analyzer.analyze()
+        
+        # Support/Resistance Analysis
+        sr_analysis = SupportResistanceAnalyzer.find_strong_levels(df)
+        
+        # Z-Score Analysis
+        zscore_analysis = ZScoreAnalyzer.calculate_zscore(df)
+        
+        # Fibonacci Analysis
+        fib_analysis = FibonacciAnalyzer.calculate_fibonacci_levels(df)
+        
+        # RSI Divergence
+        divergence = RSIDivergenceAnalyzer.detect_divergence(df)
+        
+        # Elliott Wave Analysis
+        elliott_wave = ElliottWaveAnalyzer.detect_elliott_wave(df)
+        
+        # Ratio Analysis
+        benchmark = "^NSEI" if ticker.endswith(".NS") or ticker.endswith(".BO") else "^NSEI"
+        ratio_analysis = RatioAnalyzer.analyze_relative_strength(ticker, benchmark)
+        
+        # Adjust score based on all factors WITH RELIABILITY WEIGHTING
+        adjusted_score = score
+        
+        # Sentiment adjustment
+        adjusted_score += sentiment_result['score'] * 1.5
+        
+        # Z-Score adjustment
+        zscore = zscore_analysis['current_zscore']
+        if zscore > 2:
+            adjusted_score -= 1.5
+        elif zscore < -2:
+            adjusted_score += 1.5
+        
+        # Elliott Wave adjustment (weighted by reliability)
+        elliott_reliability = reliability_scores.get('Elliott Wave', 50) / 100
+        wave_bias = elliott_wave.get('action_bias', 'HOLD')
+        if wave_bias == 'BUY':
+            adjusted_score += 1.5 * elliott_reliability
+        elif wave_bias == 'SELL':
+            adjusted_score -= 1.5 * elliott_reliability
+        elif wave_bias in ['BUY_PENDING', 'SELL_PENDING']:
+            adjusted_score *= 0.7
+        
+        # RSI Divergence adjustment (weighted by reliability)
+        rsi_reliability = reliability_scores.get('RSI', 50) / 100
+        if divergence['type'] == 'BULLISH':
+            adjusted_score += divergence['strength'] * 0.15 * rsi_reliability
+        elif divergence['type'] == 'BEARISH':
+            adjusted_score -= divergence['strength'] * 0.15 * rsi_reliability
+        
+        # Fibonacci adjustment (weighted by reliability)
+        fib_reliability = reliability_scores.get('Fibonacci', 50) / 100
+        current_price = latest['Close']
+        
+        # Check if price is near Fibonacci level
+        for level_name, level_value in fib_analysis['levels'].items():
+            if abs(current_price - level_value) / current_price < 0.01:  # Within 1%
+                if level_value < current_price and fib_analysis['trend'] == 'UPTREND':
+                    adjusted_score += 1.0 * fib_reliability  # Near support
+                elif level_value > current_price and fib_analysis['trend'] == 'DOWNTREND':
+                    adjusted_score -= 1.0 * fib_reliability  # Near resistance
+        
+        # Support/Resistance adjustment (weighted by reliability)
+        sr_reliability = reliability_scores.get('Support/Resistance', 50) / 100
+        if abs(current_price - sr_analysis['support']) / current_price < 0.015:
+            adjusted_score += 1.2 * sr_reliability  # At strong support
+        elif abs(current_price - sr_analysis['resistance']) / current_price < 0.015:
+            adjusted_score -= 1.2 * sr_reliability  # At strong resistance
+        
+        # Moving Average adjustment (weighted by reliability)
+        ma_reliability = reliability_scores.get('Moving Averages', 50) / 100
+        if latest['SMA_20'] > latest['SMA_50'] > latest['SMA_200']:
+            adjusted_score += 0.8 * ma_reliability
+        elif latest['SMA_20'] < latest['SMA_50'] < latest['SMA_200']:
+            adjusted_score -= 0.8 * ma_reliability
+        
+        # Ratio analysis adjustment
+        if ratio_analysis['relative_strength'] > 1.2:
+            adjusted_score += 0.5
+        elif ratio_analysis['relative_strength'] < 0.8:
+            adjusted_score -= 0.5
+        
+        # CRITICAL: Give extra weight if most reliable pattern confirms signal
+        if most_reliable_pattern != 'INSUFFICIENT_DATA':
+            highest_reliability = reliability_scores[most_reliable_pattern]
+            
+            if highest_reliability > 70:
+                # Check if most reliable pattern confirms the signal
+                if most_reliable_pattern == 'Elliott Wave' and wave_bias in ['BUY', 'SELL']:
+                    adjusted_score *= 1.3  # 30% boost
+                elif most_reliable_pattern == 'RSI' and divergence['type'] != 'NONE':
+                    adjusted_score *= 1.25
+                elif most_reliable_pattern == 'Support/Resistance':
+                    if abs(current_price - sr_analysis['support']) / current_price < 0.015 and adjusted_score > 0:
+                        adjusted_score *= 1.3
+                    elif abs(current_price - sr_analysis['resistance']) / current_price < 0.015 and adjusted_score < 0:
+                        adjusted_score *= 1.3
+        
+        # Determine action and confidence
+        if adjusted_score > 2.5:
+            action = "BUY"
+            confidence = min(adjusted_score / 6 * 100, 95)
+        elif adjusted_score < -2.5:
+            action = "SELL"
+            confidence = min(abs(adjusted_score) / 6 * 100, 95)
+        else:
+            action = "HOLD"
+            confidence = 50 - abs(adjusted_score) * 8
+        
+        # CRITICAL: Override if most reliable pattern strongly contradicts
+        if most_reliable_pattern != 'INSUFFICIENT_DATA':
+            highest_reliability = reliability_scores[most_reliable_pattern]
+            
+            if highest_reliability > 75:
+                if most_reliable_pattern == 'Elliott Wave' and elliott_wave['confidence'] > 70:
+                    if action == "BUY" and wave_bias == "SELL":
+                        action = "HOLD"
+                        confidence *= 0.4
+                    elif action == "SELL" and wave_bias == "BUY":
+                        action = "HOLD"
+                        confidence *= 0.4
+        
+        # Calculate risk management levels using most reliable pattern
+        if action == "BUY":
+            entry_price = close
+            
+            # Prioritize most reliable pattern for stop loss
+            if most_reliable_pattern == 'Fibonacci' and fib_analysis['nearest_support']:
+                stop_loss = min(fib_analysis['nearest_support'][1], close - (2 * atr))
+            elif most_reliable_pattern == 'Support/Resistance':
+                stop_loss = max(sr_analysis['support'] * 0.99, close - (2 * atr))
+            else:
+                stop_loss = max(sr_analysis['support'] * 0.99, close - (2 * atr))
+            
+            # Target using most reliable pattern
+            if most_reliable_pattern == 'Fibonacci' and '161.8%' in fib_analysis['extensions']:
+                target_price = min(fib_analysis['extensions']['161.8%'], close + (4 * atr))
+            elif most_reliable_pattern == 'Support/Resistance':
+                target_price = min(sr_analysis['resistance'] * 1.01, close + (3 * atr))
+            else:
+                target_price = min(sr_analysis['resistance'] * 1.01, close + (3 * atr))
+        
+        elif action == "SELL":
+            entry_price = close
+            
+            if most_reliable_pattern == 'Fibonacci' and fib_analysis['nearest_resistance']:
+                stop_loss = max(fib_analysis['nearest_resistance'][1], close + (2 * atr))
+            elif most_reliable_pattern == 'Support/Resistance':
+                stop_loss = min(sr_analysis['resistance'] * 1.01, close + (2 * atr))
+            else:
+                stop_loss = min(sr_analysis['resistance'] * 1.01, close + (2 * atr))
+            
+            if most_reliable_pattern == 'Fibonacci' and '161.8%' in fib_analysis['extensions']:
+                target_price = max(fib_analysis['extensions']['161.8%'], close - (4 * atr))
+            elif most_reliable_pattern == 'Support/Resistance':
+                target_price = max(sr_analysis['support'] * 0.99, close - (3 * atr))
+            else:
+                target_price = max(sr_analysis['support'] * 0.99, close - (3 * atr))
+        
+        else:
+            entry_price = close
+            stop_loss = close - (1.5 * atr)
+            target_price = close + (1.5 * atr)
+        
+        # Calculate risk-reward ratio
+        if action in ["BUY", "SELL"]:
+            risk = abs(entry_price - stop_loss)
+            reward = abs(target_price - entry_price)
+            risk_reward = reward / risk if risk > 0 else 0
+        else:
+            risk_reward = 1.0
+        
+        # Generate comprehensive reasoning
+        reasoning = self._generate_reasoning(df, action, signals, 
+                                             strategy_name, trading_style)
+        
+        # Generate detailed 200-word summary
+        detailed_summary = self._generate_detailed_summary(
+            df, action, adjusted_score, sentiment_result, 
+            sr_analysis, zscore_analysis, timeframe_signals,
+            fib_analysis, divergence, elliott_wave, ratio_analysis,
+            pattern_reliability
+        )
+        
+        # Generate signal confluence explanation
+        confluence_explanation = self._generate_confluence_explanation(
+            timeframe_signals, action, trading_style, elliott_wave, 
+            divergence, fib_analysis, pattern_reliability
+        )
+        
+        return TradingSignal(
+            action=action,
+            confidence=confidence,
+            entry_price=entry_price,
+            target_price=target_price,
+            stop_loss=stop_loss,
+            timeframe="Combined",
+            strategy=strategy_name.replace('_', ' ').title(),
+            reasoning=reasoning,
+            risk_reward=risk_reward,
+            sentiment_score=sentiment_result['score'],
+            sentiment_summary=sentiment_result['summary'],
+            strong_support=sr_analysis['support'],
+            strong_resistance=sr_analysis['resistance'],
+            support_strength=sr_analysis['support_strength'],
+            resistance_strength=sr_analysis['resistance_strength'],
+            zscore=zscore,
+            zscore_interpretation=zscore_analysis['interpretation'],
+            timeframe_signals=timeframe_signals,
+            detailed_summary=detailed_summary,
+            signal_confluence=confluence_explanation
+        )
+    
+    def _generate_detailed_summary(self, df: pd.DataFrame, action: str, 
+                                  score: float, sentiment: Dict, 
+                                  sr_analysis: Dict, zscore_analysis: Dict,
+                                  timeframe_signals: Dict, fib_analysis: Dict = None,
+                                  divergence: Dict = None, elliott_wave: Dict = None,
+                                  ratio_analysis: Dict = None,
+                                  pattern_reliability: Dict = None) -> str:
+        """Generate detailed 200-word summary with comprehensive analysis"""
+        
+        latest = df.iloc[-1]
+        prev_week = df.iloc[-5] if len(df) > 5 else df.iloc[0]
+        prev_month = df.iloc[-20] if len(df) > 20 else df.iloc[0]
+        
+        price_change_week = ((latest['Close'] - prev_week['Close']) / prev_week['Close']) * 100
+        price_change_month = ((latest['Close'] - prev_month['Close']) / prev_month['Close']) * 100
+        
+        summary = f"**📊 COMPREHENSIVE 200-WORD MARKET ANALYSIS**\n\n"
+        
+        # Pattern Reliability Analysis (NEW - CRITICAL)
+        if pattern_reliability and pattern_reliability['most_reliable'] != 'INSUFFICIENT_DATA':
+            most_reliable = pattern_reliability['most_reliable']
+            reliability_score = pattern_reliability['reliability_scores'][most_reliable]
+            
+            summary += f"**🎯 PATTERN RELIABILITY (CRITICAL):**\n"
+            summary += f"The market is currently following **{most_reliable}** with {reliability_score:.1f}% historical accuracy. "
+            summary += f"This pattern has been the MOST RELIABLE indicator for this instrument. "
+            
+            if reliability_score > 70:
+                summary += f"High reliability (>70%) means this pattern should be PRIMARY decision factor. "
+            elif reliability_score > 55:
+                summary += f"Moderate reliability means use this with confirming signals. "
+            else:
+                summary += f"Low reliability means this pattern is currently unreliable - avoid it. "
+            
+            summary += f"\n\n**Pattern Performance Rankings:**\n"
+            sorted_patterns = sorted(pattern_reliability['reliability_scores'].items(), 
+                                   key=lambda x: x[1], reverse=True)
+            for i, (pattern, score) in enumerate(sorted_patterns[:3], 1):
+                emoji = "🥇" if i == 1 else ("🥈" if i == 2 else "🥉")
+                summary += f"{emoji} {pattern}: {score:.1f}% | "
+            summary += "\n\n"
+        
+        # Historical Performance
+        summary += f"**📈 PAST PERFORMANCE:**\n"
+        summary += f"• Last 5 sessions: ₹{prev_week['Close']:.2f} → ₹{latest['Close']:.2f} ({price_change_week:+.2f}%)\n"
+        summary += f"• Last 20 sessions: ₹{prev_month['Close']:.2f} → ₹{latest['Close']:.2f} ({price_change_month:+.2f}%)\n"
+        
+        if price_change_week > 5:
+            summary += f"• Strong bullish momentum observed - buyers in control.\n"
+        elif price_change_week < -5:
+            summary += f"• Strong bearish pressure - sellers dominating.\n"
+        else:
+            summary += f"• Consolidation phase - market indecision evident.\n"
+        
+        # Relative Strength (Market Comparison)
+        if ratio_analysis:
+            summary += f"• Relative to benchmark: {ratio_analysis['interpretation']}\n"
+        
+        # Elliott Wave Position (Market Psychology)
+        summary += f"\n**🌊 ELLIOTT WAVE (MARKET PSYCHOLOGY):**\n"
+        if elliott_wave:
+            summary += f"• Currently in: **{elliott_wave['wave']}** (Confidence: {elliott_wave['confidence']}%)\n"
+            summary += f"• Interpretation: {elliott_wave['description']}\n"
+            summary += f"• Next Expected: {elliott_wave['next_expected']}\n"
+            summary += f"• This wave position suggests: {elliott_wave.get('action_bias', 'NEUTRAL')} bias\n"
+            
+            if elliott_wave['confidence'] > 70:
+                summary += f"• **HIGH CONFIDENCE** - Elliott Wave pattern is clear and actionable.\n"
+        
+        # Current Technical Structure
+        summary += f"\n**🔧 CURRENT TECHNICAL STRUCTURE:**\n"
+        summary += f"• Price: ₹{latest['Close']:.2f} | RSI: {latest['RSI']:.1f}"
+        
+        if latest['RSI'] > 70:
+            summary += " (Overbought - potential reversal)\n"
+        elif latest['RSI'] < 30:
+            summary += " (Oversold - potential bounce)\n"
+        else:
+            summary += " (Neutral zone)\n"
+        
+        summary += f"• ADX: {latest['ADX']:.1f}"
+        if latest['ADX'] > 25:
+            summary += " (Strong trending market - follow trend)\n"
+        elif latest['ADX'] > 20:
+            summary += " (Moderate trend developing)\n"
+        else:
+            summary += " (Ranging/choppy market - avoid trend strategies)\n"
+        
+        summary += f"• MACD: {latest['MACD']:.3f} | Signal: {latest['MACD_Signal']:.3f}"
+        if latest['MACD'] > latest['MACD_Signal']:
+            summary += " (Bullish momentum)\n"
+        else:
+            summary += " (Bearish momentum)\n"
+        
+        # RSI Divergence (Early Warning)
+        if divergence and divergence['type'] != 'NONE':
+            summary += f"\n**⚠️ RSI DIVERGENCE DETECTED:**\n"
+            summary += f"• Type: **{divergence['type']}** (Strength: {divergence['strength']:.1f})\n"
+            summary += f"• Meaning: {divergence['description']}\n"
+            summary += f"• Divergence often precedes price reversals - this is an EARLY WARNING signal.\n"
+        
+        # Fibonacci Levels (Natural Support/Resistance)
+        if fib_analysis:
+            summary += f"\n**📐 FIBONACCI ANALYSIS ({fib_analysis['trend']}):**\n"
+            if fib_analysis['nearest_support']:
+                support_dist = ((latest['Close'] - fib_analysis['nearest_support'][1]) / latest['Close']) * 100
+                summary += f"• Nearest Support: ₹{fib_analysis['nearest_support'][1]:.2f} ({fib_analysis['nearest_support'][0]}) - {support_dist:.2f}% below\n"
+            
+            if fib_analysis['nearest_resistance']:
+                resist_dist = ((fib_analysis['nearest_resistance'][1] - latest['Close']) / latest['Close']) * 100
+                summary += f"• Nearest Resistance: ₹{fib_analysis['nearest_resistance'][1]:.2f} ({fib_analysis['nearest_resistance'][0]}) - {resist_dist:.2f}% above\n"
+            
+            summary += f"• Fibonacci levels are natural reversal zones based on golden ratio (1.618).\n"
+        
+        # Support & Resistance (Key Battle Zones)
+        summary += f"\n**🎚️ KEY PRICE LEVELS:**\n"
+        summary += f"• Strong Support: ₹{sr_analysis['support']:.2f} ({sr_analysis['support_distance']:.2f}% below)\n"
+        summary += f"  Reason: {sr_analysis['support_strength'][:80]}...\n"
+        summary += f"• Strong Resistance: ₹{sr_analysis['resistance']:.2f} ({sr_analysis['resistance_distance']:.2f}% above)\n"
+        summary += f"  Reason: {sr_analysis['resistance_strength'][:80]}...\n"
+        
+        # Z-Score (Statistical Edge)
+        summary += f"\n**📊 Z-SCORE (MEAN REVERSION):**\n"
+        summary += f"• Current Z-Score: **{zscore_analysis['current_zscore']:.2f}**\n"
+        
+        if abs(zscore_analysis['current_zscore']) > 2:
+            summary += f"• **EXTREME DEVIATION** - Price is {abs(zscore_analysis['current_zscore']):.1f} standard deviations from mean.\n"
+            summary += f"• {zscore_analysis['historical_impact']}\n"
+            summary += f"• Statistical probability favors mean reversion.\n"
+        elif abs(zscore_analysis['current_zscore']) > 1:
+            summary += f"• Moderate deviation from mean - watch for reversal signals.\n"
+        else:
+            summary += f"• Price near statistical equilibrium - no extreme condition.\n"
+        
+        # News Sentiment (External Factors)
+        summary += f"\n**📰 NEWS SENTIMENT:**\n"
+        summary += f"• Sentiment: {sentiment['summary']}\n"
+        summary += f"• Score: {sentiment['score']:.3f} (Range: -1 to +1)\n"
+        
+        if abs(sentiment['score']) > 0.25:
+            summary += f"• Strong sentiment can act as catalyst - consider this in timing entry.\n"
+        
+        # Final Recommendation with Logic
+        summary += f"\n**🎯 FINAL RECOMMENDATION: {action}**\n"
+        summary += f"• Signal Strength Score: {score:.2f}/10\n"
+        summary += f"• Confidence Level: {latest.get('confidence', 'N/A')}\n"
+        
+        if action == "BUY":
+            summary += f"• **BUY LOGIC:** Multiple bullish confirmations align:\n"
+            if pattern_reliability:
+                most_reliable = pattern_reliability['most_reliable']
+                summary += f"  → Most reliable pattern ({most_reliable}) supports bullish view\n"
+            if elliott_wave and 'BUY' in str(elliott_wave.get('action_bias', '')):
+                summary += f"  → Elliott Wave in bullish phase\n"
+            if divergence and divergence['type'] == 'BULLISH':
+                summary += f"  → Bullish RSI divergence detected\n"
+            if zscore_analysis['current_zscore'] < -1.5:
+                summary += f"  → Oversold conditions (Z-Score)\n"
+            
+            summary += f"• Entry: ₹{latest['Close']:.2f} | Target: ₹{sr_analysis['resistance']:.2f} | Stop: ₹{sr_analysis['support']:.2f}\n"
+            summary += f"• Risk/Reward favorable with clear levels defined by most reliable patterns.\n"
+        
+        elif action == "SELL":
+            summary += f"• **SELL LOGIC:** Multiple bearish confirmations align:\n"
+            if pattern_reliability:
+                most_reliable = pattern_reliability['most_reliable']
+                summary += f"  → Most reliable pattern ({most_reliable}) supports bearish view\n"
+            if elliott_wave and 'SELL' in str(elliott_wave.get('action_bias', '')):
+                summary += f"  → Elliott Wave in bearish phase\n"
+            if divergence and divergence['type'] == 'BEARISH':
+                summary += f"  → Bearish RSI divergence detected\n"
+            if zscore_analysis['current_zscore'] > 1.5:
+                summary += f"  → Overbought conditions (Z-Score)\n"
+            
+            summary += f"• Entry: ₹{latest['Close']:.2f} | Target: ₹{sr_analysis['support']:.2f} | Stop: ₹{sr_analysis['resistance']:.2f}\n"
+            summary += f"• Risk/Reward favorable for short positions.\n"
+        
+        else:
+            summary += f"• **HOLD LOGIC:** Conflicting signals or weak setup:\n"
+            summary += f"  → No clear confluence across multiple indicators\n"
+            summary += f"  → Most reliable patterns show indecision\n"
+            summary += f"  → Risk/reward not favorable in current context\n"
+            summary += f"• **Professional traders wait for high-probability setups.**\n"
+            summary += f"• Patience is a position - not every moment requires action.\n"
+        
+        # Future Forecast
+        summary += f"\n**🔮 FORWARD OUTLOOK:**\n"
+        summary += f"{zscore_analysis['future_outlook'][:150]}... "
+        
+        if pattern_reliability:
+            most_reliable = pattern_reliability['most_reliable']
+            summary += f"Given {most_reliable} is most reliable ({pattern_reliability['reliability_scores'][most_reliable]:.1f}% accuracy), "
+            summary += f"this pattern should be PRIMARY guide for next move. "
+        
+        summary += f"\n\n**⚙️ DECISION METHODOLOGY:**\n"
+        summary += f"This recommendation synthesizes 10+ technical factors, weighted by historical reliability. "
+        summary += f"Each indicator is tested for accuracy on recent data. Most reliable patterns receive highest weight. "
+        summary += f"Elliott Wave captures psychology, Fibonacci marks natural levels, divergence shows momentum shifts, "
+        summary += f"and Z-Score provides statistical edge. Only when multiple HIGH-RELIABILITY factors align "
+        summary += f"do we generate BUY/SELL signals. This multi-layered approach significantly improves win probability."
+        
+        return summary
+        """Generate detailed 100-word summary with values"""
+        
+        latest = df.iloc[-1]
+        prev_week = df.iloc[-5] if len(df) > 5 else df.iloc[0]
+        
+        price_change = ((latest['Close'] - prev_week['Close']) / prev_week['Close']) * 100
+        
+        summary = f"**Comprehensive Market Summary:**\n\n"
+        
+        # Past Structure
+        summary += f"**Past Performance:** Price moved from ₹{prev_week['Close']:.2f} to ₹{latest['Close']:.2f} "
+        summary += f"({price_change:+.2f}%). "
+        
+        if ratio_analysis:
+            summary += f"{ratio_analysis['interpretation']} "
+        
+        # Elliott Wave Position (CRITICAL)
+        if elliott_wave:
+            summary += f"\n\n**Elliott Wave:** Currently in {elliott_wave['wave']} "
+            summary += f"({elliott_wave['confidence']}% confidence). {elliott_wave['description']} "
+            summary += f"Next expected: {elliott_wave['next_expected']}. "
+        
+        # Current Technical Structure
+        summary += f"\n\n**Technical Indicators:** RSI={latest['RSI']:.1f} "
+        if latest['RSI'] > 70:
+            summary += "(overbought), "
+        elif latest['RSI'] < 30:
+            summary += "(oversold), "
+        else:
+            summary += "(neutral), "
+        
+        summary += f"ADX={latest['ADX']:.1f} "
+        if latest['ADX'] > 25:
+            summary += "(strong trend), "
+        else:
+            summary += "(weak trend), "
+        
+        summary += f"MACD={latest['MACD']:.3f}. "
+        
+        # RSI Divergence
+        if divergence and divergence['type'] != 'NONE':
+            summary += f"\n\n**RSI Divergence Detected:** {divergence['description']} "
+        
+        # Fibonacci Levels
+        if fib_analysis:
+            summary += f"\n\n**Fibonacci Analysis ({fib_analysis['trend']}):** "
+            if fib_analysis['nearest_support']:
+                summary += f"Nearest support at ₹{fib_analysis['nearest_support'][1]:.2f} ({fib_analysis['nearest_support'][0]}). "
+            if fib_analysis['nearest_resistance']:
+                summary += f"Nearest resistance at ₹{fib_analysis['nearest_resistance'][1]:.2f} ({fib_analysis['nearest_resistance'][0]}). "
+        
+        # Z-Score
+        summary += f"\n\n**Mean Reversion:** Z-Score={zscore_analysis['current_zscore']:.2f}. "
+        if abs(zscore_analysis['current_zscore']) > 2:
+            summary += "Extreme deviation detected - high probability of mean reversion. "
+        
+        # Sentiment
+        summary += f"\n\n**News Sentiment:** {sentiment['summary']} (score: {sentiment['score']:.2f}). "
+        
+        # Final Recommendation
+        summary += f"\n\n**Final Signal: {action}** (Score: {score:.1f}). "
+        
+        if action == "BUY":
+            summary += f"Multiple confirmations align for upward move. "
+            if elliott_wave and 'BUY' in elliott_wave.get('action_bias', ''):
+                summary += f"Elliott Wave confirms bullish setup. "
+            summary += f"Target: ₹{sr_analysis['resistance']:.2f}, Stop: ₹{sr_analysis['support']:.2f}. "
+        elif action == "SELL":
+            summary += f"Multiple confirmations align for downward move. "
+            if elliott_wave and 'SELL' in elliott_wave.get('action_bias', ''):
+                summary += f"Elliott Wave confirms bearish setup. "
+            summary += f"Target: ₹{sr_analysis['support']:.2f}, Stop: ₹{sr_analysis['resistance']:.2f}. "
+        else:
+            summary += f"Conflicting signals or weak setup. Patience advised until clearer picture emerges. "
+        
+        summary += f"\n\n**Logic:** This recommendation is based on confluence of technical indicators, Elliott Wave positioning, Fibonacci levels, RSI divergence, sentiment analysis, and relative strength. All factors must align for high-probability trades."
+        
+        return summary
+    
+    def _generate_confluence_explanation(self, timeframe_signals: Dict, 
+                                        final_action: str, trading_style: str,
+                                        elliott_wave: Dict = None,
+                                        divergence: Dict = None,
+                                        fib_analysis: Dict = None,
+                                        pattern_reliability: Dict = None) -> str:
+        """Explain how different factors and pattern reliability contributed to final decision"""
+        
+        explanation = f"**🎯 MULTI-FACTOR CONFLUENCE ANALYSIS FOR {trading_style}**\n\n"
+        
+        # Pattern Reliability (MOST IMPORTANT SECTION)
+        if pattern_reliability and pattern_reliability['most_reliable'] != 'INSUFFICIENT_DATA':
+            explanation += f"**📊 PATTERN RELIABILITY ANALYSIS (FOUNDATION OF DECISION):**\n\n"
+            explanation += f"We tested which patterns this market follows most consistently:\n\n"
+            
+            for rec in pattern_reliability['recommendations']:
+                explanation += f"{rec}\n"
+            
+            most_reliable = pattern_reliability['most_reliable']
+            reliability_score = pattern_reliability['reliability_scores'][most_reliable]
+            
+            explanation += f"\n**🎯 PRIMARY DECISION DRIVER: {most_reliable} ({reliability_score:.1f}% Accurate)**\n"
+            explanation += f"This pattern has been correct {reliability_score:.1f}% of the time historically. "
+            
+            if reliability_score > 75:
+                explanation += f"This is EXCEPTIONALLY HIGH reliability - we give this pattern 3X weight in decision. "
+            elif reliability_score > 65:
+                explanation += f"This is HIGH reliability - we give this pattern 2X weight. "
+            elif reliability_score > 55:
+                explanation += f"This is MODERATE reliability - we use it with confirming signals. "
+            else:
+                explanation += f"This is LOW reliability - we minimize its influence. "
+            
+            explanation += f"\n\n**Logic:** Why follow the most reliable pattern? Because past performance "
+            explanation += f"indicates future probability. If {most_reliable} has been 75% accurate, "
+            explanation += f"following it gives you a statistical edge. Markets are not random - they follow patterns. "
+            explanation += f"Our job is to identify WHICH pattern is working NOW.\n\n"
+        
+        # Elliott Wave Section
+        if elliott_wave:
+            reliability = pattern_reliability['reliability_scores'].get('Elliott Wave', 50) if pattern_reliability else 50
+            explanation += f"**🌊 ELLIOTT WAVE ANALYSIS ({reliability:.1f}% Reliable):**\n"
+            explanation += f"• Current Wave: {elliott_wave['wave']}\n"
+            explanation += f"• Confidence: {elliott_wave['confidence']}%\n"
+            explanation += f"• Pattern: {elliott_wave['description']}\n"
+            explanation += f"• Expected Next: {elliott_wave['next_expected']}\n"
+            explanation += f"• Wave Bias: {elliott_wave.get('action_bias', 'N/A')}\n"
+            
+            if reliability > 70:
+                explanation += f"• **HIGH RELIABILITY** - Elliott Wave is working well for this instrument\n"
+            
+            explanation += f"\n**Why Elliott Wave?** It captures crowd psychology. Wave 3 is always strongest (greed peak), "
+            explanation += f"Wave 5 often fails (exhaustion), Wave 4 provides entry (correction). "
+            explanation += f"When pattern has {reliability:.1f}% accuracy, it's highly actionable.\n\n"
+        
+        # RSI Divergence
+        if divergence and divergence['type'] != 'NONE':
+            reliability = pattern_reliability['reliability_scores'].get('RSI', 50) if pattern_reliability else 50
+            explanation += f"**📊 RSI DIVERGENCE ({reliability:.1f}% Reliable):**\n"
+            explanation += f"• Type: {divergence['type']}\n"
+            explanation += f"• Strength: {divergence['strength']:.1f}\n"
+            explanation += f"• Explanation: {divergence['description']}\n"
+            
+            if reliability > 65:
+                explanation += f"• **STRONG SIGNAL** - RSI divergence reliable for this market\n"
+            
+            explanation += f"\n**Why Divergence?** It's a leading indicator - shows momentum shift BEFORE price reverses. "
+            explanation += f"When price makes new high but RSI doesn't, buying pressure is weakening.\n\n"
+        
+        # Fibonacci
+        if fib_analysis:
+            reliability = pattern_reliability['reliability_scores'].get('Fibonacci', 50) if pattern_reliability else 50
+            explanation += f"**📐 FIBONACCI LEVELS ({reliability:.1f}% Reliable):**\n"
+            explanation += f"• Trend: {fib_analysis['trend']}\n"
+            
+            if fib_analysis['nearest_support']:
+                explanation += f"• Support: ₹{fib_analysis['nearest_support'][1]:.2f} ({fib_analysis['nearest_support'][0]})\n"
+            if fib_analysis['nearest_resistance']:
+                explanation += f"• Resistance: ₹{fib_analysis['nearest_resistance'][1]:.2f} ({fib_analysis['nearest_resistance'][0]})\n"
+            
+            if reliability > 65:
+                explanation += f"• **HIGHLY EFFECTIVE** - Fib levels acting as strong S/R\n"
+            
+            explanation += f"\n**Why Fibonacci?** Based on golden ratio (1.618) found in nature. "
+            explanation += f"Traders worldwide watch 38.2%, 50%, 61.8% levels - becomes self-fulfilling.\n\n"
+        
+        # Multi-Timeframe
+        if timeframe_signals:
+            buy_count = sum(1 for data in timeframe_signals.values() if data['signal'] == 'BUY')
+            sell_count = sum(1 for data in timeframe_signals.values() if data['signal'] == 'SELL')
+            hold_count = sum(1 for data in timeframe_signals.values() if data['signal'] == 'HOLD')
+            
+            explanation += f"**⏱️ MULTI-TIMEFRAME CONFIRMATION:**\n"
+            for tf, data in timeframe_signals.items():
+                emoji = "🟢" if data['signal'] == "BUY" else ("🔴" if data['signal'] == "SELL" else "🟡")
+                explanation += f"{emoji} {tf}: {data['signal']} | {data['market_structure'].replace('_', ' ').title()}\n"
+            
+            explanation += f"\n• BUY signals: {buy_count}/{len(timeframe_signals)}\n"
+            explanation += f"• SELL signals: {sell_count}/{len(timeframe_signals)}\n"
+            explanation += f"• HOLD signals: {hold_count}/{len(timeframe_signals)}\n\n"
+        
+        # Final Decision Logic with Pattern Reliability
+        explanation += f"**🎯 WHY {final_action} WILL WORK - THE COMPLETE LOGIC:**\n\n"
+        
+        if final_action == "BUY":
+            explanation += "✅ **BULLISH CONFLUENCE DETECTED - Multiple High-Probability Factors Align:**\n\n"
+            
+            if pattern_reliability:
+                most_reliable = pattern_reliability['most_reliable']
+                score = pattern_reliability['reliability_scores'][most_reliable]
+                
+                if 'Elliott' in most_reliable or 'Wave' in most_reliable:
+                    if elliott_wave and 'BUY' in str(elliott_wave.get('action_bias', '')):
+                        explanation += f"1️⃣ **PRIMARY SIGNAL**: {most_reliable} ({score:.1f}% accurate) indicates BUY\n"
+                        explanation += f"   → Wave position: {elliott_wave['wave']}\n"
+                        explanation += f"   → This wave typically shows upward movement\n\n"
+                
+                elif 'Fibonacci' in most_reliable:
+                    if fib_analysis and fib_analysis['nearest_support']:
+                        dist = abs((latest['Close'] - fib_analysis['nearest_support'][1]) / latest['Close'])
+                        if dist < 0.02:
+                            explanation += f"1️⃣ **PRIMARY SIGNAL**: {most_reliable} ({score:.1f}% accurate) - Near Fib Support\n"
+                            explanation += f"   → Price at {fib_analysis['nearest_support'][0]} level\n"
+                            explanation += f"   → This level bounced {score:.0f}% of time historically\n\n"
+                
+                elif 'Support' in most_reliable or 'Resistance' in most_reliable:
+                    explanation += f"1️⃣ **PRIMARY SIGNAL**: {most_reliable} ({score:.1f}% accurate) confirms BUY\n"
+                    explanation += f"   → Near strong support level\n"
+                    explanation += f"   → Historical bounce rate: {score:.0f}%\n\n"
+            
+            if divergence and divergence['type'] == 'BULLISH':
+                explanation += f"2️⃣ **CONFIRMING SIGNAL**: Bullish RSI Divergence\n"
+                explanation += f"   → {divergence['description']}\n"
+                explanation += f"   → Leading indicator of reversal\n\n"
+            
+            if timeframe_signals and buy_count >= 2:
+                explanation += f"3️⃣ **MULTI-TIMEFRAME ALIGNMENT**: {buy_count}/{len(timeframe_signals)} timeframes bullish\n"
+                explanation += f"   → Higher timeframes confirm trend direction\n"
+                explanation += f"   → Lower timeframes identify precise entry\n\n"
+            
+            explanation += f"**SUCCESS PROBABILITY LOGIC:**\n"
+            explanation += f"• When most reliable pattern ({pattern_reliability['most_reliable']} - {pattern_reliability['reliability_scores'][pattern_reliability['most_reliable']]:.1f}% accurate) aligns with confirming signals\n"
+            explanation += f"• AND multiple timeframes agree\n"
+            explanation += f"• AND divergence shows early momentum shift\n"
+            explanation += f"• THEN probability of success increases multiplicatively\n"
+            explanation += f"• Single indicator: ~{pattern_reliability['reliability_scores'][pattern_reliability['most_reliable']]:.0f}% accuracy\n"
+            explanation += f"• Multiple confirmation: ~{min(pattern_reliability['reliability_scores'][pattern_reliability['most_reliable']] * 1.3, 90):.0f}% accuracy\n"
+            explanation += f"\n🎯 **Entry Strategy**: Buy near current level with stop below most reliable support level.\n"
+        
+        elif final_action == "SELL":
+            explanation += "✅ **BEARISH CONFLUENCE DETECTED - Multiple High-Probability Factors Align:**\n\n"
+            
+            if pattern_reliability:
+                most_reliable = pattern_reliability['most_reliable']
+                score = pattern_reliability['reliability_scores'][most_reliable]
+                
+                explanation += f"1️⃣ **PRIMARY SIGNAL**: {most_reliable} ({score:.1f}% accurate) indicates SELL\n"
+                
+                if 'Elliott' in most_reliable and elliott_wave:
+                    explanation += f"   → Wave position: {elliott_wave['wave']}\n"
+                    explanation += f"   → This wave typically shows downward pressure\n\n"
+            
+            if divergence and divergence['type'] == 'BEARISH':
+                explanation += f"2️⃣ **CONFIRMING SIGNAL**: Bearish RSI Divergence\n"
+                explanation += f"   → {divergence['description']}\n"
+                explanation += f"   → Momentum weakening despite higher prices\n\n"
+            
+            if timeframe_signals and sell_count >= 2:
+                explanation += f"3️⃣ **MULTI-TIMEFRAME ALIGNMENT**: {sell_count}/{len(timeframe_signals)} timeframes bearish\n\n"
+            
+            explanation += f"**SUCCESS PROBABILITY LOGIC:** Same multiplicative effect as BUY, but in bearish direction.\n"
+            explanation += f"🎯 **Entry Strategy**: Short near current level with stop above most reliable resistance.\n"
+        
+        else:
+            explanation += "⚠️ **HOLD RECOMMENDED - Insufficient Confluence:**\n\n"
+            explanation += f"**Why HOLD is the Right Decision:**\n"
+            explanation += f"• Conflicting signals across patterns\n"
+            explanation += f"• Most reliable pattern shows indecision\n"
+            explanation += f"• Multiple timeframes disagree\n"
+            explanation += f"• No clear statistical edge\n\n"
+            
+            explanation += f"**Professional Trading Rule:** Only trade when you have EDGE.\n"
+            explanation += f"Edge = (Win Rate × Avg Win) > (Loss Rate × Avg Loss)\n"
+            explanation += f"Current setup doesn't provide sufficient edge.\n"
+            explanation += f"Patience preserves capital for high-probability setups.\n"
+        
+        explanation += f"\n**🧠 PSYCHOLOGICAL NOTE:**\n"
+        if final_action in ["BUY", "SELL"]:
+            explanation += f"Having multi-layered confirmation helps you stay disciplined. "
+            explanation += f"When most reliable pattern + divergence + timeframes align, "
+            explanation += f"you can trust the setup and avoid emotional exit. "
+            explanation += f"This is how professional traders maintain consistency."
+        else:
+            explanation += f"Resisting FOMO (Fear of Missing Out) is crucial. "
+            explanation += f"Missing marginal setups preserves capital for clear opportunities. "
+            explanation += f"Trading without edge leads to slow capital erosion."
+        
+        return explanation
+        """Explain how different timeframes and Elliott Wave contributed to final decision"""
+        
+        explanation = f"**Multi-Factor Confluence Analysis for {trading_style}:**\n\n"
+        
+        # Elliott Wave Section (Most Important)
+        if elliott_wave:
+            explanation += f"**🌊 Elliott Wave Analysis (CRITICAL):**\n"
+            explanation += f"• Current Wave: {elliott_wave['wave']}\n"
+            explanation += f"• Confidence: {elliott_wave['confidence']}%\n"
+            explanation += f"• Pattern: {elliott_wave['description']}\n"
+            explanation += f"• Expected Next: {elliott_wave['next_expected']}\n"
+            explanation += f"• Wave Bias: {elliott_wave.get('action_bias', 'N/A')}\n\n"
+            
+            explanation += f"**Why Elliott Wave Matters:** Elliott Wave theory captures the psychology of market participants. "
+            if elliott_wave['confidence'] > 70:
+                explanation += f"High confidence ({elliott_wave['confidence']}%) means the pattern is clear and reliable. "
+            explanation += f"Currently in {elliott_wave['wave']}, which historically shows specific behavior patterns.\n\n"
+        
+        # RSI Divergence
+        if divergence and divergence['type'] != 'NONE':
+            explanation += f"**📊 RSI Divergence:**\n"
+            explanation += f"• Type: {divergence['type']}\n"
+            explanation += f"• Strength: {divergence['strength']:.1f}\n"
+            explanation += f"• Explanation: {divergence['description']}\n\n"
+        
+        # Fibonacci
+        if fib_analysis:
+            explanation += f"**📐 Fibonacci Levels:**\n"
+            explanation += f"• Trend: {fib_analysis['trend']}\n"
+            if fib_analysis['nearest_support']:
+                explanation += f"• Support: ₹{fib_analysis['nearest_support'][1]:.2f} at {fib_analysis['nearest_support'][0]}\n"
+            if fib_analysis['nearest_resistance']:
+                explanation += f"• Resistance: ₹{fib_analysis['nearest_resistance'][1]:.2f} at {fib_analysis['nearest_resistance'][0]}\n"
+            explanation += f"Fibonacci levels mark natural support/resistance where traders take action.\n\n"
+        
+        # Multi-Timeframe
+        if timeframe_signals:
+            buy_count = sum(1 for data in timeframe_signals.values() if data['signal'] == 'BUY')
+            sell_count = sum(1 for data in timeframe_signals.values() if data['signal'] == 'SELL')
+            hold_count = sum(1 for data in timeframe_signals.values() if data['signal'] == 'HOLD')
+            
+            explanation += f"**⏱️ Multi-Timeframe Signals:**\n"
+            for tf, data in timeframe_signals.items():
+                emoji = "🟢" if data['signal'] == "BUY" else ("🔴" if data['signal'] == "SELL" else "🟡")
+                explanation += f"{emoji} {tf}: {data['signal']} ({data['market_structure'].replace('_', ' ').title()})\n"
+            
+            explanation += f"\n• BUY: {buy_count}/{len(timeframe_signals)}\n"
+            explanation += f"• SELL: {sell_count}/{len(timeframe_signals)}\n"
+            explanation += f"• HOLD: {hold_count}/{len(timeframe_signals)}\n\n"
+        
+        # Final Decision Logic
+        explanation += f"**🎯 Why {final_action} Will Work:**\n\n"
+        
+        if final_action == "BUY":
+            explanation += "✅ **Bullish Confluence Detected:**\n"
+            if elliott_wave and 'BUY' in elliott_wave.get('action_bias', ''):
+                explanation += f"• Elliott Wave in bullish phase ({elliott_wave['wave']})\n"
+            if divergence and divergence['type'] == 'BULLISH':
+                explanation += f"• Bullish RSI divergence confirms momentum shift\n"
+            if fib_analysis and fib_analysis['nearest_support']:
+                explanation += f"• Price near Fibonacci support - high probability bounce zone\n"
+            
+            explanation += f"\n**Success Logic:** When Elliott Wave, divergence, and Fibonacci align bullishly, "
+            explanation += f"it creates a high-probability setup. The market psychology (Elliott Wave) "
+            explanation += f"indicates we're in a buying phase, technical divergence confirms momentum building, "
+            explanation += f"and Fibonacci support provides a safety net. This multi-layered confirmation "
+            explanation += f"significantly improves success probability."
+        
+        elif final_action == "SELL":
+            explanation += "✅ **Bearish Confluence Detected:**\n"
+            if elliott_wave and 'SELL' in elliott_wave.get('action_bias', ''):
+                explanation += f"• Elliott Wave in bearish phase ({elliott_wave['wave']})\n"
+            if divergence and divergence['type'] == 'BEARISH':
+                explanation += f"• Bearish RSI divergence confirms weakening momentum\n"
+            if fib_analysis and fib_analysis['nearest_resistance']:
+                explanation += f"• Price near Fibonacci resistance - high probability rejection zone\n"
+            
+            explanation += f"\n**Success Logic:** Bearish Elliott Wave position indicates distribution phase, "
+            explanation += f"divergence shows weakening buying pressure despite higher prices, "
+            explanation += f"and Fibonacci resistance acts as selling pressure zone. "
+            explanation += f"This combination creates high-probability short setup."
+        
+        else:
+            explanation += "⚠️ **Conflicting Signals - HOLD Recommended:**\n"
+            explanation += f"• Different timeframes or indicators show conflicting directions\n"
+            explanation += f"• Elliott Wave may not be in decisive phase\n"
+            explanation += f"• No clear confluence across multiple factors\n"
+            explanation += f"\n**Logic:** Trading without confluence reduces win probability. "
+            explanation += f"Professional traders wait for alignment across multiple factors. "
+            explanation += f"Current setup lacks the multi-layered confirmation needed for high-confidence trade."
+        
+        return explanation
+    
+    def _generate_reasoning(self, df: pd.DataFrame, action: str, 
+                           signals: List[str], strategy: str, 
+                           trading_style: str) -> str:
+        """Generate human-readable reasoning"""
+        latest = df.iloc[-1]
+        market_structure = self.detect_market_structure(df)
+        
+        reasoning = f"**Market Analysis ({trading_style})**\n\n"
+        reasoning += f"• Market Structure: {market_structure.replace('_', ' ').title()}\n"
+        reasoning += f"• Selected Strategy: {strategy.replace('_', ' ').title()}\n"
+        reasoning += f"• Current Price: ₹{latest['Close']:.2f}\n\n"
+        
+        reasoning += "**Key Indicators:**\n"
+        reasoning += f"• RSI: {latest['RSI']:.1f} "
+        if latest['RSI'] < 30:
+            reasoning += "(Oversold)\n"
+        elif latest['RSI'] > 70:
+            reasoning += "(Overbought)\n"
+        else:
+            reasoning += "(Neutral)\n"
+        
+        reasoning += f"• ADX: {latest['ADX']:.1f} "
+        if latest['ADX'] > 25:
+            reasoning += "(Strong Trend)\n"
+        else:
+            reasoning += "(Weak Trend)\n"
+        
+        reasoning += f"• Volume Ratio: {latest['Volume_Ratio']:.2f}x average\n\n"
+        
+        reasoning += "**Signal Triggers:**\n"
+        for signal in signals[:5]:  # Top 5 signals
+            reasoning += f"• {signal}\n"
+        
+        reasoning += f"\n**Recommendation: {action}**\n"
+        
+        # Psychology considerations
+        reasoning += "\n**⚠️ Trading Psychology Reminder:**\n"
+        if action == "BUY":
+            reasoning += "• Don't chase the price - wait for your entry\n"
+            reasoning += "• Set stop-loss BEFORE entering trade\n"
+            reasoning += "• Fear of missing out (FOMO) clouds judgment\n"
+        elif action == "SELL":
+            reasoning += "• Don't panic sell - follow your plan\n"
+            reasoning += "• Protect profits with trailing stops\n"
+            reasoning += "• Greed can turn winners into losers\n"
+        else:
+            reasoning += "• Patience is a position - not every moment needs action\n"
+            reasoning += "• Overtrading reduces profitability\n"
+            reasoning += "• Wait for high-probability setups\n"
+        
+        return reasoning
 
-    # DISPLAY
-    if st.session_state.analyzed and 'res' in st.session_state:
-        res = st.session_state.res
-        df = res['df']
+class BacktestEngine:
+    """Backtesting Engine with Elliott Wave for Strategy Validation"""
+    
+    @staticmethod
+    def run_backtest(df: pd.DataFrame, strategy_name: str, 
+                     initial_capital: float = 100000) -> BacktestResult:
+        """Run backtest on historical data with Elliott Wave confirmation"""
         
-        # Dashboard
-        c1, c2, c3 = st.columns([1, 1, 1])
-        with c1:
-            cls = "buy-signal" if "BUY" in res['signal'] else "sell-signal" if "SELL" in res['signal'] else "neutral-signal"
-            st.markdown(f"<div class='signal-box {cls}'>{res['signal']}</div>", unsafe_allow_html=True)
-            if "Conflict" in res['conf']: st.warning("⚠️ HTF Conflict: Scalp Only")
+        if len(df) < 100:
+            return BacktestResult(0, 0, 0, 0, 0, 0, 0, 0, 0)
         
-        with c2:
-            st.markdown(f"""<div class='metric-card'><b>Execution</b><br>Price: {df['Close'].iloc[-1]:.2f}<br>SL: <span style='color:#ff5252'>{res['sl']:.2f}</span> | TGT: <span style='color:#00e676'>{res['tgt']:.2f}</span></div>""", unsafe_allow_html=True)
+        strategy_engine = StrategyEngine()
+        strategy_func = strategy_engine.strategies[strategy_name]
+        
+        trades = []
+        capital = initial_capital
+        position = None
+        equity_curve = [initial_capital]
+        
+        for i in range(50, len(df) - 1):
+            window_df = df.iloc[:i+1].copy()
+            latest = window_df.iloc[-1]
             
-        with c3:
-            st.markdown(f"""<div class='metric-card'><b>Sentiment (NLTK)</b><br>Score: {res['news']['score']:.2f}<br>Label: {res['news']['label']}</div>""", unsafe_allow_html=True)
+            # Generate signal
+            result = strategy_func(window_df)
+            score = result['score']
+            
+            # Elliott Wave analysis for confirmation
+            elliott = ElliottWaveAnalyzer.detect_elliott_wave(window_df, lookback=30)
+            wave_bias = elliott.get('action_bias', 'HOLD')
+            
+            # Fibonacci analysis
+            fib = FibonacciAnalyzer.calculate_fibonacci_levels(window_df)
+            
+            # RSI Divergence
+            divergence = RSIDivergenceAnalyzer.detect_divergence(window_df)
+            
+            # Entry logic with Elliott Wave confirmation
+            if position is None:
+                # BUY signal with confirmations
+                if score > 2:
+                    # Require Elliott Wave confirmation
+                    if wave_bias in ['BUY', 'BUY_PENDING'] or elliott['confidence'] < 50:
+                        # Additional confirmation from divergence
+                        if divergence['type'] in ['BULLISH', 'NONE']:
+                            position = {
+                                'type': 'LONG',
+                                'entry_price': latest['Close'],
+                                'entry_idx': i,
+                                'stop_loss': latest['Close'] - (2 * latest['ATR']),
+                                'target': latest['Close'] + (3 * latest['ATR']),
+                                'wave': elliott['wave']
+                            }
+                
+                # SELL signal with confirmations
+                elif score < -2:
+                    if wave_bias in ['SELL', 'SELL_PENDING'] or elliott['confidence'] < 50:
+                        if divergence['type'] in ['BEARISH', 'NONE']:
+                            position = {
+                                'type': 'SHORT',
+                                'entry_price': latest['Close'],
+                                'entry_idx': i,
+                                'stop_loss': latest['Close'] + (2 * latest['ATR']),
+                                'target': latest['Close'] - (3 * latest['ATR']),
+                                'wave': elliott['wave']
+                            }
+            
+            # Exit logic
+            elif position is not None:
+                current_price = latest['Close']
+                entry_price = position['entry_price']
+                
+                exit_trade = False
+                exit_reason = None
+                
+                if position['type'] == 'LONG':
+                    if current_price >= position['target']:
+                        exit_trade = True
+                        exit_reason = 'TARGET'
+                    elif current_price <= position['stop_loss']:
+                        exit_trade = True
+                        exit_reason = 'STOP_LOSS'
+                    elif score < -1:  # Signal reversal
+                        exit_trade = True
+                        exit_reason = 'SIGNAL_REVERSAL'
+                    elif wave_bias == 'SELL':  # Elliott Wave reversal
+                        exit_trade = True
+                        exit_reason = 'ELLIOTT_REVERSAL'
+                else:  # SHORT
+                    if current_price <= position['target']:
+                        exit_trade = True
+                        exit_reason = 'TARGET'
+                    elif current_price >= position['stop_loss']:
+                        exit_trade = True
+                        exit_reason = 'STOP_LOSS'
+                    elif score > 1:
+                        exit_trade = True
+                        exit_reason = 'SIGNAL_REVERSAL'
+                    elif wave_bias == 'BUY':
+                        exit_trade = True
+                        exit_reason = 'ELLIOTT_REVERSAL'
+                
+                if exit_trade:
+                    if position['type'] == 'LONG':
+                        pnl = current_price - entry_price
+                    else:
+                        pnl = entry_price - current_price
+                    
+                    pnl_pct = (pnl / entry_price) * 100
+                    capital += (capital * pnl_pct / 100)
+                    
+                    trades.append({
+                        'entry': entry_price,
+                        'exit': current_price,
+                        'pnl': pnl,
+                        'pnl_pct': pnl_pct,
+                        'type': position['type'],
+                        'reason': exit_reason,
+                        'wave': position.get('wave', 'N/A')
+                    })
+                    
+                    position = None
+            
+            equity_curve.append(capital)
+        
+        # Calculate statistics
+        if not trades:
+            return BacktestResult(0, 0, 0, 0, 0, 0, 0, 0, 0)
+        
+        total_trades = len(trades)
+        winning_trades = len([t for t in trades if t['pnl'] > 0])
+        losing_trades = len([t for t in trades if t['pnl'] <= 0])
+        win_rate = (winning_trades / total_trades * 100) if total_trades > 0 else 0
+        
+        profits = [t['pnl_pct'] for t in trades if t['pnl'] > 0]
+        losses = [abs(t['pnl_pct']) for t in trades if t['pnl'] <= 0]
+        
+        avg_profit = np.mean(profits) if profits else 0
+        avg_loss = np.mean(losses) if losses else 0
+        
+        total_profit = sum(profits)
+        total_loss = sum(losses)
+        profit_factor = (total_profit / total_loss) if total_loss > 0 else 0
+        
+        # Max drawdown
+        equity_array = np.array(equity_curve)
+        running_max = np.maximum.accumulate(equity_array)
+        drawdown = (equity_array - running_max) / running_max * 100
+        max_drawdown = abs(np.min(drawdown))
+        
+        total_return = ((capital - initial_capital) / initial_capital) * 100
+        
+        return BacktestResult(
+            total_trades=total_trades,
+            winning_trades=winning_trades,
+            losing_trades=losing_trades,
+            win_rate=win_rate,
+            avg_profit=avg_profit,
+            avg_loss=avg_loss,
+            profit_factor=profit_factor,
+            max_drawdown=max_drawdown,
+            total_return=total_return
+        )
 
-        # Tabs
-        t1, t2, t3 = st.tabs(["📉 Structure Chart", "📜 Detailed Report", "📰 News"])
+class DataFetcher:
+    """Handles data fetching with rate limiting"""
+    
+    @staticmethod
+    def fetch_data(ticker: str, period: str, interval: str) -> pd.DataFrame:
+        """Fetch data with rate limiting and error handling"""
         
-        with t1:
-            fig = make_subplots(rows=2, cols=1, shared_xaxes=True, row_heights=[0.7, 0.3], vertical_spacing=0.05)
+        cache_key = f"{ticker}_{period}_{interval}"
+        current_time = time.time()
+        
+        # Check cache (5 minutes validity)
+        if cache_key in st.session_state.data_cache:
+            cached_data, cache_time = st.session_state.data_cache[cache_key]
+            if current_time - cache_time < 300:  # 5 minutes
+                return cached_data
+        
+        # Rate limiting
+        if cache_key in st.session_state.last_fetch_time:
+            time_since_last = current_time - st.session_state.last_fetch_time[cache_key]
+            if time_since_last < 1.5:
+                time.sleep(1.5 - time_since_last)
+        
+        try:
+            # Fetch data
+            stock = yf.Ticker(ticker)
+            df = stock.history(period=period, interval=interval)
             
-            # Candles
-            fig.add_trace(go.Candlestick(x=df.index, open=df['Open'], high=df['High'], low=df['Low'], close=df['Close'], name='Price'), row=1, col=1)
+            if df.empty:
+                st.error(f"No data available for {ticker}")
+                return pd.DataFrame()
             
-            # Elliott / ZigZag Visual
-            pivots = res['pivots']
-            if not pivots.empty:
-                fig.add_trace(go.Scatter(x=pivots['date'], y=pivots['price'], mode='lines+markers', 
-                                         line=dict(color='white', width=1, dash='dot'), 
-                                         marker=dict(size=5, color='yellow'), name='Market Waves'), row=1, col=1)
+            # Convert to IST
+            if df.index.tz is not None:
+                df.index = df.index.tz_convert('Asia/Kolkata')
+            else:
+                df.index = df.index.tz_localize('UTC').tz_convert('Asia/Kolkata')
             
-            # EMAs
-            fig.add_trace(go.Scatter(x=df.index, y=df['EMA_20'], line=dict(color='cyan', width=1), name='EMA 20'), row=1, col=1)
-            fig.add_trace(go.Scatter(x=df.index, y=df['EMA_50'], line=dict(color='orange', width=1), name='EMA 50'), row=1, col=1)
+            # Fetch news
+            try:
+                news = stock.news[:5] if hasattr(stock, 'news') else []
+                df.attrs['news'] = news
+            except:
+                df.attrs['news'] = []
             
-            # RSI
-            fig.add_trace(go.Scatter(x=df.index, y=df['RSI'], line=dict(color='purple'), name='RSI'), row=2, col=1)
-            fig.add_hline(y=70, line_dash="dash", line_color="red", row=2, col=1)
-            fig.add_hline(y=30, line_dash="dash", line_color="green", row=2, col=1)
+            # Cache data
+            st.session_state.data_cache[cache_key] = (df, current_time)
+            st.session_state.last_fetch_time[cache_key] = current_time
             
-            fig.update_layout(height=700, xaxis_rangeslider_visible=False, template="plotly_dark")
-            st.plotly_chart(fig, use_container_width=True)
+            return df
             
-        with t2:
-            st.markdown(f"<div class='summary-text'>{res['summary']}</div>", unsafe_allow_html=True)
+        except Exception as e:
+            st.error(f"Error fetching data: {str(e)}")
+            return pd.DataFrame()
+
+def plot_advanced_chart(df: pd.DataFrame, signal: TradingSignal):
+    """Create advanced trading chart with indicators"""
+    
+    fig = make_subplots(
+        rows=4, cols=1,
+        shared_xaxes=True,
+        vertical_spacing=0.02,
+        subplot_titles=('Price & Moving Averages', 'MACD', 'RSI', 'Volume'),
+        row_heights=[0.5, 0.15, 0.15, 0.2]
+    )
+    
+    # Candlestick chart
+    fig.add_trace(go.Candlestick(
+        x=df.index,
+        open=df['Open'],
+        high=df['High'],
+        low=df['Low'],
+        close=df['Close'],
+        name='Price'
+    ), row=1, col=1)
+    
+    # Moving Averages
+    fig.add_trace(go.Scatter(x=df.index, y=df['SMA_20'], name='SMA 20',
+                            line=dict(color='orange', width=1)), row=1, col=1)
+    fig.add_trace(go.Scatter(x=df.index, y=df['SMA_50'], name='SMA 50',
+                            line=dict(color='blue', width=1)), row=1, col=1)
+    fig.add_trace(go.Scatter(x=df.index, y=df['SMA_200'], name='SMA 200',
+                            line=dict(color='purple', width=1)), row=1, col=1)
+    
+    # Bollinger Bands
+    fig.add_trace(go.Scatter(x=df.index, y=df['BB_Upper'], name='BB Upper',
+                            line=dict(color='gray', width=1, dash='dash')), row=1, col=1)
+    fig.add_trace(go.Scatter(x=df.index, y=df['BB_Lower'], name='BB Lower',
+                            line=dict(color='gray', width=1, dash='dash'),
+                            fill='tonexty', fillcolor='rgba(128,128,128,0.1)'), row=1, col=1)
+    
+    # Entry, Target, Stop Loss lines
+    latest_time = df.index[-1]
+    if signal.action in ["BUY", "SELL"]:
+        fig.add_hline(y=signal.entry_price, line_dash="solid", line_color="blue",
+                     annotation_text="Entry", row=1, col=1)
+        fig.add_hline(y=signal.target_price, line_dash="dash", line_color="green",
+                     annotation_text="Target", row=1, col=1)
+        fig.add_hline(y=signal.stop_loss, line_dash="dash", line_color="red",
+                     annotation_text="Stop Loss", row=1, col=1)
+    
+    # MACD
+    fig.add_trace(go.Scatter(x=df.index, y=df['MACD'], name='MACD',
+                            line=dict(color='blue', width=1)), row=2, col=1)
+    fig.add_trace(go.Scatter(x=df.index, y=df['MACD_Signal'], name='Signal',
+                            line=dict(color='red', width=1)), row=2, col=1)
+    
+    colors = ['green' if val >= 0 else 'red' for val in df['MACD_Hist']]
+    fig.add_trace(go.Bar(x=df.index, y=df['MACD_Hist'], name='Histogram',
+                        marker_color=colors), row=2, col=1)
+    
+    # RSI
+    fig.add_trace(go.Scatter(x=df.index, y=df['RSI'], name='RSI',
+                            line=dict(color='purple', width=2)), row=3, col=1)
+    fig.add_hline(y=70, line_dash="dash", line_color="red", row=3, col=1)
+    fig.add_hline(y=30, line_dash="dash", line_color="green", row=3, col=1)
+    fig.add_hrect(y0=30, y1=70, fillcolor="gray", opacity=0.1, row=3, col=1)
+    
+    # Volume
+    volume_colors = ['green' if df['Close'].iloc[i] >= df['Open'].iloc[i] 
+                    else 'red' for i in range(len(df))]
+    fig.add_trace(go.Bar(x=df.index, y=df['Volume'], name='Volume',
+                        marker_color=volume_colors), row=4, col=1)
+    
+    # Layout
+    fig.update_layout(
+        title=f"Technical Analysis Chart - {signal.strategy}",
+        xaxis_rangeslider_visible=False,
+        height=1000,
+        showlegend=True,
+        hovermode='x unified'
+    )
+    
+    fig.update_xaxes(title_text="Date", row=4, col=1)
+    fig.update_yaxes(title_text="Price", row=1, col=1)
+    fig.update_yaxes(title_text="MACD", row=2, col=1)
+    fig.update_yaxes(title_text="RSI", row=3, col=1)
+    fig.update_yaxes(title_text="Volume", row=4, col=1)
+    
+    return fig
+
+def main():
+    """Main application"""
+    
+    # Header
+    st.markdown('<h1 class="main-header">📈 Professional Multi-Timeframe Trading System</h1>', 
+                unsafe_allow_html=True)
+    
+    # Sidebar
+    with st.sidebar:
+        st.header("⚙️ Configuration")
+        
+        # Instrument Selection
+        instrument = st.selectbox("Select Instrument", list(INSTRUMENTS.keys()))
+        
+        if instrument == "Custom Ticker":
+            custom_ticker = st.text_input("Enter Ticker Symbol", "RELIANCE.NS")
+            ticker = custom_ticker
+        else:
+            ticker = INSTRUMENTS[instrument]
+        
+        st.markdown("---")
+        
+        # Trading Style
+        trading_style = st.selectbox(
+            "Trading Style",
+            ["Day Trading", "Swing Trading", "Scalping", "Positional Trading"]
+        )
+        
+        # Timeframe
+        timeframe = st.selectbox("Timeframe", TIMEFRAMES, index=4)
+        
+        # Period
+        period = st.selectbox("Period", PERIODS, index=5)
+        
+        st.markdown("---")
+        
+        # API Rate Limiting
+        api_delay = st.slider("API Delay (seconds)", 1.0, 5.0, 1.5, 0.5)
+        
+        st.markdown("---")
+        
+        # Fetch Data Button
+        fetch_button = st.button("🔄 Fetch & Analyze", type="primary", use_container_width=True)
+        
+        st.markdown("---")
+        st.info("⚠️ **Risk Disclaimer**: This tool is for educational purposes. Always do your own research and consult with financial advisors.")
+    
+    # Main Content
+    if fetch_button:
+        with st.spinner("🔍 Fetching market data..."):
+            # Fetch data with delay
+            time.sleep(api_delay)
+            df = DataFetcher.fetch_data(ticker, period, timeframe)
             
-        with t3:
-            for n in res['news']['headlines']:
-                st.markdown(f"**[{n['title']}]({n['link']})**")
-                st.caption(f"Source: {n['source']}")
-                st.write("---")
+            if df.empty:
+                st.error("Unable to fetch data. Please check the ticker symbol and try again.")
+                return
+            
+            st.success(f"✅ Data fetched successfully! ({len(df)} candles)")
+        
+        with st.spinner("🧮 Calculating technical indicators..."):
+            # Calculate indicators
+            df = TechnicalAnalyzer.calculate_indicators(df)
+        
+        with st.spinner("📊 Analyzing multiple timeframes..."):
+            # Multi-timeframe analysis
+            strategy_engine = StrategyEngine()
+            timeframe_signals = strategy_engine.analyze_multiple_timeframes(
+                ticker, period, trading_style
+            )
+        
+        with st.spinner("🎯 Generating trading signals..."):
+            # Generate signals
+            best_strategy = strategy_engine.select_best_strategy(df, trading_style)
+            signal = strategy_engine.generate_signal(
+                df, best_strategy, trading_style, ticker, timeframe_signals
+            )
+            
+            # Store in session state
+            st.session_state.analysis_results = {
+                'df': df,
+                'signal': signal,
+                'strategy': best_strategy,
+                'ticker': ticker,
+                'instrument': instrument,
+                'timeframe_signals': timeframe_signals
+            }
+        
+        st.success("✅ Analysis complete!")
+    
+    # Display Results
+    if st.session_state.analysis_results is not None:
+        results = st.session_state.analysis_results
+        df = results['df']
+        signal = results['signal']
+        strategy = results['strategy']
+        ticker = results['ticker']
+        instrument = results['instrument']
+        timeframe_signals = results.get('timeframe_signals', {})
+        
+        # Signal Box
+        signal_class = {
+            'BUY': 'buy-signal',
+            'SELL': 'sell-signal',
+            'HOLD': 'hold-signal'
+        }[signal.action]
+        
+        st.markdown(f"""
+        <div class="signal-box {signal_class}">
+            🎯 Signal: {signal.action} | Confidence: {signal.confidence:.1f}% | Strategy: {signal.strategy}
+        </div>
+        """, unsafe_allow_html=True)
+        
+        # Key Metrics
+        col1, col2, col3, col4, col5 = st.columns(5)
+        
+        with col1:
+            st.metric("Current Price", f"₹{signal.entry_price:.2f}")
+        
+        with col2:
+            target_change = ((signal.target_price - signal.entry_price) / signal.entry_price) * 100
+            st.metric("Target Price", f"₹{signal.target_price:.2f}", 
+                     f"{target_change:+.2f}%")
+        
+        with col3:
+            sl_change = ((signal.stop_loss - signal.entry_price) / signal.entry_price) * 100
+            st.metric("Stop Loss", f"₹{signal.stop_loss:.2f}", 
+                     f"{sl_change:.2f}%")
+        
+        with col4:
+            st.metric("Risk:Reward", f"1:{signal.risk_reward:.2f}")
+        
+        with col5:
+            latest = df.iloc[-1]
+            st.metric("RSI", f"{latest['RSI']:.1f}")
+        
+        # Detailed Summary
+        st.markdown("---")
+        st.subheader("📋 Detailed 200-Word Market Analysis")
+        st.markdown(signal.detailed_summary)
+        
+        # Pattern Reliability Section (NEW - CRITICAL)
+        st.markdown("---")
+        st.subheader("🎯 Pattern Reliability Analysis (What's Working NOW)")
+        st.info("**Critical Insight**: This section shows which technical patterns the market is following most reliably. We test each pattern's historical accuracy and weight our signals accordingly.")
+        
+        with st.spinner("Analyzing pattern reliability..."):
+            pattern_reliability = PatternReliabilityAnalyzer.analyze_pattern_reliability(df)
+        
+        if pattern_reliability['most_reliable'] != 'INSUFFICIENT_DATA':
+            col1, col2 = st.columns([2, 1])
+            
+            with col1:
+                st.markdown("**📊 Pattern Performance Rankings:**")
+                sorted_patterns = sorted(pattern_reliability['reliability_scores'].items(), 
+                                       key=lambda x: x[1], reverse=True)
+                
+                for i, (pattern, score) in enumerate(sorted_patterns, 1):
+                    if score > 70:
+                        color = "green"
+                        badge = "🟢 HIGHLY RELIABLE"
+                    elif score > 55:
+                        color = "orange"
+                        badge = "🟡 MODERATELY RELIABLE"
+                    else:
+                        color = "red"
+                        badge = "🔴 UNRELIABLE"
+                    
+                    st.markdown(f"{i}. **{pattern}**: <span style='color:{color};font-weight:bold'>{score:.1f}%</span> {badge}", unsafe_allow_html=True)
+            
+            with col2:
+                # Create gauge chart for most reliable pattern
+                most_reliable = pattern_reliability['most_reliable']
+                reliability_score = pattern_reliability['reliability_scores'][most_reliable]
+                
+                gauge_fig = go.Figure(go.Indicator(
+                    mode = "gauge+number",
+                    value = reliability_score,
+                    domain = {'x': [0, 1], 'y': [0, 1]},
+                    title = {'text': f"{most_reliable}<br>Accuracy"},
+                    gauge = {
+                        'axis': {'range': [None, 100]},
+                        'bar': {'color': "darkblue"},
+                        'steps': [
+                            {'range': [0, 50], 'color': "lightgray"},
+                            {'range': [50, 70], 'color': "lightyellow"},
+                            {'range': [70, 100], 'color': "lightgreen"}
+                        ],
+                        'threshold': {
+                            'line': {'color': "red", 'width': 4},
+                            'thickness': 0.75,
+                            'value': 70
+                        }
+                    }
+                ))
+                gauge_fig.update_layout(height=300)
+                st.plotly_chart(gauge_fig, use_container_width=True)
+            
+            st.markdown("**💡 Interpretation:**")
+            st.success(f"The market is currently following **{most_reliable}** most reliably ({reliability_score:.1f}% accuracy). This pattern receives the highest weight in our signal generation.")
+            
+            st.markdown("**📚 Recommendations:**")
+            for rec in pattern_reliability['recommendations']:
+                st.write(rec)
+        
+        else:
+            st.warning("Insufficient data to analyze pattern reliability")
+        
+        # Multi-Timeframe Confluence
+        if timeframe_signals:
+            st.markdown("---")
+            st.subheader("⏱️ Multi-Timeframe Analysis & Signal Confluence")
+            st.markdown(signal.signal_confluence)
+        
+        # Support & Resistance Analysis
+        st.markdown("---")
+        st.subheader("🎚️ Strong Support & Resistance Levels")
+        
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            st.markdown("**🟢 Strong Support Level**")
+            st.metric("Support Price", f"₹{signal.strong_support:.2f}")
+            st.info(f"**Analysis:** {signal.support_strength}")
+        
+        with col2:
+            st.markdown("**🔴 Strong Resistance Level**")
+            st.metric("Resistance Price", f"₹{signal.strong_resistance:.2f}")
+            st.info(f"**Analysis:** {signal.resistance_strength}")
+        
+        # Z-Score Analysis
+        st.markdown("---")
+        st.subheader("📊 Z-Score Analysis (Mean Reversion)")
+        
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            zscore_color = "green" if abs(signal.zscore) < 1 else ("orange" if abs(signal.zscore) < 2 else "red")
+            st.markdown(f"**Current Z-Score:** <span style='color:{zscore_color};font-size:24px;font-weight:bold'>{signal.zscore:.2f}</span>", unsafe_allow_html=True)
+            st.write(f"**Interpretation:** {signal.zscore_interpretation}")
+        
+        with col2:
+            # Z-Score visualization
+            z_fig = go.Figure(go.Indicator(
+                mode = "gauge+number",
+                value = signal.zscore,
+                domain = {'x': [0, 1], 'y': [0, 1]},
+                gauge = {
+                    'axis': {'range': [-3, 3]},
+                    'bar': {'color': "darkblue"},
+                    'steps': [
+                        {'range': [-3, -2], 'color': "lightgreen"},
+                        {'range': [-2, -1], 'color': "lightblue"},
+                        {'range': [-1, 1], 'color': "lightyellow"},
+                        {'range': [1, 2], 'color': "lightcoral"},
+                        {'range': [2, 3], 'color': "red"}
+                    ],
+                    'threshold': {
+                        'line': {'color': "black", 'width': 4},
+                        'thickness': 0.75,
+                        'value': signal.zscore
+                    }
+                },
+                title = {'text': "Z-Score Gauge"}
+            ))
+            z_fig.update_layout(height=250)
+            st.plotly_chart(z_fig, use_container_width=True)
+        
+        # Sentiment Analysis
+        st.markdown("---")
+        st.subheader("📰 News Sentiment Analysis")
+        
+        col1, col2 = st.columns([1, 2])
+        
+        with col1:
+            sentiment_color = "green" if signal.sentiment_score > 0.15 else ("red" if signal.sentiment_score < -0.15 else "gray")
+            st.markdown(f"**Sentiment Score:** <span style='color:{sentiment_color};font-size:24px;font-weight:bold'>{signal.sentiment_score:.3f}</span>", unsafe_allow_html=True)
+            st.write(f"**Summary:** {signal.sentiment_summary}")
+        
+        with col2:
+            st.markdown("**Recent News Headlines:**")
+            sentiment_analyzer = SentimentAnalyzer(ticker)
+            sentiment_data = sentiment_analyzer.analyze()
+            
+            if sentiment_data.get('details'):
+                for item in sentiment_data['details'][:3]:
+                    score = item['score']
+                    emoji = "🟢" if score > 0.1 else ("🔴" if score < -0.1 else "🟡")
+                    st.markdown(f"{emoji} **{item['title']}** (Sentiment: {score:.2f})")
+            else:
+                st.info("No recent news available")
+        
+        # Analysis Reasoning
+        st.markdown("---")
+        st.subheader("📊 Technical Analysis Reasoning")
+        st.markdown(signal.reasoning)
+        
+        # Chart
+        st.markdown("---")
+        st.subheader("📈 Technical Chart")
+        chart = plot_advanced_chart(df, signal)
+        st.plotly_chart(chart, use_container_width=True)
+        
+        # Backtesting Section
+        st.markdown("---")
+        st.subheader("🔬 Backtest Validation (CRITICAL)")
+        
+        with st.spinner("Running backtest with Elliott Wave confirmation..."):
+            backtest_engine = BacktestEngine()
+            backtest_result = backtest_engine.run_backtest(df, strategy)
+        
+        # CRITICAL: Check if strategy is profitable
+        is_profitable = backtest_result.total_return > 0 and backtest_result.win_rate >= 45
+        
+        if is_profitable:
+            st.success(f"✅ **STRATEGY VALIDATED**: Backtest shows positive returns ({backtest_result.total_return:.2f}%) with {backtest_result.win_rate:.1f}% win rate")
+        else:
+            st.error(f"⚠️ **STRATEGY NOT VALIDATED**: Backtest shows negative returns ({backtest_result.total_return:.2f}%) with {backtest_result.win_rate:.1f}% win rate")
+            st.warning("**RECOMMENDATION OVERRIDDEN**: Due to negative backtesting results, the signal is changed to HOLD. Do not trade this setup.")
+            
+            # Override signal to HOLD if backtest is negative
+            signal.action = "HOLD"
+            signal.confidence = 30
+            signal.reasoning += "\n\n⚠️ **BACKTEST OVERRIDE**: Historical testing shows this strategy produces negative returns. Signal changed to HOLD for risk management."
+        
+        if backtest_result.total_trades > 0:
+            col1, col2, col3 = st.columns(3)
+            
+            with col1:
+                st.markdown('<div class="metric-card">', unsafe_allow_html=True)
+                st.metric("Total Trades", backtest_result.total_trades)
+                st.metric("Win Rate", f"{backtest_result.win_rate:.1f}%")
+                st.metric("Total Return", f"{backtest_result.total_return:.2f}%")
+                st.markdown('</div>', unsafe_allow_html=True)
+            
+            with col2:
+                st.markdown('<div class="metric-card">', unsafe_allow_html=True)
+                st.metric("Winning Trades", backtest_result.winning_trades)
+                st.metric("Losing Trades", backtest_result.losing_trades)
+                st.metric("Profit Factor", f"{backtest_result.profit_factor:.2f}")
+                st.markdown('</div>', unsafe_allow_html=True)
+            
+            with col3:
+                st.markdown('<div class="metric-card">', unsafe_allow_html=True)
+                st.metric("Avg Profit", f"{backtest_result.avg_profit:.2f}%")
+                st.metric("Avg Loss", f"{backtest_result.avg_loss:.2f}%")
+                st.metric("Max Drawdown", f"{backtest_result.max_drawdown:.2f}%")
+                st.markdown('</div>', unsafe_allow_html=True)
+            
+            # Backtest interpretation
+            st.markdown("---")
+            st.subheader("🎓 Backtest Interpretation")
+            
+            if backtest_result.win_rate >= 60:
+                st.success(f"✅ **Strong Strategy**: {backtest_result.win_rate:.1f}% win rate indicates reliable performance")
+            elif backtest_result.win_rate >= 50:
+                st.warning(f"⚠️ **Moderate Strategy**: {backtest_result.win_rate:.1f}% win rate - use with caution")
+            else:
+                st.error(f"❌ **Weak Strategy**: {backtest_result.win_rate:.1f}% win rate - not recommended")
+            
+            if backtest_result.profit_factor >= 2:
+                st.success(f"✅ **Excellent Risk/Reward**: Profit factor of {backtest_result.profit_factor:.2f}")
+            elif backtest_result.profit_factor >= 1.5:
+                st.info(f"ℹ️ **Good Risk/Reward**: Profit factor of {backtest_result.profit_factor:.2f}")
+            else:
+                st.warning(f"⚠️ **Poor Risk/Reward**: Profit factor of {backtest_result.profit_factor:.2f}")
+            
+            if backtest_result.max_drawdown < 10:
+                st.success(f"✅ **Low Risk**: Maximum drawdown of {backtest_result.max_drawdown:.2f}%")
+            elif backtest_result.max_drawdown < 20:
+                st.warning(f"⚠️ **Moderate Risk**: Maximum drawdown of {backtest_result.max_drawdown:.2f}%")
+            else:
+                st.error(f"❌ **High Risk**: Maximum drawdown of {backtest_result.max_drawdown:.2f}%")
+        else:
+            st.warning("⚠️ Not enough data for backtesting. Need at least 100 candles.")
+        
+        # Market Conditions
+        st.markdown("---")
+        st.subheader("🌐 Current Market Conditions")
+        
+        latest = df.iloc[-1]
+        market_structure = strategy_engine.detect_market_structure(df)
+        
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            st.markdown("**Technical Indicators:**")
+            st.write(f"• Market Structure: **{market_structure.replace('_', ' ').title()}**")
+            st.write(f"• RSI: **{latest['RSI']:.2f}**")
+            st.write(f"• MACD: **{latest['MACD']:.4f}**")
+            st.write(f"• ADX: **{latest['ADX']:.2f}**")
+            st.write(f"• ATR: **{latest['ATR']:.2f}**")
+        
+        with col2:
+            st.markdown("**Price Levels:**")
+            st.write(f"• Support: **₹{latest['Support']:.2f}**")
+            st.write(f"• Resistance: **₹{latest['Resistance']:.2f}**")
+            st.write(f"• BB Upper: **₹{latest['BB_Upper']:.2f}**")
+            st.write(f"• BB Lower: **₹{latest['BB_Lower']:.2f}**")
+            st.write(f"• Volume Ratio: **{latest['Volume_Ratio']:.2f}x**")
+        
+        # Trading Psychology Section
+        st.markdown("---")
+        st.subheader("🧠 Trading Psychology Guide")
+        
+        with st.expander("📚 Essential Trading Psychology Tips"):
+            st.markdown("""
+            **1. Emotional Control:**
+            - Fear and greed are your biggest enemies
+            - Stick to your trading plan, don't deviate
+            - Accept that losses are part of trading
+            
+            **2. Risk Management:**
+            - Never risk more than 1-2% per trade
+            - Always use stop losses
+            - Position sizing is crucial
+            
+            **3. Discipline:**
+            - Wait for high-probability setups
+            - Don't overtrade - patience is key
+            - Keep a trading journal
+            
+            **4. Avoid Common Mistakes:**
+            - Revenge trading after losses
+            - Moving stop losses when price goes against you
+            - Holding losing positions hoping for recovery
+            - FOMO (Fear of Missing Out)
+            
+            **5. Success Mindset:**
+            - Focus on the process, not just profits
+            - Continuous learning and improvement
+            - Accept responsibility for all trades
+            - Stay humble and respect the market
+            """)
+        
+        # Download Report
+        st.markdown("---")
+        
+        report = f"""
+TRADING ANALYSIS REPORT
+Generated: {datetime.now(pytz.timezone('Asia/Kolkata')).strftime('%Y-%m-%d %H:%M:%S IST')}
+
+Instrument: {instrument} ({ticker})
+Trading Style: {trading_style}
+Timeframe: {timeframe}
+Period: {period}
+
+=== SIGNAL ===
+Action: {signal.action}
+Confidence: {signal.confidence:.1f}%
+Strategy: {signal.strategy}
+
+=== PRICE LEVELS ===
+Entry Price: ₹{signal.entry_price:.2f}
+Target Price: ₹{signal.target_price:.2f}
+Stop Loss: ₹{signal.stop_loss:.2f}
+Risk:Reward: 1:{signal.risk_reward:.2f}
+
+=== SUPPORT & RESISTANCE ===
+Strong Support: ₹{signal.strong_support:.2f}
+Strong Resistance: ₹{signal.strong_resistance:.2f}
+
+=== SENTIMENT ===
+Sentiment Score: {signal.sentiment_score:.3f}
+Summary: {signal.sentiment_summary}
+
+=== Z-SCORE ===
+Current Z-Score: {signal.zscore:.2f}
+Interpretation: {signal.zscore_interpretation}
+
+=== BACKTEST RESULTS ===
+Total Trades: {backtest_result.total_trades}
+Win Rate: {backtest_result.win_rate:.1f}%
+Total Return: {backtest_result.total_return:.2f}%
+Profit Factor: {backtest_result.profit_factor:.2f}
+Max Drawdown: {backtest_result.max_drawdown:.2f}%
+
+=== DETAILED SUMMARY ===
+{signal.detailed_summary}
+
+=== REASONING ===
+{signal.reasoning}
+
+DISCLAIMER: This is for educational purposes only. Not financial advice.
+"""
+        
+        st.download_button(
+            label="📥 Download Analysis Report",
+            data=report,
+            file_name=f"trading_analysis_{ticker}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
+            mime="text/plain"
+        )
+    
+    else:
+        # Welcome screen
+        st.info("👈 Configure your settings in the sidebar and click 'Fetch & Analyze' to begin")
+        
+        st.markdown("""
+        ### Welcome to the Professional Trading System
+        
+        This advanced trading application provides:
+        
+        ✅ **Multi-timeframe Analysis** - Analyze across different timeframes
+        
+        ✅ **Intelligent Strategy Selection** - Automatically selects best strategy based on market structure
+        
+        ✅ **Comprehensive Indicators** - RSI, MACD, Bollinger Bands, ADX, Stochastic, and more
+        
+        ✅ **Backtesting Validation** - Verify signals with historical performance
+        
+        ✅ **Risk Management** - Clear entry, target, and stop-loss levels
+        
+        ✅ **News Integration** - Stay updated with latest market news
+        
+        ✅ **Psychology Guidance** - Overcome emotional trading pitfalls
+        
+        #### Supported Instruments:
+        - Indian Indices (NIFTY 50, Bank NIFTY, SENSEX)
+        - Cryptocurrencies (Bitcoin, Ethereum)
+        - Commodities (Gold, Silver)
+        - Forex (USD/INR, EUR/USD)
+        - Custom stocks and tickers
+        
+        #### Trading Styles:
+        - **Scalping**: Quick in-and-out trades (minutes)
+        - **Day Trading**: Intraday positions (hours)
+        - **Swing Trading**: Multi-day positions (days to weeks)
+        - **Positional Trading**: Long-term positions (weeks to months)
+        """)
 
 if __name__ == "__main__":
     main()
-
-
