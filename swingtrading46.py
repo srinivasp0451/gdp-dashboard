@@ -2639,7 +2639,8 @@ class StrategyEngine:
     
     def generate_signal(self, df: pd.DataFrame, strategy_name: str, 
                        trading_style: str, ticker: str, 
-                       timeframe_signals: Dict = None) -> TradingSignal:
+                       timeframe_signals: Dict = None,
+                       ratio_ticker: str = None) -> TradingSignal:
         """Generate final trading signal with comprehensive analysis and pattern reliability"""
         
         # Execute strategy
@@ -2677,8 +2678,12 @@ class StrategyEngine:
         # Elliott Wave Analysis
         elliott_wave = ElliottWaveAnalyzer.detect_elliott_wave(df)
         
-        # Ratio Analysis
-        benchmark = "^NSEI" if ticker.endswith(".NS") or ticker.endswith(".BO") else "^NSEI"
+        # Ratio Analysis (use provided ticker or default)
+        if ratio_ticker:
+            benchmark = ratio_ticker
+        else:
+            benchmark = "^NSEI" if ticker.endswith(".NS") or ticker.endswith(".BO") else "^NSEI"
+        
         ratio_analysis = RatioAnalyzer.analyze_relative_strength(ticker, benchmark)
         
         # Volume Analysis
