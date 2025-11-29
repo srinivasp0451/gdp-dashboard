@@ -282,6 +282,67 @@ class DataFetcher:
             return pd.DataFrame()
 
 
+class SentimentAnalyzer:
+    """News Sentiment Analysis using VADER"""
+    
+    def __init__(self, ticker: str):
+        self.ticker = ticker
+        self.vader = SentimentIntensityAnalyzer()
+    
+    def analyze(self) -> Dict:
+        """Analyze news sentiment"""
+        try:
+            news = yf.Ticker(self.ticker).news
+            
+            if not news:
+                return {"score": 0, "summary": "No Recent News", "details": []}
+            
+            scores = []
+            news_details = []
+            
+            for n in news[:5]:
+                try:
+                    title = n.get('title', '')
+                    if not title:
+                        continue
+                    
+                    sentiment_score = self.vader.polarity_scores(title)['compound']
+                    scores.append(sentiment_score)
+                    
+                    news_details.append({
+                        'title': title,
+                        'score': sentiment_score,
+                        'link': n.get('link', '#')
+                    })
+                    
+                except Exception as e:
+                    continue
+            
+            if not scores:
+                return {"score": 0, "summary": "No Valid News", "details": []}
+            
+            avg_score = sum(scores) / len(scores)
+            
+            # Determine sentiment
+            if avg_score > 0.25:
+                sentiment = "VERY POSITIVE (Strong Bullish Catalyst)"
+            elif avg_score > 0.15:
+                sentiment = "POSITIVE (Mild Bullish News)"
+            elif avg_score < -0.25:
+                sentiment = "VERY NEGATIVE (Strong Bearish Catalyst)"
+            elif avg_score < -0.15:
+                sentiment = "NEGATIVE (Mild Bearish News)"
+            else:
+                sentiment = "NEUTRAL (No Significant News Impact)"
+            
+            return {
+                "score": avg_score,
+                "summary": sentiment,
+                "details": news_details
+            }
+            
+        except Exception as e:
+            return {"score": 0, "summary": f"Error analyzing sentiment: {str(e)}", "details": []}
 
     """News Sentiment Analysis using VADER"""
     
