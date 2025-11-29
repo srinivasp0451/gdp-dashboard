@@ -12,6 +12,15 @@ from typing import Dict, List, Tuple, Optional
 import warnings
 warnings.filterwarnings('ignore')
 
+# Install vaderSentiment if not available
+try:
+    from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
+except ImportError:
+    import subprocess
+    import sys
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "vaderSentiment"])
+    from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
+
 # Page Configuration
 st.set_page_config(
     page_title="Professional Trading System",
@@ -81,6 +90,17 @@ class TradingSignal:
     strategy: str
     reasoning: str
     risk_reward: float
+    sentiment_score: float = 0
+    sentiment_summary: str = ""
+    strong_support: float = 0
+    strong_resistance: float = 0
+    support_strength: str = ""
+    resistance_strength: str = ""
+    zscore: float = 0
+    zscore_interpretation: str = ""
+    timeframe_signals: Dict = None
+    detailed_summary: str = ""
+    signal_confluence: str = ""
 
 @dataclass
 class BacktestResult:
@@ -119,7 +139,347 @@ if 'last_fetch_time' not in st.session_state:
 if 'analysis_results' not in st.session_state:
     st.session_state.analysis_results = None
 
-class TechnicalAnalyzer:
+class SentimentAnalyzer:
+    """News Sentiment Analysis using VADER"""
+    
+    def __init__(self, ticker: str):
+        self.ticker = ticker
+        self.vader = SentimentIntensityAnalyzer()
+    
+    def analyze(self) -> Dict:
+        """Analyze news sentiment"""
+        try:
+            news = yf.Ticker(self.ticker).news
+            
+            if not news:
+                return {"score": 0, "summary": "No Recent News", "details": []}
+            
+            scores = []
+            news_details = []
+            
+            for n in news[:5]:
+                try:
+                    title = n.get('title', '')
+                    if not title:
+                        continue
+                    
+                    sentiment_score = self.vader.polarity_scores(title)['compound']
+                    scores.append(sentiment_score)
+                    
+                    news_details.append({
+                        'title': title,
+                        'score': sentiment_score,
+                        'link': n.get('link', '#')
+                    })
+                    
+                except Exception as e:
+                    continue
+            
+            if not scores:
+                return {"score": 0, "summary": "No Valid News", "details": []}
+            
+            avg_score = sum(scores) / len(scores)
+            
+            # Determine sentiment
+            if avg_score > 0.25:
+                sentiment = "VERY POSITIVE (Strong Bullish Catalyst)"
+            elif avg_score > 0.15:
+                sentiment = "POSITIVE (Mild Bullish News)"
+            elif avg_score < -0.25:
+                sentiment = "VERY NEGATIVE (Strong Bearish Catalyst)"
+            elif avg_score < -0.15:
+                sentiment = "NEGATIVE (Mild Bearish News)"
+            else:
+                sentiment = "NEUTRAL (No Significant News Impact)"
+            
+            return {
+                "score": avg_score,
+                "summary": sentiment,
+                "details": news_details
+            }
+            
+        except Exception as e:
+            return {"score": 0, "summary": f"Error analyzing sentiment: {str(e)}", "details": []}
+
+
+class SupportResistanceAnalyzer:
+    """Advanced Support and Resistance Analysis"""
+    
+    @staticmethod
+    def find_strong_levels(df: pd.DataFrame) -> Dict:
+        """Identify strong support and resistance levels"""
+        
+        if len(df) < 50:
+            return {
+                'support': df['Low'].min(),
+                'resistance': df['High'].max(),
+                'support_strength': 'Insufficient data',
+                'resistance_strength': 'Insufficient data',
+                'support_touches': 0,
+                'resistance_touches': 0
+            }
+        
+        # Use multiple timeframe approach
+        close_prices = df['Close'].values
+        high_prices = df['High'].values
+        low_prices = df['Low'].values
+        
+        # Find pivot points
+        window = 10
+        resistance_levels = []
+        support_levels = []
+        
+        # Identify local maxima and minima
+        for i in range(window, len(df) - window):
+            # Resistance (local maxima)
+            if high_prices[i] == max(high_prices[i-window:i+window+1]):
+                resistance_levels.append(high_prices[i])
+            
+            # Support (local minima)
+            if low_prices[i] == min(low_prices[i-window:i+window+1]):
+                support_levels.append(low_prices[i])
+        
+        current_price = close_prices[-1]
+        
+        # Find strongest support (closest below current price with most touches)
+        supports_below = [s for s in support_levels if s < current_price]
+        if supports_below:
+            # Cluster nearby levels
+            support_clusters = SupportResistanceAnalyzer._cluster_levels(supports_below)
+            strong_support = max(support_clusters.keys())
+            support_touches = support_clusters[strong_support]
+        else:
+            strong_support = df['Low'].min()
+            support_touches = 1
+        
+        # Find strongest resistance (closest above current price with most touches)
+        resistances_above = [r for r in resistance_levels if r > current_price]
+        if resistances_above:
+            resistance_clusters = SupportResistanceAnalyzer._cluster_levels(resistances_above)
+            strong_resistance = min(resistance_clusters.keys())
+            resistance_touches = resistance_clusters[strong_resistance]
+        else:
+            strong_resistance = df['High'].max()
+            resistance_touches = 1
+        
+        # Calculate strength based on touches and volume
+        volume_at_support = SupportResistanceAnalyzer._volume_at_level(
+            df, strong_support, tolerance=0.02
+        )
+        volume_at_resistance = SupportResistanceAnalyzer._volume_at_level(
+            df, strong_resistance, tolerance=0.02
+        )
+        
+        # Strength interpretation
+        support_strength = SupportResistanceAnalyzer._interpret_strength(
+            support_touches, volume_at_support, "Support"
+        )
+        resistance_strength = SupportResistanceAnalyzer._interpret_strength(
+            resistance_touches, volume_at_resistance, "Resistance"
+        )
+        
+        return {
+            'support': strong_support,
+            'resistance': strong_resistance,
+            'support_strength': support_strength,
+            'resistance_strength': resistance_strength,
+            'support_touches': support_touches,
+            'resistance_touches': resistance_touches,
+            'support_distance': ((current_price - strong_support) / current_price) * 100,
+            'resistance_distance': ((strong_resistance - current_price) / current_price) * 100
+        }
+    
+    @staticmethod
+    def _cluster_levels(levels: List[float], tolerance: float = 0.02) -> Dict:
+        """Cluster nearby price levels and count touches"""
+        clusters = {}
+        
+        for level in levels:
+            found_cluster = False
+            for cluster_level in list(clusters.keys()):
+                if abs(level - cluster_level) / cluster_level < tolerance:
+                    clusters[cluster_level] += 1
+                    found_cluster = True
+                    break
+            
+            if not found_cluster:
+                clusters[level] = 1
+        
+        return clusters
+    
+    @staticmethod
+    def _volume_at_level(df: pd.DataFrame, level: float, tolerance: float = 0.02) -> float:
+        """Calculate average volume when price was near this level"""
+        mask = (df['Close'] >= level * (1 - tolerance)) & (df['Close'] <= level * (1 + tolerance))
+        if mask.sum() > 0:
+            return df.loc[mask, 'Volume'].mean()
+        return df['Volume'].mean()
+    
+    @staticmethod
+    def _interpret_strength(touches: int, volume: float, level_type: str) -> str:
+        """Interpret the strength of support/resistance"""
+        
+        strength_score = touches * 2
+        
+        if touches >= 5:
+            strength = "VERY STRONG"
+            reason = f"Tested {touches} times and held. This is a critical {level_type.lower()} zone."
+        elif touches >= 3:
+            strength = "STRONG"
+            reason = f"Tested {touches} times. Significant {level_type.lower()} level."
+        elif touches >= 2:
+            strength = "MODERATE"
+            reason = f"Tested {touches} times. Established {level_type.lower()}."
+        else:
+            strength = "WEAK"
+            reason = f"Only tested {touches} time. Unconfirmed {level_type.lower()}."
+        
+        importance = f"{strength} - {reason} High volume activity at this level increases its reliability."
+        
+        return importance
+
+
+class ZScoreAnalyzer:
+    """Z-Score Analysis for Mean Reversion and Extreme Conditions"""
+    
+    @staticmethod
+    def calculate_zscore(df: pd.DataFrame, window: int = 20) -> Dict:
+        """Calculate Z-Score and interpret its impact"""
+        
+        if len(df) < window:
+            return {
+                'current_zscore': 0,
+                'interpretation': 'Insufficient data',
+                'historical_impact': 'N/A',
+                'future_outlook': 'N/A'
+            }
+        
+        # Calculate rolling Z-Score
+        close_prices = df['Close']
+        rolling_mean = close_prices.rolling(window=window).mean()
+        rolling_std = close_prices.rolling(window=window).std()
+        
+        zscore = (close_prices - rolling_mean) / rolling_std
+        df['ZScore'] = zscore
+        
+        current_zscore = zscore.iloc[-1]
+        
+        # Historical analysis
+        historical_analysis = ZScoreAnalyzer._analyze_historical_zscore(df, window)
+        
+        # Current interpretation
+        if current_zscore > 2:
+            interpretation = "EXTREMELY OVERBOUGHT"
+            signal = "Strong mean reversion expected - consider selling"
+        elif current_zscore > 1.5:
+            interpretation = "OVERBOUGHT"
+            signal = "Price extended above mean - potential pullback"
+        elif current_zscore > 1:
+            interpretation = "MODERATELY OVERBOUGHT"
+            signal = "Price above average - watch for reversal"
+        elif current_zscore < -2:
+            interpretation = "EXTREMELY OVERSOLD"
+            signal = "Strong mean reversion expected - consider buying"
+        elif current_zscore < -1.5:
+            interpretation = "OVERSOLD"
+            signal = "Price extended below mean - potential bounce"
+        elif current_zscore < -1:
+            interpretation = "MODERATELY OVERSOLD"
+            signal = "Price below average - watch for recovery"
+        else:
+            interpretation = "NEUTRAL"
+            signal = "Price near historical average - no extreme condition"
+        
+        # Future outlook
+        future_outlook = ZScoreAnalyzer._forecast_based_on_zscore(
+            current_zscore, historical_analysis
+        )
+        
+        return {
+            'current_zscore': current_zscore,
+            'interpretation': f"{interpretation} (Z={current_zscore:.2f})",
+            'signal': signal,
+            'historical_impact': historical_analysis,
+            'future_outlook': future_outlook
+        }
+    
+    @staticmethod
+    def _analyze_historical_zscore(df: pd.DataFrame, window: int) -> str:
+        """Analyze how Z-Score behaved historically"""
+        
+        zscore = df['ZScore'].dropna()
+        
+        if len(zscore) < 50:
+            return "Limited historical data for Z-Score analysis"
+        
+        # Count extreme events
+        extreme_high = (zscore > 2).sum()
+        extreme_low = (zscore < -2).sum()
+        
+        # Check mean reversion success rate
+        reversion_success = 0
+        total_extremes = 0
+        
+        for i in range(len(zscore) - 10):
+            if zscore.iloc[i] > 2:  # Overbought
+                # Check if price reverted in next 10 periods
+                future_prices = df['Close'].iloc[i+1:i+11]
+                if future_prices.min() < df['Close'].iloc[i]:
+                    reversion_success += 1
+                total_extremes += 1
+            
+            elif zscore.iloc[i] < -2:  # Oversold
+                future_prices = df['Close'].iloc[i+1:i+11]
+                if future_prices.max() > df['Close'].iloc[i]:
+                    reversion_success += 1
+                total_extremes += 1
+        
+        success_rate = (reversion_success / total_extremes * 100) if total_extremes > 0 else 0
+        
+        analysis = f"Historical Z-Score analysis: {extreme_high} overbought events, "
+        analysis += f"{extreme_low} oversold events. Mean reversion success rate: {success_rate:.1f}%. "
+        
+        if success_rate > 70:
+            analysis += "Strong historical tendency to revert to mean."
+        elif success_rate > 50:
+            analysis += "Moderate mean reversion tendency."
+        else:
+            analysis += "Weak mean reversion - trending market."
+        
+        return analysis
+    
+    @staticmethod
+    def _forecast_based_on_zscore(current_zscore: float, historical: str) -> str:
+        """Forecast future price movement based on Z-Score"""
+        
+        if current_zscore > 2:
+            forecast = "HIGH PROBABILITY of price decline in coming sessions. "
+            forecast += "Z-Score above 2 indicates extreme deviation from mean. "
+            forecast += "Historical data suggests mean reversion is likely. "
+            forecast += "Consider taking profits or waiting for pullback before entering longs."
+        
+        elif current_zscore > 1:
+            forecast = "MODERATE PROBABILITY of consolidation or mild pullback. "
+            forecast += "Price is stretched but not at extreme levels. "
+            forecast += "Could continue higher with momentum, but risk/reward favors caution."
+        
+        elif current_zscore < -2:
+            forecast = "HIGH PROBABILITY of price recovery in coming sessions. "
+            forecast += "Z-Score below -2 indicates extreme undervaluation relative to recent mean. "
+            forecast += "Historical patterns suggest strong bounce potential. "
+            forecast += "Risk/reward favors buying at these oversold levels."
+        
+        elif current_zscore < -1:
+            forecast = "MODERATE PROBABILITY of upward move. "
+            forecast += "Price below average presents opportunity. "
+            forecast += "Could decline further, but statistical edge favors buyers."
+        
+        else:
+            forecast = "NEUTRAL OUTLOOK - Price near equilibrium. "
+            forecast += "No statistical edge from Z-Score. "
+            forecast += "Rely on trend, momentum, and other technical indicators."
+        
+        return forecast
     """Advanced Technical Analysis Engine"""
     
     @staticmethod
@@ -217,6 +577,55 @@ class StrategyEngine:
             'breakout': self.breakout_strategy,
             'scalping': self.scalping_strategy
         }
+    
+    def analyze_multiple_timeframes(self, ticker: str, period: str, 
+                                   trading_style: str) -> Dict:
+        """Analyze multiple timeframes and generate signals"""
+        
+        timeframe_map = {
+            'Scalping': ['1m', '5m', '15m'],
+            'Day Trading': ['5m', '15m', '1h'],
+            'Swing Trading': ['1h', '4h', '1d'],
+            'Positional Trading': ['1d', '1d', '1d']  # Same for all
+        }
+        
+        timeframes = timeframe_map.get(trading_style, ['15m', '1h', '4h'])
+        timeframe_results = {}
+        
+        for tf in timeframes:
+            try:
+                time.sleep(1.5)  # Rate limiting
+                df = DataFetcher.fetch_data(ticker, period, tf)
+                
+                if df.empty:
+                    continue
+                
+                df = TechnicalAnalyzer.calculate_indicators(df)
+                market_structure = self.detect_market_structure(df)
+                strategy = self.select_best_strategy(df, trading_style)
+                result = self.strategies[strategy](df)
+                
+                # Determine signal
+                score = result['score']
+                if score > 2:
+                    signal = "BUY"
+                elif score < -2:
+                    signal = "SELL"
+                else:
+                    signal = "HOLD"
+                
+                timeframe_results[tf] = {
+                    'signal': signal,
+                    'score': score,
+                    'strategy': strategy,
+                    'market_structure': market_structure,
+                    'signals_list': result['signals'][:3]  # Top 3 signals
+                }
+                
+            except Exception as e:
+                continue
+        
+        return timeframe_results
     
     def detect_market_structure(self, df: pd.DataFrame) -> str:
         """Detect current market structure"""
@@ -439,8 +848,9 @@ class StrategyEngine:
         return {'score': score, 'signals': signals}
     
     def generate_signal(self, df: pd.DataFrame, strategy_name: str, 
-                       trading_style: str) -> TradingSignal:
-        """Generate final trading signal with risk management"""
+                       trading_style: str, ticker: str, 
+                       timeframe_signals: Dict = None) -> TradingSignal:
+        """Generate final trading signal with comprehensive analysis"""
         
         # Execute strategy
         strategy_func = self.strategies[strategy_name]
@@ -453,30 +863,47 @@ class StrategyEngine:
         atr = latest['ATR']
         close = latest['Close']
         
+        # Sentiment Analysis
+        sentiment_analyzer = SentimentAnalyzer(ticker)
+        sentiment_result = sentiment_analyzer.analyze()
+        
+        # Adjust score based on sentiment
+        sentiment_adjustment = sentiment_result['score'] * 1.5
+        adjusted_score = score + sentiment_adjustment
+        
+        # Support/Resistance Analysis
+        sr_analysis = SupportResistanceAnalyzer.find_strong_levels(df)
+        
+        # Z-Score Analysis
+        zscore_analysis = ZScoreAnalyzer.calculate_zscore(df)
+        
+        # Adjust score based on Z-Score
+        zscore = zscore_analysis['current_zscore']
+        if zscore > 2:
+            adjusted_score -= 1.5  # Overbought, reduce buy signals
+        elif zscore < -2:
+            adjusted_score += 1.5  # Oversold, boost buy signals
+        
         # Determine action and confidence
-        if score > 2:
+        if adjusted_score > 2:
             action = "BUY"
-            confidence = min(score / 5 * 100, 95)
-        elif score < -2:
+            confidence = min(adjusted_score / 5 * 100, 95)
+        elif adjusted_score < -2:
             action = "SELL"
-            confidence = min(abs(score) / 5 * 100, 95)
+            confidence = min(abs(adjusted_score) / 5 * 100, 95)
         else:
             action = "HOLD"
-            confidence = 50 - abs(score) * 10
+            confidence = 50 - abs(adjusted_score) * 10
         
-        # Calculate risk management levels
+        # Calculate risk management levels using S/R
         if action == "BUY":
             entry_price = close
-            # Support-based stop loss
-            stop_loss = max(latest['Support'], close - (2 * atr))
-            # Resistance-based target
-            target_price = min(latest['Resistance'], close + (3 * atr))
+            stop_loss = max(sr_analysis['support'] * 0.99, close - (2 * atr))
+            target_price = min(sr_analysis['resistance'] * 1.01, close + (3 * atr))
         elif action == "SELL":
             entry_price = close
-            # Resistance-based stop loss
-            stop_loss = min(latest['Resistance'], close + (2 * atr))
-            # Support-based target
-            target_price = max(latest['Support'], close - (3 * atr))
+            stop_loss = min(sr_analysis['resistance'] * 1.01, close + (2 * atr))
+            target_price = max(sr_analysis['support'] * 0.99, close - (3 * atr))
         else:
             entry_price = close
             stop_loss = close - (1.5 * atr)
@@ -490,9 +917,20 @@ class StrategyEngine:
         else:
             risk_reward = 1.0
         
-        # Generate reasoning
+        # Generate comprehensive reasoning
         reasoning = self._generate_reasoning(df, action, signals, 
                                              strategy_name, trading_style)
+        
+        # Generate detailed summary
+        detailed_summary = self._generate_detailed_summary(
+            df, action, adjusted_score, sentiment_result, 
+            sr_analysis, zscore_analysis, timeframe_signals
+        )
+        
+        # Generate signal confluence explanation
+        confluence_explanation = self._generate_confluence_explanation(
+            timeframe_signals, action, trading_style
+        )
         
         return TradingSignal(
             action=action,
@@ -503,8 +941,160 @@ class StrategyEngine:
             timeframe="Combined",
             strategy=strategy_name.replace('_', ' ').title(),
             reasoning=reasoning,
-            risk_reward=risk_reward
+            risk_reward=risk_reward,
+            sentiment_score=sentiment_result['score'],
+            sentiment_summary=sentiment_result['summary'],
+            strong_support=sr_analysis['support'],
+            strong_resistance=sr_analysis['resistance'],
+            support_strength=sr_analysis['support_strength'],
+            resistance_strength=sr_analysis['resistance_strength'],
+            zscore=zscore,
+            zscore_interpretation=zscore_analysis['interpretation'],
+            timeframe_signals=timeframe_signals,
+            detailed_summary=detailed_summary,
+            signal_confluence=confluence_explanation
         )
+    
+    def _generate_detailed_summary(self, df: pd.DataFrame, action: str, 
+                                  score: float, sentiment: Dict, 
+                                  sr_analysis: Dict, zscore_analysis: Dict,
+                                  timeframe_signals: Dict) -> str:
+        """Generate detailed 100-word summary with values"""
+        
+        latest = df.iloc[-1]
+        prev_week = df.iloc[-5] if len(df) > 5 else df.iloc[0]
+        
+        price_change = ((latest['Close'] - prev_week['Close']) / prev_week['Close']) * 100
+        
+        summary = f"**Comprehensive Market Summary:**\n\n"
+        
+        # Past Structure
+        summary += f"**Past 7 Days:** Price moved from ₹{prev_week['Close']:.2f} to ₹{latest['Close']:.2f} "
+        summary += f"({price_change:+.2f}%). "
+        
+        if price_change > 5:
+            summary += "Strong bullish momentum observed. "
+        elif price_change < -5:
+            summary += "Strong bearish pressure evident. "
+        else:
+            summary += "Consolidation phase with limited directional movement. "
+        
+        # Current Structure
+        summary += f"\n\n**Current Structure:** RSI at {latest['RSI']:.1f} "
+        if latest['RSI'] > 70:
+            summary += "(overbought territory), "
+        elif latest['RSI'] < 30:
+            summary += "(oversold territory), "
+        else:
+            summary += "(neutral zone), "
+        
+        summary += f"ADX at {latest['ADX']:.1f} "
+        if latest['ADX'] > 25:
+            summary += "indicating strong trend. "
+        else:
+            summary += "suggesting weak/ranging market. "
+        
+        summary += f"Z-Score at {zscore_analysis['current_zscore']:.2f} "
+        if abs(zscore_analysis['current_zscore']) > 2:
+            summary += "shows extreme deviation from mean - high mean reversion probability. "
+        else:
+            summary += "indicates price near statistical equilibrium. "
+        
+        # Support/Resistance Context
+        summary += f"\n\n**Key Levels:** Strong support at ₹{sr_analysis['support']:.2f} "
+        summary += f"({sr_analysis['support_distance']:.2f}% below), "
+        summary += f"resistance at ₹{sr_analysis['resistance']:.2f} "
+        summary += f"({sr_analysis['resistance_distance']:.2f}% above). "
+        
+        # Sentiment
+        summary += f"News sentiment is {sentiment['summary']} (score: {sentiment['score']:.2f}). "
+        
+        # Future Forecast
+        summary += f"\n\n**Forecast:** {action} signal generated with {score:.1f} points. "
+        
+        if action == "BUY":
+            summary += f"Expect upward move toward ₹{sr_analysis['resistance']:.2f} resistance. "
+            summary += "Entry recommended near current levels with stop below support. "
+        elif action == "SELL":
+            summary += f"Expect downward move toward ₹{sr_analysis['support']:.2f} support. "
+            summary += "Short positions viable with stop above resistance. "
+        else:
+            summary += "No clear directional bias. Wait for better setup. "
+        
+        summary += f"{zscore_analysis['future_outlook'][:100]}"
+        
+        return summary
+    
+    def _generate_confluence_explanation(self, timeframe_signals: Dict, 
+                                        final_action: str, 
+                                        trading_style: str) -> str:
+        """Explain how different timeframes contributed to final decision"""
+        
+        if not timeframe_signals:
+            return "Single timeframe analysis used for signal generation."
+        
+        explanation = f"**Multi-Timeframe Analysis for {trading_style}:**\n\n"
+        
+        buy_count = 0
+        sell_count = 0
+        hold_count = 0
+        
+        for tf, data in timeframe_signals.items():
+            signal = data['signal']
+            score = data['score']
+            strategy = data['strategy'].replace('_', ' ').title()
+            market = data['market_structure'].replace('_', ' ').title()
+            
+            if signal == "BUY":
+                buy_count += 1
+                emoji = "🟢"
+            elif signal == "SELL":
+                sell_count += 1
+                emoji = "🔴"
+            else:
+                hold_count += 1
+                emoji = "🟡"
+            
+            explanation += f"{emoji} **{tf} Timeframe:** {signal} signal (Score: {score:.2f})\n"
+            explanation += f"   • Strategy: {strategy}\n"
+            explanation += f"   • Market: {market}\n"
+            explanation += f"   • Key Factors: {', '.join(data['signals_list'][:2])}\n\n"
+        
+        # Confluence Decision
+        explanation += f"**Decision Logic:**\n"
+        explanation += f"• BUY signals: {buy_count}/{len(timeframe_signals)}\n"
+        explanation += f"• SELL signals: {sell_count}/{len(timeframe_signals)}\n"
+        explanation += f"• HOLD signals: {hold_count}/{len(timeframe_signals)}\n\n"
+        
+        if final_action == "BUY":
+            explanation += f"**Why BUY Will Work:** "
+            if buy_count >= 2:
+                explanation += f"Strong confluence across {buy_count} timeframes. "
+                explanation += "Multiple timeframe alignment significantly increases probability of success. "
+            else:
+                explanation += "Primary timeframe shows strong bullish setup. "
+            
+            explanation += "Lower timeframes provide entry precision while higher timeframes confirm trend direction. "
+            explanation += "Combined with positive sentiment and oversold conditions, risk/reward favors long positions."
+        
+        elif final_action == "SELL":
+            explanation += f"**Why SELL Will Work:** "
+            if sell_count >= 2:
+                explanation += f"Strong confluence across {sell_count} timeframes. "
+                explanation += "Multiple timeframe alignment creates high-confidence short setup. "
+            else:
+                explanation += "Primary timeframe shows strong bearish setup. "
+            
+            explanation += "Lower timeframes identify reversal points while higher timeframes confirm downtrend. "
+            explanation += "Combined with negative sentiment and overbought readings, downside risk is elevated."
+        
+        else:
+            explanation += f"**Why HOLD is Prudent:** "
+            explanation += "Conflicting signals across timeframes indicate market indecision. "
+            explanation += "Trading in uncertain conditions reduces edge and increases risk. "
+            explanation += "Patience is key - wait for clearer multi-timeframe alignment before committing capital."
+        
+        return explanation
     
     def _generate_reasoning(self, df: pd.DataFrame, action: str, 
                            signals: List[str], strategy: str, 
@@ -899,11 +1489,19 @@ def main():
             analyzer = TechnicalAnalyzer()
             df = analyzer.calculate_indicators(df)
         
+        with st.spinner("📊 Analyzing multiple timeframes..."):
+            # Multi-timeframe analysis
+            strategy_engine = StrategyEngine()
+            timeframe_signals = strategy_engine.analyze_multiple_timeframes(
+                ticker, period, trading_style
+            )
+        
         with st.spinner("🎯 Generating trading signals..."):
             # Generate signals
-            strategy_engine = StrategyEngine()
             best_strategy = strategy_engine.select_best_strategy(df, trading_style)
-            signal = strategy_engine.generate_signal(df, best_strategy, trading_style)
+            signal = strategy_engine.generate_signal(
+                df, best_strategy, trading_style, ticker, timeframe_signals
+            )
             
             # Store in session state
             st.session_state.analysis_results = {
@@ -911,7 +1509,8 @@ def main():
                 'signal': signal,
                 'strategy': best_strategy,
                 'ticker': ticker,
-                'instrument': instrument
+                'instrument': instrument,
+                'timeframe_signals': timeframe_signals
             }
         
         st.success("✅ Analysis complete!")
@@ -924,6 +1523,7 @@ def main():
         strategy = results['strategy']
         ticker = results['ticker']
         instrument = results['instrument']
+        timeframe_signals = results.get('timeframe_signals', {})
         
         # Signal Box
         signal_class = {
@@ -961,25 +1561,98 @@ def main():
             latest = df.iloc[-1]
             st.metric("RSI", f"{latest['RSI']:.1f}")
         
-        # News Section
+        # Detailed Summary
         st.markdown("---")
-        st.subheader("📰 Latest News")
+        st.subheader("📋 Detailed Market Summary")
+        st.markdown(signal.detailed_summary)
         
-        news = df.attrs.get('news', [])
-        if news:
-            for item in news:
-                with st.expander(f"📌 {item.get('title', 'News Item')}"):
-                    st.write(f"**Publisher:** {item.get('publisher', 'Unknown')}")
-                    st.write(f"**Link:** [{item.get('link', '#')}]({item.get('link', '#')})")
-                    if 'providerPublishTime' in item:
-                        pub_time = datetime.fromtimestamp(item['providerPublishTime'])
-                        st.write(f"**Published:** {pub_time.strftime('%Y-%m-%d %H:%M')}")
-        else:
-            st.info("No recent news available")
+        # Multi-Timeframe Confluence
+        if timeframe_signals:
+            st.markdown("---")
+            st.subheader("⏱️ Multi-Timeframe Analysis & Signal Confluence")
+            st.markdown(signal.signal_confluence)
+        
+        # Support & Resistance Analysis
+        st.markdown("---")
+        st.subheader("🎚️ Strong Support & Resistance Levels")
+        
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            st.markdown("**🟢 Strong Support Level**")
+            st.metric("Support Price", f"₹{signal.strong_support:.2f}")
+            st.info(f"**Analysis:** {signal.support_strength}")
+        
+        with col2:
+            st.markdown("**🔴 Strong Resistance Level**")
+            st.metric("Resistance Price", f"₹{signal.strong_resistance:.2f}")
+            st.info(f"**Analysis:** {signal.resistance_strength}")
+        
+        # Z-Score Analysis
+        st.markdown("---")
+        st.subheader("📊 Z-Score Analysis (Mean Reversion)")
+        
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            zscore_color = "green" if abs(signal.zscore) < 1 else ("orange" if abs(signal.zscore) < 2 else "red")
+            st.markdown(f"**Current Z-Score:** <span style='color:{zscore_color};font-size:24px;font-weight:bold'>{signal.zscore:.2f}</span>", unsafe_allow_html=True)
+            st.write(f"**Interpretation:** {signal.zscore_interpretation}")
+        
+        with col2:
+            # Z-Score visualization
+            z_fig = go.Figure(go.Indicator(
+                mode = "gauge+number",
+                value = signal.zscore,
+                domain = {'x': [0, 1], 'y': [0, 1]},
+                gauge = {
+                    'axis': {'range': [-3, 3]},
+                    'bar': {'color': "darkblue"},
+                    'steps': [
+                        {'range': [-3, -2], 'color': "lightgreen"},
+                        {'range': [-2, -1], 'color': "lightblue"},
+                        {'range': [-1, 1], 'color': "lightyellow"},
+                        {'range': [1, 2], 'color': "lightcoral"},
+                        {'range': [2, 3], 'color': "red"}
+                    ],
+                    'threshold': {
+                        'line': {'color': "black", 'width': 4},
+                        'thickness': 0.75,
+                        'value': signal.zscore
+                    }
+                },
+                title = {'text': "Z-Score Gauge"}
+            ))
+            z_fig.update_layout(height=250)
+            st.plotly_chart(z_fig, use_container_width=True)
+        
+        # Sentiment Analysis
+        st.markdown("---")
+        st.subheader("📰 News Sentiment Analysis")
+        
+        col1, col2 = st.columns([1, 2])
+        
+        with col1:
+            sentiment_color = "green" if signal.sentiment_score > 0.15 else ("red" if signal.sentiment_score < -0.15 else "gray")
+            st.markdown(f"**Sentiment Score:** <span style='color:{sentiment_color};font-size:24px;font-weight:bold'>{signal.sentiment_score:.3f}</span>", unsafe_allow_html=True)
+            st.write(f"**Summary:** {signal.sentiment_summary}")
+        
+        with col2:
+            st.markdown("**Recent News Headlines:**")
+            sentiment_analyzer = SentimentAnalyzer(ticker)
+            sentiment_data = sentiment_analyzer.analyze()
+            
+            if sentiment_data.get('details'):
+                for item in sentiment_data['details'][:3]:
+                    score = item['score']
+                    emoji = "🟢" if score > 0.1 else ("🔴" if score < -0.1 else "🟡")
+                    st.markdown(f"{emoji} **{item['title']}** (Sentiment: {score:.2f})")
+            else:
+                st.info("No recent news available")
         
         # Analysis Reasoning
         st.markdown("---")
-        st.subheader("📊 Analysis Summary")
+        st.subheader("📊 Technical Analysis Reasoning")
         st.markdown(signal.reasoning)
         
         # Chart
