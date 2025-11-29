@@ -689,7 +689,412 @@ class ZScoreAnalyzer:
         return forecast
 
 
-class PatternReliabilityAnalyzer:
+class FibonacciAnalyzer:
+    """Fibonacci Retracement and Extension Analysis"""
+    
+    @staticmethod
+    def calculate_fibonacci_levels(df: pd.DataFrame, lookback: int = 50) -> Dict:
+        """Calculate Fibonacci retracement and extension levels"""
+        
+        if len(df) < lookback:
+            lookback = len(df)
+        
+        recent_data = df.iloc[-lookback:]
+        high = recent_data['High'].max()
+        low = recent_data['Low'].min()
+        diff = high - low
+        
+        current_price = df['Close'].iloc[-1]
+        
+        # Determine trend direction
+        sma_20 = df['SMA_20'].iloc[-1] if 'SMA_20' in df.columns else current_price
+        trend = "UPTREND" if current_price > sma_20 else "DOWNTREND"
+        
+        # Retracement levels (for pullbacks in trend)
+        if trend == "UPTREND":
+            fib_levels = {
+                '0%': high,
+                '23.6%': high - (diff * 0.236),
+                '38.2%': high - (diff * 0.382),
+                '50%': high - (diff * 0.50),
+                '61.8%': high - (diff * 0.618),
+                '78.6%': high - (diff * 0.786),
+                '100%': low
+            }
+        else:  # DOWNTREND
+            fib_levels = {
+                '0%': low,
+                '23.6%': low + (diff * 0.236),
+                '38.2%': low + (diff * 0.382),
+                '50%': low + (diff * 0.50),
+                '61.8%': low + (diff * 0.618),
+                '78.6%': low + (diff * 0.786),
+                '100%': high
+            }
+        
+        # Extension levels (for targets)
+        if trend == "UPTREND":
+            extensions = {
+                '127.2%': high + (diff * 0.272),
+                '161.8%': high + (diff * 0.618),
+                '200%': high + diff,
+                '261.8%': high + (diff * 1.618)
+            }
+        else:
+            extensions = {
+                '127.2%': low - (diff * 0.272),
+                '161.8%': low - (diff * 0.618),
+                '200%': low - diff,
+                '261.8%': low - (diff * 1.618)
+            }
+        
+        # Find nearest support/resistance
+        nearest_support = None
+        nearest_resistance = None
+        min_dist_support = float('inf')
+        min_dist_resistance = float('inf')
+        
+        for level_name, level_value in fib_levels.items():
+            dist = abs(current_price - level_value)
+            if level_value < current_price and dist < min_dist_support:
+                nearest_support = (level_name, level_value)
+                min_dist_support = dist
+            elif level_value > current_price and dist < min_dist_resistance:
+                nearest_resistance = (level_name, level_value)
+                min_dist_resistance = dist
+        
+        return {
+            'trend': trend,
+            'levels': fib_levels,
+            'extensions': extensions,
+            'nearest_support': nearest_support,
+            'nearest_resistance': nearest_resistance,
+            'high': high,
+            'low': low
+        }
+
+
+class RSIDivergenceAnalyzer:
+    """RSI Divergence Detection"""
+    
+    @staticmethod
+    def detect_divergence(df: pd.DataFrame, lookback: int = 20) -> Dict:
+        """Detect bullish and bearish RSI divergences"""
+        
+        if len(df) < lookback or 'RSI' not in df.columns:
+            return {'type': 'NONE', 'strength': 0, 'description': 'Insufficient data or RSI not available'}
+        
+        recent_df = df.iloc[-lookback:].copy()
+        prices = recent_df['Close'].values
+        rsi = recent_df['RSI'].values
+        
+        # Find peaks and troughs in price
+        price_peaks = []
+        price_troughs = []
+        
+        for i in range(2, len(prices) - 2):
+            # Peak
+            if prices[i] > prices[i-1] and prices[i] > prices[i-2] and \
+               prices[i] > prices[i+1] and prices[i] > prices[i+2]:
+                price_peaks.append((i, prices[i]))
+            
+            # Trough
+            if prices[i] < prices[i-1] and prices[i] < prices[i-2] and \
+               prices[i] < prices[i+1] and prices[i] < prices[i+2]:
+                price_troughs.append((i, prices[i]))
+        
+        # Bearish Divergence (price making higher highs, RSI making lower highs)
+        if len(price_peaks) >= 2:
+            last_peak_idx, last_peak_price = price_peaks[-1]
+            prev_peak_idx, prev_peak_price = price_peaks[-2]
+            
+            if last_peak_price > prev_peak_price and rsi[last_peak_idx] < rsi[prev_peak_idx]:
+                strength = abs(rsi[prev_peak_idx] - rsi[last_peak_idx])
+                return {
+                    'type': 'BEARISH',
+                    'strength': strength,
+                    'description': f'Price made higher high ({prev_peak_price:.2f} -> {last_peak_price:.2f}) but RSI made lower high ({rsi[prev_peak_idx]:.1f} -> {rsi[last_peak_idx]:.1f}). Indicates weakening momentum - potential reversal down.'
+                }
+        
+        # Bullish Divergence (price making lower lows, RSI making higher lows)
+        if len(price_troughs) >= 2:
+            last_trough_idx, last_trough_price = price_troughs[-1]
+            prev_trough_idx, prev_trough_price = price_troughs[-2]
+            
+            if last_trough_price < prev_trough_price and rsi[last_trough_idx] > rsi[prev_trough_idx]:
+                strength = abs(rsi[last_trough_idx] - rsi[prev_trough_idx])
+                return {
+                    'type': 'BULLISH',
+                    'strength': strength,
+                    'description': f'Price made lower low ({prev_trough_price:.2f} -> {last_trough_price:.2f}) but RSI made higher low ({rsi[prev_trough_idx]:.1f} -> {rsi[last_trough_idx]:.1f}). Indicates strengthening momentum - potential reversal up.'
+                }
+        
+        return {
+            'type': 'NONE',
+            'strength': 0,
+            'description': 'No significant divergence detected'
+        }
+
+
+class ElliottWaveAnalyzer:
+    """Elliott Wave Pattern Detection"""
+    
+    @staticmethod
+    def detect_elliott_wave(df: pd.DataFrame, lookback: int = 50) -> Dict:
+        """Detect Elliott Wave patterns and current wave position"""
+        
+        if len(df) < lookback:
+            lookback = len(df)
+        
+        recent_df = df.iloc[-lookback:].copy()
+        prices = recent_df['Close'].values
+        
+        # Find significant pivots (simplified wave detection)
+        pivots = ElliottWaveAnalyzer._find_pivots(prices)
+        
+        if len(pivots) < 5:
+            return {
+                'wave': 'UNKNOWN',
+                'confidence': 0,
+                'description': 'Insufficient pivot points for Elliott Wave analysis',
+                'next_expected': 'N/A',
+                'action_bias': 'HOLD'
+            }
+        
+        # Analyze last 5 pivots for Elliott Wave pattern
+        last_5_pivots = pivots[-5:]
+        wave_pattern = ElliottWaveAnalyzer._identify_wave_pattern(last_5_pivots, prices)
+        
+        return wave_pattern
+    
+    @staticmethod
+    def _find_pivots(prices: np.ndarray, order: int = 5) -> List:
+        """Find pivot points (local maxima and minima)"""
+        pivots = []
+        
+        for i in range(order, len(prices) - order):
+            # Check for peak
+            if all(prices[i] >= prices[i-j] for j in range(1, order+1)) and \
+               all(prices[i] >= prices[i+j] for j in range(1, order+1)):
+                pivots.append({'index': i, 'price': prices[i], 'type': 'HIGH'})
+            
+            # Check for trough
+            elif all(prices[i] <= prices[i-j] for j in range(1, order+1)) and \
+                 all(prices[i] <= prices[i+j] for j in range(1, order+1)):
+                pivots.append({'index': i, 'price': prices[i], 'type': 'LOW'})
+        
+        return pivots
+    
+    @staticmethod
+    def _identify_wave_pattern(pivots: List, prices: np.ndarray) -> Dict:
+        """Identify Elliott Wave pattern from pivots"""
+        
+        current_price = prices[-1]
+        last_pivot = pivots[-1]
+        
+        # Simplified pattern detection
+        if len(pivots) >= 5:
+            # Check for impulse pattern
+            types = [p['type'] for p in pivots[-5:]]
+            
+            # Upward impulse: LOW, HIGH, LOW, HIGH, LOW (current above last high)
+            if types == ['LOW', 'HIGH', 'LOW', 'HIGH', 'LOW']:
+                wave_5_target = pivots[-2]['price']  # Wave 3 high
+                
+                if current_price > wave_5_target:
+                    return {
+                        'wave': 'WAVE 5 (Final Impulse Up)',
+                        'confidence': 75,
+                        'description': 'In final upward wave. Expect completion soon followed by correction. Wave 5 often equals Wave 1 in length.',
+                        'next_expected': 'Corrective Wave A (Downward)',
+                        'action_bias': 'SELL'
+                    }
+                else:
+                    return {
+                        'wave': 'WAVE 4 (Correction)',
+                        'confidence': 70,
+                        'description': 'In corrective Wave 4. Expect final Wave 5 push upward. Wave 4 typically retraces 38.2% of Wave 3.',
+                        'next_expected': 'Wave 5 (Final Push Up)',
+                        'action_bias': 'BUY_PENDING'
+                    }
+            
+            # Downward impulse: HIGH, LOW, HIGH, LOW, HIGH
+            elif types == ['HIGH', 'LOW', 'HIGH', 'LOW', 'HIGH']:
+                wave_5_target = pivots[-2]['price']  # Wave 3 low
+                
+                if current_price < wave_5_target:
+                    return {
+                        'wave': 'WAVE 5 (Final Impulse Down)',
+                        'confidence': 75,
+                        'description': 'In final downward wave. Expect completion soon followed by correction upward.',
+                        'next_expected': 'Corrective Wave A (Upward)',
+                        'action_bias': 'BUY'
+                    }
+                else:
+                    return {
+                        'wave': 'WAVE 4 (Correction)',
+                        'confidence': 70,
+                        'description': 'In corrective Wave 4. Expect final Wave 5 push downward.',
+                        'next_expected': 'Wave 5 (Final Push Down)',
+                        'action_bias': 'SELL_PENDING'
+                    }
+            
+            # Wave 3 (strongest move)
+            elif len(pivots) >= 3:
+                if types[-3:] == ['LOW', 'HIGH', 'LOW'] and current_price > pivots[-2]['price']:
+                    return {
+                        'wave': 'WAVE 3 (Strong Impulse)',
+                        'confidence': 80,
+                        'description': 'In powerful Wave 3 - strongest and longest wave. High momentum expected.',
+                        'next_expected': 'Wave 4 (Correction)',
+                        'action_bias': 'BUY'
+                    }
+                elif types[-3:] == ['HIGH', 'LOW', 'HIGH'] and current_price < pivots[-2]['price']:
+                    return {
+                        'wave': 'WAVE 3 (Strong Impulse Down)',
+                        'confidence': 80,
+                        'description': 'In powerful downward Wave 3. Strong selling pressure.',
+                        'next_expected': 'Wave 4 (Bounce)',
+                        'action_bias': 'SELL'
+                    }
+        
+        return {
+            'wave': 'TRANSITIONAL',
+            'confidence': 40,
+            'description': 'Pattern not clearly defined. May be in corrective or early impulse phase.',
+            'next_expected': 'Wait for clear pattern formation',
+            'action_bias': 'HOLD'
+        }
+
+
+class RatioAnalyzer:
+    """Comparative Ratio Analysis with Market Index"""
+    
+    @staticmethod
+    def analyze_relative_strength(ticker: str, benchmark: str = "^NSEI") -> Dict:
+        """Analyze ticker performance relative to benchmark"""
+        
+        try:
+            # Add delay for rate limiting
+            time.sleep(1.5)
+            
+            # Fetch both tickers
+            stock_data = yf.Ticker(ticker).history(period='3mo', interval='1d')
+            time.sleep(1.5)
+            benchmark_data = yf.Ticker(benchmark).history(period='3mo', interval='1d')
+            
+            if stock_data.empty or benchmark_data.empty:
+                return {
+                    'relative_strength': 1.0,
+                    'outperformance': 0,
+                    'stock_return': 0,
+                    'benchmark_return': 0,
+                    'interpretation': 'Insufficient data for comparison'
+                }
+            
+            # Calculate returns
+            stock_return = ((stock_data['Close'].iloc[-1] - stock_data['Close'].iloc[0]) / 
+                          stock_data['Close'].iloc[0]) * 100
+            
+            benchmark_return = ((benchmark_data['Close'].iloc[-1] - benchmark_data['Close'].iloc[0]) / 
+                              benchmark_data['Close'].iloc[0]) * 100
+            
+            # Relative strength ratio
+            relative_strength = stock_return / benchmark_return if benchmark_return != 0 else 1.0
+            outperformance = stock_return - benchmark_return
+            
+            # Interpretation
+            if relative_strength > 1.2:
+                interpretation = f"STRONG OUTPERFORMER: Stock up {stock_return:.2f}% vs benchmark {benchmark_return:.2f}%. Shows strong relative strength - positive indicator."
+            elif relative_strength > 1.0:
+                interpretation = f"OUTPERFORMER: Stock up {stock_return:.2f}% vs benchmark {benchmark_return:.2f}%. Moderate relative strength."
+            elif relative_strength > 0.8:
+                interpretation = f"UNDERPERFORMER: Stock up {stock_return:.2f}% vs benchmark {benchmark_return:.2f}%. Lagging the market."
+            else:
+                interpretation = f"WEAK: Stock up {stock_return:.2f}% vs benchmark {benchmark_return:.2f}%. Significant underperformance - caution advised."
+            
+            return {
+                'relative_strength': relative_strength,
+                'outperformance': outperformance,
+                'stock_return': stock_return,
+                'benchmark_return': benchmark_return,
+                'interpretation': interpretation
+            }
+            
+        except Exception as e:
+            return {
+                'relative_strength': 1.0,
+                'outperformance': 0,
+                'stock_return': 0,
+                'benchmark_return': 0,
+                'interpretation': f'Error in ratio analysis: {str(e)}'
+            }
+
+
+class VolumeAnalyzer:
+    """Volume Analysis for confirmation"""
+    
+    @staticmethod
+    def analyze_volume(df: pd.DataFrame) -> Dict:
+        """Analyze volume patterns and trends"""
+        
+        if 'Volume' not in df.columns or df['Volume'].sum() == 0:
+            return {
+                'available': False,
+                'interpretation': 'Volume data not available for this instrument',
+                'volume_trend': 'N/A',
+                'volume_score': 0
+            }
+        
+        latest = df.iloc[-1]
+        volume_sma = df['Volume'].rolling(window=20).mean().iloc[-1]
+        volume_ratio = latest['Volume'] / volume_sma if volume_sma > 0 else 1
+        
+        # Volume trend (increasing or decreasing)
+        recent_volume = df['Volume'].iloc[-10:].mean()
+        older_volume = df['Volume'].iloc[-20:-10].mean()
+        volume_trend_pct = ((recent_volume - older_volume) / older_volume * 100) if older_volume > 0 else 0
+        
+        # Price-Volume relationship
+        price_change = ((latest['Close'] - df['Close'].iloc[-2]) / df['Close'].iloc[-2]) * 100
+        
+        # Determine volume trend
+        if volume_trend_pct > 20:
+            volume_trend = "INCREASING"
+        elif volume_trend_pct < -20:
+            volume_trend = "DECREASING"
+        else:
+            volume_trend = "STABLE"
+        
+        # Volume score (contribution to signal)
+        volume_score = 0
+        interpretation = ""
+        
+        if volume_ratio > 1.5 and price_change > 0:
+            volume_score = 1.5
+            interpretation = f"BULLISH CONFIRMATION: High volume ({volume_ratio:.2f}x average) on up move. Strong buying pressure."
+        elif volume_ratio > 1.5 and price_change < 0:
+            volume_score = -1.5
+            interpretation = f"BEARISH CONFIRMATION: High volume ({volume_ratio:.2f}x average) on down move. Strong selling pressure."
+        elif volume_ratio < 0.5:
+            volume_score = -0.5
+            interpretation = f"LOW CONVICTION: Volume ({volume_ratio:.2f}x average) below normal. Move lacks conviction."
+        else:
+            interpretation = f"NORMAL VOLUME: Volume ({volume_ratio:.2f}x average) near average. No special signal."
+        
+        interpretation += f" Volume trend is {volume_trend} ({volume_trend_pct:+.1f}%)."
+        
+        return {
+            'available': True,
+            'volume_ratio': volume_ratio,
+            'volume_trend': volume_trend,
+            'volume_trend_pct': volume_trend_pct,
+            'interpretation': interpretation,
+            'volume_score': volume_score
+        }
+
+
+
     """Analyzes which patterns/indicators the market is following most reliably"""
     
     @staticmethod
@@ -1810,11 +2215,18 @@ class StrategyEngine:
         benchmark = "^NSEI" if ticker.endswith(".NS") or ticker.endswith(".BO") else "^NSEI"
         ratio_analysis = RatioAnalyzer.analyze_relative_strength(ticker, benchmark)
         
+        # Volume Analysis
+        volume_analysis = VolumeAnalyzer.analyze_volume(df)
+        
         # Adjust score based on all factors WITH RELIABILITY WEIGHTING
         adjusted_score = score
         
         # Sentiment adjustment
         adjusted_score += sentiment_result['score'] * 1.5
+        
+        # Volume adjustment (if available)
+        if volume_analysis['available']:
+            adjusted_score += volume_analysis['volume_score']
         
         # Z-Score adjustment
         zscore = zscore_analysis['current_zscore']
@@ -2846,13 +3258,13 @@ class DataFetcher:
             return pd.DataFrame()
 
 def plot_advanced_chart(df: pd.DataFrame, signal: TradingSignal):
-    """Create advanced trading chart with indicators"""
+    """Create advanced trading chart with indicators, Elliott Waves, and Fibonacci"""
     
     fig = make_subplots(
         rows=4, cols=1,
         shared_xaxes=True,
         vertical_spacing=0.02,
-        subplot_titles=('Price & Moving Averages', 'MACD', 'RSI', 'Volume'),
+        subplot_titles=('Price, Elliott Wave & Fibonacci', 'MACD', 'RSI', 'Volume'),
         row_heights=[0.5, 0.15, 0.15, 0.2]
     )
     
@@ -2871,8 +3283,9 @@ def plot_advanced_chart(df: pd.DataFrame, signal: TradingSignal):
                             line=dict(color='orange', width=1)), row=1, col=1)
     fig.add_trace(go.Scatter(x=df.index, y=df['SMA_50'], name='SMA 50',
                             line=dict(color='blue', width=1)), row=1, col=1)
-    fig.add_trace(go.Scatter(x=df.index, y=df['SMA_200'], name='SMA 200',
-                            line=dict(color='purple', width=1)), row=1, col=1)
+    if 'SMA_200' in df.columns:
+        fig.add_trace(go.Scatter(x=df.index, y=df['SMA_200'], name='SMA 200',
+                                line=dict(color='purple', width=1)), row=1, col=1)
     
     # Bollinger Bands
     fig.add_trace(go.Scatter(x=df.index, y=df['BB_Upper'], name='BB Upper',
@@ -2880,6 +3293,43 @@ def plot_advanced_chart(df: pd.DataFrame, signal: TradingSignal):
     fig.add_trace(go.Scatter(x=df.index, y=df['BB_Lower'], name='BB Lower',
                             line=dict(color='gray', width=1, dash='dash'),
                             fill='tonexty', fillcolor='rgba(128,128,128,0.1)'), row=1, col=1)
+    
+    # Fibonacci Levels
+    try:
+        fib_analysis = FibonacciAnalyzer.calculate_fibonacci_levels(df)
+        for level_name, level_value in fib_analysis['levels'].items():
+            if level_name in ['38.2%', '50%', '61.8%']:  # Show key Fib levels
+                fig.add_hline(y=level_value, line_dash="dot", line_color="gold",
+                             annotation_text=f"Fib {level_name}", 
+                             annotation_position="right",
+                             row=1, col=1, opacity=0.5)
+    except:
+        pass
+    
+    # Elliott Wave Pivots
+    try:
+        elliott = ElliottWaveAnalyzer.detect_elliott_wave(df)
+        if elliott['confidence'] > 60:
+            # Add text annotation for current wave
+            latest_time = df.index[-1]
+            latest_price = df['Close'].iloc[-1]
+            fig.add_annotation(
+                x=latest_time,
+                y=latest_price,
+                text=f"<b>{elliott['wave']}</b>",
+                showarrow=True,
+                arrowhead=2,
+                arrowsize=1,
+                arrowwidth=2,
+                arrowcolor="purple",
+                ax=40,
+                ay=-40,
+                font=dict(size=12, color="purple"),
+                bgcolor="rgba(255,255,255,0.8)",
+                row=1, col=1
+            )
+    except:
+        pass
     
     # Entry, Target, Stop Loss lines
     latest_time = df.index[-1]
@@ -2892,31 +3342,34 @@ def plot_advanced_chart(df: pd.DataFrame, signal: TradingSignal):
                      annotation_text="Stop Loss", row=1, col=1)
     
     # MACD
-    fig.add_trace(go.Scatter(x=df.index, y=df['MACD'], name='MACD',
-                            line=dict(color='blue', width=1)), row=2, col=1)
-    fig.add_trace(go.Scatter(x=df.index, y=df['MACD_Signal'], name='Signal',
-                            line=dict(color='red', width=1)), row=2, col=1)
-    
-    colors = ['green' if val >= 0 else 'red' for val in df['MACD_Hist']]
-    fig.add_trace(go.Bar(x=df.index, y=df['MACD_Hist'], name='Histogram',
-                        marker_color=colors), row=2, col=1)
+    if 'MACD' in df.columns:
+        fig.add_trace(go.Scatter(x=df.index, y=df['MACD'], name='MACD',
+                                line=dict(color='blue', width=1)), row=2, col=1)
+        fig.add_trace(go.Scatter(x=df.index, y=df['MACD_Signal'], name='Signal',
+                                line=dict(color='red', width=1)), row=2, col=1)
+        
+        colors = ['green' if val >= 0 else 'red' for val in df['MACD_Hist']]
+        fig.add_trace(go.Bar(x=df.index, y=df['MACD_Hist'], name='Histogram',
+                            marker_color=colors), row=2, col=1)
     
     # RSI
-    fig.add_trace(go.Scatter(x=df.index, y=df['RSI'], name='RSI',
-                            line=dict(color='purple', width=2)), row=3, col=1)
-    fig.add_hline(y=70, line_dash="dash", line_color="red", row=3, col=1)
-    fig.add_hline(y=30, line_dash="dash", line_color="green", row=3, col=1)
-    fig.add_hrect(y0=30, y1=70, fillcolor="gray", opacity=0.1, row=3, col=1)
+    if 'RSI' in df.columns:
+        fig.add_trace(go.Scatter(x=df.index, y=df['RSI'], name='RSI',
+                                line=dict(color='purple', width=2)), row=3, col=1)
+        fig.add_hline(y=70, line_dash="dash", line_color="red", row=3, col=1)
+        fig.add_hline(y=30, line_dash="dash", line_color="green", row=3, col=1)
+        fig.add_hrect(y0=30, y1=70, fillcolor="gray", opacity=0.1, row=3, col=1)
     
     # Volume
-    volume_colors = ['green' if df['Close'].iloc[i] >= df['Open'].iloc[i] 
-                    else 'red' for i in range(len(df))]
-    fig.add_trace(go.Bar(x=df.index, y=df['Volume'], name='Volume',
-                        marker_color=volume_colors), row=4, col=1)
+    if 'Volume' in df.columns and df['Volume'].sum() > 0:
+        volume_colors = ['green' if df['Close'].iloc[i] >= df['Open'].iloc[i] 
+                        else 'red' for i in range(len(df))]
+        fig.add_trace(go.Bar(x=df.index, y=df['Volume'], name='Volume',
+                            marker_color=volume_colors), row=4, col=1)
     
     # Layout
     fig.update_layout(
-        title=f"Technical Analysis Chart - {signal.strategy}",
+        title=f"Technical Analysis Chart - {signal.strategy} | Elliott Wave: {elliott.get('wave', 'N/A') if 'elliott' in locals() else 'N/A'}",
         xaxis_rangeslider_visible=False,
         height=1000,
         showlegend=True,
