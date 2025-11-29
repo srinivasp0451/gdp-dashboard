@@ -297,17 +297,25 @@ class SentimentAnalyzer:
             if not news:
                 return {"score": 0, "summary": "No Recent News", "details": []}
             
-            scores = []
+            score = 0
             news_details = []
+            valid_count = 0
             
             for n in news[:5]:
                 try:
-                    title = n.get('title', '')
+                    # Try different ways to access title
+                    title = None
+                    if 'title' in n:
+                        title = n['title']
+                    elif 'content' in n and 'title' in n['content']:
+                        title = n['content']['title']
+                    
                     if not title:
                         continue
                     
                     sentiment_score = self.vader.polarity_scores(title)['compound']
-                    scores.append(sentiment_score)
+                    score += sentiment_score
+                    valid_count += 1
                     
                     news_details.append({
                         'title': title,
@@ -318,22 +326,17 @@ class SentimentAnalyzer:
                 except Exception as e:
                     continue
             
-            if not scores:
+            if valid_count == 0:
                 return {"score": 0, "summary": "No Valid News", "details": []}
             
-            avg_score = sum(scores) / len(scores)
+            avg_score = score / valid_count
             
             # Determine sentiment
-            if avg_score > 0.25:
-                sentiment = "VERY POSITIVE (Strong Bullish Catalyst)"
-            elif avg_score > 0.15:
-                sentiment = "POSITIVE (Mild Bullish News)"
-            elif avg_score < -0.25:
-                sentiment = "VERY NEGATIVE (Strong Bearish Catalyst)"
+            sentiment = "NEUTRAL"
+            if avg_score > 0.15:
+                sentiment = "POSITIVE (News Catalyst)"
             elif avg_score < -0.15:
-                sentiment = "NEGATIVE (Mild Bearish News)"
-            else:
-                sentiment = "NEUTRAL (No Significant News Impact)"
+                sentiment = "NEGATIVE (Bad Press)"
             
             return {
                 "score": avg_score,
@@ -342,7 +345,7 @@ class SentimentAnalyzer:
             }
             
         except Exception as e:
-            return {"score": 0, "summary": f"Error analyzing sentiment: {str(e)}", "details": []}
+            return {"score": 0, "summary": f"Error: {str(e)}", "details": []}
 
     """News Sentiment Analysis using VADER"""
     
@@ -543,7 +546,341 @@ class SupportResistanceAnalyzer:
         return importance
 
 
-class ZScoreAnalyzer:
+class FibonacciAnalyzer:
+    """Fibonacci Retracement and Extension Analysis"""
+    
+    @staticmethod
+    def calculate_fibonacci_levels(df: pd.DataFrame, lookback: int = 50) -> Dict:
+        """Calculate Fibonacci retracement and extension levels"""
+        
+        if len(df) < lookback:
+            lookback = len(df)
+        
+        recent_data = df.iloc[-lookback:]
+        high = recent_data['High'].max()
+        low = recent_data['Low'].min()
+        diff = high - low
+        
+        current_price = df['Close'].iloc[-1]
+        
+        # Determine trend direction
+        sma_20 = df['SMA_20'].iloc[-1]
+        trend = "UPTREND" if current_price > sma_20 else "DOWNTREND"
+        
+        # Retracement levels (for pullbacks in trend)
+        if trend == "UPTREND":
+            fib_levels = {
+                '0%': high,
+                '23.6%': high - (diff * 0.236),
+                '38.2%': high - (diff * 0.382),
+                '50%': high - (diff * 0.50),
+                '61.8%': high - (diff * 0.618),
+                '78.6%': high - (diff * 0.786),
+                '100%': low
+            }
+        else:  # DOWNTREND
+            fib_levels = {
+                '0%': low,
+                '23.6%': low + (diff * 0.236),
+                '38.2%': low + (diff * 0.382),
+                '50%': low + (diff * 0.50),
+                '61.8%': low + (diff * 0.618),
+                '78.6%': low + (diff * 0.786),
+                '100%': high
+            }
+        
+        # Extension levels (for targets)
+        if trend == "UPTREND":
+            extensions = {
+                '127.2%': high + (diff * 0.272),
+                '161.8%': high + (diff * 0.618),
+                '200%': high + diff,
+                '261.8%': high + (diff * 1.618)
+            }
+        else:
+            extensions = {
+                '127.2%': low - (diff * 0.272),
+                '161.8%': low - (diff * 0.618),
+                '200%': low - diff,
+                '261.8%': low - (diff * 1.618)
+            }
+        
+        # Find nearest support/resistance
+        nearest_support = None
+        nearest_resistance = None
+        min_dist_support = float('inf')
+        min_dist_resistance = float('inf')
+        
+        for level_name, level_value in fib_levels.items():
+            dist = abs(current_price - level_value)
+            if level_value < current_price and dist < min_dist_support:
+                nearest_support = (level_name, level_value)
+                min_dist_support = dist
+            elif level_value > current_price and dist < min_dist_resistance:
+                nearest_resistance = (level_name, level_value)
+                min_dist_resistance = dist
+        
+        return {
+            'trend': trend,
+            'levels': fib_levels,
+            'extensions': extensions,
+            'nearest_support': nearest_support,
+            'nearest_resistance': nearest_resistance,
+            'high': high,
+            'low': low
+        }
+
+
+class RSIDivergenceAnalyzer:
+    """RSI Divergence Detection"""
+    
+    @staticmethod
+    def detect_divergence(df: pd.DataFrame, lookback: int = 20) -> Dict:
+        """Detect bullish and bearish RSI divergences"""
+        
+        if len(df) < lookback:
+            return {'type': 'NONE', 'strength': 0, 'description': 'Insufficient data'}
+        
+        recent_df = df.iloc[-lookback:].copy()
+        prices = recent_df['Close'].values
+        rsi = recent_df['RSI'].values
+        
+        # Find peaks and troughs in price
+        price_peaks = []
+        price_troughs = []
+        
+        for i in range(2, len(prices) - 2):
+            # Peak
+            if prices[i] > prices[i-1] and prices[i] > prices[i-2] and \
+               prices[i] > prices[i+1] and prices[i] > prices[i+2]:
+                price_peaks.append((i, prices[i]))
+            
+            # Trough
+            if prices[i] < prices[i-1] and prices[i] < prices[i-2] and \
+               prices[i] < prices[i+1] and prices[i] < prices[i+2]:
+                price_troughs.append((i, prices[i]))
+        
+        # Bearish Divergence (price making higher highs, RSI making lower highs)
+        if len(price_peaks) >= 2:
+            last_peak_idx, last_peak_price = price_peaks[-1]
+            prev_peak_idx, prev_peak_price = price_peaks[-2]
+            
+            if last_peak_price > prev_peak_price and rsi[last_peak_idx] < rsi[prev_peak_idx]:
+                strength = abs(rsi[prev_peak_idx] - rsi[last_peak_idx])
+                return {
+                    'type': 'BEARISH',
+                    'strength': strength,
+                    'description': f'Price made higher high ({prev_peak_price:.2f} -> {last_peak_price:.2f}) but RSI made lower high ({rsi[prev_peak_idx]:.1f} -> {rsi[last_peak_idx]:.1f}). Indicates weakening momentum - potential reversal down.'
+                }
+        
+        # Bullish Divergence (price making lower lows, RSI making higher lows)
+        if len(price_troughs) >= 2:
+            last_trough_idx, last_trough_price = price_troughs[-1]
+            prev_trough_idx, prev_trough_price = price_troughs[-2]
+            
+            if last_trough_price < prev_trough_price and rsi[last_trough_idx] > rsi[prev_trough_idx]:
+                strength = abs(rsi[last_trough_idx] - rsi[prev_trough_idx])
+                return {
+                    'type': 'BULLISH',
+                    'strength': strength,
+                    'description': f'Price made lower low ({prev_trough_price:.2f} -> {last_trough_price:.2f}) but RSI made higher low ({rsi[prev_trough_idx]:.1f} -> {rsi[last_trough_idx]:.1f}). Indicates strengthening momentum - potential reversal up.'
+                }
+        
+        return {
+            'type': 'NONE',
+            'strength': 0,
+            'description': 'No significant divergence detected'
+        }
+
+
+class ElliottWaveAnalyzer:
+    """Elliott Wave Pattern Detection"""
+    
+    @staticmethod
+    def detect_elliott_wave(df: pd.DataFrame, lookback: int = 50) -> Dict:
+        """Detect Elliott Wave patterns and current wave position"""
+        
+        if len(df) < lookback:
+            lookback = len(df)
+        
+        recent_df = df.iloc[-lookback:].copy()
+        prices = recent_df['Close'].values
+        
+        # Find significant pivots (simplified wave detection)
+        pivots = ElliottWaveAnalyzer._find_pivots(prices)
+        
+        if len(pivots) < 5:
+            return {
+                'wave': 'UNKNOWN',
+                'confidence': 0,
+                'description': 'Insufficient pivot points for Elliott Wave analysis',
+                'next_expected': 'N/A'
+            }
+        
+        # Analyze last 5 pivots for Elliott Wave pattern
+        last_5_pivots = pivots[-5:]
+        wave_pattern = ElliottWaveAnalyzer._identify_wave_pattern(last_5_pivots, prices)
+        
+        return wave_pattern
+    
+    @staticmethod
+    def _find_pivots(prices: np.ndarray, order: int = 5) -> List:
+        """Find pivot points (local maxima and minima)"""
+        pivots = []
+        
+        for i in range(order, len(prices) - order):
+            # Check for peak
+            if all(prices[i] >= prices[i-j] for j in range(1, order+1)) and \
+               all(prices[i] >= prices[i+j] for j in range(1, order+1)):
+                pivots.append({'index': i, 'price': prices[i], 'type': 'HIGH'})
+            
+            # Check for trough
+            elif all(prices[i] <= prices[i-j] for j in range(1, order+1)) and \
+                 all(prices[i] <= prices[i+j] for j in range(1, order+1)):
+                pivots.append({'index': i, 'price': prices[i], 'type': 'LOW'})
+        
+        return pivots
+    
+    @staticmethod
+    def _identify_wave_pattern(pivots: List, prices: np.ndarray) -> Dict:
+        """Identify Elliott Wave pattern from pivots"""
+        
+        # Impulse Wave Pattern (5 waves: 1-up, 2-down, 3-up, 4-down, 5-up)
+        # Corrective Wave Pattern (3 waves: A-down, B-up, C-down)
+        
+        current_price = prices[-1]
+        last_pivot = pivots[-1]
+        
+        # Simplified pattern detection
+        if len(pivots) >= 5:
+            # Check for impulse pattern
+            types = [p['type'] for p in pivots[-5:]]
+            
+            # Upward impulse: LOW, HIGH, LOW, HIGH, LOW (current above last high)
+            if types == ['LOW', 'HIGH', 'LOW', 'HIGH', 'LOW']:
+                wave_5_target = pivots[-2]['price']  # Wave 3 high
+                
+                if current_price > wave_5_target:
+                    return {
+                        'wave': 'WAVE 5 (Final Impulse Up)',
+                        'confidence': 75,
+                        'description': 'In final upward wave. Expect completion soon followed by correction. Wave 5 often equals Wave 1 in length.',
+                        'next_expected': 'Corrective Wave A (Downward)',
+                        'action_bias': 'SELL'
+                    }
+                else:
+                    return {
+                        'wave': 'WAVE 4 (Correction)',
+                        'confidence': 70,
+                        'description': 'In corrective Wave 4. Expect final Wave 5 push upward. Wave 4 typically retraces 38.2% of Wave 3.',
+                        'next_expected': 'Wave 5 (Final Push Up)',
+                        'action_bias': 'BUY_PENDING'
+                    }
+            
+            # Downward impulse: HIGH, LOW, HIGH, LOW, HIGH
+            elif types == ['HIGH', 'LOW', 'HIGH', 'LOW', 'HIGH']:
+                wave_5_target = pivots[-2]['price']  # Wave 3 low
+                
+                if current_price < wave_5_target:
+                    return {
+                        'wave': 'WAVE 5 (Final Impulse Down)',
+                        'confidence': 75,
+                        'description': 'In final downward wave. Expect completion soon followed by correction upward.',
+                        'next_expected': 'Corrective Wave A (Upward)',
+                        'action_bias': 'BUY'
+                    }
+                else:
+                    return {
+                        'wave': 'WAVE 4 (Correction)',
+                        'confidence': 70,
+                        'description': 'In corrective Wave 4. Expect final Wave 5 push downward.',
+                        'next_expected': 'Wave 5 (Final Push Down)',
+                        'action_bias': 'SELL_PENDING'
+                    }
+            
+            # Wave 3 (strongest move)
+            elif len(pivots) >= 3:
+                if types[-3:] == ['LOW', 'HIGH', 'LOW'] and current_price > pivots[-2]['price']:
+                    return {
+                        'wave': 'WAVE 3 (Strong Impulse)',
+                        'confidence': 80,
+                        'description': 'In powerful Wave 3 - strongest and longest wave. High momentum expected.',
+                        'next_expected': 'Wave 4 (Correction)',
+                        'action_bias': 'BUY'
+                    }
+                elif types[-3:] == ['HIGH', 'LOW', 'HIGH'] and current_price < pivots[-2]['price']:
+                    return {
+                        'wave': 'WAVE 3 (Strong Impulse Down)',
+                        'confidence': 80,
+                        'description': 'In powerful downward Wave 3. Strong selling pressure.',
+                        'next_expected': 'Wave 4 (Bounce)',
+                        'action_bias': 'SELL'
+                    }
+        
+        return {
+            'wave': 'TRANSITIONAL',
+            'confidence': 40,
+            'description': 'Pattern not clearly defined. May be in corrective or early impulse phase.',
+            'next_expected': 'Wait for clear pattern formation',
+            'action_bias': 'HOLD'
+        }
+
+
+class RatioAnalyzer:
+    """Comparative Ratio Analysis with Market Index"""
+    
+    @staticmethod
+    def analyze_relative_strength(ticker: str, benchmark: str = "^NSEI") -> Dict:
+        """Analyze ticker performance relative to benchmark"""
+        
+        try:
+            # Fetch both tickers
+            stock_data = yf.Ticker(ticker).history(period='3mo', interval='1d')
+            benchmark_data = yf.Ticker(benchmark).history(period='3mo', interval='1d')
+            
+            if stock_data.empty or benchmark_data.empty:
+                return {
+                    'relative_strength': 1.0,
+                    'outperformance': 0,
+                    'interpretation': 'Insufficient data for comparison'
+                }
+            
+            # Calculate returns
+            stock_return = ((stock_data['Close'].iloc[-1] - stock_data['Close'].iloc[0]) / 
+                          stock_data['Close'].iloc[0]) * 100
+            
+            benchmark_return = ((benchmark_data['Close'].iloc[-1] - benchmark_data['Close'].iloc[0]) / 
+                              benchmark_data['Close'].iloc[0]) * 100
+            
+            # Relative strength ratio
+            relative_strength = stock_return / benchmark_return if benchmark_return != 0 else 1.0
+            outperformance = stock_return - benchmark_return
+            
+            # Interpretation
+            if relative_strength > 1.2:
+                interpretation = f"STRONG OUTPERFORMER: Stock up {stock_return:.2f}% vs benchmark {benchmark_return:.2f}%. Shows strong relative strength - positive indicator."
+            elif relative_strength > 1.0:
+                interpretation = f"OUTPERFORMER: Stock up {stock_return:.2f}% vs benchmark {benchmark_return:.2f}%. Moderate relative strength."
+            elif relative_strength > 0.8:
+                interpretation = f"UNDERPERFORMER: Stock up {stock_return:.2f}% vs benchmark {benchmark_return:.2f}%. Lagging the market."
+            else:
+                interpretation = f"WEAK: Stock up {stock_return:.2f}% vs benchmark {benchmark_return:.2f}%. Significant underperformance - caution advised."
+            
+            return {
+                'relative_strength': relative_strength,
+                'outperformance': outperformance,
+                'stock_return': stock_return,
+                'benchmark_return': benchmark_return,
+                'interpretation': interpretation
+            }
+            
+        except Exception as e:
+            return {
+                'relative_strength': 1.0,
+                'outperformance': 0,
+                'interpretation': f'Error in ratio analysis: {str(e)}'
+            }
+
     """Z-Score Analysis for Mean Reversion and Extreme Conditions"""
     
     @staticmethod
@@ -1071,43 +1408,108 @@ class StrategyEngine:
         sentiment_analyzer = SentimentAnalyzer(ticker)
         sentiment_result = sentiment_analyzer.analyze()
         
-        # Adjust score based on sentiment
-        sentiment_adjustment = sentiment_result['score'] * 1.5
-        adjusted_score = score + sentiment_adjustment
-        
         # Support/Resistance Analysis
         sr_analysis = SupportResistanceAnalyzer.find_strong_levels(df)
         
         # Z-Score Analysis
         zscore_analysis = ZScoreAnalyzer.calculate_zscore(df)
         
-        # Adjust score based on Z-Score
+        # Fibonacci Analysis
+        fib_analysis = FibonacciAnalyzer.calculate_fibonacci_levels(df)
+        
+        # RSI Divergence
+        divergence = RSIDivergenceAnalyzer.detect_divergence(df)
+        
+        # Elliott Wave Analysis
+        elliott_wave = ElliottWaveAnalyzer.detect_elliott_wave(df)
+        
+        # Ratio Analysis (compare with NIFTY for Indian stocks)
+        benchmark = "^NSEI" if ticker.endswith(".NS") or ticker.endswith(".BO") else "^NSEI"
+        ratio_analysis = RatioAnalyzer.analyze_relative_strength(ticker, benchmark)
+        
+        # Adjust score based on all factors
+        adjusted_score = score
+        
+        # Sentiment adjustment
+        adjusted_score += sentiment_result['score'] * 1.5
+        
+        # Z-Score adjustment
         zscore = zscore_analysis['current_zscore']
         if zscore > 2:
-            adjusted_score -= 1.5  # Overbought, reduce buy signals
+            adjusted_score -= 1.5
         elif zscore < -2:
-            adjusted_score += 1.5  # Oversold, boost buy signals
+            adjusted_score += 1.5
+        
+        # Elliott Wave adjustment (CRITICAL)
+        wave_bias = elliott_wave.get('action_bias', 'HOLD')
+        if wave_bias == 'BUY':
+            adjusted_score += 1.0
+        elif wave_bias == 'SELL':
+            adjusted_score -= 1.0
+        elif wave_bias in ['BUY_PENDING', 'SELL_PENDING']:
+            adjusted_score *= 0.7  # Reduce confidence
+        
+        # RSI Divergence adjustment
+        if divergence['type'] == 'BULLISH':
+            adjusted_score += divergence['strength'] * 0.1
+        elif divergence['type'] == 'BEARISH':
+            adjusted_score -= divergence['strength'] * 0.1
+        
+        # Ratio analysis adjustment
+        if ratio_analysis['relative_strength'] > 1.2:
+            adjusted_score += 0.5
+        elif ratio_analysis['relative_strength'] < 0.8:
+            adjusted_score -= 0.5
         
         # Determine action and confidence
-        if adjusted_score > 2:
+        if adjusted_score > 2.5:
             action = "BUY"
-            confidence = min(adjusted_score / 5 * 100, 95)
-        elif adjusted_score < -2:
+            confidence = min(adjusted_score / 6 * 100, 95)
+        elif adjusted_score < -2.5:
             action = "SELL"
-            confidence = min(abs(adjusted_score) / 5 * 100, 95)
+            confidence = min(abs(adjusted_score) / 6 * 100, 95)
         else:
             action = "HOLD"
-            confidence = 50 - abs(adjusted_score) * 10
+            confidence = 50 - abs(adjusted_score) * 8
         
-        # Calculate risk management levels using S/R
+        # CRITICAL: Override action if Elliott Wave strongly contradicts
+        if elliott_wave['confidence'] > 70:
+            if action == "BUY" and wave_bias == "SELL":
+                action = "HOLD"
+                confidence *= 0.5
+            elif action == "SELL" and wave_bias == "BUY":
+                action = "HOLD"
+                confidence *= 0.5
+        
+        # Calculate risk management levels using Fibonacci
         if action == "BUY":
             entry_price = close
-            stop_loss = max(sr_analysis['support'] * 0.99, close - (2 * atr))
-            target_price = min(sr_analysis['resistance'] * 1.01, close + (3 * atr))
+            # Use Fibonacci support for stop loss
+            if fib_analysis['nearest_support']:
+                stop_loss = min(fib_analysis['nearest_support'][1], close - (2 * atr))
+            else:
+                stop_loss = max(sr_analysis['support'] * 0.99, close - (2 * atr))
+            
+            # Use Fibonacci extension for target
+            if '161.8%' in fib_analysis['extensions']:
+                target_price = min(fib_analysis['extensions']['161.8%'], close + (4 * atr))
+            else:
+                target_price = min(sr_analysis['resistance'] * 1.01, close + (3 * atr))
+        
         elif action == "SELL":
             entry_price = close
-            stop_loss = min(sr_analysis['resistance'] * 1.01, close + (2 * atr))
-            target_price = max(sr_analysis['support'] * 0.99, close - (3 * atr))
+            # Use Fibonacci resistance for stop loss
+            if fib_analysis['nearest_resistance']:
+                stop_loss = max(fib_analysis['nearest_resistance'][1], close + (2 * atr))
+            else:
+                stop_loss = min(sr_analysis['resistance'] * 1.01, close + (2 * atr))
+            
+            # Use Fibonacci extension for target
+            if '161.8%' in fib_analysis['extensions']:
+                target_price = max(fib_analysis['extensions']['161.8%'], close - (4 * atr))
+            else:
+                target_price = max(sr_analysis['support'] * 0.99, close - (3 * atr))
+        
         else:
             entry_price = close
             stop_loss = close - (1.5 * atr)
@@ -1128,12 +1530,14 @@ class StrategyEngine:
         # Generate detailed summary
         detailed_summary = self._generate_detailed_summary(
             df, action, adjusted_score, sentiment_result, 
-            sr_analysis, zscore_analysis, timeframe_signals
+            sr_analysis, zscore_analysis, timeframe_signals,
+            fib_analysis, divergence, elliott_wave, ratio_analysis
         )
         
         # Generate signal confluence explanation
         confluence_explanation = self._generate_confluence_explanation(
-            timeframe_signals, action, trading_style
+            timeframe_signals, action, trading_style, elliott_wave, 
+            divergence, fib_analysis
         )
         
         return TradingSignal(
@@ -1162,7 +1566,9 @@ class StrategyEngine:
     def _generate_detailed_summary(self, df: pd.DataFrame, action: str, 
                                   score: float, sentiment: Dict, 
                                   sr_analysis: Dict, zscore_analysis: Dict,
-                                  timeframe_signals: Dict) -> str:
+                                  timeframe_signals: Dict, fib_analysis: Dict = None,
+                                  divergence: Dict = None, elliott_wave: Dict = None,
+                                  ratio_analysis: Dict = None) -> str:
         """Generate detailed 100-word summary with values"""
         
         latest = df.iloc[-1]
@@ -1173,130 +1579,170 @@ class StrategyEngine:
         summary = f"**Comprehensive Market Summary:**\n\n"
         
         # Past Structure
-        summary += f"**Past 7 Days:** Price moved from ₹{prev_week['Close']:.2f} to ₹{latest['Close']:.2f} "
+        summary += f"**Past Performance:** Price moved from ₹{prev_week['Close']:.2f} to ₹{latest['Close']:.2f} "
         summary += f"({price_change:+.2f}%). "
         
-        if price_change > 5:
-            summary += "Strong bullish momentum observed. "
-        elif price_change < -5:
-            summary += "Strong bearish pressure evident. "
-        else:
-            summary += "Consolidation phase with limited directional movement. "
+        if ratio_analysis:
+            summary += f"{ratio_analysis['interpretation']} "
         
-        # Current Structure
-        summary += f"\n\n**Current Structure:** RSI at {latest['RSI']:.1f} "
+        # Elliott Wave Position (CRITICAL)
+        if elliott_wave:
+            summary += f"\n\n**Elliott Wave:** Currently in {elliott_wave['wave']} "
+            summary += f"({elliott_wave['confidence']}% confidence). {elliott_wave['description']} "
+            summary += f"Next expected: {elliott_wave['next_expected']}. "
+        
+        # Current Technical Structure
+        summary += f"\n\n**Technical Indicators:** RSI={latest['RSI']:.1f} "
         if latest['RSI'] > 70:
-            summary += "(overbought territory), "
+            summary += "(overbought), "
         elif latest['RSI'] < 30:
-            summary += "(oversold territory), "
+            summary += "(oversold), "
         else:
-            summary += "(neutral zone), "
+            summary += "(neutral), "
         
-        summary += f"ADX at {latest['ADX']:.1f} "
+        summary += f"ADX={latest['ADX']:.1f} "
         if latest['ADX'] > 25:
-            summary += "indicating strong trend. "
+            summary += "(strong trend), "
         else:
-            summary += "suggesting weak/ranging market. "
+            summary += "(weak trend), "
         
-        summary += f"Z-Score at {zscore_analysis['current_zscore']:.2f} "
+        summary += f"MACD={latest['MACD']:.3f}. "
+        
+        # RSI Divergence
+        if divergence and divergence['type'] != 'NONE':
+            summary += f"\n\n**RSI Divergence Detected:** {divergence['description']} "
+        
+        # Fibonacci Levels
+        if fib_analysis:
+            summary += f"\n\n**Fibonacci Analysis ({fib_analysis['trend']}):** "
+            if fib_analysis['nearest_support']:
+                summary += f"Nearest support at ₹{fib_analysis['nearest_support'][1]:.2f} ({fib_analysis['nearest_support'][0]}). "
+            if fib_analysis['nearest_resistance']:
+                summary += f"Nearest resistance at ₹{fib_analysis['nearest_resistance'][1]:.2f} ({fib_analysis['nearest_resistance'][0]}). "
+        
+        # Z-Score
+        summary += f"\n\n**Mean Reversion:** Z-Score={zscore_analysis['current_zscore']:.2f}. "
         if abs(zscore_analysis['current_zscore']) > 2:
-            summary += "shows extreme deviation from mean - high mean reversion probability. "
-        else:
-            summary += "indicates price near statistical equilibrium. "
-        
-        # Support/Resistance Context
-        summary += f"\n\n**Key Levels:** Strong support at ₹{sr_analysis['support']:.2f} "
-        summary += f"({sr_analysis['support_distance']:.2f}% below), "
-        summary += f"resistance at ₹{sr_analysis['resistance']:.2f} "
-        summary += f"({sr_analysis['resistance_distance']:.2f}% above). "
+            summary += "Extreme deviation detected - high probability of mean reversion. "
         
         # Sentiment
-        summary += f"News sentiment is {sentiment['summary']} (score: {sentiment['score']:.2f}). "
+        summary += f"\n\n**News Sentiment:** {sentiment['summary']} (score: {sentiment['score']:.2f}). "
         
-        # Future Forecast
-        summary += f"\n\n**Forecast:** {action} signal generated with {score:.1f} points. "
+        # Final Recommendation
+        summary += f"\n\n**Final Signal: {action}** (Score: {score:.1f}). "
         
         if action == "BUY":
-            summary += f"Expect upward move toward ₹{sr_analysis['resistance']:.2f} resistance. "
-            summary += "Entry recommended near current levels with stop below support. "
+            summary += f"Multiple confirmations align for upward move. "
+            if elliott_wave and 'BUY' in elliott_wave.get('action_bias', ''):
+                summary += f"Elliott Wave confirms bullish setup. "
+            summary += f"Target: ₹{sr_analysis['resistance']:.2f}, Stop: ₹{sr_analysis['support']:.2f}. "
         elif action == "SELL":
-            summary += f"Expect downward move toward ₹{sr_analysis['support']:.2f} support. "
-            summary += "Short positions viable with stop above resistance. "
+            summary += f"Multiple confirmations align for downward move. "
+            if elliott_wave and 'SELL' in elliott_wave.get('action_bias', ''):
+                summary += f"Elliott Wave confirms bearish setup. "
+            summary += f"Target: ₹{sr_analysis['support']:.2f}, Stop: ₹{sr_analysis['resistance']:.2f}. "
         else:
-            summary += "No clear directional bias. Wait for better setup. "
+            summary += f"Conflicting signals or weak setup. Patience advised until clearer picture emerges. "
         
-        summary += f"{zscore_analysis['future_outlook'][:100]}"
+        summary += f"\n\n**Logic:** This recommendation is based on confluence of technical indicators, Elliott Wave positioning, Fibonacci levels, RSI divergence, sentiment analysis, and relative strength. All factors must align for high-probability trades."
         
         return summary
     
     def _generate_confluence_explanation(self, timeframe_signals: Dict, 
-                                        final_action: str, 
-                                        trading_style: str) -> str:
-        """Explain how different timeframes contributed to final decision"""
+                                        final_action: str, trading_style: str,
+                                        elliott_wave: Dict = None,
+                                        divergence: Dict = None,
+                                        fib_analysis: Dict = None) -> str:
+        """Explain how different timeframes and Elliott Wave contributed to final decision"""
         
-        if not timeframe_signals:
-            return "Single timeframe analysis used for signal generation."
+        explanation = f"**Multi-Factor Confluence Analysis for {trading_style}:**\n\n"
         
-        explanation = f"**Multi-Timeframe Analysis for {trading_style}:**\n\n"
-        
-        buy_count = 0
-        sell_count = 0
-        hold_count = 0
-        
-        for tf, data in timeframe_signals.items():
-            signal = data['signal']
-            score = data['score']
-            strategy = data['strategy'].replace('_', ' ').title()
-            market = data['market_structure'].replace('_', ' ').title()
+        # Elliott Wave Section (Most Important)
+        if elliott_wave:
+            explanation += f"**🌊 Elliott Wave Analysis (CRITICAL):**\n"
+            explanation += f"• Current Wave: {elliott_wave['wave']}\n"
+            explanation += f"• Confidence: {elliott_wave['confidence']}%\n"
+            explanation += f"• Pattern: {elliott_wave['description']}\n"
+            explanation += f"• Expected Next: {elliott_wave['next_expected']}\n"
+            explanation += f"• Wave Bias: {elliott_wave.get('action_bias', 'N/A')}\n\n"
             
-            if signal == "BUY":
-                buy_count += 1
-                emoji = "🟢"
-            elif signal == "SELL":
-                sell_count += 1
-                emoji = "🔴"
-            else:
-                hold_count += 1
-                emoji = "🟡"
-            
-            explanation += f"{emoji} **{tf} Timeframe:** {signal} signal (Score: {score:.2f})\n"
-            explanation += f"   • Strategy: {strategy}\n"
-            explanation += f"   • Market: {market}\n"
-            explanation += f"   • Key Factors: {', '.join(data['signals_list'][:2])}\n\n"
+            explanation += f"**Why Elliott Wave Matters:** Elliott Wave theory captures the psychology of market participants. "
+            if elliott_wave['confidence'] > 70:
+                explanation += f"High confidence ({elliott_wave['confidence']}%) means the pattern is clear and reliable. "
+            explanation += f"Currently in {elliott_wave['wave']}, which historically shows specific behavior patterns.\n\n"
         
-        # Confluence Decision
-        explanation += f"**Decision Logic:**\n"
-        explanation += f"• BUY signals: {buy_count}/{len(timeframe_signals)}\n"
-        explanation += f"• SELL signals: {sell_count}/{len(timeframe_signals)}\n"
-        explanation += f"• HOLD signals: {hold_count}/{len(timeframe_signals)}\n\n"
+        # RSI Divergence
+        if divergence and divergence['type'] != 'NONE':
+            explanation += f"**📊 RSI Divergence:**\n"
+            explanation += f"• Type: {divergence['type']}\n"
+            explanation += f"• Strength: {divergence['strength']:.1f}\n"
+            explanation += f"• Explanation: {divergence['description']}\n\n"
+        
+        # Fibonacci
+        if fib_analysis:
+            explanation += f"**📐 Fibonacci Levels:**\n"
+            explanation += f"• Trend: {fib_analysis['trend']}\n"
+            if fib_analysis['nearest_support']:
+                explanation += f"• Support: ₹{fib_analysis['nearest_support'][1]:.2f} at {fib_analysis['nearest_support'][0]}\n"
+            if fib_analysis['nearest_resistance']:
+                explanation += f"• Resistance: ₹{fib_analysis['nearest_resistance'][1]:.2f} at {fib_analysis['nearest_resistance'][0]}\n"
+            explanation += f"Fibonacci levels mark natural support/resistance where traders take action.\n\n"
+        
+        # Multi-Timeframe
+        if timeframe_signals:
+            buy_count = sum(1 for data in timeframe_signals.values() if data['signal'] == 'BUY')
+            sell_count = sum(1 for data in timeframe_signals.values() if data['signal'] == 'SELL')
+            hold_count = sum(1 for data in timeframe_signals.values() if data['signal'] == 'HOLD')
+            
+            explanation += f"**⏱️ Multi-Timeframe Signals:**\n"
+            for tf, data in timeframe_signals.items():
+                emoji = "🟢" if data['signal'] == "BUY" else ("🔴" if data['signal'] == "SELL" else "🟡")
+                explanation += f"{emoji} {tf}: {data['signal']} ({data['market_structure'].replace('_', ' ').title()})\n"
+            
+            explanation += f"\n• BUY: {buy_count}/{len(timeframe_signals)}\n"
+            explanation += f"• SELL: {sell_count}/{len(timeframe_signals)}\n"
+            explanation += f"• HOLD: {hold_count}/{len(timeframe_signals)}\n\n"
+        
+        # Final Decision Logic
+        explanation += f"**🎯 Why {final_action} Will Work:**\n\n"
         
         if final_action == "BUY":
-            explanation += f"**Why BUY Will Work:** "
-            if buy_count >= 2:
-                explanation += f"Strong confluence across {buy_count} timeframes. "
-                explanation += "Multiple timeframe alignment significantly increases probability of success. "
-            else:
-                explanation += "Primary timeframe shows strong bullish setup. "
+            explanation += "✅ **Bullish Confluence Detected:**\n"
+            if elliott_wave and 'BUY' in elliott_wave.get('action_bias', ''):
+                explanation += f"• Elliott Wave in bullish phase ({elliott_wave['wave']})\n"
+            if divergence and divergence['type'] == 'BULLISH':
+                explanation += f"• Bullish RSI divergence confirms momentum shift\n"
+            if fib_analysis and fib_analysis['nearest_support']:
+                explanation += f"• Price near Fibonacci support - high probability bounce zone\n"
             
-            explanation += "Lower timeframes provide entry precision while higher timeframes confirm trend direction. "
-            explanation += "Combined with positive sentiment and oversold conditions, risk/reward favors long positions."
+            explanation += f"\n**Success Logic:** When Elliott Wave, divergence, and Fibonacci align bullishly, "
+            explanation += f"it creates a high-probability setup. The market psychology (Elliott Wave) "
+            explanation += f"indicates we're in a buying phase, technical divergence confirms momentum building, "
+            explanation += f"and Fibonacci support provides a safety net. This multi-layered confirmation "
+            explanation += f"significantly improves success probability."
         
         elif final_action == "SELL":
-            explanation += f"**Why SELL Will Work:** "
-            if sell_count >= 2:
-                explanation += f"Strong confluence across {sell_count} timeframes. "
-                explanation += "Multiple timeframe alignment creates high-confidence short setup. "
-            else:
-                explanation += "Primary timeframe shows strong bearish setup. "
+            explanation += "✅ **Bearish Confluence Detected:**\n"
+            if elliott_wave and 'SELL' in elliott_wave.get('action_bias', ''):
+                explanation += f"• Elliott Wave in bearish phase ({elliott_wave['wave']})\n"
+            if divergence and divergence['type'] == 'BEARISH':
+                explanation += f"• Bearish RSI divergence confirms weakening momentum\n"
+            if fib_analysis and fib_analysis['nearest_resistance']:
+                explanation += f"• Price near Fibonacci resistance - high probability rejection zone\n"
             
-            explanation += "Lower timeframes identify reversal points while higher timeframes confirm downtrend. "
-            explanation += "Combined with negative sentiment and overbought readings, downside risk is elevated."
+            explanation += f"\n**Success Logic:** Bearish Elliott Wave position indicates distribution phase, "
+            explanation += f"divergence shows weakening buying pressure despite higher prices, "
+            explanation += f"and Fibonacci resistance acts as selling pressure zone. "
+            explanation += f"This combination creates high-probability short setup."
         
         else:
-            explanation += f"**Why HOLD is Prudent:** "
-            explanation += "Conflicting signals across timeframes indicate market indecision. "
-            explanation += "Trading in uncertain conditions reduces edge and increases risk. "
-            explanation += "Patience is key - wait for clearer multi-timeframe alignment before committing capital."
+            explanation += "⚠️ **Conflicting Signals - HOLD Recommended:**\n"
+            explanation += f"• Different timeframes or indicators show conflicting directions\n"
+            explanation += f"• Elliott Wave may not be in decisive phase\n"
+            explanation += f"• No clear confluence across multiple factors\n"
+            explanation += f"\n**Logic:** Trading without confluence reduces win probability. "
+            explanation += f"Professional traders wait for alignment across multiple factors. "
+            explanation += f"Current setup lacks the multi-layered confirmation needed for high-confidence trade."
         
         return explanation
     
@@ -1353,12 +1799,12 @@ class StrategyEngine:
         return reasoning
 
 class BacktestEngine:
-    """Backtesting Engine for Strategy Validation"""
+    """Backtesting Engine with Elliott Wave for Strategy Validation"""
     
     @staticmethod
     def run_backtest(df: pd.DataFrame, strategy_name: str, 
                      initial_capital: float = 100000) -> BacktestResult:
-        """Run backtest on historical data"""
+        """Run backtest on historical data with Elliott Wave confirmation"""
         
         if len(df) < 100:
             return BacktestResult(0, 0, 0, 0, 0, 0, 0, 0, 0)
@@ -1379,24 +1825,45 @@ class BacktestEngine:
             result = strategy_func(window_df)
             score = result['score']
             
-            # Entry logic
+            # Elliott Wave analysis for confirmation
+            elliott = ElliottWaveAnalyzer.detect_elliott_wave(window_df, lookback=30)
+            wave_bias = elliott.get('action_bias', 'HOLD')
+            
+            # Fibonacci analysis
+            fib = FibonacciAnalyzer.calculate_fibonacci_levels(window_df)
+            
+            # RSI Divergence
+            divergence = RSIDivergenceAnalyzer.detect_divergence(window_df)
+            
+            # Entry logic with Elliott Wave confirmation
             if position is None:
-                if score > 2:  # Buy signal
-                    position = {
-                        'type': 'LONG',
-                        'entry_price': latest['Close'],
-                        'entry_idx': i,
-                        'stop_loss': latest['Close'] - (2 * latest['ATR']),
-                        'target': latest['Close'] + (3 * latest['ATR'])
-                    }
-                elif score < -2:  # Sell signal
-                    position = {
-                        'type': 'SHORT',
-                        'entry_price': latest['Close'],
-                        'entry_idx': i,
-                        'stop_loss': latest['Close'] + (2 * latest['ATR']),
-                        'target': latest['Close'] - (3 * latest['ATR'])
-                    }
+                # BUY signal with confirmations
+                if score > 2:
+                    # Require Elliott Wave confirmation
+                    if wave_bias in ['BUY', 'BUY_PENDING'] or elliott['confidence'] < 50:
+                        # Additional confirmation from divergence
+                        if divergence['type'] in ['BULLISH', 'NONE']:
+                            position = {
+                                'type': 'LONG',
+                                'entry_price': latest['Close'],
+                                'entry_idx': i,
+                                'stop_loss': latest['Close'] - (2 * latest['ATR']),
+                                'target': latest['Close'] + (3 * latest['ATR']),
+                                'wave': elliott['wave']
+                            }
+                
+                # SELL signal with confirmations
+                elif score < -2:
+                    if wave_bias in ['SELL', 'SELL_PENDING'] or elliott['confidence'] < 50:
+                        if divergence['type'] in ['BEARISH', 'NONE']:
+                            position = {
+                                'type': 'SHORT',
+                                'entry_price': latest['Close'],
+                                'entry_idx': i,
+                                'stop_loss': latest['Close'] + (2 * latest['ATR']),
+                                'target': latest['Close'] - (3 * latest['ATR']),
+                                'wave': elliott['wave']
+                            }
             
             # Exit logic
             elif position is not None:
@@ -1413,9 +1880,12 @@ class BacktestEngine:
                     elif current_price <= position['stop_loss']:
                         exit_trade = True
                         exit_reason = 'STOP_LOSS'
-                    elif score < -1:
+                    elif score < -1:  # Signal reversal
                         exit_trade = True
                         exit_reason = 'SIGNAL_REVERSAL'
+                    elif wave_bias == 'SELL':  # Elliott Wave reversal
+                        exit_trade = True
+                        exit_reason = 'ELLIOTT_REVERSAL'
                 else:  # SHORT
                     if current_price <= position['target']:
                         exit_trade = True
@@ -1426,6 +1896,9 @@ class BacktestEngine:
                     elif score > 1:
                         exit_trade = True
                         exit_reason = 'SIGNAL_REVERSAL'
+                    elif wave_bias == 'BUY':
+                        exit_trade = True
+                        exit_reason = 'ELLIOTT_REVERSAL'
                 
                 if exit_trade:
                     if position['type'] == 'LONG':
@@ -1442,7 +1915,8 @@ class BacktestEngine:
                         'pnl': pnl,
                         'pnl_pct': pnl_pct,
                         'type': position['type'],
-                        'reason': exit_reason
+                        'reason': exit_reason,
+                        'wave': position.get('wave', 'N/A')
                     })
                     
                     position = None
@@ -1866,11 +2340,25 @@ def main():
         
         # Backtesting Section
         st.markdown("---")
-        st.subheader("🔬 Backtesting Results")
+        st.subheader("🔬 Backtest Validation (CRITICAL)")
         
-        with st.spinner("Running backtest..."):
+        with st.spinner("Running backtest with Elliott Wave confirmation..."):
             backtest_engine = BacktestEngine()
             backtest_result = backtest_engine.run_backtest(df, strategy)
+        
+        # CRITICAL: Check if strategy is profitable
+        is_profitable = backtest_result.total_return > 0 and backtest_result.win_rate >= 45
+        
+        if is_profitable:
+            st.success(f"✅ **STRATEGY VALIDATED**: Backtest shows positive returns ({backtest_result.total_return:.2f}%) with {backtest_result.win_rate:.1f}% win rate")
+        else:
+            st.error(f"⚠️ **STRATEGY NOT VALIDATED**: Backtest shows negative returns ({backtest_result.total_return:.2f}%) with {backtest_result.win_rate:.1f}% win rate")
+            st.warning("**RECOMMENDATION OVERRIDDEN**: Due to negative backtesting results, the signal is changed to HOLD. Do not trade this setup.")
+            
+            # Override signal to HOLD if backtest is negative
+            signal.action = "HOLD"
+            signal.confidence = 30
+            signal.reasoning += "\n\n⚠️ **BACKTEST OVERRIDE**: Historical testing shows this strategy produces negative returns. Signal changed to HOLD for risk management."
         
         if backtest_result.total_trades > 0:
             col1, col2, col3 = st.columns(3)
