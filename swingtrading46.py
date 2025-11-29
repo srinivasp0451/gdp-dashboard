@@ -139,7 +139,150 @@ if 'last_fetch_time' not in st.session_state:
 if 'analysis_results' not in st.session_state:
     st.session_state.analysis_results = None
 
-class SentimentAnalyzer:
+class TechnicalAnalyzer:
+    """Advanced Technical Analysis Engine"""
+    
+    @staticmethod
+    def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
+        """Calculate comprehensive technical indicators"""
+        df = df.copy()
+        
+        # Moving Averages
+        df['SMA_20'] = df['Close'].rolling(window=20).mean()
+        df['SMA_50'] = df['Close'].rolling(window=50).mean()
+        df['SMA_200'] = df['Close'].rolling(window=200).mean()
+        df['EMA_12'] = df['Close'].ewm(span=12, adjust=False).mean()
+        df['EMA_26'] = df['Close'].ewm(span=26, adjust=False).mean()
+        
+        # MACD
+        df['MACD'] = df['EMA_12'] - df['EMA_26']
+        df['MACD_Signal'] = df['MACD'].ewm(span=9, adjust=False).mean()
+        df['MACD_Hist'] = df['MACD'] - df['MACD_Signal']
+        
+        # RSI
+        delta = df['Close'].diff()
+        gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+        rs = gain / loss
+        df['RSI'] = 100 - (100 / (1 + rs))
+        
+        # Bollinger Bands
+        df['BB_Middle'] = df['Close'].rolling(window=20).mean()
+        bb_std = df['Close'].rolling(window=20).std()
+        df['BB_Upper'] = df['BB_Middle'] + (bb_std * 2)
+        df['BB_Lower'] = df['BB_Middle'] - (bb_std * 2)
+        
+        # ATR (Average True Range)
+        high_low = df['High'] - df['Low']
+        high_close = np.abs(df['High'] - df['Close'].shift())
+        low_close = np.abs(df['Low'] - df['Close'].shift())
+        ranges = pd.concat([high_low, high_close, low_close], axis=1)
+        true_range = np.max(ranges, axis=1)
+        df['ATR'] = true_range.rolling(14).mean()
+        
+        # Stochastic Oscillator
+        low_14 = df['Low'].rolling(window=14).min()
+        high_14 = df['High'].rolling(window=14).max()
+        df['Stoch_K'] = 100 * ((df['Close'] - low_14) / (high_14 - low_14))
+        df['Stoch_D'] = df['Stoch_K'].rolling(window=3).mean()
+        
+        # ADX (Average Directional Index)
+        df['ADX'] = TechnicalAnalyzer.calculate_adx(df)
+        
+        # Volume indicators
+        df['Volume_SMA'] = df['Volume'].rolling(window=20).mean()
+        df['Volume_Ratio'] = df['Volume'] / df['Volume_SMA']
+        
+        # Support and Resistance
+        df['Support'] = df['Low'].rolling(window=20).min()
+        df['Resistance'] = df['High'].rolling(window=20).max()
+        
+        return df
+    
+    @staticmethod
+    def calculate_adx(df: pd.DataFrame, period: int = 14) -> pd.Series:
+        """Calculate Average Directional Index"""
+        high = df['High']
+        low = df['Low']
+        close = df['Close']
+        
+        plus_dm = high.diff()
+        minus_dm = -low.diff()
+        plus_dm[plus_dm < 0] = 0
+        minus_dm[minus_dm < 0] = 0
+        
+        tr = pd.DataFrame({
+            'hl': high - low,
+            'hc': abs(high - close.shift()),
+            'lc': abs(low - close.shift())
+        }).max(axis=1)
+        
+        atr = tr.rolling(window=period).mean()
+        plus_di = 100 * (plus_dm.rolling(window=period).mean() / atr)
+        minus_di = 100 * (minus_dm.rolling(window=period).mean() / atr)
+        
+        dx = 100 * abs(plus_di - minus_di) / (plus_di + minus_di)
+        adx = dx.rolling(window=period).mean()
+        
+        return adx
+
+
+class DataFetcher:
+    """Handles data fetching with rate limiting"""
+    
+    @staticmethod
+    def fetch_data(ticker: str, period: str, interval: str) -> pd.DataFrame:
+        """Fetch data with rate limiting and error handling"""
+        
+        cache_key = f"{ticker}_{period}_{interval}"
+        current_time = time.time()
+        
+        # Check cache (5 minutes validity)
+        if cache_key in st.session_state.data_cache:
+            cached_data, cache_time = st.session_state.data_cache[cache_key]
+            if current_time - cache_time < 300:  # 5 minutes
+                return cached_data
+        
+        # Rate limiting
+        if cache_key in st.session_state.last_fetch_time:
+            time_since_last = current_time - st.session_state.last_fetch_time[cache_key]
+            if time_since_last < 1.5:
+                time.sleep(1.5 - time_since_last)
+        
+        try:
+            # Fetch data
+            stock = yf.Ticker(ticker)
+            df = stock.history(period=period, interval=interval)
+            
+            if df.empty:
+                st.error(f"No data available for {ticker}")
+                return pd.DataFrame()
+            
+            # Convert to IST
+            if df.index.tz is not None:
+                df.index = df.index.tz_convert('Asia/Kolkata')
+            else:
+                df.index = df.index.tz_localize('UTC').tz_convert('Asia/Kolkata')
+            
+            # Fetch news
+            try:
+                news = stock.news[:5] if hasattr(stock, 'news') else []
+                df.attrs['news'] = news
+            except:
+                df.attrs['news'] = []
+            
+            # Cache data
+            st.session_state.data_cache[cache_key] = (df, current_time)
+            st.session_state.last_fetch_time[cache_key] = current_time
+            
+            return df
+            
+        except Exception as e:
+            st.error(f"Error fetching data: {str(e)}")
+            return pd.DataFrame()
+
+
+
     """News Sentiment Analysis using VADER"""
     
     def __init__(self, ticker: str):
@@ -1486,8 +1629,7 @@ def main():
         
         with st.spinner("🧮 Calculating technical indicators..."):
             # Calculate indicators
-            analyzer = TechnicalAnalyzer()
-            df = analyzer.calculate_indicators(df)
+            df = TechnicalAnalyzer.calculate_indicators(df)
         
         with st.spinner("📊 Analyzing multiple timeframes..."):
             # Multi-timeframe analysis
@@ -1802,12 +1944,27 @@ Target Price: ₹{signal.target_price:.2f}
 Stop Loss: ₹{signal.stop_loss:.2f}
 Risk:Reward: 1:{signal.risk_reward:.2f}
 
+=== SUPPORT & RESISTANCE ===
+Strong Support: ₹{signal.strong_support:.2f}
+Strong Resistance: ₹{signal.strong_resistance:.2f}
+
+=== SENTIMENT ===
+Sentiment Score: {signal.sentiment_score:.3f}
+Summary: {signal.sentiment_summary}
+
+=== Z-SCORE ===
+Current Z-Score: {signal.zscore:.2f}
+Interpretation: {signal.zscore_interpretation}
+
 === BACKTEST RESULTS ===
 Total Trades: {backtest_result.total_trades}
 Win Rate: {backtest_result.win_rate:.1f}%
 Total Return: {backtest_result.total_return:.2f}%
 Profit Factor: {backtest_result.profit_factor:.2f}
 Max Drawdown: {backtest_result.max_drawdown:.2f}%
+
+=== DETAILED SUMMARY ===
+{signal.detailed_summary}
 
 === REASONING ===
 {signal.reasoning}
