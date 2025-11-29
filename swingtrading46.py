@@ -12,14 +12,14 @@ from typing import Dict, List, Tuple, Optional
 import warnings
 warnings.filterwarnings('ignore')
 
-# Install vaderSentiment if not available
+# NLTK and VADER Sentiment Setup
+import nltk
 try:
-    from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
-except ImportError:
-    import subprocess
-    import sys
-    subprocess.check_call([sys.executable, "-m", "pip", "install", "vaderSentiment"])
-    from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
+    nltk.data.find('sentiment/vader_lexicon.zip')
+except LookupError:
+    nltk.download('vader_lexicon', quiet=True)
+
+from nltk.sentiment.vader import SentimentIntensityAnalyzer
 
 # Page Configuration
 st.set_page_config(
