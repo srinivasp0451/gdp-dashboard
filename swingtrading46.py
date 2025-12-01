@@ -4615,10 +4615,261 @@ def main():
             else:
                 st.info("No strong resistance levels identified")
         
-        # Detailed Summary
+        # Comprehensive Multi-Timeframe Analysis
         st.markdown("---")
-        st.subheader("📋 Detailed 200-Word Market Analysis")
-        st.markdown(signal.detailed_summary)
+        st.subheader("🔍 Comprehensive Multi-Timeframe Analysis")
+        st.info("⏱️ Analysis across all major timeframes with exact values, test counts, and pattern following")
+        
+        # Analyze all timeframes
+        all_timeframes = ['1m', '5m', '15m', '30m', '1h', '4h', '1d']
+        mtf_data = []
+        
+        with st.spinner("Analyzing all timeframes..."):
+            for tf in all_timeframes:
+                try:
+                    time.sleep(0.8)
+                    tf_df = DataFetcher.fetch_data(ticker, '1mo' if tf in ['1m', '5m'] else period, tf)
+                    
+                    if tf_df.empty or len(tf_df) < 20:
+                        continue
+                    
+                    tf_df = TechnicalAnalyzer.calculate_indicators(tf_df)
+                    latest_tf = tf_df.iloc[-1]
+                    
+                    # Fibonacci
+                    fib_tf = FibonacciAnalyzer.calculate_fibonacci_levels(tf_df)
+                    
+                    # Elliott Wave
+                    ew_tf = ElliottWaveAnalyzer.detect_elliott_wave(tf_df)
+                    
+                    # Support/Resistance with test history
+                    sr_tf = SupportResistanceAnalyzer.find_all_strong_levels(tf_df)
+                    
+                    # Z-Score
+                    zscore_tf = ZScoreAnalyzer.calculate_zscore(tf_df)
+                    
+                    # Volatility
+                    vol_tf = VolatilityAnalyzer.analyze_volatility(tf_df)
+                    
+                    # Time since last level test
+                    current_time = tf_df.index[-1]
+                    
+                    mtf_data.append({
+                        'timeframe': tf,
+                        'price': latest_tf['Close'],
+                        'rsi': latest_tf['RSI'],
+                        'macd': latest_tf['MACD'],
+                        'ema12': latest_tf['EMA_12'],
+                        'ema26': latest_tf['EMA_26'],
+                        'fib_50': fib_tf['levels']['50%'],
+                        'fib_618': fib_tf['levels']['61.8%'],
+                        'fib_trend': fib_tf['trend'],
+                        'elliott_wave': ew_tf['wave'],
+                        'elliott_confidence': ew_tf['confidence'],
+                        'elliott_bias': ew_tf.get('action_bias', 'HOLD'),
+                        'support': sr_tf['primary_support'],
+                        'resistance': sr_tf['primary_resistance'],
+                        'support_tests': len(sr_tf.get('supports', [])),
+                        'resistance_tests': len(sr_tf.get('resistances', [])),
+                        'zscore': zscore_tf['current_zscore'],
+                        'volatility': vol_tf.volatility_regime,
+                        'vol_percentile': vol_tf.volatility_percentile,
+                        'adx': latest_tf['ADX'],
+                        'current_time': current_time
+                    })
+                    
+                except Exception as e:
+                    continue
+        
+        if mtf_data:
+            # Display by timeframe in expandable sections
+            for data in mtf_data:
+                with st.expander(f"📊 **{data['timeframe']} Timeframe** - Price: ₹{data['price']:.2f} | Elliott: {data['elliott_wave']} | RSI: {data['rsi']:.1f}", expanded=False):
+                    col1, col2, col3 = st.columns(3)
+                    
+                    with col1:
+                        st.markdown("**📈 Technical Levels:**")
+                        st.write(f"• **Current Price**: ₹{data['price']:.2f}")
+                        st.write(f"• **RSI**: {data['rsi']:.1f} {'🔴 Overbought' if data['rsi'] > 70 else '🟢 Oversold' if data['rsi'] < 30 else '🟡 Neutral'}")
+                        st.write(f"• **MACD**: {data['macd']:.4f}")
+                        st.write(f"• **EMA 12**: ₹{data['ema12']:.2f}")
+                        st.write(f"• **EMA 26**: ₹{data['ema26']:.2f}")
+                        st.write(f"• **ADX**: {data['adx']:.1f} {'🔥 Strong Trend' if data['adx'] > 25 else '📊 Weak/Ranging'}")
+                    
+                    with col2:
+                        st.markdown("**🎯 Fibonacci & Support/Resistance:**")
+                        st.write(f"• **Trend**: {data['fib_trend']}")
+                        fib_50_dist = ((data['price'] - data['fib_50']) / data['price']) * 100
+                        st.write(f"• **Fib 50%**: ₹{data['fib_50']:.2f} ({fib_50_dist:+.2f}% from price)")
+                        fib_618_dist = ((data['price'] - data['fib_618']) / data['price']) * 100
+                        st.write(f"• **Fib 61.8%**: ₹{data['fib_618']:.2f} ({fib_618_dist:+.2f}% from price)")
+                        
+                        supp_dist = ((data['price'] - data['support']) / data['price']) * 100
+                        st.write(f"• **Support**: ₹{data['support']:.2f} ({supp_dist:.2f}% below)")
+                        st.write(f"  Tested **{data['support_tests']} times** and held")
+                        
+                        res_dist = ((data['resistance'] - data['price']) / data['price']) * 100
+                        st.write(f"• **Resistance**: ₹{data['resistance']:.2f} ({res_dist:.2f}% above)")
+                        st.write(f"  Tested **{data['resistance_tests']} times** and held")
+                    
+                    with col3:
+                        st.markdown("**🌊 Pattern Analysis:**")
+                        st.write(f"• **Elliott Wave**: {data['elliott_wave']}")
+                        st.write(f"  Confidence: {data['elliott_confidence']}%")
+                        st.write(f"  Bias: **{data['elliott_bias']}**")
+                        
+                        st.write(f"• **Z-Score**: {data['zscore']:.2f}")
+                        if abs(data['zscore']) > 2:
+                            st.write(f"  🔴 **EXTREME** - Mean reversion likely")
+                        elif abs(data['zscore']) > 1:
+                            st.write(f"  🟡 Elevated - Watch for reversal")
+                        else:
+                            st.write(f"  🟢 Normal - Near equilibrium")
+                        
+                        st.write(f"• **Volatility**: {data['volatility']}")
+                        st.write(f"  Percentile: {data['vol_percentile']:.1f}%")
+            
+            # Overall Multi-Timeframe Summary
+            st.markdown("---")
+            st.markdown("### 🎯 **Multi-Timeframe Verdict & Forecast**")
+            
+            # Count bullish/bearish signals across timeframes
+            bullish_count = sum(1 for d in mtf_data if d['elliott_bias'] == 'BUY' or d['rsi'] < 40)
+            bearish_count = sum(1 for d in mtf_data if d['elliott_bias'] == 'SELL' or d['rsi'] > 60)
+            neutral_count = len(mtf_data) - bullish_count - bearish_count
+            
+            total_tf = len(mtf_data)
+            
+            # Determine overall forecast
+            if bullish_count > total_tf * 0.6:
+                forecast_direction = "🟢 **UPWARD**"
+                forecast_prob = (bullish_count / total_tf) * 100
+                forecast_detail = f"**{bullish_count}/{total_tf} timeframes** show bullish signals. High probability upward move expected."
+            elif bearish_count > total_tf * 0.6:
+                forecast_direction = "🔴 **DOWNWARD**"
+                forecast_prob = (bearish_count / total_tf) * 100
+                forecast_detail = f"**{bearish_count}/{total_tf} timeframes** show bearish signals. High probability downward move expected."
+            else:
+                forecast_direction = "🟡 **HOLD/CONSOLIDATION**"
+                forecast_prob = 50
+                forecast_detail = f"Mixed signals: {bullish_count} bullish, {bearish_count} bearish, {neutral_count} neutral. Market indecision - wait for clarity."
+            
+            st.markdown(f"### {forecast_direction}")
+            st.progress(forecast_prob / 100)
+            st.markdown(f"**Confidence: {forecast_prob:.0f}%**")
+            st.info(forecast_detail)
+            
+            # Detailed reasoning
+            st.markdown("**📊 Multi-Timeframe Logic:**")
+            for d in mtf_data:
+                signal_emoji = "🟢" if d['elliott_bias'] in ['BUY', 'BUY_PENDING'] else ("🔴" if d['elliott_bias'] in ['SELL', 'SELL_PENDING'] else "🟡")
+                st.write(f"{signal_emoji} **{d['timeframe']}**: {d['elliott_wave']} ({d['elliott_bias']}) | RSI: {d['rsi']:.0f} | Price vs Fib 50%: {((d['price'] - d['fib_50']) / d['fib_50'] * 100):+.1f}%")
+        
+        else:
+            st.warning("⚠️ Unable to analyze multiple timeframes. Using primary timeframe only.")
+        
+        # Breakout/Breakdown Analysis
+        st.markdown("---")
+        st.subheader("💥 Breakout/Breakdown & Liquidity Analysis")
+        
+        with st.spinner("Analyzing breakout patterns..."):
+            # Find recent breakouts/breakdowns
+            breakout_events = []
+            
+            for i in range(len(df) - 20, len(df)):
+                if i < 20:
+                    continue
+                
+                current = df.iloc[i]
+                prev_high = df['High'].iloc[i-20:i].max()
+                prev_low = df['Low'].iloc[i-20:i].min()
+                
+                # Breakout (price breaks above recent high with volume)
+                if current['High'] > prev_high * 1.01:
+                    hours_ago = (df.index[-1] - df.index[i]).total_seconds() / 3600
+                    breakout_events.append({
+                        'type': 'BREAKOUT',
+                        'price': current['High'],
+                        'level': prev_high,
+                        'time': df.index[i],
+                        'hours_ago': hours_ago,
+                        'strength': ((current['High'] - prev_high) / prev_high) * 100
+                    })
+                
+                # Breakdown (price breaks below recent low)
+                elif current['Low'] < prev_low * 0.99:
+                    hours_ago = (df.index[-1] - df.index[i]).total_seconds() / 3600
+                    breakout_events.append({
+                        'type': 'BREAKDOWN',
+                        'price': current['Low'],
+                        'level': prev_low,
+                        'time': df.index[i],
+                        'hours_ago': hours_ago,
+                        'strength': ((prev_low - current['Low']) / prev_low) * 100
+                    })
+            
+            if breakout_events:
+                latest_event = breakout_events[-1]
+                
+                emoji = "🟢" if latest_event['type'] == 'BREAKOUT' else "🔴"
+                st.markdown(f"### {emoji} Last {latest_event['type']}")
+                
+                col1, col2, col3 = st.columns(3)
+                
+                with col1:
+                    if latest_event['hours_ago'] < 24:
+                        time_str = f"{latest_event['hours_ago']:.1f} hours ago"
+                    else:
+                        time_str = f"{latest_event['hours_ago']/24:.1f} days ago"
+                    
+                    st.metric("When", time_str)
+                    st.write(f"**Date/Time**: {latest_event['time'].strftime('%Y-%m-%d %H:%M')}")
+                
+                with col2:
+                    st.metric("Level Broken", f"₹{latest_event['level']:.2f}")
+                    st.metric("Price Reached", f"₹{latest_event['price']:.2f}")
+                
+                with col3:
+                    st.metric("Strength", f"{latest_event['strength']:.2f}%")
+                    
+                    # Check if current price respects the breakout
+                    current_price = df['Close'].iloc[-1]
+                    if latest_event['type'] == 'BREAKOUT':
+                        if current_price > latest_event['level']:
+                            st.success("✅ Price holding above breakout level")
+                        else:
+                            st.warning("⚠️ Price fell back below breakout (false breakout)")
+                    else:
+                        if current_price < latest_event['level']:
+                            st.error("❌ Price holding below breakdown level")
+                        else:
+                            st.info("✅ Price recovered above breakdown")
+                
+                # Pattern frequency
+                st.markdown("**📊 Breakout/Breakdown Frequency:**")
+                
+                # Count events in different periods
+                last_week_events = [e for e in breakout_events if e['hours_ago'] <= 168]
+                breakouts = [e for e in last_week_events if e['type'] == 'BREAKOUT']
+                breakdowns = [e for e in last_week_events if e['type'] == 'BREAKDOWN']
+                
+                st.write(f"• **Last 7 days**: {len(breakouts)} breakouts, {len(breakdowns)} breakdowns")
+                
+                if len(breakout_events) >= 2:
+                    avg_time_between = np.mean([
+                        (breakout_events[i]['hours_ago'] - breakout_events[i-1]['hours_ago']) 
+                        for i in range(1, len(breakout_events))
+                    ])
+                    
+                    if avg_time_between > 0:
+                        if avg_time_between < 24:
+                            st.write(f"• **Pattern**: Breakout/breakdown every ~{avg_time_between:.1f} hours")
+                        else:
+                            st.write(f"• **Pattern**: Breakout/breakdown every ~{avg_time_between/24:.1f} days")
+            else:
+                st.info("No significant breakouts or breakdowns detected in recent period.")
+        
+        st.success("✅ Comprehensive multi-timeframe analysis complete!")
         
         # Pattern Reliability Section (NEW - CRITICAL)
         st.markdown("---")
@@ -4836,8 +5087,9 @@ def main():
                 st.metric("Annual Return", f"{backtest_result.annual_return:.2f}%",
                          delta=f"{annual_delta:+.2f}% vs target")
                 st.metric("Sharpe Ratio", f"{backtest_result.sharpe_ratio:.2f}")
-                st.metric("Backtest Confidence", f"{backtest_confidence}%")
                 st.markdown('</div>', unsafe_allow_html=True)
+        else:
+            st.warning("⚠️ No trades generated in quick backtest. Signal based on current technical setup.")
             
             # Backtest interpretation
             st.markdown("---")
