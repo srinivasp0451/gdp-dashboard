@@ -5115,8 +5115,6 @@ def main():
                 st.warning(f"⚠️ **Moderate Risk**: Maximum drawdown of {backtest_result.max_drawdown:.2f}%")
             else:
                 st.error(f"❌ **High Risk**: Maximum drawdown of {backtest_result.max_drawdown:.2f}%")
-        else:
-            st.warning("⚠️ Not enough data for backtesting. Need at least 100 candles.")
         
         # Market Conditions
         st.markdown("---")
