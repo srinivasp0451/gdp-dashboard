@@ -2854,7 +2854,7 @@ class StrategyEngine:
             df, action, adjusted_score, sentiment_result, 
             sr_analysis, zscore_analysis, timeframe_signals,
             fib_analysis, divergence, elliott_wave, ratio_analysis,
-            pattern_reliability
+            pattern_reliability, volume_analysis
         )
         
         # Generate signal confluence explanation
@@ -2892,7 +2892,238 @@ class StrategyEngine:
                                   timeframe_signals: Dict, fib_analysis: Dict = None,
                                   divergence: Dict = None, elliott_wave: Dict = None,
                                   ratio_analysis: Dict = None,
-                                  pattern_reliability: Dict = None) -> str:
+                                  pattern_reliability: Dict = None,
+                                  volume_analysis: Dict = None) -> str:
+        """Generate detailed 200-word summary with comprehensive analysis"""
+        
+        latest = df.iloc[-1]
+        prev_week = df.iloc[-5] if len(df) > 5 else df.iloc[0]
+        prev_month = df.iloc[-20] if len(df) > 20 else df.iloc[0]
+        
+        price_change_week = ((latest['Close'] - prev_week['Close']) / prev_week['Close']) * 100
+        price_change_month = ((latest['Close'] - prev_month['Close']) / prev_month['Close']) * 100
+        
+        summary = f"**📊 COMPREHENSIVE 200-WORD MARKET ANALYSIS**\n\n"
+        
+        # Pattern Reliability Analysis (NEW - CRITICAL)
+        if pattern_reliability and pattern_reliability['most_reliable'] != 'INSUFFICIENT_DATA':
+            most_reliable = pattern_reliability['most_reliable']
+            reliability_score = pattern_reliability['reliability_scores'][most_reliable]
+            
+            summary += f"**🎯 PATTERN RELIABILITY (CRITICAL):**\n"
+            summary += f"The market is currently following **{most_reliable}** with {reliability_score:.1f}% historical accuracy. "
+            summary += f"This pattern has been the MOST RELIABLE indicator for this instrument. "
+            
+            if reliability_score > 70:
+                summary += f"High reliability (>70%) means this pattern should be PRIMARY decision factor. "
+            elif reliability_score > 55:
+                summary += f"Moderate reliability means use this with confirming signals. "
+            else:
+                summary += f"Low reliability means this pattern is currently unreliable - avoid it. "
+            
+            summary += f"\n\n**Pattern Performance Rankings:**\n"
+            sorted_patterns = sorted(pattern_reliability['reliability_scores'].items(), 
+                                   key=lambda x: x[1], reverse=True)
+            for i, (pattern, score_val) in enumerate(sorted_patterns[:3], 1):
+                emoji = "🥇" if i == 1 else ("🥈" if i == 2 else "🥉")
+                summary += f"{emoji} {pattern}: {score_val:.1f}% | "
+            summary += "\n\n"
+        
+        # Historical Performance
+        summary += f"**📈 PAST PERFORMANCE:**\n"
+        summary += f"• Last 5 sessions: ₹{prev_week['Close']:.2f} → ₹{latest['Close']:.2f} ({price_change_week:+.2f}%)\n"
+        summary += f"• Last 20 sessions: ₹{prev_month['Close']:.2f} → ₹{latest['Close']:.2f} ({price_change_month:+.2f}%)\n"
+        
+        if price_change_week > 5:
+            summary += f"• Strong bullish momentum observed - buyers in control.\n"
+        elif price_change_week < -5:
+            summary += f"• Strong bearish pressure - sellers dominating.\n"
+        else:
+            summary += f"• Consolidation phase - market indecision evident.\n"
+        
+        # Relative Strength (Market Comparison) - CRITICAL ADDITION
+        if ratio_analysis:
+            summary += f"\n**📊 RELATIVE STRENGTH vs BENCHMARK:**\n"
+            summary += f"• Stock Return (3M): {ratio_analysis['stock_return']:.2f}%\n"
+            summary += f"• Benchmark Return (3M): {ratio_analysis['benchmark_return']:.2f}%\n"
+            summary += f"• Relative Strength Ratio: {ratio_analysis['relative_strength']:.2f}x\n"
+            summary += f"• Outperformance: {ratio_analysis['outperformance']:+.2f}%\n"
+            
+            if ratio_analysis['relative_strength'] > 1.2:
+                summary += f"• **STRONG OUTPERFORMER** - Stock showing superior strength vs market. BULLISH SIGNAL.\n"
+            elif ratio_analysis['relative_strength'] > 1.0:
+                summary += f"• **OUTPERFORMER** - Stock beating the market. Positive indicator.\n"
+            elif ratio_analysis['relative_strength'] > 0.8:
+                summary += f"• **UNDERPERFORMER** - Stock lagging the market. Cautionary signal.\n"
+            else:
+                summary += f"• **WEAK** - Significant underperformance. BEARISH SIGNAL.\n"
+            
+            summary += f"• Impact on Signal: Relative strength adjusted score by {(ratio_analysis['relative_strength'] - 1.0) * 0.5:+.2f} points\n"
+        
+        # Elliott Wave Position (Market Psychology)
+        summary += f"\n**🌊 ELLIOTT WAVE (MARKET PSYCHOLOGY):**\n"
+        if elliott_wave:
+            summary += f"• Currently in: **{elliott_wave['wave']}** (Confidence: {elliott_wave['confidence']}%)\n"
+            summary += f"• Interpretation: {elliott_wave['description']}\n"
+            summary += f"• Next Expected: {elliott_wave['next_expected']}\n"
+            summary += f"• This wave position suggests: {elliott_wave.get('action_bias', 'NEUTRAL')} bias\n"
+            
+            if elliott_wave['confidence'] > 70:
+                summary += f"• **HIGH CONFIDENCE** - Elliott Wave pattern is clear and actionable.\n"
+        
+        # Current Technical Structure
+        summary += f"\n**🔧 CURRENT TECHNICAL STRUCTURE:**\n"
+        summary += f"• Price: ₹{latest['Close']:.2f} | RSI: {latest['RSI']:.1f}"
+        
+        if latest['RSI'] > 70:
+            summary += " (Overbought - potential reversal)\n"
+        elif latest['RSI'] < 30:
+            summary += " (Oversold - potential bounce)\n"
+        else:
+            summary += " (Neutral zone)\n"
+        
+        summary += f"• ADX: {latest['ADX']:.1f}"
+        if latest['ADX'] > 25:
+            summary += " (Strong trending market - follow trend)\n"
+        elif latest['ADX'] > 20:
+            summary += " (Moderate trend developing)\n"
+        else:
+            summary += " (Ranging/choppy market - avoid trend strategies)\n"
+        
+        summary += f"• MACD: {latest['MACD']:.3f} | Signal: {latest['MACD_Signal']:.3f}"
+        if latest['MACD'] > latest['MACD_Signal']:
+            summary += " (Bullish momentum)\n"
+        else:
+            summary += " (Bearish momentum)\n"
+        
+        # Volume Impact
+        if volume_analysis and volume_analysis['available']:
+            summary += f"\n**📦 VOLUME ANALYSIS:**\n"
+            summary += f"• Volume Ratio: {volume_analysis['volume_ratio']:.2f}x average\n"
+            summary += f"• {volume_analysis['interpretation']}\n"
+            summary += f"• Volume Score Impact: {volume_analysis['volume_score']:+.2f} points to signal\n"
+        
+        # RSI Divergence (Early Warning)
+        if divergence and divergence['type'] != 'NONE':
+            summary += f"\n**⚠️ RSI DIVERGENCE DETECTED:**\n"
+            summary += f"• Type: **{divergence['type']}** (Strength: {divergence['strength']:.1f})\n"
+            summary += f"• Meaning: {divergence['description']}\n"
+            summary += f"• Divergence often precedes price reversals - this is an EARLY WARNING signal.\n"
+        
+        # Fibonacci Levels (Natural Support/Resistance)
+        if fib_analysis:
+            summary += f"\n**📐 FIBONACCI ANALYSIS ({fib_analysis['trend']}):**\n"
+            if fib_analysis['nearest_support']:
+                support_dist = ((latest['Close'] - fib_analysis['nearest_support'][1]) / latest['Close']) * 100
+                summary += f"• Nearest Support: ₹{fib_analysis['nearest_support'][1]:.2f} ({fib_analysis['nearest_support'][0]}) - {support_dist:.2f}% below\n"
+            
+            if fib_analysis['nearest_resistance']:
+                resist_dist = ((fib_analysis['nearest_resistance'][1] - latest['Close']) / latest['Close']) * 100
+                summary += f"• Nearest Resistance: ₹{fib_analysis['nearest_resistance'][1]:.2f} ({fib_analysis['nearest_resistance'][0]}) - {resist_dist:.2f}% above\n"
+            
+            summary += f"• Fibonacci levels are natural reversal zones based on golden ratio (1.618).\n"
+        
+        # Support & Resistance (Key Battle Zones)
+        summary += f"\n**🎚️ KEY PRICE LEVELS:**\n"
+        summary += f"• Strong Support: ₹{sr_analysis['support']:.2f} ({sr_analysis['support_distance']:.2f}% below)\n"
+        summary += f"  Reason: {sr_analysis['support_strength'][:80]}...\n"
+        summary += f"• Strong Resistance: ₹{sr_analysis['resistance']:.2f} ({sr_analysis['resistance_distance']:.2f}% above)\n"
+        summary += f"  Reason: {sr_analysis['resistance_strength'][:80]}...\n"
+        
+        # Z-Score (Statistical Edge)
+        summary += f"\n**📊 Z-SCORE (MEAN REVERSION):**\n"
+        summary += f"• Current Z-Score: **{zscore_analysis['current_zscore']:.2f}**\n"
+        
+        if abs(zscore_analysis['current_zscore']) > 2:
+            summary += f"• **EXTREME DEVIATION** - Price is {abs(zscore_analysis['current_zscore']):.1f} standard deviations from mean.\n"
+            summary += f"• {zscore_analysis['historical_impact']}\n"
+            summary += f"• Statistical probability favors mean reversion.\n"
+        elif abs(zscore_analysis['current_zscore']) > 1:
+            summary += f"• Moderate deviation from mean - watch for reversal signals.\n"
+        else:
+            summary += f"• Price near statistical equilibrium - no extreme condition.\n"
+        
+        # News Sentiment (External Factors)
+        summary += f"\n**📰 NEWS SENTIMENT:**\n"
+        summary += f"• Sentiment: {sentiment['summary']}\n"
+        summary += f"• Score: {sentiment['score']:.3f} (Range: -1 to +1)\n"
+        
+        if abs(sentiment['score']) > 0.25:
+            summary += f"• Strong sentiment can act as catalyst - consider this in timing entry.\n"
+        
+        # Final Recommendation with Logic
+        summary += f"\n**🎯 FINAL RECOMMENDATION: {action}**\n"
+        summary += f"• Signal Strength Score: {score:.2f}/10\n"
+        
+        if action == "BUY":
+            summary += f"• **BUY LOGIC:** Multiple bullish confirmations align:\n"
+            if pattern_reliability:
+                most_reliable = pattern_reliability['most_reliable']
+                summary += f"  → Most reliable pattern ({most_reliable}) supports bullish view\n"
+            if elliott_wave and 'BUY' in str(elliott_wave.get('action_bias', '')):
+                summary += f"  → Elliott Wave in bullish phase\n"
+            if divergence and divergence['type'] == 'BULLISH':
+                summary += f"  → Bullish RSI divergence detected\n"
+            if zscore_analysis['current_zscore'] < -1.5:
+                summary += f"  → Oversold conditions (Z-Score)\n"
+            if ratio_analysis and ratio_analysis['relative_strength'] > 1.2:
+                summary += f"  → Strong outperformance vs benchmark ({ratio_analysis['relative_strength']:.2f}x)\n"
+            
+            summary += f"• Entry: ₹{latest['Close']:.2f} | Target: ₹{sr_analysis['resistance']:.2f} | Stop: ₹{sr_analysis['support']:.2f}\n"
+            summary += f"• Risk/Reward favorable with clear levels defined by most reliable patterns.\n"
+        
+        elif action == "SELL":
+            summary += f"• **SELL LOGIC:** Multiple bearish confirmations align:\n"
+            if pattern_reliability:
+                most_reliable = pattern_reliability['most_reliable']
+                summary += f"  → Most reliable pattern ({most_reliable}) supports bearish view\n"
+            if elliott_wave and 'SELL' in str(elliott_wave.get('action_bias', '')):
+                summary += f"  → Elliott Wave in bearish phase\n"
+            if divergence and divergence['type'] == 'BEARISH':
+                summary += f"  → Bearish RSI divergence detected\n"
+            if zscore_analysis['current_zscore'] > 1.5:
+                summary += f"  → Overbought conditions (Z-Score)\n"
+            if ratio_analysis and ratio_analysis['relative_strength'] < 0.8:
+                summary += f"  → Weak relative strength vs benchmark ({ratio_analysis['relative_strength']:.2f}x)\n"
+            
+            summary += f"• Entry: ₹{latest['Close']:.2f} | Target: ₹{sr_analysis['support']:.2f} | Stop: ₹{sr_analysis['resistance']:.2f}\n"
+            summary += f"• Risk/Reward favorable for short positions.\n"
+        
+        else:
+            summary += f"• **HOLD LOGIC:** Conflicting signals or weak setup:\n"
+            summary += f"  → No clear confluence across multiple indicators\n"
+            summary += f"  → Most reliable patterns show indecision\n"
+            if ratio_analysis:
+                summary += f"  → Relative strength: {ratio_analysis['relative_strength']:.2f}x (neutral)\n"
+            summary += f"  → Risk/reward not favorable in current context\n"
+            summary += f"• **Professional traders wait for high-probability setups.**\n"
+            summary += f"• Patience is a position - not every moment requires action.\n"
+        
+        # Future Forecast
+        summary += f"\n**🔮 FORWARD OUTLOOK:**\n"
+        summary += f"{zscore_analysis['future_outlook'][:150]}... "
+        
+        if pattern_reliability:
+            most_reliable = pattern_reliability['most_reliable']
+            summary += f"Given {most_reliable} is most reliable ({pattern_reliability['reliability_scores'][most_reliable]:.1f}% accuracy), "
+            summary += f"this pattern should be PRIMARY guide for next move. "
+        
+        if ratio_analysis:
+            if ratio_analysis['relative_strength'] > 1.2:
+                summary += f"Strong relative performance ({ratio_analysis['outperformance']:+.2f}%) suggests continued strength. "
+            elif ratio_analysis['relative_strength'] < 0.8:
+                summary += f"Weak relative performance ({ratio_analysis['outperformance']:+.2f}%) suggests continued weakness. "
+        
+        summary += f"\n\n**⚙️ DECISION METHODOLOGY:**\n"
+        summary += f"This recommendation synthesizes 10+ technical factors, weighted by historical reliability. "
+        summary += f"Ratio analysis contributed {(ratio_analysis.get('relative_strength', 1.0) - 1.0) * 0.5:+.2f} points to final score. "
+        summary += f"Each indicator is tested for accuracy on recent data. Most reliable patterns receive highest weight. "
+        summary += f"Elliott Wave captures psychology, Fibonacci marks natural levels, divergence shows momentum shifts, "
+        summary += f"relative strength confirms market leadership, "
+        summary += f"and Z-Score provides statistical edge. Only when multiple HIGH-RELIABILITY factors align "
+        summary += f"do we generate BUY/SELL signals. This multi-layered approach significantly improves win probability."
+        
+        return summary
         """Generate detailed 200-word summary with comprehensive analysis"""
         
         latest = df.iloc[-1]
@@ -4173,67 +4404,98 @@ def main():
     
     # Main Content
     if fetch_button:
-        strategy_engine = StrategyEngine()  # Initialize here at the start
+        # Initialize at the very beginning
+        strategy_engine = StrategyEngine()
+        backtest_engine = BacktestEngine()
         
-        with st.spinner("🔍 Fetching market data..."):
-            # Fetch data with delay
+        progress_bar = st.progress(0)
+        status_text = st.empty()
+        
+        try:
+            # Step 1: Fetch data
+            status_text.text("Step 1/7: Fetching market data...")
+            progress_bar.progress(10)
             time.sleep(api_delay)
             df = DataFetcher.fetch_data(ticker, period, timeframe)
             
             if df.empty:
                 st.error("Unable to fetch data. Please check the ticker symbol and try again.")
+                progress_bar.empty()
+                status_text.empty()
                 return
             
-            st.success(f"✅ Data fetched successfully! ({len(df)} candles)")
-        
-        with st.spinner("🧮 Calculating technical indicators..."):
-            # Calculate indicators
+            progress_bar.progress(20)
+            status_text.text(f"✅ Data fetched: {len(df)} candles")
+            time.sleep(0.5)
+            
+            # Step 2: Calculate indicators
+            status_text.text("Step 2/7: Calculating technical indicators (RSI, MACD, Bollinger Bands, ATR, ADX)...")
+            progress_bar.progress(30)
             df = TechnicalAnalyzer.calculate_indicators(df)
-        
-        with st.spinner("📊 Analyzing multiple timeframes..."):
-            # Multi-timeframe analysis
+            progress_bar.progress(40)
+            status_text.text("✅ Technical indicators calculated")
+            time.sleep(0.5)
+            
+            # Step 3: Multi-timeframe analysis
+            status_text.text("Step 3/7: Analyzing multiple timeframes...")
+            progress_bar.progress(45)
             timeframe_signals = strategy_engine.analyze_multiple_timeframes(
                 ticker, period, trading_style
             )
-        
-        with st.spinner("🎯 Optimizing strategy parameters..."):
-            # Optimize for target returns
+            progress_bar.progress(55)
+            status_text.text(f"✅ Multi-timeframe analysis complete ({len(timeframe_signals)} timeframes)")
+            time.sleep(0.5)
+            
+            # Step 4: Optimization
+            status_text.text("Step 4/7: Optimizing strategy parameters (testing 80+ combinations)...")
+            progress_bar.progress(60)
             best_strategy = strategy_engine.select_best_strategy(df, trading_style)
             
-            # Run optimization with proper error handling
             try:
-                optimization_result = BacktestEngine.optimize_strategy_parameters(
+                optimization_result = backtest_engine.optimize_strategy_parameters(
                     df, best_strategy, target_annual_return=target_annual_return
                 )
-                
-                if optimization_result['optimized']:
-                    st.success(f"✅ Strategy optimized! {optimization_result['message']}")
-                else:
-                    st.warning(f"⚠️ {optimization_result['message']}")
-                    # Still use the best found parameters even if not fully optimized
+                progress_bar.progress(70)
+                status_text.text(f"✅ Optimization complete: {optimization_result['message']}")
+                time.sleep(0.5)
             except Exception as e:
                 st.warning(f"⚠️ Optimization encountered an issue: {str(e)}. Using default parameters.")
                 optimization_result = {
                     'optimized': False,
-                    'best_params': None,
+                    'best_params': {
+                        'entry_threshold': 2.0,
+                        'stop_loss_atr': 2.0,
+                        'take_profit_atr': 3.0
+                    },
                     'annual_return': 0,
                     'message': 'Using default parameters'
                 }
-        
-        with st.spinner("🎯 Generating trading signals..."):
-            # Generate signals with optimized parameters
+                progress_bar.progress(70)
+            
+            # Step 5: Generate signals
+            status_text.text("Step 5/7: Generating trading signals with pattern reliability...")
+            progress_bar.progress(75)
             signal = strategy_engine.generate_signal(
                 df, best_strategy, trading_style, ticker, timeframe_signals,
                 ratio_ticker=ratio_ticker if include_ratio else None
             )
+            progress_bar.progress(85)
+            status_text.text("✅ Trading signal generated")
+            time.sleep(0.5)
             
-            # Volatility analysis
+            # Step 6: Additional analysis
+            status_text.text("Step 6/7: Analyzing volatility and support/resistance levels...")
+            progress_bar.progress(90)
             volatility_analysis = VolatilityAnalyzer.analyze_volatility(df)
-            
-            # All support/resistance levels
             all_sr_levels = SupportResistanceAnalyzer.find_all_strong_levels(df)
+            progress_bar.progress(95)
+            status_text.text("✅ Additional analysis complete")
+            time.sleep(0.5)
             
-            # Store in session state
+            # Step 7: Store results
+            status_text.text("Step 7/7: Preparing results...")
+            progress_bar.progress(100)
+            
             st.session_state.analysis_results = {
                 'df': df,
                 'signal': signal,
@@ -4246,10 +4508,25 @@ def main():
                 'optimization': optimization_result,
                 'timeframe': timeframe,
                 'ratio_ticker': ratio_ticker if include_ratio else None,
-                'include_ratio': include_ratio
+                'include_ratio': include_ratio,
+                'analysis_timestamp': datetime.now(pytz.timezone('Asia/Kolkata'))
             }
-        
-        st.success("✅ Analysis complete!")
+            
+            status_text.text("✅ Analysis complete!")
+            time.sleep(0.5)
+            progress_bar.empty()
+            status_text.empty()
+            
+            st.success("🎉 All analysis complete! Scroll down to see results.")
+            
+        except Exception as e:
+            progress_bar.empty()
+            status_text.empty()
+            st.error(f"❌ Error during analysis: {str(e)}")
+            st.error("Please try again or contact support if the issue persists.")
+            import traceback
+            st.code(traceback.format_exc())
+            return
     
     # Display Results
     if st.session_state.analysis_results is not None:
@@ -4538,9 +4815,10 @@ def main():
         st.markdown("---")
         st.subheader("🔬 Backtest Validation with Optimization")
         
+        # Get analysis timestamp
+        analysis_time = results.get('analysis_timestamp', datetime.now(pytz.timezone('Asia/Kolkata')))
+        
         with st.spinner("Running optimized backtest..."):
-            backtest_engine = BacktestEngine()
-            
             # Run with optimized parameters
             if optimization and optimization.get('best_params'):
                 backtest_result = backtest_engine.run_backtest(
@@ -4549,13 +4827,67 @@ def main():
             else:
                 backtest_result = backtest_engine.run_backtest(df, strategy)
         
-        # Display optimization parameters
-        if optimization and optimization.get('best_params'):
-            st.info(f"**Optimized Parameters Applied**: Entry Threshold={optimization['best_params']['entry_threshold']}, "
-                   f"Stop Loss={optimization['best_params']['stop_loss_atr']}x ATR, "
-                   f"Take Profit={optimization['best_params']['take_profit_atr']}x ATR")
+        # Display comprehensive backtest information
+        st.markdown("### 📋 Backtest Configuration & Results")
         
-        # More lenient validation - check if we have ANY trades and positive metrics
+        # Create two columns for parameters
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            st.markdown("**⚙️ Backtest Parameters:**")
+            if optimization and optimization.get('best_params'):
+                params = optimization['best_params']
+                st.write(f"• **Entry Threshold:** {params['entry_threshold']} points")
+                st.write(f"  → Signal must score above {params['entry_threshold']} to enter trade")
+                st.write(f"• **Stop Loss:** {params['stop_loss_atr']}x ATR")
+                st.write(f"  → Exit if price moves {params['stop_loss_atr']} ATR against position")
+                st.write(f"• **Take Profit:** {params['take_profit_atr']}x ATR")
+                st.write(f"  → Exit if price moves {params['take_profit_atr']} ATR in favor")
+                st.write(f"• **Risk:Reward Ratio:** 1:{params['risk_reward_min']:.2f}")
+            else:
+                st.write("• Using default parameters")
+                st.write("• Entry Threshold: 2.0 points")
+                st.write("• Stop Loss: 2.0x ATR")
+                st.write("• Take Profit: 3.0x ATR")
+        
+        with col2:
+            st.markdown("**📅 Backtest Period:**")
+            backtest_start = df.index[50] if len(df) > 50 else df.index[0]
+            backtest_end = df.index[-1]
+            st.write(f"• **Start Date:** {backtest_start.strftime('%Y-%m-%d %H:%M')}")
+            st.write(f"• **End Date:** {backtest_end.strftime('%Y-%m-%d %H:%M')}")
+            st.write(f"• **Analysis Time:** {analysis_time.strftime('%Y-%m-%d %H:%M IST')}")
+            st.write(f"• **Total Candles:** {len(df)} in {timeframe} timeframe")
+            st.write(f"• **Data Period:** {period}")
+            days_tested = (backtest_end - backtest_start).days
+            st.write(f"• **Days Tested:** {days_tested} days")
+        
+        # Explain WHY these parameters
+        st.markdown("**🎯 Why These Parameters?**")
+        if optimization and optimization.get('best_params'):
+            st.info(f"""
+**Parameter Selection Logic:**
+The system tested 80+ parameter combinations and selected these based on:
+1. **Entry Threshold ({params['entry_threshold']})**: Balances trade frequency vs quality. 
+   Lower = more trades but lower quality. Higher = fewer but better setups.
+2. **Stop Loss ({params['stop_loss_atr']}x ATR)**: Based on instrument volatility. 
+   ATR = Average True Range = typical price movement. This prevents getting stopped out by normal noise.
+3. **Take Profit ({params['take_profit_atr']}x ATR)**: Ensures profit target is realistic given volatility.
+   Too tight = missed profits. Too wide = rarely hit.
+4. **These specific values achieved {optimization['annual_return']:.2f}% annual return** in backtesting,
+   which was the best among all tested combinations.
+            """)
+        else:
+            st.info("""
+**Default Parameters Used:**
+System used conservative default parameters as optimization couldn't find significantly better combinations.
+This often happens with:
+- Limited historical data
+- Highly volatile/unpredictable markets
+- Very trending markets where parameters don't matter as much
+            """)
+        
+        # More lenient validation
         has_trades = backtest_result.total_trades > 0
         is_profitable = backtest_result.total_return > 0 or backtest_result.win_rate >= 40
         
