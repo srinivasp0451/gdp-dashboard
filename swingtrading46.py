@@ -4323,10 +4323,10 @@ def main():
         )
         
         # Timeframe
-        timeframe = st.selectbox("Timeframe", TIMEFRAMES, index=4)
+        timeframe = st.selectbox("Timeframe", TIMEFRAMES, index=3)
         
         # Period
-        period = st.selectbox("Period", PERIODS, index=5)
+        period = st.selectbox("Period", PERIODS, index=4)
         
         st.markdown("---")
         
@@ -4338,7 +4338,7 @@ def main():
             ratio_instrument = st.selectbox(
                 "Compare with Instrument",
                 list(INSTRUMENTS.keys()),
-                index=0,
+                index=7,
                 key="ratio_instrument"
             )
             
