@@ -4323,10 +4323,10 @@ def main():
         )
         
         # Timeframe
-        timeframe = st.selectbox("Timeframe", TIMEFRAMES, index=3)
+        timeframe = st.selectbox("Timeframe", TIMEFRAMES, index=2)
         
         # Period
-        period = st.selectbox("Period", PERIODS, index=4)
+        period = st.selectbox("Period", PERIODS, index=3)
         
         st.markdown("---")
         
