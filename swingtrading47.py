@@ -47,11 +47,7 @@ def log_error(e, note=""):
         frame = inspect.trace()[-1]
         line = frame.lineno
         file = frame.filename
-        st.error(f"🔥 **ERROR**
-➤ Message: `{str(e)}`
-➤ Note: {note}
-➤ File: {file}
-➤ Line: {line}")
+        st.error(f"🔥 **ERROR* ➤ Message: `{str(e)}` ➤ Note: {note} ➤ File: {file} ➤ Line: {line}")
         st.code(tb)
     except Exception:
         print("Logging failed", e)
