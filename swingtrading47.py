@@ -19,6 +19,45 @@ import matplotlib.pyplot as plt
 import plotly.graph_objects as go
 
 # ----------------------------- Helpers: Indicators -----------------------------
+import traceback
+import inspect
+
+# --- Logging helpers (prints into Streamlit UI for quick debugging with line numbers)
+import streamlit as st
+
+def log(msg):
+    try:
+        st.write(f"🟦 LOG: {msg}")
+    except Exception:
+        print(f"LOG: {msg}")
+
+def log_shape(df, name="DF"):
+    try:
+        st.write(f"📏 {name} shape → Rows: {df.shape[0]}, Cols: {df.shape[1]}")
+        # limit columns shown to first 30 to avoid UI overload
+        cols = list(df.columns)[:30]
+        st.write(f"Columns (first up to 30): {cols}")
+    except Exception:
+        st.write(f"❌ Could not read shape for {name}")
+
+def log_error(e, note=""):
+    try:
+        # pick the last trace that is not inside this helper
+        tb = traceback.format_exc()
+        frame = inspect.trace()[-1]
+        line = frame.lineno
+        file = frame.filename
+        st.error(f"🔥 **ERROR**
+➤ Message: `{str(e)}`
+➤ Note: {note}
+➤ File: {file}
+➤ Line: {line}")
+        st.code(tb)
+    except Exception:
+        print("Logging failed", e)
+
+# end logging helpers
+
 
 def to_ist(df):
     # Convert index (DatetimeIndex) to Asia/Kolkata timezone and return with timezone-naive localized to IST
@@ -40,10 +79,26 @@ def to_ist(df):
     return df
 
 
-def flatten_multiindex(df):
-    # If yfinance returns multiindex columns, flatten them
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = ['_'.join([str(c) for c in col if c]) for col in df.columns]
+def flatten_columns(df, log_name=None):
+    """Safely flatten MultiIndex columns and log shapes.
+    Use log_name for descriptive logging (e.g., ticker name).
+    """
+    try:
+        if log_name:
+            log(f"Flattening columns for {log_name}")
+        log_shape(df, f"{log_name or 'DF'} BEFORE flatten")
+
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = [
+                "_".join([str(c) for c in col if c not in ("", None)]).strip("_")
+                for col in df.columns.values
+            ]
+        else:
+            df.columns = df.columns.astype(str)
+
+        log_shape(df, f"{log_name or 'DF'} AFTER flatten")
+    except Exception as e:
+        log_error(e, f"Error inside flatten_columns for {log_name}")
     return df
 
 
@@ -197,14 +252,32 @@ def elliott_heuristic(df):
 
 # ----------------------------- Data Fetching & Ratio handling -----------------------------
 
-def fetch_yf(ticker, period, interval):
-    # Use delays to respect rate-limits
-    time.sleep(random.uniform(1.5, 3.0))
-    data = yf.download(tickers=ticker, period=period, interval=interval, progress=False, threads=False)
-    data = flatten_multiindex(data)
-    data.dropna(how='all', inplace=True)
-    if data.empty:
+def fetch_yf(ticker, period, interval, log_name=None):
+    # Use delays to respect rate-limits and robust logging
+    try:
+        log(f"Fetching {ticker} | period={period} | interval={interval}")
+        time.sleep(random.uniform(1.5, 3.0))
+        data = yf.download(tickers=ticker, period=period, interval=interval, progress=False, threads=False)
+        if data is None or data.empty:
+            log(f"No data returned for {ticker}")
+            return pd.DataFrame()
+        # Flatten safely and log
+        data = flatten_columns(data, log_name=ticker)
+        data.dropna(how='all', inplace=True)
+        if data.empty:
+            return data
+        # Standardize column names if lowercase columns
+        colmap = {c: c.title() for c in data.columns}
+        data.rename(columns=colmap, inplace=True)
+        # Ensure required cols
+        for c in ['Open', 'High', 'Low', 'Close', 'Volume']:
+            if c not in data.columns:
+                data[c] = np.nan
+        data = to_ist(data)
         return data
+    except Exception as e:
+        log_error(e, f"Fetching failed for {ticker}")
+        return pd.DataFrame()
     # Standardize column names if lowercase columns
     colmap = {c: c.title() for c in data.columns}
     data.rename(columns=colmap, inplace=True)
@@ -216,13 +289,39 @@ def fetch_yf(ticker, period, interval):
     return data
 
 
-def align_for_ratio(df1, df2):
+def align_for_ratio(df1, df2, log_name1=None, log_name2=None):
     # Align two dataframes on index by inner join after resampling to common frequency if needed
-    # We'll reindex both to union of indexes but forward/backfill will distort — prefer inner join
-    common_idx = df1.index.intersection(df2.index)
-    a = df1.reindex(common_idx)
-    b = df2.reindex(common_idx)
-    return a, b
+    try:
+        log(f"Aligning for ratio: {log_name1 or 'DF1'} vs {log_name2 or 'DF2'}")
+        log_shape(df1, f"{log_name1 or 'DF1'} BEFORE align")
+        log_shape(df2, f"{log_name2 or 'DF2'} BEFORE align")
+
+        df1 = df1.sort_index()
+        df2 = df2.sort_index()
+
+        common_idx = df1.index.intersection(df2.index)
+        if len(common_idx) == 0:
+            # try resampling both to a coarser frequency (e.g., 1min -> 5min) as fallback
+            log("No common index — attempting resample fallback to 1min frequency union")
+            # build union and forward/backfill cautiously
+            union_idx = df1.index.union(df2.index).sort_values()
+            a = df1.reindex(union_idx).ffill().bfill()
+            b = df2.reindex(union_idx).ffill().bfill()
+            # after filling, intersect again
+            common_idx = a.index.intersection(b.index)
+            a = a.loc[common_idx]
+            b = b.loc[common_idx]
+            log_shape(a, "DF1 after resample-fallback")
+            log_shape(b, "DF2 after resample-fallback")
+            return a, b
+        a = df1.reindex(common_idx)
+        b = df2.reindex(common_idx)
+        log_shape(a, f"{log_name1 or 'DF1'} AFTER align")
+        log_shape(b, f"{log_name2 or 'DF2'} AFTER align")
+        return a, b
+    except Exception as e:
+        log_error(e, "Ratio alignment failed")
+        return pd.DataFrame(), pd.DataFrame()
 
 # ----------------------------- Analysis Engine -----------------------------
 
