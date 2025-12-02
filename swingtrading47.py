@@ -116,10 +116,52 @@ def fetch_data_with_retry(ticker, period, interval, max_retries=3):
             if data.empty:
                 return None
             
+            # Flatten multi-index columns if present
+            if isinstance(data.columns, pd.MultiIndex):
+                data.columns = ['_'.join(col).strip() if isinstance(col, tuple) else col for col in data.columns.values]
+                # If single ticker, remove ticker suffix
+                if len(data.columns) > 0:
+                    first_col = data.columns[0]
+                    if '_' in first_col:
+                        ticker_suffix = '_' + ticker.replace('^', '').replace('=', '')
+                        data.columns = [col.replace(ticker_suffix, '').strip('_') for col in data.columns]
+            
+            # Ensure we have the required columns
+            required_cols = ['Open', 'High', 'Low', 'Close']
+            for col in required_cols:
+                if col not in data.columns:
+                    st.error(f"Missing required column: {col}")
+                    return None
+            
+            # Add Volume column if not present (for indexes)
+            if 'Volume' not in data.columns:
+                data['Volume'] = 0
+            
+            # Reset index to make datetime a column, then set it back
+            data = data.reset_index()
+            
+            # Handle different datetime column names
+            datetime_col = None
+            for col_name in ['Date', 'Datetime', 'index']:
+                if col_name in data.columns:
+                    datetime_col = col_name
+                    break
+            
+            if datetime_col is None:
+                st.error("No datetime column found")
+                return None
+            
             # Convert to IST timezone
-            if data.index.tz is None:
-                data.index = data.index.tz_localize('UTC')
-            data.index = data.index.tz_convert(IST)
+            if data[datetime_col].dt.tz is None:
+                data[datetime_col] = pd.to_datetime(data[datetime_col]).dt.tz_localize('UTC')
+            data[datetime_col] = data[datetime_col].dt.tz_convert(IST)
+            
+            # Set datetime as index
+            data = data.set_index(datetime_col)
+            
+            # Keep only relevant columns
+            relevant_cols = ['Open', 'High', 'Low', 'Close', 'Volume']
+            data = data[relevant_cols]
             
             return data
         except Exception as e:
@@ -197,7 +239,7 @@ def find_support_resistance(data, window=20, prominence=0.02):
         price = highs[idx]
         date = data.index[idx]
         # Count touches within 0.5% range
-        touches = sum((abs(highs - price) / price < 0.005).astype(int))
+        touches = int(np.sum(np.abs(highs - price) / price < 0.005))
         resistances.append({'level': price, 'touches': touches, 'date': date, 'type': 'resistance'})
     
     # Get support levels
@@ -205,7 +247,7 @@ def find_support_resistance(data, window=20, prominence=0.02):
     for idx in support_indices:
         price = lows[idx]
         date = data.index[idx]
-        touches = sum((abs(lows - price) / price < 0.005).astype(int))
+        touches = int(np.sum(np.abs(lows - price) / price < 0.005))
         supports.append({'level': price, 'touches': touches, 'date': date, 'type': 'support'})
     
     # Combine and sort by touches
@@ -259,10 +301,13 @@ def detect_elliott_wave(data):
 
 def detect_rsi_divergence(price, rsi, window=14):
     """Detect RSI divergence"""
-    price_peaks, _ = find_peaks(price.values, distance=window)
-    price_troughs, _ = find_peaks(-price.values, distance=window)
-    rsi_peaks, _ = find_peaks(rsi.values, distance=window)
-    rsi_troughs, _ = find_peaks(-rsi.values, distance=window)
+    price_values = price.values
+    rsi_values = rsi.values
+    
+    price_peaks, _ = find_peaks(price_values, distance=window)
+    price_troughs, _ = find_peaks(-price_values, distance=window)
+    rsi_peaks, _ = find_peaks(rsi_values, distance=window)
+    rsi_troughs, _ = find_peaks(-rsi_values, distance=window)
     
     divergences = []
     
@@ -271,16 +316,16 @@ def detect_rsi_divergence(price, rsi, window=14):
         last_price_trough = price_troughs[-1]
         prev_price_trough = price_troughs[-2]
         
-        if price.iloc[last_price_trough] < price.iloc[prev_price_trough]:
+        if price_values[last_price_trough] < price_values[prev_price_trough]:
             # Check RSI
-            rsi_near_last = rsi_troughs[rsi_troughs >= prev_price_trough - 5]
-            rsi_near_last = rsi_near_last[rsi_near_last <= last_price_trough + 5]
+            rsi_near_last = rsi_troughs[(rsi_troughs >= prev_price_trough - 5) & 
+                                        (rsi_troughs <= last_price_trough + 5)]
             
             if len(rsi_near_last) >= 2:
-                if rsi.iloc[rsi_near_last[-1]] > rsi.iloc[rsi_near_last[-2]]:
+                if rsi_values[rsi_near_last[-1]] > rsi_values[rsi_near_last[-2]]:
                     divergences.append({
                         'type': 'bullish',
-                        'price': price.iloc[last_price_trough],
+                        'price': float(price_values[last_price_trough]),
                         'date': price.index[last_price_trough]
                     })
     
@@ -289,15 +334,15 @@ def detect_rsi_divergence(price, rsi, window=14):
         last_price_peak = price_peaks[-1]
         prev_price_peak = price_peaks[-2]
         
-        if price.iloc[last_price_peak] > price.iloc[prev_price_peak]:
-            rsi_near_last = rsi_peaks[rsi_peaks >= prev_price_peak - 5]
-            rsi_near_last = rsi_near_last[rsi_near_last <= last_price_peak + 5]
+        if price_values[last_price_peak] > price_values[prev_price_peak]:
+            rsi_near_last = rsi_peaks[(rsi_peaks >= prev_price_peak - 5) & 
+                                      (rsi_peaks <= last_price_peak + 5)]
             
             if len(rsi_near_last) >= 2:
-                if rsi.iloc[rsi_near_last[-1]] < rsi.iloc[rsi_near_last[-2]]:
+                if rsi_values[rsi_near_last[-1]] < rsi_values[rsi_near_last[-2]]:
                     divergences.append({
                         'type': 'bearish',
-                        'price': price.iloc[last_price_peak],
+                        'price': float(price_values[last_price_peak]),
                         'date': price.index[last_price_peak]
                     })
     
@@ -336,12 +381,12 @@ def generate_trading_signals(data, ticker_name, timeframe):
     volatility = calculate_volatility(returns)
     zscore = calculate_zscore(close)
     
-    # Get latest values
-    latest_price = close.iloc[-1]
-    latest_rsi = rsi.iloc[-1]
-    latest_adx = adx.iloc[-1]
-    latest_volatility = volatility.iloc[-1]
-    latest_zscore = zscore.iloc[-1]
+    # Get latest values - ensure they are scalar
+    latest_price = float(close.iloc[-1])
+    latest_rsi = float(rsi.iloc[-1]) if not pd.isna(rsi.iloc[-1]) else 50.0
+    latest_adx = float(adx.iloc[-1]) if not pd.isna(adx.iloc[-1]) else 0.0
+    latest_volatility = float(volatility.iloc[-1]) if not pd.isna(volatility.iloc[-1]) else 0.0
+    latest_zscore = float(zscore.iloc[-1]) if not pd.isna(zscore.iloc[-1]) else 0.0
     
     # Support and resistance
     sr_levels = find_support_resistance(data)
@@ -362,17 +407,20 @@ def generate_trading_signals(data, ticker_name, timeframe):
         score -= 2
     
     # Trend signals
-    if latest_price > ema_20.iloc[-1] > ema_50.iloc[-1]:
+    ema_20_latest = float(ema_20.iloc[-1]) if not pd.isna(ema_20.iloc[-1]) else latest_price
+    ema_50_latest = float(ema_50.iloc[-1]) if not pd.isna(ema_50.iloc[-1]) else latest_price
+    
+    if latest_price > ema_20_latest > ema_50_latest:
         signals.append(("Trend", "bullish", "Price above 20 & 50 EMA"))
         score += 1
-    elif latest_price < ema_20.iloc[-1] < ema_50.iloc[-1]:
+    elif latest_price < ema_20_latest < ema_50_latest:
         signals.append(("Trend", "bearish", "Price below 20 & 50 EMA"))
         score -= 1
     
     # ADX strength
     if latest_adx > 25:
         signals.append(("ADX", "strong", f"Strong trend (ADX: {latest_adx:.1f})"))
-        score += 1 if latest_price > ema_20.iloc[-1] else -1
+        score += 1 if latest_price > ema_20_latest else -1
     
     # Divergence signals
     if divergence:
@@ -408,19 +456,25 @@ def generate_trading_signals(data, ticker_name, timeframe):
                 score -= 1
     
     # Bollinger Bands
-    if latest_price < lower_bb.iloc[-1]:
+    lower_bb_latest = float(lower_bb.iloc[-1]) if not pd.isna(lower_bb.iloc[-1]) else latest_price
+    upper_bb_latest = float(upper_bb.iloc[-1]) if not pd.isna(upper_bb.iloc[-1]) else latest_price
+    
+    if latest_price < lower_bb_latest:
         signals.append(("Bollinger", "bullish", "Price below lower band"))
         score += 1
-    elif latest_price > upper_bb.iloc[-1]:
+    elif latest_price > upper_bb_latest:
         signals.append(("Bollinger", "bearish", "Price above upper band"))
         score -= 1
     
     # MACD crossover
     if len(histogram) > 1:
-        if histogram.iloc[-2] < 0 and histogram.iloc[-1] > 0:
+        hist_prev = float(histogram.iloc[-2]) if not pd.isna(histogram.iloc[-2]) else 0.0
+        hist_curr = float(histogram.iloc[-1]) if not pd.isna(histogram.iloc[-1]) else 0.0
+        
+        if hist_prev < 0 and hist_curr > 0:
             signals.append(("MACD", "bullish", "Bullish MACD crossover"))
             score += 1
-        elif histogram.iloc[-2] > 0 and histogram.iloc[-1] < 0:
+        elif hist_prev > 0 and hist_curr < 0:
             signals.append(("MACD", "bearish", "Bearish MACD crossover"))
             score -= 1
     
@@ -442,7 +496,8 @@ def generate_trading_signals(data, ticker_name, timeframe):
         signal_class = "hold-signal"
     
     # Calculate entry, SL, and targets
-    atr = (high - low).rolling(window=14).mean().iloc[-1]
+    atr_series = (high - low).rolling(window=14).mean()
+    atr = float(atr_series.iloc[-1]) if not pd.isna(atr_series.iloc[-1]) else latest_price * 0.02
     
     if "BUY" in final_signal:
         entry = latest_price
@@ -897,8 +952,12 @@ if st.session_state.data_fetched and st.session_state.ticker1_data is not None:
     fig.add_trace(go.Bar(x=data1.index, y=histogram, name='Histogram', marker_color='gray'), row=3, col=1)
     
     # Volume
-    colors = ['green' if data1['Close'].iloc[i] > data1['Open'].iloc[i] else 'red' for i in range(len(data1))]
-    fig.add_trace(go.Bar(x=data1.index, y=data1['Volume'], name='Volume', marker_color=colors), row=4, col=1)
+    if 'Volume' in data1.columns and data1['Volume'].sum() > 0:
+        colors = ['green' if data1['Close'].iloc[i] > data1['Open'].iloc[i] else 'red' for i in range(len(data1))]
+        fig.add_trace(go.Bar(x=data1.index, y=data1['Volume'], name='Volume', marker_color=colors), row=4, col=1)
+    else:
+        # If no volume data, hide the volume subplot
+        fig.update_yaxes(title_text="No Volume Data", row=4, col=1)
     
     fig.update_layout(height=1200, showlegend=True, hovermode='x unified', xaxis_rangeslider_visible=False)
     fig.update_xaxes(title_text="Date", row=4, col=1)
