@@ -806,7 +806,410 @@ def detailed_backtest(data, strategy_type, params):
     
     return pd.DataFrame(trades) if trades else None
 
-def generate_comprehensive_summary(all_timeframe_data, ticker_name, backtest_result):
+def create_indicator_tables(data, ticker_name):
+    """Create comprehensive indicator tables with datetime, price, and changes"""
+    
+    close = data['Close']
+    high = data['High']
+    low = data['Low']
+    
+    # Calculate all indicators
+    rsi = calculate_rsi(close)
+    zscore = calculate_zscore(close)
+    volatility = calculate_volatility(close.pct_change())
+    ema_9 = calculate_ema(close, 9)
+    ema_20 = calculate_ema(close, 20)
+    ema_50 = calculate_ema(close, 50)
+    
+    # Base dataframe
+    indicator_df = pd.DataFrame({
+        'DateTime': data.index.strftime('%Y-%m-%d %H:%M:%S IST'),
+        'Price': close.values
+    })
+    
+    # RSI Table
+    rsi_df = indicator_df.copy()
+    rsi_df['RSI'] = rsi.values
+    rsi_df['RSI_Change'] = rsi.diff().values
+    rsi_df['Price_Change_%'] = close.pct_change().values * 100
+    rsi_df['Price_Change_Abs'] = close.diff().values
+    rsi_df['RSI_Signal'] = rsi_df['RSI'].apply(
+        lambda x: 'Oversold' if x < 30 else 'Overbought' if x > 70 else 'Neutral'
+    )
+    
+    # Z-Score Bins Table
+    zscore_df = indicator_df.copy()
+    zscore_df['Z-Score'] = zscore.values
+    zscore_df['Z-Score_Bin'] = pd.cut(
+        zscore, 
+        bins=[-np.inf, -3, -2, -1, 0, 1, 2, 3, np.inf],
+        labels=['Extreme Oversold (<-3)', 'Very Oversold (-3 to -2)', 'Oversold (-2 to -1)', 
+                'Slightly Bearish (-1 to 0)', 'Slightly Bullish (0 to 1)', 
+                'Overbought (1 to 2)', 'Very Overbought (2 to 3)', 'Extreme Overbought (>3)']
+    )
+    zscore_df['Price_Change_%'] = close.pct_change().values * 100
+    zscore_df['Price_Change_Abs'] = close.diff().values
+    zscore_df['Mean_Reversion_Signal'] = zscore_df['Z-Score'].apply(
+        lambda x: 'Strong Buy' if x < -2 else 'Strong Sell' if x > 2 else 'Neutral'
+    )
+    
+    # Volatility Bins Table
+    volatility_df = indicator_df.copy()
+    volatility_df['Volatility_%'] = volatility.values
+    volatility_df['Volatility_Bin'] = pd.cut(
+        volatility,
+        bins=[0, 10, 20, 30, 50, np.inf],
+        labels=['Very Low (<10%)', 'Low (10-20%)', 'Medium (20-30%)', 'High (30-50%)', 'Very High (>50%)']
+    )
+    volatility_df['Price_Change_%'] = close.pct_change().values * 100
+    volatility_df['Price_Change_Abs'] = close.diff().values
+    volatility_df['Volatility_Change'] = volatility.diff().values
+    
+    # EMAs Table
+    ema_df = indicator_df.copy()
+    ema_df['EMA_9'] = ema_9.values
+    ema_df['EMA_20'] = ema_20.values
+    ema_df['EMA_50'] = ema_50.values
+    ema_df['Price_vs_EMA9_%'] = ((close - ema_9) / ema_9 * 100).values
+    ema_df['Price_vs_EMA20_%'] = ((close - ema_20) / ema_20 * 100).values
+    ema_df['Price_vs_EMA50_%'] = ((close - ema_50) / ema_50 * 100).values
+    ema_df['Price_Change_%'] = close.pct_change().values * 100
+    ema_df['Price_Change_Abs'] = close.diff().values
+    ema_df['Trend'] = ema_df.apply(
+        lambda row: 'Strong Uptrend' if row['Price'] > row['EMA_9'] > row['EMA_20'] > row['EMA_50']
+        else 'Strong Downtrend' if row['Price'] < row['EMA_9'] < row['EMA_20'] < row['EMA_50']
+        else 'Mixed',
+        axis=1
+    )
+    
+    # Support/Resistance Table
+    sr_levels = find_support_resistance(data)
+    sr_df = pd.DataFrame(sr_levels)
+    if not sr_df.empty:
+        sr_df['DateTime'] = sr_df['date'].dt.strftime('%Y-%m-%d %H:%M:%S IST')
+        current_price = float(close.iloc[-1])
+        sr_df['Distance_from_Current_%'] = ((sr_df['level'] - current_price) / current_price * 100)
+        sr_df['Distance_from_Current_Abs'] = sr_df['level'] - current_price
+        sr_df = sr_df[['DateTime', 'type', 'level', 'touches', 'sustained', 
+                       'Distance_from_Current_%', 'Distance_from_Current_Abs']]
+        sr_df.columns = ['DateTime', 'Type', 'Price_Level', 'Touch_Count', 'Sustained_Periods',
+                         'Distance_%', 'Distance_Abs']
+    
+    # Fibonacci Table
+    fib_levels = calculate_fibonacci_levels(data)
+    fib_data = []
+    current_price = float(close.iloc[-1])
+    for level_name, level_data in fib_levels.items():
+        fib_data.append({
+            'Fib_Level': level_name,
+            'Price': level_data['price'],
+            'DateTime': level_data['date'].strftime('%Y-%m-%d %H:%M:%S IST') if level_data['date'] else 'N/A',
+            'Distance_from_Current_%': ((level_data['price'] - current_price) / current_price * 100),
+            'Distance_from_Current_Abs': level_data['price'] - current_price
+        })
+    fib_df = pd.DataFrame(fib_data)
+    
+    # Elliott Wave Table
+    elliott = detect_elliott_wave_detailed(data)
+    if elliott:
+        elliott_df = pd.DataFrame(elliott['waves'])
+        elliott_df['DateTime'] = pd.to_datetime(elliott_df['date']).dt.strftime('%Y-%m-%d %H:%M:%S IST')
+        elliott_df = elliott_df[['phase', 'wave_type', 'point_type', 'price', 'high', 'low', 
+                                 'change', 'change_pct', 'duration', 'DateTime']]
+        elliott_df.columns = ['Wave_Phase', 'Wave_Type', 'Point_Type', 'Price', 'High', 'Low',
+                              'Price_Change_Abs', 'Price_Change_%', 'Duration', 'DateTime']
+    else:
+        elliott_df = pd.DataFrame()
+    
+    # RSI Divergence Table
+    divergence = detect_rsi_divergence(close, rsi)
+    if divergence:
+        div_df = pd.DataFrame(divergence)
+        div_df['DateTime'] = pd.to_datetime(div_df['date']).dt.strftime('%Y-%m-%d %H:%M:%S IST')
+        div_df['RSI_Change'] = div_df['rsi_new'] - div_df['rsi_old']
+        div_df = div_df[['DateTime', 'type', 'price', 'rsi_old', 'rsi_new', 'RSI_Change', 'time_ago']]
+        div_df.columns = ['DateTime', 'Divergence_Type', 'Price', 'RSI_Old', 'RSI_New', 'RSI_Change', 'Time_Ago']
+    else:
+        div_df = pd.DataFrame()
+    
+    return {
+        'rsi': rsi_df,
+        'zscore': zscore_df,
+        'volatility': volatility_df,
+        'ema': ema_df,
+        'support_resistance': sr_df if not sr_df.empty else pd.DataFrame(),
+        'fibonacci': fib_df,
+        'elliott': elliott_df,
+        'divergence': div_df
+    }
+
+def create_ratio_table(data1, data2, ticker1, ticker2):
+    """Create comprehensive ratio analysis table"""
+    
+    # Align data
+    common_index = data1.index.intersection(data2.index)
+    
+    if len(common_index) == 0:
+        return pd.DataFrame()
+    
+    data1_aligned = data1.loc[common_index]
+    data2_aligned = data2.loc[common_index]
+    
+    # Calculate ratio and indicators
+    ratio = data1_aligned['Close'] / data2_aligned['Close']
+    ratio_rsi = calculate_rsi(ratio)
+    ratio_zscore = calculate_zscore(ratio)
+    
+    ratio_df = pd.DataFrame({
+        'DateTime': common_index.strftime('%Y-%m-%d %H:%M:%S IST'),
+        f'{ticker1}_Price': data1_aligned['Close'].values,
+        f'{ticker2}_Price': data2_aligned['Close'].values,
+        'Ratio': ratio.values,
+        'Ratio_Change_%': ratio.pct_change().values * 100,
+        'Ratio_Change_Abs': ratio.diff().values,
+        f'{ticker1}_RSI': calculate_rsi(data1_aligned['Close']).values,
+        f'{ticker2}_RSI': calculate_rsi(data2_aligned['Close']).values,
+        'Ratio_RSI': ratio_rsi.values,
+        f'{ticker1}_Z-Score': calculate_zscore(data1_aligned['Close']).values,
+        f'{ticker2}_Z-Score': calculate_zscore(data2_aligned['Close']).values,
+        'Ratio_Z-Score': ratio_zscore.values,
+        f'{ticker1}_Volatility': calculate_volatility(data1_aligned['Close'].pct_change()).values,
+        f'{ticker2}_Volatility': calculate_volatility(data2_aligned['Close'].pct_change()).values,
+        f'{ticker1}_Change_%': data1_aligned['Close'].pct_change().values * 100,
+        f'{ticker2}_Change_%': data2_aligned['Close'].pct_change().values * 100
+    })
+    
+    return ratio_df
+
+def analyze_pattern_performance(all_timeframe_data, ticker_name):
+    """Analyze what patterns are working and what are not across timeframes"""
+    
+    pattern_results = []
+    
+    for tf_key, data in all_timeframe_data.items():
+        if len(data) < 50:
+            continue
+        
+        interval, period = tf_key.split('_')
+        
+        close = data['Close']
+        rsi = calculate_rsi(close)
+        zscore = calculate_zscore(close)
+        ema_9 = calculate_ema(close, 9)
+        ema_20 = calculate_ema(close, 20)
+        
+        # Test various patterns
+        patterns = []
+        
+        # RSI Oversold pattern
+        rsi_oversold_signals = data[rsi < 30]
+        if len(rsi_oversold_signals) > 0:
+            successes = 0
+            for idx in rsi_oversold_signals.index:
+                idx_pos = data.index.get_loc(idx)
+                if idx_pos < len(data) - 10:
+                    future_return = (data['Close'].iloc[idx_pos+10] - data['Close'].iloc[idx_pos]) / data['Close'].iloc[idx_pos] * 100
+                    if future_return > 0:
+                        successes += 1
+            accuracy = (successes / len(rsi_oversold_signals)) * 100 if len(rsi_oversold_signals) > 0 else 0
+            patterns.append({
+                'Pattern': 'RSI Oversold (<30)',
+                'Occurrences': len(rsi_oversold_signals),
+                'Success_Rate_%': accuracy,
+                'Status': '✅ Working' if accuracy > 60 else '❌ Not Working',
+                'Confidence': 'High' if accuracy > 70 else 'Medium' if accuracy > 50 else 'Low',
+                'Last_Signal': rsi_oversold_signals.index[-1].strftime('%Y-%m-%d %H:%M IST') if len(rsi_oversold_signals) > 0 else 'N/A'
+            })
+        
+        # Z-Score extreme pattern
+        zscore_extreme = data[abs(zscore) > 2]
+        if len(zscore_extreme) > 0:
+            successes = 0
+            for idx in zscore_extreme.index:
+                idx_pos = data.index.get_loc(idx)
+                if idx_pos < len(data) - 10:
+                    z_val = zscore.loc[idx]
+                    future_return = (data['Close'].iloc[idx_pos+10] - data['Close'].iloc[idx_pos]) / data['Close'].iloc[idx_pos] * 100
+                    # Success if mean reversion occurs
+                    if (z_val < -2 and future_return > 0) or (z_val > 2 and future_return < 0):
+                        successes += 1
+            accuracy = (successes / len(zscore_extreme)) * 100 if len(zscore_extreme) > 0 else 0
+            patterns.append({
+                'Pattern': 'Z-Score Mean Reversion (|Z|>2)',
+                'Occurrences': len(zscore_extreme),
+                'Success_Rate_%': accuracy,
+                'Status': '✅ Working' if accuracy > 60 else '❌ Not Working',
+                'Confidence': 'High' if accuracy > 70 else 'Medium' if accuracy > 50 else 'Low',
+                'Last_Signal': zscore_extreme.index[-1].strftime('%Y-%m-%d %H:%M IST') if len(zscore_extreme) > 0 else 'N/A'
+            })
+        
+        # EMA Crossover pattern
+        ema_cross_signals = []
+        for i in range(1, len(data)):
+            if ema_9.iloc[i-1] <= ema_20.iloc[i-1] and ema_9.iloc[i] > ema_20.iloc[i]:
+                ema_cross_signals.append(i)
+        
+        if len(ema_cross_signals) > 0:
+            successes = 0
+            for idx_pos in ema_cross_signals:
+                if idx_pos < len(data) - 10:
+                    future_return = (data['Close'].iloc[idx_pos+10] - data['Close'].iloc[idx_pos]) / data['Close'].iloc[idx_pos] * 100
+                    if future_return > 0:
+                        successes += 1
+            accuracy = (successes / len(ema_cross_signals)) * 100 if len(ema_cross_signals) > 0 else 0
+            patterns.append({
+                'Pattern': 'EMA 9/20 Bullish Crossover',
+                'Occurrences': len(ema_cross_signals),
+                'Success_Rate_%': accuracy,
+                'Status': '✅ Working' if accuracy > 60 else '❌ Not Working',
+                'Confidence': 'High' if accuracy > 70 else 'Medium' if accuracy > 50 else 'Low',
+                'Last_Signal': data.index[ema_cross_signals[-1]].strftime('%Y-%m-%d %H:%M IST') if len(ema_cross_signals) > 0 else 'N/A'
+            })
+        
+        # Support bounce pattern
+        sr_levels = find_support_resistance(data)
+        support_levels = [l for l in sr_levels if l['type'] == 'support']
+        
+        if support_levels:
+            support_bounces = 0
+            total_tests = 0
+            for level in support_levels[:3]:
+                level_price = level['level']
+                # Find times when price was near this level
+                near_support = data[abs(data['Close'] - level_price) / level_price < 0.01]
+                for idx in near_support.index:
+                    idx_pos = data.index.get_loc(idx)
+                    if idx_pos < len(data) - 5:
+                        future_return = (data['Close'].iloc[idx_pos+5] - data['Close'].iloc[idx_pos]) / data['Close'].iloc[idx_pos] * 100
+                        total_tests += 1
+                        if future_return > 0:
+                            support_bounces += 1
+            
+            accuracy = (support_bounces / total_tests * 100) if total_tests > 0 else 0
+            if total_tests > 0:
+                patterns.append({
+                    'Pattern': 'Support Level Bounce',
+                    'Occurrences': total_tests,
+                    'Success_Rate_%': accuracy,
+                    'Status': '✅ Working' if accuracy > 60 else '❌ Not Working',
+                    'Confidence': 'High' if accuracy > 70 else 'Medium' if accuracy > 50 else 'Low',
+                    'Last_Signal': near_support.index[-1].strftime('%Y-%m-%d %H:%M IST') if len(near_support) > 0 else 'N/A'
+                })
+        
+        # Store results for this timeframe
+        for pattern in patterns:
+            pattern['Timeframe'] = f"{interval}_{period}"
+            pattern_results.append(pattern)
+    
+    return pd.DataFrame(pattern_results)
+
+def create_backtest_details_table(data, strategy_type, params):
+    """Create detailed backtest execution table"""
+    
+    capital = 100000
+    position = None
+    backtest_details = []
+    
+    close = data['Close']
+    rsi = calculate_rsi(close)
+    ema_f = calculate_ema(close, params['ema_combo'][0])
+    ema_s = calculate_ema(close, params['ema_combo'][1])
+    adx = calculate_adx(data['High'], data['Low'], close)
+    
+    rsi_oversold = params['rsi_range'][0]
+    rsi_overbought = params['rsi_range'][1]
+    adx_threshold = params['adx_threshold']
+    
+    for i in range(50, len(data)):
+        current_price = float(close.iloc[i])
+        current_rsi = float(rsi.iloc[i])
+        current_adx = float(adx.iloc[i])
+        ema_fast_val = float(ema_f.iloc[i])
+        ema_slow_val = float(ema_s.iloc[i])
+        
+        entry_signal = False
+        exit_signal = False
+        signal_reasons = []
+        
+        if position is None:
+            # Check entry conditions
+            if strategy_type == 'combined':
+                if current_rsi < rsi_oversold:
+                    signal_reasons.append(f"RSI={current_rsi:.1f}<{rsi_oversold}")
+                if ema_fast_val > ema_slow_val:
+                    signal_reasons.append(f"EMA{params['ema_combo'][0]}>{params['ema_combo'][1]}")
+                if current_adx > adx_threshold:
+                    signal_reasons.append(f"ADX={current_adx:.1f}>{adx_threshold}")
+                
+                if current_rsi < rsi_oversold and ema_fast_val > ema_slow_val and current_adx > adx_threshold:
+                    entry_signal = True
+            
+            if entry_signal:
+                shares = (capital * 20 / 100) / current_price
+                position = {
+                    'entry': current_price,
+                    'shares': shares,
+                    'entry_date': data.index[i],
+                    'entry_rsi': current_rsi,
+                    'entry_adx': current_adx
+                }
+                
+                backtest_details.append({
+                    'DateTime': data.index[i].strftime('%Y-%m-%d %H:%M:%S IST'),
+                    'Action': 'BUY',
+                    'Price': current_price,
+                    'RSI': current_rsi,
+                    'ADX': current_adx,
+                    f'EMA_{params["ema_combo"][0]}': ema_fast_val,
+                    f'EMA_{params["ema_combo"][1]}': ema_slow_val,
+                    'Signal_Reasons': ' & '.join(signal_reasons),
+                    'Capital': capital,
+                    'Position_Size': shares * current_price,
+                    'Trade_Result': 'Open'
+                })
+        
+        elif position is not None:
+            # Check exit conditions
+            if strategy_type == 'combined':
+                if current_rsi > rsi_overbought:
+                    signal_reasons.append(f"RSI={current_rsi:.1f}>{rsi_overbought}")
+                    exit_signal = True
+                if ema_fast_val < ema_slow_val:
+                    signal_reasons.append(f"EMA{params['ema_combo'][0]}<{params['ema_combo'][1]}")
+                    exit_signal = True
+                if current_adx < adx_threshold:
+                    signal_reasons.append(f"ADX={current_adx:.1f}<{adx_threshold}")
+                    exit_signal = True
+            
+            pct_change = ((current_price - position['entry']) / position['entry']) * 100
+            if pct_change < -5:
+                signal_reasons.append("Stop Loss Hit (-5%)")
+                exit_signal = True
+            elif pct_change > 10:
+                signal_reasons.append("Take Profit Hit (+10%)")
+                exit_signal = True
+            
+            if exit_signal:
+                profit = (current_price - position['entry']) * position['shares']
+                capital += profit
+                
+                backtest_details.append({
+                    'DateTime': data.index[i].strftime('%Y-%m-%d %H:%M:%S IST'),
+                    'Action': 'SELL',
+                    'Price': current_price,
+                    'RSI': current_rsi,
+                    'ADX': current_adx,
+                    f'EMA_{params["ema_combo"][0]}': ema_fast_val,
+                    f'EMA_{params["ema_combo"][1]}': ema_slow_val,
+                    'Signal_Reasons': ' & '.join(signal_reasons),
+                    'Capital': capital,
+                    'Position_Size': 0,
+                    'Trade_Result': f"P/L: {profit:+.2f} ({pct_change:+.2f}%)"
+                })
+                
+                position = None
+    
+    return pd.DataFrame(backtest_details)
     """Generate ultra-detailed market analysis summary"""
     
     summary_parts = []
@@ -1168,32 +1571,95 @@ if enable_ratio:
 
 # Fetch data button
 if st.sidebar.button("🔄 Fetch All Data", type="primary"):
-    with st.spinner(f"Fetching comprehensive data for {ticker1}..."):
-        try:
-            st.session_state.all_timeframe_data = fetch_all_timeframes(ticker1)
+    # Create progress tracking
+    progress_bar = st.sidebar.progress(0)
+    status_text = st.sidebar.empty()
+    
+    try:
+        # Fetch ticker 1 data
+        status_text.text("📊 Fetching Ticker 1 data...")
+        
+        total_combinations = sum(len(periods) for periods in VALID_COMBINATIONS.values())
+        fetched = 0
+        
+        all_data_t1 = {}
+        
+        for interval, periods in VALID_COMBINATIONS.items():
+            for period in periods:
+                try:
+                    status_text.text(f"📊 Fetching {ticker1}: {interval} - {period} ({fetched+1}/{total_combinations})")
+                    data = fetch_data_with_retry(ticker1, period, interval)
+                    if data is not None and len(data) > 0:
+                        key = f"{interval}_{period}"
+                        all_data_t1[key] = data
+                    fetched += 1
+                    progress_bar.progress(fetched / (total_combinations * (2 if enable_ratio else 1)))
+                except:
+                    fetched += 1
+                    continue
+        
+        st.session_state.all_timeframe_data = all_data_t1
+        
+        if st.session_state.all_timeframe_data:
+            status_text.text(f"✅ {ticker1}: {len(st.session_state.all_timeframe_data)} combinations fetched")
+        else:
+            status_text.text(f"❌ Failed to fetch {ticker1} data")
+        
+        # Fetch ticker 2 if enabled
+        if enable_ratio and ticker2:
+            status_text.text("📊 Fetching Ticker 2 data...")
             
-            if st.session_state.all_timeframe_data:
-                st.sidebar.success(f"✅ {ticker1}: {len(st.session_state.all_timeframe_data)} timeframe combinations fetched")
+            all_data_t2 = {}
+            
+            for interval, periods in VALID_COMBINATIONS.items():
+                for period in periods:
+                    try:
+                        status_text.text(f"📊 Fetching {ticker2}: {interval} - {period} ({fetched+1}/{total_combinations * 2})")
+                        data = fetch_data_with_retry(ticker2, period, interval)
+                        if data is not None and len(data) > 0:
+                            key = f"{interval}_{period}"
+                            all_data_t2[key] = data
+                        fetched += 1
+                        progress_bar.progress(fetched / (total_combinations * 2))
+                    except:
+                        fetched += 1
+                        continue
+            
+            st.session_state.all_timeframe_data_t2 = all_data_t2
+            
+            if st.session_state.all_timeframe_data_t2:
+                status_text.text(f"✅ {ticker2}: {len(st.session_state.all_timeframe_data_t2)} combinations fetched")
             else:
-                st.sidebar.error(f"❌ Failed to fetch {ticker1} data")
+                status_text.text(f"❌ Failed to fetch {ticker2} data")
+        
+        # Analysis phase
+        if st.session_state.all_timeframe_data:
+            progress_bar.progress(0.5)
+            status_text.text("🔬 Running comprehensive analysis...")
+            time.sleep(1)
             
-            if enable_ratio and ticker2:
-                st.session_state.all_timeframe_data_t2 = fetch_all_timeframes(ticker2)
-                if st.session_state.all_timeframe_data_t2:
-                    st.sidebar.success(f"✅ {ticker2}: {len(st.session_state.all_timeframe_data_t2)} timeframe combinations fetched")
-                else:
-                    st.sidebar.error(f"❌ Failed to fetch {ticker2} data")
+            progress_bar.progress(0.7)
+            status_text.text("📈 Generating indicators...")
+            time.sleep(1)
             
-            if st.session_state.all_timeframe_data:
-                st.session_state.data_fetched = True
-                st.success("✅ Comprehensive data fetched! Scroll down for detailed analysis.")
-            else:
-                st.error("Failed to fetch data. Please try a different ticker.")
-                st.session_state.data_fetched = False
-                
-        except Exception as e:
-            st.error(f"Error during data fetch: {str(e)}")
+            progress_bar.progress(0.85)
+            status_text.text("🎯 Creating recommendations...")
+            time.sleep(1)
+            
+            progress_bar.progress(1.0)
+            status_text.text("✅ Analysis complete!")
+            
+            st.session_state.data_fetched = True
+            st.success("✅ Comprehensive data fetched! Scroll down for detailed analysis.")
+        else:
+            status_text.text("❌ Failed to fetch data")
+            st.error("Failed to fetch data. Please try a different ticker.")
             st.session_state.data_fetched = False
+            
+    except Exception as e:
+        status_text.text(f"❌ Error: {str(e)}")
+        st.error(f"Error during data fetch: {str(e)}")
+        st.session_state.data_fetched = False
 
 # Main content
 st.markdown('<div class="main-header">📈 Advanced Algorithmic Trading Analysis</div>', unsafe_allow_html=True)
@@ -1288,7 +1754,275 @@ if st.session_state.data_fetched and st.session_state.all_timeframe_data:
     </div>
     """, unsafe_allow_html=True)
     
+    # Pattern Performance Analysis
+    st.subheader("🎯 Pattern Performance Analysis - What's Working & What's Not")
+    
+    pattern_analysis = analyze_pattern_performance(st.session_state.all_timeframe_data, ticker1)
+    
+    if not pattern_analysis.empty:
+        # Separate working and not working patterns
+        working_patterns = pattern_analysis[pattern_analysis['Status'].str.contains('Working')]
+        not_working_patterns = pattern_analysis[pattern_analysis['Status'].str.contains('Not Working')]
+        
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            st.write("### ✅ Working Patterns (>60% Accuracy)")
+            if not working_patterns.empty:
+                st.dataframe(working_patterns, use_container_width=True)
+            else:
+                st.info("No consistently working patterns found in recent data")
+        
+        with col2:
+            st.write("### ❌ Non-Working Patterns (<60% Accuracy)")
+            if not not_working_patterns.empty:
+                st.dataframe(not_working_patterns, use_container_width=True)
+            else:
+                st.success("All tested patterns showing positive results!")
+        
+        # Summary statistics
+        st.write("### 📊 Pattern Performance Summary")
+        col1, col2, col3, col4 = st.columns(4)
+        
+        avg_accuracy = pattern_analysis['Success_Rate_%'].mean()
+        best_pattern = pattern_analysis.loc[pattern_analysis['Success_Rate_%'].idxmax()]
+        worst_pattern = pattern_analysis.loc[pattern_analysis['Success_Rate_%'].idxmin()]
+        high_confidence = len(pattern_analysis[pattern_analysis['Confidence'] == 'High'])
+        
+        col1.metric("Average Accuracy", f"{avg_accuracy:.1f}%")
+        col2.metric("Best Pattern", f"{best_pattern['Success_Rate_%']:.1f}%", 
+                   delta=best_pattern['Pattern'][:20])
+        col3.metric("Worst Pattern", f"{worst_pattern['Success_Rate_%']:.1f}%",
+                   delta=worst_pattern['Pattern'][:20])
+        col4.metric("High Confidence Patterns", high_confidence)
+    
+    # Detailed Indicator Tables
+    st.subheader("📊 Comprehensive Indicator Tables")
+    
+    # Create all indicator tables
+    tables = create_indicator_tables(primary_data, ticker1)
+    
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs([
+        "📈 RSI Analysis", "📊 Z-Score Bins", "💹 Volatility Bins", 
+        "🔄 EMA Analysis", "🎚️ Support/Resistance", "📐 Fibonacci",
+        "🌊 Elliott Waves", "⚡ RSI Divergence"
+    ])
+    
+    with tab1:
+        st.write("### RSI Analysis with Price Correlation")
+        st.dataframe(tables['rsi'].tail(50), use_container_width=True)
+        
+        # Download option
+        csv = tables['rsi'].to_csv(index=False)
+        st.download_button(
+            "📥 Download RSI Table",
+            data=csv,
+            file_name=f"rsi_analysis_{ticker1}_{datetime.now(IST).strftime('%Y%m%d')}.csv",
+            mime="text/csv"
+        )
+    
+    with tab2:
+        st.write("### Z-Score Distribution & Mean Reversion Analysis")
+        st.dataframe(tables['zscore'].tail(50), use_container_width=True)
+        
+        # Z-Score distribution chart
+        fig = go.Figure()
+        fig.add_trace(go.Histogram(x=tables['zscore']['Z-Score'], nbinsx=20, name='Z-Score Distribution'))
+        fig.update_layout(title="Z-Score Distribution", xaxis_title="Z-Score", yaxis_title="Frequency")
+        st.plotly_chart(fig, use_container_width=True)
+        
+        csv = tables['zscore'].to_csv(index=False)
+        st.download_button(
+            "📥 Download Z-Score Table",
+            data=csv,
+            file_name=f"zscore_analysis_{ticker1}_{datetime.now(IST).strftime('%Y%m%d')}.csv",
+            mime="text/csv"
+        )
+    
+    with tab3:
+        st.write("### Volatility Bins & Market Conditions")
+        st.dataframe(tables['volatility'].tail(50), use_container_width=True)
+        
+        # Volatility distribution
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(
+            x=tables['volatility']['DateTime'],
+            y=tables['volatility']['Volatility_%'],
+            mode='lines',
+            name='Volatility'
+        ))
+        fig.update_layout(title="Volatility Over Time", xaxis_title="Date", yaxis_title="Volatility %")
+        st.plotly_chart(fig, use_container_width=True)
+        
+        csv = tables['volatility'].to_csv(index=False)
+        st.download_button(
+            "📥 Download Volatility Table",
+            data=csv,
+            file_name=f"volatility_analysis_{ticker1}_{datetime.now(IST).strftime('%Y%m%d')}.csv",
+            mime="text/csv"
+        )
+    
+    with tab4:
+        st.write("### EMA Analysis & Trend Identification")
+        st.dataframe(tables['ema'].tail(50), use_container_width=True)
+        
+        csv = tables['ema'].to_csv(index=False)
+        st.download_button(
+            "📥 Download EMA Table",
+            data=csv,
+            file_name=f"ema_analysis_{ticker1}_{datetime.now(IST).strftime('%Y%m%d')}.csv",
+            mime="text/csv"
+        )
+    
+    with tab5:
+        st.write("### Support & Resistance Levels")
+        if not tables['support_resistance'].empty:
+            st.dataframe(tables['support_resistance'], use_container_width=True)
+            
+            csv = tables['support_resistance'].to_csv(index=False)
+            st.download_button(
+                "📥 Download S/R Table",
+                data=csv,
+                file_name=f"sr_levels_{ticker1}_{datetime.now(IST).strftime('%Y%m%d')}.csv",
+                mime="text/csv"
+            )
+        else:
+            st.info("No support/resistance levels detected in current data")
+    
+    with tab6:
+        st.write("### Fibonacci Retracement Levels")
+        st.dataframe(tables['fibonacci'], use_container_width=True)
+        
+        csv = tables['fibonacci'].to_csv(index=False)
+        st.download_button(
+            "📥 Download Fibonacci Table",
+            data=csv,
+            file_name=f"fibonacci_{ticker1}_{datetime.now(IST).strftime('%Y%m%d')}.csv",
+            mime="text/csv"
+        )
+    
+    with tab7:
+        st.write("### Elliott Wave Structure Analysis")
+        if not tables['elliott'].empty:
+            st.dataframe(tables['elliott'], use_container_width=True)
+            
+            csv = tables['elliott'].to_csv(index=False)
+            st.download_button(
+                "📥 Download Elliott Wave Table",
+                data=csv,
+                file_name=f"elliott_waves_{ticker1}_{datetime.now(IST).strftime('%Y%m%d')}.csv",
+                mime="text/csv"
+            )
+        else:
+            st.info("No clear Elliott Wave pattern detected in current data")
+    
+    with tab8:
+        st.write("### RSI Divergence Detection")
+        if not tables['divergence'].empty:
+            st.dataframe(tables['divergence'], use_container_width=True)
+            
+            csv = tables['divergence'].to_csv(index=False)
+            st.download_button(
+                "📥 Download Divergence Table",
+                data=csv,
+                file_name=f"rsi_divergence_{ticker1}_{datetime.now(IST).strftime('%Y%m%d')}.csv",
+                mime="text/csv"
+            )
+        else:
+            st.info("No RSI divergence detected in recent periods")
+    
+    # Backtest Strategy Details
+    if backtest_result and backtest_result[0]:
+        st.subheader("🔬 Backtest Strategy Details & Execution Log")
+        
+        strategy_name = backtest_result[0]
+        params = backtest_result[2]
+        
+        # Display strategy parameters
+        st.write("### ⚙️ Strategy Configuration")
+        
+        config_col1, config_col2, config_col3 = st.columns(3)
+        
+        with config_col1:
+            st.info(f"""
+            **Strategy Type:** {strategy_name.upper()}
+            
+            **RSI Parameters:**
+            - Oversold Threshold: {params['rsi_range'][0]}
+            - Overbought Threshold: {params['rsi_range'][1]}
+            - Period: 14
+            """)
+        
+        with config_col2:
+            st.info(f"""
+            **EMA Parameters:**
+            - Fast EMA: {params['ema_combo'][0]}
+            - Slow EMA: {params['ema_combo'][1]}
+            - Crossover Strategy
+            """)
+        
+        with config_col3:
+            st.info(f"""
+            **ADX Parameters:**
+            - Threshold: {params['adx_threshold']}
+            - Period: 14
+            
+            **Risk Management:**
+            - Stop Loss: -5%
+            - Take Profit: +10%
+            - Position Size: 20%
+            """)
+        
+        st.write("### 📋 Strategy Logic")
+        st.code(f"""
+Entry Conditions ({strategy_name.upper()}):
+- RSI < {params['rsi_range'][0]} (Oversold)
+- EMA {params['ema_combo'][0]} > EMA {params['ema_combo'][1]} (Uptrend)
+- ADX > {params['adx_threshold']} (Strong Trend)
+- ALL conditions must be TRUE simultaneously
+
+Exit Conditions:
+- RSI > {params['rsi_range'][1]} (Overbought) OR
+- EMA {params['ema_combo'][0]} < EMA {params['ema_combo'][1]} (Downtrend) OR
+- ADX < {params['adx_threshold']} (Weak Trend) OR
+- Stop Loss: -5% OR
+- Take Profit: +10%
+- ANY condition triggers exit
+
+Calculation Method:
+1. Calculate RSI = 100 - (100 / (1 + RS))
+   where RS = Average Gain / Average Loss over 14 periods
+   
+2. Calculate EMA = Price * (2/(Period+1)) + Previous EMA * (1 - 2/(Period+1))
+
+3. Calculate ADX using Directional Movement Index (DMI)
+   - Calculate +DI and -DI from price movements
+   - ADX = Moving Average of DX over 14 periods
+   
+4. Position Sizing = Capital * 20% / Entry Price
+
+5. Profit/Loss = (Exit Price - Entry Price) * Shares
+        """, language="python")
+        
+        # Backtest execution table
+        st.write("### 📊 Backtest Execution Log")
+        backtest_table = create_backtest_details_table(primary_data, strategy_name, params)
+        
+        if not backtest_table.empty:
+            st.dataframe(backtest_table, use_container_width=True)
+            
+            csv = backtest_table.to_csv(index=False)
+            st.download_button(
+                "📥 Download Backtest Execution Log",
+                data=csv,
+                file_name=f"backtest_log_{ticker1}_{datetime.now(IST).strftime('%Y%m%d')}.csv",
+                mime="text/csv"
+            )
+        else:
+            st.warning("No trades executed in backtest period")
+    
     # Ratio Analysis
+    
     if enable_ratio and st.session_state.all_timeframe_data_t2:
         st.subheader("🔄 Ratio Analysis")
         
