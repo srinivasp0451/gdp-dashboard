@@ -1210,6 +1210,441 @@ def create_backtest_details_table(data, strategy_type, params):
                 position = None
     
     return pd.DataFrame(backtest_details)
+
+def generate_comprehensive_summary(all_timeframe_data, ticker_name, backtest_result):
+    """Generate ultra-detailed market analysis summary"""
+    
+    summary_parts = []
+    
+    # Header
+    summary_parts.append(f"# 🎯 COMPREHENSIVE MARKET ANALYSIS: {ticker_name}")
+    summary_parts.append(f"*Analysis Time: {datetime.now(IST).strftime('%Y-%m-%d %H:%M:%S IST')}*\n")
+    
+    # Backtest Results
+    if backtest_result and backtest_result[1] > 0:
+        strategy, returns, params = backtest_result
+        summary_parts.append(f"## 💰 BACKTESTING VERDICT: **PROFITABLE**")
+        summary_parts.append(f"**Optimized Strategy:** {strategy.upper()} | **Annual Returns:** {returns:.2f}%")
+        summary_parts.append(f"**Parameters:** RSI {params['rsi_range']}, EMA {params['ema_combo']}, ADX > {params['adx_threshold']}\n")
+    else:
+        summary_parts.append(f"## ⚠️ BACKTESTING VERDICT: **REQUIRES CAUTION**")
+        summary_parts.append(f"Historical strategy performance was negative. Manual analysis recommended.\n")
+    
+    # Analyze each timeframe
+    timeframe_signals = {}
+    
+    for tf_key, data in all_timeframe_data.items():
+        if len(data) < 50:
+            continue
+        
+        interval, period = tf_key.split('_')
+        
+        # Calculate all indicators
+        close = data['Close']
+        rsi = calculate_rsi(close)
+        zscore = calculate_zscore(close)
+        volatility = calculate_volatility(close.pct_change())
+        sr_levels = find_support_resistance(data)
+        fib_levels = calculate_fibonacci_levels(data)
+        elliott = detect_elliott_wave_detailed(data)
+        divergence = detect_rsi_divergence(close, rsi)
+        zscore_patterns = analyze_zscore_patterns(data, zscore)
+        
+        current_price = float(close.iloc[-1])
+        current_rsi = float(rsi.iloc[-1])
+        current_zscore = float(zscore.iloc[-1])
+        current_volatility = float(volatility.iloc[-1])
+        
+        # Store timeframe analysis
+        timeframe_signals[tf_key] = {
+            'signal': 'BULLISH' if current_rsi < 40 and current_zscore < -1 else 'BEARISH' if current_rsi > 60 and current_zscore > 1 else 'NEUTRAL',
+            'rsi': current_rsi,
+            'zscore': current_zscore,
+            'volatility': current_volatility,
+            'price': current_price,
+            'sr_levels': sr_levels,
+            'fib': fib_levels,
+            'elliott': elliott,
+            'divergence': divergence,
+            'zscore_patterns': zscore_patterns
+        }
+    
+    # Multi-timeframe consensus
+    bullish_count = sum(1 for v in timeframe_signals.values() if v['signal'] == 'BULLISH')
+    bearish_count = sum(1 for v in timeframe_signals.values() if v['signal'] == 'BEARISH')
+    total_tf = len(timeframe_signals)
+    
+    if bullish_count / total_tf > 0.6:
+        consensus = "🟢 STRONG BULLISH"
+    elif bearish_count / total_tf > 0.6:
+        consensus = "🔴 STRONG BEARISH"
+    elif bullish_count > bearish_count:
+        consensus = "🟡 MODERATELY BULLISH"
+    elif bearish_count > bullish_count:
+        consensus = "🟡 MODERATELY BEARISH"
+    else:
+        consensus = "⚪ NEUTRAL/SIDEWAYS"
+    
+    summary_parts.append(f"## 🎲 MULTI-TIMEFRAME CONSENSUS: {consensus}")
+    summary_parts.append(f"Analyzed {total_tf} timeframes | Bullish: {bullish_count} | Bearish: {bearish_count} | Neutral: {total_tf - bullish_count - bearish_count}\n")
+    
+    # Detailed Z-Score Analysis
+    summary_parts.append("## 📊 Z-SCORE MEAN REVERSION ANALYSIS")
+    
+    for tf_key, analysis in list(timeframe_signals.items())[:3]:  # Top 3 timeframes
+        if analysis['zscore_patterns']:
+            summary_parts.append(f"\n### {tf_key.upper()} Timeframe:")
+            summary_parts.append(f"**Current Z-Score:** {analysis['zscore']:.2f}")
+            
+            # Historical patterns
+            similar_patterns = [p for p in analysis['zscore_patterns'] if abs(p['zscore'] - analysis['zscore']) < 0.5]
+            
+            if similar_patterns:
+                avg_return = np.mean([p['final_return'] for p in similar_patterns])
+                accuracy = sum(1 for p in similar_patterns if p['final_return'] > 0) / len(similar_patterns) * 100
+                
+                summary_parts.append(f"**Historical Pattern Match:** Found {len(similar_patterns)} similar conditions")
+                summary_parts.append(f"**Average Outcome:** {avg_return:+.2f}% move | Accuracy: {accuracy:.1f}%")
+                
+                # Detailed examples
+                for i, pattern in enumerate(similar_patterns[-3:], 1):
+                    summary_parts.append(
+                        f"  {i}. {pattern['time_ago']} ago @ ₹{pattern['entry_price']:.2f} "
+                        f"(Z={pattern['zscore']:.2f}) → {pattern['final_return']:+.2f}% "
+                        f"(Max: {pattern['max_gain']:+.2f}%, Min: {pattern['max_loss']:+.2f}%)"
+                    )
+                
+                # Prediction
+                if analysis['zscore'] < -2 and avg_return > 5:
+                    summary_parts.append(f"  ✅ **STRONG BUY SIGNAL**: Oversold condition with {accuracy:.0f}% historical success")
+                elif analysis['zscore'] > 2 and avg_return < -5:
+                    summary_parts.append(f"  ❌ **STRONG SELL SIGNAL**: Overbought condition with {accuracy:.0f}% historical success")
+    
+    # Support & Resistance Analysis
+    summary_parts.append("\n## 🎚️ SUPPORT & RESISTANCE ANALYSIS")
+    
+    primary_tf = list(timeframe_signals.keys())[0] if timeframe_signals else None
+    if primary_tf:
+        sr = timeframe_signals[primary_tf]['sr_levels']
+        current_p = timeframe_signals[primary_tf]['price']
+        
+        nearby_levels = [l for l in sr if abs(l['level'] - current_p) / current_p < 0.02]
+        
+        if nearby_levels:
+            for level in nearby_levels[:3]:
+                time_ago = datetime.now(IST) - level['date']
+                distance = ((level['level'] - current_p) / current_p) * 100
+                
+                summary_parts.append(
+                    f"**{level['type'].upper()} @ ₹{level['level']:.2f}** "
+                    f"({distance:+.2f}% away) | {level['touches']} touches | "
+                    f"Sustained {level['sustained']} periods | "
+                    f"Formed {str(time_ago).split('.')[0]} ago"
+                )
+                
+                if level['type'] == 'support' and distance < -1:
+                    summary_parts.append(f"  → Price near strong support: **HIGH PROBABILITY BOUNCE ZONE**")
+                elif level['type'] == 'resistance' and distance > 1:
+                    summary_parts.append(f"  → Price near strong resistance: **POTENTIAL REJECTION ZONE**")
+    
+    # Fibonacci Analysis
+    summary_parts.append("\n## 📐 FIBONACCI RETRACEMENT LEVELS")
+    
+    if primary_tf:
+        fib = timeframe_signals[primary_tf]['fib']
+        current_p = timeframe_signals[primary_tf]['price']
+        
+        for level_name, level_data in fib.items():
+            distance = ((level_data['price'] - current_p) / current_p) * 100
+            
+            if abs(distance) < 2:  # Within 2%
+                summary_parts.append(
+                    f"**Fib {level_name}** @ ₹{level_data['price']:.2f} "
+                    f"({distance:+.2f}% away) ⚠️ **CRITICAL LEVEL**"
+                )
+                
+                if level_name in ['0.382', '0.5', '0.618']:
+                    summary_parts.append(f"  → Golden ratio level: Strong support/resistance expected")
+    
+    # Elliott Wave Analysis
+    summary_parts.append("\n## 🌊 ELLIOTT WAVE PATTERN ANALYSIS")
+    
+    if primary_tf and timeframe_signals[primary_tf]['elliott']:
+        elliott = timeframe_signals[primary_tf]['elliott']
+        waves = elliott['waves']
+        
+        summary_parts.append(f"**Current Phase:** {elliott['current_wave']}")
+        summary_parts.append(f"**Wave Structure Detected:** {elliott['total_waves']} waves identified\n")
+        
+        for wave in waves[-5:]:  # Last 5 waves
+            summary_parts.append(
+                f"**{wave['phase']}** ({wave['wave_type']}) | "
+                f"{wave['point_type']} @ ₹{wave['price']:.2f} | "
+                f"Change: {wave['change']:+.2f} ({wave['change_pct']:+.2f}%) | "
+                f"Duration: {wave['duration']} | "
+                f"Date: {wave['date'].strftime('%Y-%m-%d %H:%M IST')}"
+            )
+        
+        # Wave 5 completion check
+        if elliott['current_wave'] == "Wave 5 or Extension":
+            summary_parts.append("\n⚠️ **WAVE 5 ALERT**: Impulse wave nearing completion. Expect corrective ABC wave soon.")
+        elif "Corrective" in elliott['current_wave']:
+            summary_parts.append("\n✅ **CORRECTIVE PHASE**: ABC correction in progress. Watch for Wave C completion for reversal.")
+    
+    # RSI Divergence
+    summary_parts.append("\n## ⚡ RSI DIVERGENCE SIGNALS")
+    
+    divergence_found = False
+    for tf_key, analysis in timeframe_signals.items():
+        if analysis['divergence']:
+            divergence_found = True
+            for div in analysis['divergence']:
+                summary_parts.append(
+                    f"**{tf_key.upper()}**: {div['type'].upper()} divergence detected {div['time_ago']} ago | "
+                    f"Price: ₹{div['price']:.2f} | RSI: {div['rsi_old']:.1f} → {div['rsi_new']:.1f}"
+                )
+                
+                if div['type'] == 'bullish':
+                    summary_parts.append(f"  → **BULLISH**: Lower lows in price but higher lows in RSI = Reversal likely")
+                else:
+                    summary_parts.append(f"  → **BEARISH**: Higher highs in price but lower highs in RSI = Reversal likely")
+    
+    if not divergence_found:
+        summary_parts.append("No significant RSI divergence detected in recent periods.")
+    
+    # Final Recommendation
+    summary_parts.append("\n## 🎯 FINAL TRADING RECOMMENDATION")
+    
+    # Calculate recommendation based on all factors
+    score = 0
+    reasons = []
+    
+    # Backtest
+    if backtest_result and backtest_result[1] > 15:
+        score += 3
+        reasons.append(f"✅ Backtest shows {backtest_result[1]:.1f}% annual returns")
+    elif backtest_result and backtest_result[1] > 0:
+        score += 1
+        reasons.append(f"⚠️ Backtest shows marginal {backtest_result[1]:.1f}% returns")
+    else:
+        score -= 2
+        reasons.append("❌ Backtest shows negative returns")
+    
+    # Multi-timeframe
+    if bullish_count / total_tf > 0.6:
+        score += 2
+        reasons.append(f"✅ {bullish_count}/{total_tf} timeframes bullish")
+    elif bearish_count / total_tf > 0.6:
+        score -= 2
+        reasons.append(f"❌ {bearish_count}/{total_tf} timeframes bearish")
+    
+    # Z-score
+    primary_zscore = timeframe_signals[primary_tf]['zscore'] if primary_tf else 0
+    if primary_zscore < -2:
+        score += 2
+        reasons.append(f"✅ Extreme oversold (Z={primary_zscore:.2f})")
+    elif primary_zscore > 2:
+        score -= 2
+        reasons.append(f"❌ Extreme overbought (Z={primary_zscore:.2f})")
+    
+    # Support/Resistance
+    if nearby_levels:
+        support_nearby = any(l['type'] == 'support' for l in nearby_levels)
+        resistance_nearby = any(l['type'] == 'resistance' for l in nearby_levels)
+        
+        if support_nearby:
+            score += 1
+            reasons.append("✅ Near strong support level")
+        if resistance_nearby:
+            score -= 1
+            reasons.append("❌ Near strong resistance level")
+    
+    # Divergence
+    bullish_div = any(
+        analysis['divergence'] and any(d['type'] == 'bullish' for d in analysis['divergence'])
+        for analysis in timeframe_signals.values() if analysis['divergence']
+    )
+    bearish_div = any(
+        analysis['divergence'] and any(d['type'] == 'bearish' for d in analysis['divergence'])
+        for analysis in timeframe_signals.values() if analysis['divergence']
+    )
+    
+    if bullish_div:
+        score += 2
+        reasons.append("✅ Bullish RSI divergence detected")
+    if bearish_div:
+        score -= 2
+        reasons.append("❌ Bearish RSI divergence detected")
+    
+    # Final signal
+    if score >= 5:
+        final_signal = "🟢 STRONG BUY"
+        signal_class = "buy-signal"
+    elif score >= 2:
+        final_signal = "🟢 BUY"
+        signal_class = "buy-signal"
+    elif score <= -5:
+        final_signal = "🔴 STRONG SELL"
+        signal_class = "sell-signal"
+    elif score <= -2:
+        final_signal = "🔴 SELL"
+        signal_class = "sell-signal"
+    else:
+        final_signal = "🟡 HOLD/WAIT"
+        signal_class = "hold-signal"
+    
+    summary_parts.append(f"\n### **SIGNAL: {final_signal}** (Confidence Score: {score}/10)")
+    summary_parts.append("\n**Reasoning:**")
+    for reason in reasons:
+        summary_parts.append(f"  {reason}")
+    
+    # Risk Management
+    primary_data = all_timeframe_data[primary_tf]
+    current_p = timeframe_signals[primary_tf]['price']
+    atr = (primary_data['High'] - primary_data['Low']).rolling(14).mean().iloc[-1]
+    
+    if "BUY" in final_signal:
+        entry = current_p
+        sl = entry - (1.5 * atr)
+        target1 = entry + (2 * atr)
+        target2 = entry + (3 * atr)
+        target3 = entry + (5 * atr)
+        
+        summary_parts.append(f"\n### 💼 POSITION DETAILS:")
+        summary_parts.append(f"**Entry Price:** ₹{entry:.2f}")
+        summary_parts.append(f"**Stop Loss:** ₹{sl:.2f} ({((sl-entry)/entry*100):.2f}%)")
+        summary_parts.append(f"**Target 1:** ₹{target1:.2f} ({((target1-entry)/entry*100):.2f}%) - Book 30%")
+        summary_parts.append(f"**Target 2:** ₹{target2:.2f} ({((target2-entry)/entry*100):.2f}%) - Book 40%")
+        summary_parts.append(f"**Target 3:** ₹{target3:.2f} ({((target3-entry)/entry*100):.2f}%) - Book 30%")
+        summary_parts.append(f"**Risk:Reward Ratio:** 1:{((target1-entry)/(entry-sl)):.2f}")
+        
+    elif "SELL" in final_signal:
+        entry = current_p
+        sl = entry + (1.5 * atr)
+        target1 = entry - (2 * atr)
+        target2 = entry - (3 * atr)
+        target3 = entry - (5 * atr)
+        
+        summary_parts.append(f"\n### 💼 POSITION DETAILS:")
+        summary_parts.append(f"**Entry Price:** ₹{entry:.2f}")
+        summary_parts.append(f"**Stop Loss:** ₹{sl:.2f} ({((sl-entry)/entry*100):+.2f}%)")
+        summary_parts.append(f"**Target 1:** ₹{target1:.2f} ({((target1-entry)/entry*100):.2f}%) - Book 30%")
+        summary_parts.append(f"**Target 2:** ₹{target2:.2f} ({((target2-entry)/entry*100):.2f}%) - Book 40%")
+        summary_parts.append(f"**Target 3:** ₹{target3:.2f} ({((target3-entry)/entry*100):.2f}%) - Book 30%")
+        summary_parts.append(f"**Risk:Reward Ratio:** 1:{((entry-target1)/(sl-entry)):.2f}")
+    
+    summary_parts.append(f"\n### ⚠️ RISK DISCLAIMER")
+    summary_parts.append("This is an algorithmic analysis based on historical patterns and technical indicators.")
+    summary_parts.append("Past performance does not guarantee future results. Always use proper position sizing and risk management.")
+    summary_parts.append(f"Recommended position size: 2-5% of portfolio | Never risk more than 1-2% per trade.")
+    
+    return "\n".join(summary_parts), final_signal, signal_class
+    """Create detailed backtest execution table"""
+    
+    capital = 100000
+    position = None
+    backtest_details = []
+    
+    close = data['Close']
+    rsi = calculate_rsi(close)
+    ema_f = calculate_ema(close, params['ema_combo'][0])
+    ema_s = calculate_ema(close, params['ema_combo'][1])
+    adx = calculate_adx(data['High'], data['Low'], close)
+    
+    rsi_oversold = params['rsi_range'][0]
+    rsi_overbought = params['rsi_range'][1]
+    adx_threshold = params['adx_threshold']
+    
+    for i in range(50, len(data)):
+        current_price = float(close.iloc[i])
+        current_rsi = float(rsi.iloc[i])
+        current_adx = float(adx.iloc[i])
+        ema_fast_val = float(ema_f.iloc[i])
+        ema_slow_val = float(ema_s.iloc[i])
+        
+        entry_signal = False
+        exit_signal = False
+        signal_reasons = []
+        
+        if position is None:
+            # Check entry conditions
+            if strategy_type == 'combined':
+                if current_rsi < rsi_oversold:
+                    signal_reasons.append(f"RSI={current_rsi:.1f}<{rsi_oversold}")
+                if ema_fast_val > ema_slow_val:
+                    signal_reasons.append(f"EMA{params['ema_combo'][0]}>{params['ema_combo'][1]}")
+                if current_adx > adx_threshold:
+                    signal_reasons.append(f"ADX={current_adx:.1f}>{adx_threshold}")
+                
+                if current_rsi < rsi_oversold and ema_fast_val > ema_slow_val and current_adx > adx_threshold:
+                    entry_signal = True
+            
+            if entry_signal:
+                shares = (capital * 20 / 100) / current_price
+                position = {
+                    'entry': current_price,
+                    'shares': shares,
+                    'entry_date': data.index[i],
+                    'entry_rsi': current_rsi,
+                    'entry_adx': current_adx
+                }
+                
+                backtest_details.append({
+                    'DateTime': data.index[i].strftime('%Y-%m-%d %H:%M:%S IST'),
+                    'Action': 'BUY',
+                    'Price': current_price,
+                    'RSI': current_rsi,
+                    'ADX': current_adx,
+                    f'EMA_{params["ema_combo"][0]}': ema_fast_val,
+                    f'EMA_{params["ema_combo"][1]}': ema_slow_val,
+                    'Signal_Reasons': ' & '.join(signal_reasons),
+                    'Capital': capital,
+                    'Position_Size': shares * current_price,
+                    'Trade_Result': 'Open'
+                })
+        
+        elif position is not None:
+            # Check exit conditions
+            if strategy_type == 'combined':
+                if current_rsi > rsi_overbought:
+                    signal_reasons.append(f"RSI={current_rsi:.1f}>{rsi_overbought}")
+                    exit_signal = True
+                if ema_fast_val < ema_slow_val:
+                    signal_reasons.append(f"EMA{params['ema_combo'][0]}<{params['ema_combo'][1]}")
+                    exit_signal = True
+                if current_adx < adx_threshold:
+                    signal_reasons.append(f"ADX={current_adx:.1f}<{adx_threshold}")
+                    exit_signal = True
+            
+            pct_change = ((current_price - position['entry']) / position['entry']) * 100
+            if pct_change < -5:
+                signal_reasons.append("Stop Loss Hit (-5%)")
+                exit_signal = True
+            elif pct_change > 10:
+                signal_reasons.append("Take Profit Hit (+10%)")
+                exit_signal = True
+            
+            if exit_signal:
+                profit = (current_price - position['entry']) * position['shares']
+                capital += profit
+                
+                backtest_details.append({
+                    'DateTime': data.index[i].strftime('%Y-%m-%d %H:%M:%S IST'),
+                    'Action': 'SELL',
+                    'Price': current_price,
+                    'RSI': current_rsi,
+                    'ADX': current_adx,
+                    f'EMA_{params["ema_combo"][0]}': ema_fast_val,
+                    f'EMA_{params["ema_combo"][1]}': ema_slow_val,
+                    'Signal_Reasons': ' & '.join(signal_reasons),
+                    'Capital': capital,
+                    'Position_Size': 0,
+                    'Trade_Result': f"P/L: {profit:+.2f} ({pct_change:+.2f}%)"
+                })
+                
+                position = None
+    
+    return pd.DataFrame(backtest_details)
     """Generate ultra-detailed market analysis summary"""
     
     summary_parts = []
