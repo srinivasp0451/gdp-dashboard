@@ -1,578 +1,1226 @@
-# Streamlit Algorithmic Trading Application
-# Professional-grade: multi-timeframe, indicators, support/resistance, ratio analysis,
-# simple Elliott-wave heuristic, backtest & optimization, IST timezone handling.
-# Requirements: pandas, numpy, yfinance, matplotlib, plotly, scipy
-# Optional: pip install ta (pure-python) for extra indicators.
-
 import streamlit as st
+import yfinance as yf
 import pandas as pd
 import numpy as np
-import yfinance as yf
-import time
-import random
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 from datetime import datetime, timedelta
 import pytz
-from scipy.signal import argrelextrema
-from scipy.stats import zscore
-import io
-import matplotlib.pyplot as plt
-import plotly.graph_objects as go
+import time
+from scipy import stats
+from scipy.signal import find_peaks
+import warnings
+warnings.filterwarnings('ignore')
 
-# ----------------------------- Helpers: Indicators -----------------------------
-import traceback
-import inspect
+# Page configuration
+st.set_page_config(
+    page_title="Advanced Trading Analysis",
+    page_icon="📈",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
 
-# --- Logging helpers (prints into Streamlit UI for quick debugging with line numbers)
-import streamlit as st
+# Custom CSS
+st.markdown("""
+<style>
+    .main-header {
+        font-size: 2.5rem;
+        font-weight: bold;
+        text-align: center;
+        color: #1f77b4;
+        margin-bottom: 2rem;
+    }
+    .metric-card {
+        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        padding: 1.5rem;
+        border-radius: 10px;
+        color: white;
+        margin: 0.5rem 0;
+    }
+    .positive {
+        color: #00ff00;
+        font-weight: bold;
+    }
+    .negative {
+        color: #ff4444;
+        font-weight: bold;
+    }
+    .neutral {
+        color: #ffa500;
+        font-weight: bold;
+    }
+    .signal-box {
+        padding: 1rem;
+        border-radius: 8px;
+        margin: 1rem 0;
+        font-size: 1.1rem;
+    }
+    .buy-signal {
+        background-color: #d4edda;
+        border: 2px solid #28a745;
+        color: #155724;
+    }
+    .sell-signal {
+        background-color: #f8d7da;
+        border: 2px solid #dc3545;
+        color: #721c24;
+    }
+    .hold-signal {
+        background-color: #fff3cd;
+        border: 2px solid #ffc107;
+        color: #856404;
+    }
+</style>
+""", unsafe_allow_html=True)
 
-def log(msg):
-    try:
-        st.write(f"🟦 LOG: {msg}")
-    except Exception:
-        print(f"LOG: {msg}")
+# Initialize session state
+if 'data_fetched' not in st.session_state:
+    st.session_state.data_fetched = False
+if 'ticker1_data' not in st.session_state:
+    st.session_state.ticker1_data = None
+if 'ticker2_data' not in st.session_state:
+    st.session_state.ticker2_data = None
 
-def log_shape(df, name="DF"):
-    try:
-        st.write(f"📏 {name} shape → Rows: {df.shape[0]}, Cols: {df.shape[1]}")
-        # limit columns shown to first 30 to avoid UI overload
-        cols = list(df.columns)[:30]
-        st.write(f"Columns (first up to 30): {cols}")
-    except Exception:
-        st.write(f"❌ Could not read shape for {name}")
+# Ticker mappings
+TICKER_MAP = {
+    "NIFTY 50": "^NSEI",
+    "Bank NIFTY": "^NSEBANK",
+    "SENSEX": "^BSESN",
+    "BTC": "BTC-USD",
+    "ETH": "ETH-USD",
+    "Gold": "GC=F",
+    "Silver": "SI=F",
+    "USD/INR": "INR=X",
+    "EUR/USD": "EURUSD=X",
+    "GBP/USD": "GBPUSD=X"
+}
 
-def log_error(e, note=""):
-    try:
-        # pick the last trace that is not inside this helper
-        tb = traceback.format_exc()
-        frame = inspect.trace()[-1]
-        line = frame.lineno
-        file = frame.filename
-        st.error(f"🔥 **ERROR* ➤ Message: `{str(e)}` ➤ Note: {note} ➤ File: {file} ➤ Line: {line}")
-        st.code(tb)
-    except Exception:
-        print("Logging failed", e)
+# Timeframe and period options
+TIMEFRAMES = ["1m", "3m", "5m", "10m", "15m", "30m", "1h", "2h", "4h", "1d"]
+PERIODS = ["1d", "5d", "7d", "1mo", "3mo", "6mo", "1y", "2y", "3y", "5y", "6y", "10y", "15y", "20y", "25y", "30y"]
 
-# end logging helpers
+# IST timezone
+IST = pytz.timezone('Asia/Kolkata')
 
+def get_ticker_symbol(ticker_input):
+    """Convert ticker input to yfinance symbol"""
+    return TICKER_MAP.get(ticker_input, ticker_input)
 
-def to_ist(df):
-    # Convert index (DatetimeIndex) to Asia/Kolkata timezone and return with timezone-naive localized to IST
-    if not isinstance(df.index, pd.DatetimeIndex):
-        df.index = pd.to_datetime(df.index)
-    # if tz-aware convert to Asia/Kolkata
-    try:
-        if df.index.tz is None:
-            df = df.tz_localize('UTC').tz_convert('Asia/Kolkata')
-        else:
-            df = df.tz_convert('Asia/Kolkata')
-    except Exception:
+def fetch_data_with_retry(ticker, period, interval, max_retries=3):
+    """Fetch data with retry mechanism and rate limiting"""
+    for attempt in range(max_retries):
         try:
-            df.index = df.index.tz_localize('UTC').tz_convert('Asia/Kolkata')
-        except Exception:
-            df.index = pd.to_datetime(df.index).tz_localize('UTC').tz_convert('Asia/Kolkata')
-    # drop tz info to make index naive but IST-based
-    df.index = df.index.tz_localize(None)
-    return df
-
-
-def flatten_columns(df, log_name=None):
-    """Safely flatten MultiIndex columns and log shapes.
-    Use log_name for descriptive logging (e.g., ticker name).
-    """
-    try:
-        if log_name:
-            log(f"Flattening columns for {log_name}")
-        log_shape(df, f"{log_name or 'DF'} BEFORE flatten")
-
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = [
-                "_".join([str(c) for c in col if c not in ("", None)]).strip("_")
-                for col in df.columns.values
-            ]
-        else:
-            df.columns = df.columns.astype(str)
-
-        log_shape(df, f"{log_name or 'DF'} AFTER flatten")
-    except Exception as e:
-        log_error(e, f"Error inside flatten_columns for {log_name}")
-    return df
-
-
-def sma(series, window):
-    return series.rolling(window).mean()
-
-
-def ema(series, window):
-    return series.ewm(span=window, adjust=False).mean()
-
-
-def rsi(series, period=14):
-    delta = series.diff()
-    up = delta.clip(lower=0)
-    down = -1 * delta.clip(upper=0)
-    ma_up = up.ewm(alpha=1/period, adjust=False).mean()
-    ma_down = down.ewm(alpha=1/period, adjust=False).mean()
-    rs = ma_up / ma_down
-    r = 100 - (100 / (1 + rs))
-    return r
-
-
-def macd(series, fast=12, slow=26, signal=9):
-    fast_ema = ema(series, fast)
-    slow_ema = ema(series, slow)
-    macd_line = fast_ema - slow_ema
-    signal_line = macd_line.ewm(span=signal, adjust=False).mean()
-    hist = macd_line - signal_line
-    return macd_line, signal_line, hist
-
-
-def bollinger_bands(series, window=20, numsd=2):
-    ma = series.rolling(window).mean()
-    sd = series.rolling(window).std()
-    upper = ma + numsd * sd
-    lower = ma - numsd * sd
-    return upper, ma, lower
-
-
-def atr(df, n=14):
-    high = df['High']
-    low = df['Low']
-    close = df['Close']
-    tr1 = high - low
-    tr2 = (high - close.shift()).abs()
-    tr3 = (low - close.shift()).abs()
-    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-    atr = tr.ewm(alpha=1/n, adjust=False).mean()
-    return atr
-
-
-def adx(df, n=14):
-    # Basic ADX implementation
-    high = df['High']
-    low = df['Low']
-    close = df['Close']
-    up_move = high.diff()
-    down_move = -low.diff()
-    plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
-    minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
-    tr = pd.concat([high - low, (high - close.shift()).abs(), (low - close.shift()).abs()], axis=1).max(axis=1)
-    atr_val = tr.ewm(alpha=1/n, adjust=False).mean()
-    plus_di = 100 * (pd.Series(plus_dm).ewm(alpha=1/n, adjust=False).mean() / atr_val)
-    minus_di = 100 * (pd.Series(minus_dm).ewm(alpha=1/n, adjust=False).mean() / atr_val)
-    dx = (abs(plus_di - minus_di) / (plus_di + minus_di)) * 100
-    adx_val = pd.Series(dx).ewm(alpha=1/n, adjust=False).mean()
-    plus_di.index = df.index
-    minus_di.index = df.index
-    adx_val.index = df.index
-    return plus_di, minus_di, adx_val
-
-# ----------------------------- Support & Resistance -----------------------------
-
-def detect_pivots(series, order=5):
-    # local minima/maxima
-    minima = argrelextrema(series.values, np.less_equal, order=order)[0]
-    maxima = argrelextrema(series.values, np.greater_equal, order=order)[0]
-    return minima, maxima
-
-
-def cluster_levels(levels, threshold=0.5):
-    # cluster nearby levels (threshold in price units)
-    if len(levels) == 0:
-        return []
-    levels = sorted(levels)
-    clusters = [[levels[0]]]
-    for lv in levels[1:]:
-        if abs(lv - clusters[-1][-1]) <= threshold:
-            clusters[-1].append(lv)
-        else:
-            clusters.append([lv])
-    return [np.mean(c) for c in clusters]
-
-
-def support_resistance(df, hits_threshold=3, pivot_order=5, cluster_threshold=None):
-    close = df['Close']
-    minima, maxima = detect_pivots(close, order=pivot_order)
-    supps = close.iloc[minima].values.tolist()
-    resis = close.iloc[maxima].values.tolist()
-    if cluster_threshold is None:
-        # automatic threshold as 0.5% of price
-        cluster_threshold = df['Close'].mean() * 0.005
-    supp_levels = cluster_levels(supps, threshold=cluster_threshold)
-    res_levels = cluster_levels(resis, threshold=cluster_threshold)
-    # Count hits within tolerance
-    def count_hits(levels):
-        hits = {}
-        for level in levels:
-            tol = cluster_threshold
-            hit_mask = (df['Low'] <= level + tol) & (df['High'] >= level - tol)
-            hits[level] = hit_mask.sum()
-        return hits
-    supp_hits = count_hits(supp_levels)
-    res_hits = count_hits(res_levels)
-    # Filter by hits threshold
-    strong_supports = {k: v for k, v in supp_hits.items() if v >= hits_threshold}
-    strong_res = {k: v for k, v in res_hits.items() if v >= hits_threshold}
-    return strong_supports, strong_res
-
-# ----------------------------- Simple Elliott-wave heuristic -----------------------------
-
-def swing_points(series, window=5):
-    # detect swings
-    minima, maxima = detect_pivots(series, order=window)
-    points = []
-    for i in maxima:
-        points.append((i, series.iloc[i], 'peak'))
-    for i in minima:
-        points.append((i, series.iloc[i], 'trough'))
-    points_sorted = sorted(points, key=lambda x: x[0])
-    return points_sorted
-
-
-def elliott_heuristic(df):
-    # Very approximate: look for 5 alternating swings (peak/trough) forming impulse
-    sp = swing_points(df['Close'], window=5)
-    labels = []
-    for i in range(len(sp) - 4):
-        segment = sp[i:i+5]
-        types = [s[2] for s in segment]
-        # Expect pattern: peak, trough, peak, trough, peak or inverse
-        if types == ['peak', 'trough', 'peak', 'trough', 'peak'] or types == ['trough', 'peak', 'trough', 'peak', 'trough']:
-            indices = [s[0] for s in segment]
-            prices = [s[1] for s in segment]
-            labels.append({'start_idx': indices[0], 'end_idx': indices[-1], 'prices': prices, 'indices': indices})
-    # Return the most recent label if exists
-    if labels:
-        last = labels[-1]
-        return last
+            time.sleep(np.random.uniform(1.5, 3.0))  # Rate limiting
+            data = yf.download(ticker, period=period, interval=interval, progress=False, auto_adjust=True)
+            
+            if data.empty:
+                st.warning(f"No data returned for {ticker}")
+                return None
+            
+            # Reset index first to work with datetime as a column
+            data = data.reset_index()
+            
+            # Flatten multi-index columns if present
+            if isinstance(data.columns, pd.MultiIndex):
+                data.columns = ['_'.join(str(col).strip() for col in c if col) if isinstance(c, tuple) else str(c) for c in data.columns]
+            
+            # Clean column names - remove any ticker suffixes and extra spaces
+            data.columns = [col.split('_')[0].strip() for col in data.columns]
+            
+            # Handle different datetime column names
+            datetime_col = None
+            for col_name in ['Date', 'Datetime', 'index', 'Timestamp']:
+                if col_name in data.columns:
+                    datetime_col = col_name
+                    break
+            
+            if datetime_col is None:
+                st.error(f"No datetime column found in data. Columns: {list(data.columns)}")
+                return None
+            
+            # Rename datetime column to standard name
+            data = data.rename(columns={datetime_col: 'Date'})
+            
+            # Check for required columns with various possible names
+            column_mapping = {}
+            for required in ['Open', 'High', 'Low', 'Close']:
+                found = False
+                for col in data.columns:
+                    if required.lower() in col.lower():
+                        column_mapping[col] = required
+                        found = True
+                        break
+                if not found:
+                    st.error(f"Missing required column: {required}. Available columns: {list(data.columns)}")
+                    return None
+            
+            # Rename columns to standard names
+            data = data.rename(columns=column_mapping)
+            
+            # Add Volume column if not present (for indexes)
+            has_volume = False
+            for col in data.columns:
+                if 'volume' in col.lower():
+                    data = data.rename(columns={col: 'Volume'})
+                    has_volume = True
+                    break
+            
+            if not has_volume:
+                data['Volume'] = 0
+            
+            # Convert to IST timezone
+            try:
+                if data['Date'].dt.tz is None:
+                    data['Date'] = pd.to_datetime(data['Date']).dt.tz_localize('UTC')
+                data['Date'] = data['Date'].dt.tz_convert(IST)
+            except Exception as e:
+                # If timezone conversion fails, just ensure it's datetime
+                data['Date'] = pd.to_datetime(data['Date'])
+            
+            # Set datetime as index
+            data = data.set_index('Date')
+            
+            # Keep only relevant columns
+            relevant_cols = ['Open', 'High', 'Low', 'Close', 'Volume']
+            data = data[[col for col in relevant_cols if col in data.columns]]
+            
+            # Remove any duplicate indices
+            data = data[~data.index.duplicated(keep='first')]
+            
+            # Remove any rows with all NaN values
+            data = data.dropna(how='all')
+            
+            if len(data) == 0:
+                st.warning(f"No valid data after cleaning for {ticker}")
+                return None
+            
+            return data
+            
+        except Exception as e:
+            if attempt == max_retries - 1:
+                st.error(f"Failed to fetch {ticker}: {str(e)}")
+                st.error(f"Error type: {type(e).__name__}")
+                return None
+            time.sleep(2)
     return None
 
-# ----------------------------- Data Fetching & Ratio handling -----------------------------
+def calculate_rsi(data, period=14):
+    """Calculate RSI indicator"""
+    if len(data) < period + 1:
+        return pd.Series([50] * len(data), index=data.index)
+    
+    delta = data.diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=period, min_periods=1).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=period, min_periods=1).mean()
+    
+    # Avoid division by zero
+    rs = gain / loss.replace(0, 0.0001)
+    rsi = 100 - (100 / (1 + rs))
+    
+    # Fill NaN values with 50 (neutral)
+    rsi = rsi.fillna(50)
+    
+    return rsi
 
-def fetch_yf(ticker, period, interval, log_name=None):
-    # Use delays to respect rate-limits and robust logging
-    try:
-        log(f"Fetching {ticker} | period={period} | interval={interval}")
-        time.sleep(random.uniform(1.5, 3.0))
-        data = yf.download(tickers=ticker, period=period, interval=interval, progress=False, threads=False)
-        if data is None or data.empty:
-            log(f"No data returned for {ticker}")
-            return pd.DataFrame()
-        # Flatten safely and log
-        data = flatten_columns(data, log_name=ticker)
-        data.dropna(how='all', inplace=True)
-        if data.empty:
-            return data
-        # Standardize column names if lowercase columns
-        colmap = {c: c.title() for c in data.columns}
-        data.rename(columns=colmap, inplace=True)
-        # Ensure required cols
-        for c in ['Open', 'High', 'Low', 'Close', 'Volume']:
-            if c not in data.columns:
-                data[c] = np.nan
-        data = to_ist(data)
-        return data
-    except Exception as e:
-        log_error(e, f"Fetching failed for {ticker}")
-        return pd.DataFrame()
-    # Standardize column names if lowercase columns
-    colmap = {c: c.title() for c in data.columns}
-    data.rename(columns=colmap, inplace=True)
-    # Ensure required cols
-    for c in ['Open', 'High', 'Low', 'Close', 'Volume']:
-        if c not in data.columns:
-            data[c] = np.nan
-    data = to_ist(data)
-    return data
+def calculate_ema(data, period):
+    """Calculate Exponential Moving Average"""
+    return data.ewm(span=period, adjust=False).mean()
 
+def calculate_adx(high, low, close, period=14):
+    """Calculate ADX indicator"""
+    if len(high) < period + 1:
+        return pd.Series([0] * len(high), index=high.index)
+    
+    tr1 = high - low
+    tr2 = abs(high - close.shift())
+    tr3 = abs(low - close.shift())
+    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+    atr = tr.rolling(window=period, min_periods=1).mean()
+    
+    up_move = high - high.shift()
+    down_move = low.shift() - low
+    
+    plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0)
+    minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0)
+    
+    plus_di = 100 * pd.Series(plus_dm, index=close.index).rolling(window=period, min_periods=1).mean() / atr.replace(0, 0.0001)
+    minus_di = 100 * pd.Series(minus_dm, index=close.index).rolling(window=period, min_periods=1).mean() / atr.replace(0, 0.0001)
+    
+    dx = 100 * abs(plus_di - minus_di) / (plus_di + minus_di).replace(0, 0.0001)
+    adx = dx.rolling(window=period, min_periods=1).mean()
+    
+    # Fill NaN values with 0
+    adx = adx.fillna(0)
+    
+    return adx
 
-def align_for_ratio(df1, df2, log_name1=None, log_name2=None):
-    # Align two dataframes on index by inner join after resampling to common frequency if needed
-    try:
-        log(f"Aligning for ratio: {log_name1 or 'DF1'} vs {log_name2 or 'DF2'}")
-        log_shape(df1, f"{log_name1 or 'DF1'} BEFORE align")
-        log_shape(df2, f"{log_name2 or 'DF2'} BEFORE align")
+def calculate_bollinger_bands(data, period=20, std_dev=2):
+    """Calculate Bollinger Bands"""
+    sma = data.rolling(window=period).mean()
+    std = data.rolling(window=period).std()
+    upper_band = sma + (std * std_dev)
+    lower_band = sma - (std * std_dev)
+    return upper_band, sma, lower_band
 
-        df1 = df1.sort_index()
-        df2 = df2.sort_index()
+def calculate_macd(data, fast=12, slow=26, signal=9):
+    """Calculate MACD indicator"""
+    ema_fast = data.ewm(span=fast, adjust=False).mean()
+    ema_slow = data.ewm(span=slow, adjust=False).mean()
+    macd = ema_fast - ema_slow
+    signal_line = macd.ewm(span=signal, adjust=False).mean()
+    histogram = macd - signal_line
+    return macd, signal_line, histogram
 
-        common_idx = df1.index.intersection(df2.index)
-        if len(common_idx) == 0:
-            # try resampling both to a coarser frequency (e.g., 1min -> 5min) as fallback
-            log("No common index — attempting resample fallback to 1min frequency union")
-            # build union and forward/backfill cautiously
-            union_idx = df1.index.union(df2.index).sort_values()
-            a = df1.reindex(union_idx).ffill().bfill()
-            b = df2.reindex(union_idx).ffill().bfill()
-            # after filling, intersect again
-            common_idx = a.index.intersection(b.index)
-            a = a.loc[common_idx]
-            b = b.loc[common_idx]
-            log_shape(a, "DF1 after resample-fallback")
-            log_shape(b, "DF2 after resample-fallback")
-            return a, b
-        a = df1.reindex(common_idx)
-        b = df2.reindex(common_idx)
-        log_shape(a, f"{log_name1 or 'DF1'} AFTER align")
-        log_shape(b, f"{log_name2 or 'DF2'} AFTER align")
-        return a, b
-    except Exception as e:
-        log_error(e, "Ratio alignment failed")
-        return pd.DataFrame(), pd.DataFrame()
+def find_support_resistance(data, window=20, prominence=0.02):
+    """Find strong support and resistance levels"""
+    highs = data['High'].values
+    lows = data['Low'].values
+    closes = data['Close'].values
+    
+    # Find peaks (resistance) and troughs (support)
+    resistance_indices, _ = find_peaks(highs, prominence=np.std(highs) * prominence)
+    support_indices, _ = find_peaks(-lows, prominence=np.std(lows) * prominence)
+    
+    # Get resistance levels
+    resistances = []
+    for idx in resistance_indices:
+        price = highs[idx]
+        date = data.index[idx]
+        # Count touches within 0.5% range
+        touches = int(np.sum(np.abs(highs - price) / price < 0.005))
+        resistances.append({'level': price, 'touches': touches, 'date': date, 'type': 'resistance'})
+    
+    # Get support levels
+    supports = []
+    for idx in support_indices:
+        price = lows[idx]
+        date = data.index[idx]
+        touches = int(np.sum(np.abs(lows - price) / price < 0.005))
+        supports.append({'level': price, 'touches': touches, 'date': date, 'type': 'support'})
+    
+    # Combine and sort by touches
+    levels = sorted(supports + resistances, key=lambda x: x['touches'], reverse=True)
+    
+    return levels[:10]  # Return top 10 levels
 
-# ----------------------------- Analysis Engine -----------------------------
+def calculate_fibonacci_levels(data):
+    """Calculate Fibonacci retracement levels"""
+    high = data['High'].max()
+    low = data['Low'].min()
+    diff = high - low
+    
+    levels = {
+        '0.0': high,
+        '0.236': high - 0.236 * diff,
+        '0.382': high - 0.382 * diff,
+        '0.5': high - 0.5 * diff,
+        '0.618': high - 0.618 * diff,
+        '0.786': high - 0.786 * diff,
+        '1.0': low
+    }
+    
+    return levels
 
-def compute_indicators(df):
-    df = df.copy()
-    df['RSI'] = rsi(df['Close'], 14)
-    df['EMA9'] = ema(df['Close'], 9)
-    df['EMA20'] = ema(df['Close'], 20)
-    df['EMA50'] = ema(df['Close'], 50)
-    df['SMA200'] = sma(df['Close'], 200)
-    df['MACD'], df['MACD_Signal'], df['MACD_Hist'] = macd(df['Close'])
-    df['BB_up'], df['BB_mid'], df['BB_low'] = bollinger_bands(df['Close'], 20, 2)
-    df['ATR'] = atr(df, 14)
-    df['plusDI'], df['minusDI'], df['ADX'] = adx(df, 14)
-    df['LogReturn'] = np.log(df['Close']).diff()
-    df['Volatility'] = df['LogReturn'].rolling(window=20).std() * np.sqrt(252)
-    return df
+def detect_elliott_wave(data):
+    """Simplified Elliott Wave detection"""
+    closes = data['Close'].values
+    peaks, _ = find_peaks(closes, distance=5)
+    troughs, _ = find_peaks(-closes, distance=5)
+    
+    # Combine and sort
+    turns = sorted(list(peaks) + list(troughs))
+    
+    if len(turns) < 5:
+        return None
+    
+    # Take last 5 turning points
+    wave_points = turns[-5:]
+    waves = []
+    
+    for i, idx in enumerate(wave_points):
+        waves.append({
+            'wave': i + 1,
+            'price': closes[idx],
+            'date': data.index[idx],
+            'type': 'peak' if idx in peaks else 'trough'
+        })
+    
+    return waves
 
+def detect_rsi_divergence(price, rsi, window=14):
+    """Detect RSI divergence"""
+    price_values = price.values
+    rsi_values = rsi.values
+    
+    price_peaks, _ = find_peaks(price_values, distance=window)
+    price_troughs, _ = find_peaks(-price_values, distance=window)
+    rsi_peaks, _ = find_peaks(rsi_values, distance=window)
+    rsi_troughs, _ = find_peaks(-rsi_values, distance=window)
+    
+    divergences = []
+    
+    # Bullish divergence (price lower low, RSI higher low)
+    if len(price_troughs) >= 2 and len(rsi_troughs) >= 2:
+        last_price_trough = price_troughs[-1]
+        prev_price_trough = price_troughs[-2]
+        
+        if price_values[last_price_trough] < price_values[prev_price_trough]:
+            # Check RSI
+            rsi_near_last = rsi_troughs[(rsi_troughs >= prev_price_trough - 5) & 
+                                        (rsi_troughs <= last_price_trough + 5)]
+            
+            if len(rsi_near_last) >= 2:
+                if rsi_values[rsi_near_last[-1]] > rsi_values[rsi_near_last[-2]]:
+                    divergences.append({
+                        'type': 'bullish',
+                        'price': float(price_values[last_price_trough]),
+                        'date': price.index[last_price_trough]
+                    })
+    
+    # Bearish divergence (price higher high, RSI lower high)
+    if len(price_peaks) >= 2 and len(rsi_peaks) >= 2:
+        last_price_peak = price_peaks[-1]
+        prev_price_peak = price_peaks[-2]
+        
+        if price_values[last_price_peak] > price_values[prev_price_peak]:
+            rsi_near_last = rsi_peaks[(rsi_peaks >= prev_price_peak - 5) & 
+                                      (rsi_peaks <= last_price_peak + 5)]
+            
+            if len(rsi_near_last) >= 2:
+                if rsi_values[rsi_near_last[-1]] < rsi_values[rsi_near_last[-2]]:
+                    divergences.append({
+                        'type': 'bearish',
+                        'price': float(price_values[last_price_peak]),
+                        'date': price.index[last_price_peak]
+                    })
+    
+    return divergences if divergences else None
 
-def generate_signals(df):
-    # Multi-timeframe checklist style signals
-    s = {}
-    close = df['Close']
-    s['above_20ema'] = close.iloc[-1] > df['EMA20'].iloc[-1]
-    s['adx_trend'] = df['ADX'].iloc[-1] > 25
-    s['rsi'] = df['RSI'].iloc[-1]
-    s['macd_bull'] = df['MACD_Hist'].iloc[-1] > 0
-    # Divergence (simple): price making lower low, RSI making higher low in last 5 points
-    if len(close) >= 6:
-        price_ll = close.iloc[-6:-1].min()
-        rsi_section = df['RSI'].iloc[-6:-1]
-        rsi_ll = rsi_section.min()
-        s['rsi_bull_div'] = (close.iloc[-1] < price_ll) and (df['RSI'].iloc[-1] > rsi_ll)
+def calculate_volatility(returns, window=20):
+    """Calculate rolling volatility"""
+    return returns.rolling(window=window).std() * np.sqrt(252) * 100
+
+def calculate_zscore(data, window=20):
+    """Calculate Z-score for mean reversion"""
+    mean = data.rolling(window=window).mean()
+    std = data.rolling(window=window).std()
+    zscore = (data - mean) / std
+    return zscore
+
+def generate_trading_signals(data, ticker_name, timeframe):
+    """Generate comprehensive trading signals"""
+    if data is None or len(data) < 50:
+        return None
+    
+    close = data['Close']
+    high = data['High']
+    low = data['Low']
+    
+    # Calculate indicators
+    rsi = calculate_rsi(close)
+    ema_9 = calculate_ema(close, 9)
+    ema_20 = calculate_ema(close, 20)
+    ema_50 = calculate_ema(close, 50)
+    adx = calculate_adx(high, low, close)
+    upper_bb, middle_bb, lower_bb = calculate_bollinger_bands(close)
+    macd, signal, histogram = calculate_macd(close)
+    
+    returns = close.pct_change()
+    volatility = calculate_volatility(returns)
+    zscore = calculate_zscore(close)
+    
+    # Get latest values - ensure they are scalar
+    latest_price = float(close.iloc[-1])
+    latest_rsi = float(rsi.iloc[-1]) if not pd.isna(rsi.iloc[-1]) else 50.0
+    latest_adx = float(adx.iloc[-1]) if not pd.isna(adx.iloc[-1]) else 0.0
+    latest_volatility = float(volatility.iloc[-1]) if not pd.isna(volatility.iloc[-1]) else 0.0
+    latest_zscore = float(zscore.iloc[-1]) if not pd.isna(zscore.iloc[-1]) else 0.0
+    
+    # Support and resistance
+    sr_levels = find_support_resistance(data)
+    fib_levels = calculate_fibonacci_levels(data)
+    elliott = detect_elliott_wave(data)
+    divergence = detect_rsi_divergence(close, rsi)
+    
+    # Signal generation
+    signals = []
+    score = 0
+    
+    # RSI signals
+    if latest_rsi < 30:
+        signals.append(("RSI Oversold", "bullish", f"RSI at {latest_rsi:.1f}, potential bounce"))
+        score += 2
+    elif latest_rsi > 70:
+        signals.append(("RSI Overbought", "bearish", f"RSI at {latest_rsi:.1f}, potential reversal"))
+        score -= 2
+    
+    # Trend signals
+    ema_20_latest = float(ema_20.iloc[-1]) if not pd.isna(ema_20.iloc[-1]) else latest_price
+    ema_50_latest = float(ema_50.iloc[-1]) if not pd.isna(ema_50.iloc[-1]) else latest_price
+    
+    if latest_price > ema_20_latest > ema_50_latest:
+        signals.append(("Trend", "bullish", "Price above 20 & 50 EMA"))
+        score += 1
+    elif latest_price < ema_20_latest < ema_50_latest:
+        signals.append(("Trend", "bearish", "Price below 20 & 50 EMA"))
+        score -= 1
+    
+    # ADX strength
+    if latest_adx > 25:
+        signals.append(("ADX", "strong", f"Strong trend (ADX: {latest_adx:.1f})"))
+        score += 1 if latest_price > ema_20_latest else -1
+    
+    # Divergence signals
+    if divergence:
+        for div in divergence:
+            if div['type'] == 'bullish':
+                signals.append(("RSI Divergence", "bullish", f"Bullish divergence detected"))
+                score += 2
+            else:
+                signals.append(("RSI Divergence", "bearish", f"Bearish divergence detected"))
+                score -= 2
+    
+    # Z-score mean reversion
+    if latest_zscore < -2:
+        signals.append(("Z-Score", "bullish", f"Oversold (Z: {latest_zscore:.2f}), mean reversion likely"))
+        score += 2
+    elif latest_zscore > 2:
+        signals.append(("Z-Score", "bearish", f"Overbought (Z: {latest_zscore:.2f}), mean reversion likely"))
+        score -= 2
+    
+    # Support/Resistance proximity
+    for level in sr_levels[:3]:
+        price_diff = abs(latest_price - level['level'])
+        pct_diff = (price_diff / latest_price) * 100
+        
+        if pct_diff < 0.5:  # Within 0.5%
+            if level['type'] == 'support':
+                signals.append(("Support", "bullish", 
+                              f"Near strong support {level['level']:.2f} ({level['touches']} touches)"))
+                score += 1
+            else:
+                signals.append(("Resistance", "bearish", 
+                              f"Near strong resistance {level['level']:.2f} ({level['touches']} touches)"))
+                score -= 1
+    
+    # Bollinger Bands
+    lower_bb_latest = float(lower_bb.iloc[-1]) if not pd.isna(lower_bb.iloc[-1]) else latest_price
+    upper_bb_latest = float(upper_bb.iloc[-1]) if not pd.isna(upper_bb.iloc[-1]) else latest_price
+    
+    if latest_price < lower_bb_latest:
+        signals.append(("Bollinger", "bullish", "Price below lower band"))
+        score += 1
+    elif latest_price > upper_bb_latest:
+        signals.append(("Bollinger", "bearish", "Price above upper band"))
+        score -= 1
+    
+    # MACD crossover
+    if len(histogram) > 1:
+        hist_prev = float(histogram.iloc[-2]) if not pd.isna(histogram.iloc[-2]) else 0.0
+        hist_curr = float(histogram.iloc[-1]) if not pd.isna(histogram.iloc[-1]) else 0.0
+        
+        if hist_prev < 0 and hist_curr > 0:
+            signals.append(("MACD", "bullish", "Bullish MACD crossover"))
+            score += 1
+        elif hist_prev > 0 and hist_curr < 0:
+            signals.append(("MACD", "bearish", "Bearish MACD crossover"))
+            score -= 1
+    
+    # Final signal
+    if score >= 3:
+        final_signal = "STRONG BUY"
+        signal_class = "buy-signal"
+    elif score >= 1:
+        final_signal = "BUY"
+        signal_class = "buy-signal"
+    elif score <= -3:
+        final_signal = "STRONG SELL"
+        signal_class = "sell-signal"
+    elif score <= -1:
+        final_signal = "SELL"
+        signal_class = "sell-signal"
     else:
-        s['rsi_bull_div'] = False
-    return s
+        final_signal = "HOLD"
+        signal_class = "hold-signal"
+    
+    # Calculate entry, SL, and targets
+    atr_series = (high - low).rolling(window=14).mean()
+    atr = float(atr_series.iloc[-1]) if not pd.isna(atr_series.iloc[-1]) else latest_price * 0.02
+    
+    if "BUY" in final_signal:
+        entry = latest_price
+        sl = entry - (1.5 * atr)
+        target1 = entry + (2 * atr)
+        target2 = entry + (3 * atr)
+    elif "SELL" in final_signal:
+        entry = latest_price
+        sl = entry + (1.5 * atr)
+        target1 = entry - (2 * atr)
+        target2 = entry - (3 * atr)
+    else:
+        entry = sl = target1 = target2 = latest_price
+    
+    return {
+        'signal': final_signal,
+        'signal_class': signal_class,
+        'score': score,
+        'signals': signals,
+        'entry': entry,
+        'sl': sl,
+        'target1': target1,
+        'target2': target2,
+        'rsi': latest_rsi,
+        'adx': latest_adx,
+        'volatility': latest_volatility,
+        'zscore': latest_zscore,
+        'sr_levels': sr_levels,
+        'fib_levels': fib_levels,
+        'elliott': elliott,
+        'divergence': divergence
+    }
 
-# ----------------------------- Backtesting & Optimization -----------------------------
+def multi_timeframe_analysis(ticker, period, timeframes):
+    """Analyze across multiple timeframes"""
+    results = {}
+    
+    for tf in timeframes:
+        try:
+            data = fetch_data_with_retry(ticker, period, tf)
+            if data is not None and len(data) > 0:
+                signals = generate_trading_signals(data, ticker, tf)
+                if signals:
+                    results[tf] = signals
+        except Exception as e:
+            st.warning(f"Could not analyze {tf} timeframe: {str(e)}")
+    
+    return results
 
-def backtest_simple_cross(df, short_ema=9, long_ema=20, sl_atr=1.5, tp_mul=2.0):
-    data = df.copy()
-    data['short'] = ema(data['Close'], short_ema)
-    data['long'] = ema(data['Close'], long_ema)
-    data['position'] = 0
-    data['position'] = np.where(data['short'] > data['long'], 1, 0)
-    data['signal'] = data['position'].diff()
-    cash = 100000
-    pos = 0
-    entry_price = 0
-    trades = []
-    for idx, row in data.iloc[1:].iterrows():
-        if row['signal'] == 1 and pos == 0:
-            pos = cash / row['Close']
-            entry_price = row['Close']
-            stop = entry_price - sl_atr * row['ATR']
-            target = entry_price + tp_mul * row['ATR']
-            trades.append({'entry_dt': idx, 'entry': entry_price, 'stop': stop, 'target': target, 'exit_dt': None, 'exit': None})
-        elif pos > 0:
-            # check stop/target
-            trade = trades[-1]
-            if row['Low'] <= trade['stop']:
-                trades[-1]['exit_dt'] = idx
-                trades[-1]['exit'] = trade['stop']
-                pos = 0
-            elif row['High'] >= trade['target']:
-                trades[-1]['exit_dt'] = idx
-                trades[-1]['exit'] = trade['target']
-                pos = 0
-    # compute performance
-    results = []
-    for t in trades:
-        if t['exit'] is None:
-            continue
-        pnl = (t['exit'] - t['entry']) * (cash / t['entry'])
-        results.append(pnl)
-    total = sum(results)
-    return {'trades': trades, 'total_pnl': total, 'n_trades': len(results)}
-
-
-def optimize_params(df, param_grid):
-    best = None
-    for short in param_grid['short']:
-        for long in param_grid['long']:
-            if short >= long: continue
-            res = backtest_simple_cross(df, short, long, sl_atr=param_grid.get('sl_atr',1.5), tp_mul=param_grid.get('tp_mul',2.0))
-            if best is None or res['total_pnl'] > best['total_pnl']:
-                best = {'short': short, 'long': long, **res}
-    return best
-
-# ----------------------------- Summary Generator -----------------------------
-
-def generate_summary(df, signals, supports, resistances, elliot, ratio_info=None):
-    # Create about 100-word professional summary.
-    parts = []
-    price = df['Close'].iloc[-1]
-    trend = 'bullish' if signals['above_20ema'] and signals['macd_bull'] and signals['adx_trend'] else ('bearish' if not signals['above_20ema'] and not signals['macd_bull'] else 'neutral')
-    parts.append(f"Current price {price:.2f} - trend: {trend}.")
-    if signals['rsi_bull_div']:
-        parts.append("RSI bullish divergence detected on selected timeframe.")
-    if supports:
-        s_levels = sorted(supports.items(), key=lambda x: -x[1])[:2]
-        parts.append(f"Strong support at {', '.join([f'{k:.0f}' for k,_ in s_levels])} (hits recorded).")
-    if resistances:
-        r_levels = sorted(resistances.items(), key=lambda x: -x[1])[:2]
-        parts.append(f"Strong resistance at {', '.join([f'{k:.0f}' for k,_ in r_levels])}.")
-    if elliot:
-        start_price = elliot['prices'][0]
-        end_price = elliot['prices'][-1]
-        parts.append(f"Recent Elliott-like sequence from {start_price:.0f} to {end_price:.0f} observed.")
-    # Concise recommendation
-    rec = "Hold"
-    if trend == 'bullish' and not signals.get('rsi_bull_div', False):
-        rec = f"Buy (entry ~{price:.0f}, SL {price - df['ATR'].iloc[-1]:.0f}, target {price + 2*df['ATR'].iloc[-1]:.0f})"
-    elif trend == 'bearish':
-        rec = f"Sell (entry ~{price:.0f}, SL {price + df['ATR'].iloc[-1]:.0f}, target {price - 2*df['ATR'].iloc[-1]:.0f})"
-    parts.append(f"Recommendation: {rec}.")
-    summary = ' '.join(parts)
-    # trim to ~100 words
-    words = summary.split()
-    if len(words) > 110:
-        summary = ' '.join(words[:110]) + '...'
+def create_summary_report(mtf_analysis, ticker_name):
+    """Create comprehensive summary report"""
+    if not mtf_analysis:
+        return "Insufficient data for analysis"
+    
+    # Aggregate signals across timeframes
+    buy_count = sum(1 for tf, sig in mtf_analysis.items() if "BUY" in sig['signal'])
+    sell_count = sum(1 for tf, sig in mtf_analysis.items() if "SELL" in sig['signal'])
+    hold_count = sum(1 for tf, sig in mtf_analysis.items() if sig['signal'] == "HOLD")
+    
+    total = len(mtf_analysis)
+    
+    # Determine consensus
+    if buy_count / total > 0.6:
+        consensus = "BULLISH"
+        color = "🟢"
+    elif sell_count / total > 0.6:
+        consensus = "BEARISH"
+        color = "🔴"
+    else:
+        consensus = "NEUTRAL"
+        color = "🟡"
+    
+    # Get key levels from daily timeframe
+    daily_signals = mtf_analysis.get('1d', mtf_analysis.get(list(mtf_analysis.keys())[-1]))
+    
+    summary = f"""
+    **{color} {ticker_name} - {consensus} OUTLOOK**
+    
+    **Multi-Timeframe Consensus:** {buy_count} Bullish | {sell_count} Bearish | {hold_count} Neutral (across {total} timeframes)
+    
+    **Key Technical Levels:**
+    • RSI: {daily_signals['rsi']:.1f} {'(Oversold)' if daily_signals['rsi'] < 30 else '(Overbought)' if daily_signals['rsi'] > 70 else '(Neutral)'}
+    • ADX: {daily_signals['adx']:.1f} {'(Strong Trend)' if daily_signals['adx'] > 25 else '(Weak Trend)'}
+    • Volatility: {daily_signals['volatility']:.1f}%
+    • Z-Score: {daily_signals['zscore']:.2f} {'(Mean Reversion Expected)' if abs(daily_signals['zscore']) > 2 else ''}
+    
+    **Signal Strength:** {daily_signals['score']}/10
+    
+    **Working Strategies:**
+    """
+    
+    # List working signals
+    bullish_signals = [s for s in daily_signals['signals'] if s[1] == 'bullish']
+    bearish_signals = [s for s in daily_signals['signals'] if s[1] == 'bearish']
+    
+    if bullish_signals:
+        summary += "\n✅ **Bullish Indicators:**\n"
+        for sig in bullish_signals[:3]:
+            summary += f"• {sig[0]}: {sig[2]}\n"
+    
+    if bearish_signals:
+        summary += "\n❌ **Bearish Indicators:**\n"
+        for sig in bearish_signals[:3]:
+            summary += f"• {sig[0]}: {sig[2]}\n"
+    
+    # Add top support/resistance
+    if daily_signals['sr_levels']:
+        summary += f"\n**Critical Levels:**\n"
+        for level in daily_signals['sr_levels'][:2]:
+            summary += f"• {level['type'].title()}: {level['level']:.2f} ({level['touches']} touches)\n"
+    
     return summary
 
-# ----------------------------- Streamlit UI -----------------------------
+# Sidebar
+st.sidebar.title("⚙️ Trading Configuration")
 
-st.set_page_config(page_title='Algo Trading Dashboard', layout='wide')
-st.title('Professional Algorithmic Trading Dashboard')
+ticker1_input = st.sidebar.selectbox(
+    "Select Ticker 1",
+    list(TICKER_MAP.keys()) + ["Custom"],
+    index=0
+)
 
-# Sidebar controls
-with st.sidebar:
-    st.header('Data & Settings')
-    ticker1 = st.text_input('Ticker 1 (yfinance)', value='^NSEI')
-    ticker2 = st.text_input('Ticker 2 (optional)', value='')
-    period = st.selectbox('Period', ['1d','5d','7d','1mo','3mo','6mo','1y','2y','3y','5y','6y','10y','15y','20y','25y','30y'], index=6)
-    interval = st.selectbox('Interval', ['1m','3m','5m','10m','15m','30m','60m','120m','240m','1d'], index=9)
-    enable_ratio = st.checkbox('Enable Ratio Analysis', value=False if ticker2=='' else True)
-    hits_threshold = st.number_input('Support/Resistance hits threshold', min_value=1, max_value=50, value=3)
-    pivot_order = st.slider('Pivot detection lookback (order)', 1, 20, 5)
-    fetch_button = st.button('Fetch Data')
-    st.markdown('---')
-    st.write('Backtest & Optimization')
-    run_backtest = st.button('Run Backtest')
-    run_opt = st.button('Optimize Strategy')
+if ticker1_input == "Custom":
+    ticker1_custom = st.sidebar.text_input("Enter Custom Ticker 1", "AAPL")
+    ticker1 = ticker1_custom
+else:
+    ticker1 = get_ticker_symbol(ticker1_input)
 
-# Persist data in session_state to prevent UI disappearing
-if 'df1' not in st.session_state:
-    st.session_state['df1'] = None
-if 'df2' not in st.session_state:
-    st.session_state['df2'] = None
-if 'summary' not in st.session_state:
-    st.session_state['summary'] = ''
+enable_ratio = st.sidebar.checkbox("Enable Ratio Analysis (Ticker 2)")
 
-# Fetching
-if fetch_button:
-    try:
-        with st.spinner('Fetching ticker 1...'):
-            df1 = fetch_yf(ticker1, period=period, interval=interval)
-            if df1.empty:
-                st.error('No data for ticker 1. Check ticker symbol and interval/period combination.')
-            else:
-                df1 = compute_indicators(df1)
-                st.session_state['df1'] = df1
-        if enable_ratio and ticker2.strip() != '':
-            with st.spinner('Fetching ticker 2...'):
-                df2 = fetch_yf(ticker2, period=period, interval=interval)
-                if df2.empty:
-                    st.error('No data for ticker 2. Check ticker symbol.')
-                else:
-                    df2 = compute_indicators(df2)
-                    st.session_state['df2'] = df2
-        st.success('Data fetched and indicators calculated.')
-    except Exception as e:
-        st.error(f'Error fetching data: {e}')
-
-# Show Data & Analysis if available
-if st.session_state['df1'] is not None:
-    df = st.session_state['df1']
-    st.subheader(f'{ticker1} — Latest')
-    col1, col2, col3 = st.columns([1,1,2])
-    with col1:
-        latest_price = df['Close'].iloc[-1]
-        prev = df['Close'].iloc[-2] if len(df)>=2 else latest_price
-        pct = (latest_price - prev)/prev * 100 if prev!=0 else 0
-        st.metric('Price', f'{latest_price:.2f}', f'{pct:.2f}%')
-    with col2:
-        st.metric('RSI (14)', f"{df['RSI'].iloc[-1]:.2f}")
-    with col3:
-        st.write('Key indicators')
-        st.write({'EMA9':f"{df['EMA9'].iloc[-1]:.2f}", 'EMA20':f"{df['EMA20'].iloc[-1]:.2f}", 'ADX':f"{df['ADX'].iloc[-1]:.2f}"})
-
-    # Plot interactive OHLC
-    fig = go.Figure(data=[go.Candlestick(x=df.index, open=df['Open'], high=df['High'], low=df['Low'], close=df['Close'], name='Price')])
-    fig.update_layout(height=450, margin=dict(l=20, r=20, t=30, b=20))
-    st.plotly_chart(fig, use_container_width=True)
-
-    # Support/Resistance
-    supports, resistances = support_resistance(df, hits_threshold=hits_threshold, pivot_order=pivot_order)
-    st.subheader('Strong Support & Resistance (detected)')
-    st.write('Supports (level: hits):', supports)
-    st.write('Resistances (level: hits):', resistances)
-
-    # Elliott
-    ell = elliott_heuristic(df)
-    if ell:
-        st.write('Elliott-like structure detected between indices:', ell['indices'])
+ticker2 = None
+if enable_ratio:
+    ticker2_input = st.sidebar.selectbox(
+        "Select Ticker 2",
+        list(TICKER_MAP.keys()) + ["Custom"],
+        index=1
+    )
+    
+    if ticker2_input == "Custom":
+        ticker2_custom = st.sidebar.text_input("Enter Custom Ticker 2", "MSFT")
+        ticker2 = ticker2_custom
     else:
-        st.write('No clear Elliott-like 5-wave structure detected (heuristic).')
+        ticker2 = get_ticker_symbol(ticker2_input)
 
-    # Signals & summary
-    signals = generate_signals(df)
-    summary = generate_summary(df, signals, supports, resistances, ell)
-    st.session_state['summary'] = summary
-    st.subheader('100-word Professional Summary')
-    st.info(summary)
+period = st.sidebar.selectbox("Period", PERIODS, index=PERIODS.index("3mo"))
+interval = st.sidebar.selectbox("Primary Timeframe", TIMEFRAMES, index=TIMEFRAMES.index("1d"))
 
+# Multi-timeframe selection
+st.sidebar.subheader("Multi-Timeframe Analysis")
+selected_timeframes = st.sidebar.multiselect(
+    "Select Timeframes",
+    TIMEFRAMES,
+    default=["15m", "1h", "1d"]
+)
+
+# Fetch data button
+if st.sidebar.button("🔄 Fetch Data", type="primary"):
+    with st.spinner("Fetching market data..."):
+        try:
+            st.session_state.ticker1_data = fetch_data_with_retry(ticker1, period, interval)
+            
+            if st.session_state.ticker1_data is not None:
+                st.sidebar.success(f"✅ {ticker1} data fetched: {len(st.session_state.ticker1_data)} rows")
+            else:
+                st.sidebar.error(f"❌ Failed to fetch {ticker1} data")
+            
+            if enable_ratio and ticker2:
+                st.session_state.ticker2_data = fetch_data_with_retry(ticker2, period, interval)
+                if st.session_state.ticker2_data is not None:
+                    st.sidebar.success(f"✅ {ticker2} data fetched: {len(st.session_state.ticker2_data)} rows")
+                else:
+                    st.sidebar.error(f"❌ Failed to fetch {ticker2} data")
+            
+            if st.session_state.ticker1_data is not None:
+                st.session_state.data_fetched = True
+                st.success("✅ Data fetched successfully! Scroll down to see analysis.")
+            else:
+                st.error("Failed to fetch data. Please try a different ticker or timeframe.")
+                st.session_state.data_fetched = False
+                
+        except Exception as e:
+            st.error(f"Error during data fetch: {str(e)}")
+            st.session_state.data_fetched = False
+
+# Main content
+st.markdown('<div class="main-header">📈 Advanced Algorithmic Trading Analysis</div>', unsafe_allow_html=True)
+
+if st.session_state.data_fetched and st.session_state.ticker1_data is not None and len(st.session_state.ticker1_data) > 0:
+    data1 = st.session_state.ticker1_data
+    
+    # Debug info
+    with st.expander("🔍 Data Info (Debug)"):
+        st.write(f"**Rows:** {len(data1)}")
+        st.write(f"**Columns:** {list(data1.columns)}")
+        st.write(f"**Date Range:** {data1.index[0]} to {data1.index[-1]}")
+        st.write(f"**Sample Data:**")
+        st.dataframe(data1.head())
+    
+    # Current metrics
+    st.subheader("📊 Current Market Metrics")
+    
+    col1, col2, col3, col4 = st.columns(4)
+    
+    current_price = data1['Close'].iloc[-1]
+    prev_price = data1['Close'].iloc[-2] if len(data1) > 1 else current_price
+    price_change = current_price - prev_price
+    pct_change = (price_change / prev_price) * 100
+    
+    rsi = calculate_rsi(data1['Close']).iloc[-1]
+    
+    with col1:
+        color_class = "positive" if price_change > 0 else "negative"
+        st.markdown(f"""
+        <div class="metric-card">
+            <h4>{ticker1}</h4>
+            <h2 class="{color_class}">{current_price:.2f}</h2>
+            <p class="{color_class}">{price_change:+.2f} ({pct_change:+.2f}%)</p>
+        </div>
+        """, unsafe_allow_html=True)
+    
+    with col2:
+        rsi_color = "positive" if 30 <= rsi <= 70 else "negative"
+        st.markdown(f"""
+        <div class="metric-card">
+            <h4>RSI</h4>
+            <h2 class="{rsi_color}">{rsi:.1f}</h2>
+            <p>{'Oversold' if rsi < 30 else 'Overbought' if rsi > 70 else 'Neutral'}</p>
+        </div>
+        """, unsafe_allow_html=True)
+    
+    with col3:
+        volatility = calculate_volatility(data1['Close'].pct_change()).iloc[-1]
+        st.markdown(f"""
+        <div class="metric-card">
+            <h4>Volatility</h4>
+            <h2>{volatility:.1f}%</h2>
+            <p>Annualized</p>
+        </div>
+        """, unsafe_allow_html=True)
+    
+    with col4:
+        zscore_val = calculate_zscore(data1['Close']).iloc[-1]
+        zscore_color = "positive" if abs(zscore_val) < 2 else "negative"
+        st.markdown(f"""
+        <div class="metric-card">
+            <h4>Z-Score</h4>
+            <h2 class="{zscore_color}">{zscore_val:.2f}</h2>
+            <p>Mean Reversion</p>
+        </div>
+        """, unsafe_allow_html=True)
+    
+    # Multi-timeframe analysis
+    if selected_timeframes:
+        st.subheader("🔍 Multi-Timeframe Analysis")
+        
+        with st.spinner("Analyzing across timeframes..."):
+            mtf_results = multi_timeframe_analysis(ticker1, period, selected_timeframes)
+        
+        if mtf_results:
+            # Summary report
+            st.subheader("📋 Executive Summary")
+            summary = create_summary_report(mtf_results, ticker1)
+            st.markdown(summary)
+            
+            # Detailed signals by timeframe
+            st.subheader("📈 Detailed Timeframe Analysis")
+            
+            for tf, signals in mtf_results.items():
+                with st.expander(f"{tf} Timeframe - {signals['signal']}"):
+                    st.markdown(f"""
+                    <div class="signal-box {signals['signal_class']}">
+                        <strong>Signal:</strong> {signals['signal']} (Score: {signals['score']}/10)
+                    </div>
+                    """, unsafe_allow_html=True)
+                    
+                    st.write("**📍 Trading Levels:**")
+                    col1, col2, col3, col4 = st.columns(4)
+                    col1.metric("Entry", f"{signals['entry']:.2f}")
+                    col2.metric("Stop Loss", f"{signals['sl']:.2f}")
+                    col3.metric("Target 1", f"{signals['target1']:.2f}")
+                    col4.metric("Target 2", f"{signals['target2']:.2f}")
+                    
+                    st.write("**🎯 Active Signals:**")
+                    for sig_name, sig_type, sig_desc in signals['signals']:
+                        emoji = "🟢" if sig_type == "bullish" else "🔴" if sig_type == "bearish" else "🔵"
+                        st.write(f"{emoji} **{sig_name}:** {sig_desc}")
+                    
+                    # Support/Resistance levels
+                    if signals['sr_levels']:
+                        st.write("**🎚️ Key Support & Resistance:**")
+                        sr_df = pd.DataFrame(signals['sr_levels'][:5])
+                        sr_df['date'] = sr_df['date'].dt.strftime('%Y-%m-%d %H:%M IST')
+                        st.dataframe(sr_df, use_container_width=True)
+                    
+                    # Fibonacci levels
+                    if signals['fib_levels']:
+                        st.write("**📐 Fibonacci Retracement:**")
+                        fib_df = pd.DataFrame([
+                            {'Level': k, 'Price': f"{v:.2f}"} 
+                            for k, v in signals['fib_levels'].items()
+                        ])
+                        st.dataframe(fib_df, use_container_width=True)
+                    
+                    # Elliott Wave
+                    if signals['elliott']:
+                        st.write("**🌊 Elliott Wave Analysis:**")
+                        wave_df = pd.DataFrame(signals['elliott'])
+                        wave_df['date'] = wave_df['date'].dt.strftime('%Y-%m-%d %H:%M IST')
+                        st.dataframe(wave_df, use_container_width=True)
+                    
+                    # RSI Divergence
+                    if signals['divergence']:
+                        st.write("**⚡ RSI Divergence:**")
+                        for div in signals['divergence']:
+                            div_type = div['type'].title()
+                            div_emoji = "🟢" if div['type'] == 'bullish' else "🔴"
+                            st.write(f"{div_emoji} **{div_type}** at {div['price']:.2f} on {div['date'].strftime('%Y-%m-%d %H:%M IST')}")
+    
+    # Ratio Analysis
+    if enable_ratio and st.session_state.ticker2_data is not None:
+        st.subheader("🔄 Ratio Analysis")
+        
+        data2 = st.session_state.ticker2_data
+        
+        # Align data
+        common_index = data1.index.intersection(data2.index)
+        data1_aligned = data1.loc[common_index]
+        data2_aligned = data2.loc[common_index]
+        
+        # Calculate ratio
+        ratio = data1_aligned['Close'] / data2_aligned['Close']
+        
+        # Create comprehensive comparison table
+        comparison_df = pd.DataFrame({
+            'DateTime (IST)': common_index.strftime('%Y-%m-%d %H:%M:%S'),
+            f'{ticker1} Price': data1_aligned['Close'].values,
+            f'{ticker2} Price': data2_aligned['Close'].values,
+            'Ratio': ratio.values,
+            f'{ticker1} RSI': calculate_rsi(data1_aligned['Close']).values,
+            f'{ticker2} RSI': calculate_rsi(data2_aligned['Close']).values,
+            'Ratio RSI': calculate_rsi(ratio).values,
+            f'{ticker1} Volatility': calculate_volatility(data1_aligned['Close'].pct_change()).values,
+            f'{ticker2} Volatility': calculate_volatility(data2_aligned['Close'].pct_change()).values,
+            f'{ticker1} Z-Score': calculate_zscore(data1_aligned['Close']).values,
+            f'{ticker2} Z-Score': calculate_zscore(data2_aligned['Close']).values
+        })
+        
+        st.dataframe(comparison_df.tail(50), use_container_width=True)
+        
+        # Export functionality
+        col1, col2 = st.columns(2)
+        with col1:
+            csv = comparison_df.to_csv(index=False)
+            st.download_button(
+                label="📥 Download CSV",
+                data=csv,
+                file_name=f"ratio_analysis_{ticker1}_{ticker2}_{datetime.now(IST).strftime('%Y%m%d_%H%M%S')}.csv",
+                mime="text/csv"
+            )
+        
+        with col2:
+            # Convert to Excel
+            from io import BytesIO
+            output = BytesIO()
+            with pd.ExcelWriter(output, engine='openpyxl') as writer:
+                comparison_df.to_excel(writer, index=False, sheet_name='Ratio Analysis')
+            excel_data = output.getvalue()
+            
+            st.download_button(
+                label="📥 Download Excel",
+                data=excel_data,
+                file_name=f"ratio_analysis_{ticker1}_{ticker2}_{datetime.now(IST).strftime('%Y%m%d_%H%M%S')}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            )
+        
+        # Ratio chart
+        st.subheader("📊 Ratio Visualization")
+        
+        fig = make_subplots(
+            rows=3, cols=1,
+            shared_xaxes=True,
+            vertical_spacing=0.05,
+            subplot_titles=(f'{ticker1} vs {ticker2} Price', 'Ratio', 'Ratio RSI'),
+            row_heights=[0.4, 0.3, 0.3]
+        )
+        
+        # Price comparison
+        fig.add_trace(
+            go.Scatter(x=common_index, y=data1_aligned['Close'], name=ticker1, line=dict(color='blue')),
+            row=1, col=1
+        )
+        fig.add_trace(
+            go.Scatter(x=common_index, y=data2_aligned['Close'], name=ticker2, line=dict(color='red'), yaxis='y2'),
+            row=1, col=1
+        )
+        
+        # Ratio
+        fig.add_trace(
+            go.Scatter(x=common_index, y=ratio, name='Ratio', line=dict(color='purple')),
+            row=2, col=1
+        )
+        
+        # Ratio RSI
+        ratio_rsi = calculate_rsi(ratio)
+        fig.add_trace(
+            go.Scatter(x=common_index, y=ratio_rsi, name='Ratio RSI', line=dict(color='orange')),
+            row=3, col=1
+        )
+        fig.add_hline(y=70, line_dash="dash", line_color="red", row=3, col=1)
+        fig.add_hline(y=30, line_dash="dash", line_color="green", row=3, col=1)
+        
+        fig.update_layout(height=800, showlegend=True, hovermode='x unified')
+        fig.update_xaxes(title_text="Date", row=3, col=1)
+        
+        st.plotly_chart(fig, use_container_width=True)
+    
+    # Price chart with indicators
+    st.subheader("📈 Technical Analysis Chart")
+    
+    fig = make_subplots(
+        rows=4, cols=1,
+        shared_xaxes=True,
+        vertical_spacing=0.05,
+        subplot_titles=(f'{ticker1} Price & Indicators', 'RSI', 'MACD', 'Volume'),
+        row_heights=[0.4, 0.2, 0.2, 0.2]
+    )
+    
+    # Candlestick chart
+    fig.add_trace(
+        go.Candlestick(
+            x=data1.index,
+            open=data1['Open'],
+            high=data1['High'],
+            low=data1['Low'],
+            close=data1['Close'],
+            name='Price'
+        ),
+        row=1, col=1
+    )
+    
+    # EMAs
+    ema_9 = calculate_ema(data1['Close'], 9)
+    ema_20 = calculate_ema(data1['Close'], 20)
+    ema_50 = calculate_ema(data1['Close'], 50)
+    
+    fig.add_trace(go.Scatter(x=data1.index, y=ema_9, name='EMA 9', line=dict(color='yellow', width=1)), row=1, col=1)
+    fig.add_trace(go.Scatter(x=data1.index, y=ema_20, name='EMA 20', line=dict(color='orange', width=1)), row=1, col=1)
+    fig.add_trace(go.Scatter(x=data1.index, y=ema_50, name='EMA 50', line=dict(color='red', width=1)), row=1, col=1)
+    
+    # Bollinger Bands
+    upper_bb, middle_bb, lower_bb = calculate_bollinger_bands(data1['Close'])
+    fig.add_trace(go.Scatter(x=data1.index, y=upper_bb, name='BB Upper', line=dict(color='gray', dash='dash', width=1)), row=1, col=1)
+    fig.add_trace(go.Scatter(x=data1.index, y=lower_bb, name='BB Lower', line=dict(color='gray', dash='dash', width=1)), row=1, col=1)
+    
+    # Support/Resistance levels
+    sr_levels = find_support_resistance(data1)
+    for level in sr_levels[:5]:
+        color = 'green' if level['type'] == 'support' else 'red'
+        fig.add_hline(
+            y=level['level'],
+            line_dash="dot",
+            line_color=color,
+            annotation_text=f"{level['type'][:3].upper()} {level['level']:.2f}",
+            row=1, col=1
+        )
+    
+    # RSI
+    rsi_series = calculate_rsi(data1['Close'])
+    fig.add_trace(go.Scatter(x=data1.index, y=rsi_series, name='RSI', line=dict(color='purple')), row=2, col=1)
+    fig.add_hline(y=70, line_dash="dash", line_color="red", row=2, col=1)
+    fig.add_hline(y=30, line_dash="dash", line_color="green", row=2, col=1)
+    fig.add_hline(y=50, line_dash="dash", line_color="gray", row=2, col=1)
+    
+    # MACD
+    macd, signal, histogram = calculate_macd(data1['Close'])
+    fig.add_trace(go.Scatter(x=data1.index, y=macd, name='MACD', line=dict(color='blue')), row=3, col=1)
+    fig.add_trace(go.Scatter(x=data1.index, y=signal, name='Signal', line=dict(color='red')), row=3, col=1)
+    fig.add_trace(go.Bar(x=data1.index, y=histogram, name='Histogram', marker_color='gray'), row=3, col=1)
+    
+    # Volume
+    if 'Volume' in data1.columns and data1['Volume'].sum() > 0:
+        colors = ['green' if data1['Close'].iloc[i] > data1['Open'].iloc[i] else 'red' for i in range(len(data1))]
+        fig.add_trace(go.Bar(x=data1.index, y=data1['Volume'], name='Volume', marker_color=colors), row=4, col=1)
+    else:
+        # If no volume data, hide the volume subplot
+        fig.update_yaxes(title_text="No Volume Data", row=4, col=1)
+    
+    fig.update_layout(height=1200, showlegend=True, hovermode='x unified', xaxis_rangeslider_visible=False)
+    fig.update_xaxes(title_text="Date", row=4, col=1)
+    
+    st.plotly_chart(fig, use_container_width=True)
+    
     # Data table
-    st.subheader('Data Table (last 200 rows)')
-    st.dataframe(df.tail(200))
+    st.subheader("📊 Price Data Table")
+    
+    display_data = data1.copy()
+    display_data['Returns (%)'] = display_data['Close'].pct_change() * 100
+    display_data['RSI'] = calculate_rsi(display_data['Close'])
+    display_data['Volatility'] = calculate_volatility(display_data['Close'].pct_change())
+    display_data.index = display_data.index.strftime('%Y-%m-%d %H:%M:%S IST')
+    
+    st.dataframe(display_data.tail(100), use_container_width=True)
+    
+    # Backtesting section
+    st.subheader("🔬 Strategy Backtesting")
+    
+    with st.expander("Configure & Run Backtest"):
+        col1, col2, col3 = st.columns(3)
+        
+        with col1:
+            strategy_type = st.selectbox(
+                "Strategy Type",
+                ["RSI Mean Reversion", "Moving Average Crossover", "Breakout", "Combined Signals"]
+            )
+        
+        with col2:
+            initial_capital = st.number_input("Initial Capital", value=100000, step=10000)
+        
+        with col3:
+            position_size = st.slider("Position Size (%)", 10, 100, 20)
+        
+        if st.button("🚀 Run Backtest"):
+            with st.spinner("Running backtest..."):
+                # Simple backtesting logic
+                capital = initial_capital
+                positions = []
+                trades = []
+                
+                close_prices = data1['Close'].values
+                rsi_values = calculate_rsi(data1['Close']).values
+                
+                position = None
+                
+                for i in range(50, len(data1)):
+                    if strategy_type == "RSI Mean Reversion":
+                        # Buy when RSI < 30, sell when RSI > 70
+                        if position is None and rsi_values[i] < 30:
+                            shares = (capital * position_size / 100) / close_prices[i]
+                            position = {'entry': close_prices[i], 'shares': shares, 'entry_date': data1.index[i]}
+                        
+                        elif position is not None and rsi_values[i] > 70:
+                            exit_price = close_prices[i]
+                            profit = (exit_price - position['entry']) * position['shares']
+                            capital += profit
+                            
+                            trades.append({
+                                'Entry': position['entry'],
+                                'Exit': exit_price,
+                                'Profit': profit,
+                                'Return %': (profit / (position['entry'] * position['shares'])) * 100,
+                                'Entry Date': position['entry_date'],
+                                'Exit Date': data1.index[i]
+                            })
+                            position = None
+                    
+                    elif strategy_type == "Moving Average Crossover":
+                        if i >= 50:
+                            ema_20_val = calculate_ema(data1['Close'].iloc[:i+1], 20).iloc[-1]
+                            ema_50_val = calculate_ema(data1['Close'].iloc[:i+1], 50).iloc[-1]
+                            
+                            if position is None and ema_20_val > ema_50_val:
+                                shares = (capital * position_size / 100) / close_prices[i]
+                                position = {'entry': close_prices[i], 'shares': shares, 'entry_date': data1.index[i]}
+                            
+                            elif position is not None and ema_20_val < ema_50_val:
+                                exit_price = close_prices[i]
+                                profit = (exit_price - position['entry']) * position['shares']
+                                capital += profit
+                                
+                                trades.append({
+                                    'Entry': position['entry'],
+                                    'Exit': exit_price,
+                                    'Profit': profit,
+                                    'Return %': (profit / (position['entry'] * position['shares'])) * 100,
+                                    'Entry Date': position['entry_date'],
+                                    'Exit Date': data1.index[i]
+                                })
+                                position = None
+                
+                # Calculate metrics
+                if trades:
+                    trades_df = pd.DataFrame(trades)
+                    total_return = ((capital - initial_capital) / initial_capital) * 100
+                    winning_trades = len(trades_df[trades_df['Profit'] > 0])
+                    losing_trades = len(trades_df[trades_df['Profit'] < 0])
+                    win_rate = (winning_trades / len(trades_df)) * 100 if len(trades_df) > 0 else 0
+                    
+                    avg_win = trades_df[trades_df['Profit'] > 0]['Profit'].mean() if winning_trades > 0 else 0
+                    avg_loss = trades_df[trades_df['Profit'] < 0]['Profit'].mean() if losing_trades > 0 else 0
+                    
+                    # Calculate annualized return
+                    days = (data1.index[-1] - data1.index[0]).days
+                    years = days / 365.25
+                    annualized_return = (((capital / initial_capital) ** (1 / years)) - 1) * 100 if years > 0 else 0
+                    
+                    st.success("✅ Backtest Complete!")
+                    
+                    col1, col2, col3, col4 = st.columns(4)
+                    col1.metric("Total Return", f"{total_return:.2f}%")
+                    col2.metric("Annualized Return", f"{annualized_return:.2f}%")
+                    col3.metric("Win Rate", f"{win_rate:.1f}%")
+                    col4.metric("Total Trades", len(trades_df))
+                    
+                    col1, col2, col3, col4 = st.columns(4)
+                    col1.metric("Final Capital", f"₹{capital:,.2f}")
+                    col2.metric("Winning Trades", winning_trades)
+                    col3.metric("Losing Trades", losing_trades)
+                    col4.metric("Avg Win/Loss", f"₹{avg_win:.2f} / ₹{avg_loss:.2f}")
+                    
+                    st.write("**Trade History:**")
+                    trades_df['Entry Date'] = pd.to_datetime(trades_df['Entry Date']).dt.strftime('%Y-%m-%d %H:%M IST')
+                    trades_df['Exit Date'] = pd.to_datetime(trades_df['Exit Date']).dt.strftime('%Y-%m-%d %H:%M IST')
+                    st.dataframe(trades_df, use_container_width=True)
+                    
+                    # Equity curve
+                    equity_curve = [initial_capital]
+                    for trade in trades:
+                        equity_curve.append(equity_curve[-1] + trade['Profit'])
+                    
+                    fig = go.Figure()
+                    fig.add_trace(go.Scatter(
+                        y=equity_curve,
+                        mode='lines',
+                        name='Equity Curve',
+                        line=dict(color='green', width=2)
+                    ))
+                    fig.update_layout(
+                        title="Equity Curve",
+                        xaxis_title="Trade Number",
+                        yaxis_title="Capital (₹)",
+                        height=400
+                    )
+                    st.plotly_chart(fig, use_container_width=True)
+                else:
+                    st.warning("No trades generated with current strategy parameters.")
 
-    # Export
-    to_export = df.reset_index()
-    csv_buf = to_export.to_csv(index=False).encode('utf-8')
-    st.download_button('Export CSV', data=csv_buf, file_name=f'{ticker1}_{period}_{interval}.csv')
+else:
+    st.info("👆 Configure your analysis parameters in the sidebar and click 'Fetch Data' to begin.")
+    
+    st.markdown("""
+    ### 🎯 Features:
+    
+    - **Multi-Asset Support:** NIFTY, Bank NIFTY, SENSEX, Crypto, Forex, Stocks
+    - **Multi-Timeframe Analysis:** From 1-minute to daily charts
+    - **Advanced Technical Indicators:** RSI, EMA, ADX, MACD, Bollinger Bands
+    - **Support & Resistance:** Automatic detection with touch count
+    - **Fibonacci Retracement:** Complete level analysis
+    - **Elliott Wave Detection:** Wave pattern identification
+    - **RSI Divergence:** Bullish and bearish divergence detection
+    - **Z-Score Analysis:** Mean reversion signals
+    - **AI-Powered Signals:** Multi-factor signal generation
+    - **Ratio Analysis:** Compare two assets comprehensively
+    - **Backtesting Engine:** Test your strategies with historical data
+    - **Export Functionality:** Download analysis as CSV/Excel
+    
+    ### 📊 How to Use:
+    
+    1. Select your ticker(s) from the sidebar
+    2. Choose timeframe and period
+    3. Select multiple timeframes for comprehensive analysis
+    4. Click "Fetch Data" to load market data
+    5. Review signals, levels, and recommendations
+    6. Run backtests to validate strategies
+    7. Export data for further analysis
+    
+    ### ⚠️ Disclaimer:
+    
+    This tool is for educational and informational purposes only. Trading involves risk of loss. Always do your own research and consult with a financial advisor before making investment decisions.
+    """)
 
-    # Ratio analysis
-    if enable_ratio and st.session_state['df2'] is not None:
-        df2 = st.session_state['df2']
-        a, b = align_for_ratio(df, df2)
-        ratio_series = a['Close'] / b['Close']
-        ratio_df = pd.DataFrame({'Close1': a['Close'], 'Close2': b['Close'], 'Ratio': ratio_series})
-        ratio_df['RSI1'] = rsi(a['Close'], 14)
-        ratio_df['RSI2'] = rsi(b['Close'], 14)
-        ratio_df['RSIRatio'] = rsi(ratio_df['Ratio'].fillna(method='ffill'), 14)
-        ratio_df['Z1'] = zscore(a['Close'].pct_change().fillna(0))
-        ratio_df['Z2'] = zscore(b['Close'].pct_change().fillna(0))
-        st.subheader('Ratio Analysis (aligned timestamps)')
-        st.dataframe(ratio_df.tail(200))
-        csv_buf2 = ratio_df.reset_index().to_csv(index=False).encode('utf-8')
-        st.download_button('Export Ratio CSV', data=csv_buf2, file_name=f'ratio_{ticker1}_{ticker2}.csv')
-
-# Backtesting
-if run_backtest and st.session_state.get('df1') is not None:
-    dfbt = st.session_state['df1']
-    with st.spinner('Running backtest...'):
-        bt_res = backtest_simple_cross(dfbt)
-        st.write('Backtest result (simple EMA crossover):')
-        st.write(bt_res)
-
-# Optimization
-if run_opt and st.session_state.get('df1') is not None:
-    dfopt = st.session_state['df1']
-    with st.spinner('Optimizing...'):
-        grid = {'short':[5,8,9,10], 'long':[15,20,25,30], 'sl_atr':1.5, 'tp_mul':2.0}
-        best = optimize_params(dfopt, grid)
-        st.write('Best parameters found:', best)
-
-st.markdown('---')
-st.caption('Notes: This app implements many heuristics: Elliott detection is approximate; support/resistance is pivot-based and clustered. Indicators are computed in pure-Python. Use backtest & optimize as experimental starting points. Always paper-test before real trading.')
+# Footer
+st.markdown("---")
+st.markdown("""
+<div style='text-align: center; color: gray;'>
+    <p>Advanced Algorithmic Trading Analysis Tool | Built with Streamlit & Python</p>
+    <p>⚠️ For Educational Purposes Only | Not Financial Advice</p>
+</div>
+""", unsafe_allow_html=True)
