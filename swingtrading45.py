@@ -5,469 +5,433 @@ import numpy as np
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from scipy.signal import argrelextrema
-from datetime import datetime, timedelta
 import time
+from datetime import datetime
 import pytz
 
 # ==========================================
-# 1. PAGE CONFIG & STATE MANAGEMENT
+# 1. SETUP & STATE
 # ==========================================
-st.set_page_config(layout="wide", page_title="QuanT Pro: AI Trade Logic", page_icon="⚡")
+st.set_page_config(layout="wide", page_title="QuanT Pro: Deep Scan", page_icon="⚡")
 
-# Initialize Session State for Paper Trading
-if 'balance' not in st.session_state:
-    st.session_state.balance = 100000.0  # Starting Capital
-if 'positions' not in st.session_state:
-    st.session_state.positions = []
-if 'trade_history' not in st.session_state:
-    st.session_state.trade_history = []
+# Initialize Session State
+if 'balance' not in st.session_state: st.session_state.balance = 100000.0
+if 'positions' not in st.session_state: st.session_state.positions = []
+if 'analysis_cache' not in st.session_state: st.session_state.analysis_cache = None
 
-# Custom CSS for the "Verdict Card"
+# Custom CSS
 st.markdown("""
 <style>
-    .verdict-card {
-        padding: 20px;
-        border-radius: 12px;
-        color: white;
-        text-align: center;
-        margin-bottom: 20px;
-        box-shadow: 0 4px 6px rgba(0,0,0,0.3);
-    }
-    .verdict-buy { background: linear-gradient(135deg, #0f3d0f 0%, #00ff00 100%); border: 2px solid #00ff00; }
-    .verdict-sell { background: linear-gradient(135deg, #4a0f0f 0%, #ff0000 100%); border: 2px solid #ff0000; }
-    .verdict-hold { background: linear-gradient(135deg, #333333 0%, #888888 100%); border: 2px solid #888888; }
-    .confidence-score { font-size: 3em; font-weight: 800; }
-    .big-signal { font-size: 1.5em; letter-spacing: 2px; text-transform: uppercase; }
+    .metric-box { padding: 10px; background: #1e1e1e; border-radius: 8px; border: 1px solid #333; margin-bottom: 10px; }
+    .signal-buy { color: #00ff00; font-weight: 900; font-size: 24px; }
+    .signal-sell { color: #ff2a2a; font-weight: 900; font-size: 24px; }
+    .signal-hold { color: #aaaaaa; font-weight: 900; font-size: 24px; }
+    .report-text { font-family: 'Courier New', monospace; font-size: 0.9em; }
 </style>
 """, unsafe_allow_html=True)
 
 # ==========================================
-# 2. DATA ENGINE & HELPERS
+# 2. DATA ENGINE (MULTI-TIMEFRAME)
 # ==========================================
 
-TICKER_PRESETS = [
-    "NIFTY 50", "BANK NIFTY", "SENSEX", "BTC-USD", "ETH-USD", 
-    "GC=F", "SI=F", "INR=X", "RELIANCE.NS", "TCS.NS", "INFY.NS", "HDFCBANK.NS"
-]
+TICKER_MAP = {
+    "NIFTY 50": "^NSEI", "BANK NIFTY": "^NSEBANK", "SENSEX": "^BSESN",
+    "BTC-USD": "BTC-USD", "ETH-USD": "ETH-USD", "GOLD": "GC=F", "SILVER": "SI=F", "USD/INR": "INR=X"
+}
 
-def get_ticker_symbol(friendly_name):
-    mapping = {
-        "NIFTY 50": "^NSEI", "BANK NIFTY": "^NSEBANK", "SENSEX": "^BSESN",
-        "BTC-USD": "BTC-USD", "ETH-USD": "ETH-USD", "GC=F": "GC=F", 
-        "SI=F": "SI=F", "INR=X": "INR=X"
-    }
-    return mapping.get(friendly_name, friendly_name)
+def get_symbol(t): return TICKER_MAP.get(t, t)
 
-def get_default_ratio_ticker(ticker1):
-    if "NIFTY" in ticker1 or "SENSEX" in ticker1 or ".NS" in ticker1:
-        return "INR=X" # USD/INR
-    if "BTC" in ticker1 or "ETH" in ticker1:
-        return "GC=F" # Gold
-    return "NIFTY 50"
-
-@st.cache_data(ttl=300)
-def fetch_data(ticker, period, interval):
-    """Fetches data with strict rate limiting."""
-    time.sleep(1.5)  # 1.5s delay to prevent API crash
+def fetch_data_safe(ticker, period, interval):
+    """Fetches data with mandatory delay to respect yfinance limits."""
+    time.sleep(2.0) # 2s Delay
     try:
-        symbol = get_ticker_symbol(ticker)
-        df = yf.download(symbol, period=period, interval=interval, progress=False)
-        
+        df = yf.download(get_symbol(ticker), period=period, interval=interval, progress=False)
         if df.empty: return None
-        
-        # Flatten MultiIndex
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = df.columns.get_level_values(0)
-
-        # Timezone Handling (Convert to IST)
-        if df.index.tzinfo is None:
-            df.index = df.index.tz_localize('UTC')
+        if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
+        if df.index.tzinfo is None: df.index = df.index.tz_localize('UTC')
         df.index = df.index.tz_convert('Asia/Kolkata')
-        
         return df
-    except Exception as e:
-        return None
+    except: return None
 
-def calculate_technical_metrics(df):
+# ==========================================
+# 3. MATH & INDICATORS
+# ==========================================
+
+def calculate_indicators(df):
     if df is None or len(df) < 50: return df
     
-    # 1. Standard Indicators
-    df['Returns'] = df['Close'].pct_change()
-    df['Range'] = df['High'] - df['Low']
-    
-    # EMAs
-    for span in [9, 20, 50, 200]:
-        df[f'EMA_{span}'] = df['Close'].ewm(span=span, adjust=False).mean()
+    # Basic
+    df['EMA_9'] = df['Close'].ewm(span=9).mean()
+    df['EMA_20'] = df['Close'].ewm(span=20).mean()
+    df['EMA_50'] = df['Close'].ewm(span=50).mean()
+    df['EMA_200'] = df['Close'].ewm(span=200).mean()
     
     # RSI
     delta = df['Close'].diff()
-    gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+    gain = (delta.where(delta > 0, 0)).rolling(14).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
     rs = gain / loss
     df['RSI'] = 100 - (100 / (1 + rs))
     
-    # Volatility (ATR-like)
-    df['Volatility'] = df['Range'].rolling(14).mean()
-    
-    # Z-Score of Price relative to 20 SMA
-    df['SMA_20'] = df['Close'].rolling(20).mean()
-    df['StdDev_20'] = df['Close'].rolling(20).std()
-    df['Z_Score'] = (df['Close'] - df['SMA_20']) / df['StdDev_20']
+    # Volatility & Z-Score
+    df['Log_Ret'] = np.log(df['Close'] / df['Close'].shift(1))
+    df['Volatility'] = df['Log_Ret'].rolling(20).std() * np.sqrt(20)
+    df['Z_Score'] = (df['Close'] - df['Close'].rolling(20).mean()) / df['Close'].rolling(20).std()
     
     return df
 
-# ==========================================
-# 3. ADVANCED ANALYTICAL ENGINES
-# ==========================================
+def get_strong_sr_levels(df):
+    """Finds levels hit multiple times."""
+    # Local Min/Max
+    n = 10 # Window
+    df['Min'] = df['Low'].iloc[argrelextrema(df['Low'].values, np.less_equal, order=n)[0]]
+    df['Max'] = df['High'].iloc[argrelextrema(df['High'].values, np.greater_equal, order=n)[0]]
+    
+    levels = []
+    # Combine and cluster
+    raw_levels = df['Min'].dropna().tolist() + df['Max'].dropna().tolist()
+    raw_levels.sort()
+    
+    if not raw_levels: return []
 
-def analyze_historical_similarity(df, current_idx, lookback=60):
-    """
-    Finds past instances where Price Change %, Volatility, and RSI were 
-    similar to the current candle.
-    """
-    curr = df.iloc[current_idx]
-    history = df.iloc[:-1].copy() # Exclude current candle
-    
-    # Criteria: RSI within +/- 5, Volatility within +/- 10%, Z-Score within +/- 0.5
-    matches = history[
-        (history['RSI'].between(curr['RSI']-5, curr['RSI']+5)) & 
-        (history['Z_Score'].between(curr['Z_Score']-0.5, curr['Z_Score']+0.5))
-    ].copy()
-    
-    if matches.empty:
-        return None
-    
-    # Check what happened in the NEXT 5 candles after the match
-    outcomes = []
-    for idx in matches.index:
-        loc = df.index.get_loc(idx)
-        if loc + 5 < len(df):
-            future_price = df['Close'].iloc[loc+5]
-            past_price = df['Close'].iloc[loc]
-            pct_move = ((future_price - past_price) / past_price) * 100
-            outcomes.append({
-                'Date': idx,
-                'Ref_Price': past_price,
-                'RSI_Then': df['RSI'].iloc[loc],
-                'Next_5_Candles_Return': pct_move
-            })
+    current_cluster = [raw_levels[0]]
+    for i in range(1, len(raw_levels)):
+        if raw_levels[i] <= current_cluster[-1] * 1.005: # 0.5% tolerance
+            current_cluster.append(raw_levels[i])
+        else:
+            if len(current_cluster) >= 3: # Must be hit 3 times to be strong
+                levels.append(sum(current_cluster)/len(current_cluster))
+            current_cluster = [raw_levels[i]]
             
-    return pd.DataFrame(outcomes)
+    return levels
 
-def check_what_is_working(df):
-    """
-    Checks which technical levels are currently being respected.
-    """
-    price = df['Close'].iloc[-1]
-    report = []
-    
-    # Check EMAs
-    for ema in [9, 20, 50, 200]:
-        val = df[f'EMA_{ema}'].iloc[-1]
-        dist = abs(price - val) / price
-        if dist < 0.005: # Within 0.5%
-            status = "Holding Support" if price > val else "Facing Resistance"
-            report.append(f"Price is strictly obeying **{ema} EMA** ({status}).")
-            
-    # Check RSI
-    rsi = df['RSI'].iloc[-1]
-    if rsi > 60 and price > df['EMA_20'].iloc[-1]:
-        report.append("RSI Momentum is driving the trend (Bullish Zone).")
-    elif 40 < rsi < 60:
-        report.append("RSI is Neutral/Sideways (Indecision).")
-        
-    return report
+def get_fibonacci(df):
+    high = df['High'].max()
+    low = df['Low'].min()
+    diff = high - low
+    return {
+        '0.0': high, '0.236': high - 0.236*diff, '0.382': high - 0.382*diff,
+        '0.5': high - 0.5*diff, '0.618': high - 0.618*diff, '1.0': low
+    }
 
-def detect_rsi_divergence(df, window=14):
-    """
-    Detects simple divergences over the last 'window' periods.
-    """
-    recent = df.iloc[-window:]
+def detect_elliott_wave(df):
+    # Simplified Swing Counter
+    # If 3 Higher Highs recently -> Wave 3 or 5 (Impulsive)
+    # If Lower Highs -> Correction
+    peaks = df['High'].iloc[argrelextrema(df['High'].values, np.greater, order=5)[0]].tail(5)
+    if len(peaks) < 3: return "Consolidation/Undefined"
     
-    # Price Higher High but RSI Lower High (Bearish)
-    price_highs = argrelextrema(recent['High'].values, np.greater)[0]
-    rsi_highs = argrelextrema(recent['RSI'].values, np.greater)[0]
-    
-    divergence = "None"
-    
-    if len(price_highs) >= 2 and len(rsi_highs) >= 2:
-        p_h1, p_h2 = recent['High'].iloc[price_highs[-2]], recent['High'].iloc[price_highs[-1]]
-        r_h1, r_h2 = recent['RSI'].iloc[rsi_highs[-2]], recent['RSI'].iloc[rsi_highs[-1]]
-        
-        if p_h2 > p_h1 and r_h2 < r_h1:
-            divergence = "Bearish (Regular)"
-
-    # Price Lower Low but RSI Higher Low (Bullish)
-    price_lows = argrelextrema(recent['Low'].values, np.less)[0]
-    rsi_lows = argrelextrema(recent['RSI'].values, np.less)[0]
-    
-    if len(price_lows) >= 2 and len(rsi_lows) >= 2:
-        p_l1, p_l2 = recent['Low'].iloc[price_lows[-2]], recent['Low'].iloc[price_lows[-1]]
-        r_l1, r_l2 = recent['RSI'].iloc[rsi_lows[-2]], recent['RSI'].iloc[rsi_lows[-1]]
-        
-        if p_l2 < p_l1 and r_l2 > r_l1:
-            divergence = "Bullish (Regular)"
-            
-    return divergence
-
-def generate_recommendation(df):
-    """
-    Calculates a weighted Confidence Score (0-100%).
-    """
-    score = 50 # Start Neutral
-    reasons = []
-    
-    curr = df.iloc[-1]
-    
-    # 1. Trend (30%)
-    if curr['Close'] > curr['EMA_20'] > curr['EMA_50']:
-        score += 15
-        reasons.append("Strong Uptrend (Price > EMA20 > EMA50).")
-    elif curr['Close'] < curr['EMA_20'] < curr['EMA_50']:
-        score -= 15
-        reasons.append("Strong Downtrend (Price < EMA20 < EMA50).")
-        
-    # 2. Momentum (20%)
-    if 50 < curr['RSI'] < 70:
-        score += 10
-        reasons.append("RSI shows healthy bullish momentum.")
-    elif curr['RSI'] > 75:
-        score -= 10
-        reasons.append("RSI Overbought (Risk of pullback).")
-    elif curr['RSI'] < 25:
-        score += 10
-        reasons.append("RSI Oversold (Potential bounce).")
-        
-    # 3. Mean Reversion (Z-Score) (20%)
-    if curr['Z_Score'] < -2:
-        score += 15
-        reasons.append("Z-Score < -2 indicates statistical undervaluation.")
-    elif curr['Z_Score'] > 2:
-        score -= 15
-        reasons.append("Z-Score > 2 indicates statistical overextension.")
-        
-    # 4. Divergence (30%)
-    div = detect_rsi_divergence(df)
-    if "Bullish" in div:
-        score += 20
-        reasons.append(f"Critical {div} Divergence detected.")
-    elif "Bearish" in div:
-        score -= 20
-        reasons.append(f"Critical {div} Divergence detected.")
-        
-    # Cap Score
-    score = max(0, min(100, score))
-    
-    signal = "HOLD"
-    if score >= 65: signal = "BUY"
-    elif score <= 35: signal = "SELL"
-    
-    return signal, score, reasons
+    p = peaks.values
+    if p[-1] > p[-2] > p[-3]: return "Impulse (Wave 3 or 5)"
+    if p[-1] < p[-2] < p[-3]: return "Correction (Wave A or C)"
+    return "Complex Consolidation (Wave 4 or B)"
 
 # ==========================================
-# 4. UI COMPONENTS
+# 4. BACKTEST & OPTIMIZATION ENGINE
 # ==========================================
 
-def render_verdict_card(signal, score, reasons):
-    color_class = f"verdict-{signal.lower()}"
+def optimize_strategy(df):
+    """Finds the best EMA Crossover for this specific timeframe."""
+    best_roi = -100
+    best_pair = (0,0)
     
-    html = f"""
-    <div class="verdict-card {color_class}">
-        <div class="big-signal">{signal} RECOMMENDATION</div>
-        <div class="confidence-score">{score}%</div>
-        <div>CONFIDENCE</div>
-        <hr style="border-color: rgba(255,255,255,0.3);">
-        <div style="text-align: left; padding: 0 10px;">
-            <strong>Analysis Logic:</strong><br>
-            {'<br>'.join([f"• {r}" for r in reasons])}
-        </div>
-    </div>
-    """
-    st.markdown(html, unsafe_allow_html=True)
+    pairs = [(9,21), (20,50), (50,200), (10,30)]
+    
+    for fast, slow in pairs:
+        # Vectorized Backtest
+        data = df.copy()
+        data['Fast'] = data['Close'].ewm(span=fast).mean()
+        data['Slow'] = data['Close'].ewm(span=slow).mean()
+        data['Signal'] = np.where(data['Fast'] > data['Slow'], 1, -1)
+        data['Strat_Ret'] = data['Signal'].shift(1) * data['Log_Ret']
+        
+        cum_ret = data['Strat_Ret'].sum()
+        roi = (np.exp(cum_ret) - 1) * 100
+        
+        # Annualize approximation based on data length
+        days = (data.index[-1] - data.index[0]).days
+        if days > 0:
+            ann_roi = roi * (365/days)
+            if ann_roi > best_roi:
+                best_roi = ann_roi
+                best_pair = (fast, slow)
+                
+    return best_pair, best_roi
 
-def paper_trade_ui(ticker, current_price, signal):
-    st.subheader("🛠️ Live Paper Trading Simulator")
+# ==========================================
+# 5. CORE ANALYSIS LOOP
+# ==========================================
+
+def run_multi_timeframe_analysis(ticker1, ticker2):
+    # Timeframe Config: (Interval, Period)
+    config = [
+        ("15m", "1mo"), # Short Term
+        ("1h", "1y"),   # Medium Term
+        ("1d", "5y"),   # Long Term
+        ("1wk", "10y")  # Macro
+    ]
     
+    results = {}
+    progress_text = "Initializing Deep Scan..."
+    bar = st.progress(0, text=progress_text)
+    
+    for i, (tf, per) in enumerate(config):
+        bar.progress((i+1)/len(config), text=f"Analyzing {tf} Timeframe ({per} data)...")
+        
+        # 1. Fetch
+        df1 = fetch_data_safe(ticker1, per, tf)
+        if df1 is None: continue
+        
+        # 2. Indicators
+        df1 = calculate_indicators(df1)
+        
+        # 3. Ratio
+        ratio_stats = {}
+        if ticker2:
+            df2 = fetch_data_safe(ticker2, per, tf) # 2s delay inside
+            if df2 is not None:
+                # Align
+                c = df1['Close'].to_frame('T1').join(df2['Close'].to_frame('T2'), how='outer').ffill().dropna()
+                c['Ratio'] = c['T1']/c['T2']
+                c['Ratio_EMA'] = c['Ratio'].ewm(span=20).mean()
+                curr_r = c['Ratio'].iloc[-1]
+                avg_r = c['Ratio'].mean()
+                ratio_stats = {
+                    "current": curr_r,
+                    "mean": avg_r,
+                    "status": "Overvalued" if curr_r > avg_r * 1.05 else "Undervalued" if curr_r < avg_r * 0.95 else "Fair"
+                }
+
+        # 4. Structures
+        sr_levels = get_strong_sr_levels(df1)
+        fibs = get_fibonacci(df1)
+        wave = detect_elliott_wave(df1)
+        
+        # 5. Backtest
+        best_ma, roi = optimize_strategy(df1)
+        
+        # 6. Current Signal (Technical)
+        curr = df1.iloc[-1]
+        signal = "NEUTRAL"
+        score = 0
+        
+        # Trend
+        if curr['Close'] > curr['EMA_20']: score += 1
+        if curr['EMA_20'] > curr['EMA_50']: score += 1
+        if curr['Close'] > curr['EMA_200']: score += 1 # Long trend
+        
+        # Momentum
+        if 40 < curr['RSI'] < 70: score += 1
+        elif curr['RSI'] < 30: score += 2 (Oversold Bounce)
+        
+        # Structure
+        closest_sr = min(sr_levels, key=lambda x: abs(x - curr['Close'])) if sr_levels else 0
+        dist_sr = abs(curr['Close'] - closest_sr) / curr['Close'] if closest_sr else 1
+        if dist_sr < 0.01: score += 2 # At Support/Resistance
+        
+        if score >= 4: signal = "BUY"
+        elif score <= 1: signal = "SELL"
+        
+        # Store Result
+        results[tf] = {
+            "data": df1,
+            "signal": signal,
+            "score": score,
+            "price": curr['Close'],
+            "rsi": curr['RSI'],
+            "zscore": curr['Z_Score'],
+            "volatility": curr['Volatility'],
+            "fibs": fibs,
+            "sr": sr_levels,
+            "wave": wave,
+            "opt_params": best_ma,
+            "opt_roi": roi,
+            "ratio": ratio_stats
+        }
+        
+    bar.empty()
+    return results
+
+# ==========================================
+# 6. NARRATIVE GENERATOR
+# ==========================================
+
+def generate_final_verdict(results):
+    # Weighted Voting
+    weights = {"15m": 0.1, "1h": 0.3, "1d": 0.4, "1wk": 0.2}
+    total_score = 0
+    
+    sentiment_counts = {"BUY": 0, "SELL": 0, "NEUTRAL": 0}
+    
+    for tf, res in results.items():
+        if tf not in weights: continue
+        
+        s = res['signal']
+        sentiment_counts[s] += 1
+        
+        val = 1 if s == "BUY" else -1 if s == "SELL" else 0
+        total_score += val * weights[tf]
+        
+    final_signal = "HOLD"
+    if total_score > 0.3: final_signal = "BUY"
+    if total_score < -0.3: final_signal = "SELL"
+    
+    confidence = abs(total_score) * 100
+    confidence = min(confidence + 30, 98) # Normalize to sensible %
+    
+    return final_signal, int(confidence), sentiment_counts
+
+# ==========================================
+# 7. UI COMPONENTS
+# ==========================================
+
+def draw_trading_ui(current_price, ticker):
+    st.markdown("### 🛠️ Live Simulation")
+    
+    # State handling for buttons
     c1, c2, c3 = st.columns(3)
-    c1.metric("Available Balance", f"₹{st.session_state.balance:,.2f}")
+    c1.metric("Balance", f"₹{st.session_state.balance:,.2f}")
     
-    # Calculate P&L of open positions
-    open_pnl = 0
-    for pos in st.session_state.positions:
-        if pos['status'] == 'OPEN':
-            curr_val = (current_price - pos['entry_price']) * pos['qty']
-            if pos['type'] == 'SELL': curr_val = -curr_val
-            open_pnl += curr_val
-            
-    c2.metric("Unrealized P&L", f"₹{open_pnl:,.2f}", delta_color="normal")
+    qty = c3.number_input("Qty", value=10)
     
-    with c3:
-        qty = st.number_input("Quantity", min_value=1, value=10)
-        
-    b1, b2, b3 = st.columns(3)
+    col_b, col_s, col_c = st.columns(3)
     
-    if b1.button("🟢 MARKET BUY"):
+    if col_b.button("BUY MARKET", key="buy_btn", type="primary"):
         cost = current_price * qty
         if st.session_state.balance >= cost:
             st.session_state.balance -= cost
-            st.session_state.positions.append({
-                'ticker': ticker, 'type': 'BUY', 'entry_price': current_price, 
-                'qty': qty, 'status': 'OPEN', 'time': datetime.now()
-            })
-            st.success(f"Bought {qty} {ticker} @ {current_price}")
+            st.session_state.positions.append({"type": "BUY", "price": current_price, "qty": qty, "ticker": ticker, "ts": datetime.now()})
+            st.success("Order Executed")
             st.rerun()
-        else:
-            st.error("Insufficient Funds")
-
-    if b2.button("🔴 MARKET SELL"):
-        # Allow short selling (margin logic simplified)
-        st.session_state.positions.append({
-            'ticker': ticker, 'type': 'SELL', 'entry_price': current_price, 
-            'qty': qty, 'status': 'OPEN', 'time': datetime.now()
-        })
-        st.success(f"Short Sold {qty} {ticker} @ {current_price}")
-        st.rerun()
-        
-    if b3.button("⚠️ CLOSE ALL POSITIONS"):
-        for pos in st.session_state.positions:
-            if pos['status'] == 'OPEN':
-                pos['status'] = 'CLOSED'
-                pos['exit_price'] = current_price
-                pnl = (current_price - pos['entry_price']) * pos['qty']
-                if pos['type'] == 'SELL': pnl = -pnl
-                st.session_state.balance += (pos['entry_price'] * pos['qty']) if pos['type'] == 'BUY' else 0 # Return principal
-                st.session_state.balance += pnl
-        st.success("All positions closed.")
+            
+    if col_s.button("SELL MARKET", key="sell_btn", type="primary"):
+        st.session_state.positions.append({"type": "SELL", "price": current_price, "qty": qty, "ticker": ticker, "ts": datetime.now()})
+        st.success("Short Order Executed")
         st.rerun()
 
+    # Positions Table
     if st.session_state.positions:
-        st.write("### Active Positions")
-        active_df = pd.DataFrame([p for p in st.session_state.positions if p['status']=='OPEN'])
-        if not active_df.empty:
-            active_df['Current PnL'] = active_df.apply(lambda x: (current_price - x['entry_price']) * x['qty'] if x['type'] == 'BUY' else (x['entry_price'] - current_price) * x['qty'], axis=1)
-            st.dataframe(active_df)
+        p_df = pd.DataFrame(st.session_state.positions)
+        p_df['Current'] = current_price
+        p_df['PnL'] = np.where(p_df['type']=='BUY', (p_df['Current'] - p_df['price'])*p_df['qty'], (p_df['price'] - p_df['Current'])*p_df['qty'])
+        st.dataframe(p_df)
+        
+        if col_c.button("CLOSE ALL"):
+            total_pnl = p_df['PnL'].sum()
+            # Refund principal for buys
+            principal = p_df[p_df['type']=='BUY']['price'] * p_df[p_df['type']=='BUY']['qty']
+            st.session_state.balance += principal.sum() + total_pnl
+            st.session_state.positions = []
+            st.rerun()
 
 # ==========================================
-# 5. MAIN EXECUTION
+# 8. MAIN APP
 # ==========================================
 
 def main():
-    st.sidebar.title("🎛️ Market Scanner")
+    st.sidebar.header("Algo Config")
+    t1 = st.sidebar.selectbox("Asset", list(TICKER_MAP.keys()))
     
-    # 1. Inputs
-    t1_sel = st.sidebar.selectbox("Ticker 1 (Primary)", TICKER_PRESETS, index=0)
-    ticker1 = get_ticker_symbol(t1_sel)
+    # Auto-select Ratio Ticker
+    def_t2 = "USD/INR" if t1 in ["NIFTY 50", "BANK NIFTY", "SENSEX"] else "GOLD" if "BTC" in t1 else "NIFTY 50"
+    t2 = st.sidebar.selectbox("Ratio Compare", list(TICKER_MAP.keys()), index=list(TICKER_MAP.keys()).index(def_t2))
     
-    default_t2 = get_default_ratio_ticker(t1_sel)
-    t2_sel = st.sidebar.selectbox("Ticker 2 (Ratio/Comparison)", TICKER_PRESETS, index=TICKER_PRESETS.index(default_t2) if default_t2 in TICKER_PRESETS else 0)
-    ticker2 = get_ticker_symbol(t2_sel)
+    if st.sidebar.button("🚀 START DEEP SCAN"):
+        st.session_state.analysis_cache = run_multi_timeframe_analysis(t1, t2)
     
-    timeframe = st.sidebar.selectbox("Timeframe", ["1m", "5m", "15m", "30m", "1h", "1d", "1wk"], index=4)
-    
-    # Smart Period Selection
-    period_map = {"1m": "5d", "5m": "1mo", "15m": "1mo", "30m": "3mo", "1h": "1y", "1d": "5y", "1wk": "10y"}
-    period = period_map.get(timeframe, "1y")
+    # Check if analysis exists
+    if st.session_state.analysis_cache:
+        res = st.session_state.analysis_cache
+        
+        # 1. VERDICT CARD
+        final_sig, conf, counts = generate_final_verdict(res)
+        
+        st.title(f"Analysis Report: {t1}")
+        
+        vc1, vc2 = st.columns([1,2])
+        with vc1:
+            color = "#00ff00" if final_sig == "BUY" else "#ff0000" if final_sig == "SELL" else "#888"
+            st.markdown(f"""
+            <div style="background: {color}; padding: 20px; border-radius: 10px; text-align: center; color: black;">
+                <h1 style="margin:0">{final_sig}</h1>
+                <h3 style="margin:0">Confidence: {conf}%</h3>
+            </div>
+            """, unsafe_allow_html=True)
+            
+        with vc2:
+            st.info(f"""
+            **Consensus Logic:**
+            * **15m (Short Term):** {res['15m']['signal']} (RSI: {res['15m']['rsi']:.1f})
+            * **1h (Medium Term):** {res['1h']['signal']} (Wave: {res['1h']['wave']})
+            * **1d (Long Term):** {res['1d']['signal']} (Best Strat ROI: {res['1d']['opt_roi']:.1f}%)
+            """)
 
-    if st.sidebar.button("🔍 ANALYZE MARKET", type="primary"):
-        with st.spinner("Crunching Numbers & Finding Historical Matches..."):
+        # 2. DETAILED EXPLANATION (Natural Language)
+        latest_tf = res['1h'] # Use 1h for main commentary
+        curr_price = latest_tf['price']
+        
+        txt_col, chart_col = st.columns([1, 2])
+        
+        with txt_col:
+            st.subheader("📝 Technical Executive Summary")
             
-            # Fetch Data
-            df1 = fetch_data(ticker1, period, timeframe)
-            df2 = fetch_data(ticker2, period, timeframe)
+            # Construct Narrative
+            narrative = f"""
+            **1. Structural Analysis (Elliott & Fibs):**
+            The market is currently in a **{latest_tf['wave']}** phase on the hourly chart. 
+            Price ({curr_price:.2f}) is reacting to the Fibonacci level of **{min(latest_tf['fibs'].values(), key=lambda x:abs(x-curr_price)):.2f}**.
+            Strong Support clusters detected at: {', '.join([f'{x:.0f}' for x in latest_tf['sr'][:2]])}.
             
-            if df1 is None:
-                st.error("Data Fetch Failed. Try again in 5 seconds (API Rate Limit).")
-                return
+            **2. Statistical Probability (Z-Score):**
+            Current Z-Score is **{latest_tf['zscore']:.2f}**. 
+            {'This suggests extreme overvaluation; mean reversion (pullback) is statistically likely.' if latest_tf['zscore'] > 2 else 
+             'This suggests undervaluation; a bounce is statistically likely.' if latest_tf['zscore'] < -2 else 
+             'Price is within normal statistical deviation.'}
+            
+            **3. Ratio & Inter-market Analysis:**
+            {t1} vs {t2} Ratio is **{latest_tf['ratio'].get('status', 'N/A')}**. 
+            When this ratio deviates significantly, {t1} often corrects to align with macro trends.
+            
+            **4. Backtested Strategy Optimization:**
+            We tested Moving Average strategies on this data. The optimal setup found was **EMA {latest_tf['opt_params'][0]} / {latest_tf['opt_params'][1]}**, generating an annualized return of **{latest_tf['opt_roi']:.1f}%**.
+            """
+            st.markdown(narrative)
+            
+            draw_trading_ui(curr_price, t1)
 
-            # Process Data
-            df1 = calculate_technical_metrics(df1)
-            if df2 is not None:
-                df2 = calculate_technical_metrics(df2)
-                # Align for ratio
-                combined = df1['Close'].to_frame(name='T1').join(df2['Close'].to_frame(name='T2'), how='outer').ffill().dropna()
-                combined['Ratio'] = combined['T1'] / combined['T2']
-                # Calculate Changes
-                combined['T1_Chg'] = combined['T1'].pct_change() * 100
-                combined['Ratio_Chg'] = combined['Ratio'].pct_change() * 100
-            
-            # Generate Signals
-            signal, conf, reasons = generate_recommendation(df1)
-            current_price = df1['Close'].iloc[-1]
-            
-            # --- LAYOUT ---
-            
-            # 1. Verdict Section
-            col_l, col_r = st.columns([1, 3])
-            
-            with col_l:
-                render_verdict_card(signal, conf, reasons)
-                
-            with col_r:
-                # Top Stats Grid
-                m1, m2, m3, m4 = st.columns(4)
-                m1.metric(f"{t1_sel} Price", f"{current_price:,.2f}", f"{df1['Returns'].iloc[-1]*100:.2f}%")
-                m2.metric("RSI (14)", f"{df1['RSI'].iloc[-1]:.1f}", "Bullish" if df1['RSI'].iloc[-1]>50 else "Bearish")
-                m3.metric("Volatility", f"{df1['Volatility'].iloc[-1]:.2f}", "High" if df1['Volatility'].iloc[-1] > df1['Volatility'].mean() else "Low")
-                m4.metric("Divergence", detect_rsi_divergence(df1), delta_color="off")
-                
-                # What is working text
-                st.info(f"**Market Reality Check:** {' '.join(check_what_is_working(df1))}")
-
-            # 2. Main Tabs
-            tab_trade, tab_deep, tab_ratio, tab_data = st.tabs(["⚡ Paper Trading", "🧠 Deep Analysis", "⚖️ Ratio & Stats", "📅 Historical Data"])
-            
-            with tab_trade:
-                paper_trade_ui(t1_sel, current_price, signal)
-            
-            with tab_deep:
-                st.subheader("🔍 Historical Pattern Matching")
-                st.write(f"Finding past instances where **RSI ~{df1['RSI'].iloc[-1]:.0f}** and **Z-Score ~{df1['Z_Score'].iloc[-1]:.1f}**...")
-                
-                history_matches = analyze_historical_similarity(df1, -1)
-                if history_matches is not None and not history_matches.empty:
-                    avg_return = history_matches['Next_5_Candles_Return'].mean()
-                    win_rate = len(history_matches[history_matches['Next_5_Candles_Return'] > 0]) / len(history_matches) * 100
+        with chart_col:
+            # Multi-Tab Charts
+            tabs = st.tabs(res.keys())
+            for tf, data in res.items():
+                with tabs[list(res.keys()).index(tf)]:
+                    df = data['data']
+                    fig = make_subplots(rows=2, cols=1, shared_xaxes=True, row_heights=[0.7, 0.3])
                     
-                    st.write(f"Found **{len(history_matches)}** similar instances in history.")
-                    k1, k2 = st.columns(2)
-                    k1.metric("Avg Return (Next 5 Candles)", f"{avg_return:.2f}%", delta_color="normal")
-                    k2.metric("Historical Win Rate", f"{win_rate:.1f}%")
+                    # Candles
+                    fig.add_trace(go.Candlestick(x=df.index, open=df['Open'], high=df['High'], low=df['Low'], close=df['Close'], name="Price"), row=1, col=1)
                     
-                    st.dataframe(history_matches.style.format({'Ref_Price': '{:.2f}', 'Next_5_Candles_Return': '{:.2f}%'}))
-                else:
-                    st.warning("Market conditions are unique. No sufficient historical similarity found.")
+                    # Optimized EMAs
+                    f_ma, s_ma = data['opt_params']
+                    if f_ma > 0:
+                        fig.add_trace(go.Scatter(x=df.index, y=df['Close'].ewm(span=f_ma).mean(), line=dict(color='orange'), name=f"Opt EMA {f_ma}"), row=1, col=1)
+                        fig.add_trace(go.Scatter(x=df.index, y=df['Close'].ewm(span=s_ma).mean(), line=dict(color='blue'), name=f"Opt EMA {s_ma}"), row=1, col=1)
+                        
+                    # S/R Lines
+                    for sr in data['sr']:
+                        fig.add_hline(y=sr, line_dash="dash", line_color="green", row=1, col=1)
+                        
+                    # Fibs
+                    for k, v in data['fibs'].items():
+                        if abs(v - curr_price) / curr_price < 0.05: # Only show nearby fibs
+                            fig.add_hline(y=v, line_dash="dot", line_color="gray", annotation_text=f"Fib {k}", row=1, col=1)
 
-                st.subheader("📉 Technical Charts")
-                fig = make_subplots(rows=2, cols=1, shared_xaxes=True, row_heights=[0.7, 0.3])
-                fig.add_trace(go.Candlestick(x=df1.index, open=df1['Open'], high=df1['High'], low=df1['Low'], close=df1['Close'], name="Price"), row=1, col=1)
-                fig.add_trace(go.Scatter(x=df1.index, y=df1['EMA_20'], line=dict(color='orange'), name="EMA 20"), row=1, col=1)
-                fig.add_trace(go.Scatter(x=df1.index, y=df1['EMA_50'], line=dict(color='blue'), name="EMA 50"), row=1, col=1)
-                fig.add_trace(go.Scatter(x=df1.index, y=df1['RSI'], line=dict(color='purple'), name="RSI"), row=2, col=1)
-                fig.add_hline(y=70, line_dash="dot", row=2, col=1)
-                fig.add_hline(y=30, line_dash="dot", row=2, col=1)
-                fig.update_layout(height=600, template="plotly_dark", margin=dict(l=0,r=0,t=0,b=0))
-                st.plotly_chart(fig, use_container_width=True)
-
-            with tab_ratio:
-                if df2 is not None:
-                    st.subheader(f"Ratio Dynamics: {t1_sel} vs {t2_sel}")
-                    st.write("This table shows exactly when Ratio/Volatility spikes occurred and their values.")
+                    # Z-Score
+                    fig.add_trace(go.Scatter(x=df.index, y=df['Z_Score'], line=dict(color='purple'), name="Z-Score"), row=2, col=1)
+                    fig.add_hline(y=2, line_color="red", row=2, col=1)
+                    fig.add_hline(y=-2, line_color="green", row=2, col=1)
                     
-                    # Custom Data Table for Ratio/Vol Analysis
-                    analysis_table = combined.tail(50).copy()
-                    analysis_table = analysis_table.sort_index(ascending=False)
-                    
-                    # Highlight significant moves
-                    def highlight_significant(val):
-                        if abs(val) > 1.0: return 'background-color: rgba(255, 0, 0, 0.2)'
-                        return ''
-                    
-                    st.dataframe(analysis_table[['T1', 'T2', 'Ratio', 'T1_Chg', 'Ratio_Chg']].style.applymap(highlight_significant, subset=['T1_Chg', 'Ratio_Chg']))
-                else:
-                    st.warning("Ticker 2 Data not available.")
-
-            with tab_data:
-                st.dataframe(df1.sort_index(ascending=False))
+                    fig.update_layout(height=600, template="plotly_dark", title=f"{t1} - {tf} Timeframe Analysis")
+                    st.plotly_chart(fig, use_container_width=True)
 
 if __name__ == "__main__":
     main()
