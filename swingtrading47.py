@@ -806,6 +806,32 @@ def detailed_backtest(data, strategy_type, params):
     
     return pd.DataFrame(trades) if trades else None
 
+def format_time_ago(time_diff):
+    """Format timedelta into human-readable string"""
+    total_seconds = int(time_diff.total_seconds())
+    
+    if total_seconds < 0:
+        return "Just now"
+    
+    minutes = total_seconds // 60
+    hours = minutes // 60
+    days = hours // 24
+    months = days // 30
+    
+    if months > 0:
+        remaining_days = days % 30
+        if remaining_days > 0:
+            return f"{months} month(s) {remaining_days} day(s) ago"
+        return f"{months} month(s) ago"
+    elif days > 0:
+        return f"{days} day(s) ago"
+    elif hours > 0:
+        return f"{hours} hour(s) ago"
+    elif minutes > 0:
+        return f"{minutes} minute(s) ago"
+    else:
+        return f"{total_seconds} second(s) ago"
+
 def create_indicator_tables(data, ticker_name):
     """Create comprehensive indicator tables with datetime, price, and changes"""
     
@@ -924,11 +950,20 @@ def create_indicator_tables(data, ticker_name):
     # RSI Divergence Table
     divergence = detect_rsi_divergence(close, rsi)
     if divergence:
-        div_df = pd.DataFrame(divergence)
-        div_df['DateTime'] = pd.to_datetime(div_df['date']).dt.strftime('%Y-%m-%d %H:%M:%S IST')
-        div_df['RSI_Change'] = div_df['rsi_new'] - div_df['rsi_old']
-        div_df = div_df[['DateTime', 'type', 'price', 'rsi_old', 'rsi_new', 'RSI_Change', 'time_ago']]
-        div_df.columns = ['DateTime', 'Divergence_Type', 'Price', 'RSI_Old', 'RSI_New', 'RSI_Change', 'Time_Ago']
+        div_data = []
+        for div in divergence:
+            div_data.append({
+                'DateTime': div['date'].strftime('%Y-%m-%d %H:%M:%S IST'),
+                'Divergence_Type': '🟢 Bullish' if div['type'] == 'bullish' else '🔴 Bearish',
+                'Price_Level': div['price'],
+                'RSI_Old': div['rsi_old'],
+                'RSI_New': div['rsi_new'],
+                'RSI_Change': div['rsi_new'] - div['rsi_old'],
+                'Time_Ago': div['time_ago'],
+                'Status': 'Active' if data.index[-1] - div['date'] < pd.Timedelta(days=5) else 'Resolved',
+                'Expected_Move': 'Upward Reversal Expected' if div['type'] == 'bullish' else 'Downward Reversal Expected'
+            })
+        div_df = pd.DataFrame(div_data)
     else:
         div_df = pd.DataFrame()
     
@@ -946,14 +981,27 @@ def create_indicator_tables(data, ticker_name):
 def create_ratio_table(data1, data2, ticker1, ticker2):
     """Create comprehensive ratio analysis table"""
     
-    # Align data
+    # Align data - find overlapping timestamps
     common_index = data1.index.intersection(data2.index)
     
     if len(common_index) == 0:
-        return pd.DataFrame()
-    
-    data1_aligned = data1.loc[common_index]
-    data2_aligned = data2.loc[common_index]
+        # Try to resample to find common ground
+        # Resample both to daily and try again
+        try:
+            data1_daily = data1.resample('1D').last().dropna()
+            data2_daily = data2.resample('1D').last().dropna()
+            common_index = data1_daily.index.intersection(data2_daily.index)
+            
+            if len(common_index) == 0:
+                return pd.DataFrame()
+            
+            data1_aligned = data1_daily.loc[common_index]
+            data2_aligned = data2_daily.loc[common_index]
+        except:
+            return pd.DataFrame()
+    else:
+        data1_aligned = data1.loc[common_index]
+        data2_aligned = data2.loc[common_index]
     
     # Calculate ratio and indicators
     ratio = data1_aligned['Close'] / data2_aligned['Close']
@@ -1333,19 +1381,21 @@ def generate_comprehensive_summary(all_timeframe_data, ticker_name, backtest_res
         if nearby_levels:
             for level in nearby_levels[:3]:
                 time_ago = datetime.now(IST) - level['date']
-                distance = ((level['level'] - current_p) / current_p) * 100
+                time_ago_str = format_time_ago(time_ago)
+                distance_pct = ((level['level'] - current_p) / current_p) * 100
+                distance_points = level['level'] - current_p
                 
                 summary_parts.append(
-                    f"**{level['type'].upper()} @ ₹{level['level']:.2f}** "
-                    f"({distance:+.2f}% away) | {level['touches']} touches | "
-                    f"Sustained {level['sustained']} periods | "
-                    f"Formed {str(time_ago).split('.')[0]} ago"
+                    f"**{level['type'].upper()} @ ₹{level['level']:.2f}** | "
+                    f"Distance: {distance_pct:+.2f}% ({distance_points:+.2f} points) | "
+                    f"{level['touches']} touches | Sustained {level['sustained']} periods | "
+                    f"Formed on {level['date'].strftime('%Y-%m-%d %H:%M IST')} ({time_ago_str})"
                 )
                 
-                if level['type'] == 'support' and distance < -1:
-                    summary_parts.append(f"  → Price near strong support: **HIGH PROBABILITY BOUNCE ZONE**")
-                elif level['type'] == 'resistance' and distance > 1:
-                    summary_parts.append(f"  → Price near strong resistance: **POTENTIAL REJECTION ZONE**")
+                if level['type'] == 'support' and distance_pct > -1:
+                    summary_parts.append(f"  → **HIGH PROBABILITY BOUNCE ZONE** - Price testing strong support")
+                elif level['type'] == 'resistance' and distance_pct < 1:
+                    summary_parts.append(f"  → **POTENTIAL REJECTION ZONE** - Price approaching strong resistance")
     
     # Fibonacci Analysis
     summary_parts.append("\n## 📐 FIBONACCI RETRACEMENT LEVELS")
@@ -2257,12 +2307,56 @@ if st.session_state.data_fetched and st.session_state.all_timeframe_data:
         )
     
     with tab2:
-        st.write("### Z-Score Distribution & Mean Reversion Analysis")
+        st.write("### 📊 Z-Score Distribution & Mean Reversion Analysis")
         st.dataframe(tables['zscore'].tail(50), use_container_width=True)
+        
+        # Key insights for Z-Score
+        st.write("#### 🎯 Historical Z-Score Pattern Analysis:")
+        
+        zscore_data = tables['zscore']
+        
+        # Find extreme Z-score events and their outcomes
+        extreme_events = zscore_data[abs(zscore_data['Z-Score']) > 2].tail(10)
+        
+        if not extreme_events.empty:
+            for _, event in extreme_events.iterrows():
+                z_val = event['Z-Score']
+                price = event['Price']
+                pct_change = event['Price_Change_%']
+                
+                # Find what happened after this event
+                event_idx = zscore_data[zscore_data['DateTime'] == event['DateTime']].index[0]
+                if event_idx < len(zscore_data) - 10:
+                    future_changes = zscore_data.iloc[event_idx+1:event_idx+11]['Price_Change_%'].sum()
+                    
+                    if abs(z_val) > 2:
+                        time_diff = pd.Timestamp.now(tz=IST) - pd.to_datetime(event['DateTime'])
+                        time_ago_str = format_time_ago(time_diff)
+                        
+                        if z_val < -2:
+                            st.success(f"""
+                            **Extreme Oversold Event (Z={z_val:.2f})**
+                            - **Date**: {event['DateTime']} ({time_ago_str})
+                            - **Price**: ₹{price:.2f}
+                            - **Signal**: {event['Mean_Reversion_Signal']}
+                            - **Next 10 periods move**: {future_changes:+.2f}%
+                            - **Pattern**: When Z-score drops below -2, price typically rebounds as it's too far from mean
+                            """)
+                        elif z_val > 2:
+                            st.warning(f"""
+                            **Extreme Overbought Event (Z={z_val:.2f})**
+                            - **Date**: {event['DateTime']} ({time_ago_str})
+                            - **Price**: ₹{price:.2f}
+                            - **Signal**: {event['Mean_Reversion_Signal']}
+                            - **Next 10 periods move**: {future_changes:+.2f}%
+                            - **Pattern**: When Z-score exceeds +2, price typically pulls back to mean
+                            """)
         
         # Z-Score distribution chart
         fig = go.Figure()
         fig.add_trace(go.Histogram(x=tables['zscore']['Z-Score'], nbinsx=20, name='Z-Score Distribution'))
+        fig.add_vline(x=-2, line_dash="dash", line_color="green", annotation_text="Oversold")
+        fig.add_vline(x=2, line_dash="dash", line_color="red", annotation_text="Overbought")
         fig.update_layout(title="Z-Score Distribution", xaxis_title="Z-Score", yaxis_title="Frequency")
         st.plotly_chart(fig, use_container_width=True)
         
@@ -2275,17 +2369,51 @@ if st.session_state.data_fetched and st.session_state.all_timeframe_data:
         )
     
     with tab3:
-        st.write("### Volatility Bins & Market Conditions")
+        st.write("### 💹 Volatility Bins & Market Conditions")
         st.dataframe(tables['volatility'].tail(50), use_container_width=True)
         
-        # Volatility distribution
+        # Key insights for volatility
+        st.write("#### 🎯 Volatility Pattern Analysis:")
+        
+        vol_data = tables['volatility']
+        
+        # Find high volatility events and subsequent moves
+        high_vol_events = vol_data[vol_data['Volatility_%'] > 30].tail(10)
+        
+        if not high_vol_events.empty:
+            for _, event in high_vol_events.iterrows():
+                vol = event['Volatility_%']
+                price = event['Price']
+                
+                event_idx = vol_data[vol_data['DateTime'] == event['DateTime']].index[0]
+                if event_idx < len(vol_data) - 10:
+                    future_changes = vol_data.iloc[event_idx+1:event_idx+11]['Price_Change_%']
+                    avg_move = future_changes.abs().mean()
+                    direction_move = future_changes.sum()
+                    
+                    time_diff = pd.Timestamp.now(tz=IST) - pd.to_datetime(event['DateTime'])
+                    time_ago_str = format_time_ago(time_diff)
+                    
+                    st.warning(f"""
+                    **High Volatility Event ({event['Volatility_Bin']})**
+                    - **Date**: {event['DateTime']} ({time_ago_str})
+                    - **Price**: ₹{price:.2f}
+                    - **Volatility**: {vol:.1f}%
+                    - **Subsequent Average Move**: {avg_move:.2f}% per period
+                    - **Net Direction (next 10 periods)**: {direction_move:+.2f}%
+                    - **Insight**: High volatility = High risk/reward - Price movements amplified
+                    """)
+        
+        # Volatility over time
         fig = go.Figure()
         fig.add_trace(go.Scatter(
-            x=tables['volatility']['DateTime'],
-            y=tables['volatility']['Volatility_%'],
+            x=vol_data['DateTime'],
+            y=vol_data['Volatility_%'],
             mode='lines',
-            name='Volatility'
+            name='Volatility',
+            line=dict(color='orange')
         ))
+        fig.add_hline(y=30, line_dash="dash", line_color="red", annotation_text="High Volatility")
         fig.update_layout(title="Volatility Over Time", xaxis_title="Date", yaxis_title="Volatility %")
         st.plotly_chart(fig, use_container_width=True)
         
@@ -2352,9 +2480,34 @@ if st.session_state.data_fetched and st.session_state.all_timeframe_data:
             st.info("No clear Elliott Wave pattern detected in current data")
     
     with tab8:
-        st.write("### RSI Divergence Detection")
+        st.write("### ⚡ RSI Divergence Detection & Analysis")
         if not tables['divergence'].empty:
             st.dataframe(tables['divergence'], use_container_width=True)
+            
+            # Key insights for divergences
+            st.write("#### 🎯 Key Insights:")
+            
+            for _, div in tables['divergence'].iterrows():
+                if div['Divergence_Type'] == '🟢 Bullish':
+                    st.success(f"""
+                    **Bullish Divergence Detected** ({div['Status']})
+                    - **When**: {div['DateTime']} ({div['Time_Ago']})
+                    - **Price Level**: ₹{div['Price_Level']:.2f}
+                    - **RSI Movement**: {div['RSI_Old']:.1f} → {div['RSI_New']:.1f} (Higher low in RSI)
+                    - **Price Action**: Made lower low while RSI made higher low
+                    - **Implication**: {div['Expected_Move']}
+                    - **What it means**: Price was falling but momentum was actually strengthening - typically leads to upward reversal
+                    """)
+                else:
+                    st.error(f"""
+                    **Bearish Divergence Detected** ({div['Status']})
+                    - **When**: {div['DateTime']} ({div['Time_Ago']})
+                    - **Price Level**: ₹{div['Price_Level']:.2f}
+                    - **RSI Movement**: {div['RSI_Old']:.1f} → {div['RSI_New']:.1f} (Lower high in RSI)
+                    - **Price Action**: Made higher high while RSI made lower high
+                    - **Implication**: {div['Expected_Move']}
+                    - **What it means**: Price was rising but momentum was weakening - typically leads to downward reversal
+                    """)
             
             csv = tables['divergence'].to_csv(index=False)
             st.download_button(
@@ -2364,7 +2517,7 @@ if st.session_state.data_fetched and st.session_state.all_timeframe_data:
                 mime="text/csv"
             )
         else:
-            st.info("No RSI divergence detected in recent periods")
+            st.info("✅ No RSI divergence detected in recent periods - Price and momentum moving in sync")
     
     # Backtest Strategy Details
     if backtest_result and backtest_result[0]:
@@ -2457,6 +2610,236 @@ Calculation Method:
             st.warning("No trades executed in backtest period")
     
     # Ratio Analysis
+    if enable_ratio and st.session_state.all_timeframe_data_t2:
+        st.subheader("🔄 Comprehensive Ratio Analysis - All Timeframes")
+        
+        # Try all common timeframes
+        all_ratio_data = {}
+        
+        for tf_key in st.session_state.all_timeframe_data.keys():
+            if tf_key in st.session_state.all_timeframe_data_t2:
+                data1 = st.session_state.all_timeframe_data[tf_key]
+                data2 = st.session_state.all_timeframe_data_t2[tf_key]
+                
+                ratio_table = create_ratio_table(data1, data2, ticker1, ticker2)
+                
+                if not ratio_table.empty:
+                    all_ratio_data[tf_key] = {
+                        'table': ratio_table,
+                        'data1': data1,
+                        'data2': data2
+                    }
+        
+        if all_ratio_data:
+            st.success(f"✅ Found {len(all_ratio_data)} common timeframes for ratio analysis")
+            
+            # Select timeframe for detailed analysis
+            selected_tf = st.selectbox(
+                "Select Timeframe for Detailed Ratio Analysis",
+                list(all_ratio_data.keys()),
+                format_func=lambda x: f"{x.split('_')[0].upper()} - {x.split('_')[1].upper()} ({len(all_ratio_data[x]['table'])} data points)"
+            )
+            
+            if selected_tf:
+                ratio_table = all_ratio_data[selected_tf]['table']
+                data1 = all_ratio_data[selected_tf]['data1']
+                data2 = all_ratio_data[selected_tf]['data2']
+                
+                st.write(f"### 📊 Ratio Analysis: {ticker1} / {ticker2} ({selected_tf})")
+                
+                # Display summary metrics
+                col1, col2, col3, col4 = st.columns(4)
+                
+                current_ratio = ratio_table['Ratio'].iloc[-1]
+                ratio_change = ratio_table['Ratio_Change_%'].iloc[-1]
+                ratio_rsi = ratio_table['Ratio_RSI'].iloc[-1]
+                ratio_zscore = ratio_table['Ratio_Z-Score'].iloc[-1]
+                
+                col1.metric("Current Ratio", f"{current_ratio:.4f}")
+                col2.metric("Ratio Change", f"{ratio_change:+.2f}%")
+                col3.metric("Ratio RSI", f"{ratio_rsi:.1f}")
+                col4.metric("Ratio Z-Score", f"{ratio_zscore:.2f}")
+                
+                # Display full table
+                st.dataframe(ratio_table.tail(50), use_container_width=True)
+                
+                # Export functionality
+                col1, col2 = st.columns(2)
+                with col1:
+                    csv = ratio_table.to_csv(index=False)
+                    st.download_button(
+                        label="📥 Download Ratio Analysis CSV",
+                        data=csv,
+                        file_name=f"ratio_{ticker1}_{ticker2}_{selected_tf}_{datetime.now(IST).strftime('%Y%m%d')}.csv",
+                        mime="text/csv"
+                    )
+                
+                with col2:
+                    from io import BytesIO
+                    output = BytesIO()
+                    with pd.ExcelWriter(output, engine='openpyxl') as writer:
+                        ratio_table.to_excel(writer, index=False, sheet_name='Ratio Analysis')
+                    excel_data = output.getvalue()
+                    
+                    st.download_button(
+                        label="📥 Download Ratio Analysis Excel",
+                        data=excel_data,
+                        file_name=f"ratio_{ticker1}_{ticker2}_{selected_tf}_{datetime.now(IST).strftime('%Y%m%d')}.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                    )
+                
+                # Ratio visualization
+                st.write("### 📈 Ratio Visualization")
+                
+                fig = make_subplots(
+                    rows=4, cols=1,
+                    shared_xaxes=True,
+                    vertical_spacing=0.05,
+                    subplot_titles=(
+                        f'{ticker1} vs {ticker2} Price Comparison',
+                        'Ratio Value Over Time',
+                        'Ratio RSI',
+                        'Ratio Z-Score'
+                    ),
+                    row_heights=[0.3, 0.3, 0.2, 0.2]
+                )
+                
+                # Convert DateTime to datetime for plotting
+                plot_dates = pd.to_datetime(ratio_table['DateTime'])
+                
+                # Price comparison with dual y-axes
+                fig.add_trace(
+                    go.Scatter(
+                        x=plot_dates, 
+                        y=ratio_table[f'{ticker1}_Price'], 
+                        name=f'{ticker1} Price', 
+                        line=dict(color='blue', width=2)
+                    ),
+                    row=1, col=1
+                )
+                fig.add_trace(
+                    go.Scatter(
+                        x=plot_dates, 
+                        y=ratio_table[f'{ticker2}_Price'], 
+                        name=f'{ticker2} Price', 
+                        line=dict(color='red', width=2),
+                        yaxis='y2'
+                    ),
+                    row=1, col=1
+                )
+                
+                # Ratio
+                fig.add_trace(
+                    go.Scatter(
+                        x=plot_dates, 
+                        y=ratio_table['Ratio'], 
+                        name='Ratio', 
+                        line=dict(color='purple', width=2),
+                        fill='tozeroy'
+                    ),
+                    row=2, col=1
+                )
+                
+                # Add mean line
+                mean_ratio = ratio_table['Ratio'].mean()
+                fig.add_hline(y=mean_ratio, line_dash="dash", line_color="gray", 
+                            annotation_text=f"Mean: {mean_ratio:.4f}", row=2, col=1)
+                
+                # Ratio RSI
+                fig.add_trace(
+                    go.Scatter(
+                        x=plot_dates, 
+                        y=ratio_table['Ratio_RSI'], 
+                        name='Ratio RSI', 
+                        line=dict(color='orange', width=2)
+                    ),
+                    row=3, col=1
+                )
+                fig.add_hline(y=70, line_dash="dash", line_color="red", row=3, col=1)
+                fig.add_hline(y=30, line_dash="dash", line_color="green", row=3, col=1)
+                fig.add_hline(y=50, line_dash="dash", line_color="gray", row=3, col=1)
+                
+                # Ratio Z-Score
+                fig.add_trace(
+                    go.Scatter(
+                        x=plot_dates, 
+                        y=ratio_table['Ratio_Z-Score'], 
+                        name='Ratio Z-Score', 
+                        line=dict(color='teal', width=2),
+                        fill='tozeroy'
+                    ),
+                    row=4, col=1
+                )
+                fig.add_hline(y=2, line_dash="dash", line_color="red", annotation_text="Overbought", row=4, col=1)
+                fig.add_hline(y=-2, line_dash="dash", line_color="green", annotation_text="Oversold", row=4, col=1)
+                fig.add_hline(y=0, line_dash="solid", line_color="gray", row=4, col=1)
+                
+                fig.update_layout(height=1000, showlegend=True, hovermode='x unified')
+                fig.update_xaxes(title_text="Date", row=4, col=1)
+                
+                st.plotly_chart(fig, use_container_width=True)
+                
+                # Ratio analysis insights
+                st.write("### 🎯 Ratio Trading Insights")
+                
+                mean_ratio = ratio_table['Ratio'].mean()
+                std_ratio = ratio_table['Ratio'].std()
+                
+                if current_ratio > mean_ratio + 2*std_ratio:
+                    distance_pct = ((current_ratio - mean_ratio) / mean_ratio) * 100
+                    st.warning(f"""
+                    ⚠️ **{ticker1} is OVERVALUED relative to {ticker2}**
+                    
+                    - **Current Ratio**: {current_ratio:.4f}
+                    - **Historical Mean**: {mean_ratio:.4f}
+                    - **Distance from Mean**: {distance_pct:+.2f}%
+                    - **Z-Score**: {ratio_zscore:.2f} (Extreme)
+                    
+                    **Trading Strategy:**
+                    - Consider **SELLING** the ratio (Short {ticker1}, Long {ticker2})
+                    - Expected mean reversion could provide {distance_pct:.1f}% profit
+                    - Place stop loss at Z-Score > 3.0
+                    """)
+                elif current_ratio < mean_ratio - 2*std_ratio:
+                    distance_pct = ((mean_ratio - current_ratio) / mean_ratio) * 100
+                    st.success(f"""
+                    ✅ **{ticker1} is UNDERVALUED relative to {ticker2}**
+                    
+                    - **Current Ratio**: {current_ratio:.4f}
+                    - **Historical Mean**: {mean_ratio:.4f}
+                    - **Distance from Mean**: {distance_pct:+.2f}%
+                    - **Z-Score**: {ratio_zscore:.2f} (Extreme)
+                    
+                    **Trading Strategy:**
+                    - Consider **BUYING** the ratio (Long {ticker1}, Short {ticker2})
+                    - Expected mean reversion could provide {distance_pct:.1f}% profit
+                    - Place stop loss at Z-Score < -3.0
+                    """)
+                else:
+                    st.info(f"""
+                    ℹ️ **Ratio trading near historical equilibrium**
+                    
+                    - **Current Ratio**: {current_ratio:.4f}
+                    - **Historical Mean**: {mean_ratio:.4f}
+                    - **Z-Score**: {ratio_zscore:.2f} (Normal range)
+                    
+                    **Recommendation**: Wait for ratio to reach extreme levels (|Z-Score| > 2) before initiating pair trade
+                    """)
+        else:
+            st.warning(f"""
+            ⚠️ **No overlapping data between {ticker1} and {ticker2}**
+            
+            **Possible reasons:**
+            - Different market hours (e.g., {ticker1} vs {ticker2} may trade at different times)
+            - {ticker2} may be available 24/7 while {ticker1} has fixed hours
+            - Data availability mismatch
+            
+            **Attempted {len(st.session_state.all_timeframe_data)} timeframes, found 0 matches**
+            
+            Try selecting assets that trade in similar time zones or have overlapping market hours.
+            """)
+    
+    # Detailed timeframe breakdown
     
     if enable_ratio and st.session_state.all_timeframe_data_t2:
         st.subheader("🔄 Ratio Analysis")
@@ -2567,63 +2950,135 @@ Calculation Method:
             st.warning(f"No common timeframes found between {ticker1} and {ticker2}. They may operate on different schedules.")
     
     # Detailed timeframe breakdown
-    st.subheader("🔍 Multi-Timeframe Detailed Analysis")
+    st.subheader("🔍 Multi-Timeframe Detailed Analysis - All Available Periods")
     
-    for tf_key in list(st.session_state.all_timeframe_data.keys())[:5]:  # Show top 5 timeframes
-        data = st.session_state.all_timeframe_data[tf_key]
+    # Group by interval
+    timeframe_groups = {}
+    for tf_key in st.session_state.all_timeframe_data.keys():
         interval, period = tf_key.split('_')
-        
-        with st.expander(f"📊 {interval.upper()} Interval | {period.upper()} Period ({len(data)} candles)"):
+        if interval not in timeframe_groups:
+            timeframe_groups[interval] = []
+        timeframe_groups[interval].append(tf_key)
+    
+    for interval, tf_keys in timeframe_groups.items():
+        with st.expander(f"📊 {interval.upper()} Interval Analysis ({len(tf_keys)} periods available)"):
             
-            col1, col2, col3, col4 = st.columns(4)
-            
-            close = data['Close']
-            rsi = calculate_rsi(close)
-            zscore = calculate_zscore(close)
-            volatility = calculate_volatility(close.pct_change())
-            
-            current_price = float(close.iloc[-1])
-            current_rsi = float(rsi.iloc[-1])
-            current_zscore = float(zscore.iloc[-1])
-            current_vol = float(volatility.iloc[-1]) if not pd.isna(volatility.iloc[-1]) else 0
-            
-            col1.metric("Price", f"₹{current_price:.2f}")
-            col2.metric("RSI", f"{current_rsi:.1f}")
-            col3.metric("Z-Score", f"{current_zscore:.2f}")
-            col4.metric("Volatility", f"{current_vol:.1f}%")
-            
-            # Support/Resistance
-            sr_levels = find_support_resistance(data)
-            if sr_levels:
-                st.write("**Key Levels:**")
-                for level in sr_levels[:3]:
-                    st.write(
-                        f"• {level['type'].title()}: ₹{level['level']:.2f} "
-                        f"({level['touches']} touches, sustained {level['sustained']} periods) "
-                        f"- {level['date'].strftime('%Y-%m-%d %H:%M IST')}"
-                    )
-            
-            # Elliott Wave
-            elliott = detect_elliott_wave_detailed(data)
-            if elliott:
-                st.write(f"**Elliott Wave:** {elliott['current_wave']}")
+            for tf_key in tf_keys:
+                data = st.session_state.all_timeframe_data[tf_key]
+                _, period = tf_key.split('_')
                 
-                wave_df = pd.DataFrame(elliott['waves'])
-                wave_df['date'] = pd.to_datetime(wave_df['date']).dt.strftime('%Y-%m-%d %H:%M IST')
-                st.dataframe(wave_df, use_container_width=True)
-            
-            # Fibonacci
-            fib = calculate_fibonacci_levels(data)
-            st.write("**Fibonacci Levels:**")
-            fib_data = []
-            for level_name, level_data in fib.items():
-                distance = ((level_data['price'] - current_price) / current_price) * 100
-                fib_data.append({
-                    'Level': level_name,
-                    'Price': f"₹{level_data['price']:.2f}",
-                    'Distance': f"{distance:+.2f}%"
-                })
-            st.dataframe(pd.DataFrame(fib_data), use_container_width=True)
+                st.write(f"#### Period: {period.upper()} ({len(data)} candles)")
+                
+                col1, col2, col3, col4 = st.columns(4)
+                
+                close = data['Close']
+                rsi = calculate_rsi(close)
+                zscore = calculate_zscore(close)
+                volatility = calculate_volatility(close.pct_change())
+                
+                current_price = float(close.iloc[-1])
+                current_rsi = float(rsi.iloc[-1])
+                current_zscore = float(zscore.iloc[-1])
+                current_vol = float(volatility.iloc[-1]) if not pd.isna(volatility.iloc[-1]) else 0
+                
+                col1.metric("Price", f"₹{current_price:.2f}")
+                col2.metric("RSI", f"{current_rsi:.1f}")
+                col3.metric("Z-Score", f"{current_zscore:.2f}")
+                col4.metric("Volatility", f"{current_vol:.1f}%")
+                
+                # Create tabs for each analysis type
+                sub_tab1, sub_tab2, sub_tab3, sub_tab4 = st.tabs([
+                    "🎚️ S/R Levels", "📐 Fibonacci", "🌊 Elliott Wave", "⚡ Divergence"
+                ])
+                
+                with sub_tab1:
+                    # Support/Resistance
+                    sr_levels = find_support_resistance(data)
+                    if sr_levels:
+                        st.write("**Key Support & Resistance Levels:**")
+                        for level in sr_levels[:5]:
+                            time_ago = datetime.now(IST) - level['date']
+                            time_ago_str = format_time_ago(time_ago)
+                            distance_pct = ((level['level'] - current_price) / current_price) * 100
+                            distance_points = level['level'] - current_price
+                            
+                            level_type_emoji = "🟢" if level['type'] == 'support' else "🔴"
+                            st.write(
+                                f"{level_type_emoji} **{level['type'].upper()}** @ ₹{level['level']:.2f} | "
+                                f"Distance: {distance_pct:+.2f}% ({distance_points:+.2f} pts) | "
+                                f"{level['touches']} touches, {level['sustained']} sustained | "
+                                f"Formed: {level['date'].strftime('%Y-%m-%d %H:%M IST')} ({time_ago_str})"
+                            )
+                    else:
+                        st.info("No significant S/R levels detected")
+                
+                with sub_tab2:
+                    # Fibonacci
+                    fib = calculate_fibonacci_levels(data)
+                    st.write("**Fibonacci Retracement Levels:**")
+                    fib_data = []
+                    for level_name, level_data in fib.items():
+                        distance_pct = ((level_data['price'] - current_price) / current_price) * 100
+                        distance_points = level_data['price'] - current_price
+                        date_str = level_data['date'].strftime('%Y-%m-%d %H:%M IST') if level_data['date'] else 'Calculated'
+                        
+                        fib_data.append({
+                            'Level': level_name,
+                            'Price': f"₹{level_data['price']:.2f}",
+                            'Distance_%': f"{distance_pct:+.2f}%",
+                            'Distance_Points': f"{distance_points:+.2f}",
+                            'Date': date_str
+                        })
+                    st.dataframe(pd.DataFrame(fib_data), use_container_width=True)
+                
+                with sub_tab3:
+                    # Elliott Wave
+                    elliott = detect_elliott_wave_detailed(data)
+                    if elliott:
+                        st.write(f"**Current Phase:** {elliott['current_wave']}")
+                        
+                        wave_data = []
+                        for wave in elliott['waves']:
+                            wave_data.append({
+                                'Phase': wave['phase'],
+                                'Type': wave['wave_type'],
+                                'Point': wave['point_type'],
+                                'Price': f"₹{wave['price']:.2f}",
+                                'High': f"₹{wave['high']:.2f}",
+                                'Low': f"₹{wave['low']:.2f}",
+                                'Change': f"{wave['change_pct']:+.2f}%",
+                                'Duration': wave['duration'],
+                                'Date': wave['date'].strftime('%Y-%m-%d %H:%M IST')
+                            })
+                        st.dataframe(pd.DataFrame(wave_data), use_container_width=True)
+                    else:
+                        st.info("No clear Elliott Wave pattern detected")
+                
+                with sub_tab4:
+                    # Divergence
+                    divergence = detect_rsi_divergence(close, rsi)
+                    if divergence:
+                        for div in divergence:
+                            if div['type'] == 'bullish':
+                                st.success(f"""
+                                **🟢 Bullish Divergence**
+                                - **Date**: {div['date'].strftime('%Y-%m-%d %H:%M IST')} ({div['time_ago']})
+                                - **Price**: ₹{div['price']:.2f}
+                                - **RSI**: {div['rsi_old']:.1f} → {div['rsi_new']:.1f} (Higher Low)
+                                - **Expected**: Upward reversal
+                                """)
+                            else:
+                                st.error(f"""
+                                **🔴 Bearish Divergence**
+                                - **Date**: {div['date'].strftime('%Y-%m-%d %H:%M IST')} ({div['time_ago']})
+                                - **Price**: ₹{div['price']:.2f}
+                                - **RSI**: {div['rsi_old']:.1f} → {div['rsi_new']:.1f} (Lower High)
+                                - **Expected**: Downward reversal
+                                """)
+                    else:
+                        st.info("✅ No divergence - Price and momentum aligned")
+                
+                st.markdown("---")
     
     # Price chart with indicators
     st.subheader("📈 Technical Analysis Chart")
