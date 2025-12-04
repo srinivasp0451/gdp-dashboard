@@ -222,7 +222,7 @@ def run_multi_timeframe_analysis(ticker1, ticker2):
         
         # Momentum
         if 40 < curr['RSI'] < 70: score += 1
-        elif curr['RSI'] < 30: score += 2 (Oversold Bounce)
+        elif curr['RSI'] < 30: score += 2 #(Oversold Bounce)
         
         # Structure
         closest_sr = min(sr_levels, key=lambda x: abs(x - curr['Close'])) if sr_levels else 0
