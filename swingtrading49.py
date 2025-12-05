@@ -7,7 +7,6 @@ import pytz
 import time
 from scipy import stats
 from scipy.signal import argrelextrema
-import ta
 from typing import Dict, List, Tuple, Optional
 import warnings
 warnings.filterwarnings('ignore')
@@ -66,12 +65,129 @@ TIMEFRAME_PERIODS = {
     '15m': ['1d', '5d', '1mo'],
     '30m': ['1d', '5d', '1mo'],
     '1h': ['1d', '5d', '1mo', '3mo', '6mo', '1y'],
-    '1d': ['1mo', '3mo', '6mo', '1y', '2y', '5y', '10y', '20y'],
-    '1wk': ['1y', '2y', '5y', '10y', '20y'],
-    '1mo': ['1y', '2y', '5y', '10y', '20y', '25y', '30y']
+    '1d': ['1mo', '3mo', '6mo', '1y', '2y', '5y', '10y'],
+    '1wk': ['1y', '2y', '5y', '10y'],
+    '1mo': ['1y', '2y', '5y', '10y', '20y']
 }
 
 IST = pytz.timezone('Asia/Kolkata')
+
+class TechnicalIndicators:
+    """Manual calculation of all technical indicators"""
+    
+    @staticmethod
+    def calculate_sma(data: pd.Series, period: int) -> pd.Series:
+        """Simple Moving Average"""
+        return data.rolling(window=period).mean()
+    
+    @staticmethod
+    def calculate_ema(data: pd.Series, period: int) -> pd.Series:
+        """Exponential Moving Average"""
+        return data.ewm(span=period, adjust=False).mean()
+    
+    @staticmethod
+    def calculate_rsi(data: pd.Series, period: int = 14) -> pd.Series:
+        """Relative Strength Index"""
+        delta = data.diff()
+        gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
+        rs = gain / loss
+        rsi = 100 - (100 / (1 + rs))
+        return rsi
+    
+    @staticmethod
+    def calculate_macd(data: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9) -> Dict:
+        """MACD Indicator"""
+        ema_fast = TechnicalIndicators.calculate_ema(data, fast)
+        ema_slow = TechnicalIndicators.calculate_ema(data, slow)
+        macd_line = ema_fast - ema_slow
+        signal_line = TechnicalIndicators.calculate_ema(macd_line, signal)
+        histogram = macd_line - signal_line
+        
+        return {
+            'macd': macd_line,
+            'signal': signal_line,
+            'histogram': histogram
+        }
+    
+    @staticmethod
+    def calculate_bollinger_bands(data: pd.Series, period: int = 20, std_dev: int = 2) -> Dict:
+        """Bollinger Bands"""
+        sma = TechnicalIndicators.calculate_sma(data, period)
+        std = data.rolling(window=period).std()
+        
+        return {
+            'upper': sma + (std * std_dev),
+            'middle': sma,
+            'lower': sma - (std * std_dev)
+        }
+    
+    @staticmethod
+    def calculate_atr(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14) -> pd.Series:
+        """Average True Range"""
+        tr1 = high - low
+        tr2 = abs(high - close.shift())
+        tr3 = abs(low - close.shift())
+        tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+        atr = tr.rolling(window=period).mean()
+        return atr
+    
+    @staticmethod
+    def calculate_adx(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14) -> pd.Series:
+        """Average Directional Index"""
+        # Calculate +DM and -DM
+        up_move = high.diff()
+        down_move = -low.diff()
+        
+        plus_dm = pd.Series(0.0, index=high.index)
+        minus_dm = pd.Series(0.0, index=high.index)
+        
+        plus_dm[(up_move > down_move) & (up_move > 0)] = up_move
+        minus_dm[(down_move > up_move) & (down_move > 0)] = down_move
+        
+        # Calculate ATR
+        atr = TechnicalIndicators.calculate_atr(high, low, close, period)
+        
+        # Calculate smoothed +DI and -DI
+        plus_di = 100 * (plus_dm.rolling(window=period).mean() / atr)
+        minus_di = 100 * (minus_dm.rolling(window=period).mean() / atr)
+        
+        # Calculate DX and ADX
+        dx = 100 * abs(plus_di - minus_di) / (plus_di + minus_di)
+        adx = dx.rolling(window=period).mean()
+        
+        return adx
+    
+    @staticmethod
+    def calculate_stochastic(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14, smooth_k: int = 3) -> Dict:
+        """Stochastic Oscillator"""
+        lowest_low = low.rolling(window=period).min()
+        highest_high = high.rolling(window=period).max()
+        
+        k_percent = 100 * ((close - lowest_low) / (highest_high - lowest_low))
+        k_smooth = k_percent.rolling(window=smooth_k).mean()
+        d_percent = k_smooth.rolling(window=3).mean()
+        
+        return {
+            'k': k_smooth,
+            'd': d_percent
+        }
+    
+    @staticmethod
+    def calculate_obv(close: pd.Series, volume: pd.Series) -> pd.Series:
+        """On Balance Volume"""
+        obv = pd.Series(0.0, index=close.index)
+        obv.iloc[0] = volume.iloc[0]
+        
+        for i in range(1, len(close)):
+            if close.iloc[i] > close.iloc[i-1]:
+                obv.iloc[i] = obv.iloc[i-1] + volume.iloc[i]
+            elif close.iloc[i] < close.iloc[i-1]:
+                obv.iloc[i] = obv.iloc[i-1] - volume.iloc[i]
+            else:
+                obv.iloc[i] = obv.iloc[i-1]
+        
+        return obv
 
 class TradingAnalyzer:
     """Comprehensive trading analysis engine"""
@@ -124,45 +240,47 @@ class TradingAnalyzer:
         
         # Moving Averages
         for period in [9, 20, 50, 100, 200]:
-            df[f'EMA_{period}'] = ta.trend.ema_indicator(df['Close'], window=period)
-            df[f'SMA_{period}'] = ta.trend.sma_indicator(df['Close'], window=period)
+            df[f'EMA_{period}'] = TechnicalIndicators.calculate_ema(df['Close'], period)
+            df[f'SMA_{period}'] = TechnicalIndicators.calculate_sma(df['Close'], period)
         
         # RSI
-        df['RSI'] = ta.momentum.rsi(df['Close'], window=14)
+        df['RSI'] = TechnicalIndicators.calculate_rsi(df['Close'], 14)
         df['RSI_Oversold'] = df['RSI'] < 30
         df['RSI_Overbought'] = df['RSI'] > 70
         
         # MACD
-        macd = ta.trend.MACD(df['Close'])
-        df['MACD'] = macd.macd()
-        df['MACD_Signal'] = macd.macd_signal()
-        df['MACD_Diff'] = macd.macd_diff()
+        macd_data = TechnicalIndicators.calculate_macd(df['Close'])
+        df['MACD'] = macd_data['macd']
+        df['MACD_Signal'] = macd_data['signal']
+        df['MACD_Histogram'] = macd_data['histogram']
         
         # Bollinger Bands
-        bollinger = ta.volatility.BollingerBands(df['Close'])
-        df['BB_High'] = bollinger.bollinger_hband()
-        df['BB_Low'] = bollinger.bollinger_lband()
-        df['BB_Mid'] = bollinger.bollinger_mavg()
+        bb_data = TechnicalIndicators.calculate_bollinger_bands(df['Close'])
+        df['BB_Upper'] = bb_data['upper']
+        df['BB_Middle'] = bb_data['middle']
+        df['BB_Lower'] = bb_data['lower']
         
         # ATR & Volatility
-        df['ATR'] = ta.volatility.average_true_range(df['High'], df['Low'], df['Close'])
+        df['ATR'] = TechnicalIndicators.calculate_atr(df['High'], df['Low'], df['Close'])
         df['Volatility'] = df['Returns'].rolling(window=20).std() * np.sqrt(252) * 100
         
         # ADX
-        df['ADX'] = ta.trend.adx(df['High'], df['Low'], df['Close'], window=14)
+        df['ADX'] = TechnicalIndicators.calculate_adx(df['High'], df['Low'], df['Close'])
         
         # Stochastic
-        stoch = ta.momentum.StochasticOscillator(df['High'], df['Low'], df['Close'])
-        df['Stoch_K'] = stoch.stoch()
-        df['Stoch_D'] = stoch.stoch_signal()
+        stoch_data = TechnicalIndicators.calculate_stochastic(df['High'], df['Low'], df['Close'])
+        df['Stoch_K'] = stoch_data['k']
+        df['Stoch_D'] = stoch_data['d']
         
         # Volume indicators
-        if 'Volume' in df.columns:
+        if 'Volume' in df.columns and df['Volume'].sum() > 0:
             df['Volume_MA'] = df['Volume'].rolling(window=20).mean()
-            df['OBV'] = ta.volume.on_balance_volume(df['Close'], df['Volume'])
+            df['OBV'] = TechnicalIndicators.calculate_obv(df['Close'], df['Volume'])
         
         # Z-Score of returns
-        df['Returns_ZScore'] = stats.zscore(df['Returns'].dropna())
+        returns_clean = df['Returns'].replace([np.inf, -np.inf], np.nan).dropna()
+        if len(returns_clean) > 1:
+            df['Returns_ZScore'] = stats.zscore(returns_clean, nan_policy='omit')
         
         return df
     
@@ -174,11 +292,11 @@ class TradingAnalyzer:
         df = df.copy()
         
         # Find local minima and maxima
-        df['min'] = df.iloc[argrelextrema(df['Close'].values, np.less_equal, order=window)[0]]['Close']
-        df['max'] = df.iloc[argrelextrema(df['Close'].values, np.greater_equal, order=window)[0]]['Close']
+        local_min_idx = argrelextrema(df['Close'].values, np.less_equal, order=window)[0]
+        local_max_idx = argrelextrema(df['Close'].values, np.greater_equal, order=window)[0]
         
-        support_levels = df['min'].dropna().values
-        resistance_levels = df['max'].dropna().values
+        support_levels = df['Close'].iloc[local_min_idx].values
+        resistance_levels = df['Close'].iloc[local_max_idx].values
         
         # Cluster nearby levels (within 0.5%)
         def cluster_levels(levels, tolerance=0.005):
@@ -322,16 +440,17 @@ class TradingAnalyzer:
         reasons = []
         
         current_price = df['Close'].iloc[-1]
-        current_rsi = df['RSI'].iloc[-1]
-        current_adx = df['ADX'].iloc[-1] if 'ADX' in df.columns else 0
+        current_rsi = df['RSI'].iloc[-1] if not pd.isna(df['RSI'].iloc[-1]) else 50
+        current_adx = df['ADX'].iloc[-1] if 'ADX' in df.columns and not pd.isna(df['ADX'].iloc[-1]) else 0
         
         # Trend signals
-        if current_price > df['EMA_20'].iloc[-1] > df['EMA_50'].iloc[-1]:
-            signals.append(1)
-            reasons.append("✓ Price above EMA20 and EMA50 (Uptrend)")
-        elif current_price < df['EMA_20'].iloc[-1] < df['EMA_50'].iloc[-1]:
-            signals.append(-1)
-            reasons.append("✗ Price below EMA20 and EMA50 (Downtrend)")
+        if not pd.isna(df['EMA_20'].iloc[-1]) and not pd.isna(df['EMA_50'].iloc[-1]):
+            if current_price > df['EMA_20'].iloc[-1] > df['EMA_50'].iloc[-1]:
+                signals.append(1)
+                reasons.append("✓ Price above EMA20 and EMA50 (Uptrend)")
+            elif current_price < df['EMA_20'].iloc[-1] < df['EMA_50'].iloc[-1]:
+                signals.append(-1)
+                reasons.append("✗ Price below EMA20 and EMA50 (Downtrend)")
         
         # RSI signals
         if current_rsi < 30:
@@ -343,13 +462,13 @@ class TradingAnalyzer:
         
         # ADX signals
         if current_adx > 25:
-            trend_strength = "Strong"
-            if df['EMA_20'].iloc[-1] > df['EMA_50'].iloc[-1]:
-                signals.append(1)
-                reasons.append(f"✓ Strong uptrend (ADX: {current_adx:.1f})")
-            else:
-                signals.append(-1)
-                reasons.append(f"✗ Strong downtrend (ADX: {current_adx:.1f})")
+            if not pd.isna(df['EMA_20'].iloc[-1]) and not pd.isna(df['EMA_50'].iloc[-1]):
+                if df['EMA_20'].iloc[-1] > df['EMA_50'].iloc[-1]:
+                    signals.append(1)
+                    reasons.append(f"✓ Strong uptrend (ADX: {current_adx:.1f})")
+                else:
+                    signals.append(-1)
+                    reasons.append(f"✗ Strong downtrend (ADX: {current_adx:.1f})")
         
         # Support/Resistance signals
         if sr_levels.get('analysis'):
@@ -369,13 +488,14 @@ class TradingAnalyzer:
                 reasons.append(f"✓ Near Fibonacci {fib_key} level (bounce expected)")
         
         # MACD signals
-        if 'MACD' in df.columns:
-            if df['MACD'].iloc[-1] > df['MACD_Signal'].iloc[-1] and df['MACD'].iloc[-2] <= df['MACD_Signal'].iloc[-2]:
-                signals.append(1)
-                reasons.append("✓ MACD bullish crossover")
-            elif df['MACD'].iloc[-1] < df['MACD_Signal'].iloc[-1] and df['MACD'].iloc[-2] >= df['MACD_Signal'].iloc[-2]:
-                signals.append(-1)
-                reasons.append("✗ MACD bearish crossover")
+        if 'MACD' in df.columns and len(df) >= 2:
+            if not pd.isna(df['MACD'].iloc[-1]) and not pd.isna(df['MACD_Signal'].iloc[-1]):
+                if df['MACD'].iloc[-1] > df['MACD_Signal'].iloc[-1] and df['MACD'].iloc[-2] <= df['MACD_Signal'].iloc[-2]:
+                    signals.append(1)
+                    reasons.append("✓ MACD bullish crossover")
+                elif df['MACD'].iloc[-1] < df['MACD_Signal'].iloc[-1] and df['MACD'].iloc[-2] >= df['MACD_Signal'].iloc[-2]:
+                    signals.append(-1)
+                    reasons.append("✗ MACD bearish crossover")
         
         # Calculate final signal
         if len(signals) == 0:
@@ -590,14 +710,21 @@ def main():
                 price_change = ((latest_data['Close'].iloc[-1] - latest_data['Close'].iloc[-2]) / latest_data['Close'].iloc[-2]) * 100
                 
                 col1.metric("Current Price", f"₹{current_price:.2f}", f"{price_change:+.2f}%")
-                col2.metric("RSI", f"{latest_data['RSI'].iloc[-1]:.1f}", 
-                           "Oversold" if latest_data['RSI'].iloc[-1] < 30 else ("Overbought" if latest_data['RSI'].iloc[-1] > 70 else "Neutral"))
-                col3.metric("Volatility", f"{latest_data['Volatility'].iloc[-1]:.2f}%")
-                col4.metric("ADX", f"{latest_data['ADX'].iloc[-1]:.1f}")
+                
+                current_rsi = latest_data['RSI'].iloc[-1]
+                rsi_status = "Oversold" if current_rsi < 30 else ("Overbought" if current_rsi > 70 else "Neutral")
+                col2.metric("RSI", f"{current_rsi:.1f}", rsi_status)
+                
+                current_vol = latest_data['Volatility'].iloc[-1]
+                col3.metric("Volatility", f"{current_vol:.2f}%")
+                
+                current_adx = latest_data['ADX'].iloc[-1]
+                col4.metric("ADX", f"{current_adx:.1f}")
                 
                 if 'Returns_ZScore' in latest_data.columns:
                     zscore = latest_data['Returns_ZScore'].iloc[-1]
-                    col5.metric("Z-Score", f"{zscore:.2f}")
+                    if not pd.isna(zscore):
+                        col5.metric("Z-Score", f"{zscore:.2f}")
             
             # Support/Resistance analysis
             st.markdown("---")
@@ -837,18 +964,7 @@ def main():
             
             if summary_data:
                 summary_df = pd.DataFrame(summary_data)
-                
-                # Color coding function
-                def color_signal(val):
-                    if val == 'BUY':
-                        return 'background-color: #00ff0030'
-                    elif val == 'SELL':
-                        return 'background-color: #ff000030'
-                    else:
-                        return 'background-color: #ffa50030'
-                
-                styled_df = summary_df.style.applymap(color_signal, subset=['Signal'])
-                st.dataframe(styled_df, use_container_width=True)
+                st.dataframe(summary_df, use_container_width=True, height=400)
         
         # Ratio Analysis Section (if enabled)
         if enable_ratio and ticker2:
@@ -880,8 +996,12 @@ def main():
                 
                 # Calculate ratio RSI
                 ratio_df['Ratio_Returns'] = ratio_df['Ratio'].pct_change()
-                ratio_df['Ratio_RSI'] = ta.momentum.rsi(pd.Series(ratio_df['Ratio'].values), window=14)
-                ratio_df['Ratio_ZScore'] = stats.zscore(ratio_df['Ratio'].dropna())
+                ratio_df['Ratio_RSI'] = TechnicalIndicators.calculate_rsi(pd.Series(ratio_df['Ratio'].values), 14)
+                
+                # Calculate Z-score
+                ratio_clean = ratio_df['Ratio'].replace([np.inf, -np.inf], np.nan).dropna()
+                if len(ratio_clean) > 1:
+                    ratio_df['Ratio_ZScore'] = stats.zscore(ratio_clean, nan_policy='omit')
                 
                 st.markdown(f"### {st.session_state.ticker1_name} / {st.session_state.ticker2_name} Ratio Analysis")
                 
@@ -892,14 +1012,24 @@ def main():
                 
                 col1.metric("Current Ratio", f"{current_ratio:.4f}", f"{ratio_change:+.2f}%")
                 col2.metric("Ratio RSI", f"{ratio_df['Ratio_RSI'].iloc[-1]:.1f}")
-                col3.metric("Ratio Z-Score", f"{ratio_df['Ratio_ZScore'].iloc[-1]:.2f}")
-                col4.metric("Spread Volatility", f"{ratio_df['Ratio_Returns'].std() * 100:.2f}%")
+                
+                if 'Ratio_ZScore' in ratio_df.columns:
+                    zscore_val = ratio_df['Ratio_ZScore'].iloc[-1]
+                    if not pd.isna(zscore_val):
+                        col3.metric("Ratio Z-Score", f"{zscore_val:.2f}")
+                
+                spread_vol = ratio_df['Ratio_Returns'].std() * 100
+                col4.metric("Spread Volatility", f"{spread_vol:.2f}%")
                 
                 # Display ratio dataframe
                 st.markdown("#### Detailed Ratio Data (Last 20 rows)")
-                display_df = ratio_df[['DateTime', 'Ticker1_Price', 'Ticker2_Price', 'Ratio', 
-                                       'Ticker1_RSI', 'Ticker2_RSI', 'Ratio_RSI', 
-                                       'Ticker1_Volatility', 'Ticker2_Volatility', 'Ratio_ZScore']].tail(20)
+                display_cols = ['DateTime', 'Ticker1_Price', 'Ticker2_Price', 'Ratio', 
+                               'Ticker1_RSI', 'Ticker2_RSI', 'Ratio_RSI', 
+                               'Ticker1_Volatility', 'Ticker2_Volatility']
+                if 'Ratio_ZScore' in ratio_df.columns:
+                    display_cols.append('Ratio_ZScore')
+                
+                display_df = ratio_df[display_cols].tail(20)
                 st.dataframe(display_df, use_container_width=True)
                 
                 # Export functionality
@@ -918,64 +1048,75 @@ def main():
         if st.button("Run Backtest", type="secondary"):
             with st.spinner("Running backtest..."):
                 # Get daily data for backtesting
-                daily_key = [k for k in results.keys() if k.startswith('1d_1y')][0]
-                df = results[daily_key]['ticker1']['data'].copy()
-                
-                # Simple strategy: Buy when RSI < 30 and price > EMA20, Sell when RSI > 70
-                df['Signal'] = 0
-                df.loc[(df['RSI'] < 30) & (df['Close'] > df['EMA_20']), 'Signal'] = 1
-                df.loc[(df['RSI'] > 70), 'Signal'] = -1
-                
-                # Calculate returns
-                df['Position'] = df['Signal'].shift(1)
-                df['Strategy_Returns'] = df['Returns'] * df['Position']
-                df['Cumulative_Strategy_Returns'] = (1 + df['Strategy_Returns']).cumprod()
-                df['Cumulative_Market_Returns'] = (1 + df['Returns']).cumprod()
-                
-                # Calculate metrics
-                total_return = (df['Cumulative_Strategy_Returns'].iloc[-1] - 1) * 100
-                market_return = (df['Cumulative_Market_Returns'].iloc[-1] - 1) * 100
-                sharpe_ratio = (df['Strategy_Returns'].mean() / df['Strategy_Returns'].std()) * np.sqrt(252)
-                
-                max_drawdown = ((df['Cumulative_Strategy_Returns'].cummax() - df['Cumulative_Strategy_Returns']) / df['Cumulative_Strategy_Returns'].cummax()).max() * 100
-                
-                # Display results
-                st.markdown("### Backtest Results (1 Year)")
-                
-                col1, col2, col3, col4 = st.columns(4)
-                col1.metric("Strategy Return", f"{total_return:.2f}%")
-                col2.metric("Buy & Hold Return", f"{market_return:.2f}%")
-                col3.metric("Sharpe Ratio", f"{sharpe_ratio:.2f}")
-                col4.metric("Max Drawdown", f"-{max_drawdown:.2f}%")
-                
-                # Performance comparison
-                performance_df = pd.DataFrame({
-                    'Date': df.index,
-                    'Strategy Value': df['Cumulative_Strategy_Returns'].values * 100000,
-                    'Market Value': df['Cumulative_Market_Returns'].values * 100000
-                })
-                
-                st.line_chart(performance_df.set_index('Date'))
-                
-                # Trade statistics
-                trades = df[df['Signal'] != 0].copy()
-                num_trades = len(trades)
-                winning_trades = len(trades[trades['Strategy_Returns'] > 0])
-                win_rate = (winning_trades / num_trades * 100) if num_trades > 0 else 0
-                
-                st.markdown(f"""
-                **Trade Statistics:**
-                - Total Trades: {num_trades}
-                - Winning Trades: {winning_trades}
-                - Win Rate: {win_rate:.1f}%
-                - Average Return per Trade: {df['Strategy_Returns'][df['Strategy_Returns'] != 0].mean() * 100:.2f}%
-                """)
-                
-                if total_return < 0:
-                    st.warning("⚠️ Strategy showing negative returns. Consider optimization or different parameters.")
-                    st.info("💡 Tip: Try adjusting RSI thresholds, adding stop-loss levels, or combining with other indicators.")
+                daily_keys = [k for k in results.keys() if k.startswith('1d_') and ('1y' in k or '2y' in k)]
+                if daily_keys:
+                    daily_key = daily_keys[0]
+                    df = results[daily_key]['ticker1']['data'].copy()
+                    
+                    # Simple strategy: Buy when RSI < 30 and price > EMA20, Sell when RSI > 70
+                    df['Signal'] = 0
+                    df.loc[(df['RSI'] < 30) & (df['Close'] > df['EMA_20']), 'Signal'] = 1
+                    df.loc[(df['RSI'] > 70), 'Signal'] = -1
+                    
+                    # Calculate returns
+                    df['Position'] = df['Signal'].shift(1)
+                    df['Strategy_Returns'] = df['Returns'] * df['Position']
+                    df['Cumulative_Strategy_Returns'] = (1 + df['Strategy_Returns']).cumprod()
+                    df['Cumulative_Market_Returns'] = (1 + df['Returns']).cumprod()
+                    
+                    # Calculate metrics
+                    total_return = (df['Cumulative_Strategy_Returns'].iloc[-1] - 1) * 100
+                    market_return = (df['Cumulative_Market_Returns'].iloc[-1] - 1) * 100
+                    
+                    strategy_std = df['Strategy_Returns'].std()
+                    if strategy_std > 0:
+                        sharpe_ratio = (df['Strategy_Returns'].mean() / strategy_std) * np.sqrt(252)
+                    else:
+                        sharpe_ratio = 0
+                    
+                    max_drawdown = ((df['Cumulative_Strategy_Returns'].cummax() - df['Cumulative_Strategy_Returns']) / df['Cumulative_Strategy_Returns'].cummax()).max() * 100
+                    
+                    # Display results
+                    st.markdown("### Backtest Results")
+                    
+                    col1, col2, col3, col4 = st.columns(4)
+                    col1.metric("Strategy Return", f"{total_return:.2f}%")
+                    col2.metric("Buy & Hold Return", f"{market_return:.2f}%")
+                    col3.metric("Sharpe Ratio", f"{sharpe_ratio:.2f}")
+                    col4.metric("Max Drawdown", f"-{max_drawdown:.2f}%")
+                    
+                    # Performance comparison chart
+                    performance_df = pd.DataFrame({
+                        'Date': df.index,
+                        'Strategy': df['Cumulative_Strategy_Returns'].values * 100000,
+                        'Market': df['Cumulative_Market_Returns'].values * 100000
+                    }).set_index('Date')
+                    
+                    st.line_chart(performance_df)
+                    
+                    # Trade statistics
+                    trades = df[df['Signal'] != 0].copy()
+                    num_trades = len(trades)
+                    winning_trades = len(trades[trades['Strategy_Returns'] > 0])
+                    win_rate = (winning_trades / num_trades * 100) if num_trades > 0 else 0
+                    
+                    avg_return = df['Strategy_Returns'][df['Strategy_Returns'] != 0].mean() * 100
+                    
+                    st.markdown(f"""
+                    **Trade Statistics:**
+                    - Total Trades: {num_trades}
+                    - Winning Trades: {winning_trades}
+                    - Win Rate: {win_rate:.1f}%
+                    - Average Return per Trade: {avg_return:.2f}%
+                    """)
+                    
+                    if total_return < 0:
+                        st.warning("⚠️ Strategy showing negative returns. Consider optimization or different parameters.")
+                        st.info("💡 Tip: Try adjusting RSI thresholds, adding stop-loss levels, or combining with other indicators.")
+                    else:
+                        st.success(f"✅ Strategy generated positive returns of {total_return:.2f}% over the backtest period!")
                 else:
-                    st.success(f"✅ Strategy generated positive returns of {total_return:.2f}% over the backtest period!")
+                    st.error("No suitable data available for backtesting. Please ensure daily data is loaded.")
 
     else:
         st.info("👆 Configure your analysis parameters in the sidebar and click 'Start Complete Analysis' to begin.")
@@ -984,7 +1125,7 @@ def main():
         ### 🎯 Features:
         
         - **Multi-Timeframe Analysis**: Analyzes all available timeframes from 1-minute to monthly
-        - **Comprehensive Indicators**: RSI, MACD, ADX, Bollinger Bands, EMA/SMA, Fibonacci, and more
+        - **Comprehensive Indicators**: RSI, MACD, ADX, Bollinger Bands, EMA/SMA, Fibonacci, Stochastic, ATR
         - **Support/Resistance Detection**: Identifies strong price levels with historical validation
         - **Divergence Detection**: Spots RSI and MACD divergences for reversal signals
         - **AI-Powered Signals**: Generates BUY/SELL/HOLD recommendations with confidence levels
