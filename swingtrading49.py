@@ -19,18 +19,17 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# Custom CSS for better UI
+# Custom CSS
 st.markdown("""
 <style>
     .main-header {font-size: 2.5rem; font-weight: bold; color: #1f77b4; text-align: center; margin-bottom: 2rem;}
-    .metric-positive {color: #00ff00; font-weight: bold; font-size: 1.2rem;}
-    .metric-negative {color: #ff0000; font-weight: bold; font-size: 1.2rem;}
-    .metric-neutral {color: #ffa500; font-weight: bold; font-size: 1.2rem;}
     .signal-buy {background-color: #00ff0020; padding: 1rem; border-radius: 10px; border-left: 5px solid #00ff00;}
     .signal-sell {background-color: #ff000020; padding: 1rem; border-radius: 10px; border-left: 5px solid #ff0000;}
     .signal-hold {background-color: #ffa50020; padding: 1rem; border-radius: 10px; border-left: 5px solid #ffa500;}
-    .live-guidance {background-color: #e3f2fd; padding: 1.5rem; border-radius: 10px; border: 2px solid #2196f3; margin: 1rem 0;}
-    .stProgress > div > div > div > div {background-color: #1f77b4;}
+    .live-guidance {background-color: #e8f5e9; padding: 2rem; border-radius: 15px; border: 3px solid #4caf50; margin: 1rem 0;}
+    .warning-box {background-color: #fff3e0; padding: 1.5rem; border-radius: 10px; border-left: 5px solid #ff9800;}
+    .success-box {background-color: #e8f5e9; padding: 1.5rem; border-radius: 10px; border-left: 5px solid #4caf50;}
+    .danger-box {background-color: #ffebee; padding: 1.5rem; border-radius: 10px; border-left: 5px solid #f44336;}
 </style>
 """, unsafe_allow_html=True)
 
@@ -42,7 +41,7 @@ if 'analysis_results' not in st.session_state:
 if 'paper_trades' not in st.session_state:
     st.session_state.paper_trades = []
 if 'paper_capital' not in st.session_state:
-    st.session_state.paper_capital = 100000
+    st.session_state.paper_capital = 100000.0
 if 'live_monitoring' not in st.session_state:
     st.session_state.live_monitoring = False
 
@@ -60,7 +59,6 @@ TICKER_MAP = {
     'GBP/USD': 'GBPUSD=X',
 }
 
-# Timeframe configurations
 TIMEFRAME_PERIODS = {
     '1m': ['1d', '5d'],
     '5m': ['1d', '5d', '1mo'],
@@ -79,17 +77,14 @@ class TechnicalIndicators:
     
     @staticmethod
     def calculate_sma(data: pd.Series, period: int) -> pd.Series:
-        """Simple Moving Average"""
         return data.rolling(window=period).mean()
     
     @staticmethod
     def calculate_ema(data: pd.Series, period: int) -> pd.Series:
-        """Exponential Moving Average"""
         return data.ewm(span=period, adjust=False).mean()
     
     @staticmethod
     def calculate_rsi(data: pd.Series, period: int = 14) -> pd.Series:
-        """Relative Strength Index"""
         delta = data.diff()
         gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
         loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
@@ -99,34 +94,22 @@ class TechnicalIndicators:
     
     @staticmethod
     def calculate_macd(data: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9) -> Dict:
-        """MACD Indicator"""
         ema_fast = TechnicalIndicators.calculate_ema(data, fast)
         ema_slow = TechnicalIndicators.calculate_ema(data, slow)
         macd_line = ema_fast - ema_slow
         signal_line = TechnicalIndicators.calculate_ema(macd_line, signal)
         histogram = macd_line - signal_line
         
-        return {
-            'macd': macd_line,
-            'signal': signal_line,
-            'histogram': histogram
-        }
+        return {'macd': macd_line, 'signal': signal_line, 'histogram': histogram}
     
     @staticmethod
     def calculate_bollinger_bands(data: pd.Series, period: int = 20, std_dev: int = 2) -> Dict:
-        """Bollinger Bands"""
         sma = TechnicalIndicators.calculate_sma(data, period)
         std = data.rolling(window=period).std()
-        
-        return {
-            'upper': sma + (std * std_dev),
-            'middle': sma,
-            'lower': sma - (std * std_dev)
-        }
+        return {'upper': sma + (std * std_dev), 'middle': sma, 'lower': sma - (std * std_dev)}
     
     @staticmethod
     def calculate_atr(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14) -> pd.Series:
-        """Average True Range"""
         tr1 = high - low
         tr2 = abs(high - close.shift())
         tr3 = abs(low - close.shift())
@@ -136,7 +119,6 @@ class TechnicalIndicators:
     
     @staticmethod
     def calculate_adx(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14) -> pd.Series:
-        """Average Directional Index"""
         up_move = high.diff()
         down_move = -low.diff()
         
@@ -147,10 +129,8 @@ class TechnicalIndicators:
         minus_dm[(down_move > up_move) & (down_move > 0)] = down_move
         
         atr = TechnicalIndicators.calculate_atr(high, low, close, period)
-        
         plus_di = 100 * (plus_dm.rolling(window=period).mean() / atr)
         minus_di = 100 * (minus_dm.rolling(window=period).mean() / atr)
-        
         dx = 100 * abs(plus_di - minus_di) / (plus_di + minus_di)
         adx = dx.rolling(window=period).mean()
         
@@ -158,25 +138,17 @@ class TechnicalIndicators:
     
     @staticmethod
     def calculate_stochastic(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14, smooth_k: int = 3) -> Dict:
-        """Stochastic Oscillator"""
         lowest_low = low.rolling(window=period).min()
         highest_high = high.rolling(window=period).max()
-        
         k_percent = 100 * ((close - lowest_low) / (highest_high - lowest_low))
         k_smooth = k_percent.rolling(window=smooth_k).mean()
         d_percent = k_smooth.rolling(window=3).mean()
-        
-        return {
-            'k': k_smooth,
-            'd': d_percent
-        }
+        return {'k': k_smooth, 'd': d_percent}
     
     @staticmethod
     def calculate_obv(close: pd.Series, volume: pd.Series) -> pd.Series:
-        """On Balance Volume"""
         obv = pd.Series(0.0, index=close.index)
         obv.iloc[0] = volume.iloc[0]
-        
         for i in range(1, len(close)):
             if close.iloc[i] > close.iloc[i-1]:
                 obv.iloc[i] = obv.iloc[i-1] + volume.iloc[i]
@@ -184,12 +156,10 @@ class TechnicalIndicators:
                 obv.iloc[i] = obv.iloc[i-1] - volume.iloc[i]
             else:
                 obv.iloc[i] = obv.iloc[i-1]
-        
         return obv
     
     @staticmethod
     def calculate_zscore(data: pd.Series, window: int = 20) -> pd.Series:
-        """Rolling Z-Score"""
         rolling_mean = data.rolling(window=window).mean()
         rolling_std = data.rolling(window=window).std()
         zscore = (data - rolling_mean) / rolling_std
@@ -202,7 +172,6 @@ class TradingAnalyzer:
         self.data_cache = {}
         
     def fetch_data_with_retry(self, ticker: str, period: str, interval: str, max_retries: int = 3) -> Optional[pd.DataFrame]:
-        """Fetch data with retry logic and rate limiting"""
         cache_key = f"{ticker}_{period}_{interval}"
         
         if cache_key in self.data_cache:
@@ -216,11 +185,9 @@ class TradingAnalyzer:
                 if data.empty:
                     return None
                 
-                # Handle multi-level columns from yfinance
                 if isinstance(data.columns, pd.MultiIndex):
                     data.columns = data.columns.get_level_values(0)
                 
-                # Convert to IST
                 if data.index.tz is None:
                     data.index = data.index.tz_localize('UTC').tz_convert(IST)
                 else:
@@ -238,56 +205,43 @@ class TradingAnalyzer:
         return None
     
     def calculate_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Calculate comprehensive technical indicators"""
         if df is None or df.empty:
             return df
         
         df = df.copy()
-        
-        # Price-based indicators
         df['Returns'] = df['Close'].pct_change()
         df['Log_Returns'] = np.log(df['Close'] / df['Close'].shift(1))
         
-        # Moving Averages
         for period in [9, 20, 50, 100, 200]:
             df[f'EMA_{period}'] = TechnicalIndicators.calculate_ema(df['Close'], period)
             df[f'SMA_{period}'] = TechnicalIndicators.calculate_sma(df['Close'], period)
         
-        # RSI
         df['RSI'] = TechnicalIndicators.calculate_rsi(df['Close'], 14)
         df['RSI_Oversold'] = df['RSI'] < 30
         df['RSI_Overbought'] = df['RSI'] > 70
         
-        # MACD
         macd_data = TechnicalIndicators.calculate_macd(df['Close'])
         df['MACD'] = macd_data['macd']
         df['MACD_Signal'] = macd_data['signal']
         df['MACD_Histogram'] = macd_data['histogram']
         
-        # Bollinger Bands
         bb_data = TechnicalIndicators.calculate_bollinger_bands(df['Close'])
         df['BB_Upper'] = bb_data['upper']
         df['BB_Middle'] = bb_data['middle']
         df['BB_Lower'] = bb_data['lower']
         
-        # ATR & Volatility
         df['ATR'] = TechnicalIndicators.calculate_atr(df['High'], df['Low'], df['Close'])
         df['Volatility'] = df['Returns'].rolling(window=20).std() * np.sqrt(252) * 100
-        
-        # ADX
         df['ADX'] = TechnicalIndicators.calculate_adx(df['High'], df['Low'], df['Close'])
         
-        # Stochastic
         stoch_data = TechnicalIndicators.calculate_stochastic(df['High'], df['Low'], df['Close'])
         df['Stoch_K'] = stoch_data['k']
         df['Stoch_D'] = stoch_data['d']
         
-        # Volume indicators
         if 'Volume' in df.columns and df['Volume'].sum() > 0:
             df['Volume_MA'] = df['Volume'].rolling(window=20).mean()
             df['OBV'] = TechnicalIndicators.calculate_obv(df['Close'], df['Volume'])
         
-        # Z-Score calculations
         df['Price_ZScore'] = TechnicalIndicators.calculate_zscore(df['Close'], 20)
         df['Returns_ZScore'] = TechnicalIndicators.calculate_zscore(df['Returns'].fillna(0), 20)
         df['Volume_ZScore'] = TechnicalIndicators.calculate_zscore(df['Volume'], 20) if 'Volume' in df.columns else 0
@@ -295,12 +249,10 @@ class TradingAnalyzer:
         return df
     
     def find_support_resistance(self, df: pd.DataFrame, window: int = 20) -> Dict:
-        """Find strong support and resistance levels"""
         if df is None or df.empty or len(df) < window * 2:
             return {'support': [], 'resistance': [], 'analysis': []}
         
         df = df.copy()
-        
         local_min_idx = argrelextrema(df['Close'].values, np.less_equal, order=window)[0]
         local_max_idx = argrelextrema(df['Close'].values, np.greater_equal, order=window)[0]
         
@@ -310,18 +262,15 @@ class TradingAnalyzer:
         def cluster_levels(levels, tolerance=0.005):
             if len(levels) == 0:
                 return []
-            
             clustered = []
             sorted_levels = np.sort(levels)
             current_cluster = [sorted_levels[0]]
-            
             for level in sorted_levels[1:]:
                 if (level - current_cluster[-1]) / current_cluster[-1] <= tolerance:
                     current_cluster.append(level)
                 else:
                     clustered.append(np.mean(current_cluster))
                     current_cluster = [level]
-            
             clustered.append(np.mean(current_cluster))
             return clustered
         
@@ -334,7 +283,6 @@ class TradingAnalyzer:
         for level in support_clustered[-5:]:
             touches = np.sum(np.abs(df['Low'] - level) / level < 0.01)
             sustained = np.sum((df['Close'] > level) & (df['Low'] <= level * 1.01))
-            
             if touches >= 2:
                 distance_pct = ((current_price - level) / level) * 100
                 analysis.append({
@@ -349,7 +297,6 @@ class TradingAnalyzer:
         for level in resistance_clustered[-5:]:
             touches = np.sum(np.abs(df['High'] - level) / level < 0.01)
             sustained = np.sum((df['Close'] < level) & (df['High'] >= level * 0.99))
-            
             if touches >= 2:
                 distance_pct = ((level - current_price) / current_price) * 100
                 analysis.append({
@@ -368,14 +315,12 @@ class TradingAnalyzer:
         }
     
     def calculate_fibonacci_levels(self, df: pd.DataFrame) -> Dict:
-        """Calculate Fibonacci retracement levels"""
         if df is None or df.empty or len(df) < 50:
             return {}
         
         recent_data = df.tail(100)
         swing_high = recent_data['High'].max()
         swing_low = recent_data['Low'].min()
-        
         diff = swing_high - swing_low
         
         levels = {
@@ -403,7 +348,6 @@ class TradingAnalyzer:
         }
     
     def detect_elliott_wave(self, df: pd.DataFrame) -> Dict:
-        """Simplified Elliott Wave detection"""
         if df is None or df.empty or len(df) < 50:
             return {'wave': 'Unknown', 'confidence': 0}
         
@@ -418,8 +362,34 @@ class TradingAnalyzer:
         else:
             return {'wave': 'Wave 1 (Starting)', 'confidence': 45}
     
+    def find_similar_patterns(self, df: pd.DataFrame, lookback: int = 100) -> List[Dict]:
+        """Find similar historical patterns"""
+        if df is None or df.empty or len(df) < lookback + 20:
+            return []
+        
+        current_pattern = df['Close'].tail(10).pct_change().fillna(0).values
+        similar_patterns = []
+        
+        for i in range(lookback, len(df) - 20):
+            historical_pattern = df['Close'].iloc[i:i+10].pct_change().fillna(0).values
+            correlation = np.corrcoef(current_pattern, historical_pattern)[0, 1]
+            
+            if correlation > 0.85:
+                future_returns = ((df['Close'].iloc[i+10:i+20].max() - df['Close'].iloc[i+9]) / df['Close'].iloc[i+9]) * 100
+                pattern_date = df.index[i+9]
+                pattern_price = df['Close'].iloc[i+9]
+                
+                similar_patterns.append({
+                    'date': pattern_date,
+                    'price': pattern_price,
+                    'correlation': correlation,
+                    'future_move': future_returns,
+                    'candles_to_peak': 10
+                })
+        
+        return sorted(similar_patterns, key=lambda x: x['correlation'], reverse=True)[:3]
+    
     def generate_signals(self, df: pd.DataFrame, sr_levels: Dict, fib_levels: Dict) -> Dict:
-        """Generate trading signals with Z-score analysis"""
         if df is None or df.empty:
             return {'signal': 'HOLD', 'confidence': 0, 'reasons': []}
         
@@ -430,9 +400,7 @@ class TradingAnalyzer:
         current_rsi = df['RSI'].iloc[-1] if not pd.isna(df['RSI'].iloc[-1]) else 50
         current_adx = df['ADX'].iloc[-1] if 'ADX' in df.columns and not pd.isna(df['ADX'].iloc[-1]) else 0
         price_zscore = df['Price_ZScore'].iloc[-1] if not pd.isna(df['Price_ZScore'].iloc[-1]) else 0
-        returns_zscore = df['Returns_ZScore'].iloc[-1] if not pd.isna(df['Returns_ZScore'].iloc[-1]) else 0
         
-        # Z-Score signals (mean reversion)
         if price_zscore < -2:
             signals.append(1)
             reasons.append(f"✓ Price Z-Score {price_zscore:.2f} (oversold, mean reversion expected)")
@@ -440,7 +408,6 @@ class TradingAnalyzer:
             signals.append(-1)
             reasons.append(f"✗ Price Z-Score {price_zscore:.2f} (overbought, mean reversion expected)")
         
-        # Trend signals
         if not pd.isna(df['EMA_20'].iloc[-1]) and not pd.isna(df['EMA_50'].iloc[-1]):
             if current_price > df['EMA_20'].iloc[-1] > df['EMA_50'].iloc[-1]:
                 signals.append(1)
@@ -449,7 +416,6 @@ class TradingAnalyzer:
                 signals.append(-1)
                 reasons.append("✗ Price below EMA20 and EMA50 (Downtrend)")
         
-        # RSI signals
         if current_rsi < 30:
             signals.append(1)
             reasons.append(f"✓ RSI oversold at {current_rsi:.1f}")
@@ -457,7 +423,6 @@ class TradingAnalyzer:
             signals.append(-1)
             reasons.append(f"✗ RSI overbought at {current_rsi:.1f}")
         
-        # ADX signals
         if current_adx > 25:
             if not pd.isna(df['EMA_20'].iloc[-1]) and not pd.isna(df['EMA_50'].iloc[-1]):
                 if df['EMA_20'].iloc[-1] > df['EMA_50'].iloc[-1]:
@@ -467,7 +432,6 @@ class TradingAnalyzer:
                     signals.append(-1)
                     reasons.append(f"✗ Strong downtrend (ADX: {current_adx:.1f})")
         
-        # Support/Resistance signals
         if sr_levels.get('analysis'):
             nearest = sr_levels['analysis'][0]
             if nearest['type'] == 'Support' and abs(nearest['distance_pct']) < 2:
@@ -477,14 +441,12 @@ class TradingAnalyzer:
                 signals.append(-1)
                 reasons.append(f"✗ Near strong resistance at {nearest['level']:.2f} ({nearest['touches']} touches)")
         
-        # Fibonacci signals
         if fib_levels and 'closest_level' in fib_levels:
             fib_key = fib_levels['closest_level']
             if fib_key in ['0.618', '0.786']:
                 signals.append(1)
                 reasons.append(f"✓ Near Fibonacci {fib_key} level (bounce expected)")
         
-        # MACD signals
         if 'MACD' in df.columns and len(df) >= 2:
             if not pd.isna(df['MACD'].iloc[-1]) and not pd.isna(df['MACD_Signal'].iloc[-1]):
                 if df['MACD'].iloc[-1] > df['MACD_Signal'].iloc[-1] and df['MACD'].iloc[-2] <= df['MACD_Signal'].iloc[-2]:
@@ -511,66 +473,301 @@ class TradingAnalyzer:
             'signal': signal,
             'confidence': min(confidence, 99),
             'reasons': reasons[:8],
-            'price_zscore': price_zscore,
-            'returns_zscore': returns_zscore
+            'price_zscore': price_zscore
         }
 
-def generate_live_guidance(analyzer: TradingAnalyzer, ticker: str, results: Dict) -> str:
-    """Generate live trading guidance"""
-    guidance = []
+def generate_friendly_guidance(analyzer: TradingAnalyzer, ticker: str, trade: Dict, results: Dict) -> str:
+    """Generate friend-like trading guidance"""
+    guidance_parts = []
     
-    # Get latest 5m data for real-time analysis
+    # Fetch latest 5m data
     df_5m = analyzer.fetch_data_with_retry(ticker, '1d', '5m')
     
-    if df_5m is not None and not df_5m.empty:
-        df_5m = analyzer.calculate_indicators(df_5m)
-        sr_levels = analyzer.find_support_resistance(df_5m)
-        fib_levels = analyzer.calculate_fibonacci_levels(df_5m)
-        elliott = analyzer.detect_elliott_wave(df_5m)
-        
-        current_price = df_5m['Close'].iloc[-1]
-        current_rsi = df_5m['RSI'].iloc[-1]
-        current_adx = df_5m['ADX'].iloc[-1]
-        current_vol = df_5m['Volatility'].iloc[-1]
-        price_zscore = df_5m['Price_ZScore'].iloc[-1]
-        
-        guidance.append(f"**Current Price:** ₹{current_price:.2f}")
-        guidance.append(f"**RSI:** {current_rsi:.1f} {'(Oversold)' if current_rsi < 30 else '(Overbought)' if current_rsi > 70 else '(Neutral)'}")
-        guidance.append(f"**ADX:** {current_adx:.1f} {'(Strong Trend)' if current_adx > 25 else '(Weak Trend)'}")
-        guidance.append(f"**Volatility:** {current_vol:.2f}%")
-        guidance.append(f"**Price Z-Score:** {price_zscore:.2f} {'(Oversold)' if price_zscore < -2 else '(Overbought)' if price_zscore > 2 else '(Normal)'}")
-        
-        # Support/Resistance
-        if sr_levels.get('analysis'):
-            nearest = sr_levels['analysis'][0]
-            guidance.append(f"**Nearest Level:** {nearest['type']} at ₹{nearest['level']:.2f} ({nearest['distance_pct']:.2f}% away)")
-        
-        # Fibonacci
-        if fib_levels and 'closest_level' in fib_levels:
-            guidance.append(f"**Fibonacci Level:** {fib_levels['closest_level']} at ₹{fib_levels['closest_price']:.2f}")
-        
-        # Elliott Wave
-        guidance.append(f"**Elliott Wave:** {elliott['wave']} (Confidence: {elliott['confidence']}%)")
-        
-        # Trading recommendation
-        signals = analyzer.generate_signals(df_5m, sr_levels, fib_levels)
-        
-        if signals['signal'] == 'BUY':
-            guidance.append("\n**💡 RECOMMENDATION: CONSIDER ENTRY (BUY)**")
-            guidance.append("Set stop-loss below nearest support")
-        elif signals['signal'] == 'SELL':
-            guidance.append("\n**💡 RECOMMENDATION: CONSIDER EXIT/SHORT (SELL)**")
-            guidance.append("Set stop-loss above nearest resistance")
-        else:
-            guidance.append("\n**💡 RECOMMENDATION: HOLD/WAIT**")
-            guidance.append("Wait for clearer signals or better entry point")
+    if df_5m is None or df_5m.empty:
+        return "Unable to fetch live data. Please try refreshing again."
     
-    return "\n".join(guidance)
+    df_5m = analyzer.calculate_indicators(df_5m)
+    sr_levels = analyzer.find_support_resistance(df_5m)
+    fib_levels = analyzer.calculate_fibonacci_levels(df_5m)
+    elliott = analyzer.detect_elliott_wave(df_5m)
+    similar_patterns = analyzer.find_similar_patterns(df_5m, lookback=200)
+    
+    current_price = df_5m['Close'].iloc[-1]
+    current_rsi = df_5m['RSI'].iloc[-1]
+    current_adx = df_5m['ADX'].iloc[-1]
+    current_vol = df_5m['Volatility'].iloc[-1]
+    current_zscore = df_5m['Price_ZScore'].iloc[-1]
+    
+    # Entry analysis
+    guidance_parts.append("### 📊 Trade Entry Analysis (5min/1day timeframe)")
+    guidance_parts.append(f"**You entered this {trade['action']} position at ₹{trade['price']:.2f} on {trade['entry_time']}**\n")
+    
+    guidance_parts.append("**Entry Conditions:**")
+    guidance_parts.append(f"- Z-Score was: {trade['strategy']['zscore']:.2f}")
+    guidance_parts.append(f"- Volatility was: {trade['strategy']['volatility']:.2f}%")
+    guidance_parts.append(f"- RSI was: {trade['strategy']['rsi']:.1f}")
+    
+    # Current situation
+    guidance_parts.append("\n### 📈 Current Market Status (5min/1day timeframe)")
+    guidance_parts.append(f"**Current Price: ₹{current_price:.2f}** (moved {((current_price - trade['price']) / trade['price'] * 100):+.2f}% from entry)")
+    guidance_parts.append(f"- Z-Score now: {current_zscore:.2f} (was {trade['strategy']['zscore']:.2f})")
+    guidance_parts.append(f"- Volatility now: {current_vol:.2f}% (was {trade['strategy']['volatility']:.2f}%)")
+    guidance_parts.append(f"- RSI now: {current_rsi:.1f} (was {trade['strategy']['rsi']:.1f})")
+    guidance_parts.append(f"- ADX: {current_adx:.1f} {'(Strong trend)' if current_adx > 25 else '(Weak trend)'}")
+    
+    # Parameter comparison and interpretation
+    guidance_parts.append("\n### 🔍 How Parameters Have Changed:")
+    
+    zscore_change = current_zscore - trade['strategy']['zscore']
+    if trade['action'] == 'BUY':
+        if zscore_change > 0.5:
+            guidance_parts.append("✅ **Z-Score improving** - Price moving toward mean, good for your long position")
+        elif zscore_change < -0.5:
+            guidance_parts.append("⚠️ **Z-Score deteriorating** - Price moving further from mean")
+        else:
+            guidance_parts.append("➡️ **Z-Score stable** - No significant mean reversion yet")
+    else:
+        if zscore_change < -0.5:
+            guidance_parts.append("✅ **Z-Score improving** - Price moving toward mean, good for your short position")
+        elif zscore_change > 0.5:
+            guidance_parts.append("⚠️ **Z-Score deteriorating** - Price moving further from mean")
+        else:
+            guidance_parts.append("➡️ **Z-Score stable** - No significant mean reversion yet")
+    
+    vol_change = current_vol - trade['strategy']['volatility']
+    if vol_change > 5:
+        guidance_parts.append(f"⚠️ **Volatility increased by {vol_change:.1f}%** - Market becoming more volatile")
+    elif vol_change < -5:
+        guidance_parts.append(f"✅ **Volatility decreased by {abs(vol_change):.1f}%** - Market stabilizing")
+    
+    # Support/Resistance check
+    if sr_levels.get('analysis'):
+        nearest = sr_levels['analysis'][0]
+        guidance_parts.append(f"\n**Nearest {nearest['type']}: ₹{nearest['level']:.2f}** ({abs(nearest['distance_pct']):.2f}% away, {nearest['touches']} touches)")
+        
+        if trade['action'] == 'BUY':
+            if nearest['type'] == 'Resistance' and abs(nearest['distance_pct']) < 1:
+                guidance_parts.append("🚨 **WARNING:** Approaching strong resistance! Consider partial profit booking.")
+            elif nearest['type'] == 'Support' and abs(nearest['distance_pct']) < 2:
+                guidance_parts.append("✅ **GOOD:** Strong support below providing safety net.")
+        else:
+            if nearest['type'] == 'Support' and abs(nearest['distance_pct']) < 1:
+                guidance_parts.append("🚨 **WARNING:** Approaching strong support! Consider covering position.")
+            elif nearest['type'] == 'Resistance' and abs(nearest['distance_pct']) < 2:
+                guidance_parts.append("✅ **GOOD:** Strong resistance above providing safety net.")
+    
+    # Fibonacci analysis
+    if fib_levels and 'closest_level' in fib_levels:
+        fib_dist = abs((fib_levels['closest_price'] - current_price) / current_price * 100)
+        guidance_parts.append(f"\n**Fibonacci Level:** Near {fib_levels['closest_level']} at ₹{fib_levels['closest_price']:.2f} ({fib_dist:.2f}% away)")
+        if fib_levels['closest_level'] in ['0.618', '0.5', '0.382']:
+            guidance_parts.append("✅ Key Fibonacci level nearby - potential bounce/reversal zone")
+    
+    # Elliott Wave
+    guidance_parts.append(f"\n**Elliott Wave:** Currently in {elliott['wave']} (Confidence: {elliott['confidence']}%)")
+    
+    # Historical pattern matching
+    if similar_patterns:
+        guidance_parts.append("\n### 🔮 Historical Pattern Match (5min/1day timeframe)")
+        best_match = similar_patterns[0]
+        guidance_parts.append(f"**Found similar pattern from {best_match['date'].strftime('%Y-%m-%d %H:%M IST')}!**")
+        guidance_parts.append(f"- Price then: ₹{best_match['price']:.2f}")
+        guidance_parts.append(f"- Pattern correlation: {best_match['correlation']*100:.1f}%")
+        guidance_parts.append(f"- After {best_match['candles_to_peak']} candles, price moved {best_match['future_move']:+.2f}%")
+        
+        if trade['action'] == 'BUY' and best_match['future_move'] > 2:
+            guidance_parts.append(f"✅ **Historical pattern suggests upside potential of ~{best_match['future_move']:.1f}%**")
+        elif trade['action'] == 'SELL' and best_match['future_move'] < -2:
+            guidance_parts.append(f"✅ **Historical pattern suggests downside move of ~{abs(best_match['future_move']):.1f}%**")
+        elif (trade['action'] == 'BUY' and best_match['future_move'] < -2) or (trade['action'] == 'SELL' and best_match['future_move'] > 2):
+            guidance_parts.append(f"⚠️ **Historical pattern went against current position!** Be cautious.")
+    
+    # EMA status check
+    guidance_parts.append("\n### 📉 Trend Analysis (5min/1day timeframe)")
+    ema_20 = df_5m['EMA_20'].iloc[-1]
+    ema_50 = df_5m['EMA_50'].iloc[-1]
+    
+    if not pd.isna(ema_20) and not pd.isna(ema_50):
+        if current_price > ema_20 > ema_50:
+            guidance_parts.append("✅ **Strong Uptrend:** Price > EMA20 > EMA50")
+            if trade['action'] == 'SELL':
+                guidance_parts.append("⚠️ **WARNING:** You're SHORT in an uptrend - risky!")
+        elif current_price < ema_20 < ema_50:
+            guidance_parts.append("📉 **Strong Downtrend:** Price < EMA20 < EMA50")
+            if trade['action'] == 'BUY':
+                guidance_parts.append("⚠️ **WARNING:** You're LONG in a downtrend - risky!")
+        else:
+            guidance_parts.append("➡️ **Sideways/Consolidation:** Mixed EMA signals")
+    
+    # What's working and what's not
+    guidance_parts.append("\n### ✅ What's Working in Current Analysis:")
+    working_factors = []
+    not_working_factors = []
+    
+    if trade['action'] == 'BUY':
+        if current_price > trade['price']:
+            working_factors.append(f"✓ Position in profit (+{((current_price - trade['price']) / trade['price'] * 100):.2f}%)")
+        else:
+            not_working_factors.append(f"✗ Position in loss ({((current_price - trade['price']) / trade['price'] * 100):.2f}%)")
+        
+        if current_rsi < 70:
+            working_factors.append(f"✓ RSI at {current_rsi:.1f} - not overbought yet")
+        else:
+            not_working_factors.append(f"✗ RSI at {current_rsi:.1f} - overbought territory")
+        
+        if current_zscore < 2:
+            working_factors.append(f"✓ Z-Score {current_zscore:.2f} - room for upside")
+        else:
+            not_working_factors.append(f"✗ Z-Score {current_zscore:.2f} - price extended")
+        
+        if current_adx > 25 and ema_20 > ema_50:
+            working_factors.append(f"✓ Strong uptrend confirmed (ADX {current_adx:.1f})")
+        elif current_adx > 25 and ema_20 < ema_50:
+            not_working_factors.append(f"✗ Strong downtrend active (ADX {current_adx:.1f})")
+    
+    else:  # SELL position
+        if current_price < trade['price']:
+            working_factors.append(f"✓ Position in profit (+{((trade['price'] - current_price) / trade['price'] * 100):.2f}%)")
+        else:
+            not_working_factors.append(f"✗ Position in loss ({((trade['price'] - current_price) / trade['price'] * 100):.2f}%)")
+        
+        if current_rsi > 30:
+            working_factors.append(f"✓ RSI at {current_rsi:.1f} - not oversold yet")
+        else:
+            not_working_factors.append(f"✗ RSI at {current_rsi:.1f} - oversold territory")
+        
+        if current_zscore > -2:
+            working_factors.append(f"✓ Z-Score {current_zscore:.2f} - room for downside")
+        else:
+            not_working_factors.append(f"✗ Z-Score {current_zscore:.2f} - price oversold")
+        
+        if current_adx > 25 and ema_20 < ema_50:
+            working_factors.append(f"✓ Strong downtrend confirmed (ADX {current_adx:.1f})")
+        elif current_adx > 25 and ema_20 > ema_50:
+            not_working_factors.append(f"✗ Strong uptrend active (ADX {current_adx:.1f})")
+    
+    for factor in working_factors:
+        guidance_parts.append(factor)
+    
+    if not_working_factors:
+        guidance_parts.append("\n### ⚠️ What's NOT Working:")
+        for factor in not_working_factors:
+            guidance_parts.append(factor)
+    
+    # Final recommendation
+    guidance_parts.append("\n### 🎯 My Recommendation:")
+    
+    danger_signals = len(not_working_factors)
+    positive_signals = len(working_factors)
+    
+    if danger_signals >= 3:
+        guidance_parts.append('<div class="danger-box">', )
+        guidance_parts.append("🚨 **EXIT NOW!** Too many factors working against your position.")
+        guidance_parts.append("Multiple warning signs detected. Better to take a small loss than a big one.")
+        guidance_parts.append('</div>')
+    elif danger_signals >= 2:
+        guidance_parts.append('<div class="warning-box">')
+        guidance_parts.append("⚠️ **CAUTION:** Several concerns detected. Consider:")
+        guidance_parts.append("- Book partial profits if in gain")
+        guidance_parts.append("- Tighten stop-loss")
+        guidance_parts.append("- Monitor closely for next 2-3 candles")
+        guidance_parts.append('</div>')
+    elif positive_signals >= 4:
+        guidance_parts.append('<div class="success-box">')
+        guidance_parts.append("✅ **HOLD STRONG!** Trade setup working perfectly.")
+        guidance_parts.append("All major factors supporting your position. Stay patient!")
+        if trade['action'] == 'BUY':
+            if sr_levels.get('analysis') and sr_levels['analysis'][0]['type'] == 'Resistance':
+                target = sr_levels['analysis'][0]['level']
+                guidance_parts.append(f"Target: ₹{target:.2f} (next resistance)")
+        else:
+            if sr_levels.get('analysis') and sr_levels['analysis'][0]['type'] == 'Support':
+                target = sr_levels['analysis'][0]['level']
+                guidance_parts.append(f"Target: ₹{target:.2f} (next support)")
+        guidance_parts.append('</div>')
+    else:
+        guidance_parts.append('<div class="warning-box">')
+        guidance_parts.append("➡️ **MONITOR:** Mixed signals, no clear direction yet.")
+        guidance_parts.append("Wait for 2-3 more candles for clarity. Don't panic, don't be greedy.")
+        guidance_parts.append('</div>')
+    
+    return "\n\n".join(guidance_parts)
+
+def run_detailed_backtest(df: pd.DataFrame, ticker_name: str) -> pd.DataFrame:
+    """Run detailed backtesting with entry/exit logic"""
+    if df is None or df.empty:
+        return pd.DataFrame()
+    
+    df = df.copy()
+    
+    # Strategy: Buy when RSI < 30 and price > EMA20, Sell when RSI > 70 or 3% profit/1.5% loss
+    trades = []
+    position = None
+    
+    for i in range(50, len(df)):
+        current_row = df.iloc[i]
+        current_price = current_row['Close']
+        current_rsi = current_row['RSI']
+        current_ema20 = current_row['EMA_20']
+        
+        # Entry logic
+        if position is None:
+            if current_rsi < 30 and current_price > current_ema20:
+                # Calculate targets
+                entry_price = current_price
+                atr = current_row['ATR']
+                stop_loss = entry_price - (1.5 * atr)
+                target = entry_price + (2 * atr)
+                
+                position = {
+                    'entry_date': current_row.name,
+                    'entry_price': entry_price,
+                    'entry_rsi': current_rsi,
+                    'stop_loss': stop_loss,
+                    'target': target,
+                    'entry_reason': f"RSI oversold ({current_rsi:.1f}), Price > EMA20"
+                }
+        
+        # Exit logic
+        elif position is not None:
+            pnl_pct = ((current_price - position['entry_price']) / position['entry_price']) * 100
+            
+            exit_reason = None
+            if current_price >= position['target']:
+                exit_reason = f"Target hit (₹{position['target']:.2f})"
+            elif current_price <= position['stop_loss']:
+                exit_reason = f"Stop-loss hit (₹{position['stop_loss']:.2f})"
+            elif current_rsi > 70:
+                exit_reason = f"RSI overbought ({current_rsi:.1f})"
+            elif i - df.index.get_loc(position['entry_date']) > 20:
+                exit_reason = "Time-based exit (20 candles)"
+            
+            if exit_reason:
+                pnl_points = current_price - position['entry_price']
+                
+                trades.append({
+                    'Entry Date': position['entry_date'].strftime('%Y-%m-%d %H:%M IST'),
+                    'Entry Price': f"₹{position['entry_price']:.2f}",
+                    'Entry RSI': f"{position['entry_rsi']:.1f}",
+                    'Stop Loss': f"₹{position['stop_loss']:.2f}",
+                    'Target': f"₹{position['target']:.2f}",
+                    'Exit Date': current_row.name.strftime('%Y-%m-%d %H:%M IST'),
+                    'Exit Price': f"₹{current_price:.2f}",
+                    'Exit RSI': f"{current_rsi:.1f}",
+                    'Entry Reason': position['entry_reason'],
+                    'Exit Reason': exit_reason,
+                    'P&L Points': f"{pnl_points:+.2f}",
+                    'P&L %': f"{pnl_pct:+.2f}%",
+                    'Result': '✅ WIN' if pnl_points > 0 else '❌ LOSS'
+                })
+                
+                position = None
+    
+    return pd.DataFrame(trades)
 
 def main():
     st.markdown('<h1 class="main-header">📈 Advanced Algorithmic Trading System</h1>', unsafe_allow_html=True)
     
-    # Sidebar configuration
     st.sidebar.title("⚙️ Configuration")
     
     ticker1_type = st.sidebar.selectbox("Ticker 1 Type", ["Preset", "Custom"])
@@ -605,11 +802,7 @@ def main():
         status_text = st.empty()
         
         all_results = {}
-        total_analyses = 0
-        
-        for interval, periods in TIMEFRAME_PERIODS.items():
-            total_analyses += len(periods)
-        
+        total_analyses = sum(len(periods) for periods in TIMEFRAME_PERIODS.values())
         if enable_ratio and ticker2:
             total_analyses *= 2
         
@@ -655,9 +848,7 @@ def main():
                         df2 = analyzer.calculate_indicators(df2)
                         
                         if f"{interval}_{period}" in all_results:
-                            all_results[f"{interval}_{period}"]['ticker2'] = {
-                                'data': df2
-                            }
+                            all_results[f"{interval}_{period}"]['ticker2'] = {'data': df2}
         
         progress_bar.progress(1.0)
         status_text.text("✅ Analysis Complete!")
@@ -672,7 +863,6 @@ def main():
         st.session_state.ticker2_symbol = ticker2
         st.success("✅ Analysis completed successfully!")
     
-    # Display results
     if st.session_state.analysis_results:
         results = st.session_state.analysis_results
         analyzer = TradingAnalyzer()
@@ -779,478 +969,460 @@ def main():
                     sr_df = pd.DataFrame(sr_data['analysis'])
                     st.dataframe(sr_df, use_container_width=True)
             
-            fib_key = [k for k in results.keys() if '1d_' in k]
-            if fib_key and 'fib_levels' in results[fib_key[0]]['ticker1']:
-                fib_data = results[fib_key[0]]['ticker1']['fib_levels']
-                
-                if fib_data and 'levels' in fib_data:
-                    st.markdown("### 📐 Fibonacci Retracement Levels")
-                    fib_df = pd.DataFrame(list(fib_data['levels'].items()), columns=['Level', 'Price'])
-                    fib_df['Distance from Current'] = ((fib_df['Price'] - fib_data['current_price']) / fib_data['current_price'] * 100).round(2)
-                    st.dataframe(fib_df, use_container_width=True)
-            
-            if 'elliott' in results[sr_key[0]]['ticker1']:
-                elliott_data = results[sr_key[0]]['ticker1']['elliott']
-                st.markdown(f"### 🌊 Elliott Wave Analysis: {elliott_data['wave']} (Confidence: {elliott_data['confidence']}%)")
-        
-        # Paper Trading Section with Live Guidance
-        st.markdown("---")
-        st.markdown("## 💼 Paper Trading Simulator with Live Guidance")
-        
-        col1, col2, col3 = st.columns(3)
-        
-        with col1:
-            st.metric("Virtual Capital", f"₹{st.session_state.paper_capital:,.2f}")
-        
-        with col2:
-            if st.button("Execute Recommended Trade", type="primary"):
-                if final_signal != "HOLD":
-                    latest_key = [k for k in results.keys() if '1d_' in k][0]
-                    latest_data = results[latest_key]['ticker1']['data']
-                    current_price = latest_data['Close'].iloc[-1]
-                    
-                    position_value = st.session_state.paper_capital * 0.1
-                    quantity = int(position_value / current_price)
-                    
-                    # Get strategy details
-                    strategy_details = {
-                        'zscore': avg_zscore,
-                        'volatility': latest_data['Volatility'].iloc[-1],
-                        'rsi': latest_data['RSI'].iloc[-1],
-                        'support_resistance': results[latest_key]['ticker1']['sr_levels']['analysis'][0] if results[latest_key]['ticker1']['sr_levels']['analysis'] else None
-                    }
-                    
-                    trade = {
-                        'timestamp': datetime.now(IST),
-                        'ticker': st.session_state.ticker1_name,
-                        'action': final_signal,
-                        'price': current_price,
-                        'quantity': quantity,
-                        'value': current_price * quantity,
-                        'confidence': avg_confidence,
-                        'status': 'OPEN',
-                        'strategy': strategy_details,
-                        'entry_time': datetime.now(IST).strftime('%Y-%m-%d %H:%M:%S IST')
-                    }
-                    
-                    st.session_state.paper_trades.append(trade)
-                    st.session_state.live_monitoring = True
-                    st.success(f"✅ {final_signal} order placed: {quantity} shares @ ₹{current_price:.2f}")
-                else:
-                    st.info("Current recommendation is HOLD - no trade executed")
-        
-        with col3:
-            total_pnl = 0
-            for trade in st.session_state.paper_trades:
-                if trade['status'] == 'CLOSED' and 'exit_price' in trade:
-                    if trade['action'] == 'BUY':
-                        pnl = (trade['exit_price'] - trade['price']) * trade['quantity']
-                    else:
-                        pnl = (trade['price'] - trade['exit_price']) * trade['quantity']
-                    total_pnl += pnl
-            
-            pnl_color = "green" if total_pnl >= 0 else "red"
-            st.markdown(f"**Total P&L:** <span style='color:{pnl_color}'>₹{total_pnl:,.2f}</span>", unsafe_allow_html=True)
-        
-        # Live Guidance Panel
-        if st.session_state.live_monitoring and st.session_state.paper_trades:
+            # Paper Trading Section
             st.markdown("---")
-            st.markdown("### 🔴 LIVE TRADING GUIDANCE")
+            st.markdown("## 💼 Paper Trading Simulator with Live Guidance")
             
-            refresh_btn = st.button("🔄 Refresh Live Data", type="secondary")
+            col1, col2, col3 = st.columns(3)
             
-            if refresh_btn or st.session_state.live_monitoring:
-                guidance = generate_live_guidance(analyzer, st.session_state.ticker1_symbol, results)
-                
-                st.markdown('<div class="live-guidance">', unsafe_allow_html=True)
-                st.markdown(guidance)
-                st.markdown('</div>', unsafe_allow_html=True)
-        
-        # Display trade positions
-        if st.session_state.paper_trades:
-            st.markdown("#### 📋 Active Positions & Trade History")
+            with col1:
+                st.metric("Virtual Capital", f"₹{st.session_state.paper_capital:,.2f}")
             
-            open_trades = [t for t in st.session_state.paper_trades if t['status'] == 'OPEN']
-            closed_trades = [t for t in st.session_state.paper_trades if t['status'] == 'CLOSED']
-            
-            if open_trades:
-                st.markdown("**Open Positions:**")
-                
-                # Create detailed position table
-                position_data = []
-                for idx, trade in enumerate(open_trades):
-                    # Get current price
-                    latest_key = [k for k in results.keys() if '1d_' in k][0]
-                    latest_data = results[latest_key]['ticker1']['data']
-                    current_price = latest_data['Close'].iloc[-1]
-                    
-                    if trade['action'] == 'BUY':
-                        unrealized_pnl = (current_price - trade['price']) * trade['quantity']
-                        unrealized_pnl_pct = ((current_price - trade['price']) / trade['price']) * 100
-                    else:
-                        unrealized_pnl = (trade['price'] - current_price) * trade['quantity']
-                        unrealized_pnl_pct = ((trade['price'] - current_price) / trade['price']) * 100
-                    
-                    strategy_str = f"Z-Score: {trade['strategy']['zscore']:.2f}, Vol: {trade['strategy']['volatility']:.2f}%, RSI: {trade['strategy']['rsi']:.1f}"
-                    
-                    position_data.append({
-                        'Position': idx + 1,
-                        'Ticker': trade['ticker'],
-                        'Action': trade['action'],
-                        'Entry Price': f"₹{trade['price']:.2f}",
-                        'Current Price': f"₹{current_price:.2f}",
-                        'Quantity': trade['quantity'],
-                        'Entry Time': trade['entry_time'],
-                        'Unrealized P&L': f"₹{unrealized_pnl:,.2f}",
-                        'P&L %': f"{unrealized_pnl_pct:+.2f}%",
-                        'Strategy Used': strategy_str,
-                        'Confidence': f"{trade['confidence']:.1f}%"
-                    })
-                
-                if position_data:
-                    position_df = pd.DataFrame(position_data)
-                    st.dataframe(position_df, use_container_width=True)
-                
-                # Individual position details with close button
-                for idx, trade in enumerate(open_trades):
-                    with st.expander(f"Position #{idx+1} - {trade['action']} {trade['ticker']}"):
-                        col1, col2 = st.columns(2)
-                        
-                        with col1:
-                            st.write(f"**Entry Price:** ₹{trade['price']:.2f}")
-                            st.write(f"**Quantity:** {trade['quantity']}")
-                            st.write(f"**Position Value:** ₹{trade['value']:,.2f}")
-                        
-                        with col2:
-                            st.write(f"**Entry Time:** {trade['entry_time']}")
-                            st.write(f"**Confidence:** {trade['confidence']:.1f}%")
-                        
-                        st.write("**Strategy Metrics:**")
-                        st.write(f"- Z-Score at Entry: {trade['strategy']['zscore']:.2f}")
-                        st.write(f"- Volatility at Entry: {trade['strategy']['volatility']:.2f}%")
-                        st.write(f"- RSI at Entry: {trade['strategy']['rsi']:.1f}")
-                        
-                        # Get current metrics
+            with col2:
+                if st.button("Execute Recommended Trade", type="primary"):
+                    if final_signal != "HOLD":
                         latest_key = [k for k in results.keys() if '1d_' in k][0]
                         latest_data = results[latest_key]['ticker1']['data']
                         current_price = latest_data['Close'].iloc[-1]
                         
+                        # Fix: Ensure proper quantity calculation
+                        position_value = st.session_state.paper_capital * 0.1
+                        quantity = max(1, int(position_value / current_price))  # At least 1 share
+                        
+                        strategy_details = {
+                            'zscore': avg_zscore,
+                            'volatility': latest_data['Volatility'].iloc[-1],
+                            'rsi': latest_data['RSI'].iloc[-1],
+                        }
+                        
+                        trade = {
+                            'timestamp': datetime.now(IST),
+                            'ticker': st.session_state.ticker1_name,
+                            'action': final_signal,
+                            'price': current_price,
+                            'quantity': quantity,
+                            'value': current_price * quantity,
+                            'confidence': avg_confidence,
+                            'status': 'OPEN',
+                            'strategy': strategy_details,
+                            'entry_time': datetime.now(IST).strftime('%Y-%m-%d %H:%M:%S IST')
+                        }
+                        
+                        st.session_state.paper_trades.append(trade)
+                        st.session_state.live_monitoring = True
+                        st.success(f"✅ {final_signal} order placed: {quantity} shares @ ₹{current_price:.2f} (Total: ₹{current_price * quantity:,.2f})")
+                    else:
+                        st.info("Current recommendation is HOLD - no trade executed")
+            
+            with col3:
+                total_pnl = 0
+                for trade in st.session_state.paper_trades:
+                    if trade['status'] == 'CLOSED' and 'exit_price' in trade:
                         if trade['action'] == 'BUY':
-                            unrealized_pnl = (current_price - trade['price']) * trade['quantity']
-                            unrealized_pnl_pct = ((current_price - trade['price']) / trade['price']) * 100
+                            pnl = (trade['exit_price'] - trade['price']) * trade['quantity']
                         else:
-                            unrealized_pnl = (trade['price'] - current_price) * trade['quantity']
-                            unrealized_pnl_pct = ((trade['price'] - current_price) / trade['price']) * 100
-                        
-                        pnl_color = "green" if unrealized_pnl >= 0 else "red"
-                        st.markdown(f"**Current Price:** ₹{current_price:.2f}")
-                        st.markdown(f"**Unrealized P&L:** <span style='color:{pnl_color}'>₹{unrealized_pnl:,.2f} ({unrealized_pnl_pct:+.2f}%)</span>", unsafe_allow_html=True)
-                        
-                        if st.button(f"Close Position #{idx+1}", key=f"close_{idx}"):
-                            trade_idx = len(st.session_state.paper_trades) - len(open_trades) + idx
-                            st.session_state.paper_trades[trade_idx]['status'] = 'CLOSED'
-                            st.session_state.paper_trades[trade_idx]['exit_price'] = current_price
-                            st.session_state.paper_trades[trade_idx]['exit_time'] = datetime.now(IST).strftime('%Y-%m-%d %H:%M:%S IST')
-                            st.session_state.paper_capital += unrealized_pnl
-                            
-                            if len(open_trades) == 1:
-                                st.session_state.live_monitoring = False
-                            
-                            st.rerun()
-            
-            if closed_trades:
-                st.markdown("**Closed Positions:**")
-                closed_df_data = []
+                            pnl = (trade['price'] - trade['exit_price']) * trade['quantity']
+                        total_pnl += pnl
                 
-                for trade in closed_trades:
-                    if trade['action'] == 'BUY':
-                        pnl = (trade['exit_price'] - trade['price']) * trade['quantity']
-                    else:
-                        pnl = (trade['price'] - trade['exit_price']) * trade['quantity']
-                    
-                    pnl_pct = (pnl / trade['value']) * 100
-                    
-                    strategy_str = f"Z:{trade['strategy']['zscore']:.2f}, Vol:{trade['strategy']['volatility']:.1f}%, RSI:{trade['strategy']['rsi']:.0f}"
-                    
-                    closed_df_data.append({
-                        'Ticker': trade['ticker'],
-                        'Action': trade['action'],
-                        'Entry Price': f"₹{trade['price']:.2f}",
-                        'Exit Price': f"₹{trade['exit_price']:.2f}",
-                        'Quantity': trade['quantity'],
-                        'Entry Time': trade['entry_time'],
-                        'Exit Time': trade['exit_time'],
-                        'P&L': f"₹{pnl:,.2f}",
-                        'P&L %': f"{pnl_pct:+.2f}%",
-                        'Strategy': strategy_str
-                    })
+                pnl_color = "green" if total_pnl >= 0 else "red"
+                st.markdown(f"**Total P&L:** <span style='color:{pnl_color}'>₹{total_pnl:,.2f}</span>", unsafe_allow_html=True)
+            
+            # Live Guidance Panel
+            if st.session_state.live_monitoring and st.session_state.paper_trades:
+                open_trades = [t for t in st.session_state.paper_trades if t['status'] == 'OPEN']
                 
-                if closed_df_data:
-                    closed_df = pd.DataFrame(closed_df_data)
-                    st.dataframe(closed_df, use_container_width=True)
-        
-        # Detailed Analysis Tabs
-        st.markdown("---")
-        st.markdown("## 📊 Detailed Multi-Timeframe Analysis")
-        
-        analysis_tabs = st.tabs(["1 Day", "1 Hour", "15 Min", "Summary Table"])
-        
-        with analysis_tabs[0]:
-            daily_keys = [k for k in results.keys() if k.startswith('1d_')]
-            if daily_keys:
-                for key in daily_keys[:3]:
-                    period = key.split('_')[1]
-                    st.markdown(f"### Daily - {period} Period")
-                    
-                    result = results[key]['ticker1']
-                    df = result['data']
-                    
-                    col1, col2, col3, col4, col5 = st.columns(5)
-                    col1.metric("Signal", result['signals']['signal'])
-                    col2.metric("Confidence", f"{result['signals']['confidence']:.1f}%")
-                    col3.metric("RSI", f"{df['RSI'].iloc[-1]:.1f}")
-                    col4.metric("ADX", f"{df['ADX'].iloc[-1]:.1f}")
-                    col5.metric("Z-Score", f"{df['Price_ZScore'].iloc[-1]:.2f}")
-                    
-                    st.markdown("**Key Indicators:**")
-                    for reason in result['signals']['reasons'][:5]:
-                        st.markdown(f"- {reason}")
-                    
+                if open_trades:
                     st.markdown("---")
-        
-        with analysis_tabs[1]:
-            hourly_keys = [k for k in results.keys() if k.startswith('1h_')]
-            if hourly_keys:
-                for key in hourly_keys[:2]:
-                    period = key.split('_')[1]
-                    st.markdown(f"### Hourly - {period} Period")
+                    st.markdown("### 🔴 LIVE TRADING GUIDANCE - Your Personal Trading Assistant")
                     
-                    result = results[key]['ticker1']
-                    df = result['data']
+                    refresh_btn = st.button("🔄 Refresh Live Analysis", type="secondary", key="refresh_live")
                     
-                    col1, col2, col3, col4 = st.columns(4)
-                    col1.metric("Signal", result['signals']['signal'])
-                    col2.metric("Confidence", f"{result['signals']['confidence']:.1f}%")
-                    col3.metric("RSI", f"{df['RSI'].iloc[-1]:.1f}")
-                    col4.metric("Volatility", f"{df['Volatility'].iloc[-1]:.2f}%")
-                    
-                    st.markdown("**Key Indicators:**")
-                    for reason in result['signals']['reasons'][:5]:
-                        st.markdown(f"- {reason}")
-                    
-                    st.markdown("---")
-        
-        with analysis_tabs[2]:
-            min15_keys = [k for k in results.keys() if k.startswith('15m_')]
-            if min15_keys:
-                for key in min15_keys[:2]:
-                    period = key.split('_')[1]
-                    st.markdown(f"### 15-Minute - {period} Period")
-                    
-                    result = results[key]['ticker1']
-                    df = result['data']
-                    
-                    col1, col2, col3, col4 = st.columns(4)
-                    col1.metric("Signal", result['signals']['signal'])
-                    col2.metric("Confidence", f"{result['signals']['confidence']:.1f}%")
-                    col3.metric("RSI", f"{df['RSI'].iloc[-1]:.1f}")
-                    col4.metric("MACD", f"{df['MACD'].iloc[-1]:.2f}")
-                    
-                    st.markdown("**Key Indicators:**")
-                    for reason in result['signals']['reasons'][:5]:
-                        st.markdown(f"- {reason}")
-                    
-                    st.markdown("---")
-        
-        with analysis_tabs[3]:
-            st.markdown("### All Timeframes Summary")
+                    if refresh_btn:
+                        for trade in open_trades:
+                            st.markdown(f"## Position: {trade['action']} {trade['ticker']}")
+                            guidance = generate_friendly_guidance(analyzer, st.session_state.ticker1_symbol, trade, results)
+                            st.markdown('<div class="live-guidance">', unsafe_allow_html=True)
+                            st.markdown(guidance, unsafe_allow_html=True)
+                            st.markdown('</div>', unsafe_allow_html=True)
+                            st.markdown("---")
             
-            summary_data = []
-            for key, result in results.items():
-                if 'ticker1' in result and 'signals' in result['ticker1']:
-                    interval, period = key.split('_')
-                    signal_data = result['ticker1']['signals']
-                    df = result['ticker1']['data']
+            # Display trade positions
+            if st.session_state.paper_trades:
+                st.markdown("#### 📋 Active Positions & Trade History")
+                
+                open_trades = [t for t in st.session_state.paper_trades if t['status'] == 'OPEN']
+                closed_trades = [t for t in st.session_state.paper_trades if t['status'] == 'CLOSED']
+                
+                if open_trades:
+                    st.markdown("**Open Positions:**")
                     
-                    summary_data.append({
-                        'Timeframe': interval,
-                        'Period': period,
-                        'Signal': signal_data['signal'],
-                        'Confidence': f"{signal_data['confidence']:.1f}%",
-                        'RSI': f"{df['RSI'].iloc[-1]:.1f}",
-                        'ADX': f"{df['ADX'].iloc[-1]:.1f}",
-                        'Volatility': f"{df['Volatility'].iloc[-1]:.2f}%",
-                        'Z-Score': f"{df['Price_ZScore'].iloc[-1]:.2f}",
-                        'Data Points': len(df)
-                    })
+                    position_data = []
+                    for idx, trade in enumerate(open_trades):
+                        latest_key = [k for k in results.keys() if '1d_' in k][0]
+                        latest_data = results[latest_key]['ticker1']['data']
+                        current_price = latest_data['Close'].iloc[-1]
+                        
+                        if trade['quantity'] > 0:
+                            if trade['action'] == 'BUY':
+                                unrealized_pnl = (current_price - trade['price']) * trade['quantity']
+                                unrealized_pnl_pct = ((current_price - trade['price']) / trade['price']) * 100
+                            else:
+                                unrealized_pnl = (trade['price'] - current_price) * trade['quantity']
+                                unrealized_pnl_pct = ((trade['price'] - current_price) / trade['price']) * 100
+                            
+                            strategy_str = f"Z-Score: {trade['strategy']['zscore']:.2f}, Vol: {trade['strategy']['volatility']:.2f}%, RSI: {trade['strategy']['rsi']:.1f}"
+                            
+                            position_data.append({
+                                'Position': idx + 1,
+                                'Ticker': trade['ticker'],
+                                'Action': trade['action'],
+                                'Entry Price': f"₹{trade['price']:.2f}",
+                                'Current Price': f"₹{current_price:.2f}",
+                                'Quantity': trade['quantity'],
+                                'Entry Time': trade['entry_time'],
+                                'Unrealized P&L': f"₹{unrealized_pnl:,.2f}",
+                                'P&L %': f"{unrealized_pnl_pct:+.2f}%",
+                                'Strategy Used': strategy_str,
+                                'Confidence': f"{trade['confidence']:.1f}%"
+                            })
+                    
+                    if position_data:
+                        position_df = pd.DataFrame(position_data)
+                        st.dataframe(position_df, use_container_width=True)
+                    
+                    for idx, trade in enumerate(open_trades):
+                        with st.expander(f"Position #{idx+1} Details"):
+                            latest_key = [k for k in results.keys() if '1d_' in k][0]
+                            latest_data = results[latest_key]['ticker1']['data']
+                            current_price = latest_data['Close'].iloc[-1]
+                            
+                            if trade['quantity'] > 0:
+                                if trade['action'] == 'BUY':
+                                    unrealized_pnl = (current_price - trade['price']) * trade['quantity']
+                                    unrealized_pnl_pct = ((current_price - trade['price']) / trade['price']) * 100
+                                else:
+                                    unrealized_pnl = (trade['price'] - current_price) * trade['quantity']
+                                    unrealized_pnl_pct = ((trade['price'] - current_price) / trade['price']) * 100
+                                
+                                pnl_color = "green" if unrealized_pnl >= 0 else "red"
+                                st.markdown(f"**Current Price:** ₹{current_price:.2f}")
+                                st.markdown(f"**Unrealized P&L:** <span style='color:{pnl_color}'>₹{unrealized_pnl:,.2f} ({unrealized_pnl_pct:+.2f}%)</span>", unsafe_allow_html=True)
+                                
+                                if st.button(f"Close Position #{idx+1}", key=f"close_{idx}"):
+                                    trade_idx = len(st.session_state.paper_trades) - len(open_trades) + idx
+                                    st.session_state.paper_trades[trade_idx]['status'] = 'CLOSED'
+                                    st.session_state.paper_trades[trade_idx]['exit_price'] = current_price
+                                    st.session_state.paper_trades[trade_idx]['exit_time'] = datetime.now(IST).strftime('%Y-%m-%d %H:%M:%S IST')
+                                    st.session_state.paper_capital += unrealized_pnl
+                                    
+                                    if len(open_trades) == 1:
+                                        st.session_state.live_monitoring = False
+                                    
+                                    st.rerun()
+                
+                if closed_trades:
+                    st.markdown("**Closed Positions:**")
+                    closed_df_data = []
+                    
+                    for trade in closed_trades:
+                        if trade['quantity'] > 0:
+                            if trade['action'] == 'BUY':
+                                pnl = (trade['exit_price'] - trade['price']) * trade['quantity']
+                            else:
+                                pnl = (trade['price'] - trade['exit_price']) * trade['quantity']
+                            
+                            pnl_pct = (pnl / trade['value']) * 100
+                            
+                            strategy_str = f"Z:{trade['strategy']['zscore']:.2f}, Vol:{trade['strategy']['volatility']:.1f}%, RSI:{trade['strategy']['rsi']:.0f}"
+                            
+                            closed_df_data.append({
+                                'Ticker': trade['ticker'],
+                                'Action': trade['action'],
+                                'Entry Price': f"₹{trade['price']:.2f}",
+                                'Exit Price': f"₹{trade['exit_price']:.2f}",
+                                'Quantity': trade['quantity'],
+                                'Entry Time': trade['entry_time'],
+                                'Exit Time': trade['exit_time'],
+                                'P&L': f"₹{pnl:,.2f}",
+                                'P&L %': f"{pnl_pct:+.2f}%",
+                                'Strategy': strategy_str
+                            })
+                    
+                    if closed_df_data:
+                        closed_df = pd.DataFrame(closed_df_data)
+                        st.dataframe(closed_df, use_container_width=True)
             
-            if summary_data:
-                summary_df = pd.DataFrame(summary_data)
-                st.dataframe(summary_df, use_container_width=True, height=400)
-        
-        # Ratio Analysis
-        if enable_ratio and ticker2:
+            # Backtesting Section
             st.markdown("---")
-            st.markdown("## 📊 Ratio Analysis")
+            st.markdown("## 🔬 Detailed Strategy Backtesting")
             
-            ratio_keys = [k for k in results.keys() if 'ticker2' in results[k] and '1d_' in k]
-            if ratio_keys:
-                key = ratio_keys[0]
-                df1 = results[key]['ticker1']['data']
-                df2 = results[key]['ticker2']['data']
-                
-                common_index = df1.index.intersection(df2.index)
-                df1_aligned = df1.loc[common_index]
-                df2_aligned = df2.loc[common_index]
-                
-                ratio_df = pd.DataFrame({
-                    'DateTime': common_index,
-                    'Ticker1_Price': df1_aligned['Close'].values,
-                    'Ticker2_Price': df2_aligned['Close'].values,
-                    'Ratio': df1_aligned['Close'].values / df2_aligned['Close'].values,
-                    'Ticker1_RSI': df1_aligned['RSI'].values,
-                    'Ticker2_RSI': df2_aligned['RSI'].values,
-                    'Ticker1_Volatility': df1_aligned['Volatility'].values,
-                    'Ticker2_Volatility': df2_aligned['Volatility'].values,
-                    'Ticker1_ZScore': df1_aligned['Price_ZScore'].values,
-                    'Ticker2_ZScore': df2_aligned['Price_ZScore'].values,
-                })
-                
-                ratio_df['Ratio_Returns'] = ratio_df['Ratio'].pct_change()
-                ratio_df['Ratio_RSI'] = TechnicalIndicators.calculate_rsi(pd.Series(ratio_df['Ratio'].values), 14)
-                ratio_df['Ratio_ZScore'] = TechnicalIndicators.calculate_zscore(pd.Series(ratio_df['Ratio'].values), 20)
-                
-                st.markdown(f"### {st.session_state.ticker1_name} / {st.session_state.ticker2_name} Ratio Analysis")
-                
-                col1, col2, col3, col4 = st.columns(4)
-                current_ratio = ratio_df['Ratio'].iloc[-1]
-                ratio_change = ((ratio_df['Ratio'].iloc[-1] - ratio_df['Ratio'].iloc[-2]) / ratio_df['Ratio'].iloc[-2]) * 100
-                
-                col1.metric("Current Ratio", f"{current_ratio:.4f}", f"{ratio_change:+.2f}%")
-                col2.metric("Ratio RSI", f"{ratio_df['Ratio_RSI'].iloc[-1]:.1f}")
-                col3.metric("Ratio Z-Score", f"{ratio_df['Ratio_ZScore'].iloc[-1]:.2f}")
-                col4.metric("Spread Volatility", f"{ratio_df['Ratio_Returns'].std() * 100:.2f}%")
-                
-                st.markdown("#### Detailed Ratio Data (Last 20 rows)")
-                display_df = ratio_df[['DateTime', 'Ticker1_Price', 'Ticker2_Price', 'Ratio', 
-                                       'Ticker1_RSI', 'Ticker2_RSI', 'Ratio_RSI', 
-                                       'Ticker1_Volatility', 'Ticker2_Volatility',
-                                       'Ticker1_ZScore', 'Ticker2_ZScore', 'Ratio_ZScore']].tail(20)
-                st.dataframe(display_df, use_container_width=True)
-                
-                csv = ratio_df.to_csv(index=False)
-                st.download_button(
-                    label="📥 Download Ratio Analysis (CSV)",
-                    data=csv,
-                    file_name=f"ratio_analysis_{datetime.now(IST).strftime('%Y%m%d_%H%M%S')}.csv",
-                    mime="text/csv"
-                )
-        
-        # Backtesting
-        st.markdown("---")
-        st.markdown("## 🔬 Strategy Backtesting")
-        
-        if st.button("Run Backtest", type="secondary"):
-            with st.spinner("Running backtest..."):
-                daily_keys = [k for k in results.keys() if k.startswith('1d_') and ('1y' in k or '2y' in k)]
+            if st.button("Run Detailed Backtest", type="secondary"):
+                with st.spinner("Running comprehensive backtest with detailed trade analysis..."):
+                    daily_keys = [k for k in results.keys() if k.startswith('1d_') and ('1y' in k or '2y' in k)]
+                    if daily_keys:
+                        daily_key = daily_keys[0]
+                        df = results[daily_key]['ticker1']['data'].copy()
+                        
+                        # Run detailed backtest
+                        backtest_results = run_detailed_backtest(df, st.session_state.ticker1_name)
+                        
+                        if not backtest_results.empty:
+                            st.markdown("### 📊 Backtest Summary")
+                            
+                            # Calculate summary statistics
+                            total_trades = len(backtest_results)
+                            winning_trades = len(backtest_results[backtest_results['Result'] == '✅ WIN'])
+                            losing_trades = len(backtest_results[backtest_results['Result'] == '❌ LOSS'])
+                            win_rate = (winning_trades / total_trades * 100) if total_trades > 0 else 0
+                            
+                            # Extract P&L values
+                            pnl_values = []
+                            for pnl_str in backtest_results['P&L %']:
+                                pnl_values.append(float(pnl_str.replace('%', '').replace('+', '')))
+                            
+                            avg_win = np.mean([p for p in pnl_values if p > 0]) if any(p > 0 for p in pnl_values) else 0
+                            avg_loss = np.mean([p for p in pnl_values if p < 0]) if any(p < 0 for p in pnl_values) else 0
+                            total_return = sum(pnl_values)
+                            
+                            col1, col2, col3, col4, col5 = st.columns(5)
+                            col1.metric("Total Trades", total_trades)
+                            col2.metric("Win Rate", f"{win_rate:.1f}%")
+                            col3.metric("Avg Win", f"{avg_win:.2f}%")
+                            col4.metric("Avg Loss", f"{avg_loss:.2f}%")
+                            col5.metric("Total Return", f"{total_return:.2f}%")
+                            
+                            # Display detailed trade table
+                            st.markdown("### 📋 Detailed Trade History")
+                            st.markdown(f"**Timeframe Used:** 1 Day / {daily_key.split('_')[1]}")
+                            st.markdown("**Strategy:** Buy when RSI < 30 and Price > EMA20, Exit at target/stop-loss/RSI > 70")
+                            
+                            st.dataframe(backtest_results, use_container_width=True, height=400)
+                            
+                            # Download button
+                            csv = backtest_results.to_csv(index=False)
+                            st.download_button(
+                                label="📥 Download Backtest Results (CSV)",
+                                data=csv,
+                                file_name=f"backtest_{st.session_state.ticker1_name}_{datetime.now(IST).strftime('%Y%m%d_%H%M%S')}.csv",
+                                mime="text/csv"
+                            )
+                            
+                            # Analysis of results
+                            st.markdown("### 💡 Backtest Analysis")
+                            
+                            if win_rate >= 60:
+                                st.success(f"✅ **Excellent Strategy!** {win_rate:.1f}% win rate indicates strong performance.")
+                            elif win_rate >= 50:
+                                st.info(f"✓ **Good Strategy.** {win_rate:.1f}% win rate with room for optimization.")
+                            else:
+                                st.warning(f"⚠️ **Strategy needs improvement.** {win_rate:.1f}% win rate suggests optimization needed.")
+                            
+                            if avg_win > abs(avg_loss) * 1.5:
+                                st.success(f"✅ **Excellent Risk/Reward!** Average wins ({avg_win:.2f}%) significantly exceed average losses ({avg_loss:.2f}%).")
+                            elif avg_win > abs(avg_loss):
+                                st.info(f"✓ **Positive Risk/Reward.** Average wins ({avg_win:.2f}%) exceed losses ({avg_loss:.2f}%).")
+                            else:
+                                st.warning(f"⚠️ **Poor Risk/Reward.** Average wins ({avg_win:.2f}%) don't sufficiently exceed losses ({avg_loss:.2f}%).")
+                            
+                        else:
+                            st.info("Not enough data to generate detailed backtest results.")
+                    else:
+                        st.error("No suitable daily data available for backtesting.")
+            
+            # Detailed Analysis Tabs
+            st.markdown("---")
+            st.markdown("## 📊 Detailed Multi-Timeframe Analysis")
+            
+            analysis_tabs = st.tabs(["1 Day", "1 Hour", "15 Min", "Summary Table"])
+            
+            with analysis_tabs[0]:
+                daily_keys = [k for k in results.keys() if k.startswith('1d_')]
                 if daily_keys:
-                    daily_key = daily_keys[0]
-                    df = results[daily_key]['ticker1']['data'].copy()
+                    for key in daily_keys[:3]:
+                        period = key.split('_')[1]
+                        st.markdown(f"### Daily - {period} Period")
+                        
+                        result = results[key]['ticker1']
+                        df = result['data']
+                        
+                        col1, col2, col3, col4, col5 = st.columns(5)
+                        col1.metric("Signal", result['signals']['signal'])
+                        col2.metric("Confidence", f"{result['signals']['confidence']:.1f}%")
+                        col3.metric("RSI", f"{df['RSI'].iloc[-1]:.1f}")
+                        col4.metric("ADX", f"{df['ADX'].iloc[-1]:.1f}")
+                        col5.metric("Z-Score", f"{df['Price_ZScore'].iloc[-1]:.2f}")
+                        
+                        st.markdown("**Key Indicators:**")
+                        for reason in result['signals']['reasons'][:5]:
+                            st.markdown(f"- {reason}")
+                        
+                        st.markdown("---")
+            
+            with analysis_tabs[1]:
+                hourly_keys = [k for k in results.keys() if k.startswith('1h_')]
+                if hourly_keys:
+                    for key in hourly_keys[:2]:
+                        period = key.split('_')[1]
+                        st.markdown(f"### Hourly - {period} Period")
+                        
+                        result = results[key]['ticker1']
+                        df = result['data']
+                        
+                        col1, col2, col3, col4 = st.columns(4)
+                        col1.metric("Signal", result['signals']['signal'])
+                        col2.metric("Confidence", f"{result['signals']['confidence']:.1f}%")
+                        col3.metric("RSI", f"{df['RSI'].iloc[-1]:.1f}")
+                        col4.metric("Volatility", f"{df['Volatility'].iloc[-1]:.2f}%")
+                        
+                        st.markdown("**Key Indicators:**")
+                        for reason in result['signals']['reasons'][:5]:
+                            st.markdown(f"- {reason}")
+                        
+                        st.markdown("---")
+            
+            with analysis_tabs[2]:
+                min15_keys = [k for k in results.keys() if k.startswith('15m_')]
+                if min15_keys:
+                    for key in min15_keys[:2]:
+                        period = key.split('_')[1]
+                        st.markdown(f"### 15-Minute - {period} Period")
+                        
+                        result = results[key]['ticker1']
+                        df = result['data']
+                        
+                        col1, col2, col3, col4 = st.columns(4)
+                        col1.metric("Signal", result['signals']['signal'])
+                        col2.metric("Confidence", f"{result['signals']['confidence']:.1f}%")
+                        col3.metric("RSI", f"{df['RSI'].iloc[-1]:.1f}")
+                        col4.metric("MACD", f"{df['MACD'].iloc[-1]:.2f}")
+                        
+                        st.markdown("**Key Indicators:**")
+                        for reason in result['signals']['reasons'][:5]:
+                            st.markdown(f"- {reason}")
+                        
+                        st.markdown("---")
+            
+            with analysis_tabs[3]:
+                st.markdown("### All Timeframes Summary")
+                
+                summary_data = []
+                for key, result in results.items():
+                    if 'ticker1' in result and 'signals' in result['ticker1']:
+                        interval, period = key.split('_')
+                        signal_data = result['ticker1']['signals']
+                        df = result['ticker1']['data']
+                        
+                        summary_data.append({
+                            'Timeframe': interval,
+                            'Period': period,
+                            'Signal': signal_data['signal'],
+                            'Confidence': f"{signal_data['confidence']:.1f}%",
+                            'RSI': f"{df['RSI'].iloc[-1]:.1f}",
+                            'ADX': f"{df['ADX'].iloc[-1]:.1f}",
+                            'Volatility': f"{df['Volatility'].iloc[-1]:.2f}%",
+                            'Z-Score': f"{df['Price_ZScore'].iloc[-1]:.2f}",
+                            'Data Points': len(df)
+                        })
+                
+                if summary_data:
+                    summary_df = pd.DataFrame(summary_data)
+                    st.dataframe(summary_df, use_container_width=True, height=400)
+            
+            # Ratio Analysis
+            if enable_ratio and ticker2:
+                st.markdown("---")
+                st.markdown("## 📊 Ratio Analysis")
+                
+                ratio_keys = [k for k in results.keys() if 'ticker2' in results[k] and '1d_' in k]
+                if ratio_keys:
+                    key = ratio_keys[0]
+                    df1 = results[key]['ticker1']['data']
+                    df2 = results[key]['ticker2']['data']
                     
-                    df['Signal'] = 0
-                    df.loc[(df['RSI'] < 30) & (df['Close'] > df['EMA_20']), 'Signal'] = 1
-                    df.loc[(df['RSI'] > 70), 'Signal'] = -1
+                    common_index = df1.index.intersection(df2.index)
+                    df1_aligned = df1.loc[common_index]
+                    df2_aligned = df2.loc[common_index]
                     
-                    df['Position'] = df['Signal'].shift(1)
-                    df['Strategy_Returns'] = df['Returns'] * df['Position']
-                    df['Cumulative_Strategy_Returns'] = (1 + df['Strategy_Returns']).cumprod()
-                    df['Cumulative_Market_Returns'] = (1 + df['Returns']).cumprod()
+                    ratio_df = pd.DataFrame({
+                        'DateTime': common_index,
+                        'Ticker1_Price': df1_aligned['Close'].values,
+                        'Ticker2_Price': df2_aligned['Close'].values,
+                        'Ratio': df1_aligned['Close'].values / df2_aligned['Close'].values,
+                        'Ticker1_RSI': df1_aligned['RSI'].values,
+                        'Ticker2_RSI': df2_aligned['RSI'].values,
+                        'Ticker1_Volatility': df1_aligned['Volatility'].values,
+                        'Ticker2_Volatility': df2_aligned['Volatility'].values,
+                        'Ticker1_ZScore': df1_aligned['Price_ZScore'].values,
+                        'Ticker2_ZScore': df2_aligned['Price_ZScore'].values,
+                    })
                     
-                    total_return = (df['Cumulative_Strategy_Returns'].iloc[-1] - 1) * 100
-                    market_return = (df['Cumulative_Market_Returns'].iloc[-1] - 1) * 100
+                    ratio_df['Ratio_Returns'] = ratio_df['Ratio'].pct_change()
+                    ratio_df['Ratio_RSI'] = TechnicalIndicators.calculate_rsi(pd.Series(ratio_df['Ratio'].values), 14)
+                    ratio_df['Ratio_ZScore'] = TechnicalIndicators.calculate_zscore(pd.Series(ratio_df['Ratio'].values), 20)
                     
-                    strategy_std = df['Strategy_Returns'].std()
-                    sharpe_ratio = (df['Strategy_Returns'].mean() / strategy_std) * np.sqrt(252) if strategy_std > 0 else 0
-                    
-                    max_drawdown = ((df['Cumulative_Strategy_Returns'].cummax() - df['Cumulative_Strategy_Returns']) / df['Cumulative_Strategy_Returns'].cummax()).max() * 100
-                    
-                    st.markdown("### Backtest Results")
+                    st.markdown(f"### {st.session_state.ticker1_name} / {st.session_state.ticker2_name} Ratio Analysis")
+                    st.markdown(f"**Timeframe:** 1 Day / {key.split('_')[1]}")
                     
                     col1, col2, col3, col4 = st.columns(4)
-                    col1.metric("Strategy Return", f"{total_return:.2f}%")
-                    col2.metric("Buy & Hold Return", f"{market_return:.2f}%")
-                    col3.metric("Sharpe Ratio", f"{sharpe_ratio:.2f}")
-                    col4.metric("Max Drawdown", f"-{max_drawdown:.2f}%")
+                    current_ratio = ratio_df['Ratio'].iloc[-1]
+                    ratio_change = ((ratio_df['Ratio'].iloc[-1] - ratio_df['Ratio'].iloc[-2]) / ratio_df['Ratio'].iloc[-2]) * 100
                     
-                    performance_df = pd.DataFrame({
-                        'Date': df.index,
-                        'Strategy': df['Cumulative_Strategy_Returns'].values * 100000,
-                        'Market': df['Cumulative_Market_Returns'].values * 100000
-                    }).set_index('Date')
+                    col1.metric("Current Ratio", f"{current_ratio:.4f}", f"{ratio_change:+.2f}%")
+                    col2.metric("Ratio RSI", f"{ratio_df['Ratio_RSI'].iloc[-1]:.1f}")
+                    col3.metric("Ratio Z-Score", f"{ratio_df['Ratio_ZScore'].iloc[-1]:.2f}")
+                    col4.metric("Spread Volatility", f"{ratio_df['Ratio_Returns'].std() * 100:.2f}%")
                     
-                    st.line_chart(performance_df)
+                    st.markdown("#### Detailed Ratio Data (Last 20 rows)")
+                    display_df = ratio_df[['DateTime', 'Ticker1_Price', 'Ticker2_Price', 'Ratio', 
+                                           'Ticker1_RSI', 'Ticker2_RSI', 'Ratio_RSI', 
+                                           'Ticker1_Volatility', 'Ticker2_Volatility',
+                                           'Ticker1_ZScore', 'Ticker2_ZScore', 'Ratio_ZScore']].tail(20)
+                    st.dataframe(display_df, use_container_width=True)
                     
-                    trades = df[df['Signal'] != 0].copy()
-                    num_trades = len(trades)
-                    winning_trades = len(trades[trades['Strategy_Returns'] > 0])
-                    win_rate = (winning_trades / num_trades * 100) if num_trades > 0 else 0
-                    
-                    avg_return = df['Strategy_Returns'][df['Strategy_Returns'] != 0].mean() * 100
-                    
-                    st.markdown(f"""
-                    **Trade Statistics:**
-                    - Total Trades: {num_trades}
-                    - Winning Trades: {winning_trades}
-                    - Win Rate: {win_rate:.1f}%
-                    - Average Return per Trade: {avg_return:.2f}%
-                    """)
-                    
-                    if total_return < 0:
-                        st.warning("⚠️ Strategy showing negative returns. Consider optimization or different parameters.")
-                        st.info("💡 Tip: Try adjusting RSI thresholds, adding stop-loss levels, or combining with other indicators.")
-                    else:
-                        st.success(f"✅ Strategy generated positive returns of {total_return:.2f}% over the backtest period!")
-                else:
-                    st.error("No suitable data available for backtesting.")
+                    csv = ratio_df.to_csv(index=False)
+                    st.download_button(
+                        label="📥 Download Ratio Analysis (CSV)",
+                        data=csv,
+                        file_name=f"ratio_analysis_{datetime.now(IST).strftime('%Y%m%d_%H%M%S')}.csv",
+                        mime="text/csv"
+                    )
 
     else:
         st.info("👆 Configure your analysis parameters in the sidebar and click 'Start Complete Analysis' to begin.")
         
         st.markdown("""
-        ### 🎯 Features:
+        ### 🎯 Enhanced Features:
         
-        - **Multi-Timeframe Analysis**: Analyzes all available timeframes from 1-minute to monthly
+        - **Multi-Timeframe Analysis**: Analyzes all available timeframes with proper labeling
         - **Comprehensive Indicators**: RSI, MACD, ADX, Bollinger Bands, EMA/SMA, Fibonacci, Stochastic, ATR
         - **Z-Score Analysis**: Price and returns Z-score for mean reversion detection
         - **Support/Resistance Detection**: Identifies strong price levels with historical validation
         - **Elliott Wave Detection**: Simplified wave pattern recognition
-        - **AI-Powered Signals**: Generates BUY/SELL/HOLD recommendations with confidence levels
-        - **Ratio Analysis**: Compare two assets for spread trading opportunities with Z-scores
-        - **Paper Trading with Live Guidance**: Test recommendations with real-time market analysis
-        - **Live Trading Guidance**: Continuous monitoring with entry/exit/hold recommendations
-        - **Detailed Position Tracking**: Track all metrics including entry/exit prices, strategy used, P&L
-        - **Backtesting Engine**: Validate strategies with historical performance data
-        - **Real-time Analysis**: Rate-limited API calls to ensure reliability
-        
-        ### 📝 Instructions:
-        
-        1. Select your asset(s) from the sidebar
-        2. Optionally enable ratio analysis for pair trading
-        3. Click "Start Complete Analysis" to run comprehensive analysis
-        4. Review multi-timeframe signals, Z-scores, and confidence levels
-        5. Execute paper trades to test recommendations
-        6. Monitor positions with live guidance and track performance
-        7. Use "Refresh Live Data" button to get updated market conditions
+        - **Historical Pattern Matching**: Finds similar patterns from past with outcome predictions
+        - **Friend-like Live Guidance**: Personalized trading advice comparing entry vs current conditions
+        - **What's Working Analysis**: Clear indication of which factors support or oppose your trade
+        - **Detailed Backtesting**: Complete trade history with entry/exit levels, reasons, and P&L
+        - **Paper Trading**: Test recommendations with real-time guidance and position tracking
         
         ### 💡 Live Trading Guidance Features:
         
-        - **Real-time Price Updates**: Current price with RSI, ADX, volatility
-        - **Z-Score Monitoring**: Track mean reversion opportunities
-        - **Support/Resistance Levels**: Distance from key levels
-        - **Fibonacci Levels**: Proximity to important retracement levels
-        - **Elliott Wave Status**: Current wave pattern and confidence
-        - **Entry/Exit Recommendations**: Clear guidance on when to trade
-        - **Strategy Tracking**: All positions show strategy metrics (Z-score, volatility, RSI at entry)
+        - **Entry Analysis**: Review why you entered and at what parameter values
+        - **Current vs Entry Comparison**: See how Z-score, volatility, RSI have changed
+        - **Historical Pattern Match**: Find similar past patterns with 85%+ correlation
+        - **Support/Resistance Proximity**: Distance and strength of nearby levels
+        - **What's Working/Not Working**: Clear breakdown of supporting vs opposing factors
+        - **Friend-like Recommendations**: EXIT NOW / CAUTION / HOLD STRONG based on analysis
+        - **Timeframe Labels**: Every analysis clearly shows which timeframe/period used
+        
+        ### 📊 Detailed Backtesting:
+        
+        - Entry/Exit datetime with IST timezone
+        - Entry/Exit price levels and RSI values
+        - Stop-loss and target calculations (1.5x ATR for SL, 2x ATR for target)
+        - Entry and exit reasons clearly explained
+        - P&L in both points and percentage
+        - Win/Loss indicator for each trade
+        - Summary statistics with win rate and average returns
         
         ### ⚠️ Disclaimer:
         
