@@ -1080,4 +1080,4 @@ def main():
                     current_analysis += 1
                     progress = current_analysis / total_analyses
                     progress_bar.progress(progress)
-                    status_text.text(f"Analyzing {ticker2_name} - {interval}/{period} ({current
+                    status_text.text(f"Analyzing {ticker2_name} - {interval}/{period} ({current_analysis}))
