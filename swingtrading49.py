@@ -1018,9 +1018,36 @@ def main():
     else:
         st.info("👆 Configure your analysis and click 'Start Complete Analysis'")
 
+    else:
+        st.info("👆 Configure your analysis and click 'Start Complete Analysis'")
+        
+        st.markdown("""
+        ### 🎯 Enhanced Features:
+        
+        - **Multi-Timeframe Analysis**: Comprehensive analysis across multiple timeframes
+        - **RSI Divergence Detection**: Automatic detection of bullish/bearish divergences
+        - **Auto-Refresh Positions**: Live updates every 2 seconds
+        - **Entry/Target/SL**: Clear entry points with calculated targets and stop-loss
+        - **Advanced Visualizations**: 5 comprehensive chart types
+        - **No NaN Issues**: Robust indicator calculations with proper error handling
+        
+        ### 📊 Visualization Tabs:
+        
+        1. **Price & RSI**: Candlestick + RSI with divergence detection
+        2. **Ratio Analysis**: Compare two tickers with ratio plot
+        3. **Volatility**: Track price volatility over time
+        4. **Fibonacci**: View key retracement levels
+        5. **Technical Indicators**: Complete multi-indicator dashboard
+        
+        ### ⚠️ Disclaimer:
+        
+        Educational purposes only. Not financial advice. Trade at your own risk.
+        """)
+
 if __name__ == "__main__":
-    main()
-    df['High'],low=df['Low'], close=df['Close'], name='Price'),row=1, col=1)
+    main()df['High'],
+                                  low=df['Low'], close=df['Close'], name='Price'),
+                  row=1, col=1)
     
     if 'EMA_20' in df.columns:
         fig.add_trace(go.Scatter(x=df.index, y=df['EMA_20'], name='EMA20',
