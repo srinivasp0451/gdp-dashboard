@@ -37,15 +37,15 @@ st.markdown("""
 if 'data_cache' not in st.session_state:
     st.session_state.data_cache = {}
 if 'analysis_results' not in st.session_state:
-    st.session_state.analysis_results = st.text(f"Analyzing {ticker2_name} - {interval}/{period} ({current_analysis}/{total_analyses})")
+    st.session_state.analysis_results =                     status_text.text(f"Analyzing {ticker2_name} - {interval}/{period} ({current_analysis}/{total_analyses})")
                     
-    df2 = analyzer.fetch_data_with_retry(ticker2, period, interval)
+                    df2 = analyzer.fetch_data_with_retry(ticker2, period, interval)
                     
-    if df2 is not None and not df2.empty:
-        df2 = analyzer.calculate_indicators(df2)
+                    if df2 is not None and not df2.empty:
+                        df2 = analyzer.calculate_indicators(df2)
                         
-        if f"{interval}_{period}" in all_results:
-            all_results[f"{interval}_{period}"]['ticker2'] = {'data': df2}
+                        if f"{interval}_{period}" in all_results:
+                            all_results[f"{interval}_{period}"]['ticker2'] = {'data': df2}
         
         progress_bar.progress(1.0)
         status_text.text("✅ Analysis Complete!")
@@ -553,7 +553,85 @@ if 'analysis_results' not in st.session_state:
                             col2.metric("Wins", wins)
                             col3.metric("Win Rate", f"{win_rate:.1f}%")
                             
-                
+                            st.dataframe(bt_df, use_container_width=True, height=400)
+                            
+                            csv = bt_df.to_csv(index=False)
+                            st.download_button(
+                                label="📥 Download Backtest Results",
+                                data=csv,
+                                file_name=f"backtest_{st.session_state.ticker1_name}_{datetime.now(IST).strftime('%Y%m%d_%H%M%S')}.csv",
+                                mime="text/csv"
+                            )
+                        else:
+                            st.info("No trades generated in backtest period. Try adjusting strategy parameters.")
+                    else:
+                        st.warning("Not enough historical data for backtesting. Need at least 100 data points.")
+
+    else:
+        st.info("👆 Configure your analysis parameters in the sidebar and click 'Start Complete Analysis' to begin.")
+        
+        st.markdown("""
+        ### 🎯 Complete Feature Set:
+        
+        **✅ Fixed Issues:**
+        - RSI and Volatility NaN values fixed with proper filling
+        - RSI Divergence detection added with strength calculation
+        - Backtesting now works with proper data handling
+        - Auto-refresh positions every 2 seconds
+        - Proper P&L calculation and updates
+        
+        **📊 Visual Analysis:**
+        - Price vs RSI with divergence highlighting
+        - Price vs Volatility comparison
+        - Price vs Fibonacci levels
+        - Technical indicators (MACD, ADX, EMAs)
+        - Ratio analysis charts (Ticker1/Ticker2)
+        - Ticker1 vs Ticker2 price comparison
+        
+        **🎯 Entry/Exit Levels:**
+        - Entry price displayed clearly
+        - Stop-loss (2x ATR)
+        - Three target levels (2x, 3x, 4x ATR)
+        - Risk/Reward ratios
+        - All calculated based on current ATR
+        
+        **📈 RSI Divergence:**
+        - Bullish divergence detection
+        - Bearish divergence detection
+        - Strength calculation
+        - Visual representation on charts
+        - Detailed explanation text
+        
+        **🔄 Auto-Refresh:**
+        - Positions update every 2 seconds
+        - Live price updates
+        - Live parameter updates (RSI, Volatility, Z-Score)
+        - No need to refresh entire page
+        
+        **💼 Enhanced Paper Trading:**
+        - Shows entry targets and stop-loss
+        - Tracks all parameters at entry
+        - Compares entry vs current parameters
+        - Auto-calculates P&L
+        - Position management with targets
+        
+        **🔬 Detailed Backtesting:**
+        - Entry/Exit dates with IST timezone
+        - Entry/Exit prices
+        - Stop-loss and target levels
+        - Exit reasons (Target/Stop-loss/RSI)
+        - P&L in rupees and percentage
+        - Win/Loss indicators
+        - Downloadable CSV results
+        
+        ### ⚠️ Disclaimer:
+        
+        This tool is for educational purposes only. Not financial advice.
+        Past performance does not guarantee future results. Trade at your own risk.
+        """)
+
+if __name__ == "__main__":
+    main()
 if 'paper_trades' not in st.session_state:
     st.session_state.paper_trades = []
 if 'paper_capital' not in st.session_state:
@@ -1080,4 +1158,4 @@ def main():
                     current_analysis += 1
                     progress = current_analysis / total_analyses
                     progress_bar.progress(progress)
-                    status_text.text(f"Analyzing {ticker2_name} - {interval}/{period} ({current_analysis})")
+                    status_text.text(f"Analyzing {ticker2_name} - {interval}/{period} ({current
