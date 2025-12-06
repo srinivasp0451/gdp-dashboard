@@ -1019,9 +1019,8 @@ def main():
         st.info("👆 Configure your analysis and click 'Start Complete Analysis'")
 
 if __name__ == "__main__":
-    main()df['High'],
-                                  low=df['Low'], close=df['Close'], name='Price'),
-                  row=1, col=1)
+    main()
+    df['High'],low=df['Low'], close=df['Close'], name='Price'),row=1, col=1)
     
     if 'EMA_20' in df.columns:
         fig.add_trace(go.Scatter(x=df.index, y=df['EMA_20'], name='EMA20',
