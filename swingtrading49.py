@@ -37,15 +37,15 @@ st.markdown("""
 if 'data_cache' not in st.session_state:
     st.session_state.data_cache = {}
 if 'analysis_results' not in st.session_state:
-    st.session_state.analysis_results =                     status_text.text(f"Analyzing {ticker2_name} - {interval}/{period} ({current_analysis}/{total_analyses})")
+    st.session_state.analysis_results = status_text.text(f"Analyzing {ticker2_name} - {interval}/{period} ({current_analysis}/{total_analyses})")
                     
-                    df2 = analyzer.fetch_data_with_retry(ticker2, period, interval)
+    df2 = analyzer.fetch_data_with_retry(ticker2, period, interval)
                     
-                    if df2 is not None and not df2.empty:
-                        df2 = analyzer.calculate_indicators(df2)
+    if df2 is not None and not df2.empty:
+        df2 = analyzer.calculate_indicators(df2)
                         
-                        if f"{interval}_{period}" in all_results:
-                            all_results[f"{interval}_{period}"]['ticker2'] = {'data': df2}
+        if f"{interval}_{period}" in all_results:
+            all_results[f"{interval}_{period}"]['ticker2'] = {'data': df2}
         
         progress_bar.progress(1.0)
         status_text.text("✅ Analysis Complete!")
