@@ -851,7 +851,7 @@ if st.session_state["live_monitoring"]:
                 st.write(f"RSI14: {rsi_now:.2f} | ATR14: {atr_now:.4f}")
         except Exception as e:
             log_debug(f"Live refresh error: {repr(e)}")
-    st.experimental_rerun()
+    st.rerun()
 
 # ---------------------------
 # Footer / Debug Controls
