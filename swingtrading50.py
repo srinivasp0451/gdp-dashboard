@@ -775,6 +775,46 @@ def main():
     # Main Content
     if not st.session_state.analysis_results:
         st.info("👈 Configure settings in the sidebar and click 'Fetch Data & Analyze' to start")
+        
+        # Show a sample welcome screen
+        st.markdown("---")
+        st.markdown("### 🚀 Welcome to Professional Algorithmic Trading Analysis")
+        
+        col1, col2, col3 = st.columns(3)
+        
+        with col1:
+            st.markdown("#### 📊 Features")
+            st.markdown("""
+            - Multi-timeframe analysis
+            - 20+ Technical indicators
+            - Support/Resistance detection
+            - Fibonacci & Elliott Wave
+            - RSI Divergence
+            - Pattern matching
+            """)
+        
+        with col2:
+            st.markdown("#### 💼 Trading Tools")
+            st.markdown("""
+            - Paper trading
+            - Live monitoring
+            - Backtesting engine
+            - Risk/Reward calculator
+            - Entry/Exit signals
+            - Performance tracking
+            """)
+        
+        with col3:
+            st.markdown("#### 📈 Assets Supported")
+            st.markdown("""
+            - Indian indices (NIFTY, SENSEX)
+            - Cryptocurrencies
+            - Forex pairs
+            - Commodities
+            - Indian stocks
+            - Custom tickers
+            """)
+        
         return
     
     # Create tabs for different views
@@ -798,6 +838,10 @@ def main():
         latest_key = list(st.session_state.analysis_results.keys())[0]
         latest_data = st.session_state.analysis_results[latest_key]
         df = latest_data['df']
+        
+        # Show which timeframe is being displayed
+        tf_display = latest_key.replace('_', '/')
+        st.info(f"📅 **Displaying data for timeframe/period: {tf_display}**")
         
         current_price = df['Close'].iloc[-1]
         prev_price = df['Close'].iloc[-2] if len(df) > 1 else current_price
@@ -829,8 +873,41 @@ def main():
         
         st.divider()
         
+        # Quick Recommendation for this timeframe
+        st.subheader(f"🎯 Quick Signal - {tf_display}")
+        
+        signals_data = latest_data.get('signals')
+        if signals_data:
+            avg_signal = signals_data['signal']
+            
+            if avg_signal > 0.3:
+                signal_type = "BUY"
+                signal_emoji = "🟢"
+                signal_class = "buy-signal"
+            elif avg_signal < -0.3:
+                signal_type = "SELL"
+                signal_emoji = "🔴"
+                signal_class = "sell-signal"
+            else:
+                signal_type = "HOLD"
+                signal_emoji = "🟡"
+                signal_class = "hold-signal"
+            
+            # Calculate simple confidence for this timeframe
+            reason_count = len(signals_data['reasons'])
+            confidence = min(85, 40 + (reason_count * 8))
+            
+            st.markdown(f'<div class="{signal_class}">{signal_emoji} {signal_type} - {confidence}% Confidence (Based on {tf_display})</div>', unsafe_allow_html=True)
+            
+            if signals_data['reasons']:
+                st.markdown("**Key Reasons:**")
+                for reason in signals_data['reasons'][:5]:
+                    st.write(f"• {reason}")
+        
+        st.divider()
+        
         # Key Insights
-        st.subheader("🔍 Key Insights")
+        st.subheader(f"🔍 Key Insights - {tf_display}")
         
         col1, col2 = st.columns(2)
         
@@ -872,13 +949,19 @@ def main():
         # Historical Patterns
         patterns = latest_data.get('patterns', [])
         if patterns:
-            st.subheader("🔮 Similar Historical Patterns")
+            st.subheader(f"🔮 Similar Historical Patterns - {tf_display}")
             for pattern in patterns[:2]:
                 st.markdown(f"""
                 **Pattern from {pattern['date'].strftime('%Y-%m-%d %H:%M IST')}**
                 - Correlation: {pattern['correlation']*100:.1f}%
                 - After this pattern, market {pattern['direction']} by {abs(pattern['future_move']):.2f}% over {pattern['candles']} candles
                 """)
+        
+        st.divider()
+        
+        # Show number of timeframes analyzed
+        total_tf = len(st.session_state.analysis_results)
+        st.success(f"✅ Total {total_tf} timeframe/period combinations analyzed. See 'Multi-Timeframe Analysis' tab for consolidated recommendation.")
     
     # ========================================================================
     # TAB 2: CHARTS
@@ -1194,6 +1277,7 @@ def main():
         
         # Display Signal
         st.markdown(f'<div class="{signal_class}">{signal_emoji} {final_signal} Signal - {confidence}% Confidence</div>', unsafe_allow_html=True)
+        st.caption(f"📊 **Based on analysis of {len(all_signals)} timeframe/period combinations**")
         
         st.divider()
         
@@ -1250,12 +1334,66 @@ def main():
         
         # Timeframe Breakdown
         with st.expander("📅 Detailed Timeframe Breakdown"):
+            st.write(f"**Analyzed {len(timeframe_details)} timeframe/period combinations:**")
+            st.write("")
+            
             for td in timeframe_details:
                 signal_type = "BUY" if td['signal'] > 0.3 else "SELL" if td['signal'] < -0.3 else "HOLD"
-                st.write(f"**{td['timeframe']}**: {signal_type} ({td['signal']:.2f})")
+                
+                if signal_type == "BUY":
+                    st.success(f"**{td['timeframe']}**: 🟢 {signal_type} ({td['signal']:.2f})")
+                elif signal_type == "SELL":
+                    st.error(f"**{td['timeframe']}**: 🔴 {signal_type} ({td['signal']:.2f})")
+                else:
+                    st.warning(f"**{td['timeframe']}**: 🟡 {signal_type} ({td['signal']:.2f})")
+                
                 for reason in td['reasons']:
                     st.write(f"  • {reason}")
                 st.write("")
+        
+        st.divider()
+        
+        # Professional Summary
+        st.subheader("📝 Professional Analysis Summary")
+        
+        # Generate comprehensive summary
+        ticker_name = list(st.session_state.analysis_results.values())[0]['ticker1']
+        num_timeframes = len(timeframe_details)
+        
+        # Get additional context
+        latest_data = list(st.session_state.analysis_results.values())[0]
+        div = latest_data.get('rsi_divergence', {})
+        fib = latest_data.get('fibonacci')
+        sr = latest_data.get('support_resistance', {})
+        patterns = latest_data.get('patterns', [])
+        
+        summary_parts = []
+        
+        summary_parts.append(f"Based on comprehensive multi-timeframe analysis across {num_timeframes} timeframes, **{ticker_name}** shows **{final_signal}** signal with **{confidence}% confidence**.")
+        
+        summary_parts.append(f"Current price at ₹{entry_price:,.2f}.")
+        
+        if div.get('type') != 'None':
+            summary_parts.append(f"{div['type']} RSI divergence detected (strength {div['strength']}%).")
+        
+        if fib:
+            summary_parts.append(f"Price near Fibonacci {fib['closest']} level.")
+        
+        if sr.get('support'):
+            nearest_support = min(sr['support'], key=lambda x: abs(x['distance']))
+            summary_parts.append(f"Strong support at ₹{nearest_support['level']:.2f} ({nearest_support['touches']} touches, {nearest_support['accuracy']:.1f}% accuracy).")
+        
+        if patterns:
+            best_pattern = patterns[0]
+            summary_parts.append(f"Historical pattern match ({best_pattern['correlation']*100:.1f}% correlation) suggests {abs(best_pattern['future_move']):.2f}% {best_pattern['direction']} potential.")
+        
+        summary_parts.append(f"Average Z-Score: {avg_zscore:.2f}.")
+        summary_parts.append(f"Entry: ₹{entry_price:,.2f}, SL: ₹{stop_loss:,.2f}, Targets: ₹{target1:,.2f}/₹{target2:,.2f}/₹{target3:,.2f}.")
+        summary_parts.append(f"Risk/Reward: 1:{rr_ratio:.2f}.")
+        
+        summary_text = " ".join(summary_parts)
+        
+        st.info(summary_text)
     
     # ========================================================================
     # TAB 4: DETAILED ANALYSIS
@@ -1271,6 +1409,9 @@ def main():
         
         analysis = st.session_state.analysis_results[selected_tf]
         df_analysis = analysis['df']
+        
+        # Show selected timeframe prominently
+        st.info(f"📅 **Analyzing: {selected_tf.replace('_', '/')} (Timeframe/Period)**")
         
         st.subheader(f"Analysis Summary - {selected_tf.replace('_', '/')}")
         
@@ -1493,12 +1634,19 @@ def main():
                 avg_signal = np.mean(all_signals)
                 avg_atr = np.mean(all_atrs)
                 
+                # Calculate confidence
+                signal_agreement = sum(1 for s in all_signals if (s > 0.3 and avg_signal > 0.3) or (s < -0.3 and avg_signal < -0.3) or (abs(s) <= 0.3 and abs(avg_signal) <= 0.3))
+                confidence = min(99, int((signal_agreement / len(all_signals)) * 100))
+                
                 if avg_signal > 0.3:
                     recommended_action = "BUY"
+                    rec_emoji = "🟢"
                 elif avg_signal < -0.3:
                     recommended_action = "SELL"
+                    rec_emoji = "🔴"
                 else:
                     recommended_action = "HOLD"
+                    rec_emoji = "🟡"
                 
                 latest_df = list(st.session_state.analysis_results.values())[0]['df']
                 current_price = latest_df['Close'].iloc[-1]
@@ -1509,7 +1657,8 @@ def main():
                 col1, col2 = st.columns(2)
                 
                 with col1:
-                    st.info(f"**Recommended Action:** {recommended_action}")
+                    st.success(f"**{rec_emoji} Recommended Action:** {recommended_action} (Confidence: {confidence}%)")
+                    st.caption(f"Based on {len(all_signals)} timeframe analysis")
                     st.write(f"Current Price: ₹{current_price:,.2f}")
                     st.write(f"RSI: {current_rsi:.2f}")
                     st.write(f"Volatility: {current_vol:.2f}%")
@@ -1545,11 +1694,13 @@ def main():
                             'entry_volatility': current_vol,
                             'entry_zscore': current_zscore,
                             'status': 'open',
-                            'pnl': 0
+                            'pnl': 0,
+                            'confidence': confidence,
+                            'timeframe': '5m/1d'  # Default monitoring timeframe
                         }
                         
                         st.session_state.paper_trades.append(trade)
-                        st.success(f"Trade executed! {action} {quantity} shares at ₹{current_price:.2f}")
+                        st.success(f"✅ Trade executed! {action} {quantity} shares at ₹{current_price:.2f} (Confidence: {confidence}%)")
                         st.rerun()
                     else:
                         st.error("Insufficient capital")
@@ -1603,7 +1754,7 @@ def main():
             
             # Display positions
             for trade in active_trades:
-                with st.expander(f"Position #{trade['id']} - {trade['action']} {trade['quantity']} shares"):
+                with st.expander(f"Position #{trade['id']} - {trade['action']} {trade['quantity']} shares (Confidence: {trade.get('confidence', 'N/A')}%)"):
                     
                     # Get current values
                     if st.session_state.live_monitoring and 'current_price' in trade:
@@ -1626,9 +1777,14 @@ def main():
                     
                     pnl_pct = (pnl / (trade['entry_price'] * trade['quantity'])) * 100
                     
+                    # Show timeframe
+                    monitoring_tf = trade.get('timeframe', '5m/1d')
+                    st.caption(f"📊 **Monitoring Timeframe:** {monitoring_tf}")
+                    
                     # Friendly advisor guidance
-                    st.markdown("### 📊 Trade Entry Analysis (5min/1day timeframe)")
+                    st.markdown("### 📊 Trade Entry Analysis")
                     st.write(f"You entered this **{trade['action']}** position at ₹{trade['entry_price']:,.2f} on {trade['entry_time'].strftime('%Y-%m-%d %H:%M:%S IST')}")
+                    st.caption(f"Initial Confidence: {trade.get('confidence', 'N/A')}%")
                     
                     st.markdown("**Entry Conditions:**")
                     st.write(f"- Z-Score was: {trade['entry_zscore']:.2f}")
