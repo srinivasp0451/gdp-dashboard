@@ -687,7 +687,7 @@ def main():
             ticker2_type = st.selectbox("Select Type", ["Predefined", "Custom"], key="t2_type")
             
             if ticker2_type == "Predefined":
-                ticker2_name = st.selectbox("Select Asset", list(PREDEFINED_TICKERS.keys()), key="t2_pred")
+                ticker2_name = st.selectbox("Select Asset", list(PREDEFINED_TICKERS.keys()), key="t2_pred", index=1)
                 ticker2 = PREDEFINED_TICKERS[ticker2_name]
             else:
                 ticker2 = st.text_input("Enter Ticker Symbol", value="TCS.NS", key="t2_custom")
@@ -696,81 +696,100 @@ def main():
         st.divider()
         
         # Fetch Data Button
-        if st.button("🔄 Fetch Data & Analyze", use_container_width=True):
-            st.session_state.analysis_results = {}
-            st.session_state.data_cache = {}
-            
-            with st.spinner("Fetching data and analyzing..."):
-                progress_bar = st.progress(0)
-                status_text = st.empty()
+        fetch_clicked = st.button("🔄 Fetch Data & Analyze", use_container_width=True)
+        
+        if fetch_clicked:
+            try:
+                st.session_state.analysis_results = {}
+                st.session_state.data_cache = {}
                 
-                # Get all valid combinations for analysis
-                all_combinations = []
-                for tf in TIMEFRAMES:
-                    for p in VALID_COMBINATIONS.get(tf, []):
-                        all_combinations.append((tf, p))
-                
-                total_combinations = len(all_combinations)
-                
-                for idx, (tf, p) in enumerate(all_combinations):
-                    status_text.text(f"Analyzing {ticker1_name} - {tf}/{p} ({idx+1}/{total_combinations})")
+                with st.spinner("Fetching data and analyzing..."):
+                    progress_bar = st.progress(0)
+                    status_text = st.empty()
                     
-                    df1 = fetch_data(ticker1, tf, p)
-                    if df1 is not None and not df1.empty:
-                        df1_with_indicators = calculate_all_indicators(df1)
+                    # Get all valid combinations for analysis
+                    all_combinations = []
+                    for tf in TIMEFRAMES:
+                        for p in VALID_COMBINATIONS.get(tf, []):
+                            all_combinations.append((tf, p))
+                    
+                    total_combinations = len(all_combinations)
+                    successful_fetches = 0
+                    
+                    for idx, (tf, p) in enumerate(all_combinations):
+                        try:
+                            status_text.text(f"Analyzing {ticker1_name} - {tf}/{p} ({idx+1}/{total_combinations})")
+                            
+                            df1 = fetch_data(ticker1, tf, p)
+                            if df1 is not None and not df1.empty:
+                                df1_with_indicators = calculate_all_indicators(df1)
+                                
+                                if df1_with_indicators is not None:
+                                    key = f"{tf}_{p}"
+                                    st.session_state.analysis_results[key] = {
+                                        'df': df1_with_indicators,
+                                        'ticker1': ticker1_name,
+                                        'timeframe': tf,
+                                        'period': p
+                                    }
+                                    
+                                    # Calculate additional analysis
+                                    st.session_state.analysis_results[key]['support_resistance'] = find_support_resistance(df1_with_indicators)
+                                    st.session_state.analysis_results[key]['fibonacci'] = calculate_fibonacci(df1_with_indicators)
+                                    st.session_state.analysis_results[key]['elliott_wave'] = detect_elliott_wave(df1_with_indicators)
+                                    st.session_state.analysis_results[key]['rsi_divergence'] = detect_rsi_divergence(df1_with_indicators)
+                                    st.session_state.analysis_results[key]['patterns'] = find_similar_patterns(df1_with_indicators)
+                                    st.session_state.analysis_results[key]['signals'] = generate_signals(df1_with_indicators, tf, p)
+                                    
+                                    successful_fetches += 1
+                                    
+                                    # Ratio Analysis
+                                    if enable_ratio and ticker2:
+                                        df2 = fetch_data(ticker2, tf, p)
+                                        if df2 is not None and not df2.empty:
+                                            df2_with_indicators = calculate_all_indicators(df2)
+                                            
+                                            # Align dataframes
+                                            common_index = df1_with_indicators.index.intersection(df2_with_indicators.index)
+                                            
+                                            if len(common_index) > 0:
+                                                df1_aligned = df1_with_indicators.loc[common_index]
+                                                df2_aligned = df2_with_indicators.loc[common_index]
+                                                
+                                                ratio_df = pd.DataFrame(index=common_index)
+                                                ratio_df['Ticker1_Price'] = df1_aligned['Close']
+                                                ratio_df['Ticker2_Price'] = df2_aligned['Close']
+                                                ratio_df['Ratio'] = df1_aligned['Close'] / df2_aligned['Close']
+                                                ratio_df['Ticker1_RSI'] = df1_aligned['RSI']
+                                                ratio_df['Ticker2_RSI'] = df2_aligned['RSI']
+                                                ratio_df['Ratio_RSI'] = calculate_rsi(ratio_df['Ratio'])
+                                                ratio_df['Ticker1_Vol'] = df1_aligned['Volatility']
+                                                ratio_df['Ticker2_Vol'] = df2_aligned['Volatility']
+                                                ratio_df['Ticker1_ZScore'] = df1_aligned['Price_ZScore']
+                                                ratio_df['Ticker2_ZScore'] = df2_aligned['Price_ZScore']
+                                                ratio_df['Ratio_ZScore'] = calculate_zscore(ratio_df['Ratio'])
+                                                
+                                                st.session_state.analysis_results[key]['ratio_df'] = ratio_df
+                                                st.session_state.analysis_results[key]['ticker2'] = ticker2_name
+                        except Exception as e:
+                            st.warning(f"Error analyzing {tf}/{p}: {str(e)}")
+                            continue
                         
-                        if df1_with_indicators is not None:
-                            key = f"{tf}_{p}"
-                            st.session_state.analysis_results[key] = {
-                                'df': df1_with_indicators,
-                                'ticker1': ticker1_name,
-                                'timeframe': tf,
-                                'period': p
-                            }
-                            
-                            # Calculate additional analysis
-                            st.session_state.analysis_results[key]['support_resistance'] = find_support_resistance(df1_with_indicators)
-                            st.session_state.analysis_results[key]['fibonacci'] = calculate_fibonacci(df1_with_indicators)
-                            st.session_state.analysis_results[key]['elliott_wave'] = detect_elliott_wave(df1_with_indicators)
-                            st.session_state.analysis_results[key]['rsi_divergence'] = detect_rsi_divergence(df1_with_indicators)
-                            st.session_state.analysis_results[key]['patterns'] = find_similar_patterns(df1_with_indicators)
-                            st.session_state.analysis_results[key]['signals'] = generate_signals(df1_with_indicators, tf, p)
-                            
-                            # Ratio Analysis
-                            if enable_ratio and ticker2:
-                                df2 = fetch_data(ticker2, tf, p)
-                                if df2 is not None and not df2.empty:
-                                    df2_with_indicators = calculate_all_indicators(df2)
-                                    
-                                    # Align dataframes
-                                    common_index = df1_with_indicators.index.intersection(df2_with_indicators.index)
-                                    
-                                    if len(common_index) > 0:
-                                        df1_aligned = df1_with_indicators.loc[common_index]
-                                        df2_aligned = df2_with_indicators.loc[common_index]
-                                        
-                                        ratio_df = pd.DataFrame(index=common_index)
-                                        ratio_df['Ticker1_Price'] = df1_aligned['Close']
-                                        ratio_df['Ticker2_Price'] = df2_aligned['Close']
-                                        ratio_df['Ratio'] = df1_aligned['Close'] / df2_aligned['Close']
-                                        ratio_df['Ticker1_RSI'] = df1_aligned['RSI']
-                                        ratio_df['Ticker2_RSI'] = df2_aligned['RSI']
-                                        ratio_df['Ratio_RSI'] = calculate_rsi(ratio_df['Ratio'])
-                                        ratio_df['Ticker1_Vol'] = df1_aligned['Volatility']
-                                        ratio_df['Ticker2_Vol'] = df2_aligned['Volatility']
-                                        ratio_df['Ticker1_ZScore'] = df1_aligned['Price_ZScore']
-                                        ratio_df['Ticker2_ZScore'] = df2_aligned['Price_ZScore']
-                                        ratio_df['Ratio_ZScore'] = calculate_zscore(ratio_df['Ratio'])
-                                        
-                                        st.session_state.analysis_results[key]['ratio_df'] = ratio_df
-                                        st.session_state.analysis_results[key]['ticker2'] = ticker2_name
+                        progress_bar.progress((idx + 1) / total_combinations)
                     
-                    progress_bar.progress((idx + 1) / total_combinations)
-                
-                status_text.text("✅ Analysis Complete!")
-                time.sleep(1)
-                progress_bar.empty()
-                status_text.empty()
+                    progress_bar.empty()
+                    status_text.empty()
+                    
+                    if successful_fetches > 0:
+                        st.success(f"✅ Successfully analyzed {successful_fetches}/{total_combinations} timeframes!")
+                        time.sleep(1)
+                    else:
+                        st.error("❌ Failed to fetch data. Please check ticker symbol and try again.")
+                        
+            except Exception as e:
+                st.error(f"Error during analysis: {str(e)}")
+                import traceback
+                st.error(traceback.format_exc())
     
     # Main Content
     if not st.session_state.analysis_results:
