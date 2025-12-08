@@ -11,7 +11,7 @@ import time
 import warnings
 
 # --- CONFIGURATION ---
-st.set_page_config(layout="wide", page_title="TradeFlow Pro AI v3.0", page_icon="📈")
+st.set_page_config(layout="wide", page_title="TradeFlow Pro AI v3.1", page_icon="📈")
 warnings.filterwarnings('ignore')
 IST = pytz.timezone('Asia/Kolkata')
 
@@ -41,7 +41,7 @@ ASSETS = {
     "RELIANCE": "RELIANCE.NS", "TCS": "TCS.NS"
 }
 
-# --- DATA FETCHING ---
+# --- DATA FETCHING (FIXED) ---
 @st.cache_data(ttl=60) 
 def fetch_data(ticker, interval, period='5y'):
     time.sleep(0.5)
@@ -52,10 +52,29 @@ def fetch_data(ticker, interval, period='5y'):
         
         df = yf.download(ticker, period=period, interval=interval, progress=False)
         if df.empty: return None
+        
+        # 1. Handle MultiIndex Columns
+        if isinstance(df.columns, pd.MultiIndex): 
+            df.columns = df.columns.get_level_values(0)
+            
+        # 2. Reset Index and Standardize Date Column Name (Addresses ValueError ambiguity)
+        df = df.reset_index()
+        # Rename the new index column (which could be 'Date', 'Datetime', or 'index') to 'Date'
+        df = df.rename(columns=lambda x: 'Date' if x in ['index', 'level_0', 'Datetime', 'Date'] else x, errors='ignore')
+        df = df.set_index('Date')
+        
+        # 3. Explicit Column Selection
+        required_cols = ['Open', 'High', 'Low', 'Close', 'Volume']
+        df = df[required_cols]
+
+        # 4. Handle Timezone
         if df.index.tz is None: df.index = df.index.tz_localize('UTC')
         df.index = df.index.tz_convert(IST)
+        
         return df
-    except: return None
+    except Exception as e:
+        st.error(f"Data Fetch Error for {ticker} ({interval}): {e}")
+        return None
 
 # --- TECHNICAL ANALYSIS ENGINE ---
 class Analyzer:
@@ -106,19 +125,15 @@ class Analyzer:
         return clusters
 
 def calculate_ratio_analysis(df1, df2):
-    # Ensure both DFs have data and are indexed similarly
     if df1 is None or df2 is None or df1.empty or df2.empty: return None
     
-    # Use the close prices of both assets
     common_index = df1.index.intersection(df2.index)
     if common_index.empty: return None
     
     ratio_df = pd.DataFrame({
-        'Asset1_Close': df1['Close'].loc[common_index],
-        'Asset2_Close': df2['Close'].loc[common_index]
+        'Ratio': df1['Close'].loc[common_index] / df2['Close'].loc[common_index]
     })
     
-    ratio_df['Ratio'] = ratio_df['Asset1_Close'] / ratio_df['Asset2_Close']
     ratio_df['Ratio_EMA_50'] = ratio_df['Ratio'].ewm(span=50, adjust=False).mean()
     
     current_ratio = ratio_df['Ratio'].iloc[-1]
@@ -140,7 +155,6 @@ def get_entry_reason(curr):
     return "Manual Entry (No Signal)"
 
 def manage_trade_narrative(trade, current_price, current_rsi, current_z):
-    # FIX: Definition added to resolve NameError
     pnl_pct = (current_price - trade['price']) / trade['price'] * 100
     if trade['type'] == 'SELL': pnl_pct *= -1
     
@@ -164,29 +178,30 @@ def manage_trade_narrative(trade, current_price, current_rsi, current_z):
     return status
 
 def generate_multi_timeframe_narrative(ticker, results, ratio_data):
-    # Aggregate data across timeframes
-    bull_count, bear_count, sr_hits, fib_tests = 0, 0, 0, 0
+    bull_count, bear_count = 0, 0
     total_score = 0
     
     report = "### 🕰️ Multi-Timeframe Summary\n"
     
     for interval, res in results.items():
-        if res is None: continue
-        df, fib_data, sr_levels = res['df'], res['fib_data'], res['sr_levels']
-        
+        if res is None or res['df'].empty:
+            report += f"* **{interval}:** Data unavailable.\n"
+            continue
+            
+        df, fib_data = res['df'], res['fib_data']
         curr = df.iloc[-1]
         trend = "Bullish" if curr['Close'] > curr['EMA_50'] else "Bearish"
+        
         if trend == "Bullish": bull_count += 1; total_score += 1
         else: bear_count += 1; total_score -= 1
         
         if curr['RSI'] < 30: total_score += 2
         elif curr['RSI'] > 70: total_score -= 2
-            
-        if abs(fib_data[2]) < 0.2: fib_tests += 1; total_score += 1 
+        
+        if abs(fib_data[2]) < 0.2: total_score += 1 
         
         report += f"* **{interval}:** {trend} trend. RSI {curr['RSI']:.1f}. Fib {fib_data[0]} test. Z-Score {curr['Z_Score']:.2f}.\n"
 
-    # Final Recommendation
     final_rec = "WAIT / NEUTRAL 🟡"
     if total_score >= 3 and bull_count >= bear_count: final_rec = "STRONG BUY 🟢"
     elif total_score <= -3 and bear_count >= bull_count: final_rec = "STRONG SELL 🔴"
@@ -195,7 +210,7 @@ def generate_multi_timeframe_narrative(ticker, results, ratio_data):
     
     final_narrative = f"""
     # {final_rec}
-    **Confidence:** **{confidence}%** (Based on {bull_count} Bullish vs {bear_count} Bearish signals across all analyzed timeframes).
+    **Confidence:** **{confidence}%** (Based on {bull_count} Bullish vs {bear_count} Bearish signals across all analyzed timeframes: {', '.join(ANALYSIS_INTERVALS)}).
 
     **Ratio Analysis ({ratio_data['status']}):** {ratio_data['desc']}
 
@@ -212,8 +227,8 @@ def run_backtest(df):
     for i in range(50, len(df)):
         curr = df.iloc[i]
         
-        # Loosened condition: RSI 35/65 instead of 30/70 for more trades
         if not in_pos:
+            # Loosened condition: RSI 35/65 instead of 30/70 for more trades
             if curr['RSI'] < 35 and curr['Close'] > curr['EMA_20']:
                 in_pos, entry_p, entry_d, pos_type = True, curr['Close'], curr.name, 'BUY'
                 sl = entry_p - (1 * curr['ATR'])
@@ -268,15 +283,16 @@ def main():
         qty = st.number_input("Quantity", min_value=0.001, value=1.0, step=0.1, key="order_qty")
         
         if st.button("Submit Order", key="submit_order"):
-            # Use the latest 15m data for submission metrics (as a representative close)
-            if '15m' in st.session_state.analysis_results and st.session_state.analysis_results['15m'] is not None:
-                df_15m = st.session_state.analysis_results['15m']['df']
+            res_15m = st.session_state.analysis_results.get('15m')
+            
+            if res_15m and not res_15m['df'].empty:
+                df_15m = res_15m['df']
                 curr = df_15m.iloc[-1]
                 curr_price = curr['Close']
                 
                 curr_z = curr['Z_Score'] if not np.isnan(curr['Z_Score']) else 0.0
                 curr_rsi = curr['RSI']
-                entry_reason = get_entry_reason(curr) # Determine the reason
+                entry_reason = get_entry_reason(curr)
                 
                 cost = curr_price * qty
                 
@@ -286,7 +302,7 @@ def main():
                         'qty': qty, 'price': curr_price, 
                         'entry_z': curr_z, 
                         'entry_rsi': curr_rsi,
-                        'entry_reason': entry_reason # FIX: Entry reason saved
+                        'entry_reason': entry_reason
                     })
                     if order_type == "BUY": st.session_state.capital -= cost
                     else: st.session_state.capital += cost
@@ -294,7 +310,7 @@ def main():
                 else:
                     st.error("Insufficient Funds")
             else:
-                 st.warning("Analysis not yet complete. Please wait for data to load.")
+                 st.warning("Analysis for 15m is not yet complete. Please wait for data to load.")
         
         st.divider()
         live_mode = st.toggle("🔴 Live Analysis Loop (5s)")
@@ -305,13 +321,10 @@ def main():
     
     # 1. MTF Analysis Loop
     st.session_state.analysis_results = {}
-    ratio_df2 = None
     
+    df_base = None
     if ratio_base != "None":
-        # Fetch base asset data (using 1d as a reliable common timeframe)
-        df_base = fetch_data(ASSETS[ratio_base], '1d') 
-    else:
-        df_base = None
+        df_base = fetch_data(ASSETS[ratio_base], '1d')
 
     for interval in ANALYSIS_INTERVALS:
         df = fetch_data(ASSETS[ticker], interval)
@@ -334,8 +347,6 @@ def main():
         ratio_analysis = {"status": "Disabled", "desc": "Ratio analysis disabled or base asset data not found.", "diff": 0}
 
     # 2. UI Layout
-    
-    # Use the 15m frame for main metrics display
     res_15m = st.session_state.analysis_results.get('15m')
     
     if res_15m and not res_15m['df'].empty:
@@ -345,7 +356,6 @@ def main():
         t1, t2, t3, t4 = st.tabs(["AI Guidance", "Charts (15m)", "Paper Trade Manager", "Backtest"])
         
         with t1:
-            # AI Narrative Section (includes Confidence/Metadata)
             narrative = generate_multi_timeframe_narrative(ticker, st.session_state.analysis_results, ratio_analysis)
             st.markdown(f"<div class='guidance-box'>{narrative}</div>", unsafe_allow_html=True)
             
@@ -369,7 +379,7 @@ def main():
             st.subheader(f"Active Trades for {ticker}")
             my_trades = [t for t in st.session_state.paper_trades if t['symbol'] == ticker]
             
-            if my_trades and my_trades[-1]['qty'] > 0: # Check if last trade is open
+            if my_trades and my_trades[-1]['qty'] > 0:
                 last_trade = my_trades[-1]
                 curr_z = current['Z_Score'] if not np.isnan(current['Z_Score']) else 0.0
                 advice = manage_trade_narrative(last_trade, current['Close'], current['RSI'], curr_z)
@@ -386,7 +396,7 @@ def main():
             st.subheader("Global Portfolio Dashboard")
             if st.session_state.paper_trades:
                 p_df = pd.DataFrame(st.session_state.paper_trades)
-                p_df['Current Price'] = current['Close'] # Simplified: Use 15m current price for all assets
+                p_df['Current Price'] = current['Close']
                 
                 def calc_pnl(row):
                     val = (row['Current Price'] - row['price']) * row['qty']
@@ -394,14 +404,12 @@ def main():
                     
                 p_df['Unrealized P&L'] = p_df.apply(calc_pnl, axis=1)
                 
-                # FIX: Added 'entry_reason' column
                 st.dataframe(p_df[['time', 'symbol', 'type', 'qty', 'price', 'Current Price', 'entry_reason', 'Unrealized P&L']], use_container_width=True)
             else:
                 st.info("No trades in portfolio.")
 
         with t4:
             st.subheader("Backtesting Results (1D Interval)")
-            # Use the 1D frame for backtesting historical performance
             df_1d = st.session_state.analysis_results.get('1d', {}).get('df')
             if df_1d is not None:
                 bt_df = run_backtest(df_1d)
@@ -423,7 +431,6 @@ def main():
             else:
                 st.warning("1D data required for backtesting is not available.")
 
-    # Live Loop for continuous analysis update
     if st.session_state.live_monitoring:
         time.sleep(5)
         st.rerun()
