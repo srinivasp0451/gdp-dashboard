@@ -784,18 +784,43 @@ st.markdown("""
     <p style='color: #888;'>⚠️ Educational purposes only. Trading involves substantial risk. Past performance does not guarantee future results.</p>
     <p style='color: #888;'>Built with ❤️ | Complete Multi-Timeframe Analysis Engine</p>
 </div>
-""", unsafe_allow_html=True).format(pred['exit_price']) = <span style='color: #00ff00;'>{safe_format(pred['return'])}% profit</span></p>
-                    """, unsafe_allow_html=True)
-                
-                st.markdown(f"""
-                <h4 style='color: white;'>❌ Failed Predictions:</h4>
-                """, unsafe_allow_html=True)
-                
-                wrong_predictions = [v for v in verification_results if not v['correct']][:3]
-                for pred in wrong_predictions:
-                    st.markdown(f"""
-                    <p style='color: white;'>• <strong style='color: white;'>{pred['signal']}</strong> signal on {format_datetime(pred['date'])} at ₹{safe
+""", unsafe_allow_html=True)
 
+# --- SUCCESSFUL PREDICTIONS (your original code snippet was broken here)
+for pred in verification_results:
+    if pred['correct']:
+        st.markdown(
+            f"""
+            <p>
+                {format_datetime(pred['date'])} — <strong>{pred['signal']}</strong>  
+                Entry: ₹{pred['entry_price']} | Exit: ₹{pred['exit_price']}  
+                <span style='color: #00ff00;'>{safe_format(pred['return'])}% profit</span>
+            </p>
+            """,
+            unsafe_allow_html=True,
+        )
+
+# --- FAILED PREDICTIONS SECTION ---
+st.markdown(
+    """
+    <h4 style='color: white;'>❌ Failed Predictions:</h4>
+    """,
+    unsafe_allow_html=True,
+)
+
+wrong_predictions = [v for v in verification_results if not v['correct']][:3]
+
+for pred in wrong_predictions:
+    st.markdown(
+        f"""
+        <p style='color: white;'>
+            • <strong>{pred['signal']}</strong> signal on {format_datetime(pred['date'])}  
+            at ₹{pred['entry_price']} → Exit ₹{pred['exit_price']}  
+            <span style='color: #ff4444;'>{safe_format(pred['return'])}% loss</span>
+        </p>
+        """,
+        unsafe_allow_html=True,
+    )
 # ==================== UTILITY FUNCTIONS ====================
 
 def convert_to_ist(df):
