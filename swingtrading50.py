@@ -501,7 +501,7 @@ def run_deep_scan(ticker):
     status.empty()
     st.session_state.deep_scan_results = pd.DataFrame(results)
     st.info("Deep Scan Complete. Results displayed below the Settings.")
-    st.experimental_rerun()
+    st.rerun()
 
 if __name__ == "__main__":
     if 'data_fetched' not in st.session_state:
