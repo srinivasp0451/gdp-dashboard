@@ -784,43 +784,18 @@ st.markdown("""
     <p style='color: #888;'>⚠️ Educational purposes only. Trading involves substantial risk. Past performance does not guarantee future results.</p>
     <p style='color: #888;'>Built with ❤️ | Complete Multi-Timeframe Analysis Engine</p>
 </div>
-""", unsafe_allow_html=True)
+""", unsafe_allow_html=True)_format(pred['exit_price'])} = <span style='color: #00ff00;'>{safe_format(pred['return'])}% profit</span></p>
+                    """, unsafe_allow_html=True)
+                
+                st.markdown(f"""
+                <h4 style='color: white;'>❌ Failed Predictions:</h4>
+                """, unsafe_allow_html=True)
+                
+                wrong_predictions = [v for v in verification_results if not v['correct']][:3]
+                for pred in wrong_predictions:
+                    st.markdown(f"""
+                    <p style='color: white;'>• <strong style='color: white;'>{pred['signal']}</strong> signal on {format_datetime(pred['date'])} at ₹{safe
 
-# --- SUCCESSFUL PREDICTIONS (your original code snippet was broken here)
-for pred in verification_results:
-    if pred['correct']:
-        st.markdown(
-            f"""
-            <p>
-                {format_datetime(pred['date'])} — <strong>{pred['signal']}</strong>  
-                Entry: ₹{pred['entry_price']} | Exit: ₹{pred['exit_price']}  
-                <span style='color: #00ff00;'>{safe_format(pred['return'])}% profit</span>
-            </p>
-            """,
-            unsafe_allow_html=True,
-        )
-
-# --- FAILED PREDICTIONS SECTION ---
-st.markdown(
-    """
-    <h4 style='color: white;'>❌ Failed Predictions:</h4>
-    """,
-    unsafe_allow_html=True,
-)
-
-wrong_predictions = [v for v in verification_results if not v['correct']][:3]
-
-for pred in wrong_predictions:
-    st.markdown(
-        f"""
-        <p style='color: white;'>
-            • <strong>{pred['signal']}</strong> signal on {format_datetime(pred['date'])}  
-            at ₹{pred['entry_price']} → Exit ₹{pred['exit_price']}  
-            <span style='color: #ff4444;'>{safe_format(pred['return'])}% loss</span>
-        </p>
-        """,
-        unsafe_allow_html=True,
-    )
 # ==================== UTILITY FUNCTIONS ====================
 
 def convert_to_ist(df):
@@ -837,11 +812,11 @@ def get_valid_combinations():
     """Get valid timeframe-period combinations"""
     return {
         '1m': ['1d'],
-        '5m': ['1d', '5d'],
-        '15m': ['1d', '5d'],
-        '1h': ['1d', '5d', '1mo'],
-        '4h': ['1d', '5d', '1mo'],
-        '1d': ['1mo', '3mo', '6mo', '1y', '2y', '5y'],
+        '5m': ['1d', '1mo'],
+        '15m': ['5d', '1mo'],
+        '1h': ['5d', '1mo'],
+        '4h': ['5d', '1mo'],
+        '1d': ['1mo', '6mo', '1y', '2y', '5y'],
         '1wk': ['1y', '2y', '5y'],
         '1mo': ['2y', '5y']
     }
@@ -1501,4 +1476,4 @@ with st.sidebar:
     
     st.info("📈 Analyzes: 1m, 5m, 15m, 1h, 4h, 1d, 1wk, 1mo")
     
-    #comparison_tickers =
+    comparison_tickers =
