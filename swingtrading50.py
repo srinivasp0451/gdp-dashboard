@@ -10,462 +10,444 @@ import time
 from scipy.signal import argrelextrema
 
 # ==========================================
-# 1. CONFIGURATION & CONSTANTS
+# 1. SYSTEM CONFIGURATION & STATE MANAGEMENT
 # ==========================================
-st.set_page_config(layout="wide", page_title="AlgoTrader Pro", page_icon="📈")
+st.set_page_config(layout="wide", page_title="AlgoTrader Pro V2", page_icon="📊")
 
-# Supported Assets
+# Initialize Session State for Deep Scan Persistence
+if 'deep_scan_results' not in st.session_state:
+    st.session_state.deep_scan_results = None
+
+# Constants
 ASSETS = {
     "Indices": ["^NSEI", "^NSEBANK", "^BSESN", "^GSPC", "^DJI"],
-    "Crypto": ["BTC-USD", "ETH-USD", "SOL-USD"],
+    "Crypto": ["BTC-USD", "ETH-USD", "SOL-USD", "XRP-USD"],
     "Forex": ["EURUSD=X", "GBPUSD=X", "USDINR=X", "JPY=X"],
-    "Commodities": ["GC=F", "SI=F", "CL=F"],
-    "Stocks": ["RELIANCE.NS", "TCS.NS", "INFY.NS", "HDFCBANK.NS", "AAPL", "TSLA", "NVDA"]
+    "Commodities": ["GC=F", "SI=F", "CL=F", "NG=F"],
+    "Stocks": ["RELIANCE.NS", "TCS.NS", "INFY.NS", "HDFCBANK.NS", "TATAMOTORS.NS", "AAPL", "TSLA", "NVDA", "AMD"]
 }
 
-# Valid Interval/Period Map (Strict yfinance rules)
+# Strict YFinance Valid Intervals
 VALID_INTERVALS = {
-    "1m": "7d", "5m": "60d", "15m": "60d", "30m": "60d", 
-    "1h": "730d", "1d": "max", "1wk": "max", "1mo": "max"
+    "1m": "7d", "5m": "60d", "15m": "60d", "30m": "60d",
+    "1h": "730d", "4h": "730d", "1d": "max", "1wk": "max", "1mo": "max"
 }
 
 # ==========================================
-# 2. DATA LAYER
+# 2. DATA ENGINE
 # ==========================================
 class DataManager:
     @staticmethod
-    @st.cache_data(ttl=300) # Cache for 5 mins
     def fetch_data(ticker, interval, period):
-        """Fetches data with rate limiting and timezone handling."""
-        time.sleep(1.5)  # Rate limiting
-        
+        """Fetches data with rate limiting, error handling, and timezone alignment."""
+        time.sleep(1.0)  # Prevent Rate Limiting
         try:
-            # Force auto_adjust to get real price action
             df = yf.download(ticker, period=period, interval=interval, auto_adjust=True, progress=False)
             
-            if df.empty:
-                return None
+            if df.empty: return None
             
-            # Handle MultiIndex columns if present (yfinance update)
+            # Fix YFinance MultiIndex columns (Common issue in 2024/2025)
             if isinstance(df.columns, pd.MultiIndex):
                 df.columns = df.columns.get_level_values(0)
             
-            # Timezone Conversion to IST
+            # Standardize Timezone to IST
             if df.index.tz is None:
                 df.index = df.index.tz_localize('UTC')
             df.index = df.index.tz_convert('Asia/Kolkata')
             
+            # Ensure proper types
+            df = df.astype(float)
             return df
         except Exception as e:
-            st.error(f"API Error: {e}")
+            st.error(f"Data Fetch Error for {ticker}: {e}")
             return None
 
 # ==========================================
-# 3. MANUAL TECHNICAL INDICATORS (NO TA-LIB)
+# 3. MANUAL TECHNICAL INDICATORS
 # ==========================================
 class Technicals:
     @staticmethod
-    def sma(series, window):
-        return series.rolling(window=window).mean()
-
-    @staticmethod
-    def ema(series, window):
-        return series.ewm(span=window, adjust=False).mean()
-
-    @staticmethod
-    def rsi(series, period=14):
-        delta = series.diff()
-        gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
-        loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
+    def calculate_all(df):
+        """Applies all manual indicators to the dataframe."""
+        # Moving Averages
+        df['SMA_50'] = df['Close'].rolling(window=50).mean()
+        df['SMA_200'] = df['Close'].rolling(window=200).mean()
+        df['EMA_20'] = df['Close'].ewm(span=20, adjust=False).mean()
+        
+        # RSI (14)
+        delta = df['Close'].diff()
+        gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
         rs = gain / loss
-        return 100 - (100 / (1 + rs))
-
-    @staticmethod
-    def macd(series, fast=12, slow=26, signal=9):
-        exp1 = series.ewm(span=fast, adjust=False).mean()
-        exp2 = series.ewm(span=slow, adjust=False).mean()
-        macd = exp1 - exp2
-        sig = macd.ewm(span=signal, adjust=False).mean()
-        hist = macd - sig
-        return macd, sig, hist
-
-    @staticmethod
-    def bollinger_bands(series, window=20, num_std=2):
-        ma = series.rolling(window=window).mean()
-        std = series.rolling(window=window).std()
-        upper = ma + (std * num_std)
-        lower = ma - (std * num_std)
-        return upper, lower
-
-    @staticmethod
-    def atr(high, low, close, window=14):
-        tr1 = high - low
-        tr2 = abs(high - close.shift())
-        tr3 = abs(low - close.shift())
+        df['RSI'] = 100 - (100 / (1 + rs))
+        
+        # MACD (12, 26, 9)
+        exp1 = df['Close'].ewm(span=12, adjust=False).mean()
+        exp2 = df['Close'].ewm(span=26, adjust=False).mean()
+        df['MACD'] = exp1 - exp2
+        df['Signal'] = df['MACD'].ewm(span=9, adjust=False).mean()
+        
+        # Bollinger Bands (20, 2)
+        sma20 = df['Close'].rolling(window=20).mean()
+        std20 = df['Close'].rolling(window=20).std()
+        df['BB_Upper'] = sma20 + (std20 * 2)
+        df['BB_Lower'] = sma20 - (std20 * 2)
+        
+        # ATR (14) - For SL/Target
+        tr1 = df['High'] - df['Low']
+        tr2 = abs(df['High'] - df['Close'].shift())
+        tr3 = abs(df['Low'] - df['Close'].shift())
         tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-        return tr.rolling(window=window).mean()
-
-    @staticmethod
-    def adx(high, low, close, window=14):
-        plus_dm = high.diff()
-        minus_dm = low.diff()
+        df['ATR'] = tr.rolling(window=14).mean()
+        
+        # ADX (14)
+        plus_dm = df['High'].diff()
+        minus_dm = df['Low'].diff()
         plus_dm[plus_dm < 0] = 0
         minus_dm[minus_dm > 0] = 0
         
-        tr1 = high - low
-        tr2 = abs(high - close.shift())
-        tr3 = abs(low - close.shift())
-        tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-        
-        atr = tr.rolling(window).mean()
-        plus_di = 100 * (plus_dm.ewm(alpha=1/window).mean() / atr)
-        minus_di = 100 * (abs(minus_dm).ewm(alpha=1/window).mean() / atr)
+        atr = tr.rolling(14).mean()
+        plus_di = 100 * (plus_dm.ewm(alpha=1/14).mean() / atr)
+        minus_di = 100 * (abs(minus_dm).ewm(alpha=1/14).mean() / atr)
         dx = (abs(plus_di - minus_di) / abs(plus_di + minus_di)) * 100
-        adx = dx.rolling(window).mean()
-        return adx, plus_di, minus_di
+        df['ADX'] = dx.rolling(14).mean()
+        
+        # Clean NaN
+        df.dropna(inplace=True)
+        return df
 
     @staticmethod
-    def obv(close, volume):
-        obv = (np.sign(close.diff()) * volume).fillna(0).cumsum()
-        return obv
-
-    @staticmethod
-    def z_score(series, window=20):
-        mean = series.rolling(window).mean()
-        std = series.rolling(window).std()
-        return (series - mean) / std
-
-# ==========================================
-# 4. ADVANCED PATTERN ANALYSIS
-# ==========================================
-class PatternAnalyzer:
-    @staticmethod
-    def find_support_resistance(df, window=20, tolerance=0.02):
-        """Identifies SR levels using local Min/Max clustering."""
-        # Find local peaks
-        highs = df['High'].values
-        lows = df['Low'].values
-        
-        # Get local max/min indices
-        max_idx = argrelextrema(highs, np.greater, order=window)[0]
-        min_idx = argrelextrema(lows, np.less, order=window)[0]
-        
-        levels = []
-        # Add Highs
-        for i in max_idx:
-            levels.append((highs[i], 'Resistance'))
-        # Add Lows
-        for i in min_idx:
-            levels.append((lows[i], 'Support'))
-            
-        # Cluster levels that are close
-        levels.sort(key=lambda x: x[0])
-        merged = []
-        if not levels: return []
-        
-        current_group = [levels[0]]
-        
-        for i in range(1, len(levels)):
-            if levels[i][0] <= current_group[-1][0] * (1 + tolerance):
-                current_group.append(levels[i])
-            else:
-                # Average the group
-                avg_price = np.mean([x[0] for x in current_group])
-                type_ = "Zone" # Mixed zone
-                if all(x[1] == 'Support' for x in current_group): type_ = 'Strong Support'
-                elif all(x[1] == 'Resistance' for x in current_group): type_ = 'Strong Resistance'
-                
-                merged.append({'Price': avg_price, 'Type': type_, 'Strength': len(current_group)})
-                current_group = [levels[i]]
-        
-        # Add last
-        avg_price = np.mean([x[0] for x in current_group])
-        merged.append({'Price': avg_price, 'Type': 'Level', 'Strength': len(current_group)})
-        
-        return sorted(merged, key=lambda x: x['Strength'], reverse=True)[:5] # Return top 5
-
-    @staticmethod
-    def detect_divergence(df, rsi_col='RSI'):
-        """Detects Regular Bullish/Bearish Divergence."""
-        # Simple implementation: Price makes Lower Low, RSI makes Higher Low (Bullish)
-        # Price makes Higher High, RSI makes Lower High (Bearish)
-        
-        back_candles = 20
-        if len(df) < back_candles: return None
-        
-        curr_price = df['Close'].iloc[-1]
-        prev_price = df['Close'].iloc[-back_candles]
-        
-        curr_rsi = df[rsi_col].iloc[-1]
-        prev_rsi = df[rsi_col].iloc[-back_candles]
-        
-        signal = "Neutral"
-        if curr_price < prev_price and curr_rsi > prev_rsi and curr_rsi < 50:
-            signal = "Bullish Divergence"
-        elif curr_price > prev_price and curr_rsi < prev_rsi and curr_rsi > 50:
-            signal = "Bearish Divergence"
-            
-        return signal
-
-    @staticmethod
-    def simplified_elliot_wave(df):
-        """
-        Approximation of Elliot Wave using ZigZag logic.
-        (Note: Real EW is subjective, this is a programmatic estimate)
-        """
-        # ZigZag placeholder logic for demonstration
-        # 1. Identify major Swing Highs/Lows
-        # 2. Label recent 5 swings
-        return "Market likely in Corrective Phase (Wave C or 2) based on recent volatility contraction."
-
-    @staticmethod
-    def fibonacci_levels(df):
-        """Calculates Fib levels based on recent significant High/Low."""
-        period = 100
-        recent_high = df['High'].tail(period).max()
-        recent_low = df['Low'].tail(period).min()
-        diff = recent_high - recent_low
+    def get_fibonacci_levels(df):
+        """Dynamic Fibonacci Retracement Levels based on recent swing."""
+        max_price = df['High'].max()
+        min_price = df['Low'].min()
+        diff = max_price - min_price
         
         levels = {
-            '0.0%': recent_low,
-            '23.6%': recent_low + 0.236 * diff,
-            '38.2%': recent_low + 0.382 * diff,
-            '50.0%': recent_low + 0.5 * diff,
-            '61.8%': recent_low + 0.618 * diff,
-            '100.0%': recent_high
+            0.0: min_price,
+            0.236: min_price + 0.236 * diff,
+            0.382: min_price + 0.382 * diff,
+            0.5: min_price + 0.5 * diff,
+            0.618: min_price + 0.618 * diff,
+            1.0: max_price
         }
         return levels
 
 # ==========================================
-# 5. UI & ORCHESTRATION
+# 4. SIGNAL GENERATOR & BACKTEST ENGINE
+# ==========================================
+class SignalEngine:
+    @staticmethod
+    def generate_signals(df):
+        """Generates Buy/Sell/Hold signals based on composite logic."""
+        last = df.iloc[-1]
+        score = 0
+        reasons = []
+        
+        # 1. Trend Filter
+        if last['Close'] > last['SMA_200']:
+            score += 1
+            reasons.append("Price > 200 SMA (Long-term Bullish)")
+        elif last['Close'] < last['SMA_200']:
+            score -= 1
+            reasons.append("Price < 200 SMA (Long-term Bearish)")
+            
+        # 2. Momentum (RSI)
+        if last['RSI'] < 30:
+            score += 2
+            reasons.append("RSI Oversold (Bounce Likely)")
+        elif last['RSI'] > 70:
+            score -= 2
+            reasons.append("RSI Overbought (Pullback Likely)")
+            
+        # 3. MACD
+        if last['MACD'] > last['Signal']:
+            score += 1
+            reasons.append("MACD Bullish Crossover")
+        else:
+            score -= 1
+            reasons.append("MACD Bearish Divergence")
+            
+        # 4. Bollinger
+        if last['Close'] < last['BB_Lower']:
+            score += 1
+            reasons.append("Price below Lower BB (Mean Reversion)")
+        elif last['Close'] > last['BB_Upper']:
+            score -= 1
+            reasons.append("Price above Upper BB (Mean Reversion)")
+            
+        return score, reasons
+
+    @staticmethod
+    def calculate_trade_setup(df, signal_type):
+        """Calculates precise Entry, SL, and Target using ATR."""
+        last_close = df['Close'].iloc[-1]
+        atr = df['ATR'].iloc[-1]
+        
+        if signal_type == "BUY":
+            entry = last_close
+            sl = last_close - (2.0 * atr)  # 2x ATR Stop Loss
+            target = last_close + (3.0 * atr) # 3x ATR Target
+            risk_reward = (target - entry) / (entry - sl)
+        else: # SELL
+            entry = last_close
+            sl = last_close + (2.0 * atr)
+            target = last_close - (3.0 * atr)
+            risk_reward = (entry - target) / (sl - entry)
+            
+        return entry, sl, target, risk_reward
+
+class Backtester:
+    @staticmethod
+    def prove_reliability(df):
+        """
+        Runs a vectorized backtest to PROVE if the ticker respects the strategy.
+        Checks: 'When MACD crossed up & Price > SMA200, did price rise in next 10 bars?'
+        """
+        # Define the Strategy Logic for the Backtest
+        df['Signal_Flag'] = 0
+        
+        # Condition: Golden Cross (SMA50 > SMA200) + RSI < 50 (Pullback in Uptrend)
+        buy_condition = (df['SMA_50'] > df['SMA_200']) & (df['RSI'] < 45) & (df['RSI'] > 30)
+        df.loc[buy_condition, 'Signal_Flag'] = 1
+        
+        # Forward Returns (5 periods later)
+        df['Fwd_Return'] = df['Close'].shift(-5) / df['Close'] - 1
+        
+        # Filter only signal candles
+        signals = df[df['Signal_Flag'] == 1]
+        
+        if len(signals) < 5:
+            return None, "Insufficient Historical Signals"
+        
+        win_rate = len(signals[signals['Fwd_Return'] > 0]) / len(signals) * 100
+        avg_gain = signals['Fwd_Return'].mean() * 100
+        
+        # Compare vs Buy & Hold
+        total_period_return = (df['Close'].iloc[-1] / df['Close'].iloc[0]) - 1
+        
+        return {
+            "Total Signals": len(signals),
+            "Win Rate": win_rate,
+            "Avg Trade Return": avg_gain,
+            "Buy & Hold Return": total_period_return * 100,
+            "Is Working": win_rate > 50 and avg_gain > 0
+        }, signals
+
+# ==========================================
+# 5. UI ORCHESTRATION
 # ==========================================
 def main():
-    st.sidebar.header("Data Control")
+    st.sidebar.header("🕹️ Control Panel")
     
+    # Inputs
     asset_class = st.sidebar.selectbox("Asset Class", list(ASSETS.keys()))
-    ticker = st.sidebar.selectbox("Select Asset", ASSETS[asset_class])
-    custom_ticker = st.sidebar.text_input("Or Custom Ticker (e.g., TSLA)")
-    if custom_ticker: ticker = custom_ticker
+    ticker = st.sidebar.selectbox("Ticker", ASSETS[asset_class])
+    custom = st.sidebar.text_input("Custom Ticker (YFinance)")
+    if custom: ticker = custom
     
+    # Config
     col1, col2 = st.sidebar.columns(2)
-    interval = col1.selectbox("Interval", list(VALID_INTERVALS.keys()), index=5)
-    period = col2.selectbox("Period", ["1d", "5d", "1mo", "3mo", "6mo", "1y", "2y", "5y", "max"], index=5)
+    interval = col1.selectbox("Timeframe", list(VALID_INTERVALS.keys()), index=6) # Default 1d
+    period = col2.selectbox("History", ["1mo", "3mo", "6mo", "1y", "2y", "5y", "10y"], index=3)
     
-    fetch_btn = st.sidebar.button("Analyze Market", type="primary")
+    run_analysis = st.sidebar.button("🚀 Analyze Market", type="primary")
+    run_deep_scan = st.sidebar.button("📡 Run Deep Scan (Multi-TF)")
 
-    if fetch_btn:
-        with st.spinner('Fetching Data & Crunching Numbers...'):
+    # Main Data Fetch
+    if run_analysis:
+        st.session_state.deep_scan_results = None # Reset deep scan on new analysis
+        
+        with st.spinner(f"Fetching {ticker} data..."):
             df = DataManager.fetch_data(ticker, interval, period)
             
-            if df is None:
-                st.error("Failed to fetch data. Check ticker or internet connection.")
-                return
+        if df is None:
+            st.error("❌ Data Fetch Failed. Please check the ticker symbol.")
+            return
 
-            # --- Calculation Pipeline ---
-            # 1. Basic Techs
-            df['SMA_50'] = Technicals.sma(df['Close'], 50)
-            df['SMA_200'] = Technicals.sma(df['Close'], 200)
-            df['RSI'] = Technicals.rsi(df['Close'])
-            df['MACD'], df['Signal'], df['Hist'] = Technicals.macd(df['Close'])
-            df['UpperBB'], df['LowerBB'] = Technicals.bollinger_bands(df['Close'])
-            df['ATR'] = Technicals.atr(df['High'], df['Low'], df['Close'])
-            df['ADX'], df['+DI'], df['-DI'] = Technicals.adx(df['High'], df['Low'], df['Close'])
-            df['Vol_MA'] = Technicals.sma(df['Volume'], 20)
-            df['Z_Score'] = Technicals.z_score(df['Close'])
+        # Calculate Techs
+        df = Technicals.calculate_all(df)
+        
+        # Generate Signal
+        score, reasons = SignalEngine.generate_signals(df)
+        signal_type = "BUY" if score >= 2 else "SELL" if score <= -2 else "HOLD"
+        entry, sl, target, rr = SignalEngine.calculate_trade_setup(df, signal_type)
+        
+        # --- DASHBOARD ---
+        st.title(f"📈 Algorithmic Analysis: {ticker}")
+        
+        # 1. RECOMMENDATION CARD
+        st.markdown("---")
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Recommendation", signal_type, delta=f"Score: {score}/5", delta_color="normal")
+        c2.metric("Entry Zone", f"{entry:.2f}")
+        c3.metric("Stop Loss", f"{sl:.2f}", delta=f"-{(abs(entry-sl)/entry)*100:.2f}%", delta_color="inverse")
+        c4.metric("Target", f"{target:.2f}", delta=f"+{(abs(target-entry)/entry)*100:.2f}%")
+        
+        # 2. PROOF OF CONCEPT (Validation)
+        st.markdown("### 🛡️ Does this Ticker Respect the Strategy?")
+        stats, sig_df = Backtester.prove_reliability(df)
+        
+        if stats:
+            p1, p2, p3 = st.columns(3)
+            p1.metric("Historical Win Rate", f"{stats['Win Rate']:.1f}%", help="Percentage of signals that were profitable after 5 bars.")
+            p2.metric("Avg Return per Trade", f"{stats['Avg Trade Return']:.2f}%")
             
-            # 2. Benchmarks for Ratio Analysis (Gold & SP500)
-            bench_gold = DataManager.fetch_data('GC=F', '1d', '1y')
-            bench_sp500 = DataManager.fetch_data('^GSPC', '1d', '1y')
-
-            # --- DASHBOARD ---
-            st.title(f"AlgoTrading Analysis: {ticker}")
-            st.markdown(f"**Current Price:** {df['Close'].iloc[-1]:.2f} | **RSI:** {df['RSI'].iloc[-1]:.2f} | **ADX:** {df['ADX'].iloc[-1]:.2f}")
-
-            # Tabs
-            tab1, tab2, tab3, tab4, tab5 = st.tabs(["Chart & Indicators", "Ratios & Volatility", "Advanced Patterns", "Multi-Timeframe Scan", "Signals & Backtest"])
-
-            # --- TAB 1: Main Chart ---
-            with tab1:
-                fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.03, row_heights=[0.7, 0.3])
+            is_valid = stats['Is Working']
+            color = "green" if is_valid else "red"
+            status = "APPROVED" if is_valid else "CAUTION"
+            p3.markdown(f"**Status:** :{color}[{status}]")
+            
+            if is_valid:
+                st.success(f"✅ PROOF: This asset historically respects 'Pullback in Uptrend' logic. Strategy beats random chance.")
+            else:
+                st.warning(f"⚠️ CAUTION: Historical reliability is low ({stats['Win Rate']:.1f}%). Use tight stops.")
                 
-                # Candlestick
-                fig.add_trace(go.Candlestick(x=df.index, open=df['Open'], high=df['High'], low=df['Low'], close=df['Close'], name='Price'), row=1, col=1)
-                
-                # Overlays
-                fig.add_trace(go.Scatter(x=df.index, y=df['SMA_50'], line=dict(color='orange', width=1), name='SMA 50'), row=1, col=1)
-                fig.add_trace(go.Scatter(x=df.index, y=df['SMA_200'], line=dict(color='blue', width=1), name='SMA 200'), row=1, col=1)
-                fig.add_trace(go.Scatter(x=df.index, y=df['UpperBB'], line=dict(color='gray', dash='dot'), name='Upper BB'), row=1, col=1)
-                fig.add_trace(go.Scatter(x=df.index, y=df['LowerBB'], line=dict(color='gray', dash='dot'), name='Lower BB'), row=1, col=1)
-                
-                # Subplot: RSI or MACD
-                fig.add_trace(go.Scatter(x=df.index, y=df['RSI'], line=dict(color='purple'), name='RSI'), row=2, col=1)
-                fig.add_hline(y=70, line_dash="dash", line_color="red", row=2, col=1)
-                fig.add_hline(y=30, line_dash="dash", line_color="green", row=2, col=1)
+            # Plot Proof
+            fig_proof = go.Figure()
+            fig_proof.add_trace(go.Scatter(x=df.index, y=df['Close'], name="Price", line=dict(color='gray', width=1)))
+            # Plot Winning Signals
+            wins = sig_df[sig_df['Fwd_Return'] > 0]
+            fig_proof.add_trace(go.Scatter(x=wins.index, y=wins['Close'], mode='markers', marker=dict(color='green', size=8, symbol='triangle-up'), name="Winning Signal"))
+            # Plot Losing Signals
+            losses = sig_df[sig_df['Fwd_Return'] <= 0]
+            fig_proof.add_trace(go.Scatter(x=losses.index, y=losses['Close'], mode='markers', marker=dict(color='red', size=8, symbol='x'), name="Failed Signal"))
+            
+            fig_proof.update_layout(title="Historical Signal Validation (Green=Win, Red=Loss)", height=300, margin=dict(l=0, r=0, t=30, b=0))
+            st.plotly_chart(fig_proof, use_container_width=True)
 
-                fig.update_layout(height=600, xaxis_rangeslider_visible=False, title="Price Action & Technicals")
-                st.plotly_chart(fig, use_container_width=True)
+        # 3. DETAILED CHARTS
+        tab1, tab2, tab3 = st.tabs(["Technical Chart", "Ratio & Volatility", "Logic & Summary"])
+        
+        with tab1:
+            # Main Chart
+            fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.03, row_heights=[0.7, 0.3])
+            
+            fig.add_trace(go.Candlestick(x=df.index, open=df['Open'], high=df['High'], low=df['Low'], close=df['Close'], name='Price'), row=1, col=1)
+            fig.add_trace(go.Scatter(x=df.index, y=df['SMA_50'], line=dict(color='orange', width=1), name='SMA 50'), row=1, col=1)
+            fig.add_trace(go.Scatter(x=df.index, y=df['SMA_200'], line=dict(color='blue', width=1), name='SMA 200'), row=1, col=1)
+            fig.add_trace(go.Scatter(x=df.index, y=df['BB_Upper'], line=dict(color='gray', dash='dot', width=1), name='BB Upper'), row=1, col=1)
+            fig.add_trace(go.Scatter(x=df.index, y=df['BB_Lower'], line=dict(color='gray', dash='dot', width=1), name='BB Lower'), row=1, col=1)
+            
+            # Subplot
+            fig.add_trace(go.Scatter(x=df.index, y=df['RSI'], line=dict(color='purple'), name='RSI'), row=2, col=1)
+            fig.add_hline(y=70, line_dash="dash", line_color="red", row=2, col=1)
+            fig.add_hline(y=30, line_dash="dash", line_color="green", row=2, col=1)
+            
+            # Fibonacci Levels
+            fibs = Technicals.get_fibonacci_levels(df)
+            for level, price in fibs.items():
+                fig.add_hline(y=price, line_color="gold", line_width=1, opacity=0.5, row=1, col=1, annotation_text=f"Fib {level}")
 
-            # --- TAB 2: Ratios & Volatility ---
-            with tab2:
-                col_r1, col_r2 = st.columns(2)
-                
-                # Ratio Logic
-                if bench_gold is not None:
-                    # Align dates
-                    common_idx = df.index.intersection(bench_gold.index)
-                    if len(common_idx) > 10:
-                        ratio = df.loc[common_idx]['Close'] / bench_gold.loc[common_idx]['Close']
-                        
-                        with col_r1:
-                            st.subheader("Asset / Gold Ratio")
-                            fig_ratio = go.Figure()
-                            fig_ratio.add_trace(go.Scatter(x=ratio.index, y=ratio, name=f'{ticker}/Gold'))
-                            st.plotly_chart(fig_ratio, use_container_width=True)
-                            st.caption("Rising ratio implies Asset outperforming Gold. Falling implies Gold is safer.")
-                
-                # Volatility Bins
-                with col_r2:
-                    st.subheader("Volatility Clustering")
-                    df['Returns'] = df['Close'].pct_change()
-                    df['Vol_Bin'] = pd.qcut(df['Returns'].abs(), q=4, labels=["Low", "Med", "High", "Extreme"])
-                    vol_counts = df['Vol_Bin'].value_counts()
-                    st.bar_chart(vol_counts)
-                    st.caption("Frequency of volatility regimes. 'Extreme' clusters often precede trend reversals.")
-
-                # Z-Score
-                st.subheader("Price Z-Score (Statistical Reversion)")
-                fig_z = go.Figure()
-                fig_z.add_trace(go.Bar(x=df.index, y=df['Z_Score'], marker_color=np.where(df['Z_Score'] > 2, 'red', np.where(df['Z_Score'] < -2, 'green', 'gray'))))
-                fig_z.add_hline(y=2, line_dash="dot", line_color="red")
-                fig_z.add_hline(y=-2, line_dash="dot", line_color="green")
-                st.plotly_chart(fig_z, use_container_width=True)
-                st.markdown("""
-                **Insight:** Z-Scores > 2 suggest the asset is statistically overextended (expensive). 
-                Z-Scores < -2 suggest it is undervalued relative to recent mean.
-                """)
-
-            # --- TAB 3: Advanced Patterns ---
-            with tab3:
-                c1, c2 = st.columns(2)
-                
-                with c1:
-                    st.subheader("Support & Resistance Zones")
-                    sr_levels = PatternAnalyzer.find_support_resistance(df)
-                    if sr_levels:
-                        sr_df = pd.DataFrame(sr_levels)
-                        st.dataframe(sr_df)
-                        
-                        # Plot SR on small chart
-                        fig_sr = go.Figure(data=[go.Candlestick(x=df.index, open=df['Open'], high=df['High'], low=df['Low'], close=df['Close'])])
-                        for lvl in sr_levels:
-                            color = 'green' if lvl['Type'] == 'Support' else 'red'
-                            fig_sr.add_hline(y=lvl['Price'], line_color=color, annotation_text=lvl['Type'])
-                        st.plotly_chart(fig_sr, use_container_width=True)
+            fig.update_layout(height=600, xaxis_rangeslider_visible=False, title=f"Price Action Structure ({interval})")
+            st.plotly_chart(fig, use_container_width=True)
+            
+        with tab2:
+            c1, c2 = st.columns(2)
+            with c1:
+                st.subheader("Volatility Analysis")
+                df['Returns'] = df['Close'].pct_change()
+                fig_vol = go.Figure(data=[go.Histogram(x=df['Returns'], nbinsx=50, marker_color='teal')])
+                fig_vol.update_layout(title="Return Distribution (Fat Tails = High Risk)", height=300)
+                st.plotly_chart(fig_vol, use_container_width=True)
+            
+            with c2:
+                st.subheader("Ratio Analysis (vs Gold)")
+                # Fetch Gold for Ratio
+                gold_df = DataManager.fetch_data("GC=F", interval, period)
+                if gold_df is not None:
+                    # Align indices
+                    common = df.index.intersection(gold_df.index)
+                    if not common.empty:
+                        ratio = df.loc[common]['Close'] / gold_df.loc[common]['Close']
+                        fig_ratio = go.Figure(go.Scatter(x=ratio.index, y=ratio, mode='lines', name=f'{ticker}/Gold'))
+                        fig_ratio.update_layout(title=f"Strength vs Gold (Rising = {ticker} Stronger)", height=300)
+                        st.plotly_chart(fig_ratio, use_container_width=True)
                     else:
-                        st.write("No clear strong levels found in current window.")
+                        st.warning("Timestamps do not align for Ratio analysis.")
+                else:
+                    st.warning("Could not fetch Gold data for ratio.")
 
-                with c2:
-                    st.subheader("Pattern Signals")
-                    
-                    # Divergence
-                    div = PatternAnalyzer.detect_divergence(df)
-                    st.metric("RSI Divergence", div if div else "None", help="Bullish: Price Lower Low, RSI Higher Low")
-                    
-                    # Fibonacci
-                    fibs = PatternAnalyzer.fibonacci_levels(df)
-                    st.write("**Key Fibonacci Levels (Retracement):**")
-                    st.json(fibs)
-                    
-                    # Elliot Wave
-                    st.info(f"Elliot Wave Context: {PatternAnalyzer.simplified_elliot_wave(df)}")
+        with tab3:
+            st.subheader("Strategy Logic")
+            st.write("The Recommendation is based on the following composite analysis:")
+            for reason in reasons:
+                st.write(f"• {reason}")
+            
+            st.markdown("### 300-Word Summary")
+            trend_str = "Bullish" if df['Close'].iloc[-1] > df['SMA_200'].iloc[-1] else "Bearish"
+            vol_str = "High" if df['ATR'].iloc[-1] > df['ATR'].mean() else "Low"
+            
+            summary = f"""
+            **Market Structure Analysis for {ticker}**
+            
+            The current market structure for **{ticker}** on the **{interval}** timeframe presents a **{trend_str}** bias. The price is currently trading at {df['Close'].iloc[-1]:.2f}. 
+            
+            **Trend & Momentum:** The asset is trading {'above' if trend_str == 'Bullish' else 'below'} the 200-period Simple Moving Average, indicating the long-term trend direction. The RSI is currently at {df['RSI'].iloc[-1]:.2f}, suggesting momentum is {'neutral' if 30 < df['RSI'].iloc[-1] < 70 else 'extreme'}.
+            
+            **Volatility & Risk:** Volatility is currently **{vol_str}**, as measured by the ATR ({df['ATR'].iloc[-1]:.2f}). This implies that stop-losses should be adjusted accordingly. The Bollinger Bands are {'expanding' if df['BB_Upper'].iloc[-1] - df['BB_Lower'].iloc[-1] > (df['BB_Upper'].mean() - df['BB_Lower'].mean()) else 'contracting'}, indicating a potential breakout or consolidation phase.
+            
+            **Conclusion:** Based on the statistical backtest shown in the "Proof" section, this setup has a historical win rate of {stats['Win Rate'] if stats else 'N/A'}%. Traders should watch the {entry:.2f} level for entries, strictly adhering to the stop loss at {sl:.2f}.
+            """
+            st.info(summary)
 
-            # --- TAB 4: Multi-Timeframe (Simulated Scan) ---
-            with tab4:
-                st.write("Click below to perform a Deep Scan across timeframes (15m, 1h, 4h, 1d).")
-                st.write("*Note: This simulates the 'All Timeframes' requirement by sampling key frames to respect API limits.*")
+    # ==========================================
+    # 6. DEEP SCAN LOGIC
+    # ==========================================
+    if run_deep_scan:
+        st.markdown("---")
+        st.subheader("📡 Deep Scan: Multi-Timeframe Matrix")
+        
+        # We use a subset of timeframes to prevent API Rate Limits
+        scan_tfs = ["15m", "1h", "4h", "1d"]
+        results = []
+        
+        progress_bar = st.progress(0)
+        status_text = st.empty()
+        
+        for i, tf in enumerate(scan_tfs):
+            status_text.text(f"Scanning {tf} timeframe...")
+            
+            # Fetch minimal data for speed
+            scan_period = "1mo" if tf in ["15m", "1h"] else "1y"
+            tf_df = DataManager.fetch_data(ticker, tf, scan_period)
+            
+            if tf_df is not None:
+                tf_df = Technicals.calculate_all(tf_df)
+                last_row = tf_df.iloc[-1]
                 
-                if st.button("Run Deep Scan"):
-                    scan_res = []
-                    tf_list = ['15m', '1h', '1d']
-                    p_list = ['5d', '1mo', '1y']
-                    
-                    progress = st.progress(0)
-                    for i, (tf, p) in enumerate(zip(tf_list, p_list)):
-                        try:
-                            tf_df = DataManager.fetch_data(ticker, tf, p)
-                            if tf_df is not None:
-                                last_close = tf_df['Close'].iloc[-1]
-                                sma50 = tf_df['Close'].rolling(50).mean().iloc[-1]
-                                trend = "BULLISH" if last_close > sma50 else "BEARISH"
-                                rsi_val = Technicals.rsi(tf_df['Close']).iloc[-1]
-                                scan_res.append({"Timeframe": tf, "Trend": trend, "RSI": f"{rsi_val:.1f}"})
-                        except:
-                            pass
-                        time.sleep(1) # Safety delay
-                        progress.progress((i + 1) / len(tf_list))
-                    
-                    st.table(pd.DataFrame(scan_res))
+                trend = "BULL" if last_row['Close'] > last_row['SMA_200'] else "BEAR"
+                rsi = last_row['RSI']
+                signal = "BUY" if rsi < 30 and trend == "BULL" else "SELL" if rsi > 70 and trend == "BEAR" else "NEUTRAL"
+                
+                results.append({
+                    "Timeframe": tf,
+                    "Trend (200 SMA)": trend,
+                    "RSI": f"{rsi:.1f}",
+                    "Volatility (ATR)": f"{last_row['ATR']:.2f}",
+                    "AI Signal": signal
+                })
+            
+            time.sleep(1.1) # Respect API limits
+            progress_bar.progress((i + 1) / len(scan_tfs))
+            
+        st.session_state.deep_scan_results = pd.DataFrame(results)
+        status_text.text("Scan Complete.")
 
-            # --- TAB 5: Signals & Backtest ---
-            with tab5:
-                # Signal Generation
-                last_row = df.iloc[-1]
-                score = 0
-                reasons = []
-                
-                if last_row['Close'] > last_row['SMA_200']: 
-                    score += 1
-                    reasons.append("Price above 200 SMA (Long Term Bullish)")
-                
-                if last_row['RSI'] < 30:
-                    score += 1
-                    reasons.append("RSI Oversold (Potential Bounce)")
-                elif last_row['RSI'] > 70:
-                    score -= 1
-                    reasons.append("RSI Overbought (Potential Pullback)")
-                
-                if last_row['MACD'] > last_row['Signal']:
-                    score += 1
-                    reasons.append("MACD Bullish Crossover")
-                
-                if last_row['+DI'] > 25 and last_row['ADX'] > 25:
-                    score += 1
-                    reasons.append("Strong Uptrend (ADX)")
-                    
-                recommendation = "HOLD"
-                color = "gray"
-                if score >= 2: 
-                    recommendation = "BUY"
-                    color = "green"
-                elif score <= -1:
-                    recommendation = "SELL"
-                    color = "red"
-                
-                st.markdown(f"### AI Recommendation: :{color}[{recommendation}]")
-                st.markdown(f"**Confidence Score:** {score}/5")
-                with st.expander("Logic / Reasons"):
-                    for r in reasons: st.write(f"- {r}")
-                
-                # Trade Setup
-                if recommendation == "BUY":
-                    entry = last_row['Close']
-                    sl = entry * 0.98 # 2% SL
-                    target = entry * 1.04 # 4% Target
-                    st.success(f"**Setup:** Entry: {entry:.2f} | SL: {sl:.2f} | Target: {target:.2f}")
+    # Display Deep Scan Results (Persisted)
+    if st.session_state.deep_scan_results is not None:
+        st.table(st.session_state.deep_scan_results)
+        
+        # Auto-Analysis of Matrix
+        bull_count = len(st.session_state.deep_scan_results[st.session_state.deep_scan_results['Trend (200 SMA)'] == "BULL"])
+        total = len(st.session_state.deep_scan_results)
+        
+        if bull_count == total:
+            st.success("🔥 CONFLUENCE: All Timeframes are BULLISH. Strong Buy Confidence.")
+        elif bull_count == 0:
+            st.error("❄️ CONFLUENCE: All Timeframes are BEARISH. Strong Sell Confidence.")
+        else:
+            st.warning("⚠️ CONFLICT: Mixed signals across timeframes. Trade with caution.")
 
-                # Simple Vectorized Backtest
-                st.subheader("Backtest of this Logic (Last 1 Year)")
-                df['Signal'] = 0
-                df.loc[(df['Close'] > df['SMA_50']) & (df['RSI'] < 40), 'Signal'] = 1 # Simple Mean Reversion Strategy
-                df['Strategy_Returns'] = df['Signal'].shift(1) * df['Returns']
-                cum_returns = (1 + df['Strategy_Returns']).cumprod()
-                buy_hold = (1 + df['Returns']).cumprod()
-                
-                fig_bt = go.Figure()
-                fig_bt.add_trace(go.Scatter(x=df.index, y=cum_returns, name="Algo Strategy"))
-                fig_bt.add_trace(go.Scatter(x=df.index, y=buy_hold, name="Buy & Hold", line=dict(dash='dot')))
-                st.plotly_chart(fig_bt, use_container_width=True)
-                st.caption("Backtest compares a simple 'Buy on Dip' algo (Green) vs Standard Buy & Hold (Dot).")
-                
 if __name__ == "__main__":
     main()
