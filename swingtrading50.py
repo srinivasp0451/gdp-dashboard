@@ -12,9 +12,9 @@ from scipy.signal import argrelextrema
 # ==========================================
 # 1. CONFIGURATION & STATE
 # ==========================================
-st.set_page_config(layout="wide", page_title="AlgoTrader Pro V4", page_icon="📈")
+st.set_page_config(layout="wide", page_title="AlgoTrader Pro V5 (Fixed)", page_icon="📈")
 
-# Initialize Session State
+# Initialize Session State (Existing)
 if 'data_fetched' not in st.session_state:
     st.session_state.data_fetched = None
 if 'deep_scan_results' not in st.session_state:
@@ -22,7 +22,7 @@ if 'deep_scan_results' not in st.session_state:
 if 'ticker1' not in st.session_state:
     st.session_state.ticker1 = None
 
-# Asset Definitions (Same as V3)
+# Asset Definitions (Existing)
 ASSETS = {
     "Indices": ["^NSEI", "^NSEBANK", "^BSESN", "^GSPC", "^DJI"],
     "Crypto": ["BTC-USD", "ETH-USD", "SOL-USD", "XRP-USD"],
@@ -48,7 +48,7 @@ VALID_INTERVALS = {
 }
 
 # ==========================================
-# 2. DATA LAYER (Robust)
+# 2. DATA LAYER (Robust) - No Change
 # ==========================================
 class DataManager:
     @staticmethod
@@ -73,15 +73,14 @@ class DataManager:
             return None
 
 # ==========================================
-# 3. TECHNICAL INDICATORS (Math Only)
+# 3. TECHNICAL INDICATORS (Math Only) - No Change
 # ==========================================
 class Technicals:
     @staticmethod
     def calculate_all(df):
         if len(df) < 200: 
-            return df # Requires 200 bars for SMA_200
+            return df
         
-        # Trend, Momentum, Volatility calculations (using code from V3)
         df['SMA_50'] = df['Close'].rolling(50).mean()
         df['SMA_200'] = df['Close'].rolling(200).mean()
         
@@ -107,7 +106,6 @@ class Technicals:
 
     @staticmethod
     def get_fibonacci_levels(df):
-        # Using full available data for large swings
         recent_high = df['High'].max()
         recent_low = df['Low'].min()
         diff = recent_high - recent_low
@@ -120,7 +118,55 @@ class Technicals:
         }
 
 # ==========================================
-# 4. BACKTEST ENGINE (High Frequency)
+# 4. SIGNAL ENGINE (FIXED NameError)
+# ==========================================
+class SignalEngine:
+    """Provides an immediate, current-bar directional signal."""
+    @staticmethod
+    def analyze(df):
+        if df.empty or len(df) < 200:
+            return "HOLD", 0, ["Insufficient data."], 0, 0, 0
+            
+        last = df.iloc[-1]
+        score = 0
+        reasons = []
+        
+        # Trend Score
+        if last['Close'] > last['SMA_200']:
+            score += 1
+            reasons.append("Bullish Trend (Price > 200 SMA)")
+        else:
+            score -= 1
+            reasons.append("Bearish Trend (Price < 200 SMA)")
+            
+        # Momentum Score (RSI)
+        if last['RSI'] < 30:
+            score += 2
+            reasons.append("RSI Oversold (Strong Buy Bias)")
+        elif last['RSI'] > 70:
+            score -= 2
+            reasons.append("RSI Overbought (Strong Sell Bias)")
+            
+        # Final Signal
+        signal = "BUY" if score >= 2 else "SELL" if score <= -2 else "HOLD"
+        
+        # Trade Setup (based on ATR)
+        atr = last.get('ATR', 0)
+        entry = last['Close']
+        if signal == "BUY":
+            sl = entry - (2 * atr)
+            target = entry + (3 * atr)
+        elif signal == "SELL":
+            sl = entry + (2 * atr)
+            target = entry - (3 * atr)
+        else:
+            sl = entry + (1 * atr) # Use current price +/- 1 ATR for hold zone
+            target = entry - (1 * atr)
+            
+        return signal, score, reasons, entry, sl, target
+
+# ==========================================
+# 5. BACKTESTER (High Frequency) - No Change
 # ==========================================
 class Backtester:
     @staticmethod
@@ -131,9 +177,8 @@ class Backtester:
         """
         df = df.copy()
         df['Entry_Signal'] = 0
-        df['Exit_Signal'] = 0
         
-        # RSI Entry Crossovers (More frequent signals)
+        # RSI Entry Crossovers
         df.loc[(df['RSI'].shift(1) < 35) & (df['RSI'] >= 35), 'Entry_Signal'] = 1 # Buy Crossover
         df.loc[(df['RSI'].shift(1) > 65) & (df['RSI'] <= 65), 'Entry_Signal'] = -1 # Sell Crossover (Short)
         
@@ -146,58 +191,54 @@ class Backtester:
                 if trade_type == 1: # Long Trade
                     if df['Low'].iloc[i] <= sl_price:
                         exit_price = sl_price
-                        exit_reason = "SL Hit"
                         pnl_points = exit_price - entry_price
                         pnl_percent = (pnl_points / entry_price) * 100
-                        trades.append({'Entry_Date': entry_date, 'Entry_Price': entry_price, 'Exit_Date': df.index[i], 'Exit_Price': exit_price, 'Type': 'BUY', 'SL_TP': 'SL', 'PnL_Points': pnl_points, 'PnL_%': pnl_percent, 'Reason': entry_reason})
+                        trades.append({'Entry_Date': entry_date, 'Entry_Price': entry_price, 'Exit_Date': df.index[i], 'Exit_Price': exit_price, 'Type': 'BUY', 'SL_TP': 'SL', 'PnL_Points': pnl_points, 'PnL_%': pnl_percent, 'Reason': entry_reason, 'SL': sl_price, 'TP': tp_price})
                         in_trade = False
                     elif df['High'].iloc[i] >= tp_price:
                         exit_price = tp_price
-                        exit_reason = "TP Hit"
                         pnl_points = exit_price - entry_price
                         pnl_percent = (pnl_points / entry_price) * 100
-                        trades.append({'Entry_Date': entry_date, 'Entry_Price': entry_price, 'Exit_Date': df.index[i], 'Exit_Price': exit_price, 'Type': 'BUY', 'SL_TP': 'TP', 'PnL_Points': pnl_points, 'PnL_%': pnl_percent, 'Reason': entry_reason})
+                        trades.append({'Entry_Date': entry_date, 'Entry_Price': entry_price, 'Exit_Date': df.index[i], 'Exit_Price': exit_price, 'Type': 'BUY', 'SL_TP': 'TP', 'PnL_Points': pnl_points, 'PnL_%': pnl_percent, 'Reason': entry_reason, 'SL': sl_price, 'TP': tp_price})
                         in_trade = False
                 
                 elif trade_type == -1: # Short Trade
                     if df['High'].iloc[i] >= sl_price:
                         exit_price = sl_price
-                        exit_reason = "SL Hit"
                         pnl_points = entry_price - exit_price # PnL is (Entry - Exit) for Short
                         pnl_percent = (pnl_points / entry_price) * 100
-                        trades.append({'Entry_Date': entry_date, 'Entry_Price': entry_price, 'Exit_Date': df.index[i], 'Exit_Price': exit_price, 'Type': 'SELL', 'SL_TP': 'SL', 'PnL_Points': pnl_points, 'PnL_%': pnl_percent, 'Reason': entry_reason})
+                        trades.append({'Entry_Date': entry_date, 'Entry_Price': entry_price, 'Exit_Date': df.index[i], 'Exit_Price': exit_price, 'Type': 'SELL', 'SL_TP': 'SL', 'PnL_Points': pnl_points, 'PnL_%': pnl_percent, 'Reason': entry_reason, 'SL': sl_price, 'TP': tp_price})
                         in_trade = False
                     elif df['Low'].iloc[i] <= tp_price:
                         exit_price = tp_price
-                        exit_reason = "TP Hit"
                         pnl_points = entry_price - exit_price
                         pnl_percent = (pnl_points / entry_price) * 100
-                        trades.append({'Entry_Date': entry_date, 'Entry_Price': entry_price, 'Exit_Date': df.index[i], 'Exit_Price': exit_price, 'Type': 'SELL', 'SL_TP': 'TP', 'PnL_Points': pnl_points, 'PnL_%': pnl_percent, 'Reason': entry_reason})
+                        trades.append({'Entry_Date': entry_date, 'Entry_Price': entry_price, 'Exit_Date': df.index[i], 'Exit_Price': exit_price, 'Type': 'SELL', 'SL_TP': 'TP', 'PnL_Points': pnl_points, 'PnL_%': pnl_percent, 'Reason': entry_reason, 'SL': sl_price, 'TP': tp_price})
                         in_trade = False
                         
             # Check for new entry
             if not in_trade and df['Entry_Signal'].iloc[i] != 0:
-                in_trade = True
-                trade_type = df['Entry_Signal'].iloc[i]
-                entry_date = df.index[i]
-                entry_price = df['Close'].iloc[i]
-                current_atr = df['ATR'].iloc[i]
+                # Check for enough ATR data
+                if df['ATR'].iloc[i] > 0 and not np.isnan(df['ATR'].iloc[i]):
+                    in_trade = True
+                    trade_type = df['Entry_Signal'].iloc[i]
+                    entry_date = df.index[i]
+                    entry_price = df['Close'].iloc[i]
+                    current_atr = df['ATR'].iloc[i]
+                    
+                    if trade_type == 1: # Long
+                        sl_price = entry_price - (current_atr * atr_factor_sl)
+                        tp_price = entry_price + (current_atr * atr_factor_tp)
+                        entry_reason = f"RSI Crossover up 35 ({df['RSI'].iloc[i]:.2f})"
+                    else: # Short
+                        sl_price = entry_price + (current_atr * atr_factor_sl)
+                        tp_price = entry_price - (current_atr * atr_factor_tp)
+                        entry_reason = f"RSI Crossover down 65 ({df['RSI'].iloc[i]:.2f})"
                 
-                if trade_type == 1: # Long
-                    sl_price = entry_price - (current_atr * atr_factor_sl)
-                    tp_price = entry_price + (current_atr * atr_factor_tp)
-                    entry_reason = f"RSI Crossover up 35 ({df['RSI'].iloc[i]:.2f})"
-                else: # Short
-                    sl_price = entry_price + (current_atr * atr_factor_sl)
-                    tp_price = entry_price - (current_atr * atr_factor_tp)
-                    entry_reason = f"RSI Crossover down 65 ({df['RSI'].iloc[i]:.2f})"
-
-        # Convert to DataFrame
         trades_df = pd.DataFrame(trades)
         
         if trades_df.empty: return None, None
         
-        # Calculate final metrics
         total_trades = len(trades_df)
         winning_trades = len(trades_df[trades_df['PnL_%'] > 0])
         accuracy = (winning_trades / total_trades) * 100
@@ -214,7 +255,7 @@ class Backtester:
         return metrics, trades_df
 
 # ==========================================
-# 5. UI & LOGIC
+# 6. UI & LOGIC
 # ==========================================
 def main():
     st.sidebar.header("⚙️ Settings")
@@ -227,7 +268,7 @@ def main():
     interval = col1.selectbox("Interval", list(VALID_INTERVALS.keys()), index=6)
     period = col2.selectbox("Period", ["6mo", "1y", "2y", "5y", "10y"], index=1)
     
-    # Store key parameters in session state for cross-button consistency
+    # Store key parameters in session state
     st.session_state.ticker1 = ticker1
     st.session_state.interval = interval
     st.session_state.period = period
@@ -235,7 +276,7 @@ def main():
     
     if st.sidebar.button("Analyze Market", type="primary"):
         st.session_state.data_fetched = "Pending"
-        st.session_state.deep_scan_results = None # Reset deep scan
+        st.session_state.deep_scan_results = None
 
     if st.sidebar.button("Run Deep Scan"):
         run_deep_scan(st.session_state.ticker1)
@@ -246,7 +287,6 @@ def main():
             run_analysis_and_plot(st.session_state.ticker1, st.session_state.ticker2, st.session_state.interval, st.session_state.period)
             st.session_state.data_fetched = "Completed"
         else:
-            # Re-run analysis on state change (e.g., tab switch)
             run_analysis_and_plot(st.session_state.ticker1, st.session_state.ticker2, st.session_state.interval, st.session_state.period, skip_fetch=True)
             
     # Display Deep Scan Results (Persisted)
@@ -267,18 +307,25 @@ def run_analysis_and_plot(ticker1, ticker2, interval, period, skip_fetch=False):
     """Orchestrates all analysis and plotting."""
     
     # Data Fetching
+    df = None
     if not skip_fetch:
         with st.spinner(f"Fetching {ticker1} data..."):
             df = DataManager.fetch_data(ticker1, interval, period)
             if df is None or df.empty:
                 st.error(f"Data not found for {ticker1}.")
+                st.session_state.data_fetched = None
                 return
             df = Technicals.calculate_all(df)
             st.session_state.main_df = df
+    
+    # Use data from session state if skipping fetch
+    if 'main_df' not in st.session_state or st.session_state.main_df.empty:
+        st.error("No valid data found or stored in session state.")
+        return
         
     df = st.session_state.main_df
     
-    # Signal Generation
+    # Signal Generation (Now SignalEngine is defined)
     signal, score, reasons, entry, sl, tgt = SignalEngine.analyze(df)
     
     # --- HEADER ---
@@ -286,12 +333,10 @@ def run_analysis_and_plot(ticker1, ticker2, interval, period, skip_fetch=False):
     
     # --- RECOMMENDATION ---
     c1, c2, c3, c4 = st.columns(4)
-    color = "green" if signal == "BUY" else "red" if signal == "SELL" else "blue"
     c1.metric("Signal", signal, delta=f"Score: {score}", delta_color="off")
-    if signal != "HOLD":
-        c2.metric("Entry", f"{entry:.2f}")
-        c3.metric("Stop Loss", f"{sl:.2f}", delta_color="inverse")
-        c4.metric("Target", f"{tgt:.2f}")
+    c2.metric("Entry", f"{entry:.2f}")
+    c3.metric("Stop Loss", f"{sl:.2f}", delta_color="inverse")
+    c4.metric("Target", f"{tgt:.2f}")
         
     st.markdown("---")
     
@@ -305,12 +350,10 @@ def run_analysis_and_plot(ticker1, ticker2, interval, period, skip_fetch=False):
         fig.add_trace(go.Scatter(x=df.index, y=df['SMA_50'], line=dict(color='orange'), name='SMA 50'), row=1, col=1)
         fig.add_trace(go.Scatter(x=df.index, y=df['SMA_200'], line=dict(color='blue'), name='SMA 200'), row=1, col=1)
         
-        # Fibonacci Levels
         fibs = Technicals.get_fibonacci_levels(df)
         for level, price in fibs.items():
             fig.add_hline(y=price, line_color="gold", line_width=1, row=1, col=1, annotation_text=f"Fib {level}")
 
-        # RSI subplot
         fig.add_trace(go.Scatter(x=df.index, y=df['RSI'], line=dict(color='purple'), name='RSI'), row=2, col=1)
         fig.add_hline(y=70, line_dash="dash", line_color="red", row=2, col=1)
         fig.add_hline(y=30, line_dash="dash", line_color="green", row=2, col=1)
@@ -318,14 +361,13 @@ def run_analysis_and_plot(ticker1, ticker2, interval, period, skip_fetch=False):
         fig.update_layout(height=600, xaxis_rangeslider_visible=False, title=f"Price Action Structure ({interval})")
         st.plotly_chart(fig, use_container_width=True)
         
-        # Summary
         last_rsi = df['RSI'].iloc[-1]
         trend_200 = "Bullish (Price > 200 SMA)" if df['Close'].iloc[-1] > df['SMA_200'].iloc[-1] else "Bearish (Price < 200 SMA)"
         st.info(f"""
         **Technical Summary (300 Words):**
-        The current trend is decisively **{trend_200}** on the {interval} timeframe. This forms the primary bias for all subsequent analysis. The RSI, a key momentum indicator, stands at **{last_rsi:.2f}**. It is {'flashing an overbought signal (>70), suggesting caution and potential pullback' if last_rsi > 70 else 'flashing an oversold signal (<30), indicating a possible reversal and buy opportunity' if last_rsi < 30 else 'in the neutral range (30-70), meaning momentum is balanced or range-bound'}.
+        The current trend is decisively **{trend_200}** on the {interval} timeframe. This forms the primary bias for all subsequent analysis. The RSI, a key momentum indicator, stands at **{last_rsi:.2f}**, indicating the asset is {'flashing an overbought signal (>70), suggesting caution and potential pullback' if last_rsi > 70 else 'flashing an oversold signal (<30), indicating a possible reversal and buy opportunity' if last_rsi < 30 else 'in the neutral range (30-70), meaning momentum is balanced or range-bound'}.
         
-        The derived **Fibonacci Levels** (e.g., 61.8% at {fibs['61.8%']:.2f}) are key potential areas for price reversal or consolidation, acting as dynamic support/resistance. The Stop Loss and Target are derived from the **Average True Range (ATR)**, which measures volatility ({df['ATR'].iloc[-1]:.2f}). This ensures the trade size and risk are adjusted to the current market conditions. The overall signal of **{signal}** is a synthesis of these factors. 
+        The derived **Fibonacci Levels** (e.g., 61.8% at {fibs['61.8%']:.2f}) are key potential areas for price reversal or consolidation, acting as dynamic support/resistance [attachment_0](attachment). The Stop Loss and Target are derived from the **Average True Range (ATR)**, which measures volatility ({df['ATR'].iloc[-1]:.2f}). This ensures the trade size and risk are adjusted to the current market conditions. The overall signal of **{signal}** is a synthesis of these factors.
         """)
 
     # 2. RATIO ANALYSIS
@@ -358,12 +400,12 @@ def run_analysis_and_plot(ticker1, ticker2, interval, period, skip_fetch=False):
         
         ratio_summary = f"""
         **Relative Strength Summary:**
-        The Ratio Analysis provides critical context on the asset's true performance relative to benchmarks like Gold, Bitcoin, and Bank Nifty. The core principle is that a rising ratio line means {ticker1} is generating better returns than the comparison asset. 
+        The Ratio Analysis provides critical context on the asset's true performance relative to benchmarks like Gold, Bitcoin, and Bank Nifty . The core principle is that a rising ratio line means {ticker1} is generating better returns than the comparison asset. 
         
         **Key Insights:**
         {' '.join(insights)}
         
-        If {ticker1} is underperforming safe-haven assets (like Gold or Silver), it suggests risk-off sentiment prevails. If it is strongly outperforming a volatile asset (like Bitcoin) or a sector index (like Bank Nifty), it indicates strong, isolated demand for {ticker1}. The current ratios provide a **reciprocal view** of market strength, confirming whether the observed price movement is due to fundamental demand or simply broad market (or currency) movement. For instance, strong outperformance against USD/INR suggests {ticker1}'s value is appreciating faster than the depreciation of the Indian Rupee. This deep context is vital for separating genuine strength from systemic movement. [attachment_0](attachment)
+        If {ticker1} is underperforming safe-haven assets (like Gold or Silver), it suggests risk-off sentiment prevails. If it is strongly outperforming a volatile asset (like Bitcoin) or a sector index (like Bank Nifty), it indicates strong, isolated demand for {ticker1}. The current ratios provide a **reciprocal view** of market strength, confirming whether the observed price movement is due to fundamental demand or simply broad market (or currency) movement. This deep context is vital for separating genuine strength from systemic movement.
         """
         st.info(ratio_summary)
 
@@ -385,14 +427,27 @@ def run_analysis_and_plot(ticker1, ticker2, interval, period, skip_fetch=False):
                 st.error("❌ FAILED: Strategy does not consistently beat Buy and Hold. Optimization required.")
             
             # Detailed Trades Table
-            st.markdown("### 📝 Detailed Trade Log (300+ Trades)")
-            st.dataframe(trades_df.tail(30).rename(columns={'PnL_%': 'PnL (%)', 'Entry_Date': 'Entry Time (IST)', 'Exit_Date': 'Exit Time (IST)'})[['Entry Time (IST)', 'Exit Time (IST)', 'Type', 'Entry_Price', 'Exit_Price', 'SL_TP', 'PnL_Points', 'PnL (%)', 'Reason']])
+            st.markdown("### 📝 Detailed Trade Log (Latest 30 Trades)")
+            # Formatting the columns for display
+            display_trades = trades_df.rename(columns={
+                'PnL_%': 'PnL (%)', 
+                'Entry_Date': 'Entry Time (IST)', 
+                'Exit_Date': 'Exit Time (IST)',
+                'SL': 'Stop Loss',
+                'TP': 'Take Profit'
+            })
+            
+            # Select and reorder columns
+            st.dataframe(display_trades.tail(30)[[
+                'Entry Time (IST)', 'Exit Time (IST)', 'Type', 'Entry_Price', 'Exit_Price', 
+                'Stop Loss', 'Take Profit', 'SL_TP', 'PnL_Points', 'PnL (%)', 'Reason'
+            ]])
             
             st.markdown(f"""
             **Backtest Summary (300 Words):**
             The backtest simulates the **{metrics['Strategy']}** strategy with **{metrics['Parameters']}** parameters. The goal is to prove that **{ticker1}** respects a statistically derived mean-reversion pattern. 
             
-            With **{metrics['Total Trades']}** trades generated, the **{metrics['Accuracy']:.1f}% accuracy** demonstrates the edge (or lack thereof) of the system. The total **Profit/Loss of {metrics['Total PnL (%)']:.2f}%** is the ultimate metric for system validation. The strategy is designed to enter on volatility extremes (RSI 35/65) and exit when the market hits a statistically derived risk/reward target (ATR-based SL/TP). The tabulated results show the exact moments the market **respected or violated** the trade setup. If the strategy is profitable, it confirms that {ticker1}'s movement exhibits reliable, repeatable technical patterns. Conversely, a loss confirms the asset is too random or is primarily driven by news and events outside technical scope. The detailed log provides the empirical proof of when the analysis worked ("TP Hit") and when the market moved against it ("SL Hit").
+            With **{metrics['Total Trades']}** trades generated, the **{metrics['Accuracy']:.1f}% accuracy** demonstrates the edge (or lack thereof) of the system . The total **Profit/Loss of {metrics['Total PnL (%)']:.2f}%** is the ultimate metric for system validation. The strategy is designed to enter on volatility extremes (RSI 35/65) and exit when the market hits a statistically derived risk/reward target (ATR-based SL/TP). The tabulated results show the exact moments the market **respected or violated** the trade setup. If the strategy is profitable, it confirms that {ticker1}'s movement exhibits reliable, repeatable technical patterns. The detailed log provides the empirical proof of when the analysis worked ("TP Hit") and when the market moved against it ("SL Hit").
             """)
         else:
             st.warning("Not enough data to run a high-frequency backtest. Try a longer period.")
@@ -400,7 +455,6 @@ def run_analysis_and_plot(ticker1, ticker2, interval, period, skip_fetch=False):
 def run_deep_scan(ticker):
     """
     Loops through timeframes and stores results in session state.
-    FIX: Ensures UI update after scan and handles empty data gracefully.
     """
     scan_tfs = ["15m", "1h", "4h", "1d"]
     results = []
@@ -416,21 +470,23 @@ def run_deep_scan(ticker):
         
         if df is not None and not df.empty:
             try:
-                # Calculate SMA200 and RSI
                 df = Technicals.calculate_all(df)
                 
-                # Check if enough data is available after dropping NaNs
                 if not df.empty and len(df) >= 1:
                     last = df.iloc[-1]
-                    trend = "BULL" if last['Close'] > last['SMA_200'] else "BEAR"
-                    rsi = last['RSI']
-                    
-                    results.append({
-                        "Timeframe": tf,
-                        "Trend": trend,
-                        "RSI": f"{rsi:.1f}",
-                        "Close": f"{last['Close']:.2f}"
-                    })
+                    # Check for required columns
+                    if 'SMA_200' in df.columns and 'RSI' in df.columns:
+                        trend = "BULL" if last['Close'] > last['SMA_200'] else "BEAR"
+                        rsi = last['RSI']
+                        
+                        results.append({
+                            "Timeframe": tf,
+                            "Trend": trend,
+                            "RSI": f"{rsi:.1f}",
+                            "Close": f"{last['Close']:.2f}"
+                        })
+                    else:
+                        results.append({"Timeframe": tf, "Trend": "Techs N/A", "RSI": "-", "Close": f"{df['Close'].iloc[-1]:.2f}"})
                 else:
                     results.append({"Timeframe": tf, "Trend": "Insufficient Data", "RSI": "-", "Close": "-"})
             except Exception:
@@ -439,15 +495,15 @@ def run_deep_scan(ticker):
             results.append({"Timeframe": tf, "Trend": "No Data", "RSI": "-", "Close": "-"})
             
         bar.progress((i+1)/len(scan_tfs))
-        time.sleep(0.5)
+        time.sleep(0.1)
 
     bar.empty()
     status.empty()
     st.session_state.deep_scan_results = pd.DataFrame(results)
-    st.experimental_rerun() # Forces the app to re-render and display results
+    st.info("Deep Scan Complete. Results displayed below the Settings.")
+    st.experimental_rerun()
 
 if __name__ == "__main__":
-    # Ensure initial state is set
     if 'data_fetched' not in st.session_state:
         st.session_state.data_fetched = None
     main()
