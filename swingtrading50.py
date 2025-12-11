@@ -784,7 +784,7 @@ st.markdown("""
     <p style='color: #888;'>⚠️ Educational purposes only. Trading involves substantial risk. Past performance does not guarantee future results.</p>
     <p style='color: #888;'>Built with ❤️ | Complete Multi-Timeframe Analysis Engine</p>
 </div>
-""", unsafe_allow_html=True)_format(pred['exit_price'])} = <span style='color: #00ff00;'>{safe_format(pred['return'])}% profit</span></p>
+""", unsafe_allow_html=True).format{(pred['exit_price'])} = <span style='color: #00ff00;'>{safe_format(pred['return'])}% profit</span></p>
                     """, unsafe_allow_html=True)
                 
                 st.markdown(f"""
