@@ -12,7 +12,7 @@ from scipy.stats import zscore as scipy_zscore
 # ==========================================
 # 1. CONFIGURATION & STATE
 # ==========================================
-st.set_page_config(layout="wide", page_title="AlgoTrader Pro V6 (Advanced)", page_icon="⚛️")
+st.set_page_config(layout="wide", page_title="AlgoTrader Pro V7 (Error Fixed)", page_icon="⚛️")
 
 # Initialize Session State
 if 'data_fetched' not in st.session_state:
@@ -72,7 +72,11 @@ class DataManager:
 class Technicals:
     @staticmethod
     def calculate_all(df):
-        if len(df) < 200: return df
+        if len(df) < 250: # Increased minimum length due to Z-Score 250 period
+            return df
+        
+        # Ensure we work on a copy to avoid SettingWithCopyWarning
+        df = df.copy() 
         
         df['SMA_50'] = df['Close'].rolling(50).mean()
         df['SMA_200'] = df['Close'].rolling(200).mean()
@@ -89,26 +93,32 @@ class Technicals:
         tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
         df['ATR'] = tr.rolling(14).mean()
         
-        # New: Volatility Z-Score (measures how far current ATR is from its own average)
-        df['ATR_ZScore'] = scipy_zscore(df['ATR'].rolling(window=250).mean().dropna())
+        # FIX for Z-Score: Calculate Z-score based on a large rolling window (250 bars)
+        # We must align the result with the original DataFrame index.
+        atr_mean = df['ATR'].rolling(window=250).mean()
+        
+        # Calculate Z-Score on the non-NaN part of ATR_Mean
+        z_scores = pd.Series(scipy_zscore(atr_mean.dropna()), index=atr_mean.dropna().index)
+        
+        # Reindex z_scores to match df and fill leading NaNs with 0 or a median value
+        df['ATR_ZScore'] = z_scores.reindex(df.index).fillna(0) # Filling missing Z-scores at start with 0
         
         df.dropna(inplace=True)
         return df
 
     @staticmethod
     def get_divergence_signals(df):
-        """Detects RSI Divergences by looking at recent High/Low swings."""
+        df = df.copy()
         df['Divergence'] = 0
-        df['Swing_High_Price'] = np.nan
-        df['Swing_Low_Price'] = np.nan
-        df['Swing_High_RSI'] = np.nan
-        df['Swing_Low_RSI'] = np.nan
         
         # Find swing points (simplified)
         swing_lookback = 20
-        df['Swing_High_Price'].iloc[argrelextrema(df.High.values, np.greater_equal, order=swing_lookback)[0]] = df['High']
-        df['Swing_Low_Price'].iloc[argrelextrema(df.Low.values, np.less_equal, order=swing_lookback)[0]] = df['Low']
         
+        # Calculate Swing Highs and Lows (using NaN to handle missing data)
+        df['Swing_High_Price'] = df['High'].iloc[argrelextrema(df.High.values, np.greater_equal, order=swing_lookback)[0]]
+        df['Swing_Low_Price'] = df['Low'].iloc[argrelextrema(df.Low.values, np.less_equal, order=swing_lookback)[0]]
+        
+        # Divergence Detection Loop (same logic as before, applied to the copied DF)
         for i in range(len(df)):
             # Look back for two recent swing highs/lows
             recent_swings = df.iloc[max(0, i - 100):i].dropna(subset=['Swing_High_Price', 'Swing_Low_Price'], how='all')
@@ -119,15 +129,12 @@ class Technicals:
                 last_high = highs.iloc[-1]
                 prev_high = highs.iloc[-2]
                 
-                # Compare current price to last two highs
-                if last_high['High'] > prev_high['High']: # Price made higher high
+                if last_high['High'] > prev_high['High']:
                     rsi_last = df.loc[last_high.name, 'RSI']
                     rsi_prev = df.loc[prev_high.name, 'RSI']
                     
-                    if rsi_last < rsi_prev and rsi_last > 50: # RSI made lower high (Divergence)
-                        df.loc[df.index[i], 'Divergence'] = -1  # Bearish Signal
-                        df.loc[df.index[i], 'Swing_High_Price'] = last_high['High']
-                        df.loc[df.index[i], 'Swing_High_RSI'] = rsi_last
+                    if rsi_last < rsi_prev and rsi_last > 50:
+                        df.loc[df.index[i], 'Divergence'] = -1
                         
             # --- Bullish Divergence (Price Lower, RSI Higher) ---
             lows = recent_swings.dropna(subset=['Swing_Low_Price'])
@@ -135,14 +142,12 @@ class Technicals:
                 last_low = lows.iloc[-1]
                 prev_low = lows.iloc[-2]
 
-                if last_low['Low'] < prev_low['Low']: # Price made lower low
+                if last_low['Low'] < prev_low['Low']:
                     rsi_last = df.loc[last_low.name, 'RSI']
                     rsi_prev = df.loc[prev_low.name, 'RSI']
                     
-                    if rsi_last > rsi_prev and rsi_last < 50: # RSI made higher low (Divergence)
-                        df.loc[df.index[i], 'Divergence'] = 1 # Bullish Signal
-                        df.loc[df.index[i], 'Swing_Low_Price'] = last_low['Low']
-                        df.loc[df.index[i], 'Swing_Low_RSI'] = rsi_last
+                    if rsi_last > rsi_prev and rsi_last < 50:
+                        df.loc[df.index[i], 'Divergence'] = 1
                         
         return df
 
@@ -152,9 +157,8 @@ class Technicals:
 class SignalEngine:
     @staticmethod
     def analyze(df):
-        # Existing simple analysis
-        if df.empty or len(df) < 200: return "HOLD", 0, ["Insufficient data."], 0, 0, 0
-        
+        if df.empty or len(df) < 250: return "HOLD", 0, ["Insufficient data."], 0, 0, 0
+            
         last = df.iloc[-1]
         score = 0
         reasons = []
@@ -167,14 +171,14 @@ class SignalEngine:
             score -= 1
             reasons.append("Bearish Trend (Price < 200 SMA)")
             
-        # 2. Volatility Filter (High Volatility means likely reversal/trend break)
+        # 2. Volatility Filter
         if last.get('ATR_ZScore', 0) > 1.5:
-            score -= 0.5 # De-risk in high volatility
+            score -= 0.5
             reasons.append(f"High Volatility Z-Score ({last['ATR_ZScore']:.2f}) - Caution advised")
         
         # 3. Divergence Signal
-        div_df = Technicals.get_divergence_signals(df.tail(200)) # Only scan recent data
-        last_div = div_df['Divergence'].iloc[-1] if not div_df.empty else 0
+        # Note: Div signals are pre-calculated in run_analysis_and_plot and stored in df
+        last_div = last['Divergence']
         
         if last_div == 1:
             score += 2
@@ -204,24 +208,41 @@ class Backtester:
     @staticmethod
     def run_composite_backtest(df, ratio_df=None):
         """
-        Composite Divergence Strategy:
-        Entry: Bullish RSI Divergence AND Price > SMA50 AND Ratio vs Benchmark is also trending up.
-        Exit: Fixed 1.5xATR SL, 3.0xATR TP.
+        Composite Divergence Strategy.
+        FIX: Ratio data is aligned using common index before processing.
         """
-        df = Technicals.get_divergence_signals(df)
-        df['Ratio_Strength'] = 1 # Assume neutral if no ratio data
+        df = df.copy()
+        df['Ratio_Strength'] = 0 # Default to neutral/weak
         
         # 1. Sector Strength Filter (Ratio): Use Bank Nifty as an example benchmark
-        if ratio_df is not None:
-            # Calculate the ratio
-            common = df.index.intersection(ratio_df.index)
-            ratio = df.loc[common]['Close'] / ratio_df.loc[common]['Close']
-            ratio = ratio.rolling(20).mean() # Smoothed ratio trend
+        if ratio_df is not None and not ratio_df.empty:
             
-            # Check if ratio is trending up (simplification: > its own 100-bar mean)
-            ratio_mean = ratio.rolling(100).mean()
-            df['Ratio_Strength'].loc[common] = np.where(ratio.loc[common] > ratio_mean.loc[common], 1, 0)
-
+            # --- CRITICAL FIX: Align DF and Ratio DF ---
+            combined_df = pd.merge(df[['Close', 'SMA_50', 'Divergence', 'ATR', 'ATR_ZScore']], 
+                                   ratio_df['Close'].rename('Bench_Close'), 
+                                   left_index=True, 
+                                   right_index=True, 
+                                   how='inner')
+            
+            # If alignment fails (empty combined_df), use simpler logic
+            if combined_df.empty:
+                 st.warning("Could not align primary ticker with benchmark. Backtest will skip Ratio filter.")
+            else:
+                # Calculate Ratio (Ticker / Benchmark)
+                combined_df['Ratio'] = combined_df['Close'] / combined_df['Bench_Close']
+                
+                # Smoothed ratio trend (20-bar SMA)
+                combined_df['Ratio_Trend'] = combined_df['Ratio'].rolling(20).mean()
+                
+                # Check if ratio is trending up vs its own 100-bar mean
+                ratio_mean = combined_df['Ratio_Trend'].rolling(100).mean()
+                
+                # Ratio Strength: 1 if Ratio is > its 100-bar mean
+                combined_df['Ratio_Strength'] = np.where(combined_df['Ratio_Trend'] > ratio_mean, 1, 0)
+                
+                # Re-assign Ratio_Strength back to the main DF
+                df.loc[combined_df.index, 'Ratio_Strength'] = combined_df['Ratio_Strength']
+                
         # 2. Entry Logic
         # BUY: Bullish Divergence AND Price > SMA50 AND Ratio is strong
         buy_mask = (df['Divergence'] == 1) & (df['Close'] > df['SMA_50']) & (df['Ratio_Strength'] == 1)
@@ -232,42 +253,29 @@ class Backtester:
         df.loc[buy_mask, 'Entry_Signal'] = 1
         df.loc[sell_mask, 'Entry_Signal'] = -1
         
-        # --- Execute Trades (Vectorized SL/TP) ---
+        # --- Execute Trades (SL/TP) ---
         trades = []
         in_trade = False
         
-        # Loop through data to execute trade logic bar-by-bar
         for i in range(len(df)):
             if in_trade:
-                # Check for Stop Loss (SL) or Take Profit (TP)
-                # ... (SL/TP logic remains the same as previous version) ...
-                if trade_type == 1: # Long Trade
-                    if df['Low'].iloc[i] <= sl_price:
-                        exit_price = sl_price
-                        pnl_points = exit_price - entry_price
-                        pnl_percent = (pnl_points / entry_price) * 100
-                        trades.append({'Entry_Date': entry_date, 'Entry_Price': entry_price, 'Exit_Date': df.index[i], 'Exit_Price': exit_price, 'Type': 'BUY', 'SL_TP': 'SL', 'PnL_Points': pnl_points, 'PnL_%': pnl_percent, 'Reason': entry_reason, 'SL': sl_price, 'TP': tp_price})
-                        in_trade = False
-                    elif df['High'].iloc[i] >= tp_price:
-                        exit_price = tp_price
-                        pnl_points = exit_price - entry_price
-                        pnl_percent = (pnl_points / entry_price) * 100
-                        trades.append({'Entry_Date': entry_date, 'Entry_Price': entry_price, 'Exit_Date': df.index[i], 'Exit_Price': exit_price, 'Type': 'BUY', 'SL_TP': 'TP', 'PnL_Points': pnl_points, 'PnL_%': pnl_percent, 'Reason': entry_reason, 'SL': sl_price, 'TP': tp_price})
-                        in_trade = False
+                # Long Trade
+                if trade_type == 1: 
+                    if df['Low'].iloc[i] <= sl_price: exit_price = sl_price; pnl_points = exit_price - entry_price; sl_tp = 'SL'; in_trade = False
+                    elif df['High'].iloc[i] >= tp_price: exit_price = tp_price; pnl_points = exit_price - entry_price; sl_tp = 'TP'; in_trade = False
+                    else: continue
+                    
+                    pnl_percent = (pnl_points / entry_price) * 100
+                    trades.append({'Entry_Date': entry_date, 'Entry_Price': entry_price, 'Exit_Date': df.index[i], 'Exit_Price': exit_price, 'Type': 'BUY', 'SL_TP': sl_tp, 'PnL_Points': pnl_points, 'PnL_%': pnl_percent, 'Reason': entry_reason, 'SL': sl_price, 'TP': tp_price})
                 
-                elif trade_type == -1: # Short Trade
-                    if df['High'].iloc[i] >= sl_price:
-                        exit_price = sl_price
-                        pnl_points = entry_price - exit_price
-                        pnl_percent = (pnl_points / entry_price) * 100
-                        trades.append({'Entry_Date': entry_date, 'Entry_Price': entry_price, 'Exit_Date': df.index[i], 'Exit_Price': exit_price, 'Type': 'SELL', 'SL_TP': 'SL', 'PnL_Points': pnl_points, 'PnL_%': pnl_percent, 'Reason': entry_reason, 'SL': sl_price, 'TP': tp_price})
-                        in_trade = False
-                    elif df['Low'].iloc[i] <= tp_price:
-                        exit_price = tp_price
-                        pnl_points = entry_price - exit_price
-                        pnl_percent = (pnl_points / entry_price) * 100
-                        trades.append({'Entry_Date': entry_date, 'Entry_Price': entry_price, 'Exit_Date': df.index[i], 'Exit_Price': exit_price, 'Type': 'SELL', 'SL_TP': 'TP', 'PnL_Points': pnl_points, 'PnL_%': pnl_percent, 'Reason': entry_reason, 'SL': sl_price, 'TP': tp_price})
-                        in_trade = False
+                # Short Trade
+                elif trade_type == -1: 
+                    if df['High'].iloc[i] >= sl_price: exit_price = sl_price; pnl_points = entry_price - exit_price; sl_tp = 'SL'; in_trade = False
+                    elif df['Low'].iloc[i] <= tp_price: exit_price = tp_price; pnl_points = entry_price - exit_price; sl_tp = 'TP'; in_trade = False
+                    else: continue
+                    
+                    pnl_percent = (pnl_points / entry_price) * 100
+                    trades.append({'Entry_Date': entry_date, 'Entry_Price': entry_price, 'Exit_Date': df.index[i], 'Exit_Price': exit_price, 'Type': 'SELL', 'SL_TP': sl_tp, 'PnL_Points': pnl_points, 'PnL_%': pnl_percent, 'Reason': entry_reason, 'SL': sl_price, 'TP': tp_price})
                         
             # Check for new entry
             if not in_trade and df['Entry_Signal'].iloc[i] != 0:
@@ -422,7 +430,7 @@ def run_analysis_and_plot(ticker1, ticker2, interval, period, skip_fetch=False):
         # Fibonacci Levels
         fibs = Technicals.get_fibonacci_levels(df)
         for level, price in fibs.items():
-            fig.add_hline(y=price, line_color="gold", line_width=1, row=1, col=1, annotation_text=f"Fib {level}")
+            fig.add_hline(y=price, line_color="gold", line_width=1, row=1, col=1, annotation_text=f"Fib {level}") # [attachment_0](attachment)
 
         # RSI + Divergence Markers
         fig.add_trace(go.Scatter(x=df.index, y=df['RSI'], line=dict(color='purple'), name='RSI'), row=2, col=1)
@@ -436,7 +444,7 @@ def run_analysis_and_plot(ticker1, ticker2, interval, period, skip_fetch=False):
         fig.add_trace(go.Scatter(x=bear_div.index, y=bear_div['High'], mode='markers', marker=dict(color='red', size=8, symbol='triangle-down'), name='Bear Div Price'), row=1, col=1)
 
         # RSI Markers
-        fig.add_trace(go.Scatter(x=bull_div.index, y=bull_div['RSI'], mode='markers', marker=dict(color='green', size=8, symbol='circle'), name='Bull Div RSI'), row=2, col=1)
+        fig.add_trace(go.Scatter(x=bull_div.index, y=bull_div['RSI'], mode='markers', marker=dict(color='green', size=8, symbol='circle'), name='Bull Div RSI'), row=2, col=1) # [attachment_1](attachment)
         fig.add_trace(go.Scatter(x=bear_div.index, y=bear_div['RSI'], mode='markers', marker=dict(color='red', size=8, symbol='circle'), name='Bear Div RSI'), row=2, col=1)
 
         fig.update_layout(height=600, xaxis_rangeslider_visible=False, title=f"Price, Fibonacci, and RSI Divergence ({interval})")
@@ -448,7 +456,7 @@ def run_analysis_and_plot(ticker1, ticker2, interval, period, skip_fetch=False):
         
         fig_vol.add_trace(go.Scatter(x=df.index, y=df['ATR'], line=dict(color='teal'), name='ATR (Volatility)'), row=1, col=1)
         
-        fig_vol.add_trace(go.Bar(x=df.index, y=df['ATR_ZScore'], name='ATR Z-Score', marker_color=np.where(df['ATR_ZScore'] > 1, 'red', np.where(df['ATR_ZScore'] < -1, 'green', 'gray'))), row=2, col=1)
+        fig_vol.add_trace(go.Bar(x=df.index, y=df['ATR_ZScore'], name='ATR Z-Score', marker_color=np.where(df['ATR_ZScore'] > 1.5, 'red', np.where(df['ATR_ZScore'] < -1.5, 'green', 'gray'))), row=2, col=1) # 
         fig_vol.add_hline(y=1.5, line_dash="dash", line_color="red", row=2, col=1, annotation_text="High Volatility Threshold (+1.5 Z)")
         fig_vol.add_hline(y=-1.5, line_dash="dash", line_color="green", row=2, col=1, annotation_text="Low Volatility Threshold (-1.5 Z)")
 
@@ -457,7 +465,7 @@ def run_analysis_and_plot(ticker1, ticker2, interval, period, skip_fetch=False):
         
         st.info(f"""
         **Advanced Chart Summary (300 Words):**
-        The analysis moves beyond simple crossovers. The primary signals are generated by **RSI Divergences** [attachment_0](attachment), where the price makes a higher high but the RSI makes a lower high (Bearish Divergence). This indicates weakening momentum and is visualized by red markers. **Fibonacci Retracement Levels** [attachment_1](attachment) (e.g., 61.8% at {fibs.get('61.8%', 0):.2f}) serve as key confluence points for placing trades or stops.
+        The analysis moves beyond simple crossovers. The primary signals are generated by **RSI Divergences** , where the price makes a higher high but the RSI makes a lower high (Bearish Divergence). This indicates weakening momentum and is visualized by red markers. **Fibonacci Retracement Levels**  (e.g., 61.8% at {fibs.get('61.8%', 0):.2f}) serve as key confluence points for placing trades or stops.
         
         Crucially, the **Volatility Z-Score Chart**  (bottom plot) provides a market regime filter. The Z-score measures how extreme the current volatility (ATR) is relative to its historical mean. Z-scores above +1.5 (red bars) signal an extremely volatile period, where false breakouts are common, prompting the system to reduce trade conviction. Z-scores below -1.5 (green bars) signal compressed volatility, often preceding a major breakout. This chart is used by the backtest as a risk-management layer.
         """)
@@ -476,6 +484,7 @@ def run_analysis_and_plot(ticker1, ticker2, interval, period, skip_fetch=False):
             bench_df = DataManager.fetch_data(bench_ticker, interval, period)
             
             if bench_df is not None and not bench_df.empty:
+                # Ensure DF alignment for ratio plotting
                 common = df.index.intersection(bench_df.index)
                 if len(common) > 10:
                     ratio = df.loc[common]['Close'] / bench_df.loc[common]['Close']
@@ -483,7 +492,7 @@ def run_analysis_and_plot(ticker1, ticker2, interval, period, skip_fetch=False):
                     with cols[idx % 2]:
                         fig_r = go.Figure(go.Scatter(x=ratio.index, y=ratio, mode='lines', name=f"{ticker1}/{name}"))
                         fig_r.update_layout(title=f"{ticker1} vs {name} Ratio", height=300, margin=dict(t=50, b=0, l=0, r=0))
-                        st.plotly_chart(fig_r, use_container_width=True)
+                        st.plotly_chart(fig_r, use_container_width=True) # [attachment_2](attachment)
                         
                         change = ((ratio.iloc[-1] - ratio.iloc[0]) / ratio.iloc[0]) * 100
                         direction = "Outperforming" if change > 0 else "Underperforming"
@@ -514,7 +523,7 @@ def run_analysis_and_plot(ticker1, ticker2, interval, period, skip_fetch=False):
             c1.metric("Total Trades", metrics['Total Trades'])
             c2.metric("Accuracy", f"{metrics['Accuracy']:.1f}%")
             c3.metric("Total PnL (%)", f"{metrics['Total PnL (%)']:.2f}%", delta="vs. Buy & Hold")
-            c4.metric("Strategy Used", metrics['Strategy'])
+            c4.metric("Strategy Used", metrics['Strategy']) # 
             
             if metrics['Total Trades'] < 10:
                  st.warning("⚠️ Insufficient trades (<10). Try selecting a shorter timeframe or longer period for a statistically valid backtest.")
@@ -537,13 +546,13 @@ def run_analysis_and_plot(ticker1, ticker2, interval, period, skip_fetch=False):
             st.dataframe(display_trades.tail(30)[[
                 'Entry Time (IST)', 'Exit Time (IST)', 'Type', 'Entry_Price', 'Exit_Price', 
                 'Stop Loss', 'Take Profit', 'SL_TP', 'PnL_Points', 'PnL (%)', 'Reason'
-            ]])
+            ]]) # 
             
             st.markdown(f"""
             **Backtest Summary (300 Words):**
             This backtest uses a **Composite Divergence Strategy** that requires three layers of confirmation: **RSI Divergence** (signal), **Trend Filter** (SMA50/200), and **Relative Strength** (Ratio > its own mean). This multi-layered approach dramatically reduces the number of false signals, aiming for **higher quality trades** over high quantity.
             
-            With **{metrics['Total Trades']}** trades, the focus shifts from quantity to quality. The **{metrics['Accuracy']:.1f}% accuracy** and **{metrics['Total PnL (%)']:.2f}% total PnL** confirm the viability of the combined signal layers. Trades are exited either by hitting the dynamic, volatility-adjusted Stop Loss (1.5x ATR) or the Take Profit (3.0x ATR). The trade log  proves whether the asset respected the complex combination of technical, volatility, and cross-asset strength indicators. **If the PnL is positive, it confirms the existence of a durable trading edge for {ticker1} based on divergences.**
+            With **{metrics['Total Trades']}** trades, the focus shifts from quantity to quality. The **{metrics['Accuracy']:.1f}% accuracy** and **{metrics['Total PnL (%)']:.2f}% total PnL** confirm the viability of the combined signal layers . Trades are exited either by hitting the dynamic, volatility-adjusted Stop Loss (1.5x ATR) or the Take Profit (3.0x ATR). The trade log  proves whether the asset respected the complex combination of technical, volatility, and cross-asset strength indicators. **If the PnL is positive, it confirms the existence of a durable trading edge for {ticker1} based on divergences.**
             """)
 
 def run_deep_scan(ticker):
@@ -592,7 +601,7 @@ def run_deep_scan(ticker):
     status.empty()
     st.session_state.deep_scan_results = pd.DataFrame(results)
     st.info("Deep Scan Complete. Results displayed below the Settings.")
-    st.rerun()
+    st.experimental_rerun()
 
 if __name__ == "__main__":
     if 'data_fetched' not in st.session_state:
