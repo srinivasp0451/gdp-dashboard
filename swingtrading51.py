@@ -545,9 +545,13 @@ with tab1:
                     'sl_updated': False
                 }
                 
+                # Format SL and Target for logging
+                sl_text = f"{float(sl_price):.2f}" if sl_price is not None else "Crossover"
+                target_text = f"{float(target_price):.2f}" if target_price is not None else "Crossover"
+                
                 st.session_state.trade_log.append({
                     'time': current_time,
-                    'message': f'🟢 LONG Entry at {current_price} | SL: {sl_price: if sl_price is not None else "Crossover"} | Target: {target_price: if target_price is not None else "Crossover"}'
+                    'message': f'🟢 LONG Entry at {float(current_price):.2f} | SL: {sl_text} | Target: {target_text}'
                 })
                 
             elif bearish_cross:
@@ -569,9 +573,13 @@ with tab1:
                     'sl_updated': False
                 }
                 
+                # Format SL and Target for logging
+                sl_text = f"{float(sl_price):.2f}" if sl_price is not None else "Crossover"
+                target_text = f"{float(target_price):.2f}" if target_price is not None else "Crossover"
+                
                 st.session_state.trade_log.append({
                     'time': current_time,
-                    'message': f'🔴 SHORT Entry at {current_price:} | SL: {sl_price: if sl_price is not None else "Crossover"} | Target: {target_price: if target_price is not None else "Crossover"}'
+                    'message': f'🔴 SHORT Entry at {float(current_price):.2f} | SL: {sl_text} | Target: {target_text}'
                 })
         
         else:
@@ -586,7 +594,7 @@ with tab1:
                     position['sl_updated'] = True
                     st.session_state.trade_log.append({
                         'time': current_time,
-                        'message': f'📊 Trailing SL updated to {new_sl:.2f}'
+                        'message': f'📊 Trailing SL updated to {float(new_sl):.2f}'
                     })
             
             # Check exit conditions
@@ -626,7 +634,7 @@ with tab1:
                 
                 st.session_state.trade_log.append({
                     'time': current_time,
-                    'message': f'🏁 Position Closed: {exit_reason} | P&L: {pnl:.2f} ({pnl_percent:.2f}%)'
+                    'message': f'🏁 Position Closed: {exit_reason} | P&L: {float(pnl):.2f} ({float(pnl_percent):.2f}%)'
                 })
         
         # Display current status
@@ -641,9 +649,9 @@ with tab1:
                 st.markdown(status_html)
             else:
                 st.info("⏳ Waiting for crossover signal...")
-                st.markdown(f"**Current Price:** {current_price:.2f}")
-                st.markdown(f"**Fast {ind1_type}{ind1_period}:** {current_fast:.2f}")
-                st.markdown(f"**Slow {ind2_type}{ind2_period}:** {current_slow:.2f}")
+                st.markdown(f"**Current Price:** {float(current_price):.2f}")
+                st.markdown(f"**Fast {ind1_type}{ind1_period}:** {float(current_fast):.2f}")
+                st.markdown(f"**Slow {ind2_type}{ind2_period}:** {float(current_slow):.2f}")
         
         # Display metrics
         with metrics_container:
@@ -652,17 +660,17 @@ with tab1:
                 m1, m2, m3, m4, m5 = st.columns(5)
                 
                 with m1:
-                    st.metric("Entry Price", f"{pos['entry_price']:.2f}")
+                    st.metric("Entry Price", f"{float(pos['entry_price']):.2f}")
                 with m2:
-                    st.metric("Current Price", f"{current_price:.2f}")
+                    st.metric("Current Price", f"{float(current_price):.2f}")
                 with m3:
                     pnl = (current_price - pos['entry_price']) if pos['type'] == 'LONG' else (pos['entry_price'] - current_price)
                     pnl_total = pnl * pos['quantity']
-                    st.metric("P&L Points", f"{pnl:.2f}", delta=f"{pnl_total:.2f}")
+                    st.metric("P&L Points", f"{float(pnl):.2f}", delta=f"{float(pnl_total):.2f}")
                 with m4:
-                    st.metric(f"{ind1_type}{ind1_period}", f"{current_fast:.2f}")
+                    st.metric(f"{ind1_type}{ind1_period}", f"{float(current_fast):.2f}")
                 with m5:
-                    st.metric(f"{ind2_type}{ind2_period}", f"{current_slow:.2f}")
+                    st.metric(f"{ind2_type}{ind2_period}", f"{float(current_slow):.2f}")
         
         # Display chart
         with chart_container:
@@ -751,13 +759,13 @@ with tab1:
             with m1:
                 st.metric("Position Type", pos['type'])
             with m2:
-                st.metric("Entry Price", f"{pos['entry_price']:.2f}")
+                st.metric("Entry Price", f"{float(pos['entry_price']):.2f}")
             with m3:
-                st.metric("Current Price", f"{current_price:.2f}")
+                st.metric("Current Price", f"{float(current_price):.2f}")
             with m4:
                 pnl = (current_price - pos['entry_price']) if pos['type'] == 'LONG' else (pos['entry_price'] - current_price)
                 pnl_total = pnl * pos['quantity']
-                st.metric("P&L", f"{pnl_total:.2f}", delta=f"{pnl:.2f} pts")
+                st.metric("P&L", f"{float(pnl_total):.2f}", delta=f"{float(pnl):.2f} pts")
             
             if st.button("🔴 Force Close Position"):
                 # Close position at current price
