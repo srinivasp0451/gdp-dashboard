@@ -165,7 +165,7 @@ class TradingSystem:
             if position_type == 'LONG':
                 target_price = entry_price + target_points
             else:
-                target_price = entry_points - target_points
+                target_price = entry_price - target_points
         elif target_config['type'] == 'EMA/SMA Crossover':
             target_price = None  # Will exit on crossover
         else:  # Trail
@@ -547,7 +547,7 @@ with tab1:
                 
                 st.session_state.trade_log.append({
                     'time': current_time,
-                    'message': f'🟢 LONG Entry at {current_price:.2f} | SL: {sl_price:.2f if sl_price else "Crossover"} | Target: {target_price:.2f if target_price else "Crossover"}'
+                    'message': f'🟢 LONG Entry at {current_price:.2f} | SL: {sl_price:.2f if sl_price is not None else "Crossover"} | Target: {target_price:.2f if target_price is not None else "Crossover"}'
                 })
                 
             elif bearish_cross:
@@ -571,7 +571,7 @@ with tab1:
                 
                 st.session_state.trade_log.append({
                     'time': current_time,
-                    'message': f'🔴 SHORT Entry at {current_price:.2f} | SL: {sl_price:.2f if sl_price else "Crossover"} | Target: {target_price:.2f if target_price else "Crossover"}'
+                    'message': f'🔴 SHORT Entry at {current_price:.2f} | SL: {sl_price:.2f if sl_price is not None else "Crossover"} | Target: {target_price:.2f if target_price is not None else "Crossover"}'
                 })
         
         else:
