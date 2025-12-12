@@ -547,7 +547,7 @@ with tab1:
                 
                 st.session_state.trade_log.append({
                     'time': current_time,
-                    'message': f'🟢 LONG Entry at {current_price:.2f} | SL: {sl_price:.2f if sl_price is not None else "Crossover"} | Target: {target_price:.2f if target_price is not None else "Crossover"}'
+                    'message': f'🟢 LONG Entry at {current_price} | SL: {sl_price: if sl_price is not None else "Crossover"} | Target: {target_price: if target_price is not None else "Crossover"}'
                 })
                 
             elif bearish_cross:
@@ -571,7 +571,7 @@ with tab1:
                 
                 st.session_state.trade_log.append({
                     'time': current_time,
-                    'message': f'🔴 SHORT Entry at {current_price:.2f} | SL: {sl_price:.2f if sl_price is not None else "Crossover"} | Target: {target_price:.2f if target_price is not None else "Crossover"}'
+                    'message': f'🔴 SHORT Entry at {current_price:} | SL: {sl_price: if sl_price is not None else "Crossover"} | Target: {target_price: if target_price is not None else "Crossover"}'
                 })
         
         else:
