@@ -496,240 +496,245 @@ with tab1:
     
     # Live Trading Loop
     if st.session_state.trading_active:
-        status_placeholder = st.empty()
-        metrics_placeholder = st.empty()
-        chart_placeholder = st.empty()
+        # Create fixed containers for updates
+        status_container = st.container()
+        metrics_container = st.container()
+        chart_container = st.container()
+        update_container = st.container()
         
-        while st.session_state.trading_active:
-            # Fetch latest data
-            data = trading_system.fetch_data(ticker, interval, period)
-            
-            if data is None or len(data) < max(ind1_period, ind2_period):
-                status_placeholder.error("Insufficient data. Retrying...")
-                time.sleep(2)
-                continue
-            
-            # Calculate indicators
-            fast_ind = trading_system.calculate_indicator(data, ind1_period, ind1_type)
-            slow_ind = trading_system.calculate_indicator(data, ind2_period, ind2_type)
-            
-            # Get current values
-            current_price = data['Close'].iloc[-1]
-            current_fast = fast_ind.iloc[-1]
-            current_slow = slow_ind.iloc[-1]
-            current_time = data.index[-1]
-            
-            # Check for crossover signals
-            bullish_cross, bearish_cross = trading_system.detect_crossover(fast_ind, slow_ind)
-            
-            # Position Management
-            if st.session_state.current_position is None:
-                # No position - check for entry signal
-                if bullish_cross:
-                    # Enter LONG
-                    sl_price, target_price = trading_system.calculate_sl_target(
-                        current_price, 'LONG', sl_config, target_config,
-                        current_fast, current_slow
-                    )
-                    
-                    st.session_state.current_position = {
-                        'type': 'LONG',
-                        'entry_price': current_price,
-                        'entry_time': current_time,
-                        'quantity': position_size,
-                        'sl_price': sl_price,
-                        'target_price': target_price,
-                        'fast_val': current_fast,
-                        'slow_val': current_slow,
-                        'sl_updated': False
-                    }
-                    
-                    st.session_state.trade_log.append({
-                        'time': current_time,
-                        'message': f'🟢 LONG Entry at {current_price:.2f} | SL: {sl_price:.2f if sl_price else "Crossover"} | Target: {target_price:.2f if target_price else "Crossover"}'
-                    })
-                    
-                elif bearish_cross:
-                    # Enter SHORT
-                    sl_price, target_price = trading_system.calculate_sl_target(
-                        current_price, 'SHORT', sl_config, target_config,
-                        current_fast, current_slow
-                    )
-                    
-                    st.session_state.current_position = {
-                        'type': 'SHORT',
-                        'entry_price': current_price,
-                        'entry_time': current_time,
-                        'quantity': position_size,
-                        'sl_price': sl_price,
-                        'target_price': target_price,
-                        'fast_val': current_fast,
-                        'slow_val': current_slow,
-                        'sl_updated': False
-                    }
-                    
-                    st.session_state.trade_log.append({
-                        'time': current_time,
-                        'message': f'🔴 SHORT Entry at {current_price:.2f} | SL: {sl_price:.2f if sl_price else "Crossover"} | Target: {target_price:.2f if target_price else "Crossover"}'
-                    })
-            
-            else:
-                # Have position - manage it
-                position = st.session_state.current_position
-                
-                # Update trailing SL
-                if sl_config['type'] == 'Trail SL':
-                    new_sl = trading_system.update_trailing_sl(position, current_price, sl_config)
-                    if new_sl != position['sl_price']:
-                        position['sl_price'] = new_sl
-                        position['sl_updated'] = True
-                        st.session_state.trade_log.append({
-                            'time': current_time,
-                            'message': f'📊 Trailing SL updated to {new_sl:.2f}'
-                        })
-                
-                # Check exit conditions
-                should_exit, exit_reason = trading_system.check_exit_conditions(
-                    position, current_price, current_fast, current_slow,
-                    sl_config, target_config
-                )
-                
-                if should_exit:
-                    # Close position
-                    entry_price = position['entry_price']
-                    pnl = (current_price - entry_price) if position['type'] == 'LONG' else (entry_price - current_price)
-                    pnl = pnl * position['quantity']
-                    pnl_percent = (pnl / (entry_price * position['quantity'])) * 100
-                    duration = (current_time - position['entry_time']).total_seconds()
-                    
-                    trade_record = {
-                        'entry_time': position['entry_time'],
-                        'exit_time': current_time,
-                        'type': position['type'],
-                        'entry_price': entry_price,
-                        'exit_price': current_price,
-                        'quantity': position['quantity'],
-                        'pnl': pnl,
-                        'pnl_percent': pnl_percent,
-                        'duration': duration,
-                        'exit_reason': exit_reason,
-                        'fast_ind': f"{ind1_type}{ind1_period}",
-                        'slow_ind': f"{ind2_type}{ind2_period}"
-                    }
-                    
-                    # Add trade analysis
-                    trade_record['analysis'] = trading_system.analyze_trade_performance(trade_record)
-                    
-                    st.session_state.trade_history.append(trade_record)
-                    st.session_state.current_position = None
-                    
-                    st.session_state.trade_log.append({
-                        'time': current_time,
-                        'message': f'🏁 Position Closed: {exit_reason} | P&L: {pnl:.2f} ({pnl_percent:.2f}%)'
-                    })
-            
-            # Display current status
-            with status_placeholder.container():
-                st.markdown("### 📊 Current Market Status")
-                
-                if st.session_state.current_position:
-                    status_html = trading_system.get_market_status(
-                        st.session_state.current_position, 
-                        current_price
-                    )
-                    st.markdown(status_html)
-                else:
-                    st.info("⏳ Waiting for crossover signal...")
-                    st.markdown(f"**Current Price:** {current_price:.2f}")
-                    st.markdown(f"**Fast {ind1_type}{ind1_period}:** {current_fast:.2f}")
-                    st.markdown(f"**Slow {ind2_type}{ind2_period}:** {current_slow:.2f}")
-            
-            # Display metrics
-            with metrics_placeholder.container():
-                if st.session_state.current_position:
-                    pos = st.session_state.current_position
-                    m1, m2, m3, m4, m5 = st.columns(5)
-                    
-                    with m1:
-                        st.metric("Entry Price", f"{pos['entry_price']:.2f}")
-                    with m2:
-                        st.metric("Current Price", f"{current_price:.2f}")
-                    with m3:
-                        pnl = (current_price - pos['entry_price']) if pos['type'] == 'LONG' else (pos['entry_price'] - current_price)
-                        pnl_total = pnl * pos['quantity']
-                        st.metric("P&L Points", f"{pnl:.2f}", delta=f"{pnl_total:.2f}")
-                    with m4:
-                        st.metric(f"{ind1_type}{ind1_period}", f"{current_fast:.2f}")
-                    with m5:
-                        st.metric(f"{ind2_type}{ind2_period}", f"{current_slow:.2f}")
-            
-            # Display chart
-            with chart_placeholder.container():
-                fig = go.Figure()
-                
-                # Candlestick
-                fig.add_trace(go.Candlestick(
-                    x=data.index,
-                    open=data['Open'],
-                    high=data['High'],
-                    low=data['Low'],
-                    close=data['Close'],
-                    name='Price'
-                ))
-                
-                # Indicators
-                fig.add_trace(go.Scatter(
-                    x=data.index,
-                    y=fast_ind,
-                    mode='lines',
-                    name=f'{ind1_type}{ind1_period}',
-                    line=dict(color='blue', width=2)
-                ))
-                
-                fig.add_trace(go.Scatter(
-                    x=data.index,
-                    y=slow_ind,
-                    mode='lines',
-                    name=f'{ind2_type}{ind2_period}',
-                    line=dict(color='red', width=2)
-                ))
-                
-                # Mark entry if position exists
-                if st.session_state.current_position:
-                    pos = st.session_state.current_position
-                    fig.add_trace(go.Scatter(
-                        x=[pos['entry_time']],
-                        y=[pos['entry_price']],
-                        mode='markers',
-                        name='Entry',
-                        marker=dict(
-                            size=15,
-                            color='green' if pos['type'] == 'LONG' else 'red',
-                            symbol='triangle-up' if pos['type'] == 'LONG' else 'triangle-down'
-                        )
-                    ))
-                
-                fig.update_layout(
-                    title=f'{ticker} - {interval} Chart',
-                    yaxis_title='Price',
-                    xaxis_title='Time (IST)',
-                    template='plotly_white',
-                    height=500,
-                    hovermode='x unified'
-                )
-                
-                st.plotly_chart(fig, use_container_width=True)
-            
-            # Update timestamp
-            st.session_state.last_update = current_time
-            st.caption(f"Last updated: {current_time.strftime('%Y-%m-%d %H:%M:%S IST')}")
-            
-            # Rate limiting delay
+        # Fetch latest data
+        data = trading_system.fetch_data(ticker, interval, period)
+        
+        if data is None or len(data) < max(ind1_period, ind2_period):
+            st.error("⚠️ Insufficient data. Waiting for next update...")
             time.sleep(2)
+            st.rerun()
+        
+        # Calculate indicators
+        fast_ind = trading_system.calculate_indicator(data, ind1_period, ind1_type)
+        slow_ind = trading_system.calculate_indicator(data, ind2_period, ind2_type)
+        
+        # Get current values
+        current_price = data['Close'].iloc[-1]
+        current_fast = fast_ind.iloc[-1]
+        current_slow = slow_ind.iloc[-1]
+        current_time = data.index[-1]
+        
+        # Check for crossover signals
+        bullish_cross, bearish_cross = trading_system.detect_crossover(fast_ind, slow_ind)
+        
+        # Position Management
+        if st.session_state.current_position is None:
+            # No position - check for entry signal
+            if bullish_cross:
+                # Enter LONG
+                sl_price, target_price = trading_system.calculate_sl_target(
+                    current_price, 'LONG', sl_config, target_config,
+                    current_fast, current_slow
+                )
+                
+                st.session_state.current_position = {
+                    'type': 'LONG',
+                    'entry_price': current_price,
+                    'entry_time': current_time,
+                    'quantity': position_size,
+                    'sl_price': sl_price,
+                    'target_price': target_price,
+                    'fast_val': current_fast,
+                    'slow_val': current_slow,
+                    'sl_updated': False
+                }
+                
+                st.session_state.trade_log.append({
+                    'time': current_time,
+                    'message': f'🟢 LONG Entry at {current_price:.2f} | SL: {sl_price:.2f if sl_price else "Crossover"} | Target: {target_price:.2f if target_price else "Crossover"}'
+                })
+                
+            elif bearish_cross:
+                # Enter SHORT
+                sl_price, target_price = trading_system.calculate_sl_target(
+                    current_price, 'SHORT', sl_config, target_config,
+                    current_fast, current_slow
+                )
+                
+                st.session_state.current_position = {
+                    'type': 'SHORT',
+                    'entry_price': current_price,
+                    'entry_time': current_time,
+                    'quantity': position_size,
+                    'sl_price': sl_price,
+                    'target_price': target_price,
+                    'fast_val': current_fast,
+                    'slow_val': current_slow,
+                    'sl_updated': False
+                }
+                
+                st.session_state.trade_log.append({
+                    'time': current_time,
+                    'message': f'🔴 SHORT Entry at {current_price:.2f} | SL: {sl_price:.2f if sl_price else "Crossover"} | Target: {target_price:.2f if target_price else "Crossover"}'
+                })
+        
+        else:
+            # Have position - manage it
+            position = st.session_state.current_position
             
-            # Break if trading stopped
-            if not st.session_state.trading_active:
-                break
+            # Update trailing SL
+            if sl_config['type'] == 'Trail SL':
+                new_sl = trading_system.update_trailing_sl(position, current_price, sl_config)
+                if new_sl != position['sl_price']:
+                    position['sl_price'] = new_sl
+                    position['sl_updated'] = True
+                    st.session_state.trade_log.append({
+                        'time': current_time,
+                        'message': f'📊 Trailing SL updated to {new_sl:.2f}'
+                    })
+            
+            # Check exit conditions
+            should_exit, exit_reason = trading_system.check_exit_conditions(
+                position, current_price, current_fast, current_slow,
+                sl_config, target_config
+            )
+            
+            if should_exit:
+                # Close position
+                entry_price = position['entry_price']
+                pnl = (current_price - entry_price) if position['type'] == 'LONG' else (entry_price - current_price)
+                pnl = pnl * position['quantity']
+                pnl_percent = (pnl / (entry_price * position['quantity'])) * 100
+                duration = (current_time - position['entry_time']).total_seconds()
+                
+                trade_record = {
+                    'entry_time': position['entry_time'],
+                    'exit_time': current_time,
+                    'type': position['type'],
+                    'entry_price': entry_price,
+                    'exit_price': current_price,
+                    'quantity': position['quantity'],
+                    'pnl': pnl,
+                    'pnl_percent': pnl_percent,
+                    'duration': duration,
+                    'exit_reason': exit_reason,
+                    'fast_ind': f"{ind1_type}{ind1_period}",
+                    'slow_ind': f"{ind2_type}{ind2_period}"
+                }
+                
+                # Add trade analysis
+                trade_record['analysis'] = trading_system.analyze_trade_performance(trade_record)
+                
+                st.session_state.trade_history.append(trade_record)
+                st.session_state.current_position = None
+                
+                st.session_state.trade_log.append({
+                    'time': current_time,
+                    'message': f'🏁 Position Closed: {exit_reason} | P&L: {pnl:.2f} ({pnl_percent:.2f}%)'
+                })
+        
+        # Display current status
+        with status_container:
+            st.markdown("### 📊 Current Market Status")
+            
+            if st.session_state.current_position:
+                status_html = trading_system.get_market_status(
+                    st.session_state.current_position, 
+                    current_price
+                )
+                st.markdown(status_html)
+            else:
+                st.info("⏳ Waiting for crossover signal...")
+                st.markdown(f"**Current Price:** {current_price:.2f}")
+                st.markdown(f"**Fast {ind1_type}{ind1_period}:** {current_fast:.2f}")
+                st.markdown(f"**Slow {ind2_type}{ind2_period}:** {current_slow:.2f}")
+        
+        # Display metrics
+        with metrics_container:
+            if st.session_state.current_position:
+                pos = st.session_state.current_position
+                m1, m2, m3, m4, m5 = st.columns(5)
+                
+                with m1:
+                    st.metric("Entry Price", f"{pos['entry_price']:.2f}")
+                with m2:
+                    st.metric("Current Price", f"{current_price:.2f}")
+                with m3:
+                    pnl = (current_price - pos['entry_price']) if pos['type'] == 'LONG' else (pos['entry_price'] - current_price)
+                    pnl_total = pnl * pos['quantity']
+                    st.metric("P&L Points", f"{pnl:.2f}", delta=f"{pnl_total:.2f}")
+                with m4:
+                    st.metric(f"{ind1_type}{ind1_period}", f"{current_fast:.2f}")
+                with m5:
+                    st.metric(f"{ind2_type}{ind2_period}", f"{current_slow:.2f}")
+        
+        # Display chart
+        with chart_container:
+            fig = go.Figure()
+            
+            # Candlestick
+            fig.add_trace(go.Candlestick(
+                x=data.index,
+                open=data['Open'],
+                high=data['High'],
+                low=data['Low'],
+                close=data['Close'],
+                name='Price'
+            ))
+            
+            # Indicators
+            fig.add_trace(go.Scatter(
+                x=data.index,
+                y=fast_ind,
+                mode='lines',
+                name=f'{ind1_type}{ind1_period}',
+                line=dict(color='blue', width=2)
+            ))
+            
+            fig.add_trace(go.Scatter(
+                x=data.index,
+                y=slow_ind,
+                mode='lines',
+                name=f'{ind2_type}{ind2_period}',
+                line=dict(color='red', width=2)
+            ))
+            
+            # Mark entry if position exists
+            if st.session_state.current_position:
+                pos = st.session_state.current_position
+                fig.add_trace(go.Scatter(
+                    x=[pos['entry_time']],
+                    y=[pos['entry_price']],
+                    mode='markers',
+                    name='Entry',
+                    marker=dict(
+                        size=15,
+                        color='green' if pos['type'] == 'LONG' else 'red',
+                        symbol='triangle-up' if pos['type'] == 'LONG' else 'triangle-down'
+                    )
+                ))
+            
+            fig.update_layout(
+                title=f'{ticker} - {interval} Chart',
+                yaxis_title='Price',
+                xaxis_title='Time (IST)',
+                template='plotly_white',
+                height=500,
+                hovermode='x unified'
+            )
+            
+            st.plotly_chart(fig, use_container_width=True, key=f"live_chart_{current_time.timestamp()}")
+        
+        # Update timestamp in fixed box
+        with update_container:
+            st.markdown(f"""
+            <div style='background-color: #f0f2f6; padding: 0.5rem; border-radius: 0.3rem; text-align: center; margin-top: 1rem;'>
+                <small>Last updated: {current_time.strftime('%Y-%m-%d %H:%M:%S IST')}</small>
+            </div>
+            """, unsafe_allow_html=True)
+        
+        # Rate limiting delay before next update
+        time.sleep(2)
+        
+        # Continue only if still active
+        if st.session_state.trading_active:
+            st.rerun()
     
     elif st.session_state.current_position:
         # Display current position even when trading is stopped
@@ -891,7 +896,7 @@ with tab2:
             height=400
         )
         
-        st.plotly_chart(fig_pnl, use_container_width=True)
+        st.plotly_chart(fig_pnl, use_container_width=True, key="cumulative_pnl_chart")
         
         # Win/Loss Distribution
         col1, col2 = st.columns(2)
@@ -903,7 +908,7 @@ with tab2:
                 marker_colors=['#00cc00', '#ff6b6b']
             )])
             fig_pie.update_layout(title='Win/Loss Distribution', height=300)
-            st.plotly_chart(fig_pie, use_container_width=True)
+            st.plotly_chart(fig_pie, use_container_width=True, key="win_loss_pie_chart")
         
         with col2:
             # P&L Distribution
@@ -919,7 +924,7 @@ with tab2:
                 yaxis_title='Frequency',
                 height=300
             )
-            st.plotly_chart(fig_hist, use_container_width=True)
+            st.plotly_chart(fig_hist, use_container_width=True, key="pnl_distribution_chart")
 
 with tab3:
     st.header("📋 Real-Time Trade Log")
@@ -927,23 +932,36 @@ with tab3:
     if not st.session_state.trade_log:
         st.info("No trade activity logged yet.")
     else:
-        # Display log in reverse chronological order
+        # Display log in reverse chronological order with fixed height scrollable container
         st.markdown("### Recent Activity")
         
-        log_df = pd.DataFrame([
-            {
-                'Timestamp': log['time'].strftime('%Y-%m-%d %H:%M:%S IST'),
-                'Event': log['message']
-            }
-            for log in reversed(st.session_state.trade_log[-50:])  # Show last 50 entries
-        ])
+        # Create scrollable container with fixed height
+        log_entries = []
+        for log in reversed(st.session_state.trade_log[-100:]):  # Show last 100 entries
+            log_entries.append(f"**{log['time'].strftime('%Y-%m-%d %H:%M:%S IST')}** - {log['message']}")
         
-        st.dataframe(log_df, use_container_width=True, hide_index=True, height=600)
+        log_html = """
+        <div style='background-color: #f8f9fa; padding: 1rem; border-radius: 0.5rem; 
+                    height: 600px; overflow-y: scroll; border: 1px solid #dee2e6;'>
+        """
+        
+        for entry in log_entries:
+            log_html += f"<p style='margin: 0.5rem 0; padding: 0.5rem; background: white; border-radius: 0.3rem; border-left: 3px solid #1f77b4;'>{entry}</p>"
+        
+        log_html += "</div>"
+        
+        st.markdown(log_html, unsafe_allow_html=True)
+        
+        st.markdown("<br>", unsafe_allow_html=True)
         
         # Clear log button
-        if st.button("🗑️ Clear Trade Log"):
-            st.session_state.trade_log = []
-            st.rerun()
+        col1, col2, col3 = st.columns([1, 1, 2])
+        with col1:
+            if st.button("🗑️ Clear Trade Log"):
+                st.session_state.trade_log = []
+                st.rerun()
+        with col2:
+            st.metric("Log Entries", len(st.session_state.trade_log))
 
 # Footer
 st.markdown("---")
