@@ -71,7 +71,7 @@ if 'trading_active' not in st.session_state:
 if 'trade_history' not in st.session_state:
     st.session_state.trade_history = []
 if 'current_position' not in st.session_state:
-    st.session_state.current_position =         # Check signal-based exit
+    st.session_state.current_position = None     # Check signal-based exit
         if sl_config['type'] == 'Signal Based' or target_config['type'] == 'Signal Based':
             bullish_signal, bearish_signal, _ = self.strategy.generate_signal(data)
             
