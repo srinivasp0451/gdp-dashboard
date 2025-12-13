@@ -719,3 +719,5 @@ with tab1:
         if st.session_state.trading_active:
             st.markdown('<p class="status-running">🟢 Active</p>', unsafe_allow_html=True)
         else:
+            st.markdown('<p class="status-stopped">🟢 Stopped</p>', unsafe_allow_html=True)
+        
