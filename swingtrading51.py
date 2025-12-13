@@ -80,7 +80,7 @@ if 'current_position' not in st.session_state:
         elif position['type'] == 'SHORT' and bullish_signal:
             return True, 'Bullish Signal Exit'
         
-        return False, ''
+    #return False, ''
     
     def analyze_trade_performance(self, trade: Dict) -> str:
         """AI-powered trade analysis"""
