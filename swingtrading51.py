@@ -72,15 +72,15 @@ if 'trade_history' not in st.session_state:
     st.session_state.trade_history = []
 if 'current_position' not in st.session_state:
     st.session_state.current_position = None     # Check signal-based exit
-        if sl_config['type'] == 'Signal Based' or target_config['type'] == 'Signal Based':
-            bullish_signal, bearish_signal, _ = self.strategy.generate_signal(data)
+    if sl_config['type'] == 'Signal Based' or target_config['type'] == 'Signal Based':
+        bullish_signal, bearish_signal, _ = self.strategy.generate_signal(data)
             
-            if position['type'] == 'LONG' and bearish_signal:
-                return True, 'Bearish Signal Exit'
-            elif position['type'] == 'SHORT' and bullish_signal:
-                return True, 'Bullish Signal Exit'
+        if position['type'] == 'LONG' and bearish_signal:
+            return True, 'Bearish Signal Exit'
+        elif position['type'] == 'SHORT' and bullish_signal:
+            return True, 'Bullish Signal Exit'
         
-        return False, ''
+    return False, ''
     
     def analyze_trade_performance(self, trade: Dict) -> str:
         """AI-powered trade analysis"""
