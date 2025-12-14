@@ -610,10 +610,10 @@ def apply_custom_css():
             background-color: #0e1117;
         }
         .stMetric {
-            #background-color: #1e2130;
+            background-color: #1e2130;
             padding: 10px;
             border-radius: 5px;
-            color: black;
+            color: red;
         }
         .profit {
             color: #00ff00;
