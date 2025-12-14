@@ -613,6 +613,7 @@ def apply_custom_css():
             background-color: #1e2130;
             padding: 10px;
             border-radius: 5px;
+            color: white;
         }
         .profit {
             color: #00ff00;
@@ -636,6 +637,7 @@ def apply_custom_css():
             padding: 15px;
             border-radius: 8px;
             font-family: monospace;
+            color:white;
         }
         </style>
     """, unsafe_allow_html=True)
