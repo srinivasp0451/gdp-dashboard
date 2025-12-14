@@ -627,6 +627,7 @@ def apply_custom_css():
             padding: 15px;
             border-radius: 8px;
             margin: 10px 0;
+            color: white;
         }
         .trade-log {
             height: 600px;
@@ -680,7 +681,7 @@ def main():
         
         # Timeframe & Period
         st.subheader("Timeframe & Period")
-        timeframe = st.selectbox("Timeframe:", TIMEFRAMES, index=TIMEFRAMES.index('15m'))
+        timeframe = st.selectbox("Timeframe:", TIMEFRAMES, index=TIMEFRAMES.index('1m'))
         
         compatible_periods = TIMEFRAME_PERIOD_COMPATIBILITY.get(timeframe, PERIODS)
         period = st.selectbox("Period:", compatible_periods, index=0)
