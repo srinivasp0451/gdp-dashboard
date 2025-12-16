@@ -1285,7 +1285,7 @@ def apply_custom_css():
             background-color: #0e1117;
         }
         .stMetric {
-            background-color: #1e2130;
+            #background-color: #1e2130;
             padding: 10px;
             border-radius: 5px;
         }
@@ -1298,7 +1298,7 @@ def apply_custom_css():
             font-weight: bold;
         }
         .status-box {
-            background-color: #1e2130;
+            #background-color: #1e2130;
             padding: 15px;
             border-radius: 8px;
             margin: 10px 0;
@@ -1306,10 +1306,11 @@ def apply_custom_css():
         .trade-log {
             height: 600px;
             overflow-y: scroll;
-            background-color: #1e2130;
+            #background-color: #1e2130;
             padding: 15px;
             border-radius: 8px;
             font-family: monospace;
+            color:white
         }
         </style>
     """, unsafe_allow_html=True)
@@ -1355,7 +1356,7 @@ def main():
         
         # Timeframe & Period
         st.subheader("Timeframe & Period")
-        timeframe = st.selectbox("Timeframe:", TIMEFRAMES, index=TIMEFRAMES.index('15m'))
+        timeframe = st.selectbox("Timeframe:", TIMEFRAMES, index=TIMEFRAMES.index('1m'))
         
         compatible_periods = TIMEFRAME_PERIOD_COMPATIBILITY.get(timeframe, PERIODS)
         period = st.selectbox("Period:", compatible_periods, index=0)
