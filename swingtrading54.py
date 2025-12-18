@@ -2042,7 +2042,7 @@ if selected_strategy == 'EMA/SMA Crossover':
     period2 = st.sidebar.number_input("Period 2:", min_value=2, max_value=200, value=20)
     
     crossover_type = st.sidebar.radio("Crossover Type:", 
-                                      ['simple', 'auto_strong_candle',
+                                      ['simple', 'auto_strong_candle']
 if 'trade_history' not in st.session_state:
     st.session_state.trade_history = []
 if 'trade_log' not in st.session_state:
