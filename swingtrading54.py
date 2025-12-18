@@ -10,41 +10,6 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from scipy.signal import argrelextrema
 import json
-
-# Set page config
-st.set_page_config(page_title="Algo Trading System", layout="wide", initial_sidebar_state="expanded")
-
-# Custom CSS
-st.markdown("""
-<style>
-    .main-header {font-size: 2.5rem; font-weight: bold; color: #1f77b4; text-align: center; margin-bottom: 1rem;}
-    .sub-header {font-size: 1.5rem; font-weight: bold; color: #ff7f0e; margin-top: 1rem;}
-    .profit {color: #2ca02c; font-weight: bold; font-size: 1.2rem;}
-    .loss {color: #d62728; font-weight: bold; font-size: 1.2rem;}
-    .neutral {color: #7f7f7f; font-weight: bold;}
-    .status-box {padding: 1rem; border-radius: 10px; background: #f0f2f6; margin: 1rem 0;}
-    .trade-guidance {padding: 1rem; border-radius: 10px; background: #e1f5ff; border-left: 4px solid #1f77b4; margin: 1rem 0;}
-    .log-container {height: 600px; overflow-y: scroll; background: #f8f9fa; padding: 1rem; border-radius: 5px; font-family: monospace; font-size: 0.85rem;}
-    .metric-card {background: white; padding: 1rem; border-radius: 10px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); margin: 0.5rem 0;}
-</style>
-""", unsafe_allow_html=True)
-
-# Initialize session state
-if 'trading_active' not in st.session_state:
-    st.session_state.trading_active = False
-if 'current_position' not in st.session_state:
-    st.session_state.current_position = import streamlit as st
-import yfinance as yf
-import pandas as pd
-import numpy as np
-from datetime import datetime, timedelta
-import time
-import pytz
-from abc import ABC, abstractmethod
-import plotly.graph_objects as go
-from plotly.subplots import make_subplots
-from scipy.signal import argrelextrema
-import json
 import math
 
 # Set page config
