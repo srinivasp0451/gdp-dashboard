@@ -344,23 +344,24 @@ with st.sidebar:
     ]
     asset_type = st.radio("Asset Source", ["Preset", "Custom"], horizontal=True)
     if asset_type == "Preset":
-        ticker = st.selectbox("Select Asset", preset_assets, index=0)
+        ticker = st.selectbox("Select Asset", preset_assets, index=3)
     else:
         ticker = st.text_input("Enter Ticker (e.g., INFY.NS)", value="INFY.NS")
     
     col_tf1, col_tf2 = st.columns(2)
     with col_tf1:
-        timeframe = st.selectbox("Timeframe", ["1m", "5m", "15m", "30m", "1h", "1d"], index=1)
+        timeframe = st.selectbox("Timeframe", ["1m", "5m", "15m", "30m", "1h", "1d"], index=0)
     with col_tf2:
-        period = st.selectbox("Lookback", ["1d", "5d", "1mo", "3mo", "1y"], index=1)
+        period = st.selectbox("Lookback", ["1d", "5d", "1mo", "3mo", "1y"], index=0)
 
     st.header("2. Strategy Logic")
     strategy_type = st.selectbox("Select Strategy", [
+        "Hybrid (EMA+RSI+BB)",
         "EMA Crossover", 
         "Pair Ratio Trading", 
         "RSI Mean Reversion", 
         "Psychology (Momentum)",
-        "Hybrid (EMA+RSI+BB)",
+        
         "Price Action Support/Resistance"
     ])
     
