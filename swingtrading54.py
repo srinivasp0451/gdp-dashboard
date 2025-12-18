@@ -10,6 +10,41 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from scipy.signal import argrelextrema
 import json
+
+# Set page config
+st.set_page_config(page_title="Algo Trading System", layout="wide", initial_sidebar_state="expanded")
+
+# Custom CSS
+st.markdown("""
+<style>
+    .main-header {font-size: 2.5rem; font-weight: bold; color: #1f77b4; text-align: center; margin-bottom: 1rem;}
+    .sub-header {font-size: 1.5rem; font-weight: bold; color: #ff7f0e; margin-top: 1rem;}
+    .profit {color: #2ca02c; font-weight: bold; font-size: 1.2rem;}
+    .loss {color: #d62728; font-weight: bold; font-size: 1.2rem;}
+    .neutral {color: #7f7f7f; font-weight: bold;}
+    .status-box {padding: 1rem; border-radius: 10px; background: #f0f2f6; margin: 1rem 0;}
+    .trade-guidance {padding: 1rem; border-radius: 10px; background: #e1f5ff; border-left: 4px solid #1f77b4; margin: 1rem 0;}
+    .log-container {height: 600px; overflow-y: scroll; background: #f8f9fa; padding: 1rem; border-radius: 5px; font-family: monospace; font-size: 0.85rem;}
+    .metric-card {background: white; padding: 1rem; border-radius: 10px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); margin: 0.5rem 0;}
+</style>
+""", unsafe_allow_html=True)
+
+# Initialize session state
+if 'trading_active' not in st.session_state:
+    st.session_state.trading_active = False
+if 'current_position' not in st.session_state:
+    st.session_state.current_position = import streamlit as st
+import yfinance as yf
+import pandas as pd
+import numpy as np
+from datetime import datetime, timedelta
+import time
+import pytz
+from abc import ABC, abstractmethod
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+from scipy.signal import argrelextrema
+import json
 import math
 
 # Set page config
@@ -650,68 +685,7 @@ with tab2:
         # Individual Trade Analysis
         st.markdown("#### 🔍 Individual Trade Analysis")
         
-        trade_idx = st.selectbox("Select Trade:", range(len(trades_df)), 
-                                 format_func=lambda x: f"Trade {x+1} - {trades_df.iloc[x]['type']} - {trades_df.iloc[x]['exit_reason']}")
-        
-        if trade_idx is not None:
-            selected_trade = st.session_state.trade_history[trade_idx]
-            
-            col1, col2, col3 = st.columns(3)
-            with col1:
-                st.markdown(f"**Entry:** {selected_trade['entry_time'].strftime('%Y-%m-%d %H:%M:%S')}")
-                st.markdown(f"**Entry Price:** {selected_trade['entry_price']:.2f}")
-                st.markdown(f"**Position:** {selected_trade['type']}")
-            with col2:
-                st.markdown(f"**Exit:** {selected_trade['exit_time'].strftime('%Y-%m-%d %H:%M:%S')}")
-                st.markdown(f"**Exit Price:** {selected_trade['exit_price']:.2f}")
-                st.markdown(f"**Exit Reason:** {selected_trade['exit_reason']}")
-            with col3:
-                st.markdown(f"**Duration:** {selected_trade['duration']}")
-                pnl_class = "profit" if selected_trade['pnl_pct'] > 0 else "loss"
-                st.markdown(f"<div class='{pnl_class}'>P&L: {selected_trade['pnl_points']:.2f} pts ({selected_trade['pnl_pct']:.2f}%)</div>", 
-                          unsafe_allow_html=True)
-                st.markdown(f"**Strategy:** {selected_trade['strategy']}")
-            
-            # AI Analysis
-            trading_system = TradingSystem(ticker, timeframe, period, strategy_obj, quantity, sl_config, target_config, ticker2)
-            analysis = trading_system.analyze_trade(selected_trade)
-            
-            st.markdown("**AI Analysis:**")
-            st.info(f"**Performance:** {analysis['performance']}")
-            st.info(f"**Exit Quality:** {analysis['exit_quality']}")
-            st.info(f"**Duration Insight:** {analysis['duration_insight']}")
-            
-            st.markdown("**Recommendations:**")
-            for rec in analysis['recommendations']:
-                st.markdown(f"- {rec}")
-
-# Tab 3: Trade Log
-with tab3:
-    st.markdown("### 📝 Trade Log")
-    
-    if st.button("🗑️ Clear Log"):
-        st.session_state.trade_log = []
-        st.rerun()
-    
-    if len(st.session_state.trade_log) == 0:
-        st.info("No log entries yet.")
-    else:
-        log_html = "<div class='log-container'>"
-        for entry in st.session_state.trade_log:
-            log_html += f"<div>{entry}</div>"
-        log_html += "</div>"
-        st.markdown(log_html, unsafe_allow_html=True)
-
-# Footer
-st.markdown("---")
-st.markdown("""
-<div style='text-align: center; color: #666; padding: 2rem;'>
-    <p><b>Professional Algorithmic Trading System</b></p>
-    <p>⚠️ This is for educational purposes only. Trading involves risk. Always do your own research.</p>
-    <p>💡 Tip: Use appropriate position sizing and risk management for your capital.</p>
-    <p>🎯 Features: Elliott Waves, Enhanced EMA Crossover (Angle & Candle Confirmation), Live Charts, Historical Statistics</p>
-</div>
-""", unsafe_allow_html=True)
+        trade_idx = st.selectbox("Select
 if 'trade_history' not in st.session_state:
     st.session_state.trade_history = []
 if 'trade_log' not in st.session_state:
@@ -2042,7 +2016,7 @@ if selected_strategy == 'EMA/SMA Crossover':
     period2 = st.sidebar.number_input("Period 2:", min_value=2, max_value=200, value=20)
     
     crossover_type = st.sidebar.radio("Crossover Type:", 
-                                      ['simple', 'auto_strong_candle'])
+                                      ['simple', 'auto_strong_candle',
 if 'trade_history' not in st.session_state:
     st.session_state.trade_history = []
 if 'trade_log' not in st.session_state:
