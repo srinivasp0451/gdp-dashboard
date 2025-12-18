@@ -387,7 +387,7 @@ with st.sidebar:
     sl_type = st.selectbox("Stop Loss Type", ["Fixed Points", "Trailing Points", "ATR Based", "Signal Based"])
     sl_value = 0.0
     if sl_type != "Signal Based":
-        sl_value = st.number_input("SL Value (Pts/Mult)", 0.1, 1000.0, 50.0)
+        sl_value = st.number_input("SL Value (Pts/Mult)", 0.1, 1000.0, 100.0)
         
     target_type = st.selectbox("Target Type", ["Fixed Points", "Risk:Reward", "Signal Based"])
     target_value = 0.0
