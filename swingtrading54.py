@@ -21,7 +21,7 @@ st.markdown("""
     .metric-card {background: #f0f2f6; padding: 15px; border-radius: 10px; margin: 10px 0;}
     .profit {color: #00c853; font-weight: bold;}
     .loss {color: #d32f2f; font-weight: bold;}
-    .status-active {color: #ff9800; font-weight: bold;}
+    .status-active {color: #ff9800; font-weight: bold; font-size: 1.2rem;}
     .trade-guidance {background: #e3f2fd; padding: 20px; border-radius: 10px; border-left: 5px solid #2196f3; margin: 15px 0;}
     .stButton>button {width: 100%; padding: 10px; font-size: 16px; font-weight: bold;}
     .log-container {height: 600px; overflow-y: auto; background: #fafafa; padding: 15px; border-radius: 5px; font-family: monospace; font-size: 12px;}
@@ -160,6 +160,8 @@ class EMACrossoverStrategy(BaseStrategy):
                 strong_candle = candle_body > (atr * self.atr_multiplier)
             elif self.crossover_type == 'custom_candle':
                 strong_candle = candle_body > self.custom_candle_size
+            else:
+                strong_candle = True
             
             if not strong_candle:
                 bullish_cross = False
@@ -182,17 +184,13 @@ class EMACrossoverStrategy(BaseStrategy):
                 'Mean': data['MA1'].mean(),
                 'Std': data['MA1'].std(),
                 'Min': data['MA1'].min(),
-                'Max': data['MA1'].max(),
-                '25th': data['MA1'].quantile(0.25),
-                '75th': data['MA1'].quantile(0.75)
+                'Max': data['MA1'].max()
             },
             'MA2': {
                 'Mean': data['MA2'].mean(),
                 'Std': data['MA2'].std(),
                 'Min': data['MA2'].min(),
-                'Max': data['MA2'].max(),
-                '25th': data['MA2'].quantile(0.25),
-                '75th': data['MA2'].quantile(0.75)
+                'Max': data['MA2'].max()
             },
             'ATR': {
                 'Mean': data['ATR'].mean(),
@@ -213,10 +211,10 @@ class PairRatioStrategy(BaseStrategy):
         
         # Align data lengths
         min_len = min(len(data), len(data2))
-        data = data.iloc[-min_len:]
-        data2 = data2.iloc[-min_len:]
+        data = data.iloc[-min_len:].copy()
+        data2 = data2.iloc[-min_len:].copy()
         
-        data['Ratio'] = data['Close'] / data2['Close'].values
+        data['Ratio'] = data['Close'].values / data2['Close'].values
         data['Ratio_Mean'] = data['Ratio'].rolling(window=self.lookback).mean()
         data['Ratio_Std'] = data['Ratio'].rolling(window=self.lookback).std()
         data['Z_Score'] = (data['Ratio'] - data['Ratio_Mean']) / data['Ratio_Std']
@@ -237,8 +235,7 @@ class PairRatioStrategy(BaseStrategy):
         signal_data = {
             'Z_Score': z_score,
             'Ratio': data['Ratio'].iloc[-1],
-            'Ratio_Mean': data['Ratio_Mean'].iloc[-1],
-            'Ratio_Std': data['Ratio_Std'].iloc[-1]
+            'Ratio_Mean': data['Ratio_Mean'].iloc[-1]
         }
         
         return bullish_signal, bearish_signal, signal_data
@@ -251,13 +248,7 @@ class PairRatioStrategy(BaseStrategy):
             'Z_Score': {
                 'Mean': data['Z_Score'].mean(),
                 'Std': data['Z_Score'].std(),
-                'Min': data['Z_Score'].min(),
-                'Max': data['Z_Score'].max(),
                 'Current': data['Z_Score'].iloc[-1]
-            },
-            'Ratio': {
-                'Mean': data['Ratio'].mean(),
-                'Current': data['Ratio'].iloc[-1]
             }
         }
 
@@ -293,7 +284,7 @@ class RSIDivergenceStrategy(BaseStrategy):
         rsi_peaks_idx = argrelextrema(recent_data['RSI'].values, np.greater, order=3)[0]
         rsi_troughs_idx = argrelextrema(recent_data['RSI'].values, np.less, order=3)[0]
         
-        # Bullish divergence: Price lower low, RSI higher low
+        # Bullish divergence
         bullish_div = False
         if len(price_troughs_idx) >= 2 and len(rsi_troughs_idx) >= 2:
             last_price_trough = recent_data['Close'].iloc[price_troughs_idx[-1]]
@@ -304,7 +295,7 @@ class RSIDivergenceStrategy(BaseStrategy):
             if last_price_trough < prev_price_trough and last_rsi_trough > prev_rsi_trough:
                 bullish_div = True
         
-        # Bearish divergence: Price higher high, RSI lower high
+        # Bearish divergence
         bearish_div = False
         if len(price_peaks_idx) >= 2 and len(rsi_peaks_idx) >= 2:
             last_price_peak = recent_data['Close'].iloc[price_peaks_idx[-1]]
@@ -337,26 +328,20 @@ class RSIDivergenceStrategy(BaseStrategy):
         
         signal_data = {
             'RSI': rsi_curr,
-            'Divergence_Bullish': div_bullish,
-            'Divergence_Bearish': div_bearish
+            'Div_Bullish': div_bullish,
+            'Div_Bearish': div_bearish
         }
         
         return bullish_signal, bearish_signal, signal_data
     
     def get_historical_statistics(self, data):
         data = self.calculate_indicators(data)
-        oversold_count = (data['RSI'] < self.oversold).sum()
-        overbought_count = (data['RSI'] > self.overbought).sum()
-        
         return {
             'RSI': {
                 'Mean': data['RSI'].mean(),
-                'Std': data['RSI'].std(),
-                'Min': data['RSI'].min(),
-                'Max': data['RSI'].max(),
                 'Current': data['RSI'].iloc[-1],
-                'Oversold_Count': oversold_count,
-                'Overbought_Count': overbought_count
+                'Min': data['RSI'].min(),
+                'Max': data['RSI'].max()
             }
         }
 
@@ -376,6 +361,7 @@ class FibonacciStrategy(BaseStrategy):
         swing_low = recent['Low'].min()
         diff = swing_high - swing_low
         
+        data = data.copy()
         data['Swing_High'] = swing_high
         data['Swing_Low'] = swing_low
         
@@ -400,17 +386,13 @@ class FibonacciStrategy(BaseStrategy):
             fib_price = data[f'Fib_{level}'].iloc[-1]
             if abs(curr_price - fib_price) / fib_price <= self.tolerance:
                 near_level = level
-                # Bullish if approaching from below
                 if data['Close'].iloc[-2] < fib_price and curr_price >= fib_price:
                     bullish_signal = True
-                # Bearish if approaching from above
                 elif data['Close'].iloc[-2] > fib_price and curr_price <= fib_price:
                     bearish_signal = True
                 break
         
         signal_data = {
-            'Swing_High': data['Swing_High'].iloc[-1],
-            'Swing_Low': data['Swing_Low'].iloc[-1],
             'Near_Level': near_level,
             'Fib_0.382': data['Fib_0.382'].iloc[-1],
             'Fib_0.5': data['Fib_0.5'].iloc[-1],
@@ -464,8 +446,6 @@ class ElliottWaveStrategy(BaseStrategy):
         return waves[-5:] if len(waves) >= 5 else []
     
     def calculate_indicators(self, data):
-        waves = self.find_waves(data)
-        data['Waves'] = None
         return data
     
     def generate_signal(self, data):
@@ -475,12 +455,9 @@ class ElliottWaveStrategy(BaseStrategy):
         waves = self.find_waves(data)
         
         if len(waves) < 5:
-            return False, False, {'Waves': 'Insufficient data'}
+            return False, False, {'Waves': 'Insufficient'}
         
-        # Check for 5-wave pattern
-        wave5_complete = False
-        if waves[-1]['wave'] == 5:
-            wave5_complete = True
+        wave5_complete = waves[-1]['wave'] == 5
         
         bullish_signal = wave5_complete and waves[-1]['type'] == 'trough'
         bearish_signal = wave5_complete and waves[-1]['type'] == 'peak'
@@ -488,8 +465,7 @@ class ElliottWaveStrategy(BaseStrategy):
         signal_data = {
             'Waves_Detected': len(waves),
             'Wave5_Complete': wave5_complete,
-            'Last_Wave_Type': waves[-1]['type'] if waves else None,
-            'Wave_Prices': [w['price'] for w in waves]
+            'Last_Wave_Type': waves[-1]['type'] if waves else None
         }
         
         return bullish_signal, bearish_signal, signal_data
@@ -499,7 +475,7 @@ class ElliottWaveStrategy(BaseStrategy):
         return {
             'Elliott_Waves': {
                 'Waves_Detected': len(waves),
-                'Wave_Prices': [w['price'] for w in waves] if waves else []
+                'Count': len(waves)
             }
         }
 
@@ -510,6 +486,7 @@ class ZScoreMeanReversionStrategy(BaseStrategy):
         self.threshold = params.get('threshold', 2.0)
     
     def calculate_indicators(self, data):
+        data = data.copy()
         data['Price_Mean'] = data['Close'].rolling(window=self.lookback).mean()
         data['Price_Std'] = data['Close'].rolling(window=self.lookback).std()
         data['Z_Score'] = (data['Close'] - data['Price_Mean']) / data['Price_Std']
@@ -528,8 +505,7 @@ class ZScoreMeanReversionStrategy(BaseStrategy):
         
         signal_data = {
             'Z_Score': z_score,
-            'Price_Mean': data['Price_Mean'].iloc[-1],
-            'Price_Std': data['Price_Std'].iloc[-1]
+            'Price_Mean': data['Price_Mean'].iloc[-1]
         }
         
         return bullish_signal, bearish_signal, signal_data
@@ -539,9 +515,6 @@ class ZScoreMeanReversionStrategy(BaseStrategy):
         return {
             'Z_Score': {
                 'Mean': data['Z_Score'].mean(),
-                'Std': data['Z_Score'].std(),
-                'Min': data['Z_Score'].min(),
-                'Max': data['Z_Score'].max(),
                 'Current': data['Z_Score'].iloc[-1]
             }
         }
@@ -553,6 +526,7 @@ class BreakoutVolumeStrategy(BaseStrategy):
         self.volume_multiplier = params.get('volume_multiplier', 1.5)
     
     def calculate_indicators(self, data):
+        data = data.copy()
         data['Upper_Band'] = data['High'].rolling(window=self.lookback).max()
         data['Lower_Band'] = data['Low'].rolling(window=self.lookback).min()
         if 'Volume' in data.columns:
@@ -566,10 +540,10 @@ class BreakoutVolumeStrategy(BaseStrategy):
         data = self.calculate_indicators(data)
         
         curr_close = data['Close'].iloc[-1]
-        upper_band = data['Upper_Band'].iloc[-2]  # Previous period's band
+        upper_band = data['Upper_Band'].iloc[-2]
         lower_band = data['Lower_Band'].iloc[-2]
         
-        volume_surge = False
+        volume_surge = True
         if 'Volume' in data.columns and 'Avg_Volume' in data.columns:
             curr_vol = data['Volume'].iloc[-1]
             avg_vol = data['Avg_Volume'].iloc[-1]
@@ -581,28 +555,19 @@ class BreakoutVolumeStrategy(BaseStrategy):
         signal_data = {
             'Upper_Band': upper_band,
             'Lower_Band': lower_band,
-            'Volume_Surge': volume_surge,
-            'Current_Volume': data['Volume'].iloc[-1] if 'Volume' in data.columns else 0,
-            'Avg_Volume': data['Avg_Volume'].iloc[-1] if 'Avg_Volume' in data.columns else 0
+            'Volume_Surge': volume_surge
         }
         
         return bullish_signal, bearish_signal, signal_data
     
     def get_historical_statistics(self, data):
         data = self.calculate_indicators(data)
-        stats = {
+        return {
             'Donchian': {
                 'Upper_Band': data['Upper_Band'].iloc[-1],
-                'Lower_Band': data['Lower_Band'].iloc[-1],
-                'Range': data['Upper_Band'].iloc[-1] - data['Lower_Band'].iloc[-1]
+                'Lower_Band': data['Lower_Band'].iloc[-1]
             }
         }
-        if 'Volume' in data.columns:
-            stats['Volume'] = {
-                'Mean': data['Volume'].mean(),
-                'Current': data['Volume'].iloc[-1]
-            }
-        return stats
 
 class SimpleBuyStrategy(BaseStrategy):
     def generate_signal(self, data):
@@ -627,9 +592,8 @@ class TradingSystem:
     def fetch_data(self, ticker, interval, period):
         """Fetch data with proper error handling and rate limiting"""
         try:
-            time.sleep(1.5)  # Rate limiting
+            time.sleep(1.5)
             
-            # Handle yfinance compatibility
             valid_combinations = {
                 '1m': ['1d', '5d'],
                 '5m': ['1d', '5d', '1mo'],
@@ -648,11 +612,9 @@ class TradingSystem:
             if data.empty:
                 return None
             
-            # Handle MultiIndex columns
             if isinstance(data.columns, pd.MultiIndex):
                 data.columns = data.columns.droplevel(1)
             
-            # Convert index to IST
             data.index = pd.to_datetime(data.index)
             if data.index.tz is None:
                 data.index = data.index.tz_localize('UTC')
@@ -664,6 +626,21 @@ class TradingSystem:
             st.error(f"Error fetching data for {ticker}: {str(e)}")
             return None
     
+    def calculate_atr(self, data, period=14):
+        """Calculate ATR"""
+        high_low = data['High'] - data['Low']
+        high_close = np.abs(data['High'] - data['Close'].shift())
+        low_close = np.abs(data['Low'] - data['Close'].shift())
+        tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+        return tr.rolling(window=period).mean().iloc[-1]
+    
+    def find_previous_swing(self, data, position_type):
+        """Find previous swing high/low"""
+        if position_type == 'LONG':
+            return data['Low'].iloc[-20:].min()
+        else:
+            return data['High'].iloc[-20:].max()
+    
     def calculate_stop_loss(self, entry_price, position_type, sl_type, sl_value, data):
         """Calculate stop loss based on type"""
         if sl_type == 'Custom Points':
@@ -672,7 +649,37 @@ class TradingSystem:
             else:
                 return entry_price + sl_value
         
+        elif sl_type == 'ATR Based':
+            atr = self.calculate_atr(data)
+            if position_type == 'LONG':
+                return entry_price - (atr * sl_value)
+            else:
+                return entry_price + (atr * sl_value)
+        
+        elif sl_type == 'Previous Swing':
+            swing = self.find_previous_swing(data, position_type)
+            return swing
+        
+        elif sl_type in ['Current Swing', 'Current Candle']:
+            if position_type == 'LONG':
+                return data['Low'].iloc[-1]
+            else:
+                return data['High'].iloc[-1]
+        
+        elif sl_type == 'Percentage Based':
+            pct = sl_value / 100
+            if position_type == 'LONG':
+                return entry_price * (1 - pct)
+            else:
+                return entry_price * (1 + pct)
+        
         elif sl_type == 'P&L Based':
+            if position_type == 'LONG':
+                return entry_price - sl_value
+            else:
+                return entry_price + sl_value
+        
+        elif sl_type == 'Trail SL':
             if position_type == 'LONG':
                 return entry_price - sl_value
             else:
@@ -702,22 +709,13 @@ class TradingSystem:
             else:
                 return entry_price * (1 - pct)
         
-        return entry_price
-    
-    def calculate_atr(self, data, period=14):
-        """Calculate ATR"""
-        high_low = data['High'] - data['Low']
-        high_close = np.abs(data['High'] - data['Close'].shift())
-        low_close = np.abs(data['Low'] - data['Close'].shift())
-        tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
-        return tr.rolling(window=period).mean().iloc[-1]
-    
-    def find_previous_swing(self, data, position_type):
-        """Find previous swing high/low"""
-        if position_type == 'LONG':
-            return data['Low'].iloc[-20:].min()
-        else:
-            return data['High'].iloc[-20:].max()
+        elif target_type == 'Trail Target':
+            if position_type == 'LONG':
+                return entry_price + target_value
+            else:
+                return entry_price - target_value
+        
+        return entry_price * 1.02
     
     def update_trailing_sl(self, position, current_price, trail_points):
         """Update trailing stop loss"""
@@ -738,7 +736,6 @@ class TradingSystem:
     def update_trailing_target(self, position, current_price, trail_points, tolerance=0.02):
         """Update trailing target with tolerance for volatility"""
         if position['type'] == 'LONG':
-            # Check if we're within tolerance of target
             distance_to_target = position['target'] - current_price
             if distance_to_target <= (position['target'] * tolerance):
                 new_target = current_price + trail_points
@@ -758,7 +755,6 @@ class TradingSystem:
     
     def check_exit_conditions(self, position, current_price, strategy, data, data2=None):
         """Check if any exit conditions are met"""
-        # Stop Loss
         if position['type'] == 'LONG':
             if current_price <= position['sl']:
                 return True, 'Stop Loss Hit', current_price
@@ -766,7 +762,6 @@ class TradingSystem:
             if current_price >= position['sl']:
                 return True, 'Stop Loss Hit', current_price
         
-        # Target
         if position['type'] == 'LONG':
             if current_price >= position['target']:
                 return True, 'Target Hit', current_price
@@ -774,7 +769,6 @@ class TradingSystem:
             if current_price <= position['target']:
                 return True, 'Target Hit', current_price
         
-        # Signal Based Exit
         if position.get('signal_based_exit', False):
             if strategy:
                 if data2 is not None:
@@ -794,7 +788,6 @@ class TradingSystem:
         if not position:
             return "Waiting for entry signal..."
         
-        entry = position['entry_price']
         pnl_pct = position['pnl_pct']
         
         if position['type'] == 'LONG':
@@ -845,7 +838,6 @@ class TradingSystem:
         
         analysis = f"**Trade Performance Analysis**\n\n"
         
-        # Performance assessment
         if trade['pnl_pct'] > 2:
             analysis += "✅ **Excellent Performance**: Strong profitable trade with good risk-reward execution.\n\n"
         elif trade['pnl_pct'] > 0:
@@ -853,7 +845,6 @@ class TradingSystem:
         else:
             analysis += "⚠ **Loss Trade**: Trade closed at a loss. This is part of trading - focus on learning.\n\n"
         
-        # Exit quality
         if trade['exit_reason'] == 'Target Hit':
             analysis += "🎯 **Exit Quality**: Perfect - target achieved as planned.\n\n"
         elif trade['exit_reason'] == 'Stop Loss Hit':
@@ -863,7 +854,6 @@ class TradingSystem:
         else:
             analysis += "📊 **Exit Quality**: Manual exit - ensure it was based on valid reasoning.\n\n"
         
-        # Duration insights
         if duration_minutes < 5:
             analysis += f"⏱️ **Duration**: Very short ({duration_minutes:.1f}m). Consider if entry was premature.\n\n"
         elif duration_minutes > 240:
@@ -871,7 +861,6 @@ class TradingSystem:
         else:
             analysis += f"⏱️ **Duration**: {duration_minutes:.1f} minutes - reasonable hold time.\n\n"
         
-        # Recommendations
         analysis += "**Recommendations**:\n"
         if trade['pnl_pct'] < 0 and trade['exit_reason'] == 'Stop Loss Hit':
             analysis += "- SL placement was correct - it prevented larger losses\n"
@@ -907,7 +896,6 @@ def create_chart(data, strategy, position=None, signal_data=None):
     """Create interactive chart with indicators"""
     fig = go.Figure()
     
-    # Candlestick
     fig.add_trace(go.Candlestick(
         x=data.index,
         open=data['Open'],
@@ -917,7 +905,6 @@ def create_chart(data, strategy, position=None, signal_data=None):
         name='Price'
     ))
     
-    # Add strategy-specific indicators
     if isinstance(strategy, EMACrossoverStrategy):
         if 'MA1' in data.columns:
             fig.add_trace(go.Scatter(x=data.index, y=data['MA1'], name=f'{strategy.ma1_type}{strategy.period1}', line=dict(color='blue')))
@@ -940,7 +927,6 @@ def create_chart(data, strategy, position=None, signal_data=None):
         if 'Lower_Band' in data.columns:
             fig.add_trace(go.Scatter(x=data.index, y=data['Lower_Band'], name='Lower Band', line=dict(color='red', dash='dash')))
     
-    # Mark entry point
     if position:
         entry_idx = position.get('entry_time')
         if entry_idx:
@@ -954,7 +940,6 @@ def create_chart(data, strategy, position=None, signal_data=None):
                 name=f'{position["type"]} Entry'
             ))
         
-        # SL and Target lines
         fig.add_hline(y=position['sl'], line_dash="dot", line_color="red", annotation_text="Stop Loss")
         fig.add_hline(y=position['target'], line_dash="dot", line_color="green", annotation_text="Target")
     
@@ -973,10 +958,8 @@ def main():
     
     st.markdown('<div class="main-header">🚀 Professional Algorithmic Trading System</div>', unsafe_allow_html=True)
     
-    # Sidebar Configuration
     st.sidebar.header("⚙️ Trading Configuration")
     
-    # Asset Selection
     asset_category = st.sidebar.selectbox(
         "Asset Category",
         ["Preset Assets", "Custom Ticker", "Indian Stock"]
@@ -996,14 +979,12 @@ def main():
         stock_name = st.sidebar.text_input("Enter Stock Name", "RELIANCE")
         ticker1 = f"{stock_name}.NS"
     
-    # Timeframe and Period
     col1, col2 = st.sidebar.columns(2)
     with col1:
         interval = st.selectbox("Timeframe", ["1m", "5m", "15m", "30m", "1h", "2h", "4h", "1d", "1wk", "1mo"])
     with col2:
         period = st.selectbox("Period", ["1d", "5d", "1mo", "3mo", "6mo", "1y", "2y", "5y", "10y"])
     
-    # Strategy Selection
     st.sidebar.subheader("📊 Strategy Selection")
     strategy_name = st.sidebar.selectbox(
         "Choose Strategy",
@@ -1012,7 +993,6 @@ def main():
          "Breakout + Volume", "Simple Buy", "Simple Sell"]
     )
     
-    # Strategy Parameters
     strategy_params = {}
     ticker2 = None
     
@@ -1036,7 +1016,6 @@ def main():
             strategy_params['custom_candle_size'] = st.sidebar.number_input("Custom Candle Size (points)", value=50, min_value=1)
         
         strategy_params['min_angle'] = st.sidebar.number_input("Min Crossover Angle (degrees)", value=30, min_value=0, max_value=90)
-        
         strategy = EMACrossoverStrategy(strategy_params)
     
     elif strategy_name == "Pair Ratio Trading":
@@ -1088,7 +1067,6 @@ def main():
     elif strategy_name == "Simple Sell":
         strategy = SimpleSellStrategy()
     
-    # Risk Management
     st.sidebar.subheader("🛡️ Risk Management")
     
     sl_type = st.sidebar.selectbox(
@@ -1125,14 +1103,11 @@ def main():
     
     quantity = st.sidebar.number_input("Position Size (Quantity)", value=1, min_value=1)
     
-    # Initialize Trading System
     trading_system = TradingSystem()
     
-    # Main Tabs
     tab1, tab2, tab3 = st.tabs(["📈 Live Trading", "📊 Trade History", "📝 Trade Log"])
     
     with tab1:
-        # Control Buttons
         col1, col2, col3 = st.columns(3)
         
         with col1:
@@ -1146,7 +1121,6 @@ def main():
             if st.button("🔴 Stop Trading", disabled=not st.session_state.trading_active):
                 st.session_state.trading_active = False
                 if st.session_state.current_position:
-                    # Force close position
                     data = st.session_state.last_data
                     if data is not None and len(data) > 0:
                         exit_price = data['Close'].iloc[-1]
@@ -1207,14 +1181,11 @@ def main():
                     st.session_state.current_position = None
                     st.rerun()
         
-        # Live Trading Logic
         if st.session_state.trading_active:
             st.session_state.iteration_count += 1
             
-            # Status Header
             st.markdown(f"<div class='status-active'>🔴 LIVE - Auto-refreshing every 1.5-2s | Iteration: {st.session_state.iteration_count}</div>", unsafe_allow_html=True)
             
-            # Fetch data
             data = trading_system.fetch_data(ticker1, interval, period)
             st.session_state.last_data = data
             
@@ -1230,20 +1201,16 @@ def main():
             
             current_price = data['Close'].iloc[-1]
             
-            # Calculate indicators
             data = strategy.calculate_indicators(data) if not isinstance(strategy, PairRatioStrategy) else strategy.calculate_indicators(data, data2)
             
-            # Generate signals
             if isinstance(strategy, PairRatioStrategy):
                 bullish_signal, bearish_signal, signal_data = strategy.generate_signal(data, data2)
             else:
                 bullish_signal, bearish_signal, signal_data = strategy.generate_signal(data)
             
-            # Position Management
             position = st.session_state.current_position
             
             if position is None:
-                # Look for entry
                 if bullish_signal:
                     entry_price = current_price
                     sl_price = trading_system.calculate_stop_loss(entry_price, 'LONG', sl_type, sl_value, data)
@@ -1289,21 +1256,17 @@ def main():
                     st.success(f"✅ SHORT position entered @ {entry_price:.2f}")
             
             else:
-                # Update P&L
                 pnl_points = (current_price - position['entry_price']) * (1 if position['type'] == 'LONG' else -1)
                 pnl_pct = ((current_price - position['entry_price']) / position['entry_price'] * 100) * (1 if position['type'] == 'LONG' else -1)
                 position['pnl_points'] = pnl_points
                 position['pnl_pct'] = pnl_pct
                 
-                # Update trailing SL
                 if position['trail_sl']:
                     trading_system.update_trailing_sl(position, current_price, sl_value)
                 
-                # Update trailing target
                 if position['trail_target']:
                     trading_system.update_trailing_target(position, current_price, target_value)
                 
-                # Check exit conditions
                 should_exit, exit_reason, exit_price = trading_system.check_exit_conditions(
                     position, current_price, strategy, data, data2
                 )
@@ -1333,18 +1296,15 @@ def main():
                     else:
                         st.warning(f"⚠ Position closed at loss. P&L: {pnl_pct:.2f}% ({exit_reason})")
                     
-                    # Show AI analysis
                     st.markdown("---")
                     st.markdown(trading_system.analyze_trade_performance(trade_record))
                     
                     st.session_state.current_position = None
             
-            # Display Current Status
             st.markdown("---")
             st.subheader(f"📊 {strategy_name} | {ticker1} | {interval}/{period}")
             st.caption(f"Analyzing last {len(data)} candles")
             
-            # Live Metrics
             position = st.session_state.current_position
             
             col1, col2, col3, col4 = st.columns(4)
@@ -1372,7 +1332,6 @@ def main():
                 else:
                     st.metric("Quantity", quantity)
             
-            # Strategy Parameters
             st.markdown("### 📈 Current Strategy Parameters")
             param_cols = st.columns(4)
             
@@ -1385,7 +1344,6 @@ def main():
                         else:
                             st.metric(key, str(value))
             
-            # Position Details
             if position:
                 st.markdown("### 💼 Active Position Details")
                 pos_col1, pos_col2, pos_col3, pos_col4, pos_col5 = st.columns(5)
@@ -1403,15 +1361,12 @@ def main():
                     dist_to_target = abs(current_price - position['target'])
                     st.metric("Distance to Target", f"{dist_to_target:.2f}")
                 
-                # Market Status
                 market_status = trading_system.get_market_status(position, current_price)
                 st.info(market_status)
                 
-                # Trade Guidance
                 guidance = trading_system.get_trade_guidance(position, current_price, strategy_name, signal_data)
                 st.markdown(f"<div class='trade-guidance'>{guidance}</div>", unsafe_allow_html=True)
             
-            # Historical Statistics
             st.markdown("### 📊 Historical Statistics")
             if isinstance(strategy, PairRatioStrategy):
                 hist_stats = strategy.get_historical_statistics(data, data2)
@@ -1431,17 +1386,14 @@ def main():
                             else:
                                 st.metric(stat_name, str(stat_value))
             
-            # Chart
             st.markdown("### 📈 Live Chart")
             chart = create_chart(data, strategy, position, signal_data)
             st.plotly_chart(chart, use_container_width=True)
             
-            # Auto-refresh
             time.sleep(1.5)
             st.rerun()
         
         else:
-            # Preview Mode (Trading Stopped)
             st.info("🔵 Trading is stopped. Configure settings and click 'Start Trading' to begin.")
             
             if st.button("🔄 Fetch Data Preview"):
@@ -1456,16 +1408,13 @@ def main():
                 if data is not None and len(data) > 0:
                     st.success(f"✅ Data fetched successfully! {len(data)} candles loaded.")
                     
-                    # Calculate indicators
                     data = strategy.calculate_indicators(data) if not isinstance(strategy, PairRatioStrategy) else strategy.calculate_indicators(data, data2)
                     
-                    # Generate signals
                     if isinstance(strategy, PairRatioStrategy):
                         bullish_signal, bearish_signal, signal_data = strategy.generate_signal(data, data2)
                     else:
                         bullish_signal, bearish_signal, signal_data = strategy.generate_signal(data)
                     
-                    # Display current parameters
                     st.markdown("### 📊 Current Strategy Parameters")
                     if signal_data:
                         param_cols = st.columns(4)
@@ -1477,7 +1426,6 @@ def main():
                                 else:
                                     st.metric(key, str(value))
                     
-                    # Signals
                     col1, col2 = st.columns(2)
                     with col1:
                         if bullish_signal:
@@ -1490,7 +1438,6 @@ def main():
                         else:
                             st.info("No bearish signal")
                     
-                    # Historical Stats
                     st.markdown("### 📊 Historical Statistics")
                     if isinstance(strategy, PairRatioStrategy):
                         hist_stats = strategy.get_historical_statistics(data, data2)
@@ -1510,7 +1457,6 @@ def main():
                                     else:
                                         st.metric(stat_name, str(stat_value))
                     
-                    # Chart Preview
                     st.markdown("### 📈 Chart Preview (Last 20 Candles)")
                     preview_data = data.iloc[-20:]
                     chart = create_chart(preview_data, strategy, None, signal_data)
@@ -1526,7 +1472,6 @@ def main():
         else:
             trades_df = pd.DataFrame(st.session_state.trade_history)
             
-            # Performance Summary
             st.subheader("📈 Performance Summary")
             
             total_trades = len(trades_df)
@@ -1551,7 +1496,6 @@ def main():
             with col5:
                 st.metric("Avg Win %", f"{avg_win:.2f}%")
             
-            # Strategy Breakdown
             st.subheader("📊 Performance by Strategy")
             strategy_perf = trades_df.groupby('strategy').agg({
                 'pnl_points': 'sum',
@@ -1560,11 +1504,9 @@ def main():
             }).rename(columns={'ticker': 'trades'})
             st.dataframe(strategy_perf, use_container_width=True)
             
-            # Charts
             col1, col2 = st.columns(2)
             
             with col1:
-                # Win/Loss Pie Chart
                 fig_pie = go.Figure(data=[go.Pie(
                     labels=['Wins', 'Losses'],
                     values=[winning_trades, losing_trades],
@@ -1574,7 +1516,6 @@ def main():
                 st.plotly_chart(fig_pie, use_container_width=True)
             
             with col2:
-                # P&L Distribution
                 fig_hist = go.Figure(data=[go.Histogram(
                     x=trades_df['pnl_pct'],
                     nbinsx=20,
@@ -1583,7 +1524,6 @@ def main():
                 fig_hist.update_layout(title='P&L Distribution (%)', xaxis_title='P&L %', yaxis_title='Count', height=400)
                 st.plotly_chart(fig_hist, use_container_width=True)
             
-            # Cumulative P&L
             trades_df_sorted = trades_df.sort_values('exit_time')
             trades_df_sorted['cumulative_pnl'] = trades_df_sorted['pnl_points'].cumsum()
             
@@ -1598,7 +1538,6 @@ def main():
             fig_cumulative.update_layout(title='Cumulative P&L Over Time', xaxis_title='Time', yaxis_title='Cumulative P&L (Points)', height=400)
             st.plotly_chart(fig_cumulative, use_container_width=True)
             
-            # Detailed Trade Table
             st.subheader("📋 Detailed Trade Log")
             display_df = trades_df.copy()
             display_df['entry_time'] = display_df['entry_time'].dt.strftime('%Y-%m-%d %H:%M:%S')
@@ -1608,7 +1547,6 @@ def main():
             
             st.dataframe(display_df, use_container_width=True)
             
-            # Individual Trade Analysis
             st.subheader("🔍 Individual Trade Analysis")
             trade_idx = st.selectbox("Select Trade to Analyze", range(len(trades_df)), format_func=lambda x: f"Trade #{x+1} - {trades_df.iloc[x]['strategy']} - {trades_df.iloc[x]['type']} - P&L: {trades_df.iloc[x]['pnl_pct']:.2f}%")
             
@@ -1627,7 +1565,6 @@ def main():
                     st.markdown(f"<div class='metric-card'><b>P&L</b><br><span class='{pnl_color}'>{selected_trade['pnl_pct']:.2f}%</span></div>", unsafe_allow_html=True)
                     st.metric("Exit Reason", selected_trade['exit_reason'])
                 
-                # AI Analysis for selected trade
                 st.markdown("---")
                 st.markdown(trading_system.analyze_trade_performance(selected_trade))
     
@@ -1651,34 +1588,4 @@ def main():
             st.info("No log entries yet. Start trading to see events here.")
 
 if __name__ == "__main__":
-    main() 'ATR Based':
-            atr = self.calculate_atr(data)
-            if position_type == 'LONG':
-                return entry_price - (atr * sl_value)
-            else:
-                return entry_price + (atr * sl_value)
-        
-        elif sl_type == 'Previous Swing':
-            swing = self.find_previous_swing(data, position_type)
-            return swing
-        
-        elif sl_type == 'Current Swing':
-            if position_type == 'LONG':
-                return data['Low'].iloc[-1]
-            else:
-                return data['High'].iloc[-1]
-        
-        elif sl_type == 'Current Candle':
-            if position_type == 'LONG':
-                return data['Low'].iloc[-1]
-            else:
-                return data['High'].iloc[-1]
-        
-        elif sl_type == 'Percentage Based':
-            pct = sl_value / 100
-            if position_type == 'LONG':
-                return entry_price * (1 - pct)
-            else:
-                return entry_price * (1 + pct)
-        
-        elif sl_type ==
+    main()
