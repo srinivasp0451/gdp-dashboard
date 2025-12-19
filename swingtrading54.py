@@ -1,6 +1,6 @@
-# ============================================================
-# PRO LIVE ALGO TRADING ENGINE – EXECUTION GRADE
-# ============================================================
+# =========================================================
+# PRO-LEVEL STREAMLIT ALGO TRADING ENGINE
+# =========================================================
 
 import streamlit as st
 import yfinance as yf
@@ -8,17 +8,17 @@ import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
 import time
+import pytz
 from scipy.signal import argrelextrema
 from datetime import datetime
-import pytz
 
-# ------------------ CONFIG ------------------
+# ================= CONFIG =================
 IST = pytz.timezone("Asia/Kolkata")
-REFRESH_SEC = 1.7
+REFRESH = 1.7
 
 st.set_page_config("Institutional Algo Engine", layout="wide")
 
-# ------------------ UTILITIES ------------------
+# ================= UTIL =================
 def to_ist(df):
     if df.index.tz is None:
         df.index = df.index.tz_localize("UTC")
@@ -29,174 +29,159 @@ def flatten(df):
         df.columns = df.columns.get_level_values(0)
     return df
 
-def ema(series, n):
-    return series.ewm(span=n, adjust=False).mean()
+def ema(s, n):
+    return s.ewm(span=n, adjust=False).mean()
 
-def atr(df, n=14):
-    tr = np.maximum(
-        df.High - df.Low,
-        np.maximum(abs(df.High - df.Close.shift()), abs(df.Low - df.Close.shift()))
-    )
-    return tr.rolling(n).mean()
+def rsi(series, n=14):
+    delta = series.diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+    rs = gain.rolling(n).mean() / loss.rolling(n).mean()
+    return 100 - (100 / (1 + rs))
 
-# ------------------ SESSION ------------------
-if "position" not in st.session_state:
-    st.session_state.position = None
+# ================= SESSION =================
+if "trade" not in st.session_state:
+    st.session_state.trade = None
+if "history" not in st.session_state:
+    st.session_state.history = []
 if "active" not in st.session_state:
     st.session_state.active = False
 if "iteration" not in st.session_state:
     st.session_state.iteration = 0
 
-# ------------------ STRATEGY ------------------
-def ema_crossover_strategy(df, ema1, ema2, candle_mode, candle_value):
-    df["EMA1"] = ema(df.Close, ema1)
-    df["EMA2"] = ema(df.Close, ema2)
-    df["ATR"] = atr(df)
-
-    prev, curr = df.iloc[-2], df.iloc[-1]
-    candle_size = abs(curr.Close - curr.Open)
-
-    valid_candle = True
-    if candle_mode == "Custom":
-        valid_candle = candle_size >= candle_value
-    elif candle_mode == "System":
-        valid_candle = candle_size >= 1.2 * curr.ATR
-
-    if prev.EMA1 < prev.EMA2 and curr.EMA1 > curr.EMA2 and valid_candle:
-        return {
-            "signal": "LONG",
-            "reason": "EMA crossover with bullish momentum",
-            "entry": curr.Close,
-            "sl": curr.Low,
-            "target": curr.Close + (curr.Close - curr.Low) * 2,
-            "indicators": {
-                "EMA1": curr.EMA1,
-                "EMA2": curr.EMA2,
-                "ATR": curr.ATR,
-                "Candle Size": candle_size
-            }
-        }
-
-    if prev.EMA1 > prev.EMA2 and curr.EMA1 < curr.EMA2 and valid_candle:
-        return {
-            "signal": "SHORT",
-            "reason": "EMA breakdown with bearish momentum",
-            "entry": curr.Close,
-            "sl": curr.High,
-            "target": curr.Close - (curr.High - curr.Close) * 2,
-            "indicators": {
-                "EMA1": curr.EMA1,
-                "EMA2": curr.EMA2,
-                "ATR": curr.ATR,
-                "Candle Size": candle_size
-            }
-        }
-
-    return {"signal": "NONE"}
-
-# ------------------ SIDEBAR ------------------
-st.sidebar.title("⚙ Strategy Control")
+# ================= SIDEBAR =================
+st.sidebar.title("⚙ Trading Control")
 
 ticker = st.sidebar.text_input("Ticker", "^NSEI")
-interval = st.sidebar.selectbox("Interval", ["1m","5m","15m"])
+interval = st.sidebar.selectbox("Timeframe", ["1m","5m","15m"])
 period = st.sidebar.selectbox("Period", ["1d","5d","1mo"])
 
-st.sidebar.subheader("EMA Settings")
-ema1 = st.sidebar.number_input("EMA 1", 5, 50, 9)
-ema2 = st.sidebar.number_input("EMA 2", 10, 100, 20)
-
-candle_mode = st.sidebar.selectbox(
-    "Crossover Confirmation",
-    ["None", "Custom", "System"]
-)
-candle_value = st.sidebar.number_input(
-    "Custom Candle Size (points)", value=20.0
-)
-
-st.sidebar.subheader("Risk Management")
-
-sl_type = st.sidebar.selectbox(
-    "Stop Loss Type",
-    ["System", "Custom Points", "Trailing"]
-)
-sl_points = st.sidebar.number_input("SL Points", value=20.0)
-
-target_type = st.sidebar.selectbox(
-    "Target Type",
-    ["System", "Custom Points", "Trailing"]
-)
-target_points = st.sidebar.number_input("Target Points", value=40.0)
+ema_fast = st.sidebar.number_input("EMA Fast", 5, 50, 9)
+ema_slow = st.sidebar.number_input("EMA Slow", 10, 200, 20)
 
 if st.sidebar.button("▶ START"):
     st.session_state.active = True
 
 if st.sidebar.button("⛔ STOP"):
     st.session_state.active = False
-    st.session_state.position = None
 
-# ------------------ LIVE LOOP ------------------
+# ================= LIVE =================
 if st.session_state.active:
 
     df = yf.download(ticker, interval=interval, period=period, progress=False)
     df = to_ist(flatten(df))
 
-    result = ema_crossover_strategy(
-        df, ema1, ema2, candle_mode, candle_value
-    )
+    # Indicators
+    df["EMA_FAST"] = ema(df.Close, ema_fast)
+    df["EMA_SLOW"] = ema(df.Close, ema_slow)
+    df["RSI"] = rsi(df.Close)
 
     price = df.Close.iloc[-1]
 
-    st.title("📊 LIVE TRADE STATUS")
+    # ================= PSYCHOLOGY =================
+    slope = df.EMA_FAST.iloc[-1] - df.EMA_FAST.iloc[-10]
+    psychology = (
+        "Strong institutional trend"
+        if abs(slope) > df.Close.std() * 0.1
+        else "Choppy / emotional market"
+    )
 
-    if result["signal"] != "NONE" and st.session_state.position is None:
-        st.session_state.position = result
+    # ================= RSI DIVERGENCE =================
+    rsi_signal = None
+    if df.RSI.iloc[-1] < 35 and df.Close.iloc[-1] < df.Close.iloc[-5]:
+        rsi_signal = "Bullish divergence forming"
 
-    pos = st.session_state.position
+    # ================= ELLIOTT WAVES =================
+    swings = argrelextrema(df.Close.values, np.greater, order=5)[0]
+    wave_signal = "No clear wave"
+    if len(swings) >= 5:
+        wave_signal = "Elliott impulse likely in progress"
 
-    if pos:
-        pnl = (price - pos["entry"]) if pos["signal"] == "LONG" else (pos["entry"] - price)
+    # ================= FIB =================
+    high, low = df.High.max(), df.Low.min()
+    fib618 = high - 0.618 * (high - low)
+    fib_signal = (
+        "Price reacting at 61.8% retracement"
+        if abs(price - fib618)/price < 0.002
+        else None
+    )
 
-        st.success(f"🟢 {pos['signal']} POSITION ACTIVE")
+    # ================= ENTRY LOGIC =================
+    signal = None
+    reason = []
 
-        col1, col2, col3 = st.columns(3)
-        col1.metric("Entry", round(pos["entry"],2))
-        col2.metric("Current Price", round(price,2))
-        col3.metric("P&L", round(pnl,2))
+    if df.EMA_FAST.iloc[-2] < df.EMA_SLOW.iloc[-2] and df.EMA_FAST.iloc[-1] > df.EMA_SLOW.iloc[-1]:
+        signal = "LONG"
+        reason.append("EMA bullish crossover")
 
-        st.subheader("📌 Strategy Reason")
-        st.write(pos["reason"])
+    if rsi_signal:
+        reason.append(rsi_signal)
 
-        st.subheader("📊 Indicator Snapshot")
-        for k,v in pos["indicators"].items():
-            st.write(f"**{k}:** {round(v,2)}")
+    if fib_signal:
+        reason.append(fib_signal)
 
-        st.subheader("🧠 Live Trade Guidance")
+    # ================= ENTER TRADE =================
+    if signal and st.session_state.trade is None:
+        st.session_state.trade = {
+            "side": signal,
+            "entry": price,
+            "sl": price - 10 if signal=="LONG" else price + 10,
+            "target": price + 20 if signal=="LONG" else price - 20,
+            "reason": ", ".join(reason),
+            "start": datetime.now(IST)
+        }
+
+    trade = st.session_state.trade
+
+    # ================= GUIDANCE =================
+    guidance = "Waiting for structured opportunity."
+
+    if trade:
+        pnl = price - trade["entry"] if trade["side"]=="LONG" else trade["entry"] - price
         if pnl > 0:
-            st.info(
-                "Market is moving in your favor. "
-                "Avoid early exit. Let trailing logic do its job. "
-                "Do NOT move SL away."
+            guidance = (
+                "Trade behaving well. Momentum intact. "
+                "Do NOT exit early. Trail SL only."
             )
         else:
-            st.warning(
-                "Trade is under pressure. "
-                "Watch reaction near EMA zone. "
-                "Exit only if structure breaks."
+            guidance = (
+                "Temporary adverse move. "
+                "Watch structure — exit only if SL breaks."
             )
 
-    # ------------------ CHART ------------------
+    # ================= UI =================
+    st.markdown("## 📊 Live Trade Summary")
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Position", trade["side"] if trade else "Waiting")
+    c2.metric("Price", f"{price:.2f}")
+    c3.metric("SL", f"{trade['sl']:.2f}" if trade else "-")
+    c4.metric("Target", f"{trade['target']:.2f}" if trade else "-")
+
+    st.markdown("### 🧠 Market Psychology")
+    st.success(psychology)
+
+    st.markdown("### 🎯 Trade Reasoning")
+    st.info(trade["reason"] if trade else "No active trade")
+
+    st.markdown("### 🧭 Live Guidance (Friend Mode)")
+    st.warning(guidance)
+
+    # ================= CHART =================
     fig = go.Figure(go.Candlestick(
-        x=df.index,
-        open=df.Open,
-        high=df.High,
-        low=df.Low,
-        close=df.Close
+        x=df.index, open=df.Open, high=df.High,
+        low=df.Low, close=df.Close
     ))
-    fig.add_trace(go.Scatter(x=df.index, y=df.EMA1, name="EMA 1"))
-    fig.add_trace(go.Scatter(x=df.index, y=df.EMA2, name="EMA 2"))
+    fig.add_trace(go.Scatter(x=df.index, y=df.EMA_FAST, name="EMA Fast"))
+    fig.add_trace(go.Scatter(x=df.index, y=df.EMA_SLOW, name="EMA Slow"))
+
+    if trade:
+        fig.add_hline(y=trade["entry"], line_dash="dot")
+        fig.add_hline(y=trade["sl"], line_color="red", line_dash="dot")
+        fig.add_hline(y=trade["target"], line_color="green", line_dash="dot")
 
     st.plotly_chart(fig, use_container_width=True)
 
     st.session_state.iteration += 1
-    time.sleep(REFRESH_SEC)
+    time.sleep(REFRESH)
     st.rerun()
