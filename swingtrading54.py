@@ -1,6 +1,6 @@
-# =========================================================
-# INSTITUTIONAL GRADE LIVE ALGO ENGINE
-# =========================================================
+# ============================================================
+# PRO LIVE ALGO TRADING ENGINE – EXECUTION GRADE
+# ============================================================
 
 import streamlit as st
 import yfinance as yf
@@ -8,17 +8,17 @@ import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
 import time
+from scipy.signal import argrelextrema
 from datetime import datetime
 import pytz
-from scipy.signal import argrelextrema
-from scipy.stats import zscore
 
+# ------------------ CONFIG ------------------
 IST = pytz.timezone("Asia/Kolkata")
 REFRESH_SEC = 1.7
 
-st.set_page_config("Pro Algo Trading Engine", layout="wide")
+st.set_page_config("Institutional Algo Engine", layout="wide")
 
-# ===================== UTIL =====================
+# ------------------ UTILITIES ------------------
 def to_ist(df):
     if df.index.tz is None:
         df.index = df.index.tz_localize("UTC")
@@ -29,217 +29,171 @@ def flatten(df):
         df.columns = df.columns.get_level_values(0)
     return df
 
-def ema(s, n): return s.ewm(span=n, adjust=False).mean()
+def ema(series, n):
+    return series.ewm(span=n, adjust=False).mean()
 
-def rsi(series, n=14):
-    delta = series.diff()
-    gain = delta.clip(lower=0)
-    loss = -delta.clip(upper=0)
-    rs = gain.rolling(n).mean() / loss.rolling(n).mean()
-    return 100 - (100 / (1 + rs))
+def atr(df, n=14):
+    tr = np.maximum(
+        df.High - df.Low,
+        np.maximum(abs(df.High - df.Close.shift()), abs(df.Low - df.Close.shift()))
+    )
+    return tr.rolling(n).mean()
 
-# ===================== STRATEGIES =====================
-class StrategyEngine:
-
-    # ---------- EMA CROSSOVER ----------
-    def ema_crossover(self, df):
-        df["EMA9"] = ema(df.Close, 9)
-        df["EMA20"] = ema(df.Close, 20)
-
-        prev, curr = df.iloc[-2], df.iloc[-1]
-
-        if prev.EMA9 < prev.EMA20 and curr.EMA9 > curr.EMA20:
-            return self._build(
-                "LONG",
-                "EMA9 crossed above EMA20 → bullish momentum",
-                "Fast EMA crossing slow EMA",
-                "SL below recent swing low",
-                "Risk:Reward 1:2",
-                {"EMA9": curr.EMA9, "EMA20": curr.EMA20},
-                {"ema": [(9, df.EMA9), (20, df.EMA20)]}
-            )
-
-        if prev.EMA9 > prev.EMA20 and curr.EMA9 < curr.EMA20:
-            return self._build(
-                "SHORT",
-                "EMA9 crossed below EMA20 → bearish momentum",
-                "Fast EMA breakdown",
-                "SL above recent swing high",
-                "Risk:Reward 1:2",
-                {"EMA9": curr.EMA9, "EMA20": curr.EMA20},
-                {"ema": [(9, df.EMA9), (20, df.EMA20)]}
-            )
-
-        return self._none()
-
-    # ---------- ELLIOTT WAVES ----------
-    def elliott_wave(self, df):
-        closes = df.Close.values
-        highs = argrelextrema(closes, np.greater, order=5)[0]
-        lows = argrelextrema(closes, np.less, order=5)[0]
-
-        waves = sorted(list(highs) + list(lows))
-        if len(waves) >= 5:
-            return self._build(
-                "LONG",
-                "5-wave structure detected → impulse phase",
-                "Wave 4 correction likely complete",
-                "Below Wave 4 low",
-                "Wave 5 projection",
-                {"waves": len(waves)},
-                {"elliott": waves[-5:]}
-            )
-        return self._none()
-
-    # ---------- DEMAND SUPPLY + EMA PULLBACK ----------
-    def demand_supply(self, df):
-        df["EMA50"] = ema(df.Close, 50)
-        price = df.Close.iloc[-1]
-
-        if price > df.EMA50.iloc[-1] and df.Low.iloc[-1] <= df.EMA50.iloc[-1]:
-            return self._build(
-                "LONG",
-                "Price pulled back into demand zone + EMA50",
-                "Trend continuation setup",
-                "Below demand zone",
-                "Previous high",
-                {"EMA50": df.EMA50.iloc[-1]},
-                {"ema": [(50, df.EMA50)]}
-            )
-        return self._none()
-
-    # ---------- FIBONACCI ----------
-    def fibonacci(self, df):
-        high = df.High.max()
-        low = df.Low.min()
-        fib_618 = high - 0.618 * (high - low)
-        price = df.Close.iloc[-1]
-
-        if abs(price - fib_618) / price < 0.002:
-            return self._build(
-                "LONG",
-                "Price reacting at 61.8% Fibonacci retracement",
-                "Golden ratio support",
-                "Below Fib 78.6%",
-                "Previous high",
-                {"Fib 61.8": fib_618},
-                {"fib": [low, fib_618, high]}
-            )
-        return self._none()
-
-    # ---------- Z-SCORE ----------
-    def zscore_reversion(self, df):
-        z = zscore(df.Close)[-1]
-        if z < -2:
-            return self._build(
-                "LONG",
-                f"Z-Score {z:.2f} → extreme oversold",
-                "Mean reversion expectation",
-                "Below recent low",
-                "VWAP / mean",
-                {"Z": z},
-                {}
-            )
-        if z > 2:
-            return self._build(
-                "SHORT",
-                f"Z-Score {z:.2f} → extreme overbought",
-                "Mean reversion expectation",
-                "Above recent high",
-                "VWAP / mean",
-                {"Z": z},
-                {}
-            )
-        return self._none()
-
-    # ---------- HELPERS ----------
-    def _build(self, direction, reason, entry, sl, target, indicators, draw):
-        return {
-            "signal": True,
-            "direction": direction,
-            "reason": reason,
-            "entry_logic": entry,
-            "sl_logic": sl,
-            "target_logic": target,
-            "indicators": indicators,
-            "draw": draw
-        }
-
-    def _none(self):
-        return {
-            "signal": False,
-            "direction": "NONE",
-            "reason": "No valid setup",
-            "entry_logic": "",
-            "sl_logic": "",
-            "target_logic": "",
-            "indicators": {},
-            "draw": {}
-        }
-
-# ===================== SESSION =====================
+# ------------------ SESSION ------------------
+if "position" not in st.session_state:
+    st.session_state.position = None
 if "active" not in st.session_state:
-    st.session_state.update({
-        "active": False,
-        "position": None,
-        "iteration": 0
-    })
+    st.session_state.active = False
+if "iteration" not in st.session_state:
+    st.session_state.iteration = 0
 
-engine = StrategyEngine()
+# ------------------ STRATEGY ------------------
+def ema_crossover_strategy(df, ema1, ema2, candle_mode, candle_value):
+    df["EMA1"] = ema(df.Close, ema1)
+    df["EMA2"] = ema(df.Close, ema2)
+    df["ATR"] = atr(df)
 
-# ===================== UI =====================
+    prev, curr = df.iloc[-2], df.iloc[-1]
+    candle_size = abs(curr.Close - curr.Open)
+
+    valid_candle = True
+    if candle_mode == "Custom":
+        valid_candle = candle_size >= candle_value
+    elif candle_mode == "System":
+        valid_candle = candle_size >= 1.2 * curr.ATR
+
+    if prev.EMA1 < prev.EMA2 and curr.EMA1 > curr.EMA2 and valid_candle:
+        return {
+            "signal": "LONG",
+            "reason": "EMA crossover with bullish momentum",
+            "entry": curr.Close,
+            "sl": curr.Low,
+            "target": curr.Close + (curr.Close - curr.Low) * 2,
+            "indicators": {
+                "EMA1": curr.EMA1,
+                "EMA2": curr.EMA2,
+                "ATR": curr.ATR,
+                "Candle Size": candle_size
+            }
+        }
+
+    if prev.EMA1 > prev.EMA2 and curr.EMA1 < curr.EMA2 and valid_candle:
+        return {
+            "signal": "SHORT",
+            "reason": "EMA breakdown with bearish momentum",
+            "entry": curr.Close,
+            "sl": curr.High,
+            "target": curr.Close - (curr.High - curr.Close) * 2,
+            "indicators": {
+                "EMA1": curr.EMA1,
+                "EMA2": curr.EMA2,
+                "ATR": curr.ATR,
+                "Candle Size": candle_size
+            }
+        }
+
+    return {"signal": "NONE"}
+
+# ------------------ SIDEBAR ------------------
 st.sidebar.title("⚙ Strategy Control")
+
 ticker = st.sidebar.text_input("Ticker", "^NSEI")
-strategy = st.sidebar.selectbox(
-    "Strategy",
-    ["EMA Crossover", "Elliott Waves", "Demand Supply", "Fibonacci", "Z-Score"]
-)
 interval = st.sidebar.selectbox("Interval", ["1m","5m","15m"])
 period = st.sidebar.selectbox("Period", ["1d","5d","1mo"])
 
-if st.sidebar.button("▶ START"): st.session_state.active = True
-if st.sidebar.button("⛔ STOP"): st.session_state.active = False
+st.sidebar.subheader("EMA Settings")
+ema1 = st.sidebar.number_input("EMA 1", 5, 50, 9)
+ema2 = st.sidebar.number_input("EMA 2", 10, 100, 20)
 
-# ===================== LIVE =====================
+candle_mode = st.sidebar.selectbox(
+    "Crossover Confirmation",
+    ["None", "Custom", "System"]
+)
+candle_value = st.sidebar.number_input(
+    "Custom Candle Size (points)", value=20.0
+)
+
+st.sidebar.subheader("Risk Management")
+
+sl_type = st.sidebar.selectbox(
+    "Stop Loss Type",
+    ["System", "Custom Points", "Trailing"]
+)
+sl_points = st.sidebar.number_input("SL Points", value=20.0)
+
+target_type = st.sidebar.selectbox(
+    "Target Type",
+    ["System", "Custom Points", "Trailing"]
+)
+target_points = st.sidebar.number_input("Target Points", value=40.0)
+
+if st.sidebar.button("▶ START"):
+    st.session_state.active = True
+
+if st.sidebar.button("⛔ STOP"):
+    st.session_state.active = False
+    st.session_state.position = None
+
+# ------------------ LIVE LOOP ------------------
 if st.session_state.active:
+
     df = yf.download(ticker, interval=interval, period=period, progress=False)
     df = to_ist(flatten(df))
 
-    strat_map = {
-        "EMA Crossover": engine.ema_crossover,
-        "Elliott Waves": engine.elliott_wave,
-        "Demand Supply": engine.demand_supply,
-        "Fibonacci": engine.fibonacci,
-        "Z-Score": engine.zscore_reversion
-    }
+    result = ema_crossover_strategy(
+        df, ema1, ema2, candle_mode, candle_value
+    )
 
-    result = strat_map[strategy](df)
+    price = df.Close.iloc[-1]
 
-    st.subheader("📌 Strategy Details")
-    st.json(result)
+    st.title("📊 LIVE TRADE STATUS")
 
+    if result["signal"] != "NONE" and st.session_state.position is None:
+        st.session_state.position = result
+
+    pos = st.session_state.position
+
+    if pos:
+        pnl = (price - pos["entry"]) if pos["signal"] == "LONG" else (pos["entry"] - price)
+
+        st.success(f"🟢 {pos['signal']} POSITION ACTIVE")
+
+        col1, col2, col3 = st.columns(3)
+        col1.metric("Entry", round(pos["entry"],2))
+        col2.metric("Current Price", round(price,2))
+        col3.metric("P&L", round(pnl,2))
+
+        st.subheader("📌 Strategy Reason")
+        st.write(pos["reason"])
+
+        st.subheader("📊 Indicator Snapshot")
+        for k,v in pos["indicators"].items():
+            st.write(f"**{k}:** {round(v,2)}")
+
+        st.subheader("🧠 Live Trade Guidance")
+        if pnl > 0:
+            st.info(
+                "Market is moving in your favor. "
+                "Avoid early exit. Let trailing logic do its job. "
+                "Do NOT move SL away."
+            )
+        else:
+            st.warning(
+                "Trade is under pressure. "
+                "Watch reaction near EMA zone. "
+                "Exit only if structure breaks."
+            )
+
+    # ------------------ CHART ------------------
     fig = go.Figure(go.Candlestick(
-        x=df.index, open=df.Open, high=df.High, low=df.Low, close=df.Close
+        x=df.index,
+        open=df.Open,
+        high=df.High,
+        low=df.Low,
+        close=df.Close
     ))
-
-    # ---- DRAW OVERLAYS ----
-    if "ema" in result["draw"]:
-        for n, s in result["draw"]["ema"]:
-            fig.add_trace(go.Scatter(x=df.index, y=s, name=f"EMA {n}"))
-
-    if "elliott" in result["draw"]:
-        idx = result["draw"]["elliott"]
-        fig.add_trace(go.Scatter(
-            x=df.index[idx],
-            y=df.Close.iloc[idx],
-            mode="lines+markers",
-            name="Elliott Waves",
-            line=dict(width=3)
-        ))
-
-    if "fib" in result["draw"]:
-        for lvl in result["draw"]["fib"]:
-            fig.add_hline(y=lvl, line_dash="dot")
+    fig.add_trace(go.Scatter(x=df.index, y=df.EMA1, name="EMA 1"))
+    fig.add_trace(go.Scatter(x=df.index, y=df.EMA2, name="EMA 2"))
 
     st.plotly_chart(fig, use_container_width=True)
 
