@@ -80,7 +80,7 @@ class EMACrossoverStrategy(BaseStrategy):
         self.ma1_type = params.get('ma1_type', 'EMA')
         self.ma2_type = params.get('ma2_type', 'EMA')
         self.period1 = params.get('period1', 9)
-        self.period2 = params.get('period2', 20)
+        self.period2 = params.get('period2', 15)
         self.crossover_type = params.get('crossover_type', 'simple')
         self.custom_candle_size = params.get('custom_candle_size', 50)
         self.atr_multiplier = params.get('atr_multiplier', 1.5)
@@ -1003,7 +1003,7 @@ def main():
             strategy_params['period1'] = st.number_input("MA1 Period", value=9, min_value=1)
         with col2:
             strategy_params['ma2_type'] = st.selectbox("MA2 Type", ["EMA", "SMA"])
-            strategy_params['period2'] = st.number_input("MA2 Period", value=20, min_value=1)
+            strategy_params['period2'] = st.number_input("MA2 Period", value=15, min_value=1)
         
         strategy_params['crossover_type'] = st.sidebar.selectbox(
             "Crossover Type",
@@ -1015,13 +1015,13 @@ def main():
         elif strategy_params['crossover_type'] == 'custom_candle':
             strategy_params['custom_candle_size'] = st.sidebar.number_input("Custom Candle Size (points)", value=50, min_value=1)
         
-        strategy_params['min_angle'] = st.sidebar.number_input("Min Crossover Angle (degrees)", value=30, min_value=0, max_value=90)
+        strategy_params['min_angle'] = st.sidebar.number_input("Min Crossover Angle (degrees)", value=20, min_value=0, max_value=90)
         strategy = EMACrossoverStrategy(strategy_params)
     
     elif strategy_name == "Pair Ratio Trading":
         asset_cat2 = st.sidebar.selectbox("Ticker2 Category", ["Preset Assets", "Custom Ticker", "Indian Stock"])
         if asset_cat2 == "Preset Assets":
-            ticker2_select = st.sidebar.selectbox("Select Ticker2", ["^NSEI (NIFTY 50)", "^NSEBANK (Bank NIFTY)", "BTC-USD", "ETH-USD"])
+            ticker2_select = st.sidebar.selectbox("Select Ticker2", ["^NSEI (NIFTY 50)", "^NSEBANK (Bank NIFTY)", "BTC-USD", "ETH-USD", "GC=F (Gold)", "SI=F (Silver)","USDINR=X", "EURUSD=X", "GBPUSD=X" ])
             ticker2 = ticker2_select.split(" ")[0]
         elif asset_cat2 == "Custom Ticker":
             ticker2 = st.sidebar.text_input("Enter Ticker2 Symbol", "MSFT")
@@ -1078,7 +1078,7 @@ def main():
     
     sl_value = 0
     if sl_type in ["Custom Points", "P&L Based"]:
-        sl_value = st.sidebar.number_input("SL Points", value=50.0, min_value=1.0)
+        sl_value = st.sidebar.number_input("SL Points", value=150.0, min_value=1.0)
     elif sl_type == "Trail SL":
         sl_value = st.sidebar.number_input("Trail SL Points", value=30.0, min_value=1.0)
     elif sl_type == "ATR Based":
@@ -1093,7 +1093,7 @@ def main():
     
     target_value = 0
     if target_type in ["Custom Points"]:
-        target_value = st.sidebar.number_input("Target Points", value=100.0, min_value=1.0)
+        target_value = st.sidebar.number_input("Target Points", value=200.0, min_value=1.0)
     elif target_type == "Trail Target":
         target_value = st.sidebar.number_input("Trail Target Points", value=50.0, min_value=1.0)
     elif target_type == "Risk Reward Ratio":
