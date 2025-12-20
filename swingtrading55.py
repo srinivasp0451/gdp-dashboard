@@ -269,10 +269,6 @@ class FibonacciRetracementStrategy(BaseStrategy):
         
         return bullish, bearish, signal_data
 
-import numpy as np
-import pandas as pd
-from scipy.signal import argrelextrema
-from typing import Tuple, Dict
 
 class ElliottWaveStrategy(BaseStrategy):
     def __init__(
