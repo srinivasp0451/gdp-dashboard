@@ -270,50 +270,115 @@ class FibonacciRetracementStrategy(BaseStrategy):
         return bullish, bearish, signal_data
 
 class ElliottWaveStrategy(BaseStrategy):
-    def __init__(self, wave_lookback=50):
-        super().__init__("Elliott Wave (Simplified)")
+    def __init__(self, wave_lookback=200, order=10):
+        super().__init__("Elliott Wave (Rule-Based)")
         self.wave_lookback = wave_lookback
-    
+        self.order = order
+
     def calculate_indicators(self, data: pd.DataFrame) -> pd.DataFrame:
+        data = data.copy()
+
+        data['Extrema'] = 0
+        data['Extrema_Type'] = None
+
         if len(data) < self.wave_lookback:
             return data
-        
+
         recent = data.tail(self.wave_lookback)
-        highs = argrelextrema(recent['High'].values, np.greater, order=5)[0]
-        lows = argrelextrema(recent['Low'].values, np.less, order=5)[0]
-        
-        extrema = sorted(list(highs) + list(lows))
-        data['Wave_Extrema'] = 0
-        if len(extrema) > 0:
-            data.iloc[-self.wave_lookback:].iloc[extrema, data.columns.get_loc('Wave_Extrema')] = 1
-        
+
+        highs = argrelextrema(recent['High'].values, np.greater, order=self.order)[0]
+        lows = argrelextrema(recent['Low'].values, np.less, order=self.order)[0]
+
+        for i in highs:
+            idx = recent.index[i]
+            data.loc[idx, 'Extrema'] = 1
+            data.loc[idx, 'Extrema_Type'] = 'H'
+
+        for i in lows:
+            idx = recent.index[i]
+            data.loc[idx, 'Extrema'] = 1
+            data.loc[idx, 'Extrema_Type'] = 'L'
+
         return data
-    
+
     def generate_signal(self, data: pd.DataFrame) -> Tuple[bool, bool, Dict]:
-        if len(data) < self.wave_lookback:
-            return False, False, {}
-        
-        data = self.calculate_indicators(data)
-        recent = data.tail(self.wave_lookback)
-        extrema_indices = recent[recent['Wave_Extrema'] == 1].index
-        
         bullish = False
         bearish = False
-        
-        if len(extrema_indices) >= 5:
-            # Simplified wave detection
-            wave_prices = recent.loc[extrema_indices, 'Close'].values[-5:]
-            if wave_prices[0] < wave_prices[1] > wave_prices[2] < wave_prices[3] > wave_prices[4]:
-                bullish = wave_prices[4] < wave_prices[2]
-                bearish = wave_prices[4] > wave_prices[2]
-        
-        signal_data = {
-            'Waves_Detected': len(extrema_indices),
-            'Wave_Pattern': 'Detected' if len(extrema_indices) >= 5 else 'Insufficient'
-        }
-        
-        return bullish, bearish, signal_data
+        signal_data = {}
 
+        if len(data) < self.wave_lookback:
+            return bullish, bearish, signal_data
+
+        data = self.calculate_indicators(data)
+        recent = data.tail(self.wave_lookback)
+
+        swings = recent[recent['Extrema'] == 1][
+            ['Close', 'Extrema_Type']
+        ]
+
+        # Need at least 6 swings for impulse structure
+        if len(swings) < 6:
+            signal_data['Status'] = 'Not enough swings'
+            return bullish, bearish, signal_data
+
+        # Take last 6 swings
+        swings = swings.tail(6)
+
+        prices = swings['Close'].values
+        types = swings['Extrema_Type'].values
+
+        # ----- STRUCTURE CHECK -----
+        # Bullish impulse: L H L H L H
+        if list(types) == ['L', 'H', 'L', 'H', 'L', 'H']:
+
+            w1 = prices[1] - prices[0]
+            w2 = prices[1] - prices[2]
+            w3 = prices[3] - prices[2]
+            w4 = prices[3] - prices[4]
+
+            # Elliott rules
+            valid = (
+                prices[2] > prices[0] and            # Wave 2 not below Wave 1 start
+                w3 > w1 and                           # Wave 3 longer than Wave 1
+                prices[4] > prices[1]                # Wave 4 not overlapping Wave 1
+            )
+
+            if valid:
+                bullish = True
+                signal_data = {
+                    'Pattern': 'Bullish Impulse',
+                    'Wave': 'Wave 3 likely',
+                    'Confidence': 'Medium'
+                }
+
+        # ----- BEARISH STRUCTURE -----
+        # H L H L H L
+        elif list(types) == ['H', 'L', 'H', 'L', 'H', 'L']:
+
+            w1 = prices[0] - prices[1]
+            w2 = prices[2] - prices[1]
+            w3 = prices[2] - prices[3]
+            w4 = prices[4] - prices[3]
+
+            valid = (
+                prices[2] < prices[0] and
+                w3 > w1 and
+                prices[4] < prices[1]
+            )
+
+            if valid:
+                bearish = True
+                signal_data = {
+                    'Pattern': 'Bearish Impulse',
+                    'Wave': 'Wave 3 likely',
+                    'Confidence': 'Medium'
+                }
+
+        else:
+            signal_data['Status'] = 'Structure mismatch'
+
+        signal_data['Swings_Detected'] = len(swings)
+        return bullish, bearish, signal_data
 class ZScoreMeanReversionStrategy(BaseStrategy):
     def __init__(self, lookback=20, threshold=2.0):
         super().__init__("Z-Score Mean Reversion")
