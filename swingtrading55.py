@@ -269,14 +269,33 @@ class FibonacciRetracementStrategy(BaseStrategy):
         
         return bullish, bearish, signal_data
 
+import numpy as np
+import pandas as pd
+from scipy.signal import argrelextrema
+from typing import Tuple, Dict
+
 class ElliottWaveStrategy(BaseStrategy):
-    def __init__(self, wave_lookback=200, order=10):
-        super().__init__("Elliott Wave (Rule-Based)")
+    def __init__(
+        self,
+        wave_lookback=200,
+        order=10,
+        ema_fast=50,
+        ema_slow=200,
+        confidence_threshold=60
+    ):
+        super().__init__("Elliott Wave (Rule + Fib + Trend)")
         self.wave_lookback = wave_lookback
         self.order = order
+        self.ema_fast = ema_fast
+        self.ema_slow = ema_slow
+        self.confidence_threshold = confidence_threshold
 
     def calculate_indicators(self, data: pd.DataFrame) -> pd.DataFrame:
         data = data.copy()
+
+        # EMA Trend Filter
+        data['EMA_fast'] = data['Close'].ewm(span=self.ema_fast).mean()
+        data['EMA_slow'] = data['Close'].ewm(span=self.ema_slow).mean()
 
         data['Extrema'] = 0
         data['Extrema_Type'] = None
@@ -316,69 +335,88 @@ class ElliottWaveStrategy(BaseStrategy):
             ['Close', 'Extrema_Type']
         ]
 
-        # Need at least 6 swings for impulse structure
         if len(swings) < 6:
             signal_data['Status'] = 'Not enough swings'
             return bullish, bearish, signal_data
 
-        # Take last 6 swings
         swings = swings.tail(6)
-
         prices = swings['Close'].values
         types = swings['Extrema_Type'].values
 
-        # ----- STRUCTURE CHECK -----
-        # Bullish impulse: L H L H L H
+        ema_fast = recent['EMA_fast'].iloc[-1]
+        ema_slow = recent['EMA_slow'].iloc[-1]
+
+        confidence = 0
+
+        # ================= BULLISH =================
         if list(types) == ['L', 'H', 'L', 'H', 'L', 'H']:
-
             w1 = prices[1] - prices[0]
-            w2 = prices[1] - prices[2]
             w3 = prices[3] - prices[2]
-            w4 = prices[3] - prices[4]
 
-            # Elliott rules
-            valid = (
-                prices[2] > prices[0] and            # Wave 2 not below Wave 1 start
-                w3 > w1 and                           # Wave 3 longer than Wave 1
-                prices[4] > prices[1]                # Wave 4 not overlapping Wave 1
+            fib_extension = w3 / w1 if w1 != 0 else 0
+
+            rules_valid = (
+                prices[2] > prices[0] and        # Wave 2 rule
+                w3 > w1 and                       # Wave 3 not shortest
+                prices[4] > prices[1]             # Wave 4 overlap rule
             )
 
-            if valid:
+            if rules_valid:
+                confidence += 40
+
+            if fib_extension >= 1.27:
+                confidence += 30
+
+            if ema_fast > ema_slow:
+                confidence += 30
+
+            if confidence >= self.confidence_threshold:
                 bullish = True
                 signal_data = {
-                    'Pattern': 'Bullish Impulse',
-                    'Wave': 'Wave 3 likely',
-                    'Confidence': 'Medium'
+                    'Direction': 'Bullish',
+                    'Wave': 'Wave 3',
+                    'Fib_Extension': round(fib_extension, 2),
+                    'Trend': 'Up',
+                    'Confidence': confidence
                 }
 
-        # ----- BEARISH STRUCTURE -----
-        # H L H L H L
+        # ================= BEARISH =================
         elif list(types) == ['H', 'L', 'H', 'L', 'H', 'L']:
-
             w1 = prices[0] - prices[1]
-            w2 = prices[2] - prices[1]
             w3 = prices[2] - prices[3]
-            w4 = prices[4] - prices[3]
 
-            valid = (
+            fib_extension = w3 / w1 if w1 != 0 else 0
+
+            rules_valid = (
                 prices[2] < prices[0] and
                 w3 > w1 and
                 prices[4] < prices[1]
             )
 
-            if valid:
+            if rules_valid:
+                confidence += 40
+
+            if fib_extension >= 1.27:
+                confidence += 30
+
+            if ema_fast < ema_slow:
+                confidence += 30
+
+            if confidence >= self.confidence_threshold:
                 bearish = True
                 signal_data = {
-                    'Pattern': 'Bearish Impulse',
-                    'Wave': 'Wave 3 likely',
-                    'Confidence': 'Medium'
+                    'Direction': 'Bearish',
+                    'Wave': 'Wave 3',
+                    'Fib_Extension': round(fib_extension, 2),
+                    'Trend': 'Down',
+                    'Confidence': confidence
                 }
 
         else:
-            signal_data['Status'] = 'Structure mismatch'
+            signal_data['Status'] = 'Invalid structure'
 
-        signal_data['Swings_Detected'] = len(swings)
         return bullish, bearish, signal_data
+
 class ZScoreMeanReversionStrategy(BaseStrategy):
     def __init__(self, lookback=20, threshold=2.0):
         super().__init__("Z-Score Mean Reversion")
@@ -1488,8 +1526,9 @@ def main():
             strategy = FibonacciRetracementStrategy(lookback, tolerance)
         
         elif strategy_type == "Elliott Wave":
-            wave_lookback = st.number_input("Wave Lookback:", min_value=30, value=50)
-            strategy = ElliottWaveStrategy(wave_lookback)
+            wave_lookback = st.number_input("Wave Lookback", min_value=150, value=200, step=50)
+            #wave_lookback = st.number_input("Wave Lookback:", min_value=30, value=50)
+            strategy = ElliottWaveStrategy(wave_lookback,confidence_threshold=60)
         
         elif strategy_type == "Z-Score Mean Reversion":
             lookback = st.number_input("Lookback Period:", min_value=10, value=20)
