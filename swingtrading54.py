@@ -1080,7 +1080,7 @@ def main():
     if sl_type in ["Custom Points", "P&L Based"]:
         sl_value = st.sidebar.number_input("SL Points", value=150.0, min_value=1.0)
     elif sl_type == "Trail SL":
-        sl_value = st.sidebar.number_input("Trail SL Points", value=30.0, min_value=1.0)
+        sl_value = st.sidebar.number_input("Trail SL Points", value=150.0, min_value=1.0)
     elif sl_type == "ATR Based":
         sl_value = st.sidebar.number_input("ATR Multiplier", value=2.0, min_value=0.5, step=0.1)
     elif sl_type == "Percentage Based":
@@ -1095,7 +1095,7 @@ def main():
     if target_type in ["Custom Points"]:
         target_value = st.sidebar.number_input("Target Points", value=200.0, min_value=1.0)
     elif target_type == "Trail Target":
-        target_value = st.sidebar.number_input("Trail Target Points", value=50.0, min_value=1.0)
+        target_value = st.sidebar.number_input("Trail Target Points", value=150.0, min_value=1.0)
     elif target_type == "Risk Reward Ratio":
         target_value = st.sidebar.number_input("Risk:Reward Ratio", value=2.0, min_value=0.5, step=0.1)
     elif target_type == "Percentage Based":
