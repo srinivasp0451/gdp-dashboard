@@ -290,17 +290,19 @@ def calculate_volatility_bins(data):
     vol_clean = volatility.dropna()
     if len(vol_clean) > 5:
         try:
-            bins = pd.qcut(vol_clean, q=5, labels=['Very Low', 'Low', 'Medium', 'High', 'Very High'], duplicates='drop')
+            # Create bins with ranges
+            bins_edges = pd.qcut(vol_clean, q=5, retbins=True, duplicates='drop')[1]
+            bins = pd.cut(vol_clean, bins=bins_edges, duplicates='drop', include_lowest=True)
         except ValueError:
-            # If qcut fails, use cut instead
-            bins = pd.cut(vol_clean, bins=5, labels=['Very Low', 'Low', 'Medium', 'High', 'Very High'], duplicates='drop')
+            bins_edges = pd.cut(vol_clean, bins=5, retbins=True, duplicates='drop')[1]
+            bins = pd.cut(vol_clean, bins=bins_edges, duplicates='drop', include_lowest=True)
     else:
         bins = pd.Series(['Medium'] * len(vol_clean), index=vol_clean.index)
     
     result = pd.DataFrame({
         'DateTime_IST': data.index[volatility.notna()],
         'Close': data['Close'][volatility.notna()],
-        'Volatility': volatility.dropna(),
+        'Volatility_%': volatility.dropna(),
         'Volatility_Bin': bins
     })
     
@@ -313,8 +315,12 @@ def calculate_zscore_bins(data):
     
     zscore_clean = zscore.dropna()
     if len(zscore_clean) > 0:
-        bins = pd.cut(zscore_clean, bins=[-np.inf, -2, -1, 0, 1, 2, np.inf], 
-                      labels=['Extreme Negative', 'Negative', 'Neutral Low', 'Neutral High', 'Positive', 'Extreme Positive'])
+        # Create labeled bins with explicit ranges
+        bins = pd.cut(zscore_clean, 
+                     bins=[-np.inf, -2, -1, 0, 1, 2, np.inf], 
+                     labels=['Extreme Negative (<-2)', 'Negative (-2 to -1)', 
+                            'Neutral Low (-1 to 0)', 'Neutral High (0 to 1)', 
+                            'Positive (1 to 2)', 'Extreme Positive (>2)'])
     else:
         bins = pd.Series([], dtype='object')
     
@@ -908,15 +914,29 @@ def main():
                     with col4:
                         st.metric("Std Dev", f"{zscore_data['Z_Score'].std():.2f}")
                     
-                    # Bin distribution
-                    bin_counts = zscore_data['Z_Score_Bin'].value_counts()
-                    st.write(f"**Bin Distribution** ({tf}/{period}):")
-                    bin_df = pd.DataFrame({
-                        'Bin': bin_counts.index,
-                        'Count': bin_counts.values,
-                        'Percentage': (bin_counts.values / len(zscore_data) * 100).round(1)
-                    })
-                    st.dataframe(bin_df, use_container_width=True)
+                
+                # Add bin distribution table with actual price ranges
+                st.write(f"**Bin Distribution with Price Ranges** ({tf}/{period}):")
+                bin_counts = zscore_data['Z_Score_Bin'].value_counts()
+                
+                # Calculate price ranges for each bin
+                bin_analysis = []
+                for bin_name in bin_counts.index:
+                    bin_data = zscore_data[zscore_data['Z_Score_Bin'] == bin_name]
+                    if not bin_data.empty:
+                        min_price = bin_data['Close'].min()
+                        max_price = bin_data['Close'].max()
+                        avg_price = bin_data['Close'].mean()
+                        
+                        bin_analysis.append({
+                            'Bin': bin_name,
+                            'Count': bin_counts[bin_name],
+                            'Percentage_%': f"{(bin_counts[bin_name] / len(zscore_data) * 100):.1f}",
+                            'Price_Range': f"₹{min_price:.2f} - ₹{max_price:.2f}",
+                            'Avg_Price': f"₹{avg_price:.2f}"
+                        })
+                
+                st.dataframe(pd.DataFrame(bin_analysis), use_container_width=True)
                     
                     # Recent data table
                     st.write(f"**Recent Z-Score Data** ({tf}/{period}) - Last 20 periods:")
@@ -1442,15 +1462,29 @@ def main():
                     with col4:
                         st.metric("Max Vol", f"{vol_data['Volatility'].max():.2f}%")
                     
-                    # Bin distribution
+                    # Bin distribution with price ranges
                     bin_counts = vol_data['Volatility_Bin'].value_counts()
-                    st.write(f"**Bin Distribution** ({tf}/{period}):")
-                    bin_df = pd.DataFrame({
-                        'Bin': bin_counts.index,
-                        'Count': bin_counts.values,
-                        'Percentage': (bin_counts.values / len(vol_data) * 100).round(1)
-                    })
-                    st.dataframe(bin_df, use_container_width=True)
+                    st.write(f"**Bin Distribution with Volatility Ranges** ({tf}/{period}):")
+                    
+                    bin_analysis = []
+                    for bin_name in bin_counts.index:
+                        if pd.notna(bin_name):
+                            bin_data = vol_data[vol_data['Volatility_Bin'] == bin_name]
+                            if not bin_data.empty:
+                                min_vol = bin_data['Volatility_%'].min()
+                                max_vol = bin_data['Volatility_%'].max()
+                                avg_vol = bin_data['Volatility_%'].mean()
+                                
+                                bin_analysis.append({
+                                    'Bin': str(bin_name),
+                                    'Count': bin_counts[bin_name],
+                                    'Percentage_%': f"{(bin_counts[bin_name] / len(vol_data) * 100):.1f}",
+                                    'Volatility_Range_%': f"{min_vol:.2f} - {max_vol:.2f}",
+                                    'Avg_Volatility_%': f"{avg_vol:.2f}"
+                                })
+                    
+                    if bin_analysis:
+                        st.dataframe(pd.DataFrame(bin_analysis), use_container_width=True)
                     
                     # Recent data
                     st.write(f"**Recent Volatility Data** ({tf}/{period}) - Last 20 periods:")
@@ -2183,7 +2217,196 @@ def main():
         # Tab 8: Ratio Analysis (conditional)
         if enable_ratio and mtf_data2:
             with tabs[current_tab]:
-                st.subheader("⚖️ Ratio Analysis")
+                st.subheader("⚖️ Ratio Analysis - Complete Multi-Timeframe Breakdown")
+                
+                common_keys = set(mtf_data.keys()).intersection(set(mtf_data2.keys()))
+                
+                if common_keys:
+                    st.info(f"**Analyzing {len(common_keys)} common timeframes** between both tickers")
+                    
+                    for tf_period in common_keys:
+                        tf, period = tf_period.split('_')
+                        
+                        st.markdown(f"---")
+                        st.markdown(f"## ⚖️ Ratio Analysis: {tf} Interval / {period} Period")
+                        
+                        d1 = mtf_data[tf_period]
+                        d2 = mtf_data2[tf_period]
+                        
+                        common_idx = d1.index.intersection(d2.index)
+                        
+                        if len(common_idx) > 10:
+                            d1_aligned = d1.loc[common_idx]
+                            d2_aligned = d2.loc[common_idx]
+                            
+                            ratio_series = d1_aligned['Close'] / d2_aligned['Close']
+                            
+                            ratio_df = pd.DataFrame({
+                                'DateTime_IST': common_idx,
+                                'Ticker1_Price': d1_aligned['Close'],
+                                'Ticker2_Price': d2_aligned['Close'],
+                                'Ratio': ratio_series,
+                                'Ticker1_RSI': calculate_rsi(d1_aligned['Close']),
+                                'Ticker2_RSI': calculate_rsi(d2_aligned['Close']),
+                                'Ratio_RSI': calculate_rsi(ratio_series),
+                                'Ticker1_Vol_%': d1_aligned['Close'].pct_change().rolling(20).std() * 100,
+                                'Ticker2_Vol_%': d2_aligned['Close'].pct_change().rolling(20).std() * 100
+                            })
+                            
+                            # Statistics
+                            current_ratio = ratio_df['Ratio'].iloc[-1]
+                            avg_ratio = ratio_df['Ratio'].mean()
+                            
+                            col1, col2, col3, col4 = st.columns(4)
+                            with col1:
+                                st.metric("Current Ratio", f"{current_ratio:.4f}")
+                            with col2:
+                                st.metric("Average Ratio", f"{avg_ratio:.4f}")
+                            with col3:
+                                st.metric("Min Ratio", f"{ratio_df['Ratio'].min():.4f}")
+                            with col4:
+                                st.metric("Max Ratio", f"{ratio_df['Ratio'].max():.4f}")
+                            
+                            # Ratio bins with ranges
+                            st.write(f"**Ratio Distribution Bins** ({tf}/{period}):")
+                            ratio_min = ratio_df['Ratio'].min()
+                            ratio_max = ratio_df['Ratio'].max()
+                            ratio_range = ratio_max - ratio_min
+                            num_bins = 5
+                            
+                            ratio_bins = []
+                            for i in range(num_bins):
+                                bin_start = ratio_min + (i * ratio_range / num_bins)
+                                bin_end = ratio_min + ((i + 1) * ratio_range / num_bins)
+                                bin_label = f"{bin_start:.4f} - {bin_end:.4f}"
+                                
+                                # Count occurrences in this bin
+                                in_bin = ratio_df[(ratio_df['Ratio'] >= bin_start) & (ratio_df['Ratio'] < bin_end)]
+                                count = len(in_bin)
+                                percentage = (count / len(ratio_df) * 100)
+                                
+                                # Check if current ratio in this bin
+                                is_current = "✅ Current" if bin_start <= current_ratio < bin_end else ""
+                                
+                                # Historical behavior when in this bin
+                                if count > 0:
+                                    future_moves = []
+                                    for idx in in_bin.index[:min(5, len(in_bin))]:
+                                        try:
+                                            idx_pos = ratio_df.index.get_loc(idx)
+                                            if idx_pos + 5 < len(ratio_df):
+                                                future_change = ((ratio_df['Ratio'].iloc[idx_pos + 5] - ratio_df['Ratio'].iloc[idx_pos]) / 
+                                                               ratio_df['Ratio'].iloc[idx_pos] * 100)
+                                                future_moves.append(future_change)
+                                        except:
+                                            pass
+                                    
+                                    avg_move = np.mean(future_moves) if future_moves else 0
+                                    behavior = "Rally" if avg_move > 1 else "Decline" if avg_move < -1 else "Sideways"
+                                else:
+                                    behavior = "N/A"
+                                
+                                ratio_bins.append({
+                                    'Ratio_Range': bin_label,
+                                    'Count': count,
+                                    'Percentage_%': f"{percentage:.1f}",
+                                    'Historical_Behavior': behavior,
+                                    'Status': is_current
+                                })
+                            
+                            st.dataframe(pd.DataFrame(ratio_bins), use_container_width=True)
+                            
+                            # Recent data
+                            st.write(f"**Recent Ratio Data** ({tf}/{period}) - Last 20:")
+                            st.dataframe(ratio_df.tail(20), use_container_width=True)
+                            
+                            # Forecast based on ratio
+                            st.markdown(f"### 🎯 Ratio-Based Forecast ({tf}/{period})")
+                            
+                            ratio_zscore = (current_ratio - avg_ratio) / ratio_df['Ratio'].std()
+                            
+                            if ratio_zscore > 1.5:
+                                st.warning(f"""
+                                **⚠️ RATIO ELEVATED** (Z-Score: {ratio_zscore:.2f})
+                                
+                                Current ratio {current_ratio:.4f} is significantly higher than average {avg_ratio:.4f}.
+                                
+                                **Interpretation**:
+                                - Ticker 1 is relatively expensive compared to Ticker 2
+                                - Mean reversion suggests ratio may compress
+                                - Either Ticker 1 falls or Ticker 2 rises more
+                                
+                                **Trading Implication**: Consider Ticker 2 over Ticker 1 for new positions.
+                                """)
+                            elif ratio_zscore < -1.5:
+                                st.success(f"""
+                                **🟢 RATIO DEPRESSED** (Z-Score: {ratio_zscore:.2f})
+                                
+                                Current ratio {current_ratio:.4f} is significantly lower than average {avg_ratio:.4f}.
+                                
+                                **Interpretation**:
+                                - Ticker 1 is relatively cheap compared to Ticker 2
+                                - Mean reversion suggests ratio may expand
+                                - Either Ticker 1 rises or Ticker 2 falls more
+                                
+                                **Trading Implication**: Consider Ticker 1 over Ticker 2 for new positions.
+                                """)
+                            else:
+                                st.info(f"""
+                                **🟡 RATIO NEUTRAL** (Z-Score: {ratio_zscore:.2f})
+                                
+                                Current ratio {current_ratio:.4f} is near average {avg_ratio:.4f}.
+                                No strong relative value signal.
+                                """)
+                            
+                            # Charts
+                            fig = make_subplots(rows=3, cols=1, shared_xaxes=True,
+                                              subplot_titles=(f'{ticker1} Price', f'{ticker2} Price', 'Ratio'))
+                            
+                            fig.add_trace(go.Scatter(x=common_idx, y=d1_aligned['Close'], 
+                                                    name=ticker1, line=dict(color='blue')), row=1, col=1)
+                            fig.add_trace(go.Scatter(x=common_idx, y=d2_aligned['Close'], 
+                                                    name=ticker2, line=dict(color='orange')), row=2, col=1)
+                            fig.add_trace(go.Scatter(x=common_idx, y=ratio_df['Ratio'], 
+                                                    name='Ratio', line=dict(color='purple')), row=3, col=1)
+                            fig.add_hline(y=avg_ratio, line_dash="dash", line_color='green', 
+                                         annotation_text=f"Avg: {avg_ratio:.4f}", row=3, col=1)
+                            
+                            fig.update_layout(height=900, title_text=f"Price Comparison & Ratio - {tf}/{period}")
+                            st.plotly_chart(fig, use_container_width=True)
+                        
+                        else:
+                            st.warning(f"Insufficient overlapping data for {tf}/{period}")
+                    
+                    # Export all ratios
+                    csv_data = []
+                    for tf_period in list(common_keys)[:5]:
+                        d1 = mtf_data[tf_period]
+                        d2 = mtf_data2[tf_period]
+                        common_idx = d1.index.intersection(d2.index)
+                        if len(common_idx) > 0:
+                            d1_aligned = d1.loc[common_idx]
+                            d2_aligned = d2.loc[common_idx]
+                            ratio_df = pd.DataFrame({
+                                'Timeframe': tf_period.split('_')[0],
+                                'Period': tf_period.split('_')[1],
+                                'DateTime_IST': common_idx,
+                                'Ticker1': d1_aligned['Close'],
+                                'Ticker2': d2_aligned['Close'],
+                                'Ratio': d1_aligned['Close'] / d2_aligned['Close']
+                            })
+                            csv_data.append(ratio_df)
+                    
+                    if csv_data:
+                        combined_csv = pd.concat(csv_data, ignore_index=True)
+                        csv = combined_csv.to_csv(index=False)
+                        st.download_button("📥 Download All Ratio Analysis", csv, 
+                                         f"ratio_all_{ticker1}_{ticker2}.csv", "text/csv")
+                
+                else:
+                    st.warning("No common timeframes available for ratio analysis")
+            
+            current_tab += 1
                 
                 # Use first available matching timeframe
                 common_keys = set(mtf_data.keys()).intersection(set(mtf_data2.keys()))
