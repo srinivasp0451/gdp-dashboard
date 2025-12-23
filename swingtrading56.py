@@ -879,56 +879,222 @@ def main():
         
         # Tab 3: Z-Score Analysis
         with tabs[current_tab]:
-            st.subheader("📉 Z-Score Analysis - Multi-Timeframe")
+            st.subheader("📉 Z-Score Analysis - Complete Multi-Timeframe Breakdown")
             
-            st.info(f"**Analyzing {len(list(mtf_data.items()))} timeframes** for Z-Score patterns")
+            st.info(f"**Analyzing {len(list(mtf_data.items()))} timeframes** - Each timeframe analyzed separately below")
             
-            # Analyze across all timeframes
-            all_zscore_analysis = []
-            
-            for tf_period, data in mtf_data.items():
+            # Analyze each timeframe separately with full details
+            for idx, (tf_period, data) in enumerate(mtf_data.items()):
                 tf, period = tf_period.split('_')
+                
+                st.markdown(f"---")
+                st.markdown(f"## 📊 Z-Score Analysis: {tf} Interval / {period} Period")
+                
                 zscore_data = calculate_zscore_bins(data)
                 
-                if not zscore_data.empty:
+                if not zscore_data.empty and len(zscore_data) > 10:
                     current_zscore = zscore_data['Z_Score'].iloc[-1]
                     current_bin = zscore_data['Z_Score_Bin'].iloc[-1]
+                    current_price = zscore_data['Close'].iloc[-1]
                     
+                    # Statistics
+                    col1, col2, col3, col4 = st.columns(4)
+                    with col1:
+                        st.metric("Current Z-Score", f"{current_zscore:.2f}")
+                    with col2:
+                        st.metric("Current Bin", current_bin)
+                    with col3:
+                        st.metric("Mean Z-Score", f"{zscore_data['Z_Score'].mean():.2f}")
+                    with col4:
+                        st.metric("Std Dev", f"{zscore_data['Z_Score'].std():.2f}")
+                    
+                    # Bin distribution
+                    bin_counts = zscore_data['Z_Score_Bin'].value_counts()
+                    st.write(f"**Bin Distribution** ({tf}/{period}):")
+                    bin_df = pd.DataFrame({
+                        'Bin': bin_counts.index,
+                        'Count': bin_counts.values,
+                        'Percentage': (bin_counts.values / len(zscore_data) * 100).round(1)
+                    })
+                    st.dataframe(bin_df, use_container_width=True)
+                    
+                    # Recent data table
+                    st.write(f"**Recent Z-Score Data** ({tf}/{period}) - Last 20 periods:")
+                    st.dataframe(zscore_data.tail(20), use_container_width=True)
+                    
+                    # Historical pattern analysis
                     extreme_positive = zscore_data[zscore_data['Z_Score'] > 2]
                     extreme_negative = zscore_data[zscore_data['Z_Score'] < -2]
                     
-                    signal = ""
-                    if current_zscore > 2:
-                        signal = "🔴 Extreme Positive - Correction Expected"
-                    elif current_zscore < -2:
-                        signal = "🟢 Extreme Negative - Bounce Expected"
-                    elif -1 < current_zscore < 1:
-                        signal = "🟡 Neutral Zone"
-                    else:
-                        signal = "⚪ Moderate"
+                    st.markdown(f"### 🎯 Market Impact & Historical Similarity ({tf}/{period})")
                     
-                    all_zscore_analysis.append({
-                        'Timeframe': tf,
-                        'Period': period,
-                        'Current_ZScore': f"{current_zscore:.2f}",
-                        'Bin': current_bin,
-                        'Signal': signal,
-                        'Extreme_Positive_Count': len(extreme_positive),
-                        'Extreme_Negative_Count': len(extreme_negative)
-                    })
-            
-            if all_zscore_analysis:
-                st.write("### Z-Score Analysis Across All Timeframes")
-                zscore_summary_df = pd.DataFrame(all_zscore_analysis)
-                st.dataframe(zscore_summary_df, use_container_width=True, height=400)
-            
-            # Detailed analysis for primary timeframe
-            first_key = list(mtf_data.keys())[0]
-            tf, period = first_key.split('_')
-            st.markdown(f"---")
-            st.markdown(f"### 📊 Detailed Z-Score Analysis (Primary: {tf}/{period})")
-            
-            zscore_data = calculate_zscore_bins(data1)
+                    if current_zscore > 2:
+                        st.error(f"🔴 **EXTREME POSITIVE Z-SCORE: {current_zscore:.2f}**")
+                        
+                        analysis = f"""
+                        **Current Status ({tf}/{period})**:
+                        - Price at ₹{current_price:.2f} is {current_zscore:.2f} standard deviations ABOVE normal
+                        - This is an extreme overbought statistical condition
+                        - Occurs only {(len(extreme_positive)/len(zscore_data)*100):.1f}% of the time in this timeframe
+                        
+                        **Historical Similarity Analysis**:
+                        - Found {len(extreme_positive)} similar extreme positive events in {tf}/{period} data
+                        """
+                        
+                        if len(extreme_positive) >= 2:
+                            # Analyze what happened after past extremes
+                            recent_extremes = extreme_positive.tail(5)
+                            outcomes = []
+                            
+                            for extreme_idx in recent_extremes.index:
+                                try:
+                                    idx_pos = zscore_data.index.get_loc(extreme_idx)
+                                    if idx_pos + 5 < len(zscore_data):
+                                        price_at_extreme = zscore_data['Close'].iloc[idx_pos]
+                                        price_5_later = zscore_data['Close'].iloc[idx_pos + 5]
+                                        price_10_later = zscore_data['Close'].iloc[idx_pos + 10] if idx_pos + 10 < len(zscore_data) else None
+                                        
+                                        move_5 = ((price_5_later - price_at_extreme) / price_at_extreme * 100)
+                                        move_10 = ((price_10_later - price_at_extreme) / price_at_extreme * 100) if price_10_later else None
+                                        
+                                        outcomes.append({
+                                            'date': extreme_idx,
+                                            'price': price_at_extreme,
+                                            'move_5': move_5,
+                                            'move_10': move_10
+                                        })
+                                except:
+                                    pass
+                            
+                            if outcomes:
+                                avg_move_5 = np.mean([o['move_5'] for o in outcomes])
+                                avg_move_10 = np.mean([o['move_10'] for o in outcomes if o['move_10'] is not None])
+                                down_count = len([o for o in outcomes if o['move_5'] < 0])
+                                
+                                analysis += f"""
+                        
+                        **What Happened After Similar Events**:
+                        - Last similar extreme: {time_ago(outcomes[-1]['date'])} at ₹{outcomes[-1]['price']:.2f}
+                        - After 5 periods: Average move was {avg_move_5:+.2f}%
+                        - After 10 periods: Average move was {avg_move_10:+.2f}%
+                        - Correction occurred: {down_count}/{len(outcomes)} times ({down_count/len(outcomes)*100:.0f}% accuracy)
+                        
+                        **Market Behavior Pattern**:
+                        """
+                                
+                                if avg_move_5 < -1:
+                                    analysis += f"""
+                        - 📉 **STRONG CORRECTION PATTERN**: Market typically corrected {abs(avg_move_5):.1f}% after extreme positive Z-Score
+                        - **Expected Move**: ₹{current_price * (1 + avg_move_5/100):.2f} ({abs(avg_move_5):.1f}% or {abs(current_price * avg_move_5/100):.0f} points)
+                        - **Pattern Reliability**: {down_count/len(outcomes)*100:.0f}% - HIGH confidence in correction
+                        - **Market Type**: Mean reversion - what goes up must come down
+                                    """
+                                elif -1 <= avg_move_5 <= 1:
+                                    analysis += f"""
+                        - 📊 **SIDEWAYS CONSOLIDATION PATTERN**: Market typically moved sideways after extremes
+                        - **Expected Move**: Range-bound between ₹{current_price * 0.99:.2f} - ₹{current_price * 1.01:.2f}
+                        - **Market Type**: Consolidation after extreme move
+                                    """
+                                else:
+                                    analysis += f"""
+                        - 📈 **CONTINUED RALLY PATTERN**: Market showed continued strength despite extreme readings
+                        - **Expected Move**: Possible continuation to ₹{current_price * 1.02:.2f}
+                        - **Caution**: This is rare and high-risk - could reverse sharply
+                                    """
+                        
+                        st.markdown(analysis)
+                    
+                    elif current_zscore < -2:
+                        st.success(f"🟢 **EXTREME NEGATIVE Z-SCORE: {current_zscore:.2f}**")
+                        
+                        analysis = f"""
+                        **Current Status ({tf}/{period})**:
+                        - Price at ₹{current_price:.2f} is {abs(current_zscore):.2f} standard deviations BELOW normal
+                        - This is an extreme oversold statistical condition
+                        - Occurs only {(len(extreme_negative)/len(zscore_data)*100):.1f}% of the time in this timeframe
+                        
+                        **Historical Similarity Analysis**:
+                        - Found {len(extreme_negative)} similar extreme negative events in {tf}/{period} data
+                        """
+                        
+                        if len(extreme_negative) >= 2:
+                            recent_extremes = extreme_negative.tail(5)
+                            outcomes = []
+                            
+                            for extreme_idx in recent_extremes.index:
+                                try:
+                                    idx_pos = zscore_data.index.get_loc(extreme_idx)
+                                    if idx_pos + 5 < len(zscore_data):
+                                        price_at_extreme = zscore_data['Close'].iloc[idx_pos]
+                                        price_5_later = zscore_data['Close'].iloc[idx_pos + 5]
+                                        price_10_later = zscore_data['Close'].iloc[idx_pos + 10] if idx_pos + 10 < len(zscore_data) else None
+                                        
+                                        move_5 = ((price_5_later - price_at_extreme) / price_at_extreme * 100)
+                                        move_10 = ((price_10_later - price_at_extreme) / price_at_extreme * 100) if price_10_later else None
+                                        
+                                        outcomes.append({
+                                            'date': extreme_idx,
+                                            'price': price_at_extreme,
+                                            'move_5': move_5,
+                                            'move_10': move_10
+                                        })
+                                except:
+                                    pass
+                            
+                            if outcomes:
+                                avg_move_5 = np.mean([o['move_5'] for o in outcomes])
+                                avg_move_10 = np.mean([o['move_10'] for o in outcomes if o['move_10'] is not None])
+                                up_count = len([o for o in outcomes if o['move_5'] > 0])
+                                
+                                analysis += f"""
+                        
+                        **What Happened After Similar Events**:
+                        - Last similar extreme: {time_ago(outcomes[-1]['date'])} at ₹{outcomes[-1]['price']:.2f}
+                        - After 5 periods: Average move was {avg_move_5:+.2f}%
+                        - After 10 periods: Average move was {avg_move_10:+.2f}%
+                        - Rally occurred: {up_count}/{len(outcomes)} times ({up_count/len(outcomes)*100:.0f}% accuracy)
+                        
+                        **Market Behavior Pattern**:
+                        """
+                                
+                                if avg_move_5 > 1:
+                                    analysis += f"""
+                        - 📈 **STRONG RALLY PATTERN**: Market typically rallied {avg_move_5:.1f}% after extreme negative Z-Score
+                        - **Expected Move**: ₹{current_price * (1 + avg_move_5/100):.2f} ({avg_move_5:.1f}% or {current_price * avg_move_5/100:.0f} points)
+                        - **Pattern Reliability**: {up_count/len(outcomes)*100:.0f}% - HIGH confidence in bounce
+                        - **Market Type**: Mean reversion - oversold bounce
+                                    """
+                                elif -1 <= avg_move_5 <= 1:
+                                    analysis += f"""
+                        - 📊 **SIDEWAYS CONSOLIDATION PATTERN**: Market typically stabilized after extreme selling
+                        - **Expected Move**: Range-bound between ₹{current_price * 0.99:.2f} - ₹{current_price * 1.01:.2f}
+                        - **Market Type**: Base building after washout
+                                    """
+                                else:
+                                    analysis += f"""
+                        - 📉 **CONTINUED DECLINE PATTERN**: Market showed continued weakness despite oversold
+                        - **Expected Move**: Possible further decline to ₹{current_price * 0.98:.2f}
+                        - **Caution**: Wait for stabilization before entering
+                                    """
+                        
+                        st.markdown(analysis)
+                    
+                    else:
+                        st.info(f"🟡 **NORMAL RANGE Z-SCORE: {current_zscore:.2f}**")
+                        st.markdown(f"""
+                        **Current Status ({tf}/{period})**:
+                        - Z-Score of {current_zscore:.2f} is within normal range (±2σ)
+                        - No extreme statistical condition present
+                        - Market trading in typical distribution zone
+                        - Bin: **{current_bin}**
+                        
+                        **Market Behavior**:
+                        - No strong mean reversion signal
+                        - Follow trend and other technical indicators
+                        - Wait for extreme readings for high-probability trades
+                        """)
+                else:
+                    st.warning(f"Insufficient data for {tf}/{period} Z-Score analysis")
             
             if not zscore_data.empty:
                 current_zscore = zscore_data['Z_Score'].iloc[-1]
@@ -1091,16 +1257,63 @@ def main():
                 - If reaches extreme, prepare for mean reversion trade
                 - Use tight stops as reversal can be swift
                 """
+            
+            # Summary section at the end
+            st.markdown("---")
+            st.markdown("---")
+            st.markdown("# 🎯 Z-SCORE FINAL CONSENSUS ACROSS ALL TIMEFRAMES")
+            
+            # Collect all signals
+            all_z_signals = []
+            for tf_period, data in mtf_data.items():
+                tf, period = tf_period.split('_')
+                zscore_data = calculate_zscore_bins(data)
+                if not zscore_data.empty:
+                    current_zscore = zscore_data['Z_Score'].iloc[-1]
+                    if current_zscore > 2:
+                        all_z_signals.append('correction')
+                    elif current_zscore < -2:
+                        all_z_signals.append('rally')
+                    else:
+                        all_z_signals.append('neutral')
+            
+            correction_count = all_z_signals.count('correction')
+            rally_count = all_z_signals.count('rally')
+            neutral_count = all_z_signals.count('neutral')
+            total = len(all_z_signals)
+            
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                st.metric("Correction Signals", f"{correction_count}/{total}", 
+                         f"{correction_count/total*100:.0f}%")
+            with col2:
+                st.metric("Rally Signals", f"{rally_count}/{total}", 
+                         f"{rally_count/total*100:.0f}%")
+            with col3:
+                st.metric("Neutral Signals", f"{neutral_count}/{total}", 
+                         f"{neutral_count/total*100:.0f}%")
+            
+            if correction_count > total * 0.5:
+                st.error(f"""
+                ### 🔴 Z-SCORE CONSENSUS: CORRECTION EXPECTED
                 
-                # Add bin distribution
-                st.markdown(summary_text)
+                {correction_count} out of {total} timeframes ({correction_count/total*100:.0f}%) show extreme positive Z-Scores indicating overbought conditions. 
+                Historical patterns suggest mean reversion downward is highly probable.
+                """)
+            elif rally_count > total * 0.5:
+                st.success(f"""
+                ### 🟢 Z-SCORE CONSENSUS: RALLY/BOUNCE EXPECTED
                 
-                st.markdown("---")
-                st.write("### Z-Score Distribution")
-                bin_dist = zscore_data['Z_Score_Bin'].value_counts()
-                fig = go.Figure(data=[go.Bar(x=bin_dist.index, y=bin_dist.values)])
-                fig.update_layout(title="Frequency of Z-Score Bins", xaxis_title="Bin", yaxis_title="Count", height=300)
-                st.plotly_chart(fig, use_container_width=True)
+                {rally_count} out of {total} timeframes ({rally_count/total*100:.0f}%) show extreme negative Z-Scores indicating oversold conditions. 
+                Historical patterns suggest mean reversion upward is highly probable.
+                """)
+            else:
+                st.info(f"""
+                ### 🟡 Z-SCORE CONSENSUS: NO CLEAR EXTREME
+                
+                Mixed signals across timeframes. {neutral_count} timeframes in normal range. 
+                No strong statistical edge for mean reversion trades currently.
+                """)
             
             if not zscore_data.empty:
                 # Statistics
@@ -1199,53 +1412,277 @@ def main():
         
         # Tab 4: Volatility Analysis
         with tabs[current_tab]:
-            st.subheader("💹 Volatility Analysis - Multi-Timeframe")
+            st.subheader("💹 Volatility Analysis - Complete Multi-Timeframe Breakdown")
             
-            st.info(f"**Analyzing {len(list(mtf_data.items()))} timeframes** for Volatility patterns")
+            st.info(f"**Analyzing {len(list(mtf_data.items()))} timeframes** - Each timeframe analyzed separately below")
             
-            # Analyze across all timeframes
-            all_vol_analysis = []
-            
-            for tf_period, data in mtf_data.items():
+            # Analyze each timeframe separately
+            for idx, (tf_period, data) in enumerate(mtf_data.items()):
                 tf, period = tf_period.split('_')
+                
+                st.markdown(f"---")
+                st.markdown(f"## 📊 Volatility Analysis: {tf} Interval / {period} Period")
+                
                 vol_data = calculate_volatility_bins(data)
                 
-                if not vol_data.empty:
+                if not vol_data.empty and len(vol_data) > 10:
                     current_vol = vol_data['Volatility'].iloc[-1]
                     current_bin = vol_data['Volatility_Bin'].iloc[-1]
+                    current_price = vol_data['Close'].iloc[-1]
                     avg_vol = vol_data['Volatility'].mean()
                     
-                    signal = ""
-                    if current_vol > avg_vol * 1.5:
-                        signal = "🔴 Very High - Large Moves Expected"
-                    elif current_vol > avg_vol * 1.2:
-                        signal = "🟠 High - Increased Movement"
-                    elif current_vol < avg_vol * 0.7:
-                        signal = "🟢 Low - Range-Bound"
-                    else:
-                        signal = "🟡 Moderate - Normal"
+                    # Statistics
+                    col1, col2, col3, col4 = st.columns(4)
+                    with col1:
+                        st.metric("Current Volatility", f"{current_vol:.2f}%")
+                    with col2:
+                        st.metric("Current Bin", current_bin)
+                    with col3:
+                        st.metric("Average Vol", f"{avg_vol:.2f}%")
+                    with col4:
+                        st.metric("Max Vol", f"{vol_data['Volatility'].max():.2f}%")
                     
-                    all_vol_analysis.append({
-                        'Timeframe': tf,
-                        'Period': period,
-                        'Current_Vol_%': f"{current_vol:.2f}",
-                        'Bin': current_bin,
-                        'Avg_Vol_%': f"{avg_vol:.2f}",
-                        'Signal': signal
+                    # Bin distribution
+                    bin_counts = vol_data['Volatility_Bin'].value_counts()
+                    st.write(f"**Bin Distribution** ({tf}/{period}):")
+                    bin_df = pd.DataFrame({
+                        'Bin': bin_counts.index,
+                        'Count': bin_counts.values,
+                        'Percentage': (bin_counts.values / len(vol_data) * 100).round(1)
                     })
+                    st.dataframe(bin_df, use_container_width=True)
+                    
+                    # Recent data
+                    st.write(f"**Recent Volatility Data** ({tf}/{period}) - Last 20 periods:")
+                    st.dataframe(vol_data.tail(20), use_container_width=True)
+                    
+                    # Historical analysis
+                    high_vol = vol_data[vol_data['Volatility_Bin'].isin(['High', 'Very High'])]
+                    low_vol = vol_data[vol_data['Volatility_Bin'].isin(['Low', 'Very Low'])]
+                    
+                    st.markdown(f"### 🎯 Market Impact & Historical Similarity ({tf}/{period})")
+                    
+                    if current_vol > avg_vol * 1.5:
+                        st.error(f"🔴 **VERY HIGH VOLATILITY: {current_vol:.2f}%**")
+                        
+                        analysis = f"""
+                        **Current Status ({tf}/{period})**:
+                        - Volatility at {current_vol:.2f}% is {(current_vol/avg_vol):.1f}x the average ({avg_vol:.2f}%)
+                        - This is a high volatility environment
+                        - Occurs {(len(high_vol)/len(vol_data)*100):.1f}% of the time in this timeframe
+                        
+                        **Historical Similarity Analysis**:
+                        - Found {len(high_vol)} high volatility periods in {tf}/{period} data
+                        """
+                        
+                        if len(high_vol) >= 3:
+                            recent_high_vol = high_vol.tail(5)
+                            outcomes = []
+                            
+                            for vol_idx in recent_high_vol.index:
+                                try:
+                                    idx_pos = vol_data.index.get_loc(vol_idx)
+                                    if idx_pos + 5 < len(vol_data):
+                                        price_at_vol = vol_data['Close'].iloc[idx_pos]
+                                        price_5_later = vol_data['Close'].iloc[idx_pos + 5]
+                                        
+                                        move = abs((price_5_later - price_at_vol) / price_at_vol * 100)
+                                        direction = "up" if price_5_later > price_at_vol else "down"
+                                        
+                                        outcomes.append({
+                                            'date': vol_idx,
+                                            'move': move,
+                                            'direction': direction
+                                        })
+                                except:
+                                    pass
+                            
+                            if outcomes:
+                                avg_move = np.mean([o['move'] for o in outcomes])
+                                max_move = max([o['move'] for o in outcomes])
+                                
+                                analysis += f"""
+                        
+                        **What Happened During Past High Volatility**:
+                        - Last high volatility period: {time_ago(outcomes[-1]['date'])}
+                        - Average absolute move within 5 periods: {avg_move:.2f}%
+                        - Largest move recorded: {max_move:.2f}%
+                        - Current volatility suggests move of {current_vol * 0.8:.1f}% to {current_vol * 1.5:.1f}%
+                        
+                        **Market Behavior Pattern**:
+                        """
+                                
+                                if avg_move > 3:
+                                    analysis += f"""
+                        - 📈📉 **LARGE MOVES PATTERN**: High volatility historically led to {avg_move:.1f}% average moves
+                        - **Expected Range**: ₹{current_price * (1 - avg_move/100):.2f} to ₹{current_price * (1 + avg_move/100):.2f}
+                        - **Market Type**: Trending with large swings - breakout likely
+                        - **Trading Style**: Use wider stops, reduce position size, trend-following
+                                    """
+                                else:
+                                    analysis += f"""
+                        - 📊 **MODERATE VOLATILITY PATTERN**: Elevated but controlled moves
+                        - **Expected Range**: ₹{current_price * 0.98:.2f} to ₹{current_price * 1.02:.2f}
+                        - **Market Type**: Active but not extreme
+                                    """
+                        
+                        st.markdown(analysis)
+                    
+                    elif current_vol < avg_vol * 0.7:
+                        st.success(f"🟢 **VERY LOW VOLATILITY: {current_vol:.2f}%**")
+                        
+                        analysis = f"""
+                        **Current Status ({tf}/{period})**:
+                        - Volatility at {current_vol:.2f}% is only {(current_vol/avg_vol):.1f}x the average ({avg_vol:.2f}%)
+                        - This is a low volatility / compression environment
+                        - Occurs {(len(low_vol)/len(vol_data)*100):.1f}% of the time in this timeframe
+                        
+                        **Historical Similarity Analysis**:
+                        - Found {len(low_vol)} low volatility periods in {tf}/{period} data
+                        
+                        **Volatility Compression - Spring Loading Effect**:
+                        - Low volatility is like a coiled spring
+                        - The longer the compression, the bigger the eventual expansion
+                        - Market "storing energy" for next big move
+                        """
+                        
+                        if len(low_vol) >= 3:
+                            # Find what happened after low vol periods
+                            breakout_analysis = []
+                            for vol_idx in low_vol.index[-5:]:
+                                try:
+                                    idx_pos = vol_data.index.get_loc(vol_idx)
+                                    # Look forward to find when volatility expanded
+                                    for i in range(idx_pos + 1, min(idx_pos + 20, len(vol_data))):
+                                        if vol_data['Volatility'].iloc[i] > avg_vol * 1.2:
+                                            price_at_low_vol = vol_data['Close'].iloc[idx_pos]
+                                            price_at_breakout = vol_data['Close'].iloc[i]
+                                            move = ((price_at_breakout - price_at_low_vol) / price_at_low_vol * 100)
+                                            periods_to_breakout = i - idx_pos
+                                            
+                                            breakout_analysis.append({
+                                                'periods': periods_to_breakout,
+                                                'move': abs(move),
+                                                'direction': 'up' if move > 0 else 'down'
+                                            })
+                                            break
+                                except:
+                                    pass
+                            
+                            if breakout_analysis:
+                                avg_periods = np.mean([b['periods'] for b in breakout_analysis])
+                                avg_breakout_move = np.mean([b['move'] for b in breakout_analysis])
+                                
+                                analysis += f"""
+                        
+                        **Breakout Pattern After Low Volatility**:
+                        - Historical breakouts occurred within {avg_periods:.0f} periods on average
+                        - Average breakout move: {avg_breakout_move:.2f}%
+                        - Breakout probability: {len(breakout_analysis)/5*100:.0f}% (occurred {len(breakout_analysis)}/5 times)
+                        
+                        **Expected Behavior**:
+                        - ⚡ **BREAKOUT IMMINENT**: Prepare for volatility expansion
+                        - **Direction**: Unknown until breakout occurs - could be either way
+                        - **Expected Move**: {avg_breakout_move * 0.7:.1f}% to {avg_breakout_move * 1.3:.1f}%
+                        - **Strategy**: Wait for breakout confirmation, then trade direction of move
+                                """
+                        
+                        st.markdown(analysis)
+                    
+                    else:
+                        st.info(f"🟡 **NORMAL VOLATILITY: {current_vol:.2f}%**")
+                        st.markdown(f"""
+                        **Current Status ({tf}/{period})**:
+                        - Volatility at {current_vol:.2f}% is near average ({avg_vol:.2f}%)
+                        - Normal market conditions
+                        - Bin: **{current_bin}**
+                        
+                        **Market Behavior**:
+                        - Standard trading environment
+                        - Normal position sizing appropriate
+                        - Most strategies workable
+                        """)
+                    
+                    # Mini chart for each timeframe
+                    fig = go.Figure()
+                    fig.add_trace(go.Scatter(
+                        x=vol_data['DateTime_IST'].tail(100), 
+                        y=vol_data['Volatility'].tail(100),
+                        mode='lines',
+                        name='Volatility',
+                        line=dict(color='orange')
+                    ))
+                    fig.add_hline(y=avg_vol, line_dash="dash", 
+                                 annotation_text=f"Avg: {avg_vol:.2f}%", 
+                                 line_color='blue')
+                    fig.update_layout(
+                        title=f"Volatility Chart - {tf}/{period}",
+                        xaxis_title="Date",
+                        yaxis_title="Volatility %",
+                        height=300
+                    )
+                    st.plotly_chart(fig, use_container_width=True)
+                else:
+                    st.warning(f"Insufficient data for {tf}/{period} volatility analysis")
             
-            if all_vol_analysis:
-                st.write("### Volatility Analysis Across All Timeframes")
-                vol_summary_df = pd.DataFrame(all_vol_analysis)
-                st.dataframe(vol_summary_df, use_container_width=True, height=400)
+            # Final consensus
+            st.markdown("---")
+            st.markdown("---")
+            st.markdown("# 🎯 VOLATILITY FINAL CONSENSUS ACROSS ALL TIMEFRAMES")
             
-            # Detailed analysis for primary
-            first_key = list(mtf_data.keys())[0]
-            tf, period = first_key.split('_')
-            st.markdown(f"---")
-            st.markdown(f"### 📊 Detailed Volatility Analysis (Primary: {tf}/{period})")
+            all_vol_signals = []
+            for tf_period, data in mtf_data.items():
+                vol_data = calculate_volatility_bins(data)
+                if not vol_data.empty:
+                    current_vol = vol_data['Volatility'].iloc[-1]
+                    avg_vol = vol_data['Volatility'].mean()
+                    
+                    if current_vol > avg_vol * 1.5:
+                        all_vol_signals.append('high')
+                    elif current_vol < avg_vol * 0.7:
+                        all_vol_signals.append('low')
+                    else:
+                        all_vol_signals.append('normal')
             
-            vol_data = calculate_volatility_bins(data1)
+            high_count = all_vol_signals.count('high')
+            low_count = all_vol_signals.count('low')
+            normal_count = all_vol_signals.count('normal')
+            total = len(all_vol_signals)
+            
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                st.metric("High Volatility TFs", f"{high_count}/{total}", 
+                         f"{high_count/total*100:.0f}%")
+            with col2:
+                st.metric("Low Volatility TFs", f"{low_count}/{total}", 
+                         f"{low_count/total*100:.0f}%")
+            with col3:
+                st.metric("Normal Volatility TFs", f"{normal_count}/{total}", 
+                         f"{normal_count/total*100:.0f}%")
+            
+            if high_count > total * 0.5:
+                st.error(f"""
+                ### 🔴 VOLATILITY CONSENSUS: HIGH VOLATILITY REGIME
+                
+                {high_count} out of {total} timeframes ({high_count/total*100:.0f}%) show elevated volatility.
+                Expect larger price swings, use wider stops, reduce position size.
+                Breakout/trend-following strategies favored.
+                """)
+            elif low_count > total * 0.5:
+                st.success(f"""
+                ### 🟢 VOLATILITY CONSENSUS: LOW VOLATILITY / COMPRESSION
+                
+                {low_count} out of {total} timeframes ({low_count/total*100:.0f}%) show low volatility.
+                Market in compression phase - BREAKOUT IMMINENT.
+                Prepare for volatility expansion and directional move.
+                """)
+            else:
+                st.info(f"""
+                ### 🟡 VOLATILITY CONSENSUS: NORMAL CONDITIONS
+                
+                {normal_count} timeframes show normal volatility levels.
+                Standard trading conditions apply.
+                """)
             
             if not vol_data.empty:
                 current_vol = vol_data['Volatility'].iloc[-1]
@@ -1800,85 +2237,221 @@ def main():
         
         # Tab 9: AI Signals
         with tabs[current_tab]:
-            st.subheader("🤖 AI-Powered Trading Signals & Multi-Timeframe Forecast")
+            st.subheader("🤖 FINAL MARKET FORECAST - Multi-Timeframe AI Analysis")
             
-            # Aggregate signals from all timeframes
-            all_signals = []
+            st.info(f"🔄 Analyzing {len(list(mtf_data.items()))} timeframes to generate final recommendation...")
             
-            for tf_period, data in list(mtf_data.items())[:10]:  # Analyze top 10 timeframes
+            # Comprehensive analysis across all timeframes
+            timeframe_analysis = []
+            
+            for tf_period, data in mtf_data.items():
                 tf, period = tf_period.split('_')
                 
-                data['RSI'] = calculate_rsi(data['Close'])
-                data['EMA_9'] = calculate_ema(data['Close'], 9)
-                data['EMA_20'] = calculate_ema(data['Close'], 20)
-                data['EMA_50'] = calculate_ema(data['Close'], 50)
+                # Calculate all indicators for this timeframe
+                data_copy = data.copy()
+                data_copy['RSI'] = calculate_rsi(data_copy['Close'])
+                data_copy['EMA_9'] = calculate_ema(data_copy['Close'], 9)
+                data_copy['EMA_20'] = calculate_ema(data_copy['Close'], 20)
+                data_copy['EMA_50'] = calculate_ema(data_copy['Close'], 50)
                 
-                current_price = data['Close'].iloc[-1]
-                current_rsi = data['RSI'].iloc[-1]
+                current_price = data_copy['Close'].iloc[-1]
+                current_rsi = data_copy['RSI'].iloc[-1]
                 
-                sr_levels = find_support_resistance(data)
-                divergences = detect_rsi_divergence(data, data['RSI'])
-                
-                score = 0
-                signals = []
-                
-                # RSI
-                if current_rsi < 30:
-                    score += 20
-                    signals.append("RSI Oversold")
-                elif current_rsi > 70:
-                    score -= 20
-                    signals.append("RSI Overbought")
-                
-                # EMA
-                if current_price > data['EMA_20'].iloc[-1] > data['EMA_50'].iloc[-1]:
-                    score += 15
-                    signals.append("Bullish EMA alignment")
-                elif current_price < data['EMA_20'].iloc[-1] < data['EMA_50'].iloc[-1]:
-                    score -= 15
-                    signals.append("Bearish EMA alignment")
-                
-                # Support/Resistance
+                # Get support/resistance
+                sr_levels = find_support_resistance(data_copy)
                 nearby_support = [l for l in sr_levels if l['type'] == 'Support' and 
                                 abs(current_price - l['price']) < current_price * 0.02]
                 nearby_resistance = [l for l in sr_levels if l['type'] == 'Resistance' and 
                                    abs(current_price - l['price']) < current_price * 0.02]
                 
-                if nearby_support:
-                    score += 20
-                    signals.append(f"Near support at ₹{nearby_support[0]['price']:.2f}")
-                if nearby_resistance:
-                    score -= 20
-                    signals.append(f"Near resistance at ₹{nearby_resistance[0]['price']:.2f}")
-                
-                # Divergences
+                # Get divergences
+                divergences = detect_rsi_divergence(data_copy, data_copy['RSI'])
                 active_bull_div = [d for d in divergences if d['type'] == 'Bullish' and not d['resolved']]
                 active_bear_div = [d for d in divergences if d['type'] == 'Bearish' and not d['resolved']]
                 
+                # Get Z-Score
+                zscore_data = calculate_zscore_bins(data_copy)
+                current_zscore = zscore_data['Z_Score'].iloc[-1] if not zscore_data.empty else 0
+                
+                # Get Volatility
+                vol_data = calculate_volatility_bins(data_copy)
+                current_vol = vol_data['Volatility'].iloc[-1] if not vol_data.empty else 0
+                
+                # Calculate score for this timeframe
+                score = 0
+                factors = []
+                
+                # RSI scoring
+                if current_rsi < 30:
+                    score += 20
+                    factors.append("RSI Oversold")
+                elif current_rsi > 70:
+                    score -= 20
+                    factors.append("RSI Overbought")
+                
+                # EMA scoring
+                if current_price > data_copy['EMA_20'].iloc[-1] > data_copy['EMA_50'].iloc[-1]:
+                    score += 15
+                    factors.append("Bullish EMA Alignment")
+                elif current_price < data_copy['EMA_20'].iloc[-1] < data_copy['EMA_50'].iloc[-1]:
+                    score -= 15
+                    factors.append("Bearish EMA Alignment")
+                
+                # Support/Resistance scoring
+                if nearby_support:
+                    score += 20
+                    factors.append(f"Near Support ₹{nearby_support[0]['price']:.2f}")
+                if nearby_resistance:
+                    score -= 20
+                    factors.append(f"Near Resistance ₹{nearby_resistance[0]['price']:.2f}")
+                
+                # Divergence scoring
                 if active_bull_div:
                     score += 25
-                    signals.append("Bullish RSI divergence")
+                    factors.append("Bullish Divergence")
                 if active_bear_div:
                     score -= 25
-                    signals.append("Bearish RSI divergence")
+                    factors.append("Bearish Divergence")
                 
-                all_signals.append({
+                # Z-Score scoring
+                if current_zscore < -2:
+                    score += 20
+                    factors.append(f"Extreme Oversold Z-Score")
+                elif current_zscore > 2:
+                    score -= 20
+                    factors.append(f"Extreme Overbought Z-Score")
+                
+                timeframe_analysis.append({
                     'timeframe': tf,
                     'period': period,
                     'score': score,
-                    'signals': signals,
-                    'price': current_price
+                    'factors': factors,
+                    'price': current_price,
+                    'rsi': current_rsi,
+                    'zscore': current_zscore,
+                    'volatility': current_vol
                 })
             
-            # Aggregate scores
-            total_score = sum(s['score'] for s in all_signals)
-            avg_score = total_score / len(all_signals) if all_signals else 0
+            # Calculate aggregate score and consensus
+            total_score = sum(a['score'] for a in timeframe_analysis)
+            avg_score = total_score / len(timeframe_analysis)
             
-            # Calculate entry first
+            bullish_tf_count = len([a for a in timeframe_analysis if a['score'] > 15])
+            bearish_tf_count = len([a for a in timeframe_analysis if a['score'] < -15])
+            neutral_tf_count = len(timeframe_analysis) - bullish_tf_count - bearish_tf_count
+            
+            # Calculate entry
             entry = current_price1
-            
-            # Determine final signal with reasonable targets for NIFTY-level instruments
             avg_price = current_price1
+            
+            # Determine signal with reasonable targets
+            if avg_price > 20000:  # NIFTY/SENSEX
+                if avg_score > 30:
+                    signal = "🟢 STRONG BUY"
+                    confidence = min(95, 65 + abs(avg_score) * 0.4)
+                    direction = "BULLISH"
+                    sl = entry * 0.985
+                    target = entry * 1.0175
+                elif avg_score > 15:
+                    signal = "🟢 BUY"
+                    confidence = min(85, 60 + abs(avg_score) * 0.4)
+                    direction = "BULLISH"
+                    sl = entry * 0.985
+                    target = entry * 1.015
+                elif avg_score < -30:
+                    signal = "🔴 STRONG SELL"
+                    confidence = min(95, 65 + abs(avg_score) * 0.4)
+                    direction = "BEARISH"
+                    sl = entry * 1.015
+                    target = entry * 0.9825
+                elif avg_score < -15:
+                    signal = "🔴 SELL"
+                    confidence = min(85, 60 + abs(avg_score) * 0.4)
+                    direction = "BEARISH"
+                    sl = entry * 1.015
+                    target = entry * 0.985
+                else:
+                    signal = "🟡 HOLD/NEUTRAL"
+                    confidence = 50
+                    direction = "NEUTRAL"
+                    sl = None
+                    target = None
+            else:
+                if avg_score > 30:
+                    signal = "🟢 STRONG BUY"
+                    confidence = min(95, 65 + abs(avg_score) * 0.4)
+                    direction = "BULLISH"
+                    sl = entry * 0.975
+                    target = entry * 1.03
+                elif avg_score > 15:
+                    signal = "🟢 BUY"
+                    confidence = min(85, 60 + abs(avg_score) * 0.4)
+                    direction = "BULLISH"
+                    sl = entry * 0.98
+                    target = entry * 1.025
+                elif avg_score < -30:
+                    signal = "🔴 STRONG SELL"
+                    confidence = min(95, 65 + abs(avg_score) * 0.4)
+                    direction = "BEARISH"
+                    sl = entry * 1.025
+                    target = entry * 0.97
+                elif avg_score < -15:
+                    signal = "🔴 SELL"
+                    confidence = min(85, 60 + abs(avg_score) * 0.4)
+                    direction = "BEARISH"
+                    sl = entry * 1.02
+                    target = entry * 0.975
+                else:
+                    signal = "🟡 HOLD/NEUTRAL"
+                    confidence = 50
+                    direction = "NEUTRAL"
+                    sl = None
+                    target = None
+            
+            # Display final recommendation
+            st.markdown(f"# {signal}")
+            st.markdown(f"## Confidence: {confidence:.1f}%")
+            st.markdown(f"## Multi-Timeframe Score: {avg_score:.1f}/100")
+            
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                st.metric("Bullish Timeframes", f"{bullish_tf_count}/{len(timeframe_analysis)}", 
+                         f"{bullish_tf_count/len(timeframe_analysis)*100:.0f}%")
+            with col2:
+                st.metric("Bearish Timeframes", f"{bearish_tf_count}/{len(timeframe_analysis)}", 
+                         f"{bearish_tf_count/len(timeframe_analysis)*100:.0f}%")
+            with col3:
+                st.metric("Neutral Timeframes", f"{neutral_tf_count}/{len(timeframe_analysis)}", 
+                         f"{neutral_tf_count/len(timeframe_analysis)*100:.0f}%")
+            
+            st.markdown("---")
+            
+            if direction != "NEUTRAL":
+                st.markdown(f"""
+                ### 📋 TRADING PLAN
+                
+                **Entry Price**: ₹{entry:.2f}  
+                **Stop Loss**: ₹{sl:.2f} (Risk: {abs(entry-sl):.2f} points = {abs((entry-sl)/entry)*100:.2f}%)  
+                **Target**: ₹{target:.2f} (Reward: {abs(target-entry):.2f} points = {abs((target-entry)/entry)*100:.2f}%)  
+                **Risk:Reward Ratio**: 1:{abs((target-entry)/(entry-sl)):.2f}
+                """)
+            
+            # Detailed timeframe breakdown
+            st.markdown("---")
+            st.markdown("### 📊 Timeframe-by-Timeframe Analysis")
+            
+            tf_breakdown = pd.DataFrame([{
+                'Timeframe': a['timeframe'],
+                'Period': a['period'],
+                'Score': f"{a['score']:+d}",
+                'Bias': "🟢 Bullish" if a['score'] > 15 else "🔴 Bearish" if a['score'] < -15 else "🟡 Neutral",
+                'RSI': f"{a['rsi']:.1f}",
+                'Z-Score': f"{a['zscore']:.2f}",
+                'Volatility_%': f"{a['volatility']:.1f}",
+                'Key_Factors': ", ".join(a['factors'][:2]) if a['factors'] else "No strong signals"
+            } for a in timeframe_analysis])
+            
+            st.dataframe(tf_breakdown, use_container_width=True, height=400)
             
             # Adjust targets based on instrument price level
             if avg_price > 20000:  # NIFTY/SENSEX level
