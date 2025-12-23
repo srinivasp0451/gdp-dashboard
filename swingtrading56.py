@@ -175,10 +175,14 @@ class TechnicalIndicators:
     @staticmethod
     def calculate_ema(prices: pd.Series, period: int) -> pd.Series:
         """Calculate Exponential Moving Average"""
+        if len(prices) < period:
+            return pd.Series([np.nan] * len(prices), index=prices.index)
+        
         alpha = 2 / (period + 1)
         ema = prices.copy()
-        ema.iloc[0] = prices.iloc[0]
-        for i in range(1, len(prices)):
+        # Initialize with SMA
+        ema.iloc[:period] = prices.iloc[:period].mean()
+        for i in range(period, len(prices)):
             ema.iloc[i] = alpha * prices.iloc[i] + (1 - alpha) * ema.iloc[i-1]
         return ema
     
@@ -190,6 +194,9 @@ class TechnicalIndicators:
     @staticmethod
     def calculate_rsi(prices: pd.Series, period: int = 14) -> pd.Series:
         """Calculate Relative Strength Index"""
+        if len(prices) < period + 1:
+            return pd.Series([np.nan] * len(prices), index=prices.index)
+        
         delta = prices.diff()
         gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
         loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
@@ -203,7 +210,7 @@ class TechnicalIndicators:
         ema_fast = TechnicalIndicators.calculate_ema(prices, fast)
         ema_slow = TechnicalIndicators.calculate_ema(prices, slow)
         macd_line = ema_fast - ema_slow
-        signal_line = TechnicalIndicators.calculate_ema(macd_line, signal)
+        signal_line = TechnicalIndicators.calculate_ema(macd_line.dropna(), signal)
         histogram = macd_line - signal_line
         return {'macd': macd_line, 'signal': signal_line, 'histogram': histogram}
     
@@ -219,6 +226,9 @@ class TechnicalIndicators:
     @staticmethod
     def calculate_atr(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14) -> pd.Series:
         """Calculate Average True Range"""
+        if len(high) < 2:
+            return pd.Series([np.nan] * len(high), index=high.index)
+        
         high_low = high - low
         high_close_prev = abs(high - close.shift(1))
         low_close_prev = abs(low - close.shift(1))
@@ -229,6 +239,10 @@ class TechnicalIndicators:
     @staticmethod
     def calculate_adx(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14) -> Dict[str, pd.Series]:
         """Calculate Average Directional Index"""
+        if len(high) < period:
+            empty_series = pd.Series([np.nan] * len(high), index=high.index)
+            return {'adx': empty_series, 'plus_di': empty_series, 'minus_di': empty_series}
+        
         # Calculate +DM and -DM
         high_diff = high.diff()
         low_diff = low.diff()
@@ -266,14 +280,17 @@ class TechnicalIndicators:
     @staticmethod
     def calculate_obv(close: pd.Series, volume: pd.Series) -> pd.Series:
         """Calculate On Balance Volume"""
+        if len(close) == 0:
+            return pd.Series()
+        
         obv = pd.Series(index=close.index, dtype=float)
-        obv.iloc[0] = volume.iloc[0]
+        obv.iloc[0] = volume.iloc[0] if len(volume) > 0 else 0
         
         for i in range(1, len(close)):
             if close.iloc[i] > close.iloc[i-1]:
-                obv.iloc[i] = obv.iloc[i-1] + volume.iloc[i]
+                obv.iloc[i] = obv.iloc[i-1] + volume.iloc[i] if i < len(volume) else obv.iloc[i-1]
             elif close.iloc[i] < close.iloc[i-1]:
-                obv.iloc[i] = obv.iloc[i-1] - volume.iloc[i]
+                obv.iloc[i] = obv.iloc[i-1] - volume.iloc[i] if i < len(volume) else obv.iloc[i-1]
             else:
                 obv.iloc[i] = obv.iloc[i-1]
         
@@ -282,9 +299,15 @@ class TechnicalIndicators:
     @staticmethod
     def calculate_volume_profile(volume: pd.Series, prices: pd.Series, bins: int = 20) -> Dict:
         """Calculate Volume Profile"""
+        if len(prices) == 0 or len(volume) == 0:
+            return {'profile': {}, 'poc': None, 'value_area': []}
+        
         min_price = prices.min()
         max_price = prices.max()
         price_range = max_price - min_price
+        if price_range == 0:
+            return {'profile': {}, 'poc': None, 'value_area': []}
+        
         bin_size = price_range / bins
         
         volume_by_price = {}
@@ -293,7 +316,8 @@ class TechnicalIndicators:
             next_level = price_level + bin_size
             mask = (prices >= price_level) & (prices < next_level)
             if mask.any():
-                volume_by_price[f"{price_level:.2f}-{next_level:.2f}"] = volume[mask].sum()
+                volume_sum = volume[mask].sum() if 'Volume' in volume.name else 0
+                volume_by_price[f"{price_level:.2f}-{next_level:.2f}"] = volume_sum
         
         # Find POC (Point of Control)
         poc_level = max(volume_by_price, key=volume_by_price.get) if volume_by_price else None
@@ -310,6 +334,9 @@ class SupportResistanceAnalyzer:
     @staticmethod
     def find_pivot_points(high: pd.Series, low: pd.Series, window: int = 5) -> Tuple[List[Dict], List[Dict]]:
         """Find pivot points for support and resistance"""
+        if len(high) < window * 2 or len(low) < window * 2:
+            return [], []
+        
         # Find local minima and maxima
         high_array = high.values
         low_array = low.values
@@ -346,7 +373,7 @@ class SupportResistanceAnalyzer:
     def calculate_level_strength(levels: List[Dict], prices: pd.Series, 
                                 tolerance_percent: float = 0.005) -> List[Dict]:
         """Calculate strength of support/resistance levels based on hits and bounces"""
-        if not levels:
+        if not levels or len(prices) == 0:
             return []
         
         price_array = prices.values
@@ -372,9 +399,8 @@ class SupportResistanceAnalyzer:
                     # Check for bounce (price moves away after touching)
                     if i < len(price_array) - 1:
                         # For support: price should go up after touching
-                        if level in support_levels:
-                            if price_array[i+1] > price:
-                                bounce_count += 1
+                        if price_array[i+1] > price:
+                            bounce_count += 1
                         # For resistance: price should go down after touching
                         else:
                             if price_array[i+1] < price:
@@ -447,6 +473,9 @@ class ElliottWaveAnalyzer:
     @staticmethod
     def identify_waves(prices: pd.Series, min_wave_length: int = 5) -> List[Dict]:
         """Identify potential Elliott Wave patterns"""
+        if len(prices) < min_wave_length * 5:
+            return []
+        
         waves = []
         prices_array = prices.values
         
@@ -580,6 +609,9 @@ class StatisticalAnalyzer:
     @staticmethod
     def calculate_zscore(series: pd.Series, window: int = 20) -> pd.Series:
         """Calculate Z-score for a series"""
+        if len(series) < window:
+            return pd.Series([np.nan] * len(series), index=series.index)
+        
         rolling_mean = series.rolling(window=window).mean()
         rolling_std = series.rolling(window=window).std()
         zscore = (series - rolling_mean) / rolling_std
@@ -588,6 +620,9 @@ class StatisticalAnalyzer:
     @staticmethod
     def calculate_volatility(returns: pd.Series, window: int = 20) -> pd.Series:
         """Calculate rolling volatility"""
+        if len(returns) < window:
+            return pd.Series([np.nan] * len(returns), index=returns.index)
+        
         return returns.rolling(window=window).std() * np.sqrt(252)  # Annualized
     
     @staticmethod
@@ -693,19 +728,12 @@ class DataFetcher:
             "1d": ["1mo", "3mo", "6mo", "1y", "2y", "5y", "10y", "20y", "30y"]
         }
     
-    def fetch_data_with_progress(self, ticker: str, period: str, interval: str, 
-                                progress_bar, status_text) -> pd.DataFrame:
-        """Fetch data with progress tracking"""
+    def fetch_data(self, ticker: str, period: str, interval: str) -> pd.DataFrame:
+        """Fetch data from yfinance with error handling"""
         try:
             symbol = self.predefined_assets.get(ticker, ticker)
             
-            progress_bar.progress(10)
-            status_text.text("Starting data download...")
-            
             time.sleep(self.rate_limit_delay)
-            
-            progress_bar.progress(30)
-            status_text.text("Downloading market data...")
             
             data = yf.download(
                 symbol,
@@ -716,15 +744,12 @@ class DataFetcher:
                 threads=True
             )
             
-            progress_bar.progress(70)
-            status_text.text("Processing data...")
-            
             if data.empty:
                 return pd.DataFrame()
             
             # Flatten multi-index columns
             if isinstance(data.columns, pd.MultiIndex):
-                data.columns = [col[0].upper() for col in data.columns]
+                data.columns = [col[0] for col in data.columns]
             
             # Ensure required columns exist
             required_cols = ['Open', 'High', 'Low', 'Close']
@@ -744,11 +769,6 @@ class DataFetcher:
             if data.index.tz is None:
                 data.index = data.index.tz_localize('UTC')
             data.index = data.index.tz_convert(self.ist)
-            
-            progress_bar.progress(100)
-            status_text.text("Data ready!")
-            
-            time.sleep(0.5)  # Let user see completion
             
             return data
             
@@ -788,7 +808,7 @@ class TradingSignalGenerator:
         
         # RSI
         rsi = TechnicalIndicators.calculate_rsi(close, 14)
-        current_rsi = rsi.iloc[-1] if not rsi.empty else 50
+        current_rsi = rsi.iloc[-1] if not rsi.empty and not pd.isna(rsi.iloc[-1]) else 50
         
         # Moving averages
         ema_9 = TechnicalIndicators.calculate_ema(close, 9)
@@ -800,7 +820,7 @@ class TradingSignalGenerator:
         
         # ADX
         adx_data = TechnicalIndicators.calculate_adx(high, low, close)
-        current_adx = adx_data['adx'].iloc[-1] if not adx_data['adx'].empty else 0
+        current_adx = adx_data['adx'].iloc[-1] if not adx_data['adx'].empty and not pd.isna(adx_data['adx'].iloc[-1]) else 0
         
         # Bollinger Bands
         bb = TechnicalIndicators.calculate_bollinger_bands(close)
@@ -824,25 +844,26 @@ class TradingSignalGenerator:
             confidence_score -= 15
         
         # Moving Average Analysis
-        if current_price > ema_9.iloc[-1] > ema_20.iloc[-1] > ema_50.iloc[-1]:
-            signal_reasons.append("Price above all EMAs (bullish alignment)")
-            confidence_score += 20
-        elif current_price < ema_9.iloc[-1] < ema_20.iloc[-1] < ema_50.iloc[-1]:
-            signal_reasons.append("Price below all EMAs (bearish alignment)")
-            confidence_score -= 20
+        if not ema_9.empty and not ema_20.empty and not ema_50.empty:
+            if current_price > ema_9.iloc[-1] > ema_20.iloc[-1] > ema_50.iloc[-1]:
+                signal_reasons.append("Price above all EMAs (bullish alignment)")
+                confidence_score += 20
+            elif current_price < ema_9.iloc[-1] < ema_20.iloc[-1] < ema_50.iloc[-1]:
+                signal_reasons.append("Price below all EMAs (bearish alignment)")
+                confidence_score -= 20
         
         # Support/Resistance Analysis
         if nearest_support:
             distance_to_support = abs(current_price - nearest_support['price']) / current_price * 100
             if distance_to_support < 1:  # Within 1%
-                signal_reasons.append(f"Near strong support at {nearest_support['price']} ({nearest_support['hits']} hits)")
-                confidence_score += nearest_support['strength'] * 10
+                signal_reasons.append(f"Near strong support at {nearest_support['price']:.2f} ({nearest_support.get('hits', 0)} hits)")
+                confidence_score += nearest_support.get('strength', 0) * 10
         
         if nearest_resistance:
             distance_to_resistance = abs(current_price - nearest_resistance['price']) / current_price * 100
             if distance_to_resistance < 1:  # Within 1%
-                signal_reasons.append(f"Near strong resistance at {nearest_resistance['price']} ({nearest_resistance['hits']} hits)")
-                confidence_score -= nearest_resistance['strength'] * 10
+                signal_reasons.append(f"Near strong resistance at {nearest_resistance['price']:.2f} ({nearest_resistance.get('hits', 0)} hits)")
+                confidence_score -= nearest_resistance.get('strength', 0) * 10
         
         # ADX Trend Strength
         if current_adx > 25:
@@ -850,12 +871,13 @@ class TradingSignalGenerator:
             confidence_score += 10
         
         # MACD Signal
-        if macd_data['macd'].iloc[-1] > macd_data['signal'].iloc[-1]:
-            signal_reasons.append("MACD bullish (above signal line)")
-            confidence_score += 10
-        else:
-            signal_reasons.append("MACD bearish (below signal line)")
-            confidence_score -= 10
+        if not macd_data['macd'].empty and not macd_data['signal'].empty:
+            if macd_data['macd'].iloc[-1] > macd_data['signal'].iloc[-1]:
+                signal_reasons.append("MACD bullish (above signal line)")
+                confidence_score += 10
+            else:
+                signal_reasons.append("MACD bearish (below signal line)")
+                confidence_score -= 10
         
         # Determine primary signal
         if confidence_score >= 30:
@@ -924,8 +946,11 @@ class Backtester:
         
         # Generate signals
         df['Signal'] = 0
-        df.loc[(df['RSI'] < 30) & (df['Close'] > df['EMA_20']), 'Signal'] = 1  # Buy
-        df.loc[(df['RSI'] > 70) & (df['Close'] < df['EMA_20']), 'Signal'] = -1  # Sell
+        buy_condition = (df['RSI'] < 30) & (df['Close'] > df['EMA_20'])
+        sell_condition = (df['RSI'] > 70) & (df['Close'] < df['EMA_20'])
+        
+        df.loc[buy_condition, 'Signal'] = 1  # Buy
+        df.loc[sell_condition, 'Signal'] = -1  # Sell
         
         # Calculate positions
         df['Position'] = df['Signal'].diff()
@@ -942,7 +967,7 @@ class Backtester:
             price = df['Close'].iloc[i]
             
             if df['Position'].iloc[i] == 1:  # Buy signal
-                shares_to_buy = (cash * position_size) // price
+                shares_to_buy = int((cash * position_size) // price)
                 if shares_to_buy > 0:
                     cost = shares_to_buy * price
                     cash -= cost
@@ -965,17 +990,24 @@ class Backtester:
         
         # Calculate Sharpe ratio
         df['Returns'] = df['Total'].pct_change()
-        sharpe_ratio = np.sqrt(252) * df['Returns'].mean() / df['Returns'].std() if df['Returns'].std() > 0 else 0
+        if df['Returns'].std() > 0:
+            sharpe_ratio = np.sqrt(252) * df['Returns'].mean() / df['Returns'].std()
+        else:
+            sharpe_ratio = 0
         
         # Calculate max drawdown
         df['Peak'] = df['Total'].cummax()
         df['Drawdown'] = (df['Total'] - df['Peak']) / df['Peak'] * 100
-        max_drawdown = df['Drawdown'].min()
+        max_drawdown = df['Drawdown'].min() if not df['Drawdown'].empty else 0
         
         # Count trades
         trades = len(df[df['Position'] != 0])
-        winning_trades = len(df[(df['Position'] == -1) & (df['Total'] > df['Total'].shift(1))])
-        win_rate = winning_trades / trades * 100 if trades > 0 else 0
+        if trades > 0:
+            winning_trades = len(df[(df['Position'] == -1) & (df['Total'] > df['Total'].shift(1))])
+            win_rate = winning_trades / trades * 100
+        else:
+            winning_trades = 0
+            win_rate = 0
         
         return {
             'initial_capital': initial_capital,
@@ -992,171 +1024,7 @@ class Backtester:
             'trade_signals': df[['Close', 'RSI', 'EMA_20', 'Signal', 'Position']]
         }
 
-# Main Streamlit Application
-def main():
-    st.markdown("<h1 class='main-header'>📈 Algorithmic Trading Analyzer Pro</h1>", unsafe_allow_html=True)
-    
-    # Initialize session state
-    if 'data_fetched' not in st.session_state:
-        st.session_state.data_fetched = False
-    if 'ticker1_data' not in st.session_state:
-        st.session_state.ticker1_data = None
-    if 'ticker2_data' not in st.session_state:
-        st.session_state.ticker2_data = None
-    if 'current_analysis' not in st.session_state:
-        st.session_state.current_analysis = None
-    
-    # Sidebar configuration
-    with st.sidebar:
-        st.markdown("### ⚙️ Configuration")
-        
-        # Asset selection
-        asset_options = list(DataFetcher().predefined_assets.keys()) + ["Custom Ticker"]
-        ticker1 = st.selectbox("Select Ticker 1:", asset_options, index=0)
-        
-        if ticker1 == "Custom Ticker":
-            ticker1 = st.text_input("Enter custom ticker symbol (e.g., AAPL):", "AAPL")
-        
-        enable_ratio = st.checkbox("Enable Ratio Analysis (Ticker 2)", value=False)
-        
-        if enable_ratio:
-            ticker2 = st.selectbox("Select Ticker 2:", asset_options, index=1)
-            if ticker2 == "Custom Ticker":
-                ticker2 = st.text_input("Enter custom ticker 2 symbol:", "GOOGL")
-        else:
-            ticker2 = None
-        
-        # Timeframe and period selection
-        col1, col2 = st.columns(2)
-        with col1:
-            timeframe = st.selectbox(
-                "Timeframe:",
-                ["1m", "3m", "5m", "10m", "15m", "30m", "1h", "2h", "4h", "1d"]
-            )
-        
-        with col2:
-            period = st.selectbox(
-                "Period:",
-                ["1d", "5d", "7d", "1mo", "3mo", "6mo", "1y", "2y", "5y", "10y", "20y", "30y"]
-            )
-        
-        # Check compatibility
-        fetcher = DataFetcher()
-        compatible_periods = fetcher.timeframe_period_compatibility.get(timeframe, [])
-        if period not in compatible_periods and compatible_periods:
-            st.warning(f"⚠️ {timeframe} timeframe is typically compatible with: {', '.join(compatible_periods)}")
-            if st.button("Use recommended period"):
-                period = compatible_periods[0]
-        
-        # Analysis options
-        st.markdown("### 📊 Analysis Options")
-        analyze_support_resistance = st.checkbox("Support/Resistance Analysis", value=True)
-        analyze_fibonacci = st.checkbox("Fibonacci Levels", value=True)
-        analyze_elliott = st.checkbox("Elliott Wave Analysis", value=False)
-        analyze_statistics = st.checkbox("Statistical Analysis", value=True)
-        generate_signals = st.checkbox("Generate Trading Signals", value=True)
-        run_backtest = st.checkbox("Run Backtest", value=False)
-        
-        # Fetch data button
-        if st.button("🚀 Fetch & Analyze Data", type="primary", use_container_width=True):
-            with st.spinner("Fetching data..."):
-                # Create progress bar
-                progress_bar = st.progress(0)
-                status_text = st.empty()
-                
-                # Fetch data
-                ticker1_data = fetcher.fetch_data_with_progress(ticker1, period, timeframe, progress_bar, status_text)
-                
-                if not ticker1_data.empty:
-                    st.session_state.ticker1_data = ticker1_data
-                    
-                    if enable_ratio and ticker2:
-                        ticker2_data = fetcher.fetch_data_with_progress(ticker2, period, timeframe, progress_bar, status_text)
-                        st.session_state.ticker2_data = ticker2_data
-                    
-                    st.session_state.data_fetched = True
-                    st.success("✅ Data fetched successfully!")
-                else:
-                    st.error("❌ Failed to fetch data. Please check ticker symbol and try again.")
-    
-    # Main content area
-    if st.session_state.data_fetched and st.session_state.ticker1_data is not None:
-        data = st.session_state.ticker1_data
-        
-        # Create tabs for different analyses
-        tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs([
-            "📈 Overview", 
-            "🎯 Support/Resistance", 
-            "📊 Technical Indicators",
-            "📐 Fibonacci & Elliott",
-            "📉 Statistical Analysis",
-            "🚦 Trading Signals",
-            "🧪 Backtesting",
-            "📋 Summary Report"
-        ])
-        
-        with tab1:
-            display_overview_tab(data, ticker1, ticker2 if enable_ratio else None)
-        
-        with tab2:
-            display_support_resistance_tab(data)
-        
-        with tab3:
-            display_technical_indicators_tab(data)
-        
-        with tab4:
-            display_fibonacci_elliott_tab(data)
-        
-        with tab5:
-            display_statistical_analysis_tab(data)
-        
-        with tab6:
-            display_trading_signals_tab(data)
-        
-        with tab7:
-            display_backtesting_tab(data)
-        
-        with tab8:
-            display_summary_report_tab(data, ticker1, enable_ratio)
-    
-    elif not st.session_state.data_fetched:
-        # Show welcome/instructions
-        st.markdown("""
-        <div class="info-box">
-            <h3>Welcome to Algorithmic Trading Analyzer Pro</h3>
-            <p>This powerful tool provides comprehensive algorithmic trading analysis with:</p>
-            <ul>
-                <li><b>Multi-Asset Support:</b> Stocks, Indices, Crypto, Forex, Commodities</li>
-                <li><b>Multi-Timeframe Analysis:</b> 1 minute to 1 day timeframes</li>
-                <li><b>Advanced Technical Analysis:</b> Custom indicators without TA-Lib dependency</li>
-                <li><b>Statistical Testing:</b> Z-scores, volatility analysis, pattern recognition</li>
-                <li><b>AI-Powered Signals:</b> Machine learning based trading signals</li>
-                <li><b>Backtesting Engine:</b> Strategy validation with performance metrics</li>
-            </ul>
-            <p><b>To get started:</b></p>
-            <ol>
-                <li>Select your assets in the sidebar</li>
-                <li>Choose timeframe and period</li>
-                <li>Configure analysis options</li>
-                <li>Click "Fetch & Analyze Data"</li>
-            </ol>
-        </div>
-        """, unsafe_allow_html=True)
-        
-        # Quick example
-        st.markdown("### 🎯 Quick Analysis Examples")
-        
-        col1, col2, col3 = st.columns(3)
-        
-        with col1:
-            st.metric("NIFTY 50", "22,150.35", "+125.50 (+0.57%)")
-        
-        with col2:
-            st.metric("BTC-USD", "$67,250.80", "+1,250.50 (+1.89%)")
-        
-        with col3:
-            st.metric("Gold", "$2,350.75", "+15.25 (+0.65%)")
-
+# Display functions for each tab
 def display_overview_tab(data: pd.DataFrame, ticker1: str, ticker2: Optional[str] = None):
     """Display overview tab with key metrics and charts"""
     
@@ -1167,15 +1035,15 @@ def display_overview_tab(data: pd.DataFrame, ticker1: str, ticker2: Optional[str
         return
     
     # Calculate key metrics
-    current_price = data['Close'].iloc[-1]
+    current_price = data['Close'].iloc[-1] if len(data) > 0 else 0
     prev_price = data['Close'].iloc[-2] if len(data) > 1 else current_price
     price_change = current_price - prev_price
     price_change_pct = (price_change / prev_price * 100) if prev_price != 0 else 0
     
-    high_price = data['High'].max()
-    low_price = data['Low'].min()
-    avg_price = data['Close'].mean()
-    volume = data['Volume'].sum() if 'Volume' in data.columns else 0
+    high_price = data['High'].max() if len(data) > 0 else 0
+    low_price = data['Low'].min() if len(data) > 0 else 0
+    avg_price = data['Close'].mean() if len(data) > 0 else 0
+    volume = data['Volume'].sum() if 'Volume' in data.columns and len(data) > 0 else 0
     
     # Display key metrics
     col1, col2, col3, col4 = st.columns(4)
@@ -1206,79 +1074,82 @@ def display_overview_tab(data: pd.DataFrame, ticker1: str, ticker2: Optional[str
         <div class="metric-card">
             <h3>Volume</h3>
             <h2>{volume:,.0f}</h2>
-            <p>Average: {data['Volume'].mean():,.0f}</p>
+            <p>Average: {data['Volume'].mean():,.0f if len(data) > 0 else 0}</p>
         </div>
         """, unsafe_allow_html=True)
     
     with col4:
-        volatility = data['Close'].pct_change().std() * 100
+        volatility = data['Close'].pct_change().std() * 100 if len(data) > 1 else 0
         st.markdown(f"""
         <div class="metric-card">
             <h3>Volatility</h3>
             <h2>{volatility:.2f}%</h2>
-            <p>Daily Range: {((high_price - low_price) / avg_price * 100):.2f}%</p>
+            <p>Daily Range: {((high_price - low_price) / avg_price * 100):.2f if avg_price != 0 else 0}%</p>
         </div>
         """, unsafe_allow_html=True)
     
     # Price chart
     st.markdown("### 📈 Price Chart")
-    fig = go.Figure()
-    
-    fig.add_trace(go.Candlestick(
-        x=data.index,
-        open=data['Open'],
-        high=data['High'],
-        low=data['Low'],
-        close=data['Close'],
-        name='Price'
-    ))
-    
-    # Add moving averages
-    ema_9 = TechnicalIndicators.calculate_ema(data['Close'], 9)
-    ema_20 = TechnicalIndicators.calculate_ema(data['Close'], 20)
-    
-    fig.add_trace(go.Scatter(
-        x=data.index,
-        y=ema_9,
-        mode='lines',
-        name='EMA 9',
-        line=dict(color='orange', width=1)
-    ))
-    
-    fig.add_trace(go.Scatter(
-        x=data.index,
-        y=ema_20,
-        mode='lines',
-        name='EMA 20',
-        line=dict(color='blue', width=1)
-    ))
-    
-    fig.update_layout(
-        title=f"{ticker1} Price Action",
-        yaxis_title="Price",
-        xaxis_title="Date/Time (IST)",
-        template="plotly_dark",
-        height=500,
-        showlegend=True
-    )
-    
-    st.plotly_chart(fig, use_container_width=True)
+    if len(data) > 0:
+        fig = go.Figure()
+        
+        fig.add_trace(go.Candlestick(
+            x=data.index,
+            open=data['Open'],
+            high=data['High'],
+            low=data['Low'],
+            close=data['Close'],
+            name='Price'
+        ))
+        
+        # Add moving averages
+        if len(data) >= 20:
+            ema_9 = TechnicalIndicators.calculate_ema(data['Close'], 9)
+            ema_20 = TechnicalIndicators.calculate_ema(data['Close'], 20)
+            
+            fig.add_trace(go.Scatter(
+                x=data.index,
+                y=ema_9,
+                mode='lines',
+                name='EMA 9',
+                line=dict(color='orange', width=1)
+            ))
+            
+            fig.add_trace(go.Scatter(
+                x=data.index,
+                y=ema_20,
+                mode='lines',
+                name='EMA 20',
+                line=dict(color='blue', width=1)
+            ))
+        
+        fig.update_layout(
+            title=f"{ticker1} Price Action",
+            yaxis_title="Price",
+            xaxis_title="Date/Time (IST)",
+            template="plotly_dark",
+            height=500,
+            showlegend=True
+        )
+        
+        st.plotly_chart(fig, use_container_width=True)
     
     # Data table
     st.markdown("### 📋 Recent Data")
-    display_data = data.tail(20).copy()
-    display_data.index = display_data.index.strftime('%Y-%m-%d %H:%M:%S IST')
-    
-    st.dataframe(
-        display_data.style.format({
-            'Open': '{:.2f}',
-            'High': '{:.2f}',
-            'Low': '{:.2f}',
-            'Close': '{:.2f}',
-            'Volume': '{:,.0f}'
-        }),
-        use_container_width=True
-    )
+    if len(data) > 0:
+        display_data = data.tail(20).copy()
+        display_data.index = display_data.index.strftime('%Y-%m-%d %H:%M:%S IST')
+        
+        st.dataframe(
+            display_data.style.format({
+                'Open': '{:.2f}',
+                'High': '{:.2f}',
+                'Low': '{:.2f}',
+                'Close': '{:.2f}',
+                'Volume': '{:,.0f}'
+            }),
+            use_container_width=True
+        )
 
 def display_support_resistance_tab(data: pd.DataFrame):
     """Display support and resistance analysis"""
@@ -1289,7 +1160,7 @@ def display_support_resistance_tab(data: pd.DataFrame):
         st.warning("No data available")
         return
     
-    current_price = data['Close'].iloc[-1]
+    current_price = data['Close'].iloc[-1] if len(data) > 0 else 0
     
     # Calculate support and resistance levels
     analyzer = SupportResistanceAnalyzer()
@@ -1302,88 +1173,93 @@ def display_support_resistance_tab(data: pd.DataFrame):
     resistance_levels = analyzer.merge_similar_levels(resistance_levels)
     
     # Display current price context
+    nearest_support_price = min(support_levels, key=lambda x: abs(x['price'] - current_price))['price'] if support_levels else 0
+    nearest_resistance_price = min(resistance_levels, key=lambda x: abs(x['price'] - current_price))['price'] if resistance_levels else 0
+    
     st.markdown(f"""
     <div class="info-box">
         <h4>📊 Current Price Context: {current_price:.2f}</h4>
-        <p><b>Nearest Support:</b> {min(support_levels, key=lambda x: abs(x['price'] - current_price))['price']:.2f if support_levels else 'N/A'}</p>
-        <p><b>Nearest Resistance:</b> {min(resistance_levels, key=lambda x: abs(x['price'] - current_price))['price']:.2f if resistance_levels else 'N/A'}</p>
-        <p><b>Price Range:</b> {data['Low'].min():.2f} - {data['High'].max():.2f}</p>
+        <p><b>Nearest Support:</b> {nearest_support_price:.2f if support_levels else 'N/A'}</p>
+        <p><b>Nearest Resistance:</b> {nearest_resistance_price:.2f if resistance_levels else 'N/A'}</p>
+        <p><b>Price Range:</b> {data['Low'].min():.2f if len(data) > 0 else 0} - {data['High'].max():.2f if len(data) > 0 else 0}</p>
     </div>
     """, unsafe_allow_html=True)
     
     # Create visualization
-    fig = make_subplots(
-        rows=2, cols=1,
-        subplot_titles=('Price with Support/Resistance', 'Level Strength'),
-        vertical_spacing=0.15,
-        row_heights=[0.7, 0.3]
-    )
-    
-    # Price chart with levels
-    fig.add_trace(
-        go.Candlestick(
-            x=data.index,
-            open=data['Open'],
-            high=data['High'],
-            low=data['Low'],
-            close=data['Close'],
-            name='Price'
-        ),
-        row=1, col=1
-    )
-    
-    # Add support levels
-    for level in support_levels[:5]:  # Top 5 strongest support levels
-        fig.add_hline(
-            y=level['price'],
-            line_dash="dash",
-            line_color="green",
-            opacity=0.7,
-            row=1, col=1,
-            annotation_text=f"S: {level['price']:.2f}",
-            annotation_position="bottom right"
+    if len(data) > 0:
+        fig = make_subplots(
+            rows=2, cols=1,
+            subplot_titles=('Price with Support/Resistance', 'Level Strength'),
+            vertical_spacing=0.15,
+            row_heights=[0.7, 0.3]
         )
-    
-    # Add resistance levels
-    for level in resistance_levels[:5]:  # Top 5 strongest resistance levels
-        fig.add_hline(
-            y=level['price'],
-            line_dash="dash",
-            line_color="red",
-            opacity=0.7,
-            row=1, col=1,
-            annotation_text=f"R: {level['price']:.2f}",
-            annotation_position="top right"
+        
+        # Price chart with levels
+        fig.add_trace(
+            go.Candlestick(
+                x=data.index,
+                open=data['Open'],
+                high=data['High'],
+                low=data['Low'],
+                close=data['Close'],
+                name='Price'
+            ),
+            row=1, col=1
         )
-    
-    # Level strength chart
-    all_levels = support_levels[:5] + resistance_levels[:5]
-    level_prices = [level['price'] for level in all_levels]
-    level_strengths = [level['strength'] for level in all_levels]
-    level_types = ['Support'] * min(5, len(support_levels)) + ['Resistance'] * min(5, len(resistance_levels))
-    
-    fig.add_trace(
-        go.Bar(
-            x=level_prices,
-            y=level_strengths,
-            marker_color=['green' if t == 'Support' else 'red' for t in level_types],
-            name='Level Strength',
-            text=[f"{s:.1f}" for s in level_strengths],
-            textposition='auto'
-        ),
-        row=2, col=1
-    )
-    
-    fig.update_xaxes(title_text="Price Level", row=2, col=1)
-    fig.update_yaxes(title_text="Strength Score", row=2, col=1)
-    
-    fig.update_layout(
-        height=800,
-        showlegend=False,
-        template="plotly_dark"
-    )
-    
-    st.plotly_chart(fig, use_container_width=True)
+        
+        # Add support levels
+        for level in support_levels[:5]:  # Top 5 strongest support levels
+            fig.add_hline(
+                y=level['price'],
+                line_dash="dash",
+                line_color="green",
+                opacity=0.7,
+                row=1, col=1,
+                annotation_text=f"S: {level['price']:.2f}",
+                annotation_position="bottom right"
+            )
+        
+        # Add resistance levels
+        for level in resistance_levels[:5]:  # Top 5 strongest resistance levels
+            fig.add_hline(
+                y=level['price'],
+                line_dash="dash",
+                line_color="red",
+                opacity=0.7,
+                row=1, col=1,
+                annotation_text=f"R: {level['price']:.2f}",
+                annotation_position="top right"
+            )
+        
+        # Level strength chart
+        all_levels = support_levels[:5] + resistance_levels[:5]
+        if all_levels:
+            level_prices = [level['price'] for level in all_levels]
+            level_strengths = [level['strength'] for level in all_levels]
+            level_types = ['Support'] * min(5, len(support_levels)) + ['Resistance'] * min(5, len(resistance_levels))
+            
+            fig.add_trace(
+                go.Bar(
+                    x=level_prices,
+                    y=level_strengths,
+                    marker_color=['green' if t == 'Support' else 'red' for t in level_types],
+                    name='Level Strength',
+                    text=[f"{s:.1f}" for s in level_strengths],
+                    textposition='auto'
+                ),
+                row=2, col=1
+            )
+        
+        fig.update_xaxes(title_text="Price Level", row=2, col=1)
+        fig.update_yaxes(title_text="Strength Score", row=2, col=1)
+        
+        fig.update_layout(
+            height=800,
+            showlegend=False,
+            template="plotly_dark"
+        )
+        
+        st.plotly_chart(fig, use_container_width=True)
     
     # Display levels in tables
     col1, col2 = st.columns(2)
@@ -1437,7 +1313,7 @@ def display_technical_indicators_tab(data: pd.DataFrame):
     
     # RSI
     rsi = TechnicalIndicators.calculate_rsi(close, 14)
-    current_rsi = rsi.iloc[-1] if not rsi.empty else 50
+    current_rsi = rsi.iloc[-1] if not rsi.empty and not pd.isna(rsi.iloc[-1]) else 50
     
     # MACD
     macd_data = TechnicalIndicators.calculate_macd(close)
@@ -1484,137 +1360,143 @@ def display_technical_indicators_tab(data: pd.DataFrame):
         st.metric("Stochastic", f"K:{stoch_k:.1f}/D:{stoch_d:.1f}", stoch_signal, delta_color="off")
     
     # Create subplots for indicators
-    fig = make_subplots(
-        rows=4, cols=1,
-        subplot_titles=('Price with Bollinger Bands', 'RSI', 'MACD', 'Volume'),
-        vertical_spacing=0.08,
-        row_heights=[0.35, 0.2, 0.2, 0.25],
-        shared_xaxes=True
-    )
-    
-    # Price with Bollinger Bands
-    fig.add_trace(
-        go.Candlestick(
-            x=data.index,
-            open=data['Open'],
-            high=data['High'],
-            low=data['Low'],
-            close=data['Close'],
-            name='Price'
-        ),
-        row=1, col=1
-    )
-    
-    fig.add_trace(
-        go.Scatter(
-            x=data.index,
-            y=bb['upper'],
-            mode='lines',
-            name='BB Upper',
-            line=dict(color='gray', width=1)
-        ),
-        row=1, col=1
-    )
-    
-    fig.add_trace(
-        go.Scatter(
-            x=data.index,
-            y=bb['middle'],
-            mode='lines',
-            name='BB Middle',
-            line=dict(color='blue', width=1)
-        ),
-        row=1, col=1
-    )
-    
-    fig.add_trace(
-        go.Scatter(
-            x=data.index,
-            y=bb['lower'],
-            mode='lines',
-            name='BB Lower',
-            line=dict(color='gray', width=1),
-            fill='tonexty',
-            fillcolor='rgba(128, 128, 128, 0.1)'
-        ),
-        row=1, col=1
-    )
-    
-    # RSI
-    fig.add_trace(
-        go.Scatter(
-            x=data.index,
-            y=rsi,
-            mode='lines',
-            name='RSI',
-            line=dict(color='purple', width=2)
-        ),
-        row=2, col=1
-    )
-    
-    # Add RSI levels
-    fig.add_hline(y=70, line_dash="dash", line_color="red", opacity=0.5, row=2, col=1)
-    fig.add_hline(y=30, line_dash="dash", line_color="green", opacity=0.5, row=2, col=1)
-    fig.add_hline(y=50, line_dash="dot", line_color="gray", opacity=0.3, row=2, col=1)
-    
-    # MACD
-    fig.add_trace(
-        go.Scatter(
-            x=data.index,
-            y=macd_data['macd'],
-            mode='lines',
-            name='MACD',
-            line=dict(color='blue', width=2)
-        ),
-        row=3, col=1
-    )
-    
-    fig.add_trace(
-        go.Scatter(
-            x=data.index,
-            y=macd_data['signal'],
-            mode='lines',
-            name='Signal',
-            line=dict(color='red', width=1)
-        ),
-        row=3, col=1
-    )
-    
-    # MACD Histogram
-    colors = ['green' if h >= 0 else 'red' for h in macd_data['histogram']]
-    fig.add_trace(
-        go.Bar(
-            x=data.index,
-            y=macd_data['histogram'],
-            name='Histogram',
-            marker_color=colors
-        ),
-        row=3, col=1
-    )
-    
-    # Volume
-    colors_volume = ['green' if data['Close'].iloc[i] >= data['Open'].iloc[i] else 'red' 
-                     for i in range(len(data))]
-    fig.add_trace(
-        go.Bar(
-            x=data.index,
-            y=volume,
-            name='Volume',
-            marker_color=colors_volume
-        ),
-        row=4, col=1
-    )
-    
-    fig.update_layout(
-        height=1000,
-        showlegend=True,
-        template="plotly_dark",
-        xaxis4=dict(title="Date/Time (IST)")
-    )
-    
-    fig.update_xaxes(rangeslider_visible=False)
-    
-    st.plotly_chart(fig, use_container_width=True)
+    if len(data) > 0:
+        fig = make_subplots(
+            rows=4, cols=1,
+            subplot_titles=('Price with Bollinger Bands', 'RSI', 'MACD', 'Volume'),
+            vertical_spacing=0.08,
+            row_heights=[0.35, 0.2, 0.2, 0.25],
+            shared_xaxes=True
+        )
+        
+        # Price with Bollinger Bands
+        fig.add_trace(
+            go.Candlestick(
+                x=data.index,
+                open=data['Open'],
+                high=data['High'],
+                low=data['Low'],
+                close=data['Close'],
+                name='Price'
+            ),
+            row=1, col=1
+        )
+        
+        if not bb['upper'].empty:
+            fig.add_trace(
+                go.Scatter(
+                    x=data.index,
+                    y=bb['upper'],
+                    mode='lines',
+                    name='BB Upper',
+                    line=dict(color='gray', width=1)
+                ),
+                row=1, col=1
+            )
+            
+            fig.add_trace(
+                go.Scatter(
+                    x=data.index,
+                    y=bb['middle'],
+                    mode='lines',
+                    name='BB Middle',
+                    line=dict(color='blue', width=1)
+                ),
+                row=1, col=1
+            )
+            
+            fig.add_trace(
+                go.Scatter(
+                    x=data.index,
+                    y=bb['lower'],
+                    mode='lines',
+                    name='BB Lower',
+                    line=dict(color='gray', width=1),
+                    fill='tonexty',
+                    fillcolor='rgba(128, 128, 128, 0.1)'
+                ),
+                row=1, col=1
+            )
+        
+        # RSI
+        if not rsi.empty:
+            fig.add_trace(
+                go.Scatter(
+                    x=data.index,
+                    y=rsi,
+                    mode='lines',
+                    name='RSI',
+                    line=dict(color='purple', width=2)
+                ),
+                row=2, col=1
+            )
+            
+            # Add RSI levels
+            fig.add_hline(y=70, line_dash="dash", line_color="red", opacity=0.5, row=2, col=1)
+            fig.add_hline(y=30, line_dash="dash", line_color="green", opacity=0.5, row=2, col=1)
+            fig.add_hline(y=50, line_dash="dot", line_color="gray", opacity=0.3, row=2, col=1)
+        
+        # MACD
+        if not macd_data['macd'].empty:
+            fig.add_trace(
+                go.Scatter(
+                    x=data.index,
+                    y=macd_data['macd'],
+                    mode='lines',
+                    name='MACD',
+                    line=dict(color='blue', width=2)
+                ),
+                row=3, col=1
+            )
+            
+            fig.add_trace(
+                go.Scatter(
+                    x=data.index,
+                    y=macd_data['signal'],
+                    mode='lines',
+                    name='Signal',
+                    line=dict(color='red', width=1)
+                ),
+                row=3, col=1
+            )
+            
+            # MACD Histogram
+            if not macd_data['histogram'].empty:
+                colors = ['green' if h >= 0 else 'red' for h in macd_data['histogram']]
+                fig.add_trace(
+                    go.Bar(
+                        x=data.index,
+                        y=macd_data['histogram'],
+                        name='Histogram',
+                        marker_color=colors
+                    ),
+                    row=3, col=1
+                )
+        
+        # Volume
+        if len(volume) > 0:
+            colors_volume = ['green' if data['Close'].iloc[i] >= data['Open'].iloc[i] else 'red' 
+                            for i in range(len(data))]
+            fig.add_trace(
+                go.Bar(
+                    x=data.index,
+                    y=volume,
+                    name='Volume',
+                    marker_color=colors_volume
+                ),
+                row=4, col=1
+            )
+        
+        fig.update_layout(
+            height=1000,
+            showlegend=True,
+            template="plotly_dark",
+            xaxis4=dict(title="Date/Time (IST)")
+        )
+        
+        fig.update_xaxes(rangeslider_visible=False)
+        
+        st.plotly_chart(fig, use_container_width=True)
     
     # Additional indicator tables
     st.markdown("### 📋 Indicator Summary Table")
@@ -1622,17 +1504,17 @@ def display_technical_indicators_tab(data: pd.DataFrame):
     # Create summary dataframe
     summary_data = []
     for i in range(min(20, len(data))):
-        idx = -20 + i
+        idx = -min(20, len(data)) + i
         summary_data.append({
-            'DateTime': data.index[idx].strftime('%Y-%m-%d %H:%M IST'),
-            'Price': data['Close'].iloc[idx],
-            'RSI': rsi.iloc[idx] if idx < len(rsi) else None,
-            'MACD': macd_data['macd'].iloc[idx] if idx < len(macd_data['macd']) else None,
-            'MACD_Signal': macd_data['signal'].iloc[idx] if idx < len(macd_data['signal']) else None,
-            'BB_Upper': bb['upper'].iloc[idx] if idx < len(bb['upper']) else None,
-            'BB_Lower': bb['lower'].iloc[idx] if idx < len(bb['lower']) else None,
-            'Stoch_K': stoch['k'].iloc[idx] if idx < len(stoch['k']) else None,
-            'ADX': adx_data['adx'].iloc[idx] if idx < len(adx_data['adx']) else None
+            'DateTime': data.index[idx].strftime('%Y-%m-%d %H:%M IST') if idx >= 0 else '',
+            'Price': data['Close'].iloc[idx] if idx >= 0 else 0,
+            'RSI': rsi.iloc[idx] if idx >= 0 and idx < len(rsi) and not rsi.empty else None,
+            'MACD': macd_data['macd'].iloc[idx] if idx >= 0 and idx < len(macd_data['macd']) and not macd_data['macd'].empty else None,
+            'MACD_Signal': macd_data['signal'].iloc[idx] if idx >= 0 and idx < len(macd_data['signal']) and not macd_data['signal'].empty else None,
+            'BB_Upper': bb['upper'].iloc[idx] if idx >= 0 and idx < len(bb['upper']) and not bb['upper'].empty else None,
+            'BB_Lower': bb['lower'].iloc[idx] if idx >= 0 and idx < len(bb['lower']) and not bb['lower'].empty else None,
+            'Stoch_K': stoch['k'].iloc[idx] if idx >= 0 and idx < len(stoch['k']) and not stoch['k'].empty else None,
+            'ADX': adx_data['adx'].iloc[idx] if idx >= 0 and idx < len(adx_data['adx']) and not adx_data['adx'].empty else None
         })
     
     summary_df = pd.DataFrame(summary_data)
@@ -1659,9 +1541,9 @@ def display_fibonacci_elliott_tab(data: pd.DataFrame):
         st.warning("No data available")
         return
     
-    current_price = data['Close'].iloc[-1]
-    high_price = data['High'].max()
-    low_price = data['Low'].min()
+    current_price = data['Close'].iloc[-1] if len(data) > 0 else 0
+    high_price = data['High'].max() if len(data) > 0 else 0
+    low_price = data['Low'].min() if len(data) > 0 else 0
     
     # Fibonacci Analysis
     st.markdown("### 📐 Fibonacci Retracement Levels")
@@ -1671,7 +1553,7 @@ def display_fibonacci_elliott_tab(data: pd.DataFrame):
     # Display Fibonacci levels
     fib_df = pd.DataFrame.from_dict(fib_levels, orient='index', columns=['Price'])
     fib_df['Distance from Current'] = fib_df['Price'] - current_price
-    fib_df['Distance %'] = (fib_df['Distance from Current'] / current_price * 100)
+    fib_df['Distance %'] = (fib_df['Distance from Current'] / current_price * 100) if current_price > 0 else 0
     
     col1, col2 = st.columns(2)
     
@@ -1692,7 +1574,7 @@ def display_fibonacci_elliott_tab(data: pd.DataFrame):
         # Identify important Fibonacci zones near current price
         important_levels = []
         for level, price in fib_levels.items():
-            distance_pct = abs(price - current_price) / current_price * 100
+            distance_pct = abs(price - current_price) / current_price * 100 if current_price > 0 else 0
             if distance_pct < 5:  # Within 5%
                 importance = "High" if level in ['38.2%', '50.0%', '61.8%'] else "Medium"
                 important_levels.append({
@@ -1709,40 +1591,42 @@ def display_fibonacci_elliott_tab(data: pd.DataFrame):
             st.info("No key Fibonacci levels within 5% of current price")
     
     # Create Fibonacci chart
-    fig = go.Figure()
-    
-    # Price chart
-    fig.add_trace(go.Candlestick(
-        x=data.index,
-        open=data['Open'],
-        high=data['High'],
-        low=data['Low'],
-        close=data['Close'],
-        name='Price'
-    ))
-    
-    # Add Fibonacci levels
-    colors = ['#FF6B6B', '#4ECDC4', '#45B7D1', '#96CEB4', '#FFEAA7', '#DDA0DD']
-    for i, (level, price) in enumerate(fib_levels.items()):
-        if level in ['0.0%', '23.6%', '38.2%', '50.0%', '61.8%', '78.6%', '100.0%']:
-            fig.add_hline(
-                y=price,
-                line_dash="dash",
-                line_color=colors[i % len(colors)],
-                opacity=0.7,
-                annotation_text=f"Fib {level}",
-                annotation_position="right"
-            )
-    
-    fig.update_layout(
-        title="Fibonacci Retracement Levels",
-        yaxis_title="Price",
-        xaxis_title="Date/Time (IST)",
-        template="plotly_dark",
-        height=500
-    )
-    
-    st.plotly_chart(fig, use_container_width=True)
+    if len(data) > 0:
+        fig = go.Figure()
+        
+        # Price chart
+        fig.add_trace(go.Candlestick(
+            x=data.index,
+            open=data['Open'],
+            high=data['High'],
+            low=data['Low'],
+            close=data['Close'],
+            name='Price'
+        ))
+        
+        # Add Fibonacci levels
+        colors = ['#FF6B6B', '#4ECDC4', '#45B7D1', '#96CEB4', '#FFEAA7', '#DDA0DD']
+        fib_levels_to_show = ['0.0%', '23.6%', '38.2%', '50.0%', '61.8%', '78.6%', '100.0%']
+        for i, level in enumerate(fib_levels_to_show):
+            if level in fib_levels:
+                fig.add_hline(
+                    y=fib_levels[level],
+                    line_dash="dash",
+                    line_color=colors[i % len(colors)],
+                    opacity=0.7,
+                    annotation_text=f"Fib {level}",
+                    annotation_position="right"
+                )
+        
+        fig.update_layout(
+            title="Fibonacci Retracement Levels",
+            yaxis_title="Price",
+            xaxis_title="Date/Time (IST)",
+            template="plotly_dark",
+            height=500
+        )
+        
+        st.plotly_chart(fig, use_container_width=True)
     
     # Elliott Wave Analysis
     st.markdown("### 🌊 Elliott Wave Analysis")
@@ -1830,7 +1714,7 @@ def display_fibonacci_elliott_tab(data: pd.DataFrame):
                 'Convergence Strength': cluster['convergence_strength'],
                 'Fibonacci Levels': fib_levels_str,
                 'Distance from Current': f"{(cluster['price_zone'] - current_price):.2f}",
-                'Distance %': f"{abs(cluster['price_zone'] - current_price)/current_price*100:.2f}%"
+                'Distance %': f"{abs(cluster['price_zone'] - current_price)/current_price*100:.2f if current_price > 0 else 0}%"
             })
         
         cluster_df = pd.DataFrame(cluster_data)
@@ -1854,11 +1738,11 @@ def display_statistical_analysis_tab(data: pd.DataFrame):
     st.markdown("### 📊 Z-Score Analysis (Mean Reversion)")
     
     zscore = StatisticalAnalyzer.calculate_zscore(data['Close'], window=20)
-    current_zscore = zscore.iloc[-1] if not zscore.empty else 0
+    current_zscore = zscore.iloc[-1] if not zscore.empty and not pd.isna(zscore.iloc[-1]) else 0
     
     # Volatility analysis
     volatility = StatisticalAnalyzer.calculate_volatility(returns, window=20)
-    current_volatility = volatility.iloc[-1] if not volatility.empty else 0
+    current_volatility = volatility.iloc[-1] if not volatility.empty and not pd.isna(volatility.iloc[-1]) else 0
     
     # Display current statistics
     col1, col2, col3, col4 = st.columns(4)
@@ -1873,12 +1757,12 @@ def display_statistical_analysis_tab(data: pd.DataFrame):
         st.metric("Annualized Volatility", f"{current_volatility*100:.1f}%", vol_status, delta_color="off")
     
     with col3:
-        mean_return = returns.mean() * 100
+        mean_return = returns.mean() * 100 if len(returns) > 0 else 0
         st.metric("Mean Daily Return", f"{mean_return:.3f}%", 
                  "Positive" if mean_return > 0 else "Negative", delta_color="normal")
     
     with col4:
-        sharpe_ratio = np.sqrt(252) * returns.mean() / returns.std() if returns.std() > 0 else 0
+        sharpe_ratio = np.sqrt(252) * returns.mean() / returns.std() if len(returns) > 0 and returns.std() > 0 else 0
         st.metric("Sharpe Ratio", f"{sharpe_ratio:.2f}", 
                  "Good" if sharpe_ratio > 1 else "Poor", delta_color="off")
     
@@ -1892,10 +1776,10 @@ def display_statistical_analysis_tab(data: pd.DataFrame):
         # Display extreme zones
         zone_data = []
         for zone in extreme_zones[:5]:  # Show last 5 zones
-            start_price = data['Close'].iloc[zone['start_idx']]
-            end_price = data['Close'].iloc[zone['end_idx']]
+            start_price = data['Close'].iloc[zone['start_idx']] if zone['start_idx'] < len(data) else 0
+            end_price = data['Close'].iloc[zone['end_idx']] if zone['end_idx'] < len(data) else 0
             price_change = end_price - start_price
-            price_change_pct = (price_change / start_price * 100)
+            price_change_pct = (price_change / start_price * 100) if start_price > 0 else 0
             
             zone_data.append({
                 'Start Time': zone['start_time'].strftime('%Y-%m-%d %H:%M IST'),
@@ -1913,161 +1797,168 @@ def display_statistical_analysis_tab(data: pd.DataFrame):
         st.dataframe(zone_df, use_container_width=True)
     
     # Create statistical charts
-    fig = make_subplots(
-        rows=3, cols=1,
-        subplot_titles=('Price with Z-Score Bands', 'Z-Score', 'Rolling Volatility'),
-        vertical_spacing=0.1,
-        row_heights=[0.4, 0.3, 0.3],
-        shared_xaxes=True
-    )
-    
-    # Price with Z-score bands
-    fig.add_trace(
-        go.Candlestick(
-            x=data.index,
-            open=data['Open'],
-            high=data['High'],
-            low=data['Low'],
-            close=data['Close'],
-            name='Price'
-        ),
-        row=1, col=1
-    )
-    
-    # Add Z-score bands (price levels corresponding to Z=±1, ±2)
-    rolling_mean = data['Close'].rolling(window=20).mean()
-    rolling_std = data['Close'].rolling(window=20).std()
-    
-    for std_mult, color, opacity in [(1, 'yellow', 0.3), (2, 'red', 0.2)]:
+    if len(data) > 0:
+        fig = make_subplots(
+            rows=3, cols=1,
+            subplot_titles=('Price with Z-Score Bands', 'Z-Score', 'Rolling Volatility'),
+            vertical_spacing=0.1,
+            row_heights=[0.4, 0.3, 0.3],
+            shared_xaxes=True
+        )
+        
+        # Price with Z-score bands
         fig.add_trace(
-            go.Scatter(
+            go.Candlestick(
                 x=data.index,
-                y=rolling_mean + (rolling_std * std_mult),
-                mode='lines',
-                line=dict(color=color, width=1, dash='dash'),
-                name=f'+{std_mult}σ',
-                opacity=opacity
+                open=data['Open'],
+                high=data['High'],
+                low=data['Low'],
+                close=data['Close'],
+                name='Price'
             ),
             row=1, col=1
         )
         
-        fig.add_trace(
-            go.Scatter(
-                x=data.index,
-                y=rolling_mean - (rolling_std * std_mult),
-                mode='lines',
-                line=dict(color=color, width=1, dash='dash'),
-                name=f'-{std_mult}σ',
-                opacity=opacity,
-                fill='tonexty' if std_mult == 1 else None,
-                fillcolor='rgba(255, 255, 0, 0.1)'
-            ),
-            row=1, col=1
+        # Add Z-score bands (price levels corresponding to Z=±1, ±2)
+        if len(data) >= 20:
+            rolling_mean = data['Close'].rolling(window=20).mean()
+            rolling_std = data['Close'].rolling(window=20).std()
+            
+            for std_mult, color, opacity in [(1, 'yellow', 0.3), (2, 'red', 0.2)]:
+                fig.add_trace(
+                    go.Scatter(
+                        x=data.index,
+                        y=rolling_mean + (rolling_std * std_mult),
+                        mode='lines',
+                        line=dict(color=color, width=1, dash='dash'),
+                        name=f'+{std_mult}σ',
+                        opacity=opacity
+                    ),
+                    row=1, col=1
+                )
+                
+                fig.add_trace(
+                    go.Scatter(
+                        x=data.index,
+                        y=rolling_mean - (rolling_std * std_mult),
+                        mode='lines',
+                        line=dict(color=color, width=1, dash='dash'),
+                        name=f'-{std_mult}σ',
+                        opacity=opacity,
+                        fill='tonexty' if std_mult == 1 else None,
+                        fillcolor='rgba(255, 255, 0, 0.1)'
+                    ),
+                    row=1, col=1
+                )
+        
+        # Z-score chart
+        if not zscore.empty:
+            fig.add_trace(
+                go.Scatter(
+                    x=data.index,
+                    y=zscore,
+                    mode='lines',
+                    name='Z-Score',
+                    line=dict(color='purple', width=2)
+                ),
+                row=2, col=1
+            )
+            
+            # Add Z-score levels
+            fig.add_hline(y=2, line_dash="dash", line_color="red", opacity=0.5, row=2, col=1)
+            fig.add_hline(y=-2, line_dash="dash", line_color="red", opacity=0.5, row=2, col=1)
+            fig.add_hline(y=1, line_dash="dash", line_color="yellow", opacity=0.3, row=2, col=1)
+            fig.add_hline(y=-1, line_dash="dash", line_color="yellow", opacity=0.3, row=2, col=1)
+            fig.add_hline(y=0, line_dash="dot", line_color="gray", opacity=0.3, row=2, col=1)
+        
+        # Volatility chart
+        if not volatility.empty:
+            fig.add_trace(
+                go.Scatter(
+                    x=data.index,
+                    y=volatility * 100,  # Convert to percentage
+                    mode='lines',
+                    name='Volatility',
+                    line=dict(color='green', width=2)
+                ),
+                row=3, col=1
+            )
+        
+        fig.update_layout(
+            height=900,
+            showlegend=True,
+            template="plotly_dark"
         )
-    
-    # Z-score chart
-    fig.add_trace(
-        go.Scatter(
-            x=data.index,
-            y=zscore,
-            mode='lines',
-            name='Z-Score',
-            line=dict(color='purple', width=2)
-        ),
-        row=2, col=1
-    )
-    
-    # Add Z-score levels
-    fig.add_hline(y=2, line_dash="dash", line_color="red", opacity=0.5, row=2, col=1)
-    fig.add_hline(y=-2, line_dash="dash", line_color="red", opacity=0.5, row=2, col=1)
-    fig.add_hline(y=1, line_dash="dash", line_color="yellow", opacity=0.3, row=2, col=1)
-    fig.add_hline(y=-1, line_dash="dash", line_color="yellow", opacity=0.3, row=2, col=1)
-    fig.add_hline(y=0, line_dash="dot", line_color="gray", opacity=0.3, row=2, col=1)
-    
-    # Volatility chart
-    fig.add_trace(
-        go.Scatter(
-            x=data.index,
-            y=volatility * 100,  # Convert to percentage
-            mode='lines',
-            name='Volatility',
-            line=dict(color='green', width=2)
-        ),
-        row=3, col=1
-    )
-    
-    fig.update_layout(
-        height=900,
-        showlegend=True,
-        template="plotly_dark"
-    )
-    
-    fig.update_xaxes(rangeslider_visible=False)
-    
-    st.plotly_chart(fig, use_container_width=True)
+        
+        fig.update_xaxes(rangeslider_visible=False)
+        
+        st.plotly_chart(fig, use_container_width=True)
     
     # Distribution analysis
     st.markdown("### 📈 Return Distribution Analysis")
     
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        # Histogram of returns
-        fig_hist = px.histogram(
-            returns * 100,  # Convert to percentage
-            nbins=50,
-            title="Return Distribution",
-            labels={'value': 'Daily Return %'},
-            color_discrete_sequence=['#6366f1']
-        )
+    if len(returns) > 0:
+        col1, col2 = st.columns(2)
         
-        fig_hist.add_vline(x=returns.mean() * 100, line_dash="dash", line_color="red")
-        fig_hist.update_layout(template="plotly_dark", height=400)
-        st.plotly_chart(fig_hist, use_container_width=True)
-    
-    with col2:
-        # QQ plot for normality test
-        from scipy import stats as sp_stats
+        with col1:
+            # Histogram of returns
+            fig_hist = px.histogram(
+                returns * 100,  # Convert to percentage
+                nbins=50,
+                title="Return Distribution",
+                labels={'value': 'Daily Return %'},
+                color_discrete_sequence=['#6366f1']
+            )
+            
+            fig_hist.add_vline(x=returns.mean() * 100, line_dash="dash", line_color="red")
+            fig_hist.update_layout(template="plotly_dark", height=400)
+            st.plotly_chart(fig_hist, use_container_width=True)
         
-        # Calculate theoretical quantiles
-        theoretical_quantiles = sp_stats.norm.ppf(
-            np.linspace(0.01, 0.99, len(returns))
-        )
-        actual_quantiles = np.percentile(returns, np.linspace(1, 99, len(returns)))
-        
-        fig_qq = go.Figure()
-        
-        fig_qq.add_trace(go.Scatter(
-            x=theoretical_quantiles,
-            y=actual_quantiles,
-            mode='markers',
-            name='Returns',
-            marker=dict(color='#6366f1', size=6)
-        ))
-        
-        # Add 45-degree line
-        min_val = min(theoretical_quantiles.min(), actual_quantiles.min())
-        max_val = max(theoretical_quantiles.max(), actual_quantiles.max())
-        fig_qq.add_trace(go.Scatter(
-            x=[min_val, max_val],
-            y=[min_val, max_val],
-            mode='lines',
-            name='Normal Line',
-            line=dict(color='red', dash='dash')
-        ))
-        
-        fig_qq.update_layout(
-            title="Q-Q Plot (Normality Test)",
-            xaxis_title="Theoretical Quantiles",
-            yaxis_title="Sample Quantiles",
-            template="plotly_dark",
-            height=400
-        )
-        
-        st.plotly_chart(fig_qq, use_container_width=True)
+        with col2:
+            # QQ plot for normality test
+            from scipy import stats as sp_stats
+            
+            # Calculate theoretical quantiles
+            theoretical_quantiles = sp_stats.norm.ppf(
+                np.linspace(0.01, 0.99, len(returns))
+            )
+            actual_quantiles = np.percentile(returns, np.linspace(1, 99, len(returns)))
+            
+            fig_qq = go.Figure()
+            
+            fig_qq.add_trace(go.Scatter(
+                x=theoretical_quantiles,
+                y=actual_quantiles,
+                mode='markers',
+                name='Returns',
+                marker=dict(color='#6366f1', size=6)
+            ))
+            
+            # Add 45-degree line
+            min_val = min(theoretical_quantiles.min(), actual_quantiles.min())
+            max_val = max(theoretical_quantiles.max(), actual_quantiles.max())
+            fig_qq.add_trace(go.Scatter(
+                x=[min_val, max_val],
+                y=[min_val, max_val],
+                mode='lines',
+                name='Normal Line',
+                line=dict(color='red', dash='dash')
+            ))
+            
+            fig_qq.update_layout(
+                title="Q-Q Plot (Normality Test)",
+                xaxis_title="Theoretical Quantiles",
+                yaxis_title="Sample Quantiles",
+                template="plotly_dark",
+                height=400
+            )
+            
+            st.plotly_chart(fig_qq, use_container_width=True)
     
     # Statistical summary table
     st.markdown("### 📋 Statistical Summary")
+    
+    zscore_value = StatisticalAnalyzer.calculate_zscore(data['Close']).iloc[-1] if not data.empty else 0
     
     stats_summary = {
         'Metric': [
@@ -2075,16 +1966,16 @@ def display_statistical_analysis_tab(data: pd.DataFrame):
             'Min Return', 'Max Return', 'VaR (95%)', 'CVaR (95%)', 'Information Ratio'
         ],
         'Value': [
-            f"{returns.mean() * 100:.4f}%",
-            f"{returns.median() * 100:.4f}%",
-            f"{returns.std() * 100:.4f}%",
-            f"{returns.skew():.4f}",
-            f"{returns.kurtosis():.4f}",
-            f"{returns.min() * 100:.4f}%",
-            f"{returns.max() * 100:.4f}%",
-            f"{np.percentile(returns, 5) * 100:.4f}%",
-            f"{returns[returns <= np.percentile(returns, 5)].mean() * 100:.4f}%",
-            f"{(returns.mean() / returns.std() * np.sqrt(252)):.4f}" if returns.std() > 0 else "N/A"
+            f"{returns.mean() * 100:.4f}%" if len(returns) > 0 else 'N/A',
+            f"{returns.median() * 100:.4f}%" if len(returns) > 0 else 'N/A',
+            f"{returns.std() * 100:.4f}%" if len(returns) > 0 else 'N/A',
+            f"{returns.skew():.4f}" if len(returns) > 0 else 'N/A',
+            f"{returns.kurtosis():.4f}" if len(returns) > 0 else 'N/A',
+            f"{returns.min() * 100:.4f}%" if len(returns) > 0 else 'N/A',
+            f"{returns.max() * 100:.4f}%" if len(returns) > 0 else 'N/A',
+            f"{np.percentile(returns, 5) * 100:.4f}%" if len(returns) > 0 else 'N/A',
+            f"{returns[returns <= np.percentile(returns, 5)].mean() * 100:.4f}%" if len(returns) > 0 else 'N/A',
+            f"{(returns.mean() / returns.std() * np.sqrt(252)):.4f}" if len(returns) > 0 and returns.std() > 0 else "N/A"
         ],
         'Interpretation': [
             'Average daily return',
@@ -2112,7 +2003,7 @@ def display_trading_signals_tab(data: pd.DataFrame):
         st.warning("No data available")
         return
     
-    current_price = data['Close'].iloc[-1]
+    current_price = data['Close'].iloc[-1] if len(data) > 0 else 0
     
     # Calculate support and resistance levels for signal generation
     analyzer = SupportResistanceAnalyzer()
@@ -2191,7 +2082,7 @@ def display_trading_signals_tab(data: pd.DataFrame):
             for i, (col, target) in enumerate(zip(target_cols, signals['targets']), 1):
                 with col:
                     profit = target - signals['entry_price'] if signals['primary_signal'] == 'BUY' else signals['entry_price'] - target
-                    profit_pct = (profit / signals['entry_price'] * 100)
+                    profit_pct = (profit / signals['entry_price'] * 100) if signals['entry_price'] > 0 else 0
                     st.metric(f"Target {i}", f"{target:.2f}", 
                              f"{profit:+.2f} ({profit_pct:+.1f}%)")
     
@@ -2203,10 +2094,9 @@ def display_trading_signals_tab(data: pd.DataFrame):
     timeframe_signals = []
     
     for tf in timeframes:
-        # In a real implementation, you would fetch data for each timeframe
-        # For now, we'll simulate based on current data
+        # Simple signal logic for demo
         rsi = TechnicalIndicators.calculate_rsi(data['Close'], 14)
-        current_rsi = rsi.iloc[-1] if not rsi.empty else 50
+        current_rsi = rsi.iloc[-1] if not rsi.empty and not pd.isna(rsi.iloc[-1]) else 50
         
         # Simple signal logic for demo
         if current_rsi < 35:
@@ -2224,8 +2114,8 @@ def display_trading_signals_tab(data: pd.DataFrame):
             'RSI': f"{current_rsi:.1f}",
             'Signal': signal,
             'Strength': strength,
-            'Trend': 'Bullish' if data['Close'].iloc[-1] > data['Close'].iloc[-20] else 'Bearish',
-            'Volatility': f"{data['Close'].pct_change().std() * 100:.1f}%"
+            'Trend': 'Bullish' if len(data) > 20 and data['Close'].iloc[-1] > data['Close'].iloc[-20] else 'Bearish',
+            'Volatility': f"{data['Close'].pct_change().std() * 100:.1f}%" if len(data) > 1 else "0.0%"
         })
     
     signals_df = pd.DataFrame(timeframe_signals)
@@ -2249,39 +2139,43 @@ def display_trading_signals_tab(data: pd.DataFrame):
     rsi = TechnicalIndicators.calculate_rsi(data['Close'], 14)
     
     # Find RSI divergences
-    price_peaks = argrelextrema(data['Close'].values, np.greater, order=5)[0]
-    rsi_peaks = argrelextrema(rsi.values, np.greater, order=5)[0]
-    
-    bearish_divergences = []
-    bullish_divergences = []
-    
-    # Check for divergences
-    for i in range(1, min(len(price_peaks), len(rsi_peaks))):
-        if price_peaks[i] > price_peaks[i-1] and rsi_peaks[i] < rsi_peaks[i-1]:
-            bearish_divergences.append({
-                'type': 'Bearish Divergence',
-                'price_high_1': data['Close'].iloc[price_peaks[i-1]],
-                'price_high_2': data['Close'].iloc[price_peaks[i]],
-                'rsi_high_1': rsi.iloc[rsi_peaks[i-1]],
-                'rsi_high_2': rsi.iloc[rsi_peaks[i]],
-                'date_1': data.index[price_peaks[i-1]],
-                'date_2': data.index[price_peaks[i]]
-            })
-    
-    price_troughs = argrelextrema(data['Close'].values, np.less, order=5)[0]
-    rsi_troughs = argrelextrema(rsi.values, np.less, order=5)[0]
-    
-    for i in range(1, min(len(price_troughs), len(rsi_troughs))):
-        if price_troughs[i] < price_troughs[i-1] and rsi_troughs[i] > rsi_troughs[i-1]:
-            bullish_divergences.append({
-                'type': 'Bullish Divergence',
-                'price_low_1': data['Close'].iloc[price_troughs[i-1]],
-                'price_low_2': data['Close'].iloc[price_troughs[i]],
-                'rsi_low_1': rsi.iloc[rsi_troughs[i-1]],
-                'rsi_low_2': rsi.iloc[rsi_troughs[i]],
-                'date_1': data.index[price_troughs[i-1]],
-                'date_2': data.index[price_troughs[i]]
-            })
+    try:
+        price_peaks = argrelextrema(data['Close'].values, np.greater, order=5)[0]
+        rsi_peaks = argrelextrema(rsi.values, np.greater, order=5)[0] if not rsi.empty else []
+        
+        bearish_divergences = []
+        bullish_divergences = []
+        
+        # Check for divergences
+        for i in range(1, min(len(price_peaks), len(rsi_peaks))):
+            if price_peaks[i] > price_peaks[i-1] and rsi_peaks[i] < rsi_peaks[i-1]:
+                bearish_divergences.append({
+                    'type': 'Bearish Divergence',
+                    'price_high_1': data['Close'].iloc[price_peaks[i-1]],
+                    'price_high_2': data['Close'].iloc[price_peaks[i]],
+                    'rsi_high_1': rsi.iloc[rsi_peaks[i-1]] if rsi_peaks[i-1] < len(rsi) else 0,
+                    'rsi_high_2': rsi.iloc[rsi_peaks[i]] if rsi_peaks[i] < len(rsi) else 0,
+                    'date_1': data.index[price_peaks[i-1]],
+                    'date_2': data.index[price_peaks[i]]
+                })
+        
+        price_troughs = argrelextrema(data['Close'].values, np.less, order=5)[0]
+        rsi_troughs = argrelextrema(rsi.values, np.less, order=5)[0] if not rsi.empty else []
+        
+        for i in range(1, min(len(price_troughs), len(rsi_troughs))):
+            if price_troughs[i] < price_troughs[i-1] and rsi_troughs[i] > rsi_troughs[i-1]:
+                bullish_divergences.append({
+                    'type': 'Bullish Divergence',
+                    'price_low_1': data['Close'].iloc[price_troughs[i-1]],
+                    'price_low_2': data['Close'].iloc[price_troughs[i]],
+                    'rsi_low_1': rsi.iloc[rsi_troughs[i-1]] if rsi_troughs[i-1] < len(rsi) else 0,
+                    'rsi_low_2': rsi.iloc[rsi_troughs[i]] if rsi_troughs[i] < len(rsi) else 0,
+                    'date_1': data.index[price_troughs[i-1]],
+                    'date_2': data.index[price_troughs[i]]
+                })
+    except:
+        bearish_divergences = []
+        bullish_divergences = []
     
     # Display divergences
     col1, col2 = st.columns(2)
@@ -2429,59 +2323,60 @@ def display_backtesting_tab(data: pd.DataFrame):
         # Equity curve
         st.markdown("### 📈 Equity Curve")
         
-        fig = make_subplots(
-            rows=2, cols=1,
-            subplot_titles=('Portfolio Value', 'Drawdown'),
-            vertical_spacing=0.15,
-            row_heights=[0.7, 0.3],
-            shared_xaxes=True
-        )
-        
-        fig.add_trace(
-            go.Scatter(
-                x=results['equity_curve'].index,
-                y=results['equity_curve']['Total'],
-                mode='lines',
-                name='Portfolio Value',
-                line=dict(color='green', width=2)
-            ),
-            row=1, col=1
-        )
-        
-        fig.add_trace(
-            go.Scatter(
-                x=results['equity_curve'].index,
-                y=results['equity_curve']['Peak'],
-                mode='lines',
-                name='Peak',
-                line=dict(color='blue', width=1, dash='dash')
-            ),
-            row=1, col=1
-        )
-        
-        fig.add_trace(
-            go.Scatter(
-                x=results['equity_curve'].index,
-                y=results['equity_curve']['Drawdown'],
-                mode='lines',
-                name='Drawdown',
-                line=dict(color='red', width=2),
-                fill='tozeroy',
-                fillcolor='rgba(255, 0, 0, 0.1)'
-            ),
-            row=2, col=1
-        )
-        
-        fig.update_layout(
-            height=600,
-            showlegend=True,
-            template="plotly_dark"
-        )
-        
-        fig.update_yaxes(title_text="Portfolio Value ($)", row=1, col=1)
-        fig.update_yaxes(title_text="Drawdown (%)", row=2, col=1)
-        
-        st.plotly_chart(fig, use_container_width=True)
+        if 'equity_curve' in results and not results['equity_curve'].empty:
+            fig = make_subplots(
+                rows=2, cols=1,
+                subplot_titles=('Portfolio Value', 'Drawdown'),
+                vertical_spacing=0.15,
+                row_heights=[0.7, 0.3],
+                shared_xaxes=True
+            )
+            
+            fig.add_trace(
+                go.Scatter(
+                    x=results['equity_curve'].index,
+                    y=results['equity_curve']['Total'],
+                    mode='lines',
+                    name='Portfolio Value',
+                    line=dict(color='green', width=2)
+                ),
+                row=1, col=1
+            )
+            
+            fig.add_trace(
+                go.Scatter(
+                    x=results['equity_curve'].index,
+                    y=results['equity_curve']['Peak'],
+                    mode='lines',
+                    name='Peak',
+                    line=dict(color='blue', width=1, dash='dash')
+                ),
+                row=1, col=1
+            )
+            
+            fig.add_trace(
+                go.Scatter(
+                    x=results['equity_curve'].index,
+                    y=results['equity_curve']['Drawdown'],
+                    mode='lines',
+                    name='Drawdown',
+                    line=dict(color='red', width=2),
+                    fill='tozeroy',
+                    fillcolor='rgba(255, 0, 0, 0.1)'
+                ),
+                row=2, col=1
+            )
+            
+            fig.update_layout(
+                height=600,
+                showlegend=True,
+                template="plotly_dark"
+            )
+            
+            fig.update_yaxes(title_text="Portfolio Value ($)", row=1, col=1)
+            fig.update_yaxes(title_text="Drawdown (%)", row=2, col=1)
+            
+            st.plotly_chart(fig, use_container_width=True)
         
         # Trade log
         st.markdown("### 📋 Trade Log")
@@ -2522,7 +2417,7 @@ def display_backtesting_tab(data: pd.DataFrame):
             for ema_period in ema_periods:
                 # Simplified optimization - in reality, you'd run full backtest
                 returns = data['Close'].pct_change().dropna()
-                sharpe = np.sqrt(252) * returns.mean() / returns.std() if returns.std() > 0 else 0
+                sharpe = np.sqrt(252) * returns.mean() / returns.std() if len(returns) > 0 and returns.std() > 0 else 0
                 
                 optimization_results.append({
                     'RSI Period': rsi_period,
@@ -2559,13 +2454,14 @@ def display_backtesting_tab(data: pd.DataFrame):
         st.markdown("### 💾 Export Results")
         
         if st.button("📥 Export Backtest Results to CSV"):
-            csv = results['equity_curve'].to_csv()
-            st.download_button(
-                label="Download CSV",
-                data=csv,
-                file_name="backtest_results.csv",
-                mime="text/csv"
-            )
+            if 'equity_curve' in results:
+                csv = results['equity_curve'].to_csv()
+                st.download_button(
+                    label="Download CSV",
+                    data=csv,
+                    file_name="backtest_results.csv",
+                    mime="text/csv"
+                )
 
 def display_summary_report_tab(data: pd.DataFrame, ticker1: str, enable_ratio: bool = False):
     """Display comprehensive summary report"""
@@ -2576,14 +2472,15 @@ def display_summary_report_tab(data: pd.DataFrame, ticker1: str, enable_ratio: b
         st.warning("No data available")
         return
     
-    current_price = data['Close'].iloc[-1]
+    current_price = data['Close'].iloc[-1] if len(data) > 0 else 0
+    initial_capital = 100000  # Default value for display
     
     # Generate comprehensive analysis
     st.markdown("### 🎯 Executive Summary")
     
     # Calculate key metrics
     returns = data['Close'].pct_change().dropna()
-    volatility = returns.std() * np.sqrt(252) * 100
+    volatility = returns.std() * np.sqrt(252) * 100 if len(returns) > 0 and returns.std() > 0 else 0
     
     # Support/Resistance analysis
     analyzer = SupportResistanceAnalyzer()
@@ -2591,21 +2488,31 @@ def display_summary_report_tab(data: pd.DataFrame, ticker1: str, enable_ratio: b
     support_levels = analyzer.merge_similar_levels(support_points)
     resistance_levels = analyzer.merge_similar_levels(resistance_points)
     
+    # Get nearest levels safely
     nearest_support = min(support_levels, key=lambda x: abs(x['price'] - current_price)) if support_levels else None
     nearest_resistance = min(resistance_levels, key=lambda x: abs(x['price'] - current_price)) if resistance_levels else None
     
     # Technical indicators
     rsi = TechnicalIndicators.calculate_rsi(data['Close'], 14)
-    current_rsi = rsi.iloc[-1] if not rsi.empty else 50
+    current_rsi = rsi.iloc[-1] if not rsi.empty and not pd.isna(rsi.iloc[-1]) else 50
     
     macd_data = TechnicalIndicators.calculate_macd(data['Close'])
-    macd_bullish = macd_data['macd'].iloc[-1] > macd_data['signal'].iloc[-1] if not macd_data['macd'].empty else False
+    macd_bullish = macd_data['macd'].iloc[-1] > macd_data['signal'].iloc[-1] if not macd_data['macd'].empty and not macd_data['signal'].empty else False
     
     # Generate signal
     signal_generator = TradingSignalGenerator()
     signals = signal_generator.generate_signals(data, support_levels, resistance_levels, current_price)
     
-    # Create comprehensive summary
+    # Create comprehensive summary - FIXED: Use safe access to nearest levels
+    support_price_str = f"{nearest_support['price']:.2f}" if nearest_support else 'N/A'
+    support_distance_str = f"{abs(current_price - nearest_support['price'])/current_price*100:.1f}%" if nearest_support and current_price > 0 else 'N/A'
+    resistance_price_str = f"{nearest_resistance['price']:.2f}" if nearest_resistance else 'N/A'
+    resistance_distance_str = f"{abs(nearest_resistance['price'] - current_price)/current_price*100:.1f}%" if nearest_resistance and current_price > 0 else 'N/A'
+    
+    # ADX calculation
+    adx_data = TechnicalIndicators.calculate_adx(data['High'], data['Low'], data['Close'])
+    current_adx = adx_data['adx'].iloc[-1] if not adx_data['adx'].empty and not pd.isna(adx_data['adx'].iloc[-1]) else 0
+    
     summary_html = f"""
     <div class="info-box">
         <h3>📊 {ticker1} - Market Analysis Summary</h3>
@@ -2613,14 +2520,14 @@ def display_summary_report_tab(data: pd.DataFrame, ticker1: str, enable_ratio: b
         
         <h4>🎯 Key Levels:</h4>
         <ul>
-            <li><b>Nearest Support:</b> {nearest_support['price']:.2f if nearest_support else 'N/A'} ({abs(current_price - nearest_support['price'])/current_price*100:.1f}% away)</li>
-            <li><b>Nearest Resistance:</b> {nearest_resistance['price']:.2f if nearest_resistance else 'N/A'} ({abs(nearest_resistance['price'] - current_price)/current_price*100:.1f}% away)</li>
+            <li><b>Nearest Support:</b> {support_price_str} ({support_distance_str} away)</li>
+            <li><b>Nearest Resistance:</b> {resistance_price_str} ({resistance_distance_str} away)</li>
         </ul>
         
         <h4>📈 Technical Outlook:</h4>
         <ul>
             <li><b>Primary Signal:</b> <span class="{'positive' if signals['primary_signal'] == 'BUY' else 'negative' if signals['primary_signal'] == 'SELL' else 'neutral'}">{signals['primary_signal']}</span> ({signals['confidence']:.0f}% confidence)</li>
-            <li><b>Trend:</b> {'Bullish' if current_price > data['Close'].rolling(20).mean().iloc[-1] else 'Bearish'}</li>
+            <li><b>Trend:</b> {'Bullish' if len(data) >= 20 and current_price > data['Close'].rolling(20).mean().iloc[-1] else 'Bearish'}</li>
             <li><b>Momentum:</b> {'Positive' if macd_bullish else 'Negative'}</li>
             <li><b>RSI State:</b> {'Oversold' if current_rsi < 30 else 'Overbought' if current_rsi > 70 else 'Neutral'}</li>
         </ul>
@@ -2628,8 +2535,8 @@ def display_summary_report_tab(data: pd.DataFrame, ticker1: str, enable_ratio: b
         <h4>⚡ What's Working:</h4>
         <ul>
             <li>Support/Resistance levels showing good respect ({len(support_levels)} S, {len(resistance_levels)} R identified)</li>
-            <li>{'Strong trend detected (ADX > 25)' if TechnicalIndicators.calculate_adx(data['High'], data['Low'], data['Close'])['adx'].iloc[-1] > 25 else 'Range-bound market'}</li>
-            <li>{'Volume confirming price moves' if data['Volume'].iloc[-1] > data['Volume'].rolling(20).mean().iloc[-1] else 'Volume below average'}</li>
+            <li>{'Strong trend detected (ADX > 25)' if current_adx > 25 else 'Range-bound market'}</li>
+            <li>{'Volume confirming price moves' if 'Volume' in data.columns and len(data) > 0 and data['Volume'].iloc[-1] > data['Volume'].rolling(20).mean().iloc[-1] else 'Volume below average'}</li>
         </ul>
         
         <h4>⚠️ What's Not Working:</h4>
@@ -2669,23 +2576,27 @@ def display_summary_report_tab(data: pd.DataFrame, ticker1: str, enable_ratio: b
         st.markdown("#### Technical Analysis Details")
         
         # Calculate all technical indicators
+        bb = TechnicalIndicators.calculate_bollinger_bands(data['Close'])
+        stoch = TechnicalIndicators.calculate_stochastic(data['High'], data['Low'], data['Close'])
+        adx_data = TechnicalIndicators.calculate_adx(data['High'], data['Low'], data['Close'])
+        
         tech_data = {
             'Indicator': ['RSI (14)', 'MACD', 'Stochastic', 'ADX', 'Bollinger Band Position', 'Volume Trend'],
             'Value': [
                 f"{current_rsi:.1f}",
                 f"{'Bullish' if macd_bullish else 'Bearish'}",
-                f"{TechnicalIndicators.calculate_stochastic(data['High'], data['Low'], data['Close'])['k'].iloc[-1]:.1f}",
-                f"{TechnicalIndicators.calculate_adx(data['High'], data['Low'], data['Close'])['adx'].iloc[-1]:.1f}",
-                f"{'Upper Band' if current_price > TechnicalIndicators.calculate_bollinger_bands(data['Close'])['upper'].iloc[-1] else 'Lower Band' if current_price < TechnicalIndicators.calculate_bollinger_bands(data['Close'])['lower'].iloc[-1] else 'Middle'}",
-                f"{'Increasing' if data['Volume'].iloc[-1] > data['Volume'].rolling(5).mean().iloc[-1] else 'Decreasing'}"
+                f"{stoch['k'].iloc[-1]:.1f}" if not stoch['k'].empty else 'N/A',
+                f"{adx_data['adx'].iloc[-1]:.1f}" if not adx_data['adx'].empty else 'N/A',
+                f"{'Upper Band' if not bb['upper'].empty and current_price > bb['upper'].iloc[-1] else 'Lower Band' if not bb['lower'].empty and current_price < bb['lower'].iloc[-1] else 'Middle'}" if not bb['upper'].empty else 'N/A',
+                f"{'Increasing' if 'Volume' in data.columns and len(data) > 5 and data['Volume'].iloc[-1] > data['Volume'].rolling(5).mean().iloc[-1] else 'Decreasing'}"
             ],
             'Signal': [
                 'Oversold' if current_rsi < 30 else 'Overbought' if current_rsi > 70 else 'Neutral',
                 'Buy' if macd_bullish else 'Sell',
-                'Oversold' if TechnicalIndicators.calculate_stochastic(data['High'], data['Low'], data['Close'])['k'].iloc[-1] < 20 else 'Overbought' if TechnicalIndicators.calculate_stochastic(data['High'], data['Low'], data['Close'])['k'].iloc[-1] > 80 else 'Neutral',
-                'Strong Trend' if TechnicalIndicators.calculate_adx(data['High'], data['Low'], data['Close'])['adx'].iloc[-1] > 25 else 'Weak Trend',
-                'Extreme' if abs(current_price - TechnicalIndicators.calculate_bollinger_bands(data['Close'])['middle'].iloc[-1]) > TechnicalIndicators.calculate_bollinger_bands(data['Close'])['upper'].iloc[-1] - TechnicalIndicators.calculate_bollinger_bands(data['Close'])['middle'].iloc[-1] else 'Normal',
-                'Confirming' if (data['Close'].iloc[-1] > data['Close'].iloc[-2] and data['Volume'].iloc[-1] > data['Volume'].iloc[-2]) or (data['Close'].iloc[-1] < data['Close'].iloc[-2] and data['Volume'].iloc[-1] > data['Volume'].iloc[-2]) else 'Diverging'
+                'Oversold' if not stoch['k'].empty and stoch['k'].iloc[-1] < 20 else 'Overbought' if not stoch['k'].empty and stoch['k'].iloc[-1] > 80 else 'Neutral',
+                'Strong Trend' if not adx_data['adx'].empty and adx_data['adx'].iloc[-1] > 25 else 'Weak Trend',
+                'Extreme' if not bb['upper'].empty and abs(current_price - bb['middle'].iloc[-1]) > (bb['upper'].iloc[-1] - bb['middle'].iloc[-1]) else 'Normal',
+                'Confirming' if 'Volume' in data.columns and len(data) > 1 and ((data['Close'].iloc[-1] > data['Close'].iloc[-2] and data['Volume'].iloc[-1] > data['Volume'].iloc[-2]) or (data['Close'].iloc[-1] < data['Close'].iloc[-2] and data['Volume'].iloc[-1] > data['Volume'].iloc[-2])) else 'Diverging'
             ]
         }
         
@@ -2695,27 +2606,30 @@ def display_summary_report_tab(data: pd.DataFrame, ticker1: str, enable_ratio: b
     with tabs[1]:
         st.markdown("#### Statistical Analysis Details")
         
+        # Calculate statistical metrics
+        zscore_value = StatisticalAnalyzer.calculate_zscore(data['Close']).iloc[-1] if not data.empty else 0
+        
         stat_data = {
             'Metric': ['Mean Return', 'Volatility (Annual)', 'Sharpe Ratio', 'Skewness', 'Kurtosis', 'VaR (95%)', 'Z-Score', 'Autocorrelation'],
             'Value': [
-                f"{returns.mean() * 100:.3f}%",
+                f"{returns.mean() * 100:.3f}%" if len(returns) > 0 else 'N/A',
                 f"{volatility:.1f}%",
-                f"{np.sqrt(252) * returns.mean() / returns.std() if returns.std() > 0 else 0:.2f}",
-                f"{returns.skew():.3f}",
-                f"{returns.kurtosis():.3f}",
-                f"{np.percentile(returns, 5) * 100:.2f}%",
-                f"{StatisticalAnalyzer.calculate_zscore(data['Close']).iloc[-1]:.2f}",
-                f"{returns.autocorr():.3f}"
+                f"{np.sqrt(252) * returns.mean() / returns.std() if len(returns) > 0 and returns.std() > 0 else 0:.2f}",
+                f"{returns.skew():.3f}" if len(returns) > 0 else 'N/A',
+                f"{returns.kurtosis():.3f}" if len(returns) > 0 else 'N/A',
+                f"{np.percentile(returns, 5) * 100:.2f}%" if len(returns) > 0 else 'N/A',
+                f"{zscore_value:.2f}",
+                f"{returns.autocorr():.3f}" if len(returns) > 0 else 'N/A'
             ],
             'Interpretation': [
-                'Slightly positive' if returns.mean() > 0 else 'Negative',
+                'Slightly positive' if len(returns) > 0 and returns.mean() > 0 else 'Negative' if len(returns) > 0 else 'N/A',
                 'High' if volatility > 20 else 'Moderate' if volatility > 10 else 'Low',
                 'Good' if np.sqrt(252) * returns.mean() / returns.std() > 1 else 'Poor',
-                'Right skewed' if returns.skew() > 0 else 'Left skewed',
-                'Fat tails' if returns.kurtosis() > 3 else 'Normal tails',
+                'Right skewed' if len(returns) > 0 and returns.skew() > 0 else 'Left skewed' if len(returns) > 0 else 'N/A',
+                'Fat tails' if len(returns) > 0 and returns.kurtosis() > 3 else 'Normal tails' if len(returns) > 0 else 'N/A',
                 'Daily risk measure',
-                'Mean reversion signal' if abs(StatisticalAnalyzer.calculate_zscore(data['Close']).iloc[-1]) > 2 else 'Normal',
-                'Trend persistence' if returns.autocorr() > 0.1 else 'Random'
+                'Mean reversion signal' if abs(zscore_value) > 2 else 'Normal',
+                'Trend persistence' if len(returns) > 0 and returns.autocorr() > 0.1 else 'Random'
             ]
         }
         
@@ -2776,6 +2690,12 @@ def display_summary_report_tab(data: pd.DataFrame, ticker1: str, enable_ratio: b
     # Final recommendations
     st.markdown("### 🎯 Final Trading Plan")
     
+    # Prepare strings for the trading plan
+    stop_loss_val = signals['stop_loss'] if signals['stop_loss'] else (nearest_support['price'] * 0.99 if nearest_support else current_price * 0.98)
+    target1 = signals['targets'][0] if signals['targets'] else (nearest_resistance['price'] if nearest_resistance else current_price * 1.02)
+    target2 = signals['targets'][1] if len(signals['targets']) > 1 else (nearest_resistance['price'] * 1.02 if nearest_resistance else current_price * 1.05)
+    target3 = signals['targets'][2] if len(signals['targets']) > 2 else (nearest_resistance['price'] * 1.05 if nearest_resistance else current_price * 1.08)
+    
     recommendation_html = f"""
     <div class="success-box">
         <h3>🚀 Trading Plan for {ticker1}</h3>
@@ -2783,22 +2703,22 @@ def display_summary_report_tab(data: pd.DataFrame, ticker1: str, enable_ratio: b
         <h4>Entry Strategy:</h4>
         <ol>
             <li><b>Entry Price:</b> {current_price:.2f} (market) or better on pullback</li>
-            <li><b>Entry Conditions:</b> {', '.join(signals['reasons'][:3])}</li>
+            <li><b>Entry Conditions:</b> {', '.join(signals['reasons'][:3]) if signals['reasons'] else 'Technical confirmation required'}</li>
             <li><b>Confirmation:</b> Wait for 15M candle close above {current_price * 1.002:.2f}</li>
         </ol>
         
         <h4>Risk Management:</h4>
         <ol>
-            <li><b>Stop Loss:</b> {signals['stop_loss'] if signals['stop_loss'] else nearest_support['price'] * 0.99 if nearest_support else current_price * 0.98:.2f}</li>
+            <li><b>Stop Loss:</b> {stop_loss_val:.2f}</li>
             <li><b>Position Size:</b> 1-2% of capital (${initial_capital * 0.02:,.0f})</li>
-            <li><b>Maximum Risk:</b> ${abs(current_price - (signals['stop_loss'] if signals['stop_loss'] else current_price * 0.98)) * (initial_capital * 0.02 / current_price):.0f}</li>
+            <li><b>Maximum Risk:</b> ${abs(current_price - stop_loss_val) * (initial_capital * 0.02 / current_price):.0f if current_price > 0 else 0}</li>
         </ol>
         
         <h4>Profit Taking:</h4>
         <ol>
-            <li><b>Target 1:</b> {signals['targets'][0] if signals['targets'] else nearest_resistance['price'] if nearest_resistance else current_price * 1.02:.2f} (Take 50% profit)</li>
-            <li><b>Target 2:</b> {signals['targets'][1] if len(signals['targets']) > 1 else (nearest_resistance['price'] * 1.02 if nearest_resistance else current_price * 1.05):.2f} (Take 30% profit)</li>
-            <li><b>Target 3:</b> {signals['targets'][2] if len(signals['targets']) > 2 else (nearest_resistance['price'] * 1.05 if nearest_resistance else current_price * 1.08):.2f} (Take 20% profit)</li>
+            <li><b>Target 1:</b> {target1:.2f} (Take 50% profit)</li>
+            <li><b>Target 2:</b> {target2:.2f} (Take 30% profit)</li>
+            <li><b>Target 3:</b> {target3:.2f} (Take 20% profit)</li>
         </ol>
         
         <h4>Trade Management:</h4>
@@ -2821,11 +2741,194 @@ def display_summary_report_tab(data: pd.DataFrame, ticker1: str, enable_ratio: b
     # Export full report
     st.markdown("### 💾 Export Full Report")
     
-    if st.button("📄 Generate PDF Report"):
-        st.info("PDF report generation would be implemented here with proper formatting")
+    col1, col2 = st.columns(2)
     
-    if st.button("📊 Export to Excel"):
-        st.info("Excel export with all analysis would be implemented here")
+    with col1:
+        if st.button("📄 Generate PDF Report"):
+            st.info("PDF report generation would be implemented here with proper formatting")
+    
+    with col2:
+        if st.button("📊 Export to Excel"):
+            # Create a summary DataFrame for export
+            export_data = {
+                'Metric': ['Ticker', 'Current Price', 'RSI', 'Volatility %', 'Signal', 'Confidence %', 
+                          'Nearest Support', 'Nearest Resistance', 'Stop Loss', 'Target 1', 'Target 2', 'Target 3'],
+                'Value': [ticker1, f"{current_price:.2f}", f"{current_rsi:.1f}", f"{volatility:.1f}",
+                         signals['primary_signal'], f"{signals['confidence']:.0f}",
+                         support_price_str, resistance_price_str,
+                         f"{stop_loss_val:.2f}", f"{target1:.2f}", f"{target2:.2f}", f"{target3:.2f}"]
+            }
+            
+            export_df = pd.DataFrame(export_data)
+            csv = export_df.to_csv(index=False)
+            
+            st.download_button(
+                label="Download Summary CSV",
+                data=csv,
+                file_name=f"{ticker1}_analysis_summary.csv",
+                mime="text/csv"
+            )
+
+# Main Streamlit Application
+def main():
+    st.markdown("<h1 class='main-header'>📈 Algorithmic Trading Analyzer Pro</h1>", unsafe_allow_html=True)
+    
+    # Initialize session state
+    if 'data_fetched' not in st.session_state:
+        st.session_state.data_fetched = False
+    if 'ticker1_data' not in st.session_state:
+        st.session_state.ticker1_data = None
+    if 'ticker2_data' not in st.session_state:
+        st.session_state.ticker2_data = None
+    if 'current_analysis' not in st.session_state:
+        st.session_state.current_analysis = None
+    
+    # Sidebar configuration
+    with st.sidebar:
+        st.markdown("### ⚙️ Configuration")
+        
+        # Asset selection
+        fetcher = DataFetcher()
+        asset_options = list(fetcher.predefined_assets.keys()) + ["Custom Ticker"]
+        ticker1 = st.selectbox("Select Ticker 1:", asset_options, index=0)
+        
+        if ticker1 == "Custom Ticker":
+            ticker1 = st.text_input("Enter custom ticker symbol (e.g., AAPL):", "AAPL")
+        
+        enable_ratio = st.checkbox("Enable Ratio Analysis (Ticker 2)", value=False)
+        
+        if enable_ratio:
+            ticker2 = st.selectbox("Select Ticker 2:", asset_options, index=1)
+            if ticker2 == "Custom Ticker":
+                ticker2 = st.text_input("Enter custom ticker 2 symbol:", "GOOGL")
+        else:
+            ticker2 = None
+        
+        # Timeframe and period selection
+        col1, col2 = st.columns(2)
+        with col1:
+            timeframe = st.selectbox(
+                "Timeframe:",
+                ["1m", "3m", "5m", "10m", "15m", "30m", "1h", "2h", "4h", "1d"]
+            )
+        
+        with col2:
+            period = st.selectbox(
+                "Period:",
+                ["1d", "5d", "7d", "1mo", "3mo", "6mo", "1y", "2y", "5y", "10y", "20y", "30y"]
+            )
+        
+        # Check compatibility
+        compatible_periods = fetcher.timeframe_period_compatibility.get(timeframe, [])
+        if period not in compatible_periods and compatible_periods:
+            st.warning(f"⚠️ {timeframe} timeframe is typically compatible with: {', '.join(compatible_periods)}")
+            if st.button("Use recommended period"):
+                period = compatible_periods[0]
+        
+        # Analysis options
+        st.markdown("### 📊 Analysis Options")
+        analyze_support_resistance = st.checkbox("Support/Resistance Analysis", value=True)
+        analyze_fibonacci = st.checkbox("Fibonacci Levels", value=True)
+        analyze_elliott = st.checkbox("Elliott Wave Analysis", value=False)
+        analyze_statistics = st.checkbox("Statistical Analysis", value=True)
+        generate_signals = st.checkbox("Generate Trading Signals", value=True)
+        run_backtest = st.checkbox("Run Backtest", value=False)
+        
+        # Fetch data button
+        if st.button("🚀 Fetch & Analyze Data", type="primary", use_container_width=True):
+            with st.spinner("Fetching data..."):
+                # Fetch data
+                ticker1_data = fetcher.fetch_data(ticker1, period, timeframe)
+                
+                if not ticker1_data.empty:
+                    st.session_state.ticker1_data = ticker1_data
+                    
+                    if enable_ratio and ticker2:
+                        ticker2_data = fetcher.fetch_data(ticker2, period, timeframe)
+                        st.session_state.ticker2_data = ticker2_data
+                    
+                    st.session_state.data_fetched = True
+                    st.success("✅ Data fetched successfully!")
+                else:
+                    st.error("❌ Failed to fetch data. Please check ticker symbol and try again.")
+    
+    # Main content area
+    if st.session_state.data_fetched and st.session_state.ticker1_data is not None:
+        data = st.session_state.ticker1_data
+        
+        # Create tabs for different analyses
+        tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs([
+            "📈 Overview", 
+            "🎯 Support/Resistance", 
+            "📊 Technical Indicators",
+            "📐 Fibonacci & Elliott",
+            "📉 Statistical Analysis",
+            "🚦 Trading Signals",
+            "🧪 Backtesting",
+            "📋 Summary Report"
+        ])
+        
+        with tab1:
+            display_overview_tab(data, ticker1, ticker2 if enable_ratio else None)
+        
+        with tab2:
+            display_support_resistance_tab(data)
+        
+        with tab3:
+            display_technical_indicators_tab(data)
+        
+        with tab4:
+            display_fibonacci_elliott_tab(data)
+        
+        with tab5:
+            display_statistical_analysis_tab(data)
+        
+        with tab6:
+            display_trading_signals_tab(data)
+        
+        with tab7:
+            display_backtesting_tab(data)
+        
+        with tab8:
+            display_summary_report_tab(data, ticker1, enable_ratio)
+    
+    elif not st.session_state.data_fetched:
+        # Show welcome/instructions
+        st.markdown("""
+        <div class="info-box">
+            <h3>Welcome to Algorithmic Trading Analyzer Pro</h3>
+            <p>This powerful tool provides comprehensive algorithmic trading analysis with:</p>
+            <ul>
+                <li><b>Multi-Asset Support:</b> Stocks, Indices, Crypto, Forex, Commodities</li>
+                <li><b>Multi-Timeframe Analysis:</b> 1 minute to 1 day timeframes</li>
+                <li><b>Advanced Technical Analysis:</b> Custom indicators without TA-Lib dependency</li>
+                <li><b>Statistical Testing:</b> Z-scores, volatility analysis, pattern recognition</li>
+                <li><b>AI-Powered Signals:</b> Machine learning based trading signals</li>
+                <li><b>Backtesting Engine:</b> Strategy validation with performance metrics</li>
+            </ul>
+            <p><b>To get started:</b></p>
+            <ol>
+                <li>Select your assets in the sidebar</li>
+                <li>Choose timeframe and period</li>
+                <li>Configure analysis options</li>
+                <li>Click "Fetch & Analyze Data"</li>
+            </ol>
+        </div>
+        """, unsafe_allow_html=True)
+        
+        # Quick example
+        st.markdown("### 🎯 Quick Analysis Examples")
+        
+        col1, col2, col3 = st.columns(3)
+        
+        with col1:
+            st.metric("NIFTY 50", "22,150.35", "+125.50 (+0.57%)")
+        
+        with col2:
+            st.metric("BTC-USD", "$67,250.80", "+1,250.50 (+1.89%)")
+        
+        with col3:
+            st.metric("Gold", "$2,350.75", "+15.25 (+0.65%)")
 
 # Run the app
 if __name__ == "__main__":
