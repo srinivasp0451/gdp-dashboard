@@ -333,7 +333,7 @@ def backtest_strategy(data, strategy_type='rsi_ema', timeframe='', period=''):
     df = data.copy()
     
     if len(df) < 60:
-        return pd.DataFrame(), 0, 0, strategy_type, timeframe, period
+        return pd.DataFrame(), 0, 0
     
     df['RSI'] = calculate_rsi(df['Close'])
     df['EMA_9'] = calculate_ema(df['Close'], 9)
@@ -341,6 +341,21 @@ def backtest_strategy(data, strategy_type='rsi_ema', timeframe='', period=''):
     df['EMA_50'] = calculate_ema(df['Close'], 50)
     df['Returns'] = df['Close'].pct_change()
     df['Volatility'] = df['Returns'].rolling(20).std()
+    
+    # Calculate average true range for dynamic stop loss
+    df['ATR'] = (df['High'] - df['Low']).rolling(14).mean()
+    avg_price = df['Close'].mean()
+    
+    # Adjust stop loss and target based on price level and volatility
+    if avg_price > 20000:  # NIFTY/SENSEX level
+        base_sl_pct = 0.015  # 1.5%
+        base_target_pct = 0.025  # 2.5%
+    elif avg_price > 1000:  # Bank NIFTY or stock level
+        base_sl_pct = 0.02
+        base_target_pct = 0.03
+    else:  # Other assets
+        base_sl_pct = 0.025
+        base_target_pct = 0.04
     
     trades = []
     position = None
@@ -353,16 +368,16 @@ def backtest_strategy(data, strategy_type='rsi_ema', timeframe='', period=''):
         if position is None:
             entry_signal = False
             reason = ""
-            sl_pct = 0.03
-            target_pct = 0.05
+            sl_pct = base_sl_pct
+            target_pct = base_target_pct
             
             # Strategy 1: RSI + EMA
             if strategy_type == 'rsi_ema':
                 if current_rsi < 40 and df['Close'].iloc[i] > df['EMA_20'].iloc[i]:
                     entry_signal = True
                     reason = f'RSI Oversold ({current_rsi:.1f}) + Price > 20EMA'
-                    sl_pct = 0.025
-                    target_pct = 0.045
+                    sl_pct = base_sl_pct
+                    target_pct = base_target_pct
             
             # Strategy 2: EMA Crossover
             elif strategy_type == 'ema_crossover':
@@ -370,8 +385,8 @@ def backtest_strategy(data, strategy_type='rsi_ema', timeframe='', period=''):
                     df['EMA_9'].iloc[i-1] <= df['EMA_20'].iloc[i-1]):
                     entry_signal = True
                     reason = '9 EMA crossed above 20 EMA (Bullish)'
-                    sl_pct = 0.02
-                    target_pct = 0.04
+                    sl_pct = base_sl_pct * 0.8
+                    target_pct = base_target_pct * 0.9
             
             # Strategy 3: Volatility Breakout
             elif strategy_type == 'volatility_breakout':
@@ -380,8 +395,8 @@ def backtest_strategy(data, strategy_type='rsi_ema', timeframe='', period=''):
                     if df['Close'].iloc[i] > df['Close'].iloc[i-1]:
                         entry_signal = True
                         reason = f'High Volatility Breakout ({df["Volatility"].iloc[i]*100:.2f}%)'
-                        sl_pct = 0.035
-                        target_pct = 0.06
+                        sl_pct = base_sl_pct * 1.2
+                        target_pct = base_target_pct * 1.5
             
             # Strategy 4: Support Bounce
             elif strategy_type == 'support_bounce':
@@ -392,8 +407,8 @@ def backtest_strategy(data, strategy_type='rsi_ema', timeframe='', period=''):
                     if nearby_support:
                         entry_signal = True
                         reason = f'Bouncing from Support at ₹{nearby_support[0]["price"]:.2f}'
-                        sl_pct = 0.02
-                        target_pct = 0.04
+                        sl_pct = base_sl_pct * 0.9
+                        target_pct = base_target_pct
             
             # Strategy 5: RSI Divergence
             elif strategy_type == 'rsi_divergence':
@@ -403,8 +418,8 @@ def backtest_strategy(data, strategy_type='rsi_ema', timeframe='', period=''):
                     if active_bull and current_rsi < 45:
                         entry_signal = True
                         reason = 'Bullish RSI Divergence Detected'
-                        sl_pct = 0.025
-                        target_pct = 0.05
+                        sl_pct = base_sl_pct
+                        target_pct = base_target_pct * 1.2
             
             # Strategy 6: 9 EMA Pullback
             elif strategy_type == 'ema_pullback':
@@ -414,8 +429,8 @@ def backtest_strategy(data, strategy_type='rsi_ema', timeframe='', period=''):
                     current_rsi > 40 and current_rsi < 60):
                     entry_signal = True
                     reason = 'Pullback to 9 EMA in Uptrend'
-                    sl_pct = 0.02
-                    target_pct = 0.045
+                    sl_pct = base_sl_pct * 0.85
+                    target_pct = base_target_pct
             
             # Strategy 7: Z-Score Mean Reversion
             elif strategy_type == 'zscore_reversion':
@@ -425,8 +440,8 @@ def backtest_strategy(data, strategy_type='rsi_ema', timeframe='', period=''):
                     if zscore < -1.5 and current_rsi < 40:
                         entry_signal = True
                         reason = f'Z-Score Mean Reversion ({zscore:.2f})'
-                        sl_pct = 0.025
-                        target_pct = 0.045
+                        sl_pct = base_sl_pct
+                        target_pct = base_target_pct
             
             # Strategy 8: Price Action
             elif strategy_type == 'price_action':
@@ -438,8 +453,8 @@ def backtest_strategy(data, strategy_type='rsi_ema', timeframe='', period=''):
                     df['Close'].iloc[i] > df['EMA_20'].iloc[i]):
                     entry_signal = True
                     reason = 'Bullish Engulfing Pattern + Above 20 EMA'
-                    sl_pct = 0.02
-                    target_pct = 0.04
+                    sl_pct = base_sl_pct * 0.9
+                    target_pct = base_target_pct
             
             if entry_signal:
                 sl = current_price * (1 - sl_pct)
@@ -491,26 +506,47 @@ def backtest_strategy(data, strategy_type='rsi_ema', timeframe='', period=''):
         trades_df = pd.DataFrame(trades)
         total_pnl = trades_df['PnL_%'].sum()
         win_rate = len(trades_df[trades_df['PnL_%'] > 0]) / len(trades_df) * 100
-        return trades_df, total_pnl, win_rate, strategy_type, timeframe, period
+        return trades_df, total_pnl, win_rate
     
-    return pd.DataFrame(), 0, 0, strategy_type, timeframe, period
+    return pd.DataFrame(), 0, 0
 
 def fetch_multi_timeframe_data(ticker, progress_placeholder):
-    """Fetch data across all valid timeframes"""
+    """Fetch data across carefully selected timeframes"""
     all_data = {}
     
-    total_combinations = sum(len(periods) for periods in VALID_COMBINATIONS.values())
-    current = 0
+    # Carefully selected timeframe-period combinations for comprehensive analysis
+    combinations = [
+        ('1m', '1d'),
+        ('1m', '5d'),
+        ('5m', '1d'),
+        ('5m', '1mo'),
+        ('15m', '1d'),
+        ('15m', '1mo'),
+        ('30m', '1d'),
+        ('30m', '1mo'),
+        ('1h', '1mo'),
+        ('1h', '3mo'),
+        ('1d', '1mo'),
+        ('1d', '3mo'),
+        ('1d', '6mo'),
+        ('1d', '1y'),
+        ('1d', '2y'),
+        ('1d', '5y'),
+        ('1d', '10y'),
+        ('1wk', '1y'),
+        ('1wk', '2y'),
+        ('1wk', '5y')
+    ]
     
-    for timeframe, periods in VALID_COMBINATIONS.items():
-        for period in periods[:2]:  # Limit to 2 periods per timeframe for speed
-            current += 1
-            progress = current / total_combinations
-            progress_placeholder.progress(progress, text=f"Fetching {timeframe}/{period}... ({current}/{total_combinations})")
-            
-            data = fetch_data(ticker, period, timeframe)
-            if data is not None and not data.empty:
-                all_data[f"{timeframe}_{period}"] = data
+    total = len(combinations)
+    
+    for idx, (timeframe, period) in enumerate(combinations):
+        progress = (idx + 1) / total
+        progress_placeholder.progress(progress, text=f"Fetching {timeframe}/{period}... ({idx+1}/{total})")
+        
+        data = fetch_data(ticker, period, timeframe)
+        if data is not None and not data.empty and len(data) > 30:
+            all_data[f"{timeframe}_{period}"] = data
     
     return all_data
 
@@ -686,7 +722,21 @@ def main():
         
         # Tab 1: Support/Resistance (using primary timeframe)
         with tabs[current_tab]:
-            st.subheader("🎯 Support and Resistance Levels")
+            st.subheader("🎯 Support and Resistance Levels - Multi-Timeframe Analysis")
+            
+            # Analyze across multiple timeframes
+            all_sr_levels = {}
+            for tf_period, data in list(mtf_data.items())[:10]:
+                tf, period = tf_period.split('_')
+                sr_levels = find_support_resistance(data)
+                if sr_levels:
+                    all_sr_levels[tf_period] = sr_levels
+            
+            # Show primary timeframe detailed analysis
+            first_key = list(mtf_data.keys())[0]
+            tf, period = first_key.split('_')
+            st.info(f"**Primary Timeframe**: {tf} interval, {period} period | **Total Timeframes Analyzed**: {len(all_sr_levels)}")
+            
             sr_levels = find_support_resistance(data1)
             
             if sr_levels:
@@ -718,14 +768,20 @@ def main():
         
         # Tab 2: Technical Indicators
         with tabs[current_tab]:
-            st.subheader("📊 Technical Indicators")
+            st.subheader("📊 Technical Indicators - Multi-Timeframe Analysis")
             
+            # Show analysis across timeframes
+            first_key = list(mtf_data.keys())[0]
+            tf, period = first_key.split('_')
+            st.info(f"**Primary Timeframe**: {tf} interval, {period} period | **Analyzing**: {len(list(mtf_data.items())[:10])} timeframes")
+            
+            # Primary timeframe detailed analysis
             data1['RSI'] = calculate_rsi(data1['Close'])
             data1['EMA_9'] = calculate_ema(data1['Close'], 9)
             data1['EMA_20'] = calculate_ema(data1['Close'], 20)
             data1['EMA_50'] = calculate_ema(data1['Close'], 50)
             
-            st.write("**Exponential Moving Averages**")
+            st.write("**Exponential Moving Averages (Primary Timeframe)**")
             ema_df = pd.DataFrame({
                 'DateTime_IST': data1.index,
                 'Close': data1['Close'],
@@ -738,14 +794,86 @@ def main():
             })
             st.dataframe(ema_df.tail(30), use_container_width=True)
             
-            st.write("**RSI Values**")
+            # Multi-timeframe EMA status
+            st.write("**EMA Alignment Across Timeframes**")
+            ema_summary = []
+            for tf_period, data in list(mtf_data.items())[:10]:
+                tf_name, per = tf_period.split('_')
+                curr_price = data['Close'].iloc[-1]
+                ema20 = calculate_ema(data['Close'], 20).iloc[-1]
+                ema50 = calculate_ema(data['Close'], 50).iloc[-1]
+                
+                trend = "🟢 Bullish" if curr_price > ema20 > ema50 else "🔴 Bearish" if curr_price < ema20 < ema50 else "🟡 Mixed"
+                
+                ema_summary.append({
+                    'Timeframe': tf_name,
+                    'Period': per,
+                    'Price': f"₹{curr_price:.2f}",
+                    '20_EMA': f"₹{ema20:.2f}",
+                    '50_EMA': f"₹{ema50:.2f}",
+                    'Trend': trend
+                })
+            
+            st.dataframe(pd.DataFrame(ema_summary), use_container_width=True)
+            
+            st.write("**RSI Values (Primary Timeframe)**")
             rsi_df = pd.DataFrame({
                 'DateTime_IST': data1.index,
                 'Close': data1['Close'],
                 'RSI': data1['RSI'],
-                'Status': data1['RSI'].apply(lambda x: 'Oversold' if x < 30 else 'Overbought' if x > 70 else 'Neutral')
+                'Status': data1['RSI'].apply(lambda x: '🟢 Oversold' if x < 30 else '🔴 Overbought' if x > 70 else '🟡 Neutral')
             })
             st.dataframe(rsi_df.tail(30), use_container_width=True)
+            
+            # Analysis Summary
+            st.markdown("---")
+            st.markdown("### 📊 Technical Indicator Analysis Summary")
+            
+            current_price = data1['Close'].iloc[-1]
+            current_rsi = data1['RSI'].iloc[-1]
+            
+            tech_summary = f"""
+            **Current Technical State ({tf}/{period})**:
+            
+            **Price vs Moving Averages**:
+            - Current Price: ₹{current_price:.2f}
+            - 9 EMA: ₹{data1['EMA_9'].iloc[-1]:.2f} ({"Above" if current_price > data1['EMA_9'].iloc[-1] else "Below"} by {abs(current_price - data1['EMA_9'].iloc[-1]):.2f} points)
+            - 20 EMA: ₹{data1['EMA_20'].iloc[-1]:.2f} ({"Above" if current_price > data1['EMA_20'].iloc[-1] else "Below"} by {abs(current_price - data1['EMA_20'].iloc[-1]):.2f} points)
+            - 50 EMA: ₹{data1['EMA_50'].iloc[-1]:.2f} ({"Above" if current_price > data1['EMA_50'].iloc[-1] else "Below"} by {abs(current_price - data1['EMA_50'].iloc[-1]):.2f} points)
+            
+            **RSI Analysis**:
+            - Current RSI: {current_rsi:.2f}
+            - Status: {"🟢 OVERSOLD - Potential bounce expected" if current_rsi < 30 else "🔴 OVERBOUGHT - Potential correction expected" if current_rsi > 70 else "🟡 NEUTRAL - No extreme condition"}
+            
+            **Multi-Timeframe Consensus**:
+            - Bullish Timeframes: {len([s for s in ema_summary if "Bullish" in s['Trend']])}/{len(ema_summary)}
+            - Bearish Timeframes: {len([s for s in ema_summary if "Bearish" in s['Trend']])}/{len(ema_summary)}
+            - Mixed Timeframes: {len([s for s in ema_summary if "Mixed" in s['Trend']])}/{len(ema_summary)}
+            
+            **What This Means**:
+            """
+            
+            bullish_tf = len([s for s in ema_summary if "Bullish" in s['Trend']])
+            if bullish_tf > len(ema_summary) * 0.6:
+                tech_summary += """
+            The majority of timeframes show bullish EMA alignment (price above 20 EMA and 50 EMA), indicating strong uptrend momentum across multiple timeframes. This increases confidence in bullish trades. When short-term and long-term timeframes align bullishly, it creates a high-probability setup for continuation of upward movement.
+            
+            **Trading Implication**: Consider long positions with stop loss below 20 EMA on primary timeframe.
+            """
+            elif len([s for s in ema_summary if "Bearish" in s['Trend']]) > len(ema_summary) * 0.6:
+                tech_summary += """
+            The majority of timeframes show bearish EMA alignment (price below 20 EMA and 50 EMA), indicating strong downtrend momentum. This suggests selling pressure dominates across multiple timeframes, making bullish trades risky.
+            
+            **Trading Implication**: Avoid long positions. Consider short positions or wait for trend reversal signals.
+            """
+            else:
+                tech_summary += """
+            Timeframes show mixed signals with no clear consensus. Some timeframes are bullish while others are bearish, indicating market indecision or transition phase. Trading in such conditions is riskier as direction is unclear.
+            
+            **Trading Implication**: WAIT for clearer signals. Market in consolidation/transition. Risk of whipsaw trades is high.
+            """
+            
+            st.markdown(tech_summary)
         
         current_tab += 1
         
@@ -1285,39 +1413,103 @@ def main():
             total_score = sum(s['score'] for s in all_signals)
             avg_score = total_score / len(all_signals) if all_signals else 0
             
-            # Determine final signal
-            if avg_score > 30:
-                signal = "🟢 STRONG BUY"
-                confidence = min(95, 60 + abs(avg_score) * 0.5)
-                direction = "BULLISH"
-            elif avg_score > 15:
-                signal = "🟢 BUY"
-                confidence = min(85, 60 + abs(avg_score) * 0.5)
-                direction = "BULLISH"
-            elif avg_score < -30:
-                signal = "🔴 STRONG SELL"
-                confidence = min(95, 60 + abs(avg_score) * 0.5)
-                direction = "BEARISH"
-            elif avg_score < -15:
-                signal = "🔴 SELL"
-                confidence = min(85, 60 + abs(avg_score) * 0.5)
-                direction = "BEARISH"
-            else:
-                signal = "🟡 HOLD/NEUTRAL"
-                confidence = 50
-                direction = "NEUTRAL"
+            # Determine final signal with reasonable targets for NIFTY-level instruments
+            avg_price = current_price1
             
-            # Calculate entry, SL, target
-            entry = current_price1
-            if direction == "BULLISH":
-                sl = entry * 0.97
-                target = entry * 1.05
-            elif direction == "BEARISH":
-                sl = entry * 1.03
-                target = entry * 0.95
-            else:
-                sl = None
-                target = None
+            # Adjust targets based on instrument price level
+            if avg_price > 20000:  # NIFTY/SENSEX level
+                if avg_score > 30:
+                    signal = "🟢 STRONG BUY"
+                    confidence = min(95, 60 + abs(avg_score) * 0.5)
+                    direction = "BULLISH"
+                    sl = entry * 0.985  # 1.5% SL (reasonable for index)
+                    target = entry * 1.0175  # 1.75% target (realistic for NIFTY)
+                elif avg_score > 15:
+                    signal = "🟢 BUY"
+                    confidence = min(85, 60 + abs(avg_score) * 0.5)
+                    direction = "BULLISH"
+                    sl = entry * 0.985  # 1.5% SL
+                    target = entry * 1.015  # 1.5% target
+                elif avg_score < -30:
+                    signal = "🔴 STRONG SELL"
+                    confidence = min(95, 60 + abs(avg_score) * 0.5)
+                    direction = "BEARISH"
+                    sl = entry * 1.015
+                    target = entry * 0.9825
+                elif avg_score < -15:
+                    signal = "🔴 SELL"
+                    confidence = min(85, 60 + abs(avg_score) * 0.5)
+                    direction = "BEARISH"
+                    sl = entry * 1.015
+                    target = entry * 0.985
+                else:
+                    signal = "🟡 HOLD/NEUTRAL"
+                    confidence = 50
+                    direction = "NEUTRAL"
+                    sl = None
+                    target = None
+            elif avg_price > 1000:  # Bank NIFTY or stocks
+                if avg_score > 30:
+                    signal = "🟢 STRONG BUY"
+                    confidence = min(95, 60 + abs(avg_score) * 0.5)
+                    direction = "BULLISH"
+                    sl = entry * 0.98
+                    target = entry * 1.025
+                elif avg_score > 15:
+                    signal = "🟢 BUY"
+                    confidence = min(85, 60 + abs(avg_score) * 0.5)
+                    direction = "BULLISH"
+                    sl = entry * 0.98
+                    target = entry * 1.02
+                elif avg_score < -30:
+                    signal = "🔴 STRONG SELL"
+                    confidence = min(95, 60 + abs(avg_score) * 0.5)
+                    direction = "BEARISH"
+                    sl = entry * 1.02
+                    target = entry * 0.975
+                elif avg_score < -15:
+                    signal = "🔴 SELL"
+                    confidence = min(85, 60 + abs(avg_score) * 0.5)
+                    direction = "BEARISH"
+                    sl = entry * 1.02
+                    target = entry * 0.98
+                else:
+                    signal = "🟡 HOLD/NEUTRAL"
+                    confidence = 50
+                    direction = "NEUTRAL"
+                    sl = None
+                    target = None
+            else:  # Other assets (crypto, forex, etc.)
+                if avg_score > 30:
+                    signal = "🟢 STRONG BUY"
+                    confidence = min(95, 60 + abs(avg_score) * 0.5)
+                    direction = "BULLISH"
+                    sl = entry * 0.97
+                    target = entry * 1.04
+                elif avg_score > 15:
+                    signal = "🟢 BUY"
+                    confidence = min(85, 60 + abs(avg_score) * 0.5)
+                    direction = "BULLISH"
+                    sl = entry * 0.975
+                    target = entry * 1.03
+                elif avg_score < -30:
+                    signal = "🔴 STRONG SELL"
+                    confidence = min(95, 60 + abs(avg_score) * 0.5)
+                    direction = "BEARISH"
+                    sl = entry * 1.03
+                    target = entry * 0.96
+                elif avg_score < -15:
+                    signal = "🔴 SELL"
+                    confidence = min(85, 60 + abs(avg_score) * 0.5)
+                    direction = "BEARISH"
+                    sl = entry * 1.03
+                    target = entry * 0.97
+                else:
+                    signal = "🟡 HOLD/NEUTRAL"
+                    confidence = 50
+                    direction = "NEUTRAL"
+                    sl = None
+                    target = None
             
             # Display
             st.markdown(f"""
