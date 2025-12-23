@@ -57,7 +57,6 @@ ASSET_MAPPING = {
 }
 
 TIMEFRAMES = ['1m', '2m', '5m', '15m', '30m', '60m', '90m', '1h', '1d', '5d', '1wk', '1mo', '3mo']
-PERIODS = ['1d', '5d', '7d', '1mo', '3mo', '6mo', '1y', '2y', '3y', '5y', '10y', '15y', '20y', '25y', '30y', 'max']
 
 # Valid timeframe-period combinations
 VALID_COMBINATIONS = {
@@ -79,10 +78,13 @@ VALID_COMBINATIONS = {
 # Helper Functions
 def convert_to_ist(df):
     """Convert DataFrame index to IST timezone"""
-    if df.index.tz is None:
-        df.index = df.index.tz_localize('UTC').tz_convert(IST)
-    else:
-        df.index = df.index.tz_convert(IST)
+    try:
+        if df.index.tz is None:
+            df.index = df.index.tz_localize('UTC').tz_convert(IST)
+        else:
+            df.index = df.index.tz_convert(IST)
+    except:
+        pass
     return df
 
 def time_ago(dt):
@@ -91,9 +93,9 @@ def time_ago(dt):
     if isinstance(dt, str):
         dt = pd.to_datetime(dt)
     if dt.tz is None:
-        dt = dt.tz_localize(IST)
+        dt = IST.localize(dt)
     else:
-        dt = dt.tz_convert(IST)
+        dt = dt.astimezone(IST)
     
     diff = now - dt
     
@@ -110,32 +112,24 @@ def time_ago(dt):
         minutes = diff.seconds // 60
         return f"{minutes} minute(s) ago ({dt.strftime('%Y-%m-%d %H:%M:%S IST')})"
 
-def fetch_data(ticker, period, interval, progress_bar=None, progress_text=None):
+def fetch_data(ticker, period, interval):
     """Fetch data from yfinance with rate limiting"""
     try:
-        time.sleep(np.random.uniform(1.5, 3.0))  # Rate limiting
-        if progress_text:
-            progress_text.text(f"Fetching {ticker} data for {period} period at {interval} interval...")
-        
+        time.sleep(np.random.uniform(1.5, 2.0))
         data = yf.download(ticker, period=period, interval=interval, progress=False)
         
         if data.empty:
             return None
         
-        # Handle multi-index columns
         if isinstance(data.columns, pd.MultiIndex):
             data.columns = data.columns.droplevel(1)
         
-        # Keep only relevant columns
         cols = ['Open', 'High', 'Low', 'Close', 'Volume']
         data = data[[col for col in cols if col in data.columns]]
-        
-        # Convert to IST
         data = convert_to_ist(data)
         
         return data
     except Exception as e:
-        st.error(f"Error fetching {ticker}: {str(e)}")
         return None
 
 def calculate_rsi(data, period=14):
@@ -157,14 +151,11 @@ def find_support_resistance(data, window=20, tolerance=5):
     closes = data['Close'].values
     
     for i in range(window, len(closes) - window):
-        # Check for local maxima (resistance)
         if closes[i] == max(closes[i-window:i+window+1]):
             levels.append({'price': closes[i], 'type': 'Resistance', 'index': i})
-        # Check for local minima (support)
         elif closes[i] == min(closes[i-window:i+window+1]):
             levels.append({'price': closes[i], 'type': 'Support', 'index': i})
     
-    # Cluster similar levels
     clustered_levels = []
     for level in levels:
         found = False
@@ -182,13 +173,11 @@ def find_support_resistance(data, window=20, tolerance=5):
                 'indices': [level['index']]
             })
     
-    # Add timestamps and sustainability check
     for cluster in clustered_levels:
         cluster['dates'] = [data.index[idx] for idx in cluster['indices']]
         cluster['last_hit'] = cluster['dates'][-1]
         cluster['first_hit'] = cluster['dates'][0]
         
-        # Check sustainability (how long price stayed near level)
         sustained_count = 0
         for idx in cluster['indices']:
             window_data = closes[max(0, idx-5):min(len(closes), idx+5)]
@@ -221,12 +210,10 @@ def detect_elliott_waves(data):
     closes = data['Close'].values
     waves = []
     
-    # Find peaks and troughs
     from scipy.signal import argrelextrema
     maxima_idx = argrelextrema(closes, np.greater, order=5)[0]
     minima_idx = argrelextrema(closes, np.less, order=5)[0]
     
-    # Combine and sort
     all_points = sorted([(idx, 'peak') for idx in maxima_idx] + [(idx, 'trough') for idx in minima_idx])
     
     if len(all_points) >= 5:
@@ -255,10 +242,9 @@ def detect_rsi_divergence(data, rsi_data):
     rsi_peaks = argrelextrema(rsi_values, np.greater, order=5)[0]
     rsi_troughs = argrelextrema(rsi_values, np.less, order=5)[0]
     
-    # Bullish divergence: price makes lower low, RSI makes higher low
     for i in range(len(price_troughs) - 1):
         idx1, idx2 = price_troughs[i], price_troughs[i+1]
-        if closes[idx2] < closes[idx1]:
+        if idx2 < len(closes) and closes[idx2] < closes[idx1]:
             rsi_near = [r for r in rsi_troughs if abs(r - idx2) < 10]
             if rsi_near:
                 rsi_idx = rsi_near[0]
@@ -275,10 +261,9 @@ def detect_rsi_divergence(data, rsi_data):
                         'resolved': closes[-1] > closes[idx2]
                     })
     
-    # Bearish divergence: price makes higher high, RSI makes lower high
     for i in range(len(price_peaks) - 1):
         idx1, idx2 = price_peaks[i], price_peaks[i+1]
-        if closes[idx2] > closes[idx1]:
+        if idx2 < len(closes) and closes[idx2] > closes[idx1]:
             rsi_near = [r for r in rsi_peaks if abs(r - idx2) < 10]
             if rsi_near:
                 rsi_idx = rsi_near[0]
@@ -305,7 +290,7 @@ def calculate_volatility_bins(data):
     bins = pd.qcut(volatility.dropna(), q=5, labels=['Very Low', 'Low', 'Medium', 'High', 'Very High'], duplicates='drop')
     
     result = pd.DataFrame({
-        'DateTime': data.index,
+        'DateTime_IST': data.index,
         'Close': data['Close'],
         'Volatility': volatility,
         'Volatility_Bin': bins
@@ -322,11 +307,11 @@ def calculate_zscore_bins(data):
                   labels=['Extreme Negative', 'Negative', 'Neutral Low', 'Neutral High', 'Positive', 'Extreme Positive'])
     
     result = pd.DataFrame({
-        'DateTime': data.index,
+        'DateTime_IST': data.index,
         'Close': data['Close'],
-        'Return': returns * 100,
-        'Z-Score': zscore,
-        'Z-Score_Bin': bins
+        'Return_%': returns * 100,
+        'Z_Score': zscore,
+        'Z_Score_Bin': bins
     })
     
     return result.dropna()
@@ -335,6 +320,7 @@ def backtest_strategy(data, strategy_type='rsi_ema'):
     """Backtest trading strategy"""
     df = data.copy()
     df['RSI'] = calculate_rsi(df['Close'])
+    df['EMA_9'] = calculate_ema(df['Close'], 9)
     df['EMA_20'] = calculate_ema(df['Close'], 20)
     df['EMA_50'] = calculate_ema(df['Close'], 50)
     
@@ -345,59 +331,100 @@ def backtest_strategy(data, strategy_type='rsi_ema'):
         current_price = df['Close'].iloc[i]
         current_date = df.index[i]
         
-        # Entry conditions
         if position is None:
+            # Multiple strategy types
             if strategy_type == 'rsi_ema':
-                if (df['RSI'].iloc[i] < 30 and 
-                    df['Close'].iloc[i] > df['EMA_20'].iloc[i]):
-                    sl = current_price * 0.98
+                if df['RSI'].iloc[i] < 35 and df['Close'].iloc[i] > df['EMA_20'].iloc[i]:
+                    sl = current_price * 0.97
                     target = current_price * 1.05
                     position = {
                         'entry_date': current_date,
                         'entry_price': current_price,
                         'sl': sl,
                         'target': target,
-                        'reason': 'RSI Oversold + Above 20 EMA'
+                        'reason': 'RSI < 35 + Price > 20 EMA'
+                    }
+            elif strategy_type == 'ema_crossover':
+                if df['EMA_9'].iloc[i] > df['EMA_20'].iloc[i] and df['EMA_9'].iloc[i-1] <= df['EMA_20'].iloc[i-1]:
+                    sl = current_price * 0.98
+                    target = current_price * 1.04
+                    position = {
+                        'entry_date': current_date,
+                        'entry_price': current_price,
+                        'sl': sl,
+                        'target': target,
+                        'reason': '9 EMA crossed above 20 EMA'
+                    }
+            elif strategy_type == 'volatility':
+                returns = df['Close'].pct_change()
+                vol = returns.rolling(20).std().iloc[i]
+                if vol > returns.rolling(20).std().mean() * 1.5:
+                    sl = current_price * 0.96
+                    target = current_price * 1.06
+                    position = {
+                        'entry_date': current_date,
+                        'entry_price': current_price,
+                        'sl': sl,
+                        'target': target,
+                        'reason': 'High volatility breakout'
                     }
         
-        # Exit conditions
         elif position is not None:
             if current_price <= position['sl']:
                 trades.append({
-                    'Entry Date': position['entry_date'],
-                    'Entry Price': position['entry_price'],
-                    'Exit Date': current_date,
-                    'Exit Price': current_price,
+                    'Entry_Date': position['entry_date'],
+                    'Entry_Price': position['entry_price'],
+                    'Exit_Date': current_date,
+                    'Exit_Price': current_price,
                     'SL': position['sl'],
                     'Target': position['target'],
                     'Points': current_price - position['entry_price'],
-                    'PnL %': ((current_price - position['entry_price']) / position['entry_price']) * 100,
+                    'PnL_%': ((current_price - position['entry_price']) / position['entry_price']) * 100,
                     'Reason': position['reason'],
-                    'Exit Reason': 'Stop Loss Hit'
+                    'Exit_Reason': 'Stop Loss Hit'
                 })
                 position = None
             elif current_price >= position['target']:
                 trades.append({
-                    'Entry Date': position['entry_date'],
-                    'Entry Price': position['entry_price'],
-                    'Exit Date': current_date,
-                    'Exit Price': current_price,
+                    'Entry_Date': position['entry_date'],
+                    'Entry_Price': position['entry_price'],
+                    'Exit_Date': current_date,
+                    'Exit_Price': current_price,
                     'SL': position['sl'],
                     'Target': position['target'],
                     'Points': current_price - position['entry_price'],
-                    'PnL %': ((current_price - position['entry_price']) / position['entry_price']) * 100,
+                    'PnL_%': ((current_price - position['entry_price']) / position['entry_price']) * 100,
                     'Reason': position['reason'],
-                    'Exit Reason': 'Target Hit'
+                    'Exit_Reason': 'Target Hit'
                 })
                 position = None
     
     if trades:
         trades_df = pd.DataFrame(trades)
-        total_pnl = trades_df['PnL %'].sum()
-        win_rate = len(trades_df[trades_df['PnL %'] > 0]) / len(trades_df) * 100
+        total_pnl = trades_df['PnL_%'].sum()
+        win_rate = len(trades_df[trades_df['PnL_%'] > 0]) / len(trades_df) * 100
         return trades_df, total_pnl, win_rate
     
     return pd.DataFrame(), 0, 0
+
+def fetch_multi_timeframe_data(ticker, progress_placeholder):
+    """Fetch data across all valid timeframes"""
+    all_data = {}
+    
+    total_combinations = sum(len(periods) for periods in VALID_COMBINATIONS.values())
+    current = 0
+    
+    for timeframe, periods in VALID_COMBINATIONS.items():
+        for period in periods[:2]:  # Limit to 2 periods per timeframe for speed
+            current += 1
+            progress = current / total_combinations
+            progress_placeholder.progress(progress, text=f"Fetching {timeframe}/{period}... ({current}/{total_combinations})")
+            
+            data = fetch_data(ticker, period, timeframe)
+            if data is not None and not data.empty:
+                all_data[f"{timeframe}_{period}"] = data
+    
+    return all_data
 
 # Main Application
 def main():
@@ -408,14 +435,12 @@ def main():
     with st.sidebar:
         st.header("Configuration")
         
-        # Ticker 1
         asset1 = st.selectbox("Select Ticker 1", list(ASSET_MAPPING.keys()))
         if asset1 == 'Custom Ticker':
             ticker1 = st.text_input("Enter Ticker 1 Symbol", "AAPL")
         else:
             ticker1 = ASSET_MAPPING[asset1]
         
-        # Ratio Analysis Toggle
         enable_ratio = st.checkbox("Enable Ratio Analysis (Ticker 2)")
         
         ticker2 = None
@@ -426,56 +451,41 @@ def main():
             else:
                 ticker2 = ASSET_MAPPING[asset2]
         
-        # Timeframe and Period
-        timeframe = st.selectbox("Select Timeframe", TIMEFRAMES)
-        
-        # Filter valid periods for selected timeframe
-        valid_periods = VALID_COMBINATIONS.get(timeframe, PERIODS)
-        period = st.selectbox("Select Period", valid_periods)
-        
-        fetch_button = st.button("🚀 Fetch Data & Analyze", use_container_width=True)
+        fetch_button = st.button("🚀 Analyze All Timeframes", use_container_width=True)
     
-    # Initialize session state
-    if 'data1' not in st.session_state:
-        st.session_state.data1 = None
-        st.session_state.data2 = None
+    if 'mtf_data' not in st.session_state:
+        st.session_state.mtf_data = None
+        st.session_state.mtf_data2 = None
         st.session_state.analysis_complete = False
     
-    # Fetch Data
     if fetch_button:
         st.session_state.analysis_complete = False
         
-        progress_bar = st.progress(0)
-        progress_text = st.empty()
+        progress_placeholder = st.empty()
         
-        # Fetch Ticker 1
-        progress_text.text("Fetching Ticker 1 data...")
-        st.session_state.data1 = fetch_data(ticker1, period, timeframe, progress_bar, progress_text)
-        progress_bar.progress(50)
+        st.info("🔄 Fetching multi-timeframe data... This may take a few minutes.")
+        st.session_state.mtf_data = fetch_multi_timeframe_data(ticker1, progress_placeholder)
         
-        # Fetch Ticker 2 if enabled
         if enable_ratio and ticker2:
-            progress_text.text("Fetching Ticker 2 data...")
-            st.session_state.data2 = fetch_data(ticker2, period, timeframe, progress_bar, progress_text)
+            st.session_state.mtf_data2 = fetch_multi_timeframe_data(ticker2, progress_placeholder)
         else:
-            st.session_state.data2 = None
+            st.session_state.mtf_data2 = None
         
-        progress_bar.progress(100)
-        progress_text.text("Data fetching complete!")
-        time.sleep(1)
-        progress_bar.empty()
-        progress_text.empty()
+        progress_placeholder.empty()
         
-        if st.session_state.data1 is not None:
+        if st.session_state.mtf_data:
             st.session_state.analysis_complete = True
-            st.success("✅ Data fetched successfully!")
+            st.success(f"✅ Fetched data for {len(st.session_state.mtf_data)} timeframe/period combinations!")
         else:
             st.error("❌ Failed to fetch data. Please try again.")
     
-    # Display Analysis
-    if st.session_state.analysis_complete and st.session_state.data1 is not None:
-        data1 = st.session_state.data1
-        data2 = st.session_state.data2
+    if st.session_state.analysis_complete and st.session_state.mtf_data:
+        mtf_data = st.session_state.mtf_data
+        mtf_data2 = st.session_state.mtf_data2
+        
+        # Get first available data for current stats
+        first_key = list(mtf_data.keys())[0]
+        data1 = mtf_data[first_key]
         
         # Basic Statistics
         st.header("📊 Current Market Statistics")
@@ -487,29 +497,23 @@ def main():
         pct_change1 = (change1 / prev_price1) * 100
         
         with col1:
-            st.metric(
-                f"{ticker1} Price",
-                f"₹{current_price1:.2f}",
-                f"{change1:.2f} ({pct_change1:+.2f}%)"
-            )
+            st.metric(f"{ticker1} Price", f"₹{current_price1:.2f}", f"{change1:.2f} ({pct_change1:+.2f}%)")
         
         rsi1 = calculate_rsi(data1['Close']).iloc[-1]
         with col2:
             rsi_color = "🟢" if rsi1 < 30 else "🔴" if rsi1 > 70 else "🟡"
             st.metric(f"{ticker1} RSI", f"{rsi_color} {rsi1:.2f}", "")
         
-        if enable_ratio and data2 is not None:
+        if enable_ratio and mtf_data2:
+            first_key2 = list(mtf_data2.keys())[0]
+            data2 = mtf_data2[first_key2]
             current_price2 = data2['Close'].iloc[-1]
-            prev_price2 = data2['Close'].iloc[-2]
-            change2 = current_price2 - prev_price2
-            pct_change2 = (change2 / prev_price2) * 100
             
             with col3:
-                st.metric(
-                    f"{ticker2} Price",
-                    f"₹{current_price2:.2f}",
-                    f"{change2:.2f} ({pct_change2:+.2f}%)"
-                )
+                prev_price2 = data2['Close'].iloc[-2]
+                change2 = current_price2 - prev_price2
+                pct_change2 = (change2 / prev_price2) * 100
+                st.metric(f"{ticker2} Price", f"₹{current_price2:.2f}", f"{change2:.2f} ({pct_change2:+.2f}%)")
             
             ratio = current_price1 / current_price2
             with col4:
@@ -517,9 +521,9 @@ def main():
         
         st.markdown("---")
         
-        # Tabs
-        tabs = st.tabs([
-            "📈 Overview", 
+        # Create tabs list dynamically
+        tab_names = [
+            "📈 Multi-Timeframe Overview",
             "🎯 Support/Resistance",
             "📊 Technical Indicators",
             "📉 Z-Score Analysis",
@@ -527,32 +531,73 @@ def main():
             "🌊 Elliott Waves",
             "📐 Fibonacci Levels",
             "🔄 RSI Divergence",
-            "⚖️ Ratio Analysis" if enable_ratio else None,
-            "🤖 AI Signals",
+            "🤖 AI Signals & Forecast",
             "🔬 Backtesting"
-        ])
+        ]
         
-        tabs = [t for t in tabs if t is not None]
+        if enable_ratio and mtf_data2:
+            tab_names.insert(-2, "⚖️ Ratio Analysis")
         
-        # Tab 0: Overview
-        with tabs[0]:
-            st.subheader("Market Overview")
-            fig = go.Figure()
-            fig.add_trace(go.Candlestick(
-                x=data1.index,
-                open=data1['Open'],
-                high=data1['High'],
-                low=data1['Low'],
-                close=data1['Close'],
-                name=ticker1
-            ))
-            fig.update_layout(title=f"{ticker1} Price Chart", xaxis_title="Date", yaxis_title="Price", height=600)
-            st.plotly_chart(fig, use_container_width=True)
+        tabs = st.tabs(tab_names)
+        current_tab = 0
+        
+        # Tab 0: Multi-Timeframe Overview
+        with tabs[current_tab]:
+            st.subheader("📈 Multi-Timeframe Analysis Overview")
             
-            st.dataframe(data1.tail(20), use_container_width=True)
+            mtf_summary = []
+            for tf_period, data in mtf_data.items():
+                tf, period = tf_period.split('_')
+                curr_price = data['Close'].iloc[-1]
+                prev_price = data['Close'].iloc[0]
+                returns = ((curr_price - prev_price) / prev_price) * 100
+                points = curr_price - prev_price
+                
+                rsi = calculate_rsi(data['Close']).iloc[-1]
+                
+                # Check divergence
+                divergences = detect_rsi_divergence(data, calculate_rsi(data['Close']))
+                active_div = [d for d in divergences if not d['resolved']]
+                div_text = f"{active_div[0]['type']}" if active_div else "None"
+                
+                # Check S/R
+                sr_levels = find_support_resistance(data)
+                nearby_sr = [l for l in sr_levels if abs(curr_price - l['price']) < curr_price * 0.02]
+                sr_text = f"{nearby_sr[0]['type']} at ₹{nearby_sr[0]['price']:.2f}" if nearby_sr else "None"
+                
+                # Fibonacci
+                fib_levels, _, _ = calculate_fibonacci_levels(data)
+                nearest_fib = min(fib_levels.items(), key=lambda x: abs(x[1] - curr_price))
+                fib_dist = abs(curr_price - nearest_fib[1])
+                
+                color = "🟢" if returns > 0 else "🔴" if returns < 0 else "⚪"
+                
+                mtf_summary.append({
+                    'Timeframe': tf,
+                    'Period': period,
+                    'Status': color,
+                    'Current_Price': f"₹{curr_price:.2f}",
+                    'Returns_%': f"{returns:+.2f}%",
+                    'Points': f"{points:+.2f}",
+                    'RSI': f"{rsi:.2f}",
+                    'RSI_Divergence': div_text,
+                    'Near_SR': sr_text,
+                    'Nearest_Fib': f"{nearest_fib[0]} (₹{fib_dist:.2f} away)"
+                })
+            
+            mtf_df = pd.DataFrame(mtf_summary)
+            
+            # Color-code the dataframe
+            st.dataframe(mtf_df, use_container_width=True, height=600)
+            
+            # Download button
+            csv = mtf_df.to_csv(index=False)
+            st.download_button("📥 Download Multi-Timeframe Data", csv, f"mtf_analysis_{ticker1}.csv", "text/csv")
         
-        # Tab 1: Support/Resistance
-        with tabs[1]:
+        current_tab += 1
+        
+        # Tab 1: Support/Resistance (using primary timeframe)
+        with tabs[current_tab]:
             st.subheader("🎯 Support and Resistance Levels")
             sr_levels = find_support_resistance(data1)
             
@@ -560,28 +605,31 @@ def main():
                 sr_df = pd.DataFrame([{
                     'Type': level['type'],
                     'Price': f"₹{level['price']:.2f}",
-                    'Distance from Current': f"{abs(current_price1 - level['price']):.2f} points ({abs((current_price1 - level['price'])/current_price1)*100:.2f}%)",
-                    'Hit Count': level['count'],
-                    'Sustained Count': level['sustained'],
-                    'First Hit': time_ago(level['first_hit']),
-                    'Last Hit': time_ago(level['last_hit']),
-                    'Accuracy': f"{(level['sustained']/level['count'])*100:.1f}%"
+                    'Distance_Points': f"{abs(current_price1 - level['price']):.2f}",
+                    'Distance_%': f"{abs((current_price1 - level['price'])/current_price1)*100:.2f}%",
+                    'Hit_Count': level['count'],
+                    'Sustained': level['sustained'],
+                    'First_Hit': time_ago(level['first_hit']),
+                    'Last_Hit': time_ago(level['last_hit']),
+                    'Accuracy_%': f"{(level['sustained']/level['count'])*100:.1f}%"
                 } for level in sr_levels[:10]])
                 
                 st.dataframe(sr_df, use_container_width=True)
                 
-                # Plot
                 fig = go.Figure()
-                fig.add_trace(go.Scatter(x=data1.index, y=data1['Close'], mode='lines', name='Price'))
+                fig.add_trace(go.Scatter(x=data1.index, y=data1['Close'], mode='lines', name='Price', line=dict(color='blue')))
                 for level in sr_levels[:5]:
+                    color = 'green' if level['type'] == 'Support' else 'red'
                     fig.add_hline(y=level['price'], line_dash="dash", 
                                   annotation_text=f"{level['type']}: {level['price']:.2f}", 
-                                  line_color='green' if level['type'] == 'Support' else 'red')
+                                  line_color=color)
                 fig.update_layout(title="Support & Resistance Levels", height=500)
                 st.plotly_chart(fig, use_container_width=True)
         
+        current_tab += 1
+        
         # Tab 2: Technical Indicators
-        with tabs[2]:
+        with tabs[current_tab]:
             st.subheader("📊 Technical Indicators")
             
             data1['RSI'] = calculate_rsi(data1['Close'])
@@ -589,84 +637,338 @@ def main():
             data1['EMA_20'] = calculate_ema(data1['Close'], 20)
             data1['EMA_50'] = calculate_ema(data1['Close'], 50)
             
-            # EMA Table
             st.write("**Exponential Moving Averages**")
             ema_df = pd.DataFrame({
-                'DateTime': data1.index,
+                'DateTime_IST': data1.index,
                 'Close': data1['Close'],
-                'EMA 9': data1['EMA_9'],
-                'EMA 20': data1['EMA_20'],
-                'EMA 50': data1['EMA_50'],
-                'Distance from 9 EMA': data1['Close'] - data1['EMA_9'],
-                'Distance from 20 EMA': data1['Close'] - data1['EMA_20'],
-                'Distance from 50 EMA': data1['Close'] - data1['EMA_50']
+                'EMA_9': data1['EMA_9'],
+                'EMA_20': data1['EMA_20'],
+                'EMA_50': data1['EMA_50'],
+                'Dist_9EMA': data1['Close'] - data1['EMA_9'],
+                'Dist_20EMA': data1['Close'] - data1['EMA_20'],
+                'Dist_50EMA': data1['Close'] - data1['EMA_50']
             })
-            st.dataframe(ema_df.tail(20), use_container_width=True)
+            st.dataframe(ema_df.tail(30), use_container_width=True)
             
-            # RSI Table
             st.write("**RSI Values**")
             rsi_df = pd.DataFrame({
-                'DateTime': data1.index,
+                'DateTime_IST': data1.index,
                 'Close': data1['Close'],
                 'RSI': data1['RSI'],
                 'Status': data1['RSI'].apply(lambda x: 'Oversold' if x < 30 else 'Overbought' if x > 70 else 'Neutral')
             })
-            st.dataframe(rsi_df.tail(20), use_container_width=True)
+            st.dataframe(rsi_df.tail(30), use_container_width=True)
+        
+        current_tab += 1
         
         # Tab 3: Z-Score Analysis
-        with tabs[3]:
+        with tabs[current_tab]:
             st.subheader("📉 Z-Score Analysis")
             zscore_data = calculate_zscore_bins(data1)
             
-            st.write("**Z-Score Distribution**")
-            st.dataframe(zscore_data.tail(50), use_container_width=True)
-            
-            # Historical pattern analysis
-            st.write("**Historical Rally Analysis Based on Z-Score**")
-            extreme_moves = zscore_data[zscore_data['Z-Score'].abs() > 2]
-            if not extreme_moves.empty:
-                st.write(f"Found {len(extreme_moves)} extreme Z-Score events")
-                st.dataframe(extreme_moves, use_container_width=True)
+            if not zscore_data.empty:
+                # Statistics
+                current_zscore = zscore_data['Z_Score'].iloc[-1]
+                current_bin = zscore_data['Z_Score_Bin'].iloc[-1]
+                
+                st.write("### Current Z-Score Statistics")
+                col1, col2, col3, col4 = st.columns(4)
+                with col1:
+                    st.metric("Current Z-Score", f"{current_zscore:.2f}")
+                with col2:
+                    st.metric("Current Bin", current_bin)
+                with col3:
+                    st.metric("Average Z-Score", f"{zscore_data['Z_Score'].mean():.2f}")
+                with col4:
+                    st.metric("Std Dev", f"{zscore_data['Z_Score'].std():.2f}")
+                
+                st.write("**Z-Score Distribution Table**")
+                st.dataframe(zscore_data.tail(50), use_container_width=True)
+                
+                # Analysis Summary
+                st.write("### 📊 Z-Score Analysis Summary")
+                
+                extreme_positive = zscore_data[zscore_data['Z_Score'] > 2]
+                extreme_negative = zscore_data[zscore_data['Z_Score'] < -2]
+                
+                summary_text = f"""
+                **Current Market Position**: The market is currently in the **{current_bin}** zone with a Z-Score of **{current_zscore:.2f}**.
+                
+                **Historical Context**: 
+                - Found **{len(extreme_positive)}** instances of extreme positive Z-Scores (>2.0) in the dataset
+                - Found **{len(extreme_negative)}** instances of extreme negative Z-Scores (<-2.0) in the dataset
+                
+                **What This Means**:
+                """
+                
+                if current_zscore > 2:
+                    summary_text += f"""
+                - The current price change is **{current_zscore:.2f} standard deviations above the mean**, indicating an extreme upward move
+                - Historically, such extreme moves often lead to **mean reversion** within the next few periods
+                - Last time we saw similar extreme positive Z-Scores: {time_ago(extreme_positive.index[-2]) if len(extreme_positive) > 1 else "First occurrence"}
+                - **Expected Direction**: Potential downside correction or consolidation ahead
+                - **Confidence**: High probability of mean reversion based on statistical analysis
+                """
+                elif current_zscore < -2:
+                    summary_text += f"""
+                - The current price change is **{abs(current_zscore):.2f} standard deviations below the mean**, indicating an extreme downward move
+                - Historically, such extreme moves often lead to **mean reversion** (bounce back) within the next few periods
+                - Last time we saw similar extreme negative Z-Scores: {time_ago(extreme_negative.index[-2]) if len(extreme_negative) > 1 else "First occurrence"}
+                - **Expected Direction**: Potential upside bounce or recovery ahead
+                - **Confidence**: High probability of mean reversion based on statistical analysis
+                """
+                elif -1 < current_zscore < 1:
+                    summary_text += f"""
+                - The current price movement is within **1 standard deviation** of the mean, indicating normal market behavior
+                - This is the most common zone where price typically trades
+                - **Expected Direction**: Continuation of current trend with no extreme moves expected
+                - **Confidence**: Moderate - market is in equilibrium, wait for clearer signals
+                """
+                else:
+                    summary_text += f"""
+                - The current price movement is between 1-2 standard deviations from mean, showing elevated but not extreme activity
+                - Market is showing stronger than normal momentum but not yet at extreme levels
+                - **Expected Direction**: Monitor for potential reversal if Z-Score reaches ±2
+                - **Confidence**: Moderate - trending market with some continuation expected
+                """
+                
+                # Add recent rally analysis
+                if len(extreme_negative) > 0:
+                    recent_extreme = extreme_negative.tail(5)
+                    avg_recovery = []
+                    for idx in recent_extreme.index:
+                        try:
+                            idx_pos = zscore_data.index.get_loc(idx)
+                            if idx_pos + 10 < len(zscore_data):
+                                future_return = ((zscore_data['Close'].iloc[idx_pos + 10] - zscore_data['Close'].iloc[idx_pos]) / 
+                                               zscore_data['Close'].iloc[idx_pos] * 100)
+                                avg_recovery.append(future_return)
+                        except:
+                            pass
+                    
+                    if avg_recovery:
+                        summary_text += f"""
+                        
+                **Historical Rally Pattern**: After extreme negative Z-Scores (oversold conditions), the market typically recovered by an average of **{np.mean(avg_recovery):.2f}%** within the next 10 periods. This pattern has occurred **{len(avg_recovery)}** times with an accuracy of approximately **{(len([r for r in avg_recovery if r > 0])/len(avg_recovery))*100:.1f}%**.
+                """
+                
+                st.markdown(summary_text)
+                
+                # Bin distribution
+                st.write("### Z-Score Bin Distribution")
+                bin_dist = zscore_data['Z_Score_Bin'].value_counts()
+                st.bar_chart(bin_dist)
         
-        # Continue with remaining tabs...
-        # (Due to length constraints, I'll provide the structure for remaining tabs)
+        current_tab += 1
         
-        # Tab 4: Volatility
-        with tabs[4]:
+        # Tab 4: Volatility Analysis
+        with tabs[current_tab]:
             st.subheader("💹 Volatility Analysis")
             vol_data = calculate_volatility_bins(data1)
-            st.dataframe(vol_data.tail(50), use_container_width=True)
+            
+            if not vol_data.empty:
+                current_vol = vol_data['Volatility'].iloc[-1]
+                current_vol_bin = vol_data['Volatility_Bin'].iloc[-1]
+                
+                st.write("### Current Volatility Statistics")
+                col1, col2, col3, col4 = st.columns(4)
+                with col1:
+                    st.metric("Current Volatility", f"{current_vol:.2f}%")
+                with col2:
+                    st.metric("Current Bin", current_vol_bin)
+                with col3:
+                    st.metric("Average Volatility", f"{vol_data['Volatility'].mean():.2f}%")
+                with col4:
+                    st.metric("Max Volatility", f"{vol_data['Volatility'].max():.2f}%")
+                
+                st.write("**Volatility Distribution Table**")
+                st.dataframe(vol_data.tail(50), use_container_width=True)
+                
+                # Volatility Summary
+                st.write("### 📊 Volatility Analysis Summary")
+                
+                high_vol = vol_data[vol_data['Volatility_Bin'].isin(['High', 'Very High'])]
+                low_vol = vol_data[vol_data['Volatility_Bin'].isin(['Low', 'Very Low'])]
+                
+                vol_summary = f"""
+                **Current Market Volatility**: The market is currently experiencing **{current_vol_bin}** volatility at **{current_vol:.2f}%**.
+                
+                **Historical Volatility Context**:
+                - High volatility periods occurred **{len(high_vol)}** times ({(len(high_vol)/len(vol_data)*100):.1f}% of the time)
+                - Low volatility periods occurred **{len(low_vol)}** times ({(len(low_vol)/len(vol_data)*100):.1f}% of the time)
+                """
+                
+                if current_vol_bin in ['Very High', 'High']:
+                    vol_summary += f"""
+                    
+                **High Volatility Implications**:
+                - **Increased Risk**: Wider price swings expected, suggesting larger stop losses
+                - **Breakout Potential**: High volatility often precedes significant directional moves
+                - **Last High Vol Period**: {time_ago(high_vol.index[-2]) if len(high_vol) > 1 else "Current"}
+                - **Strategy**: Consider volatility-based strategies, breakout trades with wider stops
+                - **Expected Move**: Price may move {current_vol * 0.5:.1f}% - {current_vol * 1.5:.1f}% in coming periods
+                """
+                elif current_vol_bin in ['Very Low', 'Low']:
+                    vol_summary += f"""
+                    
+                **Low Volatility Implications**:
+                - **Consolidation Phase**: Market is in a tight range, low momentum
+                - **Breakout Watch**: Low volatility often precedes explosive moves (volatility compression)
+                - **Last Low Vol Period**: {time_ago(low_vol.index[-2]) if len(low_vol) > 1 else "Current"}
+                - **Strategy**: Wait for volatility expansion, avoid large positions
+                - **Expected Move**: Limited movement expected, range-bound trading likely
+                """
+                else:
+                    vol_summary += f"""
+                    
+                **Medium Volatility Implications**:
+                - **Normal Trading Conditions**: Market showing typical price movement patterns
+                - **Balanced Risk**: Neither extreme caution nor aggressive positioning required
+                - **Strategy**: Standard trend-following or mean-reversion strategies applicable
+                - **Expected Move**: Moderate price movements within normal ranges
+                """
+                
+                # Calculate volatility-based rally predictions
+                if len(high_vol) > 5:
+                    high_vol_returns = []
+                    for idx in high_vol.index[-5:]:
+                        try:
+                            idx_pos = vol_data.index.get_loc(idx)
+                            if idx_pos + 5 < len(vol_data):
+                                future_return = abs((vol_data['Close'].iloc[idx_pos + 5] - vol_data['Close'].iloc[idx_pos]) / 
+                                                   vol_data['Close'].iloc[idx_pos] * 100)
+                                high_vol_returns.append(future_return)
+                        except:
+                            pass
+                    
+                    if high_vol_returns:
+                        vol_summary += f"""
+                        
+                **Historical Pattern**: During high volatility periods, the market typically moved **{np.mean(high_vol_returns):.2f}%** (average absolute move) within the next 5 periods. Based on current volatility of {current_vol:.2f}%, expect potential moves of **{current_vol * 0.8:.1f} to {current_vol * 1.2:.1f} points**.
+                """
+                
+                st.markdown(vol_summary)
+                
+                # Volatility chart
+                fig = go.Figure()
+                fig.add_trace(go.Scatter(x=vol_data['DateTime_IST'], y=vol_data['Volatility'], 
+                                        mode='lines', name='Volatility', fill='tozeroy'))
+                fig.update_layout(title="Volatility Over Time", xaxis_title="Date", yaxis_title="Volatility %", height=400)
+                st.plotly_chart(fig, use_container_width=True)
+        
+        current_tab += 1
         
         # Tab 5: Elliott Waves
-        with tabs[5]:
+        with tabs[current_tab]:
             st.subheader("🌊 Elliott Wave Analysis")
             waves = detect_elliott_waves(data1)
+            
             if waves:
                 waves_df = pd.DataFrame(waves)
-                st.dataframe(waves_df, use_container_width=True)
+                waves_df['Start_Date'] = waves_df['start_date'].apply(time_ago)
+                waves_df['End_Date'] = waves_df['end_date'].apply(time_ago)
+                waves_df['Price_Move'] = waves_df['end_price'] - waves_df['start_price']
+                waves_df['Move_%'] = ((waves_df['end_price'] - waves_df['start_price']) / waves_df['start_price']) * 100
+                
+                display_df = waves_df[['wave', 'type', 'start_price', 'end_price', 'Price_Move', 'Move_%', 'Start_Date', 'End_Date']]
+                st.dataframe(display_df, use_container_width=True)
+                
+                # Elliott Wave Summary
+                st.write("### 🌊 Elliott Wave Summary")
+                if len(waves) > 0:
+                    latest_wave = waves[-1]
+                    wave_summary = f"""
+                    **Current Wave Analysis**: The market appears to be in **{latest_wave['wave']}** ({latest_wave['type']} wave).
+                    
+                    - **Wave Started**: {time_ago(latest_wave['start_date'])} at ₹{latest_wave['start_price']:.2f}
+                    - **Current/End Price**: ₹{latest_wave['end_price']:.2f}
+                    - **Wave Movement**: {latest_wave['end_price'] - latest_wave['start_price']:.2f} points ({((latest_wave['end_price'] - latest_wave['start_price'])/latest_wave['start_price']*100):.2f}%)
+                    
+                    **Elliott Wave Theory Implications**:
+                    """
+                    
+                    if latest_wave['type'] == 'Impulse':
+                        wave_summary += """
+                        - **Impulse Wave**: This is a trending wave in the direction of the larger trend
+                        - **Expectation**: After an impulse wave completes, expect a corrective wave (pullback)
+                        - **Trading Strategy**: Look for the corrective wave to end before entering in trend direction
+                        """
+                    else:
+                        wave_summary += """
+                        - **Corrective Wave**: This is a counter-trend wave (pullback/consolidation)
+                        - **Expectation**: After correction completes, trend should resume with next impulse wave
+                        - **Trading Strategy**: Watch for correction completion signals to enter in trend direction
+                        """
+                    
+                    st.markdown(wave_summary)
+            else:
+                st.info("Insufficient data points for Elliott Wave analysis")
         
-        # Tab 6: Fibonacci
-        with tabs[6]:
+        current_tab += 1
+        
+        # Tab 6: Fibonacci Levels
+        with tabs[current_tab]:
             st.subheader("📐 Fibonacci Retracement Levels")
             fib_levels, high, low = calculate_fibonacci_levels(data1)
-            fib_df = pd.DataFrame([
-                {'Level': k, 'Price': f"₹{v:.2f}", 
-                 'Distance from Current': f"{abs(current_price1 - v):.2f} points ({abs((current_price1 - v)/current_price1)*100:.2f}%)"}
-                for k, v in fib_levels.items()
-            ])
+            
+            fib_df = pd.DataFrame([{
+                'Level': k,
+                'Price': f"₹{v:.2f}",
+                'Distance_Points': f"{abs(current_price1 - v):.2f}",
+                'Distance_%': f"{abs((current_price1 - v)/current_price1)*100:.2f}%",
+                'Status': '🔵 Current' if abs(current_price1 - v) < current_price1 * 0.01 else ''
+            } for k, v in fib_levels.items()])
+            
             st.dataframe(fib_df, use_container_width=True)
             
-            # Plot Fibonacci levels
+            # Fibonacci Summary
+            st.write("### 📐 Fibonacci Analysis Summary")
+            nearest_fib = min(fib_levels.items(), key=lambda x: abs(x[1] - current_price1))
+            
+            fib_summary = f"""
+            **Current Price Position**: ₹{current_price1:.2f} is nearest to the **{nearest_fib[0]} Fibonacci level** at ₹{nearest_fib[1]:.2f}
+            
+            **Fibonacci Range**: 
+            - **High**: ₹{high:.2f} ({time_ago(data1[data1['High'] == high].index[0])})
+            - **Low**: ₹{low:.2f} ({time_ago(data1[data1['Low'] == low].index[0])})
+            - **Range**: {high - low:.2f} points
+            
+            **Key Support Levels** (below current price):
+            """
+            
+            below_levels = {k: v for k, v in fib_levels.items() if v < current_price1}
+            for level, price in sorted(below_levels.items(), key=lambda x: x[1], reverse=True)[:3]:
+                distance = current_price1 - price
+                fib_summary += f"\n- **{level}**: ₹{price:.2f} ({distance:.2f} points away, {(distance/current_price1)*100:.2f}%)"
+            
+            fib_summary += "\n\n**Key Resistance Levels** (above current price):"
+            above_levels = {k: v for k, v in fib_levels.items() if v > current_price1}
+            for level, price in sorted(above_levels.items(), key=lambda x: x[1])[:3]:
+                distance = price - current_price1
+                fib_summary += f"\n- **{level}**: ₹{price:.2f} ({distance:.2f} points away, {(distance/current_price1)*100:.2f}%)"
+            
+            fib_summary += f"""
+            
+            **Trading Implications**:
+            - The **61.8% (Golden Ratio)** level at ₹{fib_levels['61.8%']:.2f} is historically the most reliable support/resistance
+            - The **50% level** at ₹{fib_levels['50.0%']:.2f} often acts as a psychological pivot point
+            - Watch for price reactions at these key Fibonacci levels for potential reversals or bounces
+            """
+            
+            st.markdown(fib_summary)
+            
+            # Plot
             fig = go.Figure()
             fig.add_trace(go.Scatter(x=data1.index, y=data1['Close'], mode='lines', name='Price'))
             for level_name, level_price in fib_levels.items():
-                fig.add_hline(y=level_price, line_dash="dash", 
-                              annotation_text=f"{level_name}: {level_price:.2f}")
+                fig.add_hline(y=level_price, line_dash="dash", annotation_text=f"{level_name}: {level_price:.2f}")
             fig.update_layout(title="Fibonacci Retracement Levels", height=500)
             st.plotly_chart(fig, use_container_width=True)
         
+        current_tab += 1
+        
         # Tab 7: RSI Divergence
-        with tabs[7]:
+        with tabs[current_tab]:
             st.subheader("🔄 RSI Divergence Analysis")
             data1['RSI'] = calculate_rsi(data1['Close'])
             divergences = detect_rsi_divergence(data1, data1['RSI'])
@@ -674,309 +976,606 @@ def main():
             if divergences:
                 st.write(f"**Found {len(divergences)} RSI Divergences**")
                 
-                for div in divergences:
-                    status = "✅ Resolved" if div['resolved'] else "⏳ Active"
-                    color = "green" if div['type'] == 'Bullish' else "red"
-                    
-                    st.markdown(f"""
-                    ### {div['type']} Divergence {status}
-                    - **Price Movement**: {div['price1']:.2f} → {div['price2']:.2f} 
-                    - **RSI Movement**: {div['rsi1']:.2f} → {div['rsi2']:.2f}
-                    - **Period**: {time_ago(div['date1'])} to {time_ago(div['date2'])}
-                    - **Status**: {status}
-                    """)
+                active_divs = [d for d in divergences if not d['resolved']]
+                resolved_divs = [d for d in divergences if d['resolved']]
+                
+                if active_divs:
+                    st.success(f"### ⏳ {len(active_divs)} Active Divergence(s)")
+                    for div in active_divs:
+                        color = "green" if div['type'] == 'Bullish' else "red"
+                        expected_move = abs(div['price2'] - div['price1'])
+                        
+                        st.markdown(f"""
+                        #### {div['type']} Divergence (ACTIVE)
+                        - **Price Movement**: ₹{div['price1']:.2f} → ₹{div['price2']:.2f} ({time_ago(div['date1'])} to {time_ago(div['date2'])})
+                        - **RSI Movement**: {div['rsi1']:.2f} → {div['rsi2']:.2f}
+                        - **Expected Move**: Approximately {expected_move:.2f} points {"upward" if div['type'] == 'Bullish' else "downward"}
+                        - **Target Price**: ₹{div['price2'] + expected_move if div['type'] == 'Bullish' else div['price2'] - expected_move:.2f}
+                        - **Status**: ⏳ Divergence not yet resolved, watching for price confirmation
+                        """)
+                
+                if resolved_divs:
+                    st.info(f"### ✅ {len(resolved_divs)} Resolved Divergence(s)")
                 
                 div_df = pd.DataFrame([{
                     'Type': d['type'],
-                    'Price 1': f"₹{d['price1']:.2f}",
-                    'Price 2': f"₹{d['price2']:.2f}",
-                    'Date 1': time_ago(d['date1']),
-                    'Date 2': time_ago(d['date2']),
-                    'RSI 1': f"{d['rsi1']:.2f}",
-                    'RSI 2': f"{d['rsi2']:.2f}",
-                    'Resolved': d['resolved']
+                    'Price_1': f"₹{d['price1']:.2f}",
+                    'Price_2': f"₹{d['price2']:.2f}",
+                    'Date_1': time_ago(d['date1']),
+                    'Date_2': time_ago(d['date2']),
+                    'RSI_1': f"{d['rsi1']:.2f}",
+                    'RSI_2': f"{d['rsi2']:.2f}",
+                    'Resolved': '✅' if d['resolved'] else '⏳'
                 } for d in divergences])
                 
                 st.dataframe(div_df, use_container_width=True)
+                
+                # Summary
+                st.write("### 📊 RSI Divergence Summary")
+                bullish_count = len([d for d in divergences if d['type'] == 'Bullish'])
+                bearish_count = len([d for d in divergences if d['type'] == 'Bearish'])
+                
+                div_summary = f"""
+                **Divergence Statistics**:
+                - **Bullish Divergences**: {bullish_count} (suggesting upward reversals)
+                - **Bearish Divergences**: {bearish_count} (suggesting downward reversals)
+                - **Active Divergences**: {len(active_divs)} (unresolved, watching closely)
+                - **Resolved Divergences**: {len(resolved_divs)} (already played out)
+                
+                **What RSI Divergence Means**:
+                - **Bullish Divergence**: Price makes lower lows but RSI makes higher lows → Weakening downtrend, potential reversal up
+                - **Bearish Divergence**: Price makes higher highs but RSI makes lower highs → Weakening uptrend, potential reversal down
+                
+                **Trading Strategy**:
+                """
+                
+                if active_divs:
+                    active_div = active_divs[0]
+                    if active_div['type'] == 'Bullish':
+                        div_summary += f"""
+                        - **Active Bullish Divergence** detected from {time_ago(active_div['date1'])} to {time_ago(active_div['date2'])}
+                        - **Recommendation**: Watch for bullish confirmation (price breaking above recent highs)
+                        - **Potential Target**: ₹{active_div['price2'] + abs(active_div['price2'] - active_div['price1']):.2f}
+                        - **Stop Loss**: Below ₹{active_div['price2']:.2f}
+                        """
+                    else:
+                        div_summary += f"""
+                        - **Active Bearish Divergence** detected from {time_ago(active_div['date1'])} to {time_ago(active_div['date2'])}
+                        - **Recommendation**: Watch for bearish confirmation (price breaking below recent lows)
+                        - **Potential Target**: ₹{active_div['price2'] - abs(active_div['price2'] - active_div['price1']):.2f}
+                        - **Stop Loss**: Above ₹{active_div['price2']:.2f}
+                        """
+                else:
+                    div_summary += "\n- No active divergences currently, monitor for new formations"
+                
+                st.markdown(div_summary)
             else:
                 st.info("No RSI divergences detected in the current dataset")
         
-        # Tab 8: Ratio Analysis
-        if enable_ratio and data2 is not None:
-            with tabs[8]:
+        current_tab += 1
+        
+        # Tab 8: Ratio Analysis (conditional)
+        if enable_ratio and mtf_data2:
+            with tabs[current_tab]:
                 st.subheader("⚖️ Ratio Analysis")
                 
-                # Align data
-                common_idx = data1.index.intersection(data2.index)
-                if len(common_idx) > 0:
-                    d1_aligned = data1.loc[common_idx]
-                    d2_aligned = data2.loc[common_idx]
+                # Use first available matching timeframe
+                common_keys = set(mtf_data.keys()).intersection(set(mtf_data2.keys()))
+                if common_keys:
+                    key = list(common_keys)[0]
+                    d1 = mtf_data[key]
+                    d2 = mtf_data2[key]
                     
-                    ratio_df = pd.DataFrame({
-                        'DateTime': common_idx,
-                        'Ticker 1 Price': d1_aligned['Close'],
-                        'Ticker 2 Price': d2_aligned['Close'],
-                        'Ratio': d1_aligned['Close'] / d2_aligned['Close'],
-                        'Ticker 1 RSI': calculate_rsi(d1_aligned['Close']),
-                        'Ticker 2 RSI': calculate_rsi(d2_aligned['Close']),
-                        'Ratio RSI': calculate_rsi(d1_aligned['Close'] / d2_aligned['Close']),
-                        'Ticker 1 Volatility': d1_aligned['Close'].pct_change().rolling(20).std() * np.sqrt(252) * 100,
-                        'Ticker 2 Volatility': d2_aligned['Close'].pct_change().rolling(20).std() * np.sqrt(252) * 100
-                    })
-                    
-                    st.dataframe(ratio_df.tail(50), use_container_width=True)
-                    
-                    # Export functionality
-                    csv = ratio_df.to_csv(index=False)
-                    st.download_button(
-                        label="📥 Download Ratio Analysis as CSV",
-                        data=csv,
-                        file_name=f"ratio_analysis_{ticker1}_{ticker2}.csv",
-                        mime="text/csv"
-                    )
-                    
-                    # Plot comparison
-                    fig = make_subplots(rows=2, cols=1, shared_xaxes=True,
-                                       subplot_titles=(f'{ticker1} vs {ticker2} Prices', 'Ratio'))
-                    
-                    fig.add_trace(go.Scatter(x=common_idx, y=d1_aligned['Close'], 
-                                            name=ticker1), row=1, col=1)
-                    fig.add_trace(go.Scatter(x=common_idx, y=d2_aligned['Close'], 
-                                            name=ticker2), row=1, col=1)
-                    fig.add_trace(go.Scatter(x=common_idx, y=ratio_df['Ratio'], 
-                                            name='Ratio', line=dict(color='purple')), row=2, col=1)
-                    
-                    fig.update_layout(height=700, title_text="Price Comparison & Ratio")
-                    st.plotly_chart(fig, use_container_width=True)
+                    common_idx = d1.index.intersection(d2.index)
+                    if len(common_idx) > 0:
+                        d1_aligned = d1.loc[common_idx]
+                        d2_aligned = d2.loc[common_idx]
+                        
+                        ratio_df = pd.DataFrame({
+                            'DateTime_IST': common_idx,
+                            'Ticker1_Price': d1_aligned['Close'],
+                            'Ticker2_Price': d2_aligned['Close'],
+                            'Ratio': d1_aligned['Close'] / d2_aligned['Close'],
+                            'Ticker1_RSI': calculate_rsi(d1_aligned['Close']),
+                            'Ticker2_RSI': calculate_rsi(d2_aligned['Close']),
+                            'Ratio_RSI': calculate_rsi(d1_aligned['Close'] / d2_aligned['Close']),
+                            'Ticker1_Vol': d1_aligned['Close'].pct_change().rolling(20).std() * 100,
+                            'Ticker2_Vol': d2_aligned['Close'].pct_change().rolling(20).std() * 100
+                        })
+                        
+                        st.dataframe(ratio_df.tail(50), use_container_width=True)
+                        
+                        csv = ratio_df.to_csv(index=False)
+                        st.download_button("📥 Download Ratio Analysis", csv, 
+                                         f"ratio_{ticker1}_{ticker2}.csv", "text/csv")
+                        
+                        # Plot
+                        fig = make_subplots(rows=3, cols=1, shared_xaxes=True,
+                                          subplot_titles=(f'{ticker1} Price', f'{ticker2} Price', 'Ratio'))
+                        
+                        fig.add_trace(go.Scatter(x=common_idx, y=d1_aligned['Close'], 
+                                                name=ticker1, line=dict(color='blue')), row=1, col=1)
+                        fig.add_trace(go.Scatter(x=common_idx, y=d2_aligned['Close'], 
+                                                name=ticker2, line=dict(color='orange')), row=2, col=1)
+                        fig.add_trace(go.Scatter(x=common_idx, y=ratio_df['Ratio'], 
+                                                name='Ratio', line=dict(color='purple')), row=3, col=1)
+                        
+                        fig.update_layout(height=900, title_text="Price Comparison & Ratio")
+                        st.plotly_chart(fig, use_container_width=True)
+                    else:
+                        st.warning("No overlapping timestamps between tickers")
                 else:
-                    st.warning("No overlapping timestamps between tickers (e.g., 24x7 crypto vs market hours stocks)")
+                    st.warning("No common timeframes available for ratio analysis")
+            
+            current_tab += 1
         
         # Tab 9: AI Signals
-        with tabs[-2]:
-            st.subheader("🤖 AI-Powered Trading Signals")
+        with tabs[current_tab]:
+            st.subheader("🤖 AI-Powered Trading Signals & Multi-Timeframe Forecast")
             
-            # Calculate all indicators
-            data1['RSI'] = calculate_rsi(data1['Close'])
-            data1['EMA_9'] = calculate_ema(data1['Close'], 9)
-            data1['EMA_20'] = calculate_ema(data1['Close'], 20)
-            data1['EMA_50'] = calculate_ema(data1['Close'], 50)
-            data1['Volatility'] = data1['Close'].pct_change().rolling(20).std() * np.sqrt(252) * 100
+            # Aggregate signals from all timeframes
+            all_signals = []
             
+            for tf_period, data in list(mtf_data.items())[:10]:  # Analyze top 10 timeframes
+                tf, period = tf_period.split('_')
+                
+                data['RSI'] = calculate_rsi(data['Close'])
+                data['EMA_9'] = calculate_ema(data['Close'], 9)
+                data['EMA_20'] = calculate_ema(data['Close'], 20)
+                data['EMA_50'] = calculate_ema(data['Close'], 50)
+                
+                current_price = data['Close'].iloc[-1]
+                current_rsi = data['RSI'].iloc[-1]
+                
+                sr_levels = find_support_resistance(data)
+                divergences = detect_rsi_divergence(data, data['RSI'])
+                
+                score = 0
+                signals = []
+                
+                # RSI
+                if current_rsi < 30:
+                    score += 20
+                    signals.append("RSI Oversold")
+                elif current_rsi > 70:
+                    score -= 20
+                    signals.append("RSI Overbought")
+                
+                # EMA
+                if current_price > data['EMA_20'].iloc[-1] > data['EMA_50'].iloc[-1]:
+                    score += 15
+                    signals.append("Bullish EMA alignment")
+                elif current_price < data['EMA_20'].iloc[-1] < data['EMA_50'].iloc[-1]:
+                    score -= 15
+                    signals.append("Bearish EMA alignment")
+                
+                # Support/Resistance
+                nearby_support = [l for l in sr_levels if l['type'] == 'Support' and 
+                                abs(current_price - l['price']) < current_price * 0.02]
+                nearby_resistance = [l for l in sr_levels if l['type'] == 'Resistance' and 
+                                   abs(current_price - l['price']) < current_price * 0.02]
+                
+                if nearby_support:
+                    score += 20
+                    signals.append(f"Near support at ₹{nearby_support[0]['price']:.2f}")
+                if nearby_resistance:
+                    score -= 20
+                    signals.append(f"Near resistance at ₹{nearby_resistance[0]['price']:.2f}")
+                
+                # Divergences
+                active_bull_div = [d for d in divergences if d['type'] == 'Bullish' and not d['resolved']]
+                active_bear_div = [d for d in divergences if d['type'] == 'Bearish' and not d['resolved']]
+                
+                if active_bull_div:
+                    score += 25
+                    signals.append("Bullish RSI divergence")
+                if active_bear_div:
+                    score -= 25
+                    signals.append("Bearish RSI divergence")
+                
+                all_signals.append({
+                    'timeframe': tf,
+                    'period': period,
+                    'score': score,
+                    'signals': signals,
+                    'price': current_price
+                })
+            
+            # Aggregate scores
+            total_score = sum(s['score'] for s in all_signals)
+            avg_score = total_score / len(all_signals) if all_signals else 0
+            
+            # Determine final signal
+            if avg_score > 30:
+                signal = "🟢 STRONG BUY"
+                confidence = min(95, 60 + abs(avg_score) * 0.5)
+                direction = "BULLISH"
+            elif avg_score > 15:
+                signal = "🟢 BUY"
+                confidence = min(85, 60 + abs(avg_score) * 0.5)
+                direction = "BULLISH"
+            elif avg_score < -30:
+                signal = "🔴 STRONG SELL"
+                confidence = min(95, 60 + abs(avg_score) * 0.5)
+                direction = "BEARISH"
+            elif avg_score < -15:
+                signal = "🔴 SELL"
+                confidence = min(85, 60 + abs(avg_score) * 0.5)
+                direction = "BEARISH"
+            else:
+                signal = "🟡 HOLD/NEUTRAL"
+                confidence = 50
+                direction = "NEUTRAL"
+            
+            # Calculate entry, SL, target
+            entry = current_price1
+            if direction == "BULLISH":
+                sl = entry * 0.97
+                target = entry * 1.05
+            elif direction == "BEARISH":
+                sl = entry * 1.03
+                target = entry * 0.95
+            else:
+                sl = None
+                target = None
+            
+            # Display
+            st.markdown(f"""
+            ## {signal}
+            ### Confidence: {confidence:.1f}%
+            ### Multi-Timeframe Score: {avg_score:.1f}
+            
+            **Current Price**: ₹{entry:.2f}  
+            **Entry Price**: ₹{entry:.2f}  
+            {"**Stop Loss**: ₹" + f"{sl:.2f} ({abs(entry-sl):.2f} points, {abs((entry-sl)/entry)*100:.2f}%)" if sl else ""}  
+            {"**Target**: ₹" + f"{target:.2f} ({abs(target-entry):.2f} points, {abs((target-entry)/entry)*100:.2f}%)" if target else ""}  
+            {"**Risk:Reward Ratio**: " + f"{abs((target-entry)/entry) / abs((entry-sl)/entry):.2f}:1" if sl and target else ""}
+            """)
+            
+            st.markdown("---")
+            st.markdown("### 📋 Multi-Timeframe Signal Breakdown")
+            
+            signals_df = pd.DataFrame([{
+                'Timeframe': s['timeframe'],
+                'Period': s['period'],
+                'Score': f"{s['score']:+d}",
+                'Bias': "🟢 Bullish" if s['score'] > 0 else "🔴 Bearish" if s['score'] < 0 else "🟡 Neutral",
+                'Key_Signals': ", ".join(s['signals'][:3]) if s['signals'] else "No strong signals"
+            } for s in all_signals])
+            
+            st.dataframe(signals_df, use_container_width=True)
+            
+            # Comprehensive Analysis Summary
+            st.markdown("---")
+            st.markdown("### 🔍 Comprehensive Market Analysis & Forecast")
+            
+            # Get all analysis data
+            zscore_data = calculate_zscore_bins(data1)
+            vol_data = calculate_volatility_bins(data1)
             sr_levels = find_support_resistance(data1)
             fib_levels, _, _ = calculate_fibonacci_levels(data1)
             divergences = detect_rsi_divergence(data1, data1['RSI'])
             
-            current_price = data1['Close'].iloc[-1]
-            current_rsi = data1['RSI'].iloc[-1]
-            price_vs_ema20 = current_price > data1['EMA_20'].iloc[-1]
-            price_vs_ema50 = current_price > data1['EMA_50'].iloc[-1]
+            current_zscore = zscore_data['Z_Score'].iloc[-1] if not zscore_data.empty else 0
+            current_vol = vol_data['Volatility'].iloc[-1] if not vol_data.empty else 0
             
-            # Signal Generation Logic
-            signals = []
-            signal_type = "NEUTRAL"
-            confidence = 0
+            bullish_factors = []
+            bearish_factors = []
+            neutral_factors = []
             
-            # Check support/resistance proximity
-            nearby_support = [l for l in sr_levels if l['type'] == 'Support' 
-                            and abs(current_price - l['price']) < current_price * 0.02]
-            nearby_resistance = [l for l in sr_levels if l['type'] == 'Resistance' 
-                               and abs(current_price - l['price']) < current_price * 0.02]
-            
-            # Bullish Signals
-            bullish_score = 0
-            if current_rsi < 30:
-                signals.append("✅ RSI Oversold (RSI < 30)")
-                bullish_score += 20
-            if price_vs_ema20 and price_vs_ema50:
-                signals.append("✅ Price above 20 EMA and 50 EMA")
-                bullish_score += 15
-            if nearby_support:
-                signals.append(f"✅ Near strong support at ₹{nearby_support[0]['price']:.2f} (Hit {nearby_support[0]['count']} times)")
-                bullish_score += 20
-            
-            bullish_divs = [d for d in divergences if d['type'] == 'Bullish' and not d['resolved']]
-            if bullish_divs:
-                signals.append("✅ Active Bullish RSI Divergence detected")
-                bullish_score += 25
-            
-            # Bearish Signals
-            bearish_score = 0
-            if current_rsi > 70:
-                signals.append("⚠️ RSI Overbought (RSI > 70)")
-                bearish_score += 20
-            if not price_vs_ema20 and not price_vs_ema50:
-                signals.append("⚠️ Price below 20 EMA and 50 EMA")
-                bearish_score += 15
-            if nearby_resistance:
-                signals.append(f"⚠️ Near strong resistance at ₹{nearby_resistance[0]['price']:.2f} (Hit {nearby_resistance[0]['count']} times)")
-                bearish_score += 20
-            
-            bearish_divs = [d for d in divergences if d['type'] == 'Bearish' and not d['resolved']]
-            if bearish_divs:
-                signals.append("⚠️ Active Bearish RSI Divergence detected")
-                bearish_score += 25
-            
-            # Determine final signal
-            net_score = bullish_score - bearish_score
-            
-            if net_score > 30:
-                signal_type = "🟢 STRONG BUY"
-                confidence = min(bullish_score, 95)
-                entry = current_price
-                sl = current_price * 0.97
-                target = current_price * 1.05
-            elif net_score > 15:
-                signal_type = "🟢 BUY"
-                confidence = min(bullish_score, 85)
-                entry = current_price
-                sl = current_price * 0.98
-                target = current_price * 1.03
-            elif net_score < -30:
-                signal_type = "🔴 STRONG SELL"
-                confidence = min(bearish_score, 95)
-                entry = current_price
-                sl = current_price * 1.03
-                target = current_price * 0.95
-            elif net_score < -15:
-                signal_type = "🔴 SELL"
-                confidence = min(bearish_score, 85)
-                entry = current_price
-                sl = current_price * 1.02
-                target = current_price * 0.97
+            # Analyze each component
+            if current_price1 > data1['EMA_20'].iloc[-1]:
+                bullish_factors.append(f"Price (₹{current_price1:.2f}) above 20 EMA (₹{data1['EMA_20'].iloc[-1]:.2f})")
             else:
-                signal_type = "🟡 HOLD/NEUTRAL"
-                confidence = 50
-                entry = current_price
-                sl = None
-                target = None
+                bearish_factors.append(f"Price (₹{current_price1:.2f}) below 20 EMA (₹{data1['EMA_20'].iloc[-1]:.2f})")
             
-            # Display Signal
-            st.markdown(f"""
-            ## {signal_type}
-            ### Confidence: {confidence}%
+            if data1['RSI'].iloc[-1] < 30:
+                bullish_factors.append(f"RSI oversold at {data1['RSI'].iloc[-1]:.2f}, suggesting bounce")
+            elif data1['RSI'].iloc[-1] > 70:
+                bearish_factors.append(f"RSI overbought at {data1['RSI'].iloc[-1]:.2f}, suggesting correction")
             
-            **Current Price**: ₹{current_price:.2f}  
-            **Entry Price**: ₹{entry:.2f}  
-            {"**Stop Loss**: ₹" + f"{sl:.2f}" if sl else ""}  
-            {"**Target**: ₹" + f"{target:.2f}" if target else ""}  
-            {"**Risk**: " + f"{abs(entry - sl):.2f} points ({abs((entry - sl)/entry)*100:.2f}%)" if sl else ""}  
-            {"**Reward**: " + f"{abs(target - entry):.2f} points ({abs((target - entry)/entry)*100:.2f}%)" if target else ""}  
-            """)
+            nearby_support = [l for l in sr_levels if l['type'] == 'Support' and 
+                            abs(current_price1 - l['price']) < current_price1 * 0.02]
+            nearby_resistance = [l for l in sr_levels if l['type'] == 'Resistance' and 
+                               abs(current_price1 - l['price']) < current_price1 * 0.02]
             
-            st.markdown("### 📋 Analysis Summary")
-            for signal in signals:
-                st.markdown(f"- {signal}")
+            if nearby_support:
+                bullish_factors.append(f"Near strong support at ₹{nearby_support[0]['price']:.2f} (tested {nearby_support[0]['count']} times, {(nearby_support[0]['sustained']/nearby_support[0]['count']*100):.0f}% accuracy)")
             
-            # Comprehensive Analysis
-            st.markdown("---")
-            st.markdown("### 🔍 Comprehensive Market Analysis")
+            if nearby_resistance:
+                bearish_factors.append(f"Near strong resistance at ₹{nearby_resistance[0]['price']:.2f} (tested {nearby_resistance[0]['count']} times)")
             
-            analysis_text = f"""
-            **Technical Position**: The {ticker1} is currently trading at ₹{current_price:.2f} with RSI at {current_rsi:.2f}. 
-            The price is {"above" if price_vs_ema20 else "below"} the 20-period EMA (₹{data1['EMA_20'].iloc[-1]:.2f}) 
-            and {"above" if price_vs_ema50 else "below"} the 50-period EMA (₹{data1['EMA_50'].iloc[-1]:.2f}).
+            active_bull_div = [d for d in divergences if d['type'] == 'Bullish' and not d['resolved']]
+            active_bear_div = [d for d in divergences if d['type'] == 'Bearish' and not d['resolved']]
             
-            **Support/Resistance**: {f"Price is near strong support at ₹{nearby_support[0]['price']:.2f} which has been tested {nearby_support[0]['count']} times" if nearby_support else ""} 
-            {f"Price is near strong resistance at ₹{nearby_resistance[0]['price']:.2f} which has been tested {nearby_resistance[0]['count']} times" if nearby_resistance else ""}
-            {f"Next major support: ₹{sr_levels[0]['price']:.2f}" if sr_levels and sr_levels[0]['type'] == 'Support' else ""}
+            if active_bull_div:
+                bullish_factors.append(f"Active bullish RSI divergence from {time_ago(active_bull_div[0]['date1'])}")
+            if active_bear_div:
+                bearish_factors.append(f"Active bearish RSI divergence from {time_ago(active_bear_div[0]['date1'])}")
             
-            **Pattern Analysis**: {f"Bullish divergence detected - price making lower lows while RSI making higher lows, suggesting potential reversal" if bullish_divs else ""}
-            {f"Bearish divergence detected - price making higher highs while RSI making lower highs, suggesting potential correction" if bearish_divs else ""}
+            if current_zscore < -2:
+                bullish_factors.append(f"Extreme negative Z-Score ({current_zscore:.2f}), mean reversion expected upward")
+            elif current_zscore > 2:
+                bearish_factors.append(f"Extreme positive Z-Score ({current_zscore:.2f}), mean reversion expected downward")
             
-            **Volatility**: Current volatility is {data1['Volatility'].iloc[-1]:.2f}%, indicating {"high" if data1['Volatility'].iloc[-1] > 30 else "moderate" if data1['Volatility'].iloc[-1] > 15 else "low"} market volatility.
+            if current_vol > vol_data['Volatility'].mean() * 1.5:
+                neutral_factors.append(f"Very high volatility ({current_vol:.2f}%), expect larger moves in either direction")
             
-            **Recommendation**: Based on multi-timeframe analysis across {len(data1)} data points, the signal is {signal_type} with {confidence}% confidence.
-            Key factors: {"Strong momentum with price above key EMAs" if bullish_score > bearish_score else "Weakening momentum with price below key EMAs" if bearish_score > bullish_score else "Sideways consolidation"}
+            # Create comprehensive summary
+            summary = f"""
+            **MARKET FORECAST FOR {ticker1}**
+            
+            **Overall Signal**: {signal} with {confidence:.1f}% confidence based on analysis of {len(all_signals)} timeframes
+            
+            **Current Market State**:
+            - Price: ₹{current_price1:.2f}
+            - RSI: {data1['RSI'].iloc[-1]:.2f}
+            - 20 EMA: ₹{data1['EMA_20'].iloc[-1]:.2f}
+            - 50 EMA: ₹{data1['EMA_50'].iloc[-1]:.2f}
+            - Volatility: {current_vol:.2f}%
+            - Z-Score: {current_zscore:.2f}
+            
+            **BULLISH FACTORS ({len(bullish_factors)}):**
             """
             
-            st.markdown(analysis_text)
+            for i, factor in enumerate(bullish_factors, 1):
+                summary += f"\n{i}. {factor}"
+            
+            summary += f"\n\n**BEARISH FACTORS ({len(bearish_factors)}):**"
+            for i, factor in enumerate(bearish_factors, 1):
+                summary += f"\n{i}. {factor}"
+            
+            if neutral_factors:
+                summary += f"\n\n**NEUTRAL/CAUTION FACTORS ({len(neutral_factors)}):**"
+                for i, factor in enumerate(neutral_factors, 1):
+                    summary += f"\n{i}. {factor}"
+            
+            summary += f"""
+            
+            **RECOMMENDED ACTION**:
+            """
+            
+            if direction == "BULLISH":
+                expected_move = abs(target - entry) if target else current_price1 * 0.05
+                summary += f"""
+                - **Direction**: BUY/LONG
+                - **Entry**: ₹{entry:.2f} (current market price)
+                - **Stop Loss**: ₹{sl:.2f} (risk of {abs(entry-sl):.2f} points or {abs((entry-sl)/entry)*100:.2f}%)
+                - **Target 1**: ₹{target:.2f} (reward of {abs(target-entry):.2f} points or {abs((target-entry)/entry)*100:.2f}%)
+                - **Target 2**: ₹{entry + expected_move * 1.5:.2f} (extended target)
+                - **Expected Move**: {expected_move:.2f} points upward
+                - **Time Horizon**: {period} (based on primary analysis timeframe)
+                
+                **REASONING**: The confluence of {len(bullish_factors)} bullish factors across multiple timeframes suggests upward momentum. 
+                Key support from technical indicators, price action patterns, and statistical models align for a high-probability bullish move.
+                """
+            elif direction == "BEARISH":
+                expected_move = abs(entry - target) if target else current_price1 * 0.05
+                summary += f"""
+                - **Direction**: SELL/SHORT
+                - **Entry**: ₹{entry:.2f} (current market price)
+                - **Stop Loss**: ₹{sl:.2f} (risk of {abs(sl-entry):.2f} points or {abs((sl-entry)/entry)*100:.2f}%)
+                - **Target 1**: ₹{target:.2f} (reward of {abs(entry-target):.2f} points or {abs((entry-target)/entry)*100:.2f}%)
+                - **Target 2**: ₹{entry - expected_move * 1.5:.2f} (extended target)
+                - **Expected Move**: {expected_move:.2f} points downward
+                - **Time Horizon**: {period} (based on primary analysis timeframe)
+                
+                **REASONING**: The presence of {len(bearish_factors)} bearish factors indicates downward pressure. 
+                Technical weakness combined with negative divergences and resistance levels suggest a high-probability bearish move.
+                """
+            else:
+                summary += f"""
+                - **Direction**: HOLD/WAIT
+                - **Current Status**: Market is in consolidation/sideways mode
+                - **Action**: Stay on sidelines, wait for clearer directional signals
+                
+                **REASONING**: Conflicting signals across timeframes ({len(bullish_factors)} bullish vs {len(bearish_factors)} bearish factors) 
+                suggest market indecision. Waiting for stronger confirmation reduces risk of whipsaw trades.
+                """
+            
+            summary += f"""
+            
+            **RISK MANAGEMENT**:
+            - Never risk more than 1-2% of capital on a single trade
+            - Use proper position sizing based on stop loss distance
+            - Trail stop loss as trade moves in your favor
+            - Monitor key support/resistance levels for early exit signals
+            
+            **CONFIDENCE BREAKDOWN**:
+            - Technical Score: {avg_score:.1f}/100
+            - Number of Confirming Timeframes: {len([s for s in all_signals if (s['score'] > 0 and direction == 'BULLISH') or (s['score'] < 0 and direction == 'BEARISH')])}/{len(all_signals)}
+            - Pattern Reliability: {confidence:.1f}%
+            """
+            
+            st.markdown(summary)
             
             # Pattern Performance
             st.markdown("---")
-            st.markdown("### 📊 What's Working / Not Working")
+            st.markdown("### 📊 What's Working vs What's Not Working")
             
             col1, col2 = st.columns(2)
+            
             with col1:
-                st.success("**✅ Working Patterns**")
-                if bullish_score > 0:
-                    st.write(f"- Bullish indicators showing {bullish_score}% strength")
-                if nearby_support:
-                    st.write(f"- Support levels holding with {nearby_support[0]['sustained']}/{nearby_support[0]['count']} sustains")
+                st.success("**✅ WORKING PATTERNS**")
+                for factor in bullish_factors[:5]:
+                    st.write(f"• {factor}")
             
             with col2:
-                st.error("**⚠️ Caution Areas**")
-                if bearish_score > 0:
-                    st.write(f"- Bearish indicators showing {bearish_score}% strength")
-                if nearby_resistance:
-                    st.write(f"- Resistance overhead at ₹{nearby_resistance[0]['price']:.2f}")
+                st.error("**⚠️ NOT WORKING / CAUTION**")
+                for factor in bearish_factors[:5]:
+                    st.write(f"• {factor}")
+        
+        current_tab += 1
         
         # Tab 10: Backtesting
-        with tabs[-1]:
-            st.subheader("🔬 Strategy Backtesting")
+        with tabs[current_tab]:
+            st.subheader("🔬 Multi-Strategy Backtesting")
             
-            strategy_type = st.selectbox(
-                "Select Strategy",
-                ["RSI + EMA Strategy", "Support/Resistance Bounce", "Moving Average Crossover"]
-            )
+            strategy_options = ["RSI + EMA Strategy", "EMA Crossover", "Volatility Breakout", 
+                              "RSI Divergence", "Support/Resistance Bounce"]
             
-            if st.button("🚀 Run Backtest"):
-                with st.spinner("Running backtest..."):
-                    trades_df, total_pnl, win_rate = backtest_strategy(data1, 'rsi_ema')
+            selected_strategies = st.multiselect("Select Strategies to Backtest", 
+                                                strategy_options, 
+                                                default=["RSI + EMA Strategy"])
+            
+            if st.button("🚀 Run Backtests on All Timeframes"):
+                results_summary = []
+                
+                progress_bar = st.progress(0)
+                status_text = st.empty()
+                
+                strategy_mapping = {
+                    "RSI + EMA Strategy": "rsi_ema",
+                    "EMA Crossover": "ema_crossover",
+                    "Volatility Breakout": "volatility"
+                }
+                
+                total_tests = len(selected_strategies) * len(list(mtf_data.items())[:5])
+                current_test = 0
+                
+                for strategy_name in selected_strategies:
+                    strategy_type = strategy_mapping.get(strategy_name, "rsi_ema")
+                    
+                    for tf_period, data in list(mtf_data.items())[:5]:
+                        current_test += 1
+                        progress_bar.progress(current_test / total_tests)
+                        status_text.text(f"Testing {strategy_name} on {tf_period}... ({current_test}/{total_tests})")
+                        
+                        tf, period = tf_period.split('_')
+                        trades_df, total_pnl, win_rate = backtest_strategy(data, strategy_type)
+                        
+                        if not trades_df.empty:
+                            results_summary.append({
+                                'Strategy': strategy_name,
+                                'Timeframe': tf,
+                                'Period': period,
+                                'Total_Trades': len(trades_df),
+                                'Win_Rate_%': f"{win_rate:.2f}%",
+                                'Total_PnL_%': f"{total_pnl:.2f}%",
+                                'Avg_Win': f"{trades_df[trades_df['PnL_%'] > 0]['PnL_%'].mean():.2f}%" if len(trades_df[trades_df['PnL_%'] > 0]) > 0 else "0%",
+                                'Avg_Loss': f"{trades_df[trades_df['PnL_%'] < 0]['PnL_%'].mean():.2f}%" if len(trades_df[trades_df['PnL_%'] < 0]) > 0 else "0%",
+                                'Best_Trade': f"{trades_df['PnL_%'].max():.2f}%",
+                                'Worst_Trade': f"{trades_df['PnL_%'].min():.2f}%"
+                            })
+                
+                progress_bar.empty()
+                status_text.empty()
+                
+                if results_summary:
+                    st.success(f"✅ Completed {len(results_summary)} backtests!")
+                    
+                    results_df = pd.DataFrame(results_summary)
+                    st.dataframe(results_df, use_container_width=True)
+                    
+                    # Summary statistics
+                    st.markdown("### 📊 Backtest Performance Summary")
+                    
+                    best_strategy = results_df.loc[results_df['Total_PnL_%'].apply(lambda x: float(x.strip('%'))).idxmax()]
+                    
+                    col1, col2, col3 = st.columns(3)
+                    with col1:
+                        st.metric("Best Strategy", best_strategy['Strategy'])
+                    with col2:
+                        st.metric("Best Timeframe", f"{best_strategy['Timeframe']}/{best_strategy['Period']}")
+                    with col3:
+                        st.metric("Best PnL", best_strategy['Total_PnL_%'])
+                    
+                    # Export
+                    csv = results_df.to_csv(index=False)
+                    st.download_button("📥 Download All Backtest Results", csv, 
+                                     f"backtests_{ticker1}.csv", "text/csv")
+                    
+                    # Detailed trades for best strategy
+                    st.markdown("---")
+                    st.markdown(f"### 📋 Detailed Trades: {best_strategy['Strategy']} ({best_strategy['Timeframe']}/{best_strategy['Period']})")
+                    
+                    best_tf_period = f"{best_strategy['Timeframe']}_{best_strategy['Period']}"
+                    best_data = mtf_data[best_tf_period]
+                    strategy_type = strategy_mapping.get(best_strategy['Strategy'], "rsi_ema")
+                    trades_df, _, _ = backtest_strategy(best_data, strategy_type)
                     
                     if not trades_df.empty:
-                        st.success(f"✅ Backtest Complete!")
+                        # Add time ago formatting
+                        trades_display = trades_df.copy()
+                        trades_display['Entry_Date'] = trades_display['Entry_Date'].apply(time_ago)
+                        trades_display['Exit_Date'] = trades_display['Exit_Date'].apply(time_ago)
                         
-                        col1, col2, col3 = st.columns(3)
+                        st.dataframe(trades_display, use_container_width=True)
+                        
+                        # Strategy explanation
+                        st.markdown("---")
+                        st.markdown("### 📖 Strategy Logic & Parameters")
+                        
+                        if strategy_type == "rsi_ema":
+                            explanation = """
+                            **RSI + EMA Strategy**:
+                            - **Entry**: RSI < 35 AND Price > 20 EMA (oversold with uptrend confirmation)
+                            - **Stop Loss**: 3% below entry
+                            - **Target**: 5% above entry
+                            - **Logic**: Buys oversold conditions in an uptrend, exits on stop or target
+                            """
+                        elif strategy_type == "ema_crossover":
+                            explanation = """
+                            **EMA Crossover Strategy**:
+                            - **Entry**: 9 EMA crosses above 20 EMA (bullish momentum shift)
+                            - **Stop Loss**: 2% below entry
+                            - **Target**: 4% above entry
+                            - **Logic**: Captures momentum when fast EMA crosses slow EMA upward
+                            """
+                        elif strategy_type == "volatility":
+                            explanation = """
+                            **Volatility Breakout Strategy**:
+                            - **Entry**: Volatility > 1.5x average (high volatility expansion)
+                            - **Stop Loss**: 4% below entry
+                            - **Target**: 6% above entry
+                            - **Logic**: Enters on volatility spikes expecting continuation
+                            """
+                        
+                        st.info(explanation)
+                        
+                        # Performance metrics
+                        winning_trades = trades_df[trades_df['PnL_%'] > 0]
+                        losing_trades = trades_df[trades_df['PnL_%'] < 0]
+                        
+                        st.markdown("### 📈 Performance Metrics")
+                        
+                        col1, col2, col3, col4 = st.columns(4)
                         with col1:
                             st.metric("Total Trades", len(trades_df))
                         with col2:
-                            st.metric("Win Rate", f"{win_rate:.2f}%")
+                            st.metric("Winning Trades", len(winning_trades))
                         with col3:
-                            st.metric("Total PnL", f"{total_pnl:.2f}%", 
-                                    delta=f"{'Profit' if total_pnl > 0 else 'Loss'}")
+                            st.metric("Losing Trades", len(losing_trades))
+                        with col4:
+                            st.metric("Win Rate", f"{(len(winning_trades)/len(trades_df)*100):.1f}%")
                         
-                        st.markdown("### 📋 Trade Details")
-                        st.dataframe(trades_df, use_container_width=True)
+                        col1, col2, col3, col4 = st.columns(4)
+                        with col1:
+                            st.metric("Avg Win", f"{winning_trades['PnL_%'].mean():.2f}%" if len(winning_trades) > 0 else "N/A")
+                        with col2:
+                            st.metric("Avg Loss", f"{losing_trades['PnL_%'].mean():.2f}%" if len(losing_trades) > 0 else "N/A")
+                        with col3:
+                            avg_win = winning_trades['PnL_%'].mean() if len(winning_trades) > 0 else 0
+                            avg_loss = abs(losing_trades['PnL_%'].mean()) if len(losing_trades) > 0 else 1
+                            st.metric("Risk:Reward", f"{avg_win/avg_loss:.2f}:1" if avg_loss != 0 else "N/A")
+                        with col4:
+                            st.metric("Total PnL", f"{trades_df['PnL_%'].sum():.2f}%")
                         
-                        # Strategy Explanation
-                        st.markdown("---")
-                        st.markdown("### 📖 Strategy Logic")
-                        st.info("""
-                        **Entry Conditions:**
-                        - RSI < 30 (Oversold)
-                        - Price above 20-period EMA
-                        
-                        **Exit Conditions:**
-                        - Stop Loss: 2% below entry
-                        - Target: 5% above entry
-                        
-                        **Timeframe**: {timeframe}  
-                        **Period**: {period}
-                        """)
-                        
-                        # Calculate metrics
-                        avg_gain = trades_df[trades_df['PnL %'] > 0]['PnL %'].mean() if len(trades_df[trades_df['PnL %'] > 0]) > 0 else 0
-                        avg_loss = trades_df[trades_df['PnL %'] < 0]['PnL %'].mean() if len(trades_df[trades_df['PnL %'] < 0]) > 0 else 0
-                        
-                        st.markdown(f"""
-                        ### 📊 Performance Metrics
-                        - **Average Win**: {avg_gain:.2f}%
-                        - **Average Loss**: {avg_loss:.2f}%
-                        - **Risk/Reward Ratio**: {abs(avg_gain/avg_loss):.2f} if avg_loss != 0 else "N/A"
-                        - **Profitable Trades**: {len(trades_df[trades_df['PnL %'] > 0])}
-                        - **Loss Trades**: {len(trades_df[trades_df['PnL %'] < 0])}
-                        """)
-                        
-                        # Export
-                        csv = trades_df.to_csv(index=False)
-                        st.download_button(
-                            label="📥 Download Backtest Results",
-                            data=csv,
-                            file_name=f"backtest_{ticker1}_{timeframe}_{period}.csv",
-                            mime="text/csv"
-                        )
-                    else:
-                        st.warning("No trades generated with current strategy parameters")
+                        # Profit curve
+                        trades_df['Cumulative_PnL'] = trades_df['PnL_%'].cumsum()
+                        fig = go.Figure()
+                        fig.add_trace(go.Scatter(x=list(range(len(trades_df))), 
+                                                y=trades_df['Cumulative_PnL'],
+                                                mode='lines+markers',
+                                                name='Cumulative PnL',
+                                                line=dict(color='green')))
+                        fig.update_layout(title="Cumulative PnL Curve", 
+                                        xaxis_title="Trade Number", 
+                                        yaxis_title="Cumulative PnL (%)",
+                                        height=400)
+                        st.plotly_chart(fig, use_container_width=True)
+                else:
+                    st.warning("No trades generated across all tested strategies and timeframes. Try adjusting parameters.")
 
 if __name__ == "__main__":
     main()
