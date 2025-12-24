@@ -343,12 +343,19 @@ def run_analysis_pipeline(ticker, ticker_name, timeframes_map, enable_ratio, tic
     
     for i, (tf, period) in enumerate(timeframes_map.items()):
         status_text.text(f"Fetching data for {tf} / {period}...")
-        df = fetch_data(ticker, period, tf)
-        if df is not None and len(df) > 20:
+        
+        # 1. Fetch Raw Data
+        raw_df = fetch_data(ticker, period, tf)
+        
+        if raw_df is not None and len(raw_df) > 20:
+            # 2. Initialize Analyzer (Calculates Indicators)
+            analyzer = MarketAnalyzer(raw_df, ticker)
+            
+            # 3. Store the PROCESSED data (analyzer.data), not the raw_df
             results[tf] = {
-                'data': df,
+                'data': analyzer.data,  # <--- FIXED: Using analyzer.data which contains EMA_50
                 'period': period,
-                'analyzer': MarketAnalyzer(df, ticker)
+                'analyzer': analyzer
             }
         progress_bar.progress((i + 1) / total_steps)
     
