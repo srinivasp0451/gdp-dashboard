@@ -353,7 +353,10 @@ def run_backtest(df, strategy_params):
                     trailing_sl_lowest = df['Low'].iloc[i]
             
             in_position = True
-            trade_logs.append(f"{current_time} - Entered {('LONG' if signal == 1 else 'SHORT')} at {entry_price:.2f} - SL: {stop_loss:.2f} - Target: {target:.2f if target != 0 else 'Signal Based'}")
+            target_str = f"{target:.2f}" if target != 0 else "Signal Based"
+            trade_logs.append(f"{current_time} - Entered {('LONG' if signal == 1 else 'SHORT')} at {entry_price:.2f} - SL: {stop_loss:.2f} - Target: {target_str}")
+            #The issue is you can't use conditional
+            #trade_logs.append(f"{current_time} - Entered {('LONG' if signal == 1 else 'SHORT')} at {entry_price:.2f} - SL: {stop_loss:.2f} - Target: {target:.2f if target != 0 else 'Signal Based'}")
     
     return trades, trade_logs
 
