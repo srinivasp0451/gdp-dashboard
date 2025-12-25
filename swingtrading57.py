@@ -771,22 +771,48 @@ def main():
                 with col2:
                     if 'EMA_Fast' in df.columns:
                         current_angle = abs(df['Fast_Angle'].iloc[-1]) if not pd.isna(df['Fast_Angle'].iloc[-1]) else 0
-                        st.metric("Current Angle", f"{current_angle:.2f}°")
+                        ema_fast_val = df['EMA_Fast'].iloc[-1]
+                        ema_slow_val = df['EMA_Slow'].iloc[-1]
+                        st.metric("EMA Fast", f"{ema_fast_val:.2f}")
+                    else:
+                        st.metric("EMA Fast", "N/A")
                 
                 with col3:
+                    if 'EMA_Slow' in df.columns:
+                        ema_slow_val = df['EMA_Slow'].iloc[-1]
+                        st.metric("EMA Slow", f"{ema_slow_val:.2f}")
+                    else:
+                        st.metric("EMA Slow", "N/A")
+                
+                # Additional metrics row
+                col4, col5, col6 = st.columns(3)
+                
+                with col4:
+                    if 'Fast_Angle' in df.columns:
+                        current_angle = abs(df['Fast_Angle'].iloc[-1]) if not pd.isna(df['Fast_Angle'].iloc[-1]) else 0
+                        st.metric("Crossover Angle", f"{current_angle:.2f}°")
+                    else:
+                        st.metric("Crossover Angle", "N/A")
+                
+                with col5:
                     position_status = "OPEN" if st.session_state.in_position else "CLOSED"
                     st.metric("Position", position_status)
                 
+                with col6:
+                    st.metric("Signal", "BUY" if df['Signal'].iloc[-1] == 1 else ("SELL" if df['Signal'].iloc[-1] == -1 else "NONE"))
+                
                 # Display position details if in position
                 if st.session_state.in_position:
+                    target_display = f"{st.session_state.target:.2f}" if st.session_state.target != 0 else "Signal Based"
+                    unrealized_pnl = (current_price - st.session_state.entry_price) * st.session_state.position_type
                     st.info(f"""
                     📊 **Active Position**
                     - Type: {('LONG' if st.session_state.position_type == 1 else 'SHORT')}
                     - Entry: {st.session_state.entry_price:.2f}
                     - Current: {current_price:.2f}
                     - Stop Loss: {st.session_state.stop_loss:.2f}
-                    - Target: {st.session_state.target:.2f if st.session_state.target != 0 else 'Signal Based'}
-                    - Unrealized P&L: {((current_price - st.session_state.entry_price) * st.session_state.position_type):.2f}
+                    - Target: {target_display}
+                    - Unrealized P&L: {unrealized_pnl:.2f}
                     """)
                 
                 # Strategy guidance
@@ -848,7 +874,7 @@ def main():
                 with st.expander("Strategy Parameters"):
                     st.write(f"**Strategy:** {strategy_type}")
                     if strategy_type == "EMA Crossover":
-                        st.write(f"**EMA Fast:** {ema_fast}{df.columns}")
+                        st.write(f"**EMA Fast:** {ema_fast}")
                         st.write(f"**EMA Slow:** {ema_slow}")
                         st.write(f"**Min Angle:** {min_angle}°")
                     st.write(f"**SL Type:** {sl_type}")
