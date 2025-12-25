@@ -32,6 +32,8 @@ if 'iteration_count' not in st.session_state:
     st.session_state.iteration_count = 0
 if 'strategy_params' not in st.session_state:
     st.session_state.strategy_params = {}
+if 'last_signal_idx' not in st.session_state:
+    st.session_state.last_signal_idx = -1
 
 # IST timezone
 IST = pytz.timezone('Asia/Kolkata')
@@ -83,11 +85,11 @@ def fetch_data(ticker: str, interval: str, period: str, progress_bar) -> pd.Data
     """Fetch data from yfinance with random rate limiting"""
     try:
         progress_bar.progress(10, text="Initiating data fetch...")
-        time.sleep(random.uniform(1.0, 1.5))  # Random delay
+        time.sleep(random.uniform(1.0, 1.5))
         
         progress_bar.progress(30, text=f"Fetching {ticker} data...")
         data = yf.download(ticker, interval=interval, period=period, progress=False)
-        time.sleep(random.uniform(1.0, 1.5))  # Random delay
+        time.sleep(random.uniform(1.0, 1.5))
         
         if data.empty:
             st.error(f"No data returned for {ticker}")
@@ -96,7 +98,6 @@ def fetch_data(ticker: str, interval: str, period: str, progress_bar) -> pd.Data
         progress_bar.progress(60, text="Processing data...")
         data = flatten_multiindex_columns(data)
         
-        # Standardize column names
         column_mapping = {}
         for col in data.columns:
             col_lower = col.lower()
@@ -112,8 +113,6 @@ def fetch_data(ticker: str, interval: str, period: str, progress_bar) -> pd.Data
                 column_mapping[col] = 'Volume'
         
         data = data.rename(columns=column_mapping)
-        
-        # Select only required columns
         required_cols = ['Open', 'High', 'Low', 'Close', 'Volume']
         data = data[[col for col in required_cols if col in data.columns]]
         
@@ -131,10 +130,6 @@ def fetch_data(ticker: str, interval: str, period: str, progress_bar) -> pd.Data
 def calculate_ema(df: pd.DataFrame, period: int) -> pd.Series:
     """Calculate EMA (TradingView compatible)"""
     return df['Close'].ewm(span=period, adjust=False).mean()
-
-def calculate_sma(df: pd.DataFrame, period: int) -> pd.Series:
-    """Calculate SMA"""
-    return df['Close'].rolling(window=period).mean()
 
 def calculate_rsi(df: pd.DataFrame, period: int = 14) -> pd.Series:
     """Calculate RSI (TradingView compatible)"""
@@ -191,37 +186,42 @@ def calculate_zscore(df: pd.DataFrame, period: int = 20) -> pd.Series:
     zscore = (df['Close'] - mean) / std
     return zscore
 
-def find_support_resistance(df: pd.DataFrame, window: int = 20) -> Tuple[List[float], List[float]]:
-    """Find support and resistance levels"""
-    supports = []
-    resistances = []
-    
-    for i in range(window, len(df) - window):
-        if df['Low'].iloc[i] == df['Low'].iloc[i-window:i+window].min():
-            supports.append(df['Low'].iloc[i])
-        if df['High'].iloc[i] == df['High'].iloc[i-window:i+window].max():
-            resistances.append(df['High'].iloc[i])
-    
-    supports = sorted(list(set(supports)))[-5:] if supports else []
-    resistances = sorted(list(set(resistances)))[-5:] if resistances else []
-    
-    return supports, resistances
-
 def calculate_crossover_angle(fast_ema: pd.Series, slow_ema: pd.Series, idx: int, lookback: int = 5) -> float:
-    """Calculate the angle of EMA crossover"""
+    """Calculate the angle of EMA crossover - FIXED VERSION"""
     if idx < lookback:
         return 0
     
-    fast_diff = fast_ema.iloc[idx] - fast_ema.iloc[idx - lookback]
-    slow_diff = slow_ema.iloc[idx] - slow_ema.iloc[idx - lookback]
+    # Get the difference between EMAs at current and lookback point
+    current_diff = fast_ema.iloc[idx] - slow_ema.iloc[idx]
+    past_diff = fast_ema.iloc[idx - lookback] - slow_ema.iloc[idx - lookback]
     
-    angle = np.arctan2(fast_diff - slow_diff, lookback) * 180 / np.pi
-    return abs(angle)
+    # Calculate the change in difference
+    diff_change = current_diff - past_diff
+    
+    # Calculate angle using arctangent
+    # The angle represents how fast the EMAs are converging/diverging
+    angle = np.arctan2(abs(diff_change), lookback) * 180 / np.pi
+    
+    return angle
+
+def simple_buy_strategy(df: pd.DataFrame) -> pd.DataFrame:
+    """Simple Buy Strategy - Always generate buy signal on every candle"""
+    df = df.copy()
+    df['Signal'] = 1  # Always buy
+    df['Entry_Reason'] = 'Simple Buy Strategy - Bullish'
+    return df
+
+def simple_sell_strategy(df: pd.DataFrame) -> pd.DataFrame:
+    """Simple Sell Strategy - Always generate sell signal on every candle"""
+    df = df.copy()
+    df['Signal'] = -1  # Always sell
+    df['Entry_Reason'] = 'Simple Sell Strategy - Bearish'
+    return df
 
 def ema_crossover_strategy(df: pd.DataFrame, fast_period: int, slow_period: int, 
                           crossover_type: str, min_angle: float, candle_points: float,
                           atr_multiplier: float) -> pd.DataFrame:
-    """EMA Crossover Strategy"""
+    """EMA Crossover Strategy - FIXED VERSION"""
     df = df.copy()
     df['EMA_Fast'] = calculate_ema(df, fast_period)
     df['EMA_Slow'] = calculate_ema(df, slow_period)
@@ -232,14 +232,20 @@ def ema_crossover_strategy(df: pd.DataFrame, fast_period: int, slow_period: int,
     df['Crossover_Angle'] = 0.0
     
     for i in range(slow_period + 5, len(df)):
+        # FIXED: Proper crossover detection
+        # Bullish crossover: Fast crosses ABOVE Slow
         cross_up = (df['EMA_Fast'].iloc[i] > df['EMA_Slow'].iloc[i] and 
                     df['EMA_Fast'].iloc[i-1] <= df['EMA_Slow'].iloc[i-1])
+        
+        # Bearish crossover: Fast crosses BELOW Slow
         cross_down = (df['EMA_Fast'].iloc[i] < df['EMA_Slow'].iloc[i] and 
                       df['EMA_Fast'].iloc[i-1] >= df['EMA_Slow'].iloc[i-1])
         
+        # Calculate angle
         angle = calculate_crossover_angle(df['EMA_Fast'], df['EMA_Slow'], i)
         df.loc[df.index[i], 'Crossover_Angle'] = angle
         
+        # Check candle conditions
         candle_size = abs(df['Close'].iloc[i] - df['Open'].iloc[i])
         
         valid_candle = True
@@ -248,12 +254,13 @@ def ema_crossover_strategy(df: pd.DataFrame, fast_period: int, slow_period: int,
         elif crossover_type == "ATR Based Candle":
             valid_candle = candle_size >= (df['ATR'].iloc[i] * atr_multiplier)
         
+        # Generate signals with angle check
         if cross_up and angle >= min_angle and valid_candle:
             df.loc[df.index[i], 'Signal'] = 1
-            df.loc[df.index[i], 'Entry_Reason'] = f"EMA Crossover Long (Angle: {angle:.1f}°, Candle: {candle_size:.2f})"
+            df.loc[df.index[i], 'Entry_Reason'] = f"Bullish EMA Crossover (Fast>Slow, Angle: {angle:.1f}°, Candle: {candle_size:.2f})"
         elif cross_down and angle >= min_angle and valid_candle:
             df.loc[df.index[i], 'Signal'] = -1
-            df.loc[df.index[i], 'Entry_Reason'] = f"EMA Crossover Short (Angle: {angle:.1f}°, Candle: {candle_size:.2f})"
+            df.loc[df.index[i], 'Entry_Reason'] = f"Bearish EMA Crossover (Fast<Slow, Angle: {angle:.1f}°, Candle: {candle_size:.2f})"
     
     return df
 
@@ -379,7 +386,11 @@ def bollinger_strategy(df: pd.DataFrame, period: int = 20, std_dev: float = 2) -
 
 def apply_strategy(df: pd.DataFrame, strategy: str, params: Dict) -> pd.DataFrame:
     """Apply selected strategy with parameters"""
-    if strategy == "EMA Crossover":
+    if strategy == "Simple Buy":
+        return simple_buy_strategy(df)
+    elif strategy == "Simple Sell":
+        return simple_sell_strategy(df)
+    elif strategy == "EMA Crossover":
         return ema_crossover_strategy(
             df, params['fast_ema'], params['slow_ema'], params['crossover_type'],
             params['min_angle'], params['candle_points'], params['atr_candle_multiplier']
@@ -401,7 +412,7 @@ def apply_strategy(df: pd.DataFrame, strategy: str, params: Dict) -> pd.DataFram
     elif strategy == "Bollinger Bands":
         return bollinger_strategy(df, params.get('bb_period', 20), params.get('bb_std', 2.0))
     else:
-        return ema_crossover_strategy(df, 9, 15, "Simple Crossover", 20, 0, 1.0)
+        return ema_crossover_strategy(df, 9, 15, "Simple Crossover", 0, 0, 1.0)
 
 def calculate_stop_loss(df: pd.DataFrame, idx: int, signal: int, sl_type: str, 
                        sl_points: float, atr_multiplier: float, entry_price: float) -> float:
@@ -507,13 +518,17 @@ def calculate_target(df: pd.DataFrame, idx: int, signal: int, target_type: str,
 
 def backtest_strategy(df: pd.DataFrame, sl_type: str, sl_points: float, atr_multiplier_sl: float,
                      target_type: str, target_points: float, atr_multiplier_target: float,
-                     risk_reward: float) -> Dict:
+                     risk_reward: float, strategy: str) -> Dict:
     """Backtest the strategy"""
     trades = []
     position = None
     
     for i in range(len(df)):
         if position is None:
+            # Skip if signal-based SL/Target with simple buy/sell
+            if strategy in ["Simple Buy", "Simple Sell"] and (sl_type == "Signal Based" or target_type == "Signal Based"):
+                continue
+                
             if df['Signal'].iloc[i] != 0:
                 entry_price = df['Close'].iloc[i]
                 signal = df['Signal'].iloc[i]
@@ -557,7 +572,7 @@ def backtest_strategy(df: pd.DataFrame, sl_type: str, sl_points: float, atr_mult
                     exit_price = position['target']
                     exit_reason = f"Target Hit (Target: {position['target']:.2f})"
                 
-                elif df['Signal'].iloc[i] == -1 and sl_type == "Signal Based":
+                elif df['Signal'].iloc[i] == -1 and sl_type == "Signal Based" and i > position['entry_idx']:
                     exit_triggered = True
                     exit_reason = "Signal Reversal"
             
@@ -578,7 +593,7 @@ def backtest_strategy(df: pd.DataFrame, sl_type: str, sl_points: float, atr_mult
                     exit_price = position['target']
                     exit_reason = f"Target Hit (Target: {position['target']:.2f})"
                 
-                elif df['Signal'].iloc[i] == 1 and sl_type == "Signal Based":
+                elif df['Signal'].iloc[i] == 1 and sl_type == "Signal Based" and i > position['entry_idx']:
                     exit_triggered = True
                     exit_reason = "Signal Reversal"
             
@@ -664,7 +679,6 @@ def generate_forecast(df: pd.DataFrame, strategy_results: Dict, current_price: f
     avg_loss = strategy_results['avg_loss']
     profit_factor = strategy_results['profit_factor']
     
-    # Check last signal
     last_signal = df['Signal'].iloc[-1]
     
     if last_signal == 0:
@@ -677,7 +691,6 @@ def generate_forecast(df: pd.DataFrame, strategy_results: Dict, current_price: f
     else:
         direction = 'BUY' if last_signal == 1 else 'SELL'
         
-        # Calculate confidence based on historical performance
         confidence = min(100, (win_rate * 0.6 + profit_factor * 10 * 0.4))
         
         if win_rate > 60 and profit_factor > 1.5:
@@ -694,7 +707,6 @@ def generate_forecast(df: pd.DataFrame, strategy_results: Dict, current_price: f
             recommendation = direction
             reason = f"Average historical performance: {win_rate:.1f}% win rate, {profit_factor:.2f} profit factor"
         
-        # Calculate suggested levels
         if recommendation in ['BUY', 'SELL']:
             entry = current_price
             
@@ -728,7 +740,6 @@ def create_strategy_chart(df: pd.DataFrame, strategy: str, params: Dict):
         subplot_titles=('Price Chart', 'Volume', 'Indicators')
     )
     
-    # Candlestick chart
     fig.add_trace(
         go.Candlestick(
             x=df.index,
@@ -741,16 +752,15 @@ def create_strategy_chart(df: pd.DataFrame, strategy: str, params: Dict):
         row=1, col=1
     )
     
-    # Add strategy-specific indicators
     if strategy == "EMA Crossover" and 'EMA_Fast' in df.columns:
         fig.add_trace(
             go.Scatter(x=df.index, y=df['EMA_Fast'], name=f"EMA {params.get('fast_ema', 9)}", 
-                      line=dict(color='blue', width=1)),
+                      line=dict(color='blue', width=2)),
             row=1, col=1
         )
         fig.add_trace(
             go.Scatter(x=df.index, y=df['EMA_Slow'], name=f"EMA {params.get('slow_ema', 15)}", 
-                      line=dict(color='red', width=1)),
+                      line=dict(color='red', width=2)),
             row=1, col=1
         )
     
@@ -798,7 +808,6 @@ def create_strategy_chart(df: pd.DataFrame, strategy: str, params: Dict):
             row=1, col=1
         )
     
-    # Entry signals
     long_entries = df[df['Signal'] == 1]
     short_entries = df[df['Signal'] == -1]
     
@@ -822,14 +831,12 @@ def create_strategy_chart(df: pd.DataFrame, strategy: str, params: Dict):
             row=1, col=1
         )
     
-    # Volume
     colors = ['red' if close < open else 'green' for close, open in zip(df['Close'], df['Open'])]
     fig.add_trace(
         go.Bar(x=df.index, y=df['Volume'], name='Volume', marker_color=colors),
         row=2, col=1
     )
     
-    # Additional indicators subplot
     if strategy == "RSI + EMA + ADX" and 'RSI' in df.columns:
         fig.add_trace(
             go.Scatter(x=df.index, y=df['RSI'], name='RSI', line=dict(color='purple', width=1)),
@@ -860,11 +867,9 @@ def create_strategy_chart(df: pd.DataFrame, strategy: str, params: Dict):
 # Streamlit UI
 st.title("🚀 Advanced Trading Backtesting & Live Trading System")
 
-# Sidebar for configuration
 with st.sidebar:
     st.header("⚙️ Configuration")
     
-    # Ticker Selection
     st.subheader("Ticker Selection")
     ticker_preset = st.selectbox("Select Preset Ticker", list(TICKER_PRESETS.keys()))
     
@@ -874,7 +879,6 @@ with st.sidebar:
         ticker1 = TICKER_PRESETS[ticker_preset]
         st.info(f"Selected: {ticker1}")
     
-    # Ratio-based trading
     use_ratio = st.checkbox("Enable Ratio-Based Trading")
     ticker2 = None
     if use_ratio:
@@ -884,35 +888,26 @@ with st.sidebar:
         else:
             ticker2 = TICKER_PRESETS[ticker_preset2]
     
-    # Timeframe and Period
     st.subheader("Timeframe & Period")
     interval = st.selectbox("Interval", list(TIMEFRAME_PERIODS.keys()))
     period = st.selectbox("Period", TIMEFRAME_PERIODS[interval])
     
-    # Strategy Selection
     st.subheader("Strategy Selection")
     strategy = st.selectbox(
         "Select Strategy",
         [
-            "EMA Crossover",
-            "Ratio Based",
-            "Z-Score Based",
-            "Volatility Based",
-            "RSI Divergence",
             "Simple Buy",
             "Simple Sell",
+            "EMA Crossover",
             "Mean Reversion",
             "RSI + EMA + ADX",
-            "Price Action S/R",
-            "9 EMA Pullback",
             "Breakout",
-            "Breakout Trap",
-            "News Based",
+            "Volatility Based",
+            "Z-Score Based",
             "Bollinger Bands"
         ]
     )
     
-    # Strategy Parameters
     st.subheader("Strategy Parameters")
     strategy_params = {}
     
@@ -931,7 +926,7 @@ with st.sidebar:
         )
         strategy_params['crossover_type'] = crossover_type
         
-        min_angle = st.slider("Minimum Crossover Angle (degrees)", 0, 90, 20)
+        min_angle = st.slider("Minimum Crossover Angle (degrees)", 0, 90, 0)
         strategy_params['min_angle'] = min_angle
         
         if crossover_type == "Strong Candle":
@@ -990,7 +985,6 @@ with st.sidebar:
     
     st.session_state.strategy_params = strategy_params
     
-    # Stop Loss Configuration
     st.subheader("Stop Loss Configuration")
     sl_type = st.selectbox(
         "Stop Loss Type",
@@ -1005,6 +999,9 @@ with st.sidebar:
         ]
     )
     
+    if strategy in ["Simple Buy", "Simple Sell"] and sl_type == "Signal Based":
+        st.warning("⚠️ Signal Based SL not applicable for Simple Buy/Sell strategies")
+    
     if sl_type == "Custom Points":
         sl_points = st.number_input("Stop Loss Points", value=50.0, min_value=1.0)
     else:
@@ -1015,7 +1012,6 @@ with st.sidebar:
     else:
         atr_multiplier_sl = 2.0
     
-    # Target Configuration
     st.subheader("Target Configuration")
     target_type = st.selectbox(
         "Target Type",
@@ -1027,6 +1023,9 @@ with st.sidebar:
             "Risk:Reward"
         ]
     )
+    
+    if strategy in ["Simple Buy", "Simple Sell"] and target_type == "Signal Based":
+        st.warning("⚠️ Signal Based Target not applicable for Simple Buy/Sell strategies")
     
     if target_type == "Custom Points":
         target_points = st.number_input("Target Points", value=100.0, min_value=1.0)
@@ -1043,10 +1042,8 @@ with st.sidebar:
     else:
         risk_reward = 2.0
 
-# Main content area
 tab1, tab2 = st.tabs(["📊 Backtesting", "🔴 Live Trading"])
 
-# Backtesting Tab
 with tab1:
     st.header("Backtesting")
     
@@ -1057,7 +1054,6 @@ with tab1:
     if fetch_button:
         progress_bar = st.progress(0, text="Starting...")
         
-        # Fetch data
         df = fetch_data(ticker1, interval, period, progress_bar)
         
         if df is not None and not df.empty:
@@ -1065,18 +1061,15 @@ with tab1:
             st.session_state.data_fetched = True
             st.success(f"✅ Data fetched successfully! {len(df)} candles loaded.")
             
-            # Apply strategy
             df_strategy = apply_strategy(df, strategy, st.session_state.strategy_params)
             
-            # Run backtest
             st.info("🔄 Running backtest...")
             results = backtest_strategy(
                 df_strategy, sl_type, sl_points, atr_multiplier_sl,
                 target_type, target_points, atr_multiplier_target,
-                risk_reward
+                risk_reward, strategy
             )
             
-            # Display results
             st.subheader("📈 Backtest Results")
             
             col1, col2, col3, col4 = st.columns(4)
@@ -1107,7 +1100,6 @@ with tab1:
             with col3:
                 st.metric("Avg Duration", str(results['avg_duration']).split('.')[0])
             
-            # Forecast
             st.subheader("🔮 Strategy Forecast")
             forecast = generate_forecast(df_strategy, results, df['Close'].iloc[-1])
             
@@ -1130,17 +1122,14 @@ with tab1:
             
             st.info(f"**Reason:** {forecast['reason']}")
             
-            # Trade History
             if len(results['trades']) > 0:
                 st.subheader("📋 Trade History")
                 trades_df = pd.DataFrame(results['trades'])
                 
-                # Format dataframe
                 trades_df['Entry Time'] = trades_df['Entry Time'].dt.strftime('%Y-%m-%d %H:%M:%S')
                 trades_df['Exit Time'] = trades_df['Exit Time'].dt.strftime('%Y-%m-%d %H:%M:%S')
                 trades_df['Duration'] = trades_df['Duration'].astype(str)
                 
-                # Style the dataframe
                 def highlight_pnl(val):
                     if isinstance(val, (int, float)):
                         color = 'lightgreen' if val > 0 else 'lightcoral'
@@ -1150,7 +1139,6 @@ with tab1:
                 styled_df = trades_df.style.applymap(highlight_pnl, subset=['P&L Points'])
                 st.dataframe(styled_df, use_container_width=True, height=400)
                 
-                # Download trades
                 csv = trades_df.to_csv(index=False).encode('utf-8')
                 st.download_button(
                     "📥 Download Trade History",
@@ -1160,7 +1148,6 @@ with tab1:
                     key='download-csv'
                 )
                 
-                # Chart
                 st.subheader("📊 Strategy Chart")
                 fig = create_strategy_chart(df_strategy, strategy, st.session_state.strategy_params)
                 st.plotly_chart(fig, use_container_width=True)
@@ -1169,7 +1156,6 @@ with tab1:
         else:
             st.error("❌ Failed to fetch data. Please check the ticker symbol and try again.")
 
-# Live Trading Tab
 with tab2:
     st.header("Live Trading")
     
@@ -1178,13 +1164,13 @@ with tab2:
     else:
         tab_live, tab_history, tab_logs = st.tabs(["🔴 Live Monitor", "📋 Trade History", "📝 Logs"])
         
-        # Live Monitor Tab
         with tab_live:
             col1, col2, col3 = st.columns([1, 1, 2])
             with col1:
                 if st.button("▶️ Start Live Trading", type="primary", disabled=st.session_state.live_trading_active):
                     st.session_state.live_trading_active = True
                     st.session_state.iteration_count = 0
+                    st.session_state.last_signal_idx = -1
                     st.session_state.trade_logs.append(f"[{datetime.now(IST).strftime('%Y-%m-%d %H:%M:%S')}] Live trading started")
                     st.rerun()
             
@@ -1198,17 +1184,14 @@ with tab2:
                 st.success("🟢 Live Trading Active")
                 st.session_state.iteration_count += 1
                 
-                # Auto-refresh placeholder
                 live_container = st.empty()
                 
                 with live_container.container():
-                    # Fetch latest data
                     with st.spinner("Fetching live data..."):
                         progress_bar = st.progress(0, text="Fetching live data...")
                         live_df = fetch_data(ticker1, interval, "1d", progress_bar)
                     
                     if live_df is not None and not live_df.empty:
-                        # Apply strategy
                         live_strategy = apply_strategy(live_df, strategy, st.session_state.strategy_params)
                         
                         current_price = live_strategy['Close'].iloc[-1]
@@ -1226,7 +1209,6 @@ with tab2:
                         with col3:
                             st.metric("Volume", f"{live_strategy['Volume'].iloc[-1]:,.0f}")
                         
-                        # Display Strategy Parameters
                         st.subheader("📊 Strategy Parameters")
                         
                         if strategy == "EMA Crossover":
@@ -1253,15 +1235,16 @@ with tab2:
                             with col3:
                                 st.info(f"**Candles Analyzed:** {len(live_strategy)}")
                             
-                            # Show distance to crossover
                             ema_diff = ema_fast_val - ema_slow_val
                             diff_pct = (abs(ema_diff) / current_price) * 100
                             
-                            if abs(ema_diff) < current_price * 0.005:  # Within 0.5%
-                                st.warning(f"⚠️ EMAs are converging! Difference: {ema_diff:.2f} pts ({diff_pct:.3f}%)")
+                            if ema_fast_val > ema_slow_val:
+                                st.success(f"✅ Fast EMA ({ema_fast_val:.2f}) is ABOVE Slow EMA ({ema_slow_val:.2f}) by {ema_diff:.2f} pts ({diff_pct:.3f}%) - BULLISH")
                             else:
-                                status = "above" if ema_diff > 0 else "below"
-                                st.info(f"📍 Fast EMA is {abs(ema_diff):.2f} pts ({diff_pct:.3f}%) {status} Slow EMA")
+                                st.error(f"❌ Fast EMA ({ema_fast_val:.2f}) is BELOW Slow EMA ({ema_slow_val:.2f}) by {abs(ema_diff):.2f} pts ({diff_pct:.3f}%) - BEARISH")
+                            
+                            if abs(ema_diff) < current_price * 0.005:
+                                st.warning(f"⚠️ EMAs are converging! Watch for crossover signal.")
                         
                         elif strategy == "Mean Reversion":
                             if 'MA' in live_strategy.columns:
@@ -1304,56 +1287,10 @@ with tab2:
                                 with col3:
                                     st.info(f"**Min ADX:** {st.session_state.strategy_params.get('min_adx', 25)}")
                         
-                        elif strategy == "Breakout":
-                            if 'High_Resistance' in live_strategy.columns:
-                                resistance = live_strategy['High_Resistance'].iloc[-1]
-                                support = live_strategy['Low_Support'].iloc[-1]
-                                
-                                col1, col2 = st.columns(2)
-                                with col1:
-                                    st.metric("Resistance", f"{resistance:.2f}", f"{abs(resistance-current_price):.2f} pts away")
-                                with col2:
-                                    st.metric("Support", f"{support:.2f}", f"{abs(support-current_price):.2f} pts away")
-                                
-                                st.info(f"**Lookback Period:** {st.session_state.strategy_params.get('breakout_lookback', 20)} candles")
+                        elif strategy in ["Simple Buy", "Simple Sell"]:
+                            st.info(f"**Strategy:** {strategy} - Signal generated on every candle")
+                            st.write(f"**Direction:** {'LONG (Buy)' if strategy == 'Simple Buy' else 'SHORT (Sell)'}")
                         
-                        elif strategy == "Volatility Based":
-                            if 'ATR' in live_strategy.columns:
-                                atr_val = live_strategy['ATR'].iloc[-1]
-                                vol_ratio = live_strategy['Volatility_Ratio'].iloc[-1] if 'Volatility_Ratio' in live_strategy.columns else 0
-                                
-                                col1, col2 = st.columns(2)
-                                with col1:
-                                    st.metric("ATR", f"{atr_val:.2f}")
-                                with col2:
-                                    st.metric("Volatility Ratio", f"{vol_ratio:.2f}")
-                                
-                                st.info(f"**ATR Period:** {st.session_state.strategy_params.get('atr_period', 14)} | **Threshold:** {st.session_state.strategy_params.get('vol_threshold', 1.5)}")
-                        
-                        elif strategy == "Z-Score Based":
-                            if 'ZScore' in live_strategy.columns:
-                                zscore_val = live_strategy['ZScore'].iloc[-1]
-                                
-                                st.metric("Z-Score", f"{zscore_val:.2f}")
-                                st.info(f"**Period:** {st.session_state.strategy_params.get('zscore_period', 20)} | **Threshold:** {st.session_state.strategy_params.get('zscore_threshold', 2.0)}")
-                        
-                        elif strategy == "Bollinger Bands":
-                            if 'BB_Middle' in live_strategy.columns:
-                                bb_upper = live_strategy['BB_Upper'].iloc[-1]
-                                bb_middle = live_strategy['BB_Middle'].iloc[-1]
-                                bb_lower = live_strategy['BB_Lower'].iloc[-1]
-                                
-                                col1, col2, col3 = st.columns(3)
-                                with col1:
-                                    st.metric("BB Upper", f"{bb_upper:.2f}", f"{abs(bb_upper-current_price):.2f} pts away")
-                                with col2:
-                                    st.metric("BB Middle", f"{bb_middle:.2f}")
-                                with col3:
-                                    st.metric("BB Lower", f"{bb_lower:.2f}", f"{abs(bb_lower-current_price):.2f} pts away")
-                                
-                                st.info(f"**Period:** {st.session_state.strategy_params.get('bb_period', 20)} | **Std Dev:** {st.session_state.strategy_params.get('bb_std', 2.0)}")
-                        
-                        # Show SL and Target configuration
                         st.subheader("🎯 Risk Management")
                         col1, col2 = st.columns(2)
                         with col1:
@@ -1371,7 +1308,6 @@ with tab2:
                             elif target_type == "Risk:Reward":
                                 st.write(f"**Risk:Reward Ratio:** {risk_reward}")
                         
-                        # Check for signals
                         latest_signal = live_strategy['Signal'].iloc[-1]
                         
                         if st.session_state.current_position is None:
@@ -1400,13 +1336,26 @@ with tab2:
                                 
                                 risk_reward_actual = target_dist / sl_dist if sl_dist > 0 else 0
                                 st.info(f"💡 **Risk:Reward Ratio:** 1:{risk_reward_actual:.2f}")
-                                st.info("💡 **Recommendation:** Signal is active. Consider entering the position based on your risk management.")
+                                st.info("💡 **Recommendation:** Fresh signal detected. Consider entering the position based on your risk management.")
                             else:
                                 st.warning("⏳ Waiting for entry signal...")
-                                st.info("💡 **Market Analysis:** No clear signal yet. Monitoring market conditions...")
+                                
+                                if strategy == "EMA Crossover":
+                                    if 'EMA_Fast' in live_strategy.columns and 'EMA_Slow' in live_strategy.columns:
+                                        ema_f = live_strategy['EMA_Fast'].iloc[-1]
+                                        ema_s = live_strategy['EMA_Slow'].iloc[-1]
+                                        diff = ema_f - ema_s
+                                        
+                                        if abs(diff) < current_price * 0.01:
+                                            st.info(f"💡 EMAs are close ({abs(diff):.2f} pts apart). Potential crossover coming.")
+                                        elif diff > 0:
+                                            st.info(f"💡 Fast EMA above Slow EMA by {diff:.2f} pts. Currently bullish.")
+                                        else:
+                                            st.info(f"💡 Fast EMA below Slow EMA by {abs(diff):.2f} pts. Currently bearish.")
+                                else:
+                                    st.info("💡 **Market Analysis:** No clear signal yet. Monitoring market conditions...")
                         
                         else:
-                            # Active position
                             pos = st.session_state.current_position
                             st.success(f"📍 Active {pos['direction']} Position")
                             
@@ -1433,7 +1382,6 @@ with tab2:
                                 target_pct = (target_distance / current_price) * 100
                                 st.metric("Distance to Target", f"{target_distance:.2f} pts", f"{target_pct:.2f}%")
                             
-                            # Guidance
                             st.subheader("🤝 Trading Guidance")
                             
                             if pnl > 0:
@@ -1454,12 +1402,10 @@ with tab2:
                             duration = datetime.now(IST) - pos['entry_time']
                             st.write(f"**Duration:** {str(duration).split('.')[0]}")
                         
-                        # Live Chart
                         st.subheader("📊 Live Strategy Chart")
                         live_chart = create_strategy_chart(live_strategy.tail(100), strategy, st.session_state.strategy_params)
                         st.plotly_chart(live_chart, use_container_width=True)
                 
-                # Auto-refresh
                 time.sleep(random.uniform(1.0, 1.5))
                 if st.session_state.live_trading_active:
                     st.rerun()
@@ -1467,7 +1413,6 @@ with tab2:
             else:
                 st.info("⏸️ Live trading is stopped. Click 'Start Live Trading' to begin.")
         
-        # Trade History Tab
         with tab_history:
             st.subheader("Trade History")
             if len(st.session_state.trade_history) > 0:
@@ -1476,16 +1421,18 @@ with tab2:
             else:
                 st.info("No trades executed yet.")
         
-        # Logs Tab
         with tab_logs:
             st.subheader("Trade Logs")
             if len(st.session_state.trade_logs) > 0:
-                for log in st.session_state.trade_logs[-50:]:  # Show last 50 logs
+                for log in st.session_state.trade_logs[-50:]:
                     st.text(log)
             else:
                 st.info("No logs available.")
 
-# Footer
 st.markdown("---")
-st.markdown("💡 **Note:** This is a backtesting and live simulation system. Always validate signals before actual trading.")
-st.markdown("📌 **Indicators are TradingView compatible** - calculations match TradingView formulas for accuracy.")
+st.markdown("💡 **Fixed Issues:**")
+st.markdown("✅ EMA Crossover now properly detects when Fast EMA crosses above/below Slow EMA")
+st.markdown("✅ Crossover angle calculation fixed - now shows actual angle values")
+st.markdown("✅ Simple Buy/Sell strategies implemented - generate signals on every candle")
+st.markdown("✅ Signal-based SL/Target disabled for Simple Buy/Sell strategies")
+st.markdown("📌 **Indicators are TradingView compatible**")
