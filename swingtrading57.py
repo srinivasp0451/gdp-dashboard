@@ -3,227 +3,184 @@ import yfinance as yf
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
-from datetime import datetime
-import time
 import pytz
+import time
+import random
+from datetime import datetime
 
-# --- INITIALIZATION & IST SETUP ---
-IST = pytz.timezone('Asia/Kolkata')
-if 'trading_active' not in st.session_state:
-    st.session_state.update({
-        'trading_active': False,
-        'current_position': None,
-        'trade_history': [],
-        'trade_log': [],
-        'iteration': 0
-    })
+# ---------------- CONFIG ---------------- #
+IST = pytz.timezone("Asia/Kolkata")
 
-def add_log(msg):
-    t = datetime.now(IST).strftime("%H:%M:%S")
-    st.session_state.trade_log.insert(0, f"[{t}] {msg}")
+st.set_page_config(layout="wide")
+st.title("EMA Crossover Algo (Stable Core Version)")
 
-# --- MATHEMATICAL ENGINE (MANUAL) ---
-def get_ema(s, p): return s.ewm(span=p, adjust=False).mean()
+# ---------------- UTILITIES ---------------- #
+def safe_sleep():
+    time.sleep(random.uniform(1.0, 1.5))
 
-def get_atr(df, p=14):
-    tr = pd.concat([
-        df['High'] - df['Low'], 
-        (df['High'] - df['Close'].shift()).abs(), 
-        (df['Low'] - df['Close'].shift()).abs()
-    ], axis=1).max(axis=1)
-    return tr.rolling(p).mean()
+def convert_to_ist(idx):
+    if idx.tz is None:
+        return idx.tz_localize("UTC").tz_convert(IST)
+    return idx.tz_convert(IST)
 
-# --- ADVANCED EMA STRATEGY CLASS ---
-class AdvancedEMA:
-    def __init__(self, p1, p2, mode, min_angle, candle_pts=0, atr_mult=0):
-        self.p1, self.p2 = p1, p2
-        self.mode = mode  # simple, strong_candle_pts, strong_candle_atr
-        self.min_angle = min_angle
-        self.candle_pts = candle_pts
-        self.atr_mult = atr_mult
+def flatten_df(df):
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = [c[0] for c in df.columns]
+    return df
 
-    def analyze(self, df):
-        df = df.copy()
-        df['fast'] = get_ema(df['Close'], self.p1)
-        df['slow'] = get_ema(df['Close'], self.p2)
-        
-        # Angle Calculation: Slope of Fast EMA converted to degrees
-        # (Change in price / Previous Price) * 100 provides a scaled slope
-        slope_raw = (df['fast'] - df['fast'].shift(1)) / df['fast'].shift(1) * 100
-        df['angle'] = np.degrees(np.arctan(slope_raw))
-        
-        curr, prev = df.iloc[-1], df.iloc[-2]
-        
-        # 1. Base Crossover Check
-        bull_cross = (prev['fast'] <= prev['slow']) and (curr['fast'] > curr['slow'])
-        bear_cross = (prev['fast'] >= prev['slow']) and (curr['fast'] < curr['slow'])
-        
-        # 2. Angle Filter (Ensures trend strength)
-        angle_ok = abs(curr['angle']) >= self.min_angle
-        
-        # 3. Candle Confirmation (Momentum)
-        candle_ok = True
-        body_size = abs(curr['Close'] - curr['Open'])
-        if self.mode == "strong_candle_pts":
-            candle_ok = body_size >= self.candle_pts
-        elif self.mode == "strong_candle_atr":
-            atr = get_atr(df).iloc[-1]
-            candle_ok = body_size >= (atr * self.atr_mult)
+def ema(series, period):
+    return series.ewm(span=period, adjust=False).mean()
 
-        bull_signal = bull_cross and angle_ok and candle_ok
-        bear_signal = bear_cross and angle_ok and candle_ok
-        
-        return bull_signal, bear_signal, {
-            "fast": curr['fast'], 
-            "slow": curr['slow'], 
-            "angle": curr['angle'],
-            "body": body_size
-        }
+def ema_angle(ema_series):
+    slope = ema_series.diff()
+    angle = np.degrees(np.arctan(slope))
+    return angle
 
-# --- SIDEBAR CONFIGURATION ---
-with st.sidebar:
-    st.header("⚡ Live Strategy Config")
-    ticker = st.text_input("Ticker Symbol", "BTC-USD")
-    strat_type = st.selectbox("Entry Mode", ["Simple Buy", "Simple Sell", "EMA Crossover"])
-    
-    if strat_type == "EMA Crossover":
-        p1 = st.number_input("Fast EMA Period", 9)
-        p2 = st.number_input("Slow EMA Period", 20)
-        ema_mode = st.selectbox("Crossover Confirmation", 
-                                ["simple", "strong_candle_pts", "strong_candle_atr"])
-        c_angle = st.slider("Min Slope Angle (Degrees)", 0, 90, 20)
-        
-        c_pts = 0.0
-        c_atr = 0.0
-        if ema_mode == "strong_candle_pts":
-            c_pts = st.number_input("Min Candle Body (Points)", value=10.0)
-        elif ema_mode == "strong_candle_atr":
-            c_atr = st.number_input("ATR Multiplier", value=1.5)
-            
-        engine = AdvancedEMA(p1, p2, ema_mode, c_angle, c_pts, c_atr)
-    
-    st.divider()
-    st.header("🛡️ Risk & Exit")
-    sl_type = st.selectbox("Stop Loss Type", ["Signal Based", "Fixed Points"])
-    sl_val = st.number_input("SL Points", 50.0)
-    tp_type = st.selectbox("Target Type", ["Signal Based", "Fixed Points"])
-    tp_val = st.number_input("TP Points", 100.0)
+# ---------------- DATA FETCH ---------------- #
+@st.cache_data(show_spinner=False)
+def fetch_data(ticker, interval, period):
+    safe_sleep()
+    df = yf.download(
+        ticker,
+        interval=interval,
+        period=period,
+        progress=False,
+        auto_adjust=False,
+        threads=False,
+    )
+    df = flatten_df(df)
+    df.index = convert_to_ist(df.index)
+    return df.dropna()
 
-# --- MAIN DASHBOARD ---
-tab_live, tab_logs = st.tabs(["Live Terminal", "Activity Log"])
+# ---------------- STRATEGY ENGINE ---------------- #
+def backtest_ema(
+    df,
+    fast=9,
+    slow=15,
+    angle_thresh=20,
+    trailing_sl_points=10,
+    use_signal_sl=True,
+):
+    df = df.copy()
+    df["ema_fast"] = ema(df["Close"], fast)
+    df["ema_slow"] = ema(df["Close"], slow)
+    df["angle"] = ema_angle(df["ema_fast"])
 
-with tab_live:
-    # Action Buttons
-    if not st.session_state.trading_active:
-        if st.button("▶ START TRADING SESSION", type="primary", use_container_width=True):
-            st.session_state.trading_active = True
-            st.session_state.iteration = 0
-            add_log(f"System Online: {ticker} | {strat_type}")
-            st.rerun()
+    trades = []
+    in_trade = False
+    entry_price = sl = None
+
+    for i in range(2, len(df)):
+        row, prev = df.iloc[i], df.iloc[i - 1]
+
+        # ENTRY
+        if not in_trade:
+            crossed_up = (
+                prev.ema_fast < prev.ema_slow
+                and row.ema_fast > row.ema_slow
+                and row.angle > angle_thresh
+            )
+            if crossed_up:
+                entry_price = row.Close
+                sl = entry_price - trailing_sl_points
+                in_trade = True
+                trades.append(
+                    {
+                        "Entry Time": row.name,
+                        "Entry": entry_price,
+                        "SL Type": "Signal / Trailing",
+                    }
+                )
+
+        # MANAGE TRADE
+        else:
+            # Trailing SL
+            sl = max(sl, row.Close - trailing_sl_points)
+
+            # Exit by SL
+            if row.Low <= sl:
+                trades[-1].update(
+                    {
+                        "Exit Time": row.name,
+                        "Exit": sl,
+                        "Reason": "Trailing SL",
+                        "PnL": sl - entry_price,
+                    }
+                )
+                in_trade = False
+
+            # Signal-based SL (reverse crossover)
+            elif (
+                use_signal_sl
+                and prev.ema_fast > prev.ema_slow
+                and row.ema_fast < row.ema_slow
+            ):
+                trades[-1].update(
+                    {
+                        "Exit Time": row.name,
+                        "Exit": row.Close,
+                        "Reason": "Reverse EMA",
+                        "PnL": row.Close - entry_price,
+                    }
+                )
+                in_trade = False
+
+    return pd.DataFrame(trades), df
+
+# ---------------- UI ---------------- #
+ticker = st.text_input("Ticker", "^NSEI")
+interval = st.selectbox("Interval", ["1m", "5m", "15m"])
+period = st.selectbox("Period", ["1d", "5d", "1mo"])
+
+fast = st.number_input("Fast EMA", 1, 50, 9)
+slow = st.number_input("Slow EMA", 1, 100, 15)
+angle = st.number_input("Min EMA Angle (deg)", 0, 90, 20)
+trail = st.number_input("Trailing SL Points", 1, 1000, 10)
+
+if "df" not in st.session_state:
+    st.session_state.df = None
+
+if st.button("Fetch Data"):
+    st.session_state.df = fetch_data(ticker, interval, period)
+
+if st.session_state.df is not None:
+    df = st.session_state.df
+
+    trades, df2 = backtest_ema(
+        df,
+        fast=fast,
+        slow=slow,
+        angle_thresh=angle,
+        trailing_sl_points=trail,
+    )
+
+    # --------- CHART --------- #
+    fig = go.Figure()
+    fig.add_candlestick(
+        x=df2.index,
+        open=df2.Open,
+        high=df2.High,
+        low=df2.Low,
+        close=df2.Close,
+        name="Price",
+    )
+    fig.add_line(
+        x=df2.index,
+        y=df2.ema_fast,
+        name=f"EMA {fast}",
+    )
+    fig.add_line(
+        x=df2.index,
+        y=df2.ema_slow,
+        name=f"EMA {slow}",
+    )
+
+    st.plotly_chart(fig, use_container_width=True, key="chart_main")
+
+    # --------- RESULTS --------- #
+    st.subheader("Trades")
+    if not trades.empty:
+        st.dataframe(trades)
+        st.metric("Total PnL", round(trades.PnL.sum(), 2))
     else:
-        if st.button("⏹ EMERGENCY STOP", type="secondary", use_container_width=True):
-            st.session_state.trading_active = False
-            st.session_state.current_position = None
-            add_log("System Offline: All monitoring stopped.")
-            st.rerun()
-
-    # Data Acquisition
-    df_raw = yf.download(ticker, period="1d", interval="1m", progress=False)
-    
-    if not df_raw.empty:
-        # Timezone Handling
-        if isinstance(df_raw.columns, pd.MultiIndex): df_raw.columns = df_raw.columns.get_level_values(0)
-        df_raw.index = df_raw.index.tz_convert(IST)
-        
-        curr_price = df_raw['Close'].iloc[-1]
-        curr_time = df_raw.index[-1]
-        
-        # Signal Generation
-        if strat_type == "EMA Crossover":
-            bull, bear, meta = engine.analyze(df_raw)
-        else:
-            # Simple Buy/Sell triggers immediately on session start
-            bull = (strat_type == "Simple Buy")
-            bear = (strat_type == "Simple Sell")
-            meta = {"angle": 0, "body": 0}
-
-        # --- LIVE TRADING ENGINE ---
-        if st.session_state.trading_active:
-            pos = st.session_state.current_position
-            
-            # 1. ENTRY LOGIC
-            if pos is None:
-                if bull:
-                    st.session_state.current_position = {
-                        'type': 'LONG', 'entry': curr_price, 'time': curr_time, 
-                        'sl': curr_price - sl_val, 'tp': curr_price + tp_val
-                    }
-                    add_log(f"ENTRY LONG @ {curr_price}")
-                elif bear:
-                    st.session_state.current_position = {
-                        'type': 'SHORT', 'entry': curr_price, 'time': curr_time,
-                        'sl': curr_price + sl_val, 'tp': curr_price - tp_val
-                    }
-                    add_log(f"ENTRY SHORT @ {curr_price}")
-
-            # 2. EXIT LOGIC (LOCKED TO NEW CANDLES)
-            else:
-                is_new_candle = curr_time > pos['time']
-                exit_now = False
-                reason = ""
-                pnl = (curr_price - pos['entry']) if pos['type'] == 'LONG' else (pos['entry'] - curr_price)
-
-                # Fixed Point Check
-                if sl_type == "Fixed Points":
-                    if (pos['type'] == 'LONG' and curr_price <= pos['sl']) or \
-                       (pos['type'] == 'SHORT' and curr_price >= pos['sl']):
-                        exit_now, reason = True, "Stop Loss Triggered"
-                
-                # Signal Based Check (Requires New Candle & Strategy Reversal)
-                if (sl_type == "Signal Based" or tp_type == "Signal Based") and is_new_candle:
-                    # In EMA mode, we exit if the opposite signal appears
-                    if strat_type == "EMA Crossover":
-                        if pos['type'] == 'LONG' and bear:
-                            exit_now, reason = True, "Strategy Reversal (Exit Long)"
-                        elif pos['type'] == 'SHORT' and bull:
-                            exit_now, reason = True, "Strategy Reversal (Exit Short)"
-
-                if exit_now:
-                    st.session_state.trade_history.append({'pnl': pnl, 'reason': reason, 'time': curr_time})
-                    st.session_state.current_position = None
-                    add_log(f"TRADE CLOSED @ {curr_price} | {reason} | P&L: {pnl:.2f}")
-
-        # --- DASHBOARD UI ---
-        col1, col2, col3 = st.columns(3)
-        col1.metric("Current Market Price", f"{curr_price:.2f}")
-        
-        if st.session_state.current_position:
-            p = st.session_state.current_position
-            pnl = (curr_price - p['entry']) if p['type'] == 'LONG' else (p['entry'] - curr_price)
-            col2.metric("Open P&L", f"{pnl:.2f}", delta=f"{(pnl/p['entry'])*100:.2f}%")
-            col3.info(f"💡 **Mentor:** Holding {p['type']}. Angle is {meta['angle']:.1f}°. Monitoring for reversal on new candles.")
-        else:
-            col2.write("🔭 Scanning for signals...")
-            col3.write(f"Refreshes: {st.session_state.iteration}")
-
-        # Charting with Indicators
-        fig = go.Figure(data=[go.Candlestick(x=df_raw.index, open=df_raw['Open'], 
-                        high=df_raw['High'], low=df_raw['Low'], close=df_raw['Close'], name="Price")])
-        
-        if strat_type == "EMA Crossover":
-            fig.add_trace(go.Scatter(x=df_raw.index, y=get_ema(df_raw['Close'], p1), line=dict(color='cyan', width=1.5), name="Fast EMA"))
-            fig.add_trace(go.Scatter(x=df_raw.index, y=get_ema(df_raw['Close'], p2), line=dict(color='orange', width=1.5), name="Slow EMA"))
-
-        
-        
-        fig.update_layout(height=600, template="plotly_dark", margin=dict(l=0,r=0,b=0,t=0))
-        st.plotly_chart(fig, use_container_width=True)
-
-with tab_logs:
-    st.text_area("Live Feed", value="\n".join(st.session_state.trade_log), height=500)
-
-# --- AUTO-REFRESH TRIGGER ---
-if st.session_state.trading_active:
-    st.session_state.iteration += 1
-    time.sleep(1.8)  # Rate limiting
-    st.rerun()
+        st.info("No trades generated")
