@@ -848,7 +848,7 @@ def main():
                 with st.expander("Strategy Parameters"):
                     st.write(f"**Strategy:** {strategy_type}")
                     if strategy_type == "EMA Crossover":
-                        st.write(f"**EMA Fast:** {ema_fast}{df}")
+                        st.write(f"**EMA Fast:** {ema_fast}{df.columns}")
                         st.write(f"**EMA Slow:** {ema_slow}")
                         st.write(f"**Min Angle:** {min_angle}°")
                     st.write(f"**SL Type:** {sl_type}")
