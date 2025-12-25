@@ -7,25 +7,32 @@ from datetime import datetime
 import pytz
 import plotly.graph_objects as go
 
+# ================= CONFIG =================
 IST = pytz.timezone("Asia/Kolkata")
 st.set_page_config(layout="wide")
 
-# ================= SESSION STATE =================
+# ================= SESSION =================
 def ss(k, v):
     if k not in st.session_state:
         st.session_state[k] = v
 
 ss("data", None)
-ss("live_trade", None)
-ss("trade_history", [])
-ss("logs", [])
 ss("live_on", False)
+ss("live_pos", None)
+ss("trades", [])
+ss("logs", [])
 
-# ================= LOGGING =================
+# ================= LOG =================
 def log(msg):
     st.session_state.logs.append(
-        f"{datetime.now(IST).strftime('%Y-%m-%d %H:%M:%S')} | {msg}"
+        f"{datetime.now(IST).strftime('%H:%M:%S')} | {msg}"
     )
+
+# ================= SAFE TZ =================
+def ensure_ist(df):
+    if df.index.tz is None:
+        df.index = df.index.tz_localize("UTC")
+    return df.tz_convert(IST)
 
 # ================= UTILS =================
 def flatten_df(df):
@@ -37,121 +44,85 @@ def rate_limit():
     time.sleep(random.uniform(1.0, 1.5))
 
 # ================= INDICATORS =================
-def ema(series, period):
-    return series.ewm(span=period, adjust=False).mean()
+def ema(series, n):
+    return series.ewm(span=n, adjust=False).mean()
 
-def atr(df, period=14):
+def atr(df, n=14):
     h, l, c = df["High"], df["Low"], df["Close"]
     tr = pd.concat([h-l, abs(h-c.shift()), abs(l-c.shift())], axis=1).max(axis=1)
-    return tr.rolling(period).mean()
+    return tr.rolling(n).mean()
 
-def swing_low(df, lookback=5):
-    return df["Low"].rolling(lookback).min()
-
-def swing_high(df, lookback=5):
-    return df["High"].rolling(lookback).max()
-
-# ================= DATA FETCH =================
+# ================= DATA =================
 def fetch_data(ticker, interval, period):
     rate_limit()
     df = yf.download(ticker, interval=interval, period=period, progress=False)
     df = flatten_df(df)
     df.dropna(inplace=True)
-    df.index = df.index.tz_localize("UTC").tz_convert(IST)
+    df = ensure_ist(df)
     return df
 
-# ================= EMA CROSS SIGNAL =================
-def ema_signal(df, ema1, ema2, angle_min):
-    df["ema1"] = ema(df["Close"], ema1)
-    df["ema2"] = ema(df["Close"], ema2)
+# ================= SIGNAL =================
+def ema_signal(df, e1, e2):
+    df["ema1"] = ema(df["Close"], e1)
+    df["ema2"] = ema(df["Close"], e2)
 
-    slope = np.degrees(np.arctan(df["ema1"].diff()))
-    long = (
-        (df["ema1"] > df["ema2"]) &
-        (df["ema1"].shift() <= df["ema2"].shift()) &
-        (slope > angle_min)
-    )
-    short = (
-        (df["ema1"] < df["ema2"]) &
-        (df["ema1"].shift() >= df["ema2"].shift()) &
-        (slope < -angle_min)
-    )
+    long = (df["ema1"] > df["ema2"]) & (df["ema1"].shift() <= df["ema2"].shift())
+    short = (df["ema1"] < df["ema2"]) & (df["ema1"].shift() >= df["ema2"].shift())
+    return np.where(long, 1, np.where(short, -1, 0))
 
-    signal = np.where(long, 1, np.where(short, -1, 0))
-    return signal, slope.iloc[-1]
+# ================= TRAILING SL =================
+def update_trailing_sl(pos, price, atr_val, method, pts):
+    dir = pos["dir"]
 
-# ================= SL / TARGET =================
-def compute_sl_target(df, entry, direction, sl_type, tgt_type, atr_val, rr):
-    if sl_type == "Custom":
-        sl = entry - direction * st.session_state.sl_points
-    elif sl_type == "ATR":
-        sl = entry - direction * atr_val
-    elif sl_type == "Prev Candle":
-        sl = df["Low"].iloc[-2] if direction == 1 else df["High"].iloc[-2]
-    elif sl_type == "Swing":
-        sl = swing_low(df).iloc[-1] if direction == 1 else swing_high(df).iloc[-1]
+    if method == "Points":
+        new_sl = price - dir * pts
+
+    elif method == "ATR":
+        new_sl = price - dir * atr_val
+
+    elif method == "Candle":
+        new_sl = pos["last_low"] if dir == 1 else pos["last_high"]
+
     else:
-        sl = entry - direction * 10
+        return pos["sl"]
 
-    risk = abs(entry - sl)
-
-    if tgt_type == "RR":
-        tgt = entry + direction * risk * rr
-    elif tgt_type == "ATR":
-        tgt = entry + direction * atr_val
-    elif tgt_type == "Custom":
-        tgt = entry + direction * st.session_state.tgt_points
+    # TRAIL ONLY FORWARD
+    if dir == 1:
+        return max(pos["sl"], new_sl)
     else:
-        tgt = entry + direction * risk * 2
-
-    return sl, tgt
+        return min(pos["sl"], new_sl)
 
 # ================= BACKTEST =================
-def backtest(df, strategy):
+def backtest(df):
     trades = []
     pos = None
 
-    for i in range(50, len(df)):
+    for i in range(20, len(df)):
         sub = df.iloc[:i+1]
-        atr_val = atr(sub).iloc[-1]
-
-        if strategy == "EMA Crossover":
-            sig, angle = ema_signal(
-                sub, st.session_state.ema1, st.session_state.ema2, st.session_state.angle
-            )
-            sig = sig[-1]
-        elif strategy == "Simple Buy":
-            sig = 1
-        else:
-            sig = -1
-
         price = sub["Close"].iloc[-1]
+        atr_val = atr(sub).iloc[-1]
+        sig = ema_signal(sub, ema1, ema2)[-1]
 
         if pos is None and sig != 0:
-            sl, tgt = compute_sl_target(sub, price, sig,
-                                        st.session_state.sl_type,
-                                        st.session_state.tgt_type,
-                                        atr_val,
-                                        st.session_state.rr)
-
             pos = {
                 "dir": sig,
                 "entry": price,
-                "sl": sl,
-                "tgt": tgt,
-                "time": sub.index[-1]
+                "sl": price - sig * sl_points,
+                "entry_time": sub.index[-1],
+                "last_low": sub["Low"].iloc[-1],
+                "last_high": sub["High"].iloc[-1],
             }
 
         elif pos:
+            pos["last_low"] = sub["Low"].iloc[-1]
+            pos["last_high"] = sub["High"].iloc[-1]
+
+            pos["sl"] = update_trailing_sl(
+                pos, price, atr_val, trail_type, sl_points
+            )
+
             if (pos["dir"] == 1 and price <= pos["sl"]) or \
                (pos["dir"] == -1 and price >= pos["sl"]):
-                pos["exit"] = price
-                pos["pnl"] = (price - pos["entry"]) * pos["dir"]
-                trades.append(pos)
-                pos = None
-
-            elif (pos["dir"] == 1 and price >= pos["tgt"]) or \
-                 (pos["dir"] == -1 and price <= pos["tgt"]):
                 pos["exit"] = price
                 pos["pnl"] = (price - pos["entry"]) * pos["dir"]
                 trades.append(pos)
@@ -160,11 +131,17 @@ def backtest(df, strategy):
     return pd.DataFrame(trades)
 
 # ================= UI =================
-st.title("EMA Crossover – Professional Trading Engine")
+st.title("EMA Strategy with TRUE Trailing SL")
 
 ticker = st.text_input("Ticker", "^NSEI")
-interval = st.selectbox("Interval", ["1m","5m","15m","30m","1h","1d"])
-period = st.selectbox("Period", ["1d","5d","1mo","1y"])
+interval = st.selectbox("Interval", ["1m","5m","15m","30m","1h"])
+period = st.selectbox("Period", ["1d","5d","1mo"])
+
+ema1 = st.number_input("EMA 1", 1, 100, 9)
+ema2 = st.number_input("EMA 2", 1, 200, 15)
+
+trail_type = st.selectbox("Trailing SL Type", ["Points","ATR","Candle"])
+sl_points = st.number_input("SL / Trail Points", 1, 500, 10)
 
 if st.button("Fetch Data"):
     st.session_state.data = fetch_data(ticker, interval, period)
@@ -172,38 +149,71 @@ if st.button("Fetch Data"):
 if st.session_state.data is not None:
     df = st.session_state.data
 
-    strategy = st.selectbox("Strategy", ["EMA Crossover","Simple Buy","Simple Sell"])
-
-    st.session_state.ema1 = st.number_input("EMA 1", 1, 100, 9)
-    st.session_state.ema2 = st.number_input("EMA 2", 1, 200, 15)
-    st.session_state.angle = st.number_input("Min Angle", 0, 90, 20)
-
-    st.session_state.sl_type = st.selectbox(
-        "SL Type", ["Custom","ATR","Prev Candle","Swing"]
-    )
-    st.session_state.tgt_type = st.selectbox(
-        "Target Type", ["RR","ATR","Custom"]
-    )
-
-    st.session_state.sl_points = st.number_input("SL Points", 1, 500, 10)
-    st.session_state.tgt_points = st.number_input("Target Points", 1, 500, 20)
-    st.session_state.rr = st.number_input("Risk Reward", 0.5, 5.0, 2.0)
-
     if st.button("Run Backtest"):
-        res = backtest(df, strategy)
-        st.subheader("Trade History")
+        res = backtest(df)
+        st.subheader("Backtest Trades")
         st.dataframe(res)
 
-    fig = go.Figure()
-    fig.add_candlestick(
-        x=df.index, open=df["Open"], high=df["High"],
-        low=df["Low"], close=df["Close"]
-    )
-    fig.add_scatter(x=df.index, y=ema(df["Close"], st.session_state.ema1),
-                    name="EMA1")
-    fig.add_scatter(x=df.index, y=ema(df["Close"], st.session_state.ema2),
-                    name="EMA2")
-    st.plotly_chart(fig, use_container_width=True)
+    # ===== LIVE =====
+    st.subheader("Live Trading (Paper)")
+
+    col1, col2 = st.columns(2)
+    with col1:
+        if st.button("▶ Start"):
+            st.session_state.live_on = True
+            st.session_state.live_pos = None
+
+    with col2:
+        if st.button("⏹ Stop"):
+            st.session_state.live_on = False
+            st.session_state.live_pos = None
+
+    chart = st.empty()
+    status = st.empty()
+
+    while st.session_state.live_on:
+        df = fetch_data(ticker, interval, period)
+        price = df["Close"].iloc[-1]
+        atr_val = atr(df).iloc[-1]
+        sig = ema_signal(df, ema1, ema2)[-1]
+
+        pos = st.session_state.live_pos
+
+        if pos is None and sig != 0:
+            st.session_state.live_pos = {
+                "dir": sig,
+                "entry": price,
+                "sl": price - sig * sl_points,
+                "last_low": df["Low"].iloc[-1],
+                "last_high": df["High"].iloc[-1],
+            }
+            log(f"ENTRY {'LONG' if sig==1 else 'SHORT'} @ {price}")
+
+        elif pos:
+            pos["last_low"] = df["Low"].iloc[-1]
+            pos["last_high"] = df["High"].iloc[-1]
+
+            pos["sl"] = update_trailing_sl(
+                pos, price, atr_val, trail_type, sl_points
+            )
+
+            if (pos["dir"] == 1 and price <= pos["sl"]) or \
+               (pos["dir"] == -1 and price >= pos["sl"]):
+                log(f"EXIT @ {price}")
+                st.session_state.live_pos = None
+
+        fig = go.Figure()
+        fig.add_candlestick(
+            x=df.index, open=df["Open"], high=df["High"],
+            low=df["Low"], close=df["Close"]
+        )
+        fig.add_scatter(x=df.index, y=ema(df["Close"], ema1), name="EMA1")
+        fig.add_scatter(x=df.index, y=ema(df["Close"], ema2), name="EMA2")
+
+        chart.plotly_chart(fig, use_container_width=True)
+        status.write(st.session_state.live_pos)
+
+        time.sleep(random.uniform(1.0, 1.5))
 
 st.subheader("Logs")
 st.text("\n".join(st.session_state.logs[-20:]))
