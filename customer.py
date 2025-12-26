@@ -4,21 +4,52 @@ from PIL import Image
 import base64
 from io import BytesIO
 import json
+import hashlib
 
 # Set page config
 st.set_page_config(page_title="MediFind - Customer", page_icon="💊", layout="wide")
 
-# Initialize session state for in-memory storage
-if 'requests' not in st.session_state:
-    st.session_state.requests = []
-if 'current_request_id' not in st.session_state:
-    st.session_state.current_request_id = None
+# Shared storage key (use URL parameter to sync between apps)
+STORAGE_KEY = 'medifind_requests'
 
 def image_to_base64(image):
     """Convert PIL image to base64 string"""
     buffered = BytesIO()
     image.save(buffered, format="PNG")
     return base64.b64encode(buffered.getvalue()).decode()
+
+def get_storage_data():
+    """Get data from URL params"""
+    params = st.query_params
+    if 'data' in params:
+        try:
+            return json.loads(params['data'])
+        except:
+            return {'requests': []}
+    return {'requests': []}
+
+def save_storage_data(data):
+    """Save data to URL params"""
+    st.query_params['data'] = json.dumps(data)
+
+# Initialize from URL or create new
+if 'initialized' not in st.session_state:
+    url_data = get_storage_data()
+    if url_data['requests']:
+        st.session_state.requests = url_data['requests']
+    else:
+        st.session_state.requests = []
+    st.session_state.initialized = True
+    st.session_state.current_request_id = None
+
+# Sync with URL params on each load
+url_data = get_storage_data()
+if url_data['requests']:
+    # Update responses from vendor
+    for url_req in url_data['requests']:
+        for session_req in st.session_state.requests:
+            if session_req['request_id'] == url_req['request_id']:
+                session_req['responses'] = url_req.get('responses', [])
 
 # Custom CSS
 st.markdown("""
@@ -64,18 +95,15 @@ st.markdown("""
         font-size: 1.1rem;
         border-radius: 10px;
         box-shadow: 0 4px 15px rgba(102, 126, 234, 0.4);
-        transition: transform 0.2s;
     }
-    .stButton>button:hover {
-        transform: translateY(-2px);
-        box-shadow: 0 6px 20px rgba(102, 126, 234, 0.6);
-    }
-    .api-box {
+    .share-url-box {
         background: #f8f9fa;
-        border: 2px dashed #6c757d;
+        border: 2px solid #28a745;
         border-radius: 10px;
         padding: 1rem;
         margin: 1rem 0;
+        font-family: monospace;
+        word-break: break-all;
     }
     </style>
 """, unsafe_allow_html=True)
@@ -83,16 +111,17 @@ st.markdown("""
 # Header
 st.markdown('<h1 class="main-header">💊 MediFind - Find Your Medicine</h1>', unsafe_allow_html=True)
 
-# Vendor API URL input
+# Vendor URL Configuration
 st.sidebar.title("⚙️ Configuration")
-st.sidebar.markdown("### Vendor App URL")
-vendor_url = st.sidebar.text_input(
-    "Enter Vendor App URL",
-    placeholder="https://your-vendor-app.streamlit.app",
-    help="The URL where your vendor app is hosted"
-)
-st.sidebar.markdown("---")
-st.sidebar.info("💡 **Tip:** Get the vendor URL from your hosting platform after deploying vendor_app.py")
+st.sidebar.markdown("### 🔗 Share URL with Vendor")
+
+# Generate shareable URL
+current_url = st.query_params.get('data', '')
+if current_url:
+    vendor_url = f"Open vendor app and import this URL"
+    st.sidebar.code(f"{st.get_option('browser.serverAddress')}:{st.get_option('browser.serverPort')}")
+else:
+    st.sidebar.info("Submit a request first, then share the URL with vendor")
 
 # Main form
 st.markdown("### 📋 Request Medicine from Nearby Shops")
@@ -114,12 +143,12 @@ with col2:
     <div class="info-box">
     <h4>📝 How it works:</h4>
     <ol>
-    <li>Configure vendor URL in sidebar</li>
     <li>Enter medicine name</li>
     <li>Add dosage (optional)</li>
     <li>Upload picture (optional)</li>
     <li>Click 'Request Medicine'</li>
-    <li>Wait for shop responses</li>
+    <li>Share URL with vendor</li>
+    <li>Get real-time responses!</li>
     </ol>
     </div>
     """, unsafe_allow_html=True)
@@ -147,23 +176,45 @@ if st.button("🔍 Request Medicine from Nearby Shops", type="primary", use_cont
             'responses': []
         }
         
-        # Store in session state
+        # Add to session
         st.session_state.requests.append(new_request)
         st.session_state.current_request_id = request_id
         
+        # Save to URL params
+        save_storage_data({'requests': st.session_state.requests})
+        
         st.markdown(f"""
         <div class="success-box">
-        ✅ <strong>Request created successfully!</strong><br>
+        ✅ <strong>Request submitted successfully!</strong><br>
         Request ID: <strong>{request_id}</strong><br>
         Medicine: <strong>{medicine_name}</strong><br>
         Time: <strong>{new_request['timestamp']}</strong>
         </div>
         """, unsafe_allow_html=True)
         st.balloons()
-        
-        # Show API payload for vendor
-        st.markdown("### 📡 Request Data (Share this with vendor)")
-        st.json(new_request)
+        st.rerun()
+
+# Share URL section
+if st.session_state.requests:
+    st.markdown("---")
+    st.markdown("### 🔗 Share This URL with Vendor")
+    
+    # Create shareable link
+    current_data = json.dumps({'requests': st.session_state.requests})
+    share_url = f"Copy the current page URL and share with vendor app"
+    
+    col_a, col_b = st.columns([3, 1])
+    with col_a:
+        st.info("📋 **Copy current page URL from browser address bar and paste in vendor app**")
+    with col_b:
+        if st.button("📋 How to Share"):
+            st.info("""
+            1. Copy URL from browser
+            2. Send to vendor
+            3. Vendor opens vendor app
+            4. Vendor pastes URL
+            5. Real-time sync!
+            """)
 
 # Display requests section
 st.markdown("---")
@@ -200,7 +251,7 @@ else:
                 if response_count > 0:
                     st.success(f"🎉 {response_count} Response(s)")
                 else:
-                    st.warning("Waiting for shops...")
+                    st.warning("Waiting for vendor...")
             
             # Display responses
             if request.get('responses'):
@@ -221,114 +272,13 @@ else:
                     if response.get('location'):
                         st.markdown(f"[🗺️ **View Location on Google Maps**]({response['location']})")
                     st.markdown("")
-            
-            # Manual response input section
-            st.markdown("---")
-            st.markdown("#### 📥 Add Vendor Response (Manual)")
-            st.info("💡 Vendor will provide response data. Copy and paste it here.")
-            
-            with st.form(key=f"response_form_{request['request_id']}"):
-                response_json = st.text_area(
-                    "Paste vendor response JSON here",
-                    height=150,
-                    placeholder='{"shop_name": "ABC Pharmacy", "address": "123 Main St", ...}'
-                )
-                
-                if st.form_submit_button("➕ Add Response"):
-                    try:
-                        response_data = json.loads(response_json)
-                        
-                        # Find and update request
-                        for req in st.session_state.requests:
-                            if req['request_id'] == request['request_id']:
-                                req['responses'].append(response_data)
-                                req['status'] = 'responded'
-                                break
-                        
-                        st.success("✅ Response added successfully!")
-                        st.rerun()
-                    except json.JSONDecodeError:
-                        st.error("❌ Invalid JSON format. Please check the response data.")
-
-# API Information Section
-st.markdown("---")
-st.markdown("### 📡 API Integration Guide")
-
-with st.expander("🔌 How to Connect with Vendor App"):
-    st.markdown("""
-    #### Method 1: Share Request Data
-    1. Submit a request above
-    2. Copy the JSON data shown
-    3. Send to vendor via any method (email, chat, etc.)
-    4. Vendor processes and sends back response JSON
-    5. Paste vendor's response in "Add Vendor Response" section
-    
-    #### Method 2: Direct URL Communication (Advanced)
-    1. Configure vendor URL in sidebar
-    2. Both apps can read from each other's query parameters
-    3. Use the data export/import features below
-    
-    #### Request Data Format:
-    ```json
-    {
-        "request_id": "REQ_20241226_143022_123456",
-        "medicine_name": "Paracetamol",
-        "medicine_mg": "500mg",
-        "image_data": "base64_encoded_string",
-        "timestamp": "2024-12-26 14:30:22",
-        "status": "pending",
-        "responses": []
-    }
-    ```
-    
-    #### Response Data Format:
-    ```json
-    {
-        "shop_name": "ABC Pharmacy",
-        "address": "123 Main Street, City",
-        "contact": "+1234567890",
-        "location": "https://maps.google.com/?q=lat,lng",
-        "response_time": "2024-12-26 14:35:00"
-    }
-    ```
-    """)
-
-# Data Export/Import
-st.markdown("---")
-col_exp, col_imp = st.columns(2)
-
-with col_exp:
-    st.markdown("#### 📤 Export All Requests")
-    if st.button("Export Requests as JSON"):
-        export_data = {
-            'requests': st.session_state.requests,
-            'exported_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        }
-        st.download_button(
-            label="⬇️ Download JSON",
-            data=json.dumps(export_data, indent=2),
-            file_name=f"requests_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
-            mime="application/json"
-        )
-
-with col_imp:
-    st.markdown("#### 📥 Import Requests")
-    uploaded_json = st.file_uploader("Upload JSON file", type=['json'], key="import_file")
-    if uploaded_json:
-        try:
-            import_data = json.load(uploaded_json)
-            if st.button("Import Data"):
-                st.session_state.requests = import_data.get('requests', [])
-                st.success("✅ Data imported successfully!")
-                st.rerun()
-        except:
-            st.error("❌ Invalid JSON file")
 
 # Clear data option
 st.markdown("---")
-if st.button("🗑️ Clear All Requests", type="secondary"):
+if st.button("🗑️ Clear All Requests"):
     st.session_state.requests = []
     st.session_state.current_request_id = None
+    st.query_params.clear()
     st.success("✅ All requests cleared!")
     st.rerun()
 
@@ -336,16 +286,17 @@ if st.button("🗑️ Clear All Requests", type="secondary"):
 st.markdown("---")
 col_ref1, col_ref2 = st.columns([3, 1])
 with col_ref1:
-    st.info("💡 **Tip:** Enable auto-refresh to check for new responses automatically!")
+    st.info("💡 **Tip:** Keep auto-refresh ON to receive vendor responses in real-time!")
 with col_ref2:
-    if st.button("🔄 Refresh Now"):
+    if st.button("🔄 Refresh"):
         st.rerun()
 
-if st.checkbox("🔄 Auto-refresh (every 10 seconds)"):
+auto_refresh = st.checkbox("🔄 Auto-refresh (every 5 seconds)", value=True)
+if auto_refresh:
     import time
-    time.sleep(10)
+    time.sleep(5)
     st.rerun()
 
 # Footer
 st.markdown("---")
-st.caption("💊 MediFind Customer App | API-Based Communication | Session Storage")
+st.caption("💊 MediFind Customer App | Real-time Communication via URL Sharing")
