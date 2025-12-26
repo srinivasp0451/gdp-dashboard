@@ -1,54 +1,20 @@
 import streamlit as st
-import json
-import os
-from datetime import datetime, timedelta
+from datetime import datetime
 from PIL import Image
 import base64
 from io import BytesIO
+import json
 
 # Set page config
 st.set_page_config(page_title="MediFind - Vendor", page_icon="🏪", layout="wide")
 
-# Shared data file - using absolute path to ensure both apps use same file
-import sys
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-DATA_FILE = os.path.join(SCRIPT_DIR, 'shared_requests.json')
+# Initialize session state for in-memory storage
+if 'requests' not in st.session_state:
+    st.session_state.requests = []
 
-# Initialize or load data
-def load_data():
-    try:
-        if os.path.exists(DATA_FILE):
-            with open(DATA_FILE, 'r') as f:
-                content = f.read()
-                if content.strip():
-                    return json.loads(content)
-                return {'requests': []}
-        return {'requests': []}
-    except Exception as e:
-        st.error(f"Error loading data: {e}")
-        return {'requests': []}
-
-def save_data(data):
-    try:
-        with open(DATA_FILE, 'w') as f:
-            json.dump(data, f, indent=2)
-        return True
-    except Exception as e:
-        st.error(f"Error saving data: {e}")
-        return False
-
-def cleanup_old_requests(data):
-    """Remove requests older than 24 hours"""
-    current_time = datetime.now()
-    data['requests'] = [
-        req for req in data['requests']
-        if (current_time - datetime.strptime(req['timestamp'], '%Y-%m-%d %H:%M:%S')) < timedelta(hours=24)
-    ]
-    return data
-
-def count_pending_requests(data):
+def count_pending_requests():
     """Count requests without responses"""
-    return sum(1 for req in data['requests'] if not req.get('responses'))
+    return sum(1 for req in st.session_state.requests if not req.get('responses'))
 
 # Custom CSS with animation
 st.markdown("""
@@ -132,39 +98,25 @@ st.markdown("""
         border-radius: 10px;
         box-shadow: 0 4px 15px rgba(102, 126, 234, 0.4);
     }
-    .metric-card {
-        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-        padding: 1.5rem;
-        border-radius: 15px;
-        color: white;
-        text-align: center;
-        box-shadow: 0 4px 15px rgba(102, 126, 234, 0.3);
-    }
     </style>
 """, unsafe_allow_html=True)
 
 # Header
 st.markdown('<h1 class="main-header">🏪 MediFind - Vendor Dashboard</h1>', unsafe_allow_html=True)
 
-# Load and cleanup data
-data = load_data()
-data = cleanup_old_requests(data)
-save_data(data)
-
-# Show debug info
-with st.expander("🔧 Debug Info (Click to expand)"):
-    st.code(f"Data file location: {DATA_FILE}")
-    st.code(f"File exists: {os.path.exists(DATA_FILE)}")
-    st.code(f"File writable: {os.access(DATA_FILE, os.W_OK) if os.path.exists(DATA_FILE) else 'N/A'}")
-    st.code(f"Total requests in file: {len(data['requests'])}")
-    #st.code(f"Pending requests: {pending_count}")
-    if st.button("View Raw Data"):
-        st.json(data)
-    if st.button("Force Refresh Data"):
-        st.rerun()
+# Customer API URL input
+st.sidebar.title("⚙️ Configuration")
+st.sidebar.markdown("### Customer App URL")
+customer_url = st.sidebar.text_input(
+    "Enter Customer App URL",
+    placeholder="https://your-customer-app.streamlit.app",
+    help="The URL where your customer app is hosted"
+)
+st.sidebar.markdown("---")
+st.sidebar.info("💡 **Tip:** Get the customer URL from your hosting platform after deploying customer_app.py")
 
 # Alert for new requests
-pending_count = count_pending_requests(data)
+pending_count = count_pending_requests()
 if pending_count > 0:
     st.markdown(f'''
     <div class="alert-box">
@@ -176,8 +128,8 @@ if pending_count > 0:
 st.markdown("### 📊 Dashboard Statistics")
 col1, col2, col3, col4 = st.columns(4)
 
-total_requests = len(data['requests'])
-responded = sum(1 for req in data['requests'] if req.get('responses'))
+total_requests = len(st.session_state.requests)
+responded = sum(1 for req in st.session_state.requests if req.get('responses'))
 pending = pending_count
 response_rate = (responded / total_requests * 100) if total_requests > 0 else 0
 
@@ -190,17 +142,86 @@ with col3:
 with col4:
     st.metric("📈 Response Rate", f"{response_rate:.0f}%")
 
+# Import Request Section
+st.markdown("---")
+st.markdown("### 📥 Import Customer Request")
+
+col_import1, col_import2 = st.columns([2, 1])
+
+with col_import1:
+    st.markdown("#### Paste Request JSON from Customer")
+    request_json_input = st.text_area(
+        "Request Data",
+        height=200,
+        placeholder='Paste the complete JSON request from customer here...\n{\n  "request_id": "REQ_...",\n  "medicine_name": "...",\n  ...\n}'
+    )
+    
+    if st.button("➕ Import Request", type="primary", use_container_width=True):
+        if request_json_input.strip():
+            try:
+                new_request = json.loads(request_json_input)
+                
+                # Check if request already exists
+                existing_ids = [req['request_id'] for req in st.session_state.requests]
+                if new_request['request_id'] in existing_ids:
+                    st.warning("⚠️ This request already exists!")
+                else:
+                    st.session_state.requests.append(new_request)
+                    st.success(f"✅ Request imported: {new_request['medicine_name']}")
+                    st.balloons()
+                    st.rerun()
+            except json.JSONDecodeError:
+                st.error("❌ Invalid JSON format. Please check the request data.")
+        else:
+            st.error("⚠️ Please paste request data")
+
+with col_import2:
+    st.info("""
+    **📋 How to Import:**
+    
+    1. Customer submits request
+    2. Customer copies JSON data
+    3. Paste JSON in text area
+    4. Click "Import Request"
+    5. Respond to the request
+    """)
+
+# Upload JSON file option
+uploaded_request = st.file_uploader("Or upload request JSON file", type=['json'], key="upload_request")
+if uploaded_request:
+    try:
+        uploaded_data = json.load(uploaded_request)
+        if st.button("Import from File"):
+            # Check if it's a single request or multiple
+            if isinstance(uploaded_data, dict) and 'request_id' in uploaded_data:
+                # Single request
+                existing_ids = [req['request_id'] for req in st.session_state.requests]
+                if uploaded_data['request_id'] not in existing_ids:
+                    st.session_state.requests.append(uploaded_data)
+                    st.success("✅ Request imported from file!")
+                    st.rerun()
+            elif isinstance(uploaded_data, dict) and 'requests' in uploaded_data:
+                # Multiple requests
+                for req in uploaded_data['requests']:
+                    existing_ids = [r['request_id'] for r in st.session_state.requests]
+                    if req['request_id'] not in existing_ids:
+                        st.session_state.requests.append(req)
+                st.success(f"✅ Imported {len(uploaded_data['requests'])} requests!")
+                st.rerun()
+    except:
+        st.error("❌ Invalid JSON file")
+
 # Display requests
 st.markdown("---")
 st.markdown("### 📋 Medicine Requests")
 
-if not data['requests']:
-    st.info("📭 No requests yet. Waiting for customers to submit requests...")
-    st.markdown("💡 **Tip:** Keep auto-refresh enabled to catch new requests instantly!")
+if not st.session_state.requests:
+    st.info("📭 No requests yet. Import customer requests above to get started!")
+    st.markdown("💡 **Tip:** Ask customers to share their request JSON with you")
 else:
     # Sort: pending first, then by timestamp
     sorted_requests = sorted(
-        data['requests'], 
+        st.session_state.requests, 
         key=lambda x: (bool(x.get('responses')), x['timestamp']), 
         reverse=False
     )
@@ -225,7 +246,7 @@ else:
                 st.markdown(f"**💊 Medicine:** {request['medicine_name']}")
                 st.markdown(f"**⚖️ Dosage:** {request['medicine_mg']}")
                 st.markdown(f"**🕒 Request Time:** {request['timestamp']}")
-                st.markdown(f"**📝 Status:** {'Responded' if has_response else 'Awaiting Response'}")
+                st.markdown(f"**📝 Request ID:** {request_id}")
                 
                 # Display image if available
                 if request.get('image_data'):
@@ -238,9 +259,9 @@ else:
             
             with col_b:
                 if has_response:
-                    st.success(f"✅ Response sent at\n{request['responses'][0]['response_time']}")
+                    st.success(f"✅ Response sent")
                 else:
-                    st.warning("⏰ No response yet\n\nPlease respond below")
+                    st.warning("⏰ Awaiting response")
             
             # Show existing responses
             if has_response:
@@ -251,7 +272,8 @@ else:
                     🏪 **Shop:** {resp['shop_name']}  
                     📍 **Address:** {resp['address']}  
                     📞 **Contact:** {resp.get('contact', 'N/A')}  
-                    🗺️ **Location:** {resp['location']}
+                    🗺️ **Location:** {resp['location']}  
+                    ⏰ **Time:** {resp['response_time']}
                     """)
             
             # Response form (only for pending requests)
@@ -279,12 +301,9 @@ else:
                     st.caption("• Open Google Maps → Long press your shop → Click coordinates to copy")
                     st.caption("• Or use 'Share' button → Copy link")
                     
-                    col_submit, col_cancel = st.columns([1, 1])
-                    
-                    with col_submit:
-                        submit = st.form_submit_button("✉️ Send Response", 
-                                                      type="primary", 
-                                                      use_container_width=True)
+                    submit = st.form_submit_button("✉️ Generate Response", 
+                                                  type="primary", 
+                                                  use_container_width=True)
                     
                     if submit:
                         if not shop_name or not address or not location:
@@ -299,39 +318,82 @@ else:
                                 'response_time': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
                             }
                             
-                            # Find and update request
-                            for req in data['requests']:
+                            # Update request
+                            for req in st.session_state.requests:
                                 if req['request_id'] == request_id:
                                     req['responses'].append(response_data)
                                     req['status'] = 'responded'
                                     break
                             
-                            save_data(data)
+                            st.success("✅ Response created!")
+                            st.markdown("### 📋 Copy this JSON and send to customer:")
+                            st.code(json.dumps(response_data, indent=2), language='json')
                             
-                            st.success("✅ Response sent successfully!")
+                            # Download button
+                            st.download_button(
+                                label="⬇️ Download Response JSON",
+                                data=json.dumps(response_data, indent=2),
+                                file_name=f"response_{request_id}.json",
+                                mime="application/json"
+                            )
+                            
                             st.balloons()
                             import time
-                            time.sleep(1)
+                            time.sleep(2)
                             st.rerun()
+
+# Export all responses
+st.markdown("---")
+st.markdown("### 📤 Export All Responses")
+
+if st.button("Export All Responses as JSON"):
+    all_responses = []
+    for req in st.session_state.requests:
+        if req.get('responses'):
+            all_responses.append({
+                'request_id': req['request_id'],
+                'medicine_name': req['medicine_name'],
+                'responses': req['responses']
+            })
+    
+    export_data = {
+        'responses': all_responses,
+        'exported_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+        'total_responses': len(all_responses)
+    }
+    
+    st.download_button(
+        label="⬇️ Download All Responses",
+        data=json.dumps(export_data, indent=2),
+        file_name=f"all_responses_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
+        mime="application/json"
+    )
+
+# Clear data option
+st.markdown("---")
+if st.button("🗑️ Clear All Requests", type="secondary"):
+    st.session_state.requests = []
+    st.success("✅ All requests cleared!")
+    st.rerun()
 
 # Auto-refresh controls
 st.markdown("---")
 col_refresh1, col_refresh2 = st.columns([3, 1])
 
 with col_refresh1:
-    st.info("💡 **Keep this page open!** Enable auto-refresh to catch new requests instantly.")
+    st.info("💡 **Keep this page open!** Enable auto-refresh to catch new requests.")
 
 with col_refresh2:
     if st.button("🔄 Refresh Now", use_container_width=True):
         st.rerun()
 
-auto_refresh = st.checkbox("🔄 Auto-refresh every 5 seconds", value=True)
+auto_refresh = st.checkbox("🔄 Auto-refresh every 10 seconds", value=False)
 
 if auto_refresh:
     import time
-    time.sleep(5)
+    time.sleep(10)
     st.rerun()
 
 # Footer
 st.markdown("---")
-st.caption("🏪 MediFind Vendor Dashboard | Requests auto-delete after 24 hours | Stay online to serve customers!")
+st.caption("🏪 MediFind Vendor Dashboard | API-Based Communication | Session Storage")
