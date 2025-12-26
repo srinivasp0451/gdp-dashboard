@@ -936,6 +936,7 @@ with col2:
                 st.session_state.trailing_sl_lowest = 0
                 st.session_state.potential_pnl_sl = 0
                 st.session_state.potential_pnl_target = 0
+                st.info("Live trading Force stopped")
                 
             
             elif position_type == -1 and current_price <= st.session_state.target:
@@ -956,21 +957,21 @@ with col2:
                 }
                 
                 st.session_state.live_trades.append(trade)
-            add_log(f"Position force closed in loss | PnL: {pnl:.2f}")
+                add_log(f"Position force closed in loss | PnL: {pnl:.2f}")
+                    
+                st.session_state.in_position = False
+                st.session_state.position_type = 0
+                st.session_state.entry_price = 0
+                st.session_state.stop_loss = 0
+                st.session_state.target = 0
+                st.session_state.trailing_sl_highest = 0
+                st.session_state.trailing_sl_lowest = 0
+                st.session_state.potential_pnl_sl = 0
+                st.session_state.potential_pnl_target = 0
+                # end of added code
+                add_log("Live trading Force stopped")
+                st.info("Live trading Force stopped")
                 
-            st.session_state.in_position = False
-            st.session_state.position_type = 0
-            st.session_state.entry_price = 0
-            st.session_state.stop_loss = 0
-            st.session_state.target = 0
-            st.session_state.trailing_sl_highest = 0
-            st.session_state.trailing_sl_lowest = 0
-            st.session_state.potential_pnl_sl = 0
-            st.session_state.potential_pnl_target = 0
-            # end of added code
-            add_log("Live trading stopped")
-            st.info("Live trading stopped")
-            st.rerun()
 
 with col3:
     st.metric("Iterations", st.session_state.iteration_count)
