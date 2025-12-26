@@ -157,7 +157,7 @@ with st.expander("🔧 Debug Info (Click to expand)"):
     st.code(f"File exists: {os.path.exists(DATA_FILE)}")
     st.code(f"File writable: {os.access(DATA_FILE, os.W_OK) if os.path.exists(DATA_FILE) else 'N/A'}")
     st.code(f"Total requests in file: {len(data['requests'])}")
-    st.code(f"Pending requests: {pending_count}")
+    #st.code(f"Pending requests: {pending_count}")
     if st.button("View Raw Data"):
         st.json(data)
     if st.button("Force Refresh Data"):
