@@ -955,7 +955,7 @@ with col2:
                     'Quantity': st.session_state.quantity
                 }
                 
-            st.session_state.live_trades.append(trade)
+                st.session_state.live_trades.append(trade)
             add_log(f"Position force closed in loss | PnL: {pnl:.2f}")
                 
             st.session_state.in_position = False
