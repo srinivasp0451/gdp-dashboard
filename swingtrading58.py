@@ -801,7 +801,7 @@ if strategy_type == 'EMA Crossover':
     with col2:
         ema_slow = st.number_input("EMA Slow", min_value=1, max_value=200, value=15)
     
-    min_angle = st.sidebar.slider("Minimum Crossover Angle (°)", 0, 90, 20)
+    min_angle = st.sidebar.slider("Minimum Crossover Angle (°)", 0, 90, 2)
     
     entry_filter = st.sidebar.selectbox(
         "Entry Filter",
