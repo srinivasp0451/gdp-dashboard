@@ -936,7 +936,7 @@ with col2:
                 st.session_state.trailing_sl_lowest = 0
                 st.session_state.potential_pnl_sl = 0
                 st.session_state.potential_pnl_target = 0
-                return
+                
             
             elif position_type == -1 and current_price <= st.session_state.target:
                 exit_price = st.session_state.target
