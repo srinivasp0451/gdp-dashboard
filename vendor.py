@@ -9,22 +9,33 @@ from io import BytesIO
 # Set page config
 st.set_page_config(page_title="MediFind - Vendor", page_icon="🏪", layout="wide")
 
-# Shared data file
-DATA_FILE = 'shared_requests.json'
+# Shared data file - using absolute path to ensure both apps use same file
+import sys
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+DATA_FILE = os.path.join(SCRIPT_DIR, 'shared_requests.json')
 
 # Initialize or load data
 def load_data():
-    if os.path.exists(DATA_FILE):
-        try:
+    try:
+        if os.path.exists(DATA_FILE):
             with open(DATA_FILE, 'r') as f:
-                return json.load(f)
-        except:
-            return {'requests': []}
-    return {'requests': []}
+                content = f.read()
+                if content.strip():
+                    return json.loads(content)
+                return {'requests': []}
+        return {'requests': []}
+    except Exception as e:
+        st.error(f"Error loading data: {e}")
+        return {'requests': []}
 
 def save_data(data):
-    with open(DATA_FILE, 'w') as f:
-        json.dump(data, f, indent=2)
+    try:
+        with open(DATA_FILE, 'w') as f:
+            json.dump(data, f, indent=2)
+        return True
+    except Exception as e:
+        st.error(f"Error saving data: {e}")
+        return False
 
 def cleanup_old_requests(data):
     """Remove requests older than 24 hours"""
@@ -139,6 +150,18 @@ st.markdown('<h1 class="main-header">🏪 MediFind - Vendor Dashboard</h1>', uns
 data = load_data()
 data = cleanup_old_requests(data)
 save_data(data)
+
+# Show debug info
+with st.expander("🔧 Debug Info (Click to expand)"):
+    st.code(f"Data file location: {DATA_FILE}")
+    st.code(f"File exists: {os.path.exists(DATA_FILE)}")
+    st.code(f"File writable: {os.access(DATA_FILE, os.W_OK) if os.path.exists(DATA_FILE) else 'N/A'}")
+    st.code(f"Total requests in file: {len(data['requests'])}")
+    st.code(f"Pending requests: {pending_count}")
+    if st.button("View Raw Data"):
+        st.json(data)
+    if st.button("Force Refresh Data"):
+        st.rerun()
 
 # Alert for new requests
 pending_count = count_pending_requests(data)
