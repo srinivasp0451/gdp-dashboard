@@ -901,6 +901,63 @@ with col2:
         if st.session_state.live_running:
             st.session_state.live_running = False
             # added this extra code
+            data = fetch_data_with_retry(ticker, interval, period)
+            i = len(data) - 1
+            current_price = data['Close'].iloc[i]
+            position_type = st.session_state.position_type
+            entry_price = st.session_state.entry_price
+        
+            if position_type == 1 and current_price >= st.session_state.target:
+                exit_price = st.session_state.target
+                pnl = (current_price - entry_price) * st.session_state.quantity
+                
+                trade = {
+                    'Entry Time': df['Datetime'].iloc[st.session_state.entry_idx].strftime('%Y-%m-%d %H:%M:%S'),
+                    'Exit Time': df['Datetime'].iloc[i].strftime('%Y-%m-%d %H:%M:%S'),
+                    'Type': 'LONG',
+                    'Entry Price': entry_price,
+                    'Exit Price': exit_price,
+                    'Stop Loss': st.session_state.stop_loss,
+                    'Target': st.session_state.target,
+                    'Exit Reason': 'Force closed in profit',
+                    'PnL': pnl,
+                    'Quantity': st.session_state.quantity
+                }
+                
+                st.session_state.live_trades.append(trade)
+                add_log(f"Position closed in profit | PnL: {pnl:.2f}")
+                
+                st.session_state.in_position = False
+                st.session_state.position_type = 0
+                st.session_state.entry_price = 0
+                st.session_state.stop_loss = 0
+                st.session_state.target = 0
+                st.session_state.trailing_sl_highest = 0
+                st.session_state.trailing_sl_lowest = 0
+                st.session_state.potential_pnl_sl = 0
+                st.session_state.potential_pnl_target = 0
+                return
+            
+            elif position_type == -1 and current_price <= st.session_state.target:
+                exit_price = st.session_state.target
+                pnl = (entry_price - current_price) * st.session_state.quantity
+                
+                trade = {
+                    'Entry Time': df['Datetime'].iloc[st.session_state.entry_idx].strftime('%Y-%m-%d %H:%M:%S'),
+                    'Exit Time': df['Datetime'].iloc[i].strftime('%Y-%m-%d %H:%M:%S'),
+                    'Type': 'SHORT',
+                    'Entry Price': entry_price,
+                    'Exit Price': exit_price,
+                    'Stop Loss': st.session_state.stop_loss,
+                    'Target': st.session_state.target,
+                    'Exit Reason': 'Force closed in loss',
+                    'PnL': pnl,
+                    'Quantity': st.session_state.quantity
+                }
+                
+            st.session_state.live_trades.append(trade)
+            add_log(f"Position force closed in loss | PnL: {pnl:.2f}")
+                
             st.session_state.in_position = False
             st.session_state.position_type = 0
             st.session_state.entry_price = 0
