@@ -341,7 +341,8 @@ def update_trailing_sl(current_price, position_type, sl_type, trail_percent=1):
     if position_type == 1:
         if current_price > st.session_state.trailing_sl_highest:
             st.session_state.trailing_sl_highest = current_price
-            new_sl = current_price * (1 - trail_percent / 100)
+            #new_sl = current_price * (1 - trail_percent / 100)
+            new_sl = current_price - trail_percent
             if new_sl > st.session_state.stop_loss:
                 st.session_state.stop_loss = new_sl
                 add_log(f"Trailing SL updated to {new_sl:.2f}")
@@ -349,7 +350,8 @@ def update_trailing_sl(current_price, position_type, sl_type, trail_percent=1):
     else:
         if current_price < st.session_state.trailing_sl_lowest or st.session_state.trailing_sl_lowest == 0:
             st.session_state.trailing_sl_lowest = current_price
-            new_sl = current_price * (1 + trail_percent / 100)
+            #new_sl = current_price * (1 + trail_percent / 100)
+            new_sl = current_price + trail_percent
             if new_sl < st.session_state.stop_loss or st.session_state.stop_loss == 0:
                 st.session_state.stop_loss = new_sl
                 add_log(f"Trailing SL updated to {new_sl:.2f}")
@@ -832,7 +834,7 @@ atr_multiplier = 2
 if sl_type == 'Custom Points':
     sl_value = st.sidebar.number_input("SL Points", min_value=1, value=50)
 elif sl_type == 'Trailing SL':
-    trail_percent = st.sidebar.slider("Trail Percentage", 0.1, 5.0, 1.0, 0.1)
+    trail_percent = st.sidebar.number_input("Trail points", min_value=1, value=10)
 elif sl_type == 'ATR Based':
     atr_multiplier = st.sidebar.slider("ATR Multiplier", 0.5, 5.0, 2.0, 0.1)
 
@@ -898,6 +900,17 @@ with col2:
     if st.button("⏹️ Stop Live Trading", use_container_width=True):
         if st.session_state.live_running:
             st.session_state.live_running = False
+            # added this extra code
+            st.session_state.in_position = False
+            st.session_state.position_type = 0
+            st.session_state.entry_price = 0
+            st.session_state.stop_loss = 0
+            st.session_state.target = 0
+            st.session_state.trailing_sl_highest = 0
+            st.session_state.trailing_sl_lowest = 0
+            st.session_state.potential_pnl_sl = 0
+            st.session_state.potential_pnl_target = 0
+            # end of added code
             add_log("Live trading stopped")
             st.info("Live trading stopped")
             st.rerun()
