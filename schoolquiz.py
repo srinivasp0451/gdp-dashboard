@@ -9,7 +9,7 @@ from typing import Dict, List
 # ============================================================================
 
 st.set_page_config(
-    page_title="SSC Telangana Quiz System",
+    page_title="School Quiz System (srinivas)",
     page_icon="📚",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -445,8 +445,8 @@ def show_home_page():
     
     st.markdown("""
     <div class="card">
-        <h1 style="color: white; margin: 0;">📚 SSC Telangana Online Quiz System</h1>
-        <p style="color: white; opacity: 0.9; font-size: 1.1rem; margin-top: 0.5rem;">
+        <h1 style="color: white; margin: 0;">📚 School Online Quiz System(srinivas)</h1>
+        <p style="color: black; opacity: 0.9; font-size: 1.1rem; margin-top: 0.5rem;">
             Professional Quiz Platform for Students
         </p>
     </div>
