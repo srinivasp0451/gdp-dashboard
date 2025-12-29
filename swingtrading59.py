@@ -645,7 +645,7 @@ def main():
     strategy_params['quantity'] = st.sidebar.number_input("Quantity", min_value=1, value=1)
     st.session_state.quantity = strategy_params['quantity']
     
-    # Control buttons moved to main page
+    # Control buttons on main page
     st.subheader("🎮 Trading Controls")
     col1, col2, col3 = st.columns([1, 1, 4])
     
@@ -673,244 +673,240 @@ def main():
             add_log("🛑 Live trading stopped")
             st.rerun()
     
-    # Tabs always visible - show data whether running or not
+    # Tabs always visible
     tab1, tab2, tab3 = st.tabs(["📊 Live Dashboard", "📜 Trade History", "📝 Trade Logs"])
     
-    if st.session_state.live_running:
-        
-        with tab1:
-            if st.session_state.live_running:
-                time.sleep(random.uniform(1.0, 1.5))
+    with tab1:
+        if st.session_state.live_running:
+            time.sleep(random.uniform(1.0, 1.5))
+            
+            data = fetch_data_yfinance(ticker, interval, period)
+            
+            if data is not None and not data.empty:
+                if strategy == "EMA Crossover":
+                    data['EMA_Fast'] = calculate_ema(data['Close'], strategy_params['ema_fast'])
+                    data['EMA_Slow'] = calculate_ema(data['Close'], strategy_params['ema_slow'])
+                    data['ATR'] = calculate_atr(data, 14)
                 
-                data = fetch_data_yfinance(ticker, interval, period)
+                st.session_state.live_data = data
                 
-                if data is not None and not data.empty:
+                latest_idx = len(data) - 1
+                current_price = data['Close'].iloc[latest_idx]
+                
+                st.subheader("📈 Live Market Data")
+                
+                metric_col1, metric_col2, metric_col3 = st.columns(3)
+                
+                with metric_col1:
+                    st.metric("Current Price", f"{current_price:.2f}")
+                
+                with metric_col2:
                     if strategy == "EMA Crossover":
-                        data['EMA_Fast'] = calculate_ema(data['Close'], strategy_params['ema_fast'])
-                        data['EMA_Slow'] = calculate_ema(data['Close'], strategy_params['ema_slow'])
-                        data['ATR'] = calculate_atr(data, 14)
+                        ema_fast_val = data['EMA_Fast'].iloc[latest_idx]
+                        st.metric("EMA Fast", f"{ema_fast_val:.2f}")
+                
+                with metric_col3:
+                    if strategy == "EMA Crossover":
+                        ema_slow_val = data['EMA_Slow'].iloc[latest_idx]
+                        st.metric("EMA Slow", f"{ema_slow_val:.2f}")
+                
+                metric_col4, metric_col5, metric_col6 = st.columns(3)
+                
+                with metric_col4:
+                    if strategy == "EMA Crossover":
+                        angle = calculate_ema_angle(data['EMA_Fast'], data['EMA_Slow'], latest_idx)
+                        angle_str = f"{angle:.1f}°"
+                        st.metric("Crossover Angle", angle_str)
+                
+                with metric_col5:
+                    position_status = "OPEN" if st.session_state.in_position else "CLOSED"
+                    position_color = "🟢" if st.session_state.in_position else "⚪"
+                    st.metric("Position Status", f"{position_color} {position_status}")
+                
+                with metric_col6:
+                    current_signal = "NONE"
+                    if strategy == "EMA Crossover":
+                        signal, signal_data = generate_ema_crossover_signal(data, latest_idx, strategy_params)
+                        if signal == 1:
+                            current_signal = "🟢 BUY"
+                        elif signal == -1:
+                            current_signal = "🔴 SELL"
+                    st.metric("Current Signal", current_signal)
+                
+                if st.session_state.in_position:
+                    st.subheader("💼 Open Position Details")
                     
-                    st.session_state.live_data = data
+                    pos_col1, pos_col2, pos_col3, pos_col4 = st.columns(4)
                     
-                    latest_idx = len(data) - 1
-                    current_price = data['Close'].iloc[latest_idx]
+                    with pos_col1:
+                        pos_type = "LONG" if st.session_state.position_type == 1 else "SHORT"
+                        st.metric("Type", pos_type)
                     
-                    st.subheader("📈 Live Market Data")
+                    with pos_col2:
+                        st.metric("Entry Price", f"{st.session_state.entry_price:.2f}")
                     
-                    metric_col1, metric_col2, metric_col3 = st.columns(3)
-                    
-                    with metric_col1:
-                        st.metric("Current Price", f"{current_price:.2f}")
-                    
-                    with metric_col2:
-                        if strategy == "EMA Crossover":
-                            ema_fast_val = data['EMA_Fast'].iloc[latest_idx]
-                            st.metric("EMA Fast", f"{ema_fast_val:.2f}")
-                    
-                    with metric_col3:
-                        if strategy == "EMA Crossover":
-                            ema_slow_val = data['EMA_Slow'].iloc[latest_idx]
-                            st.metric("EMA Slow", f"{ema_slow_val:.2f}")
-                    
-                    metric_col4, metric_col5, metric_col6 = st.columns(3)
-                    
-                    with metric_col4:
-                        if strategy == "EMA Crossover":
-                            angle = calculate_ema_angle(data['EMA_Fast'], data['EMA_Slow'], latest_idx)
-                            angle_str = f"{angle:.1f}°"
-                            st.metric("Crossover Angle", angle_str)
-                    
-                    with metric_col5:
-                        position_status = "OPEN" if st.session_state.in_position else "CLOSED"
-                        position_color = "🟢" if st.session_state.in_position else "⚪"
-                        st.metric("Position Status", f"{position_color} {position_status}")
-                    
-                    with metric_col6:
-                        current_signal = "NONE"
-                        if strategy == "EMA Crossover":
-                            signal, signal_data = generate_ema_crossover_signal(data, latest_idx, strategy_params)
-                            if signal == 1:
-                                current_signal = "🟢 BUY"
-                            elif signal == -1:
-                                current_signal = "🔴 SELL"
-                        st.metric("Current Signal", current_signal)
-                    
-                    if st.session_state.in_position:
-                        st.subheader("💼 Open Position Details")
-                        
-                        pos_col1, pos_col2, pos_col3, pos_col4 = st.columns(4)
-                        
-                        with pos_col1:
-                            pos_type = "LONG" if st.session_state.position_type == 1 else "SHORT"
-                            st.metric("Type", pos_type)
-                        
-                        with pos_col2:
-                            st.metric("Entry Price", f"{st.session_state.entry_price:.2f}")
-                        
-                        with pos_col3:
-                            if st.session_state.stop_loss != 0:
-                                sl_display = f"{st.session_state.stop_loss:.2f}"
-                            else:
-                                sl_display = "Signal Based"
-                            st.metric("Stop Loss", sl_display)
-                        
-                        with pos_col4:
-                            if st.session_state.target != 0:
-                                target_display = f"{st.session_state.target:.2f}"
-                            else:
-                                target_display = "Signal Based"
-                            st.metric("Target", target_display)
-                        
-                        pos_col5, pos_col6, pos_col7 = st.columns(3)
-                        
-                        with pos_col5:
-                            if st.session_state.stop_loss != 0:
-                                sl_distance = abs(current_price - st.session_state.stop_loss)
-                                st.metric("Distance to SL", f"{sl_distance:.2f}")
-                        
-                        with pos_col6:
-                            if st.session_state.target != 0:
-                                target_distance = abs(st.session_state.target - current_price)
-                                st.metric("Distance to Target", f"{target_distance:.2f}")
-                        
-                        with pos_col7:
-                            if st.session_state.position_type == 1:
-                                unrealized_pnl = (current_price - st.session_state.entry_price) * st.session_state.quantity
-                            else:
-                                unrealized_pnl = (st.session_state.entry_price - current_price) * st.session_state.quantity
-                            
-                            st.metric("Unrealized PnL", f"{unrealized_pnl:.2f}", delta=f"{unrealized_pnl:.2f}")
-                        
-                        st.subheader("💡 Trading Guidance")
-                        
-                        guidance_text = ""
-                        if st.session_state.position_type == 1:
-                            if current_price > st.session_state.entry_price:
-                                guidance_text = "✅ Position in profit. Monitor for exit signals."
-                            else:
-                                guidance_text = "⚠️ Position in loss. Watch stop loss level."
+                    with pos_col3:
+                        if st.session_state.stop_loss != 0:
+                            sl_display = f"{st.session_state.stop_loss:.2f}"
                         else:
-                            if current_price < st.session_state.entry_price:
-                                guidance_text = "✅ Position in profit. Monitor for exit signals."
-                            else:
-                                guidance_text = "⚠️ Position in loss. Watch stop loss level."
+                            sl_display = "Signal Based"
+                        st.metric("Stop Loss", sl_display)
+                    
+                    with pos_col4:
+                        if st.session_state.target != 0:
+                            target_display = f"{st.session_state.target:.2f}"
+                        else:
+                            target_display = "Signal Based"
+                        st.metric("Target", target_display)
+                    
+                    pos_col5, pos_col6, pos_col7 = st.columns(3)
+                    
+                    with pos_col5:
+                        if st.session_state.stop_loss != 0:
+                            sl_distance = abs(current_price - st.session_state.stop_loss)
+                            st.metric("Distance to SL", f"{sl_distance:.2f}")
+                    
+                    with pos_col6:
+                        if st.session_state.target != 0:
+                            target_distance = abs(st.session_state.target - current_price)
+                            st.metric("Distance to Target", f"{target_distance:.2f}")
+                    
+                    with pos_col7:
+                        if st.session_state.position_type == 1:
+                            unrealized_pnl = (current_price - st.session_state.entry_price) * st.session_state.quantity
+                        else:
+                            unrealized_pnl = (st.session_state.entry_price - current_price) * st.session_state.quantity
                         
-                        st.info(guidance_text)
+                        st.metric("Unrealized PnL", f"{unrealized_pnl:.2f}", delta=f"{unrealized_pnl:.2f}")
                     
-                    if not st.session_state.in_position:
-                        if strategy == "EMA Crossover":
-                            signal, signal_data = generate_ema_crossover_signal(data, latest_idx, strategy_params)
-                            if signal != 0:
-                                execute_live_trade(data, latest_idx, signal, strategy_params)
-                                st.rerun()
-                        elif strategy == "Simple Buy":
-                            execute_live_trade(data, latest_idx, 1, strategy_params)
-                            st.rerun()
-                        elif strategy == "Simple Sell":
-                            execute_live_trade(data, latest_idx, -1, strategy_params)
-                            st.rerun()
+                    st.subheader("💡 Trading Guidance")
+                    
+                    guidance_text = ""
+                    if st.session_state.position_type == 1:
+                        if current_price > st.session_state.entry_price:
+                            guidance_text = "✅ Position in profit. Monitor for exit signals."
+                        else:
+                            guidance_text = "⚠️ Position in loss. Watch stop loss level."
                     else:
-                        should_exit, exit_price, exit_reason = check_exit_conditions(data, latest_idx, strategy_params)
-                        if should_exit:
-                            execute_exit(exit_price, exit_reason, data, latest_idx)
+                        if current_price < st.session_state.entry_price:
+                            guidance_text = "✅ Position in profit. Monitor for exit signals."
+                        else:
+                            guidance_text = "⚠️ Position in loss. Watch stop loss level."
+                    
+                    st.info(guidance_text)
+                
+                if not st.session_state.in_position:
+                    if strategy == "EMA Crossover":
+                        signal, signal_data = generate_ema_crossover_signal(data, latest_idx, strategy_params)
+                        if signal != 0:
+                            execute_live_trade(data, latest_idx, signal, strategy_params)
                             st.rerun()
-                    
-                    st.subheader("📊 Live Chart")
-                    chart_key = f"live_chart_{get_ist_time().timestamp()}"
-                    fig = plot_live_chart(data, strategy_params)
-                    st.plotly_chart(fig, use_container_width=True, key=chart_key)
-                    
-                    st.subheader("⚙️ Active Strategy Parameters")
-                    param_col1, param_col2 = st.columns(2)
-                    
-                    with param_col1:
-                        st.write(f"**Strategy:** {strategy}")
-                        if strategy == "EMA Crossover":
-                            st.write(f"**EMA Fast:** {strategy_params['ema_fast']}")
-                            st.write(f"**EMA Slow:** {strategy_params['ema_slow']}")
-                            st.write(f"**Min Angle:** {strategy_params['min_angle']}°")
-                            st.write(f"**Entry Filter:** {strategy_params['entry_filter']}")
-                    
-                    with param_col2:
-                        st.write(f"**SL Type:** {strategy_params['sl_type']}")
-                        st.write(f"**Target Type:** {strategy_params['target_type']}")
-                        st.write(f"**Quantity:** {strategy_params['quantity']}")
-                    
-                    time.sleep(1)
-                    st.rerun()
+                    elif strategy == "Simple Buy":
+                        execute_live_trade(data, latest_idx, 1, strategy_params)
+                        st.rerun()
+                    elif strategy == "Simple Sell":
+                        execute_live_trade(data, latest_idx, -1, strategy_params)
+                        st.rerun()
+                else:
+                    should_exit, exit_price, exit_reason = check_exit_conditions(data, latest_idx, strategy_params)
+                    if should_exit:
+                        execute_exit(exit_price, exit_reason, data, latest_idx)
+                        st.rerun()
+                
+                st.subheader("📊 Live Chart")
+                chart_key = f"live_chart_{get_ist_time().timestamp()}"
+                fig = plot_live_chart(data, strategy_params)
+                st.plotly_chart(fig, use_container_width=True, key=chart_key)
+                
+                st.subheader("⚙️ Active Strategy Parameters")
+                param_col1, param_col2 = st.columns(2)
+                
+                with param_col1:
+                    st.write(f"**Strategy:** {strategy}")
+                    if strategy == "EMA Crossover":
+                        st.write(f"**EMA Fast:** {strategy_params['ema_fast']}")
+                        st.write(f"**EMA Slow:** {strategy_params['ema_slow']}")
+                        st.write(f"**Min Angle:** {strategy_params['min_angle']}°")
+                        st.write(f"**Entry Filter:** {strategy_params['entry_filter']}")
+                
+                with param_col2:
+                    st.write(f"**SL Type:** {strategy_params['sl_type']}")
+                    st.write(f"**Target Type:** {strategy_params['target_type']}")
+                    st.write(f"**Quantity:** {strategy_params['quantity']}")
+                
+                time.sleep(1)
+                st.rerun()
         else:
             st.info("Click 'Start Trading' button above to begin live trading.")
     
     with tab2:
         st.subheader("📜 Trade History")
+        
+        if st.session_state.live_trades:
+            trades_df = pd.DataFrame(st.session_state.live_trades)
             
-            if st.session_state.live_trades:
-                trades_df = pd.DataFrame(st.session_state.live_trades)
-                
-                total_trades = len(trades_df)
-                winning_trades = len(trades_df[trades_df['PnL'] > 0])
-                losing_trades = len(trades_df[trades_df['PnL'] < 0])
-                if total_trades > 0:
-                    accuracy = (winning_trades / total_trades * 100)
-                else:
-                    accuracy = 0
-                total_pnl = trades_df['PnL'].sum()
-                
-                metric_col1, metric_col2, metric_col3, metric_col4 = st.columns(4)
-                
-                with metric_col1:
-                    st.metric("Total Trades", total_trades)
-                
-                with metric_col2:
-                    st.metric("Winning Trades", winning_trades)
-                
-                with metric_col3:
-                    st.metric("Accuracy %", f"{accuracy:.2f}%")
-                
-                with metric_col4:
-                    st.metric("Total PnL", f"{total_pnl:.2f}", delta=f"{total_pnl:.2f}")
-                
-                st.dataframe(trades_df, use_container_width=True)
-                
-                st.subheader("📖 Trade Explanations")
-                for idx, trade in enumerate(st.session_state.live_trades):
-                    with st.expander(f"Trade #{idx + 1} - {trade['Type']} - PnL: {trade['PnL']:.2f}"):
-                        st.write(f"**Entry Time:** {trade['Entry Time']}")
-                        st.write(f"**Exit Time:** {trade['Exit Time']}")
-                        st.write(f"**Position Type:** {trade['Type']}")
-                        st.write(f"**Entry Price:** {trade['Entry Price']:.2f}")
-                        st.write(f"**Exit Price:** {trade['Exit Price']:.2f}")
-                        
-                        if trade['Stop Loss'] != 0:
-                            sl_text = f"{trade['Stop Loss']:.2f}"
-                        else:
-                            sl_text = "Signal Based"
-                        
-                        if trade['Target'] != 0:
-                            target_text = f"{trade['Target']:.2f}"
-                        else:
-                            target_text = "Signal Based"
-                        
-                        st.write(f"**Stop Loss:** {sl_text}")
-                        st.write(f"**Target:** {target_text}")
-                        st.write(f"**Exit Reason:** {trade['Reason']}")
-                        st.write(f"**PnL:** {trade['PnL']:.2f}")
-                        
-                        holding_time = trade['Exit Time'] - trade['Entry Time']
-                        st.write(f"**Holding Time:** {holding_time}")
+            total_trades = len(trades_df)
+            winning_trades = len(trades_df[trades_df['PnL'] > 0])
+            losing_trades = len(trades_df[trades_df['PnL'] < 0])
+            if total_trades > 0:
+                accuracy = (winning_trades / total_trades * 100)
+            else:
+                accuracy = 0
+            total_pnl = trades_df['PnL'].sum()
+            
+            metric_col1, metric_col2, metric_col3, metric_col4 = st.columns(4)
+            
+            with metric_col1:
+                st.metric("Total Trades", total_trades)
+            
+            with metric_col2:
+                st.metric("Winning Trades", winning_trades)
+            
+            with metric_col3:
+                st.metric("Accuracy %", f"{accuracy:.2f}%")
+            
+            with metric_col4:
+                st.metric("Total PnL", f"{total_pnl:.2f}", delta=f"{total_pnl:.2f}")
+            
+            st.dataframe(trades_df, use_container_width=True)
+            
+            st.subheader("📖 Trade Explanations")
+            for idx, trade in enumerate(st.session_state.live_trades):
+                with st.expander(f"Trade #{idx + 1} - {trade['Type']} - PnL: {trade['PnL']:.2f}"):
+                    st.write(f"**Entry Time:** {trade['Entry Time']}")
+                    st.write(f"**Exit Time:** {trade['Exit Time']}")
+                    st.write(f"**Position Type:** {trade['Type']}")
+                    st.write(f"**Entry Price:** {trade['Entry Price']:.2f}")
+                    st.write(f"**Exit Price:** {trade['Exit Price']:.2f}")
+                    
+                    if trade['Stop Loss'] != 0:
+                        sl_text = f"{trade['Stop Loss']:.2f}"
+                    else:
+                        sl_text = "Signal Based"
+                    
+                    if trade['Target'] != 0:
+                        target_text = f"{trade['Target']:.2f}"
+                    else:
+                        target_text = "Signal Based"
+                    
+                    st.write(f"**Stop Loss:** {sl_text}")
+                    st.write(f"**Target:** {target_text}")
+                    st.write(f"**Exit Reason:** {trade['Reason']}")
+                    st.write(f"**PnL:** {trade['PnL']:.2f}")
+                    
+                    holding_time = trade['Exit Time'] - trade['Entry Time']
+                    st.write(f"**Holding Time:** {holding_time}")
         else:
             st.info("No trades executed yet. Waiting for signals...")
     
     with tab3:
         st.subheader("📝 Trade Logs")
-            
-            if st.session_state.live_logs:
-                for log in reversed(st.session_state.live_logs):
-                    st.text(log)
-            else:
-                st.info("No logs yet. Start trading to see activity logs.")
-    
-    # Welcome message removed from else block since tabs are always visible
+        
+        if st.session_state.live_logs:
+            for log in reversed(st.session_state.live_logs):
+                st.text(log)
+        else:
+            st.info("No logs yet. Start trading to see activity logs.")
 
 if __name__ == "__main__":
     main()
