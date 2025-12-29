@@ -599,7 +599,7 @@ def main():
     if strategy == "EMA Crossover":
         strategy_params['ema_fast'] = st.sidebar.number_input("EMA Fast", min_value=1, value=9)
         strategy_params['ema_slow'] = st.sidebar.number_input("EMA Slow", min_value=1, value=15)
-        strategy_params['min_angle'] = st.sidebar.number_input("Min Crossover Angle (degrees)", min_value=0, value=20)
+        strategy_params['min_angle'] = st.sidebar.number_input("Min Crossover Angle (degrees)", min_value=0, value=1)
         strategy_params['entry_filter'] = st.sidebar.selectbox(
             "Entry Filter",
             ["Simple Crossover", "Strong Candle (Points)", "ATR-based Candle"]
@@ -620,7 +620,7 @@ def main():
     strategy_params['sl_type'] = sl_type
     
     if sl_type in ["Custom Points", "Trailing SL"]:
-        strategy_params['sl_value'] = st.sidebar.number_input("SL Points", min_value=1, value=50)
+        strategy_params['sl_value'] = st.sidebar.number_input("SL Points", min_value=1, value=5)
     elif sl_type == "ATR-based":
         strategy_params['sl_value'] = st.sidebar.number_input("ATR Multiplier", min_value=0.1, value=2.0, step=0.1)
     else:
@@ -634,7 +634,7 @@ def main():
     strategy_params['target_type'] = target_type
     
     if target_type in ["Custom Points", "Trailing Target"]:
-        strategy_params['target_value'] = st.sidebar.number_input("Target Points", min_value=1, value=100)
+        strategy_params['target_value'] = st.sidebar.number_input("Target Points", min_value=1, value=2)
     elif target_type == "ATR-based":
         strategy_params['target_value'] = st.sidebar.number_input("ATR Multiplier (Target)", min_value=0.1, value=3.0, step=0.1)
     elif target_type == "Risk-Reward Based":
@@ -645,11 +645,12 @@ def main():
     strategy_params['quantity'] = st.sidebar.number_input("Quantity", min_value=1, value=1)
     st.session_state.quantity = strategy_params['quantity']
     
-    st.sidebar.subheader("🎮 Controls")
-    col1, col2 = st.sidebar.columns(2)
+    # Control buttons moved to main page
+    st.subheader("🎮 Trading Controls")
+    col1, col2, col3 = st.columns([1, 1, 4])
     
     with col1:
-        if st.button("▶️ Start", disabled=st.session_state.live_running):
+        if st.button("▶️ Start Trading", disabled=st.session_state.live_running, use_container_width=True):
             with st.spinner("Fetching market data..."):
                 data = fetch_data_yfinance(ticker, interval, period)
                 
@@ -661,22 +662,21 @@ def main():
                     
                     st.session_state.live_data = data
                     st.session_state.live_running = True
-                    st.session_state.live_trades = []
-                    st.session_state.live_logs = []
-                    st.session_state.in_position = False
                     add_log("✅ Live trading started")
                     st.rerun()
                 else:
                     st.error("Failed to fetch data. Please check ticker and try again.")
     
     with col2:
-        if st.button("⏹️ Stop", disabled=not st.session_state.live_running):
+        if st.button("⏹️ Stop Trading", disabled=not st.session_state.live_running, use_container_width=True):
             st.session_state.live_running = False
             add_log("🛑 Live trading stopped")
             st.rerun()
     
+    # Tabs always visible - show data whether running or not
+    tab1, tab2, tab3 = st.tabs(["📊 Live Dashboard", "📜 Trade History", "📝 Trade Logs"])
+    
     if st.session_state.live_running:
-        tab1, tab2, tab3 = st.tabs(["📊 Live Dashboard", "📜 Trade History", "📝 Trade Logs"])
         
         with tab1:
             if st.session_state.live_running:
@@ -838,9 +838,11 @@ def main():
                     
                     time.sleep(1)
                     st.rerun()
-        
-        with tab2:
-            st.subheader("📜 Trade History")
+        else:
+            st.info("Click 'Start Trading' button above to begin live trading.")
+    
+    with tab2:
+        st.subheader("📜 Trade History")
             
             if st.session_state.live_trades:
                 trades_df = pd.DataFrame(st.session_state.live_trades)
@@ -896,11 +898,11 @@ def main():
                         
                         holding_time = trade['Exit Time'] - trade['Entry Time']
                         st.write(f"**Holding Time:** {holding_time}")
-            else:
-                st.info("No trades executed yet. Waiting for signals...")
-        
-        with tab3:
-            st.subheader("📝 Trade Logs")
+        else:
+            st.info("No trades executed yet. Waiting for signals...")
+    
+    with tab3:
+        st.subheader("📝 Trade Logs")
             
             if st.session_state.live_logs:
                 for log in reversed(st.session_state.live_logs):
@@ -908,32 +910,7 @@ def main():
             else:
                 st.info("No logs yet. Start trading to see activity logs.")
     
-    else:
-        st.info("👈 Configure your strategy in the sidebar and click 'Start' to begin live trading.")
-        
-        st.markdown("""
-        ### 🎯 Features
-        
-        - **Multiple Strategies**: EMA Crossover, Simple Buy/Sell
-        - **Advanced Stop Loss**: Custom Points, Trailing SL, ATR-based, Swing-based, Signal-based
-        - **Multiple Targets**: Custom Points, ATR-based, Risk-Reward, Signal-based
-        - **Live Chart**: Real-time candlestick chart with indicators
-        - **Trade History**: Complete record of all trades with metrics
-        - **Trade Logs**: Timestamped entry/exit logs with price levels and PnL
-        
-        ### 📊 Supported Assets
-        
-        - **Indian Indices**: NIFTY 50, BANKNIFTY, SENSEX
-        - **Crypto**: BTC-USD, ETH-USD
-        - **Forex**: USD/INR, EUR/USD, GBP/USD
-        - **Commodities**: Gold, Silver
-        - **Custom Tickers**: Any yfinance supported ticker
-        
-        ### ⚠️ Disclaimer
-        
-        This is a simulated trading environment for educational purposes only.
-        Always test strategies thoroughly before live deployment.
-        """)
+    # Welcome message removed from else block since tabs are always visible
 
 if __name__ == "__main__":
     main()
