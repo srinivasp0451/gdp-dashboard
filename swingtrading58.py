@@ -1068,6 +1068,7 @@ with tab1:
                     st.metric("Current Signal", "SELL", "🔴")
                 else:
                     st.metric("Current Signal", "NONE", "⚪")
+                    st.session_state.stop_loss = 0
             
             st.markdown("---")
             
