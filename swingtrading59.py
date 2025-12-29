@@ -165,13 +165,13 @@ def identify_swing_points(df, lookback=5):
 
 def calculate_stop_loss(df, idx, sl_type, sl_value, position_type, entry_price, atr_value=None):
     """Calculate stop loss based on type"""
-    min_distance = entry_price * 0.005
     
     if sl_type == "Custom Points":
         if position_type == 1:
             sl = entry_price - sl_value
         else:
             sl = entry_price + sl_value
+        return sl
     
     elif sl_type == "ATR-based":
         if atr_value is None:
@@ -180,12 +180,14 @@ def calculate_stop_loss(df, idx, sl_type, sl_value, position_type, entry_price, 
             sl = entry_price - (sl_value * atr_value)
         else:
             sl = entry_price + (sl_value * atr_value)
+        return sl
     
     elif sl_type == "Current Candle Low/High":
         if position_type == 1:
             sl = df['Low'].iloc[idx]
         else:
             sl = df['High'].iloc[idx]
+        return sl
     
     elif sl_type == "Previous Candle Low/High":
         if idx < 1:
@@ -194,6 +196,7 @@ def calculate_stop_loss(df, idx, sl_type, sl_value, position_type, entry_price, 
             sl = df['Low'].iloc[idx-1]
         else:
             sl = df['High'].iloc[idx-1]
+        return sl
     
     elif sl_type == "Current Swing Low/High":
         swing_highs, swing_lows = identify_swing_points(df[:idx+1])
@@ -203,6 +206,7 @@ def calculate_stop_loss(df, idx, sl_type, sl_value, position_type, entry_price, 
             sl = df['High'].iloc[swing_highs[-1]]
         else:
             return 0
+        return sl
     
     elif sl_type == "Previous Swing Low/High":
         swing_highs, swing_lows = identify_swing_points(df[:idx+1])
@@ -212,6 +216,7 @@ def calculate_stop_loss(df, idx, sl_type, sl_value, position_type, entry_price, 
             sl = df['High'].iloc[swing_highs[-2]]
         else:
             return 0
+        return sl
     
     elif sl_type == "Signal-based":
         return 0
@@ -221,26 +226,20 @@ def calculate_stop_loss(df, idx, sl_type, sl_value, position_type, entry_price, 
             sl = entry_price - sl_value
         else:
             sl = entry_price + sl_value
+        return sl
     
     else:
-        sl = 0
-    
-    if position_type == 1:
-        sl = min(sl, entry_price - min_distance)
-    else:
-        sl = max(sl, entry_price + min_distance)
-    
-    return sl
+        return 0
 
 def calculate_target(df, idx, target_type, target_value, position_type, entry_price, atr_value=None, sl_price=0):
     """Calculate target based on type"""
-    min_distance = entry_price * 0.01
     
     if target_type == "Custom Points":
         if position_type == 1:
             target = entry_price + target_value
         else:
             target = entry_price - target_value
+        return target
     
     elif target_type == "ATR-based":
         if atr_value is None:
@@ -249,6 +248,7 @@ def calculate_target(df, idx, target_type, target_value, position_type, entry_pr
             target = entry_price + (target_value * atr_value)
         else:
             target = entry_price - (target_value * atr_value)
+        return target
     
     elif target_type == "Risk-Reward Based":
         if sl_price == 0:
@@ -258,6 +258,7 @@ def calculate_target(df, idx, target_type, target_value, position_type, entry_pr
             target = entry_price + (risk * target_value)
         else:
             target = entry_price - (risk * target_value)
+        return target
     
     elif target_type == "Signal-based":
         return 0
@@ -267,16 +268,10 @@ def calculate_target(df, idx, target_type, target_value, position_type, entry_pr
             target = entry_price + target_value
         else:
             target = entry_price - target_value
+        return target
     
     else:
-        target = 0
-    
-    if position_type == 1:
-        target = max(target, entry_price + min_distance)
-    else:
-        target = min(target, entry_price - min_distance)
-    
-    return target
+        return 0
 
 def update_trailing_sl(df, idx, position_type, entry_price, trailing_points):
     """Update trailing stop loss"""
