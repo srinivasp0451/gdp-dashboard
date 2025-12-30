@@ -85,6 +85,18 @@ def add_log(message):
     if len(st.session_state.live_logs) > 100:
         st.session_state.live_logs = st.session_state.live_logs[-100:]
 
+def reset_position_state():
+    """Reset all position-related session state variables"""
+    st.session_state.in_position = False
+    st.session_state.position_type = 0
+    st.session_state.entry_price = 0
+    st.session_state.stop_loss = 0
+    st.session_state.target = 0
+    st.session_state.entry_idx = 0
+    st.session_state.entry_time = None
+    st.session_state.trailing_sl_highest = 0
+    st.session_state.trailing_sl_lowest = 0
+
 def fetch_data_yfinance(ticker, interval, period):
     """Fetch data from yfinance with rate limiting and proper timezone handling"""
     try:
@@ -173,6 +185,57 @@ def calculate_stop_loss(df, idx, sl_type, sl_value, position_type, entry_price, 
             sl = entry_price + sl_value
         return sl
     
+    elif sl_type == "Trailing SL (Points)":
+        if position_type == 1:
+            sl = entry_price - sl_value
+        else:
+            sl = entry_price + sl_value
+        return sl
+    
+    elif sl_type == "Trailing SL + Current Candle":
+        # Start with current candle, then trail
+        if position_type == 1:
+            sl = df['Low'].iloc[idx]
+        else:
+            sl = df['High'].iloc[idx]
+        return sl
+    
+    elif sl_type == "Trailing SL + Previous Candle":
+        # Start with previous candle, then trail
+        if idx < 1:
+            return 0
+        if position_type == 1:
+            sl = df['Low'].iloc[idx-1]
+        else:
+            sl = df['High'].iloc[idx-1]
+        return sl
+    
+    elif sl_type == "Trailing SL + Current Swing":
+        # Start with current swing, then trail
+        swing_highs, swing_lows = identify_swing_points(df[:idx+1])
+        if position_type == 1 and swing_lows:
+            sl = df['Low'].iloc[swing_lows[-1]]
+        elif position_type == -1 and swing_highs:
+            sl = df['High'].iloc[swing_highs[-1]]
+        else:
+            return 0
+        return sl
+    
+    elif sl_type == "Trailing SL + Previous Swing":
+        # Start with previous swing, then trail
+        swing_highs, swing_lows = identify_swing_points(df[:idx+1])
+        if position_type == 1 and len(swing_lows) > 1:
+            sl = df['Low'].iloc[swing_lows[-2]]
+        elif position_type == -1 and len(swing_highs) > 1:
+            sl = df['High'].iloc[swing_highs[-2]]
+        else:
+            return 0
+        return sl
+    
+    elif sl_type == "Trailing SL + Signal Based":
+        # Signal-based with trailing - no fixed SL, only reverse crossover
+        return 0
+    
     elif sl_type == "ATR-based":
         if atr_value is None:
             return 0
@@ -221,13 +284,6 @@ def calculate_stop_loss(df, idx, sl_type, sl_value, position_type, entry_price, 
     elif sl_type == "Signal-based":
         return 0
     
-    elif sl_type == "Trailing SL":
-        if position_type == 1:
-            sl = entry_price - sl_value
-        else:
-            sl = entry_price + sl_value
-        return sl
-    
     else:
         return 0
 
@@ -240,6 +296,53 @@ def calculate_target(df, idx, target_type, target_value, position_type, entry_pr
         else:
             target = entry_price - target_value
         return target
+    
+    elif target_type == "Trailing Target (Points)":
+        if position_type == 1:
+            target = entry_price + target_value
+        else:
+            target = entry_price - target_value
+        return target
+    
+    elif target_type == "Current Candle Low/High":
+        if position_type == 1:
+            target = df['High'].iloc[idx]
+        else:
+            target = df['Low'].iloc[idx]
+        return target
+    
+    elif target_type == "Previous Candle Low/High":
+        if idx < 1:
+            return 0
+        if position_type == 1:
+            target = df['High'].iloc[idx-1]
+        else:
+            target = df['Low'].iloc[idx-1]
+        return target
+    
+    elif target_type == "Current Swing Low/High":
+        swing_highs, swing_lows = identify_swing_points(df[:idx+1])
+        if position_type == 1 and swing_highs:
+            target = df['High'].iloc[swing_highs[-1]]
+        elif position_type == -1 and swing_lows:
+            target = df['Low'].iloc[swing_lows[-1]]
+        else:
+            return 0
+        return target
+    
+    elif target_type == "Previous Swing Low/High":
+        swing_highs, swing_lows = identify_swing_points(df[:idx+1])
+        if position_type == 1 and len(swing_highs) > 1:
+            target = df['High'].iloc[swing_highs[-2]]
+        elif position_type == -1 and len(swing_lows) > 1:
+            target = df['Low'].iloc[swing_lows[-2]]
+        else:
+            return 0
+        return target
+    
+    elif target_type == "Trailing Target + Signal Based":
+        # Signal-based with trailing - no fixed target, only reverse crossover
+        return 0
     
     elif target_type == "ATR-based":
         if atr_value is None:
@@ -263,31 +366,80 @@ def calculate_target(df, idx, target_type, target_value, position_type, entry_pr
     elif target_type == "Signal-based":
         return 0
     
-    elif target_type == "Trailing Target":
-        if position_type == 1:
-            target = entry_price + target_value
-        else:
-            target = entry_price - target_value
-        return target
-    
     else:
         return 0
 
-def update_trailing_sl(df, idx, position_type, entry_price, trailing_points):
-    """Update trailing stop loss"""
+def update_trailing_sl(df, idx, position_type, entry_price, trailing_points, sl_type):
+    """Update trailing stop loss based on type"""
     current_price = df['Close'].iloc[idx]
+    current_high = df['High'].iloc[idx]
+    current_low = df['Low'].iloc[idx]
     
-    if position_type == 1:
-        if current_price > st.session_state.trailing_sl_highest:
-            st.session_state.trailing_sl_highest = current_price
-            new_sl = st.session_state.trailing_sl_highest - trailing_points
+    if position_type == 1:  # LONG
+        # Update highest price seen
+        if current_high > st.session_state.trailing_sl_highest:
+            st.session_state.trailing_sl_highest = current_high
+            
+            # Calculate new SL based on type
+            if sl_type == "Trailing SL (Points)":
+                new_sl = st.session_state.trailing_sl_highest - trailing_points
+            elif sl_type == "Trailing SL + Current Candle":
+                new_sl = current_low
+            elif sl_type == "Trailing SL + Previous Candle":
+                if idx >= 1:
+                    new_sl = df['Low'].iloc[idx-1]
+                else:
+                    new_sl = current_low
+            elif sl_type == "Trailing SL + Current Swing":
+                swing_highs, swing_lows = identify_swing_points(df[:idx+1])
+                if swing_lows:
+                    new_sl = df['Low'].iloc[swing_lows[-1]]
+                else:
+                    new_sl = st.session_state.stop_loss
+            elif sl_type == "Trailing SL + Previous Swing":
+                swing_highs, swing_lows = identify_swing_points(df[:idx+1])
+                if len(swing_lows) > 1:
+                    new_sl = df['Low'].iloc[swing_lows[-2]]
+                else:
+                    new_sl = st.session_state.stop_loss
+            else:
+                new_sl = st.session_state.trailing_sl_highest - trailing_points
+            
+            # Only move SL up, never down
             if new_sl > st.session_state.stop_loss:
                 st.session_state.stop_loss = new_sl
     
-    else:
-        if st.session_state.trailing_sl_lowest == 0 or current_price < st.session_state.trailing_sl_lowest:
-            st.session_state.trailing_sl_lowest = current_price
-            new_sl = st.session_state.trailing_sl_lowest + trailing_points
+    else:  # SHORT
+        # Update lowest price seen
+        if st.session_state.trailing_sl_lowest == 0 or current_low < st.session_state.trailing_sl_lowest:
+            st.session_state.trailing_sl_lowest = current_low
+            
+            # Calculate new SL based on type
+            if sl_type == "Trailing SL (Points)":
+                new_sl = st.session_state.trailing_sl_lowest + trailing_points
+            elif sl_type == "Trailing SL + Current Candle":
+                new_sl = current_high
+            elif sl_type == "Trailing SL + Previous Candle":
+                if idx >= 1:
+                    new_sl = df['High'].iloc[idx-1]
+                else:
+                    new_sl = current_high
+            elif sl_type == "Trailing SL + Current Swing":
+                swing_highs, swing_lows = identify_swing_points(df[:idx+1])
+                if swing_highs:
+                    new_sl = df['High'].iloc[swing_highs[-1]]
+                else:
+                    new_sl = st.session_state.stop_loss
+            elif sl_type == "Trailing SL + Previous Swing":
+                swing_highs, swing_lows = identify_swing_points(df[:idx+1])
+                if len(swing_highs) > 1:
+                    new_sl = df['High'].iloc[swing_highs[-2]]
+                else:
+                    new_sl = st.session_state.stop_loss
+            else:
+                new_sl = st.session_state.trailing_sl_lowest + trailing_points
+            
+            # Only move SL down, never up
             if st.session_state.stop_loss == 0 or new_sl < st.session_state.stop_loss:
                 st.session_state.stop_loss = new_sl
 
@@ -416,22 +568,28 @@ def check_exit_conditions(df, idx, strategy_params):
     entry_price = st.session_state.entry_price
     stop_loss = st.session_state.stop_loss
     target = st.session_state.target
+    sl_type = strategy_params['sl_type']
+    target_type = strategy_params['target_type']
     
-    if strategy_params['sl_type'] == "Trailing SL":
-        update_trailing_sl(df, idx, position_type, entry_price, strategy_params['sl_value'])
+    # Update trailing SL if applicable
+    if sl_type.startswith("Trailing SL"):
+        update_trailing_sl(df, idx, position_type, entry_price, strategy_params['sl_value'], sl_type)
         stop_loss = st.session_state.stop_loss
     
-    if strategy_params['sl_type'] == "Signal-based" or strategy_params['target_type'] == "Signal-based":
+    # Check signal-based exit first (for both SL and Target)
+    if sl_type == "Signal-based" or sl_type == "Trailing SL + Signal Based" or target_type == "Signal-based" or target_type == "Trailing Target + Signal Based":
         should_exit, reason = check_signal_based_exit(df, idx, position_type)
         if should_exit:
             return True, current_price, reason
     
+    # Check stop loss
     if stop_loss != 0:
         if position_type == 1 and current_price <= stop_loss:
             return True, current_price, "Stop Loss Hit"
         elif position_type == -1 and current_price >= stop_loss:
             return True, current_price, "Stop Loss Hit"
     
+    # Check target
     if target != 0:
         if position_type == 1 and current_price >= target:
             return True, current_price, "Target Hit"
@@ -481,15 +639,8 @@ def execute_exit(exit_price, exit_reason, df, idx):
     #     price=0
     # )
     
-    st.session_state.in_position = False
-    st.session_state.position_type = 0
-    st.session_state.entry_price = 0
-    st.session_state.stop_loss = 0
-    st.session_state.target = 0
-    st.session_state.entry_idx = 0
-    st.session_state.entry_time = None
-    st.session_state.trailing_sl_highest = 0
-    st.session_state.trailing_sl_lowest = 0
+    # CRITICAL: Reset ALL position states immediately after exit
+    reset_position_state()
 
 def plot_live_chart(df, strategy_params):
     """Plot live candlestick chart with EMAs and trade levels"""
@@ -608,13 +759,23 @@ def main():
     st.sidebar.subheader("🛑 Stop Loss Settings")
     sl_type = st.sidebar.selectbox(
         "SL Type",
-        ["Custom Points", "Trailing SL", "ATR-based", "Current Candle Low/High",
-         "Previous Candle Low/High", "Current Swing Low/High", "Previous Swing Low/High",
+        ["Custom Points", 
+         "Trailing SL (Points)", 
+         "Trailing SL + Current Candle",
+         "Trailing SL + Previous Candle",
+         "Trailing SL + Current Swing",
+         "Trailing SL + Previous Swing",
+         "Trailing SL + Signal Based",
+         "ATR-based", 
+         "Current Candle Low/High",
+         "Previous Candle Low/High", 
+         "Current Swing Low/High", 
+         "Previous Swing Low/High",
          "Signal-based"]
     )
     strategy_params['sl_type'] = sl_type
     
-    if sl_type in ["Custom Points", "Trailing SL"]:
+    if sl_type in ["Custom Points", "Trailing SL (Points)"]:
         strategy_params['sl_value'] = st.sidebar.number_input("SL Points", min_value=1, value=5)
     elif sl_type == "ATR-based":
         strategy_params['sl_value'] = st.sidebar.number_input("ATR Multiplier", min_value=0.1, value=2.0, step=0.1)
@@ -624,11 +785,20 @@ def main():
     st.sidebar.subheader("🎯 Target Settings")
     target_type = st.sidebar.selectbox(
         "Target Type",
-        ["Custom Points", "ATR-based", "Trailing Target", "Risk-Reward Based", "Signal-based"]
+        ["Custom Points",
+         "Trailing Target (Points)",
+         "Current Candle Low/High",
+         "Previous Candle Low/High",
+         "Current Swing Low/High",
+         "Previous Swing Low/High",
+         "Trailing Target + Signal Based",
+         "ATR-based",
+         "Risk-Reward Based",
+         "Signal-based"]
     )
     strategy_params['target_type'] = target_type
     
-    if target_type in ["Custom Points", "Trailing Target"]:
+    if target_type in ["Custom Points", "Trailing Target (Points)"]:
         strategy_params['target_value'] = st.sidebar.number_input("Target Points", min_value=1, value=2)
     elif target_type == "ATR-based":
         strategy_params['target_value'] = st.sidebar.number_input("ATR Multiplier (Target)", min_value=0.1, value=3.0, step=0.1)
@@ -657,16 +827,8 @@ def main():
                     
                     st.session_state.live_data = data
                     st.session_state.live_running = True
-                    # Clear all position states when starting fresh
-                    st.session_state.in_position = False
-                    st.session_state.position_type = 0
-                    st.session_state.entry_price = 0
-                    st.session_state.stop_loss = 0
-                    st.session_state.target = 0
-                    st.session_state.entry_idx = 0
-                    st.session_state.entry_time = None
-                    st.session_state.trailing_sl_highest = 0
-                    st.session_state.trailing_sl_lowest = 0
+                    # Clear all position states when starting fresh using reset function
+                    reset_position_state()
                     add_log("✅ Live trading started")
                     st.rerun()
                 else:
@@ -711,17 +873,9 @@ def main():
                 log_msg = f"EXIT | Time: {exit_time_str} | Price: {exit_price:.2f} | PnL: {pnl_text} | Reason: Manual Exit - Trading Stopped"
                 add_log(log_msg)
             
-            # Clear all position states
+            # Clear all position states using reset function
             st.session_state.live_running = False
-            st.session_state.in_position = False
-            st.session_state.position_type = 0
-            st.session_state.entry_price = 0
-            st.session_state.stop_loss = 0
-            st.session_state.target = 0
-            st.session_state.entry_idx = 0
-            st.session_state.entry_time = None
-            st.session_state.trailing_sl_highest = 0
-            st.session_state.trailing_sl_lowest = 0
+            reset_position_state()
             add_log("🛑 Live trading stopped")
             st.rerun()
     
@@ -799,7 +953,7 @@ def main():
                     
                     with pos_col3:
                         # Display SL based on current strategy settings
-                        if strategy_params['sl_type'] == "Signal-based":
+                        if strategy_params['sl_type'] in ["Signal-based", "Trailing SL + Signal Based"]:
                             sl_display = "Signal Based"
                         elif st.session_state.stop_loss != 0:
                             sl_display = f"{st.session_state.stop_loss:.2f}"
@@ -809,7 +963,7 @@ def main():
                     
                     with pos_col4:
                         # Display Target based on current strategy settings
-                        if strategy_params['target_type'] == "Signal-based":
+                        if strategy_params['target_type'] in ["Signal-based", "Trailing Target + Signal Based"]:
                             target_display = "Signal Based"
                         elif st.session_state.target != 0:
                             target_display = f"{st.session_state.target:.2f}"
@@ -817,11 +971,9 @@ def main():
                             target_display = "Not Set"
                         st.metric("Target", target_display)
                     
-                    pos_col5, pos_col6, pos_col7 = st.columns(3)
-                    
                     with pos_col5:
                         # Only show distance if SL is not signal-based
-                        if strategy_params['sl_type'] != "Signal-based" and st.session_state.stop_loss != 0:
+                        if not (strategy_params['sl_type'] in ["Signal-based", "Trailing SL + Signal Based"]) and st.session_state.stop_loss != 0:
                             sl_distance = abs(current_price - st.session_state.stop_loss)
                             st.metric("Distance to SL", f"{sl_distance:.2f}")
                         else:
@@ -829,7 +981,7 @@ def main():
                     
                     with pos_col6:
                         # Only show distance if Target is not signal-based
-                        if strategy_params['target_type'] != "Signal-based" and st.session_state.target != 0:
+                        if not (strategy_params['target_type'] in ["Signal-based", "Trailing Target + Signal Based"]) and st.session_state.target != 0:
                             target_distance = abs(st.session_state.target - current_price)
                             st.metric("Distance to Target", f"{target_distance:.2f}")
                         else:
