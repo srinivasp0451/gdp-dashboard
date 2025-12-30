@@ -657,6 +657,16 @@ def main():
                     
                     st.session_state.live_data = data
                     st.session_state.live_running = True
+                    # Clear all position states when starting fresh
+                    st.session_state.in_position = False
+                    st.session_state.position_type = 0
+                    st.session_state.entry_price = 0
+                    st.session_state.stop_loss = 0
+                    st.session_state.target = 0
+                    st.session_state.entry_idx = 0
+                    st.session_state.entry_time = None
+                    st.session_state.trailing_sl_highest = 0
+                    st.session_state.trailing_sl_lowest = 0
                     add_log("✅ Live trading started")
                     st.rerun()
                 else:
@@ -664,7 +674,54 @@ def main():
     
     with col2:
         if st.button("⏹️ Stop Trading", disabled=not st.session_state.live_running, use_container_width=True):
+            # If in position, close it before stopping
+            if st.session_state.in_position and st.session_state.live_data is not None:
+                data = st.session_state.live_data
+                latest_idx = len(data) - 1
+                exit_price = data['Close'].iloc[latest_idx]
+                exit_time = data.index[latest_idx]
+                
+                entry_price = st.session_state.entry_price
+                position_type = st.session_state.position_type
+                entry_time = st.session_state.entry_time
+                
+                # Calculate PnL
+                if position_type == 1:
+                    pnl = (exit_price - entry_price) * st.session_state.quantity
+                else:
+                    pnl = (entry_price - exit_price) * st.session_state.quantity
+                
+                # Record trade
+                trade = {
+                    'Entry Time': entry_time,
+                    'Exit Time': exit_time,
+                    'Type': "LONG" if position_type == 1 else "SHORT",
+                    'Entry Price': entry_price,
+                    'Exit Price': exit_price,
+                    'PnL': pnl,
+                    'Reason': "Manual Exit - Trading Stopped",
+                    'Stop Loss': st.session_state.stop_loss,
+                    'Target': st.session_state.target
+                }
+                
+                st.session_state.live_trades.append(trade)
+                
+                exit_time_str = exit_time.strftime("%Y-%m-%d %H:%M:%S")
+                pnl_text = f"+{pnl:.2f}" if pnl > 0 else f"{pnl:.2f}"
+                log_msg = f"EXIT | Time: {exit_time_str} | Price: {exit_price:.2f} | PnL: {pnl_text} | Reason: Manual Exit - Trading Stopped"
+                add_log(log_msg)
+            
+            # Clear all position states
             st.session_state.live_running = False
+            st.session_state.in_position = False
+            st.session_state.position_type = 0
+            st.session_state.entry_price = 0
+            st.session_state.stop_loss = 0
+            st.session_state.target = 0
+            st.session_state.entry_idx = 0
+            st.session_state.entry_time = None
+            st.session_state.trailing_sl_highest = 0
+            st.session_state.trailing_sl_lowest = 0
             add_log("🛑 Live trading stopped")
             st.rerun()
     
@@ -741,30 +798,42 @@ def main():
                         st.metric("Entry Price", f"{st.session_state.entry_price:.2f}")
                     
                     with pos_col3:
-                        if st.session_state.stop_loss != 0:
+                        # Display SL based on current strategy settings
+                        if strategy_params['sl_type'] == "Signal-based":
+                            sl_display = "Signal Based"
+                        elif st.session_state.stop_loss != 0:
                             sl_display = f"{st.session_state.stop_loss:.2f}"
                         else:
-                            sl_display = "Signal Based"
+                            sl_display = "Not Set"
                         st.metric("Stop Loss", sl_display)
                     
                     with pos_col4:
-                        if st.session_state.target != 0:
+                        # Display Target based on current strategy settings
+                        if strategy_params['target_type'] == "Signal-based":
+                            target_display = "Signal Based"
+                        elif st.session_state.target != 0:
                             target_display = f"{st.session_state.target:.2f}"
                         else:
-                            target_display = "Signal Based"
+                            target_display = "Not Set"
                         st.metric("Target", target_display)
                     
                     pos_col5, pos_col6, pos_col7 = st.columns(3)
                     
                     with pos_col5:
-                        if st.session_state.stop_loss != 0:
+                        # Only show distance if SL is not signal-based
+                        if strategy_params['sl_type'] != "Signal-based" and st.session_state.stop_loss != 0:
                             sl_distance = abs(current_price - st.session_state.stop_loss)
                             st.metric("Distance to SL", f"{sl_distance:.2f}")
+                        else:
+                            st.metric("Distance to SL", "N/A (Signal Based)")
                     
                     with pos_col6:
-                        if st.session_state.target != 0:
+                        # Only show distance if Target is not signal-based
+                        if strategy_params['target_type'] != "Signal-based" and st.session_state.target != 0:
                             target_distance = abs(st.session_state.target - current_price)
                             st.metric("Distance to Target", f"{target_distance:.2f}")
+                        else:
+                            st.metric("Distance to Target", "N/A (Signal Based)")
                     
                     with pos_col7:
                         if st.session_state.position_type == 1:
