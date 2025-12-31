@@ -52,7 +52,8 @@ def init_session_state():
         'entry_time': None,
         'trailing_sl_highest': 0,
         'trailing_sl_lowest': 0,
-        'last_fetch_time': 0
+        'last_fetch_time': 0,
+        'last_signal_candle': None
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -68,6 +69,7 @@ def reset_position_state():
     st.session_state.entry_time = None
     st.session_state.trailing_sl_highest = 0
     st.session_state.trailing_sl_lowest = 0
+    st.session_state.last_signal_candle = None
 
 def fetch_data_with_delay(ticker, interval, period):
     time.sleep(random.uniform(1.0, 1.5))
@@ -161,6 +163,11 @@ def add_indicators(df, params):
 def generate_ema_crossover_signal(df, idx, params):
     if idx < 1:
         return 0, {}
+    
+    current_candle_time = df.index[idx]
+    if st.session_state.last_signal_candle == current_candle_time:
+        return 0, {}
+    
     ema_fast_curr = df['EMA_Fast'].iloc[idx]
     ema_slow_curr = df['EMA_Slow'].iloc[idx]
     ema_fast_prev = df['EMA_Fast'].iloc[idx-1]
@@ -298,6 +305,8 @@ def calculate_target(df, idx, signal, params):
     elif target_type == 'risk_reward':
         entry = st.session_state.entry_price
         sl = st.session_state.stop_loss
+        if sl is None:
+            return None
         rr_ratio = params.get('risk_reward_ratio', 2)
         risk = abs(entry - sl)
         return entry + (risk * rr_ratio) if signal == 1 else entry - (risk * rr_ratio)
@@ -428,6 +437,7 @@ def execute_entry(df, idx, signal, params):
     st.session_state.entry_time = df.index[idx]
     st.session_state.trailing_sl_highest = entry_price
     st.session_state.trailing_sl_lowest = entry_price
+    st.session_state.last_signal_candle = df.index[idx]
     position_name = "LONG" if signal == 1 else "SHORT"
     log_entry = f"ENTRY: {position_name} | Time: {df.index[idx]} | Price: {entry_price:.2f} | SL: {stop_loss if stop_loss else 'Signal Based'} | Target: {target if target else 'Signal Based'}"
     st.session_state.live_logs.append(log_entry)
@@ -488,9 +498,11 @@ def process_live_tick(df, idx, params):
         if strategy_type == 'ema_crossover':
             signal, _ = generate_ema_crossover_signal(df, idx, params)
         elif strategy_type == 'simple_buy':
-            signal = 1
+            if st.session_state.last_signal_candle != df.index[idx]:
+                signal = 1
         elif strategy_type == 'simple_sell':
-            signal = -1
+            if st.session_state.last_signal_candle != df.index[idx]:
+                signal = -1
         if signal != 0:
             execute_entry(df, idx, signal, params)
 
@@ -567,7 +579,8 @@ def main():
                     st.session_state.live_running = True
                     st.session_state.last_fetch_time = time.time()
                     reset_position_state()
-                    st.success("Trading started!")
+                    st.success("✅ Trading started!")
+                    st.rerun()
                 else:
                     st.error("Failed to fetch data")
     with col2:
@@ -578,7 +591,8 @@ def main():
                     current_price = df['Close'].iloc[-1]
                     execute_exit(df, len(df)-1, current_price, "Manual Exit - Trading Stopped", strategy_params)
                 st.session_state.live_running = False
-                st.success("Trading stopped!")
+                st.success("⏹️ Trading stopped!")
+                st.rerun()
     tab1, tab2, tab3 = st.tabs(["📊 Live Dashboard", "📈 Trade History", "📝 Trade Logs"])
     with tab1:
         if st.session_state.live_data is not None:
@@ -609,9 +623,12 @@ def main():
             st.subheader("📊 Live Market Data")
             live_col1, live_col2, live_col3, live_col4, live_col5 = st.columns(5)
             current_price = df['Close'].iloc[-1]
+            prev_close = df['Close'].iloc[-2] if len(df) > 1 else current_price
+            price_change = current_price - prev_close
+            price_change_pct = (price_change / prev_close * 100) if prev_close != 0 else 0
             atr_val = df['ATR'].iloc[-1]
             with live_col1:
-                st.metric("Current Price", f"{current_price:.2f}")
+                st.metric("Current Price", f"{current_price:.2f}", delta=f"{price_change:.2f} ({price_change_pct:+.2f}%)")
             with live_col2:
                 if strategy_params['strategy_type'] == 'ema_crossover':
                     ema_fast_val = df['EMA_Fast'].iloc[-1]
@@ -625,7 +642,10 @@ def main():
                 else:
                     st.metric("High", f"{df['High'].iloc[-1]:.2f}")
             with live_col4:
-                st.metric("ATR", f"{atr_val:.2f}")
+                if strategy_params['strategy_type'] == 'ema_crossover':
+                    st.metric("ATR", f"{atr_val:.2f}")
+                else:
+                    st.metric("Low", f"{df['Low'].iloc[-1]:.2f}")
             with live_col5:
                 if strategy_params.get('use_adx', False) and strategy_params['strategy_type'] == 'ema_crossover':
                     adx_val = df['ADX'].iloc[-1]
@@ -647,6 +667,7 @@ def main():
                         unrealized_pnl = current_price - st.session_state.entry_price
                     else:
                         unrealized_pnl = st.session_state.entry_price - current_price
+                    pnl_delta_color = "normal" if unrealized_pnl >= 0 else "inverse"
                     st.metric("Unrealized P&L", f"{unrealized_pnl:.2f}", delta=f"{unrealized_pnl:.2f}")
                     st.write("**Entry Price:**")
                     st.write(f"{st.session_state.entry_price:.2f}")
@@ -664,7 +685,7 @@ def main():
                     if len(st.session_state.live_trades) > 0:
                         trades_df = pd.DataFrame(st.session_state.live_trades)
                         total_pnl = trades_df['PnL'].sum()
-                        st.write("**Session P&L:**")
+                        st.write("**Total P&L:**")
                         st.write(f"{total_pnl:.2f}")
             with status_col2:
                 if st.session_state.in_position:
@@ -684,8 +705,9 @@ def main():
                                     st.caption(f"Swing High: {swing_val.iloc[-1]:.2f}")
                         if 'candle' in strategy_params['sl_type']:
                             if 'previous' in strategy_params['sl_type']:
-                                candle_val = df['Low'].iloc[-2] if st.session_state.position_type == 1 else df['High'].iloc[-2]
-                                st.caption(f"Prev Candle: {candle_val:.2f}")
+                                if len(df) > 1:
+                                    candle_val = df['Low'].iloc[-2] if st.session_state.position_type == 1 else df['High'].iloc[-2]
+                                    st.caption(f"Prev Candle: {candle_val:.2f}")
                             elif 'current' in strategy_params['sl_type']:
                                 candle_val = df['Low'].iloc[-1] if st.session_state.position_type == 1 else df['High'].iloc[-1]
                                 st.caption(f"Curr Candle: {candle_val:.2f}")
@@ -716,8 +738,9 @@ def main():
                                     st.caption(f"Swing Low: {swing_val.iloc[-1]:.2f}")
                         if 'candle' in strategy_params['target_type']:
                             if 'previous' in strategy_params['target_type']:
-                                candle_val = df['High'].iloc[-2] if st.session_state.position_type == 1 else df['Low'].iloc[-2]
-                                st.caption(f"Prev Candle: {candle_val:.2f}")
+                                if len(df) > 1:
+                                    candle_val = df['High'].iloc[-2] if st.session_state.position_type == 1 else df['Low'].iloc[-2]
+                                    st.caption(f"Prev Candle: {candle_val:.2f}")
                             elif 'current' in strategy_params['target_type']:
                                 candle_val = df['High'].iloc[-1] if st.session_state.position_type == 1 else df['Low'].iloc[-1]
                                 st.caption(f"Curr Candle: {candle_val:.2f}")
@@ -739,14 +762,14 @@ def main():
             st.write("")
             st.write("**What you'll see once trading starts:**")
             st.write("• ⚙️ Your active strategy configuration at the top")
-            st.write("• 📊 Live price and indicator values")
+            st.write("• 📊 Live price and indicator values with price change")
             st.write("• 📍 Real-time position status and P&L")
-            st.write("• 📈 Interactive candlestick chart")
+            st.write("• 📈 Interactive candlestick chart with entry/exit levels")
             st.write("• 🔄 Auto-refresh every 1-1.5 seconds")
             st.write("")
             st.write("**Configure your strategy in the sidebar:**")
             st.write("1. Select asset and timeframe")
-            st.write("2. Choose strategy type")
+            st.write("2. Choose strategy type (EMA Crossover, Simple Buy/Sell)")
             st.write("3. Set stop loss and target parameters")
             st.write("4. Click 'Start Trading' to begin!")
     with tab2:
@@ -756,26 +779,35 @@ def main():
             metric_col1, metric_col2, metric_col3, metric_col4 = st.columns(4)
             total_trades = len(trades_df)
             winning_trades = len(trades_df[trades_df['PnL'] > 0])
+            losing_trades = len(trades_df[trades_df['PnL'] < 0])
             accuracy = (winning_trades / total_trades * 100) if total_trades > 0 else 0
             total_pnl = trades_df['PnL'].sum()
             with metric_col1:
                 st.metric("Total Trades", total_trades)
             with metric_col2:
-                st.metric("Winning Trades", winning_trades)
+                st.metric("Winning Trades", f"{winning_trades} ({accuracy:.1f}%)")
             with metric_col3:
-                st.metric("Accuracy", f"{accuracy:.2f}%")
+                st.metric("Losing Trades", losing_trades)
             with metric_col4:
-                st.metric("Total PnL", f"{total_pnl:.2f}")
-            st.dataframe(trades_df, use_container_width=True)
+                st.metric("Total P&L", f"{total_pnl:.2f}", delta=f"{total_pnl:.2f}")
+            st.dataframe(trades_df, use_container_width=True, hide_index=True)
         else:
-            st.info("No trades executed yet")
+            st.info("No trades executed yet. Trades will appear here after entry and exit.")
     with tab3:
         st.subheader("Trade Logs")
         if len(st.session_state.live_logs) > 0:
             for log in reversed(st.session_state.live_logs):
-                st.text(log)
+                if "ENTRY" in log:
+                    st.success(log)
+                elif "EXIT" in log:
+                    if "PnL: -" in log:
+                        st.error(log)
+                    else:
+                        st.info(log)
+                else:
+                    st.text(log)
         else:
-            st.info("No trade logs yet")
+            st.info("No trade logs yet. Entry and exit events will be logged here.")
     if st.session_state.live_running:
         current_time = time.time()
         time_diff = current_time - st.session_state.last_fetch_time
