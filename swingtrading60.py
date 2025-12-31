@@ -925,6 +925,7 @@ def main():
                         st.session_state.last_fetch_time = time.time()
                         reset_position_state()
                         st.success("Trading started!")
+                        time.sleep(0.5)
                         st.rerun()
                     else:
                         st.error("Failed to fetch data")
@@ -939,20 +940,23 @@ def main():
                 
                 st.session_state.live_running = False
                 st.success("Trading stopped!")
+                time.sleep(0.5)
                 st.rerun()
     
     if st.session_state.live_running:
         current_time = time.time()
-        if st.session_state.last_fetch_time is None or (current_time - st.session_state.last_fetch_time) >= random.uniform(1.0, 1.5):
-            with st.spinner("Updating data..."):
-                df = fetch_data_with_delay(ticker, interval, period)
-                if df is not None and not df.empty:
-                    df = add_indicators(df, strategy_params)
-                    st.session_state.live_data = df
-                    st.session_state.last_fetch_time = current_time
-                    
-                    process_live_tick(df, len(df)-1, strategy_params)
+        time_since_last_fetch = current_time - st.session_state.last_fetch_time if st.session_state.last_fetch_time else 999
+        
+        if time_since_last_fetch >= 1.0:
+            df = fetch_data_with_delay(ticker, interval, period)
+            if df is not None and not df.empty:
+                df = add_indicators(df, strategy_params)
+                st.session_state.live_data = df
+                st.session_state.last_fetch_time = current_time
+                
+                process_live_tick(df, len(df)-1, strategy_params)
             
+            time.sleep(0.1)
             st.rerun()
     
     tab1, tab2, tab3 = st.tabs(["📊 Live Dashboard", "📈 Trade History", "📝 Trade Logs"])
@@ -961,27 +965,68 @@ def main():
         if st.session_state.live_data is not None:
             df = st.session_state.live_data
             
+            # Live indicator values at top
+            st.subheader("📊 Live Market Data")
+            live_col1, live_col2, live_col3, live_col4, live_col5 = st.columns(5)
+            
+            current_price = df['Close'].iloc[-1]
+            ema_fast_val = df['EMA_Fast'].iloc[-1]
+            ema_slow_val = df['EMA_Slow'].iloc[-1]
+            atr_val = df['ATR'].iloc[-1]
+            
+            with live_col1:
+                st.metric("Current Price", f"{current_price:.2f}")
+            with live_col2:
+                st.metric(f"EMA {strategy_params.get('ema_fast', 9)}", f"{ema_fast_val:.2f}")
+            with live_col3:
+                st.metric(f"EMA {strategy_params.get('ema_slow', 15)}", f"{ema_slow_val:.2f}")
+            with live_col4:
+                st.metric("ATR", f"{atr_val:.2f}")
+            with live_col5:
+                if strategy_params.get('use_adx', False):
+                    adx_val = df['ADX'].iloc[-1]
+                    st.metric("ADX", f"{adx_val:.2f}" if not pd.isna(adx_val) else "N/A")
+                else:
+                    st.metric("Volume", f"{int(df['Volume'].iloc[-1]):,}")
+            
+            # Auto-refresh indicator
+            if st.session_state.live_running:
+                time_since_fetch = time.time() - st.session_state.last_fetch_time if st.session_state.last_fetch_time else 0
+                st.caption(f"🔄 Auto-refreshing... Last update: {time_since_fetch:.1f}s ago")
+            
             chart_key = f"chart_{int(time.time() * 1000)}"
             fig = create_candlestick_chart(df, strategy_params)
             st.plotly_chart(fig, use_container_width=True, key=chart_key)
             
-            st.subheader("Strategy Information")
+            st.subheader("⚙️ Active Strategy Configuration")
+            config_col1, config_col2 = st.columns(2)
+            
+            with config_col1:
+                st.write("**Strategy Settings:**")
+                st.write(f"• Type: {strategy_params['strategy_type'].replace('_', ' ').title()}")
+                if strategy_params['strategy_type'] == 'ema_crossover':
+                    st.write(f"• EMA Fast: {strategy_params.get('ema_fast', 9)}")
+                    st.write(f"• EMA Slow: {strategy_params.get('ema_slow', 15)}")
+                    st.write(f"• Min Angle: {strategy_params.get('min_ema_angle', 1.0)}°")
+                    if strategy_params.get('use_adx', False):
+                        st.write(f"• ADX Filter: ON (Min: {strategy_params.get('min_adx', 20)})")
+                    st.write(f"• Entry Filter: {strategy_params.get('entry_filter', 'simple_crossover').replace('_', ' ').title()}")
+            
+            with config_col2:
+                st.write("**Risk Management:**")
+                st.write(f"• SL Type: {strategy_params['sl_type'].replace('_', ' ').title()}")
+                if strategy_params['sl_type'] in ['custom_points', 'trailing_points']:
+                    st.write(f"• SL Points: {strategy_params.get('sl_points', 5)}")
+                if 'trailing' in strategy_params['sl_type']:
+                    st.write(f"• Trailing Threshold: {strategy_params.get('trailing_threshold', 0)} pts")
+                st.write(f"• Target Type: {strategy_params['target_type'].replace('_', ' ').title()}")
+                if strategy_params['target_type'] in ['custom_points', 'trailing_points']:
+                    st.write(f"• Target Points: {strategy_params.get('target_points', 2)}")
+            
+            st.subheader("📍 Position Status")
             info_col1, info_col2, info_col3 = st.columns(3)
             
             with info_col1:
-                st.metric("Strategy", strategy_params['strategy_type'].replace('_', ' ').title())
-                if strategy_params['strategy_type'] == 'ema_crossover':
-                    st.metric("EMA Fast", strategy_params['ema_fast'])
-                    st.metric("EMA Slow", strategy_params['ema_slow'])
-            
-            with info_col2:
-                st.metric("SL Type", sl_type.replace('_', ' ').title())
-                st.metric("Target Type", target_type.replace('_', ' ').title())
-                if strategy_params.get('use_adx', False):
-                    adx_val = df['ADX'].iloc[-1]
-                    st.metric("Current ADX", f"{adx_val:.2f}" if not pd.isna(adx_val) else "N/A")
-            
-            with info_col3:
                 if st.session_state.in_position:
                     position_name = "LONG" if st.session_state.position_type == 1 else "SHORT"
                     st.metric("Current Position", position_name)
@@ -993,56 +1038,71 @@ def main():
                     else:
                         unrealized_pnl = st.session_state.entry_price - current_price
                     
-                    st.metric("Unrealized P&L", f"{unrealized_pnl:.2f}")
-                    
-                    if sl_type == 'signal_based' or sl_type == 'trailing_signal_based':
-                        st.metric("Distance to SL", "N/A (Signal Based)")
-                    elif st.session_state.stop_loss is not None:
-                        dist_to_sl = abs(current_price - st.session_state.stop_loss)
-                        st.metric("Distance to SL", f"{dist_to_sl:.2f}")
-                    
-                    if target_type == 'signal_based' or target_type == 'trailing_signal_based':
-                        st.metric("Distance to Target", "N/A (Signal Based)")
-                    elif st.session_state.target is not None:
-                        dist_to_target = abs(current_price - st.session_state.target)
-                        st.metric("Distance to Target", f"{dist_to_target:.2f}")
+                    st.metric("Unrealized P&L", f"{unrealized_pnl:.2f}", delta=f"{unrealized_pnl:.2f}")
                 else:
                     st.metric("Current Position", "NONE")
                     
                     if strategy_params['strategy_type'] == 'ema_crossover':
                         signal, _ = generate_ema_crossover_signal(df, len(df)-1, strategy_params)
                         signal_text = "BUY" if signal == 1 else ("SELL" if signal == -1 else "NONE")
-                        st.metric("Current Signal", signal_text)
+                        signal_color = "🟢" if signal == 1 else ("🔴" if signal == -1 else "⚪")
+                        st.metric("Current Signal", f"{signal_color} {signal_text}")
             
-            if st.session_state.in_position:
-                st.subheader("Position Details")
-                detail_col1, detail_col2, detail_col3, detail_col4 = st.columns(4)
-                
-                with detail_col1:
+            with info_col2:
+                if st.session_state.in_position:
                     st.write("**Entry Price:**")
                     st.write(f"{st.session_state.entry_price:.2f}")
-                
-                with detail_col2:
+                    st.write("**Entry Time:**")
+                    st.write(f"{st.session_state.entry_time}")
+                else:
+                    st.write("**Market Status:**")
+                    st.write("Waiting for signal...")
+                    st.write("**Last Candle:**")
+                    st.write(f"{df.index[-1]}")
+            
+            with info_col3:
+                if st.session_state.in_position:
                     if st.session_state.stop_loss is not None:
                         st.write("**Stop Loss:**")
                         st.write(f"{st.session_state.stop_loss:.2f}")
+                        dist_to_sl = abs(current_price - st.session_state.stop_loss)
+                        st.caption(f"Distance: {dist_to_sl:.2f} pts")
                     else:
                         st.write("**Stop Loss:**")
                         st.write("Signal Based")
-                
-                with detail_col3:
+                    
                     if st.session_state.target is not None:
                         st.write("**Target:**")
                         st.write(f"{st.session_state.target:.2f}")
+                        dist_to_target = abs(current_price - st.session_state.target)
+                        st.caption(f"Distance: {dist_to_target:.2f} pts")
                     else:
                         st.write("**Target:**")
                         st.write("Signal Based")
-                
-                with detail_col4:
-                    st.write("**Entry Time:**")
-                    st.write(f"{st.session_state.entry_time}")
+                else:
+                    # Show trade statistics
+                    if len(st.session_state.live_trades) > 0:
+                        trades_df = pd.DataFrame(st.session_state.live_trades)
+                        total_pnl = trades_df['PnL'].sum()
+                        st.write("**Total P&L:**")
+                        st.write(f"{total_pnl:.2f}")
+                        st.write("**Total Trades:**")
+                        st.write(f"{len(trades_df)}")
         else:
-            st.info("Click 'Start Trading' to begin live trading simulation")
+            st.info("👆 Click 'Start Trading' to begin live trading simulation")
+            st.write("")
+            st.write("**What you'll see once trading starts:**")
+            st.write("• 📊 Live price chart with EMA indicators")
+            st.write("• 📈 Real-time EMA values and market data")
+            st.write("• ⚙️ Your active strategy configuration")
+            st.write("• 📍 Current position status and P&L")
+            st.write("• 🔄 Auto-refresh every 1-1.5 seconds")
+            st.write("")
+            st.write("**Configure your strategy in the sidebar:**")
+            st.write("1. Select asset and timeframe")
+            st.write("2. Choose strategy type")
+            st.write("3. Set stop loss and target parameters")
+            st.write("4. Click 'Start Trading' to begin!")
     
     with tab2:
         st.subheader("Trade History")
