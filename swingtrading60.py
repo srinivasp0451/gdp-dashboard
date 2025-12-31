@@ -197,8 +197,12 @@ def find_swing_points(df, lookback=5):
 
 # Add indicators
 def add_indicators(df, params):
-    df['EMA_Fast'] = calculate_ema(df['Close'], params['ema_fast'])
-    df['EMA_Slow'] = calculate_ema(df['Close'], params['ema_slow'])
+    # Set default EMA values if not present
+    ema_fast = params.get('ema_fast', 9)
+    ema_slow = params.get('ema_slow', 15)
+    
+    df['EMA_Fast'] = calculate_ema(df['Close'], ema_fast)
+    df['EMA_Slow'] = calculate_ema(df['Close'], ema_slow)
     
     if params.get('use_adx', False):
         df['ADX'], df['Plus_DI'], df['Minus_DI'] = calculate_adx(df, params.get('adx_period', 14))
@@ -820,7 +824,9 @@ def main():
     )
     
     strategy_params = {
-        'strategy_type': strategy_type
+        'strategy_type': strategy_type,
+        'ema_fast': 9,
+        'ema_slow': 15
     }
     
     if strategy_type == 'ema_crossover':
