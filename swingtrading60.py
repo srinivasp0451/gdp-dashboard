@@ -180,8 +180,8 @@ def calculate_ema_angle(data, ema_fast, ema_slow):
     
     return abs(angle_deg)
 
-def check_ema_crossover(data, fast_period, slow_period, min_angle=1.0):
-    """Check for EMA crossover with angle validation"""
+def check_ema_crossover(data, fast_period, slow_period, min_angle=1.0, entry_filter="Simple Crossover", config=None):
+    """Check for EMA crossover with angle validation and entry filters"""
     if len(data) < max(fast_period, slow_period) + 1:
         return 0, 0
     
@@ -197,15 +197,51 @@ def check_ema_crossover(data, fast_period, slow_period, min_angle=1.0):
     # Calculate angle
     angle = calculate_ema_angle(data, ema_fast, ema_slow)
     
-    # Bullish crossover
-    if fast_curr > slow_curr and fast_prev <= slow_prev:
-        if angle >= min_angle:
-            return 1, angle
+    # Check for crossover
+    bullish_cross = fast_curr > slow_curr and fast_prev <= slow_prev
+    bearish_cross = fast_curr < slow_curr and fast_prev >= slow_prev
     
-    # Bearish crossover
-    if fast_curr < slow_curr and fast_prev >= slow_prev:
-        if angle >= min_angle:
+    # If no crossover, return early
+    if not bullish_cross and not bearish_cross:
+        return 0, angle
+    
+    # Check angle requirement
+    if angle < min_angle:
+        return 0, angle
+    
+    # Apply entry filter
+    if entry_filter == "Simple Crossover":
+        # No additional filter - just angle check
+        if bullish_cross:
+            return 1, angle
+        if bearish_cross:
             return -1, angle
+    
+    elif entry_filter == "Custom Candle (Points)":
+        # Check candle size in points
+        candle_size = abs(data['Close'].iloc[-1] - data['Open'].iloc[-1])
+        min_candle_size = config.get('candle_points', 10)
+        
+        if candle_size >= min_candle_size:
+            if bullish_cross:
+                return 1, angle
+            if bearish_cross:
+                return -1, angle
+        return 0, angle
+    
+    elif entry_filter == "ATR-based Candle":
+        # Check candle size relative to ATR
+        candle_size = abs(data['Close'].iloc[-1] - data['Open'].iloc[-1])
+        atr = calculate_atr(data).iloc[-1]
+        atr_multiplier = config.get('atr_multiplier', 1.0)
+        min_candle_size = atr * atr_multiplier
+        
+        if candle_size >= min_candle_size:
+            if bullish_cross:
+                return 1, angle
+            if bearish_cross:
+                return -1, angle
+        return 0, angle
     
     return 0, angle
 
@@ -591,6 +627,18 @@ def main():
         config['ema_fast'] = st.sidebar.number_input("EMA Fast", min_value=2, value=9)
         config['ema_slow'] = st.sidebar.number_input("EMA Slow", min_value=2, value=15)
         config['min_angle'] = st.sidebar.number_input("Min Crossover Angle (°)", min_value=0.0, value=1.0, step=0.1)
+        
+        # Entry Filter Type
+        config['entry_filter'] = st.sidebar.selectbox(
+            "Entry Filter",
+            ["Simple Crossover", "Custom Candle (Points)", "ATR-based Candle"]
+        )
+        
+        if config['entry_filter'] == "Custom Candle (Points)":
+            config['candle_points'] = st.sidebar.number_input("Min Candle Size (Points)", min_value=1, value=10)
+        elif config['entry_filter'] == "ATR-based Candle":
+            config['atr_multiplier'] = st.sidebar.number_input("ATR Multiplier for Candle", min_value=0.1, value=1.0, step=0.1)
+        
         config['use_adx'] = st.sidebar.checkbox("Include ADX Filter", value=False)
         
         if config['use_adx']:
@@ -747,7 +795,14 @@ def main():
                         fast_val = ema_fast.iloc[-1]
                         slow_val = ema_slow.iloc[-1]
                         
-                        signal, angle = check_ema_crossover(data, config['ema_fast'], config['ema_slow'], config['min_angle'])
+                        signal, angle = check_ema_crossover(
+                            data, 
+                            config['ema_fast'], 
+                            config['ema_slow'], 
+                            config['min_angle'],
+                            config.get('entry_filter', 'Simple Crossover'),
+                            config
+                        )
                         
                         # Check ADX if enabled
                         adx_pass = True
@@ -776,6 +831,25 @@ def main():
                         else:
                             pos_status = "⚪ NO POSITION"
                         col6.metric("Position Status", pos_status)
+                        
+                        # Display entry filter info
+                        entry_filter = config.get('entry_filter', 'Simple Crossover')
+                        filter_info = f"📋 Entry Filter: {entry_filter}"
+                        
+                        if entry_filter == "Custom Candle (Points)":
+                            candle_size = abs(data['Close'].iloc[-1] - data['Open'].iloc[-1])
+                            min_size = config.get('candle_points', 10)
+                            filter_pass = "✅" if candle_size >= min_size else "❌"
+                            filter_info += f" | Candle Size: {candle_size:.2f} / Min: {min_size} {filter_pass}"
+                        elif entry_filter == "ATR-based Candle":
+                            candle_size = abs(data['Close'].iloc[-1] - data['Open'].iloc[-1])
+                            atr = calculate_atr(data).iloc[-1]
+                            multiplier = config.get('atr_multiplier', 1.0)
+                            min_size = atr * multiplier
+                            filter_pass = "✅" if candle_size >= min_size else "❌"
+                            filter_info += f" | Candle Size: {candle_size:.2f} / Min (ATR×{multiplier}): {min_size:.2f} {filter_pass}"
+                        
+                        st.info(filter_info)
                         
                         if config.get('use_adx', False):
                             adx_status = '✅ PASS' if adx_pass else '❌ FAIL'
