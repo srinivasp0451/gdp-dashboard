@@ -4,6 +4,7 @@ import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
+import plotly.express as px
 from datetime import datetime, timedelta
 import pytz
 import time
@@ -31,6 +32,11 @@ st.markdown("""
     .neutral {color: #ffaa00; font-weight: bold;}
     .stTabs [data-baseweb="tab-list"] {gap: 8px;}
     .stTabs [data-baseweb="tab"] {padding: 10px 20px; background-color: #f0f2f6; border-radius: 5px;}
+    .impact-explanation {background-color: #e8f4f8; padding: 15px; border-radius: 8px; border-left: 4px solid #1f77b4; margin: 10px 0;}
+    .gap-card {background-color: #fff3cd; padding: 15px; border-radius: 8px; border-left: 4px solid #ffc107; margin: 10px 0;}
+    .fundamental-strong {background-color: #d4edda; padding: 10px; border-radius: 5px; border-left: 3px solid #28a745;}
+    .fundamental-weak {background-color: #f8d7da; padding: 10px; border-radius: 5px; border-left: 3px solid #dc3545;}
+    .fundamental-neutral {background-color: #fff3cd; padding: 10px; border-radius: 5px; border-left: 3px solid #ffc107;}
 </style>
 """, unsafe_allow_html=True)
 
@@ -129,6 +135,146 @@ def safe_yfinance_call(ticker: str, **kwargs) -> Optional[pd.DataFrame]:
         st.warning(f"Error fetching {ticker}: {str(e)}")
         return None
 
+def get_fundamental_data(ticker: str) -> Dict:
+    """Fetch fundamental data for a stock"""
+    try:
+        delay = random.uniform(1.0, 1.5)
+        time.sleep(delay)
+        
+        stock = yf.Ticker(ticker)
+        info = stock.info
+        
+        # Extract fundamental metrics
+        fundamentals = {
+            'market_cap': info.get('marketCap', None),
+            'pe_ratio': info.get('trailingPE', None),
+            'forward_pe': info.get('forwardPE', None),
+            'pb_ratio': info.get('priceToBook', None),
+            'debt_to_equity': info.get('debtToEquity', None),
+            'roe': info.get('returnOnEquity', None),
+            'eps': info.get('trailingEps', None),
+            'div_yield': info.get('dividendYield', None),
+            'book_value': info.get('bookValue', None),
+            'sector': info.get('sector', 'N/A'),
+            'industry': info.get('industry', 'N/A'),
+            'revenue_growth': info.get('revenueGrowth', None),
+            'profit_margins': info.get('profitMargins', None),
+            'current_ratio': info.get('currentRatio', None),
+            'quick_ratio': info.get('quickRatio', None)
+        }
+        
+        return fundamentals
+    
+    except Exception as e:
+        return {}
+
+def analyze_fundamentals(fundamentals: Dict, ticker: str) -> Dict:
+    """Analyze fundamental metrics and provide rating"""
+    
+    score = 0
+    max_score = 0
+    reasons = []
+    
+    # PE Ratio Analysis
+    if fundamentals.get('pe_ratio'):
+        max_score += 1
+        pe = fundamentals['pe_ratio']
+        if 10 < pe < 25:
+            score += 1
+            reasons.append(f"✓ Healthy P/E ratio ({pe:.2f}) - fairly valued")
+        elif pe < 10:
+            score += 0.5
+            reasons.append(f"⚠ Low P/E ratio ({pe:.2f}) - potentially undervalued or concerns")
+        else:
+            reasons.append(f"✗ High P/E ratio ({pe:.2f}) - potentially overvalued")
+    
+    # PB Ratio Analysis
+    if fundamentals.get('pb_ratio'):
+        max_score += 1
+        pb = fundamentals['pb_ratio']
+        if 1 < pb < 3:
+            score += 1
+            reasons.append(f"✓ Good P/B ratio ({pb:.2f}) - reasonable book value")
+        elif pb < 1:
+            score += 0.5
+            reasons.append(f"⚠ P/B below 1 ({pb:.2f}) - trading below book value")
+        else:
+            reasons.append(f"✗ High P/B ratio ({pb:.2f}) - premium valuation")
+    
+    # Debt to Equity
+    if fundamentals.get('debt_to_equity'):
+        max_score += 1
+        de = fundamentals['debt_to_equity']
+        if de < 1:
+            score += 1
+            reasons.append(f"✓ Low debt-to-equity ({de:.2f}) - strong balance sheet")
+        elif de < 2:
+            score += 0.5
+            reasons.append(f"⚠ Moderate debt-to-equity ({de:.2f}) - manageable debt")
+        else:
+            reasons.append(f"✗ High debt-to-equity ({de:.2f}) - high leverage risk")
+    
+    # ROE Analysis
+    if fundamentals.get('roe'):
+        max_score += 1
+        roe = fundamentals['roe'] * 100
+        if roe > 15:
+            score += 1
+            reasons.append(f"✓ Strong ROE ({roe:.2f}%) - efficient capital use")
+        elif roe > 10:
+            score += 0.5
+            reasons.append(f"⚠ Moderate ROE ({roe:.2f}%) - acceptable returns")
+        else:
+            reasons.append(f"✗ Low ROE ({roe:.2f}%) - poor capital efficiency")
+    
+    # Profit Margins
+    if fundamentals.get('profit_margins'):
+        max_score += 1
+        margin = fundamentals['profit_margins'] * 100
+        if margin > 10:
+            score += 1
+            reasons.append(f"✓ Healthy profit margins ({margin:.2f}%) - good profitability")
+        elif margin > 5:
+            score += 0.5
+            reasons.append(f"⚠ Moderate profit margins ({margin:.2f}%)")
+        else:
+            reasons.append(f"✗ Low profit margins ({margin:.2f}%) - profitability concerns")
+    
+    # Dividend Yield
+    if fundamentals.get('div_yield'):
+        div_yield = fundamentals['div_yield'] * 100
+        if div_yield > 2:
+            reasons.append(f"✓ Attractive dividend yield ({div_yield:.2f}%)")
+        elif div_yield > 0:
+            reasons.append(f"⚠ Moderate dividend yield ({div_yield:.2f}%)")
+    
+    # Calculate rating
+    if max_score > 0:
+        rating_pct = (score / max_score) * 100
+        
+        if rating_pct >= 75:
+            rating = "Strong"
+            rating_class = "fundamental-strong"
+        elif rating_pct >= 50:
+            rating = "Moderate"
+            rating_class = "fundamental-neutral"
+        else:
+            rating = "Weak"
+            rating_class = "fundamental-weak"
+    else:
+        rating = "Insufficient Data"
+        rating_class = "fundamental-neutral"
+        rating_pct = 0
+    
+    return {
+        'rating': rating,
+        'rating_class': rating_class,
+        'rating_pct': rating_pct,
+        'score': score,
+        'max_score': max_score,
+        'reasons': reasons
+    }
+
 def calculate_ema(data: pd.Series, period: int) -> pd.Series:
     """Calculate Exponential Moving Average"""
     return data.ewm(span=period, adjust=False).mean()
@@ -203,18 +349,33 @@ def detect_gap(data: pd.DataFrame) -> Dict:
     
     prev_close = data['Close'].iloc[-2]
     curr_open = data['Open'].iloc[-1]
+    curr_close = data['Close'].iloc[-1]
     gap_size = curr_open - prev_close
     gap_pct = (gap_size / prev_close) * 100
     
     if abs(gap_pct) > 0.5:  # Gap threshold 0.5%
         gap_type = 'up' if gap_size > 0 else 'down'
+        
+        # Calculate gap fill probability
+        if gap_type == 'up':
+            fill_progress = ((prev_close - curr_close) / (prev_close - curr_open)) * 100 if curr_open != prev_close else 0
+            is_filling = curr_close < curr_open
+        else:
+            fill_progress = ((curr_close - prev_close) / (curr_open - prev_close)) * 100 if curr_open != prev_close else 0
+            is_filling = curr_close > curr_open
+        
+        fill_progress = max(0, min(100, fill_progress))
+        
         return {
             'has_gap': True,
             'gap_type': gap_type,
             'gap_size': gap_size,
             'gap_pct': gap_pct,
             'prev_close': prev_close,
-            'curr_open': curr_open
+            'curr_open': curr_open,
+            'curr_close': curr_close,
+            'fill_progress': fill_progress,
+            'is_filling': is_filling
         }
     
     return {'has_gap': False, 'gap_type': None, 'gap_size': 0}
@@ -359,20 +520,29 @@ def gap_fill_strategy(data: pd.DataFrame, ticker: str) -> Optional[Dict]:
     curr_price = data['Close'].iloc[-1]
     atr = calculate_atr(data['High'], data['Low'], data['Close']).iloc[-1]
     
+    # Calculate probability based on gap size and current price action
+    gap_fill_prob = 70  # Base probability
+    
+    if gap_info['is_filling']:
+        gap_fill_prob += 15
+    
+    if abs(gap_info['gap_pct']) < 2:
+        gap_fill_prob += 10
+    elif abs(gap_info['gap_pct']) > 5:
+        gap_fill_prob -= 20
+    
     if gap_info['gap_type'] == 'up':
-        # Gap up - look for gap fill short
         entry = curr_price
         target = gap_info['prev_close']
         sl = curr_price + (1.5 * atr)
         direction = 'SHORT'
-        reason = f"Gap up of {gap_info['gap_pct']:.2f}% detected. Price likely to fill gap down to {target:.2f}"
+        reason = f"Gap up of {gap_info['gap_pct']:.2f}% detected. Price likely to fill gap down to {target:.2f}. Fill progress: {gap_info['fill_progress']:.1f}%"
     else:
-        # Gap down - look for gap fill long
         entry = curr_price
         target = gap_info['prev_close']
         sl = curr_price - (1.5 * atr)
         direction = 'LONG'
-        reason = f"Gap down of {abs(gap_info['gap_pct']):.2f}% detected. Price likely to fill gap up to {target:.2f}"
+        reason = f"Gap down of {abs(gap_info['gap_pct']):.2f}% detected. Price likely to fill gap up to {target:.2f}. Fill progress: {gap_info['fill_progress']:.1f}%"
     
     return {
         'strategy': 'Gap Fill',
@@ -382,7 +552,9 @@ def gap_fill_strategy(data: pd.DataFrame, ticker: str) -> Optional[Dict]:
         'target': target,
         'sl': sl,
         'risk_reward': abs((target - entry) / (sl - entry)) if sl != entry else 0,
-        'reason': reason
+        'reason': reason,
+        'gap_info': gap_info,
+        'probability': min(95, max(40, gap_fill_prob))
     }
 
 def support_resistance_strategy(data: pd.DataFrame, ticker: str, ema_fast: int = 9, ema_slow: int = 15, min_angle: float = 10, min_candle_size: float = 5) -> Optional[Dict]:
@@ -394,21 +566,16 @@ def support_resistance_strategy(data: pd.DataFrame, ticker: str, ema_fast: int =
     curr_high = data['High'].iloc[-1]
     curr_low = data['Low'].iloc[-1]
     
-    # Get support/resistance levels
     sr_levels = identify_support_resistance(data)
     
-    # Calculate EMAs
     ema_f = calculate_ema(data['Close'], ema_fast)
     ema_s = calculate_ema(data['Close'], ema_slow)
     
-    # Crossover angle
     crossover_angle = calculate_ema_crossover_angle(ema_f, ema_s)
     
-    # Candle size
     candle_size = curr_high - curr_low
     atr = calculate_atr(data['High'], data['Low'], data['Close']).iloc[-1]
     
-    # Check conditions
     if crossover_angle < min_angle:
         return None
     
@@ -417,7 +584,6 @@ def support_resistance_strategy(data: pd.DataFrame, ticker: str, ema_fast: int =
     
     # Bullish setup
     if ema_f.iloc[-1] > ema_s.iloc[-1] and curr_price > ema_f.iloc[-1]:
-        # Check if near support
         near_support = any(abs(curr_price - sup) / curr_price < 0.01 for sup in sr_levels['support'])
         
         if near_support:
@@ -438,7 +604,6 @@ def support_resistance_strategy(data: pd.DataFrame, ticker: str, ema_fast: int =
     
     # Bearish setup
     elif ema_f.iloc[-1] < ema_s.iloc[-1] and curr_price < ema_f.iloc[-1]:
-        # Check if near resistance
         near_resistance = any(abs(curr_price - res) / curr_price < 0.01 for res in sr_levels['resistance'])
         
         if near_resistance:
@@ -464,7 +629,6 @@ def breakout_strategy(data: pd.DataFrame, ticker: str) -> Optional[Dict]:
     if len(data) < 20:
         return None
     
-    # Get recent high/low
     recent_high = data['High'].iloc[-20:].max()
     recent_low = data['Low'].iloc[-20:].min()
     
@@ -606,7 +770,7 @@ def momentum_strategy(data: pd.DataFrame, ticker: str) -> Optional[Dict]:
     return None
 
 # ==================== SCREENER FUNCTIONS ====================
-def fetch_index_constituents(index_name: str, tickers_dict: Dict, interval: str, period: str) -> List[Dict]:
+def fetch_index_constituents(index_name: str, tickers_dict: Dict, interval: str, period: str, fetch_fundamentals: bool = False) -> List[Dict]:
     """Fetch data for all constituents of an index"""
     results = []
     total = len(tickers_dict)
@@ -627,7 +791,7 @@ def fetch_index_constituents(index_name: str, tickers_dict: Dict, interval: str,
                 change = curr_price - prev_close
                 change_pct = (change / prev_close) * 100 if prev_close != 0 else 0
                 
-                # 52-week high/low (approximate from available data)
+                # 52-week high/low
                 high_52w = data['High'].max()
                 low_52w = data['Low'].min()
                 dist_from_high = ((curr_price - high_52w) / high_52w) * 100
@@ -647,7 +811,10 @@ def fetch_index_constituents(index_name: str, tickers_dict: Dict, interval: str,
                 # Price action analysis
                 price_action = analyze_price_action(data)
                 
-                results.append({
+                # Gap detection
+                gap_info = detect_gap(data)
+                
+                result = {
                     'ticker': ticker,
                     'weight': weight,
                     'data': data,
@@ -665,8 +832,18 @@ def fetch_index_constituents(index_name: str, tickers_dict: Dict, interval: str,
                     'atr': atr,
                     'adx': adx,
                     'macd': histogram.iloc[-1],
-                    'price_action': price_action
-                })
+                    'price_action': price_action,
+                    'gap_info': gap_info
+                }
+                
+                # Fetch fundamentals if requested
+                if fetch_fundamentals:
+                    fundamentals = get_fundamental_data(ticker)
+                    if fundamentals:
+                        result['fundamentals'] = fundamentals
+                        result['fundamental_analysis'] = analyze_fundamentals(fundamentals, ticker)
+                
+                results.append(result)
             except Exception as e:
                 st.warning(f"Error processing {ticker}: {str(e)}")
                 continue
@@ -677,25 +854,41 @@ def fetch_index_constituents(index_name: str, tickers_dict: Dict, interval: str,
     return results
 
 def calculate_index_impact(results: List[Dict]) -> Dict:
-    """Calculate index impact based on constituent performance"""
+    """Calculate index impact with detailed explanation"""
     total_impact = 0
     positive_contributors = []
     negative_contributors = []
+    contribution_details = []
     
     for result in results:
-        impact = result['change_pct'] * (result['weight'] / 100)
+        # Calculate weighted contribution
+        price_change_pct = result['change_pct']
+        weight = result['weight']
+        
+        # Impact = (Price Change %) × (Weight % / 100)
+        impact = price_change_pct * (weight / 100)
         total_impact += impact
+        
+        contribution_details.append({
+            'ticker': result['ticker'],
+            'price_change_pct': price_change_pct,
+            'weight': weight,
+            'impact': impact,
+            'calculation': f"({price_change_pct:.2f}% × {weight:.2f}% / 100) = {impact:.4f}%"
+        })
         
         if result['change_pct'] > 0:
             positive_contributors.append({
                 'ticker': result['ticker'],
                 'change_pct': result['change_pct'],
+                'weight': weight,
                 'impact': impact
             })
         else:
             negative_contributors.append({
                 'ticker': result['ticker'],
                 'change_pct': result['change_pct'],
+                'weight': weight,
                 'impact': impact
             })
     
@@ -703,10 +896,31 @@ def calculate_index_impact(results: List[Dict]) -> Dict:
     positive_contributors.sort(key=lambda x: x['impact'], reverse=True)
     negative_contributors.sort(key=lambda x: x['impact'])
     
+    # Build explanation
+    explanation = f"""
+    **Index Impact Calculation Method:**
+    
+    The index movement is calculated as a weighted sum of individual stock movements:
+    
+    **Formula:** Index Change (%) = Σ [(Stock Change % × Stock Weight %) / 100]
+    
+    **Example Calculation:**
+    - If Stock A changes by +2% and has 10% weight: Impact = (2 × 10) / 100 = +0.20%
+    - If Stock B changes by -1% and has 5% weight: Impact = (-1 × 5) / 100 = -0.05%
+    - Total Index Change = +0.20% - 0.05% = +0.15%
+    
+    **Current Analysis:**
+    - Total positive impact: {sum(c['impact'] for c in positive_contributors):.4f}%
+    - Total negative impact: {sum(c['impact'] for c in negative_contributors):.4f}%
+    - **Net index movement: {total_impact:.4f}%**
+    """
+    
     return {
         'total_impact': total_impact,
         'positive_contributors': positive_contributors[:5],
-        'negative_contributors': negative_contributors[:5]
+        'negative_contributors': negative_contributors[:5],
+        'contribution_details': contribution_details,
+        'explanation': explanation
     }
 
 def generate_trade_recommendations(results: List[Dict], strategies: List[str], ema_fast: int, ema_slow: int, min_angle: float, min_candle_size: float) -> List[Dict]:
@@ -717,7 +931,6 @@ def generate_trade_recommendations(results: List[Dict], strategies: List[str], e
         ticker = result['ticker']
         data = result['data']
         
-        # Apply each selected strategy
         for strategy_name in strategies:
             trade = None
             
@@ -733,17 +946,44 @@ def generate_trade_recommendations(results: List[Dict], strategies: List[str], e
                 trade = momentum_strategy(data, ticker)
             
             if trade:
-                # Add current price and indicators
                 trade['current_price'] = result['price']
                 trade['rsi'] = result['rsi']
                 trade['adx'] = result['adx']
                 trade['volume_ratio'] = result['volume_ratio']
                 recommendations.append(trade)
     
-    # Sort by risk-reward ratio
     recommendations.sort(key=lambda x: x['risk_reward'], reverse=True)
     
     return recommendations
+
+def get_gap_fill_stocks(results: List[Dict]) -> List[Dict]:
+    """Filter stocks with gaps that are likely to fill"""
+    gap_stocks = []
+    
+    for result in results:
+        gap_info = result['gap_info']
+        
+        if gap_info['has_gap']:
+            gap_stocks.append({
+                'ticker': result['ticker'],
+                'price': result['price'],
+                'gap_type': gap_info['gap_type'],
+                'gap_size': gap_info['gap_size'],
+                'gap_pct': gap_info['gap_pct'],
+                'prev_close': gap_info['prev_close'],
+                'curr_open': gap_info['curr_open'],
+                'curr_close': gap_info['curr_close'],
+                'fill_progress': gap_info['fill_progress'],
+                'is_filling': gap_info['is_filling'],
+                'distance_to_fill': abs(gap_info['curr_close'] - gap_info['prev_close']),
+                'rsi': result['rsi'],
+                'volume_ratio': result['volume_ratio']
+            })
+    
+    # Sort by fill progress (descending)
+    gap_stocks.sort(key=lambda x: x['fill_progress'], reverse=True)
+    
+    return gap_stocks
 
 # ==================== STREAMLIT UI ====================
 def main():
@@ -765,7 +1005,7 @@ def main():
         
         # Timeframe selection
         st.subheader("Timeframe")
-        interval = st.selectbox("Interval", list(TIMEFRAME_PERIODS.keys()), index=1)
+        interval = st.selectbox("Interval", list(TIMEFRAME_PERIODS.keys()), index=4)
         period = st.selectbox("Period", TIMEFRAME_PERIODS[interval])
         
         # Strategy selection
@@ -788,6 +1028,9 @@ def main():
         min_volume_ratio = st.slider("Min Volume Ratio", 1.0, 5.0, 1.5)
         min_rr = st.slider("Min Risk:Reward", 1.0, 5.0, 1.5)
         
+        # Fetch fundamentals
+        fetch_fundamentals = st.checkbox("Fetch Fundamental Data", value=True)
+        
         # Run screener button
         run_screener = st.button("🚀 Run Screener", type="primary", use_container_width=True)
     
@@ -803,7 +1046,7 @@ def main():
                 tickers_dict = {custom_ticker: 100.0}
             
             # Fetch data
-            results = fetch_index_constituents(index_type, tickers_dict, interval, period)
+            results = fetch_index_constituents(index_type, tickers_dict, interval, period, fetch_fundamentals)
             
             if not results:
                 st.error("❌ No data fetched. Please check your inputs and try again.")
@@ -820,26 +1063,50 @@ def main():
                 col1, col2, col3 = st.columns(3)
                 
                 with col1:
-                    impact_color = "green" if impact['total_impact'] > 0 else "red"
                     st.metric(
                         "Estimated Index Movement",
-                        f"{impact['total_impact']:.2f}%",
-                        delta=f"{impact['total_impact']:.2f}%"
+                        f"{impact['total_impact']:.4f}%",
+                        delta=f"{impact['total_impact']:.4f}%"
                     )
                 
                 with col2:
                     st.markdown("**Top Positive Contributors:**")
                     for contrib in impact['positive_contributors'][:3]:
-                        st.write(f"• {contrib['ticker']}: +{contrib['change_pct']:.2f}%")
+                        st.write(f"• **{contrib['ticker']}**: +{contrib['change_pct']:.2f}% (weight: {contrib['weight']:.2f}%) → +{contrib['impact']:.4f}%")
                 
                 with col3:
                     st.markdown("**Top Negative Contributors:**")
                     for contrib in impact['negative_contributors'][:3]:
-                        st.write(f"• {contrib['ticker']}: {contrib['change_pct']:.2f}%")
+                        st.write(f"• **{contrib['ticker']}**: {contrib['change_pct']:.2f}% (weight: {contrib['weight']:.2f}%) → {contrib['impact']:.4f}%")
+                
+                # Show detailed explanation
+                with st.expander("📖 How is the index movement calculated? (Click to expand)"):
+                    st.markdown(f"""
+                    <div class="impact-explanation">
+                    {impact['explanation']}
+                    </div>
+                    """, unsafe_allow_html=True)
+                    
+                    st.markdown("**Detailed Contribution Breakdown:**")
+                    contrib_df = pd.DataFrame(impact['contribution_details'])
+                    contrib_df = contrib_df.sort_values('impact', ascending=False)
+                    st.dataframe(contrib_df[['ticker', 'price_change_pct', 'weight', 'impact', 'calculation']], use_container_width=True)
+            
+            # Get gap fill stocks
+            gap_fill_stocks = get_gap_fill_stocks(results)
+            
+            # Calculate sentiment
+            bullish_count = sum(1 for r in results if r['price_action']['signal'] == 'BULLISH')
+            bearish_count = sum(1 for r in results if r['price_action']['signal'] == 'BEARISH')
+            neutral_count = sum(1 for r in results if r['price_action']['signal'] == 'NEUTRAL')
+            total_count = len(results)
             
             # Create tabs
-            tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+            tabs = st.tabs([
                 "🎯 Trade Recommendations",
+                "🔄 Gap Fill Opportunities",
+                "💰 Fundamental Analysis",
+                "🗺️ Market Heatmap",
                 "📈 All Stocks Overview",
                 "🔥 Top Gainers/Losers",
                 "📊 Active Stocks",
@@ -848,14 +1115,13 @@ def main():
             ])
             
             # Tab 1: Trade Recommendations
-            with tab1:
+            with tabs[0]:
                 st.markdown('<div class="sub-header">🎯 Intraday Trade Recommendations</div>', unsafe_allow_html=True)
                 
                 recommendations = generate_trade_recommendations(
                     results, strategies, ema_fast, ema_slow, min_angle, min_candle_size
                 )
                 
-                # Filter by criteria
                 filtered_recs = [
                     rec for rec in recommendations
                     if rec['risk_reward'] >= min_rr and rec.get('volume_ratio', 0) >= min_volume_ratio
@@ -885,21 +1151,271 @@ def main():
                             with col4:
                                 st.metric("Risk:Reward", f"{rec['risk_reward']:.2f}")
                                 st.metric("RSI", f"{rec['rsi']:.1f}")
+                                if 'probability' in rec:
+                                    st.metric("Success Probability", f"{rec['probability']:.0f}%")
                             
                             st.info(f"**Reason:** {rec['reason']}")
-                            
-                            # Additional indicators
                             st.write(f"**ADX:** {rec['adx']:.1f} | **Volume Ratio:** {rec['volume_ratio']:.2f}x")
                 else:
                     st.warning("No trading opportunities found matching your criteria. Try adjusting filters.")
             
-            # Tab 2: All Stocks Overview
-            with tab2:
+            # Tab 2: Gap Fill Opportunities
+            with tabs[1]:
+                st.markdown('<div class="sub-header">🔄 Gap Fill Opportunities</div>', unsafe_allow_html=True)
+                
+                if gap_fill_stocks:
+                    st.write(f"**Found {len(gap_fill_stocks)} stocks with gaps**")
+                    
+                    for idx, gap_stock in enumerate(gap_fill_stocks, 1):
+                        gap_type_color = "#28a745" if gap_stock['gap_type'] == 'down' else "#dc3545"
+                        fill_status = "✅ Filling" if gap_stock['is_filling'] else "⏳ Not filling yet"
+                        
+                        with st.expander(f"#{idx} {gap_stock['ticker']} - Gap {gap_stock['gap_type'].upper()} ({gap_stock['gap_pct']:.2f}%) - {fill_status}"):
+                            st.markdown(f"""
+                            <div class="gap-card">
+                                <h4 style="color: {gap_type_color};">Gap {gap_stock['gap_type'].upper()} detected</h4>
+                                <p><strong>Gap Size:</strong> ₹{abs(gap_stock['gap_size']):.2f} ({abs(gap_stock['gap_pct']):.2f}%)</p>
+                                <p><strong>Previous Close:</strong> ₹{gap_stock['prev_close']:.2f}</p>
+                                <p><strong>Current Open:</strong> ₹{gap_stock['curr_open']:.2f}</p>
+                                <p><strong>Current Price:</strong> ₹{gap_stock['curr_close']:.2f}</p>
+                                <p><strong>Distance to Fill:</strong> ₹{gap_stock['distance_to_fill']:.2f}</p>
+                                <p><strong>Fill Progress:</strong> {gap_stock['fill_progress']:.1f}%</p>
+                            </div>
+                            """, unsafe_allow_html=True)
+                            
+                            col1, col2, col3 = st.columns(3)
+                            
+                            with col1:
+                                if gap_stock['gap_type'] == 'up':
+                                    st.write(f"**📉 Expected Direction:** Downward (to fill gap)")
+                                    st.write(f"**🎯 Target:** ₹{gap_stock['prev_close']:.2f}")
+                                else:
+                                    st.write(f"**📈 Expected Direction:** Upward (to fill gap)")
+                                    st.write(f"**🎯 Target:** ₹{gap_stock['prev_close']:.2f}")
+                            
+                            with col2:
+                                st.metric("RSI", f"{gap_stock['rsi']:.1f}")
+                                st.metric("Volume Ratio", f"{gap_stock['volume_ratio']:.2f}x")
+                            
+                            with col3:
+                                # Calculate probability
+                                prob = 70
+                                if gap_stock['is_filling']:
+                                    prob += 15
+                                if abs(gap_stock['gap_pct']) < 2:
+                                    prob += 10
+                                elif abs(gap_stock['gap_pct']) > 5:
+                                    prob -= 20
+                                prob = min(95, max(40, prob))
+                                
+                                st.metric("Fill Probability", f"{prob}%")
+                                
+                                if gap_stock['is_filling']:
+                                    st.success("Price is currently filling the gap!")
+                                else:
+                                    st.info("Waiting for gap fill to begin")
+                            
+                            st.markdown(f"""
+                            **Trading Strategy:**
+                            - **Entry:** Current price (₹{gap_stock['curr_close']:.2f})
+                            - **Target:** Previous close (₹{gap_stock['prev_close']:.2f})
+                            - **Reason:** Gaps have a high probability of being filled. Current progress: {gap_stock['fill_progress']:.1f}%
+                            """)
+                else:
+                    st.info("No significant gaps detected in the current timeframe.")
+            
+            # Tab 3: Fundamental Analysis
+            with tabs[2]:
+                st.markdown('<div class="sub-header">💰 Fundamental Analysis</div>', unsafe_allow_html=True)
+                
+                if not fetch_fundamentals:
+                    st.warning("Fundamental data fetching is disabled. Enable it in the sidebar to see this analysis.")
+                else:
+                    stocks_with_fundamentals = [r for r in results if 'fundamentals' in r and r['fundamentals']]
+                    
+                    if stocks_with_fundamentals:
+                        st.write(f"**Fundamental analysis for {len(stocks_with_fundamentals)} stocks**")
+                        
+                        # Metric descriptions
+                        with st.expander("📚 Understanding Fundamental Metrics"):
+                            st.markdown("""
+                            **Key Fundamental Metrics Explained:**
+                            
+                            1. **Market Cap**: Total market value of company's shares. Indicates company size.
+                            2. **P/E Ratio (Price-to-Earnings)**: Price relative to earnings. Lower may indicate undervaluation.
+                               - Good: 10-25 | High: >25 | Low: <10
+                            3. **P/B Ratio (Price-to-Book)**: Price relative to book value. Measures valuation.
+                               - Good: 1-3 | High: >3 | Low: <1
+                            4. **Debt-to-Equity**: Total debt relative to equity. Measures financial leverage.
+                               - Good: <1 | Moderate: 1-2 | High: >2
+                            5. **ROE (Return on Equity)**: Profitability relative to equity. Higher is better.
+                               - Strong: >15% | Moderate: 10-15% | Weak: <10%
+                            6. **EPS (Earnings Per Share)**: Company's profit per share. Higher indicates better profitability.
+                            7. **Dividend Yield**: Annual dividend as % of price. Income for investors.
+                               - Attractive: >2% | Moderate: 1-2% | Low: <1%
+                            8. **Profit Margins**: Net income as % of revenue. Shows operational efficiency.
+                               - Healthy: >10% | Moderate: 5-10% | Low: <5%
+                            9. **Current Ratio**: Current assets / current liabilities. Measures liquidity.
+                               - Good: >1.5 | Acceptable: 1-1.5 | Concern: <1
+                            10. **Revenue Growth**: YoY revenue increase. Indicates business expansion.
+                            """)
+                        
+                        for stock_data in stocks_with_fundamentals:
+                            ticker = stock_data['ticker']
+                            fundamentals = stock_data['fundamentals']
+                            analysis = stock_data['fundamental_analysis']
+                            
+                            with st.expander(f"{ticker} - {analysis['rating']} ({analysis['rating_pct']:.0f}/100)"):
+                                # Display rating
+                                st.markdown(f"""
+                                <div class="{analysis['rating_class']}">
+                                    <h3>Overall Rating: {analysis['rating']}</h3>
+                                    <p>Fundamental Score: {analysis['score']:.1f} / {analysis['max_score']:.0f} ({analysis['rating_pct']:.0f}%)</p>
+                                </div>
+                                """, unsafe_allow_html=True)
+                                
+                                # Display metrics
+                                col1, col2, col3, col4 = st.columns(4)
+                                
+                                with col1:
+                                    if fundamentals.get('market_cap'):
+                                        market_cap_cr = fundamentals['market_cap'] / 10000000
+                                        st.metric("Market Cap", f"₹{market_cap_cr:.0f} Cr")
+                                    if fundamentals.get('pe_ratio'):
+                                        st.metric("P/E Ratio", f"{fundamentals['pe_ratio']:.2f}")
+                                    if fundamentals.get('pb_ratio'):
+                                        st.metric("P/B Ratio", f"{fundamentals['pb_ratio']:.2f}")
+                                
+                                with col2:
+                                    if fundamentals.get('debt_to_equity'):
+                                        st.metric("Debt/Equity", f"{fundamentals['debt_to_equity']:.2f}")
+                                    if fundamentals.get('roe'):
+                                        st.metric("ROE", f"{fundamentals['roe']*100:.2f}%")
+                                    if fundamentals.get('eps'):
+                                        st.metric("EPS", f"₹{fundamentals['eps']:.2f}")
+                                
+                                with col3:
+                                    if fundamentals.get('div_yield'):
+                                        st.metric("Div Yield", f"{fundamentals['div_yield']*100:.2f}%")
+                                    if fundamentals.get('book_value'):
+                                        st.metric("Book Value", f"₹{fundamentals['book_value']:.2f}")
+                                    if fundamentals.get('profit_margins'):
+                                        st.metric("Profit Margin", f"{fundamentals['profit_margins']*100:.2f}%")
+                                
+                                with col4:
+                                    if fundamentals.get('current_ratio'):
+                                        st.metric("Current Ratio", f"{fundamentals['current_ratio']:.2f}")
+                                    if fundamentals.get('revenue_growth'):
+                                        st.metric("Revenue Growth", f"{fundamentals['revenue_growth']*100:.2f}%")
+                                    st.write(f"**Sector:** {fundamentals.get('sector', 'N/A')}")
+                                
+                                # Analysis summary
+                                st.markdown("**Analysis Summary:**")
+                                for reason in analysis['reasons']:
+                                    st.write(f"• {reason}")
+                                
+                                # Investment summary
+                                if analysis['rating'] == 'Strong':
+                                    st.success(f"**Investment Summary:** {ticker} shows strong fundamentals with healthy financial metrics. Good for long-term investment consideration.")
+                                elif analysis['rating'] == 'Moderate':
+                                    st.info(f"**Investment Summary:** {ticker} has moderate fundamentals. Some strengths and some areas of concern. Requires careful analysis before investment.")
+                                else:
+                                    st.warning(f"**Investment Summary:** {ticker} shows weak fundamentals. Higher risk investment with concerns in key financial metrics.")
+                    else:
+                        st.info("No fundamental data available. This may be due to API limitations or data unavailability.")
+            
+            # Tab 4: Market Heatmap
+            with tabs[3]:
+                st.markdown('<div class="sub-header">🗺️ Market Sentiment Heatmap</div>', unsafe_allow_html=True)
+                
+                # Show sentiment metrics
+                col1, col2, col3, col4 = st.columns(4)
+                
+                with col1:
+                    st.metric("Total Stocks", total_count)
+                with col2:
+                    st.metric("Bullish", bullish_count, f"{(bullish_count/total_count)*100:.1f}%")
+                with col3:
+                    st.metric("Bearish", bearish_count, f"{(bearish_count/total_count)*100:.1f}%")
+                with col4:
+                    st.metric("Neutral", neutral_count, f"{(neutral_count/total_count)*100:.1f}%")
+                
+                # Overall sentiment
+                if bullish_count > bearish_count + neutral_count:
+                    st.success("🟢 **Overall Market Sentiment: BULLISH** - Majority of stocks showing positive signals")
+                elif bearish_count > bullish_count + neutral_count:
+                    st.error("🔴 **Overall Market Sentiment: BEARISH** - Majority of stocks showing negative signals")
+                else:
+                    st.info("🟡 **Overall Market Sentiment: MIXED** - Market is showing mixed signals")
+                
+                # Create heatmap data
+                heatmap_data = []
+                for result in results:
+                    signal = result['price_action']['signal']
+                    change_pct = result['change_pct']
+                    
+                    if signal == 'BULLISH':
+                        color_val = min(100, 50 + change_pct * 10)
+                    elif signal == 'BEARISH':
+                        color_val = max(-100, -50 + change_pct * 10)
+                    else:
+                        color_val = change_pct * 10
+                    
+                    heatmap_data.append({
+                        'Ticker': result['ticker'],
+                        'Signal': signal,
+                        'Change %': change_pct,
+                        'Value': color_val,
+                        'RSI': result['rsi'],
+                        'Price': result['price']
+                    })
+                
+                df_heatmap = pd.DataFrame(heatmap_data)
+                
+                # Create treemap
+                fig = px.treemap(
+                    df_heatmap,
+                    path=['Signal', 'Ticker'],
+                    values=abs(df_heatmap['Change %']) + 0.1,
+                    color='Value',
+                    color_continuous_scale=['#ff0000', '#ffaa00', '#00ff00'],
+                    color_continuous_midpoint=0,
+                    hover_data=['Change %', 'RSI', 'Price'],
+                    title=f'{index_type} Stock Heatmap - Color: Green (Bullish) | Yellow (Neutral) | Red (Bearish)'
+                )
+                
+                fig.update_layout(height=600)
+                st.plotly_chart(fig, use_container_width=True)
+                
+                # Signal breakdown
+                st.markdown("**Signal Distribution by Stocks:**")
+                
+                col1, col2, col3 = st.columns(3)
+                
+                with col1:
+                    st.markdown("**🟢 Bullish Stocks:**")
+                    bullish_stocks = [r for r in results if r['price_action']['signal'] == 'BULLISH']
+                    for stock in bullish_stocks[:10]:
+                        st.write(f"• {stock['ticker']}: {stock['change_pct']:+.2f}%")
+                
+                with col2:
+                    st.markdown("**🔴 Bearish Stocks:**")
+                    bearish_stocks = [r for r in results if r['price_action']['signal'] == 'BEARISH']
+                    for stock in bearish_stocks[:10]:
+                        st.write(f"• {stock['ticker']}: {stock['change_pct']:+.2f}%")
+                
+                with col3:
+                    st.markdown("**🟡 Neutral Stocks:**")
+                    neutral_stocks = [r for r in results if r['price_action']['signal'] == 'NEUTRAL']
+                    for stock in neutral_stocks[:10]:
+                        st.write(f"• {stock['ticker']}: {stock['change_pct']:+.2f}%")
+            
+            # Tab 5: All Stocks Overview
+            with tabs[4]:
                 st.markdown('<div class="sub-header">📈 All Stocks Overview</div>', unsafe_allow_html=True)
                 
                 overview_data = []
                 for result in results:
-                    color_class = "bullish" if result['change_pct'] > 0 else "bearish"
                     overview_data.append({
                         'Ticker': result['ticker'],
                         'Price': f"₹{result['price']:.2f}",
@@ -912,7 +1428,6 @@ def main():
                 
                 df_overview = pd.DataFrame(overview_data)
                 
-                # Style the dataframe
                 def color_change(val):
                     if isinstance(val, str) and '%' in val:
                         num = float(val.replace('%', ''))
@@ -923,8 +1438,8 @@ def main():
                 styled_df = df_overview.style.applymap(color_change, subset=['Change %'])
                 st.dataframe(styled_df, use_container_width=True, height=400)
             
-            # Tab 3: Top Gainers/Losers
-            with tab3:
+            # Tab 6: Top Gainers/Losers
+            with tabs[5]:
                 st.markdown('<div class="sub-header">🔥 Top Gainers & Losers</div>', unsafe_allow_html=True)
                 
                 col1, col2 = st.columns(2)
@@ -955,11 +1470,10 @@ def main():
                         </div>
                         """, unsafe_allow_html=True)
             
-            # Tab 4: Active Stocks
-            with tab4:
+            # Tab 7: Active Stocks
+            with tabs[6]:
                 st.markdown('<div class="sub-header">📊 Active Stocks Analysis</div>', unsafe_allow_html=True)
                 
-                # Filter stocks with >1% change and high volume
                 active_stocks = [
                     r for r in results
                     if abs(r['change_pct']) > 1.0 and r['volume_ratio'] > 1.2
@@ -986,13 +1500,12 @@ def main():
                             st.markdown(f"**Signal:** <span class='{signal_class}'>{signal}</span>", unsafe_allow_html=True)
                             st.write(f"**Strength:** {stock['price_action']['strength']}/5")
                         
-                        # Technical details
                         st.write("**Key Indicators:**")
                         for reason in stock['price_action']['reasons'][:3]:
                             st.write(f"• {reason}")
             
-            # Tab 5: 52-Week High/Low
-            with tab5:
+            # Tab 8: 52-Week High/Low
+            with tabs[7]:
                 st.markdown('<div class="sub-header">🎚️ 52-Week High/Low Analysis</div>', unsafe_allow_html=True)
                 
                 col1, col2 = st.columns(2)
@@ -1032,25 +1545,19 @@ def main():
                         </div>
                         """, unsafe_allow_html=True)
             
-            # Tab 6: Technical Signals
-            with tab6:
+            # Tab 9: Technical Signals
+            with tabs[8]:
                 st.markdown('<div class="sub-header">📉 Technical Signals Summary</div>', unsafe_allow_html=True)
-                
-                # Categorize by signals
-                bullish_stocks = [r for r in results if r['price_action']['signal'] == 'BULLISH']
-                bearish_stocks = [r for r in results if r['price_action']['signal'] == 'BEARISH']
-                neutral_stocks = [r for r in results if r['price_action']['signal'] == 'NEUTRAL']
                 
                 col1, col2, col3 = st.columns(3)
                 
                 with col1:
-                    st.metric("Bullish Signals", len(bullish_stocks))
+                    st.metric("Bullish Signals", bullish_count)
                 with col2:
-                    st.metric("Bearish Signals", len(bearish_stocks))
+                    st.metric("Bearish Signals", bearish_count)
                 with col3:
-                    st.metric("Neutral Signals", len(neutral_stocks))
+                    st.metric("Neutral Signals", neutral_count)
                 
-                # Show detailed technical analysis
                 st.subheader("Detailed Technical Analysis")
                 
                 selected_stock = st.selectbox(
@@ -1133,7 +1640,6 @@ def main():
     else:
         st.info("👈 Configure your parameters in the sidebar and click 'Run Screener' to start analysis")
         
-        # Show example information
         st.markdown("""
         ### 📚 Features
         
@@ -1143,7 +1649,7 @@ def main():
         - Custom tickers via yfinance
         
         **Trading Strategies:**
-        1. **Gap Fill Strategy** - Identifies gap ups/downs with fill potential
+        1. **Gap Fill Strategy** - Identifies gap ups/downs with fill potential and probability
         2. **Support/Resistance + EMA** - Price action near key levels with EMA crossovers
         3. **Breakout Strategy** - Volume-backed breakouts above/below recent ranges
         4. **Mean Reversion** - Bollinger Band extremes with RSI confirmation
@@ -1151,6 +1657,9 @@ def main():
         
         **Analysis Tabs:**
         - 🎯 **Trade Recommendations** - Entry, SL, Target with R:R ratios
+        - 🔄 **Gap Fill Opportunities** - Dedicated tab for gap analysis with probabilities
+        - 💰 **Fundamental Analysis** - PE, PB, ROE, Debt/Equity, margins with ratings
+        - 🗺️ **Market Heatmap** - Visual sentiment map with bullish/bearish breakdown
         - 📈 **All Stocks** - Complete overview with price changes
         - 🔥 **Top Gainers/Losers** - Best and worst performers
         - 📊 **Active Stocks** - High volume with >1% moves
@@ -1158,9 +1667,10 @@ def main():
         - 📉 **Technical Signals** - Detailed indicator analysis with charts
         
         **Index Impact Analysis:**
-        - Calculates weighted contribution to index movement
-        - Identifies top positive and negative contributors
-        - Shows estimated index movement based on constituents
+        - Detailed calculation methodology explained
+        - Formula breakdown: (Stock Change % × Weight %) / 100
+        - Top positive and negative contributors
+        - Complete contribution breakdown table
         """)
 
 if __name__ == "__main__":
