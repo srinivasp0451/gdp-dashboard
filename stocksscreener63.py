@@ -19,13 +19,20 @@ st.markdown("""
     .main-header {font-size: 2.5rem; font-weight: bold; color: #1f77b4; text-align: center; margin-bottom: 2rem;}
     .sub-header {font-size: 1.5rem; font-weight: bold; color: #2ca02c; margin-top: 1rem;}
     .metric-card {background-color: #f0f2f6; padding: 1rem; border-radius: 0.5rem; margin: 0.5rem 0;}
-    .stTabs [data-baseweb="tab-list"] {gap: 1rem;}
+    .stTabs [data-baseweb="tab-list"] {
+        gap: 0.5rem;
+        overflow-x: auto;
+        flex-wrap: wrap;
+    }
     .stTabs [data-baseweb="tab"] {
         height: auto;
-        white-space: pre-wrap;
+        white-space: normal;
+        word-wrap: break-word;
         font-weight: 600;
-        padding: 10px 20px;
-        font-size: 14px;
+        padding: 8px 12px;
+        font-size: 13px;
+        min-width: 100px;
+        max-width: 200px;
     }
     .timeframe-badge {
         background-color: #e1f5ff;
@@ -81,6 +88,31 @@ def fetch_stock_data(symbol: str, period: str = "1y", interval: str = "1d") -> p
     try:
         time.sleep(1.2)  # Rate limiting
         stock = yf.Ticker(symbol)
+        
+        # For intraday intervals, try alternative periods if initial fetch fails
+        if interval in ['1m', '5m', '15m', '30m', '1h']:
+            # Map of intervals to minimum required periods
+            min_periods = {
+                '1m': '7d',
+                '5m': '60d',
+                '15m': '60d',
+                '30m': '60d',
+                '1h': '730d'
+            }
+            
+            # If period is too short for the interval, use minimum period
+            period_days = {
+                '1d': 1, '5d': 5, '1mo': 30, '3mo': 90, 
+                '6mo': 180, '1y': 365, '2y': 730, '5y': 1825
+            }
+            
+            min_period = min_periods.get(interval, period)
+            current_period_days = period_days.get(period, 365)
+            min_period_days = period_days.get(min_period, 365)
+            
+            if current_period_days < min_period_days:
+                period = min_period
+        
         df = stock.history(period=period, interval=interval)
         
         if df.empty:
@@ -163,10 +195,211 @@ def calculate_obv(close: pd.Series, volume: pd.Series) -> pd.Series:
     obv = (np.sign(close.diff()) * volume).fillna(0).cumsum()
     return obv
 
-def calculate_vwap(df: pd.DataFrame) -> pd.Series:
-    """Calculate Volume Weighted Average Price"""
-    typical_price = (df['High'] + df['Low'] + df['Close']) / 3
-    return (typical_price * df['Volume']).cumsum() / df['Volume'].cumsum()
+def fetch_fundamental_data(symbol: str) -> Dict:
+    """Fetch fundamental data for a stock"""
+    try:
+        time.sleep(0.5)  # Lighter rate limiting for info
+        stock = yf.Ticker(symbol)
+        info = stock.info
+        
+        if not info:
+            return None
+        
+        return {
+            'market_cap': info.get('marketCap', 0),
+            'pe_ratio': info.get('trailingPE', 0),
+            'forward_pe': info.get('forwardPE', 0),
+            'peg_ratio': info.get('pegRatio', 0),
+            'pb_ratio': info.get('priceToBook', 0),
+            'ps_ratio': info.get('priceToSalesTrailing12Months', 0),
+            'dividend_yield': info.get('dividendYield', 0) * 100 if info.get('dividendYield') else 0,
+            'debt_to_equity': info.get('debtToEquity', 0),
+            'current_ratio': info.get('currentRatio', 0),
+            'quick_ratio': info.get('quickRatio', 0),
+            'roe': info.get('returnOnEquity', 0) * 100 if info.get('returnOnEquity') else 0,
+            'roa': info.get('returnOnAssets', 0) * 100 if info.get('returnOnAssets') else 0,
+            'profit_margin': info.get('profitMargins', 0) * 100 if info.get('profitMargins') else 0,
+            'operating_margin': info.get('operatingMargins', 0) * 100 if info.get('operatingMargins') else 0,
+            'revenue_growth': info.get('revenueGrowth', 0) * 100 if info.get('revenueGrowth') else 0,
+            'earnings_growth': info.get('earningsGrowth', 0) * 100 if info.get('earningsGrowth') else 0,
+            'beta': info.get('beta', 0),
+            'fifty_two_week_high': info.get('fiftyTwoWeekHigh', 0),
+            'fifty_two_week_low': info.get('fiftyTwoWeekLow', 0),
+            'sector': info.get('sector', 'Unknown'),
+            'industry': info.get('industry', 'Unknown')
+        }
+    except:
+        return None
+
+def calculate_fundamental_score(fundamentals: Dict) -> Dict:
+    """Calculate fundamental quality score"""
+    if not fundamentals:
+        return {'score': 0, 'rating': 'No Data', 'strengths': [], 'weaknesses': []}
+    
+    score = 0
+    strengths = []
+    weaknesses = []
+    
+    # Valuation (30 points)
+    if 0 < fundamentals['pe_ratio'] < 15:
+        score += 15
+        strengths.append("Attractive P/E ratio")
+    elif fundamentals['pe_ratio'] > 30:
+        weaknesses.append("High P/E ratio - overvalued")
+    
+    if 0 < fundamentals['pb_ratio'] < 3:
+        score += 10
+        strengths.append("Good P/B ratio")
+    elif fundamentals['pb_ratio'] > 5:
+        weaknesses.append("High P/B ratio")
+    
+    if 0 < fundamentals['peg_ratio'] < 1:
+        score += 5
+        strengths.append("Excellent PEG ratio")
+    
+    # Financial Health (30 points)
+    if fundamentals['debt_to_equity'] < 1:
+        score += 10
+        strengths.append("Low debt levels")
+    elif fundamentals['debt_to_equity'] > 2:
+        weaknesses.append("High debt to equity")
+    
+    if fundamentals['current_ratio'] > 1.5:
+        score += 10
+        strengths.append("Strong liquidity")
+    elif fundamentals['current_ratio'] < 1:
+        weaknesses.append("Poor liquidity position")
+    
+    if fundamentals['roe'] > 15:
+        score += 10
+        strengths.append("High ROE")
+    elif fundamentals['roe'] < 10:
+        weaknesses.append("Low return on equity")
+    
+    # Growth (20 points)
+    if fundamentals['revenue_growth'] > 15:
+        score += 10
+        strengths.append("Strong revenue growth")
+    elif fundamentals['revenue_growth'] < 0:
+        weaknesses.append("Declining revenues")
+    
+    if fundamentals['earnings_growth'] > 15:
+        score += 10
+        strengths.append("Strong earnings growth")
+    elif fundamentals['earnings_growth'] < 0:
+        weaknesses.append("Declining earnings")
+    
+    # Profitability (20 points)
+    if fundamentals['profit_margin'] > 10:
+        score += 10
+        strengths.append("High profit margins")
+    elif fundamentals['profit_margin'] < 5:
+        weaknesses.append("Low profit margins")
+    
+    if fundamentals['operating_margin'] > 15:
+        score += 10
+        strengths.append("Efficient operations")
+    
+    # Rating
+    if score >= 80:
+        rating = "⭐⭐⭐⭐⭐ Excellent"
+    elif score >= 60:
+        rating = "⭐⭐⭐⭐ Good"
+    elif score >= 40:
+        rating = "⭐⭐⭐ Average"
+    elif score >= 20:
+        rating = "⭐⭐ Below Average"
+    else:
+        rating = "⭐ Poor"
+    
+    return {
+        'score': score,
+        'rating': rating,
+        'strengths': strengths,
+        'weaknesses': weaknesses
+    }
+
+def generate_recommendations(stock_data: Dict, fundamentals: Dict = None) -> Dict:
+    """Generate trading recommendations based on technical and fundamental analysis"""
+    recommendations = {
+        'action': 'HOLD',
+        'confidence': 'Low',
+        'timeframe': 'N/A',
+        'reasons': [],
+        'risks': [],
+        'targets': [],
+        'stop_loss': None
+    }
+    
+    signal_strength = stock_data.get('signal_strength', 0)
+    trend = stock_data.get('trend', 'Neutral')
+    rsi = stock_data.get('rsi', 50)
+    adx = stock_data.get('adx', 0)
+    risk_reward = stock_data.get('risk_reward', 0)
+    
+    # Determine action
+    if signal_strength > 30 and risk_reward > 2:
+        recommendations['action'] = 'STRONG BUY'
+        recommendations['confidence'] = 'High'
+    elif signal_strength > 15 and risk_reward > 1.5:
+        recommendations['action'] = 'BUY'
+        recommendations['confidence'] = 'Medium'
+    elif signal_strength < -30:
+        recommendations['action'] = 'STRONG SELL'
+        recommendations['confidence'] = 'High'
+    elif signal_strength < -15:
+        recommendations['action'] = 'SELL'
+        recommendations['confidence'] = 'Medium'
+    else:
+        recommendations['action'] = 'HOLD'
+        recommendations['confidence'] = 'Low'
+    
+    # Timeframe recommendation
+    if adx > 25 and trend in ['Strong Uptrend', 'Strong Downtrend']:
+        recommendations['timeframe'] = 'Positional (1-3 months)'
+    elif adx > 20:
+        recommendations['timeframe'] = 'Swing (1-2 weeks)'
+    else:
+        recommendations['timeframe'] = 'Intraday/Short-term'
+    
+    # Reasons
+    if signal_strength > 15:
+        recommendations['reasons'].append(f"Strong technical signals ({signal_strength:.0f})")
+    if trend in ['Strong Uptrend', 'Uptrend']:
+        recommendations['reasons'].append(f"Positive trend: {trend}")
+    if rsi < 40:
+        recommendations['reasons'].append("RSI showing potential upside")
+    if adx > 25:
+        recommendations['reasons'].append(f"Strong trend (ADX: {adx:.1f})")
+    if risk_reward > 2:
+        recommendations['reasons'].append(f"Favorable R:R ({risk_reward:.1f}:1)")
+    
+    # Add fundamental reasons if available
+    if fundamentals:
+        fund_score = calculate_fundamental_score(fundamentals)
+        if fund_score['score'] > 60:
+            recommendations['reasons'].append(f"Strong fundamentals (Score: {fund_score['score']}/100)")
+        for strength in fund_score['strengths'][:2]:
+            recommendations['reasons'].append(strength)
+    
+    # Risks
+    if rsi > 70:
+        recommendations['risks'].append("RSI overbought - potential reversal")
+    if adx < 20:
+        recommendations['risks'].append("Weak trend - choppy movement expected")
+    if risk_reward < 1.5:
+        recommendations['risks'].append("Poor risk-reward ratio")
+    if stock_data.get('volume_ratio', 0) < 1:
+        recommendations['risks'].append("Low volume - liquidity concerns")
+    
+    # Targets and SL
+    recommendations['targets'] = [
+        stock_data.get('target1', 0),
+        stock_data.get('target2', 0)
+    ]
+    recommendations['stop_loss'] = stock_data.get('stop_loss', 0)
+    
+    return recommendations
 
 def calculate_ema_angle(ema_series: pd.Series, lookback: int = 5) -> float:
     """Calculate the angle of EMA in degrees"""
@@ -475,8 +708,13 @@ def calculate_technical_indicators(df: pd.DataFrame, symbol: str) -> Dict:
             'data_available': False
         }
 
-def analyze_stocks(stock_list: List[str], progress_bar, status_text) -> Tuple[List, List]:
-    """Analyze all stocks in the list"""
+def calculate_vwap(df: pd.DataFrame) -> pd.Series:
+    """Calculate Volume Weighted Average Price"""
+    typical_price = (df['High'] + df['Low'] + df['Close']) / 3
+    return (typical_price * df['Volume']).cumsum() / df['Volume'].cumsum()
+
+def analyze_stocks_with_fundamentals(stock_list: List[str], progress_bar, status_text, include_fundamentals: bool = True) -> Tuple[List, List]:
+    """Analyze all stocks with technical and fundamental data"""
     successful_results = []
     all_results = []
     total = len(stock_list)
@@ -485,9 +723,18 @@ def analyze_stocks(stock_list: List[str], progress_bar, status_text) -> Tuple[Li
         status_text.text(f"Analyzing {symbol.replace('.NS', '')} ({idx+1}/{total})...")
         progress_bar.progress((idx + 1) / total)
         
+        # Technical analysis
         df = fetch_stock_data(symbol, period=st.session_state.timeframe_info['period'], 
                              interval=st.session_state.timeframe_info['interval'])
         indicators = calculate_technical_indicators(df, symbol)
+        
+        # Fundamental analysis (only for daily timeframe)
+        if include_fundamentals and st.session_state.timeframe_info['interval'] == '1d':
+            fundamentals = fetch_fundamental_data(symbol)
+            if fundamentals:
+                indicators['fundamentals'] = fundamentals
+                indicators['fundamental_score'] = calculate_fundamental_score(fundamentals)
+        
         all_results.append(indicators)
         
         if indicators.get('data_available', False):
@@ -968,6 +1215,13 @@ with st.sidebar:
     min_signal_strength = st.slider("Min Signal Strength", -50, 50, 0)
     min_volume_ratio = st.slider("Min Volume Ratio", 0.5, 3.0, 1.0, 0.1)
     
+    # Fundamental Analysis Toggle
+    include_fundamentals = st.checkbox(
+        "Include Fundamental Analysis", 
+        value=True,
+        help="Only works with daily timeframe. Adds ~1s per stock."
+    )
+    
     st.markdown("---")
     
     # Run Analysis Button
@@ -1005,7 +1259,10 @@ if run_button:
         status_text = st.empty()
         
         with st.spinner("Fetching and analyzing data..."):
-            successful_results, all_results = analyze_stocks(stock_list, progress_bar, status_text)
+            successful_results, all_results = analyze_stocks_with_fundamentals(
+                stock_list, progress_bar, status_text, 
+                include_fundamentals and interval == '1d'
+            )
             
             if successful_results:
                 st.session_state.analysis_data = pd.DataFrame(successful_results)
@@ -1057,14 +1314,16 @@ if st.session_state.analysis_data is not None:
     # Tabs for different views
     tab_names = [
         "📋 Overview",
-        "🎯 Top Opportunities",
-        "📈 Long/Short Buildup",
-        "🔄 EMA Crossover",
+        "🎯 Top Picks",
+        "📈 Buildup",
+        "🔄 EMA Cross",
+        "💰 Fundamentals",
         "📊 Intraday",
         "🌊 Swing",
         "📍 Positional",
         "💎 Long-term",
         "🔍 Detailed",
+        "✅ Recommendations",
         "📑 All Stocks"
     ]
     
@@ -1163,8 +1422,108 @@ if st.session_state.analysis_data is not None:
         )
         display_ema_crossover_stocks(df_filtered)
     
-    # Tab 4: Intraday
+    # Tab 4: Fundamentals
     with tabs[4]:
+        display_timeframe_badge(
+            st.session_state.timeframe_info['period'],
+            st.session_state.timeframe_info['interval']
+        )
+        
+        st.subheader("💰 Fundamental Analysis")
+        
+        # Check if fundamental data exists
+        has_fundamentals = any(row.get('fundamentals') for idx, row in df_filtered.iterrows())
+        
+        if not has_fundamentals:
+            st.warning("⚠️ Fundamental data not available. Enable 'Include Fundamental Analysis' in sidebar and use daily timeframe.")
+        else:
+            # Filter stocks with fundamental data
+            fund_stocks = df_filtered[df_filtered.apply(lambda x: x.get('fundamentals') is not None, axis=1)].copy()
+            
+            if fund_stocks.empty:
+                st.info("No stocks with fundamental data in filtered results")
+            else:
+                # Create fundamental comparison
+                fund_data = []
+                for idx, row in fund_stocks.iterrows():
+                    fund = row['fundamentals']
+                    fund_score = row.get('fundamental_score', {'score': 0, 'rating': 'N/A'})
+                    fund_data.append({
+                        'Symbol': row['symbol'],
+                        'Score': fund_score['score'],
+                        'Rating': fund_score['rating'],
+                        'P/E': fund.get('pe_ratio', 0),
+                        'P/B': fund.get('pb_ratio', 0),
+                        'ROE %': fund.get('roe', 0),
+                        'Debt/Equity': fund.get('debt_to_equity', 0),
+                        'Dividend %': fund.get('dividend_yield', 0),
+                        'Revenue Growth %': fund.get('revenue_growth', 0),
+                        'Profit Margin %': fund.get('profit_margin', 0),
+                        'Sector': fund.get('sector', 'Unknown')
+                    })
+                
+                fund_df = pd.DataFrame(fund_data).sort_values('Score', ascending=False)
+                st.dataframe(fund_df.round(2), use_container_width=True, height=400)
+                
+                # Visualizations
+                col1, col2 = st.columns(2)
+                
+                with col1:
+                    fig = px.bar(fund_df.head(15), x='Symbol', y='Score',
+                               title="Fundamental Quality Score (Top 15)",
+                               color='Score', color_continuous_scale='Greens')
+                    st.plotly_chart(fig, use_container_width=True)
+                
+                with col2:
+                    fig = px.scatter(fund_df, x='P/E', y='ROE %', size='Score',
+                                   hover_data=['Symbol'], color='Sector',
+                                   title="Valuation vs Returns")
+                    st.plotly_chart(fig, use_container_width=True)
+                
+                # Sector analysis
+                st.subheader("📊 Sector-wise Analysis")
+                sector_avg = fund_df.groupby('Sector').agg({
+                    'Score': 'mean',
+                    'ROE %': 'mean',
+                    'P/E': 'mean',
+                    'Symbol': 'count'
+                }).round(2)
+                sector_avg.columns = ['Avg Score', 'Avg ROE %', 'Avg P/E', 'Count']
+                sector_avg = sector_avg.sort_values('Avg Score', ascending=False)
+                st.dataframe(sector_avg, use_container_width=True)
+                
+                # Best fundamental picks
+                st.subheader("⭐ Top Fundamental Picks")
+                top_fund = fund_df.head(10)
+                for idx, row in top_fund.iterrows():
+                    stock_row = fund_stocks[fund_stocks['symbol'] == row['Symbol']].iloc[0]
+                    fund_score = stock_row.get('fundamental_score', {})
+                    
+                    with st.expander(f"{row['Rating']} {row['Symbol']} - Score: {row['Score']}/100"):
+                        col1, col2, col3 = st.columns(3)
+                        
+                        with col1:
+                            st.metric("P/E Ratio", f"{row['P/E']:.2f}")
+                            st.metric("P/B Ratio", f"{row['P/B']:.2f}")
+                            st.metric("Dividend Yield", f"{row['Dividend %']:.2f}%")
+                        
+                        with col2:
+                            st.metric("ROE", f"{row['ROE %']:.2f}%")
+                            st.metric("Debt/Equity", f"{row['Debt/Equity']:.2f}")
+                            st.metric("Revenue Growth", f"{row['Revenue Growth %']:.2f}%")
+                        
+                        with col3:
+                            st.metric("Profit Margin", f"{row['Profit Margin %']:.2f}%")
+                            st.metric("Sector", row['Sector'])
+                            st.metric("Technical Signal", f"{stock_row['signal_strength']:.0f}")
+                        
+                        if fund_score.get('strengths'):
+                            st.success("**Strengths:** " + ", ".join(fund_score['strengths']))
+                        if fund_score.get('weaknesses'):
+                            st.warning("**Weaknesses:** " + ", ".join(fund_score['weaknesses']))
+    
+    # Tab 5: Intraday (was tab 4)
+    with tabs[5]:
         display_timeframe_badge(
             st.session_state.timeframe_info['period'],
             st.session_state.timeframe_info['interval']
@@ -1189,8 +1548,8 @@ if st.session_state.analysis_data is not None:
                                   'VWAP', 'ATR', 'Candle', 'SL', 'Target']
             st.dataframe(intraday_df.round(2), use_container_width=True)
     
-    # Tab 5: Swing
-    with tabs[5]:
+    # Tab 6: Swing (was tab 5)
+    with tabs[6]:
         display_timeframe_badge(
             st.session_state.timeframe_info['period'],
             st.session_state.timeframe_info['interval']
@@ -1209,8 +1568,8 @@ if st.session_state.analysis_data is not None:
                                        'ema20', 'stop_loss', 'target1']].round(2), 
                         use_container_width=True)
     
-    # Tab 6: Positional
-    with tabs[6]:
+    # Tab 7: Positional (was tab 6)
+    with tabs[7]:
         display_timeframe_badge(
             st.session_state.timeframe_info['period'],
             st.session_state.timeframe_info['interval']
@@ -1228,8 +1587,8 @@ if st.session_state.analysis_data is not None:
                                      'ema50', 'ema200', 'signal_strength']].round(2),
                         use_container_width=True)
     
-    # Tab 7: Long-term
-    with tabs[7]:
+    # Tab 8: Long-term (was tab 7)
+    with tabs[8]:
         display_timeframe_badge(
             st.session_state.timeframe_info['period'],
             st.session_state.timeframe_info['interval']
@@ -1247,8 +1606,8 @@ if st.session_state.analysis_data is not None:
                                    'ema200', 'rsi', 'adx']].round(2),
                         use_container_width=True)
     
-    # Tab 8: Detailed Analysis
-    with tabs[8]:
+    # Tab 9: Detailed Analysis (was tab 8)
+    with tabs[9]:
         display_timeframe_badge(
             st.session_state.timeframe_info['period'],
             st.session_state.timeframe_info['interval']
@@ -1380,8 +1739,98 @@ if st.session_state.analysis_data is not None:
                 else:
                     st.success("All criteria met!")
     
-    # Tab 9: All Stocks Analysis
-    with tabs[9]:
+    # Tab 10: Recommendations (NEW)
+    with tabs[10]:
+        display_timeframe_badge(
+            st.session_state.timeframe_info['period'],
+            st.session_state.timeframe_info['interval']
+        )
+        
+        st.subheader("✅ Trading Recommendations")
+        st.write("AI-powered recommendations based on technical and fundamental analysis")
+        
+        # Generate recommendations for top stocks
+        top_stocks_for_reco = df_filtered.sort_values('signal_strength', ascending=False).head(20)
+        
+        for idx, row in top_stocks_for_reco.iterrows():
+            fundamentals = row.get('fundamentals', None)
+            reco = generate_recommendations(row, fundamentals)
+            
+            # Color code by action
+            action_colors = {
+                'STRONG BUY': '🟢',
+                'BUY': '🟩',
+                'HOLD': '🟨',
+                'SELL': '🟧',
+                'STRONG SELL': '🔴'
+            }
+            
+            action_icon = action_colors.get(reco['action'], '⚪')
+            
+            with st.expander(f"{action_icon} {row['symbol']} - {reco['action']} | {reco['confidence']} Confidence"):
+                # Action summary
+                col1, col2, col3, col4 = st.columns(4)
+                
+                with col1:
+                    st.metric("Recommendation", reco['action'])
+                    st.metric("Confidence", reco['confidence'])
+                
+                with col2:
+                    st.metric("Timeframe", reco['timeframe'])
+                    st.metric("Current Price", f"₹{row['price']:.2f}")
+                
+                with col3:
+                    if reco['targets']:
+                        st.metric("Target 1", f"₹{reco['targets'][0]:.2f}")
+                        st.metric("Target 2", f"₹{reco['targets'][1]:.2f}")
+                
+                with col4:
+                    if reco['stop_loss']:
+                        st.metric("Stop Loss", f"₹{reco['stop_loss']:.2f}")
+                    st.metric("Risk:Reward", f"1:{row['risk_reward']:.2f}")
+                
+                # Reasons
+                col1, col2 = st.columns(2)
+                
+                with col1:
+                    st.markdown("**✅ Reasons to Trade:**")
+                    if reco['reasons']:
+                        for reason in reco['reasons']:
+                            st.success(f"• {reason}")
+                    else:
+                        st.info("No strong reasons identified")
+                
+                with col2:
+                    st.markdown("**⚠️ Risk Factors:**")
+                    if reco['risks']:
+                        for risk in reco['risks']:
+                            st.warning(f"• {risk}")
+                    else:
+                        st.success("No major risks identified")
+                
+                # Technical + Fundamental summary
+                st.markdown("**📊 Complete Analysis:**")
+                summary_col1, summary_col2 = st.columns(2)
+                
+                with summary_col1:
+                    st.write(f"**Technical Signal:** {row['signal_strength']:.0f}")
+                    st.write(f"**Trend:** {row['trend']}")
+                    st.write(f"**RSI:** {row['rsi']:.1f}")
+                    st.write(f"**ADX:** {row['adx']:.1f}")
+                    st.write(f"**Volume Ratio:** {row['volume_ratio']:.2f}x")
+                
+                with summary_col2:
+                    if fundamentals:
+                        fund_score = row.get('fundamental_score', {})
+                        st.write(f"**Fundamental Score:** {fund_score.get('score', 0)}/100")
+                        st.write(f"**P/E Ratio:** {fundamentals.get('pe_ratio', 0):.2f}")
+                        st.write(f"**ROE:** {fundamentals.get('roe', 0):.1f}%")
+                        st.write(f"**Debt/Equity:** {fundamentals.get('debt_to_equity', 0):.2f}")
+                    else:
+                        st.info("Fundamental data not available")
+    
+    # Tab 11: All Stocks (was tab 9)
+    with tabs[11]:
         display_timeframe_badge(
             st.session_state.timeframe_info['period'],
             st.session_state.timeframe_info['interval']
