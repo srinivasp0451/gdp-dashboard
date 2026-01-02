@@ -1476,7 +1476,7 @@ def main():
                 
                 active_stocks = [
                     r for r in results
-                    if abs(r['change_pct']) > 1.0 and r['volume_ratio'] > 1.2
+                    if abs(r['change_pct']) > 0.1 and r['volume_ratio'] > 1.2
                 ]
                 
                 st.write(f"**{len(active_stocks)} stocks with >1% price change and high volume**")
