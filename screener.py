@@ -1479,7 +1479,7 @@ def main():
                     if abs(r['change_pct']) > 0.1 and r['volume_ratio'] > 1.2
                 ]
                 
-                st.write(f"**{len(active_stocks)} stocks with >1% price change and high volume**")
+                st.write(f"**{len(active_stocks)} stocks with >0.1% price change and high volume**")
                 
                 for stock in active_stocks[:15]:
                     with st.expander(f"{stock['ticker']} - {stock['change_pct']:+.2f}%"):
