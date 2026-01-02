@@ -1005,7 +1005,7 @@ def main():
         
         # Timeframe selection
         st.subheader("Timeframe")
-        interval = st.selectbox("Interval", list(TIMEFRAME_PERIODS.keys()), index=4)
+        interval = st.selectbox("Interval", list(TIMEFRAME_PERIODS.keys()), index=2)
         period = st.selectbox("Period", TIMEFRAME_PERIODS[interval])
         
         # Strategy selection
