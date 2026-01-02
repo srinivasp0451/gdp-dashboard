@@ -1753,8 +1753,11 @@ if st.session_state.analysis_data is not None:
         top_stocks_for_reco = df_filtered.sort_values('signal_strength', ascending=False).head(20)
         
         for idx, row in top_stocks_for_reco.iterrows():
-            fundamentals = row.get('fundamentals', None)
-            reco = generate_recommendations(row, fundamentals)
+            # Convert row to dictionary to avoid subscriptable error
+            row_dict = row.to_dict() if hasattr(row, 'to_dict') else row
+        
+            fundamentals = row_dict.get('fundamentals', None)
+            reco = generate_recommendations(row_dict, fundamentals)
             
             # Color code by action
             action_colors = {
