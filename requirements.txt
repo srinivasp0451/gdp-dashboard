@@ -21,4 +21,3 @@ Dhan-Tradehull
 curl_cffi
 openpyxl
 mplfinance
-opencv-python
