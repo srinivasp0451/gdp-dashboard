@@ -21,4 +21,4 @@ Dhan-Tradehull
 curl_cffi
 openpyxl
 mplfinance
-streamlit-drawable-canvas
+
