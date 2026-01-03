@@ -1,8 +1,9 @@
 import streamlit as st
-from streamlit_drawable_canvas import st_canvas
+import streamlit.components.v1 as components
 from PIL import Image, ImageFilter, ImageDraw, ImageOps, ImageEnhance
 import numpy as np
 import io
+import base64
 
 # Page configuration
 st.set_page_config(
@@ -144,6 +145,213 @@ def resize_image(img, max_size=600):
         return img.resize((new_w, new_h), Image.Resampling.LANCZOS)
     return img
 
+def image_to_base64(img):
+    """Convert PIL image to base64"""
+    buffered = io.BytesIO()
+    img.save(buffered, format="PNG")
+    return base64.b64encode(buffered.getvalue()).decode()
+
+def create_drawing_canvas(background_img, width, height, pencil_color, pencil_size, show_guide, guide_opacity):
+    """Create HTML canvas for drawing"""
+    bg_base64 = image_to_base64(background_img)
+    
+    html_code = f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <style>
+            body {{
+                margin: 0;
+                padding: 20px;
+                display: flex;
+                flex-direction: column;
+                align-items: center;
+                background: #f0f0f0;
+            }}
+            #canvasContainer {{
+                position: relative;
+                border: 3px solid #333;
+                box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+                background: white;
+            }}
+            #guideCanvas, #drawingCanvas {{
+                position: absolute;
+                top: 0;
+                left: 0;
+                cursor: crosshair;
+            }}
+            #guideCanvas {{
+                z-index: 1;
+                opacity: {guide_opacity if show_guide else 0};
+            }}
+            #drawingCanvas {{
+                z-index: 2;
+            }}
+            .controls {{
+                margin: 20px 0;
+                display: flex;
+                gap: 10px;
+            }}
+            button {{
+                padding: 10px 20px;
+                font-size: 16px;
+                cursor: pointer;
+                border: none;
+                border-radius: 5px;
+                background: #4CAF50;
+                color: white;
+                font-weight: bold;
+            }}
+            button:hover {{
+                background: #45a049;
+            }}
+            button.secondary {{
+                background: #808080;
+            }}
+            button.secondary:hover {{
+                background: #606060;
+            }}
+        </style>
+    </head>
+    <body>
+        <div class="controls">
+            <button onclick="clearCanvas()">🔄 Clear Drawing</button>
+            <button onclick="toggleGuide()" class="secondary" id="toggleBtn">
+                👁️ Hide Guide
+            </button>
+            <button onclick="downloadDrawing()">📥 Download</button>
+        </div>
+        
+        <div id="canvasContainer">
+            <canvas id="guideCanvas" width="{width}" height="{height}"></canvas>
+            <canvas id="drawingCanvas" width="{width}" height="{height}"></canvas>
+        </div>
+
+        <script>
+            const guideCanvas = document.getElementById('guideCanvas');
+            const guideCtx = guideCanvas.getContext('2d');
+            const drawingCanvas = document.getElementById('drawingCanvas');
+            const ctx = drawingCanvas.getContext('2d');
+            
+            let isDrawing = false;
+            let lastX = 0;
+            let lastY = 0;
+            let guideVisible = {str(show_guide).lower()};
+            
+            // Load background image
+            const img = new Image();
+            img.onload = function() {{
+                guideCtx.drawImage(img, 0, 0, {width}, {height});
+            }};
+            img.src = 'data:image/png;base64,{bg_base64}';
+            
+            // Drawing settings
+            ctx.strokeStyle = '{pencil_color}';
+            ctx.lineWidth = {pencil_size};
+            ctx.lineCap = 'round';
+            ctx.lineJoin = 'round';
+            
+            // Mouse events
+            drawingCanvas.addEventListener('mousedown', startDrawing);
+            drawingCanvas.addEventListener('mousemove', draw);
+            drawingCanvas.addEventListener('mouseup', stopDrawing);
+            drawingCanvas.addEventListener('mouseout', stopDrawing);
+            
+            // Touch events
+            drawingCanvas.addEventListener('touchstart', handleTouchStart);
+            drawingCanvas.addEventListener('touchmove', handleTouchMove);
+            drawingCanvas.addEventListener('touchend', stopDrawing);
+            
+            function startDrawing(e) {{
+                isDrawing = true;
+                const rect = drawingCanvas.getBoundingClientRect();
+                lastX = e.clientX - rect.left;
+                lastY = e.clientY - rect.top;
+            }}
+            
+            function draw(e) {{
+                if (!isDrawing) return;
+                
+                const rect = drawingCanvas.getBoundingClientRect();
+                const x = e.clientX - rect.left;
+                const y = e.clientY - rect.top;
+                
+                ctx.beginPath();
+                ctx.moveTo(lastX, lastY);
+                ctx.lineTo(x, y);
+                ctx.stroke();
+                
+                lastX = x;
+                lastY = y;
+            }}
+            
+            function stopDrawing() {{
+                isDrawing = false;
+            }}
+            
+            function handleTouchStart(e) {{
+                e.preventDefault();
+                const touch = e.touches[0];
+                const rect = drawingCanvas.getBoundingClientRect();
+                lastX = touch.clientX - rect.left;
+                lastY = touch.clientY - rect.top;
+                isDrawing = true;
+            }}
+            
+            function handleTouchMove(e) {{
+                e.preventDefault();
+                if (!isDrawing) return;
+                
+                const touch = e.touches[0];
+                const rect = drawingCanvas.getBoundingClientRect();
+                const x = touch.clientX - rect.left;
+                const y = touch.clientY - rect.top;
+                
+                ctx.beginPath();
+                ctx.moveTo(lastX, lastY);
+                ctx.lineTo(x, y);
+                ctx.stroke();
+                
+                lastX = x;
+                lastY = y;
+            }}
+            
+            function clearCanvas() {{
+                ctx.clearRect(0, 0, drawingCanvas.width, drawingCanvas.height);
+            }}
+            
+            function toggleGuide() {{
+                guideVisible = !guideVisible;
+                guideCanvas.style.opacity = guideVisible ? '{guide_opacity}' : '0';
+                document.getElementById('toggleBtn').textContent = guideVisible ? '👁️ Hide Guide' : '👁️ Show Guide';
+            }}
+            
+            function downloadDrawing() {{
+                const tempCanvas = document.createElement('canvas');
+                tempCanvas.width = {width};
+                tempCanvas.height = {height};
+                const tempCtx = tempCanvas.getContext('2d');
+                
+                // White background
+                tempCtx.fillStyle = 'white';
+                tempCtx.fillRect(0, 0, {width}, {height});
+                
+                // Draw the drawing
+                tempCtx.drawImage(drawingCanvas, 0, 0);
+                
+                // Download
+                const link = document.createElement('a');
+                link.download = 'my_drawing_step_{st.session_state.current_step}.png';
+                link.href = tempCanvas.toDataURL();
+                link.click();
+            }}
+        </script>
+    </body>
+    </html>
+    """
+    
+    return html_code
+
 # Sidebar
 with st.sidebar:
     st.header("📤 Upload Photo")
@@ -166,13 +374,13 @@ with st.sidebar:
     # Step navigation
     st.header("📚 Drawing Steps")
     
-    cols = st.columns(4)
     for i in range(1, 5):
-        with cols[i-1]:
-            if st.button(f"Step {i}", key=f"step_{i}", 
-                        type="primary" if st.session_state.current_step == i else "secondary",
-                        use_container_width=True):
-                st.session_state.current_step = i
+        if st.button(f"{'✅ ' if i < st.session_state.current_step else ''}Step {i}{' 👉' if i == st.session_state.current_step else ''}", 
+                    key=f"step_{i}", 
+                    use_container_width=True,
+                    type="primary" if st.session_state.current_step == i else "secondary"):
+            st.session_state.current_step = i
+            st.rerun()
     
     st.markdown("---")
     
@@ -204,8 +412,9 @@ if st.session_state.uploaded_image is None:
     1. **Upload** a portrait photo in the sidebar
     2. **Follow** the 4 progressive steps
     3. **Select** the recommended pencil for each step
-    4. **Draw** directly on the canvas
+    4. **Draw** directly on the canvas with your mouse or touch
     5. **Toggle** the guide overlay to check your progress
+    6. **Download** your drawing when done!
     """)
 else:
     # Create guide for current step
@@ -218,7 +427,7 @@ else:
     else:
         guide_img = st.session_state.processed_steps[st.session_state.current_step]
     
-    # Convert guide to RGB for canvas background
+    # Convert guide to RGB
     guide_rgb = guide_img.convert('RGB')
     
     # Canvas size
@@ -229,7 +438,8 @@ else:
     st.markdown("### ✏️ Select Your Pencil")
     pencil_cols = st.columns(len(PENCILS))
     
-    selected_pencil = st.session_state.get('selected_pencil', current_step_config['pencil'])
+    if 'selected_pencil' not in st.session_state:
+        st.session_state.selected_pencil = current_step_config['pencil']
     
     for idx, (pencil_name, pencil_info) in enumerate(PENCILS.items()):
         with pencil_cols[idx]:
@@ -238,51 +448,40 @@ else:
             
             if st.button(button_label, key=f"pencil_{pencil_name}", 
                         use_container_width=True,
-                        type="primary" if selected_pencil == pencil_name else "secondary"):
+                        type="primary" if st.session_state.selected_pencil == pencil_name else "secondary"):
                 st.session_state.selected_pencil = pencil_name
-                selected_pencil = pencil_name
+                st.rerun()
     
     # Show selected pencil info
-    st.markdown(f"**Selected: {selected_pencil}** - {PENCILS[selected_pencil]['description']}")
+    selected_pencil = st.session_state.selected_pencil
+    pencil_config = PENCILS[selected_pencil]
+    st.markdown(f"**Selected: {selected_pencil}** - {pencil_config['description']}")
     
     st.markdown("---")
     
-    # Tool selector
-    col1, col2, col3 = st.columns([1, 1, 4])
-    with col1:
-        drawing_mode = st.radio("Tool:", ["Pencil ✏️", "Eraser 🧹"], horizontal=True)
-    with col2:
-        if st.button("🔄 Clear Canvas", use_container_width=True):
-            st.rerun()
-    
-    # Prepare background
+    # Create blended background
     if show_guide:
-        # Create semi-transparent guide overlay
         guide_array = np.array(guide_rgb)
         white_bg = np.ones_like(guide_array) * 255
         blended = (guide_opacity * guide_array + (1 - guide_opacity) * white_bg).astype(np.uint8)
         background_image = Image.fromarray(blended)
     else:
-        # White background
         background_image = Image.new('RGB', (canvas_width, canvas_height), 'white')
     
     # Drawing canvas
     st.markdown("### 🎨 Drawing Canvas")
     
-    pencil_config = PENCILS[selected_pencil]
-    stroke_width = pencil_config['size']
-    stroke_color = pencil_config['color'] if drawing_mode == "Pencil ✏️" else "#FFFFFF"
-    
-    canvas_result = st_canvas(
-        fill_color="rgba(0, 0, 0, 0)",
-        stroke_width=stroke_width,
-        stroke_color=stroke_color,
-        background_image=background_image,
-        height=canvas_height,
-        width=canvas_width,
-        drawing_mode="freedraw" if drawing_mode == "Pencil ✏️" else "freedraw",
-        key=f"canvas_step_{st.session_state.current_step}",
+    canvas_html = create_drawing_canvas(
+        background_image,
+        canvas_width,
+        canvas_height,
+        pencil_config['color'],
+        pencil_config['size'],
+        show_guide,
+        guide_opacity
     )
+    
+    components.html(canvas_html, height=canvas_height + 150, scrolling=False)
     
     # Navigation buttons
     st.markdown("---")
