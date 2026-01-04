@@ -209,15 +209,27 @@ def create_drawing_canvas(background_img, width, height, tool_color, tool_size, 
                 flex-wrap: wrap;
                 width: 100%;
             }}
-            #canvasContainer {{
+            #canvasWrapper {{
                 position: relative;
                 border: 3px solid #333;
                 box-shadow: 0 4px 8px rgba(0,0,0,0.2);
-                background: white;
+                background: #d0d0d0;
                 margin: 0 auto;
                 max-width: 100%;
                 overflow: auto;
                 -webkit-overflow-scrolling: touch;
+                scroll-behavior: smooth;
+                height: 70vh;
+                cursor: grab;
+            }}
+            #canvasWrapper:active {{
+                cursor: grabbing;
+            }}
+            #canvasContainer {{
+                position: relative;
+                display: inline-block;
+                transform-origin: 0 0;
+                transition: transform 0.1s ease-out;
             }}
             canvas {{
                 display: block;
@@ -273,6 +285,32 @@ def create_drawing_canvas(background_img, width, height, tool_color, tool_size, 
                 font-weight: bold;
                 text-align: center;
             }}
+            .zoom-controls {{
+                position: absolute;
+                bottom: 20px;
+                right: 20px;
+                z-index: 50;
+                background: white;
+                border: 2px solid #333;
+                border-radius: 8px;
+                padding: 10px;
+                box-shadow: 0 2px 8px rgba(0,0,0,0.3);
+            }}
+            .zoom-btn {{
+                display: block;
+                width: 50px;
+                height: 50px;
+                margin: 5px 0;
+                font-size: 24px;
+                padding: 0;
+                min-width: 50px;
+            }}
+            .zoom-display {{
+                text-align: center;
+                padding: 5px;
+                font-weight: bold;
+                font-size: 16px;
+            }}
             @media (max-width: 768px) {{
                 button {{
                     font-size: 12px;
@@ -282,6 +320,15 @@ def create_drawing_canvas(background_img, width, height, tool_color, tool_size, 
                 .toolbar {{
                     padding: 5px;
                     gap: 5px;
+                }}
+                .zoom-controls {{
+                    bottom: 10px;
+                    right: 10px;
+                }}
+                .zoom-btn {{
+                    width: 45px;
+                    height: 45px;
+                    font-size: 20px;
                 }}
             }}
         </style>
@@ -323,13 +370,24 @@ def create_drawing_canvas(background_img, width, height, tool_color, tool_size, 
         
         <input type="text" id="textInput" placeholder="Type text and click on canvas">
         
-        <div id="canvasContainer">
-            <canvas id="guideCanvas" width="{width}" height="{height}"></canvas>
-            <canvas id="animationCanvas" width="{width}" height="{height}"></canvas>
-            <canvas id="drawingCanvas" width="{width}" height="{height}"></canvas>
+        <div id="canvasWrapper">
+            <div id="canvasContainer">
+                <canvas id="guideCanvas" width="{width}" height="{height}"></canvas>
+                <canvas id="animationCanvas" width="{width}" height="{height}"></canvas>
+                <canvas id="drawingCanvas" width="{width}" height="{height}"></canvas>
+            </div>
+        </div>
+        
+        <div class="zoom-controls">
+            <button class="zoom-btn" onclick="zoomIn()">➕</button>
+            <div class="zoom-display" id="zoomDisplay">100%</div>
+            <button class="zoom-btn" onclick="zoomOut()">➖</button>
+            <button class="zoom-btn" onclick="resetZoom()">⟲</button>
         </div>
 
         <script>
+            const canvasWrapper = document.getElementById('canvasWrapper');
+            const canvasContainer = document.getElementById('canvasContainer');
             const guideCanvas = document.getElementById('guideCanvas');
             const guideCtx = guideCanvas.getContext('2d');
             const animCanvas = document.getElementById('animationCanvas');
@@ -349,6 +407,140 @@ def create_drawing_canvas(background_img, width, height, tool_color, tool_size, 
             let animationVisible = {str(show_animation).lower()};
             let history = [];
             let historyStep = -1;
+            
+            // Zoom and pan variables
+            let scale = 1;
+            let isPanning = false;
+            let startPanX = 0;
+            let startPanY = 0;
+            let translateX = 0;
+            let translateY = 0;
+            
+            // Apply initial transform
+            function updateTransform() {{
+                canvasContainer.style.transform = `translate(${{translateX}}px, ${{translateY}}px) scale(${{scale}})`;
+            }}
+            
+            // Zoom functions
+            function zoomIn() {{
+                scale = Math.min(scale + 0.25, 5);
+                updateTransform();
+                document.getElementById('zoomDisplay').textContent = Math.round(scale * 100) + '%';
+            }}
+            
+            function zoomOut() {{
+                scale = Math.max(scale - 0.25, 0.25);
+                updateTransform();
+                document.getElementById('zoomDisplay').textContent = Math.round(scale * 100) + '%';
+            }}
+            
+            function resetZoom() {{
+                scale = 1;
+                translateX = 0;
+                translateY = 0;
+                updateTransform();
+                document.getElementById('zoomDisplay').textContent = '100%';
+                canvasWrapper.scrollTop = 0;
+                canvasWrapper.scrollLeft = 0;
+            }}
+            
+            // Mouse wheel zoom
+            canvasWrapper.addEventListener('wheel', (e) => {{
+                if (e.ctrlKey || e.metaKey) {{
+                    e.preventDefault();
+                    const delta = e.deltaY > 0 ? -0.1 : 0.1;
+                    const newScale = Math.max(0.25, Math.min(5, scale + delta));
+                    
+                    // Zoom towards mouse position
+                    const rect = canvasWrapper.getBoundingClientRect();
+                    const mouseX = e.clientX - rect.left;
+                    const mouseY = e.clientY - rect.top;
+                    
+                    const scaleRatio = newScale / scale;
+                    translateX = mouseX - (mouseX - translateX) * scaleRatio;
+                    translateY = mouseY - (mouseY - translateY) * scaleRatio;
+                    
+                    scale = newScale;
+                    updateTransform();
+                    document.getElementById('zoomDisplay').textContent = Math.round(scale * 100) + '%';
+                }}
+            }}, {{ passive: false }});
+            
+            // Pan with middle mouse or space+drag
+            let spacePressed = false;
+            
+            document.addEventListener('keydown', (e) => {{
+                if (e.code === 'Space' && !e.repeat) {{
+                    spacePressed = true;
+                    canvasWrapper.style.cursor = 'grab';
+                }}
+            }});
+            
+            document.addEventListener('keyup', (e) => {{
+                if (e.code === 'Space') {{
+                    spacePressed = false;
+                    canvasWrapper.style.cursor = '';
+                }}
+            }});
+            
+            canvasWrapper.addEventListener('mousedown', (e) => {{
+                if (e.button === 1 || spacePressed) {{ // Middle button or space
+                    e.preventDefault();
+                    isPanning = true;
+                    startPanX = e.clientX - translateX;
+                    startPanY = e.clientY - translateY;
+                    canvasWrapper.style.cursor = 'grabbing';
+                }}
+            }});
+            
+            document.addEventListener('mousemove', (e) => {{
+                if (isPanning) {{
+                    translateX = e.clientX - startPanX;
+                    translateY = e.clientY - startPanY;
+                    updateTransform();
+                }}
+            }});
+            
+            document.addEventListener('mouseup', () => {{
+                if (isPanning) {{
+                    isPanning = false;
+                    canvasWrapper.style.cursor = spacePressed ? 'grab' : '';
+                }}
+            }});
+            
+            // Touch pinch zoom
+            let lastTouchDistance = 0;
+            let touchStartScale = 1;
+            
+            canvasWrapper.addEventListener('touchstart', (e) => {{
+                if (e.touches.length === 2) {{
+                    e.preventDefault();
+                    const touch1 = e.touches[0];
+                    const touch2 = e.touches[1];
+                    lastTouchDistance = Math.hypot(
+                        touch2.clientX - touch1.clientX,
+                        touch2.clientY - touch1.clientY
+                    );
+                    touchStartScale = scale;
+                }}
+            }}, {{ passive: false }});
+            
+            canvasWrapper.addEventListener('touchmove', (e) => {{
+                if (e.touches.length === 2) {{
+                    e.preventDefault();
+                    const touch1 = e.touches[0];
+                    const touch2 = e.touches[1];
+                    const distance = Math.hypot(
+                        touch2.clientX - touch1.clientX,
+                        touch2.clientY - touch1.clientY
+                    );
+                    
+                    const scaleChange = distance / lastTouchDistance;
+                    scale = Math.max(0.25, Math.min(5, touchStartScale * scaleChange));
+                    updateTransform();
+                    document.getElementById('zoomDisplay').textContent = Math.round(scale * 100) + '%';
+                }}
+            }}, {{ passive: false }});
             
             // Load background
             const img = new Image();
@@ -435,6 +627,7 @@ def create_drawing_canvas(background_img, width, height, tool_color, tool_size, 
                 const scaleY = drawingCanvas.height / rect.height;
                 
                 if (e.touches) {{
+                    if (e.touches.length !== 1) return null; // Ignore multi-touch for drawing
                     return {{
                         x: (e.touches[0].clientX - rect.left) * scaleX,
                         y: (e.touches[0].clientY - rect.top) * scaleY
@@ -447,9 +640,11 @@ def create_drawing_canvas(background_img, width, height, tool_color, tool_size, 
             }}
             
             function startDrawing(e) {{
+                if (isPanning || spacePressed) return;
                 e.preventDefault();
                 isDrawing = true;
                 const coords = getCoordinates(e);
+                if (!coords) return;
                 lastX = startX = coords.x;
                 lastY = startY = coords.y;
                 
@@ -466,10 +661,11 @@ def create_drawing_canvas(background_img, width, height, tool_color, tool_size, 
             }}
             
             function draw(e) {{
-                if (!isDrawing) return;
+                if (!isDrawing || isPanning) return;
                 e.preventDefault();
                 
                 const coords = getCoordinates(e);
+                if (!coords) return;
                 const x = coords.x;
                 const y = coords.y;
                 
@@ -494,6 +690,7 @@ def create_drawing_canvas(background_img, width, height, tool_color, tool_size, 
                 
                 if (currentTool === 'line' || currentTool === 'rectangle' || currentTool === 'circle') {{
                     const coords = getCoordinates(e);
+                    if (!coords) return;
                     const x = coords.x;
                     const y = coords.y;
                     
@@ -521,6 +718,7 @@ def create_drawing_canvas(background_img, width, height, tool_color, tool_size, 
             }}
             
             function handleTouch(e) {{
+                if (e.touches.length !== 1) return; // Only handle single touch for drawing
                 e.preventDefault();
                 if (e.type === 'touchstart') {{
                     startDrawing(e);
