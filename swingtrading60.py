@@ -376,9 +376,9 @@ def calculate_sl_target(data, signal, sl_type, target_type, config):
         
         offset = config['target_points']
         target_price = entry_price + offset if signal == 1 else entry_price - offset
-        if target_price >= entry_price+offset:
+        if target_price >= entry_price+offset :
             target_price = max(target_price, target_price + offset)
-        else target_price <= entry_price-offset:
+        else:
             target_price = min(target_price, target_price - offset)
         
         
