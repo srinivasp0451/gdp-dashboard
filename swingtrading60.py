@@ -373,10 +373,14 @@ def calculate_sl_target(data, signal, sl_type, target_type, config):
         target_price = 0
     
     elif target_type == "Trailing Target (Points)":
+        
         offset = config['target_points']
         # target_price = entry_price + offset if signal == 1 else entry_price - offset
         # target_price = data['Close'].iloc[-1] - offset if signal == 1 else data['Close'].iloc[-1] + offset
-        target_price = (data['Close'].cummax().iloc[-1] + offset if signal == 1 else data['Close'].cummin().iloc[-1] - offset)
+        #target_price = (data['Close'].cummax().iloc[-1] + offset if signal == 1 else data['Close'].cummin().iloc[-1] - offset)
+        prev_high = entry_price
+        prev_low = entry_price
+        target_price = (max(prev_high, data['High'].iloc[-1]) - offset if signal == 1 else min(prev_low, data['Low'].iloc[-1]) + offset)
 
     
     elif "Trailing Target + Signal Based" in target_type:
