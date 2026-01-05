@@ -22,6 +22,15 @@ ASSET_MAPPING = {
     "Silver": "SI=F"
 }
 
+# Minimum initial target distances for different assets
+ASSET_MIN_TARGET = {
+    "^NSEI": 10,      # NIFTY
+    "^NSEBANK": 20,   # BANKNIFTY
+    "^BSESN": 10,     # SENSEX
+    "BTC-USD": 150,   # BTC
+    "ETH-USD": 10,    # ETH
+}
+
 TIMEFRAME_PERIODS = {
     "1m": ["1d", "5d"],
     "5m": ["1d", "1mo"],
@@ -46,6 +55,10 @@ def convert_to_ist(df):
     else:
         df.index = df.index.tz_convert('Asia/Kolkata')
     return df
+
+def get_min_target_for_asset(ticker):
+    """Get minimum initial target distance based on asset"""
+    return ASSET_MIN_TARGET.get(ticker, 15)  # Default 15 if not specified
 
 def fetch_data(ticker, interval, period):
     """Fetch data from yfinance with rate limiting"""
@@ -386,7 +399,7 @@ def calculate_stop_loss(df, idx, entry_price, signal, sl_type, sl_points,
         return entry_price + 10
 
 def calculate_target(df, idx, entry_price, signal, target_type, target_points, 
-                     atr_multiplier, risk_reward_ratio, current_target=None):
+                     atr_multiplier, risk_reward_ratio, current_target=None, min_target_distance=15):
     """Calculate target based on selected type"""
     if target_type == "Custom Points":
         if signal == 1:
@@ -396,56 +409,113 @@ def calculate_target(df, idx, entry_price, signal, target_type, target_points,
     
     elif target_type == "Trailing Target (Points)":
         current_price = df['Close'].iloc[idx]
-        ## me added this extra code
-        min_distance = 100
-        target_points = entry_price + min_distance
-        ## till here
         
+        # Initialize trailing target on first call
         if current_target is None or current_target == 0:
             if signal == 1:
-                return entry_price + target_points
+                initial_target = entry_price + min_target_distance
+                st.session_state.trailing_target_high = entry_price
+                st.session_state.trailing_profit_points = 0
+                return initial_target
             else:
-                return entry_price - target_points
+                initial_target = entry_price - min_target_distance
+                st.session_state.trailing_target_low = entry_price
+                st.session_state.trailing_profit_points = 0
+                return initial_target
         
         if signal == 1:
-            # Update highest price
+            # Calculate profit from entry
+            profit_from_entry = current_price - entry_price
+            
+            # Update highest price reached
             highest = st.session_state.get('trailing_target_high', entry_price)
             if current_price > highest:
                 st.session_state.trailing_target_high = current_price
                 highest = current_price
-            # Return highest as the trailing target (not hit until price drops back)
-            return highest
-        else:
-            # Update lowest price
+            
+            # Calculate profit points moved from initial entry
+            profit_points = highest - entry_price
+            prev_profit_points = st.session_state.get('trailing_profit_points', 0)
+            
+            # Check if we've moved target_points from last update
+            if profit_points >= prev_profit_points + target_points:
+                # Update the tracking
+                st.session_state.trailing_profit_points = profit_points
+                # New target is highest - target_points (trailing behind)
+                new_target = highest
+                return new_target
+            
+            # Return current target if threshold not met
+            return current_target
+        
+        else:  # SHORT
+            # Calculate profit from entry
+            profit_from_entry = entry_price - current_price
+            
+            # Update lowest price reached
             lowest = st.session_state.get('trailing_target_low', entry_price)
             if current_price < lowest:
                 st.session_state.trailing_target_low = current_price
                 lowest = current_price
-            # Return lowest as the trailing target (not hit until price rises back)
-            return lowest
+            
+            # Calculate profit points moved from initial entry
+            profit_points = entry_price - lowest
+            prev_profit_points = st.session_state.get('trailing_profit_points', 0)
+            
+            # Check if we've moved target_points from last update
+            if profit_points >= prev_profit_points + target_points:
+                # Update the tracking
+                st.session_state.trailing_profit_points = profit_points
+                # New target is lowest + target_points (trailing behind)
+                new_target = lowest
+                return new_target
+            
+            # Return current target if threshold not met
+            return current_target
     
     elif target_type == "Trailing Target + Signal Based":
-        # Combination of trailing and signal exit
         current_price = df['Close'].iloc[idx]
         
         if current_target is None or current_target == 0:
             if signal == 1:
-                return entry_price + target_points
+                initial_target = entry_price + min_target_distance
+                st.session_state.trailing_target_high = entry_price
+                st.session_state.trailing_profit_points = 0
+                return initial_target
             else:
-                return entry_price - target_points
+                initial_target = entry_price - min_target_distance
+                st.session_state.trailing_target_low = entry_price
+                st.session_state.trailing_profit_points = 0
+                return initial_target
         
         if signal == 1:
             highest = st.session_state.get('trailing_target_high', entry_price)
             if current_price > highest:
                 st.session_state.trailing_target_high = current_price
                 highest = current_price
-            return highest
+            
+            profit_points = highest - entry_price
+            prev_profit_points = st.session_state.get('trailing_profit_points', 0)
+            
+            if profit_points >= prev_profit_points + target_points:
+                st.session_state.trailing_profit_points = profit_points
+                return highest
+            
+            return current_target
         else:
             lowest = st.session_state.get('trailing_target_low', entry_price)
             if current_price < lowest:
                 st.session_state.trailing_target_low = current_price
                 lowest = current_price
-            return lowest
+            
+            profit_points = entry_price - lowest
+            prev_profit_points = st.session_state.get('trailing_profit_points', 0)
+            
+            if profit_points >= prev_profit_points + target_points:
+                st.session_state.trailing_profit_points = profit_points
+                return lowest
+            
+            return current_target
     
     elif target_type == "Current Candle Low/High":
         if signal == 1:
@@ -502,7 +572,7 @@ def calculate_target(df, idx, entry_price, signal, target_type, target_points,
         return entry_price - 15
 
 # ==================== LIVE TRADING FUNCTIONS ====================
-def add_trade_log(message, force=False):
+def add_trade_log(message):
     """Add timestamped log entry - only important events"""
     if 'trade_logs' not in st.session_state:
         st.session_state.trade_logs = []
@@ -606,8 +676,12 @@ def initialize_session_state():
         st.session_state.trailing_target_high = None
     if 'trailing_target_low' not in st.session_state:
         st.session_state.trailing_target_low = None
+    if 'trailing_profit_points' not in st.session_state:
+        st.session_state.trailing_profit_points = 0
     if 'last_fetch_time' not in st.session_state:
         st.session_state.last_fetch_time = None
+    if 'threshold_crossed' not in st.session_state:
+        st.session_state.threshold_crossed = False
 
 def main():
     st.set_page_config(page_title="Live Trading Dashboard", layout="wide")
@@ -640,7 +714,7 @@ def main():
         # Strategy Selection
         strategy = st.selectbox("Strategy", 
                                ["EMA Crossover", "Simple Buy", "Simple Sell",
-                                "Price >= Threshold", "Price <= Threshold"])
+                                "Price Crosses Threshold"])
         
         # Strategy Parameters
         if strategy == "EMA Crossover":
@@ -675,9 +749,14 @@ def main():
                 adx_threshold = st.number_input("ADX Threshold", 
                                                min_value=1, value=25)
         
-        elif strategy in ["Price >= Threshold", "Price <= Threshold"]:
+        elif strategy == "Price Crosses Threshold":
             threshold_price = st.number_input("Threshold Price", 
                                              min_value=0.0, value=100.0, step=0.01)
+            threshold_direction = st.selectbox("Entry Direction", 
+                                              ["LONG (Price >= Threshold)", 
+                                               "SHORT (Price >= Threshold)",
+                                               "LONG (Price <= Threshold)",
+                                               "SHORT (Price <= Threshold)"])
         
         st.divider()
         
@@ -736,7 +815,7 @@ def main():
         risk_reward_ratio = 2.0
         
         if "Points" in target_type:
-            target_points = st.number_input("Target Points", min_value=1, value=20)
+            target_points = st.number_input("Target Points", min_value=1, value=50)
         
         if target_type == "ATR-based":
             target_atr_multiplier = st.number_input("Target ATR Multiplier", 
@@ -760,6 +839,8 @@ def main():
                 st.session_state.trailing_sl_low = None
                 st.session_state.trailing_target_high = None
                 st.session_state.trailing_target_low = None
+                st.session_state.trailing_profit_points = 0
+                st.session_state.threshold_crossed = False
                 add_trade_log("Trading started")
                 st.rerun()
         
@@ -769,22 +850,27 @@ def main():
                 if st.session_state.position:
                     # Close position
                     pos = st.session_state.position
-                    exit_price = st.session_state.current_data['Close'].iloc[-1]
-                    pnl = (exit_price - pos['entry_price']) * pos['signal']
-                    
-                    trade_data = {
-                        'entry_time': pos['entry_time'],
-                        'exit_time': get_ist_time().strftime("%Y-%m-%d %H:%M:%S"),
-                        'signal': pos['signal'],
-                        'entry_price': pos['entry_price'],
-                        'exit_price': exit_price,
-                        'sl': pos['sl'],
-                        'target': pos['target'],
-                        'pnl': pnl,
-                        'exit_reason': "Manual Stop"
-                    }
-                    add_trade_to_history(trade_data)
-                    add_trade_log(f"Position closed manually. PnL: {pnl:.2f}")
+                    if st.session_state.current_data is not None:
+                        exit_price = st.session_state.current_data['Close'].iloc[-1]
+                        pnl = (exit_price - pos['entry_price']) * pos['signal']
+                        
+                        duration = get_ist_time() - pos['entry_datetime']
+                        duration_str = str(duration).split('.')[0]
+                        
+                        trade_data = {
+                            'entry_time': pos['entry_time'],
+                            'exit_time': get_ist_time().strftime("%Y-%m-%d %H:%M:%S"),
+                            'duration': duration_str,
+                            'signal': pos['signal'],
+                            'entry_price': pos['entry_price'],
+                            'exit_price': exit_price,
+                            'sl': pos['sl'],
+                            'target': pos['target'],
+                            'pnl': pnl,
+                            'exit_reason': "Manual Stop"
+                        }
+                        add_trade_to_history(trade_data)
+                        add_trade_log(f"Position closed manually. PnL: {pnl:.2f}")
                     st.session_state.position = None
                 
                 add_trade_log("Trading stopped")
@@ -815,6 +901,9 @@ def main():
                 
                 st.session_state.current_data = df
                 st.session_state.last_fetch_time = get_ist_time()
+                
+                # Get minimum target distance for this asset
+                min_target_distance = get_min_target_for_asset(ticker)
                 
                 # Calculate indicators
                 if strategy == "EMA Crossover":
@@ -911,6 +1000,9 @@ def main():
                         else:
                             st.info("📊 Current Signal: NONE")
                     
+                    elif strategy == "Price Crosses Threshold":
+                        st.info(f"Monitoring: {threshold_direction} | Threshold: {threshold_price:.2f} | Current: {current_price:.2f}")
+                    
                     st.divider()
                     
                     # Position Management
@@ -929,17 +1021,31 @@ def main():
                             signal = -1
                             add_trade_log("Simple Sell - Entering SHORT")
                         
-                        elif strategy == "Price >= Threshold":
-                            if current_price >= threshold_price:
-                                enter_trade = True
-                                signal = 1
-                                add_trade_log(f"Price crossed above threshold {threshold_price} - Entering LONG")
-                        
-                        elif strategy == "Price <= Threshold":
-                            if current_price <= threshold_price:
-                                enter_trade = True
-                                signal = -1
-                                add_trade_log(f"Price crossed below threshold {threshold_price} - Entering SHORT")
+                        elif strategy == "Price Crosses Threshold":
+                            # Check if threshold is crossed
+                            if not st.session_state.threshold_crossed:
+                                if "Price >= Threshold" in threshold_direction:
+                                    if current_price >= threshold_price:
+                                        st.session_state.threshold_crossed = True
+                                        if "LONG" in threshold_direction:
+                                            enter_trade = True
+                                            signal = 1
+                                            add_trade_log(f"Price crossed above {threshold_price} - Entering LONG")
+                                        else:
+                                            enter_trade = True
+                                            signal = -1
+                                            add_trade_log(f"Price crossed above {threshold_price} - Entering SHORT")
+                                elif "Price <= Threshold" in threshold_direction:
+                                    if current_price <= threshold_price:
+                                        st.session_state.threshold_crossed = True
+                                        if "LONG" in threshold_direction:
+                                            enter_trade = True
+                                            signal = 1
+                                            add_trade_log(f"Price crossed below {threshold_price} - Entering LONG")
+                                        else:
+                                            enter_trade = True
+                                            signal = -1
+                                            add_trade_log(f"Price crossed below {threshold_price} - Entering SHORT")
                         
                         elif strategy == "EMA Crossover":
                             signal, angle, filter_ok, candle_sz, min_candle, adx_ok, adx_val, _ = generate_ema_signal(
@@ -963,7 +1069,7 @@ def main():
                             
                             target = calculate_target(
                                 df, current_idx, entry_price, signal, target_type,
-                                target_points, target_atr_multiplier, risk_reward_ratio
+                                target_points, target_atr_multiplier, risk_reward_ratio, None, min_target_distance
                             )
                             
                             # Apply minimum distances
@@ -973,17 +1079,18 @@ def main():
                                 else:
                                     sl = max(sl, entry_price + 10)
                             
-                            if target != 0:
+                            if target != 0 and target_type not in ["Trailing Target (Points)", "Trailing Target + Signal Based"]:
                                 if signal == 1:
-                                    target = max(target, entry_price + 15)
+                                    target = max(target, entry_price + min_target_distance)
                                 else:
-                                    target = min(target, entry_price - 15)
+                                    target = min(target, entry_price - min_target_distance)
                             
                             # Initialize trailing variables
                             st.session_state.trailing_sl_high = entry_price
                             st.session_state.trailing_sl_low = entry_price
                             st.session_state.trailing_target_high = entry_price
                             st.session_state.trailing_target_low = entry_price
+                            st.session_state.trailing_profit_points = 0
                             
                             # Create position
                             st.session_state.position = {
@@ -1026,7 +1133,7 @@ def main():
                         # Update Target
                         new_target = calculate_target(
                             df, current_idx, entry_price, signal, target_type,
-                            target_points, target_atr_multiplier, risk_reward_ratio, current_target
+                            target_points, target_atr_multiplier, risk_reward_ratio, current_target, min_target_distance
                         )
                         
                         st.session_state.position['sl'] = new_sl
@@ -1056,6 +1163,11 @@ def main():
                             else:
                                 st.metric("Target", target_display)
                         
+                        # Show trailing info for trailing targets
+                        if target_type in ["Trailing Target (Points)", "Trailing Target + Signal Based"]:
+                            profit_moved = st.session_state.get('trailing_profit_points', 0)
+                            st.caption(f"Trailing: Profit moved {profit_moved:.2f} points | Next update at {profit_moved + target_points:.2f} points")
+                        
                         # Check exit conditions
                         exit_trade = False
                         exit_reason = ""
@@ -1081,12 +1193,9 @@ def main():
                                 exit_reason = "Stop Loss Hit"
                                 exit_price = new_sl
                         
-                        # Check Target hit - FIXED for trailing target
+                        # Check Target hit - for non-trailing targets only
                         if not exit_trade and new_target != 0:
-                            if target_type == "Trailing Target (Points)" or target_type == "Trailing Target + Signal Based":
-                                # For trailing target, don't exit - it keeps moving
-                                pass
-                            else:
+                            if target_type not in ["Trailing Target (Points)", "Trailing Target + Signal Based"]:
                                 # For fixed targets, check if hit
                                 if signal == 1 and current_price >= new_target:
                                     exit_trade = True
@@ -1116,12 +1225,14 @@ def main():
                             add_trade_to_history(trade_data)
                             add_trade_log(f"Position closed: {exit_reason} | PnL: {pnl:.2f}")
                             
-                            # Reset position
+                            # Reset position and threshold
                             st.session_state.position = None
                             st.session_state.trailing_sl_high = None
                             st.session_state.trailing_sl_low = None
                             st.session_state.trailing_target_high = None
                             st.session_state.trailing_target_low = None
+                            st.session_state.trailing_profit_points = 0
+                            st.session_state.threshold_crossed = False
                             
                             pnl_color = "🟢" if pnl > 0 else "🔴"
                             st.success(f"{pnl_color} Position Closed: {exit_reason} | PnL: {pnl:.2f}")
@@ -1166,8 +1277,8 @@ def main():
     with tab2:
         st.header("📜 Trade History")
         
-        if not st.session_state.trade_history:
-            st.info("No completed trades yet. Trade history will appear here once trades are closed.")
+        if len(st.session_state.trade_history) == 0:
+            st.info("📋 No completed trades yet. Trade history will appear here once trades are closed.")
         else:
             # Calculate statistics
             total_trades = len(st.session_state.trade_history)
@@ -1220,10 +1331,11 @@ def main():
     with tab3:
         st.header("📝 Trade Logs")
         
-        if not st.session_state.trade_logs:
-            st.info("No logs yet. Important trading events will be logged here.")
+        if len(st.session_state.trade_logs) == 0:
+            st.info("📝 No logs yet. Important trading events will be logged here.")
         else:
             st.caption(f"Showing last {len(st.session_state.trade_logs)} logs (max 50 kept in memory)")
+            st.divider()
             # Display logs in reverse order (newest first)
             for log in reversed(st.session_state.trade_logs):
                 st.text(log)
