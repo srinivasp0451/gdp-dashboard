@@ -376,6 +376,11 @@ def calculate_sl_target(data, signal, sl_type, target_type, config):
         
         offset = config['target_points']
         target_price = entry_price + offset if signal == 1 else entry_price - offset
+        if target_price >= entry_price+offset:
+            target_price = max(target_price, target_price + offset)
+        else target_price <= entry_price-offset:
+            target_price = min(target_price, target_price - offset)
+        
         
     
     elif "Trailing Target + Signal Based" in target_type:
@@ -384,13 +389,13 @@ def calculate_sl_target(data, signal, sl_type, target_type, config):
     
     # Ensure minimum target distance
     if target_price != 0:
-        min_target_distance = 50
+        min_target_distance = 20
         if signal == 1:
             target_price = max(target_price, target_price + min_target_distance)
-            target_price = target_price+min_target_distance
+            #target_price = target_price+min_target_distance
         else:
             target_price = min(target_price, target_price - min_target_distance)
-            target_price = target_price-min_target_distance
+            #target_price = target_price-min_target_distance
     
     return entry_price, sl_price, target_price
 
