@@ -396,6 +396,10 @@ def calculate_target(df, idx, entry_price, signal, target_type, target_points,
     
     elif target_type == "Trailing Target (Points)":
         current_price = df['Close'].iloc[idx]
+        ## me added this extra code
+        min_distance = 100
+        target_points = entry_price + min_distance
+        ## till here
         
         if current_target is None or current_target == 0:
             if signal == 1:
