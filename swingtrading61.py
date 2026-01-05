@@ -405,18 +405,20 @@ def calculate_target(df, idx, entry_price, signal, target_type, target_points,
         
         if signal == 1:
             # Update highest price
-            highest = st.session_state.get('trailing_target_high', current_price)
+            highest = st.session_state.get('trailing_target_high', entry_price)
             if current_price > highest:
                 st.session_state.trailing_target_high = current_price
-                return current_price
-            return max(current_target, highest)
+                highest = current_price
+            # Return highest as the trailing target (not hit until price drops back)
+            return highest
         else:
             # Update lowest price
-            lowest = st.session_state.get('trailing_target_low', current_price)
+            lowest = st.session_state.get('trailing_target_low', entry_price)
             if current_price < lowest:
                 st.session_state.trailing_target_low = current_price
-                return current_price
-            return min(current_target, lowest)
+                lowest = current_price
+            # Return lowest as the trailing target (not hit until price rises back)
+            return lowest
     
     elif target_type == "Trailing Target + Signal Based":
         # Combination of trailing and signal exit
@@ -429,17 +431,17 @@ def calculate_target(df, idx, entry_price, signal, target_type, target_points,
                 return entry_price - target_points
         
         if signal == 1:
-            highest = st.session_state.get('trailing_target_high', current_price)
+            highest = st.session_state.get('trailing_target_high', entry_price)
             if current_price > highest:
                 st.session_state.trailing_target_high = current_price
-                return current_price
-            return max(current_target, highest)
+                highest = current_price
+            return highest
         else:
-            lowest = st.session_state.get('trailing_target_low', current_price)
+            lowest = st.session_state.get('trailing_target_low', entry_price)
             if current_price < lowest:
                 st.session_state.trailing_target_low = current_price
-                return current_price
-            return min(current_target, lowest)
+                lowest = current_price
+            return lowest
     
     elif target_type == "Current Candle Low/High":
         if signal == 1:
@@ -496,10 +498,14 @@ def calculate_target(df, idx, entry_price, signal, target_type, target_points,
         return entry_price - 15
 
 # ==================== LIVE TRADING FUNCTIONS ====================
-def add_trade_log(message):
-    """Add timestamped log entry"""
+def add_trade_log(message, force=False):
+    """Add timestamped log entry - only important events"""
     if 'trade_logs' not in st.session_state:
         st.session_state.trade_logs = []
+    
+    # Keep only last 50 logs to prevent memory overflow
+    if len(st.session_state.trade_logs) > 50:
+        st.session_state.trade_logs = st.session_state.trade_logs[-50:]
     
     timestamp = get_ist_time().strftime("%Y-%m-%d %H:%M:%S")
     st.session_state.trade_logs.append(f"[{timestamp}] {message}")
@@ -940,7 +946,7 @@ def main():
                             if signal != 0:
                                 enter_trade = True
                                 signal_type = "BUY" if signal == 1 else "SELL"
-                                add_trade_log(f"EMA Crossover - {signal_type} signal generated")
+                                add_trade_log(f"EMA Crossover - {signal_type} signal")
                         
                         if enter_trade and signal != 0:
                             # Calculate SL and Target
@@ -980,6 +986,7 @@ def main():
                                 'signal': signal,
                                 'entry_price': entry_price,
                                 'entry_time': get_ist_time().strftime("%Y-%m-%d %H:%M:%S"),
+                                'entry_datetime': get_ist_time(),
                                 'sl': sl,
                                 'target': target,
                                 'entry_idx': current_idx
@@ -1000,6 +1007,11 @@ def main():
                         entry_price = pos['entry_price']
                         current_sl = pos['sl']
                         current_target = pos['target']
+                        entry_datetime = pos['entry_datetime']
+                        
+                        # Calculate trade duration
+                        duration = get_ist_time() - entry_datetime
+                        duration_str = str(duration).split('.')[0]  # Remove microseconds
                         
                         # Update SL
                         new_sl = calculate_stop_loss(
@@ -1016,7 +1028,9 @@ def main():
                         st.session_state.position['sl'] = new_sl
                         st.session_state.position['target'] = new_target
                         
-                        # Display position info
+                        # Display position info with entry time and duration
+                        st.info(f"📍 **Entry Time:** {pos['entry_time']} | **Duration:** {duration_str}")
+                        
                         pos_col1, pos_col2, pos_col3 = st.columns(3)
                         
                         with pos_col1:
@@ -1063,16 +1077,21 @@ def main():
                                 exit_reason = "Stop Loss Hit"
                                 exit_price = new_sl
                         
-                        # Check Target hit
+                        # Check Target hit - FIXED for trailing target
                         if not exit_trade and new_target != 0:
-                            if signal == 1 and current_price >= new_target:
-                                exit_trade = True
-                                exit_reason = "Target Hit"
-                                exit_price = new_target
-                            elif signal == -1 and current_price <= new_target:
-                                exit_trade = True
-                                exit_reason = "Target Hit"
-                                exit_price = new_target
+                            if target_type == "Trailing Target (Points)" or target_type == "Trailing Target + Signal Based":
+                                # For trailing target, don't exit - it keeps moving
+                                pass
+                            else:
+                                # For fixed targets, check if hit
+                                if signal == 1 and current_price >= new_target:
+                                    exit_trade = True
+                                    exit_reason = "Target Hit"
+                                    exit_price = new_target
+                                elif signal == -1 and current_price <= new_target:
+                                    exit_trade = True
+                                    exit_reason = "Target Hit"
+                                    exit_price = new_target
                         
                         if exit_trade:
                             pnl = (exit_price - entry_price) * signal
@@ -1080,6 +1099,7 @@ def main():
                             trade_data = {
                                 'entry_time': pos['entry_time'],
                                 'exit_time': get_ist_time().strftime("%Y-%m-%d %H:%M:%S"),
+                                'duration': duration_str,
                                 'signal': signal,
                                 'entry_price': entry_price,
                                 'exit_price': exit_price,
@@ -1143,7 +1163,7 @@ def main():
         st.header("📜 Trade History")
         
         if not st.session_state.trade_history:
-            st.info("No trades yet. Start trading to see history.")
+            st.info("No completed trades yet. Trade history will appear here once trades are closed.")
         else:
             # Calculate statistics
             total_trades = len(st.session_state.trade_history)
@@ -1169,7 +1189,8 @@ def main():
             
             # Display trades
             for idx, trade in enumerate(reversed(st.session_state.trade_history), 1):
-                with st.expander(f"Trade #{total_trades - idx + 1} - {trade['exit_reason']} - P&L: {trade['pnl']:.2f}"):
+                pnl_emoji = "🟢" if trade['pnl'] > 0 else "🔴"
+                with st.expander(f"Trade #{total_trades - idx + 1} - {pnl_emoji} {trade['exit_reason']} - P&L: {trade['pnl']:.2f}"):
                     trade_type = "LONG 📈" if trade['signal'] == 1 else "SHORT 📉"
                     
                     col1, col2 = st.columns(2)
@@ -1181,9 +1202,10 @@ def main():
                         st.write(f"**Stop Loss:** {sl_display}")
                     
                     with col2:
-                        pnl_emoji = "🟢" if trade['pnl'] > 0 else "🔴"
-                        st.write(f"**P&L:** {pnl_emoji} {trade['pnl']:.2f}")
+                        pnl_display_emoji = "🟢" if trade['pnl'] > 0 else "🔴"
+                        st.write(f"**P&L:** {pnl_display_emoji} {trade['pnl']:.2f}")
                         st.write(f"**Exit Time:** {trade['exit_time']}")
+                        st.write(f"**Duration:** {trade['duration']}")
                         st.write(f"**Exit Price:** {trade['exit_price']:.2f}")
                         target_display = f"{trade['target']:.2f}" if trade['target'] != 0 else "Signal Based"
                         st.write(f"**Target:** {target_display}")
@@ -1195,8 +1217,9 @@ def main():
         st.header("📝 Trade Logs")
         
         if not st.session_state.trade_logs:
-            st.info("No logs yet. Start trading to see logs.")
+            st.info("No logs yet. Important trading events will be logged here.")
         else:
+            st.caption(f"Showing last {len(st.session_state.trade_logs)} logs (max 50 kept in memory)")
             # Display logs in reverse order (newest first)
             for log in reversed(st.session_state.trade_logs):
                 st.text(log)
