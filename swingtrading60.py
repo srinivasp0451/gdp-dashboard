@@ -389,7 +389,7 @@ def calculate_sl_target(data, signal, sl_type, target_type, config):
     
     # Ensure minimum target distance
     if target_price != 0:
-        min_target_distance = 15
+        min_target_distance = 200
         if signal == 1:
             target_price = max(target_price, entry_price + min_target_distance)
         else:
