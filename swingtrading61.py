@@ -866,6 +866,83 @@ def main():
     
     # Main Content Area - Tabs
     tab1, tab2, tab3 = st.tabs(["📊 Live Dashboard", "📜 Trade History", "📝 Trade Logs"])
+
+    # ==================== TAB 2: TRADE HISTORY ====================
+    with tab2:
+        st.header("📜 Trade History")
+        
+        # Always check current state
+        trade_history = st.session_state.get('trade_history', [])
+        
+        if not trade_history or len(trade_history) == 0:
+            st.info("📋 No completed trades yet. Trade history will appear here once trades are closed.")
+            st.write("")
+            st.write("**Note:** Trades will appear here after they are closed (either by hitting SL/Target or manual stop).")
+        else:
+            # Calculate statistics
+            total_trades = len(trade_history)
+            winning_trades = sum(1 for t in trade_history if t.get('pnl', 0) > 0)
+            losing_trades = total_trades - winning_trades
+            accuracy = (winning_trades / total_trades * 100) if total_trades > 0 else 0
+            total_pnl = sum(t.get('pnl', 0) for t in trade_history)
+            
+            # Display metrics
+            metric_col1, metric_col2, metric_col3, metric_col4 = st.columns(4)
+            
+            with metric_col1:
+                st.metric("Total Trades", total_trades)
+            with metric_col2:
+                st.metric("Winning Trades", f"{winning_trades} ({accuracy:.1f}%)")
+            with metric_col3:
+                st.metric("Losing Trades", losing_trades)
+            with metric_col4:
+                pnl_color = "🟢" if total_pnl > 0 else "🔴"
+                st.metric("Total P&L", f"{pnl_color} {total_pnl:.2f}")
+            
+            st.divider()
+            
+            # Display trades
+            for idx, trade in enumerate(reversed(trade_history), 1):
+                pnl_emoji = "🟢" if trade.get('pnl', 0) > 0 else "🔴"
+                with st.expander(f"Trade #{total_trades - idx + 1} - {pnl_emoji} {trade.get('exit_reason', 'N/A')} - P&L: {trade.get('pnl', 0):.2f}"):
+                    trade_type = "LONG 📈" if trade.get('signal', 0) == 1 else "SHORT 📉"
+                    
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        st.write(f"**Type:** {trade_type}")
+                        st.write(f"**Entry Time:** {trade.get('entry_time', 'N/A')}")
+                        st.write(f"**Entry Price:** {trade.get('entry_price', 0):.2f}")
+                        sl_display = f"{trade.get('sl', 0):.2f}" if trade.get('sl', 0) != 0 else "Signal Based"
+                        st.write(f"**Stop Loss:** {sl_display}")
+                    
+                    with col2:
+                        pnl_display_emoji = "🟢" if trade.get('pnl', 0) > 0 else "🔴"
+                        st.write(f"**P&L:** {pnl_display_emoji} {trade.get('pnl', 0):.2f}")
+                        st.write(f"**Exit Time:** {trade.get('exit_time', 'N/A')}")
+                        st.write(f"**Duration:** {trade.get('duration', 'N/A')}")
+                        st.write(f"**Exit Price:** {trade.get('exit_price', 0):.2f}")
+                        target_display = f"{trade.get('target', 0):.2f}" if trade.get('target', 0) != 0 else "Signal Based"
+                        st.write(f"**Target:** {target_display}")
+                    
+                    st.write(f"**Exit Reason:** {trade.get('exit_reason', 'N/A')}")
+    
+    # ==================== TAB 3: TRADE LOGS ====================
+    with tab3:
+        st.header("📝 Trade Logs")
+        
+        # Always check current state
+        trade_logs = st.session_state.get('trade_logs', [])
+        
+        if not trade_logs or len(trade_logs) == 0:
+            st.info("📝 No logs yet. Important trading events will be logged here.")
+            st.write("")
+            st.write("**Logs include:** Trading start/stop, position entries/exits, and important events.")
+        else:
+            st.caption(f"Showing last {len(trade_logs)} logs (max 50 kept in memory)")
+            st.divider()
+            # Display logs in reverse order (newest first)
+            for log in reversed(trade_logs):
+                st.text(log)
     
     # ==================== TAB 1: LIVE DASHBOARD ====================
     with tab1:
@@ -1318,82 +1395,7 @@ def main():
                 add_trade_log(f"Error: {e}")
                 time.sleep(2)
     
-    # ==================== TAB 2: TRADE HISTORY ====================
-    with tab2:
-        st.header("📜 Trade History")
-        
-        # Always check current state
-        trade_history = st.session_state.get('trade_history', [])
-        
-        if not trade_history or len(trade_history) == 0:
-            st.info("📋 No completed trades yet. Trade history will appear here once trades are closed.")
-            st.write("")
-            st.write("**Note:** Trades will appear here after they are closed (either by hitting SL/Target or manual stop).")
-        else:
-            # Calculate statistics
-            total_trades = len(trade_history)
-            winning_trades = sum(1 for t in trade_history if t.get('pnl', 0) > 0)
-            losing_trades = total_trades - winning_trades
-            accuracy = (winning_trades / total_trades * 100) if total_trades > 0 else 0
-            total_pnl = sum(t.get('pnl', 0) for t in trade_history)
-            
-            # Display metrics
-            metric_col1, metric_col2, metric_col3, metric_col4 = st.columns(4)
-            
-            with metric_col1:
-                st.metric("Total Trades", total_trades)
-            with metric_col2:
-                st.metric("Winning Trades", f"{winning_trades} ({accuracy:.1f}%)")
-            with metric_col3:
-                st.metric("Losing Trades", losing_trades)
-            with metric_col4:
-                pnl_color = "🟢" if total_pnl > 0 else "🔴"
-                st.metric("Total P&L", f"{pnl_color} {total_pnl:.2f}")
-            
-            st.divider()
-            
-            # Display trades
-            for idx, trade in enumerate(reversed(trade_history), 1):
-                pnl_emoji = "🟢" if trade.get('pnl', 0) > 0 else "🔴"
-                with st.expander(f"Trade #{total_trades - idx + 1} - {pnl_emoji} {trade.get('exit_reason', 'N/A')} - P&L: {trade.get('pnl', 0):.2f}"):
-                    trade_type = "LONG 📈" if trade.get('signal', 0) == 1 else "SHORT 📉"
-                    
-                    col1, col2 = st.columns(2)
-                    with col1:
-                        st.write(f"**Type:** {trade_type}")
-                        st.write(f"**Entry Time:** {trade.get('entry_time', 'N/A')}")
-                        st.write(f"**Entry Price:** {trade.get('entry_price', 0):.2f}")
-                        sl_display = f"{trade.get('sl', 0):.2f}" if trade.get('sl', 0) != 0 else "Signal Based"
-                        st.write(f"**Stop Loss:** {sl_display}")
-                    
-                    with col2:
-                        pnl_display_emoji = "🟢" if trade.get('pnl', 0) > 0 else "🔴"
-                        st.write(f"**P&L:** {pnl_display_emoji} {trade.get('pnl', 0):.2f}")
-                        st.write(f"**Exit Time:** {trade.get('exit_time', 'N/A')}")
-                        st.write(f"**Duration:** {trade.get('duration', 'N/A')}")
-                        st.write(f"**Exit Price:** {trade.get('exit_price', 0):.2f}")
-                        target_display = f"{trade.get('target', 0):.2f}" if trade.get('target', 0) != 0 else "Signal Based"
-                        st.write(f"**Target:** {target_display}")
-                    
-                    st.write(f"**Exit Reason:** {trade.get('exit_reason', 'N/A')}")
     
-    # ==================== TAB 3: TRADE LOGS ====================
-    with tab3:
-        st.header("📝 Trade Logs")
-        
-        # Always check current state
-        trade_logs = st.session_state.get('trade_logs', [])
-        
-        if not trade_logs or len(trade_logs) == 0:
-            st.info("📝 No logs yet. Important trading events will be logged here.")
-            st.write("")
-            st.write("**Logs include:** Trading start/stop, position entries/exits, and important events.")
-        else:
-            st.caption(f"Showing last {len(trade_logs)} logs (max 50 kept in memory)")
-            st.divider()
-            # Display logs in reverse order (newest first)
-            for log in reversed(trade_logs):
-                st.text(log)
 
 if __name__ == "__main__":
     main()
