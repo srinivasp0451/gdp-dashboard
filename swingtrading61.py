@@ -574,22 +574,30 @@ def calculate_target(df, idx, entry_price, signal, target_type, target_points,
 # ==================== LIVE TRADING FUNCTIONS ====================
 def add_trade_log(message):
     """Add timestamped log entry - only important events"""
+    # Initialize if not exists
     if 'trade_logs' not in st.session_state:
-        st.session_state.trade_logs = []
+        st.session_state['trade_logs'] = []
     
     # Keep only last 50 logs to prevent memory overflow
-    if len(st.session_state.trade_logs) > 50:
-        st.session_state.trade_logs = st.session_state.trade_logs[-50:]
+    if len(st.session_state['trade_logs']) > 50:
+        st.session_state['trade_logs'] = st.session_state['trade_logs'][-50:]
     
     timestamp = get_ist_time().strftime("%Y-%m-%d %H:%M:%S")
-    st.session_state.trade_logs.append(f"[{timestamp}] {message}")
+    st.session_state['trade_logs'].append(f"[{timestamp}] {message}")
+    
+    # Force update
+    st.session_state['trade_logs'] = st.session_state['trade_logs']
 
 def add_trade_to_history(trade_data):
     """Add completed trade to history"""
+    # Initialize if not exists
     if 'trade_history' not in st.session_state:
-        st.session_state.trade_history = []
+        st.session_state['trade_history'] = []
     
-    st.session_state.trade_history.append(trade_data)
+    st.session_state['trade_history'].append(trade_data)
+    
+    # Force update
+    st.session_state['trade_history'] = st.session_state['trade_history']
 
 def create_live_chart(df, position=None):
     """Create live candlestick chart with indicators"""
@@ -659,29 +667,29 @@ def create_live_chart(df, position=None):
 def initialize_session_state():
     """Initialize session state variables"""
     if 'trading_active' not in st.session_state:
-        st.session_state.trading_active = False
+        st.session_state['trading_active'] = False
     if 'current_data' not in st.session_state:
-        st.session_state.current_data = None
+        st.session_state['current_data'] = None
     if 'position' not in st.session_state:
-        st.session_state.position = None
+        st.session_state['position'] = None
     if 'trade_history' not in st.session_state:
-        st.session_state.trade_history = []
+        st.session_state['trade_history'] = []
     if 'trade_logs' not in st.session_state:
-        st.session_state.trade_logs = []
+        st.session_state['trade_logs'] = []
     if 'trailing_sl_high' not in st.session_state:
-        st.session_state.trailing_sl_high = None
+        st.session_state['trailing_sl_high'] = None
     if 'trailing_sl_low' not in st.session_state:
-        st.session_state.trailing_sl_low = None
+        st.session_state['trailing_sl_low'] = None
     if 'trailing_target_high' not in st.session_state:
-        st.session_state.trailing_target_high = None
+        st.session_state['trailing_target_high'] = None
     if 'trailing_target_low' not in st.session_state:
-        st.session_state.trailing_target_low = None
+        st.session_state['trailing_target_low'] = None
     if 'trailing_profit_points' not in st.session_state:
-        st.session_state.trailing_profit_points = 0
+        st.session_state['trailing_profit_points'] = 0
     if 'last_fetch_time' not in st.session_state:
-        st.session_state.last_fetch_time = None
+        st.session_state['last_fetch_time'] = None
     if 'threshold_crossed' not in st.session_state:
-        st.session_state.threshold_crossed = False
+        st.session_state['threshold_crossed'] = False
 
 def main():
     st.set_page_config(page_title="Live Trading Dashboard", layout="wide")
