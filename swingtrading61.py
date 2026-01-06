@@ -574,30 +574,54 @@ def calculate_target(df, idx, entry_price, signal, target_type, target_points,
 # ==================== LIVE TRADING FUNCTIONS ====================
 def add_trade_log(message):
     """Add timestamped log entry - only important events"""
+    print(f"\n=== ADD_TRADE_LOG CALLED ===")
+    print(f"Message: {message}")
+    
     # Initialize if not exists
     if 'trade_logs' not in st.session_state:
         st.session_state['trade_logs'] = []
+        print("Initialized trade_logs in session_state")
+    
+    print(f"Current trade_logs length BEFORE: {len(st.session_state['trade_logs'])}")
     
     # Keep only last 50 logs to prevent memory overflow
     if len(st.session_state['trade_logs']) > 50:
         st.session_state['trade_logs'] = st.session_state['trade_logs'][-50:]
+        print("Trimmed logs to last 50")
     
     timestamp = get_ist_time().strftime("%Y-%m-%d %H:%M:%S")
-    st.session_state['trade_logs'].append(f"[{timestamp}] {message}")
+    log_entry = f"[{timestamp}] {message}"
+    st.session_state['trade_logs'].append(log_entry)
+    print(f"Added log: {log_entry}")
     
     # Force update
     st.session_state['trade_logs'] = st.session_state['trade_logs']
+    
+    print(f"Current trade_logs length AFTER: {len(st.session_state['trade_logs'])}")
+    print(f"Last 3 logs: {st.session_state['trade_logs'][-3:]}")
+    print("=== ADD_TRADE_LOG COMPLETED ===\n")
 
 def add_trade_to_history(trade_data):
     """Add completed trade to history"""
+    print(f"\n=== ADD_TRADE_TO_HISTORY CALLED ===")
+    print(f"Trade data: {trade_data}")
+    
     # Initialize if not exists
     if 'trade_history' not in st.session_state:
         st.session_state['trade_history'] = []
+        print("Initialized trade_history in session_state")
+    
+    print(f"Current trade_history length BEFORE: {len(st.session_state['trade_history'])}")
     
     st.session_state['trade_history'].append(trade_data)
+    print(f"Added trade to history")
     
     # Force update
     st.session_state['trade_history'] = st.session_state['trade_history']
+    
+    print(f"Current trade_history length AFTER: {len(st.session_state['trade_history'])}")
+    print(f"All trades: {[t.get('exit_reason', 'N/A') for t in st.session_state['trade_history']]}")
+    print("=== ADD_TRADE_TO_HISTORY COMPLETED ===\n")
 
 def create_live_chart(df, position=None):
     """Create live candlestick chart with indicators"""
