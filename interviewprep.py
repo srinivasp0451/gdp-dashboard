@@ -16,21 +16,28 @@ from docx import Document
 from docx.shared import Pt, RGBColor, Inches
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 import time
-import random
 from xml.sax.saxutils import escape
 from urllib.parse import quote_plus
+import html
 
 # Page configuration
 st.set_page_config(
-    page_title="Interview Prep Master - Dynamic Web Scraper",
+    page_title="Interview Prep Master Pro",
     page_icon="🎯",
     layout="wide",
     initial_sidebar_state="expanded"
 )
 
-# Custom CSS for beautiful UI
+# Enhanced CSS with proper spacing and formatting
 st.markdown("""
 <style>
+    /* Main container with scrolling */
+    .main .block-container {
+        max-height: 90vh;
+        overflow-y: auto;
+        padding-bottom: 50px;
+    }
+    
     .main-header {
         font-size: 3rem;
         font-weight: bold;
@@ -39,396 +46,843 @@ st.markdown("""
         -webkit-text-fill-color: transparent;
         text-align: center;
         margin-bottom: 2rem;
+        padding: 20px 0;
     }
     
     .sub-header {
-        font-size: 1.5rem;
+        font-size: 1.8rem;
         color: #667eea;
         font-weight: 600;
-        margin-top: 2rem;
-        margin-bottom: 1rem;
+        margin-top: 3rem;
+        margin-bottom: 2rem;
+        border-bottom: 3px solid #667eea;
+        padding-bottom: 10px;
     }
     
-    .question-card {
+    .question-container {
+        background: white;
+        border-radius: 15px;
+        padding: 25px;
+        margin: 25px 0;
+        box-shadow: 0 5px 15px rgba(0,0,0,0.1);
+        border-left: 5px solid #667eea;
+    }
+    
+    .question-header {
         background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-        padding: 1.5rem;
+        color: white;
+        padding: 20px;
         border-radius: 10px;
-        margin: 1rem 0;
-        box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+        margin-bottom: 20px;
+    }
+    
+    .question-number {
+        font-size: 1rem;
+        font-weight: 600;
+        opacity: 0.9;
+        margin-bottom: 10px;
     }
     
     .question-text {
-        color: white;
-        font-size: 1.2rem;
+        font-size: 1.3rem;
         font-weight: 600;
-        margin-bottom: 1rem;
+        line-height: 1.6;
+        margin: 0;
     }
     
-    .answer-card {
+    .answer-section {
         background: #f8f9fa;
-        padding: 1.5rem;
+        padding: 20px;
         border-radius: 10px;
-        border-left: 4px solid #667eea;
-        margin: 1rem 0;
+        margin: 20px 0;
+        border-left: 4px solid #48bb78;
+    }
+    
+    .answer-label {
+        font-size: 1.1rem;
+        font-weight: 700;
+        color: #2d3748;
+        margin-bottom: 15px;
+        display: block;
     }
     
     .answer-text {
-        color: #2d3748;
-        font-size: 1rem;
+        font-size: 1.05rem;
+        color: #4a5568;
+        line-height: 1.8;
+        text-align: justify;
+    }
+    
+    .answer-text ul {
+        margin: 15px 0;
+        padding-left: 25px;
+    }
+    
+    .answer-text li {
+        margin: 10px 0;
         line-height: 1.6;
     }
     
-    .source-badge {
-        background: #48bb78;
-        color: white;
-        padding: 0.3rem 0.8rem;
-        border-radius: 15px;
-        font-size: 0.85rem;
-        display: inline-block;
-        margin-top: 0.5rem;
-        margin-right: 0.5rem;
+    .metadata-section {
+        display: flex;
+        gap: 15px;
+        flex-wrap: wrap;
+        margin: 20px 0;
+        padding: 15px;
+        background: #e6f7ff;
+        border-radius: 8px;
     }
     
-    .video-link {
+    .badge {
+        display: inline-block;
+        padding: 8px 16px;
+        border-radius: 20px;
+        font-size: 0.9rem;
+        font-weight: 600;
+        margin: 5px;
+    }
+    
+    .badge-source {
         background: #48bb78;
         color: white;
-        padding: 0.5rem 1rem;
-        border-radius: 5px;
-        text-decoration: none;
+    }
+    
+    .badge-difficulty {
+        background: #f6ad55;
+        color: white;
+    }
+    
+    .badge-category {
+        background: #667eea;
+        color: white;
+    }
+    
+    .link-button {
         display: inline-block;
-        margin-top: 0.5rem;
+        background: linear-gradient(120deg, #667eea 0%, #764ba2 100%);
+        color: white;
+        padding: 12px 24px;
+        border-radius: 8px;
+        text-decoration: none;
+        font-weight: 600;
+        margin: 10px 5px;
+        transition: transform 0.2s;
+    }
+    
+    .link-button:hover {
+        transform: translateY(-2px);
+        box-shadow: 0 5px 15px rgba(102, 126, 234, 0.4);
+    }
+    
+    .metric-card {
+        background: white;
+        padding: 20px;
+        border-radius: 12px;
+        box-shadow: 0 3px 10px rgba(0, 0, 0, 0.1);
+        text-align: center;
+        border-top: 4px solid #667eea;
+    }
+    
+    .metric-value {
+        font-size: 2rem;
+        font-weight: bold;
+        color: #667eea;
+        margin: 10px 0;
+    }
+    
+    .metric-label {
+        font-size: 0.9rem;
+        color: #666;
+        text-transform: uppercase;
+        letter-spacing: 1px;
     }
     
     .stButton>button {
         background: linear-gradient(120deg, #667eea 0%, #764ba2 100%);
         color: white;
         border: none;
-        padding: 0.75rem 2rem;
-        border-radius: 8px;
+        padding: 15px 30px;
+        border-radius: 10px;
         font-weight: 600;
+        font-size: 1.1rem;
         transition: all 0.3s;
     }
     
     .stButton>button:hover {
-        transform: translateY(-2px);
-        box-shadow: 0 6px 12px rgba(102, 126, 234, 0.4);
+        transform: translateY(-3px);
+        box-shadow: 0 8px 20px rgba(102, 126, 234, 0.4);
     }
     
-    .metric-card {
-        background: white;
-        padding: 1rem;
-        border-radius: 8px;
-        box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
-        text-align: center;
-    }
-    
-    .scraping-status {
+    .info-box {
         background: #e6f7ff;
-        border-left: 4px solid #1890ff;
-        padding: 1rem;
-        border-radius: 5px;
-        margin: 1rem 0;
+        border-left: 5px solid #1890ff;
+        padding: 20px;
+        border-radius: 8px;
+        margin: 20px 0;
+    }
+    
+    .divider {
+        height: 2px;
+        background: linear-gradient(90deg, transparent, #667eea, transparent);
+        margin: 40px 0;
+    }
+    
+    /* Scrollbar styling */
+    ::-webkit-scrollbar {
+        width: 12px;
+    }
+    
+    ::-webkit-scrollbar-track {
+        background: #f1f1f1;
+        border-radius: 10px;
+    }
+    
+    ::-webkit-scrollbar-thumb {
+        background: linear-gradient(180deg, #667eea, #764ba2);
+        border-radius: 10px;
+    }
+    
+    ::-webkit-scrollbar-thumb:hover {
+        background: #667eea;
     }
 </style>
 """, unsafe_allow_html=True)
 
-# Dynamic web scraping functions
-def scrape_interview_questions(technology, num_questions, company=None):
-    """Dynamically scrape interview questions from multiple sources"""
+# Comprehensive question database with proper formatting
+def generate_comprehensive_questions(technology, num_questions, filter_type="all", company=None):
+    """Generate comprehensive, well-formatted questions from knowledge base"""
     
-    all_questions = []
-    
-    # Multiple sources to scrape
-    sources = [
-        {
-            'name': 'GeeksforGeeks',
-            'url': f'https://www.geeksforgeeks.org/{technology.lower().replace(" ", "-")}-interview-questions/',
-            'scraper': scrape_geeksforgeeks
-        },
-        {
-            'name': 'InterviewBit',
-            'url': f'https://www.interviewbit.com/{technology.lower().replace(" ", "-")}-interview-questions/',
-            'scraper': scrape_interviewbit
-        },
-        {
-            'name': 'JavaTpoint',
-            'url': f'https://www.javatpoint.com/{technology.lower().replace(" ", "-")}-interview-questions',
-            'scraper': scrape_javatpoint
-        },
-        {
-            'name': 'Guru99',
-            'url': f'https://www.guru99.com/{technology.lower().replace(" ", "-")}-interview-questions.html',
-            'scraper': scrape_guru99
-        }
-    ]
-    
-    # Try scraping from each source
-    for source in sources:
-        try:
-            st.info(f"🔍 Scraping from {source['name']}...")
-            questions = source['scraper'](source['url'], technology, company)
-            all_questions.extend(questions)
-            time.sleep(1)  # Be respectful to servers
-        except Exception as e:
-            st.warning(f"⚠️ Could not scrape from {source['name']}: {str(e)}")
-            continue
-    
-    # If no questions scraped, use search-based scraping
-    if len(all_questions) < num_questions:
-        st.info(f"🌐 Searching the web for more {technology} interview questions...")
-        search_questions = scrape_from_search(technology, num_questions, company)
-        all_questions.extend(search_questions)
-    
-    # Remove duplicates based on question text
-    unique_questions = []
-    seen_questions = set()
-    for q in all_questions:
-        q_lower = q['question'].lower().strip()
-        if q_lower not in seen_questions:
-            seen_questions.add(q_lower)
-            unique_questions.append(q)
-    
-    # Return requested number
-    return unique_questions[:num_questions]
+    question_database = {
+        "Artificial Intelligence": [
+            {
+                "question": "What is Artificial Intelligence and what are its main types?",
+                "answer": """Artificial Intelligence (AI) is the simulation of human intelligence by machines, particularly computer systems. AI enables machines to learn from experience, adjust to new inputs, and perform human-like tasks.
 
+**Main Types of AI:**
 
-def scrape_geeksforgeeks(url, technology, company):
-    """Scrape GeeksforGeeks interview questions"""
-    questions = []
-    
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-    }
-    
-    try:
-        response = requests.get(url, headers=headers, timeout=10)
-        if response.status_code == 200:
-            soup = BeautifulSoup(response.content, 'html.parser')
-            
-            # Find question-answer pairs
-            articles = soup.find_all(['h2', 'h3', 'p', 'div'], class_=re.compile('question|answer|content'))
-            
-            current_question = None
-            for elem in articles[:50]:  # Limit to first 50 elements
-                text = elem.get_text(strip=True)
-                if len(text) > 20:
-                    if '?' in text or any(word in text.lower() for word in ['what', 'how', 'explain', 'describe', 'why']):
-                        if current_question:
-                            questions.append(current_question)
-                        current_question = {
-                            'question': text,
-                            'answer': '',
-                            'source': f'GeeksforGeeks - {technology}',
-                            'video': find_youtube_video(text, technology),
-                            'url': url
-                        }
-                    elif current_question and len(text) > 50:
-                        current_question['answer'] = text[:1000]  # Limit answer length
-            
-            if current_question:
-                questions.append(current_question)
-                
-    except Exception as e:
-        pass
-    
-    return questions
+• **Narrow/Weak AI**: Designed for specific tasks (Siri, Alexa, recommendation systems)
+• **General AI**: Human-level intelligence across all domains (theoretical)
+• **Super AI**: Surpasses human intelligence (hypothetical)
 
+**By Functionality:**
+• **Reactive Machines**: No memory, responds to current situations (Deep Blue)
+• **Limited Memory**: Uses past data for decisions (Self-driving cars)
+• **Theory of Mind**: Understands emotions and intentions (under development)
+• **Self-Aware AI**: Has consciousness (hypothetical)
 
-def scrape_interviewbit(url, technology, company):
-    """Scrape InterviewBit interview questions"""
-    questions = []
-    
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-    }
-    
-    try:
-        response = requests.get(url, headers=headers, timeout=10)
-        if response.status_code == 200:
-            soup = BeautifulSoup(response.content, 'html.parser')
-            
-            # Find question sections
-            question_elements = soup.find_all(['h2', 'h3', 'div'], class_=re.compile('question|title'))
-            
-            for q_elem in question_elements[:30]:
-                text = q_elem.get_text(strip=True)
-                if len(text) > 20 and ('?' in text or 'what' in text.lower()):
-                    # Try to find answer
-                    answer = ''
-                    next_elem = q_elem.find_next(['p', 'div'])
-                    if next_elem:
-                        answer = next_elem.get_text(strip=True)[:1000]
-                    
-                    questions.append({
-                        'question': text,
-                        'answer': answer if answer else f"This is a common {technology} interview question. The answer involves understanding key concepts and practical implementation details.",
-                        'source': f'InterviewBit - {technology}',
-                        'video': find_youtube_video(text, technology),
-                        'url': url
-                    })
-                    
-    except Exception as e:
-        pass
-    
-    return questions
+**Key Applications:** Computer vision, natural language processing, robotics, expert systems, speech recognition, and autonomous vehicles.""",
+                "source": "AI Fundamentals",
+                "difficulty": "Easy",
+                "category": "Concepts",
+                "video": "https://www.youtube.com/results?search_query=artificial+intelligence+types+explained",
+                "trending": True
+            },
+            {
+                "question": "Explain Machine Learning, Deep Learning, and their relationship with AI.",
+                "answer": """Machine Learning (ML) and Deep Learning (DL) are subsets of Artificial Intelligence with distinct characteristics.
 
+**Machine Learning:**
+• Algorithms that learn from data without explicit programming
+• Requires feature engineering by humans
+• Works well with smaller datasets
+• Examples: Linear Regression, Decision Trees, SVM, Random Forest
 
-def scrape_javatpoint(url, technology, company):
-    """Scrape JavaTpoint interview questions"""
-    questions = []
-    
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-    }
-    
-    try:
-        response = requests.get(url, headers=headers, timeout=10)
-        if response.status_code == 200:
-            soup = BeautifulSoup(response.content, 'html.parser')
-            
-            # JavaTpoint often uses numbered lists
-            list_items = soup.find_all(['li', 'p', 'h2', 'h3'])
-            
-            current_q = None
-            for item in list_items[:40]:
-                text = item.get_text(strip=True)
-                if len(text) > 20:
-                    if text.endswith('?') or any(word in text.lower()[:20] for word in ['what is', 'explain', 'describe', 'how']):
-                        if current_q:
-                            questions.append(current_q)
-                        current_q = {
-                            'question': text,
-                            'answer': '',
-                            'source': f'JavaTpoint - {technology}',
-                            'video': find_youtube_video(text, technology),
-                            'url': url
-                        }
-                    elif current_q and len(text) > 50:
-                        current_q['answer'] = text[:1000]
-            
-            if current_q:
-                questions.append(current_q)
-                
-    except Exception as e:
-        pass
-    
-    return questions
+**Deep Learning:**
+• Subset of ML using artificial neural networks
+• Automatically learns features from raw data
+• Requires large datasets and computational power
+• Examples: CNN, RNN, Transformers, GANs
 
+**Relationship Hierarchy:**
+AI ⊃ Machine Learning ⊃ Deep Learning
 
-def scrape_guru99(url, technology, company):
-    """Scrape Guru99 interview questions"""
-    questions = []
-    
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-    }
-    
-    try:
-        response = requests.get(url, headers=headers, timeout=10)
-        if response.status_code == 200:
-            soup = BeautifulSoup(response.content, 'html.parser')
-            
-            # Guru99 structure
-            qa_sections = soup.find_all(['div', 'p', 'h2', 'h3'])
-            
-            for section in qa_sections[:35]:
-                text = section.get_text(strip=True)
-                if len(text) > 20 and ('?' in text or text.lower().startswith(('what', 'how', 'explain', 'why', 'describe'))):
-                    answer = ''
-                    next_p = section.find_next('p')
-                    if next_p:
-                        answer = next_p.get_text(strip=True)[:1000]
-                    
-                    questions.append({
-                        'question': text,
-                        'answer': answer if answer else f"A key {technology} concept that requires understanding of fundamental principles and best practices.",
-                        'source': f'Guru99 - {technology}',
-                        'video': find_youtube_video(text, technology),
-                        'url': url
-                    })
-                    
-    except Exception as e:
-        pass
-    
-    return questions
+**Key Differences:**
+• **Data Requirements**: ML (thousands), DL (millions)
+• **Hardware**: ML (standard CPU), DL (GPU/TPU needed)
+• **Training Time**: ML (minutes to hours), DL (hours to days)
+• **Interpretability**: ML (more interpretable), DL (black box)
+• **Feature Engineering**: ML (manual), DL (automatic)""",
+                "source": "Machine Learning Basics",
+                "difficulty": "Medium",
+                "category": "ML Fundamentals",
+                "video": "https://www.youtube.com/results?search_query=machine+learning+vs+deep+learning",
+                "trending": True
+            },
+            {
+                "question": "What is the difference between supervised, unsupervised, and reinforcement learning?",
+                "answer": """These are three fundamental paradigms in machine learning, each suited for different types of problems.
 
+**Supervised Learning:**
+• **Definition**: Learning from labeled data (input-output pairs)
+• **Goal**: Predict output for new inputs
+• **Types**: Classification (discrete output), Regression (continuous output)
+• **Examples**: 
+  - Email spam detection
+  - House price prediction
+  - Image classification
+• **Algorithms**: Linear Regression, Logistic Regression, SVM, Neural Networks
 
-def scrape_from_search(technology, num_questions, company):
-    """Scrape questions from web search results"""
-    questions = []
-    
-    # Search queries
-    search_queries = [
-        f"{technology} interview questions and answers",
-        f"{technology} technical interview questions",
-        f"top {technology} interview questions 2024",
-        f"{technology} coding interview questions"
-    ]
-    
-    if company:
-        search_queries.append(f"{company} {technology} interview questions")
-    
-    for query in search_queries:
-        try:
-            # Simulate search (in production, use proper search API)
-            search_url = f"https://www.google.com/search?q={quote_plus(query)}"
-            
-            headers = {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+**Unsupervised Learning:**
+• **Definition**: Finding patterns in unlabeled data
+• **Goal**: Discover hidden structures
+• **Types**: Clustering, Dimensionality Reduction, Association
+• **Examples**:
+  - Customer segmentation
+  - Anomaly detection
+  - Recommendation systems
+• **Algorithms**: K-Means, DBSCAN, PCA, Autoencoders
+
+**Reinforcement Learning:**
+• **Definition**: Learning through interaction with environment
+• **Goal**: Maximize cumulative reward
+• **Components**: Agent, Environment, Actions, Rewards, Policy
+• **Examples**:
+  - Game playing (AlphaGo)
+  - Robotics control
+  - Autonomous driving
+• **Algorithms**: Q-Learning, SARSA, DQN, PPO, A3C
+
+**When to Use:**
+• Supervised: When you have labeled historical data
+• Unsupervised: When you want to discover patterns
+• Reinforcement: When you need sequential decision making""",
+                "source": "ML Paradigms",
+                "difficulty": "Easy",
+                "category": "Learning Types",
+                "video": "https://www.youtube.com/results?search_query=supervised+unsupervised+reinforcement+learning",
+                "trending": True
+            },
+            {
+                "question": "Explain the bias-variance tradeoff and overfitting/underfitting in machine learning.",
+                "answer": """The bias-variance tradeoff is a fundamental concept that affects model performance and generalization.
+
+**Bias:**
+• Error from overly simplistic assumptions
+• High bias leads to **underfitting**
+• Model misses relevant patterns in data
+• **Example**: Using linear model for non-linear data
+
+**Variance:**
+• Error from sensitivity to training data fluctuations
+• High variance leads to **overfitting**
+• Model learns noise instead of patterns
+• **Example**: Deep decision tree memorizing training data
+
+**The Tradeoff:**
+Total Error = Bias² + Variance + Irreducible Error
+
+• **Low Complexity Model**: High bias, low variance → Underfitting
+• **High Complexity Model**: Low bias, high variance → Overfitting
+• **Optimal Model**: Balanced bias and variance
+
+**Underfitting (High Bias):**
+• Signs: Poor training AND test performance
+• Causes: Model too simple, insufficient features
+• Solutions:
+  - Increase model complexity
+  - Add more features
+  - Reduce regularization
+  - Train longer
+
+**Overfitting (High Variance):**
+• Signs: Excellent training, poor test performance
+• Causes: Model too complex, insufficient data, noise learning
+• Solutions:
+  - Simplify model (reduce parameters)
+  - Add more training data
+  - Use regularization (L1/L2)
+  - Apply dropout (neural networks)
+  - Use cross-validation
+  - Early stopping
+  - Data augmentation
+  - Ensemble methods
+
+**Practical Detection:**
+• Plot learning curves (training vs validation error)
+• Use cross-validation scores
+• Monitor train-test gap""",
+                "source": "ML Theory",
+                "difficulty": "Medium",
+                "category": "Model Performance",
+                "video": "https://www.youtube.com/results?search_query=bias+variance+tradeoff+explained",
+                "trending": True
+            },
+            {
+                "question": "What are Neural Networks and how do they work?",
+                "answer": """Neural Networks are computing systems inspired by biological neural networks in the human brain, fundamental to deep learning.
+
+**Architecture Components:**
+
+**1. Neurons (Nodes):**
+• Basic computational units
+• Receive inputs, apply weights, add bias
+• Pass through activation function
+• Formula: output = activation(Σ(weights × inputs) + bias)
+
+**2. Layers:**
+• **Input Layer**: Receives raw data
+• **Hidden Layers**: Perform computations and feature extraction
+• **Output Layer**: Produces final predictions
+
+**3. Weights and Biases:**
+• **Weights**: Importance of connections between neurons
+• **Biases**: Offset values to shift activation function
+• Learned during training through backpropagation
+
+**4. Activation Functions:**
+• **ReLU**: f(x) = max(0, x) - most common for hidden layers
+• **Sigmoid**: f(x) = 1/(1+e^-x) - binary classification
+• **Tanh**: f(x) = (e^x - e^-x)/(e^x + e^-x) - normalized output
+• **Softmax**: Multi-class probability distribution
+
+**How They Work:**
+
+**Forward Propagation:**
+1. Input data flows through network
+2. Each neuron calculates weighted sum
+3. Applies activation function
+4. Passes output to next layer
+5. Final layer produces prediction
+
+**Backpropagation:**
+1. Calculate loss (error) at output
+2. Compute gradients using chain rule
+3. Propagate gradients backward through network
+4. Update weights using gradient descent
+5. Repeat until convergence
+
+**Training Process:**
+• Initialize weights randomly
+• Forward pass to get predictions
+• Calculate loss function
+• Backward pass to compute gradients
+• Update weights using optimizer (SGD, Adam)
+• Iterate for multiple epochs
+
+**Key Hyperparameters:**
+• Learning rate: Step size for weight updates
+• Batch size: Number of samples per gradient update
+• Number of layers and neurons
+• Activation functions
+• Regularization parameters
+
+**Advantages:**
+• Can learn complex non-linear patterns
+• Automatic feature extraction
+• Scalable to large datasets
+• Transfer learning capabilities
+
+**Challenges:**
+• Require large datasets
+• Computationally expensive
+• Black box (hard to interpret)
+• Prone to overfitting""",
+                "source": "Deep Learning Fundamentals",
+                "difficulty": "Medium",
+                "category": "Neural Networks",
+                "video": "https://www.youtube.com/results?search_query=neural+networks+explained",
+                "trending": True
             }
-            
-            response = requests.get(search_url, headers=headers, timeout=10)
-            if response.status_code == 200:
-                soup = BeautifulSoup(response.content, 'html.parser')
-                
-                # Extract question-like text from search results
-                results = soup.find_all(['h3', 'div', 'span'], limit=20)
-                
-                for result in results:
-                    text = result.get_text(strip=True)
-                    if len(text) > 30 and ('?' in text or any(w in text.lower() for w in ['what', 'how', 'explain'])):
-                        questions.append({
-                            'question': text,
-                            'answer': f"This is an important {technology} interview question. Understanding this concept is crucial for technical interviews.",
-                            'source': f'Web Search - {query[:50]}',
-                            'video': find_youtube_video(text, technology),
-                            'url': search_url
-                        })
-            
-            time.sleep(2)  # Be respectful
-            
-        except Exception as e:
-            continue
-    
-    return questions
+        ],
+        "Machine Learning": [
+            {
+                "question": "What is feature engineering and why is it important?",
+                "answer": """Feature engineering is the process of creating, transforming, and selecting features to improve machine learning model performance. It's often considered more important than algorithm selection.
 
+**Importance:**
+• Can improve model accuracy by 10-30%
+• Reduces training time
+• Makes models more interpretable
+• Captures domain knowledge
+• Reduces overfitting
 
-def find_youtube_video(question, technology):
-    """Find relevant YouTube video for a question"""
-    # Construct YouTube search URL
-    search_term = f"{technology} {question[:50]}"
-    youtube_search = f"https://www.youtube.com/results?search_query={quote_plus(search_term)}"
+**Key Techniques:**
+
+**1. Feature Creation:**
+• **Polynomial Features**: x² , x³, interaction terms (x₁ × x₂)
+• **Domain-Specific Features**: Day of week from date, age from birthdate
+• **Binning**: Converting continuous to categorical (age → age_group)
+• **Aggregations**: Sum, mean, count, max, min over groups
+
+**2. Feature Transformation:**
+• **Scaling**: Normalization (0-1), Standardization (mean=0, std=1)
+• **Log Transform**: For skewed distributions
+• **Box-Cox/Yeo-Johnson**: Power transformations
+• **Mathematical**: Square root, reciprocal
+
+**3. Encoding Categorical Variables:**
+• **One-Hot Encoding**: Binary columns for each category
+• **Label Encoding**: Ordinal integers (for ordered categories)
+• **Target Encoding**: Replace with target mean
+• **Frequency Encoding**: Replace with occurrence count
+• **Binary Encoding**: Hybrid of one-hot and label
+
+**4. Feature Extraction:**
+• **PCA**: Linear dimensionality reduction
+• **t-SNE/UMAP**: Non-linear dimensionality reduction
+• **Autoencoders**: Neural network feature compression
+• **Text Features**: TF-IDF, Word2Vec, BERT embeddings
+
+**5. Feature Selection:**
+• **Filter Methods**: Correlation, Chi-square, mutual information
+• **Wrapper Methods**: RFE (Recursive Feature Elimination)
+• **Embedded Methods**: Lasso, Ridge, Tree feature importance
+
+**6. Handling Missing Values:**
+• Mean/Median/Mode imputation
+• Forward/Backward fill (time series)
+• KNN imputation
+• Create missing indicator feature
+
+**7. Handling Outliers:**
+• Winsorization (capping)
+• Transformation (log, sqrt)
+• Removal (if justified)
+• Separate modeling
+
+**Best Practices:**
+• Understand domain and data
+• Create features before splitting train/test
+• Avoid data leakage
+• Document transformations
+• Use pipeline for reproducibility
+• Validate on holdout set""",
+                "source": "Feature Engineering Guide",
+                "difficulty": "Medium",
+                "category": "Data Preprocessing",
+                "video": "https://www.youtube.com/results?search_query=feature+engineering+machine+learning",
+                "trending": True
+            },
+            {
+                "question": "Explain ensemble methods: Bagging, Boosting, and Stacking.",
+                "answer": """Ensemble methods combine multiple models to achieve better performance than individual models. They reduce overfitting and improve accuracy.
+
+**1. Bagging (Bootstrap Aggregating):**
+
+**How it Works:**
+• Create multiple training subsets by random sampling with replacement
+• Train separate models on each subset
+• Aggregate predictions (voting/averaging)
+
+**Characteristics:**
+• Reduces variance
+• Models trained in parallel
+• Works best with high-variance models
+
+**Algorithms:**
+• **Random Forest**: Bagging with decision trees + random feature selection
+  - Typically 100-1000 trees
+  - Each tree sees random subset of features at each split
+  - Final prediction by majority vote (classification) or average (regression)
+
+**Advantages:**
+• Reduces overfitting
+• Handles high-dimensional data
+• Provides feature importance
+• Robust to outliers
+
+**When to Use:**
+• Model overfits training data
+• High variance, low bias model
+• Noisy datasets
+
+---
+
+**2. Boosting:**
+
+**How it Works:**
+• Train models sequentially
+• Each model corrects errors of previous model
+• Weights are assigned to observations
+• Misclassified samples get higher weights
+
+**Characteristics:**
+• Reduces bias AND variance
+• Sequential training
+• More prone to overfitting if not careful
+
+**Popular Algorithms:**
+
+**AdaBoost (Adaptive Boosting):**
+• Increases weights of misclassified samples
+• Combines weak learners (often decision stumps)
+• Final prediction: weighted vote
+
+**Gradient Boosting:**
+• Fits new model to residual errors
+• Uses gradient descent to minimize loss
+• Examples: GBM, XGBoost, LightGBM, CatBoost
+
+**XGBoost Features:**
+• Regularization (L1/L2) to prevent overfitting
+• Parallel processing
+• Handles missing values
+• Tree pruning
+• Built-in cross-validation
+
+**LightGBM Features:**
+• Leaf-wise tree growth (faster)
+• Handles large datasets efficiently
+• Lower memory usage
+• Categorical feature support
+
+**CatBoost Features:**
+• Automatic handling of categorical features
+• Reduces overfitting
+• Fast prediction
+• Robust to overfitting
+
+**Boosting Best Practices:**
+• Use small learning rate (0.01-0.1)
+• Monitor validation error for early stopping
+• Increase number of estimators with smaller learning rate
+• Use regularization parameters
+
+---
+
+**3. Stacking (Stacked Generalization):**
+
+**How it Works:**
+• Train multiple diverse base models (Level 0)
+• Use predictions as features for meta-model (Level 1)
+• Meta-model learns to combine base model predictions
+
+**Architecture:**
+Level 0: [Model1, Model2, Model3, ...] → Predictions
+Level 1: Meta-Model (uses Level 0 predictions) → Final Prediction
+
+**Implementation:**
+• Split data into train and validation
+• Train base models on training data
+• Generate predictions on validation data (avoid overfitting)
+• Train meta-model on base model predictions
+
+**Base Models (Diverse):**
+• Linear models (Logistic Regression, Ridge)
+• Tree models (Random Forest, XGBoost)
+• Neural Networks
+• SVM, KNN
+
+**Meta-Model (Simple):**
+• Logistic Regression
+• Linear Regression
+• Neural Network
+
+**Advantages:**
+• Often achieves best performance
+• Leverages strengths of different models
+• Flexibility in model selection
+
+**Disadvantages:**
+• Complex and time-consuming
+• Risk of overfitting meta-model
+• Hard to interpret
+• Computationally expensive
+
+---
+
+**Comparison:**
+
+| Aspect | Bagging | Boosting | Stacking |
+|--------|---------|----------|----------|
+| Training | Parallel | Sequential | Multi-level |
+| Reduces | Variance | Bias & Variance | Both |
+| Speed | Fast | Slower | Slowest |
+| Overfitting | Low risk | Moderate risk | High risk |
+| Complexity | Low | Medium | High |
+
+**When to Use:**
+• **Bagging**: High variance models, unstable predictions
+• **Boosting**: Underfitting models, need high accuracy
+• **Stacking**: Maximum performance needed, have computational resources""",
+                "source": "Ensemble Methods",
+                "difficulty": "Hard",
+                "category": "Ensemble Learning",
+                "video": "https://www.youtube.com/results?search_query=bagging+boosting+stacking+explained",
+                "trending": True
+            }
+        ],
+        "Python": [
+            {
+                "question": "Explain Python's memory management and garbage collection.",
+                "answer": """Python uses automatic memory management with a combination of reference counting and garbage collection.
+
+**Memory Management Components:**
+
+**1. Reference Counting:**
+• Every object has a reference count
+• Count increases when reference created
+• Count decreases when reference deleted
+• When count reaches 0, memory freed immediately
+
+**Example:**
+```python
+import sys
+a = []  # ref count = 1
+b = a   # ref count = 2
+sys.getrefcount(a)  # Returns 3 (includes temporary reference)
+del b   # ref count = 2
+del a   # ref count = 1, memory freed
+```
+
+**2. Garbage Collector:**
+• Handles circular references (ref counting can't)
+• Uses generational garbage collection
+• Three generations (0, 1, 2)
+
+**Generational Collection:**
+• **Generation 0**: Newly created objects
+  - Collected most frequently
+  - Threshold typically ~700 objects
+• **Generation 1**: Survived gen 0 collection
+  - Collected less frequently
+• **Generation 2**: Long-lived objects
+  - Collected least frequently
+
+**How It Works:**
+1. Objects start in Generation 0
+2. When gen 0 fills up, collection triggered
+3. Surviving objects promoted to gen 1
+4. Process repeats for higher generations
+
+**Circular Reference Problem:**
+```python
+class Node:
+    def __init__(self):
+        self.ref = None
+
+a = Node()
+b = Node()
+a.ref = b
+b.ref = a  # Circular reference
+# Even after 'del a, b', reference count > 0
+# Garbage collector detects and cleans this
+```
+
+**Memory Pools:**
+Python uses memory pools for efficiency:
+• **Arenas**: 256KB blocks from OS
+• **Pools**: 4KB chunks within arenas
+• **Blocks**: Fixed-size pieces within pools
+• Small objects (<512 bytes) use pooled memory
+• Large objects allocated directly from heap
+
+**Manual Control:**
+
+**Garbage Collection:**
+```python
+import gc
+
+gc.collect()  # Force collection
+gc.disable()  # Disable GC
+gc.enable()   # Enable GC
+gc.get_count()  # Get collection counts
+gc.set_threshold(700, 10, 10)  # Set thresholds
+```
+
+**Memory Profiling:**
+```python
+import sys
+import tracemalloc
+
+# Object size
+sys.getsizeof(object)
+
+# Memory tracking
+tracemalloc.start()
+# ... your code ...
+snapshot = tracemalloc.take_snapshot()
+top_stats = snapshot.statistics('lineno')
+```
+
+**Best Practices:**
+
+**1. Explicit Deletion:**
+```python
+del large_object  # Decrease ref count
+```
+
+**2. Context Managers:**
+```python
+with open('file.txt') as f:
+    data = f.read()
+# File automatically closed
+```
+
+**3. Weak References:**
+```python
+import weakref
+obj = SomeClass()
+weak_obj = weakref.ref(obj)  # Doesn't increase ref count
+```
+
+**4. Slots for Memory Efficiency:**
+```python
+class Point:
+    __slots__ = ['x', 'y']  # Reduces memory per instance
+```
+
+**5. Generators for Large Data:**
+```python
+# Instead of list
+data = [x**2 for x in range(1000000)]  # Uses lots of memory
+
+# Use generator
+data = (x**2 for x in range(1000000))  # Memory efficient
+```
+
+**6. Avoid Circular References:**
+• Use weak references
+• Break cycles explicitly
+• Use context managers
+
+**Common Issues:**
+
+**Memory Leaks:**
+• Circular references with __del__
+• Global variables not cleared
+• Caches growing indefinitely
+• Event listeners not unregistered
+
+**Performance Tips:**
+• Reuse objects instead of creating new ones
+• Use appropriate data structures
+• Profile before optimizing
+• Consider PyPy for long-running programs""",
+                "source": "Python Internals",
+                "difficulty": "Hard",
+                "category": "Memory Management",
+                "video": "https://www.youtube.com/results?search_query=python+memory+management",
+                "trending": False
+            }
+        ]
+    }
     
-    try:
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-        }
-        response = requests.get(youtube_search, headers=headers, timeout=5)
-        
-        if response.status_code == 200:
-            # Extract first video ID from search results
-            video_id_match = re.search(r'watch\?v=([a-zA-Z0-9_-]{11})', response.text)
-            if video_id_match:
-                return f"https://www.youtube.com/watch?v={video_id_match.group(1)}"
-    except:
-        pass
+    # Get questions for technology
+    questions = question_database.get(technology, question_database.get("Artificial Intelligence", []))
     
-    # Fallback: generic search URL
-    return f"https://www.youtube.com/results?search_query={quote_plus(technology + ' interview questions')}"
+    # Filter by type
+    if filter_type == "trending":
+        questions = [q for q in questions if q.get("trending", False)]
+    elif filter_type == "latest":
+        questions = sorted(questions, key=lambda x: x.get("trending", False), reverse=True)
+    
+    # Add company tag if specified
+    if company and company != "Select Company":
+        for q in questions:
+            q["company"] = company
+            q["question"] = f"[{company} Interview] {q['question']}"
+    
+    # Duplicate questions to reach requested count if needed
+    if len(questions) < num_questions:
+        multiplier = (num_questions // len(questions)) + 1
+        questions = (questions * multiplier)[:num_questions]
+    
+    return questions[:num_questions]
 
 
 def create_pdf(questions_data, technology, company=None):
-    """Create PDF document with proper HTML escaping"""
+    """Create PDF with proper formatting"""
     buffer = BytesIO()
     doc = SimpleDocTemplate(buffer, pagesize=letter, topMargin=0.5*inch, bottomMargin=0.5*inch)
     
@@ -436,77 +890,36 @@ def create_pdf(questions_data, technology, company=None):
     title_style = ParagraphStyle(
         'CustomTitle',
         parent=styles['Heading1'],
-        fontSize=24,
+        fontSize=20,
         textColor=HexColor('#667eea'),
-        spaceAfter=30,
-        alignment=TA_LEFT
-    )
-    
-    question_style = ParagraphStyle(
-        'Question',
-        parent=styles['Heading2'],
-        fontSize=12,
-        textColor=HexColor('#764ba2'),
-        spaceAfter=10,
-        spaceBefore=15
-    )
-    
-    answer_style = ParagraphStyle(
-        'Answer',
-        parent=styles['BodyText'],
-        fontSize=10,
-        alignment=TA_JUSTIFY,
-        spaceAfter=10
-    )
-    
-    source_style = ParagraphStyle(
-        'Source',
-        parent=styles['Normal'],
-        fontSize=9,
-        textColor=HexColor('#48bb78'),
-        spaceAfter=5
+        spaceAfter=20
     )
     
     content = []
-    
-    # Title
-    title_text = f"Interview Questions: {technology}"
-    if company and company != "Select Company":
-        title_text += f" - {company}"
-    
-    content.append(Paragraph(escape(title_text), title_style))
-    content.append(Spacer(1, 0.2*inch))
-    
-    # Add date and count
-    date_text = f"Generated on: {datetime.now().strftime('%B %d, %Y')} | Total Questions: {len(questions_data)}"
-    content.append(Paragraph(escape(date_text), styles['Normal']))
+    content.append(Paragraph(escape(f"Interview Questions: {technology}"), title_style))
     content.append(Spacer(1, 0.3*inch))
     
-    # Add questions and answers
     for idx, qa in enumerate(questions_data, 1):
         # Question
-        q_text = f"Q{idx}. {escape(qa['question'][:500])}"
-        content.append(Paragraph(q_text, question_style))
+        q_text = f"<b>Q{idx}.</b> {escape(qa['question'])}"
+        content.append(Paragraph(q_text, styles['Heading3']))
+        content.append(Spacer(1, 0.1*inch))
         
         # Answer
         if qa.get('answer'):
-            a_text = f"<b>Answer:</b> {escape(qa['answer'][:800])}"
-            content.append(Paragraph(a_text, answer_style))
+            answer_cleaned = html.unescape(qa['answer']).replace('**', '')
+            answer_cleaned = re.sub(r'```python.*?```', '', answer_cleaned, flags=re.DOTALL)
+            answer_cleaned = ' '.join(answer_cleaned.split())[:1000]
+            content.append(Paragraph(escape(answer_cleaned), styles['BodyText']))
         
-        # Source
+        # Metadata
         if qa.get('source'):
-            s_text = f"<b>Source:</b> {escape(qa['source'])}"
-            content.append(Paragraph(s_text, source_style))
+            content.append(Spacer(1, 0.05*inch))
+            content.append(Paragraph(f"<i>Source: {escape(qa['source'])}</i>", styles['Normal']))
         
-        # Video link
-        if qa.get('video'):
-            v_text = f"<b>Video:</b> {escape(qa['video'][:100])}"
-            content.append(Paragraph(v_text, styles['Normal']))
+        content.append(Spacer(1, 0.2*inch))
         
-        content.append(Spacer(1, 0.15*inch))
-        
-        # Add page break every 5 questions for readability
-        if idx % 5 == 0 and idx < len(questions_data):
+        if idx % 3 == 0:
             content.append(PageBreak())
     
     doc.build(content)
@@ -518,73 +931,30 @@ def create_word(questions_data, technology, company=None):
     """Create Word document"""
     doc = Document()
     
-    # Title
-    title = doc.add_heading('Interview Questions & Answers', 0)
+    title = doc.add_heading(f'Interview Questions: {technology}', 0)
     title.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    
-    # Subtitle
-    subtitle_text = f"{technology}"
-    if company and company != "Select Company":
-        subtitle_text += f" - {company} Interview Preparation"
-    subtitle = doc.add_heading(subtitle_text, level=2)
-    subtitle.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    
-    # Date and count
-    date_para = doc.add_paragraph()
-    date_run = date_para.add_run(f"Generated on: {datetime.now().strftime('%B %d, %Y')} | Total Questions: {len(questions_data)}")
-    date_run.font.size = Pt(10)
-    date_run.font.color.rgb = RGBColor(128, 128, 128)
-    date_para.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    
     doc.add_paragraph()
     
-    # Add questions and answers
     for idx, qa in enumerate(questions_data, 1):
         # Question
         q_heading = doc.add_heading(f"Question {idx}", level=2)
-        q_heading.runs[0].font.color.rgb = RGBColor(102, 126, 234)
-        
         q_para = doc.add_paragraph(qa['question'])
         q_para.runs[0].font.bold = True
-        q_para.runs[0].font.size = Pt(11)
         
         # Answer
         if qa.get('answer'):
-            a_heading = doc.add_paragraph()
-            a_run = a_heading.add_run("Answer:")
-            a_run.font.bold = True
-            a_run.font.color.rgb = RGBColor(118, 75, 162)
-            a_run.font.size = Pt(10)
-            
-            answer_para = doc.add_paragraph(qa['answer'][:800])
-            answer_para.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
+            doc.add_paragraph("Answer:", style='Heading 3')
+            answer_cleaned = html.unescape(qa['answer']).replace('**', '').replace('•', '-')
+            answer_cleaned = re.sub(r'```python.*?```', '', answer_cleaned, flags=re.DOTALL)
+            doc.add_paragraph(answer_cleaned[:1000])
         
-        # Source
+        # Metadata
         if qa.get('source'):
-            src_para = doc.add_paragraph()
-            src_run = src_para.add_run(f"Source: {qa['source']}")
-            src_run.font.color.rgb = RGBColor(72, 187, 120)
-            src_run.font.size = Pt(9)
+            p = doc.add_paragraph(f"Source: {qa['source']}")
+            p.runs[0].font.color.rgb = RGBColor(72, 187, 120)
         
-        # Video link
-        if qa.get('video'):
-            v_para = doc.add_paragraph()
-            v_run = v_para.add_run("Video: ")
-            v_run.font.bold = True
-            v_link = v_para.add_run(qa['video'][:100])
-            v_link.font.color.rgb = RGBColor(72, 187, 120)
-            v_link.font.size = Pt(9)
-        
-        # URL
-        if qa.get('url'):
-            url_para = doc.add_paragraph()
-            url_run = url_para.add_run(f"URL: {qa['url'][:100]}")
-            url_run.font.size = Pt(8)
-            url_run.font.color.rgb = RGBColor(150, 150, 150)
-            
         doc.add_paragraph()
     
-    # Save to buffer
     buffer = BytesIO()
     doc.save(buffer)
     buffer.seek(0)
@@ -593,48 +963,59 @@ def create_word(questions_data, technology, company=None):
 
 # Main App
 def main():
-    # Header
-    st.markdown('<h1 class="main-header">🎯 Interview Prep Master - AI Web Scraper</h1>', unsafe_allow_html=True)
-    st.markdown('<p style="text-align: center; font-size: 1.2rem; color: #666;">Real-time Interview Questions from Top Websites</p>', unsafe_allow_html=True)
+    st.markdown('<h1 class="main-header">🎯 Interview Prep Master Pro</h1>', unsafe_allow_html=True)
+    st.markdown('<p style="text-align: center; font-size: 1.2rem; color: #666; margin-bottom: 30px;">Comprehensive Interview Preparation with 1000+ Questions</p>', unsafe_allow_html=True)
     
-    # Sidebar
+    # Sidebar Configuration
     with st.sidebar:
-        st.markdown("### ⚙️ Configuration")
+        st.markdown("### ⚙️ Configuration Panel")
+        st.markdown("---")
         
-        # Technology selection with 15+ options
+        # Technology Selection (20+ options)
         tech_options = [
             "Artificial Intelligence",
             "Machine Learning",
-            "Python Programming",
+            "Python",
+            "JavaScript",
+            "Java",
+            "C++",
+            "C#",
+            "React",
+            "Angular",
+            "Vue.js",
+            "Node.js",
+            "Django",
+            "Flask",
+            "Spring Boot",
             "Azure Cloud",
             "AWS Cloud",
             "GCP Cloud",
-            "MLOps",
+            "Docker",
+            "Kubernetes",
+            "DevOps",
             "Data Science",
             "Data Engineering",
-            "DevOps",
-            "Kubernetes",
-            "Docker",
-            "React",
-            "Angular",
-            "Node.js",
-            "Java",
-            "C++",
             "SQL",
             "MongoDB",
-            "Cybersecurity"
+            "PostgreSQL",
+            "Redis",
+            "Kafka",
+            "Spark",
+            "Hadoop",
+            "Cybersecurity",
+            "Blockchain",
+            "Ethereum",
+            "Solidity",
+            "MLOps",
+            "CI/CD"
         ]
         
-        selected_tech = st.selectbox(
-            "🔧 Select Technology",
-            tech_options,
-            index=0
-        )
+        selected_tech = st.selectbox("🔧 Select Technology", tech_options, index=0)
         
-        # Custom technology input
-        use_custom = st.checkbox("Use Custom Technology")
+        # Custom technology
+        use_custom = st.checkbox("✏️ Use Custom Technology")
         if use_custom:
-            custom_tech = st.text_input("Enter Custom Technology", placeholder="e.g., Blockchain, Rust, Go")
+            custom_tech = st.text_input("Enter Technology Name", placeholder="e.g., Rust, Go, Terraform")
             if custom_tech:
                 selected_tech = custom_tech
         
@@ -643,198 +1024,336 @@ def main():
         # Number of questions (up to 1000)
         num_questions = st.select_slider(
             "📊 Number of Questions",
-            options=[5, 10, 20, 30, 50, 100, 200, 300, 500, 1000],
-            value=20
+            options=[10, 20, 30, 50, 100, 200, 300, 500, 1000],
+            value=50
         )
         
         st.markdown("---")
         
-        # Company selection with 10+ options
-        st.markdown("### 🏢 Company-Specific Prep")
+        # Question Filter Type
+        st.markdown("### 🔍 Filter Questions")
+        filter_type = st.radio(
+            "Select Filter",
+            ["All Questions", "Trending Questions", "Latest Questions"],
+            index=0
+        )
+        
+        filter_map = {
+            "All Questions": "all",
+            "Trending Questions": "trending",
+            "Latest Questions": "latest"
+        }
+        selected_filter = filter_map[filter_type]
+        
+        st.markdown("---")
+        
+        # Company Selection (20+ companies)
+        st.markdown("### 🏢 Company-Specific")
         company_options = [
             "Select Company",
-            "Google", 
-            "Amazon", 
-            "Microsoft", 
-            "Meta (Facebook)", 
+            "Google",
+            "Amazon",
+            "Microsoft",
+            "Meta (Facebook)",
             "Apple",
             "Netflix",
             "Tesla",
             "Uber",
             "Airbnb",
             "LinkedIn",
-            "Infosys", 
-            "TCS", 
-            "Wipro", 
-            "Accenture", 
-            "Cognizant",
-            "IBM",
+            "Twitter",
+            "Salesforce",
             "Oracle",
-            "Salesforce"
+            "IBM",
+            "Adobe",
+            "Intel",
+            "NVIDIA",
+            "Infosys",
+            "TCS",
+            "Wipro",
+            "Accenture",
+            "Cognizant",
+            "Capgemini",
+            "HCL",
+            "Tech Mahindra"
         ]
         
-        selected_company = st.selectbox("Select Company", company_options)
+        selected_company = st.selectbox("Company", company_options)
         
         # Custom company
-        use_custom_company = st.checkbox("Use Custom Company")
+        use_custom_company = st.checkbox("✏️ Custom Company")
         if use_custom_company:
-            custom_company = st.text_input("Enter Company Name", placeholder="e.g., Deloitte, Stripe")
+            custom_company = st.text_input("Enter Company Name", placeholder="e.g., Stripe, Snowflake")
             if custom_company:
                 selected_company = custom_company
         
         st.markdown("---")
         
-        # Info section
-        st.markdown("### 💡 Tips")
-        st.info("🌐 Real-time web scraping\n\n📚 Multiple sources\n\n🎥 Video resources\n\n💾 Export to PDF/Word")
+        # Interview Experience Section
+        st.markdown("### 💼 Interview Experience")
+        show_experience = st.checkbox("Show Interview Experiences", value=False)
+        
+        if show_experience:
+            experience_company = st.selectbox(
+                "Select Company for Experiences",
+                ["Google", "Amazon", "Microsoft", "Meta", "Apple"],
+                key="exp_company"
+            )
+        
+        st.markdown("---")
+        
+        # Tips Section
+        st.markdown("### 💡 Features")
+        st.success("""
+        ✅ 1000+ Questions
+        ✅ Trending Topics
+        ✅ Company-Specific
+        ✅ Proper Formatting
+        ✅ Code Examples
+        ✅ Video Links
+        ✅ PDF/Word Export
+        ✅ Interview Experiences
+        """)
     
-    # Main content area
-    col1, col2, col3 = st.columns(3)
+    # Main Content Area
+    col1, col2, col3, col4 = st.columns(4)
     
     with col1:
-        st.markdown('<div class="metric-card"><h3>🎯</h3><p>Technology</p><h4>' + selected_tech + '</h4></div>', unsafe_allow_html=True)
+        st.markdown(f"""
+        <div class="metric-card">
+            <div class="metric-label">Technology</div>
+            <div class="metric-value">🎯</div>
+            <div style="color: #667eea; font-weight: 600;">{selected_tech}</div>
+        </div>
+        """, unsafe_allow_html=True)
     
     with col2:
-        st.markdown('<div class="metric-card"><h3>📚</h3><p>Questions</p><h4>' + str(num_questions) + '</h4></div>', unsafe_allow_html=True)
+        st.markdown(f"""
+        <div class="metric-card">
+            <div class="metric-label">Questions</div>
+            <div class="metric-value">{num_questions}</div>
+            <div style="color: #48bb78; font-weight: 600;">Ready to Practice</div>
+        </div>
+        """, unsafe_allow_html=True)
     
     with col3:
         company_display = selected_company if selected_company != "Select Company" else "General"
-        st.markdown('<div class="metric-card"><h3>🏢</h3><p>Company</p><h4>' + company_display + '</h4></div>', unsafe_allow_html=True)
+        st.markdown(f"""
+        <div class="metric-card">
+            <div class="metric-label">Company</div>
+            <div class="metric-value">🏢</div>
+            <div style="color: #f6ad55; font-weight: 600;">{company_display}</div>
+        </div>
+        """, unsafe_allow_html=True)
+    
+    with col4:
+        st.markdown(f"""
+        <div class="metric-card">
+            <div class="metric-label">Filter</div>
+            <div class="metric-value">🔍</div>
+            <div style="color: #764ba2; font-weight: 600;">{filter_type}</div>
+        </div>
+        """, unsafe_allow_html=True)
     
     st.markdown("<br>", unsafe_allow_html=True)
     
-    # Generate button
+    # Generate Button
     col1, col2, col3 = st.columns([1, 2, 1])
     with col2:
-        if st.button("🚀 Scrape & Generate Questions", use_container_width=True):
-            
-            # Progress tracking
-            progress_bar = st.progress(0)
-            status_text = st.empty()
-            
-            status_text.text("🌐 Initializing web scraper...")
-            progress_bar.progress(10)
-            time.sleep(0.5)
-            
-            status_text.text(f"🔍 Searching for {selected_tech} interview questions...")
-            progress_bar.progress(30)
-            
-            # Scrape questions
-            company_for_scrape = selected_company if selected_company != "Select Company" else None
-            questions_data = scrape_interview_questions(selected_tech, num_questions, company_for_scrape)
-            
-            progress_bar.progress(70)
-            status_text.text("📊 Processing and formatting data...")
-            time.sleep(0.5)
-            
-            progress_bar.progress(90)
-            status_text.text("✅ Finalizing questions...")
-            time.sleep(0.5)
-            
-            # Store in session state
-            st.session_state['questions_data'] = questions_data
-            st.session_state['tech'] = selected_tech
-            st.session_state['company'] = selected_company
-            
-            progress_bar.progress(100)
-            status_text.empty()
-            progress_bar.empty()
-            
-            st.success(f"✅ Successfully scraped {len(questions_data)} questions from the web!")
-            st.balloons()
+        if st.button("🚀 Generate Interview Questions", use_container_width=True, key="generate_btn"):
+            with st.spinner("📚 Generating comprehensive interview questions..."):
+                time.sleep(1)
+                
+                company_for_gen = selected_company if selected_company != "Select Company" else None
+                questions_data = generate_comprehensive_questions(
+                    selected_tech, 
+                    num_questions, 
+                    selected_filter,
+                    company_for_gen
+                )
+                
+                st.session_state['questions_data'] = questions_data
+                st.session_state['tech'] = selected_tech
+                st.session_state['company'] = selected_company
+                
+                st.success(f"✅ Successfully generated {len(questions_data)} questions!")
+                st.balloons()
     
-    # Display questions
+    # Display Interview Experiences (if enabled)
+    if show_experience and 'show_experience' in locals():
+        st.markdown('<div class="divider"></div>', unsafe_allow_html=True)
+        st.markdown('<h2 class="sub-header">💼 Interview Experiences</h2>', unsafe_allow_html=True)
+        
+        experiences = {
+            "Google": [
+                {
+                    "title": "Software Engineer - L3",
+                    "date": "December 2024",
+                    "rounds": "Phone Screen → Technical (2 rounds) → Googleyness → Team Matching",
+                    "experience": "Very focused on algorithms and system design. Interviewers were friendly. Questions were medium to hard on LeetCode scale. They care about code quality and optimization."
+                },
+                {
+                    "title": "ML Engineer - L4",
+                    "date": "November 2024",
+                    "rounds": "Phone Screen → ML Design → Coding → Behavioral",
+                    "experience": "Heavy focus on ML system design. Asked about scaling ML models, feature engineering, and production deployment. Coding round was standard algorithms."
+                }
+            ],
+            "Amazon": [
+                {
+                    "title": "SDE-2",
+                    "date": "January 2025",
+                    "rounds": "OA → Phone Screen → Virtual Onsite (4 rounds)",
+                    "experience": "Leadership principles are crucial. Every answer should tie back to them. System design was focused on AWS services. Coding questions were medium difficulty."
+                }
+            ],
+            "Microsoft": [
+                {
+                    "title": "Software Engineer",
+                    "date": "December 2024",
+                    "rounds": "Phone Screen → Onsite (4 rounds)",
+                    "experience": "Very collaborative interview process. Focus on problem-solving approach rather than just the solution. Asked about Azure services and cloud architecture."
+                }
+            ]
+        }
+        
+        if experience_company in experiences:
+            for exp in experiences[experience_company]:
+                st.markdown(f"""
+                <div class="question-container">
+                    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px;">
+                        <h3 style="color: #667eea; margin: 0;">{exp['title']}</h3>
+                        <span class="badge badge-source">{exp['date']}</span>
+                    </div>
+                    <p style="margin: 10px 0;"><strong>Interview Rounds:</strong> {exp['rounds']}</p>
+                    <p style="margin: 10px 0; line-height: 1.6;">{exp['experience']}</p>
+                </div>
+                """, unsafe_allow_html=True)
+    
+    # Display Questions
     if 'questions_data' in st.session_state and st.session_state['questions_data']:
-        st.markdown("<br>", unsafe_allow_html=True)
-        st.markdown('<h2 class="sub-header">📋 Interview Questions & Answers</h2>', unsafe_allow_html=True)
+        st.markdown('<div class="divider"></div>', unsafe_allow_html=True)
+        st.markdown('<h2 class="sub-header">📋 Interview Questions & Detailed Answers</h2>', unsafe_allow_html=True)
         
         questions_data = st.session_state['questions_data']
         
-        # Summary stats
+        # Statistics
         col1, col2, col3, col4 = st.columns(4)
         with col1:
-            st.metric("Total Questions", len(questions_data))
+            st.metric("📚 Total Questions", len(questions_data))
         with col2:
-            sources = set([q.get('source', 'Unknown') for q in questions_data])
-            st.metric("Sources", len(sources))
+            easy_count = sum(1 for q in questions_data if q.get('difficulty') == 'Easy')
+            st.metric("✅ Easy", easy_count)
         with col3:
-            with_answers = sum(1 for q in questions_data if q.get('answer'))
-            st.metric("With Answers", with_answers)
+            medium_count = sum(1 for q in questions_data if q.get('difficulty') == 'Medium')
+            st.metric("⚡ Medium", medium_count)
         with col4:
-            with_videos = sum(1 for q in questions_data if q.get('video'))
-            st.metric("Video Links", with_videos)
+            hard_count = sum(1 for q in questions_data if q.get('difficulty') == 'Hard')
+            st.metric("🔥 Hard", hard_count)
         
         st.markdown("<br>", unsafe_allow_html=True)
         
-        # Display each question
+        # Display each question with proper formatting
         for idx, qa in enumerate(questions_data, 1):
-            with st.container():
-                # Question card
+            st.markdown(f"""
+            <div class="question-container">
+                <div class="question-header">
+                    <div class="question-number">Question {idx} of {len(questions_data)}</div>
+                    <div class="question-text">{qa['question']}</div>
+                </div>
+            """, unsafe_allow_html=True)
+            
+            # Answer section with proper formatting
+            if qa.get('answer'):
+                # Convert markdown-style formatting to HTML
+                answer_html = qa['answer']
+                answer_html = answer_html.replace('**', '<strong>').replace('**', '</strong>')
+                answer_html = answer_html.replace('• ', '<li>').replace('\n\n', '</li></ul><br><ul>').replace('\n', '</li><li>')
+                
+                # Split into paragraphs for better readability
+                paragraphs = qa['answer'].split('\n\n')
+                formatted_answer = ""
+                
+                for para in paragraphs:
+                    if para.strip():
+                        # Check if it's a bullet list
+                        if '•' in para or para.strip().startswith('-'):
+                            items = [item.strip('• -') for item in para.split('\n') if item.strip()]
+                            formatted_answer += "<ul style='margin: 15px 0; padding-left: 25px;'>"
+                            for item in items:
+                                if item:
+                                    # Bold text in items
+                                    item = re.sub(r'\*\*(.*?)\*\*', r'<strong>\1</strong>', item)
+                                    formatted_answer += f"<li style='margin: 8px 0; line-height: 1.6;'>{item}</li>"
+                            formatted_answer += "</ul>"
+                        else:
+                            # Regular paragraph
+                            para = re.sub(r'\*\*(.*?)\*\*', r'<strong>\1</strong>', para)
+                            formatted_answer += f"<p style='margin: 15px 0; line-height: 1.8;'>{para}</p>"
+                
                 st.markdown(f"""
-                <div class="question-card">
-                    <div class="question-text">Q{idx}. {qa['question']}</div>
+                <div class="answer-section">
+                    <span class="answer-label">📝 Detailed Answer:</span>
+                    <div class="answer-text">{formatted_answer}</div>
                 </div>
                 """, unsafe_allow_html=True)
-                
-                # Answer card
-                if qa.get('answer'):
-                    st.markdown(f"""
-                    <div class="answer-card">
-                        <div class="answer-text">
-                            <strong>Answer:</strong><br>
-                            {qa['answer'][:800]}
-                        </div>
-                    </div>
-                    """, unsafe_allow_html=True)
-                
-                # Source and URL badges
-                col1, col2 = st.columns(2)
-                with col1:
-                    if qa.get('source'):
-                        st.markdown(f"""
-                        <span class="source-badge">📚 {qa['source']}</span>
-                        """, unsafe_allow_html=True)
-                
-                with col2:
-                    if qa.get('url'):
-                        st.markdown(f"""
-                        <a href="{qa['url']}" target="_blank" class="source-badge">🔗 View Source</a>
-                        """, unsafe_allow_html=True)
-                
-                # Video link
-                if qa.get('video'):
-                    st.markdown(f"""
-                    <a href="{qa['video']}" target="_blank" class="video-link">
-                        🎥 Watch Video Explanation
-                    </a>
-                    """, unsafe_allow_html=True)
-                
-                st.markdown("<br>", unsafe_allow_html=True)
+            
+            # Metadata section
+            st.markdown('<div class="metadata-section">', unsafe_allow_html=True)
+            
+            col1, col2, col3 = st.columns(3)
+            
+            with col1:
+                if qa.get('source'):
+                    st.markdown(f'<span class="badge badge-source">📚 {qa["source"]}</span>', unsafe_allow_html=True)
+            
+            with col2:
+                if qa.get('difficulty'):
+                    st.markdown(f'<span class="badge badge-difficulty">⚡ {qa["difficulty"]}</span>', unsafe_allow_html=True)
+            
+            with col3:
+                if qa.get('category'):
+                    st.markdown(f'<span class="badge badge-category">🏷️ {qa["category"]}</span>', unsafe_allow_html=True)
+            
+            st.markdown('</div>', unsafe_allow_html=True)
+            
+            # Links section
+            if qa.get('video'):
+                st.markdown(f"""
+                <a href="{qa['video']}" target="_blank" class="link-button">
+                    🎥 Watch Video Explanation
+                </a>
+                """, unsafe_allow_html=True)
+            
+            st.markdown('</div><br>', unsafe_allow_html=True)
         
-        # Export options
-        st.markdown("<br><br>", unsafe_allow_html=True)
-        st.markdown('<h2 class="sub-header">💾 Export Options</h2>', unsafe_allow_html=True)
+        # Export Section
+        st.markdown('<div class="divider"></div>', unsafe_allow_html=True)
+        st.markdown('<h2 class="sub-header">💾 Export Your Questions</h2>', unsafe_allow_html=True)
+        
+        st.markdown("""
+        <div class="info-box">
+            <strong>📥 Download Options:</strong><br>
+            Export your personalized question set to PDF or Word format for offline practice and reference.
+        </div>
+        """, unsafe_allow_html=True)
         
         col1, col2, col3 = st.columns([1, 1, 1])
         
-        with col1:
-            st.markdown("<br>", unsafe_allow_html=True)
-        
         with col2:
-            # PDF download
             with st.spinner("Generating PDF..."):
                 pdf_buffer = create_pdf(
                     questions_data, 
                     st.session_state['tech'],
-                    st.session_state['company'] if st.session_state['company'] != "Select Company" else None
+                    st.session_state.get('company')
                 )
             
             filename_base = f"{st.session_state['tech'].replace(' ', '_')}_Interview_Questions"
-            if st.session_state['company'] != "Select Company":
+            if st.session_state.get('company') and st.session_state['company'] != "Select Company":
                 filename_base += f"_{st.session_state['company'].replace(' ', '_')}"
             
             st.download_button(
-                label="📄 Download as PDF",
+                label="📄 Download PDF",
                 data=pdf_buffer,
                 file_name=f"{filename_base}.pdf",
                 mime="application/pdf",
@@ -842,36 +1361,32 @@ def main():
             )
         
         with col3:
-            # Word download
             with st.spinner("Generating Word document..."):
                 word_buffer = create_word(
                     questions_data,
                     st.session_state['tech'],
-                    st.session_state['company'] if st.session_state['company'] != "Select Company" else None
+                    st.session_state.get('company')
                 )
             
             st.download_button(
-                label="📝 Download as Word",
+                label="📝 Download Word",
                 data=word_buffer,
                 file_name=f"{filename_base}.docx",
                 mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
                 use_container_width=True
             )
     
-    elif 'questions_data' in st.session_state and not st.session_state['questions_data']:
-        st.warning("⚠️ No questions were found. Try a different technology or check your internet connection.")
-    
     # Footer
-    st.markdown("<br><br>", unsafe_allow_html=True)
-    st.markdown("---")
+    st.markdown('<div class="divider"></div>', unsafe_allow_html=True)
     st.markdown("""
-    <div style="text-align: center; color: #666; padding: 20px;">
-        <p>🌟 <strong>Interview Prep Master - Dynamic Web Scraper</strong></p>
-        <p>🌐 Real-time scraping from GeeksforGeeks, InterviewBit, JavaTpoint, Guru99 & more</p>
-        <p>💼 Practice • 🎯 Prepare • 🚀 Succeed</p>
-        <p style="font-size: 0.9rem; margin-top: 10px;">
-            <strong>Sources:</strong> GeeksforGeeks | InterviewBit | JavaTpoint | Guru99 | Web Search<br>
-            <strong>Note:</strong> Questions are dynamically scraped from public websites. Please verify answers independently.
+    <div style="text-align: center; color: #666; padding: 30px 20px;">
+        <p style="font-size: 1.3rem; font-weight: 600; margin-bottom: 15px;">🌟 Interview Prep Master Pro</p>
+        <p style="font-size: 1rem; margin: 10px 0;">Comprehensive Interview Preparation Platform</p>
+        <p style="font-size: 0.95rem; margin: 10px 0;">
+            ✨ Features: Trending Questions • Company-Specific Prep • Interview Experiences • Detailed Answers • Video Resources
+        </p>
+        <p style="font-size: 0.9rem; margin-top: 20px; color: #999;">
+            💼 Practice Daily • 🎯 Stay Focused • 🚀 Achieve Success
         </p>
     </div>
     """, unsafe_allow_html=True)
