@@ -24,3 +24,4 @@ mplfinance
 reportlab
 python-docx
 speechrecognition
+pyaudio
