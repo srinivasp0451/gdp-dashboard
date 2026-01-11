@@ -2,10 +2,10 @@ import streamlit as st
 import streamlit.components.v1 as components
 from datetime import datetime
 import requests
-from bs4 import BeautifulSoup
 import re
+import json
+import time
 
-# Page configuration
 st.set_page_config(
     page_title="AI Interview Assistant",
     page_icon="🎤",
@@ -13,58 +13,85 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# Custom CSS
 st.markdown("""
     <style>
-    .main { background-color: #f8f9fa; }
+    .main { background-color: #f5f7fa; }
     .stButton>button {
         width: 100%;
-        border-radius: 8px;
-        height: 50px;
-        font-weight: 600;
-        font-size: 16px;
+        border-radius: 10px;
+        height: 60px;
+        font-weight: 700;
+        font-size: 18px;
         transition: all 0.3s;
     }
-    .question-display {
+    .status-listening {
         background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
         color: white;
-        padding: 25px;
-        border-radius: 12px;
+        padding: 30px;
+        border-radius: 15px;
+        text-align: center;
+        font-size: 24px;
+        font-weight: bold;
+        animation: pulse 2s infinite;
         margin: 20px 0;
-        box-shadow: 0 4px 15px rgba(0,0,0,0.2);
     }
-    .answer-display {
-        background: linear-gradient(135deg, #f093fb 0%, #f5576c 100%);
+    .status-stopped {
+        background: #f8d7da;
+        color: #721c24;
+        padding: 30px;
+        border-radius: 15px;
+        text-align: center;
+        font-size: 24px;
+        font-weight: bold;
+        margin: 20px 0;
+    }
+    @keyframes pulse {
+        0%, 100% { opacity: 1; }
+        50% { opacity: 0.8; }
+    }
+    .question-card {
+        background: linear-gradient(135deg, #4facfe 0%, #00f2fe 100%);
         color: white;
-        padding: 25px;
-        border-radius: 12px;
+        padding: 30px;
+        border-radius: 15px;
         margin: 20px 0;
-        box-shadow: 0 4px 15px rgba(0,0,0,0.2);
+        box-shadow: 0 10px 30px rgba(0,0,0,0.2);
     }
-    .source-box {
-        background: #fff;
-        padding: 15px;
-        border-radius: 8px;
-        border-left: 4px solid #ff9800;
-        margin: 10px 0;
-        box-shadow: 0 2px 5px rgba(0,0,0,0.1);
+    .answer-card {
+        background: white;
+        padding: 25px;
+        border-radius: 15px;
+        margin: 15px 0;
+        box-shadow: 0 5px 15px rgba(0,0,0,0.1);
+        border-left: 5px solid #4CAF50;
     }
-    .source-link {
-        color: #1976D2;
+    .source-tag {
+        display: inline-block;
+        background: #ff9800;
+        color: white;
+        padding: 8px 15px;
+        border-radius: 20px;
+        font-size: 14px;
+        margin: 5px;
         text-decoration: none;
         font-weight: 600;
+    }
+    .source-tag:hover {
+        background: #f57c00;
     }
     </style>
 """, unsafe_allow_html=True)
 
-# Initialize session state
+# Session state
 if 'qa_history' not in st.session_state:
     st.session_state.qa_history = []
-if 'transcript_buffer' not in st.session_state:
-    st.session_state.transcript_buffer = ""
+if 'is_listening' not in st.session_state:
+    st.session_state.is_listening = False
+if 'last_question_hash' not in st.session_state:
+    st.session_state.last_question_hash = None
 
-def clean_text(text):
-    """Remove repeated words"""
+def clean_repeated_words(text):
+    """Remove consecutive duplicate words"""
     words = text.split()
     result = []
     prev = ""
@@ -75,61 +102,64 @@ def clean_text(text):
     return " ".join(result)
 
 def search_wikipedia(query):
-    """Search Wikipedia"""
+    """Search Wikipedia API"""
     try:
-        search_url = "https://en.wikipedia.org/w/api.php"
+        url = "https://en.wikipedia.org/w/api.php"
+        
+        # Search for page
         search_params = {
             'action': 'query',
             'format': 'json',
             'list': 'search',
             'srsearch': query,
             'utf8': 1,
-            'srlimit': 1
+            'srlimit': 3
         }
         
-        search_response = requests.get(search_url, params=search_params, timeout=10)
-        search_data = search_response.json()
+        search_resp = requests.get(url, params=search_params, timeout=8)
+        search_data = search_resp.json()
         
-        if not search_data.get('query', {}).get('search'):
-            return None
+        results = []
+        search_results = search_data.get('query', {}).get('search', [])
         
-        page_title = search_data['query']['search'][0]['title']
-        
-        content_params = {
-            'action': 'query',
-            'format': 'json',
-            'titles': page_title,
-            'prop': 'extracts',
-            'exintro': 1,
-            'explaintext': 1
-        }
-        
-        content_response = requests.get(search_url, params=content_params, timeout=10)
-        content_data = content_response.json()
-        
-        pages = content_data.get('query', {}).get('pages', {})
-        if pages:
-            page = list(pages.values())[0]
-            extract = page.get('extract', '')
+        for item in search_results[:2]:
+            title = item['title']
             
-            sentences = re.split(r'(?<=[.!?])\s+', extract)[:5]
-            answer = ' '.join(sentences)
-            
-            url = f"https://en.wikipedia.org/wiki/{page_title.replace(' ', '_')}"
-            
-            return {
-                'answer': answer,
-                'source': url,
-                'title': f'Wikipedia: {page_title}'
+            # Get page extract
+            extract_params = {
+                'action': 'query',
+                'format': 'json',
+                'titles': title,
+                'prop': 'extracts',
+                'exintro': 1,
+                'explaintext': 1
             }
+            
+            extract_resp = requests.get(url, params=extract_params, timeout=8)
+            extract_data = extract_resp.json()
+            
+            pages = extract_data.get('query', {}).get('pages', {})
+            if pages:
+                page = list(pages.values())[0]
+                extract = page.get('extract', '')
+                
+                if extract:
+                    # Get first 3-4 sentences
+                    sentences = re.split(r'(?<=[.!?])\s+', extract)[:4]
+                    answer_text = ' '.join(sentences)
+                    
+                    results.append({
+                        'answer': answer_text,
+                        'source': f"https://en.wikipedia.org/wiki/{title.replace(' ', '_')}",
+                        'title': f'Wikipedia: {title}'
+                    })
         
-        return None
+        return results
     except Exception as e:
-        st.error(f"Wikipedia error: {str(e)}")
-        return None
+        return []
 
 def search_duckduckgo(query):
-    """Search DuckDuckGo"""
+    """Search DuckDuckGo API"""
     try:
         url = "https://api.duckduckgo.com/"
         params = {
@@ -139,8 +169,8 @@ def search_duckduckgo(query):
             'skip_disambig': 1
         }
         
-        response = requests.get(url, params=params, timeout=10)
-        data = response.json()
+        resp = requests.get(url, params=params, timeout=8)
+        data = resp.json()
         
         results = []
         
@@ -148,10 +178,10 @@ def search_duckduckgo(query):
             results.append({
                 'answer': data['Abstract'],
                 'source': data.get('AbstractURL', 'https://duckduckgo.com'),
-                'title': data.get('Heading', 'DuckDuckGo')
+                'title': data.get('Heading', 'DuckDuckGo Answer')
             })
         
-        for topic in data.get('RelatedTopics', [])[:2]:
+        for topic in data.get('RelatedTopics', [])[:1]:
             if isinstance(topic, dict) and topic.get('Text'):
                 results.append({
                     'answer': topic['Text'],
@@ -159,214 +189,334 @@ def search_duckduckgo(query):
                     'title': 'DuckDuckGo Related'
                 })
         
-        return results if results else None
-    except Exception as e:
-        st.error(f"DuckDuckGo error: {str(e)}")
-        return None
+        return results
+    except:
+        return []
 
-def get_web_answers(question):
-    """Get answers from web"""
-    answers = []
+def get_answers(question):
+    """Get answers from multiple sources"""
+    all_answers = []
     
-    with st.spinner("🔍 Searching Wikipedia..."):
-        wiki_result = search_wikipedia(question)
-        if wiki_result:
-            answers.append(wiki_result)
+    # Wikipedia
+    wiki_results = search_wikipedia(question)
+    all_answers.extend(wiki_results)
     
-    with st.spinner("🔍 Searching DuckDuckGo..."):
-        ddg_results = search_duckduckgo(question)
-        if ddg_results:
-            answers.extend(ddg_results)
+    # DuckDuckGo
+    ddg_results = search_duckduckgo(question)
+    all_answers.extend(ddg_results)
     
-    if not answers:
-        answers.append({
-            'answer': f'No results found for "{question}". Try rephrasing.',
+    if not all_answers:
+        all_answers.append({
+            'answer': f'No direct answer found for "{question}". This might be a very specific or new topic.',
             'source': f'https://www.google.com/search?q={question.replace(" ", "+")}',
-            'title': 'Search Google'
+            'title': 'Try Google Search'
         })
     
-    return answers
+    return all_answers
 
 # Sidebar
 with st.sidebar:
-    st.title("⚙️ Settings")
+    st.title("⚙️ Configuration")
     
     trigger_keyword = st.text_input(
-        "🎯 Trigger Keyword",
+        "Trigger Keyword",
         value="I understood",
-        help="Say this after your question"
+        help="Say this to trigger answer search"
     ).lower().strip()
     
-    max_sources = st.slider("📊 Max Sources", 1, 5, 3)
+    language = st.selectbox(
+        "Language",
+        ["en-US", "en-GB", "es-ES", "fr-FR", "de-DE", "hi-IN"],
+        index=0
+    )
+    
+    max_answers = st.slider("Max Answers", 1, 5, 3)
     
     st.markdown("---")
-    st.metric("📚 Total Q&A", len(st.session_state.qa_history))
+    st.metric("📊 Questions Asked", len(st.session_state.qa_history))
     
-    if st.button("🗑️ Clear All"):
+    if st.button("🗑️ Clear History"):
         st.session_state.qa_history = []
-        st.session_state.transcript_buffer = ""
         st.rerun()
 
 # Main UI
-st.title("🎤 Interview Assistant with Web Search")
-st.markdown("### Type your question + trigger word, then click Search!")
+st.title("🎤 AI Interview Assistant")
+st.markdown("### Automatic Speech-to-Text with Web Search")
+
+# Control buttons
+col1, col2 = st.columns(2)
+
+with col1:
+    if st.button("▶️ START INTERVIEW", type="primary", use_container_width=True):
+        st.session_state.is_listening = True
+        st.rerun()
+
+with col2:
+    if st.button("⏹️ STOP INTERVIEW", use_container_width=True):
+        st.session_state.is_listening = False
+        st.rerun()
 
 st.markdown("---")
 
-# Input area
-col1, col2 = st.columns([3, 1])
-
-with col1:
-    transcript = st.text_area(
-        "📝 Type Your Question:",
-        value=st.session_state.transcript_buffer,
-        height=120,
-        placeholder=f"Example: What is Python {trigger_keyword}",
-        key="transcript_input"
-    )
-    st.session_state.transcript_buffer = transcript
-
-with col2:
-    st.markdown("### Actions")
+# Speech recognition component
+speech_component = f"""
+<!DOCTYPE html>
+<html>
+<head>
+    <style>
+        body {{
+            font-family: 'Arial', sans-serif;
+            padding: 20px;
+            background: #f5f7fa;
+            margin: 0;
+        }}
+        #status {{
+            font-size: 20px;
+            font-weight: bold;
+            padding: 20px;
+            border-radius: 10px;
+            text-align: center;
+            margin-bottom: 20px;
+        }}
+        .listening {{
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+        }}
+        .stopped {{
+            background: #f8d7da;
+            color: #721c24;
+        }}
+        #transcript {{
+            background: white;
+            padding: 20px;
+            border-radius: 10px;
+            min-height: 100px;
+            font-size: 18px;
+            line-height: 1.6;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+        }}
+        .interim {{ color: #999; font-style: italic; }}
+        .detected {{ color: #4CAF50; font-weight: bold; }}
+    </style>
+</head>
+<body>
+    <div id="status">Initializing...</div>
+    <div id="transcript">Waiting to start...</div>
     
-    if st.button("🔍 Search Now", type="primary", use_container_width=True):
-        if trigger_keyword in transcript.lower():
-            parts = transcript.lower().split(trigger_keyword)
-            question = clean_text(parts[0].strip())
-            
-            if len(question) > 3:
-                st.session_state.current_question = question
-                st.rerun()
-            else:
-                st.error("Question too short!")
-        else:
-            st.warning(f"Add '{trigger_keyword}' after question!")
-    
-    if st.button("🔄 Clear", use_container_width=True):
-        st.session_state.transcript_buffer = ""
-        st.rerun()
-
-# Process and display results
-if 'current_question' in st.session_state and st.session_state.current_question:
-    question = st.session_state.current_question
-    
-    st.markdown("---")
-    st.markdown("## 🔍 SEARCH RESULTS")
-    
-    # Display question
-    st.markdown(
-        f'<div class="question-display">'
-        f'<h2>❓ YOUR QUESTION:</h2>'
-        f'<h3>{question}</h3>'
-        f'</div>',
-        unsafe_allow_html=True
-    )
-    
-    # Get answers
-    answers = get_web_answers(question)[:max_sources]
-    
-    # Display answers
-    st.markdown("### ✅ ANSWERS FROM WEB:")
-    
-    for idx, ans in enumerate(answers, 1):
-        st.markdown(
-            f'<div class="answer-display">'
-            f'<h3>📝 Answer {idx}:</h3>'
-            f'<p style="font-size: 18px; line-height: 1.8;">{ans["answer"]}</p>'
-            f'</div>',
-            unsafe_allow_html=True
-        )
+    <script>
+        let recognition;
+        let isListening = {json.dumps(st.session_state.is_listening)};
+        let finalTranscript = '';
+        const triggerWord = '{trigger_keyword}';
+        const lang = '{language}';
+        let questionProcessed = false;
         
-        st.markdown(
-            f'<div class="source-box">'
-            f'🔗 <strong>Source:</strong> '
-            f'<a href="{ans["source"]}" target="_blank" class="source-link">{ans["title"]}</a><br>'
-            f'<small style="color: #666;">{ans["source"]}</small>'
-            f'</div>',
-            unsafe_allow_html=True
-        )
-    
-    # Combined text
-    combined = f"QUESTION:\n{question}\n\n"
-    for idx, ans in enumerate(answers, 1):
-        combined += f"ANSWER {idx}:\n{ans['answer']}\n\nSOURCE: {ans['title']}\n{ans['source']}\n\n"
-    
-    st.text_area("📋 COPY ALL (Question + Answers + Sources)", value=combined, height=300)
-    
-    # Save to history
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    st.session_state.qa_history.append({
-        'question': question,
-        'answers': answers,
-        'timestamp': timestamp
-    })
-    
-    st.session_state.transcript_buffer = ""
-    del st.session_state.current_question
-    
-    st.success("✅ Saved to history! Ready for next question.")
+        function cleanRepeated(text) {{
+            const words = text.split(' ');
+            const cleaned = [];
+            let prev = '';
+            for (let word of words) {{
+                if (word.toLowerCase() !== prev.toLowerCase() || word.length < 3) {{
+                    cleaned.push(word);
+                }}
+                prev = word;
+            }}
+            return cleaned.join(' ');
+        }}
+        
+        function init() {{
+            if (!('webkitSpeechRecognition' in window)) {{
+                document.getElementById('status').innerHTML = '❌ Speech Recognition not supported. Use Chrome/Edge/Safari.';
+                document.getElementById('status').className = 'stopped';
+                return;
+            }}
+            
+            recognition = new webkitSpeechRecognition();
+            recognition.continuous = true;
+            recognition.interimResults = true;
+            recognition.lang = lang;
+            
+            recognition.onstart = () => {{
+                document.getElementById('status').innerHTML = '🎙️ LISTENING - Ask your question then say "' + triggerWord + '"';
+                document.getElementById('status').className = 'listening';
+                document.getElementById('transcript').innerHTML = '🎤 Listening...';
+                questionProcessed = false;
+            }};
+            
+            recognition.onresult = (event) => {{
+                let interim = '';
+                finalTranscript = '';
+                
+                for (let i = 0; i < event.results.length; i++) {{
+                    if (event.results[i].isFinal) {{
+                        finalTranscript += event.results[i][0].transcript + ' ';
+                    }} else {{
+                        interim += event.results[i][0].transcript;
+                    }}
+                }}
+                
+                const cleanFinal = cleanRepeated(finalTranscript);
+                const cleanInterim = cleanRepeated(interim);
+                
+                document.getElementById('transcript').innerHTML = 
+                    cleanFinal + '<span class="interim">' + cleanInterim + '</span>';
+                
+                // Check for trigger
+                const fullText = (cleanFinal + ' ' + cleanInterim).toLowerCase();
+                if (fullText.includes(triggerWord) && !questionProcessed) {{
+                    const idx = cleanFinal.toLowerCase().indexOf(triggerWord);
+                    if (idx > 0) {{
+                        const question = cleanFinal.substring(0, idx).trim();
+                        
+                        if (question.length > 3) {{
+                            questionProcessed = true;
+                            
+                            document.getElementById('transcript').innerHTML = 
+                                '<span class="detected">✅ Question: "' + question + '"</span><br>🔍 Searching web...';
+                            
+                            // Send to Streamlit
+                            const data = {{
+                                question: question,
+                                timestamp: new Date().toISOString()
+                            }};
+                            
+                            window.parent.postMessage({{
+                                type: 'streamlit:setComponentValue',
+                                data: data
+                            }}, '*');
+                            
+                            // Reset for next
+                            finalTranscript = '';
+                            setTimeout(() => {{
+                                if (isListening) {{
+                                    document.getElementById('transcript').innerHTML = '🎤 Ready for next question...';
+                                    questionProcessed = false;
+                                }}
+                            }}, 3000);
+                        }}
+                    }}
+                }}
+            }};
+            
+            recognition.onerror = (event) => {{
+                if (event.error === 'not-allowed') {{
+                    document.getElementById('status').innerHTML = '❌ Microphone access denied';
+                    document.getElementById('status').className = 'stopped';
+                }}
+            }};
+            
+            recognition.onend = () => {{
+                if (isListening && !questionProcessed) {{
+                    setTimeout(() => recognition.start(), 100);
+                }} else {{
+                    document.getElementById('status').innerHTML = '⏸️ STOPPED';
+                    document.getElementById('status').className = 'stopped';
+                }}
+            }};
+            
+            if (isListening) {{
+                recognition.start();
+            }} else {{
+                document.getElementById('status').innerHTML = '⏸️ Click START INTERVIEW to begin';
+                document.getElementById('status').className = 'stopped';
+            }}
+        }}
+        
+        init();
+    </script>
+</body>
+</html>
+"""
 
-# History
+# Display speech component
+result = components.html(speech_component, height=200)
+
+# Process question automatically
+if result and isinstance(result, dict):
+    data = result.get('data', {})
+    if data and isinstance(data, dict):
+        question = data.get('question', '').strip()
+        question_hash = hash(question)
+        
+        # Avoid duplicate processing
+        if question and question_hash != st.session_state.last_question_hash:
+            st.session_state.last_question_hash = question_hash
+            
+            # Display question
+            st.markdown(
+                f'<div class="question-card">'
+                f'<h2>❓ YOUR QUESTION:</h2>'
+                f'<h3>{question}</h3>'
+                f'</div>',
+                unsafe_allow_html=True
+            )
+            
+            # Search and display answers
+            with st.spinner("🔍 Searching Wikipedia and DuckDuckGo..."):
+                answers = get_answers(question)[:max_answers]
+            
+            st.markdown("### ✅ ANSWERS:")
+            
+            for idx, ans in enumerate(answers, 1):
+                st.markdown(
+                    f'<div class="answer-card">'
+                    f'<h4>Answer {idx}:</h4>'
+                    f'<p style="font-size: 16px; line-height: 1.8; color: #333;">{ans["answer"]}</p>'
+                    f'<a href="{ans["source"]}" target="_blank" class="source-tag">🔗 {ans["title"]}</a>'
+                    f'</div>',
+                    unsafe_allow_html=True
+                )
+            
+            # Save to history
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            st.session_state.qa_history.append({
+                'question': question,
+                'answers': answers,
+                'timestamp': timestamp
+            })
+            
+            st.success("✅ Saved to history!")
+            time.sleep(1)
+            st.rerun()
+
+# History section
 if st.session_state.qa_history:
     st.markdown("---")
-    st.markdown("## 📚 HISTORY")
+    st.markdown("## 📚 Interview History")
     
     for idx, qa in enumerate(reversed(st.session_state.qa_history), 1):
-        with st.expander(
-            f"Q{len(st.session_state.qa_history) - idx + 1}: {qa['question'][:60]}... ({qa['timestamp']})"
-        ):
-            st.markdown(f"**❓ Question:** {qa['question']}")
+        with st.expander(f"Q{len(st.session_state.qa_history)-idx+1}: {qa['question'][:60]}... ({qa['timestamp']})"):
+            st.markdown(f"**Question:** {qa['question']}")
+            st.markdown("**Answers:**")
             
-            for ans_idx, ans in enumerate(qa['answers'], 1):
-                st.markdown(f"**📝 Answer {ans_idx}:**")
-                st.write(ans['answer'])
-                st.markdown(f"🔗 [{ans['title']}]({ans['source']})")
+            for aidx, ans in enumerate(qa['answers'], 1):
+                st.write(f"{aidx}. {ans['answer']}")
+                st.markdown(f"   🔗 [{ans['title']}]({ans['source']})")
             
-            combined = f"Q: {qa['question']}\n\n"
-            for ans_idx, ans in enumerate(qa['answers'], 1):
-                combined += f"A{ans_idx}: {ans['answer']}\nSource: {ans['source']}\n\n"
+            # Copy text
+            copy_text = f"Q: {qa['question']}\n\n"
+            for aidx, ans in enumerate(qa['answers'], 1):
+                copy_text += f"A{aidx}: {ans['answer']}\nSource: {ans['source']}\n\n"
             
-            st.text_area("Copy", combined, height=120, key=f"h_{idx}")
+            st.text_area("Copy", copy_text, height=100, key=f"copy_{idx}")
 
 # Instructions
-with st.expander("📖 HOW TO USE"):
+with st.expander("ℹ️ Instructions"):
     st.markdown("""
-    ### Simple Steps:
+    ### How to Use:
     
-    1. **Type your question** in the text box
-    2. **Add trigger keyword** at the end (default: "I understood")
-    3. **Click "🔍 Search Now"**
-    4. **See results**: Question + Answers from Wikipedia & DuckDuckGo + Source links
+    1. Click **"▶️ START INTERVIEW"**
+    2. Allow microphone access when prompted
+    3. **Speak your question**: "What is Python?"
+    4. **Say trigger word**: "I understood"
+    5. **Automatic**: Question detected → Web search → Answers displayed!
     
-    ### Example:
-    ```
-    Type: "What is machine learning I understood"
-    Click: Search Now
+    ### No typing, no clicking needed!
     
-    Get:
-    ❓ YOUR QUESTION: What is machine learning
-    
-    ✅ ANSWERS FROM WEB:
-    📝 Answer 1: [Wikipedia explanation]
-    🔗 Source: Wikipedia link
-    
-    📝 Answer 2: [DuckDuckGo result]
-    🔗 Source: DuckDuckGo link
-    
-    📋 Copy box with everything combined
-    ```
-    
-    ### Tips:
-    - Always add trigger keyword after your question
-    - Questions must be at least 3 words
-    - Click source links to read full articles
-    - All Q&A saved in History section
+    - Questions and answers appear automatically
+    - All saved in history below
+    - Click stop when done
     """)
 
 st.markdown("---")
-st.markdown(
-    "<div style='text-align: center; color: #666;'>"
-    "💡 Searches Wikipedia & DuckDuckGo automatically!"
-    "</div>",
-    unsafe_allow_html=True
-)
+st.markdown("<div style='text-align: center; color: #666;'>💡 Fully Automated Speech Recognition + Web Search</div>", unsafe_allow_html=True)
