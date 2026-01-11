@@ -2,6 +2,9 @@ import streamlit as st
 import streamlit.components.v1 as components
 from datetime import datetime
 import json
+import requests
+from bs4 import BeautifulSoup
+import time
 
 # Page configuration
 st.set_page_config(
@@ -43,6 +46,11 @@ st.markdown("""
         border: 2px solid #c3e6cb;
         animation: pulse 2s infinite;
     }
+    .processing {
+        background-color: #fff3cd;
+        color: #856404;
+        border: 2px solid #ffeaa7;
+    }
     .stopped {
         background-color: #f8d7da;
         color: #721c24;
@@ -66,22 +74,21 @@ st.markdown("""
         border-left: 4px solid #4CAF50;
         margin: 10px 0;
     }
-    .metric-card {
-        background-color: white;
-        padding: 20px;
-        border-radius: 10px;
-        box-shadow: 0 2px 8px rgba(0,0,0,0.1);
-        text-align: center;
+    .source-box {
+        background-color: #fff3e0;
+        padding: 10px;
+        border-radius: 6px;
+        border-left: 3px solid #ff9800;
+        margin: 5px 0;
+        font-size: 14px;
     }
-    #transcriptBox {
-        background-color: #fff;
-        border: 2px solid #ddd;
-        border-radius: 8px;
-        padding: 15px;
-        min-height: 100px;
-        font-size: 16px;
-        line-height: 1.6;
-        margin: 10px 0;
+    .source-link {
+        color: #1976D2;
+        text-decoration: none;
+        font-weight: 500;
+    }
+    .source-link:hover {
+        text-decoration: underline;
     }
     </style>
 """, unsafe_allow_html=True)
@@ -91,8 +98,125 @@ if 'qa_history' not in st.session_state:
     st.session_state.qa_history = []
 if 'is_listening' not in st.session_state:
     st.session_state.is_listening = False
-if 'last_processed' not in st.session_state:
-    st.session_state.last_processed = ""
+if 'last_processed_question' not in st.session_state:
+    st.session_state.last_processed_question = ""
+if 'processing' not in st.session_state:
+    st.session_state.processing = False
+
+def search_web(query):
+    """Search DuckDuckGo for answers"""
+    try:
+        # DuckDuckGo Instant Answer API
+        url = "https://api.duckduckgo.com/"
+        params = {
+            'q': query,
+            'format': 'json',
+            'no_html': 1,
+            'skip_disambig': 1
+        }
+        
+        response = requests.get(url, params=params, timeout=5)
+        data = response.json()
+        
+        results = []
+        
+        # Get abstract
+        if data.get('Abstract'):
+            results.append({
+                'answer': data['Abstract'],
+                'source': data.get('AbstractURL', 'DuckDuckGo'),
+                'title': data.get('Heading', 'Answer')
+            })
+        
+        # Get related topics
+        if data.get('RelatedTopics'):
+            for topic in data['RelatedTopics'][:3]:
+                if isinstance(topic, dict) and topic.get('Text'):
+                    results.append({
+                        'answer': topic['Text'],
+                        'source': topic.get('FirstURL', 'DuckDuckGo'),
+                        'title': 'Related Information'
+                    })
+        
+        return results
+    except Exception as e:
+        return [{'answer': f'Error searching: {str(e)}', 'source': 'Error', 'title': 'Error'}]
+
+def search_wikipedia(query):
+    """Search Wikipedia for answers"""
+    try:
+        # Wikipedia API
+        url = "https://en.wikipedia.org/w/api.php"
+        params = {
+            'action': 'query',
+            'format': 'json',
+            'list': 'search',
+            'srsearch': query,
+            'utf8': 1,
+            'srlimit': 1
+        }
+        
+        response = requests.get(url, params=params, timeout=5)
+        data = response.json()
+        
+        if data.get('query', {}).get('search'):
+            result = data['query']['search'][0]
+            title = result['title']
+            snippet = BeautifulSoup(result['snippet'], 'html.parser').get_text()
+            
+            # Get full extract
+            extract_params = {
+                'action': 'query',
+                'format': 'json',
+                'titles': title,
+                'prop': 'extracts',
+                'exintro': 1,
+                'explaintext': 1
+            }
+            
+            extract_response = requests.get(url, params=extract_params, timeout=5)
+            extract_data = extract_response.json()
+            
+            pages = extract_data.get('query', {}).get('pages', {})
+            if pages:
+                page = list(pages.values())[0]
+                full_text = page.get('extract', snippet)
+                
+                # Limit to first 3 sentences
+                sentences = full_text.split('. ')[:3]
+                answer_text = '. '.join(sentences) + '.'
+                
+                return [{
+                    'answer': answer_text,
+                    'source': f'https://en.wikipedia.org/wiki/{title.replace(" ", "_")}',
+                    'title': title
+                }]
+        
+        return []
+    except Exception as e:
+        return []
+
+def get_answer(question):
+    """Get answer from multiple sources"""
+    all_results = []
+    
+    # Search Wikipedia first
+    wiki_results = search_wikipedia(question)
+    all_results.extend(wiki_results)
+    
+    # Then DuckDuckGo
+    ddg_results = search_web(question)
+    all_results.extend(ddg_results)
+    
+    # If no results, provide a generic message
+    if not all_results:
+        all_results.append({
+            'answer': f'No specific answer found for "{question}". Please try rephrasing or check the sources manually.',
+            'source': 'No source available',
+            'title': 'No Results'
+        })
+    
+    return all_results
 
 # Sidebar configuration
 with st.sidebar:
@@ -102,7 +226,7 @@ with st.sidebar:
     trigger_keyword = st.text_input(
         "Trigger Keyword",
         value="I understood",
-        help="Say this keyword to process your answer"
+        help="Say this keyword to search for the answer"
     ).lower().strip()
     
     language = st.selectbox(
@@ -123,15 +247,24 @@ with st.sidebar:
         index=0
     )
     
-    continuous_mode = st.checkbox(
-        "Continuous Listening",
+    st.markdown("### Search Settings")
+    max_sources = st.slider(
+        "Maximum Sources",
+        min_value=1,
+        max_value=5,
+        value=3,
+        help="Number of sources to display"
+    )
+    
+    auto_search = st.checkbox(
+        "Auto-search on trigger",
         value=True,
-        help="Keep listening after processing each answer"
+        help="Automatically search when trigger keyword is detected"
     )
     
     st.markdown("### Display Settings")
     show_timestamps = st.checkbox("Show Timestamps", value=True)
-    show_raw_transcript = st.checkbox("Show Raw Transcript", value=True)
+    show_raw_transcript = st.checkbox("Show Live Transcript", value=True)
     
     st.markdown("---")
     st.markdown("### Statistics")
@@ -144,13 +277,13 @@ with st.sidebar:
     
     if st.button("🗑️ Clear All History"):
         st.session_state.qa_history = []
-        st.session_state.last_processed = ""
+        st.session_state.last_processed_question = ""
         st.rerun()
 
 # Main content
-st.title("🎤 AI Interview Assistant")
-st.markdown("### Real-time Speech-to-Text Interview Helper")
-st.markdown("*Uses browser's built-in speech recognition - no additional installation required!*")
+st.title("🎤 AI Interview Assistant with Web Search")
+st.markdown("### Ask questions, get answers from the web automatically!")
+st.markdown("*Searches Wikipedia and DuckDuckGo for instant answers*")
 
 # Control buttons
 col1, col2 = st.columns(2)
@@ -164,6 +297,7 @@ with col2:
     stop_clicked = st.button("⏹️ Stop Interview", use_container_width=True)
     if stop_clicked:
         st.session_state.is_listening = False
+        st.session_state.processing = False
 
 # Web Speech API Component
 speech_component = f"""
@@ -182,7 +316,8 @@ let triggerKeyword = "{trigger_keyword}";
 let currentTranscript = "";
 let finalTranscript = "";
 let language = "{language[1]}";
-let continuousMode = {json.dumps(continuous_mode)};
+let autoSearch = {json.dumps(auto_search)};
+let questionDetected = false;
 
 function initializeSpeechRecognition() {{
     if (!('webkitSpeechRecognition' in window) && !('SpeechRecognition' in window)) {{
@@ -199,7 +334,7 @@ function initializeSpeechRecognition() {{
     recognition.lang = language;
     
     recognition.onstart = function() {{
-        document.getElementById('statusIndicator').innerHTML = '🎙️ LISTENING - Say your trigger keyword after answering';
+        document.getElementById('statusIndicator').innerHTML = '🎙️ LISTENING - Ask your question, then say "' + triggerKeyword + '"';
         document.getElementById('statusIndicator').className = 'status-box listening';
         document.getElementById('transcript').innerHTML = 'Listening...';
     }};
@@ -208,7 +343,6 @@ function initializeSpeechRecognition() {{
         let interimTranscript = "";
         finalTranscript = "";
         
-        // Build complete transcript from all final results
         for (let i = 0; i < event.results.length; i++) {{
             const transcript = event.results[i][0].transcript;
             if (event.results[i].isFinal) {{
@@ -219,18 +353,16 @@ function initializeSpeechRecognition() {{
         }}
         
         currentTranscript = finalTranscript.trim();
-        
-        // Clean up repeated words
         const cleanTranscript = cleanRepeatedWords(currentTranscript);
         const cleanInterim = cleanRepeatedWords(interimTranscript);
         
         const displayText = cleanTranscript + " <i style='color: #666;'>" + cleanInterim + "</i>";
         document.getElementById('transcript').innerHTML = displayText || 'Listening...';
         
-        // Check for trigger keyword in the combined text
         const fullText = (cleanTranscript + " " + cleanInterim).toLowerCase();
-        if (fullText.includes(triggerKeyword)) {{
-            processAnswer(cleanTranscript + " " + cleanInterim);
+        if (fullText.includes(triggerKeyword) && !questionDetected) {{
+            questionDetected = true;
+            processQuestion(cleanTranscript);
         }}
     }};
     
@@ -245,8 +377,7 @@ function initializeSpeechRecognition() {{
     }};
     
     recognition.onend = function() {{
-        if (isListening && continuousMode) {{
-            // Restart recognition if still in listening mode
+        if (isListening && !questionDetected) {{
             setTimeout(() => {{
                 if (isListening) {{
                     recognition.start();
@@ -259,61 +390,53 @@ function initializeSpeechRecognition() {{
     }};
 }}
 
-function processAnswer(transcript) {{
-    // Clean the transcript
+function processQuestion(transcript) {{
     const cleanedTranscript = cleanRepeatedWords(transcript);
-    
-    // Extract answer before trigger keyword
     const lowerTranscript = cleanedTranscript.toLowerCase();
     const keywordIndex = lowerTranscript.indexOf(triggerKeyword);
     
     if (keywordIndex >= 0) {{
-        const answer = cleanedTranscript.substring(0, keywordIndex).trim();
-        if (answer.length > 5) {{  // Minimum length check
-            // Send data to Streamlit
+        const question = cleanedTranscript.substring(0, keywordIndex).trim();
+        
+        if (question.length > 5) {{
+            document.getElementById('statusIndicator').innerHTML = '🔍 SEARCHING FOR ANSWER...';
+            document.getElementById('statusIndicator').className = 'status-box processing';
+            
             window.parent.postMessage({{
                 type: 'streamlit:setComponentValue',
                 value: {{
-                    answer: answer,
-                    timestamp: new Date().toISOString()
+                    question: question,
+                    timestamp: new Date().toISOString(),
+                    action: 'search'
                 }}
             }}, '*');
             
-            // Visual feedback
             document.getElementById('transcript').innerHTML = 
-                '✅ <strong>Answer captured!</strong><br>' + 
-                '<span style="color: #4CAF50;">Answer: ' + answer.substring(0, 100) + 
-                (answer.length > 100 ? '...' : '') + '</span><br>' +
-                'Ready for next question...';
+                '✅ <strong>Question detected:</strong><br>"' + question + '"<br>🔍 Searching web for answer...';
             
-            // Reset for next question
-            finalTranscript = "";
-            currentTranscript = "";
-            
-            // Brief pause before continuing
-            if (continuousMode) {{
-                setTimeout(() => {{
-                    document.getElementById('transcript').innerHTML = 'Listening for next question...';
-                }}, 3000);
-            }}
-        }} else {{
-            document.getElementById('transcript').innerHTML = 
-                '⚠️ Answer too short. Please speak your answer before saying the trigger keyword.';
+            setTimeout(() => {{
+                finalTranscript = "";
+                currentTranscript = "";
+                questionDetected = false;
+                
+                if (isListening) {{
+                    document.getElementById('transcript').innerHTML = 'Ready for next question...';
+                    document.getElementById('statusIndicator').innerHTML = '🎙️ LISTENING - Ask your next question';
+                    document.getElementById('statusIndicator').className = 'status-box listening';
+                }}
+            }}, 3000);
         }}
     }}
 }}
 
 function cleanRepeatedWords(text) {{
     if (!text) return text;
-    
-    // Split into words
     const words = text.split(' ');
     const cleanedWords = [];
     let prevWord = '';
     
     for (let word of words) {{
         const cleanWord = word.toLowerCase().trim();
-        // Only add if it's not the same as previous word
         if (cleanWord !== prevWord.toLowerCase().trim() || cleanWord.length < 3) {{
             cleanedWords.push(word);
         }}
@@ -325,6 +448,7 @@ function cleanRepeatedWords(text) {{
 
 function startListening() {{
     isListening = true;
+    questionDetected = false;
     if (recognition) {{
         finalTranscript = "";
         currentTranscript = "";
@@ -334,6 +458,7 @@ function startListening() {{
 
 function stopListening() {{
     isListening = false;
+    questionDetected = false;
     if (recognition) {{
         recognition.stop();
     }}
@@ -342,59 +467,55 @@ function stopListening() {{
     document.getElementById('transcript').innerHTML = 'Stopped';
 }}
 
-// Initialize on load
 initializeSpeechRecognition();
 
-// Start/stop based on initial state
 if (isListening) {{
     startListening();
 }}
-
-// Listen for updates from Streamlit
-window.addEventListener('message', function(event) {{
-    if (event.data.type === 'streamlit:render') {{
-        const newListening = event.data.args.is_listening;
-        if (newListening && !isListening) {{
-            startListening();
-        }} else if (!newListening && isListening) {{
-            stopListening();
-        }}
-    }}
-}});
 </script>
 """
 
 # Render the speech component
-result = components.html(
-    speech_component,
-    height=200 if show_raw_transcript else 100,
-)
+result = components.html(speech_component, height=200 if show_raw_transcript else 100)
 
-# Process received data
+# Process received data and search
 if result is not None:
     try:
-        if isinstance(result, dict):
-            answer = result.get('answer', '')
+        if isinstance(result, dict) and result.get('action') == 'search':
+            question = result.get('question', '')
             timestamp = result.get('timestamp', '')
             
-            # Avoid duplicate processing
-            if answer and answer != st.session_state.last_processed:
-                st.session_state.last_processed = answer
+            if question and question != st.session_state.last_processed_question:
+                st.session_state.last_processed_question = question
+                st.session_state.processing = True
                 
-                try:
-                    dt = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
-                    formatted_time = dt.strftime("%H:%M:%S")
-                except:
-                    formatted_time = datetime.now().strftime("%H:%M:%S")
-                
-                st.session_state.qa_history.append({
-                    'question': f"Question {len(st.session_state.qa_history) + 1}",
-                    'answer': answer,
-                    'timestamp': formatted_time
-                })
-                st.rerun()
+                # Show processing message
+                with st.spinner(f"🔍 Searching for answer to: '{question}'"):
+                    # Get answers from web
+                    answers = get_answer(question)
+                    
+                    # Limit to max_sources
+                    answers = answers[:max_sources]
+                    
+                    try:
+                        dt = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
+                        formatted_time = dt.strftime("%H:%M:%S")
+                    except:
+                        formatted_time = datetime.now().strftime("%H:%M:%S")
+                    
+                    st.session_state.qa_history.append({
+                        'question': question,
+                        'answers': answers,
+                        'timestamp': formatted_time
+                    })
+                    
+                    st.session_state.processing = False
+                    st.success("✅ Answer found and added to history!")
+                    time.sleep(1)
+                    st.rerun()
     except Exception as e:
-        pass  # Silently ignore processing errors
+        st.error(f"Error processing: {str(e)}")
+        st.session_state.processing = False
 
 # Q&A History
 if st.session_state.qa_history:
@@ -403,25 +524,43 @@ if st.session_state.qa_history:
     
     for idx, qa in enumerate(reversed(st.session_state.qa_history), 1):
         with st.expander(
-            f"Question {len(st.session_state.qa_history) - idx + 1}" + 
+            f"❓ {qa['question'][:80]}..." if len(qa['question']) > 80 else f"❓ {qa['question']}" + 
             (f" - {qa['timestamp']}" if show_timestamps else ""), 
             expanded=(idx==1)
         ):
             st.markdown(
-                f'<div class="question-box"><strong>❓ Question:</strong> {qa["question"]}</div>', 
+                f'<div class="question-box"><strong>❓ Question:</strong><br>{qa["question"]}</div>', 
                 unsafe_allow_html=True
             )
             
-            st.markdown(
-                f'<div class="answer-box"><strong>✅ Your Answer:</strong><br>{qa["answer"]}</div>', 
-                unsafe_allow_html=True
-            )
+            # Display all answers with sources
+            for ans_idx, answer in enumerate(qa['answers'], 1):
+                st.markdown(
+                    f'<div class="answer-box">'
+                    f'<strong>✅ Answer {ans_idx}:</strong><br>{answer["answer"]}'
+                    f'</div>', 
+                    unsafe_allow_html=True
+                )
+                
+                st.markdown(
+                    f'<div class="source-box">'
+                    f'📎 <strong>Source:</strong> '
+                    f'<a href="{answer["source"]}" target="_blank" class="source-link">{answer["title"]}</a> | '
+                    f'<a href="{answer["source"]}" target="_blank" class="source-link">{answer["source"][:60]}...</a>'
+                    f'</div>',
+                    unsafe_allow_html=True
+                )
             
-            # Editable answer text area
-            edited_answer = st.text_area(
-                "Formatted Answer (Edit/Copy)",
-                value=qa['answer'],
-                height=120,
+            # Combined answer for copying
+            combined_answer = "\n\n".join([
+                f"Answer {i+1}:\n{ans['answer']}\n\nSource: {ans['title']}\n{ans['source']}"
+                for i, ans in enumerate(qa['answers'])
+            ])
+            
+            st.text_area(
+                "📋 Combined Answer (Copy/Edit)",
+                value=combined_answer,
+                height=200,
                 key=f"answer_{len(st.session_state.qa_history) - idx + 1}"
             )
             
@@ -431,7 +570,7 @@ if st.session_state.qa_history:
                     st.session_state.qa_history.pop(len(st.session_state.qa_history) - idx)
                     st.rerun()
 else:
-    st.info("👆 Start the interview and begin answering questions. Your responses will appear here!")
+    st.info("👆 Start the interview and ask questions. Answers will be automatically searched from the web!")
 
 # Instructions
 with st.expander("ℹ️ How to Use", expanded=False):
@@ -440,51 +579,47 @@ with st.expander("ℹ️ How to Use", expanded=False):
     
     1. **Configure Settings** in the sidebar:
        - Set your trigger keyword (default: "I understood")
-       - Choose your language
-       - Toggle continuous listening mode
+       - Choose language and max sources
        - Customize display preferences
     
     2. **Start Interview**:
-       - Click the "▶️ Start Interview" button
-       - **Allow microphone access** when your browser prompts you
-       - Wait for "LISTENING" status
+       - Click "▶️ Start Interview"
+       - Allow microphone access
     
-    3. **Answer Questions**:
-       - Listen to the interviewer's question
-       - Speak your answer clearly into your microphone
-       - Say the trigger keyword when done (e.g., "I understood")
-       - Your answer will be automatically captured and formatted
-       - The system continues listening for the next question
+    3. **Ask Questions**:
+       - Speak your question clearly: *"What is polymorphism in Python?"*
+       - Say the trigger keyword: *"I understood"*
+       - **The app will automatically search the web** for answers
+       - Answers from Wikipedia and DuckDuckGo will be displayed with sources
     
-    4. **Review & Edit**:
-       - Expand any Q&A to view full details
-       - Edit answers directly in the text area
-       - Copy formatted answers for use elsewhere
-       - Delete individual Q&As if needed
+    4. **Review Answers**:
+       - Each question shows multiple answers with source links
+       - Click source links to read full articles
+       - Copy formatted answers for your use
     
-    5. **Stop Interview**:
+    5. **Continue or Stop**:
+       - Ask more questions - system keeps listening
        - Click "⏹️ Stop Interview" when done
-       - Use "🗑️ Clear All History" to start fresh
+    
+    ### Example Flow:
+    1. You say: *"Explain recursion in programming I understood"*
+    2. App searches web automatically
+    3. Displays answers from Wikipedia, DuckDuckGo with clickable source links
+    4. You can copy/edit the answers
+    5. Ready for next question!
     
     ### Tips:
-    - **Speak clearly** and at a moderate pace
-    - **Minimize background noise** for better recognition
-    - Use **Chrome, Edge, or Safari** for best compatibility
-    - **Test your microphone** before important interviews
-    - The system works **entirely in your browser** - no server processing!
-    
-    ### Troubleshooting:
-    - If speech isn't recognized, check microphone permissions in browser settings
-    - Refresh the page if recognition stops working
-    - Ensure you're using a supported browser (Chrome recommended)
+    - Speak questions clearly before saying trigger keyword
+    - System searches Wikipedia and DuckDuckGo automatically
+    - Multiple sources give you comprehensive answers
+    - Click source links to verify information
     """)
 
 # Footer
 st.markdown("---")
 st.markdown(
     "<div style='text-align: center; color: #666; padding: 20px;'>"
-    "💡 <strong>Browser-based Speech Recognition</strong> - Works without PyAudio! | "
-    "Powered by Web Speech API"
+    "💡 <strong>Web-Powered Interview Assistant</strong> - Searches Wikipedia & DuckDuckGo automatically! 🌐"
     "</div>",
     unsafe_allow_html=True
 )
