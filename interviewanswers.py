@@ -1,9 +1,7 @@
 import streamlit as st
-import speech_recognition as sr
-import threading
-import queue
-import time
+import streamlit.components.v1 as components
 from datetime import datetime
+import json
 
 # Page configuration
 st.set_page_config(
@@ -43,11 +41,16 @@ st.markdown("""
         background-color: #d4edda;
         color: #155724;
         border: 2px solid #c3e6cb;
+        animation: pulse 2s infinite;
     }
     .stopped {
         background-color: #f8d7da;
         color: #721c24;
         border: 2px solid #f5c6cb;
+    }
+    @keyframes pulse {
+        0%, 100% { opacity: 1; }
+        50% { opacity: 0.7; }
     }
     .question-box {
         background-color: #e3f2fd;
@@ -70,20 +73,26 @@ st.markdown("""
         box-shadow: 0 2px 8px rgba(0,0,0,0.1);
         text-align: center;
     }
+    #transcriptBox {
+        background-color: #fff;
+        border: 2px solid #ddd;
+        border-radius: 8px;
+        padding: 15px;
+        min-height: 100px;
+        font-size: 16px;
+        line-height: 1.6;
+        margin: 10px 0;
+    }
     </style>
 """, unsafe_allow_html=True)
 
 # Initialize session state
-if 'is_listening' not in st.session_state:
-    st.session_state.is_listening = False
 if 'qa_history' not in st.session_state:
     st.session_state.qa_history = []
-if 'current_transcript' not in st.session_state:
-    st.session_state.current_transcript = ""
-if 'audio_queue' not in st.session_state:
-    st.session_state.audio_queue = queue.Queue()
-if 'stop_flag' not in st.session_state:
-    st.session_state.stop_flag = False
+if 'is_listening' not in st.session_state:
+    st.session_state.is_listening = False
+if 'last_processed' not in st.session_state:
+    st.session_state.last_processed = ""
 
 # Sidebar configuration
 with st.sidebar:
@@ -94,29 +103,35 @@ with st.sidebar:
         "Trigger Keyword",
         value="I understood",
         help="Say this keyword to process your answer"
-    ).lower()
+    ).lower().strip()
     
-    energy_threshold = st.slider(
-        "Microphone Sensitivity",
-        min_value=100,
-        max_value=4000,
-        value=2000,
-        step=100,
-        help="Lower values = more sensitive"
+    language = st.selectbox(
+        "Language",
+        options=[
+            ("English (US)", "en-US"),
+            ("English (UK)", "en-GB"),
+            ("Spanish", "es-ES"),
+            ("French", "fr-FR"),
+            ("German", "de-DE"),
+            ("Italian", "it-IT"),
+            ("Portuguese", "pt-BR"),
+            ("Hindi", "hi-IN"),
+            ("Chinese", "zh-CN"),
+            ("Japanese", "ja-JP")
+        ],
+        format_func=lambda x: x[0],
+        index=0
     )
     
-    pause_threshold = st.slider(
-        "Pause Duration (seconds)",
-        min_value=0.5,
-        max_value=3.0,
-        value=1.0,
-        step=0.1,
-        help="Time to wait before processing speech"
+    continuous_mode = st.checkbox(
+        "Continuous Listening",
+        value=True,
+        help="Keep listening after processing each answer"
     )
     
     st.markdown("### Display Settings")
     show_timestamps = st.checkbox("Show Timestamps", value=True)
-    auto_clear = st.checkbox("Auto-clear after processing", value=False)
+    show_raw_transcript = st.checkbox("Show Raw Transcript", value=True)
     
     st.markdown("---")
     st.markdown("### Statistics")
@@ -126,105 +141,218 @@ with st.sidebar:
     with col2:
         status = "🟢 Active" if st.session_state.is_listening else "🔴 Stopped"
         st.metric("Status", status)
+    
+    if st.button("🗑️ Clear All History"):
+        st.session_state.qa_history = []
+        st.session_state.last_processed = ""
+        st.rerun()
 
 # Main content
 st.title("🎤 AI Interview Assistant")
 st.markdown("### Real-time Speech-to-Text Interview Helper")
+st.markdown("*Uses browser's built-in speech recognition - no additional installation required!*")
 
 # Control buttons
-col1, col2, col3 = st.columns([1, 1, 2])
+col1, col2 = st.columns(2)
 
 with col1:
-    if st.button("▶️ Start Interview", type="primary", disabled=st.session_state.is_listening):
+    start_clicked = st.button("▶️ Start Interview", type="primary", use_container_width=True)
+    if start_clicked:
         st.session_state.is_listening = True
-        st.session_state.stop_flag = False
-        st.rerun()
 
 with col2:
-    if st.button("⏹️ Stop Interview", disabled=not st.session_state.is_listening):
+    stop_clicked = st.button("⏹️ Stop Interview", use_container_width=True)
+    if stop_clicked:
         st.session_state.is_listening = False
-        st.session_state.stop_flag = True
-        st.rerun()
 
-with col3:
-    if st.button("🗑️ Clear History"):
-        st.session_state.qa_history = []
-        st.session_state.current_transcript = ""
-        st.rerun()
+# Web Speech API Component
+speech_component = f"""
+<div>
+    <div id="statusIndicator" class="status-box stopped">⏸️ Click 'Start Interview' to begin</div>
+    <div id="transcriptBox" style="display: {'block' if show_raw_transcript else 'none'};">
+        <strong>Live Transcript:</strong><br>
+        <span id="transcript">Waiting to start...</span>
+    </div>
+</div>
 
-# Status indicator
-if st.session_state.is_listening:
-    st.markdown('<div class="status-box listening">🎙️ LISTENING - Say your trigger keyword after answering</div>', unsafe_allow_html=True)
-else:
-    st.markdown('<div class="status-box stopped">⏸️ INTERVIEW STOPPED</div>', unsafe_allow_html=True)
+<script>
+let recognition = null;
+let isListening = {json.dumps(st.session_state.is_listening)};
+let triggerKeyword = "{trigger_keyword}";
+let currentTranscript = "";
+let finalTranscript = "";
+let language = "{language[1]}";
+let continuousMode = {json.dumps(continuous_mode)};
 
-# Speech recognition function
-def listen_and_transcribe():
-    recognizer = sr.Recognizer()
-    recognizer.energy_threshold = energy_threshold
-    recognizer.pause_threshold = pause_threshold
+function initializeSpeechRecognition() {{
+    if (!('webkitSpeechRecognition' in window) && !('SpeechRecognition' in window)) {{
+        document.getElementById('statusIndicator').innerHTML = '❌ Speech Recognition not supported in this browser. Please use Chrome, Edge, or Safari.';
+        document.getElementById('statusIndicator').className = 'status-box stopped';
+        return;
+    }}
     
-    with sr.Microphone() as source:
-        st.session_state.current_transcript = "🎤 Adjusting for ambient noise..."
-        recognizer.adjust_for_ambient_noise(source, duration=1)
+    const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+    recognition = new SpeechRecognition();
+    
+    recognition.continuous = true;
+    recognition.interimResults = true;
+    recognition.lang = language;
+    
+    recognition.onstart = function() {{
+        document.getElementById('statusIndicator').innerHTML = '🎙️ LISTENING - Say your trigger keyword after answering';
+        document.getElementById('statusIndicator').className = 'status-box listening';
+        document.getElementById('transcript').innerHTML = 'Listening...';
+    }};
+    
+    recognition.onresult = function(event) {{
+        currentTranscript = "";
+        let interimTranscript = "";
         
-        while st.session_state.is_listening and not st.session_state.stop_flag:
-            try:
-                st.session_state.current_transcript = "🎤 Listening..."
-                audio = recognizer.listen(source, timeout=5, phrase_time_limit=30)
-                
-                try:
-                    text = recognizer.recognize_google(audio)
-                    st.session_state.current_transcript = f"Heard: {text}"
-                    
-                    # Check for trigger keyword
-                    if trigger_keyword in text.lower():
-                        # Extract answer (text before trigger keyword)
-                        answer_text = text.lower().split(trigger_keyword)[0].strip()
-                        
-                        if answer_text:
-                            timestamp = datetime.now().strftime("%H:%M:%S")
-                            st.session_state.qa_history.append({
-                                'question': f"Question {len(st.session_state.qa_history) + 1}",
-                                'answer': answer_text.capitalize(),
-                                'timestamp': timestamp
-                            })
-                            
-                            if auto_clear:
-                                st.session_state.current_transcript = ""
-                            else:
-                                st.session_state.current_transcript = f"✅ Answer processed! Ready for next question."
-                            
-                            time.sleep(0.5)
-                    
-                except sr.UnknownValueError:
-                    st.session_state.current_transcript = "⚠️ Could not understand audio"
-                except sr.RequestError as e:
-                    st.session_state.current_transcript = f"❌ Error: {str(e)}"
-                    
-            except sr.WaitTimeoutError:
-                continue
-            except Exception as e:
-                st.session_state.current_transcript = f"❌ Error: {str(e)}"
-                break
-
-# Live transcription display
-st.markdown("### 📝 Live Transcription")
-transcript_placeholder = st.empty()
-
-if st.session_state.is_listening:
-    transcript_placeholder.info(st.session_state.current_transcript)
+        for (let i = event.resultIndex; i < event.results.length; i++) {{
+            const transcript = event.results[i][0].transcript;
+            if (event.results[i].isFinal) {{
+                finalTranscript += transcript + " ";
+                currentTranscript = finalTranscript;
+            }} else {{
+                interimTranscript += transcript;
+            }}
+        }}
+        
+        const displayText = currentTranscript + "<i style='color: #666;'>" + interimTranscript + "</i>";
+        document.getElementById('transcript').innerHTML = displayText || 'Listening...';
+        
+        // Check for trigger keyword
+        const fullText = (currentTranscript + interimTranscript).toLowerCase();
+        if (fullText.includes(triggerKeyword)) {{
+            processAnswer(currentTranscript);
+        }}
+    }};
     
-    # Start listening in a separate thread
-    if 'listener_thread' not in st.session_state or not st.session_state.listener_thread.is_alive():
-        st.session_state.listener_thread = threading.Thread(target=listen_and_transcribe, daemon=True)
-        st.session_state.listener_thread.start()
+    recognition.onerror = function(event) {{
+        console.error('Speech recognition error:', event.error);
+        if (event.error === 'no-speech') {{
+            document.getElementById('transcript').innerHTML = '⚠️ No speech detected. Please try again.';
+        }} else if (event.error === 'not-allowed') {{
+            document.getElementById('statusIndicator').innerHTML = '❌ Microphone access denied. Please allow microphone access.';
+            document.getElementById('statusIndicator').className = 'status-box stopped';
+        }}
+    }};
     
-    # Auto-refresh while listening
-    time.sleep(0.5)
-    st.rerun()
-else:
-    transcript_placeholder.warning("Click 'Start Interview' to begin")
+    recognition.onend = function() {{
+        if (isListening && continuousMode) {{
+            // Restart recognition if still in listening mode
+            setTimeout(() => {{
+                if (isListening) {{
+                    recognition.start();
+                }}
+            }}, 100);
+        }} else {{
+            document.getElementById('statusIndicator').innerHTML = '⏸️ INTERVIEW STOPPED';
+            document.getElementById('statusIndicator').className = 'status-box stopped';
+        }}
+    }};
+}}
+
+function processAnswer(transcript) {{
+    // Extract answer before trigger keyword
+    const lowerTranscript = transcript.toLowerCase();
+    const keywordIndex = lowerTranscript.indexOf(triggerKeyword);
+    
+    if (keywordIndex > 0) {{
+        const answer = transcript.substring(0, keywordIndex).trim();
+        if (answer.length > 0) {{
+            // Send data to Streamlit
+            window.parent.postMessage({{
+                type: 'streamlit:setComponentValue',
+                value: {{
+                    answer: answer,
+                    timestamp: new Date().toISOString()
+                }}
+            }}, '*');
+            
+            // Visual feedback
+            document.getElementById('transcript').innerHTML = 
+                '✅ <strong>Answer captured!</strong><br>Ready for next question...';
+            
+            // Reset for next question
+            finalTranscript = "";
+            currentTranscript = "";
+            
+            // Brief pause before continuing
+            if (continuousMode) {{
+                setTimeout(() => {{
+                    document.getElementById('transcript').innerHTML = 'Listening...';
+                }}, 2000);
+            }}
+        }}
+    }}
+}}
+
+function startListening() {{
+    isListening = true;
+    if (recognition) {{
+        finalTranscript = "";
+        currentTranscript = "";
+        recognition.start();
+    }}
+}}
+
+function stopListening() {{
+    isListening = false;
+    if (recognition) {{
+        recognition.stop();
+    }}
+    document.getElementById('statusIndicator').innerHTML = '⏸️ INTERVIEW STOPPED';
+    document.getElementById('statusIndicator').className = 'status-box stopped';
+    document.getElementById('transcript').innerHTML = 'Stopped';
+}}
+
+// Initialize on load
+initializeSpeechRecognition();
+
+// Start/stop based on initial state
+if (isListening) {{
+    startListening();
+}}
+
+// Listen for updates from Streamlit
+window.addEventListener('message', function(event) {{
+    if (event.data.type === 'streamlit:render') {{
+        const newListening = event.data.args.is_listening;
+        if (newListening && !isListening) {{
+            startListening();
+        }} else if (!newListening && isListening) {{
+            stopListening();
+        }}
+    }}
+}});
+</script>
+"""
+
+# Render the speech component
+result = components.html(
+    speech_component,
+    height=200 if show_raw_transcript else 100,
+)
+
+# Process received data
+if result:
+    answer = result.get('answer', '')
+    timestamp = result.get('timestamp', '')
+    
+    # Avoid duplicate processing
+    if answer and answer != st.session_state.last_processed:
+        st.session_state.last_processed = answer
+        
+        dt = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
+        formatted_time = dt.strftime("%H:%M:%S")
+        
+        st.session_state.qa_history.append({
+            'question': f"Question {len(st.session_state.qa_history) + 1}",
+            'answer': answer,
+            'timestamp': formatted_time
+        })
+        st.rerun()
 
 # Q&A History
 if st.session_state.qa_history:
@@ -232,22 +360,36 @@ if st.session_state.qa_history:
     st.markdown("### 📚 Interview Q&A History")
     
     for idx, qa in enumerate(reversed(st.session_state.qa_history), 1):
-        with st.expander(f"Question {len(st.session_state.qa_history) - idx + 1}" + 
-                        (f" - {qa['timestamp']}" if show_timestamps else ""), expanded=(idx==1)):
+        with st.expander(
+            f"Question {len(st.session_state.qa_history) - idx + 1}" + 
+            (f" - {qa['timestamp']}" if show_timestamps else ""), 
+            expanded=(idx==1)
+        ):
+            st.markdown(
+                f'<div class="question-box"><strong>❓ Question:</strong> {qa["question"]}</div>', 
+                unsafe_allow_html=True
+            )
             
-            st.markdown(f'<div class="question-box"><strong>❓ Question:</strong> {qa["question"]}</div>', 
-                       unsafe_allow_html=True)
+            st.markdown(
+                f'<div class="answer-box"><strong>✅ Your Answer:</strong><br>{qa["answer"]}</div>', 
+                unsafe_allow_html=True
+            )
             
-            st.markdown(f'<div class="answer-box"><strong>✅ Your Answer:</strong><br>{qa["answer"]}</div>', 
-                       unsafe_allow_html=True)
-            
-            # Answer text area for editing/copying
-            st.text_area(
-                "Formatted Answer (Copy/Edit)",
+            # Editable answer text area
+            edited_answer = st.text_area(
+                "Formatted Answer (Edit/Copy)",
                 value=qa['answer'],
-                height=100,
+                height=120,
                 key=f"answer_{len(st.session_state.qa_history) - idx + 1}"
             )
+            
+            col_a, col_b = st.columns([3, 1])
+            with col_b:
+                if st.button(f"🗑️ Delete", key=f"del_{len(st.session_state.qa_history) - idx + 1}"):
+                    st.session_state.qa_history.pop(len(st.session_state.qa_history) - idx)
+                    st.rerun()
+else:
+    st.info("👆 Start the interview and begin answering questions. Your responses will appear here!")
 
 # Instructions
 with st.expander("ℹ️ How to Use", expanded=False):
@@ -256,41 +398,51 @@ with st.expander("ℹ️ How to Use", expanded=False):
     
     1. **Configure Settings** in the sidebar:
        - Set your trigger keyword (default: "I understood")
-       - Adjust microphone sensitivity
+       - Choose your language
+       - Toggle continuous listening mode
        - Customize display preferences
     
     2. **Start Interview**:
        - Click the "▶️ Start Interview" button
-       - Allow microphone access when prompted
-       - Wait for "Listening..." status
+       - **Allow microphone access** when your browser prompts you
+       - Wait for "LISTENING" status
     
     3. **Answer Questions**:
        - Listen to the interviewer's question
-       - Speak your answer clearly
+       - Speak your answer clearly into your microphone
        - Say the trigger keyword when done (e.g., "I understood")
        - Your answer will be automatically captured and formatted
+       - The system continues listening for the next question
     
     4. **Review & Edit**:
        - Expand any Q&A to view full details
-       - Copy or edit answers as needed
-       - Timestamps show when each answer was recorded
+       - Edit answers directly in the text area
+       - Copy formatted answers for use elsewhere
+       - Delete individual Q&As if needed
     
     5. **Stop Interview**:
        - Click "⏹️ Stop Interview" when done
-       - Use "🗑️ Clear History" to start fresh
+       - Use "🗑️ Clear All History" to start fresh
     
     ### Tips:
-    - Speak clearly and at a moderate pace
-    - Ensure minimal background noise
-    - Adjust sensitivity if recognition is poor
-    - Test your microphone before important interviews
+    - **Speak clearly** and at a moderate pace
+    - **Minimize background noise** for better recognition
+    - Use **Chrome, Edge, or Safari** for best compatibility
+    - **Test your microphone** before important interviews
+    - The system works **entirely in your browser** - no server processing!
+    
+    ### Troubleshooting:
+    - If speech isn't recognized, check microphone permissions in browser settings
+    - Refresh the page if recognition stops working
+    - Ensure you're using a supported browser (Chrome recommended)
     """)
 
 # Footer
 st.markdown("---")
 st.markdown(
     "<div style='text-align: center; color: #666; padding: 20px;'>"
-    "💡 Tip: Practice with the assistant to improve your interview responses!"
+    "💡 <strong>Browser-based Speech Recognition</strong> - Works without PyAudio! | "
+    "Powered by Web Speech API"
     "</div>",
     unsafe_allow_html=True
 )
