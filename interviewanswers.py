@@ -33,8 +33,8 @@ if 'is_listening' not in st.session_state:
     st.session_state.is_listening = False
 if 'current_transcript' not in st.session_state:
     st.session_state.current_transcript = ""
-if 'processing' not in st.session_state:
-    st.session_state.processing = False
+if 'last_processed_question' not in st.session_state:
+    st.session_state.last_processed_question = ""
 
 def clean_repeated_words(text):
     words = text.split()
@@ -379,12 +379,14 @@ with right_col:
     if result and isinstance(result, dict):
         question = result.get('question', '').strip()
         
-        if question and not st.session_state.processing:
-            st.session_state.processing = True
+        # Only process if it's a new question
+        if question and question != st.session_state.last_processed_question:
+            st.session_state.last_processed_question = question
             
-            # Get answers
-            with st.spinner("🔍 Searching web..."):
+            # Show searching message
+            with st.spinner("🔍 Searching web for answers..."):
                 answers = get_answers(question)
+                time.sleep(0.5)  # Brief pause to show the search message
             
             # Add to history
             st.session_state.qa_list.append({
@@ -393,7 +395,7 @@ with right_col:
                 'timestamp': datetime.now().strftime("%H:%M:%S")
             })
             
-            st.session_state.processing = False
+            # Force refresh to show new Q&A
             st.rerun()
     
     # Display all Q&A (newest first)
