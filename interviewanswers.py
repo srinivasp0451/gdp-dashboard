@@ -205,26 +205,32 @@ function initializeSpeechRecognition() {{
     }};
     
     recognition.onresult = function(event) {{
-        currentTranscript = "";
         let interimTranscript = "";
+        finalTranscript = "";
         
-        for (let i = event.resultIndex; i < event.results.length; i++) {{
+        // Build complete transcript from all final results
+        for (let i = 0; i < event.results.length; i++) {{
             const transcript = event.results[i][0].transcript;
             if (event.results[i].isFinal) {{
                 finalTranscript += transcript + " ";
-                currentTranscript = finalTranscript;
             }} else {{
                 interimTranscript += transcript;
             }}
         }}
         
-        const displayText = currentTranscript + "<i style='color: #666;'>" + interimTranscript + "</i>";
+        currentTranscript = finalTranscript.trim();
+        
+        // Clean up repeated words
+        const cleanTranscript = cleanRepeatedWords(currentTranscript);
+        const cleanInterim = cleanRepeatedWords(interimTranscript);
+        
+        const displayText = cleanTranscript + " <i style='color: #666;'>" + cleanInterim + "</i>";
         document.getElementById('transcript').innerHTML = displayText || 'Listening...';
         
-        // Check for trigger keyword
-        const fullText = (currentTranscript + interimTranscript).toLowerCase();
+        // Check for trigger keyword in the combined text
+        const fullText = (cleanTranscript + " " + cleanInterim).toLowerCase();
         if (fullText.includes(triggerKeyword)) {{
-            processAnswer(currentTranscript);
+            processAnswer(cleanTranscript + " " + cleanInterim);
         }}
     }};
     
@@ -254,13 +260,16 @@ function initializeSpeechRecognition() {{
 }}
 
 function processAnswer(transcript) {{
+    // Clean the transcript
+    const cleanedTranscript = cleanRepeatedWords(transcript);
+    
     // Extract answer before trigger keyword
-    const lowerTranscript = transcript.toLowerCase();
+    const lowerTranscript = cleanedTranscript.toLowerCase();
     const keywordIndex = lowerTranscript.indexOf(triggerKeyword);
     
-    if (keywordIndex > 0) {{
-        const answer = transcript.substring(0, keywordIndex).trim();
-        if (answer.length > 0) {{
+    if (keywordIndex >= 0) {{
+        const answer = cleanedTranscript.substring(0, keywordIndex).trim();
+        if (answer.length > 5) {{  // Minimum length check
             // Send data to Streamlit
             window.parent.postMessage({{
                 type: 'streamlit:setComponentValue',
@@ -272,7 +281,10 @@ function processAnswer(transcript) {{
             
             // Visual feedback
             document.getElementById('transcript').innerHTML = 
-                '✅ <strong>Answer captured!</strong><br>Ready for next question...';
+                '✅ <strong>Answer captured!</strong><br>' + 
+                '<span style="color: #4CAF50;">Answer: ' + answer.substring(0, 100) + 
+                (answer.length > 100 ? '...' : '') + '</span><br>' +
+                'Ready for next question...';
             
             // Reset for next question
             finalTranscript = "";
@@ -281,11 +293,34 @@ function processAnswer(transcript) {{
             // Brief pause before continuing
             if (continuousMode) {{
                 setTimeout(() => {{
-                    document.getElementById('transcript').innerHTML = 'Listening...';
-                }}, 2000);
+                    document.getElementById('transcript').innerHTML = 'Listening for next question...';
+                }}, 3000);
             }}
+        }} else {{
+            document.getElementById('transcript').innerHTML = 
+                '⚠️ Answer too short. Please speak your answer before saying the trigger keyword.';
         }}
     }}
+}}
+
+function cleanRepeatedWords(text) {{
+    if (!text) return text;
+    
+    // Split into words
+    const words = text.split(' ');
+    const cleanedWords = [];
+    let prevWord = '';
+    
+    for (let word of words) {{
+        const cleanWord = word.toLowerCase().trim();
+        // Only add if it's not the same as previous word
+        if (cleanWord !== prevWord.toLowerCase().trim() || cleanWord.length < 3) {{
+            cleanedWords.push(word);
+        }}
+        prevWord = word;
+    }}
+    
+    return cleanedWords.join(' ');
 }}
 
 function startListening() {{
