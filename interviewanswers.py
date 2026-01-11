@@ -336,23 +336,30 @@ result = components.html(
 )
 
 # Process received data
-if result:
-    answer = result.get('answer', '')
-    timestamp = result.get('timestamp', '')
-    
-    # Avoid duplicate processing
-    if answer and answer != st.session_state.last_processed:
-        st.session_state.last_processed = answer
-        
-        dt = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
-        formatted_time = dt.strftime("%H:%M:%S")
-        
-        st.session_state.qa_history.append({
-            'question': f"Question {len(st.session_state.qa_history) + 1}",
-            'answer': answer,
-            'timestamp': formatted_time
-        })
-        st.rerun()
+if result is not None:
+    try:
+        if isinstance(result, dict):
+            answer = result.get('answer', '')
+            timestamp = result.get('timestamp', '')
+            
+            # Avoid duplicate processing
+            if answer and answer != st.session_state.last_processed:
+                st.session_state.last_processed = answer
+                
+                try:
+                    dt = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
+                    formatted_time = dt.strftime("%H:%M:%S")
+                except:
+                    formatted_time = datetime.now().strftime("%H:%M:%S")
+                
+                st.session_state.qa_history.append({
+                    'question': f"Question {len(st.session_state.qa_history) + 1}",
+                    'answer': answer,
+                    'timestamp': formatted_time
+                })
+                st.rerun()
+    except Exception as e:
+        pass  # Silently ignore processing errors
 
 # Q&A History
 if st.session_state.qa_history:
