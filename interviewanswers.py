@@ -290,10 +290,12 @@ speech_component = f"""
             background: white;
             padding: 20px;
             border-radius: 10px;
-            min-height: 100px;
+            min-height: 120px;
             font-size: 18px;
-            line-height: 1.6;
+            line-height: 1.8;
             box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+            max-height: 200px;
+            overflow-y: auto;
         }}
         .interim {{ color: #999; font-style: italic; }}
         .detected {{ color: #4CAF50; font-weight: bold; }}
@@ -358,12 +360,13 @@ speech_component = f"""
                 const cleanFinal = cleanRepeated(finalTranscript);
                 const cleanInterim = cleanRepeated(interim);
                 
+                // Always show full transcript
                 document.getElementById('transcript').innerHTML = 
-                    cleanFinal + '<span class="interim">' + cleanInterim + '</span>';
+                    '<strong>You said:</strong><br>' + cleanFinal + '<span class="interim">' + cleanInterim + '</span>';
                 
-                // Check for trigger
-                const fullText = (cleanFinal + ' ' + cleanInterim).toLowerCase();
-                if (fullText.includes(triggerWord) && !questionProcessed) {{
+                // Only check for trigger in FINAL transcript (not interim)
+                // This ensures we wait for user to finish saying "I understood"
+                if (cleanFinal.toLowerCase().includes(triggerWord) && !questionProcessed) {{
                     const idx = cleanFinal.toLowerCase().indexOf(triggerWord);
                     if (idx > 0) {{
                         const question = cleanFinal.substring(0, idx).trim();
@@ -372,7 +375,7 @@ speech_component = f"""
                             questionProcessed = true;
                             
                             document.getElementById('transcript').innerHTML = 
-                                '<span class="detected">✅ Question: "' + question + '"</span><br>🔍 Searching web...';
+                                '<span class="detected">✅ Question Captured: "' + question + '"</span><br>🔍 Searching web for answers...';
                             
                             // Send to Streamlit
                             const data = {{
@@ -385,14 +388,14 @@ speech_component = f"""
                                 data: data
                             }}, '*');
                             
-                            // Reset for next
+                            // Reset for next question
                             finalTranscript = '';
                             setTimeout(() => {{
                                 if (isListening) {{
                                     document.getElementById('transcript').innerHTML = '🎤 Ready for next question...';
                                     questionProcessed = false;
                                 }}
-                            }}, 3000);
+                            }}, 2000);
                         }}
                     }}
                 }}
@@ -429,7 +432,46 @@ speech_component = f"""
 """
 
 # Display speech component
-result = components.html(speech_component, height=200)
+result = components.html(speech_component, height=220)
+
+st.markdown("---")
+
+# Current Q&A Display Section
+if st.session_state.qa_history:
+    st.markdown("## 📋 Most Recent Question & Answer")
+    
+    latest_qa = st.session_state.qa_history[-1]
+    
+    # Display latest question
+    st.markdown(
+        f'<div class="question-card">'
+        f'<h2>❓ QUESTION:</h2>'
+        f'<h3>{latest_qa["question"]}</h3>'
+        f'</div>',
+        unsafe_allow_html=True
+    )
+    
+    # Display latest answers
+    st.markdown("### ✅ ANSWERS:")
+    
+    for idx, ans in enumerate(latest_qa['answers'], 1):
+        st.markdown(
+            f'<div class="answer-card">'
+            f'<h4>Answer {idx}:</h4>'
+            f'<p style="font-size: 16px; line-height: 1.8; color: #333;">{ans["answer"]}</p>'
+            f'<a href="{ans["source"]}" target="_blank" class="source-tag">🔗 {ans["title"]}</a>'
+            f'</div>',
+            unsafe_allow_html=True
+        )
+    
+    # Copy section for latest Q&A
+    copy_latest = f"QUESTION:\n{latest_qa['question']}\n\n"
+    for idx, ans in enumerate(latest_qa['answers'], 1):
+        copy_latest += f"ANSWER {idx}:\n{ans['answer']}\n\nSOURCE: {ans['title']}\n{ans['source']}\n\n"
+    
+    st.text_area("📋 Copy Current Q&A", copy_latest, height=300, key="current_qa_copy")
+
+st.markdown("---")
 
 # Process question automatically
 if result and isinstance(result, dict):
@@ -442,30 +484,9 @@ if result and isinstance(result, dict):
         if question and question_hash != st.session_state.last_question_hash:
             st.session_state.last_question_hash = question_hash
             
-            # Display question
-            st.markdown(
-                f'<div class="question-card">'
-                f'<h2>❓ YOUR QUESTION:</h2>'
-                f'<h3>{question}</h3>'
-                f'</div>',
-                unsafe_allow_html=True
-            )
-            
-            # Search and display answers
+            # Search and get answers
             with st.spinner("🔍 Searching Wikipedia and DuckDuckGo..."):
                 answers = get_answers(question)[:max_answers]
-            
-            st.markdown("### ✅ ANSWERS:")
-            
-            for idx, ans in enumerate(answers, 1):
-                st.markdown(
-                    f'<div class="answer-card">'
-                    f'<h4>Answer {idx}:</h4>'
-                    f'<p style="font-size: 16px; line-height: 1.8; color: #333;">{ans["answer"]}</p>'
-                    f'<a href="{ans["source"]}" target="_blank" class="source-tag">🔗 {ans["title"]}</a>'
-                    f'</div>',
-                    unsafe_allow_html=True
-                )
             
             # Save to history
             timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -475,22 +496,23 @@ if result and isinstance(result, dict):
                 'timestamp': timestamp
             })
             
-            st.success("✅ Saved to history!")
+            st.success("✅ Answer found! Check 'Most Recent Question & Answer' section above.")
             time.sleep(1)
             st.rerun()
 
 # History section
-if st.session_state.qa_history:
-    st.markdown("---")
-    st.markdown("## 📚 Interview History")
+if st.session_state.qa_history and len(st.session_state.qa_history) > 1:
+    st.markdown("## 📚 Previous Questions & Answers")
     
-    for idx, qa in enumerate(reversed(st.session_state.qa_history), 1):
-        with st.expander(f"Q{len(st.session_state.qa_history)-idx+1}: {qa['question'][:60]}... ({qa['timestamp']})"):
-            st.markdown(f"**Question:** {qa['question']}")
-            st.markdown("**Answers:**")
+    # Show all except the most recent (which is already shown above)
+    for idx, qa in enumerate(reversed(st.session_state.qa_history[:-1]), 1):
+        actual_idx = len(st.session_state.qa_history) - idx - 1
+        with st.expander(f"Q{actual_idx + 1}: {qa['question'][:70]}... ({qa['timestamp']})", expanded=False):
+            st.markdown(f"**❓ Question:** {qa['question']}")
+            st.markdown("**✅ Answers:**")
             
             for aidx, ans in enumerate(qa['answers'], 1):
-                st.write(f"{aidx}. {ans['answer']}")
+                st.write(f"**{aidx}.** {ans['answer']}")
                 st.markdown(f"   🔗 [{ans['title']}]({ans['source']})")
             
             # Copy text
@@ -498,25 +520,40 @@ if st.session_state.qa_history:
             for aidx, ans in enumerate(qa['answers'], 1):
                 copy_text += f"A{aidx}: {ans['answer']}\nSource: {ans['source']}\n\n"
             
-            st.text_area("Copy", copy_text, height=100, key=f"copy_{idx}")
+            st.text_area("Copy", copy_text, height=200, key=f"copy_{actual_idx}")
 
 # Instructions
-with st.expander("ℹ️ Instructions"):
+st.markdown("---")
+with st.expander("ℹ️ How to Use This App"):
     st.markdown("""
     ### How to Use:
     
-    1. Click **"▶️ START INTERVIEW"**
-    2. Allow microphone access when prompted
-    3. **Speak your question**: "What is Python?"
-    4. **Say trigger word**: "I understood"
-    5. **Automatic**: Question detected → Web search → Answers displayed!
+    1. Click **"▶️ START INTERVIEW"** button at the top
+    2. Allow microphone access when your browser prompts
+    3. **Speak your question clearly**: "What is machine learning?"
+    4. **Wait and say trigger word**: "I understood" (can be said anytime after your question)
+    5. **Automatic process**: 
+       - App waits for you to say "I understood"
+       - Question extracted automatically
+       - Web search happens
+       - Answers appear in "Most Recent Question & Answer" section
+       - Previous Q&As move to history below
     
-    ### No typing, no clicking needed!
+    ### Important:
+    - ✅ No need to rush - say "I understood" whenever you're ready
+    - ✅ App waits for complete trigger phrase before searching
+    - ✅ All Q&As stay visible - most recent on top
+    - ✅ Previous questions in collapsible history section
+    - ✅ Click source links to read full articles
     
-    - Questions and answers appear automatically
-    - All saved in history below
-    - Click stop when done
+    ### Example:
+    ```
+    You: "What is artificial intelligence?"
+    (pause... think...)
+    You: "I understood"
+    
+    App: ✅ Searches and displays answers automatically!
+    ```
     """)
 
-st.markdown("---")
-st.markdown("<div style='text-align: center; color: #666;'>💡 Fully Automated Speech Recognition + Web Search</div>", unsafe_allow_html=True)
+st.markdown("<div style='text-align: center; color: #666; padding: 20px;'>💡 Fully Automated: Speak → Trigger → Auto Search → Display</div>", unsafe_allow_html=True)
