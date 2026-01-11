@@ -23,4 +23,3 @@ openpyxl
 mplfinance
 reportlab
 python-docx
-speechrecognition
