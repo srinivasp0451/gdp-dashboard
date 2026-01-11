@@ -280,7 +280,7 @@ with left_col:
                 recognition.lang = 'en-US';
                 
                 recognition.onstart = () => {{
-                    document.getElementById('status').innerHTML = '🎙️ LISTENING - Speak freely, say "{triggerWord}" when ready';
+                    document.getElementById('status').innerHTML = '🎙️ LISTENING - Speak freely, say "' + triggerWord + '" when ready';
                     document.getElementById('status').className = 'listening';
                     document.getElementById('transcript').innerHTML = 'Speak now...';
                     questionSent = false;
