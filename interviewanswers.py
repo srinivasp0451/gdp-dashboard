@@ -328,14 +328,12 @@ with left_col:
                                 timestamp: new Date().toISOString()
                             }}, '*');
                             
-                            // Reset after 3 seconds
+                            // Reset immediately for next question
                             setTimeout(() => {{
-                                if (isListening) {{
-                                    fullTranscript = '';
-                                    document.getElementById('transcript').innerHTML = '🎤 Ready for next question...';
-                                    questionSent = false;
-                                }}
-                            }}, 3000);
+                                fullTranscript = '';
+                                questionSent = false;
+                                document.getElementById('transcript').innerHTML = '🎤 Listening for next question...';
+                            }}, 2000);
                         }}
                     }}
                 }};
@@ -349,11 +347,19 @@ with left_col:
                 }};
                 
                 recognition.onend = () => {{
-                    if (isListening && !questionSent) {{
-                        setTimeout(() => recognition.start(), 100);
+                    // Always restart if still in listening mode
+                    if (isListening) {{
+                        setTimeout(() => {{
+                            try {{
+                                recognition.start();
+                            }} catch(e) {{
+                                console.log('Restarting recognition...');
+                            }}
+                        }}, 100);
                     }} else {{
                         document.getElementById('status').innerHTML = '⏹️ STOPPED';
                         document.getElementById('status').className = 'stopped';
+                        document.getElementById('transcript').innerHTML = 'Click START LISTENING to begin again';
                     }}
                 }};
                 
@@ -383,20 +389,20 @@ with right_col:
         if question and question != st.session_state.last_processed_question:
             st.session_state.last_processed_question = question
             
-            # Show searching message
-            with st.spinner("🔍 Searching web for answers..."):
-                answers = get_answers(question)
-                time.sleep(0.5)  # Brief pause to show the search message
-            
-            # Add to history
+            # Add placeholder immediately
             st.session_state.qa_list.append({
                 'question': question,
-                'answers': answers,
-                'timestamp': datetime.now().strftime("%H:%M:%S")
+                'answers': [],
+                'timestamp': datetime.now().strftime("%H:%M:%S"),
+                'loading': True
             })
             
-            # Force refresh to show new Q&A
-            st.rerun()
+            # Get answers
+            answers = get_answers(question)
+            
+            # Update the last item with answers
+            st.session_state.qa_list[-1]['answers'] = answers
+            st.session_state.qa_list[-1]['loading'] = False
     
     # Display all Q&A (newest first)
     if st.session_state.qa_list:
@@ -413,32 +419,36 @@ with right_col:
             </div>
             """, unsafe_allow_html=True)
             
-            # Answers
-            for aidx, ans in enumerate(qa['answers'], 1):
-                st.markdown(f"""
-                <div style='background: white; padding: 20px; border-radius: 12px; 
-                            margin: 10px 0; border-left: 5px solid #4CAF50;'>
-                    <h4 style='color: #4CAF50;'>✅ Answer {aidx}</h4>
-                    <p style='font-size: 16px; line-height: 1.8; color: #333;'>{ans['answer']}</p>
-                    <a href='{ans['source']}' target='_blank' 
-                       style='background: #ff9800; color: white; padding: 8px 15px; 
-                              border-radius: 20px; text-decoration: none; font-weight: bold;'>
-                        🔗 {ans['title']}
-                    </a>
-                </div>
-                """, unsafe_allow_html=True)
-            
-            # Copy section
-            copy_text = f"QUESTION {qa_num}:\n{qa['question']}\n\n"
-            for aidx, ans in enumerate(qa['answers'], 1):
-                copy_text += f"ANSWER {aidx}:\n{ans['answer']}\n\nSOURCE: {ans['title']}\n{ans['source']}\n\n"
-            
-            st.text_area(
-                f"📋 Copy Q&A #{qa_num}", 
-                copy_text, 
-                height=250,
-                key=f"copy_{qa_num}"
-            )
+            # Check if loading
+            if qa.get('loading', False):
+                st.info("🔍 Searching for answers...")
+            else:
+                # Answers
+                for aidx, ans in enumerate(qa['answers'], 1):
+                    st.markdown(f"""
+                    <div style='background: white; padding: 20px; border-radius: 12px; 
+                                margin: 10px 0; border-left: 5px solid #4CAF50;'>
+                        <h4 style='color: #4CAF50;'>✅ Answer {aidx}</h4>
+                        <p style='font-size: 16px; line-height: 1.8; color: #333;'>{ans['answer']}</p>
+                        <a href='{ans['source']}' target='_blank' 
+                           style='background: #ff9800; color: white; padding: 8px 15px; 
+                                  border-radius: 20px; text-decoration: none; font-weight: bold;'>
+                            🔗 {ans['title']}
+                        </a>
+                    </div>
+                    """, unsafe_allow_html=True)
+                
+                # Copy section
+                copy_text = f"QUESTION {qa_num}:\n{qa['question']}\n\n"
+                for aidx, ans in enumerate(qa['answers'], 1):
+                    copy_text += f"ANSWER {aidx}:\n{ans['answer']}\n\nSOURCE: {ans['title']}\n{ans['source']}\n\n"
+                
+                st.text_area(
+                    f"📋 Copy Q&A #{qa_num}", 
+                    copy_text, 
+                    height=250,
+                    key=f"copy_{qa_num}"
+                )
             
             st.markdown("---")
     else:
