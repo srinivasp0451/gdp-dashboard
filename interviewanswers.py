@@ -344,7 +344,7 @@ with left_col:
     </html>
     """
     
-    result = components.html(speech_html, height=650, key=f"speech_{st.session_state.is_listening}")
+    result = components.html(speech_html, height=650)
     
     # Debug: Show what we're receiving
     if result:
