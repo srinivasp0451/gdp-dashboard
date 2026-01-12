@@ -344,31 +344,56 @@ with left_col:
     </html>
     """
     
-    result = components.html(speech_html, height=650)
+    result = components.html(speech_html, height=650, key=f"speech_{st.session_state.is_listening}")
+    
+    # Debug: Show what we're receiving
+    if result:
+        st.write("DEBUG - Received from component:", result)
     
     st.info("**💡 How to use:**\n\n1. Click START LISTENING\n2. Speak your question naturally\n3. Take your time - NO RUSH\n4. Say trigger keyword when ready\n5. Answers appear on right →")
 
 with right_col:
     st.subheader("📝 QUESTIONS & ANSWERS")
     
+    # Debug display
+    st.write(f"DEBUG - Total Q&As: {len(st.session_state.qa_list)}")
+    st.write(f"DEBUG - Listening: {st.session_state.is_listening}")
+    
     # Process new question
-    if result and isinstance(result, dict):
-        question = result.get('question', '').strip()
+    if result:
+        st.write("DEBUG - Result type:", type(result))
+        st.write("DEBUG - Result content:", result)
         
-        if question:
-            # Check if not duplicate
-            if not st.session_state.qa_list or st.session_state.qa_list[-1]['question'] != question:
-                # Get answers
-                answers = get_answers(question)
-                
-                # Add to list
-                st.session_state.qa_list.append({
-                    'question': question,
-                    'answers': answers,
-                    'timestamp': datetime.now().strftime("%H:%M:%S")
-                })
-                
-                st.rerun()
+        if isinstance(result, dict):
+            question = result.get('question', '').strip()
+            st.write(f"DEBUG - Extracted question: '{question}'")
+            
+            if question:
+                # Check if not duplicate
+                if not st.session_state.qa_list or st.session_state.qa_list[-1]['question'] != question:
+                    st.write("DEBUG - Getting answers...")
+                    
+                    # Get answers
+                    answers = get_answers(question)
+                    st.write(f"DEBUG - Got {len(answers)} answers")
+                    
+                    # Add to list
+                    st.session_state.qa_list.append({
+                        'question': question,
+                        'answers': answers,
+                        'timestamp': datetime.now().strftime("%H:%M:%S")
+                    })
+                    
+                    st.write("DEBUG - Added to list, forcing rerun...")
+                    st.rerun()
+                else:
+                    st.write("DEBUG - Duplicate question, skipping")
+        else:
+            st.write("DEBUG - Result is not a dict")
+    else:
+        st.write("DEBUG - No result received")
+    
+    st.markdown("---")
     
     # Display all Q&A
     if st.session_state.qa_list:
