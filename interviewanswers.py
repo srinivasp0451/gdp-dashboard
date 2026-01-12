@@ -19,6 +19,10 @@ if 'qa_list' not in st.session_state:
     st.session_state.qa_list = []
 if 'is_listening' not in st.session_state:
     st.session_state.is_listening = False
+if 'pending_question' not in st.session_state:
+    st.session_state.pending_question = None
+if 'component_key' not in st.session_state:
+    st.session_state.component_key = 0
 
 def clean_repeated_words(text):
     """Remove consecutive duplicate words"""
@@ -294,11 +298,29 @@ with left_col:
                                 '<div style="font-size: 18px; margin: 15px 0;"><strong>Question:</strong> ' + question + '</div>' +
                                 '<div style="color: #ff9800; font-weight: bold;">🔍 Searching for answers...</div>';
                             
-                            // Send to Streamlit
+                            // Send to Streamlit using query params hack
+                            const question_encoded = encodeURIComponent(question);
+                            const timestamp_encoded = new Date().getTime();
+                            
+                            // Try multiple methods to communicate
                             window.parent.postMessage({{
                                 type: 'streamlit:setComponentValue',
-                                question: question,
-                                timestamp: new Date().toISOString()
+                                key: 'speech_result',
+                                value: {{
+                                    question: question,
+                                    timestamp: timestamp_encoded
+                                }}
+                            }}, '*');
+                            
+                            // Also try storing in session storage
+                            try {{
+                                sessionStorage.setItem('pending_question', question);
+                                sessionStorage.setItem('question_timestamp', timestamp_encoded);
+                            }} catch(e) {{}}
+                            
+                            // Force parent refresh
+                            window.parent.postMessage({{
+                                type: 'streamlit:rerun'
                             }}, '*');
                             
                             // Reset after delay
@@ -344,54 +366,80 @@ with left_col:
     </html>
     """
     
+    # Add JavaScript to check session storage
+    check_storage_html = """
+    <script>
+        const question = sessionStorage.getItem('pending_question');
+        const timestamp = sessionStorage.getItem('question_timestamp');
+        
+        if (question && timestamp) {
+            window.parent.postMessage({
+                type: 'streamlit:setComponentValue',
+                value: {
+                    question: question,
+                    timestamp: timestamp
+                }
+            }, '*');
+            
+            // Clear after sending
+            sessionStorage.removeItem('pending_question');
+            sessionStorage.removeItem('question_timestamp');
+        }
+    </script>
+    """
+    
+    check_result = components.html(check_storage_html, height=0)
+    
     result = components.html(speech_html, height=650)
     
     # Debug: Show what we're receiving
-    if result:
-        st.write("DEBUG - Received from component:", result)
+    st.write("DEBUG - check_result type:", type(check_result))
+    st.write("DEBUG - result type:", type(result))
+    if check_result and isinstance(check_result, dict):
+        st.write("DEBUG - check_result:", check_result)
+    if result and isinstance(result, dict):
+        st.write("DEBUG - result:", result)
     
     st.info("**💡 How to use:**\n\n1. Click START LISTENING\n2. Speak your question naturally\n3. Take your time - NO RUSH\n4. Say trigger keyword when ready\n5. Answers appear on right →")
 
 with right_col:
     st.subheader("📝 QUESTIONS & ANSWERS")
     
-    # Debug display
-    st.write(f"DEBUG - Total Q&As: {len(st.session_state.qa_list)}")
-    st.write(f"DEBUG - Listening: {st.session_state.is_listening}")
+    # Try to get data from both components
+    question_to_process = None
     
-    # Process new question
-    if result:
-        st.write("DEBUG - Result type:", type(result))
-        st.write("DEBUG - Result content:", result)
-        
-        if isinstance(result, dict):
-            question = result.get('question', '').strip()
-            st.write(f"DEBUG - Extracted question: '{question}'")
+    # Check storage component
+    if check_result and isinstance(check_result, dict):
+        q = check_result.get('question', '').strip()
+        if q:
+            question_to_process = q
+            st.success(f"✅ Got question from storage: {q}")
+    
+    # Check speech component
+    if result and isinstance(result, dict):
+        q = result.get('question', '').strip()
+        if q:
+            question_to_process = q
+            st.success(f"✅ Got question from speech: {q}")
+    
+    # Process if we have a question
+    if question_to_process:
+        # Check if not duplicate
+        if not st.session_state.qa_list or st.session_state.qa_list[-1]['question'] != question_to_process:
+            st.info("🔍 Searching for answers...")
             
-            if question:
-                # Check if not duplicate
-                if not st.session_state.qa_list or st.session_state.qa_list[-1]['question'] != question:
-                    st.write("DEBUG - Getting answers...")
-                    
-                    # Get answers
-                    answers = get_answers(question)
-                    st.write(f"DEBUG - Got {len(answers)} answers")
-                    
-                    # Add to list
-                    st.session_state.qa_list.append({
-                        'question': question,
-                        'answers': answers,
-                        'timestamp': datetime.now().strftime("%H:%M:%S")
-                    })
-                    
-                    st.write("DEBUG - Added to list, forcing rerun...")
-                    st.rerun()
-                else:
-                    st.write("DEBUG - Duplicate question, skipping")
-        else:
-            st.write("DEBUG - Result is not a dict")
-    else:
-        st.write("DEBUG - No result received")
+            # Get answers
+            answers = get_answers(question_to_process)
+            
+            # Add to list
+            st.session_state.qa_list.append({
+                'question': question_to_process,
+                'answers': answers,
+                'timestamp': datetime.now().strftime("%H:%M:%S")
+            })
+            
+            st.success(f"✅ Added! Total Q&As: {len(st.session_state.qa_list)}")
+            st.rerun()
     
     st.markdown("---")
     
