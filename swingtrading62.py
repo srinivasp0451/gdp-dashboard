@@ -264,9 +264,9 @@ def ema_crossover_strategy(df, i, config):
     if not (bullish_cross or bearish_cross):
         return 0, None
     
-    # Check EMA angle
-    angle = calculate_ema_angle(df['EMA_Fast'], i)
-    if abs(angle) < config['min_ema_angle']:
+    # Check EMA angle - must be positive for both bullish and bearish
+    angle = abs(calculate_ema_angle(df['EMA_Fast'], i))
+    if angle < config['min_ema_angle']:
         return 0, None
     
     # Check ADX filter if enabled
@@ -311,29 +311,26 @@ def price_threshold_strategy(df, i, config):
     threshold = config['threshold_price']
     direction = config['threshold_direction']
     
-    prev_price = df['Close'].iloc[i-1] if i > 0 else current_price
-    
     # Check if threshold was crossed in this candle
     crossed = False
+    signal = 0
     
     if direction == 'LONG (Price >= Threshold)':
-        if current_price >= threshold and prev_price < threshold:
+        if current_price >= threshold:
             crossed = True
             signal = 1
     elif direction == 'SHORT (Price >= Threshold)':
-        if current_price >= threshold and prev_price < threshold:
+        if current_price >= threshold:
             crossed = True
             signal = -1
     elif direction == 'LONG (Price <= Threshold)':
-        if current_price <= threshold and prev_price > threshold:
+        if current_price <= threshold:
             crossed = True
             signal = 1
     elif direction == 'SHORT (Price <= Threshold)':
-        if current_price <= threshold and prev_price > threshold:
+        if current_price <= threshold:
             crossed = True
             signal = -1
-    else:
-        return 0, None
     
     if crossed:
         return signal, df['Close'].iloc[i]
@@ -475,19 +472,25 @@ def custom_strategy(df, i, conditions):
     if not conditions:
         return 0, None
     
-    buy_conditions = [c for c in conditions if c['action'] == 'BUY']
-    sell_conditions = [c for c in conditions if c['action'] == 'SELL']
+    buy_conditions = [c for c in conditions if c['action'] == 'BUY' and c.get('use_condition', True)]
+    sell_conditions = [c for c in conditions if c['action'] == 'SELL' and c.get('use_condition', True)]
     
     buy_met = 0
     sell_met = 0
     
     for condition in conditions:
+        if not condition.get('use_condition', True):
+            continue
+            
         indicator = condition['indicator']
         operator = condition['operator']
         value = condition['value']
         
         # Get indicator value
-        if indicator in df.columns:
+        if indicator == 'Price':
+            ind_value = df['Close'].iloc[i]
+            prev_ind_value = df['Close'].iloc[i-1] if i > 0 else ind_value
+        elif indicator in df.columns:
             ind_value = df[indicator].iloc[i]
             prev_ind_value = df[indicator].iloc[i-1] if i > 0 else ind_value
         elif indicator == 'Close':
@@ -721,34 +724,24 @@ def update_trailing_sl(position, current_price, config):
     current_sl = position['sl']
     
     if 'Trailing SL (Points)' == sl_type:
-        # Pure trailing with point offset
+        # Pure trailing with point offset - distance always maintained
         points = config.get('sl_points', 10)
         threshold = config.get('trailing_threshold', 0)
         
         if signal == 1:  # LONG
-            if st.session_state['trailing_sl_high'] is None:
-                st.session_state['trailing_sl_high'] = current_price
+            # SL always trails at fixed distance below current price
+            new_sl = current_price - points
             
-            if current_price > st.session_state['trailing_sl_high']:
-                st.session_state['trailing_sl_high'] = current_price
-            
-            # Calculate new SL
-            new_sl = st.session_state['trailing_sl_high'] - points
-            
-            # Apply threshold
-            if new_sl > current_sl + threshold:
+            # Only update if new SL is higher than current SL
+            if new_sl > current_sl:
                 return new_sl
         
         else:  # SHORT
-            if st.session_state['trailing_sl_low'] is None:
-                st.session_state['trailing_sl_low'] = current_price
+            # SL always trails at fixed distance above current price
+            new_sl = current_price + points
             
-            if current_price < st.session_state['trailing_sl_low']:
-                st.session_state['trailing_sl_low'] = current_price
-            
-            new_sl = st.session_state['trailing_sl_low'] + points
-            
-            if new_sl < current_sl - threshold:
+            # Only update if new SL is lower than current SL
+            if new_sl < current_sl:
                 return new_sl
     
     return current_sl
@@ -833,6 +826,162 @@ def check_breakeven_sl(position, current_price, config):
         return entry_price
     
     return position['sl']
+
+# ============================================================================
+# BACKTEST ENGINE
+# ============================================================================
+
+def run_backtest(df, strategy, config):
+    """Run backtest on historical data"""
+    backtest_results = {
+        'trades': [],
+        'total_trades': 0,
+        'winning_trades': 0,
+        'losing_trades': 0,
+        'total_pnl': 0,
+        'accuracy': 0,
+        'avg_duration': 0
+    }
+    
+    position = None
+    
+    for i in range(len(df)):
+        if i < 50:  # Need enough data for indicators
+            continue
+        
+        # Check for entry
+        if position is None:
+            signal = 0
+            entry_price = None
+            
+            if strategy == "EMA Crossover":
+                signal, entry_price = ema_crossover_strategy(df, i, config)
+            elif strategy == "Simple Buy":
+                signal, entry_price = simple_buy_strategy(df, i)
+            elif strategy == "Simple Sell":
+                signal, entry_price = simple_sell_strategy(df, i)
+            elif strategy == "Price Crosses Threshold":
+                signal, entry_price = price_threshold_strategy(df, i, config)
+            elif strategy == "RSI-ADX-EMA":
+                signal, entry_price = rsi_adx_ema_strategy(df, i, config)
+            elif strategy == "AI Price Action Analysis":
+                signal, entry_price, analysis = ai_price_action_strategy(df, i, config)
+                if signal != 0:
+                    atr = df['ATR'].iloc[i]
+                    if signal == 1:
+                        config['auto_sl'] = entry_price - (atr * 1.5)
+                        config['auto_target'] = entry_price + (atr * 3)
+                    else:
+                        config['auto_sl'] = entry_price + (atr * 1.5)
+                        config['auto_target'] = entry_price - (atr * 3)
+            elif strategy == "Custom Strategy Builder":
+                signal, entry_price = custom_strategy(df, i, config.get('custom_conditions', []))
+            
+            if signal != 0:
+                sl = calculate_stop_loss(df, i, entry_price, signal, config['sl_type'], config)
+                target = calculate_target(df, i, entry_price, signal, config['target_type'], config)
+                
+                if strategy == "AI Price Action Analysis":
+                    sl = config.get('auto_sl', sl)
+                    target = config.get('auto_target', target)
+                
+                position = {
+                    'signal': signal,
+                    'entry_price': entry_price,
+                    'entry_time': df.index[i],
+                    'entry_index': i,
+                    'sl': sl,
+                    'target': target,
+                    'quantity': config['quantity'],
+                    'highest_price': entry_price,
+                    'lowest_price': entry_price
+                }
+        
+        else:
+            # Manage position
+            current_price = df['Close'].iloc[i]
+            
+            # Update highest/lowest
+            position['highest_price'] = max(position['highest_price'], current_price)
+            position['lowest_price'] = min(position['lowest_price'], current_price)
+            
+            # Check exits
+            exit_trade = False
+            exit_reason = ""
+            exit_price = current_price
+            
+            # Check signal-based exit
+            if config['sl_type'] == 'Signal-based' or config['target_type'] == 'Signal-based':
+                if check_signal_based_exit(df, i, position):
+                    exit_trade = True
+                    exit_reason = "Reverse Signal"
+            
+            # Check SL
+            if not exit_trade and position['sl'] != 0:
+                if position['signal'] == 1 and current_price <= position['sl']:
+                    exit_trade = True
+                    exit_reason = "Stop Loss"
+                    exit_price = position['sl']
+                elif position['signal'] == -1 and current_price >= position['sl']:
+                    exit_trade = True
+                    exit_reason = "Stop Loss"
+                    exit_price = position['sl']
+            
+            # Check target
+            if not exit_trade and position['target'] != 0:
+                if position['signal'] == 1 and current_price >= position['target']:
+                    exit_trade = True
+                    exit_reason = "Target"
+                    exit_price = position['target']
+                elif position['signal'] == -1 and current_price <= position['target']:
+                    exit_trade = True
+                    exit_reason = "Target"
+                    exit_price = position['target']
+            
+            if exit_trade:
+                # Calculate P&L
+                if position['signal'] == 1:
+                    pnl = (exit_price - position['entry_price']) * position['quantity']
+                else:
+                    pnl = (position['entry_price'] - exit_price) * position['quantity']
+                
+                # Record trade
+                trade_record = {
+                    'entry_time': position['entry_time'],
+                    'exit_time': df.index[i],
+                    'duration': df.index[i] - position['entry_time'],
+                    'signal': 'LONG' if position['signal'] == 1 else 'SHORT',
+                    'entry_price': position['entry_price'],
+                    'exit_price': exit_price,
+                    'sl': position['sl'],
+                    'target': position['target'],
+                    'exit_reason': exit_reason,
+                    'pnl': pnl,
+                    'quantity': position['quantity'],
+                    'highest_price': position['highest_price'],
+                    'lowest_price': position['lowest_price'],
+                    'range': position['highest_price'] - position['lowest_price']
+                }
+                
+                backtest_results['trades'].append(trade_record)
+                backtest_results['total_pnl'] += pnl
+                
+                if pnl > 0:
+                    backtest_results['winning_trades'] += 1
+                else:
+                    backtest_results['losing_trades'] += 1
+                
+                position = None
+    
+    # Calculate stats
+    backtest_results['total_trades'] = len(backtest_results['trades'])
+    if backtest_results['total_trades'] > 0:
+        backtest_results['accuracy'] = (backtest_results['winning_trades'] / backtest_results['total_trades']) * 100
+        
+        total_duration = sum([trade['duration'].total_seconds() for trade in backtest_results['trades']])
+        backtest_results['avg_duration'] = total_duration / backtest_results['total_trades']
+    
+    return backtest_results
 
 # ============================================================================
 # MAIN APPLICATION
@@ -992,11 +1141,18 @@ def main():
             
             for idx, condition in enumerate(st.session_state['custom_conditions']):
                 with st.expander(f"Condition {idx + 1}", expanded=True):
+                    condition['use_condition'] = st.selectbox(
+                        "Use this condition?",
+                        [True, False],
+                        index=0 if condition.get('use_condition', True) else 1,
+                        key=f"use_{idx}"
+                    )
+                    
                     condition['indicator'] = st.selectbox(
                         "Indicator",
-                        ["RSI", "ADX", "EMA_Fast", "EMA_Slow", "MACD", "MACD_Signal", 
+                        ["Price", "RSI", "ADX", "EMA_Fast", "EMA_Slow", "MACD", "MACD_Signal", 
                          "BB_Upper", "BB_Lower", "ATR", "Volume", "VWAP", "Close", "High", "Low",
-                         "Support", "Resistance"],
+                         "Support", "Resistance", "EMA_20", "EMA_50"],
                         key=f"ind_{idx}"
                     )
                     condition['operator'] = st.selectbox(
@@ -1041,10 +1197,10 @@ def main():
         ])
         
         if 'Custom Points' in config['sl_type'] or 'Trailing' in config['sl_type']:
-            config['sl_points'] = st.number_input("SL Points", min_value=1.0, value=10.0, step=1.0)
+            config['sl_points'] = st.number_input("SL Points", min_value=1.0, value=10.0, step=1.0, key='sl_points_input')
         
         if 'Trailing' in config['sl_type']:
-            config['trailing_threshold'] = st.number_input("Trailing Threshold (Points)", min_value=0.0, value=0.0, step=1.0)
+            config['trailing_threshold'] = st.number_input("Trailing Threshold (Points)", min_value=0.0, value=0.0, step=1.0, key='trail_thresh_input')
         
         if config['sl_type'] == 'ATR-based' or config['sl_type'] == 'Volatility-Adjusted Trailing SL':
             config['atr_multiplier_sl'] = st.number_input("ATR Multiplier (SL)", min_value=0.1, value=1.5, step=0.1)
@@ -1067,7 +1223,7 @@ def main():
         
         if 'Custom Points' in config['target_type'] or 'Trailing' in config['target_type'] or '50%' in config['target_type']:
             default_target = get_asset_minimum_target(ticker)
-            config['target_points'] = st.number_input("Target Points", min_value=1.0, value=float(default_target), step=1.0)
+            config['target_points'] = st.number_input("Target Points", min_value=1.0, value=float(default_target), step=1.0, key='target_points_input')
         
         if config['target_type'] == 'ATR-based':
             config['atr_multiplier_target'] = st.number_input("ATR Multiplier (Target)", min_value=0.1, value=3.0, step=0.1)
@@ -1076,7 +1232,7 @@ def main():
             config['risk_reward_ratio'] = st.number_input("Risk:Reward Ratio", min_value=0.1, value=2.0, step=0.1)
     
     # Main Content Area
-    tab1, tab2, tab3 = st.tabs(["📊 Live Trading Dashboard", "📈 Trade History", "📝 Trade Logs"])
+    tab1, tab2, tab3, tab4 = st.tabs(["📊 Live Trading Dashboard", "📈 Trade History", "📝 Trade Logs", "📊 Backtest Results"])
     
     with tab1:
         # Trading Controls at top
@@ -1090,6 +1246,48 @@ def main():
         with col2:
             if st.button("⏹️ Stop Trading", type="secondary", use_container_width=True):
                 st.session_state['trading_active'] = False
+                
+                # If position exists, close it manually
+                if st.session_state['position'] is not None:
+                    pos = st.session_state['position']
+                    current_time = get_ist_time()
+                    
+                    # Get current price from latest data
+                    if st.session_state['current_data'] is not None:
+                        current_price = st.session_state['current_data']['Close'].iloc[-1]
+                    else:
+                        current_price = pos['entry_price']
+                    
+                    # Calculate P&L
+                    if pos['signal'] == 1:
+                        pnl = (current_price - pos['entry_price']) * pos['quantity']
+                    else:
+                        pnl = (pos['entry_price'] - current_price) * pos['quantity']
+                    
+                    # Record trade
+                    trade_record = {
+                        'entry_time': pos['entry_time'].strftime('%Y-%m-%d %H:%M:%S'),
+                        'exit_time': current_time.strftime('%Y-%m-%d %H:%M:%S'),
+                        'duration': str(current_time - pos['entry_time']).split('.')[0],
+                        'signal': 'LONG' if pos['signal'] == 1 else 'SHORT',
+                        'entry_price': pos['entry_price'],
+                        'exit_price': current_price,
+                        'sl': pos['sl'],
+                        'target': pos['target'],
+                        'exit_reason': 'Manual Close',
+                        'pnl': pnl,
+                        'quantity': pos['quantity'],
+                        'strategy': pos['strategy'],
+                        'highest_price': st.session_state.get('highest_price', 0),
+                        'lowest_price': st.session_state.get('lowest_price', 0),
+                        'range': st.session_state.get('highest_price', 0) - st.session_state.get('lowest_price', 0)
+                    }
+                    
+                    st.session_state['trade_history'].append(trade_record)
+                    st.session_state['trade_history'] = st.session_state['trade_history']
+                    
+                    add_log(f"EXIT: Manual Close at {current_price:.2f} | P&L: {pnl:.2f}")
+                
                 reset_position_state()
                 add_log("Trading stopped - Position state reset")
         
@@ -1175,6 +1373,31 @@ def main():
             
             with metric_cols[4]:
                 st.metric("Last Update", current_time.strftime('%H:%M:%S'))
+            
+            st.divider()
+            
+            # Display Selected Parameters
+            st.markdown("### ⚙️ Active Configuration")
+            
+            param_col1, param_col2, param_col3 = st.columns(3)
+            
+            with param_col1:
+                st.markdown(f"**Asset:** {ticker}")
+                st.markdown(f"**Interval:** {interval}")
+                st.markdown(f"**Period:** {period}")
+                st.markdown(f"**Quantity:** {quantity}")
+            
+            with param_col2:
+                st.markdown(f"**Strategy:** {strategy}")
+                st.markdown(f"**SL Type:** {config['sl_type']}")
+                if 'sl_points' in config:
+                    st.markdown(f"**SL Points:** {config['sl_points']}")
+            
+            with param_col3:
+                st.markdown(f"**Target Type:** {config['target_type']}")
+                if 'target_points' in config:
+                    st.markdown(f"**Target Points:** {config['target_points']}")
+                st.markdown(f"**Mode:** {mode}")
             
             st.divider()
             
@@ -1410,10 +1633,8 @@ def main():
                         signal, entry_price = simple_sell_strategy(df, current_idx)
                     
                     elif strategy == "Price Crosses Threshold":
-                        if not st.session_state['threshold_crossed']:
-                            signal, entry_price = price_threshold_strategy(df, current_idx, config)
-                            if signal != 0:
-                                st.session_state['threshold_crossed'] = True
+                        # Always check threshold condition
+                        signal, entry_price = price_threshold_strategy(df, current_idx, config)
                     
                     elif strategy == "RSI-ADX-EMA":
                         signal, entry_price = rsi_adx_ema_strategy(df, current_idx, config)
@@ -1669,6 +1890,99 @@ def main():
         else:
             for log in reversed(st.session_state['trade_logs']):
                 st.text(log)
+
+    with tab4:
+        st.markdown("### 📊 Backtest Results")
+        
+        if mode == "Backtest":
+            if st.button("▶️ Run Backtest", type="primary"):
+                with st.spinner("Running backtest..."):
+                    # Fetch data
+                    df = fetch_data(ticker, interval, period, 'backtest')
+                    
+                    if df is None or df.empty:
+                        st.error("Failed to fetch data")
+                    else:
+                        # Calculate indicators
+                        df['EMA_Fast'] = calculate_ema(df['Close'], config.get('ema_fast', 9))
+                        df['EMA_Slow'] = calculate_ema(df['Close'], config.get('ema_slow', 15))
+                        df['EMA_20'] = calculate_ema(df['Close'], 20)
+                        df['EMA_50'] = calculate_ema(df['Close'], 50)
+                        df['ATR'] = calculate_atr(df, 14)
+                        df['RSI'] = calculate_rsi(df['Close'], config.get('rsi_period', 14))
+                        df['ADX'] = calculate_adx(df, config.get('adx_period', 14))
+                        df['BB_Upper'], df['BB_Middle'], df['BB_Lower'] = calculate_bollinger_bands(df['Close'])
+                        df['MACD'], df['MACD_Signal'], df['MACD_Hist'] = calculate_macd(df['Close'])
+                        df['VWAP'] = calculate_vwap(df)
+                        df['Support'], df['Resistance'] = calculate_support_resistance(df)
+                        df['Swing_High'], df['Swing_Low'] = detect_swing_high_low(df)
+                        
+                        # Run backtest
+                        config['custom_conditions'] = st.session_state.get('custom_conditions', [])
+                        results = run_backtest(df, strategy, config)
+                        
+                        # Display results
+                        st.success("Backtest completed!")
+                        
+                        # Summary metrics
+                        metric_cols = st.columns(5)
+                        
+                        with metric_cols[0]:
+                            st.metric("Total Trades", results['total_trades'])
+                        
+                        with metric_cols[1]:
+                            st.metric("Winning", results['winning_trades'])
+                        
+                        with metric_cols[2]:
+                            st.metric("Losing", results['losing_trades'])
+                        
+                        with metric_cols[3]:
+                            st.metric("Accuracy", f"{results['accuracy']:.1f}%")
+                        
+                        with metric_cols[4]:
+                            pnl = results['total_pnl']
+                            pnl_delta = f"+{pnl:.2f}" if pnl >= 0 else f"{pnl:.2f}"
+                            st.metric("Total P&L", f"{pnl:.2f}", delta=pnl_delta, delta_color="normal" if pnl >= 0 else "inverse")
+                        
+                        st.divider()
+                        
+                        # Average duration
+                        if results['total_trades'] > 0:
+                            avg_duration_hours = results['avg_duration'] / 3600
+                            st.markdown(f"**Average Trade Duration:** {avg_duration_hours:.2f} hours")
+                        
+                        st.divider()
+                        
+                        # Trade details
+                        st.markdown("### 📋 Trade Details")
+                        
+                        for idx, trade in enumerate(results['trades']):
+                            with st.expander(f"Trade #{idx + 1} - {trade['signal']} - P&L: {trade['pnl']:.2f}", expanded=False):
+                                col1, col2 = st.columns(2)
+                                
+                                with col1:
+                                    st.markdown(f"**Entry Time:** {trade['entry_time'].strftime('%Y-%m-%d %H:%M:%S')}")
+                                    st.markdown(f"**Exit Time:** {trade['exit_time'].strftime('%Y-%m-%d %H:%M:%S')}")
+                                    st.markdown(f"**Duration:** {str(trade['duration']).split('.')[0]}")
+                                    st.markdown(f"**Signal:** {trade['signal']}")
+                                    st.markdown(f"**Entry Price:** {trade['entry_price']:.2f}")
+                                
+                                with col2:
+                                    st.markdown(f"**Exit Price:** {trade['exit_price']:.2f}")
+                                    st.markdown(f"**Stop Loss:** {trade['sl']:.2f}")
+                                    st.markdown(f"**Target:** {trade['target']:.2f}")
+                                    st.markdown(f"**Exit Reason:** {trade['exit_reason']}")
+                                    
+                                    pnl = trade['pnl']
+                                    pnl_color = "green" if pnl >= 0 else "red"
+                                    st.markdown(f"**P&L:** :{pnl_color}[{pnl:.2f}]")
+                                
+                                st.markdown("---")
+                                st.markdown(f"**Highest Price:** {trade['highest_price']:.2f}")
+                                st.markdown(f"**Lowest Price:** {trade['lowest_price']:.2f}")
+                                st.markdown(f"**Range:** {trade['range']:.2f}")
+        else:
+            st.info("Switch to Backtest mode to run backtests")
 
 if __name__ == "__main__":
     main()
