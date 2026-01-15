@@ -564,20 +564,43 @@ def calculate_sl_target(df, i, signal, config):
         sl = entry_price - sl_points if signal == 1 else entry_price + sl_points
     elif sl_type == 'ATR-based':
         atr = df['ATR'].iloc[i]
-        atr_multiplier = config.get('atr_multiplier', 1.5)
-        sl = entry_price - (atr * atr_multiplier) if signal == 1 else entry_price + (atr * atr_multiplier)
+        if pd.notna(atr) and atr > 0:
+            atr_multiplier = config.get('atr_multiplier', 1.5)
+            sl = entry_price - (atr * atr_multiplier) if signal == 1 else entry_price + (atr * atr_multiplier)
+        else:
+            sl_points = config.get('sl_points', 10)
+            sl = entry_price - sl_points if signal == 1 else entry_price + sl_points
     elif sl_type == 'Current Candle Low/High':
         sl = df['Low'].iloc[i] if signal == 1 else df['High'].iloc[i]
     elif sl_type == 'Previous Candle Low/High':
-        sl = df['Low'].iloc[i-1] if signal == 1 else df['High'].iloc[i-1]
+        if i > 0:
+            sl = df['Low'].iloc[i-1] if signal == 1 else df['High'].iloc[i-1]
+        else:
+            sl_points = config.get('sl_points', 10)
+            sl = entry_price - sl_points if signal == 1 else entry_price + sl_points
     elif sl_type == 'Current Swing Low/High':
-        sl = df['Swing_Low'].iloc[i] if signal == 1 else df['Swing_High'].iloc[i]
+        swing_val = df['Swing_Low'].iloc[i] if signal == 1 else df['Swing_High'].iloc[i]
+        if pd.notna(swing_val):
+            sl = swing_val
+        else:
+            sl_points = config.get('sl_points', 10)
+            sl = entry_price - sl_points if signal == 1 else entry_price + sl_points
     elif sl_type == 'Previous Swing Low/High':
-        prev_swing = df['Swing_Low'].iloc[:i].dropna()
+        prev_swing = df['Swing_Low'].iloc[:i].dropna() if signal == 1 else df['Swing_High'].iloc[:i].dropna()
         if len(prev_swing) > 0:
-            sl = prev_swing.iloc[-1] if signal == 1 else df['Swing_High'].iloc[:i].dropna().iloc[-1]
+            sl = prev_swing.iloc[-1]
+        else:
+            sl_points = config.get('sl_points', 10)
+            sl = entry_price - sl_points if signal == 1 else entry_price + sl_points
     elif sl_type == 'Signal-based (reverse EMA crossover)':
         sl = 0
+    else:
+        sl_points = config.get('sl_points', 10)
+        sl = entry_price - sl_points if signal == 1 else entry_price + sl_points
+    
+    if sl is None:
+        sl_points = config.get('sl_points', 10)
+        sl = entry_price - sl_points if signal == 1 else entry_price + sl_points
     
     if sl is not None and sl != 0:
         min_sl_distance = config.get('min_sl_distance', 10)
@@ -608,25 +631,51 @@ def calculate_sl_target(df, i, signal, config):
         target = entry_price + target_points if signal == 1 else entry_price - target_points
     elif target_type == 'ATR-based':
         atr = df['ATR'].iloc[i]
-        atr_multiplier = config.get('target_atr_multiplier', 2.0)
-        target = entry_price + (atr * atr_multiplier) if signal == 1 else entry_price - (atr * atr_multiplier)
+        if pd.notna(atr) and atr > 0:
+            atr_multiplier = config.get('target_atr_multiplier', 2.0)
+            target = entry_price + (atr * atr_multiplier) if signal == 1 else entry_price - (atr * atr_multiplier)
+        else:
+            target_points = config.get('target_points', 20)
+            target = entry_price + target_points if signal == 1 else entry_price - target_points
     elif target_type == 'Risk-Reward Based':
         if sl is not None and sl != 0:
             risk = abs(entry_price - sl)
             rr_ratio = config.get('rr_ratio', 2.0)
             target = entry_price + (risk * rr_ratio) if signal == 1 else entry_price - (risk * rr_ratio)
+        else:
+            target_points = config.get('target_points', 20)
+            target = entry_price + target_points if signal == 1 else entry_price - target_points
     elif target_type == 'Current Candle Low/High':
         target = df['High'].iloc[i] if signal == 1 else df['Low'].iloc[i]
     elif target_type == 'Previous Candle Low/High':
-        target = df['High'].iloc[i-1] if signal == 1 else df['Low'].iloc[i-1]
+        if i > 0:
+            target = df['High'].iloc[i-1] if signal == 1 else df['Low'].iloc[i-1]
+        else:
+            target_points = config.get('target_points', 20)
+            target = entry_price + target_points if signal == 1 else entry_price - target_points
     elif target_type == 'Current Swing Low/High':
-        target = df['Swing_High'].iloc[i] if signal == 1 else df['Swing_Low'].iloc[i]
+        swing_val = df['Swing_High'].iloc[i] if signal == 1 else df['Swing_Low'].iloc[i]
+        if pd.notna(swing_val):
+            target = swing_val
+        else:
+            target_points = config.get('target_points', 20)
+            target = entry_price + target_points if signal == 1 else entry_price - target_points
     elif target_type == 'Previous Swing Low/High':
-        prev_swing = df['Swing_High'].iloc[:i].dropna()
+        prev_swing = df['Swing_High'].iloc[:i].dropna() if signal == 1 else df['Swing_Low'].iloc[:i].dropna()
         if len(prev_swing) > 0:
-            target = prev_swing.iloc[-1] if signal == 1 else df['Swing_Low'].iloc[:i].dropna().iloc[-1]
+            target = prev_swing.iloc[-1]
+        else:
+            target_points = config.get('target_points', 20)
+            target = entry_price + target_points if signal == 1 else entry_price - target_points
     elif target_type == 'Signal-based (reverse EMA crossover)':
         target = 0
+    else:
+        target_points = config.get('target_points', 20)
+        target = entry_price + target_points if signal == 1 else entry_price - target_points
+    
+    if target is None:
+        target_points = config.get('target_points', 20)
+        target = entry_price + target_points if signal == 1 else entry_price - target_points
     
     if target is not None and target != 0:
         min_target_distance = config.get('min_target_distance', 15)
@@ -635,7 +684,7 @@ def calculate_sl_target(df, i, signal, config):
         else:
             target = min(target, entry_price - min_target_distance)
     
-    return sl, target
+    return sl if sl is not None else 0, target if target is not None else 0
 
 def update_trailing_sl(current_price, entry_price, signal, config, position):
     """Update trailing stop loss"""
@@ -1144,6 +1193,8 @@ def live_trading_loop(config):
                 st.metric("Current Price", f"{current_price:.2f}")
                 if position:
                     st.metric("Entry Price", f"{position['entry_price']:.2f}")
+                else:
+                    st.metric("Entry Price", "N/A")
             
             with col2:
                 pos_status = "IN POSITION" if position else "NO POSITION"
@@ -1151,6 +1202,8 @@ def live_trading_loop(config):
                 if position:
                     pos_type = "LONG" if position['signal'] == 1 else "SHORT"
                     st.metric("Position Type", pos_type)
+                else:
+                    st.metric("Position Type", "N/A")
             
             with col3:
                 if position:
@@ -1162,40 +1215,57 @@ def live_trading_loop(config):
             
             with col4:
                 st.metric("Last Update", current_time.strftime("%H:%M:%S"))
-                st.metric("EMA Fast", f"{df['EMA_Fast'].iloc[-1]:.2f}")
+                if len(df) > 0 and 'EMA_Fast' in df.columns:
+                    st.metric("EMA Fast", f"{df['EMA_Fast'].iloc[-1]:.2f}")
+                else:
+                    st.metric("EMA Fast", "N/A")
             
             col5, col6, col7, col8 = st.columns(4)
             with col5:
-                st.metric("EMA Slow", f"{df['EMA_Slow'].iloc[-1]:.2f}")
+                if len(df) > 0 and 'EMA_Slow' in df.columns:
+                    st.metric("EMA Slow", f"{df['EMA_Slow'].iloc[-1]:.2f}")
+                else:
+                    st.metric("EMA Slow", "N/A")
             with col6:
-                st.metric("Crossover Angle", f"{df['EMA_Angle'].iloc[-1]:.2f}°")
+                if len(df) > 0 and 'EMA_Angle' in df.columns:
+                    st.metric("Crossover Angle", f"{df['EMA_Angle'].iloc[-1]:.2f}°")
+                else:
+                    st.metric("Crossover Angle", "N/A")
             with col7:
-                st.metric("RSI", f"{df['RSI'].iloc[-1]:.2f}")
+                if len(df) > 0 and 'RSI' in df.columns:
+                    st.metric("RSI", f"{df['RSI'].iloc[-1]:.2f}")
+                else:
+                    st.metric("RSI", "N/A")
             with col8:
-                current_signal = "BUY" if df['EMA_Fast'].iloc[-1] > df['EMA_Slow'].iloc[-1] else "SELL"
-                st.metric("Current Signal", current_signal)
+                if len(df) > 0 and 'EMA_Fast' in df.columns and 'EMA_Slow' in df.columns:
+                    current_signal = "BUY" if df['EMA_Fast'].iloc[-1] > df['EMA_Slow'].iloc[-1] else "SELL"
+                    st.metric("Current Signal", current_signal)
+                else:
+                    st.metric("Current Signal", "N/A")
             
             if strategy == 'EMA Crossover':
                 entry_filter = config.get('entry_filter', 'Simple Crossover')
                 st.markdown(f"**Entry Filter:** {entry_filter}")
                 
-                candle_size = abs(df['Close'].iloc[-1] - df['Open'].iloc[-1])
-                if entry_filter == 'Custom Candle (Points)':
-                    custom_points = config.get('custom_points', 10)
-                    status = "✅" if candle_size >= custom_points else "❌"
-                    st.markdown(f"{status} Candle Size: {candle_size:.2f} / Min: {custom_points:.2f}")
-                elif entry_filter == 'ATR-based Candle':
-                    atr = df['ATR'].iloc[-1]
-                    multiplier = config.get('atr_multiplier', 1.5)
-                    min_candle = atr * multiplier
-                    status = "✅" if candle_size >= min_candle else "❌"
-                    st.markdown(f"{status} Candle Size: {candle_size:.2f} / Min (ATR×{multiplier}): {min_candle:.2f}")
-                
-                if config.get('use_adx', False):
-                    adx = df['ADX'].iloc[-1]
-                    threshold = config.get('adx_threshold', 25)
-                    status = "✅" if adx >= threshold else "❌"
-                    st.markdown(f"{status} ADX: {adx:.2f} / Threshold: {threshold:.2f}")
+                if len(df) > 0 and 'Close' in df.columns and 'Open' in df.columns:
+                    candle_size = abs(df['Close'].iloc[-1] - df['Open'].iloc[-1])
+                    if entry_filter == 'Custom Candle (Points)':
+                        custom_points = config.get('custom_points', 10)
+                        status = "✅" if candle_size >= custom_points else "❌"
+                        st.markdown(f"{status} Candle Size: {candle_size:.2f} / Min: {custom_points:.2f}")
+                    elif entry_filter == 'ATR-based Candle':
+                        if 'ATR' in df.columns:
+                            atr = df['ATR'].iloc[-1]
+                            multiplier = config.get('atr_multiplier', 1.5)
+                            min_candle = atr * multiplier
+                            status = "✅" if candle_size >= min_candle else "❌"
+                            st.markdown(f"{status} Candle Size: {candle_size:.2f} / Min (ATR×{multiplier}): {min_candle:.2f}")
+                    
+                    if config.get('use_adx', False) and 'ADX' in df.columns:
+                        adx = df['ADX'].iloc[-1]
+                        threshold = config.get('adx_threshold', 25)
+                        status = "✅" if adx >= threshold else "❌"
+                        st.markdown(f"{status} ADX: {adx:.2f} / Threshold: {threshold:.2f}")
         
         if position:
             with position_placeholder:
@@ -1208,16 +1278,18 @@ def live_trading_loop(config):
                     st.metric("Entry Time", position['entry_time'].strftime("%H:%M:%S"))
                     st.metric("Duration", duration_str)
                 with col2:
-                    sl_str = f"{position['sl']:.2f}" if position['sl'] != 0 else "Signal Based"
+                    sl_val = position.get('sl', 0)
+                    sl_str = f"{sl_val:.2f}" if sl_val != 0 else "Signal Based"
                     st.metric("Stop Loss", sl_str)
-                    if position['sl'] != 0:
-                        dist_sl = abs(current_price - position['sl'])
+                    if sl_val != 0:
+                        dist_sl = abs(current_price - sl_val)
                         st.metric("Distance to SL", f"{dist_sl:.2f}")
                 with col3:
-                    target_str = f"{position['target']:.2f}" if position['target'] != 0 else "Signal Based"
+                    target_val = position.get('target', 0)
+                    target_str = f"{target_val:.2f}" if target_val != 0 else "Signal Based"
                     st.metric("Target", target_str)
-                    if position['target'] != 0:
-                        dist_target = abs(position['target'] - current_price)
+                    if target_val != 0:
+                        dist_target = abs(target_val - current_price)
                         st.metric("Distance to Target", f"{dist_target:.2f}")
                 with col4:
                     highest = st.session_state.get('highest_price', 0)
@@ -1230,39 +1302,49 @@ def live_trading_loop(config):
                 
                 if st.session_state.get('breakeven_activated', False):
                     st.info("ℹ️ SL moved to break-even")
+        else:
+            # Display message when no position
+            with position_placeholder:
+                st.info("No active position - Waiting for entry signal...")
         
         with chart_placeholder:
             st.markdown("### 📈 Live Chart")
-            fig = go.Figure()
             
-            fig.add_trace(go.Candlestick(
-                x=df.index,
-                open=df['Open'],
-                high=df['High'],
-                low=df['Low'],
-                close=df['Close'],
-                name='Price'
-            ))
-            
-            fig.add_trace(go.Scatter(x=df.index, y=df['EMA_Fast'], name='EMA Fast', line=dict(color='blue', width=1)))
-            fig.add_trace(go.Scatter(x=df.index, y=df['EMA_Slow'], name='EMA Slow', line=dict(color='red', width=1)))
-            
-            if position:
-                fig.add_hline(y=position['entry_price'], line_dash="dash", line_color="yellow", annotation_text="Entry")
-                if position['sl'] != 0:
-                    fig.add_hline(y=position['sl'], line_dash="dash", line_color="red", annotation_text="SL")
-                if position['target'] != 0:
-                    fig.add_hline(y=position['target'], line_dash="dash", line_color="green", annotation_text="Target")
-            
-            fig.update_layout(
-                title=f"{ticker} - {interval}",
-                xaxis_title="Time",
-                yaxis_title="Price",
-                height=500,
-                xaxis_rangeslider_visible=False
-            )
-            
-            st.plotly_chart(fig, use_container_width=True, key=f"live_chart_{current_time.timestamp()}")
+            if len(df) > 0:
+                fig = go.Figure()
+                
+                fig.add_trace(go.Candlestick(
+                    x=df.index,
+                    open=df['Open'],
+                    high=df['High'],
+                    low=df['Low'],
+                    close=df['Close'],
+                    name='Price'
+                ))
+                
+                if 'EMA_Fast' in df.columns:
+                    fig.add_trace(go.Scatter(x=df.index, y=df['EMA_Fast'], name='EMA Fast', line=dict(color='blue', width=1)))
+                if 'EMA_Slow' in df.columns:
+                    fig.add_trace(go.Scatter(x=df.index, y=df['EMA_Slow'], name='EMA Slow', line=dict(color='red', width=1)))
+                
+                if position:
+                    fig.add_hline(y=position['entry_price'], line_dash="dash", line_color="yellow", annotation_text="Entry")
+                    if position.get('sl', 0) != 0:
+                        fig.add_hline(y=position['sl'], line_dash="dash", line_color="red", annotation_text="SL")
+                    if position.get('target', 0) != 0:
+                        fig.add_hline(y=position['target'], line_dash="dash", line_color="green", annotation_text="Target")
+                
+                fig.update_layout(
+                    title=f"{ticker} - {interval}",
+                    xaxis_title="Time",
+                    yaxis_title="Price",
+                    height=500,
+                    xaxis_rangeslider_visible=False
+                )
+                
+                st.plotly_chart(fig, use_container_width=True, key=f"live_chart_{current_time.timestamp()}")
+            else:
+                st.warning("No data available for chart")
         
         with status_placeholder:
             if position:
