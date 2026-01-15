@@ -1396,7 +1396,7 @@ def live_trading_loop(config):
         
         time.sleep(random.uniform(1.0, 1.5))
     
-    st.info("⚪ STOPPED")
+        st.info("⚪ STOPPED")
         
         if df is None or len(df) < 50:
             with status_container:
