@@ -467,65 +467,75 @@ def check_custom_conditions(df, i, conditions):
             continue
         
         use_price = cond.get('use_price', False)
-        price_val = df['Close'].iloc[i] if use_price else None
-        
         indicator = cond.get('indicator', 'RSI')
         operator = cond.get('operator', '>')
         value = cond.get('value', 0)
         action = cond.get('action', 'BUY')
+        compare_indicator = cond.get('compare_indicator', 'EMA_20')
         
-        if indicator == 'Price':
-            ind_val = df['Close'].iloc[i]
-        elif indicator == 'Close':
-            ind_val = df['Close'].iloc[i]
-        elif indicator == 'High':
-            ind_val = df['High'].iloc[i]
-        elif indicator == 'Low':
-            ind_val = df['Low'].iloc[i]
-        elif indicator == 'Volume':
-            ind_val = df['Volume'].iloc[i] if df['Volume'].iloc[i] > 0 else 0
-        elif indicator in df.columns:
-            ind_val = df[indicator].iloc[i]
-        else:
-            continue
+        # Get current price
+        current_price = df['Close'].iloc[i]
         
-        condition_met = False
-        if operator == '>':
-            if use_price and price_val is not None:
+        # Get indicator value
+        if use_price:
+            # Price is being compared with another indicator
+            ind_val = df[compare_indicator].iloc[i] if compare_indicator in df.columns else value
+            price_val = current_price
+            
+            # Check operator with price vs indicator
+            condition_met = False
+            if operator == '>':
                 condition_met = price_val > ind_val
-            else:
-                condition_met = ind_val > value
-        elif operator == '<':
-            if use_price and price_val is not None:
+            elif operator == '<':
                 condition_met = price_val < ind_val
-            else:
-                condition_met = ind_val < value
-        elif operator == '>=':
-            if use_price and price_val is not None:
+            elif operator == '>=':
                 condition_met = price_val >= ind_val
-            else:
-                condition_met = ind_val >= value
-        elif operator == '<=':
-            if use_price and price_val is not None:
+            elif operator == '<=':
                 condition_met = price_val <= ind_val
-            else:
-                condition_met = ind_val <= value
-        elif operator == '==':
-            if use_price and price_val is not None:
+            elif operator == '==':
                 condition_met = abs(price_val - ind_val) < 0.01
+            elif operator == 'crosses_above':
+                prev_price = df['Close'].iloc[i-1]
+                prev_ind = df[compare_indicator].iloc[i-1] if compare_indicator in df.columns else ind_val
+                condition_met = price_val > ind_val and prev_price <= prev_ind
+            elif operator == 'crosses_below':
+                prev_price = df['Close'].iloc[i-1]
+                prev_ind = df[compare_indicator].iloc[i-1] if compare_indicator in df.columns else ind_val
+                condition_met = price_val < ind_val and prev_price >= prev_ind
+        else:
+            # Normal indicator comparison with value
+            if indicator == 'Price':
+                ind_val = current_price
+            elif indicator == 'Close':
+                ind_val = df['Close'].iloc[i]
+            elif indicator == 'High':
+                ind_val = df['High'].iloc[i]
+            elif indicator == 'Low':
+                ind_val = df['Low'].iloc[i]
+            elif indicator == 'Volume':
+                ind_val = df['Volume'].iloc[i] if df['Volume'].iloc[i] > 0 else 0
+            elif indicator in df.columns:
+                ind_val = df[indicator].iloc[i]
             else:
+                continue
+            
+            # Check operator
+            condition_met = False
+            if operator == '>':
+                condition_met = ind_val > value
+            elif operator == '<':
+                condition_met = ind_val < value
+            elif operator == '>=':
+                condition_met = ind_val >= value
+            elif operator == '<=':
+                condition_met = ind_val <= value
+            elif operator == '==':
                 condition_met = abs(ind_val - value) < 0.01
-        elif operator == 'crosses_above':
-            prev_ind = df[indicator].iloc[i-1] if indicator in df.columns else 0
-            if use_price and price_val is not None:
-                condition_met = ind_val > price_val and prev_ind <= price_val
-            else:
+            elif operator == 'crosses_above':
+                prev_ind = df[indicator].iloc[i-1] if indicator in df.columns else 0
                 condition_met = ind_val > value and prev_ind <= value
-        elif operator == 'crosses_below':
-            prev_ind = df[indicator].iloc[i-1] if indicator in df.columns else 0
-            if use_price and price_val is not None:
-                condition_met = ind_val < price_val and prev_ind >= price_val
-            else:
+            elif operator == 'crosses_below':
+                prev_ind = df[indicator].iloc[i-1] if indicator in df.columns else 0
                 condition_met = ind_val < value and prev_ind >= value
         
         if condition_met:
@@ -1031,21 +1041,83 @@ def live_trading_loop(config):
         
         with config_placeholder:
             st.markdown("### 📋 Active Configuration")
-            col1, col2, col3, col4 = st.columns(4)
-            with col1:
-                st.metric("Asset", ticker)
-                st.metric("Interval", interval)
-            with col2:
-                st.metric("Period", period)
-                st.metric("Quantity", quantity)
-            with col3:
-                st.metric("Strategy", strategy)
-                sl_type_display = config.get('sl_type', 'Custom Points')
-                st.metric("SL Type", sl_type_display[:20])
-            with col4:
-                target_type_display = config.get('target_type', 'Custom Points')
-                st.metric("Target Type", target_type_display[:20])
-                st.metric("Mode", "LIVE TRADING")
+            
+            # Display all configuration parameters
+            st.markdown("**Asset & Timeframe:**")
+            col_conf1, col_conf2, col_conf3, col_conf4 = st.columns(4)
+            with col_conf1:
+                st.write(f"**Ticker:** {ticker}")
+            with col_conf2:
+                st.write(f"**Interval:** {interval}")
+            with col_conf3:
+                st.write(f"**Period:** {period}")
+            with col_conf4:
+                st.write(f"**Quantity:** {quantity}")
+            
+            st.markdown("**Strategy Configuration:**")
+            col_conf5, col_conf6 = st.columns(2)
+            with col_conf5:
+                st.write(f"**Strategy:** {strategy}")
+                st.write(f"**Mode:** Live Trading")
+            with col_conf6:
+                st.write(f"**SL Type:** {config.get('sl_type', 'N/A')[:30]}")
+                st.write(f"**Target Type:** {config.get('target_type', 'N/A')[:30]}")
+            
+            # Strategy-specific parameters
+            if strategy == "EMA Crossover":
+                st.markdown("**EMA Crossover Settings:**")
+                col_ema1, col_ema2, col_ema3, col_ema4 = st.columns(4)
+                with col_ema1:
+                    st.write(f"**EMA Fast:** {config.get('ema_fast', 9)}")
+                with col_ema2:
+                    st.write(f"**EMA Slow:** {config.get('ema_slow', 15)}")
+                with col_ema3:
+                    st.write(f"**Min Angle:** {config.get('min_angle', 1)}°")
+                with col_ema4:
+                    st.write(f"**Entry Filter:** {config.get('entry_filter', 'Simple')}")
+                
+                if config.get('entry_filter') == 'Custom Candle (Points)':
+                    st.write(f"**Custom Points:** {config.get('custom_points', 10)}")
+                elif config.get('entry_filter') == 'ATR-based Candle':
+                    st.write(f"**ATR Multiplier:** {config.get('atr_multiplier', 1.5)}")
+                
+                if config.get('use_adx', False):
+                    st.write(f"**ADX Filter:** Enabled (Threshold: {config.get('adx_threshold', 25)})")
+            
+            elif strategy == "Price Crosses Threshold":
+                st.markdown("**Threshold Settings:**")
+                st.write(f"**Threshold Value:** {config.get('threshold_value', 0)}")
+                st.write(f"**Threshold Type:** {config.get('threshold_type', 'N/A')}")
+            
+            elif strategy == "Custom Strategy Builder":
+                st.markdown("**Custom Conditions:**")
+                active_conds = [c for c in config.get('custom_conditions', []) if c.get('active', False)]
+                st.write(f"**Active Conditions:** {len(active_conds)}")
+                for idx, cond in enumerate(active_conds):
+                    if cond.get('use_price'):
+                        st.write(f"{idx+1}. Price {cond.get('operator', '>')} {cond.get('compare_indicator', 'EMA_20')} → {cond.get('action', 'BUY')}")
+                    else:
+                        st.write(f"{idx+1}. {cond.get('indicator', 'RSI')} {cond.get('operator', '>')} {cond.get('value', 0)} → {cond.get('action', 'BUY')}")
+            
+            # SL/Target parameters
+            st.markdown("**Risk Management:**")
+            col_rm1, col_rm2, col_rm3, col_rm4 = st.columns(4)
+            with col_rm1:
+                if 'Custom Points' in config.get('sl_type', '') or 'Trailing SL' in config.get('sl_type', ''):
+                    st.write(f"**SL Points:** {config.get('sl_points', 10)}")
+                st.write(f"**Min SL Distance:** {config.get('min_sl_distance', 10)}")
+            with col_rm2:
+                if 'Custom Points' in config.get('target_type', '') or 'Trailing Target' in config.get('target_type', ''):
+                    st.write(f"**Target Points:** {config.get('target_points', 20)}")
+                st.write(f"**Min Target Distance:** {config.get('min_target_distance', 15)}")
+            with col_rm3:
+                if 'Trailing' in config.get('sl_type', ''):
+                    st.write(f"**Trailing Threshold:** {config.get('trailing_threshold', 0)}")
+            with col_rm4:
+                if 'Risk-Reward' in config.get('target_type', ''):
+                    st.write(f"**Risk-Reward Ratio:** {config.get('rr_ratio', 2.0)}")
+            
+            st.markdown("---")
         
         if position is not None:
             if position['signal'] == 1:
@@ -1623,18 +1695,31 @@ def main():
             cond['active'] = st.sidebar.checkbox(f"Use condition {idx + 1}", value=cond.get('active', True), key=f"active_{idx}")
             
             if cond['active']:
-                cond['use_price'] = st.sidebar.checkbox(f"Use Price", value=cond.get('use_price', False), key=f"use_price_{idx}")
+                cond['use_price'] = st.sidebar.checkbox(f"Compare Price with Indicator", value=cond.get('use_price', False), key=f"use_price_{idx}")
                 
-                cond['indicator'] = st.sidebar.selectbox(
-                    f"Indicator",
-                    ["Price", "RSI", "ADX", "EMA_Fast", "EMA_Slow", "SuperTrend", "MACD", "MACD_Signal", 
-                     "BB_Upper", "BB_Lower", "ATR", "Volume", "VWAP", "KC_Upper", "KC_Lower",
-                     "Close", "High", "Low", "Support", "Resistance", "EMA_20", "EMA_50"],
-                    key=f"indicator_{idx}",
-                    index=["Price", "RSI", "ADX", "EMA_Fast", "EMA_Slow", "SuperTrend", "MACD", "MACD_Signal", 
-                           "BB_Upper", "BB_Lower", "ATR", "Volume", "VWAP", "KC_Upper", "KC_Lower",
-                           "Close", "High", "Low", "Support", "Resistance", "EMA_20", "EMA_50"].index(cond.get('indicator', 'RSI'))
-                )
+                if cond['use_price']:
+                    # When use_price is enabled, compare price with another indicator
+                    st.sidebar.markdown("**Price will be compared with:**")
+                    cond['compare_indicator'] = st.sidebar.selectbox(
+                        f"Compare Indicator",
+                        ["EMA_Fast", "EMA_Slow", "EMA_20", "EMA_50", "SuperTrend", "VWAP", 
+                         "BB_Upper", "BB_Lower", "KC_Upper", "KC_Lower", "Support", "Resistance"],
+                        key=f"compare_ind_{idx}",
+                        index=["EMA_Fast", "EMA_Slow", "EMA_20", "EMA_50", "SuperTrend", "VWAP", 
+                               "BB_Upper", "BB_Lower", "KC_Upper", "KC_Lower", "Support", "Resistance"].index(cond.get('compare_indicator', 'EMA_20'))
+                    )
+                else:
+                    # Normal indicator comparison
+                    cond['indicator'] = st.sidebar.selectbox(
+                        f"Indicator",
+                        ["Price", "RSI", "ADX", "EMA_Fast", "EMA_Slow", "SuperTrend", "MACD", "MACD_Signal", 
+                         "BB_Upper", "BB_Lower", "ATR", "Volume", "VWAP", "KC_Upper", "KC_Lower",
+                         "Close", "High", "Low", "Support", "Resistance", "EMA_20", "EMA_50"],
+                        key=f"indicator_{idx}",
+                        index=["Price", "RSI", "ADX", "EMA_Fast", "EMA_Slow", "SuperTrend", "MACD", "MACD_Signal", 
+                               "BB_Upper", "BB_Lower", "ATR", "Volume", "VWAP", "KC_Upper", "KC_Lower",
+                               "Close", "High", "Low", "Support", "Resistance", "EMA_20", "EMA_50"].index(cond.get('indicator', 'RSI'))
+                    )
                 
                 cond['operator'] = st.sidebar.selectbox(
                     f"Operator",
@@ -1764,13 +1849,13 @@ def main():
                             'signal': 'LONG' if position['signal'] == 1 else 'SHORT',
                             'entry_price': position['entry_price'],
                             'exit_price': current_price,
-                            'sl': position['sl'],
-                            'target': position['target'],
+                            'sl': position.get('sl', 0),
+                            'target': position.get('target', 0),
                             'exit_reason': 'Manual Close',
                             'pnl': pnl,
-                            'highest_price': st.session_state.get('highest_price'),
-                            'lowest_price': st.session_state.get('lowest_price'),
-                            'range': abs(st.session_state.get('highest_price', 0) - st.session_state.get('lowest_price', 0))
+                            'highest_price': st.session_state.get('highest_price', 0) or 0,
+                            'lowest_price': st.session_state.get('lowest_price', 0) or 0,
+                            'range': abs((st.session_state.get('highest_price', 0) or 0) - (st.session_state.get('lowest_price', 0) or 0))
                         }
                         
                         st.session_state['trade_history'].append(trade)
@@ -1880,14 +1965,27 @@ def main():
             
             if st.button("▶️ Run Backtest", type="primary"):
                 with st.spinner("Running backtest..."):
+                    # Clear any cached data
+                    if 'backtest_data' in st.session_state:
+                        del st.session_state['backtest_data']
+                    
+                    # Fetch fresh data
                     df = fetch_data(ticker, interval, period, mode='backtest')
                     
                     if df is None or len(df) < 50:
                         st.error("Failed to fetch data or insufficient data for backtest")
                     else:
+                        # Store data in session state
+                        st.session_state['backtest_data'] = df
+                        
+                        # Add indicators
                         df = add_all_indicators(df, config)
                         
+                        # Run backtest
                         results = run_backtest(df, strategy, config)
+                        
+                        # Store results
+                        st.session_state['backtest_results'] = results
                         
                         st.success("Backtest completed!")
                         
@@ -1899,14 +1997,17 @@ def main():
                         with col3:
                             st.metric("Losing Trades", results['losing_trades'])
                         with col4:
-                            st.metric("Accuracy", f"{results['accuracy']:.1f}%")
+                            accuracy_val = results.get('accuracy', 0)
+                            st.metric("Accuracy", f"{accuracy_val:.1f}%")
                         with col5:
-                            if results['total_pnl'] >= 0:
-                                st.metric("Total P&L", f"{results['total_pnl']:.2f}", delta=f"+{results['total_pnl']:.2f}")
+                            total_pnl_val = results.get('total_pnl', 0)
+                            if total_pnl_val >= 0:
+                                st.metric("Total P&L", f"₹{total_pnl_val:.2f}", delta=f"+{total_pnl_val:.2f}")
                             else:
-                                st.metric("Total P&L", f"{results['total_pnl']:.2f}", delta=f"{results['total_pnl']:.2f}", delta_color="inverse")
+                                st.metric("Total P&L", f"₹{total_pnl_val:.2f}", delta=f"{total_pnl_val:.2f}", delta_color="inverse")
                         
-                        st.metric("Avg Trade Duration", f"{results['avg_duration']:.2f} hours")
+                        if results['total_trades'] > 0:
+                            st.metric("Avg Trade Duration", f"{results['avg_duration']:.2f} hours")
                         
                         st.markdown("---")
                         st.markdown("### 📊 All Trades")
@@ -1915,7 +2016,9 @@ def main():
                             st.info("No trades generated in backtest")
                         else:
                             for idx, trade in enumerate(results['trades']):
-                                with st.expander(f"Trade #{idx + 1} - {trade['signal']} - P&L: {trade['pnl']:.2f}"):
+                                pnl_val = trade.get('pnl', 0)
+                                pnl_color = "🟢" if pnl_val >= 0 else "🔴"
+                                with st.expander(f"Trade #{idx + 1} - {trade['signal']} - {pnl_color} P&L: ₹{pnl_val:.2f}"):
                                     col1, col2 = st.columns(2)
                                     
                                     with col1:
@@ -1925,27 +2028,29 @@ def main():
                                         dur_mins = int((trade['duration'] - dur_hours) * 60)
                                         st.write(f"**Duration:** {dur_hours}h {dur_mins}m")
                                         st.write(f"**Signal:** {trade['signal']}")
-                                        st.write(f"**Entry Price:** {trade['entry_price']:.2f}")
-                                        st.write(f"**Exit Price:** {trade['exit_price']:.2f}")
+                                        st.write(f"**Entry Price:** ₹{trade['entry_price']:.2f}")
+                                        st.write(f"**Exit Price:** ₹{trade['exit_price']:.2f}")
                                     
                                     with col2:
-                                        sl_str = f"{trade['sl']:.2f}" if trade.get('sl', 0) != 0 else "Signal Based"
-                                        target_str = f"{trade['target']:.2f}" if trade.get('target', 0) != 0 else "Signal Based"
+                                        sl_val = trade.get('sl', 0)
+                                        target_val = trade.get('target', 0)
+                                        sl_str = f"₹{sl_val:.2f}" if sl_val != 0 else "Signal Based"
+                                        target_str = f"₹{target_val:.2f}" if target_val != 0 else "Signal Based"
                                         st.write(f"**Stop Loss:** {sl_str}")
                                         st.write(f"**Target:** {target_str}")
                                         st.write(f"**Exit Reason:** {trade.get('exit_reason', 'Unknown')}")
                                         
-                                        if trade['pnl'] >= 0:
-                                            st.success(f"**P&L:** +{trade['pnl']:.2f}")
+                                        if pnl_val >= 0:
+                                            st.success(f"**P&L:** +₹{pnl_val:.2f}")
                                         else:
-                                            st.error(f"**P&L:** {trade['pnl']:.2f}")
+                                            st.error(f"**P&L:** ₹{pnl_val:.2f}")
                                         
-                                        highest = trade.get('highest_price', 0)
-                                        lowest = trade.get('lowest_price', 0)
-                                        range_val = trade.get('range', 0)
-                                        st.write(f"**Highest Price:** {highest:.2f}" if highest else "**Highest Price:** N/A")
-                                        st.write(f"**Lowest Price:** {lowest:.2f}" if lowest else "**Lowest Price:** N/A")
-                                        st.write(f"**Range:** {range_val:.2f}" if range_val else "**Range:** N/A")
+                                        highest = trade.get('highest_price', 0) or 0
+                                        lowest = trade.get('lowest_price', 0) or 0
+                                        range_val = trade.get('range', 0) or 0
+                                        st.write(f"**Highest Price:** ₹{highest:.2f}" if highest else "**Highest Price:** N/A")
+                                        st.write(f"**Lowest Price:** ₹{lowest:.2f}" if lowest else "**Lowest Price:** N/A")
+                                        st.write(f"**Range:** ₹{range_val:.2f}" if range_val else "**Range:** N/A")
         else:
             st.info("Switch to 'Backtest' mode in the sidebar to run backtests")
 
