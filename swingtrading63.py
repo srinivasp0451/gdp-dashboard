@@ -1396,83 +1396,83 @@ def live_trading_loop(config):
         
         time.sleep(random.uniform(1.0, 1.5))
     
-    st.info("⚪ STOPPED")
-                st.markdown("### 📋 Active Configuration")
-                
-                st.markdown("**Asset & Timeframe:**")
-                col_conf1, col_conf2, col_conf3, col_conf4 = st.columns(4)
-                with col_conf1:
-                    st.write(f"**Ticker:** {ticker}")
-                with col_conf2:
-                    st.write(f"**Interval:** {interval}")
-                with col_conf3:
-                    st.write(f"**Period:** {period}")
-                with col_conf4:
-                    st.write(f"**Quantity:** {quantity}")
-                
-                st.markdown("**Strategy Configuration:**")
-                col_conf5, col_conf6 = st.columns(2)
-                with col_conf5:
-                    st.write(f"**Strategy:** {strategy}")
-                    st.write(f"**Mode:** Live Trading")
-                with col_conf6:
-                    st.write(f"**SL Type:** {config.get('sl_type', 'N/A')[:30]}")
-                    st.write(f"**Target Type:** {config.get('target_type', 'N/A')[:30]}")
-                
-                if strategy == "EMA Crossover":
-                    st.markdown("**EMA Crossover Settings:**")
-                    col_ema1, col_ema2, col_ema3, col_ema4 = st.columns(4)
-                    with col_ema1:
-                        st.write(f"**EMA Fast:** {config.get('ema_fast', 9)}")
-                    with col_ema2:
-                        st.write(f"**EMA Slow:** {config.get('ema_slow', 15)}")
-                    with col_ema3:
-                        st.write(f"**Min Angle:** {config.get('min_angle', 1)}°")
-                    with col_ema4:
-                        st.write(f"**Entry Filter:** {config.get('entry_filter', 'Simple')}")
-                    
-                    if config.get('entry_filter') == 'Custom Candle (Points)':
-                        st.write(f"**Custom Points:** {config.get('custom_points', 10)}")
-                    elif config.get('entry_filter') == 'ATR-based Candle':
-                        st.write(f"**ATR Multiplier:** {config.get('atr_multiplier', 1.5)}")
-                    
-                    if config.get('use_adx', False):
-                        st.write(f"**ADX Filter:** Enabled (Threshold: {config.get('adx_threshold', 25)})")
-                
-                elif strategy == "Price Crosses Threshold":
-                    st.markdown("**Threshold Settings:**")
-                    st.write(f"**Threshold Value:** {config.get('threshold_value', 0)}")
-                    st.write(f"**Threshold Type:** {config.get('threshold_type', 'N/A')}")
-                
-                elif strategy == "Custom Strategy Builder":
-                    st.markdown("**Custom Conditions:**")
-                    active_conds = [c for c in config.get('custom_conditions', []) if c.get('active', False)]
-                    st.write(f"**Active Conditions:** {len(active_conds)}")
-                    for idx, cond in enumerate(active_conds):
-                        if cond.get('use_price'):
-                            st.write(f"{idx+1}. Price {cond.get('operator', '>')} {cond.get('compare_indicator', 'EMA_20')} → {cond.get('action', 'BUY')}")
-                        else:
-                            st.write(f"{idx+1}. {cond.get('indicator', 'RSI')} {cond.get('operator', '>')} {cond.get('value', 0)} → {cond.get('action', 'BUY')}")
-                
-                st.markdown("**Risk Management:**")
-                col_rm1, col_rm2, col_rm3, col_rm4 = st.columns(4)
-                with col_rm1:
-                    if 'Custom Points' in config.get('sl_type', '') or 'Trailing SL' in config.get('sl_type', ''):
-                        st.write(f"**SL Points:** {config.get('sl_points', 10)}")
-                    st.write(f"**Min SL Distance:** {config.get('min_sl_distance', 10)}")
-                with col_rm2:
-                    if 'Custom Points' in config.get('target_type', '') or 'Trailing Target' in config.get('target_type', ''):
-                        st.write(f"**Target Points:** {config.get('target_points', 20)}")
-                    st.write(f"**Min Target Distance:** {config.get('min_target_distance', 15)}")
-                with col_rm3:
-                    if 'Trailing' in config.get('sl_type', ''):
-                        st.write(f"**Trailing Threshold:** {config.get('trailing_threshold', 0)}")
-                with col_rm4:
-                    if 'Risk-Reward' in config.get('target_type', ''):
-                        st.write(f"**Risk-Reward Ratio:** {config.get('rr_ratio', 2.0)}")
-                
-                st.markdown("---")
-            config_display_done = True
+        st.info("⚪ STOPPED")
+        st.markdown("### 📋 Active Configuration")
+        
+        st.markdown("**Asset & Timeframe:**")
+        col_conf1, col_conf2, col_conf3, col_conf4 = st.columns(4)
+        with col_conf1:
+            st.write(f"**Ticker:** {ticker}")
+        with col_conf2:
+            st.write(f"**Interval:** {interval}")
+        with col_conf3:
+            st.write(f"**Period:** {period}")
+        with col_conf4:
+            st.write(f"**Quantity:** {quantity}")
+        
+        st.markdown("**Strategy Configuration:**")
+        col_conf5, col_conf6 = st.columns(2)
+        with col_conf5:
+            st.write(f"**Strategy:** {strategy}")
+            st.write(f"**Mode:** Live Trading")
+        with col_conf6:
+            st.write(f"**SL Type:** {config.get('sl_type', 'N/A')[:30]}")
+            st.write(f"**Target Type:** {config.get('target_type', 'N/A')[:30]}")
+        
+        if strategy == "EMA Crossover":
+            st.markdown("**EMA Crossover Settings:**")
+            col_ema1, col_ema2, col_ema3, col_ema4 = st.columns(4)
+            with col_ema1:
+                st.write(f"**EMA Fast:** {config.get('ema_fast', 9)}")
+            with col_ema2:
+                st.write(f"**EMA Slow:** {config.get('ema_slow', 15)}")
+            with col_ema3:
+                st.write(f"**Min Angle:** {config.get('min_angle', 1)}°")
+            with col_ema4:
+                st.write(f"**Entry Filter:** {config.get('entry_filter', 'Simple')}")
+            
+            if config.get('entry_filter') == 'Custom Candle (Points)':
+                st.write(f"**Custom Points:** {config.get('custom_points', 10)}")
+            elif config.get('entry_filter') == 'ATR-based Candle':
+                st.write(f"**ATR Multiplier:** {config.get('atr_multiplier', 1.5)}")
+            
+            if config.get('use_adx', False):
+                st.write(f"**ADX Filter:** Enabled (Threshold: {config.get('adx_threshold', 25)})")
+        
+        elif strategy == "Price Crosses Threshold":
+            st.markdown("**Threshold Settings:**")
+            st.write(f"**Threshold Value:** {config.get('threshold_value', 0)}")
+            st.write(f"**Threshold Type:** {config.get('threshold_type', 'N/A')}")
+        
+        elif strategy == "Custom Strategy Builder":
+            st.markdown("**Custom Conditions:**")
+            active_conds = [c for c in config.get('custom_conditions', []) if c.get('active', False)]
+            st.write(f"**Active Conditions:** {len(active_conds)}")
+            for idx, cond in enumerate(active_conds):
+                if cond.get('use_price'):
+                    st.write(f"{idx+1}. Price {cond.get('operator', '>')} {cond.get('compare_indicator', 'EMA_20')} → {cond.get('action', 'BUY')}")
+                else:
+                    st.write(f"{idx+1}. {cond.get('indicator', 'RSI')} {cond.get('operator', '>')} {cond.get('value', 0)} → {cond.get('action', 'BUY')}")
+        
+        st.markdown("**Risk Management:**")
+        col_rm1, col_rm2, col_rm3, col_rm4 = st.columns(4)
+        with col_rm1:
+            if 'Custom Points' in config.get('sl_type', '') or 'Trailing SL' in config.get('sl_type', ''):
+                st.write(f"**SL Points:** {config.get('sl_points', 10)}")
+            st.write(f"**Min SL Distance:** {config.get('min_sl_distance', 10)}")
+        with col_rm2:
+            if 'Custom Points' in config.get('target_type', '') or 'Trailing Target' in config.get('target_type', ''):
+                st.write(f"**Target Points:** {config.get('target_points', 20)}")
+            st.write(f"**Min Target Distance:** {config.get('min_target_distance', 15)}")
+        with col_rm3:
+            if 'Trailing' in config.get('sl_type', ''):
+                st.write(f"**Trailing Threshold:** {config.get('trailing_threshold', 0)}")
+        with col_rm4:
+            if 'Risk-Reward' in config.get('target_type', ''):
+                st.write(f"**Risk-Reward Ratio:** {config.get('rr_ratio', 2.0)}")
+        
+        st.markdown("---")
+        config_display_done = True
         
         # Check position and handle exits/updates
         if position is not None:
