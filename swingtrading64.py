@@ -918,7 +918,7 @@ def live_trading_loop(config):
             continue
         
         # Add indicators
-        df = add_all_indicators(df, config['ema_fast'], config['ema_slow'], config['adx_period'])
+        df = add_all_indicators(df, config.get('ema_fast', 9), config.get('ema_slow', 15), config.get('adx_period', 14))
         st.session_state['current_data'] = df
         
         i = len(df) - 1
@@ -1296,7 +1296,7 @@ def main():
                         st.error("Unable to fetch data. Please check your settings.")
                     else:
                         # Add indicators
-                        df = add_all_indicators(df, config['ema_fast'], config['ema_slow'], config['adx_period'])
+                        df = add_all_indicators(df, config.get('ema_fast', 9), config.get('ema_slow', 15), config.get('adx_period', 14))
                         
                         # Run backtest
                         results = run_backtest(df, config['strategy'], config)
@@ -1818,8 +1818,8 @@ def main():
                     st.text(log)
 
 if __name__ == "__main__":
-    main()
-    # Clear cache
-    st.session_state['current_data'] = None
+    main()..."):
+                    # Clear cache
+                    st.session_state['current_data'] = None
                     
-    # Fetch data
+                    # Fetch data
