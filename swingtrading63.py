@@ -1381,7 +1381,7 @@ def live_trading_loop(config):
                 
                 fig.update_layout(title=f"{ticker} - {interval}", xaxis_title="Time",
                                 yaxis_title="Price", height=500, xaxis_rangeslider_visible=False)
-                st.plotly_chart(fig, use_container_width=True, key=f"chart_{iteration}")
+                st.plotly_chart(fig, use_container_width=True, key=f"live_chart_{int(time.time())}")
         
         # Status
         with status_placeholder.container():
