@@ -497,6 +497,45 @@ def ai_price_action_analysis(df, i, config):
     analysis_text = f"⚪ NEUTRAL (Score: {score}, Confidence: {confidence:.1f}%)\n\n{analysis_text}"
     return 0, None, None, None, analysis_text
 
+def check_percentage_change(df, i, config):
+    """Check percentage change strategy"""
+    if i < 1:
+        return 0, None, None, None
+    
+    # Calculate percentage change from first candle to current
+    first_price = df['Close'].iloc[0]
+    current_price = df['Close'].iloc[i]
+    pct_change = ((current_price - first_price) / first_price) * 100
+    
+    threshold_pct = config['pct_threshold']
+    direction = config['pct_direction']
+    
+    signal = 0
+    
+    if direction == "BUY on Fall":
+        # Buy if price has fallen by threshold percentage or more
+        if pct_change <= -threshold_pct:
+            signal = 1
+    elif direction == "SELL on Fall":
+        # Sell if price has fallen by threshold percentage or more
+        if pct_change <= -threshold_pct:
+            signal = -1
+    elif direction == "BUY on Rise":
+        # Buy if price has risen by threshold percentage or more
+        if pct_change >= threshold_pct:
+            signal = 1
+    elif direction == "SELL on Rise":
+        # Sell if price has risen by threshold percentage or more
+        if pct_change >= threshold_pct:
+            signal = -1
+    
+    if signal != 0:
+        entry_price = df['Close'].iloc[i]
+        sl, target = calculate_sl_target(entry_price, signal, df, i, config)
+        return signal, entry_price, sl, target
+    
+    return 0, None, None, None
+
 def check_custom_strategy(df, i, conditions):
     """Check custom strategy conditions"""
     if i < 1:
@@ -872,6 +911,8 @@ def run_backtest(df, strategy, config):
                 signal, entry_price, sl, target = check_rsi_adx_ema(df, i, config)
             elif strategy == "AI Price Action Analysis":
                 signal, entry_price, sl, target, _ = ai_price_action_analysis(df, i, config)
+            elif strategy == "Percentage Change Strategy":
+                signal, entry_price, sl, target = check_percentage_change(df, i, config)
             elif strategy == "Custom Strategy Builder":
                 signal, entry_price, sl, target = check_custom_strategy(df, i, st.session_state['custom_conditions'])
                 if signal != 0 and (sl is None or target is None):
@@ -1038,6 +1079,8 @@ def live_trading_loop(config):
                 signal, entry_price, sl, target = check_rsi_adx_ema(df, i, config)
             elif config['strategy'] == "AI Price Action Analysis":
                 signal, entry_price, sl, target, _ = ai_price_action_analysis(df, i, config)
+            elif config['strategy'] == "Percentage Change Strategy":
+                signal, entry_price, sl, target = check_percentage_change(df, i, config)
             elif config['strategy'] == "Custom Strategy Builder":
                 signal, entry_price, sl, target = check_custom_strategy(df, i, st.session_state['custom_conditions'])
                 if signal != 0 and (sl is None or target is None):
@@ -1107,6 +1150,7 @@ def main():
             "Simple Sell Strategy",
             "Price Crosses Threshold",
             "RSI-ADX-EMA Strategy",
+            "Percentage Change Strategy",
             "AI Price Action Analysis",
             "Custom Strategy Builder"
         ], key="strategy_select")
@@ -1165,6 +1209,17 @@ def main():
                 "LONG (Price <= Threshold)",
                 "SHORT (Price <= Threshold)"
             ], key="threshold_dir_select")
+        
+        # Percentage Change Parameters
+        if strategy == "Percentage Change Strategy":
+            st.subheader("Percentage Change Parameters")
+            config['pct_threshold'] = st.number_input("Percentage Threshold (%)", min_value=0.01, value=0.5, step=0.01, key="pct_threshold_input")
+            config['pct_direction'] = st.selectbox("Direction", [
+                "BUY on Fall",
+                "SELL on Fall",
+                "BUY on Rise",
+                "SELL on Rise"
+            ], key="pct_dir_select")
         
         # Stop Loss Configuration
         st.subheader("Stop Loss Configuration")
@@ -1516,11 +1571,153 @@ def main():
             
             st.markdown("---")
             
-            # Start trading loop
+            # Start trading loop FIRST - fetch data before displaying
             if st.session_state['trading_active']:
-                live_trading_loop(config)
+                # Fetch data immediately for display
+                ticker = ASSET_TICKERS.get(config['asset'], config['custom_ticker'])
+                df = fetch_data(ticker, config['interval'], config['period'], mode="Live Trading")
+                
+                if df is not None and len(df) >= 50:
+                    df = add_all_indicators(df, config.get('ema_fast', 9), config.get('ema_slow', 15), config.get('adx_period', 14))
+                    st.session_state['current_data'] = df
+                    st.session_state['last_refresh'] = datetime.now(pytz.timezone('Asia/Kolkata'))
+                    
+                    # Process trading logic
+                    i = len(df) - 1
+                    current_price = df['Close'].iloc[i]
+                    
+                    # Check if in position
+                    if st.session_state['position']:
+                        position = st.session_state['position']
+                        
+                        # Update highest/lowest
+                        if st.session_state['highest_price'] is None or current_price > st.session_state['highest_price']:
+                            st.session_state['highest_price'] = current_price
+                        if st.session_state['lowest_price'] is None or current_price < st.session_state['lowest_price']:
+                            st.session_state['lowest_price'] = current_price
+                        
+                        # Update trailing SL
+                        if "Trailing" in config['sl_type']:
+                            new_sl = update_trailing_sl(position, current_price, config)
+                            if new_sl != position['sl']:
+                                position['sl'] = new_sl
+                                st.session_state['position'] = position
+                                add_log(f"Trailing SL updated to {new_sl:.2f}")
+                        
+                        # Check break-even
+                        if config['sl_type'] == "Break-even After 50% Target" and not st.session_state['breakeven_activated']:
+                            if position['signal'] == 1:
+                                profit_dist = current_price - position['entry_price']
+                                target_dist = position['target'] - position['entry_price']
+                                if profit_dist >= target_dist * 0.5:
+                                    position['sl'] = position['entry_price']
+                                    st.session_state['position'] = position
+                                    st.session_state['breakeven_activated'] = True
+                                    add_log("Break-even activated - SL moved to entry")
+                            elif position['signal'] == -1:
+                                profit_dist = position['entry_price'] - current_price
+                                target_dist = position['entry_price'] - position['target']
+                                if profit_dist >= target_dist * 0.5:
+                                    position['sl'] = position['entry_price']
+                                    st.session_state['position'] = position
+                                    st.session_state['breakeven_activated'] = True
+                                    add_log("Break-even activated - SL moved to entry")
+                        
+                        # Check partial exit
+                        if config['target_type'] == "50% Exit at Target (Partial)" and not st.session_state['partial_exit_done']:
+                            if position['signal'] == 1 and current_price >= position['target']:
+                                st.session_state['partial_exit_done'] = True
+                                add_log("50% position exited at target - trailing remaining")
+                            elif position['signal'] == -1 and current_price <= position['target']:
+                                st.session_state['partial_exit_done'] = True
+                                add_log("50% position exited at target - trailing remaining")
+                        
+                        # Check exit
+                        should_exit, exit_reason, exit_price = check_exit_conditions(position, current_price, df, i, config)
+                        
+                        if should_exit:
+                            # Calculate PnL
+                            quantity = config['quantity']
+                            if position['signal'] == 1:
+                                pnl = (exit_price - position['entry_price']) * quantity
+                            else:
+                                pnl = (position['entry_price'] - exit_price) * quantity
+                            
+                            # Adjust for partial exit
+                            if st.session_state['partial_exit_done']:
+                                pnl = pnl * 0.5
+                            
+                            # Record trade
+                            duration = (datetime.now(pytz.timezone('Asia/Kolkata')) - position['entry_time']).total_seconds() / 3600
+                            trade_record = {
+                                'entry_time': position['entry_time'],
+                                'exit_time': datetime.now(pytz.timezone('Asia/Kolkata')),
+                                'duration': duration,
+                                'signal': 'LONG' if position['signal'] == 1 else 'SHORT',
+                                'entry_price': position['entry_price'],
+                                'exit_price': exit_price,
+                                'sl': position['sl'],
+                                'target': position['target'],
+                                'exit_reason': exit_reason,
+                                'pnl': pnl,
+                                'highest': st.session_state['highest_price'],
+                                'lowest': st.session_state['lowest_price'],
+                                'range': st.session_state['highest_price'] - st.session_state['lowest_price'],
+                            }
+                            
+                            st.session_state['trade_history'].append(trade_record)
+                            st.session_state['trade_history'] = st.session_state['trade_history']
+                            
+                            add_log(f"Position closed: {exit_reason} | PnL: {pnl:.2f}")
+                            reset_position_state()
+                    
+                    # Check for entry signal
+                    if not st.session_state['position']:
+                        signal = 0
+                        entry_price = None
+                        sl = None
+                        target = None
+                        
+                        if config['strategy'] == "EMA Crossover Strategy":
+                            signal, entry_price, sl, target = check_ema_crossover(df, i, config)
+                        elif config['strategy'] == "Simple Buy Strategy":
+                            signal, entry_price, sl, target = check_simple_buy(df, i, config)
+                        elif config['strategy'] == "Simple Sell Strategy":
+                            signal, entry_price, sl, target = check_simple_sell(df, i, config)
+                        elif config['strategy'] == "Price Crosses Threshold":
+                            signal, entry_price, sl, target = check_price_threshold(df, i, config)
+                        elif config['strategy'] == "RSI-ADX-EMA Strategy":
+                            signal, entry_price, sl, target = check_rsi_adx_ema(df, i, config)
+                        elif config['strategy'] == "Percentage Change Strategy":
+                            signal, entry_price, sl, target = check_percentage_change(df, i, config)
+                        elif config['strategy'] == "AI Price Action Analysis":
+                            signal, entry_price, sl, target, _ = ai_price_action_analysis(df, i, config)
+                        elif config['strategy'] == "Custom Strategy Builder":
+                            signal, entry_price, sl, target = check_custom_strategy(df, i, st.session_state['custom_conditions'])
+                            if signal != 0 and (sl is None or target is None):
+                                sl, target = calculate_sl_target(entry_price, signal, df, i, config)
+                        
+                        if signal != 0:
+                            position = {
+                                'signal': signal,
+                                'entry_price': entry_price,
+                                'entry_time': datetime.now(pytz.timezone('Asia/Kolkata')),
+                                'sl': sl,
+                                'target': target,
+                            }
+                            
+                            st.session_state['position'] = position
+                            st.session_state['highest_price'] = entry_price
+                            st.session_state['lowest_price'] = entry_price
+                            
+                            signal_text = "LONG" if signal == 1 else "SHORT"
+                            add_log(f"{signal_text} entry at {entry_price:.2f} | SL: {sl:.2f} | Target: {target:.2f}")
+                    
+                    # Schedule next refresh
+                    time.sleep(random.uniform(1.0, 1.5))
+                    st.rerun()
             
-            # Live Metrics Display
+            # Live Metrics Display (ALWAYS show if data exists)
             if st.session_state['current_data'] is not None and len(st.session_state['current_data']) > 0:
                 df = st.session_state['current_data']
                 current_price = df['Close'].iloc[-1]
@@ -1637,6 +1834,13 @@ def main():
                         signal, entry_price, sl, target = check_price_threshold(df, i, config)
                     elif config['strategy'] == "RSI-ADX-EMA Strategy":
                         signal, entry_price, sl, target = check_rsi_adx_ema(df, i, config)
+                    elif config['strategy'] == "Percentage Change Strategy":
+                        signal, entry_price, sl, target = check_percentage_change(df, i, config)
+                        # Show current percentage change
+                        first_price = df['Close'].iloc[0]
+                        pct_change = ((current_price - first_price) / first_price) * 100
+                        pct_color = "green" if pct_change >= 0 else "red"
+                        st.markdown(f"**Current % Change from start:** <span style='color:{pct_color}'>{pct_change:+.2f}%</span>", unsafe_allow_html=True)
                     elif config['strategy'] == "AI Price Action Analysis":
                         signal, entry_price, sl, target, analysis = ai_price_action_analysis(df, i, config)
                         if analysis:
@@ -1818,8 +2022,8 @@ def main():
                     st.text(log)
 
 if __name__ == "__main__":
-    main()
+    main()..."):
     # Clear cache
     st.session_state['current_data'] = None
                     
-    # Fetch data
+    ## Fetch data
