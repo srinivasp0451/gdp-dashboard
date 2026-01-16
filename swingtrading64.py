@@ -2022,7 +2022,7 @@ def main():
                     st.text(log)
 
 if __name__ == "__main__":
-    main()..."):
+    main()
     # Clear cache
     st.session_state['current_data'] = None
                     
