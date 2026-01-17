@@ -27,9 +27,9 @@ def reset_position_state():
                 'highest': st.session_state['highest_price'], 'lowest': st.session_state['lowest_price'],
                 'range': st.session_state['highest_price'] - st.session_state['lowest_price']
             }
-            st.session_state['trade_history'].append(trade)
-            log_message(f"CLOSED: {exit_reason} | PnL: {pnl:.2f}")
-            reset_position_state()
+    st.session_state['trade_history'].append(trade)
+    log_message(f"CLOSED: {exit_reason} | PnL: {pnl:.2f}")
+    reset_position_state()
     
     if not st.session_state['position'] and df['Signal'].iloc[-1] != 0:
         sig = df['Signal'].iloc[-1]
