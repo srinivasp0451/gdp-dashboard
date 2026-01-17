@@ -1,4 +1,4 @@
-import streamlit as st
+ import streamlit as st
 import yfinance as yf
 import pandas as pd
 import numpy as np
@@ -450,7 +450,7 @@ def run_backtest(df, strategy, config, qty):
     return res
 
 def process_live_trading(df, strategy, config, qty):
-    if not df or len(df) == 0:
+    if df is None or len(df) == 0:
         return
     
     cp = df['Close'].iloc[-1]
@@ -906,8 +906,10 @@ def main():
                         st.write(f"**Entry Price:** {t['entry_price']:.2f}")
                     with c2:
                         st.write(f"**Exit Price:** {t['exit_price']:.2f}")
-                        st.write(f"**SL:** {t['sl']:.2f if t['sl'] != 0 else 'Signal'}")
-                        st.write(f"**Target:** {t['target']:.2f if t['target'] != 0 else 'Signal'}")
+                        sl_display = f"{t['sl']:.2f}" if t['sl'] != 0 else "Signal"
+                        st.write(f"**SL:** {sl_display}")
+                        tgt_display = f"{t['target']:.2f}" if t['target'] != 0 else "Signal"
+                        st.write(f"**Target:** {tgt_display}")
                         st.write(f"**Reason:** {t['exit_reason']}")
                     if t['pnl'] >= 0:
                         st.success(f"**P&L:** +{t['pnl']:.2f}")
@@ -990,11 +992,13 @@ def main():
                                 st.write(f"**Exit:** {t['exit_time'].strftime('%Y-%m-%d %H:%M')}")
                                 st.write(f"**Duration:** {t['duration']:.2f}h")
                                 st.write(f"**Entry Price:** {t['entry_price']:.2f}")
-                            with c2:
-                                st.write(f"**Exit Price:** {t['exit_price']:.2f}")
-                                st.write(f"**SL:** {t['sl']:.2f if t['sl'] != 0 else 'Signal'}")
-                                st.write(f"**Target:** {t['target']:.2f if t['target'] != 0 else 'Signal'}")
-                                st.write(f"**Reason:** {t['exit_reason']}")
+                    with c2:
+                        st.write(f"**Exit Price:** {t['exit_price']:.2f}")
+                        sl_str = f"{t['sl']:.2f}" if t['sl'] != 0 else "Signal"
+                        st.write(f"**SL:** {sl_str}")
+                        tgt_str = f"{t['target']:.2f}" if t['target'] != 0 else "Signal"
+                        st.write(f"**Target:** {tgt_str}")
+                        st.write(f"**Reason:** {t['exit_reason']}")
                             if t['pnl'] >= 0:
                                 st.success(f"**P&L:** +{t['pnl']:.2f}")
                             else:
