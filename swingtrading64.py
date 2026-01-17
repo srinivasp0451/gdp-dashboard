@@ -1105,4 +1105,4 @@ def process_live_trading(df, strategy, config, qty):
                 'signal': 'LONG' if pos['signal'] == 1 else 'SHORT',
                 'entry_price': pos['entry_price'], 'exit_price': exit_price,
                 'sl': pos['sl'], 'target': pos['target'], 'exit_reason': exit_reason, 'pnl': pnl,
-                'highest': st.session_state['highest_price'], 'lowest': st.session
+                'highest': st.session_state['highest_price'], 'lowest': st.session}
