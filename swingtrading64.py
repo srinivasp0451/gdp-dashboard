@@ -1031,7 +1031,7 @@ def run_backtest(df, strategy, config):
 
 # ==================== LIVE TRADING ENGINE ====================
 
-def live_trading_loop(asset, ticker, interval, period, strategy, config, mode):
+def live_trading_loop(asset, ticker, interval, period, strategy, config, mode, placeholder):
     """Main live trading loop"""
     st.session_state['trading_active'] = True
     
@@ -1214,8 +1214,153 @@ def live_trading_loop(asset, ticker, interval, period, strategy, config, mode):
                 
                 reset_position_state()
         
+        # Update UI placeholder with current data
+        with placeholder.container():
+            display_live_dashboard(df, position, config, asset, interval, quantity)
+        
         # Wait before next iteration
         time.sleep(random.uniform(1.0, 1.5))
+
+def display_live_dashboard(df, position, config, asset, interval, quantity):
+    """Display live dashboard content"""
+    if df is None or df.empty:
+        st.info("⏳ Waiting for data...")
+        return
+    
+    current_price = df['Close'].iloc[-1]
+    current_signal = df['Signal'].iloc[-1] if 'Signal' in df.columns else 0
+    
+    st.subheader("📊 Live Metrics")
+    
+    metric_col1, metric_col2, metric_col3, metric_col4 = st.columns(4)
+    
+    with metric_col1:
+        st.metric("Current Price", f"{current_price:.2f}")
+        if position:
+            st.metric("Entry Price", f"{position['entry_price']:.2f}")
+    
+    with metric_col2:
+        if position:
+            status_text = "LONG" if position['type'] == 1 else "SHORT"
+            st.metric("Position", status_text)
+            
+            # Calculate unrealized P&L
+            if position['type'] == 1:
+                unrealized_pnl = (current_price - position['entry_price']) * quantity
+            else:
+                unrealized_pnl = (position['entry_price'] - current_price) * quantity
+            
+            if unrealized_pnl >= 0:
+                st.metric("Unrealized P&L", f"{unrealized_pnl:.2f}", delta=f"+{unrealized_pnl:.2f}")
+            else:
+                st.metric("Unrealized P&L", f"{unrealized_pnl:.2f}", delta=f"{unrealized_pnl:.2f}", delta_color="inverse")
+        else:
+            st.metric("Position", "None")
+    
+    with metric_col3:
+        if 'EMA_Fast' in df.columns:
+            st.metric("EMA Fast", f"{df['EMA_Fast'].iloc[-1]:.2f}")
+        if 'EMA_Slow' in df.columns:
+            st.metric("EMA Slow", f"{df['EMA_Slow'].iloc[-1]:.2f}")
+    
+    with metric_col4:
+        if 'RSI' in df.columns:
+            st.metric("RSI", f"{df['RSI'].iloc[-1]:.2f}")
+        
+        signal_text = "NONE"
+        if current_signal == 1:
+            signal_text = "🟢 BUY"
+        elif current_signal == -1:
+            signal_text = "🔴 SELL"
+        st.metric("Current Signal", signal_text)
+    
+    # Position Details
+    if position:
+        st.divider()
+        st.subheader("📌 Position Information")
+        
+        pos_col1, pos_col2, pos_col3, pos_col4 = st.columns(4)
+        
+        with pos_col1:
+            entry_time = position['entry_time']
+            now_time = df.index[-1]
+            duration = (now_time - entry_time).total_seconds() / 3600
+            st.metric("Entry Time", entry_time.strftime("%H:%M:%S"))
+            st.metric("Duration (hours)", f"{duration:.2f}")
+        
+        with pos_col2:
+            sl_val = position.get('sl', 0)
+            if sl_val:
+                st.metric("Stop Loss", f"{sl_val:.2f}")
+                if position['type'] == 1:
+                    dist_to_sl = current_price - sl_val
+                else:
+                    dist_to_sl = sl_val - current_price
+                st.metric("Distance to SL", f"{dist_to_sl:.2f}")
+        
+        with pos_col3:
+            target_val = position.get('target', 0)
+            if target_val:
+                st.metric("Target", f"{target_val:.2f}")
+                if position['type'] == 1:
+                    dist_to_target = target_val - current_price
+                else:
+                    dist_to_target = current_price - target_val
+                st.metric("Distance to Target", f"{dist_to_target:.2f}")
+        
+        with pos_col4:
+            st.metric("Highest", f"{position.get('highest_price', current_price):.2f}")
+            st.metric("Lowest", f"{position.get('lowest_price', current_price):.2f}")
+            range_val = position.get('highest_price', current_price) - position.get('lowest_price', current_price)
+            st.metric("Range", f"{range_val:.2f}")
+        
+        if position.get('breakeven_activated', False):
+            st.success("✅ Stop Loss moved to break-even")
+        
+        if position.get('partial_exit_done', False):
+            st.info("ℹ️ 50% position already exited - Trailing remaining")
+    
+    # Live Chart
+    st.divider()
+    st.subheader("📈 Live Chart")
+    
+    fig = go.Figure(data=[go.Candlestick(
+        x=df.index,
+        open=df['Open'],
+        high=df['High'],
+        low=df['Low'],
+        close=df['Close'],
+        name='Price'
+    )])
+    
+    if 'EMA_Fast' in df.columns:
+        fig.add_trace(go.Scatter(x=df.index, y=df['EMA_Fast'], mode='lines', name='EMA Fast', line=dict(color='blue')))
+    
+    if 'EMA_Slow' in df.columns:
+        fig.add_trace(go.Scatter(x=df.index, y=df['EMA_Slow'], mode='lines', name='EMA Slow', line=dict(color='orange')))
+    
+    if position:
+        # Entry line
+        fig.add_hline(y=position['entry_price'], line_dash="dash", line_color="yellow", annotation_text="Entry")
+        
+        # SL line
+        if position.get('sl'):
+            fig.add_hline(y=position['sl'], line_dash="dash", line_color="red", annotation_text="SL")
+        
+        # Target line
+        if position.get('target'):
+            fig.add_hline(y=position['target'], line_dash="dash", line_color="green", annotation_text="Target")
+    
+    fig.update_layout(
+        title=f"{asset} - {interval}",
+        xaxis_title="Time",
+        yaxis_title="Price",
+        height=600,
+        xaxis_rangeslider_visible=False
+    )
+    
+    chart_key = f"live_chart_{int(time.time() * 1000)}"
+    st.plotly_chart(fig, use_container_width=True, key=chart_key)
 
 # ==================== STREAMLIT UI ====================
 
@@ -1406,13 +1551,42 @@ def main():
             col1, col2, col3 = st.columns([2, 2, 3])
             
             with col1:
-                if st.button("▶️ Start Trading", type="primary", use_container_width=True):
-                    if not st.session_state.get('trading_active', False):
-                        add_log("Trading started")
-                        live_trading_loop(asset, ticker, interval, period, strategy, config, mode)
+                start_disabled = st.session_state.get('trading_active', False)
+                if st.button("▶️ Start Trading", type="primary", use_container_width=True, disabled=start_disabled):
+                    # Create placeholder for live updates
+                    st.session_state['live_placeholder'] = st.empty()
+                    
+                    # Display active configuration
+                    st.subheader("📋 Active Configuration")
+                    conf_col1, conf_col2, conf_col3 = st.columns(3)
+                    
+                    with conf_col1:
+                        st.metric("Asset", asset)
+                        st.metric("Interval", interval)
+                        st.metric("Period", period)
+                    
+                    with conf_col2:
+                        st.metric("Quantity", quantity)
+                        st.metric("Strategy", strategy)
+                        st.metric("SL Type", sl_type)
+                    
+                    with conf_col3:
+                        sl_val_str = "Signal Based" if sl_type == "Signal-based (reverse EMA crossover)" else f"{config.get('sl_points', 0):.2f}"
+                        st.metric("SL Points", sl_val_str)
+                        st.metric("Target Type", target_type)
+                        target_val_str = "Signal Based" if target_type == "Signal-based (reverse EMA crossover)" else f"{config.get('target_points', 0):.2f}"
+                        st.metric("Target Points", target_val_str)
+                    
+                    st.divider()
+                    
+                    # Start trading with placeholder
+                    placeholder = st.empty()
+                    add_log("Trading started")
+                    live_trading_loop(asset, ticker, interval, period, strategy, config, mode, placeholder)
             
             with col2:
-                if st.button("⏹️ Stop Trading", use_container_width=True):
+                stop_disabled = not st.session_state.get('trading_active', False)
+                if st.button("⏹️ Stop Trading", use_container_width=True, disabled=stop_disabled):
                     if st.session_state.get('trading_active', False):
                         st.session_state['trading_active'] = False
                         
@@ -1465,171 +1639,31 @@ def main():
             
             st.divider()
             
-            # Active Configuration Display
-            st.subheader("📋 Active Configuration")
-            conf_col1, conf_col2, conf_col3 = st.columns(3)
-            
-            with conf_col1:
-                st.metric("Asset", asset)
-                st.metric("Interval", interval)
-                st.metric("Period", period)
-            
-            with conf_col2:
-                st.metric("Quantity", quantity)
-                st.metric("Strategy", strategy)
-                st.metric("SL Type", sl_type)
-            
-            with conf_col3:
-                sl_val_str = "Signal Based" if sl_type == "Signal-based (reverse EMA crossover)" else f"{config.get('sl_points', 0):.2f}"
-                st.metric("SL Points", sl_val_str)
-                st.metric("Target Type", target_type)
-                target_val_str = "Signal Based" if target_type == "Signal-based (reverse EMA crossover)" else f"{config.get('target_points', 0):.2f}"
-                st.metric("Target Points", target_val_str)
-            
-            st.divider()
-            
-            # Live Metrics
-            df = st.session_state.get('current_data')
-            position = st.session_state.get('position')
-            
-            if df is not None and not df.empty:
-                current_price = df['Close'].iloc[-1]
-                current_signal = df['Signal'].iloc[-1]
+            # Show live data if available
+            if not st.session_state.get('trading_active', False):
+                # Active Configuration Display
+                st.subheader("📋 Active Configuration")
+                conf_col1, conf_col2, conf_col3 = st.columns(3)
                 
-                st.subheader("📊 Live Metrics")
+                with conf_col1:
+                    st.metric("Asset", asset)
+                    st.metric("Interval", interval)
+                    st.metric("Period", period)
                 
-                metric_col1, metric_col2, metric_col3, metric_col4 = st.columns(4)
+                with conf_col2:
+                    st.metric("Quantity", quantity)
+                    st.metric("Strategy", strategy)
+                    st.metric("SL Type", sl_type)
                 
-                with metric_col1:
-                    st.metric("Current Price", f"{current_price:.2f}")
-                    if position:
-                        st.metric("Entry Price", f"{position['entry_price']:.2f}")
+                with conf_col3:
+                    sl_val_str = "Signal Based" if sl_type == "Signal-based (reverse EMA crossover)" else f"{config.get('sl_points', 0):.2f}"
+                    st.metric("SL Points", sl_val_str)
+                    st.metric("Target Type", target_type)
+                    target_val_str = "Signal Based" if target_type == "Signal-based (reverse EMA crossover)" else f"{config.get('target_points', 0):.2f}"
+                    st.metric("Target Points", target_val_str)
                 
-                with metric_col2:
-                    if position:
-                        status_text = "LONG" if position['type'] == 1 else "SHORT"
-                        st.metric("Position", status_text)
-                        
-                        # Calculate unrealized P&L
-                        if position['type'] == 1:
-                            unrealized_pnl = (current_price - position['entry_price']) * quantity
-                        else:
-                            unrealized_pnl = (position['entry_price'] - current_price) * quantity
-                        
-                        if unrealized_pnl >= 0:
-                            st.metric("Unrealized P&L", f"{unrealized_pnl:.2f}", delta=f"+{unrealized_pnl:.2f}")
-                        else:
-                            st.metric("Unrealized P&L", f"{unrealized_pnl:.2f}", delta=f"{unrealized_pnl:.2f}", delta_color="inverse")
-                    else:
-                        st.metric("Position", "None")
-                
-                with metric_col3:
-                    if 'EMA_Fast' in df.columns:
-                        st.metric("EMA Fast", f"{df['EMA_Fast'].iloc[-1]:.2f}")
-                    if 'EMA_Slow' in df.columns:
-                        st.metric("EMA Slow", f"{df['EMA_Slow'].iloc[-1]:.2f}")
-                
-                with metric_col4:
-                    if 'RSI' in df.columns:
-                        st.metric("RSI", f"{df['RSI'].iloc[-1]:.2f}")
-                    
-                    signal_text = "NONE"
-                    if current_signal == 1:
-                        signal_text = "🟢 BUY"
-                    elif current_signal == -1:
-                        signal_text = "🔴 SELL"
-                    st.metric("Current Signal", signal_text)
-                
-                # Position Details
-                if position:
-                    st.divider()
-                    st.subheader("📌 Position Information")
-                    
-                    pos_col1, pos_col2, pos_col3, pos_col4 = st.columns(4)
-                    
-                    with pos_col1:
-                        entry_time = position['entry_time']
-                        now_time = df.index[-1]
-                        duration = (now_time - entry_time).total_seconds() / 3600
-                        st.metric("Entry Time", entry_time.strftime("%H:%M:%S"))
-                        st.metric("Duration (hours)", f"{duration:.2f}")
-                    
-                    with pos_col2:
-                        sl_val = position.get('sl', 0)
-                        if sl_val:
-                            st.metric("Stop Loss", f"{sl_val:.2f}")
-                            if position['type'] == 1:
-                                dist_to_sl = current_price - sl_val
-                            else:
-                                dist_to_sl = sl_val - current_price
-                            st.metric("Distance to SL", f"{dist_to_sl:.2f}")
-                    
-                    with pos_col3:
-                        target_val = position.get('target', 0)
-                        if target_val:
-                            st.metric("Target", f"{target_val:.2f}")
-                            if position['type'] == 1:
-                                dist_to_target = target_val - current_price
-                            else:
-                                dist_to_target = current_price - target_val
-                            st.metric("Distance to Target", f"{dist_to_target:.2f}")
-                    
-                    with pos_col4:
-                        st.metric("Highest", f"{position.get('highest_price', current_price):.2f}")
-                        st.metric("Lowest", f"{position.get('lowest_price', current_price):.2f}")
-                        range_val = position.get('highest_price', current_price) - position.get('lowest_price', current_price)
-                        st.metric("Range", f"{range_val:.2f}")
-                    
-                    if position.get('breakeven_activated', False):
-                        st.success("✅ Stop Loss moved to break-even")
-                    
-                    if position.get('partial_exit_done', False):
-                        st.info("ℹ️ 50% position already exited - Trailing remaining")
-                
-                # Live Chart
                 st.divider()
-                st.subheader("📈 Live Chart")
-                
-                fig = go.Figure(data=[go.Candlestick(
-                    x=df.index,
-                    open=df['Open'],
-                    high=df['High'],
-                    low=df['Low'],
-                    close=df['Close'],
-                    name='Price'
-                )])
-                
-                if 'EMA_Fast' in df.columns:
-                    fig.add_trace(go.Scatter(x=df.index, y=df['EMA_Fast'], mode='lines', name='EMA Fast', line=dict(color='blue')))
-                
-                if 'EMA_Slow' in df.columns:
-                    fig.add_trace(go.Scatter(x=df.index, y=df['EMA_Slow'], mode='lines', name='EMA Slow', line=dict(color='orange')))
-                
-                if position:
-                    # Entry line
-                    fig.add_hline(y=position['entry_price'], line_dash="dash", line_color="yellow", annotation_text="Entry")
-                    
-                    # SL line
-                    if position.get('sl'):
-                        fig.add_hline(y=position['sl'], line_dash="dash", line_color="red", annotation_text="SL")
-                    
-                    # Target line
-                    if position.get('target'):
-                        fig.add_hline(y=position['target'], line_dash="dash", line_color="green", annotation_text="Target")
-                
-                fig.update_layout(
-                    title=f"{asset} - {interval}",
-                    xaxis_title="Time",
-                    yaxis_title="Price",
-                    height=600,
-                    xaxis_rangeslider_visible=False
-                )
-                
-                chart_key = f"live_chart_{int(time.time())}"
-                st.plotly_chart(fig, use_container_width=True, key=chart_key)
-                
-            else:
-                st.info("⏳ Waiting for data... Click 'Start Trading' to begin.")
+                st.info("Click 'Start Trading' to begin live monitoring")
         
         with tab2:
             st.markdown("### 📈 Trade History")
@@ -1682,9 +1716,17 @@ def main():
                             st.write(f"**Entry Price:** {trade.get('entry_price', 0):.2f}")
                         
                         with trade_col2:
-                            st.write(f"**Exit Price:** {trade.get('exit_price', 0):.2f}")
-                            st.write(f"**Stop Loss:** {trade.get('sl', 0):.2f}")
-                            st.write(f"**Target:** {trade.get('target', 0):.2f}")
+                            exit_price_val = trade.get('exit_price', 0)
+                            sl_val = trade.get('sl')
+                            target_val = trade.get('target')
+                            
+                            exit_price_str = f"{exit_price_val:.2f}" if exit_price_val else "N/A"
+                            sl_str = f"{sl_val:.2f}" if sl_val is not None else "Signal Based"
+                            target_str = f"{target_val:.2f}" if target_val is not None else "Signal Based"
+                            
+                            st.write(f"**Exit Price:** {exit_price_str}")
+                            st.write(f"**Stop Loss:** {sl_str}")
+                            st.write(f"**Target:** {target_str}")
                             st.write(f"**Exit Reason:** {trade.get('exit_reason', 'N/A')}")
                             
                             pnl = trade.get('pnl', 0)
@@ -1705,7 +1747,7 @@ def main():
                     st.text(log)
     
     else:  # Backtest mode
-        tab1, tab2 = st.tabs(["📊 Configuration", "📈 Backtest Results"])
+        tab1, tab2, tab3 = st.tabs(["📊 Configuration", "📈 Backtest Results", "📊 Market Data Analysis"])
         
         with tab1:
             st.subheader("Backtest Configuration")
@@ -1827,6 +1869,223 @@ def main():
                                         st.markdown(f"**P&L:** <span style='color:{pnl_color}'>{pnl:.2f}</span>", unsafe_allow_html=True)
                                     
                                     st.write(f"**Highest:** {trade['highest']:.2f} | **Lowest:** {trade['lowest']:.2f} | **Range:** {trade['range']:.2f}")
+        
+        with tab3:
+            st.markdown("### 📊 Market Data Analysis")
+            
+            if st.button("📥 Load Market Data", type="primary"):
+                with st.spinner("Loading market data..."):
+                    # Fetch fresh data
+                    raw_df = fetch_data(ticker, interval, period, mode)
+                    
+                    if raw_df is None or raw_df.empty:
+                        st.error("Unable to fetch market data")
+                    else:
+                        # Prepare data with additional columns
+                        analysis_df = raw_df[['Open', 'High', 'Low', 'Close']].copy()
+                        
+                        # Calculate changes
+                        analysis_df['Change_Points'] = analysis_df['Close'].diff()
+                        analysis_df['Change_Pct'] = analysis_df['Close'].pct_change() * 100
+                        
+                        # Add day of week
+                        analysis_df['Day_of_Week'] = analysis_df.index.day_name()
+                        
+                        # Store in session state
+                        st.session_state['market_data'] = analysis_df
+                        st.success("Market data loaded successfully!")
+                        st.rerun()
+            
+            if 'market_data' in st.session_state and st.session_state['market_data'] is not None:
+                analysis_df = st.session_state['market_data']
+                
+                st.divider()
+                
+                # Display data table
+                st.subheader("📋 Market Data Table")
+                
+                # Create display dataframe with colored changes
+                display_df = analysis_df.copy()
+                display_df = display_df.reset_index()
+                display_df.columns = ['Datetime', 'Open', 'High', 'Low', 'Close', 'Change (Points)', 'Change (%)', 'Day of Week']
+                
+                # Format numeric columns
+                for col in ['Open', 'High', 'Low', 'Close', 'Change (Points)', 'Change (%)']:
+                    if col in display_df.columns:
+                        display_df[col] = display_df[col].round(2)
+                
+                st.dataframe(display_df, use_container_width=True, height=400)
+                
+                st.divider()
+                
+                # Plot 1: Change in Points over Time
+                st.subheader("📈 Change in Points Over Time")
+                
+                fig_points = go.Figure()
+                
+                colors = ['green' if val >= 0 else 'red' for val in analysis_df['Change_Points']]
+                
+                fig_points.add_trace(go.Bar(
+                    x=analysis_df.index,
+                    y=analysis_df['Change_Points'],
+                    marker_color=colors,
+                    name='Change (Points)'
+                ))
+                
+                fig_points.update_layout(
+                    title='Daily Change in Points',
+                    xaxis_title='Date',
+                    yaxis_title='Change (Points)',
+                    height=400,
+                    showlegend=False
+                )
+                
+                st.plotly_chart(fig_points, use_container_width=True)
+                
+                # Plot 2: Change in Percentage over Time
+                st.subheader("📊 Change in Percentage Over Time")
+                
+                fig_pct = go.Figure()
+                
+                colors_pct = ['green' if val >= 0 else 'red' for val in analysis_df['Change_Pct']]
+                
+                fig_pct.add_trace(go.Bar(
+                    x=analysis_df.index,
+                    y=analysis_df['Change_Pct'],
+                    marker_color=colors_pct,
+                    name='Change (%)'
+                ))
+                
+                fig_pct.update_layout(
+                    title='Daily Change in Percentage',
+                    xaxis_title='Date',
+                    yaxis_title='Change (%)',
+                    height=400,
+                    showlegend=False
+                )
+                
+                st.plotly_chart(fig_pct, use_container_width=True)
+                
+                st.divider()
+                
+                # Heatmap 1: Returns Heatmap
+                st.subheader("🔥 Returns Heatmap (Percentage)")
+                
+                # Prepare data for heatmap - group by day of week and hour/date
+                heatmap_df = analysis_df.copy()
+                heatmap_df['Date'] = heatmap_df.index.date
+                heatmap_df['Hour'] = heatmap_df.index.hour
+                
+                # Create pivot table for heatmap
+                if interval in ['1m', '5m', '15m', '30m', '1h', '4h']:
+                    # Intraday - use hours
+                    pivot_pct = heatmap_df.pivot_table(
+                        values='Change_Pct',
+                        index='Date',
+                        columns='Hour',
+                        aggfunc='mean'
+                    )
+                else:
+                    # Daily or higher - use day of week
+                    heatmap_df['Week'] = heatmap_df.index.isocalendar().week
+                    pivot_pct = heatmap_df.pivot_table(
+                        values='Change_Pct',
+                        index='Week',
+                        columns=heatmap_df.index.day_name(),
+                        aggfunc='mean'
+                    )
+                
+                fig_heatmap_pct = go.Figure(data=go.Heatmap(
+                    z=pivot_pct.values,
+                    x=pivot_pct.columns,
+                    y=pivot_pct.index,
+                    colorscale='RdYlGn',
+                    zmid=0,
+                    text=np.round(pivot_pct.values, 2),
+                    texttemplate='%{text}',
+                    textfont={"size": 10},
+                    colorbar=dict(title="Change (%)")
+                ))
+                
+                fig_heatmap_pct.update_layout(
+                    title='Returns Heatmap by Time Period',
+                    xaxis_title='Hour' if interval in ['1m', '5m', '15m', '30m', '1h', '4h'] else 'Day of Week',
+                    yaxis_title='Date/Week',
+                    height=600
+                )
+                
+                st.plotly_chart(fig_heatmap_pct, use_container_width=True)
+                
+                st.divider()
+                
+                # Heatmap 2: Points Heatmap
+                st.subheader("🔥 Points Change Heatmap")
+                
+                if interval in ['1m', '5m', '15m', '30m', '1h', '4h']:
+                    pivot_points = heatmap_df.pivot_table(
+                        values='Change_Points',
+                        index='Date',
+                        columns='Hour',
+                        aggfunc='mean'
+                    )
+                else:
+                    pivot_points = heatmap_df.pivot_table(
+                        values='Change_Points',
+                        index='Week',
+                        columns=heatmap_df.index.day_name(),
+                        aggfunc='mean'
+                    )
+                
+                fig_heatmap_points = go.Figure(data=go.Heatmap(
+                    z=pivot_points.values,
+                    x=pivot_points.columns,
+                    y=pivot_points.index,
+                    colorscale='RdYlGn',
+                    zmid=0,
+                    text=np.round(pivot_points.values, 2),
+                    texttemplate='%{text}',
+                    textfont={"size": 10},
+                    colorbar=dict(title="Change (Points)")
+                ))
+                
+                fig_heatmap_points.update_layout(
+                    title='Points Change Heatmap by Time Period',
+                    xaxis_title='Hour' if interval in ['1m', '5m', '15m', '30m', '1h', '4h'] else 'Day of Week',
+                    yaxis_title='Date/Week',
+                    height=600
+                )
+                
+                st.plotly_chart(fig_heatmap_points, use_container_width=True)
+                
+                # Summary statistics
+                st.divider()
+                st.subheader("📊 Summary Statistics")
+                
+                stats_col1, stats_col2, stats_col3, stats_col4 = st.columns(4)
+                
+                with stats_col1:
+                    avg_change_points = analysis_df['Change_Points'].mean()
+                    st.metric("Avg Change (Points)", f"{avg_change_points:.2f}")
+                
+                with stats_col2:
+                    avg_change_pct = analysis_df['Change_Pct'].mean()
+                    st.metric("Avg Change (%)", f"{avg_change_pct:.2f}%")
+                
+                with stats_col3:
+                    positive_days = (analysis_df['Change_Points'] > 0).sum()
+                    total_days = len(analysis_df)
+                    win_rate = (positive_days / total_days * 100) if total_days > 0 else 0
+                    st.metric("Positive Days", f"{positive_days}/{total_days}")
+                    st.metric("Win Rate", f"{win_rate:.2f}%")
+                
+                with stats_col4:
+                    max_gain = analysis_df['Change_Points'].max()
+                    max_loss = analysis_df['Change_Points'].min()
+                    st.metric("Max Gain (Points)", f"{max_gain:.2f}")
+                    st.metric("Max Loss (Points)", f"{max_loss:.2f}")
+            
+            else:
+                st.info("Click 'Load Market Data' to view market analysis")
 
 if __name__ == "__main__":
     main()
