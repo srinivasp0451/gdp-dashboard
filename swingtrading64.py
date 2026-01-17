@@ -340,17 +340,19 @@ def run_backtest(df, strategy, config, qty):
             exit_price = None
             exit_reason = None
             
+            # Check signal-based exit first
             if config['sl_type'] == 'Signal-based (reverse EMA crossover)' or \
                config['target_type'] == 'Signal-based (reverse EMA crossover)':
                 if pos['signal'] == 1:
                     if df['EMA_Fast'].iloc[i] < df['EMA_Slow'].iloc[i] and df['EMA_Fast'].iloc[i-1] >= df['EMA_Slow'].iloc[i-1]:
-                        exit_reason = 'Reverse Signal'
+                        exit_reason = 'Reverse Signal - Bearish Crossover'
                         exit_price = cp
                 elif pos['signal'] == -1:
                     if df['EMA_Fast'].iloc[i] > df['EMA_Slow'].iloc[i] and df['EMA_Fast'].iloc[i-1] <= df['EMA_Slow'].iloc[i-1]:
-                        exit_reason = 'Reverse Signal'
+                        exit_reason = 'Reverse Signal - Bullish Crossover'
                         exit_price = cp
             
+            # Update highest/lowest based on current candle close
             if pos['signal'] == 1:
                 if pos['highest_price'] is None or cp > pos['highest_price']:
                     pos['highest_price'] = cp
@@ -358,9 +360,11 @@ def run_backtest(df, strategy, config, qty):
                 if pos['lowest_price'] is None or cp < pos['lowest_price']:
                     pos['lowest_price'] = cp
             
+            # Update trailing SL based on current candle close
             if config['sl_type'] in ['Trailing SL (Points)', 'Trailing SL + Signal Based']:
                 pos['sl'] = update_trailing_sl(cp, pos['sl'], pos['signal'], config['sl_type'], config, pos)
             
+            # Check break-even based on current candle close
             if config['sl_type'] == 'Break-even After 50% Target' and not pos.get('breakeven_activated'):
                 if pos['signal'] == 1:
                     prof = cp - pos['entry_price']
@@ -375,6 +379,7 @@ def run_backtest(df, strategy, config, qty):
                         pos['sl'] = pos['entry_price']
                         pos['breakeven_activated'] = True
             
+            # Check SL hit based on current candle close
             if config['sl_type'] != 'Signal-based (reverse EMA crossover)' and not exit_reason:
                 if pos['signal'] == 1 and cp <= pos['sl']:
                     exit_reason = 'Stop Loss Hit'
@@ -383,6 +388,7 @@ def run_backtest(df, strategy, config, qty):
                     exit_reason = 'Stop Loss Hit'
                     exit_price = pos['sl']
             
+            # Check target hit based on current candle close
             if config['target_type'] not in ['Trailing Target (Points)', 'Trailing Target + Signal Based', 
                                              'Signal-based (reverse EMA crossover)'] and not exit_reason:
                 if config['target_type'] == '50% Exit at Target (Partial)':
@@ -420,6 +426,7 @@ def run_backtest(df, strategy, config, qty):
                     res['losing_trades'] += 1
                 pos = None
         
+        # Check for entry at current candle close
         if not pos and df['Signal'].iloc[i] != 0:
             sig = df['Signal'].iloc[i]
             entry = cp
@@ -588,6 +595,26 @@ def main():
         if key not in st.session_state:
             st.session_state[key] = False if key == 'trading_active' else ([] if 'history' in key or 'logs' in key else None)
     
+    # PLACEHOLDER: Dhan API Integration
+    # Uncomment and configure when ready to connect to Dhan broker
+    # from dhanhq import dhanhq
+    # dhan = dhanhq("client_id", "access_token")
+    # def place_dhan_order(symbol, qty, order_type, price=0):
+    #     try:
+    #         order = dhan.place_order(
+    #             security_id=symbol,
+    #             exchange_segment=dhan.NSE,
+    #             transaction_type=dhan.BUY if order_type == 'BUY' else dhan.SELL,
+    #             quantity=qty,
+    #             order_type=dhan.MARKET,
+    #             product_type=dhan.INTRA,
+    #             price=price
+    #         )
+    #         return order
+    #     except Exception as e:
+    #         st.error(f"Dhan order failed: {e}")
+    #         return None
+    
     with st.sidebar:
         st.header("⚙️ Configuration")
         
@@ -621,7 +648,7 @@ def main():
         
         strategy = st.selectbox("Strategy", [
             "EMA Crossover", "Simple Buy", "Simple Sell", "Price Crosses Threshold",
-            "RSI-ADX-EMA", "Percentage Change", "AI Price Action Analysis"
+            "RSI-ADX-EMA", "Percentage Change", "AI Price Action Analysis", "Custom Strategy Builder"
         ])
         
         config = {}
@@ -757,6 +784,10 @@ def main():
                 pb = st.progress(0)
                 st_txt = st.empty()
                 
+                # Show live data immediately even while fetching
+                if st.session_state['current_data'] is not None:
+                    display_live_metrics(st.session_state['current_data'], st.session_state['position'], qty, config, symbol, interval)
+                
                 while st.session_state['trading_active']:
                     st_txt.text("Fetching...")
                     pb.progress(30)
@@ -789,83 +820,122 @@ def main():
                         pb.progress(100)
                         st_txt.text("Updated")
                         st.session_state['current_data'] = df
+                        
+                        # Display updated metrics immediately
+                        display_live_metrics(df, st.session_state['position'], qty, config, symbol, interval)
                     else:
                         st.error("Failed to fetch")
                     
                     time.sleep(random.uniform(1.0, 1.5))
                     st.rerun()
             
+            # Show metrics even when stopped
             if st.session_state['current_data'] is not None:
-                df = st.session_state['current_data']
-                cp = df['Close'].iloc[-1]
-                pos = st.session_state['position']
-                
-                st.markdown("### 📈 Metrics")
-                m1, m2, m3, m4 = st.columns(4)
-                
-                with m1:
-                    st.metric("Price", f"{cp:.2f}")
-                with m2:
-                    st.metric("Entry", f"{pos['entry_price']:.2f}" if pos else "N/A")
-                with m3:
-                    st.metric("Position", ("LONG" if pos['signal'] == 1 else "SHORT") if pos else "None")
-                with m4:
-                    if pos:
-                        upnl = (cp - pos['entry_price']) * qty if pos['signal'] == 1 else (pos['entry_price'] - cp) * qty
-                        if upnl >= 0:
-                            st.metric("P&L", f"{upnl:.2f}", delta=f"+{upnl:.2f}")
-                        else:
-                            st.metric("P&L", f"{upnl:.2f}", delta=f"{upnl:.2f}", delta_color="inverse")
-                    else:
-                        st.metric("P&L", "0.00")
-                
-                sig = df['Signal'].iloc[-1]
-                if sig == 1:
-                    st.success("🟢 BUY")
-                elif sig == -1:
-                    st.error("🔴 SELL")
-                else:
-                    st.info("⚪ NONE")
-                
-                if pos:
-                    st.markdown("### 💼 Position")
-                    p1, p2, p3 = st.columns(3)
-                    with p1:
-                        st.write(f"**Entry:** {pos['entry_time'].strftime('%H:%M:%S')}")
-                        st.write(f"**Price:** {pos['entry_price']:.2f}")
-                    with p2:
-                        st.write(f"**SL:** {pos['sl']:.2f if pos['sl'] != 0 else 'Signal'}")
-                        st.write(f"**Target:** {pos['target']:.2f if pos['target'] != 0 else 'Signal'}")
-                    with p3:
-                        if st.session_state['highest_price']:
-                            st.write(f"**High:** {st.session_state['highest_price']:.2f}")
-                        if st.session_state['lowest_price']:
-                            st.write(f"**Low:** {st.session_state['lowest_price']:.2f}")
-                
-                st.markdown("### 📊 Chart")
-                fig = go.Figure()
-                fig.add_trace(go.Candlestick(x=df.index, open=df['Open'], high=df['High'],
-                                            low=df['Low'], close=df['Close'], name='Price'))
-                
-                if 'EMA_Fast' in df.columns:
-                    fig.add_trace(go.Scatter(x=df.index, y=df['EMA_Fast'], mode='lines',
-                                            name='Fast', line=dict(color='blue', width=1)))
-                if 'EMA_Slow' in df.columns:
-                    fig.add_trace(go.Scatter(x=df.index, y=df['EMA_Slow'], mode='lines',
-                                            name='Slow', line=dict(color='red', width=1)))
-                
-                if pos:
-                    fig.add_hline(y=pos['entry_price'], line_dash="dash", line_color="yellow", annotation_text="Entry")
-                    if pos['sl'] != 0:
-                        fig.add_hline(y=pos['sl'], line_dash="dash", line_color="red", annotation_text="SL")
-                    if pos['target'] != 0:
-                        fig.add_hline(y=pos['target'], line_dash="dash", line_color="green", annotation_text="Tgt")
-                
-                fig.update_layout(title=f"{symbol} - {interval}", xaxis_title="Time",
-                                 yaxis_title="Price", height=600, xaxis_rangeslider_visible=False)
-                st.plotly_chart(fig, use_container_width=True, key=f"c_{int(time.time())}")
+                display_live_metrics(st.session_state['current_data'], st.session_state['position'], qty, config, symbol, interval)
         else:
             st.info("Live Dashboard only in Live Trading mode")
+
+def display_live_metrics(df, pos, qty, config, symbol, interval):
+    """Display live trading metrics"""
+    cp = df['Close'].iloc[-1]
+    
+    st.markdown("### 📊 Active Configuration")
+    cfg1, cfg2, cfg3 = st.columns(3)
+    with cfg1:
+        st.info(f"**Asset:** {symbol}")
+        st.info(f"**Interval:** {interval}")
+        st.info(f"**Quantity:** {qty}")
+    with cfg2:
+        st.info(f"**SL Type:** {config['sl_type']}")
+        sl_pts = f"{config.get('sl_points', 0):.0f}" if config.get('sl_points', 0) != 0 else "Signal Based"
+        st.info(f"**SL Points:** {sl_pts}")
+    with cfg3:
+        st.info(f"**Target Type:** {config['target_type']}")
+        tgt_pts = f"{config.get('target_points', 0):.0f}" if config.get('target_points', 0) != 0 else "Signal Based"
+        st.info(f"**Target Points:** {tgt_pts}")
+    
+    st.markdown("---")
+    st.markdown("### 📈 Metrics")
+    m1, m2, m3, m4 = st.columns(4)
+    
+    with m1:
+        st.metric("Price", f"{cp:.2f}")
+    with m2:
+        st.metric("Entry", f"{pos['entry_price']:.2f}" if pos else "N/A")
+    with m3:
+        st.metric("Position", ("LONG" if pos['signal'] == 1 else "SHORT") if pos else "None")
+    with m4:
+        if pos:
+            upnl = (cp - pos['entry_price']) * qty if pos['signal'] == 1 else (pos['entry_price'] - cp) * qty
+            if upnl >= 0:
+                st.metric("P&L", f"{upnl:.2f}", delta=f"+{upnl:.2f}")
+            else:
+                st.metric("P&L", f"{upnl:.2f}", delta=f"{upnl:.2f}", delta_color="inverse")
+        else:
+            st.metric("P&L", "0.00")
+    
+    # Show EMA values
+    if 'EMA_Fast' in df.columns and 'EMA_Slow' in df.columns:
+        st.markdown("### 🔢 Indicator Values")
+        ind1, ind2, ind3, ind4 = st.columns(4)
+        with ind1:
+            st.metric("EMA Fast", f"{df['EMA_Fast'].iloc[-1]:.2f}")
+        with ind2:
+            st.metric("EMA Slow", f"{df['EMA_Slow'].iloc[-1]:.2f}")
+        with ind3:
+            if 'EMA_Angle' in df.columns:
+                st.metric("EMA Angle", f"{df['EMA_Angle'].iloc[-1]:.2f}°")
+        with ind4:
+            if 'RSI' in df.columns:
+                st.metric("RSI", f"{df['RSI'].iloc[-1]:.2f}")
+    
+    sig = df['Signal'].iloc[-1]
+    if sig == 1:
+        st.success("🟢 BUY")
+    elif sig == -1:
+        st.error("🔴 SELL")
+    else:
+        st.info("⚪ NONE")
+    
+    if pos:
+        st.markdown("### 💼 Position")
+        p1, p2, p3 = st.columns(3)
+        with p1:
+            st.write(f"**Entry:** {pos['entry_time'].strftime('%H:%M:%S')}")
+            st.write(f"**Price:** {pos['entry_price']:.2f}")
+        with p2:
+            sl_display = f"{pos['sl']:.2f}" if pos['sl'] != 0 else "Signal Based"
+            st.write(f"**SL:** {sl_display}")
+            tgt_display = f"{pos['target']:.2f}" if pos['target'] != 0 else "Signal Based"
+            st.write(f"**Target:** {tgt_display}")
+        with p3:
+            if st.session_state.get('highest_price'):
+                st.write(f"**High:** {st.session_state['highest_price']:.2f}")
+            if st.session_state.get('lowest_price'):
+                st.write(f"**Low:** {st.session_state['lowest_price']:.2f}")
+    
+    st.markdown("### 📊 Chart")
+    fig = go.Figure()
+    fig.add_trace(go.Candlestick(x=df.index, open=df['Open'], high=df['High'],
+                                low=df['Low'], close=df['Close'], name='Price'))
+    
+    if 'EMA_Fast' in df.columns:
+        fig.add_trace(go.Scatter(x=df.index, y=df['EMA_Fast'], mode='lines',
+                                name='Fast', line=dict(color='blue', width=1)))
+    if 'EMA_Slow' in df.columns:
+        fig.add_trace(go.Scatter(x=df.index, y=df['EMA_Slow'], mode='lines',
+                                name='Slow', line=dict(color='red', width=1)))
+    
+    if pos:
+        fig.add_hline(y=pos['entry_price'], line_dash="dash", line_color="yellow", annotation_text="Entry")
+        if pos['sl'] != 0:
+            fig.add_hline(y=pos['sl'], line_dash="dash", line_color="red", annotation_text="SL")
+        if pos['target'] != 0:
+            fig.add_hline(y=pos['target'], line_dash="dash", line_color="green", annotation_text="Tgt")
+    
+    fig.update_layout(title=f"{symbol} - {interval}", xaxis_title="Time",
+                     yaxis_title="Price", height=600, xaxis_rangeslider_visible=False)
+    st.plotly_chart(fig, use_container_width=True, key=f"c_{int(time.time())}")
     
     with tab2:
         st.markdown("### 📈 Trade History")
