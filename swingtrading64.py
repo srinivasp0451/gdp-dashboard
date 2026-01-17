@@ -1216,12 +1216,12 @@ def live_trading_loop(asset, ticker, interval, period, strategy, config, mode, p
         
         # Update UI placeholder with current data
         with placeholder.container():
-            display_live_dashboard(df, position, config, asset, interval, quantity)
+            display_live_dashboard(df, position, config, asset, interval)
         
         # Wait before next iteration
         time.sleep(random.uniform(1.0, 1.5))
 
-def display_live_dashboard(df, position, config, asset, interval, quantity):
+def display_live_dashboard(df, position, config, asset, interval):
     """Display live dashboard content"""
     if df is None or df.empty:
         st.info("⏳ Waiting for data...")
@@ -1229,6 +1229,7 @@ def display_live_dashboard(df, position, config, asset, interval, quantity):
     
     current_price = df['Close'].iloc[-1]
     current_signal = df['Signal'].iloc[-1] if 'Signal' in df.columns else 0
+    quantity = config.get('quantity', 1)
     
     st.subheader("📊 Live Metrics")
     
