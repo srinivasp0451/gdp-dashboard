@@ -1557,41 +1557,41 @@ def main():
             col1, col2, col3 = st.columns([2, 2, 3])
             
             with col1:
-                start_disabled = st.session_state.get('trading_active', False)
-                if st.button("▶️ Start Trading", type="primary", use_container_width=True, disabled=start_disabled):
-                    # Create placeholder for live updates
-                    st.session_state['live_placeholder'] = st.empty()
-                    
-                    # Display active configuration
-                    st.subheader("📋 Active Configuration")
-                    conf_col1, conf_col2, conf_col3 = st.columns(3)
-                    
-                    with conf_col1:
-                        st.metric("Asset", asset)
-                        st.metric("Interval", interval)
-                        st.metric("Period", period)
-                    
-                    with conf_col2:
-                        st.metric("Quantity", quantity)
-                        st.metric("Strategy", strategy)
-                        st.metric("SL Type", sl_type)
-                    
-                    with conf_col3:
-                        sl_val_str = "Signal Based" if sl_type == "Signal-based (reverse EMA crossover)" else f"{config.get('sl_points', 0):.2f}"
-                        st.metric("SL Points", sl_val_str)
-                        st.metric("Target Type", target_type)
-                        target_val_str = "Signal Based" if target_type == "Signal-based (reverse EMA crossover)" else f"{config.get('target_points', 0):.2f}"
-                        st.metric("Target Points", target_val_str)
-                    
-                    st.divider()
-                    
-                    # Start trading with placeholder
-                    placeholder = st.empty()
-                    add_log("Trading started")
-                    live_trading_loop(asset, ticker, interval, period, strategy, config, mode, placeholder)
+                # Start button is NEVER disabled
+                if st.button("▶️ Start Trading", type="primary", use_container_width=True):
+                    if not st.session_state.get('trading_active', False):
+                        # Display active configuration
+                        st.subheader("📋 Active Configuration")
+                        conf_col1, conf_col2, conf_col3 = st.columns(3)
+                        
+                        with conf_col1:
+                            st.metric("Asset", asset)
+                            st.metric("Interval", interval)
+                            st.metric("Period", period)
+                        
+                        with conf_col2:
+                            st.metric("Quantity", quantity)
+                            st.metric("Strategy", strategy)
+                            st.metric("SL Type", sl_type)
+                        
+                        with conf_col3:
+                            sl_val_str = "Signal Based" if sl_type == "Signal-based (reverse EMA crossover)" else f"{config.get('sl_points', 0):.2f}"
+                            st.metric("SL Points", sl_val_str)
+                            st.metric("Target Type", target_type)
+                            target_val_str = "Signal Based" if target_type == "Signal-based (reverse EMA crossover)" else f"{config.get('target_points', 0):.2f}"
+                            st.metric("Target Points", target_val_str)
+                        
+                        st.divider()
+                        
+                        # Start trading with placeholder
+                        placeholder = st.empty()
+                        add_log("Trading started")
+                        live_trading_loop(asset, ticker, interval, period, strategy, config, mode, placeholder)
+                    else:
+                        st.warning("Trading is already active!")
             
             with col2:
-                # Stop trading button is NEVER disabled
+                # Stop button is NEVER disabled
                 if st.button("⏹️ Stop Trading", use_container_width=True):
                     if st.session_state.get('trading_active', False):
                         st.session_state['trading_active'] = False
