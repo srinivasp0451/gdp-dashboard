@@ -1214,6 +1214,11 @@ def live_trading_loop(asset, ticker, interval, period, strategy, config, mode, p
                 
                 reset_position_state()
         
+        # Check if user clicked stop trading
+        if not st.session_state.get('trading_active', False):
+            add_log("Trading loop stopped by user")
+            break
+        
         # Update UI placeholder with current data
         with placeholder.container():
             display_live_dashboard(df, position, config, asset, interval)
@@ -1586,8 +1591,8 @@ def main():
                     live_trading_loop(asset, ticker, interval, period, strategy, config, mode, placeholder)
             
             with col2:
-                stop_disabled = not st.session_state.get('trading_active', False)
-                if st.button("⏹️ Stop Trading", use_container_width=True, disabled=stop_disabled):
+                # Stop trading button is NEVER disabled
+                if st.button("⏹️ Stop Trading", use_container_width=True):
                     if st.session_state.get('trading_active', False):
                         st.session_state['trading_active'] = False
                         
@@ -1630,7 +1635,9 @@ def main():
                         
                         reset_position_state()
                         add_log("Trading stopped")
-                        st.rerun()
+                        st.success("✅ Trading stopped successfully!")
+                    else:
+                        st.info("Trading is not currently active")
             
             with col3:
                 if st.session_state.get('trading_active', False):
