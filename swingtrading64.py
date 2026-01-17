@@ -999,10 +999,10 @@ def main():
                         tgt_str = f"{t['target']:.2f}" if t['target'] != 0 else "Signal"
                         st.write(f"**Target:** {tgt_str}")
                         st.write(f"**Reason:** {t['exit_reason']}")
-                            if t['pnl'] >= 0:
-                                st.success(f"**P&L:** +{t['pnl']:.2f}")
-                            else:
-                                st.error(f"**P&L:** {t['pnl']:.2f}")
+                        if t['pnl'] >= 0:
+                            st.success(f"**P&L:** +{t['pnl']:.2f}")
+                        else:
+                            st.error(f"**P&L:** {t['pnl']:.2f}")
                             st.info(f"H: {t.get('highest', 0):.2f} | L: {t.get('lowest', 0):.2f} | R: {t.get('range', 0):.2f}")
         else:
             st.info("Backtest only in Backtest mode")
