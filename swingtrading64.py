@@ -1343,7 +1343,8 @@ def display_live_dashboard(df, position, config, asset, interval):
                 entry_time_str = entry_time.strftime("%H:%M:%S")
                 st.metric("Entry Time", entry_time_str)
                 st.metric("Duration", f"{duration:.2f}h")
-
+    
+            with pos_col2:
                 sl_val = position.get('sl', 0)
                 if sl_val:
                     st.metric("Stop Loss", f"{sl_val:.2f}")
@@ -1352,7 +1353,10 @@ def display_live_dashboard(df, position, config, asset, interval):
                     else:
                         dist_to_sl = sl_val - current_price
                     st.metric("To SL", f"{dist_to_sl:.2f}")
-
+            
+            
+            
+            with pos_col3:
                 target_val = position.get('target', 0)
                 if target_val:
                     st.metric("Target", f"{target_val:.2f}")
@@ -1361,41 +1365,13 @@ def display_live_dashboard(df, position, config, asset, interval):
                     else:
                         dist_to_target = current_price - target_val
                     st.metric("To Target", f"{dist_to_target:.2f}")
-
+            
+            with pos_col4:
                 highest = position.get('highest_price', current_price)
                 lowest = position.get('lowest_price', current_price)
                 range_val = highest - lowest
                 st.metric("High", f"{highest:.2f}")
                 st.metric("Low", f"{lowest:.2f}")
-    
-            # with pos_col2:
-            #     sl_val = position.get('sl', 0)
-            #     if sl_val:
-            #         st.metric("Stop Loss", f"{sl_val:.2f}")
-            #         if position['type'] == 1:
-            #             dist_to_sl = current_price - sl_val
-            #         else:
-            #             dist_to_sl = sl_val - current_price
-            #         st.metric("To SL", f"{dist_to_sl:.2f}")
-            
-            
-            
-            # with pos_col3:
-            #     target_val = position.get('target', 0)
-            #     if target_val:
-            #         st.metric("Target", f"{target_val:.2f}")
-            #         if position['type'] == 1:
-            #             dist_to_target = target_val - current_price
-            #         else:
-            #             dist_to_target = current_price - target_val
-            #         st.metric("To Target", f"{dist_to_target:.2f}")
-            
-            # with pos_col4:
-            #     highest = position.get('highest_price', current_price)
-            #     lowest = position.get('lowest_price', current_price)
-            #     range_val = highest - lowest
-            #     st.metric("High", f"{highest:.2f}")
-            #     st.metric("Low", f"{lowest:.2f}")
             
             # Second row for range
             range_col1, range_col2, range_col3, range_col4 = st.columns(4)
