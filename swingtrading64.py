@@ -1327,33 +1327,13 @@ def display_live_dashboard(df, position, config, asset, interval):
     # Position Details
     
     if position:
-        st.markdown(
-            """
-            <style>
-            .stMainBlockContainer {
-                max-width: 95% !important;
-                padding-top: 2rem !important;
-                padding-right: 1rem !important;
-                padding-left: 1rem !important;
-            }
-            </style>
-            """,
-            unsafe_allow_html=True
-        )
+        
         st.divider()
         st.subheader("📌 Position Information")
         
         # First row of position metrics
         pos_col1, pos_col2, pos_col3, pos_col4 = st.columns(4)
-        
-        with pos_col1:
-            entry_time = position['entry_time']
-            now_time = df.index[-1]
-            duration = (now_time - entry_time).total_seconds() / 3600
-            entry_time_str = entry_time.strftime("%H:%M:%S")
-            st.metric("Entry Time", entry_time_str)
-            st.metric("Duration", f"{duration:.2f}h")
-        
+
         with pos_col2:
             sl_val = position.get('sl', 0)
             if sl_val:
@@ -1363,6 +1343,16 @@ def display_live_dashboard(df, position, config, asset, interval):
                 else:
                     dist_to_sl = sl_val - current_price
                 st.metric("To SL", f"{dist_to_sl:.2f}")
+        
+        with pos_col1:
+            entry_time = position['entry_time']
+            now_time = df.index[-1]
+            duration = (now_time - entry_time).total_seconds() / 3600
+            entry_time_str = entry_time.strftime("%H:%M:%S")
+            st.metric("Entry Time", entry_time_str)
+            st.metric("Duration", f"{duration:.2f}h")
+        
+        
         
         with pos_col3:
             target_val = position.get('target', 0)
