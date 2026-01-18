@@ -1270,7 +1270,6 @@ def live_trading_loop(asset, ticker, interval, period, strategy, config, mode, p
         time.sleep(random.uniform(1.0, 1.5))
 
 def display_live_dashboard(df, position, config, asset, interval):
-    st.set_page_config(page_title="My Wide App",layout="wide",   initial_sidebar_state="expanded")
     """Display live dashboard content"""
     if df is None or df.empty:
         st.info("⏳ Waiting for data...")
