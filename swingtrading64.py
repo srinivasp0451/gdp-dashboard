@@ -1238,91 +1238,99 @@ def display_live_dashboard(df, position, config, asset, interval):
     
     st.subheader("📊 Live Metrics")
     
-    metric_col1, metric_col2, metric_col3, metric_col4 = st.columns(4)
-    
-    with metric_col1:
-        st.metric("Current Price", f"{current_price:.2f}")
-        if position:
-            st.metric("Entry Price", f"{position['entry_price']:.2f}")
-    
-    with metric_col2:
-        if position:
-            status_text = "LONG" if position['type'] == 1 else "SHORT"
-            st.metric("Position", status_text)
-            
-            # Calculate unrealized P&L
-            if position['type'] == 1:
-                unrealized_pnl = (current_price - position['entry_price']) * quantity
-            else:
-                unrealized_pnl = (position['entry_price'] - current_price) * quantity
-            
-            pnl_label = "Unrealized P&L"
-            if unrealized_pnl >= 0:
-                st.metric(pnl_label, f"{unrealized_pnl:.2f}", delta=f"+{unrealized_pnl:.2f}")
-            else:
-                st.metric(pnl_label, f"{unrealized_pnl:.2f}", delta=f"{unrealized_pnl:.2f}", delta_color="inverse")
-        else:
-            st.metric("Position", "None")
-    
-    with metric_col3:
-        if 'EMA_Fast' in df.columns:
-            st.metric("EMA Fast", f"{df['EMA_Fast'].iloc[-1]:.2f}")
-        if 'EMA_Slow' in df.columns:
-            st.metric("EMA Slow", f"{df['EMA_Slow'].iloc[-1]:.2f}")
-    
-    with metric_col4:
-        if 'RSI' in df.columns:
-            st.metric("RSI", f"{df['RSI'].iloc[-1]:.2f}")
+    # Use container with full width
+    with st.container():
+        metric_col1, metric_col2, metric_col3, metric_col4 = st.columns(4)
         
-        signal_text = "NONE"
-        if current_signal == 1:
-            signal_text = "🟢 BUY"
-        elif current_signal == -1:
-            signal_text = "🔴 SELL"
-        st.metric("Signal", signal_text)
+        with metric_col1:
+            st.metric("Current Price", f"{current_price:.2f}")
+            if position:
+                st.metric("Entry Price", f"{position['entry_price']:.2f}")
+        
+        with metric_col2:
+            if position:
+                status_text = "LONG" if position['type'] == 1 else "SHORT"
+                st.metric("Position", status_text)
+                
+                # Calculate unrealized P&L
+                if position['type'] == 1:
+                    unrealized_pnl = (current_price - position['entry_price']) * quantity
+                else:
+                    unrealized_pnl = (position['entry_price'] - current_price) * quantity
+                
+                pnl_label = "P&L"
+                if unrealized_pnl >= 0:
+                    st.metric(pnl_label, f"{unrealized_pnl:.2f}", delta=f"+{unrealized_pnl:.2f}")
+                else:
+                    st.metric(pnl_label, f"{unrealized_pnl:.2f}", delta=f"{unrealized_pnl:.2f}", delta_color="inverse")
+            else:
+                st.metric("Position", "None")
+        
+        with metric_col3:
+            if 'EMA_Fast' in df.columns:
+                st.metric("EMA Fast", f"{df['EMA_Fast'].iloc[-1]:.2f}")
+            if 'EMA_Slow' in df.columns:
+                st.metric("EMA Slow", f"{df['EMA_Slow'].iloc[-1]:.2f}")
+        
+        with metric_col4:
+            if 'RSI' in df.columns:
+                st.metric("RSI", f"{df['RSI'].iloc[-1]:.2f}")
+            
+            signal_text = "NONE"
+            if current_signal == 1:
+                signal_text = "🟢 BUY"
+            elif current_signal == -1:
+                signal_text = "🔴 SELL"
+            st.metric("Signal", signal_text)
     
     # Position Details
     if position:
         st.divider()
         st.subheader("📌 Position Information")
         
-        pos_col1, pos_col2, pos_col3, pos_col4 = st.columns(4)
+        with st.container():
+            pos_col1, pos_col2, pos_col3, pos_col4 = st.columns(4)
+            
+            with pos_col1:
+                entry_time = position['entry_time']
+                now_time = df.index[-1]
+                duration = (now_time - entry_time).total_seconds() / 3600
+                entry_time_str = entry_time.strftime("%H:%M:%S")
+                st.metric("Entry Time", entry_time_str)
+                st.metric("Duration", f"{duration:.2f}h")
+            
+            with pos_col2:
+                sl_val = position.get('sl', 0)
+                if sl_val:
+                    st.metric("Stop Loss", f"{sl_val:.2f}")
+                    if position['type'] == 1:
+                        dist_to_sl = current_price - sl_val
+                    else:
+                        dist_to_sl = sl_val - current_price
+                    st.metric("To SL", f"{dist_to_sl:.2f}")
+            
+            with pos_col3:
+                target_val = position.get('target', 0)
+                if target_val:
+                    st.metric("Target", f"{target_val:.2f}")
+                    if position['type'] == 1:
+                        dist_to_target = target_val - current_price
+                    else:
+                        dist_to_target = current_price - target_val
+                    st.metric("To Target", f"{dist_to_target:.2f}")
+            
+            with pos_col4:
+                highest = position.get('highest_price', current_price)
+                lowest = position.get('lowest_price', current_price)
+                range_val = highest - lowest
+                st.metric("High", f"{highest:.2f}")
+                st.metric("Low", f"{lowest:.2f}")
         
-        with pos_col1:
-            entry_time = position['entry_time']
-            now_time = df.index[-1]
-            duration = (now_time - entry_time).total_seconds() / 3600
-            entry_time_str = entry_time.strftime("%H:%M:%S")
-            st.metric("Entry Time", entry_time_str)
-            st.metric("Duration (hrs)", f"{duration:.2f}")
-        
-        with pos_col2:
-            sl_val = position.get('sl', 0)
-            if sl_val:
-                st.metric("Stop Loss", f"{sl_val:.2f}")
-                if position['type'] == 1:
-                    dist_to_sl = current_price - sl_val
-                else:
-                    dist_to_sl = sl_val - current_price
-                st.metric("Dist to SL", f"{dist_to_sl:.2f}")
-        
-        with pos_col3:
-            target_val = position.get('target', 0)
-            if target_val:
-                st.metric("Target", f"{target_val:.2f}")
-                if position['type'] == 1:
-                    dist_to_target = target_val - current_price
-                else:
-                    dist_to_target = current_price - target_val
-                st.metric("Dist to Tgt", f"{dist_to_target:.2f}")
-        
-        with pos_col4:
-            highest = position.get('highest_price', current_price)
-            lowest = position.get('lowest_price', current_price)
-            range_val = highest - lowest
-            st.metric("Highest", f"{highest:.2f}")
-            st.metric("Lowest", f"{lowest:.2f}")
-            st.metric("Range", f"{range_val:.2f}")
+        # Additional row for range
+        with st.container():
+            range_col1, range_col2, range_col3, range_col4 = st.columns(4)
+            with range_col1:
+                st.metric("Range", f"{range_val:.2f}")
         
         if position.get('breakeven_activated', False):
             st.success("✅ Stop Loss moved to break-even")
