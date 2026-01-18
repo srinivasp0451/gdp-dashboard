@@ -1289,7 +1289,7 @@ def display_live_dashboard(df, position, config, asset, interval):
         st.subheader("📌 Position Information")
         
         with st.container():
-            pos_col1, pos_col2, pos_col3, pos_col4 = st.columns([2, 2, 2, 2])
+            pos_col1, pos_col2, pos_col3, pos_col4 = st.columns(4)
             
             with pos_col1:
                 entry_time = position['entry_time']
@@ -1297,7 +1297,7 @@ def display_live_dashboard(df, position, config, asset, interval):
                 duration = (now_time - entry_time).total_seconds() / 3600
                 entry_time_str = entry_time.strftime("%H:%M:%S")
                 st.write("Entry Time", entry_time_str)
-                st.metric("Duration", f"{duration:.2f}h")
+                st.write("Duration", f"{duration:.2f}h")
             
             with pos_col2:
                 sl_val = position.get('sl', 0)
