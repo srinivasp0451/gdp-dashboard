@@ -1221,19 +1221,46 @@ def live_trading_loop(asset, ticker, interval, period, strategy, config, mode, p
         
         # Update UI placeholder with current data - use full width
         with placeholder.container():
-            # Force full width display
+            # Force full width display with aggressive CSS
             st.markdown("""
                 <style>
-                    .block-container {
-                        max-width: 100%;
-                        padding-left: 1rem;
-                        padding-right: 1rem;
+                    /* Force full width for all containers */
+                    .main .block-container {
+                        max-width: 100% !important;
+                        padding-left: 1rem !important;
+                        padding-right: 1rem !important;
                     }
-                    div[data-testid="stMetricValue"] {
-                        font-size: 1.2rem;
+                    
+                    /* Remove width constraints from columns */
+                    [data-testid="column"] {
+                        width: calc(25% - 1rem) !important;
+                        flex: 1 1 calc(25% - 1rem) !important;
                     }
-                    div[data-testid="stMetricLabel"] {
-                        font-size: 0.9rem;
+                    
+                    /* Ensure metrics use full width */
+                    [data-testid="stMetric"] {
+                        width: 100% !important;
+                    }
+                    
+                    /* Prevent label truncation */
+                    [data-testid="stMetricLabel"] {
+                        width: 100% !important;
+                        white-space: nowrap !important;
+                        overflow: visible !important;
+                        text-overflow: clip !important;
+                        font-size: 0.875rem !important;
+                    }
+                    
+                    /* Make metric values readable */
+                    [data-testid="stMetricValue"] {
+                        font-size: 1.5rem !important;
+                        width: 100% !important;
+                    }
+                    
+                    /* Fix container width */
+                    section[data-testid="stSidebar"] ~ div {
+                        width: 100% !important;
+                        max-width: 100% !important;
                     }
                 </style>
             """, unsafe_allow_html=True)
