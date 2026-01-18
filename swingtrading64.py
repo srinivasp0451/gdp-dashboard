@@ -1296,8 +1296,8 @@ def display_live_dashboard(df, position, config, asset, interval):
                 now_time = df.index[-1]
                 duration = (now_time - entry_time).total_seconds() / 3600
                 entry_time_str = entry_time.strftime("%H:%M:%S")
-                st.write("Entry Time", entry_time_str)
-                st.write("Duration", f"{duration:.2f}h")
+                st.metric("Entry Time", entry_time_str)
+                st.metric("Duration", f"{duration:.2f}h")
             
             with pos_col2:
                 sl_val = position.get('sl', 0)
