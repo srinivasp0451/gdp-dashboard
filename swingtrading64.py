@@ -1325,7 +1325,21 @@ def display_live_dashboard(df, position, config, asset, interval):
         st.metric("Signal", signal_text)
     
     # Position Details
+    
     if position:
+        st.markdown(
+            """
+            <style>
+            .stMainBlockContainer {
+                max-width: 95% !important;
+                padding-top: 2rem !important;
+                padding-right: 1rem !important;
+                padding-left: 1rem !important;
+            }
+            </style>
+            """,
+            unsafe_allow_html=True
+        )
         st.divider()
         st.subheader("📌 Position Information")
         
