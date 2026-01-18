@@ -9,6 +9,7 @@ import time
 import random
 
 # ==================== CONFIGURATION ====================
+st.set_page_config(layout="wide")
 
 ASSET_TICKERS = {
     "NIFTY 50": "^NSEI",
@@ -1287,7 +1288,6 @@ def display_live_dashboard(df, position, config, asset, interval):
     if position:
         st.divider()
         st.subheader("📌 Position Information")
-        st.set_page_config(layout="wide")
         
         with st.container():
             pos_col1, pos_col2, pos_col3, pos_col4 = st.columns(4)
