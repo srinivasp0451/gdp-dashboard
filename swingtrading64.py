@@ -1332,7 +1332,7 @@ def display_live_dashboard(df, position, config, asset, interval):
         st.subheader("📌 Position Information")
         
         # First row of position metrics
-        pos_col1, pos_col2, pos_col3, pos_col4 = st.columns([2, 2, 3,5])
+        pos_col1, pos_col2, pos_col3, pos_col4 = st.columns([7, 7, 7,7])
 
         
         
