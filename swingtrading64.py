@@ -1256,10 +1256,11 @@ def display_live_dashboard(df, position, config, asset, interval):
             else:
                 unrealized_pnl = (position['entry_price'] - current_price) * quantity
             
+            pnl_label = "Unrealized P&L"
             if unrealized_pnl >= 0:
-                st.metric("Unrealized P&L", f"{unrealized_pnl:.2f}", delta=f"+{unrealized_pnl:.2f}")
+                st.metric(pnl_label, f"{unrealized_pnl:.2f}", delta=f"+{unrealized_pnl:.2f}")
             else:
-                st.metric("Unrealized P&L", f"{unrealized_pnl:.2f}", delta=f"{unrealized_pnl:.2f}", delta_color="inverse")
+                st.metric(pnl_label, f"{unrealized_pnl:.2f}", delta=f"{unrealized_pnl:.2f}", delta_color="inverse")
         else:
             st.metric("Position", "None")
     
@@ -1278,7 +1279,7 @@ def display_live_dashboard(df, position, config, asset, interval):
             signal_text = "🟢 BUY"
         elif current_signal == -1:
             signal_text = "🔴 SELL"
-        st.metric("Current Signal", signal_text)
+        st.metric("Signal", signal_text)
     
     # Position Details
     if position:
@@ -1291,8 +1292,9 @@ def display_live_dashboard(df, position, config, asset, interval):
             entry_time = position['entry_time']
             now_time = df.index[-1]
             duration = (now_time - entry_time).total_seconds() / 3600
-            st.metric("Entry Time", entry_time.strftime("%H:%M:%S"))
-            st.metric("Duration (hours)", f"{duration:.2f}")
+            entry_time_str = entry_time.strftime("%H:%M:%S")
+            st.metric("Entry Time", entry_time_str)
+            st.metric("Duration (hrs)", f"{duration:.2f}")
         
         with pos_col2:
             sl_val = position.get('sl', 0)
@@ -1302,7 +1304,7 @@ def display_live_dashboard(df, position, config, asset, interval):
                     dist_to_sl = current_price - sl_val
                 else:
                     dist_to_sl = sl_val - current_price
-                st.metric("Distance to SL", f"{dist_to_sl:.2f}")
+                st.metric("Dist to SL", f"{dist_to_sl:.2f}")
         
         with pos_col3:
             target_val = position.get('target', 0)
@@ -1312,12 +1314,14 @@ def display_live_dashboard(df, position, config, asset, interval):
                     dist_to_target = target_val - current_price
                 else:
                     dist_to_target = current_price - target_val
-                st.metric("Distance to Target", f"{dist_to_target:.2f}")
+                st.metric("Dist to Tgt", f"{dist_to_target:.2f}")
         
         with pos_col4:
-            st.metric("Highest", f"{position.get('highest_price', current_price):.2f}")
-            st.metric("Lowest", f"{position.get('lowest_price', current_price):.2f}")
-            range_val = position.get('highest_price', current_price) - position.get('lowest_price', current_price)
+            highest = position.get('highest_price', current_price)
+            lowest = position.get('lowest_price', current_price)
+            range_val = highest - lowest
+            st.metric("Highest", f"{highest:.2f}")
+            st.metric("Lowest", f"{lowest:.2f}")
             st.metric("Range", f"{range_val:.2f}")
         
         if position.get('breakeven_activated', False):
@@ -1560,29 +1564,6 @@ def main():
                 # Start button is NEVER disabled
                 if st.button("▶️ Start Trading", type="primary", use_container_width=True):
                     if not st.session_state.get('trading_active', False):
-                        # Display active configuration
-                        st.subheader("📋 Active Configuration")
-                        conf_col1, conf_col2, conf_col3 = st.columns(3)
-                        
-                        with conf_col1:
-                            st.metric("Asset", asset)
-                            st.metric("Interval", interval)
-                            st.metric("Period", period)
-                        
-                        with conf_col2:
-                            st.metric("Quantity", quantity)
-                            st.metric("Strategy", strategy)
-                            st.metric("SL Type", sl_type)
-                        
-                        with conf_col3:
-                            sl_val_str = "Signal Based" if sl_type == "Signal-based (reverse EMA crossover)" else f"{config.get('sl_points', 0):.2f}"
-                            st.metric("SL Points", sl_val_str)
-                            st.metric("Target Type", target_type)
-                            target_val_str = "Signal Based" if target_type == "Signal-based (reverse EMA crossover)" else f"{config.get('target_points', 0):.2f}"
-                            st.metric("Target Points", target_val_str)
-                        
-                        st.divider()
-                        
                         # Start trading with placeholder
                         placeholder = st.empty()
                         add_log("Trading started")
@@ -2069,28 +2050,149 @@ def main():
                 st.divider()
                 st.subheader("📊 Summary Statistics")
                 
-                stats_col1, stats_col2, stats_col3, stats_col4 = st.columns(4)
+                stats_col1, stats_col2, stats_col3, stats_col4, stats_col5 = st.columns(5)
                 
                 with stats_col1:
-                    avg_change_points = analysis_df['Change_Points'].mean()
-                    st.metric("Avg Change (Points)", f"{avg_change_points:.2f}")
+                    max_price = analysis_df['Close'].max()
+                    min_price = analysis_df['Close'].min()
+                    st.metric("Max Price", f"{max_price:.2f}")
+                    st.metric("Min Price", f"{min_price:.2f}")
                 
                 with stats_col2:
-                    avg_change_pct = analysis_df['Change_Pct'].mean()
-                    st.metric("Avg Change (%)", f"{avg_change_pct:.2f}%")
+                    avg_price = analysis_df['Close'].mean()
+                    st.metric("Avg Price", f"{avg_price:.2f}")
+                    volatility_pct = analysis_df['Close'].std() / avg_price * 100
+                    st.metric("Volatility %", f"{volatility_pct:.2f}%")
                 
                 with stats_col3:
+                    total_change = analysis_df['Close'].iloc[-1] - analysis_df['Close'].iloc[0]
+                    total_change_pct = (total_change / analysis_df['Close'].iloc[0]) * 100
+                    st.metric("Total Change", f"{total_change:.2f}")
+                    st.metric("Total Change %", f"{total_change_pct:.2f}%")
+                
+                with stats_col4:
+                    avg_change_points = analysis_df['Change_Points'].mean()
+                    avg_change_pct = analysis_df['Change_Pct'].mean()
+                    st.metric("Avg Change (Pts)", f"{avg_change_points:.2f}")
+                    st.metric("Avg Change (%)", f"{avg_change_pct:.2f}%")
+                
+                with stats_col5:
                     positive_days = (analysis_df['Change_Points'] > 0).sum()
                     total_days = len(analysis_df)
                     win_rate = (positive_days / total_days * 100) if total_days > 0 else 0
                     st.metric("Positive Days", f"{positive_days}/{total_days}")
                     st.metric("Win Rate", f"{win_rate:.2f}%")
                 
-                with stats_col4:
-                    max_gain = analysis_df['Change_Points'].max()
-                    max_loss = analysis_df['Change_Points'].min()
-                    st.metric("Max Gain (Points)", f"{max_gain:.2f}")
-                    st.metric("Max Loss (Points)", f"{max_loss:.2f}")
+                max_gain = analysis_df['Change_Points'].max()
+                max_loss = analysis_df['Change_Points'].min()
+                
+                extra_col1, extra_col2 = st.columns(2)
+                with extra_col1:
+                    st.metric("Max Gain (Pts)", f"{max_gain:.2f}")
+                with extra_col2:
+                    st.metric("Max Loss (Pts)", f"{max_loss:.2f}")
+                
+                st.divider()
+                
+                # Additional Heatmaps - 10 Year Monthly Returns
+                st.subheader("🔥 10-Year Monthly Returns Heatmap")
+                
+                with st.spinner("Loading 10-year data for monthly returns..."):
+                    # Fetch 10 years of daily data
+                    ten_year_df = fetch_data(ticker, '1d', '10y', mode)
+                    
+                    if ten_year_df is not None and not ten_year_df.empty:
+                        # Calculate monthly returns
+                        ten_year_df['Year'] = ten_year_df.index.year
+                        ten_year_df['Month'] = ten_year_df.index.month
+                        ten_year_df['Month_Name'] = ten_year_df.index.strftime('%b')
+                        
+                        # Calculate monthly returns
+                        monthly_returns = ten_year_df.groupby(['Year', 'Month', 'Month_Name'])['Close'].agg(['first', 'last'])
+                        monthly_returns['Return_Pct'] = ((monthly_returns['last'] - monthly_returns['first']) / monthly_returns['first']) * 100
+                        monthly_returns = monthly_returns.reset_index()
+                        
+                        # Create pivot table
+                        pivot_monthly = monthly_returns.pivot_table(
+                            values='Return_Pct',
+                            index='Year',
+                            columns='Month_Name',
+                            aggfunc='mean'
+                        )
+                        
+                        # Reorder columns by month
+                        month_order = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
+                        pivot_monthly = pivot_monthly.reindex(columns=[m for m in month_order if m in pivot_monthly.columns])
+                        
+                        fig_monthly_returns = go.Figure(data=go.Heatmap(
+                            z=pivot_monthly.values,
+                            x=pivot_monthly.columns,
+                            y=pivot_monthly.index,
+                            colorscale='RdYlGn',
+                            zmid=0,
+                            text=np.round(pivot_monthly.values, 2),
+                            texttemplate='%{text}%',
+                            textfont={"size": 11},
+                            colorbar=dict(title="Return (%)")
+                        ))
+                        
+                        fig_monthly_returns.update_layout(
+                            title='Monthly Returns by Year (Last 10 Years)',
+                            xaxis_title='Month',
+                            yaxis_title='Year',
+                            height=600
+                        )
+                        
+                        st.plotly_chart(fig_monthly_returns, use_container_width=True)
+                    else:
+                        st.warning("Unable to load 10-year data for monthly returns heatmap")
+                
+                st.divider()
+                
+                # Volatility Heatmap - 10 Years
+                st.subheader("🔥 10-Year Monthly Volatility Heatmap")
+                
+                if ten_year_df is not None and not ten_year_df.empty:
+                    # Calculate daily returns
+                    ten_year_df['Daily_Return'] = ten_year_df['Close'].pct_change() * 100
+                    
+                    # Calculate monthly volatility (standard deviation of daily returns)
+                    monthly_volatility = ten_year_df.groupby(['Year', 'Month', 'Month_Name'])['Daily_Return'].std()
+                    monthly_volatility = monthly_volatility.reset_index()
+                    monthly_volatility.columns = ['Year', 'Month', 'Month_Name', 'Volatility']
+                    
+                    # Create pivot table
+                    pivot_volatility = monthly_volatility.pivot_table(
+                        values='Volatility',
+                        index='Year',
+                        columns='Month_Name',
+                        aggfunc='mean'
+                    )
+                    
+                    # Reorder columns by month
+                    pivot_volatility = pivot_volatility.reindex(columns=[m for m in month_order if m in pivot_volatility.columns])
+                    
+                    fig_volatility = go.Figure(data=go.Heatmap(
+                        z=pivot_volatility.values,
+                        x=pivot_volatility.columns,
+                        y=pivot_volatility.index,
+                        colorscale='Reds',
+                        text=np.round(pivot_volatility.values, 2),
+                        texttemplate='%{text}%',
+                        textfont={"size": 11},
+                        colorbar=dict(title="Volatility (%)")
+                    ))
+                    
+                    fig_volatility.update_layout(
+                        title='Monthly Volatility by Year (Last 10 Years)',
+                        xaxis_title='Month',
+                        yaxis_title='Year',
+                        height=600
+                    )
+                    
+                    st.plotly_chart(fig_volatility, use_container_width=True)
+                else:
+                    st.warning("Unable to load 10-year data for volatility heatmap")
             
             else:
                 st.info("Click 'Load Market Data' to view market analysis")
