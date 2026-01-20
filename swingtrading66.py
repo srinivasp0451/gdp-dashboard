@@ -622,7 +622,7 @@ with st.sidebar:
                         'all_data': all_data
                     }
                     
-                    st.success('✅ Data fetched successfully!')
+                        st.success('✅ Data fetched successfully!')
                 else:
                     st.error('Failed to fetch data. Please check ticker symbols and try again.')
 
@@ -674,19 +674,18 @@ if st.session_state.data_fetched:
         # Create display dataframe properly
         last_n_indices = data1.tail(data['bins']).index
         
-        display_data = pd.DataFrame({
-            'Open': data1.loc[last_n_indices, 'Open'].values,
-            'High': data1.loc[last_n_indices, 'High'].values,
-            'Low': data1.loc[last_n_indices, 'Low'].values,
-            'Close': data1.loc[last_n_indices, 'Close'].values,
-            'Ratio': ratio.loc[last_n_indices].values
-        }, index=last_n_indices)
+        display_data = pd.DataFrame(index=last_n_indices)
+        display_data['Open'] = data1.loc[last_n_indices, 'Open'].values
+        display_data['High'] = data1.loc[last_n_indices, 'High'].values
+        display_data['Low'] = data1.loc[last_n_indices, 'Low'].values
+        display_data['Close'] = data1.loc[last_n_indices, 'Close'].values
+        display_data['Ratio'] = ratio.loc[last_n_indices].values
         
         # Add Volume if available
         if 'Volume' in data1.columns:
             display_data['Volume'] = data1.loc[last_n_indices, 'Volume'].values
         
-        # Add movement columns
+        # Add movement columns one by one
         movements_tail = movements_df.tail(data['bins'])
         for col in movements_df.columns:
             display_data[col] = movements_tail[col].values
@@ -804,15 +803,22 @@ if st.session_state.data_fetched:
         # Create RSI display dataframe properly
         last_15_indices = data1.tail(15).index
         
-        rsi_display = pd.DataFrame({
-            'Close': data1.loc[last_15_indices, 'Close'].values,
-            'RSI_T1': rsi1.loc[last_15_indices].values if len(rsi1) >= 15 else [np.nan] * 15,
-            'RSI_T2': rsi2.loc[last_15_indices].values if len(rsi2) >= 15 else [np.nan] * 15
-        }, index=last_15_indices)
+        rsi_display = pd.DataFrame(index=last_15_indices)
+        rsi_display['Close'] = data1.loc[last_15_indices, 'Close'].values
+        
+        if len(rsi1) >= 15:
+            rsi_display['RSI_T1'] = rsi1.loc[last_15_indices].values
+        else:
+            rsi_display['RSI_T1'] = np.nan
+            
+        if len(rsi2) >= 15:
+            rsi_display['RSI_T2'] = rsi2.loc[last_15_indices].values
+        else:
+            rsi_display['RSI_T2'] = np.nan
         
         rsi_display['RSI_Diff'] = rsi_display['RSI_T1'] - rsi_display['RSI_T2']
         
-        # Add movement columns
+        # Add movement columns one by one
         movements_tail_15 = movements_df.tail(15)
         for col in movements_df.columns:
             rsi_display[col] = movements_tail_15[col].values
@@ -1073,13 +1079,12 @@ if st.session_state.data_fetched:
     with tab4:
         st.header('Statistical Analysis')
         
-        # Calculate statistics properly
-        data1_stats = pd.DataFrame({
-            'Close': data1['Close'].values,
-            'Price_Change': data1['Close'].diff().values,
-            'Price_Change_Pct': data1['Close'].pct_change().mul(100).values,
-            'Day_of_Week': [dt.day_name() for dt in data1.index]
-        }, index=data1.index)
+        # Calculate statistics properly - build incrementally
+        data1_stats = pd.DataFrame(index=data1.index)
+        data1_stats['Close'] = data1['Close'].values
+        data1_stats['Price_Change'] = data1['Close'].diff().values
+        data1_stats['Price_Change_Pct'] = data1['Close'].pct_change().mul(100).values
+        data1_stats['Day_of_Week'] = [dt.day_name() for dt in data1.index]
         
         data1_stats = data1_stats.dropna()
         
