@@ -652,18 +652,25 @@ if st.session_state.data_fetched:
         # Display table with last N bins
         st.subheader(f'Last {data["bins"]} Data Points with Future Movements')
         
-        display_data = data1.tail(data['bins']).copy()
-        ratio_tail = ratio.tail(data['bins'])
+        # Create display dataframe properly
+        last_n_indices = data1.tail(data['bins']).index
         
-        # Safely assign ratio column
-        if isinstance(ratio_tail, pd.Series):
-            display_data.loc[:, 'Ratio'] = ratio_tail.values
-        else:
-            display_data.loc[:, 'Ratio'] = ratio_tail
+        display_data = pd.DataFrame({
+            'Open': data1.loc[last_n_indices, 'Open'].values,
+            'High': data1.loc[last_n_indices, 'High'].values,
+            'Low': data1.loc[last_n_indices, 'Low'].values,
+            'Close': data1.loc[last_n_indices, 'Close'].values,
+            'Ratio': ratio.loc[last_n_indices].values
+        }, index=last_n_indices)
+        
+        # Add Volume if available
+        if 'Volume' in data1.columns:
+            display_data['Volume'] = data1.loc[last_n_indices, 'Volume'].values
         
         # Add movement columns
+        movements_tail = movements_df.tail(data['bins'])
         for col in movements_df.columns:
-            display_data.loc[:, col] = movements_df[col].tail(data['bins']).values
+            display_data[col] = movements_tail[col].values
         
         # Format datetime index
         display_data.index = display_data.index.strftime('%Y-%m-%d %H:%M:%S')
@@ -775,15 +782,21 @@ if st.session_state.data_fetched:
         # Table with RSI and future movements
         st.subheader('RSI Data with Future Price Movements')
         
-        rsi_display = data1.tail(15).copy()
-        rsi_display['RSI_T1'] = rsi1.tail(15)
-        rsi_display['RSI_T2'] = rsi2.tail(15)
+        # Create RSI display dataframe properly
+        last_15_indices = data1.tail(15).index
+        
+        rsi_display = pd.DataFrame({
+            'Close': data1.loc[last_15_indices, 'Close'].values,
+            'RSI_T1': rsi1.loc[last_15_indices].values if len(rsi1) >= 15 else [np.nan] * 15,
+            'RSI_T2': rsi2.loc[last_15_indices].values if len(rsi2) >= 15 else [np.nan] * 15
+        }, index=last_15_indices)
+        
         rsi_display['RSI_Diff'] = rsi_display['RSI_T1'] - rsi_display['RSI_T2']
         
         # Add movement columns
-        movements_df = calculate_future_movements(data1, data['n_candles'])
+        movements_tail_15 = movements_df.tail(15)
         for col in movements_df.columns:
-            rsi_display[col] = movements_df[col].tail(15).values
+            rsi_display[col] = movements_tail_15[col].values
         
         rsi_display.index = rsi_display.index.strftime('%Y-%m-%d %H:%M:%S')
         
@@ -1041,11 +1054,14 @@ if st.session_state.data_fetched:
     with tab4:
         st.header('Statistical Analysis')
         
-        # Calculate statistics
-        data1_stats = data1.copy()
-        data1_stats['Price_Change'] = data1_stats['Close'].diff()
-        data1_stats['Price_Change_Pct'] = data1_stats['Close'].pct_change() * 100
-        data1_stats['Day_of_Week'] = data1_stats.index.day_name()
+        # Calculate statistics properly
+        data1_stats = pd.DataFrame({
+            'Close': data1['Close'].values,
+            'Price_Change': data1['Close'].diff().values,
+            'Price_Change_Pct': data1['Close'].pct_change().mul(100).values,
+            'Day_of_Week': [dt.day_name() for dt in data1.index]
+        }, index=data1.index)
+        
         data1_stats = data1_stats.dropna()
         
         # Overall statistics
@@ -1186,10 +1202,12 @@ if st.session_state.data_fetched:
         if data['timeframe'] in ['1m', '5m', '15m', '30m', '1h', '4h']:
             st.subheader('⏰ Intraday Volatility Analysis')
             
-            data1_stats_hourly = data1_stats.copy()
-            data1_stats_hourly['Hour'] = data1_stats_hourly.index.hour
+            hourly_data = pd.DataFrame({
+                'Price_Change_Pct': data1_stats['Price_Change_Pct'].values,
+                'Hour': [dt.hour for dt in data1_stats.index]
+            }, index=data1_stats.index)
             
-            hourly_volatility = data1_stats_hourly.groupby('Hour').agg({
+            hourly_volatility = hourly_data.groupby('Hour').agg({
                 'Price_Change_Pct': ['mean', 'std', 'count']
             }).round(2)
             
