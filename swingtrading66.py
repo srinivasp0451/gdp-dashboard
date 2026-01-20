@@ -88,6 +88,25 @@ TIMEFRAME_PERIODS = {
     '1mo': ['1y', '2y', '5y', '10y', '20y', '30y']
 }
 
+def convert_to_ist(df):
+    """Convert dataframe index to IST timezone"""
+    try:
+        if df.index.tz is None:
+            # Timezone-naive: localize to UTC first, then convert to IST
+            df.index = df.index.tz_localize('UTC').tz_convert('Asia/Kolkata')
+        else:
+            # Timezone-aware: just convert to IST
+            df.index = df.index.tz_convert('Asia/Kolkata')
+    except Exception as e:
+        st.warning(f"Timezone conversion warning: {e}")
+    return df
+
+def flatten_multiindex(df):
+    """Flatten multi-index dataframe from yfinance"""
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = ['_'.join(col).strip() if col[1] else col[0] for col in df.columns.values]
+    return df
+
 def align_dataframes(df1, df2):
     """Align two dataframes by their indices (datetime) using inner join"""
     try:
