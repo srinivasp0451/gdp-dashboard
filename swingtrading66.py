@@ -622,7 +622,7 @@ with st.sidebar:
                         'all_data': all_data
                     }
                     
-                        st.success('✅ Data fetched successfully!')
+                    st.success('✅ Data fetched successfully!')
                 else:
                     st.error('Failed to fetch data. Please check ticker symbols and try again.')
 
