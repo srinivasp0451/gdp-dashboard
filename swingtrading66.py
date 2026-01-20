@@ -4,1140 +4,903 @@ import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
-from datetime import datetime, timedelta
 import time
+from datetime import datetime, timedelta
 import pytz
-from scipy import stats
+from typing import Dict, List, Tuple, Optional
 import warnings
 warnings.filterwarnings('ignore')
 
-# Set page configuration
-st.set_page_config(
-    page_title="Professional Algo Trading Platform",
-    page_icon="📈",
-    layout="wide",
-    initial_sidebar_state="expanded"
-)
+# Page configuration
+st.set_page_config(page_title="Professional AlgoTrading Platform", layout="wide", initial_sidebar_state="expanded")
 
-# Custom CSS
-st.markdown("""
-<style>
-    .main-header {
-        font-size: 2.5rem;
-        color: #1E88E5;
-        text-align: center;
-        margin-bottom: 2rem;
-    }
-    .sub-header {
-        font-size: 1.8rem;
-        color: #424242;
-        margin-top: 1.5rem;
-        margin-bottom: 1rem;
-    }
-    .metric-card {
-        background-color: #f8f9fa;
-        padding: 1rem;
-        border-radius: 10px;
-        border-left: 4px solid #1E88E5;
-        margin-bottom: 1rem;
-    }
-    .forecast-card {
-        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-        color: white;
-        padding: 1.5rem;
-        border-radius: 15px;
-        margin: 1rem 0;
-    }
-    .stTabs [data-baseweb="tab-list"] {
-        gap: 24px;
-    }
-    .stTabs [data-baseweb="tab"] {
-        height: 50px;
-        white-space: pre-wrap;
-        background-color: #f0f2f6;
-        border-radius: 4px 4px 0px 0px;
-        gap: 1px;
-        padding-top: 10px;
-        padding-bottom: 10px;
-    }
-    .stTabs [aria-selected="true"] {
-        background-color: #1E88E5;
-        color: white;
-    }
-    .bin-table {
-        width: 100%;
-        border-collapse: collapse;
-        margin: 1rem 0;
-    }
-    .bin-table th, .bin-table td {
-        border: 1px solid #ddd;
-        padding: 8px;
-        text-align: center;
-    }
-    .bin-table th {
-        background-color: #1E88E5;
-        color: white;
-    }
-    .bin-table tr:nth-child(even) {
-        background-color: #f9f9f9;
-    }
-    .bin-table tr:hover {
-        background-color: #f5f5f5;
-    }
-    .current-bin {
-        background-color: #ffeb3b !important;
-        font-weight: bold;
-    }
-</style>
-""", unsafe_allow_html=True)
-
-# Initialize session state
-if 'data_fetched' not in st.session_state:
-    st.session_state.data_fetched = False
-if 'ticker1_data' not in st.session_state:
-    st.session_state.ticker1_data = {}
-if 'ticker2_data' not in st.session_state:
-    st.session_state.ticker2_data = {}
-if 'ratio_data' not in st.session_state:
-    st.session_state.ratio_data = {}
-if 'current_selections' not in st.session_state:
-    st.session_state.current_selections = {}
-if 'all_analysis' not in st.session_state:
-    st.session_state.all_analysis = {}
-
-# Constants
-TIMEZONE_MAPPING = {
-    'NIFTY 50': 'Asia/Kolkata',
-    'BANKNIFTY': 'Asia/Kolkata',
-    'SENSEX': 'Asia/Kolkata',
-    'USDINR': 'Asia/Kolkata',
-    'GOLD': 'Asia/Kolkata',
-    'SILVER': 'Asia/Kolkata',
-    'MCX': 'Asia/Kolkata',
-    'BTC': 'UTC',
-    'ETH': 'UTC',
-    'EURUSD': 'America/New_York',
-    'GBPUSD': 'America/New_York'
+# ==================== CONSTANTS ====================
+TICKER_MAP = {
+    "NIFTY 50": "^NSEI",
+    "BANKNIFTY": "^NSEBANK",
+    "SENSEX": "^BSESN",
+    "BTC": "BTC-USD",
+    "ETH": "ETH-USD",
+    "USDINR": "USDINR=X",
+    "EURUSD": "EURUSD=X",
+    "GBPUSD": "GBPUSD=X",
+    "GOLD": "GC=F",
+    "SILVER": "SI=F",
+    "MCX": "MCX.NS",
+    "CUSTOM": ""
 }
 
-ALLOWED_PERIODS = {
-    '1m': ['1d', '5d'],
-    '5m': ['1d', '1mo'],
-    '15m': ['1mo'],
-    '30m': ['1mo'],
-    '1h': ['1mo'],
-    '4h': ['1mo'],
-    '1d': ['1mo', '1y', '2y', '5y'],
-    '1wk': ['1mo', '1y',  '5y', '10y', '20y'],
-    '1mo': ['1y', '2y', '5y', '10y', '20y', '30y']
+TIMEFRAME_PERIODS = {
+    "1m": ["1d", "5d"],
+    "5m": ["1d", "1mo"],
+    "15m": ["1mo"],
+    "30m": ["1mo"],
+    "1h": ["1mo"],
+    "4h": ["1mo"],
+    "1d": ["1mo", "1y", "2y", "5y"],
+    "1wk": ["1mo", "1y", "5y", "10y", "20y"],
+    "1mo": ["1y", "2y", "5y", "10y", "20y", "30y"]
 }
 
-TICKER_MAPPING = {
-    'NIFTY 50': '^NSEI',
-    'BANKNIFTY': '^NSEBANK',
-    'SENSEX': '^BSESN',
-    'BTC': 'BTC-USD',
-    'ETH': 'ETH-USD',
-    'USDINR': 'INR=X',
-    'GOLD': 'GC=F',
-    'SILVER': 'SI=F',
-    'MCX': 'MCX.NS',
-    'EURUSD': 'EURUSD=X',
-    'GBPUSD': 'GBPUSD=X'
-}
+IST = pytz.timezone('Asia/Kolkata')
 
-class AlgoTradingPlatform:
-    def __init__(self):
-        self.ist = pytz.timezone('Asia/Kolkata')
-    
-    def get_yfinance_ticker(self, ticker_name):
-        """Get yfinance ticker symbol"""
-        if ticker_name in TICKER_MAPPING:
-            return TICKER_MAPPING[ticker_name]
-        else:
-            # For custom tickers
-            return ticker_name
-    
-    def fetch_data_with_progress(self, ticker, interval, period, progress_bar, status_text, progress_value):
-        """Fetch data with progress tracking"""
+# ==================== HELPER FUNCTIONS ====================
+
+def validate_timeframe_period(timeframe: str, period: str) -> bool:
+    """Validate timeframe and period combination"""
+    return period in TIMEFRAME_PERIODS.get(timeframe, [])
+
+def fetch_data_with_retry(ticker: str, interval: str, period: str, max_retries: int = 3) -> Optional[pd.DataFrame]:
+    """Fetch data from yfinance with retry logic and rate limiting"""
+    for attempt in range(max_retries):
         try:
-            status_text.text(f"Fetching {ticker} ({interval}/{period})...")
-            progress_bar.progress(progress_value + 0.1)
-            
-            # Add randomized delay
+            # Random delay between 1.0 and 1.5 seconds
             time.sleep(np.random.uniform(1.0, 1.5))
             
-            yf_ticker = self.get_yfinance_ticker(ticker)
-            data = yf.download(
-                yf_ticker,
-                period=period,
-                interval=interval,
-                progress=False,
-                auto_adjust=True
-            )
+            data = yf.download(ticker, interval=interval, period=period, progress=False, auto_adjust=True)
             
             if data.empty:
                 return None
             
-            # Flatten multi-index DataFrame
+            # Flatten multi-index if present
             if isinstance(data.columns, pd.MultiIndex):
-                data.columns = ['_'.join(col).strip() for col in data.columns.values]
-                # Rename common columns
-                rename_dict = {}
-                for col in data.columns:
-                    if 'Close' in col:
-                        rename_dict[col] = 'Close'
-                    elif 'Open' in col:
-                        rename_dict[col] = 'Open'
-                    elif 'High' in col:
-                        rename_dict[col] = 'High'
-                    elif 'Low' in col:
-                        rename_dict[col] = 'Low'
-                    elif 'Volume' in col:
-                        rename_dict[col] = 'Volume'
-                data = data.rename(columns=rename_dict)
-            
-            # Ensure required columns
-            required_cols = ['Open', 'High', 'Low', 'Close']
-            for col in required_cols:
-                if col not in data.columns:
-                    data[col] = np.nan
-            if 'Volume' not in data.columns:
-                data['Volume'] = np.nan
+                data.columns = ['_'.join(col).strip() if isinstance(col, tuple) else col for col in data.columns]
+                # Keep only OHLCV columns
+                ohlcv_cols = [col for col in data.columns if any(x in col.lower() for x in ['open', 'high', 'low', 'close', 'volume'])]
+                data = data[ohlcv_cols]
+                # Rename to standard format
+                data.columns = [col.split('_')[0] if '_' in col else col for col in data.columns]
             
             # Handle timezone
             if data.index.tz is None:
-                source_tz = TIMEZONE_MAPPING.get(ticker, 'UTC')
-                data.index = data.index.tz_localize(source_tz)
+                data.index = data.index.tz_localize('UTC').tz_convert(IST)
+            else:
+                data.index = data.index.tz_convert(IST)
             
-            # Convert to IST
-            data.index = data.index.tz_convert(self.ist)
-            
-            # Sort index
-            data = data.sort_index()
-            
-            progress_bar.progress(progress_value + 0.3)
-            status_text.text(f"✓ {ticker} data fetched successfully")
+            # Ensure standard OHLCV columns
+            required_cols = ['Open', 'High', 'Low', 'Close']
+            for col in required_cols:
+                if col not in data.columns:
+                    st.warning(f"Missing {col} column for {ticker}")
+                    return None
             
             return data
             
         except Exception as e:
-            st.error(f"Error fetching {ticker}: {str(e)}")
-            return None
+            if attempt == max_retries - 1:
+                st.error(f"Failed to fetch {ticker} after {max_retries} attempts: {str(e)}")
+                return None
+            time.sleep(2 ** attempt)  # Exponential backoff
     
-    def calculate_rsi(self, prices, period=14):
-        """Calculate RSI"""
-        delta = prices.diff()
-        gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
-        loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
-        rs = gain / loss
-        rsi = 100 - (100 / (1 + rs))
-        return rsi
+    return None
+
+def calculate_rsi(data: pd.Series, period: int = 14) -> pd.Series:
+    """Calculate RSI indicator"""
+    delta = data.diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
+    rs = gain / loss
+    rsi = 100 - (100 / (1 + rs))
+    return rsi
+
+def calculate_ratio(data1: pd.DataFrame, data2: pd.DataFrame) -> pd.DataFrame:
+    """Calculate ratio between two datasets"""
+    # Align dataframes by index
+    common_index = data1.index.intersection(data2.index)
+    if len(common_index) == 0:
+        return pd.DataFrame()
     
-    def calculate_divergence(self, price_series, indicator_series, lookback=20):
-        """Calculate divergence between price and indicator"""
-        divergences = []
-        
-        for i in range(lookback, len(price_series) - lookback):
-            # Check for bearish divergence (price higher high, indicator lower high)
-            if (price_series.iloc[i] > price_series.iloc[i-lookback:i].max() and
-                indicator_series.iloc[i] < indicator_series.iloc[i-lookback:i].max()):
-                divergences.append((price_series.index[i], 'bearish'))
-            
-            # Check for bullish divergence (price lower low, indicator higher low)
-            if (price_series.iloc[i] < price_series.iloc[i-lookback:i].min() and
-                indicator_series.iloc[i] > indicator_series.iloc[i-lookback:i].min()):
-                divergences.append((price_series.index[i], 'bullish'))
-        
-        return divergences
+    aligned_data1 = data1.loc[common_index]
+    aligned_data2 = data2.loc[common_index]
     
-    def calculate_future_movement(self, data, n_candles=20):
-        """Calculate future price movement for next n candles"""
-        movements = []
+    ratio_df = pd.DataFrame(index=common_index)
+    ratio_df['Ratio'] = aligned_data1['Close'] / aligned_data2['Close']
+    ratio_df['Ticker1_Close'] = aligned_data1['Close']
+    ratio_df['Ticker2_Close'] = aligned_data2['Close']
+    
+    # Add volume if available
+    if 'Volume' in aligned_data1.columns:
+        ratio_df['Ticker1_Volume'] = aligned_data1['Volume']
+    if 'Volume' in aligned_data2.columns:
+        ratio_df['Ticker2_Volume'] = aligned_data2['Volume']
+    
+    return ratio_df
+
+def calculate_future_movement(data: pd.DataFrame, n_candles: int = 15) -> pd.DataFrame:
+    """Calculate future price movement for next N candles"""
+    results = []
+    
+    for i in range(len(data)):
+        row_data = {'DateTime': data.index[i], 'Current_Close': data['Close'].iloc[i]}
         
-        for i in range(len(data) - n_candles):
-            current_close = data['Close'].iloc[i]
-            future_data = []
-            
-            for j in range(1, n_candles + 1):
-                future_close = data['Close'].iloc[i + j]
-                points_change = future_close - current_close
-                percent_change = (points_change / current_close) * 100
+        for n in range(1, n_candles + 1):
+            if i + n < len(data):
+                future_close = data['Close'].iloc[i + n]
+                future_datetime = data.index[i + n]
+                points_change = future_close - data['Close'].iloc[i]
+                pct_change = (points_change / data['Close'].iloc[i]) * 100
                 
-                future_data.append({
-                    'points': round(points_change, 2),
-                    'percent': round(percent_change, 2)
-                })
-            
-            movements.append(future_data)
-        
-        return movements
-    
-    def create_bins_with_ranges(self, ratio_series, num_bins):
-        """Create bins with ranges for ratio analysis"""
-        if len(ratio_series) < 2:
-            return [], []
-        
-        # Remove NaN values
-        clean_ratio = ratio_series.dropna()
-        
-        if len(clean_ratio) < 2:
-            return [], []
-        
-        # Create bins
-        min_val = clean_ratio.min()
-        max_val = clean_ratio.max()
-        
-        # Create bin edges
-        bin_edges = np.linspace(min_val, max_val, num_bins + 1)
-        
-        # Create bin ranges
-        bin_ranges = []
-        bin_counts = []
-        
-        for i in range(num_bins):
-            lower = bin_edges[i]
-            upper = bin_edges[i + 1]
-            bin_ranges.append(f"{lower:.6f} - {upper:.6f}")
-            
-            # Count values in this bin
-            if i == num_bins - 1:  # Last bin includes upper edge
-                count = ((clean_ratio >= lower) & (clean_ratio <= upper)).sum()
+                row_data[f'Next_{n}_DateTime'] = future_datetime
+                row_data[f'Next_{n}_Points'] = points_change
+                row_data[f'Next_{n}_Pct'] = pct_change
             else:
-                count = ((clean_ratio >= lower) & (clean_ratio < upper)).sum()
-            bin_counts.append(count)
+                row_data[f'Next_{n}_DateTime'] = None
+                row_data[f'Next_{n}_Points'] = np.nan
+                row_data[f'Next_{n}_Pct'] = np.nan
         
-        return bin_ranges, bin_counts, bin_edges
+        results.append(row_data)
     
-    def analyze_ratio_bins(self, ratio_series, num_bins):
-        """Analyze ratio distribution in bins"""
-        bin_ranges, bin_counts, bin_edges = self.create_bins_with_ranges(ratio_series, num_bins)
-        
-        if not bin_ranges:
-            return None
-        
-        # Calculate statistics
-        clean_ratio = ratio_series.dropna()
-        current_ratio = clean_ratio.iloc[-1]
-        
-        # Find which bin contains current ratio
-        current_bin_idx = -1
-        for i, (lower, upper) in enumerate(zip(bin_edges[:-1], bin_edges[1:])):
-            if i == len(bin_edges) - 2:  # Last bin
-                if lower <= current_ratio <= upper:
-                    current_bin_idx = i
-                    break
-            else:
-                if lower <= current_ratio < upper:
-                    current_bin_idx = i
-                    break
-        
-        # Calculate bin percentages
-        total_count = sum(bin_counts)
-        bin_percentages = [(count / total_count * 100) for count in bin_counts]
-        
-        # Find significant bins (bins with highest counts)
-        significant_bins = []
-        if bin_counts:
-            max_count = max(bin_counts)
-            threshold = max_count * 0.7  # 70% of max count
-            for i, count in enumerate(bin_counts):
-                if count >= threshold:
-                    significant_bins.append({
-                        'range': bin_ranges[i],
-                        'count': count,
-                        'percentage': bin_percentages[i]
-                    })
-        
-        # Calculate historical impact
-        historical_impact = []
-        if len(bin_edges) > 1:
-            midpoints = [(bin_edges[i] + bin_edges[i+1]) / 2 for i in range(len(bin_edges)-1)]
-            for i, midpoint in enumerate(midpoints):
-                if bin_counts[i] > 0:
-                    # Simple impact score based on position
-                    position_score = i / len(midpoints)  # Normalized position
-                    if position_score < 0.33:
-                        impact = "Bullish rally zone"
-                    elif position_score > 0.66:
-                        impact = "Bearish decline zone"
-                    else:
-                        impact = "Neutral consolidation"
-                    historical_impact.append({
-                        'range': bin_ranges[i],
-                        'impact': impact,
-                        'midpoint': midpoint
-                    })
-        
-        return {
-            'bin_ranges': bin_ranges,
-            'bin_counts': bin_counts,
-            'bin_percentages': bin_percentages,
-            'bin_edges': bin_edges,
-            'current_ratio': current_ratio,
-            'current_bin_idx': current_bin_idx,
-            'current_bin_range': bin_ranges[current_bin_idx] if current_bin_idx >= 0 else "N/A",
-            'significant_bins': significant_bins,
-            'historical_impact': historical_impact,
-            'min_value': clean_ratio.min(),
-            'max_value': clean_ratio.max(),
-            'mean_value': clean_ratio.mean(),
-            'std_value': clean_ratio.std(),
-            'percentile': stats.percentileofscore(clean_ratio, current_ratio)
-        }
-    
-    def generate_forecast(self, analysis_results):
-        """Generate forecast based on multiple analysis"""
-        if not analysis_results:
-            return "neutral", 0, []
-        
-        forecasts = []
-        confidences = []
-        
-        for result in analysis_results:
-            if 'forecast' in result:
-                forecasts.append(result['forecast'])
-                confidences.append(result.get('confidence', 50))
-        
-        if not forecasts:
-            return "neutral", 0, []
-        
-        # Count occurrences
-        forecast_counts = {}
-        for forecast in forecasts:
-            forecast_counts[forecast] = forecast_counts.get(forecast, 0) + 1
-        
-        # Determine majority forecast
-        total = len(forecasts)
-        majority_forecast = max(forecast_counts, key=forecast_counts.get)
-        confidence = (forecast_counts[majority_forecast] / total) * 100
-        
-        # Calculate average confidence for majority forecast
-        majority_confidences = [confidences[i] for i in range(len(forecasts)) if forecasts[i] == majority_forecast]
-        avg_confidence = np.mean(majority_confidences) if majority_confidences else confidence
-        
-        return majority_forecast, avg_confidence, forecast_counts
-    
-    def calculate_trading_levels(self, current_price, forecast, volatility, ratio_position):
-        """Calculate trading levels based on forecast"""
-        if forecast == 'bullish':
-            if ratio_position < 0.3:  # Very bullish
-                entry = current_price * 0.99
-                sl = entry * 0.97
-                targets = [
-                    entry * 1.03,
-                    entry * 1.06,
-                    entry * 1.10
-                ]
-                risk_reward = 3.0
-            else:
-                entry = current_price * 0.995
-                sl = entry * 0.98
-                targets = [
-                    entry * 1.02,
-                    entry * 1.04,
-                    entry * 1.07
-                ]
-                risk_reward = 2.0
-        elif forecast == 'bearish':
-            if ratio_position > 0.7:  # Very bearish
-                entry = current_price * 1.01
-                sl = entry * 1.03
-                targets = [
-                    entry * 0.97,
-                    entry * 0.94,
-                    entry * 0.90
-                ]
-                risk_reward = 3.0
-            else:
-                entry = current_price * 1.005
-                sl = entry * 1.02
-                targets = [
-                    entry * 0.98,
-                    entry * 0.96,
-                    entry * 0.93
-                ]
-                risk_reward = 2.0
-        else:  # sideways
-            entry = current_price
-            sl = current_price * 0.985
-            targets = [
-                current_price * 1.015,
-                current_price * 1.03,
-                current_price * 1.05
-            ]
-            risk_reward = 1.5
-        
-        return {
-            'entry': round(entry, 2),
-            'sl': round(sl, 2),
-            'targets': [round(t, 2) for t in targets],
-            'risk_reward': round(risk_reward, 2),
-            'points_risk': round(abs(entry - sl), 2),
-            'points_reward1': round(abs(targets[0] - entry), 2),
-            'points_reward2': round(abs(targets[1] - entry), 2),
-            'points_reward3': round(abs(targets[2] - entry), 2)
-        }
+    return pd.DataFrame(results)
 
-# Initialize platform
-platform = AlgoTradingPlatform()
+def calculate_rsi_divergence(data1: pd.DataFrame, data2: pd.DataFrame, rsi_period: int = 14) -> Dict:
+    """Calculate RSI divergence between two tickers"""
+    common_index = data1.index.intersection(data2.index)
+    if len(common_index) == 0:
+        return {}
+    
+    aligned_data1 = data1.loc[common_index].copy()
+    aligned_data2 = data2.loc[common_index].copy()
+    
+    # Calculate RSI for both
+    aligned_data1['RSI'] = calculate_rsi(aligned_data1['Close'], rsi_period)
+    aligned_data2['RSI'] = calculate_rsi(aligned_data2['Close'], rsi_period)
+    
+    # Calculate divergence
+    divergence_df = pd.DataFrame(index=common_index)
+    divergence_df['Ticker1_RSI'] = aligned_data1['RSI']
+    divergence_df['Ticker2_RSI'] = aligned_data2['RSI']
+    divergence_df['RSI_Diff'] = aligned_data1['RSI'] - aligned_data2['RSI']
+    divergence_df['Ticker1_Close'] = aligned_data1['Close']
+    
+    return {
+        'data': divergence_df,
+        'ticker1_rsi': aligned_data1['RSI'],
+        'ticker2_rsi': aligned_data2['RSI']
+    }
 
-# UI Header
-st.markdown("<h1 class='main-header'>📈 Professional Algo Trading Platform</h1>", unsafe_allow_html=True)
+def get_majority_forecast(movements: List[float]) -> Tuple[str, float]:
+    """Calculate majority forecast based on movement analysis"""
+    if not movements:
+        return "SIDEWAYS", 0.0
+    
+    bullish = sum(1 for m in movements if m > 0.5)
+    bearish = sum(1 for m in movements if m < -0.5)
+    sideways = len(movements) - bullish - bearish
+    
+    total = len(movements)
+    if bullish > bearish and bullish > sideways:
+        return "BULLISH", (bullish / total) * 100
+    elif bearish > bullish and bearish > sideways:
+        return "BEARISH", (bearish / total) * 100
+    else:
+        return "SIDEWAYS", (sideways / total) * 100
 
-# Sidebar for controls
+def create_ratio_chart(ratio_df: pd.DataFrame, ticker1_name: str, ticker2_name: str, timeframe: str):
+    """Create ratio chart with price and volume"""
+    fig = make_subplots(
+        rows=3, cols=1,
+        shared_xaxes=True,
+        vertical_spacing=0.05,
+        subplot_titles=(f'{ticker1_name}/{ticker2_name} Ratio', 'RSI', 'Volume'),
+        row_heights=[0.5, 0.25, 0.25]
+    )
+    
+    # Ratio line
+    fig.add_trace(go.Scatter(
+        x=ratio_df.index, y=ratio_df['Ratio'],
+        mode='lines', name='Ratio',
+        line=dict(color='blue', width=2)
+    ), row=1, col=1)
+    
+    # RSI
+    if len(ratio_df) > 14:
+        rsi = calculate_rsi(ratio_df['Ratio'])
+        fig.add_trace(go.Scatter(
+            x=ratio_df.index, y=rsi,
+            mode='lines', name='RSI',
+            line=dict(color='purple', width=1.5)
+        ), row=2, col=1)
+        
+        # RSI levels
+        fig.add_hline(y=70, line_dash="dash", line_color="red", row=2, col=1, opacity=0.5)
+        fig.add_hline(y=30, line_dash="dash", line_color="green", row=2, col=1, opacity=0.5)
+    
+    # Volume
+    has_volume = False
+    if 'Ticker1_Volume' in ratio_df.columns:
+        fig.add_trace(go.Bar(
+            x=ratio_df.index, y=ratio_df['Ticker1_Volume'],
+            name=f'{ticker1_name} Volume',
+            marker_color='lightblue', opacity=0.7
+        ), row=3, col=1)
+        has_volume = True
+    
+    fig.update_layout(
+        title=f'{ticker1_name}/{ticker2_name} Analysis - {timeframe}',
+        height=800,
+        showlegend=True,
+        hovermode='x unified'
+    )
+    
+    return fig
+
+# ==================== STREAMLIT UI ====================
+
+st.title("🚀 Professional AlgoTrading Platform")
+st.markdown("---")
+
+# Initialize session state
+if 'data_fetched' not in st.session_state:
+    st.session_state.data_fetched = False
+if 'analysis_results' not in st.session_state:
+    st.session_state.analysis_results = {}
+
+# Sidebar controls
 with st.sidebar:
-    st.markdown("### ⚙️ Controls")
+    st.header("⚙️ Configuration")
     
-    # Ticker selection
-    ticker_options = ['NIFTY 50', 'BANKNIFTY', 'SENSEX', 'BTC', 'ETH', 
-                      'USDINR', 'GOLD', 'SILVER', 'MCX', 'EURUSD', 'GBPUSD', 'Custom']
+    # Ticker 1 selection
+    ticker1_type = st.selectbox("Ticker 1", list(TICKER_MAP.keys()), index=0, key='ticker1_type')
+    if ticker1_type == "CUSTOM":
+        ticker1_custom = st.text_input("Enter Ticker 1 Symbol", "^NSEI", key='ticker1_custom')
+        ticker1 = ticker1_custom
+    else:
+        ticker1 = TICKER_MAP[ticker1_type]
     
-    col1, col2 = st.columns(2)
-    with col1:
-        ticker1 = st.selectbox(
-            "Ticker 1",
-            options=ticker_options,
-            index=0,
-            key="ticker1_select"
-        )
-        if ticker1 == 'Custom':
-            ticker1 = st.text_input("Enter custom ticker 1:", value="^NSEI")
-    
-    with col2:
-        ticker2 = st.selectbox(
-            "Ticker 2",
-            options=ticker_options,
-            index=5,
-            key="ticker2_select"
-        )
-        if ticker2 == 'Custom':
-            ticker2 = st.text_input("Enter custom ticker 2:", value="INR=X")
+    # Ticker 2 selection
+    ticker2_type = st.selectbox("Ticker 2", list(TICKER_MAP.keys()), index=5, key='ticker2_type')
+    if ticker2_type == "CUSTOM":
+        ticker2_custom = st.text_input("Enter Ticker 2 Symbol", "USDINR=X", key='ticker2_custom')
+        ticker2 = ticker2_custom
+    else:
+        ticker2 = TICKER_MAP[ticker2_type]
     
     # Timeframe selection
-    timeframe = st.selectbox(
-        "Timeframe",
-        options=['1m', '5m', '15m', '30m', '1h', '4h', '1d', '1wk', '1mo'],
-        index=6
-    )
+    timeframe = st.selectbox("Timeframe", list(TIMEFRAME_PERIODS.keys()), index=6, key='timeframe')
     
-    # Period selection
-    available_periods = ALLOWED_PERIODS.get(timeframe, ['1mo'])
-    period = st.selectbox(
-        "Period",
-        options=available_periods,
-        index=0
-    )
+    # Period selection (filtered based on timeframe)
+    available_periods = TIMEFRAME_PERIODS[timeframe]
+    period = st.selectbox("Period", available_periods, key='period')
     
-    # Other parameters
-    col3, col4 = st.columns(2)
-    with col3:
-        bins = st.number_input("Number of Bins", min_value=3, max_value=20, value=10)
+    # Number of bins
+    n_bins = st.number_input("Number of Bins", min_value=5, max_value=100, value=20, step=5, key='n_bins')
     
-    with col4:
-        n_candles = st.number_input("Next N Candles", min_value=1, max_value=30, value=15)
+    # Next N candles
+    n_candles = st.number_input("Next N Candles", min_value=1, max_value=50, value=15, step=1, key='n_candles')
+    
+    st.markdown("---")
     
     # Fetch button
-    fetch_button = st.button("🚀 Fetch & Analyze", type="primary", use_container_width=True)
-    
-    # Progress section
-    if fetch_button:
-        progress_bar = st.progress(0)
-        status_text = st.empty()
-
-# Main content
-if fetch_button:
-    # Clear previous data
-    st.session_state.ticker1_data = {}
-    st.session_state.ticker2_data = {}
-    st.session_state.ratio_data = {}
-    st.session_state.all_analysis = {}
-    
-    # Fetch data
-    with st.spinner("Fetching data..."):
-        # Initialize progress
-        progress = 0
-        status_text.text("Starting data fetch...")
-        progress_bar.progress(progress)
+    if st.button("🔄 Fetch & Analyze", type="primary", use_container_width=True):
+        st.session_state.data_fetched = False
+        st.session_state.analysis_results = {}
         
-        # Fetch ticker1 data
-        ticker1_data = platform.fetch_data_with_progress(ticker1, timeframe, period, progress_bar, status_text, progress)
-        progress = 0.4
-        time.sleep(1)
-        
-        # Fetch ticker2 data
-        ticker2_data = platform.fetch_data_with_progress(ticker2, timeframe, period, progress_bar, status_text, progress)
-        progress = 0.8
-        
-        if ticker1_data is not None and ticker2_data is not None:
-            # Align timestamps
-            common_index = ticker1_data.index.intersection(ticker2_data.index)
-            if len(common_index) == 0:
-                st.error("No common timestamps found between the two tickers. Please check timezones.")
-            else:
-                ticker1_data = ticker1_data.loc[common_index]
-                ticker2_data = ticker2_data.loc[common_index]
+        # Validate combination
+        if not validate_timeframe_period(timeframe, period):
+            st.error(f"Invalid combination: {timeframe} with {period}")
+        else:
+            with st.spinner("Fetching and analyzing data..."):
+                progress_bar = st.progress(0)
+                status_text = st.empty()
                 
-                # Calculate ratio
-                ratio_series = ticker1_data['Close'] / ticker2_data['Close']
+                # Fetch data for all timeframes
+                all_results = {}
+                all_timeframes = list(TIMEFRAME_PERIODS.keys())
+                total_steps = len(all_timeframes) * 2 + 2
+                current_step = 0
                 
-                # Store in session state
-                st.session_state.ticker1_data = ticker1_data
-                st.session_state.ticker2_data = ticker2_data
-                st.session_state.ratio_data = ratio_series
-                st.session_state.data_fetched = True
-                st.session_state.current_selections = {
-                    'ticker1': ticker1,
-                    'ticker2': ticker2,
-                    'timeframe': timeframe,
-                    'period': period,
-                    'bins': bins,
-                    'n_candles': n_candles
-                }
+                for tf in all_timeframes:
+                    for prd in TIMEFRAME_PERIODS[tf]:
+                        current_step += 1
+                        progress = current_step / total_steps
+                        progress_bar.progress(progress)
+                        status_text.text(f"Fetching {ticker1_type} - {tf}/{prd}... ({int(progress*100)}%)")
+                        
+                        data1 = fetch_data_with_retry(ticker1, tf, prd)
+                        
+                        current_step += 1
+                        progress = current_step / total_steps
+                        progress_bar.progress(progress)
+                        status_text.text(f"Fetching {ticker2_type} - {tf}/{prd}... ({int(progress*100)}%)")
+                        
+                        data2 = fetch_data_with_retry(ticker2, tf, prd)
+                        
+                        if data1 is not None and data2 is not None:
+                            key = f"{tf}_{prd}"
+                            
+                            # Calculate ratio
+                            ratio_df = calculate_ratio(data1, data2)
+                            
+                            # Calculate future movements
+                            movement_df = calculate_future_movement(data1, n_candles)
+                            
+                            # Calculate RSI divergence
+                            rsi_div = calculate_rsi_divergence(data1, data2)
+                            
+                            all_results[key] = {
+                                'data1': data1,
+                                'data2': data2,
+                                'ratio': ratio_df,
+                                'movement': movement_df,
+                                'rsi_divergence': rsi_div
+                            }
                 
                 progress_bar.progress(1.0)
-                status_text.text("✅ Data fetched and processed successfully!")
-                st.success("Data ready for analysis!")
-        else:
-            st.error("Failed to fetch data. Please check ticker symbols and try again.")
+                status_text.text("Analysis complete! ✅")
+                
+                st.session_state.analysis_results = all_results
+                st.session_state.data_fetched = True
+                time.sleep(1)
+                st.rerun()
 
-# Create tabs if data is fetched
-if st.session_state.data_fetched:
-    # Get data
-    ticker1_data = st.session_state.ticker1_data
-    ticker2_data = st.session_state.ticker2_data
-    ratio_series = st.session_state.ratio_data
-    selections = st.session_state.current_selections
+# Main content area
+if st.session_state.data_fetched and st.session_state.analysis_results:
     
-    tab1, tab2, tab3, tab4 = st.tabs(["📊 Ratio Charts", "🔄 RSI Divergence", "🧪 Backtesting", "📈 Statistics"])
+    # Create tabs
+    tab1, tab2, tab3, tab4 = st.tabs(["📊 Ratio Charts", "📈 RSI Divergence", "🎯 Backtesting", "📉 Statistics"])
     
-    with tab1:
-        st.markdown("<h2 class='sub-header'>Ratio Analysis</h2>", unsafe_allow_html=True)
+    # Get current selection data
+    current_key = f"{timeframe}_{period}"
+    current_data = st.session_state.analysis_results.get(current_key)
+    
+    if current_data:
         
-        # Calculate future movements
-        with st.spinner("Calculating future movements..."):
-            future_movements = platform.calculate_future_movement(ticker1_data, selections['n_candles'])
-        
-        # Display future movements table
-        st.markdown("### 📈 Future Price Movements")
-        
-        table_data = []
-        display_rows = min(20, len(future_movements))
-        
-        for i in range(display_rows):
-            row = {
-                'From DateTime': ticker1_data.index[i].strftime('%Y-%m-%d %H:%M IST'),
-                'Close Price': round(ticker1_data['Close'].iloc[i], 2),
-                'Ratio': round(ratio_series.iloc[i], 6)
-            }
+        # TAB 1: Ratio Charts
+        with tab1:
+            st.header(f"Ratio Analysis: {ticker1_type} / {ticker2_type}")
             
-            # Add future candle movements
-            for j in range(min(selections['n_candles'], 10)):  # Show first 10 candles
-                if j < len(future_movements[i]):
-                    movement = future_movements[i][j]
-                    row[f'Candle {j+1}'] = f"{movement['points']:+} pts ({movement['percent']:+.2f}%)"
+            ratio_df = current_data['ratio']
+            movement_df = current_data['movement']
             
-            table_data.append(row)
-        
-        df_table = pd.DataFrame(table_data)
-        st.dataframe(df_table, use_container_width=True, height=400)
-        
-        # Ratio Bins Analysis
-        st.markdown("### 📊 Ratio Bins Analysis")
-        
-        bin_analysis = platform.analyze_ratio_bins(ratio_series, selections['bins'])
-        
-        if bin_analysis:
-            # Display bins table
-            st.markdown("#### Bins Distribution")
-            
-            bins_html = """
-            <table class='bin-table'>
-                <tr>
-                    <th>Bin Range</th>
-                    <th>Count</th>
-                    <th>Percentage</th>
-                    <th>Historical Impact</th>
-                </tr>
-            """
-            
-            for i in range(len(bin_analysis['bin_ranges'])):
-                bin_range = bin_analysis['bin_ranges'][i]
-                count = bin_analysis['bin_counts'][i]
-                percentage = f"{bin_analysis['bin_percentages'][i]:.1f}%"
+            if not ratio_df.empty:
+                # Display last N bins
+                st.subheader(f"Last {n_bins} Data Points")
+                display_df = movement_df.tail(n_bins).copy()
+                display_df['DateTime'] = display_df['DateTime'].dt.strftime('%Y-%m-%d %H:%M:%S IST')
+                st.dataframe(display_df, use_container_width=True, height=400)
                 
-                # Find historical impact for this bin
-                impact = "Neutral"
-                for hist_impact in bin_analysis['historical_impact']:
-                    if hist_impact['range'] == bin_range:
-                        impact = hist_impact['impact']
-                        break
+                # Analysis summary
+                with st.expander("📋 Analysis Summary & Forecast", expanded=True):
+                    current_ratio = ratio_df['Ratio'].iloc[-1]
+                    max_ratio = ratio_df['Ratio'].max()
+                    min_ratio = ratio_df['Ratio'].min()
+                    mean_ratio = ratio_df['Ratio'].mean()
+                    
+                    col1, col2, col3, col4 = st.columns(4)
+                    col1.metric("Current Ratio", f"{current_ratio:.4f}")
+                    col2.metric("Max Ratio", f"{max_ratio:.4f}")
+                    col3.metric("Min Ratio", f"{min_ratio:.4f}")
+                    col4.metric("Mean Ratio", f"{mean_ratio:.4f}")
+                    
+                    # Calculate movements for forecast
+                    recent_movements = movement_df.tail(20)['Next_1_Pct'].dropna().tolist()
+                    forecast, confidence = get_majority_forecast(recent_movements)
+                    
+                    st.markdown(f"### 🎯 Forecast: **{forecast}** (Confidence: {confidence:.1f}%)")
+                    
+                    # Generate trading recommendation
+                    if forecast == "BULLISH":
+                        entry = current_ratio
+                        sl = entry * 0.98
+                        target1 = entry * 1.02
+                        target2 = entry * 1.04
+                        st.success(f"📈 **Entry**: {entry:.4f} | **SL**: {sl:.4f} | **T1**: {target1:.4f} | **T2**: {target2:.4f}")
+                    elif forecast == "BEARISH":
+                        entry = current_ratio
+                        sl = entry * 1.02
+                        target1 = entry * 0.98
+                        target2 = entry * 0.96
+                        st.error(f"📉 **Entry**: {entry:.4f} | **SL**: {sl:.4f} | **T1**: {target1:.4f} | **T2**: {target2:.4f}")
+                    else:
+                        st.info("↔️ Market showing sideways movement. Wait for clear signal.")
+                    
+                    st.markdown(f"""
+                    **Highlights**: Current ratio at {current_ratio:.4f}, {((current_ratio - mean_ratio)/mean_ratio*100):.1f}% from mean. 
+                    Historical range: {min_ratio:.4f} to {max_ratio:.4f}. Recent momentum suggests {forecast.lower()} bias 
+                    based on {len(recent_movements)} recent candles with {confidence:.0f}% confidence.
+                    """)
                 
-                # Highlight current bin
-                row_class = "class='current-bin'" if i == bin_analysis['current_bin_idx'] else ""
+                # Plot charts for all timeframes
+                st.subheader("📊 Multi-Timeframe Analysis")
+                for key, data in st.session_state.analysis_results.items():
+                    tf, prd = key.split('_')
+                    with st.expander(f"{tf} / {prd}", expanded=(key == current_key)):
+                        fig = create_ratio_chart(data['ratio'], ticker1_type, ticker2_type, f"{tf}/{prd}")
+                        st.plotly_chart(fig, use_container_width=True)
+        
+        # TAB 2: RSI Divergence
+        with tab2:
+            st.header(f"RSI Divergence: {ticker1_type} vs {ticker2_type}")
+            
+            rsi_div = current_data['rsi_divergence']
+            
+            if rsi_div and 'data' in rsi_div:
+                div_df = rsi_div['data']
                 
-                bins_html += f"""
-                <tr {row_class}>
-                    <td>{bin_range}</td>
-                    <td>{count}</td>
-                    <td>{percentage}</td>
-                    <td>{impact}</td>
-                </tr>
-                """
+                # Calculate movements with RSI
+                st.subheader("Price Movement with RSI Analysis")
+                movement_with_rsi = movement_df.tail(n_bins).copy()
+                movement_with_rsi['DateTime'] = movement_with_rsi['DateTime'].dt.strftime('%Y-%m-%d %H:%M:%S IST')
+                st.dataframe(movement_with_rsi, use_container_width=True, height=400)
+                
+                # RSI Divergence analysis
+                with st.expander("📋 RSI Divergence Analysis & Forecast", expanded=True):
+                    current_rsi1 = div_df['Ticker1_RSI'].iloc[-1]
+                    current_rsi2 = div_df['Ticker2_RSI'].iloc[-1]
+                    rsi_diff = current_rsi1 - current_rsi2
+                    
+                    col1, col2, col3 = st.columns(3)
+                    col1.metric(f"{ticker1_type} RSI", f"{current_rsi1:.2f}")
+                    col2.metric(f"{ticker2_type} RSI", f"{current_rsi2:.2f}")
+                    col3.metric("RSI Divergence", f"{rsi_diff:.2f}")
+                    
+                    # Forecast based on RSI
+                    rsi_movements = []
+                    if current_rsi1 < 30:
+                        rsi_movements.extend([1, 1, 1])  # Oversold - bullish
+                    elif current_rsi1 > 70:
+                        rsi_movements.extend([-1, -1, -1])  # Overbought - bearish
+                    
+                    forecast, confidence = get_majority_forecast(rsi_movements + movement_df.tail(15)['Next_1_Pct'].dropna().tolist())
+                    
+                    st.markdown(f"### 🎯 RSI Forecast: **{forecast}** (Confidence: {confidence:.1f}%)")
+                    
+                    st.markdown(f"""
+                    **RSI Analysis**: {ticker1_type} RSI at {current_rsi1:.1f} vs {ticker2_type} at {current_rsi2:.1f}. 
+                    Divergence of {abs(rsi_diff):.1f} points suggests {'strong ' if abs(rsi_diff) > 20 else ''}
+                    {'correlation' if abs(rsi_diff) < 10 else 'divergence'}. Current momentum: {forecast.lower()}.
+                    """)
+                
+                # Plot RSI divergence for all timeframes
+                st.subheader("📈 Multi-Timeframe RSI Analysis")
+                for key, data in st.session_state.analysis_results.items():
+                    tf, prd = key.split('_')
+                    if 'rsi_divergence' in data and data['rsi_divergence']:
+                        with st.expander(f"{tf} / {prd}", expanded=(key == current_key)):
+                            rsi_data = data['rsi_divergence']['data']
+                            
+                            fig = make_subplots(
+                                rows=2, cols=1,
+                                shared_xaxes=True,
+                                subplot_titles=(f'{ticker1_type} Price', 'RSI Comparison'),
+                                row_heights=[0.6, 0.4]
+                            )
+                            
+                            # Price
+                            fig.add_trace(go.Scatter(
+                                x=rsi_data.index, y=rsi_data['Ticker1_Close'],
+                                mode='lines', name=f'{ticker1_type} Price',
+                                line=dict(color='blue', width=2)
+                            ), row=1, col=1)
+                            
+                            # RSI comparison
+                            fig.add_trace(go.Scatter(
+                                x=rsi_data.index, y=rsi_data['Ticker1_RSI'],
+                                mode='lines', name=f'{ticker1_type} RSI',
+                                line=dict(color='green', width=2)
+                            ), row=2, col=1)
+                            
+                            fig.add_trace(go.Scatter(
+                                x=rsi_data.index, y=rsi_data['Ticker2_RSI'],
+                                mode='lines', name=f'{ticker2_type} RSI',
+                                line=dict(color='red', width=2)
+                            ), row=2, col=1)
+                            
+                            fig.add_hline(y=70, line_dash="dash", line_color="red", row=2, col=1, opacity=0.5)
+                            fig.add_hline(y=30, line_dash="dash", line_color="green", row=2, col=1, opacity=0.5)
+                            
+                            fig.update_layout(height=700, title=f'RSI Divergence Analysis - {tf}/{prd}', hovermode='x unified')
+                            st.plotly_chart(fig, use_container_width=True)
+        
+        # TAB 3: Backtesting
+        with tab3:
+            st.header("🎯 Backtesting Results")
             
-            bins_html += "</table>"
-            st.markdown(bins_html, unsafe_allow_html=True)
+            data1 = current_data['data1']
+            ratio_df = current_data['ratio']
             
-            # Current bin info
-            st.markdown(f"""
-            <div class='metric-card'>
-                <h4>📍 Current Ratio Position</h4>
-                <p><strong>Current Ratio:</strong> {bin_analysis['current_ratio']:.6f}</p>
-                <p><strong>Current Bin:</strong> {bin_analysis['current_bin_range']}</p>
-                <p><strong>Percentile:</strong> {bin_analysis['percentile']:.1f}%</p>
-                <p><strong>Distance from Min:</strong> {((bin_analysis['current_ratio'] - bin_analysis['min_value']) / (bin_analysis['max_value'] - bin_analysis['min_value']) * 100):.1f}%</p>
-                <p><strong>Distance from Max:</strong> {((bin_analysis['max_value'] - bin_analysis['current_ratio']) / (bin_analysis['max_value'] - bin_analysis['min_value']) * 100):.1f}%</p>
-            </div>
-            """, unsafe_allow_html=True)
+            # Simple backtesting strategy based on ratio
+            st.subheader(f"Strategy: Ratio Mean Reversion ({timeframe}/{period})")
             
-            # Historical significant levels
-            st.markdown("#### 📜 Historical Significant Levels")
+            backtest_results = []
+            mean_ratio = ratio_df['Ratio'].mean()
+            std_ratio = ratio_df['Ratio'].std()
             
-            if bin_analysis['significant_bins']:
-                for sig_bin in bin_analysis['significant_bins'][:5]:  # Show top 5
-                    st.write(f"**Range:** {sig_bin['range']} - **Frequency:** {sig_bin['count']} candles ({sig_bin['percentage']:.1f}%)")
+            position = None
+            entry_price = 0
+            entry_datetime = None
             
-            # Generate forecast
-            current_price = ticker1_data['Close'].iloc[-1]
-            current_ratio = bin_analysis['current_ratio']
-            ratio_position = (current_ratio - bin_analysis['min_value']) / (bin_analysis['max_value'] - bin_analysis['min_value'])
+            for i in range(1, len(ratio_df)):
+                current_ratio = ratio_df['Ratio'].iloc[i]
+                current_price = ratio_df['Ticker1_Close'].iloc[i]
+                current_datetime = ratio_df.index[i]
+                
+                # Entry logic
+                if position is None:
+                    if current_ratio < mean_ratio - std_ratio:  # Oversold
+                        position = "LONG"
+                        entry_price = current_price
+                        entry_datetime = current_datetime
+                    elif current_ratio > mean_ratio + std_ratio:  # Overbought
+                        position = "SHORT"
+                        entry_price = current_price
+                        entry_datetime = current_datetime
+                
+                # Exit logic
+                elif position == "LONG":
+                    if current_ratio > mean_ratio:
+                        pnl_points = current_price - entry_price
+                        pnl_pct = (pnl_points / entry_price) * 100
+                        backtest_results.append({
+                            'Entry_DateTime': entry_datetime.strftime('%Y-%m-%d %H:%M:%S IST'),
+                            'Exit_DateTime': current_datetime.strftime('%Y-%m-%d %H:%M:%S IST'),
+                            'Position': position,
+                            'Entry_Price': entry_price,
+                            'Exit_Price': current_price,
+                            'SL': entry_price * 0.98,
+                            'Target': entry_price * 1.02,
+                            'PnL_Points': pnl_points,
+                            'PnL_Pct': pnl_pct,
+                            'Reason': 'Ratio reverted to mean'
+                        })
+                        position = None
+                
+                elif position == "SHORT":
+                    if current_ratio < mean_ratio:
+                        pnl_points = entry_price - current_price
+                        pnl_pct = (pnl_points / entry_price) * 100
+                        backtest_results.append({
+                            'Entry_DateTime': entry_datetime.strftime('%Y-%m-%d %H:%M:%S IST'),
+                            'Exit_DateTime': current_datetime.strftime('%Y-%m-%d %H:%M:%S IST'),
+                            'Position': position,
+                            'Entry_Price': entry_price,
+                            'Exit_Price': current_price,
+                            'SL': entry_price * 1.02,
+                            'Target': entry_price * 0.98,
+                            'PnL_Points': pnl_points,
+                            'PnL_Pct': pnl_pct,
+                            'Reason': 'Ratio reverted to mean'
+                        })
+                        position = None
             
-            if ratio_position < 0.25:
-                forecast = "bullish"
-                confidence = 80 - (ratio_position * 100)
-                explanation = "Ratio is in lower historical range (bullish zone). Historically, this level has led to upward movements."
-            elif ratio_position > 0.75:
-                forecast = "bearish"
-                confidence = 80 - ((1 - ratio_position) * 100)
-                explanation = "Ratio is in upper historical range (bearish zone). Historically, this level has led to downward corrections."
+            if backtest_results:
+                results_df = pd.DataFrame(backtest_results)
+                
+                # Summary metrics
+                total_trades = len(results_df)
+                winning_trades = len(results_df[results_df['PnL_Points'] > 0])
+                accuracy = (winning_trades / total_trades) * 100 if total_trades > 0 else 0
+                total_pnl = results_df['PnL_Points'].sum()
+                avg_pnl = results_df['PnL_Points'].mean()
+                
+                col1, col2, col3, col4 = st.columns(4)
+                col1.metric("Total Trades", total_trades)
+                col2.metric("Winning Trades", winning_trades)
+                col3.metric("Accuracy", f"{accuracy:.1f}%")
+                col4.metric("Total PnL", f"{total_pnl:.2f}")
+                
+                st.dataframe(results_df, use_container_width=True, height=500)
+                
+                # Forecast based on backtesting
+                forecast_movements = results_df.tail(10)['PnL_Points'].tolist()
+                forecast, confidence = get_majority_forecast(forecast_movements)
+                st.markdown(f"### 🎯 Backtesting Forecast: **{forecast}** (Confidence: {confidence:.1f}%)")
             else:
-                forecast = "sideways"
-                confidence = 60
-                explanation = "Ratio is in middle range. Expect consolidation with possible breakout based on momentum."
+                st.info("No trades executed in the selected timeframe with current strategy parameters.")
+        
+        # TAB 4: Statistics
+        with tab4:
+            st.header("📉 Statistical Analysis")
             
-            # Calculate trading levels
-            volatility = ticker1_data['Close'].pct_change().std() * 100
-            trading_levels = platform.calculate_trading_levels(current_price, forecast, volatility, ratio_position)
+            data1 = current_data['data1']
             
-            # Display forecast and trading levels
+            # Prepare statistics dataframe
+            stats_df = data1.copy()
+            stats_df['Points_Change'] = stats_df['Close'].diff()
+            stats_df['Pct_Change'] = stats_df['Close'].pct_change() * 100
+            stats_df['Day_of_Week'] = stats_df.index.day_name()
+            stats_df['Hour'] = stats_df.index.hour
+            stats_df['DateTime_IST'] = stats_df.index.strftime('%Y-%m-%d %H:%M:%S IST')
+            
+            # Sort in descending order
+            stats_df_display = stats_df.sort_index(ascending=False).copy()
+            
+            st.subheader(f"Price Movement Analysis ({timeframe}/{period})")
+            
+            # Display table with color coding
+            display_cols = ['DateTime_IST', 'Close', 'Points_Change', 'Pct_Change', 'Day_of_Week']
+            if 'Hour' in stats_df_display.columns and timeframe in ['1m', '5m', '15m', '30m', '1h', '4h']:
+                display_cols.append('Hour')
+            
+            # Style function for dataframe
+            def highlight_changes(val):
+                if pd.isna(val):
+                    return ''
+                try:
+                    color = 'background-color: lightgreen' if float(val) > 0 else 'background-color: lightcoral' if float(val) < 0 else ''
+                    return color
+                except:
+                    return ''
+            
+            styled_df = stats_df_display[display_cols].head(n_bins).style.applymap(
+                highlight_changes, 
+                subset=['Points_Change', 'Pct_Change']
+            )
+            
+            st.dataframe(styled_df, use_container_width=True, height=400)
+            
+            # Statistical summary
+            with st.expander("📊 Statistical Summary", expanded=True):
+                col1, col2, col3, col4 = st.columns(4)
+                
+                col1.metric("Min Points Change", f"{stats_df['Points_Change'].min():.2f}")
+                col2.metric("Max Points Change", f"{stats_df['Points_Change'].max():.2f}")
+                col3.metric("Median Points Change", f"{stats_df['Points_Change'].median():.2f}")
+                col4.metric("Mean Points Change", f"{stats_df['Points_Change'].mean():.2f}")
+                
+                # Day of week analysis
+                st.markdown("### 📅 Day of Week Analysis")
+                day_stats = stats_df.groupby('Day_of_Week').agg({
+                    'Points_Change': ['mean', 'std', 'count'],
+                    'Pct_Change': 'mean'
+                }).round(2)
+                
+                # Reorder days
+                days_order = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday']
+                day_stats = day_stats.reindex([d for d in days_order if d in day_stats.index])
+                
+                st.dataframe(day_stats, use_container_width=True)
+                
+                # Best and worst days
+                best_day = day_stats[('Points_Change', 'mean')].idxmax()
+                worst_day = day_stats[('Points_Change', 'mean')].idxmin()
+                
+                col1, col2 = st.columns(2)
+                col1.success(f"🟢 Best Day: **{best_day}** ({day_stats.loc[best_day, ('Points_Change', 'mean')]:.2f} pts)")
+                col2.error(f"🔴 Worst Day: **{worst_day}** ({day_stats.loc[worst_day, ('Points_Change', 'mean')]:.2f} pts)")
+                
+                # Hour analysis (if intraday)
+                if timeframe in ['1m', '5m', '15m', '30m', '1h', '4h']:
+                    st.markdown("### ⏰ Hourly Analysis")
+                    hour_stats = stats_df.groupby('Hour').agg({
+                        'Points_Change': 'mean',
+                        'Pct_Change': 'mean'
+                    }).round(2)
+                    
+                    st.dataframe(hour_stats, use_container_width=True)
+                    
+                    best_hour = hour_stats['Points_Change'].idxmax()
+                    worst_hour = hour_stats['Points_Change'].idxmin()
+                    
+                    col1, col2 = st.columns(2)
+                    col1.success(f"🟢 Best Hour: **{best_hour}:00** ({hour_stats.loc[best_hour, 'Points_Change']:.2f} pts)")
+                    col2.error(f"🔴 Worst Hour: **{worst_hour}:00** ({hour_stats.loc[worst_hour, 'Points_Change']:.2f} pts)")
+                
+                # Majority forecast
+                all_movements = stats_df['Pct_Change'].dropna().tail(50).tolist()
+                forecast, confidence = get_majority_forecast(all_movements)
+                st.markdown(f"### 🎯 Statistical Forecast: **{forecast}** (Confidence: {confidence:.1f}%)")
+            
+            # Charts
+            st.subheader("📈 Visualizations")
+            
             col1, col2 = st.columns(2)
             
             with col1:
-                forecast_color = "green" if forecast == "bullish" else "red" if forecast == "bearish" else "orange"
-                st.markdown(f"""
-                <div class='forecast-card'>
-                    <h3>🎯 Forecast: <span style='color:{forecast_color}'>{forecast.upper()}</span></h3>
-                    <p><strong>Confidence:</strong> {confidence:.1f}%</p>
-                    <p><strong>Explanation:</strong> {explanation}</p>
-                    <p><strong>Current Ratio Position:</strong> {ratio_position:.1%} from minimum</p>
-                </div>
-                """, unsafe_allow_html=True)
+                # Points change chart
+                fig_points = go.Figure()
+                fig_points.add_trace(go.Scatter(
+                    x=stats_df.index,
+                    y=stats_df['Points_Change'],
+                    mode='lines',
+                    name='Points Change',
+                    line=dict(color='blue', width=1.5),
+                    fill='tozeroy'
+                ))
+                fig_points.update_layout(
+                    title='Points Change Over Time',
+                    xaxis_title='DateTime (IST)',
+                    yaxis_title='Points',
+                    height=400,
+                    hovermode='x unified'
+                )
+                st.plotly_chart(fig_points, use_container_width=True)
             
             with col2:
-                st.markdown(f"""
-                <div class='metric-card'>
-                    <h4>💰 Trading Plan</h4>
-                    <p><strong>Entry:</strong> {trading_levels['entry']}</p>
-                    <p><strong>Stop Loss:</strong> {trading_levels['sl']} (Risk: {trading_levels['points_risk']} pts)</p>
-                    <p><strong>Target 1:</strong> {trading_levels['targets'][0]} (Reward: {trading_levels['points_reward1']} pts)</p>
-                    <p><strong>Target 2:</strong> {trading_levels['targets'][1]} (Reward: {trading_levels['points_reward2']} pts)</p>
-                    <p><strong>Target 3:</strong> {trading_levels['targets'][2]} (Reward: {trading_levels['points_reward3']} pts)</p>
-                    <p><strong>Risk/Reward:</strong> 1:{trading_levels['risk_reward']}</p>
-                </div>
-                """, unsafe_allow_html=True)
-            
-            # Create charts
-            st.markdown("### 📉 Charts")
-            
-            # Price and Ratio Chart
-            fig1 = make_subplots(
-                rows=3, cols=1,
-                subplot_titles=(f'{ticker1} Price', f'{ticker2} Price', f'{ticker1}/{ticker2} Ratio'),
-                vertical_spacing=0.08,
-                row_heights=[0.4, 0.4, 0.2]
-            )
-            
-            # Ticker 1
-            fig1.add_trace(
-                go.Candlestick(
-                    x=ticker1_data.index,
-                    open=ticker1_data['Open'],
-                    high=ticker1_data['High'],
-                    low=ticker1_data['Low'],
-                    close=ticker1_data['Close'],
-                    name=ticker1
-                ),
-                row=1, col=1
-            )
-            
-            # Ticker 2
-            fig1.add_trace(
-                go.Candlestick(
-                    x=ticker2_data.index,
-                    open=ticker2_data['Open'],
-                    high=ticker2_data['High'],
-                    low=ticker2_data['Low'],
-                    close=ticker2_data['Close'],
-                    name=ticker2
-                ),
-                row=2, col=1
-            )
-            
-            # Ratio
-            fig1.add_trace(
-                go.Scatter(
-                    x=ratio_series.index,
-                    y=ratio_series.values,
+                # Percentage change chart
+                fig_pct = go.Figure()
+                fig_pct.add_trace(go.Scatter(
+                    x=stats_df.index,
+                    y=stats_df['Pct_Change'],
                     mode='lines',
-                    name='Ratio',
-                    line=dict(color='purple', width=2)
-                ),
-                row=3, col=1
-            )
-            
-            # Add bin ranges as horizontal lines
-            for edge in bin_analysis['bin_edges']:
-                fig1.add_hline(
-                    y=edge,
-                    line=dict(color='gray', dash='dot', width=1),
-                    row=3, col=1
+                    name='% Change',
+                    line=dict(color='green', width=1.5),
+                    fill='tozeroy'
+                ))
+                fig_pct.update_layout(
+                    title='Percentage Change Over Time',
+                    xaxis_title='DateTime (IST)',
+                    yaxis_title='Percentage (%)',
+                    height=400,
+                    hovermode='x unified'
                 )
+                st.plotly_chart(fig_pct, use_container_width=True)
             
-            # Highlight current bin
-            if bin_analysis['current_bin_idx'] >= 0:
-                lower = bin_analysis['bin_edges'][bin_analysis['current_bin_idx']]
-                upper = bin_analysis['bin_edges'][bin_analysis['current_bin_idx'] + 1]
-                fig1.add_hrect(
-                    y0=lower, y1=upper,
-                    fillcolor="yellow", opacity=0.2,
-                    line_width=0, row=3, col=1
+            # Day of week distribution
+            if not day_stats.empty:
+                fig_day = go.Figure()
+                fig_day.add_trace(go.Bar(
+                    x=day_stats.index,
+                    y=day_stats[('Points_Change', 'mean')],
+                    marker_color=['lightgreen' if x > 0 else 'lightcoral' for x in day_stats[('Points_Change', 'mean')]],
+                    text=day_stats[('Points_Change', 'mean')].round(2),
+                    textposition='auto'
+                ))
+                fig_day.update_layout(
+                    title='Average Points Change by Day of Week',
+                    xaxis_title='Day',
+                    yaxis_title='Average Points Change',
+                    height=400
                 )
-            
-            fig1.update_layout(
-                height=800,
-                showlegend=True,
-                xaxis_rangeslider_visible=False,
-                title_text=f"Price and Ratio Analysis - {timeframe} timeframe"
-            )
-            
-            st.plotly_chart(fig1, use_container_width=True)
-            
-            # Volume charts if available
-            if 'Volume' in ticker1_data.columns and ticker1_data['Volume'].notna().any():
-                fig2 = make_subplots(
-                    rows=2, cols=1,
-                    subplot_titles=(f'{ticker1} Volume', f'{ticker2} Volume')
-                )
-                
-                fig2.add_trace(
-                    go.Bar(
-                        x=ticker1_data.index,
-                        y=ticker1_data['Volume'],
-                        name=f'{ticker1} Volume'
-                    ),
-                    row=1, col=1
-                )
-                
-                if 'Volume' in ticker2_data.columns and ticker2_data['Volume'].notna().any():
-                    fig2.add_trace(
-                        go.Bar(
-                            x=ticker2_data.index,
-                            y=ticker2_data['Volume'],
-                            name=f'{ticker2} Volume'
-                        ),
-                        row=2, col=1
-                    )
-                
-                fig2.update_layout(height=400)
-                st.plotly_chart(fig2, use_container_width=True)
+                st.plotly_chart(fig_day, use_container_width=True)
         
+        # FINAL SUMMARY - Below all tabs
+        st.markdown("---")
+        st.header("🎯 FINAL COMPREHENSIVE FORECAST")
+        
+        # Collect forecasts from all analyses
+        all_forecasts = []
+        
+        # From all timeframes
+        for key, data in st.session_state.analysis_results.items():
+            if 'movement' in data:
+                movements = data['movement']['Next_1_Pct'].dropna().tail(20).tolist()
+                if movements:
+                    forecast, _ = get_majority_forecast(movements)
+                    all_forecasts.append(forecast)
+        
+        # Count forecasts
+        bullish_count = all_forecasts.count("BULLISH")
+        bearish_count = all_forecasts.count("BEARISH")
+        sideways_count = all_forecasts.count("SIDEWAYS")
+        total_count = len(all_forecasts)
+        
+        # Determine final forecast
+        if bullish_count > bearish_count and bullish_count > sideways_count:
+            final_forecast = "BULLISH"
+            final_confidence = (bullish_count / total_count) * 100
+            color = "green"
+        elif bearish_count > bullish_count and bearish_count > sideways_count:
+            final_forecast = "BEARISH"
+            final_confidence = (bearish_count / total_count) * 100
+            color = "red"
         else:
-            st.warning("Insufficient data for bin analysis.")
-    
-    with tab2:
-        st.markdown("<h2 class='sub-header'>RSI Divergence Analysis</h2>", unsafe_allow_html=True)
+            final_forecast = "SIDEWAYS"
+            final_confidence = (sideways_count / total_count) * 100
+            color = "gray"
         
-        # Calculate RSI
-        rsi_period = 14
-        rsi_ticker1 = platform.calculate_rsi(ticker1_data['Close'], rsi_period)
-        rsi_ticker2 = platform.calculate_rsi(ticker2_data['Close'], rsi_period)
-        
-        # Find divergences
-        divergences_t1 = platform.calculate_divergence(ticker1_data['Close'], rsi_ticker1)
-        divergences_t2 = platform.calculate_divergence(ticker2_data['Close'], rsi_ticker2)
-        
-        # Display divergence points
-        col1, col2 = st.columns(2)
+        # Display final forecast
+        col1, col2, col3, col4, col5 = st.columns(5)
         
         with col1:
-            st.markdown(f"#### {ticker1} Divergences")
-            if divergences_t1:
-                df_div1 = pd.DataFrame(divergences_t1, columns=['DateTime', 'Type'])
-                df_div1['DateTime'] = df_div1['DateTime'].dt.strftime('%Y-%m-%d %H:%M IST')
-                st.dataframe(df_div1.tail(10), use_container_width=True)
-            else:
-                st.info("No divergences found")
-        
+            st.metric("Final Forecast", final_forecast)
         with col2:
-            st.markdown(f"#### {ticker2} Divergences")
-            if divergences_t2:
-                df_div2 = pd.DataFrame(divergences_t2, columns=['DateTime', 'Type'])
-                df_div2['DateTime'] = df_div2['DateTime'].dt.strftime('%Y-%m-%d %H:%M IST')
-                st.dataframe(df_div2.tail(10), use_container_width=True)
-            else:
-                st.info("No divergences found")
-        
-        # RSI Chart
-        fig_rsi = make_subplots(
-            rows=2, cols=2,
-            subplot_titles=(
-                f'{ticker1} Price',
-                f'{ticker1} RSI',
-                f'{ticker2} Price',
-                f'{ticker2} RSI'
-            ),
-            vertical_spacing=0.1,
-            horizontal_spacing=0.1
-        )
-        
-        # Ticker 1 Price
-        fig_rsi.add_trace(
-            go.Scatter(
-                x=ticker1_data.index,
-                y=ticker1_data['Close'],
-                mode='lines',
-                name=f'{ticker1} Price',
-                line=dict(color='blue', width=2)
-            ),
-            row=1, col=1
-        )
-        
-        # Ticker 1 RSI
-        fig_rsi.add_trace(
-            go.Scatter(
-                x=rsi_ticker1.index,
-                y=rsi_ticker1.values,
-                mode='lines',
-                name=f'{ticker1} RSI',
-                line=dict(color='orange', width=2)
-            ),
-            row=1, col=2
-        )
-        
-        # Add RSI levels
-        fig_rsi.add_hline(y=70, line_dash="dash", line_color="red", row=1, col=2)
-        fig_rsi.add_hline(y=30, line_dash="dash", line_color="green", row=1, col=2)
-        
-        # Ticker 2 Price
-        fig_rsi.add_trace(
-            go.Scatter(
-                x=ticker2_data.index,
-                y=ticker2_data['Close'],
-                mode='lines',
-                name=f'{ticker2} Price',
-                line=dict(color='green', width=2)
-            ),
-            row=2, col=1
-        )
-        
-        # Ticker 2 RSI
-        fig_rsi.add_trace(
-            go.Scatter(
-                x=rsi_ticker2.index,
-                y=rsi_ticker2.values,
-                mode='lines',
-                name=f'{ticker2} RSI',
-                line=dict(color='red', width=2)
-            ),
-            row=2, col=2
-        )
-        
-        # Add RSI levels
-        fig_rsi.add_hline(y=70, line_dash="dash", line_color="red", row=2, col=2)
-        fig_rsi.add_hline(y=30, line_dash="dash", line_color="green", row=2, col=2)
-        
-        fig_rsi.update_layout(
-            height=800,
-            showlegend=True,
-            title_text="RSI Divergence Analysis"
-        )
-        
-        st.plotly_chart(fig_rsi, use_container_width=True)
-        
-        # Forecast based on RSI
-        current_rsi1 = rsi_ticker1.iloc[-1]
-        current_rsi2 = rsi_ticker2.iloc[-1]
-        
-        if current_rsi1 < 30 and current_rsi2 < 30:
-            rsi_forecast = "bullish"
-            rsi_confidence = 75
-            rsi_explanation = "Both tickers in oversold territory (RSI < 30), suggesting potential upward reversal."
-        elif current_rsi1 > 70 and current_rsi2 > 70:
-            rsi_forecast = "bearish"
-            rsi_confidence = 75
-            rsi_explanation = "Both tickers in overbought territory (RSI > 70), suggesting potential downward correction."
-        elif abs(current_rsi1 - 50) < 10 and abs(current_rsi2 - 50) < 10:
-            rsi_forecast = "sideways"
-            rsi_confidence = 60
-            rsi_explanation = "Both RSIs near 50, indicating neutral momentum and possible consolidation."
-        else:
-            rsi_forecast = "mixed"
-            rsi_confidence = 50
-            rsi_explanation = "Mixed RSI signals between tickers, requiring confirmation from other indicators."
-        
-        st.markdown(f"""
-        <div class='metric-card'>
-            <h4>📊 RSI Analysis</h4>
-            <p><strong>{ticker1} RSI:</strong> {current_rsi1:.1f} ({'Oversold' if current_rsi1 < 30 else 'Overbought' if current_rsi1 > 70 else 'Neutral'})</p>
-            <p><strong>{ticker2} RSI:</strong> {current_rsi2:.1f} ({'Oversold' if current_rsi2 < 30 else 'Overbought' if current_rsi2 > 70 else 'Neutral'})</p>
-            <p><strong>Forecast:</strong> {rsi_forecast.upper()} (Confidence: {rsi_confidence}%)</p>
-            <p><strong>Explanation:</strong> {rsi_explanation}</p>
-        </div>
-        """, unsafe_allow_html=True)
-    
-    with tab3:
-        st.markdown("<h2 class='sub-header'>Backtesting Results</h2>", unsafe_allow_html=True)
-        
-        # Simple backtesting simulation
-        st.info("""
-        **Backtesting Module Under Development**
-        
-        This module will implement:
-        - Historical strategy testing
-        - Entry/Exit signal generation
-        - P&L calculation with commissions
-        - Risk management metrics
-        - Performance statistics
-        """)
-        
-        # Placeholder for future implementation
-        st.write("Coming soon: Complete backtesting engine with walk-forward optimization")
-    
-    with tab4:
-        st.markdown("<h2 class='sub-header'>Statistical Analysis</h2>", unsafe_allow_html=True)
-        
-        # Prepare data for statistics
-        returns = ticker1_data['Close'].pct_change().dropna() * 100
-        returns_abs = abs(returns)
-        
-        # Add day of week
-        ticker1_data['Day'] = ticker1_data.index.day_name()
-        ticker1_data['Hour'] = ticker1_data.index.hour
-        ticker1_data['Return'] = returns
-        ticker1_data['Abs_Return'] = returns_abs
-        
-        # Display statistics
-        col1, col2, col3 = st.columns(3)
-        
-        with col1:
-            st.metric("Mean Return", f"{returns.mean():.2f}%")
-            st.metric("Standard Deviation", f"{returns.std():.2f}%")
-            st.metric("Sharpe Ratio", f"{returns.mean()/returns.std():.2f}" if returns.std() > 0 else "N/A")
-        
-        with col2:
-            st.metric("Min Return", f"{returns.min():.2f}%")
-            st.metric("Max Return", f"{returns.max():.2f}%")
-            st.metric("Win Rate", f"{(returns > 0).sum()/len(returns)*100:.1f}%")
-        
+            st.metric("Confidence", f"{final_confidence:.1f}%")
         with col3:
-            st.metric("Avg Win", f"{returns[returns > 0].mean():.2f}%")
-            st.metric("Avg Loss", f"{returns[returns < 0].mean():.2f}%")
-            st.metric("Profit Factor", f"{-returns[returns > 0].sum()/returns[returns < 0].sum():.2f}" if returns[returns < 0].sum() != 0 else "N/A")
+            st.metric("Bullish Signals", f"{bullish_count}/{total_count}")
+        with col4:
+            st.metric("Bearish Signals", f"{bearish_count}/{total_count}")
+        with col5:
+            st.metric("Sideways Signals", f"{sideways_count}/{total_count}")
         
-        # Day of week analysis
-        st.markdown("#### 📅 Day of Week Analysis")
+        # Visual indicator
+        if final_forecast == "BULLISH":
+            st.success(f"🚀 **STRONG {final_forecast} SIGNAL** - {bullish_count} out of {total_count} timeframes show bullish momentum with {final_confidence:.0f}% confidence.")
+        elif final_forecast == "BEARISH":
+            st.error(f"📉 **STRONG {final_forecast} SIGNAL** - {bearish_count} out of {total_count} timeframes show bearish momentum with {final_confidence:.0f}% confidence.")
+        else:
+            st.info(f"↔️ **{final_forecast} MARKET** - Market consolidating with {final_confidence:.0f}% confidence. Wait for clear directional move.")
         
-        day_stats = ticker1_data.groupby('Day').agg({
-            'Return': ['mean', 'std', 'count'],
-            'Abs_Return': 'mean'
-        }).round(2)
+        # Recommendation
+        st.markdown("### 💡 Trading Recommendation")
+        current_price = current_data['data1']['Close'].iloc[-1]
         
-        day_stats.columns = ['Avg Return %', 'Std Dev %', 'Count', 'Avg Abs Return %']
-        
-        # Reorder days
-        day_order = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday']
-        day_stats = day_stats.reindex([day for day in day_order if day in day_stats.index])
-        
-        st.dataframe(day_stats, use_container_width=True)
-        
-        # Hourly analysis
-        st.markdown("#### ⏰ Hourly Analysis")
-        
-        if timeframe in ['1m', '5m', '15m', '30m', '1h']:
-            hour_stats = ticker1_data.groupby('Hour').agg({
-                'Return': ['mean', 'std', 'count'],
-                'Abs_Return': 'mean'
-            }).round(2)
+        if final_forecast == "BULLISH" and final_confidence > 60:
+            entry = current_price
+            sl = entry * 0.985
+            target1 = entry * 1.015
+            target2 = entry * 1.03
+            risk_reward = (target1 - entry) / (entry - sl)
             
-            hour_stats.columns = ['Avg Return %', 'Std Dev %', 'Count', 'Avg Abs Return %']
-            st.dataframe(hour_stats, use_container_width=True)
+            st.success(f"""
+            **LONG SETUP** ({ticker1_type})
+            - Entry: {entry:.2f}
+            - Stop Loss: {sl:.2f} ({-1.5:.1f}%)
+            - Target 1: {target1:.2f} ({1.5:.1f}%)
+            - Target 2: {target2:.2f} ({3.0:.1f}%)
+            - Risk:Reward = 1:{risk_reward:.1f}
+            """)
         
-        # Create return distribution chart
-        st.markdown("#### 📊 Return Distribution")
+        elif final_forecast == "BEARISH" and final_confidence > 60:
+            entry = current_price
+            sl = entry * 1.015
+            target1 = entry * 0.985
+            target2 = entry * 0.97
+            risk_reward = (entry - target1) / (sl - entry)
+            
+            st.error(f"""
+            **SHORT SETUP** ({ticker1_type})
+            - Entry: {entry:.2f}
+            - Stop Loss: {sl:.2f} ({1.5:.1f}%)
+            - Target 1: {target1:.2f} ({-1.5:.1f}%)
+            - Target 2: {target2:.2f} ({-3.0:.1f}%)
+            - Risk:Reward = 1:{risk_reward:.1f}
+            """)
         
-        fig_dist = go.Figure()
-        fig_dist.add_trace(go.Histogram(
-            x=returns,
-            nbinsx=50,
-            name='Returns',
-            marker_color='#1E88E5'
-        ))
-        
-        fig_dist.update_layout(
-            title="Return Distribution",
-            xaxis_title="Return (%)",
-            yaxis_title="Frequency",
-            height=400
-        )
-        
-        st.plotly_chart(fig_dist, use_container_width=True)
+        else:
+            st.warning(f"""
+            **NO CLEAR SETUP**
+            - Current Price: {current_price:.2f}
+            - Confidence: {final_confidence:.0f}% (below 60% threshold)
+            - Recommendation: Wait for clearer signal or use range-bound strategies
+            """)
+    
+    else:
+        st.warning(f"No data available for {timeframe}/{period}. Please try a different combination.")
 
 else:
     # Welcome screen
-    st.markdown("""
-    <div style='text-align: center; padding: 50px;'>
-        <h2>Welcome to Professional Algo Trading Platform</h2>
-        <p style='font-size: 1.2rem; color: #666; margin-top: 20px;'>
-            Select your instruments, timeframe, and parameters in the sidebar,<br>
-            then click <strong>"Fetch & Analyze"</strong> to begin.
-        </p>
-        <div style='margin-top: 40px; background: #f8f9fa; padding: 20px; border-radius: 10px;'>
-            <h4>📋 Default Settings:</h4>
-            <ul style='text-align: left; display: inline-block;'>
-                <li><strong>Ticker 1:</strong> NIFTY 50 (Indian Index)</li>
-                <li><strong>Ticker 2:</strong> USD/INR (Forex)</li>
-                <li><strong>Timeframe:</strong> 1d (Daily)</li>
-                <li><strong>Period:</strong> 1mo (1 Month)</li>
-                <li><strong>Bins:</strong> 10 (for ratio analysis)</li>
-                <li><strong>Next N Candles:</strong> 15 (for future movement analysis)</li>
-            </ul>
-        </div>
-        <div style='margin-top: 30px;'>
-            <h4>🎯 Features Available:</h4>
-            <div style='display: flex; justify-content: center; gap: 20px; margin-top: 20px;'>
-                <div style='padding: 15px; background: #e3f2fd; border-radius: 8px;'>
-                    <h5>📊 Ratio Charts</h5>
-                    <p>Bin-based ratio analysis</p>
-                </div>
-                <div style='padding: 15px; background: #f3e5f5; border-radius: 8px;'>
-                    <h5>🔄 RSI Divergence</h5>
-                    <p>Momentum analysis</p>
-                </div>
-                <div style='padding: 15px; background: #e8f5e8; border-radius: 8px;'>
-                    <h5>📈 Statistics</h5>
-                    <p>Performance metrics</p>
-                </div>
-            </div>
-        </div>
-    </div>
-    """, unsafe_allow_html=True)
+    st.info("""
+    👋 **Welcome to the Professional AlgoTrading Platform!**
+    
+    **Getting Started:**
+    1. Select your tickers from the sidebar (Default: NIFTY 50 / USDINR)
+    2. Choose timeframe and period (validated combinations only)
+    3. Set number of bins and next N candles to analyze
+    4. Click **Fetch & Analyze** to start
+    
+    **Features:**
+    - 📊 Multi-timeframe ratio analysis
+    - 📈 RSI divergence detection
+    - 🎯 Automated backtesting
+    - 📉 Statistical analysis with day/hour patterns
+    - 🎯 AI-powered forecasting with confidence levels
+    
+    **Note:** Data fetching respects yfinance API rate limits with 1-1.5 second delays between requests.
+    All timestamps are converted to IST (Indian Standard Time) for consistency.
+    """)
+    
+    # Show example combinations
+    with st.expander("📚 Valid Timeframe/Period Combinations"):
+        for tf, periods in TIMEFRAME_PERIODS.items():
+            st.write(f"**{tf}:** {', '.join(periods)}")
+
+# Footer
+st.markdown("---")
+st.markdown("""
+<div style='text-align: center; color: gray; padding: 20px;'>
+    <p><strong>Professional AlgoTrading Platform v1.0</strong></p>
+    <p>⚠️ Disclaimer: This tool is for educational purposes only. Past performance does not guarantee future results. 
+    Always perform your own analysis and risk management before trading.</p>
+</div>
+""", unsafe_allow_html=True)
