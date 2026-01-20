@@ -173,7 +173,71 @@ def calculate_rsi(prices, period=14):
     
     return rsi
 
-def detect_divergence(prices, rsi_values):
+def analyze_signals(data1, data2, n_candles=15):
+    """Analyze all timeframes and provide majority forecast"""
+    signals = {'bullish': 0, 'bearish': 0, 'sideways': 0}
+    
+    ratio = data1['Close'] / data2['Close']
+    current_ratio = ratio.iloc[-1] if len(ratio) > 0 else 0
+    avg_ratio = ratio.mean()
+    
+    rsi1 = calculate_rsi(data1['Close'])
+    rsi2 = calculate_rsi(data2['Close'])
+    
+    # Ratio analysis
+    if current_ratio > avg_ratio * 1.02:
+        signals['bearish'] += 1
+    elif current_ratio < avg_ratio * 0.98:
+        signals['bullish'] += 1
+    else:
+        signals['sideways'] += 1
+    
+    # RSI analysis
+    if len(rsi1) > 0 and not pd.isna(rsi1.iloc[-1]):
+        current_rsi1 = rsi1.iloc[-1]
+        if current_rsi1 < 30:
+            signals['bullish'] += 1
+        elif current_rsi1 > 70:
+            signals['bearish'] += 1
+        else:
+            signals['sideways'] += 1
+    
+    # Divergence analysis
+    divergences = detect_divergence(data1['Close'], rsi1)
+    if len(divergences) > 0:
+        latest_div = divergences[-1]
+        if latest_div['type'] == 'bullish':
+            signals['bullish'] += 1
+        else:
+            signals['bearish'] += 1
+    
+    # Price momentum
+    recent_changes = data1['Close'].pct_change().tail(5).mean()
+    if recent_changes > 0.001:
+        signals['bullish'] += 1
+    elif recent_changes < -0.001:
+        signals['bearish'] += 1
+    else:
+        signals['sideways'] += 1
+    
+    return signals
+
+def get_majority_forecast(signals):
+    """Generate forecast based on majority signals"""
+    total = sum(signals.values())
+    if total == 0:
+        return "Insufficient data for forecast", 0
+    
+    max_signal = max(signals, key=signals.get)
+    confidence = (signals[max_signal] / total) * 100
+    
+    forecast_map = {
+        'bullish': '📈 BULLISH - Expect upward movement',
+        'bearish': '📉 BEARISH - Expect downward movement',
+        'sideways': '↔️ SIDEWAYS - Expect range-bound movement'
+    }
+    
+    return forecast_map[max_signal], confidence
     """Detect RSI divergence patterns"""
     divergences = []
     lookback = 5
@@ -376,6 +440,7 @@ with st.sidebar:
                     all_data = {}
                     
                     progress_bar = st.progress(0)
+                    status_text = st.empty()
                     total_combinations = sum(len(periods) for periods in TIMEFRAME_PERIODS.values())
                     current = 0
                     
@@ -383,6 +448,9 @@ with st.sidebar:
                         all_data[tf] = {}
                         for p in periods:
                             try:
+                                progress_pct = int((current / total_combinations) * 100)
+                                status_text.text(f'⏳ Fetching data: {progress_pct}% | Timeframe: {tf} | Period: {p}')
+                                
                                 d1 = fetch_yfinance_data(ticker1, tf, p)
                                 d2 = fetch_yfinance_data(ticker2, tf, p)
                                 
@@ -391,13 +459,15 @@ with st.sidebar:
                                         'data1': d1,
                                         'data2': d2
                                     }
-                            except:
+                            except Exception as e:
+                                st.warning(f'⚠️ Failed to fetch {tf}/{p}: {str(e)}')
                                 pass
                             
                             current += 1
                             progress_bar.progress(current / total_combinations)
                     
                     progress_bar.empty()
+                    status_text.empty()
                     
                     # Store in session state
                     st.session_state.data_fetched = True
@@ -433,12 +503,16 @@ if st.session_state.data_fetched:
         data1 = data['data1']
         data2 = data['data2']
         
-        # Calculate ratio
-        ratio = data1['Close'] / data2['Close']
-        current_ratio = ratio.iloc[-1]
-        min_ratio = ratio.min()
-        max_ratio = ratio.max()
-        avg_ratio = ratio.mean()
+        # Calculate ratio safely
+        try:
+            ratio = data1['Close'] / data2['Close']
+            current_ratio = float(ratio.iloc[-1])
+            min_ratio = float(ratio.min())
+            max_ratio = float(ratio.max())
+            avg_ratio = float(ratio.mean())
+        except Exception as e:
+            st.error(f"Error calculating ratio: {e}")
+            current_ratio = min_ratio = max_ratio = avg_ratio = 0.0
         
         # Metrics
         col1, col2, col3, col4 = st.columns(4)
@@ -507,6 +581,36 @@ if st.session_state.data_fetched:
         """
         
         st.markdown(f'<div class="info-box">{summary_text}</div>', unsafe_allow_html=True)
+        
+        # Multi-timeframe majority forecast
+        st.subheader('🎯 Multi-Timeframe Forecast')
+        
+        all_signals = {'bullish': 0, 'bearish': 0, 'sideways': 0}
+        
+        for tf, periods_data in data['all_data'].items():
+            for p, tf_data in periods_data.items():
+                signals = analyze_signals(tf_data['data1'], tf_data['data2'], data['n_candles'])
+                all_signals['bullish'] += signals['bullish']
+                all_signals['bearish'] += signals['bearish']
+                all_signals['sideways'] += signals['sideways']
+        
+        forecast_text, confidence = get_majority_forecast(all_signals)
+        
+        forecast_box = f"""
+        ### Final Forecast (All Timeframes)
+        
+        **Signal Distribution:**
+        - 📈 Bullish Signals: {all_signals['bullish']}
+        - 📉 Bearish Signals: {all_signals['bearish']}
+        - ↔️ Sideways Signals: {all_signals['sideways']}
+        
+        **Forecast:** {forecast_text}  
+        **Confidence:** {confidence:.1f}%
+        
+        Based on analysis across all {len(data['all_data'])} timeframes and their respective periods.
+        """
+        
+        st.markdown(f'<div class="metric-card" style="color: white;">{forecast_box}</div>', unsafe_allow_html=True)
         
         # Plot charts for all timeframes
         st.subheader('📊 Multi-Timeframe Analysis')
@@ -581,6 +685,36 @@ if st.session_state.data_fetched:
         """
         
         st.markdown(f'<div class="warning-box">{divergence_text}</div>', unsafe_allow_html=True)
+        
+        # Multi-timeframe majority forecast for RSI
+        st.subheader('🎯 Multi-Timeframe RSI Forecast')
+        
+        all_signals_rsi = {'bullish': 0, 'bearish': 0, 'sideways': 0}
+        
+        for tf, periods_data in data['all_data'].items():
+            for p, tf_data in periods_data.items():
+                signals = analyze_signals(tf_data['data1'], tf_data['data2'], data['n_candles'])
+                all_signals_rsi['bullish'] += signals['bullish']
+                all_signals_rsi['bearish'] += signals['bearish']
+                all_signals_rsi['sideways'] += signals['sideways']
+        
+        forecast_text_rsi, confidence_rsi = get_majority_forecast(all_signals_rsi)
+        
+        forecast_box_rsi = f"""
+        ### Final RSI Divergence Forecast
+        
+        **Signal Distribution:**
+        - 📈 Bullish Signals: {all_signals_rsi['bullish']}
+        - 📉 Bearish Signals: {all_signals_rsi['bearish']}
+        - ↔️ Sideways Signals: {all_signals_rsi['sideways']}
+        
+        **Forecast:** {forecast_text_rsi}  
+        **Confidence:** {confidence_rsi:.1f}%
+        
+        RSI divergence analysis suggests {forecast_text_rsi.split('-')[1].strip().lower()} with {confidence_rsi:.1f}% confidence.
+        """
+        
+        st.markdown(f'<div class="metric-card" style="color: white;">{forecast_box_rsi}</div>', unsafe_allow_html=True)
         
         # Plot RSI divergence for all timeframes
         st.subheader('📊 RSI Divergence Charts - All Timeframes')
@@ -730,6 +864,50 @@ if st.session_state.data_fetched:
         )
         
         st.plotly_chart(fig_pnl, use_container_width=True)
+        
+        # Multi-timeframe backtest forecast
+        st.subheader('🎯 Backtesting Strategy Forecast')
+        
+        # Analyze based on backtest results
+        bt_signals = {'bullish': 0, 'bearish': 0, 'sideways': 0}
+        
+        if total_points > 50:
+            bt_signals['bullish'] += 3
+        elif total_points < -50:
+            bt_signals['bearish'] += 3
+        else:
+            bt_signals['sideways'] += 2
+        
+        if accuracy > 60:
+            bt_signals['bullish'] += 2
+        elif accuracy < 40:
+            bt_signals['bearish'] += 1
+        else:
+            bt_signals['sideways'] += 1
+        
+        if risk_reward > 1.5:
+            bt_signals['bullish'] += 2
+        elif risk_reward < 1:
+            bt_signals['bearish'] += 1
+        
+        forecast_text_bt, confidence_bt = get_majority_forecast(bt_signals)
+        
+        forecast_box_bt = f"""
+        ### Final Backtesting Forecast
+        
+        **Strategy Performance Signals:**
+        - 📈 Bullish Signals: {bt_signals['bullish']}
+        - 📉 Bearish Signals: {bt_signals['bearish']}
+        - ↔️ Sideways Signals: {bt_signals['sideways']}
+        
+        **Forecast:** {forecast_text_bt}  
+        **Confidence:** {confidence_bt:.1f}%
+        
+        Strategy shows {accuracy:.1f}% accuracy with {total_points} total points. 
+        Risk-reward ratio of {risk_reward:.2f}:1 indicates {'strong' if risk_reward > 1.5 else 'moderate' if risk_reward > 1 else 'weak'} setup.
+        """
+        
+        st.markdown(f'<div class="metric-card" style="color: white;">{forecast_box_bt}</div>', unsafe_allow_html=True)
     
     # TAB 4: Statistics
     with tab4:
@@ -909,6 +1087,64 @@ if st.session_state.data_fetched:
                 'Std Dev': '{:.2f}',
                 'Count': '{:.0f}'
             }), use_container_width=True)
+        
+        # Multi-timeframe statistical forecast
+        st.subheader('🎯 Statistical Analysis Forecast')
+        
+        stat_signals = {'bullish': 0, 'bearish': 0, 'sideways': 0}
+        
+        # Analyze recent trend
+        recent_avg = data1_stats.tail(10)['Price_Change'].mean()
+        if recent_avg > 0:
+            stat_signals['bullish'] += 2
+        elif recent_avg < 0:
+            stat_signals['bearish'] += 2
+        else:
+            stat_signals['sideways'] += 2
+        
+        # Analyze volatility
+        recent_volatility = data1_stats.tail(20)['Price_Change_Pct'].std()
+        overall_volatility = data1_stats['Price_Change_Pct'].std()
+        
+        if recent_volatility < overall_volatility * 0.8:
+            stat_signals['sideways'] += 1
+        elif recent_volatility > overall_volatility * 1.2:
+            # High volatility can lead to either direction
+            if recent_avg > 0:
+                stat_signals['bullish'] += 1
+            else:
+                stat_signals['bearish'] += 1
+        
+        # Day of week pattern
+        current_day = data1_stats.index[-1].day_name()
+        if current_day in day_stats.index:
+            day_avg = day_stats.loc[current_day, 'Avg %']
+            if day_avg > 0.1:
+                stat_signals['bullish'] += 1
+            elif day_avg < -0.1:
+                stat_signals['bearish'] += 1
+            else:
+                stat_signals['sideways'] += 1
+        
+        forecast_text_stat, confidence_stat = get_majority_forecast(stat_signals)
+        
+        forecast_box_stat = f"""
+        ### Final Statistical Forecast
+        
+        **Statistical Signals:**
+        - 📈 Bullish Signals: {stat_signals['bullish']}
+        - 📉 Bearish Signals: {stat_signals['bearish']}
+        - ↔️ Sideways Signals: {stat_signals['sideways']}
+        
+        **Forecast:** {forecast_text_stat}  
+        **Confidence:** {confidence_stat:.1f}%
+        
+        Recent 10-period average change: {recent_avg:.2f} points. 
+        Current volatility: {recent_volatility:.2f}% vs overall {overall_volatility:.2f}%.
+        {current_day} historically shows {day_avg if current_day in day_stats.index else 'neutral':.2f}% average movement.
+        """
+        
+        st.markdown(f'<div class="metric-card" style="color: white;">{forecast_box_stat}</div>', unsafe_allow_html=True)
         
         # Volume analysis (if available)
         if 'Volume' in data1.columns and data1['Volume'].sum() > 0:
