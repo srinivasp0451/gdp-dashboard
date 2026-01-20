@@ -88,7 +88,84 @@ TIMEFRAME_PERIODS = {
     '1mo': ['1y', '2y', '5y', '10y', '20y', '30y']
 }
 
-def convert_to_ist(df):
+def align_dataframes(df1, df2):
+    """Align two dataframes by their indices (datetime) using inner join"""
+    try:
+        # Ensure both have datetime index
+        if not isinstance(df1.index, pd.DatetimeIndex):
+            df1.index = pd.to_datetime(df1.index)
+        if not isinstance(df2.index, pd.DatetimeIndex):
+            df2.index = pd.to_datetime(df2.index)
+        
+        # Convert both to same timezone (IST)
+        df1 = convert_to_ist(df1)
+        df2 = convert_to_ist(df2)
+        
+        # Remove timezone info for alignment (keep IST times but make tz-naive)
+        df1.index = df1.index.tz_localize(None)
+        df2.index = df2.index.tz_localize(None)
+        
+        # Find common timestamps using inner join
+        common_index = df1.index.intersection(df2.index)
+        
+        if len(common_index) == 0:
+            st.warning("⚠️ No overlapping timestamps found. Using nearest timestamp alignment.")
+            # Use merge_asof for nearest timestamp matching
+            df1_reset = df1.reset_index()
+            df2_reset = df2.reset_index()
+            df1_reset.columns = ['timestamp'] + [f'df1_{col}' for col in df1.columns]
+            df2_reset.columns = ['timestamp'] + [f'df2_{col}' for col in df2.columns]
+            
+            merged = pd.merge_asof(
+                df1_reset.sort_values('timestamp'),
+                df2_reset.sort_values('timestamp'),
+                on='timestamp',
+                direction='nearest',
+                tolerance=pd.Timedelta('1H')
+            )
+            
+            if merged.empty:
+                return None, None
+            
+            merged = merged.set_index('timestamp')
+            df1_aligned = merged[[col for col in merged.columns if col.startswith('df1_')]]
+            df2_aligned = merged[[col for col in merged.columns if col.startswith('df2_')]]
+            
+            df1_aligned.columns = [col.replace('df1_', '') for col in df1_aligned.columns]
+            df2_aligned.columns = [col.replace('df2_', '') for col in df2_aligned.columns]
+            
+            return df1_aligned, df2_aligned
+        
+        # Use common timestamps
+        df1_aligned = df1.loc[common_index]
+        df2_aligned = df2.loc[common_index]
+        
+        return df1_aligned, df2_aligned
+        
+    except Exception as e:
+        st.error(f"Error aligning dataframes: {e}")
+        return None, None
+
+def calculate_ratio_safe(data1, data2):
+    """Safely calculate ratio between two price series"""
+    try:
+        # Align dataframes first
+        data1_aligned, data2_aligned = align_dataframes(data1, data2)
+        
+        if data1_aligned is None or data2_aligned is None:
+            return None
+        
+        if len(data1_aligned) == 0 or len(data2_aligned) == 0:
+            return None
+        
+        # Calculate ratio on aligned data
+        ratio = data1_aligned['Close'] / data2_aligned['Close']
+        
+        return ratio, data1_aligned, data2_aligned
+        
+    except Exception as e:
+        st.error(f"Error calculating ratio: {e}")
+        return None
     """Convert dataframe index to IST timezone"""
     try:
         if df.index.tz is None:
@@ -177,48 +254,58 @@ def analyze_signals(data1, data2, n_candles=15):
     """Analyze all timeframes and provide majority forecast"""
     signals = {'bullish': 0, 'bearish': 0, 'sideways': 0}
     
-    ratio = data1['Close'] / data2['Close']
-    current_ratio = ratio.iloc[-1] if len(ratio) > 0 else 0
-    avg_ratio = ratio.mean()
-    
-    rsi1 = calculate_rsi(data1['Close'])
-    rsi2 = calculate_rsi(data2['Close'])
-    
-    # Ratio analysis
-    if current_ratio > avg_ratio * 1.02:
-        signals['bearish'] += 1
-    elif current_ratio < avg_ratio * 0.98:
-        signals['bullish'] += 1
-    else:
-        signals['sideways'] += 1
-    
-    # RSI analysis
-    if len(rsi1) > 0 and not pd.isna(rsi1.iloc[-1]):
-        current_rsi1 = rsi1.iloc[-1]
-        if current_rsi1 < 30:
+    try:
+        # Ensure dataframes are aligned
+        data1_aligned, data2_aligned = align_dataframes(data1, data2)
+        
+        if data1_aligned is None or data2_aligned is None:
+            return signals
+        
+        ratio = data1_aligned['Close'] / data2_aligned['Close']
+        current_ratio = ratio.iloc[-1] if len(ratio) > 0 else 0
+        avg_ratio = ratio.mean()
+        
+        rsi1 = calculate_rsi(data1_aligned['Close'])
+        rsi2 = calculate_rsi(data2_aligned['Close'])
+        
+        # Ratio analysis
+        if current_ratio > avg_ratio * 1.02:
+            signals['bearish'] += 1
+        elif current_ratio < avg_ratio * 0.98:
             signals['bullish'] += 1
-        elif current_rsi1 > 70:
+        else:
+            signals['sideways'] += 1
+        
+        # RSI analysis
+        if len(rsi1) > 0 and not pd.isna(rsi1.iloc[-1]):
+            current_rsi1 = rsi1.iloc[-1]
+            if current_rsi1 < 30:
+                signals['bullish'] += 1
+            elif current_rsi1 > 70:
+                signals['bearish'] += 1
+            else:
+                signals['sideways'] += 1
+        
+        # Divergence analysis
+        divergences = detect_divergence(data1_aligned['Close'], rsi1)
+        if len(divergences) > 0:
+            latest_div = divergences[-1]
+            if latest_div['type'] == 'bullish':
+                signals['bullish'] += 1
+            else:
+                signals['bearish'] += 1
+        
+        # Price momentum
+        recent_changes = data1_aligned['Close'].pct_change().tail(5).mean()
+        if recent_changes > 0.001:
+            signals['bullish'] += 1
+        elif recent_changes < -0.001:
             signals['bearish'] += 1
         else:
             signals['sideways'] += 1
     
-    # Divergence analysis
-    divergences = detect_divergence(data1['Close'], rsi1)
-    if len(divergences) > 0:
-        latest_div = divergences[-1]
-        if latest_div['type'] == 'bullish':
-            signals['bullish'] += 1
-        else:
-            signals['bearish'] += 1
-    
-    # Price momentum
-    recent_changes = data1['Close'].pct_change().tail(5).mean()
-    if recent_changes > 0.001:
-        signals['bullish'] += 1
-    elif recent_changes < -0.001:
-        signals['bearish'] += 1
-    else:
-        signals['sideways'] += 1
+    except Exception as e:
+        st.warning(f"Error in signal analysis: {e}")
     
     return signals
 
@@ -294,60 +381,71 @@ def calculate_future_movements(data, n_candles):
 
 def plot_ratio_charts(data1, data2, ticker1_name, ticker2_name):
     """Create ratio analysis charts"""
-    ratio = data1['Close'] / data2['Close']
-    
-    fig = make_subplots(
-        rows=4, cols=1,
-        shared_xaxes=True,
-        vertical_spacing=0.05,
-        subplot_titles=(
-            f'{ticker1_name} Price',
-            f'{ticker2_name} Price',
-            f'{ticker1_name}/{ticker2_name} Ratio',
-            'RSI Comparison'
-        ),
-        row_heights=[0.25, 0.25, 0.25, 0.25]
-    )
-    
-    # Ticker 1 price
-    fig.add_trace(
-        go.Scatter(x=data1.index, y=data1['Close'], name=ticker1_name, line=dict(color='blue')),
-        row=1, col=1
-    )
-    
-    # Ticker 2 price
-    fig.add_trace(
-        go.Scatter(x=data2.index, y=data2['Close'], name=ticker2_name, line=dict(color='green')),
-        row=2, col=1
-    )
-    
-    # Ratio
-    fig.add_trace(
-        go.Scatter(x=ratio.index, y=ratio.values, name='Ratio', line=dict(color='orange')),
-        row=3, col=1
-    )
-    
-    # RSI
-    rsi1 = calculate_rsi(data1['Close'])
-    rsi2 = calculate_rsi(data2['Close'])
-    
-    fig.add_trace(
-        go.Scatter(x=rsi1.index, y=rsi1.values, name=f'RSI {ticker1_name}', line=dict(color='blue')),
-        row=4, col=1
-    )
-    fig.add_trace(
-        go.Scatter(x=rsi2.index, y=rsi2.values, name=f'RSI {ticker2_name}', line=dict(color='green')),
-        row=4, col=1
-    )
-    
-    # Add RSI reference lines
-    fig.add_hline(y=70, line_dash="dash", line_color="red", row=4, col=1)
-    fig.add_hline(y=30, line_dash="dash", line_color="green", row=4, col=1)
-    
-    fig.update_layout(height=1000, showlegend=True)
-    fig.update_xaxes(title_text="Date", row=4, col=1)
-    
-    return fig
+    try:
+        # Ensure data is aligned
+        data1_aligned, data2_aligned = align_dataframes(data1, data2)
+        
+        if data1_aligned is None or data2_aligned is None:
+            st.error("Cannot create charts - data alignment failed")
+            return None
+        
+        ratio = data1_aligned['Close'] / data2_aligned['Close']
+        
+        fig = make_subplots(
+            rows=4, cols=1,
+            shared_xaxes=True,
+            vertical_spacing=0.05,
+            subplot_titles=(
+                f'{ticker1_name} Price',
+                f'{ticker2_name} Price',
+                f'{ticker1_name}/{ticker2_name} Ratio',
+                'RSI Comparison'
+            ),
+            row_heights=[0.25, 0.25, 0.25, 0.25]
+        )
+        
+        # Ticker 1 price
+        fig.add_trace(
+            go.Scatter(x=data1_aligned.index, y=data1_aligned['Close'], name=ticker1_name, line=dict(color='blue')),
+            row=1, col=1
+        )
+        
+        # Ticker 2 price
+        fig.add_trace(
+            go.Scatter(x=data2_aligned.index, y=data2_aligned['Close'], name=ticker2_name, line=dict(color='green')),
+            row=2, col=1
+        )
+        
+        # Ratio
+        fig.add_trace(
+            go.Scatter(x=ratio.index, y=ratio.values, name='Ratio', line=dict(color='orange')),
+            row=3, col=1
+        )
+        
+        # RSI
+        rsi1 = calculate_rsi(data1_aligned['Close'])
+        rsi2 = calculate_rsi(data2_aligned['Close'])
+        
+        fig.add_trace(
+            go.Scatter(x=rsi1.index, y=rsi1.values, name=f'RSI {ticker1_name}', line=dict(color='blue')),
+            row=4, col=1
+        )
+        fig.add_trace(
+            go.Scatter(x=rsi2.index, y=rsi2.values, name=f'RSI {ticker2_name}', line=dict(color='green')),
+            row=4, col=1
+        )
+        
+        # Add RSI reference lines
+        fig.add_hline(y=70, line_dash="dash", line_color="red", row=4, col=1)
+        fig.add_hline(y=30, line_dash="dash", line_color="green", row=4, col=1)
+        
+        fig.update_layout(height=1000, showlegend=True)
+        fig.update_xaxes(title_text="Date", row=4, col=1)
+        
+        return fig
+    except Exception as e:
+        st.error(f"Error creating ratio charts: {e}")
+        return None
 
 def plot_rsi_divergence(data, ticker_name, divergences):
     """Create RSI divergence charts"""
@@ -395,14 +493,18 @@ with st.sidebar:
     st.header("⚙️ Configuration")
     
     # Ticker 1
-    ticker1_option = st.selectbox('Select Ticker 1', list(TICKERS.keys()), key='ticker1_select')
+    ticker1_option = st.selectbox('Select Ticker 1', list(TICKERS.keys()), 
+                                  index=list(TICKERS.keys()).index('NIFTY 50'),
+                                  key='ticker1_select')
     if ticker1_option == 'Custom':
         ticker1 = st.text_input('Enter Custom Ticker 1', key='custom_ticker1')
     else:
         ticker1 = TICKERS[ticker1_option]
     
     # Ticker 2
-    ticker2_option = st.selectbox('Select Ticker 2', list(TICKERS.keys()), key='ticker2_select')
+    ticker2_option = st.selectbox('Select Ticker 2', list(TICKERS.keys()),
+                                  index=list(TICKERS.keys()).index('USD/INR'),
+                                  key='ticker2_select')
     if ticker2_option == 'Custom':
         ticker2 = st.text_input('Enter Custom Ticker 2', key='custom_ticker2')
     else:
@@ -432,42 +534,58 @@ with st.sidebar:
         else:
             with st.spinner('Fetching data from yfinance... Please wait...'):
                 # Fetch data for selected timeframe/period
-                data1 = fetch_yfinance_data(ticker1, timeframe, period)
-                data2 = fetch_yfinance_data(ticker2, timeframe, period)
+                data1_raw = fetch_yfinance_data(ticker1, timeframe, period)
+                data2_raw = fetch_yfinance_data(ticker2, timeframe, period)
                 
-                if data1 is not None and data2 is not None:
-                    # Fetch all timeframes and periods
-                    all_data = {}
-                    
-                    progress_bar = st.progress(0)
+                if data1_raw is not None and data2_raw is not None:
+                    # Align the dataframes
                     status_text = st.empty()
-                    total_combinations = sum(len(periods) for periods in TIMEFRAME_PERIODS.values())
-                    current = 0
+                    status_text.text('⏳ Aligning timestamps across different timezones...')
                     
-                    for tf, periods in TIMEFRAME_PERIODS.items():
-                        all_data[tf] = {}
-                        for p in periods:
-                            try:
-                                progress_pct = int((current / total_combinations) * 100)
-                                status_text.text(f'⏳ Fetching data: {progress_pct}% | Timeframe: {tf} | Period: {p}')
-                                
-                                d1 = fetch_yfinance_data(ticker1, tf, p)
-                                d2 = fetch_yfinance_data(ticker2, tf, p)
-                                
-                                if d1 is not None and d2 is not None:
-                                    all_data[tf][p] = {
-                                        'data1': d1,
-                                        'data2': d2
-                                    }
-                            except Exception as e:
-                                st.warning(f'⚠️ Failed to fetch {tf}/{p}: {str(e)}')
-                                pass
-                            
-                            current += 1
-                            progress_bar.progress(current / total_combinations)
+                    data1, data2 = align_dataframes(data1_raw, data2_raw)
                     
-                    progress_bar.empty()
-                    status_text.empty()
+                    if data1 is None or data2 is None or len(data1) == 0 or len(data2) == 0:
+                        st.error('Failed to align data. Tickers may have incompatible timeframes or no overlapping data.')
+                        status_text.empty()
+                    else:
+                        status_text.empty()
+                        
+                        # Fetch all timeframes and periods
+                        all_data = {}
+                        
+                        progress_bar = st.progress(0)
+                        status_text = st.empty()
+                        total_combinations = sum(len(periods) for periods in TIMEFRAME_PERIODS.values())
+                        current = 0
+                        
+                        for tf, periods in TIMEFRAME_PERIODS.items():
+                            all_data[tf] = {}
+                            for p in periods:
+                                try:
+                                    progress_pct = int((current / total_combinations) * 100)
+                                    status_text.text(f'⏳ Fetching data: {progress_pct}% | Timeframe: {tf} | Period: {p}')
+                                    
+                                    d1_raw = fetch_yfinance_data(ticker1, tf, p)
+                                    d2_raw = fetch_yfinance_data(ticker2, tf, p)
+                                    
+                                    if d1_raw is not None and d2_raw is not None:
+                                        # Align each timeframe/period pair
+                                        d1, d2 = align_dataframes(d1_raw, d2_raw)
+                                        
+                                        if d1 is not None and d2 is not None and len(d1) > 0 and len(d2) > 0:
+                                            all_data[tf][p] = {
+                                                'data1': d1,
+                                                'data2': d2
+                                            }
+                                except Exception as e:
+                                    st.warning(f'⚠️ Failed to fetch {tf}/{p}: {str(e)}')
+                                    pass
+                                
+                                current += 1
+                                progress_bar.progress(current / total_combinations)
+                        
+                        progress_bar.empty()
+                        status_text.empty()
                     
                     # Store in session state
                     st.session_state.data_fetched = True
@@ -485,7 +603,7 @@ with st.sidebar:
                         'all_data': all_data
                     }
                     
-                    st.success('✅ Data fetched successfully!')
+                        st.success('✅ Data fetched successfully!')
                 else:
                     st.error('Failed to fetch data. Please check ticker symbols and try again.')
 
@@ -502,6 +620,9 @@ if st.session_state.data_fetched:
         
         data1 = data['data1']
         data2 = data['data2']
+        
+        # Display alignment info
+        st.info(f'📊 Data aligned: {len(data1)} timestamps | From {data1.index[0].strftime("%Y-%m-%d %H:%M")} to {data1.index[-1].strftime("%Y-%m-%d %H:%M")} IST')
         
         # Calculate ratio safely
         try:
@@ -532,11 +653,17 @@ if st.session_state.data_fetched:
         st.subheader(f'Last {data["bins"]} Data Points with Future Movements')
         
         display_data = data1.tail(data['bins']).copy()
-        display_data['Ratio'] = ratio.tail(data['bins'])
+        ratio_tail = ratio.tail(data['bins'])
+        
+        # Safely assign ratio column
+        if isinstance(ratio_tail, pd.Series):
+            display_data.loc[:, 'Ratio'] = ratio_tail.values
+        else:
+            display_data.loc[:, 'Ratio'] = ratio_tail
         
         # Add movement columns
         for col in movements_df.columns:
-            display_data[col] = movements_df[col].tail(data['bins']).values
+            display_data.loc[:, col] = movements_df[col].tail(data['bins']).values
         
         # Format datetime index
         display_data.index = display_data.index.strftime('%Y-%m-%d %H:%M:%S')
@@ -625,7 +752,8 @@ if st.session_state.data_fetched:
                         data['ticker1_name'],
                         data['ticker2_name']
                     )
-                    st.plotly_chart(fig, use_container_width=True)
+                    if fig is not None:
+                        st.plotly_chart(fig, use_container_width=True)
     
     # TAB 2: RSI Divergence
     with tab2:
