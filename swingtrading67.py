@@ -1,254 +1,505 @@
 import streamlit as st
-import yfinance as yf
 import pandas as pd
 import numpy as np
+import requests
+from datetime import datetime, timedelta
 import plotly.graph_objects as go
-import time
-from datetime import datetime
+from plotly.subplots import make_subplots
+import yfinance as yf
+import warnings
+warnings.filterwarnings('ignore')
 
-# ==========================================
-# 1. CONFIGURATION & STYLING
-# ==========================================
-st.set_page_config(page_title="Zero-Hero Algo Trader Pro", layout="wide", page_icon="⚡")
+# Page configuration
+st.set_page_config(
+    page_title="Options Chain Momentum Predictor",
+    page_icon="📈",
+    layout="wide"
+)
 
+# Title and description
+st.title("📈 Zero to Hero Options Chain Momentum Predictor")
 st.markdown("""
-<style>
-    .metric-container { background-color: #121212; padding: 10px; border-radius: 5px; border: 1px solid #444; }
-    .stButton>button { width: 100%; border-radius: 5px; font-weight: bold; }
-    .buy-signal { color: #00ff00; font-weight: bold; font-size: 20px; animation: blinker 1s linear infinite; }
-    @keyframes blinker { 50% { opacity: 0; } }
-</style>
-""", unsafe_allow_html=True)
+**Predict Big Momentum Moves using Options Chain Analysis**
+- Put-Call Ratio (PCR) Analysis
+- Open Interest Analysis
+- Max Pain Calculation
+- Implied Volatility Analysis
+- Support/Resistance from Options Data
+""")
 
-# ==========================================
-# 2. DHAN API PLACEHOLDER (INTEGRATION READY)
-# ==========================================
-class OrderManager:
-    """
-    Placeholder class for Dhan API integration.
-    Uncomment and fill credentials when ready.
-    """
-    def __init__(self):
-        # self.client_id = "YOUR_CLIENT_ID"
-        # self.access_token = "YOUR_ACCESS_TOKEN"
-        # self.dhan = dhanhq(self.client_id, self.access_token)
-        pass
+# Helper Functions
+def get_nse_option_chain(symbol):
+    """Fetch NSE options data using NSEpy or web scraping"""
+    try:
+        # For demonstration - using mock data structure
+        # In production, use NSEpy or official NSE API
+        st.warning("⚠️ NSE real-time data requires authentication. Using demo structure.")
+        return None
+    except Exception as e:
+        st.error(f"Error fetching NSE data: {e}")
+        return None
 
-    def place_buy_order(self, symbol, quantity, price):
-        st.toast(f"🚀 SIGNAL: Placing BUY Order for {symbol} at {price}", icon="🟢")
-        # try:
-        #     order = self.dhan.place_order(
-        #         security_id=symbol,  # You need to map Symbol to Security ID
-        #         exchange_segment=dhan.NSE_FNO,
-        #         transaction_type=dhan.BUY,
-        #         quantity=quantity,
-        #         order_type=dhan.MARKET,
-        #         product_type=dhan.INTRADAY,
-        #         price=0
-        #     )
-        #     return order
-        # except Exception as e:
-        #     st.error(f"Dhan Order Failed: {e}")
-
-    def place_sell_order(self, symbol, quantity):
-        st.toast(f"🛑 SIGNAL: Placing SELL Order for {symbol}", icon="🔴")
-        # Implementation similar to buy
-
-order_manager = OrderManager()
-
-# ==========================================
-# 3. HELPER FUNCTIONS
-# ==========================================
-@st.cache_data(ttl=60)
-def get_stock_data(ticker):
+def get_yahoo_options(ticker):
+    """Fetch options data from Yahoo Finance"""
     try:
         stock = yf.Ticker(ticker)
-        # fast_info is efficient for single price checks
-        price = stock.fast_info['last_price']
-        return price
+        exp_dates = stock.options
+        
+        if not exp_dates:
+            return None, None
+        
+        # Get nearest expiry
+        exp_date = exp_dates[0]
+        opt_chain = stock.option_chain(exp_date)
+        
+        calls = opt_chain.calls
+        puts = opt_chain.puts
+        
+        return calls, puts, exp_date
+    except Exception as e:
+        st.error(f"Error fetching options data: {e}")
+        return None, None, None
+
+def calculate_pcr(calls, puts):
+    """Calculate Put-Call Ratio"""
+    try:
+        put_oi = puts['openInterest'].sum()
+        call_oi = calls['openInterest'].sum()
+        
+        put_vol = puts['volume'].sum()
+        call_vol = calls['volume'].sum()
+        
+        pcr_oi = put_oi / call_oi if call_oi > 0 else 0
+        pcr_vol = put_vol / call_vol if call_vol > 0 else 0
+        
+        return pcr_oi, pcr_vol
+    except:
+        return 0, 0
+
+def calculate_max_pain(calls, puts):
+    """Calculate Max Pain - price where most options expire worthless"""
+    try:
+        strikes = sorted(set(calls['strike'].tolist() + puts['strike'].tolist()))
+        pain_values = []
+        
+        for strike in strikes:
+            call_pain = calls[calls['strike'] < strike]['openInterest'].sum() * (strike - calls[calls['strike'] < strike]['strike']).sum()
+            put_pain = puts[puts['strike'] > strike]['openInterest'].sum() * (puts[puts['strike'] > strike]['strike'] - strike).sum()
+            total_pain = call_pain + put_pain
+            pain_values.append(total_pain)
+        
+        max_pain_strike = strikes[pain_values.index(min(pain_values))]
+        return max_pain_strike
     except:
         return 0
 
-def get_option_chain_data(ticker, expiry):
-    stock = yf.Ticker(ticker)
-    opt = stock.option_chain(expiry)
-    return opt.calls, opt.puts
+def analyze_oi_buildup(calls, puts, current_price):
+    """Analyze Open Interest buildup for support/resistance"""
+    try:
+        # Call OI analysis
+        calls_sorted = calls.sort_values('openInterest', ascending=False).head(5)
+        puts_sorted = puts.sort_values('openInterest', ascending=False).head(5)
+        
+        # Find strong resistance (high call OI above current price)
+        resistance = calls_sorted[calls_sorted['strike'] > current_price]['strike'].min()
+        
+        # Find strong support (high put OI below current price)
+        support = puts_sorted[puts_sorted['strike'] < current_price]['strike'].max()
+        
+        return support, resistance, calls_sorted, puts_sorted
+    except:
+        return 0, 0, None, None
 
-def calculate_levels(entry_price):
-    """Calculates Zero-Hero Risk Management Levels"""
-    sl = entry_price * 0.70  # 30% Stop Loss (High risk for Zero Hero)
-    target1 = entry_price * 1.50 # 50% Gain
-    target2 = entry_price * 2.00 # 100% Gain (The "Hero" move)
-    return sl, target1, target2
-
-# ==========================================
-# 4. MAIN APPLICATION
-# ==========================================
-st.title("⚡ Zero-Hero Algo Trader Pro")
-
-# Create Tabs
-tab_analysis, tab_live = st.tabs(["🔍 Market Scanner", "🤖 Live Trading Bot"])
-
-# -----------------------------------------------------------------------------
-# TAB 1: MARKET SCANNER (Logic from previous request)
-# -----------------------------------------------------------------------------
-with tab_analysis:
-    st.header("Option Chain Scanner")
-    col1, col2, col3 = st.columns(3)
-    ticker_input = col1.text_input("Ticker Symbol", value="SPY", help="e.g., SPY, AAPL, BTC-USD").upper()
-    budget = col2.number_input("Max Budget ($)", value=2.0)
-    vol_min = col3.number_input("Min Volume", value=500)
-
-    if st.button("Scan Markets"):
-        try:
-            stock = yf.Ticker(ticker_input)
-            spot_price = stock.fast_info['last_price']
-            st.metric("Spot Price", f"{spot_price:.2f}")
-
-            # Get Expirations
-            exps = stock.options
-            if exps:
-                # Default to nearest expiry
-                calls, puts = get_option_chain_data(ticker_input, exps[0])
-                
-                # Zero Hero Logic: Cheap + High Volume
-                # 1. Filter Calls
-                hero_calls = calls[(calls['lastPrice'] <= budget) & (calls['volume'] > vol_min)].copy()
-                hero_calls['HeroScore'] = hero_calls['volume'] / (hero_calls['openInterest'] + 1)
-                hero_calls = hero_calls.sort_values(by='HeroScore', ascending=False)
-                
-                # 2. Filter Puts
-                hero_puts = puts[(puts['lastPrice'] <= budget) & (puts['volume'] > vol_min)].copy()
-                hero_puts['HeroScore'] = hero_puts['volume'] / (hero_puts['openInterest'] + 1)
-                hero_puts = hero_puts.sort_values(by='HeroScore', ascending=False)
-
-                c1, c2 = st.columns(2)
-                with c1:
-                    st.subheader("🚀 Call Candidates")
-                    st.dataframe(hero_calls[['contractSymbol', 'strike', 'lastPrice', 'volume', 'HeroScore']].head(5), hide_index=True)
-                with c2:
-                    st.subheader("🐻 Put Candidates")
-                    st.dataframe(hero_puts[['contractSymbol', 'strike', 'lastPrice', 'volume', 'HeroScore']].head(5), hide_index=True)
-                
-                st.info("Copy the 'contractSymbol' of your chosen option to the Live Trading tab.")
-            else:
-                st.error("No options data found.")
-        except Exception as e:
-            st.error(f"Error scanning: {e}")
-
-# -----------------------------------------------------------------------------
-# TAB 2: LIVE TRADING BOT (New Feature)
-# -----------------------------------------------------------------------------
-with tab_live:
-    st.header("🤖 Live Zero-Hero Monitor")
-    st.caption("Real-time tracking with Rate Limits & Auto-Trade Execution")
-
-    # Inputs
-    col_l1, col_l2, col_l3 = st.columns(3)
-    contract_symbol = col_l1.text_input("Contract Symbol", value="", placeholder="e.g. SPY231117C00440000")
-    refresh_rate = col_l2.slider("Refresh Rate (Seconds)", 1.0, 5.0, 1.5)
-    auto_trade = col_l3.checkbox("Enable Auto-Orders (Dhan)", value=False)
-
-    # Session State for tracking trade status
-    if 'in_trade' not in st.session_state:
-        st.session_state.in_trade = False
-        st.session_state.entry_price = 0.0
-        st.session_state.sl = 0.0
-        st.session_state.target = 0.0
-
-    # Placeholders for live data updates
-    status_ph = st.empty()
-    metric_ph = st.empty()
-    chart_ph = st.empty()
-    log_ph = st.empty()
-
-    # Start Button
-    start_btn = st.button("🔴 START LIVE TRACKING")
+def calculate_momentum_signal(pcr_oi, pcr_vol, max_pain, current_price, support, resistance):
+    """Calculate momentum signal based on multiple factors"""
+    signals = []
+    score = 0
     
-    if start_btn and contract_symbol:
-        price_history = []
+    # PCR Analysis
+    if pcr_oi > 1.2:
+        signals.append("🟢 High PCR (OI): Bullish - More puts than calls")
+        score += 2
+    elif pcr_oi < 0.8:
+        signals.append("🔴 Low PCR (OI): Bearish - More calls than puts")
+        score -= 2
+    else:
+        signals.append("🟡 Neutral PCR (OI)")
+    
+    # Max Pain Analysis
+    if current_price < max_pain * 0.98:
+        signals.append(f"🟢 Price below Max Pain (${max_pain:.2f}): Potential upside")
+        score += 1
+    elif current_price > max_pain * 1.02:
+        signals.append(f"🔴 Price above Max Pain (${max_pain:.2f}): Potential downside")
+        score -= 1
+    else:
+        signals.append(f"🟡 Price near Max Pain (${max_pain:.2f})")
+    
+    # Support/Resistance Analysis
+    if support and resistance:
+        range_pct = ((resistance - support) / current_price) * 100
+        signals.append(f"📊 Trading Range: ${support:.2f} - ${resistance:.2f} ({range_pct:.1f}%)")
         
-        # SIMULATED LIVE LOOP
-        # Note: In a real server, this would be a background thread. 
-        # In Streamlit, this loops until user stops or error.
-        st.toast("System Initialized. Fetching Data...")
+        # Position in range
+        if current_price <= support * 1.01:
+            signals.append("🟢 Near Support: Potential bounce")
+            score += 1
+        elif current_price >= resistance * 0.99:
+            signals.append("🔴 Near Resistance: Potential rejection")
+            score -= 1
+    
+    # Final Signal
+    if score >= 3:
+        momentum = "🚀 STRONG BULLISH"
+    elif score >= 1:
+        momentum = "📈 BULLISH"
+    elif score <= -3:
+        momentum = "📉 STRONG BEARISH"
+    elif score <= -1:
+        momentum = "📉 BEARISH"
+    else:
+        momentum = "➡️ NEUTRAL"
+    
+    return momentum, signals, score
+
+def plot_oi_chart(calls, puts, current_price, max_pain):
+    """Create Open Interest visualization"""
+    fig = make_subplots(
+        rows=2, cols=1,
+        subplot_titles=('Open Interest Distribution', 'Volume Distribution'),
+        vertical_spacing=0.15
+    )
+    
+    # OI Chart
+    fig.add_trace(
+        go.Bar(x=calls['strike'], y=calls['openInterest'], 
+               name='Call OI', marker_color='green', opacity=0.6),
+        row=1, col=1
+    )
+    fig.add_trace(
+        go.Bar(x=puts['strike'], y=puts['openInterest'], 
+               name='Put OI', marker_color='red', opacity=0.6),
+        row=1, col=1
+    )
+    
+    # Volume Chart
+    fig.add_trace(
+        go.Bar(x=calls['strike'], y=calls['volume'], 
+               name='Call Vol', marker_color='lightgreen', opacity=0.6),
+        row=2, col=1
+    )
+    fig.add_trace(
+        go.Bar(x=puts['strike'], y=puts['volume'], 
+               name='Put Vol', marker_color='lightcoral', opacity=0.6),
+        row=2, col=1
+    )
+    
+    # Add current price line
+    fig.add_vline(x=current_price, line_dash="dash", line_color="blue", 
+                  annotation_text="Current Price", row=1, col=1)
+    fig.add_vline(x=current_price, line_dash="dash", line_color="blue", row=2, col=1)
+    
+    # Add max pain line
+    if max_pain > 0:
+        fig.add_vline(x=max_pain, line_dash="dot", line_color="purple", 
+                      annotation_text="Max Pain", row=1, col=1)
+    
+    fig.update_layout(height=700, showlegend=True, title_text="Options Chain Analysis")
+    fig.update_xaxes(title_text="Strike Price", row=2, col=1)
+    fig.update_yaxes(title_text="Open Interest", row=1, col=1)
+    fig.update_yaxes(title_text="Volume", row=2, col=1)
+    
+    return fig
+
+def plot_price_levels(ticker, support, resistance, max_pain):
+    """Plot price with support/resistance levels"""
+    try:
+        stock = yf.Ticker(ticker)
+        hist = stock.history(period="1mo")
         
-        while True:
-            try:
-                # 1. Fetch Data with Rate Limit
-                # We use yfinance Ticker for the specific OPTION symbol
-                opt = yf.Ticker(contract_symbol)
+        fig = go.Figure()
+        
+        fig.add_trace(go.Candlestick(
+            x=hist.index,
+            open=hist['Open'],
+            high=hist['High'],
+            low=hist['Low'],
+            close=hist['Close'],
+            name='Price'
+        ))
+        
+        # Add support/resistance lines
+        if support > 0:
+            fig.add_hline(y=support, line_dash="dash", line_color="green", 
+                         annotation_text="Support")
+        if resistance > 0:
+            fig.add_hline(y=resistance, line_dash="dash", line_color="red", 
+                         annotation_text="Resistance")
+        if max_pain > 0:
+            fig.add_hline(y=max_pain, line_dash="dot", line_color="purple", 
+                         annotation_text="Max Pain")
+        
+        fig.update_layout(
+            title=f"{ticker} Price with Key Levels",
+            yaxis_title="Price",
+            xaxis_title="Date",
+            height=400
+        )
+        
+        return fig
+    except:
+        return None
+
+# Sidebar Configuration
+st.sidebar.header("⚙️ Configuration")
+
+# Asset Class Selection
+asset_class = st.sidebar.selectbox(
+    "Select Asset Class",
+    ["Indian Indices (NSE)", "US Stocks", "Crypto", "Forex", "Commodities"]
+)
+
+# Ticker input based on asset class
+if asset_class == "Indian Indices (NSE)":
+    ticker_options = ["NIFTY", "BANKNIFTY", "SENSEX", "FINNIFTY"]
+    ticker = st.sidebar.selectbox("Select Index", ticker_options)
+    st.sidebar.info("Note: NSE real-time data requires authentication. Use Yahoo Finance alternatives below.")
+    use_nse = False
+    
+elif asset_class == "US Stocks":
+    popular_stocks = ["AAPL", "TSLA", "MSFT", "GOOGL", "AMZN", "NVDA", "META", "SPY", "QQQ"]
+    ticker = st.sidebar.selectbox("Select Stock", popular_stocks + ["Custom"])
+    if ticker == "Custom":
+        ticker = st.sidebar.text_input("Enter Stock Ticker", "AAPL")
+    use_nse = False
+    
+elif asset_class == "Crypto":
+    crypto_options = ["BTC-USD", "ETH-USD", "BNB-USD", "SOL-USD", "XRP-USD"]
+    ticker = st.sidebar.selectbox("Select Crypto", crypto_options)
+    st.sidebar.warning("⚠️ Limited options data available for crypto")
+    use_nse = False
+    
+elif asset_class == "Forex":
+    forex_options = ["USDINR=X", "EURUSD=X", "GBPUSD=X", "JPYUSD=X"]
+    ticker = st.sidebar.selectbox("Select Forex Pair", forex_options)
+    st.sidebar.warning("⚠️ Limited options data available for forex")
+    use_nse = False
+    
+else:  # Commodities
+    commodity_options = ["GC=F", "SI=F", "CL=F", "NG=F"]  # Gold, Silver, Crude, Natural Gas
+    commodity_names = ["Gold", "Silver", Crude Oil", "Natural Gas"]
+    selection = st.sidebar.selectbox("Select Commodity", commodity_names)
+    ticker = commodity_options[commodity_names.index(selection)]
+    st.sidebar.warning("⚠️ Limited options data available for commodities")
+    use_nse = False
+
+# Analysis button
+analyze_button = st.sidebar.button("🔍 Analyze Options Chain", type="primary")
+
+# Main Analysis
+if analyze_button:
+    with st.spinner(f"Fetching options data for {ticker}..."):
+        
+        # Get current price
+        try:
+            stock = yf.Ticker(ticker)
+            current_price = stock.info.get('currentPrice') or stock.info.get('regularMarketPrice')
+            if not current_price:
+                hist = stock.history(period="1d")
+                current_price = hist['Close'].iloc[-1] if not hist.empty else 0
+        except:
+            current_price = 0
+        
+        if current_price == 0:
+            st.error("❌ Unable to fetch current price. Please check ticker symbol.")
+        else:
+            # Display current price
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                st.metric("Current Price", f"${current_price:.2f}")
+            
+            # Fetch options data
+            calls, puts, exp_date = get_yahoo_options(ticker)
+            
+            if calls is not None and puts is not None:
+                st.success(f"✅ Options data fetched successfully! Expiry: {exp_date}")
                 
-                # Fetch live price (fast_info is best for this)
-                current_price = opt.fast_info['last_price']
-                prev_close = opt.fast_info['previous_close']
+                # Calculate metrics
+                pcr_oi, pcr_vol = calculate_pcr(calls, puts)
+                max_pain = calculate_max_pain(calls, puts)
+                support, resistance, top_calls, top_puts = analyze_oi_buildup(calls, puts, current_price)
                 
-                # If data is missing (common in yfinance for illiquid options), skip
-                if current_price is None:
-                    time.sleep(refresh_rate)
-                    continue
-
-                price_history.append(current_price)
-                if len(price_history) > 50: price_history.pop(0)
-
-                # 2. Logic: Momentum Trigger
-                # Simple Logic: If Price > Previous Close + 10% AND not already in trade
-                pct_change = ((current_price - prev_close) / prev_close) * 100
+                # Display key metrics
+                with col2:
+                    st.metric("PCR (OI)", f"{pcr_oi:.2f}")
+                with col3:
+                    st.metric("Max Pain", f"${max_pain:.2f}")
                 
-                # 3. Update UI
-                with metric_ph.container():
-                    m1, m2, m3 = st.columns(3)
-                    m1.metric("Live Premium", f"${current_price:.2f}")
-                    m2.metric("Change", f"{pct_change:.2f}%", delta_color="normal")
-                    m3.metric("Status", "IN TRADE" if st.session_state.in_trade else "SCANNING")
+                col4, col5 = st.columns(2)
+                with col4:
+                    st.metric("Support Level", f"${support:.2f}" if support > 0 else "N/A")
+                with col5:
+                    st.metric("Resistance Level", f"${resistance:.2f}" if resistance > 0 else "N/A")
+                
+                # Calculate momentum signal
+                momentum, signals, score = calculate_momentum_signal(
+                    pcr_oi, pcr_vol, max_pain, current_price, support, resistance
+                )
+                
+                # Display momentum signal
+                st.markdown("---")
+                st.subheader("🎯 Momentum Signal")
+                st.markdown(f"## {momentum}")
+                st.markdown(f"**Signal Strength Score: {score}**")
+                
+                st.markdown("### Analysis Details:")
+                for signal in signals:
+                    st.markdown(f"- {signal}")
+                
+                # Trading recommendation
+                st.markdown("---")
+                st.subheader("💡 Trading Insights")
+                
+                if score >= 2:
+                    st.success("""
+                    **Bullish Setup Detected:**
+                    - Consider LONG positions or CALL options
+                    - Watch for breakout above resistance
+                    - Target: Next resistance level
+                    - Stop Loss: Below support
+                    """)
+                elif score <= -2:
+                    st.warning("""
+                    **Bearish Setup Detected:**
+                    - Consider SHORT positions or PUT options
+                    - Watch for breakdown below support
+                    - Target: Next support level
+                    - Stop Loss: Above resistance
+                    """)
+                else:
+                    st.info("""
+                    **Neutral Zone:**
+                    - Wait for clear directional move
+                    - Consider range-bound strategies
+                    - Monitor key levels for breakout
+                    """)
+                
+                # Visualizations
+                st.markdown("---")
+                st.subheader("📊 Options Chain Visualization")
+                
+                oi_chart = plot_oi_chart(calls, puts, current_price, max_pain)
+                st.plotly_chart(oi_chart, use_container_width=True)
+                
+                # Price chart with levels
+                price_chart = plot_price_levels(ticker, support, resistance, max_pain)
+                if price_chart:
+                    st.plotly_chart(price_chart, use_container_width=True)
+                
+                # Detailed OI Tables
+                st.markdown("---")
+                col_left, col_right = st.columns(2)
+                
+                with col_left:
+                    st.subheader("📞 Top Call OI")
+                    if top_calls is not None:
+                        display_calls = top_calls[['strike', 'openInterest', 'volume', 'impliedVolatility']].copy()
+                        display_calls.columns = ['Strike', 'Open Interest', 'Volume', 'IV']
+                        st.dataframe(display_calls, use_container_width=True)
+                
+                with col_right:
+                    st.subheader("📉 Top Put OI")
+                    if top_puts is not None:
+                        display_puts = top_puts[['strike', 'openInterest', 'volume', 'impliedVolatility']].copy()
+                        display_puts.columns = ['Strike', 'Open Interest', 'Volume', 'IV']
+                        st.dataframe(display_puts, use_container_width=True)
+                
+            else:
+                st.error(f"""
+                ❌ No options data available for {ticker}
+                
+                **Possible reasons:**
+                - Options not traded for this ticker
+                - Ticker symbol incorrect
+                - Data not available on Yahoo Finance
+                
+                **Try:**
+                - Use tickers with active options (e.g., AAPL, TSLA, SPY)
+                - Check ticker symbol format
+                """)
 
-                # 4. Charting
-                fig = go.Figure(data=go.Scatter(y=price_history, mode='lines+markers', line=dict(color='#00ffca')))
-                fig.update_layout(title="Live Premium Momentum", height=300, margin=dict(l=0, r=0, t=30, b=0))
-                chart_ph.plotly_chart(fig, use_container_width=True)
+else:
+    # Landing page
+    st.info("👆 Select an asset class and ticker from the sidebar, then click 'Analyze Options Chain'")
+    
+    st.markdown("---")
+    st.subheader("📚 How It Works")
+    
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        st.markdown("""
+        **Key Indicators:**
+        
+        1. **Put-Call Ratio (PCR)**
+           - > 1.2: Bullish (more puts, fear)
+           - < 0.8: Bearish (more calls, greed)
+        
+        2. **Max Pain**
+           - Price where most options expire worthless
+           - Market tends to gravitate here
+        
+        3. **Open Interest Analysis**
+           - High Call OI = Resistance
+           - High Put OI = Support
+        """)
+    
+    with col2:
+        st.markdown("""
+        **Trading Strategy:**
+        
+        1. **Strong Bullish Signal (Score ≥ 3)**
+           - Enter long positions
+           - Buy calls near support
+        
+        2. **Strong Bearish Signal (Score ≤ -3)**
+           - Enter short positions
+           - Buy puts near resistance
+        
+        3. **Neutral (Score -1 to 1)**
+           - Range-bound strategies
+           - Wait for breakout
+        """)
+    
+    st.markdown("---")
+    st.subheader("⚠️ Important Notes")
+    st.warning("""
+    - This tool is for educational purposes only
+    - Options trading involves significant risk
+    - Always do your own research
+    - Use proper risk management
+    - Past performance doesn't guarantee future results
+    - Real-time NSE data requires authentication/subscription
+    """)
+    
+    st.markdown("---")
+    st.subheader("🔧 Data Sources")
+    st.markdown("""
+    - **Yahoo Finance**: US stocks, ETFs, some crypto
+    - **yfinance Python library**: Free, no API key needed
+    - **NSE Data**: Requires NSEpy or official API subscription
+    
+    For Indian markets (NIFTY, BANKNIFTY), consider:
+    - NSEpy library (unofficial)
+    - Official NSE API (requires registration)
+    - Broker APIs (Zerodha Kite, etc.)
+    """)
 
-                # 5. TRADE EXECUTION LOGIC
-                # ENTRY CONDITION: Premium jumps > 15% and we are not in trade
-                if not st.session_state.in_trade and pct_change > 15.0:
-                    st.session_state.in_trade = True
-                    st.session_state.entry_price = current_price
-                    st.session_state.sl, t1, st.session_state.target = calculate_levels(current_price)
-                    
-                    msg = f"⚔️ ENTRY TRIGGERED @ {current_price} | SL: {st.session_state.sl:.2f} | TGT: {st.session_state.target:.2f}"
-                    log_ph.warning(msg)
-                    
-                    # ----------------------
-                    # DHAN API: BUY ORDER
-                    # ----------------------
-                    if auto_trade:
-                        order_manager.place_buy_order(contract_symbol, 25, current_price) # Qty 25 example
-
-                # EXIT CONDITIONS
-                if st.session_state.in_trade:
-                    # Check Stop Loss
-                    if current_price <= st.session_state.sl:
-                        msg = f"🛑 STOP LOSS HIT @ {current_price}. Exiting..."
-                        st.session_state.in_trade = False
-                        log_ph.error(msg)
-                        if auto_trade: order_manager.place_sell_order(contract_symbol, 25)
-
-                    # Check Target
-                    elif current_price >= st.session_state.target:
-                        msg = f"💰 TARGET HIT @ {current_price}. Profit Booked!"
-                        st.session_state.in_trade = False
-                        log_ph.success(msg)
-                        if auto_trade: order_manager.place_sell_order(contract_symbol, 25)
-                        
-                    # Trailing SL Logic (Simple)
-                    # If price moves 10% above entry, move SL to Break Even
-                    elif current_price > st.session_state.entry_price * 1.10 and st.session_state.sl < st.session_state.entry_price:
-                        st.session_state.sl = st.session_state.entry_price
-                        st.toast("Trailing SL moved to Break Even")
-
-                # 6. Rate Limit Sleep
-                time.sleep(refresh_rate)
-
-            except Exception as e:
-                # Handle API crashes gracefully
-                status_ph.error(f"API Limit/Error: {e}. Retrying...")
-                time.sleep(5) # Longer wait on error
+# Footer
+st.markdown("---")
+st.markdown("""
+<div style='text-align: center'>
+    <p>Built with ❤️ using Streamlit | Data from Yahoo Finance (yfinance)</p>
+    <p><strong>Disclaimer:</strong> Not financial advice. Trade at your own risk.</p>
+</div>
+""", unsafe_allow_html=True)
