@@ -826,7 +826,12 @@ def live_trading_iteration():
                             'pnl': pnl,
                             'exit_reason': '50% Partial Exit',
                             'sl_price': sl_price,
-                            'target_price': target_price
+                            'target_price': target_price,
+                            'strategy': config['strategy'],
+                            'asset': config['ticker'],
+                            'interval': config['interval'],
+                            'sl_type': config['sl_type'],
+                            'target_type': config['target_type']
                         })
                         
                         st.session_state['trade_logs'].append({
@@ -852,7 +857,12 @@ def live_trading_iteration():
                             'pnl': pnl,
                             'exit_reason': '50% Partial Exit',
                             'sl_price': sl_price,
-                            'target_price': target_price
+                            'target_price': target_price,
+                            'strategy': config['strategy'],
+                            'asset': config['ticker'],
+                            'interval': config['interval'],
+                            'sl_type': config['sl_type'],
+                            'target_type': config['target_type']
                         })
                         
                         st.session_state['trade_logs'].append({
@@ -887,7 +897,12 @@ def live_trading_iteration():
                 'pnl': pnl,
                 'exit_reason': exit_reason,
                 'sl_price': sl_price,
-                'target_price': target_price
+                'target_price': target_price,
+                'strategy': config['strategy'],
+                'asset': config['ticker'],
+                'interval': config['interval'],
+                'sl_type': config['sl_type'],
+                'target_type': config['target_type']
             })
             
             st.session_state['trade_logs'].append({
@@ -1153,6 +1168,8 @@ def main():
         with st.expander("🔌 Broker Settings (Optional)", expanded=False):
             st.info("Configure these parameters for live broker integration")
             config['broker_enabled'] = st.checkbox("Enable Broker Integration", value=False)
+            config['broker_client_id'] = st.text_input("Client ID", type="password", help="Your broker client ID")
+            config['broker_api_token'] = st.text_input("API Token", type="password", help="Your broker API token/secret")
             config['expiry_date'] = st.date_input("Expiry Date")
             config['strike_price'] = st.number_input("Strike Price", min_value=0.0, value=0.0, step=50.0)
             config['option_type'] = st.selectbox("Option Type", ["CE", "PE", "FUT", "EQUITY"])
@@ -1165,7 +1182,8 @@ def main():
             st.code("""
 # Example: Dhan/Zerodha Integration
 # from dhanhq import dhanhq
-# dhan = dhanhq(client_id, access_token)
+# dhan = dhanhq(client_id=broker_client_id, 
+#               access_token=broker_api_token)
 # 
 # order = dhan.place_order(
 #     exchange_segment='NSE_FNO',
@@ -1254,21 +1272,169 @@ def render_live_trading(config):
             st.info("Start trading to begin...")
     
     with tab2:
+        st.subheader("📈 Trade History")
+        
         if st.session_state.get('trade_history'):
             trades = st.session_state['trade_history']
+            
+            total_trades = len(trades)
+            winning_trades = len([t for t in trades if t['pnl'] > 0])
+            losing_trades = len([t for t in trades if t['pnl'] < 0])
+            accuracy = (winning_trades / total_trades * 100) if total_trades > 0 else 0
             total_pnl = sum([t['pnl'] for t in trades])
             
-            st.metric("Total Trades", len(trades))
-            st.metric("Total P&L", f"₹{total_pnl:.2f}", delta=f"{total_pnl:.2f}", delta_color="normal" if total_pnl >= 0 else "inverse")
+            col1, col2, col3, col4, col5 = st.columns(5)
+            col1.metric("Total Trades", total_trades)
+            col2.metric("Winning Trades", winning_trades)
+            col3.metric("Losing Trades", losing_trades)
+            col4.metric("Accuracy", f"{accuracy:.2f}%")
             
+            pnl_color = "normal" if total_pnl >= 0 else "inverse"
+            col5.metric("Total P&L", f"₹{total_pnl:.2f}", delta=f"{total_pnl:.2f}", delta_color=pnl_color)
+            
+            st.markdown("---")
+            
+            # Detailed Trade History
             for i, trade in enumerate(reversed(trades)):
-                with st.expander(f"Trade {len(trades)-i} - P&L: ₹{trade['pnl']:.2f}"):
-                    st.write(f"**Type:** {trade['type']}")
-                    st.write(f"**Entry:** ₹{trade['entry_price']:.2f}")
-                    st.write(f"**Exit:** ₹{trade['exit_price']:.2f}")
-                    st.write(f"**Reason:** {trade['exit_reason']}")
+                trade_num = total_trades - i
+                pnl_emoji = "✅" if trade['pnl'] > 0 else "❌"
+                
+                with st.expander(f"{pnl_emoji} Trade #{trade_num} - {trade['type']} - P&L: ₹{trade['pnl']:.2f}", expanded=False):
+                    # Trade Overview
+                    st.markdown("### 📊 Trade Overview")
+                    col1, col2, col3 = st.columns(3)
+                    
+                    with col1:
+                        st.markdown("**Basic Info:**")
+                        st.write(f"🎯 Position Type: `{trade['type']}`")
+                        st.write(f"📊 Asset: `{trade.get('asset', 'N/A')}`")
+                        st.write(f"⏱️ Interval: `{trade.get('interval', 'N/A')}`")
+                        st.write(f"🔢 Quantity: `{trade['quantity']}`")
+                    
+                    with col2:
+                        st.markdown("**Strategy Details:**")
+                        st.write(f"🎲 Strategy: `{trade.get('strategy', 'N/A')}`")
+                        st.write(f"🛑 SL Type: `{trade.get('sl_type', 'N/A')}`")
+                        st.write(f"🎯 Target Type: `{trade.get('target_type', 'N/A')}`")
+                        st.write(f"🚪 Exit Reason: `{trade['exit_reason']}`")
+                    
+                    with col3:
+                        st.markdown("**P&L Analysis:**")
+                        pnl_value = trade['pnl']
+                        pnl_pct = (pnl_value / (trade['entry_price'] * trade['quantity'])) * 100
+                        
+                        if pnl_value > 0:
+                            st.success(f"💰 P&L: ₹{pnl_value:.2f}")
+                            st.success(f"📈 P&L %: {pnl_pct:.2f}%")
+                        else:
+                            st.error(f"💸 P&L: ₹{pnl_value:.2f}")
+                            st.error(f"📉 P&L %: {pnl_pct:.2f}%")
+                        
+                        points_diff = abs(trade['exit_price'] - trade['entry_price'])
+                        st.write(f"📍 Points: `{points_diff:.2f}`")
+                    
+                    st.markdown("---")
+                    
+                    # Entry Details
+                    st.markdown("### 📥 Entry Details")
+                    col1, col2, col3, col4 = st.columns(4)
+                    
+                    with col1:
+                        entry_time_str = trade['entry_time'].strftime('%Y-%m-%d %H:%M:%S') if hasattr(trade['entry_time'], 'strftime') else str(trade['entry_time'])
+                        st.write(f"🕐 **Entry Time:**")
+                        st.code(entry_time_str)
+                    
+                    with col2:
+                        st.write(f"💰 **Entry Price:**")
+                        st.code(f"₹{trade['entry_price']:.2f}")
+                    
+                    with col3:
+                        if trade.get('sl_price'):
+                            st.write(f"🛑 **Stop Loss:**")
+                            st.code(f"₹{trade['sl_price']:.2f}")
+                        else:
+                            st.write(f"🛑 **Stop Loss:**")
+                            st.code("Signal-based")
+                    
+                    with col4:
+                        if trade.get('target_price'):
+                            st.write(f"🎯 **Target:**")
+                            st.code(f"₹{trade['target_price']:.2f}")
+                        else:
+                            st.write(f"🎯 **Target:**")
+                            st.code("Signal-based")
+                    
+                    st.markdown("---")
+                    
+                    # Exit Details
+                    st.markdown("### 📤 Exit Details")
+                    col1, col2, col3, col4 = st.columns(4)
+                    
+                    with col1:
+                        exit_time_str = trade['exit_time'].strftime('%Y-%m-%d %H:%M:%S') if hasattr(trade['exit_time'], 'strftime') else str(trade['exit_time'])
+                        st.write(f"🕐 **Exit Time:**")
+                        st.code(exit_time_str)
+                    
+                    with col2:
+                        st.write(f"💰 **Exit Price:**")
+                        st.code(f"₹{trade['exit_price']:.2f}")
+                    
+                    with col3:
+                        st.write(f"🚪 **Exit Reason:**")
+                        st.code(trade['exit_reason'])
+                    
+                    with col4:
+                        # Calculate duration
+                        if hasattr(trade['entry_time'], 'strftime') and hasattr(trade['exit_time'], 'strftime'):
+                            duration = trade['exit_time'] - trade['entry_time']
+                            duration_str = str(duration).split('.')[0]
+                        else:
+                            duration_str = "N/A"
+                        
+                        st.write(f"⏱️ **Duration:**")
+                        st.code(duration_str)
+                    
+                    st.markdown("---")
+                    
+                    # Risk Management
+                    st.markdown("### ⚖️ Risk Management")
+                    col1, col2, col3, col4 = st.columns(4)
+                    
+                    with col1:
+                        if trade.get('sl_price'):
+                            risk = abs(trade['entry_price'] - trade['sl_price'])
+                            st.write(f"📉 **Risk (Points):**")
+                            st.code(f"{risk:.2f}")
+                        else:
+                            st.write(f"📉 **Risk:**")
+                            st.code("Dynamic")
+                    
+                    with col2:
+                        if trade.get('target_price'):
+                            reward = abs(trade['target_price'] - trade['entry_price'])
+                            st.write(f"📈 **Reward (Points):**")
+                            st.code(f"{reward:.2f}")
+                        else:
+                            st.write(f"📈 **Reward:**")
+                            st.code("Dynamic")
+                    
+                    with col3:
+                        if trade.get('sl_price') and trade.get('target_price'):
+                            risk = abs(trade['entry_price'] - trade['sl_price'])
+                            reward = abs(trade['target_price'] - trade['entry_price'])
+                            rr_ratio = reward / risk if risk > 0 else 0
+                            st.write(f"⚖️ **R:R Ratio:**")
+                            st.code(f"1:{rr_ratio:.2f}")
+                        else:
+                            st.write(f"⚖️ **R:R Ratio:**")
+                            st.code("N/A")
+                    
+                    with col4:
+                        total_trade_value = trade['entry_price'] * trade['quantity']
+                        st.write(f"💼 **Trade Value:**")
+                        st.code(f"₹{total_trade_value:.2f}")
         else:
-            st.info("No trades yet")
+            st.info("No trades executed yet.")
     
     with tab3:
         if st.session_state.get('trade_logs'):
@@ -1315,12 +1481,140 @@ def render_backtesting(config):
             col2.metric("Win Rate", f"{wins/len(trades)*100:.1f}%")
             col3.metric("Total P&L", f"₹{total_pnl:.2f}", delta=f"{total_pnl:.2f}", delta_color="normal" if total_pnl >= 0 else "inverse")
             
+            # Detailed Trade History
             for i, trade in enumerate(trades):
-                with st.expander(f"Trade {i+1} - P&L: ₹{trade['pnl']:.2f}"):
-                    st.write(f"**Type:** {trade['type']}")
-                    st.write(f"**Entry:** ₹{trade['entry_price']:.2f}")
-                    st.write(f"**Exit:** ₹{trade['exit_price']:.2f}")
-                    st.write(f"**Reason:** {trade['exit_reason']}")
+                trade_num = i + 1
+                pnl_emoji = "✅" if trade['pnl'] > 0 else "❌"
+                
+                with st.expander(f"{pnl_emoji} Trade #{trade_num} - {trade['type']} - P&L: ₹{trade['pnl']:.2f}", expanded=False):
+                    # Trade Overview
+                    st.markdown("### 📊 Trade Overview")
+                    col1, col2, col3 = st.columns(3)
+                    
+                    with col1:
+                        st.markdown("**Basic Info:**")
+                        st.write(f"🎯 Position Type: `{trade['type']}`")
+                        st.write(f"📊 Asset: `{trade.get('asset', config['ticker'])}`")
+                        st.write(f"⏱️ Interval: `{trade.get('interval', config['interval'])}`")
+                        st.write(f"🔢 Quantity: `{trade['quantity']}`")
+                    
+                    with col2:
+                        st.markdown("**Strategy Details:**")
+                        st.write(f"🎲 Strategy: `{trade.get('strategy', config['strategy'])}`")
+                        st.write(f"🛑 SL Type: `{trade.get('sl_type', config['sl_type'])}`")
+                        st.write(f"🎯 Target Type: `{trade.get('target_type', config['target_type'])}`")
+                        st.write(f"🚪 Exit Reason: `{trade['exit_reason']}`")
+                    
+                    with col3:
+                        st.markdown("**P&L Analysis:**")
+                        pnl_value = trade['pnl']
+                        pnl_pct = (pnl_value / (trade['entry_price'] * trade['quantity'])) * 100
+                        
+                        if pnl_value > 0:
+                            st.success(f"💰 P&L: ₹{pnl_value:.2f}")
+                            st.success(f"📈 P&L %: {pnl_pct:.2f}%")
+                        else:
+                            st.error(f"💸 P&L: ₹{pnl_value:.2f}")
+                            st.error(f"📉 P&L %: {pnl_pct:.2f}%")
+                        
+                        points_diff = abs(trade['exit_price'] - trade['entry_price'])
+                        st.write(f"📍 Points: `{points_diff:.2f}`")
+                    
+                    st.markdown("---")
+                    
+                    # Entry Details
+                    st.markdown("### 📥 Entry Details")
+                    col1, col2, col3, col4 = st.columns(4)
+                    
+                    with col1:
+                        entry_time_str = trade['entry_time'].strftime('%Y-%m-%d %H:%M:%S')
+                        st.write(f"🕐 **Entry Time:**")
+                        st.code(entry_time_str)
+                    
+                    with col2:
+                        st.write(f"💰 **Entry Price:**")
+                        st.code(f"₹{trade['entry_price']:.2f}")
+                    
+                    with col3:
+                        if trade.get('sl_price'):
+                            st.write(f"🛑 **Stop Loss:**")
+                            st.code(f"₹{trade['sl_price']:.2f}")
+                        else:
+                            st.write(f"🛑 **Stop Loss:**")
+                            st.code("Signal-based")
+                    
+                    with col4:
+                        if trade.get('target_price'):
+                            st.write(f"🎯 **Target:**")
+                            st.code(f"₹{trade['target_price']:.2f}")
+                        else:
+                            st.write(f"🎯 **Target:**")
+                            st.code("Signal-based")
+                    
+                    st.markdown("---")
+                    
+                    # Exit Details
+                    st.markdown("### 📤 Exit Details")
+                    col1, col2, col3, col4 = st.columns(4)
+                    
+                    with col1:
+                        exit_time_str = trade['exit_time'].strftime('%Y-%m-%d %H:%M:%S')
+                        st.write(f"🕐 **Exit Time:**")
+                        st.code(exit_time_str)
+                    
+                    with col2:
+                        st.write(f"💰 **Exit Price:**")
+                        st.code(f"₹{trade['exit_price']:.2f}")
+                    
+                    with col3:
+                        st.write(f"🚪 **Exit Reason:**")
+                        st.code(trade['exit_reason'])
+                    
+                    with col4:
+                        duration = trade['exit_time'] - trade['entry_time']
+                        duration_str = str(duration).split('.')[0]
+                        st.write(f"⏱️ **Duration:**")
+                        st.code(duration_str)
+                    
+                    st.markdown("---")
+                    
+                    # Risk Management
+                    st.markdown("### ⚖️ Risk Management")
+                    col1, col2, col3, col4 = st.columns(4)
+                    
+                    with col1:
+                        if trade.get('sl_price'):
+                            risk = abs(trade['entry_price'] - trade['sl_price'])
+                            st.write(f"📉 **Risk (Points):**")
+                            st.code(f"{risk:.2f}")
+                        else:
+                            st.write(f"📉 **Risk:**")
+                            st.code("Dynamic")
+                    
+                    with col2:
+                        if trade.get('target_price'):
+                            reward = abs(trade['target_price'] - trade['entry_price'])
+                            st.write(f"📈 **Reward (Points):**")
+                            st.code(f"{reward:.2f}")
+                        else:
+                            st.write(f"📈 **Reward:**")
+                            st.code("Dynamic")
+                    
+                    with col3:
+                        if trade.get('sl_price') and trade.get('target_price'):
+                            risk = abs(trade['entry_price'] - trade['sl_price'])
+                            reward = abs(trade['target_price'] - trade['entry_price'])
+                            rr_ratio = reward / risk if risk > 0 else 0
+                            st.write(f"⚖️ **R:R Ratio:**")
+                            st.code(f"1:{rr_ratio:.2f}")
+                        else:
+                            st.write(f"⚖️ **R:R Ratio:**")
+                            st.code("N/A")
+                    
+                    with col4:
+                        total_trade_value = trade['entry_price'] * trade['quantity']
+                        st.write(f"💼 **Trade Value:**")
+                        st.code(f"₹{total_trade_value:.2f}")
     
     with tab2:
         df = fetch_data(config['ticker'], config['interval'], config['period'])
