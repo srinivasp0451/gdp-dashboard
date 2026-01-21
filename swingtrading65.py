@@ -1147,6 +1147,38 @@ def main():
         if 'Risk-Reward' in config['target_type']:
             config['risk_reward_ratio'] = st.number_input("Risk-Reward Ratio", min_value=0.1, value=2.0, step=0.1)
         
+        st.markdown("---")
+        
+        # Broker Integration Settings (Optional)
+        with st.expander("🔌 Broker Settings (Optional)", expanded=False):
+            st.info("Configure these parameters for live broker integration")
+            config['broker_enabled'] = st.checkbox("Enable Broker Integration", value=False)
+            config['expiry_date'] = st.date_input("Expiry Date")
+            config['strike_price'] = st.number_input("Strike Price", min_value=0.0, value=0.0, step=50.0)
+            config['option_type'] = st.selectbox("Option Type", ["CE", "PE", "FUT", "EQUITY"])
+            config['order_type'] = st.selectbox("Order Type", ["MARKET", "LIMIT"])
+            
+            if config['order_type'] == "LIMIT":
+                config['limit_price'] = st.number_input("Limit Price", min_value=0.0, value=0.0)
+            
+            st.markdown("**Broker API Placeholder Code:**")
+            st.code("""
+# Example: Dhan/Zerodha Integration
+# from dhanhq import dhanhq
+# dhan = dhanhq(client_id, access_token)
+# 
+# order = dhan.place_order(
+#     exchange_segment='NSE_FNO',
+#     transaction_type='BUY' or 'SELL',
+#     quantity=quantity,
+#     order_type='MARKET' or 'LIMIT',
+#     price=price,
+#     strike_price=strike_price,
+#     expiry_date=expiry_date,
+#     option_type='CE' or 'PE'
+# )
+            """, language="python")
+        
         st.session_state['config'] = config
     
     if mode == "Live Trading":
