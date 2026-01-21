@@ -287,7 +287,7 @@ elif asset_class == "Forex":
     
 else:  # Commodities
     commodity_options = ["GC=F", "SI=F", "CL=F", "NG=F"]  # Gold, Silver, Crude, Natural Gas
-    commodity_names = ["Gold", "Silver", Crude Oil", "Natural Gas"]
+    commodity_names = ["Gold", "Silver", "Crude Oil", "Natural Gas"]
     selection = st.sidebar.selectbox("Select Commodity", commodity_names)
     ticker = commodity_options[commodity_names.index(selection)]
     st.sidebar.warning("⚠️ Limited options data available for commodities")
