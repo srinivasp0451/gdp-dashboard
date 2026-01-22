@@ -1029,31 +1029,7 @@ st.markdown("""
 </div>
 """, unsafe_allow_html=True)
         **Key Indicators Explained:**
-        
-        **1. Put-Call Ratio (PCR)**
-        - Measures sentiment via options activity
-        - **PCR > 1.2:** Bullish (more puts = fear/hedging)
-        - **PCR < 0.8:** Bearish (more calls = greed)
-        - Contrarian indicator - works best at extremes
-        
-        **2. Max Pain Theory**
-        - Price where most options expire worthless
-        - Market makers profit maximization point
-        - Price tends to gravitate toward max pain
-        - Useful for weekly/monthly expiry predictions
-        
-        **3. Open Interest (OI) Analysis**
-        - **High Call OI** = Strong resistance level
-        - **High Put OI** = Strong support level
-        - OI > Volume = Established positions
-        - Volume > OI = Fresh positioning
-        
-        **4. Momentum Score**
-        - Combines all indicators (±5 scale)
-        - ≥3: Strong Bullish | ≤-3: Strong Bearish
-        - Weighted by conviction and confluence
-        """)
-    
+      
     with col2:
         st.subheader("🎯 Trading Strategies")
         st.markdown("""
