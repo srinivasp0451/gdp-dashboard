@@ -753,42 +753,20 @@ def main():
             status_text = "ACTIVE" if st.session_state.trading_active else "INACTIVE"
             st.markdown(f"### {status_color} Status: {status_text}")
         
-        # Display configuration
-        st.markdown("---")
-        st.subheader("📋 Active Configuration")
-        config_col1, config_col2, config_col3 = st.columns(3)
-        
-        with config_col1:
-            st.metric("Asset", asset_name)
-            st.metric("Interval", interval)
-            st.metric("Period", period)
-            st.metric("Quantity", quantity)
-        
-        with config_col2:
-            st.metric("Strategy", strategy)
-            st.metric("SL Type", sl_type)
-            st.metric("Target Type", target_type)
-        
-        with config_col3:
-            st.metric("SL Points", sl_points)
-            st.metric("Target Points", target_points)
-            if strategy == 'EMA Crossover':
-                st.metric("EMA Fast/Slow", f"{config['ema_fast']}/{config['ema_slow']}")
-        
         st.markdown("---")
         
-        # Tabs for different views
+        # Tabs for different views - MOVED TO TOP
         tab1, tab2, tab3 = st.tabs(["📈 Live Dashboard", "📜 Trade History", "📝 Trade Logs"])
         
         with tab1:
-            # Live data display
-            live_col1, live_col2 = st.columns([2, 1])
+            # Live metrics display
+            metrics_placeholder = st.empty()
             
-            with live_col1:
-                chart_placeholder = st.empty()
+            # Chart placeholder
+            chart_placeholder = st.empty()
             
-            with live_col2:
-                metrics_placeholder = st.empty()
+            # Configuration display at bottom
+            config_placeholder = st.empty()
             
             # Auto-refresh loop for live trading
             if st.session_state.trading_active:
@@ -915,9 +893,9 @@ def main():
                     
                     # Display live metrics
                     with metrics_placeholder.container():
-                        st.subheader("Live Metrics")
+                        st.subheader("📊 Live Metrics")
                         
-                        met_col1, met_col2 = st.columns(2)
+                        met_col1, met_col2, met_col3, met_col4 = st.columns(4)
                         with met_col1:
                             st.metric("Current Price", f"{current_price:.2f}")
                         
@@ -933,23 +911,37 @@ def main():
                                          delta=f"{pnl:.2f}",
                                          delta_color="normal" if pnl >= 0 else "inverse")
                             
-                            st.markdown("---")
-                            st.markdown(f"**Position:** {st.session_state.position['type']}")
-                            st.markdown(f"**Entry Price:** {st.session_state.position['entry_price']:.2f}")
-                            st.markdown(f"**Stop Loss:** {st.session_state.position['stop_loss']:.2f}")
+                            with met_col3:
+                                st.metric("Position", st.session_state.position['type'])
                             
-                            if st.session_state.position['target']:
-                                st.markdown(f"**Target:** {st.session_state.position['target']:.2f}")
-                            else:
-                                st.markdown(f"**Target:** Signal-based")
+                            with met_col4:
+                                st.metric("Entry Price", f"{st.session_state.position['entry_price']:.2f}")
                             
-                            st.markdown(f"**Quantity:** {st.session_state.position['quantity']}")
+                            # Second row of metrics
+                            met_col5, met_col6, met_col7, met_col8 = st.columns(4)
                             
-                            duration = datetime.now(pytz.timezone('Asia/Kolkata')) - st.session_state.position['entry_time']
-                            st.markdown(f"**Duration:** {str(duration).split('.')[0]}")
+                            with met_col5:
+                                st.metric("Stop Loss", f"{st.session_state.position['stop_loss']:.2f}")
                             
-                            st.markdown(f"**Highest:** {st.session_state.position['highest_price']:.2f}")
-                            st.markdown(f"**Lowest:** {st.session_state.position['lowest_price']:.2f}")
+                            with met_col6:
+                                if st.session_state.position['target']:
+                                    st.metric("Target", f"{st.session_state.position['target']:.2f}")
+                                else:
+                                    st.metric("Target", "Signal-based")
+                            
+                            with met_col7:
+                                st.metric("Quantity", st.session_state.position['quantity'])
+                            
+                            with met_col8:
+                                duration = datetime.now(pytz.timezone('Asia/Kolkata')) - st.session_state.position['entry_time']
+                                st.metric("Duration", str(duration).split('.')[0])
+                            
+                            # Third row - Highest/Lowest
+                            met_col9, met_col10 = st.columns(2)
+                            with met_col9:
+                                st.metric("Highest", f"{st.session_state.position['highest_price']:.2f}")
+                            with met_col10:
+                                st.metric("Lowest", f"{st.session_state.position['lowest_price']:.2f}")
                         
                         # Strategy-specific metrics
                         if strategy == 'EMA Crossover':
@@ -958,25 +950,56 @@ def main():
                             ema_slow_vals = calculate_ema(closes, config['ema_slow'])
                             
                             st.markdown("---")
-                            st.markdown("**Indicators:**")
-                            if ema_fast_vals[-1]:
-                                st.markdown(f"EMA{config['ema_fast']}: {ema_fast_vals[-1]:.2f}")
-                            if ema_slow_vals[-1]:
-                                st.markdown(f"EMA{config['ema_slow']}: {ema_slow_vals[-1]:.2f}")
+                            st.markdown("**📈 Indicators:**")
+                            ind_col1, ind_col2, ind_col3 = st.columns(3)
                             
-                            rsi = calculate_rsi(closes, 14)
-                            if rsi[-1]:
-                                st.markdown(f"RSI: {rsi[-1]:.2f}")
+                            with ind_col1:
+                                if ema_fast_vals[-1]:
+                                    st.metric(f"EMA{config['ema_fast']}", f"{ema_fast_vals[-1]:.2f}")
+                            with ind_col2:
+                                if ema_slow_vals[-1]:
+                                    st.metric(f"EMA{config['ema_slow']}", f"{ema_slow_vals[-1]:.2f}")
+                            with ind_col3:
+                                rsi = calculate_rsi(closes, 14)
+                                if rsi[-1]:
+                                    st.metric("RSI", f"{rsi[-1]:.2f}")
                         
                         elif strategy == 'Percentage Change':
                             pct_change = ((current_price - st.session_state.first_candle_price) / st.session_state.first_candle_price) * 100
                             st.markdown("---")
-                            st.metric("% Change from First Candle", f"{pct_change:.3f}%")
+                            st.metric("% Change from First Candle", f"{pct_change:.3f}%",
+                                     delta=f"{pct_change:.3f}%",
+                                     delta_color="normal" if pct_change >= 0 else "inverse")
                     
                     # Display chart
                     with chart_placeholder.container():
+                        st.markdown("---")
+                        st.subheader("📈 Live Price Chart")
                         fig = create_live_chart(df, st.session_state.position, config, strategy)
                         st.plotly_chart(fig, use_container_width=True, key=f"live_chart_{time.time()}")
+                    
+                    # Display configuration at bottom
+                    with config_placeholder.container():
+                        st.markdown("---")
+                        st.subheader("📋 Active Configuration")
+                        config_col1, config_col2, config_col3 = st.columns(3)
+                        
+                        with config_col1:
+                            st.metric("Asset", asset_name)
+                            st.metric("Interval", interval)
+                            st.metric("Period", period)
+                            st.metric("Quantity", quantity)
+                        
+                        with config_col2:
+                            st.metric("Strategy", strategy)
+                            st.metric("SL Type", sl_type)
+                            st.metric("Target Type", target_type)
+                        
+                        with config_col3:
+                            st.metric("SL Points", sl_points)
+                            st.metric("Target Points", target_points)
+                            if strategy == 'EMA Crossover':
+                                st.metric("EMA Fast/Slow", f"{config['ema_fast']}/{config['ema_slow']}")
                 
                 # Add delay and rerun
                 time.sleep(random.uniform(1.0, 1.5))
@@ -1458,10 +1481,18 @@ def analyze_market_data(ticker, interval, period):
     
     st.session_state.current_data = df
     
-    # Calculate statistics
-    df['change_points'] = df['close'] - df['open']
-    df['change_pct'] = ((df['close'] - df['open']) / df['open']) * 100
-    df['day_of_week'] = df.index.day_name()
+    # Calculate statistics - FIXED
+    df['change_points'] = df['close'] - df['close'].shift(1)  # Fixed: compare with previous close
+    df['change_pct'] = ((df['close'] - df['close'].shift(1)) / df['close'].shift(1)) * 100  # Fixed
+    
+    # Drop first row with NaN
+    df = df.dropna()
+    
+    # Fix day of week for datetime index
+    if isinstance(df.index, pd.DatetimeIndex):
+        df['day_of_week'] = df.index.strftime('%A')  # Fixed: proper day name extraction
+    else:
+        df['day_of_week'] = pd.to_datetime(df.index).strftime('%A')
     
     # Display data table
     st.subheader("📋 Data Table")
