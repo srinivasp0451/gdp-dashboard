@@ -641,24 +641,7 @@ else:
     
     with col1:
         st.subheader("📚 How It Works")
-        st.markdown("""
-        ---")
-    
-    st.subheader("⚠️ Risk Disclaimer")
-    st.warning("""
-    **IMPORTANT - READ CAREFULLY:**
-    
-    - 📚 This tool is for **EDUCATIONAL PURPOSES ONLY**
-    - 💰 Options trading involves **SIGNIFICANT RISK** of loss
-    - 🎓 Always do your own research (DYOR)
-    - 📊 Past performance ≠ future results
-    - 💼 Never risk more than you can afford to lose
-    - 🤝 Consider consulting a licensed financial advisor
-    - 🎯 Use proper position sizing (2-5% max per trade)
-    - 🛑 Always use stop losses
-    
-    **This is NOT financial advice. Trade at your own risk.**
-    """)
+        st.markdown("---")
     
     st.markdown("---")
     st.subheader("🔧 Data Sources & Setup")
@@ -1040,16 +1023,9 @@ else:
 # Footer
 st.markdown("---")
 st.markdown("""
-<div style='text-align: center; padding: 20px; background-color: #f0f2f6; border-radius: 10px;'>
-    <h3 style='color: #1f77b4;'>📈 Zero to Hero Options Chain Momentum Predictor</h3>
-    <p style='font-size: 14px;'>Built with ❤️ using Streamlit | Data powered by Yahoo Finance (yfinance)</p>
-    <p style='font-size: 12px; color: #666;'><strong>⚠️ DISCLAIMER:</strong> This tool is for educational purposes only. Not financial advice. Options trading involves substantial risk of loss. Always do your own research and consult with a licensed financial advisor before making investment decisions.</p>
-    <p style='font-size: 12px; color: #666; margin-top: 10px;'>
-        💡 <strong>Pro Tip:</strong> Start with paper trading to test strategies risk-free!
-    </p>
-    <p style='font-size: 11px; color: #999; margin-top: 15px;'>
-        Version 1.0 | Last Updated: January 2026 | For suggestions/bugs: Open an issue on GitHub
-    </p>
+<div style='text-align: center'>
+    <p>Options Chain Momentum Predictor | Data: Yahoo Finance</p>
+    <p><strong>Disclaimer:</strong> Not financial advice. Trade at your own risk.</p>
 </div>
 """, unsafe_allow_html=True)
         **Key Indicators Explained:**
