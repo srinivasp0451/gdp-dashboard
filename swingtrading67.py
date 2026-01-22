@@ -577,6 +577,21 @@ else:  # Custom Ticker
 # Analysis button
 analyze_button = st.sidebar.button("🔍 Analyze Options Chain", type="primary", use_container_width=True)
 
+st.sidebar.markdown("---")
+st.sidebar.markdown("### 💡 Quick Tips")
+st.sidebar.info("""
+**✅ Working Now:**
+- US Stocks: AAPL, TSLA, SPY
+- US ETFs: QQQ, IWM, DIA
+
+**⚠️ Limited/Not Working:**
+- Indian Indices (NSE blocking)
+- Crypto (limited options)
+- Forex (very limited)
+
+**Best Results:** Use US stocks/ETFs
+""")
+
 # Main Analysis
 if analyze_button and ticker:
     with st.spinner(f"Fetching options data for {ticker}..."):
@@ -617,21 +632,73 @@ if analyze_button and ticker:
             
             if opt_error or calls is None:
                 st.error(f"❌ {opt_error or 'Unable to fetch options data'}")
-                st.warning(f"""
-                **No Options Data Available for {ticker}**
                 
-                This could mean:
-                - Options are not traded for this ticker
-                - Ticker format is incorrect
-                - Data not available on Yahoo Finance
-                
-                **✅ Best Tickers for Options Analysis:**
-                - **US Stocks:** AAPL, TSLA, MSFT, NVDA, AMZN
-                - **ETFs:** SPY, QQQ, IWM, DIA
-                - **High Volume:** AMD, PLTR, SOFI, F
-                
-                Try selecting "US Stocks & ETFs" from the dropdown!
-                """)
+                if use_nse_api:
+                    st.warning(f"""
+                    **NSE Options Data Not Available**
+                    
+                    The NSE website may be blocking automated requests or the API format has changed.
+                    
+                    **Alternative Solutions for Indian Markets:**
+                    
+                    1. **Use Broker APIs (Recommended):**
+                       - Zerodha Kite Connect (₹2000/month)
+                       - Upstox API (Free tier)
+                       - Angel Broking SmartAPI
+                    
+                    2. **Install NSEpy Library:**
+                       ```bash
+                       pip install nsepy
+                       ```
+                       Then modify code to use nsepy for data fetching
+                    
+                    3. **Manual Data Entry:**
+                       - Visit NSE website manually
+                       - Export options chain CSV
+                       - Upload to this app (feature coming soon)
+                    
+                    4. **Try US Markets Instead:**
+                       - Select "US Stocks & ETFs" from sidebar
+                       - Try: SPY, QQQ, AAPL (excellent data availability)
+                    
+                    **Why NSE is Difficult:**
+                    - NSE blocks automated scraping
+                    - Requires cookies/session management
+                    - API access needs authentication
+                    - Rate limiting on requests
+                    """)
+                else:
+                    st.warning(f"""
+                    **No Options Data Available for {ticker}**
+                    
+                    This could mean:
+                    - Options are not traded for this ticker
+                    - Ticker format is incorrect
+                    - Data not available on Yahoo Finance
+                    
+                    **✅ Best Tickers for Options Analysis:**
+                    
+                    **US Stocks (100% Working):**
+                    - **AAPL** - Apple
+                    - **TSLA** - Tesla  
+                    - **MSFT** - Microsoft
+                    - **NVDA** - NVIDIA
+                    - **AMZN** - Amazon
+                    
+                    **ETFs (Excellent Data):**
+                    - **SPY** - S&P 500
+                    - **QQQ** - Nasdaq 100
+                    - **IWM** - Russell 2000
+                    - **DIA** - Dow Jones
+                    
+                    **High Volume Options:**
+                    - **AMD** - Advanced Micro Devices
+                    - **PLTR** - Palantir
+                    - **SOFI** - SoFi
+                    - **F** - Ford
+                    
+                    Try selecting "US Stocks & ETFs" from the dropdown!
+                    """)
             else:
                 with col3:
                     st.metric("📅 Expiry Date", exp_date)
@@ -814,31 +881,35 @@ if analyze_button and ticker:
                     if not calls_near.empty:
                         # Prepare display dataframe
                         ce_display = pd.DataFrame()
-                        ce_display['Strike'] = calls_near['strike']
-                        ce_display['LTP'] = calls_near.get('lastPrice', 0).round(2)
-                        ce_display['Chg'] = calls_near.get('change', 0).round(2)
-                        ce_display['Chg%'] = calls_near.get('pChange', 0).round(2)
-                        ce_display['OI'] = calls_near['openInterest'].astype(int)
-                        ce_display['OI Chg'] = calls_near.get('changeinOpenInterest', 0).astype(int)
+                        ce_display['Strike'] = calls_near['strike'].round(2)
+                        ce_display['LTP'] = pd.to_numeric(calls_near.get('lastPrice', 0), errors='coerce').fillna(0).round(2)
+                        ce_display['Chg'] = pd.to_numeric(calls_near.get('change', 0), errors='coerce').fillna(0).round(2)
+                        ce_display['Chg%'] = pd.to_numeric(calls_near.get('pChange', 0), errors='coerce').fillna(0).round(2)
+                        ce_display['OI'] = pd.to_numeric(calls_near['openInterest'], errors='coerce').fillna(0).astype(int)
+                        ce_display['OI Chg'] = pd.to_numeric(calls_near.get('changeinOpenInterest', 0), errors='coerce').fillna(0).astype(int)
                         
                         # Calculate OI change percentage
                         prev_oi = ce_display['OI'] - ce_display['OI Chg']
-                        ce_display['OI Chg%'] = ((ce_display['OI Chg'] / prev_oi.replace(0, 1)) * 100).round(2)
+                        prev_oi = prev_oi.replace(0, 1)  # Avoid division by zero
+                        ce_display['OI Chg%'] = ((ce_display['OI Chg'] / prev_oi) * 100).round(2)
                         
-                        ce_display['Vol'] = calls_near.get('volume', 0).astype(int)
+                        ce_display['Vol'] = pd.to_numeric(calls_near.get('volume', 0), errors='coerce').fillna(0).astype(int)
                         
                         # Delta and Gamma
                         if 'delta' in calls_near.columns:
-                            ce_display['Delta'] = calls_near['delta'].round(3)
-                            ce_display['Gamma'] = calls_near['gamma'].round(4)
+                            ce_display['Delta'] = pd.to_numeric(calls_near['delta'], errors='coerce').fillna(0).round(3)
+                            ce_display['Gamma'] = pd.to_numeric(calls_near['gamma'], errors='coerce').fillna(0).round(4)
                         
                         # IV
-                        ce_display['IV'] = (calls_near.get('impliedVolatility', 0) * 100).round(2)
+                        ce_display['IV%'] = (pd.to_numeric(calls_near.get('impliedVolatility', 0), errors='coerce').fillna(0) * 100).round(2)
                         
                         # Highlight ATM
                         def highlight_atm(row):
-                            if abs(row['Strike'] - current_price) < 50:
-                                return ['background-color: #90EE90'] * len(row)
+                            try:
+                                if abs(row['Strike'] - current_price) < 50:
+                                    return ['background-color: #90EE90'] * len(row)
+                            except:
+                                pass
                             return [''] * len(row)
                         
                         styled_ce = ce_display.style.apply(highlight_atm, axis=1)
@@ -852,31 +923,35 @@ if analyze_button and ticker:
                     if not puts_near.empty:
                         # Prepare display dataframe
                         pe_display = pd.DataFrame()
-                        pe_display['Strike'] = puts_near['strike']
-                        pe_display['LTP'] = puts_near.get('lastPrice', 0).round(2)
-                        pe_display['Chg'] = puts_near.get('change', 0).round(2)
-                        pe_display['Chg%'] = puts_near.get('pChange', 0).round(2)
-                        pe_display['OI'] = puts_near['openInterest'].astype(int)
-                        pe_display['OI Chg'] = puts_near.get('changeinOpenInterest', 0).astype(int)
+                        pe_display['Strike'] = puts_near['strike'].round(2)
+                        pe_display['LTP'] = pd.to_numeric(puts_near.get('lastPrice', 0), errors='coerce').fillna(0).round(2)
+                        pe_display['Chg'] = pd.to_numeric(puts_near.get('change', 0), errors='coerce').fillna(0).round(2)
+                        pe_display['Chg%'] = pd.to_numeric(puts_near.get('pChange', 0), errors='coerce').fillna(0).round(2)
+                        pe_display['OI'] = pd.to_numeric(puts_near['openInterest'], errors='coerce').fillna(0).astype(int)
+                        pe_display['OI Chg'] = pd.to_numeric(puts_near.get('changeinOpenInterest', 0), errors='coerce').fillna(0).astype(int)
                         
                         # Calculate OI change percentage
                         prev_oi = pe_display['OI'] - pe_display['OI Chg']
-                        pe_display['OI Chg%'] = ((pe_display['OI Chg'] / prev_oi.replace(0, 1)) * 100).round(2)
+                        prev_oi = prev_oi.replace(0, 1)  # Avoid division by zero
+                        pe_display['OI Chg%'] = ((pe_display['OI Chg'] / prev_oi) * 100).round(2)
                         
-                        pe_display['Vol'] = puts_near.get('volume', 0).astype(int)
+                        pe_display['Vol'] = pd.to_numeric(puts_near.get('volume', 0), errors='coerce').fillna(0).astype(int)
                         
                         # Delta and Gamma
                         if 'delta' in puts_near.columns:
-                            pe_display['Delta'] = puts_near['delta'].round(3)
-                            pe_display['Gamma'] = puts_near['gamma'].round(4)
+                            pe_display['Delta'] = pd.to_numeric(puts_near['delta'], errors='coerce').fillna(0).round(3)
+                            pe_display['Gamma'] = pd.to_numeric(puts_near['gamma'], errors='coerce').fillna(0).round(4)
                         
                         # IV
-                        pe_display['IV'] = (puts_near.get('impliedVolatility', 0) * 100).round(2)
+                        pe_display['IV%'] = (pd.to_numeric(puts_near.get('impliedVolatility', 0), errors='coerce').fillna(0) * 100).round(2)
                         
                         # Highlight ATM
                         def highlight_atm(row):
-                            if abs(row['Strike'] - current_price) < 50:
-                                return ['background-color: #FFB6C6'] * len(row)
+                            try:
+                                if abs(row['Strike'] - current_price) < 50:
+                                    return ['background-color: #FFB6C6'] * len(row)
+                            except:
+                                pass
                             return [''] * len(row)
                         
                         styled_pe = pe_display.style.apply(highlight_atm, axis=1)
@@ -1533,3 +1608,69 @@ else:
         """)
     
     st.markdown("---")
+
+# Footer
+st.markdown("---")
+st.markdown("""
+<div style='text-align: center'>
+    <p>Options Chain Momentum Predictor | Data: Yahoo Finance</p>
+    <p><strong>Disclaimer:</strong> Not financial advice. Trade at your own risk.</p>
+</div>
+""", unsafe_allow_html=True)
+        **Key Indicators Explained:**
+        
+        **1. Put-Call Ratio (PCR)**
+        - Measures sentiment via options activity
+        - **PCR > 1.2:** Bullish (more puts = fear/hedging)
+        - **PCR < 0.8:** Bearish (more calls = greed)
+        - Contrarian indicator - works best at extremes
+        
+        **2. Max Pain Theory**
+        - Price where most options expire worthless
+        - Market makers profit maximization point
+        - Price tends to gravitate toward max pain
+        - Useful for weekly/monthly expiry predictions
+        
+        **3. Open Interest (OI) Analysis**
+        - **High Call OI** = Strong resistance level
+        - **High Put OI** = Strong support level
+        - OI > Volume = Established positions
+        - Volume > OI = Fresh positioning
+        
+        **4. Momentum Score**
+        - Combines all indicators (±5 scale)
+        - ≥3: Strong Bullish | ≤-3: Strong Bearish
+        - Weighted by conviction and confluence
+        """)
+    
+    with col2:
+        st.subheader("🎯 Trading Strategies")
+        st.markdown("""
+        **Based on Signal Strength:**
+        
+        **Strong Bullish (Score ≥3)**
+        - Enter LONG positions
+        - Buy ATM/OTM calls
+        - Target resistance levels
+        - Stop below support
+        
+        **Strong Bearish (Score ≤-3)**
+        - Enter SHORT positions  
+        - Buy ATM/OTM puts
+        - Target support levels
+        - Stop above resistance
+        
+        **Neutral (-1.5 to 1.5)**
+        - Range-bound strategies
+        - Iron Condor/Butterfly spreads
+        - Wait for breakout confirmation
+        - Reduce position sizing
+        
+        **Pro Tips:**
+        - Combine with price action & volume
+        - Watch for divergences
+        - Monitor IV changes
+        - Respect risk management
+        - Use stop losses always
+        """)
+    
