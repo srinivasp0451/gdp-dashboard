@@ -630,6 +630,236 @@ if analyze_button and ticker:
                         display_puts.columns = ['Strike', 'Open Interest', 'Volume', 'IV (%)']
                         display_puts['IV (%)'] = (display_puts['IV (%)'] * 100).round(2)
                         st.dataframe(display_puts, use_container_width=True, hide_index=True)
+                
+                # STRIKE PRICE RECOMMENDATIONS
+                st.markdown("---")
+                st.subheader("🎯 STRIKE PRICE RECOMMENDATIONS")
+                
+                # Calculate recommended strikes
+                if score >= 2:  # Bullish
+                    # Call recommendations
+                    atm_call = round(current_price / 5) * 5  # Round to nearest 5
+                    otm_call_1 = atm_call + 5
+                    otm_call_2 = atm_call + 10
+                    
+                    # Calculate targets and stops
+                    call_target_1 = resistance if resistance > 0 else current_price * 1.03
+                    call_target_2 = call_target_1 * 1.05
+                    call_stop = support if support > 0 else current_price * 0.97
+                    
+                    risk_pct = ((current_price - call_stop) / current_price) * 100
+                    reward_pct = ((call_target_1 - current_price) / current_price) * 100
+                    rr_ratio = reward_pct / risk_pct if risk_pct > 0 else 0
+                    
+                    st.success("### 🟢 CALL (CE) BUY RECOMMENDATIONS")
+                    
+                    rec_col1, rec_col2, rec_col3 = st.columns(3)
+                    
+                    with rec_col1:
+                        st.markdown(f"""
+                        **🎯 CONSERVATIVE (ATM)**
+                        - **Strike:** ${atm_call:.0f} CE
+                        - **Entry:** Current price zone
+                        - **Target 1:** ${call_target_1:.2f} (+{reward_pct:.1f}%)
+                        - **Target 2:** ${call_target_2:.2f} (+{((call_target_2/current_price - 1)*100):.1f}%)
+                        - **Stop Loss:** ${call_stop:.2f} (-{risk_pct:.1f}%)
+                        - **Risk/Reward:** 1:{rr_ratio:.1f}
+                        
+                        **Logic:**
+                        - ATM = Highest delta, moves with stock
+                        - Best for directional conviction
+                        - Lower risk, moderate reward
+                        """)
+                    
+                    with rec_col2:
+                        otm_reward_pct = ((call_target_1 - current_price) / current_price) * 150  # Higher leverage
+                        st.markdown(f"""
+                        **⚡ AGGRESSIVE (OTM)**
+                        - **Strike:** ${otm_call_1:.0f} CE
+                        - **Entry:** On dips/pullbacks
+                        - **Target 1:** ${call_target_1:.2f} (~{otm_reward_pct:.0f}% option gain)
+                        - **Target 2:** ${call_target_2:.2f}
+                        - **Stop Loss:** ${call_stop:.2f} or 30% of premium
+                        - **Risk/Reward:** High risk, high reward
+                        
+                        **Logic:**
+                        - OTM = Higher gamma, explosive moves
+                        - Cheaper premium, higher % gains
+                        - Best when expecting big move
+                        """)
+                    
+                    with rec_col3:
+                        deep_otm_reward = ((call_target_2 - current_price) / current_price) * 200
+                        st.markdown(f"""
+                        **🚀 LOTTERY (Deep OTM)**
+                        - **Strike:** ${otm_call_2:.0f} CE
+                        - **Entry:** Small position only
+                        - **Target:** ${call_target_2:.2f} (~{deep_otm_reward:.0f}% option gain)
+                        - **Stop Loss:** 50% of premium or worthless
+                        - **Position Size:** Max 1% of capital
+                        
+                        **Logic:**
+                        - Deep OTM = Very cheap, lottery ticket
+                        - Only for strong momentum
+                        - High probability of 100% loss
+                        - Can return 5-10x if hits
+                        """)
+                    
+                    st.markdown("---")
+                    st.info(f"""
+                    **📊 TRADE RATIONALE:**
+                    - **Signal Score:** {score:.1f} (Strong Bullish)
+                    - **PCR:** {pcr_oi:.2f} (High put activity = contrarian bullish)
+                    - **Max Pain:** ${max_pain:.2f} (Price likely to rise toward/above it)
+                    - **Support:** ${support:.2f} (Strong put OI acting as floor)
+                    - **Resistance:** ${resistance:.2f} (Initial target zone)
+                    - **Strategy:** Buy calls on dips near support, target resistance breakout
+                    """)
+                
+                elif score <= -2:  # Bearish
+                    # Put recommendations
+                    atm_put = round(current_price / 5) * 5
+                    otm_put_1 = atm_put - 5
+                    otm_put_2 = atm_put - 10
+                    
+                    # Calculate targets and stops
+                    put_target_1 = support if support > 0 else current_price * 0.97
+                    put_target_2 = put_target_1 * 0.95
+                    put_stop = resistance if resistance > 0 else current_price * 1.03
+                    
+                    risk_pct = ((put_stop - current_price) / current_price) * 100
+                    reward_pct = ((current_price - put_target_1) / current_price) * 100
+                    rr_ratio = reward_pct / risk_pct if risk_pct > 0 else 0
+                    
+                    st.error("### 🔴 PUT (PE) BUY RECOMMENDATIONS")
+                    
+                    rec_col1, rec_col2, rec_col3 = st.columns(3)
+                    
+                    with rec_col1:
+                        st.markdown(f"""
+                        **🎯 CONSERVATIVE (ATM)**
+                        - **Strike:** ${atm_put:.0f} PE
+                        - **Entry:** Current price zone
+                        - **Target 1:** ${put_target_1:.2f} (-{reward_pct:.1f}%)
+                        - **Target 2:** ${put_target_2:.2f} (-{((1 - put_target_2/current_price)*100):.1f}%)
+                        - **Stop Loss:** ${put_stop:.2f} (+{risk_pct:.1f}%)
+                        - **Risk/Reward:** 1:{rr_ratio:.1f}
+                        
+                        **Logic:**
+                        - ATM put = Best delta for downside
+                        - Moves 1:1 with stock decline
+                        - Lower risk, steady gains
+                        """)
+                    
+                    with rec_col2:
+                        otm_reward_pct = ((current_price - put_target_1) / current_price) * 150
+                        st.markdown(f"""
+                        **⚡ AGGRESSIVE (OTM)**
+                        - **Strike:** ${otm_put_1:.0f} PE
+                        - **Entry:** On rallies/bounces
+                        - **Target 1:** ${put_target_1:.2f} (~{otm_reward_pct:.0f}% option gain)
+                        - **Target 2:** ${put_target_2:.2f}
+                        - **Stop Loss:** ${put_stop:.2f} or 30% of premium
+                        - **Risk/Reward:** High risk, high reward
+                        
+                        **Logic:**
+                        - OTM put = Cheaper, higher leverage
+                        - Best for sharp declines
+                        - Can double/triple quickly
+                        """)
+                    
+                    with rec_col3:
+                        deep_otm_reward = ((current_price - put_target_2) / current_price) * 200
+                        st.markdown(f"""
+                        **💥 LOTTERY (Deep OTM)**
+                        - **Strike:** ${otm_put_2:.0f} PE
+                        - **Entry:** Small position only
+                        - **Target:** ${put_target_2:.2f} (~{deep_otm_reward:.0f}% option gain)
+                        - **Stop Loss:** 50% of premium or worthless
+                        - **Position Size:** Max 1% of capital
+                        
+                        **Logic:**
+                        - Deep OTM = Crash protection
+                        - Cheap lottery ticket
+                        - Only for major breakdown
+                        - 10x+ potential if crashes
+                        """)
+                    
+                    st.markdown("---")
+                    st.info(f"""
+                    **📊 TRADE RATIONALE:**
+                    - **Signal Score:** {score:.1f} (Strong Bearish)
+                    - **PCR:** {pcr_oi:.2f} (Low PCR = too many calls = contrarian bearish)
+                    - **Max Pain:** ${max_pain:.2f} (Price likely to fall toward it)
+                    - **Resistance:** ${resistance:.2f} (Heavy call OI acting as ceiling)
+                    - **Support:** ${support:.2f} (Initial downside target)
+                    - **Strategy:** Buy puts on rallies near resistance, target support breakdown
+                    """)
+                
+                else:  # Neutral
+                    st.warning("### ↔️ NEUTRAL ZONE - NO DIRECTIONAL TRADE")
+                    
+                    st.markdown("""
+                    **Current Market Status:**
+                    - No clear bullish or bearish signal
+                    - Range-bound price action expected
+                    - Low conviction for directional trades
+                    
+                    **Recommended Strategies:**
+                    """)
+                    
+                    strat_col1, strat_col2 = st.columns(2)
+                    
+                    with strat_col1:
+                        iron_condor_call_sell = round((current_price * 1.02) / 5) * 5
+                        iron_condor_call_buy = iron_condor_call_sell + 5
+                        iron_condor_put_sell = round((current_price * 0.98) / 5) * 5
+                        iron_condor_put_buy = iron_condor_put_sell - 5
+                        
+                        st.markdown(f"""
+                        **🦋 IRON CONDOR (Neutral Strategy)**
+                        - **Sell Call:** ${iron_condor_call_sell:.0f} CE
+                        - **Buy Call:** ${iron_condor_call_buy:.0f} CE
+                        - **Sell Put:** ${iron_condor_put_sell:.0f} PE
+                        - **Buy Put:** ${iron_condor_put_buy:.0f} PE
+                        - **Max Profit:** Premium collected
+                        - **Max Loss:** Width of spread - premium
+                        - **Best For:** Low volatility, range-bound
+                        
+                        **Logic:**
+                        - Profit if price stays between sold strikes
+                        - Time decay works in your favor
+                        - Defined risk, defined reward
+                        """)
+                    
+                    with strat_col2:
+                        st.markdown(f"""
+                        **⏳ WAIT FOR SETUP**
+                        
+                        **Watch For:**
+                        - PCR moving above 1.2 or below 0.8
+                        - Volume spike with direction
+                        - Break above ${resistance:.2f} (bullish)
+                        - Break below ${support:.2f} (bearish)
+                        - Signal score reaching ±2 or more
+                        
+                        **Action Plan:**
+                        - Stay in cash for now
+                        - Set price alerts at key levels
+                        - Re-analyze when signal improves
+                        - Don't force trades in unclear markets
+                        
+                        **Remember:** No trade is better than a bad trade
+                        """)
+                    
+                    st.markdown("---")
+                    st.info(f"""
+                    **📊 CURRENT STATUS:**
+                    - **Signal Score:** {score:.1f} (Neutral/Indecisive)
+                    - **PCR:** {pcr_oi:.2f} (Neither fear nor greed extreme)
+                    - **Price Position:** Between support (${support:.2f}) and resistance (${resistance:.2f})
+                    - **Recommendation:** Wait for clearer signal or use range-bound strategies
+                    """)
 
 else:
     # Landing page
@@ -1028,7 +1258,32 @@ st.markdown("""
     <p><strong>Disclaimer:</strong> Not financial advice. Trade at your own risk.</p>
 </div>
 """, unsafe_allow_html=True)
-      
+        **Key Indicators Explained:**
+        
+        **1. Put-Call Ratio (PCR)**
+        - Measures sentiment via options activity
+        - **PCR > 1.2:** Bullish (more puts = fear/hedging)
+        - **PCR < 0.8:** Bearish (more calls = greed)
+        - Contrarian indicator - works best at extremes
+        
+        **2. Max Pain Theory**
+        - Price where most options expire worthless
+        - Market makers profit maximization point
+        - Price tends to gravitate toward max pain
+        - Useful for weekly/monthly expiry predictions
+        
+        **3. Open Interest (OI) Analysis**
+        - **High Call OI** = Strong resistance level
+        - **High Put OI** = Strong support level
+        - OI > Volume = Established positions
+        - Volume > OI = Fresh positioning
+        
+        **4. Momentum Score**
+        - Combines all indicators (±5 scale)
+        - ≥3: Strong Bullish | ≤-3: Strong Bearish
+        - Weighted by conviction and confluence
+        """)
+    
     with col2:
         st.subheader("🎯 Trading Strategies")
         st.markdown("""
