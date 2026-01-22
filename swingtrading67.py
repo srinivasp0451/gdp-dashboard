@@ -1028,7 +1028,6 @@ st.markdown("""
     <p><strong>Disclaimer:</strong> Not financial advice. Trade at your own risk.</p>
 </div>
 """, unsafe_allow_html=True)
-        **Key Indicators Explained:**
       
     with col2:
         st.subheader("🎯 Trading Strategies")
