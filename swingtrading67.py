@@ -9,6 +9,14 @@ import yfinance as yf
 import warnings
 warnings.filterwarnings('ignore')
 
+try:
+    from scipy.stats import norm
+    import math
+    SCIPY_AVAILABLE = True
+except:
+    SCIPY_AVAILABLE = False
+    st.warning("⚠️ scipy not installed. Greeks calculation will be limited. Install with: pip install scipy")
+
 # Page configuration
 st.set_page_config(
     page_title="Options Chain Momentum Predictor",
@@ -51,6 +59,167 @@ def get_yahoo_options(ticker):
         return calls, puts, exp_date, None
     except Exception as e:
         return None, None, None, str(e)
+
+def get_nse_options_web(symbol):
+    """Fetch NSE options data via web scraping (for NIFTY, BANKNIFTY)"""
+    try:
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+            'Accept': 'application/json',
+            'Accept-Language': 'en-US,en;q=0.9',
+        }
+        
+        # Create session
+        session = requests.Session()
+        
+        # Get cookies first
+        session.get('https://www.nseindia.com', headers=headers, timeout=10)
+        
+        # Fetch option chain
+        if symbol in ['NIFTY', 'BANKNIFTY', 'FINNIFTY']:
+            url = f'https://www.nseindia.com/api/option-chain-indices?symbol={symbol}'
+        else:
+            url = f'https://www.nseindia.com/api/option-chain-equities?symbol={symbol}'
+        
+        response = session.get(url, headers=headers, timeout=10)
+        
+        if response.status_code == 200:
+            data = response.json()
+            records = data.get('records', {}).get('data', [])
+            
+            if not records:
+                return None, None, None, "No options data in NSE response"
+            
+            # Parse into calls and puts dataframes
+            calls_data = []
+            puts_data = []
+            
+            for record in records:
+                strike = record.get('strikePrice', 0)
+                
+                # Parse Call data
+                if 'CE' in record:
+                    ce = record['CE']
+                    calls_data.append({
+                        'strike': strike,
+                        'lastPrice': ce.get('lastPrice', 0),
+                        'change': ce.get('change', 0),
+                        'pChange': ce.get('pchangeinOpenInterest', 0),
+                        'openInterest': ce.get('openInterest', 0),
+                        'changeinOpenInterest': ce.get('changeinOpenInterest', 0),
+                        'volume': ce.get('totalTradedVolume', 0),
+                        'impliedVolatility': ce.get('impliedVolatility', 0),
+                        'bidQty': ce.get('bidQty', 0),
+                        'bidprice': ce.get('bidprice', 0),
+                        'askPrice': ce.get('askPrice', 0),
+                        'askQty': ce.get('askQty', 0),
+                    })
+                
+                # Parse Put data
+                if 'PE' in record:
+                    pe = record['PE']
+                    puts_data.append({
+                        'strike': strike,
+                        'lastPrice': pe.get('lastPrice', 0),
+                        'change': pe.get('change', 0),
+                        'pChange': pe.get('pchangeinOpenInterest', 0),
+                        'openInterest': pe.get('openInterest', 0),
+                        'changeinOpenInterest': pe.get('changeinOpenInterest', 0),
+                        'volume': pe.get('totalTradedVolume', 0),
+                        'impliedVolatility': pe.get('impliedVolatility', 0),
+                        'bidQty': pe.get('bidQty', 0),
+                        'bidprice': pe.get('bidprice', 0),
+                        'askPrice': pe.get('askPrice', 0),
+                        'askQty': pe.get('askQty', 0),
+                    })
+            
+            calls_df = pd.DataFrame(calls_data)
+            puts_df = pd.DataFrame(puts_data)
+            
+            # Get expiry date
+            expiry = data.get('records', {}).get('expiryDates', [''])[0]
+            
+            return calls_df, puts_df, expiry, None
+        else:
+            return None, None, None, f"NSE API returned status code {response.status_code}"
+            
+    except Exception as e:
+        return None, None, None, f"NSE fetch error: {str(e)}"
+
+def calculate_greeks_approximate(option_type, S, K, T, r, sigma):
+    """Approximate Black-Scholes Greeks calculation"""
+    if not SCIPY_AVAILABLE:
+        return 0, 0
+    
+    try:
+        if T <= 0 or sigma <= 0 or S <= 0 or K <= 0:
+            return 0, 0
+        
+        d1 = (math.log(S / K) + (r + 0.5 * sigma ** 2) * T) / (sigma * math.sqrt(T))
+        d2 = d1 - sigma * math.sqrt(T)
+        
+        if option_type == 'call':
+            delta = norm.cdf(d1)
+        else:  # put
+            delta = norm.cdf(d1) - 1
+        
+        # Gamma is same for calls and puts
+        gamma = norm.pdf(d1) / (S * sigma * math.sqrt(T))
+        
+        return delta, gamma
+    except Exception as e:
+        return 0, 0
+
+def enrich_options_with_greeks(calls, puts, current_price, exp_date_str):
+    """Add Greeks to options dataframe"""
+    try:
+        from datetime import datetime
+        
+        # Calculate time to expiry
+        exp_date = datetime.strptime(exp_date_str, '%Y-%m-%d')
+        today = datetime.now()
+        T = max((exp_date - today).days / 365.0, 0.001)  # Time in years
+        r = 0.05  # Risk-free rate (5%)
+        
+        # Add Greeks to calls
+        calls['delta'] = 0.0
+        calls['gamma'] = 0.0
+        
+        for idx, row in calls.iterrows():
+            sigma = row.get('impliedVolatility', 0.3)
+            if sigma > 0:
+                delta, gamma = calculate_greeks_approximate('call', current_price, row['strike'], T, r, sigma)
+                calls.at[idx, 'delta'] = delta
+                calls.at[idx, 'gamma'] = gamma
+        
+        # Add Greeks to puts
+        puts['delta'] = 0.0
+        puts['gamma'] = 0.0
+        
+        for idx, row in puts.iterrows():
+            sigma = row.get('impliedVolatility', 0.3)
+            if sigma > 0:
+                delta, gamma = calculate_greeks_approximate('put', current_price, row['strike'], T, r, sigma)
+                puts.at[idx, 'delta'] = delta
+                puts.at[idx, 'gamma'] = gamma
+        
+        return calls, puts
+    except:
+        return calls, puts
+
+def get_strikes_near_spot(calls, puts, current_price, num_strikes=10):
+    """Get N strikes closest to current price"""
+    all_strikes = sorted(set(calls['strike'].tolist() + puts['strike'].tolist()))
+    
+    # Find strikes around current price
+    strikes_near = sorted(all_strikes, key=lambda x: abs(x - current_price))[:num_strikes * 2]
+    strikes_near = sorted(strikes_near)
+    
+    # Filter calls and puts for these strikes
+    calls_near = calls[calls['strike'].isin(strikes_near)].copy()
+    puts_near = puts[puts['strike'].isin(strikes_near)].copy()
+    
+    return calls_near, puts_near
 
 def get_current_price(ticker):
     """Get current price with multiple fallback methods"""
@@ -412,17 +581,26 @@ analyze_button = st.sidebar.button("🔍 Analyze Options Chain", type="primary",
 if analyze_button and ticker:
     with st.spinner(f"Fetching options data for {ticker}..."):
         
+        # Determine if we should use NSE API
+        use_nse_api = use_nse if 'use_nse' in locals() else False
+        
         # Get current price
-        current_price, price_error = get_current_price(ticker)
+        if use_nse_api:
+            # For NSE, try to get spot price from Yahoo with correct ticker
+            spot_ticker_map = {
+                'NIFTY': '^NSEI',
+                'BANKNIFTY': '^NSEBANK',
+                'FINNIFTY': '^CNXFINANCE',
+                'SENSEX': '^BSESN'
+            }
+            spot_ticker = spot_ticker_map.get(ticker, ticker)
+            current_price, price_error = get_current_price(spot_ticker)
+        else:
+            current_price, price_error = get_current_price(ticker)
         
         if price_error or not current_price:
             st.error(f"❌ Error fetching price for {ticker}: {price_error}")
-            st.info("""
-            **Troubleshooting:**
-            - Verify the ticker symbol is correct
-            - Try a different asset class
-            - US stocks (AAPL, TSLA, SPY) have the best data availability
-            """)
+            st.info("Try US stocks (AAPL, TSLA, SPY) for best data")
         else:
             # Display current price
             col1, col2, col3 = st.columns(3)
@@ -432,7 +610,10 @@ if analyze_button and ticker:
                 st.metric("💰 Current Price", f"${current_price:.2f}")
             
             # Fetch options data
-            calls, puts, exp_date, opt_error = get_yahoo_options(ticker)
+            if use_nse_api:
+                calls, puts, exp_date, opt_error = get_nse_options_web(ticker)
+            else:
+                calls, puts, exp_date, opt_error = get_yahoo_options(ticker)
             
             if opt_error or calls is None:
                 st.error(f"❌ {opt_error or 'Unable to fetch options data'}")
@@ -456,6 +637,12 @@ if analyze_button and ticker:
                     st.metric("📅 Expiry Date", exp_date)
                 
                 st.success(f"✅ Options data loaded successfully!")
+                
+                # Enrich with Greeks if possible
+                try:
+                    calls, puts = enrich_options_with_greeks(calls, puts, current_price, exp_date)
+                except:
+                    pass
                 
                 # Calculate metrics
                 pcr_oi, pcr_vol = calculate_pcr(calls, puts)
@@ -611,7 +798,104 @@ if analyze_button and ticker:
                 
                 # Detailed OI Tables
                 st.markdown("---")
-                st.subheader("📋 Detailed Options Chain Data")
+                st.subheader("📊 DETAILED STRIKE PRICE ANALYSIS - 10 Strikes Near Spot")
+                
+                # Get 10 strikes near current price
+                calls_near, puts_near = get_strikes_near_spot(calls, puts, current_price, 10)
+                
+                st.markdown(f"**Spot Price: ${current_price:.2f}**")
+                
+                # Create comprehensive table
+                col_ce, col_pe = st.columns(2)
+                
+                with col_ce:
+                    st.markdown("### 📞 CALL OPTIONS (CE)")
+                    
+                    if not calls_near.empty:
+                        # Prepare display dataframe
+                        ce_display = pd.DataFrame()
+                        ce_display['Strike'] = calls_near['strike']
+                        ce_display['LTP'] = calls_near.get('lastPrice', 0).round(2)
+                        ce_display['Chg'] = calls_near.get('change', 0).round(2)
+                        ce_display['Chg%'] = calls_near.get('pChange', 0).round(2)
+                        ce_display['OI'] = calls_near['openInterest'].astype(int)
+                        ce_display['OI Chg'] = calls_near.get('changeinOpenInterest', 0).astype(int)
+                        
+                        # Calculate OI change percentage
+                        prev_oi = ce_display['OI'] - ce_display['OI Chg']
+                        ce_display['OI Chg%'] = ((ce_display['OI Chg'] / prev_oi.replace(0, 1)) * 100).round(2)
+                        
+                        ce_display['Vol'] = calls_near.get('volume', 0).astype(int)
+                        
+                        # Delta and Gamma
+                        if 'delta' in calls_near.columns:
+                            ce_display['Delta'] = calls_near['delta'].round(3)
+                            ce_display['Gamma'] = calls_near['gamma'].round(4)
+                        
+                        # IV
+                        ce_display['IV'] = (calls_near.get('impliedVolatility', 0) * 100).round(2)
+                        
+                        # Highlight ATM
+                        def highlight_atm(row):
+                            if abs(row['Strike'] - current_price) < 50:
+                                return ['background-color: #90EE90'] * len(row)
+                            return [''] * len(row)
+                        
+                        styled_ce = ce_display.style.apply(highlight_atm, axis=1)
+                        st.dataframe(styled_ce, use_container_width=True, hide_index=True, height=400)
+                    else:
+                        st.warning("No call data available")
+                
+                with col_pe:
+                    st.markdown("### 📉 PUT OPTIONS (PE)")
+                    
+                    if not puts_near.empty:
+                        # Prepare display dataframe
+                        pe_display = pd.DataFrame()
+                        pe_display['Strike'] = puts_near['strike']
+                        pe_display['LTP'] = puts_near.get('lastPrice', 0).round(2)
+                        pe_display['Chg'] = puts_near.get('change', 0).round(2)
+                        pe_display['Chg%'] = puts_near.get('pChange', 0).round(2)
+                        pe_display['OI'] = puts_near['openInterest'].astype(int)
+                        pe_display['OI Chg'] = puts_near.get('changeinOpenInterest', 0).astype(int)
+                        
+                        # Calculate OI change percentage
+                        prev_oi = pe_display['OI'] - pe_display['OI Chg']
+                        pe_display['OI Chg%'] = ((pe_display['OI Chg'] / prev_oi.replace(0, 1)) * 100).round(2)
+                        
+                        pe_display['Vol'] = puts_near.get('volume', 0).astype(int)
+                        
+                        # Delta and Gamma
+                        if 'delta' in puts_near.columns:
+                            pe_display['Delta'] = puts_near['delta'].round(3)
+                            pe_display['Gamma'] = puts_near['gamma'].round(4)
+                        
+                        # IV
+                        pe_display['IV'] = (puts_near.get('impliedVolatility', 0) * 100).round(2)
+                        
+                        # Highlight ATM
+                        def highlight_atm(row):
+                            if abs(row['Strike'] - current_price) < 50:
+                                return ['background-color: #FFB6C6'] * len(row)
+                            return [''] * len(row)
+                        
+                        styled_pe = pe_display.style.apply(highlight_atm, axis=1)
+                        st.dataframe(styled_pe, use_container_width=True, hide_index=True, height=400)
+                    else:
+                        st.warning("No put data available")
+                
+                # Legend
+                st.markdown("""
+                **Legend:**
+                - **LTP:** Last Traded Price | **Chg:** Price Change | **Chg%:** Price Change %
+                - **OI:** Open Interest | **OI Chg:** Change in OI | **OI Chg%:** OI Change %
+                - **Vol:** Volume | **Delta:** Rate of change | **Gamma:** Delta acceleration
+                - **IV:** Implied Volatility (%)
+                - 🟢 **Green Background:** Near ATM (money) strikes
+                """)
+                
+                st.markdown("---")
+                st.subheader("📋 Top 5 by Open Interest")
                 
                 col_left, col_right = st.columns(2)
                 
@@ -1251,3 +1535,68 @@ else:
     st.markdown("---")
 
 # Footer
+st.markdown("---")
+st.markdown("""
+<div style='text-align: center'>
+    <p>Options Chain Momentum Predictor | Data: Yahoo Finance</p>
+    <p><strong>Disclaimer:</strong> Not financial advice. Trade at your own risk.</p>
+</div>
+""", unsafe_allow_html=True)
+        **Key Indicators Explained:**
+        
+        **1. Put-Call Ratio (PCR)**
+        - Measures sentiment via options activity
+        - **PCR > 1.2:** Bullish (more puts = fear/hedging)
+        - **PCR < 0.8:** Bearish (more calls = greed)
+        - Contrarian indicator - works best at extremes
+        
+        **2. Max Pain Theory**
+        - Price where most options expire worthless
+        - Market makers profit maximization point
+        - Price tends to gravitate toward max pain
+        - Useful for weekly/monthly expiry predictions
+        
+        **3. Open Interest (OI) Analysis**
+        - **High Call OI** = Strong resistance level
+        - **High Put OI** = Strong support level
+        - OI > Volume = Established positions
+        - Volume > OI = Fresh positioning
+        
+        **4. Momentum Score**
+        - Combines all indicators (±5 scale)
+        - ≥3: Strong Bullish | ≤-3: Strong Bearish
+        - Weighted by conviction and confluence
+        """)
+    
+    with col2:
+        st.subheader("🎯 Trading Strategies")
+        st.markdown("""
+        **Based on Signal Strength:**
+        
+        **Strong Bullish (Score ≥3)**
+        - Enter LONG positions
+        - Buy ATM/OTM calls
+        - Target resistance levels
+        - Stop below support
+        
+        **Strong Bearish (Score ≤-3)**
+        - Enter SHORT positions  
+        - Buy ATM/OTM puts
+        - Target support levels
+        - Stop above resistance
+        
+        **Neutral (-1.5 to 1.5)**
+        - Range-bound strategies
+        - Iron Condor/Butterfly spreads
+        - Wait for breakout confirmation
+        - Reduce position sizing
+        
+        **Pro Tips:**
+        - Combine with price action & volume
+        - Watch for divergences
+        - Monitor IV changes
+        - Respect risk management
+        - Use stop losses always
+        """)
+    
+    st.markdown("
