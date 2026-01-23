@@ -564,6 +564,10 @@ def calculate_stop_loss(df, entry_price, signal, sl_type, config, position=None)
     
     current_price = df['Close'].iloc[-1]
     
+    # Calculate ATR if needed
+    if 'ATR' not in df.columns and 'ATR' in sl_type:
+        df['ATR'] = calculate_atr(df, 14)
+    
     if sl_type == 'Custom Points':
         if signal == 1:
             sl = entry_price - sl_points
@@ -584,8 +588,8 @@ def calculate_stop_loss(df, entry_price, signal, sl_type, config, position=None)
             else:
                 sl = new_sl
     
-    elif sl_type == 'ATR-based':
-        atr = df['ATR'].iloc[-1]
+    elif sl_type == 'ATR-based' or 'Volatility' in sl_type:
+        atr = df['ATR'].iloc[-1] if 'ATR' in df.columns else calculate_atr(df, 14).iloc[-1]
         if signal == 1:
             sl = entry_price - (atr * atr_mult)
         else:
@@ -632,7 +636,7 @@ def calculate_stop_loss(df, entry_price, signal, sl_type, config, position=None)
         else:
             sl = entry_price + sl_points
     
-    if sl != 0:
+    if sl != 0 and sl is not None:
         if signal == 1:
             sl = min(sl, entry_price - min_sl_distance)
         else:
@@ -649,6 +653,10 @@ def calculate_target(df, entry_price, signal, target_type, config, position=None
     
     current_price = df['Close'].iloc[-1]
     
+    # Calculate ATR if needed
+    if 'ATR' not in df.columns and 'ATR' in target_type:
+        df['ATR'] = calculate_atr(df, 14)
+    
     if target_type == 'Custom Points':
         if signal == 1:
             target = entry_price + target_points
@@ -658,13 +666,13 @@ def calculate_target(df, entry_price, signal, target_type, config, position=None
     elif 'Trailing Target' in target_type:
         if signal == 1:
             highest = st.session_state.get('highest_price', entry_price)
-            target = highest
+            target = highest if highest is not None else entry_price
         else:
             lowest = st.session_state.get('lowest_price', entry_price)
-            target = lowest
+            target = lowest if lowest is not None else entry_price
     
     elif target_type == 'ATR-based':
-        atr = df['ATR'].iloc[-1]
+        atr = df['ATR'].iloc[-1] if 'ATR' in df.columns else calculate_atr(df, 14).iloc[-1]
         if signal == 1:
             target = entry_price + (atr * atr_mult)
         else:
@@ -703,7 +711,7 @@ def calculate_target(df, entry_price, signal, target_type, config, position=None
             target = entry_price + target_points if signal == 1 else entry_price - target_points
     
     elif target_type == 'Risk-Reward Based':
-        if position and position.get('sl'):
+        if position and position.get('sl') and position['sl'] != 0:
             sl_distance = abs(entry_price - position['sl'])
             if signal == 1:
                 target = entry_price + (sl_distance * rr_ratio)
@@ -724,7 +732,7 @@ def calculate_target(df, entry_price, signal, target_type, config, position=None
         else:
             target = entry_price - target_points
     
-    if target != 0:
+    if target != 0 and target is not None:
         if signal == 1:
             target = max(target, entry_price + min_target_distance)
         else:
