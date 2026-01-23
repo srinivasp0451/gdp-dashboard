@@ -810,28 +810,29 @@ def run_backtest(df, strategy_func, config):
             if exit_price is None:
                 if 'Trailing' in sl_type and 'Signal-based' not in sl_type:
                     new_sl = calculate_stop_loss(temp_df, position['entry_price'], position['signal'], sl_type, config, position)
-                    position['sl'] = new_sl
+                    if new_sl is not None:
+                        position['sl'] = new_sl
                 
                 if position['signal'] == 1:
-                    if position['sl'] > 0 and current_price <= position['sl']:
+                    if position.get('sl') and position['sl'] > 0 and current_price <= position['sl']:
                         exit_price = position['sl']
                         exit_reason = 'SL Hit'
                 else:
-                    if position['sl'] > 0 and current_price >= position['sl']:
+                    if position.get('sl') and position['sl'] > 0 and current_price >= position['sl']:
                         exit_price = position['sl']
                         exit_reason = 'SL Hit'
             
             if exit_price is None and target_type == '50% Exit at Target (Partial)':
-                if not position['partial_exit_done']:
-                    if position['signal'] == 1 and position['target'] > 0:
+                if not position.get('partial_exit_done', False):
+                    if position['signal'] == 1 and position.get('target') and position['target'] > 0:
                         if current_price >= position['target']:
                             position['partial_exit_done'] = True
-                    elif position['signal'] == -1 and position['target'] > 0:
+                    elif position['signal'] == -1 and position.get('target') and position['target'] > 0:
                         if current_price <= position['target']:
                             position['partial_exit_done'] = True
             
             if exit_price is None and 'Break-even' in sl_type:
-                if not position['breakeven_activated'] and position['target'] > 0:
+                if not position.get('breakeven_activated', False) and position.get('target') and position['target'] > 0:
                     if position['signal'] == 1:
                         profit = current_price - position['entry_price']
                         target_dist = position['target'] - position['entry_price']
@@ -845,7 +846,7 @@ def run_backtest(df, strategy_func, config):
                             position['sl'] = position['entry_price']
                             position['breakeven_activated'] = True
             
-            if exit_price is None and position['target'] > 0 and 'Trailing Target' not in target_type and 'Signal-based' not in target_type:
+            if exit_price is None and position.get('target') and position['target'] > 0 and 'Trailing Target' not in target_type and 'Signal-based' not in target_type:
                 if position['signal'] == 1:
                     if current_price >= position['target']:
                         exit_price = position['target']
@@ -994,17 +995,17 @@ def execute_live_trading(ticker, interval, period, strategy_func, config, mode):
             
             if exit_price is None and target_type == '50% Exit at Target (Partial)':
                 if not st.session_state.get('partial_exit_done', False):
-                    if position['signal'] == 1 and position['target'] > 0:
+                    if position['signal'] == 1 and position.get('target') and position['target'] > 0:
                         if current_price >= position['target']:
                             st.session_state['partial_exit_done'] = True
                             add_log("50% position exited at target - trailing remaining")
-                    elif position['signal'] == -1 and position['target'] > 0:
+                    elif position['signal'] == -1 and position.get('target') and position['target'] > 0:
                         if current_price <= position['target']:
                             st.session_state['partial_exit_done'] = True
                             add_log("50% position exited at target - trailing remaining")
             
             if exit_price is None and 'Break-even' in sl_type:
-                if not st.session_state.get('breakeven_activated', False) and position['target'] > 0:
+                if not st.session_state.get('breakeven_activated', False) and position.get('target') and position['target'] > 0:
                     if position['signal'] == 1:
                         profit = current_price - position['entry_price']
                         target_dist = position['target'] - position['entry_price']
@@ -1022,7 +1023,7 @@ def execute_live_trading(ticker, interval, period, strategy_func, config, mode):
                             st.session_state['position'] = position
                             add_log("SL moved to break-even")
             
-            if exit_price is None and position['target'] > 0 and 'Trailing Target' not in target_type and 'Signal-based' not in target_type:
+            if exit_price is None and position.get('target') and position['target'] > 0 and 'Trailing Target' not in target_type and 'Signal-based' not in target_type:
                 if position['signal'] == 1:
                     if current_price >= position['target']:
                         exit_price = position['target']
@@ -1456,6 +1457,17 @@ def main():
         if st.session_state.get('trading_active', False):
             execute_live_trading(ticker, interval, period, strategy_func, config, mode)
         
+        # Always show live metrics and chart when data is available
+        current_df = st.session_state.get('current_data')
+        
+        # Fetch initial data if not available
+        if current_df is None and not st.session_state.get('trading_active', False):
+            with st.spinner("Fetching initial data..."):
+                current_df = fetch_data(ticker, interval, period, mode)
+                if current_df is not None:
+                    current_df = strategy_func(current_df, config)
+                    st.session_state['current_data'] = current_df
+        
         if st.session_state.get('current_data') is not None:
             df = st.session_state['current_data']
             
@@ -1585,11 +1597,11 @@ def main():
                 fig.add_hline(y=position['entry_price'], line_dash="dash", 
                             line_color="white", annotation_text="Entry")
                 
-                if position['sl'] > 0:
+                if position.get('sl') and position['sl'] > 0:
                     fig.add_hline(y=position['sl'], line_dash="dash", 
                                 line_color="red", annotation_text="SL")
                 
-                if position['target'] > 0:
+                if position.get('target') and position['target'] > 0:
                     fig.add_hline(y=position['target'], line_dash="dash", 
                                 line_color="green", annotation_text="Target")
             
