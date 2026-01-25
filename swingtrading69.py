@@ -4,219 +4,420 @@ import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
 from datetime import datetime
-import pytz
-import time
-import random
+import time, pytz, random
 
-st.set_page_config(page_title="Quantitative Trading System", layout="wide")
+st.set_page_config(page_title="Quant Trading", layout="wide")
 
-# Session state
-for k in ['trading_active','current_data','position','trade_history','trade_logs','trailing_sl_high','trailing_sl_low','trailing_target_high','trailing_target_low','trailing_profit_points','threshold_crossed','highest_price','lowest_price','partial_exit_done','breakeven_activated']:
-    if k not in st.session_state:
-        st.session_state[k]=[]if'history'in k or'logs'in k else(False if'active'in k or'crossed'in k or'done'in k or'activated'in k else(0 if'points'in k else None))
+ASSETS = {"NIFTY 50": "^NSEI", "BANKNIFTY": "^NSEBANK", "SENSEX": "^BSESN", "BTC": "BTC-USD", "ETH": "ETH-USD", 
+          "USDINR": "USDINR=X", "EURUSD": "EURUSD=X", "GBPUSD": "GBPUSD=X", "Gold": "GC=F", "Silver": "SI=F"}
+INTERVALS = {"1m": ["1d","5d"], "5m": ["1d","1mo"], "15m": ["1mo"], "30m": ["1mo"], "1h": ["1mo"], "4h": ["1mo"],
+             "1d": ["1mo","1y","2y","5y"], "1wk": ["1mo","1y","5y","10y","15y","20y"], "1mo": ["1y","2y","5y","10y","15y","20y","25y","30y"]}
 
-def ist():return datetime.now(pytz.timezone('Asia/Kolkata'))
-def fmt(d):return d.strftime("%Y-%m-%d %H:%M:%S IST")if d and not isinstance(d,str)else(d if d else"N/A")
-def log(m):st.session_state['trade_logs'].append(f"[{fmt(ist())}] {m}");st.session_state['trade_logs']=st.session_state['trade_logs'][-50:]
-def rst():
-    for k in['position','trailing_sl_high','trailing_sl_low','trailing_target_high','trailing_target_low','threshold_crossed','highest_price','lowest_price','partial_exit_done','breakeven_activated']:
-        st.session_state[k]=0 if'points'in k else(False if any(x in k for x in['crossed','done','activated'])else None)
+if 'trading_active' not in st.session_state:
+    for k,v in {'trading_active': False, 'position': None, 'trade_history': [], 'trade_logs': [], 'current_data': None,
+                'highest_price': None, 'lowest_price': None, 'partial_exit_done': False, 'breakeven_activated': False}.items():
+        st.session_state[k] = v
 
-def ema(d,p):return d.ewm(span=p,adjust=False).mean()
-def rsi(d,p=14):g=(d.diff().where(d.diff()>0,0)).rolling(p).mean();l=(-d.diff().where(d.diff()<0,0)).rolling(p).mean();return 100-(100/(1+g/l))
-def atr(h,l,c,p=14):return pd.concat([h-l,abs(h-c.shift(1)),abs(l-c.shift(1))],axis=1).max(axis=1).rolling(p).mean()
-def adx(h,l,c,p=14):pd1,md=h.diff(),-l.diff();pd1[pd1<0],md[md<0]=0,0;tr=pd.concat([h-l,abs(h-c.shift(1)),abs(l-c.shift(1))],axis=1).max(axis=1);a=tr.rolling(p).mean();pi,mi=100*pd1.rolling(p).mean()/a,100*md.rolling(p).mean()/a;return(100*abs(pi-mi)/(pi+mi)).rolling(p).mean()
-def ang(e,p=2):return np.degrees(np.arctan(e.diff(p)))if len(e)>=p+1 else pd.Series([0]*len(e),index=e.index)
-def swg(h,l,p=5):sh,sl=pd.Series(index=h.index,dtype=float),pd.Series(index=l.index,dtype=float);[sh.__setitem__(i,h.iloc[i])if h.iloc[i]==h.iloc[i-p:i+p+1].max()else None for i in range(p,len(h)-p)];[sl.__setitem__(i,l.iloc[i])if l.iloc[i]==l.iloc[i-p:i+p+1].min()else None for i in range(p,len(l)-p)];return sh,sl
+def ema(d, p): return d.ewm(span=p, adjust=False).mean()
+def atr(df, p=14):
+    tr = pd.concat([df['High']-df['Low'], abs(df['High']-df['Close'].shift()), abs(df['Low']-df['Close'].shift())], axis=1).max(axis=1)
+    return tr.rolling(p).mean()
+def rsi(d, p=14):
+    delta = d.diff(); gain = delta.where(delta>0, 0).rolling(p).mean(); loss = -delta.where(delta<0, 0).rolling(p).mean()
+    return 100 - 100/(1 + gain/loss)
+def adx(df, p=14):
+    pdm, mdm = df['High'].diff(), -df['Low'].diff(); pdm[pdm<0]=0; mdm[mdm<0]=0
+    tr = pd.concat([df['High']-df['Low'], abs(df['High']-df['Close'].shift()), abs(df['Low']-df['Close'].shift())], axis=1).max(axis=1)
+    atr_v = tr.rolling(p).mean(); pdi = 100*(pdm.rolling(p).mean()/atr_v); mdi = 100*(mdm.rolling(p).mean()/atr_v)
+    return (100*abs(pdi-mdi)/(pdi+mdi)).rolling(p).mean()
+def ema_angle(es, p=2): return np.degrees(np.arctan(es.diff(p)/p))
 
-def fch(t,i,p,m):
+def fetch_data(ticker, interval, period):
     try:
-        m=="Live Trading"and time.sleep(random.uniform(1.0,1.5));d=yf.download(t,interval=i,period=p,progress=False)
-        if d.empty:return None
-        isinstance(d.columns,pd.MultiIndex)and setattr(d,'columns',d.columns.droplevel(1));d=d[[c for c in['Open','High','Low','Close','Volume']if c in d.columns]]
-        d.index=d.index.tz_localize('UTC').tz_convert('Asia/Kolkata')if d.index.tz is None else d.index.tz_convert('Asia/Kolkata');return d
-    except:return None
+        data = yf.download(ticker, interval=interval, period=period, progress=False)
+        if data.empty: return None
+        if isinstance(data.columns, pd.MultiIndex): data.columns = [col[0] for col in data.columns.values]
+        data = data[['Open','High','Low','Close','Volume']].copy()
+        data.index = data.index.tz_localize('UTC').tz_convert('Asia/Kolkata') if data.index.tz is None else data.index.tz_convert('Asia/Kolkata')
+        return data
+    except: return None
 
-def csl(e,s,t,c,d,i,p=None):
-    sp,md=c.get('sl_points',10),c.get('min_sl_distance',10)
-    if t=="Custom Points":sl=e-sp if s==1 else e+sp
-    elif"Trailing"in t and"Points"in t:sl=(p-sp if s==1 else p+sp)if p else(e-sp if s==1 else e+sp)
-    elif"ATR"in t or"Volatility"in t:a=d['ATR'].iloc[i]*c.get('sl_atr',1.5);sl=e-a if s==1 else e+a
-    elif"Swing"in t:sh,sl1=swg(d['High'],d['Low']);r=sl1[:i+1 if"Current"in t else i].dropna()if s==1 else sh[:i+1 if"Current"in t else i].dropna();sl=r.iloc[-1]if len(r)>0 else(e-sp if s==1 else e+sp)
-    elif"Candle"in t:j=i if"Current"in t else(i-1 if i>0 else i);sl=d['Low'].iloc[j]if s==1 else d['High'].iloc[j]
-    else:sl=e-sp if s==1 else e+sp
-    return min(sl,e-md)if s==1 else max(sl,e+md)
+def ema_cross_strat(df, cfg):
+    fast, slow = cfg.get('ema_fast',9), cfg.get('ema_slow',15); min_ang = cfg.get('min_angle',1)
+    entry_filt = cfg.get('entry_filter','Simple Crossover'); cpts = cfg.get('custom_points',10); atr_m = cfg.get('atr_multiplier',1.5)
+    use_adx, adx_th = cfg.get('use_adx',False), cfg.get('adx_threshold',25)
+    df['EMA_Fast'], df['EMA_Slow'] = ema(df['Close'], fast), ema(df['Close'], slow)
+    df['EMA_Angle'], df['ATR'] = ema_angle(df['EMA_Fast'], 2), atr(df, 14)
+    if use_adx: df['ADX'] = adx(df, 14)
+    sigs = pd.Series(index=df.index, data=0)
+    for i in range(1, len(df)):
+        bc = df['EMA_Fast'].iloc[i]>df['EMA_Slow'].iloc[i] and df['EMA_Fast'].iloc[i-1]<=df['EMA_Slow'].iloc[i-1]
+        brc = df['EMA_Fast'].iloc[i]<df['EMA_Slow'].iloc[i] and df['EMA_Fast'].iloc[i-1]>=df['EMA_Slow'].iloc[i-1]
+        ang_ok = abs(df['EMA_Angle'].iloc[i]) >= min_ang; adx_ok = not use_adx or df['ADX'].iloc[i]>=adx_th
+        csz = abs(df['Close'].iloc[i]-df['Open'].iloc[i])
+        fok = csz>=cpts if entry_filt=='Custom Candle (Points)' else (csz>=df['ATR'].iloc[i]*atr_m if entry_filt=='ATR-based Candle' else True)
+        if bc and ang_ok and fok and adx_ok: sigs.iloc[i]=1
+        elif brc and ang_ok and fok and adx_ok: sigs.iloc[i]=-1
+    df['Signal'] = sigs; return df
 
-def ctg(e,s,t,c,d,i,sp):
-    tp,md=c.get('target_points',20),c.get('min_target_distance',15)
-    if"Custom"in t or"Trailing"in t:tg=e+tp if s==1 else e-tp
-    elif"ATR"in t:a=d['ATR'].iloc[i]*c.get('tgt_atr',3.0);tg=e+a if s==1 else e-a
-    elif"Risk-Reward"in t:tg=e+(abs(e-sp)*c.get('rr_ratio',2.0))if s==1 else e-(abs(e-sp)*c.get('rr_ratio',2.0))
-    elif"Swing"in t:sh,sl=swg(d['High'],d['Low']);r=sh[:i+1 if"Current"in t else i].dropna()if s==1 else sl[:i+1 if"Current"in t else i].dropna();tg=r.iloc[-1]if len(r)>0 else(e+tp if s==1 else e-tp)
-    elif"Candle"in t:j=i if"Current"in t else(i-1 if i>0 else i);tg=d['High'].iloc[j]if s==1 else d['Low'].iloc[j]
-    else:tg=e+tp if s==1 else e-tp
-    return max(tg,e+md)if s==1 else min(tg,e-md)
+def pct_change_strat(df, cfg):
+    pth, direc = cfg.get('pct_threshold',0.01), cfg.get('pct_direction','BUY on Fall')
+    fp = df['Close'].iloc[0]; df['PctChange'] = ((df['Close']-fp)/fp)*100; df['Signal']=0
+    for i in range(len(df)):
+        pc = df['PctChange'].iloc[i]
+        if direc=='BUY on Fall' and pc<=-pth: df['Signal'].iloc[i]=1
+        elif direc=='SELL on Fall' and pc<=-pth: df['Signal'].iloc[i]=-1
+        elif direc=='BUY on Rise' and pc>=pth: df['Signal'].iloc[i]=1
+        elif direc=='SELL on Rise' and pc>=pth: df['Signal'].iloc[i]=-1
+    return df
 
-def utsl(p,cs,s,t,c,d,i):
-    if"Trailing"not in t:return cs
-    sp,th=c.get('sl_points',10),c.get('trailing_threshold',0)
-    if"Points"in t:n=p-sp if s==1 else p+sp;return n if(s==1 and n>cs+th)or(s==-1 and n<cs-th)else cs
-    elif"Candle"in t:n=d['Low'].iloc[i]if s==1 else d['High'].iloc[i];return n if(s==1 and n>cs)or(s==-1 and n<cs)else cs
-    return cs
+def calc_sl(df, i, pos, slt, slp, cfg):
+    ent, sig, cur = pos['entry_price'], pos['signal'], df['Close'].iloc[i]
+    if slt=='Custom Points': return ent-slp if sig==1 else ent+slp
+    elif slt=='Trailing SL (Points)':
+        nsl = cur-slp if sig==1 else cur+slp
+        return nsl if pos['sl'] is None or ((sig==1 and nsl>pos['sl']) or (sig==-1 and nsl<pos['sl'])) else pos['sl']
+    elif slt=='ATR-based':
+        av = df['ATR'].iloc[i] if 'ATR' in df.columns else atr(df.iloc[:i+1],14).iloc[-1]
+        return ent-av*cfg.get('atr_sl_multiplier',1.5) if sig==1 else ent+av*cfg.get('atr_sl_multiplier',1.5)
+    elif slt=='Break-even After 50% Target':
+        if pos.get('breakeven_activated'): return ent
+        if pos['target']:
+            td, cp = abs(pos['target']-ent), abs(cur-ent)
+            if cp>=td*0.5: pos['breakeven_activated']=True; return ent
+        return ent-slp if sig==1 else ent+slp
+    else: return ent-slp if sig==1 else ent+slp
 
-def bkt(t,i,p,st,c,q):
-    d=fch(t,i,p,"Backtest")
-    if d is None or len(d)<50:return None,"Insufficient data"
-    d['EF'],d['ES'],d['A'],d['R'],d['X'],d['T']=ema(d['Close'],c.get('ema_fast',9)),ema(d['Close'],c.get('ema_slow',15)),ang(ema(d['Close'],c.get('ema_fast',9))),rsi(d['Close']),adx(d['High'],d['Low'],d['Close']),atr(d['High'],d['Low'],d['Close'])
-    tr,po=[],None
-    for j in range(50,len(d)):
-        cp,ef,es,an,ax=d['Close'].iloc[j],d['EF'].iloc[j],d['ES'].iloc[j],abs(d['A'].iloc[j]),d['X'].iloc[j]
-        if po is None:
-            sg=0
-            if st=="EMA Crossover"and ef>es and d['EF'].iloc[j-1]<=d['ES'].iloc[j-1]and an>=c.get('min_angle',1.0)and(not c.get('use_adx')or ax>=c.get('adx_threshold',25)):sg=1
-            elif st=="EMA Crossover"and ef<es and d['EF'].iloc[j-1]>=d['ES'].iloc[j-1]and an>=c.get('min_angle',1.0)and(not c.get('use_adx')or ax>=c.get('adx_threshold',25)):sg=-1
-            elif st=="Simple Buy":sg=1
-            elif st=="Simple Sell":sg=-1
-            elif st=="Price Threshold":th,dr=c['threshold'],c['direction'];sg=1 if("LONG (>="in dr and cp>=th)or("LONG (<="in dr and cp<=th)else(-1 if("SHORT (>="in dr and cp>=th)or("SHORT (<="in dr and cp<=th)else 0)
-            elif st=="Percentage Change":pc=((cp-d['Close'].iloc[0])/d['Close'].iloc[0])*100;pt,pd=c['pct_threshold'],c['pct_direction'];sg=1 if(("BUY on Fall"in pd and pc<=-pt)or("BUY on Rise"in pd and pc>=pt))else(-1 if(("SELL on Fall"in pd and pc<=-pt)or("SELL on Rise"in pd and pc>=pt))else 0)
-            if sg!=0:sl=csl(cp,sg,c['sl_type'],c,d,j);tg=ctg(cp,sg,c['target_type'],c,d,j,sl);po={'et':d.index[j],'ep':cp,'sg':sg,'sl':sl,'tg':tg,'hi':cp,'lo':cp}
+def calc_tgt(df, i, pos, tgtt, tgtp, cfg):
+    ent, sig = pos['entry_price'], pos['signal']
+    if tgtt=='Custom Points': return ent+tgtp if sig==1 else ent-tgtp
+    elif tgtt=='ATR-based':
+        av = df['ATR'].iloc[i] if 'ATR' in df.columns else atr(df.iloc[:i+1],14).iloc[-1]
+        return ent+av*cfg.get('atr_target_multiplier',3) if sig==1 else ent-av*cfg.get('atr_target_multiplier',3)
+    elif tgtt in ['Trailing Target (Points)','Signal-based (reverse EMA crossover)']: return None
+    else: return ent+tgtp if sig==1 else ent-tgtp
+
+def check_sig_exit(df, i, pos):
+    if 'EMA_Fast' not in df.columns or i<1: return False
+    if pos['signal']==1: return df['EMA_Fast'].iloc[i]<df['EMA_Slow'].iloc[i] and df['EMA_Fast'].iloc[i-1]>=df['EMA_Slow'].iloc[i-1]
+    else: return df['EMA_Fast'].iloc[i]>df['EMA_Slow'].iloc[i] and df['EMA_Fast'].iloc[i-1]<=df['EMA_Slow'].iloc[i-1]
+
+def add_log(m):
+    ts = datetime.now(pytz.timezone('Asia/Kolkata')).strftime('%Y-%m-%d %H:%M:%S')
+    st.session_state['trade_logs'].append(f"[{ts}] {m}"); st.session_state['trade_logs']=st.session_state['trade_logs'][-50:]
+
+def reset_pos():
+    for k in ['position','highest_price','lowest_price','partial_exit_done','breakeven_activated']: st.session_state[k]=None if 'price' in k or k=='position' else False
+
+def run_backtest(df, strat_func, cfg, slt, slp, tgtt, tgtp, qty):
+    trades, pos = [], None
+    for i in range(1, len(df)):
+        if pos is None:
+            if df['Signal'].iloc[i]!=0:
+                pos = {'entry_time': df.index[i], 'entry_price': df['Close'].iloc[i], 'signal': df['Signal'].iloc[i],
+                       'sl': None, 'target': None, 'highest': df['Close'].iloc[i], 'lowest': df['Close'].iloc[i],
+                       'partial_exit_done': False, 'breakeven_activated': False}
+                pos['sl'], pos['target'] = calc_sl(df,i,pos,slt,slp,cfg), calc_tgt(df,i,pos,tgtt,tgtp,cfg)
         else:
-            sg,ep,sl,tg=po['sg'],po['ep'],po['sl'],po['tg'];po['hi'],po['lo']=max(po['hi'],cp),min(po['lo'],cp);sl=utsl(cp,sl,sg,c['sl_type'],c,d,j);po['sl']=sl
-            xt,xr,xp=False,"",cp
-            if(sg==1 and cp<=sl)or(sg==-1 and cp>=sl):xt,xr,xp=True,"SL Hit",sl
-            elif(sg==1 and cp>=tg)or(sg==-1 and cp<=tg):xt,xr,xp=True,"Target Hit",tg
-            elif"Signal-based"in c['sl_type']or"Signal-based"in c['target_type']:
-                if(sg==1 and ef<es and d['EF'].iloc[j-1]>=d['ES'].iloc[j-1])or(sg==-1 and ef>es and d['EF'].iloc[j-1]<=d['ES'].iloc[j-1]):xt,xr,xp=True,"Reverse Signal",cp
-            if xt:pnl=(xp-ep)*q if sg==1 else(ep-xp)*q;tr.append({'entry_time':po['et'],'exit_time':d.index[j],'duration':(d.index[j]-po['et']).total_seconds()/3600,'signal':'LONG'if sg==1 else'SHORT','entry_price':ep,'exit_price':xp,'sl':po['sl'],'target':tg,'exit_reason':xr,'pnl':pnl,'highest':po['hi'],'lowest':po['lo'],'range':po['hi']-po['lo']});po=None
-    return tr,None
-
-# Sidebar
-st.sidebar.header("⚙️ Configuration")
-am={"NIFTY 50":"^NSEI","BANKNIFTY":"^NSEBANK","SENSEX":"^BSESN","BTC":"BTC-USD","ETH":"ETH-USD","USDINR":"USDINR=X","EURUSD":"EURUSD=X","GBPUSD":"GBPUSD=X","GOLD":"GC=F","SILVER":"SI=F"}
-a=st.sidebar.selectbox("Asset",list(am.keys())+["Custom"])
-tk=st.sidebar.text_input("Ticker",am.get(a,"^NSEI"))if a=="Custom"else am[a]
-iv=st.sidebar.selectbox("Interval",["1m","5m","15m","30m","1h","4h","1d","1wk","1mo"])
-pm={"1m":["1d","5d"],"5m":["1d","1mo"],"15m":["1mo"],"30m":["1mo"],"1h":["1mo"],"4h":["1mo"],"1d":["1mo","1y","2y","5y"],"1wk":["1mo","1y","5y","10y","15y","20y"],"1mo":["1y","2y","5y","10y","15y","20y","25y","30y"]}
-pr=st.sidebar.selectbox("Period",pm.get(iv,["1mo"]))
-md=st.sidebar.selectbox("Mode",["Live Trading","Backtest"])
-qty=st.sidebar.number_input("Quantity",min_value=1,value=1)
-strat=st.sidebar.selectbox("Strategy",["EMA Crossover","Simple Buy","Simple Sell","Price Threshold","Percentage Change"])
-
-cfg={}
-if strat=="EMA Crossover":
-    st.sidebar.subheader("EMA Settings");cfg['ema_fast'],cfg['ema_slow'],cfg['min_angle']=st.sidebar.number_input("Fast",value=9,key="ef"),st.sidebar.number_input("Slow",value=15,key="es"),st.sidebar.number_input("Min Angle",value=1.0,key="ma")
-    cfg['use_adx']=st.sidebar.checkbox("Use ADX Filter")
-    cfg['use_adx']and setattr(cfg,'adx_threshold',st.sidebar.number_input("ADX Threshold",value=25.0,key="at"))or None
-elif strat=="Price Threshold":cfg['threshold'],cfg['direction']=st.sidebar.number_input("Threshold",value=100.0,key="th"),st.sidebar.selectbox("Direction",["LONG (>=)","SHORT (>=)","LONG (<=)","SHORT (<=)"])
-elif strat=="Percentage Change":cfg['pct_threshold'],cfg['pct_direction']=st.sidebar.number_input("% Threshold",value=0.01,step=0.01,key="pt"),st.sidebar.selectbox("Direction",["BUY on Fall","SELL on Fall","BUY on Rise","SELL on Rise"])
-
-st.sidebar.subheader("Stop Loss")
-slt=st.sidebar.selectbox("SL Type",["Custom Points","Trailing SL (Points)","Trailing SL + Current Candle","Trailing SL + Previous Candle","Trailing SL + Current Swing","Trailing SL + Previous Swing","Trailing SL + Signal Based","Volatility-Adjusted Trailing SL","Break-even After 50% Target","ATR-based","Current Candle Low/High","Previous Candle Low/High","Current Swing Low/High","Previous Swing Low/High","Signal-based (reverse EMA crossover)"])
-cfg['sl_type']=slt
-("Points"in slt or"Custom"in slt)and setattr(cfg,'sl_points',st.sidebar.number_input("SL Points",value=10.0,key="slp"))or None
-("ATR"in slt or"Volatility"in slt)and setattr(cfg,'sl_atr',st.sidebar.number_input("ATR Mult (SL)",value=1.5,key="sla"))or None
-"Trailing"in slt and setattr(cfg,'trailing_threshold',st.sidebar.number_input("Trailing Threshold",value=0.0,key="tth"))or None
-cfg['min_sl_distance']=st.sidebar.number_input("Min SL Distance",value=10.0,key="msd")
-
-st.sidebar.subheader("Target")
-tgt=st.sidebar.selectbox("Target Type",["Custom Points","Trailing Target (Points)","Trailing Target + Signal Based","50% Exit at Target (Partial)","Current Candle Low/High","Previous Candle Low/High","Current Swing Low/High","Previous Swing Low/High","ATR-based","Risk-Reward Based","Signal-based (reverse EMA crossover)"])
-cfg['target_type']=tgt
-("Points"in tgt or"Custom"in tgt)and setattr(cfg,'target_points',st.sidebar.number_input("Target Points",value=20.0,key="tp"))or None
-"ATR"in tgt and setattr(cfg,'tgt_atr',st.sidebar.number_input("ATR Mult (Tgt)",value=3.0,key="ta"))or None
-"Risk-Reward"in tgt and setattr(cfg,'rr_ratio',st.sidebar.number_input("R:R Ratio",value=2.0,key="rr"))or None
-cfg['min_target_distance']=st.sidebar.number_input("Min Target Distance",value=15.0,key="mtd")
-
-st.sidebar.subheader("Dhan (Placeholder)")
-ud=st.sidebar.checkbox("Enable Dhan")
-ud and(st.sidebar.text_input("Client ID",key="dci"),st.sidebar.text_input("Token",type="password",key="dtk"),st.sidebar.info("Placeholder only"))or None
+            cp = df['Close'].iloc[i]; pos['highest'], pos['lowest'] = max(pos['highest'],cp), min(pos['lowest'],cp)
+            exp, exr = None, None
+            if slt=='Signal-based (reverse EMA crossover)' or tgtt=='Signal-based (reverse EMA crossover)':
+                if check_sig_exit(df,i,pos): exp, exr = cp, "Reverse Signal"
+            if exp is None and pos['sl']:
+                if (pos['signal']==1 and cp<=pos['sl']) or (pos['signal']==-1 and cp>=pos['sl']): exp, exr = pos['sl'], "Stop Loss"
+            if exp is None and pos['target']:
+                if (pos['signal']==1 and cp>=pos['target']) or (pos['signal']==-1 and cp<=pos['target']):
+                    if tgtt=='50% Exit at Target (Partial)' and not pos['partial_exit_done']: pos['partial_exit_done']=True
+                    else: exp, exr = pos['target'], "Target Hit"
+            if exp is None and slt in ['Trailing SL (Points)','Break-even After 50% Target']: pos['sl']=calc_sl(df,i,pos,slt,slp,cfg)
+            if exp:
+                pnl = (exp-pos['entry_price'])*qty if pos['signal']==1 else (pos['entry_price']-exp)*qty
+                dur = (df.index[i]-pos['entry_time']).total_seconds()/3600
+                trades.append({'entry_time': pos['entry_time'], 'exit_time': df.index[i], 'duration': dur,
+                              'signal': 'LONG' if pos['signal']==1 else 'SHORT', 'entry_price': pos['entry_price'],
+                              'exit_price': exp, 'sl': pos['sl'], 'target': pos['target'], 'exit_reason': exr,
+                              'pnl': pnl, 'highest': pos['highest'], 'lowest': pos['lowest']})
+                pos = None
+    tt = len(trades); win = sum(1 for t in trades if t['pnl']>0); los = tt-win
+    acc = win/tt*100 if tt>0 else 0; tpnl = sum(t['pnl'] for t in trades); avgd = sum(t['duration'] for t in trades)/tt if tt>0 else 0
+    return {'trades': trades, 'total_trades': tt, 'winning_trades': win, 'losing_trades': los, 'accuracy': acc, 'total_pnl': tpnl, 'avg_duration': avgd}
 
 st.title("🎯 Professional Quantitative Trading System")
 
-t1,t2,t3,t4=st.tabs(["📊 Live Dashboard","📈 Trade History","📝 Logs","🔬 Backtest"])
+st.sidebar.header("Configuration")
+asset_name = st.sidebar.selectbox("Select Asset", list(ASSETS.keys())+["Custom"])
+ticker = st.sidebar.text_input("Enter Ticker", "AAPL") if asset_name=="Custom" else ASSETS[asset_name]
+interval = st.sidebar.selectbox("Interval", list(INTERVALS.keys()))
+period = st.sidebar.selectbox("Period", INTERVALS[interval])
+mode = st.sidebar.radio("Mode", ["Backtest","Live Trading"])
+quantity = st.sidebar.number_input("Quantity", min_value=1, value=1, step=1, key="qty")
+strategy = st.sidebar.selectbox("Strategy", ["EMA Crossover","Simple Buy","Simple Sell","Price Threshold","RSI-ADX-EMA","Percentage Change","AI Price Action","Custom Builder"])
 
-with t1:
-    st.header("Live Trading Dashboard")
-    c1,c2,c3=st.columns([1,1,2])
+cfg = {}
+if strategy=="EMA Crossover":
+    cfg['ema_fast'] = st.sidebar.number_input("EMA Fast", value=9, min_value=1, key="ef")
+    cfg['ema_slow'] = st.sidebar.number_input("EMA Slow", value=15, min_value=1, key="es")
+    cfg['min_angle'] = st.sidebar.number_input("Min Angle", value=1.0, min_value=0.0, key="ma")
+    cfg['entry_filter'] = st.sidebar.selectbox("Entry Filter", ["Simple Crossover","Custom Candle (Points)","ATR-based Candle"])
+    if cfg['entry_filter']=="Custom Candle (Points)": cfg['custom_points']=st.sidebar.number_input("Custom Points", value=10.0, key="cp")
+    elif cfg['entry_filter']=="ATR-based Candle": cfg['atr_multiplier']=st.sidebar.number_input("ATR Multiplier", value=1.5, key="am")
+    cfg['use_adx'] = st.sidebar.checkbox("Use ADX Filter")
+    if cfg['use_adx']:
+        cfg['adx_period'], cfg['adx_threshold'] = st.sidebar.number_input("ADX Period", value=14, min_value=1, key="ap"), st.sidebar.number_input("ADX Threshold", value=25.0, key="at")
+elif strategy=="Percentage Change":
+    cfg['pct_threshold'] = st.sidebar.number_input("% Threshold", value=0.01, min_value=0.001, step=0.001, key="pt")
+    cfg['pct_direction'] = st.sidebar.selectbox("Direction", ["BUY on Fall","SELL on Fall","BUY on Rise","SELL on Rise"])
+
+sl_type = st.sidebar.selectbox("Stop Loss Type", ["Custom Points","Trailing SL (Points)","ATR-based","Signal-based (reverse EMA crossover)","Break-even After 50% Target","Current Candle Low/High"])
+sl_points = 10.0
+if sl_type not in ["Signal-based (reverse EMA crossover)"]: sl_points = st.sidebar.number_input("SL Points", value=10.0, min_value=1.0, key="slp")
+if sl_type=="ATR-based": cfg['atr_sl_multiplier'] = st.sidebar.number_input("ATR SL Multiplier", value=1.5, key="asm")
+
+target_type = st.sidebar.selectbox("Target Type", ["Custom Points","Trailing Target (Points)","ATR-based","Signal-based (reverse EMA crossover)","50% Exit at Target (Partial)"])
+target_points = 20.0
+if target_type not in ["Signal-based (reverse EMA crossover)","Trailing Target (Points)"]: target_points = st.sidebar.number_input("Target Points", value=20.0, min_value=1.0, key="tp")
+if target_type=="ATR-based": cfg['atr_target_multiplier'] = st.sidebar.number_input("ATR Target Multiplier", value=3.0, key="atm")
+
+st.sidebar.markdown("---")
+st.sidebar.subheader("Dhan Integration (Placeholder)")
+use_dhan = st.sidebar.checkbox("Enable Dhan Brokerage")
+if use_dhan:
+    dhan_client_id, dhan_token = st.sidebar.text_input("Client ID"), st.sidebar.text_input("Token", type="password")
+    dhan_strike, dhan_option = st.sidebar.number_input("Strike Price", value=0.0), st.sidebar.selectbox("Option Type", ["CE","PE"])
+    dhan_expiry, dhan_lots = st.sidebar.date_input("Expiry Date"), st.sidebar.number_input("Lots", value=1, min_value=1)
+
+tab1, tab2, tab3, tab4 = st.tabs(["📊 Live Trading","📈 Trade History","📝 Trade Logs","🔬 Backtest"])
+
+with tab1:
+    c1,c2,c3 = st.columns([2,2,6])
     with c1:
-        st.button("▶️ Start",type="primary",use_container_width=True)and(setattr(st.session_state,'trading_active',True),log("Trading started"),st.rerun())or None
+        if st.button("▶️ Start Trading", type="primary", use_container_width=True):
+            st.session_state['trading_active']=True; reset_pos(); add_log("Trading started"); st.rerun()
     with c2:
-        if st.button("⏹️ Stop",type="secondary",use_container_width=True):
-            st.session_state['trading_active']=False
-            if st.session_state['position']:
-                po=st.session_state['position'];xp=st.session_state['current_data']['Close'].iloc[-1]if st.session_state['current_data']is not None else po['entry_price'];pnl=(xp-po['entry_price'])*qty if po['signal']==1 else(po['entry_price']-xp)*qty
-                st.session_state['trade_history'].append({'entry_time':po['entry_time'],'exit_time':ist(),'signal':'LONG'if po['signal']==1 else'SHORT','entry_price':po['entry_price'],'exit_price':xp,'sl':po.get('sl',0),'target':po.get('target',0),'exit_reason':'Manual Close','pnl':pnl,'highest':po.get('highest',xp),'lowest':po.get('lowest',xp),'range':po.get('highest',xp)-po.get('lowest',xp),'duration':(ist()-po['entry_time']).total_seconds()/3600})
-                log(f"Manual close. PnL: {pnl:.2f}")
-            rst();log("Trading stopped");st.rerun()
-    with c3:st.success("🟢 ACTIVE")if st.session_state['trading_active']else st.info("⚪ STOPPED")
+        if st.button("⏹️ Stop Trading", use_container_width=True):
+            if st.session_state['trading_active']:
+                if st.session_state['position']:
+                    pos = st.session_state['position']
+                    cp = st.session_state['current_data']['Close'].iloc[-1] if st.session_state['current_data'] is not None else pos['entry_price']
+                    pnl = (cp-pos['entry_price'])*quantity if pos['signal']==1 else (pos['entry_price']-cp)*quantity
+                    dur = (datetime.now(pytz.timezone('Asia/Kolkata'))-pos['entry_time']).total_seconds()/3600
+                    st.session_state['trade_history'].append({'entry_time': pos['entry_time'], 'exit_time': datetime.now(pytz.timezone('Asia/Kolkata')),
+                                                               'duration': dur, 'signal': 'LONG' if pos['signal']==1 else 'SHORT', 'entry_price': pos['entry_price'],
+                                                               'exit_price': cp, 'sl': pos.get('sl'), 'target': pos.get('target'), 'exit_reason': 'Manual Close',
+                                                               'pnl': pnl, 'highest': pos.get('highest',cp), 'lowest': pos.get('lowest',cp)})
+                    add_log(f"Position manually closed - PnL: {pnl:.2f}")
+                st.session_state['trading_active']=False; reset_pos(); add_log("Trading stopped"); st.rerun()
+    with c3:
+        st.success("🟢 Trading is ACTIVE") if st.session_state['trading_active'] else st.info("⚪ Trading is STOPPED")
     
-    st.button("🔄 Refresh")and st.rerun()or None
+    if st.button("🔄 Manual Refresh"): st.rerun()
     
-    c1,c2,c3=st.columns(3)
-    c1.write(f"**Asset:** {a} ({tk})\n**Interval:** {iv} | **Period:** {pr}")
-    c2.write(f"**Qty:** {qty} | **Strategy:** {strat}\n**Mode:** {md}")
-    c3.write(f"**SL:** {slt}\n**Target:** {tgt}")
+    st.markdown("### Configuration")
+    c1,c2,c3,c4 = st.columns(4)
+    with c1: st.metric("Asset", asset_name if asset_name!="Custom" else ticker); st.metric("Interval", interval)
+    with c2: st.metric("Period", period); st.metric("Quantity", quantity)
+    with c3: st.metric("Strategy", strategy); st.metric("SL Type", sl_type)
+    with c4:
+        sl_d = f"{sl_points:.2f}" if sl_type!="Signal-based (reverse EMA crossover)" else "Signal Based"
+        tgt_d = f"{target_points:.2f}" if target_type not in ["Signal-based (reverse EMA crossover)","Trailing Target (Points)"] else "Signal Based"
+        st.metric("SL Points", sl_d); st.metric("Target Points", tgt_d)
     
-    if st.session_state['trading_active']and md=="Live Trading":
-        ph=st.empty()
-        while st.session_state['trading_active']:
-            with ph.container():
-                df=fch(tk,iv,pr,md)
-                if df is None or len(df)==0:st.error("No data");time.sleep(2);continue
-                st.session_state['current_data']=df;df['EF'],df['ES'],df['A'],df['R'],df['X'],df['T']=ema(df['Close'],cfg.get('ema_fast',9)),ema(df['Close'],cfg.get('ema_slow',15)),ang(ema(df['Close'],cfg.get('ema_fast',9))),rsi(df['Close']),adx(df['High'],df['Low'],df['Close']),atr(df['High'],df['Low'],df['Close'])
-                cp,ef,es,an,rs,ax=df['Close'].iloc[-1],df['EF'].iloc[-1],df['ES'].iloc[-1],abs(df['A'].iloc[-1]),df['R'].iloc[-1],df['X'].iloc[-1]
-                
-                m1,m2,m3,m4,m5=st.columns(5)
-                m1.metric("Price",f"{cp:.2f}");m2.metric("EMA Fast",f"{ef:.2f}");m3.metric("EMA Slow",f"{es:.2f}");m4.metric("RSI",f"{rs:.2f}");m5.metric("ADX",f"{ax:.2f}")
-                m6,m7,m8=st.columns(3)
-                m6.metric("Angle",f"{an:.2f}°");m7.metric("Updated",fmt(ist()))
-                
-                po=st.session_state['position']
-                if po is None:
-                    sg=0
-                    if strat=="EMA Crossover"and ef>es and df['EF'].iloc[-2]<=df['ES'].iloc[-2]and an>=cfg.get('min_angle',1.0)and(not cfg.get('use_adx')or ax>=cfg.get('adx_threshold',25)):sg=1
-                    elif strat=="EMA Crossover"and ef<es and df['EF'].iloc[-2]>=df['ES'].iloc[-2]and an>=cfg.get('min_angle',1.0)and(not cfg.get('use_adx')or ax>=cfg.get('adx_threshold',25)):sg=-1
-                    elif strat=="Simple Buy":sg=1
-                    elif strat=="Simple Sell":sg=-1
-                    elif strat=="Price Threshold":th,dr=cfg['threshold'],cfg['direction'];sg=1 if("LONG (>="in dr and cp>=th)or("LONG (<="in dr and cp<=th)else(-1 if("SHORT (>="in dr and cp>=th)or("SHORT (<="in dr and cp<=th)else 0)
-                    elif strat=="Percentage Change":pc=((cp-df['Close'].iloc[0])/df['Close'].iloc[0])*100;pt,pd=cfg['pct_threshold'],cfg['pct_direction'];sg=1 if(("BUY on Fall"in pd and pc<=-pt)or("BUY on Rise"in pd and pc>=pt))else(-1 if(("SELL on Fall"in pd and pc<=-pt)or("SELL on Rise"in pd and pc>=pt))else 0)
-                    
-                    if sg!=0:sl=csl(cp,sg,cfg['sl_type'],cfg,df,len(df)-1);tg=ctg(cp,sg,cfg['target_type'],cfg,df,len(df)-1,sl);st.session_state['position']={'entry_time':ist(),'entry_price':cp,'signal':sg,'sl':sl,'target':tg,'highest':cp,'lowest':cp};log(f"{'LONG'if sg==1 else'SHORT'} @ {cp:.2f}, SL: {sl:.2f}, Tgt: {tg:.2f}");m8.success("✅ Entered")
-                else:
-                    sg,ep,sl,tg=po['signal'],po['entry_price'],po['sl'],po['target'];po['highest'],po['lowest']=max(po['highest'],cp),min(po['lowest'],cp);pnl=(cp-ep)*qty if sg==1 else(ep-cp)*qty
-                    
-                    p1,p2,p3,p4=st.columns(4)
-                    p1.metric("Entry",f"{ep:.2f}");p1.metric("Type","LONG"if sg==1 else"SHORT");p2.metric("SL",f"{sl:.2f}");p2.metric("Dist SL",f"{abs(cp-sl):.2f}");p3.metric("Target",f"{tg:.2f}");p3.metric("Dist Tgt",f"{abs(tg-cp):.2f}");p4.metric("P&L",f"{pnl:.2f}",delta=f"{'+'if pnl>=0 else''}{pnl:.2f}",delta_color="normal"if pnl>=0 else"inverse")
-                    
-                    sl=utsl(cp,sl,sg,cfg['sl_type'],cfg,df,len(df)-1);po['sl']=sl
-                    xt,xr=False,""
-                    if(sg==1 and cp<=sl)or(sg==-1 and cp>=sl):xt,xr=True,"SL Hit"
-                    elif(sg==1 and cp>=tg)or(sg==-1 and cp<=tg):xt,xr=True,"Target Hit"
-                    elif"Signal-based"in cfg['sl_type']or"Signal-based"in cfg['target_type']:
-                        if(sg==1 and ef<es and df['EF'].iloc[-2]>=df['ES'].iloc[-2])or(sg==-1 and ef>es and df['EF'].iloc[-2]<=df['ES'].iloc[-2]):xt,xr=True,"Reverse Signal"
-                    
-                    if xt:st.session_state['trade_history'].append({'entry_time':po['entry_time'],'exit_time':ist(),'signal':'LONG'if sg==1 else'SHORT','entry_price':ep,'exit_price':cp,'sl':sl,'target':tg,'exit_reason':xr,'pnl':pnl,'highest':po['highest'],'lowest':po['lowest'],'range':po['highest']-po['lowest'],'duration':(ist()-po['entry_time']).total_seconds()/3600});log(f"Exit: {xr}. PnL: {pnl:.2f}");rst();st.success(f"✅ {xr}")
-                
-                fig=go.Figure()
-                fig.add_trace(go.Candlestick(x=df.index,open=df['Open'],high=df['High'],low=df['Low'],close=df['Close'],name='Price'))
-                fig.add_trace(go.Scatter(x=df.index,y=df['EF'],name='Fast',line=dict(color='blue')))
-                fig.add_trace(go.Scatter(x=df.index,y=df['ES'],name='Slow',line=dict(color='red')))
-                po and(fig.add_hline(y=po['entry_price'],line_dash="dash",line_color="yellow",annotation_text="Entry"),fig.add_hline(y=po['sl'],line_dash="dash",line_color="red",annotation_text="SL"),fig.add_hline(y=po['target'],line_dash="dash",line_color="green",annotation_text="Target"))or None
-                fig.update_layout(xaxis_rangeslider_visible=False,height=500)
-                st.plotly_chart(fig,use_container_width=True,key=f"ch_{int(time.time())}")
+    met_cont, chart_cont = st.container(), st.container()
+    
+    if st.session_state['trading_active']:
+        if mode=="Live Trading": time.sleep(random.uniform(1.0,1.5))
+        df = fetch_data(ticker, interval, period)
+        if df is None or df.empty: st.error("Unable to fetch data"); st.session_state['trading_active']=False; st.rerun()
+        st.session_state['current_data'] = df
+        
+        if strategy=="EMA Crossover": df = ema_cross_strat(df, cfg)
+        elif strategy=="Percentage Change": df = pct_change_strat(df, cfg)
+        else: df['Signal'] = 0
+        
+        df['EMA_Fast'], df['EMA_Slow'] = ema(df['Close'], cfg.get('ema_fast',9)), ema(df['Close'], cfg.get('ema_slow',15))
+        df['EMA_Angle'], df['RSI'], df['ADX'], df['ATR'] = ema_angle(df['EMA_Fast'],2), rsi(df['Close'],14), adx(df,14), atr(df,14)
+        
+        cp, cs = df['Close'].iloc[-1], df['Signal'].iloc[-1]
+        pos = st.session_state['position']
+        
+        if pos is None and cs!=0:
+            pos = {'entry_time': df.index[-1], 'entry_price': cp, 'signal': cs, 'sl': None, 'target': None,
+                   'highest': cp, 'lowest': cp, 'partial_exit_done': False, 'breakeven_activated': False}
+            pos['sl'], pos['target'] = calc_sl(df,len(df)-1,pos,sl_type,sl_points,cfg), calc_tgt(df,len(df)-1,pos,target_type,target_points,cfg)
+            st.session_state['position'], st.session_state['highest_price'], st.session_state['lowest_price'] = pos, cp, cp
+            add_log(f"{'LONG' if cs==1 else 'SHORT'} entry at {cp:.2f}")
+        
+        elif pos:
+            pos['highest'], pos['lowest'] = max(pos.get('highest',cp),cp), min(pos.get('lowest',cp),cp)
+            st.session_state['highest_price'], st.session_state['lowest_price'] = pos['highest'], pos['lowest']
+            exp, exr = None, None
             
-            if not st.session_state['trading_active']:break
-            time.sleep(random.uniform(1.0,1.5))
+            if sl_type=='Signal-based (reverse EMA crossover)' or target_type=='Signal-based (reverse EMA crossover)':
+                if check_sig_exit(df,len(df)-1,pos): exp, exr = cp, "Reverse Signal"
+            if exp is None and pos['sl']:
+                if (pos['signal']==1 and cp<=pos['sl']) or (pos['signal']==-1 and cp>=pos['sl']): exp, exr = pos['sl'], "Stop Loss"
+            if exp is None and pos['target']:
+                if (pos['signal']==1 and cp>=pos['target']) or (pos['signal']==-1 and cp<=pos['target']):
+                    if target_type=='50% Exit at Target (Partial)' and not pos['partial_exit_done']:
+                        pos['partial_exit_done']=True; add_log("50% position exited")
+                    else: exp, exr = pos['target'], "Target Hit"
+            if exp is None and sl_type in ['Trailing SL (Points)','Break-even After 50% Target']: pos['sl']=calc_sl(df,len(df)-1,pos,sl_type,sl_points,cfg)
+            
+            if exp:
+                pnl = (exp-pos['entry_price'])*quantity if pos['signal']==1 else (pos['entry_price']-exp)*quantity
+                dur = (df.index[-1]-pos['entry_time']).total_seconds()/3600
+                st.session_state['trade_history'].append({'entry_time': pos['entry_time'], 'exit_time': df.index[-1], 'duration': dur,
+                                                           'signal': 'LONG' if pos['signal']==1 else 'SHORT', 'entry_price': pos['entry_price'],
+                                                           'exit_price': exp, 'sl': pos['sl'], 'target': pos['target'], 'exit_reason': exr,
+                                                           'pnl': pnl, 'highest': pos['highest'], 'lowest': pos['lowest']})
+                add_log(f"Exit: {exr} at {exp:.2f}, PnL: {pnl:.2f}"); reset_pos()
+            else: st.session_state['position'] = pos
+        
+        with met_cont:
+            st.markdown("### Live Metrics")
+            m1,m2,m3,m4,m5 = st.columns(5)
+            with m1: st.metric("Current Price", f"{cp:.2f}"); st.metric("EMA Fast", f"{df['EMA_Fast'].iloc[-1]:.2f}")
+            with m2:
+                ep = pos['entry_price'] if pos else 0
+                st.metric("Entry Price", f"{ep:.2f}" if pos else "—")
+                st.metric("EMA Slow", f"{df['EMA_Slow'].iloc[-1]:.2f}")
+            with m3:
+                sig_txt = "LONG" if cs==1 else ("SHORT" if cs==-1 else "NONE")
+                st.metric("Signal", sig_txt)
+                st.metric("Crossover Angle", f"{abs(df['EMA_Angle'].iloc[-1]):.2f}°")
+            with m4:
+                if pos:
+                    pnl = (cp-ep)*quantity if pos['signal']==1 else (ep-cp)*quantity
+                    if pnl>=0: st.metric("Unrealized P&L", f"{pnl:.2f}", delta=f"+{pnl:.2f}")
+                    else: st.metric("Unrealized P&L", f"{pnl:.2f}", delta=f"{pnl:.2f}", delta_color="inverse")
+                else: st.metric("Unrealized P&L", "—")
+                st.metric("RSI", f"{df['RSI'].iloc[-1]:.2f}")
+            with m5:
+                pos_stat = "IN POSITION" if pos else "NO POSITION"
+                st.metric("Position Status", pos_stat)
+                st.metric("ADX", f"{df['ADX'].iloc[-1]:.2f}")
+            
+            if pos:
+                st.markdown("### Position Details")
+                p1,p2,p3,p4 = st.columns(4)
+                with p1:
+                    dur = (datetime.now(pytz.timezone('Asia/Kolkata'))-pos['entry_time']).total_seconds()/60
+                    st.metric("Duration", f"{dur:.1f} min")
+                    sl_val = f"{pos['sl']:.2f}" if pos['sl'] else "—"
+                    st.metric("Stop Loss", sl_val)
+                with p2:
+                    st.metric("Entry Price", f"{pos['entry_price']:.2f}")
+                    tgt_val = f"{pos['target']:.2f}" if pos['target'] else "—"
+                    st.metric("Target", tgt_val)
+                with p3:
+                    sl_dist = abs(cp-pos['sl']) if pos['sl'] else 0
+                    st.metric("Distance to SL", f"{sl_dist:.2f}")
+                    st.metric("Highest", f"{pos['highest']:.2f}")
+                with p4:
+                    tgt_dist = abs(pos['target']-cp) if pos['target'] else 0
+                    st.metric("Distance to Target", f"{tgt_dist:.2f}")
+                    st.metric("Lowest", f"{pos['lowest']:.2f}")
+        
+        with chart_cont:
+            st.markdown("### Live Chart")
+            fig = go.Figure(data=[go.Candlestick(x=df.index, open=df['Open'], high=df['High'], low=df['Low'], close=df['Close'], name='Price')])
+            fig.add_trace(go.Scatter(x=df.index, y=df['EMA_Fast'], name='EMA Fast', line=dict(color='blue', width=1)))
+            fig.add_trace(go.Scatter(x=df.index, y=df['EMA_Slow'], name='EMA Slow', line=dict(color='red', width=1)))
+            if pos:
+                fig.add_hline(y=pos['entry_price'], line_dash="dash", line_color="yellow", annotation_text="Entry")
+                if pos['sl']: fig.add_hline(y=pos['sl'], line_dash="dash", line_color="red", annotation_text="SL")
+                if pos['target']: fig.add_hline(y=pos['target'], line_dash="dash", line_color="green", annotation_text="Target")
+            fig.update_layout(height=500, xaxis_rangeslider_visible=False, template='plotly_dark')
+            st.plotly_chart(fig, use_container_width=True, key=f"live_chart_{int(time.time())}")
+        
+        time.sleep(0.1); st.rerun()
 
-with t2:
+with tab2:
     st.markdown("### 📈 Trade History")
-    if len(st.session_state['trade_history'])==0:st.info("No trades yet")
+    if len(st.session_state['trade_history'])==0: st.info("No trades yet")
     else:
-        tot=len(st.session_state['trade_history']);wins=sum(1 for t in st.session_state['trade_history']if t['pnl']>0);loss=tot-wins;acc=(wins/tot*100)if tot>0 else 0;tpnl=sum(t['pnl']for t in st.session_state['trade_history'])
-        m1,m2,m3,m4,m5=st.columns(5);m1.metric("Total",tot);m2.metric("Wins",wins);m3.metric("Losses",loss);m4.metric("Accuracy",f"{acc:.1f}%");m5.metric("Total P&L",f"{tpnl:.2f}",delta=f"{'+'if tpnl>=0 else''}{tpnl:.2f}",delta_color="normal"if tpnl>=0 else"inverse")
-        for i,t in enumerate(reversed(st.session_state['trade_history'])):
-            with st.expander(f"Trade #{tot-i}: {t['signal']} | P&L: {t['pnl']:.2f}"):
-                c1,c2=st.columns(2)
-                c1.write(f"**Entry:** {fmt(t['entry_time'])}\n**Entry Price:** {t['entry_price']:.2f}\n**SL:** {t['sl']:.2f}\n**Highest:** {t['highest']:.2f}")
-                c2.write(f"**Exit:** {fmt(t['exit_time'])}\n**Exit Price:** {t['exit_price']:.2f}\n**Target:** {t['target']:.2f}\n**Lowest:** {t['lowest']:.2f}")
-                st.write(f"**Exit Reason:** {t['exit_reason']}")
-                st.markdown(f"**P&L:** <span style='color:{'green'if t['pnl']>=0 else'red'
+        tt = len(st.session_state['trade_history']); win = sum(1 for t in st.session_state['trade_history'] if t['pnl']>0)
+        los = tt-win; acc = win/tt*100 if tt>0 else 0; tpnl = sum(t['pnl'] for t in st.session_state['trade_history'])
+        h1,h2,h3,h4,h5 = st.columns(5)
+        with h1: st.metric("Total Trades", tt)
+        with h2: st.metric("Winning", win)
+        with h3: st.metric("Losing", los)
+        with h4: st.metric("Accuracy", f"{acc:.1f}%")
+        with h5:
+            if tpnl>=0: st.metric("Total P&L", f"{tpnl:.2f}", delta=f"+{tpnl:.2f}")
+            else: st.metric("Total P&L", f"{tpnl:.2f}", delta=f"{tpnl:.2f}", delta_color="inverse")
+        
+        st.markdown("---")
+        for idx, t in enumerate(reversed(st.session_state['trade_history'])):
+            with st.expander(f"Trade #{tt-idx} - {t.get('signal','N/A')} - P&L: {t.get('pnl',0):.2f}"):
+                tc1,tc2 = st.columns(2)
+                with tc1:
+                    st.write(f"**Entry Time:** {t.get('entry_time','N/A')}")
+                    st.write(f"**Entry Price:** {t.get('entry_price',0):.2f}")
+                    st.write(f"**Stop Loss:** {t.get('sl',0):.2f}" if t.get('sl') else "**Stop Loss:** —")
+                    st.write(f"**Highest:** {t.get('highest',0):.2f}")
+                with tc2:
+                    st.write(f"**Exit Time:** {t.get('exit_time','N/A')}")
+                    st.write(f"**Exit Price:** {t.get('exit_price',0):.2f}")
+                    st.write(f"**Target:** {t.get('target',0):.2f}" if t.get('target') else "**Target:** —")
+                    st.write(f"**Lowest:** {t.get('lowest',0):.2f}")
+                st.write(f"**Duration:** {t.get('duration',0):.2f} hours")
+                st.write(f"**Exit Reason:** {t.get('exit_reason','N/A')}")
+                pnl_val = t.get('pnl',0)
+                pnl_str = f"{pnl_val:.2f}"
+                if pnl_val>=0: st.success(f"**P&L:** +{pnl_str}")
+                else: st.error(f"**P&L:** {pnl_str}")
+
+with tab3:
+    st.markdown("### 📝 Trade Logs")
+    if len(st.session_state['trade_logs'])==0: st.info("No logs yet")
+    else:
+        for log in reversed(st.session_state['trade_logs']): st.text(log)
+
+with tab4:
+    st.markdown("### 🔬 Backtest Results")
+    if mode!="Backtest": st.warning("Switch to Backtest mode to run backtests")
+    else:
+        if st.button("▶️ Run Backtest", type="primary"):
+            with st.spinner("Running backtest..."):
+                df = fetch_data(ticker, interval, period)
+                if df is None or df.empty: st.error("Unable to fetch data")
+                else:
+                    if strategy=="EMA Crossover": df = ema_cross_strat(df, cfg)
+                    elif strategy=="Percentage Change": df = pct_change_strat(df, cfg)
+                    else: df['Signal'] = 0
+                    
+                    results = run_backtest(df, None, cfg, sl_type, sl_points, target_type, target_points, quantity)
+                    
+                    st.success("Backtest completed!")
+                    b1,b2,b3,b4,b5,b6 = st.columns(6)
+                    with b1: st.metric("Total Trades", results['total_trades'])
+                    with b2: st.metric("Winning", results['winning_trades'])
+                    with b3: st.metric("Losing", results['losing_trades'])
+                    with b4: st.metric("Accuracy", f"{results['accuracy']:.1f}%")
+                    with b5:
+                        tpnl = results['total_pnl']
+                        if tpnl>=0: st.metric("Total P&L", f"{tpnl:.2f}", delta=f"+{tpnl:.2f}")
+                        else: st.metric("Total P&L", f"{tpnl:.2f}", delta=f"{tpnl:.2f}", delta_color="inverse")
+                    with b6: st.metric("Avg Duration", f"{results['avg_duration']:.2f}h")
+                    
+                    st.markdown("---")
+                    st.markdown("### All Trades")
+                    for idx, t in enumerate(results['trades']):
+                        with st.expander(f"Trade #{idx+1} - {t['signal']} - P&L: {t['pnl']:.2f}"):
+                            bc1,bc2 = st.columns(2)
+                            with bc1:
+                                st.write(f"**Entry Time:** {t['entry_time']}")
+                                st.write(f"**Entry Price:** {t['entry_price']:.2f}")
+                                st.write(f"**Stop Loss:** {t['sl']:.2f}" if t['sl'] else "**Stop Loss:** —")
+                                st.write(f"**Highest:** {t['highest']:.2f}")
+                            with bc2:
+                                st.write(f"**Exit Time:** {t['exit_time']}")
+                                st.write(f"**Exit Price:** {t['exit_price']:.2f}")
+                                st.write(f"**Target:** {t['target']:.2f}" if t['target'] else "**Target:** —")
+                                st.write(f"**Lowest:** {t['lowest']:.2f}")
+                            st.write(f"**Duration:** {t['duration']:.2f} hours")
+                            st.write(f"**Exit Reason:** {t['exit_reason']}")
+                            st.write(f"**Range:** {t['highest']-t['lowest']:.2f}")
+                            if t['pnl']>=0: st.success(f"**P&L:** +{t['pnl']:.2f}")
+                            else: st.error(f"**P&L:** {t['pnl']:.2f}")
