@@ -1026,11 +1026,14 @@ def run_backtest(df, config):
             if signal:
                 signals_generated += 1
                 
-                sl_price = calculate_initial_sl(entry_price, signal, sl_type, config, current_data)
-                target_price = calculate_initial_target(entry_price, signal, target_type, config, current_data)
+                # Convert BUY/SELL to LONG/SHORT for internal consistency
+                position_type = 'LONG' if signal == 'BUY' else 'SHORT'
+                
+                sl_price = calculate_initial_sl(entry_price, position_type, sl_type, config, current_data)
+                target_price = calculate_initial_target(entry_price, position_type, target_type, config, current_data)
                 
                 position = {
-                    'type': signal,
+                    'type': position_type,
                     'entry_price': entry_price,
                     'entry_time': current_time,
                     'entry_idx': idx,
@@ -1039,8 +1042,8 @@ def run_backtest(df, config):
                     'quantity': quantity,
                     'partial_exit_done': False,
                     'breakeven_activated': False,
-                    'highest_price': entry_price if signal == 'LONG' else None,
-                    'lowest_price': entry_price if signal == 'SELL' else None,
+                    'highest_price': entry_price if position_type == 'LONG' else None,
+                    'lowest_price': entry_price if position_type == 'SHORT' else None,
                 }
                 trades_entered += 1
         
@@ -1233,11 +1236,14 @@ def live_trading_iteration():
         signal, entry_price = strategy_func(df, idx, config, None)
         
         if signal:
-            sl_price = calculate_initial_sl(entry_price, signal, config['sl_type'], config, current_data)
-            target_price = calculate_initial_target(entry_price, signal, config['target_type'], config, current_data)
+            # Convert BUY/SELL to LONG/SHORT for internal consistency
+            position_type = 'LONG' if signal == 'BUY' else 'SHORT'
+            
+            sl_price = calculate_initial_sl(entry_price, position_type, config['sl_type'], config, current_data)
+            target_price = calculate_initial_target(entry_price, position_type, config['target_type'], config, current_data)
             
             st.session_state['position'] = {
-                'type': signal,
+                'type': position_type,
                 'entry_price': entry_price,
                 'entry_time': current_time,
                 'sl_price': sl_price,
@@ -1245,8 +1251,8 @@ def live_trading_iteration():
                 'quantity': config['quantity'],
                 'partial_exit_done': False,
                 'breakeven_activated': False,
-                'highest_price': entry_price if signal == 'LONG' else None,
-                'lowest_price': entry_price if signal == 'SELL' else None,
+                'highest_price': entry_price if position_type == 'LONG' else None,
+                'lowest_price': entry_price if position_type == 'SHORT' else None,
             }
             
             sl_display = f"{sl_price:.2f}" if sl_price else "Signal"
@@ -1901,7 +1907,7 @@ def render_live_trading_ui():
                     
                     if position['type'] == 'LONG':
                         pnl = (current_price - position['entry_price']) * position['quantity']
-                    else:
+                    else:  # SHORT
                         pnl = (position['entry_price'] - current_price) * position['quantity']
                     
                     trade = {
@@ -1999,9 +2005,10 @@ def render_live_dashboard():
             st.metric("Position Status", "OPEN", delta="Active")
             st.metric("Position Type", position['type'])
             
+            # Calculate unrealized P&L
             if position['type'] == 'LONG':
                 unrealized_pnl = (current_price - position['entry_price']) * position['quantity']
-            else:
+            else:  # SHORT
                 unrealized_pnl = (position['entry_price'] - current_price) * position['quantity']
             
             pnl_color = "normal" if unrealized_pnl >= 0 else "inverse"
@@ -2050,7 +2057,7 @@ def render_live_dashboard():
             if position['highest_price'] and position['type'] == 'LONG':
                 st.markdown(f"**Highest Price:** {position['highest_price']:.2f}")
             
-            if position['lowest_price'] and position['type'] == 'SELL':
+            if position['lowest_price'] and position['type'] == 'SHORT':
                 st.markdown(f"**Lowest Price:** {position['lowest_price']:.2f}")
             
             if position.get('breakeven_activated'):
