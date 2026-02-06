@@ -83,8 +83,10 @@ class DhanBrokerIntegration:
         self.use_algo_signals = config.get('dhan_use_algo_signals', True)
         self.custom_sl_type = config.get('dhan_custom_sl_type', 'Custom Points')
         self.custom_sl_points = config.get('dhan_custom_sl_points', 50)
+        self.custom_sl_rupees = config.get('dhan_custom_sl_rupees', 300)
         self.custom_target_type = config.get('dhan_custom_target_type', 'Custom Points')
         self.custom_target_points = config.get('dhan_custom_target_points', 100)
+        self.custom_target_rupees = config.get('dhan_custom_target_rupees', 5000)
         
         # Broker position tracking
         self.broker_position = None
@@ -157,12 +159,18 @@ class DhanBrokerIntegration:
                 sl_price = entry_price - self.custom_sl_points
             else:
                 sl_price = entry_price + self.custom_sl_points
+        elif self.custom_sl_type == 'P&L Based (Rupees)':
+            # P&L-based, will be checked during position update
+            sl_price = None
         
         if self.custom_target_type == 'Custom Points':
             if position_type == 'BUY':
                 target_price = entry_price + self.custom_target_points
             else:
                 target_price = entry_price - self.custom_target_points
+        elif self.custom_target_type == 'P&L Based (Rupees)':
+            # P&L-based, will be checked during position update
+            target_price = None
         
         return sl_price, target_price
     
@@ -227,7 +235,7 @@ class DhanBrokerIntegration:
         
         return None
     
-    def update_broker_position(self, current_price, algo_sl=None, algo_target=None):
+    def update_broker_position(self, current_price, algo_sl=None, algo_target=None, algo_sl_type=None, algo_target_type=None, algo_sl_rupees=None, algo_target_rupees=None):
         """Update broker position and check for exits"""
         if not self.enabled or self.broker_position is None:
             return None
@@ -249,15 +257,35 @@ class DhanBrokerIntegration:
             if position['lowest_price'] is None or current_price < position['lowest_price']:
                 position['lowest_price'] = current_price
         
-        # Check for SL hit
-        if position['sl_price']:
+        # Calculate current P&L
+        if position['type'] == 'BUY':
+            current_pnl = (current_price - position['entry_price']) * position['quantity']
+        else:
+            current_pnl = (position['entry_price'] - current_price) * position['quantity']
+        
+        # Check for P&L-based SL (from algo or custom)
+        if self.use_algo_signals and algo_sl_type == 'P&L Based (Rupees)' and algo_sl_rupees:
+            if current_pnl <= -algo_sl_rupees:
+                return self.exit_broker_position(current_price, 'P&L SL (from algo)')
+        elif not self.use_algo_signals and self.custom_sl_type == 'P&L Based (Rupees)':
+            if current_pnl <= -self.custom_sl_rupees:
+                return self.exit_broker_position(current_price, 'P&L Stop Loss')
+        # Check for price-based SL
+        elif position['sl_price']:
             if position['type'] == 'BUY' and current_price <= position['sl_price']:
                 return self.exit_broker_position(current_price, 'Stop Loss')
             elif position['type'] == 'SELL' and current_price >= position['sl_price']:
                 return self.exit_broker_position(current_price, 'Stop Loss')
         
-        # Check for Target hit
-        if position['target_price']:
+        # Check for P&L-based Target (from algo or custom)
+        if self.use_algo_signals and algo_target_type == 'P&L Based (Rupees)' and algo_target_rupees:
+            if current_pnl >= algo_target_rupees:
+                return self.exit_broker_position(current_price, 'P&L Target (from algo)')
+        elif not self.use_algo_signals and self.custom_target_type == 'P&L Based (Rupees)':
+            if current_pnl >= self.custom_target_rupees:
+                return self.exit_broker_position(current_price, 'P&L Target')
+        # Check for price-based Target
+        elif position['target_price']:
             if position['type'] == 'BUY' and current_price >= position['target_price']:
                 return self.exit_broker_position(current_price, 'Target')
             elif position['type'] == 'SELL' and current_price <= position['target_price']:
@@ -1110,15 +1138,31 @@ def run_backtest(df, config):
                 target_type == 'Signal-based (reverse EMA crossover)'):
                 signal_exit = check_signal_based_exit(df, idx, position_type)
             
+            # Calculate current P&L for P&L-based exits
+            if position_type == 'LONG':
+                current_pnl = (current_price - entry_price) * position['quantity']
+            else:
+                current_pnl = (entry_price - current_price) * position['quantity']
+            
+            # Check P&L-based SL
             sl_hit = False
-            if sl_price is not None:
+            if sl_type == 'P&L Based (Rupees)':
+                sl_rupees = config.get('sl_rupees', 300)
+                if current_pnl <= -sl_rupees:  # Loss exceeded limit
+                    sl_hit = True
+            elif sl_price is not None:
                 if position_type == 'LONG' and current_price <= sl_price:
                     sl_hit = True
                 elif position_type == 'SELL' and current_price >= sl_price:
                     sl_hit = True
             
+            # Check P&L-based Target
             target_hit = False
-            if target_price is not None and 'Trailing' not in target_type:
+            if target_type == 'P&L Based (Rupees)':
+                target_rupees = config.get('target_rupees', 5000)
+                if current_pnl >= target_rupees:  # Profit reached target
+                    target_hit = True
+            elif target_price is not None and 'Trailing' not in target_type:
                 if position_type == 'LONG' and current_price >= target_price:
                     target_hit = True
                 elif position_type == 'SELL' and current_price <= target_price:
@@ -1331,15 +1375,33 @@ def live_trading_iteration():
             config['target_type'] == 'Signal-based (reverse EMA crossover)'):
             signal_exit = check_signal_based_exit(df, idx, position_type)
         
+        # Calculate current P&L for P&L-based exits
+        if position_type == 'LONG':
+            current_pnl = (current_price - entry_price) * position['quantity']
+        else:
+            current_pnl = (entry_price - current_price) * position['quantity']
+        
+        # Check P&L-based SL
         sl_hit = False
-        if sl_price is not None:
+        if config['sl_type'] == 'P&L Based (Rupees)':
+            sl_rupees = config.get('sl_rupees', 300)
+            if current_pnl <= -sl_rupees:  # Loss exceeded limit
+                sl_hit = True
+                add_log(f"P&L-based SL Hit: Loss {current_pnl:.2f} exceeded limit -{sl_rupees:.2f}")
+        elif sl_price is not None:
             if position_type == 'LONG' and current_price <= sl_price:
                 sl_hit = True
             elif position_type == 'SELL' and current_price >= sl_price:
                 sl_hit = True
         
+        # Check P&L-based Target
         target_hit = False
-        if target_price is not None and 'Trailing' not in config['target_type']:
+        if config['target_type'] == 'P&L Based (Rupees)':
+            target_rupees = config.get('target_rupees', 5000)
+            if current_pnl >= target_rupees:  # Profit reached target
+                target_hit = True
+                add_log(f"P&L-based Target Hit: Profit {current_pnl:.2f} reached target {target_rupees:.2f}")
+        elif target_price is not None and 'Trailing' not in config['target_type']:
             if position_type == 'LONG' and current_price >= target_price:
                 target_hit = True
             elif position_type == 'SELL' and current_price <= target_price:
@@ -1405,8 +1467,16 @@ def live_trading_iteration():
             # Pass algo SL/Target if using algo signals
             algo_sl = position['sl_price'] if position and dhan_broker.use_algo_signals else None
             algo_target = position['target_price'] if position and dhan_broker.use_algo_signals else None
+            algo_sl_type = config.get('sl_type') if position and dhan_broker.use_algo_signals else None
+            algo_target_type = config.get('target_type') if position and dhan_broker.use_algo_signals else None
+            algo_sl_rupees = config.get('sl_rupees') if position and dhan_broker.use_algo_signals else None
+            algo_target_rupees = config.get('target_rupees') if position and dhan_broker.use_algo_signals else None
             
-            broker_trade = dhan_broker.update_broker_position(current_price, algo_sl, algo_target)
+            broker_trade = dhan_broker.update_broker_position(
+                current_price, algo_sl, algo_target, 
+                algo_sl_type, algo_target_type,
+                algo_sl_rupees, algo_target_rupees
+            )
             
             if broker_trade:
                 st.session_state['broker_trade_history'].append(broker_trade)
@@ -1777,6 +1847,7 @@ def render_configuration_ui():
                         "Broker SL Type",
                         [
                             "Custom Points",
+                            "P&L Based (Rupees)",
                             "Trailing SL (Points)",
                             "ATR-based",
                             "Current Candle Low/High",
@@ -1792,6 +1863,14 @@ def render_configuration_ui():
                             value=50,
                             key="dhan_sl_points"
                         )
+                    elif config['dhan_custom_sl_type'] == 'P&L Based (Rupees)':
+                        config['dhan_custom_sl_rupees'] = st.number_input(
+                            "Broker SL Amount (₹)",
+                            min_value=1.0,
+                            value=300.0,
+                            step=10.0,
+                            key="dhan_sl_rupees"
+                        )
                 
                 st.markdown("**Custom Target Configuration**")
                 col1, col2 = st.columns(2)
@@ -1800,6 +1879,7 @@ def render_configuration_ui():
                         "Broker Target Type",
                         [
                             "Custom Points",
+                            "P&L Based (Rupees)",
                             "Trailing Target (Points)",
                             "ATR-based",
                             "Risk-Reward Based"
@@ -1814,6 +1894,14 @@ def render_configuration_ui():
                             value=100,
                             key="dhan_target_points"
                         )
+                    elif config['dhan_custom_target_type'] == 'P&L Based (Rupees)':
+                        config['dhan_custom_target_rupees'] = st.number_input(
+                            "Broker Target Amount (₹)",
+                            min_value=1.0,
+                            value=5000.0,
+                            step=100.0,
+                            key="dhan_target_rupees"
+                        )
         
         st.info("ℹ️ Dhan broker integration is enabled. Orders will be placed when conditions are met.")
     
@@ -1824,6 +1912,7 @@ def render_configuration_ui():
         "Stop Loss Type",
         [
             "Custom Points",
+            "P&L Based (Rupees)",
             "Trailing SL (Points)",
             "Trailing SL + Current Candle",
             "Trailing SL + Previous Candle",
@@ -1845,6 +1934,15 @@ def render_configuration_ui():
     if 'Points' in sl_type or sl_type == 'Custom Points':
         config['sl_points'] = st.number_input("SL Points", min_value=1, value=10)
     
+    if sl_type == 'P&L Based (Rupees)':
+        config['sl_rupees'] = st.number_input(
+            "Stop Loss Amount (₹)", 
+            min_value=1.0, 
+            value=300.0, 
+            step=10.0,
+            help="Exit position if loss exceeds this amount"
+        )
+    
     if 'ATR' in sl_type:
         config['sl_atr_multiplier'] = st.number_input("ATR Multiplier (SL)", min_value=0.1, value=1.5, step=0.1)
     
@@ -1853,6 +1951,7 @@ def render_configuration_ui():
         "Target Type",
         [
             "Custom Points",
+            "P&L Based (Rupees)",
             "Trailing Target (Points)",
             "Trailing Target + Signal Based",
             "50% Exit at Target (Partial)",
@@ -1869,6 +1968,15 @@ def render_configuration_ui():
     
     if 'Points' in target_type or target_type == 'Custom Points':
         config['target_points'] = st.number_input("Target Points", min_value=1, value=20)
+    
+    if target_type == 'P&L Based (Rupees)':
+        config['target_rupees'] = st.number_input(
+            "Target Profit Amount (₹)", 
+            min_value=1.0, 
+            value=5000.0, 
+            step=100.0,
+            help="Exit position if profit reaches this amount"
+        )
     
     if 'ATR' in target_type:
         config['target_atr_multiplier'] = st.number_input("ATR Multiplier (Target)", min_value=0.1, value=3.0, step=0.1)
