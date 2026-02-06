@@ -515,6 +515,11 @@ def check_ema_crossover_strategy(df, idx, config, position_type=None):
     current = df.iloc[idx]
     previous = df.iloc[idx-1]
     
+    # Check for NaN values in EMAs
+    if pd.isna(current['EMA_Fast']) or pd.isna(current['EMA_Slow']) or \
+       pd.isna(previous['EMA_Fast']) or pd.isna(previous['EMA_Slow']):
+        return None, None
+    
     bullish_cross = (previous['EMA_Fast'] <= previous['EMA_Slow'] and 
                      current['EMA_Fast'] > current['EMA_Slow'])
     bearish_cross = (previous['EMA_Fast'] >= previous['EMA_Slow'] and 
@@ -523,12 +528,14 @@ def check_ema_crossover_strategy(df, idx, config, position_type=None):
     if not bullish_cross and not bearish_cross:
         return None, None
     
+    # Check EMA angle (optional)
     min_angle = config.get('ema_min_angle', 1.0)
-    fast_angle = abs(current['EMA_Fast_Angle'])
+    if min_angle > 0:  # Only check if min_angle is set
+        fast_angle = abs(current['EMA_Fast_Angle'])
+        if pd.isna(fast_angle) or fast_angle < min_angle:
+            return None, None
     
-    if fast_angle < min_angle:
-        return None, None
-    
+    # Entry filter logic
     entry_filter = config.get('ema_entry_filter', 'Simple Crossover')
     
     if entry_filter == 'Custom Candle (Points)':
@@ -540,9 +547,10 @@ def check_ema_crossover_strategy(df, idx, config, position_type=None):
     elif entry_filter == 'ATR-based Candle':
         atr_multiplier = config.get('ema_atr_multiplier', 1.0)
         candle_size = abs(current['Close'] - current['Open'])
-        if pd.notna(current['ATR']) and candle_size < (current['ATR'] * atr_multiplier):
+        if pd.isna(current['ATR']) or candle_size < (current['ATR'] * atr_multiplier):
             return None, None
     
+    # ADX filter (optional)
     if config.get('ema_use_adx', False):
         adx_threshold = config.get('ema_adx_threshold', 25)
         if pd.isna(current['ADX']) or current['ADX'] < adx_threshold:
@@ -991,15 +999,33 @@ def run_backtest(df, config):
     target_type = config['target_type']
     quantity = config.get('quantity', 1)
     
-    for idx in range(len(df)):
+    # Track statistics for debugging
+    total_candles = len(df)
+    signals_checked = 0
+    signals_generated = 0
+    trades_entered = 0
+    trades_exited = 0
+    
+    # Start from index where indicators are ready (skip NaN period)
+    start_idx = max(config.get('ema_slow', 15), 20)  # Wait for indicators to stabilize
+    
+    for idx in range(start_idx, len(df)):
         current_data = df.iloc[idx]
         current_time = df.index[idx]
         current_price = current_data['Close']
+        
+        # Skip if essential data is NaN
+        if pd.isna(current_price):
+            continue
+        
+        signals_checked += 1
         
         if position is None:
             signal, entry_price = strategy_func(df, idx, config, None)
             
             if signal:
+                signals_generated += 1
+                
                 sl_price = calculate_initial_sl(entry_price, signal, sl_type, config, current_data)
                 target_price = calculate_initial_target(entry_price, signal, target_type, config, current_data)
                 
@@ -1016,6 +1042,7 @@ def run_backtest(df, config):
                     'highest_price': entry_price if signal == 'LONG' else None,
                     'lowest_price': entry_price if signal == 'SELL' else None,
                 }
+                trades_entered += 1
         
         else:
             position_type = position['type']
@@ -1127,7 +1154,18 @@ def run_backtest(df, config):
                     'Exit Reason': exit_reason
                 })
                 
+                trades_exited += 1
                 position = None
+    
+    # Store debug info in session state
+    st.session_state['backtest_debug'] = {
+        'total_candles': total_candles,
+        'candles_analyzed': signals_checked,
+        'signals_generated': signals_generated,
+        'trades_entered': trades_entered,
+        'trades_completed': trades_exited,
+        'skipped_candles': start_idx
+    }
     
     return trades
 
@@ -1340,7 +1378,7 @@ def live_trading_iteration():
             st.session_state['position'] = None
     
     # DHAN BROKER LOGIC
-    if dhan_broker.enabled:
+    if dhan_broker and dhan_broker.enabled:
         # Check for broker entry trigger
         if dhan_broker.broker_position is None and dhan_broker.check_trigger_condition(current_price):
             # Determine signal based on algo or independent trigger
@@ -1550,7 +1588,7 @@ def render_configuration_ui():
         with col2:
             config['ema_slow'] = st.number_input("EMA Slow", min_value=1, value=15)
         with col3:
-            config['ema_min_angle'] = st.number_input("Min Angle (degrees)", min_value=0.0, value=1.0, step=0.1)
+            config['ema_min_angle'] = st.number_input("Min Angle (degrees)", min_value=0.0, value=0.0, step=0.1, help="Set to 0.0 to allow all crossovers")
         
         entry_filter = st.selectbox(
             "Entry Filter",
@@ -2216,9 +2254,49 @@ def render_backtest_results():
     if 'backtest_results' in st.session_state:
         trades = st.session_state['backtest_results']
         df = st.session_state['backtest_data']
+        debug_info = st.session_state.get('backtest_debug', {})
+        
+        # Display debug information
+        if debug_info:
+            with st.expander("🔍 Backtest Analysis Details", expanded=True):
+                col1, col2, col3 = st.columns(3)
+                with col1:
+                    st.metric("Total Candles", debug_info.get('total_candles', 0))
+                    st.metric("Candles Analyzed", debug_info.get('candles_analyzed', 0))
+                with col2:
+                    st.metric("Signals Generated", debug_info.get('signals_generated', 0))
+                    st.metric("Trades Entered", debug_info.get('trades_entered', 0))
+                with col3:
+                    st.metric("Trades Completed", debug_info.get('trades_completed', 0))
+                    st.metric("Skipped (NaN period)", debug_info.get('skipped_candles', 0))
         
         if not trades:
-            st.warning("No trades generated in backtest")
+            st.warning("⚠️ No trades generated in backtest")
+            
+            # Provide helpful debugging information
+            st.info("""
+            **Possible Reasons:**
+            1. **EMA Angle Filter**: Try setting Min Angle to 0.0 degrees
+            2. **ADX Filter**: Disable ADX filter or lower the threshold
+            3. **Entry Filters**: Switch to 'Simple Crossover'
+            4. **Insufficient Data**: For 1m/5m intervals, ensure period has enough candles
+            5. **Indicator Values**: Check if EMAs are generating valid crossovers
+            
+            **Quick Fix**: Try these settings:
+            - Min Angle: 0.0
+            - Entry Filter: Simple Crossover
+            - ADX Filter: Unchecked
+            - SL: Custom Points (50)
+            - Target: Custom Points (100)
+            """)
+            
+            # Show sample data to help debug
+            if not df.empty:
+                st.subheader("Sample Data (Last 10 Candles)")
+                sample_cols = ['Close', 'EMA_Fast', 'EMA_Slow', 'RSI', 'ADX', 'ATR']
+                available_cols = [col for col in sample_cols if col in df.columns]
+                st.dataframe(df[available_cols].tail(10))
+            
             return
         
         total_trades = len(trades)
