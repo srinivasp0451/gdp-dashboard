@@ -52,6 +52,232 @@ INTERVAL_PERIOD_MAP = {
 IST = pytz.timezone('Asia/Kolkata')
 
 # ============================================================================
+# DHAN BROKER INTEGRATION
+# ============================================================================
+
+class DhanBrokerIntegration:
+    """
+    Dhan Broker Integration for Live Order Placement
+    Placeholder for actual Dhan API integration
+    """
+    
+    def __init__(self, config):
+        self.enabled = config.get('dhan_enabled', False)
+        self.client_id = config.get('dhan_client_id', '')
+        self.access_token = config.get('dhan_access_token', '')
+        self.security_id = config.get('dhan_security_id', '')
+        self.exchange = config.get('dhan_exchange', 'NSE')
+        self.segment = config.get('dhan_segment', 'EQ')
+        
+        # Options parameters
+        self.is_options = config.get('dhan_is_options', False)
+        self.strike_price = config.get('dhan_strike_price', 0)
+        self.expiry_date = config.get('dhan_expiry_date', '')
+        self.option_type = config.get('dhan_option_type', 'CE')  # CE or PE
+        
+        # Order trigger parameters
+        self.trigger_condition = config.get('dhan_trigger_condition', '>=')  # >= or <=
+        self.trigger_price = config.get('dhan_trigger_price', 0.0)
+        
+        # SL/Target configuration
+        self.use_algo_signals = config.get('dhan_use_algo_signals', True)
+        self.custom_sl_type = config.get('dhan_custom_sl_type', 'Custom Points')
+        self.custom_sl_points = config.get('dhan_custom_sl_points', 50)
+        self.custom_target_type = config.get('dhan_custom_target_type', 'Custom Points')
+        self.custom_target_points = config.get('dhan_custom_target_points', 100)
+        
+        # Broker position tracking
+        self.broker_position = None
+        self.broker_orders = []
+        
+    def check_trigger_condition(self, current_price):
+        """Check if price crosses the trigger threshold"""
+        if not self.enabled:
+            return False
+        
+        if self.trigger_condition == '>=':
+            return current_price >= self.trigger_price
+        elif self.trigger_condition == '<=':
+            return current_price <= self.trigger_price
+        
+        return False
+    
+    def place_order(self, order_type, quantity, price, order_mode='MARKET'):
+        """
+        Place order with Dhan broker
+        PLACEHOLDER - Replace with actual Dhan API calls
+        """
+        if not self.enabled:
+            return None
+        
+        # PLACEHOLDER: Actual Dhan API integration
+        # from dhanhq import dhanhq
+        # dhan = dhanhq(self.client_id, self.access_token)
+        # order_id = dhan.place_order(
+        #     security_id=self.security_id,
+        #     exchange_segment=self.exchange,
+        #     transaction_type=order_type,
+        #     quantity=quantity,
+        #     order_type=order_mode,
+        #     price=price if order_mode == 'LIMIT' else 0
+        # )
+        
+        # Simulated order for demonstration
+        order = {
+            'order_id': f"DHAN{int(time.time())}",
+            'security_id': self.security_id,
+            'type': order_type,
+            'quantity': quantity,
+            'price': price,
+            'order_mode': order_mode,
+            'status': 'PLACED',
+            'timestamp': datetime.now(IST),
+            'strike_price': self.strike_price if self.is_options else None,
+            'option_type': self.option_type if self.is_options else None,
+            'expiry_date': self.expiry_date if self.is_options else None
+        }
+        
+        self.broker_orders.append(order)
+        add_log(f"🏦 DHAN ORDER: {order_type} {quantity} @ {price:.2f} | Order ID: {order['order_id']}")
+        
+        return order
+    
+    def calculate_broker_sl_target(self, entry_price, position_type):
+        """Calculate SL and Target for broker position"""
+        if self.use_algo_signals:
+            # Will be set from algo signals
+            return None, None
+        
+        # Custom SL/Target
+        sl_price = None
+        target_price = None
+        
+        if self.custom_sl_type == 'Custom Points':
+            if position_type == 'BUY':
+                sl_price = entry_price - self.custom_sl_points
+            else:
+                sl_price = entry_price + self.custom_sl_points
+        
+        if self.custom_target_type == 'Custom Points':
+            if position_type == 'BUY':
+                target_price = entry_price + self.custom_target_points
+            else:
+                target_price = entry_price - self.custom_target_points
+        
+        return sl_price, target_price
+    
+    def enter_broker_position(self, signal, price, quantity):
+        """Enter broker position"""
+        if not self.enabled or self.broker_position is not None:
+            return
+        
+        order_type = 'BUY' if signal == 'BUY' else 'SELL'
+        order = self.place_order(order_type, quantity, price)
+        
+        if order:
+            sl_price, target_price = self.calculate_broker_sl_target(price, order_type)
+            
+            self.broker_position = {
+                'type': order_type,
+                'entry_price': price,
+                'entry_time': datetime.now(IST),
+                'quantity': quantity,
+                'sl_price': sl_price,
+                'target_price': target_price,
+                'order_id': order['order_id'],
+                'highest_price': price if order_type == 'BUY' else None,
+                'lowest_price': price if order_type == 'SELL' else None
+            }
+            
+            add_log(f"🏦 DHAN POSITION OPENED: {order_type} @ {price:.2f}")
+    
+    def exit_broker_position(self, price, reason='Manual'):
+        """Exit broker position"""
+        if not self.enabled or self.broker_position is None:
+            return None
+        
+        position = self.broker_position
+        exit_type = 'SELL' if position['type'] == 'BUY' else 'BUY'
+        
+        order = self.place_order(exit_type, position['quantity'], price)
+        
+        if order:
+            # Calculate P&L
+            if position['type'] == 'BUY':
+                pnl = (price - position['entry_price']) * position['quantity']
+            else:
+                pnl = (position['entry_price'] - price) * position['quantity']
+            
+            trade_record = {
+                'Entry Time': position['entry_time'],
+                'Exit Time': datetime.now(IST),
+                'Type': position['type'],
+                'Entry Price': position['entry_price'],
+                'Exit Price': price,
+                'Quantity': position['quantity'],
+                'P&L': pnl,
+                'Exit Reason': reason,
+                'Order IDs': f"{position['order_id']} / {order['order_id']}"
+            }
+            
+            add_log(f"🏦 DHAN POSITION CLOSED: {exit_type} @ {price:.2f} | P&L: {pnl:.2f} | Reason: {reason}")
+            
+            self.broker_position = None
+            return trade_record
+        
+        return None
+    
+    def update_broker_position(self, current_price, algo_sl=None, algo_target=None):
+        """Update broker position and check for exits"""
+        if not self.enabled or self.broker_position is None:
+            return None
+        
+        position = self.broker_position
+        
+        # Update SL/Target from algo if using algo signals
+        if self.use_algo_signals:
+            if algo_sl is not None:
+                position['sl_price'] = algo_sl
+            if algo_target is not None:
+                position['target_price'] = algo_target
+        
+        # Track highest/lowest
+        if position['type'] == 'BUY':
+            if position['highest_price'] is None or current_price > position['highest_price']:
+                position['highest_price'] = current_price
+        else:
+            if position['lowest_price'] is None or current_price < position['lowest_price']:
+                position['lowest_price'] = current_price
+        
+        # Check for SL hit
+        if position['sl_price']:
+            if position['type'] == 'BUY' and current_price <= position['sl_price']:
+                return self.exit_broker_position(current_price, 'Stop Loss')
+            elif position['type'] == 'SELL' and current_price >= position['sl_price']:
+                return self.exit_broker_position(current_price, 'Stop Loss')
+        
+        # Check for Target hit
+        if position['target_price']:
+            if position['type'] == 'BUY' and current_price >= position['target_price']:
+                return self.exit_broker_position(current_price, 'Target')
+            elif position['type'] == 'SELL' and current_price <= position['target_price']:
+                return self.exit_broker_position(current_price, 'Target')
+        
+        return None
+    
+    def get_broker_pnl(self, current_price):
+        """Calculate current unrealized P&L for broker position"""
+        if not self.enabled or self.broker_position is None:
+            return 0.0
+        
+        position = self.broker_position
+        
+        if position['type'] == 'BUY':
+            return (current_price - position['entry_price']) * position['quantity']
+        else:
+            return (position['entry_price'] - current_price) * position['quantity']
+
+# ============================================================================
 # INDICATOR CALCULATIONS (MANUAL - NO TALIB/PANDAS-TA)
 # ============================================================================
 
@@ -942,6 +1168,13 @@ def live_trading_iteration():
     current_time = df.index[idx]
     current_price = current_data['Close']
     
+    # Initialize Dhan broker if not exists
+    if 'dhan_broker' not in st.session_state:
+        st.session_state['dhan_broker'] = DhanBrokerIntegration(config)
+        st.session_state['broker_trade_history'] = []
+    
+    dhan_broker = st.session_state['dhan_broker']
+    
     strategy_name = config['strategy']
     strategy_func_map = {
         'EMA Crossover': check_ema_crossover_strategy,
@@ -957,6 +1190,7 @@ def live_trading_iteration():
     strategy_func = strategy_func_map.get(strategy_name)
     position = st.session_state.get('position')
     
+    # MAIN ALGO ENTRY LOGIC
     if position is None:
         signal, entry_price = strategy_func(df, idx, config, None)
         
@@ -977,8 +1211,11 @@ def live_trading_iteration():
                 'lowest_price': entry_price if signal == 'SELL' else None,
             }
             
-            add_log(f"ENTRY: {signal} @ {entry_price:.2f} | SL: {sl_price:.2f if sl_price else 'Signal'} | Target: {target_price:.2f if target_price else 'Signal'}")
+            sl_display = f"{sl_price:.2f}" if sl_price else "Signal"
+            target_display = f"{target_price:.2f}" if target_price else "Signal"
+            add_log(f"ENTRY: {signal} @ {entry_price:.2f} | SL: {sl_display} | Target: {target_display}")
     
+    # MAIN ALGO EXIT LOGIC
     else:
         position_type = position['type']
         entry_price = position['entry_price']
@@ -1101,6 +1338,34 @@ def live_trading_iteration():
             add_log(f"EXIT: {exit_reason} @ {exit_price:.2f} | P&L: {pnl:.2f}")
             
             st.session_state['position'] = None
+    
+    # DHAN BROKER LOGIC
+    if dhan_broker.enabled:
+        # Check for broker entry trigger
+        if dhan_broker.broker_position is None and dhan_broker.check_trigger_condition(current_price):
+            # Determine signal based on algo or independent trigger
+            if position:
+                broker_signal = 'BUY' if position['type'] == 'LONG' else 'SELL'
+            else:
+                # Independent broker entry based on trigger condition
+                broker_signal = 'BUY' if dhan_broker.trigger_condition == '>=' else 'SELL'
+            
+            dhan_broker.enter_broker_position(
+                broker_signal,
+                current_price,
+                config.get('dhan_quantity', 1)
+            )
+        
+        # Update broker position
+        if dhan_broker.broker_position:
+            # Pass algo SL/Target if using algo signals
+            algo_sl = position['sl_price'] if position and dhan_broker.use_algo_signals else None
+            algo_target = position['target_price'] if position and dhan_broker.use_algo_signals else None
+            
+            broker_trade = dhan_broker.update_broker_position(current_price, algo_sl, algo_target)
+            
+            if broker_trade:
+                st.session_state['broker_trade_history'].append(broker_trade)
     
     time.sleep(random.uniform(1.0, 1.5))
     st.rerun()
@@ -1403,6 +1668,113 @@ def render_configuration_ui():
         
         config['custom_conditions'] = st.session_state['custom_conditions']
     
+    # Dhan Broker Integration Configuration
+    st.markdown("---")
+    st.subheader("🏦 Dhan Broker Integration")
+    
+    dhan_enabled = st.checkbox("Enable Dhan Broker Orders", value=False, key="dhan_enabled")
+    config['dhan_enabled'] = dhan_enabled
+    
+    if dhan_enabled:
+        with st.expander("📝 Broker Credentials", expanded=True):
+            config['dhan_client_id'] = st.text_input("Client ID", value="", type="password")
+            config['dhan_access_token'] = st.text_input("Access Token", value="", type="password")
+        
+        with st.expander("📊 Security Details", expanded=True):
+            col1, col2 = st.columns(2)
+            with col1:
+                config['dhan_security_id'] = st.text_input("Security ID", value="")
+                config['dhan_exchange'] = st.selectbox("Exchange", ["NSE", "BSE", "NFO", "MCX"])
+            with col2:
+                config['dhan_segment'] = st.selectbox("Segment", ["EQ", "FUT", "OPT"])
+                config['dhan_quantity'] = st.number_input("Broker Quantity", min_value=1, value=1)
+        
+        with st.expander("🎯 Options Configuration (if applicable)", expanded=False):
+            config['dhan_is_options'] = st.checkbox("Is Options Contract", value=False)
+            
+            if config['dhan_is_options']:
+                col1, col2, col3 = st.columns(3)
+                with col1:
+                    config['dhan_strike_price'] = st.number_input("Strike Price", min_value=0, value=0)
+                with col2:
+                    config['dhan_expiry_date'] = st.text_input("Expiry Date (YYYY-MM-DD)", value="")
+                with col3:
+                    config['dhan_option_type'] = st.selectbox("Option Type", ["CE", "PE"])
+        
+        with st.expander("⚡ Order Trigger Condition", expanded=True):
+            col1, col2 = st.columns(2)
+            with col1:
+                config['dhan_trigger_condition'] = st.selectbox(
+                    "Trigger When Price",
+                    [">=", "<="],
+                    help="Place order when price crosses this threshold"
+                )
+            with col2:
+                config['dhan_trigger_price'] = st.number_input(
+                    "Trigger Price",
+                    min_value=0.0,
+                    value=0.0,
+                    step=0.5,
+                    help="Price level to trigger broker order"
+                )
+        
+        with st.expander("🎯 Broker SL/Target Configuration", expanded=True):
+            config['dhan_use_algo_signals'] = st.checkbox(
+                "Use Main Algo SL/Target Signals",
+                value=True,
+                help="Use the same SL/Target from main algorithm"
+            )
+            
+            if not config['dhan_use_algo_signals']:
+                st.markdown("**Custom SL Configuration**")
+                col1, col2 = st.columns(2)
+                with col1:
+                    config['dhan_custom_sl_type'] = st.selectbox(
+                        "Broker SL Type",
+                        [
+                            "Custom Points",
+                            "Trailing SL (Points)",
+                            "ATR-based",
+                            "Current Candle Low/High",
+                            "Previous Candle Low/High"
+                        ],
+                        key="dhan_sl_type_select"
+                    )
+                with col2:
+                    if 'Points' in config['dhan_custom_sl_type']:
+                        config['dhan_custom_sl_points'] = st.number_input(
+                            "Broker SL Points",
+                            min_value=1,
+                            value=50,
+                            key="dhan_sl_points"
+                        )
+                
+                st.markdown("**Custom Target Configuration**")
+                col1, col2 = st.columns(2)
+                with col1:
+                    config['dhan_custom_target_type'] = st.selectbox(
+                        "Broker Target Type",
+                        [
+                            "Custom Points",
+                            "Trailing Target (Points)",
+                            "ATR-based",
+                            "Risk-Reward Based"
+                        ],
+                        key="dhan_target_type_select"
+                    )
+                with col2:
+                    if 'Points' in config['dhan_custom_target_type']:
+                        config['dhan_custom_target_points'] = st.number_input(
+                            "Broker Target Points",
+                            min_value=1,
+                            value=100,
+                            key="dhan_target_points"
+                        )
+        
+        st.info("ℹ️ Dhan broker integration is enabled. Orders will be placed when conditions are met.")
+    
+    st.markdown("---")
+    
     st.subheader("Stop Loss Configuration")
     sl_type = st.selectbox(
         "Stop Loss Type",
@@ -1511,6 +1883,16 @@ def render_live_trading_ui():
                     st.session_state['trade_history'].append(trade)
                     add_log(f"Manual Close @ {current_price:.2f} | P&L: {pnl:.2f}")
             
+            # Close broker position if exists
+            dhan_broker = st.session_state.get('dhan_broker')
+            if dhan_broker and dhan_broker.broker_position:
+                if st.session_state.get('current_data') is not None:
+                    df = st.session_state['current_data']
+                    current_price = df.iloc[-1]['Close']
+                    broker_trade = dhan_broker.exit_broker_position(current_price, 'Manual Close')
+                    if broker_trade:
+                        st.session_state['broker_trade_history'].append(broker_trade)
+            
             st.session_state['trading_active'] = False
             st.session_state['position'] = None
             add_log("Trading stopped")
@@ -1587,6 +1969,21 @@ def render_live_dashboard():
             pnl_color = "normal" if unrealized_pnl >= 0 else "inverse"
             st.metric("Unrealized P&L", f"{unrealized_pnl:.2f}", delta=f"{unrealized_pnl:.2f}", delta_color=pnl_color)
             
+            # Display broker P&L if enabled
+            if config.get('dhan_enabled', False):
+                dhan_broker = st.session_state.get('dhan_broker')
+                if dhan_broker and dhan_broker.broker_position:
+                    broker_pnl = dhan_broker.get_broker_pnl(current_price)
+                    broker_pnl_color = "normal" if broker_pnl >= 0 else "inverse"
+                    st.metric("🏦 Broker Unrealized P&L", f"{broker_pnl:.2f}", delta=f"{broker_pnl:.2f}", delta_color=broker_pnl_color)
+                    
+                    # Combined P&L
+                    combined_pnl = unrealized_pnl + broker_pnl
+                    combined_pnl_color = "normal" if combined_pnl >= 0 else "inverse"
+                    st.metric("📊 Total Combined P&L", f"{combined_pnl:.2f}", delta=f"{combined_pnl:.2f}", delta_color=combined_pnl_color)
+                else:
+                    st.metric("🏦 Broker Position", "No Position")
+            
             st.metric("EMA Fast", f"{current_data['EMA_Fast']:.2f}")
             st.metric("EMA Slow", f"{current_data['EMA_Slow']:.2f}")
             st.metric("RSI", f"{current_data['RSI']:.2f}")
@@ -1623,6 +2020,57 @@ def render_live_dashboard():
             
             if position.get('partial_exit_done'):
                 st.info("ℹ️ Partial exit completed")
+        
+        # Broker Position Information
+        if config.get('dhan_enabled', False):
+            dhan_broker = st.session_state.get('dhan_broker')
+            if dhan_broker and dhan_broker.broker_position:
+                st.markdown("---")
+                st.subheader("🏦 Broker Position Information")
+                
+                broker_pos = dhan_broker.broker_position
+                broker_duration = datetime.now(IST) - broker_pos['entry_time']
+                
+                st.markdown(f"**Entry Time:** {broker_pos['entry_time'].strftime('%Y-%m-%d %H:%M:%S')}")
+                st.markdown(f"**Duration:** {str(broker_duration).split('.')[0]}")
+                st.markdown(f"**Type:** {broker_pos['type']}")
+                st.markdown(f"**Entry Price:** {broker_pos['entry_price']:.2f}")
+                st.markdown(f"**Quantity:** {broker_pos['quantity']}")
+                
+                broker_sl_display = f"{broker_pos['sl_price']:.2f}" if broker_pos['sl_price'] else "Not Set"
+                broker_target_display = f"{broker_pos['target_price']:.2f}" if broker_pos['target_price'] else "Not Set"
+                
+                st.markdown(f"**Stop Loss:** {broker_sl_display}")
+                st.markdown(f"**Target:** {broker_target_display}")
+                st.markdown(f"**Order ID:** {broker_pos['order_id']}")
+                
+                if broker_pos['highest_price'] and broker_pos['type'] == 'BUY':
+                    st.markdown(f"**Highest Price:** {broker_pos['highest_price']:.2f}")
+                
+                if broker_pos['lowest_price'] and broker_pos['type'] == 'SELL':
+                    st.markdown(f"**Lowest Price:** {broker_pos['lowest_price']:.2f}")
+                
+                # Display broker trade history
+                broker_trades = st.session_state.get('broker_trade_history', [])
+                if broker_trades:
+                    st.markdown("---")
+                    st.subheader("🏦 Broker Trade History")
+                    
+                    total_broker_pnl = sum(t['P&L'] for t in broker_trades)
+                    broker_total_pnl_color = "normal" if total_broker_pnl >= 0 else "inverse"
+                    st.metric("Total Broker P&L", f"{total_broker_pnl:.2f}", delta=f"{total_broker_pnl:.2f}", delta_color=broker_total_pnl_color)
+                    
+                    for i, trade in enumerate(reversed(broker_trades[-5:])):  # Show last 5 broker trades
+                        with st.expander(f"Broker Trade #{len(broker_trades) - i} - P&L: {trade['P&L']:.2f}"):
+                            st.markdown(f"**Entry:** {trade['Entry Time'].strftime('%Y-%m-%d %H:%M:%S')} @ {trade['Entry Price']:.2f}")
+                            st.markdown(f"**Exit:** {trade['Exit Time'].strftime('%Y-%m-%d %H:%M:%S')} @ {trade['Exit Price']:.2f}")
+                            st.markdown(f"**Type:** {trade['Type']}")
+                            st.markdown(f"**Quantity:** {trade['Quantity']}")
+                            st.markdown(f"**Exit Reason:** {trade['Exit Reason']}")
+                            st.markdown(f"**Order IDs:** {trade['Order IDs']}")
+                            
+                            pnl_color = "🟢" if trade['P&L'] > 0 else "🔴"
+                            st.markdown(f"**P&L:** {pnl_color} {trade['P&L']:.2f}")
         
         else:
             st.metric("Position Status", "CLOSED", delta="No Active Position")
@@ -1689,13 +2137,15 @@ def render_trade_history():
             with col1:
                 st.markdown(f"**Entry Time:** {trade['Entry Time'].strftime('%Y-%m-%d %H:%M:%S')}")
                 st.markdown(f"**Entry Price:** {trade['Entry Price']:.2f}")
-                st.markdown(f"**SL:** {trade['SL']:.2f if trade['SL'] else 'Signal'}")
+                sl_display = f"{trade['SL']:.2f}" if trade['SL'] else "Signal"
+                st.markdown(f"**SL:** {sl_display}")
                 st.markdown(f"**Quantity:** {trade['Quantity']}")
             
             with col2:
                 st.markdown(f"**Exit Time:** {trade['Exit Time'].strftime('%Y-%m-%d %H:%M:%S')}")
                 st.markdown(f"**Exit Price:** {trade['Exit Price']:.2f}")
-                st.markdown(f"**Target:** {trade['Target']:.2f if trade['Target'] else 'Signal'}")
+                target_display = f"{trade['Target']:.2f}" if trade['Target'] else "Signal"
+                st.markdown(f"**Target:** {target_display}")
                 st.markdown(f"**Duration:** {str(trade['Duration']).split('.')[0]}")
             
             st.markdown(f"**Exit Reason:** {trade['Exit Reason']}")
@@ -1809,13 +2259,15 @@ def render_backtest_results():
                 with col1:
                     st.markdown(f"**Entry Time:** {trade['Entry Time'].strftime('%Y-%m-%d %H:%M:%S')}")
                     st.markdown(f"**Entry Price:** {trade['Entry Price']:.2f}")
-                    st.markdown(f"**SL:** {trade['SL']:.2f if trade['SL'] else 'Signal'}")
+                    sl_display = f"{trade['SL']:.2f}" if trade['SL'] else "Signal"
+                    st.markdown(f"**SL:** {sl_display}")
                     st.markdown(f"**Quantity:** {trade['Quantity']}")
                 
                 with col2:
                     st.markdown(f"**Exit Time:** {trade['Exit Time'].strftime('%Y-%m-%d %H:%M:%S')}")
                     st.markdown(f"**Exit Price:** {trade['Exit Price']:.2f}")
-                    st.markdown(f"**Target:** {trade['Target']:.2f if trade['Target'] else 'Signal'}")
+                    target_display = f"{trade['Target']:.2f}" if trade['Target'] else "Signal"
+                    st.markdown(f"**Target:** {target_display}")
                     st.markdown(f"**Duration:** {str(trade['Duration']).split('.')[0]}")
                 
                 st.markdown(f"**Exit Reason:** {trade['Exit Reason']}")
@@ -2016,7 +2468,9 @@ def initialize_session_state():
         'config': {},
         'custom_conditions': [],
         'current_pct_change': 0.0,
-        'ai_analysis': {}
+        'ai_analysis': {},
+        'dhan_broker': None,
+        'broker_trade_history': []
     }
     
     for key, value in defaults.items():
