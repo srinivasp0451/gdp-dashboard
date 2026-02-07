@@ -1004,11 +1004,29 @@ def check_signal_based_exit(df, idx, position_type):
 # ============================================================================
 
 def run_backtest(df, config):
+    """
+    BACKTEST ENGINE - COMPLETELY REWRITTEN FROM SCRATCH
+    
+    Clear, simple logic:
+    1. Loop through each candle
+    2. If no position: check for entry signals
+    3. If position open: check for exit conditions
+    4. Track all P&L accurately
+    5. No position data carries over between trades
+    """
+    
+    # Initialize
     trades = []
     position = None
     
-    strategy_name = config['strategy']
-    strategy_func_map = {
+    # Get configuration
+    strategy_name = config.get('strategy', 'EMA Crossover')
+    sl_type = config.get('sl_type', 'Custom Points')
+    target_type = config.get('target_type', 'Custom Points')
+    quantity = config.get('quantity', 1)
+    
+    # Map strategies to functions
+    strategy_map = {
         'EMA Crossover': check_ema_crossover_strategy,
         'Simple Buy': check_simple_buy_strategy,
         'Simple Sell': check_simple_sell_strategy,
@@ -1019,199 +1037,263 @@ def run_backtest(df, config):
         'Custom Strategy': check_custom_strategy,
     }
     
-    strategy_func = strategy_func_map.get(strategy_name)
+    strategy_func = strategy_map.get(strategy_name)
     if not strategy_func:
         return trades
     
-    sl_type = config['sl_type']
-    target_type = config['target_type']
-    quantity = config.get('quantity', 1)
-    
-    # Track statistics for debugging
+    # Debugging stats
     total_candles = len(df)
-    signals_checked = 0
-    signals_generated = 0
+    entry_signals = 0
     trades_entered = 0
     trades_exited = 0
     
-    # Start from index where indicators are ready (skip NaN period)
-    start_idx = max(config.get('ema_slow', 15), 20)  # Wait for indicators to stabilize
+    # Start after indicators are ready
+    start_idx = 20  # Skip first 20 candles for indicator warmup
     
-    for idx in range(start_idx, len(df)):
-        current_data = df.iloc[idx]
-        current_time = df.index[idx]
-        current_price = current_data['Close']
+    # =========================================================================
+    # MAIN BACKTEST LOOP
+    # =========================================================================
+    for idx in range(start_idx, total_candles):
         
-        # Skip if essential data is NaN
-        if pd.isna(current_price):
+        # Get current candle data
+        candle = df.iloc[idx]
+        timestamp = df.index[idx]
+        price = candle['Close']
+        
+        # Validate price data
+        if pd.isna(price) or price <= 0:
             continue
         
-        signals_checked += 1
-        
+        # =====================================================================
+        # SCENARIO 1: NO POSITION - Look for entry signal
+        # =====================================================================
         if position is None:
-            signal, entry_price = strategy_func(df, idx, config, None)
             
-            if signal:
-                signals_generated += 1
+            # Check strategy for signal
+            signal, signal_price = strategy_func(df, idx, config, None)
+            
+            if signal:  # Entry signal found
+                entry_signals += 1
                 
-                # Convert BUY/SELL to LONG/SHORT for internal consistency
-                position_type = 'LONG' if signal == 'BUY' else 'SHORT'
+                # Determine position type
+                pos_type = 'LONG' if signal == 'BUY' else 'SHORT'
                 
-                sl_price = calculate_initial_sl(entry_price, position_type, sl_type, config, current_data)
-                target_price = calculate_initial_target(entry_price, position_type, target_type, config, current_data)
+                # Use signal price as entry (current candle close)
+                entry_px = signal_price
                 
+                # Calculate SL price
+                sl_px = calculate_initial_sl(entry_px, pos_type, sl_type, config, candle)
+                
+                # Calculate Target price  
+                tgt_px = calculate_initial_target(entry_px, pos_type, target_type, config, candle)
+                
+                # Create NEW position (completely fresh, no old data)
                 position = {
-                    'type': position_type,
-                    'entry_price': entry_price,
-                    'entry_time': current_time,
+                    'type': pos_type,
+                    'entry_price': entry_px,
+                    'entry_time': timestamp,
                     'entry_idx': idx,
-                    'sl_price': sl_price,
-                    'target_price': target_price,
                     'quantity': quantity,
-                    'partial_exit_done': False,
-                    'breakeven_activated': False,
-                    'highest_price': entry_price if position_type == 'LONG' else None,
-                    'lowest_price': entry_price if position_type == 'SHORT' else None,
+                    'sl_price': sl_px,
+                    'target_price': tgt_px,
+                    'highest_price': entry_px,
+                    'lowest_price': entry_px,
+                    'highest_pnl': 0.0,
+                    'lowest_pnl': 0.0,
+                    'partial_exited': False,
+                    'breakeven_active': False,
+                    'current_qty': quantity,
                 }
+                
                 trades_entered += 1
-        
+                
+        # =====================================================================
+        # SCENARIO 2: POSITION OPEN - Check for exit
+        # =====================================================================
         else:
-            position_type = position['type']
-            entry_price = position['entry_price']
-            sl_price = position['sl_price']
-            target_price = position['target_price']
             
-            if 'Trailing' in sl_type:
-                new_sl = update_trailing_sl(current_price, sl_price, position_type, sl_type, 
-                                            config, current_data, df, idx)
+            # Extract position data (use local variables to avoid confusion)
+            pos_type = position['type']
+            entry_px = position['entry_price']
+            curr_qty = position['current_qty']
+            sl_px = position['sl_price']
+            tgt_px = position['target_price']
+            
+            # Calculate CURRENT P&L for THIS position
+            # CRITICAL: Use same asset's entry and current price
+            if pos_type == 'LONG':
+                pnl = (price - entry_px) * curr_qty
+            else:  # SHORT
+                pnl = (entry_px - price) * curr_qty
+            
+            # Track price extremes
+            if price > position['highest_price']:
+                position['highest_price'] = price
+            if price < position['lowest_price']:
+                position['lowest_price'] = price
+            
+            # Track P&L extremes
+            if pnl > position['highest_pnl']:
+                position['highest_pnl'] = pnl
+            if pnl < position['lowest_pnl']:
+                position['lowest_pnl'] = pnl
+            
+            # -----------------------------------------------------------------
+            # Update Trailing SL (if applicable)
+            # -----------------------------------------------------------------
+            if 'Trailing' in sl_type and sl_type not in ['Trailing Profit (Rupees)', 'Trailing Loss (Rupees)']:
+                new_sl = update_trailing_sl(price, sl_px, pos_type, sl_type, config, candle, df, idx)
                 if new_sl is not None:
                     position['sl_price'] = new_sl
-                    sl_price = new_sl
+                    sl_px = new_sl
             
+            # -----------------------------------------------------------------
+            # Update Trailing Target (if applicable)
+            # -----------------------------------------------------------------
             if 'Trailing' in target_type:
-                new_target = update_trailing_target(current_price, target_price, position_type, 
-                                                    target_type, config)
-                if new_target is not None:
-                    position['target_price'] = new_target
-                    target_price = new_target
+                new_tgt = update_trailing_target(price, tgt_px, pos_type, target_type, config)
+                if new_tgt is not None:
+                    position['target_price'] = new_tgt
+                    tgt_px = new_tgt
             
-            if position_type == 'LONG':
-                if position['highest_price'] is None or current_price > position['highest_price']:
-                    position['highest_price'] = current_price
-            else:
-                if position['lowest_price'] is None or current_price < position['lowest_price']:
-                    position['lowest_price'] = current_price
+            # -----------------------------------------------------------------
+            # Check EXIT conditions (in priority order)
+            # -----------------------------------------------------------------
             
-            if (target_type == 'Break-even After 50% Target' and 
-                not position['breakeven_activated'] and 
-                target_price is not None):
+            exit_now = False
+            exit_price = price
+            exit_reason = None
+            
+            # 1. Trailing Profit Exit
+            if sl_type == 'Trailing Profit (Rupees)':
+                trail_amt = config.get('trailing_profit_rupees', 1000)
+                profit_drop = position['highest_pnl'] - pnl
                 
-                if position_type == 'LONG':
-                    target_50 = entry_price + (target_price - entry_price) * 0.5
-                    if current_price >= target_50:
-                        position['sl_price'] = entry_price
-                        position['breakeven_activated'] = True
-                else:
-                    target_50 = entry_price - (entry_price - target_price) * 0.5
-                    if current_price <= target_50:
-                        position['sl_price'] = entry_price
-                        position['breakeven_activated'] = True
+                if position['highest_pnl'] > 0 and profit_drop >= trail_amt:
+                    exit_now = True
+                    exit_reason = 'Trailing Profit'
             
-            if (target_type == '50% Exit at Target (Partial)' and 
-                not position['partial_exit_done'] and 
-                target_price is not None):
+            # 2. Trailing Loss Exit
+            if not exit_now and sl_type == 'Trailing Loss (Rupees)':
+                trail_amt = config.get('trailing_loss_rupees', 500)
+                loss_increase = pnl - position['lowest_pnl']
                 
-                target_hit = False
-                if position_type == 'LONG' and current_price >= target_price:
-                    target_hit = True
-                elif position_type == 'SELL' and current_price <= target_price:
-                    target_hit = True
+                if position['lowest_pnl'] < 0 and abs(loss_increase) >= trail_amt:
+                    exit_now = True
+                    exit_reason = 'Trailing Loss'
+            
+            # 3. P&L-based SL
+            if not exit_now and sl_type == 'P&L Based (Rupees)':
+                sl_amt = config.get('sl_rupees', 300)
+                if pnl <= -sl_amt:
+                    exit_now = True
+                    exit_reason = 'P&L SL'
+            
+            # 4. P&L-based Target
+            if not exit_now and target_type == 'P&L Based (Rupees)':
+                tgt_amt = config.get('target_rupees', 5000)
+                if pnl >= tgt_amt:
+                    exit_now = True
+                    exit_reason = 'P&L Target'
+            
+            # 5. Price-based SL
+            if not exit_now and sl_px is not None:
+                if pos_type == 'LONG' and price <= sl_px:
+                    exit_now = True
+                    exit_reason = 'SL'
+                elif pos_type == 'SHORT' and price >= sl_px:
+                    exit_now = True
+                    exit_reason = 'SL'
+            
+            # 6. Price-based Target
+            if not exit_now and tgt_px is not None:
+                if pos_type == 'LONG' and price >= tgt_px:
+                    exit_now = True
+                    exit_reason = 'Target'
+                elif pos_type == 'SHORT' and price <= tgt_px:
+                    exit_now = True
+                    exit_reason = 'Target'
+            
+            # 7. Signal-based Exit
+            if not exit_now:
+                if (sl_type == 'Signal-based (reverse EMA crossover)' or 
+                    target_type == 'Signal-based (reverse EMA crossover)'):
+                    if check_signal_based_exit(df, idx, pos_type):
+                        exit_now = True
+                        exit_reason = 'Signal'
+            
+            # -----------------------------------------------------------------
+            # Execute EXIT
+            # -----------------------------------------------------------------
+            if exit_now:
                 
-                if target_hit:
-                    partial_qty = quantity // 2
-                    if partial_qty > 0:
-                        position['partial_exit_done'] = True
-                        position['quantity'] = quantity - partial_qty
-            
-            signal_exit = False
-            if (sl_type == 'Signal-based (reverse EMA crossover)' or 
-                target_type == 'Signal-based (reverse EMA crossover)'):
-                signal_exit = check_signal_based_exit(df, idx, position_type)
-            
-            # Calculate current P&L for P&L-based exits
-            if position_type == 'LONG':
-                current_pnl = (current_price - entry_price) * position['quantity']
-            else:
-                current_pnl = (entry_price - current_price) * position['quantity']
-            
-            # Check P&L-based SL
-            sl_hit = False
-            if sl_type == 'P&L Based (Rupees)':
-                sl_rupees = config.get('sl_rupees', 300)
-                if current_pnl <= -sl_rupees:  # Loss exceeded limit
-                    sl_hit = True
-            elif sl_price is not None:
-                if position_type == 'LONG' and current_price <= sl_price:
-                    sl_hit = True
-                elif position_type == 'SELL' and current_price >= sl_price:
-                    sl_hit = True
-            
-            # Check P&L-based Target
-            target_hit = False
-            if target_type == 'P&L Based (Rupees)':
-                target_rupees = config.get('target_rupees', 5000)
-                if current_pnl >= target_rupees:  # Profit reached target
-                    target_hit = True
-            elif target_price is not None and 'Trailing' not in target_type:
-                if position_type == 'LONG' and current_price >= target_price:
-                    target_hit = True
-                elif position_type == 'SELL' and current_price <= target_price:
-                    target_hit = True
-            
-            if signal_exit or sl_hit or target_hit:
-                exit_price = current_price
-                exit_reason = 'Signal' if signal_exit else ('SL' if sl_hit else 'Target')
-                
-                if position_type == 'LONG':
-                    pnl = (exit_price - entry_price) * position['quantity']
-                else:
-                    pnl = (entry_price - exit_price) * position['quantity']
-                
-                if position['partial_exit_done']:
-                    partial_qty = quantity - position['quantity']
-                    if position_type == 'LONG':
-                        partial_pnl = (target_price - entry_price) * partial_qty
+                # Handle partial exits
+                final_pnl = pnl
+                if position['partial_exited']:
+                    # Add P&L from partial exit
+                    partial_qty = quantity - curr_qty
+                    if pos_type == 'LONG':
+                        partial_pnl = (tgt_px - entry_px) * partial_qty
                     else:
-                        partial_pnl = (entry_price - target_price) * partial_qty
-                    pnl += partial_pnl
+                        partial_pnl = (entry_px - tgt_px) * partial_qty
+                    final_pnl += partial_pnl
                 
-                duration = current_time - position['entry_time']
-                
-                trades.append({
+                # Create trade record
+                trade = {
                     'Entry Time': position['entry_time'],
-                    'Exit Time': current_time,
-                    'Duration': duration,
-                    'Type': position_type,
-                    'Entry Price': entry_price,
+                    'Exit Time': timestamp,
+                    'Duration': timestamp - position['entry_time'],
+                    'Type': pos_type,
+                    'Entry Price': entry_px,
                     'Exit Price': exit_price,
-                    'SL': sl_price,
-                    'Target': target_price,
+                    'SL': sl_px,
+                    'Target': tgt_px,
                     'Quantity': quantity,
-                    'P&L': pnl,
+                    'P&L': final_pnl,
                     'Exit Reason': exit_reason
-                })
+                }
                 
+                trades.append(trade)
                 trades_exited += 1
+                
+                # CRITICAL: Clear position completely
                 position = None
+            
+            # -----------------------------------------------------------------
+            # Handle Break-even (if not exiting)
+            # -----------------------------------------------------------------
+            elif target_type == 'Break-even After 50% Target' and not position['breakeven_active']:
+                if tgt_px is not None:
+                    halfway = entry_px + (tgt_px - entry_px) * 0.5 if pos_type == 'LONG' else entry_px - (entry_px - tgt_px) * 0.5
+                    
+                    if (pos_type == 'LONG' and price >= halfway) or (pos_type == 'SHORT' and price <= halfway):
+                        position['sl_price'] = entry_px
+                        position['breakeven_active'] = True
+            
+            # -----------------------------------------------------------------
+            # Handle Partial Exit (if not exiting)
+            # -----------------------------------------------------------------
+            elif target_type == '50% Exit at Target (Partial)' and not position['partial_exited']:
+                if tgt_px is not None:
+                    hit = (pos_type == 'LONG' and price >= tgt_px) or (pos_type == 'SHORT' and price <= tgt_px)
+                    
+                    if hit:
+                        partial_qty = quantity // 2
+                        if partial_qty > 0:
+                            position['partial_exited'] = True
+                            position['current_qty'] = quantity - partial_qty
     
-    # Store debug info in session state
+    # =========================================================================
+    # Store debug info
+    # =========================================================================
     st.session_state['backtest_debug'] = {
         'total_candles': total_candles,
-        'candles_analyzed': signals_checked,
-        'signals_generated': signals_generated,
+        'candles_analyzed': total_candles - start_idx,
+        'signals_generated': entry_signals,
         'trades_entered': trades_entered,
         'trades_completed': trades_exited,
-        'skipped_candles': start_idx
+        'skipped_candles': start_idx,
+        'position_still_open': position is not None
     }
     
     return trades
@@ -1295,8 +1377,10 @@ def live_trading_iteration():
                 'quantity': config['quantity'],
                 'partial_exit_done': False,
                 'breakeven_activated': False,
-                'highest_price': entry_price if position_type == 'LONG' else None,
-                'lowest_price': entry_price if position_type == 'SHORT' else None,
+                'highest_price': entry_price,
+                'lowest_price': entry_price,
+                'highest_profit': 0.0,
+                'lowest_profit': 0.0,
             }
             
             sl_display = f"{sl_price:.2f}" if sl_price else "Signal"
@@ -1332,6 +1416,84 @@ def live_trading_iteration():
         else:
             if position['lowest_price'] is None or current_price < position['lowest_price']:
                 st.session_state['position']['lowest_price'] = current_price
+        
+        # Calculate current P&L
+        if position_type == 'LONG':
+            current_pnl = (current_price - entry_price) * position['quantity']
+        else:
+            current_pnl = (entry_price - current_price) * position['quantity']
+        
+        # Track highest profit and lowest profit
+        if current_pnl > position.get('highest_profit', 0):
+            st.session_state['position']['highest_profit'] = current_pnl
+        if current_pnl < position.get('lowest_profit', 0):
+            st.session_state['position']['lowest_profit'] = current_pnl
+        
+        # Check Trailing Profit exit
+        if config['sl_type'] == 'Trailing Profit (Rupees)':
+            trailing_profit_amount = config.get('trailing_profit_rupees', 1000)
+            highest_profit = position.get('highest_profit', 0)
+            profit_drop = highest_profit - current_pnl
+            
+            if highest_profit > 0 and profit_drop >= trailing_profit_amount:
+                exit_price = current_price
+                pnl = current_pnl
+                
+                duration = current_time - position['entry_time']
+                trade = {
+                    'Entry Time': position['entry_time'],
+                    'Exit Time': current_time,
+                    'Duration': duration,
+                    'Type': position_type,
+                    'Entry Price': entry_price,
+                    'Exit Price': exit_price,
+                    'SL': sl_price,
+                    'Target': target_price,
+                    'Quantity': config['quantity'],
+                    'P&L': pnl,
+                    'Exit Reason': 'Trailing Profit'
+                }
+                
+                st.session_state['trade_history'].append(trade)
+                add_log(f"Trailing Profit Exit: Profit dropped ₹{profit_drop:.2f} from peak | P&L: {pnl:.2f}")
+                st.session_state['position'] = None
+                
+                time.sleep(random.uniform(1.0, 1.5))
+                st.rerun()
+                return
+        
+        # Check Trailing Loss exit
+        if config['sl_type'] == 'Trailing Loss (Rupees)':
+            trailing_loss_amount = config.get('trailing_loss_rupees', 500)
+            lowest_profit = position.get('lowest_profit', 0)
+            loss_increase = current_pnl - lowest_profit
+            
+            if lowest_profit < 0 and abs(loss_increase) >= trailing_loss_amount:
+                exit_price = current_price
+                pnl = current_pnl
+                
+                duration = current_time - position['entry_time']
+                trade = {
+                    'Entry Time': position['entry_time'],
+                    'Exit Time': current_time,
+                    'Duration': duration,
+                    'Type': position_type,
+                    'Entry Price': entry_price,
+                    'Exit Price': exit_price,
+                    'SL': sl_price,
+                    'Target': target_price,
+                    'Quantity': config['quantity'],
+                    'P&L': pnl,
+                    'Exit Reason': 'Trailing Loss'
+                }
+                
+                st.session_state['trade_history'].append(trade)
+                add_log(f"Trailing Loss Exit: Loss increased ₹{abs(loss_increase):.2f} from lowest | P&L: {pnl:.2f}")
+                st.session_state['position'] = None
+                
+                time.sleep(random.uniform(1.0, 1.5))
+                st.rerun()
+                return
         
         if (config['target_type'] == 'Break-even After 50% Target' and
             not position['breakeven_activated'] and target_price is not None):
@@ -1374,12 +1536,6 @@ def live_trading_iteration():
         if (config['sl_type'] == 'Signal-based (reverse EMA crossover)' or
             config['target_type'] == 'Signal-based (reverse EMA crossover)'):
             signal_exit = check_signal_based_exit(df, idx, position_type)
-        
-        # Calculate current P&L for P&L-based exits
-        if position_type == 'LONG':
-            current_pnl = (current_price - entry_price) * position['quantity']
-        else:
-            current_pnl = (entry_price - current_price) * position['quantity']
         
         # Check P&L-based SL
         sl_hit = False
@@ -1617,9 +1773,28 @@ def render_configuration_ui():
         st.subheader("Asset Selection")
         asset_type = st.selectbox("Asset Type", list(ASSET_MAPPING.keys()) + ["Custom"])
         
+        # Clear position if asset changes (prevent BTC/NIFTY price mixing)
+        if 'last_selected_asset' not in st.session_state:
+            st.session_state['last_selected_asset'] = asset_type
+        elif st.session_state['last_selected_asset'] != asset_type:
+            # Asset changed - clear position to prevent price mixing
+            st.session_state['position'] = None
+            st.session_state['last_selected_asset'] = asset_type
+            if st.session_state.get('trading_active', False):
+                st.warning("⚠️ Asset changed - Previous position cleared")
+        
         if asset_type == "Custom":
             custom_ticker = st.text_input("Enter Ticker Symbol", "^NSEI")
             selected_asset = "Custom"
+            
+            # Also check custom ticker changes
+            if 'last_custom_ticker' not in st.session_state:
+                st.session_state['last_custom_ticker'] = custom_ticker
+            elif st.session_state['last_custom_ticker'] != custom_ticker:
+                st.session_state['position'] = None
+                st.session_state['last_custom_ticker'] = custom_ticker
+                if st.session_state.get('trading_active', False):
+                    st.warning("⚠️ Ticker changed - Previous position cleared")
         else:
             custom_ticker = None
             selected_asset = asset_type
@@ -1913,6 +2088,8 @@ def render_configuration_ui():
         [
             "Custom Points",
             "P&L Based (Rupees)",
+            "Trailing Profit (Rupees)",
+            "Trailing Loss (Rupees)",
             "Trailing SL (Points)",
             "Trailing SL + Current Candle",
             "Trailing SL + Previous Candle",
@@ -1940,7 +2117,25 @@ def render_configuration_ui():
             min_value=1.0, 
             value=300.0, 
             step=10.0,
-            help="Exit position if loss exceeds this amount"
+            help="Exit if loss exceeds this amount"
+        )
+    
+    if sl_type == 'Trailing Profit (Rupees)':
+        config['trailing_profit_rupees'] = st.number_input(
+            "Trailing Profit Amount (₹)", 
+            min_value=1.0, 
+            value=1000.0, 
+            step=100.0,
+            help="Exit if profit drops by this amount from highest profit"
+        )
+    
+    if sl_type == 'Trailing Loss (Rupees)':
+        config['trailing_loss_rupees'] = st.number_input(
+            "Trailing Loss Amount (₹)", 
+            min_value=1.0, 
+            value=500.0, 
+            step=50.0,
+            help="Exit if loss increases by this amount from lowest point"
         )
     
     if 'ATR' in sl_type:
