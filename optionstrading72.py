@@ -99,13 +99,16 @@ class OptionSignalGenerator:
         """Calculate all technical indicators"""
         if self.data is None or self.data.empty:
             return None
+        
+        # Check minimum data requirement (need at least 60 days for 50-day MA)
+        if len(self.data) < 60:
+            return None
             
         df = self.data.copy()
         
-        # Moving Averages
+        # Moving Averages (removed MA200 to allow shorter periods)
         df['MA20'] = df['Close'].rolling(20).mean()
         df['MA50'] = df['Close'].rolling(50).mean()
-        df['MA200'] = df['Close'].rolling(200).mean()
         
         # RSI
         delta = df['Close'].diff()
@@ -157,7 +160,7 @@ class OptionSignalGenerator:
     
     def generate_signal(self):
         """Generate comprehensive BUY CALL or BUY PUT signal"""
-        if self.data is None or len(self.data) < 200:
+        if self.data is None or len(self.data) < 60:
             return None
             
         df = self.data
@@ -330,7 +333,7 @@ class OptionSignalGenerator:
         return signal
     
     def get_volatility_context(self):
-        """Get volatility analysis for IV comparison"""
+        """Get volatility analysis for IV comparison - standardized to 1-year comparison"""
         if self.data is None:
             return None
             
@@ -340,14 +343,21 @@ class OptionSignalGenerator:
         if len(hv_data) == 0:
             return None
         
-        hv_percentile = (hv_data < current['HV']).sum() / len(hv_data) * 100
+        # IMPORTANT: For options trading, we ALWAYS compare against 1 year (252 trading days)
+        # This is the industry standard regardless of period selected
+        comparison_period = min(252, len(hv_data))  # Use 1 year or less if not available
+        comparison_data = hv_data.tail(comparison_period)
+        
+        # Calculate percentile against the comparison period
+        hv_percentile = (comparison_data < current['HV']).sum() / len(comparison_data) * 100
         
         context = {
             'current_hv': current['HV'],
             'hv_percentile': hv_percentile,
-            'avg_hv_6m': hv_data.mean(),
-            'min_hv_6m': hv_data.min(),
-            'max_hv_6m': hv_data.max()
+            'avg_hv_period': comparison_data.mean(),
+            'min_hv_period': comparison_data.min(),
+            'max_hv_period': comparison_data.max(),
+            'comparison_days': comparison_period
         }
         
         # Recommendation based on HV percentile
@@ -940,11 +950,18 @@ def main():
         st.markdown("---")
         
         # Data period
+        st.markdown("### 📊 Data Period")
         period = st.selectbox(
             "Historical Data Period",
-            options=["1mo", "3mo", "6mo", "1y", "2y"],
-            index=2
+            options=["3mo", "6mo", "1y", "2y"],
+            index=2,  # Default to 1y
+            help="1y (1 year) is recommended for standard HV percentile calculation"
         )
+        
+        if period in ["3mo"]:
+            st.warning("⚠️ 3mo may have insufficient data for some indicators. Recommend 6mo or 1y.")
+        
+        st.info("💡 **Recommended: 1y** - Industry standard for options HV analysis")
         
         st.markdown("---")
         
@@ -977,6 +994,9 @@ def main():
                     
                     if data is None or data.empty:
                         st.error(f"❌ Could not fetch data for {ticker_symbol}. Please check ticker symbol.")
+                    elif len(data) < 60:
+                        st.error(f"❌ Insufficient data: Only {len(data)} days available. Need at least 60 days.")
+                        st.warning("💡 Try selecting a longer period (6mo or 1y) or check if the ticker is newly listed.")
                     else:
                         # Calculate indicators
                         signal_gen.calculate_indicators()
@@ -1004,14 +1024,14 @@ def main():
                                 with vol_col1:
                                     st.metric("Current HV", f"{vol_context['current_hv']:.2f}%")
                                 with vol_col2:
-                                    st.metric("6M Average HV", f"{vol_context['avg_hv_6m']:.2f}%")
+                                    st.metric(f"Avg HV ({vol_context['comparison_days']}d)", f"{vol_context['avg_hv_period']:.2f}%")
                                 with vol_col3:
                                     st.metric("HV Percentile", f"{vol_context['hv_percentile']:.1f}%")
                                 with vol_col4:
                                     st.markdown(f"**Status**")
                                     st.markdown(f":{vol_context['color']}[{vol_context['recommendation']}]")
                                 
-                                st.info("💡 **How to use HV:** Compare Current HV with IV from your option chain screenshot. If IV < HV, options are cheap (good to buy). If IV > HV, options are expensive (avoid).")
+                                st.info(f"💡 **HV Analysis:** Comparing current volatility against last {vol_context['comparison_days']} trading days (~{vol_context['comparison_days']//21} months). Industry standard uses 1 year (252 days). If IV from your option chain < Current HV ({vol_context['current_hv']:.2f}%), options are cheap.")
                             
                             # Technical indicators summary
                             st.markdown("---")
