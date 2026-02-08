@@ -351,28 +351,40 @@ class OptionSignalGenerator:
         # Calculate percentile against the comparison period
         hv_percentile = (comparison_data < current['HV']).sum() / len(comparison_data) * 100
         
+        # Calculate statistical measures
+        hv_mean = comparison_data.mean()
+        hv_std = comparison_data.std()
+        hv_z_score = (current['HV'] - hv_mean) / hv_std if hv_std > 0 else 0
+        
         context = {
             'current_hv': current['HV'],
             'hv_percentile': hv_percentile,
-            'avg_hv_period': comparison_data.mean(),
+            'avg_hv_period': hv_mean,
             'min_hv_period': comparison_data.min(),
             'max_hv_period': comparison_data.max(),
+            'hv_std': hv_std,
+            'hv_z_score': hv_z_score,
             'comparison_days': comparison_period
         }
         
-        # Recommendation based on HV percentile
-        if hv_percentile < 30:
+        # More lenient recommendation logic
+        # Using percentile OR z-score (whichever is more favorable)
+        if hv_percentile < 30 and hv_z_score < 0:
             context['recommendation'] = 'EXCELLENT - Low volatility, cheap options'
             context['color'] = 'green'
-        elif hv_percentile < 50:
-            context['recommendation'] = 'GOOD - Below average volatility'
+            context['trade_ok'] = True
+        elif hv_percentile < 60 or hv_z_score < 0.5:
+            context['recommendation'] = 'GOOD - Reasonable volatility, can trade'
             context['color'] = 'lightgreen'
-        elif hv_percentile < 70:
-            context['recommendation'] = 'NEUTRAL - Average volatility'
+            context['trade_ok'] = True
+        elif hv_percentile < 75:
+            context['recommendation'] = 'CAUTION - Elevated volatility, smaller position'
             context['color'] = 'orange'
+            context['trade_ok'] = True  # Still tradeable but be careful
         else:
-            context['recommendation'] = 'EXPENSIVE - High volatility, avoid buying'
+            context['recommendation'] = 'EXPENSIVE - Very high volatility, avoid buying'
             context['color'] = 'red'
+            context['trade_ok'] = False
         
         return context
 
@@ -518,8 +530,8 @@ def display_signal_box(signal, vol_context=None):
     decision_color = "orange"
     
     if signal['signal'] != 'NO SIGNAL' and vol_context:
-        # Both technical AND volatility must be favorable
-        if vol_context['hv_percentile'] < 50:  # Good volatility environment
+        # Use the trade_ok flag from volatility context
+        if vol_context.get('trade_ok', False):
             can_trade = True
             final_decision = "TRADE NOW ✅"
             decision_color = "green"
@@ -760,15 +772,18 @@ def analyze_extracted_options(call_data, put_data, signal, vol_context):
         hv = vol_context['current_hv']
         
         # Check overall volatility environment first
-        if vol_context['hv_percentile'] >= 50:
-            st.error("❌ **STOP: High Volatility Environment**")
-            st.warning(f"HV Percentile: {vol_context['hv_percentile']:.1f}% - Options are EXPENSIVE. DO NOT BUY even with good technical setup.")
-            st.info("💡 **Wait for volatility to drop below 50th percentile before entering trades.**")
-            return
+        if not vol_context.get('trade_ok', False):
+            st.error("❌ **STOP: Unfavorable Volatility Environment**")
+            st.warning(f"HV Percentile: {vol_context['hv_percentile']:.1f}% | Z-Score: {vol_context['hv_z_score']:.2f}")
+            st.warning("Options may be overpriced. Consider waiting for better entry or use smaller position size.")
+            st.info("💡 **You can still trade**, but be aware options are relatively expensive. Risk:Reward will be less favorable.")
+            # Don't return - allow analysis to continue
+        else:
+            st.success("✅ **Good Volatility Environment - Favorable for Option Buying**")
+            st.success(f"✅ HV Percentile: {vol_context['hv_percentile']:.1f}% | Z-Score: {vol_context['hv_z_score']:.2f}")
         
         if signal['signal'] == 'BUY CALL':
-            st.success("✅ Technical Signal: BUY CALL + Favorable Volatility")
-            st.success(f"✅ HV Percentile: {vol_context['hv_percentile']:.1f}% - Options are CHEAP")
+            st.success("✅ Technical Signal: BUY CALL")
             
             if call_data:
                 df_calls = pd.DataFrame(call_data)
@@ -808,8 +823,7 @@ def analyze_extracted_options(call_data, put_data, signal, vol_context):
                 st.warning("No CALL data extracted")
         
         elif signal['signal'] == 'BUY PUT':
-            st.success("✅ Technical Signal: BUY PUT + Favorable Volatility")
-            st.success(f"✅ HV Percentile: {vol_context['hv_percentile']:.1f}% - Options are CHEAP")
+            st.success("✅ Technical Signal: BUY PUT")
             
             if put_data:
                 df_puts = pd.DataFrame(put_data)
@@ -1019,7 +1033,7 @@ def main():
                             st.markdown("### 📊 Volatility Analysis")
                             
                             if vol_context:
-                                vol_col1, vol_col2, vol_col3, vol_col4 = st.columns(4)
+                                vol_col1, vol_col2, vol_col3, vol_col4, vol_col5 = st.columns(5)
                                 
                                 with vol_col1:
                                     st.metric("Current HV", f"{vol_context['current_hv']:.2f}%")
@@ -1028,10 +1042,52 @@ def main():
                                 with vol_col3:
                                     st.metric("HV Percentile", f"{vol_context['hv_percentile']:.1f}%")
                                 with vol_col4:
+                                    st.metric("Z-Score", f"{vol_context['hv_z_score']:.2f}")
+                                with vol_col5:
                                     st.markdown(f"**Status**")
                                     st.markdown(f":{vol_context['color']}[{vol_context['recommendation']}]")
                                 
-                                st.info(f"💡 **HV Analysis:** Comparing current volatility against last {vol_context['comparison_days']} trading days (~{vol_context['comparison_days']//21} months). Industry standard uses 1 year (252 days). If IV from your option chain < Current HV ({vol_context['current_hv']:.2f}%), options are cheap.")
+                                # Explanation of metrics
+                                st.info(f"""
+                                💡 **Understanding Volatility Metrics:**
+                                - **HV Percentile {vol_context['hv_percentile']:.1f}%**: Current HV is higher than {vol_context['hv_percentile']:.1f}% of the past year
+                                - **Z-Score {vol_context['hv_z_score']:.2f}**: How many standard deviations from mean (±1.0 is normal range)
+                                - **Comparison**: Using last {vol_context['comparison_days']} days (~{vol_context['comparison_days']//21} months)
+                                - **For Trading**: HV < 60th percentile OR Z-Score < 0.5 = Good to trade
+                                """)
+                                
+                                # Show HV history chart
+                                if len(signal_gen.data) > 0:
+                                    st.markdown("#### Historical Volatility Trend")
+                                    hv_chart_data = signal_gen.data[['HV']].tail(252).dropna()
+                                    if len(hv_chart_data) > 0:
+                                        import plotly.graph_objects as go
+                                        fig_hv = go.Figure()
+                                        fig_hv.add_trace(go.Scatter(
+                                            x=hv_chart_data.index,
+                                            y=hv_chart_data['HV'],
+                                            name='HV',
+                                            line=dict(color='blue')
+                                        ))
+                                        fig_hv.add_hline(
+                                            y=vol_context['avg_hv_period'],
+                                            line_dash="dash",
+                                            line_color="green",
+                                            annotation_text=f"Average: {vol_context['avg_hv_period']:.2f}%"
+                                        )
+                                        fig_hv.add_hline(
+                                            y=vol_context['current_hv'],
+                                            line_dash="dot",
+                                            line_color="red",
+                                            annotation_text=f"Current: {vol_context['current_hv']:.2f}%"
+                                        )
+                                        fig_hv.update_layout(
+                                            title="Historical Volatility Over Time",
+                                            xaxis_title="Date",
+                                            yaxis_title="HV (%)",
+                                            height=300
+                                        )
+                                        st.plotly_chart(fig_hv, use_container_width=True)
                             
                             # Technical indicators summary
                             st.markdown("---")
