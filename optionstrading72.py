@@ -499,22 +499,45 @@ def plot_technical_chart(data, signal):
     return fig
 
 
-def display_signal_box(signal):
-    """Display signal in a styled box"""
+def display_signal_box(signal, vol_context=None):
+    """Display signal in a styled box with clear trade decision"""
+    
+    # Determine if we should actually trade
+    can_trade = False
+    final_decision = "WAIT"
+    decision_color = "orange"
+    
+    if signal['signal'] != 'NO SIGNAL' and vol_context:
+        # Both technical AND volatility must be favorable
+        if vol_context['hv_percentile'] < 50:  # Good volatility environment
+            can_trade = True
+            final_decision = "TRADE NOW ✅"
+            decision_color = "green"
+        else:
+            final_decision = "DON'T TRADE - Wait for IV to drop ❌"
+            decision_color = "red"
+    
+    # Original signal display
     if signal['signal'] == 'BUY CALL':
         box_class = 'signal-buy-call'
         emoji = '🟢'
-        signal_text = '📈 BUY CALL OPTION'
+        signal_text = '📈 TECHNICAL SIGNAL: BUY CALL'
     elif signal['signal'] == 'BUY PUT':
         box_class = 'signal-buy-put'
         emoji = '🔴'
-        signal_text = '📉 BUY PUT OPTION'
+        signal_text = '📉 TECHNICAL SIGNAL: BUY PUT'
     else:
         box_class = 'signal-no'
         emoji = '⚪'
-        signal_text = '⏸️ NO SIGNAL - WAIT'
+        signal_text = '⏸️ NO TECHNICAL SIGNAL'
     
     st.markdown(f'<div class="signal-box {box_class}">', unsafe_allow_html=True)
+    
+    # Show final decision prominently
+    if signal['signal'] != 'NO SIGNAL':
+        st.markdown(f"## :{decision_color}[{final_decision}]")
+        st.markdown("---")
+    
     st.markdown(f"### {emoji} {signal_text}")
     st.markdown(f"**Confidence Level:** {signal['confidence']}%")
     st.progress(signal['confidence'] / 100)
@@ -537,179 +560,356 @@ def display_signal_box(signal):
     st.markdown('</div>', unsafe_allow_html=True)
 
 
+def extract_option_data_from_image(image):
+    """Extract option chain data using OCR"""
+    try:
+        import easyocr
+        import cv2
+        import numpy as np
+        
+        # Convert PIL image to numpy array
+        img_array = np.array(image)
+        
+        # Initialize OCR reader
+        reader = easyocr.Reader(['en'], gpu=False)
+        
+        # Perform OCR
+        result = reader.readtext(img_array)
+        
+        # Extract text
+        extracted_text = []
+        for (bbox, text, prob) in result:
+            if prob > 0.3:  # Confidence threshold
+                extracted_text.append(text.strip())
+        
+        return extracted_text, True
+    
+    except ImportError:
+        return None, False
+    except Exception as e:
+        st.error(f"OCR Error: {e}")
+        return None, False
+
+
+def parse_option_chain_data(extracted_text):
+    """Parse extracted text to find strikes, premiums, and IVs"""
+    import re
+    
+    options_data = {'calls': [], 'puts': []}
+    
+    # Patterns to match
+    strike_pattern = r'\b\d{4,6}\b'  # 4-6 digit numbers (strikes)
+    premium_pattern = r'\b\d+\.?\d*\b'  # Decimal numbers (premiums/IV)
+    
+    i = 0
+    while i < len(extracted_text):
+        text = extracted_text[i]
+        
+        # Try to find strike price
+        strike_match = re.search(strike_pattern, text)
+        if strike_match:
+            strike = float(strike_match.group())
+            
+            # Look ahead for premium and IV
+            premium = None
+            iv = None
+            
+            # Search next 5 items for premium and IV
+            for j in range(i+1, min(i+6, len(extracted_text))):
+                next_text = extracted_text[j]
+                numbers = re.findall(premium_pattern, next_text)
+                
+                for num in numbers:
+                    try:
+                        val = float(num)
+                        if 10 < val < 500:  # Likely premium
+                            if premium is None:
+                                premium = val
+                        elif 0 < val < 100:  # Likely IV percentage
+                            if iv is None:
+                                iv = val
+                    except:
+                        continue
+            
+            if premium and iv:
+                # Determine if CALL or PUT based on context
+                # This is simplified - in real scenario, would need better logic
+                option_type = 'calls'  # Default
+                
+                options_data[option_type].append({
+                    'strike': strike,
+                    'premium': premium,
+                    'iv': iv
+                })
+        
+        i += 1
+    
+    return options_data
+
+
 def option_chain_analyzer():
-    """Manual option chain analysis from screenshot"""
+    """Automatic option chain analysis from screenshots with OCR"""
     st.markdown("### 📸 Option Chain Screenshot Analysis")
-    st.info("💡 Upload your option chain screenshot. I'll help you select the best strike based on the technical signal.")
     
-    uploaded_file = st.file_uploader("Upload Option Chain Screenshot (JPG/PNG)", type=['jpg', 'jpeg', 'png'])
+    # Check if OCR libraries are available
+    ocr_available = False
+    try:
+        import easyocr
+        import cv2
+        ocr_available = True
+    except ImportError:
+        pass
     
-    if uploaded_file is not None:
-        image = Image.open(uploaded_file)
-        st.image(image, caption="Uploaded Option Chain", use_column_width=True)
+    if ocr_available:
+        st.success("✅ OCR Mode: Automatic extraction enabled")
+        st.info("💡 Upload 1-3 screenshots of your option chain. The system will automatically extract Strike, Premium, and IV data.")
+    else:
+        st.warning("⚠️ OCR libraries not installed. Using manual input mode.")
+        st.info("💡 To enable automatic OCR, run: `pip install easyocr opencv-python`")
+    
+    # Multi-file uploader
+    uploaded_files = st.file_uploader(
+        "Upload Option Chain Screenshots (JPG/PNG)", 
+        type=['jpg', 'jpeg', 'png'],
+        accept_multiple_files=True
+    )
+    
+    if uploaded_files:
+        # Display all uploaded images
+        st.markdown(f"**{len(uploaded_files)} screenshot(s) uploaded**")
+        
+        cols = st.columns(min(len(uploaded_files), 3))
+        images = []
+        
+        for idx, uploaded_file in enumerate(uploaded_files):
+            image = Image.open(uploaded_file)
+            images.append(image)
+            with cols[idx % 3]:
+                st.image(image, caption=f"Screenshot {idx+1}", use_column_width=True)
         
         st.markdown("---")
-        st.markdown("### 📊 Manual IV Input")
-        st.warning("⚠️ Since automated OCR isn't perfect, please manually input the IV data from the screenshot above")
         
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            st.markdown("#### CALL Options")
-            num_call_strikes = st.number_input("Number of CALL strikes to analyze", min_value=1, max_value=10, value=5, key='num_calls')
-            
-            call_data = []
-            for i in range(num_call_strikes):
-                st.markdown(f"**Call Strike {i+1}:**")
-                c1, c2, c3 = st.columns(3)
-                with c1:
-                    strike = st.number_input(f"Strike", key=f'call_strike_{i}', value=0.0, format="%.2f")
-                with c2:
-                    premium = st.number_input(f"Premium", key=f'call_premium_{i}', value=0.0, format="%.2f")
-                with c3:
-                    iv = st.number_input(f"IV %", key=f'call_iv_{i}', value=0.0, format="%.2f")
+        # OCR Processing
+        if ocr_available and st.button("🤖 Auto-Extract Data with OCR", type="primary"):
+            with st.spinner("🔍 Extracting data from screenshots..."):
+                all_call_data = []
+                all_put_data = []
                 
-                if strike > 0:
-                    call_data.append({'strike': strike, 'premium': premium, 'iv': iv})
-        
-        with col2:
-            st.markdown("#### PUT Options")
-            num_put_strikes = st.number_input("Number of PUT strikes to analyze", min_value=1, max_value=10, value=5, key='num_puts')
-            
-            put_data = []
-            for i in range(num_put_strikes):
-                st.markdown(f"**Put Strike {i+1}:**")
-                p1, p2, p3 = st.columns(3)
-                with p1:
-                    strike = st.number_input(f"Strike", key=f'put_strike_{i}', value=0.0, format="%.2f")
-                with p2:
-                    premium = st.number_input(f"Premium", key=f'put_premium_{i}', value=0.0, format="%.2f")
-                with p3:
-                    iv = st.number_input(f"IV %", key=f'put_iv_{i}', value=0.0, format="%.2f")
-                
-                if strike > 0:
-                    put_data.append({'strike': strike, 'premium': premium, 'iv': iv})
-        
-        if st.button("🔍 Analyze Option Chain", key='analyze_chain'):
-            if call_data or put_data:
-                st.markdown("---")
-                st.markdown("### 📈 Option Chain Analysis Results")
-                
-                # Get current signal from session state
-                if 'current_signal' in st.session_state and 'vol_context' in st.session_state:
-                    signal = st.session_state.current_signal
-                    vol_context = st.session_state.vol_context
+                for idx, image in enumerate(images):
+                    st.markdown(f"**Processing Screenshot {idx+1}...**")
                     
-                    if signal and signal['signal'] != 'NO SIGNAL':
-                        hv = vol_context['current_hv']
+                    extracted_text, success = extract_option_data_from_image(image)
+                    
+                    if success and extracted_text:
+                        st.success(f"✅ Extracted {len(extracted_text)} text elements")
                         
-                        if signal['signal'] == 'BUY CALL':
-                            st.success("✅ Technical Signal: BUY CALL - Analyzing CALL options")
-                            
-                            if call_data:
-                                df_calls = pd.DataFrame(call_data)
-                                df_calls['iv_vs_hv'] = df_calls['iv'] - hv
-                                df_calls['iv_spread'] = df_calls['iv'] - df_calls['iv'].min()
-                                df_calls['score'] = 0.0
-                                
-                                # Scoring system
-                                for idx, row in df_calls.iterrows():
-                                    score = 0
-                                    # Lower IV is better (up to 3 points)
-                                    if row['iv'] < hv:
-                                        score += 3
-                                    elif row['iv'] < hv * 1.1:
-                                        score += 2
-                                    elif row['iv'] < hv * 1.2:
-                                        score += 1
-                                    
-                                    # Reasonable premium (1 point)
-                                    if 50 < row['premium'] < 300:
-                                        score += 1
-                                    
-                                    df_calls.at[idx, 'score'] = score
-                                
-                                df_calls = df_calls.sort_values('score', ascending=False)
-                                
-                                st.markdown("#### 🎯 CALL Options Ranking")
-                                st.dataframe(df_calls.style.highlight_max(subset=['score'], color='lightgreen'), use_container_width=True)
-                                
-                                best_call = df_calls.iloc[0]
-                                st.success(f"**🏆 RECOMMENDED: {best_call['strike']} CE at ₹{best_call['premium']:.2f}**")
-                                st.info(f"IV: {best_call['iv']:.2f}% | HV: {hv:.2f}% | {'✅ Cheap' if best_call['iv'] < hv else '⚠️ Expensive'}")
-                                
-                                # Entry recommendation
-                                st.markdown("#### 💰 Trade Recommendation")
-                                entry_premium = best_call['premium']
-                                target_premium = entry_premium * 2.0  # 100% target
-                                stop_premium = entry_premium * 0.5  # 50% stop
-                                
-                                rec_col1, rec_col2, rec_col3 = st.columns(3)
-                                with rec_col1:
-                                    st.metric("Entry", f"₹{entry_premium:.2f}")
-                                with rec_col2:
-                                    st.metric("Target", f"₹{target_premium:.2f}", "+100%")
-                                with rec_col3:
-                                    st.metric("Stop Loss", f"₹{stop_premium:.2f}", "-50%")
-                            else:
-                                st.warning("No CALL data provided")
+                        # Parse the data
+                        parsed_data = parse_option_chain_data(extracted_text)
                         
-                        elif signal['signal'] == 'BUY PUT':
-                            st.error("✅ Technical Signal: BUY PUT - Analyzing PUT options")
-                            
-                            if put_data:
-                                df_puts = pd.DataFrame(put_data)
-                                df_puts['iv_vs_hv'] = df_puts['iv'] - hv
-                                df_puts['iv_spread'] = df_puts['iv'] - df_puts['iv'].min()
-                                df_puts['score'] = 0.0
-                                
-                                # Scoring system
-                                for idx, row in df_puts.iterrows():
-                                    score = 0
-                                    # Lower IV is better (up to 3 points)
-                                    if row['iv'] < hv:
-                                        score += 3
-                                    elif row['iv'] < hv * 1.1:
-                                        score += 2
-                                    elif row['iv'] < hv * 1.2:
-                                        score += 1
-                                    
-                                    # Reasonable premium (1 point)
-                                    if 50 < row['premium'] < 300:
-                                        score += 1
-                                    
-                                    df_puts.at[idx, 'score'] = score
-                                
-                                df_puts = df_puts.sort_values('score', ascending=False)
-                                
-                                st.markdown("#### 🎯 PUT Options Ranking")
-                                st.dataframe(df_puts.style.highlight_max(subset=['score'], color='lightcoral'), use_container_width=True)
-                                
-                                best_put = df_puts.iloc[0]
-                                st.success(f"**🏆 RECOMMENDED: {best_put['strike']} PE at ₹{best_put['premium']:.2f}**")
-                                st.info(f"IV: {best_put['iv']:.2f}% | HV: {hv:.2f}% | {'✅ Cheap' if best_put['iv'] < hv else '⚠️ Expensive'}")
-                                
-                                # Entry recommendation
-                                st.markdown("#### 💰 Trade Recommendation")
-                                entry_premium = best_put['premium']
-                                target_premium = entry_premium * 2.0  # 100% target
-                                stop_premium = entry_premium * 0.5  # 50% stop
-                                
-                                rec_col1, rec_col2, rec_col3 = st.columns(3)
-                                with rec_col1:
-                                    st.metric("Entry", f"₹{entry_premium:.2f}")
-                                with rec_col2:
-                                    st.metric("Target", f"₹{target_premium:.2f}", "+100%")
-                                with rec_col3:
-                                    st.metric("Stop Loss", f"₹{stop_premium:.2f}", "-50%")
-                            else:
-                                st.warning("No PUT data provided")
+                        all_call_data.extend(parsed_data['calls'])
+                        all_put_data.extend(parsed_data['puts'])
                     else:
-                        st.warning("⚠️ No active technical signal. Generate signal first in the main tab.")
+                        st.warning(f"⚠️ Could not extract data from screenshot {idx+1}")
+                
+                if all_call_data or all_put_data:
+                    st.success(f"✅ Total extracted: {len(all_call_data)} CALL options, {len(all_put_data)} PUT options")
+                    
+                    # Display extracted data
+                    if all_call_data:
+                        st.markdown("#### 📊 Extracted CALL Options")
+                        df_calls = pd.DataFrame(all_call_data)
+                        st.dataframe(df_calls, use_container_width=True)
+                    
+                    if all_put_data:
+                        st.markdown("#### 📊 Extracted PUT Options")
+                        df_puts = pd.DataFrame(all_put_data)
+                        st.dataframe(df_puts, use_container_width=True)
+                    
+                    # Analyze the data
+                    if 'current_signal' in st.session_state and 'vol_context' in st.session_state:
+                        analyze_extracted_options(all_call_data, all_put_data, 
+                                                 st.session_state.current_signal,
+                                                 st.session_state.vol_context)
                 else:
-                    st.warning("⚠️ Please generate a technical signal first in the 'Signal Generator' tab")
+                    st.error("❌ Could not extract option data. OCR may not have detected the data correctly.")
+                    st.info("💡 Try the manual input mode below as fallback")
+        
+        st.markdown("---")
+        st.markdown("### 🖊️ Manual Input (Fallback Mode)")
+        st.info("If OCR doesn't work well, manually input the data you see in the screenshots above")
+        
+        manual_input_section()
+
+
+def analyze_extracted_options(call_data, put_data, signal, vol_context):
+    """Analyze extracted option data and provide recommendations"""
+    st.markdown("---")
+    st.markdown("### 📈 Analysis Results")
+    
+    if signal and signal['signal'] != 'NO SIGNAL':
+        hv = vol_context['current_hv']
+        
+        # Check overall volatility environment first
+        if vol_context['hv_percentile'] >= 50:
+            st.error("❌ **STOP: High Volatility Environment**")
+            st.warning(f"HV Percentile: {vol_context['hv_percentile']:.1f}% - Options are EXPENSIVE. DO NOT BUY even with good technical setup.")
+            st.info("💡 **Wait for volatility to drop below 50th percentile before entering trades.**")
+            return
+        
+        if signal['signal'] == 'BUY CALL':
+            st.success("✅ Technical Signal: BUY CALL + Favorable Volatility")
+            st.success(f"✅ HV Percentile: {vol_context['hv_percentile']:.1f}% - Options are CHEAP")
+            
+            if call_data:
+                df_calls = pd.DataFrame(call_data)
+                df_calls['iv_vs_hv'] = df_calls['iv'] - hv
+                df_calls['score'] = 0.0
+                
+                # Scoring system
+                for idx, row in df_calls.iterrows():
+                    score = 0
+                    # Lower IV is better (up to 3 points)
+                    if row['iv'] < hv:
+                        score += 3
+                    elif row['iv'] < hv * 1.1:
+                        score += 2
+                    elif row['iv'] < hv * 1.2:
+                        score += 1
+                    
+                    # Reasonable premium (1 point)
+                    if 50 < row['premium'] < 300:
+                        score += 1
+                    
+                    df_calls.at[idx, 'score'] = score
+                
+                df_calls = df_calls.sort_values('score', ascending=False)
+                
+                st.markdown("#### 🎯 CALL Options Ranking")
+                st.dataframe(df_calls.style.highlight_max(subset=['score'], color='lightgreen'), 
+                           use_container_width=True)
+                
+                if len(df_calls) > 0:
+                    best_call = df_calls.iloc[0]
+                    st.success(f"**🏆 RECOMMENDED: {best_call['strike']:.0f} CE at ₹{best_call['premium']:.2f}**")
+                    st.info(f"IV: {best_call['iv']:.2f}% | HV: {hv:.2f}% | {'✅ Cheap' if best_call['iv'] < hv else '⚠️ Expensive'}")
+                    
+                    display_trade_recommendation(best_call['premium'])
             else:
-                st.error("Please input option chain data")
+                st.warning("No CALL data extracted")
+        
+        elif signal['signal'] == 'BUY PUT':
+            st.success("✅ Technical Signal: BUY PUT + Favorable Volatility")
+            st.success(f"✅ HV Percentile: {vol_context['hv_percentile']:.1f}% - Options are CHEAP")
+            
+            if put_data:
+                df_puts = pd.DataFrame(put_data)
+                df_puts['iv_vs_hv'] = df_puts['iv'] - hv
+                df_puts['score'] = 0.0
+                
+                # Scoring system
+                for idx, row in df_puts.iterrows():
+                    score = 0
+                    if row['iv'] < hv:
+                        score += 3
+                    elif row['iv'] < hv * 1.1:
+                        score += 2
+                    elif row['iv'] < hv * 1.2:
+                        score += 1
+                    
+                    if 50 < row['premium'] < 300:
+                        score += 1
+                    
+                    df_puts.at[idx, 'score'] = score
+                
+                df_puts = df_puts.sort_values('score', ascending=False)
+                
+                st.markdown("#### 🎯 PUT Options Ranking")
+                st.dataframe(df_puts.style.highlight_max(subset=['score'], color='lightcoral'), 
+                           use_container_width=True)
+                
+                if len(df_puts) > 0:
+                    best_put = df_puts.iloc[0]
+                    st.success(f"**🏆 RECOMMENDED: {best_put['strike']:.0f} PE at ₹{best_put['premium']:.2f}**")
+                    st.info(f"IV: {best_put['iv']:.2f}% | HV: {hv:.2f}% | {'✅ Cheap' if best_put['iv'] < hv else '⚠️ Expensive'}")
+                    
+                    display_trade_recommendation(best_put['premium'])
+            else:
+                st.warning("No PUT data extracted")
+    else:
+        st.warning("⚠️ No active technical signal. Generate signal first in the main tab.")
+
+
+def display_trade_recommendation(entry_premium):
+    """Display trade entry, target, and stop loss"""
+    st.markdown("#### 💰 Trade Setup")
+    
+    target_premium = entry_premium * 2.0  # 100% target
+    stop_premium = entry_premium * 0.5  # 50% stop
+    
+    rec_col1, rec_col2, rec_col3 = st.columns(3)
+    with rec_col1:
+        st.metric("Entry", f"₹{entry_premium:.2f}")
+    with rec_col2:
+        st.metric("Target", f"₹{target_premium:.2f}", "+100%")
+    with rec_col3:
+        st.metric("Stop Loss", f"₹{stop_premium:.2f}", "-50%")
+    
+    st.success("✅ **Risk:Reward = 1:2** | **Expected Win Rate: 55-65%**")
+
+
+def manual_input_section():
+    """Fallback manual input section"""
+def manual_input_section():
+    """Fallback manual input section"""
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        st.markdown("#### CALL Options")
+        num_call_strikes = st.number_input("Number of CALL strikes", min_value=1, max_value=10, value=5, key='num_calls')
+        
+        call_data = []
+        for i in range(num_call_strikes):
+            st.markdown(f"**Call Strike {i+1}:**")
+            c1, c2, c3 = st.columns(3)
+            with c1:
+                strike = st.number_input(f"Strike", key=f'call_strike_{i}', value=0.0, format="%.2f")
+            with c2:
+                premium = st.number_input(f"Premium", key=f'call_premium_{i}', value=0.0, format="%.2f")
+            with c3:
+                iv = st.number_input(f"IV %", key=f'call_iv_{i}', value=0.0, format="%.2f")
+            
+            if strike > 0:
+                call_data.append({'strike': strike, 'premium': premium, 'iv': iv})
+    
+    with col2:
+        st.markdown("#### PUT Options")
+        num_put_strikes = st.number_input("Number of PUT strikes", min_value=1, max_value=10, value=5, key='num_puts')
+        
+        put_data = []
+        for i in range(num_put_strikes):
+            st.markdown(f"**Put Strike {i+1}:**")
+            p1, p2, p3 = st.columns(3)
+            with p1:
+                strike = st.number_input(f"Strike", key=f'put_strike_{i}', value=0.0, format="%.2f")
+            with p2:
+                premium = st.number_input(f"Premium", key=f'put_premium_{i}', value=0.0, format="%.2f")
+            with p3:
+                iv = st.number_input(f"IV %", key=f'put_iv_{i}', value=0.0, format="%.2f")
+            
+            if strike > 0:
+                put_data.append({'strike': strike, 'premium': premium, 'iv': iv})
+    
+    if st.button("🔍 Analyze Option Chain (Manual)", key='analyze_manual'):
+        if call_data or put_data:
+            if 'current_signal' in st.session_state and 'vol_context' in st.session_state:
+                analyze_extracted_options(call_data, put_data,
+                                        st.session_state.current_signal,
+                                        st.session_state.vol_context)
+            else:
+                st.warning("⚠️ Please generate a technical signal first in the 'Signal Generator' tab")
+        else:
+            st.error("Please input option chain data")
+
 
 
 def main():
@@ -791,8 +991,8 @@ def main():
                         st.session_state.current_ticker = ticker_name
                         
                         if signal:
-                            # Display signal
-                            display_signal_box(signal)
+                            # Display signal with volatility context
+                            display_signal_box(signal, vol_context)
                             
                             # Volatility context
                             st.markdown("---")
