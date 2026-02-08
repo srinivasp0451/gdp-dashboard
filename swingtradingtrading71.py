@@ -109,20 +109,31 @@ class DhanBrokerIntegration:
         Place order with Dhan broker
         PLACEHOLDER - Replace with actual Dhan API calls
         """
+        from dhanhq import dhanhq
+        dhan = dhanhq(self.client_id, self.access_token)
         if not self.enabled:
             return None
+
+        # if selected_index in ["Nifty", "Bank Nifty","Fin Nifty","Midcap Nifty"]:
+        #     exchange_segment = dhan.NSE_FNO  # Futures and Options segment
+        # else:
+        #     exchange_segment = dhan.BSE_FNO
+
+        exchange_segment = dhan.NSE_FNO
+
+        product_type = dhan.INTRA
         
         # PLACEHOLDER: Actual Dhan API integration
-        # from dhanhq import dhanhq
-        # dhan = dhanhq(self.client_id, self.access_token)
-        # order_id = dhan.place_order(
-        #     security_id=self.security_id,
-        #     exchange_segment=self.exchange,
-        #     transaction_type=order_type,
-        #     quantity=quantity,
-        #     order_type=order_mode,
-        #     price=price if order_mode == 'LIMIT' else 0
-        # )
+        
+        order_id = dhan.place_order(
+            security_id=self.security_id,
+            exchange_segment=dhan.NSE_FNO, # instead of self.exchange
+            transaction_type=order_type,
+            quantity=quantity,
+            order_type=order_mode,
+            product_type=dhan.INTRA,
+            price=price if order_mode == 'LIMIT' else 0
+        )
         
         # Simulated order for demonstration
         order = {
