@@ -24,6 +24,6 @@ mplfinance
 reportlab
 python-docx
 
-Pillow==9.5
+Pillow
 easyocr==1.7.0
 opencv-python==4.9.0.80
