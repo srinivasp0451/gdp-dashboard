@@ -670,8 +670,8 @@ def parse_option_chain_data(extracted_text):
 
 
 def option_chain_analyzer():
-    """Automatic option chain analysis from screenshots with OCR"""
-    st.markdown("### 📸 Option Chain Screenshot Analysis")
+    """Option chain analysis - Manual input primary, OCR optional"""
+    st.markdown("### 📊 Option Chain Analysis")
     
     # Check if OCR libraries are available
     ocr_available = False
@@ -682,85 +682,92 @@ def option_chain_analyzer():
     except ImportError:
         pass
     
+    # ALWAYS show manual input first (primary method)
+    st.markdown("#### 🖊️ Manual Input (Recommended)")
+    st.info("💡 Enter strike prices, premiums, and IV values from your broker's option chain")
+    
+    manual_input_section()
+    
+    # OCR as optional feature if available
     if ocr_available:
-        st.success("✅ OCR Mode: Automatic extraction enabled")
-        st.info("💡 Upload 1-3 screenshots of your option chain. The system will automatically extract Strike, Premium, and IV data.")
+        st.markdown("---")
+        st.markdown("### 🤖 Advanced: Auto-Extract with OCR (Beta)")
+        st.warning("⚠️ OCR is experimental. Manual input above is more reliable.")
+        
+        with st.expander("📸 Try OCR Auto-Extract (Optional)"):
+            st.info("Upload 1-3 screenshots and the system will attempt to extract data automatically")
+            
+            uploaded_files = st.file_uploader(
+                "Upload Option Chain Screenshots", 
+                type=['jpg', 'jpeg', 'png'],
+                accept_multiple_files=True,
+                key='ocr_upload'
+            )
+            
+            if uploaded_files:
+                # Display all uploaded images
+                st.markdown(f"**{len(uploaded_files)} screenshot(s) uploaded**")
+                
+                cols = st.columns(min(len(uploaded_files), 3))
+                images = []
+                
+                for idx, uploaded_file in enumerate(uploaded_files):
+                    image = Image.open(uploaded_file)
+                    images.append(image)
+                    with cols[idx % 3]:
+                        st.image(image, caption=f"Screenshot {idx+1}", use_column_width=True)
+                
+                st.markdown("---")
+                
+                # OCR Processing
+                if st.button("🤖 Try Auto-Extract with OCR", type="secondary", key='ocr_extract'):
+                    with st.spinner("🔍 Extracting data from screenshots..."):
+                        all_call_data = []
+                        all_put_data = []
+                        
+                        for idx, image in enumerate(images):
+                            st.markdown(f"**Processing Screenshot {idx+1}...**")
+                            
+                            try:
+                                extracted_text, success = extract_option_data_from_image(image)
+                                
+                                if success and extracted_text:
+                                    st.success(f"✅ Extracted {len(extracted_text)} text elements")
+                                    
+                                    # Parse the data
+                                    parsed_data = parse_option_chain_data(extracted_text)
+                                    
+                                    all_call_data.extend(parsed_data['calls'])
+                                    all_put_data.extend(parsed_data['puts'])
+                                else:
+                                    st.warning(f"⚠️ Could not extract data from screenshot {idx+1}")
+                            except Exception as e:
+                                st.error(f"❌ Error processing screenshot {idx+1}: {e}")
+                        
+                        if all_call_data or all_put_data:
+                            st.success(f"✅ Total extracted: {len(all_call_data)} CALL options, {len(all_put_data)} PUT options")
+                            
+                            # Display extracted data
+                            if all_call_data:
+                                st.markdown("#### 📊 Extracted CALL Options")
+                                df_calls = pd.DataFrame(all_call_data)
+                                st.dataframe(df_calls, use_container_width=True)
+                            
+                            if all_put_data:
+                                st.markdown("#### 📊 Extracted PUT Options")
+                                df_puts = pd.DataFrame(all_put_data)
+                                st.dataframe(df_puts, use_container_width=True)
+                            
+                            # Analyze the data
+                            if 'current_signal' in st.session_state and 'vol_context' in st.session_state:
+                                analyze_extracted_options(all_call_data, all_put_data, 
+                                                         st.session_state.current_signal,
+                                                         st.session_state.vol_context)
+                        else:
+                            st.error("❌ Could not extract option data. OCR may not have detected the data correctly.")
+                            st.info("💡 **No problem!** Use the Manual Input section above instead - it's more reliable.")
     else:
-        st.warning("⚠️ OCR libraries not installed. Using manual input mode.")
-        st.info("💡 To enable automatic OCR, run: `pip install easyocr opencv-python`")
-    
-    # Multi-file uploader
-    uploaded_files = st.file_uploader(
-        "Upload Option Chain Screenshots (JPG/PNG)", 
-        type=['jpg', 'jpeg', 'png'],
-        accept_multiple_files=True
-    )
-    
-    if uploaded_files:
-        # Display all uploaded images
-        st.markdown(f"**{len(uploaded_files)} screenshot(s) uploaded**")
-        
-        cols = st.columns(min(len(uploaded_files), 3))
-        images = []
-        
-        for idx, uploaded_file in enumerate(uploaded_files):
-            image = Image.open(uploaded_file)
-            images.append(image)
-            with cols[idx % 3]:
-                st.image(image, caption=f"Screenshot {idx+1}", use_column_width=True)
-        
-        st.markdown("---")
-        
-        # OCR Processing
-        if ocr_available and st.button("🤖 Auto-Extract Data with OCR", type="primary"):
-            with st.spinner("🔍 Extracting data from screenshots..."):
-                all_call_data = []
-                all_put_data = []
-                
-                for idx, image in enumerate(images):
-                    st.markdown(f"**Processing Screenshot {idx+1}...**")
-                    
-                    extracted_text, success = extract_option_data_from_image(image)
-                    
-                    if success and extracted_text:
-                        st.success(f"✅ Extracted {len(extracted_text)} text elements")
-                        
-                        # Parse the data
-                        parsed_data = parse_option_chain_data(extracted_text)
-                        
-                        all_call_data.extend(parsed_data['calls'])
-                        all_put_data.extend(parsed_data['puts'])
-                    else:
-                        st.warning(f"⚠️ Could not extract data from screenshot {idx+1}")
-                
-                if all_call_data or all_put_data:
-                    st.success(f"✅ Total extracted: {len(all_call_data)} CALL options, {len(all_put_data)} PUT options")
-                    
-                    # Display extracted data
-                    if all_call_data:
-                        st.markdown("#### 📊 Extracted CALL Options")
-                        df_calls = pd.DataFrame(all_call_data)
-                        st.dataframe(df_calls, use_container_width=True)
-                    
-                    if all_put_data:
-                        st.markdown("#### 📊 Extracted PUT Options")
-                        df_puts = pd.DataFrame(all_put_data)
-                        st.dataframe(df_puts, use_container_width=True)
-                    
-                    # Analyze the data
-                    if 'current_signal' in st.session_state and 'vol_context' in st.session_state:
-                        analyze_extracted_options(all_call_data, all_put_data, 
-                                                 st.session_state.current_signal,
-                                                 st.session_state.vol_context)
-                else:
-                    st.error("❌ Could not extract option data. OCR may not have detected the data correctly.")
-                    st.info("💡 Try the manual input mode below as fallback")
-        
-        st.markdown("---")
-        st.markdown("### 🖊️ Manual Input (Fallback Mode)")
-        st.info("If OCR doesn't work well, manually input the data you see in the screenshots above")
-        
-        manual_input_section()
+        st.info("ℹ️ OCR auto-extract is not available. Manual input works perfectly - use the form above!")
 
 
 def analyze_extracted_options(call_data, put_data, signal, vol_context):
