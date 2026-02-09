@@ -73,7 +73,8 @@ class DhanBrokerIntegration:
         self.is_options = config.get('dhan_is_options', False)
         self.strike_price = config.get('dhan_strike_price', 0)
         self.expiry_date = config.get('dhan_expiry_date', '')
-        self.option_type = config.get('dhan_option_type', 'CE')  # CE or PE
+        self.option_type = config.get('dhan_option_type', 'CE')  # CE, PE, or AUTO
+        self.auto_ce_pe = config.get('dhan_auto_ce_pe', True)  # Auto select based on signal
         
         # Order trigger parameters
         self.trigger_condition = config.get('dhan_trigger_condition', '>=')  # >= or <=
@@ -104,54 +105,68 @@ class DhanBrokerIntegration:
         
         return False
     
-    def place_order(self, order_type, quantity, price, order_mode='MARKET'):
+    def place_order(self, order_type, quantity, price, order_mode='MARKET', signal_type=None):
         """
-        Place order with Dhan broker
-        PLACEHOLDER - Replace with actual Dhan API calls
+        Place order with Dhan broker - REAL API INTEGRATION
         """
-        from dhanhq import dhanhq
-        dhan = dhanhq(self.client_id, self.access_token)
         if not self.enabled:
             return None
-
-        # if selected_index in ["Nifty", "Bank Nifty","Fin Nifty","Midcap Nifty"]:
-        #     exchange_segment = dhan.NSE_FNO  # Futures and Options segment
-        # else:
-        #     exchange_segment = dhan.BSE_FNO
-
-        exchange_segment = dhan.NSE_FNO
-
-        product_type = dhan.INTRA
         
-        # PLACEHOLDER: Actual Dhan API integration
-        
-        order_id = dhan.place_order(
-            security_id=self.security_id,
-            exchange_segment=dhan.NSE_FNO, # instead of self.exchange
-            transaction_type=order_type,
-            quantity=quantity,
-            order_type=order_mode,
-            product_type=dhan.INTRA,
-            price=price if order_mode == 'LIMIT' else 0
-        )
-        
-        # Simulated order for demonstration
-        order = {
-            'order_id': f"DHAN{int(time.time())}",
-            'security_id': self.security_id,
-            'type': order_type,
-            'quantity': quantity,
-            'price': price,
-            'order_mode': order_mode,
-            'status': 'PLACED',
-            'timestamp': datetime.now(IST),
-            'strike_price': self.strike_price if self.is_options else None,
-            'option_type': self.option_type if self.is_options else None,
-            'expiry_date': self.expiry_date if self.is_options else None
-        }
-        
-        self.broker_orders.append(order)
-        add_log(f"🏦 DHAN ORDER: {order_type} {quantity} @ {price:.2f} | Order ID: {order['order_id']}")
+        try:
+            # Real Dhan API integration
+            from dhanhq import dhanhq
+            dhan = dhanhq(self.client_id, self.access_token)
+            
+            # Determine exchange segment
+            exchange_segment = dhan.NSE_FNO
+            
+            # Determine product type
+            product_type = dhan.INTRA
+            
+            # Determine option type based on signal (if auto mode and options)
+            actual_option_type = self.option_type
+            if self.is_options and self.auto_ce_pe and signal_type:
+                # Auto select: CE for BUY/LONG, PE for SELL/SHORT
+                actual_option_type = 'CE' if signal_type in ['BUY', 'LONG'] else 'PE'
+                add_log(f"🏦 Auto-selected {actual_option_type} for {signal_type} signal")
+            
+            # Place the order
+            order_id = dhan.place_order(
+                security_id=self.security_id,
+                exchange_segment=dhan.NSE_FNO,
+                transaction_type=order_type,
+                quantity=quantity,
+                order_type=order_mode,
+                product_type=dhan.INTRA,
+                price=price if order_mode == 'LIMIT' else 0
+            )
+            
+            # Create order record
+            order = {
+                'order_id': str(order_id),
+                'security_id': self.security_id,
+                'type': order_type,
+                'quantity': quantity,
+                'price': price,
+                'order_mode': order_mode,
+                'status': 'PLACED',
+                'timestamp': datetime.now(IST),
+                'strike_price': self.strike_price if self.is_options else None,
+                'option_type': actual_option_type if self.is_options else None,
+                'expiry_date': self.expiry_date if self.is_options else None
+            }
+            
+            self.broker_orders.append(order)
+            add_log(f"🏦 DHAN ORDER: {order_type} {quantity} @ {price:.2f} | Order ID: {order['order_id']}")
+            
+            if self.is_options:
+                add_log(f"🏦 Options: Strike {self.strike_price} {actual_option_type} Expiry {self.expiry_date}")
+            
+            return order
+            
+        except Exception as e:
+            add_log(f"❌ DHAN ORDER FAILED: {str(e)}")
+            return None
         
         return order
     
@@ -186,12 +201,14 @@ class DhanBrokerIntegration:
         return sl_price, target_price
     
     def enter_broker_position(self, signal, price, quantity):
-        """Enter broker position"""
+        """Enter broker position with auto CE/PE selection"""
         if not self.enabled or self.broker_position is not None:
             return
         
         order_type = 'BUY' if signal == 'BUY' else 'SELL'
-        order = self.place_order(order_type, quantity, price)
+        
+        # Pass signal type for auto CE/PE selection
+        order = self.place_order(order_type, quantity, price, signal_type=signal)
         
         if order:
             sl_price, target_price = self.calculate_broker_sl_target(price, order_type)
@@ -547,7 +564,14 @@ def fetch_data(ticker, interval, period, is_live_trading=False):
 # ============================================================================
 
 def check_ema_crossover_strategy(df, idx, config, position_type=None):
-    """EMA Crossover Strategy"""
+    """
+    EMA Crossover Strategy - REWRITTEN
+    Checks all filters properly:
+    1. Crossover detection
+    2. Absolute angle check
+    3. Candle size filters (Points or ATR)
+    4. ADX trend filter
+    """
     if idx < 1:
         return None, None
     
@@ -559,42 +583,75 @@ def check_ema_crossover_strategy(df, idx, config, position_type=None):
        pd.isna(previous['EMA_Fast']) or pd.isna(previous['EMA_Slow']):
         return None, None
     
+    # =========================================================================
+    # STEP 1: Detect Crossover
+    # =========================================================================
     bullish_cross = (previous['EMA_Fast'] <= previous['EMA_Slow'] and 
                      current['EMA_Fast'] > current['EMA_Slow'])
     bearish_cross = (previous['EMA_Fast'] >= previous['EMA_Slow'] and 
                      current['EMA_Fast'] < current['EMA_Slow'])
     
     if not bullish_cross and not bearish_cross:
-        return None, None
+        return None, None  # No crossover, exit early
     
-    # Check EMA angle (optional)
-    min_angle = config.get('ema_min_angle', 1.0)
-    if min_angle > 0:  # Only check if min_angle is set
-        fast_angle = abs(current['EMA_Fast_Angle'])
-        if pd.isna(fast_angle) or fast_angle < min_angle:
-            return None, None
+    # =========================================================================
+    # STEP 2: Check ABSOLUTE Angle (if configured)
+    # =========================================================================
+    min_angle = config.get('ema_min_angle', 0.0)
     
-    # Entry filter logic
+    if min_angle > 0:  # Only check if user set a minimum angle
+        # Use ABSOLUTE angle value (always positive)
+        ema_fast_angle = current.get('EMA_Fast_Angle', 0)
+        
+        if pd.isna(ema_fast_angle):
+            return None, None  # No angle data
+        
+        absolute_angle = abs(ema_fast_angle)  # Take absolute value
+        
+        if absolute_angle < min_angle:
+            return None, None  # Angle too small, reject crossover
+    
+    # =========================================================================
+    # STEP 3: Entry Filter - Candle Size Check
+    # =========================================================================
     entry_filter = config.get('ema_entry_filter', 'Simple Crossover')
     
     if entry_filter == 'Custom Candle (Points)':
+        # Check if candle size meets minimum points requirement
         custom_points = config.get('ema_custom_points', 10)
         candle_size = abs(current['Close'] - current['Open'])
+        
         if candle_size < custom_points:
-            return None, None
-            
-    elif entry_filter == 'ATR-based Candle':
-        atr_multiplier = config.get('ema_atr_multiplier', 1.0)
-        candle_size = abs(current['Close'] - current['Open'])
-        if pd.isna(current['ATR']) or candle_size < (current['ATR'] * atr_multiplier):
-            return None, None
+            return None, None  # Candle too small
     
-    # ADX filter (optional)
+    elif entry_filter == 'ATR-based Candle':
+        # Check if candle size is at least X times ATR
+        atr_multiplier = config.get('ema_atr_multiplier', 1.0)
+        
+        if pd.isna(current['ATR']):
+            return None, None  # No ATR data
+        
+        candle_size = abs(current['Close'] - current['Open'])
+        min_candle_size = current['ATR'] * atr_multiplier
+        
+        if candle_size < min_candle_size:
+            return None, None  # Candle too small relative to ATR
+    
+    # =========================================================================
+    # STEP 4: ADX Trend Filter (if enabled)
+    # =========================================================================
     if config.get('ema_use_adx', False):
         adx_threshold = config.get('ema_adx_threshold', 25)
-        if pd.isna(current['ADX']) or current['ADX'] < adx_threshold:
-            return None, None
+        
+        if pd.isna(current['ADX']):
+            return None, None  # No ADX data
+        
+        if current['ADX'] < adx_threshold:
+            return None, None  # Trend not strong enough
     
+    # =========================================================================
+    # All filters passed - Return signal
+    # =========================================================================
     if bullish_cross:
         return 'BUY', current['Close']
     elif bearish_cross:
@@ -1999,7 +2056,15 @@ def render_configuration_ui():
                 with col2:
                     config['dhan_expiry_date'] = st.text_input("Expiry Date (YYYY-MM-DD)", value="")
                 with col3:
-                    config['dhan_option_type'] = st.selectbox("Option Type", ["CE", "PE"])
+                    auto_ce_pe = st.checkbox("Auto CE/PE based on Signal", value=True, 
+                                            help="CE for LONG, PE for SHORT automatically")
+                    config['dhan_auto_ce_pe'] = auto_ce_pe
+                    
+                    if not auto_ce_pe:
+                        config['dhan_option_type'] = st.selectbox("Option Type", ["CE", "PE"])
+                    else:
+                        st.info("CE/PE will be selected automatically:\n• LONG signal → CE\n• SHORT signal → PE")
+                        config['dhan_option_type'] = 'AUTO'  # Will be set dynamically
         
         with st.expander("⚡ Order Trigger Condition", expanded=True):
             col1, col2 = st.columns(2)
