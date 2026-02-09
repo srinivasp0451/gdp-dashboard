@@ -61,7 +61,61 @@ TICKER_MAP = {
     "S&P 500": "^GSPC",
     "Nasdaq": "^IXIC",
     "Dow Jones": "^DJI",
+    "🔍 SCAN ALL NIFTY 50 STOCKS": "SCAN_NIFTY50",  # Scanner option
     "Custom": "CUSTOM"
+}
+
+# Nifty 50 constituent stocks
+NIFTY50_STOCKS = {
+    "Reliance": "RELIANCE.NS",
+    "TCS": "TCS.NS",
+    "HDFC Bank": "HDFCBANK.NS",
+    "Infosys": "INFY.NS",
+    "ICICI Bank": "ICICIBANK.NS",
+    "Hindustan Unilever": "HINDUNILVR.NS",
+    "ITC": "ITC.NS",
+    "SBI": "SBIN.NS",
+    "Bharti Airtel": "BHARTIARTL.NS",
+    "Kotak Bank": "KOTAKBANK.NS",
+    "L&T": "LT.NS",
+    "Asian Paints": "ASIANPAINT.NS",
+    "Axis Bank": "AXISBANK.NS",
+    "Maruti": "MARUTI.NS",
+    "Bajaj Finance": "BAJFINANCE.NS",
+    "HCL Tech": "HCLTECH.NS",
+    "Wipro": "WIPRO.NS",
+    "Titan": "TITAN.NS",
+    "Nestle": "NESTLEIND.NS",
+    "Sun Pharma": "SUNPHARMA.NS",
+    "UltraTech": "ULTRACEMCO.NS",
+    "Tech Mahindra": "TECHM.NS",
+    "Tata Steel": "TATASTEEL.NS",
+    "Bajaj Finserv": "BAJAJFINSV.NS",
+    "Power Grid": "POWERGRID.NS",
+    "M&M": "M&M.NS",
+    "NTPC": "NTPC.NS",
+    "Adani Ports": "ADANIPORTS.NS",
+    "JSW Steel": "JSWSTEEL.NS",
+    "Coal India": "COALINDIA.NS",
+    "Tata Motors": "TATAMOTORS.NS",
+    "Grasim": "GRASIM.NS",
+    "Britannia": "BRITANNIA.NS",
+    "Cipla": "CIPLA.NS",
+    "Hero MotoCorp": "HEROMOTOCO.NS",
+    "Eicher Motors": "EICHERMOT.NS",
+    "Shree Cement": "SHREECEM.NS",
+    "Bajaj Auto": "BAJAJ-AUTO.NS",
+    "Dr Reddy's": "DRREDDY.NS",
+    "Adani Enterprises": "ADANIENT.NS",
+    "Tata Consumer": "TATACONSUM.NS",
+    "IndusInd Bank": "INDUSINDBK.NS",
+    "Hindalco": "HINDALCO.NS",
+    "ONGC": "ONGC.NS",
+    "BPCL": "BPCL.NS",
+    "Divis Labs": "DIVISLAB.NS",
+    "Apollo Hospital": "APOLLOHOSP.NS",
+    "SBI Life": "SBILIFE.NS",
+    "BEL": "BEL.NS"
 }
 
 INDEX_TICKERS = ["^NSEI", "^NSEBANK", "^BSESN", "^GSPC", "^IXIC", "^DJI", "^INDIAVIX"]
@@ -92,7 +146,7 @@ class OptionSignalGenerator:
                 self.data = ticker_obj.history(period=period)
             else:
                 # For intraday/scalping, use download with interval support
-                import yfinance as yf
+                # yf is already imported at module level
                 self.data = yf.download(
                     self.ticker,
                     period=period,
@@ -106,7 +160,7 @@ class OptionSignalGenerator:
                 except:
                     pass  # If timezone issues, skip filtering
             
-            if self.data.empty:
+            if self.data is None or self.data.empty:
                 return None
             
             return self.data
@@ -979,6 +1033,77 @@ def manual_input_section():
             st.error("Please input option chain data")
 
 
+def scan_nifty50_stocks(strategy, period, interval):
+    """Scan all Nifty 50 stocks and return tradeable opportunities with API rate limit protection"""
+    import time
+    import random
+    
+    st.markdown("## 🔍 Scanning All Nifty 50 Stocks...")
+    st.info(f"📊 Running **{strategy}** strategy on {len(NIFTY50_STOCKS)} stocks. This will take ~1-2 minutes with rate limit protection...")
+    
+    # Progress tracking
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+    
+    results = []
+    total_stocks = len(NIFTY50_STOCKS)
+    
+    for idx, (stock_name, ticker) in enumerate(NIFTY50_STOCKS.items()):
+        # Update progress
+        progress = (idx + 1) / total_stocks
+        progress_bar.progress(progress)
+        status_text.text(f"📊 Scanning {stock_name} ({idx + 1}/{total_stocks})...")
+        
+        try:
+            # Initialize signal generator for this stock (all are stocks, not indices)
+            signal_gen = OptionSignalGenerator(ticker, is_index=False)
+            
+            # Fetch data with appropriate interval
+            data = signal_gen.fetch_data(period=period, interval=interval)
+            
+            if data is not None and not data.empty and len(data) >= 60:
+                # Calculate indicators
+                signal_gen.calculate_indicators()
+                
+                # Generate signal with strategy
+                signal = signal_gen.generate_signal(strategy=strategy)
+                vol_context = signal_gen.get_volatility_context()
+                
+                # Only include if there's a tradeable signal
+                if signal and signal['signal'] != 'NO SIGNAL' and vol_context:
+                    # Check volatility
+                    vol_status = "GOOD ✅" if vol_context.get('trade_ok', False) else "HIGH ⚠️"
+                    tradeable = '✅ YES' if vol_context.get('trade_ok', False) else '⏸️ WAIT'
+                    
+                    results.append({
+                        'Stock': stock_name,
+                        'Ticker': ticker,
+                        'Signal': signal['signal'],
+                        'Confidence': f"{signal['confidence']}%",
+                        'Price': f"₹{signal['price']:.2f}",
+                        'Target': f"₹{signal['target']:.2f}",
+                        'Stop': f"₹{signal['stop_loss']:.2f}",
+                        'R:R': f"{signal['risk_reward']:.1f}:1",
+                        'HV Percentile': f"{vol_context['hv_percentile']:.1f}%",
+                        'Vol Status': vol_status,
+                        'Trade?': tradeable
+                    })
+        
+        except Exception as e:
+            # Silently skip stocks with errors (data unavailable, delisted, etc.)
+            pass
+        
+        # CRITICAL: Random delay between 1.0 to 1.5 seconds to avoid yfinance API rate limits
+        if idx < total_stocks - 1:  # Don't delay after last stock
+            delay = random.uniform(1.0, 1.5)
+            time.sleep(delay)
+    
+    # Clear progress indicators
+    progress_bar.empty()
+    status_text.empty()
+    
+    return results
+
 
 def main():
     """Main Streamlit app"""
@@ -1111,9 +1236,80 @@ def main():
         st.markdown("### 🎯 Real-Time Signal Generation")
         
         if generate_signal:
-            if not ticker_symbol:
+            # Check if scanner option selected
+            if ticker_symbol == "SCAN_NIFTY50":
+                # Run Nifty 50 stock scanner
+                st.success("🔍 **NIFTY 50 SCANNER MODE** - Scanning all 50 stocks for opportunities")
+                
+                scan_results = scan_nifty50_stocks(STRATEGY, period, interval)
+                
+                if scan_results:
+                    st.markdown("---")
+                    st.markdown(f"## ✅ Found {len(scan_results)} Trading Opportunities")
+                    
+                    # Convert to DataFrame for better display
+                    df_results = pd.DataFrame(scan_results)
+                    
+                    # Separate tradeable from wait
+                    tradeable_df = df_results[df_results['Trade?'] == '✅ YES']
+                    wait_df = df_results[df_results['Trade?'] == '⏸️ WAIT']
+                    
+                    # Show tradeable opportunities first
+                    if not tradeable_df.empty:
+                        st.success(f"### ✅ {len(tradeable_df)} TRADEABLE Now (Good Volatility)")
+                        st.dataframe(
+                            tradeable_df,
+                            use_container_width=True,
+                            hide_index=True
+                        )
+                        
+                        # Download button for tradeable stocks
+                        csv_tradeable = tradeable_df.to_csv(index=False)
+                        st.download_button(
+                            label="📥 Download Tradeable Stocks (CSV)",
+                            data=csv_tradeable,
+                            file_name=f"nifty50_tradeable_{STRATEGY}_{pd.Timestamp.now().strftime('%Y%m%d')}.csv",
+                            mime="text/csv"
+                        )
+                    else:
+                        st.warning("⚠️ No stocks with good volatility for trading right now")
+                    
+                    st.markdown("---")
+                    
+                    # Show wait list
+                    if not wait_df.empty:
+                        st.warning(f"### ⏸️ {len(wait_df)} Stocks with Good Signal BUT High Volatility (Wait)")
+                        st.info("These have good technical setups but options are expensive. Wait for volatility to drop.")
+                        st.dataframe(
+                            wait_df,
+                            use_container_width=True,
+                            hide_index=True
+                        )
+                    
+                    # Summary statistics
+                    st.markdown("---")
+                    st.markdown("### 📊 Scan Summary")
+                    col1, col2, col3, col4 = st.columns(4)
+                    
+                    with col1:
+                        st.metric("Total Signals", len(scan_results))
+                    with col2:
+                        st.metric("Tradeable Now", len(tradeable_df))
+                    with col3:
+                        buy_calls = len(df_results[df_results['Signal'] == 'BUY CALL'])
+                        st.metric("BUY CALL", buy_calls)
+                    with col4:
+                        buy_puts = len(df_results[df_results['Signal'] == 'BUY PUT'])
+                        st.metric("BUY PUT", buy_puts)
+                    
+                else:
+                    st.warning("⚠️ No trading opportunities found in Nifty 50 stocks with current criteria")
+                    st.info("💡 Try again later or use a different strategy/timeframe")
+            
+            elif not ticker_symbol:
                 st.error("Please select or enter a ticker symbol")
             else:
+                # Normal single-ticker analysis
                 with st.spinner(f"Analyzing {ticker_name} using {STRATEGY} strategy..."):
                     # Initialize signal generator
                     signal_gen = OptionSignalGenerator(ticker_symbol, is_index)
