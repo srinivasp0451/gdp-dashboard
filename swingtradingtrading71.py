@@ -1977,8 +1977,8 @@ def render_configuration_ui():
     
     if dhan_enabled:
         with st.expander("📝 Broker Credentials", expanded=True):
-            config['dhan_client_id'] = st.text_input("Client ID", value="", type="password")
-            config['dhan_access_token'] = st.text_input("Access Token", value="", type="password")
+            config['dhan_client_id'] = st.text_input("Client ID", value="1104779876", type="password")
+            config['dhan_access_token'] = st.text_input("Access Token", value="eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzUxMiJ9.eyJpc3MiOiJkaGFuIiwicGFydG5lcklkIjoiIiwiZXhwIjoxNzcwNjk1Nzk3LCJpYXQiOjE3NzA2MDkzOTcsInRva2VuQ29uc3VtZXJUeXBlIjoiU0VMRiIsIndlYmhvb2tVcmwiOiIiLCJkaGFuQ2xpZW50SWQiOiIxMTA0Nzc5ODc2In0.UGpwqKYkopPZ5ultbC93iw8Ks60wDi2EgeBgzUVRtCZOWJxHR2ZcuHKPt6atliAnMs-W9DPyO85knEsr7SHl8g", type="password")
         
         with st.expander("📊 Security Details", expanded=True):
             col1, col2 = st.columns(2)
