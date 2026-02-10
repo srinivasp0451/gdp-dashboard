@@ -169,19 +169,24 @@ class OptionSignalGenerator:
             return None
     
     def calculate_indicators(self):
-        """Calculate all technical indicators"""
+        """Calculate all technical indicators with safety for shorter timeframes"""
         if self.data is None or self.data.empty:
             return None
         
-        # Check minimum data requirement (need at least 60 days for 50-day MA)
-        if len(self.data) < 60:
+        # Reduced minimum requirement - need at least 20 bars for MA20
+        if len(self.data) < 20:
             return None
             
         df = self.data.copy()
         
-        # Moving Averages (removed MA200 to allow shorter periods)
+        # Moving Averages
         df['MA20'] = df['Close'].rolling(20).mean()
-        df['MA50'] = df['Close'].rolling(50).mean()
+        
+        # MA50 only if we have enough data, otherwise use MA20
+        if len(df) >= 50:
+            df['MA50'] = df['Close'].rolling(50).mean()
+        else:
+            df['MA50'] = df['MA20']  # Fallback for short timeframes
         
         # RSI
         delta = df['Close'].diff()
@@ -233,7 +238,16 @@ class OptionSignalGenerator:
     
     def generate_signal(self, strategy="SWING"):
         """Generate signal - uses original logic for SWING, modified for INTRADAY/SCALPING"""
-        if self.data is None or len(self.data) < 60:
+        
+        # Strategy-specific minimum data requirements
+        if strategy == "SWING":
+            min_data_required = 60  # Original requirement for daily data
+        elif strategy == "INTRADAY":
+            min_data_required = 30  # Lower requirement for intraday (need ~25 for MA20)
+        else:  # SCALPING
+            min_data_required = 25  # Minimal requirement for scalping
+        
+        if self.data is None or len(self.data) < min_data_required:
             return None
             
         df = self.data
@@ -1041,6 +1055,14 @@ def scan_nifty50_stocks(strategy, period, interval):
     st.markdown("## 🔍 Scanning All Nifty 50 Stocks...")
     st.info(f"📊 Running **{strategy}** strategy on {len(NIFTY50_STOCKS)} stocks. This will take ~1-2 minutes with rate limit protection...")
     
+    # Strategy-specific minimum data requirements
+    if strategy == "SWING":
+        min_bars_required = 60
+    elif strategy == "INTRADAY":
+        min_bars_required = 30
+    else:  # SCALPING
+        min_bars_required = 25
+    
     # Progress tracking
     progress_bar = st.progress(0)
     status_text = st.empty()
@@ -1061,7 +1083,7 @@ def scan_nifty50_stocks(strategy, period, interval):
             # Fetch data with appropriate interval
             data = signal_gen.fetch_data(period=period, interval=interval)
             
-            if data is not None and not data.empty and len(data) >= 60:
+            if data is not None and not data.empty and len(data) >= min_bars_required:
                 # Calculate indicators
                 signal_gen.calculate_indicators()
                 
@@ -1082,9 +1104,12 @@ def scan_nifty50_stocks(strategy, period, interval):
                         'Confidence': f"{signal['confidence']}%",
                         'Price': f"₹{signal['price']:.2f}",
                         'Target': f"₹{signal['target']:.2f}",
-                        'Stop': f"₹{signal['stop_loss']:.2f}",
+                        'Stop Loss': f"₹{signal['stop_loss']:.2f}",
                         'R:R': f"{signal['risk_reward']:.1f}:1",
+                        'Current HV': f"{vol_context['current_hv']:.2f}%",
+                        'Avg HV': f"{vol_context['avg_hv_period']:.2f}%",
                         'HV Percentile': f"{vol_context['hv_percentile']:.1f}%",
+                        'Z-Score': f"{vol_context['hv_z_score']:.2f}",
                         'Vol Status': vol_status,
                         'Trade?': tradeable
                     })
@@ -1180,13 +1205,8 @@ def main():
             interval = "1d"
             
         elif STRATEGY == "INTRADAY":
-            # INTRADAY SETTINGS
-            period = st.selectbox(
-                "Intraday Data Period",
-                options=["5d", "10d"],
-                index=0,
-                help="Last 5-10 days for intraday patterns"
-            )
+            # INTRADAY SETTINGS - Updated for yfinance limits
+            st.info("ℹ️ **Intraday Limits:** 5m = max 60 days, 15m = max 60 days")
             
             interval = st.selectbox(
                 "Candle Timeframe",
@@ -1195,24 +1215,58 @@ def main():
                 help="5-min = faster signals | 15-min = less noise"
             )
             
+            # Period options based on interval
+            if interval == "5m":
+                period = st.selectbox(
+                    "Intraday Data Period",
+                    options=["1d", "5d", "1mo"],
+                    index=1,  # Default to 5d
+                    help="5-min candles: 1d=~75 bars, 5d=~375 bars, 1mo=~1500 bars"
+                )
+            else:  # 15m
+                period = st.selectbox(
+                    "Intraday Data Period",
+                    options=["1d", "5d", "1mo"],
+                    index=2,  # Default to 1mo for 15-min
+                    help="15-min candles: 1d=~25 bars, 5d=~125 bars, 1mo=~500 bars"
+                )
+            
             st.warning("⚠️ **Trade only 10:00 AM - 2:00 PM**")
             st.warning("⚠️ **MUST exit before market close!**")
             
         else:  # SCALPING
-            # SCALPING SETTINGS
-            period = st.selectbox(
-                "Scalping Data Period",
-                options=["2d", "5d"],
-                index=0,
-                help="Very recent data only"
-            )
+            # SCALPING SETTINGS - Updated for yfinance limits
+            st.error("ℹ️ **Scalping Limits:** 1m = max 7 days only!")
             
             interval = st.selectbox(
                 "Candle Timeframe",
                 options=["1m", "3m", "5m"],
-                index=1,  # Default to 3m (1m too fast)
-                help="1-min = extreme speed | 3-min = recommended | 5-min = slower"
+                index=1,  # Default to 3m (1m has very limited data)
+                help="1-min = max 7 days | 3-min = max 60 days | 5-min = max 60 days"
             )
+            
+            # Period options based on interval
+            if interval == "1m":
+                period = st.selectbox(
+                    "Scalping Data Period",
+                    options=["1d", "5d", "7d"],
+                    index=1,  # Default to 5d
+                    help="1-min candles: 1d=~375 bars, 5d=~1875 bars, 7d=~2625 bars"
+                )
+            elif interval == "3m":
+                period = st.selectbox(
+                    "Scalping Data Period",
+                    options=["1d", "5d", "1mo"],
+                    index=1,  # Default to 5d
+                    help="3-min candles: Good data availability"
+                )
+            else:  # 5m
+                period = st.selectbox(
+                    "Scalping Data Period",
+                    options=["1d", "5d", "1mo"],
+                    index=1,  # Default to 5d
+                    help="5-min candles: Same as intraday"
+                )
             
             st.error("❌ **EXTREME RISK - Not Recommended!**")
             st.error("⚠️ Bid-ask spreads will eat profits")
@@ -1319,12 +1373,15 @@ def main():
                     
                     if data is None or data.empty:
                         st.error(f"❌ Could not fetch data for {ticker_symbol}. Please check ticker symbol.")
-                    elif len(data) < 60:
-                        st.error(f"❌ Insufficient data: Only {len(data)} bars available. Need at least 60.")
+                    elif len(data) < 20:
+                        st.error(f"❌ Insufficient data: Only {len(data)} bars available.")
+                        
                         if STRATEGY == "SWING":
-                            st.warning("💡 Try selecting a longer period (6mo or 1y) or check if the ticker is newly listed.")
-                        else:
-                            st.warning("💡 Try selecting a longer period for intraday/scalping data.")
+                            st.warning("💡 Need at least 60 bars. Try selecting a longer period (6mo or 1y).")
+                        elif STRATEGY == "INTRADAY":
+                            st.warning(f"💡 Need at least 30 bars for intraday. Try 5d or 1mo period with {interval} candles.")
+                        else:  # SCALPING
+                            st.warning(f"💡 Need at least 25 bars for scalping. Try 5d or 7d period with {interval} candles.")
                     else:
                         # Show data info for intraday/scalping
                         if STRATEGY != "SWING":
@@ -1592,84 +1649,162 @@ def main():
     with tab4:
         st.markdown("### 📚 Strategy Guide & Best Practices")
         
-        st.markdown("""
-        ## 🎯 How This Strategy Works
-        
-        This is a **technical analysis + volatility-based option buying strategy** designed for high-probability entries.
-        
-        ### Core Principles:
-        
-        1. **Multiple Confirmation Filters**
-           - Trend analysis (MA20, MA50)
-           - Momentum indicators (RSI, MACD)
-           - Volatility checks (Bollinger Bands, Stochastic)
-           - Volume confirmation (for stocks)
-           
-        2. **Entry Only at High-Probability Setups**
-           - Minimum 7/12 points needed for signal
-           - All factors must align in same direction
-           - Enter when options are cheap (low IV)
-        
-        3. **Strict Risk Management**
-           - Fixed 50% stop loss on option premium
-           - 100% profit target (2:1 risk-reward minimum)
-           - Partial exit at target + trailing stop
-        
-        ### 📊 Volatility Check (Critical!)
-        
-        **Before buying ANY option:**
-        1. Check Current HV from the app
-        2. Upload option chain screenshot
-        3. Compare IV with HV:
-           - **IV < HV**: Options are CHEAP ✅
-           - **IV > HV**: Options are EXPENSIVE ❌
-        
-        ### 🎲 Expected Performance:
-        
-        - **Win Rate**: 55-65% (with discipline)
-        - **Average Risk:Reward**: 2:1 to 3:1
-        - **Signals Per Month**: 2-4 (quality over quantity)
-        - **Max Position Risk**: 2% of capital per trade
-        
-        ### ⚠️ Common Mistakes to Avoid:
-        
-        1. ❌ Taking signals without IV check
-        2. ❌ Not honoring stop losses
-        3. ❌ Overtrading (taking weak signals)
-        4. ❌ Position sizing too large
-        5. ❌ Buying options with <30 days to expiry
-        
-        ### ✅ Best Practices:
-        
-        1. ✅ Only trade when confidence >70%
-        2. ✅ Always check IV before entry
-        3. ✅ Use 30-45 DTE options minimum
-        4. ✅ Paper trade for 2-3 months first
-        5. ✅ Keep detailed trade journal
-        
-        ### 📈 Ideal Market Conditions:
-        
-        **For NIFTY/BANKNIFTY:**
-        - Clear trending market (not sideways)
-        - India VIX below 15 (calm market)
-        - Liquid strikes with tight bid-ask
-        
-        **For Stocks:**
-        - Large cap stocks (better liquidity)
-        - No earnings within option expiry
-        - Clear technical setup on daily chart
-        
-        ### 💡 Pro Tips:
-        
-        - Trade morning session (9:30-11:00 AM) for best liquidity
-        - Avoid trading on expiry day unless experienced
-        - Use limit orders, not market orders
-        - Exit 50% at target, trail remaining 50%
-        - Never risk more than 2% total capital per trade
-        """)
+        # Strategy comparison table
+        st.markdown("## 📊 Strategy Comparison")
+        comparison_data = {
+            "Aspect":          ["Hold Duration", "Win Rate",    "Risk:Reward",   "Target Gains", "Stop Loss",       "Signals/Month", "Time Per Day", "Difficulty", "Monthly Return",    "Best For"],
+            "✅ Swing (Default)":["2–10 days",    "60–65%",      "2:1 to 3:1",    "50–100%",      "50% of premium",  "2–4 setups",    "5 min",        "Medium",     "10–20%",            "Everyone"],
+            "⚠️ Intraday":      ["1–4 hours",    "45–55%",      "1.5:1 to 2:1",  "20–40%",       "10–20% of prem.", "5–10 setups",   "4–6 hours",    "High",       "5–15%",             "Full-time traders"],
+            "❌ Scalping":      ["5–30 minutes", "40–50%",      "1:1 to 1.5:1",  "10–20%",       "5–10% of prem.",  "10–20 attempts","All day",      "Extreme",    "-5% to +10%",       "Experts only"],
+        }
+        st.dataframe(pd.DataFrame(comparison_data), use_container_width=True, hide_index=True)
         
         st.markdown("---")
-        st.success("📞 **Need Help?** Use this systematically, follow the rules, and track your results!")
+        
+        # Detailed tabs for each strategy
+        s1, s2, s3 = st.tabs(["✅ Swing Trading (Recommended)", "⚠️ Intraday Trading", "❌ Scalping (Not Recommended)"])
+        
+        with s1:
+            st.success("### ✅ Swing Trading — The Proven System")
+            st.markdown("""
+**This is the original, unchanged strategy built into the app.**
+
+#### 🎯 Core Logic
+- Uses **daily candles** + **1 year of history**
+- Requires **7 / 12 technical points** to fire a signal
+- Buys options only when **HV Percentile < 60%** (cheap options)
+- Hold 2–10 days, exit at **+100% target** or **-50% stop**
+
+#### 📊 Indicators Used (all 12)
+| # | Indicator | Bullish Condition |
+|---|-----------|-------------------|
+| 1 | MA20 vs MA50 | Price > MA20 > MA50 |
+| 2 | Price vs MA20 | Close > MA20 |
+| 3 | RSI | 30–60 zone (recovery) |
+| 4 | MACD | MACD crosses above signal line |
+| 5 | MACD Histogram | Rising histogram |
+| 6 | Bollinger Bands | Price near lower band (bounce) |
+| 7 | Stochastic %K | Below 30 (oversold) |
+| 8 | Stochastic Cross | %K crossing above %D |
+| 9 | ATR Expansion | ATR rising (momentum) |
+| 10 | Price Momentum | Close > 5-day avg |
+| 11 | Volume | Volume > 20-day avg |
+| 12 | HV Percentile | < 60% (cheap options) |
+
+#### 🧮 Volatility Filters
+| HV Percentile | Z-Score | Status | Action |
+|---------------|---------|--------|--------|
+| < 30% | < 0 | Excellent | Trade aggressively |
+| 30–60% | < 0.5 | Good | Trade normally |
+| 60–75% | 0.5–1.0 | Caution | Trade smaller size |
+| > 75% | > 1.0 | Expensive | Skip / Wait |
+
+#### 💡 Best Practices
+1. ✅ Only trade when Confidence ≥ 70%
+2. ✅ Use options with 30–45 DTE minimum
+3. ✅ Exit 50% at target, trail the rest
+4. ✅ Never risk more than 2% of capital per trade
+5. ✅ Paper trade 2–3 months before going live
+            """)
+
+        with s2:
+            st.warning("### ⚠️ Intraday Trading — Active, Harder, Lower Returns")
+            st.markdown("""
+**Same indicators as Swing but applied to 5-min / 15-min candles.**
+
+#### ⚙️ Key Differences from Swing
+| Parameter | Swing | Intraday |
+|-----------|-------|----------|
+| Candle size | 1 day | 5-min or 15-min |
+| Data window | 1 year | 5 days – 1 month |
+| Min signal points | 7 / 12 | 6 / 12 |
+| ATR target mult | 2.5× | 1.5× |
+| ATR stop mult | 1.0× | 0.5× |
+| Hold time | Days | Hours |
+
+#### ⏰ Strict Time Rules
+| Time | Action |
+|------|--------|
+| Before 9:30 AM | Do not trade (opening volatility) |
+| 9:30–10:00 AM | Watch only, let price settle |
+| 10:00 AM–2:00 PM | **Trading window** ✅ |
+| After 2:00 PM | **EXIT ALL positions** — theta accelerates |
+| 3:30 PM | Market close — anything open LOSES |
+
+#### ⚠️ Why Intraday Is Harder
+- **Bid-ask spread** eats 10–20% of profit on small moves
+- Signals are noisier — 70% noise vs 30% signal on 5-min charts
+- Requires **constant screen monitoring** — not compatible with a job
+- Lower win rate (45–55%) vs Swing (60–65%)
+
+#### 📐 Position Sizing
+- Use **half the position size** of your swing trades
+- Risk only **1% per trade** (vs 2% for swing)
+- If 3 consecutive losses: stop for the day
+
+#### 💡 Only Works Well When
+✓ India VIX < 18 (calm market)  
+✓ Clear gap-and-go trending day  
+✓ Trading Nifty/BankNifty ATM options only  
+✓ Using 5-min charts (NOT 1-min — too much noise)  
+            """)
+
+        with s3:
+            st.error("### ❌ Scalping — Why It Almost Always Fails")
+            st.markdown("""
+**Technical signals exist but economics make it nearly impossible to profit.**
+
+#### 🔢 The Math That Kills Scalping
+```
+Buy at ask:          ₹100
+Immediate bid:       ₹98      ← you're already -2%
+Your 10% target:     ₹110 bid
+But seller asks:     ₹112     ← you must wait for this
+Net spread cost:     ~2% of trade = 20% of your 10% gain!
+```
+
+#### 🤖 You're Competing Against HFT Algorithms
+| Factor | You | HFT Algo |
+|--------|-----|----------|
+| Execution speed | Seconds | Microseconds |
+| Order flow visibility | None | Full |
+| Spread cost | Full spread | Near-zero |
+| Co-location | No | Yes |
+**Result: You are outgunned on every trade.**
+
+#### 📉 Statistical Reality
+| Metric | Value |
+|--------|-------|
+| Win Rate | 40–50% |
+| Risk:Reward | ~1:1 |
+| Expected Value per trade | **Negative** |
+| Long-term success rate | < 5% of scalpers |
+| Monthly return (typical) | −5% to +5% |
+
+#### ⚙️ Scalping Settings in This App (If You Insist)
+| Setting | Recommended | Why |
+|---------|------------|-----|
+| Interval | 3-min (NOT 1-min) | Less noise |
+| Period | 5d | Enough bars |
+| Min signal points | 5 / 12 | Quick signals |
+| Risk per trade | 0.5% of capital | Survival |
+| Daily loss limit | 3% of capital | Stop immediately |
+| Time window | 10:30 AM – 1:30 PM | Best liquidity |
+
+#### ✅ Better Alternatives to Scalping
+| If you want... | Use instead |
+|----------------|------------|
+| Fast trades | Nifty Futures (tiny spreads) |
+| Same-day expiry | 0DTE weekly options (Thursdays) |
+| More trades | Intraday options |
+| Best returns | **Swing trading** ← always this |
+
+> **Honest advice: Don't scalp options. The math doesn't work.**  
+> Switch to Swing Trading — higher win rate, better returns, less stress.
+            """)
+        
+        st.markdown("---")
+        st.success("📞 **Recommendation:** Start with Swing Trading. Master it first. Only move to faster strategies after 3 months of profitable swing trading.")
 
 
 if __name__ == "__main__":
