@@ -146,18 +146,26 @@ class OptionSignalGenerator:
                 self.data = ticker_obj.history(period=period)
             else:
                 # For intraday/scalping, use download with interval support
-                # yf is already imported at module level
                 self.data = yf.download(
                     self.ticker,
                     period=period,
                     interval=interval,
-                    progress=False
+                    progress=False,
+                    auto_adjust=True
                 )
+                
+                # Flatten MultiIndex columns that yf.download creates
+                # e.g. ('Close', '^NSEI') → 'Close'
+                if isinstance(self.data.columns, pd.MultiIndex):
+                    self.data.columns = self.data.columns.get_level_values(0)
+                
+                # Remove duplicate columns if any
+                self.data = self.data.loc[:, ~self.data.columns.duplicated()]
                 
                 # Filter to market hours for intraday (9:15 AM - 3:30 PM IST)
                 try:
                     self.data = self.data.between_time('09:15', '15:30')
-                except:
+                except Exception:
                     pass  # If timezone issues, skip filtering
             
             if self.data is None or self.data.empty:
@@ -233,6 +241,12 @@ class OptionSignalGenerator:
         df['Stoch_K'] = 100 * ((df['Close'] - low_14) / (high_14 - low_14))
         df['Stoch_D'] = df['Stoch_K'].rolling(3).mean()
         
+        # Drop rows where key indicators are NaN (first ~26 rows from rolling windows)
+        # This ensures current/prev/prev2 always have valid scalar values
+        key_cols = ['MA20', 'MA50', 'RSI', 'MACD', 'Signal_Line', 'ATR',
+                    'BB_upper', 'BB_lower', 'Stoch_K', 'HV']
+        df = df.dropna(subset=key_cols)
+        
         self.data = df
         return df
     
@@ -240,20 +254,27 @@ class OptionSignalGenerator:
         """Generate signal - uses original logic for SWING, modified for INTRADAY/SCALPING"""
         
         # Strategy-specific minimum data requirements
+        # NOTE: these are checked AFTER calculate_indicators() has already run dropna(),
+        # so counts are post-dropna. Swing keeps 60 (original logic).
+        # Intraday/Scalping just need 3 rows for current/prev/prev2.
         if strategy == "SWING":
-            min_data_required = 60  # Original requirement for daily data
+            min_data_required = 60  # Original requirement — daily data always has plenty
         elif strategy == "INTRADAY":
-            min_data_required = 30  # Lower requirement for intraday (need ~25 for MA20)
+            min_data_required = 3   # Post-dropna; raw bar check happens in UI
         else:  # SCALPING
-            min_data_required = 25  # Minimal requirement for scalping
+            min_data_required = 3   # Post-dropna; raw bar check happens in UI
         
         if self.data is None or len(self.data) < min_data_required:
             return None
-            
+        
+        # After dropna in calculate_indicators, we need at least 3 valid rows
         df = self.data
+        if len(df) < 3:
+            return None
+            
         current = df.iloc[-1]
-        prev = df.iloc[-2]
-        prev2 = df.iloc[-3]
+        prev    = df.iloc[-2]
+        prev2   = df.iloc[-3]
         
         # Strategy-specific thresholds
         if strategy == "SWING":
@@ -1055,13 +1076,12 @@ def scan_nifty50_stocks(strategy, period, interval):
     st.markdown("## 🔍 Scanning All Nifty 50 Stocks...")
     st.info(f"📊 Running **{strategy}** strategy on {len(NIFTY50_STOCKS)} stocks. This will take ~1-2 minutes with rate limit protection...")
     
-    # Strategy-specific minimum data requirements
+    # Strategy-specific minimum raw bars (before dropna)
+    # Swing needs 60 for MA50 + HV. Intraday/scalping just need enough to compute rolling(26).
     if strategy == "SWING":
         min_bars_required = 60
-    elif strategy == "INTRADAY":
-        min_bars_required = 30
-    else:  # SCALPING
-        min_bars_required = 25
+    else:
+        min_bars_required = 30  # Raw bars; after dropna we need >= 3
     
     # Progress tracking
     progress_bar = st.progress(0)
@@ -1205,70 +1225,54 @@ def main():
             interval = "1d"
             
         elif STRATEGY == "INTRADAY":
-            # INTRADAY SETTINGS - Updated for yfinance limits
-            st.info("ℹ️ **Intraday Limits:** 5m = max 60 days, 15m = max 60 days")
+            # INTRADAY SETTINGS - yfinance verified limits
+            st.info("ℹ️ **Intraday:** 5m & 15m support up to 6mo of data")
             
             interval = st.selectbox(
                 "Candle Timeframe",
-                options=["1m","5m", "15m"],
+                options=["5m", "15m"],
                 index=0,
                 help="5-min = faster signals | 15-min = less noise"
             )
             
-            # Period options based on interval
-            if interval == "5m":
-                period = st.selectbox(
-                    "Intraday Data Period",
-                    options=["1d", "5d", "7d","1mo"],
-                    index=1,  # Default to 5d
-                    help="5-min candles: 1d=~75 bars, 5d=~375 bars, 1mo=~1500 bars"
-                )
-            else:  # 15m
-                period = st.selectbox(
-                    "Intraday Data Period",
-                    options=["1d", "5d","7d", "1mo"],
-                    index=2,  # Default to 1mo for 15-min
-                    help="15-min candles: 1d=~25 bars, 5d=~125 bars, 1mo=~500 bars"
-                )
+            period = st.selectbox(
+                "Intraday Data Period",
+                options=["1d", "5d", "7d", "1mo", "3mo", "6mo"],
+                index=2,   # Default 7d — good balance of bars
+                help="5m/15m work for all these periods"
+            )
             
-            st.warning("⚠️ **Trade only 10:00 AM - 2:00 PM**")
+            st.warning("⚠️ **Trade only 10:00 AM – 2:00 PM**")
             st.warning("⚠️ **MUST exit before market close!**")
             
         else:  # SCALPING
-            # SCALPING SETTINGS - Updated for yfinance limits
-            st.error("ℹ️ **Scalping Limits:** 1m = max 7 days only!")
+            # SCALPING SETTINGS - yfinance verified limits
+            # 3m does NOT work. 1m = max 7d. 5m = up to 6mo.
+            st.error("ℹ️ **Scalping:** 1m supports 1d/5d/7d only. 5m supports up to 6mo.")
             
             interval = st.selectbox(
                 "Candle Timeframe",
-                options=["1m", "3m", "5m"],
-                index=1,  # Default to 3m (1m has very limited data)
-                help="1-min = max 7 days | 3-min = max 60 days | 5-min = max 60 days"
+                options=["1m", "5m"],
+                index=0,
+                help="1-min: max 7 days | 5-min: up to 6 months (3m removed — not supported)"
             )
             
-            # Period options based on interval
             if interval == "1m":
                 period = st.selectbox(
                     "Scalping Data Period",
-                    options=["1d", "5d", "7d","1mo"],
-                    index=1,  # Default to 5d
-                    help="1-min candles: 1d=~375 bars, 5d=~1875 bars, 7d=~2625 bars"
-                )
-            elif interval == "3m":
-                period = st.selectbox(
-                    "Scalping Data Period",
-                    options=["1d", "5d", "1mo"],
-                    index=1,  # Default to 5d
-                    help="3-min candles: Good data availability"
+                    options=["1d", "5d", "7d"],
+                    index=1,   # Default 5d
+                    help="1-min candles: yfinance limit is 7 days max"
                 )
             else:  # 5m
                 period = st.selectbox(
                     "Scalping Data Period",
-                    options=["1d", "5d", "1mo"],
-                    index=1,  # Default to 5d
-                    help="5-min candles: Same as intraday"
+                    options=["1d", "5d", "7d", "1mo", "3mo", "6mo"],
+                    index=2,   # Default 7d
+                    help="5-min candles: up to 6 months supported"
                 )
             
-            st.error("❌ **EXTREME RISK - Not Recommended!**")
+            st.error("❌ **EXTREME RISK — Not Recommended!**")
             st.error("⚠️ Bid-ask spreads will eat profits")
         
         st.markdown("---")
@@ -1373,15 +1377,14 @@ def main():
                     
                     if data is None or data.empty:
                         st.error(f"❌ Could not fetch data for {ticker_symbol}. Please check ticker symbol.")
-                    elif len(data) < 20:
-                        st.error(f"❌ Insufficient data: Only {len(data)} bars available.")
-                        
+                    elif len(data) < 30:
+                        st.error(f"❌ Insufficient data: Only {len(data)} bars fetched.")
                         if STRATEGY == "SWING":
-                            st.warning("💡 Need at least 60 bars. Try selecting a longer period (6mo or 1y).")
+                            st.warning("💡 Need at least 60 bars. Try a longer period (6mo or 1y).")
                         elif STRATEGY == "INTRADAY":
-                            st.warning(f"💡 Need at least 30 bars for intraday. Try 5d or 1mo period with {interval} candles.")
-                        else:  # SCALPING
-                            st.warning(f"💡 Need at least 25 bars for scalping. Try 5d or 7d period with {interval} candles.")
+                            st.warning(f"💡 Try period 5d or 7d with {interval} candles.")
+                        else:
+                            st.warning(f"💡 For 1m try period 5d/7d. For 5m try period 5d or 1mo.")
                     else:
                         # Show data info for intraday/scalping
                         if STRATEGY != "SWING":
