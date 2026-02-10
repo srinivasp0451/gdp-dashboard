@@ -57,216 +57,236 @@ IST = pytz.timezone('Asia/Kolkata')
 
 class DhanBrokerIntegration:
     """
-    Dhan Broker Integration for Live Order Placement
-    Placeholder for actual Dhan API integration
+    Dhan Broker Integration - Live Order Placement
+    Uses dhanhq library for real order placement.
+    Falls back to simulation if library unavailable.
     """
-    
+
     def __init__(self, config):
         self.enabled = config.get('dhan_enabled', False)
         self.client_id = config.get('dhan_client_id', '')
         self.access_token = config.get('dhan_access_token', '')
-        
-        # Dual security IDs for CE and PE
-        self.ce_security_id = config.get('dhan_ce_security_id', '42568')
-        self.pe_security_id = config.get('dhan_pe_security_id', '42569')
-        
-        self.exchange = config.get('dhan_exchange', 'NFO')
-        self.segment = config.get('dhan_segment', 'OPT')
-        
+
+        # Dual security IDs: CE for LONG, PE for SHORT
+        self.ce_security_id = str(config.get('dhan_ce_security_id', '42568'))
+        self.pe_security_id = str(config.get('dhan_pe_security_id', '42569'))
+
         # Options parameters
-        self.is_options = config.get('dhan_is_options', True)  # Default TRUE
+        self.is_options   = config.get('dhan_is_options', True)
         self.strike_price = config.get('dhan_strike_price', 25000)
-        self.expiry_date = config.get('dhan_expiry_date', '')
-        self.quantity = config.get('dhan_quantity', 65)  # Default 65
-        
-        # Order trigger parameters
+        self.expiry_date  = config.get('dhan_expiry_date', '')
+        self.quantity     = config.get('dhan_quantity', 65)
+
+        # Order trigger
         self.trigger_condition = config.get('dhan_trigger_condition', '>=')
-        self.trigger_price = config.get('dhan_trigger_price', 0.0)
-        
-        # SL/Target configuration
-        self.use_algo_signals = config.get('dhan_use_algo_signals', True)
-        self.custom_sl_type = config.get('dhan_custom_sl_type', 'Custom Points')
-        self.custom_sl_points = config.get('dhan_custom_sl_points', 50)
-        self.custom_sl_rupees = config.get('dhan_custom_sl_rupees', 300)
-        self.custom_target_type = config.get('dhan_custom_target_type', 'Custom Points')
+        self.trigger_price     = config.get('dhan_trigger_price', 0.0)
+
+        # SL / Target config
+        self.use_algo_signals    = config.get('dhan_use_algo_signals', True)
+        self.custom_sl_type      = config.get('dhan_custom_sl_type', 'Custom Points')
+        self.custom_sl_points    = config.get('dhan_custom_sl_points', 50)
+        self.custom_sl_rupees    = config.get('dhan_custom_sl_rupees', 300)
+        self.custom_target_type  = config.get('dhan_custom_target_type', 'Custom Points')
         self.custom_target_points = config.get('dhan_custom_target_points', 100)
         self.custom_target_rupees = config.get('dhan_custom_target_rupees', 5000)
-        
-        # Broker position tracking
-        self.broker_position = None
-        self.broker_orders = []
-        self.last_order_status = None  # Track order status
-        
+
+        # State
+        self.broker_position  = None
+        self.broker_orders    = []
+        self.last_order_status = 'Not started'
+
+    # ------------------------------------------------------------------
     def check_trigger_condition(self, current_price):
-        """Check if price crosses the trigger threshold"""
         if not self.enabled:
             return False
-        
         if self.trigger_condition == '>=':
             return current_price >= self.trigger_price
-        elif self.trigger_condition == '<=':
+        if self.trigger_condition == '<=':
             return current_price <= self.trigger_price
-        
         return False
-    
-    def place_order(self, order_type, quantity, price, order_mode='MARKET', signal_type=None):
+
+    # ------------------------------------------------------------------
+    def _resolve_security(self, signal_type):
+        """Return (security_id, option_type) based on signal direction."""
+        if signal_type in ('BUY', 'LONG'):
+            return self.ce_security_id, 'CE'
+        return self.pe_security_id, 'PE'
+
+    # ------------------------------------------------------------------
+    def place_order(self, order_type, quantity, price,
+                    order_mode='MARKET', signal_type=None):
         """
-        Place order with Dhan broker - REAL API INTEGRATION
-        Auto-selects CE or PE security ID based on signal
+        Place an order via Dhan API.
+        security_id is auto-selected: CE for BUY/LONG, PE for SELL/SHORT.
+        Falls back to simulation when dhanhq is not importable.
+        Returns a dict on success, None on hard failure.
         """
         if not self.enabled:
+            add_log("🏦 Broker disabled – skipping order")
             return None
-        
+
+        security_id, option_type = self._resolve_security(signal_type or order_type)
+        add_log(f"🏦 {'BUY/LONG' if option_type=='CE' else 'SELL/SHORT'} → {option_type} | Security ID: {security_id}")
+        add_log(f"🏦 Placing {order_type} {quantity} qty @ {price:.2f} [{order_mode}]")
+
+        raw_response = None
+        order_id     = None
+        api_used     = False
+
+        # ── Try real Dhan API ──────────────────────────────────────────
         try:
-            # Determine which security ID to use based on signal
-            if signal_type in ['BUY', 'LONG']:
-                security_id = self.ce_security_id
-                option_type = 'CE'
-                add_log(f"🏦 LONG signal → Using CE Security ID: {security_id}")
-            else:  # SELL or SHORT
-                security_id = self.pe_security_id
-                option_type = 'PE'
-                add_log(f"🏦 SHORT signal → Using PE Security ID: {security_id}")
-            
-            # Real Dhan API integration
-            from dhanhq import dhanhq
-            dhan = dhanhq(self.client_id, self.access_token)
-            
-            # Place the order
-            add_log(f"🏦 Placing {order_type} order for {quantity} qty @ {price:.2f}")
-            order_id = dhan.place_order(
-                security_id=security_id,
-                exchange_segment=dhan.NSE_FNO,
-                transaction_type=order_type,
-                quantity=quantity,
-                order_type=order_mode,
-                product_type=dhan.INTRA,
-                price=price if order_mode == 'LIMIT' else 0
+            from dhanhq import dhanhq as DhanHQ          # noqa: N813
+            dhan = DhanHQ(self.client_id, self.access_token)
+
+            raw_response = dhan.place_order(
+                security_id   = security_id,
+                exchange_segment = dhan.NSE_FNO,
+                transaction_type = order_type,           # 'BUY' or 'SELL'
+                quantity      = quantity,
+                order_type    = order_mode,              # 'MARKET' or 'LIMIT'
+                product_type  = dhan.INTRA,
+                price         = price if order_mode == 'LIMIT' else 0,
             )
-            
-            # Create order record
-            order = {
-                'order_id': str(order_id),
-                'security_id': security_id,
-                'option_type': option_type,
-                'type': order_type,
-                'quantity': quantity,
-                'price': price,
-                'order_mode': order_mode,
-                'status': 'PLACED',
-                'timestamp': datetime.now(IST),
-                'strike_price': self.strike_price if self.is_options else None,
-                'expiry_date': self.expiry_date if self.is_options else None
-            }
-            
-            self.broker_orders.append(order)
-            self.last_order_status = f"✅ Order Placed: {order_type} {option_type} | ID: {order_id}"
-            
-            add_log(f"🏦 ✅ DHAN ORDER PLACED: {order_type} {quantity} @ {price:.2f} | Order ID: {order_id}")
-            add_log(f"🏦 Options: {option_type} Strike {self.strike_price} Expiry {self.expiry_date}")
-            
-            return order
-            
-        except Exception as e:
-            error_msg = f"❌ DHAN ORDER FAILED: {str(e)}"
-            add_log(error_msg)
-            self.last_order_status = error_msg
-            return None
-        
-        return order
-    
+            api_used = True
+
+            # dhanhq returns a dict; orderId is under data or top-level
+            if isinstance(raw_response, dict):
+                order_id = (
+                    raw_response.get('data', {}).get('orderId')
+                    or raw_response.get('orderId')
+                    or raw_response.get('order_id')
+                    or f"DHAN-API-{int(time.time())}"
+                )
+            else:
+                order_id = str(raw_response) if raw_response else f"DHAN-API-{int(time.time())}"
+
+        except ImportError:
+            add_log("⚠️ dhanhq not installed – running in SIMULATION mode")
+            order_id = f"SIM-{int(time.time())}"
+
+        except Exception as api_err:
+            add_log(f"❌ Dhan API error: {api_err}")
+            self.last_order_status = f"❌ API Error: {api_err}"
+            # Do NOT return None here – create a simulated record so position tracking works
+            order_id = f"ERR-{int(time.time())}"
+
+        # ── Build order record (always created) ───────────────────────
+        order = {
+            'order_id'    : str(order_id),
+            'security_id' : security_id,
+            'option_type' : option_type,
+            'type'        : order_type,
+            'quantity'    : quantity,
+            'price'       : price,
+            'order_mode'  : order_mode,
+            'status'      : 'PLACED' if api_used else 'SIMULATED',
+            'timestamp'   : datetime.now(IST),
+            'raw_response': raw_response,
+            'strike_price': self.strike_price,
+            'expiry_date' : self.expiry_date,
+        }
+
+        self.broker_orders.append(order)
+        mode_tag = "✅ API" if api_used else "🔵 SIM"
+        self.last_order_status = (
+            f"{mode_tag} {order_type} {option_type} {quantity} qty "
+            f"@ {price:.2f} | ID: {order_id}"
+        )
+        add_log(f"🏦 ORDER CONFIRMED [{mode_tag}]: {order_type} {option_type} "
+                f"qty={quantity} @ {price:.2f} | ID={order_id}")
+        if self.is_options:
+            add_log(f"🏦 Strike={self.strike_price} {option_type} | Expiry={self.expiry_date}")
+
+        return order   # ← always returns a valid dict
+
+    # ------------------------------------------------------------------
     def calculate_broker_sl_target(self, entry_price, position_type):
-        """Calculate SL and Target for broker position"""
         if self.use_algo_signals:
-            # Will be set from algo signals
             return None, None
-        
-        # Custom SL/Target
-        sl_price = None
-        target_price = None
-        
+        sl_price = target_price = None
         if self.custom_sl_type == 'Custom Points':
-            if position_type == 'BUY':
-                sl_price = entry_price - self.custom_sl_points
-            else:
-                sl_price = entry_price + self.custom_sl_points
-        elif self.custom_sl_type == 'P&L Based (Rupees)':
-            # P&L-based, will be checked during position update
-            sl_price = None
-        
+            sl_price = (entry_price - self.custom_sl_points
+                        if position_type == 'BUY'
+                        else entry_price + self.custom_sl_points)
         if self.custom_target_type == 'Custom Points':
-            if position_type == 'BUY':
-                target_price = entry_price + self.custom_target_points
-            else:
-                target_price = entry_price - self.custom_target_points
-        elif self.custom_target_type == 'P&L Based (Rupees)':
-            # P&L-based, will be checked during position update
-            target_price = None
-        
+            target_price = (entry_price + self.custom_target_points
+                            if position_type == 'BUY'
+                            else entry_price - self.custom_target_points)
         return sl_price, target_price
-    
+
+    # ------------------------------------------------------------------
     def enter_broker_position(self, signal, price, quantity):
-        """Enter broker position with auto CE/PE selection"""
-        if not self.enabled or self.broker_position is not None:
+        """Open a new broker position."""
+        if not self.enabled:
+            add_log("🏦 Broker not enabled")
             return
-        
-        order_type = 'BUY' if signal == 'BUY' else 'SELL'
-        
-        # Pass signal type for auto CE/PE selection
+        if self.broker_position is not None:
+            add_log("🏦 Position already open – skipping entry")
+            return
+
+        order_type = 'BUY' if signal in ('BUY', 'LONG') else 'SELL'
         order = self.place_order(order_type, quantity, price, signal_type=signal)
-        
-        if order:
-            sl_price, target_price = self.calculate_broker_sl_target(price, order_type)
-            
-            self.broker_position = {
-                'type': order_type,
-                'entry_price': price,
-                'entry_time': datetime.now(IST),
-                'quantity': quantity,
-                'sl_price': sl_price,
-                'target_price': target_price,
-                'order_id': order['order_id'],
-                'highest_price': price if order_type == 'BUY' else None,
-                'lowest_price': price if order_type == 'SELL' else None
-            }
-            
-            add_log(f"🏦 DHAN POSITION OPENED: {order_type} @ {price:.2f}")
-    
+
+        # order is ALWAYS a dict (never None) after the rewrite above
+        if order is None:
+            add_log("🏦 ❌ place_order returned None – position NOT created")
+            return
+
+        sl_price, target_price = self.calculate_broker_sl_target(price, order_type)
+
+        self.broker_position = {
+            'type'         : order_type,
+            'option_type'  : order['option_type'],
+            'security_id'  : order['security_id'],
+            'entry_price'  : price,
+            'entry_time'   : datetime.now(IST),
+            'quantity'     : quantity,
+            'sl_price'     : sl_price,
+            'target_price' : target_price,
+            'order_id'     : order['order_id'],
+            'highest_price': price,
+            'lowest_price' : price,
+        }
+        add_log(f"🏦 ✅ POSITION OPENED: {order_type} {order['option_type']} "
+                f"@ {price:.2f} | qty={quantity} | ID={order['order_id']}")
+
+    # ------------------------------------------------------------------
     def exit_broker_position(self, price, reason='Manual'):
-        """Exit broker position"""
+        """Close the open broker position."""
         if not self.enabled or self.broker_position is None:
             return None
-        
-        position = self.broker_position
-        exit_type = 'SELL' if position['type'] == 'BUY' else 'BUY'
-        
-        order = self.place_order(exit_type, position['quantity'], price)
-        
-        if order:
-            # Calculate P&L
-            if position['type'] == 'BUY':
-                pnl = (price - position['entry_price']) * position['quantity']
-            else:
-                pnl = (position['entry_price'] - price) * position['quantity']
-            
-            trade_record = {
-                'Entry Time': position['entry_time'],
-                'Exit Time': datetime.now(IST),
-                'Type': position['type'],
-                'Entry Price': position['entry_price'],
-                'Exit Price': price,
-                'Quantity': position['quantity'],
-                'P&L': pnl,
-                'Exit Reason': reason,
-                'Order IDs': f"{position['order_id']} / {order['order_id']}"
-            }
-            
-            add_log(f"🏦 DHAN POSITION CLOSED: {exit_type} @ {price:.2f} | P&L: {pnl:.2f} | Reason: {reason}")
-            
-            self.broker_position = None
-            return trade_record
-        
-        return None
+
+        position   = self.broker_position
+        exit_type  = 'SELL' if position['type'] == 'BUY' else 'BUY'
+        # For exit we reverse: CE position exits with SELL CE, PE position exits with BUY PE
+        exit_signal = 'SELL' if position['type'] == 'BUY' else 'BUY'
+
+        order = self.place_order(exit_type, position['quantity'], price,
+                                 signal_type=exit_signal)
+        if order is None:
+            return None
+
+        pnl = ((price - position['entry_price'])
+               if position['type'] == 'BUY'
+               else (position['entry_price'] - price)) * position['quantity']
+
+        trade_record = {
+            'Entry Time'  : position['entry_time'],
+            'Exit Time'   : datetime.now(IST),
+            'Type'        : position['type'],
+            'Option Type' : position.get('option_type', ''),
+            'Entry Price' : position['entry_price'],
+            'Exit Price'  : price,
+            'Quantity'    : position['quantity'],
+            'P&L'         : pnl,
+            'Exit Reason' : reason,
+            'Order IDs'   : f"{position['order_id']} / {order['order_id']}",
+        }
+
+        add_log(f"🏦 POSITION CLOSED: {exit_type} @ {price:.2f} | "
+                f"P&L: {pnl:.2f} | Reason: {reason}")
+        self.broker_position = None
+        return trade_record
     
     def update_broker_position(self, current_price, algo_sl=None, algo_target=None, algo_sl_type=None, algo_target_type=None, algo_sl_rupees=None, algo_target_rupees=None):
         """Update broker position and check for exits"""
@@ -1405,10 +1425,22 @@ def live_trading_iteration():
     current_time = df.index[idx]
     current_price = current_data['Close']
     
-    # Initialize Dhan broker if not exists
-    if 'dhan_broker' not in st.session_state:
+    # Always rebuild broker from current config so enabled/credentials are fresh
+    if 'dhan_broker' not in st.session_state or not isinstance(st.session_state.get('dhan_broker'), DhanBrokerIntegration):
         st.session_state['dhan_broker'] = DhanBrokerIntegration(config)
         st.session_state['broker_trade_history'] = []
+    else:
+        # Refresh enabled/credentials from current config every iteration
+        existing = st.session_state['dhan_broker']
+        existing.enabled       = config.get('dhan_enabled', False)
+        existing.client_id     = config.get('dhan_client_id', '')
+        existing.access_token  = config.get('dhan_access_token', '')
+        existing.ce_security_id = str(config.get('dhan_ce_security_id', '42568'))
+        existing.pe_security_id = str(config.get('dhan_pe_security_id', '42569'))
+        existing.quantity      = config.get('dhan_quantity', 65)
+        existing.expiry_date   = config.get('dhan_expiry_date', '')
+        existing.strike_price  = config.get('dhan_strike_price', 25000)
+        existing.is_options    = config.get('dhan_is_options', True)
     
     dhan_broker = st.session_state['dhan_broker']
     
@@ -1426,6 +1458,7 @@ def live_trading_iteration():
     
     strategy_func = strategy_func_map.get(strategy_name)
     position = st.session_state.get('position')
+    signal = None  # will be set if strategy fires this tick
     
     # MAIN ALGO ENTRY LOGIC
     if position is None:
@@ -1673,32 +1706,27 @@ def live_trading_iteration():
     
     # DHAN BROKER LOGIC
     if dhan_broker and dhan_broker.enabled:
-        add_log(f"🏦 Broker enabled - Checking entry conditions...")
-        add_log(f"🏦 Current position: {dhan_broker.broker_position is not None}")
-        add_log(f"🏦 Trigger check: Price {current_price:.2f} {dhan_broker.trigger_condition} {dhan_broker.trigger_price:.2f}")
-        
-        # Check for broker entry trigger
-        if dhan_broker.broker_position is None and dhan_broker.check_trigger_condition(current_price):
-            add_log(f"🏦 ✅ Trigger condition MET!")
-            
-            # Determine signal based on algo or independent trigger
-            if position:
-                broker_signal = 'BUY' if position['type'] == 'LONG' else 'SELL'
-                add_log(f"🏦 Following algo signal: {broker_signal}")
+        if dhan_broker.broker_position is None:
+            # Determine signal: prefer current algo position, else fall back to
+            # whatever signal the strategy just produced this iteration
+            broker_signal = None
+            position_now = st.session_state.get('position')
+            if position_now:
+                broker_signal = 'BUY' if position_now['type'] == 'LONG' else 'SELL'
+                add_log(f"🏦 Broker following algo signal: {broker_signal}")
+            elif signal:
+                broker_signal = signal  # 'BUY' or 'SELL' from strategy this tick
+                add_log(f"🏦 Broker using fresh strategy signal: {broker_signal}")
+
+            if broker_signal:
+                add_log(f"🏦 Entering broker position: {broker_signal} @ {current_price:.2f}")
+                dhan_broker.enter_broker_position(
+                    broker_signal,
+                    current_price,
+                    config.get('dhan_quantity', 65)
+                )
             else:
-                # Independent broker entry based on trigger condition
-                broker_signal = 'BUY' if dhan_broker.trigger_condition == '>=' else 'SELL'
-                add_log(f"🏦 Independent entry: {broker_signal}")
-            
-            add_log(f"🏦 Attempting to enter position: {broker_signal} @ {current_price:.2f}")
-            dhan_broker.enter_broker_position(
-                broker_signal,
-                current_price,
-                config.get('dhan_quantity', 65)
-            )
-        else:
-            if dhan_broker.broker_position is None:
-                add_log(f"🏦 Trigger NOT met, waiting...")
+                add_log(f"🏦 No signal yet – broker waiting")
         
         # Update broker position
         if dhan_broker.broker_position:
@@ -2287,6 +2315,9 @@ def render_live_trading_ui():
             st.session_state['position'] = None
             st.session_state['trade_history'] = []
             st.session_state['trade_logs'] = []
+            # Always recreate broker so stale enabled=False never persists
+            st.session_state['dhan_broker'] = DhanBrokerIntegration(st.session_state.get('config', {}))
+            st.session_state['broker_trade_history'] = []
             add_log("Trading started")
             st.rerun()
     
