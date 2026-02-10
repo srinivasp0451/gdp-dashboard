@@ -1210,7 +1210,7 @@ def main():
             
             interval = st.selectbox(
                 "Candle Timeframe",
-                options=["5m", "15m"],
+                options=["1m","5m", "15m"],
                 index=0,
                 help="5-min = faster signals | 15-min = less noise"
             )
@@ -1219,14 +1219,14 @@ def main():
             if interval == "5m":
                 period = st.selectbox(
                     "Intraday Data Period",
-                    options=["1d", "5d", "1mo"],
+                    options=["1d", "5d", "7d","1mo"],
                     index=1,  # Default to 5d
                     help="5-min candles: 1d=~75 bars, 5d=~375 bars, 1mo=~1500 bars"
                 )
             else:  # 15m
                 period = st.selectbox(
                     "Intraday Data Period",
-                    options=["1d", "5d", "1mo"],
+                    options=["1d", "5d","7d", "1mo"],
                     index=2,  # Default to 1mo for 15-min
                     help="15-min candles: 1d=~25 bars, 5d=~125 bars, 1mo=~500 bars"
                 )
@@ -1249,7 +1249,7 @@ def main():
             if interval == "1m":
                 period = st.selectbox(
                     "Scalping Data Period",
-                    options=["1d", "5d", "7d"],
+                    options=["1d", "5d", "7d","1mo"],
                     index=1,  # Default to 5d
                     help="1-min candles: 1d=~375 bars, 5d=~1875 bars, 7d=~2625 bars"
                 )
