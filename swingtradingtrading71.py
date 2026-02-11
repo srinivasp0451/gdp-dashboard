@@ -147,6 +147,7 @@ class DhanBrokerIntegration:
                 product_type  = dhan.INTRA,
                 price         = price if order_mode == 'LIMIT' else 0,
             )
+            st.write(f"raw response {raw_response}")
             api_used = True
 
             # dhanhq returns a dict; orderId is under data or top-level
@@ -159,6 +160,7 @@ class DhanBrokerIntegration:
                 )
             else:
                 order_id = str(raw_response) if raw_response else f"DHAN-API-{int(time.time())}"
+            sr.write("after order placed")
 
         except ImportError:
             add_log("⚠️ dhanhq not installed – running in SIMULATION mode")
