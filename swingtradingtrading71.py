@@ -122,7 +122,6 @@ class DhanBrokerIntegration:
         Returns a dict on success, None on hard failure.
         """
         if not self.enabled:
-            st.write("going back")
             add_log("🏦 Broker disabled – skipping order")
             return None
 
@@ -148,7 +147,6 @@ class DhanBrokerIntegration:
                 product_type  = dhan.INTRA,
                 price         = price if order_mode == 'LIMIT' else 0,
             )
-            st.write("raw response", raw_response)
             api_used = True
 
             # dhanhq returns a dict; orderId is under data or top-level
@@ -1061,6 +1059,31 @@ def update_trailing_sl(current_price, current_sl, position_type, sl_type, config
                 if current_sl is None or new_sl < current_sl:
                     return new_sl
     
+    elif sl_type == 'Cost-to-Cost + N Points Trailing SL':
+        # Phase 1: wait until market moves K points in favour
+        # Phase 2: once triggered, trail as (current_price - N) for LONG
+        k = config.get('ctc_trigger_points', 3.0)
+        n = config.get('ctc_offset_points', 2.0)
+        entry_price = config.get('_ctc_entry_price')  # set when position opens
+
+        if entry_price is None:
+            return current_sl  # not yet initialised
+
+        if position_type == 'LONG':
+            triggered = current_price >= entry_price + k
+            if triggered:
+                # SL is entry+n OR current_price-n, whichever is higher
+                candidate = max(entry_price + n, current_price - n)
+                # Only ratchet up, never down
+                if current_sl is None or candidate > current_sl:
+                    return round(candidate, 2)
+        else:  # SHORT
+            triggered = current_price <= entry_price - k
+            if triggered:
+                candidate = min(entry_price - n, current_price + n)
+                if current_sl is None or candidate < current_sl:
+                    return round(candidate, 2)
+
     return current_sl
 
 def update_trailing_target(current_price, current_target, position_type, target_type, config):
@@ -1234,6 +1257,7 @@ def run_backtest(df, config):
             # Update Trailing SL (if applicable)
             # -----------------------------------------------------------------
             if 'Trailing' in sl_type and sl_type not in ['Trailing Profit (Rupees)', 'Trailing Loss (Rupees)']:
+                config['_ctc_entry_price'] = position['entry_price']  # needed for CTC trailing
                 new_sl = update_trailing_sl(price, sl_px, pos_type, sl_type, config, candle, df, idx)
                 if new_sl is not None:
                     position['sl_price'] = new_sl
@@ -1500,6 +1524,7 @@ def live_trading_iteration():
         target_price = position['target_price']
         
         if 'Trailing' in config['sl_type']:
+            config['_ctc_entry_price'] = position['entry_price']  # needed for CTC trailing
             new_sl = update_trailing_sl(current_price, sl_price, position_type, config['sl_type'],
                                         config, current_data, df, idx)
             if new_sl is not None and new_sl != sl_price:
@@ -2214,6 +2239,7 @@ def render_configuration_ui():
             "Trailing Profit (Rupees)",
             "Trailing Loss (Rupees)",
             "Trailing SL (Points)",
+            "Cost-to-Cost + N Points Trailing SL",
             "Trailing SL + Current Candle",
             "Trailing SL + Previous Candle",
             "Trailing SL + Current Swing",
@@ -2233,6 +2259,25 @@ def render_configuration_ui():
     
     if 'Points' in sl_type or sl_type == 'Custom Points':
         config['sl_points'] = st.number_input("SL Points", min_value=1, value=10)
+
+    if sl_type == 'Cost-to-Cost + N Points Trailing SL':
+        _col1, _col2 = st.columns(2)
+        with _col1:
+            config['ctc_trigger_points'] = st.number_input(
+                "Trigger (K points in favour)",
+                min_value=0.1, value=3.0, step=0.5,
+                help="Market must move this many points in your favour before SL activates"
+            )
+        with _col2:
+            config['ctc_offset_points'] = st.number_input(
+                "SL Offset above cost (N points)",
+                min_value=0.0, value=2.0, step=0.5,
+                help="Once triggered, SL = entry + N (LONG) or entry - N (SHORT)"
+            )
+        st.caption(
+            "Example: entry=50, K=3, N=2 → when price reaches 53, SL moves to 52 "
+            "and then trails normally (price-N) as price continues upward."
+        )
     
     if sl_type == 'P&L Based (Rupees)':
         config['sl_rupees'] = st.number_input(
@@ -2530,6 +2575,16 @@ def render_live_dashboard():
                 st.markdown(f"**Stop Loss:** {broker_sl_display}")
                 st.markdown(f"**Target:** {broker_target_display}")
                 st.markdown(f"**Order ID:** {broker_pos['order_id']}")
+                
+                # Raw API response for debugging
+                raw = None
+                if dhan_broker.broker_orders:
+                    raw = dhan_broker.broker_orders[-1].get('raw_response')
+                with st.expander('📡 Raw API Response (last order)', expanded=False):
+                    if raw is not None:
+                        st.json(raw) if isinstance(raw, (dict, list)) else st.code(str(raw))
+                    else:
+                        st.caption('No raw response yet (simulation mode or no order placed)')
                 
                 if broker_pos['highest_price'] and broker_pos['type'] == 'BUY':
                     st.markdown(f"**Highest Price:** {broker_pos['highest_price']:.2f}")
