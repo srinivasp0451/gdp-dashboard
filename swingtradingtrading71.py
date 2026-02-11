@@ -122,6 +122,7 @@ class DhanBrokerIntegration:
         Returns a dict on success, None on hard failure.
         """
         if not self.enabled:
+            st.write("going back")
             add_log("🏦 Broker disabled – skipping order")
             return None
 
@@ -147,6 +148,7 @@ class DhanBrokerIntegration:
                 product_type  = dhan.INTRA,
                 price         = price if order_mode == 'LIMIT' else 0,
             )
+            st.write("raw response", raw_response)
             api_used = True
 
             # dhanhq returns a dict; orderId is under data or top-level
