@@ -1748,26 +1748,21 @@ def live_trading_iteration():
     # DHAN BROKER LOGIC
     if dhan_broker and dhan_broker.enabled:
         if dhan_broker.broker_position is None:
-            # Determine signal: prefer current algo position, else fall back to
-            # whatever signal the strategy just produced this iteration
+            # Only enter broker position when algo JUST opened a position (signal fired THIS tick)
+            # NOT on every tick where position exists
             broker_signal = None
-            position_now = st.session_state.get('position')
-            if position_now:
-                broker_signal = 'BUY' if position_now['type'] == 'LONG' else 'SELL'
-                add_log(f"🏦 Broker following algo signal: {broker_signal}")
-            elif signal:
+            
+            # Check if strategy fired a NEW signal this tick
+            if signal:
                 broker_signal = signal  # 'BUY' or 'SELL' from strategy this tick
-                add_log(f"🏦 Broker using fresh strategy signal: {broker_signal}")
-
-            if broker_signal:
+                add_log(f"🏦 NEW signal detected: {broker_signal}")
                 add_log(f"🏦 Entering broker position: {broker_signal} @ {current_price:.2f}")
                 dhan_broker.enter_broker_position(
                     broker_signal,
                     current_price,
                     config.get('dhan_quantity', 65)
                 )
-            else:
-                add_log(f"🏦 No signal yet – broker waiting")
+            # else: no signal this tick, broker waits (no log spam)
         
         # Update broker position
         if dhan_broker.broker_position:
