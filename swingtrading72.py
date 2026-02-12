@@ -76,6 +76,7 @@ class DhanBrokerIntegration:
         self.strike_price = config.get('dhan_strike_price', 25000)
         self.expiry_date  = config.get('dhan_expiry_date', '')
         self.quantity     = config.get('dhan_quantity', 65)
+        self.asset        = config.get('asset', 'NIFTY 50')  # For exchange mapping
 
         # Order trigger
         self.trigger_condition = config.get('dhan_trigger_condition', '>=')
@@ -138,9 +139,17 @@ class DhanBrokerIntegration:
             from dhanhq import dhanhq as DhanHQ          # noqa: N813
             dhan = DhanHQ(self.client_id, self.access_token)
 
+            # Select exchange based on asset
+            if self.asset in ('NIFTY 50', 'BANKNIFTY', 'FINNIFTY', 'MIDCPNIFTY'):
+                exchange_seg = dhan.NSE_FNO
+            elif self.asset == 'SENSEX':
+                exchange_seg = dhan.BSE_FNO
+            else:
+                exchange_seg = dhan.NSE_FNO  # default
+
             raw_response = dhan.place_order(
                 security_id   = security_id,
-                exchange_segment = dhan.NSE_FNO,
+                exchange_segment = exchange_seg,
                 transaction_type = order_type,           # 'BUY' or 'SELL'
                 quantity      = quantity,
                 order_type    = order_mode,              # 'MARKET' or 'LIMIT'
@@ -224,7 +233,9 @@ class DhanBrokerIntegration:
             add_log("🏦 Position already open – skipping entry")
             return
 
-        order_type = 'BUY' if signal in ('BUY', 'LONG') else 'SELL'
+        # ALWAYS BUY to enter (you're a buyer opening a position)
+        # Signal determines CE vs PE, but transaction is always BUY
+        order_type = 'BUY'
         order = self.place_order(order_type, quantity, price, signal_type=signal)
 
         # order is ALWAYS a dict (never None) after the rewrite above
@@ -1469,6 +1480,7 @@ def live_trading_iteration():
         existing.expiry_date   = config.get('dhan_expiry_date', '')
         existing.strike_price  = config.get('dhan_strike_price', 25000)
         existing.is_options    = config.get('dhan_is_options', True)
+        existing.asset         = config.get('asset', 'NIFTY 50')
     
     dhan_broker = st.session_state['dhan_broker']
     
