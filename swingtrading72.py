@@ -959,7 +959,8 @@ def calculate_initial_sl(entry_price, position_type, sl_type, config, current_da
             return current_data['Swing_High']
     
     elif sl_type in ['Trailing SL (Points)', 'Trailing SL + Signal Based', 
-                     'Volatility-Adjusted Trailing SL', 'Break-even After 50% Target']:
+                     'Volatility-Adjusted Trailing SL', 'Break-even After 50% Target',
+                     'Cost-to-Cost + N Points Trailing SL']:
         points = config.get('sl_points', 10)
         if position_type == 'LONG':
             return entry_price - points
@@ -1071,49 +1072,55 @@ def update_trailing_sl(current_price, current_sl, position_type, sl_type, config
                     return new_sl
     
     elif sl_type == 'Cost-to-Cost + N Points Trailing SL':
-        # Two-phase CTC logic:
-        # Phase 1: Normal trailing until trigger
-        # Phase 2: Lock SL at entry+N until price reaches entry+initial_sl_points
-        # Phase 3: Continue trailing with reduced SL distance (initial_sl_points - N)
+        # Two-phase CTC logic
+        # LONG: Entry=50, K=3, N=2, InitialSL=10
+        #   Phase 1: Normal trailing (50→40, 51→41, 52→42)
+        #   Phase 2: Triggered at 53, lock SL=52 until price≥60
+        #   Phase 3: Price≥60, trail with distance=8 (10-2)
+        # SHORT: Mirror logic reversed
         
         k = config.get('ctc_trigger_points', 3.0)
         n = config.get('ctc_offset_points', 2.0)
         entry_price = config.get('_ctc_entry_price')
-        initial_sl_points = config.get('sl_points', 10)  # Original SL distance
+        initial_sl_points = config.get('sl_points', 10)
         
         if entry_price is None or current_sl is None:
             return current_sl
         
         if position_type == 'LONG':
-            # Check if triggered (moved K points in favour)
             triggered = current_price >= entry_price + k
             
             if triggered:
-                # Phase 2: Lock at entry+N until price reaches entry+initial_sl_points
                 breakout_price = entry_price + initial_sl_points
                 
                 if current_price < breakout_price:
-                    # Keep SL locked at max(entry+N, existing trailing SL)
+                    # Phase 2: Lock at entry+N
                     candidate = max(entry_price + n, current_sl)
                     return round(candidate, 2)
                 else:
-                    # Phase 3: Resume trailing with new distance (initial_sl_points - N)
+                    # Phase 3: Trail with reduced distance
                     new_trail_distance = initial_sl_points - n
                     candidate = max(current_sl, current_price - new_trail_distance)
                     if candidate > current_sl:
                         return round(candidate, 2)
-            # else: Phase 1 continues (normal trailing before trigger)
         
-        else:  # SHORT
+        else:  # SHORT - REVERSE LOGIC
+            # Entry=50, K=3, N=2, InitialSL=10
+            # Phase 1: 50→60, 49→59, 48→58
+            # Phase 2: Triggered at 47, lock SL=48 until price≤40
+            # Phase 3: Price≤40, trail with distance=8
+            
             triggered = current_price <= entry_price - k
             
             if triggered:
                 breakout_price = entry_price - initial_sl_points
                 
                 if current_price > breakout_price:
+                    # Phase 2: Lock at entry-N
                     candidate = min(entry_price - n, current_sl)
                     return round(candidate, 2)
                 else:
+                    # Phase 3: Trail with reduced distance
                     new_trail_distance = initial_sl_points - n
                     candidate = min(current_sl, current_price + new_trail_distance)
                     if candidate < current_sl:
@@ -1444,8 +1451,17 @@ def run_backtest(df, config):
         'trades_entered': trades_entered,
         'trades_completed': trades_exited,
         'skipped_candles': start_idx,
-        'position_still_open': position is not None
+        'position_still_open': position is not None,
+        'strategy_name': strategy_name,
+        'config_keys': list(config.keys())
     }
+    
+    # Display debug in sidebar if no trades
+    if len(trades) == 0:
+        st.sidebar.warning(f"⚠️ Backtest Debug: 0 trades generated")
+        st.sidebar.write(f"Strategy: {strategy_name}")
+        st.sidebar.write(f"Signals detected: {entry_signals}")
+        st.sidebar.write(f"Candles analyzed: {total_candles - start_idx}")
     
     return trades
 
