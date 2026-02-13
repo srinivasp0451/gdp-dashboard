@@ -1071,31 +1071,53 @@ def update_trailing_sl(current_price, current_sl, position_type, sl_type, config
                     return new_sl
     
     elif sl_type == 'Cost-to-Cost + N Points Trailing SL':
-        # Phase 1: wait until market moves K points in favour
-        # Phase 2: once triggered, trail as (current_price - N) for LONG
+        # Two-phase CTC logic:
+        # Phase 1: Normal trailing until trigger
+        # Phase 2: Lock SL at entry+N until price reaches entry+initial_sl_points
+        # Phase 3: Continue trailing with reduced SL distance (initial_sl_points - N)
+        
         k = config.get('ctc_trigger_points', 3.0)
         n = config.get('ctc_offset_points', 2.0)
-        entry_price = config.get('_ctc_entry_price')  # set when position opens
-
-        if entry_price is None:
-            return current_sl  # not yet initialised
-
+        entry_price = config.get('_ctc_entry_price')
+        initial_sl_points = config.get('sl_points', 10)  # Original SL distance
+        
+        if entry_price is None or current_sl is None:
+            return current_sl
+        
         if position_type == 'LONG':
+            # Check if triggered (moved K points in favour)
             triggered = current_price >= entry_price + k
+            
             if triggered:
-                # SL = max of: entry+n, current_price-n, existing trailing SL
-                candidate = max(entry_price + n, current_price - n, current_sl or 0)
-                # Only ratchet up, never down
-                if candidate > (current_sl or 0):
+                # Phase 2: Lock at entry+N until price reaches entry+initial_sl_points
+                breakout_price = entry_price + initial_sl_points
+                
+                if current_price < breakout_price:
+                    # Keep SL locked at max(entry+N, existing trailing SL)
+                    candidate = max(entry_price + n, current_sl)
                     return round(candidate, 2)
+                else:
+                    # Phase 3: Resume trailing with new distance (initial_sl_points - N)
+                    new_trail_distance = initial_sl_points - n
+                    candidate = max(current_sl, current_price - new_trail_distance)
+                    if candidate > current_sl:
+                        return round(candidate, 2)
+            # else: Phase 1 continues (normal trailing before trigger)
+        
         else:  # SHORT
             triggered = current_price <= entry_price - k
+            
             if triggered:
-                # SL = min of: entry-n, current_price+n, existing trailing SL
-                candidate = min(entry_price - n, current_price + n, current_sl or float('inf'))
-                # Only ratchet down (SHORT means lower is tighter), never up
-                if candidate < (current_sl or float('inf')):
+                breakout_price = entry_price - initial_sl_points
+                
+                if current_price > breakout_price:
+                    candidate = min(entry_price - n, current_sl)
                     return round(candidate, 2)
+                else:
+                    new_trail_distance = initial_sl_points - n
+                    candidate = min(current_sl, current_price + new_trail_distance)
+                    if candidate < current_sl:
+                        return round(candidate, 2)
 
     return current_sl
 
@@ -2367,14 +2389,19 @@ def render_live_trading_ui():
     
     with col1:
         if st.button("▶️ Start Trading", key="start_btn", use_container_width=True):
+            # Complete session reset for clean start
             st.session_state['trading_active'] = True
             st.session_state['position'] = None
             st.session_state['trade_history'] = []
             st.session_state['trade_logs'] = []
-            # Always recreate broker so stale enabled=False never persists
-            st.session_state['dhan_broker'] = DhanBrokerIntegration(st.session_state.get('config', {}))
+            st.session_state['current_data'] = None  # Clear stale data
+            
+            # Always recreate broker from current config
+            config = st.session_state.get('config', {})
+            st.session_state['dhan_broker'] = DhanBrokerIntegration(config)
             st.session_state['broker_trade_history'] = []
-            add_log("Trading started")
+            
+            add_log("🚀 Trading started - all sessions cleared")
             st.rerun()
     
     with col2:
@@ -2383,8 +2410,11 @@ def render_live_trading_ui():
                 position = st.session_state['position']
                 config = st.session_state['config']
                 
-                if st.session_state.get('current_data') is not None:
-                    df = st.session_state['current_data']
+                # Fetch fresh data for the CURRENT config asset (not stale data)
+                ticker = ASSET_MAPPING.get(config['asset'], config.get('custom_ticker', '^NSEI'))
+                df = fetch_data(ticker, config['interval'], config['period'], is_live_trading=True)
+                
+                if df is not None and not df.empty:
                     current_price = df.iloc[-1]['Close']
                     current_time = df.index[-1]
                     
@@ -2413,14 +2443,17 @@ def render_live_trading_ui():
             # Close broker position if exists
             dhan_broker = st.session_state.get('dhan_broker')
             if dhan_broker and dhan_broker.broker_position:
-                if st.session_state.get('current_data') is not None:
-                    df = st.session_state['current_data']
-                    current_price = df.iloc[-1]['Close']
-                    broker_trade = dhan_broker.exit_broker_position(current_price, 'Manual Close')
+                # Fetch fresh data for broker's asset
+                df_broker = fetch_data(ticker, config['interval'], config['period'], is_live_trading=True)
+                if df_broker is not None and not df_broker.empty:
+                    broker_price = df_broker.iloc[-1]['Close']
+                    broker_trade = dhan_broker.exit_broker_position(broker_price, 'Manual Close')
                     if broker_trade:
                         st.session_state['broker_trade_history'].append(broker_trade)
             
             st.session_state['trading_active'] = False
+            st.session_state['current_data'] = None  # Clear stale data on stop
+            add_log("⏹️ Trading stopped - session cleared")
             st.session_state['position'] = None
             add_log("Trading stopped")
             st.rerun()
@@ -2536,8 +2569,8 @@ def render_live_dashboard():
             st.markdown(f"**Entry Time:** {position['entry_time'].strftime('%Y-%m-%d %H:%M:%S')}")
             st.markdown(f"**Duration:** {str(duration).split('.')[0]}")
             
-            sl_display = f"{position['sl_price']:.2f}" if position['sl_price'] else "Signal-based"
-            target_display = f"{position['target_price']:.2f}" if position['target_price'] else "Signal-based"
+            sl_display = f"{position['sl_price']:.2f}" if position['sl_price'] else "Not Set"
+            target_display = f"{position['target_price']:.2f}" if position['target_price'] else "Not Set"
             
             st.markdown(f"**Stop Loss:** {sl_display}")
             st.markdown(f"**Target:** {target_display}")
