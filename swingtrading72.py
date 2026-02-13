@@ -1699,7 +1699,7 @@ def live_trading_iteration():
             target_hit = False
             if position_type == 'LONG' and current_price >= target_price:
                 target_hit = True
-            elif position_type == 'SELL' and current_price <= target_price:
+            elif position_type == 'SHORT' and current_price <= target_price:
                 target_hit = True
             
             if target_hit:
@@ -1729,7 +1729,7 @@ def live_trading_iteration():
         elif sl_price is not None:
             if position_type == 'LONG' and current_price <= sl_price:
                 sl_hit = True
-            elif position_type == 'SELL' and current_price >= sl_price:
+            elif position_type == 'SHORT' and current_price >= sl_price:
                 sl_hit = True
         
         # Check P&L-based Target
@@ -1742,7 +1742,7 @@ def live_trading_iteration():
         elif target_price is not None and 'Trailing' not in config['target_type']:
             if position_type == 'LONG' and current_price >= target_price:
                 target_hit = True
-            elif position_type == 'SELL' and current_price <= target_price:
+            elif position_type == 'SHORT' and current_price <= target_price:
                 target_hit = True
         
         if signal_exit or sl_hit or target_hit:
@@ -1781,7 +1781,11 @@ def live_trading_iteration():
             st.session_state['trade_history'].append(trade)
             add_log(f"EXIT: {exit_reason} @ {exit_price:.2f} | P&L: {pnl:.2f}")
             
+            # Clear position and session
             st.session_state['position'] = None
+            
+            # Force refresh to clear stale data
+            add_log("✅ Position closed, session cleared")
     
     # DHAN BROKER LOGIC
     if dhan_broker and dhan_broker.enabled:
@@ -2455,6 +2459,9 @@ def render_live_trading_ui():
                     
                     st.session_state['trade_history'].append(trade)
                     add_log(f"Manual Close @ {current_price:.2f} | P&L: {pnl:.2f}")
+                    
+                    # Clear position
+                    st.session_state['position'] = None
             
             # Close broker position if exists
             dhan_broker = st.session_state.get('dhan_broker')
