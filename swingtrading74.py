@@ -41,6 +41,7 @@ ASSET_MAPPING = {
     "CRUDE OIL": "CL=F",
     "SPY": "SPY",
     "QQQ": "QQQ",
+    "Custom Ticker": "CUSTOM",  # Placeholder for custom input
 }
 
 INTERVAL_MAPPING = {
@@ -346,7 +347,7 @@ class DhanBrokerIntegration:
 # DATA FETCHING
 # ================================
 
-def fetch_data(ticker_symbol, interval, period, is_live_trading=False):
+def fetch_data(ticker_symbol, interval, period, is_live_trading=False, custom_ticker=None):
     """
     Fetch historical/live data using yfinance
     
@@ -355,12 +356,17 @@ def fetch_data(ticker_symbol, interval, period, is_live_trading=False):
         interval: Time interval
         period: Historical period
         is_live_trading: If True, fetch minimal data for live trading
+        custom_ticker: Custom ticker symbol if using "Custom Ticker" option
         
     Returns:
         DataFrame with OHLCV data in IST timezone
     """
     try:
-        ticker = ASSET_MAPPING.get(ticker_symbol, ticker_symbol)
+        # Use custom ticker if provided
+        if ticker_symbol == "Custom Ticker" and custom_ticker:
+            ticker = custom_ticker
+        else:
+            ticker = ASSET_MAPPING.get(ticker_symbol, ticker_symbol)
         
         if is_live_trading:
             # For live trading, fetch smaller dataset
@@ -633,25 +639,27 @@ def check_simple_sell_strategy(df, idx, config, current_position):
     return 'SELL', df.iloc[idx]['Close']
 
 def check_price_crosses_threshold(df, idx, config, current_position):
-    """Price crosses threshold strategy"""
+    """Price crosses threshold strategy with direction option"""
     if current_position is not None:
         return None, None
         
     threshold = config.get('price_threshold', 25000)
     current_price = df.iloc[idx]['Close']
+    direction = config.get('price_cross_direction', 'LONG (Above Threshold)')
     
     if idx < 1:
         return None, None
         
     prev_price = df.iloc[idx - 1]['Close']
     
-    # Bullish cross above threshold
-    if prev_price <= threshold and current_price > threshold:
-        return 'BUY', current_price
-    
-    # Bearish cross below threshold
-    if prev_price >= threshold and current_price < threshold:
-        return 'SELL', current_price
+    if 'LONG' in direction:
+        # LONG: Enter when price crosses ABOVE threshold
+        if prev_price <= threshold and current_price > threshold:
+            return 'BUY', current_price
+    else:  # SHORT
+        # SHORT: Enter when price crosses BELOW threshold
+        if prev_price >= threshold and current_price < threshold:
+            return 'SELL', current_price
     
     return None, None
 
@@ -685,7 +693,7 @@ def check_rsi_adx_ema_combined(df, idx, config, current_position):
     return None, None
 
 def check_percentage_change(df, idx, config, current_position):
-    """Percentage change strategy"""
+    """Percentage change strategy with direction option"""
     if current_position is not None:
         return None, None
         
@@ -697,11 +705,16 @@ def check_percentage_change(df, idx, config, current_position):
     
     pct_change = ((current_price - prev_price) / prev_price) * 100
     threshold = config.get('pct_change_threshold', 2.0)
+    direction = config.get('pct_change_direction', 'LONG (Positive %)')
     
-    if pct_change >= threshold:
-        return 'BUY', current_price
-    elif pct_change <= -threshold:
-        return 'SELL', current_price
+    if 'LONG' in direction:
+        # LONG: Enter on positive % change
+        if pct_change >= threshold:
+            return 'BUY', current_price
+    else:  # SHORT
+        # SHORT: Enter on negative % change
+        if pct_change <= -threshold:
+            return 'SELL', current_price
     
     return None, None
 
@@ -1522,8 +1535,9 @@ def live_trading_iteration():
     ticker = config.get('asset', 'NIFTY 50')
     interval = INTERVAL_MAPPING.get(config.get('interval', '1 day'), '1d')
     period = PERIOD_MAPPING.get(config.get('period', '1 month'), '1mo')
+    custom_ticker = config.get('custom_ticker', None)
     
-    df = fetch_data(ticker, interval, period, is_live_trading=True)
+    df = fetch_data(ticker, interval, period, is_live_trading=True, custom_ticker=custom_ticker)
     
     if df is None or df.empty:
         add_log("❌ Failed to fetch data")
@@ -1742,9 +1756,13 @@ def render_config_ui():
     # Asset Selection
     config['asset'] = st.sidebar.selectbox("Asset", list(ASSET_MAPPING.keys()), index=0)
     
+    # Custom Ticker Input
+    if config['asset'] == 'Custom Ticker':
+        config['custom_ticker'] = st.sidebar.text_input("Enter Ticker Symbol", value="AAPL", help="e.g., AAPL, TSLA, MSFT")
+    
     # Timeframe
-    config['interval'] = st.sidebar.selectbox("Interval", list(INTERVAL_MAPPING.keys()), index=5)
-    config['period'] = st.sidebar.selectbox("Period", list(PERIOD_MAPPING.keys()), index=2)
+    config['interval'] = st.sidebar.selectbox("Interval", list(INTERVAL_MAPPING.keys()), index=0)  # Default to 1 minute
+    config['period'] = st.sidebar.selectbox("Period", list(PERIOD_MAPPING.keys()), index=0)  # Default to 1 day
     
     # Quantity
     config['quantity'] = st.sidebar.number_input("Quantity", min_value=1, value=1)
@@ -1773,9 +1791,19 @@ def render_config_ui():
     
     elif config['strategy'] == 'Price Crosses Threshold':
         config['price_threshold'] = st.sidebar.number_input("Price Threshold", min_value=0.0, value=25000.0)
+        config['price_cross_direction'] = st.sidebar.selectbox(
+            "Direction", 
+            ["LONG (Above Threshold)", "SHORT (Below Threshold)"],
+            help="LONG: Enter when price crosses above threshold\nSHORT: Enter when price crosses below threshold"
+        )
     
     elif config['strategy'] == 'Percentage Change':
         config['pct_change_threshold'] = st.sidebar.number_input("% Change Threshold", min_value=0.1, value=2.0, step=0.1)
+        config['pct_change_direction'] = st.sidebar.selectbox(
+            "Direction",
+            ["LONG (Positive %)", "SHORT (Negative %)"],
+            help="LONG: Enter on positive % change\nSHORT: Enter on negative % change"
+        )
     
     # Stop Loss Configuration
     st.sidebar.subheader("🛡️ Stop Loss")
@@ -1844,8 +1872,9 @@ def render_backtest_ui(config):
             ticker = config.get('asset', 'NIFTY 50')
             interval = INTERVAL_MAPPING.get(config.get('interval', '1 day'), '1d')
             period = PERIOD_MAPPING.get(config.get('period', '1 month'), '1mo')
+            custom_ticker = config.get('custom_ticker', None)
             
-            df = fetch_data(ticker, interval, period)
+            df = fetch_data(ticker, interval, period, custom_ticker=custom_ticker)
             
             if df is not None:
                 # Calculate indicators
@@ -1965,8 +1994,9 @@ def render_live_trading_ui(config):
                 ticker = config.get('asset', 'NIFTY 50')
                 interval = INTERVAL_MAPPING.get(config.get('interval', '1 day'), '1d')
                 period = PERIOD_MAPPING.get(config.get('period', '1 month'), '1mo')
+                custom_ticker = config.get('custom_ticker', None)
                 
-                df = fetch_data(ticker, interval, period, is_live_trading=True)
+                df = fetch_data(ticker, interval, period, is_live_trading=True, custom_ticker=custom_ticker)
                 if df is not None:
                     df = calculate_all_indicators(df, config)
                     current_price = df.iloc[-1]['Close']
@@ -2182,7 +2212,7 @@ def render_live_trading_ui(config):
         # Run iteration
         live_trading_iteration()
         
-        # Auto-refresh every 5 seconds
+        # Auto-refresh every 1.5 seconds
         time.sleep(1.5)
         st.rerun()
 
@@ -2404,10 +2434,20 @@ def main():
     )
     
     st.title("📈 Algorithmic Trading System")
-    st.markdown("---")
     
-    # Render configuration
+    # Render configuration first to get the selected ticker
     config = render_config_ui()
+    
+    # Display selected ticker prominently at the top
+    ticker_display = config.get('asset', 'NIFTY 50')
+    if ticker_display == 'Custom Ticker':
+        custom_ticker = config.get('custom_ticker', 'N/A')
+        st.info(f"🎯 **Selected Ticker:** {custom_ticker} (Custom)")
+    else:
+        ticker_symbol = ASSET_MAPPING.get(ticker_display, ticker_display)
+        st.info(f"🎯 **Selected Ticker:** {ticker_display} ({ticker_symbol})")
+    
+    st.markdown("---")
     
     # Main tabs
     tab1, tab2, tab3 = st.tabs(["📈 Backtest", "🔴 Live Trading", "📊 Trade History"])
