@@ -22,6 +22,7 @@ from datetime import datetime, timedelta
 import time
 import pytz
 import traceback
+import plotly.graph_objects as go
 
 # ================================
 # CONSTANTS & MAPPINGS
@@ -1587,8 +1588,13 @@ def live_trading_iteration():
             if config.get('dhan_enabled', False):
                 dhan_broker = st.session_state.get('dhan_broker')
                 if dhan_broker:
-                    broker_position = dhan_broker.enter_broker_position(signal, entry_price, config, add_log)
-                    st.session_state['broker_position'] = broker_position
+                    try:
+                        broker_position = dhan_broker.enter_broker_position(signal, entry_price, config, add_log)
+                        st.session_state['broker_position'] = broker_position
+                    except Exception as e:
+                        add_log(f"🏦 ⚠️ Broker order error: {e}")
+                else:
+                    add_log("🏦 ⚠️ Broker not initialized")
     
     else:
         # Update tracking
@@ -1655,14 +1661,38 @@ def live_trading_iteration():
             
             add_log(f"EXIT: {exit_reason} @ {exit_price:.2f} | P&L: ₹{pnl:.2f}")
             
+            # Save to trade history
+            trade_record = {
+                'entry_time': position['entry_time'],
+                'exit_time': datetime.now(pytz.timezone('Asia/Kolkata')),
+                'type': position['type'],
+                'entry_price': position['entry_price'],
+                'exit_price': exit_price,
+                'sl_price': position['sl_price'],
+                'target_price': position['target_price'],
+                'highest_price': position.get('highest_price', exit_price),
+                'lowest_price': position.get('lowest_price', exit_price),
+                'quantity': position['quantity'],
+                'pnl': pnl,
+                'exit_reason': exit_reason,
+                'price_range': position.get('highest_price', exit_price) - position.get('lowest_price', exit_price)
+            }
+            
+            if 'trade_history' not in st.session_state:
+                st.session_state['trade_history'] = []
+            st.session_state['trade_history'].append(trade_record)
+            
             # Exit broker position if exists
             if config.get('dhan_enabled', False):
                 broker_position = st.session_state.get('broker_position')
                 if broker_position:
                     dhan_broker = st.session_state.get('dhan_broker')
                     if dhan_broker:
-                        exit_info = dhan_broker.exit_broker_position(broker_position, exit_price, exit_reason, add_log)
-                        st.session_state['broker_exit'] = exit_info
+                        try:
+                            exit_info = dhan_broker.exit_broker_position(broker_position, exit_price, exit_reason, add_log)
+                            st.session_state['broker_exit'] = exit_info
+                        except Exception as e:
+                            add_log(f"🏦 ⚠️ Broker exit error: {e}")
             
             add_log("✅ Position closed, session cleared")
             
@@ -1686,8 +1716,8 @@ def render_config_ui():
     config['asset'] = st.sidebar.selectbox("Asset", list(ASSET_MAPPING.keys()), index=0)
     
     # Timeframe
-    config['interval'] = st.sidebar.selectbox("Interval", list(INTERVAL_MAPPING.keys()), index=0)
-    config['period'] = st.sidebar.selectbox("Period", list(PERIOD_MAPPING.keys()), index=0)
+    config['interval'] = st.sidebar.selectbox("Interval", list(INTERVAL_MAPPING.keys()), index=5)
+    config['period'] = st.sidebar.selectbox("Period", list(PERIOD_MAPPING.keys()), index=2)
     
     # Quantity
     config['quantity'] = st.sidebar.number_input("Quantity", min_value=1, value=1)
@@ -1760,7 +1790,7 @@ def render_config_ui():
     
     # Dhan Broker Configuration
     st.sidebar.subheader("🏦 Dhan Broker (Optional)")
-    config['dhan_enabled'] = st.sidebar.checkbox("Enable Dhan Broker", value=False)
+    config['dhan_enabled'] = st.sidebar.checkbox("Enable Dhan Broker", value=True)
     
     if config['dhan_enabled']:
         config['dhan_client_id'] = st.sidebar.text_input("Client ID", value="1104779876")
@@ -1769,8 +1799,8 @@ def render_config_ui():
         config['dhan_is_options'] = st.sidebar.checkbox("Is Options", value=True)
         
         if config['dhan_is_options']:
-            config['dhan_ce_security_id'] = st.sidebar.text_input("CE Security ID", value="42568")
-            config['dhan_pe_security_id'] = st.sidebar.text_input("PE Security ID", value="42569")
+            config['dhan_ce_security_id'] = st.sidebar.text_input("CE Security ID", value="48228")
+            config['dhan_pe_security_id'] = st.sidebar.text_input("PE Security ID", value="48229")
             config['dhan_strike_price'] = st.sidebar.number_input("Strike Price", min_value=0, value=25000)
             config['dhan_expiry_date'] = st.sidebar.date_input("Expiry Date", value=datetime.now().date())
             config['dhan_quantity'] = st.sidebar.number_input("Dhan Quantity", min_value=1, value=65)
@@ -1856,7 +1886,7 @@ def render_backtest_ui(config):
                 st.write("- Check if indicators are calculating correctly")
 
 def render_live_trading_ui(config):
-    """Render live trading interface"""
+    """Render live trading interface with comprehensive information"""
     st.header("🔴 Live Trading")
     
     # Control buttons
@@ -1869,6 +1899,10 @@ def render_live_trading_ui(config):
             st.session_state['position'] = None
             st.session_state['broker_position'] = None
             st.session_state['live_logs'] = []
+            
+            # Initialize trade history if not exists
+            if 'trade_history' not in st.session_state:
+                st.session_state['trade_history'] = []
             
             if 'current_data' in st.session_state:
                 del st.session_state['current_data']
@@ -1898,6 +1932,7 @@ def render_live_trading_ui(config):
                 
                 df = fetch_data(ticker, interval, period, is_live_trading=True)
                 if df is not None:
+                    df = calculate_all_indicators(df, config)
                     current_price = df.iloc[-1]['Close']
                     
                     # Calculate P&L
@@ -1907,6 +1942,27 @@ def render_live_trading_ui(config):
                         pnl = (position['entry_price'] - current_price) * position['quantity']
                     
                     add_log(f"EXIT: Manual Close @ {current_price:.2f} | P&L: ₹{pnl:.2f}")
+                    
+                    # Save to trade history
+                    trade_record = {
+                        'entry_time': position['entry_time'],
+                        'exit_time': datetime.now(pytz.timezone('Asia/Kolkata')),
+                        'type': position['type'],
+                        'entry_price': position['entry_price'],
+                        'exit_price': current_price,
+                        'sl_price': position['sl_price'],
+                        'target_price': position['target_price'],
+                        'highest_price': position.get('highest_price', current_price),
+                        'lowest_price': position.get('lowest_price', current_price),
+                        'quantity': position['quantity'],
+                        'pnl': pnl,
+                        'exit_reason': 'Manual Close',
+                        'price_range': position.get('highest_price', current_price) - position.get('lowest_price', current_price)
+                    }
+                    
+                    if 'trade_history' not in st.session_state:
+                        st.session_state['trade_history'] = []
+                    st.session_state['trade_history'].append(trade_record)
                     
                     # Exit broker position if exists
                     if config.get('dhan_enabled', False):
@@ -1934,43 +1990,123 @@ def render_live_trading_ui(config):
     else:
         st.info("⚪ Trading Inactive")
     
-    # Display current position
+    # Display strategy parameters
+    st.subheader("📋 Strategy Parameters")
+    
+    col1, col2, col3, col4 = st.columns(4)
+    with col1:
+        st.info(f"**Asset:** {config.get('asset', 'N/A')}")
+        st.info(f"**Interval:** {config.get('interval', 'N/A')}")
+    with col2:
+        st.info(f"**Strategy:** {config.get('strategy', 'N/A')}")
+        st.info(f"**Quantity:** {config.get('quantity', 'N/A')}")
+    with col3:
+        st.info(f"**SL Type:** {config.get('sl_type', 'N/A')}")
+        st.info(f"**SL Points:** {config.get('sl_points', 'N/A')}")
+    with col4:
+        st.info(f"**Target Type:** {config.get('target_type', 'N/A')}")
+        st.info(f"**Target Points:** {config.get('target_points', 'N/A')}")
+    
+    # Display EMA parameters if using EMA strategy
+    if config.get('strategy') == 'EMA Crossover':
+        st.subheader("📊 EMA Strategy Parameters")
+        col1, col2, col3, col4 = st.columns(4)
+        with col1:
+            st.info(f"**Fast EMA:** {config.get('ema_fast', 'N/A')}")
+        with col2:
+            st.info(f"**Slow EMA:** {config.get('ema_slow', 'N/A')}")
+        with col3:
+            st.info(f"**Min Angle:** {config.get('ema_min_angle', 'N/A')}")
+        with col4:
+            st.info(f"**Entry Filter:** {config.get('ema_entry_filter', 'N/A')}")
+    
+    # Display current indicators and prices
+    current_data = st.session_state.get('current_data')
+    if current_data is not None:
+        st.subheader("📈 Current Market Data")
+        
+        col1, col2, col3, col4, col5 = st.columns(5)
+        with col1:
+            st.metric("Current Price", f"₹{current_data['Close']:.2f}")
+        with col2:
+            if not pd.isna(current_data.get('EMA_Fast')):
+                st.metric("Fast EMA", f"₹{current_data['EMA_Fast']:.2f}")
+            else:
+                st.metric("Fast EMA", "N/A")
+        with col3:
+            if not pd.isna(current_data.get('EMA_Slow')):
+                st.metric("Slow EMA", f"₹{current_data['EMA_Slow']:.2f}")
+            else:
+                st.metric("Slow EMA", "N/A")
+        with col4:
+            if not pd.isna(current_data.get('EMA_Fast_Angle')):
+                st.metric("EMA Angle", f"{current_data['EMA_Fast_Angle']:.2f}°")
+            else:
+                st.metric("EMA Angle", "N/A")
+        with col5:
+            # Determine crossover type
+            if not pd.isna(current_data.get('EMA_Fast')) and not pd.isna(current_data.get('EMA_Slow')):
+                if current_data['EMA_Fast'] > current_data['EMA_Slow']:
+                    crossover = "Bullish ⬆️"
+                else:
+                    crossover = "Bearish ⬇️"
+                st.metric("Crossover", crossover)
+            else:
+                st.metric("Crossover", "N/A")
+    
+    # Display current position with all details
     st.subheader("📊 Current Position")
     
     position = st.session_state.get('position')
     
     if position:
-        col1, col2, col3, col4 = st.columns(4)
+        # Main position metrics
+        col1, col2, col3, col4, col5 = st.columns(5)
         
         with col1:
             st.metric("Type", position['type'])
         with col2:
             st.metric("Entry Price", f"₹{position['entry_price']:.2f}")
         with col3:
+            if current_data is not None:
+                current_price = current_data['Close']
+                st.metric("Current Price", f"₹{current_price:.2f}")
+            else:
+                st.metric("Current Price", "N/A")
+        with col4:
             sl_display = f"₹{position['sl_price']:.2f}" if position['sl_price'] is not None else "Not Set"
             st.metric("Stop Loss", sl_display)
-        with col4:
+        with col5:
             target_display = f"₹{position['target_price']:.2f}" if position['target_price'] is not None else "Not Set"
             st.metric("Target", target_display)
         
-        # Display current data if available
-        current_data = st.session_state.get('current_data')
-        if current_data is not None:
-            current_price = current_data['Close']
-            
-            # Calculate current P&L
-            if position['type'] == 'LONG':
-                current_pnl = (current_price - position['entry_price']) * position['quantity']
-            else:  # SHORT
-                current_pnl = (position['entry_price'] - current_price) * position['quantity']
-            
-            col1, col2, col3 = st.columns(3)
-            with col1:
-                st.metric("Current Price", f"₹{current_price:.2f}")
-            with col2:
-                st.metric("Current P&L", f"₹{current_pnl:.2f}", delta=f"{current_pnl:.2f}")
-            with col3:
-                st.metric("Quantity", position['quantity'])
+        # Additional position details
+        col1, col2, col3, col4, col5 = st.columns(5)
+        
+        with col1:
+            st.metric("Quantity", position['quantity'])
+        with col2:
+            if current_data is not None:
+                current_price = current_data['Close']
+                if position['type'] == 'LONG':
+                    current_pnl = (current_price - position['entry_price']) * position['quantity']
+                else:  # SHORT
+                    current_pnl = (position['entry_price'] - current_price) * position['quantity']
+                
+                pnl_color = "normal" if current_pnl >= 0 else "inverse"
+                st.metric("Current P&L", f"₹{current_pnl:.2f}", delta=f"₹{current_pnl:.2f}")
+            else:
+                st.metric("Current P&L", "N/A")
+        with col3:
+            st.metric("Highest Price", f"₹{position.get('highest_price', 0):.2f}")
+        with col4:
+            st.metric("Lowest Price", f"₹{position.get('lowest_price', 0):.2f}")
+        with col5:
+            price_range = position.get('highest_price', 0) - position.get('lowest_price', 0)
+            st.metric("Price Range", f"₹{price_range:.2f}")
+        
+        # Entry time
+        st.info(f"**Entry Time:** {position['entry_time'].strftime('%Y-%m-%d %H:%M:%S')}")
     else:
         st.info("No active position")
     
@@ -1980,12 +2116,14 @@ def render_live_trading_ui(config):
         
         broker_pos = st.session_state['broker_position']
         
-        col1, col2, col3 = st.columns(3)
+        col1, col2, col3, col4 = st.columns(4)
         with col1:
             st.metric("Order ID", broker_pos['order_id'])
         with col2:
             st.metric("Option Type", broker_pos['option_type'])
         with col3:
+            st.metric("Security ID", broker_pos['security_id'])
+        with col4:
             st.metric("Status", broker_pos['status'])
         
         # Display raw API response
@@ -2012,6 +2150,211 @@ def render_live_trading_ui(config):
         time.sleep(5)
         st.rerun()
 
+def render_trade_logs_ui():
+    """Render comprehensive trade logs and statistics"""
+    st.header("📊 Trade Logs & Statistics")
+    
+    # Get trade history
+    trade_history = st.session_state.get('trade_history', [])
+    
+    if not trade_history:
+        st.info("No trades recorded yet. Start live trading to see your trade history here.")
+        return
+    
+    # Convert to DataFrame
+    df_trades = pd.DataFrame(trade_history)
+    
+    # Calculate statistics
+    total_trades = len(df_trades)
+    profit_trades = len(df_trades[df_trades['pnl'] > 0])
+    loss_trades = len(df_trades[df_trades['pnl'] < 0])
+    breakeven_trades = len(df_trades[df_trades['pnl'] == 0])
+    
+    total_pnl = df_trades['pnl'].sum()
+    avg_pnl = df_trades['pnl'].mean()
+    
+    if profit_trades > 0:
+        avg_profit = df_trades[df_trades['pnl'] > 0]['pnl'].mean()
+    else:
+        avg_profit = 0
+    
+    if loss_trades > 0:
+        avg_loss = df_trades[df_trades['pnl'] < 0]['pnl'].mean()
+    else:
+        avg_loss = 0
+    
+    accuracy = (profit_trades / total_trades * 100) if total_trades > 0 else 0
+    
+    # Display statistics
+    st.subheader("📈 Overall Statistics")
+    
+    col1, col2, col3, col4, col5 = st.columns(5)
+    
+    with col1:
+        st.metric("Total Trades", total_trades)
+    with col2:
+        st.metric("Profit Trades", profit_trades, delta=f"{profit_trades}")
+    with col3:
+        st.metric("Loss Trades", loss_trades, delta=f"-{loss_trades}")
+    with col4:
+        st.metric("Accuracy", f"{accuracy:.2f}%")
+    with col5:
+        st.metric("Total P&L", f"₹{total_pnl:.2f}", delta=f"₹{total_pnl:.2f}")
+    
+    col1, col2, col3, col4 = st.columns(4)
+    
+    with col1:
+        st.metric("Avg P&L", f"₹{avg_pnl:.2f}")
+    with col2:
+        st.metric("Avg Profit", f"₹{avg_profit:.2f}")
+    with col3:
+        st.metric("Avg Loss", f"₹{avg_loss:.2f}")
+    with col4:
+        if profit_trades > 0 and loss_trades > 0:
+            profit_factor = abs(avg_profit / avg_loss)
+            st.metric("Profit Factor", f"{profit_factor:.2f}")
+        else:
+            st.metric("Profit Factor", "N/A")
+    
+    # Display trade history table
+    st.subheader("📋 Detailed Trade History")
+    
+    # Format the dataframe for display
+    display_df = df_trades.copy()
+    
+    # Format datetime columns
+    if 'entry_time' in display_df.columns:
+        display_df['entry_time'] = pd.to_datetime(display_df['entry_time']).dt.strftime('%Y-%m-%d %H:%M:%S')
+    if 'exit_time' in display_df.columns:
+        display_df['exit_time'] = pd.to_datetime(display_df['exit_time']).dt.strftime('%Y-%m-%d %H:%M:%S')
+    
+    # Format numeric columns
+    numeric_cols = ['entry_price', 'exit_price', 'sl_price', 'target_price', 
+                    'highest_price', 'lowest_price', 'pnl', 'price_range']
+    for col in numeric_cols:
+        if col in display_df.columns:
+            display_df[col] = display_df[col].apply(lambda x: f"₹{x:.2f}" if pd.notna(x) else "N/A")
+    
+    # Reorder columns for better readability
+    column_order = ['entry_time', 'exit_time', 'type', 'entry_price', 'exit_price', 
+                    'sl_price', 'target_price', 'highest_price', 'lowest_price', 
+                    'price_range', 'quantity', 'pnl', 'exit_reason']
+    
+    # Only include columns that exist
+    column_order = [col for col in column_order if col in display_df.columns]
+    display_df = display_df[column_order]
+    
+    # Rename columns for display
+    display_df = display_df.rename(columns={
+        'entry_time': 'Entry Time',
+        'exit_time': 'Exit Time',
+        'type': 'Type',
+        'entry_price': 'Entry Price',
+        'exit_price': 'Exit Price',
+        'sl_price': 'Stop Loss',
+        'target_price': 'Target',
+        'highest_price': 'Highest Price',
+        'lowest_price': 'Lowest Price',
+        'price_range': 'Price Range',
+        'quantity': 'Quantity',
+        'pnl': 'P&L',
+        'exit_reason': 'Exit Reason'
+    })
+    
+    # Display table
+    st.dataframe(display_df, use_container_width=True, height=400)
+    
+    # Add download button
+    csv = display_df.to_csv(index=False)
+    st.download_button(
+        label="📥 Download Trade History (CSV)",
+        data=csv,
+        file_name=f"trade_history_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+        mime="text/csv"
+    )
+    
+    # Display P&L chart
+    st.subheader("📊 P&L Chart")
+    
+    # Calculate cumulative P&L
+    df_trades_chart = df_trades.copy()
+    df_trades_chart['cumulative_pnl'] = df_trades_chart['pnl'].cumsum()
+    df_trades_chart['trade_number'] = range(1, len(df_trades_chart) + 1)
+    
+    # Create chart data
+    import plotly.graph_objects as go
+    
+    fig = go.Figure()
+    
+    # Add cumulative P&L line
+    fig.add_trace(go.Scatter(
+        x=df_trades_chart['trade_number'],
+        y=df_trades_chart['cumulative_pnl'],
+        mode='lines+markers',
+        name='Cumulative P&L',
+        line=dict(color='blue', width=2),
+        marker=dict(size=6)
+    ))
+    
+    # Add individual trade P&L as bars
+    colors = ['green' if pnl > 0 else 'red' for pnl in df_trades_chart['pnl']]
+    fig.add_trace(go.Bar(
+        x=df_trades_chart['trade_number'],
+        y=df_trades_chart['pnl'],
+        name='Trade P&L',
+        marker=dict(color=colors),
+        opacity=0.6
+    ))
+    
+    fig.update_layout(
+        title='Trade P&L Analysis',
+        xaxis_title='Trade Number',
+        yaxis_title='P&L (₹)',
+        hovermode='x unified',
+        height=400
+    )
+    
+    st.plotly_chart(fig, use_container_width=True)
+    
+    # Trade type distribution
+    st.subheader("📊 Trade Type Distribution")
+    
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        # Count by type
+        type_counts = df_trades['type'].value_counts()
+        
+        fig_type = go.Figure(data=[go.Pie(
+            labels=type_counts.index,
+            values=type_counts.values,
+            hole=0.4
+        )])
+        
+        fig_type.update_layout(
+            title='Long vs Short Trades',
+            height=300
+        )
+        
+        st.plotly_chart(fig_type, use_container_width=True)
+    
+    with col2:
+        # Count by exit reason
+        reason_counts = df_trades['exit_reason'].value_counts()
+        
+        fig_reason = go.Figure(data=[go.Pie(
+            labels=reason_counts.index,
+            values=reason_counts.values,
+            hole=0.4
+        )])
+        
+        fig_reason.update_layout(
+            title='Exit Reason Distribution',
+            height=300
+        )
+        
+        st.plotly_chart(fig_reason, use_container_width=True)
+
 # ================================
 # MAIN APP
 # ================================
@@ -2031,13 +2374,16 @@ def main():
     config = render_config_ui()
     
     # Main tabs
-    tab1, tab2 = st.tabs(["📈 Backtest", "🔴 Live Trading"])
+    tab1, tab2, tab3 = st.tabs(["📈 Backtest", "🔴 Live Trading", "📊 Trade Logs"])
     
     with tab1:
         render_backtest_ui(config)
     
     with tab2:
         render_live_trading_ui(config)
+    
+    with tab3:
+        render_trade_logs_ui()
 
 if __name__ == "__main__":
     main()
