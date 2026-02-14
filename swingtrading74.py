@@ -515,6 +515,10 @@ def calculate_all_indicators(df, config):
     df['EMA_Fast'] = df['Close'].ewm(span=ema_fast, adjust=False).mean()
     df['EMA_Slow'] = df['Close'].ewm(span=ema_slow, adjust=False).mean()
     
+    # SMA for custom strategy
+    df['SMA_20'] = df['Close'].rolling(window=20).mean()
+    df['SMA_50'] = df['Close'].rolling(window=50).mean()
+    
     # EMA Angle
     df['EMA_Fast_Angle'] = calculate_ema_angle(df['EMA_Fast'])
     df['EMA_Slow_Angle'] = calculate_ema_angle(df['EMA_Slow'])
@@ -528,6 +532,25 @@ def calculate_all_indicators(df, config):
     
     # ATR
     df['ATR'] = calculate_atr(df, 14)
+    
+    # Bollinger Bands
+    bb_period = config.get('custom_bb_period', 20)
+    bb_std = config.get('custom_bb_std', 2.0)
+    df['BB_Middle'] = df['Close'].rolling(window=bb_period).mean()
+    bb_std_dev = df['Close'].rolling(window=bb_period).std()
+    df['BB_Upper'] = df['BB_Middle'] + (bb_std_dev * bb_std)
+    df['BB_Lower'] = df['BB_Middle'] - (bb_std_dev * bb_std)
+    
+    # MACD
+    exp1 = df['Close'].ewm(span=12, adjust=False).mean()
+    exp2 = df['Close'].ewm(span=26, adjust=False).mean()
+    df['MACD'] = exp1 - exp2
+    df['MACD_Signal'] = df['MACD'].ewm(span=9, adjust=False).mean()
+    df['MACD_Hist'] = df['MACD'] - df['MACD_Signal']
+    
+    # Volume MA (if volume exists)
+    if 'Volume' in df.columns:
+        df['Volume_MA'] = df['Volume'].rolling(window=20).mean()
     
     # Swing Highs and Lows
     df['Swing_High'] = df['High'].rolling(window=5, center=True).max()
@@ -639,26 +662,45 @@ def check_simple_sell_strategy(df, idx, config, current_position):
     return 'SELL', df.iloc[idx]['Close']
 
 def check_price_crosses_threshold(df, idx, config, current_position):
-    """Price crosses threshold strategy with direction option"""
+    """
+    Price crosses threshold strategy with full flexibility
+    
+    Combinations:
+    - Above Threshold → LONG
+    - Above Threshold → SHORT
+    - Below Threshold → LONG
+    - Below Threshold → SHORT
+    """
     if current_position is not None:
         return None, None
         
     threshold = config.get('price_threshold', 25000)
     current_price = df.iloc[idx]['Close']
-    direction = config.get('price_cross_direction', 'LONG (Above Threshold)')
+    cross_type = config.get('price_cross_type', 'Above Threshold')
+    position_type = config.get('price_cross_position', 'LONG')
     
     if idx < 1:
         return None, None
         
     prev_price = df.iloc[idx - 1]['Close']
     
-    if 'LONG' in direction:
-        # LONG: Enter when price crosses ABOVE threshold
+    # Determine if cross occurred
+    cross_occurred = False
+    
+    if cross_type == 'Above Threshold':
+        # Check if price crossed above threshold
         if prev_price <= threshold and current_price > threshold:
-            return 'BUY', current_price
-    else:  # SHORT
-        # SHORT: Enter when price crosses BELOW threshold
+            cross_occurred = True
+    else:  # 'Below Threshold'
+        # Check if price crossed below threshold
         if prev_price >= threshold and current_price < threshold:
+            cross_occurred = True
+    
+    # If cross occurred, return signal based on position type
+    if cross_occurred:
+        if position_type == 'LONG':
+            return 'BUY', current_price
+        else:  # SHORT
             return 'SELL', current_price
     
     return None, None
@@ -693,7 +735,15 @@ def check_rsi_adx_ema_combined(df, idx, config, current_position):
     return None, None
 
 def check_percentage_change(df, idx, config, current_position):
-    """Percentage change strategy with direction option"""
+    """
+    Percentage change strategy with full flexibility
+    
+    Combinations:
+    - Positive % → LONG
+    - Positive % → SHORT
+    - Negative % → LONG
+    - Negative % → SHORT
+    """
     if current_position is not None:
         return None, None
         
@@ -705,15 +755,26 @@ def check_percentage_change(df, idx, config, current_position):
     
     pct_change = ((current_price - prev_price) / prev_price) * 100
     threshold = config.get('pct_change_threshold', 2.0)
-    direction = config.get('pct_change_direction', 'LONG (Positive %)')
+    change_type = config.get('pct_change_type', 'Positive % (Price Up)')
+    position_type = config.get('pct_change_position', 'LONG')
     
-    if 'LONG' in direction:
-        # LONG: Enter on positive % change
+    # Determine if condition met
+    condition_met = False
+    
+    if 'Positive' in change_type:
+        # Check for positive % change
         if pct_change >= threshold:
-            return 'BUY', current_price
-    else:  # SHORT
-        # SHORT: Enter on negative % change
+            condition_met = True
+    else:  # Negative
+        # Check for negative % change
         if pct_change <= -threshold:
+            condition_met = True
+    
+    # If condition met, return signal based on position type
+    if condition_met:
+        if position_type == 'LONG':
+            return 'BUY', current_price
+        else:  # SHORT
             return 'SELL', current_price
     
     return None, None
@@ -740,8 +801,280 @@ def check_ai_price_action(df, idx, config, current_position):
     return None, None
 
 def check_custom_strategy(df, idx, config, current_position):
-    """Custom strategy placeholder - can be customized by user"""
-    # User can implement their own logic here
+    """
+    Custom strategy with multiple configurable options
+    
+    Types:
+    1. Price Crosses Indicator (EMA, SMA, BB)
+    2. Price Pullback from Indicator
+    3. Indicator Crosses Level (RSI, MACD, Volume)
+    4. Indicator Crossover (EMA/EMA, MACD/Signal, Price/MA)
+    """
+    if current_position is not None:
+        return None, None
+    
+    if idx < 1:
+        return None, None
+    
+    strategy_type = config.get('custom_strategy_type', 'Price Crosses Indicator')
+    current = df.iloc[idx]
+    previous = df.iloc[idx - 1]
+    current_price = current['Close']
+    position_type = config.get('custom_position_type', 'LONG')
+    
+    signal_triggered = False
+    
+    # ==========================================
+    # 1. PRICE CROSSES INDICATOR
+    # ==========================================
+    if strategy_type == 'Price Crosses Indicator':
+        indicator_name = config.get('custom_indicator', 'EMA')
+        cross_type = config.get('custom_cross_type', 'Above Indicator')
+        
+        # Get indicator value
+        if indicator_name == 'EMA':
+            period = config.get('custom_indicator_period', 20)
+            indicator_col = f'EMA_{period}'
+            if indicator_col not in df.columns:
+                df[indicator_col] = df['Close'].ewm(span=period, adjust=False).mean()
+            indicator_value = current[indicator_col]
+            prev_indicator = previous[indicator_col]
+        
+        elif indicator_name == 'SMA':
+            period = config.get('custom_indicator_period', 20)
+            indicator_col = f'SMA_{period}'
+            if indicator_col not in df.columns:
+                df[indicator_col] = df['Close'].rolling(window=period).mean()
+            indicator_value = current[indicator_col]
+            prev_indicator = previous[indicator_col]
+        
+        elif indicator_name == 'BB Upper':
+            indicator_value = current['BB_Upper']
+            prev_indicator = previous['BB_Upper']
+        
+        elif indicator_name == 'BB Lower':
+            indicator_value = current['BB_Lower']
+            prev_indicator = previous['BB_Lower']
+        
+        elif indicator_name == 'BB Middle':
+            indicator_value = current['BB_Middle']
+            prev_indicator = previous['BB_Middle']
+        
+        else:
+            return None, None
+        
+        # Check if indicator values are valid
+        if pd.isna(indicator_value) or pd.isna(prev_indicator):
+            return None, None
+        
+        # Check cross
+        prev_price = previous['Close']
+        
+        if cross_type == 'Above Indicator':
+            # Price crosses above indicator
+            if prev_price <= prev_indicator and current_price > indicator_value:
+                signal_triggered = True
+        else:  # 'Below Indicator'
+            # Price crosses below indicator
+            if prev_price >= prev_indicator and current_price < indicator_value:
+                signal_triggered = True
+    
+    # ==========================================
+    # 2. PRICE PULLBACK FROM INDICATOR
+    # ==========================================
+    elif strategy_type == 'Price Pullback from Indicator':
+        indicator_name = config.get('custom_indicator', 'EMA')
+        pullback_points = config.get('custom_pullback_points', 10)
+        
+        # Get indicator value
+        if indicator_name == 'EMA':
+            period = config.get('custom_indicator_period', 20)
+            indicator_col = f'EMA_{period}'
+            if indicator_col not in df.columns:
+                df[indicator_col] = df['Close'].ewm(span=period, adjust=False).mean()
+            indicator_value = current[indicator_col]
+        
+        elif indicator_name == 'SMA':
+            period = config.get('custom_indicator_period', 20)
+            indicator_col = f'SMA_{period}'
+            if indicator_col not in df.columns:
+                df[indicator_col] = df['Close'].rolling(window=period).mean()
+            indicator_value = current[indicator_col]
+        
+        elif indicator_name == 'BB Upper':
+            indicator_value = current['BB_Upper']
+        
+        elif indicator_name == 'BB Lower':
+            indicator_value = current['BB_Lower']
+        
+        else:
+            return None, None
+        
+        if pd.isna(indicator_value):
+            return None, None
+        
+        # Check if price pulled back to within N points of indicator
+        distance = abs(current_price - indicator_value)
+        
+        if distance <= pullback_points:
+            signal_triggered = True
+    
+    # ==========================================
+    # 3. INDICATOR CROSSES LEVEL
+    # ==========================================
+    elif strategy_type == 'Indicator Crosses Level':
+        indicator_name = config.get('custom_indicator', 'RSI')
+        cross_type = config.get('custom_cross_type', 'Above Level')
+        
+        if indicator_name == 'RSI':
+            level = config.get('custom_level', 50.0)
+            current_rsi = current['RSI']
+            prev_rsi = previous['RSI']
+            
+            if pd.isna(current_rsi) or pd.isna(prev_rsi):
+                return None, None
+            
+            if cross_type == 'Above Level':
+                # RSI crosses above level
+                if prev_rsi <= level and current_rsi > level:
+                    signal_triggered = True
+            else:  # 'Below Level'
+                # RSI crosses below level
+                if prev_rsi >= level and current_rsi < level:
+                    signal_triggered = True
+        
+        elif indicator_name == 'MACD':
+            level = config.get('custom_level', 0.0)
+            current_macd = current['MACD']
+            prev_macd = previous['MACD']
+            
+            if pd.isna(current_macd) or pd.isna(prev_macd):
+                return None, None
+            
+            if cross_type == 'Above Level':
+                # MACD crosses above level
+                if prev_macd <= level and current_macd > level:
+                    signal_triggered = True
+            else:  # 'Below Level'
+                # MACD crosses below level
+                if prev_macd >= level and current_macd < level:
+                    signal_triggered = True
+        
+        elif indicator_name == 'Volume':
+            if 'Volume' not in current or pd.isna(current.get('Volume')):
+                return None, None
+            
+            volume_ma_period = config.get('custom_volume_ma_period', 20)
+            volume_multiplier = config.get('custom_volume_multiplier', 1.5)
+            
+            if 'Volume_MA' not in df.columns or pd.isna(current.get('Volume_MA')):
+                return None, None
+            
+            current_volume = current['Volume']
+            volume_ma = current['Volume_MA']
+            threshold_volume = volume_ma * volume_multiplier
+            
+            prev_volume = previous.get('Volume', 0)
+            
+            if cross_type == 'Above Level':
+                # Volume crosses above threshold
+                if prev_volume <= threshold_volume and current_volume > threshold_volume:
+                    signal_triggered = True
+            else:  # 'Below Level'
+                # Volume crosses below threshold
+                if prev_volume >= threshold_volume and current_volume < threshold_volume:
+                    signal_triggered = True
+    
+    # ==========================================
+    # 4. INDICATOR CROSSOVER
+    # ==========================================
+    elif strategy_type == 'Indicator Crossover':
+        crossover_type = config.get('custom_crossover_type', 'Fast EMA crosses Slow EMA')
+        cross_type = config.get('custom_cross_type', 'Bullish Crossover (Fast > Slow)')
+        
+        if crossover_type == 'Fast EMA crosses Slow EMA':
+            fast_period = config.get('custom_fast_ema', 9)
+            slow_period = config.get('custom_slow_ema', 21)
+            
+            fast_col = f'EMA_{fast_period}'
+            slow_col = f'EMA_{slow_period}'
+            
+            if fast_col not in df.columns:
+                df[fast_col] = df['Close'].ewm(span=fast_period, adjust=False).mean()
+            if slow_col not in df.columns:
+                df[slow_col] = df['Close'].ewm(span=slow_period, adjust=False).mean()
+            
+            current_fast = current[fast_col]
+            current_slow = current[slow_col]
+            prev_fast = previous[fast_col]
+            prev_slow = previous[slow_col]
+            
+            if pd.isna(current_fast) or pd.isna(current_slow):
+                return None, None
+            
+            if 'Bullish' in cross_type:
+                # Fast crosses above slow
+                if prev_fast <= prev_slow and current_fast > current_slow:
+                    signal_triggered = True
+            else:  # Bearish
+                # Fast crosses below slow
+                if prev_fast >= prev_slow and current_fast < current_slow:
+                    signal_triggered = True
+        
+        elif crossover_type == 'MACD crosses Signal':
+            current_macd = current['MACD']
+            current_signal = current['MACD_Signal']
+            prev_macd = previous['MACD']
+            prev_signal = previous['MACD_Signal']
+            
+            if pd.isna(current_macd) or pd.isna(current_signal):
+                return None, None
+            
+            if 'Bullish' in cross_type:
+                # MACD crosses above signal
+                if prev_macd <= prev_signal and current_macd > current_signal:
+                    signal_triggered = True
+            else:  # Bearish
+                # MACD crosses below signal
+                if prev_macd >= prev_signal and current_macd < current_signal:
+                    signal_triggered = True
+        
+        elif crossover_type == 'Price crosses MA':
+            ma_type = config.get('custom_ma_type', 'EMA')
+            ma_period = config.get('custom_ma_period', 50)
+            
+            if ma_type == 'EMA':
+                ma_col = f'EMA_{ma_period}'
+                if ma_col not in df.columns:
+                    df[ma_col] = df['Close'].ewm(span=ma_period, adjust=False).mean()
+            else:  # SMA
+                ma_col = f'SMA_{ma_period}'
+                if ma_col not in df.columns:
+                    df[ma_col] = df['Close'].rolling(window=ma_period).mean()
+            
+            current_ma = current[ma_col]
+            prev_ma = previous[ma_col]
+            prev_price = previous['Close']
+            
+            if pd.isna(current_ma) or pd.isna(prev_ma):
+                return None, None
+            
+            if 'Bullish' in cross_type:
+                # Price crosses above MA
+                if prev_price <= prev_ma and current_price > current_ma:
+                    signal_triggered = True
+            else:  # Bearish
+                # Price crosses below MA
+                if prev_price >= prev_ma and current_price < current_ma:
+                    signal_triggered = True
+    
+    # Return signal based on position type if triggered
+    if signal_triggered:
+        if position_type == 'LONG':
+            return 'BUY', current_price
+        else:  # SHORT
+            return 'SELL', current_price
+    
     return None, None
 
 # Strategy mapping
@@ -1791,19 +2124,148 @@ def render_config_ui():
     
     elif config['strategy'] == 'Price Crosses Threshold':
         config['price_threshold'] = st.sidebar.number_input("Price Threshold", min_value=0.0, value=25000.0)
-        config['price_cross_direction'] = st.sidebar.selectbox(
-            "Direction", 
-            ["LONG (Above Threshold)", "SHORT (Below Threshold)"],
-            help="LONG: Enter when price crosses above threshold\nSHORT: Enter when price crosses below threshold"
+        
+        # Cross direction
+        config['price_cross_type'] = st.sidebar.selectbox(
+            "Cross Type",
+            ["Above Threshold", "Below Threshold"],
+            help="When should the signal trigger?"
+        )
+        
+        # Position direction
+        config['price_cross_position'] = st.sidebar.selectbox(
+            "Position Type",
+            ["LONG", "SHORT"],
+            help="What position to take when cross occurs?"
         )
     
     elif config['strategy'] == 'Percentage Change':
-        config['pct_change_threshold'] = st.sidebar.number_input("% Change Threshold", min_value=0.1, value=2.0, step=0.1)
-        config['pct_change_direction'] = st.sidebar.selectbox(
-            "Direction",
-            ["LONG (Positive %)", "SHORT (Negative %)"],
-            help="LONG: Enter on positive % change\nSHORT: Enter on negative % change"
+        config['pct_change_threshold'] = st.sidebar.number_input("% Change Threshold", min_value=0.001, value=2.0, step=0.001, format="%.3f")
+        
+        # Change direction
+        config['pct_change_type'] = st.sidebar.selectbox(
+            "Change Type",
+            ["Positive % (Price Up)", "Negative % (Price Down)"],
+            help="When should the signal trigger?"
         )
+        
+        # Position direction
+        config['pct_change_position'] = st.sidebar.selectbox(
+            "Position Type",
+            ["LONG", "SHORT"],
+            help="What position to take when % change occurs?"
+        )
+    
+    elif config['strategy'] == 'Custom Strategy':
+        st.sidebar.markdown("**Custom Strategy Builder**")
+        
+        # Strategy type
+        config['custom_strategy_type'] = st.sidebar.selectbox(
+            "Strategy Type",
+            [
+                "Price Crosses Indicator",
+                "Price Pullback from Indicator",
+                "Indicator Crosses Level",
+                "Indicator Crossover"
+            ]
+        )
+        
+        if config['custom_strategy_type'] == "Price Crosses Indicator":
+            # Select indicator
+            config['custom_indicator'] = st.sidebar.selectbox(
+                "Indicator",
+                ["EMA", "SMA", "BB Upper", "BB Lower", "BB Middle"]
+            )
+            
+            if config['custom_indicator'] in ['EMA', 'SMA']:
+                config['custom_indicator_period'] = st.sidebar.number_input("Period", min_value=1, value=20)
+            elif 'BB' in config['custom_indicator']:
+                config['custom_bb_period'] = st.sidebar.number_input("BB Period", min_value=1, value=20)
+                config['custom_bb_std'] = st.sidebar.number_input("BB Std Dev", min_value=0.1, value=2.0, step=0.1)
+            
+            # Cross direction
+            config['custom_cross_type'] = st.sidebar.selectbox(
+                "Cross Type",
+                ["Above Indicator", "Below Indicator"]
+            )
+            
+            # Position type
+            config['custom_position_type'] = st.sidebar.selectbox(
+                "Position Type",
+                ["LONG", "SHORT"]
+            )
+        
+        elif config['custom_strategy_type'] == "Price Pullback from Indicator":
+            config['custom_indicator'] = st.sidebar.selectbox(
+                "Indicator",
+                ["EMA", "SMA", "BB Upper", "BB Lower"]
+            )
+            
+            if config['custom_indicator'] in ['EMA', 'SMA']:
+                config['custom_indicator_period'] = st.sidebar.number_input("Period", min_value=1, value=20)
+            elif 'BB' in config['custom_indicator']:
+                config['custom_bb_period'] = st.sidebar.number_input("BB Period", min_value=1, value=20)
+                config['custom_bb_std'] = st.sidebar.number_input("BB Std Dev", min_value=0.1, value=2.0, step=0.1)
+            
+            config['custom_pullback_points'] = st.sidebar.number_input("Pullback Points", min_value=1, value=10)
+            
+            # Position type
+            config['custom_position_type'] = st.sidebar.selectbox(
+                "Position Type",
+                ["LONG", "SHORT"]
+            )
+        
+        elif config['custom_strategy_type'] == "Indicator Crosses Level":
+            config['custom_indicator'] = st.sidebar.selectbox(
+                "Indicator",
+                ["RSI", "MACD", "Volume"]
+            )
+            
+            if config['custom_indicator'] == 'RSI':
+                config['custom_rsi_period'] = st.sidebar.number_input("RSI Period", min_value=1, value=14)
+                config['custom_level'] = st.sidebar.number_input("RSI Level", min_value=0.0, max_value=100.0, value=50.0)
+            elif config['custom_indicator'] == 'MACD':
+                config['custom_level'] = st.sidebar.number_input("MACD Level", value=0.0)
+            elif config['custom_indicator'] == 'Volume':
+                config['custom_volume_ma_period'] = st.sidebar.number_input("Volume MA Period", min_value=1, value=20)
+                config['custom_volume_multiplier'] = st.sidebar.number_input("Volume Multiplier", min_value=0.1, value=1.5, step=0.1)
+            
+            # Cross direction
+            config['custom_cross_type'] = st.sidebar.selectbox(
+                "Cross Type",
+                ["Above Level", "Below Level"]
+            )
+            
+            # Position type
+            config['custom_position_type'] = st.sidebar.selectbox(
+                "Position Type",
+                ["LONG", "SHORT"]
+            )
+        
+        elif config['custom_strategy_type'] == "Indicator Crossover":
+            config['custom_crossover_type'] = st.sidebar.selectbox(
+                "Crossover Type",
+                ["Fast EMA crosses Slow EMA", "MACD crosses Signal", "Price crosses MA"]
+            )
+            
+            if config['custom_crossover_type'] == "Fast EMA crosses Slow EMA":
+                config['custom_fast_ema'] = st.sidebar.number_input("Fast EMA", min_value=1, value=9)
+                config['custom_slow_ema'] = st.sidebar.number_input("Slow EMA", min_value=1, value=21)
+            elif config['custom_crossover_type'] == "Price crosses MA":
+                config['custom_ma_type'] = st.sidebar.selectbox("MA Type", ["EMA", "SMA"])
+                config['custom_ma_period'] = st.sidebar.number_input("MA Period", min_value=1, value=50)
+            
+            # Cross direction
+            config['custom_cross_type'] = st.sidebar.selectbox(
+                "Cross Type",
+                ["Bullish Crossover (Fast > Slow)", "Bearish Crossover (Fast < Slow)"]
+            )
+            
+            # Position type
+            config['custom_position_type'] = st.sidebar.selectbox(
+                "Position Type",
+                ["LONG", "SHORT"]
+            )
     
     # Stop Loss Configuration
     st.sidebar.subheader("🛡️ Stop Loss")
