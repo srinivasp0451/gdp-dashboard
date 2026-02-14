@@ -1686,8 +1686,8 @@ def render_config_ui():
     config['asset'] = st.sidebar.selectbox("Asset", list(ASSET_MAPPING.keys()), index=0)
     
     # Timeframe
-    config['interval'] = st.sidebar.selectbox("Interval", list(INTERVAL_MAPPING.keys()), index=5)
-    config['period'] = st.sidebar.selectbox("Period", list(PERIOD_MAPPING.keys()), index=2)
+    config['interval'] = st.sidebar.selectbox("Interval", list(INTERVAL_MAPPING.keys()), index=0)
+    config['period'] = st.sidebar.selectbox("Period", list(PERIOD_MAPPING.keys()), index=0)
     
     # Quantity
     config['quantity'] = st.sidebar.number_input("Quantity", min_value=1, value=1)
@@ -1763,8 +1763,8 @@ def render_config_ui():
     config['dhan_enabled'] = st.sidebar.checkbox("Enable Dhan Broker", value=False)
     
     if config['dhan_enabled']:
-        config['dhan_client_id'] = st.sidebar.text_input("Client ID", value="")
-        config['dhan_access_token'] = st.sidebar.text_input("Access Token", type="password", value="")
+        config['dhan_client_id'] = st.sidebar.text_input("Client ID", value="1104779876")
+        config['dhan_access_token'] = st.sidebar.text_input("Access Token", type="password", value="eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzUxMiJ9.eyJpc3MiOiJkaGFuIiwicGFydG5lcklkIjoiIiwiZXhwIjoxNzcxMTQzMjM5LCJpYXQiOjE3NzEwNTY4MzksInRva2VuQ29uc3VtZXJUeXBlIjoiU0VMRiIsIndlYmhvb2tVcmwiOiIiLCJkaGFuQ2xpZW50SWQiOiIxMTA0Nzc5ODc2In0.qP8kVXDQt-sFa6LWJqd1MRTPESHCCPCqHzEnjsFI2WVbNdywKHXgAKHxVpuH6tP_AJTdqowv9nbqf-2NcGibbQ")
         
         config['dhan_is_options'] = st.sidebar.checkbox("Is Options", value=True)
         
