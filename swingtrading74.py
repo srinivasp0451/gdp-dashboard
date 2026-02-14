@@ -617,24 +617,20 @@ def check_ema_crossover_strategy(df, idx, config, current_position):
     return None, None
 
 def check_simple_buy_strategy(df, idx, config, current_position):
-    """Simple Buy strategy - always returns BUY on first candle"""
+    """Simple Buy strategy - always returns BUY immediately if no position"""
     if current_position is not None:
         return None, None
     
-    if idx == 0:
-        return 'BUY', df.iloc[idx]['Close']
-    
-    return None, None
+    # Always signal BUY if no position exists
+    return 'BUY', df.iloc[idx]['Close']
 
 def check_simple_sell_strategy(df, idx, config, current_position):
-    """Simple Sell strategy - always returns SELL on first candle"""
+    """Simple Sell strategy - always returns SELL immediately if no position"""
     if current_position is not None:
         return None, None
     
-    if idx == 0:
-        return 'SELL', df.iloc[idx]['Close']
-    
-    return None, None
+    # Always signal SELL if no position exists
+    return 'SELL', df.iloc[idx]['Close']
 
 def check_price_crosses_threshold(df, idx, config, current_position):
     """Price crosses threshold strategy"""
@@ -1553,9 +1549,12 @@ def live_trading_iteration():
     
     if position is None:
         # Check for entry signal
+        add_log(f"🔍 Checking for entry signal using {strategy_name}...")
         signal, entry_price = strategy_func(df, idx, config, None)
         
         if signal:
+            add_log(f"✅ SIGNAL DETECTED: {signal} at {entry_price:.2f}")
+            
             # Convert to position type
             position_type = 'LONG' if signal in ('BUY', 'LONG') else 'SHORT'
             
@@ -1564,11 +1563,11 @@ def live_trading_iteration():
             target_price = calculate_initial_target(position_type, entry_price, df, idx, config)
             
             # Log entry
-            add_log(f"{signal} @ {entry_price:.2f}")
+            add_log(f"📈 ENTERING {position_type} POSITION @ {entry_price:.2f}")
             
             sl_display = f"{sl_price:.2f}" if sl_price is not None else "Not Set"
             target_display = f"{target_price:.2f}" if target_price is not None else "Not Set"
-            add_log(f"Initial SL: {sl_display} | Target: {target_display}")
+            add_log(f"🛡️ Initial SL: {sl_display} | 🎯 Target: {target_display}")
             
             # Create position
             position = {
@@ -1583,9 +1582,11 @@ def live_trading_iteration():
             }
             
             st.session_state['position'] = position
+            add_log(f"✅ Position created in session state")
             
             # Place broker order if enabled
             if config.get('dhan_enabled', False):
+                add_log(f"🏦 Dhan broker enabled, attempting to place order...")
                 dhan_broker = st.session_state.get('dhan_broker')
                 if dhan_broker:
                     try:
@@ -1593,13 +1594,30 @@ def live_trading_iteration():
                         st.session_state['broker_position'] = broker_position
                     except Exception as e:
                         add_log(f"🏦 ⚠️ Broker order error: {e}")
+                        import traceback
+                        add_log(f"🏦 Error details: {traceback.format_exc()}")
                 else:
                     add_log("🏦 ⚠️ Broker not initialized")
+            else:
+                add_log("🏦 Dhan broker disabled in config")
+        else:
+            add_log(f"⏳ No entry signal detected (Price: {current_price:.2f})")
     
     else:
+        # Position exists - monitor for exit
+        add_log(f"📊 Monitoring {position['type']} position @ {current_price:.2f}")
+        
         # Update tracking
         position['highest_price'] = max(position['highest_price'], current_price)
         position['lowest_price'] = min(position['lowest_price'], current_price)
+        
+        # Calculate current P&L
+        if position['type'] == 'LONG':
+            current_pnl = (current_price - position['entry_price']) * position['quantity']
+        else:  # SHORT
+            current_pnl = (position['entry_price'] - current_price) * position['quantity']
+        
+        add_log(f"💰 Current P&L: ₹{current_pnl:.2f}")
         
         # Update trailing SL/Target
         old_sl = position['sl_price']
@@ -1607,14 +1625,14 @@ def live_trading_iteration():
             position['sl_price'] = update_trailing_sl(position, current_price, df, idx, config)
             
             if position['sl_price'] != old_sl:
-                add_log(f"SL Updated: {position['sl_price']:.2f}")
+                add_log(f"🛡️ SL Updated: {old_sl:.2f} → {position['sl_price']:.2f}")
         
         old_target = position['target_price']
         if old_target is not None:
             position['target_price'] = update_trailing_target(position, current_price, df, idx, config)
             
             if position['target_price'] != old_target:
-                add_log(f"Target Updated: {position['target_price']:.2f}")
+                add_log(f"🎯 Target Updated: {old_target:.2f} → {position['target_price']:.2f}")
         
         # Check exit conditions
         exit_reason = None
@@ -1626,10 +1644,12 @@ def live_trading_iteration():
                 if current_price <= position['sl_price']:
                     exit_reason = 'SL Hit'
                     exit_price = position['sl_price']
+                    add_log(f"🛑 STOP LOSS HIT! Price {current_price:.2f} <= SL {position['sl_price']:.2f}")
             else:  # SHORT
                 if current_price >= position['sl_price']:
                     exit_reason = 'SL Hit'
                     exit_price = position['sl_price']
+                    add_log(f"🛑 STOP LOSS HIT! Price {current_price:.2f} >= SL {position['sl_price']:.2f}")
         
         # Check Target hit
         if exit_reason is None and position['target_price'] is not None:
@@ -1637,10 +1657,12 @@ def live_trading_iteration():
                 if current_price >= position['target_price']:
                     exit_reason = 'Target Hit'
                     exit_price = position['target_price']
+                    add_log(f"🎯 TARGET HIT! Price {current_price:.2f} >= Target {position['target_price']:.2f}")
             else:  # SHORT
                 if current_price <= position['target_price']:
                     exit_reason = 'Target Hit'
                     exit_price = position['target_price']
+                    add_log(f"🎯 TARGET HIT! Price {current_price:.2f} <= Target {position['target_price']:.2f}")
         
         # Check signal-based exit
         if exit_reason is None and config.get('sl_type') == 'Signal-based (Reverse Crossover)':
@@ -1650,6 +1672,7 @@ def live_trading_iteration():
                    (position['type'] == 'SHORT' and signal in ('BUY', 'LONG')):
                     exit_reason = 'Signal Exit'
                     exit_price = current_price
+                    add_log(f"🔄 REVERSE SIGNAL DETECTED: {signal}")
         
         # Exit if conditions met
         if exit_reason:
@@ -1659,7 +1682,8 @@ def live_trading_iteration():
             else:  # SHORT
                 pnl = (position['entry_price'] - exit_price) * position['quantity']
             
-            add_log(f"EXIT: {exit_reason} @ {exit_price:.2f} | P&L: ₹{pnl:.2f}")
+            add_log(f"🚪 EXITING POSITION: {exit_reason} @ {exit_price:.2f}")
+            add_log(f"💰 Final P&L: ₹{pnl:.2f}")
             
             # Save to trade history
             trade_record = {
@@ -1681,6 +1705,7 @@ def live_trading_iteration():
             if 'trade_history' not in st.session_state:
                 st.session_state['trade_history'] = []
             st.session_state['trade_history'].append(trade_record)
+            add_log(f"📝 Trade saved to history")
             
             # Exit broker position if exists
             if config.get('dhan_enabled', False):
@@ -1701,6 +1726,8 @@ def live_trading_iteration():
             st.session_state['broker_position'] = None
             if 'current_data' in st.session_state:
                 del st.session_state['current_data']
+        else:
+            add_log(f"⏳ No exit conditions met - holding position")
 
 # ================================
 # UI COMPONENTS
@@ -1910,11 +1937,20 @@ def render_live_trading_ui(config):
             # Store config
             st.session_state['config'] = config
             
+            # Log configuration
+            add_log("🚀 Trading started - all sessions cleared")
+            add_log(f"📋 Strategy: {config.get('strategy', 'N/A')}")
+            add_log(f"📋 Asset: {config.get('asset', 'N/A')} | Interval: {config.get('interval', 'N/A')}")
+            add_log(f"📋 SL Type: {config.get('sl_type', 'N/A')} | Target Type: {config.get('target_type', 'N/A')}")
+            add_log(f"📋 Quantity: {config.get('quantity', 'N/A')}")
+            
             # Initialize broker if enabled
             if config.get('dhan_enabled', False):
+                add_log("🏦 Initializing Dhan broker...")
                 st.session_state['dhan_broker'] = DhanBrokerIntegration(config)
-            
-            add_log("🚀 Trading started - all sessions cleared")
+                add_log("🏦 Broker initialization complete")
+            else:
+                add_log("🏦 Dhan broker disabled")
     
     with col2:
         if st.button("⏹️ Stop Trading"):
@@ -2147,12 +2183,12 @@ def render_live_trading_ui(config):
         live_trading_iteration()
         
         # Auto-refresh every 5 seconds
-        time.sleep(5)
+        time.sleep(1.5)
         st.rerun()
 
 def render_trade_logs_ui():
-    """Render comprehensive trade logs and statistics"""
-    st.header("📊 Trade Logs & Statistics")
+    """Render comprehensive trade history and statistics"""
+    st.header("📊 Trade History & Statistics")
     
     # Get trade history
     trade_history = st.session_state.get('trade_history', [])
@@ -2374,7 +2410,7 @@ def main():
     config = render_config_ui()
     
     # Main tabs
-    tab1, tab2, tab3 = st.tabs(["📈 Backtest", "🔴 Live Trading", "📊 Trade Logs"])
+    tab1, tab2, tab3 = st.tabs(["📈 Backtest", "🔴 Live Trading", "📊 Trade History"])
     
     with tab1:
         render_backtest_ui(config)
