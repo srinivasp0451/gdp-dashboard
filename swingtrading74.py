@@ -175,18 +175,30 @@ class DhanBrokerIntegration:
         return security_id, option_type
     
     def _get_exchange_segment(self):
-        """Determine exchange segment based on asset"""
+        """Determine exchange segment based on asset and trading type"""
         if not self.dhanhq_module:
             return "NSE_FNO"
-            
-        asset = self.config.get('asset', 'NIFTY 50')
         
-        if asset in ('NIFTY 50', 'BANKNIFTY', 'FINNIFTY', 'MIDCPNIFTY'):
-            return self.dhanhq_module.NSE_FNO
-        elif asset == 'SENSEX':
-            return self.dhanhq_module.BSE_FNO
+        is_options = self.config.get('dhan_is_options', True)
+        
+        if is_options:
+            # Options trading - use FNO exchanges
+            asset = self.config.get('asset', 'NIFTY 50')
+            
+            if asset in ('NIFTY 50', 'BANKNIFTY', 'FINNIFTY', 'MIDCPNIFTY'):
+                return self.dhanhq_module.NSE_FNO
+            elif asset == 'SENSEX':
+                return self.dhanhq_module.BSE_FNO
+            else:
+                return self.dhanhq_module.NSE_FNO  # default
         else:
-            return self.dhanhq_module.NSE_FNO  # default
+            # Stock trading - use equity exchanges
+            exchange = self.config.get('dhan_exchange', 'NSE')
+            
+            if exchange == 'BSE':
+                return self.dhanhq_module.BSE
+            else:
+                return self.dhanhq_module.NSE  # default
     
     def place_order(self, transaction_type, security_id, quantity, signal_type=None):
         """
@@ -253,7 +265,15 @@ class DhanBrokerIntegration:
     
     def enter_broker_position(self, signal, price, config, log_func):
         """
-        Enter broker position (ALWAYS BUY)
+        Enter broker position - handles both options and stock trading
+        
+        Options Trading:
+        - LONG signal → BUY CE
+        - SHORT signal → BUY PE
+        
+        Stock Trading:
+        - LONG signal → BUY stock
+        - SHORT signal → SELL stock
         
         Args:
             signal: 'BUY', 'SELL', 'LONG', or 'SHORT'
@@ -264,32 +284,62 @@ class DhanBrokerIntegration:
         Returns:
             dict: Broker position info
         """
-        # Resolve security based on signal
-        security_id, option_type = self._resolve_security(signal)
-        quantity = config.get('dhan_quantity', 65)
+        is_options = config.get('dhan_is_options', True)
+        quantity = config.get('dhan_quantity', 10)
         
         log_func(f"🏦 NEW signal detected: {signal}")
-        log_func(f"🏦 {signal} signal → Using {option_type} Security ID: {security_id}")
         
-        # ALWAYS BUY to open position
-        order_response = self.place_order('BUY', security_id, quantity, signal)
-        
-        # Create broker position record
-        broker_position = {
-            'order_id': order_response['order_id'],
-            'signal_type': signal,
-            'option_type': option_type,
-            'security_id': security_id,
-            'transaction_type': 'BUY',
-            'entry_price': price,
-            'quantity': quantity,
-            'timestamp': datetime.now(pytz.timezone('Asia/Kolkata')),
-            'status': order_response['status'],
-            'raw_response': order_response['raw_response']
-        }
+        if is_options:
+            # Options trading logic (existing)
+            security_id, option_type = self._resolve_security(signal)
+            log_func(f"🏦 {signal} signal → Using {option_type} Security ID: {security_id}")
+            
+            # ALWAYS BUY to open position (buying the option)
+            order_response = self.place_order('BUY', security_id, quantity, signal)
+            
+            broker_position = {
+                'order_id': order_response['order_id'],
+                'signal_type': signal,
+                'option_type': option_type,
+                'security_id': security_id,
+                'transaction_type': 'BUY',
+                'entry_price': price,
+                'quantity': quantity,
+                'timestamp': datetime.now(pytz.timezone('Asia/Kolkata')),
+                'status': order_response['status'],
+                'raw_response': order_response['raw_response'],
+                'is_options': True
+            }
+        else:
+            # Stock trading logic (new)
+            security_id = config.get('dhan_security_id', '1234')
+            log_func(f"🏦 Stock Trading → Security ID: {security_id}")
+            
+            # Determine transaction type based on signal
+            if signal in ('BUY', 'LONG'):
+                transaction_type = 'BUY'
+                log_func(f"🏦 LONG signal → BUY stock")
+            else:  # 'SELL' or 'SHORT'
+                transaction_type = 'SELL'
+                log_func(f"🏦 SHORT signal → SELL stock")
+            
+            order_response = self.place_order(transaction_type, security_id, quantity, signal)
+            
+            broker_position = {
+                'order_id': order_response['order_id'],
+                'signal_type': signal,
+                'security_id': security_id,
+                'transaction_type': transaction_type,
+                'entry_price': price,
+                'quantity': quantity,
+                'timestamp': datetime.now(pytz.timezone('Asia/Kolkata')),
+                'status': order_response['status'],
+                'raw_response': order_response['raw_response'],
+                'is_options': False
+            }
         
         if order_response['status'] in ('SUCCESS', 'SIMULATED'):
-            log_func(f"🏦 ✅ DHAN ORDER PLACED: BUY {quantity} @ {price:.2f}")
+            log_func(f"🏦 ✅ DHAN ORDER PLACED: {broker_position.get('transaction_type', 'BUY')} {quantity} @ {price:.2f}")
         else:
             log_func(f"🏦 ❌ DHAN ORDER FAILED: {order_response.get('error', 'Unknown error')}")
             
@@ -297,7 +347,14 @@ class DhanBrokerIntegration:
     
     def exit_broker_position(self, broker_position, price, reason, log_func):
         """
-        Exit broker position (ALWAYS SELL)
+        Exit broker position - handles both options and stock trading
+        
+        Options Trading:
+        - Always SELL (sell the option you bought)
+        
+        Stock Trading:
+        - If entered with BUY → Exit with SELL
+        - If entered with SELL → Exit with BUY (square off short)
         
         Args:
             broker_position: Existing broker position dict
@@ -310,11 +367,25 @@ class DhanBrokerIntegration:
         """
         security_id = broker_position['security_id']
         quantity = broker_position['quantity']
+        is_options = broker_position.get('is_options', True)
         
         log_func(f"🏦 Exiting position: {reason}")
         
-        # ALWAYS SELL to close position
-        order_response = self.place_order('SELL', security_id, quantity)
+        if is_options:
+            # Options: Always SELL to close
+            exit_transaction = 'SELL'
+            log_func(f"🏦 Options Exit → SELL")
+        else:
+            # Stock: Exit opposite of entry
+            entry_transaction = broker_position['transaction_type']
+            if entry_transaction == 'BUY':
+                exit_transaction = 'SELL'
+                log_func(f"🏦 Stock Exit → SELL (close long)")
+            else:  # entry was SELL
+                exit_transaction = 'BUY'
+                log_func(f"🏦 Stock Exit → BUY (square off short)")
+        
+        order_response = self.place_order(exit_transaction, security_id, quantity)
         
         # Calculate P&L
         entry_price = broker_position['entry_price']
@@ -327,7 +398,7 @@ class DhanBrokerIntegration:
             
         exit_info = {
             'order_id': order_response['order_id'],
-            'transaction_type': 'SELL',
+            'transaction_type': exit_transaction,
             'exit_price': price,
             'quantity': quantity,
             'pnl': pnl,
@@ -337,7 +408,7 @@ class DhanBrokerIntegration:
         }
         
         if order_response['status'] in ('SUCCESS', 'SIMULATED'):
-            log_func(f"🏦 ✅ DHAN EXIT ORDER PLACED: SELL {quantity} @ {price:.2f} | P&L: ₹{pnl:.2f}")
+            log_func(f"🏦 ✅ DHAN EXIT ORDER PLACED: {exit_transaction} {quantity} @ {price:.2f} | P&L: ₹{pnl:.2f}")
         else:
             log_func(f"🏦 ❌ DHAN EXIT ORDER FAILED: {order_response.get('error', 'Unknown error')}")
             
@@ -663,7 +734,10 @@ def check_simple_sell_strategy(df, idx, config, current_position):
 
 def check_price_crosses_threshold(df, idx, config, current_position):
     """
-    Price crosses threshold strategy with full flexibility
+    Price crosses threshold strategy - checks current price state
+    
+    Checks if current price is above/below threshold and takes action
+    No need for actual "crossing" - just checks current state
     
     Combinations:
     - Above Threshold → LONG
@@ -679,25 +753,20 @@ def check_price_crosses_threshold(df, idx, config, current_position):
     cross_type = config.get('price_cross_type', 'Above Threshold')
     position_type = config.get('price_cross_position', 'LONG')
     
-    if idx < 1:
-        return None, None
-        
-    prev_price = df.iloc[idx - 1]['Close']
-    
-    # Determine if cross occurred
-    cross_occurred = False
+    # Check current price state against threshold
+    condition_met = False
     
     if cross_type == 'Above Threshold':
-        # Check if price crossed above threshold
-        if prev_price <= threshold and current_price > threshold:
-            cross_occurred = True
+        # Check if current price IS above threshold
+        if current_price > threshold:
+            condition_met = True
     else:  # 'Below Threshold'
-        # Check if price crossed below threshold
-        if prev_price >= threshold and current_price < threshold:
-            cross_occurred = True
+        # Check if current price IS below threshold
+        if current_price < threshold:
+            condition_met = True
     
-    # If cross occurred, return signal based on position type
-    if cross_occurred:
+    # If condition met, return signal based on position type
+    if condition_met:
         if position_type == 'LONG':
             return 'BUY', current_price
         else:  # SHORT
@@ -2307,7 +2376,7 @@ def render_config_ui():
     
     # Dhan Broker Configuration
     st.sidebar.subheader("🏦 Dhan Broker (Optional)")
-    config['dhan_enabled'] = st.sidebar.checkbox("Enable Dhan Broker", value=True)
+    config['dhan_enabled'] = st.sidebar.checkbox("Enable Dhan Broker", value=False)
     
     if config['dhan_enabled']:
         config['dhan_client_id'] = st.sidebar.text_input("Client ID", value="1104779876")
@@ -2316,11 +2385,19 @@ def render_config_ui():
         config['dhan_is_options'] = st.sidebar.checkbox("Is Options", value=True)
         
         if config['dhan_is_options']:
+            # Options trading configuration
             config['dhan_ce_security_id'] = st.sidebar.text_input("CE Security ID", value="48228")
             config['dhan_pe_security_id'] = st.sidebar.text_input("PE Security ID", value="48229")
             config['dhan_strike_price'] = st.sidebar.number_input("Strike Price", min_value=0, value=25000)
             config['dhan_expiry_date'] = st.sidebar.date_input("Expiry Date", value=datetime.now().date())
             config['dhan_quantity'] = st.sidebar.number_input("Dhan Quantity", min_value=1, value=65)
+        else:
+            # Stock/Intraday trading configuration
+            st.sidebar.markdown("**Stock/Intraday Trading**")
+            config['dhan_security_id'] = st.sidebar.text_input("Security ID", value="1234", help="Stock security ID from Dhan")
+            config['dhan_exchange'] = st.sidebar.selectbox("Exchange", ["NSE", "BSE"], index=0)
+            config['dhan_quantity'] = st.sidebar.number_input("Quantity", min_value=1, value=10)
+            st.sidebar.info("Order Type: MARKET | Product: INTRA")
     
     return config
 
@@ -2643,16 +2720,30 @@ def render_live_trading_ui(config):
         st.subheader("🏦 Broker Position")
         
         broker_pos = st.session_state['broker_position']
+        is_options = broker_pos.get('is_options', True)
         
-        col1, col2, col3, col4 = st.columns(4)
-        with col1:
-            st.metric("Order ID", broker_pos['order_id'])
-        with col2:
-            st.metric("Option Type", broker_pos['option_type'])
-        with col3:
-            st.metric("Security ID", broker_pos['security_id'])
-        with col4:
-            st.metric("Status", broker_pos['status'])
+        if is_options:
+            # Options trading display
+            col1, col2, col3, col4 = st.columns(4)
+            with col1:
+                st.metric("Order ID", broker_pos['order_id'])
+            with col2:
+                st.metric("Option Type", broker_pos['option_type'])
+            with col3:
+                st.metric("Security ID", broker_pos['security_id'])
+            with col4:
+                st.metric("Status", broker_pos['status'])
+        else:
+            # Stock trading display
+            col1, col2, col3, col4 = st.columns(4)
+            with col1:
+                st.metric("Order ID", broker_pos['order_id'])
+            with col2:
+                st.metric("Transaction", broker_pos['transaction_type'])
+            with col3:
+                st.metric("Security ID", broker_pos['security_id'])
+            with col4:
+                st.metric("Status", broker_pos['status'])
         
         # Display raw API response
         with st.expander("📄 Raw API Response"):
