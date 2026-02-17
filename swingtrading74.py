@@ -179,40 +179,24 @@ class DhanBrokerIntegration:
         if not self.dhanhq_module:
             return "NSE_FNO"
         
-        is_options = self.config.get('dhan_is_options', True)
-        
+        is_options    = self.config.get('dhan_is_options', True)
+        trading_type  = self.config.get('dhan_trading_type', 'Intraday')
+        exchange      = self.config.get('dhan_exchange', 'NSE')
+
         if is_options:
-            # Options trading - use FNO exchanges
+            # Options → FNO segment
             asset = self.config.get('asset', 'NIFTY 50')
-            
-            if asset in ('NIFTY 50', 'BANKNIFTY', 'FINNIFTY', 'MIDCPNIFTY'):
-                return self.dhanhq_module.NSE_FNO
-            elif asset == 'SENSEX':
+            if asset == 'SENSEX':
                 return self.dhanhq_module.BSE_FNO
-            else:
-                return self.dhanhq_module.NSE_FNO  # default
+            return self.dhanhq_module.NSE_FNO
         else:
-            # Stock trading - use equity exchanges
-            exchange = self.config.get('dhan_exchange', 'NSE')
-            
+            # Stocks (Intraday or Delivery) → Equity segment
             if exchange == 'BSE':
-                return self.dhanhq_module.BSE
-            else:
-                return self.dhanhq_module.NSE  # default
+                return self.dhanhq_module.BSE  # BSE_EQ
+            return self.dhanhq_module.NSE       # NSE_EQ
     
-    def place_order(self, transaction_type, security_id, quantity, signal_type=None):
-        """
-        Place order via Dhan API
-        
-        Args:
-            transaction_type: 'BUY' or 'SELL'
-            security_id: Security ID
-            quantity: Order quantity
-            signal_type: Original signal ('BUY', 'SELL', 'LONG', 'SHORT') for logging
-            
-        Returns:
-            dict: Order response with order_id, status, raw_response
-        """
+    def place_order(self, transaction_type, security_id, quantity, signal_type=None, order_params=None):
+        """Place order via Dhan API - supports INTRA and CNC product types"""
         order_response = {
             'order_id': None,
             'status': 'FAILED',
@@ -222,18 +206,36 @@ class DhanBrokerIntegration:
         
         try:
             if self.initialized and self.dhan:
-                # Real API call
                 exchange_segment = self._get_exchange_segment()
+                is_options  = self.config.get('dhan_is_options', True)
+                trading_type = self.config.get('dhan_trading_type', 'Intraday')
                 
-                response = self.dhan.place_order(
-                    security_id=str(security_id),
-                    exchange_segment=exchange_segment,
-                    transaction_type=transaction_type,
-                    quantity=int(quantity),
-                    order_type=self.dhanhq_module.MARKET,
-                    product_type=self.dhanhq_module.INTRA,
-                    price=0
-                )
+                if not is_options and trading_type == 'Delivery (CNC)':
+                    # Delivery order with SL/Target
+                    op = order_params or {}
+                    response = self.dhan.place_order(
+                        security_id=str(security_id),
+                        exchange_segment=exchange_segment,
+                        transaction_type=transaction_type,
+                        quantity=int(quantity),
+                        order_type=self.dhanhq_module.LIMIT,
+                        product_type=self.dhanhq_module.CNC,
+                        price=float(op.get('price', 0)),
+                        trigger_price=float(op.get('stopLossPrice', 0)),
+                        target_price=float(op.get('targetPrice', 0)),
+                        trailing_jump=float(op.get('trailingJump', 0))
+                    )
+                else:
+                    # Market / Intraday order
+                    response = self.dhan.place_order(
+                        security_id=str(security_id),
+                        exchange_segment=exchange_segment,
+                        transaction_type=transaction_type,
+                        quantity=int(quantity),
+                        order_type=self.dhanhq_module.MARKET,
+                        product_type=self.dhanhq_module.INTRA,
+                        price=0
+                    )
                 
                 order_response['raw_response'] = response
                 
@@ -245,7 +247,6 @@ class DhanBrokerIntegration:
                     order_response['error'] = response.get('remarks', 'Unknown error')
                     
             else:
-                # Simulation mode
                 order_response['order_id'] = f"SIM-{int(time.time())}"
                 order_response['status'] = 'SIMULATED'
                 order_response['raw_response'] = {
@@ -256,47 +257,21 @@ class DhanBrokerIntegration:
         except Exception as e:
             order_response['order_id'] = f"ERR-{int(time.time())}"
             order_response['error'] = str(e)
-            order_response['raw_response'] = {
-                'error': str(e),
-                'traceback': traceback.format_exc()
-            }
+            order_response['raw_response'] = {'error': str(e), 'traceback': traceback.format_exc()}
             
         return order_response
     
     def enter_broker_position(self, signal, price, config, log_func):
-        """
-        Enter broker position - handles both options and stock trading
-        
-        Options Trading:
-        - LONG signal → BUY CE
-        - SHORT signal → BUY PE
-        
-        Stock Trading:
-        - LONG signal → BUY stock
-        - SHORT signal → SELL stock
-        
-        Args:
-            signal: 'BUY', 'SELL', 'LONG', or 'SHORT'
-            price: Entry price
-            config: Configuration dict
-            log_func: Logging function
-            
-        Returns:
-            dict: Broker position info
-        """
+        """Enter broker position - handles Options, Intraday, and Delivery (CNC)"""
         is_options = config.get('dhan_is_options', True)
         quantity = config.get('dhan_quantity', 10)
-        
+        trading_type = config.get('dhan_trading_type', 'Intraday')
         log_func(f"🏦 NEW signal detected: {signal}")
-        
+
         if is_options:
-            # Options trading logic (existing)
             security_id, option_type = self._resolve_security(signal)
             log_func(f"🏦 {signal} signal → Using {option_type} Security ID: {security_id}")
-            
-            # ALWAYS BUY to open position (buying the option)
             order_response = self.place_order('BUY', security_id, quantity, signal)
-            
             broker_position = {
                 'order_id': order_response['order_id'],
                 'signal_type': signal,
@@ -308,23 +283,37 @@ class DhanBrokerIntegration:
                 'timestamp': datetime.now(pytz.timezone('Asia/Kolkata')),
                 'status': order_response['status'],
                 'raw_response': order_response['raw_response'],
-                'is_options': True
+                'is_options': True,
+                'trading_type': 'Options'
             }
-        else:
-            # Stock trading logic (new)
+        elif trading_type == 'Delivery (CNC)':
             security_id = config.get('dhan_security_id', '1234')
-            log_func(f"🏦 Stock Trading → Security ID: {security_id}")
-            
-            # Determine transaction type based on signal
-            if signal in ('BUY', 'LONG'):
-                transaction_type = 'BUY'
-                log_func(f"🏦 LONG signal → BUY stock")
-            else:  # 'SELL' or 'SHORT'
-                transaction_type = 'SELL'
-                log_func(f"🏦 SHORT signal → SELL stock")
-            
-            order_response = self.place_order(transaction_type, security_id, quantity, signal)
-            
+            log_func(f"🏦 Delivery (CNC) → Security ID: {security_id}")
+            transaction_type = 'BUY' if signal in ('BUY', 'LONG') else 'SELL'
+            log_func(f"🏦 {signal} signal → {transaction_type} stock (CNC)")
+
+            # Build order params — use broker SL/target if enabled, else use algo values
+            use_broker_sl = config.get('broker_use_own_sl', False)
+            if use_broker_sl:
+                sl_pts   = config.get('broker_sl_points', 50)
+                tgt_pts  = config.get('broker_target_points', 100)
+                trail    = config.get('broker_trailing_jump', 0)
+                lmt_price = price
+                sl_price  = price - sl_pts  if transaction_type == 'BUY' else price + sl_pts
+                tgt_price = price + tgt_pts if transaction_type == 'BUY' else price - tgt_pts
+            else:
+                sl_price  = price
+                tgt_price = price
+                lmt_price = price
+                trail     = 0
+
+            order_params = {
+                'price': lmt_price,
+                'stopLossPrice': sl_price,
+                'targetPrice': tgt_price,
+                'trailingJump': trail
+            }
+            order_response = self.place_order(transaction_type, security_id, quantity, signal, order_params)
             broker_position = {
                 'order_id': order_response['order_id'],
                 'signal_type': signal,
@@ -335,14 +324,34 @@ class DhanBrokerIntegration:
                 'timestamp': datetime.now(pytz.timezone('Asia/Kolkata')),
                 'status': order_response['status'],
                 'raw_response': order_response['raw_response'],
-                'is_options': False
+                'is_options': False,
+                'trading_type': 'Delivery'
             }
-        
+        else:
+            # Intraday
+            security_id = config.get('dhan_security_id', '1234')
+            log_func(f"🏦 Intraday → Security ID: {security_id}")
+            transaction_type = 'BUY' if signal in ('BUY', 'LONG') else 'SELL'
+            log_func(f"🏦 {signal} signal → {transaction_type} stock (INTRA)")
+            order_response = self.place_order(transaction_type, security_id, quantity, signal)
+            broker_position = {
+                'order_id': order_response['order_id'],
+                'signal_type': signal,
+                'security_id': security_id,
+                'transaction_type': transaction_type,
+                'entry_price': price,
+                'quantity': quantity,
+                'timestamp': datetime.now(pytz.timezone('Asia/Kolkata')),
+                'status': order_response['status'],
+                'raw_response': order_response['raw_response'],
+                'is_options': False,
+                'trading_type': 'Intraday'
+            }
+
         if order_response['status'] in ('SUCCESS', 'SIMULATED'):
-            log_func(f"🏦 ✅ DHAN ORDER PLACED: {broker_position.get('transaction_type', 'BUY')} {quantity} @ {price:.2f}")
+            log_func(f"🏦 ✅ DHAN ORDER PLACED: {broker_position.get('transaction_type')} {quantity} @ {price:.2f}")
         else:
             log_func(f"🏦 ❌ DHAN ORDER FAILED: {order_response.get('error', 'Unknown error')}")
-            
         return broker_position
     
     def exit_broker_position(self, broker_position, price, reason, log_func):
@@ -871,279 +880,230 @@ def check_ai_price_action(df, idx, config, current_position):
 
 def check_custom_strategy(df, idx, config, current_position):
     """
-    Custom strategy with multiple configurable options
-    
+    Custom Strategy Builder - supports all popular indicators
     Types:
-    1. Price Crosses Indicator (EMA, SMA, BB)
-    2. Price Pullback from Indicator
-    3. Indicator Crosses Level (RSI, MACD, Volume)
-    4. Indicator Crossover (EMA/EMA, MACD/Signal, Price/MA)
+      1. Price Crosses Indicator   (EMA/SMA/BB/VWAP/MACD-signal)
+      2. Price Pullback            (touches indicator within N pts)
+      3. Indicator Crosses Level   (RSI/MACD/ADX/Volume)
+      4. Indicator Crossover       (EMA×EMA, MACD×Signal, Price×MA)
     """
     if current_position is not None:
         return None, None
-    
-    if idx < 1:
+    if idx < 2:
         return None, None
-    
-    strategy_type = config.get('custom_strategy_type', 'Price Crosses Indicator')
-    current = df.iloc[idx]
-    previous = df.iloc[idx - 1]
-    current_price = current['Close']
-    position_type = config.get('custom_position_type', 'LONG')
-    
+
+    strategy_type   = config.get('custom_strategy_type', 'Price Crosses Indicator')
+    position_type   = config.get('custom_position_type', 'LONG')
+    current         = df.iloc[idx]
+    previous        = df.iloc[idx - 1]
+    current_price   = float(current['Close'])
+    prev_price      = float(previous['Close'])
     signal_triggered = False
-    
-    # ==========================================
-    # 1. PRICE CROSSES INDICATOR
-    # ==========================================
+
+    def _get_indicator_col(df, name, period, bb_std=2.0):
+        """Compute and cache arbitrary indicator columns."""
+        col = f"{name}_{period}"
+        if col not in df.columns:
+            if name == 'EMA':
+                df[col] = df['Close'].ewm(span=period, adjust=False).mean()
+            elif name == 'SMA':
+                df[col] = df['Close'].rolling(window=period).mean()
+            elif name == 'BB_UPPER':
+                mid = df['Close'].rolling(window=period).mean()
+                std = df['Close'].rolling(window=period).std()
+                df[col] = mid + bb_std * std
+            elif name == 'BB_LOWER':
+                mid = df['Close'].rolling(window=period).mean()
+                std = df['Close'].rolling(window=period).std()
+                df[col] = mid - bb_std * std
+            elif name == 'BB_MID':
+                df[col] = df['Close'].rolling(window=period).mean()
+        return col
+
+    # ── 1. PRICE CROSSES INDICATOR ──────────────────────────────────────────
     if strategy_type == 'Price Crosses Indicator':
-        indicator_name = config.get('custom_indicator', 'EMA')
-        cross_type = config.get('custom_cross_type', 'Above Indicator')
-        
-        # Get indicator value
-        if indicator_name == 'EMA':
-            period = config.get('custom_indicator_period', 20)
-            indicator_col = f'EMA_{period}'
-            if indicator_col not in df.columns:
-                df[indicator_col] = df['Close'].ewm(span=period, adjust=False).mean()
-            indicator_value = current[indicator_col]
-            prev_indicator = previous[indicator_col]
-        
-        elif indicator_name == 'SMA':
-            period = config.get('custom_indicator_period', 20)
-            indicator_col = f'SMA_{period}'
-            if indicator_col not in df.columns:
-                df[indicator_col] = df['Close'].rolling(window=period).mean()
-            indicator_value = current[indicator_col]
-            prev_indicator = previous[indicator_col]
-        
-        elif indicator_name == 'BB Upper':
-            indicator_value = current['BB_Upper']
-            prev_indicator = previous['BB_Upper']
-        
-        elif indicator_name == 'BB Lower':
-            indicator_value = current['BB_Lower']
-            prev_indicator = previous['BB_Lower']
-        
-        elif indicator_name == 'BB Middle':
-            indicator_value = current['BB_Middle']
-            prev_indicator = previous['BB_Middle']
-        
+        ind     = config.get('custom_indicator', 'EMA')
+        cross   = config.get('custom_cross_type', 'Above Indicator')
+        period  = int(config.get('custom_indicator_period', 20))
+        bb_std  = float(config.get('custom_bb_std', 2.0))
+
+        ind_map = {
+            'EMA':       ('EMA',      period),
+            'SMA':       ('SMA',      period),
+            'BB Upper':  ('BB_UPPER', config.get('custom_bb_period', 20)),
+            'BB Lower':  ('BB_LOWER', config.get('custom_bb_period', 20)),
+            'BB Middle': ('BB_MID',   config.get('custom_bb_period', 20)),
+        }
+        if ind not in ind_map:
+            return None, None
+        col = _get_indicator_col(df, *ind_map[ind], bb_std=bb_std)
+        iv  = current.get(col, np.nan)
+        piv = previous.get(col, np.nan)
+        if pd.isna(iv) or pd.isna(piv):
+            return None, None
+
+        if cross == 'Above Indicator':
+            signal_triggered = prev_price <= float(piv) and current_price > float(iv)
         else:
-            return None, None
-        
-        # Check if indicator values are valid
-        if pd.isna(indicator_value) or pd.isna(prev_indicator):
-            return None, None
-        
-        # Check cross
-        prev_price = previous['Close']
-        
-        if cross_type == 'Above Indicator':
-            # Price crosses above indicator
-            if prev_price <= prev_indicator and current_price > indicator_value:
-                signal_triggered = True
-        else:  # 'Below Indicator'
-            # Price crosses below indicator
-            if prev_price >= prev_indicator and current_price < indicator_value:
-                signal_triggered = True
-    
-    # ==========================================
-    # 2. PRICE PULLBACK FROM INDICATOR
-    # ==========================================
+            signal_triggered = prev_price >= float(piv) and current_price < float(iv)
+
+    # ── 2. PRICE PULLBACK FROM INDICATOR ────────────────────────────────────
     elif strategy_type == 'Price Pullback from Indicator':
-        indicator_name = config.get('custom_indicator', 'EMA')
-        pullback_points = config.get('custom_pullback_points', 10)
-        
-        # Get indicator value
-        if indicator_name == 'EMA':
-            period = config.get('custom_indicator_period', 20)
-            indicator_col = f'EMA_{period}'
-            if indicator_col not in df.columns:
-                df[indicator_col] = df['Close'].ewm(span=period, adjust=False).mean()
-            indicator_value = current[indicator_col]
-        
-        elif indicator_name == 'SMA':
-            period = config.get('custom_indicator_period', 20)
-            indicator_col = f'SMA_{period}'
-            if indicator_col not in df.columns:
-                df[indicator_col] = df['Close'].rolling(window=period).mean()
-            indicator_value = current[indicator_col]
-        
-        elif indicator_name == 'BB Upper':
-            indicator_value = current['BB_Upper']
-        
-        elif indicator_name == 'BB Lower':
-            indicator_value = current['BB_Lower']
-        
-        else:
+        ind           = config.get('custom_indicator', 'EMA')
+        period        = int(config.get('custom_indicator_period', 20))
+        bb_std        = float(config.get('custom_bb_std', 2.0))
+        pullback_pts  = float(config.get('custom_pullback_points', 10))
+        side          = config.get('custom_pullback_side', 'Approach from Above')
+
+        ind_map = {
+            'EMA':      ('EMA',      period),
+            'SMA':      ('SMA',      period),
+            'BB Upper': ('BB_UPPER', config.get('custom_bb_period', 20)),
+            'BB Lower': ('BB_LOWER', config.get('custom_bb_period', 20)),
+        }
+        if ind not in ind_map:
             return None, None
-        
-        if pd.isna(indicator_value):
+        col = _get_indicator_col(df, *ind_map[ind], bb_std=bb_std)
+        iv  = current.get(col, np.nan)
+        if pd.isna(iv):
             return None, None
-        
-        # Check if price pulled back to within N points of indicator
-        distance = abs(current_price - indicator_value)
-        
-        if distance <= pullback_points:
-            signal_triggered = True
-    
-    # ==========================================
-    # 3. INDICATOR CROSSES LEVEL
-    # ==========================================
+        iv = float(iv)
+        distance = abs(current_price - iv)
+        if distance <= pullback_pts:
+            if side == 'Approach from Above':
+                signal_triggered = current_price >= iv       # price above indicator
+            else:
+                signal_triggered = current_price <= iv       # price below indicator
+
+    # ── 3. INDICATOR CROSSES LEVEL ───────────────────────────────────────────
     elif strategy_type == 'Indicator Crosses Level':
-        indicator_name = config.get('custom_indicator', 'RSI')
-        cross_type = config.get('custom_cross_type', 'Above Level')
-        
-        if indicator_name == 'RSI':
-            level = config.get('custom_level', 50.0)
-            current_rsi = current['RSI']
-            prev_rsi = previous['RSI']
-            
-            if pd.isna(current_rsi) or pd.isna(prev_rsi):
-                return None, None
-            
-            if cross_type == 'Above Level':
-                # RSI crosses above level
-                if prev_rsi <= level and current_rsi > level:
-                    signal_triggered = True
-            else:  # 'Below Level'
-                # RSI crosses below level
-                if prev_rsi >= level and current_rsi < level:
-                    signal_triggered = True
-        
-        elif indicator_name == 'MACD':
-            level = config.get('custom_level', 0.0)
-            current_macd = current['MACD']
-            prev_macd = previous['MACD']
-            
-            if pd.isna(current_macd) or pd.isna(prev_macd):
-                return None, None
-            
-            if cross_type == 'Above Level':
-                # MACD crosses above level
-                if prev_macd <= level and current_macd > level:
-                    signal_triggered = True
-            else:  # 'Below Level'
-                # MACD crosses below level
-                if prev_macd >= level and current_macd < level:
-                    signal_triggered = True
-        
-        elif indicator_name == 'Volume':
-            if 'Volume' not in current or pd.isna(current.get('Volume')):
-                return None, None
-            
-            volume_ma_period = config.get('custom_volume_ma_period', 20)
-            volume_multiplier = config.get('custom_volume_multiplier', 1.5)
-            
-            if 'Volume_MA' not in df.columns or pd.isna(current.get('Volume_MA')):
-                return None, None
-            
-            current_volume = current['Volume']
-            volume_ma = current['Volume_MA']
-            threshold_volume = volume_ma * volume_multiplier
-            
-            prev_volume = previous.get('Volume', 0)
-            
-            if cross_type == 'Above Level':
-                # Volume crosses above threshold
-                if prev_volume <= threshold_volume and current_volume > threshold_volume:
-                    signal_triggered = True
-            else:  # 'Below Level'
-                # Volume crosses below threshold
-                if prev_volume >= threshold_volume and current_volume < threshold_volume:
-                    signal_triggered = True
-    
-    # ==========================================
-    # 4. INDICATOR CROSSOVER
-    # ==========================================
+        ind       = config.get('custom_indicator', 'RSI')
+        cross     = config.get('custom_cross_type', 'Above Level')
+        level     = float(config.get('custom_level', 50.0))
+
+        def _cross_above(cur_val, prev_val, lvl):
+            return float(prev_val) <= lvl and float(cur_val) > lvl
+        def _cross_below(cur_val, prev_val, lvl):
+            return float(prev_val) >= lvl and float(cur_val) < lvl
+
+        if ind == 'RSI':
+            period = int(config.get('custom_rsi_period', 14))
+            col    = f'RSI_{period}'
+            if col not in df.columns:
+                df[col] = calculate_rsi(df['Close'], period)
+            cv, pv = current.get(col, np.nan), previous.get(col, np.nan)
+            if pd.isna(cv) or pd.isna(pv): return None, None
+            signal_triggered = _cross_above(cv,pv,level) if 'Above' in cross else _cross_below(cv,pv,level)
+
+        elif ind == 'MACD':
+            cv, pv = current.get('MACD', np.nan), previous.get('MACD', np.nan)
+            if pd.isna(cv) or pd.isna(pv): return None, None
+            signal_triggered = _cross_above(cv,pv,level) if 'Above' in cross else _cross_below(cv,pv,level)
+
+        elif ind == 'MACD Histogram':
+            cv, pv = current.get('MACD_Hist', np.nan), previous.get('MACD_Hist', np.nan)
+            if pd.isna(cv) or pd.isna(pv): return None, None
+            signal_triggered = _cross_above(cv,pv,level) if 'Above' in cross else _cross_below(cv,pv,level)
+
+        elif ind == 'ADX':
+            cv, pv = current.get('ADX', np.nan), previous.get('ADX', np.nan)
+            if pd.isna(cv) or pd.isna(pv): return None, None
+            signal_triggered = _cross_above(cv,pv,level) if 'Above' in cross else _cross_below(cv,pv,level)
+
+        elif ind == 'Volume':
+            if 'Volume' not in df.columns: return None, None
+            vol_ma_period = int(config.get('custom_volume_ma_period', 20))
+            vol_mult      = float(config.get('custom_volume_multiplier', 1.5))
+            if 'Volume_MA' not in df.columns:
+                df['Volume_MA'] = df['Volume'].rolling(window=vol_ma_period).mean()
+            cv   = float(current.get('Volume', 0))
+            pv   = float(previous.get('Volume', 0))
+            vma  = float(current.get('Volume_MA', 1))
+            thresh = vma * vol_mult
+            signal_triggered = _cross_above(cv, pv, thresh) if 'Above' in cross else _cross_below(cv, pv, thresh)
+
+        elif ind == 'BB %B':
+            bb_period = int(config.get('custom_bb_period', 20))
+            bb_std    = float(config.get('custom_bb_std', 2.0))
+            mid = df['Close'].rolling(bb_period).mean()
+            std = df['Close'].rolling(bb_period).std()
+            upper = mid + bb_std * std
+            lower = mid - bb_std * std
+            pctb_col = 'BB_PCTB'
+            df[pctb_col] = (df['Close'] - lower) / (upper - lower)
+            cv, pv = df[pctb_col].iloc[idx], df[pctb_col].iloc[idx-1]
+            if pd.isna(cv) or pd.isna(pv): return None, None
+            signal_triggered = _cross_above(cv,pv,level/100) if 'Above' in cross else _cross_below(cv,pv,level/100)
+
+    # ── 4. INDICATOR CROSSOVER ───────────────────────────────────────────────
     elif strategy_type == 'Indicator Crossover':
-        crossover_type = config.get('custom_crossover_type', 'Fast EMA crosses Slow EMA')
-        cross_type = config.get('custom_cross_type', 'Bullish Crossover (Fast > Slow)')
-        
-        if crossover_type == 'Fast EMA crosses Slow EMA':
-            fast_period = config.get('custom_fast_ema', 9)
-            slow_period = config.get('custom_slow_ema', 21)
-            
-            fast_col = f'EMA_{fast_period}'
-            slow_col = f'EMA_{slow_period}'
-            
-            if fast_col not in df.columns:
-                df[fast_col] = df['Close'].ewm(span=fast_period, adjust=False).mean()
-            if slow_col not in df.columns:
-                df[slow_col] = df['Close'].ewm(span=slow_period, adjust=False).mean()
-            
-            current_fast = current[fast_col]
-            current_slow = current[slow_col]
-            prev_fast = previous[fast_col]
-            prev_slow = previous[slow_col]
-            
-            if pd.isna(current_fast) or pd.isna(current_slow):
-                return None, None
-            
-            if 'Bullish' in cross_type:
-                # Fast crosses above slow
-                if prev_fast <= prev_slow and current_fast > current_slow:
-                    signal_triggered = True
-            else:  # Bearish
-                # Fast crosses below slow
-                if prev_fast >= prev_slow and current_fast < current_slow:
-                    signal_triggered = True
-        
-        elif crossover_type == 'MACD crosses Signal':
-            current_macd = current['MACD']
-            current_signal = current['MACD_Signal']
-            prev_macd = previous['MACD']
-            prev_signal = previous['MACD_Signal']
-            
-            if pd.isna(current_macd) or pd.isna(current_signal):
-                return None, None
-            
-            if 'Bullish' in cross_type:
-                # MACD crosses above signal
-                if prev_macd <= prev_signal and current_macd > current_signal:
-                    signal_triggered = True
-            else:  # Bearish
-                # MACD crosses below signal
-                if prev_macd >= prev_signal and current_macd < current_signal:
-                    signal_triggered = True
-        
-        elif crossover_type == 'Price crosses MA':
-            ma_type = config.get('custom_ma_type', 'EMA')
-            ma_period = config.get('custom_ma_period', 50)
-            
-            if ma_type == 'EMA':
-                ma_col = f'EMA_{ma_period}'
-                if ma_col not in df.columns:
-                    df[ma_col] = df['Close'].ewm(span=ma_period, adjust=False).mean()
-            else:  # SMA
-                ma_col = f'SMA_{ma_period}'
-                if ma_col not in df.columns:
-                    df[ma_col] = df['Close'].rolling(window=ma_period).mean()
-            
-            current_ma = current[ma_col]
-            prev_ma = previous[ma_col]
-            prev_price = previous['Close']
-            
-            if pd.isna(current_ma) or pd.isna(prev_ma):
-                return None, None
-            
-            if 'Bullish' in cross_type:
-                # Price crosses above MA
-                if prev_price <= prev_ma and current_price > current_ma:
-                    signal_triggered = True
-            else:  # Bearish
-                # Price crosses below MA
-                if prev_price >= prev_ma and current_price < current_ma:
-                    signal_triggered = True
-    
-    # Return signal based on position type if triggered
+        co_type = config.get('custom_crossover_type', 'Fast EMA × Slow EMA')
+        cross   = config.get('custom_cross_type', 'Bullish Crossover')
+
+        def bullish(fast_cur, fast_prev, slow_cur, slow_prev):
+            return float(fast_prev) <= float(slow_prev) and float(fast_cur) > float(slow_cur)
+        def bearish(fast_cur, fast_prev, slow_cur, slow_prev):
+            return float(fast_prev) >= float(slow_prev) and float(fast_cur) < float(slow_cur)
+        is_bull = 'Bullish' in cross
+
+        if co_type == 'Fast EMA × Slow EMA':
+            fp  = int(config.get('custom_fast_ema', 9))
+            sp  = int(config.get('custom_slow_ema', 21))
+            fc  = _get_indicator_col(df, 'EMA', fp)
+            sc  = _get_indicator_col(df, 'EMA', sp)
+            fc_cur,fc_prev = current.get(fc,np.nan), previous.get(fc,np.nan)
+            sc_cur,sc_prev = current.get(sc,np.nan), previous.get(sc,np.nan)
+            if any(pd.isna(v) for v in [fc_cur,fc_prev,sc_cur,sc_prev]): return None,None
+            signal_triggered = bullish(fc_cur,fc_prev,sc_cur,sc_prev) if is_bull else bearish(fc_cur,fc_prev,sc_cur,sc_prev)
+
+        elif co_type == 'Fast SMA × Slow SMA':
+            fp  = int(config.get('custom_fast_sma', 20))
+            sp  = int(config.get('custom_slow_sma', 50))
+            fc  = _get_indicator_col(df, 'SMA', fp)
+            sc  = _get_indicator_col(df, 'SMA', sp)
+            fc_cur,fc_prev = current.get(fc,np.nan), previous.get(fc,np.nan)
+            sc_cur,sc_prev = current.get(sc,np.nan), previous.get(sc,np.nan)
+            if any(pd.isna(v) for v in [fc_cur,fc_prev,sc_cur,sc_prev]): return None,None
+            signal_triggered = bullish(fc_cur,fc_prev,sc_cur,sc_prev) if is_bull else bearish(fc_cur,fc_prev,sc_cur,sc_prev)
+
+        elif co_type == 'MACD × Signal':
+            mc,mp = current.get('MACD',np.nan), previous.get('MACD',np.nan)
+            sc,sp2= current.get('MACD_Signal',np.nan), previous.get('MACD_Signal',np.nan)
+            if any(pd.isna(v) for v in [mc,mp,sc,sp2]): return None,None
+            signal_triggered = bullish(mc,mp,sc,sp2) if is_bull else bearish(mc,mp,sc,sp2)
+
+        elif co_type == 'Price × EMA':
+            period = int(config.get('custom_ma_period', 50))
+            col    = _get_indicator_col(df, 'EMA', period)
+            ic,ip  = current.get(col,np.nan), previous.get(col,np.nan)
+            if pd.isna(ic) or pd.isna(ip): return None,None
+            signal_triggered = bullish(current_price,prev_price,float(ic),float(ip)) if is_bull \
+                           else bearish(current_price,prev_price,float(ic),float(ip))
+
+        elif co_type == 'Price × SMA':
+            period = int(config.get('custom_ma_period', 50))
+            col    = _get_indicator_col(df, 'SMA', period)
+            ic,ip  = current.get(col,np.nan), previous.get(col,np.nan)
+            if pd.isna(ic) or pd.isna(ip): return None,None
+            signal_triggered = bullish(current_price,prev_price,float(ic),float(ip)) if is_bull \
+                           else bearish(current_price,prev_price,float(ic),float(ip))
+
+        elif co_type == 'RSI Crossover (Overbought/Oversold)':
+            period  = int(config.get('custom_rsi_period', 14))
+            ob      = float(config.get('custom_rsi_ob', 70))
+            os_lvl  = float(config.get('custom_rsi_os', 30))
+            rsi_col = f'RSI_{period}'
+            if rsi_col not in df.columns:
+                df[rsi_col] = calculate_rsi(df['Close'], period)
+            rc,rp   = df[rsi_col].iloc[idx], df[rsi_col].iloc[idx-1]
+            if pd.isna(rc) or pd.isna(rp): return None,None
+            if is_bull:   # crosses out of oversold
+                signal_triggered = float(rp) <= os_lvl and float(rc) > os_lvl
+            else:         # crosses into overbought
+                signal_triggered = float(rp) <= ob and float(rc) > ob
+
     if signal_triggered:
-        if position_type == 'LONG':
-            return 'BUY', current_price
-        else:  # SHORT
-            return 'SELL', current_price
-    
+        return ('BUY' if position_type == 'LONG' else 'SELL'), current_price
     return None, None
 
 # Strategy mapping
@@ -2227,114 +2187,79 @@ def render_config_ui():
     
     elif config['strategy'] == 'Custom Strategy':
         st.sidebar.markdown("**Custom Strategy Builder**")
-        
-        # Strategy type
         config['custom_strategy_type'] = st.sidebar.selectbox(
             "Strategy Type",
-            [
-                "Price Crosses Indicator",
-                "Price Pullback from Indicator",
-                "Indicator Crosses Level",
-                "Indicator Crossover"
-            ]
+            ["Price Crosses Indicator", "Price Pullback from Indicator",
+             "Indicator Crosses Level", "Indicator Crossover"]
         )
-        
+
         if config['custom_strategy_type'] == "Price Crosses Indicator":
-            # Select indicator
             config['custom_indicator'] = st.sidebar.selectbox(
-                "Indicator",
-                ["EMA", "SMA", "BB Upper", "BB Lower", "BB Middle"]
-            )
-            
+                "Indicator", ["EMA", "SMA", "BB Upper", "BB Lower", "BB Middle"])
             if config['custom_indicator'] in ['EMA', 'SMA']:
                 config['custom_indicator_period'] = st.sidebar.number_input("Period", min_value=1, value=20)
             elif 'BB' in config['custom_indicator']:
                 config['custom_bb_period'] = st.sidebar.number_input("BB Period", min_value=1, value=20)
-                config['custom_bb_std'] = st.sidebar.number_input("BB Std Dev", min_value=0.1, value=2.0, step=0.1)
-            
-            # Cross direction
-            config['custom_cross_type'] = st.sidebar.selectbox(
-                "Cross Type",
-                ["Above Indicator", "Below Indicator"]
-            )
-            
-            # Position type
-            config['custom_position_type'] = st.sidebar.selectbox(
-                "Position Type",
-                ["LONG", "SHORT"]
-            )
-        
+                config['custom_bb_std']    = st.sidebar.number_input("BB Std Dev", min_value=0.1, value=2.0, step=0.1)
+            config['custom_cross_type']    = st.sidebar.selectbox("Cross Type", ["Above Indicator", "Below Indicator"])
+            config['custom_position_type'] = st.sidebar.selectbox("Position Type", ["LONG", "SHORT"])
+
         elif config['custom_strategy_type'] == "Price Pullback from Indicator":
             config['custom_indicator'] = st.sidebar.selectbox(
-                "Indicator",
-                ["EMA", "SMA", "BB Upper", "BB Lower"]
-            )
-            
+                "Indicator", ["EMA", "SMA", "BB Upper", "BB Lower"])
             if config['custom_indicator'] in ['EMA', 'SMA']:
                 config['custom_indicator_period'] = st.sidebar.number_input("Period", min_value=1, value=20)
             elif 'BB' in config['custom_indicator']:
                 config['custom_bb_period'] = st.sidebar.number_input("BB Period", min_value=1, value=20)
-                config['custom_bb_std'] = st.sidebar.number_input("BB Std Dev", min_value=0.1, value=2.0, step=0.1)
-            
-            config['custom_pullback_points'] = st.sidebar.number_input("Pullback Points", min_value=1, value=10)
-            
-            # Position type
-            config['custom_position_type'] = st.sidebar.selectbox(
-                "Position Type",
-                ["LONG", "SHORT"]
-            )
-        
+                config['custom_bb_std']    = st.sidebar.number_input("BB Std Dev", min_value=0.1, value=2.0, step=0.1)
+            config['custom_pullback_points'] = st.sidebar.number_input("Pullback Points (distance)", min_value=0.01, value=10.0, step=0.01)
+            config['custom_pullback_side']   = st.sidebar.selectbox(
+                "Approach Side",
+                ["Approach from Above", "Approach from Below"],
+                help="From Above = price > indicator (pullback down to it).  From Below = price < indicator (bounce up to it).")
+            config['custom_position_type'] = st.sidebar.selectbox("Position Type", ["LONG", "SHORT"])
+
         elif config['custom_strategy_type'] == "Indicator Crosses Level":
             config['custom_indicator'] = st.sidebar.selectbox(
-                "Indicator",
-                ["RSI", "MACD", "Volume"]
-            )
-            
+                "Indicator", ["RSI", "MACD", "MACD Histogram", "ADX", "Volume", "BB %B"])
             if config['custom_indicator'] == 'RSI':
                 config['custom_rsi_period'] = st.sidebar.number_input("RSI Period", min_value=1, value=14)
-                config['custom_level'] = st.sidebar.number_input("RSI Level", min_value=0.0, max_value=100.0, value=50.0)
-            elif config['custom_indicator'] == 'MACD':
-                config['custom_level'] = st.sidebar.number_input("MACD Level", value=0.0)
+                config['custom_level']      = st.sidebar.number_input("Level", min_value=0.0, max_value=100.0, value=50.0)
+            elif config['custom_indicator'] in ['MACD', 'MACD Histogram']:
+                config['custom_level']      = st.sidebar.number_input("Level (0 = zero-line)", value=0.0)
+            elif config['custom_indicator'] == 'ADX':
+                config['custom_level']      = st.sidebar.number_input("ADX Level", min_value=0.0, value=25.0)
             elif config['custom_indicator'] == 'Volume':
-                config['custom_volume_ma_period'] = st.sidebar.number_input("Volume MA Period", min_value=1, value=20)
-                config['custom_volume_multiplier'] = st.sidebar.number_input("Volume Multiplier", min_value=0.1, value=1.5, step=0.1)
-            
-            # Cross direction
-            config['custom_cross_type'] = st.sidebar.selectbox(
-                "Cross Type",
-                ["Above Level", "Below Level"]
-            )
-            
-            # Position type
-            config['custom_position_type'] = st.sidebar.selectbox(
-                "Position Type",
-                ["LONG", "SHORT"]
-            )
-        
+                config['custom_volume_ma_period']    = st.sidebar.number_input("Volume MA Period", min_value=1, value=20)
+                config['custom_volume_multiplier']   = st.sidebar.number_input("Volume Multiplier", min_value=0.1, value=1.5, step=0.1)
+            elif config['custom_indicator'] == 'BB %B':
+                config['custom_bb_period'] = st.sidebar.number_input("BB Period", min_value=1, value=20)
+                config['custom_bb_std']    = st.sidebar.number_input("BB Std Dev", min_value=0.1, value=2.0, step=0.1)
+                config['custom_level']     = st.sidebar.number_input("%%B Level (0–100)", min_value=0.0, max_value=100.0, value=80.0)
+                st.sidebar.caption("%%B = 0 → lower band | 100 → upper band")
+            config['custom_cross_type']    = st.sidebar.selectbox("Cross Type", ["Above Level", "Below Level"])
+            config['custom_position_type'] = st.sidebar.selectbox("Position Type", ["LONG", "SHORT"])
+
         elif config['custom_strategy_type'] == "Indicator Crossover":
             config['custom_crossover_type'] = st.sidebar.selectbox(
-                "Crossover Type",
-                ["Fast EMA crosses Slow EMA", "MACD crosses Signal", "Price crosses MA"]
-            )
-            
-            if config['custom_crossover_type'] == "Fast EMA crosses Slow EMA":
+                "Crossover Pair",
+                ["Fast EMA × Slow EMA", "Fast SMA × Slow SMA",
+                 "MACD × Signal", "Price × EMA", "Price × SMA",
+                 "RSI Crossover (Overbought/Oversold)"])
+            if config['custom_crossover_type'] == "Fast EMA × Slow EMA":
                 config['custom_fast_ema'] = st.sidebar.number_input("Fast EMA", min_value=1, value=9)
                 config['custom_slow_ema'] = st.sidebar.number_input("Slow EMA", min_value=1, value=21)
-            elif config['custom_crossover_type'] == "Price crosses MA":
-                config['custom_ma_type'] = st.sidebar.selectbox("MA Type", ["EMA", "SMA"])
+            elif config['custom_crossover_type'] == "Fast SMA × Slow SMA":
+                config['custom_fast_sma'] = st.sidebar.number_input("Fast SMA", min_value=1, value=20)
+                config['custom_slow_sma'] = st.sidebar.number_input("Slow SMA", min_value=1, value=50)
+            elif config['custom_crossover_type'] in ["Price × EMA", "Price × SMA"]:
                 config['custom_ma_period'] = st.sidebar.number_input("MA Period", min_value=1, value=50)
-            
-            # Cross direction
-            config['custom_cross_type'] = st.sidebar.selectbox(
-                "Cross Type",
-                ["Bullish Crossover (Fast > Slow)", "Bearish Crossover (Fast < Slow)"]
-            )
-            
-            # Position type
-            config['custom_position_type'] = st.sidebar.selectbox(
-                "Position Type",
-                ["LONG", "SHORT"]
-            )
+            elif config['custom_crossover_type'] == "RSI Crossover (Overbought/Oversold)":
+                config['custom_rsi_period'] = st.sidebar.number_input("RSI Period", min_value=1, value=14)
+                config['custom_rsi_ob']     = st.sidebar.number_input("Overbought Level", min_value=50.0, max_value=100.0, value=70.0)
+                config['custom_rsi_os']     = st.sidebar.number_input("Oversold Level",   min_value=0.0,  max_value=50.0,  value=30.0)
+            config['custom_cross_type']    = st.sidebar.selectbox("Cross Direction", ["Bullish Crossover", "Bearish Crossover"])
+            config['custom_position_type'] = st.sidebar.selectbox("Position Type", ["LONG", "SHORT"])
     
     # Stop Loss Configuration
     st.sidebar.subheader("🛡️ Stop Loss")
@@ -2380,105 +2305,280 @@ def render_config_ui():
     
     if config['dhan_enabled']:
         config['dhan_client_id'] = st.sidebar.text_input("Client ID", value="1104779876")
-        config['dhan_access_token'] = st.sidebar.text_input("Access Token", type="password", value="eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzUxMiJ9.eyJpc3MiOiJkaGFuIiwicGFydG5lcklkIjoiIiwiZXhwIjoxNzcxMzk4NTkxLCJpYXQiOjE3NzEzMTIxOTEsInRva2VuQ29uc3VtZXJUeXBlIjoiU0VMRiIsIndlYmhvb2tVcmwiOiIiLCJkaGFuQ2xpZW50SWQiOiIxMTA0Nzc5ODc2In0.z198m5s2dlmwqvPWno-s8Pg64lDrmLnU-fjrZRxB4cWQQPkwXVL74u-lpwuCqNwqHqEVI-9MvyaqLGAYioJe1w")
+        config['dhan_access_token'] = st.sidebar.text_input("Access Token", type="password", value="eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzUxMiJ9.eyJpc3MiOiJkaGFuIiwicGFydG5lcklkIjoiIiwiZXhwIjoxNzcxMTQzMjM5LCJpYXQiOjE3NzEwNTY4MzksInRva2VuQ29uc3VtZXJUeXBlIjoiU0VMRiIsIndlYmhvb2tVcmwiOiIiLCJkaGFuQ2xpZW50SWQiOiIxMTA0Nzc5ODc2In0.qP8kVXDQt-sFa6LWJqd1MRTPESHCCPCqHzEnjsFI2WVbNdywKHXgAKHxVpuH6tP_AJTdqowv9nbqf-2NcGibbQ")
         
         config['dhan_is_options'] = st.sidebar.checkbox("Is Options", value=True)
         
         if config['dhan_is_options']:
-            # Options trading configuration
+            # ── Options trading ──
             config['dhan_ce_security_id'] = st.sidebar.text_input("CE Security ID", value="48228")
             config['dhan_pe_security_id'] = st.sidebar.text_input("PE Security ID", value="48229")
-            config['dhan_strike_price'] = st.sidebar.number_input("Strike Price", min_value=0, value=25000)
-            config['dhan_expiry_date'] = st.sidebar.date_input("Expiry Date", value=datetime.now().date())
-            config['dhan_quantity'] = st.sidebar.number_input("Dhan Quantity", min_value=1, value=65)
+            config['dhan_strike_price']   = st.sidebar.number_input("Strike Price", min_value=0, value=25000)
+            config['dhan_expiry_date']    = st.sidebar.date_input("Expiry Date", value=datetime.now().date())
+            config['dhan_quantity']       = st.sidebar.number_input("Dhan Quantity", min_value=1, value=65)
         else:
-            # Stock/Intraday trading configuration
-            st.sidebar.markdown("**Stock/Intraday Trading**")
-            config['dhan_security_id'] = st.sidebar.text_input("Security ID", value="1234", help="Stock security ID from Dhan")
-            config['dhan_exchange'] = st.sidebar.selectbox("Exchange", ["NSE", "BSE"], index=0)
-            config['dhan_quantity'] = st.sidebar.number_input("Quantity", min_value=1, value=10)
-            st.sidebar.info("Order Type: MARKET | Product: INTRA")
+            # ── Stock/Equity trading ──
+            config['dhan_trading_type'] = st.sidebar.selectbox(
+                "Trading Type",
+                ["Intraday", "Delivery (CNC)"],
+                help="Intraday = MIS/INTRA  |  Delivery = CNC positional"
+            )
+            config['dhan_security_id'] = st.sidebar.text_input("Security ID", value="1234")
+            config['dhan_exchange']    = st.sidebar.selectbox("Exchange", ["NSE", "BSE"], index=0)
+            config['dhan_quantity']    = st.sidebar.number_input("Quantity", min_value=1, value=10)
+
+            if config['dhan_trading_type'] == 'Delivery (CNC)':
+                st.sidebar.markdown("**Delivery Order Settings**")
+                st.sidebar.info("Order Type: LIMIT | Product: CNC")
+                # ── Broker-side SL / Target ──
+                config['broker_use_own_sl'] = st.sidebar.checkbox(
+                    "Use Broker SL/Target (not algo)",
+                    value=False,
+                    help="When enabled, overrides algo SL/Target and uses broker-level SL, target & trailing jump"
+                )
+                if config['broker_use_own_sl']:
+                    config['broker_sl_points']      = st.sidebar.number_input("Broker SL Points",      min_value=1,   value=50)
+                    config['broker_target_points']  = st.sidebar.number_input("Broker Target Points",  min_value=1,   value=100)
+                    config['broker_trailing_jump']  = st.sidebar.number_input("Trailing Jump (0=off)", min_value=0,   value=0)
+                    st.sidebar.info("ℹ️ Algo SL/Target will be disabled; Dhan manages exits.")
+            else:
+                st.sidebar.info("Order Type: MARKET | Product: INTRA")
     
     return config
 
 def render_backtest_ui(config):
-    """Render backtesting interface"""
+    """Render backtesting interface with EMA plot and IST time filter"""
     st.header("📈 Backtest Results")
-    
+
+    # ── Time-filter checkbox (outside Run button so it persists) ──────────────
+    filter_market_hours = st.checkbox(
+        "🕐 Filter to Market Hours Only (9:15 AM – 3:15 PM IST)",
+        value=False,
+        help="Removes gap-up / gap-down candles that occur before 9:15 AM or after 3:15 PM IST, which can distort accuracy statistics."
+    )
+
     if st.button("Run Backtest", type="primary"):
         with st.spinner("Running backtest..."):
-            # Fetch data
-            ticker = config.get('asset', 'NIFTY 50')
-            interval = INTERVAL_MAPPING.get(config.get('interval', '1 day'), '1d')
-            period = PERIOD_MAPPING.get(config.get('period', '1 month'), '1mo')
+            ticker       = config.get('asset', 'NIFTY 50')
+            interval     = INTERVAL_MAPPING.get(config.get('interval', '1 day'), '1d')
+            period       = PERIOD_MAPPING.get(config.get('period', '1 month'), '1mo')
             custom_ticker = config.get('custom_ticker', None)
-            
+
             df = fetch_data(ticker, interval, period, custom_ticker=custom_ticker)
-            
+
             if df is not None:
-                # Calculate indicators
                 df = calculate_all_indicators(df, config)
-                
-                # Run backtest
                 trades, metrics, debug_info = run_backtest(df, config)
-                
-                # Store in session
+
                 st.session_state['backtest_results'] = {
-                    'trades': trades,
-                    'metrics': metrics,
-                    'debug_info': debug_info
+                    'trades':     trades,
+                    'metrics':    metrics,
+                    'debug_info': debug_info,
+                    'df':         df          # store for chart
                 }
-    
-    # Display results
+
+    # ── Display results ───────────────────────────────────────────────────────
     if 'backtest_results' in st.session_state:
-        results = st.session_state['backtest_results']
-        metrics = results['metrics']
-        trades = results['trades']
+        results    = st.session_state['backtest_results']
+        all_trades = results['trades']
         debug_info = results['debug_info']
-        
-        # Display metrics
+        df_chart   = results.get('df')
+
+        # ── Apply IST time filter if checkbox is on ───────────────────────────
+        IST = pytz.timezone('Asia/Kolkata')
+        if filter_market_hours and all_trades:
+            filtered_trades = []
+            for t in all_trades:
+                et = t.get('entry_time')
+                xt = t.get('exit_time')
+                try:
+                    # Normalise to IST
+                    if et is not None:
+                        if hasattr(et, 'tzinfo') and et.tzinfo is not None:
+                            et_ist = et.astimezone(IST)
+                        else:
+                            et_ist = IST.localize(et)
+                        entry_ok = (et_ist.hour > 9 or (et_ist.hour == 9 and et_ist.minute >= 15)) and \
+                                   (et_ist.hour < 15 or (et_ist.hour == 15 and et_ist.minute <= 15))
+                    else:
+                        entry_ok = True
+                    if exit_ok := True:
+                        if xt is not None:
+                            if hasattr(xt, 'tzinfo') and xt.tzinfo is not None:
+                                xt_ist = xt.astimezone(IST)
+                            else:
+                                xt_ist = IST.localize(xt)
+                            exit_ok = (xt_ist.hour > 9 or (xt_ist.hour == 9 and xt_ist.minute >= 15)) and \
+                                      (xt_ist.hour < 15 or (xt_ist.hour == 15 and xt_ist.minute <= 15))
+                    if entry_ok and exit_ok:
+                        filtered_trades.append(t)
+                except Exception:
+                    filtered_trades.append(t)
+
+            trades = filtered_trades
+            st.info(f"🕐 Market-hours filter applied: {len(trades)} / {len(all_trades)} trades shown")
+        else:
+            trades = all_trades
+
+        # ── Recompute metrics on filtered trades ──────────────────────────────
+        if trades:
+            df_t = pd.DataFrame(trades)
+            total_trades   = len(df_t)
+            winning_trades = int((df_t['pnl'] > 0).sum())
+            losing_trades  = int((df_t['pnl'] < 0).sum())
+            win_rate       = (winning_trades / total_trades * 100) if total_trades else 0
+            total_pnl      = float(df_t['pnl'].sum())
+            avg_pnl        = float(df_t['pnl'].mean())
+            cum_pnl        = df_t['pnl'].cumsum()
+            max_drawdown   = float((cum_pnl - cum_pnl.cummax()).min())
+        else:
+            total_trades = winning_trades = losing_trades = 0
+            win_rate = total_pnl = avg_pnl = max_drawdown = 0.0
+
+        metrics = dict(total_trades=total_trades, winning_trades=winning_trades,
+                       losing_trades=losing_trades, win_rate=win_rate,
+                       total_pnl=total_pnl, avg_pnl=avg_pnl, max_drawdown=max_drawdown)
+
+        # ── Metrics display ───────────────────────────────────────────────────
         col1, col2, col3, col4 = st.columns(4)
-        
-        with col1:
-            st.metric("Total Trades", metrics['total_trades'])
-        with col2:
-            st.metric("Win Rate", f"{metrics['win_rate']:.2f}%")
-        with col3:
-            st.metric("Total P&L", f"₹{metrics['total_pnl']:.2f}")
-        with col4:
-            st.metric("Avg Trade", f"₹{metrics['avg_pnl']:.2f}")
-        
-        col5, col6 = st.columns(2)
-        with col5:
-            st.metric("Winning Trades", metrics['winning_trades'])
-        with col6:
-            st.metric("Losing Trades", metrics['losing_trades'])
-        
-        st.metric("Max Drawdown", f"₹{metrics['max_drawdown']:.2f}")
-        
-        # Display trades table
+        with col1: st.metric("Total Trades",    metrics['total_trades'])
+        with col2: st.metric("Win Rate",        f"{metrics['win_rate']:.2f}%")
+        with col3: st.metric("Total P&L",       f"₹{metrics['total_pnl']:.2f}")
+        with col4: st.metric("Avg Trade",       f"₹{metrics['avg_pnl']:.2f}")
+        col5, col6, col7 = st.columns(3)
+        with col5: st.metric("Winning Trades",  metrics['winning_trades'])
+        with col6: st.metric("Losing Trades",   metrics['losing_trades'])
+        with col7: st.metric("Max Drawdown",    f"₹{metrics['max_drawdown']:.2f}")
+
+        # ── EMA Crossover chart ───────────────────────────────────────────────
+        if df_chart is not None:
+            st.subheader("📊 Price Chart with EMA Overlay & Signals")
+            strategy = config.get('strategy', '')
+
+            # Determine how many candles to show (cap at 300 for readability)
+            plot_df = df_chart.tail(300).copy()
+
+            fig = go.Figure()
+
+            # Candlestick
+            fig.add_trace(go.Candlestick(
+                x=plot_df['Datetime'],
+                open=plot_df['Open'], high=plot_df['High'],
+                low=plot_df['Low'],   close=plot_df['Close'],
+                name='Price', increasing_line_color='#26a69a',
+                decreasing_line_color='#ef5350'
+            ))
+
+            # EMA overlays (always shown when columns exist)
+            if 'EMA_Fast' in plot_df.columns:
+                fast_p = config.get('ema_fast', 9)
+                fig.add_trace(go.Scatter(
+                    x=plot_df['Datetime'], y=plot_df['EMA_Fast'],
+                    mode='lines', name=f'EMA {fast_p}',
+                    line=dict(color='#FF9800', width=1.5)))
+
+            if 'EMA_Slow' in plot_df.columns:
+                slow_p = config.get('ema_slow', 21)
+                fig.add_trace(go.Scatter(
+                    x=plot_df['Datetime'], y=plot_df['EMA_Slow'],
+                    mode='lines', name=f'EMA {slow_p}',
+                    line=dict(color='#2196F3', width=1.5)))
+
+            # BB overlay if custom strategy uses BB
+            if 'BB_Upper' in plot_df.columns and strategy == 'Custom Strategy':
+                fig.add_trace(go.Scatter(x=plot_df['Datetime'], y=plot_df['BB_Upper'],
+                    mode='lines', name='BB Upper', line=dict(color='#9C27B0', width=1, dash='dot')))
+                fig.add_trace(go.Scatter(x=plot_df['Datetime'], y=plot_df['BB_Lower'],
+                    mode='lines', name='BB Lower', line=dict(color='#9C27B0', width=1, dash='dot'),
+                    fill='tonexty', fillcolor='rgba(156,39,176,0.05)'))
+                fig.add_trace(go.Scatter(x=plot_df['Datetime'], y=plot_df['BB_Middle'],
+                    mode='lines', name='BB Mid', line=dict(color='#9C27B0', width=1)))
+
+            # Plot trade entry/exit markers from *filtered* trades
+            if trades:
+                # Filter markers to the plotted window
+                min_dt = plot_df['Datetime'].min()
+                for tr in trades:
+                    et = tr.get('entry_time')
+                    xt = tr.get('exit_time')
+                    ep = tr.get('entry_price')
+                    xp = tr.get('exit_price')
+                    pos = tr.get('type', 'LONG')
+
+                    if et is not None and ep is not None:
+                        try:
+                            if hasattr(et, 'tzinfo') and et.tzinfo and hasattr(min_dt, 'tzinfo') and min_dt.tzinfo:
+                                in_window = et >= min_dt
+                            else:
+                                in_window = True
+                        except Exception:
+                            in_window = True
+                        if in_window:
+                            fig.add_trace(go.Scatter(
+                                x=[et], y=[ep],
+                                mode='markers',
+                                marker=dict(symbol='triangle-up' if pos == 'LONG' else 'triangle-down',
+                                            size=12,
+                                            color='#00E676' if pos == 'LONG' else '#FF1744',
+                                            line=dict(width=1, color='black')),
+                                name=f'Entry {pos}', showlegend=False,
+                                hovertemplate=f"Entry {pos}<br>Price: {ep:.2f}<extra></extra>"))
+
+                    if xt is not None and xp is not None:
+                        try:
+                            in_window = True
+                        except Exception:
+                            in_window = True
+                        if in_window:
+                            fig.add_trace(go.Scatter(
+                                x=[xt], y=[xp],
+                                mode='markers',
+                                marker=dict(symbol='x', size=10,
+                                            color='#FF6F00',
+                                            line=dict(width=2, color='black')),
+                                name='Exit', showlegend=False,
+                                hovertemplate=f"Exit<br>Price: {xp:.2f}<extra></extra>"))
+
+            # Market-hours shading for intraday intervals
+            if filter_market_hours and '1d' not in INTERVAL_MAPPING.get(config.get('interval',''), '1d'):
+                pass  # shading optional, skip for clarity
+
+            fig.update_layout(
+                title=f"{config.get('asset','Asset')} — {config.get('interval','')}"
+                      + (" [Market Hours Filter ON]" if filter_market_hours else ""),
+                xaxis_title='Time',
+                yaxis_title='Price',
+                xaxis_rangeslider_visible=False,
+                height=500,
+                legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1),
+                hovermode='x unified',
+                template='plotly_dark'
+            )
+            st.plotly_chart(fig, use_container_width=True)
+
+        # ── Trade table ───────────────────────────────────────────────────────
         if trades:
             st.subheader("Trade History")
             df_trades = pd.DataFrame(trades)
+            # Friendly column formatting
+            for col in ['entry_price','exit_price','sl_price','target_price','pnl']:
+                if col in df_trades.columns:
+                    df_trades[col] = df_trades[col].apply(
+                        lambda x: f"₹{x:.2f}" if pd.notna(x) else "—")
             st.dataframe(df_trades, use_container_width=True)
-        
-        # Display debug info if no trades
+
+        # ── Debug expander ────────────────────────────────────────────────────
         if metrics['total_trades'] == 0:
             st.warning("⚠️ No trades generated")
-            
-            with st.expander("🔍 Debug Information"):
-                st.write("**Backtest Statistics:**")
-                st.write(f"- Total Candles: {debug_info['total_candles']}")
-                st.write(f"- Candles Analyzed: {debug_info['candles_analyzed']}")
-                st.write(f"- Signals Generated: {debug_info['signals_generated']}")
-                st.write(f"- Trades Entered: {debug_info['trades_entered']}")
-                st.write(f"- Trades Completed: {debug_info['trades_completed']}")
-                
-                st.write("\n**Suggestions:**")
-                st.write("- Try reducing the Minimum Angle filter")
-                st.write("- Use a longer historical period")
-                st.write("- Adjust entry filter settings")
-                st.write("- Check if indicators are calculating correctly")
+
+        with st.expander("🔍 Debug Information"):
+            st.write(f"- Total Candles: {debug_info['total_candles']}")
+            st.write(f"- Candles Analyzed: {debug_info['candles_analyzed']}")
+            st.write(f"- Signals Generated: {debug_info['signals_generated']}")
+            st.write(f"- Trades Entered: {debug_info['trades_entered']}")
+            st.write(f"- Trades Completed: {debug_info['trades_completed']}")
+            if filter_market_hours:
+                st.write(f"- Trades after time filter: {len(trades)}")
 
 def render_live_trading_ui(config):
     """Render live trading interface with comprehensive information"""
