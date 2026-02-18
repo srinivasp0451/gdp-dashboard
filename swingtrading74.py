@@ -2540,9 +2540,9 @@ def render_backtest_ui(config):
 
     # ── Time-filter checkbox (outside Run button so it persists) ──────────────
     filter_market_hours = st.checkbox(
-        "🕐 Filter to Market Hours Only (9:15 AM – 3:15 PM IST)",
+        "🕐 Filter Same-Day Trades Only (9:15 AM – 3:00 PM IST)",
         value=False,
-        help="Removes gap-up / gap-down candles that occur before 9:15 AM or after 3:15 PM IST, which can distort accuracy statistics."
+        help="Shows only trades that were entered AND exited on the same day between 9:15 AM and 3:00 PM IST. Removes gap-up/gap-down and overnight trades."
     )
 
     if st.button("Run Backtest", type="primary"):
@@ -2586,25 +2586,46 @@ def render_backtest_ui(config):
                             et_ist = et.astimezone(IST)
                         else:
                             et_ist = IST.localize(et)
+                        # Entry must be between 9:15 AM and 3:00 PM (not 3:15 PM)
                         entry_ok = (et_ist.hour > 9 or (et_ist.hour == 9 and et_ist.minute >= 15)) and \
-                                   (et_ist.hour < 15 or (et_ist.hour == 15 and et_ist.minute <= 15))
+                                   (et_ist.hour < 15)  # Strictly before 3:00 PM
                     else:
-                        entry_ok = True
-                    if exit_ok := True:
-                        if xt is not None:
-                            if hasattr(xt, 'tzinfo') and xt.tzinfo is not None:
-                                xt_ist = xt.astimezone(IST)
-                            else:
-                                xt_ist = IST.localize(xt)
-                            exit_ok = (xt_ist.hour > 9 or (xt_ist.hour == 9 and xt_ist.minute >= 15)) and \
-                                      (xt_ist.hour < 15 or (xt_ist.hour == 15 and xt_ist.minute <= 15))
-                    if entry_ok and exit_ok:
+                        entry_ok = False  # Reject if no entry time
+                    
+                    if xt is not None:
+                        if hasattr(xt, 'tzinfo') and xt.tzinfo is not None:
+                            xt_ist = xt.astimezone(IST)
+                        else:
+                            xt_ist = IST.localize(xt)
+                        # Exit must be between 9:15 AM and 3:00 PM
+                        exit_ok = (xt_ist.hour > 9 or (xt_ist.hour == 9 and xt_ist.minute >= 15)) and \
+                                  (xt_ist.hour < 15)  # Strictly before 3:00 PM
+                    else:
+                        exit_ok = False  # Reject if no exit time
+                    
+                    # SAME DAY CHECK: entry and exit must be on same date
+                    same_day = False
+                    if et is not None and xt is not None:
+                        if hasattr(et, 'tzinfo') and et.tzinfo is not None:
+                            et_ist = et.astimezone(IST)
+                        else:
+                            et_ist = IST.localize(et) if not hasattr(et, 'tzinfo') or et.tzinfo is None else et
+                        if hasattr(xt, 'tzinfo') and xt.tzinfo is not None:
+                            xt_ist = xt.astimezone(IST)
+                        else:
+                            xt_ist = IST.localize(xt) if not hasattr(xt, 'tzinfo') or xt.tzinfo is None else xt
+                        
+                        same_day = et_ist.date() == xt_ist.date()
+                    
+                    # All three conditions must be true
+                    if entry_ok and exit_ok and same_day:
                         filtered_trades.append(t)
                 except Exception:
-                    filtered_trades.append(t)
+                    # Skip trades with timestamp errors
+                    pass
 
             trades = filtered_trades
-            st.info(f"🕐 Market-hours filter applied: {len(trades)} / {len(all_trades)} trades shown")
+            st.info(f"🕐 Same-day filter (9:15 AM–3:00 PM IST): {len(trades)} / {len(all_trades)} trades shown")
         else:
             trades = all_trades
 
@@ -2766,7 +2787,7 @@ def render_backtest_ui(config):
             st.write(f"- Trades Entered: {debug_info['trades_entered']}")
             st.write(f"- Trades Completed: {debug_info['trades_completed']}")
             if filter_market_hours:
-                st.write(f"- Trades after time filter: {len(trades)}")
+                st.write(f"- Trades after same-day filter (9:15 AM–3:00 PM IST): {len(trades)}")
 
 def render_live_trading_ui(config):
     """Render live trading interface with comprehensive information"""
