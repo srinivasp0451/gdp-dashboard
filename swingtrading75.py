@@ -22,6 +22,8 @@ for k, v in {
     "theme":"White","trading_active":False,"trade_history":[],"open_positions":{},
     "live_realized_pnl":0.0,"live_unrealized_pnl":0.0,"paper_capital":100000.0,
     "last_fetch_time":{},"bt_run":False,"last_auto_refresh":0.0,"auto_refresh_interval":30,
+    "dhan_enabled":False,"dhan_client_id":"","dhan_access_token":"",
+    "dhan_orders":{},"dhan_product":"INTRADAY",
 }.items():
     if k not in st.session_state: st.session_state[k]=v
 
@@ -82,6 +84,33 @@ input:focus {{ border-color:{T['ACCENT']} !important; }}
 .tf-badge {{ display:inline-block; background:{T['CARD_BG2']}; color:{T['ACCENT']}; border:1px solid rgba(245,158,11,0.4); border-radius:6px; padding:2px 8px; font-size:11px; font-weight:700; font-family:'JetBrains Mono',monospace; margin:2px; }}
 .stAlert,[data-testid="stAlert"] {{ background:{T['CARD_BG']} !important; color:{T['TEXT']} !important; border-color:{T['BORDER']} !important; }}
 .stProgress > div > div {{ background:{T['ACCENT']} !important; }}
+/* ── RESPONSIVE ── */
+@media(max-width:768px){{
+  .block-container{{padding:.5rem .8rem!important}}
+  [data-testid="stMetricValue"]{{font-size:14px!important}}
+  [data-testid="stHorizontalBlock"]{{flex-wrap:wrap!important}}
+  [data-testid="stHorizontalBlock"]>div{{min-width:130px!important;flex:1 1 130px!important}}
+  .stTabs [data-baseweb="tab"]{{font-size:10px!important;padding:4px 7px!important}}
+  .section-hdr{{font-size:13px!important}}
+  .alpha-card{{padding:10px 12px!important}}
+}}
+@media(max-width:480px){{
+  .block-container{{padding:.3rem .4rem!important}}
+  [data-testid="stHorizontalBlock"]>div{{min-width:100px!important}}
+}}
+@media(min-width:1400px){{
+  .block-container{{max-width:1380px!important;padding-left:2rem!important;padding-right:2rem!important}}
+}}
+/* ── LIVE METRICS ── */
+.lm-box{{background:{T['CARD_BG']};border:1px solid {T['BORDER']};border-radius:10px;padding:10px 12px;text-align:center;transition:background .3s}}
+.lm-lbl{{font-size:10px;color:{T['TEXT_MUTED']};text-transform:uppercase;letter-spacing:.8px;margin-bottom:3px}}
+.lm-val{{font-family:'JetBrains Mono',monospace;font-size:17px;font-weight:800;line-height:1.2}}
+.lm-sub{{font-size:10px;margin-top:2px}}
+/* ── DHAN ── */
+.dhan-box{{background:{T['CARD_BG']};border:1px solid {T['BLUE']}50;border-left:4px solid {T['BLUE']};border-radius:10px;padding:12px 16px;margin:6px 0}}
+.order-ok{{background:{T['GREEN']}15;border:1px solid {T['GREEN']}50;border-radius:8px;padding:8px 12px;margin:3px 0;font-size:13px}}
+.order-fail{{background:{T['RED']}15;border:1px solid {T['RED']}50;border-radius:8px;padding:8px 12px;margin:3px 0;font-size:13px}}
+.order-skip{{background:{T['ACCENT']}15;border:1px solid {T['ACCENT']}50;border-radius:8px;padding:8px 12px;margin:3px 0;font-size:13px}}
 </style>
 """, unsafe_allow_html=True)
 
@@ -573,6 +602,107 @@ def update_unreal(cur_price,asset,capital,risk_pct):
             new_tsl=cur_price*(1+p["trail_pct"]/100)
             st.session_state["open_positions"][key]["sl"]=min(p["sl"],new_tsl)
     st.session_state["live_unrealized_pnl"]=total
+
+# ─── DHAN ORDER ENGINE ──────────────────────────────────────────────────────
+def dhan_place_order(symbol, qty, side, client_id, access_token, exchange="NSE_EQ", product="INTRADAY"):
+    """Place a BUY order via Dhan API. Returns (order_id, message)."""
+    url="https://api.dhan.co/orders"
+    headers={"Content-Type":"application/json","access-token":access_token}
+    payload={"dhanClientId":client_id,"transactionType":side,"exchangeSegment":exchange,
+        "productType":product,"orderType":"MARKET","validity":"DAY","tradingSymbol":symbol,
+        "securityId":"","quantity":str(qty),"price":"0","triggerPrice":"0",
+        "disclosedQuantity":"0","afterMarketOrder":False,"amoTime":"OPEN",
+        "boProfitValue":"0","boStopLossValue":"0"}
+    try:
+        r=requests.post(url,json=payload,headers=headers,timeout=10)
+        if r.status_code in (200,201):
+            d=r.json(); return d.get("orderId") or d.get("order_id"),"OK"
+        return None, f"HTTP {r.status_code}: {r.text[:100]}"
+    except Exception as e: return None, str(e)
+
+def dhan_get_status(order_id, access_token):
+    """Get current status of a Dhan order."""
+    try:
+        r=requests.get(f"https://api.dhan.co/orders/{order_id}",
+            headers={"access-token":access_token},timeout=8)
+        if r.status_code==200: return r.json().get("orderStatus","UNKNOWN")
+    except Exception: pass
+    return "UNKNOWN"
+
+def dhan_resolve_symbol(asset_name, direction, trade_type, atm_strike):
+    """
+    Returns (symbol, exchange, is_option, opt_type).
+    Rules:
+    - Indices (Nifty/BankNifty): always options CE/PE
+    - Stocks (.NS): equity BUY/SELL
+    - Other (crypto, forex): not supported
+    Direction: 1=long, -1=short
+    """
+    raw=ASSET_MAP.get(asset_name,"")
+    opt_type="CE" if direction==1 else "PE"
+    # Index → FNO options
+    idx_map={"^NSEI":"NIFTY","^NSEBANK":"BANKNIFTY","^BSESN":"SENSEX"}
+    if raw in idx_map:
+        base=idx_map[raw]
+        expiry=datetime.now().strftime("%d%b%y").upper()
+        sym=f"{base}{expiry}{atm_strike}{opt_type}"
+        return sym,"NSE_FNO",True,opt_type
+    # Stock equity
+    if raw.endswith(".NS"):
+        sym=raw.replace(".NS","")
+        return sym,"NSE_EQ",False,opt_type
+    return None,None,False,opt_type
+
+def dhan_execute(signal, asset_name, strategy, trade_type, atm_strike, qty_est,
+                  client_id, access_token, product):
+    """
+    Buyer-only Dhan order logic:
+    - LONG  → BUY CE (options) or BUY stock
+    - SHORT → BUY PE (options) or SELL stock ONLY if prior BUY is TRADED
+    - Never short-sell stocks naked
+    """
+    orders=st.session_state["dhan_orders"]
+    key=f"{asset_name}_{strategy}"
+    sym, exch, is_opt, opt_t = dhan_resolve_symbol(asset_name, signal, trade_type, atm_strike)
+    if sym is None:
+        return {"action":"SKIPPED","msg":"Instrument not supported (crypto/forex)","sym":"—"}
+
+    if signal==1:  # LONG → BUY CE or BUY stock
+        oid, msg = dhan_place_order(sym, max(qty_est,1), "BUY", client_id, access_token, exch, product)
+        if oid:
+            orders[key]={"order_id":oid,"symbol":sym,"qty":max(qty_est,1),"side":"BUY",
+                "status":"PLACED","direction":1,"is_opt":is_opt,"exch":exch,
+                "placed_at":datetime.now().strftime("%H:%M:%S")}
+            return {"action":"BUY_PLACED","sym":sym,"oid":oid,"msg":"OK"}
+        return {"action":"BUY_FAILED","sym":sym,"oid":None,"msg":msg}
+
+    elif signal==-1:  # SHORT
+        if is_opt:  # BUY PE option
+            oid, msg = dhan_place_order(sym, max(qty_est,1), "BUY", client_id, access_token, exch, product)
+            if oid:
+                orders[key]={"order_id":oid,"symbol":sym,"qty":max(qty_est,1),"side":"BUY",
+                    "status":"PLACED","direction":-1,"is_opt":True,"exch":exch,
+                    "placed_at":datetime.now().strftime("%H:%M:%S")}
+                return {"action":"PE_BUY_PLACED","sym":sym,"oid":oid,"msg":"OK"}
+            return {"action":"PE_BUY_FAILED","sym":sym,"oid":None,"msg":msg}
+        else:  # Stock: square off ONLY if prior BUY is confirmed TRADED
+            if key in orders and orders[key].get("side")=="BUY":
+                status=dhan_get_status(orders[key]["order_id"], access_token)
+                orders[key]["status"]=status
+                if status in ("TRADED","PART_TRADED"):
+                    sq_oid, sq_msg = dhan_place_order(sym, orders[key]["qty"], "SELL",
+                        client_id, access_token, exch, product)
+                    if sq_oid:
+                        orders[key]["status"]="SQUARED_OFF"
+                        orders[key]["sell_oid"]=sq_oid
+                        return {"action":"SQUAREOFF_PLACED","sym":sym,"oid":sq_oid,"msg":"OK"}
+                    return {"action":"SQUAREOFF_FAILED","sym":sym,"oid":None,"msg":sq_msg}
+                return {"action":"SKIPPED","sym":sym,"oid":None,
+                    "msg":f"BUY not filled yet (status={status}). Won't short-sell."}
+            return {"action":"SKIPPED","sym":sym,"oid":None,
+                "msg":"No active BUY order found. Never short-selling naked."}
+    return {"action":"NO_ACTION","sym":"—","oid":None,"msg":"Signal=0"}
+
 def price_chart(df,sig_df=None,an=None,title="",tflabel=""):
     fig=make_subplots(rows=4,cols=1,shared_xaxes=True,row_heights=[0.55,0.15,0.15,0.15],
         vertical_spacing=0.02,subplot_titles=(f"{title} {tflabel}","Volume","RSI(14)","MACD"))
@@ -771,6 +901,21 @@ with st.sidebar:
     refresh_int=st.slider("Auto-Refresh (sec)",15,120,30,5)
     st.session_state["auto_refresh_interval"]=refresh_int
     st.markdown("---")
+    # ── Dhan Integration ──────────────────────────────────────────
+    dhan_on=st.checkbox("🏦 Enable Dhan Orders",value=st.session_state["dhan_enabled"],
+        help="Place real/paper orders via Dhan API (buyer perspective only)")
+    st.session_state["dhan_enabled"]=dhan_on
+    if dhan_on:
+        st.session_state["dhan_client_id"]=st.text_input(
+            "Client ID",st.session_state["dhan_client_id"],key="d_cid")
+        st.session_state["dhan_access_token"]=st.text_input(
+            "Access Token",st.session_state["dhan_access_token"],type="password",key="d_tok")
+        st.session_state["dhan_product"]=st.selectbox(
+            "Product",["INTRADAY","CNC","MARGIN"],
+            index=["INTRADAY","CNC","MARGIN"].index(st.session_state["dhan_product"]))
+        st.caption("✅ LONG→BUY CE/Stock  |  SHORT→BUY PE / Square-off only if BUY filled")
+    dhan_product=st.session_state["dhan_product"]
+    st.markdown("---")
     run_btn=st.button("🚀 Run Analysis",use_container_width=True)
     if run_btn: st.session_state["bt_run"]=True; st.cache_data.clear()
 
@@ -828,8 +973,8 @@ with tab1:
                 for col,lbl,val in zip(mc2,["Net P&L","Total Return","Avg Win","Avg Loss"],
                     [f"Rs{m['Net P&L']:,.0f}",f"{m['Total Return %']}%",f"{m['Avg Win %']}%",f"{m['Avg Loss %']}%"]):
                     with col: st.metric(lbl,val)
-                st.plotly_chart(price_chart(df_ind.tail(250),df_sig.tail(250),None,f"{asset_name_sel} — {strategy_name}",f"[{bt_interval}|{bt_period}]"),use_container_width=True)
-                st.plotly_chart(equity_chart(result["equity"],result["drawdown"],result["trades"]),use_container_width=True)
+                st.plotly_chart(price_chart(df_ind.tail(250),df_sig.tail(250),None,f"{asset_name_sel} — {strategy_name}",f"[{bt_interval}|{bt_period}]"),use_container_width=True, key="pc_1")
+                st.plotly_chart(equity_chart(result["equity"],result["drawdown"],result["trades"]),use_container_width=True, key="pc_2")
                 section("📋 Trade Log")
                 tdf2=result["trades"].copy()
                 st.dataframe(tdf2[["Entry Date","Exit Date","Direction","Entry","Exit","SL","Target","P&L %","P&L Rs","Capital","Exit Reason"]].tail(60),use_container_width=True,height=300)
@@ -838,15 +983,15 @@ with tab1:
                     ec=result["trades"]["Exit Reason"].value_counts().reset_index()
                     pie=px.pie(ec,names="Exit Reason",values="count",color_discrete_sequence=[T["GREEN"],T["RED"],T["ACCENT"],T["BLUE"],T["PURPLE"]],title="Exit Reasons")
                     pie.update_layout(paper_bgcolor=T["PLOT_PAPER"],font_color=T["TEXT"],height=300)
-                    st.plotly_chart(pie,use_container_width=True)
+                    st.plotly_chart(pie,use_container_width=True, key="pc_3")
                 with cc2:
                     hist_fig=px.histogram(result["trades"],x="P&L %",nbins=30,color_discrete_sequence=[T["BLUE"]],title="P&L Distribution")
                     hist_fig.update_layout(paper_bgcolor=T["PLOT_PAPER"],plot_bgcolor=T["PLOT_BG"],font_color=T["TEXT"],height=300)
-                    st.plotly_chart(hist_fig,use_container_width=True)
+                    st.plotly_chart(hist_fig,use_container_width=True, key="pc_4")
                 section("📈 OHLC Daily Returns — 1Y")
                 ohlc1y=fetch_data(ticker,"1y","1d")
                 if not ohlc1y.empty:
-                    st.plotly_chart(returns_chart(ohlc1y,asset_name_sel),use_container_width=True)
+                    st.plotly_chart(returns_chart(ohlc1y,asset_name_sel),use_container_width=True, key="pc_5")
                     tbl=ohlc_table(ohlc1y)
                     st.dataframe(tbl,use_container_width=True,height=320)
     else:
@@ -878,43 +1023,158 @@ with tab2:
             <b style="color:{tc}">{tt}</b> | <span style="color:{T['TEXT_MUTED']};font-size:12px">
             Capital: <b>Rs{st.session_state['paper_capital']:,.0f}</b> | {live_interval} | {live_period} | Refresh: {refresh_int}s</span></div>""",unsafe_allow_html=True)
     if ticker=="NIFTY50_ALL": st.warning("Select a specific ticker for Live Trading."); st.stop()
-    st.info(f"Yahoo Finance (15-20 min delay India) | Rate limit: {FETCH_DELAY}s | Interval: {live_interval} | Period: {live_period}")
+    st.info(f"Data via Yahoo Finance | Rate limit: {FETCH_DELAY}s | Interval: {live_interval} | Period: {live_period} | ~15-20min delay for India")
+
+    # ── Placeholders — update in-place without full tab re-render ──
+    metrics_ph = st.empty()
+    signal_ph  = st.empty()
+    hits_ph    = st.empty()
+    dhan_ph    = st.empty()
+
+    # ── Fetch with explicit 1.5s delays between each call ──
     with st.spinner("Fetching live data..."):
-        live_raw=fetch_live(ticker,live_interval,live_period)
-    if live_raw.empty: st.error("No live data."); st.stop()
-    live_df=compute_indicators(live_raw)
-    live_sig=get_strat(live_df,strategy_key,sl_val,rr_ratio,trail_sl,tsl_pct)
-    an=generate_analysis(live_df,ticker,asset_name_sel,sl_type,sl_val,rr_ratio,capital,risk_pct)
-    if not an: st.warning("Insufficient data."); st.stop()
-    cur_price=an["price"]
+        live_raw = fetch_live(ticker, live_interval, live_period)
+        time.sleep(FETCH_DELAY)
+
+    if live_raw.empty: st.error("No live data. Check ticker or connection."); st.stop()
+    live_df  = compute_indicators(live_raw)
+    time.sleep(FETCH_DELAY)
+    live_sig = get_strat(live_df, strategy_key, sl_val, rr_ratio, trail_sl, tsl_pct)
+    time.sleep(FETCH_DELAY)
+    an = generate_analysis(live_df, ticker, asset_name_sel, sl_type, sl_val, rr_ratio, capital, risk_pct)
+    if not an: st.warning("Insufficient data for analysis."); st.stop()
+    cur_price = an["price"]
+
+    # ── Process signals and SL/TGT hits ──
+    dhan_result = None
     if st.session_state["trading_active"]:
-        latest_sig=int(live_sig["Signal"].iloc[-1])
-        latest_atr=float(live_sig["ATR"].iloc[-1])
-        if latest_sig!=0:
-            process_live_signal(latest_sig,cur_price,latest_atr,strategy_key,asset_name_sel,
-                sl_type,sl_val,rr_ratio,tsl_pct,capital,risk_pct)
-        hits=check_sl_tgt_hits(cur_price,asset_name_sel,capital,risk_pct)
-        if hits>0: st.success(f"🎯 {hits} position(s) auto-closed (SL/Target hit)")
-    update_unreal(cur_price,asset_name_sel,capital,risk_pct)
-    realized=st.session_state["live_realized_pnl"]
-    unrealized=st.session_state["live_unrealized_pnl"]
-    total_pnl=realized+unrealized
-    prev_px=float(live_df["Close"].iloc[-2]) if len(live_df)>1 else cur_price
-    price_chg=cur_price-prev_px; price_pct=price_chg/prev_px*100 if prev_px else 0
-    pm=st.columns(6)
-    with pm[0]: st.metric("📍 LTP",f"Rs{cur_price:,.2f}",f"{price_chg:+.2f} ({price_pct:+.2f}%)")
-    with pm[1]: st.metric("💰 Realized",f"Rs{realized:+,.0f}")
-    with pm[2]: st.metric("📊 Unrealized",f"Rs{unrealized:+,.0f}")
-    with pm[3]: st.metric("🏦 Total P&L",f"Rs{total_pnl:+,.0f}")
-    with pm[4]: st.metric("📂 Open Pos",len(st.session_state["open_positions"]))
-    with pm[5]: st.metric("RSI / ATR",f"{an['rsi']:.1f} / {an['atr']:.1f}")
-    st.markdown("---")
-    sig_c=T["GREEN"] if "BUY" in an["bias"] else (T["RED"] if "SELL" in an["bias"] else T["ACCENT"])
-    st.markdown(f"""<div style="background:{sig_c}10;border:1px solid {sig_c}40;border-left:5px solid {sig_c};
-        border-radius:10px;padding:14px 20px;margin:8px 0">
-        <span style="font-size:22px;font-weight:800;color:{sig_c}">{an['strength']} {an['bias']}</span>
-        <span style="color:{T['TEXT_MUTED']};font-size:12px"> | {strategy_name} | Trend:{an['trend_score']}/10 | Mom:{an['mom_score']}/10 | Score:{an['combined']}/20 | HV:{an['hv20']}% | IV:{an['iv_pct']}% | {datetime.now().strftime('%H:%M:%S')}</span>
-    </div>""",unsafe_allow_html=True)
+        latest_sig = int(live_sig["Signal"].iloc[-1])
+        latest_atr = float(live_sig["ATR"].iloc[-1])
+        if latest_sig != 0:
+            process_live_signal(latest_sig, cur_price, latest_atr, strategy_key,
+                asset_name_sel, sl_type, sl_val, rr_ratio, tsl_pct, capital, risk_pct)
+            # Dhan order if enabled and credentials set
+            if (st.session_state["dhan_enabled"]
+                    and st.session_state["dhan_client_id"]
+                    and st.session_state["dhan_access_token"]):
+                dhan_result = dhan_execute(
+                    latest_sig, asset_name_sel, strategy_key, trade_type,
+                    an.get("atm_strike", round(cur_price/100)*100),
+                    max(an.get("qty_est", 1), 1),
+                    st.session_state["dhan_client_id"],
+                    st.session_state["dhan_access_token"],
+                    dhan_product,
+                )
+        hits = check_sl_tgt_hits(cur_price, asset_name_sel, capital, risk_pct)
+        with hits_ph.container():
+            if hits > 0:
+                st.success(f"🎯 {hits} position(s) auto-closed (SL/Target hit)")
+    update_unreal(cur_price, asset_name_sel, capital, risk_pct)
+
+    # ── Live metrics rendered into placeholder (fast in-place update) ──
+    realized   = st.session_state["live_realized_pnl"]
+    unrealized = st.session_state["live_unrealized_pnl"]
+    total_pnl  = realized + unrealized
+    prev_px    = float(live_df["Close"].iloc[-2]) if len(live_df) > 1 else cur_price
+    price_chg  = cur_price - prev_px
+    price_pct  = price_chg / prev_px * 100 if prev_px else 0
+    ltp_c  = T["GREEN"] if price_chg >= 0 else T["RED"]
+    pnl_c  = T["GREEN"] if total_pnl >= 0 else T["RED"]
+    re_c   = T["GREEN"] if realized >= 0 else T["RED"]
+    unr_c  = T["GREEN"] if unrealized >= 0 else T["RED"]
+
+    with metrics_ph.container():
+        m1,m2,m3,m4,m5,m6 = st.columns([2,1.2,1.2,1.2,1,1])
+        with m1:
+            st.markdown(f"""<div class="lm-box">
+            <div class="lm-lbl">📍 Live Price</div>
+            <div class="lm-val" style="color:{ltp_c}">₹{cur_price:,.2f}</div>
+            <div class="lm-sub" style="color:{ltp_c}">{price_chg:+.2f} ({price_pct:+.2f}%)</div>
+            </div>""", unsafe_allow_html=True)
+        with m2:
+            st.markdown(f"""<div class="lm-box">
+            <div class="lm-lbl">💰 Realized</div>
+            <div class="lm-val" style="color:{re_c}">₹{realized:+,.0f}</div>
+            </div>""", unsafe_allow_html=True)
+        with m3:
+            st.markdown(f"""<div class="lm-box">
+            <div class="lm-lbl">📊 Unrealized</div>
+            <div class="lm-val" style="color:{unr_c}">₹{unrealized:+,.0f}</div>
+            </div>""", unsafe_allow_html=True)
+        with m4:
+            st.markdown(f"""<div class="lm-box">
+            <div class="lm-lbl">🏦 Total P&L</div>
+            <div class="lm-val" style="color:{pnl_c}">₹{total_pnl:+,.0f}</div>
+            </div>""", unsafe_allow_html=True)
+        with m5:
+            st.markdown(f"""<div class="lm-box">
+            <div class="lm-lbl">📂 Positions</div>
+            <div class="lm-val" style="color:{T["METRIC_VAL"]}">{len(st.session_state["open_positions"])}</div>
+            </div>""", unsafe_allow_html=True)
+        with m6:
+            st.markdown(f"""<div class="lm-box">
+            <div class="lm-lbl">RSI / ATR</div>
+            <div class="lm-val" style="color:{T["METRIC_VAL"]};font-size:14px">{an["rsi"]:.1f} / {an["atr"]:.1f}</div>
+            <div class="lm-sub" style="color:{T["TEXT_FAINT"]}">{datetime.now().strftime("%H:%M:%S")}</div>
+            </div>""", unsafe_allow_html=True)
+
+    # ── Signal banner ──
+    sig_c = T["GREEN"] if "BUY" in an["bias"] else (T["RED"] if "SELL" in an["bias"] else T["ACCENT"])
+    with signal_ph.container():
+        st.markdown(f"""<div style="background:{sig_c}10;border:1px solid {sig_c}40;border-left:5px solid {sig_c};
+            border-radius:10px;padding:12px 18px;margin:8px 0">
+            <span style="font-size:20px;font-weight:800;color:{sig_c}">{an["strength"]} {an["bias"]}</span>
+            <span style="color:{T["TEXT_MUTED"]};font-size:11px"> | {strategy_name} | Trend:{an["trend_score"]}/10 | Mom:{an["mom_score"]}/10 | Score:{an["combined"]}/20 | HV:{an["hv20"]}% | IV:{an["iv_pct"]}%</span>
+        </div>""", unsafe_allow_html=True)
+
+    # ── Dhan order panel ──
+    if st.session_state["dhan_enabled"]:
+        with dhan_ph.container():
+            section("🏦 Dhan Order Panel")
+            if not st.session_state["dhan_client_id"] or not st.session_state["dhan_access_token"]:
+                st.warning("⚠️ Add Client ID and Access Token in sidebar to activate Dhan orders.")
+            else:
+                dc1, dc2 = st.columns([3,1])
+                with dc2:
+                    st.markdown(f"""<div class="dhan-box" style="font-size:12px">
+                    <b style="color:{T["BLUE"]}">Order Rules</b><br>
+                    🟢 LONG → BUY CE / BUY Stock<br>
+                    🔴 SHORT → BUY PE (options)<br>
+                    🔴 SHORT stock → Square-off only<br>
+                    ❌ No naked short-selling<br>
+                    ✅ Sell only after BUY filled
+                    </div>""", unsafe_allow_html=True)
+                    if st.button("🔄 Refresh Status", use_container_width=True, key="dhan_refresh"):
+                        for _k in list(st.session_state["dhan_orders"].keys()):
+                            oid = st.session_state["dhan_orders"][_k].get("order_id")
+                            if oid:
+                                s = dhan_get_status(oid, st.session_state["dhan_access_token"])
+                                st.session_state["dhan_orders"][_k]["status"] = s
+                        st.rerun()
+                with dc1:
+                    if dhan_result:
+                        is_ok = "PLACED" in dhan_result.get("action","") or "OK" in dhan_result.get("msg","")
+                        is_skip = "SKIP" in dhan_result.get("action","")
+                        css_cls = "order-ok" if is_ok else ("order-skip" if is_skip else "order-fail")
+                        act_c = T["GREEN"] if is_ok else (T["ACCENT"] if is_skip else T["RED"])
+                        st.markdown(f"""<div class="{css_cls}">
+                        <b style="color:{act_c}">🔔 {dhan_result.get("action","—")}</b>
+                        &nbsp;| <b>{dhan_result.get("sym","—")}</b>
+                        &nbsp;| OrderID: <code>{dhan_result.get("oid","—")}</code>
+                        &nbsp;| <span style="color:{T["TEXT_MUTED"]}">{dhan_result.get("msg","")}</span>
+                        </div>""", unsafe_allow_html=True)
+                    orders = st.session_state["dhan_orders"]
+                    if orders:
+                        ord_df = pd.DataFrame([
+                            {"Key":k,"Symbol":v.get("symbol"),"Side":v.get("side"),
+                             "Qty":v.get("qty"),"Status":v.get("status"),
+                             "Time":v.get("placed_at"),"OrderID":v.get("order_id")}
+                            for k,v in orders.items()
+                        ])
+                        st.dataframe(ord_df, use_container_width=True, height=150)
+                    else:
+                        st.info("No orders placed yet this session.")
+
     section("🎯 Entry | SL | Targets")
     em=st.columns(7)
     for col,(lbl,val,dlt) in zip(em,[("Entry",f"Rs{an['entry']:,.2f}",""),
@@ -925,6 +1185,7 @@ with tab2:
         ("Target 3",f"Rs{an['tgt3']:,.2f}",f"+{abs(an['tgt3']-an['entry']):.1f}pts"),
         ("R:R",f"1:{rr_ratio}","")]):
         with col: st.metric(lbl,val,dlt if dlt else None)
+
     if st.session_state["open_positions"]:
         section("📂 Open Positions (Paper)")
         rows=[]
@@ -938,13 +1199,18 @@ with tab2:
                 "Target":round(pos["target"],2),"Time":pos["entry_time"],
                 "Unreal P&L":f"Rs{upnl:+,.0f}","P&L%":f"{ppts/pos['entry']*100*pos['direction']:+.2f}%"})
         st.dataframe(pd.DataFrame(rows),use_container_width=True)
+
     section(f"📈 Live Chart [{live_interval} | {live_period}]")
-    st.plotly_chart(price_chart(live_df.tail(120),live_sig.tail(120),an,f"Live {asset_name_sel}",f"[{live_interval}|{live_period}]"),use_container_width=True)
+    st.plotly_chart(price_chart(live_df.tail(120),live_sig.tail(120),an,
+        f"Live {asset_name_sel}",f"[{live_interval}|{live_period}]"),
+        use_container_width=True, key="pc_live_chart")
+
     recent=live_sig[live_sig["Signal"]!=0].tail(10)
     if not recent.empty:
         section("📡 Recent Signals")
         showcols=[c for c in ["Close","Signal","RSI","MACD","ATR","Vol_Ratio","EMA20","VWAP"] if c in recent.columns]
         st.dataframe(recent[showcols].round(2),use_container_width=True)
+
     section("📜 Trade History (Paper Trades)")
     hist_list=st.session_state["trade_history"]
     if hist_list:
@@ -956,10 +1222,11 @@ with tab2:
         with sm[1]: st.metric("Win Rate",f"{len(wins_h)/len(hdf)*100:.1f}%")
         with sm[2]: st.metric("Total P&L",f"Rs{total_r:+,.0f}")
         with sm[3]: st.metric("Avg/Trade",f"Rs{total_r/len(hdf):+,.0f}")
-        if st.button("🗑️ Clear History"):
+        if st.button("🗑️ Clear History", key="clear_hist_btn"):
             st.session_state["trade_history"]=[]; st.session_state["live_realized_pnl"]=0.0; st.rerun()
     else:
-        st.info("No paper trades yet. Click Start to begin.")
+        st.info("No paper trades yet. Click ▶ Start to begin.")
+
     section("📊 Option Pricing (Live)")
     nse_sym=NSE_OC_MAP.get(ticker)
     opt_t="CE" if "CE" in opt_type else "PE"
@@ -986,6 +1253,7 @@ with tab2:
             mon="ATM" if k==atm_k_live else ("ITM" if ((opt_t=="CE" and cur_price>k) or (opt_t=="PE" and cur_price<k)) else "OTM")
             bs_rows.append({"Strike":k,"Type":opt_t,"Moneyness":mon,"Premium":p,"Delta":d,"Gamma":g,"Theta":th,"Vega":v,"BEP":round(k+p if opt_t=="CE" else k-p,2)})
         st.dataframe(pd.DataFrame(bs_rows),use_container_width=True)
+
     section("📐 Live Greeks (ATM)")
     cp_,cd_,cg_,cth_,cv_=bs_price(cur_price,atm_k_live,T_exp,risk_free/100,sigma,"CE")
     pp_,pd__,pg_,pth_,pv_=bs_price(cur_price,atm_k_live,T_exp,risk_free/100,sigma,"PE")
@@ -993,22 +1261,36 @@ with tab2:
     for col,lbl,val in zip(gk,["IV Live","CE Prem","PE Prem","Straddle","Theta/day","Vega"],
         [f"{an['iv_pct']}%",f"Rs{cp_}",f"Rs{pp_}",f"Rs{cp_+pp_}",f"Rs{cth_+pth_}",cv_]):
         with col: st.metric(lbl,val)
+
     section(f"📊 {asset_name_sel} OHLC Returns — 1Y Daily")
     ohlc_1y=fetch_data(ticker,"1y","1d")
     if not ohlc_1y.empty:
-        st.plotly_chart(returns_chart(ohlc_1y,asset_name_sel),use_container_width=True)
+        time.sleep(FETCH_DELAY)
+        st.plotly_chart(returns_chart(ohlc_1y,asset_name_sel),use_container_width=True,key="pc_live_returns")
         tbl2=ohlc_table(ohlc_1y)
         st.dataframe(tbl2,use_container_width=True,height=300)
-    # AUTO-REFRESH
+
+    # ── AUTO-REFRESH with 1.5s spacing ──
     if st.session_state["trading_active"]:
-        now=time.time(); elapsed=now-st.session_state.get("last_auto_refresh",0)
-        remaining=int(st.session_state["auto_refresh_interval"]-elapsed)
+        now=time.time()
+        elapsed=now-st.session_state.get("last_auto_refresh",0)
+        interval=st.session_state["auto_refresh_interval"]
+        remaining=int(interval-elapsed)
+        timer_ph=st.empty()
         if remaining>0:
-            st.markdown(f"""<div style="text-align:center;padding:10px;color:{T['TEXT_MUTED']};font-size:12px">
-            Auto-refresh in <b style="color:{T['ACCENT']}">{remaining}s</b> (every {refresh_int}s) | 1.5s rate limit between requests</div>""",unsafe_allow_html=True)
-            time.sleep(max(remaining,1))
+            timer_ph.markdown(f"""<div style="text-align:center;padding:8px;color:{T["TEXT_MUTED"]};font-size:12px;
+                background:{T["CARD_BG"]};border-radius:8px;margin-top:8px">
+                ⏱ Auto-refresh in <b style="color:{T["ACCENT"]}">{remaining}s</b>
+                &nbsp;|&nbsp; Every {interval}s &nbsp;|&nbsp; 1.5s API delay &nbsp;|&nbsp;
+                Last: {datetime.now().strftime("%H:%M:%S")}
+            </div>""", unsafe_allow_html=True)
+            time.sleep(max(remaining, 1))
+        timer_ph.empty()
         st.session_state["last_auto_refresh"]=time.time()
-        st.cache_data.clear(); st.rerun()
+        time.sleep(FETCH_DELAY)   # 1.5s before rerun to avoid burst
+        st.cache_data.clear()
+        st.rerun()
+
 # ════════════════════════════════════════════════════════════════════════════
 # TAB 3 — ANALYSE
 # ════════════════════════════════════════════════════════════════════════════
@@ -1076,18 +1358,18 @@ with tab3:
             st.markdown(f'<div style="background:{bg};border-radius:6px;padding:8px 12px;margin:4px 0;font-size:13px;color:{T["TEXT"]}">{note}</div>',unsafe_allow_html=True)
     st.markdown("---")
     an_sig=get_strat(an_df,strategy_key,sl_val,rr_ratio,trail_sl,tsl_pct)
-    st.plotly_chart(price_chart(an_df.tail(250),an_sig.tail(250),an,f"🔭 {asset_name_sel}","[1D|1Y]"),use_container_width=True)
+    st.plotly_chart(price_chart(an_df.tail(250),an_sig.tail(250),an,f"🔭 {asset_name_sel}","[1D|1Y]"),use_container_width=True, key="pc_8")
     section("📡 Signal Gauges")
     gc=st.columns(4)
     for col,v,mx,ttl,clr in zip(gc,
         [an["trend_score"],an["mom_score"],an["rsi"],min(an["vol_ratio"]*4,20)],
         [10,10,100,20],["Trend","Momentum","RSI","Volume"],
         [T["BLUE"],T["PURPLE"],T["ACCENT"],T["GREEN"]]):
-        with col: st.plotly_chart(gauge_chart(v,mx,ttl,clr),use_container_width=True)
+        with col: st.plotly_chart(gauge_chart(v,mx,ttl,clr),use_container_width=True, key="pc_9")
     section("📈 OHLC Daily Returns (1Y | 1D)")
     ohlc_an=fetch_data(ticker,"1y","1d")
     if not ohlc_an.empty:
-        st.plotly_chart(returns_chart(ohlc_an,asset_name_sel),use_container_width=True)
+        st.plotly_chart(returns_chart(ohlc_an,asset_name_sel),use_container_width=True, key="pc_10")
         tbl_an=ohlc_table(ohlc_an)
         st.dataframe(tbl_an,use_container_width=True,height=320)
     st.markdown("---")
@@ -1159,7 +1441,7 @@ with tab4:
                     f'🟢 <b>Straddle Cheap (Z={sp_z:.2f})</b> — {((sp_mean-sp_curr)/sp_mean*100):.1f}% below avg. '
                     f'Consider BUYING straddle/strangle. Volatility expansion expected.</div>',unsafe_allow_html=True)
             else: st.info(f"Straddle at normal level (Z={sp_z:.2f}). No strong edge for sellers or buyers.")
-            st.plotly_chart(straddle_chart(sdf_hist,asset_name_sel),use_container_width=True)
+            st.plotly_chart(straddle_chart(sdf_hist,asset_name_sel),use_container_width=True, key="pc_11")
             section(f"🔄 Reversal Analysis — After ±{threshold_pct:.0f}% move")
             rev_df=straddle_reversal_stats(sdf_hist,threshold_pct)
             if not rev_df.empty:
@@ -1182,7 +1464,7 @@ with tab4:
             dist_fig.add_vline(x=sp_curr,line_color=T["ACCENT"],line_dash="dash",annotation_text=f"Current:{sp_curr:.0f}")
             dist_fig.add_vline(x=sp_mean,line_color=T["BLUE"],line_dash="dot",annotation_text=f"Mean:{sp_mean:.0f}")
             dist_fig.update_layout(paper_bgcolor=T["PLOT_PAPER"],plot_bgcolor=T["PLOT_BG"],font_color=T["TEXT"],height=300)
-            st.plotly_chart(dist_fig,use_container_width=True)
+            st.plotly_chart(dist_fig,use_container_width=True, key="pc_12")
 
     with sub2:
         section("⚡ Zero Hero — 0DTE Options Analysis")
@@ -1250,7 +1532,7 @@ with tab4:
         for i in range(1,3):
             fig_gth.update_xaxes(gridcolor=T["GRID"],tickfont=dict(color=T["TEXT"]),row=1,col=i)
             fig_gth.update_yaxes(gridcolor=T["GRID"],tickfont=dict(color=T["TEXT"]),row=1,col=i)
-        st.plotly_chart(fig_gth,use_container_width=True)
+        st.plotly_chart(fig_gth,use_container_width=True, key="pc_13")
         section("⏱️ Theta Decay Over Time (ATM)")
         atm_k_zh=round(spot_zh/100)*100; days_arr=list(range(max(days_exp,1),0,-1)); decay_rows=[]
         for d in days_arr:
@@ -1266,7 +1548,7 @@ with tab4:
         for i in range(1,3):
             fig_dec.update_xaxes(gridcolor=T["GRID"],tickfont=dict(color=T["TEXT"]),row=i,col=1)
             fig_dec.update_yaxes(gridcolor=T["GRID"],tickfont=dict(color=T["TEXT"]),row=i,col=1)
-        st.plotly_chart(fig_dec,use_container_width=True)
+        st.plotly_chart(fig_dec,use_container_width=True, key="pc_14")
         if not zh_oc_df.empty:
             section("📊 Open Interest — CE vs PE")
             fig_oi=go.Figure()
@@ -1279,7 +1561,7 @@ with tab4:
                 legend=dict(bgcolor="rgba(0,0,0,0)",font=dict(color=T["TEXT"])))
             fig_oi.update_xaxes(gridcolor=T["GRID"],tickfont=dict(color=T["TEXT"]))
             fig_oi.update_yaxes(gridcolor=T["GRID"],tickfont=dict(color=T["TEXT"]))
-            st.plotly_chart(fig_oi,use_container_width=True)
+            st.plotly_chart(fig_oi,use_container_width=True, key="pc_15")
             section("📈 Change in OI")
             fig_coi=go.Figure()
             ce_chg_clr=[T["GREEN"] if v>0 else T["RED"] for v in zh_oc_df["CE_ChgOI"]]
@@ -1291,7 +1573,7 @@ with tab4:
                 legend=dict(bgcolor="rgba(0,0,0,0)",font=dict(color=T["TEXT"])))
             fig_coi.update_xaxes(gridcolor=T["GRID"],tickfont=dict(color=T["TEXT"]))
             fig_coi.update_yaxes(gridcolor=T["GRID"],tickfont=dict(color=T["TEXT"]))
-            st.plotly_chart(fig_coi,use_container_width=True)
+            st.plotly_chart(fig_coi,use_container_width=True, key="pc_16")
         if zh_summary:
             section("🎯 Zero Hero Trade Recommendation")
             zh_dir="BUY" in zh_summary["Bias"]; zh_opt="CE" if zh_dir else "PE"
