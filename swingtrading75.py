@@ -1130,7 +1130,7 @@ def build_equity_chart(equity, drawdown, trade_df) -> go.Figure:
                         row_heights=[0.65, 0.35], vertical_spacing=0.04,
                         subplot_titles=("Equity Curve", "Drawdown %"))
     fig.add_trace(go.Scatter(x=equity.index, y=equity,
-        fill="tozeroy", fillcolor=f"{T['BLUE']}20",
+        fill="tozeroy", fillcolor="rgba(96,165,250,0.12)",
         line=dict(color=T["BLUE"], width=2), name="Portfolio Value"), row=1, col=1)
     if trade_df is not None and len(trade_df):
         wins = trade_df[trade_df["P&L %"] > 0]
@@ -1144,7 +1144,7 @@ def build_equity_chart(equity, drawdown, trade_df) -> go.Figure:
                 mode="markers", marker=dict(symbol="x", size=7, color=T["RED"]),
                 name="Loss"), row=1, col=1)
     fig.add_trace(go.Scatter(x=drawdown.index, y=drawdown,
-        fill="tozeroy", fillcolor=f"{T['RED']}20",
+        fill="tozeroy", fillcolor="rgba(239,68,68,0.12)",
         line=dict(color=T["RED"], width=1.5), name="Drawdown %"), row=2, col=1)
     fig.update_layout(paper_bgcolor=T["PLOT_PAPER"], plot_bgcolor=T["PLOT_BG"],
         font=dict(color=T["TEXT"]),
@@ -1164,9 +1164,9 @@ def build_gauge(val, max_val, title, color):
             "bar": {"color": color}, "bgcolor": T["CARD_BG"],
             "bordercolor": T["BORDER"],
             "steps": [
-                {"range": [0, max_val*.33], "color": f"{T['RED']}30"},
-                {"range": [max_val*.33, max_val*.66], "color": f"{T['ACCENT']}30"},
-                {"range": [max_val*.66, max_val],  "color": f"{T['GREEN']}30"},
+                {"range": [0, max_val*.33], "color": "rgba(220,38,38,0.18)"},
+                {"range": [max_val*.33, max_val*.66], "color": "rgba(245,158,11,0.18)"},
+                {"range": [max_val*.66, max_val],  "color": "rgba(16,185,129,0.18)"},
             ],
         },
         number={"font": {"color": color, "family": "JetBrains Mono"}}
