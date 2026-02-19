@@ -110,8 +110,31 @@ input:focus {{ border-color:{T['ACCENT']} !important; }}
 .stSlider > div > div > div {{ background:{T['ACCENT']} !important; }}
 .stSlider [role="slider"] {{ background:{T['ACCENT']} !important; border-color:{T['ACCENT']} !important; }}
 .stRadio label,.stCheckbox label {{ color:{T['TEXT']} !important; }}
-.stTabs [data-baseweb="tab-list"] {{ background:{T['CARD_BG']}; border-radius:12px; padding:4px; border:1px solid {T['BORDER']}; gap:4px; flex-wrap:wrap; }}
-.stTabs [data-baseweb="tab"] {{ border-radius:8px; color:{T['TEXT_MUTED']} !important; font-weight:600; font-size:13px; padding:7px 14px; }}
+.stTabs [data-baseweb="tab-list"] {{
+    background:{T['CARD_BG']};
+    border-radius:12px;
+    padding:4px;
+    border:1px solid {T['BORDER']};
+    gap:2px;
+    flex-wrap:nowrap !important;
+    overflow-x:auto !important;
+    overflow-y:hidden;
+    scrollbar-width:none;
+    -ms-overflow-style:none;
+    white-space:nowrap;
+    display:flex !important;
+    align-items:center;
+}}
+.stTabs [data-baseweb="tab-list"]::-webkit-scrollbar {{ display:none; }}
+.stTabs [data-baseweb="tab"] {{
+    border-radius:8px;
+    color:{T['TEXT_MUTED']} !important;
+    font-weight:600;
+    font-size:12px;
+    padding:6px 12px;
+    white-space:nowrap;
+    flex-shrink:0;
+}}
 .stTabs [aria-selected="true"] {{ background:{T['ACCENT']} !important; color:#000 !important; font-weight:700; }}
 .stTabs [data-testid="stTabPanel"] {{ background:transparent !important; }}
 [data-testid="metric-container"] {{ background:{T['CARD_BG']} !important; border:1px solid {T['BORDER']}; border-radius:10px; padding:10px 14px; }}
@@ -963,6 +986,79 @@ with st.sidebar:
     if run_btn: st.session_state["bt_run"]=True; st.cache_data.clear()
 
 # ─── TABS ─────────────────────────────────────────────────────────────────────
+
+# ─── LIVE METRICS FRAGMENT ────────────────────────────────────────────────────
+try:
+    @st.fragment(run_every="2s")
+    def live_price_ticker(ticker_sym, asset_nm, interval_sym, period_sym,
+                          sl_type_v, sl_val_v, rr_v, capital_v, risk_pct_v,
+                          strategy_key_v, trail_sl_v, tsl_pct_v):
+        """Fragment: auto-refreshes every 2s independently from main page."""
+        _wait(f"frag_{ticker_sym}")
+        try:
+            raw = yf.download(ticker_sym, period=period_sym, interval=interval_sym,
+                              auto_adjust=True, progress=False, threads=False)
+            if raw.empty: st.warning("No live data"); return
+            raw.columns = [c[0] if isinstance(c,tuple) else c for c in raw.columns]
+            raw = raw.dropna()
+        except Exception as e:
+            st.warning(f"Fetch error: {e}"); return
+
+        df = compute_indicators(raw)
+        an = generate_analysis(df, ticker_sym, asset_nm, sl_type_v, sl_val_v,
+                               rr_v, capital_v, risk_pct_v)
+        if not an: st.warning("Insufficient data"); return
+
+        cur = an["price"]
+        prev = float(df["Close"].iloc[-2]) if len(df) > 1 else cur
+        chg = cur - prev; pct = chg/prev*100 if prev else 0
+        realized   = st.session_state["live_realized_pnl"]
+        unrealized = st.session_state["live_unrealized_pnl"]
+        total_pnl  = realized + unrealized
+        ltp_c  = T["GREEN"] if chg >= 0 else T["RED"]
+        pnl_c  = T["GREEN"] if total_pnl >= 0 else T["RED"]
+
+        m1,m2,m3,m4,m5,m6 = st.columns([2,1.2,1.2,1.2,1,1])
+        with m1:
+            st.markdown(f'''<div class="lm-box">
+            <div class="lm-lbl">📍 Live Price</div>
+            <div class="lm-val" style="color:{ltp_c}">₹{cur:,.2f}</div>
+            <div class="lm-sub" style="color:{ltp_c}">{chg:+.2f} ({pct:+.2f}%)</div>
+            </div>''', unsafe_allow_html=True)
+        with m2:
+            rc = T["GREEN"] if realized >= 0 else T["RED"]
+            st.markdown(f'''<div class="lm-box">
+            <div class="lm-lbl">💰 Realized</div>
+            <div class="lm-val" style="color:{rc}">₹{realized:+,.0f}</div>
+            </div>''', unsafe_allow_html=True)
+        with m3:
+            uc = T["GREEN"] if unrealized >= 0 else T["RED"]
+            st.markdown(f'''<div class="lm-box">
+            <div class="lm-lbl">📊 Unrealized</div>
+            <div class="lm-val" style="color:{uc}">₹{unrealized:+,.0f}</div>
+            </div>''', unsafe_allow_html=True)
+        with m4:
+            st.markdown(f'''<div class="lm-box">
+            <div class="lm-lbl">🏦 Total P&L</div>
+            <div class="lm-val" style="color:{pnl_c}">₹{total_pnl:+,.0f}</div>
+            </div>''', unsafe_allow_html=True)
+        with m5:
+            st.markdown(f'''<div class="lm-box">
+            <div class="lm-lbl">📂 Positions</div>
+            <div class="lm-val" style="color:{T["METRIC_VAL"]}">{len(st.session_state["open_positions"])}</div>
+            </div>''', unsafe_allow_html=True)
+        with m6:
+            sig_s = an.get("bias","—"); sig_col = T["GREEN"] if "BUY" in sig_s else (T["RED"] if "SELL" in sig_s else T["ACCENT"])
+            st.markdown(f'''<div class="lm-box">
+            <div class="lm-lbl">Signal / RSI</div>
+            <div class="lm-val" style="color:{sig_col};font-size:12px">{sig_s.split()[0]}</div>
+            <div class="lm-sub" style="color:{T["TEXT_MUTED"]}">RSI {an["rsi"]:.1f} · {datetime.now().strftime("%H:%M:%S")}</div>
+            </div>''', unsafe_allow_html=True)
+
+    _live_ticker_available = True
+except (AttributeError, TypeError):
+    _live_ticker_available = False
+
 tab1,tab2,tab3,tab4=st.tabs(["📊 Backtesting","⚡ Live Trading","🔭 Analyse","🎯 Straddle & Zero Hero"])
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -1068,14 +1164,16 @@ with tab2:
     if ticker=="NIFTY50_ALL": st.warning("Select a specific ticker for Live Trading."); st.stop()
     st.info(f"Data via Yahoo Finance | Rate limit: {FETCH_DELAY}s | Interval: {live_interval} | Period: {live_period} | ~15-20min delay for India")
 
-    # ── Placeholders — update in-place without full tab re-render ──
-    metrics_ph = st.empty()
-    signal_ph  = st.empty()
-    hits_ph    = st.empty()
-    dhan_ph    = st.empty()
+    # ── Fragment-based live ticker (updates every 2s independently) ──
+    if _live_ticker_available and st.session_state["trading_active"]:
+        live_price_ticker(ticker, asset_name_sel, live_interval, live_period,
+                          sl_type, sl_val, rr_ratio, capital, risk_pct,
+                          strategy_key, trail_sl, tsl_pct)
+    hits_ph = st.empty()
+    dhan_ph = st.empty()
 
-    # ── Fetch with explicit 1.5s delays between each call ──
-    with st.spinner("Fetching live data..."):
+    # ── Main data fetch with 1.5s delays ──
+    with st.spinner("Fetching data..."):
         live_raw = fetch_live(ticker, live_interval, live_period)
         time.sleep(FETCH_DELAY)
 
@@ -1096,7 +1194,6 @@ with tab2:
         if latest_sig != 0:
             process_live_signal(latest_sig, cur_price, latest_atr, strategy_key,
                 asset_name_sel, sl_type, sl_val, rr_ratio, tsl_pct, capital, risk_pct)
-            # Dhan order if enabled and credentials set
             if (st.session_state["dhan_enabled"]
                     and st.session_state["dhan_client_id"]
                     and st.session_state["dhan_access_token"]):
@@ -1114,61 +1211,59 @@ with tab2:
                 st.success(f"🎯 {hits} position(s) auto-closed (SL/Target hit)")
     update_unreal(cur_price, asset_name_sel, capital, risk_pct)
 
-    # ── Live metrics rendered into placeholder (fast in-place update) ──
-    realized   = st.session_state["live_realized_pnl"]
-    unrealized = st.session_state["live_unrealized_pnl"]
-    total_pnl  = realized + unrealized
-    prev_px    = float(live_df["Close"].iloc[-2]) if len(live_df) > 1 else cur_price
-    price_chg  = cur_price - prev_px
-    price_pct  = price_chg / prev_px * 100 if prev_px else 0
-    ltp_c  = T["GREEN"] if price_chg >= 0 else T["RED"]
-    pnl_c  = T["GREEN"] if total_pnl >= 0 else T["RED"]
-    re_c   = T["GREEN"] if realized >= 0 else T["RED"]
-    unr_c  = T["GREEN"] if unrealized >= 0 else T["RED"]
-
-    with metrics_ph.container():
+    # ── Fallback metrics (when fragment not available or trading stopped) ──
+    if not _live_ticker_available or not st.session_state["trading_active"]:
+        realized   = st.session_state["live_realized_pnl"]
+        unrealized = st.session_state["live_unrealized_pnl"]
+        total_pnl  = realized + unrealized
+        prev_px    = float(live_df["Close"].iloc[-2]) if len(live_df) > 1 else cur_price
+        price_chg  = cur_price - prev_px
+        price_pct  = price_chg / prev_px * 100 if prev_px else 0
+        ltp_c  = T["GREEN"] if price_chg >= 0 else T["RED"]
+        pnl_c  = T["GREEN"] if total_pnl >= 0 else T["RED"]
+        re_c   = T["GREEN"] if realized >= 0 else T["RED"]
+        unr_c  = T["GREEN"] if unrealized >= 0 else T["RED"]
         m1,m2,m3,m4,m5,m6 = st.columns([2,1.2,1.2,1.2,1,1])
         with m1:
-            st.markdown(f"""<div class="lm-box">
+            st.markdown(f'''<div class="lm-box">
             <div class="lm-lbl">📍 Live Price</div>
             <div class="lm-val" style="color:{ltp_c}">₹{cur_price:,.2f}</div>
             <div class="lm-sub" style="color:{ltp_c}">{price_chg:+.2f} ({price_pct:+.2f}%)</div>
-            </div>""", unsafe_allow_html=True)
+            </div>''', unsafe_allow_html=True)
         with m2:
-            st.markdown(f"""<div class="lm-box">
+            st.markdown(f'''<div class="lm-box">
             <div class="lm-lbl">💰 Realized</div>
             <div class="lm-val" style="color:{re_c}">₹{realized:+,.0f}</div>
-            </div>""", unsafe_allow_html=True)
+            </div>''', unsafe_allow_html=True)
         with m3:
-            st.markdown(f"""<div class="lm-box">
+            st.markdown(f'''<div class="lm-box">
             <div class="lm-lbl">📊 Unrealized</div>
             <div class="lm-val" style="color:{unr_c}">₹{unrealized:+,.0f}</div>
-            </div>""", unsafe_allow_html=True)
+            </div>''', unsafe_allow_html=True)
         with m4:
-            st.markdown(f"""<div class="lm-box">
+            st.markdown(f'''<div class="lm-box">
             <div class="lm-lbl">🏦 Total P&L</div>
             <div class="lm-val" style="color:{pnl_c}">₹{total_pnl:+,.0f}</div>
-            </div>""", unsafe_allow_html=True)
+            </div>''', unsafe_allow_html=True)
         with m5:
-            st.markdown(f"""<div class="lm-box">
+            st.markdown(f'''<div class="lm-box">
             <div class="lm-lbl">📂 Positions</div>
             <div class="lm-val" style="color:{T["METRIC_VAL"]}">{len(st.session_state["open_positions"])}</div>
-            </div>""", unsafe_allow_html=True)
+            </div>''', unsafe_allow_html=True)
         with m6:
-            st.markdown(f"""<div class="lm-box">
+            st.markdown(f'''<div class="lm-box">
             <div class="lm-lbl">RSI / ATR</div>
             <div class="lm-val" style="color:{T["METRIC_VAL"]};font-size:14px">{an["rsi"]:.1f} / {an["atr"]:.1f}</div>
             <div class="lm-sub" style="color:{T["TEXT_FAINT"]}">{datetime.now().strftime("%H:%M:%S")}</div>
-            </div>""", unsafe_allow_html=True)
+            </div>''', unsafe_allow_html=True)
 
     # ── Signal banner ──
     sig_c = T["GREEN"] if "BUY" in an["bias"] else (T["RED"] if "SELL" in an["bias"] else T["ACCENT"])
-    with signal_ph.container():
-        st.markdown(f"""<div style="background:{sig_c}10;border:1px solid {sig_c}40;border-left:5px solid {sig_c};
-            border-radius:10px;padding:12px 18px;margin:8px 0">
-            <span style="font-size:20px;font-weight:800;color:{sig_c}">{an["strength"]} {an["bias"]}</span>
-            <span style="color:{T["TEXT_MUTED"]};font-size:11px"> | {strategy_name} | Trend:{an["trend_score"]}/10 | Mom:{an["mom_score"]}/10 | Score:{an["combined"]}/20 | HV:{an["hv20"]}% | IV:{an["iv_pct"]}%</span>
-        </div>""", unsafe_allow_html=True)
+    st.markdown(f'''<div style="background:{sig_c}10;border:1px solid {sig_c}40;border-left:5px solid {sig_c};
+        border-radius:10px;padding:12px 18px;margin:8px 0">
+        <span style="font-size:20px;font-weight:800;color:{sig_c}">{an["strength"]} {an["bias"]}</span>
+        <span style="color:{T["TEXT_MUTED"]};font-size:11px"> | {strategy_name} | Trend:{an["trend_score"]}/10 | Mom:{an["mom_score"]}/10 | Score:{an["combined"]}/20 | HV:{an["hv20"]}% | IV:{an["iv_pct"]}%</span>
+    </div>''', unsafe_allow_html=True)
 
     # ── Dhan order panel ──
     if st.session_state["dhan_enabled"]:
@@ -1450,14 +1545,44 @@ with tab4:
 
     with sub1:
         section("📊 Historical ATM Straddle Premium")
+        # ── Straddle Education Panel ──
         st.markdown(f"""<div class="alpha-card">
-        <b style="color:{T['ACCENT']}">What is Straddle Premium?</b><br>
-        <span style="font-size:13px;color:{T['TEXT_MUTED']}">
-        ATM Straddle = Buy ATM CE + ATM PE. Combined premium = expected move in points.<br>
-        <b>HIGH premium</b> = market expects big move → consider SELLING.<br>
-        <b>LOW premium</b> = cheap optionality → consider BUYING gamma.<br><br>
-        Red stars = historically high (sell zone) | Green stars = historically low (buy zone)
-        </span></div>""",unsafe_allow_html=True)
+        <b style="color:{T['ACCENT']};font-size:15px">📚 Understanding ATM Straddle Premium</b><br><br>
+        <span style="font-size:13px;color:{T['TEXT']}">
+        An <b>ATM Straddle</b> = simultaneously buying the ATM Call (CE) + ATM Put (PE) at the same strike.
+        The combined premium is the market's expectation of how far the underlying will move by expiry.<br><br>
+        </span>
+        <table style="width:100%;border-collapse:collapse;font-size:13px">
+        <tr style="border-bottom:1px solid {T['BORDER']}">
+            <td style="padding:6px 10px;font-weight:700;color:{T['ACCENT']}">Zone</td>
+            <td style="padding:6px 10px;font-weight:700;color:{T['ACCENT']}">Z-Score</td>
+            <td style="padding:6px 10px;font-weight:700;color:{T['ACCENT']}">What It Means</td>
+            <td style="padding:6px 10px;font-weight:700;color:{T['ACCENT']}">Strategy</td>
+        </tr>
+        <tr style="border-bottom:1px solid {T['BORDER']}20">
+            <td style="padding:6px 10px;color:{T['RED']};font-weight:700">🔴 HIGH Premium</td>
+            <td style="padding:6px 10px;color:{T['TEXT_MUTED']}">Z &gt; +1.5</td>
+            <td style="padding:6px 10px;color:{T['TEXT_MUTED']}">IV spike, fear/greed elevated, market expects big move. Options are expensive relative to history.</td>
+            <td style="padding:6px 10px;color:{T['RED']}">SELL straddle / iron condor. Collect premium. Place SL at 25% loss.</td>
+        </tr>
+        <tr style="border-bottom:1px solid {T['BORDER']}20">
+            <td style="padding:6px 10px;color:{T['ACCENT']};font-weight:700">🟡 NORMAL</td>
+            <td style="padding:6px 10px;color:{T['TEXT_MUTED']}">-1.5 to +1.5</td>
+            <td style="padding:6px 10px;color:{T['TEXT_MUTED']}">Premium fairly priced. IV near its historical average. No structural edge for buyers or sellers.</td>
+            <td style="padding:6px 10px;color:{T['ACCENT']}">Wait for edge. Use directional spreads if bias clear. Avoid naked straddle.</td>
+        </tr>
+        <tr>
+            <td style="padding:6px 10px;color:{T['GREEN']};font-weight:700">🟢 LOW Premium</td>
+            <td style="padding:6px 10px;color:{T['TEXT_MUTED']}">Z &lt; -1.5</td>
+            <td style="padding:6px 10px;color:{T['TEXT_MUTED']}">IV crushed, complacency high, cheap options. Market underpricing expected volatility.</td>
+            <td style="padding:6px 10px;color:{T['GREEN']}">BUY straddle / strangle. Expect volatility expansion. Risk: time decay if move delayed.</td>
+        </tr>
+        </table><br>
+        <span style="font-size:11px;color:{T['TEXT_FAINT']}">
+        ⭐ Red stars on chart = historically expensive (sell zone) &nbsp;|&nbsp; 🟢 Green stars = historically cheap (buy zone)<br>
+        Z-Score = (Current − Mean) / StdDev over 1 year. Expected move = ±Straddle Premium in points.
+        </span>
+        </div>""",unsafe_allow_html=True)
         sd1,sd2=st.columns(2)
         with sd1: threshold_pct=st.slider("Reversal Threshold %",5.0,30.0,10.0,1.0)
         with sd2: straddle_days=st.slider("Days to Expiry (Straddle)",1,30,7)
@@ -1475,15 +1600,64 @@ with tab4:
             with sm3: st.metric("Straddle % Spot",f"{sp_pct:.2f}%")
             with sm4: st.metric("Z-Score",f"{sp_z:.2f}","High" if sp_z>1.5 else "Low" if sp_z<-1.5 else "Normal")
             with sm5: st.metric("Expected Move",f"+-Rs{sp_curr:.0f}")
+            # ── Statistics summary ──
+            sp_p10=sdf_hist["Straddle"].quantile(0.10); sp_p90=sdf_hist["Straddle"].quantile(0.90)
+            sp_p25=sdf_hist["Straddle"].quantile(0.25); sp_p75=sdf_hist["Straddle"].quantile(0.75)
+            pct_rank=float((sdf_hist["Straddle"]<=sp_curr).mean()*100)
             if sp_z>1.5:
-                st.markdown(f'<div style="background:{T["RED"]}10;border-left:4px solid {T["RED"]};border-radius:8px;padding:12px 16px;font-size:13px">'
-                    f'🔴 <b>Straddle Overpriced (Z={sp_z:.2f})</b> — {((sp_curr-sp_mean)/sp_mean*100):.1f}% above avg. '
-                    f'Consider SELLING straddle/iron condor. Avoid buying options.</div>',unsafe_allow_html=True)
+                rec_dir="SHORT (Sell Premium)"; rec_c=T["RED"]; rec_icon="🔴"
+                rec_action="Sell ATM Straddle / Iron Condor. Collect overpriced premium."
+                rec_sl=f"SL: Premium rises 25% from entry"
+                rec_tgt=f"Target: Premium falls 30-40% (time decay + IV crush)"
+                rec_hold="SHORT bias — IV likely to mean-revert downward"
             elif sp_z<-1.5:
-                st.markdown(f'<div style="background:{T["GREEN"]}10;border-left:4px solid {T["GREEN"]};border-radius:8px;padding:12px 16px;font-size:13px">'
-                    f'🟢 <b>Straddle Cheap (Z={sp_z:.2f})</b> — {((sp_mean-sp_curr)/sp_mean*100):.1f}% below avg. '
-                    f'Consider BUYING straddle/strangle. Volatility expansion expected.</div>',unsafe_allow_html=True)
-            else: st.info(f"Straddle at normal level (Z={sp_z:.2f}). No strong edge for sellers or buyers.")
+                rec_dir="LONG (Buy Gamma)"; rec_c=T["GREEN"]; rec_icon="🟢"
+                rec_action="Buy ATM Straddle / Strangle. Cheap vol, expect expansion."
+                rec_sl=f"SL: Premium falls 20% from entry"
+                rec_tgt=f"Target: 1.5x-2x premium if big move occurs"
+                rec_hold="LONG bias — IV likely to expand, buy dips in premium"
+            elif sp_z>0.5:
+                rec_dir="SLIGHT SHORT bias"; rec_c=T["ORANGE"]; rec_icon="🟡"
+                rec_action="Slight premium richness. Prefer spreads over naked longs."
+                rec_sl="SL: If vol spikes further, cut position"
+                rec_tgt="Target: Mean reversion to average"
+                rec_hold="NEUTRAL-SHORT — hold short gamma positions with caution"
+            elif sp_z<-0.5:
+                rec_dir="SLIGHT LONG bias"; rec_c=T["BLUE"]; rec_icon="🔵"
+                rec_action="Slight premium cheapness. Okay to buy options for directional plays."
+                rec_sl="SL: If vol stays suppressed >3 days, exit"
+                rec_tgt="Target: Vol expansion on event/news"
+                rec_hold="NEUTRAL-LONG — hold long gamma, wait for catalyst"
+            else:
+                rec_dir="NEUTRAL"; rec_c=T["ACCENT"]; rec_icon="⚪"
+                rec_action="Premium fairly priced. Use directional spread if bias exists."
+                rec_sl="No straddle edge"; rec_tgt="No straddle edge"
+                rec_hold="HOLD CASH — wait for premium to reach extreme zone"
+
+            st.markdown(f"""<div style="background:{rec_c}10;border:1px solid {rec_c}40;border-left:5px solid {rec_c};
+                border-radius:10px;padding:14px 20px;margin:8px 0">
+                <div style="font-size:18px;font-weight:800;color:{rec_c}">{rec_icon} Recommendation: {rec_dir}</div>
+                <div style="color:{T['TEXT']};margin:8px 0;font-size:13px">{rec_action}</div>
+                <div style="display:flex;gap:20px;flex-wrap:wrap;font-size:12px;color:{T['TEXT_MUTED']}">
+                    <span>📍 Z-Score: <b style="color:{rec_c}">{sp_z:+.2f}</b></span>
+                    <span>📊 Pct Rank: <b style="color:{rec_c}">{pct_rank:.0f}th</b> percentile</span>
+                    <span>📉 vs Avg: <b>{((sp_curr-sp_mean)/sp_mean*100):+.1f}%</b></span>
+                    <span>P10–P90: <b>Rs{sp_p10:.0f}–Rs{sp_p90:.0f}</b></span>
+                </div>
+                <div style="font-size:12px;color:{T['TEXT_MUTED']};margin-top:6px">
+                    🎯 {rec_sl} &nbsp;|&nbsp; 🏆 {rec_tgt}
+                </div>
+                <div style="font-size:11px;color:{T['TEXT_FAINT']};margin-top:4px;font-style:italic">
+                    Position: {rec_hold}
+                </div>
+            </div>""",unsafe_allow_html=True)
+
+            # ── Percentile bands ──
+            sc1,sc2,sc3,sc4=st.columns(4)
+            with sc1: st.metric("P10 (Very Low)",f"Rs{sp_p10:.0f}","Buy zone")
+            with sc2: st.metric("P25 (Low)",f"Rs{sp_p25:.0f}","Mild buy")
+            with sc3: st.metric("P75 (High)",f"Rs{sp_p75:.0f}","Mild sell")
+            with sc4: st.metric("P90 (Very High)",f"Rs{sp_p90:.0f}","Sell zone")
             st.plotly_chart(straddle_chart(sdf_hist,asset_name_sel),use_container_width=True, key="pc_11")
             section(f"🔄 Reversal Analysis — After ±{threshold_pct:.0f}% move")
             rev_df=straddle_reversal_stats(sdf_hist,threshold_pct)
@@ -1617,6 +1791,149 @@ with tab4:
             fig_coi.update_xaxes(gridcolor=T["GRID"],tickfont=dict(color=T["TEXT"]))
             fig_coi.update_yaxes(gridcolor=T["GRID"],tickfont=dict(color=T["TEXT"]))
             st.plotly_chart(fig_coi,use_container_width=True, key="pc_16")
+        # ── CE/PE Premium Plot by Strike + Option Chain Display ──
+        section("📈 CE / PE Premium Plot by Strike")
+        oc_src = zh_oc_df if not zh_oc_df.empty else pd.DataFrame()
+        if not oc_src.empty:
+            all_strikes = sorted(oc_src["Strike"].tolist())
+            # Default to ATM ±5 strikes
+            atm_default = round(zh_spot/50)*50
+            atm_idx = min(range(len(all_strikes)), key=lambda i: abs(all_strikes[i]-atm_default))
+            sel_lo = max(0, atm_idx-5); sel_hi = min(len(all_strikes)-1, atm_idx+5)
+            cpc1, cpc2 = st.columns([3,1])
+            with cpc1:
+                strike_range = st.select_slider("Select Strike Range",
+                    options=all_strikes,
+                    value=(all_strikes[sel_lo], all_strikes[sel_hi]),
+                    key="ce_pe_strike_range")
+            with cpc2:
+                ce_pe_view = st.radio("Chart Type",["Premium","IV","OI","Delta"], index=0, key="ce_pe_view", horizontal=True)
+
+            mask = (oc_src["Strike"] >= strike_range[0]) & (oc_src["Strike"] <= strike_range[1])
+            fdf = oc_src[mask].copy()
+            if not fdf.empty:
+                fig_cep = go.Figure()
+                if ce_pe_view == "Premium":
+                    fig_cep.add_trace(go.Scatter(x=fdf["Strike"],y=fdf["CE_LTP"],name="CE Premium",
+                        mode="lines+markers",line=dict(color=T["RED"],width=2.5),
+                        marker=dict(size=8,color=T["RED"],line=dict(color="white",width=1))))
+                    fig_cep.add_trace(go.Scatter(x=fdf["Strike"],y=fdf["PE_LTP"],name="PE Premium",
+                        mode="lines+markers",line=dict(color=T["GREEN"],width=2.5),
+                        marker=dict(size=8,color=T["GREEN"],line=dict(color="white",width=1))))
+                    y_title="Premium (Rs)"
+                elif ce_pe_view == "IV":
+                    fig_cep.add_trace(go.Scatter(x=fdf["Strike"],y=fdf["CE_IV"],name="CE IV%",
+                        mode="lines+markers",line=dict(color=T["RED"],width=2.5),marker=dict(size=8,color=T["RED"])))
+                    fig_cep.add_trace(go.Scatter(x=fdf["Strike"],y=fdf["PE_IV"],name="PE IV%",
+                        mode="lines+markers",line=dict(color=T["GREEN"],width=2.5),marker=dict(size=8,color=T["GREEN"])))
+                    y_title="Implied Volatility (%)"
+                elif ce_pe_view == "OI":
+                    fig_cep.add_trace(go.Bar(x=fdf["Strike"],y=fdf["CE_OI"],name="CE OI",
+                        marker_color=T["RED"],opacity=0.8))
+                    fig_cep.add_trace(go.Bar(x=fdf["Strike"],y=fdf["PE_OI"],name="PE OI",
+                        marker_color=T["GREEN"],opacity=0.8))
+                    y_title="Open Interest"
+                else:  # Delta
+                    ce_deltas,pe_deltas=[],[]
+                    for _,row in fdf.iterrows():
+                        k=float(row["Strike"]); T_d=max(zh_days,0.01)/365
+                        _,cd,_,_,_=bs_price(zh_spot,k,T_d,risk_free/100,zh_iv/100,"CE")
+                        _,pd_v,_,_,_=bs_price(zh_spot,k,T_d,risk_free/100,zh_iv/100,"PE")
+                        ce_deltas.append(cd); pe_deltas.append(pd_v)
+                    fig_cep.add_trace(go.Scatter(x=fdf["Strike"],y=ce_deltas,name="CE Delta",
+                        mode="lines+markers",line=dict(color=T["RED"],width=2.5),marker=dict(size=8,color=T["RED"])))
+                    fig_cep.add_trace(go.Scatter(x=fdf["Strike"],y=pe_deltas,name="PE Delta",
+                        mode="lines+markers",line=dict(color=T["GREEN"],width=2.5),marker=dict(size=8,color=T["GREEN"])))
+                    y_title="Delta"
+
+                fig_cep.add_vline(x=zh_spot,line_color=T["ACCENT"],line_dash="dash",
+                    line_width=2,annotation_text=f"Spot {zh_spot:,.0f}",
+                    annotation_font_color=T["ACCENT"])
+                fig_cep.add_vline(x=round(zh_spot/50)*50,line_color=T["PURPLE"],
+                    line_dash="dot",line_width=1.5,
+                    annotation_text=f"ATM {round(zh_spot/50)*50}",
+                    annotation_font_color=T["PURPLE"])
+                fig_cep.update_layout(
+                    barmode="group",
+                    title=dict(text=f"CE vs PE {ce_pe_view} — {asset_name_sel} | Spot: Rs{zh_spot:,.2f}",
+                               font=dict(color=T["TEXT"],size=14)),
+                    paper_bgcolor=T["PLOT_PAPER"],plot_bgcolor=T["PLOT_BG"],
+                    font_color=T["TEXT"],height=420,
+                    margin=dict(l=10,r=10,t=50,b=10),
+                    legend=dict(bgcolor="rgba(0,0,0,0)",font=dict(color=T["TEXT"],size=12)),
+                    xaxis=dict(title="Strike Price",gridcolor=T["GRID"],tickfont=dict(color=T["TEXT"])),
+                    yaxis=dict(title=y_title,gridcolor=T["GRID"],tickfont=dict(color=T["TEXT"])),
+                )
+                st.plotly_chart(fig_cep, use_container_width=True, key="pc_ce_pe_plot")
+
+                # Quick stats row
+                atm_row=fdf.iloc[(fdf["Strike"]-zh_spot).abs().argsort()[:1]]
+                if not atm_row.empty:
+                    ar=atm_row.iloc[0]
+                    qs1,qs2,qs3,qs4,qs5=st.columns(5)
+                    with qs1: st.metric("ATM Strike",f"Rs{ar['Strike']:,.0f}")
+                    with qs2: st.metric("CE Premium",f"Rs{ar['CE_LTP']:.2f}")
+                    with qs3: st.metric("PE Premium",f"Rs{ar['PE_LTP']:.2f}")
+                    with qs4: st.metric("Straddle",f"Rs{ar['CE_LTP']+ar['PE_LTP']:.2f}")
+                    with qs5:
+                        pcr_local=float(fdf["PE_OI"].sum())/float(fdf["CE_OI"].sum()) if fdf["CE_OI"].sum()>0 else 0
+                        st.metric("PCR (Sel.)",f"{pcr_local:.2f}")
+            else:
+                st.info("No strikes in selected range.")
+
+            # ── Full Option Chain Table ──
+            section("📋 Full Option Chain")
+            oc_display = oc_src.copy()
+            oc_display = oc_display.rename(columns={
+                "CE_LTP":"CE LTP","CE_IV":"CE IV%","CE_OI":"CE OI","CE_ChgOI":"CE ΔOI",
+                "CE_Delta":"CE Δ","CE_Gamma":"CE γ","CE_Theta":"CE θ","CE_Vega":"CE ν",
+                "PE_LTP":"PE LTP","PE_IV":"PE IV%","PE_OI":"PE OI","PE_ChgOI":"PE ΔOI",
+                "PE_Delta":"PE Δ","PE_Gamma":"PE γ","PE_Theta":"PE θ","PE_Vega":"PE ν",
+            })
+            # Highlight ATM row
+            atm_k_oc=round(zh_spot/50)*50
+            st.markdown(f"<small style='color:{T['TEXT_MUTED']}'>ATM Strike: <b style='color:{T['ACCENT']}'>Rs{atm_k_oc}</b> | Spot: <b>Rs{zh_spot:,.2f}</b> | {len(oc_src)} strikes loaded</small>",unsafe_allow_html=True)
+            cols_show = [c for c in ["Strike","CE LTP","CE IV%","CE OI","CE ΔOI","CE Δ","PE LTP","PE IV%","PE OI","PE ΔOI","PE Δ"] if c in oc_display.columns]
+            st.dataframe(oc_display[cols_show], use_container_width=True, height=400)
+            # Download button
+            csv_oc = oc_display.to_csv(index=False)
+            st.download_button("⬇ Download Option Chain CSV", csv_oc,
+                file_name=f"option_chain_{asset_name_sel}_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
+                mime="text/csv", key="oc_download")
+        else:
+            st.info("📡 Option chain not available for this instrument. Only NSE indices (Nifty/BankNifty/Sensex) have live option chains via NSE API.")
+            # Show BS-generated chain as fallback
+            section("📊 Theoretical Option Chain (Black-Scholes)")
+            bs_strikes=[round(zh_spot/50)*50+i*50 for i in range(-10,11)]
+            bs_chain=[]
+            T_bs=max(zh_days,0.01)/365; iv_bs=zh_iv/100
+            for k in bs_strikes:
+                cp,cd,cg,cth,cv=bs_price(zh_spot,k,T_bs,risk_free/100,iv_bs,"CE")
+                pp,pd_v,pg,pth,pv=bs_price(zh_spot,k,T_bs,risk_free/100,iv_bs,"PE")
+                mon="ATM" if abs(k-zh_spot)<50 else ("ITM CE/OTM PE" if k<zh_spot else "OTM CE/ITM PE")
+                bs_chain.append({"Strike":k,"Moneyness":mon,
+                    "CE Prem":cp,"CE Delta":cd,"CE Gamma":cg,"CE Theta":cth,
+                    "PE Prem":pp,"PE Delta":pd_v,"PE Gamma":pg,"PE Theta":pth})
+            bs_df=pd.DataFrame(bs_chain)
+            # CE/PE plot from BS
+            fig_bs=go.Figure()
+            fig_bs.add_trace(go.Scatter(x=bs_df["Strike"],y=bs_df["CE Prem"],name="CE Premium",
+                mode="lines+markers",line=dict(color=T["RED"],width=2.5),marker=dict(size=7,color=T["RED"])))
+            fig_bs.add_trace(go.Scatter(x=bs_df["Strike"],y=bs_df["PE Prem"],name="PE Premium",
+                mode="lines+markers",line=dict(color=T["GREEN"],width=2.5),marker=dict(size=7,color=T["GREEN"])))
+            fig_bs.add_vline(x=zh_spot,line_color=T["ACCENT"],line_dash="dash",
+                annotation_text=f"Spot {zh_spot:,.0f}",annotation_font_color=T["ACCENT"])
+            fig_bs.update_layout(
+                title=dict(text=f"BS Theoretical CE/PE Premium — {asset_name_sel} | IV: {zh_iv}%",font=dict(color=T["TEXT"],size=14)),
+                paper_bgcolor=T["PLOT_PAPER"],plot_bgcolor=T["PLOT_BG"],font_color=T["TEXT"],height=380,
+                margin=dict(l=10,r=10,t=50,b=10),
+                legend=dict(bgcolor="rgba(0,0,0,0)",font=dict(color=T["TEXT"])),
+                xaxis=dict(title="Strike",gridcolor=T["GRID"],tickfont=dict(color=T["TEXT"])),
+                yaxis=dict(title="Premium (Rs)",gridcolor=T["GRID"],tickfont=dict(color=T["TEXT"])),
+            )
+            st.plotly_chart(fig_bs,use_container_width=True,key="pc_bs_chain_plot")
+            st.dataframe(bs_df,use_container_width=True,height=380)
+
         if zh_summary:
             section("🎯 Zero Hero Trade Recommendation")
             zh_dir="BUY" in zh_summary["Bias"]; zh_opt="CE" if zh_dir else "PE"
