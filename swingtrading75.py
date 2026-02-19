@@ -47,142 +47,133 @@ else:
 
 st.markdown(f"""
 <style>
-@import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
-*, html, body, [class*="css"] {{ font-family: 'Space Grotesk', sans-serif !important; }}
-.stApp, .main, .block-container {{ background-color:{T['BG']} !important; color:{T['TEXT']} !important; }}
-/* === SIDEBAR HAMBURGER ICON === */
-/* Hide Streamlit material-symbol text icon (the "double_arrow_right" text) */
-[data-testid="stIconMaterial"] {{ visibility:hidden !important; font-size:0 !important; width:0 !important; }}
-[data-testid="collapsedControl"] span,
-[data-testid="collapsedControl"] div {{ visibility:hidden !important; font-size:0 !important; }}
-[data-testid="collapsedControl"] svg {{ display:none !important; }}
-/* The container button */
+@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600&display=swap');
+
+/* Custom card/badge classes only - no Streamlit selector overrides */
+.ae-card {{
+    background: {T['CARD_BG']};
+    border: 1px solid {T['BORDER']};
+    border-radius: 10px;
+    padding: 14px 18px;
+    margin: 6px 0;
+    color: {T['TEXT']};
+    font-size: 13px;
+    line-height: 1.6;
+}}
+.ae-section {{
+    font-size: 15px;
+    font-weight: 700;
+    color: {T['ACCENT']};
+    border-bottom: 2px solid {T['BORDER']};
+    padding-bottom: 5px;
+    margin: 14px 0 10px 0;
+}}
+.ae-badge {{
+    display: inline-block;
+    background: {T['CARD_BG2']};
+    color: {T['ACCENT']};
+    border: 1px solid {T['BORDER']};
+    border-radius: 5px;
+    padding: 2px 7px;
+    font-size: 11px;
+    font-weight: 700;
+    font-family: 'JetBrains Mono', monospace;
+    margin: 2px;
+}}
+.ae-lm {{
+    background: {T['CARD_BG']};
+    border: 1px solid {T['BORDER']};
+    border-radius: 8px;
+    padding: 10px 12px;
+    text-align: center;
+    min-height: 65px;
+    margin-bottom: 4px;
+}}
+.ae-lm-lbl {{
+    font-size: 10px;
+    color: {T['TEXT_MUTED']};
+    text-transform: uppercase;
+    letter-spacing: .7px;
+    margin-bottom: 2px;
+}}
+.ae-lm-val {{
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 15px;
+    font-weight: 800;
+    line-height: 1.3;
+}}
+.ae-lm-sub {{ font-size: 10px; margin-top: 2px; }}
+.ae-summary {{
+    background: {T['CARD_BG']};
+    border: 1px solid {T['BORDER']};
+    border-left: 5px solid {T['ACCENT']};
+    border-radius: 8px;
+    padding: 12px 16px;
+    margin: 0 0 14px 0;
+    font-size: 13px;
+    line-height: 1.6;
+    color: {T['TEXT']};
+}}
+.ae-rec-buy {{
+    background: {T['GREEN']}12;
+    border-left: 5px solid {T['GREEN']};
+    border-radius: 8px;
+    padding: 12px 16px;
+    margin: 6px 0;
+    font-size: 13px;
+}}
+.ae-rec-sell {{
+    background: {T['RED']}12;
+    border-left: 5px solid {T['RED']};
+    border-radius: 8px;
+    padding: 12px 16px;
+    margin: 6px 0;
+    font-size: 13px;
+}}
+.ae-rec-neutral {{
+    background: {T['ACCENT']}10;
+    border-left: 5px solid {T['ACCENT']};
+    border-radius: 8px;
+    padding: 12px 16px;
+    margin: 6px 0;
+    font-size: 13px;
+}}
+.ae-dhan {{
+    background: {T['CARD_BG']};
+    border: 1px solid {T['BLUE']}50;
+    border-left: 4px solid {T['BLUE']};
+    border-radius: 8px;
+    padding: 12px 16px;
+    margin: 6px 0;
+    font-size: 12px;
+}}
+.ae-signal-bar {{
+    border-radius: 8px;
+    padding: 12px 18px;
+    margin: 8px 0;
+}}
+/* ☰ hamburger — only targets the specific icon element, nothing else */
 [data-testid="collapsedControl"] {{
-    position:relative !important;
-    min-width:2.5rem !important;
-    width:2.5rem !important;
-    display:flex !important;
-    align-items:center !important;
-    justify-content:center !important;
-    overflow:visible !important;
+    overflow: visible !important;
 }}
-/* Inject ☰ via pseudo-element */
-[data-testid="collapsedControl"]::before {{
-    content:"☰" !important;
-    font-size:24px !important;
-    color:{T['NAV']} !important;
-    font-family:sans-serif !important;
-    position:absolute !important;
-    visibility:visible !important;
-    display:block !important;
-    line-height:1 !important;
-    z-index:9999 !important;
+[data-testid="stIconMaterial"] {{
+    font-size: 0 !important;
+    line-height: 0 !important;
+    color: transparent !important;
 }}
-/* Fallback: newer Streamlit baseButton selector */
-button[data-testid="baseButton-headerNoPadding"] > * {{ visibility:hidden !important; font-size:0 !important; }}
-button[data-testid="baseButton-headerNoPadding"] {{
-    position:relative !important;
-    min-width:2.5rem !important;
-    overflow:visible !important;
+[data-testid="collapsedControl"]::after {{
+    content: "☰";
+    font-size: 20px;
+    color: {T['TEXT']} !important;
+    position: absolute;
+    pointer-events: none;
 }}
-button[data-testid="baseButton-headerNoPadding"]::before {{
-    content:"☰" !important;
-    font-size:22px !important;
-    color:{T['NAV']} !important;
-    font-family:sans-serif !important;
-    position:absolute !important;
-    visibility:visible !important;
-    display:block !important;
-    z-index:9999 !important;
-}}
-[data-testid="stSidebar"] {{ background:{T['SIDEBAR_BG']} !important; border-right:1px solid {T['SIDEBAR_BORDER']}; }}
-[data-testid="stSidebar"] * {{ color:{T['TEXT']} !important; }}
-[data-testid="stSidebar"] label, [data-testid="stSidebar"] small {{ color:{T['TEXT_MUTED']} !important; }}
-p,span,div,label,h1,h2,h3,h4,h5,h6,.stMarkdown {{ color:{T['TEXT']} !important; }}
-small {{ color:{T['TEXT_MUTED']} !important; }}
-input,textarea {{ background-color:{T['INPUT_BG']} !important; color:{T['INPUT_TEXT']} !important; border:1px solid {T['INPUT_BORDER']} !important; border-radius:6px !important; }}
-input:focus {{ border-color:{T['ACCENT']} !important; }}
-.stNumberInput input {{ background:{T['INPUT_BG']} !important; color:{T['INPUT_TEXT']} !important; }}
-.stSelectbox > div > div {{ background:{T['INPUT_BG']} !important; color:{T['INPUT_TEXT']} !important; border:1px solid {T['INPUT_BORDER']} !important; }}
-.stSelectbox svg {{ fill:{T['TEXT_MUTED']} !important; }}
-[data-baseweb="popover"] *,[data-baseweb="menu"] * {{ background:{T['CARD_BG']} !important; color:{T['TEXT']} !important; }}
-[data-baseweb="option"]:hover {{ background:{T['CARD_BG2']} !important; }}
-.stSlider > div > div > div {{ background:{T['ACCENT']} !important; }}
-.stSlider [role="slider"] {{ background:{T['ACCENT']} !important; border-color:{T['ACCENT']} !important; }}
-.stRadio label,.stCheckbox label {{ color:{T['TEXT']} !important; }}
-.stTabs [data-baseweb="tab-list"] {{
-    background:{T['CARD_BG']};
-    border-radius:12px;
-    padding:4px;
-    border:1px solid {T['BORDER']};
-    gap:2px;
-    flex-wrap:nowrap !important;
-    overflow-x:auto !important;
-    overflow-y:hidden;
-    scrollbar-width:none;
-    -ms-overflow-style:none;
-    white-space:nowrap;
-    display:flex !important;
-    align-items:center;
-}}
-.stTabs [data-baseweb="tab-list"]::-webkit-scrollbar {{ display:none; }}
-.stTabs [data-baseweb="tab"] {{
-    border-radius:8px;
-    color:{T['TEXT_MUTED']} !important;
-    font-weight:600;
-    font-size:12px;
-    padding:6px 12px;
-    white-space:nowrap;
-    flex-shrink:0;
-}}
-.stTabs [aria-selected="true"] {{ background:{T['ACCENT']} !important; color:#000 !important; font-weight:700; }}
-.stTabs [data-testid="stTabPanel"] {{ background:transparent !important; }}
-[data-testid="metric-container"] {{ background:{T['CARD_BG']} !important; border:1px solid {T['BORDER']}; border-radius:10px; padding:10px 14px; }}
-[data-testid="stMetricLabel"] {{ color:{T['TEXT_MUTED']} !important; font-size:11px; }}
-[data-testid="stMetricValue"] {{ color:{T['METRIC_VAL']} !important; font-family:'JetBrains Mono',monospace !important; font-size:18px !important; font-weight:700 !important; }}
-[data-testid="stMetricDelta"] {{ font-size:11px !important; }}
-.stDataFrame,.stDataFrame * {{ background:{T['CARD_BG']} !important; color:{T['TEXT']} !important; }}
-.stDataFrame thead th {{ background:{T['CARD_BG2']} !important; color:{T['ACCENT']} !important; font-weight:700 !important; }}
-.stButton > button {{ background:linear-gradient(135deg,{T['ACCENT']},#D97706) !important; color:#000 !important; font-weight:700 !important; border:none !important; border-radius:8px !important; padding:9px 18px !important; font-size:13px !important; transition:all 0.2s !important; }}
-.stButton > button:hover {{ transform:translateY(-1px); box-shadow:0 4px 16px rgba(245,158,11,0.5) !important; }}
-.alpha-card {{ background:{T['CARD_BG']}; border:1px solid {T['BORDER']}; border-radius:12px; padding:14px 18px; margin:6px 0; color:{T['TEXT']}; }}
-.section-hdr {{ font-size:17px; font-weight:700; color:{T['ACCENT']}; border-bottom:2px solid {T['BORDER']}; padding-bottom:7px; margin:16px 0 12px; }}
-.tf-badge {{ display:inline-block; background:{T['CARD_BG2']}; color:{T['ACCENT']}; border:1px solid rgba(245,158,11,0.4); border-radius:6px; padding:2px 8px; font-size:11px; font-weight:700; font-family:'JetBrains Mono',monospace; margin:2px; }}
-.stAlert,[data-testid="stAlert"] {{ background:{T['CARD_BG']} !important; color:{T['TEXT']} !important; border-color:{T['BORDER']} !important; }}
-.stProgress > div > div {{ background:{T['ACCENT']} !important; }}
-/* ── RESPONSIVE ── */
-@media(max-width:768px){{
-  .block-container{{padding:.5rem .8rem!important}}
-  [data-testid="stMetricValue"]{{font-size:14px!important}}
-  [data-testid="stHorizontalBlock"]{{flex-wrap:wrap!important}}
-  [data-testid="stHorizontalBlock"]>div{{min-width:130px!important;flex:1 1 130px!important}}
-  .stTabs [data-baseweb="tab"]{{font-size:10px!important;padding:4px 7px!important}}
-  .section-hdr{{font-size:13px!important}}
-  .alpha-card{{padding:10px 12px!important}}
-}}
-@media(max-width:480px){{
-  .block-container{{padding:.3rem .4rem!important}}
-  [data-testid="stHorizontalBlock"]>div{{min-width:100px!important}}
-}}
-@media(min-width:1400px){{
-  .block-container{{max-width:1380px!important;padding-left:2rem!important;padding-right:2rem!important}}
-}}
-/* ── LIVE METRICS ── */
-.lm-box{{background:{T['CARD_BG']};border:1px solid {T['BORDER']};border-radius:10px;padding:10px 12px;text-align:center;transition:background .3s}}
-.lm-lbl{{font-size:10px;color:{T['TEXT_MUTED']};text-transform:uppercase;letter-spacing:.8px;margin-bottom:3px}}
-.lm-val{{font-family:'JetBrains Mono',monospace;font-size:17px;font-weight:800;line-height:1.2}}
-.lm-sub{{font-size:10px;margin-top:2px}}
-/* ── DHAN ── */
-.dhan-box{{background:{T['CARD_BG']};border:1px solid {T['BLUE']}50;border-left:4px solid {T['BLUE']};border-radius:10px;padding:12px 16px;margin:6px 0}}
-.order-ok{{background:{T['GREEN']}15;border:1px solid {T['GREEN']}50;border-radius:8px;padding:8px 12px;margin:3px 0;font-size:13px}}
-.order-fail{{background:{T['RED']}15;border:1px solid {T['RED']}50;border-radius:8px;padding:8px 12px;margin:3px 0;font-size:13px}}
-.order-skip{{background:{T['ACCENT']}15;border:1px solid {T['ACCENT']}50;border-radius:8px;padding:8px 12px;margin:3px 0;font-size:13px}}
 </style>
 """, unsafe_allow_html=True)
 
-def badge(t): return f'<span class="tf-badge">{t}</span>'
-def section(t): st.markdown(f'<div class="section-hdr">{t}</div>', unsafe_allow_html=True)
-def acard(h): st.markdown(f'<div class="alpha-card">{h}</div>', unsafe_allow_html=True)
+def badge(t): return f'<span class="ae-badge">{t}</span>'
+def section(t): st.markdown(f'<div class="ae-section">{t}</div>', unsafe_allow_html=True)
+def acard(h): st.markdown(f'<div class="ae-card">{h}</div>', unsafe_allow_html=True)
 NIFTY50_STOCKS = {
     "Adani Enterprises":"ADANIENT.NS","Adani Ports":"ADANIPORTS.NS",
     "Apollo Hospitals":"APOLLOHOSP.NS","Asian Paints":"ASIANPAINT.NS",
@@ -1020,39 +1011,39 @@ try:
 
         m1,m2,m3,m4,m5,m6 = st.columns([2,1.2,1.2,1.2,1,1])
         with m1:
-            st.markdown(f'''<div class="lm-box">
-            <div class="lm-lbl">📍 Live Price</div>
-            <div class="lm-val" style="color:{ltp_c}">₹{cur:,.2f}</div>
-            <div class="lm-sub" style="color:{ltp_c}">{chg:+.2f} ({pct:+.2f}%)</div>
+            st.markdown(f'''<div class="ae-lm">
+            <div class="ae-lm-lbl">📍 Live Price</div>
+            <div class="ae-lm-val" style="color:{ltp_c}">₹{cur:,.2f}</div>
+            <div class="ae-lm-sub" style="color:{ltp_c}">{chg:+.2f} ({pct:+.2f}%)</div>
             </div>''', unsafe_allow_html=True)
         with m2:
             rc = T["GREEN"] if realized >= 0 else T["RED"]
-            st.markdown(f'''<div class="lm-box">
-            <div class="lm-lbl">💰 Realized</div>
-            <div class="lm-val" style="color:{rc}">₹{realized:+,.0f}</div>
+            st.markdown(f'''<div class="ae-lm">
+            <div class="ae-lm-lbl">💰 Realized</div>
+            <div class="ae-lm-val" style="color:{rc}">₹{realized:+,.0f}</div>
             </div>''', unsafe_allow_html=True)
         with m3:
             uc = T["GREEN"] if unrealized >= 0 else T["RED"]
-            st.markdown(f'''<div class="lm-box">
-            <div class="lm-lbl">📊 Unrealized</div>
-            <div class="lm-val" style="color:{uc}">₹{unrealized:+,.0f}</div>
+            st.markdown(f'''<div class="ae-lm">
+            <div class="ae-lm-lbl">📊 Unrealized</div>
+            <div class="ae-lm-val" style="color:{uc}">₹{unrealized:+,.0f}</div>
             </div>''', unsafe_allow_html=True)
         with m4:
-            st.markdown(f'''<div class="lm-box">
-            <div class="lm-lbl">🏦 Total P&L</div>
-            <div class="lm-val" style="color:{pnl_c}">₹{total_pnl:+,.0f}</div>
+            st.markdown(f'''<div class="ae-lm">
+            <div class="ae-lm-lbl">🏦 Total P&L</div>
+            <div class="ae-lm-val" style="color:{pnl_c}">₹{total_pnl:+,.0f}</div>
             </div>''', unsafe_allow_html=True)
         with m5:
-            st.markdown(f'''<div class="lm-box">
-            <div class="lm-lbl">📂 Positions</div>
-            <div class="lm-val" style="color:{T["METRIC_VAL"]}">{len(st.session_state["open_positions"])}</div>
+            st.markdown(f'''<div class="ae-lm">
+            <div class="ae-lm-lbl">📂 Positions</div>
+            <div class="ae-lm-val" style="color:{T["METRIC_VAL"]}">{len(st.session_state["open_positions"])}</div>
             </div>''', unsafe_allow_html=True)
         with m6:
             sig_s = an.get("bias","—"); sig_col = T["GREEN"] if "BUY" in sig_s else (T["RED"] if "SELL" in sig_s else T["ACCENT"])
-            st.markdown(f'''<div class="lm-box">
-            <div class="lm-lbl">Signal / RSI</div>
-            <div class="lm-val" style="color:{sig_col};font-size:12px">{sig_s.split()[0]}</div>
-            <div class="lm-sub" style="color:{T["TEXT_MUTED"]}">RSI {an["rsi"]:.1f} · {datetime.now().strftime("%H:%M:%S")}</div>
+            st.markdown(f'''<div class="ae-lm">
+            <div class="ae-lm-lbl">Signal / RSI</div>
+            <div class="ae-lm-val" style="color:{sig_col};font-size:12px">{sig_s.split()[0]}</div>
+            <div class="ae-lm-sub" style="color:{T["TEXT_MUTED"]}">RSI {an["rsi"]:.1f} · {datetime.now().strftime("%H:%M:%S")}</div>
             </div>''', unsafe_allow_html=True)
 
     _live_ticker_available = True
@@ -1066,6 +1057,12 @@ tab1,tab2,tab3,tab4=st.tabs(["📊 Backtesting","⚡ Live Trading","🔭 Analyse
 # ════════════════════════════════════════════════════════════════════════════
 with tab1:
     section("📊 Strategy Backtesting Engine")
+    st.markdown(f"""<div class="ae-summary">
+    <b style="color:{T['ACCENT']}">📊 Backtesting</b> — Simulate your selected strategy (<b>{strategy_name}</b>) on historical data for <b>{asset_name_sel}</b>.<br>
+    Uses <b>{bt_interval}</b> candles over <b>{bt_period}</b> with <b>{sl_type} stop-loss</b> ({sl_label}) and <b>1:{rr_ratio} R:R</b>.
+    Review win rate, Sharpe ratio, drawdown, equity curve, and per-trade P&amp;L before going live.
+    Click <b>🚀 Run Analysis</b> in the sidebar to start.
+    </div>""", unsafe_allow_html=True)
     if ticker=="NIFTY50_ALL":
         section("All Nifty 50 Stocks — Batch Analysis")
         st.info("Scans all 50 stocks. Allow ~2 min with rate limiting (1.5s delay).")
@@ -1140,6 +1137,17 @@ with tab1:
 # ════════════════════════════════════════════════════════════════════════════
 with tab2:
     section("⚡ Live Trading Dashboard")
+    _t2_status = "🟢 ACTIVE" if st.session_state["trading_active"] else "⚫ Stopped"
+    _t2_pos = len(st.session_state["open_positions"])
+    _t2_pnl = st.session_state["live_realized_pnl"] + st.session_state["live_unrealized_pnl"]
+    _t2_pnl_c = T["GREEN"] if _t2_pnl >= 0 else T["RED"]
+    st.markdown(f"""<div class="ae-summary">
+    <b style="color:{T['ACCENT']}">⚡ Live Trading</b> — Paper-trade <b>{asset_name_sel}</b> using <b>{strategy_name}</b> on <b>{live_interval}</b> candles.
+    Status: <b>{_t2_status}</b> | Open positions: <b>{_t2_pos}</b> |
+    Session P&amp;L: <b style="color:{_t2_pnl_c}">₹{_t2_pnl:+,.0f}</b><br>
+    Auto-refresh every <b>{refresh_int}s</b>. Signals auto-process SL/Target hits.
+    Press <b>▶ Start</b> to begin, <b>⏹ Stop</b> to pause. Data is ~15-20 min delayed (Yahoo Finance).
+    </div>""", unsafe_allow_html=True)
     ctrl=st.columns([1,1,1,4])
     with ctrl[0]:
         if st.button("▶ Start",disabled=st.session_state["trading_active"],use_container_width=True):
@@ -1225,36 +1233,36 @@ with tab2:
         unr_c  = T["GREEN"] if unrealized >= 0 else T["RED"]
         m1,m2,m3,m4,m5,m6 = st.columns([2,1.2,1.2,1.2,1,1])
         with m1:
-            st.markdown(f'''<div class="lm-box">
-            <div class="lm-lbl">📍 Live Price</div>
-            <div class="lm-val" style="color:{ltp_c}">₹{cur_price:,.2f}</div>
-            <div class="lm-sub" style="color:{ltp_c}">{price_chg:+.2f} ({price_pct:+.2f}%)</div>
+            st.markdown(f'''<div class="ae-lm">
+            <div class="ae-lm-lbl">📍 Live Price</div>
+            <div class="ae-lm-val" style="color:{ltp_c}">₹{cur_price:,.2f}</div>
+            <div class="ae-lm-sub" style="color:{ltp_c}">{price_chg:+.2f} ({price_pct:+.2f}%)</div>
             </div>''', unsafe_allow_html=True)
         with m2:
-            st.markdown(f'''<div class="lm-box">
-            <div class="lm-lbl">💰 Realized</div>
-            <div class="lm-val" style="color:{re_c}">₹{realized:+,.0f}</div>
+            st.markdown(f'''<div class="ae-lm">
+            <div class="ae-lm-lbl">💰 Realized</div>
+            <div class="ae-lm-val" style="color:{re_c}">₹{realized:+,.0f}</div>
             </div>''', unsafe_allow_html=True)
         with m3:
-            st.markdown(f'''<div class="lm-box">
-            <div class="lm-lbl">📊 Unrealized</div>
-            <div class="lm-val" style="color:{unr_c}">₹{unrealized:+,.0f}</div>
+            st.markdown(f'''<div class="ae-lm">
+            <div class="ae-lm-lbl">📊 Unrealized</div>
+            <div class="ae-lm-val" style="color:{unr_c}">₹{unrealized:+,.0f}</div>
             </div>''', unsafe_allow_html=True)
         with m4:
-            st.markdown(f'''<div class="lm-box">
-            <div class="lm-lbl">🏦 Total P&L</div>
-            <div class="lm-val" style="color:{pnl_c}">₹{total_pnl:+,.0f}</div>
+            st.markdown(f'''<div class="ae-lm">
+            <div class="ae-lm-lbl">🏦 Total P&L</div>
+            <div class="ae-lm-val" style="color:{pnl_c}">₹{total_pnl:+,.0f}</div>
             </div>''', unsafe_allow_html=True)
         with m5:
-            st.markdown(f'''<div class="lm-box">
-            <div class="lm-lbl">📂 Positions</div>
-            <div class="lm-val" style="color:{T["METRIC_VAL"]}">{len(st.session_state["open_positions"])}</div>
+            st.markdown(f'''<div class="ae-lm">
+            <div class="ae-lm-lbl">📂 Positions</div>
+            <div class="ae-lm-val" style="color:{T["METRIC_VAL"]}">{len(st.session_state["open_positions"])}</div>
             </div>''', unsafe_allow_html=True)
         with m6:
-            st.markdown(f'''<div class="lm-box">
-            <div class="lm-lbl">RSI / ATR</div>
-            <div class="lm-val" style="color:{T["METRIC_VAL"]};font-size:14px">{an["rsi"]:.1f} / {an["atr"]:.1f}</div>
-            <div class="lm-sub" style="color:{T["TEXT_FAINT"]}">{datetime.now().strftime("%H:%M:%S")}</div>
+            st.markdown(f'''<div class="ae-lm">
+            <div class="ae-lm-lbl">RSI / ATR</div>
+            <div class="ae-lm-val" style="color:{T["METRIC_VAL"]};font-size:14px">{an["rsi"]:.1f} / {an["atr"]:.1f}</div>
+            <div class="ae-lm-sub" style="color:{T["TEXT_FAINT"]}">{datetime.now().strftime("%H:%M:%S")}</div>
             </div>''', unsafe_allow_html=True)
 
     # ── Signal banner ──
@@ -1274,7 +1282,7 @@ with tab2:
             else:
                 dc1, dc2 = st.columns([3,1])
                 with dc2:
-                    st.markdown(f"""<div class="dhan-box" style="font-size:12px">
+                    st.markdown(f"""<div class="ae-dhan" style="font-size:12px">
                     <b style="color:{T["BLUE"]}">Order Rules</b><br>
                     🟢 LONG → BUY CE / BUY Stock<br>
                     🔴 SHORT → BUY PE (options)<br>
@@ -1434,6 +1442,11 @@ with tab2:
 # ════════════════════════════════════════════════════════════════════════════
 with tab3:
     section("🔭 Deep Analysis & Recommendations")
+    st.markdown(f"""<div class="ae-summary">
+    <b style="color:{T['ACCENT']}">🔭 Analysis</b> — Deep technical breakdown of <b>{asset_name_sel}</b> using 1Y daily data.
+    Get trend score, momentum score, RSI, VWAP levels, ATR, Pivot Points and a full trade plan
+    (entry, SL, 3 targets, trailing SL). Signal gauges show the overall market bias at a glance.
+    </div>""", unsafe_allow_html=True)
     if ticker=="NIFTY50_ALL": st.warning("Select a specific ticker."); st.stop()
     with st.spinner("Fetching 1Y daily data..."):
         an_raw=fetch_data(ticker,"1y","1d")
@@ -1444,6 +1457,18 @@ with tab3:
     dr_s=an_raw.index[0].strftime("%d %b %Y"); dr_e=an_raw.index[-1].strftime("%d %b %Y")
     st.markdown(f"Data: {badge('1Y Daily')} Range: {badge(dr_s+' to '+dr_e)} SL: {badge(sl_type+' '+sl_label)} RR: {badge('1:'+str(rr_ratio))}",unsafe_allow_html=True)
     dir_c=T["GREEN"] if "BUY" in an["bias"] else T["RED"]
+    # ── Dynamic summary box with actual computed values ──
+    _t3_rsi_txt = "overbought — watch for reversal" if an["rsi"]>70 else ("oversold — potential bounce" if an["rsi"]<30 else "neutral zone")
+    _t3_trend_txt = "strong uptrend" if an["trend_score"]>=8 else ("uptrend" if an["trend_score"]>=6 else ("downtrend" if an["trend_score"]<=3 else "sideways/mixed"))
+    _t3_rec_cls = "ae-rec-buy" if "BUY" in an["bias"] else ("ae-rec-sell" if "SELL" in an["bias"] else "ae-rec-neutral")
+    st.markdown(f"""<div class="{_t3_rec_cls}">
+    <b style="color:{dir_c}">📌 Current Recommendation: {an['strength']} {an['bias']}</b><br>
+    <span style="font-size:12px;color:{T['TEXT_MUTED']}">
+    {asset_name_sel} is in a <b>{_t3_trend_txt}</b> (Trend score {an['trend_score']}/10, Momentum {an['mom_score']}/10, Combined {an['combined']}/20).
+    RSI at <b>{an['rsi']:.1f}</b> — {_t3_rsi_txt}.
+    ATR <b>{an['atr']:.1f}</b> pts · IV <b>{an['iv_pct']}%</b> · HV20 <b>{an['hv20']}%</b>.<br>
+    Entry: <b>Rs{an['entry']:,.2f}</b> · SL: <b>Rs{an['sl_fixed']:,.2f}</b> · Targets: <b>{an['tgt1']:,.0f} / {an['tgt2']:,.0f} / {an['tgt3']:,.0f}</b>
+    </span></div>""", unsafe_allow_html=True)
     st.markdown(f"""<div style="background:{dir_c}10;border:1px solid {dir_c}40;border-left:6px solid {dir_c};
         border-radius:14px;padding:22px 26px;margin-bottom:18px">
         <div style="font-size:28px;font-weight:800;color:{dir_c}">{an['strength']} {an['bias']}</div>
@@ -1470,7 +1495,7 @@ with tab3:
             ("R:R",f'<b>1:{abs(an["tgt1"]-an["entry"])/(an["sl_dist"]+1e-9):.1f}</b>')]
         hr="".join([f'<tr><td style="color:{T["TEXT_MUTED"]};padding:5px 8px 5px 0;font-size:13px;border-bottom:1px solid {T["BORDER"]}20">{r}</td>'
             f'<td style="font-size:13px;padding:5px 0;border-bottom:1px solid {T["BORDER"]}20">{v}</td></tr>' for r,v in plan_rows])
-        st.markdown(f'<div class="alpha-card"><b style="color:{T["ACCENT"]};font-size:15px">🎯 Trade Setup</b><br><br><table style="width:100%;border-collapse:collapse">{hr}</table></div>',unsafe_allow_html=True)
+        st.markdown(f'<div class="ae-card"><b style="color:{T["ACCENT"]};font-size:15px">🎯 Trade Setup</b><br><br><table style="width:100%;border-collapse:collapse">{hr}</table></div>',unsafe_allow_html=True)
     with tp2:
         lv_html="".join([f'<tr><td style="color:{T["TEXT_MUTED"]};font-size:13px;padding:5px 8px 5px 0;border-bottom:1px solid {T["BORDER"]}20">{n}</td>'
             f'<td style="color:{c};font-weight:600;font-size:13px;font-family:JetBrains Mono;padding:5px 0;border-bottom:1px solid {T["BORDER"]}20">Rs{v:,.2f}'
@@ -1481,7 +1506,7 @@ with tab3:
                 ("R2",an["levels"]["R2"],T["GREEN"]),("S1",an["levels"]["S1"],T["RED"]),
                 ("S2",an["levels"]["S2"],T["RED"]),("BB Upper",an["levels"]["BB Upper"],T["PURPLE"]),
                 ("BB Lower",an["levels"]["BB Lower"],T["PURPLE"])]])
-        st.markdown(f'<div class="alpha-card"><b style="color:{T["ACCENT"]};font-size:15px">📐 Key Levels</b><br><br><table style="width:100%;border-collapse:collapse">{lv_html}</table></div>',unsafe_allow_html=True)
+        st.markdown(f'<div class="ae-card"><b style="color:{T["ACCENT"]};font-size:15px">📐 Key Levels</b><br><br><table style="width:100%;border-collapse:collapse">{lv_html}</table></div>',unsafe_allow_html=True)
     st.markdown("---")
     ta1,ta2=st.columns(2)
     with ta1:
@@ -1541,12 +1566,18 @@ with tab4:
     section("🎯 Straddle Premium Chart & Zero Hero Analysis")
     if ticker=="NIFTY50_ALL": st.warning("Select a specific ticker."); st.stop()
     st.markdown(f"Asset: {badge(asset_name_sel)} Data: {badge('1Y Daily')} Exp: {badge(str(days_exp)+'d')} IV: {badge('NSE/HV Proxy')}",unsafe_allow_html=True)
+    st.markdown(f"""<div class="ae-summary">
+    <b style="color:{T['ACCENT']}">🎯 Straddle & Zero Hero</b> — Two tools in one tab.<br>
+    <b>Straddle History:</b> 1-year ATM straddle premium chart. Z-score tells if options are cheap or expensive vs history.
+    <b>Z &gt; +1.5</b> = sell premium (overpriced). <b>Z &lt; -1.5</b> = buy premium (cheap). Percentile bands and reversal stats included.<br>
+    <b>Zero Hero:</b> 0DTE options analysis — PCR, Max Pain, OI, Gamma/Theta curves, and a trade plan for same-day expiry plays.
+    </div>""", unsafe_allow_html=True)
     sub1,sub2=st.tabs(["📊 Straddle Premium History","⚡ Zero Hero (0DTE)"])
 
     with sub1:
         section("📊 Historical ATM Straddle Premium")
         # ── Straddle Education Panel ──
-        st.markdown(f"""<div class="alpha-card">
+        st.markdown(f"""<div class="ae-card">
         <b style="color:{T['ACCENT']};font-size:15px">📚 Understanding ATM Straddle Premium</b><br><br>
         <span style="font-size:13px;color:{T['TEXT']}">
         An <b>ATM Straddle</b> = simultaneously buying the ATM Call (CE) + ATM Put (PE) at the same strike.
@@ -1670,7 +1701,7 @@ with tab4:
                 with rc3: st.metric("Reversal Rate",f"{rev_wr}%","High Edge" if rev_wr>65 else "Moderate" if rev_wr>50 else "Low")
                 st.dataframe(rev_df,use_container_width=True,height=230)
                 if rev_wr>60:
-                    st.markdown(f"""<div class="alpha-card">
+                    st.markdown(f"""<div class="ae-card">
                     <b style="color:{T['ACCENT']}">📐 Straddle Reversal Strategy (Edge Found)</b><br><br>
                     After straddle moves >{threshold_pct:.0f}%, reversal happens {rev_wr}% of time in 5 bars.<br><br>
                     <b style="color:{T['RED']}">After EXPANSION (+{threshold_pct:.0f}%):</b> Sell straddle | SL: 20% above entry | Target: 30% below<br>
@@ -1685,7 +1716,7 @@ with tab4:
 
     with sub2:
         section("⚡ Zero Hero — 0DTE Options Analysis")
-        st.markdown(f"""<div class="alpha-card">
+        st.markdown(f"""<div class="ae-card">
         <b style="color:{T['ACCENT']}">Zero Hero Strategy (0DTE = Same-Day Expiry)</b><br>
         <span style="font-size:13px;color:{T['TEXT_MUTED']}">
         0DTE options have maximum Theta decay and explosive Gamma near ATM.<br>
@@ -1941,7 +1972,7 @@ with tab4:
             zh_sl_pts=round(zh_summary["Straddle Premium"]*0.30,2)
             zh_tgt=round(zh_summary["Straddle Premium"]*0.50,2)
             zh_c=T["GREEN"] if zh_dir else T["RED"]
-            st.markdown(f"""<div class="alpha-card">
+            st.markdown(f"""<div class="ae-card">
             <b style="color:{T['ACCENT']};font-size:15px">⚡ Zero Hero Trade Plan</b><br><br>
             <table style="width:100%;border-collapse:collapse;font-size:13px">
             <tr><td style="color:{T['TEXT_MUTED']};padding:5px 8px 5px 0">Direction</td><td><b style="color:{zh_c}">BUY {zh_opt} {"▲" if zh_dir else "▼"}</b></td></tr>
