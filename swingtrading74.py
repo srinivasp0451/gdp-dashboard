@@ -198,8 +198,7 @@ class DhanBrokerIntegration:
     def place_order(self, transaction_type, security_id, quantity, signal_type=None, order_params=None):
         """
         Place order via Dhan API.
-        Supports: Market/Intraday, CNC/Delivery, Bracket Orders (BO) with SL+Target+Trail.
-        When broker_use_own_sl is enabled, uses Bracket Order (BO) format for all order types.
+        Supports: Market/Limit orders, CNC/Delivery, Bracket Orders (BO) with SL+Target+Trail.
         """
         order_response = {
             'order_id': None, 'status': 'FAILED', 'raw_response': None, 'error': None
@@ -210,27 +209,35 @@ class DhanBrokerIntegration:
                 is_options   = self.config.get('dhan_is_options', True)
                 trading_type = self.config.get('dhan_trading_type', 'Intraday')
                 use_broker_sl = self.config.get('broker_use_own_sl', False)
+                order_type_selection = self.config.get('dhan_order_type', 'Market Order')
                 op = order_params or {}
 
+                # Determine order type
+                if order_type_selection == 'Limit Order':
+                    order_type = self.dhanhq_module.LIMIT
+                    limit_price = float(op.get('price', 0)) if op else 0
+                else:
+                    order_type = self.dhanhq_module.MARKET
+                    limit_price = 0
+
                 if use_broker_sl and op:
-                    # ── Bracket Order (BO) for all order types ──────────────
-                    # Uses boProfitValue and boStopLossValue as per Dhan BO API
+                    # ── Bracket Order (BO) - always uses LIMIT ──────────────
                     lmt_price = float(op.get('price', 0))
                     bo_profit  = float(op.get('boProfitValue', 0))
                     bo_sl      = float(op.get('boStopLossValue', 0))
                     trail_sl   = float(op.get('trailStopLoss', 0))
 
                     if is_options or trading_type == 'Intraday':
-                        product = self.dhanhq_module.BO   # Bracket Order (INTRA)
+                        product = self.dhanhq_module.BO
                     else:
-                        product = self.dhanhq_module.BO   # BO works for CNC too
+                        product = self.dhanhq_module.BO
 
                     response = self.dhan.place_order(
                         security_id=str(security_id),
                         exchange_segment=exchange_segment,
                         transaction_type=transaction_type,
                         quantity=int(quantity),
-                        order_type=self.dhanhq_module.LIMIT,
+                        order_type=self.dhanhq_module.LIMIT,  # BO always LIMIT
                         product_type=product,
                         price=lmt_price,
                         bo_profit_value=bo_profit,
@@ -239,26 +246,26 @@ class DhanBrokerIntegration:
                     )
 
                 elif not is_options and trading_type == 'Delivery (CNC)':
-                    # ── Plain CNC (no bracket) ──────────────────────────────
+                    # ── CNC (Market or Limit) ────────────────────────────────
                     response = self.dhan.place_order(
                         security_id=str(security_id),
                         exchange_segment=exchange_segment,
                         transaction_type=transaction_type,
                         quantity=int(quantity),
-                        order_type=self.dhanhq_module.MARKET,
+                        order_type=order_type,
                         product_type=self.dhanhq_module.CNC,
-                        price=0
+                        price=limit_price
                     )
                 else:
-                    # ── Market / Intraday ───────────────────────────────────
+                    # ── Intraday / Options (Market or Limit) ────────────────
                     response = self.dhan.place_order(
                         security_id=str(security_id),
                         exchange_segment=exchange_segment,
                         transaction_type=transaction_type,
                         quantity=int(quantity),
-                        order_type=self.dhanhq_module.MARKET,
+                        order_type=order_type,
                         product_type=self.dhanhq_module.INTRA,
-                        price=0
+                        price=limit_price
                     )
 
                 order_response['raw_response'] = response
@@ -1129,6 +1136,67 @@ def check_custom_strategy(df, idx, config, current_position):
 
     return None, None
 
+# ================================
+# HELPER FUNCTIONS
+# ================================
+
+def is_within_trade_window(timestamp, config):
+    """
+    Check if timestamp is within configured trade window.
+    Returns True if trade window is disabled or timestamp is within window.
+    """
+    if not config.get('use_trade_window', False):
+        return True
+    
+    try:
+        # Get IST time
+        IST = pytz.timezone('Asia/Kolkata')
+        if hasattr(timestamp, 'tzinfo') and timestamp.tzinfo is not None:
+            ts_ist = timestamp.astimezone(IST)
+        else:
+            ts_ist = IST.localize(timestamp) if not hasattr(timestamp, 'tzinfo') else timestamp
+        
+        start_time = config.get('trade_window_start', datetime.strptime("09:30", "%H:%M").time())
+        end_time = config.get('trade_window_end', datetime.strptime("15:00", "%H:%M").time())
+        
+        current_time = ts_ist.time()
+        return start_time <= current_time <= end_time
+    except Exception:
+        return True  # Default to allowing trade if error
+
+def should_allow_trade_direction(signal, config):
+    """
+    Check if signal matches allowed trade direction filter.
+    Returns True if signal is allowed, False otherwise.
+    """
+    direction_filter = config.get('trade_direction', 'Both (LONG + SHORT)')
+    
+    if direction_filter == 'Both (LONG + SHORT)':
+        return True
+    elif direction_filter == 'LONG Only':
+        return signal in ('BUY', 'LONG')
+    elif direction_filter == 'SHORT Only':
+        return signal in ('SELL', 'SHORT')
+    
+    return True  # Default to allowing all
+
+def calculate_brokerage(entry_price, exit_price, quantity, config):
+    """
+    Calculate brokerage and return Net P&L after brokerage.
+    Returns brokerage amount.
+    """
+    if not config.get('include_brokerage', False):
+        return 0.0
+    
+    brokerage_type = config.get('brokerage_type', 'Fixed per Trade')
+    
+    if brokerage_type == 'Fixed per Trade':
+        return float(config.get('brokerage_per_trade', 20.0))
+    else:  # Percentage of Turnover
+        turnover = (entry_price + exit_price) * quantity
+        brokerage_pct = float(config.get('brokerage_percentage', 0.03)) / 100  # Convert % to decimal
+        return turnover * brokerage_pct
+
 # Strategy mapping
 STRATEGY_FUNCTIONS = {
     'EMA Crossover': check_ema_crossover_strategy,
@@ -1737,10 +1805,18 @@ def run_backtest(df, config):
         current_price = current_data['Close']
         
         if position is None:
+            # Check if within trade window before checking for entry
+            if not is_within_trade_window(current_data['Datetime'], config):
+                continue  # Skip entry check if outside trade window
+            
             # Check for entry signal
             signal, entry_price = strategy_func(df, idx, config, None)
             
             if signal:
+                # Check if signal matches trade direction filter
+                if not should_allow_trade_direction(signal, config):
+                    continue  # Skip this signal if direction not allowed
+                
                 signals_generated += 1
                 
                 # Convert signal to position type
@@ -1780,8 +1856,13 @@ def run_backtest(df, config):
             exit_reason = None
             exit_price = current_price
             
+            # Check if outside trade window - force exit
+            if not is_within_trade_window(current_data['Datetime'], config):
+                exit_reason = 'Trade Window Closed'
+                exit_price = current_price
+            
             # Check SL hit
-            if position['sl_price'] is not None:
+            if exit_reason is None and position['sl_price'] is not None:
                 if position['type'] == 'LONG':
                     if current_price <= position['sl_price']:
                         exit_reason = 'SL Hit'
@@ -1820,6 +1901,10 @@ def run_backtest(df, config):
                 else:  # SHORT
                     pnl = (position['entry_price'] - exit_price) * position['quantity']
                 
+                # Calculate brokerage
+                brokerage = calculate_brokerage(position['entry_price'], exit_price, position['quantity'], config)
+                net_pnl = pnl - brokerage
+                
                 # Record trade
                 trade = {
                     'entry_time': position['entry_time'],
@@ -1831,6 +1916,8 @@ def run_backtest(df, config):
                     'target_price': position['target_price'],
                     'quantity': position['quantity'],
                     'pnl': pnl,
+                    'brokerage': brokerage,
+                    'net_pnl': net_pnl,
                     'exit_reason': exit_reason,
                 }
                 
@@ -1852,8 +1939,14 @@ def run_backtest(df, config):
         total_pnl = df_trades['pnl'].sum()
         avg_pnl = df_trades['pnl'].mean()
         
-        # Calculate max drawdown
-        cumulative_pnl = df_trades['pnl'].cumsum()
+        # Net P&L calculations
+        total_brokerage = df_trades['brokerage'].sum() if 'brokerage' in df_trades.columns else 0
+        total_net_pnl = df_trades['net_pnl'].sum() if 'net_pnl' in df_trades.columns else total_pnl
+        avg_net_pnl = df_trades['net_pnl'].mean() if 'net_pnl' in df_trades.columns else avg_pnl
+        
+        # Calculate max drawdown (using net P&L)
+        pnl_column = 'net_pnl' if 'net_pnl' in df_trades.columns else 'pnl'
+        cumulative_pnl = df_trades[pnl_column].cumsum()
         running_max = cumulative_pnl.cummax()
         drawdown = cumulative_pnl - running_max
         max_drawdown = drawdown.min()
@@ -1865,6 +1958,9 @@ def run_backtest(df, config):
             'win_rate': win_rate,
             'total_pnl': total_pnl,
             'avg_pnl': avg_pnl,
+            'total_brokerage': total_brokerage,
+            'total_net_pnl': total_net_pnl,
+            'avg_net_pnl': avg_net_pnl,
             'max_drawdown': max_drawdown,
         }
     else:
@@ -1947,11 +2043,29 @@ def live_trading_iteration():
     position = st.session_state.get('position')
     
     if position is None:
+        # Check if within trade window
+        if not is_within_trade_window(current_data['Datetime'], config):
+            add_log(f"⏰ Outside trade window - no new entries allowed")
+            return
+        
         # Check for entry signal
         add_log(f"🔍 Checking for entry signal using {strategy_name}...")
         signal, entry_price = strategy_func(df, idx, config, None)
         
         if signal:
+            # Check if signal matches trade direction filter
+            if not should_allow_trade_direction(signal, config):
+                direction_filter = config.get('trade_direction', 'Both (LONG + SHORT)')
+                add_log(f"⛔ Signal {signal} filtered out by direction setting: {direction_filter}")
+                return
+            
+            # Check if broker already has an active position - prevent duplicate orders
+            if config.get('dhan_enabled', False):
+                existing_broker_pos = st.session_state.get('broker_position')
+                if existing_broker_pos:
+                    add_log(f"⛔ Broker order already active - preventing duplicate order")
+                    return
+            
             add_log(f"✅ SIGNAL DETECTED: {signal} at {entry_price:.2f}")
             
             # Convert to position type
@@ -2037,8 +2151,14 @@ def live_trading_iteration():
         exit_reason = None
         exit_price = current_price
         
+        # Check if outside trade window - force exit
+        if not is_within_trade_window(current_data['Datetime'], config):
+            exit_reason = 'Trade Window Closed'
+            exit_price = current_price
+            add_log(f"⏰ TRADE WINDOW CLOSED - Force exiting position")
+        
         # Check SL hit
-        if position['sl_price'] is not None:
+        if exit_reason is None and position['sl_price'] is not None:
             if position['type'] == 'LONG':
                 if current_price <= position['sl_price']:
                     exit_reason = 'SL Hit'
@@ -2081,8 +2201,15 @@ def live_trading_iteration():
             else:  # SHORT
                 pnl = (position['entry_price'] - exit_price) * position['quantity']
             
+            # Calculate brokerage and net P&L
+            brokerage = calculate_brokerage(position['entry_price'], exit_price, position['quantity'], config)
+            net_pnl = pnl - brokerage
+            
             add_log(f"🚪 EXITING POSITION: {exit_reason} @ {exit_price:.2f}")
-            add_log(f"💰 Final P&L: ₹{pnl:.2f}")
+            add_log(f"💰 P&L: ₹{pnl:.2f}")
+            if config.get('include_brokerage', False):
+                add_log(f"💸 Brokerage: ₹{brokerage:.2f}")
+                add_log(f"💵 Net P&L: ₹{net_pnl:.2f}")
             
             # Save to trade history
             trade_record = {
@@ -2097,6 +2224,8 @@ def live_trading_iteration():
                 'lowest_price': position.get('lowest_price', exit_price),
                 'quantity': position['quantity'],
                 'pnl': pnl,
+                'brokerage': brokerage,
+                'net_pnl': net_pnl,
                 'exit_reason': exit_reason,
                 'price_range': position.get('highest_price', exit_price) - position.get('lowest_price', exit_price)
             }
@@ -2151,6 +2280,37 @@ def render_config_ui():
     
     # Quantity
     config['quantity'] = st.sidebar.number_input("Quantity", min_value=1, value=1)
+    
+    # ── Trade Window Settings ────────────────────────────────────────────────
+    st.sidebar.subheader("⏰ Trade Window")
+    config['use_trade_window'] = st.sidebar.checkbox(
+        "Enable Trade Window",
+        value=False,
+        help="Restricts trading to specific hours. Exits positions and blocks new entries outside this window."
+    )
+    if config['use_trade_window']:
+        col_tw1, col_tw2 = st.sidebar.columns(2)
+        with col_tw1:
+            config['trade_window_start'] = st.sidebar.time_input(
+                "Start Time (IST)",
+                value=datetime.strptime("09:30", "%H:%M").time(),
+                help="Trading starts at this time"
+            )
+        with col_tw2:
+            config['trade_window_end'] = st.sidebar.time_input(
+                "End Time (IST)",
+                value=datetime.strptime("15:00", "%H:%M").time(),
+                help="Trading ends at this time. Positions auto-exit after this."
+            )
+        st.sidebar.info(f"🕐 Active: {config['trade_window_start'].strftime('%H:%M')} - {config['trade_window_end'].strftime('%H:%M')} IST")
+    
+    # ── Trade Direction Filter ───────────────────────────────────────────────
+    config['trade_direction'] = st.sidebar.selectbox(
+        "Trade Direction Filter",
+        ["Both (LONG + SHORT)", "LONG Only", "SHORT Only"],
+        index=0,
+        help="Filters which trade directions the algo will take"
+    )
     
     # Strategy Selection
     st.sidebar.subheader("📊 Strategy")
@@ -2473,7 +2633,7 @@ def render_config_ui():
     
     if config['dhan_enabled']:
         config['dhan_client_id'] = st.sidebar.text_input("Client ID", value="1104779876")
-        config['dhan_access_token'] = st.sidebar.text_input("Access Token", type="password", value="eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzUxMiJ9.eyJpc3MiOiJkaGFuIiwicGFydG5lcklkIjoiIiwiZXhwIjoxNzcxNjQ1NTI3LCJpYXQiOjE3NzE1NTkxMjcsInRva2VuQ29uc3VtZXJUeXBlIjoiU0VMRiIsIndlYmhvb2tVcmwiOiIiLCJkaGFuQ2xpZW50SWQiOiIxMTA0Nzc5ODc2In0.9TKVXk-LfPxyZzAn3pUj2aFV87SgPM7um2DO3nmDF1mlCB_7f6BHtIzrl7JDxcLqxJGDfmkCfVMjgZEQz_KXWg")
+        config['dhan_access_token'] = st.sidebar.text_input("Access Token", type="password", value="eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzUxMiJ9.eyJpc3MiOiJkaGFuIiwicGFydG5lcklkIjoiIiwiZXhwIjoxNzcxMTQzMjM5LCJpYXQiOjE3NzEwNTY4MzksInRva2VuQ29uc3VtZXJUeXBlIjoiU0VMRiIsIndlYmhvb2tVcmwiOiIiLCJkaGFuQ2xpZW50SWQiOiIxMTA0Nzc5ODc2In0.qP8kVXDQt-sFa6LWJqd1MRTPESHCCPCqHzEnjsFI2WVbNdywKHXgAKHxVpuH6tP_AJTdqowv9nbqf-2NcGibbQ")
         
         config['dhan_is_options'] = st.sidebar.checkbox("Is Options", value=True)
         
@@ -2502,6 +2662,47 @@ def render_config_ui():
 
         # ── Broker SL / Target (Bracket Order) — available for ALL order types ──
         st.sidebar.markdown("---")
+        
+        # Order Type Selection
+        config['dhan_order_type'] = st.sidebar.selectbox(
+            "Order Type",
+            ["Market Order", "Limit Order"],
+            index=0,
+            help="Market: Executes immediately at best price | Limit: Executes at specified price or better"
+        )
+        
+        # Brokerage Configuration
+        config['include_brokerage'] = st.sidebar.checkbox(
+            "💰 Include Brokerage & Charges",
+            value=False,
+            help="Deducts brokerage from P&L to show Net P&L"
+        )
+        if config['include_brokerage']:
+            col_b1, col_b2 = st.sidebar.columns(2)
+            with col_b1:
+                config['brokerage_per_trade'] = st.sidebar.number_input(
+                    "Brokerage per Trade (₹)",
+                    min_value=0.0,
+                    value=20.0,
+                    step=1.0,
+                    help="Total brokerage + charges per trade (entry + exit)"
+                )
+            with col_b2:
+                config['brokerage_percentage'] = st.sidebar.number_input(
+                    "Or % of Turnover",
+                    min_value=0.0,
+                    value=0.03,
+                    step=0.01,
+                    format="%.3f",
+                    help="Alternative: % of trade value (0.03% typical for intraday)"
+                )
+            config['brokerage_type'] = st.sidebar.radio(
+                "Brokerage Calculation",
+                ["Fixed per Trade", "Percentage of Turnover"],
+                index=0,
+                horizontal=True
+            )
+        
         config['broker_use_own_sl'] = st.sidebar.checkbox(
             "🎯 Use Broker SL/Target (Bracket Order)",
             value=False,
@@ -2654,6 +2855,15 @@ def render_backtest_ui(config):
         with col2: st.metric("Win Rate",        f"{metrics['win_rate']:.2f}%")
         with col3: st.metric("Total P&L",       f"₹{metrics['total_pnl']:.2f}")
         with col4: st.metric("Avg Trade",       f"₹{metrics['avg_pnl']:.2f}")
+        
+        # Display brokerage and net P&L if brokerage is enabled
+        if config.get('include_brokerage', False) and 'total_brokerage' in metrics:
+            col_b1, col_b2, col_b3, col_b4 = st.columns(4)
+            with col_b1: st.metric("Total Brokerage", f"₹{metrics['total_brokerage']:.2f}")
+            with col_b2: st.metric("**Net P&L**",      f"**₹{metrics['total_net_pnl']:.2f}**")
+            with col_b3: st.metric("Avg Net P&L",      f"₹{metrics['avg_net_pnl']:.2f}")
+            with col_b4: pass
+        
         col5, col6, col7 = st.columns(3)
         with col5: st.metric("Winning Trades",  metrics['winning_trades'])
         with col6: st.metric("Losing Trades",   metrics['losing_trades'])
