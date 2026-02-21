@@ -1782,12 +1782,14 @@ def run_backtest(df, config):
         config: Configuration dict
         
     Returns:
-        tuple: (trades_list, metrics_dict, debug_info)
+        tuple: (trades_list, metrics_dict, debug_info, skipped_trades_list)
     """
     trades = []
+    skipped_trades = []  # Track overlapping/skipped signals
     position = None
     strategy_name = config.get('strategy', 'EMA Crossover')
     strategy_func = STRATEGY_FUNCTIONS.get(strategy_name, check_ema_crossover_strategy)
+    prevent_overlapping = config.get('prevent_overlapping_trades', True)
     
     # Debug tracking
     total_candles = len(df)
@@ -1795,6 +1797,7 @@ def run_backtest(df, config):
     signals_generated = 0
     trades_entered = 0
     trades_exited = 0
+    signals_skipped = 0
     
     # Start from a reasonable index to ensure indicators are calculated
     start_idx = max(50, config.get('ema_slow', 21) + 10)
@@ -1826,6 +1829,32 @@ def run_backtest(df, config):
                 sl_price = calculate_initial_sl(position_type, entry_price, df, idx, config)
                 target_price = calculate_initial_target(position_type, entry_price, df, idx, config)
                 
+                # Collect detailed entry metrics
+                entry_metrics = {
+                    'strategy': strategy_name,
+                    'entry_idx': idx,
+                }
+                
+                # EMA-specific metrics (if applicable)
+                if strategy_name == 'EMA Crossover' or 'EMA_Fast' in df.columns:
+                    ema_fast_period = config.get('ema_fast', 9)
+                    ema_slow_period = config.get('ema_slow', 21)
+                    
+                    ema_fast_val = current_data.get('EMA_Fast', np.nan)
+                    ema_slow_val = current_data.get('EMA_Slow', np.nan)
+                    ema_angle = current_data.get('EMA_Fast_Angle', np.nan)
+                    
+                    entry_metrics.update({
+                        'ema_fast_period': ema_fast_period,
+                        'ema_slow_period': ema_slow_period,
+                        'ema_fast_entry': ema_fast_val,
+                        'ema_slow_entry': ema_slow_val,
+                        'ema_angle_entry': ema_angle,
+                        'price_fast_ema_diff_entry': entry_price - ema_fast_val if not pd.isna(ema_fast_val) else np.nan,
+                        'price_slow_ema_diff_entry': entry_price - ema_slow_val if not pd.isna(ema_slow_val) else np.nan,
+                        'fast_slow_ema_diff_entry': ema_fast_val - ema_slow_val if not pd.isna(ema_fast_val) and not pd.isna(ema_slow_val) else np.nan,
+                    })
+                
                 # Create position
                 position = {
                     'type': position_type,
@@ -1836,11 +1865,90 @@ def run_backtest(df, config):
                     'quantity': config.get('quantity', 1),
                     'highest_price': entry_price,
                     'lowest_price': entry_price,
+                    'entry_metrics': entry_metrics,
                 }
                 
                 trades_entered += 1
         
         else:
+            # Position exists - check if new signal came (overlapping scenario)
+            if prevent_overlapping:
+                signal, signal_price = strategy_func(df, idx, config, None)
+                if signal and should_allow_trade_direction(signal, config):
+                    # New signal while position active - track as skipped
+                    signals_skipped += 1
+                    
+                    # Calculate what P&L would have been for this skipped trade
+                    # (simulate exit at some future point for analysis)
+                    skipped_position_type = 'LONG' if signal in ('BUY', 'LONG') else 'SHORT'
+                    skipped_sl = calculate_initial_sl(skipped_position_type, signal_price, df, idx, config)
+                    skipped_target = calculate_initial_target(skipped_position_type, signal_price, df, idx, config)
+                    
+                    # Find when this trade would have exited (next 50 candles or actual signal resolution)
+                    skipped_exit_price = None
+                    skipped_exit_reason = None
+                    skipped_exit_time = None
+                    
+                    for future_idx in range(idx + 1, min(idx + 100, len(df))):
+                        future_price = df.iloc[future_idx]['Close']
+                        future_time = df.iloc[future_idx]['Datetime']
+                        
+                        # Check SL hit
+                        if skipped_sl is not None:
+                            if skipped_position_type == 'LONG' and future_price <= skipped_sl:
+                                skipped_exit_price = skipped_sl
+                                skipped_exit_reason = 'SL Hit (Skipped)'
+                                skipped_exit_time = future_time
+                                break
+                            elif skipped_position_type == 'SHORT' and future_price >= skipped_sl:
+                                skipped_exit_price = skipped_sl
+                                skipped_exit_reason = 'SL Hit (Skipped)'
+                                skipped_exit_time = future_time
+                                break
+                        
+                        # Check Target hit
+                        if skipped_target is not None:
+                            if skipped_position_type == 'LONG' and future_price >= skipped_target:
+                                skipped_exit_price = skipped_target
+                                skipped_exit_reason = 'Target Hit (Skipped)'
+                                skipped_exit_time = future_time
+                                break
+                            elif skipped_position_type == 'SHORT' and future_price <= skipped_target:
+                                skipped_exit_price = skipped_target
+                                skipped_exit_reason = 'Target Hit (Skipped)'
+                                skipped_exit_time = future_time
+                                break
+                    
+                    # If no exit found, use current+20 candles as exit
+                    if skipped_exit_price is None and idx + 20 < len(df):
+                        skipped_exit_price = df.iloc[idx + 20]['Close']
+                        skipped_exit_reason = 'Simulated Exit (Skipped)'
+                        skipped_exit_time = df.iloc[idx + 20]['Datetime']
+                    
+                    if skipped_exit_price:
+                        if skipped_position_type == 'LONG':
+                            skipped_pnl = (skipped_exit_price - signal_price) * config.get('quantity', 1)
+                        else:
+                            skipped_pnl = (signal_price - skipped_exit_price) * config.get('quantity', 1)
+                        
+                        brokerage = calculate_brokerage(signal_price, skipped_exit_price, config.get('quantity', 1), config)
+                        
+                        skipped_trades.append({
+                            'entry_time': current_data['Datetime'],
+                            'exit_time': skipped_exit_time,
+                            'type': skipped_position_type,
+                            'entry_price': signal_price,
+                            'exit_price': skipped_exit_price,
+                            'sl_price': skipped_sl,
+                            'target_price': skipped_target,
+                            'quantity': config.get('quantity', 1),
+                            'pnl': skipped_pnl,
+                            'brokerage': brokerage,
+                            'net_pnl': skipped_pnl - brokerage,
+                            'exit_reason': skipped_exit_reason,
+                            'note': 'Overlapped with active trade'
+                        })
+            
             # Update tracking
             position['highest_price'] = max(position['highest_price'], current_price)
             position['lowest_price'] = min(position['lowest_price'], current_price)
@@ -1905,13 +2013,36 @@ def run_backtest(df, config):
                 brokerage = calculate_brokerage(position['entry_price'], exit_price, position['quantity'], config)
                 net_pnl = pnl - brokerage
                 
-                # Record trade
+                # Calculate trade duration
+                duration_seconds = (current_data['Datetime'] - position['entry_time']).total_seconds()
+                duration_minutes = duration_seconds / 60
+                
+                # Collect exit metrics
+                exit_metrics = {}
+                if strategy_name == 'EMA Crossover' or 'EMA_Fast' in df.columns:
+                    ema_fast_val_exit = current_data.get('EMA_Fast', np.nan)
+                    ema_slow_val_exit = current_data.get('EMA_Slow', np.nan)
+                    
+                    exit_metrics.update({
+                        'ema_fast_exit': ema_fast_val_exit,
+                        'ema_slow_exit': ema_slow_val_exit,
+                        'price_fast_ema_diff_exit': exit_price - ema_fast_val_exit if not pd.isna(ema_fast_val_exit) else np.nan,
+                        'price_slow_ema_diff_exit': exit_price - ema_slow_val_exit if not pd.isna(ema_slow_val_exit) else np.nan,
+                        'fast_slow_ema_diff_exit': ema_fast_val_exit - ema_slow_val_exit if not pd.isna(ema_fast_val_exit) and not pd.isna(ema_slow_val_exit) else np.nan,
+                    })
+                
+                # Merge entry and exit metrics
+                entry_metrics = position.get('entry_metrics', {})
+                
+                # Record trade with detailed metrics
                 trade = {
                     'entry_time': position['entry_time'],
                     'exit_time': current_data['Datetime'],
                     'type': position['type'],
                     'entry_price': position['entry_price'],
                     'exit_price': exit_price,
+                    'highest_price': position['highest_price'],
+                    'lowest_price': position['lowest_price'],
                     'sl_price': position['sl_price'],
                     'target_price': position['target_price'],
                     'quantity': position['quantity'],
@@ -1919,6 +2050,21 @@ def run_backtest(df, config):
                     'brokerage': brokerage,
                     'net_pnl': net_pnl,
                     'exit_reason': exit_reason,
+                    'duration_minutes': duration_minutes,
+                    'strategy': entry_metrics.get('strategy', strategy_name),
+                    'ema_fast_period': entry_metrics.get('ema_fast_period', np.nan),
+                    'ema_slow_period': entry_metrics.get('ema_slow_period', np.nan),
+                    'ema_angle_entry': entry_metrics.get('ema_angle_entry', np.nan),
+                    'ema_fast_entry': entry_metrics.get('ema_fast_entry', np.nan),
+                    'ema_slow_entry': entry_metrics.get('ema_slow_entry', np.nan),
+                    'price_fast_ema_diff_entry': entry_metrics.get('price_fast_ema_diff_entry', np.nan),
+                    'price_slow_ema_diff_entry': entry_metrics.get('price_slow_ema_diff_entry', np.nan),
+                    'fast_slow_ema_diff_entry': entry_metrics.get('fast_slow_ema_diff_entry', np.nan),
+                    'ema_fast_exit': exit_metrics.get('ema_fast_exit', np.nan),
+                    'ema_slow_exit': exit_metrics.get('ema_slow_exit', np.nan),
+                    'price_fast_ema_diff_exit': exit_metrics.get('price_fast_ema_diff_exit', np.nan),
+                    'price_slow_ema_diff_exit': exit_metrics.get('price_slow_ema_diff_exit', np.nan),
+                    'fast_slow_ema_diff_exit': exit_metrics.get('fast_slow_ema_diff_exit', np.nan),
                 }
                 
                 trades.append(trade)
@@ -1981,9 +2127,11 @@ def run_backtest(df, config):
         'signals_generated': signals_generated,
         'trades_entered': trades_entered,
         'trades_completed': trades_exited,
+        'signals_skipped': signals_skipped,
+        'overlapping_trades': len(skipped_trades),
     }
     
-    return trades, metrics, debug_info
+    return trades, metrics, debug_info, skipped_trades
 
 # ================================
 # LIVE TRADING
@@ -2310,6 +2458,46 @@ def render_config_ui():
         ["Both (LONG + SHORT)", "LONG Only", "SHORT Only"],
         index=0,
         help="Filters which trade directions the algo will take"
+    )
+    
+    # ── Brokerage Configuration (Available Always) ───────────────────────────
+    st.sidebar.subheader("💰 Brokerage & Charges")
+    config['include_brokerage'] = st.sidebar.checkbox(
+        "Include Brokerage & Charges",
+        value=False,
+        help="Deducts brokerage from P&L to show Net P&L (works in backtesting and live trading)"
+    )
+    if config['include_brokerage']:
+        col_b1, col_b2 = st.sidebar.columns(2)
+        with col_b1:
+            config['brokerage_per_trade'] = st.sidebar.number_input(
+                "Brokerage per Trade (₹)",
+                min_value=0.0,
+                value=20.0,
+                step=1.0,
+                help="Total brokerage + charges per trade (entry + exit)"
+            )
+        with col_b2:
+            config['brokerage_percentage'] = st.sidebar.number_input(
+                "Or % of Turnover",
+                min_value=0.0,
+                value=0.03,
+                step=0.01,
+                format="%.3f",
+                help="Alternative: % of trade value (0.03% typical for intraday)"
+            )
+        config['brokerage_type'] = st.sidebar.radio(
+            "Brokerage Calculation",
+            ["Fixed per Trade", "Percentage of Turnover"],
+            index=0,
+            horizontal=True
+        )
+    
+    # ── Overlapping Trades Prevention ────────────────────────────────────────
+    config['prevent_overlapping_trades'] = st.sidebar.checkbox(
+        "🚫 Prevent Overlapping Trades",
+        value=True,
+        help="When enabled, blocks new signals while a position is active. Skipped signals are tracked separately for analysis."
     )
     
     # Strategy Selection
@@ -2671,38 +2859,6 @@ def render_config_ui():
             help="Market: Executes immediately at best price | Limit: Executes at specified price or better"
         )
         
-        # Brokerage Configuration
-        config['include_brokerage'] = st.sidebar.checkbox(
-            "💰 Include Brokerage & Charges",
-            value=False,
-            help="Deducts brokerage from P&L to show Net P&L"
-        )
-        if config['include_brokerage']:
-            col_b1, col_b2 = st.sidebar.columns(2)
-            with col_b1:
-                config['brokerage_per_trade'] = st.sidebar.number_input(
-                    "Brokerage per Trade (₹)",
-                    min_value=0.0,
-                    value=20.0,
-                    step=1.0,
-                    help="Total brokerage + charges per trade (entry + exit)"
-                )
-            with col_b2:
-                config['brokerage_percentage'] = st.sidebar.number_input(
-                    "Or % of Turnover",
-                    min_value=0.0,
-                    value=0.03,
-                    step=0.01,
-                    format="%.3f",
-                    help="Alternative: % of trade value (0.03% typical for intraday)"
-                )
-            config['brokerage_type'] = st.sidebar.radio(
-                "Brokerage Calculation",
-                ["Fixed per Trade", "Percentage of Turnover"],
-                index=0,
-                horizontal=True
-            )
-        
         config['broker_use_own_sl'] = st.sidebar.checkbox(
             "🎯 Use Broker SL/Target (Bracket Order)",
             value=False,
@@ -2732,6 +2888,112 @@ def render_config_ui():
                 f"+{config['broker_target_points']}pts Target"
                 + (f" | Trail: {config['broker_trailing_jump']}pts" if config['broker_trailing_jump'] > 0 else "")
             )
+        
+        # ── Multi-Account Trading ────────────────────────────────────────────
+        st.sidebar.markdown("---")
+        st.sidebar.markdown("**🔀 Multi-Account Trading**")
+        
+        # Initialize multi_accounts in session state if not exists
+        if 'multi_accounts' not in st.session_state:
+            st.session_state['multi_accounts'] = []
+        
+        # Display existing accounts
+        if st.session_state['multi_accounts']:
+            st.sidebar.write(f"**Configured Accounts:** {len(st.session_state['multi_accounts'])}")
+            for i, acc in enumerate(st.session_state['multi_accounts']):
+                col_acc1, col_acc2 = st.sidebar.columns([3, 1])
+                with col_acc1:
+                    st.sidebar.caption(f"{i+1}. Client: {acc['client_id'][:8]}...")
+                with col_acc2:
+                    if st.sidebar.button("❌", key=f"del_acc_{i}"):
+                        st.session_state['multi_accounts'].pop(i)
+                        st.rerun()
+        
+        # Add new account form
+        with st.sidebar.expander("➕ Add Account"):
+            new_client_id = st.text_input("Client ID", key="new_client_id")
+            new_token = st.text_input("Access Token", type="password", key="new_token")
+            if st.button("Add Account", key="add_account_btn"):
+                if new_client_id and new_token:
+                    st.session_state['multi_accounts'].append({
+                        'client_id': new_client_id,
+                        'access_token': new_token
+                    })
+                    st.success(f"Account added! Total: {len(st.session_state['multi_accounts'])}")
+                    st.rerun()
+                else:
+                    st.error("Please provide both Client ID and Token")
+        
+        config['multi_accounts'] = st.session_state['multi_accounts']
+        
+        # ── Multi-Strike Options ─────────────────────────────────────────────
+        if config['dhan_is_options']:
+            st.sidebar.markdown("**📊 Multi-Strike Options**")
+            config['multi_strike_enabled'] = st.sidebar.checkbox(
+                "Enable Multi-Strike Orders",
+                value=False,
+                help="Place orders on multiple strike prices simultaneously"
+            )
+            
+            if config['multi_strike_enabled']:
+                # Initialize multi_strikes in session state
+                if 'multi_strikes_ce' not in st.session_state:
+                    st.session_state['multi_strikes_ce'] = []
+                if 'multi_strikes_pe' not in st.session_state:
+                    st.session_state['multi_strikes_pe'] = []
+                
+                strike_type = st.sidebar.radio(
+                    "Strike Type",
+                    ["CE (Call)", "PE (Put)"],
+                    horizontal=True
+                )
+                
+                if strike_type == "CE (Call)":
+                    # Display existing CE strikes
+                    if st.session_state['multi_strikes_ce']:
+                        st.sidebar.write(f"**CE Strikes:** {len(st.session_state['multi_strikes_ce'])}")
+                        for i, sec_id in enumerate(st.session_state['multi_strikes_ce']):
+                            col_s1, col_s2 = st.sidebar.columns([3, 1])
+                            with col_s1:
+                                st.sidebar.caption(f"{i+1}. {sec_id}")
+                            with col_s2:
+                                if st.sidebar.button("❌", key=f"del_ce_{i}"):
+                                    st.session_state['multi_strikes_ce'].pop(i)
+                                    st.rerun()
+                    
+                    # Add CE strike
+                    with st.sidebar.expander("➕ Add CE Strike"):
+                        new_ce_id = st.text_input("CE Security ID", key="new_ce_id")
+                        if st.button("Add CE", key="add_ce_btn"):
+                            if new_ce_id:
+                                st.session_state['multi_strikes_ce'].append(new_ce_id)
+                                st.success(f"CE Strike added! Total: {len(st.session_state['multi_strikes_ce'])}")
+                                st.rerun()
+                
+                else:  # PE
+                    # Display existing PE strikes
+                    if st.session_state['multi_strikes_pe']:
+                        st.sidebar.write(f"**PE Strikes:** {len(st.session_state['multi_strikes_pe'])}")
+                        for i, sec_id in enumerate(st.session_state['multi_strikes_pe']):
+                            col_s1, col_s2 = st.sidebar.columns([3, 1])
+                            with col_s1:
+                                st.sidebar.caption(f"{i+1}. {sec_id}")
+                            with col_s2:
+                                if st.sidebar.button("❌", key=f"del_pe_{i}"):
+                                    st.session_state['multi_strikes_pe'].pop(i)
+                                    st.rerun()
+                    
+                    # Add PE strike
+                    with st.sidebar.expander("➕ Add PE Strike"):
+                        new_pe_id = st.text_input("PE Security ID", key="new_pe_id")
+                        if st.button("Add PE", key="add_pe_btn"):
+                            if new_pe_id:
+                                st.session_state['multi_strikes_pe'].append(new_pe_id)
+                                st.success(f"PE Strike added! Total: {len(st.session_state['multi_strikes_pe'])}")
+                                st.rerun()
+                
+                config['multi_strikes_ce'] = st.session_state.get('multi_strikes_ce', [])
+                config['multi_strikes_pe'] = st.session_state.get('multi_strikes_pe', [])
     
     return config
 
@@ -2757,13 +3019,14 @@ def render_backtest_ui(config):
 
             if df is not None:
                 df = calculate_all_indicators(df, config)
-                trades, metrics, debug_info = run_backtest(df, config)
+                trades, metrics, debug_info, skipped_trades = run_backtest(df, config)
 
                 st.session_state['backtest_results'] = {
-                    'trades':     trades,
-                    'metrics':    metrics,
-                    'debug_info': debug_info,
-                    'df':         df          # store for chart
+                    'trades':         trades,
+                    'metrics':        metrics,
+                    'debug_info':     debug_info,
+                    'skipped_trades': skipped_trades,
+                    'df':             df          # store for chart
                 }
 
     # ── Display results ───────────────────────────────────────────────────────
@@ -2977,14 +3240,80 @@ def render_backtest_ui(config):
 
         # ── Trade table ───────────────────────────────────────────────────────
         if trades:
-            st.subheader("Trade History")
+            st.subheader("✅ Executed Trade History")
             df_trades = pd.DataFrame(trades)
             # Friendly column formatting
-            for col in ['entry_price','exit_price','sl_price','target_price','pnl']:
+            for col in ['entry_price','exit_price','highest_price','lowest_price','sl_price','target_price','pnl','net_pnl','brokerage']:
                 if col in df_trades.columns:
                     df_trades[col] = df_trades[col].apply(
+                        lambda x: f"₹{x:.2f}" if pd.notna(x) and x == x else "—")  # x == x checks for NaN
+            
+            # Format duration
+            if 'duration_minutes' in df_trades.columns:
+                df_trades['duration'] = df_trades['duration_minutes'].apply(
+                    lambda x: f"{int(x)} min" if pd.notna(x) else "—")
+            
+            # Format angle
+            if 'ema_angle_entry' in df_trades.columns:
+                df_trades['angle'] = df_trades['ema_angle_entry'].apply(
+                    lambda x: f"{x:.2f}°" if pd.notna(x) else "—")
+            
+            # Select columns to display
+            display_cols = ['entry_time', 'exit_time', 'type', 'entry_price', 'exit_price', 
+                           'highest_price', 'lowest_price', 'pnl', 'net_pnl', 'exit_reason']
+            if 'duration' in df_trades.columns:
+                display_cols.insert(3, 'duration')
+            
+            # Show subset for display
+            df_display = df_trades[[c for c in display_cols if c in df_trades.columns]]
+            st.dataframe(df_display, use_container_width=True)
+            
+            # Detailed metrics expander
+            with st.expander("📊 Detailed Trade Metrics (EMA, Angles, Differences)"):
+                detailed_cols = [
+                    'entry_time', 'exit_time', 'type', 'strategy', 
+                    'ema_fast_period', 'ema_slow_period', 'angle',
+                    'ema_fast_entry', 'ema_slow_entry', 
+                    'price_fast_ema_diff_entry', 'price_slow_ema_diff_entry', 'fast_slow_ema_diff_entry',
+                    'ema_fast_exit', 'ema_slow_exit',
+                    'price_fast_ema_diff_exit', 'price_slow_ema_diff_exit', 'fast_slow_ema_diff_exit'
+                ]
+                df_detailed = df_trades[[c for c in detailed_cols if c in df_trades.columns]]
+                st.dataframe(df_detailed, use_container_width=True)
+        
+        # ── Skipped/Overlapping Trades Table ─────────────────────────────────
+        skipped_trades = results.get('skipped_trades', [])
+        if skipped_trades and config.get('prevent_overlapping_trades', True):
+            st.subheader("⚠️ Skipped/Overlapping Trades (Not Included in P&L)")
+            st.info(
+                f"**{len(skipped_trades)} signals were skipped** because they occurred while a position was active. "
+                "These trades show what *would have happened* if overlapping trades were allowed. "
+                "Their P&L is NOT included in total metrics above."
+            )
+            
+            df_skipped = pd.DataFrame(skipped_trades)
+            # Format columns
+            for col in ['entry_price', 'exit_price', 'sl_price', 'target_price', 'pnl', 'net_pnl', 'brokerage']:
+                if col in df_skipped.columns:
+                    df_skipped[col] = df_skipped[col].apply(
                         lambda x: f"₹{x:.2f}" if pd.notna(x) else "—")
-            st.dataframe(df_trades, use_container_width=True)
+            
+            st.dataframe(df_skipped, use_container_width=True)
+            
+            # Skipped trades summary
+            if len(skipped_trades) > 0:
+                df_skip_raw = pd.DataFrame(skipped_trades)
+                skip_win = len(df_skip_raw[df_skip_raw['pnl'] > 0])
+                skip_loss = len(df_skip_raw[df_skip_raw['pnl'] <= 0])
+                skip_total_pnl = df_skip_raw['pnl'].sum()
+                
+                col_sk1, col_sk2, col_sk3 = st.columns(3)
+                with col_sk1:
+                    st.metric("Skipped Winning", skip_win)
+                with col_sk2:
+                    st.metric("Skipped Losing", skip_loss)
+                with col_sk3:
+                    st.metric("Skipped Total P&L", f"₹{skip_total_pnl:.2f}")
 
         # ── Debug expander ────────────────────────────────────────────────────
         if metrics['total_trades'] == 0:
@@ -2996,6 +3325,10 @@ def render_backtest_ui(config):
             st.write(f"- Signals Generated: {debug_info['signals_generated']}")
             st.write(f"- Trades Entered: {debug_info['trades_entered']}")
             st.write(f"- Trades Completed: {debug_info['trades_completed']}")
+            if 'signals_skipped' in debug_info:
+                st.write(f"- Signals Skipped (Overlapping): {debug_info['signals_skipped']}")
+            if 'overlapping_trades' in debug_info:
+                st.write(f"- Overlapping Trades Tracked: {debug_info['overlapping_trades']}")
             if filter_market_hours:
                 st.write(f"- Trades after same-day filter (9:15 AM–3:00 PM IST): {len(trades)}")
 
