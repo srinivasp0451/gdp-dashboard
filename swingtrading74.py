@@ -77,7 +77,7 @@ STRATEGY_LIST = [
     "SuperTrend AI",
     "VWAP + Volume Spike",
     "Bollinger Squeeze Breakout",
-    "Elliott Waves + Ratio Charts"
+    #"Elliott Waves + Ratio Charts"
 ]
 
 SL_TYPES = [
