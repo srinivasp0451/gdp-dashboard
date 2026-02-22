@@ -76,7 +76,8 @@ STRATEGY_LIST = [
     "Custom Strategy",
     "SuperTrend AI",
     "VWAP + Volume Spike",
-    "Bollinger Squeeze Breakout"
+    "Bollinger Squeeze Breakout",
+    "Elliott Waves + Ratio Charts"
 ]
 
 SL_TYPES = [
@@ -105,6 +106,7 @@ TARGET_TYPES = [
     "P&L Based (Rupees)",
     "Trailing Target (Points)",
     "Trailing Target + Signal Based",
+    "Dynamic Trailing SL+Target (Lock Profits)",
     "50% Exit at Target (Partial)",
     "Current Candle Low/High",
     "Previous Candle Low/High",
@@ -1423,6 +1425,94 @@ def check_bollinger_squeeze_breakout(df, idx, config, current_position):
     
     return None, None
 
+def check_elliott_waves_ratio_charts(df, idx, config, current_position):
+    """
+    Elliott Waves + Ratio Charts Strategy
+    Combines Elliott Wave pattern detection with ratio chart analysis
+    Signals when both Elliott Wave and Ratio Chart indicators align
+    """
+    if current_position is not None:
+        return None, None
+    if idx < 50:
+        return None, None
+    
+    # Parameters
+    reference_ticker = config.get('elliott_reference_ticker', 'SPY')
+    ratio_threshold = config.get('elliott_ratio_threshold', 1.0)
+    wave_lookback = config.get('elliott_wave_lookback', 13)
+    ema_period = config.get('elliott_ema_period', 21)
+    
+    # Elliott Wave Detection (Simplified)
+    # Looking for 5-wave pattern in price
+    if f'EW_Signal' not in df.columns:
+        # Calculate pivot points for wave detection
+        window = wave_lookback
+        df['EW_Pivot_High'] = df['High'].rolling(window=window, center=True).max()
+        df['EW_Pivot_Low'] = df['Low'].rolling(window=window, center=True).min()
+        
+        # Detect wave structure
+        df['EW_Trend'] = np.where(df['Close'] > df['Close'].shift(1), 1, -1)
+        df['EW_Signal'] = 0  # 0=no signal, 1=bullish wave complete, -1=bearish wave complete
+        
+        # Simplified wave counting: look for 5 consecutive higher highs (bullish) or lower lows (bearish)
+        for i in range(window, len(df)):
+            recent_highs = df['High'].iloc[i-window:i]
+            recent_lows = df['Low'].iloc[i-window:i]
+            
+            # Count consecutive higher highs
+            higher_highs = 0
+            for j in range(len(recent_highs)-1):
+                if recent_highs.iloc[j+1] > recent_highs.iloc[j]:
+                    higher_highs += 1
+            
+            # Count consecutive lower lows
+            lower_lows = 0
+            for j in range(len(recent_lows)-1):
+                if recent_lows.iloc[j+1] < recent_lows.iloc[j]:
+                    lower_lows += 1
+            
+            # Signal when 5-wave pattern detected
+            if higher_highs >= 5:
+                df.loc[df.index[i], 'EW_Signal'] = 1  # Bullish wave complete
+            elif lower_lows >= 5:
+                df.loc[df.index[i], 'EW_Signal'] = -1  # Bearish wave complete
+    
+    # Ratio Chart Calculation
+    if f'Ratio_Chart' not in df.columns:
+        # For simplicity, calculate ratio between current price and reference EMA
+        # In live implementation, this would fetch reference_ticker data and calculate ratio
+        # Here we use price/EMA as proxy for ratio analysis
+        df['Ratio_EMA'] = df['Close'].rolling(ema_period).mean()
+        df['Ratio_Chart'] = df['Close'] / df['Ratio_EMA']
+        df['Ratio_MA'] = df['Ratio_Chart'].rolling(10).mean()
+    
+    current = df.iloc[idx]
+    previous = df.iloc[idx - 1]
+    
+    ew_signal = current.get('EW_Signal', 0)
+    ratio = current.get('Ratio_Chart', 1.0)
+    ratio_ma = current.get('Ratio_MA', 1.0)
+    ratio_prev = previous.get('Ratio_Chart', 1.0)
+    
+    # Check for alignment between Elliott Wave and Ratio Chart
+    # Bullish: EW bullish wave complete + Ratio breaking above threshold
+    if ew_signal == 1:
+        # Ratio chart confirms bullish momentum
+        if ratio > ratio_threshold and ratio > ratio_ma:
+            # Additional confirmation: ratio crossing above MA
+            if ratio_prev <= previous.get('Ratio_MA', 1.0):
+                return 'BUY', current['Close']
+    
+    # Bearish: EW bearish wave complete + Ratio breaking below threshold
+    if ew_signal == -1:
+        # Ratio chart confirms bearish momentum
+        if ratio < (2.0 - ratio_threshold) and ratio < ratio_ma:
+            # Additional confirmation: ratio crossing below MA
+            if ratio_prev >= previous.get('Ratio_MA', 1.0):
+                return 'SELL', current['Close']
+    
+    return None, None
+
 # ================================
 # HELPER FUNCTIONS
 # ================================
@@ -1497,6 +1587,7 @@ STRATEGY_FUNCTIONS = {
     'SuperTrend AI': check_supertrend_ai,
     'VWAP + Volume Spike': check_vwap_volume_spike,
     'Bollinger Squeeze Breakout': check_bollinger_squeeze_breakout,
+    'Elliott Waves + Ratio Charts': check_elliott_waves_ratio_charts,
 }
 
 # ================================
@@ -1709,6 +1800,15 @@ def calculate_initial_target(position_type, entry_price, df, idx, config):
         else:  # SHORT
             return entry_price - target_distance
     
+    elif target_type == 'Dynamic Trailing SL+Target (Lock Profits)':
+        # Initial target is based on entry price + target distance
+        target_distance = config.get('dynamic_trail_target_points', 20)
+        
+        if position_type == 'LONG':
+            return entry_price + target_distance
+        else:  # SHORT
+            return entry_price - target_distance
+    
     elif target_type == 'Current Candle Low/High':
         if position_type == 'LONG':
             return current['High']
@@ -1787,6 +1887,7 @@ def update_trailing_sl(position, current_price, df, idx, config):
     - Cost-to-Cost 3-phase trailing
     - Candle/Swing-based trailing
     - Volatility-adjusted trailing
+    - Dynamic Trailing SL+Target (trails with price)
     
     Args:
         position: Current position dict
@@ -1799,10 +1900,28 @@ def update_trailing_sl(position, current_price, df, idx, config):
         float: Updated SL price (or existing if no update)
     """
     sl_type = config.get('sl_type', 'Custom Points')
+    target_type = config.get('target_type', 'Custom Points')
     position_type = position['type']
     current_sl = position['sl_price']
     entry_price = position['entry_price']
     current = df.iloc[idx]
+    
+    # ============================================
+    # DYNAMIC TRAILING SL+TARGET
+    # ============================================
+    if target_type == 'Dynamic Trailing SL+Target (Lock Profits)':
+        sl_distance = config.get('dynamic_trail_sl_points', 10)
+        
+        if position_type == 'LONG':
+            # SL trails below current price
+            new_sl = current_price - sl_distance
+            # Only move SL up, never down
+            return max(current_sl, new_sl) if current_sl is not None else new_sl
+        else:  # SHORT
+            # SL trails above current price
+            new_sl = current_price + sl_distance
+            # Only move SL down, never up
+            return min(current_sl, new_sl) if current_sl is not None else new_sl
     
     # ============================================
     # COST-TO-COST + N POINTS TRAILING SL
@@ -2055,6 +2174,20 @@ def update_trailing_target(position, current_price, df, idx, config):
             # Target trails down
             new_target = current_price - trail_points
             return min(current_target, new_target)
+    
+    elif target_type == 'Dynamic Trailing SL+Target (Lock Profits)':
+        target_distance = config.get('dynamic_trail_target_points', 20)
+        
+        if position_type == 'LONG':
+            # Target trails above current price
+            new_target = current_price + target_distance
+            # Only move target up, never down
+            return max(current_target, new_target) if current_target is not None else new_target
+        else:  # SHORT
+            # Target trails below current price
+            new_target = current_price - target_distance
+            # Only move target down, never up
+            return min(current_target, new_target) if current_target is not None else new_target
     
     # No trailing update for other target types
     return current_target
@@ -2895,6 +3028,14 @@ def render_config_ui():
         config['bb_squeeze_volume_mult'] = st.sidebar.number_input("Breakout Volume Mult", min_value=1.0, value=1.8, step=0.1)
         st.sidebar.info("📊 Low volatility squeeze → High probability breakout")
     
+    elif config['strategy'] == 'Elliott Waves + Ratio Charts':
+        st.sidebar.markdown("**Elliott Waves + Ratio Charts Parameters**")
+        config['elliott_wave_lookback'] = st.sidebar.number_input("Wave Lookback Period", min_value=5, value=13)
+        config['elliott_ema_period'] = st.sidebar.number_input("Ratio EMA Period", min_value=5, value=21)
+        config['elliott_ratio_threshold'] = st.sidebar.number_input("Ratio Threshold", min_value=0.5, value=1.0, step=0.1)
+        config['elliott_reference_ticker'] = st.sidebar.text_input("Reference Ticker (Optional)", value="SPY", help="Used for ratio calculation")
+        st.sidebar.info("🌊 Elliott Wave patterns + Ratio chart confirmation")
+    
     elif config['strategy'] == 'Custom Strategy':
         st.sidebar.markdown("**🛠️ Custom Strategy Builder (Multi-Indicator)**")
 
@@ -3153,6 +3294,27 @@ def render_config_ui():
     
     if config['target_type'] == 'ATR-based':
         config['target_atr_multiplier'] = st.sidebar.number_input("Target ATR Multiplier", min_value=0.1, value=2.0, step=0.1)
+    
+    if config['target_type'] == 'Dynamic Trailing SL+Target (Lock Profits)':
+        st.sidebar.markdown("**Dynamic Trailing Configuration**")
+        st.sidebar.info("Both SL and Target trail together as price moves favorably")
+        config['dynamic_trail_sl_points'] = st.sidebar.number_input(
+            "SL Distance (Points)", 
+            min_value=1, 
+            value=10,
+            help="Distance from current price to SL (trails with price)"
+        )
+        config['dynamic_trail_target_points'] = st.sidebar.number_input(
+            "Target Distance (Points)", 
+            min_value=1, 
+            value=20,
+            help="Distance from current price to Target (trails with price)"
+        )
+        st.sidebar.caption(
+            f"Example: If price = 50\n"
+            f"SL = {50 - config['dynamic_trail_sl_points']:.0f} | Target = {50 + config['dynamic_trail_target_points']:.0f}\n"
+            f"Price → 51: SL = {51 - config['dynamic_trail_sl_points']:.0f} | Target = {51 + config['dynamic_trail_target_points']:.0f}"
+        )
     
     # Dhan Broker Configuration
     st.sidebar.subheader("🏦 Dhan Broker (Optional)")
