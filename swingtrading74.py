@@ -73,7 +73,10 @@ STRATEGY_LIST = [
     "RSI-ADX-EMA Combined",
     "Percentage Change",
     "AI Price Action",
-    "Custom Strategy"
+    "Custom Strategy",
+    "SuperTrend AI",
+    "VWAP + Volume Spike",
+    "Bollinger Squeeze Breakout"
 ]
 
 SL_TYPES = [
@@ -423,6 +426,86 @@ class DhanBrokerIntegration:
             log_func(f"🏦 ❌ DHAN EXIT ORDER FAILED: {order_response.get('error', 'Unknown error')}")
             
         return exit_info
+    
+    def clear_all_positions(self, log_func):
+        """
+        Clear all positions: cancel pending orders and close open positions
+        Returns dict with cleared orders and positions count
+        """
+        result = {
+            'cancelled_orders': 0,
+            'closed_positions': 0,
+            'errors': []
+        }
+        
+        if not self.initialized or not self.dhan:
+            log_func("🏦 ⚠️ Broker not initialized - skipping position clear")
+            return result
+        
+        try:
+            # Get all orders
+            order_list = self.dhan.get_order_list()
+            
+            if order_list and order_list.get('status') == 'success':
+                orders = order_list.get('data', [])
+                
+                for order in orders:
+                    order_status = order.get('orderStatus', '')
+                    order_id = order.get('orderId', '')
+                    
+                    # Cancel pending orders
+                    if order_status == 'PENDING':
+                        try:
+                            cancel_response = self.dhan.cancel_order(order_id)
+                            if cancel_response and cancel_response.get('status') == 'success':
+                                result['cancelled_orders'] += 1
+                                log_func(f"🏦 ✅ Cancelled pending order: {order_id}")
+                            else:
+                                error_msg = f"Failed to cancel order {order_id}: {cancel_response.get('remarks', 'Unknown')}"
+                                result['errors'].append(error_msg)
+                                log_func(f"🏦 ⚠️ {error_msg}")
+                        except Exception as e:
+                            error_msg = f"Error cancelling order {order_id}: {str(e)}"
+                            result['errors'].append(error_msg)
+                            log_func(f"🏦 ❌ {error_msg}")
+                    
+                    # Close open positions (TRANSIT status)
+                    elif order_status == 'TRANSIT':
+                        try:
+                            # Place opposite order to close
+                            opposite_txn = 'SELL' if order.get('transactionType') == 'BUY' else 'BUY'
+                            
+                            close_response = self.dhan.place_order(
+                                tag=order.get('tag', ''),
+                                transaction_type=opposite_txn,
+                                exchange_segment=order.get('exchangeSegment'),
+                                product_type=order.get('productType'),
+                                order_type=self.dhanhq_module.MARKET,
+                                security_id=str(order.get('securityId', '')),
+                                quantity=int(order.get('quantity', 0)),
+                                price=0
+                            )
+                            
+                            if close_response and close_response.get('status') == 'success':
+                                result['closed_positions'] += 1
+                                log_func(f"🏦 ✅ Closed position: {order_id} with {opposite_txn}")
+                            else:
+                                error_msg = f"Failed to close position {order_id}: {close_response.get('remarks', 'Unknown')}"
+                                result['errors'].append(error_msg)
+                                log_func(f"🏦 ⚠️ {error_msg}")
+                        except Exception as e:
+                            error_msg = f"Error closing position {order_id}: {str(e)}"
+                            result['errors'].append(error_msg)
+                            log_func(f"🏦 ❌ {error_msg}")
+            
+            log_func(f"🏦 🧹 Position Clear Summary: {result['cancelled_orders']} orders cancelled, {result['closed_positions']} positions closed")
+            
+        except Exception as e:
+            error_msg = f"Error in clear_all_positions: {str(e)}"
+            result['errors'].append(error_msg)
+            log_func(f"🏦 ❌ {error_msg}")
+        
+        return result
 
 # ================================
 # DATA FETCHING
@@ -1136,6 +1219,210 @@ def check_custom_strategy(df, idx, config, current_position):
 
     return None, None
 
+def check_supertrend_ai(df, idx, config, current_position):
+    """
+    SuperTrend AI Strategy - Highly profitable trend-following strategy
+    Uses SuperTrend indicator with ADX confirmation and volume filter
+    """
+    if current_position is not None:
+        return None, None
+    if idx < 20:
+        return None, None
+    
+    # Parameters
+    atr_period = config.get('supertrend_atr_period', 10)
+    multiplier = config.get('supertrend_multiplier', 3.0)
+    adx_threshold = config.get('supertrend_adx_threshold', 25)
+    volume_mult = config.get('supertrend_volume_mult', 1.5)
+    
+    # Calculate SuperTrend
+    if 'SuperTrend' not in df.columns or 'SuperTrend_Direction' not in df.columns:
+        # Calculate ATR
+        df['ATR_ST'] = calculate_atr(df, atr_period)
+        
+        # Calculate basic bands
+        hl_avg = (df['High'] + df['Low']) / 2
+        df['ST_Upper'] = hl_avg + (multiplier * df['ATR_ST'])
+        df['ST_Lower'] = hl_avg - (multiplier * df['ATR_ST'])
+        
+        # Calculate final SuperTrend
+        supertrend = []
+        direction = []
+        
+        for i in range(len(df)):
+            if i == 0:
+                supertrend.append(df['ST_Lower'].iloc[i])
+                direction.append(1)
+            else:
+                prev_st = supertrend[i-1]
+                prev_dir = direction[i-1]
+                close = df['Close'].iloc[i]
+                upper = df['ST_Upper'].iloc[i]
+                lower = df['ST_Lower'].iloc[i]
+                
+                # Determine current SuperTrend
+                if prev_dir == 1:
+                    if close <= prev_st:
+                        supertrend.append(upper)
+                        direction.append(-1)
+                    else:
+                        supertrend.append(max(lower, prev_st))
+                        direction.append(1)
+                else:
+                    if close >= prev_st:
+                        supertrend.append(lower)
+                        direction.append(1)
+                    else:
+                        supertrend.append(min(upper, prev_st))
+                        direction.append(-1)
+        
+        df['SuperTrend'] = supertrend
+        df['SuperTrend_Direction'] = direction
+    
+    current = df.iloc[idx]
+    previous = df.iloc[idx - 1]
+    
+    # Check for trend change
+    curr_dir = current['SuperTrend_Direction']
+    prev_dir = previous['SuperTrend_Direction']
+    
+    # ADX filter
+    adx = current.get('ADX', 0)
+    if pd.isna(adx) or adx < adx_threshold:
+        return None, None
+    
+    # Volume filter
+    if 'Volume' in df.columns:
+        vol_ma = df['Volume'].rolling(20).mean().iloc[idx]
+        if current['Volume'] < vol_ma * volume_mult:
+            return None, None
+    
+    # Bullish signal
+    if prev_dir == -1 and curr_dir == 1:
+        return 'BUY', current['Close']
+    
+    # Bearish signal
+    if prev_dir == 1 and curr_dir == -1:
+        return 'SELL', current['Close']
+    
+    return None, None
+
+def check_vwap_volume_spike(df, idx, config, current_position):
+    """
+    VWAP + Volume Spike Strategy - High probability reversal/momentum strategy
+    Triggers when price crosses VWAP with significant volume spike
+    """
+    if current_position is not None:
+        return None, None
+    if idx < 50:
+        return None, None
+    
+    # Parameters
+    volume_mult = config.get('vwap_volume_mult', 2.0)
+    vwap_distance = config.get('vwap_distance_pct', 0.3)  # % distance from VWAP
+    rsi_ob = config.get('vwap_rsi_ob', 70)
+    rsi_os = config.get('vwap_rsi_os', 30)
+    
+    # Calculate VWAP
+    if 'VWAP' not in df.columns:
+        df['Typical_Price'] = (df['High'] + df['Low'] + df['Close']) / 3
+        df['VWAP'] = (df['Typical_Price'] * df['Volume']).cumsum() / df['Volume'].cumsum()
+    
+    current = df.iloc[idx]
+    previous = df.iloc[idx - 1]
+    current_price = current['Close']
+    prev_price = previous['Close']
+    vwap = current['VWAP']
+    
+    # Volume spike check
+    vol_ma = df['Volume'].rolling(20).mean().iloc[idx]
+    if current['Volume'] < vol_ma * volume_mult:
+        return None, None
+    
+    # Distance check (price within acceptable distance from VWAP)
+    distance_pct = abs(current_price - vwap) / vwap * 100
+    if distance_pct > vwap_distance:
+        return None, None
+    
+    # RSI confirmation
+    rsi = current.get('RSI', 50)
+    
+    # Bullish: Price crosses above VWAP with volume spike + RSI oversold recovery
+    if prev_price < previous['VWAP'] and current_price > vwap:
+        if not pd.isna(rsi) and rsi < 55:  # Not overbought
+            return 'BUY', current_price
+    
+    # Bearish: Price crosses below VWAP with volume spike + RSI overbought
+    if prev_price > previous['VWAP'] and current_price < vwap:
+        if not pd.isna(rsi) and rsi > 45:  # Not oversold
+            return 'SELL', current_price
+    
+    return None, None
+
+def check_bollinger_squeeze_breakout(df, idx, config, current_position):
+    """
+    Bollinger Band Squeeze Breakout - High probability breakout strategy
+    Identifies low volatility squeeze periods followed by explosive breakouts
+    """
+    if current_position is not None:
+        return None, None
+    if idx < 30:
+        return None, None
+    
+    # Parameters
+    bb_period = config.get('bb_squeeze_period', 20)
+    bb_std = config.get('bb_squeeze_std', 2.0)
+    squeeze_threshold = config.get('bb_squeeze_threshold', 0.02)  # 2% bandwidth
+    volume_mult = config.get('bb_squeeze_volume_mult', 1.8)
+    
+    # Calculate Bollinger Bands
+    if f'BB_Upper_{bb_period}' not in df.columns:
+        bb_mid = df['Close'].rolling(bb_period).mean()
+        bb_std_val = df['Close'].rolling(bb_period).std()
+        df[f'BB_Upper_{bb_period}'] = bb_mid + (bb_std * bb_std_val)
+        df[f'BB_Lower_{bb_period}'] = bb_mid - (bb_std * bb_std_val)
+        df[f'BB_Mid_{bb_period}'] = bb_mid
+        
+        # Calculate bandwidth (normalized)
+        df[f'BB_Bandwidth_{bb_period}'] = (df[f'BB_Upper_{bb_period}'] - df[f'BB_Lower_{bb_period}']) / df[f'BB_Mid_{bb_period}']
+    
+    current = df.iloc[idx]
+    previous = df.iloc[idx - 1]
+    current_price = current['Close']
+    prev_price = previous['Close']
+    
+    bb_upper = current[f'BB_Upper_{bb_period}']
+    bb_lower = current[f'BB_Lower_{bb_period}']
+    bb_mid = current[f'BB_Mid_{bb_period}']
+    bandwidth = current[f'BB_Bandwidth_{bb_period}']
+    prev_bandwidth = previous[f'BB_Bandwidth_{bb_period}']
+    
+    # Check if squeeze is present (low volatility)
+    is_squeezed = bandwidth < squeeze_threshold
+    was_squeezed = prev_bandwidth < squeeze_threshold
+    
+    # Volume confirmation
+    vol_ma = df['Volume'].rolling(20).mean().iloc[idx]
+    volume_surge = current['Volume'] > vol_ma * volume_mult
+    
+    # Bullish breakout: Price breaks above upper band during/after squeeze
+    if (is_squeezed or was_squeezed) and volume_surge:
+        if prev_price <= previous[f'BB_Upper_{bb_period}'] and current_price > bb_upper:
+            # Additional confirmation: RSI not extremely overbought
+            rsi = current.get('RSI', 50)
+            if pd.isna(rsi) or rsi < 75:
+                return 'BUY', current_price
+    
+    # Bearish breakout: Price breaks below lower band during/after squeeze
+    if (is_squeezed or was_squeezed) and volume_surge:
+        if prev_price >= previous[f'BB_Lower_{bb_period}'] and current_price < bb_lower:
+            # Additional confirmation: RSI not extremely oversold
+            rsi = current.get('RSI', 50)
+            if pd.isna(rsi) or rsi > 25:
+                return 'SELL', current_price
+    
+    return None, None
+
 # ================================
 # HELPER FUNCTIONS
 # ================================
@@ -1207,6 +1494,9 @@ STRATEGY_FUNCTIONS = {
     'Percentage Change': check_percentage_change,
     'AI Price Action': check_ai_price_action,
     'Custom Strategy': check_custom_strategy,
+    'SuperTrend AI': check_supertrend_ai,
+    'VWAP + Volume Spike': check_vwap_volume_spike,
+    'Bollinger Squeeze Breakout': check_bollinger_squeeze_breakout,
 }
 
 # ================================
@@ -1825,9 +2115,24 @@ def run_backtest(df, config):
                 # Convert signal to position type
                 position_type = 'LONG' if signal in ('BUY', 'LONG') else 'SHORT'
                 
+                # ── Method 2: Use next candle's open as entry (more realistic) ─────
+                use_method2 = config.get('use_backtest_method2', False)
+                if use_method2:
+                    # Check if next candle exists
+                    if idx + 1 < len(df):
+                        actual_entry_price = df.iloc[idx + 1]['Open']
+                        actual_entry_time = df.iloc[idx + 1]['Datetime']
+                    else:
+                        # No next candle - skip this trade
+                        continue
+                else:
+                    # Method 1: Use signal price (current close)
+                    actual_entry_price = entry_price
+                    actual_entry_time = current_data['Datetime']
+                
                 # Calculate initial SL and Target
-                sl_price = calculate_initial_sl(position_type, entry_price, df, idx, config)
-                target_price = calculate_initial_target(position_type, entry_price, df, idx, config)
+                sl_price = calculate_initial_sl(position_type, actual_entry_price, df, idx, config)
+                target_price = calculate_initial_target(position_type, actual_entry_price, df, idx, config)
                 
                 # Collect detailed entry metrics
                 entry_metrics = {
@@ -1850,21 +2155,21 @@ def run_backtest(df, config):
                         'ema_fast_entry': ema_fast_val,
                         'ema_slow_entry': ema_slow_val,
                         'ema_angle_entry': ema_angle,
-                        'price_fast_ema_diff_entry': entry_price - ema_fast_val if not pd.isna(ema_fast_val) else np.nan,
-                        'price_slow_ema_diff_entry': entry_price - ema_slow_val if not pd.isna(ema_slow_val) else np.nan,
+                        'price_fast_ema_diff_entry': actual_entry_price - ema_fast_val if not pd.isna(ema_fast_val) else np.nan,
+                        'price_slow_ema_diff_entry': actual_entry_price - ema_slow_val if not pd.isna(ema_slow_val) else np.nan,
                         'fast_slow_ema_diff_entry': ema_fast_val - ema_slow_val if not pd.isna(ema_fast_val) and not pd.isna(ema_slow_val) else np.nan,
                     })
                 
                 # Create position
                 position = {
                     'type': position_type,
-                    'entry_price': entry_price,
-                    'entry_time': current_data['Datetime'],
+                    'entry_price': actual_entry_price,
+                    'entry_time': actual_entry_time,
                     'sl_price': sl_price,
                     'target_price': target_price,
                     'quantity': config.get('quantity', 1),
-                    'highest_price': entry_price,
-                    'lowest_price': entry_price,
+                    'highest_price': actual_entry_price,
+                    'lowest_price': actual_entry_price,
                     'entry_metrics': entry_metrics,
                 }
                 
@@ -2251,6 +2556,16 @@ def live_trading_iteration():
                 dhan_broker = st.session_state.get('dhan_broker')
                 if dhan_broker:
                     try:
+                        # Clear all positions before new entry if enabled
+                        if config.get('clear_positions_before_entry', False):
+                            add_log(f"🏦 🧹 Clearing all existing positions before new entry...")
+                            clear_result = dhan_broker.clear_all_positions(add_log)
+                            if clear_result['cancelled_orders'] > 0 or clear_result['closed_positions'] > 0:
+                                add_log(f"🏦 ✅ Cleared: {clear_result['cancelled_orders']} pending orders, {clear_result['closed_positions']} open positions")
+                            else:
+                                add_log(f"🏦 ℹ️ No existing positions to clear")
+                        
+                        # Now place the new order
                         broker_position = dhan_broker.enter_broker_position(signal, entry_price, config, add_log)
                         st.session_state['broker_position'] = broker_position
                     except Exception as e:
@@ -2555,6 +2870,30 @@ def render_config_ui():
             ["LONG", "SHORT"],
             help="What position to take when % change occurs?"
         )
+    
+    elif config['strategy'] == 'SuperTrend AI':
+        st.sidebar.markdown("**SuperTrend AI Parameters**")
+        config['supertrend_atr_period'] = st.sidebar.number_input("ATR Period", min_value=5, value=10)
+        config['supertrend_multiplier'] = st.sidebar.number_input("Multiplier", min_value=1.0, value=3.0, step=0.5)
+        config['supertrend_adx_threshold'] = st.sidebar.number_input("ADX Threshold", min_value=10, value=25)
+        config['supertrend_volume_mult'] = st.sidebar.number_input("Volume Multiplier", min_value=1.0, value=1.5, step=0.1)
+        st.sidebar.info("📊 Trend-following with SuperTrend + ADX + Volume confirmation")
+    
+    elif config['strategy'] == 'VWAP + Volume Spike':
+        st.sidebar.markdown("**VWAP + Volume Spike Parameters**")
+        config['vwap_volume_mult'] = st.sidebar.number_input("Volume Spike Multiplier", min_value=1.5, value=2.0, step=0.1)
+        config['vwap_distance_pct'] = st.sidebar.number_input("Max Distance from VWAP (%)", min_value=0.1, value=0.3, step=0.1)
+        config['vwap_rsi_ob'] = st.sidebar.number_input("RSI Overbought", min_value=60, max_value=100, value=70)
+        config['vwap_rsi_os'] = st.sidebar.number_input("RSI Oversold", min_value=0, max_value=40, value=30)
+        st.sidebar.info("📊 Price/VWAP crossover with volume confirmation")
+    
+    elif config['strategy'] == 'Bollinger Squeeze Breakout':
+        st.sidebar.markdown("**Bollinger Squeeze Breakout Parameters**")
+        config['bb_squeeze_period'] = st.sidebar.number_input("BB Period", min_value=10, value=20)
+        config['bb_squeeze_std'] = st.sidebar.number_input("BB Std Dev", min_value=1.0, value=2.0, step=0.1)
+        config['bb_squeeze_threshold'] = st.sidebar.number_input("Squeeze Threshold (%)", min_value=0.01, value=0.02, step=0.01, format="%.3f")
+        config['bb_squeeze_volume_mult'] = st.sidebar.number_input("Breakout Volume Mult", min_value=1.0, value=1.8, step=0.1)
+        st.sidebar.info("📊 Low volatility squeeze → High probability breakout")
     
     elif config['strategy'] == 'Custom Strategy':
         st.sidebar.markdown("**🛠️ Custom Strategy Builder (Multi-Indicator)**")
@@ -2994,6 +3333,18 @@ def render_config_ui():
                 
                 config['multi_strikes_ce'] = st.session_state.get('multi_strikes_ce', [])
                 config['multi_strikes_pe'] = st.session_state.get('multi_strikes_pe', [])
+        
+        # ── Clear/Close All Positions Before New Entry ───────────────────────
+        st.sidebar.markdown("---")
+        config['clear_positions_before_entry'] = st.sidebar.checkbox(
+            "🧹 Clear All Positions Before New Entry",
+            value=False,
+            help=(
+                "When enabled, cancels all pending orders and closes all open positions "
+                "with market orders before placing a new entry order.\n"
+                "Prevents messy orders when algo exits but broker order still pending."
+            )
+        )
     
     return config
 
@@ -3007,6 +3358,21 @@ def render_backtest_ui(config):
         value=False,
         help="Shows only trades that were entered AND exited on the same day between 9:15 AM and 3:00 PM IST. Removes gap-up/gap-down and overnight trades."
     )
+    
+    # ── Backtesting Method 2 (Realistic Entry) ───────────────────────────────
+    use_method2 = st.checkbox(
+        "🔬 Use Backtesting Method 2 (Realistic Entry)",
+        value=False,
+        help=(
+            "Method 2 fixes look-ahead bias and entry price issues:\n"
+            "• Entry price = NEXT candle's OPEN (not current close)\n"
+            "• Prevents using future data\n"
+            "• More realistic simulation\n"
+            "⚠️ Results will be more conservative but accurate"
+        )
+    )
+    
+    config['use_backtest_method2'] = use_method2
 
     if st.button("Run Backtest", type="primary"):
         with st.spinner("Running backtest..."):
@@ -3102,15 +3468,33 @@ def render_backtest_ui(config):
             win_rate       = (winning_trades / total_trades * 100) if total_trades else 0
             total_pnl      = float(df_t['pnl'].sum())
             avg_pnl        = float(df_t['pnl'].mean())
-            cum_pnl        = df_t['pnl'].cumsum()
+            
+            # Net P&L calculations
+            total_brokerage = float(df_t['brokerage'].sum()) if 'brokerage' in df_t.columns else 0
+            total_net_pnl = float(df_t['net_pnl'].sum()) if 'net_pnl' in df_t.columns else total_pnl
+            avg_net_pnl = float(df_t['net_pnl'].mean()) if 'net_pnl' in df_t.columns else avg_pnl
+            
+            # Drawdown calculation
+            pnl_column = 'net_pnl' if 'net_pnl' in df_t.columns else 'pnl'
+            cum_pnl = df_t[pnl_column].cumsum()
             max_drawdown   = float((cum_pnl - cum_pnl.cummax()).min())
         else:
             total_trades = winning_trades = losing_trades = 0
             win_rate = total_pnl = avg_pnl = max_drawdown = 0.0
+            total_brokerage = total_net_pnl = avg_net_pnl = 0.0
 
-        metrics = dict(total_trades=total_trades, winning_trades=winning_trades,
-                       losing_trades=losing_trades, win_rate=win_rate,
-                       total_pnl=total_pnl, avg_pnl=avg_pnl, max_drawdown=max_drawdown)
+        metrics = dict(
+            total_trades=total_trades, 
+            winning_trades=winning_trades,
+            losing_trades=losing_trades, 
+            win_rate=win_rate,
+            total_pnl=total_pnl, 
+            avg_pnl=avg_pnl, 
+            max_drawdown=max_drawdown,
+            total_brokerage=total_brokerage,
+            total_net_pnl=total_net_pnl,
+            avg_net_pnl=avg_net_pnl
+        )
 
         # ── Metrics display ───────────────────────────────────────────────────
         col1, col2, col3, col4 = st.columns(4)
@@ -3272,14 +3656,26 @@ def render_backtest_ui(config):
             with st.expander("📊 Detailed Trade Metrics (EMA, Angles, Differences)"):
                 detailed_cols = [
                     'entry_time', 'exit_time', 'type', 'strategy', 
+                    'pnl', 'net_pnl', 'brokerage',
                     'ema_fast_period', 'ema_slow_period', 'angle',
                     'ema_fast_entry', 'ema_slow_entry', 
                     'price_fast_ema_diff_entry', 'price_slow_ema_diff_entry', 'fast_slow_ema_diff_entry',
                     'ema_fast_exit', 'ema_slow_exit',
                     'price_fast_ema_diff_exit', 'price_slow_ema_diff_exit', 'fast_slow_ema_diff_exit'
                 ]
-                df_detailed = df_trades[[c for c in detailed_cols if c in df_trades.columns]]
-                st.dataframe(df_detailed, use_container_width=True)
+                # Keep formatting for numeric columns
+                df_detailed = df_trades.copy()
+                for col in ['pnl', 'net_pnl', 'brokerage', 'ema_fast_entry', 'ema_slow_entry', 
+                           'price_fast_ema_diff_entry', 'price_slow_ema_diff_entry', 'fast_slow_ema_diff_entry',
+                           'ema_fast_exit', 'ema_slow_exit', 'price_fast_ema_diff_exit', 
+                           'price_slow_ema_diff_exit', 'fast_slow_ema_diff_exit']:
+                    if col in df_detailed.columns and col not in ['pnl', 'net_pnl', 'brokerage']:
+                        # Format technical indicators
+                        df_detailed[col] = df_detailed[col].apply(
+                            lambda x: f"{x:.2f}" if pd.notna(x) and x == x else "—")
+                
+                df_detailed_display = df_detailed[[c for c in detailed_cols if c in df_detailed.columns]]
+                st.dataframe(df_detailed_display, use_container_width=True)
         
         # ── Skipped/Overlapping Trades Table ─────────────────────────────────
         skipped_trades = results.get('skipped_trades', [])
