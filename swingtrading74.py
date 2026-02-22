@@ -77,7 +77,7 @@ STRATEGY_LIST = [
     "SuperTrend AI",
     "VWAP + Volume Spike",
     "Bollinger Squeeze Breakout",
-    #"Elliott Waves + Ratio Charts"
+    "Elliott Waves + Ratio Charts"
 ]
 
 SL_TYPES = [
@@ -1858,13 +1858,18 @@ def calculate_initial_target(position_type, entry_price, df, idx, config):
             return current['Prev_Swing_Low']
     
     elif target_type in ['Trailing Target (Points)', 'Trailing Target + Signal Based',
-                         '50% Exit at Target (Partial)', 'Signal-based (Reverse Crossover)']:
+                         '50% Exit at Target (Partial)']:
         # Start with initial target
         points = config.get('target_points', 20)
         if position_type == 'LONG':
             return entry_price + points
         else:  # SHORT
             return entry_price - points
+    
+    elif target_type == 'Signal-based (Reverse Crossover)':
+        # No price-based target - exit only on reverse signal
+        # Return None to disable price target checks
+        return None
     
     else:
         # Default fallback
@@ -2429,8 +2434,11 @@ def run_backtest(df, config):
                         exit_reason = 'Target Hit'
                         exit_price = position['target_price']
             
-            # Check signal-based exit
-            if exit_reason is None and config.get('sl_type') == 'Signal-based (Reverse Crossover)':
+            # Check signal-based exit (for both SL and Target types)
+            if exit_reason is None and (
+                config.get('sl_type') == 'Signal-based (Reverse Crossover)' or 
+                config.get('target_type') == 'Signal-based (Reverse Crossover)'
+            ):
                 signal, _ = strategy_func(df, idx, config, position)
                 if signal:
                     # Reverse signal detected
@@ -2779,8 +2787,11 @@ def live_trading_iteration():
                     exit_price = position['target_price']
                     add_log(f"🎯 TARGET HIT! Price {current_price:.2f} <= Target {position['target_price']:.2f}")
         
-        # Check signal-based exit
-        if exit_reason is None and config.get('sl_type') == 'Signal-based (Reverse Crossover)':
+        # Check signal-based exit (for both SL and Target types)
+        if exit_reason is None and (
+            config.get('sl_type') == 'Signal-based (Reverse Crossover)' or 
+            config.get('target_type') == 'Signal-based (Reverse Crossover)'
+        ):
             signal, _ = strategy_func(df, idx, config, position)
             if signal:
                 if (position['type'] == 'LONG' and signal in ('SELL', 'SHORT')) or \
