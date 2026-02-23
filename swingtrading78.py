@@ -10,9 +10,11 @@ import pandas as pd
 import numpy as np
 import yfinance as yf
 import requests
+import requests.adapters
 import time
 import json
 import warnings
+import random
 from datetime import datetime, timedelta
 import plotly.graph_objects as go
 import plotly.express as px
@@ -21,6 +23,50 @@ from scipy.stats import norm
 from scipy.optimize import brentq
 
 warnings.filterwarnings("ignore")
+
+# ─── SHARED YFINANCE SESSION (created once, reused globally) ──────────────────
+@st.cache_resource
+def get_yf_session():
+    """
+    One persistent requests.Session shared across ALL yfinance calls.
+    Mimics a real browser and uses an adapter that retries on 429/5xx.
+    """
+    from requests.adapters import HTTPAdapter
+    from urllib3.util.retry import Retry
+
+    sess = requests.Session()
+    sess.headers.update({
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/123.0.0.0 Safari/537.36"
+        ),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept-Encoding": "gzip, deflate, br",
+    })
+    retry = Retry(
+        total=4,
+        backoff_factor=2,           # 2s, 4s, 8s, 16s
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=["GET", "HEAD"],
+        raise_on_status=False,
+    )
+    adapter = HTTPAdapter(max_retries=retry)
+    sess.mount("https://", adapter)
+    sess.mount("http://", adapter)
+    return sess
+
+
+def yf_ticker(sym: str) -> yf.Ticker:
+    """Return a yfinance Ticker that reuses our shared session."""
+    sess = get_yf_session()
+    return yf.Ticker(sym, session=sess)
+
+
+def safe_sleep(base: float = 1.5):
+    """Sleep with ±0.3s jitter to avoid identical-interval detection."""
+    time.sleep(base + random.uniform(-0.3, 0.4))
 
 # ─── PAGE CONFIG ──────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -209,7 +255,6 @@ for key, val in {
     "trade_history": [],
     "active_trades": [],
     "backtest_results": None,
-    "last_req_time": {},
     "df_cache": None,
     "spot_cache": None,
     "signal_cache": None,
@@ -217,17 +262,18 @@ for key, val in {
     if key not in st.session_state:
         st.session_state[key] = val
 
+# Module-level throttle dict (persists across Streamlit reruns in same process)
+_LAST_YF_CALL: dict = {}
 
-# ─── RATE LIMITER ──────────────────────────────────────────────────────────────
-def rate_limited(key: str, fn, delay: float = REQUEST_DELAY):
+
+def _global_throttle(min_gap: float = 2.0):
+    """Enforce minimum gap between yfinance calls regardless of which function calls them."""
     now = time.time()
-    last = st.session_state.last_req_time.get(key, 0)
-    wait = delay - (now - last)
-    if wait > 0:
-        time.sleep(wait)
-    result = fn()
-    st.session_state.last_req_time[key] = time.time()
-    return result
+    last = _LAST_YF_CALL.get("ts", 0)
+    gap = now - last
+    if gap < min_gap:
+        time.sleep(min_gap - gap + random.uniform(0.1, 0.3))
+    _LAST_YF_CALL["ts"] = time.time()
 
 
 # ─── BLACK-SCHOLES ENGINE ──────────────────────────────────────────────────────
@@ -339,55 +385,108 @@ def _parse_nse(data):
     return df, spot, expiries
 
 
-@st.cache_data(ttl=90, show_spinner=False)
+@st.cache_data(ttl=120, show_spinner=False)
 def fetch_yf_chain(yf_sym: str, expiry: str = None):
-    """Fetch yfinance option chain with rate limiting."""
+    """
+    Fetch yfinance option chain in a single Ticker pass.
+    Uses shared session + retry adapter. Only 2 HTTP calls total:
+      1. tk.options  (expiry list + sets cookie)
+      2. tk.option_chain(expiry)
+    Spot price is extracted from the chain directly (no extra history call).
+    """
     try:
-        time.sleep(REQUEST_DELAY)
-        tk = yf.Ticker(yf_sym)
-        expiries = list(tk.options or [])
+        _global_throttle(2.0)
+        tk = yf_ticker(yf_sym)
+
+        # ── 1. Get expiry list ────────────────────────────────────────────────
+        try:
+            expiries = list(tk.options or [])
+        except Exception:
+            expiries = []
+
         if not expiries:
+            st.warning(f"No options data found for {yf_sym}. Market may be closed or symbol invalid.")
             return None, None, []
+
         sel = expiry if expiry in expiries else expiries[0]
-        time.sleep(REQUEST_DELAY)
+
+        # ── 2. Single chain call ──────────────────────────────────────────────
+        _global_throttle(2.0)
         chain = tk.option_chain(sel)
-        time.sleep(REQUEST_DELAY)
-        hist = tk.history(period="1d", interval="1m")
-        spot = float(hist["Close"].iloc[-1]) if not hist.empty else 0
-        calls, puts = chain.calls.copy(), chain.puts.copy()
+        calls = chain.calls.copy()
+        puts  = chain.puts.copy()
+
+        # ── 3. Spot from fast_info (no extra HTTP call) ───────────────────────
+        try:
+            spot = float(tk.fast_info.get("last_price") or tk.fast_info.get("regularMarketPrice") or 0)
+        except Exception:
+            spot = 0
+
+        # Fallback: midpoint of ATM options
+        if spot == 0 and not calls.empty and "strike" in calls.columns:
+            atm_idx = (calls["strike"] - calls["strike"].median()).abs().idxmin()
+            atm_call = float(calls.loc[atm_idx, "lastPrice"]) if "lastPrice" in calls.columns else 0
+            atm_put_row = puts[puts["strike"] == calls.loc[atm_idx, "strike"]] if "strike" in puts.columns else pd.DataFrame()
+            atm_put = float(atm_put_row["lastPrice"].values[0]) if not atm_put_row.empty else 0
+            # spot ≈ strike + call - put (put-call parity)
+            spot = float(calls.loc[atm_idx, "strike"]) + atm_call - atm_put
+
+        # ── 4. Build unified DataFrame ────────────────────────────────────────
+        if calls.empty:
+            return None, spot, expiries
 
         df = pd.DataFrame()
-        df["strikePrice"] = calls["strike"] if "strike" in calls.columns else pd.Series()
-        df["expiryDate"] = sel
-        df["CE_LTP"] = calls["lastPrice"].values if "lastPrice" in calls.columns else 0
-        df["CE_OI"] = calls.get("openInterest", pd.Series([0] * len(calls))).values
-        df["CE_volume"] = calls.get("volume", pd.Series([0] * len(calls))).values
-        df["CE_IV"] = (calls.get("impliedVolatility", pd.Series([0.0] * len(calls))).values * 100)
-        df["CE_bid"] = calls.get("bid", pd.Series([0] * len(calls))).values
-        df["CE_ask"] = calls.get("ask", pd.Series([0] * len(calls))).values
+        df["strikePrice"] = calls["strike"].values if "strike" in calls.columns else pd.Series(dtype=float)
+        df["expiryDate"]  = sel
+
+        for col, src_col in [
+            ("CE_LTP",    "lastPrice"),
+            ("CE_OI",     "openInterest"),
+            ("CE_volume", "volume"),
+            ("CE_bid",    "bid"),
+            ("CE_ask",    "ask"),
+        ]:
+            df[col] = calls[src_col].values if src_col in calls.columns else 0
+
+        df["CE_IV"] = (calls["impliedVolatility"].values * 100) if "impliedVolatility" in calls.columns else 0
         df["CE_changeOI"] = 0
 
-        puts_indexed = puts.set_index("strike") if "strike" in puts.columns else puts
-        for col, pcol, default in [
-            ("PE_LTP", "lastPrice", 0),
-            ("PE_OI", "openInterest", 0),
-            ("PE_volume", "volume", 0),
-            ("PE_bid", "bid", 0),
-            ("PE_ask", "ask", 0),
-        ]:
-            if pcol in puts_indexed.columns:
-                df[col] = df["strikePrice"].map(puts_indexed[pcol]).fillna(default)
-            else:
-                df[col] = default
-        if "impliedVolatility" in puts_indexed.columns:
-            df["PE_IV"] = df["strikePrice"].map(puts_indexed["impliedVolatility"]).fillna(0) * 100
+        # Merge puts by strike
+        if not puts.empty and "strike" in puts.columns:
+            puts_idx = puts.set_index("strike")
+            for col, src_col in [
+                ("PE_LTP",    "lastPrice"),
+                ("PE_OI",     "openInterest"),
+                ("PE_volume", "volume"),
+                ("PE_bid",    "bid"),
+                ("PE_ask",    "ask"),
+            ]:
+                df[col] = df["strikePrice"].map(
+                    puts_idx[src_col] if src_col in puts_idx.columns else pd.Series(dtype=float)
+                ).fillna(0)
+            df["PE_IV"] = df["strikePrice"].map(
+                puts_idx["impliedVolatility"] * 100 if "impliedVolatility" in puts_idx.columns else pd.Series(dtype=float)
+            ).fillna(0)
         else:
-            df["PE_IV"] = 0
+            for col in ["PE_LTP", "PE_OI", "PE_volume", "PE_bid", "PE_ask", "PE_IV"]:
+                df[col] = 0
+
         df["PE_changeOI"] = 0
         df = df.fillna(0)
-        return df, spot, expiries
+        df = df[df["CE_LTP"] + df["PE_LTP"] > 0]   # drop empty rows
+        df = df.reset_index(drop=True)
+        return df, round(spot, 2), expiries
+
     except Exception as e:
-        st.error(f"yfinance error: {e}")
+        err = str(e)
+        if "429" in err or "Too Many" in err.lower() or "rate" in err.lower():
+            st.error(
+                "⏳ **yfinance rate limit hit.** The shared session will auto-retry with backoff. "
+                "Wait ~15 seconds and press **Fetch Live Data** again. "
+                "If persistent, restart the Streamlit app (clears session)."
+            )
+        else:
+            st.error(f"yfinance error: {err}")
         return None, None, []
 
 
@@ -604,14 +703,9 @@ def generate_signals(df: pd.DataFrame, spot: float) -> dict:
 def run_backtest(yf_sym: str, lookback: int, init_capital: float, pos_size_pct: float):
     """
     Vectorised backtest using the SAME scoring algorithm as generate_signals().
-    Ensures live/backtest consistency by sharing all threshold logic.
+    Uses cached price history — no extra yfinance calls.
     """
-    time.sleep(REQUEST_DELAY)
-    try:
-        raw = yf.download(yf_sym, period=f"{lookback}d", interval="1d", progress=False)
-    except Exception as e:
-        return None, str(e)
-
+    raw = fetch_price_history(yf_sym, f"{lookback}d")
     if raw is None or raw.empty or len(raw) < 15:
         return None, "Insufficient data"
 
@@ -863,16 +957,27 @@ def plot_greeks(df, spot):
     return fig
 
 
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_price_history(yf_sym: str, period: str = "45d") -> pd.DataFrame:
+    """Single cached price history fetch used by both straddle chart and backtest."""
+    _global_throttle(2.0)
+    try:
+        tk = yf_ticker(yf_sym)
+        hist = tk.history(period=period, interval="1d", auto_adjust=True)
+        return hist if hist is not None and not hist.empty else pd.DataFrame()
+    except Exception as e:
+        st.warning(f"Price history fetch failed: {e}")
+        return pd.DataFrame()
+
+
 def plot_straddle_history(yf_sym, straddle_now):
     try:
-        time.sleep(REQUEST_DELAY)
-        hist = yf.download(yf_sym, period="45d", interval="1d", progress=False)
-        if hist is None or hist.empty:
+        hist = fetch_price_history(yf_sym, "45d")
+        if hist.empty:
             return None, None
         close = hist["Close"].squeeze().astype(float)
         rets = close.pct_change().dropna()
         rv7 = rets.rolling(7).std() * np.sqrt(252)
-        # Estimated ATM straddle ≈ spot × σ × √(7/252) × 0.8 (vega-adjusted)
         straddle_est = close * rv7 * np.sqrt(7 / 252) * 0.8
         straddle_est = straddle_est.dropna()
 
@@ -887,7 +992,6 @@ def plot_straddle_history(yf_sym, straddle_now):
         fig.add_hline(y=p25, line_color="#00ff88", line_dash="dot", annotation_text=f"25th: {p25:.0f}")
         fig.add_hline(y=p75, line_color="#ff3b5c", line_dash="dot", annotation_text=f"75th: {p75:.0f}")
         fig.add_hline(y=p50, line_color="#ff9500", line_dash="dot", annotation_text=f"50th: {p50:.0f}")
-
         fig.update_layout(template=_DARK, height=360, title="Straddle Price vs 45-Day History")
 
         if straddle_now > 0:
@@ -967,8 +1071,32 @@ def main():
             df_raw, spot, expiries = fetch_yf_chain(symbol)
 
     if df_raw is None or spot is None or spot == 0:
-        st.error("❌ Could not fetch live data. Check ticker / network. NSE data may require Indian IP.")
-        st.info("Try Global tab with BTC-USD, GC=F (Gold), or a US stock like AAPL.")
+        st.error("❌ Could not fetch live data.")
+        st.markdown("""
+<div style='background:#0a1929; border:1px solid #1e3050; border-radius:12px; padding:20px; margin:10px 0'>
+<h4 style='color:#ff9500; margin-top:0'>🛠️ Troubleshooting Guide</h4>
+
+**Most likely causes & fixes:**
+
+1. **Rate limited** (most common) → Wait 15–30 seconds, then click **🔄 FETCH LIVE DATA** again.
+   The retry adapter will automatically back off and retry.
+
+2. **Market closed** → yfinance option chain data is only available during US/global market hours.
+   Try BTC-USD (24/7) or GC=F (Gold futures) from the Global tab.
+
+3. **Wrong symbol** → Confirm the yfinance ticker. Examples: `AAPL`, `BTC-USD`, `GC=F`, `^NSEI`
+
+4. **NSE data** → Requires Indian IP. If outside India, switch to Global > BTC/USD or Gold.
+
+5. **Still failing?** → Click the button below to clear all caches and start fresh.
+</div>
+""", unsafe_allow_html=True)
+        col_r1, col_r2 = st.columns(2)
+        if col_r1.button("🔄 Clear Cache & Retry", type="primary", use_container_width=True):
+            st.cache_data.clear()
+            _LAST_YF_CALL.clear()
+            st.rerun()
+        col_r2.info("💡 Try: BTC-USD, GC=F, SI=F, AAPL, TSLA")
         return
 
     spot = float(spot)
