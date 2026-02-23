@@ -306,7 +306,8 @@ class DhanBrokerIntegration:
         def _build_bo_params(txn, entry_px):
             """Build BO order params (boProfitValue / boStopLossValue)"""
             if not use_broker_sl:
-                return None
+                # Even without BO, pass price for limit orders
+                return {'price': entry_px}
             sl_pts  = float(config.get('broker_sl_points', 50))
             tgt_pts = float(config.get('broker_target_points', 100))
             trail   = float(config.get('broker_trailing_jump', 0))
@@ -400,7 +401,12 @@ class DhanBrokerIntegration:
                 exit_transaction = 'BUY'
                 log_func(f"🏦 Stock Exit → BUY (square off short)")
         
-        order_response = self.place_order(exit_transaction, security_id, quantity)
+        order_response = self.place_order(
+            exit_transaction, 
+            security_id, 
+            quantity,
+            order_params={'price': price}  # Pass exit price for limit orders
+        )
         
         # Calculate P&L
         entry_price = broker_position['entry_price']
@@ -3333,7 +3339,7 @@ def render_config_ui():
     
     if config['dhan_enabled']:
         config['dhan_client_id'] = st.sidebar.text_input("Client ID", value="1104779876")
-        config['dhan_access_token'] = st.sidebar.text_input("Access Token", type="password", value="eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzUxMiJ9.eyJpc3MiOiJkaGFuIiwicGFydG5lcklkIjoiIiwiZXhwIjoxNzcxOTA0MzkxLCJpYXQiOjE3NzE4MTc5OTEsInRva2VuQ29uc3VtZXJUeXBlIjoiU0VMRiIsIndlYmhvb2tVcmwiOiIiLCJkaGFuQ2xpZW50SWQiOiIxMTA0Nzc5ODc2In0.Sacz2-G2BlhRmiO3IVbHZ_Dw6UNhMiG7qd9NamhBTBTVgehl--x_CRf1KeT-4AFP9I_8n5n9gI4T8zCqyePDhw")
+        config['dhan_access_token'] = st.sidebar.text_input("Access Token", type="password", value="eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzUxMiJ9.eyJpc3MiOiJkaGFuIiwicGFydG5lcklkIjoiIiwiZXhwIjoxNzcxMTQzMjM5LCJpYXQiOjE3NzEwNTY4MzksInRva2VuQ29uc3VtZXJUeXBlIjoiU0VMRiIsIndlYmhvb2tVcmwiOiIiLCJkaGFuQ2xpZW50SWQiOiIxMTA0Nzc5ODc2In0.qP8kVXDQt-sFa6LWJqd1MRTPESHCCPCqHzEnjsFI2WVbNdywKHXgAKHxVpuH6tP_AJTdqowv9nbqf-2NcGibbQ")
         
         config['dhan_is_options'] = st.sidebar.checkbox("Is Options", value=True)
         
