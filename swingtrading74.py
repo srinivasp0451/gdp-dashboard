@@ -435,34 +435,86 @@ class DhanBrokerIntegration:
             
         return exit_info
     
-    def clear_all_positions(self, log_func):
+    def clear_all_positions(self, log_func, convert_to_market=True):
         """
-        Clear all positions: cancel pending orders and close open positions
-        Returns dict with cleared orders and positions count
+        Clear all positions: cancel/convert pending orders and close open positions
+        
+        Args:
+            log_func: Logging function
+            convert_to_market: If True, try to convert pending LIMIT orders to MARKET for faster fill
+        
+        Returns:
+            dict with cleared orders and positions count
         """
         result = {
             'cancelled_orders': 0,
+            'converted_orders': 0,
             'closed_positions': 0,
-            'errors': []
+            'errors': [],
+            'clearing_complete': False
         }
         
         if not self.initialized or not self.dhan:
             log_func("🏦 ⚠️ Broker not initialized - skipping position clear")
+            result['clearing_complete'] = True
             return result
         
         try:
+            log_func("🏦 🧹 Starting position clearing process...")
+            
             # Get all orders
             order_list = self.dhan.get_order_list()
             
             if order_list and order_list.get('status') == 'success':
                 orders = order_list.get('data', [])
+                log_func(f"🏦 Found {len(orders)} orders to process")
                 
                 for order in orders:
                     order_status = order.get('orderStatus', '')
                     order_id = order.get('orderId', '')
+                    order_type = order.get('orderType', '')
                     
-                    # Cancel pending orders
-                    if order_status == 'PENDING':
+                    # Handle pending LIMIT orders
+                    if order_status == 'PENDING' and order_type == 'LIMIT' and convert_to_market:
+                        try:
+                            log_func(f"🏦 Converting pending LIMIT order {order_id} to MARKET...")
+                            
+                            # Cancel the LIMIT order first
+                            cancel_response = self.dhan.cancel_order(order_id)
+                            
+                            if cancel_response and cancel_response.get('status') == 'success':
+                                log_func(f"🏦 ✅ Cancelled LIMIT order: {order_id}")
+                                
+                                # Place new MARKET order with same parameters
+                                market_response = self.dhan.place_order(
+                                    tag=order.get('tag', ''),
+                                    transaction_type=order.get('transactionType'),
+                                    exchange_segment=order.get('exchangeSegment'),
+                                    product_type=order.get('productType'),
+                                    order_type=self.dhanhq_module.MARKET,
+                                    security_id=str(order.get('securityId', '')),
+                                    quantity=int(order.get('quantity', 0)),
+                                    price=0
+                                )
+                                
+                                if market_response and market_response.get('status') == 'success':
+                                    result['converted_orders'] += 1
+                                    log_func(f"🏦 ✅ Converted to MARKET order: {market_response.get('data', {}).get('orderId', 'N/A')}")
+                                else:
+                                    # If market order fails, just count as cancelled
+                                    result['cancelled_orders'] += 1
+                                    log_func(f"🏦 ⚠️ MARKET conversion failed, order cancelled")
+                            else:
+                                error_msg = f"Failed to cancel order {order_id}: {cancel_response.get('remarks', 'Unknown')}"
+                                result['errors'].append(error_msg)
+                                log_func(f"🏦 ⚠️ {error_msg}")
+                        except Exception as e:
+                            error_msg = f"Error converting order {order_id}: {str(e)}"
+                            result['errors'].append(error_msg)
+                            log_func(f"🏦 ❌ {error_msg}")
+                    
+                    # Handle other pending orders (non-LIMIT or if convert disabled)
+                    elif order_status == 'PENDING':
                         try:
                             cancel_response = self.dhan.cancel_order(order_id)
                             if cancel_response and cancel_response.get('status') == 'success':
@@ -477,11 +529,13 @@ class DhanBrokerIntegration:
                             result['errors'].append(error_msg)
                             log_func(f"🏦 ❌ {error_msg}")
                     
-                    # Close open positions (TRANSIT status)
-                    elif order_status == 'TRANSIT':
+                    # Close open positions (TRANSIT/TRADED status)
+                    elif order_status in ['TRANSIT', 'TRADED']:
                         try:
-                            # Place opposite order to close
+                            # Place opposite MARKET order to close immediately
                             opposite_txn = 'SELL' if order.get('transactionType') == 'BUY' else 'BUY'
+                            
+                            log_func(f"🏦 Closing position {order_id} with {opposite_txn} MARKET order...")
                             
                             close_response = self.dhan.place_order(
                                 tag=order.get('tag', ''),
@@ -506,12 +560,20 @@ class DhanBrokerIntegration:
                             result['errors'].append(error_msg)
                             log_func(f"🏦 ❌ {error_msg}")
             
-            log_func(f"🏦 🧹 Position Clear Summary: {result['cancelled_orders']} orders cancelled, {result['closed_positions']} positions closed")
+            # Mark clearing as complete
+            result['clearing_complete'] = True
+            
+            summary_msg = f"🏦 🧹 Clearing Complete: {result['cancelled_orders']} cancelled, {result['converted_orders']} converted, {result['closed_positions']} closed"
+            log_func(summary_msg)
+            
+            if result['errors']:
+                log_func(f"🏦 ⚠️ {len(result['errors'])} errors during clearing")
             
         except Exception as e:
             error_msg = f"Error in clear_all_positions: {str(e)}"
             result['errors'].append(error_msg)
             log_func(f"🏦 ❌ {error_msg}")
+            result['clearing_complete'] = True  # Mark as complete even with error to unblock
         
         return result
 
@@ -2612,6 +2674,11 @@ def live_trading_iteration():
     """
     config = st.session_state.get('config', {})
     
+    # Check if clearing is in progress - skip iteration
+    if st.session_state.get('clearing_in_progress', False):
+        add_log(f"🏦 ⏳ Position clearing in progress - skipping iteration")
+        return
+    
     # Fetch fresh data
     ticker = config.get('asset', 'NIFTY 50')
     interval = INTERVAL_MAPPING.get(config.get('interval', '1 day'), '1d')
@@ -2648,11 +2715,29 @@ def live_trading_iteration():
             add_log(f"⏰ Outside trade window - no new entries allowed")
             return
         
+        # Check cooldown period after previous exit (prevent immediate re-entry)
+        last_exit_time = st.session_state.get('last_exit_time')
+        cooldown_seconds = config.get('entry_cooldown_seconds', 60)  # Default 60 seconds
+        
+        if last_exit_time is not None:
+            time_since_exit = (datetime.now(pytz.timezone('Asia/Kolkata')) - last_exit_time).total_seconds()
+            if time_since_exit < cooldown_seconds:
+                add_log(f"⏳ Cooldown active: {int(cooldown_seconds - time_since_exit)}s remaining (prevents duplicate entries)")
+                return
+        
+        # Check if signal is different from last signal (prevent same-signal re-entry)
+        last_signal = st.session_state.get('last_signal_type')
+        
         # Check for entry signal
         add_log(f"🔍 Checking for entry signal using {strategy_name}...")
         signal, entry_price = strategy_func(df, idx, config, None)
         
         if signal:
+            # Prevent re-entry with same signal type immediately after exit
+            if last_signal == signal:
+                add_log(f"⛔ Same signal {signal} as last trade - waiting for new crossover/condition")
+                return
+            
             # Check if signal matches trade direction filter
             if not should_allow_trade_direction(signal, config):
                 direction_filter = config.get('trade_direction', 'Both (LONG + SHORT)')
@@ -2667,6 +2752,9 @@ def live_trading_iteration():
                     return
             
             add_log(f"✅ SIGNAL DETECTED: {signal} at {entry_price:.2f}")
+            
+            # Store current signal type
+            st.session_state['last_signal_type'] = signal
             
             # Convert to position type
             position_type = 'LONG' if signal in ('BUY', 'LONG') else 'SHORT'
@@ -2706,11 +2794,27 @@ def live_trading_iteration():
                         # Clear all positions before new entry if enabled
                         if config.get('clear_positions_before_entry', False):
                             add_log(f"🏦 🧹 Clearing all existing positions before new entry...")
-                            clear_result = dhan_broker.clear_all_positions(add_log)
-                            if clear_result['cancelled_orders'] > 0 or clear_result['closed_positions'] > 0:
-                                add_log(f"🏦 ✅ Cleared: {clear_result['cancelled_orders']} pending orders, {clear_result['closed_positions']} open positions")
+                            
+                            # Set clearing flag to block concurrent entries
+                            st.session_state['clearing_in_progress'] = True
+                            
+                            clear_result = dhan_broker.clear_all_positions(add_log, convert_to_market=True)
+                            
+                            # Check if clearing completed successfully
+                            if not clear_result['clearing_complete']:
+                                add_log(f"🏦 ⚠️ Position clearing incomplete - aborting new entry")
+                                st.session_state['clearing_in_progress'] = False
+                                return
+                            
+                            # Log results
+                            total_cleared = clear_result['cancelled_orders'] + clear_result['converted_orders'] + clear_result['closed_positions']
+                            if total_cleared > 0:
+                                add_log(f"🏦 ✅ Cleared {total_cleared} orders/positions ({clear_result['cancelled_orders']} cancelled, {clear_result['converted_orders']} converted, {clear_result['closed_positions']} closed)")
                             else:
                                 add_log(f"🏦 ℹ️ No existing positions to clear")
+                            
+                            # Clear flag
+                            st.session_state['clearing_in_progress'] = False
                         
                         # Now place the new order
                         broker_position = dhan_broker.enter_broker_position(signal, entry_price, config, add_log)
@@ -2862,6 +2966,9 @@ def live_trading_iteration():
             
             add_log("✅ Position closed, session cleared")
             
+            # Store exit time for cooldown
+            st.session_state['last_exit_time'] = datetime.now(pytz.timezone('Asia/Kolkata'))
+            
             # Clear position and session data
             st.session_state['position'] = None
             st.session_state['broker_position'] = None
@@ -2964,6 +3071,16 @@ def render_config_ui():
         value=True,
         help="When enabled, blocks new signals while a position is active. Skipped signals are tracked separately for analysis."
     )
+    
+    # ── Entry Cooldown (Live Trading) ────────────────────────────────────────
+    config['entry_cooldown_seconds'] = st.sidebar.number_input(
+        "⏱️ Entry Cooldown (seconds)",
+        min_value=0,
+        value=60,
+        step=5,
+        help="Prevents immediate re-entry after exit (Live Trading only). Useful to avoid duplicate orders on same signal."
+    )
+    st.sidebar.caption(f"Cooldown: {config['entry_cooldown_seconds']}s wait after exit before new entry")
     
     # Strategy Selection
     st.sidebar.subheader("📊 Strategy")
@@ -3921,6 +4038,9 @@ def render_live_trading_ui(config):
             st.session_state['position'] = None
             st.session_state['broker_position'] = None
             st.session_state['live_logs'] = []
+            st.session_state['last_exit_time'] = None
+            st.session_state['last_signal_type'] = None
+            st.session_state['clearing_in_progress'] = False
             
             # Initialize trade history if not exists
             if 'trade_history' not in st.session_state:
@@ -3938,6 +4058,7 @@ def render_live_trading_ui(config):
             add_log(f"📋 Asset: {config.get('asset', 'N/A')} | Interval: {config.get('interval', 'N/A')}")
             add_log(f"📋 SL Type: {config.get('sl_type', 'N/A')} | Target Type: {config.get('target_type', 'N/A')}")
             add_log(f"📋 Quantity: {config.get('quantity', 'N/A')}")
+            add_log(f"⏱️ Entry Cooldown: {config.get('entry_cooldown_seconds', 60)}s")
             
             # Initialize broker if enabled
             if config.get('dhan_enabled', False):
