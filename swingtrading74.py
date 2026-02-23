@@ -23,6 +23,7 @@ import time
 import pytz
 import traceback
 import plotly.graph_objects as go
+from scipy.signal import argrelextrema
 
 # ================================
 # CONSTANTS & MAPPINGS
@@ -1495,89 +1496,64 @@ def check_bollinger_squeeze_breakout(df, idx, config, current_position):
 
 def check_elliott_waves_ratio_charts(df, idx, config, current_position):
     """
-    Elliott Waves + Ratio Charts Strategy
-    Combines Elliott Wave pattern detection with ratio chart analysis
-    Signals when both Elliott Wave and Ratio Chart indicators align
+    Elliott Waves Strategy (Simplified with argrelextrema)
+    Detects extrema points and identifies 5-wave patterns
     """
     if current_position is not None:
         return None, None
-    if idx < 50:
-        return None, None
     
     # Parameters
-    reference_ticker = config.get('elliott_reference_ticker', 'SPY')
-    ratio_threshold = config.get('elliott_ratio_threshold', 1.0)
-    wave_lookback = config.get('elliott_wave_lookback', 13)
-    ema_period = config.get('elliott_ema_period', 21)
+    wave_lookback = config.get('elliott_wave_lookback', 50)
     
-    # Elliott Wave Detection (Simplified)
-    # Looking for 5-wave pattern in price
-    if f'EW_Signal' not in df.columns:
-        # Calculate pivot points for wave detection
-        window = wave_lookback
-        df['EW_Pivot_High'] = df['High'].rolling(window=window, center=True).max()
-        df['EW_Pivot_Low'] = df['Low'].rolling(window=window, center=True).min()
+    if idx < wave_lookback:
+        return None, None
+    
+    # Calculate extrema if not already done
+    if 'Wave_Extrema' not in df.columns:
+        df['Wave_Extrema'] = 0
         
-        # Detect wave structure
-        df['EW_Trend'] = np.where(df['Close'] > df['Close'].shift(1), 1, -1)
-        df['EW_Signal'] = 0  # 0=no signal, 1=bullish wave complete, -1=bearish wave complete
+        # Get recent data for analysis
+        if len(df) >= wave_lookback:
+            # Find local maxima and minima
+            highs_idx = argrelextrema(df['High'].values, np.greater, order=5)[0]
+            lows_idx = argrelextrema(df['Low'].values, np.less, order=5)[0]
+            
+            # Mark extrema points
+            for h_idx in highs_idx:
+                if h_idx < len(df):
+                    df.iloc[h_idx, df.columns.get_loc('Wave_Extrema')] = 1
+            
+            for l_idx in lows_idx:
+                if l_idx < len(df):
+                    df.iloc[l_idx, df.columns.get_loc('Wave_Extrema')] = 1
+    
+    # Get recent window for wave detection
+    recent_start = max(0, idx - wave_lookback)
+    recent = df.iloc[recent_start:idx+1]
+    
+    # Find extrema indices in recent window
+    extrema_mask = recent['Wave_Extrema'] == 1
+    extrema_indices = recent[extrema_mask].index.tolist()
+    
+    bullish = False
+    bearish = False
+    
+    # Need at least 5 extrema points for wave pattern
+    if len(extrema_indices) >= 5:
+        # Get last 5 extrema prices
+        wave_prices = df.loc[extrema_indices[-5:], 'Close'].values
         
-        # Simplified wave counting: look for 5 consecutive higher highs (bullish) or lower lows (bearish)
-        for i in range(window, len(df)):
-            recent_highs = df['High'].iloc[i-window:i]
-            recent_lows = df['Low'].iloc[i-window:i]
-            
-            # Count consecutive higher highs
-            higher_highs = 0
-            for j in range(len(recent_highs)-1):
-                if recent_highs.iloc[j+1] > recent_highs.iloc[j]:
-                    higher_highs += 1
-            
-            # Count consecutive lower lows
-            lower_lows = 0
-            for j in range(len(recent_lows)-1):
-                if recent_lows.iloc[j+1] < recent_lows.iloc[j]:
-                    lower_lows += 1
-            
-            # Signal when 5-wave pattern detected
-            if higher_highs >= 5:
-                df.loc[df.index[i], 'EW_Signal'] = 1  # Bullish wave complete
-            elif lower_lows >= 5:
-                df.loc[df.index[i], 'EW_Signal'] = -1  # Bearish wave complete
+        # Simplified wave detection pattern: High-Low-High-Low-High (or reverse)
+        # Bullish: Wave completes with lower low (wave 4 < wave 2)
+        if (wave_prices[0] < wave_prices[1] > wave_prices[2] < wave_prices[3] > wave_prices[4]):
+            bullish = wave_prices[4] < wave_prices[2]
+            bearish = wave_prices[4] > wave_prices[2]
     
-    # Ratio Chart Calculation
-    if f'Ratio_Chart' not in df.columns:
-        # For simplicity, calculate ratio between current price and reference EMA
-        # In live implementation, this would fetch reference_ticker data and calculate ratio
-        # Here we use price/EMA as proxy for ratio analysis
-        df['Ratio_EMA'] = df['Close'].rolling(ema_period).mean()
-        df['Ratio_Chart'] = df['Close'] / df['Ratio_EMA']
-        df['Ratio_MA'] = df['Ratio_Chart'].rolling(10).mean()
-    
-    current = df.iloc[idx]
-    previous = df.iloc[idx - 1]
-    
-    ew_signal = current.get('EW_Signal', 0)
-    ratio = current.get('Ratio_Chart', 1.0)
-    ratio_ma = current.get('Ratio_MA', 1.0)
-    ratio_prev = previous.get('Ratio_Chart', 1.0)
-    
-    # Check for alignment between Elliott Wave and Ratio Chart
-    # Bullish: EW bullish wave complete + Ratio breaking above threshold
-    if ew_signal == 1:
-        # Ratio chart confirms bullish momentum
-        if ratio > ratio_threshold and ratio > ratio_ma:
-            # Additional confirmation: ratio crossing above MA
-            if ratio_prev <= previous.get('Ratio_MA', 1.0):
-                return 'BUY', current['Close']
-    
-    # Bearish: EW bearish wave complete + Ratio breaking below threshold
-    if ew_signal == -1:
-        # Ratio chart confirms bearish momentum
-        if ratio < (2.0 - ratio_threshold) and ratio < ratio_ma:
-            # Additional confirmation: ratio crossing below MA
-            if ratio_prev >= previous.get('Ratio_MA', 1.0):
-                return 'SELL', current['Close']
+    # Generate signals
+    if bullish:
+        return 'BUY', df.iloc[idx]['Close']
+    elif bearish:
+        return 'SELL', df.iloc[idx]['Close']
     
     return None, None
 
@@ -2680,10 +2656,19 @@ def live_trading_iteration():
         return
     
     # Fetch fresh data
-    ticker = config.get('asset', 'NIFTY 50')
+    position = st.session_state.get('position')
+    
+    # Use ticker from active position if exists, otherwise from config
+    if position is not None and 'ticker' in position:
+        ticker = position['ticker']
+        custom_ticker = position.get('custom_ticker')
+        add_log(f"📊 Using locked ticker from position: {ticker}")
+    else:
+        ticker = config.get('asset', 'NIFTY 50')
+        custom_ticker = config.get('custom_ticker', None)
+    
     interval = INTERVAL_MAPPING.get(config.get('interval', '1 day'), '1d')
     period = PERIOD_MAPPING.get(config.get('period', '1 month'), '1mo')
-    custom_ticker = config.get('custom_ticker', None)
     
     df = fetch_data(ticker, interval, period, is_live_trading=True, custom_ticker=custom_ticker)
     
@@ -2780,10 +2765,13 @@ def live_trading_iteration():
                 'quantity': config.get('quantity', 1),
                 'highest_price': entry_price,
                 'lowest_price': entry_price,
+                'ticker': config.get('asset', 'NIFTY 50'),  # Store ticker with position
+                'custom_ticker': config.get('custom_ticker'),  # Store custom ticker too
             }
             
             st.session_state['position'] = position
             add_log(f"✅ Position created in session state")
+            add_log(f"📊 Locked ticker: {position['ticker']}")
             
             # Place broker order if enabled
             if config.get('dhan_enabled', False):
@@ -3163,12 +3151,9 @@ def render_config_ui():
         st.sidebar.info("📊 Low volatility squeeze → High probability breakout")
     
     elif config['strategy'] == 'Elliott Waves + Ratio Charts':
-        st.sidebar.markdown("**Elliott Waves + Ratio Charts Parameters**")
-        config['elliott_wave_lookback'] = st.sidebar.number_input("Wave Lookback Period", min_value=5, value=13)
-        config['elliott_ema_period'] = st.sidebar.number_input("Ratio EMA Period", min_value=5, value=21)
-        config['elliott_ratio_threshold'] = st.sidebar.number_input("Ratio Threshold", min_value=0.5, value=1.0, step=0.1)
-        config['elliott_reference_ticker'] = st.sidebar.text_input("Reference Ticker (Optional)", value="SPY", help="Used for ratio calculation")
-        st.sidebar.info("🌊 Elliott Wave patterns + Ratio chart confirmation")
+        st.sidebar.markdown("**Elliott Waves Parameters**")
+        config['elliott_wave_lookback'] = st.sidebar.number_input("Wave Lookback Period", min_value=20, value=50)
+        st.sidebar.info("🌊 Detects extrema points and identifies 5-wave patterns using argrelextrema")
     
     elif config['strategy'] == 'Custom Strategy':
         st.sidebar.markdown("**🛠️ Custom Strategy Builder (Multi-Indicator)**")
@@ -4329,6 +4314,10 @@ def render_live_trading_ui(config):
         with col1:
             st.metric("Quantity", position['quantity'])
         with col2:
+            # Display locked ticker
+            locked_ticker = position.get('ticker', 'N/A')
+            st.metric("Locked Ticker", locked_ticker)
+        with col3:
             if current_data is not None:
                 current_price = current_data['Close']
                 if position['type'] == 'LONG':
@@ -4340,13 +4329,14 @@ def render_live_trading_ui(config):
                 st.metric("Current P&L", f"₹{current_pnl:.2f}", delta=f"₹{current_pnl:.2f}")
             else:
                 st.metric("Current P&L", "N/A")
-        with col3:
-            st.metric("Highest Price", f"₹{position.get('highest_price', 0):.2f}")
         with col4:
-            st.metric("Lowest Price", f"₹{position.get('lowest_price', 0):.2f}")
+            st.metric("Highest Price", f"₹{position.get('highest_price', 0):.2f}")
         with col5:
-            price_range = position.get('highest_price', 0) - position.get('lowest_price', 0)
-            st.metric("Price Range", f"₹{price_range:.2f}")
+            st.metric("Lowest Price", f"₹{position.get('lowest_price', 0):.2f}")
+        
+        # Show warning about locked ticker
+        if position.get('ticker') != config.get('asset'):
+            st.warning(f"⚠️ Position locked to {position.get('ticker')}. Config changes won't affect active position.")
         
         # Entry time
         st.info(f"**Entry Time:** {position['entry_time'].strftime('%Y-%m-%d %H:%M:%S')}")
@@ -4386,6 +4376,54 @@ def render_live_trading_ui(config):
         # Display raw API response
         with st.expander("📄 Raw API Response"):
             st.json(broker_pos['raw_response'])
+    
+    # Display completed trades (immediate update)
+    st.subheader("✅ Completed Trades")
+    
+    trade_history = st.session_state.get('trade_history', [])
+    if trade_history:
+        df_history = pd.DataFrame(trade_history)
+        
+        # Format columns
+        for col in ['entry_price', 'exit_price', 'pnl', 'net_pnl', 'brokerage', 'sl_price', 'target_price']:
+            if col in df_history.columns:
+                df_history[col] = df_history[col].apply(
+                    lambda x: f"₹{x:.2f}" if pd.notna(x) else "—"
+                )
+        
+        # Calculate duration if available
+        if 'entry_time' in df_history.columns and 'exit_time' in df_history.columns:
+            df_history['duration'] = df_history.apply(
+                lambda row: f"{int((row['exit_time'] - row['entry_time']).total_seconds() / 60)} min" 
+                if pd.notna(row['entry_time']) and pd.notna(row['exit_time']) else "—",
+                axis=1
+            )
+        
+        # Show summary metrics
+        col1, col2, col3, col4 = st.columns(4)
+        with col1:
+            st.metric("Total Trades", len(df_history))
+        with col2:
+            profitable = len(df_history[df_history['pnl'].str.replace('₹', '').str.replace(',', '').astype(float) > 0])
+            st.metric("Winning", profitable)
+        with col3:
+            if 'pnl' in df_history.columns:
+                total_pnl = df_history['pnl'].str.replace('₹', '').str.replace(',', '').astype(float).sum()
+                st.metric("Total P&L", f"₹{total_pnl:.2f}")
+        with col4:
+            if 'net_pnl' in df_history.columns:
+                total_net_pnl = df_history['net_pnl'].str.replace('₹', '').str.replace(',', '').astype(float).sum()
+                st.metric("Net P&L", f"₹{total_net_pnl:.2f}")
+        
+        # Display trade table
+        display_cols = ['entry_time', 'exit_time', 'type', 'entry_price', 'exit_price', 'pnl', 'net_pnl', 'exit_reason']
+        if 'duration' in df_history.columns:
+            display_cols.insert(3, 'duration')
+        
+        df_display = df_history[[c for c in display_cols if c in df_history.columns]]
+        st.dataframe(df_display, use_container_width=True, height=200)
+    else:
+        st.info("No completed trades yet. Trades will appear here immediately after exit.")
     
     # Display logs
     st.subheader("📝 Trading Logs")
