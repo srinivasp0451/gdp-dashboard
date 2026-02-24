@@ -2856,7 +2856,7 @@ def live_trading_iteration():
             
             st.session_state['position'] = position
             add_log(f"✅ Position created in session state")
-            add_log(f"📊 Locked ticker: {position['ticker']}")
+            add_log(f"📊 Locked ticker: {position['ticker']} | Entry Price: ₹{entry_price:.2f}")
             
             # Place broker order if enabled
             if config.get('dhan_enabled', False):
@@ -2906,6 +2906,13 @@ def live_trading_iteration():
     else:
         # Position exists - monitor for exit
         add_log(f"📊 Monitoring {position['type']} position @ {current_price:.2f}")
+        
+        # Sanity check: verify current price is reasonable compared to entry
+        price_diff_pct = abs(current_price - position['entry_price']) / position['entry_price'] * 100
+        if price_diff_pct > 50:
+            add_log(f"⚠️ WARNING: Current price ₹{current_price:.2f} differs by {price_diff_pct:.1f}% from entry ₹{position['entry_price']:.2f}")
+            add_log(f"⚠️ Expected ticker: {position.get('ticker', 'Unknown')}")
+            add_log(f"⚠️ If this is wrong, there may be a ticker mismatch issue!")
         
         # Update tracking
         position['highest_price'] = max(position['highest_price'], current_price)
@@ -2987,6 +2994,32 @@ def live_trading_iteration():
         
         # Exit if conditions met
         if exit_reason:
+            # Validate exit price is reasonable (within 50% of entry to catch ticker mismatch)
+            price_change_pct = abs(exit_price - position['entry_price']) / position['entry_price'] * 100
+            
+            if price_change_pct > 50:
+                add_log(f"⚠️ WARNING: Exit price {exit_price:.2f} differs by {price_change_pct:.1f}% from entry {position['entry_price']:.2f}")
+                add_log(f"⚠️ Possible ticker mismatch! Fetching fresh data to verify...")
+                
+                # Re-fetch data with locked ticker to get correct price
+                locked_ticker = position.get('ticker', config.get('asset', 'NIFTY 50'))
+                locked_custom = position.get('custom_ticker')
+                
+                add_log(f"📊 Re-fetching with locked ticker: {locked_ticker}")
+                
+                df_verify = fetch_data(locked_ticker, interval, period, is_live_trading=True, custom_ticker=locked_custom)
+                
+                if df_verify is not None and not df_verify.empty:
+                    verified_price = df_verify.iloc[-1]['Close']
+                    add_log(f"✅ Verified current price: ₹{verified_price:.2f}")
+                    
+                    # Use verified price if it's more reasonable
+                    verified_change_pct = abs(verified_price - position['entry_price']) / position['entry_price'] * 100
+                    if verified_change_pct < price_change_pct:
+                        add_log(f"✅ Using verified price (change: {verified_change_pct:.1f}%) instead of {exit_price:.2f} (change: {price_change_pct:.1f}%)")
+                        exit_price = verified_price
+                        current_price = verified_price  # Update for SL/Target checks too
+            
             # Calculate P&L
             if position['type'] == 'LONG':
                 pnl = (exit_price - position['entry_price']) * position['quantity']
@@ -2998,7 +3031,7 @@ def live_trading_iteration():
             net_pnl = pnl - brokerage
             
             add_log(f"🚪 EXITING POSITION: {exit_reason} @ {exit_price:.2f}")
-            add_log(f"💰 P&L: ₹{pnl:.2f}")
+            add_log(f"💰 P&L: ₹{pnl:.2f} | Entry: ₹{position['entry_price']:.2f} | Exit: ₹{exit_price:.2f}")
             if config.get('include_brokerage', False):
                 add_log(f"💸 Brokerage: ₹{brokerage:.2f}")
                 add_log(f"💵 Net P&L: ₹{net_pnl:.2f}")
@@ -3019,7 +3052,9 @@ def live_trading_iteration():
                 'brokerage': brokerage,
                 'net_pnl': net_pnl,
                 'exit_reason': exit_reason,
-                'price_range': position.get('highest_price', exit_price) - position.get('lowest_price', exit_price)
+                'price_range': position.get('highest_price', exit_price) - position.get('lowest_price', exit_price),
+                'ticker': position.get('ticker', 'Unknown'),  # Store ticker for debugging
+                'price_change_pct': abs(exit_price - position['entry_price']) / position['entry_price'] * 100
             }
             
             if 'trade_history' not in st.session_state:
@@ -4527,12 +4562,24 @@ def render_live_trading_ui(config):
                 st.metric("Net P&L", f"₹{total_net_pnl:.2f}")
         
         # Display trade table
-        display_cols = ['entry_time', 'exit_time', 'type', 'entry_price', 'exit_price', 'pnl', 'net_pnl', 'exit_reason']
+        display_cols = ['entry_time', 'exit_time', 'ticker', 'type', 'entry_price', 'exit_price', 'pnl', 'net_pnl', 'exit_reason']
         if 'duration' in df_history.columns:
             display_cols.insert(3, 'duration')
         
+        # Add warning column for suspicious trades
+        if 'price_change_pct' in df_history.columns:
+            df_history['⚠️'] = df_history['price_change_pct'].apply(
+                lambda x: '⚠️ CHECK' if pd.notna(x) and x > 50 else ''
+            )
+            display_cols.append('⚠️')
+        
         df_display = df_history[[c for c in display_cols if c in df_history.columns]]
         st.dataframe(df_display, use_container_width=True, height=200)
+        
+        # Show warning if any suspicious trades
+        suspicious_trades = len(df_history[df_history.get('price_change_pct', pd.Series([0])) > 50])
+        if suspicious_trades > 0:
+            st.warning(f"⚠️ {suspicious_trades} trade(s) have large price changes (>50%). Check logs for verification details.")
     else:
         st.info("No completed trades yet. Trades will appear here immediately after exit.")
     
