@@ -90,6 +90,7 @@ SL_TYPES = [
     "Current Swing Low/High",
     "Previous Swing Low/High",
     "Signal-based (Reverse Crossover)",
+    "Strategy-based Signal",
     "Trailing SL (Points)",
     "Trailing Profit (Rupees)",
     "Trailing Loss (Rupees)",
@@ -115,7 +116,8 @@ TARGET_TYPES = [
     "Previous Swing Low/High",
     "ATR-based",
     "Risk-Reward Based",
-    "Signal-based (Reverse Crossover)"
+    "Signal-based (Reverse Crossover)",
+    "Strategy-based Signal"
 ]
 
 EMA_ENTRY_FILTERS = [
@@ -1741,6 +1743,10 @@ def calculate_initial_sl(position_type, entry_price, df, idx, config):
         # No initial SL, will be set on reverse crossover
         return None
     
+    elif sl_type == 'Strategy-based Signal':
+        # No price-based SL, exits only on strategy signal
+        return None
+    
     elif sl_type in ['Trailing SL (Points)', 'Trailing Profit (Rupees)', 'Trailing Loss (Rupees)',
                      'Trailing SL + Current Candle', 'Trailing SL + Previous Candle',
                      'Trailing SL + Current Swing', 'Trailing SL + Previous Swing',
@@ -1912,6 +1918,11 @@ def calculate_initial_target(position_type, entry_price, df, idx, config):
     
     elif target_type == 'Signal-based (Reverse Crossover)':
         # No price-based target - exit only on reverse signal
+        # Return None to disable price target checks
+        return None
+    
+    elif target_type == 'Strategy-based Signal':
+        # No price-based target - exit only on strategy signal
         # Return None to disable price target checks
         return None
     
@@ -2481,14 +2492,16 @@ def run_backtest(df, config):
             # Check signal-based exit (for both SL and Target types)
             if exit_reason is None and (
                 config.get('sl_type') == 'Signal-based (Reverse Crossover)' or 
-                config.get('target_type') == 'Signal-based (Reverse Crossover)'
+                config.get('target_type') == 'Signal-based (Reverse Crossover)' or
+                config.get('sl_type') == 'Strategy-based Signal' or
+                config.get('target_type') == 'Strategy-based Signal'
             ):
                 signal, _ = strategy_func(df, idx, config, position)
                 if signal:
-                    # Reverse signal detected
+                    # Check for opposite signal (reverse)
                     if (position['type'] == 'LONG' and signal in ('SELL', 'SHORT')) or \
                        (position['type'] == 'SHORT' and signal in ('BUY', 'LONG')):
-                        exit_reason = 'Signal Exit'
+                        exit_reason = 'Strategy Signal Exit'
                         exit_price = current_price
             
             # Exit position if conditions met
@@ -2670,19 +2683,82 @@ def live_trading_iteration():
     interval = INTERVAL_MAPPING.get(config.get('interval', '1 day'), '1d')
     period = PERIOD_MAPPING.get(config.get('period', '1 month'), '1mo')
     
-    df = fetch_data(ticker, interval, period, is_live_trading=True, custom_ticker=custom_ticker)
+    # Enhanced Live Trading Mode
+    enhanced_mode = config.get('enhanced_live_trading', False)
     
-    if df is None or df.empty:
-        add_log("❌ Failed to fetch data")
-        return
-    
-    # Calculate indicators
-    df = calculate_all_indicators(df, config)
-    
-    # Get current data
-    idx = len(df) - 1
-    current_data = df.iloc[idx]
-    current_price = current_data['Close']
+    if enhanced_mode:
+        # Check if current time is at round interval
+        current_time = datetime.now(pytz.timezone('Asia/Kolkata'))
+        
+        # Determine interval minutes
+        interval_minutes = {
+            '1m': 1, '5m': 5, '15m': 15, '30m': 30, '1h': 60
+        }.get(interval, 1)
+        
+        # Check if at round time (e.g., 10:30:00, 10:31:00 for 1m)
+        is_round_time = (current_time.minute % interval_minutes == 0 and current_time.second < 5)
+        
+        # Get last candlestick fetch time
+        last_candle_fetch = st.session_state.get('last_candle_fetch_time')
+        
+        # Fetch candlestick data if at round time and haven't fetched recently
+        if is_round_time and (last_candle_fetch is None or 
+                              (current_time - last_candle_fetch).total_seconds() >= interval_minutes * 60):
+            add_log(f"🔄 Enhanced Mode: Fetching candlestick data at round time {current_time.strftime('%H:%M:%S')}")
+            
+            # Fetch candlestick data for indicators
+            df_candles = fetch_data(ticker, interval, period, is_live_trading=True, custom_ticker=custom_ticker)
+            
+            if df_candles is not None and not df_candles.empty:
+                # Calculate indicators on candlestick data
+                df_candles = calculate_all_indicators(df_candles, config)
+                
+                # Store in session for use
+                st.session_state['indicator_df'] = df_candles
+                st.session_state['last_candle_fetch_time'] = current_time
+                add_log(f"✅ Indicators calculated from {len(df_candles)} candles")
+        
+        # Get indicator dataframe (use stored if available, otherwise fetch new)
+        df = st.session_state.get('indicator_df')
+        
+        if df is None or df.empty:
+            add_log("⚠️ No indicator data available, fetching fresh data")
+            df = fetch_data(ticker, interval, period, is_live_trading=True, custom_ticker=custom_ticker)
+            if df is None or df.empty:
+                add_log("❌ Failed to fetch data")
+                return
+            df = calculate_all_indicators(df, config)
+            st.session_state['indicator_df'] = df
+        
+        # Fetch separate live data for current price (SL/Target checks)
+        df_live = fetch_data(ticker, interval, period, is_live_trading=True, custom_ticker=custom_ticker)
+        
+        if df_live is None or df_live.empty:
+            add_log("❌ Failed to fetch live data")
+            return
+        
+        # Use live data for current price
+        current_data = df_live.iloc[-1].copy()
+        current_price = current_data['Close']
+        
+        # But use indicator data for strategy checks
+        idx = len(df) - 1
+        
+    else:
+        # Standard mode: fetch once and use for everything
+        df = fetch_data(ticker, interval, period, is_live_trading=True, custom_ticker=custom_ticker)
+        
+        if df is None or df.empty:
+            add_log("❌ Failed to fetch data")
+            return
+        
+        # Calculate indicators
+        df = calculate_all_indicators(df, config)
+        
+        # Get current data
+        idx = len(df) - 1
+        current_data = df.iloc[idx]
+        current_price = current_data['Close']
     
     # Store current data in session
     st.session_state['current_data'] = current_data
@@ -2888,15 +2964,17 @@ def live_trading_iteration():
         # Check signal-based exit (for both SL and Target types)
         if exit_reason is None and (
             config.get('sl_type') == 'Signal-based (Reverse Crossover)' or 
-            config.get('target_type') == 'Signal-based (Reverse Crossover)'
+            config.get('target_type') == 'Signal-based (Reverse Crossover)' or
+            config.get('sl_type') == 'Strategy-based Signal' or
+            config.get('target_type') == 'Strategy-based Signal'
         ):
             signal, _ = strategy_func(df, idx, config, position)
             if signal:
                 if (position['type'] == 'LONG' and signal in ('SELL', 'SHORT')) or \
                    (position['type'] == 'SHORT' and signal in ('BUY', 'LONG')):
-                    exit_reason = 'Signal Exit'
+                    exit_reason = 'Strategy Signal Exit'
                     exit_price = current_price
-                    add_log(f"🔄 REVERSE SIGNAL DETECTED: {signal}")
+                    add_log(f"🔄 STRATEGY SIGNAL DETECTED: {signal}")
         
         # Exit if conditions met
         if exit_reason:
@@ -3069,6 +3147,25 @@ def render_config_ui():
         help="Prevents immediate re-entry after exit (Live Trading only). Useful to avoid duplicate orders on same signal."
     )
     st.sidebar.caption(f"Cooldown: {config['entry_cooldown_seconds']}s wait after exit before new entry")
+    
+    # ── Enhanced Live Trading Mode ────────────────────────────────────────────
+    config['enhanced_live_trading'] = st.sidebar.checkbox(
+        "🔄 Enhanced Live Trading (TradingView Match)",
+        value=False,
+        help=(
+            "When enabled, fetches candlestick data at round time intervals matching your timeframe "
+            "(e.g., 10:30:00, 10:31:00 for 1min; 10:30:00, 10:35:00 for 5min). "
+            "Uses candlestick data for indicators and live data for SL/Target checks. "
+            "Ensures indicator values match TradingView."
+        )
+    )
+    if config['enhanced_live_trading']:
+        st.sidebar.info(
+            "📊 Enhanced Mode Active:\n"
+            "- Indicators calculated from round-time candles\n"
+            "- Live data used for SL/Target checks\n"
+            "- Matches TradingView indicator values"
+        )
     
     # Strategy Selection
     st.sidebar.subheader("📊 Strategy")
@@ -3441,7 +3538,7 @@ def render_config_ui():
     
     if config['dhan_enabled']:
         config['dhan_client_id'] = st.sidebar.text_input("Client ID", value="1104779876")
-        config['dhan_access_token'] = st.sidebar.text_input("Access Token", type="password", value="eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzUxMiJ9.eyJpc3MiOiJkaGFuIiwicGFydG5lcklkIjoiIiwiZXhwIjoxNzcxOTg5NTc2LCJpYXQiOjE3NzE5MDMxNzYsInRva2VuQ29uc3VtZXJUeXBlIjoiU0VMRiIsIndlYmhvb2tVcmwiOiIiLCJkaGFuQ2xpZW50SWQiOiIxMTA0Nzc5ODc2In0.dRi_IT5yFmGcLIdBfywr-4JLYcqFfL5qNEqjJtw3D-HiahpakwY9HgzDEzpQ0trdh1hiy5uUUtuAaT9UpBkEDg")
+        config['dhan_access_token'] = st.sidebar.text_input("Access Token", type="password", value="eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzUxMiJ9.eyJpc3MiOiJkaGFuIiwicGFydG5lcklkIjoiIiwiZXhwIjoxNzcxMTQzMjM5LCJpYXQiOjE3NzEwNTY4MzksInRva2VuQ29uc3VtZXJUeXBlIjoiU0VMRiIsIndlYmhvb2tVcmwiOiIiLCJkaGFuQ2xpZW50SWQiOiIxMTA0Nzc5ODc2In0.qP8kVXDQt-sFa6LWJqd1MRTPESHCCPCqHzEnjsFI2WVbNdywKHXgAKHxVpuH6tP_AJTdqowv9nbqf-2NcGibbQ")
         
         config['dhan_is_options'] = st.sidebar.checkbox("Is Options", value=True)
         
@@ -4026,6 +4123,8 @@ def render_live_trading_ui(config):
             st.session_state['last_exit_time'] = None
             st.session_state['last_signal_type'] = None
             st.session_state['clearing_in_progress'] = False
+            st.session_state['indicator_df'] = None
+            st.session_state['last_candle_fetch_time'] = None
             
             # Initialize trade history if not exists
             if 'trade_history' not in st.session_state:
@@ -4044,6 +4143,9 @@ def render_live_trading_ui(config):
             add_log(f"📋 SL Type: {config.get('sl_type', 'N/A')} | Target Type: {config.get('target_type', 'N/A')}")
             add_log(f"📋 Quantity: {config.get('quantity', 'N/A')}")
             add_log(f"⏱️ Entry Cooldown: {config.get('entry_cooldown_seconds', 60)}s")
+            
+            if config.get('enhanced_live_trading', False):
+                add_log("🔄 Enhanced Live Trading Mode ENABLED - indicators will match TradingView")
             
             # Initialize broker if enabled
             if config.get('dhan_enabled', False):
