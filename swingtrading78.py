@@ -298,7 +298,8 @@ def build_chain_df(calls, puts, expiry, spot):
             df[c] = 0
     df["PE_changeOI"] = 0
     df = df.fillna(0)
-    df = df[(df["CE_LTP"] + df["PE_LTP"]) > 0].reset_index(drop=True)
+    # Keep any row with a valid strike — don't filter by LTP (market may be pre/post hours)
+    df = df[df["strikePrice"] > 0].reset_index(drop=True)
     return df
 
 
@@ -611,8 +612,8 @@ def plot_chain(df, spot):
                               line=dict(color="#00ff88", width=2)), 2, 1)
     fig.add_trace(go.Scatter(name="PE IV", x=x, y=sub["PE_IV"], mode="lines+markers",
                               line=dict(color="#ff3b5c", width=2)), 2, 1)
-    fig.add_trace(go.Bar(name="CE Vol", x=x, y=sub["CE_volume"], marker_color="#00ff8866"), 2, 2)
-    fig.add_trace(go.Bar(name="PE Vol", x=x, y=sub["PE_volume"], marker_color="#ff3b5c66"), 2, 2)
+    fig.add_trace(go.Bar(name="CE Vol", x=x, y=sub["CE_volume"], marker_color="rgba(0,255,136,0.4)"), 2, 2)
+    fig.add_trace(go.Bar(name="PE Vol", x=x, y=sub["PE_volume"], marker_color="rgba(255,59,92,0.4)"), 2, 2)
     for r in [1, 2]:
         for c in [1, 2]: vl(fig, spot, "Spot", row=r, col=c)
     fig.update_layout(template=DARK, height=520, barmode="group",
@@ -636,9 +637,9 @@ def plot_oi(df, spot, sig):
     fig.add_trace(go.Bar(name="ΔPE", x=x, y=sub["PE_changeOI"],
                           marker_color=["#ff9500" if v >= 0 else "#8888ff" for v in sub["PE_changeOI"]]), 2, 1)
     fig.add_trace(go.Bar(name="CE%", x=x, y=sub["CE_pct"],
-                          marker_color=["#00ff8877" if v >= 0 else "#ff3b5c77" for v in sub["CE_pct"]]), 3, 1)
+                          marker_color=["rgba(0,255,136,0.47)" if v >= 0 else "rgba(255,59,92,0.47)" for v in sub["CE_pct"]]), 3, 1)
     fig.add_trace(go.Bar(name="PE%", x=x, y=sub["PE_pct"],
-                          marker_color=["#ff950077" if v >= 0 else "#8888ff77" for v in sub["PE_pct"]]), 3, 1)
+                          marker_color=["rgba(255,149,0,0.47)" if v >= 0 else "rgba(136,136,255,0.47)" for v in sub["PE_pct"]]), 3, 1)
     for row in [1, 2, 3]:
         vl(fig, spot, "Spot", row=row)
         if sig["resistance"]: vl(fig, sig["resistance"], "R", "#ff3b5c", "dot", row, 1)
@@ -706,8 +707,8 @@ def main():
     with st.sidebar:
         st.markdown("### ⚙️ Instrument")
         src_type = st.selectbox("Market", [
-            "🇮🇳 NSE India",
             "🇺🇸 US Stocks / ETFs",
+            "🇮🇳 NSE India",
             "📊 Spot-Only (BTC / Gold / FX)",
         ])
 
@@ -841,7 +842,7 @@ def main():
         return
 
     spot = float(spot)
-    has_chain = has_opts and not df_exp.empty
+    has_chain = not df_exp.empty and "strikePrice" in df_exp.columns and len(df_exp) > 0
 
     if has_chain:
         with st.spinner("🔢 Computing Greeks…"):
@@ -1155,8 +1156,8 @@ SL ₹{t['sl']:.2f} | Target ₹{t['target']:.2f}<br>
                 w = tdf[tdf["P&L(₹)"] > 0]["P&L(₹)"]
                 l = tdf[tdf["P&L(₹)"] <= 0]["P&L(₹)"]
                 fig_d = go.Figure()
-                fig_d.add_trace(go.Histogram(x=w, name="Wins",   marker_color="#00ff8877", nbinsx=20))
-                fig_d.add_trace(go.Histogram(x=l, name="Losses", marker_color="#ff3b5c77", nbinsx=20))
+                fig_d.add_trace(go.Histogram(x=w, name="Wins",   marker_color="rgba(0,255,136,0.47)", nbinsx=20))
+                fig_d.add_trace(go.Histogram(x=l, name="Losses", marker_color="rgba(255,59,92,0.47)",  nbinsx=20))
                 fig_d.update_layout(template=DARK, height=240, title="P&L Distribution", barmode="overlay")
                 st.plotly_chart(fig_d, use_container_width=True)
                 st.dataframe(tdf, use_container_width=True, height=260)
