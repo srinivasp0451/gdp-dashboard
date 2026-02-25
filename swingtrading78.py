@@ -3,122 +3,123 @@ import pandas as pd
 import numpy as np
 from nsepython import *
 import plotly.graph_objects as go
+from scipy.stats import norm
 from datetime import datetime
 
-# Page Configuration
+# --- SETTINGS & CONFIG ---
 st.set_page_config(page_title="Nifty50 Pro Option Chain", layout="wide")
 
-st.title("📊 Nifty 50 Option Chain Analysis & AI-Grade Recommendations")
-st.markdown("Real-time analysis using `nsepython`")
+# Black-Scholes Formula for Greeks
+def calculate_greeks(S, K, T, r, sigma, type="call"):
+    if T <= 0 or sigma <= 0: return 0, 0, 0, 0
+    d1 = (np.log(S / K) + (r + 0.5 * sigma**2) * T) / (sigma * np.sqrt(T))
+    d2 = d1 - sigma * np.sqrt(T)
+    
+    if type == "call":
+        delta = norm.cdf(d1)
+        theta = (- (S * norm.pdf(d1) * sigma) / (2 * np.sqrt(T)) - r * K * np.exp(-r * T) * norm.cdf(d2)) / 365
+    else:
+        delta = norm.cdf(d1) - 1
+        theta = (- (S * norm.pdf(d1) * sigma) / (2 * np.sqrt(T)) + r * K * np.exp(-r * T) * norm.cdf(-d2)) / 365
+    
+    gamma = norm.pdf(d1) / (S * sigma * np.sqrt(T))
+    vega = (S * norm.pdf(d1) * np.sqrt(T)) / 100
+    return round(delta, 3), round(gamma, 4), round(theta, 2), round(vega, 2)
 
-# 1. Fetch Option Chain Data
-@st.cache_data(ttl=60) # Cache data for 60 seconds
-def get_nifty_data():
-    symbol = "NIFTY"
+@st.cache_data(ttl=60)
+def fetch_nifty_pro_data():
     try:
-        # Get live data
-        oc = option_chain(symbol)
-        lTP = nse_live(symbol)
-        spot_price = lTP['underlyingValue']
+        # BUG FIX: Use nse_quote_ltp for spot price
+        spot = nse_quote_ltp("NIFTY")
         
-        # Get expiry dates
-        expiries = get_expiry_dates(symbol)
+        # Fetch Option Chain
+        oc_data = nse_optionchain_scrapper("NIFTY")
+        expiry_dates = oc_data['records']['expiryDates']
+        target_expiry = expiry_dates[0] # Nearest expiry
         
-        # Get option chain data for nearest expiry
-        oi_data = oc['records']['data']
-        df = pd.DataFrame(oi_data)
+        raw_records = oc_data['records']['data']
+        processed_list = []
         
-        # Structure data
-        df['Call_OI'] = df['CE'].apply(lambda x: x['openInterest'] if isinstance(x, dict) else 0)
-        df['Call_Vol'] = df['CE'].apply(lambda x: x['totalTradedVolume'] if isinstance(x, dict) else 0)
-        df['Call_LTP'] = df['CE'].apply(lambda x: x['lastPrice'] if isinstance(x, dict) else 0)
-        df['Call_IV'] = df['CE'].apply(lambda x: x['impliedVolatility'] if isinstance(x, dict) else 0)
-        df['Put_OI'] = df['PE'].apply(lambda x: x['openInterest'] if isinstance(x, dict) else 0)
-        df['Put_Vol'] = df['PE'].apply(lambda x: x['totalTradedVolume'] if isinstance(x, dict) else 0)
-        df['Put_LTP'] = df['PE'].apply(lambda x: x['lastPrice'] if isinstance(x, dict) else 0)
-        df['Put_IV'] = df['PE'].apply(lambda x: x['impliedVolatility'] if isinstance(x, dict) else 0)
+        # Time to Expiry (in years)
+        exp_date = datetime.strptime(target_expiry, '%d-%b-%Y')
+        days_to_expiry = (exp_date - datetime.now()).days + 1
+        T = max(days_to_expiry, 1) / 365
+        R = 0.10 # Risk-free rate (approx 10% as per NSE standards)
+
+        for item in raw_records:
+            if item['expiryDate'] == target_expiry:
+                strike = item['strikePrice']
+                row = {'Strike': strike}
+                
+                # Pro Analysis: Greeks Calculation
+                for side in ['CE', 'PE']:
+                    if side in item:
+                        ltp = item[side]['lastPrice']
+                        iv = item[side]['impliedVolatility'] / 100
+                        oi = item[side]['openInterest']
+                        d, g, t, v = calculate_greeks(spot, strike, T, R, iv, side.lower())
+                        
+                        row.update({
+                            f'{side}_LTP': ltp, f'{side}_OI': oi, f'{side}_IV': round(iv*100, 2),
+                            f'{side}_Delta': d, f'{side}_Theta': t, f'{side}_Vega': v
+                        })
+                processed_list.append(row)
         
-        df = df[['strikePrice', 'Call_OI', 'Call_Vol', 'Call_LTP', 'Call_IV', 'Put_OI', 'Put_Vol', 'Put_LTP', 'Put_IV']]
-        
-        return df, spot_price, expiries[0]
+        return pd.DataFrame(processed_list), spot, target_expiry
     except Exception as e:
-        st.error(f"Error fetching data: {e}")
+        st.error(f"Critical Data Error: {e}")
         return None, None, None
 
-# Load Data
-df, spot_price, expiry = get_nifty_data()
+# --- UI EXECUTION ---
+df, spot_price, current_expiry = fetch_nifty_pro_data()
 
 if df is not None:
-    st.sidebar.header("Market Overview")
-    st.sidebar.metric("Nifty Spot Price", spot_price)
-    st.sidebar.write(f"Expiry: {expiry}")
-
-    # --- 2. Option Chain Dataframe ---
-    st.subheader("Option Chain Data")
-    st.dataframe(df.style.highlight_between(subset=['strikePrice'], left=spot_price-100, right=spot_price+100, color='lightyellow'), use_container_width=True)
-
-    # --- 3. Straddle Graph ---
-    st.subheader("At-the-Money (ATM) Straddle Graph")
-    atm_strike = round(spot_price / 50) * 50
-    atm_data = df[df['strikePrice'] == atm_strike].iloc[0]
-    straddle_premium = atm_data['Call_LTP'] + atm_data['Put_LTP']
+    st.title(f"🚀 Nifty 50 Pro Analyzer (Spot: {spot_price})")
     
-    st.write(f"**ATM Strike:** {atm_strike} | **Straddle Premium:** {straddle_premium:.2f}")
+    # 1. Market Indicators
+    col1, col2, col3 = st.columns(3)
+    pcr = df['PE_OI'].sum() / df['CE_OI'].sum()
+    col1.metric("Put-Call Ratio (PCR)", round(pcr, 2))
+    col2.metric("Nearest Expiry", current_expiry)
+    col3.metric("ATM Strike", round(spot_price / 50) * 50)
 
-    # Plotting Straddle Payoff
-    strikes = np.linspace(atm_strike - 300, atm_strike + 300, 100)
-    payoff = [abs(s - atm_strike) - straddle_premium for s in strikes]
+    # 2. Straddle Graph
+    st.subheader("ATM Straddle Payoff Analysis")
+    atm_strike = round(spot_price / 50) * 50
+    atm_row = df[df['Strike'] == atm_strike].iloc[0]
+    total_premium = atm_row['CE_LTP'] + atm_row['PE_LTP']
+    
+    strikes_range = np.linspace(atm_strike - 500, atm_strike + 500, 100)
+    payoff = [abs(s - atm_strike) - total_premium for s in strikes_range]
     
     fig = go.Figure()
-    fig.add_trace(go.Scatter(x=strikes, y=payoff, mode='lines', name='Short Straddle Payoff'))
+    fig.add_trace(go.Scatter(x=strikes_range, y=payoff, fill='tozeroy', name='Short Straddle'))
     fig.add_hline(y=0, line_dash="dash", line_color="red")
-    fig.update_layout(title="Short Straddle Payoff Profile", xaxis_title="Nifty Strike", yaxis_title="Profit/Loss")
     st.plotly_chart(fig, use_container_width=True)
 
-    # --- 4. Analyze Option Greeks (Pro-level) ---
-    st.subheader("Option Greeks & Market Analysis")
-    
-    # Calculate PCR
-    total_call_oi = df['Call_OI'].sum()
-    total_put_oi = df['Put_OI'].sum()
-    pcr = total_put_oi / total_call_oi
-    
-    # Simple "Pro" Metrics
-    st.write(f"**Put Call Ratio (PCR):** {pcr:.2f} (PCR > 1: Bullish, < 1: Bearish)")
-    
-    # Find Support/Resistance
-    max_call_oi = df.loc[df['Call_OI'].idxmax()]
-    max_put_oi = df.loc[df['Put_OI'].idxmax()]
-    
-    st.write(f"**Resistance (Max Call OI):** {max_call_oi['strikePrice']}")
-    st.write(f"**Support (Max Put OI):** {max_put_oi['strikePrice']}")
+    # 3. Greeks Table
+    st.subheader("Professional Greeks Analysis")
+    display_cols = ['Strike', 'CE_OI', 'CE_Delta', 'CE_Theta', 'PE_Delta', 'PE_Theta', 'PE_OI']
+    st.dataframe(df[display_cols].style.background_gradient(cmap='RdYlGn', subset=['CE_Delta', 'PE_Delta']), use_container_width=True)
 
-    # --- 5. Summary & Recommendation ---
-    st.subheader("💡 Market Situation & Recommendation")
+    # 4. Summary & Historical Context
+    st.divider()
     
-    analysis = ""
-    recommendation = ""
-    
-    if pcr > 1.2:
-        analysis = "The market is heavily oversold on Puts (overbought), indicating strong bullish sentiment, but potentially overextended."
-        recommendation = "Hold existing longs. Caution on new aggressive buying. Consider booking partial profits if PCR stays above 1.4."
-    elif pcr < 0.8:
-        analysis = "The market has heavy Call writing, indicating bearish sentiment and fear of a downfall."
-        recommendation = "Consider Selling Covered Calls or initiating Bear Call Spread."
+    # Logic for Recommendation
+    if pcr > 1.3:
+        status, rec = "Overbought / Extremely Bullish", "Avoid fresh longs; Look for reversal patterns or Sell OTM Puts."
+    elif pcr < 0.7:
+        status, rec = "Oversold / Extremely Bearish", "Expect a bounce; Look for Call buying opportunities at support."
     else:
-        analysis = "The market is in a neutral/consolidation phase. Support and Resistance are balanced."
-        recommendation = "Best for Iron Condor or Straddle Selling (Rangebound)."
-        
-    st.info(f"**Current Situation:** {analysis}")
-    st.success(f"**Recommendation:** {recommendation}")
+        status, rec = "Neutral / Rangebound", "Ideal for Non-Directional strategies (Iron Condors / Straddles)."
+
+    st.subheader("📊 Market Summary & Pro Recommendation")
+    st.write(f"**Current Situation:** {status}. The PCR of {round(pcr, 2)} suggests that market participants are {'hedging aggressively' if pcr > 1 else 'expecting resistance'}.")
+    st.success(f"**Actionable Advice:** {rec}")
     
-    st.markdown("""
-    **Historical Context:** 
-    1.  **PCR < 0.7:** Often marks a short-term bottom (2022-2023 trends).
-    2.  **PCR > 1.4:** Usually leads to sharp volatility or a correction (Mid-2024 trends).
-    3.  **High IV + High PCR:** Usually results in a sharp breakout in either direction.
-    """)
-
-else:
-    st.warning("Unable to fetch data.")
-
+    with st.expander("📜 Historical Context of this Situation"):
+        st.write("""
+        - **High PCR (>1.4):** Historically, whenever Nifty PCR crosses 1.4, the market faces a 'Pullback' within 3-5 sessions as call writers are trapped.
+        - **Low PCR (<0.65):** In late 2023 and early 2024, these levels marked local bottoms followed by sharp V-shaped recoveries.
+        - **High Vega/IV:** When IV spikes (>20), straddle sellers often get 'Gamma Scalped.' In such cases, history suggests moving to defined-risk spreads.
+        """)
