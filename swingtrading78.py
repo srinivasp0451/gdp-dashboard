@@ -1,98 +1,75 @@
 import streamlit as st
+import yfinance as yf
 import pandas as pd
 import numpy as np
-import requests
-import yfinance as yf
 import time
 from scipy.stats import norm
 import plotly.graph_objects as go
 from datetime import datetime
 
 st.set_page_config(layout="wide")
-st.title("Professional Options Trading System (Buyer Bias)")
+st.title("Professional Multi-Asset Options Trading System")
 
 # =====================================================
-# BLACK SCHOLES GREEKS
+# BLACK SCHOLES
 # =====================================================
 
 def black_scholes_greeks(S, K, T, r, sigma, option_type="call"):
     if sigma <= 0 or T <= 0:
         return 0,0,0,0
 
-    d1 = (np.log(S/K) + (r + sigma**2/2)*T) / (sigma*np.sqrt(T))
+    d1 = (np.log(S/K)+(r+sigma**2/2)*T)/(sigma*np.sqrt(T))
     d2 = d1 - sigma*np.sqrt(T)
 
-    if option_type == "call":
-        delta = norm.cdf(d1)
-    else:
-        delta = -norm.cdf(-d1)
-
+    delta = norm.cdf(d1) if option_type=="call" else -norm.cdf(-d1)
     gamma = norm.pdf(d1)/(S*sigma*np.sqrt(T))
     theta = -(S*norm.pdf(d1)*sigma)/(2*np.sqrt(T))
     vega = S*norm.pdf(d1)*np.sqrt(T)
 
-    return delta, gamma, theta, vega
-
-# =====================================================
-# NSE OPTION CHAIN FETCH
-# =====================================================
-
-@st.cache_data(ttl=10)
-def fetch_nse_option_chain(symbol="NIFTY"):
-
-    base_url = "https://www.nseindia.com/"
-
-    if symbol in ["NIFTY", "BANKNIFTY", "FINNIFTY", "SENSEX"]:
-        url = f"https://www.nseindia.com/api/option-chain-indices?symbol={symbol}"
-    else:
-        url = f"https://www.nseindia.com/api/option-chain-equities?symbol={symbol}"
-
-    headers = {
-        "User-Agent": "Mozilla/5.0",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Accept-Encoding": "gzip, deflate, br"
-    }
-
-    session = requests.Session()
-    session.get(base_url, headers=headers)
-    response = session.get(url, headers=headers)
-
-    if response.status_code != 200:
-        return None
-
-    data = response.json()
-
-    if "records" in data:
-        records = data["records"]["data"]
-    elif "filtered" in data:
-        records = data["filtered"]["data"]
-    else:
-        return None
-
-    df = pd.json_normalize(records)
-    return df
+    return delta,gamma,theta,vega
 
 
 # =====================================================
-# YFINANCE FETCH WITH RATE LIMIT CONTROL
+# FETCH PRICE DATA (RATE LIMIT SAFE)
 # =====================================================
 
-@st.cache_data(ttl=10)
-def fetch_yf_data(ticker):
-    time.sleep(1.5)   # Rate limit protection
+@st.cache_data(ttl=15)
+def fetch_price_data(ticker):
+    time.sleep(1.5)
     data = yf.download(ticker, period="5d", interval="5m", progress=False)
     return data
 
 
 # =====================================================
-# BUYER BIAS SIGNAL ENGINE
+# FETCH OPTION CHAIN
 # =====================================================
 
-def generate_signal(price_change, oi_change, iv_change):
+@st.cache_data(ttl=15)
+def fetch_option_chain(ticker):
+    time.sleep(1.5)
+    tk = yf.Ticker(ticker)
+    expiries = tk.options
 
-    if price_change > 0 and oi_change > 0 and iv_change > 0:
+    if len(expiries) == 0:
+        return None, None, None
+
+    expiry = expiries[0]
+    chain = tk.option_chain(expiry)
+
+    calls = chain.calls
+    puts = chain.puts
+
+    return calls, puts, expiry
+
+
+# =====================================================
+# BUYER BIAS SIGNAL
+# =====================================================
+
+def generate_signal(price_change, iv_change):
+    if price_change > 0 and iv_change > 0:
         return "BUY CALL"
-    elif price_change < 0 and oi_change > 0 and iv_change > 0:
+    elif price_change < 0 and iv_change > 0:
         return "BUY PUT"
     else:
         return "HOLD"
@@ -102,113 +79,142 @@ def generate_signal(price_change, oi_change, iv_change):
 # TABS
 # =====================================================
 
-tabs = st.tabs(["Live Trading", "Backtesting", "Trade History", "Analysis"])
+tabs = st.tabs(["Live Trading","Backtesting","Trade History","Analysis"])
 
 
 # =====================================================
-# LIVE TRADING TAB
+# LIVE TAB
 # =====================================================
 
 with tabs[0]:
 
-    st.subheader("Live Option Chain Analysis")
+    st.subheader("Live Multi-Asset Analysis")
 
-    symbol = st.selectbox("Select NSE Index",
-                          ["NIFTY", "BANKNIFTY", "FINNIFTY", "SENSEX"])
+    ticker = st.text_input(
+        "Enter Ticker (Examples: ^NSEI, ^NSEBANK, BTC-USD, GC=F, SI=F, USDINR=X, RELIANCE.NS)",
+        "^NSEI"
+    )
 
-    df = fetch_nse_option_chain(symbol)
+    price_data = fetch_price_data(ticker)
 
-    if df is None:
-        st.error("Failed to fetch NSE data.")
+    if price_data.empty:
+        st.error("Failed to fetch price data.")
         st.stop()
 
-    st.write("### Raw Option Chain Snapshot")
+    spot = price_data["Close"].iloc[-1]
+
+    st.metric("Current Price", round(spot,2))
+
+    calls, puts, expiry = fetch_option_chain(ticker)
+
+    if calls is None:
+        st.warning("Options not available for this asset.")
+        st.stop()
+
+    st.write("Nearest Expiry:", expiry)
+
+    # Merge Calls & Puts
+    df = calls.merge(
+        puts,
+        on="strike",
+        suffixes=("_CE","_PE")
+    )
+
+    st.write("### Option Chain Snapshot")
     st.dataframe(df.head())
 
-    # -------------------------
-    # OI PLOT
-    # -------------------------
+    # ========================
+    # STRADDLE
+    # ========================
 
-    fig = go.Figure()
-    fig.add_trace(go.Bar(
-        x=df["strikePrice"],
-        y=df["CE.openInterest"],
-        name="Call OI"
-    ))
-    fig.add_trace(go.Bar(
-        x=df["strikePrice"],
-        y=df["PE.openInterest"],
-        name="Put OI"
-    ))
+    df["distance"] = abs(df["strike"] - spot)
+    atm_strike = df.sort_values("distance").iloc[0]["strike"]
 
-    fig.update_layout(title="Open Interest by Strike")
-    st.plotly_chart(fig, use_container_width=True)
+    atm_row = df[df["strike"]==atm_strike]
 
-    # -------------------------
-    # STRADDLE CALCULATION
-    # -------------------------
-
-    spot = df['CE.underlyingValue'].dropna().iloc[0]
-
-    df["distance"] = abs(df["strikePrice"] - spot)
-    atm_strike = df.sort_values("distance").iloc[0]["strikePrice"]
-
-    atm_row = df[df["strikePrice"] == atm_strike]
-
-    call_ltp = atm_row["CE.lastPrice"].values[0]
-    put_ltp = atm_row["PE.lastPrice"].values[0]
+    call_ltp = atm_row["lastPrice_CE"].values[0]
+    put_ltp  = atm_row["lastPrice_PE"].values[0]
 
     straddle_price = call_ltp + put_ltp
 
-    st.metric("Spot Price", round(spot,2))
     st.metric("ATM Strike", atm_strike)
     st.metric("ATM Straddle Price", round(straddle_price,2))
 
-    df["straddle"] = df["CE.lastPrice"].fillna(0) + df["PE.lastPrice"].fillna(0)
+    df["straddle"] = df["lastPrice_CE"] + df["lastPrice_PE"]
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=df["strike"],
+        y=df["straddle"],
+        mode="lines+markers"
+    ))
+    fig.add_vline(x=atm_strike, line_dash="dash")
+    fig.update_layout(title="Straddle Premium Across Strikes")
+
+    st.plotly_chart(fig, use_container_width=True)
+
+    # ========================
+    # OI PLOT
+    # ========================
 
     fig2 = go.Figure()
-    fig2.add_trace(go.Scatter(
-        x=df["strikePrice"],
-        y=df["straddle"],
-        mode="lines+markers",
-        name="Straddle Premium"
+    fig2.add_trace(go.Bar(
+        x=df["strike"],
+        y=df["openInterest_CE"],
+        name="Call OI"
     ))
-    fig2.add_vline(x=atm_strike, line_dash="dash")
-    fig2.update_layout(title="Straddle Premium Across Strikes")
+    fig2.add_trace(go.Bar(
+        x=df["strike"],
+        y=df["openInterest_PE"],
+        name="Put OI"
+    ))
+    fig2.update_layout(title="Open Interest Distribution")
 
     st.plotly_chart(fig2, use_container_width=True)
 
-    # -------------------------
-    # GREEKS CALCULATION ATM
-    # -------------------------
+    # ========================
+    # GREEKS (REAL IV)
+    # ========================
 
-    T = 5/365
+    iv_call = atm_row["impliedVolatility_CE"].values[0]
+    iv_put  = atm_row["impliedVolatility_PE"].values[0]
+
+    T = 7/365
     r = 0.06
-    sigma = 0.2
 
-    call_delta, call_gamma, call_theta, call_vega = black_scholes_greeks(
-        spot, atm_strike, T, r, sigma, "call")
+    call_delta,call_gamma,call_theta,call_vega = black_scholes_greeks(
+        spot,atm_strike,T,r,iv_call,"call")
 
-    put_delta, put_gamma, put_theta, put_vega = black_scholes_greeks(
-        spot, atm_strike, T, r, sigma, "put")
-
-    st.write("### ATM Greeks")
+    put_delta,put_gamma,put_theta,put_vega = black_scholes_greeks(
+        spot,atm_strike,T,r,iv_put,"put")
 
     greeks_df = pd.DataFrame({
         "Type":["Call","Put"],
-        "Delta":[call_delta, put_delta],
-        "Gamma":[call_gamma, put_gamma],
-        "Theta":[call_theta, put_theta],
-        "Vega":[call_vega, put_vega]
+        "Delta":[call_delta,put_delta],
+        "Gamma":[call_gamma,put_gamma],
+        "Theta":[call_theta,put_theta],
+        "Vega":[call_vega,put_vega]
     })
 
+    st.write("### ATM Greeks")
     st.dataframe(greeks_df)
+
+    # ========================
+    # SIGNAL
+    # ========================
+
+    price_change = price_data["Close"].pct_change().iloc[-1]
+    iv_change = iv_call
+
+    signal = generate_signal(price_change, iv_change)
+
+    st.success(f"Buyer Recommendation: {signal}")
 
     st.info("""
     Summary:
-    Buy options when price, OI and IV expand together.
-    Avoid buying during IV crush or sideways theta decay markets.
-    Straddle low → volatility expansion possible.
+    Buy only when price momentum aligns with IV expansion.
+    Avoid range markets where theta decay dominates.
+    Straddle cheap + IV expansion → strong buyer opportunity.
     """)
 
 
@@ -218,27 +224,19 @@ with tabs[0]:
 
 with tabs[1]:
 
-    st.subheader("Backtesting Engine (Price-Volume Proxy)")
-
-    ticker = st.text_input("Enter Ticker (Example: ^NSEI, BTC-USD, RELIANCE.NS)", "^NSEI")
+    st.subheader("Backtest (Volatility Expansion Model)")
 
     if st.button("Run Backtest"):
 
-        data = fetch_yf_data(ticker)
-
-        if data.empty:
-            st.error("No data fetched.")
-            st.stop()
+        data = price_data.copy()
 
         data["price_change"] = data["Close"].pct_change()
-        data["oi_change"] = data["Volume"].pct_change()
-        data["iv_change"] = data["price_change"].rolling(5).std()
+        data["volatility"] = data["price_change"].rolling(10).std()
 
         data["signal"] = data.apply(
             lambda row: generate_signal(
                 row["price_change"],
-                row["oi_change"],
-                row["iv_change"]
+                row["volatility"]
             ), axis=1
         )
 
@@ -246,14 +244,14 @@ with tabs[1]:
 
         st.success("""
         Summary:
-        Backtest identifies volatility expansion regimes.
-        Works best during trending markets.
-        Weak during range-bound or low IV markets.
+        Backtest captures volatility breakout regimes.
+        Strong in trending markets.
+        Weak in sideways markets.
         """)
 
 
 # =====================================================
-# TRADE HISTORY TAB
+# TRADE HISTORY
 # =====================================================
 
 with tabs[2]:
@@ -267,9 +265,8 @@ with tabs[2]:
 
     st.info("""
     Summary:
-    Tracks simulated trades.
-    Helps evaluate consistency.
-    Focus on win-rate + risk-reward ratio.
+    Track trades, evaluate consistency.
+    Focus on risk-reward > win-rate.
     """)
 
 
@@ -279,18 +276,15 @@ with tabs[2]:
 
 with tabs[3]:
 
-    st.subheader("Advanced Option Chain Interpretation")
+    st.subheader("Advanced Interpretation")
 
     st.markdown("""
-    Long Buildup  → Price ↑ OI ↑ → Bullish  
-    Short Buildup → Price ↓ OI ↑ → Bearish  
-    Short Cover   → Price ↑ OI ↓ → Short squeeze  
-    Long Unwind   → Price ↓ OI ↓ → Weakness  
+    Long Build-up → Price ↑ + OI ↑  
+    Short Build-up → Price ↓ + OI ↑  
+    Gamma High → Explosive movement possible  
+    Straddle Low → Volatility expansion expected  
+    Straddle High → Avoid fresh buying  
 
-    Gamma High near ATM → explosive move possible  
-    Straddle cheap → volatility expansion  
-    Straddle expensive → avoid buying  
-
-    Option buyers must trade only volatility expansion regimes.
+    Option buying works best in volatility expansion regimes.
     Avoid expiry theta decay periods.
     """)
