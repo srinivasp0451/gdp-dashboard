@@ -203,10 +203,18 @@ class DhanBrokerIntegration:
                 return self.dhanhq_module.BSE  # BSE_EQ
             return self.dhanhq_module.NSE       # NSE_EQ
     
-    def place_order(self, transaction_type, security_id, quantity, signal_type=None, order_params=None):
+    def place_order(self, transaction_type, security_id, quantity, signal_type=None, order_params=None, is_exit=False):
         """
         Place order via Dhan API.
         Supports: Market/Limit orders, CNC/Delivery, Bracket Orders (BO) with SL+Target+Trail.
+        
+        Args:
+            transaction_type: 'BUY' or 'SELL'
+            security_id: Dhan security ID
+            quantity: Order quantity
+            signal_type: Entry signal type (optional)
+            order_params: Dict with order parameters like price
+            is_exit: True if this is an exit order (uses exit order type config)
         """
         order_response = {
             'order_id': None, 'status': 'FAILED', 'raw_response': None, 'error': None
@@ -217,7 +225,17 @@ class DhanBrokerIntegration:
                 is_options   = self.config.get('dhan_is_options', True)
                 trading_type = self.config.get('dhan_trading_type', 'Intraday')
                 use_broker_sl = self.config.get('broker_use_own_sl', False)
-                order_type_selection = self.config.get('dhan_order_type', 'Market Order')
+                
+                # Select appropriate order type based on entry/exit
+                if is_exit:
+                    order_type_selection = self.config.get('dhan_exit_order_type', 'Market Order')
+                else:
+                    order_type_selection = self.config.get('dhan_entry_order_type', 'Market Order')
+                
+                # Fallback to legacy config if new ones not set
+                if not order_type_selection:
+                    order_type_selection = self.config.get('dhan_order_type', 'Market Order')
+                
                 op = order_params or {}
 
                 # Determine order type
@@ -408,7 +426,8 @@ class DhanBrokerIntegration:
             exit_transaction, 
             security_id, 
             quantity,
-            order_params={'price': price}  # Pass exit price for limit orders
+            order_params={'price': price},  # Pass exit price for limit orders
+            is_exit=True  # Use exit order type configuration
         )
         
         # Calculate P&L
@@ -745,12 +764,16 @@ def calculate_all_indicators(df, config):
     Returns:
         DataFrame with all indicators added
     """
-    # EMA Fast and Slow
+    # EMA Fast and Slow (TradingView-compatible calculation)
     ema_fast = config.get('ema_fast', 9)
     ema_slow = config.get('ema_slow', 21)
     
-    df['EMA_Fast'] = df['Close'].ewm(span=ema_fast, adjust=False).mean()
-    df['EMA_Slow'] = df['Close'].ewm(span=ema_slow, adjust=False).mean()
+    # Calculate EMA with exact TradingView parameters
+    # TradingView uses: alpha = 2/(length+1), which is pandas span parameter
+    # adjust=False ensures we use the recursive formula like TradingView
+    # min_periods=ema_fast ensures we start calculation after sufficient data
+    df['EMA_Fast'] = df['Close'].ewm(span=ema_fast, adjust=False, min_periods=ema_fast).mean()
+    df['EMA_Slow'] = df['Close'].ewm(span=ema_slow, adjust=False, min_periods=ema_slow).mean()
     
     # SMA for custom strategy
     df['SMA_20'] = df['Close'].rolling(window=20).mean()
@@ -3211,6 +3234,13 @@ def render_config_ui():
             "- Matches TradingView indicator values"
         )
     
+    # Display Last Candle Details
+    config['show_last_candle'] = st.sidebar.checkbox(
+        "📊 Show Last Candle Details",
+        value=False,
+        help="Display the last received candle with all calculated indicator values in Live Trading tab"
+    )
+    
     # Strategy Selection
     st.sidebar.subheader("📊 Strategy")
     config['strategy'] = st.sidebar.selectbox("Strategy Type", STRATEGY_LIST, index=0)
@@ -3582,7 +3612,7 @@ def render_config_ui():
     
     if config['dhan_enabled']:
         config['dhan_client_id'] = st.sidebar.text_input("Client ID", value="1104779876")
-        config['dhan_access_token'] = st.sidebar.text_input("Access Token", type="password", value="eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzUxMiJ9.eyJpc3MiOiJkaGFuIiwicGFydG5lcklkIjoiIiwiZXhwIjoxNzcyMDc3MjAyLCJpYXQiOjE3NzE5OTA4MDIsInRva2VuQ29uc3VtZXJUeXBlIjoiU0VMRiIsIndlYmhvb2tVcmwiOiIiLCJkaGFuQ2xpZW50SWQiOiIxMTA0Nzc5ODc2In0.3loxHr6Qu_46ZI5mEML_wss6aJJD9iZuAW5dMS-zfkvyVAey8LYvQTR-XoF6xhwkD4PGEaRrGiLb2svXPM9plw")
+        config['dhan_access_token'] = st.sidebar.text_input("Access Token", type="password", value="eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzUxMiJ9.eyJpc3MiOiJkaGFuIiwicGFydG5lcklkIjoiIiwiZXhwIjoxNzcxMTQzMjM5LCJpYXQiOjE3NzEwNTY4MzksInRva2VuQ29uc3VtZXJUeXBlIjoiU0VMRiIsIndlYmhvb2tVcmwiOiIiLCJkaGFuQ2xpZW50SWQiOiIxMTA0Nzc5ODc2In0.qP8kVXDQt-sFa6LWJqd1MRTPESHCCPCqHzEnjsFI2WVbNdywKHXgAKHxVpuH6tP_AJTdqowv9nbqf-2NcGibbQ")
         
         config['dhan_is_options'] = st.sidebar.checkbox("Is Options", value=True)
         
@@ -3612,13 +3642,32 @@ def render_config_ui():
         # ── Broker SL / Target (Bracket Order) — available for ALL order types ──
         st.sidebar.markdown("---")
         
-        # Order Type Selection
-        config['dhan_order_type'] = st.sidebar.selectbox(
-            "Order Type",
-            ["Market Order", "Limit Order"],
-            index=0,
-            help="Market: Executes immediately at best price | Limit: Executes at specified price or better"
-        )
+        # Order Type Selection - Separate for Entry and Exit
+        st.sidebar.markdown("**Order Type Configuration**")
+        
+        col_entry, col_exit = st.sidebar.columns(2)
+        with col_entry:
+            config['dhan_entry_order_type'] = st.sidebar.selectbox(
+                "Entry Order Type",
+                ["Market Order", "Limit Order"],
+                index=0,
+                help="Entry: Market = Immediate | Limit = At specified price"
+            )
+        with col_exit:
+            config['dhan_exit_order_type'] = st.sidebar.selectbox(
+                "Exit Order Type",
+                ["Market Order", "Limit Order"],
+                index=0,
+                help="Exit: Market = Immediate | Limit = At specified price"
+            )
+        
+        # Display order combination
+        entry_type = "MARKET" if config['dhan_entry_order_type'] == "Market Order" else "LIMIT"
+        exit_type = "MARKET" if config['dhan_exit_order_type'] == "Market Order" else "LIMIT"
+        st.sidebar.caption(f"📋 Configuration: Entry {entry_type} | Exit {exit_type}")
+        
+        # Legacy support: set dhan_order_type to entry type for backward compatibility
+        config['dhan_order_type'] = config['dhan_entry_order_type']
         
         config['broker_use_own_sl'] = st.sidebar.checkbox(
             "🎯 Use Broker SL/Target (Bracket Order)",
@@ -4427,6 +4476,94 @@ def render_live_trading_ui(config):
                 st.metric("Crossover", crossover)
             else:
                 st.metric("Crossover", "N/A")
+    
+    # Display Last Candle Details (if enabled)
+    if config.get('show_last_candle', False) and current_data is not None:
+        st.subheader("📊 Last Candle Details")
+        
+        with st.expander("🔍 Click to view complete candle data with all indicators", expanded=False):
+            # OHLCV Data
+            st.markdown("**📈 OHLCV Data**")
+            col1, col2, col3, col4, col5 = st.columns(5)
+            with col1:
+                st.metric("Open", f"₹{current_data.get('Open', 0):.2f}")
+            with col2:
+                st.metric("High", f"₹{current_data.get('High', 0):.2f}")
+            with col3:
+                st.metric("Low", f"₹{current_data.get('Low', 0):.2f}")
+            with col4:
+                st.metric("Close", f"₹{current_data.get('Close', 0):.2f}")
+            with col5:
+                st.metric("Volume", f"{int(current_data.get('Volume', 0)):,}")
+            
+            # Timestamp
+            if 'Datetime' in current_data.index:
+                st.caption(f"🕐 Candle Time: {current_data['Datetime']}")
+            
+            st.markdown("---")
+            
+            # Strategy-specific indicators
+            strategy_name = config.get('strategy', 'EMA Crossover')
+            st.markdown(f"**📊 Indicators ({strategy_name})**")
+            
+            # Create a dict of all indicator values
+            indicator_data = {}
+            
+            # Common indicators
+            common_indicators = [
+                ('EMA_Fast', 'EMA Fast'),
+                ('EMA_Slow', 'EMA Slow'),
+                ('EMA_Fast_Angle', 'EMA Fast Angle'),
+                ('EMA_Slow_Angle', 'EMA Slow Angle'),
+                ('SMA_20', 'SMA 20'),
+                ('SMA_50', 'SMA 50'),
+                ('RSI', 'RSI'),
+                ('ADX', 'ADX'),
+                ('ATR', 'ATR'),
+                ('MACD', 'MACD'),
+                ('MACD_Signal', 'MACD Signal'),
+                ('MACD_Hist', 'MACD Histogram'),
+                ('Bollinger_Upper', 'Bollinger Upper'),
+                ('Bollinger_Middle', 'Bollinger Middle'),
+                ('Bollinger_Lower', 'Bollinger Lower'),
+                ('VWAP', 'VWAP'),
+                ('Supertrend', 'SuperTrend'),
+                ('Supertrend_Direction', 'SuperTrend Direction'),
+                ('Stochastic_K', 'Stochastic %K'),
+                ('Stochastic_D', 'Stochastic %D'),
+                ('Volume_MA', 'Volume MA'),
+                ('OBV', 'OBV'),
+            ]
+            
+            # Collect available indicators
+            for col_name, display_name in common_indicators:
+                if col_name in current_data.index and not pd.isna(current_data.get(col_name)):
+                    value = current_data[col_name]
+                    indicator_data[display_name] = value
+            
+            # Display indicators in a grid
+            if indicator_data:
+                # Display in rows of 3
+                indicator_items = list(indicator_data.items())
+                for i in range(0, len(indicator_items), 3):
+                    cols = st.columns(3)
+                    for j, col in enumerate(cols):
+                        if i + j < len(indicator_items):
+                            name, value = indicator_items[i + j]
+                            with col:
+                                if 'Angle' in name:
+                                    st.metric(name, f"{value:.2f}°")
+                                elif name in ['RSI', 'ADX', 'Stochastic %K', 'Stochastic %D']:
+                                    st.metric(name, f"{value:.2f}")
+                                elif 'Direction' in name:
+                                    direction = "LONG ⬆️" if value == 1 else "SHORT ⬇️"
+                                    st.metric(name, direction)
+                                elif name in ['OBV', 'Volume MA']:
+                                    st.metric(name, f"{int(value):,}")
+                                else:
+                                    st.metric(name, f"₹{value:.2f}")
+            else:
+                st.info("No indicators calculated yet. Wait for data to be fetched.")
     
     # Display current position with all details
     st.subheader("📊 Current Position")
