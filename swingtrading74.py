@@ -4091,7 +4091,7 @@ def render_backtest_ui(config):
                 hovermode='x unified',
                 template='plotly_dark'
             )
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width='stretch')
 
         # ── Trade table ───────────────────────────────────────────────────────
         if trades:
@@ -4121,7 +4121,7 @@ def render_backtest_ui(config):
             
             # Show subset for display
             df_display = df_trades[[c for c in display_cols if c in df_trades.columns]]
-            st.dataframe(df_display, use_container_width=True)
+            st.dataframe(df_display, width="stretch")
             
             # Detailed metrics expander
             with st.expander("📊 Detailed Trade Metrics (EMA, Angles, Differences)"):
@@ -4146,7 +4146,7 @@ def render_backtest_ui(config):
                             lambda x: f"{x:.2f}" if pd.notna(x) and x == x else "—")
                 
                 df_detailed_display = df_detailed[[c for c in detailed_cols if c in df_detailed.columns]]
-                st.dataframe(df_detailed_display, use_container_width=True)
+                st.dataframe(df_detailed_display, width="stretch")
         
         # ── Skipped/Overlapping Trades Table ─────────────────────────────────
         skipped_trades = results.get('skipped_trades', [])
@@ -4165,7 +4165,7 @@ def render_backtest_ui(config):
                     df_skipped[col] = df_skipped[col].apply(
                         lambda x: f"₹{x:.2f}" if pd.notna(x) else "—")
             
-            st.dataframe(df_skipped, use_container_width=True)
+            st.dataframe(df_skipped, width="stretch")
             
             # Skipped trades summary
             if len(skipped_trades) > 0:
@@ -4437,7 +4437,7 @@ def render_live_trading_ui(config):
                 hovermode='x unified',
                 template='plotly_dark'
             )
-            st.plotly_chart(fig_live, use_container_width=True)
+            st.plotly_chart(fig_live, width="stretch")
         else:
             st.warning("⚠️ Could not load chart data")
     except Exception as e:
@@ -4711,7 +4711,7 @@ def render_live_trading_ui(config):
             display_cols.append('⚠️')
         
         df_display = df_history[[c for c in display_cols if c in df_history.columns]]
-        st.dataframe(df_display, use_container_width=True, height=200)
+        st.dataframe(df_display, width="stretch", height=200)
         
         # Show warning if any suspicious trades
         suspicious_trades = len(df_history[df_history.get('price_change_pct', pd.Series([0])) > 50])
@@ -4727,7 +4727,7 @@ def render_live_trading_ui(config):
     if logs:
         # Display in reverse order (latest first)
         log_text = "\n".join(reversed(logs[-50:]))  # Last 50 logs
-        st.text_area("", value=log_text, height=300, disabled=True)
+        st.text_area("Trading Logs", value=log_text, height=300, disabled=True, label_visibility="collapsed")
     else:
         st.info("No logs yet")
     
@@ -4852,7 +4852,7 @@ def render_trade_logs_ui():
     })
     
     # Display table
-    st.dataframe(display_df, use_container_width=True, height=400)
+    st.dataframe(display_df, width="stretch", height=400)
     
     # Add download button
     csv = display_df.to_csv(index=False)
@@ -4904,7 +4904,7 @@ def render_trade_logs_ui():
         height=400
     )
     
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width="stretch")
     
     # Trade type distribution
     st.subheader("📊 Trade Type Distribution")
@@ -4926,7 +4926,7 @@ def render_trade_logs_ui():
             height=300
         )
         
-        st.plotly_chart(fig_type, use_container_width=True)
+        st.plotly_chart(fig_type, width="stretch")
     
     with col2:
         # Count by exit reason
@@ -4943,7 +4943,7 @@ def render_trade_logs_ui():
             height=300
         )
         
-        st.plotly_chart(fig_reason, use_container_width=True)
+        st.plotly_chart(fig_reason, width="stretch")
 
 # ================================
 # MAIN APP
