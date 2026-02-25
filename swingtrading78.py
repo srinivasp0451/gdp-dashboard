@@ -20,6 +20,7 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from scipy.stats import norm
 from scipy.optimize import brentq
+import re
 
 try:
     import yfinance as yf
