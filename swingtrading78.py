@@ -1,159 +1,124 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-import requests
-import time
+from nsepython import *
 import plotly.graph_objects as go
-from scipy.stats import norm
 from datetime import datetime
 
-# --- CONFIG & INITIALIZATION ---
-st.set_page_config(layout="wide", page_title="Gamma-Hunter Pro")
+# Page Configuration
+st.set_page_config(page_title="Nifty50 Pro Option Chain", layout="wide")
 
-if 'df' not in st.session_state:
-    st.session_state.df = None
-if 'spot' not in st.session_state:
-    st.session_state.spot = 0
-if 'trade_history' not in st.session_state:
-    st.session_state.trade_history = []
+st.title("📊 Nifty 50 Option Chain Analysis & AI-Grade Recommendations")
+st.markdown("Real-time analysis using `nsepython`")
 
-# --- BRAIN: ROBUST NSE SCRAPER ---
-class NSEScraper:
-    def __init__(self):
-        self.headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
-            'Accept-Encoding': 'gzip, deflate, br',
-            'Accept-Language': 'en-US,en;q=0.9',
-            'Referer': 'https://www.nseindia.com/option-chain'
-        }
-        self.session = requests.Session()
-        self.session.headers.update(self.headers)
-        self.init_cookies()
-
-    def init_cookies(self):
-        """Bypass 403 by hitting the home page first."""
-        try:
-            self.session.get("https://www.nseindia.com", timeout=10)
-            self.session.get("https://www.nseindia.com/option-chain", timeout=10)
-        except Exception as e:
-            st.error(f"Connection Error: {e}")
-
-    def get_data(self, symbol="NIFTY"):
-        # Index vs Stock API endpoints
-        is_index = symbol in ["NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY"]
-        url = f"https://www.nseindia.com/api/option-chain-{'indices' if is_index else 'equities'}?symbol={symbol}"
+# 1. Fetch Option Chain Data
+@st.cache_data(ttl=60) # Cache data for 60 seconds
+def get_nifty_data():
+    symbol = "NIFTY"
+    try:
+        # Get live data
+        oc = option_chain(symbol)
+        lTP = nse_live(symbol)
+        spot_price = lTP['underlyingValue']
         
-        try:
-            response = self.session.get(url, timeout=15)
-            if response.status_code == 200:
-                return response.json()
-            else:
-                return None
-        except:
-            return None
+        # Get expiry dates
+        expiries = get_expiry_dates(symbol)
+        
+        # Get option chain data for nearest expiry
+        oi_data = oc['records']['data']
+        df = pd.DataFrame(oi_data)
+        
+        # Structure data
+        df['Call_OI'] = df['CE'].apply(lambda x: x['openInterest'] if isinstance(x, dict) else 0)
+        df['Call_Vol'] = df['CE'].apply(lambda x: x['totalTradedVolume'] if isinstance(x, dict) else 0)
+        df['Call_LTP'] = df['CE'].apply(lambda x: x['lastPrice'] if isinstance(x, dict) else 0)
+        df['Call_IV'] = df['CE'].apply(lambda x: x['impliedVolatility'] if isinstance(x, dict) else 0)
+        df['Put_OI'] = df['PE'].apply(lambda x: x['openInterest'] if isinstance(x, dict) else 0)
+        df['Put_Vol'] = df['PE'].apply(lambda x: x['totalTradedVolume'] if isinstance(x, dict) else 0)
+        df['Put_LTP'] = df['PE'].apply(lambda x: x['lastPrice'] if isinstance(x, dict) else 0)
+        df['Put_IV'] = df['PE'].apply(lambda x: x['impliedVolatility'] if isinstance(x, dict) else 0)
+        
+        df = df[['strikePrice', 'Call_OI', 'Call_Vol', 'Call_LTP', 'Call_IV', 'Put_OI', 'Put_Vol', 'Put_LTP', 'Put_IV']]
+        
+        return df, spot_price, expiries[0]
+    except Exception as e:
+        st.error(f"Error fetching data: {e}")
+        return None, None, None
 
-# --- BLACK-SCHOLES ENGINE ---
-def get_greeks(S, K, T, r, sigma, type="CE"):
-    if T <= 0 or sigma <= 0: return 0.5, 0, 0, 0 # Defaults
-    d1 = (np.log(S / K) + (r + 0.5 * sigma**2) * T) / (sigma * np.sqrt(T))
-    d2 = d1 - sigma * np.sqrt(T)
-    if type == "CE":
-        delta = norm.cdf(d1)
-        theta = -(S * norm.pdf(d1) * sigma) / (2 * np.sqrt(T)) - r * K * np.exp(-r * T) * norm.cdf(d2)
-    else:
-        delta = norm.cdf(d1) - 1
-        theta = -(S * norm.pdf(d1) * sigma) / (2 * np.sqrt(T)) + r * K * np.exp(-r * T) * norm.cdf(-d2)
-    gamma = norm.pdf(d1) / (S * sigma * np.sqrt(T))
-    return round(delta, 3), round(gamma, 5), round(theta/365, 3)
+# Load Data
+df, spot_price, expiry = get_nifty_data()
 
-# --- APP UI ---
-st.sidebar.title("🛠️ Control Panel")
-target = st.sidebar.selectbox("Symbol", ["NIFTY", "BANKNIFTY", "RELIANCE", "SBIN"])
+if df is not None:
+    st.sidebar.header("Market Overview")
+    st.sidebar.metric("Nifty Spot Price", spot_price)
+    st.sidebar.write(f"Expiry: {expiry}")
 
-if st.sidebar.button("🔄 Refresh Data"):
-    scraper = NSEScraper()
-    raw_data = scraper.get_data(target)
+    # --- 2. Option Chain Dataframe ---
+    st.subheader("Option Chain Data")
+    st.dataframe(df.style.highlight_between(subset=['strikePrice'], left=spot_price-100, right=spot_price+100, color='lightyellow'), use_container_width=True)
+
+    # --- 3. Straddle Graph ---
+    st.subheader("At-the-Money (ATM) Straddle Graph")
+    atm_strike = round(spot_price / 50) * 50
+    atm_data = df[df['strikePrice'] == atm_strike].iloc[0]
+    straddle_premium = atm_data['Call_LTP'] + atm_data['Put_LTP']
     
-    if raw_data:
-        records = raw_data['records']['data']
-        st.session_state.spot = raw_data['records']['underlyingValue']
-        st.session_state.expiries = raw_data['records']['expiryDates']
-        
-        # Default to first expiry
-        current_exp = st.session_state.expiries[0]
-        chain = [r for r in records if r['expiryDate'] == current_exp]
-        
-        # Build DataFrame
-        rows = []
-        for r in chain:
-            strike = r['strikePrice']
-            ce = r.get('CE', {})
-            pe = r.get('PE', {})
-            
-            # T Calculation (Days to Expiry)
-            exp_date = datetime.strptime(current_exp, '%d-%b-%Y')
-            T = (exp_date - datetime.now()).days / 365
-            
-            ce_delta, ce_gamma, ce_theta = get_greeks(st.session_state.spot, strike, T, 0.07, ce.get('impliedVolatility', 0)/100, "CE")
-            pe_delta, pe_gamma, pe_theta = get_greeks(st.session_state.spot, strike, T, 0.07, pe.get('impliedVolatility', 0)/100, "PE")
+    st.write(f"**ATM Strike:** {atm_strike} | **Straddle Premium:** {straddle_premium:.2f}")
 
-            rows.append({
-                "Strike": strike,
-                "CE_LTP": ce.get('lastPrice', 0), "CE_OI": ce.get('openInterest', 0), "CE_Delta": ce_delta, "CE_Gamma": ce_gamma,
-                "PE_LTP": pe.get('lastPrice', 0), "PE_OI": pe.get('openInterest', 0), "PE_Delta": pe_delta, "PE_Gamma": pe_gamma,
-                "Total_OI": ce.get('openInterest', 0) + pe.get('openInterest', 0)
-            })
-        st.session_state.df = pd.DataFrame(rows)
-        st.success(f"Fetched {target} @ {st.session_state.spot}")
+    # Plotting Straddle Payoff
+    strikes = np.linspace(atm_strike - 300, atm_strike + 300, 100)
+    payoff = [abs(s - atm_strike) - straddle_premium for s in strikes]
+    
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=strikes, y=payoff, mode='lines', name='Short Straddle Payoff'))
+    fig.add_hline(y=0, line_dash="dash", line_color="red")
+    fig.update_layout(title="Short Straddle Payoff Profile", xaxis_title="Nifty Strike", yaxis_title="Profit/Loss")
+    st.plotly_chart(fig, use_container_width=True)
+
+    # --- 4. Analyze Option Greeks (Pro-level) ---
+    st.subheader("Option Greeks & Market Analysis")
+    
+    # Calculate PCR
+    total_call_oi = df['Call_OI'].sum()
+    total_put_oi = df['Put_OI'].sum()
+    pcr = total_put_oi / total_call_oi
+    
+    # Simple "Pro" Metrics
+    st.write(f"**Put Call Ratio (PCR):** {pcr:.2f} (PCR > 1: Bullish, < 1: Bearish)")
+    
+    # Find Support/Resistance
+    max_call_oi = df.loc[df['Call_OI'].idxmax()]
+    max_put_oi = df.loc[df['Put_OI'].idxmax()]
+    
+    st.write(f"**Resistance (Max Call OI):** {max_call_oi['strikePrice']}")
+    st.write(f"**Support (Max Put OI):** {max_put_oi['strikePrice']}")
+
+    # --- 5. Summary & Recommendation ---
+    st.subheader("💡 Market Situation & Recommendation")
+    
+    analysis = ""
+    recommendation = ""
+    
+    if pcr > 1.2:
+        analysis = "The market is heavily oversold on Puts (overbought), indicating strong bullish sentiment, but potentially overextended."
+        recommendation = "Hold existing longs. Caution on new aggressive buying. Consider booking partial profits if PCR stays above 1.4."
+    elif pcr < 0.8:
+        analysis = "The market has heavy Call writing, indicating bearish sentiment and fear of a downfall."
+        recommendation = "Consider Selling Covered Calls or initiating Bear Call Spread."
     else:
-        st.error("NSE blocked the request. Try again in 5 seconds.")
-
-# --- TABS ---
-t1, t2, t3, t4, t5 = st.tabs(["📊 Chain", "🧠 Analysis", "⚡ Trading", "⏪ Backtest", "📜 History"])
-
-# Gating the tabs to prevent NameError
-if st.session_state.df is not None:
-    df = st.session_state.df
-    spot = st.session_state.spot
-
-    with t1:
-        st.write("### Option Chain Summary")
-        st.write("Provides a real-time view of liquidity and pricing. As a buyer, monitor the 'Total OI' to see where major support/resistance levels are forming. Higher OI at a strike acts as a psychological magnet for price action.")
-        st.dataframe(df.style.highlight_max(axis=0, subset=['CE_OI', 'PE_OI']))
-
-    with t2:
-        st.write("### Smart Buyer Analysis")
-        st.write("Analyzes Greeks for explosive potential. We look for 'Gamma Squeezes' where rapid price movement forces sellers to cover. Buyers should prioritize strikes with Delta > 0.45 and increasing OI to ensure momentum alignment.")
+        analysis = "The market is in a neutral/consolidation phase. Support and Resistance are balanced."
+        recommendation = "Best for Iron Condor or Straddle Selling (Rangebound)."
         
-        pcr = round(df['PE_OI'].sum() / df['CE_OI'].sum(), 2)
-        st.metric("Market PCR", pcr, delta="Bullish" if pcr > 1 else "Bearish")
-        
-        # Simple Gamma Blast Logic
-        gamma_lead = df.loc[df['CE_Gamma'].idxmax()]
-        st.info(f"🚀 Potential Gamma Blast Zone: {gamma_lead['Strike']} Strike")
+    st.info(f"**Current Situation:** {analysis}")
+    st.success(f"**Recommendation:** {recommendation}")
+    
+    st.markdown("""
+    **Historical Context:** 
+    1.  **PCR < 0.7:** Often marks a short-term bottom (2022-2023 trends).
+    2.  **PCR > 1.4:** Usually leads to sharp volatility or a correction (Mid-2024 trends).
+    3.  **High IV + High PCR:** Usually results in a sharp breakout in either direction.
+    """)
 
-    with t3:
-        st.write("### Live Trade Execution")
-        st.write("Simulates market orders with a 1.5s latency buffer to mimic real-world exchange execution. It monitors 'Theta Decay' live, warning buyers if the time-decay cost exceeds the potential delta gain for the next 4 hours.")
-        
-        c1, c2 = st.columns(2)
-        sel_strike = c1.selectbox("Strike", df['Strike'])
-        sel_type = c2.selectbox("Type", ["CE", "PE"])
-        
-        if st.button("Execute Buyer Trade"):
-            time.sleep(1.5)
-            price = df[df['Strike'] == sel_strike][f'{sel_type}_LTP'].values[0]
-            st.session_state.trade_history.append({"Time": datetime.now().strftime("%H:%M:%S"), "Strike": sel_strike, "Type": sel_type, "Price": price})
-            st.toast(f"Trade Filled: {sel_type} @ {price}")
-
-    with t4:
-        st.write("### Historical Backtester")
-        st.write("Matches current market signals against the last 5 days of tick data. By using the identical Black-Scholes engine, it ensures zero 'model drift,' meaning if a strategy works here, it should perform identically in live markets.")
-        st.line_chart(np.random.randn(20, 1)) # Placeholder for historical spot data
-
-    with t5:
-        st.write("### Trade History & Audit")
-        st.write("Maintains a record of all simulated entries. This audit trail allows buyers to identify if they are consistently 'over-paying' for volatility or getting caught in 'Theta traps' on low-probability OTM strike selections.")
-        st.table(st.session_state.trade_history)
 else:
-    st.warning("👈 Please click 'Refresh Data' in the sidebar to start.")
+    st.warning("Unable to fetch data.")
+
