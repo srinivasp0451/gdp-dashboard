@@ -110,98 +110,152 @@ for k,v in {"trades":[],"active":[],"bt_result":None}.items():
 # ═══════════════════════════════════════════════════════════════════════
 # CSV PARSER — handles actual NSE download format
 # ═══════════════════════════════════════════════════════════════════════
-def parse_nse_csv(raw_bytes):
+def parse_nse_csv(raw_bytes, filename=""):
     """
-    Parse CSV downloaded from nseindia.com → Option Chain → Download button.
+    Parse the actual NSE option chain CSV downloaded from nseindia.com.
+
+    Exact NSE format (2-row header):
+      Row 0: ,CALLS,,,,,,,,,,PUTS,,,,,,,,,,,
+      Row 1: ,OI,CHNG IN OI,VOLUME,IV,LTP,CHNG,BID QTY,BID,ASK,ASK QTY,STRIKE,BID QTY,BID,ASK,ASK QTY,CHNG,LTP,IV,VOLUME,CHNG IN OI,OI,
+      Rows 2+: data  (numbers use Indian comma format like "2,54,729")
+
+    Strategy: use csv.reader (handles quoted commas), find STRIKE column in row 1,
+    then map all other columns by their fixed offset from STRIKE.
+
+    Expiry is extracted from the filename (e.g. option-chain-ED-NIFTY-02-Mar-2026).
+
     Returns (DataFrame, list_of_debug_messages)
     """
+    import csv as _csv
+
     debug = []
+
+    # ── decode bytes ──────────────────────────────────────────────
     try:
         content = raw_bytes.decode("utf-8", errors="ignore")
     except Exception as e:
-        return pd.DataFrame(), [f"Cannot decode file: {e}"]
+        return pd.DataFrame(), [f"Cannot read file: {e}"]
 
-    lines = [l for l in content.split("\n") if l.strip()]
-    debug.append(f"File has {len(lines)} non-empty lines")
-    if lines:
-        debug.append(f"Line 1: {lines[0][:100]}")
-        if len(lines) > 1:
-            debug.append(f"Line 2: {lines[1][:100]}")
+    debug.append(f"File size: {len(raw_bytes)} bytes")
 
-    for skip in range(min(6, len(lines))):
+    # ── extract expiry from filename ───────────────────────────────
+    expiry = "Uploaded"
+    m = re.search(r'(\d{2}-[A-Za-z]{3}-\d{4})', filename)
+    if m:
+        expiry = m.group(1)
+        debug.append(f"Expiry from filename: {expiry}")
+    else:
+        debug.append("No expiry date found in filename — will use 'Uploaded'")
+
+    # ── helper: strip commas and convert to float ──────────────────
+    def to_f(s):
         try:
-            chunk = "\n".join(lines[skip:])
-            df = pd.read_csv(io.StringIO(chunk), thousands=",")
-            if df.empty or len(df.columns) < 5:
-                debug.append(f"skip={skip}: only {len(df.columns)} columns, skipping")
-                continue
-            df.columns = [str(c).strip() for c in df.columns]
-            debug.append(f"skip={skip}: {len(df.columns)} cols — {list(df.columns[:6])}")
+            s = str(s).replace(",", "").strip()
+            if s in ("-", "", "nan", "None", "none", "--"): return 0.0
+            return float(s)
+        except:
+            return 0.0
 
-            # ── detect NSE option-chain download format ──
-            has_strike = any("strike" in c.lower() for c in df.columns)
-            has_calls  = any("calls"  in c.lower() for c in df.columns)
-            has_puts   = any("puts"   in c.lower() for c in df.columns)
+    # ── read all rows with csv.reader (handles "2,54,729" quoting) ─
+    all_rows = []
+    reader = _csv.reader(io.StringIO(content))
+    for row in reader:
+        all_rows.append(row)
 
-            if has_strike and has_calls and has_puts:
-                def gcol(must, exclude=()):
-                    for c in df.columns:
-                        cl = c.lower()
-                        if all(m in cl for m in must) and not any(e in cl for e in exclude):
-                            return c
-                    return None
+    debug.append(f"Total CSV rows: {len(all_rows)}")
+    for i, r in enumerate(all_rows[:3]):
+        debug.append(f"  Row {i}: {r[:8]}")
 
-                sc = gcol(["strike"])
-                if sc is None:
-                    debug.append(f"skip={skip}: strike col not found"); continue
+    if len(all_rows) < 3:
+        return pd.DataFrame(), debug + ["File has fewer than 3 rows — not enough data"]
 
-                def safe(col):
-                    if col is None:
-                        return pd.Series([0.0]*len(df), dtype=float)
-                    return pd.to_numeric(df[col], errors="coerce").fillna(0.0)
+    # ── find STRIKE column — scan rows 0,1,2 for the word "STRIKE" ─
+    strike_col = None
+    header_row_idx = None
+    for row_i in range(min(4, len(all_rows))):
+        for col_i, val in enumerate(all_rows[row_i]):
+            if str(val).strip().upper() == "STRIKE":
+                strike_col = col_i
+                header_row_idx = row_i
+                debug.append(f"Found STRIKE at row={row_i}, col={col_i}")
+                break
+        if strike_col is not None:
+            break
 
-                out = pd.DataFrame()
-                out["strikePrice"] = pd.to_numeric(df[sc], errors="coerce")
-                out["CE_LTP"]      = safe(gcol(["calls","ltp"]))
-                out["PE_LTP"]      = safe(gcol(["puts","ltp"]))
-                out["CE_OI"]       = safe(gcol(["calls","oi"],   exclude=["chng","change"]))
-                out["PE_OI"]       = safe(gcol(["puts","oi"],    exclude=["chng","change"]))
-                out["CE_IV"]       = safe(gcol(["calls","iv"]))
-                out["PE_IV"]       = safe(gcol(["puts","iv"]))
-                out["CE_changeOI"] = safe(gcol(["calls","chng"]))
-                out["PE_changeOI"] = safe(gcol(["puts","chng"]))
-                out["CE_volume"]   = safe(gcol(["calls","volume"]))
-                out["PE_volume"]   = safe(gcol(["puts","volume"]))
-                out["CE_bid"] = out["CE_ask"] = out["PE_bid"] = out["PE_ask"] = 0.0
-                out["expiryDate"] = "Uploaded"
-
-                out = out.dropna(subset=["strikePrice"])
-                out = out[out["strikePrice"] > 100].reset_index(drop=True)
-                if len(out) >= 1:
-                    debug.append(f"✅ NSE format — {len(out)} strikes parsed (skip={skip})")
-                    return out, debug
-                else:
-                    debug.append(f"skip={skip}: 0 valid strikes after filtering")
-
-            # ── detect already-correct format ──
-            elif "strikePrice" in df.columns:
+    if strike_col is None:
+        debug.append("❌ Could not find STRIKE column — trying fallback")
+        # Fallback: maybe it's already a simple format
+        try:
+            df = pd.read_csv(io.StringIO(content))
+            df.columns = [c.strip() for c in df.columns]
+            if "strikePrice" in df.columns:
                 for c in ["CE_OI","PE_OI","CE_IV","PE_IV","CE_changeOI","PE_changeOI",
                           "CE_volume","PE_volume","CE_bid","CE_ask","PE_bid","PE_ask"]:
                     if c not in df.columns: df[c] = 0.0
-                if "expiryDate" not in df.columns: df["expiryDate"] = "Uploaded"
-                out = df.dropna(subset=["strikePrice"])
-                out = out[out["strikePrice"] > 0].reset_index(drop=True)
-                if len(out) >= 1:
-                    debug.append(f"✅ Already-correct format — {len(out)} strikes")
-                    return out, debug
+                if "expiryDate" not in df.columns: df["expiryDate"] = expiry
+                df = df[df["strikePrice"] > 0].reset_index(drop=True)
+                if not df.empty:
+                    debug.append(f"✅ Fallback: strikePrice format — {len(df)} strikes")
+                    return df.fillna(0), debug
+        except: pass
+        return pd.DataFrame(), debug + ["Cannot parse: no STRIKE column found"]
 
-            else:
-                debug.append(f"skip={skip}: unrecognised format")
+    # ── data starts on the row after the header row ────────────────
+    data_start = header_row_idx + 1
+    sc = strike_col  # short alias
 
-        except Exception as e:
-            debug.append(f"skip={skip} exception: {e}")
+    # Column offsets from STRIKE (verified against actual NSE file):
+    # Left side  = CALLS: sc-10=OI, sc-9=CHNG IN OI, sc-8=VOLUME, sc-7=IV, sc-6=LTP
+    #              sc-5=CHNG, sc-4=BID QTY, sc-3=BID, sc-2=ASK, sc-1=ASK QTY
+    # Right side = PUTS:  sc+1=BID QTY, sc+2=BID, sc+3=ASK, sc+4=ASK QTY, sc+5=CHNG
+    #              sc+6=LTP, sc+7=IV, sc+8=VOLUME, sc+9=CHNG IN OI, sc+10=OI
+    offsets = {
+        "strikePrice": 0,
+        "CE_OI":       -10,
+        "CE_changeOI": -9,
+        "CE_volume":   -8,
+        "CE_IV":       -7,
+        "CE_LTP":      -6,
+        "CE_bid":      -3,
+        "CE_ask":      -2,
+        "PE_bid":      +2,
+        "PE_ask":      +3,
+        "PE_LTP":      +6,
+        "PE_IV":       +7,
+        "PE_volume":   +8,
+        "PE_changeOI": +9,
+        "PE_OI":       +10,
+    }
 
-    return pd.DataFrame(), debug
+    records = []
+    skipped = 0
+    for row in all_rows[data_start:]:
+        if len(row) <= sc:
+            skipped += 1
+            continue
+        sp = to_f(row[sc])
+        if sp <= 0:
+            skipped += 1
+            continue
+        rec = {"expiryDate": expiry}
+        for col_name, offset in offsets.items():
+            idx = sc + offset
+            rec[col_name] = to_f(row[idx]) if 0 <= idx < len(row) else 0.0
+        records.append(rec)
+
+    if skipped:
+        debug.append(f"Skipped {skipped} non-data rows")
+
+    if not records:
+        return pd.DataFrame(), debug + ["No valid strike rows found after parsing"]
+
+    df = pd.DataFrame(records).fillna(0)
+    df = df[df["strikePrice"] > 0].reset_index(drop=True)
+    debug.append(f"✅ Parsed {len(df)} strikes | expiry={expiry}")
+    debug.append(f"   Sample: strike={df['strikePrice'].iloc[0]:,.0f} "
+                 f"CE_LTP={df['CE_LTP'].iloc[0]} CE_IV={df['CE_IV'].iloc[0]}% "
+                 f"PE_LTP={df['PE_LTP'].iloc[0]} PE_OI={df['PE_OI'].iloc[0]:,.0f}")
+    return df, debug
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -811,21 +865,25 @@ def main():
         if csv_file is not None:
             ph.info("📂 Reading uploaded CSV…")
             raw = csv_file.read()
-            df_csv, csv_dbg = parse_nse_csv(raw)
+            fname = getattr(csv_file, "name", "")
+            df_csv, csv_dbg = parse_nse_csv(raw, filename=fname)
             if not df_csv.empty:
-                df_exp=df_csv; data_src="CSV"
-                spot=get_spot(yf_sym)
-                expiries=df_csv["expiryDate"].unique().tolist()
-                sel_expiry=expiries[0]
-                ph.success(f"✅ CSV parsed — {len(df_exp)} strikes | Spot ₹{spot:,.2f}")
+                df_exp = df_csv
+                data_src = "CSV"
+                spot = get_spot(yf_sym)
+                expiries = df_csv["expiryDate"].unique().tolist()
+                sel_expiry = expiries[0]
+                ph.success(f"✅ CSV parsed — {len(df_exp)} strikes | Expiry: {sel_expiry} | Spot ₹{spot:,.2f}")
+                with st.expander("🔍 CSV parse details"):
+                    for line in csv_dbg: st.text(line)
             else:
                 ph.error("❌ CSV failed to parse. See debug below.")
                 with st.expander("📋 CSV debug — share this to get help"):
                     for line in csv_dbg: st.text(line)
                 st.markdown("""**CSV parse failed. Common fixes:**
-- Make sure you clicked the **Download CSV** button on nseindia.com (not copy-paste)
-- Do NOT open and re-save in Excel — use the raw downloaded file  
-- The file should be around 10-50 KB with 50-200 rows""")
+- Download directly from nseindia.com (do not open in Excel and re-save)
+- The file should be the raw .csv, around 10-50 KB""")
+
 
         # ── Live fetch path ──
         if df_exp.empty:
