@@ -686,29 +686,49 @@ def _trade_rec(et, xt, side, entry, exit_, pnl, reason, t_reason):
 # ══════════════════════════════════════════════════════════════
 # DATA FETCHER
 # ══════════════════════════════════════════════════════════════
-@st.cache_data(ttl=60)
-def fetch(ticker, period, interval):
-    try:
-        df = yf.download(ticker, period=period, interval=interval, progress=False, auto_adjust=True)
-        if df.empty: return None
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = [col[0] for col in df.columns]
-        df = df[["Open","High","Low","Close","Volume"]].dropna()
-        return df
-    except Exception as e:
-        return None
+_FETCH_MIN_GAP = 1.5   # minimum seconds between any yfinance requests
 
-@st.cache_data(ttl=30)
+def _safe_download(ticker, period, interval, retries=3):
+    """
+    Wraps yf.download with:
+      • 1.5 s minimum gap between calls (rate-limit friendly)
+      • exponential back-off on failure (1.5 s → 3 s → 6 s)
+      • up to `retries` attempts before returning None
+    """
+    now = time_module.time()
+    last = st.session_state.get("_last_yf_call", 0)
+    wait = _FETCH_MIN_GAP - (now - last)
+    if wait > 0:
+        time_module.sleep(wait)
+
+    delay = _FETCH_MIN_GAP
+    for attempt in range(retries):
+        try:
+            st.session_state["_last_yf_call"] = time_module.time()
+            df = yf.download(ticker, period=period, interval=interval,
+                             progress=False, auto_adjust=True)
+            if df.empty:
+                return None
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = [col[0] for col in df.columns]
+            df = df[["Open", "High", "Low", "Close", "Volume"]].dropna()
+            return df
+        except Exception:
+            if attempt < retries - 1:
+                time_module.sleep(delay)
+                delay *= 2          # exponential back-off
+    return None
+
+
+@st.cache_data(ttl=120)
+def fetch(ticker, period, interval):
+    return _safe_download(ticker, period, interval)
+
+
+@st.cache_data(ttl=45)
 def fetch_live(ticker, period, interval):
-    try:
-        df = yf.download(ticker, period=period, interval=interval, progress=False, auto_adjust=True)
-        if df.empty: return None
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = [col[0] for col in df.columns]
-        df = df[["Open","High","Low","Close","Volume"]].dropna()
-        return df
-    except Exception as e:
-        return None
+    return _safe_download(ticker, period, interval)
+
 
 
 # ══════════════════════════════════════════════════════════════
@@ -1081,10 +1101,16 @@ def main():
     with tab_live:
         col_r, col_a, col_info = st.columns([1, 1, 4])
         with col_r:
-            if st.button("🔄 Refresh", use_container_width=True):
+            last_ts = st.session_state.get("_last_refresh_ts", 0)
+            since   = time_module.time() - last_ts
+            btn_ok  = since >= _FETCH_MIN_GAP   # enforce gap on manual too
+            if st.button("🔄 Refresh", use_container_width=True, disabled=not btn_ok):
+                st.session_state["_last_refresh_ts"] = time_module.time()
                 st.cache_data.clear(); st.rerun()
+            if not btn_ok:
+                st.caption(f"⏳ {_FETCH_MIN_GAP - since:.1f}s cooldown")
         with col_a:
-            auto = st.checkbox("⚡ Auto (30s)", value=st.session_state.auto_refresh)
+            auto = st.checkbox("⚡ Auto (45s)", value=st.session_state.auto_refresh)
             st.session_state.auto_refresh = auto
         with col_info:
             st.caption(f"Last scan: {datetime.now().strftime('%H:%M:%S')} | {cfg['ticker']} | "
@@ -1227,9 +1253,21 @@ def main():
             elif pos["side"] == "SHORT" and px <= pos["target"]:
                 st.success("🎯 Target HIT — closing position"); _close_pos("Target Hit")
 
+        # ── Auto-refresh with rate-limit guard ──────────
         if st.session_state.auto_refresh:
-            time_module.sleep(30)
-            st.cache_data.clear(); st.rerun()
+            REFRESH_EVERY = 45          # seconds between full refreshes
+            last = st.session_state.get("_last_refresh_ts", 0)
+            elapsed = time_module.time() - last
+            remaining = max(0, int(REFRESH_EVERY - elapsed))
+
+            if remaining > 0:
+                st.caption(f"⏱ Next refresh in **{remaining}s** (rate-limit safe · min gap {_FETCH_MIN_GAP}s)")
+                time_module.sleep(1)    # tick every 1 second
+                st.rerun()
+            else:
+                st.session_state["_last_refresh_ts"] = time_module.time()
+                st.cache_data.clear()
+                st.rerun()
 
     # ══════════════════════════════════════════════════════
     # TAB 2 — BACKTESTING
@@ -1432,7 +1470,10 @@ Exit breakdown: {er_dict}
     with tab_an:
         st.subheader("📊 Deep Market Analysis")
 
-        if st.button("🔄 Refresh Analysis", key="an_refresh"):
+        an_since = time_module.time() - st.session_state.get("_last_refresh_ts", 0)
+        an_ok    = an_since >= _FETCH_MIN_GAP
+        if st.button("🔄 Refresh Analysis", key="an_refresh", disabled=not an_ok):
+            st.session_state["_last_refresh_ts"] = time_module.time()
             st.cache_data.clear(); st.rerun()
 
         df_an = fetch(cfg["ticker"], cfg["prd"], cfg["tf"])
@@ -1488,11 +1529,13 @@ Exit breakdown: {er_dict}
                 ("R1/S1",        f"{sig_an.get('r1','N/A')}/{sig_an.get('s1','N/A')}", "Pivot levels"),
                 ("OBV",          f"{sig_an['obv_v']:.0f}",   ""),
             ]
-            r1, r2, r3 = st.columns(3), st.columns(3), st.columns(3)
-            for ri, (nm, vl, nt) in enumerate(ind_rows):
-                row = [r1,r2,r3][ri//4]
-                with row[ri % 4 if ri < 4 else (ri-4)%4 if ri < 8 else (ri-8)%4]:
-                    st.metric(nm, vl, nt if nt else None)
+            # 12 items → 3 rows × 4 cols
+            for row_start in range(0, len(ind_rows), 4):
+                cols = st.columns(4)
+                for col_i, item in enumerate(ind_rows[row_start:row_start+4]):
+                    nm, vl, nt = item
+                    with cols[col_i]:
+                        st.metric(nm, vl, nt if nt else None)
 
         st.divider()
 
