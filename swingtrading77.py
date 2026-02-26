@@ -1,4 +1,4 @@
-"""
+ """
 ProTrader AI — Professional Algorithmic Trading Platform
 Built with Streamlit | Free APIs (yfinance) | No talib/pandas_ta
 """
@@ -729,8 +729,8 @@ def build_chart(df, I, sig_data=None, dark=True, height=800):
     # ── Candlestick ─────────────────────────────────────
     fig.add_trace(go.Candlestick(x=c_idx, open=df["Open"], high=df["High"],
                                   low=df["Low"], close=df["Close"], name="Price",
-                                  increasing=dict(line_color=UP, fillcolor=UP+"88"),
-                                  decreasing=dict(line_color=DN, fillcolor=DN+"88")), row=1, col=1)
+                                  increasing=dict(line_color=UP, fillcolor="rgba(0,212,170,0.55)"),
+                                  decreasing=dict(line_color=DN, fillcolor="rgba(255,77,109,0.55)")), row=1, col=1)
 
     # ── EMAs ────────────────────────────────────────────
     for ema_p, col, nm in [(21,"#FFD700","EMA21"),(50,"#FF8C00","EMA50"),(200,"#A78BFA","EMA200")]:
