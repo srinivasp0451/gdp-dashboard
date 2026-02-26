@@ -1,4 +1,4 @@
- """
+"""
 ProTrader AI — Professional Algorithmic Trading Platform
 Built with Streamlit | Free APIs (yfinance) | No talib/pandas_ta
 """
