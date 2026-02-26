@@ -712,6 +712,16 @@ def fetch_live(ticker, period, interval):
 
 
 # ══════════════════════════════════════════════════════════════
+# COLOR HELPERS
+# ══════════════════════════════════════════════════════════════
+def hex_rgba(hex_color: str, alpha: float) -> str:
+    """Convert a 6-digit hex string to rgba(r,g,b,alpha) — Plotly-safe."""
+    h = hex_color.lstrip("#")
+    r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+    return f"rgba({r},{g},{b},{alpha})"
+
+
+# ══════════════════════════════════════════════════════════════
 # CHART BUILDER
 # ══════════════════════════════════════════════════════════════
 def build_chart(df, I, sig_data=None, dark=True, height=800):
@@ -797,7 +807,7 @@ def build_chart(df, I, sig_data=None, dark=True, height=800):
         paper_bgcolor=BG, plot_bgcolor=BG,
         font=dict(color=TEXT, family="DM Sans"),
         xaxis_rangeslider_visible=False,
-        legend=dict(bgcolor=BG+"cc", bordercolor=GRID, borderwidth=1,
+        legend=dict(bgcolor=hex_rgba(BG, 0.80), bordercolor=GRID, borderwidth=1,
                     font=dict(color=TEXT, size=11), orientation="h",
                     x=0, y=1.02, xanchor="left"),
         margin=dict(l=60, r=60, t=50, b=20), height=height,
