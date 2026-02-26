@@ -1,3058 +1,1503 @@
 """
-╔══════════════════════════════════════════════════════════════════════════════════╗
-║         COMPLETE ALGORITHMIC TRADING SYSTEM v2.0                               ║
-║  Strategies: 17 | SL Types: 18 | Target Types: 13 | Broker: Dhan              ║
-║  Features: Backtest (Method1/2) | Live Trading | Multi-Account | Multi-Strike  ║
-╚══════════════════════════════════════════════════════════════════════════════════╝
+ProTrader AI — Professional Algorithmic Trading Platform
+Built with Streamlit | Free APIs (yfinance) | No talib/pandas_ta
 """
 
 import streamlit as st
 import pandas as pd
 import numpy as np
-import pytz
+import yfinance as yf
 from datetime import datetime, time as dtime, timedelta
-import time
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+import time as time_module
 import warnings
-warnings.filterwarnings('ignore')
+warnings.filterwarnings("ignore")
 
-try:
-    import yfinance as yf
-    YFINANCE_AVAILABLE = True
-except ImportError:
-    YFINANCE_AVAILABLE = False
+# ══════════════════════════════════════════════════════════════
+# PAGE CONFIG  (must be first Streamlit call)
+# ══════════════════════════════════════════════════════════════
+st.set_page_config(
+    page_title="ProTrader AI",
+    page_icon="📈",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
 
-try:
-    import plotly.graph_objects as go
-    from plotly.subplots import make_subplots
-    PLOTLY_AVAILABLE = True
-except ImportError:
-    PLOTLY_AVAILABLE = False
+# ══════════════════════════════════════════════════════════════
+# THEME CSS
+# ══════════════════════════════════════════════════════════════
+def apply_theme(dark: bool):
+    if dark:
+        BG   = "#0d1117"; CARD = "#161b22"; TEXT = "#e6edf3"
+        ACC  = "#00d4aa"; SEC  = "#21262d"; BDR  = "#30363d"
+        UP   = "#00d4aa"; DN   = "#ff4d6d"
+    else:
+        BG   = "#f8fafc"; CARD = "#ffffff"; TEXT = "#1a1a2e"
+        ACC  = "#0055ff"; SEC  = "#eef2f7"; BDR  = "#d1d9e0"
+        UP   = "#059669"; DN   = "#dc2626"
 
-try:
-    from dhanhq import dhanhq
-    DHAN_AVAILABLE = True
-except ImportError:
-    DHAN_AVAILABLE = False
+    st.markdown(f"""
+<style>
+@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600&family=Syne:wght@600;800&family=DM+Sans:wght@300;400;500;600&display=swap');
 
-# ──────────────────────────────────────────────────────────────────────────────
+/* ── GLOBAL ── */
+html, body, .stApp                {{ background-color:{BG} !important; color:{TEXT} !important; font-family:'DM Sans',sans-serif; }}
+.stApp > header                   {{ background-color:{BG} !important; border-bottom:1px solid {BDR}; }}
+
+/* ── SIDEBAR ── */
+section[data-testid="stSidebar"]                 {{ background:{CARD} !important; border-right:1px solid {BDR} !important; }}
+section[data-testid="stSidebar"] *               {{ color:{TEXT} !important; }}
+section[data-testid="stSidebar"] .stSelectbox > div > div {{ background:{SEC}; border:1px solid {BDR}; border-radius:8px; }}
+
+/* ── TABS ── */
+.stTabs [data-baseweb="tab-list"] {{ background:{CARD}; border-radius:12px; padding:4px; border:1px solid {BDR}; gap:2px; }}
+.stTabs [data-baseweb="tab"]     {{ color:{TEXT} !important; border-radius:8px; font-weight:500; padding:8px 20px; transition:all .2s; }}
+.stTabs [aria-selected="true"]   {{ background:{ACC} !important; color:#fff !important; font-weight:600; }}
+
+/* ── METRICS ── */
+[data-testid="stMetricValue"]    {{ color:{ACC} !important; font-size:1.35rem !important; font-weight:700; font-family:'JetBrains Mono',monospace; }}
+[data-testid="stMetricLabel"]    {{ color:{TEXT} !important; opacity:.75; font-size:.8rem; text-transform:uppercase; letter-spacing:.05em; }}
+[data-testid="stMetricDelta"]    {{ font-family:'JetBrains Mono',monospace; font-size:.8rem; }}
+
+/* ── BUTTONS ── */
+.stButton > button               {{ background:{ACC}; color:#fff; border:none; border-radius:8px; font-weight:600; padding:10px 24px; transition:all .2s; font-family:'DM Sans',sans-serif; }}
+.stButton > button:hover         {{ opacity:.88; transform:translateY(-1px); box-shadow:0 4px 12px rgba(0,212,170,.35); }}
+
+/* ── INPUTS ── */
+.stSelectbox > div > div, .stNumberInput > div > div > input,
+.stTextInput > div > div > input, .stSlider {{ color:{TEXT} !important; }}
+
+/* ── CARDS ── */
+.pt-card  {{ background:{CARD}; border:1px solid {BDR}; border-radius:14px; padding:18px 22px; margin:8px 0; }}
+.pt-signal-long  {{ background:linear-gradient(135deg,#052e1a,#0a4d28); border:2px solid {UP}; border-radius:14px; padding:22px; color:#fff; }}
+.pt-signal-short {{ background:linear-gradient(135deg,#2e0511,#4d0a1a); border:2px solid {DN}; border-radius:14px; padding:22px; color:#fff; }}
+.pt-signal-hold  {{ background:linear-gradient(135deg,#1c1a05,#33300a); border:2px solid #f59e0b; border-radius:14px; padding:22px; color:#fff; }}
+
+/* ── COMMENTARY ── */
+.pt-commentary {{ background:{SEC}; border-left:4px solid {ACC}; border-radius:0 10px 10px 0; padding:14px 18px; margin:6px 0;
+                  color:{TEXT}; font-family:'JetBrains Mono',monospace; font-size:.82rem; line-height:1.7; white-space:pre-wrap; }}
+
+/* ── DATAFRAME ── */
+.stDataFrame  {{ background:{CARD}; border-radius:10px; border:1px solid {BDR}; }}
+iframe        {{ border-radius:10px; }}
+
+/* ── DIVIDER ── */
+hr {{ border-color:{BDR} !important; }}
+
+/* ── TEXT ── */
+h1,h2,h3,h4,h5,h6,p,label,span,div {{ color:{TEXT}; }}
+.stMarkdown p  {{ color:{TEXT} !important; }}
+
+/* ── SCROLLBAR ── */
+::-webkit-scrollbar       {{ width:6px; height:6px; }}
+::-webkit-scrollbar-track {{ background:{BG}; }}
+::-webkit-scrollbar-thumb {{ background:{ACC}; border-radius:4px; }}
+
+/* ── BADGE ── */
+.badge {{ display:inline-block; padding:3px 10px; border-radius:20px; font-size:.75rem; font-weight:600; font-family:'JetBrains Mono',monospace; }}
+.badge-up {{ background:{'rgba(0,212,170,.18)' if dark else 'rgba(5,150,105,.1)'}; color:{UP}; border:1px solid {UP}; }}
+.badge-dn {{ background:{'rgba(255,77,109,.18)' if dark else 'rgba(220,38,38,.1)'}; color:{DN}; border:1px solid {DN}; }}
+.badge-nt {{ background:rgba(245,158,11,.18); color:#f59e0b; border:1px solid #f59e0b; }}
+
+/* ── LOGO ── */
+.pt-logo {{ font-family:'Syne',sans-serif; font-weight:800; font-size:1.9rem;
+            background:linear-gradient(135deg,{ACC},{ACC}aa); -webkit-background-clip:text; -webkit-text-fill-color:transparent; }}
+</style>
+""", unsafe_allow_html=True)
+
+
+# ══════════════════════════════════════════════════════════════
 # CONSTANTS
-# ──────────────────────────────────────────────────────────────────────────────
-IST = pytz.timezone('Asia/Kolkata')
-UTC = pytz.utc
-
-ASSET_MAP = {
-    "NIFTY 50":        "^NSEI",
-    "NIFTY BANK":      "^NSEBANK",
-    "SENSEX":          "^BSESN",
-    "S&P 500":         "^GSPC",
-    "NASDAQ":          "^IXIC",
-    "DOW JONES":       "^DJI",
-    "Reliance":        "RELIANCE.NS",
-    "TCS":             "TCS.NS",
-    "Infosys":         "INFY.NS",
-    "HDFC Bank":       "HDFCBANK.NS",
-    "ICICI Bank":      "ICICIBANK.NS",
-    "Custom Ticker":   "CUSTOM",
+# ══════════════════════════════════════════════════════════════
+TICKERS = {
+    "NIFTY 50":     "^NSEI",
+    "BANK NIFTY":   "^NSEBANK",
+    "SENSEX":       "^BSESN",
+    "BTC/USD":      "BTC-USD",
+    "ETH/USD":      "ETH-USD",
+    "USD/INR":      "INR=X",
+    "GOLD":         "GC=F",
+    "SILVER":       "SI=F",
+    "CRUDE OIL":    "CL=F",
+    "EUR/USD":      "EURUSD=X",
+    "GBP/USD":      "GBPUSD=X",
+    "USD/JPY":      "JPY=X",
+    "APPLE":        "AAPL",
+    "RELIANCE":     "RELIANCE.NS",
+    "TCS":          "TCS.NS",
+    "HDFC BANK":    "HDFCBANK.NS",
+    "⚙ Custom":     "__custom__",
 }
 
-INTERVAL_MAP = {
-    "1 minute":  "1m",
-    "5 minutes": "5m",
-    "15 minutes":"15m",
-    "30 minutes":"30m",
-    "1 hour":    "1h",
-    "1 day":     "1d",
-    "1 week":    "1wk",
+TIMEFRAMES = {
+    "1 Minute":   "1m",
+    "5 Minutes":  "5m",
+    "15 Minutes": "15m",
+    "30 Minutes": "30m",
+    "1 Hour":     "1h",
+    "4 Hours":    "4h",
+    "1 Day":      "1d",
+    "1 Week":     "1wk",
 }
 
-PERIOD_MAP = {
-    "1 day":    "1d",
-    "5 days":   "5d",
-    "1 month":  "1mo",
-    "3 months": "3mo",
-    "6 months": "6mo",
-    "1 year":   "1y",
-    "2 years":  "2y",
-    "5 years":  "5y",
+PERIODS = {
+    "1 Day":    "1d",
+    "5 Days":   "5d",
+    "1 Month":  "1mo",
+    "3 Months": "3mo",
+    "6 Months": "6mo",
+    "1 Year":   "1y",
+    "2 Years":  "2y",
 }
 
-STRATEGIES = [
-    "EMA Crossover",
-    "Simple Buy",
-    "Simple Sell",
-    "Price Crosses Threshold",
-    "RSI-ADX-EMA Combined",
-    "Percentage Change",
-    "AI Price Action",
-    "Custom Strategy (Multi-Indicator)",
-    "SuperTrend AI",
-    "VWAP + Volume Spike",
-    "Bollinger Squeeze Breakout",
-    "Elliott Waves + Ratio Charts",
-    # 5 New High-Probability Strategies
-    "Morning Breakout (ORB)",
-    "MACD Divergence",
-    "Triple EMA Momentum",
-    "Mean Reversion (Bollinger + RSI)",
-    "Ichimoku Cloud Breakout",
-]
+REC_TF = {
+    "Scalping":    ("5 Minutes",  "5 Days"),
+    "Intraday":    ("15 Minutes", "1 Month"),
+    "Swing":       ("1 Hour",     "3 Months"),
+    "Positional":  ("1 Day",      "1 Year"),
+}
 
-SL_TYPES = [
-    "Custom Points",
-    "P&L Based (Rupees)",
-    "ATR-based",
-    "Current Candle Low/High",
-    "Previous Candle Low/High",
-    "Current Swing Low/High",
-    "Previous Swing Low/High",
-    "Signal-based (Reverse Crossover)",
-    "Trailing SL (Points)",
-    "Trailing Profit (Rupees)",
-    "Trailing Loss (Rupees)",
-    "Trailing SL + Current Candle",
-    "Trailing SL + Previous Candle",
-    "Trailing SL + Current Swing",
-    "Trailing SL + Previous Swing",
-    "Volatility-Adjusted Trailing SL",
-    "Break-even After 50% Target",
-    "Cost-to-Cost + N Points Trailing SL",
-]
+SL_TYPES = {
+    "ATR-Based (Dynamic)":      "atr",
+    "Fixed %":                  "pct",
+    "Swing High/Low":           "swing",
+    "Volatility (2×ATR)":       "vol",
+    "Previous Candle H/L":      "candle",
+}
 
-TARGET_TYPES = [
-    "Custom Points",
-    "P&L Based (Rupees)",
-    "Trailing Target (Points)",
-    "Trailing Target + Signal Based",
-    "Dynamic Trailing SL+Target (Lock Profits)",
-    "50% Exit at Target (Partial)",
-    "Current Candle Low/High",
-    "Previous Candle Low/High",
-    "Current Swing Low/High",
-    "Previous Swing Low/High",
-    "ATR-based",
-    "Risk-Reward Based",
-    "Signal-based (Reverse Crossover)",
-]
+TARGET_TYPES = {
+    "ATR Multiple":             "atr",
+    "Risk:Reward Ratio":        "rr",
+    "Pivot Points (R1/S1)":     "pivot",
+    "Bollinger Band Extreme":   "bb",
+    "Fixed %":                  "pct",
+}
 
-# ──────────────────────────────────────────────────────────────────────────────
-# DATA FETCHING
-# ──────────────────────────────────────────────────────────────────────────────
-def fetch_data(ticker: str, interval: str, period: str) -> pd.DataFrame:
-    """
-    Fetch OHLCV data from Yahoo Finance and convert timestamps to IST.
-    Returns a DataFrame with columns: Datetime, Open, High, Low, Close, Volume
-    """
-    if not YFINANCE_AVAILABLE:
-        st.error("yfinance not installed. Run: pip install yfinance")
-        return pd.DataFrame()
+STRATEGY_DESC = {
+    "Scalping":   "EMA9/21 cross + RSI + Stochastic + Volume surge | Best on 1m–5m | Tight SLs",
+    "Intraday":   "VWAP deviation + EMA21/50 + MACD + Bollinger Bands | Best on 15m–30m",
+    "Swing":      "EMA21/50 Golden/Death Cross + ADX trend strength + Supertrend | Best on 1h–4h",
+    "Positional": "Supertrend + EMA200 + ADX + MACD | Best on 1d–1wk | Wide SLs",
+}
+
+
+# ══════════════════════════════════════════════════════════════
+# SESSION STATE
+# ══════════════════════════════════════════════════════════════
+def _init():
+    defaults = {
+        "dark_mode":       False,   # default: light theme
+        "trade_history":   [],
+        "paper_position":  None,
+        "paper_balance":   100_000.0,
+        "commentary_log":  [],
+        "auto_refresh":    False,
+        "last_refresh":    None,
+    }
+    for k, v in defaults.items():
+        if k not in st.session_state:
+            st.session_state[k] = v
+
+
+# ══════════════════════════════════════════════════════════════
+# INDICATORS  (pure pandas/numpy — no talib)
+# ══════════════════════════════════════════════════════════════
+def _ema(s, n):
+    return s.ewm(span=n, adjust=False).mean()
+
+def _sma(s, n):
+    return s.rolling(n).mean()
+
+def _rsi(s, n=14):
+    d = s.diff()
+    g = d.clip(lower=0).ewm(com=n-1, min_periods=n).mean()
+    l = (-d.clip(upper=0)).ewm(com=n-1, min_periods=n).mean()
+    return 100 - 100 / (1 + g / l.replace(0, np.nan))
+
+def _macd(s, f=12, sl=26, sig=9):
+    m = _ema(s, f) - _ema(s, sl)
+    si = _ema(m, sig)
+    return m, si, m - si
+
+def _boll(s, n=20, k=2):
+    m = _sma(s, n)
+    std = s.rolling(n).std()
+    return m + k*std, m, m - k*std
+
+def _atr(h, l, c, n=14):
+    tr = pd.concat([h-l, (h-c.shift()).abs(), (l-c.shift()).abs()], axis=1).max(axis=1)
+    return tr.ewm(com=n-1, min_periods=n).mean()
+
+def _vwap(h, l, c, v):
+    tp = (h + l + c) / 3
+    return (tp * v).cumsum() / v.cumsum()
+
+def _supertrend(h, l, c, n=10, mult=3.0):
+    atr_v   = _atr(h, l, c, n).values
+    hl2     = ((h + l) / 2).values
+    c_arr   = c.values
+    ub, lb  = hl2 + mult*atr_v, hl2 - mult*atr_v
+    fub, flb = ub.copy(), lb.copy()
+    trend = np.ones(len(c_arr))
+    for i in range(1, len(c_arr)):
+        fub[i] = ub[i] if (ub[i] < fub[i-1] or c_arr[i-1] > fub[i-1]) else fub[i-1]
+        flb[i] = lb[i] if (lb[i] > flb[i-1] or c_arr[i-1] < flb[i-1]) else flb[i-1]
+        if trend[i-1] == -1:
+            trend[i] = 1  if c_arr[i] > fub[i] else -1
+        else:
+            trend[i] = -1 if c_arr[i] < flb[i] else  1
+    st_line = np.where(trend == 1, flb, fub)
+    return pd.Series(st_line, index=c.index), pd.Series(trend, index=c.index)
+
+def _adx(h, l, c, n=14):
+    tr  = pd.concat([h-l, (h-c.shift()).abs(), (l-c.shift()).abs()], axis=1).max(axis=1)
+    dmp = h.diff().clip(lower=0)
+    dmn = (-l.diff()).clip(lower=0)
+    dmp = dmp.where(dmp > dmn, 0.0)
+    dmn = dmn.where(dmn > dmp, 0.0)
+    atr14  = tr.ewm(com=n-1, min_periods=n).mean()
+    dip    = 100 * dmp.ewm(com=n-1, min_periods=n).mean() / atr14
+    din    = 100 * dmn.ewm(com=n-1, min_periods=n).mean() / atr14
+    dx     = 100 * (dip - din).abs() / (dip + din).replace(0, np.nan)
+    return dx.ewm(com=n-1, min_periods=n).mean(), dip, din
+
+def _stoch(h, l, c, k=14, d=3):
+    lo, hi = l.rolling(k).min(), h.rolling(k).max()
+    sk = 100 * (c - lo) / (hi - lo).replace(0, np.nan)
+    return sk, sk.rolling(d).mean()
+
+def _obv(c, v):
+    return (np.sign(c.diff()).fillna(0) * v).cumsum()
+
+def compute_indicators(df):
+    c, h, l = df["Close"], df["High"], df["Low"]
+    v = df.get("Volume", pd.Series(np.ones(len(df)), index=df.index))
+    I = {}
+    I["ema9"]   = _ema(c, 9);   I["ema21"]  = _ema(c, 21)
+    I["ema50"]  = _ema(c, 50);  I["ema200"] = _ema(c, 200)
+    I["sma20"]  = _sma(c, 20)
+    I["rsi"]    = _rsi(c, 14)
+    I["macd"], I["macd_sig"], I["macd_hist"] = _macd(c)
+    I["bb_up"], I["bb_mid"], I["bb_lo"]      = _boll(c)
+    I["atr"]    = _atr(h, l, c, 14)
     try:
-        raw = yf.download(ticker, period=period, interval=interval,
-                          auto_adjust=True, progress=False)
-        if raw.empty:
-            return pd.DataFrame()
-
-        # Flatten multi-level columns if present
-        if isinstance(raw.columns, pd.MultiIndex):
-            raw.columns = raw.columns.get_level_values(0)
-
-        raw = raw.reset_index()
-        # Rename datetime column
-        if 'Datetime' in raw.columns:
-            raw = raw.rename(columns={'Datetime': 'Datetime'})
-        elif 'Date' in raw.columns:
-            raw = raw.rename(columns={'Date': 'Datetime'})
-
-        # Convert to IST
-        if raw['Datetime'].dtype == 'object':
-            raw['Datetime'] = pd.to_datetime(raw['Datetime'])
-
-        if raw['Datetime'].dt.tz is None:
-            raw['Datetime'] = raw['Datetime'].dt.tz_localize('UTC')
-        raw['Datetime'] = raw['Datetime'].dt.tz_convert(IST)
-
-        raw = raw[['Datetime', 'Open', 'High', 'Low', 'Close', 'Volume']].copy()
-        raw = raw.dropna(subset=['Open', 'High', 'Low', 'Close'])
-        raw = raw.reset_index(drop=True)
-        return raw
-    except Exception as e:
-        st.error(f"Data fetch error: {e}")
-        return pd.DataFrame()
+        I["vwap"] = _vwap(h, l, c, v)
+    except Exception:
+        I["vwap"] = c.copy()
+    I["st_line"], I["st_dir"]   = _supertrend(h, l, c)
+    I["adx"], I["dip"], I["din"] = _adx(h, l, c)
+    I["stoch_k"], I["stoch_d"]  = _stoch(h, l, c)
+    I["obv"]    = _obv(c, v)
+    pivot       = (h.shift(1) + l.shift(1) + c.shift(1)) / 3
+    I["pivot"]  = pivot
+    I["r1"]     = 2*pivot - l.shift(1)
+    I["s1"]     = 2*pivot - h.shift(1)
+    I["r2"]     = pivot + (h.shift(1) - l.shift(1))
+    I["s2"]     = pivot - (h.shift(1) - l.shift(1))
+    return I
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# INDICATOR CALCULATIONS
-# ──────────────────────────────────────────────────────────────────────────────
-def calculate_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
-    """Average True Range."""
-    high_low   = df['High'] - df['Low']
-    high_close = (df['High'] - df['Close'].shift(1)).abs()
-    low_close  = (df['Low']  - df['Close'].shift(1)).abs()
-    tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
-    return tr.rolling(period).mean()
+# ══════════════════════════════════════════════════════════════
+# STRATEGIES
+# ══════════════════════════════════════════════════════════════
+def _score_to_signal(score, threshold=50):
+    if score >= threshold:   return "LONG"
+    if score <= -threshold:  return "SHORT"
+    return "HOLD"
+
+def _strat_scalping(df, I):
+    c = df["Close"]; v = df.get("Volume", pd.Series(np.ones(len(df)), index=df.index))
+    e9, e21 = I["ema9"].values, I["ema21"].values
+    r, sk, sd = I["rsi"].values, I["stoch_k"].values, I["stoch_d"].values
+    vol, vol_ma = v.values, v.rolling(20).mean().values
+    sigs, scores, reasons = (pd.Series("HOLD", index=df.index),
+                             pd.Series(0.0, index=df.index), pd.Series("", index=df.index))
+    for i in range(21, len(df)):
+        sc, rs = 0, []
+        # EMA cross
+        if e9[i] > e21[i] and e9[i-1] <= e21[i-1]: sc += 40; rs.append("EMA9 crossed ↑ EMA21 (fresh bull cross)")
+        elif e9[i] < e21[i] and e9[i-1] >= e21[i-1]: sc -= 40; rs.append("EMA9 crossed ↓ EMA21 (fresh bear cross)")
+        elif e9[i] > e21[i]: sc += 15; rs.append("EMA9>EMA21 (uptrend)")
+        else: sc -= 15; rs.append("EMA9<EMA21 (downtrend)")
+        # RSI
+        if not np.isnan(r[i]):
+            if r[i] < 30: sc += 25; rs.append(f"RSI={r[i]:.1f} oversold")
+            elif r[i] > 70: sc -= 25; rs.append(f"RSI={r[i]:.1f} overbought")
+        # Stochastic
+        if not (np.isnan(sk[i]) or np.isnan(sd[i])):
+            if sk[i] < 20 and sd[i] < 20: sc += 20; rs.append("Stoch oversold")
+            elif sk[i] > 80 and sd[i] > 80: sc -= 20; rs.append("Stoch overbought")
+            if sk[i] > sd[i] and sk[i-1] <= sd[i-1]: sc += 15; rs.append("Stoch K↑D (buy)")
+            elif sk[i] < sd[i] and sk[i-1] >= sd[i-1]: sc -= 15; rs.append("Stoch K↓D (sell)")
+        # Volume
+        if not np.isnan(vol_ma[i]) and vol_ma[i] > 0:
+            if vol[i] > 1.5*vol_ma[i]:
+                addon = 10 if sc > 0 else -10
+                sc += addon; rs.append("Volume surge confirms move")
+        scores.iloc[i] = np.clip(sc, -100, 100)
+        reasons.iloc[i] = " | ".join(rs)
+        sigs.iloc[i] = _score_to_signal(sc, 50)
+    return sigs, scores, reasons
+
+def _strat_intraday(df, I):
+    c = df["Close"]
+    vw, e21, e50 = I["vwap"].values, I["ema21"].values, I["ema50"].values
+    m, ms, mh = I["macd"].values, I["macd_sig"].values, I["macd_hist"].values
+    r, bbu, bbl = I["rsi"].values, I["bb_up"].values, I["bb_lo"].values
+    cv = c.values
+    sigs, scores, reasons = (pd.Series("HOLD", index=df.index),
+                             pd.Series(0.0, index=df.index), pd.Series("", index=df.index))
+    for i in range(50, len(df)):
+        sc, rs = 0, []
+        # VWAP
+        if not np.isnan(vw[i]):
+            if cv[i] > vw[i]*1.001: sc += 25; rs.append(f"Price above VWAP (bull bias)")
+            elif cv[i] < vw[i]*0.999: sc -= 25; rs.append(f"Price below VWAP (bear bias)")
+        # EMA alignment
+        if e21[i] > e50[i]: sc += 15; rs.append("EMA21>EMA50 uptrend")
+        else: sc -= 15; rs.append("EMA21<EMA50 downtrend")
+        # MACD
+        if not (np.isnan(m[i]) or np.isnan(ms[i])):
+            if m[i] > ms[i] and m[i-1] <= ms[i-1]: sc += 30; rs.append("MACD bull crossover")
+            elif m[i] < ms[i] and m[i-1] >= ms[i-1]: sc -= 30; rs.append("MACD bear crossover")
+            elif m[i] > ms[i]: sc += 10; rs.append("MACD bullish")
+            else: sc -= 10; rs.append("MACD bearish")
+            if mh[i] > 0 and mh[i] > mh[i-1]: sc += 8; rs.append("Histogram expanding ↑")
+            elif mh[i] < 0 and mh[i] < mh[i-1]: sc -= 8; rs.append("Histogram expanding ↓")
+        # RSI
+        if not np.isnan(r[i]):
+            if r[i] < 35: sc += 18; rs.append(f"RSI={r[i]:.1f} oversold")
+            elif r[i] > 65: sc -= 18; rs.append(f"RSI={r[i]:.1f} overbought")
+        # Bollinger
+        if not np.isnan(bbl[i]):
+            if cv[i] <= bbl[i]: sc += 14; rs.append("Price at BB lower (bounce zone)")
+            elif cv[i] >= bbu[i]: sc -= 14; rs.append("Price at BB upper (reversal zone)")
+        scores.iloc[i] = np.clip(sc, -100, 100)
+        reasons.iloc[i] = " | ".join(rs)
+        sigs.iloc[i] = _score_to_signal(sc, 55)
+    return sigs, scores, reasons
+
+def _strat_swing(df, I):
+    c = df["Close"]
+    e21, e50, e200 = I["ema21"].values, I["ema50"].values, I["ema200"].values
+    m, ms = I["macd"].values, I["macd_sig"].values
+    r, adx_v = I["rsi"].values, I["adx"].values
+    dip, din = I["dip"].values, I["din"].values
+    std = I["st_dir"].values; cv = c.values
+    sigs, scores, reasons = (pd.Series("HOLD", index=df.index),
+                             pd.Series(0.0, index=df.index), pd.Series("", index=df.index))
+    for i in range(201, len(df)):
+        sc, rs = 0, []
+        # EMA200 context
+        if cv[i] > e200[i]: sc += 12; rs.append("Above EMA200 (macro uptrend)")
+        else: sc -= 12; rs.append("Below EMA200 (macro downtrend)")
+        # EMA21/50 cross
+        if e21[i] > e50[i] and e21[i-1] <= e50[i-1]: sc += 38; rs.append("🟡 Golden Cross: EMA21 above EMA50")
+        elif e21[i] < e50[i] and e21[i-1] >= e50[i-1]: sc -= 38; rs.append("💀 Death Cross: EMA21 below EMA50")
+        elif e21[i] > e50[i]: sc += 16; rs.append("EMA21>EMA50 (swing uptrend)")
+        else: sc -= 16; rs.append("EMA21<EMA50 (swing downtrend)")
+        # ADX
+        if not np.isnan(adx_v[i]):
+            mult = 1.5 if adx_v[i] > 25 else (1.0 if adx_v[i] > 20 else 0.4)
+            if dip[i] > din[i]: sc += int(15*mult); rs.append(f"ADX={adx_v[i]:.0f} DI+ dominant (bull)")
+            else: sc -= int(15*mult); rs.append(f"ADX={adx_v[i]:.0f} DI- dominant (bear)")
+        # MACD
+        if not np.isnan(m[i]):
+            if m[i] > ms[i]: sc += 14; rs.append("MACD bullish")
+            else: sc -= 14; rs.append("MACD bearish")
+        # RSI momentum
+        if not np.isnan(r[i]):
+            if r[i] > 55: sc += 8; rs.append(f"RSI={r[i]:.0f} bullish momentum")
+            elif r[i] < 45: sc -= 8; rs.append(f"RSI={r[i]:.0f} bearish momentum")
+        # Supertrend
+        if not np.isnan(std[i]):
+            if std[i] == 1: sc += 14; rs.append("Supertrend BULLISH")
+            else: sc -= 14; rs.append("Supertrend BEARISH")
+        scores.iloc[i] = np.clip(sc, -100, 100)
+        reasons.iloc[i] = " | ".join(rs)
+        sigs.iloc[i] = _score_to_signal(sc, 60)
+    return sigs, scores, reasons
+
+def _strat_positional(df, I):
+    c = df["Close"]
+    e50, e200 = I["ema50"].values, I["ema200"].values
+    stl, std = I["st_line"].values, I["st_dir"].values
+    adx_v, dip, din = I["adx"].values, I["dip"].values, I["din"].values
+    m, ms = I["macd"].values, I["macd_sig"].values
+    r = I["rsi"].values; cv = c.values
+    sigs, scores, reasons = (pd.Series("HOLD", index=df.index),
+                             pd.Series(0.0, index=df.index), pd.Series("", index=df.index))
+    for i in range(201, len(df)):
+        sc, rs = 0, []
+        # Supertrend — primary signal
+        if not np.isnan(std[i]):
+            if std[i] == 1: sc += 42; rs.append(f"Supertrend BULLISH (support at {stl[i]:.4f})")
+            else: sc -= 42; rs.append(f"Supertrend BEARISH (resistance at {stl[i]:.4f})")
+        # EMA200 major trend
+        if cv[i] > e200[i]: sc += 22; rs.append(f"Above EMA200={e200[i]:.4f} (primary uptrend)")
+        else: sc -= 22; rs.append(f"Below EMA200={e200[i]:.4f} (primary downtrend)")
+        # ADX + directional
+        if not np.isnan(adx_v[i]) and adx_v[i] > 18:
+            if dip[i] > din[i]: sc += 18; rs.append(f"ADX={adx_v[i]:.0f} bullish direction")
+            else: sc -= 18; rs.append(f"ADX={adx_v[i]:.0f} bearish direction")
+        # MACD confirmation
+        if not np.isnan(m[i]):
+            if m[i] > ms[i]: sc += 12; rs.append("MACD confirms bull momentum")
+            else: sc -= 12; rs.append("MACD confirms bear momentum")
+        if not np.isnan(r[i]): sc += 6 if r[i] > 50 else -6
+        scores.iloc[i] = np.clip(sc, -100, 100)
+        reasons.iloc[i] = " | ".join(rs)
+        sigs.iloc[i] = _score_to_signal(sc, 65)
+    return sigs, scores, reasons
+
+def run_strategy(df, strategy, I=None):
+    if I is None: I = compute_indicators(df)
+    fn = {"Scalping": _strat_scalping, "Intraday": _strat_intraday,
+          "Swing": _strat_swing, "Positional": _strat_positional}[strategy]
+    return fn(df, I)
 
 
-def calculate_supertrend(df: pd.DataFrame, period: int = 10,
-                         multiplier: float = 3.0):
-    """SuperTrend indicator. Returns (trend_series, direction_series)."""
-    atr = calculate_atr(df, period)
-    hl_avg = (df['High'] + df['Low']) / 2
-    upper = hl_avg + multiplier * atr
-    lower = hl_avg - multiplier * atr
+# ══════════════════════════════════════════════════════════════
+# SIGNAL BUILDER  (entry + all SL/target variants)
+# ══════════════════════════════════════════════════════════════
+def compute_sl_target(side, entry, atr_v, sl_type, tgt_type, sl_mult, t_mult, high, low, pivot, r1, s1, bb_up, bb_lo, pct=1.5):
+    """Returns sl, t1, t2, t3, tsl_offset"""
+    direction = 1 if side == "LONG" else -1
 
-    supertrend = pd.Series(index=df.index, dtype=float)
-    direction  = pd.Series(index=df.index, dtype=int)
+    # ── Stop Loss ──────────────────────────────────────────
+    if sl_type == "atr":
+        sl = entry - direction * sl_mult * atr_v
+    elif sl_type == "pct":
+        sl = entry * (1 - direction * pct/100)
+    elif sl_type == "swing":
+        sl = low - atr_v*0.2 if side == "LONG" else high + atr_v*0.2
+    elif sl_type == "vol":
+        sl = entry - direction * 2 * atr_v
+    elif sl_type == "candle":
+        sl = low if side == "LONG" else high
+    else:
+        sl = entry - direction * sl_mult * atr_v
+
+    risk = abs(entry - sl) if abs(entry - sl) > 1e-9 else atr_v
+
+    # ── Targets ────────────────────────────────────────────
+    if tgt_type == "atr":
+        t1 = entry + direction * t_mult * atr_v
+        t2 = entry + direction * t_mult * 1.8 * atr_v
+        t3 = entry + direction * t_mult * 3.0 * atr_v
+    elif tgt_type == "rr":
+        t1 = entry + direction * risk * t_mult
+        t2 = entry + direction * risk * t_mult * 1.8
+        t3 = entry + direction * risk * t_mult * 3.0
+    elif tgt_type == "pivot" and r1 and s1:
+        t1 = r1 if side == "LONG" else s1
+        t2 = entry + direction * risk * 2.5
+        t3 = entry + direction * risk * 4.0
+    elif tgt_type == "bb":
+        t1 = bb_up if side == "LONG" else bb_lo
+        t2 = entry + direction * risk * 2.5
+        t3 = entry + direction * risk * 4.0
+    elif tgt_type == "pct":
+        t1 = entry * (1 + direction * pct * t_mult / 100)
+        t2 = entry * (1 + direction * pct * t_mult * 1.8 / 100)
+        t3 = entry * (1 + direction * pct * t_mult * 3.0 / 100)
+    else:
+        t1 = entry + direction * t_mult * atr_v
+        t2 = entry + direction * t_mult * 1.8 * atr_v
+        t3 = entry + direction * t_mult * 3.0 * atr_v
+
+    tsl_offset = sl_mult * atr_v
+    return sl, t1, t2, t3, tsl_offset
+
+def get_signal(df, strategy, sl_type="atr", tgt_type="atr", sl_mult=1.5, t_mult=2.0):
+    if df is None or len(df) < 30: return None
+    I   = compute_indicators(df)
+    sigs, scores, reasons = run_strategy(df, strategy, I)
+    i   = -1
+    sig = sigs.iloc[i]; score = scores.iloc[i]; reason = reasons.iloc[i]
+    c   = df["Close"].iloc[i]
+    h   = df["High"].iloc[-5:].min();  l = df["Low"].iloc[-5:].max()
+    h_c = df["High"].iloc[i]; l_c = df["Low"].iloc[i]
+    atr_v  = I["atr"].iloc[i]
+    if np.isnan(atr_v) or atr_v == 0: atr_v = c * 0.01
+    r1_v = I["r1"].iloc[i]; s1_v = I["s1"].iloc[i]
+    bbu  = I["bb_up"].iloc[i]; bbl = I["bb_lo"].iloc[i]
+    pivot_v = I["pivot"].iloc[i]
+    sl, t1, t2, t3, tsl = compute_sl_target(
+        sig, c, atr_v, sl_type, tgt_type, sl_mult, t_mult,
+        h_c, l_c, pivot_v, r1_v, s1_v, bbu, bbl)
+    rr = abs(t1 - c) / max(abs(c - sl), 1e-9)
+    return {
+        "signal":     sig,
+        "confidence": float(min(abs(score), 100)),
+        "score":      float(score),
+        "entry":      c,
+        "sl":         sl, "t1": t1, "t2": t2, "t3": t3,
+        "tsl_offset": tsl,
+        "atr":        atr_v,
+        "reason":     reason,
+        "rr":         rr,
+        "rsi":        float(I["rsi"].iloc[i]),
+        "macd_v":     float(I["macd"].iloc[i]),
+        "adx_v":      float(I["adx"].iloc[i]),
+        "st_dir":     float(I["st_dir"].iloc[i]),
+        "ema21":      float(I["ema21"].iloc[i]),
+        "ema50":      float(I["ema50"].iloc[i]),
+        "vwap_v":     float(I["vwap"].iloc[i]),
+        "r1":         float(r1_v) if not np.isnan(r1_v) else None,
+        "s1":         float(s1_v) if not np.isnan(s1_v) else None,
+        "dip":        float(I["dip"].iloc[i]),
+        "din":        float(I["din"].iloc[i]),
+        "bb_up":      float(bbu),
+        "bb_lo":      float(bbl),
+        "obv_v":      float(I["obv"].iloc[i]),
+    }
+
+
+# ══════════════════════════════════════════════════════════════
+# BACKTESTING ENGINE
+# ══════════════════════════════════════════════════════════════
+def run_backtest(df, strategy, sl_mult=1.5, t_mult=2.0, sl_type="atr", tgt_type="atr",
+                 use_window=False, win_start=None, win_end=None, capital=100_000, qty=1):
+    I = compute_indicators(df)
+    sigs, scores, reasons = run_strategy(df, strategy, I)
+    c_arr   = df["Close"].values
+    h_arr   = df["High"].values
+    l_arr   = df["Low"].values
+    atr_arr = I["atr"].values
+    r1_arr  = I["r1"].values
+    s1_arr  = I["s1"].values
+    bbu_arr = I["bb_up"].values
+    bbl_arr = I["bb_lo"].values
+    piv_arr = I["pivot"].values
+    idx     = df.index
+
+    trades = []
+    equity = [capital]
+    bal    = capital
+    peak   = capital
+    max_dd = 0.0
+
+    in_trade = False; side = None; entry = 0.0; sl = 0.0; target = 0.0
+    tsl_off  = 0.0;  best_price = 0.0; t_entry = None; t_reason = ""
 
     for i in range(1, len(df)):
-        if pd.isna(atr.iloc[i]):
-            supertrend.iloc[i] = np.nan
-            direction.iloc[i]  = 1
-            continue
+        # ── Trading window ──────────────────────────────
+        if use_window and win_start and win_end:
+            ts = pd.Timestamp(idx[i])
+            if hasattr(ts, "time"):
+                t = ts.time()
+                in_window = win_start <= t <= win_end
+                if not in_window:
+                    if in_trade:
+                        pnl = (c_arr[i] - entry)*qty if side == "LONG" else (entry - c_arr[i])*qty
+                        bal += pnl; trades.append(_trade_rec(t_entry, idx[i], side, entry, c_arr[i], pnl, "Window Close", t_reason))
+                        in_trade = False
+                    equity.append(bal); peak = max(peak, bal); max_dd = max(max_dd, (peak-bal)/peak*100)
+                    continue
 
-        prev_upper = upper.iloc[i - 1] if not pd.isna(upper.iloc[i - 1]) else upper.iloc[i]
-        prev_lower = lower.iloc[i - 1] if not pd.isna(lower.iloc[i - 1]) else lower.iloc[i]
-        prev_dir   = direction.iloc[i - 1] if i > 0 else 1
+        sig   = sigs.iloc[i]; score = abs(scores.iloc[i])
+        atr_v = atr_arr[i] if not np.isnan(atr_arr[i]) else c_arr[i]*0.01
+        r1_v  = r1_arr[i] if not np.isnan(r1_arr[i]) else None
+        s1_v  = s1_arr[i] if not np.isnan(s1_arr[i]) else None
 
-        # Adjust bands
-        curr_upper = upper.iloc[i] if (upper.iloc[i] < prev_upper or df['Close'].iloc[i - 1] > prev_upper) else prev_upper
-        curr_lower = lower.iloc[i] if (lower.iloc[i] > prev_lower or df['Close'].iloc[i - 1] < prev_lower) else prev_lower
+        # ── Manage open trade ────────────────────────────
+        if in_trade:
+            if side == "LONG":
+                best_price = max(best_price, h_arr[i])
+                new_tsl    = best_price - tsl_off
+                sl         = max(sl, new_tsl)      # trail up only
+                if l_arr[i] <= sl:
+                    pnl = (sl - entry)*qty; bal += pnl
+                    trades.append(_trade_rec(t_entry, idx[i], "LONG", entry, sl, pnl, "Stop Loss", t_reason))
+                    in_trade = False
+                elif h_arr[i] >= target:
+                    pnl = (target - entry)*qty; bal += pnl
+                    trades.append(_trade_rec(t_entry, idx[i], "LONG", entry, target, pnl, "Target Hit", t_reason))
+                    in_trade = False
+                elif sig == "SHORT" and score >= 55:
+                    pnl = (c_arr[i] - entry)*qty; bal += pnl
+                    trades.append(_trade_rec(t_entry, idx[i], "LONG", entry, c_arr[i], pnl, "Signal Flip", t_reason))
+                    in_trade = False
+            else:
+                best_price = min(best_price, l_arr[i])
+                new_tsl    = best_price + tsl_off
+                sl         = min(sl, new_tsl)      # trail down only
+                if h_arr[i] >= sl:
+                    pnl = (entry - sl)*qty; bal += pnl
+                    trades.append(_trade_rec(t_entry, idx[i], "SHORT", entry, sl, pnl, "Stop Loss", t_reason))
+                    in_trade = False
+                elif l_arr[i] <= target:
+                    pnl = (entry - target)*qty; bal += pnl
+                    trades.append(_trade_rec(t_entry, idx[i], "SHORT", entry, target, pnl, "Target Hit", t_reason))
+                    in_trade = False
+                elif sig == "LONG" and score >= 55:
+                    pnl = (entry - c_arr[i])*qty; bal += pnl
+                    trades.append(_trade_rec(t_entry, idx[i], "SHORT", entry, c_arr[i], pnl, "Signal Flip", t_reason))
+                    in_trade = False
+            peak   = max(peak, bal); max_dd = max(max_dd, (peak-bal)/peak*100)
 
-        if prev_dir == 1:
-            curr_dir = -1 if df['Close'].iloc[i] < curr_lower else 1
-        else:
-            curr_dir = 1 if df['Close'].iloc[i] > curr_upper else -1
+        # ── Enter new trade ──────────────────────────────
+        if not in_trade and sig in ("LONG","SHORT") and score >= 50:
+            sl_c, t1_c, _, t3_c, tsl_c = compute_sl_target(
+                sig, c_arr[i], atr_v, sl_type, tgt_type, sl_mult, t_mult,
+                h_arr[i], l_arr[i], piv_arr[i], r1_v, s1_v, bbu_arr[i], bbl_arr[i])
+            in_trade   = True; side  = sig; entry = c_arr[i]
+            sl         = sl_c; target = t3_c; tsl_off = tsl_c
+            best_price = entry if sig == "LONG" else entry
+            t_entry    = idx[i]; t_reason = reasons.iloc[i]
 
-        supertrend.iloc[i] = curr_lower if curr_dir == 1 else curr_upper
-        direction.iloc[i]  = curr_dir
+        equity.append(bal)
 
-    return supertrend, direction
+    # ── Force close at end ──────────────────────────────
+    if in_trade:
+        pnl = (c_arr[-1]-entry)*qty if side=="LONG" else (entry-c_arr[-1])*qty
+        bal += pnl
+        trades.append(_trade_rec(t_entry, idx[-1], side, entry, c_arr[-1], pnl, "End of Data", t_reason))
+        equity.append(bal)
+
+    if not trades:
+        return None, pd.DataFrame(), []
+
+    tf = pd.DataFrame(trades)
+    w  = tf[tf["pnl"] > 0]; lo = tf[tf["pnl"] <= 0]
+    stats = {
+        "trades":   len(tf),
+        "win_rate": len(w)/len(tf)*100,
+        "total_pnl":  tf["pnl"].sum(),
+        "return_pct": tf["pnl"].sum()/capital*100,
+        "avg_win":  w["pnl"].mean() if len(w) else 0,
+        "avg_loss": lo["pnl"].mean() if len(lo) else 0,
+        "pf":       abs(w["pnl"].sum()/lo["pnl"].sum()) if lo["pnl"].sum() != 0 else 999,
+        "max_dd":   max_dd,
+        "final":    bal,
+        "sharpe":   tf["pnl"].mean()/(tf["pnl"].std()+1e-9)*np.sqrt(252) if len(tf)>1 else 0,
+        "expectancy": tf["pnl"].mean(),
+    }
+    return stats, tf, equity
+
+def _trade_rec(et, xt, side, entry, exit_, pnl, reason, t_reason):
+    return {"entry_time": et, "exit_time": xt, "side": side,
+            "entry": entry, "exit": exit_, "pnl": pnl,
+            "exit_reason": reason, "analysis": t_reason}
 
 
-def calculate_ichimoku(df: pd.DataFrame,
-                       tenkan_period: int = 9,
-                       kijun_period:  int = 26,
-                       senkou_b_period: int = 52):
-    """Ichimoku Cloud components."""
-    def donchian_mid(series_high, series_low, n):
-        return (series_high.rolling(n).max() + series_low.rolling(n).min()) / 2
+# ══════════════════════════════════════════════════════════════
+# DATA FETCHER
+# ══════════════════════════════════════════════════════════════
+@st.cache_data(ttl=60)
+def fetch(ticker, period, interval):
+    try:
+        df = yf.download(ticker, period=period, interval=interval, progress=False, auto_adjust=True)
+        if df.empty: return None
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = [col[0] for col in df.columns]
+        df = df[["Open","High","Low","Close","Volume"]].dropna()
+        return df
+    except Exception as e:
+        return None
 
-    tenkan_sen  = donchian_mid(df['High'], df['Low'], tenkan_period)
-    kijun_sen   = donchian_mid(df['High'], df['Low'], kijun_period)
-    senkou_a    = ((tenkan_sen + kijun_sen) / 2).shift(kijun_period)
-    senkou_b    = donchian_mid(df['High'], df['Low'], senkou_b_period).shift(kijun_period)
-    chikou_span = df['Close'].shift(-kijun_period)
+@st.cache_data(ttl=30)
+def fetch_live(ticker, period, interval):
+    try:
+        df = yf.download(ticker, period=period, interval=interval, progress=False, auto_adjust=True)
+        if df.empty: return None
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = [col[0] for col in df.columns]
+        df = df[["Open","High","Low","Close","Volume"]].dropna()
+        return df
+    except Exception as e:
+        return None
 
-    return tenkan_sen, kijun_sen, senkou_a, senkou_b, chikou_span
+
+# ══════════════════════════════════════════════════════════════
+# CHART BUILDER
+# ══════════════════════════════════════════════════════════════
+def build_chart(df, I, sig_data=None, dark=True, height=800):
+    BG   = "#0d1117" if dark else "#f8fafc"
+    GRID = "#1e2633" if dark else "#e2e8f0"
+    TEXT = "#e6edf3" if dark else "#1a1a2e"
+    UP   = "#00d4aa"; DN = "#ff4d6d"
+
+    rows    = [0.50, 0.18, 0.15, 0.17]
+    fig     = make_subplots(rows=4, cols=1, shared_xaxes=True, row_heights=rows,
+                            vertical_spacing=0.025,
+                            subplot_titles=["Price", "MACD", "RSI", "Volume / OBV"])
+    c_idx   = df.index
+
+    # ── Candlestick ─────────────────────────────────────
+    fig.add_trace(go.Candlestick(x=c_idx, open=df["Open"], high=df["High"],
+                                  low=df["Low"], close=df["Close"], name="Price",
+                                  increasing=dict(line_color=UP, fillcolor=UP+"88"),
+                                  decreasing=dict(line_color=DN, fillcolor=DN+"88")), row=1, col=1)
+
+    # ── EMAs ────────────────────────────────────────────
+    for ema_p, col, nm in [(21,"#FFD700","EMA21"),(50,"#FF8C00","EMA50"),(200,"#A78BFA","EMA200")]:
+        k = f"ema{ema_p}"
+        if k in I:
+            fig.add_trace(go.Scatter(x=c_idx, y=I[k], name=nm, line=dict(color=col,width=1), opacity=0.85), row=1, col=1)
+
+    # ── VWAP ────────────────────────────────────────────
+    fig.add_trace(go.Scatter(x=c_idx, y=I["vwap"], name="VWAP",
+                              line=dict(color="#00BFFF",width=1.5,dash="dash"), opacity=0.9), row=1, col=1)
+
+    # ── Bollinger ───────────────────────────────────────
+    fig.add_trace(go.Scatter(x=c_idx, y=I["bb_up"], name="BB Upper",
+                              line=dict(color="rgba(156,163,175,0.45)",width=1), showlegend=False), row=1, col=1)
+    fig.add_trace(go.Scatter(x=c_idx, y=I["bb_lo"], name="BB Lower",
+                              line=dict(color="rgba(156,163,175,0.45)",width=1),
+                              fill="tonexty", fillcolor="rgba(156,163,175,0.06)", showlegend=False), row=1, col=1)
+
+    # ── Supertrend ──────────────────────────────────────
+    st_b = I["st_line"].where(I["st_dir"] == 1)
+    st_r = I["st_line"].where(I["st_dir"] == -1)
+    fig.add_trace(go.Scatter(x=c_idx, y=st_b, name="ST Bull", line=dict(color=UP,width=2.2), mode="lines"), row=1, col=1)
+    fig.add_trace(go.Scatter(x=c_idx, y=st_r, name="ST Bear", line=dict(color=DN,width=2.2), mode="lines"), row=1, col=1)
+
+    # ── Signal markers & levels ─────────────────────────
+    if sig_data and sig_data["signal"] != "HOLD":
+        lt = c_idx[-1]; lc = df["Close"].iloc[-1]
+        mc = UP if sig_data["signal"]=="LONG" else DN
+        ms = "triangle-up" if sig_data["signal"]=="LONG" else "triangle-down"
+        fig.add_trace(go.Scatter(x=[lt], y=[lc], mode="markers",
+                                  marker=dict(symbol=ms,size=16,color=mc,line=dict(color="#fff",width=1.5)),
+                                  name=f"▶ {sig_data['signal']}"), row=1, col=1)
+        lvls = [("SL",sig_data["sl"],"#ff4d6d","dash"),
+                ("T1",sig_data["t1"],"#00d4aa","dot"),
+                ("T2",sig_data["t2"],"#4ade80","dot"),
+                ("T3",sig_data["t3"],"#86efac","dot")]
+        for lbl, val, lc2, ld in lvls:
+            if val: fig.add_hline(y=val, line_dash=ld, line_color=lc2,
+                                    annotation_text=f" {lbl}:{val:.4f}",
+                                    annotation_font_color=lc2, row=1, col=1)
+
+    # ── MACD ────────────────────────────────────────────
+    hist_col = [UP if v >= 0 else DN for v in I["macd_hist"].fillna(0)]
+    fig.add_trace(go.Bar(x=c_idx, y=I["macd_hist"], name="Histogram",
+                          marker_color=hist_col, opacity=0.75), row=2, col=1)
+    fig.add_trace(go.Scatter(x=c_idx, y=I["macd"],     name="MACD",   line=dict(color="#FFD700",width=1.5)), row=2, col=1)
+    fig.add_trace(go.Scatter(x=c_idx, y=I["macd_sig"], name="Signal", line=dict(color="#FF6B35",width=1.5)), row=2, col=1)
+
+    # ── RSI ─────────────────────────────────────────────
+    fig.add_trace(go.Scatter(x=c_idx, y=I["rsi"], name="RSI", line=dict(color="#A78BFA",width=1.8)), row=3, col=1)
+    for lvl, col in [(70,"#ff4d6d"),(50,"#94a3b8"),(30,"#00d4aa")]:
+        fig.add_hline(y=lvl, line_dash="dash", line_color=col, line_width=0.8, row=3, col=1)
+
+    # ── Volume + OBV ────────────────────────────────────
+    if "Volume" in df.columns:
+        vcol = [UP if c >= o else DN for c, o in zip(df["Close"], df["Open"])]
+        fig.add_trace(go.Bar(x=c_idx, y=df["Volume"], name="Volume",
+                              marker_color=vcol, opacity=0.55), row=4, col=1)
+        vol_ma = df["Volume"].rolling(20).mean()
+        fig.add_trace(go.Scatter(x=c_idx, y=vol_ma, name="Vol MA20",
+                                  line=dict(color="#FFD700",width=1.3)), row=4, col=1)
+
+    fig.update_layout(
+        paper_bgcolor=BG, plot_bgcolor=BG,
+        font=dict(color=TEXT, family="DM Sans"),
+        xaxis_rangeslider_visible=False,
+        legend=dict(bgcolor=BG+"cc", bordercolor=GRID, borderwidth=1,
+                    font=dict(color=TEXT, size=11), orientation="h",
+                    x=0, y=1.02, xanchor="left"),
+        margin=dict(l=60, r=60, t=50, b=20), height=height,
+    )
+    for r in range(1, 5):
+        fig.update_xaxes(row=r, col=1, gridcolor=GRID, showgrid=True, zeroline=False,
+                          showspikes=True, spikecolor=TEXT, spikethickness=1)
+        fig.update_yaxes(row=r, col=1, gridcolor=GRID, showgrid=True, zeroline=False)
+    return fig
 
 
-def calculate_all_indicators(df: pd.DataFrame, config: dict) -> pd.DataFrame:
-    """
-    Calculate ALL indicators needed by all strategies.
-    This ensures backtest and live trading use identical calculations.
-    """
-    df = df.copy()
+# ══════════════════════════════════════════════════════════════
+# COMMENTARY GENERATOR
+# ══════════════════════════════════════════════════════════════
+def generate_commentary(sig_data, strategy, ticker):
+    ts   = datetime.now().strftime("%H:%M:%S")
+    sig  = sig_data["signal"]; conf = sig_data["confidence"]
+    px   = sig_data["entry"];  rsi  = sig_data["rsi"]
+    adx  = sig_data["adx_v"]; macd = sig_data["macd_v"]
+    e21  = sig_data["ema21"]; e50  = sig_data["ema50"]
+    vw   = sig_data["vwap_v"]; std  = sig_data["st_dir"]
+    dip  = sig_data["dip"];   din  = sig_data["din"]
 
-    fast = config.get('ema_fast', 9)
-    slow = config.get('ema_slow', 21)
+    L = []
+    L.append(f"[{ts}] ══════════ MARKET SCAN ══════════")
+    L.append(f"[{ts}] Asset: {ticker} | Strategy: {strategy} | Price: {px:.5f}")
 
-    # EMA
-    df['EMA_Fast'] = df['Close'].ewm(span=fast, adjust=False).mean()
-    df['EMA_Slow'] = df['Close'].ewm(span=slow, adjust=False).mean()
-    df['EMA_9']    = df['Close'].ewm(span=9,    adjust=False).mean()
-    df['EMA_20']   = df['Close'].ewm(span=20,   adjust=False).mean()
-    df['EMA_50']   = df['Close'].ewm(span=50,   adjust=False).mean()
-    df['EMA_200']  = df['Close'].ewm(span=200,  adjust=False).mean()
-
-    # SMA
-    df['SMA_20']   = df['Close'].rolling(20).mean()
-    df['SMA_50']   = df['Close'].rolling(50).mean()
-    df['SMA_200']  = df['Close'].rolling(200).mean()
-
-    # Bollinger Bands
-    bb_period  = config.get('bb_period', 20)
-    bb_std_dev = config.get('bb_std_dev', 2.0)
-    bb_mid     = df['Close'].rolling(bb_period).mean()
-    bb_std     = df['Close'].rolling(bb_period).std()
-    df['BB_Upper']  = bb_mid + bb_std_dev * bb_std
-    df['BB_Lower']  = bb_mid - bb_std_dev * bb_std
-    df['BB_Mid']    = bb_mid
-    df['BB_Width']  = (df['BB_Upper'] - df['BB_Lower']) / df['BB_Mid'].replace(0, np.nan)
-    df['BB_%B']     = (df['Close'] - df['BB_Lower']) / (df['BB_Upper'] - df['BB_Lower']).replace(0, np.nan)
+    # Trend
+    if e21 > e50: L.append(f"[{ts}] 📈 TREND BIAS: BULLISH  (EMA21={e21:.4f} > EMA50={e50:.4f})")
+    else:          L.append(f"[{ts}] 📉 TREND BIAS: BEARISH  (EMA21={e21:.4f} < EMA50={e50:.4f})")
 
     # RSI
-    rsi_period = config.get('rsi_period', 14)
-    delta = df['Close'].diff()
-    gain  = delta.where(delta > 0, 0.0).rolling(rsi_period).mean()
-    loss  = (-delta.where(delta < 0, 0.0)).rolling(rsi_period).mean()
-    rs    = gain / loss.replace(0, np.nan)
-    df['RSI'] = 100 - (100 / (1 + rs))
-
-    # MACD
-    macd_fast   = config.get('macd_fast', 12)
-    macd_slow   = config.get('macd_slow', 26)
-    macd_signal = config.get('macd_signal', 9)
-    ema_f = df['Close'].ewm(span=macd_fast,   adjust=False).mean()
-    ema_s = df['Close'].ewm(span=macd_slow,   adjust=False).mean()
-    df['MACD']           = ema_f - ema_s
-    df['MACD_Signal']    = df['MACD'].ewm(span=macd_signal, adjust=False).mean()
-    df['MACD_Histogram'] = df['MACD'] - df['MACD_Signal']
+    if   rsi < 30: L.append(f"[{ts}] 🔴 RSI={rsi:.1f}  ⚡ OVERSOLD — strong bounce potential")
+    elif rsi > 70: L.append(f"[{ts}] 🟡 RSI={rsi:.1f}  ⚡ OVERBOUGHT — profit-taking zone")
+    else:           L.append(f"[{ts}] ⚪ RSI={rsi:.1f}  Neutral momentum")
 
     # ADX
-    adx_period = config.get('adx_period', 14)
-    plus_dm  = df['High'].diff()
-    minus_dm = -df['Low'].diff()
-    plus_dm[plus_dm  < 0] = 0
-    minus_dm[minus_dm < 0] = 0
-    tr       = pd.concat([df['High'] - df['Low'],
-                          (df['High'] - df['Close'].shift(1)).abs(),
-                          (df['Low']  - df['Close'].shift(1)).abs()], axis=1).max(axis=1)
-    atr_adx  = tr.rolling(adx_period).mean()
-    plus_di  = 100 * (plus_dm.rolling(adx_period).mean() / atr_adx.replace(0, np.nan))
-    minus_di = 100 * (minus_dm.rolling(adx_period).mean() / atr_adx.replace(0, np.nan))
-    dx       = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)
-    df['ADX']       = dx.rolling(adx_period).mean()
-    df['ADX_Plus']  = plus_di
-    df['ADX_Minus'] = minus_di
-
-    # ATR
-    df['ATR'] = calculate_atr(df, 14)
-    df['ATR_Fast'] = calculate_atr(df, config.get('st_atr_period', 10))
-
-    # Volume
-    df['Volume_MA']   = df['Volume'].rolling(20).mean()
-    df['Volume_Ratio'] = df['Volume'] / df['Volume_MA'].replace(0, np.nan)
-
-    # VWAP (cumulative within dataset - for intraday use)
-    df['Typical_Price'] = (df['High'] + df['Low'] + df['Close']) / 3
-    df['VWAP'] = (df['Typical_Price'] * df['Volume']).cumsum() / df['Volume'].cumsum().replace(0, np.nan)
-
-    # Historical Volatility
-    df['HV'] = df['Close'].pct_change().rolling(20).std() * (252 ** 0.5) * 100
-
-    # Standard Deviation
-    df['StdDev'] = df['Close'].rolling(20).std()
-
-    # EMA Angle
-    df['EMA_Fast_Angle'] = np.degrees(np.arctan(df['EMA_Fast'].diff()))
-    df['EMA_Slow_Angle'] = np.degrees(np.arctan(df['EMA_Slow'].diff()))
-
-    # Swing High/Low (5-candle lookback)
-    window = 5
-    df['Swing_High'] = df['High'].rolling(window=window, center=True).max()
-    df['Swing_Low']  = df['Low'].rolling(window=window,  center=True).min()
-
-    # SuperTrend
-    st_supertrend, st_direction = calculate_supertrend(
-        df, config.get('st_atr_period', 10), config.get('st_multiplier', 3.0))
-    df['SuperTrend']  = st_supertrend
-    df['ST_Direction'] = st_direction
-
-    # Ichimoku
-    tenkan, kijun, senkou_a, senkou_b, chikou = calculate_ichimoku(df)
-    df['Tenkan_Sen']  = tenkan
-    df['Kijun_Sen']   = kijun
-    df['Senkou_A']    = senkou_a
-    df['Senkou_B']    = senkou_b
-    df['Chikou_Span'] = chikou
-
-    # Opening Range (first 15-min high/low of each day)
-    if 'Datetime' in df.columns:
-        df['_date'] = df['Datetime'].apply(
-            lambda x: x.date() if hasattr(x, 'date') else x)
-        orb_highs = {}
-        orb_lows  = {}
-        for d, grp in df.groupby('_date'):
-            cutoff = grp[grp['Datetime'].apply(
-                lambda x: x.time() <= dtime(9, 30))].copy() if len(grp) > 0 else grp
-            if not cutoff.empty:
-                orb_highs[d] = cutoff['High'].max()
-                orb_lows[d]  = cutoff['Low'].min()
-            else:
-                orb_highs[d] = grp.iloc[0]['High'] if len(grp) > 0 else np.nan
-                orb_lows[d]  = grp.iloc[0]['Low']  if len(grp) > 0 else np.nan
-        df['ORB_High'] = df['_date'].map(orb_highs)
-        df['ORB_Low']  = df['_date'].map(orb_lows)
-        df.drop(columns=['_date'], inplace=True, errors='ignore')
-    else:
-        df['ORB_High'] = np.nan
-        df['ORB_Low']  = np.nan
-
-    return df
-
-# ──────────────────────────────────────────────────────────────────────────────
-# STRATEGY FUNCTIONS
-# ──────────────────────────────────────────────────────────────────────────────
-def _safe_val(series, idx, default=np.nan):
-    """Safely get value from series at index."""
-    try:
-        v = series.iloc[idx]
-        return default if pd.isna(v) else v
-    except Exception:
-        return default
-
-
-def check_ema_crossover_strategy(df, idx, config, position=None):
-    """Strategy 1: EMA Crossover with optional filters."""
-    if idx < 2:
-        return None, {}
-
-    fast_now  = _safe_val(df['EMA_Fast'], idx)
-    fast_prev = _safe_val(df['EMA_Fast'], idx - 1)
-    slow_now  = _safe_val(df['EMA_Slow'], idx)
-    slow_prev = _safe_val(df['EMA_Slow'], idx - 1)
-
-    if any(pd.isna(v) for v in [fast_now, fast_prev, slow_now, slow_prev]):
-        return None, {}
-
-    angle = abs(_safe_val(df['EMA_Fast_Angle'], idx, 0))
-    min_angle = config.get('ema_min_angle', 0.0)
-    if angle < min_angle:
-        return None, {}
-
-    # ADX filter
-    if config.get('use_adx_filter', False):
-        adx = _safe_val(df['ADX'], idx, 0)
-        if adx < config.get('adx_threshold', 20):
-            return None, {}
-
-    # RSI filter
-    if config.get('use_rsi_filter', False):
-        rsi = _safe_val(df['RSI'], idx, 50)
-        rsi_min = config.get('rsi_filter_min', 30)
-        rsi_max = config.get('rsi_filter_max', 70)
-        if not (rsi_min <= rsi <= rsi_max):
-            return None, {}
-
-    bullish = (fast_prev <= slow_prev) and (fast_now > slow_now)
-    bearish = (fast_prev >= slow_prev) and (fast_now < slow_now)
-
-    # Entry filters
-    entry_filter = config.get('ema_entry_filter', 'Simple Crossover')
-    if entry_filter == 'Volume Confirmation':
-        vol_ratio = _safe_val(df['Volume_Ratio'], idx, 1)
-        if vol_ratio < 1.3:
-            return None, {}
-
-    info = {'angle': angle, 'ema_fast': fast_now, 'ema_slow': slow_now}
-    if bullish:
-        return 'LONG', info
-    if bearish:
-        return 'SHORT', info
-    return None, {}
-
-
-def check_simple_buy_strategy(df, idx, config, position=None):
-    """Strategy 2: Always BUY."""
-    return 'LONG', {}
-
-
-def check_simple_sell_strategy(df, idx, config, position=None):
-    """Strategy 3: Always SELL."""
-    return 'SHORT', {}
-
-
-def check_price_crosses_threshold(df, idx, config, position=None):
-    """Strategy 4: Price crosses threshold (4 combinations)."""
-    if idx < 1:
-        return None, {}
-    threshold  = config.get('threshold_price', 0)
-    cross_dir  = config.get('threshold_cross_dir', 'Above')
-    pos_type   = config.get('threshold_position', 'LONG')
-
-    price_now  = _safe_val(df['Close'], idx)
-    price_prev = _safe_val(df['Close'], idx - 1)
-
-    if any(pd.isna(v) for v in [price_now, price_prev]):
-        return None, {}
-
-    if cross_dir == 'Above':
-        crossed = (price_prev <= threshold) and (price_now > threshold)
-    else:
-        crossed = (price_prev >= threshold) and (price_now < threshold)
-
-    return (pos_type, {}) if crossed else (None, {})
-
-
-def check_rsi_adx_ema_combined(df, idx, config, position=None):
-    """Strategy 5: RSI + ADX + EMA Combined."""
-    if idx < 50:
-        return None, {}
-    rsi   = _safe_val(df['RSI'],     idx)
-    adx   = _safe_val(df['ADX'],     idx)
-    price = _safe_val(df['Close'],   idx)
-    ema50 = _safe_val(df['EMA_50'],  idx)
-    adx_thresh = config.get('adx_threshold', 25)
-
-    if any(pd.isna(v) for v in [rsi, adx, price, ema50]):
-        return None, {}
-
-    if rsi < 30 and adx > adx_thresh and price > ema50:
-        return 'LONG', {'rsi': rsi, 'adx': adx}
-    if rsi > 70 and adx > adx_thresh and price < ema50:
-        return 'SHORT', {'rsi': rsi, 'adx': adx}
-    return None, {}
-
-
-def check_percentage_change(df, idx, config, position=None):
-    """Strategy 6: Percentage Change (4 combinations)."""
-    if idx < 1:
-        return None, {}
-    threshold  = config.get('pct_threshold', 2.0)
-    change_dir = config.get('pct_change_dir', 'Positive')
-    pos_type   = config.get('pct_position', 'LONG')
-
-    prev_close = _safe_val(df['Close'], idx - 1)
-    curr_close = _safe_val(df['Close'], idx)
-    if pd.isna(prev_close) or prev_close == 0 or pd.isna(curr_close):
-        return None, {}
-
-    pct_change = ((curr_close - prev_close) / prev_close) * 100
-
-    if change_dir == 'Positive' and pct_change >= threshold:
-        return pos_type, {'pct_change': pct_change}
-    if change_dir == 'Negative' and pct_change <= -threshold:
-        return pos_type, {'pct_change': pct_change}
-    return None, {}
-
-
-def check_ai_price_action(df, idx, config, position=None):
-    """Strategy 7: AI Price Action - 3 consecutive higher/lower closes."""
-    if idx < 3:
-        return None, {}
-    closes = [_safe_val(df['Close'], idx - i) for i in range(4)]
-    if any(pd.isna(c) for c in closes):
-        return None, {}
-    if closes[2] > closes[3] and closes[1] > closes[2] and closes[0] > closes[1]:
-        return 'LONG', {'pattern': '3 higher closes'}
-    if closes[2] < closes[3] and closes[1] < closes[2] and closes[0] < closes[1]:
-        return 'SHORT', {'pattern': '3 lower closes'}
-    return None, {}
-
-
-def check_custom_strategy(df, idx, config, position=None):
-    """Strategy 8: Custom Multi-Indicator with AND/OR logic."""
-    conditions = config.get('custom_conditions', [])
-    if not conditions:
-        return None, {}
-
-    logic = config.get('custom_logic', 'AND')
-    results = []
-
-    for cond in conditions:
-        ctype    = cond.get('type', '')
-        pos_type = cond.get('position', 'LONG')
-        met      = False
-
-        if ctype == 'Price Crosses Indicator':
-            indicator  = cond.get('indicator', 'EMA')
-            period     = cond.get('period', 20)
-            cross_type = cond.get('cross_type', 'Above')
-            price_now  = _safe_val(df['Close'], idx)
-            price_prev = _safe_val(df['Close'], idx - 1) if idx > 0 else np.nan
-            ind_key    = f'EMA_{period}' if 'EMA' in indicator else f'SMA_{period}'
-            if 'BB Upper' in indicator:
-                ind_now  = _safe_val(df['BB_Upper'],  idx)
-                ind_prev = _safe_val(df['BB_Upper'],  idx - 1)
-            elif 'BB Lower' in indicator:
-                ind_now  = _safe_val(df['BB_Lower'],  idx)
-                ind_prev = _safe_val(df['BB_Lower'],  idx - 1)
-            elif 'BB Mid' in indicator:
-                ind_now  = _safe_val(df['BB_Mid'],    idx)
-                ind_prev = _safe_val(df['BB_Mid'],    idx - 1)
-            elif 'EMA' in indicator:
-                col      = f'EMA_Fast' if period == config.get('ema_fast', 9) else f'EMA_Slow'
-                try:
-                    col = f'EMA_{period}'
-                    ind_now  = _safe_val(df[col], idx)
-                    ind_prev = _safe_val(df[col], idx - 1)
-                except:
-                    ind_now  = _safe_val(df['EMA_Fast'], idx)
-                    ind_prev = _safe_val(df['EMA_Fast'], idx - 1)
-            else:
-                try:
-                    col      = f'SMA_{period}'
-                    ind_now  = _safe_val(df[col], idx)
-                    ind_prev = _safe_val(df[col], idx - 1)
-                except:
-                    continue
-
-            if not any(pd.isna(v) for v in [price_now, price_prev, ind_now, ind_prev]):
-                if cross_type == 'Above':
-                    met = (price_prev <= ind_prev) and (price_now > ind_now)
-                else:
-                    met = (price_prev >= ind_prev) and (price_now < ind_now)
-
-        elif ctype == 'Indicator Crosses Level':
-            indicator = cond.get('indicator', 'RSI')
-            level     = cond.get('level', 50)
-            cross_dir = cond.get('cross_dir', 'Above')
-            ind_map   = {
-                'RSI': 'RSI', 'MACD': 'MACD', 'MACD Histogram': 'MACD_Histogram',
-                'ADX': 'ADX', 'Volume': 'Volume', 'BB %B': 'BB_%B',
-                'ATR': 'ATR', 'Historical Volatility': 'HV', 'Std Dev': 'StdDev'
-            }
-            col = ind_map.get(indicator, 'RSI')
-            ind_now  = _safe_val(df[col], idx) if col in df.columns else np.nan
-            ind_prev = _safe_val(df[col], idx - 1) if col in df.columns else np.nan
-            if not any(pd.isna(v) for v in [ind_now, ind_prev]):
-                if cross_dir == 'Above':
-                    met = (ind_prev <= level) and (ind_now > level)
-                else:
-                    met = (ind_prev >= level) and (ind_now < level)
-
-        elif ctype == 'Indicator Crossover':
-            cross_kind = cond.get('cross_kind', 'Fast EMA x Slow EMA')
-            direction  = cond.get('direction', 'Bullish')
-            if 'EMA' in cross_kind:
-                a_now  = _safe_val(df['EMA_Fast'], idx)
-                a_prev = _safe_val(df['EMA_Fast'], idx - 1)
-                b_now  = _safe_val(df['EMA_Slow'], idx)
-                b_prev = _safe_val(df['EMA_Slow'], idx - 1)
-            elif 'RSI' in cross_kind:
-                a_now  = _safe_val(df['RSI'], idx)
-                a_prev = _safe_val(df['RSI'], idx - 1)
-                b_now  = 50.0; b_prev = 50.0
-            else:
-                continue
-            if not any(pd.isna(v) for v in [a_now, a_prev, b_now, b_prev]):
-                if direction == 'Bullish':
-                    met = (a_prev <= b_prev) and (a_now > b_now)
-                else:
-                    met = (a_prev >= b_prev) and (a_now < b_now)
-
-        results.append((met, pos_type))
-
-    if not results:
-        return None, {}
-
-    if logic == 'AND':
-        if all(r[0] for r in results):
-            return results[0][1], {'logic': 'AND', 'conditions': len(results)}
-    else:  # OR
-        for met, pt in results:
-            if met:
-                return pt, {'logic': 'OR', 'conditions': len(results)}
-    return None, {}
-
-
-def check_supertrend_ai(df, idx, config, position=None):
-    """Strategy 9: SuperTrend AI with ADX and Volume confirmation."""
-    if idx < 2:
-        return None, {}
-    adx_thresh = config.get('adx_threshold', 25)
-    vol_mult   = config.get('st_vol_multiplier', 1.5)
-
-    st_dir_now  = _safe_val(df['ST_Direction'], idx, 0)
-    st_dir_prev = _safe_val(df['ST_Direction'], idx - 1, 0)
-    adx         = _safe_val(df['ADX'], idx, 0)
-    vol_ratio   = _safe_val(df['Volume_Ratio'], idx, 1)
-
-    if any(pd.isna(v) for v in [st_dir_now, st_dir_prev]):
-        return None, {}
-
-    flipped_bull = (st_dir_prev == -1) and (st_dir_now == 1)
-    flipped_bear = (st_dir_prev == 1)  and (st_dir_now == -1)
-
-    if flipped_bull and adx > adx_thresh and vol_ratio >= vol_mult:
-        return 'LONG', {'adx': adx, 'vol_ratio': vol_ratio}
-    if flipped_bear and adx > adx_thresh and vol_ratio >= vol_mult:
-        return 'SHORT', {'adx': adx, 'vol_ratio': vol_ratio}
-    return None, {}
-
-
-def check_vwap_volume_spike(df, idx, config, position=None):
-    """Strategy 10: VWAP + Volume Spike."""
-    if idx < 1:
-        return None, {}
-    vol_mult    = config.get('vwap_vol_multiplier', 2.0)
-    max_dist    = config.get('vwap_max_dist', 0.3)
-    rsi_ob      = config.get('vwap_rsi_ob', 70)
-    rsi_os      = config.get('vwap_rsi_os', 30)
-
-    price_now  = _safe_val(df['Close'], idx)
-    price_prev = _safe_val(df['Close'], idx - 1)
-    vwap_now   = _safe_val(df['VWAP'],  idx)
-    vwap_prev  = _safe_val(df['VWAP'],  idx - 1)
-    vol_ratio  = _safe_val(df['Volume_Ratio'], idx, 1)
-    rsi        = _safe_val(df['RSI'], idx, 50)
-
-    if any(pd.isna(v) for v in [price_now, price_prev, vwap_now, vwap_prev]):
-        return None, {}
-
-    dist_pct = abs(price_now - vwap_now) / vwap_now * 100 if vwap_now != 0 else 999
-
-    bull = (price_prev <= vwap_prev) and (price_now > vwap_now)
-    bear = (price_prev >= vwap_prev) and (price_now < vwap_now)
-
-    if bull and vol_ratio >= vol_mult and rsi < 55 and dist_pct <= max_dist:
-        return 'LONG', {'vwap': vwap_now, 'vol_ratio': vol_ratio}
-    if bear and vol_ratio >= vol_mult and rsi > 45 and dist_pct <= max_dist:
-        return 'SHORT', {'vwap': vwap_now, 'vol_ratio': vol_ratio}
-    return None, {}
-
-
-def check_bollinger_squeeze_breakout(df, idx, config, position=None):
-    """Strategy 11: Bollinger Squeeze Breakout."""
-    if idx < 1:
-        return None, {}
-    squeeze_thresh = config.get('bb_squeeze_thresh', 0.02)
-    vol_mult       = config.get('bb_vol_multiplier', 1.8)
-
-    bb_width  = _safe_val(df['BB_Width'], idx, 1)
-    bb_upper  = _safe_val(df['BB_Upper'], idx)
-    bb_lower  = _safe_val(df['BB_Lower'], idx)
-    price_now = _safe_val(df['Close'],    idx)
-    price_prev= _safe_val(df['Close'],    idx - 1)
-    vol_ratio = _safe_val(df['Volume_Ratio'], idx, 1)
-
-    if any(pd.isna(v) for v in [bb_upper, bb_lower, price_now]):
-        return None, {}
-
-    squeeze = bb_width < squeeze_thresh
-
-    if squeeze and price_now > bb_upper and vol_ratio >= vol_mult:
-        return 'LONG', {'bb_width': bb_width, 'vol_ratio': vol_ratio}
-    if squeeze and price_now < bb_lower and vol_ratio >= vol_mult:
-        return 'SHORT', {'bb_width': bb_width, 'vol_ratio': vol_ratio}
-    return None, {}
-
-
-def check_elliott_waves_ratio_charts(df, idx, config, position=None):
-    """Strategy 12: Elliott Waves + Ratio Charts."""
-    lookback      = config.get('wave_lookback', 13)
-    ratio_period  = config.get('ratio_ema_period', 21)
-    ratio_thresh  = config.get('ratio_threshold', 1.0)
-
-    if idx < max(lookback + 1, ratio_period + 1):
-        return None, {}
-
-    highs  = df['High'].iloc[idx - lookback: idx + 1]
-    lows   = df['Low'].iloc[idx - lookback: idx + 1]
-    closes = df['Close'].iloc[idx - lookback: idx + 1]
-
-    bull_waves = 0
-    bear_waves = 0
-    for i in range(1, len(highs)):
-        if highs.iloc[i] > highs.iloc[i - 1]:
-            bull_waves += 1
-        if lows.iloc[i] < lows.iloc[i - 1]:
-            bear_waves += 1
-
-    price = _safe_val(df['Close'], idx)
-    ema50 = _safe_val(df['EMA_50'], idx)
-    if pd.isna(ema50) or ema50 == 0:
-        return None, {}
-
-    ratio = price / ema50
-    ratio_series = (df['Close'] / df['EMA_50'].replace(0, np.nan)).iloc[:idx + 1]
-    ratio_ma = ratio_series.rolling(ratio_period).mean().iloc[-1]
-    if pd.isna(ratio_ma):
-        return None, {}
-
-    if bull_waves >= 5 and ratio > ratio_thresh and ratio > ratio_ma:
-        return 'LONG', {'bull_waves': bull_waves, 'ratio': ratio}
-    if bear_waves >= 5 and ratio < (2.0 - ratio_thresh) and ratio < ratio_ma:
-        return 'SHORT', {'bear_waves': bear_waves, 'ratio': ratio}
-    return None, {}
-
-
-# ──────────── 5 NEW HIGH-PROBABILITY STRATEGIES ────────────────────────────
-
-def check_morning_breakout_orb(df, idx, config, position=None):
-    """
-    Strategy 13: Morning Breakout / Opening Range Breakout (ORB).
-    High probability intraday strategy.
-    Enter when price breaks ORB High (LONG) or ORB Low (SHORT) with volume.
-    """
-    if idx < 1:
-        return None, {}
-    orb_high  = _safe_val(df['ORB_High'], idx)
-    orb_low   = _safe_val(df['ORB_Low'],  idx)
-    price_now = _safe_val(df['Close'],    idx)
-    price_prev= _safe_val(df['Close'],    idx - 1)
-    vol_ratio = _safe_val(df['Volume_Ratio'], idx, 1)
-    orb_vol_mult = config.get('orb_vol_multiplier', 1.5)
-
-    if any(pd.isna(v) for v in [orb_high, orb_low, price_now, price_prev]):
-        return None, {}
-    if orb_high == orb_low:
-        return None, {}
-
-    # Only trade during market hours
-    if 'Datetime' in df.columns:
-        t = df['Datetime'].iloc[idx]
-        if hasattr(t, 'time'):
-            trade_time = t.time()
-            if not (dtime(9, 30) <= trade_time <= dtime(14, 30)):
-                return None, {}
-
-    bull = (price_prev <= orb_high) and (price_now > orb_high) and (vol_ratio >= orb_vol_mult)
-    bear = (price_prev >= orb_low)  and (price_now < orb_low)  and (vol_ratio >= orb_vol_mult)
-
-    if bull:
-        return 'LONG', {'orb_high': orb_high, 'vol_ratio': vol_ratio}
-    if bear:
-        return 'SHORT', {'orb_low': orb_low, 'vol_ratio': vol_ratio}
-    return None, {}
-
-
-def check_macd_divergence(df, idx, config, position=None):
-    """
-    Strategy 14: MACD Divergence.
-    Detects regular divergence between price and MACD for high-probability reversals.
-    Bullish divergence: Price makes lower low, MACD makes higher low.
-    Bearish divergence: Price makes higher high, MACD makes lower high.
-    """
-    lookback = config.get('macd_div_lookback', 20)
-    if idx < lookback + 2:
-        return None, {}
-
-    # Look at last `lookback` candles
-    prices = df['Close'].iloc[idx - lookback: idx + 1]
-    macds  = df['MACD'].iloc[idx - lookback: idx + 1]
-
-    if prices.isna().any() or macds.isna().any():
-        return None, {}
-
-    # Find recent pivot low (bullish divergence check)
-    pivot_range = 5
-    if idx < pivot_range * 2:
-        return None, {}
-
-    # Recent low vs previous low in price
-    p_recent_lo_idx = prices.iloc[-pivot_range:].idxmin()
-    p_prev_lo_idx   = prices.iloc[:-pivot_range].idxmin()
-    m_recent_lo     = macds.loc[p_recent_lo_idx]
-    m_prev_lo       = macds.loc[p_prev_lo_idx]
-    p_recent_lo     = prices.loc[p_recent_lo_idx]
-    p_prev_lo       = prices.loc[p_prev_lo_idx]
-
-    # Recent high vs previous high in price
-    p_recent_hi_idx = prices.iloc[-pivot_range:].idxmax()
-    p_prev_hi_idx   = prices.iloc[:-pivot_range].idxmax()
-    m_recent_hi     = macds.loc[p_recent_hi_idx]
-    m_prev_hi       = macds.loc[p_prev_hi_idx]
-    p_recent_hi     = prices.loc[p_recent_hi_idx]
-    p_prev_hi       = prices.loc[p_prev_hi_idx]
-
-    # MACD Histogram for confirmation
-    hist = _safe_val(df['MACD_Histogram'], idx, 0)
-
-    # Bullish divergence: price lower low, MACD higher low → expect UP
-    bull_div = (p_recent_lo < p_prev_lo) and (m_recent_lo > m_prev_lo) and (hist > 0)
-    # Bearish divergence: price higher high, MACD lower high → expect DOWN
-    bear_div = (p_recent_hi > p_prev_hi) and (m_recent_hi < m_prev_hi) and (hist < 0)
-
-    rsi = _safe_val(df['RSI'], idx, 50)
-
-    if bull_div and rsi < 50:
-        return 'LONG', {'divergence': 'bullish', 'macd_hist': hist}
-    if bear_div and rsi > 50:
-        return 'SHORT', {'divergence': 'bearish', 'macd_hist': hist}
-    return None, {}
-
-
-def check_triple_ema_momentum(df, idx, config, position=None):
-    """
-    Strategy 15: Triple EMA Momentum.
-    All 3 EMAs (9, 20, 50) aligned in same direction = strong trend.
-    Entry on pullback to fast EMA with RSI confirmation.
-    Very high probability in trending markets.
-    """
-    if idx < 51:
-        return None, {}
-
-    ema9  = _safe_val(df['EMA_9'],  idx)
-    ema20 = _safe_val(df['EMA_20'], idx)
-    ema50 = _safe_val(df['EMA_50'], idx)
-    ema9_prev  = _safe_val(df['EMA_9'],  idx - 1)
-    ema20_prev = _safe_val(df['EMA_20'], idx - 1)
-    price = _safe_val(df['Close'],  idx)
-    rsi   = _safe_val(df['RSI'],    idx, 50)
-    adx   = _safe_val(df['ADX'],    idx, 0)
-
-    if any(pd.isna(v) for v in [ema9, ema20, ema50, price]):
-        return None, {}
-
-    # Bull alignment: EMA9 > EMA20 > EMA50, ADX strong
-    bull_aligned = (ema9 > ema20 > ema50) and adx > 20
-    # Bear alignment: EMA9 < EMA20 < EMA50, ADX strong
-    bear_aligned = (ema9 < ema20 < ema50) and adx > 20
-
-    # Pullback: price touched or crossed EMA9 from above (bull) or below (bear)
-    bull_pullback = bull_aligned and (price > ema9) and (ema9_prev >= ema20_prev) and rsi > 45 and rsi < 65
-    bear_pullback = bear_aligned and (price < ema9) and (ema9_prev <= ema20_prev) and rsi < 55 and rsi > 35
-
-    if bull_pullback:
-        return 'LONG', {'ema9': ema9, 'ema20': ema20, 'ema50': ema50, 'adx': adx}
-    if bear_pullback:
-        return 'SHORT', {'ema9': ema9, 'ema20': ema20, 'ema50': ema50, 'adx': adx}
-    return None, {}
-
-
-def check_mean_reversion_bb_rsi(df, idx, config, position=None):
-    """
-    Strategy 16: Mean Reversion with Bollinger Bands + RSI.
-    High-probability reversal strategy.
-    LONG: Price touches/breaks BB Lower + RSI oversold + RSI starts turning up.
-    SHORT: Price touches/breaks BB Upper + RSI overbought + RSI starts turning down.
-    """
-    if idx < 21:
-        return None, {}
-
-    price    = _safe_val(df['Close'],    idx)
-    bb_upper = _safe_val(df['BB_Upper'], idx)
-    bb_lower = _safe_val(df['BB_Lower'], idx)
-    bb_mid   = _safe_val(df['BB_Mid'],   idx)
-    rsi      = _safe_val(df['RSI'],      idx, 50)
-    rsi_prev = _safe_val(df['RSI'],      idx - 1, 50)
-    vol_ratio= _safe_val(df['Volume_Ratio'], idx, 1)
-
-    if any(pd.isna(v) for v in [price, bb_upper, bb_lower, bb_mid]):
-        return None, {}
-
-    mr_rsi_os = config.get('mr_rsi_os', 30)
-    mr_rsi_ob = config.get('mr_rsi_ob', 70)
-
-    # Oversold at lower band + RSI turning up
-    bull = (price <= bb_lower) and (rsi <= mr_rsi_os) and (rsi > rsi_prev)
-    # Overbought at upper band + RSI turning down
-    bear = (price >= bb_upper) and (rsi >= mr_rsi_ob) and (rsi < rsi_prev)
-
-    if bull:
-        return 'LONG', {'bb_lower': bb_lower, 'rsi': rsi, 'mean_target': bb_mid}
-    if bear:
-        return 'SHORT', {'bb_upper': bb_upper, 'rsi': rsi, 'mean_target': bb_mid}
-    return None, {}
-
-
-def check_ichimoku_cloud_breakout(df, idx, config, position=None):
-    """
-    Strategy 17: Ichimoku Cloud Breakout.
-    One of the most reliable trend-following strategies.
-    LONG: Price breaks above cloud + Tenkan > Kijun + Chikou above cloud.
-    SHORT: Price breaks below cloud + Tenkan < Kijun + Chikou below cloud.
-    """
-    if idx < 53:
-        return None, {}
-
-    price    = _safe_val(df['Close'],      idx)
-    price_prev = _safe_val(df['Close'],    idx - 1)
-    tenkan   = _safe_val(df['Tenkan_Sen'], idx)
-    kijun    = _safe_val(df['Kijun_Sen'],  idx)
-    senkou_a = _safe_val(df['Senkou_A'],   idx)
-    senkou_b = _safe_val(df['Senkou_B'],   idx)
-    adx      = _safe_val(df['ADX'],        idx, 0)
-
-    if any(pd.isna(v) for v in [price, tenkan, kijun, senkou_a, senkou_b]):
-        return None, {}
-
-    cloud_top    = max(senkou_a, senkou_b)
-    cloud_bottom = min(senkou_a, senkou_b)
-
-    # Bullish: price breaks above cloud + Tenkan > Kijun
-    bull = (price_prev <= cloud_top) and (price > cloud_top) and (tenkan > kijun) and adx > 20
-    # Bearish: price breaks below cloud + Tenkan < Kijun
-    bear = (price_prev >= cloud_bottom) and (price < cloud_bottom) and (tenkan < kijun) and adx > 20
-
-    if bull:
-        return 'LONG', {'cloud_top': cloud_top, 'tenkan': tenkan, 'kijun': kijun}
-    if bear:
-        return 'SHORT', {'cloud_bottom': cloud_bottom, 'tenkan': tenkan, 'kijun': kijun}
-    return None, {}
-
-
-# ──── Strategy dispatcher ────
-STRATEGY_FUNC_MAP = {
-    "EMA Crossover":                    check_ema_crossover_strategy,
-    "Simple Buy":                       check_simple_buy_strategy,
-    "Simple Sell":                      check_simple_sell_strategy,
-    "Price Crosses Threshold":          check_price_crosses_threshold,
-    "RSI-ADX-EMA Combined":             check_rsi_adx_ema_combined,
-    "Percentage Change":                check_percentage_change,
-    "AI Price Action":                  check_ai_price_action,
-    "Custom Strategy (Multi-Indicator)":check_custom_strategy,
-    "SuperTrend AI":                    check_supertrend_ai,
-    "VWAP + Volume Spike":              check_vwap_volume_spike,
-    "Bollinger Squeeze Breakout":       check_bollinger_squeeze_breakout,
-    "Elliott Waves + Ratio Charts":     check_elliott_waves_ratio_charts,
-    "Morning Breakout (ORB)":           check_morning_breakout_orb,
-    "MACD Divergence":                  check_macd_divergence,
-    "Triple EMA Momentum":              check_triple_ema_momentum,
-    "Mean Reversion (Bollinger + RSI)": check_mean_reversion_bb_rsi,
-    "Ichimoku Cloud Breakout":          check_ichimoku_cloud_breakout,
-}
-
-def get_strategy_signal(strategy_name, df, idx, config, position=None):
-    """Unified entry point for strategy signals."""
-    func = STRATEGY_FUNC_MAP.get(strategy_name)
-    if func is None:
-        return None, {}
-    try:
-        return func(df, idx, config, position)
-    except Exception as e:
-        return None, {}
-
-# ──────────────────────────────────────────────────────────────────────────────
-# HELPER FUNCTIONS
-# ──────────────────────────────────────────────────────────────────────────────
-def is_within_trade_window(dt, config: dict) -> bool:
-    """Check if datetime is within the configured trade window."""
-    if not config.get('use_trade_window', False):
-        return True
-    try:
-        if hasattr(dt, 'time'):
-            t = dt.time()
-        elif hasattr(dt, 'hour'):
-            t = dt
-        else:
-            return True
-        start = config.get('window_start', dtime(9, 30))
-        end   = config.get('window_end',   dtime(15, 0))
-        return start <= t <= end
-    except Exception:
-        return True
-
-
-def should_allow_trade_direction(signal: str, config: dict) -> bool:
-    """Filter by trade direction (Both / LONG Only / SHORT Only)."""
-    direction_filter = config.get('direction_filter', 'Both')
-    if direction_filter == 'Both':
-        return True
-    if direction_filter == 'LONG Only' and signal in ('LONG', 'BUY'):
-        return True
-    if direction_filter == 'SHORT Only' and signal in ('SHORT', 'SELL'):
-        return True
-    return False
-
-
-def calculate_brokerage(entry_price: float, exit_price: float,
-                        quantity: int, config: dict) -> float:
-    """Calculate brokerage charges for a trade."""
-    if not config.get('include_brokerage', False):
-        return 0.0
-    calc_type = config.get('brokerage_calc_type', 'Fixed')
-    if calc_type == 'Fixed':
-        return config.get('brokerage_fixed', 20.0) * 2  # entry + exit
-    else:
-        pct = config.get('brokerage_pct', 0.03) / 100
-        return (entry_price + exit_price) * quantity * pct
-
-
-def is_same_day_trade(entry_time, exit_time) -> bool:
-    """Check if trade was entered and exited on same trading day."""
-    try:
-        e = entry_time if hasattr(entry_time, 'date') else entry_time
-        x = exit_time  if hasattr(exit_time, 'date')  else exit_time
-        if hasattr(e, 'date') and hasattr(x, 'date'):
-            if e.date() != x.date():
-                return False
-            start_t = dtime(9, 15)
-            end_t   = dtime(15, 0)
-            et = e.time() if hasattr(e, 'time') else e
-            xt = x.time() if hasattr(x, 'time') else x
-            return (start_t <= et <= end_t) and (start_t <= xt <= end_t)
-    except Exception:
-        pass
-    return True
-
-
-def find_swing_high(df, idx, lookback=20):
-    """Find most recent swing high."""
-    start = max(0, idx - lookback)
-    swing_h = _safe_val(df['Swing_High'], idx)
-    if pd.isna(swing_h):
-        swing_h = df['High'].iloc[start:idx + 1].max()
-    return swing_h
-
-
-def find_swing_low(df, idx, lookback=20):
-    """Find most recent swing low."""
-    start = max(0, idx - lookback)
-    swing_l = _safe_val(df['Swing_Low'], idx)
-    if pd.isna(swing_l):
-        swing_l = df['Low'].iloc[start:idx + 1].min()
-    return swing_l
-
-
-def find_prev_swing_high(df, idx, lookback=20):
-    """Find previous swing high (2nd most recent)."""
-    start = max(0, idx - lookback)
-    sub   = df['High'].iloc[start:idx]
-    if len(sub) < 2:
-        return _safe_val(df['High'], idx)
-    return sub.nlargest(2).iloc[-1]
-
-
-def find_prev_swing_low(df, idx, lookback=20):
-    """Find previous swing low (2nd most recent)."""
-    start = max(0, idx - lookback)
-    sub   = df['Low'].iloc[start:idx]
-    if len(sub) < 2:
-        return _safe_val(df['Low'], idx)
-    return sub.nsmallest(2).iloc[-1]
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# SL / TARGET CALCULATION
-# ──────────────────────────────────────────────────────────────────────────────
-def calculate_initial_sl(entry_price: float, position_type: str,
-                         df: pd.DataFrame, idx: int, config: dict) -> float:
-    """
-    Calculate initial stop loss price.
-    Returns the SL price (or None for signal-based).
-    """
-    sl_type  = config.get('sl_type', 'Custom Points')
-    sl_pts   = config.get('sl_points', 10.0)
-    quantity = config.get('quantity', 1)
-    direction = 1 if position_type == 'LONG' else -1
-
-    if sl_type == 'Custom Points':
-        return entry_price - direction * sl_pts
-
-    elif sl_type == 'P&L Based (Rupees)':
-        sl_rupees = config.get('sl_rupees', 500.0)
-        pts = sl_rupees / max(quantity, 1)
-        return entry_price - direction * pts
-
-    elif sl_type == 'ATR-based':
-        atr = _safe_val(df['ATR'], idx, sl_pts)
-        mult = config.get('sl_atr_mult', 1.5)
-        return entry_price - direction * atr * mult
-
-    elif sl_type == 'Current Candle Low/High':
-        if position_type == 'LONG':
-            return _safe_val(df['Low'],  idx, entry_price - sl_pts)
-        else:
-            return _safe_val(df['High'], idx, entry_price + sl_pts)
-
-    elif sl_type == 'Previous Candle Low/High':
-        prev = max(0, idx - 1)
-        if position_type == 'LONG':
-            return _safe_val(df['Low'],  prev, entry_price - sl_pts)
-        else:
-            return _safe_val(df['High'], prev, entry_price + sl_pts)
-
-    elif sl_type == 'Current Swing Low/High':
-        if position_type == 'LONG':
-            return find_swing_low(df, idx)
-        else:
-            return find_swing_high(df, idx)
-
-    elif sl_type == 'Previous Swing Low/High':
-        if position_type == 'LONG':
-            return find_prev_swing_low(df, idx)
-        else:
-            return find_prev_swing_high(df, idx)
-
-    elif sl_type == 'Signal-based (Reverse Crossover)':
-        return None  # Will use signal exit
-
-    elif sl_type in ['Trailing SL (Points)', 'Trailing SL + Current Candle',
-                     'Trailing SL + Previous Candle', 'Trailing SL + Current Swing',
-                     'Trailing SL + Previous Swing', 'Volatility-Adjusted Trailing SL',
-                     'Cost-to-Cost + N Points Trailing SL']:
-        # Initial SL same as custom points; will trail
-        if sl_type == 'Volatility-Adjusted Trailing SL':
-            atr = _safe_val(df['ATR'], idx, sl_pts)
-            return entry_price - direction * atr * 1.5
-        return entry_price - direction * sl_pts
-
-    elif sl_type == 'Trailing Profit (Rupees)':
-        return entry_price  # SL at entry initially (break-even style)
-
-    elif sl_type == 'Trailing Loss (Rupees)':
-        sl_rupees = config.get('sl_rupees', 500.0)
-        pts = sl_rupees / max(quantity, 1)
-        return entry_price - direction * pts
-
-    elif sl_type == 'Break-even After 50% Target':
-        return entry_price - direction * sl_pts
-
-    return entry_price - direction * sl_pts
-
-
-def calculate_initial_target(entry_price: float, position_type: str,
-                             df: pd.DataFrame, idx: int, config: dict,
-                             initial_sl: float = None) -> float:
-    """
-    Calculate initial target price.
-    Returns the target price (or None for signal-based).
-    """
-    target_type = config.get('target_type', 'Custom Points')
-    target_pts  = config.get('target_points', 20.0)
-    quantity    = config.get('quantity', 1)
-    direction   = 1 if position_type == 'LONG' else -1
-
-    if target_type == 'Signal-based (Reverse Crossover)':
-        return None  # No price target; exits on reverse signal
-
-    elif target_type == 'Custom Points':
-        return entry_price + direction * target_pts
-
-    elif target_type == 'P&L Based (Rupees)':
-        target_rupees = config.get('target_rupees', 1000.0)
-        pts = target_rupees / max(quantity, 1)
-        return entry_price + direction * pts
-
-    elif target_type in ['Trailing Target (Points)', 'Trailing Target + Signal Based',
-                         'Dynamic Trailing SL+Target (Lock Profits)', '50% Exit at Target (Partial)']:
-        return entry_price + direction * target_pts
-
-    elif target_type == 'Current Candle Low/High':
-        if position_type == 'LONG':
-            return _safe_val(df['High'], idx, entry_price + target_pts)
-        else:
-            return _safe_val(df['Low'],  idx, entry_price - target_pts)
-
-    elif target_type == 'Previous Candle Low/High':
-        prev = max(0, idx - 1)
-        if position_type == 'LONG':
-            return _safe_val(df['High'], prev, entry_price + target_pts)
-        else:
-            return _safe_val(df['Low'],  prev, entry_price - target_pts)
-
-    elif target_type == 'Current Swing Low/High':
-        if position_type == 'LONG':
-            return find_swing_high(df, idx)
-        else:
-            return find_swing_low(df, idx)
-
-    elif target_type == 'Previous Swing Low/High':
-        if position_type == 'LONG':
-            return find_prev_swing_high(df, idx)
-        else:
-            return find_prev_swing_low(df, idx)
-
-    elif target_type == 'ATR-based':
-        atr = _safe_val(df['ATR'], idx, target_pts)
-        mult = config.get('target_atr_mult', 2.0)
-        return entry_price + direction * atr * mult
-
-    elif target_type == 'Risk-Reward Based':
-        if initial_sl is not None:
-            sl_dist = abs(entry_price - initial_sl)
-            rr = config.get('target_rr_ratio', 2.0)
-            return entry_price + direction * sl_dist * rr
-        return entry_price + direction * target_pts
-
-    return entry_price + direction * target_pts
-
-
-def update_trailing_sl(position: dict, current_price: float,
-                       df: pd.DataFrame, idx: int, config: dict) -> float:
-    """
-    Update trailing stop loss. Returns updated SL price.
-    Ensures SL only moves in favorable direction.
-    """
-    sl_type   = config.get('sl_type', 'Custom Points')
-    sl_pts    = config.get('sl_points', 10.0)
-    direction = 1 if position['type'] == 'LONG' else -1
-    current_sl = position.get('sl_price', position['entry_price'])
-
-    if sl_type == 'Trailing SL (Points)':
-        new_sl = current_price - direction * sl_pts
-        if direction == 1:
-            return max(current_sl, new_sl)
-        else:
-            return min(current_sl, new_sl) if current_sl is not None else new_sl
-
-    elif sl_type == 'Trailing Profit (Rupees)':
-        qty = config.get('quantity', 1)
-        trail_rupees = config.get('sl_rupees', 500.0)
-        pts = trail_rupees / max(qty, 1)
-        new_sl = current_price - direction * pts
-        if direction == 1:
-            return max(current_sl or position['entry_price'], new_sl)
-        else:
-            return min(current_sl or position['entry_price'], new_sl)
-
-    elif sl_type == 'Trailing Loss (Rupees)':
-        return current_sl  # Fixed, doesn't trail
-
-    elif sl_type == 'Trailing SL + Current Candle':
-        if position['type'] == 'LONG':
-            candle_sl = _safe_val(df['Low'],  idx, current_price - sl_pts)
-        else:
-            candle_sl = _safe_val(df['High'], idx, current_price + sl_pts)
-        new_sl = candle_sl
-        if direction == 1:
-            return max(current_sl, new_sl)
-        else:
-            return min(current_sl, new_sl)
-
-    elif sl_type == 'Trailing SL + Previous Candle':
-        prev = max(0, idx - 1)
-        if position['type'] == 'LONG':
-            candle_sl = _safe_val(df['Low'],  prev, current_price - sl_pts)
-        else:
-            candle_sl = _safe_val(df['High'], prev, current_price + sl_pts)
-        if direction == 1:
-            return max(current_sl, candle_sl)
-        else:
-            return min(current_sl, candle_sl)
-
-    elif sl_type == 'Trailing SL + Current Swing':
-        if position['type'] == 'LONG':
-            swing_sl = find_swing_low(df, idx)
-        else:
-            swing_sl = find_swing_high(df, idx)
-        if direction == 1:
-            return max(current_sl, swing_sl)
-        else:
-            return min(current_sl, swing_sl)
-
-    elif sl_type == 'Trailing SL + Previous Swing':
-        if position['type'] == 'LONG':
-            swing_sl = find_prev_swing_low(df, idx)
-        else:
-            swing_sl = find_prev_swing_high(df, idx)
-        if direction == 1:
-            return max(current_sl, swing_sl)
-        else:
-            return min(current_sl, swing_sl)
-
-    elif sl_type == 'Volatility-Adjusted Trailing SL':
-        atr = _safe_val(df['ATR'], idx, sl_pts)
-        new_sl = current_price - direction * atr * 1.5
-        if direction == 1:
-            return max(current_sl, new_sl)
-        else:
-            return min(current_sl, new_sl)
-
-    elif sl_type == 'Break-even After 50% Target':
-        entry = position['entry_price']
-        target = position.get('target_price', entry + direction * 20)
-        half_target_reached = False
-        if target is not None:
-            half_dist = abs(target - entry) * 0.5
-            if direction == 1 and current_price >= entry + half_dist:
-                half_target_reached = True
-            elif direction == -1 and current_price <= entry - half_dist:
-                half_target_reached = True
-        if half_target_reached:
-            # Move SL to break-even
-            breakeven = entry
-            if direction == 1:
-                return max(current_sl, breakeven)
-            else:
-                return min(current_sl, breakeven)
-        return current_sl
-
-    elif sl_type == 'Cost-to-Cost + N Points Trailing SL':
-        entry      = position['entry_price']
-        trigger_k  = config.get('c2c_trigger_k', 3.0)
-        offset_n   = config.get('c2c_offset_n', 2.0)
-        profit_pts = (current_price - entry) * direction
-
-        if profit_pts < trigger_k:
-            # Phase 1: Normal trailing
-            new_sl = current_price - direction * sl_pts
-        elif profit_pts < sl_pts:
-            # Phase 2: Lock at entry + N
-            new_sl = entry + direction * offset_n
-        else:
-            # Phase 3: Resume trailing with reduced distance
-            reduced_dist = sl_pts - offset_n
-            new_sl = current_price - direction * reduced_dist
-
-        if direction == 1:
-            return max(current_sl, new_sl)
-        else:
-            return min(current_sl, new_sl)
-
-    return current_sl
-
-
-def update_trailing_target(position: dict, current_price: float,
-                           df: pd.DataFrame, idx: int, config: dict):
-    """
-    Update trailing target. Returns (new_target, partial_exit_triggered).
-    """
-    target_type   = config.get('target_type', 'Custom Points')
-    target_pts    = config.get('target_points', 20.0)
-    direction     = 1 if position['type'] == 'LONG' else -1
-    current_target = position.get('target_price')
-    partial_exit   = False
-
-    if target_type == 'Trailing Target (Points)':
-        new_target = current_price + direction * target_pts
-        if current_target is None:
-            return new_target, False
-        if direction == 1:
-            return max(current_target, new_target), False
-        else:
-            return min(current_target, new_target), False
-
-    elif target_type == '50% Exit at Target (Partial)':
-        # Flag partial exit when target hit
-        if not position.get('partial_exit_done', False):
-            partial_exit = True
-        return current_target, partial_exit
-
-    elif target_type == 'Dynamic Trailing SL+Target (Lock Profits)':
-        new_target = current_price + direction * target_pts
-        if current_target is None:
-            return new_target, False
-        if direction == 1:
-            return max(current_target, new_target), False
-        else:
-            return min(current_target, new_target), False
-
-    return current_target, partial_exit
-
-# ──────────────────────────────────────────────────────────────────────────────
-# BACKTESTING ENGINE
-# ──────────────────────────────────────────────────────────────────────────────
-def run_backtest(df: pd.DataFrame, config: dict) -> dict:
-    """
-    Core backtesting engine. Implements Method 1 (current close) & Method 2 (next open).
-    Uses IDENTICAL logic to live trading for consistent results.
-    """
-    if df.empty:
-        return {'trades': [], 'skipped_trades': [], 'metrics': {}, 'debug': {}}
-
-    strategy_name   = config.get('strategy', 'EMA Crossover')
-    use_method2     = config.get('use_method2', False)
-    prevent_overlap = config.get('prevent_overlap', True)
-    sl_type         = config.get('sl_type', 'Custom Points')
-    target_type     = config.get('target_type', 'Custom Points')
-
-    trades          = []
-    skipped_trades  = []
-    position        = None
-    signals_skipped = 0
-    signals_total   = 0
-
-    # Min starting index to ensure indicators are computed
-    start_idx = max(60, len(df) // 10)
-
-    for idx in range(start_idx, len(df)):
-        row        = df.iloc[idx]
-        price      = row['Close']
-        datetime_  = row.get('Datetime', idx)
-
-        # ── Trade Window Exit ──
-        if position is not None:
-            if config.get('use_trade_window', False):
-                if not is_within_trade_window(datetime_, config):
-                    # Force-exit position
-                    exit_price  = price
-                    exit_reason = 'Trade Window Closed'
-                    pnl, brokerage, net_pnl = _close_position(
-                        position, exit_price, datetime_, exit_reason, df, idx, config)
-                    trades.append(position.copy())
-                    position = None
-                    continue
-
-        # ── Manage Active Position ──
-        if position is not None:
-            pos_type  = position['type']
-            direction = 1 if pos_type == 'LONG' else -1
-
-            # Track high/low during trade
-            position['highest_price'] = max(position.get('highest_price', price), row['High'])
-            position['lowest_price']  = min(position.get('lowest_price', price), row['Low'])
-
-            # Update trailing SL
-            if sl_type in ['Trailing SL (Points)', 'Trailing Profit (Rupees)',
-                           'Trailing SL + Current Candle', 'Trailing SL + Previous Candle',
-                           'Trailing SL + Current Swing', 'Trailing SL + Previous Swing',
-                           'Volatility-Adjusted Trailing SL', 'Break-even After 50% Target',
-                           'Cost-to-Cost + N Points Trailing SL']:
-                if position.get('sl_price') is not None:
-                    new_sl = update_trailing_sl(position, price, df, idx, config)
-                    position['sl_price'] = new_sl
-
-            # Update Dynamic Trailing Target
-            if target_type in ['Trailing Target (Points)', 'Dynamic Trailing SL+Target (Lock Profits)']:
-                if target_type == 'Dynamic Trailing SL+Target (Lock Profits)':
-                    # Also update trailing SL alongside target
-                    sl_pts = config.get('sl_points', 10.0)
-                    new_sl = price - direction * sl_pts
-                    if direction == 1:
-                        position['sl_price'] = max(position.get('sl_price') or 0, new_sl)
-                    else:
-                        position['sl_price'] = min(position.get('sl_price') or 999999, new_sl)
-                new_target, partial = update_trailing_target(position, price, df, idx, config)
-                position['target_price'] = new_target
-
-            # ── Check SL Hit ──
-            exit_reason = None
-            if position.get('sl_price') is not None:
-                if pos_type == 'LONG'  and row['Low']  <= position['sl_price']:
-                    exit_reason = 'SL Hit'
-                    price = position['sl_price']  # Simulate exact SL fill
-                elif pos_type == 'SHORT' and row['High'] >= position['sl_price']:
-                    exit_reason = 'SL Hit'
-                    price = position['sl_price']
-
-            # ── Check Target Hit ──
-            if exit_reason is None and position.get('target_price') is not None:
-                if pos_type == 'LONG'  and row['High'] >= position['target_price']:
-                    exit_reason = 'Target Hit'
-                    price = position['target_price']
-                elif pos_type == 'SHORT' and row['Low']  <= position['target_price']:
-                    exit_reason = 'Target Hit'
-                    price = position['target_price']
-
-            # ── Check Signal-Based Exit ──
-            if exit_reason is None:
-                use_signal_exit = (
-                    sl_type     == 'Signal-based (Reverse Crossover)' or
-                    target_type == 'Signal-based (Reverse Crossover)'
-                )
-                if use_signal_exit:
-                    sig, _ = get_strategy_signal(strategy_name, df, idx, config, position)
-                    if sig:
-                        if (pos_type == 'LONG'  and sig in ('SELL', 'SHORT')) or \
-                           (pos_type == 'SHORT' and sig in ('BUY',  'LONG')):
-                            exit_reason = 'Signal Exit'
-                            price = row['Close']
-
-            # ── Close Position ──
-            if exit_reason:
-                _close_position(position, price, datetime_, exit_reason, df, idx, config)
-                trades.append(position.copy())
-                position = None
-                continue
-
-        # ── Look for New Signal ──
-        if position is not None and prevent_overlap:
-            # Track skipped signal
-            sig, sig_info = get_strategy_signal(strategy_name, df, idx, config, position)
-            if sig and should_allow_trade_direction(sig, config):
-                signals_total += 1
-                signals_skipped += 1
-                # Simulate skipped trade
-                skip = _simulate_skipped_trade(df, idx, sig, config)
-                if skip:
-                    skipped_trades.append(skip)
-            continue
-
-        if position is None:
-            sig, sig_info = get_strategy_signal(strategy_name, df, idx, config, None)
-            if sig is None:
-                continue
-            if not should_allow_trade_direction(sig, config):
-                continue
-
-            dt = datetime_
-            if not is_within_trade_window(dt, config):
-                continue
-
-            signals_total += 1
-
-            # ── Method 1 vs Method 2 Entry ──
-            if use_method2:
-                if idx + 1 >= len(df):
-                    continue
-                entry_row   = df.iloc[idx + 1]
-                entry_price = entry_row['Open']
-                entry_time  = entry_row.get('Datetime', idx + 1)
-                entry_idx   = idx + 1
-            else:
-                entry_price = row['Close']
-                entry_time  = datetime_
-                entry_idx   = idx
-
-            initial_sl = calculate_initial_sl(entry_price, sig, df, entry_idx, config)
-            initial_tgt = calculate_initial_target(entry_price, sig, df, entry_idx, config, initial_sl)
-
-            position = {
-                'type':          sig,
-                'entry_price':   entry_price,
-                'entry_time':    entry_time,
-                'sl_price':      initial_sl,
-                'target_price':  initial_tgt,
-                'exit_price':    None,
-                'exit_time':     None,
-                'exit_reason':   None,
-                'pnl':           0.0,
-                'brokerage':     0.0,
-                'net_pnl':       0.0,
-                'highest_price': entry_price,
-                'lowest_price':  entry_price,
-                'signal_info':   sig_info,
-                'partial_exit_done': False,
-                'quantity':      config.get('quantity', 1),
-            }
-
-    # Close any open position at end of data
-    if position is not None:
-        last_idx = len(df) - 1
-        exit_price = df.iloc[last_idx]['Close']
-        _close_position(position, exit_price, df.iloc[last_idx].get('Datetime', last_idx),
-                        'End of Data', df, last_idx, config)
-        trades.append(position.copy())
-
-    metrics = _calculate_metrics(trades, config)
-    debug   = {
-        'total_signals': signals_total,
-        'signals_skipped': signals_skipped,
-        'overlapping_trades_tracked': len(skipped_trades),
-        'candles_analyzed': len(df) - start_idx,
-    }
-
-    return {
-        'trades':        trades,
-        'skipped_trades': skipped_trades,
-        'metrics':       metrics,
-        'debug':         debug,
-        'df':            df,
-    }
-
-
-def _close_position(position, exit_price, exit_time, exit_reason,
-                    df, idx, config):
-    """Compute P&L and populate exit fields on position dict."""
-    pos_type  = position['type']
-    direction = 1 if pos_type == 'LONG' else -1
-    qty       = position.get('quantity', config.get('quantity', 1))
-
-    raw_pnl   = direction * (exit_price - position['entry_price']) * qty
-    brokerage = calculate_brokerage(position['entry_price'], exit_price, qty, config)
-
-    position['exit_price']  = exit_price
-    position['exit_time']   = exit_time
-    position['exit_reason'] = exit_reason
-    position['pnl']         = round(raw_pnl, 2)
-    position['brokerage']   = round(brokerage, 2)
-    position['net_pnl']     = round(raw_pnl - brokerage, 2)
-
-    if 'entry_time' in position and exit_time is not None:
-        try:
-            et = position['entry_time']
-            xt = exit_time
-            if hasattr(et, 'timestamp') and hasattr(xt, 'timestamp'):
-                duration = (xt.timestamp() - et.timestamp()) / 60
-            else:
-                duration = 0
-            position['duration_min'] = round(duration, 1)
-        except:
-            position['duration_min'] = 0
-    return raw_pnl, brokerage, raw_pnl - brokerage
-
-
-def _simulate_skipped_trade(df, signal_idx, signal, config):
-    """Simulate outcome of a skipped (overlapping) trade."""
-    try:
-        direction = 1 if signal in ('LONG', 'BUY') else -1
-        entry_price = df.iloc[signal_idx]['Close']
-        sl_pts  = config.get('sl_points', 10.0)
-        tgt_pts = config.get('target_points', 20.0)
-        sl_price  = entry_price - direction * sl_pts
-        tgt_price = entry_price + direction * tgt_pts
-        qty = config.get('quantity', 1)
-
-        max_sim = min(signal_idx + 100, len(df))
-        exit_price  = df.iloc[max_sim - 1]['Close']
-        exit_reason = 'Simulated End'
-
-        for i in range(signal_idx + 1, max_sim):
-            h = df.iloc[i]['High']
-            l = df.iloc[i]['Low']
-            if direction == 1:
-                if l <= sl_price:
-                    exit_price = sl_price; exit_reason = 'SL Hit'; break
-                if h >= tgt_price:
-                    exit_price = tgt_price; exit_reason = 'Target Hit'; break
-            else:
-                if h >= sl_price:
-                    exit_price = sl_price; exit_reason = 'SL Hit'; break
-                if l <= tgt_price:
-                    exit_price = tgt_price; exit_reason = 'Target Hit'; break
-
-        pnl = direction * (exit_price - entry_price) * qty
-        return {
-            'type':       signal,
-            'entry_price': entry_price,
-            'exit_price': exit_price,
-            'pnl':        round(pnl, 2),
-            'exit_reason': exit_reason,
-            'note':       'Overlapped with active trade',
-        }
-    except Exception:
-        return None
-
-
-def _calculate_metrics(trades, config):
-    """Calculate comprehensive backtest metrics."""
-    if not trades:
-        return {}
-
-    use_net = config.get('include_brokerage', False)
-    pnl_key = 'net_pnl' if use_net else 'pnl'
-
-    total   = len(trades)
-    winners = [t for t in trades if t.get(pnl_key, 0) > 0]
-    losers  = [t for t in trades if t.get(pnl_key, 0) <= 0]
-
-    total_pnl     = sum(t.get('pnl',     0) for t in trades)
-    total_net_pnl = sum(t.get('net_pnl', 0) for t in trades)
-    total_brokerage = sum(t.get('brokerage', 0) for t in trades)
-
-    win_rate = len(winners) / total * 100 if total > 0 else 0
-    avg_pnl  = total_pnl / total if total > 0 else 0
-    avg_net  = total_net_pnl / total if total > 0 else 0
-
-    # Max drawdown (using cumulative P&L)
-    pnl_series = [t.get(pnl_key, 0) for t in trades]
-    cum_pnl    = 0
-    peak       = 0
-    max_dd     = 0
-    for p in pnl_series:
-        cum_pnl += p
-        peak     = max(peak, cum_pnl)
-        dd       = peak - cum_pnl
-        max_dd   = max(max_dd, dd)
-
-    avg_win  = sum(t.get(pnl_key, 0) for t in winners) / len(winners) if winners else 0
-    avg_loss = sum(t.get(pnl_key, 0) for t in losers)  / len(losers)  if losers  else 0
-    profit_factor = abs(sum(t.get(pnl_key, 0) for t in winners)) / abs(sum(t.get(pnl_key, 0) for t in losers)) if losers and sum(t.get(pnl_key, 0) for t in losers) != 0 else float('inf')
-
-    return {
-        'total_trades':    total,
-        'win_rate':        round(win_rate, 2),
-        'winning_trades':  len(winners),
-        'losing_trades':   len(losers),
-        'total_pnl':       round(total_pnl, 2),
-        'total_net_pnl':   round(total_net_pnl, 2),
-        'total_brokerage': round(total_brokerage, 2),
-        'avg_pnl':         round(avg_pnl, 2),
-        'avg_net_pnl':     round(avg_net, 2),
-        'avg_win':         round(avg_win, 2),
-        'avg_loss':        round(avg_loss, 2),
-        'max_drawdown':    round(max_dd, 2),
-        'profit_factor':   round(profit_factor, 2),
-    }
-
-# ──────────────────────────────────────────────────────────────────────────────
-# DHAN BROKER INTEGRATION
-# ──────────────────────────────────────────────────────────────────────────────
-class DhanBrokerIntegration:
-    """Dhan broker integration with full order management."""
-
-    EXCHANGE_MAP = {
-        'NSE': 'NSE_EQ',
-        'BSE': 'BSE_EQ',
-        'NSE_FO': 'NSE_FNO',
-    }
-    PRODUCT_INTRADAY  = 'INTRADAY'
-    PRODUCT_CNC       = 'CNC'
-    PRODUCT_BO        = 'BO'
-
-    def __init__(self, client_id: str, access_token: str):
-        self.client_id    = client_id
-        self.access_token = access_token
-        self.dhan         = None
-        self.connected    = False
-
-        if DHAN_AVAILABLE and client_id and access_token:
-            try:
-                self.dhan      = dhanhq(client_id, access_token)
-                self.connected = True
-            except Exception as e:
-                self.connected = False
-
-    def _get_exchange_segment(self, config: dict) -> str:
-        asset_type = config.get('asset_type', 'Stocks')
-        exchange   = config.get('exchange', 'NSE')
-        if asset_type in ('Options', 'Stock Options'):
-            return 'NSE_FNO'
-        return self.EXCHANGE_MAP.get(exchange, 'NSE_EQ')
-
-    def place_order(self, transaction_type: str, security_id: str,
-                    quantity: int, config: dict,
-                    price: float = 0, log_func=None) -> dict:
-        """Place a single order on Dhan."""
-        if not self.connected or self.dhan is None:
-            msg = f"[BROKER SIMULATION] {transaction_type} {quantity} @ {price}"
-            if log_func:
-                log_func(msg)
-            return {'status': 'simulated', 'orderId': 'SIM001'}
-
-        exchange  = self._get_exchange_segment(config)
-        prod_type = self.PRODUCT_INTRADAY if config.get('trading_type') == 'Intraday' else self.PRODUCT_CNC
-        order_type_str = config.get('order_type', 'Market Order')
-        use_bracket    = config.get('use_bracket', False)
-
-        try:
-            if use_bracket:
-                sl_pts  = config.get('broker_sl_points', 50)
-                tgt_pts = config.get('broker_target_points', 100)
-                trail   = config.get('broker_trail_sl', 0)
-                resp = self.dhan.place_order(
-                    transaction_type = transaction_type,
-                    exchange_segment = exchange,
-                    product_type     = self.PRODUCT_BO,
-                    order_type       = 'LIMIT',
-                    security_id      = str(security_id),
-                    quantity         = quantity,
-                    price            = price,
-                    bo_profit_value  = tgt_pts,
-                    bo_stop_loss_value = sl_pts,
-                    trail_stop_loss  = trail,
-                )
-            else:
-                otype  = 'MARKET' if order_type_str == 'Market Order' else 'LIMIT'
-                fill_p = 0 if otype == 'MARKET' else price
-                resp   = self.dhan.place_order(
-                    transaction_type = transaction_type,
-                    exchange_segment = exchange,
-                    product_type     = prod_type,
-                    order_type       = otype,
-                    security_id      = str(security_id),
-                    quantity         = quantity,
-                    price            = fill_p,
-                )
-
-            if log_func:
-                log_func(f"✅ Order placed: {transaction_type} {quantity}x {security_id} - {resp}")
-            return resp
-        except Exception as e:
-            if log_func:
-                log_func(f"❌ Order error: {e}")
-            return {'status': 'error', 'message': str(e)}
-
-    def enter_broker_position(self, signal: str, entry_price: float,
-                               config: dict, log_func=None) -> list:
-        """Enter position(s) - handles multi-account and multi-strike."""
-        results   = []
-        tx_type   = 'BUY' if signal in ('LONG', 'BUY') else 'SELL'
-        quantity  = config.get('quantity', 1)
-        sec_id    = config.get('security_id', '')
-
-        accounts = config.get('multi_accounts', []) or []
-        if not accounts:
-            accounts = [{'client_id': self.client_id, 'access_token': self.access_token}]
-
-        # Determine strike list
-        asset_type = config.get('asset_type', 'Stocks')
-        use_multi_strike = config.get('use_multi_strike', False) and asset_type == 'Options'
-        option_side = config.get('option_side', 'CE')
-
-        if use_multi_strike:
-            strike_key = f'multi_strikes_{option_side.lower()}'
-            strikes = config.get(strike_key, [sec_id]) or [sec_id]
-        else:
-            strikes = [sec_id]
-
-        for acc in accounts:
-            broker = DhanBrokerIntegration(acc['client_id'], acc['access_token'])
-            for sid in strikes:
-                r = broker.place_order(tx_type, sid, quantity, config, entry_price, log_func)
-                results.append(r)
-
-        return results
-
-    def exit_broker_position(self, signal: str, exit_price: float,
-                              config: dict, log_func=None) -> list:
-        """Exit position(s)."""
-        tx_type  = 'SELL' if signal in ('LONG', 'BUY') else 'BUY'
-        quantity = config.get('quantity', 1)
-        sec_id   = config.get('security_id', '')
-
-        accounts = config.get('multi_accounts', []) or []
-        if not accounts:
-            accounts = [{'client_id': self.client_id, 'access_token': self.access_token}]
-
-        asset_type = config.get('asset_type', 'Stocks')
-        use_multi_strike = config.get('use_multi_strike', False) and asset_type == 'Options'
-        option_side = config.get('option_side', 'CE')
-        if use_multi_strike:
-            strike_key = f'multi_strikes_{option_side.lower()}'
-            strikes = config.get(strike_key, [sec_id]) or [sec_id]
-        else:
-            strikes = [sec_id]
-
-        results = []
-        for acc in accounts:
-            broker = DhanBrokerIntegration(acc['client_id'], acc['access_token'])
-            for sid in strikes:
-                r = broker.place_order(tx_type, sid, quantity, config, exit_price, log_func)
-                results.append(r)
-        return results
-
-    def clear_all_positions(self, config: dict, log_func=None):
-        """Cancel pending orders and close all positions."""
-        if not self.connected or self.dhan is None:
-            if log_func:
-                log_func("🧹 [Simulation] Clearing all positions...")
-            return
-        try:
-            if log_func:
-                log_func("🧹 Clearing all existing positions...")
-            order_list = self.dhan.get_order_list()
-            cancelled  = 0
-            closed     = 0
-            if order_list and 'data' in order_list:
-                for order in order_list['data']:
-                    status = order.get('orderStatus', '')
-                    if status == 'PENDING':
-                        try:
-                            self.dhan.cancel_order(order['orderId'])
-                            cancelled += 1
-                            if log_func:
-                                log_func(f"✅ Cancelled pending order: {order['orderId']}")
-                        except Exception as e:
-                            if log_func:
-                                log_func(f"⚠️ Cancel failed: {e}")
-                    elif status == 'TRANSIT':
-                        try:
-                            reverse_tx = 'SELL' if order['transactionType'] == 'BUY' else 'BUY'
-                            self.dhan.place_order(
-                                transaction_type=reverse_tx,
-                                exchange_segment=order.get('exchangeSegment', 'NSE_EQ'),
-                                product_type='INTRADAY',
-                                order_type='MARKET',
-                                security_id=order['securityId'],
-                                quantity=order['quantity'],
-                                price=0,
-                            )
-                            closed += 1
-                            if log_func:
-                                log_func(f"✅ Closed transit position: {order['orderId']}")
-                        except Exception as e:
-                            if log_func:
-                                log_func(f"⚠️ Close failed: {e}")
-            if log_func:
-                log_func(f"✅ Cleared: {cancelled} orders cancelled, {closed} positions closed")
-        except Exception as e:
-            if log_func:
-                log_func(f"❌ Clear positions error: {e}")
-
-# ──────────────────────────────────────────────────────────────────────────────
-# LIVE TRADING ENGINE
-# ──────────────────────────────────────────────────────────────────────────────
-def add_log(message: str, log_key: str = 'live_logs'):
-    """Add timestamped log entry."""
-    now = datetime.now(IST).strftime('%H:%M:%S')
-    entry = f"[{now}] {message}"
-    if log_key not in st.session_state:
-        st.session_state[log_key] = []
-    st.session_state[log_key].insert(0, entry)
-    if len(st.session_state[log_key]) > 200:
-        st.session_state[log_key] = st.session_state[log_key][:200]
-
-
-def live_trading_iteration(config: dict):
-    """
-    Single iteration of live trading loop.
-    Uses IDENTICAL logic to backtesting for result consistency.
-    """
-    ticker   = config.get('ticker', '^NSEI')
-    interval = config.get('interval', '5m')
-    period   = '1d'  # Minimal data for live
-
-    # Fetch fresh data
-    df_raw = fetch_data(ticker, interval, period)
-    if df_raw.empty:
-        add_log("⚠️ No data fetched – skipping iteration")
-        return
-
-    df = calculate_all_indicators(df_raw, config)
-    if df.empty or len(df) < 30:
-        add_log("⚠️ Insufficient data for indicators")
-        return
-
-    st.session_state['current_data'] = df
-
-    idx         = len(df) - 1  # Latest candle
-    row         = df.iloc[idx]
-    price       = row['Close']
-    datetime_   = row.get('Datetime', datetime.now(IST))
-    position    = st.session_state.get('position')
-    broker      = st.session_state.get('dhan_broker')
-    sl_type     = config.get('sl_type', 'Custom Points')
-    target_type = config.get('target_type', 'Custom Points')
-
-    # ── Trade Window Exit ──
-    if position is not None and config.get('use_trade_window', False):
-        if not is_within_trade_window(datetime_, config):
-            add_log("⏰ Trade window closed – force exiting position")
-            _live_exit(position, price, 'Trade Window Closed', broker, config, df, idx)
-            return
-
-    # ── Manage Active Position ──
-    if position is not None:
-        pos_type  = position['type']
-        direction = 1 if pos_type == 'LONG' else -1
-
-        # Update trailing SL
-        if sl_type in ['Trailing SL (Points)', 'Trailing Profit (Rupees)',
-                       'Trailing SL + Current Candle', 'Trailing SL + Previous Candle',
-                       'Trailing SL + Current Swing', 'Trailing SL + Previous Swing',
-                       'Volatility-Adjusted Trailing SL', 'Break-even After 50% Target',
-                       'Cost-to-Cost + N Points Trailing SL']:
-            if position.get('sl_price') is not None:
-                new_sl = update_trailing_sl(position, price, df, idx, config)
-                if new_sl != position.get('sl_price'):
-                    position['sl_price'] = new_sl
-                    add_log(f"📊 Trailing SL updated → ₹{new_sl:.2f}")
-
-        # Update Dynamic Trailing Target
-        if target_type in ['Trailing Target (Points)', 'Dynamic Trailing SL+Target (Lock Profits)']:
-            if target_type == 'Dynamic Trailing SL+Target (Lock Profits)':
-                sl_pts = config.get('sl_points', 10.0)
-                new_sl = price - direction * sl_pts
-                if direction == 1:
-                    position['sl_price'] = max(position.get('sl_price') or 0, new_sl)
-                else:
-                    position['sl_price'] = min(position.get('sl_price') or 999999, new_sl)
-            new_target, _ = update_trailing_target(position, price, df, idx, config)
-            position['target_price'] = new_target
-
-        # Check SL
-        exit_reason = None
-        exit_price  = price
-        if position.get('sl_price') is not None:
-            if pos_type == 'LONG'  and price <= position['sl_price']:
-                exit_reason = 'SL Hit'
-                exit_price  = position['sl_price']
-            elif pos_type == 'SHORT' and price >= position['sl_price']:
-                exit_reason = 'SL Hit'
-                exit_price  = position['sl_price']
-
-        # Check Target
-        if exit_reason is None and position.get('target_price') is not None:
-            if pos_type == 'LONG'  and price >= position['target_price']:
-                exit_reason = 'Target Hit'
-                exit_price  = position['target_price']
-            elif pos_type == 'SHORT' and price <= position['target_price']:
-                exit_reason = 'Target Hit'
-                exit_price  = position['target_price']
-
-        # Signal Exit
-        if exit_reason is None:
-            use_sig = (sl_type == 'Signal-based (Reverse Crossover)' or
-                       target_type == 'Signal-based (Reverse Crossover)')
-            if use_sig:
-                sig, _ = get_strategy_signal(config.get('strategy'), df, idx, config, position)
-                if sig:
-                    if (pos_type == 'LONG'  and sig in ('SELL', 'SHORT')) or \
-                       (pos_type == 'SHORT' and sig in ('BUY',  'LONG')):
-                        exit_reason = 'Signal Exit'
-                        exit_price  = price
-
-        if exit_reason:
-            _live_exit(position, exit_price, exit_reason, broker, config, df, idx)
-            return
-
-        pnl = (price - position['entry_price']) * (1 if pos_type == 'LONG' else -1) * config.get('quantity', 1)
-        add_log(f"📈 {'🟢' if pos_type == 'LONG' else '🔴'} {pos_type} Active | Price: ₹{price:.2f} | P&L: ₹{pnl:.2f} | SL: ₹{position.get('sl_price', 0):.2f}")
-        st.session_state['position'] = position
-        return
-
-    # ── Look for New Entry ──
-    if not is_within_trade_window(datetime_, config):
-        return
-
-    sig, sig_info = get_strategy_signal(config.get('strategy'), df, idx, config, None)
-    if sig is None:
-        return
-    if not should_allow_trade_direction(sig, config):
-        return
-
-    # Check no existing broker position (prevent duplicates)
-    if st.session_state.get('broker_position'):
-        add_log("⚠️ Broker position already active – skipping new signal")
-        return
-
-    entry_price = price
-    add_log(f"🚨 Signal detected: {sig} @ ₹{entry_price:.2f}")
-
-    # Clear positions if enabled
-    if config.get('clear_positions_before_entry', False) and broker:
-        broker.clear_all_positions(config, lambda m: add_log(m))
-
-    # Calculate SL & Target
-    initial_sl  = calculate_initial_sl(entry_price, sig, df, idx, config)
-    initial_tgt = calculate_initial_target(entry_price, sig, df, idx, config, initial_sl)
-
-    # Enter broker position
-    if broker and config.get('enable_broker', False):
-        broker.enter_broker_position(sig, entry_price, config, lambda m: add_log(m))
-        st.session_state['broker_position'] = {'signal': sig, 'price': entry_price}
-
-    position = {
-        'type':        sig,
-        'entry_price': entry_price,
-        'entry_time':  datetime_,
-        'sl_price':    initial_sl,
-        'target_price': initial_tgt,
-        'exit_price':  None,
-        'exit_time':   None,
-        'exit_reason': None,
-        'pnl':         0.0,
-        'brokerage':   0.0,
-        'net_pnl':     0.0,
-        'highest_price': entry_price,
-        'lowest_price':  entry_price,
-        'signal_info': sig_info,
-        'quantity':    config.get('quantity', 1),
-    }
-    st.session_state['position'] = position
-    add_log(f"📈 ENTERED {'🟢 LONG' if sig == 'LONG' else '🔴 SHORT'} @ ₹{entry_price:.2f} | SL: ₹{initial_sl:.2f} | Target: ₹{initial_tgt:.2f}" if initial_tgt else f"📈 ENTERED {sig} @ ₹{entry_price:.2f} | SL: ₹{initial_sl:.2f} | Target: Signal-based")
-
-
-def _live_exit(position, exit_price, reason, broker, config, df, idx):
-    """Execute live trade exit."""
-    sig       = position['type']
-    qty       = position.get('quantity', config.get('quantity', 1))
-    direction = 1 if sig in ('LONG', 'BUY') else -1
-    pnl       = direction * (exit_price - position['entry_price']) * qty
-    brokerage = calculate_brokerage(position['entry_price'], exit_price, qty, config)
-    net_pnl   = pnl - brokerage
-
-    position['exit_price']  = exit_price
-    position['exit_time']   = datetime.now(IST)
-    position['exit_reason'] = reason
-    position['pnl']         = round(pnl, 2)
-    position['brokerage']   = round(brokerage, 2)
-    position['net_pnl']     = round(net_pnl, 2)
-
-    emoji = '✅' if pnl > 0 else '❌'
-    add_log(f"{emoji} EXIT {sig} @ ₹{exit_price:.2f} | Reason: {reason} | P&L: ₹{pnl:.2f} | Net: ₹{net_pnl:.2f}")
-
-    # Exit broker
-    if broker and config.get('enable_broker', False):
-        broker.exit_broker_position(sig, exit_price, config, lambda m: add_log(m))
-    st.session_state['broker_position'] = None
-
-    # Store in trade history
-    if 'trade_history' not in st.session_state:
-        st.session_state['trade_history'] = []
-    st.session_state['trade_history'].append(position.copy())
-    st.session_state['position'] = None
-
-# ──────────────────────────────────────────────────────────────────────────────
-# CHARTING & VISUALIZATION
-# ──────────────────────────────────────────────────────────────────────────────
-def build_candlestick_chart(df: pd.DataFrame, trades: list, config: dict,
-                            title: str = "Backtest Chart",
-                            max_candles: int = 300,
-                            position: dict = None) -> "go.Figure":
-    """Build plotly candlestick chart with overlays and trade markers."""
-    if not PLOTLY_AVAILABLE:
-        return None
-
-    plot_df = df.tail(max_candles).copy()
-
-    fig = go.Figure()
-
-    # Candlesticks
-    fig.add_trace(go.Candlestick(
-        x=plot_df['Datetime'],
-        open=plot_df['Open'],
-        high=plot_df['High'],
-        low=plot_df['Low'],
-        close=plot_df['Close'],
-        name='Price',
-        increasing_line_color='#26a69a',
-        decreasing_line_color='#ef5350',
-    ))
-
-    # EMA overlays
-    if 'EMA_Fast' in plot_df.columns:
-        fig.add_trace(go.Scatter(
-            x=plot_df['Datetime'], y=plot_df['EMA_Fast'],
-            name=f"EMA {config.get('ema_fast', 9)}",
-            line=dict(color='#FF9800', width=1.5),
-        ))
-    if 'EMA_Slow' in plot_df.columns:
-        fig.add_trace(go.Scatter(
-            x=plot_df['Datetime'], y=plot_df['EMA_Slow'],
-            name=f"EMA {config.get('ema_slow', 21)}",
-            line=dict(color='#2196F3', width=1.5),
-        ))
-
-    # Bollinger Bands
-    strat = config.get('strategy', '')
-    if 'BB' in strat or 'Bollinger' in strat or 'Mean Reversion' in strat:
-        if 'BB_Upper' in plot_df.columns:
-            fig.add_trace(go.Scatter(
-                x=plot_df['Datetime'], y=plot_df['BB_Upper'],
-                name='BB Upper', line=dict(color='#9C27B0', width=1, dash='dot'),
-            ))
-            fig.add_trace(go.Scatter(
-                x=plot_df['Datetime'], y=plot_df['BB_Lower'],
-                name='BB Lower', line=dict(color='#9C27B0', width=1, dash='dot'),
-                fill='tonexty', fillcolor='rgba(156,39,176,0.05)',
-            ))
+    if   adx > 30: L.append(f"[{ts}] 💪 ADX={adx:.1f}  STRONG directional trend — follow signals")
+    elif adx > 20: L.append(f"[{ts}] 👍 ADX={adx:.1f}  Moderate trend — signals reliable")
+    else:           L.append(f"[{ts}] ⚠️  ADX={adx:.1f}  WEAK/RANGING — filter trades carefully")
+
+    # DI
+    if dip > din: L.append(f"[{ts}] DI+ ({dip:.1f}) > DI- ({din:.1f}) → Bullish directional edge")
+    else:          L.append(f"[{ts}] DI- ({din:.1f}) > DI+ ({dip:.1f}) → Bearish directional edge")
 
     # VWAP
-    if 'VWAP' in strat or config.get('strategy', '') == 'VWAP + Volume Spike':
-        if 'VWAP' in plot_df.columns:
-            fig.add_trace(go.Scatter(
-                x=plot_df['Datetime'], y=plot_df['VWAP'],
-                name='VWAP', line=dict(color='#FFEB3B', width=1.5, dash='dash'),
-            ))
+    if px > vw: L.append(f"[{ts}] ✅ Price ABOVE VWAP ({vw:.4f}) → institutional buy zone")
+    else:        L.append(f"[{ts}] ❌ Price BELOW VWAP ({vw:.4f}) → institutional sell zone")
 
-    # Ichimoku Cloud
-    if 'Ichimoku' in strat:
-        for col, color, name in [('Senkou_A', 'rgba(38,166,154,0.2)', 'Senkou A'),
-                                  ('Senkou_B', 'rgba(239,83,80,0.2)', 'Senkou B')]:
-            if col in plot_df.columns:
-                fig.add_trace(go.Scatter(
-                    x=plot_df['Datetime'], y=plot_df[col],
-                    name=name, line=dict(color=color, width=1),
-                    fill='tonexty' if col == 'Senkou_B' else None,
-                    fillcolor='rgba(100,200,180,0.08)',
-                ))
+    # Supertrend
+    if std == 1:  L.append(f"[{ts}] 🟢 SUPERTREND: BULLISH (price above trend line)")
+    elif std == -1: L.append(f"[{ts}] 🔴 SUPERTREND: BEARISH (price below trend line)")
 
-    # Trade markers on chart
-    for trade in trades:
-        entry_t = trade.get('entry_time')
-        exit_t  = trade.get('exit_time')
-        ep      = trade.get('entry_price', 0)
-        xp      = trade.get('exit_price',  0)
-        ttype   = trade.get('type', 'LONG')
-        pnl     = trade.get('pnl', 0)
+    # MACD
+    if macd > 0: L.append(f"[{ts}] 📊 MACD positive ({macd:.4f}) → bullish momentum building")
+    else:         L.append(f"[{ts}] 📊 MACD negative ({macd:.4f}) → bearish momentum building")
 
-        if entry_t is not None:
-            fig.add_trace(go.Scatter(
-                x=[entry_t], y=[ep],
-                mode='markers',
-                marker=dict(
-                    symbol='triangle-up' if ttype == 'LONG' else 'triangle-down',
-                    size=10,
-                    color='#00FF00' if ttype == 'LONG' else '#FF4444',
-                ),
-                name='Entry',
-                text=f"Entry {ttype} @ ₹{ep:.2f}",
-                hoverinfo='text',
-                showlegend=False,
-            ))
-        if exit_t is not None:
-            fig.add_trace(go.Scatter(
-                x=[exit_t], y=[xp],
-                mode='markers',
-                marker=dict(symbol='x', size=10,
-                            color='#FFA500' if pnl > 0 else '#FF0000'),
-                name='Exit',
-                text=f"Exit @ ₹{xp:.2f} | P&L: ₹{pnl:.2f}",
-                hoverinfo='text',
-                showlegend=False,
-            ))
+    L.append(f"[{ts}] ────────────────────────────────────")
 
-    # Live position markers
-    if position is not None:
-        ep = position.get('entry_price', 0)
-        sl = position.get('sl_price')
-        tp = position.get('target_price')
-        if ep:
-            fig.add_hline(y=ep, line_dash="dash", line_color="green",
-                          annotation_text=f"Entry ₹{ep:.2f}")
-        if sl:
-            fig.add_hline(y=sl, line_dash="dot", line_color="red",
-                          annotation_text=f"SL ₹{sl:.2f}")
-        if tp:
-            fig.add_hline(y=tp, line_dash="dot", line_color="cyan",
-                          annotation_text=f"Target ₹{tp:.2f}")
+    # Signal action
+    if sig == "LONG":
+        rr = sig_data["rr"]
+        L.append(f"[{ts}] 🟢 SIGNAL: LONG  |  Confidence: {conf:.0f}%  |  R:R = 1:{rr:.2f}")
+        L.append(f"[{ts}] 📍 Entry:  {px:.5f}")
+        L.append(f"[{ts}] 🛑 Stop Loss:  {sig_data['sl']:.5f}  (risk = {abs(px-sig_data['sl']):.5f})")
+        L.append(f"[{ts}] 🎯 Target 1:  {sig_data['t1']:.5f}  (+{abs(sig_data['t1']-px):.5f})")
+        L.append(f"[{ts}] 🎯 Target 2:  {sig_data['t2']:.5f}")
+        L.append(f"[{ts}] 🎯 Target 3:  {sig_data['t3']:.5f}  (full runner)")
+        L.append(f"[{ts}] 🔒 Trailing SL offset: {sig_data['tsl_offset']:.5f} below peak")
+        L.append(f"[{ts}] ► ACTION: ENTER LONG | Partial exit at T1, trail to T3")
+    elif sig == "SHORT":
+        rr = sig_data["rr"]
+        L.append(f"[{ts}] 🔴 SIGNAL: SHORT  |  Confidence: {conf:.0f}%  |  R:R = 1:{rr:.2f}")
+        L.append(f"[{ts}] 📍 Entry:  {px:.5f}")
+        L.append(f"[{ts}] 🛑 Stop Loss:  {sig_data['sl']:.5f}")
+        L.append(f"[{ts}] 🎯 Target 1:  {sig_data['t1']:.5f}")
+        L.append(f"[{ts}] 🎯 Target 2:  {sig_data['t2']:.5f}")
+        L.append(f"[{ts}] 🎯 Target 3:  {sig_data['t3']:.5f}")
+        L.append(f"[{ts}] 🔒 Trailing SL offset: {sig_data['tsl_offset']:.5f} above trough")
+        L.append(f"[{ts}] ► ACTION: ENTER SHORT | Partial exit at T1, trail to T3")
+    else:
+        L.append(f"[{ts}] ⏸️  SIGNAL: HOLD  |  Confidence: {conf:.0f}%")
+        L.append(f"[{ts}] ► ACTION: WAIT — no high-probability setup. Monitor for breakout.")
+        L.append(f"[{ts}]   Watch: price vs VWAP and EMA alignment for next signal.")
 
-    height = 500 if max_candles == 300 else 420
-    fig.update_layout(
-        title=title,
-        template='plotly_dark',
-        height=height,
-        xaxis_rangeslider_visible=False,
-        hovermode='x unified',
-        legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1),
-        margin=dict(l=40, r=40, t=60, b=40),
-    )
-    return fig
+    L.append(f"[{ts}] ════════════════════════════════════")
+
+    # Reasoning
+    if sig_data.get("reason"):
+        L.append(f"[{ts}] BREAKDOWN:")
+        for r in sig_data["reason"].split(" | ")[:6]:
+            if r.strip(): L.append(f"[{ts}]   → {r}")
+    return L
 
 
-def build_pnl_chart(trades: list, config: dict) -> "go.Figure":
-    """Build cumulative P&L chart."""
-    if not PLOTLY_AVAILABLE or not trades:
-        return None
+# ══════════════════════════════════════════════════════════════
+# ANALYSIS SUMMARY
+# ══════════════════════════════════════════════════════════════
+def analysis_summary(df, I, sig, ticker, strategy, tf_label, period_label):
+    if sig is None: return "Insufficient data."
+    px      = sig["entry"]
+    chg_pct = (df["Close"].iloc[-1] - df["Close"].iloc[-2]) / df["Close"].iloc[-2] * 100
+    atr_pct = sig["atr"] / px * 100
+    trend   = "UPTREND" if sig["ema21"] > sig["ema50"] else "DOWNTREND"
+    vol_str = ""
+    if "Volume" in df.columns:
+        v_now, v_avg = df["Volume"].iloc[-1], df["Volume"].rolling(20).mean().iloc[-1]
+        if   v_now > 1.5*v_avg: vol_str = "🔴 ABOVE AVERAGE — Volume surge (conviction move)"
+        elif v_now < 0.7*v_avg: vol_str = "🟡 LOW — below average volume (weak conviction)"
+        else:                    vol_str = "⚪ AVERAGE — normal volume"
+    rr_str  = f"1:{sig['rr']:.2f}" if sig["signal"] != "HOLD" else "N/A"
+    reasons_fmt = "\n".join(f"  • {r}" for r in sig["reason"].split(" | ") if r.strip()) if sig.get("reason") else "N/A"
 
-    use_net = config.get('include_brokerage', False)
-    pnl_key = 'net_pnl' if use_net else 'pnl'
+    return f"""
+## 📊 Technical Analysis — {ticker}
 
-    cum_pnl = []
-    running  = 0
-    labels   = []
-    for i, t in enumerate(trades):
-        running += t.get(pnl_key, 0)
-        cum_pnl.append(running)
-        labels.append(f"Trade {i + 1}")
+**Strategy:** {strategy} &nbsp;|&nbsp; **Timeframe:** {tf_label} &nbsp;|&nbsp; **Period:** {period_label}  
+**Generated:** {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
 
-    colors = ['#26a69a' if v >= 0 else '#ef5350' for v in cum_pnl]
+---
 
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(
-        x=list(range(1, len(cum_pnl) + 1)),
-        y=cum_pnl,
-        mode='lines+markers',
-        name='Cumulative P&L',
-        line=dict(color='#2196F3', width=2),
-        marker=dict(color=colors, size=6),
-    ))
-    fig.add_hline(y=0, line_dash='dash', line_color='white', opacity=0.4)
+### 🔍 Market Overview
+Current price **{px:.5f}** ({chg_pct:+.2f}% last candle). Primary structure: **{trend}**.  
+EMA21 = {sig["ema21"]:.4f} | EMA50 = {sig["ema50"]:.4f} | EMA200 context: {"above" if px > sig.get("ema50",px) else "below"} medium-term average.
 
-    fig.update_layout(
-        title=f"Cumulative {'Net ' if use_net else ''}P&L",
-        xaxis_title='Trade Number',
-        yaxis_title='P&L (₹)',
-        template='plotly_dark',
-        height=300,
-        margin=dict(l=40, r=40, t=50, b=40),
-    )
-    return fig
+### 📈 Trend & Momentum
+| Indicator | Value | Interpretation |
+|-----------|-------|----------------|
+| **RSI (14)** | {sig["rsi"]:.1f} | {"Oversold — bounce likely" if sig["rsi"]<30 else "Overbought — reversal risk" if sig["rsi"]>70 else "Neutral zone"} |
+| **MACD** | {sig["macd_v"]:.4f} | {"Bullish momentum" if sig["macd_v"]>0 else "Bearish momentum"} |
+| **ADX** | {sig["adx_v"]:.1f} | {"Strong trend (>25)" if sig["adx_v"]>25 else "Moderate trend" if sig["adx_v"]>20 else "⚠️ Weak/ranging"} |
+| **Supertrend** | {"🟢 BULLISH" if sig["st_dir"]==1 else "🔴 BEARISH"} | Trend direction confirmed |
+| **DI+/DI-** | {sig["dip"]:.1f} / {sig["din"]:.1f} | {"Bullish edge" if sig["dip"]>sig["din"] else "Bearish edge"} |
+| **VWAP** | {sig["vwap_v"]:.4f} | Price {"above ✅" if px>sig["vwap_v"] else "below ❌"} VWAP |
+| **ATR (14)** | {sig["atr"]:.4f} | {atr_pct:.2f}% of price (volatility) |
 
-# ──────────────────────────────────────────────────────────────────────────────
-# UI COMPONENTS
-# ──────────────────────────────────────────────────────────────────────────────
-def render_config_ui() -> dict:
-    """Render sidebar configuration. Returns config dict."""
-    config = {}
+### 🎯 Key Levels
+- **Resistance (R1):** {sig.get("r1", "N/A")}  
+- **Support (S1):**    {sig.get("s1", "N/A")}  
+- **BB Upper:**        {sig["bb_up"]:.4f}  
+- **BB Lower:**        {sig["bb_lo"]:.4f}  
 
-    st.sidebar.title("⚙️ Configuration")
+### 🚦 Signal
+**Direction: {sig["signal"]}** | Confidence: **{sig["confidence"]:.0f}%** | Risk:Reward = **{rr_str}**
 
-    # ── Asset & Data ──
-    with st.sidebar.expander("📊 Asset & Timeframe", expanded=True):
-        asset_name = st.selectbox("Asset", list(ASSET_MAP.keys()), key='sb_asset')
-        if asset_name == "Custom Ticker":
-            ticker = st.text_input("Custom Yahoo Ticker", value="AAPL", key='sb_custom_ticker')
+{"**Entry:** "+f'{sig["entry"]:.5f} | **SL:** '+f'{sig["sl"]:.5f} | **T1:** '+f'{sig["t1"]:.5f} | **T2:** '+f'{sig["t2"]:.5f} | **T3:** '+f'{sig["t3"]:.5f}' if sig["signal"] != "HOLD" else "No active trade setup — awaiting confirmation."}
+
+### 📝 Reasoning
+{reasons_fmt}
+
+### 📦 Volume Analysis
+{vol_str if vol_str else "Volume data unavailable"}
+
+### ⚠️ Risk Management Notes
+- Risk only **1–2% of capital** per trade
+- Move SL to breakeven once T1 is reached
+- Scale out at T1 (50%), T2 (30%), T3 (20%)
+- Trailing SL locks in profits as price extends
+- Avoid trading ADX < 20 with trend-following strategies
+"""
+
+
+# ══════════════════════════════════════════════════════════════
+# SIDEBAR
+# ══════════════════════════════════════════════════════════════
+def sidebar():
+    with st.sidebar:
+        st.markdown('<div class="pt-logo">⚡ ProTrader AI</div>', unsafe_allow_html=True)
+        st.caption("Professional Algo Trading Platform")
+        st.divider()
+
+        # Theme
+        dark = st.toggle("🌙 Dark Theme", value=st.session_state.dark_mode, key="theme_toggle")
+        if dark != st.session_state.dark_mode:
+            st.session_state.dark_mode = dark
+            st.rerun()
+
+        st.divider()
+
+        # Ticker
+        tk_name = st.selectbox("📊 Asset", list(TICKERS.keys()), index=3)
+        if tk_name == "⚙ Custom":
+            ticker = st.text_input("Enter symbol (e.g. AAPL, ^NSEI)", "AAPL")
         else:
-            ticker = ASSET_MAP[asset_name]
-        config['asset_name'] = asset_name
-        config['ticker']     = ticker
+            ticker = TICKERS[tk_name]
 
-        interval_name = st.selectbox("Interval", list(INTERVAL_MAP.keys()),
-                                     index=1, key='sb_interval')
-        config['interval'] = INTERVAL_MAP[interval_name]
-        config['interval_name'] = interval_name
+        st.divider()
 
-        period_name = st.selectbox("Historical Period", list(PERIOD_MAP.keys()),
-                                   index=4, key='sb_period')
-        config['period'] = PERIOD_MAP[period_name]
+        # Strategy
+        strategy = st.selectbox("🎯 Strategy", list(REC_TF.keys()), index=1)
+        st.caption(f"💡 {STRATEGY_DESC[strategy]}")
 
-    # ── Strategy ──
-    with st.sidebar.expander("🎯 Strategy", expanded=True):
-        strategy = st.selectbox("Strategy", STRATEGIES, key='sb_strategy')
-        config['strategy'] = strategy
+        rec_tf, rec_p = REC_TF[strategy]
+        tf_label  = st.selectbox("⏱ Timeframe", list(TIMEFRAMES.keys()),
+                                  index=list(TIMEFRAMES.keys()).index(rec_tf))
+        prd_label = st.selectbox("📅 Period",    list(PERIODS.keys()),
+                                  index=list(PERIODS.keys()).index(rec_p))
+        tf  = TIMEFRAMES[tf_label]
+        prd = PERIODS[prd_label]
 
-        if strategy == 'EMA Crossover':
-            config['ema_fast'] = st.number_input("Fast EMA", value=9,  min_value=2, key='sb_ema_fast')
-            config['ema_slow'] = st.number_input("Slow EMA", value=21, min_value=3, key='sb_ema_slow')
-            config['ema_min_angle'] = st.number_input("Min Angle (°)", value=0.0, step=0.1, key='sb_angle')
-            filters = st.multiselect("Entry Filters",
-                ['Simple Crossover', 'Volume Confirmation', 'RSI Filter'],
-                default=['Simple Crossover'], key='sb_ema_filters')
-            config['ema_entry_filter'] = filters[0] if filters else 'Simple Crossover'
-            if 'RSI Filter' in filters:
-                config['use_rsi_filter'] = True
-                c1, c2 = st.columns(2)
-                config['rsi_filter_min'] = c1.number_input("RSI Min", value=30, key='sb_rsi_min')
-                config['rsi_filter_max'] = c2.number_input("RSI Max", value=70, key='sb_rsi_max')
-            if 'Volume Confirmation' in filters:
-                config['use_rsi_filter'] = False
-            config['use_adx_filter'] = st.checkbox("ADX Filter", value=False, key='sb_adx_filt')
-            if config.get('use_adx_filter'):
-                config['adx_threshold'] = st.number_input("ADX Threshold", value=20, key='sb_adx_thresh')
-                config['adx_period']    = st.number_input("ADX Period", value=14, key='sb_adx_per')
+        st.divider()
+        st.subheader("🛡 Risk / SL Settings")
+        sl_type  = st.selectbox("SL Type",     list(SL_TYPES.keys()),  index=0)
+        tgt_type = st.selectbox("Target Type", list(TARGET_TYPES.keys()), index=0)
+        sl_mult  = st.slider("SL Multiplier (ATR×)",  0.5, 4.0, 1.5, 0.25)
+        t_mult   = st.slider("Target Multiplier",      1.0, 8.0, 2.5, 0.25)
 
-        elif strategy == 'Price Crosses Threshold':
-            config['threshold_price']    = st.number_input("Price Threshold", value=25000.0, step=10.0, key='sb_thresh')
-            config['threshold_cross_dir'] = st.radio("Cross Direction", ['Above', 'Below'], key='sb_cross_dir')
-            config['threshold_position']  = st.radio("Position Type", ['LONG', 'SHORT'], key='sb_thresh_pos')
-
-        elif strategy == 'RSI-ADX-EMA Combined':
-            config['adx_threshold'] = st.number_input("ADX Threshold", value=25, key='sb_radx')
-            config['rsi_period']    = st.number_input("RSI Period", value=14, key='sb_rsi_per')
-            config['ema_slow']      = 50
-
-        elif strategy == 'Percentage Change':
-            config['pct_threshold'] = st.number_input("% Threshold", value=2.0, step=0.001, format="%.3f", key='sb_pct')
-            config['pct_change_dir'] = st.radio("Change Direction", ['Positive', 'Negative'], key='sb_pct_dir')
-            config['pct_position']   = st.radio("Position Type", ['LONG', 'SHORT'], key='sb_pct_pos')
-
-        elif strategy == 'Custom Strategy (Multi-Indicator)':
-            _render_custom_strategy_ui(config)
-
-        elif strategy == 'SuperTrend AI':
-            config['st_atr_period']   = st.number_input("ATR Period", value=10, key='sb_st_atr')
-            config['st_multiplier']   = st.number_input("Multiplier", value=3.0, step=0.1, key='sb_st_mult')
-            config['adx_threshold']   = st.number_input("ADX Threshold", value=25, key='sb_st_adx')
-            config['st_vol_multiplier'] = st.number_input("Volume Multiplier", value=1.5, step=0.1, key='sb_st_vol')
-
-        elif strategy == 'VWAP + Volume Spike':
-            config['vwap_vol_multiplier'] = st.number_input("Vol Spike Multiplier", value=2.0, step=0.1, key='sb_vwap_vol')
-            config['vwap_max_dist']       = st.number_input("Max VWAP Distance (%)", value=0.3, step=0.1, key='sb_vwap_dist')
-            config['vwap_rsi_ob']         = st.number_input("RSI Overbought", value=70, key='sb_vwap_ob')
-            config['vwap_rsi_os']         = st.number_input("RSI Oversold", value=30, key='sb_vwap_os')
-
-        elif strategy == 'Bollinger Squeeze Breakout':
-            config['bb_period']          = st.number_input("BB Period", value=20, key='sb_bbs_per')
-            config['bb_std_dev']         = st.number_input("BB Std Dev", value=2.0, step=0.1, key='sb_bbs_std')
-            config['bb_squeeze_thresh']  = st.number_input("Squeeze Threshold", value=0.02, step=0.001, format="%.3f", key='sb_bbs_sq')
-            config['bb_vol_multiplier']  = st.number_input("Breakout Vol Multiplier", value=1.8, step=0.1, key='sb_bbs_vol')
-
-        elif strategy == 'Elliott Waves + Ratio Charts':
-            config['wave_lookback']     = st.number_input("Wave Lookback", value=13, key='sb_ew_lb')
-            config['ratio_ema_period']  = st.number_input("Ratio EMA Period", value=21, key='sb_ew_rep')
-            config['ratio_threshold']   = st.number_input("Ratio Threshold", value=1.0, step=0.01, key='sb_ew_rt')
-
-        elif strategy == 'Morning Breakout (ORB)':
-            config['orb_vol_multiplier'] = st.number_input("Volume Multiplier", value=1.5, step=0.1, key='sb_orb_vol')
-            st.info("ℹ️ Breaks Opening Range (first 15 min) with volume surge")
-
-        elif strategy == 'MACD Divergence':
-            config['macd_div_lookback'] = st.number_input("Lookback Period", value=20, key='sb_md_lb')
-            config['macd_fast']  = st.number_input("MACD Fast", value=12, key='sb_mf')
-            config['macd_slow']  = st.number_input("MACD Slow", value=26, key='sb_ms')
-            config['macd_signal']= st.number_input("MACD Signal", value=9, key='sb_msig')
-
-        elif strategy == 'Triple EMA Momentum':
-            st.info("ℹ️ Uses EMA 9, 20, 50 alignment with pullback entry")
-            config['adx_threshold'] = st.number_input("Min ADX for Signal", value=20, key='sb_tem_adx')
-
-        elif strategy == 'Mean Reversion (Bollinger + RSI)':
-            config['bb_period']   = st.number_input("BB Period", value=20, key='sb_mr_bbp')
-            config['bb_std_dev']  = st.number_input("BB Std Dev", value=2.0, step=0.1, key='sb_mr_bbs')
-            config['mr_rsi_os']   = st.number_input("RSI Oversold Level", value=30, key='sb_mr_os')
-            config['mr_rsi_ob']   = st.number_input("RSI Overbought Level", value=70, key='sb_mr_ob')
-
-        elif strategy == 'Ichimoku Cloud Breakout':
-            st.info("ℹ️ Tenkan(9), Kijun(26), Senkou B(52) - cloud breakout entry")
-            config['adx_threshold'] = st.number_input("Min ADX", value=20, key='sb_ich_adx')
-
-        # Defaults for missing params
-        config.setdefault('ema_fast', 9)
-        config.setdefault('ema_slow', 21)
-        config.setdefault('bb_period', 20)
-        config.setdefault('bb_std_dev', 2.0)
-        config.setdefault('adx_threshold', 25)
-        config.setdefault('adx_period', 14)
-        config.setdefault('rsi_period', 14)
-        config.setdefault('macd_fast', 12)
-        config.setdefault('macd_slow', 26)
-        config.setdefault('macd_signal', 9)
-        config.setdefault('st_atr_period', 10)
-        config.setdefault('st_multiplier', 3.0)
-
-    # ── SL Configuration ──
-    with st.sidebar.expander("🛑 Stop Loss", expanded=True):
-        sl_type = st.selectbox("SL Type", SL_TYPES, key='sb_sl_type')
-        config['sl_type'] = sl_type
-
-        if sl_type in ['Custom Points', 'Trailing SL (Points)', 'Trailing SL + Current Candle',
-                       'Trailing SL + Previous Candle', 'Trailing SL + Current Swing',
-                       'Trailing SL + Previous Swing', 'Break-even After 50% Target',
-                       'Cost-to-Cost + N Points Trailing SL']:
-            config['sl_points'] = st.number_input("SL Points", value=10.0, step=0.5, min_value=0.1, key='sb_sl_pts')
-
-        if sl_type in ['P&L Based (Rupees)', 'Trailing Profit (Rupees)', 'Trailing Loss (Rupees)']:
-            config['sl_rupees'] = st.number_input("SL Rupees", value=500.0, step=50.0, key='sb_sl_rs')
-
-        if sl_type == 'ATR-based':
-            config['sl_atr_mult'] = st.number_input("ATR Multiplier", value=1.5, step=0.1, key='sb_sl_atr')
-
-        if sl_type == 'Cost-to-Cost + N Points Trailing SL':
+        st.divider()
+        st.subheader("⏰ Trading Window")
+        use_win  = st.checkbox("Restrict to Trading Hours", value=True)
+        w_sh, w_sm = 9,  15
+        w_eh, w_em = 15,  0
+        if use_win:
             c1, c2 = st.columns(2)
-            config['c2c_trigger_k'] = c1.number_input("Trigger K pts", value=3.0, step=0.5, key='sb_c2c_k')
-            config['c2c_offset_n']  = c2.number_input("Offset N pts", value=2.0, step=0.5, key='sb_c2c_n')
+            with c1: w_sh = st.number_input("Start Hr",  0, 23, 9);  w_sm = st.number_input("Start Min", 0, 59, 15)
+            with c2: w_eh = st.number_input("End Hr",    0, 23, 15); w_em = st.number_input("End Min",   0, 59, 0)
+        win_s = dtime(w_sh, w_sm); win_e = dtime(w_eh, w_em)
 
-    # ── Target Configuration ──
-    with st.sidebar.expander("🎯 Target", expanded=True):
-        target_type = st.selectbox("Target Type", TARGET_TYPES, key='sb_tgt_type')
-        config['target_type'] = target_type
-
-        if target_type in ['Custom Points', 'Trailing Target (Points)',
-                           'Dynamic Trailing SL+Target (Lock Profits)', '50% Exit at Target (Partial)']:
-            config['target_points'] = st.number_input("Target Points", value=20.0, step=0.5, min_value=0.1, key='sb_tgt_pts')
-
-        if target_type == 'P&L Based (Rupees)':
-            config['target_rupees'] = st.number_input("Target Rupees", value=1000.0, step=100.0, key='sb_tgt_rs')
-
-        if target_type == 'ATR-based':
-            config['target_atr_mult'] = st.number_input("ATR Multiplier", value=2.0, step=0.1, key='sb_tgt_atr')
-
-        if target_type == 'Risk-Reward Based':
-            config['target_rr_ratio'] = st.number_input("R:R Ratio", value=2.0, step=0.1, min_value=0.1, key='sb_rr')
-
-        if target_type == 'Signal-based (Reverse Crossover)':
-            st.info("ℹ️ Exits only on reverse signal. No price target is set.")
-
-    # ── Trade Configuration ──
-    with st.sidebar.expander("📋 Trade Settings"):
-        config['quantity'] = st.number_input("Quantity (Lots/Shares)", value=1, min_value=1, key='sb_qty')
-        config['direction_filter'] = st.radio("Trade Direction",
-            ['Both', 'LONG Only', 'SHORT Only'], key='sb_dir_filter')
-
-        config['use_trade_window'] = st.checkbox("⏰ Enable Trade Window", key='sb_tw')
-        if config['use_trade_window']:
-            c1, c2 = st.columns(2)
-            ws = c1.time_input("Start Time (IST)", value=dtime(9, 30), key='sb_tw_start')
-            we = c2.time_input("End Time (IST)",   value=dtime(15, 0), key='sb_tw_end')
-            config['window_start'] = ws
-            config['window_end']   = we
-
-        config['prevent_overlap'] = st.checkbox("🚫 Prevent Overlapping Trades",
-                                                 value=True, key='sb_overlap')
-
-    # ── Backtesting Options ──
-    with st.sidebar.expander("🔬 Backtesting Options"):
-        config['use_method2'] = st.checkbox(
-            "🔬 Method 2 (Realistic Entry – Next Open)", key='sb_m2',
-            help="Entry at next candle open. More realistic, avoids look-ahead bias.")
-        config['filter_same_day'] = st.checkbox(
-            "📅 Filter Same-Day Trades Only", key='sb_same_day',
-            help="Show only intraday trades (9:15 AM – 3:00 PM)")
-
-    # ── Brokerage ──
-    with st.sidebar.expander("💰 Brokerage & Charges"):
-        config['include_brokerage'] = st.checkbox("Include Brokerage", key='sb_brok')
-        if config['include_brokerage']:
-            config['brokerage_calc_type'] = st.radio("Calculation", ['Fixed', 'Percentage'], key='sb_brok_type')
-            if config['brokerage_calc_type'] == 'Fixed':
-                config['brokerage_fixed'] = st.number_input("Brokerage per Trade (₹)", value=20.0, key='sb_brok_fixed')
-            else:
-                config['brokerage_pct'] = st.number_input("Turnover % (e.g. 0.03)", value=0.03, step=0.001, format="%.3f", key='sb_brok_pct')
-
-    # ── Broker (Dhan) ──
-    with st.sidebar.expander("🏦 Dhan Broker"):
-        config['enable_broker'] = st.checkbox("Enable Dhan Broker", key='sb_dhan')
-        if config['enable_broker']:
-            config['dhan_client_id']    = st.text_input("Client ID", key='sb_dhan_cid')
-            config['dhan_access_token'] = st.text_input("Access Token", type='password', key='sb_dhan_tok')
-            config['asset_type']  = st.selectbox("Asset Type", ['Stocks', 'Options', 'Stock Options'], key='sb_atype')
-            config['security_id'] = st.text_input("Security ID", value='', key='sb_secid')
-            config['exchange']    = st.selectbox("Exchange", ['NSE', 'BSE'], key='sb_exch')
-            config['trading_type']= st.selectbox("Trading Type", ['Intraday', 'Delivery (CNC)'], key='sb_ttype')
-            config['order_type']  = st.selectbox("Order Type", ['Market Order', 'Limit Order'], key='sb_otype')
-
-            config['use_bracket'] = st.checkbox("🎯 Bracket Order (SL+Target)", key='sb_bo')
-            if config['use_bracket']:
-                c1, c2, c3 = st.columns(3)
-                config['broker_sl_points']     = c1.number_input("SL Pts", value=50, key='sb_bo_sl')
-                config['broker_target_points'] = c2.number_input("Tgt Pts", value=100, key='sb_bo_tgt')
-                config['broker_trail_sl']      = c3.number_input("Trail SL", value=0, key='sb_bo_trail')
-
-            config['clear_positions_before_entry'] = st.checkbox("🧹 Clear Positions Before Entry", key='sb_clear')
-
-            # Multi-account
-            st.markdown("**🔀 Multi-Account Trading**")
-            if 'multi_accounts' not in st.session_state:
-                st.session_state['multi_accounts'] = []
-            accts = st.session_state['multi_accounts']
-            if accts:
-                st.write(f"Configured Accounts: {len(accts)}")
-                for i, a in enumerate(accts):
-                    col1, col2 = st.columns([4, 1])
-                    col1.write(f"{i+1}. Client: {str(a['client_id'])[:8]}...")
-                    if col2.button("❌", key=f'del_acc_{i}'):
-                        accts.pop(i)
-                        st.rerun()
-            with st.expander("➕ Add Account"):
-                new_cid = st.text_input("Client ID", key='sb_new_cid')
-                new_tok = st.text_input("Access Token", type='password', key='sb_new_tok')
-                if st.button("Add Account", key='sb_add_acc'):
-                    if new_cid and new_tok:
-                        accts.append({'client_id': new_cid, 'access_token': new_tok})
-                        st.success("Account added!")
-            config['multi_accounts'] = accts
-
-            # Multi-strike
-            if config.get('asset_type') == 'Options':
-                config['use_multi_strike'] = st.checkbox("Enable Multi-Strike Orders", key='sb_ms')
-                if config.get('use_multi_strike'):
-                    config['option_side'] = st.radio("Option Side", ['CE', 'PE'], key='sb_os')
-                    for side in ['CE', 'PE']:
-                        key = f'multi_strikes_{side.lower()}'
-                        if key not in st.session_state:
-                            st.session_state[key] = []
-                        strikes = st.session_state[key]
-                        if strikes:
-                            st.write(f"{side} Strikes: {len(strikes)}")
-                            for i, s in enumerate(strikes):
-                                c1, c2 = st.columns([4, 1])
-                                c1.write(f"{i+1}. {s}")
-                                if c2.button("❌", key=f'del_{side}_{i}'):
-                                    strikes.pop(i)
-                                    st.rerun()
-                        with st.expander(f"➕ Add {side} Strike"):
-                            new_sid = st.text_input(f"{side} Security ID", key=f'new_{side}_sid')
-                            if st.button(f"Add {side}", key=f'add_{side}'):
-                                if new_sid:
-                                    strikes.append(new_sid)
-                                    st.success(f"{side} strike added!")
-                        config[key] = strikes
-
-    return config
-
-
-def _render_custom_strategy_ui(config: dict):
-    """Render dynamic condition builder for Custom Strategy."""
-    if 'custom_indicator_conditions' not in st.session_state:
-        st.session_state['custom_indicator_conditions'] = []
-    conds = st.session_state['custom_indicator_conditions']
-
-    config['custom_logic'] = st.radio("Logic", ['AND', 'OR'], horizontal=True, key='sb_logic')
-
-    col1, col2 = st.columns(2)
-    if col1.button("➕ Add Condition", key='sb_add_cond'):
-        conds.append({
-            'type': 'Indicator Crosses Level',
-            'indicator': 'RSI', 'level': 50, 'cross_dir': 'Above', 'position': 'LONG'
-        })
-        st.rerun()
-    if col2.button("🗑️ Clear All", key='sb_clear_cond'):
-        st.session_state['custom_indicator_conditions'] = []
-        st.rerun()
-
-    for i, cond in enumerate(conds):
-        with st.expander(f"Condition #{i+1} – {cond.get('type', '')}", expanded=True):
-            ctype = st.selectbox("Type", ['Price Crosses Indicator', 'Indicator Crosses Level',
-                                          'Indicator Crossover'],
-                                 key=f'ctype_{i}',
-                                 index=['Price Crosses Indicator', 'Indicator Crosses Level',
-                                        'Indicator Crossover'].index(cond.get('type', 'Indicator Crosses Level')))
-            cond['type'] = ctype
-
-            if ctype == 'Price Crosses Indicator':
-                cond['indicator']  = st.selectbox("Indicator", ['EMA', 'SMA', 'BB Upper', 'BB Lower', 'BB Mid'], key=f'ind_{i}')
-                cond['period']     = st.number_input("Period", value=20, key=f'per_{i}')
-                cond['cross_type'] = st.radio("Cross", ['Above', 'Below'], key=f'ct_{i}')
-
-            elif ctype == 'Indicator Crosses Level':
-                cond['indicator'] = st.selectbox("Indicator",
-                    ['RSI', 'MACD', 'MACD Histogram', 'ADX', 'Volume', 'BB %B', 'ATR', 'Historical Volatility', 'Std Dev'],
-                    key=f'ind_{i}')
-                cond['level']     = st.number_input("Level", value=50.0, step=0.5, key=f'lev_{i}')
-                cond['cross_dir'] = st.radio("Cross Direction", ['Above', 'Below'], key=f'cd_{i}')
-
-            elif ctype == 'Indicator Crossover':
-                cond['cross_kind'] = st.selectbox("Crossover Type",
-                    ['Fast EMA x Slow EMA', 'Fast SMA x Slow SMA', 'Price x EMA', 'RSI Crossover'],
-                    key=f'ck_{i}')
-                cond['direction'] = st.radio("Direction", ['Bullish', 'Bearish'], key=f'dir_{i}')
-
-            cond['position'] = st.radio("Position", ['LONG', 'SHORT'], key=f'pos_{i}')
-
-            if st.button(f"🗑️ Delete #{i+1}", key=f'del_cond_{i}'):
-                conds.pop(i)
-                st.rerun()
-
-    config['custom_conditions'] = conds
-    st.session_state['custom_indicator_conditions'] = conds
-
-# ──────────────────────────────────────────────────────────────────────────────
-# BACKTEST UI TAB
-# ──────────────────────────────────────────────────────────────────────────────
-def render_backtest_ui(config: dict):
-    """Render the Backtest tab."""
-    st.subheader("📈 Backtesting")
-    method_label = "Method 2 – Realistic (Next Open)" if config.get('use_method2') else "Method 1 – Signal Close"
-    st.caption(f"Entry: **{method_label}** | Strategy: **{config.get('strategy')}** | Asset: **{config.get('asset_name')}**")
-
-    if st.button("▶️ Run Backtest", type='primary', use_container_width=True, key='run_bt'):
-        with st.spinner("Fetching data & running backtest..."):
-            df_raw = fetch_data(config['ticker'], config['interval'], config['period'])
-            if df_raw.empty:
-                st.error("❌ No data fetched. Check ticker/interval/period.")
-                return
-
-            df = calculate_all_indicators(df_raw, config)
-            results = run_backtest(df, config)
-
-        st.session_state['backtest_results'] = results
-        st.success(f"✅ Backtest complete! {results['metrics'].get('total_trades', 0)} trades found.")
-
-    if 'backtest_results' not in st.session_state:
-        st.info("👆 Configure your strategy in the sidebar and click **Run Backtest**")
-        return
-
-    results = st.session_state['backtest_results']
-    trades  = results.get('trades', [])
-    metrics = results.get('metrics', {})
-    df      = results.get('df', pd.DataFrame())
-
-    # ── Filter Same-Day Trades ──
-    display_trades = trades
-    if config.get('filter_same_day') and trades:
-        display_trades = [t for t in trades if is_same_day_trade(t.get('entry_time'), t.get('exit_time'))]
-        if display_trades:
-            metrics = _calculate_metrics(display_trades, config)
-        st.info(f"📅 Filtered to {len(display_trades)} same-day trades (from {len(trades)} total)")
-
-    if not display_trades:
-        st.warning("⚠️ No trades found. Try adjusting strategy parameters or period.")
-        _render_debug_info(results.get('debug', {}))
-        return
-
-    # ── Metrics Row 1 ──
-    st.markdown("### 📊 Performance Metrics")
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Total Trades",  metrics.get('total_trades', 0))
-    c2.metric("Win Rate",      f"{metrics.get('win_rate', 0):.1f}%")
-    c3.metric("Total P&L",     f"₹{metrics.get('total_pnl', 0):,.2f}",
-              delta=f"{'▲' if metrics.get('total_pnl', 0) >= 0 else '▼'}")
-    c4.metric("Avg Trade P&L", f"₹{metrics.get('avg_pnl', 0):,.2f}")
-
-    # ── Metrics Row 2 (Brokerage) ──
-    if config.get('include_brokerage'):
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Total Brokerage",  f"₹{metrics.get('total_brokerage', 0):,.2f}")
-        c2.metric("Net P&L",           f"₹{metrics.get('total_net_pnl', 0):,.2f}",
-                  delta=f"{'▲' if metrics.get('total_net_pnl', 0) >= 0 else '▼'}")
-        c3.metric("Avg Net P&L",       f"₹{metrics.get('avg_net_pnl', 0):,.2f}")
-        c4.metric("Profit Factor",     f"{metrics.get('profit_factor', 0):.2f}")
-
-    # ── Metrics Row 3 ──
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Winning Trades",  metrics.get('winning_trades', 0))
-    c2.metric("Losing Trades",   metrics.get('losing_trades', 0))
-    c3.metric("Max Drawdown",    f"₹{metrics.get('max_drawdown', 0):,.2f}")
-    c4.metric("Avg Win",         f"₹{metrics.get('avg_win', 0):,.2f}")
-
-    # ── Charts ──
-    st.markdown("### 📉 Price Chart with Trades")
-    if PLOTLY_AVAILABLE and not df.empty:
-        chart = build_candlestick_chart(df, display_trades, config,
-                                        title=f"Backtest: {config.get('asset_name')} | {config.get('interval_name')}")
-        if chart:
-            st.plotly_chart(chart, use_container_width=True)
-
-        pnl_chart = build_pnl_chart(display_trades, config)
-        if pnl_chart:
-            st.plotly_chart(pnl_chart, use_container_width=True)
-
-    # ── Trade Table ──
-    st.markdown("### 📋 Trade Records")
-    use_net = config.get('include_brokerage', False)
-    trade_rows = []
-    for t in display_trades:
-        et = t.get('entry_time')
-        xt = t.get('exit_time')
-        row = {
-            'Entry Time':    str(et)[:19] if et else '',
-            'Exit Time':     str(xt)[:19] if xt else '',
-            'Type':          t.get('type', ''),
-            'Duration (min)':t.get('duration_min', 0),
-            'Entry ₹':       f"{t.get('entry_price', 0):.2f}",
-            'Exit ₹':        f"{t.get('exit_price', 0):.2f}",
-            'High ₹':        f"{t.get('highest_price', 0):.2f}",
-            'Low ₹':         f"{t.get('lowest_price', 0):.2f}",
-            'SL ₹':          f"{t.get('sl_price', 0):.2f}" if t.get('sl_price') else 'Signal',
-            'Target ₹':      f"{t.get('target_price', 0):.2f}" if t.get('target_price') else 'Signal',
-            'P&L ₹':         f"{t.get('pnl', 0):.2f}",
-            'Reason':        t.get('exit_reason', ''),
-        }
-        if use_net:
-            row['Brokerage ₹'] = f"{t.get('brokerage', 0):.2f}"
-            row['Net P&L ₹']   = f"{t.get('net_pnl', 0):.2f}"
-        trade_rows.append(row)
-
-    if trade_rows:
-        tdf = pd.DataFrame(trade_rows)
-        # Color positive/negative P&L
-        def color_pnl(val):
-            try:
-                v = float(str(val).replace(',', ''))
-                return 'color: #26a69a' if v > 0 else ('color: #ef5350' if v < 0 else '')
-            except:
-                return ''
-        pnl_col = 'Net P&L ₹' if use_net else 'P&L ₹'
-        styled = tdf.style.applymap(color_pnl, subset=[pnl_col])
-        st.dataframe(styled, use_container_width=True, height=400)
-
-        # Download
-        csv = tdf.to_csv(index=False)
-        st.download_button("⬇️ Download CSV", csv, "backtest_trades.csv", "text/csv")
-
-    # ── Skipped Trades ──
-    skipped = results.get('skipped_trades', [])
-    if skipped:
-        with st.expander(f"⚠️ Skipped/Overlapping Trades ({len(skipped)}) – Not in P&L"):
-            sk_rows = []
-            for s in skipped:
-                sk_rows.append({
-                    'Type':    s.get('type', ''),
-                    'Entry ₹': f"{s.get('entry_price', 0):.2f}",
-                    'Exit ₹':  f"{s.get('exit_price', 0):.2f}",
-                    'P&L ₹':   f"{s.get('pnl', 0):.2f}",
-                    'Reason':  s.get('exit_reason', ''),
-                    'Note':    s.get('note', ''),
-                })
-            st.dataframe(pd.DataFrame(sk_rows), use_container_width=True)
-            skip_win = sum(1 for s in skipped if s.get('pnl', 0) > 0)
-            total_skip_pnl = sum(s.get('pnl', 0) for s in skipped)
-            c1, c2, c3 = st.columns(3)
-            c1.metric("Skipped Winning",  skip_win)
-            c2.metric("Skipped Losing",   len(skipped) - skip_win)
-            c3.metric("Total Skipped P&L", f"₹{total_skip_pnl:.2f}")
-
-    # ── Debug Info ──
-    _render_debug_info(results.get('debug', {}))
-
-
-def _render_debug_info(debug: dict):
-    """Render debug information expander."""
-    if not debug:
-        return
-    with st.expander("🔍 Debug Information"):
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Candles Analyzed",      debug.get('candles_analyzed', 0))
-        c2.metric("Total Signals",         debug.get('total_signals', 0))
-        c3.metric("Signals Skipped",       debug.get('signals_skipped', 0))
-        c4.metric("Overlapping Tracked",   debug.get('overlapping_trades_tracked', 0))
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# LIVE TRADING UI TAB
-# ──────────────────────────────────────────────────────────────────────────────
-def render_live_trading_ui(config: dict):
-    """Render the Live Trading tab."""
-    st.subheader("🔴 Live Trading")
-    st.caption(f"Strategy: **{config.get('strategy')}** | Asset: **{config.get('asset_name')}** | Interval: **{config.get('interval_name')}**")
-
-    is_trading = st.session_state.get('trading_active', False)
-
-    # ── Control Buttons ──
-    c1, c2, c3, c4 = st.columns(4)
-
-    if not is_trading:
-        if c1.button("▶️ Start Trading", type='primary', use_container_width=True, key='btn_start'):
-            # Init broker
-            if config.get('enable_broker') and config.get('dhan_client_id'):
-                broker = DhanBrokerIntegration(config['dhan_client_id'], config['dhan_access_token'])
-                st.session_state['dhan_broker'] = broker
-                add_log(f"{'✅ Broker connected' if broker.connected else '⚠️ Broker not connected (simulation mode)'}")
-            else:
-                st.session_state['dhan_broker'] = None
-
-            # Reset session
-            st.session_state['trading_active'] = True
-            st.session_state['position']       = None
-            st.session_state['broker_position'] = None
-            st.session_state['live_logs']      = []
-            st.session_state['trade_history']  = []
-            st.session_state['current_data']   = None
-            st.session_state['config']         = config
-            add_log(f"🚀 Live trading started | {config.get('strategy')} | {config.get('asset_name')}")
-            st.rerun()
-    else:
-        if c1.button("⏹️ Stop Trading", use_container_width=True, key='btn_stop'):
-            st.session_state['trading_active'] = False
-            add_log("⏹️ Trading stopped by user")
+        st.divider()
+        st.subheader("💼 Paper Trading")
+        capital = st.number_input("Capital", 1_000, 10_000_000, 100_000, 1_000)
+        qty     = st.number_input("Qty / Lot", 1, 10_000, 1, 1)
+        st.metric("Balance", f"{st.session_state.paper_balance:,.0f}")
+        if st.session_state.paper_position:
+            p = st.session_state.paper_position
+            st.success(f"Open {p['side']} @ {p['entry']:.5f}")
+        if st.button("♻️ Reset Account"):
+            st.session_state.paper_balance = capital
+            st.session_state.paper_position = None
+            st.session_state.trade_history  = []
             st.rerun()
 
-    position = st.session_state.get('position')
-    if c2.button("🔄 Close Position", use_container_width=True,
-                 disabled=(not is_trading or position is None), key='btn_close'):
-        if position:
-            df_live = st.session_state.get('current_data')
-            if df_live is not None and not df_live.empty:
-                manual_price = df_live.iloc[-1]['Close']
-                broker = st.session_state.get('dhan_broker')
-                _live_exit(position, manual_price, 'Manual Close', broker, config, df_live, len(df_live) - 1)
-            st.rerun()
-
-    if c3.button("🔍 Price Check", use_container_width=True, key='btn_price'):
-        df_chk = fetch_data(config['ticker'], config['interval'], '1d')
-        if not df_chk.empty:
-            p = df_chk.iloc[-1]['Close']
-            add_log(f"💲 Current price: ₹{p:.2f}")
-        st.rerun()
-
-    if c4.button("🔄 Refresh", use_container_width=True, key='btn_refresh'):
-        st.rerun()
-
-    # ── Position Display ──
-    if position is not None:
-        pos_type = position['type']
-        ep       = position['entry_price']
-        sl       = position.get('sl_price')
-        tp       = position.get('target_price')
-        et       = position.get('entry_time')
-        df_live  = st.session_state.get('current_data')
-        curr_p   = df_live.iloc[-1]['Close'] if df_live is not None and not df_live.empty else ep
-        pnl_live = (curr_p - ep) * (1 if pos_type == 'LONG' else -1) * config.get('quantity', 1)
-
-        color = "🟢" if pos_type == 'LONG' else "🔴"
-        bg    = "#1a3a1a" if pos_type == 'LONG' else "#3a1a1a"
-
-        st.markdown(f"""
-        <div style="background:{bg}; padding:16px; border-radius:12px; border-left:4px solid {'#26a69a' if pos_type == 'LONG' else '#ef5350'}; margin:10px 0">
-            <h4>{color} {pos_type} Position Active</h4>
-            <div style="display:grid; grid-template-columns: repeat(4,1fr); gap:10px; margin-top:8px">
-                <div><b>Entry</b><br>₹{ep:,.2f}</div>
-                <div><b>Current</b><br>₹{curr_p:,.2f} (<span style="color:{'#26a69a' if pnl_live >= 0 else '#ef5350'}">₹{pnl_live:+.2f}</span>)</div>
-                <div><b>SL</b><br>₹{sl:,.2f if sl else 'Signal'}</div>
-                <div><b>Target</b><br>{'₹' + f'{tp:,.2f}' if tp else 'Signal'}</div>
-            </div>
-        </div>
-        """, unsafe_allow_html=True)
-    else:
-        st.info("💤 No active position" if is_trading else "⏸️ Trading not started")
-
-    # ── Live Chart ──
-    if is_trading:
-        df_live = st.session_state.get('current_data')
-        if df_live is None or df_live.empty:
-            # Fetch data now for chart
-            df_live_raw = fetch_data(config['ticker'], config['interval'], '1d')
-            if not df_live_raw.empty:
-                df_live = calculate_all_indicators(df_live_raw, config)
-                st.session_state['current_data'] = df_live
-
-        if df_live is not None and not df_live.empty:
-            chart = build_candlestick_chart(
-                df_live, [], config,
-                title=f"Live: {config.get('asset_name')} | {config.get('interval_name')}",
-                max_candles=150,
-                position=position,
-            )
-            if chart:
-                st.plotly_chart(chart, use_container_width=True)
-
-    # ── Auto-Refresh & Iteration ──
-    if is_trading:
-        live_config = st.session_state.get('config', config)
-        with st.spinner("🔄 Running iteration..."):
-            live_trading_iteration(live_config)
-
-        # Auto-refresh using st.rerun after delay
-        time.sleep(1.5)
-        st.rerun()
-
-    # ── Logs ──
-    logs = st.session_state.get('live_logs', [])
-    st.markdown("### 📝 Trading Logs")
-    log_text = "\n".join(logs[:50]) if logs else "No logs yet..."
-    st.text_area("", value=log_text, height=200, key='log_display', disabled=True)
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# TRADE HISTORY UI TAB
-# ──────────────────────────────────────────────────────────────────────────────
-def render_trade_history_ui(config: dict):
-    """Render the Trade History tab."""
-    st.subheader("📊 Trade History (Live Session)")
-
-    history = st.session_state.get('trade_history', [])
-    if not history:
-        st.info("No completed trades in this session yet. Start live trading to see trade history.")
-        return
-
-    # Metrics
-    use_net = config.get('include_brokerage', False)
-    pnl_key = 'net_pnl' if use_net else 'pnl'
-
-    total_trades = len(history)
-    total_pnl    = sum(t.get(pnl_key, 0) for t in history)
-    winners      = [t for t in history if t.get(pnl_key, 0) > 0]
-    win_rate     = len(winners) / total_trades * 100 if total_trades > 0 else 0
-
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Total Trades",  total_trades)
-    c2.metric("Win Rate",      f"{win_rate:.1f}%")
-    c3.metric("Total P&L",     f"₹{total_pnl:,.2f}",
-              delta=f"{'▲' if total_pnl >= 0 else '▼'}")
-
-    # Table
-    rows = []
-    for t in history:
-        rows.append({
-            'Entry Time':   str(t.get('entry_time', ''))[:19],
-            'Exit Time':    str(t.get('exit_time', ''))[:19],
-            'Type':         t.get('type', ''),
-            'Entry ₹':      f"{t.get('entry_price', 0):.2f}",
-            'Exit ₹':       f"{t.get('exit_price', 0):.2f}",
-            'P&L ₹':        f"{t.get('pnl', 0):.2f}",
-            'Net P&L ₹':    f"{t.get('net_pnl', 0):.2f}",
-            'Reason':       t.get('exit_reason', ''),
-        })
-    hdf = pd.DataFrame(rows)
-    st.dataframe(hdf, use_container_width=True, height=400)
-
-    csv = hdf.to_csv(index=False)
-    st.download_button("⬇️ Download Trade History CSV", csv, "live_trade_history.csv", "text/csv")
-
-    # P&L chart
-    if PLOTLY_AVAILABLE and history:
-        pnl_chart = build_pnl_chart(history, config)
-        if pnl_chart:
-            st.plotly_chart(pnl_chart, use_container_width=True)
-
-# ──────────────────────────────────────────────────────────────────────────────
-# MAIN APPLICATION
-# ──────────────────────────────────────────────────────────────────────────────
-def main():
-    """Main Streamlit application entry point."""
-    st.set_page_config(
-        page_title="AlgoTrader Pro v2",
-        page_icon="📈",
-        layout="wide",
-        initial_sidebar_state="expanded",
+    return dict(
+        ticker=ticker, tk_name=tk_name, strategy=strategy,
+        tf=tf, tf_label=tf_label, prd=prd, prd_label=prd_label,
+        sl_type=SL_TYPES[sl_type], tgt_type=TARGET_TYPES[tgt_type],
+        sl_mult=sl_mult, t_mult=t_mult,
+        use_win=use_win, win_s=win_s, win_e=win_e,
+        capital=capital, qty=qty,
     )
 
-    # Custom CSS
-    st.markdown("""
-    <style>
-    /* Dark theme enhancements */
-    .stMetric { background: #1e1e2e; padding: 12px; border-radius: 8px; border-left: 3px solid #2196F3; }
-    .stButton > button { border-radius: 8px; }
-    .block-container { padding-top: 1rem; }
-    div[data-testid="stExpander"] { border-radius: 8px; }
-    .stTabs [data-baseweb="tab-list"] { gap: 8px; }
-    .stTabs [data-baseweb="tab"] { border-radius: 6px 6px 0 0; }
-    /* Metric colors */
-    [data-testid="metric-container"] { background: #0e1117; border-radius: 10px; padding: 12px; }
-    </style>
-    """, unsafe_allow_html=True)
 
-    # Header
-    st.markdown("""
-    <div style="background: linear-gradient(135deg, #1a1a2e, #16213e, #0f3460);
-                padding: 20px 30px; border-radius: 12px; margin-bottom: 20px;
-                border: 1px solid #2196F3;">
-        <h1 style="margin:0; color:#fff">📈 AlgoTrader Pro v2.0</h1>
-        <p style="margin:4px 0 0 0; color:#90caf9">
-            17 Strategies | 18 SL Types | 13 Target Types | Dhan Integration | Backtest ↔ Live Consistency
-        </p>
+# ══════════════════════════════════════════════════════════════
+# MAIN
+# ══════════════════════════════════════════════════════════════
+def main():
+    _init()
+    cfg = sidebar()
+    apply_theme(st.session_state.dark_mode)
+
+    # ── Header ──────────────────────────────────────────────
+    st.markdown(f"""
+    <div style="display:flex;align-items:center;justify-content:space-between;padding:8px 0 4px 0;">
+      <div>
+        <div class="pt-logo" style="font-size:1.5rem;">⚡ ProTrader AI</div>
+        <small style="opacity:.6;">{cfg['tk_name']} &nbsp;·&nbsp; {cfg['strategy']} &nbsp;·&nbsp; {cfg['tf_label']} &nbsp;·&nbsp; {cfg['prd_label']}</small>
+      </div>
+      <div>
+        <span class="badge badge-{'up' if cfg['strategy'] in ('Swing','Positional') else 'nt'}">{cfg['strategy'].upper()}</span>
+        &nbsp;<span class="badge badge-nt">{cfg['tf_label']}</span>
+      </div>
     </div>
     """, unsafe_allow_html=True)
 
-    # Check dependencies
-    if not YFINANCE_AVAILABLE:
-        st.error("❌ yfinance not installed. Run: `pip install yfinance`")
-    if not PLOTLY_AVAILABLE:
-        st.warning("⚠️ plotly not installed. Charts disabled. Run: `pip install plotly`")
-    if not DHAN_AVAILABLE:
-        st.info("ℹ️ dhanhq not installed. Broker features disabled. Run: `pip install dhanhq`")
+    tab_live, tab_bt, tab_hist, tab_an = st.tabs(
+        ["📡 Live Trading", "🔬 Backtesting", "📋 Trade History", "📊 Analysis"])
 
-    # Render sidebar config
-    config = render_config_ui()
+    # ══════════════════════════════════════════════════════
+    # TAB 1 — LIVE TRADING
+    # ══════════════════════════════════════════════════════
+    with tab_live:
+        col_r, col_a, col_info = st.columns([1, 1, 4])
+        with col_r:
+            if st.button("🔄 Refresh", use_container_width=True):
+                st.cache_data.clear(); st.rerun()
+        with col_a:
+            auto = st.checkbox("⚡ Auto (30s)", value=st.session_state.auto_refresh)
+            st.session_state.auto_refresh = auto
+        with col_info:
+            st.caption(f"Last scan: {datetime.now().strftime('%H:%M:%S')} | {cfg['ticker']} | "
+                       f"TF:{cfg['tf_label']} | Period:{cfg['prd_label']} | "
+                       f"SL:{list(SL_TYPES.keys())[list(SL_TYPES.values()).index(cfg['sl_type'])]} | "
+                       f"Target:{list(TARGET_TYPES.keys())[list(TARGET_TYPES.values()).index(cfg['tgt_type'])]}")
 
-    # Store config in session
-    if not st.session_state.get('trading_active', False):
-        st.session_state['config'] = config
+        df = fetch_live(cfg["ticker"], cfg["prd"], cfg["tf"])
 
-    # Main tabs
-    tab1, tab2, tab3 = st.tabs(["📈 Backtest", "🔴 Live Trading", "📊 Trade History"])
+        if df is None or len(df) < 30:
+            st.error("⚠️ Data unavailable. Check ticker or network. Try a different period/timeframe.")
+            st.stop()
 
-    with tab1:
-        render_backtest_ui(config)
+        I   = compute_indicators(df)
+        sig = get_signal(df, cfg["strategy"], cfg["sl_type"], cfg["tgt_type"], cfg["sl_mult"], cfg["t_mult"])
 
-    with tab2:
-        render_live_trading_ui(config)
+        if sig is None:
+            st.warning("Computing indicators… not enough history yet."); st.stop()
 
-    with tab3:
-        render_trade_history_ui(config)
+        # ── Signal Banner ────────────────────────────────
+        s_val = sig["signal"]; conf = sig["confidence"]; px = sig["entry"]
+        if s_val == "LONG":
+            css, icon = "pt-signal-long",  "🟢 LONG"
+        elif s_val == "SHORT":
+            css, icon = "pt-signal-short", "🔴 SHORT"
+        else:
+            css, icon = "pt-signal-hold",  "⏸️ HOLD"
 
-    # Footer
-    st.markdown("---")
-    st.markdown(
-        "<center><small>AlgoTrader Pro v2.0 | 17 Strategies | Backtesting Method 1 & 2 | "
-        "Dhan Broker Integration | Built with Streamlit</small></center>",
-        unsafe_allow_html=True
-    )
+        rr_str = f"1:{sig['rr']:.2f}" if s_val != "HOLD" else "—"
+        sl_str = f"{sig['sl']:.5f}" if s_val != "HOLD" else "—"
+        t1_str = f"{sig['t1']:.5f}" if s_val != "HOLD" else "—"
+        t3_str = f"{sig['t3']:.5f}" if s_val != "HOLD" else "—"
+
+        st.markdown(f"""
+        <div class="{css}">
+          <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px;">
+            <div><span style="font-size:1.6rem;font-weight:800;font-family:Syne,sans-serif;">{icon}</span>
+                 &nbsp;<span style="font-size:1.1rem;">Confidence: <b>{conf:.0f}%</b></span>
+                 &nbsp;<span style="opacity:.75;font-size:.95rem;">R:R {rr_str}</span></div>
+            <div style="font-family:JetBrains Mono,monospace;font-size:.9rem;line-height:2;">
+              Entry: <b>{px:.5f}</b> &nbsp;|&nbsp; SL: <b>{sl_str}</b> &nbsp;|&nbsp;
+              T1: <b>{t1_str}</b> &nbsp;|&nbsp; T2: <b>{sig.get("t2","—") if s_val!="HOLD" else "—"}</b> &nbsp;|&nbsp;
+              T3: <b>{t3_str}</b>
+            </div>
+          </div>
+        </div>
+        """, unsafe_allow_html=True)
+
+        st.markdown("")
+
+        # ── Metrics Row ──────────────────────────────────
+        chg = (df["Close"].iloc[-1] - df["Close"].iloc[-2]) / df["Close"].iloc[-2] * 100
+        m1, m2, m3, m4, m5, m6, m7 = st.columns(7)
+        m1.metric("Price",      f"{px:.4f}",         f"{chg:+.2f}%")
+        m2.metric("RSI",        f"{sig['rsi']:.1f}",  "OS" if sig["rsi"]<30 else "OB" if sig["rsi"]>70 else "Neutral")
+        m3.metric("ADX",        f"{sig['adx_v']:.1f}", "Strong" if sig["adx_v"]>25 else "Weak")
+        m4.metric("MACD",       f"{sig['macd_v']:.4f}", "Bull" if sig["macd_v"]>0 else "Bear")
+        m5.metric("Supertrend", "🟢 Bull" if sig["st_dir"]==1 else "🔴 Bear")
+        m6.metric("VWAP",       f"{sig['vwap_v']:.4f}", "Above" if px > sig["vwap_v"] else "Below")
+        m7.metric("ATR",        f"{sig['atr']:.4f}")
+
+        # ── Chart ────────────────────────────────────────
+        st.plotly_chart(build_chart(df, I, sig, st.session_state.dark_mode), use_container_width=True)
+
+        # ── Commentary ───────────────────────────────────
+        st.subheader("📡 Live Commentary")
+        lines = generate_commentary(sig, cfg["strategy"], cfg["tk_name"])
+        # Keep last 60 lines in log
+        st.session_state.commentary_log = (st.session_state.commentary_log + lines)[-120:]
+        block = "\n".join(st.session_state.commentary_log[-50:])
+        st.markdown(f'<div class="pt-commentary">{block}</div>', unsafe_allow_html=True)
+
+        # ── Paper Trade Controls ─────────────────────────
+        st.divider()
+        st.subheader("💼 Paper Trade Desk")
+
+        def _enter(side):
+            if st.session_state.paper_position is not None:
+                st.warning("Close current position first."); return
+            sl_p  = sig["sl"]; t3_p = sig["t3"]; tsl_p = sig["tsl_offset"]
+            cost  = px * cfg["qty"]
+            if cost > st.session_state.paper_balance:
+                st.error("Insufficient balance."); return
+            st.session_state.paper_position = {
+                "side":       side, "entry": px, "qty": cfg["qty"],
+                "sl":         sl_p, "target": t3_p, "tsl_offset": tsl_p,
+                "best_price": px, "entry_time": datetime.now().isoformat(),
+                "ticker":     cfg["ticker"], "strategy": cfg["strategy"],
+            }
+            st.success(f"✅ {side} entered @ {px:.5f} | SL: {sl_p:.5f} | T: {t3_p:.5f}")
+
+        def _close_pos(reason="Manual Close"):
+            pos = st.session_state.paper_position
+            if pos is None: st.info("No open position."); return
+            pnl = (px - pos["entry"]) * pos["qty"] if pos["side"] == "LONG" else (pos["entry"] - px) * pos["qty"]
+            st.session_state.paper_balance += pnl
+            st.session_state.trade_history.append({
+                "entry_time":  pos["entry_time"],
+                "exit_time":   datetime.now().isoformat(),
+                "ticker":      pos.get("ticker", cfg["ticker"]),
+                "strategy":    pos.get("strategy", cfg["strategy"]),
+                "side":        pos["side"], "entry": pos["entry"], "exit": px,
+                "qty":         pos["qty"], "pnl":  pnl, "exit_reason": reason,
+            })
+            st.session_state.paper_position = None
+            (st.success if pnl > 0 else st.error)(f"Closed @ {px:.5f} | P&L: {pnl:+.2f}")
+
+        col_l, col_s, col_c = st.columns(3)
+        with col_l:
+            if st.button("🟢 ENTER LONG",  use_container_width=True): _enter("LONG")
+        with col_s:
+            if st.button("🔴 ENTER SHORT", use_container_width=True): _enter("SHORT")
+        with col_c:
+            if st.button("❌ CLOSE POSITION", use_container_width=True): _close_pos()
+
+        # Live P&L display
+        pos = st.session_state.paper_position
+        if pos:
+            live_pnl = (px - pos["entry"]) * pos["qty"] if pos["side"] == "LONG" else (pos["entry"] - px) * pos["qty"]
+            # Update trailing SL
+            if pos["side"] == "LONG":
+                pos["best_price"] = max(pos["best_price"], px)
+                new_tsl = pos["best_price"] - pos["tsl_offset"]
+                pos["sl"] = max(pos["sl"], new_tsl)
+            else:
+                pos["best_price"] = min(pos["best_price"], px)
+                new_tsl = pos["best_price"] + pos["tsl_offset"]
+                pos["sl"] = min(pos["sl"], new_tsl)
+
+            color = "🟢" if live_pnl >= 0 else "🔴"
+            st.info(f"{color} **{pos['side']}** @ {pos['entry']:.5f} | Current: {px:.5f} | "
+                    f"Live P&L: **{live_pnl:+.2f}** | Trailing SL: {pos['sl']:.5f} | Target: {pos['target']:.5f}")
+            # Auto SL/target check
+            if pos["side"] == "LONG" and px <= pos["sl"]:
+                st.error("⚠️ Trailing SL HIT — closing position"); _close_pos("Trailing SL")
+            elif pos["side"] == "SHORT" and px >= pos["sl"]:
+                st.error("⚠️ Trailing SL HIT — closing position"); _close_pos("Trailing SL")
+            elif pos["side"] == "LONG" and px >= pos["target"]:
+                st.success("🎯 Target HIT — closing position"); _close_pos("Target Hit")
+            elif pos["side"] == "SHORT" and px <= pos["target"]:
+                st.success("🎯 Target HIT — closing position"); _close_pos("Target Hit")
+
+        if st.session_state.auto_refresh:
+            time_module.sleep(30)
+            st.cache_data.clear(); st.rerun()
+
+    # ══════════════════════════════════════════════════════
+    # TAB 2 — BACKTESTING
+    # ══════════════════════════════════════════════════════
+    with tab_bt:
+        st.subheader("🔬 Strategy Backtesting")
+        st.caption("⚡ Uses identical signal logic as Live Trading for consistency")
+
+        bc1, bc2, bc3 = st.columns(3)
+        with bc1:
+            bt_prd_label = st.selectbox("Backtest Period", list(PERIODS.keys()), index=4, key="bt_prd")
+            bt_prd       = PERIODS[bt_prd_label]
+        with bc2:
+            bt_tf_label  = st.selectbox("Backtest Timeframe", list(TIMEFRAMES.keys()), key="bt_tf",
+                                         index=list(TIMEFRAMES.keys()).index(cfg["tf_label"]))
+            bt_tf        = TIMEFRAMES[bt_tf_label]
+        with bc3:
+            bt_cap = st.number_input("Starting Capital", 1_000, 10_000_000, cfg["capital"], 1_000, key="bt_cap")
+            bt_qty = st.number_input("Qty per Trade", 1, 10_000, cfg["qty"], 1, key="bt_qty")
+
+        use_win_bt = st.checkbox("Use Trading Window Filter",
+                                  value=cfg["use_win"], key="bt_win",
+                                  help=f"Restrict to {cfg['win_s']} – {cfg['win_e']}")
+
+        run_col, _ = st.columns([2, 5])
+        with run_col:
+            run_bt = st.button("🚀 Run Backtest", use_container_width=True, type="primary")
+
+        if run_bt:
+            with st.spinner("Fetching data & running backtest…"):
+                df_bt = fetch(cfg["ticker"], bt_prd, bt_tf)
+
+            if df_bt is None or len(df_bt) < 60:
+                st.error("Not enough data. Try a longer period or different timeframe.")
+            else:
+                with st.spinner("Simulating trades…"):
+                    stats, t_df, equity = run_backtest(
+                        df_bt, cfg["strategy"],
+                        cfg["sl_mult"], cfg["t_mult"],
+                        cfg["sl_type"], cfg["tgt_type"],
+                        use_win_bt,
+                        cfg["win_s"] if use_win_bt else None,
+                        cfg["win_e"] if use_win_bt else None,
+                        bt_cap, bt_qty,
+                    )
+
+                if stats is None:
+                    st.warning("No trades generated. Try relaxing signal thresholds or a different period.")
+                else:
+                    # ── Performance Cards ────────────────────────
+                    st.subheader("📈 Performance Summary")
+                    p1,p2,p3,p4,p5,p6 = st.columns(6)
+                    p1.metric("Trades",        stats["trades"])
+                    p2.metric("Win Rate",       f"{stats['win_rate']:.1f}%",
+                               "✅ Good" if stats["win_rate"]>=50 else "❌ Poor")
+                    p3.metric("Total P&L",      f"{stats['total_pnl']:+,.2f}",
+                               f"{stats['return_pct']:+.1f}%")
+                    p4.metric("Profit Factor",  f"{min(stats['pf'],99):.2f}",
+                               "✅" if stats["pf"]>=1.5 else "⚠️")
+                    p5.metric("Max Drawdown",   f"{stats['max_dd']:.1f}%")
+                    p6.metric("Sharpe Ratio",   f"{stats['sharpe']:.2f}")
+
+                    p7,p8,p9,p10 = st.columns(4)
+                    p7.metric("Avg Win",        f"{stats['avg_win']:+.2f}")
+                    p8.metric("Avg Loss",       f"{stats['avg_loss']:+.2f}")
+                    p9.metric("Expectancy",     f"{stats['expectancy']:+.2f}")
+                    p10.metric("Final Capital", f"{stats['final']:,.0f}")
+
+                    # ── Equity Curve ────────────────────────────
+                    BG2 = "#0d1117" if st.session_state.dark_mode else "#f8fafc"
+                    TC  = "#e6edf3" if st.session_state.dark_mode else "#1a1a2e"
+                    eq_fig = go.Figure()
+                    eq_fig.add_trace(go.Scatter(
+                        x=list(range(len(equity))), y=equity,
+                        mode="lines", name="Equity",
+                        line=dict(color="#00d4aa", width=2.5),
+                        fill="tozeroy", fillcolor="rgba(0,212,170,0.08)"
+                    ))
+                    eq_fig.add_hline(y=bt_cap, line_dash="dash", line_color="#94a3b8",
+                                      annotation_text=" Initial Capital")
+                    eq_fig.update_layout(paper_bgcolor=BG2, plot_bgcolor=BG2,
+                                         font=dict(color=TC), height=280,
+                                         margin=dict(l=50,r=20,t=30,b=20),
+                                         title=dict(text="Equity Curve", font=dict(color=TC)))
+                    st.plotly_chart(eq_fig, use_container_width=True)
+
+                    # ── Per-trade P&L bars ──────────────────────
+                    pnl_colors = ["#00d4aa" if p>0 else "#ff4d6d" for p in t_df["pnl"]]
+                    bar_fig = go.Figure(go.Bar(x=list(range(len(t_df))), y=t_df["pnl"],
+                                               marker_color=pnl_colors, opacity=0.8, name="P&L"))
+                    bar_fig.update_layout(paper_bgcolor=BG2, plot_bgcolor=BG2,
+                                          font=dict(color=TC), height=220,
+                                          margin=dict(l=50,r=20,t=30,b=20),
+                                          title=dict(text="Trade-by-Trade P&L", font=dict(color=TC)))
+                    st.plotly_chart(bar_fig, use_container_width=True)
+
+                    # ── Exit Reason Pie ─────────────────────────
+                    er = t_df["exit_reason"].value_counts()
+                    pie_fig = go.Figure(go.Pie(labels=er.index, values=er.values, hole=0.4,
+                                               marker=dict(colors=["#00d4aa","#ff4d6d","#FFD700","#A78BFA","#94a3b8"])))
+                    pie_fig.update_layout(paper_bgcolor=BG2, font=dict(color=TC), height=250,
+                                          margin=dict(l=20,r=20,t=30,b=20),
+                                          title=dict(text="Exit Reasons", font=dict(color=TC)))
+                    st.plotly_chart(pie_fig, use_container_width=True)
+
+                    # ── Drawdown Curve ──────────────────────────
+                    eq_s   = pd.Series(equity)
+                    peak_s = eq_s.cummax()
+                    dd_s   = (peak_s - eq_s) / peak_s * 100
+                    dd_fig = go.Figure(go.Scatter(x=list(range(len(dd_s))), y=-dd_s,
+                                                   mode="lines", fill="tozeroy",
+                                                   fillcolor="rgba(255,77,109,0.12)",
+                                                   line=dict(color="#ff4d6d", width=1.5), name="Drawdown %"))
+                    dd_fig.update_layout(paper_bgcolor=BG2, plot_bgcolor=BG2, font=dict(color=TC),
+                                         height=200, margin=dict(l=50,r=20,t=30,b=20),
+                                         title=dict(text="Drawdown (%)", font=dict(color=TC)))
+                    st.plotly_chart(dd_fig, use_container_width=True)
+
+                    # ── Trade Log ───────────────────────────────
+                    st.subheader("📋 Detailed Trade Log")
+                    show_cols = ["entry_time","exit_time","side","entry","exit","pnl","exit_reason"]
+                    st.dataframe(
+                        t_df[show_cols].style
+                          .format({"entry": "{:.5f}", "exit": "{:.5f}", "pnl": "{:+.2f}"})
+                          .applymap(lambda v: "color:#00d4aa" if isinstance(v,(int,float)) and v>0
+                                    else "color:#ff4d6d" if isinstance(v,(int,float)) and v<0 else "",
+                                    subset=["pnl"]),
+                        use_container_width=True, height=320
+                    )
+
+                    # ── Text Summary ─────────────────────────────
+                    st.subheader("📝 Backtest Narrative")
+                    verdict = "PROFITABLE ✅" if stats["total_pnl"] > 0 else "NOT PROFITABLE ❌"
+                    er_dict = t_df["exit_reason"].value_counts().to_dict()
+                    st.markdown(f"""
+**Strategy:** {cfg["strategy"]} on **{cfg["tk_name"]}** ({bt_tf_label} | {bt_prd_label})  
+Window filter: {"ON (" + str(cfg["win_s"]) + " – " + str(cfg["win_e"]) + ")" if use_win_bt else "OFF"}
+
+The backtest simulated **{stats["trades"]} trades** achieving a win rate of **{stats["win_rate"]:.1f}%** with
+a profit factor of **{min(stats["pf"],99):.2f}**. The strategy is **{verdict}** on this data,
+returning **{stats["return_pct"]:.1f}%** ({stats["total_pnl"]:+,.2f}) from {bt_cap:,} capital.
+
+Max drawdown was **{stats["max_dd"]:.1f}%** — {"acceptable" if stats["max_dd"]<20 else "consider tighter SLs"}.  
+Sharpe ratio: **{stats["sharpe"]:.2f}** {"(excellent)" if stats["sharpe"]>2 else "(good)" if stats["sharpe"]>1 else "(needs improvement)"}.  
+Expectancy per trade: **{stats["expectancy"]:+.2f}**.  
+Exit breakdown: {er_dict}
+                    """)
+
+    # ══════════════════════════════════════════════════════
+    # TAB 3 — TRADE HISTORY
+    # ══════════════════════════════════════════════════════
+    with tab_hist:
+        st.subheader("📋 Paper Trade History")
+
+        if not st.session_state.trade_history:
+            st.info("No paper trades yet. Use the Live Trading tab to execute trades.")
+        else:
+            th = pd.DataFrame(st.session_state.trade_history)
+            total = th["pnl"].sum(); wr = len(th[th["pnl"]>0])/len(th)*100
+
+            hm1,hm2,hm3,hm4,hm5 = st.columns(5)
+            hm1.metric("Total Trades",  len(th))
+            hm2.metric("Total P&L",     f"{total:+,.2f}", "Profit" if total>0 else "Loss")
+            hm3.metric("Win Rate",       f"{wr:.1f}%")
+            hm4.metric("Balance",        f"{st.session_state.paper_balance:,.0f}")
+            hm5.metric("Best Trade",     f"{th['pnl'].max():+.2f}")
+
+            BG2 = "#0d1117" if st.session_state.dark_mode else "#f8fafc"
+            TC  = "#e6edf3" if st.session_state.dark_mode else "#1a1a2e"
+
+            # Cumulative P&L
+            cum_fig = go.Figure(go.Scatter(y=th["pnl"].cumsum(), mode="lines+markers",
+                                            line=dict(color="#00d4aa",width=2),
+                                            marker=dict(size=5)))
+            cum_fig.update_layout(paper_bgcolor=BG2, plot_bgcolor=BG2, font=dict(color=TC),
+                                   height=220, margin=dict(l=50,r=20,t=30,b=20),
+                                   title=dict(text="Cumulative P&L", font=dict(color=TC)))
+            st.plotly_chart(cum_fig, use_container_width=True)
+
+            # Table
+            st.dataframe(
+                th.style.format({"entry": "{:.5f}", "exit": "{:.5f}", "pnl": "{:+.2f}"})
+                  .applymap(lambda v: "color:#00d4aa" if isinstance(v,(int,float)) and v>0
+                            else "color:#ff4d6d" if isinstance(v,(int,float)) and v<0 else "",
+                            subset=["pnl"]),
+                use_container_width=True, height=380
+            )
+
+            cl1, cl2 = st.columns([1,5])
+            with cl1:
+                if st.button("🗑️ Clear History"):
+                    st.session_state.trade_history = []; st.rerun()
+            with cl2:
+                csv = th.to_csv(index=False).encode("utf-8")
+                st.download_button("📥 Export CSV", csv, "trade_history.csv", "text/csv")
+
+    # ══════════════════════════════════════════════════════
+    # TAB 4 — ANALYSIS
+    # ══════════════════════════════════════════════════════
+    with tab_an:
+        st.subheader("📊 Deep Market Analysis")
+
+        if st.button("🔄 Refresh Analysis", key="an_refresh"):
+            st.cache_data.clear(); st.rerun()
+
+        df_an = fetch(cfg["ticker"], cfg["prd"], cfg["tf"])
+        if df_an is None or len(df_an) < 30:
+            st.error("Not enough data for analysis."); st.stop()
+
+        I_an  = compute_indicators(df_an)
+        sig_an = get_signal(df_an, cfg["strategy"], cfg["sl_type"], cfg["tgt_type"],
+                             cfg["sl_mult"], cfg["t_mult"])
+
+        # ── Multi-strategy consensus ─────────────────────
+        st.subheader("🎯 Multi-Strategy Consensus")
+        consensus = {}
+        for strat in ["Scalping","Intraday","Swing","Positional"]:
+            s = get_signal(df_an, strat, cfg["sl_type"], cfg["tgt_type"], cfg["sl_mult"], cfg["t_mult"])
+            if s: consensus[strat] = s
+
+        cv = {"LONG":0,"SHORT":0,"HOLD":0}
+        cols_c = st.columns(4)
+        for idx, (strat_n, s) in enumerate(consensus.items()):
+            cv[s["signal"]] += 1
+            col_c = "#00d4aa" if s["signal"]=="LONG" else "#ff4d6d" if s["signal"]=="SHORT" else "#f59e0b"
+            with cols_c[idx]:
+                st.markdown(f"""
+                <div style="background:{col_c}1a;border:1.5px solid {col_c};border-radius:12px;
+                             padding:14px;text-align:center;">
+                  <div style="font-weight:700;font-size:.9rem;opacity:.75;">{strat_n}</div>
+                  <div style="font-size:1.3rem;font-weight:800;color:{col_c};">{s["signal"]}</div>
+                  <div style="font-size:.8rem;font-family:JetBrains Mono,monospace;">{s["confidence"]:.0f}%</div>
+                </div>""", unsafe_allow_html=True)
+
+        overall = max(cv, key=cv.get)
+        badge   = "badge-up" if overall=="LONG" else "badge-dn" if overall=="SHORT" else "badge-nt"
+        st.markdown(f'<br><b>Overall Consensus:</b> <span class="badge {badge}">{overall}</span> '
+                    f'({cv[overall]}/4 strategies agree)', unsafe_allow_html=True)
+
+        st.divider()
+
+        # ── Indicator dashboard ──────────────────────────
+        if sig_an:
+            st.subheader("📊 Indicator Dashboard")
+            ind_rows = [
+                ("RSI (14)",     f"{sig_an['rsi']:.1f}",     "Oversold" if sig_an["rsi"]<30 else "Overbought" if sig_an["rsi"]>70 else "Neutral"),
+                ("MACD",         f"{sig_an['macd_v']:.5f}",  "Bullish" if sig_an["macd_v"]>0 else "Bearish"),
+                ("ADX",          f"{sig_an['adx_v']:.1f}",   "Strong" if sig_an["adx_v"]>25 else "Weak"),
+                ("Supertrend",   "🟢 Bull" if sig_an["st_dir"]==1 else "🔴 Bear", ""),
+                ("DI+ / DI-",    f"{sig_an['dip']:.1f}/{sig_an['din']:.1f}", "Bull edge" if sig_an["dip"]>sig_an["din"] else "Bear edge"),
+                ("EMA21/EMA50",  f"{sig_an['ema21']:.4f}/{sig_an['ema50']:.4f}", "↑ Uptrend" if sig_an["ema21"]>sig_an["ema50"] else "↓ Downtrend"),
+                ("VWAP",         f"{sig_an['vwap_v']:.4f}",  "Price above" if sig_an["entry"]>sig_an["vwap_v"] else "Price below"),
+                ("ATR",          f"{sig_an['atr']:.5f}",     f"{sig_an['atr']/sig_an['entry']*100:.2f}% vol"),
+                ("BB Upper/Lo",  f"{sig_an['bb_up']:.4f}/{sig_an['bb_lo']:.4f}", ""),
+                ("Signal Score", f"{sig_an['score']:.0f}/100",""),
+                ("R1/S1",        f"{sig_an.get('r1','N/A')}/{sig_an.get('s1','N/A')}", "Pivot levels"),
+                ("OBV",          f"{sig_an['obv_v']:.0f}",   ""),
+            ]
+            r1, r2, r3 = st.columns(3), st.columns(3), st.columns(3)
+            for ri, (nm, vl, nt) in enumerate(ind_rows):
+                row = [r1,r2,r3][ri//4]
+                with row[ri % 4 if ri < 4 else (ri-4)%4 if ri < 8 else (ri-8)%4]:
+                    st.metric(nm, vl, nt if nt else None)
+
+        st.divider()
+
+        # ── Full text analysis ───────────────────────────
+        st.subheader("📝 Analysis Report")
+        st.markdown(analysis_summary(df_an, I_an, sig_an, cfg["tk_name"],
+                                      cfg["strategy"], cfg["tf_label"], cfg["prd_label"]))
+
+        st.divider()
+
+        # ── Chart ────────────────────────────────────────
+        st.subheader("📈 Full Chart")
+        st.plotly_chart(build_chart(df_an, I_an, sig_an, st.session_state.dark_mode, height=850),
+                        use_container_width=True)
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
