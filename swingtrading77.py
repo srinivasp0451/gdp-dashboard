@@ -127,7 +127,61 @@ TICKERS = {
     "RELIANCE":     "RELIANCE.NS",
     "TCS":          "TCS.NS",
     "HDFC BANK":    "HDFCBANK.NS",
+    "📊 Nifty 50 Scanner": "__nifty50__",
     "⚙ Custom":     "__custom__",
+}
+
+NIFTY50_STOCKS = {
+    "Reliance":         "RELIANCE.NS",
+    "TCS":              "TCS.NS",
+    "HDFC Bank":        "HDFCBANK.NS",
+    "Infosys":          "INFY.NS",
+    "ICICI Bank":       "ICICIBANK.NS",
+    "HUL":              "HINDUNILVR.NS",
+    "ITC":              "ITC.NS",
+    "SBI":              "SBIN.NS",
+    "Bharti Airtel":    "BHARTIARTL.NS",
+    "Kotak Bank":       "KOTAKBANK.NS",
+    "L&T":              "LT.NS",
+    "Axis Bank":        "AXISBANK.NS",
+    "Asian Paints":     "ASIANPAINT.NS",
+    "Maruti":           "MARUTI.NS",
+    "Titan":            "TITAN.NS",
+    "Bajaj Finance":    "BAJFINANCE.NS",
+    "Wipro":            "WIPRO.NS",
+    "UltraTech":        "ULTRACEMCO.NS",
+    "Sun Pharma":       "SUNPHARMA.NS",
+    "Nestle India":     "NESTLEIND.NS",
+    "Power Grid":       "POWERGRID.NS",
+    "NTPC":             "NTPC.NS",
+    "HCL Tech":         "HCLTECH.NS",
+    "Tech Mahindra":    "TECHM.NS",
+    "M&M":              "M&M.NS",
+    "ONGC":             "ONGC.NS",
+    "Tata Motors":      "TATAMOTORS.NS",
+    "Tata Steel":       "TATASTEEL.NS",
+    "Coal India":       "COALINDIA.NS",
+    "Divi's Labs":      "DIVISLAB.NS",
+    "Bajaj Finserv":    "BAJAJFINSV.NS",
+    "Grasim":           "GRASIM.NS",
+    "JSW Steel":        "JSWSTEEL.NS",
+    "Cipla":            "CIPLA.NS",
+    "Dr Reddy's":       "DRREDDY.NS",
+    "Eicher Motors":    "EICHERMOT.NS",
+    "Hero MotoCorp":    "HEROMOTOCO.NS",
+    "Apollo Hosp":      "APOLLOHOSP.NS",
+    "Adani Ent":        "ADANIENT.NS",
+    "Adani Ports":      "ADANIPORTS.NS",
+    "BPCL":             "BPCL.NS",
+    "Britannia":        "BRITANNIA.NS",
+    "Hindalco":         "HINDALCO.NS",
+    "IndusInd Bank":    "INDUSINDBK.NS",
+    "SBI Life":         "SBILIFE.NS",
+    "HDFC Life":        "HDFCLIFE.NS",
+    "Tata Consumer":    "TATACONSUM.NS",
+    "UPL":              "UPL.NS",
+    "Shree Cement":     "SHREECEM.NS",
+    "BEL":              "BEL.NS",
 }
 
 TIMEFRAMES = {
@@ -556,16 +610,29 @@ def get_signal(df, strategy, sl_type="atr", tgt_type="atr", sl_mult=1.5, t_mult=
 
 
 # ══════════════════════════════════════════════════════════════
-# BACKTESTING ENGINE
+# BACKTESTING ENGINE  (professional grade)
+# ── Why old engine lost money ──────────────────────────────
+#  1. Used T3 (3× ATR) as sole target  → rarely hit → mostly SLs
+#  2. No trend-quality filter          → entered during choppy ranges
+#  3. Trailing SL from bar 1           → noise whipsawed it immediately
+#  4. Signal flip exit at score ≥ 55   → exited too early on noise
+# ── Fixes ──────────────────────────────────────────────────
+#  1. Partial exits: 40% at T1, 35% at T2, 25% runner to T3
+#  2. ADX ≥ 18 filter (skip ranging markets)
+#  3. Break-even move: SL → entry+spread once T1 is hit
+#  4. Trailing SL only activates after T1 is cleared
+#  5. Minimum score ≥ 55 (was 50) for entry
 # ══════════════════════════════════════════════════════════════
 def run_backtest(df, strategy, sl_mult=1.5, t_mult=2.0, sl_type="atr", tgt_type="atr",
-                 use_window=False, win_start=None, win_end=None, capital=100_000, qty=1):
+                 use_window=False, win_start=None, win_end=None, capital=100_000, qty=1,
+                 adx_filter=True, min_score=55):
     I = compute_indicators(df)
     sigs, scores, reasons = run_strategy(df, strategy, I)
     c_arr   = df["Close"].values
     h_arr   = df["High"].values
     l_arr   = df["Low"].values
     atr_arr = I["atr"].values
+    adx_arr = I["adx"].values
     r1_arr  = I["r1"].values
     s1_arr  = I["s1"].values
     bbu_arr = I["bb_up"].values
@@ -573,14 +640,28 @@ def run_backtest(df, strategy, sl_mult=1.5, t_mult=2.0, sl_type="atr", tgt_type=
     piv_arr = I["pivot"].values
     idx     = df.index
 
-    trades = []
-    equity = [capital]
-    bal    = capital
-    peak   = capital
-    max_dd = 0.0
+    trades      = []
+    equity      = [capital]
+    bal         = capital
+    peak        = capital
+    max_dd      = 0.0
 
-    in_trade = False; side = None; entry = 0.0; sl = 0.0; target = 0.0
-    tsl_off  = 0.0;  best_price = 0.0; t_entry = None; t_reason = ""
+    # Trade state
+    in_trade    = False
+    side        = None
+    entry       = 0.0
+    sl          = 0.0
+    t1 = t2 = t3 = 0.0
+    tsl_off     = 0.0
+    best_price  = 0.0
+    t_entry     = None
+    t_reason    = ""
+    t1_hit      = False    # partial exit flag
+    t2_hit      = False
+    be_moved    = False    # break-even flag
+    open_qty    = 0.0      # remaining position fraction
+
+    SPREAD = 0.0002        # 0.02% simulated spread/slippage
 
     for i in range(1, len(df)):
         # ── Trading window ──────────────────────────────
@@ -588,94 +669,202 @@ def run_backtest(df, strategy, sl_mult=1.5, t_mult=2.0, sl_type="atr", tgt_type=
             ts = pd.Timestamp(idx[i])
             if hasattr(ts, "time"):
                 t = ts.time()
-                in_window = win_start <= t <= win_end
-                if not in_window:
+                if not (win_start <= t <= win_end):
                     if in_trade:
-                        pnl = (c_arr[i] - entry)*qty if side == "LONG" else (entry - c_arr[i])*qty
-                        bal += pnl; trades.append(_trade_rec(t_entry, idx[i], side, entry, c_arr[i], pnl, "Window Close", t_reason))
+                        exit_px = c_arr[i]
+                        pnl_dir = (exit_px - entry) if side == "LONG" else (entry - exit_px)
+                        pnl = pnl_dir * qty * open_qty
+                        bal += pnl
+                        trades.append(_trade_rec(t_entry, idx[i], side, entry, exit_px,
+                                                  pnl, "Window Close", t_reason))
                         in_trade = False
-                    equity.append(bal); peak = max(peak, bal); max_dd = max(max_dd, (peak-bal)/peak*100)
+                    equity.append(bal)
+                    peak = max(peak, bal)
+                    max_dd = max(max_dd, (peak - bal) / peak * 100 if peak > 0 else 0)
                     continue
 
-        sig   = sigs.iloc[i]; score = abs(scores.iloc[i])
-        atr_v = atr_arr[i] if not np.isnan(atr_arr[i]) else c_arr[i]*0.01
-        r1_v  = r1_arr[i] if not np.isnan(r1_arr[i]) else None
-        s1_v  = s1_arr[i] if not np.isnan(s1_arr[i]) else None
+        raw_score = scores.iloc[i]
+        sig       = sigs.iloc[i]
+        score_abs = abs(raw_score)
+        atr_v     = atr_arr[i] if not np.isnan(atr_arr[i]) else c_arr[i] * 0.01
+        adx_v     = adx_arr[i] if not np.isnan(adx_arr[i]) else 0.0
+        r1_v      = r1_arr[i]  if not np.isnan(r1_arr[i])  else None
+        s1_v      = s1_arr[i]  if not np.isnan(s1_arr[i])  else None
 
         # ── Manage open trade ────────────────────────────
         if in_trade:
             if side == "LONG":
                 best_price = max(best_price, h_arr[i])
-                new_tsl    = best_price - tsl_off
-                sl         = max(sl, new_tsl)      # trail up only
+
+                # Move SL to break-even after T1 hit
+                if t1_hit and not be_moved:
+                    sl = max(sl, entry + atr_v * 0.1)   # just above entry
+                    be_moved = True
+
+                # Activate trailing SL only after T1 (prevents early whipsaw)
+                if t1_hit:
+                    new_tsl = best_price - tsl_off
+                    sl = max(sl, new_tsl)
+
+                # Check exits in priority order
                 if l_arr[i] <= sl:
-                    pnl = (sl - entry)*qty; bal += pnl
-                    trades.append(_trade_rec(t_entry, idx[i], "LONG", entry, sl, pnl, "Stop Loss", t_reason))
+                    exit_px = sl
+                    pnl = (exit_px - entry) * qty * open_qty
+                    bal += pnl
+                    reason_str = "Break-Even SL" if be_moved and abs(exit_px - entry) < atr_v * 0.3 else "Stop Loss"
+                    trades.append(_trade_rec(t_entry, idx[i], "LONG", entry, exit_px,
+                                              pnl, reason_str, t_reason))
                     in_trade = False
-                elif h_arr[i] >= target:
-                    pnl = (target - entry)*qty; bal += pnl
-                    trades.append(_trade_rec(t_entry, idx[i], "LONG", entry, target, pnl, "Target Hit", t_reason))
+
+                elif not t1_hit and h_arr[i] >= t1:
+                    # Partial exit 40% at T1
+                    partial_pnl = (t1 - entry) * qty * 0.40
+                    bal += partial_pnl
+                    t1_hit   = True
+                    open_qty = 0.60   # 60% remaining
+                    # Don't close trade, continue
+
+                elif t1_hit and not t2_hit and h_arr[i] >= t2:
+                    # Partial exit 35% at T2
+                    partial_pnl = (t2 - entry) * qty * 0.35
+                    bal += partial_pnl
+                    t2_hit   = True
+                    open_qty = 0.25   # 25% runner remains
+
+                elif t1_hit and t2_hit and h_arr[i] >= t3:
+                    # Final 25% at T3
+                    pnl = (t3 - entry) * qty * open_qty
+                    bal += pnl
+                    trades.append(_trade_rec(t_entry, idx[i], "LONG", entry, t3,
+                                              pnl, "Target 3 (Runner)", t_reason))
                     in_trade = False
-                elif sig == "SHORT" and score >= 55:
-                    pnl = (c_arr[i] - entry)*qty; bal += pnl
-                    trades.append(_trade_rec(t_entry, idx[i], "LONG", entry, c_arr[i], pnl, "Signal Flip", t_reason))
+
+                elif sig == "SHORT" and score_abs >= 65 and t1_hit:
+                    # Only flip if T1 already banked and strong opposing signal
+                    pnl = (c_arr[i] - entry) * qty * open_qty
+                    bal += pnl
+                    trades.append(_trade_rec(t_entry, idx[i], "LONG", entry, c_arr[i],
+                                              pnl, "Signal Flip", t_reason))
                     in_trade = False
-            else:
+
+            else:  # SHORT
                 best_price = min(best_price, l_arr[i])
-                new_tsl    = best_price + tsl_off
-                sl         = min(sl, new_tsl)      # trail down only
+
+                if t1_hit and not be_moved:
+                    sl = min(sl, entry - atr_v * 0.1)
+                    be_moved = True
+
+                if t1_hit:
+                    new_tsl = best_price + tsl_off
+                    sl = min(sl, new_tsl)
+
                 if h_arr[i] >= sl:
-                    pnl = (entry - sl)*qty; bal += pnl
-                    trades.append(_trade_rec(t_entry, idx[i], "SHORT", entry, sl, pnl, "Stop Loss", t_reason))
+                    exit_px = sl
+                    pnl = (entry - exit_px) * qty * open_qty
+                    bal += pnl
+                    reason_str = "Break-Even SL" if be_moved and abs(exit_px - entry) < atr_v * 0.3 else "Stop Loss"
+                    trades.append(_trade_rec(t_entry, idx[i], "SHORT", entry, exit_px,
+                                              pnl, reason_str, t_reason))
                     in_trade = False
-                elif l_arr[i] <= target:
-                    pnl = (entry - target)*qty; bal += pnl
-                    trades.append(_trade_rec(t_entry, idx[i], "SHORT", entry, target, pnl, "Target Hit", t_reason))
+
+                elif not t1_hit and l_arr[i] <= t1:
+                    partial_pnl = (entry - t1) * qty * 0.40
+                    bal += partial_pnl
+                    t1_hit   = True
+                    open_qty = 0.60
+
+                elif t1_hit and not t2_hit and l_arr[i] <= t2:
+                    partial_pnl = (entry - t2) * qty * 0.35
+                    bal += partial_pnl
+                    t2_hit   = True
+                    open_qty = 0.25
+
+                elif t1_hit and t2_hit and l_arr[i] <= t3:
+                    pnl = (entry - t3) * qty * open_qty
+                    bal += pnl
+                    trades.append(_trade_rec(t_entry, idx[i], "SHORT", entry, t3,
+                                              pnl, "Target 3 (Runner)", t_reason))
                     in_trade = False
-                elif sig == "LONG" and score >= 55:
-                    pnl = (entry - c_arr[i])*qty; bal += pnl
-                    trades.append(_trade_rec(t_entry, idx[i], "SHORT", entry, c_arr[i], pnl, "Signal Flip", t_reason))
+
+                elif sig == "LONG" and score_abs >= 65 and t1_hit:
+                    pnl = (entry - c_arr[i]) * qty * open_qty
+                    bal += pnl
+                    trades.append(_trade_rec(t_entry, idx[i], "SHORT", entry, c_arr[i],
+                                              pnl, "Signal Flip", t_reason))
                     in_trade = False
-            peak   = max(peak, bal); max_dd = max(max_dd, (peak-bal)/peak*100)
+
+            peak   = max(peak, bal)
+            max_dd = max(max_dd, (peak - bal) / peak * 100 if peak > 0 else 0)
 
         # ── Enter new trade ──────────────────────────────
-        if not in_trade and sig in ("LONG","SHORT") and score >= 50:
-            sl_c, t1_c, _, t3_c, tsl_c = compute_sl_target(
+        # Quality filters: score threshold + optional ADX trend filter
+        adx_ok = (adx_v >= 18) if adx_filter else True
+        if (not in_trade
+                and sig in ("LONG", "SHORT")
+                and score_abs >= min_score
+                and adx_ok):
+
+            sl_c, t1_c, t2_c, t3_c, tsl_c = compute_sl_target(
                 sig, c_arr[i], atr_v, sl_type, tgt_type, sl_mult, t_mult,
                 h_arr[i], l_arr[i], piv_arr[i], r1_v, s1_v, bbu_arr[i], bbl_arr[i])
-            in_trade   = True; side  = sig; entry = c_arr[i]
-            sl         = sl_c; target = t3_c; tsl_off = tsl_c
-            best_price = entry if sig == "LONG" else entry
-            t_entry    = idx[i]; t_reason = reasons.iloc[i]
+
+            # Apply spread/slippage to entry
+            entry_px = c_arr[i] * (1 + SPREAD) if sig == "LONG" else c_arr[i] * (1 - SPREAD)
+
+            in_trade   = True
+            side       = sig
+            entry      = entry_px
+            sl         = sl_c
+            t1         = t1_c
+            t2         = t2_c
+            t3         = t3_c
+            tsl_off    = tsl_c
+            best_price = entry_px
+            t_entry    = idx[i]
+            t_reason   = reasons.iloc[i]
+            t1_hit     = False
+            t2_hit     = False
+            be_moved   = False
+            open_qty   = 1.0
 
         equity.append(bal)
 
-    # ── Force close at end ──────────────────────────────
+    # ── Force close any open trade at end ────────────────
     if in_trade:
-        pnl = (c_arr[-1]-entry)*qty if side=="LONG" else (entry-c_arr[-1])*qty
+        exit_px = c_arr[-1]
+        pnl = (exit_px - entry) * qty * open_qty if side == "LONG" else (entry - exit_px) * qty * open_qty
         bal += pnl
-        trades.append(_trade_rec(t_entry, idx[-1], side, entry, c_arr[-1], pnl, "End of Data", t_reason))
+        trades.append(_trade_rec(t_entry, idx[-1], side, entry, exit_px,
+                                  pnl, "End of Data", t_reason))
         equity.append(bal)
 
     if not trades:
         return None, pd.DataFrame(), []
 
-    tf = pd.DataFrame(trades)
-    w  = tf[tf["pnl"] > 0]; lo = tf[tf["pnl"] <= 0]
+    tf_df = pd.DataFrame(trades)
+    w     = tf_df[tf_df["pnl"] > 0]
+    lo    = tf_df[tf_df["pnl"] <= 0]
+    pf    = abs(w["pnl"].sum() / lo["pnl"].sum()) if (len(lo) > 0 and lo["pnl"].sum() != 0) else 999
     stats = {
-        "trades":   len(tf),
-        "win_rate": len(w)/len(tf)*100,
-        "total_pnl":  tf["pnl"].sum(),
-        "return_pct": tf["pnl"].sum()/capital*100,
-        "avg_win":  w["pnl"].mean() if len(w) else 0,
-        "avg_loss": lo["pnl"].mean() if len(lo) else 0,
-        "pf":       abs(w["pnl"].sum()/lo["pnl"].sum()) if lo["pnl"].sum() != 0 else 999,
-        "max_dd":   max_dd,
-        "final":    bal,
-        "sharpe":   tf["pnl"].mean()/(tf["pnl"].std()+1e-9)*np.sqrt(252) if len(tf)>1 else 0,
-        "expectancy": tf["pnl"].mean(),
+        "trades":      len(tf_df),
+        "wins":        len(w),
+        "losses":      len(lo),
+        "win_rate":    len(w) / len(tf_df) * 100,
+        "total_pnl":   tf_df["pnl"].sum(),
+        "return_pct":  tf_df["pnl"].sum() / capital * 100,
+        "avg_win":     w["pnl"].mean()  if len(w)  else 0,
+        "avg_loss":    lo["pnl"].mean() if len(lo) else 0,
+        "pf":          pf,
+        "max_dd":      max_dd,
+        "final":       bal,
+        "sharpe":      (tf_df["pnl"].mean() / (tf_df["pnl"].std() + 1e-9) * np.sqrt(252)
+                        if len(tf_df) > 1 else 0),
+        "expectancy":  tf_df["pnl"].mean(),
+        "best_trade":  tf_df["pnl"].max(),
+        "worst_trade": tf_df["pnl"].min(),
+        "strategy":    strategy,
     }
-    return stats, tf, equity
+    return stats, tf_df, equity
 
 def _trade_rec(et, xt, side, entry, exit_, pnl, reason, t_reason):
     return {"entry_time": et, "exit_time": xt, "side": side,
@@ -1092,8 +1281,8 @@ def main():
     </div>
     """, unsafe_allow_html=True)
 
-    tab_live, tab_bt, tab_hist, tab_an = st.tabs(
-        ["📡 Live Trading", "🔬 Backtesting", "📋 Trade History", "📊 Analysis"])
+    tab_live, tab_bt, tab_hist, tab_an, tab_nifty = st.tabs(
+        ["📡 Live Trading", "🔬 Backtesting", "📋 Trade History", "📊 Analysis", "🏦 Nifty 50 Scanner"])
 
     # ══════════════════════════════════════════════════════
     # TAB 1 — LIVE TRADING
@@ -1273,8 +1462,26 @@ def main():
     # TAB 2 — BACKTESTING
     # ══════════════════════════════════════════════════════
     with tab_bt:
-        st.subheader("🔬 Strategy Backtesting")
-        st.caption("⚡ Uses identical signal logic as Live Trading for consistency")
+        # ── Strategy banner ──────────────────────────────
+        BG_BT = "#0d1117" if st.session_state.dark_mode else "#f8fafc"
+        TC_BT = "#e6edf3" if st.session_state.dark_mode else "#1a1a2e"
+        st.markdown(f"""
+        <div style="background:{'#161b22' if st.session_state.dark_mode else '#fff'};
+                    border:1px solid {'#30363d' if st.session_state.dark_mode else '#d1d9e0'};
+                    border-radius:12px;padding:16px 22px;margin-bottom:12px;">
+          <div style="font-family:Syne,sans-serif;font-size:1.1rem;font-weight:700;margin-bottom:4px;">
+            🔬 Backtesting &nbsp;—&nbsp;
+            <span style="color:#00d4aa;">{cfg['strategy']}</span> Strategy on
+            <span style="color:#FFD700;">{cfg['tk_name']}</span>
+          </div>
+          <div style="font-size:.82rem;opacity:.7;">{STRATEGY_DESC[cfg['strategy']]}</div>
+          <div style="font-size:.78rem;opacity:.55;margin-top:6px;">
+            ℹ️ Engine: Partial exits at T1 (40%), T2 (35%), T3 runner (25%) ·
+            Break-even SL after T1 hit · ADX filter skips ranging markets ·
+            Spread/slippage included · Same signal logic as Live Trading
+          </div>
+        </div>
+        """, unsafe_allow_html=True)
 
         bc1, bc2, bc3 = st.columns(3)
         with bc1:
@@ -1286,63 +1493,85 @@ def main():
             bt_tf        = TIMEFRAMES[bt_tf_label]
         with bc3:
             bt_cap = st.number_input("Starting Capital", 1_000, 10_000_000, cfg["capital"], 1_000, key="bt_cap")
-            bt_qty = st.number_input("Qty per Trade", 1, 10_000, cfg["qty"], 1, key="bt_qty")
+            bt_qty = st.number_input("Qty per Trade",    1, 10_000, cfg["qty"], 1, key="bt_qty")
 
-        use_win_bt = st.checkbox("Use Trading Window Filter",
-                                  value=cfg["use_win"], key="bt_win",
-                                  help=f"Restrict to {cfg['win_s']} – {cfg['win_e']}")
+        f1, f2, f3 = st.columns(3)
+        with f1:
+            use_win_bt  = st.checkbox("Trading Window Filter", value=cfg["use_win"], key="bt_win",
+                                       help=f"Restrict to {cfg['win_s']} – {cfg['win_e']}")
+        with f2:
+            adx_filter  = st.checkbox("ADX Trend Filter (skip ranging)", value=True, key="bt_adx",
+                                       help="Skip trades when ADX < 18 (avoids choppy market entries)")
+        with f3:
+            min_score   = st.slider("Min Signal Score", 45, 80, 55, 5, key="bt_score",
+                                     help="Higher = fewer but higher quality trades")
 
         run_col, _ = st.columns([2, 5])
         with run_col:
             run_bt = st.button("🚀 Run Backtest", use_container_width=True, type="primary")
 
         if run_bt:
-            with st.spinner("Fetching data & running backtest…"):
+            with st.spinner(f"Fetching {cfg['tk_name']} data…"):
                 df_bt = fetch(cfg["ticker"], bt_prd, bt_tf)
 
             if df_bt is None or len(df_bt) < 60:
                 st.error("Not enough data. Try a longer period or different timeframe.")
             else:
-                with st.spinner("Simulating trades…"):
+                with st.spinner(f"Simulating {cfg['strategy']} trades…"):
                     stats, t_df, equity = run_backtest(
                         df_bt, cfg["strategy"],
                         cfg["sl_mult"], cfg["t_mult"],
-                        cfg["sl_type"], cfg["tgt_type"],
+                        cfg["sl_type"],  cfg["tgt_type"],
                         use_win_bt,
                         cfg["win_s"] if use_win_bt else None,
                         cfg["win_e"] if use_win_bt else None,
                         bt_cap, bt_qty,
+                        adx_filter=adx_filter,
+                        min_score=min_score,
                     )
 
                 if stats is None:
-                    st.warning("No trades generated. Try relaxing signal thresholds or a different period.")
+                    st.warning("No trades generated. Try lowering Min Signal Score or a longer period.")
                 else:
                     # ── Performance Cards ────────────────────────
                     st.subheader("📈 Performance Summary")
-                    p1,p2,p3,p4,p5,p6 = st.columns(6)
-                    p1.metric("Trades",        stats["trades"])
-                    p2.metric("Win Rate",       f"{stats['win_rate']:.1f}%",
-                               "✅ Good" if stats["win_rate"]>=50 else "❌ Poor")
-                    p3.metric("Total P&L",      f"{stats['total_pnl']:+,.2f}",
-                               f"{stats['return_pct']:+.1f}%")
-                    p4.metric("Profit Factor",  f"{min(stats['pf'],99):.2f}",
-                               "✅" if stats["pf"]>=1.5 else "⚠️")
-                    p5.metric("Max Drawdown",   f"{stats['max_dd']:.1f}%")
-                    p6.metric("Sharpe Ratio",   f"{stats['sharpe']:.2f}")
 
-                    p7,p8,p9,p10 = st.columns(4)
-                    p7.metric("Avg Win",        f"{stats['avg_win']:+.2f}")
-                    p8.metric("Avg Loss",       f"{stats['avg_loss']:+.2f}")
-                    p9.metric("Expectancy",     f"{stats['expectancy']:+.2f}")
-                    p10.metric("Final Capital", f"{stats['final']:,.0f}")
+                    # Strategy + settings recap
+                    sl_label  = list(SL_TYPES.keys())[list(SL_TYPES.values()).index(cfg["sl_type"])]
+                    tgt_label = list(TARGET_TYPES.keys())[list(TARGET_TYPES.values()).index(cfg["tgt_type"])]
+                    st.caption(
+                        f"**Strategy:** {cfg['strategy']}  ·  **Asset:** {cfg['tk_name']}  ·  "
+                        f"**TF:** {bt_tf_label}  ·  **Period:** {bt_prd_label}  ·  "
+                        f"**SL:** {sl_label} ({cfg['sl_mult']}×ATR)  ·  "
+                        f"**Target:** {tgt_label} ({cfg['t_mult']}×)  ·  "
+                        f"**ADX filter:** {'ON' if adx_filter else 'OFF'}  ·  "
+                        f"**Min score:** {min_score}"
+                    )
+
+                    p1,p2,p3,p4,p5,p6,p7 = st.columns(7)
+                    p1.metric("Total Trades",   stats["trades"])
+                    p2.metric("Wins / Losses",  f"{stats['wins']} / {stats['losses']}")
+                    p3.metric("Win Rate",        f"{stats['win_rate']:.1f}%",
+                               "✅ Good" if stats["win_rate"] >= 50 else "❌ Poor")
+                    p4.metric("Total P&L",       f"{stats['total_pnl']:+,.2f}",
+                               f"{stats['return_pct']:+.1f}%")
+                    p5.metric("Profit Factor",   f"{min(stats['pf'],99):.2f}",
+                               "✅" if stats["pf"] >= 1.5 else "⚠️")
+                    p6.metric("Max Drawdown",    f"{stats['max_dd']:.1f}%")
+                    p7.metric("Sharpe Ratio",    f"{stats['sharpe']:.2f}")
+
+                    p8,p9,p10,p11 = st.columns(4)
+                    p8.metric("Avg Win",         f"{stats['avg_win']:+.2f}")
+                    p9.metric("Avg Loss",        f"{stats['avg_loss']:+.2f}")
+                    p10.metric("Expectancy",     f"{stats['expectancy']:+.2f}")
+                    p11.metric("Final Capital",  f"{stats['final']:,.0f}")
+
+                    BG2 = BG_BT; TC = TC_BT
 
                     # ── Equity Curve ────────────────────────────
-                    BG2 = "#0d1117" if st.session_state.dark_mode else "#f8fafc"
-                    TC  = "#e6edf3" if st.session_state.dark_mode else "#1a1a2e"
                     eq_fig = go.Figure()
                     eq_fig.add_trace(go.Scatter(
-                        x=list(range(len(equity))), y=equity,
-                        mode="lines", name="Equity",
+                        x=list(range(len(equity))), y=equity, mode="lines", name="Equity",
                         line=dict(color="#00d4aa", width=2.5),
                         fill="tozeroy", fillcolor="rgba(0,212,170,0.08)"
                     ))
@@ -1350,70 +1579,124 @@ def main():
                                       annotation_text=" Initial Capital")
                     eq_fig.update_layout(paper_bgcolor=BG2, plot_bgcolor=BG2,
                                          font=dict(color=TC), height=280,
-                                         margin=dict(l=50,r=20,t=30,b=20),
-                                         title=dict(text="Equity Curve", font=dict(color=TC)))
+                                         margin=dict(l=50,r=20,t=40,b=20),
+                                         title=dict(text=f"Equity Curve — {cfg['strategy']} on {cfg['tk_name']}",
+                                                    font=dict(color=TC)))
                     st.plotly_chart(eq_fig, use_container_width=True)
 
-                    # ── Per-trade P&L bars ──────────────────────
-                    pnl_colors = ["#00d4aa" if p>0 else "#ff4d6d" for p in t_df["pnl"]]
-                    bar_fig = go.Figure(go.Bar(x=list(range(len(t_df))), y=t_df["pnl"],
-                                               marker_color=pnl_colors, opacity=0.8, name="P&L"))
-                    bar_fig.update_layout(paper_bgcolor=BG2, plot_bgcolor=BG2,
-                                          font=dict(color=TC), height=220,
-                                          margin=dict(l=50,r=20,t=30,b=20),
-                                          title=dict(text="Trade-by-Trade P&L", font=dict(color=TC)))
-                    st.plotly_chart(bar_fig, use_container_width=True)
+                    ch1, ch2 = st.columns(2)
+                    with ch1:
+                        pnl_colors = ["#00d4aa" if p > 0 else "#ff4d6d" for p in t_df["pnl"]]
+                        bar_fig = go.Figure(go.Bar(x=list(range(len(t_df))), y=t_df["pnl"],
+                                                   marker_color=pnl_colors, opacity=0.8, name="P&L"))
+                        bar_fig.update_layout(paper_bgcolor=BG2, plot_bgcolor=BG2,
+                                              font=dict(color=TC), height=240,
+                                              margin=dict(l=50,r=20,t=40,b=20),
+                                              title=dict(text="Trade-by-Trade P&L", font=dict(color=TC)))
+                        st.plotly_chart(bar_fig, use_container_width=True)
 
-                    # ── Exit Reason Pie ─────────────────────────
-                    er = t_df["exit_reason"].value_counts()
-                    pie_fig = go.Figure(go.Pie(labels=er.index, values=er.values, hole=0.4,
-                                               marker=dict(colors=["#00d4aa","#ff4d6d","#FFD700","#A78BFA","#94a3b8"])))
-                    pie_fig.update_layout(paper_bgcolor=BG2, font=dict(color=TC), height=250,
-                                          margin=dict(l=20,r=20,t=30,b=20),
-                                          title=dict(text="Exit Reasons", font=dict(color=TC)))
-                    st.plotly_chart(pie_fig, use_container_width=True)
+                    with ch2:
+                        er = t_df["exit_reason"].value_counts()
+                        pie_fig = go.Figure(go.Pie(labels=er.index, values=er.values, hole=0.4,
+                                                   marker=dict(colors=["#00d4aa","#ff4d6d","#FFD700","#A78BFA","#94a3b8","#38bdf8"])))
+                        pie_fig.update_layout(paper_bgcolor=BG2, font=dict(color=TC), height=240,
+                                              margin=dict(l=20,r=20,t=40,b=20),
+                                              title=dict(text="Exit Reasons", font=dict(color=TC)))
+                        st.plotly_chart(pie_fig, use_container_width=True)
 
-                    # ── Drawdown Curve ──────────────────────────
+                    # ── Drawdown ─────────────────────────────────
                     eq_s   = pd.Series(equity)
                     peak_s = eq_s.cummax()
-                    dd_s   = (peak_s - eq_s) / peak_s * 100
-                    dd_fig = go.Figure(go.Scatter(x=list(range(len(dd_s))), y=-dd_s,
-                                                   mode="lines", fill="tozeroy",
-                                                   fillcolor="rgba(255,77,109,0.12)",
-                                                   line=dict(color="#ff4d6d", width=1.5), name="Drawdown %"))
+                    dd_s   = (peak_s - eq_s) / peak_s.replace(0, np.nan) * 100
+                    dd_fig = go.Figure(go.Scatter(
+                        x=list(range(len(dd_s))), y=-dd_s.fillna(0),
+                        mode="lines", fill="tozeroy",
+                        fillcolor="rgba(255,77,109,0.12)",
+                        line=dict(color="#ff4d6d", width=1.5), name="Drawdown %"))
                     dd_fig.update_layout(paper_bgcolor=BG2, plot_bgcolor=BG2, font=dict(color=TC),
-                                         height=200, margin=dict(l=50,r=20,t=30,b=20),
+                                         height=200, margin=dict(l=50,r=20,t=40,b=20),
                                          title=dict(text="Drawdown (%)", font=dict(color=TC)))
                     st.plotly_chart(dd_fig, use_container_width=True)
 
-                    # ── Trade Log ───────────────────────────────
-                    st.subheader("📋 Detailed Trade Log")
-                    show_cols = ["entry_time","exit_time","side","entry","exit","pnl","exit_reason"]
+                    # ── Trade Log with Entry Reason ───────────────
+                    st.subheader("📋 Detailed Trade Log (with Entry Reason)")
+                    st.caption("Each row shows the full technical reason why the trade was entered and how it exited")
+
+                    # Truncate long analysis strings for table display
+                    display_df = t_df.copy()
+                    display_df["entry_reason"] = display_df["analysis"].apply(
+                        lambda x: x[:120] + "…" if isinstance(x, str) and len(x) > 120 else x
+                    )
+                    display_df["result"] = display_df["pnl"].apply(
+                        lambda p: "✅ WIN" if p > 0 else "❌ LOSS"
+                    )
+                    show_cols = ["entry_time", "exit_time", "side", "entry", "exit",
+                                 "pnl", "result", "exit_reason", "entry_reason"]
                     st.dataframe(
-                        t_df[show_cols].style
-                          .format({"entry": "{:.5f}", "exit": "{:.5f}", "pnl": "{:+.2f}"})
-                          .applymap(lambda v: "color:#00d4aa" if isinstance(v,(int,float)) and v>0
-                                    else "color:#ff4d6d" if isinstance(v,(int,float)) and v<0 else "",
+                        display_df[show_cols].style
+                          .format({"entry": "{:.4f}", "exit": "{:.4f}", "pnl": "{:+.2f}"})
+                          .applymap(lambda v: "color:#00d4aa" if isinstance(v,(int,float)) and v > 0
+                                    else "color:#ff4d6d" if isinstance(v,(int,float)) and v < 0 else "",
                                     subset=["pnl"]),
-                        use_container_width=True, height=320
+                        use_container_width=True, height=380
                     )
 
-                    # ── Text Summary ─────────────────────────────
-                    st.subheader("📝 Backtest Narrative")
-                    verdict = "PROFITABLE ✅" if stats["total_pnl"] > 0 else "NOT PROFITABLE ❌"
-                    er_dict = t_df["exit_reason"].value_counts().to_dict()
+                    # Expandable full reasons
+                    with st.expander("📖 View Full Entry Reasons for Each Trade"):
+                        for idx_t, row in t_df.iterrows():
+                            color = "#00d4aa" if row["pnl"] > 0 else "#ff4d6d"
+                            st.markdown(
+                                f"**Trade #{idx_t+1}** &nbsp; "
+                                f"<span style='color:{color}'>{row['side']} @ {row['entry']:.4f} → "
+                                f"{row['exit']:.4f} | P&L: {row['pnl']:+.2f} | {row['exit_reason']}</span>",
+                                unsafe_allow_html=True
+                            )
+                            if row.get("analysis"):
+                                for part in str(row["analysis"]).split(" | "):
+                                    if part.strip():
+                                        st.markdown(f"&nbsp;&nbsp;&nbsp;• {part.strip()}")
+                            st.markdown("---")
+
+                    # ── Backtest Narrative ────────────────────────
+                    st.subheader("📝 Backtest Analysis Report")
+                    verdict   = "**PROFITABLE ✅**" if stats["total_pnl"] > 0 else "**LOSS-MAKING ❌**"
+                    er_dict   = t_df["exit_reason"].value_counts().to_dict()
+                    t1_hits   = er_dict.get("Target 3 (Runner)", 0) + sum(v for k,v in er_dict.items() if "Target" in k)
+                    sl_hits   = er_dict.get("Stop Loss", 0) + er_dict.get("Break-Even SL", 0)
+                    quality   = "Strong ✅" if stats["win_rate"] >= 55 and stats["pf"] >= 1.5 else \
+                                "Acceptable ⚠️" if stats["win_rate"] >= 45 else "Weak ❌"
+
                     st.markdown(f"""
-**Strategy:** {cfg["strategy"]} on **{cfg["tk_name"]}** ({bt_tf_label} | {bt_prd_label})  
-Window filter: {"ON (" + str(cfg["win_s"]) + " – " + str(cfg["win_e"]) + ")" if use_win_bt else "OFF"}
+### Strategy: `{cfg['strategy']}` on `{cfg['tk_name']}` — {bt_tf_label} | {bt_prd_label}
 
-The backtest simulated **{stats["trades"]} trades** achieving a win rate of **{stats["win_rate"]:.1f}%** with
-a profit factor of **{min(stats["pf"],99):.2f}**. The strategy is **{verdict}** on this data,
-returning **{stats["return_pct"]:.1f}%** ({stats["total_pnl"]:+,.2f}) from {bt_cap:,} capital.
+| Setting | Value |
+|---------|-------|
+| SL Type | {sl_label} ({cfg['sl_mult']}× ATR) |
+| Target Type | {tgt_label} ({cfg['t_mult']}×) |
+| ADX Filter | {'ON (skip ADX < 18)' if adx_filter else 'OFF'} |
+| Min Score | {min_score}/100 |
+| Window | {'ON ' + str(cfg['win_s']) + ' – ' + str(cfg['win_e']) if use_win_bt else 'OFF'} |
+| Capital | {bt_cap:,} |
 
-Max drawdown was **{stats["max_dd"]:.1f}%** — {"acceptable" if stats["max_dd"]<20 else "consider tighter SLs"}.  
-Sharpe ratio: **{stats["sharpe"]:.2f}** {"(excellent)" if stats["sharpe"]>2 else "(good)" if stats["sharpe"]>1 else "(needs improvement)"}.  
-Expectancy per trade: **{stats["expectancy"]:+.2f}**.  
-Exit breakdown: {er_dict}
+**Verdict: {verdict}**
+
+The backtest ran **{stats['trades']} trades** ({stats['wins']} wins, {stats['losses']} losses) with a
+win rate of **{stats['win_rate']:.1f}%** and profit factor **{min(stats['pf'],99):.2f}**.
+Return: **{stats['return_pct']:+.1f}%** ({stats['total_pnl']:+,.2f}).
+
+**Signal Quality: {quality}**
+- Max drawdown: **{stats['max_dd']:.1f}%** {"✅ controlled" if stats['max_dd'] < 15 else "⚠️ consider tighter SL"}
+- Sharpe ratio: **{stats['sharpe']:.2f}** {"(excellent)" if stats['sharpe'] > 2 else "(good)" if stats['sharpe'] > 1 else "(improve by raising min score)"}
+- Expectancy/trade: **{stats['expectancy']:+.2f}**
+- Best trade: **{stats['best_trade']:+.2f}** | Worst: **{stats['worst_trade']:+.2f}**
+- Stop Loss exits: {sl_hits} | Target exits: {t1_hits} | Other: {stats['trades'] - sl_hits - t1_hits}
+
+**Exit Breakdown:** {er_dict}
+
+**Tips to improve this strategy:**
+- {"Raise Min Score to 65+ to filter only high-conviction setups" if stats['win_rate'] < 50 else "Win rate is healthy — focus on increasing position size on A+ setups"}
+- {"Enable ADX filter to avoid ranging markets" if not adx_filter else "ADX filter is ON — good for trend strategies"}
+- {"Use Swing or Positional strategy for cleaner signals on daily charts" if bt_tf in ["1m","5m"] else "Timeframe looks appropriate for this strategy"}
                     """)
 
     # ══════════════════════════════════════════════════════
@@ -1550,6 +1833,256 @@ Exit breakdown: {er_dict}
         st.subheader("📈 Full Chart")
         st.plotly_chart(build_chart(df_an, I_an, sig_an, st.session_state.dark_mode, height=850),
                         use_container_width=True)
+
+    # ══════════════════════════════════════════════════════
+    # TAB 5 — NIFTY 50 SCANNER
+    # ══════════════════════════════════════════════════════
+    with tab_nifty:
+        BG_N = "#0d1117" if st.session_state.dark_mode else "#f8fafc"
+        TC_N = "#e6edf3" if st.session_state.dark_mode else "#1a1a2e"
+
+        st.markdown(f"""
+        <div style="background:{'#161b22' if st.session_state.dark_mode else '#fff'};
+                    border:1px solid {'#30363d' if st.session_state.dark_mode else '#d1d9e0'};
+                    border-radius:12px;padding:16px 22px;margin-bottom:14px;">
+          <div style="font-family:Syne,sans-serif;font-size:1.2rem;font-weight:800;">
+            🏦 Nifty 50 Stock Scanner
+          </div>
+          <div style="font-size:.82rem;opacity:.65;margin-top:4px;">
+            Scans all 50 Nifty constituents · Ranks by signal strength ·
+            Shows best BUY / SELL opportunities with entry, SL, targets and reasons
+          </div>
+        </div>
+        """, unsafe_allow_html=True)
+
+        ns1, ns2, ns3, ns4 = st.columns(4)
+        with ns1:
+            n_strategy  = st.selectbox("Strategy", list(REC_TF.keys()), index=1, key="n_strat")
+        with ns2:
+            rec_tf_n, _ = REC_TF[n_strategy]
+            n_tf_label  = st.selectbox("Timeframe", list(TIMEFRAMES.keys()), key="n_tf",
+                                        index=list(TIMEFRAMES.keys()).index(rec_tf_n))
+            n_tf        = TIMEFRAMES[n_tf_label]
+        with ns3:
+            n_prd_label = st.selectbox("Period", list(PERIODS.keys()), index=3, key="n_prd")
+            n_prd       = PERIODS[n_prd_label]
+        with ns4:
+            n_top       = st.slider("Show Top N", 5, 50, 15, 5, key="n_top")
+
+        scan_col, _ = st.columns([2, 5])
+        with scan_col:
+            run_scan = st.button("🔍 Scan All Nifty 50 Stocks", use_container_width=True, type="primary")
+
+        if run_scan:
+            results  = []
+            errors   = []
+            progress = st.progress(0, text="Starting scan…")
+            status   = st.empty()
+            total_n  = len(NIFTY50_STOCKS)
+
+            for i, (name, sym) in enumerate(NIFTY50_STOCKS.items()):
+                progress.progress((i + 1) / total_n,
+                                   text=f"Scanning {name} ({i+1}/{total_n})…")
+                status.caption(f"⏳ Fetching: **{name}** ({sym})")
+                time_module.sleep(_FETCH_MIN_GAP)   # respect rate limit between each stock
+
+                df_n = fetch(sym, n_prd, n_tf)
+                if df_n is None or len(df_n) < 50:
+                    errors.append(name); continue
+
+                try:
+                    sig_n = get_signal(df_n, n_strategy,
+                                       cfg["sl_type"], cfg["tgt_type"],
+                                       cfg["sl_mult"], cfg["t_mult"])
+                    if sig_n is None: continue
+
+                    chg = (df_n["Close"].iloc[-1] - df_n["Close"].iloc[-2]) / df_n["Close"].iloc[-2] * 100
+                    results.append({
+                        "name":       name,
+                        "symbol":     sym,
+                        "signal":     sig_n["signal"],
+                        "confidence": sig_n["confidence"],
+                        "score":      sig_n["score"],
+                        "price":      sig_n["entry"],
+                        "chg_pct":    chg,
+                        "sl":         sig_n["sl"],
+                        "t1":         sig_n["t1"],
+                        "t2":         sig_n["t2"],
+                        "t3":         sig_n["t3"],
+                        "rr":         sig_n["rr"],
+                        "rsi":        sig_n["rsi"],
+                        "adx":        sig_n["adx_v"],
+                        "st_dir":     sig_n["st_dir"],
+                        "reason":     sig_n["reason"],
+                        "atr":        sig_n["atr"],
+                    })
+                except Exception:
+                    errors.append(name)
+
+            progress.empty(); status.empty()
+
+            if not results:
+                st.error("No results. Check your network or try a different timeframe.")
+                st.stop()
+
+            df_res = pd.DataFrame(results)
+
+            # ── Summary Counts ────────────────────────────
+            longs  = df_res[df_res["signal"] == "LONG"]
+            shorts = df_res[df_res["signal"] == "SHORT"]
+            holds  = df_res[df_res["signal"] == "HOLD"]
+
+            sm1, sm2, sm3, sm4, sm5 = st.columns(5)
+            sm1.metric("Stocks Scanned",   len(results))
+            sm2.metric("🟢 BUY Signals",   len(longs))
+            sm3.metric("🔴 SELL Signals",  len(shorts))
+            sm4.metric("⏸ HOLD",          len(holds))
+            sm5.metric("Errors",           len(errors))
+
+            # ── Market Sentiment Gauge ────────────────────
+            bull_pct = len(longs) / max(len(results), 1) * 100
+            bear_pct = len(shorts) / max(len(results), 1) * 100
+            sentiment = "BULLISH 🟢" if bull_pct > 55 else "BEARISH 🔴" if bear_pct > 55 else "NEUTRAL ⚖️"
+            s_color   = "#00d4aa" if "BULL" in sentiment else "#ff4d6d" if "BEAR" in sentiment else "#f59e0b"
+            st.markdown(
+                f'<div style="background:{s_color}22;border:2px solid {s_color};border-radius:10px;'
+                f'padding:12px 20px;margin:10px 0;font-weight:700;font-size:1rem;">'
+                f'📊 Nifty 50 Market Sentiment: <span style="color:{s_color}">{sentiment}</span> '
+                f'&nbsp;·&nbsp; {bull_pct:.0f}% bullish &nbsp;·&nbsp; {bear_pct:.0f}% bearish</div>',
+                unsafe_allow_html=True
+            )
+
+            st.divider()
+
+            # ── TOP BUY RECOMMENDATIONS ────────────────────
+            if len(longs) > 0:
+                st.subheader("🟢 Top BUY Recommendations")
+                top_longs = longs.sort_values("confidence", ascending=False).head(n_top)
+
+                for _, row in top_longs.iterrows():
+                    risk    = abs(row["price"] - row["sl"])
+                    rr_str  = f"1:{row['rr']:.2f}"
+                    adx_str = f"ADX={row['adx']:.0f} {'(Strong)' if row['adx']>25 else '(Mod)' if row['adx']>18 else '(Weak)'}"
+                    st_str  = "🟢 Bull" if row["st_dir"] == 1 else "🔴 Bear"
+
+                    with st.expander(
+                        f"🟢 {row['name']} ({row['symbol']})  ·  ₹{row['price']:.2f}  "
+                        f"({row['chg_pct']:+.1f}%)  ·  Confidence: {row['confidence']:.0f}%  ·  R:R {rr_str}",
+                        expanded=(row['confidence'] >= 75)
+                    ):
+                        c1, c2, c3, c4, c5 = st.columns(5)
+                        c1.metric("Entry",        f"₹{row['price']:.2f}")
+                        c2.metric("Stop Loss",    f"₹{row['sl']:.2f}",
+                                   f"Risk: ₹{risk:.2f}")
+                        c3.metric("Target 1",     f"₹{row['t1']:.2f}",
+                                   f"+{abs(row['t1']-row['price']):.2f}")
+                        c4.metric("Target 2",     f"₹{row['t2']:.2f}",
+                                   f"+{abs(row['t2']-row['price']):.2f}")
+                        c5.metric("Target 3",     f"₹{row['t3']:.2f}",
+                                   f"+{abs(row['t3']-row['price']):.2f}")
+
+                        # Indicator pills
+                        st.markdown(
+                            f'<div style="display:flex;flex-wrap:wrap;gap:8px;margin:10px 0;">'
+                            f'<span class="badge badge-nt">RSI: {row["rsi"]:.0f}</span>'
+                            f'<span class="badge badge-nt">{adx_str}</span>'
+                            f'<span class="badge badge-{"up" if row["st_dir"]==1 else "dn"}">Supertrend: {st_str}</span>'
+                            f'<span class="badge badge-nt">ATR: {row["atr"]:.2f}</span>'
+                            f'<span class="badge badge-nt">Score: {row["score"]:.0f}/100</span>'
+                            f'<span class="badge badge-up">R:R = {rr_str}</span>'
+                            f'</div>',
+                            unsafe_allow_html=True
+                        )
+
+                        # Full entry reason breakdown
+                        st.markdown("**📋 Entry Reason:**")
+                        reasons_list = [r.strip() for r in row["reason"].split("|") if r.strip()]
+                        for r in reasons_list:
+                            st.markdown(f"&nbsp;&nbsp;→ {r}")
+
+                        st.markdown(
+                            f"**📌 Trade Plan:** Enter LONG at **₹{row['price']:.2f}** · "
+                            f"Place SL at **₹{row['sl']:.2f}** (below support/ATR buffer) · "
+                            f"Book 40% at T1 (**₹{row['t1']:.2f}**), 35% at T2 (**₹{row['t2']:.2f}**), "
+                            f"let 25% run to T3 (**₹{row['t3']:.2f}**) with trailing SL. "
+                            f"Move SL to break-even after T1 hit."
+                        )
+
+                st.divider()
+
+            # ── TOP SELL RECOMMENDATIONS ───────────────────
+            if len(shorts) > 0:
+                st.subheader("🔴 Top SELL / SHORT Recommendations")
+                top_shorts = shorts.sort_values("confidence", ascending=False).head(n_top)
+
+                for _, row in top_shorts.iterrows():
+                    risk   = abs(row["price"] - row["sl"])
+                    rr_str = f"1:{row['rr']:.2f}"
+
+                    with st.expander(
+                        f"🔴 {row['name']} ({row['symbol']})  ·  ₹{row['price']:.2f}  "
+                        f"({row['chg_pct']:+.1f}%)  ·  Confidence: {row['confidence']:.0f}%  ·  R:R {rr_str}",
+                        expanded=(row['confidence'] >= 75)
+                    ):
+                        c1, c2, c3, c4, c5 = st.columns(5)
+                        c1.metric("Entry",       f"₹{row['price']:.2f}")
+                        c2.metric("Stop Loss",   f"₹{row['sl']:.2f}",
+                                   f"Risk: ₹{risk:.2f}")
+                        c3.metric("Target 1",    f"₹{row['t1']:.2f}",
+                                   f"-{abs(row['t1']-row['price']):.2f}")
+                        c4.metric("Target 2",    f"₹{row['t2']:.2f}",
+                                   f"-{abs(row['t2']-row['price']):.2f}")
+                        c5.metric("Target 3",    f"₹{row['t3']:.2f}",
+                                   f"-{abs(row['t3']-row['price']):.2f}")
+
+                        st.markdown("**📋 Entry Reason:**")
+                        for r in [x.strip() for x in row["reason"].split("|") if x.strip()]:
+                            st.markdown(f"&nbsp;&nbsp;→ {r}")
+
+                        st.markdown(
+                            f"**📌 Trade Plan:** SHORT entry at **₹{row['price']:.2f}** · "
+                            f"SL at **₹{row['sl']:.2f}** · "
+                            f"Cover 40% at T1 (**₹{row['t1']:.2f}**), 35% at T2 (**₹{row['t2']:.2f}**), "
+                            f"25% runner to T3 (**₹{row['t3']:.2f}**) with trailing SL."
+                        )
+
+                st.divider()
+
+            # ── Full Ranked Table ──────────────────────────
+            st.subheader("📊 Full Scan Results — Ranked by Signal Strength")
+            df_display = df_res.copy()
+            df_display = df_display.sort_values("confidence", ascending=False)
+            df_display["signal_icon"] = df_display["signal"].map(
+                {"LONG": "🟢 LONG", "SHORT": "🔴 SHORT", "HOLD": "⏸ HOLD"})
+            df_display["chg_str"]   = df_display["chg_pct"].apply(lambda x: f"{x:+.2f}%")
+            df_display["entry_summary"] = df_display.apply(
+                lambda r: f"SL:{r['sl']:.1f} T1:{r['t1']:.1f} T2:{r['t2']:.1f}", axis=1)
+
+            tbl_cols = ["name","symbol","signal_icon","confidence","price","chg_str",
+                        "entry_summary","rsi","adx","rr"]
+            tbl_rename = {"name":"Stock","symbol":"Symbol","signal_icon":"Signal",
+                          "confidence":"Conf%","price":"Price","chg_str":"Chg%",
+                          "entry_summary":"SL / Targets","rsi":"RSI","adx":"ADX","rr":"R:R"}
+
+            st.dataframe(
+                df_display[tbl_cols].rename(columns=tbl_rename)
+                  .style.format({"Conf%": "{:.0f}", "Price": "{:.2f}", "RSI": "{:.1f}",
+                                  "ADX": "{:.1f}", "R:R": "{:.2f}"}),
+                use_container_width=True, height=420
+            )
+
+            if errors:
+                st.caption(f"⚠️ Could not fetch: {', '.join(errors)}")
+
+            # ── Export ────────────────────────────────────
+            csv_n = df_res.drop(columns=["reason"]).to_csv(index=False).encode("utf-8")
+            st.download_button("📥 Export Scan Results CSV", csv_n,
+                                f"nifty50_scan_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
+                                "text/csv")
+
+        else:
+            st.info("👆 Click **Scan All Nifty 50 Stocks** to start. Scans all 50 constituents and ranks them by signal strength.\n\n"
+                    "⏱ Takes ~2 minutes due to API rate limits (1.5s gap between requests).")
 
 
 if __name__ == "__main__":
