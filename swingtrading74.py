@@ -87,7 +87,10 @@ STRATEGY_LIST = [
     "Pivot Point Reversal",
     "Ichimoku Cloud",
     "Volume Breakout",
-    "Gap Trading Strategy"
+    "Gap Trading Strategy",
+    "Mean Reversion with Bollinger Bands",
+    "Momentum Breakout with ADX",
+    "Support Resistance Bounce"
 ]
 
 SL_TYPES = [
@@ -1901,6 +1904,190 @@ def check_gap_trading(df, idx, config, current_position):
     
     return None, None
 
+def check_mean_reversion_bollinger(df, idx, config, current_position):
+    """
+    Mean Reversion with Bollinger Bands Strategy
+    Trades oversold/overbought conditions when price touches Bollinger Bands
+    High probability in ranging markets
+    """
+    if current_position is not None:
+        return None, None
+    if idx < 2:
+        return None, None
+    
+    # Parameters
+    bb_period = config.get('bb_period', 20)
+    bb_std = config.get('bb_std', 2.0)
+    rsi_oversold = config.get('mr_rsi_oversold', 30)
+    rsi_overbought = config.get('mr_rsi_overbought', 70)
+    
+    # Get Bollinger Bands
+    if 'Bollinger_Upper' not in df.columns or 'Bollinger_Lower' not in df.columns:
+        return None, None
+    
+    current = df.iloc[idx]
+    previous = df.iloc[idx - 1]
+    
+    current_price = current['Close']
+    bb_upper = current.get('Bollinger_Upper')
+    bb_lower = current.get('Bollinger_Lower')
+    bb_middle = current.get('Bollinger_Middle')
+    rsi = current.get('RSI', 50)
+    
+    if pd.isna(bb_upper) or pd.isna(bb_lower) or pd.isna(bb_middle):
+        return None, None
+    
+    prev_price = previous['Close']
+    
+    # Buy Signal: Price touches lower band + RSI oversold + price bounces
+    if prev_price <= bb_lower and current_price > bb_lower and rsi < rsi_oversold:
+        # Additional confirmation: price moving back toward middle
+        if current_price > prev_price:
+            return 'BUY', current_price
+    
+    # Sell Signal: Price touches upper band + RSI overbought + price reverses
+    if prev_price >= bb_upper and current_price < bb_upper and rsi > rsi_overbought:
+        # Additional confirmation: price moving back toward middle
+        if current_price < prev_price:
+            return 'SELL', current_price
+    
+    return None, None
+
+def check_momentum_breakout_adx(df, idx, config, current_position):
+    """
+    Momentum Breakout with ADX Strategy
+    Combines strong momentum (ADX) with price breakout
+    High probability when trend strength confirmed
+    """
+    if current_position is not None:
+        return None, None
+    if idx < 50:
+        return None, None
+    
+    # Parameters
+    adx_threshold = config.get('momentum_adx_threshold', 25)
+    breakout_lookback = config.get('momentum_lookback', 20)
+    min_volume_ratio = config.get('momentum_volume_ratio', 1.5)
+    
+    current = df.iloc[idx]
+    current_price = current['Close']
+    adx = current.get('ADX', 0)
+    rsi = current.get('RSI', 50)
+    
+    if adx < adx_threshold:
+        return None, None  # Not enough trend strength
+    
+    # Calculate breakout levels from recent high/low
+    recent_data = df.iloc[idx - breakout_lookback:idx]
+    recent_high = recent_data['High'].max()
+    recent_low = recent_data['Low'].min()
+    
+    # Volume confirmation
+    current_volume = current['Volume']
+    avg_volume = recent_data['Volume'].mean()
+    
+    if current_volume < avg_volume * min_volume_ratio:
+        return None, None  # Volume not strong enough
+    
+    # Bullish Breakout: Price breaks above recent high + Strong ADX + RSI not extreme
+    if current_price > recent_high and rsi < 70:
+        # Confirm with previous candle close below the high
+        prev_close = df.iloc[idx - 1]['Close']
+        if prev_close <= recent_high:
+            return 'BUY', current_price
+    
+    # Bearish Breakdown: Price breaks below recent low + Strong ADX + RSI not extreme
+    if current_price < recent_low and rsi > 30:
+        # Confirm with previous candle close above the low
+        prev_close = df.iloc[idx - 1]['Close']
+        if prev_close >= recent_low:
+            return 'SELL', current_price
+    
+    return None, None
+
+def check_support_resistance_bounce(df, idx, config, current_position):
+    """
+    Support Resistance Bounce Strategy
+    Identifies key S/R levels and trades bounces with confirmation
+    High probability at well-tested levels
+    """
+    if current_position is not None:
+        return None, None
+    if idx < 100:
+        return None, None
+    
+    # Parameters
+    sr_lookback = config.get('sr_lookback', 100)
+    sr_tolerance = config.get('sr_tolerance', 0.002)  # 0.2% tolerance
+    min_touches = config.get('sr_min_touches', 3)  # Minimum times level was tested
+    
+    current = df.iloc[idx]
+    current_price = current['Close']
+    current_high = current['High']
+    current_low = current['Low']
+    
+    # Look back to find support and resistance levels
+    lookback_data = df.iloc[max(0, idx - sr_lookback):idx]
+    
+    # Find swing highs and lows (potential S/R levels)
+    swing_highs = []
+    swing_lows = []
+    
+    for i in range(2, len(lookback_data) - 2):
+        high = lookback_data.iloc[i]['High']
+        low = lookback_data.iloc[i]['Low']
+        
+        # Check if it's a swing high
+        if (high > lookback_data.iloc[i-1]['High'] and 
+            high > lookback_data.iloc[i-2]['High'] and
+            high > lookback_data.iloc[i+1]['High'] and 
+            high > lookback_data.iloc[i+2]['High']):
+            swing_highs.append(high)
+        
+        # Check if it's a swing low
+        if (low < lookback_data.iloc[i-1]['Low'] and 
+            low < lookback_data.iloc[i-2]['Low'] and
+            low < lookback_data.iloc[i+1]['Low'] and 
+            low < lookback_data.iloc[i+2]['Low']):
+            swing_lows.append(low)
+    
+    if len(swing_highs) < 2 or len(swing_lows) < 2:
+        return None, None
+    
+    # Cluster swing points to find key levels
+    def find_key_level(levels, current_level, tolerance):
+        """Find if current level matches a key S/R level"""
+        clusters = []
+        for level in levels:
+            if abs(level - current_level) / current_level <= tolerance:
+                clusters.append(level)
+        
+        if len(clusters) >= min_touches:
+            return sum(clusters) / len(clusters)  # Average of cluster
+        return None
+    
+    # Check for support bounce
+    support_level = find_key_level(swing_lows, current_low, sr_tolerance)
+    if support_level is not None:
+        # Price bounced off support
+        if current_low <= support_level * (1 + sr_tolerance) and current_price > current_low:
+            # Confirm with RSI
+            rsi = current.get('RSI', 50)
+            if rsi < 50:  # Not overbought
+                return 'BUY', current_price
+    
+    # Check for resistance rejection
+    resistance_level = find_key_level(swing_highs, current_high, sr_tolerance)
+    if resistance_level is not None:
+        # Price rejected at resistance
+        if current_high >= resistance_level * (1 - sr_tolerance) and current_price < current_high:
+            # Confirm with RSI
+            rsi = current.get('RSI', 50)
+            if rsi > 50:  # Not oversold
+                return 'SELL', current_price
+    
+    return None, None
+
 # ================================
 # HELPER FUNCTIONS
 # ================================
@@ -1981,6 +2168,9 @@ STRATEGY_FUNCTIONS = {
     'Ichimoku Cloud': check_ichimoku_cloud,
     'Volume Breakout': check_volume_breakout,
     'Gap Trading Strategy': check_gap_trading,
+    'Mean Reversion with Bollinger Bands': check_mean_reversion_bollinger,
+    'Momentum Breakout with ADX': check_momentum_breakout_adx,
+    'Support Resistance Bounce': check_support_resistance_bounce,
 }
 
 # ================================
@@ -3150,18 +3340,17 @@ def live_trading_iteration():
                 else:
                     add_log(f"✅ Entry Cooldown Complete: {int(time_since_exit)}s passed (cooldown was {cooldown_seconds}s)")
         
-        # Check if signal is different from last signal (prevent same-signal re-entry)
-        last_signal = st.session_state.get('last_signal_type')
-        
         # Check for entry signal
         add_log(f"🔍 Checking for entry signal using {strategy_name}...")
         signal, entry_price = strategy_func(df, idx, config, None)
         
         if signal:
-            # Prevent re-entry with same signal type immediately after exit
-            if last_signal == signal:
-                add_log(f"⛔ Same signal {signal} as last trade - waiting for new crossover/condition")
-                return
+            # Same-signal prevention (ONLY when cooldown is enabled)
+            if cooldown_enabled and cooldown_seconds > 0:
+                last_signal = st.session_state.get('last_signal_type')
+                if last_signal == signal:
+                    add_log(f"⛔ Same signal {signal} as last trade - waiting for signal change (part of cooldown protection)")
+                    return
             
             # Check if signal matches trade direction filter
             if not should_allow_trade_direction(signal, config):
@@ -3547,7 +3736,7 @@ def render_config_ui():
     if config['enable_entry_cooldown']:
         config['entry_cooldown_seconds'] = st.sidebar.number_input(
             "Cooldown Duration (seconds)",
-            min_value=5,
+            min_value=0,
             max_value=300,
             value=60,
             step=5,
@@ -3693,6 +3882,28 @@ def render_config_ui():
         config['gap_min_percent'] = st.sidebar.number_input("Minimum Gap (%)", min_value=0.1, max_value=2.0, value=0.5, step=0.1)
         config['gap_max_percent'] = st.sidebar.number_input("Maximum Gap (%)", min_value=1.0, max_value=10.0, value=3.0, step=0.5)
         st.sidebar.info("📉 Trades gap fills at market open. Best for first hour trading.")
+    
+    elif config['strategy'] == 'Mean Reversion with Bollinger Bands':
+        st.sidebar.markdown("**Mean Reversion Parameters**")
+        config['bb_period'] = st.sidebar.number_input("Bollinger Period", min_value=10, max_value=50, value=20)
+        config['bb_std'] = st.sidebar.number_input("Standard Deviations", min_value=1.5, max_value=3.0, value=2.0, step=0.5)
+        config['mr_rsi_oversold'] = st.sidebar.number_input("RSI Oversold", min_value=20, max_value=40, value=30)
+        config['mr_rsi_overbought'] = st.sidebar.number_input("RSI Overbought", min_value=60, max_value=80, value=70)
+        st.sidebar.info("📊 Trades price bounces at Bollinger Band extremes. Best for ranging markets with high win rate.")
+    
+    elif config['strategy'] == 'Momentum Breakout with ADX':
+        st.sidebar.markdown("**Momentum Breakout Parameters**")
+        config['momentum_adx_threshold'] = st.sidebar.number_input("ADX Threshold", min_value=20, max_value=40, value=25)
+        config['momentum_lookback'] = st.sidebar.number_input("Breakout Lookback", min_value=10, max_value=50, value=20)
+        config['momentum_volume_ratio'] = st.sidebar.number_input("Volume Ratio", min_value=1.0, max_value=3.0, value=1.5, step=0.5)
+        st.sidebar.info("🚀 Combines strong ADX trend with price breakout. High probability in trending markets.")
+    
+    elif config['strategy'] == 'Support Resistance Bounce':
+        st.sidebar.markdown("**Support/Resistance Parameters**")
+        config['sr_lookback'] = st.sidebar.number_input("Lookback Period", min_value=50, max_value=200, value=100)
+        config['sr_tolerance'] = st.sidebar.number_input("Level Tolerance (%)", min_value=0.1, max_value=1.0, value=0.2, step=0.1)
+        config['sr_min_touches'] = st.sidebar.number_input("Min Level Touches", min_value=2, max_value=5, value=3)
+        st.sidebar.info("🎯 Identifies key S/R levels and trades bounces. Very high probability at well-tested levels.")
     
     elif config['strategy'] == 'Custom Strategy':
         st.sidebar.markdown("**🛠️ Custom Strategy Builder (Multi-Indicator)**")
@@ -5036,7 +5247,7 @@ def render_live_trading_ui(config):
         df_history = pd.DataFrame(trade_history)
         
         # Format columns
-        for col in ['entry_price', 'exit_price', 'pnl', 'net_pnl', 'brokerage', 'sl_price', 'target_price']:
+        for col in ['entry_price', 'exit_price', 'highest_price', 'lowest_price', 'pnl', 'net_pnl', 'brokerage', 'sl_price', 'target_price']:
             if col in df_history.columns:
                 df_history[col] = df_history[col].apply(
                     lambda x: f"₹{x:.2f}" if pd.notna(x) else "—"
@@ -5067,7 +5278,7 @@ def render_live_trading_ui(config):
                 st.metric("Net P&L", f"₹{total_net_pnl:.2f}")
         
         # Display trade table
-        display_cols = ['entry_time', 'exit_time', 'ticker', 'type', 'entry_price', 'exit_price', 'pnl', 'net_pnl', 'exit_reason']
+        display_cols = ['entry_time', 'exit_time', 'ticker', 'type', 'entry_price', 'exit_price', 'highest_price', 'lowest_price', 'pnl', 'net_pnl', 'exit_reason']
         if 'duration' in df_history.columns:
             display_cols.insert(3, 'duration')
         
