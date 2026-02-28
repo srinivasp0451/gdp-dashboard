@@ -24,6 +24,10 @@ import pytz
 import traceback
 import plotly.graph_objects as go
 from scipy.signal import argrelextrema
+import warnings
+
+# Suppress SyntaxWarning from dhanhq library (invalid escape sequence in their code)
+warnings.filterwarnings('ignore', category=SyntaxWarning, module='dhanhq')
 
 # ================================
 # CONSTANTS & MAPPINGS
@@ -78,7 +82,12 @@ STRATEGY_LIST = [
     "SuperTrend AI",
     "VWAP + Volume Spike",
     "Bollinger Squeeze Breakout",
-    "Elliott Waves + Ratio Charts"
+    "Elliott Waves + Ratio Charts",
+    "Opening Range Breakout (ORB)",
+    "Pivot Point Reversal",
+    "Ichimoku Cloud",
+    "Volume Breakout",
+    "Gap Trading Strategy"
 ]
 
 SL_TYPES = [
@@ -1582,6 +1591,316 @@ def check_elliott_waves_ratio_charts(df, idx, config, current_position):
     
     return None, None
 
+def check_opening_range_breakout(df, idx, config, current_position):
+    """
+    Opening Range Breakout (ORB) Strategy
+    Trades breakouts from the opening range (first 15-30 minutes)
+    High probability strategy for intraday trading
+    """
+    if current_position is not None:
+        return None, None
+    if idx < 30:
+        return None, None
+    
+    # Parameters
+    orb_minutes = config.get('orb_minutes', 15)  # Opening range duration
+    breakout_buffer = config.get('orb_breakout_buffer', 0.1)  # % buffer to avoid fakeouts
+    
+    # Get time information
+    if 'Datetime' not in df.columns:
+        return None, None
+    
+    current_time = df.iloc[idx]['Datetime']
+    if not hasattr(current_time, 'time'):
+        return None, None
+    
+    # Check if we're past the opening range
+    market_open_time = current_time.replace(hour=9, minute=15, second=0, microsecond=0)
+    orb_end_time = market_open_time + timedelta(minutes=orb_minutes)
+    
+    if current_time < orb_end_time:
+        return None, None  # Still in opening range
+    
+    # Find the opening range candles
+    orb_mask = (df['Datetime'] >= market_open_time) & (df['Datetime'] <= orb_end_time)
+    orb_candles = df[orb_mask]
+    
+    if len(orb_candles) == 0:
+        return None, None
+    
+    # Calculate opening range high and low
+    orb_high = orb_candles['High'].max()
+    orb_low = orb_candles['Low'].min()
+    
+    # Add buffer to avoid fakeouts
+    breakout_high = orb_high * (1 + breakout_buffer / 100)
+    breakout_low = orb_low * (1 - breakout_buffer / 100)
+    
+    current_price = df.iloc[idx]['Close']
+    previous_price = df.iloc[idx - 1]['Close']
+    
+    # Bullish breakout: Price crosses above ORB high
+    if previous_price <= orb_high and current_price > breakout_high:
+        return 'BUY', current_price
+    
+    # Bearish breakout: Price crosses below ORB low
+    if previous_price >= orb_low and current_price < breakout_low:
+        return 'SELL', current_price
+    
+    return None, None
+
+def check_pivot_point_reversal(df, idx, config, current_position):
+    """
+    Pivot Point Reversal Strategy
+    Uses pivot points (R1, R2, S1, S2) for support/resistance trading
+    High probability at key levels
+    """
+    if current_position is not None:
+        return None, None
+    if idx < 2:
+        return None, None
+    
+    # Calculate pivot points from previous day
+    # For simplicity, use last 24 candles as "previous day"
+    lookback = config.get('pivot_lookback', 24)
+    
+    if idx < lookback:
+        return None, None
+    
+    prev_data = df.iloc[idx - lookback:idx]
+    
+    # Calculate pivot point
+    pivot_high = prev_data['High'].max()
+    pivot_low = prev_data['Low'].min()
+    pivot_close = prev_data['Close'].iloc[-1]
+    
+    pivot = (pivot_high + pivot_low + pivot_close) / 3
+    r1 = 2 * pivot - pivot_low
+    r2 = pivot + (pivot_high - pivot_low)
+    s1 = 2 * pivot - pivot_high
+    s2 = pivot - (pivot_high - pivot_low)
+    
+    current_price = df.iloc[idx]['Close']
+    previous_price = df.iloc[idx - 1]['Close']
+    
+    # RSI for confirmation
+    rsi = df.iloc[idx].get('RSI', 50)
+    
+    tolerance = current_price * 0.001  # 0.1% tolerance
+    
+    # Buy at support levels (S1 or S2) when oversold
+    if rsi < 40:
+        if abs(current_price - s1) < tolerance or abs(current_price - s2) < tolerance:
+            # Price bouncing off support
+            if current_price > previous_price:
+                return 'BUY', current_price
+    
+    # Sell at resistance levels (R1 or R2) when overbought
+    if rsi > 60:
+        if abs(current_price - r1) < tolerance or abs(current_price - r2) < tolerance:
+            # Price rejecting resistance
+            if current_price < previous_price:
+                return 'SELL', current_price
+    
+    return None, None
+
+def check_ichimoku_cloud(df, idx, config, current_position):
+    """
+    Ichimoku Cloud Strategy
+    Complete trend-following system with multiple components
+    Very reliable for trending markets
+    """
+    if current_position is not None:
+        return None, None
+    if idx < 52:
+        return None, None
+    
+    # Calculate Ichimoku components if not already present
+    if 'Ichimoku_Tenkan' not in df.columns:
+        # Tenkan-sen (Conversion Line): (9-period high + 9-period low)/2
+        high_9 = df['High'].rolling(window=9).max()
+        low_9 = df['Low'].rolling(window=9).min()
+        df['Ichimoku_Tenkan'] = (high_9 + low_9) / 2
+        
+        # Kijun-sen (Base Line): (26-period high + 26-period low)/2
+        high_26 = df['High'].rolling(window=26).max()
+        low_26 = df['Low'].rolling(window=26).min()
+        df['Ichimoku_Kijun'] = (high_26 + low_26) / 2
+        
+        # Senkou Span A (Leading Span A): (Tenkan + Kijun)/2, shifted 26 periods ahead
+        df['Ichimoku_SpanA'] = ((df['Ichimoku_Tenkan'] + df['Ichimoku_Kijun']) / 2).shift(26)
+        
+        # Senkou Span B (Leading Span B): (52-period high + 52-period low)/2, shifted 26 periods ahead
+        high_52 = df['High'].rolling(window=52).max()
+        low_52 = df['Low'].rolling(window=52).min()
+        df['Ichimoku_SpanB'] = ((high_52 + low_52) / 2).shift(26)
+        
+        # Chikou Span (Lagging Span): Current close shifted 26 periods back
+        df['Ichimoku_Chikou'] = df['Close'].shift(-26)
+    
+    current = df.iloc[idx]
+    current_price = current['Close']
+    
+    tenkan = current.get('Ichimoku_Tenkan')
+    kijun = current.get('Ichimoku_Kijun')
+    span_a = current.get('Ichimoku_SpanA')
+    span_b = current.get('Ichimoku_SpanB')
+    
+    if pd.isna(tenkan) or pd.isna(kijun) or pd.isna(span_a) or pd.isna(span_b):
+        return None, None
+    
+    # Determine cloud (Kumo)
+    cloud_top = max(span_a, span_b)
+    cloud_bottom = min(span_a, span_b)
+    
+    # Strong bullish signal: Tenkan crosses above Kijun + Price above cloud
+    previous = df.iloc[idx - 1]
+    prev_tenkan = previous.get('Ichimoku_Tenkan')
+    prev_kijun = previous.get('Ichimoku_Kijun')
+    
+    if not pd.isna(prev_tenkan) and not pd.isna(prev_kijun):
+        # TK Cross (Tenkan-Kijun crossover)
+        if prev_tenkan <= prev_kijun and tenkan > kijun:
+            # Additional confirmation: Price above cloud
+            if current_price > cloud_top:
+                return 'BUY', current_price
+        
+        # Bearish TK Cross
+        if prev_tenkan >= prev_kijun and tenkan < kijun:
+            # Additional confirmation: Price below cloud
+            if current_price < cloud_bottom:
+                return 'SELL', current_price
+    
+    return None, None
+
+def check_volume_breakout(df, idx, config, current_position):
+    """
+    Volume Breakout Strategy
+    Trades when price breaks out with high volume confirmation
+    High probability when volume confirms the move
+    """
+    if current_position is not None:
+        return None, None
+    if idx < 20:
+        return None, None
+    
+    # Parameters
+    volume_multiplier = config.get('volume_multiplier', 2.0)  # Volume must be 2x average
+    price_change_threshold = config.get('volume_price_threshold', 0.5)  # 0.5% price change
+    
+    # Calculate volume moving average
+    if 'Volume_MA' not in df.columns:
+        df['Volume_MA'] = df['Volume'].rolling(window=20).mean()
+    
+    current = df.iloc[idx]
+    current_price = current['Close']
+    current_volume = current['Volume']
+    volume_ma = current.get('Volume_MA', 0)
+    
+    if volume_ma == 0 or pd.isna(volume_ma):
+        return None, None
+    
+    # Check for high volume
+    if current_volume < volume_ma * volume_multiplier:
+        return None, None  # Volume not high enough
+    
+    # Calculate price change
+    open_price = current['Open']
+    price_change_pct = abs(current_price - open_price) / open_price * 100
+    
+    if price_change_pct < price_change_threshold:
+        return None, None  # Price change not significant
+    
+    # RSI for entry confirmation
+    rsi = current.get('RSI', 50)
+    
+    # Bullish volume breakout: High volume + price up + not overbought
+    if current_price > open_price and rsi < 70:
+        # Confirm with previous candle trend
+        prev_close = df.iloc[idx - 1]['Close']
+        if current_price > prev_close:
+            return 'BUY', current_price
+    
+    # Bearish volume breakout: High volume + price down + not oversold
+    if current_price < open_price and rsi > 30:
+        # Confirm with previous candle trend
+        prev_close = df.iloc[idx - 1]['Close']
+        if current_price < prev_close:
+            return 'SELL', current_price
+    
+    return None, None
+
+def check_gap_trading(df, idx, config, current_position):
+    """
+    Gap Trading Strategy
+    Trades gaps at market open (gap up or gap down)
+    High probability for gap fill trades
+    """
+    if current_position is not None:
+        return None, None
+    if idx < 2:
+        return None, None
+    
+    # Parameters
+    min_gap_percent = config.get('gap_min_percent', 0.5)  # Minimum 0.5% gap
+    max_gap_percent = config.get('gap_max_percent', 3.0)  # Maximum 3% gap (avoid runaway gaps)
+    
+    # Get current and previous day's data
+    current = df.iloc[idx]
+    previous = df.iloc[idx - 1]
+    
+    current_open = current['Open']
+    prev_close = previous['Close']
+    current_price = current['Close']
+    
+    # Calculate gap
+    gap_percent = abs(current_open - prev_close) / prev_close * 100
+    
+    # Check if gap is within acceptable range
+    if gap_percent < min_gap_percent or gap_percent > max_gap_percent:
+        return None, None
+    
+    # Check time - only trade gaps in first hour
+    if 'Datetime' in df.columns:
+        current_time = current['Datetime']
+        if hasattr(current_time, 'time'):
+            # Check if we're in first hour (9:15 to 10:15)
+            market_open = current_time.replace(hour=9, minute=15, second=0, microsecond=0)
+            first_hour_end = market_open + timedelta(hours=1)
+            
+            if current_time > first_hour_end:
+                return None, None  # Too late for gap trading
+    
+    # Gap Up (current_open > prev_close)
+    if current_open > prev_close:
+        gap_up_percent = (current_open - prev_close) / prev_close * 100
+        
+        if gap_up_percent >= min_gap_percent and gap_up_percent <= max_gap_percent:
+            # Trade gap fill: SHORT when price starts to fall back
+            if current_price < current_open:
+                # Confirm with volume
+                current_volume = current['Volume']
+                if idx >= 20:
+                    volume_ma = df.iloc[idx - 20:idx]['Volume'].mean()
+                    if current_volume > volume_ma:
+                        return 'SELL', current_price
+    
+    # Gap Down (current_open < prev_close)
+    elif current_open < prev_close:
+        gap_down_percent = (prev_close - current_open) / prev_close * 100
+        
+        if gap_down_percent >= min_gap_percent and gap_down_percent <= max_gap_percent:
+            # Trade gap fill: LONG when price starts to rise back
+            if current_price > current_open:
+                # Confirm with volume
+                current_volume = current['Volume']
+                if idx >= 20:
+                    volume_ma = df.iloc[idx - 20:idx]['Volume'].mean()
+                    if current_volume > volume_ma:
+                        return 'BUY', current_price
+    
+    return None, None
+
 # ================================
 # HELPER FUNCTIONS
 # ================================
@@ -1657,6 +1976,11 @@ STRATEGY_FUNCTIONS = {
     'VWAP + Volume Spike': check_vwap_volume_spike,
     'Bollinger Squeeze Breakout': check_bollinger_squeeze_breakout,
     'Elliott Waves + Ratio Charts': check_elliott_waves_ratio_charts,
+    'Opening Range Breakout (ORB)': check_opening_range_breakout,
+    'Pivot Point Reversal': check_pivot_point_reversal,
+    'Ichimoku Cloud': check_ichimoku_cloud,
+    'Volume Breakout': check_volume_breakout,
+    'Gap Trading Strategy': check_gap_trading,
 }
 
 # ================================
@@ -2808,15 +3132,23 @@ def live_trading_iteration():
             add_log(f"⏰ Outside trade window - no new entries allowed")
             return
         
-        # Check cooldown period after previous exit (prevent immediate re-entry)
-        last_exit_time = st.session_state.get('last_exit_time')
-        cooldown_seconds = config.get('entry_cooldown_seconds', 60)  # Default 60 seconds
+        # Check entry cooldown if enabled
+        cooldown_enabled = config.get('enable_entry_cooldown', False)
+        cooldown_seconds = config.get('entry_cooldown_seconds', 0)
         
-        if last_exit_time is not None:
-            time_since_exit = (datetime.now(pytz.timezone('Asia/Kolkata')) - last_exit_time).total_seconds()
-            if time_since_exit < cooldown_seconds:
-                add_log(f"⏳ Cooldown active: {int(cooldown_seconds - time_since_exit)}s remaining (prevents duplicate entries)")
-                return
+        if cooldown_enabled and cooldown_seconds > 0:
+            last_exit_time = st.session_state.get('last_exit_time')
+            
+            if last_exit_time is not None:
+                current_time = datetime.now(pytz.timezone('Asia/Kolkata'))
+                time_since_exit = (current_time - last_exit_time).total_seconds()
+                
+                if time_since_exit < cooldown_seconds:
+                    remaining = int(cooldown_seconds - time_since_exit)
+                    add_log(f"⏳ Entry Cooldown Active: {remaining}s remaining (waiting period after last exit)")
+                    return
+                else:
+                    add_log(f"✅ Entry Cooldown Complete: {int(time_since_exit)}s passed (cooldown was {cooldown_seconds}s)")
         
         # Check if signal is different from last signal (prevent same-signal re-entry)
         last_signal = st.session_state.get('last_signal_type')
@@ -3125,7 +3457,7 @@ def render_config_ui():
     
     # Custom Ticker Input
     if config['asset'] == 'Custom Ticker':
-        config['custom_ticker'] = st.sidebar.text_input("Enter Ticker Symbol", value="AAPL", help="e.g., AAPL, TSLA, MSFT")
+        config['custom_ticker'] = st.sidebar.text_input("Enter Ticker Symbol", value="KAYNES.NS", help="e.g., KAYNES.NS, RELIANCE.NS, TCS.NS")
     
     # Timeframe
     config['interval'] = st.sidebar.selectbox("Interval", list(INTERVAL_MAPPING.keys()), index=0)  # Default to 1 minute
@@ -3206,14 +3538,24 @@ def render_config_ui():
     )
     
     # ── Entry Cooldown (Live Trading) ────────────────────────────────────────
-    config['entry_cooldown_seconds'] = st.sidebar.number_input(
-        "⏱️ Entry Cooldown (seconds)",
-        min_value=0,
-        value=60,
-        step=5,
+    config['enable_entry_cooldown'] = st.sidebar.checkbox(
+        "⏱️ Enable Entry Cooldown",
+        value=False,
         help="Prevents immediate re-entry after exit (Live Trading only). Useful to avoid duplicate orders on same signal."
     )
-    st.sidebar.caption(f"Cooldown: {config['entry_cooldown_seconds']}s wait after exit before new entry")
+    
+    if config['enable_entry_cooldown']:
+        config['entry_cooldown_seconds'] = st.sidebar.number_input(
+            "Cooldown Duration (seconds)",
+            min_value=5,
+            max_value=300,
+            value=60,
+            step=5,
+            help="Number of seconds to wait after exit before allowing new entry"
+        )
+        st.sidebar.caption(f"⏱️ Cooldown: {config['entry_cooldown_seconds']}s wait after exit before new entry")
+    else:
+        config['entry_cooldown_seconds'] = 0  # Disabled
     
     # ── Enhanced Live Trading Mode ────────────────────────────────────────────
     config['enhanced_live_trading'] = st.sidebar.checkbox(
@@ -3325,6 +3667,32 @@ def render_config_ui():
         st.sidebar.markdown("**Elliott Waves Parameters**")
         config['elliott_wave_lookback'] = st.sidebar.number_input("Wave Lookback Period", min_value=20, value=50)
         st.sidebar.info("🌊 Detects extrema points and identifies 5-wave patterns using argrelextrema")
+    
+    elif config['strategy'] == 'Opening Range Breakout (ORB)':
+        st.sidebar.markdown("**Opening Range Breakout Parameters**")
+        config['orb_minutes'] = st.sidebar.number_input("Opening Range Duration (minutes)", min_value=5, max_value=60, value=15)
+        config['orb_breakout_buffer'] = st.sidebar.number_input("Breakout Buffer (%)", min_value=0.0, max_value=1.0, value=0.1, step=0.05)
+        st.sidebar.info("📊 Trades breakouts from first N minutes of market open. High probability intraday strategy.")
+    
+    elif config['strategy'] == 'Pivot Point Reversal':
+        st.sidebar.markdown("**Pivot Point Parameters**")
+        config['pivot_lookback'] = st.sidebar.number_input("Lookback Period", min_value=12, max_value=48, value=24)
+        st.sidebar.info("🎯 Uses pivot points for support/resistance levels. Best for ranging markets.")
+    
+    elif config['strategy'] == 'Ichimoku Cloud':
+        st.sidebar.info("☁️ Complete Ichimoku system with Tenkan/Kijun crossovers and cloud analysis. No additional parameters needed. Strong trend-following strategy.")
+    
+    elif config['strategy'] == 'Volume Breakout':
+        st.sidebar.markdown("**Volume Breakout Parameters**")
+        config['volume_multiplier'] = st.sidebar.number_input("Volume Multiplier", min_value=1.5, max_value=5.0, value=2.0, step=0.5)
+        config['volume_price_threshold'] = st.sidebar.number_input("Min Price Change (%)", min_value=0.1, max_value=2.0, value=0.5, step=0.1)
+        st.sidebar.info("📈 Trades when price moves with high volume confirmation. Best for momentum trades.")
+    
+    elif config['strategy'] == 'Gap Trading Strategy':
+        st.sidebar.markdown("**Gap Trading Parameters**")
+        config['gap_min_percent'] = st.sidebar.number_input("Minimum Gap (%)", min_value=0.1, max_value=2.0, value=0.5, step=0.1)
+        config['gap_max_percent'] = st.sidebar.number_input("Maximum Gap (%)", min_value=1.0, max_value=10.0, value=3.0, step=0.5)
+        st.sidebar.info("📉 Trades gap fills at market open. Best for first hour trading.")
     
     elif config['strategy'] == 'Custom Strategy':
         st.sidebar.markdown("**🛠️ Custom Strategy Builder (Multi-Indicator)**")
@@ -3612,7 +3980,7 @@ def render_config_ui():
     
     if config['dhan_enabled']:
         config['dhan_client_id'] = st.sidebar.text_input("Client ID", value="1104779876")
-        config['dhan_access_token'] = st.sidebar.text_input("Access Token", type="password", value="eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzUxMiJ9.eyJpc3MiOiJkaGFuIiwicGFydG5lcklkIjoiIiwiZXhwIjoxNzcyMDc3MjAyLCJpYXQiOjE3NzE5OTA4MDIsInRva2VuQ29uc3VtZXJUeXBlIjoiU0VMRiIsIndlYmhvb2tVcmwiOiIiLCJkaGFuQ2xpZW50SWQiOiIxMTA0Nzc5ODc2In0.3loxHr6Qu_46ZI5mEML_wss6aJJD9iZuAW5dMS-zfkvyVAey8LYvQTR-XoF6xhwkD4PGEaRrGiLb2svXPM9plw")
+        config['dhan_access_token'] = st.sidebar.text_input("Access Token", type="password", value="eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzUxMiJ9.eyJpc3MiOiJkaGFuIiwicGFydG5lcklkIjoiIiwiZXhwIjoxNzcxMTQzMjM5LCJpYXQiOjE3NzEwNTY4MzksInRva2VuQ29uc3VtZXJUeXBlIjoiU0VMRiIsIndlYmhvb2tVcmwiOiIiLCJkaGFuQ2xpZW50SWQiOiIxMTA0Nzc5ODc2In0.qP8kVXDQt-sFa6LWJqd1MRTPESHCCPCqHzEnjsFI2WVbNdywKHXgAKHxVpuH6tP_AJTdqowv9nbqf-2NcGibbQ")
         
         config['dhan_is_options'] = st.sidebar.checkbox("Is Options", value=True)
         
@@ -3631,7 +3999,7 @@ def render_config_ui():
                 ["Intraday", "Delivery (CNC)"],
                 help="Intraday = MIS/INTRA  |  Delivery = CNC positional"
             )
-            config['dhan_security_id'] = st.sidebar.text_input("Security ID", value="1234")
+            config['dhan_security_id'] = st.sidebar.text_input("Security ID", value="12092")
             config['dhan_exchange']    = st.sidebar.selectbox("Exchange", ["NSE", "BSE"], index=0)
             config['dhan_quantity']    = st.sidebar.number_input("Quantity", min_value=1, value=10)
             if config['dhan_trading_type'] == 'Delivery (CNC)':
@@ -3650,14 +4018,14 @@ def render_config_ui():
             config['dhan_entry_order_type'] = st.sidebar.selectbox(
                 "Entry Order Type",
                 ["Market Order", "Limit Order"],
-                index=0,
+                index=1,  # Default to Limit Order
                 help="Entry: Market = Immediate | Limit = At specified price"
             )
         with col_exit:
             config['dhan_exit_order_type'] = st.sidebar.selectbox(
                 "Exit Order Type",
                 ["Market Order", "Limit Order"],
-                index=0,
+                index=1,  # Default to Limit Order
                 help="Exit: Market = Immediate | Limit = At specified price"
             )
         
