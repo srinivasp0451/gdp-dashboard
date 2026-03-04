@@ -26,7 +26,6 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from scipy.stats import norm
 from scipy.optimize import brentq
-import datetime
 
 try:
     import yfinance as yf
@@ -493,6 +492,45 @@ def _nse_opstra(sym):
             except: pass
         return df,spot,exps,None
     except Exception as e: return None,0.0,[],f"Opstra: {e}"
+
+# ═══════════════════════════════════════════════════════════════════════
+# JSON FILE READER — reads data saved by nse_fetcher.py (PRIMARY source)
+# ═══════════════════════════════════════════════════════════════════════
+import datetime as _dt
+
+NSE_DATA_FILE = "nse_data.json"
+
+def read_json_data(symbol=None):
+    """
+    Read chain data saved by nse_fetcher.py.
+    Returns (df, spot, expiries, timestamp_str, age_seconds) or None if not found/stale.
+    """
+    try:
+        from pathlib import Path
+        p = Path(NSE_DATA_FILE)
+        if not p.exists():
+            return None
+        with open(p) as f:
+            import json as _json
+            d = _json.load(f)
+        # Check if this file is for the right symbol
+        if symbol and d.get("symbol","").upper() != symbol.upper():
+            return None
+        # Check staleness — don't use data older than 10 minutes
+        ts = _dt.datetime.fromisoformat(d["timestamp"])
+        age = (_dt.datetime.now() - ts).total_seconds()
+        if age > 600:
+            return None  # stale
+        rows = d.get("rows", [])
+        if not rows:
+            return None
+        df = pd.DataFrame(rows)
+        spot = float(d.get("spot", 0))
+        expiries = d.get("expiries", [])
+        time_str = d.get("time_str", "")
+        return df, spot, expiries, time_str, int(age)
+    except Exception as e:
+        return None
 
 @st.cache_data(ttl=90, show_spinner=False)
 def fetch_nse_chain(symbol):
@@ -1251,7 +1289,17 @@ def main():
                 with st.expander("CSV debug"): [st.text(l) for l in csv_dbg]
 
         if df_exp.empty:
-            ph.info("📡 Fetching NSE live (5 sources)…")
+            # ── Priority 1: nse_fetcher.py JSON file (fastest, most reliable) ──
+            jd = read_json_data(fetch_sym)
+            if jd is not None:
+                df_j, spot_j, exps_j, ts_j, age_j = jd
+                if not df_j.empty and spot_j > 0:
+                    df_exp=df_j; spot=spot_j; expiries=exps_j; data_src="nse_fetcher"
+                    ph.success(f"✅ **nse_fetcher.py** data | Spot ₹{spot:,.2f} | Updated {ts_j} ({age_j}s ago)")
+
+        if df_exp.empty:
+            # ── Priority 2: Direct live API sources ──
+            ph.info("📡 Fetching NSE live (5 sources)… this can take 15–20s")
             with st.spinner("Contacting NSE…"):
                 df_raw,spot_raw,exps_raw,src,errs=fetch_nse_chain(fetch_sym)
             fetch_errors=errs
@@ -1262,7 +1310,11 @@ def main():
                 spot=get_spot(yf_sym); has_opts=False
                 ph.warning(f"⚠️ All live sources failed. Spot ₹{spot:,.2f} from yFinance only.")
                 for e in fetch_errors: st.markdown(f"- {e}")
-                st.info("**Fix:** `pip install nsepython` → restart. Or upload NSE CSV from sidebar.")
+                with st.expander("🚀 Best fix: run nse_fetcher.py in a separate terminal"):
+                    st.code("python nse_fetcher.py --symbol " + fetch_sym + " --interval 60", language="bash")
+                    st.markdown("""**This opens a real Chrome browser, authenticates with NSE, and saves data every 60s.**
+The dashboard reads it instantly — no more authentication failures.""")
+                st.info("Or: `pip install nsepython` | Or: upload NSE CSV from sidebar")
 
         if not df_exp.empty and expiries:
             with st.sidebar:
@@ -1287,6 +1339,16 @@ def main():
                 with st.expander("Debug"): [st.text(l) for l in p_dbg]
 
         if df_exp.empty:
+            # ── Priority 1: nse_fetcher.py JSON file ──
+            jd = read_json_data(fetch_sym)
+            if jd is not None:
+                df_j, spot_j, exps_j, ts_j, age_j = jd
+                if not df_j.empty and spot_j > 0:
+                    df_exp=df_j; spot=spot_j; expiries=exps_j; data_src="nse_fetcher"
+                    ph.success(f"✅ **nse_fetcher.py** BSE data | Spot ₹{spot:,.2f} | Updated {ts_j} ({age_j}s ago)")
+
+        if df_exp.empty:
+            # ── Priority 2: BSE live API ──
             ph.info("📡 Trying BSE live API…")
             with st.spinner("Contacting BSE…"):
                 df_raw,spot_raw,exps_raw,src,errs=fetch_bse_chain(fetch_sym)
@@ -1302,7 +1364,9 @@ def main():
                 spot=get_spot(yf_sym); has_opts=False
                 ph.warning(f"⚠️ BSE live failed. Spot ₹{spot:,.2f} from yFinance.")
                 for e in errs: st.markdown(f"- {e}")
-                st.info("**Use BSE paste:** Go to bseindia.com → Derivatives, select all table data, paste in sidebar.")
+                with st.expander("🚀 Best fix: run nse_fetcher.py --bse in a separate terminal"):
+                    st.code("python nse_fetcher.py --symbol SENSEX --bse --interval 60", language="bash")
+                st.info("Or: paste BSE data from sidebar (select all table data on bseindia.com)")
 
     elif has_opts:
         ph.info("📡 Fetching from yFinance…")
