@@ -4212,7 +4212,7 @@ def render_config_ui():
             )
             config['dhan_security_id'] = st.sidebar.text_input("Security ID", value="12092")
             config['dhan_exchange']    = st.sidebar.selectbox("Exchange", ["NSE", "BSE"], index=0)
-            config['dhan_quantity']    = st.sidebar.number_input("Quantity", min_value=1, value=10)
+            config['dhan_quantity']    = st.sidebar.number_input("Quantity", min_value=1, value=1)
             if config['dhan_trading_type'] == 'Delivery (CNC)':
                 st.sidebar.info("Order Type: MARKET | Product: CNC")
             else:
