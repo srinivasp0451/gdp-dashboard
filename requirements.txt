@@ -29,3 +29,6 @@ easyocr==1.7.0
 opencv-python==4.9.0.80
 nsepython
 selenium
+playwright
+webdriver-manager
+
