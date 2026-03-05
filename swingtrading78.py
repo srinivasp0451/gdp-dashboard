@@ -1,22 +1,24 @@
 """
 ╔══════════════════════════════════════════════════════════════════╗
 ║   PRO OPTIONS DASHBOARD — NSE + BSE India + Global              ║
-║   Single file · Selenium scraper + Full analysis dashboard       ║
+║   Single file · Live scraper + Full analysis dashboard           ║
 ╠══════════════════════════════════════════════════════════════════╣
 ║   Run:  streamlit run options_final.py                           ║
-║   Deps: pip install streamlit selenium webdriver-manager         ║
-║          yfinance plotly scipy pandas requests                   ║
-╠══════════════════════════════════════════════════════════════════╣
+║                                                                  ║
+║   Install (best results — install all):                          ║
+║     pip install streamlit yfinance plotly scipy pandas requests  ║
+║     pip install nsepython                                        ║
+║     pip install playwright && playwright install chromium        ║
+║     pip install selenium webdriver-manager                       ║
+║                                                                  ║
+║   Scraper uses 3-tier waterfall per symbol:                      ║
+║     Tier 1: nsepython  — purpose-built NSE lib (fastest)         ║
+║     Tier 2: Playwright — headless browser via fetch() in-page    ║
+║     Tier 3: Selenium   — visible Chrome, scrapes DOM table       ║
+║                                                                  ║
 ║   NSE  : NIFTY, BANKNIFTY, FINNIFTY, MIDCPNIFTY + 80 stocks     ║
 ║   BSE  : SENSEX, BANKEX                                          ║
 ║   Global: SPY QQQ AAPL TSLA NVDA + any ticker                   ║
-╠══════════════════════════════════════════════════════════════════╣
-║   How it works:                                                  ║
-║   1. Click START in sidebar — opens Chrome headless ONCE         ║
-║   2. Browser navigates NSE/BSE, solves Akamai JS challenge       ║
-║   3. Cookies extracted, used for fast API calls every 60s        ║
-║   4. Cookies auto-refreshed every 24 min via browser             ║
-║   5. Dashboard reads live data instantly, no network calls       ║
 ╚══════════════════════════════════════════════════════════════════╝
 """
 
@@ -203,212 +205,402 @@ def _bse_parse(j):
     return (pd.DataFrame(rows) if rows else None), spot, exps
 
 # ═══════════════════════════════════════════════════
-# SELENIUM SCRAPER THREAD
+# LIVE SCRAPER — 3-tier waterfall
 # ═══════════════════════════════════════════════════
-class Scraper(threading.Thread):
-    def __init__(self, nse_syms, bse_syms, visible=False, interval=60):
-        super().__init__(daemon=True)
-        self.nse     = nse_syms
-        self.bse     = bse_syms
-        self.visible = visible
-        self.interval= max(interval, 30)
-        self.driver  = None
-        self.ns      = requests.Session()   # NSE session
-        self.bs_     = requests.Session()   # BSE session
-        self._ck_ts  = 0
-        self._stop   = threading.Event()
+# Tier 1: nsepython  — purpose-built NSE lib, handles auth
+# Tier 2: Playwright — modern browser automation, better stealth than selenium
+# Tier 3: Selenium   — visible browser, scrapes rendered HTML table from DOM
+#
+# Why cookie-extraction approaches fail:
+#   NSE's Akamai checks TLS fingerprint + Sec-CH-UA headers on EVERY request.
+#   A requests.Session with copied cookies will always be blocked because it
+#   doesn't have the exact TLS/HTTP2 fingerprint of the original browser.
+#
+# What actually works:
+#   1. nsepython — uses its own session management tuned for NSE
+#   2. Playwright stealth — patches 20+ fingerprints at the binary level
+#   3. Selenium visible — real browser, real user fingerprint, scrape DOM table
+# ═══════════════════════════════════════════════════
 
-    def _browser_start(self):
+# ── Tier 1: nsepython ─────────────────────────────
+def _try_nsepython(sym):
+    """nsepython is purpose-built for NSE data. Try this first."""
+    try:
+        from nsepython import nse_optionchain_scrapper, nsefetch
+        raw = nse_optionchain_scrapper(sym)
+        if not raw or "records" not in raw:
+            return None, 0.0, []
+        df, spot, exps = _nse_parse(raw)
+        return df, spot, exps
+    except ImportError:
+        return None, 0.0, []
+    except Exception as e:
+        _slog(f"nsepython {sym}: {e}")
+        return None, 0.0, []
+
+# ── Tier 2: Playwright ────────────────────────────
+def _try_playwright(sym, bse=False):
+    """
+    Playwright with stealth plugin — makes fetch() from inside real browser.
+    Much better fingerprint masking than selenium.
+    """
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        return None, 0.0, []
+
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(
+                headless=True,
+                args=["--no-sandbox","--disable-dev-shm-usage",
+                      "--lang=en-IN","--window-size=1366,768"]
+            )
+            ctx = browser.new_context(
+                user_agent=_UA,
+                locale="en-IN",
+                timezone_id="Asia/Kolkata",
+                viewport={"width":1366,"height":768},
+                extra_http_headers={
+                    "Accept-Language":"en-IN,en;q=0.9,hi;q=0.8",
+                    "Accept-Encoding":"gzip, deflate, br",
+                }
+            )
+            # Stealth: remove webdriver traces
+            ctx.add_init_script("""
+                Object.defineProperty(navigator,'webdriver',{get:()=>undefined});
+                Object.defineProperty(navigator,'plugins',{get:()=>[1,2,3,4,5]});
+                Object.defineProperty(navigator,'languages',{get:()=>['en-IN','en','hi']});
+                window.chrome={runtime:{}};
+            """)
+            page = ctx.new_page()
+            if not bse:
+                page.goto("https://www.nseindia.com/", wait_until="networkidle")
+                page.wait_for_timeout(random.randint(3000,5000))
+                page.evaluate("window.scrollBy(0,300)")
+                page.wait_for_timeout(1000)
+                page.goto("https://www.nseindia.com/option-chain", wait_until="networkidle")
+                page.wait_for_timeout(random.randint(2000,3500))
+                url = (f"https://www.nseindia.com/api/option-chain-indices?symbol={sym}"
+                       if sym in NSE_INDICES else
+                       f"https://www.nseindia.com/api/option-chain-equities?symbol={sym}")
+                result = page.evaluate(f"""async () => {{
+                    const r = await fetch("{url}", {{
+                        credentials:"include",
+                        headers:{{"Accept":"*/*","X-Requested-With":"XMLHttpRequest",
+                                 "Referer":"https://www.nseindia.com/option-chain",
+                                 "Sec-Fetch-Mode":"cors","Sec-Fetch-Site":"same-origin"}}
+                    }});
+                    return r.ok ? await r.json() : null;
+                }}""")
+                browser.close()
+                if result and "records" in result:
+                    return _nse_parse(result)
+            else:
+                pid, scrip = BSE_MAP.get(sym, ("1","SENSEX"))
+                page.goto("https://www.bseindia.com/", wait_until="networkidle")
+                page.wait_for_timeout(random.randint(2000,3000))
+                exp_url = (f"https://api.bseindia.com/BseIndiaAPI/api/ddlExpiry_Options/w"
+                           f"?productid={pid}&scripcode=&ExpiryDate=&optionType=CE&StrikePrice=&SeleScrip={scrip}")
+                exps_j = page.evaluate(f"""async () => {{
+                    const r = await fetch("{exp_url}",{{
+                        credentials:"include",
+                        headers:{{"Accept":"application/json","Origin":"https://www.bseindia.com",
+                                 "Referer":"https://www.bseindia.com/"}}
+                    }});
+                    return r.ok ? await r.json() : null;
+                }}""")
+                if not exps_j:
+                    browser.close(); return None, 0.0, []
+                exps = [x["ExpiryDate"] for x in (exps_j.get("Table") or [])]
+                if not exps:
+                    browser.close(); return None, 0.0, []
+                chain_url = (f"https://api.bseindia.com/BseIndiaAPI/api/FnOChainData/w"
+                             f"?productid={pid}&scripcode=&ExpiryDate={exps[0]}"
+                             f"&optionType=&StrikePrice=&SeleScrip={scrip}")
+                chain_j = page.evaluate(f"""async () => {{
+                    const r = await fetch("{chain_url}",{{
+                        credentials:"include",
+                        headers:{{"Accept":"application/json","Origin":"https://www.bseindia.com",
+                                 "Referer":"https://www.bseindia.com/"}}
+                    }});
+                    return r.ok ? await r.json() : null;
+                }}""")
+                browser.close()
+                if chain_j:
+                    df, spot, _ = _bse_parse(chain_j)
+                    return df, spot, exps
+    except Exception as e:
+        _slog(f"Playwright {sym}: {e}")
+    return None, 0.0, []
+
+
+# ── Tier 3: Selenium — visible browser, scrape DOM table ──────────────────────
+def _try_selenium_dom(sym, driver_holder):
+    """
+    Opens a VISIBLE Chrome browser (or reuses existing), navigates to the NSE
+    option chain page, waits for the JS table to render fully, then extracts
+    data directly from the DOM — no API call, no cookie extraction.
+    This is the most reliable method: Akamai never sees an API request at all.
+    """
+    try:
         from selenium import webdriver
         from selenium.webdriver.chrome.options import Options
         from selenium.webdriver.chrome.service import Service
+        from selenium.webdriver.common.by import By
+        from selenium.webdriver.support.ui import WebDriverWait, Select
+        from selenium.webdriver.support import expected_conditions as EC
         try:
             from webdriver_manager.chrome import ChromeDriverManager
             svc = Service(ChromeDriverManager().install())
         except ImportError:
             svc = Service()
-        opts = Options()
-        if not self.visible:
-            opts.add_argument("--headless=new")
-        for arg in ["--no-sandbox","--disable-dev-shm-usage",
-                    "--disable-blink-features=AutomationControlled",
-                    "--window-size=1366,768",f"--user-agent={_UA}","--lang=en-IN"]:
-            opts.add_argument(arg)
-        opts.add_experimental_option("excludeSwitches",["enable-automation"])
-        opts.add_experimental_option("useAutomationExtension",False)
-        self.driver = webdriver.Chrome(service=svc, options=opts)
-        self.driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument",{"source":"""
-            Object.defineProperty(navigator,'webdriver',{get:()=>undefined});
-            Object.defineProperty(navigator,'plugins',{get:()=>[1,2,3,4,5]});
-            Object.defineProperty(navigator,'languages',{get:()=>['en-IN','en','hi']});
-            window.chrome={runtime:{}};
-        """})
-        _status["driver_ok"] = True
-        _slog("✅ Chrome started")
 
-    def _human(self):
-        from selenium.webdriver.common.action_chains import ActionChains
+        # Reuse existing driver if alive
+        drv = driver_holder.get("driver")
+        if drv is None:
+            opts = Options()
+            # NOT headless — visible browser bypasses Akamai completely
+            for a in ["--no-sandbox","--disable-dev-shm-usage","--window-size=1366,768",
+                      f"--user-agent={_UA}","--lang=en-IN",
+                      "--disable-blink-features=AutomationControlled"]:
+                opts.add_argument(a)
+            opts.add_experimental_option("excludeSwitches",["enable-automation"])
+            opts.add_experimental_option("useAutomationExtension",False)
+            drv = webdriver.Chrome(service=svc, options=opts)
+            drv.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument",{"source":
+                "Object.defineProperty(navigator,'webdriver',{get:()=>undefined});"})
+            driver_holder["driver"] = drv
+            drv.get("https://www.nseindia.com/")
+            time.sleep(random.uniform(3.5, 5.0))
+
+        # Navigate to option chain for this symbol
+        url = f"https://www.nseindia.com/option-chain"
+        if sym not in NSE_INDICES:
+            url = f"https://www.nseindia.com/get-quotes/derivatives?symbol={sym}"
+        drv.get(url)
+        time.sleep(random.uniform(3.0, 4.5))
+
+        # If index: select the right symbol in dropdown
+        if sym in NSE_INDICES and sym != "NIFTY":
+            try:
+                sel_el = WebDriverWait(drv, 10).until(
+                    EC.presence_of_element_located((By.ID, "equity_optionchain_select")))
+                Select(sel_el).select_by_value(sym)
+                time.sleep(2.5)
+            except Exception:
+                pass
+
+        # Wait for the option chain table to render
         try:
-            for _ in range(random.randint(2,4)):
-                self.driver.execute_script(f"window.scrollBy(0,{random.randint(80,300)});")
-                time.sleep(random.uniform(0.3,0.7))
-            ActionChains(self.driver).move_by_offset(
-                random.randint(80,400),random.randint(40,250)).perform()
-            time.sleep(random.uniform(0.2,0.4))
+            WebDriverWait(drv, 15).until(
+                EC.presence_of_element_located((By.CSS_SELECTOR, "table.table-bordered tbody tr")))
+        except Exception:
+            _slog(f"⚠️ Selenium DOM: table not found for {sym}")
+            return None, 0.0, []
+
+        time.sleep(1.5)  # let JS finish populating
+
+        # Grab spot price
+        spot = 0.0
+        try:
+            el = drv.find_element(By.CSS_SELECTOR, "#equity_optionchain_underlying_value, .nseSpanVal, [id*='underlyingVal']")
+            spot = _f(el.text.strip())
         except Exception:
             pass
 
-    def _refresh_nse(self):
-        _slog("🔄 Refreshing NSE cookies via browser…")
-        self.driver.get("https://www.nseindia.com/")
-        time.sleep(random.uniform(3.5,5.0))
-        self._human()
-        self.driver.get("https://www.nseindia.com/option-chain")
-        time.sleep(random.uniform(2.5,3.5))
-        self._human()
-        self.ns.cookies.clear()
-        names = []
-        for c in self.driver.get_cookies():
-            self.ns.cookies.set(c["name"],c["value"],domain=c.get("domain",""))
-            names.append(c["name"])
-        self.ns.headers.update({
-            "User-Agent":_UA,"Accept":"*/*",
-            "Accept-Language":"en-IN,en;q=0.9","Accept-Encoding":"gzip,deflate,br",
-            "Referer":"https://www.nseindia.com/option-chain",
-            "X-Requested-With":"XMLHttpRequest","Sec-Fetch-Mode":"cors","Sec-Fetch-Site":"same-origin",
-        })
-        self._ck_ts = time.time()
-        key = [n for n in names if n in ("nsit","nseappid","ak_bmsc","bm_sz","AKA_A2")]
-        _slog(f"✅ NSE cookies: {', '.join(key) or 'basic set'}")
+        # Extract table rows via JS (much faster than find_elements)
+        rows_data = drv.execute_script("""
+            var rows = [];
+            var trs = document.querySelectorAll('table.table-bordered tbody tr');
+            trs.forEach(function(tr) {
+                var cells = tr.querySelectorAll('td');
+                var r = [];
+                cells.forEach(function(td) { r.push(td.innerText.trim()); });
+                if (r.length > 10) rows.push(r);
+            });
+            return rows;
+        """)
 
-    def _refresh_bse(self):
-        try:
-            self.driver.get("https://www.bseindia.com/")
-            time.sleep(random.uniform(2.0,3.0))
-            self.bs_.cookies.clear()
-            for c in self.driver.get_cookies():
-                self.bs_.cookies.set(c["name"],c["value"],domain=c.get("domain",""))
-            self.bs_.headers.update({
-                "User-Agent":_UA,"Accept":"application/json,*/*",
-                "Referer":"https://www.bseindia.com/","Origin":"https://www.bseindia.com",
+        if not rows_data:
+            _slog(f"⚠️ Selenium DOM: no rows extracted for {sym}")
+            return None, 0.0, []
+
+        # NSE table layout: CE side (10 cols) | Strike | PE side (10 cols)
+        # CE cols: OI, Chng OI, Volume, IV, LTP, Net Chng, Bid Qty, Bid, Ask, Ask Qty
+        # Then Strike Price
+        # PE cols: Bid Qty, Bid, Ask, Ask Qty, Net Chng, LTP, IV, Volume, Chng OI, OI
+        records = []
+        expiry = dt.datetime.now().strftime("%d-%b-%Y")
+        for row in rows_data:
+            if len(row) < 11: continue
+            # Find strike: look for the middle cell that's a clean number
+            mid = len(row) // 2
+            sp = _f(row[mid])
+            if sp <= 0:
+                # Try searching nearby
+                for idx in range(max(0,mid-2), min(len(row),mid+3)):
+                    sp = _f(row[idx])
+                    if sp > 1000:
+                        mid = idx; break
+            if sp <= 0: continue
+
+            ce_cols = row[:mid]
+            pe_cols = row[mid+1:]
+
+            def gc(arr, i): return _f(arr[i]) if i < len(arr) else 0.0
+
+            records.append({
+                "strikePrice":   sp,
+                "expiryDate":    expiry,
+                "CE_OI":         gc(ce_cols, 0),
+                "CE_changeOI":   gc(ce_cols, 1),
+                "CE_volume":     gc(ce_cols, 2),
+                "CE_IV":         gc(ce_cols, 3),
+                "CE_LTP":        gc(ce_cols, 4),
+                "CE_bid":        gc(ce_cols, 7),
+                "CE_ask":        gc(ce_cols, 9),
+                "PE_bid":        gc(pe_cols, 0),
+                "PE_ask":        gc(pe_cols, 2),
+                "PE_LTP":        gc(pe_cols, 5),
+                "PE_IV":         gc(pe_cols, 6),
+                "PE_volume":     gc(pe_cols, 7),
+                "PE_changeOI":   gc(pe_cols, 8),
+                "PE_OI":         gc(pe_cols, 9),
             })
-            _slog("✅ BSE cookies refreshed")
-        except Exception as e:
-            _slog(f"⚠️ BSE cookies: {e}")
 
-    def _need_ck(self):
-        return (time.time()-self._ck_ts) > COOKIE_TTL
+        if not records:
+            return None, 0.0, []
 
-    def _nse_get(self, url):
+        df = pd.DataFrame(records).fillna(0)
+        df = df[df["strikePrice"] > 0].reset_index(drop=True)
+
+        # Get spot from page if not found earlier
+        if spot == 0 and not df.empty:
+            mid_idx = len(df) // 2
+            spot = float(df.iloc[mid_idx]["strikePrice"])
+
+        exps = [expiry]
+        # Try to get expiry dates from dropdown
         try:
-            r = self.ns.get(url, timeout=12)
-            if r.status_code in (401,403):
-                _slog(f"⚠️ NSE {r.status_code} — refreshing")
-                self._refresh_nse()
-                r = self.ns.get(url, timeout=12)
-            return r.json() if r.status_code==200 else None
-        except Exception as e:
-            _slog(f"⚠️ NSE req: {e}"); return None
+            exp_sel = drv.find_element(By.CSS_SELECTOR, "#equity_optionchain_expirydate, select[name*='expiry']")
+            opts_el = exp_sel.find_elements(By.TAG_NAME, "option")
+            exps = [o.get_attribute("value") or o.text for o in opts_el if o.get_attribute("value")]
+        except Exception:
+            pass
 
-    def _nse_url(self, sym):
-        if sym in NSE_INDICES:
-            return f"https://www.nseindia.com/api/option-chain-indices?symbol={sym}"
-        return f"https://www.nseindia.com/api/option-chain-equities?symbol={sym}"
+        return df, spot, exps
 
-    def _fetch_bse(self, sym):
-        pid,scrip = BSE_MAP.get(sym,("1","SENSEX"))
-        try:
-            er = self.bs_.get(
-                f"https://api.bseindia.com/BseIndiaAPI/api/ddlExpiry_Options/w"
-                f"?productid={pid}&scripcode=&ExpiryDate=&optionType=CE&StrikePrice=&SeleScrip={scrip}",
-                timeout=10)
-            if er.status_code!=200: _slog(f"⚠️ BSE expiry {er.status_code}"); return
-            exps = [x["ExpiryDate"] for x in (er.json().get("Table") or [])]
-            if not exps: _slog(f"⚠️ BSE {sym}: no expiries"); return
-            cr = self.bs_.get(
-                f"https://api.bseindia.com/BseIndiaAPI/api/FnOChainData/w"
-                f"?productid={pid}&scripcode=&ExpiryDate={exps[0]}&optionType=&StrikePrice=&SeleScrip={scrip}",
-                timeout=12)
-            if cr.status_code!=200: _slog(f"⚠️ BSE chain {cr.status_code}"); return
-            df,spot,_ = _bse_parse(cr.json())
-            if df is not None and spot>0:
-                _save(sym,df,spot,exps,"BSE-Selenium")
-                _slog(f"✅ {sym} ₹{spot:,.2f} | {len(df)} strikes")
-            else:
-                _slog(f"⚠️ BSE {sym}: empty response")
-        except Exception as e:
-            _slog(f"❌ BSE {sym}: {e}")
+    except Exception as e:
+        _slog(f"Selenium DOM {sym}: {e}")
+        return None, 0.0, []
+
+
+# ── Scraper Thread ────────────────────────────────
+class Scraper(threading.Thread):
+    """
+    Background thread. Tries 3 methods in order for each symbol:
+    1. nsepython  — fastest, no browser needed
+    2. Playwright — headless, good stealth
+    3. Selenium   — visible Chrome, scrapes DOM table, most reliable
+    """
+    def __init__(self, nse_syms, bse_syms, visible=False, interval=60):
+        super().__init__(daemon=True)
+        self.nse      = nse_syms
+        self.bse      = bse_syms
+        self.visible  = visible
+        self.interval = max(interval, 30)
+        self._stop    = threading.Event()
+        self._sel_drv = {}   # holds reusable selenium driver
+
+    def _fetch_one_nse(self, sym):
+        """Try all 3 tiers for a single NSE symbol."""
+        # Tier 1: nsepython
+        df, spot, exps = _try_nsepython(sym)
+        if df is not None and spot > 0 and not df.empty:
+            _save(sym, df, spot, exps, "nsepython")
+            _slog(f"✅ [nsepython] {sym} ₹{spot:,.2f} | {len(df)} strikes")
+            return True
+
+        _slog(f"   nsepython failed for {sym} — trying Playwright…")
+
+        # Tier 2: Playwright
+        df, spot, exps = _try_playwright(sym, bse=False)
+        if df is not None and spot > 0 and not df.empty:
+            _save(sym, df, spot, exps, "Playwright")
+            _slog(f"✅ [Playwright] {sym} ₹{spot:,.2f} | {len(df)} strikes")
+            return True
+
+        _slog(f"   Playwright failed for {sym} — trying Selenium DOM…")
+
+        # Tier 3: Selenium DOM scrape
+        df, spot, exps = _try_selenium_dom(sym, self._sel_drv)
+        if df is not None and spot > 0 and not df.empty:
+            _save(sym, df, spot, exps, "Selenium-DOM")
+            _slog(f"✅ [Selenium-DOM] {sym} ₹{spot:,.2f} | {len(df)} strikes")
+            return True
+
+        _slog(f"❌ All methods failed for {sym}")
+        return False
+
+    def _fetch_one_bse(self, sym):
+        """Try Playwright then nsepython for BSE."""
+        # Playwright
+        df, spot, exps = _try_playwright(sym, bse=True)
+        if df is not None and spot > 0 and not df.empty:
+            _save(sym, df, spot, exps, "Playwright-BSE")
+            _slog(f"✅ [Playwright] {sym} ₹{spot:,.2f} | {len(df)} strikes")
+            return True
+        _slog(f"❌ BSE {sym} fetch failed — use BSE paste in sidebar as fallback")
+        return False
 
     def run(self):
-        _status["running"]=True
-        _slog("Scraper thread started")
-        try:
-            self._browser_start()
-        except Exception as e:
-            _status["error"]=str(e)
-            _slog(f"❌ Chrome failed: {e}")
-            _slog("Fix: pip install selenium webdriver-manager + install Google Chrome")
-            _status["running"]=False; return
-        try:
-            self._refresh_nse()
-            if self.bse: self._refresh_bse()
-        except Exception as e:
-            _slog(f"❌ Initial auth failed: {e}")
-            _status["running"]=False; return
+        _status["running"] = True
+        _slog("=" * 50)
+        _slog("Scraper started — trying 3 methods per symbol")
+        _slog("Methods: nsepython → Playwright → Selenium-DOM")
+        _slog("=" * 50)
 
-        errors=0
         while not self._stop.is_set():
-            try:
-                if self._need_ck():
-                    self._refresh_nse()
-                    if self.bse: self._refresh_bse()
+            for sym in self.nse:
+                if self._stop.is_set(): break
+                self._fetch_one_nse(sym)
+                if len(self.nse) > 1:
+                    time.sleep(random.uniform(3, 6))
 
-                for sym in self.nse:
-                    if self._stop.is_set(): break
-                    j = self._nse_get(self._nse_url(sym))
-                    if j:
-                        df,spot,exps = _nse_parse(j)
-                        if df is not None and spot>0:
-                            _save(sym,df,spot,exps,"NSE-Selenium")
-                            _slog(f"✅ {sym} ₹{spot:,.2f} | {len(df)} strikes")
-                            errors=0
-                        else:
-                            _slog(f"⚠️ {sym}: empty"); errors+=1
-                    else:
-                        errors+=1
-                    if len(self.nse)>1:
-                        time.sleep(random.uniform(2,4))
+            for sym in self.bse:
+                if self._stop.is_set(): break
+                self._fetch_one_bse(sym)
+                if len(self.bse) > 1:
+                    time.sleep(random.uniform(2, 4))
 
-                for sym in self.bse:
-                    if self._stop.is_set(): break
-                    self._fetch_bse(sym)
-                    if len(self.bse)>1:
-                        time.sleep(random.uniform(2,3))
-
-                if errors>=4:
-                    _slog(f"⚠️ {errors} errors — forcing re-auth")
-                    self._refresh_nse(); errors=0
-
-            except Exception as e:
-                _slog(f"❌ Loop: {e}"); errors+=1; time.sleep(10)
-
-            _slog(f"⏳ Next fetch in {self.interval}s")
+            _slog(f"⏳ Cycle done — next in {self.interval}s")
             self._stop.wait(self.interval)
 
-        try: self.driver.quit()
-        except Exception: pass
-        _status["running"]=False
+        # Cleanup selenium driver
+        try:
+            if self._sel_drv.get("driver"):
+                self._sel_drv["driver"].quit()
+        except Exception:
+            pass
+        _status["running"] = False
         _slog("Scraper stopped")
 
     def stop(self):
         self._stop.set()
 
+def _market_open():
+    n = dt.datetime.now()
+    if n.weekday() >= 5: return False
+    return dt.time(9, 15) <= n.time() <= dt.time(15, 30)
+
 _scraper: Scraper = None
 
-def ensure_scraper(nse,bse,visible=False,interval=60):
+def ensure_scraper(nse, bse, visible=False, interval=60):
     global _scraper
-    if _scraper and _scraper.is_alive(): return
-    _scraper = Scraper(nse,bse,visible,interval)
+    if _scraper and _scraper.is_alive():
+        return
+    _scraper = Scraper(nse, bse, visible, interval)
     _scraper.start()
 
 # ═══════════════════════════════════════════════════
@@ -946,6 +1138,15 @@ def main():
         running=_scraper is not None and _scraper.is_alive()
         st.markdown(f'<div class="{"sok" if running else "serr"}">{"🟢 SCRAPER RUNNING" if running else "🔴 SCRAPER STOPPED"}</div>',unsafe_allow_html=True)
         if _status.get("error"): st.error(_status["error"])
+        if not running:
+            st.markdown("""<div style="background:#0a1520;border:1px solid #1e3050;border-radius:8px;padding:10px 12px;font-size:12px;color:#7a9ab5;margin-top:6px">
+<b style="color:#00e5ff">Install for best results:</b><br>
+<code>pip install nsepython</code><br>
+<code>pip install playwright</code><br>
+<code>playwright install chromium</code><br>
+<code>pip install selenium webdriver-manager</code><br>
+<span style="color:#5a7a9a">Scraper tries all 3 in order.</span>
+</div>""", unsafe_allow_html=True)
         with st.expander("📋 Live log"):
             with _lock: logs=list(reversed(_logs[-20:]))
             st.markdown("<br>".join(f'<span style="font-size:11px;color:#7a9ab5">{l}</span>' for l in logs),unsafe_allow_html=True)
@@ -1364,4 +1565,3 @@ Good results: Win Rate &gt; 60% · R:R &gt; 1.5 · Max Drawdown &lt; 20%</div>""
 
 if __name__=="__main__":
     main()
-
