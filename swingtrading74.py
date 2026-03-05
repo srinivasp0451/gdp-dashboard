@@ -4191,7 +4191,7 @@ def render_config_ui():
     
     if config['dhan_enabled']:
         config['dhan_client_id'] = st.sidebar.text_input("Client ID", value="1104779876")
-        config['dhan_access_token'] = st.sidebar.text_input("Access Token", type="password", value="eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzUxMiJ9.eyJpc3MiOiJkaGFuIiwicGFydG5lcklkIjoiIiwiZXhwIjoxNzcyNjgzMDY1LCJpYXQiOjE3NzI1OTY2NjUsInRva2VuQ29uc3VtZXJUeXBlIjoiU0VMRiIsIndlYmhvb2tVcmwiOiIiLCJkaGFuQ2xpZW50SWQiOiIxMTA0Nzc5ODc2In0.w-WwqMDPEoICIhMRPHd87zx8hth3vHGliCXQTW9Gzpax3wYqw-opKgTACVlYexkIuEYV5aKxs3X2wqXecZeCnw")
+        config['dhan_access_token'] = st.sidebar.text_input("Access Token", type="password", value="eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzUxMiJ9.eyJpc3MiOiJkaGFuIiwicGFydG5lcklkIjoiIiwiZXhwIjoxNzcyNzY4OTU4LCJpYXQiOjE3NzI2ODI1NTgsInRva2VuQ29uc3VtZXJUeXBlIjoiU0VMRiIsIndlYmhvb2tVcmwiOiIiLCJkaGFuQ2xpZW50SWQiOiIxMTA0Nzc5ODc2In0.tc4RYV8daLjGe1AaLYjr-sGhJ7AnnkdbB7ZTMp1WSl6qJIM_T05eq-6E-BA3YTdQZBh3KEV-M6uj6Hf_JA3ehA")
         
         config['dhan_is_options'] = st.sidebar.checkbox("Is Options", value=True)
         
