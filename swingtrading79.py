@@ -203,6 +203,9 @@ STRATEGIES = [
     "38. ATR Breakout with Trend Filter",
     "39. Elliott Wave Simplified + Confluence",
     "40. 5-Factor High-Probability (90%+ Aim)",
+    # ── Always-On / Manual ─────────────────────────────────────
+    "41. Simple Buy  (Always Long — every bar)",
+    "42. Simple Sell (Always Short — every bar)",
 ]
 
 SL_TYPES = [
@@ -246,11 +249,19 @@ def init_session():
         "live_open_pos"    : None,
         "live_running"     : False,
         "live_last_signal" : None,
+        "last_trade_time"  : 0.0,
         "trade_history"    : [],
         "opt_results"      : None,
         "data_cache"       : {},
         "last_fetch"       : 0.0,
         "live_chart_data"  : pd.DataFrame(),
+        # Sidebar injection from optimizer
+        "inject_sl_type"   : None,
+        "inject_tgt_type"  : None,
+        "inject_sl_pts"    : None,
+        "inject_tgt_pts"   : None,
+        "inject_atr_sl"    : None,
+        "inject_rr"        : None,
     }
     for k, v in keys.items():
         if k not in st.session_state:
@@ -825,6 +836,14 @@ def compute_signals(df: pd.DataFrame, strategy: str, p: dict = None) -> pd.DataF
             # Only trigger on STATE CHANGE (new signal, not continuation)
             df["signal"] = np.where(bull&~bull.shift().fillna(True),1,
                            np.where(bear&~bear.shift().fillna(True),-1,0))
+
+        elif num == 41:
+            # Simple Buy — BUY signal on first bar, held until exit rule triggers
+            df.iloc[1, df.columns.get_loc("signal")] = 1
+
+        elif num == 42:
+            # Simple Sell — SELL signal on first bar, held until exit rule triggers
+            df.iloc[1, df.columns.get_loc("signal")] = -1
 
     except Exception as e:
         st.warning(f"Signal error [{strategy}]: {e}")
@@ -1916,6 +1935,16 @@ with tab_live:
     refresh_s  = lc3.number_input("Refresh interval (sec)", min_value=1.0, max_value=300.0,
                                    value=1.5, step=0.5, format="%.1f", key="live_refresh")
 
+    # ── Cooloff + Squareoff options ───────────────────────────────
+    lo1, lo2, lo3 = st.columns(3)
+    cooloff_s   = lo1.number_input("Cooloff between trades (sec)", min_value=0, max_value=3600,
+                                    value=12, step=1, key="live_cooloff",
+                                    help="Min seconds to wait after closing a trade before opening another.")
+    squareoff_eod = lo2.checkbox("Auto Square-off at Time Window End", value=True, key="live_sq_eod",
+                                  help="If time filter is ON, force-close any open position when time window ends.")
+    sq_before_new = lo3.checkbox("Square-off Before Placing New Order", value=False, key="live_sq_new",
+                                  help="Close any open position before opening a new signal trade.")
+
     if stop_live:
         st.session_state.live_running = False
         st.info("Live scanning stopped.")
@@ -1940,6 +1969,35 @@ with tab_live:
                 in_time = t_start <= now_ist.time() <= t_end
                 if not in_time:
                     st.warning(f"⏰ Outside trading hours ({t_start}–{t_end} IST). Waiting…")
+                    # ── Auto square-off at EOD if option enabled ──────────────
+                    if squareoff_eod and st.session_state.live_open_pos is not None:
+                        pos = st.session_state.live_open_pos
+                        d   = pos["direction"]
+                        sq_price = pos.get("current_price", pos["entry_price"])
+                        pnl_sq   = (sq_price - pos["entry_price"]) * d * qty
+                        pts_sq   = (sq_price - pos["entry_price"]) * d
+                        st.session_state.live_trades.append({
+                            "entry_time"      : pos["entry_time"],
+                            "exit_time"       : now_ist,
+                            "direction"       : "LONG" if d==1 else "SHORT",
+                            "entry_type"      : pos.get("entry_type","Signal"),
+                            "entry_logic"     : pos.get("entry_logic",""),
+                            "entry_price"     : pos["entry_price"],
+                            "exit_price"      : round(sq_price,4),
+                            "sl_level"        : round(pos.get("sl_initial", pos["sl"]),4),
+                            "final_sl"        : round(pos["sl"],4),
+                            "target_level"    : round(pos["target"],4),
+                            "points_captured" : round(pts_sq,4),
+                            "points_risked"   : round(abs(pos["entry_price"]-pos.get("sl_initial",pos["sl"])),4),
+                            "qty"             : qty,
+                            "pnl"             : round(pnl_sq,2),
+                            "result"          : "WIN" if pnl_sq>0 else ("LOSS" if pnl_sq<0 else "BE"),
+                            "exit_reason"     : "EOD Square-off",
+                            "exit_logic"      : f"Automatic square-off at {now_ist.strftime('%H:%M:%S IST')} — trading window ended.",
+                        })
+                        st.session_state.live_open_pos = None
+                        st.session_state.last_trade_time = time.time()
+                        st.warning(f"🔔 EOD Square-off: Position closed at {sq_price:.2f}. P&L: {pnl_sq:+.2f}")
 
             if in_time:
                 with st.spinner("Fetching latest data…"):
@@ -2008,6 +2066,7 @@ with tab_live:
                                 "exit_logic"      : _exit_logic_text(reason, pos, ep_exit, d),
                             })
                             st.session_state.live_open_pos = None
+                            st.session_state.last_trade_time = time.time()
                             pnl_color = "win" if pnl>0 else "loss"
                             st.markdown(f'<div class="signal-{"long" if pnl>0 else "short"}">'
                                         f'⚡ Position closed — {reason} | P&L: '
@@ -2018,22 +2077,54 @@ with tab_live:
 
                     # Open new position on confirmed signal
                     if last_sig != 0 and st.session_state.live_open_pos is None:
-                        entry_price_live = last_o   # current bar open = "next bar after signal"
-                        sl_  = calc_sl(df_sig, -1, entry_price_live, last_sig, sl_type, SL_PARAMS, atr_v)
-                        tg_  = calc_target(df_sig, -1, entry_price_live, last_sig, tgt_type, TGT_PARAMS, atr_v)
-                        entry_logic_live = _entry_logic_text(strategy, last_sig, df_sig, sig_bar_idx, atr_v, entry_price_live)
-                        st.session_state.live_open_pos = {
-                            "direction"     : last_sig,
-                            "entry_price"   : entry_price_live,
-                            "entry_time"    : last_t,
-                            "sl"            : sl_,
-                            "sl_initial"    : sl_,
-                            "target"        : tg_,
-                            "current_price" : last_c,
-                            "unrealized_pnl": round((last_c - entry_price_live) * last_sig * qty, 2),
-                            "entry_type"    : "Signal-Bar+1 Open (Live)",
-                            "entry_logic"   : entry_logic_live,
-                        }
+                        # ── Cooloff check ─────────────────────────────────────
+                        secs_since_last = time.time() - st.session_state.get("last_trade_time", 0)
+                        in_cooloff = secs_since_last < float(cooloff_s)
+                        if in_cooloff:
+                            remaining = int(float(cooloff_s) - secs_since_last)
+                            st.warning(f"⏳ Cooloff active — {remaining}s remaining before next trade allowed.")
+                        else:
+                            entry_price_live = last_o   # current bar open = "next bar after signal"
+                            sl_  = calc_sl(df_sig, -1, entry_price_live, last_sig, sl_type, SL_PARAMS, atr_v)
+                            tg_  = calc_target(df_sig, -1, entry_price_live, last_sig, tgt_type, TGT_PARAMS, atr_v)
+                            entry_logic_live = _entry_logic_text(strategy, last_sig, df_sig, sig_bar_idx, atr_v, entry_price_live)
+                            st.session_state.live_open_pos = {
+                                "direction"     : last_sig,
+                                "entry_price"   : entry_price_live,
+                                "entry_time"    : last_t,
+                                "sl"            : sl_,
+                                "sl_initial"    : sl_,
+                                "target"        : tg_,
+                                "current_price" : last_c,
+                                "unrealized_pnl": round((last_c - entry_price_live) * last_sig * qty, 2),
+                                "entry_type"    : "Signal-Bar+1 Open (Live)",
+                                "entry_logic"   : entry_logic_live,
+                            }
+
+                    # ── Square-off before new order if option is enabled ──────
+                    elif last_sig != 0 and st.session_state.live_open_pos is not None and sq_before_new:
+                        pos = st.session_state.live_open_pos
+                        if pos["direction"] != last_sig:   # only if direction changed
+                            d = pos["direction"]
+                            sq_p = last_c
+                            pnl_sq = (sq_p - pos["entry_price"]) * d * qty
+                            pts_sq = (sq_p - pos["entry_price"]) * d
+                            st.session_state.live_trades.append({
+                                "entry_time": pos["entry_time"], "exit_time": last_t,
+                                "direction": "LONG" if d==1 else "SHORT",
+                                "entry_type": pos.get("entry_type","Signal"),
+                                "entry_logic": pos.get("entry_logic",""),
+                                "entry_price": pos["entry_price"], "exit_price": round(sq_p,4),
+                                "sl_level": round(pos.get("sl_initial",pos["sl"]),4),
+                                "final_sl": round(pos["sl"],4), "target_level": round(pos["target"],4),
+                                "points_captured": round(pts_sq,4),
+                                "points_risked": round(abs(pos["entry_price"]-pos.get("sl_initial",pos["sl"])),4),
+                                "qty": qty, "pnl": round(pnl_sq,2),
+                                "result": "WIN" if pnl_sq>0 else ("LOSS" if pnl_sq<0 else "BE"),
+                                "exit_reason": "Square-off Before New", "exit_logic": f"Squared off at {sq_p:.2f} before new signal.",
+                            })
+                            st.session_state.live_open_pos = None
+                            st.session_state.last_trade_time = time.time()
 
                     # ── Signal display ─────────────────────────────────────
                     st.markdown("#### Latest Signal")
@@ -2463,8 +2554,10 @@ with tab_opt:
     with oc3:
         opt_target_wr = st.number_input("Target Win Rate (%)", min_value=0.0, max_value=99.0,
                                          value=60.0, step=1.0, format="%.1f", key="opt_wr")
-        opt_min_trades = st.number_input("Min Trades Threshold", 5, 500, 10, key="opt_min_tr")
-        opt_max_combos = st.number_input("Max Combinations to Test", 50, 2000, 400, key="opt_max_c")
+        opt_min_trades = st.number_input("Min Trades Threshold", min_value=1, max_value=500,
+                                          value=10, step=1, key="opt_min_tr")
+        opt_max_combos = st.number_input("Max Combinations to Test", min_value=50, max_value=5000,
+                                          value=400, step=50, key="opt_max_c")
 
     run_opt = st.button("🚀 Run Full Auto-Optimization", key="btn_opt")
 
@@ -2742,7 +2835,29 @@ with tab_opt:
 | **R:R Ratio** | {best['R:R Ratio']} |
 | **Strategy Params** | `{best['Strategy Params']}` |
         """)
-        st.info("💡 Apply these exact settings in the sidebar, then go to Live Trading or Backtesting with full confidence.")
+
+        if st.button("⚡ Apply Best Config to Sidebar (Use for Live/Backtest)", key="btn_apply_best"):
+            st.session_state["sb_sl_type"]  = best["SL Type"]
+            st.session_state["sb_tgt_type"] = best["Target Type"]
+            st.session_state["sb_sl_pts"]   = int(best["SL Points"])
+            st.session_state["sb_tgt_pts"]  = int(best["Target Points"])
+            st.session_state["sb_atr_sl"]   = float(best["ATR SL Mult"])
+            st.session_state["sb_rr_sl"]    = float(best["R:R Ratio"])
+            st.session_state["sb_rr_tgt"]   = float(best["R:R Ratio"])
+            # Apply strategy params if available
+            try:
+                import ast as _ast
+                p_dict = _ast.literal_eval(best["Strategy Params"])
+                if "fast" in p_dict:
+                    st.session_state["sb_ema_f"]  = int(p_dict["fast"])
+                if "slow" in p_dict:
+                    st.session_state["sb_ema_sl"] = int(p_dict["slow"])
+            except:
+                pass
+            st.success("✅ Best config applied to sidebar! Switch to Backtesting or Live Trading tab.")
+            st.rerun()
+
+        st.info("💡 Click the button above to auto-fill sidebar settings with the best found configuration.")
 
         # Tabs for results exploration
         res_tabs = st.tabs(["Top 30 Results","Win Rate Distribution","Parameter Heatmap","Export"])
@@ -2832,159 +2947,325 @@ with tab_opt:
                          use_container_width=True)
 
 # ═════════════════════════════════════════════════════════════
-# TAB 6 – DHAN API
+# TAB 6 – DHAN API  (Complete Order Placement)
 # ═════════════════════════════════════════════════════════════
 with tab_dhan:
-    st.markdown('<div class="section-header">Dhan API — Live Order Placement</div>',
+    show_price_ticker(ACTIVE_TICKER)
+    st.markdown('<div class="section-header">🏦 Dhan API — Live Order Placement</div>',
                 unsafe_allow_html=True)
-    st.info("📌 Fill in your Dhan credentials to enable live order placement. "
-            "Orders are placed based on signals from the Live Trading tab.")
+    st.caption("Orders are triggered by signals from the Live Trading tab. Install: `pip install dhanhq`")
 
-    dc1, dc2 = st.columns(2)
-    with dc1:
-        dhan_client_id  = st.text_input("Dhan Client ID", type="password", key="dhan_cid")
-        dhan_token      = st.text_input("Dhan Access Token", type="password", key="dhan_tok")
-        dhan_enabled    = st.checkbox("Enable Live Order Placement", value=False, key="dhan_en")
-    with dc2:
-        dhan_product    = st.selectbox("Product Type", ["INTRADAY","CNC","MARGIN"], key="dhan_prod")
-        dhan_order_type = st.selectbox("Order Type", ["MARKET","LIMIT","SL","SL-M"], key="dhan_ord_t")
-        dhan_exchange   = st.selectbox("Exchange", ["NSE","BSE","MCX","NFO"], key="dhan_exch")
-        dhan_security_id= st.text_input("Security ID (Dhan Symbol ID)", "13", key="dhan_sec_id")
-
-    st.markdown("---")
-    st.markdown("#### Order Placement Code (Dhan SDK)")
-
-    dhan_code = '''
-# ─────────────────────────────────────────────────────────────
-# DHAN ORDER PLACEMENT  (Install: pip install dhanhq)
-# ─────────────────────────────────────────────────────────────
-# from dhanhq import dhanhq
-
-# Initialize Dhan client
-# dhan = dhanhq(client_id=DHAN_CLIENT_ID, access_token=DHAN_ACCESS_TOKEN)
-
-def place_dhan_order(signal: int, qty: int, price: float = 0,
-                     security_id: str = "13",
-                     exchange_segment: str = "NSE_EQ",
-                     product_type: str = "INTRADAY",
-                     order_type: str = "MARKET") -> dict:
-    """
-    Place BUY or SELL order via Dhan API.
-    signal:  1 = BUY (Long),  -1 = SELL (Short)
-    """
-    # transaction_type = dhan.BUY if signal == 1 else dhan.SELL
-
-    # response = dhan.place_order(
-    #     security_id     = security_id,
-    #     exchange_segment= exchange_segment,     # NSE_EQ / NSE_FNO / MCX_COMM
-    #     transaction_type= transaction_type,
-    #     quantity        = qty,
-    #     order_type      = order_type,           # MARKET / LIMIT / SL / SL-M
-    #     product_type    = product_type,         # INTRADAY / CNC / MARGIN
-    #     price           = price,                # 0 for MARKET
-    #     trigger_price   = 0,                    # For SL orders
-    #     disclosed_quantity = 0,
-    #     after_market_order = False,
-    #     validity        = "DAY",
-    #     amo_time        = "OPEN",
-    #     bo_profit_value = 0,
-    #     bo_stop_loss_Value = 0,
-    # )
-    # return response
-
-    # ── Simulated response for testing ──────────────────────
-    action = "BUY" if signal == 1 else "SELL"
-    return {
-        "status"   : "success",
-        "orderId"  : "SIMULATED_ORDER_12345",
-        "action"   : action,
-        "qty"      : qty,
-        "price"    : price,
-        "timestamp": str(datetime.datetime.now(IST)),
-    }
-
-
-def cancel_dhan_order(order_id: str) -> dict:
-    """Cancel an existing Dhan order"""
-    # response = dhan.cancel_order(order_id=order_id)
-    # return response
-    return {"status": "cancelled", "orderId": order_id}
-
-
-def get_positions() -> list:
-    """Fetch open positions from Dhan"""
-    # return dhan.get_positions()
-    return []
-
-
-def get_order_status(order_id: str) -> dict:
-    """Check order status"""
-    # return dhan.get_order_by_id(order_id=order_id)
-    return {"status": "TRADED", "orderId": order_id}
-
-
-# ── Integration with AlgoTrader signals ─────────────────────
-def execute_signal(signal: int, last_close: float, sl: float, target: float) -> dict:
-    """
-    Called by live trading loop when a new signal is generated.
-    Handles entry order + SL/Target bracket orders.
-    """
-    if signal == 0:
-        return {}
-
-    entry_order = place_dhan_order(
-        signal=signal, qty=1, price=0,  # MARKET order
-        order_type="MARKET"
-    )
-
-    # ── After entry, place SL order ──────────────────────────
-    # sl_order = place_dhan_order(
-    #     signal=-signal,   # opposite direction for SL
-    #     qty=1,
-    #     price=sl,
-    #     order_type="SL-M",
-    #     trigger_price=sl,
-    # )
-
-    # ── Place Target (Limit) order ───────────────────────────
-    # tgt_order = place_dhan_order(
-    #     signal=-signal,
-    #     qty=1,
-    #     price=target,
-    #     order_type="LIMIT",
-    # )
-
-    return {
-        "entry" : entry_order,
-        # "sl"    : sl_order,
-        # "target": tgt_order,
-    }
-'''
-    st.code(dhan_code, language="python")
-
-    st.markdown("---")
-    st.markdown("#### Test Signal Placement")
-    tc1, tc2, tc3 = st.columns(3)
-    test_signal = tc1.selectbox("Signal", ["BUY (Long)","SELL (Short)"], key="dhan_test_sig")
-    test_price  = tc2.number_input("Price", 0.0, 1_000_000.0, 0.0, key="dhan_test_pr")
-    test_qty    = tc3.number_input("Qty", 1, 10_000, int(qty), key="dhan_test_qty")
-
-    if st.button("📤 Test Order (Simulated)", key="btn_dhan_test"):
-        sig_val = 1 if "BUY" in test_signal else -1
-        result = {
-            "status"   : "success (simulated)",
-            "action"   : test_signal,
-            "qty"      : test_qty,
-            "price"    : test_price if test_price > 0 else "MARKET",
-            "timestamp": datetime.datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S IST"),
-            "note"     : "Enable Dhan credentials to place real orders."
+    # ════════════════════════════════════════════════════════
+    # HELPER: Dhan order placer (real when SDK present, sim otherwise)
+    # ════════════════════════════════════════════════════════
+    def _dhan_place_order(client_id, token, transaction_type, exchange_segment,
+                          product_type, order_type, security_id, quantity,
+                          price=0.0, trigger_price=0.0, validity="DAY",
+                          bo_profit=0.0, bo_stoploss=0.0):
+        try:
+            from dhanhq import market as _mkt
+            dhan = _mkt.DhanMarket(client_id=client_id, access_token=token)
+            resp = dhan.place_order(
+                transaction_type=transaction_type,
+                exchange_segment=exchange_segment,
+                product_type=product_type,
+                order_type=order_type,
+                security_id=str(security_id),
+                quantity=int(quantity),
+                price=float(price),
+                validity=validity,
+            )
+            return resp
+        except ImportError:
+            pass
+        except Exception as e:
+            return {"status":"error","message":str(e)}
+        # Simulated
+        return {
+            "status"    : "success (SIMULATED)",
+            "orderId"   : f"SIM_{int(time.time())}",
+            "txn"       : transaction_type,
+            "segment"   : exchange_segment,
+            "secId"     : security_id,
+            "qty"       : quantity,
+            "price"     : price if price>0 else "MARKET",
+            "timestamp" : datetime.datetime.now(IST).strftime("%H:%M:%S IST"),
         }
-        st.json(result)
+
+    def _dhan_get_positions(client_id, token):
+        try:
+            from dhanhq import market as _mkt
+            dhan = _mkt.DhanMarket(client_id=client_id, access_token=token)
+            return dhan.get_positions()
+        except:
+            return []
+
+    def _dhan_squareoff_all(client_id, token, product_type="MIS"):
+        """Square off all open positions for an account."""
+        positions = _dhan_get_positions(client_id, token)
+        results = []
+        for pos in positions:
+            try:
+                if str(pos.get("positionType","")).lower() == "open" or int(pos.get("netQty",0)) != 0:
+                    net = int(pos.get("netQty", pos.get("quantity",0)))
+                    if net == 0:
+                        continue
+                    txn = "SELL" if net > 0 else "BUY"
+                    r = _dhan_place_order(
+                        client_id, token,
+                        transaction_type=txn,
+                        exchange_segment=pos.get("exchangeSegment","NSE_FNO"),
+                        product_type=product_type,
+                        order_type="MARKET",
+                        security_id=pos.get("securityId","0"),
+                        quantity=abs(net),
+                    )
+                    results.append(r)
+            except:
+                continue
+        return results
+
+    # ════════════════════════════════════════════════════════
+    # MULTI-ACCOUNT MANAGEMENT
+    # ════════════════════════════════════════════════════════
+    st.markdown("### 🏦 Dhan Account(s)")
+    enable_multi_account = st.checkbox("Enable Multiple Dhan Accounts", value=False, key="dhan_multi")
+    if "dhan_accounts" not in st.session_state:
+        st.session_state.dhan_accounts = [{"name":"Account 1","client_id":"","token":"","enabled":True}]
+
+    # Add / Remove accounts
+    if enable_multi_account:
+        col_add, col_rem = st.columns([1,1])
+        if col_add.button("➕ Add Account", key="dhan_add_acc"):
+            n = len(st.session_state.dhan_accounts)+1
+            st.session_state.dhan_accounts.append({"name":f"Account {n}","client_id":"","token":"","enabled":True})
+        if col_rem.button("➖ Remove Last Account", key="dhan_rem_acc"):
+            if len(st.session_state.dhan_accounts) > 1:
+                st.session_state.dhan_accounts.pop()
+
+    shown_accounts = st.session_state.dhan_accounts
+    if not enable_multi_account:
+        shown_accounts = shown_accounts[:1]
+
+    acc_cols_headers = st.columns([2,3,3,1])
+    acc_cols_headers[0].markdown("**Name**"); acc_cols_headers[1].markdown("**Client ID**")
+    acc_cols_headers[2].markdown("**Access Token**"); acc_cols_headers[3].markdown("**Active**")
+    for ai, acc in enumerate(shown_accounts):
+        ac1,ac2,ac3,ac4 = st.columns([2,3,3,1])
+        acc["name"]      = ac1.text_input("", acc["name"],      key=f"acc_name_{ai}")
+        acc["client_id"] = ac2.text_input("", acc["client_id"], key=f"acc_cid_{ai}",  type="password")
+        acc["token"]     = ac3.text_input("", acc["token"],     key=f"acc_tok_{ai}",  type="password")
+        acc["enabled"]   = ac4.checkbox("",  acc["enabled"],    key=f"acc_en_{ai}")
+
+    active_accounts = [a for a in shown_accounts if a["enabled"] and a["client_id"] and a["token"]]
+    st.caption(f"Active accounts: {len(active_accounts)}")
+    st.markdown("---")
+
+    # ════════════════════════════════════════════════════════
+    # MASTER ENABLE
+    # ════════════════════════════════════════════════════════
+    dhan_enabled = st.checkbox("✅ Enable Live Order Placement (sends REAL orders if SDK installed)",
+                                value=False, key="dhan_en")
+    sq_all_before = st.checkbox("🚨 Square-off ALL open positions before placing new orders",
+                                 value=False, key="dhan_sq_all")
 
     st.markdown("---")
-    st.markdown("#### Dhan SDK Installation")
+    # ════════════════════════════════════════════════════════
+    # TRADING MODE: Options vs Equity/Intraday
+    # ════════════════════════════════════════════════════════
+    is_options = st.checkbox("📋 Options Mode (CE/PE Buying)", value=True, key="dhan_is_opts",
+                              help="When ON: Long signal → BUY CE, Short signal → BUY PE. When OFF: equity/intraday mode.")
+
+    # ─── OPTIONS MODE ─────────────────────────────────────────
+    if is_options:
+        st.markdown("### Options Order Configuration")
+        st.info("🟢 Long signal → BUY CE &nbsp;&nbsp; 🔴 Short signal → BUY PE")
+
+        enable_multi_strike = st.checkbox("Enable Multi-Strike (place orders for multiple CE/PE)", value=False, key="dhan_multi_strike")
+
+        if not enable_multi_strike:
+            op1, op2, op3 = st.columns(3)
+            dhan_ce_id  = op1.text_input("CE Security ID",  key="dhan_ce_id_0",  value="")
+            dhan_pe_id  = op2.text_input("PE Security ID",  key="dhan_pe_id_0",  value="")
+            dhan_opt_qty= op3.number_input("Quantity (lots)", min_value=1, max_value=10000, value=65, step=1, key="dhan_opt_qty_0")
+            strikes = [{"ce": dhan_ce_id, "pe": dhan_pe_id, "qty": dhan_opt_qty}]
+        else:
+            if "dhan_strikes" not in st.session_state:
+                st.session_state.dhan_strikes = [{"ce":"","pe":"","qty":65}]
+            sk_add, sk_rem = st.columns(2)
+            if sk_add.button("➕ Add Strike", key="dhan_add_strike"):
+                st.session_state.dhan_strikes.append({"ce":"","pe":"","qty":65})
+            if sk_rem.button("➖ Remove Last Strike", key="dhan_rem_strike"):
+                if len(st.session_state.dhan_strikes) > 1:
+                    st.session_state.dhan_strikes.pop()
+            sh1,sh2,sh3 = st.columns(3)
+            sh1.markdown("**CE Security ID**"); sh2.markdown("**PE Security ID**"); sh3.markdown("**Qty**")
+            for si, sk in enumerate(st.session_state.dhan_strikes):
+                sc1,sc2,sc3 = st.columns(3)
+                sk["ce"]  = sc1.text_input("", sk["ce"],  key=f"sk_ce_{si}")
+                sk["pe"]  = sc2.text_input("", sk["pe"],  key=f"sk_pe_{si}")
+                sk["qty"] = sc3.number_input("", min_value=1, max_value=10000, value=sk["qty"], step=1, key=f"sk_qty_{si}")
+            strikes = st.session_state.dhan_strikes
+
+        oe1, oe2 = st.columns(2)
+        opt_entry_order_type = oe1.selectbox("Entry Order Type",  ["LIMIT","MARKET"], key="dhan_opt_entry_ot")
+        opt_exit_order_type  = oe2.selectbox("Exit Order Type",   ["LIMIT","MARKET"], key="dhan_opt_exit_ot")
+
+        # Bracket order / SL-Target
+        enable_dhan_sl_tgt = st.checkbox("Enable Dhan SL & Target (Bracket Order)", value=False, key="dhan_bo_en")
+        if enable_dhan_sl_tgt:
+            bo1, bo2, bo3 = st.columns(3)
+            dhan_bo_sl    = bo1.number_input("SL (points)", min_value=0.05, max_value=9999.0, value=10.0, step=0.5, format="%.2f", key="dhan_bo_sl")
+            dhan_bo_tgt   = bo2.number_input("Target (points)", min_value=0.05, max_value=9999.0, value=20.0, step=0.5, format="%.2f", key="dhan_bo_tgt")
+            dhan_bo_trail = bo3.number_input("Trail SL (points, 0=off)", min_value=0.0, max_value=9999.0, value=0.0, step=0.5, format="%.2f", key="dhan_bo_trail")
+
+    # ─── EQUITY / INTRADAY / DELIVERY MODE ─────────────────────
+    else:
+        st.markdown("### Equity / F&O Order Configuration")
+        st.info("🟢 Long signal → BUY &nbsp;&nbsp; 🔴 Short signal → SELL")
+        eq1, eq2, eq3, eq4, eq5 = st.columns(5)
+        dhan_trading_type = eq1.selectbox("Trading Type", ["INTRADAY","DELIVERY (CNC)"], key="dhan_eq_type")
+        dhan_eq_sec_id    = eq2.text_input("Security ID", value="12092", key="dhan_eq_sec_id")
+        dhan_eq_exchange  = eq3.selectbox("Exchange", ["NSE","BSE","NSE_FNO","MCX"], key="dhan_eq_exch")
+        dhan_eq_qty       = eq4.number_input("Quantity", min_value=1, max_value=100000, value=1, step=1, key="dhan_eq_qty")
+        dhan_eq_product   = "MIS" if "INTRADAY" in dhan_trading_type else "CNC"
+
+        ee1, ee2 = st.columns(2)
+        eq_entry_order_type = ee1.selectbox("Entry Order Type", ["LIMIT","MARKET"], key="dhan_eq_entry_ot")
+        eq_exit_order_type  = ee2.selectbox("Exit Order Type",  ["LIMIT","MARKET"], key="dhan_eq_exit_ot")
+
+        enable_dhan_sl_tgt = st.checkbox("Enable Dhan SL & Target (Bracket Order)", value=False, key="dhan_eq_bo_en")
+        if enable_dhan_sl_tgt:
+            bo1e, bo2e, bo3e = st.columns(3)
+            dhan_bo_sl    = bo1e.number_input("SL (points)", min_value=0.05, max_value=9999.0, value=20.0, step=0.5, format="%.2f", key="dhan_eq_bo_sl")
+            dhan_bo_tgt   = bo2e.number_input("Target (points)", min_value=0.05, max_value=9999.0, value=40.0, step=0.5, format="%.2f", key="dhan_eq_bo_tgt")
+            dhan_bo_trail = bo3e.number_input("Trail SL (points, 0=off)", min_value=0.0, max_value=9999.0, value=0.0, step=0.5, format="%.2f", key="dhan_eq_bo_trail")
+
+    st.markdown("---")
+
+    # ════════════════════════════════════════════════════════
+    # ORDER EXECUTION FUNCTION
+    # ════════════════════════════════════════════════════════
+    def execute_dhan_signal(signal: int, price: float = 0.0):
+        """Execute orders across all active accounts for a given signal."""
+        if not dhan_enabled or not active_accounts:
+            return [{"status":"skipped","reason":"Dhan disabled or no active accounts"}]
+
+        all_results = []
+
+        for acc in active_accounts:
+            cid   = acc["client_id"]
+            token = acc["token"]
+
+            # Square off all before new if enabled
+            if sq_all_before:
+                sq_res = _dhan_squareoff_all(cid, token)
+                for r in sq_res:
+                    all_results.append({**r, "account": acc["name"], "action":"squareoff"})
+
+            if is_options:
+                # Options mode: Long → BUY CE, Short → BUY PE
+                for sk in strikes:
+                    if signal == 1 and sk.get("ce"):
+                        r = _dhan_place_order(
+                            cid, token,
+                            transaction_type="BUY",
+                            exchange_segment="NSE_FNO",
+                            product_type="MIS",
+                            order_type=opt_entry_order_type,
+                            security_id=sk["ce"],
+                            quantity=sk["qty"],
+                            price=price if opt_entry_order_type=="LIMIT" else 0,
+                        )
+                        all_results.append({**r, "account":acc["name"], "strike_type":"CE", "action":"BUY CE"})
+                    elif signal == -1 and sk.get("pe"):
+                        r = _dhan_place_order(
+                            cid, token,
+                            transaction_type="BUY",
+                            exchange_segment="NSE_FNO",
+                            product_type="MIS",
+                            order_type=opt_entry_order_type,
+                            security_id=sk["pe"],
+                            quantity=sk["qty"],
+                            price=price if opt_entry_order_type=="LIMIT" else 0,
+                        )
+                        all_results.append({**r, "account":acc["name"], "strike_type":"PE", "action":"BUY PE"})
+            else:
+                # Equity/intraday mode: Long → BUY, Short → SELL
+                txn = "BUY" if signal == 1 else "SELL"
+                seg_map = {"NSE":"NSE_EQ","BSE":"BSE_EQ","NSE_FNO":"NSE_FNO","MCX":"MCX_COMM"}
+                seg = seg_map.get(dhan_eq_exchange, "NSE_EQ")
+                r = _dhan_place_order(
+                    cid, token,
+                    transaction_type=txn,
+                    exchange_segment=seg,
+                    product_type=dhan_eq_product,
+                    order_type=eq_entry_order_type,
+                    security_id=dhan_eq_sec_id,
+                    quantity=dhan_eq_qty,
+                    price=price if eq_entry_order_type=="LIMIT" else 0,
+                )
+                all_results.append({**r, "account":acc["name"], "action":txn})
+
+        return all_results
+
+    # ════════════════════════════════════════════════════════
+    # MANUAL TEST ORDER
+    # ════════════════════════════════════════════════════════
+    st.markdown("### 🧪 Manual Test Order")
+    mt1, mt2, mt3 = st.columns(3)
+    test_signal = mt1.selectbox("Signal", ["🟢 BUY / LONG (CE for options, BUY for equity)",
+                                            "🔴 SELL / SHORT (PE for options, SELL for equity)"],
+                                 key="dhan_test_sig")
+    test_price  = mt2.number_input("Limit Price (0 = Market)", 0.0, 1_000_000.0, 0.0, key="dhan_test_pr")
+    sig_val     = 1 if "BUY" in test_signal else -1
+
+    if mt3.button("📤 Place Test Order", key="btn_dhan_test"):
+        if not active_accounts:
+            st.error("No active accounts configured. Add Client ID + Token above.")
+        else:
+            results = execute_dhan_signal(sig_val, test_price)
+            for r in results:
+                if "error" in str(r.get("status","")).lower():
+                    st.error(f"[{r.get('account','?')}] ❌ {r}")
+                else:
+                    st.success(f"[{r.get('account','?')}] ✅ {r.get('action','?')} → Order: {r.get('orderId','?')} | {r.get('status','?')}")
+
+    st.markdown("---")
+    st.markdown("### ⚡ Current Live Signal (from Live Trading tab)")
+    last_live_sig = st.session_state.get("live_last_signal", 0)
+    sig_label = "🟢 LONG" if last_live_sig==1 else ("🔴 SHORT" if last_live_sig==-1 else "⬜ No Signal")
+    st.metric("Last Signal", sig_label)
+    if st.button("🚀 Execute Current Signal Now", key="btn_dhan_exec_live"):
+        if last_live_sig == 0:
+            st.warning("No active signal to execute.")
+        elif not active_accounts:
+            st.error("No active accounts configured.")
+        else:
+            results = execute_dhan_signal(last_live_sig, 0.0)
+            for r in results:
+                acc_name = r.get("account","?")
+                if "error" in str(r.get("status","")).lower():
+                    st.error(f"[{acc_name}] ❌ {r}")
+                else:
+                    st.success(f"[{acc_name}] ✅ {r.get('action','?')} → {r.get('orderId','?')} | {r.get('status','?')}")
+
+    st.markdown("---")
+    if st.button("🚨 Square-off ALL Positions (All Accounts)", key="btn_sq_all"):
+        if not active_accounts:
+            st.error("No active accounts configured.")
+        else:
+            for acc in active_accounts:
+                results = _dhan_squareoff_all(acc["client_id"], acc["token"])
+                if results:
+                    st.success(f"[{acc['name']}] Squared off {len(results)} position(s).")
+                else:
+                    st.info(f"[{acc['name']}] No open positions found (or simulated).")
+
+    st.markdown("---")
+    st.markdown("#### 📦 SDK Reference")
     st.code("pip install dhanhq", language="bash")
-    st.caption("Docs: https://dhanhq.co/docs/v2/")
+    st.caption("Docs: https://dhanhq.co/docs/v2/ | The app simulates orders if SDK is not installed.")
 
 # ─────────────────────────────────────────────────────────────
 # FOOTER
