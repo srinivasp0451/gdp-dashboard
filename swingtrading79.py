@@ -33,74 +33,91 @@ st.set_page_config(
 # ─────────────────────────────────────────────────────────────
 st.markdown("""
 <style>
-  html, body, [class*="css"], .stApp {
-      background-color: #ffffff !important;
-      color: #000000 !important;
-      font-family: 'Segoe UI', sans-serif;
-  }
+  /* ── Base ── */
+  html, body, .stApp { background-color:#ffffff !important; font-family:'Segoe UI',sans-serif; }
+
+  /* ── Kill the global color override that breaks buttons & tabs ── */
+  .stApp, .main .block-container { color: #000000; }
+
+  /* ── Tabs – unselected ── */
+  .stTabs [data-baseweb="tab-list"] { background:#ffffff !important; gap:4px; }
   .stTabs [data-baseweb="tab"] {
-      background-color: #f5f5f5 !important;
-      color: #000000 !important;
-      border-radius: 6px 6px 0 0;
-      font-weight: 600;
-      padding: 8px 20px;
+      background:#e8e8e8 !important;
+      border-radius:6px 6px 0 0 !important;
+      font-weight:700 !important; font-size:13px !important;
+      padding:8px 18px !important; color:#000000 !important;
+      border:1px solid #ccc !important; border-bottom:none !important;
   }
+  /* ── Tabs – SELECTED: black bg, WHITE text ── */
   .stTabs [aria-selected="true"] {
-      background-color: #000000 !important;
-      color: #ffffff !important;
+      background:#000000 !important; color:#ffffff !important;
+      border-color:#000 !important;
   }
-  .metric-card {
-      background: #f9f9f9;
-      border: 1px solid #ddd;
-      border-radius: 8px;
-      padding: 12px 16px;
-      text-align: center;
-  }
-  .metric-card .label { font-size: 12px; color: #555; margin-bottom: 4px; }
-  .metric-card .value { font-size: 22px; font-weight: 700; color: #000; }
-  .win  { color: #006400 !important; }
-  .loss { color: #8b0000 !important; }
-  .section-header {
-      font-size: 18px; font-weight: 700;
-      border-bottom: 2px solid #000;
-      padding-bottom: 6px; margin-bottom: 14px;
-  }
-  div.stButton > button {
-      background: #000000 !important;
-      color: #ffffff !important;
-      border-radius: 6px; border: none !important;
-      padding: 8px 22px; font-weight: 600;
-      transition: background 0.2s;
-  }
-  div.stButton > button * { color: #ffffff !important; }
-  div.stButton > button:hover { background: #333333 !important; color: #ffffff !important; }
-  div.stButton > button:active { background: #111111 !important; color: #ffffff !important; }
+  .stTabs [aria-selected="true"] p,
+  .stTabs [aria-selected="true"] span,
+  .stTabs [aria-selected="true"] div { color:#ffffff !important; }
+
+  /* ── Buttons – always black bg, WHITE text ── */
+  div.stButton > button,
   div.stDownloadButton > button {
-      background: #000000 !important; color: #ffffff !important;
-      border-radius: 6px; border: none !important; font-weight: 600;
+      background-color:#000000 !important;
+      color:#ffffff !important;
+      border:none !important; border-radius:6px !important;
+      padding:8px 22px !important; font-weight:700 !important;
+      font-size:14px !important; cursor:pointer !important;
   }
-  div.stDownloadButton > button:hover { background: #333333 !important; }
-  .stSelectbox label, .stMultiSelect label,
-  .stNumberInput label,
-  .stCheckbox label, .stRadio label { color: #000 !important; font-weight: 500; }
-  .stDataFrame { border: 1px solid #ddd; border-radius: 6px; }
+  div.stButton > button:hover,
+  div.stDownloadButton > button:hover { background-color:#333333 !important; }
+  div.stButton > button p,
+  div.stButton > button span,
+  div.stButton > button div,
+  div.stDownloadButton > button p,
+  div.stDownloadButton > button span { color:#ffffff !important; }
+
+  /* ── Labels & text ── */
+  label, .stSelectbox label, .stMultiSelect label,
+  .stNumberInput label, .stCheckbox label,
+  .stRadio label, .stTimeInput label { color:#000000 !important; font-weight:500 !important; }
+  h1,h2,h3,h4,h5,h6 { color:#000000 !important; }
+  p { color:#000000 !important; }
+  .stMarkdown p, .stMarkdown li { color:#000000 !important; }
+
+  /* ── Sidebar ── */
+  .stSidebar { background-color:#f8f8f8 !important; }
+  .stSidebar label, .stSidebar p, .stSidebar div,
+  .stSidebar span, .stSidebar h1, .stSidebar h2,
+  .stSidebar h3 { color:#000000 !important; }
+
+  /* ── Custom components ── */
+  .metric-card {
+      background:#f9f9f9; border:1px solid #ddd;
+      border-radius:8px; padding:12px 16px; text-align:center;
+  }
+  .metric-card .label { font-size:11px; color:#555 !important; margin-bottom:4px; }
+  .metric-card .value { font-size:20px; font-weight:700; color:#000 !important; }
+  .win  { color:#006400 !important; font-weight:700; }
+  .loss { color:#8b0000 !important; font-weight:700; }
+  .section-header {
+      font-size:18px; font-weight:700; color:#000 !important;
+      border-bottom:2px solid #000; padding-bottom:6px; margin-bottom:14px;
+  }
+  .price-ticker {
+      background:#000; color:#fff !important; border-radius:8px;
+      padding:8px 18px; font-size:15px; font-weight:700;
+      display:inline-block; margin-bottom:10px;
+  }
+  .price-ticker span { color:#fff !important; }
   .live-badge {
-      display: inline-block;
-      background: #000; color: #fff;
-      border-radius: 12px; padding: 2px 12px;
-      font-size: 12px; font-weight: 700;
-      animation: blink 1.2s step-start infinite;
+      display:inline-block; background:#000; color:#fff !important;
+      border-radius:12px; padding:2px 12px; font-size:12px; font-weight:700;
+      animation:blink 1.2s step-start infinite;
   }
-  @keyframes blink { 50% { opacity: 0.4; } }
-  .signal-long  { background:#e6ffe6; border-left:4px solid #006400; padding:8px 14px; border-radius:4px; }
-  .signal-short { background:#ffe6e6; border-left:4px solid #8b0000; padding:8px 14px; border-radius:4px; }
-  .signal-none  { background:#f5f5f5; border-left:4px solid #999;    padding:8px 14px; border-radius:4px; }
-  .stSidebar { background-color: #fafafa !important; }
-  .stSidebar * { color: #000 !important; }
-  h1, h2, h3, h4, h5, h6 { color: #000 !important; }
-  p { color: #000 !important; }
-  label:not([data-baseweb]) { color: #000 !important; }
-  .stMarkdown, .stText { color: #000 !important; }
+  @keyframes blink { 50% { opacity:0.4; } }
+  .signal-long  { background:#e6ffe6; border-left:4px solid #006400; padding:8px 14px; border-radius:4px; color:#000 !important; }
+  .signal-short { background:#ffe6e6; border-left:4px solid #8b0000; padding:8px 14px; border-radius:4px; color:#000 !important; }
+  .signal-none  { background:#f5f5f5; border-left:4px solid #999;    padding:8px 14px; border-radius:4px; color:#000 !important; }
+  .summary-box  { background:#f0f4ff; border-left:4px solid #000; padding:14px 18px; border-radius:6px; color:#000 !important; }
+  .stDataFrame  { border:1px solid #ddd; border-radius:6px; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -142,6 +159,7 @@ TF_PERIOD_MAP = {
 ALL_PERIODS = ["1d","5d","7d","1mo","3mo","6mo","1y","2y","5y","10y","20y"]
 
 STRATEGIES = [
+    # ── Classic Trend ──────────────────────────────────────────
     "1.  EMA Crossover (9 / 21)",
     "2.  EMA Crossover (20 / 50)",
     "3.  Triple EMA (9 / 21 / 50)",
@@ -152,6 +170,7 @@ STRATEGIES = [
     "8.  Supertrend",
     "9.  ADX + DI Crossover",
     "10. Stochastic Crossover",
+    # ── Combined Momentum ──────────────────────────────────────
     "11. Stochastic + RSI Combined",
     "12. Ichimoku Cloud",
     "13. VWAP Cross",
@@ -162,6 +181,7 @@ STRATEGIES = [
     "18. Pivot Point Bounce",
     "19. Heikin Ashi + EMA",
     "20. RSI + MACD Combined",
+    # ── Filtered / High-Confirmation ───────────────────────────
     "21. EMA + RSI Filter",
     "22. Opening Range Breakout",
     "23. Inside Bar Breakout",
@@ -172,6 +192,17 @@ STRATEGIES = [
     "28. EMA Ribbon",
     "29. Parabolic SAR",
     "30. Dual Momentum",
+    # ── NEW High-Probability Strategies ────────────────────────
+    "31. Triple Confluence (EMA+RSI+MACD+ADX)",
+    "32. Supertrend + MACD + Volume Confirm",
+    "33. RSI Divergence + EMA Trend",
+    "34. Bollinger Squeeze Breakout (ADX+Vol)",
+    "35. VWAP + Supertrend + RSI",
+    "36. Multi-EMA + Stochastic + ADX",
+    "37. Candle Pattern + EMA (Engulfing/Pin)",
+    "38. ATR Breakout with Trend Filter",
+    "39. Elliott Wave Simplified + Confluence",
+    "40. 5-Factor High-Probability (90%+ Aim)",
 ]
 
 SL_TYPES = [
@@ -643,6 +674,157 @@ def compute_signals(df: pd.DataFrame, strategy: str, p: dict = None) -> pd.DataF
             df["signal"] = np.where(
                 (m1>0)&(m2>0)&((m1.shift()<=0)|(m2.shift()<=0)),1,
                 np.where((m1<0)&(m2<0)&((m1.shift()>=0)|(m2.shift()>=0)),-1,0))
+
+        # ═══════════════════════════════════════════════════════
+        # NEW HIGH-PROBABILITY STRATEGIES  (31-40)
+        # ═══════════════════════════════════════════════════════
+
+        elif num == 31:
+            # Triple Confluence: EMA stack + RSI momentum + MACD direction + ADX trend strength
+            e9=_ema(c,9); e21=_ema(c,21); e50=_ema(c,50)
+            rsi=_rsi(c,14); ml,sl_,_ = _macd(c)
+            adx_,pdi,ndi = _adx(h,l,c,14)
+            bull = (e9>e21)&(e21>e50)&(rsi>50)&(rsi<70)&(ml>sl_)&(adx_>20)
+            bear = (e9<e21)&(e21<e50)&(rsi<50)&(rsi>30)&(ml<sl_)&(adx_>20)
+            df["signal"] = np.where(bull&~bull.shift().fillna(True),1,
+                           np.where(bear&~bear.shift().fillna(True),-1,0))
+
+        elif num == 32:
+            # Supertrend + MACD histogram turning positive + volume surge
+            _,dir_ = _supertrend(h,l,c,10,3.0)
+            ml,sl_,hist = _macd(c)
+            avg_vol = v.rolling(20).mean()
+            vol_surge = v > avg_vol * 1.2
+            bull = (dir_==1)&(hist>0)&(hist.shift()<=0)&vol_surge
+            bear = (dir_==-1)&(hist<0)&(hist.shift()>=0)&vol_surge
+            df["signal"] = np.where(bull,1,np.where(bear,-1,0))
+
+        elif num == 33:
+            # RSI Divergence approximation + EMA trend filter
+            # Bullish: price makes lower low but RSI makes higher low (hidden momentum)
+            rsi=_rsi(c,14); e50=_ema(c,50)
+            pl = c.rolling(5).min(); pr = rsi.rolling(5).min()
+            bull_div = (c<c.shift(5))&(rsi>rsi.shift(5))&(c>e50.shift())
+            bear_div = (c>c.shift(5))&(rsi<rsi.shift(5))&(c<e50.shift())
+            df["signal"] = np.where(bull_div&~bull_div.shift().fillna(True),1,
+                           np.where(bear_div&~bear_div.shift().fillna(True),-1,0))
+
+        elif num == 34:
+            # BB Squeeze: narrow bands + ADX rising + volume breakout
+            ub,mb,lb_ = _bb(c,20,2)
+            bw = (ub-lb_)/mb
+            sq = bw < bw.rolling(20).mean()*0.85   # bands narrower than average
+            adx_,pdi,ndi = _adx(h,l,c,14)
+            avg_vol = v.rolling(20).mean()
+            bull = sq.shift(1)&(c>ub)&(adx_>adx_.shift())&(v>avg_vol)
+            bear = sq.shift(1)&(c<lb_)&(adx_>adx_.shift())&(v>avg_vol)
+            df["signal"] = np.where(bull,1,np.where(bear,-1,0))
+
+        elif num == 35:
+            # VWAP + Supertrend + RSI triple confirmation
+            vw = _vwap(h,l,c,v)
+            _,dir_ = _supertrend(h,l,c,10,3.0)
+            rsi = _rsi(c,14)
+            bull = (c>vw)&(dir_==1)&(rsi>50)&(rsi<68)
+            bear = (c<vw)&(dir_==-1)&(rsi<50)&(rsi>32)
+            df["signal"] = np.where(bull&~bull.shift().fillna(True),1,
+                           np.where(bear&~bear.shift().fillna(True),-1,0))
+
+        elif num == 36:
+            # Multi-EMA ribbon aligned + Stochastic from oversold/overbought + ADX strength
+            e8=_ema(c,8); e13=_ema(c,13); e21=_ema(c,21); e34=_ema(c,34)
+            k,d_ = _stoch(h,l,c,14,3)
+            adx_,pdi,ndi = _adx(h,l,c,14)
+            bull = (e8>e13)&(e13>e21)&(e21>e34)&(k>d_)&(k.shift()<=d_.shift())&(k<70)&(adx_>20)
+            bear = (e8<e13)&(e13<e21)&(e21<e34)&(k<d_)&(k.shift()>=d_.shift())&(k>30)&(adx_>20)
+            df["signal"] = np.where(bull,1,np.where(bear,-1,0))
+
+        elif num == 37:
+            # Candle Pattern (Engulfing / Pin Bar) + EMA trend filter
+            e21 = _ema(c,21)
+            body = (c - o).abs()
+            prev_body = body.shift()
+            # Bullish engulfing: body covers prev body and closes above prev open
+            bull_eng = (c>o)&(o<c.shift())&(c>o.shift())&(body>prev_body)&(c>e21)
+            # Bearish engulfing
+            bear_eng = (c<o)&(o>c.shift())&(c<o.shift())&(body>prev_body)&(c<e21)
+            # Bullish pin bar: lower wick > 2x body, close in upper half
+            low_wick = np.minimum(o,c) - l
+            up_wick  = h - np.maximum(o,c)
+            bull_pin = (low_wick > 2*body)&(up_wick < body)&(c>e21)
+            bear_pin = (up_wick  > 2*body)&(low_wick < body)&(c<e21)
+            bull = bull_eng | bull_pin
+            bear = bear_eng | bear_pin
+            df["signal"] = np.where(bull&~bull.shift().fillna(True),1,
+                           np.where(bear&~bear.shift().fillna(True),-1,0))
+
+        elif num == 38:
+            # ATR-based volatility breakout with trend filter + volume confirmation
+            atr_ = _atr(h,l,c,14)
+            e50 = _ema(c,50); e200 = _ema(c,200) if n>200 else _ema(c,50)
+            # Price breaks above highest_high + ATR
+            hh = h.rolling(20).max().shift(1)
+            ll = l.rolling(20).min().shift(1)
+            avg_vol = v.rolling(20).mean()
+            bull = (c > hh + atr_*0.5)&(c > e50)&(v > avg_vol)
+            bear = (c < ll - atr_*0.5)&(c < e50)&(v > avg_vol)
+            df["signal"] = np.where(bull&~bull.shift().fillna(True),1,
+                           np.where(bear&~bear.shift().fillna(True),-1,0))
+
+        elif num == 39:
+            # Elliott Wave Simplified + Multi-Confluence
+            # Detects potential Wave 3 (strongest) by:
+            # - Impulse move > 1.618 of Wave 1 (Fibonacci)
+            # - Trend confirmed by EMA stack
+            # - RSI 50-80 for bullish wave 3 (momentum)
+            # - ADX > 25 (trend is strong)
+            # - Volume expanding
+            lb = 20
+            # Wave 1 proxy: largest impulse in prior lb bars
+            roll_h = h.rolling(lb).max(); roll_l = l.rolling(lb).min()
+            wave1_size = (roll_h - roll_l).shift(lb)
+            # Wave 2 retracement: price pulled back to ~61.8% fib
+            fib618_bull = roll_l.shift(lb) + wave1_size * 0.382  # entry zone
+            fib618_bear = roll_h.shift(lb) - wave1_size * 0.382
+            # Current momentum
+            e21=_ema(c,21); e50=_ema(c,50)
+            rsi = _rsi(c,14)
+            adx_,pdi,ndi = _adx(h,l,c,14)
+            avg_vol = v.rolling(20).mean()
+            # Wave 3 bull: price above fib618 recovery + all confirmations
+            bull = (c > fib618_bull)&(c > e21)&(e21>e50)&(rsi>50)&(rsi<80)&(adx_>25)&(v>avg_vol)
+            bear = (c < fib618_bear)&(c < e21)&(e21<e50)&(rsi<50)&(rsi>20)&(adx_>25)&(v>avg_vol)
+            df["signal"] = np.where(bull&~bull.shift().fillna(True),1,
+                           np.where(bear&~bear.shift().fillna(True),-1,0))
+
+        elif num == 40:
+            # 5-Factor High-Probability Strategy (aims for 90%+ accuracy)
+            # Requires ALL 5 factors to align — fewer trades, highest conviction
+            # Factor 1: Strong trend (EMA9 > EMA21 > EMA50)
+            e9=_ema(c,9); e21=_ema(c,21); e50=_ema(c,50)
+            f1_bull = (e9>e21)&(e21>e50)
+            f1_bear = (e9<e21)&(e21<e50)
+            # Factor 2: RSI in healthy momentum zone (NOT overbought)
+            rsi = _rsi(c,14)
+            f2_bull = (rsi>50)&(rsi<72)
+            f2_bear = (rsi<50)&(rsi>28)
+            # Factor 3: MACD bullish crossover or sustained positive
+            ml,sl_,hist = _macd(c)
+            f3_bull = (ml>sl_)&(hist>0)
+            f3_bear = (ml<sl_)&(hist<0)
+            # Factor 4: ADX > 25 (trend is strong, not ranging)
+            adx_,pdi,ndi = _adx(h,l,c,14)
+            f4 = adx_ > 25
+            # Factor 5: Volume confirms (current > 20-bar avg)
+            avg_vol = v.rolling(20).mean()
+            f5 = v > avg_vol * 0.9
+            # Entry: all 5 factors + Supertrend confirmation
+            _,dir_ = _supertrend(h,l,c,10,3.0)
+            bull = f1_bull&f2_bull&f3_bull&f4&f5&(dir_==1)
+            bear = f1_bear&f2_bear&f3_bear&f4&f5&(dir_==-1)
+            # Only trigger on STATE CHANGE (new signal, not continuation)
+            df["signal"] = np.where(bull&~bull.shift().fillna(True),1,
+                           np.where(bear&~bear.shift().fillna(True),-1,0))
 
     except Exception as e:
         st.warning(f"Signal error [{strategy}]: {e}")
@@ -1456,6 +1638,45 @@ ATR (volatility buffer): {atr_v:.2f} pts.
     return commentary.strip()
 
 # ─────────────────────────────────────────────────────────────
+# LIVE PRICE TICKER  –  shown on every tab
+# ─────────────────────────────────────────────────────────────
+def _get_live_price(ticker: str) -> tuple:
+    """Returns (price, change_pct, direction_emoji). Cached for 10s."""
+    key = f"_lprice_{ticker}"
+    if key in st.session_state:
+        ts, data = st.session_state[key]
+        if time.time() - ts < 10:
+            return data
+    try:
+        df_tick = yf.download(ticker, period="2d", interval="1m", progress=False, auto_adjust=True)
+        if df_tick is not None and not df_tick.empty:
+            if isinstance(df_tick.columns, pd.MultiIndex):
+                df_tick.columns = df_tick.columns.get_level_values(0)
+            last_c = float(df_tick["Close"].iloc[-1])
+            prev_c = float(df_tick["Close"].iloc[-2]) if len(df_tick)>1 else last_c
+            chg = (last_c - prev_c) / prev_c * 100
+            em  = "🟢" if chg >= 0 else "🔴"
+            data = (last_c, chg, em)
+            st.session_state[key] = (time.time(), data)
+            return data
+    except:
+        pass
+    return (None, None, "⬜")
+
+def show_price_ticker(ticker: str):
+    price, chg, em = _get_live_price(ticker)
+    if price is not None:
+        chg_str = f"{chg:+.2f}%"
+        st.markdown(
+            f'<div class="price-ticker">'
+            f'{em} <span>{ticker}</span> &nbsp;|&nbsp; '
+            f'<span style="font-size:18px;">{price:.2f}</span> &nbsp;'
+            f'<span style="font-size:13px;color:{"#00ff88" if chg>=0 else "#ff6666"};">{chg_str}</span>'
+            f'</div>',
+            unsafe_allow_html=True
+        )
+
+# ─────────────────────────────────────────────────────────────
 # SIDEBAR  –  Global Configuration
 # ─────────────────────────────────────────────────────────────
 with st.sidebar:
@@ -1563,6 +1784,7 @@ tab_bt, tab_live, tab_hist, tab_analysis, tab_opt, tab_dhan = st.tabs([
 # TAB 1 – BACKTESTING
 # ═════════════════════════════════════════════════════════════
 with tab_bt:
+    show_price_ticker(ACTIVE_TICKER)
     st.markdown('<div class="section-header">Backtesting Engine</div>', unsafe_allow_html=True)
 
     col_cfg, col_run = st.columns([3,1])
@@ -1618,6 +1840,16 @@ with tab_bt:
         if not trades:
             st.warning("No trades generated. Try different parameters or a longer period.")
         else:
+            # ── Price range overview ───────────────────────────
+            period_high = float(df_res["High"].max())
+            period_low  = float(df_res["Low"].min())
+            last_close  = float(df_res["Close"].iloc[-1])
+            ph1,ph2,ph3,ph4 = st.columns(4)
+            ph1.metric("Period High", f"{period_high:.2f}")
+            ph2.metric("Period Low",  f"{period_low:.2f}")
+            ph3.metric("Last Close",  f"{last_close:.2f}")
+            ph4.metric("Range (pts)", f"{period_high-period_low:.2f}")
+
             st.success(f"✅ Backtest complete — {len(trades)} trades found.")
             st.markdown("### Performance Metrics")
             show_metrics(metrics)
@@ -1662,6 +1894,7 @@ with tab_bt:
 # TAB 2 – LIVE TRADING
 # ═════════════════════════════════════════════════════════════
 with tab_live:
+    show_price_ticker(ACTIVE_TICKER)
     st.markdown('<div class="section-header">Live Trading Monitor</div>', unsafe_allow_html=True)
 
     st.markdown("#### Active Configuration")
@@ -1870,12 +2103,15 @@ with tab_live:
                         wr_live = len(ltd[ltd["pnl"]>0])/len(ltd)*100 if len(ltd)>0 else 0
                         s4.metric("Session Win Rate", f"{wr_live:.1f}%")
 
-        st.info(f"⏱ Next refresh in {refresh_s}s. Press **Stop** to halt. Auto-refreshes require manual page reload or a loop.")
+        st.info(f"⏱ Auto-refreshing every **{refresh_s}s**. Press **⏹ Stop** to halt.")
+        time.sleep(float(refresh_s))
+        st.rerun()
 
 # ═════════════════════════════════════════════════════════════
 # TAB 3 – TRADE HISTORY
 # ═════════════════════════════════════════════════════════════
 with tab_hist:
+    show_price_ticker(ACTIVE_TICKER)
     st.markdown('<div class="section-header">Trade History</div>', unsafe_allow_html=True)
 
     all_trades = (st.session_state.get("trade_history", []) +
@@ -1928,6 +2164,7 @@ with tab_hist:
 # TAB 4 – ANALYSIS
 # ═════════════════════════════════════════════════════════════
 with tab_analysis:
+    show_price_ticker(ACTIVE_TICKER)
     st.markdown('<div class="section-header">Deep Analysis</div>', unsafe_allow_html=True)
 
     an_btn = st.button("🔄 Load & Analyse Data", key="btn_analysis")
@@ -2041,6 +2278,20 @@ with tab_analysis:
             sc1.metric("Long Signals",  total_l)
             sc2.metric("Short Signals", total_s)
 
+            total_sig = total_l + total_s
+            sig_ratio = total_l / total_sig if total_sig > 0 else 0.5
+            freq_msg = ("**Signal Frequency:** Very active strategy generating many signals. Consider "
+                       "that more signals = more noise in sideways markets."
+                       if total_sig > len(df_an)*0.05 else
+                       "**Signal Frequency:** Low-frequency strategy. Fewer signals usually means higher conviction per trade.")
+            if sig_ratio > 0.65:
+                bias_msg = f"**Signal Bias:** Strongly BULLISH bias ({total_l} long vs {total_s} short signals). The strategy sees predominantly bullish conditions in this period."
+            elif sig_ratio < 0.35:
+                bias_msg = f"**Signal Bias:** Strongly BEARISH bias ({total_l} long vs {total_s} short signals). The strategy sees predominantly bearish conditions in this period."
+            else:
+                bias_msg = f"**Signal Bias:** Balanced ({total_l} long vs {total_s} short). The strategy is trading both directions — suitable for two-way markets."
+            st.info(f"{freq_msg}\n\n{bias_msg}\n\n**Recommendation:** Run a backtest (Tab 1) with the current settings to see how profitable these signals were historically. Check if win rate > 55% before using live.")
+
             # Show signal distribution over time
             fig_sig = go.Figure()
             long_idx  = df_sigs[df_sigs["signal"]==1]
@@ -2097,10 +2348,94 @@ with tab_analysis:
                 colorscale=[[0,"#ffffff"],[0.5,"#999999"],[1,"#000000"]],
                 text=corr_matrix.round(2).values, texttemplate="%{text}",
                 showscale=True))
-            fig_hm.update_layout(height=450, template="plotly_white",
+            fig_hm.update_layout(height=420, template="plotly_white",
                                   plot_bgcolor="#fff", paper_bgcolor="#fff",
                                   font=dict(color="#000"))
             st.plotly_chart(fig_hm, use_container_width=True)
+
+            # ── Human-readable correlation analysis ──────────────
+            st.markdown("#### 📝 What This Correlation Heatmap Is Telling You")
+            corr_ema9_ema21  = float(corr_matrix.loc["EMA9","EMA21"])
+            corr_close_rsi   = float(corr_matrix.loc["Close","RSI14"])
+            corr_close_macd  = float(corr_matrix.loc["Close","MACD"])
+            corr_atr_volume  = float(corr_matrix.loc["ATR14","Volume"])
+            corr_cci_rsi     = float(corr_matrix.loc["CCI20","RSI14"])
+
+            # EMA9/EMA21 correlation
+            if corr_ema9_ema21 > 0.95:
+                ema_corr_msg = (f"EMA9 and EMA21 are very tightly correlated ({corr_ema9_ema21:.2f}). "
+                                f"This means the EMAs are moving almost in lockstep — the trend is very smooth and consistent. "
+                                f"**Recommendation:** EMA crossover strategies should work well here. Trade in the direction of the prevailing trend.")
+            elif corr_ema9_ema21 > 0.85:
+                ema_corr_msg = (f"EMA9 and EMA21 have a strong correlation ({corr_ema9_ema21:.2f}) but some divergence exists. "
+                                f"**Recommendation:** EMAs are reliable trend filters but may produce occasional whipsaws. "
+                                f"Add RSI confirmation before entering on EMA crossovers.")
+            else:
+                ema_corr_msg = (f"EMA9 and EMA21 have lower correlation ({corr_ema9_ema21:.2f}) — the market is choppy. "
+                                f"**Recommendation:** Avoid pure EMA crossover strategies in this environment. "
+                                f"Use range-bound strategies like Bollinger Band mean reversion instead.")
+
+            # RSI-Close correlation
+            if corr_close_rsi > 0.7:
+                rsi_msg = (f"RSI is strongly correlated with price ({corr_close_rsi:.2f}). "
+                           f"This indicates RSI is trending along with price — the instrument is trending, not ranging. "
+                           f"**Do NOT use RSI as an overbought/oversold reversal signal.** Instead use RSI >50 as a trend confirmation tool.")
+            elif corr_close_rsi < 0.3:
+                rsi_msg = (f"RSI has a low correlation with price ({corr_close_rsi:.2f}). "
+                           f"This is ideal — RSI is behaving as an independent momentum oscillator. "
+                           f"**RSI overbought/oversold signals are more reliable** in this environment. "
+                           f"Strategy 5 (RSI OB/OS) may be effective here.")
+            else:
+                rsi_msg = (f"RSI has a moderate correlation with price ({corr_close_rsi:.2f}). "
+                           f"Use RSI with at least one trend filter (like EMA) before trading its signals.")
+
+            # ATR-Volume correlation
+            if corr_atr_volume > 0.5:
+                atr_vol_msg = (f"ATR (volatility) and Volume move together ({corr_atr_volume:.2f}). "
+                               f"This is healthy — big moves are accompanied by volume. "
+                               f"**Breakout strategies are more reliable** since volume confirms price moves.")
+            elif corr_atr_volume < 0.2:
+                atr_vol_msg = (f"ATR and Volume are weakly correlated ({corr_atr_volume:.2f}). "
+                               f"Price volatility and volume are disconnected. "
+                               f"**Be cautious with breakout strategies** — breakouts may lack volume confirmation. "
+                               f"False breakouts are more likely in this regime.")
+            else:
+                atr_vol_msg = (f"ATR-Volume correlation is moderate ({corr_atr_volume:.2f}). "
+                               f"Volatility and volume are partially aligned — require both to confirm breakouts.")
+
+            # MACD-Close correlation
+            if corr_close_macd > 0.6:
+                macd_msg = (f"MACD is strongly correlated with price ({corr_close_macd:.2f}). "
+                            f"MACD is functioning as a trend indicator here rather than a divergence detector. "
+                            f"**Trade MACD in the direction of the trend, not as a reversal signal.**")
+            else:
+                macd_msg = (f"MACD has lower correlation with price ({corr_close_macd:.2f}). "
+                            f"MACD may show useful divergences. Watch for MACD making new highs/lows "
+                            f"while price does not — those divergences often precede reversals.")
+
+            # Overall recommendation
+            bull_factors = sum([corr_ema9_ema21 > 0.90, corr_close_rsi > 0.5, corr_atr_volume > 0.4])
+            if bull_factors >= 2:
+                overall_rec = ("**Overall Recommendation:** The correlations suggest a TRENDING market environment. "
+                               "Prefer trend-following strategies: Triple EMA (3), Supertrend (8), Triple Confluence (31), "
+                               "or the 5-Factor High-Probability strategy (40). Avoid mean-reversion strategies.")
+            else:
+                overall_rec = ("**Overall Recommendation:** The correlations suggest a RANGING/CHOPPY market environment. "
+                               "Prefer mean-reversion strategies: Bollinger Band Mean Reversion (7), Stochastic+RSI (11), "
+                               "or Pivot Point Bounce (18). Avoid pure trend-following as it will produce whipsaws.")
+
+            corr_summary = f"""
+**EMA Trend Consistency:** {ema_corr_msg}
+
+**RSI Behavior:** {rsi_msg}
+
+**Volatility-Volume Relationship:** {atr_vol_msg}
+
+**MACD Signal Quality:** {macd_msg}
+
+{overall_rec}
+"""
+            st.markdown(f'<div class="summary-box">{corr_summary}</div>', unsafe_allow_html=True)
     else:
         st.info("Click **Load & Analyse Data** to begin.")
 
@@ -2108,6 +2443,7 @@ with tab_analysis:
 # TAB 5 – OPTIMIZATION  (full auto, all strategies)
 # ═════════════════════════════════════════════════════════════
 with tab_opt:
+    show_price_ticker(ACTIVE_TICKER)
     st.markdown('<div class="section-header">🎯 Auto Strategy Optimizer</div>',
                 unsafe_allow_html=True)
     st.markdown(
@@ -2125,7 +2461,7 @@ with tab_opt:
         vp2 = TF_PERIOD_MAP.get(opt_tf_sel, ALL_PERIODS)
         opt_period   = st.selectbox("Period", vp2, index=min(3,len(vp2)-1), key="opt_per")
     with oc3:
-        opt_target_wr = st.number_input("Target Win Rate (%)", min_value=30.0, max_value=99.0,
+        opt_target_wr = st.number_input("Target Win Rate (%)", min_value=0.0, max_value=99.0,
                                          value=60.0, step=1.0, format="%.1f", key="opt_wr")
         opt_min_trades = st.number_input("Min Trades Threshold", 5, 500, 10, key="opt_min_tr")
         opt_max_combos = st.number_input("Max Combinations to Test", 50, 2000, 400, key="opt_max_c")
@@ -2323,14 +2659,15 @@ with tab_opt:
                     )
                     mt_ = calc_metrics(tr_)
 
-                    if mt_ and mt_.get("Total Trades",0) >= int(opt_min_trades):
+                    # Save ALL combos that had at least 1 trade — no hard minimum
+                    if mt_ and mt_.get("Total Trades",0) >= max(1, int(opt_min_trades)):
                         best_results.append({
                             "Win Rate (%)"  : mt_["Win Rate (%)"],
                             "Profit Factor" : mt_["Profit Factor"],
                             "Total Trades"  : mt_["Total Trades"],
                             "Total P&L"     : mt_["Total P&L (pts×qty)"],
-                            "Avg Win"       : mt_["Avg Win (pts×qty)"],
-                            "Avg Loss"      : mt_["Avg Loss (pts×qty)"],
+                            "Avg Win"       : mt_.get("Avg Win (pts)",0),
+                            "Avg Loss"      : mt_.get("Avg Loss (pts)",0),
                             "Max Drawdown"  : mt_["Max Drawdown"],
                             "Sharpe"        : mt_["Sharpe Ratio"],
                             "Expectancy"    : mt_["Expectancy"],
@@ -2342,18 +2679,30 @@ with tab_opt:
                             "R:R Ratio"     : combo["rr"],
                             "Strategy Params": str(combo["params"]),
                         })
+                        # Incremental save every 50 results so progress is never lost
+                        if len(best_results) % 50 == 0:
+                            interim = pd.DataFrame(best_results).sort_values(
+                                ["Win Rate (%)","Profit Factor"], ascending=False).reset_index(drop=True)
+                            st.session_state.opt_results = interim
                 except:
                     continue
 
             prog.empty(); prog_text.empty()
 
+            # Final save — always save whatever we got
             if best_results:
                 opt_df_res = pd.DataFrame(best_results).sort_values(
                     ["Win Rate (%)","Profit Factor"], ascending=False
                 ).reset_index(drop=True)
                 st.session_state.opt_results = opt_df_res
+                st.success(f"✅ Optimization complete! Found {len(opt_df_res)} valid combinations.")
             else:
-                st.warning("No valid combinations found. Try a longer period or lower min trades.")
+                # No trades at all — show a warning but don't wipe partial results
+                st.warning(
+                    f"No combinations produced trades with the current min-trades={opt_min_trades}. "
+                    f"Try setting min trades to 1, using a longer period, or switching to a strategy "
+                    f"that generates more signals (e.g. Strategy 1, 4, or 8)."
+                )
 
     # ── Display results ──────────────────────────────────────
     opt_df = st.session_state.get("opt_results")
