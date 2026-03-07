@@ -66,14 +66,22 @@ st.markdown("""
       padding-bottom: 6px; margin-bottom: 14px;
   }
   div.stButton > button {
-      background: #000000; color: #ffffff;
-      border-radius: 6px; border: none;
+      background: #000000 !important;
+      color: #ffffff !important;
+      border-radius: 6px; border: none !important;
       padding: 8px 22px; font-weight: 600;
       transition: background 0.2s;
   }
-  div.stButton > button:hover { background: #333333; }
+  div.stButton > button * { color: #ffffff !important; }
+  div.stButton > button:hover { background: #333333 !important; color: #ffffff !important; }
+  div.stButton > button:active { background: #111111 !important; color: #ffffff !important; }
+  div.stDownloadButton > button {
+      background: #000000 !important; color: #ffffff !important;
+      border-radius: 6px; border: none !important; font-weight: 600;
+  }
+  div.stDownloadButton > button:hover { background: #333333 !important; }
   .stSelectbox label, .stMultiSelect label,
-  .stSlider label, .stNumberInput label,
+  .stNumberInput label,
   .stCheckbox label, .stRadio label { color: #000 !important; font-weight: 500; }
   .stDataFrame { border: 1px solid #ddd; border-radius: 6px; }
   .live-badge {
@@ -90,7 +98,9 @@ st.markdown("""
   .stSidebar { background-color: #fafafa !important; }
   .stSidebar * { color: #000 !important; }
   h1, h2, h3, h4, h5, h6 { color: #000 !important; }
-  p, span, div, label { color: #000 !important; }
+  p { color: #000 !important; }
+  label:not([data-baseweb]) { color: #000 !important; }
+  .stMarkdown, .stText { color: #000 !important; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -205,7 +215,6 @@ def init_session():
         "live_open_pos"    : None,
         "live_running"     : False,
         "live_last_signal" : None,
-        "live_capital"     : 100_000.0,
         "trade_history"    : [],
         "opt_results"      : None,
         "data_cache"       : {},
@@ -753,7 +762,7 @@ def update_trail_sl(pos, df, i, sl_type, sp, atr_v):
 # ─────────────────────────────────────────────────────────────
 def run_backtest(df_raw, strategy, sl_type, tgt_type, sp, tp,
                  allow_overlap=False, use_tf=False, tf_start=None, tf_end=None,
-                 initial_capital=100_000.0, qty=1):
+                 qty=1):
 
     df = compute_signals(df_raw, strategy)
 
@@ -769,7 +778,6 @@ def run_backtest(df_raw, strategy, sl_type, tgt_type, sp, tp,
     ema_sl  = _ema(df["Close"], sp.get("ema_slow",21))
 
     trades  = []
-    capital = initial_capital
     open_positions = []   # list of pos dicts (supports overlap)
 
     for i in range(1, len(df)):
@@ -840,7 +848,6 @@ def run_backtest(df_raw, strategy, sl_type, tgt_type, sp, tp,
             if exit_reason:
                 q = pos.get("qty_remaining", qty)
                 pnl = (exit_price - pos["entry_price"]) * d * q
-                capital += pnl
                 trades.append({
                     "entry_time"  : pos["entry_time"],
                     "exit_time"   : cur_t,
@@ -851,7 +858,6 @@ def run_backtest(df_raw, strategy, sl_type, tgt_type, sp, tp,
                     "target"      : round(pos["target"],4),
                     "pnl"         : round(pnl,2),
                     "exit_reason" : exit_reason,
-                    "capital"     : round(capital,2),
                 })
             else:
                 still_open.append(pos)
@@ -883,7 +889,6 @@ def run_backtest(df_raw, strategy, sl_type, tgt_type, sp, tp,
             d = pos["direction"]
             q = pos.get("qty_remaining", qty)
             pnl = (last_c - pos["entry_price"]) * d * q
-            capital += pnl
             trades.append({
                 "entry_time"  : pos["entry_time"],
                 "exit_time"   : last_t,
@@ -894,7 +899,6 @@ def run_backtest(df_raw, strategy, sl_type, tgt_type, sp, tp,
                 "target"      : round(pos["target"],4),
                 "pnl"         : round(pnl,2),
                 "exit_reason" : "End of Data",
-                "capital"     : round(capital,2),
             })
 
     return trades
@@ -902,7 +906,7 @@ def run_backtest(df_raw, strategy, sl_type, tgt_type, sp, tp,
 # ─────────────────────────────────────────────────────────────
 # METRICS CALCULATOR
 # ─────────────────────────────────────────────────────────────
-def calc_metrics(trades, initial_capital=100_000.0):
+def calc_metrics(trades, initial_capital=0.0):
     if not trades:
         return {}
     df = pd.DataFrame(trades)
@@ -918,10 +922,8 @@ def calc_metrics(trades, initial_capital=100_000.0):
     cum = df["pnl"].cumsum()
     peak = cum.cummax()
     dd = (cum-peak).min()
-    # Sharpe (daily)
     sh = (df["pnl"].mean()/df["pnl"].std()*np.sqrt(252)
           if df["pnl"].std()>0 else 0)
-    # Expectancy
     exp_ = (wr/100)*avg_w + (1-wr/100)*avg_l
 
     c_wins=c_loss=mx_cw=mx_cl=0
@@ -931,13 +933,21 @@ def calc_metrics(trades, initial_capital=100_000.0):
         else:
             c_loss+=1; c_wins=0; mx_cl=max(mx_cl,c_loss)
 
+    avg_dur = "N/A"
+    try:
+        df["entry_time"] = pd.to_datetime(df["entry_time"])
+        df["exit_time"]  = pd.to_datetime(df["exit_time"])
+        durs = (df["exit_time"] - df["entry_time"]).dt.total_seconds() / 60
+        avg_dur = f"{durs.mean():.0f} min"
+    except:
+        pass
+
     return {
         "Total Trades"      : n,
         "Win Rate (%)"      : round(wr,2),
-        "Total P&L"         : round(tot_pnl,2),
-        "Return (%)"        : round(tot_pnl/initial_capital*100,2),
-        "Avg Win"           : round(avg_w,2),
-        "Avg Loss"          : round(avg_l,2),
+        "Total P&L (pts×qty)": round(tot_pnl,2),
+        "Avg Win (pts×qty)" : round(avg_w,2),
+        "Avg Loss (pts×qty)": round(avg_l,2),
         "Profit Factor"     : round(pf,2),
         "Max Drawdown"      : round(dd,2),
         "Sharpe Ratio"      : round(sh,2),
@@ -946,6 +956,7 @@ def calc_metrics(trades, initial_capital=100_000.0):
         "Max Consec Losses" : mx_cl,
         "Gross Profit"      : round(gross_w,2),
         "Gross Loss"        : round(gross_l,2),
+        "Avg Trade Duration": avg_dur,
     }
 
 # ─────────────────────────────────────────────────────────────
@@ -1026,23 +1037,23 @@ def build_chart(df, trades, strategy, show_indicators=True):
     fig.update_yaxes(gridcolor="#eeeeee")
     return fig
 
-def build_equity_curve(trades, initial_capital=100_000.0):
+def build_equity_curve(trades, initial_capital=0.0):
     if not trades:
         return go.Figure()
     df = pd.DataFrame(trades)
-    cum_pnl = df["pnl"].cumsum() + initial_capital
+    cum_pnl = df["pnl"].cumsum()
     fig = go.Figure()
     fig.add_trace(go.Scatter(
         x=list(range(len(cum_pnl))), y=cum_pnl,
         fill="tozeroy", fillcolor="rgba(0,0,0,0.08)",
-        line=dict(color="#000000",width=2), name="Equity"))
-    fig.add_hline(y=initial_capital, line_dash="dash", line_color="#888888")
+        line=dict(color="#000000",width=2), name="Cumulative P&L"))
+    fig.add_hline(y=0, line_dash="dash", line_color="#888888")
     fig.update_layout(
-        title="Equity Curve", height=300,
+        title="Cumulative P&L Curve (Points × Qty)", height=300,
         template="plotly_white", plot_bgcolor="#ffffff",
         paper_bgcolor="#ffffff",
         font=dict(color="#000000"),
-        xaxis_title="Trade #", yaxis_title="Capital"
+        xaxis_title="Trade #", yaxis_title="Cumulative P&L"
     )
     return fig
 
@@ -1067,6 +1078,250 @@ def show_metrics(metrics: dict):
           <div class="value {color_cls}">{v}</div>
         </div>""", unsafe_allow_html=True)
     st.write("")
+
+# ─────────────────────────────────────────────────────────────
+# MARKET SUMMARY  –  human-readable analysis
+# ─────────────────────────────────────────────────────────────
+def generate_market_summary(df: pd.DataFrame, ticker: str) -> str:
+    """Returns a plain-English paragraph describing the current market state."""
+    if df is None or len(df) < 30:
+        return "Insufficient data to generate a market summary."
+
+    c   = df["Close"]
+    h   = df["High"]
+    l   = df["Low"]
+    v   = df["Volume"]
+
+    last_c   = float(c.iloc[-1])
+    prev_c   = float(c.iloc[-2])
+    chg_pct  = (last_c - prev_c) / prev_c * 100
+
+    # Trend
+    ema9_v  = float(_ema(c,9).iloc[-1])
+    ema21_v = float(_ema(c,21).iloc[-1])
+    ema50_v = float(_ema(c,50).iloc[-1]) if len(c)>=50 else ema21_v
+    if ema9_v > ema21_v > ema50_v:
+        trend = "in a strong UPTREND — all EMAs (9, 21, 50) are stacked bullishly"
+        trend_action = "Prefer LONG setups. Look for dips to EMA9 or EMA21 as buying opportunities."
+    elif ema9_v < ema21_v < ema50_v:
+        trend = "in a strong DOWNTREND — all EMAs (9, 21, 50) are stacked bearishly"
+        trend_action = "Prefer SHORT setups. Rallies to EMA9 or EMA21 are sell opportunities."
+    elif ema9_v > ema21_v:
+        trend = "in a short-term BULLISH phase (EMA9 above EMA21), though medium-term trend is mixed"
+        trend_action = "Cautious LONG trades can be considered, but confirm with volume."
+    else:
+        trend = "in a short-term BEARISH phase (EMA9 below EMA21)"
+        trend_action = "Avoid aggressive longs. Sideways or downward bias expected in the short term."
+
+    # RSI
+    rsi_v = float(_rsi(c,14).iloc[-1])
+    if rsi_v > 70:
+        rsi_msg = f"RSI is at {rsi_v:.1f} — OVERBOUGHT territory. The market may be overextended; avoid chasing longs. Watch for exhaustion or reversal candles."
+    elif rsi_v < 30:
+        rsi_msg = f"RSI is at {rsi_v:.1f} — OVERSOLD territory. Selling pressure may be exhausting; a bounce or reversal is possible. But in strong downtrends, oversold can stay oversold."
+    elif rsi_v > 55:
+        rsi_msg = f"RSI is at {rsi_v:.1f} — Moderately bullish momentum. Buyers are in control without being overstretched."
+    elif rsi_v < 45:
+        rsi_msg = f"RSI is at {rsi_v:.1f} — Moderately bearish momentum. Sellers have a slight edge."
+    else:
+        rsi_msg = f"RSI is at {rsi_v:.1f} — Neutral zone. No strong bias from momentum alone; wait for directional confirmation."
+
+    # MACD
+    ml,sl_,hi_ = _macd(c)
+    macd_v = float(ml.iloc[-1]); macd_sig = float(sl_.iloc[-1]); hist_v = float(hi_.iloc[-1])
+    if macd_v > macd_sig and hist_v > 0:
+        macd_msg = "MACD is above its signal line with positive histogram — bullish momentum is building."
+    elif macd_v < macd_sig and hist_v < 0:
+        macd_msg = "MACD is below its signal line with negative histogram — bearish momentum is dominant."
+    elif macd_v > macd_sig and hist_v < 0:
+        macd_msg = "MACD crossed above signal but histogram is shrinking — momentum is slowing; watch carefully."
+    else:
+        macd_msg = "MACD just crossed below its signal line — early bearish signal, confirmation needed."
+
+    # Bollinger Bands
+    ub,mb,lb_ = _bb(c,20,2)
+    ub_v=float(ub.iloc[-1]); lb_v=float(lb_.iloc[-1]); mb_v=float(mb.iloc[-1])
+    band_width = (ub_v - lb_v) / mb_v * 100
+    if last_c > ub_v:
+        bb_msg = f"Price is ABOVE the upper Bollinger Band ({ub_v:.2f}) — price is stretched. Breakouts can continue but a mean-reversion pullback to the middle band ({mb_v:.2f}) is common."
+    elif last_c < lb_v:
+        bb_msg = f"Price is BELOW the lower Bollinger Band ({lb_v:.2f}) — deeply oversold on a statistical basis. A snap-back to the middle band ({mb_v:.2f}) is historically likely."
+    elif band_width < 2:
+        bb_msg = f"Bollinger Bands are SQUEEZING (width: {band_width:.1f}%) — volatility is very low. Expect a sharp breakout soon; direction is unknown until it triggers."
+    else:
+        bb_msg = f"Price is trading INSIDE the Bollinger Bands (upper: {ub_v:.2f}, lower: {lb_v:.2f}). No extreme stretching detected."
+
+    # ATR / Volatility
+    atr_v = float(_atr(h,l,c,14).iloc[-1])
+    atr_pct = atr_v / last_c * 100
+    if atr_pct > 2:
+        vol_msg = f"Volatility is HIGH (ATR={atr_v:.2f}, {atr_pct:.1f}% of price). Use wider stops and reduce position size. Large moves are possible in both directions."
+    elif atr_pct < 0.5:
+        vol_msg = f"Volatility is LOW (ATR={atr_v:.2f}, {atr_pct:.1f}% of price). Tight stops are viable, but breakouts may be muted."
+    else:
+        vol_msg = f"Volatility is MODERATE (ATR={atr_v:.2f}, {atr_pct:.1f}% of price). Normal risk management applies."
+
+    # Volume
+    avg_vol = float(v.rolling(20).mean().iloc[-1]) if len(v)>=20 else float(v.mean())
+    last_vol = float(v.iloc[-1])
+    if avg_vol > 0:
+        vol_ratio = last_vol / avg_vol
+        if vol_ratio > 1.5:
+            vol_msg2 = f"Volume on the last candle is {vol_ratio:.1f}x the 20-bar average — STRONG participation. This move has conviction behind it."
+        elif vol_ratio < 0.5:
+            vol_msg2 = f"Volume is only {vol_ratio:.1f}x the 20-bar average — LOW participation. Treat any breakout or breakdown with skepticism until volume confirms."
+        else:
+            vol_msg2 = "Volume is near its 20-bar average — normal participation, no special volume signal."
+    else:
+        vol_msg2 = "Volume data not available for this instrument."
+
+    # Support / Resistance (simple)
+    recent_high = float(h.rolling(20).max().iloc[-1])
+    recent_low  = float(l.rolling(20).min().iloc[-1])
+    dist_to_hi  = (recent_high - last_c) / last_c * 100
+    dist_to_lo  = (last_c - recent_low)  / last_c * 100
+
+    # Candle bias
+    candle_dir = "BULLISH" if last_c >= prev_c else "BEARISH"
+    candle_chg = abs(chg_pct)
+
+    # Final recommendation
+    bull_signals = sum([
+        ema9_v > ema21_v,
+        rsi_v > 50,
+        macd_v > macd_sig,
+        last_c > mb_v,
+        last_c >= prev_c,
+    ])
+    if bull_signals >= 4:
+        overall = "Overall bias: BULLISH. Multiple indicators align. Prefer long trades with proper risk management."
+    elif bull_signals <= 1:
+        overall = "Overall bias: BEARISH. Multiple indicators point down. Prefer short trades or stay in cash."
+    else:
+        overall = "Overall bias: MIXED/NEUTRAL. Conflicting signals. Wait for clearer directional confirmation before trading."
+
+    summary = f"""
+**{ticker} — Market Intelligence Summary**
+
+The instrument is currently trading at **{last_c:.2f}**, {candle_dir} by **{candle_chg:.2f}%** from the previous candle close. It is {trend}.
+
+**Trend:** {trend_action}
+
+**Momentum (RSI):** {rsi_msg}
+
+**MACD:** {macd_msg}
+
+**Bollinger Bands:** {bb_msg}
+
+**Volatility:** {vol_msg} {vol_msg2}
+
+**Key Levels:** 20-bar resistance near **{recent_high:.2f}** (price is {dist_to_hi:.1f}% away). 20-bar support near **{recent_low:.2f}** (price is {dist_to_lo:.1f}% above it).
+
+**⚡ {overall}**
+
+*Note: This is a technical analysis summary based on historical price data. Always apply your own judgment, position sizing, and never risk more than you can afford to lose.*
+"""
+    return summary.strip()
+
+# ─────────────────────────────────────────────────────────────
+# LIVE COMMENTARY  –  real-time market reading
+# ─────────────────────────────────────────────────────────────
+def generate_live_commentary(df: pd.DataFrame, last_c: float,
+                              last_sig: int, pos: dict | None,
+                              atr_v: float, ticker: str) -> str:
+    """Returns a real-time plain-English commentary for the live trading panel."""
+    if df is None or len(df) < 20:
+        return "Waiting for enough data to generate commentary…"
+
+    c = df["Close"]; h = df["High"]; l = df["Low"]
+    ema9_v  = float(_ema(c,9).iloc[-1])
+    ema21_v = float(_ema(c,21).iloc[-1])
+    rsi_v   = float(_rsi(c,14).iloc[-1])
+    ml,sl_,_ = _macd(c)
+    macd_v  = float(ml.iloc[-1]); macd_sig_v = float(sl_.iloc[-1])
+    ub,mb,lb_ = _bb(c,20,2)
+    ub_v=float(ub.iloc[-1]); lb_v=float(lb_.iloc[-1]); mb_v=float(mb.iloc[-1])
+
+    # Price vs key levels
+    if last_c > ema9_v > ema21_v:
+        price_level = f"Price ({last_c:.2f}) is ABOVE both EMA9 ({ema9_v:.2f}) and EMA21 ({ema21_v:.2f}) — bullish structure intact."
+    elif last_c < ema9_v < ema21_v:
+        price_level = f"Price ({last_c:.2f}) is BELOW both EMA9 ({ema9_v:.2f}) and EMA21 ({ema21_v:.2f}) — bearish structure."
+    elif last_c > ema21_v:
+        price_level = f"Price ({last_c:.2f}) is between EMA9 ({ema9_v:.2f}) and EMA21 ({ema21_v:.2f}) — testing key EMA support/resistance."
+    else:
+        price_level = f"Price ({last_c:.2f}) is below EMA21 ({ema21_v:.2f}) — caution advised."
+
+    # RSI reading
+    if rsi_v > 70:
+        rsi_note = f"RSI {rsi_v:.1f} — overbought. Do NOT add to longs here. Consider partial profit booking if long."
+    elif rsi_v < 30:
+        rsi_note = f"RSI {rsi_v:.1f} — oversold. Do NOT add to shorts here. Watch for reversal."
+    elif rsi_v > 55:
+        rsi_note = f"RSI {rsi_v:.1f} — bullish momentum."
+    elif rsi_v < 45:
+        rsi_note = f"RSI {rsi_v:.1f} — bearish momentum."
+    else:
+        rsi_note = f"RSI {rsi_v:.1f} — neutral."
+
+    # BB position
+    if last_c > ub_v:
+        bb_note = f"Price above upper BB ({ub_v:.2f}) — statistically stretched. Avoid new longs."
+    elif last_c < lb_v:
+        bb_note = f"Price below lower BB ({lb_v:.2f}) — extreme oversold. Potential snap-back zone."
+    else:
+        bb_note = f"Price inside BB bands. Normal range. Mid-band at {mb_v:.2f}."
+
+    # Signal
+    if last_sig == 1:
+        sig_note = "🟢 FRESH LONG SIGNAL on this candle. Strategy suggests entering a BUY position."
+        action = "✅ ACTION: Consider entering LONG with appropriate SL and Target as configured."
+    elif last_sig == -1:
+        sig_note = "🔴 FRESH SHORT SIGNAL on this candle. Strategy suggests entering a SELL position."
+        action = "✅ ACTION: Consider entering SHORT with appropriate SL and Target as configured."
+    else:
+        sig_note = "⬜ No new signal. Market is in a wait state per the selected strategy."
+        action = "⏳ ACTION: Stay patient. No new trade trigger. Manage existing positions if any."
+
+    # Position status
+    if pos is not None:
+        d = pos["direction"]
+        ep = pos["entry_price"]
+        sl = pos["sl"]
+        tg = pos["target"]
+        upnl = (last_c - ep) * d
+        risk_pts = abs(ep - sl)
+        rwd_pts  = abs(tg - ep)
+        pos_note = (
+            f"**Open Position:** {'LONG' if d==1 else 'SHORT'} entered at {ep:.2f}. "
+            f"SL at {sl:.2f} (risk: {risk_pts:.2f} pts). Target: {tg:.2f} (reward: {rwd_pts:.2f} pts). "
+            f"Unrealized: {upnl:+.2f} pts × qty. "
+        )
+        if d == 1:
+            if last_c < ema9_v:
+                pos_note += "⚠️ Price dipped below EMA9 — monitor closely, consider tightening SL."
+            elif upnl > rwd_pts * 0.6:
+                pos_note += "💡 Approaching 60% of target. Consider partial booking."
+        else:
+            if last_c > ema9_v:
+                pos_note += "⚠️ Price recovered above EMA9 — monitor closely for short squeeze."
+            elif abs(upnl) > rwd_pts * 0.6:
+                pos_note += "💡 Approaching 60% of target. Consider partial booking."
+    else:
+        pos_note = "No open position. System is scanning for the next entry."
+
+    commentary = f"""
+{price_level}
+{rsi_note} | {bb_note}
+MACD: {'Bullish' if macd_v > macd_sig_v else 'Bearish'} — MACD {macd_v:.2f} vs Signal {macd_sig_v:.2f}.
+ATR (volatility buffer): {atr_v:.2f} pts.
+
+{sig_note}
+{pos_note}
+
+{action}
+"""
+    return commentary.strip()
 
 # ─────────────────────────────────────────────────────────────
 # SIDEBAR  –  Global Configuration
@@ -1096,10 +1351,10 @@ with st.sidebar:
     st.markdown("### Strategy")
     strategy = st.selectbox("Strategy", STRATEGIES, key="sb_strategy")
 
-    # ── Capital & Qty ─────────────────────────────────────────
-    st.markdown("### Capital & Quantity")
-    initial_cap = st.number_input("Initial Capital (₹)", 10_000, 10_000_000, 100_000, 10_000)
-    qty = st.number_input("Lot / Qty", 1, 10_000, 1)
+    # ── Quantity ──────────────────────────────────────────────
+    st.markdown("### Quantity")
+    qty = st.number_input("Lot / Qty (default 1)", 1, 10_000, 1, key="sb_qty")
+    st.caption("All P&L shown as: Points × Qty")
 
     # ── Trading Time Filter ───────────────────────────────────
     st.markdown("### Trading Time Filter")
@@ -1116,10 +1371,10 @@ with st.sidebar:
 
     # ── Stop Loss ─────────────────────────────────────────────
     st.markdown("### Stop Loss")
-    sl_type = st.selectbox("SL Type", SL_TYPES, index=5, key="sb_sl_type")
+    sl_type    = st.selectbox("SL Type", SL_TYPES, index=5, key="sb_sl_type")
     sl_pts     = st.number_input("SL Points (Custom/Trailing)", 1, 10_000, 20, key="sb_sl_pts")
-    atr_sl_m   = st.slider("ATR SL Multiplier", 0.5, 5.0, 2.0, 0.1, key="sb_atr_sl")
-    rr_ratio_sl= st.slider("R:R Ratio (for RR-based SL)", 1.0, 10.0, 2.0, 0.5, key="sb_rr_sl")
+    atr_sl_m   = st.number_input("ATR SL Multiplier", min_value=0.1, max_value=10.0, value=2.0, step=0.1, format="%.1f", key="sb_atr_sl")
+    rr_ratio_sl= st.number_input("R:R Ratio (RR-based SL)", min_value=0.5, max_value=20.0, value=2.0, step=0.5, format="%.1f", key="sb_rr_sl")
     ema_fast_s = st.number_input("EMA Fast (Crossover SL)", 3, 100, 9,  key="sb_ema_f")
     ema_slow_s = st.number_input("EMA Slow (Crossover SL)", 5, 200, 21, key="sb_ema_sl")
     swing_lb_s = st.number_input("Swing Lookback (bars)", 3, 50, 5, key="sb_swing_sl")
@@ -1138,8 +1393,8 @@ with st.sidebar:
     st.markdown("### Target")
     tgt_type   = st.selectbox("Target Type", TARGET_TYPES, index=6, key="sb_tgt_type")
     tgt_pts    = st.number_input("Target Points", 1, 50_000, 40, key="sb_tgt_pts")
-    atr_tgt_m  = st.slider("ATR Target Multiplier", 0.5, 10.0, 3.0, 0.5, key="sb_atr_tgt")
-    rr_ratio_t = st.slider("R:R Ratio (Target)", 1.0, 10.0, 2.0, 0.5, key="sb_rr_tgt")
+    atr_tgt_m  = st.number_input("ATR Target Multiplier", min_value=0.5, max_value=20.0, value=3.0, step=0.5, format="%.1f", key="sb_atr_tgt")
+    rr_ratio_t = st.number_input("R:R Ratio (Target)", min_value=0.5, max_value=20.0, value=2.0, step=0.5, format="%.1f", key="sb_rr_tgt")
     swing_lb_t = st.number_input("Swing Lookback (Target)", 3, 50, 5, key="sb_swing_tgt")
 
     TGT_PARAMS = {
@@ -1208,10 +1463,9 @@ with tab_bt:
                     allow_overlap=allow_overlap,
                     use_tf=use_time_filter,
                     tf_start=t_start, tf_end=t_end,
-                    initial_capital=float(initial_cap),
                     qty=int(qty)
                 )
-                metrics = calc_metrics(trades, float(initial_cap))
+                metrics = calc_metrics(trades)
 
             st.session_state.bt_results = df_raw
             st.session_state.bt_trades  = trades
@@ -1237,7 +1491,7 @@ with tab_bt:
             show_metrics(metrics)
 
             st.markdown("### Equity Curve")
-            st.plotly_chart(build_equity_curve(trades, float(initial_cap)),
+            st.plotly_chart(build_equity_curve(trades),
                             use_container_width=True)
 
             st.markdown("### Price Chart with Trades")
@@ -1274,7 +1528,8 @@ with tab_live:
     lc1, lc2, lc3 = st.columns(3)
     start_live = lc1.button("▶ Start Live Scan", key="btn_live_start")
     stop_live  = lc2.button("⏹ Stop", key="btn_live_stop")
-    refresh_s  = lc3.number_input("Refresh (sec)", 10, 300, 60, key="live_refresh")
+    refresh_s  = lc3.number_input("Refresh interval (sec)", min_value=1.0, max_value=300.0,
+                                   value=1.5, step=0.5, format="%.1f", key="live_refresh")
 
     if stop_live:
         st.session_state.live_running = False
@@ -1390,6 +1645,15 @@ with tab_live:
                             '<div class="signal-none">⬜ No Signal on last candle</div>',
                             unsafe_allow_html=True)
 
+                    # ── Live Commentary ─────────────────────────────────────
+                    st.markdown("#### 📢 Live Market Commentary")
+                    commentary = generate_live_commentary(
+                        df_sig, last_c, last_sig,
+                        st.session_state.live_open_pos,
+                        atr_v, ACTIVE_TICKER
+                    )
+                    st.info(commentary)
+
                     # ── Open position display ───────────────────────────────
                     pos = st.session_state.live_open_pos
                     if pos:
@@ -1400,8 +1664,8 @@ with tab_live:
                         p_cols[2].metric("SL",    f"{pos['sl']:.4f}")
                         p_cols[3].metric("Target",f"{pos['target']:.4f}")
                         pnl_v = pos.get("unrealized_pnl",0)
-                        p_cols[4].metric("Unrealized P&L", f"₹{pnl_v:,.2f}",
-                                         delta=f"₹{pnl_v:,.2f}")
+                        p_cols[4].metric("Unrealized P&L (pts×qty)", f"{pnl_v:+.2f}",
+                                         delta=f"{pnl_v:+.2f}")
                     else:
                         st.info("No open position.")
 
@@ -1466,7 +1730,7 @@ with tab_hist:
         st.dataframe(filt[cols_show], use_container_width=True, height=400)
 
         if len(filt) > 0:
-            m = calc_metrics(filt.to_dict("records"), float(initial_cap))
+            m = calc_metrics(filt.to_dict("records"))
             st.markdown("### Aggregate Metrics")
             show_metrics(m)
 
@@ -1495,6 +1759,16 @@ with tab_analysis:
         a_tabs = st.tabs(["OHLCV","Indicators","Strategy Signals","Statistics","Correlation"])
 
         with a_tabs[0]:
+            # Quick stats bar
+            last_c_an = float(df_an["Close"].iloc[-1])
+            prev_c_an = float(df_an["Close"].iloc[-2]) if len(df_an)>1 else last_c_an
+            chg_an = last_c_an - prev_c_an
+            chg_pct_an = chg_an/prev_c_an*100 if prev_c_an>0 else 0
+            qs1,qs2,qs3,qs4 = st.columns(4)
+            qs1.metric("Last Close", f"{last_c_an:.4f}")
+            qs2.metric("Change", f"{chg_an:+.4f}", delta=f"{chg_pct_an:+.2f}%")
+            qs3.metric("52-bar High", f"{df_an['High'].tail(52).max():.4f}")
+            qs4.metric("52-bar Low",  f"{df_an['Low'].tail(52).min():.4f}")
             st.plotly_chart(build_chart(df_an.tail(200), [], strategy, False), use_container_width=True)
             st.dataframe(df_an.tail(50), use_container_width=True)
 
@@ -1602,6 +1876,10 @@ with tab_analysis:
             st.plotly_chart(fig_sig, use_container_width=True)
 
         with a_tabs[3]:
+            st.markdown("#### 📝 Human-Readable Market Summary")
+            summary_text = generate_market_summary(df_an, ACTIVE_TICKER)
+            st.markdown(summary_text)
+            st.markdown("---")
             st.markdown("#### Descriptive Statistics")
             st.dataframe(df_an.describe(), use_container_width=True)
             # Returns distribution
@@ -1642,83 +1920,242 @@ with tab_analysis:
         st.info("Click **Load & Analyse Data** to begin.")
 
 # ═════════════════════════════════════════════════════════════
-# TAB 5 – OPTIMIZATION
+# TAB 5 – OPTIMIZATION  (full auto, all strategies)
 # ═════════════════════════════════════════════════════════════
 with tab_opt:
-    st.markdown('<div class="section-header">Strategy Optimizer — Target 90%+ Win Rate</div>',
+    st.markdown('<div class="section-header">🎯 Auto Strategy Optimizer</div>',
                 unsafe_allow_html=True)
-    st.warning("⚠️ Optimization runs many backtests. Large grids may take several minutes. "
-               "Reduce parameter ranges if needed.")
+    st.markdown(
+        "Enter your ticker, choose a strategy, set the target accuracy, and hit **Run**. "
+        "The optimizer automatically searches ALL relevant parameter combinations for that strategy, "
+        "tests every SL/Target pairing, and ranks results by win rate. No manual ranges needed."
+    )
 
-    st.markdown("#### Optimization Parameters")
-    oc1, oc2 = st.columns(2)
+    oc1, oc2, oc3 = st.columns(3)
     with oc1:
-        opt_strategy  = st.selectbox("Strategy to Optimize", STRATEGIES, key="opt_strat")
-        opt_target_wr = st.slider("Target Win Rate (%)", 50, 95, 70, 5, key="opt_wr")
-        opt_min_trades= st.number_input("Min Trades Required", 5, 500, 20, key="opt_min_tr")
-        opt_ticker    = st.text_input("Ticker for Opt", ACTIVE_TICKER, key="opt_tick")
-        opt_tf        = st.selectbox("Timeframe", TIMEFRAMES, index=TIMEFRAMES.index(tf), key="opt_tf")
-        opt_period    = st.selectbox("Period", valid_periods, key="opt_per")
+        opt_ticker   = st.text_input("Ticker", ACTIVE_TICKER, key="opt_tick")
+        opt_tf_sel   = st.selectbox("Timeframe", TIMEFRAMES, index=TIMEFRAMES.index(tf), key="opt_tf")
     with oc2:
-        st.markdown("**EMA Fast range:**")
-        ef_lo,ef_hi = st.slider("EMA Fast",3,100,(5,20),key="opt_ef")
-        ef_step     = st.number_input("Step",1,10,2,key="opt_ef_s")
-        st.markdown("**EMA Slow range:**")
-        es_lo,es_hi = st.slider("EMA Slow",10,200,(15,60),key="opt_es")
-        es_step     = st.number_input("Step ",1,20,5,key="opt_es_s")
-        opt_sl_type = st.selectbox("SL for Opt", SL_TYPES, index=5, key="opt_sl_t")
-        opt_tgt_type= st.selectbox("Target for Opt", TARGET_TYPES, index=6, key="opt_tgt_t")
-        opt_sl_pts  = st.number_input("SL Pts (opt)", 5, 500, 20, key="opt_sl_p")
-        opt_tgt_pts = st.number_input("Target Pts (opt)", 5, 1000, 40, key="opt_tgt_p")
+        opt_strategy = st.selectbox("Strategy", STRATEGIES, key="opt_strat")
+        vp2 = TF_PERIOD_MAP.get(opt_tf_sel, ALL_PERIODS)
+        opt_period   = st.selectbox("Period", vp2, index=min(3,len(vp2)-1), key="opt_per")
+    with oc3:
+        opt_target_wr = st.number_input("Target Win Rate (%)", min_value=30.0, max_value=99.0,
+                                         value=60.0, step=1.0, format="%.1f", key="opt_wr")
+        opt_min_trades = st.number_input("Min Trades Threshold", 5, 500, 10, key="opt_min_tr")
+        opt_max_combos = st.number_input("Max Combinations to Test", 50, 2000, 400, key="opt_max_c")
 
-    run_opt = st.button("🚀 Run Optimization", key="btn_opt")
+    run_opt = st.button("🚀 Run Full Auto-Optimization", key="btn_opt")
+
+    # ── STRATEGY PARAM SPACE (per strategy num) ──────────────
+    def _opt_param_space(num: int) -> list[dict]:
+        """Return list of param dicts to sweep for a given strategy number."""
+        grids = []
+        if num in (1, 21):   # EMA Crossover
+            for f in [5,7,9,12,14,17]:
+                for s in [15,18,21,26,30,34,50]:
+                    if f < s: grids.append({"fast":f,"slow":s})
+        elif num == 2:
+            for f in [10,15,20,25]:
+                for s in [35,40,50,55,60]:
+                    if f < s: grids.append({"fast":f,"slow":s})
+        elif num == 3:
+            for e1 in [5,7,9,12]:
+                for e2 in [15,18,21,26]:
+                    for e3 in [34,40,50,55]:
+                        if e1<e2<e3: grids.append({"e1":e1,"e2":e2,"e3":e3})
+        elif num == 4:   # MACD
+            for f in [8,10,12,14]:
+                for s in [20,24,26,28]:
+                    for sg in [7,9,11]:
+                        if f<s: grids.append({"fast":f,"slow":s,"sig":sg})
+        elif num == 5:   # RSI
+            for p in [9,11,14,18,21]:
+                for ob in [65,70,75]:
+                    for os_ in [25,30,35]:
+                        grids.append({"period":p,"overbought":ob,"oversold":os_})
+        elif num in (6, 7):  # Bollinger
+            for p in [15,18,20,25]:
+                for std in [1.5,2.0,2.5]:
+                    grids.append({"period":p,"std":std})
+        elif num == 8:   # Supertrend
+            for p in [7,8,10,12,14]:
+                for m in [2.0,2.5,3.0,3.5,4.0]:
+                    grids.append({"period":p,"mult":m})
+        elif num == 9:   # ADX
+            for p in [10,12,14,18]:
+                for t in [20,25,30]:
+                    grids.append({"period":p,"thresh":t})
+        elif num in (10, 11):  # Stochastic
+            for k in [9,11,14,18]:
+                for d in [3,5]:
+                    grids.append({"k":k,"d":d})
+        elif num == 12:  # Ichimoku – structural, fewer variations
+            grids = [{}]
+        elif num == 13:  # VWAP
+            grids = [{}]
+        elif num == 14:  # Donchian
+            for p in [10,15,20,25,30]:
+                grids.append({"period":p})
+        elif num == 15:  # Keltner
+            for en in [15,18,20,25]:
+                for m in [1.0,1.5,2.0]:
+                    grids.append({"en":en,"mult":m})
+        elif num == 16:  # CCI
+            for p in [14,16,20,24]:
+                grids.append({"period":p})
+        elif num == 17:  # WPR
+            for p in [10,12,14,18]:
+                grids.append({"period":p})
+        elif num == 18:  # Pivot
+            grids = [{}]
+        elif num == 19:  # Heikin Ashi
+            for e in [14,18,21,26]:
+                grids.append({"ema":e})
+        elif num == 20:  # RSI+MACD
+            for rp in [9,14,18]:
+                grids.append({"rsi":rp})
+        elif num == 22:  # ORB
+            grids = [{}]
+        elif num == 23:  # Inside Bar
+            grids = [{}]
+        elif num == 24:  # MACD Histogram
+            for f in [8,10,12,14]:
+                for s in [20,24,26,28]:
+                    if f<s: grids.append({"fast":f,"slow":s})
+        elif num == 25:  # Supertrend+RSI
+            for p in [7,10,12]:
+                for m in [2.5,3.0,3.5]:
+                    for rp in [10,14,18]:
+                        grids.append({"period":p,"mult":m,"rsi":rp})
+        elif num == 26:  # VPT
+            for p in [10,12,14,18]:
+                grids.append({"period":p})
+        elif num == 27:  # Swing Breakout
+            for lb in [5,8,10,15,20]:
+                grids.append({"lookback":lb})
+        elif num == 28:  # EMA Ribbon
+            grids = [{}]
+        elif num == 29:  # Parabolic SAR
+            for af0 in [0.01,0.02,0.03]:
+                for afm in [0.15,0.20,0.25]:
+                    grids.append({"af0":af0,"afmax":afm})
+        elif num == 30:  # Dual Momentum
+            for p1 in [5,7,10,12]:
+                for p2 in [20,25,30,35]:
+                    grids.append({"p1":p1,"p2":p2})
+        else:
+            grids = [{}]
+        return grids if grids else [{}]
 
     if run_opt:
         st.session_state.opt_results = None
-        with st.spinner("Fetching data for optimization…"):
-            df_opt = fetch_data(opt_ticker, opt_period, opt_tf, force_fresh=True)
-        if df_opt is None or df_opt.empty:
-            st.error("Failed to fetch data.")
-        else:
-            ef_range = list(range(ef_lo, ef_hi+1, max(ef_step,1)))
-            es_range = list(range(es_lo, es_hi+1, max(es_step,1)))
-            combos   = [(ef,es) for ef in ef_range for es in es_range if ef < es]
+        with st.spinner(f"Fetching data for {opt_ticker}…"):
+            df_opt = fetch_data(opt_ticker, opt_period, opt_tf_sel, force_fresh=True)
 
-            if len(combos) > 200:
-                st.warning(f"Limiting to first 200 out of {len(combos)} combinations.")
-                combos = combos[:200]
+        if df_opt is None or df_opt.empty:
+            st.error("Failed to fetch data. Check ticker / period / timeframe.")
+        else:
+            try:
+                strat_num = int(opt_strategy.split(".")[0].strip())
+            except:
+                strat_num = 1
+
+            param_space = _opt_param_space(strat_num)
+
+            # SL / Target combos to test
+            sl_combos  = ["Custom Points","ATR Based","Trailing SL (Fixed Points)",
+                          "Previous Candle Low/High","Volatility Based","Auto (AI Managed)"]
+            tgt_combos = ["Custom Points","ATR Based","Risk/Reward Based",
+                          "Trailing Target (Fixed Points)","Auto (AI Managed)"]
+
+            # SL/Target params variations
+            sl_pt_vals  = [10,20,30,50]
+            tgt_pt_vals = [20,40,60,100]
+            atr_sl_vals = [1.5,2.0,2.5,3.0]
+            atr_tg_vals = [2.0,3.0,4.0]
+            rr_vals     = [1.5,2.0,2.5,3.0]
+
+            # Build full combination list
+            all_combos = []
+            for p_dict in param_space:
+                for sl_t in sl_combos:
+                    for tgt_t in tgt_combos:
+                        for sl_pts_ in sl_pt_vals:
+                            for tgt_pts_ in tgt_pt_vals:
+                                for atr_sl_ in atr_sl_vals:
+                                    all_combos.append({
+                                        "params"   : p_dict,
+                                        "sl_type"  : sl_t,
+                                        "tgt_type" : tgt_t,
+                                        "sl_pts"   : sl_pts_,
+                                        "tgt_pts"  : tgt_pts_,
+                                        "atr_sl"   : atr_sl_,
+                                        "atr_tgt"  : 3.0,
+                                        "rr"       : 2.0,
+                                    })
+
+            # Cap and shuffle for diversity
+            import random
+            random.seed(42)
+            random.shuffle(all_combos)
+            max_c = int(opt_max_combos)
+            all_combos = all_combos[:max_c]
 
             best_results = []
-            prog = st.progress(0)
+            prog      = st.progress(0)
             prog_text = st.empty()
 
-            sp_ = {"sl_pts":opt_sl_pts,"atr_sl_mult":2.0,"rr_target_pts":opt_tgt_pts,
-                   "rr_ratio":2.0,"ema_fast":9,"ema_slow":21,"swing_lb":5}
-            tp_ = {"tgt_pts":opt_tgt_pts,"atr_tgt_mult":3.0,"rr_sl_pts":opt_sl_pts,
-                   "rr_ratio":2.0,"swing_lb":5}
-
-            for idx_,(ef,es) in enumerate(combos):
-                prog_text.text(f"Testing EMA({ef},{es}) — {idx_+1}/{len(combos)}")
-                prog.progress((idx_+1)/len(combos))
-
+            for idx_, combo in enumerate(all_combos):
+                pct = (idx_+1)/len(all_combos)
+                prog.progress(pct)
+                prog_text.text(
+                    f"Testing combo {idx_+1}/{len(all_combos)}  "
+                    f"| SL: {combo['sl_type'][:18]}  "
+                    f"| Tgt: {combo['tgt_type'][:18]}  "
+                    f"| Params: {combo['params']}"
+                )
                 try:
-                    df_tmp = df_opt.copy()
-                    df_s   = compute_signals(df_tmp, opt_strategy, {"fast":ef,"slow":es,"e1":ef,"e2":es})
-                    tr_    = run_backtest(df_opt, opt_strategy, opt_sl_type, opt_tgt_type,
-                                         sp_, tp_, allow_overlap=False, initial_capital=float(initial_cap))
-                    mt_    = calc_metrics(tr_, float(initial_cap))
+                    sp_ = {
+                        "sl_pts"       : combo["sl_pts"],
+                        "atr_sl_mult"  : combo["atr_sl"],
+                        "rr_target_pts": combo["tgt_pts"],
+                        "rr_ratio"     : combo["rr"],
+                        "ema_fast"     : combo["params"].get("fast",9),
+                        "ema_slow"     : combo["params"].get("slow",21),
+                        "swing_lb"     : 5,
+                    }
+                    tp_ = {
+                        "tgt_pts"     : combo["tgt_pts"],
+                        "atr_tgt_mult": combo["atr_tgt"],
+                        "rr_sl_pts"   : combo["sl_pts"],
+                        "rr_ratio"    : combo["rr"],
+                        "swing_lb"    : 5,
+                    }
+                    tr_ = run_backtest(
+                        df_opt, opt_strategy, combo["sl_type"], combo["tgt_type"],
+                        sp_, tp_, allow_overlap=False, qty=1
+                    )
+                    mt_ = calc_metrics(tr_)
 
-                    if mt_ and mt_.get("Total Trades",0) >= opt_min_trades:
+                    if mt_ and mt_.get("Total Trades",0) >= int(opt_min_trades):
                         best_results.append({
-                            "EMA Fast"    : ef,
-                            "EMA Slow"    : es,
-                            "Win Rate (%)" : mt_["Win Rate (%)"],
-                            "Total Trades" : mt_["Total Trades"],
-                            "Total P&L"   : mt_["Total P&L"],
-                            "Profit Factor": mt_["Profit Factor"],
-                            "Max Drawdown" : mt_["Max Drawdown"],
-                            "Return (%)"   : mt_["Return (%)"],
-                            "Sharpe"       : mt_["Sharpe Ratio"],
+                            "Win Rate (%)"  : mt_["Win Rate (%)"],
+                            "Profit Factor" : mt_["Profit Factor"],
+                            "Total Trades"  : mt_["Total Trades"],
+                            "Total P&L"     : mt_["Total P&L (pts×qty)"],
+                            "Avg Win"       : mt_["Avg Win (pts×qty)"],
+                            "Avg Loss"      : mt_["Avg Loss (pts×qty)"],
+                            "Max Drawdown"  : mt_["Max Drawdown"],
+                            "Sharpe"        : mt_["Sharpe Ratio"],
+                            "Expectancy"    : mt_["Expectancy"],
+                            "SL Type"       : combo["sl_type"],
+                            "Target Type"   : combo["tgt_type"],
+                            "SL Points"     : combo["sl_pts"],
+                            "Target Points" : combo["tgt_pts"],
+                            "ATR SL Mult"   : combo["atr_sl"],
+                            "R:R Ratio"     : combo["rr"],
+                            "Strategy Params": str(combo["params"]),
                         })
                 except:
                     continue
@@ -1726,70 +2163,139 @@ with tab_opt:
             prog.empty(); prog_text.empty()
 
             if best_results:
-                opt_df = pd.DataFrame(best_results).sort_values("Win Rate (%)", ascending=False)
-                st.session_state.opt_results = opt_df
+                opt_df_res = pd.DataFrame(best_results).sort_values(
+                    ["Win Rate (%)","Profit Factor"], ascending=False
+                ).reset_index(drop=True)
+                st.session_state.opt_results = opt_df_res
             else:
-                st.warning("No valid combinations found. Try wider ranges or more data.")
+                st.warning("No valid combinations found. Try a longer period or lower min trades.")
 
-    # Display optimization results
+    # ── Display results ──────────────────────────────────────
     opt_df = st.session_state.get("opt_results")
     if opt_df is not None and not opt_df.empty:
-        st.markdown("### Optimization Results")
-        st.success(f"Found {len(opt_df)} valid parameter sets. Sorted by Win Rate.")
-
-        # Top 10
-        top10 = opt_df.head(10)
-        st.markdown("#### Top 10 Configurations")
-        st.dataframe(top10, use_container_width=True)
-
-        # Best config
-        best = opt_df.iloc[0]
         st.markdown("---")
-        st.markdown("### ⭐ Best Configuration")
-        bc1,bc2,bc3,bc4 = st.columns(4)
-        bc1.metric("EMA Fast",  int(best["EMA Fast"]))
-        bc2.metric("EMA Slow",  int(best["EMA Slow"]))
-        bc3.metric("Win Rate",  f"{best['Win Rate (%)']:.1f}%")
-        bc4.metric("Profit Factor", f"{best['Profit Factor']:.2f}")
+        st.success(f"✅ Optimization complete — {len(opt_df)} valid configurations found out of tested combos.")
 
-        st.info(f"💡 **Recommended:** Use EMA Fast = **{int(best['EMA Fast'])}**, "
-                f"EMA Slow = **{int(best['EMA Slow'])}** with **{opt_strategy}** strategy. "
-                f"Win Rate: **{best['Win Rate (%)']:.1f}%** | Trades: **{int(best['Total Trades'])}** | "
-                f"P&L: **₹{best['Total P&L']:,.0f}**")
+        target_wr_val = st.session_state.get("opt_wr_val", 60.0)
 
-        if best["Win Rate (%)"] >= opt_target_wr:
-            st.success(f"✅ Target of {opt_target_wr}% win rate ACHIEVED!")
+        best = opt_df.iloc[0]
+        beat_target = best["Win Rate (%)"] >= opt_target_wr
+
+        if beat_target:
+            st.success(f"🏆 Target win rate of {opt_target_wr:.1f}% ACHIEVED! Best result: {best['Win Rate (%)']:.1f}%")
         else:
-            st.warning(f"⚠️ Best win rate {best['Win Rate (%)']:.1f}% is below target {opt_target_wr}%. "
-                       f"Consider a different strategy or instrument.")
+            st.warning(f"⚠️ Best win rate is {best['Win Rate (%)']:.1f}% — below target of {opt_target_wr:.1f}%. "
+                       f"Try a different period, timeframe, or lower the target.")
 
-        # Scatter plot
-        fig_opt = go.Figure()
-        fig_opt.add_trace(go.Scatter(
-            x=opt_df["EMA Fast"], y=opt_df["Win Rate (%)"],
-            mode="markers",
-            marker=dict(
-                size=opt_df["Total Trades"].clip(1)/opt_df["Total Trades"].max()*20+5,
-                color=opt_df["Profit Factor"].clip(0,5),
-                colorscale=[[0,"#cccccc"],[0.5,"#666666"],[1,"#000000"]],
-                colorbar=dict(title="Profit Factor"),
-                showscale=True
-            ),
-            text=[f"EMA({r['EMA Fast']},{r['EMA Slow']})<br>WR:{r['Win Rate (%)']:.1f}%"
-                  for _,r in opt_df.iterrows()],
-            hovertemplate="%{text}<extra></extra>"
-        ))
-        fig_opt.update_layout(title="Optimization Landscape",
-                              xaxis_title="EMA Fast", yaxis_title="Win Rate (%)",
-                              height=400, template="plotly_white",
-                              plot_bgcolor="#fff", paper_bgcolor="#fff",
-                              font=dict(color="#000"))
-        st.plotly_chart(fig_opt, use_container_width=True)
+        st.markdown("### ⭐ Best Configuration")
+        bc_cols = st.columns(5)
+        bc_cols[0].metric("Win Rate",      f"{best['Win Rate (%)']:.1f}%")
+        bc_cols[1].metric("Profit Factor", f"{best['Profit Factor']:.2f}")
+        bc_cols[2].metric("Total Trades",  int(best["Total Trades"]))
+        bc_cols[3].metric("Total P&L",     f"{best['Total P&L']:.2f}")
+        bc_cols[4].metric("Sharpe",        f"{best['Sharpe']:.2f}")
 
-        if st.button("📋 Export Optimization Results as CSV", key="btn_opt_csv"):
-            csv = opt_df.to_csv(index=False)
-            st.download_button("⬇ Download CSV", csv, "optimization_results.csv",
-                               "text/csv", key="dl_opt_csv")
+        st.markdown("#### Best Parameters to Use in Live Trading")
+        st.markdown(f"""
+| Parameter | Value |
+|-----------|-------|
+| **Strategy** | {st.session_state.get("opt_strat","—")} |
+| **SL Type** | {best['SL Type']} |
+| **Target Type** | {best['Target Type']} |
+| **SL Points** | {best['SL Points']} |
+| **Target Points** | {best['Target Points']} |
+| **ATR SL Multiplier** | {best['ATR SL Mult']} |
+| **R:R Ratio** | {best['R:R Ratio']} |
+| **Strategy Params** | `{best['Strategy Params']}` |
+        """)
+        st.info("💡 Apply these exact settings in the sidebar, then go to Live Trading or Backtesting with full confidence.")
+
+        # Tabs for results exploration
+        res_tabs = st.tabs(["Top 30 Results","Win Rate Distribution","Parameter Heatmap","Export"])
+        with res_tabs[0]:
+            st.dataframe(opt_df.head(30), use_container_width=True)
+
+        with res_tabs[1]:
+            fig_wr = go.Figure()
+            fig_wr.add_trace(go.Histogram(
+                x=opt_df["Win Rate (%)"], nbinsx=30,
+                marker_color="#000000", opacity=0.7, name="Win Rate Distribution"
+            ))
+            fig_wr.add_vline(x=opt_target_wr, line_dash="dash", line_color="#555",
+                             annotation_text=f"Target {opt_target_wr:.0f}%")
+            fig_wr.update_layout(
+                title="Win Rate Distribution Across All Tested Combinations",
+                height=350, template="plotly_white",
+                plot_bgcolor="#fff", paper_bgcolor="#fff",
+                font=dict(color="#000"),
+                xaxis_title="Win Rate (%)", yaxis_title="Count"
+            )
+            st.plotly_chart(fig_wr, use_container_width=True)
+
+            # PF vs WR scatter
+            fig_pf = go.Figure()
+            fig_pf.add_trace(go.Scatter(
+                x=opt_df["Win Rate (%)"],
+                y=opt_df["Profit Factor"].clip(0,10),
+                mode="markers",
+                marker=dict(
+                    color=opt_df["Total P&L"],
+                    colorscale=[[0,"#cccccc"],[0.5,"#666"],[1,"#000"]],
+                    size=8, colorbar=dict(title="P&L"),
+                    showscale=True
+                ),
+                text=[f"WR:{r['Win Rate (%)']:.1f}%  PF:{r['Profit Factor']:.2f}<br>"
+                      f"SL:{r['SL Type']}<br>Tgt:{r['Target Type']}"
+                      for _,r in opt_df.iterrows()],
+                hovertemplate="%{text}<extra></extra>",
+                name="All Results"
+            ))
+            fig_pf.update_layout(
+                title="Win Rate vs Profit Factor",
+                height=350, template="plotly_white",
+                plot_bgcolor="#fff", paper_bgcolor="#fff",
+                font=dict(color="#000"),
+                xaxis_title="Win Rate (%)", yaxis_title="Profit Factor"
+            )
+            st.plotly_chart(fig_pf, use_container_width=True)
+
+        with res_tabs[2]:
+            st.markdown("#### Top SL Types by Average Win Rate")
+            sl_grp = opt_df.groupby("SL Type")["Win Rate (%)"].mean().sort_values(ascending=False).reset_index()
+            fig_sl = go.Figure(go.Bar(
+                x=sl_grp["SL Type"], y=sl_grp["Win Rate (%)"],
+                marker_color="#000000"
+            ))
+            fig_sl.update_layout(height=300, template="plotly_white",
+                                  plot_bgcolor="#fff", paper_bgcolor="#fff",
+                                  font=dict(color="#000"),
+                                  xaxis_title="SL Type", yaxis_title="Avg Win Rate (%)")
+            st.plotly_chart(fig_sl, use_container_width=True)
+
+            st.markdown("#### Top Target Types by Average Win Rate")
+            tgt_grp = opt_df.groupby("Target Type")["Win Rate (%)"].mean().sort_values(ascending=False).reset_index()
+            fig_tgt = go.Figure(go.Bar(
+                x=tgt_grp["Target Type"], y=tgt_grp["Win Rate (%)"],
+                marker_color="#444444"
+            ))
+            fig_tgt.update_layout(height=300, template="plotly_white",
+                                   plot_bgcolor="#fff", paper_bgcolor="#fff",
+                                   font=dict(color="#000"))
+            st.plotly_chart(fig_tgt, use_container_width=True)
+
+        with res_tabs[3]:
+            csv_data = opt_df.to_csv(index=False)
+            st.download_button(
+                "⬇ Download All Results as CSV",
+                csv_data,
+                f"optimization_{opt_strategy[:15].strip()}.csv",
+                "text/csv",
+                key="dl_opt_csv"
+            )
+            st.markdown("**Summary Statistics:**")
+            st.dataframe(opt_df[["Win Rate (%)","Profit Factor","Total P&L",
+                                  "Sharpe","Expectancy"]].describe().round(2),
+                         use_container_width=True)
 
 # ═════════════════════════════════════════════════════════════
 # TAB 6 – DHAN API
