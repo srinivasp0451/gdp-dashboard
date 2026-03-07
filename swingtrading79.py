@@ -77,10 +77,24 @@ st.markdown("""
   /* ── Labels & text ── */
   label, .stSelectbox label, .stMultiSelect label,
   .stNumberInput label, .stCheckbox label,
-  .stRadio label, .stTimeInput label { color:#000000 !important; font-weight:500 !important; }
+  .stRadio label, .stTimeInput label,
+  .stTextInput label { color:#000000 !important; font-weight:500 !important; }
+  .stTextInput input, .stNumberInput input { color:#000000 !important; background:#ffffff !important; }
+  .stSelectbox div[data-baseweb="select"] { color:#000000 !important; }
   h1,h2,h3,h4,h5,h6 { color:#000000 !important; }
   p { color:#000000 !important; }
   .stMarkdown p, .stMarkdown li { color:#000000 !important; }
+  /* Force ALL text in main area to be black */
+  .main .block-container p,
+  .main .block-container label,
+  .main .block-container span:not(.live-badge):not(.price-ticker span),
+  .main .block-container div:not(.stButton):not(.stDownloadButton) {
+      color:#000000 !important;
+  }
+  /* Metric labels */
+  [data-testid="stMetricLabel"] { color:#000000 !important; }
+  [data-testid="stMetricValue"] { color:#000000 !important; }
+  [data-testid="stMetricDelta"] { color:#006400 !important; }
 
   /* ── Sidebar ── */
   .stSidebar { background-color:#f8f8f8 !important; }
@@ -1080,6 +1094,15 @@ def run_backtest(df_raw, strategy, sl_type, tgt_type, sp, tp,
         for pos in open_positions:
             d = pos["direction"]
 
+            # Track high/low during the trade
+            pos["trade_high"] = max(pos.get("trade_high", cur_h), cur_h)
+            pos["trade_low"]  = min(pos.get("trade_low",  cur_l), cur_l)
+
+            # Don't check exits on the same bar as entry
+            if i <= pos.get("entry_bar", 0):
+                still_open.append(pos)
+                continue
+
             # Update trailing SL
             pos = update_trail_sl(pos, df, i, sl_type, sp, atr_v)
 
@@ -1141,6 +1164,9 @@ def run_backtest(df_raw, strategy, sl_type, tgt_type, sp, tp,
                     "sl_level"        : round(pos["sl_initial"],4),
                     "final_sl"        : round(pos["sl"],4),
                     "target_level"    : round(pos["target"],4),
+                    # ── High / Low during trade ──────────────────────
+                    "trade_high"      : round(pos.get("trade_high", cur_h),4),
+                    "trade_low"       : round(pos.get("trade_low",  cur_l),4),
                     # ── Points ──────────────────────────────────────
                     "points_captured" : round(pts,4),
                     "points_risked"   : round(abs(pos["entry_price"]-pos["sl_initial"]),4),
@@ -1167,21 +1193,26 @@ def run_backtest(df_raw, strategy, sl_type, tgt_type, sp, tp,
                 if i + 1 < len(df):
                     ep = float(df["Open"].iloc[i+1])
                     entry_t = df.index[i+1]
+                    entry_bar_idx = i + 1  # first bar we can exit is i+2
                 else:
                     ep = cur_c
                     entry_t = cur_t
+                    entry_bar_idx = i
                 sl_ = calc_sl(df, i, ep, sig, sl_type, sp, atr_v)
                 tg_ = calc_target(df, i, ep, sig, tgt_type, tp, atr_v)
                 entry_logic = _entry_logic_text(strategy, sig, df, i, atr_v, ep)
                 open_positions.append({
-                    "direction"   : sig,
-                    "entry_price" : ep,
-                    "entry_time"  : entry_t,
-                    "sl"          : sl_,
-                    "sl_initial"  : sl_,
-                    "target"      : tg_,
-                    "entry_type"  : "Signal-Bar+1 Open",
-                    "entry_logic" : entry_logic,
+                    "direction"    : sig,
+                    "entry_price"  : ep,
+                    "entry_time"   : entry_t,
+                    "entry_bar"    : entry_bar_idx,
+                    "sl"           : sl_,
+                    "sl_initial"   : sl_,
+                    "target"       : tg_,
+                    "entry_type"   : "Signal-Bar+1 Open",
+                    "entry_logic"  : entry_logic,
+                    "trade_high"   : ep,   # track highest price during trade
+                    "trade_low"    : ep,   # track lowest price during trade
                 })
 
     # Close any remaining open positions
@@ -1204,6 +1235,8 @@ def run_backtest(df_raw, strategy, sl_type, tgt_type, sp, tp,
                 "sl_level"        : round(pos["sl_initial"],4),
                 "final_sl"        : round(pos["sl"],4),
                 "target_level"    : round(pos["target"],4),
+                "trade_high"      : round(pos.get("trade_high", last_c),4),
+                "trade_low"       : round(pos.get("trade_low",  last_c),4),
                 "points_captured" : round(pts,4),
                 "points_risked"   : round(abs(pos["entry_price"]-pos["sl_initial"]),4),
                 "qty"             : q,
@@ -1699,6 +1732,27 @@ def show_price_ticker(ticker: str):
 # SIDEBAR  –  Global Configuration
 # ─────────────────────────────────────────────────────────────
 with st.sidebar:
+    # ── Consume any pending config from optimizer ──────────────
+    _p = st.session_state
+    if "_pending_sl_type" in _p:
+        sl_type_default  = _p.pop("_pending_sl_type")
+        tgt_type_default = _p.pop("_pending_tgt_type", None)
+        sl_pts_default   = _p.pop("_pending_sl_pts",   20)
+        tgt_pts_default  = _p.pop("_pending_tgt_pts",  40)
+        atr_sl_default   = _p.pop("_pending_atr_sl",   2.0)
+        rr_default       = _p.pop("_pending_rr",       2.0)
+        ema_f_default    = _p.pop("_pending_ema_f",    9)
+        ema_sl_default   = _p.pop("_pending_ema_sl",   21)
+    else:
+        sl_type_default  = _p.get("sb_sl_type_val",   SL_TYPES[5])
+        tgt_type_default = _p.get("sb_tgt_type_val",  TARGET_TYPES[6])
+        sl_pts_default   = _p.get("sb_sl_pts_val",    20)
+        tgt_pts_default  = _p.get("sb_tgt_pts_val",   40)
+        atr_sl_default   = _p.get("sb_atr_sl_val",    2.0)
+        rr_default       = _p.get("sb_rr_val",        2.0)
+        ema_f_default    = _p.get("sb_ema_f_val",     9)
+        ema_sl_default   = _p.get("sb_ema_sl_val",    21)
+
     st.markdown("## ⚙️ Configuration")
     st.markdown("---")
 
@@ -1743,12 +1797,13 @@ with st.sidebar:
 
     # ── Stop Loss ─────────────────────────────────────────────
     st.markdown("### Stop Loss")
-    sl_type    = st.selectbox("SL Type", SL_TYPES, index=5, key="sb_sl_type")
-    sl_pts     = st.number_input("SL Points (Custom/Trailing)", 1, 10_000, 20, key="sb_sl_pts")
-    atr_sl_m   = st.number_input("ATR SL Multiplier", min_value=0.1, max_value=10.0, value=2.0, step=0.1, format="%.1f", key="sb_atr_sl")
-    rr_ratio_sl= st.number_input("R:R Ratio (RR-based SL)", min_value=0.5, max_value=20.0, value=2.0, step=0.5, format="%.1f", key="sb_rr_sl")
-    ema_fast_s = st.number_input("EMA Fast (Crossover SL)", 3, 100, 9,  key="sb_ema_f")
-    ema_slow_s = st.number_input("EMA Slow (Crossover SL)", 5, 200, 21, key="sb_ema_sl")
+    _sl_idx = SL_TYPES.index(sl_type_default) if sl_type_default in SL_TYPES else 5
+    sl_type    = st.selectbox("SL Type", SL_TYPES, index=_sl_idx, key="sb_sl_type")
+    sl_pts     = st.number_input("SL Points (Custom/Trailing)", 1, 10_000, int(sl_pts_default), key="sb_sl_pts")
+    atr_sl_m   = st.number_input("ATR SL Multiplier", min_value=0.1, max_value=10.0, value=float(atr_sl_default), step=0.1, format="%.1f", key="sb_atr_sl")
+    rr_ratio_sl= st.number_input("R:R Ratio (RR-based SL)", min_value=0.5, max_value=20.0, value=float(rr_default), step=0.5, format="%.1f", key="sb_rr_sl")
+    ema_fast_s = st.number_input("EMA Fast (Crossover SL)", 3, 100, int(ema_f_default),  key="sb_ema_f")
+    ema_slow_s = st.number_input("EMA Slow (Crossover SL)", 5, 200, int(ema_sl_default), key="sb_ema_sl")
     swing_lb_s = st.number_input("Swing Lookback (bars)", 3, 50, 5, key="sb_swing_sl")
 
     SL_PARAMS = {
@@ -1763,10 +1818,11 @@ with st.sidebar:
 
     # ── Target ────────────────────────────────────────────────
     st.markdown("### Target")
-    tgt_type   = st.selectbox("Target Type", TARGET_TYPES, index=6, key="sb_tgt_type")
-    tgt_pts    = st.number_input("Target Points", 1, 50_000, 40, key="sb_tgt_pts")
+    _tgt_idx = TARGET_TYPES.index(tgt_type_default) if tgt_type_default in TARGET_TYPES else 6
+    tgt_type   = st.selectbox("Target Type", TARGET_TYPES, index=_tgt_idx, key="sb_tgt_type")
+    tgt_pts    = st.number_input("Target Points", 1, 50_000, int(tgt_pts_default), key="sb_tgt_pts")
     atr_tgt_m  = st.number_input("ATR Target Multiplier", min_value=0.5, max_value=20.0, value=3.0, step=0.5, format="%.1f", key="sb_atr_tgt")
-    rr_ratio_t = st.number_input("R:R Ratio (Target)", min_value=0.5, max_value=20.0, value=2.0, step=0.5, format="%.1f", key="sb_rr_tgt")
+    rr_ratio_t = st.number_input("R:R Ratio (Target)", min_value=0.5, max_value=20.0, value=float(rr_default), step=0.5, format="%.1f", key="sb_rr_tgt")
     swing_lb_t = st.number_input("Swing Lookback (Target)", 3, 50, 5, key="sb_swing_tgt")
 
     TGT_PARAMS = {
@@ -1891,7 +1947,8 @@ with tab_bt:
             display_cols = [
                 c for c in [
                     "entry_time","exit_time","direction","entry_type",
-                    "entry_price","exit_price","sl_level","target_level","final_sl",
+                    "entry_price","exit_price","trade_high","trade_low",
+                    "sl_level","target_level","final_sl",
                     "points_captured","points_risked","qty","pnl","result_icon",
                     "cum_pts","cum_pnl","exit_reason","entry_logic","exit_logic"
                 ] if c in tdf.columns
@@ -2013,6 +2070,16 @@ with tab_live:
                     # Signal from last CLOSED bar (iloc[-2]), price levels from current bar
                     sig_bar_idx = -2 if len(df_sig) >= 2 else -1
                     last_sig = int(df_sig["signal"].iloc[sig_bar_idx])
+
+                    # For Simple Buy / Simple Sell — always active, no waiting for crossover
+                    try:
+                        _strat_num = int(strategy.split(".")[0].strip())
+                        if _strat_num == 41:
+                            last_sig = 1   # Always LONG
+                        elif _strat_num == 42:
+                            last_sig = -1  # Always SHORT
+                    except:
+                        pass
                     last_c   = float(df_sig["Close"].iloc[-1])   # current bar close
                     last_h   = float(df_sig["High"].iloc[-1])
                     last_l   = float(df_sig["Low"].iloc[-1])
@@ -2046,25 +2113,32 @@ with tab_live:
                             ep_exit = pos["sl"] if sl_hit else (pos["target"] if tgt_hit else last_c)
                             pnl  = (ep_exit - pos["entry_price"]) * d * qty
                             pts  = (ep_exit - pos["entry_price"]) * d
-                            st.session_state.live_trades.append({
-                                "entry_time"      : pos["entry_time"],
-                                "exit_time"       : last_t,
-                                "direction"       : "LONG" if d==1 else "SHORT",
-                                "entry_type"      : pos.get("entry_type","Signal"),
-                                "entry_logic"     : pos.get("entry_logic",""),
-                                "entry_price"     : pos["entry_price"],
-                                "exit_price"      : round(ep_exit,4),
-                                "sl_level"        : round(pos.get("sl_initial", pos["sl"]),4),
-                                "final_sl"        : round(pos["sl"],4),
-                                "target_level"    : round(pos["target"],4),
-                                "points_captured" : round(pts,4),
-                                "points_risked"   : round(abs(pos["entry_price"]-pos.get("sl_initial",pos["sl"])),4),
-                                "qty"             : qty,
-                                "pnl"             : round(pnl,2),
-                                "result"          : "WIN" if pnl>0 else ("LOSS" if pnl<0 else "BE"),
-                                "exit_reason"     : reason,
-                                "exit_logic"      : _exit_logic_text(reason, pos, ep_exit, d),
-                            })
+                            # Guard: only append if this position hasn't been closed already
+                            already_closed = any(
+                                t.get("entry_time") == pos["entry_time"] and
+                                t.get("entry_price") == pos["entry_price"]
+                                for t in st.session_state.live_trades
+                            )
+                            if not already_closed:
+                                st.session_state.live_trades.append({
+                                    "entry_time"      : pos["entry_time"],
+                                    "exit_time"       : last_t,
+                                    "direction"       : "LONG" if d==1 else "SHORT",
+                                    "entry_type"      : pos.get("entry_type","Signal"),
+                                    "entry_logic"     : pos.get("entry_logic",""),
+                                    "entry_price"     : pos["entry_price"],
+                                    "exit_price"      : round(ep_exit,4),
+                                    "sl_level"        : round(pos.get("sl_initial", pos["sl"]),4),
+                                    "final_sl"        : round(pos["sl"],4),
+                                    "target_level"    : round(pos["target"],4),
+                                    "points_captured" : round(pts,4),
+                                    "points_risked"   : round(abs(pos["entry_price"]-pos.get("sl_initial",pos["sl"])),4),
+                                    "qty"             : qty,
+                                    "pnl"             : round(pnl,2),
+                                    "result"          : "WIN" if pnl>0 else ("LOSS" if pnl<0 else "BE"),
+                                    "exit_reason"     : reason,
+                                    "exit_logic"      : _exit_logic_text(reason, pos, ep_exit, d),
+                                })
                             st.session_state.live_open_pos = None
                             st.session_state.last_trade_time = time.time()
                             pnl_color = "win" if pnl>0 else "loss"
@@ -2072,8 +2146,9 @@ with tab_live:
                                         f'⚡ Position closed — {reason} | P&L: '
                                         f'<span class="{pnl_color}">{pnl:+.2f} pts×qty</span></div>',
                                         unsafe_allow_html=True)
-
-                        st.session_state.live_open_pos = pos
+                        else:
+                            # Position still open — update unrealized and save back
+                            st.session_state.live_open_pos = pos
 
                     # Open new position on confirmed signal
                     if last_sig != 0 and st.session_state.live_open_pos is None:
@@ -2216,12 +2291,12 @@ with tab_hist:
         # Filters
         fc1, fc2, fc3 = st.columns(3)
         if "strategy" in hist_df.columns:
-            strats_avail = ["All"] + sorted(hist_df["strategy"].unique().tolist())
+            strats_avail = ["All"] + sorted([str(x) for x in hist_df["strategy"].dropna().unique()])
             sel_strat = fc1.selectbox("Filter Strategy", strats_avail, key="hist_strat_f")
         else:
             sel_strat = "All"
         if "ticker" in hist_df.columns:
-            tickers_avail = ["All"] + sorted(hist_df["ticker"].unique().tolist())
+            tickers_avail = ["All"] + sorted([str(x) for x in hist_df["ticker"].dropna().unique()])
             sel_tick = fc2.selectbox("Filter Ticker", tickers_avail, key="hist_tick_f")
         else:
             sel_tick = "All"
@@ -2561,6 +2636,11 @@ with tab_opt:
 
     run_opt = st.button("🚀 Run Full Auto-Optimization", key="btn_opt")
 
+    # Time filter option for optimization
+    opt_use_tf = st.checkbox("Apply Trading Time Filter in Optimization",
+                              value=use_time_filter, key="opt_use_tf",
+                              help=f"Uses the same time window set in sidebar: {t_start} – {t_end} IST")
+
     # ── STRATEGY PARAM SPACE (per strategy num) ──────────────
     def _opt_param_space(num: int) -> list[dict]:
         """Return list of param dicts to sweep for a given strategy number."""
@@ -2748,7 +2828,8 @@ with tab_opt:
                     }
                     tr_ = run_backtest(
                         df_opt, opt_strategy, combo["sl_type"], combo["tgt_type"],
-                        sp_, tp_, allow_overlap=False, qty=1
+                        sp_, tp_, allow_overlap=False, qty=1,
+                        use_tf=opt_use_tf, tf_start=t_start, tf_end=t_end
                     )
                     mt_ = calc_metrics(tr_)
 
@@ -2837,24 +2918,21 @@ with tab_opt:
         """)
 
         if st.button("⚡ Apply Best Config to Sidebar (Use for Live/Backtest)", key="btn_apply_best"):
-            st.session_state["sb_sl_type"]  = best["SL Type"]
-            st.session_state["sb_tgt_type"] = best["Target Type"]
-            st.session_state["sb_sl_pts"]   = int(best["SL Points"])
-            st.session_state["sb_tgt_pts"]  = int(best["Target Points"])
-            st.session_state["sb_atr_sl"]   = float(best["ATR SL Mult"])
-            st.session_state["sb_rr_sl"]    = float(best["R:R Ratio"])
-            st.session_state["sb_rr_tgt"]   = float(best["R:R Ratio"])
-            # Apply strategy params if available
+            # Store pending values — sidebar reads these on next rerun BEFORE widget creation
+            st.session_state["_pending_sl_type"]  = best["SL Type"]
+            st.session_state["_pending_tgt_type"] = best["Target Type"]
+            st.session_state["_pending_sl_pts"]   = int(float(best["SL Points"]))
+            st.session_state["_pending_tgt_pts"]  = int(float(best["Target Points"]))
+            st.session_state["_pending_atr_sl"]   = float(best["ATR SL Mult"])
+            st.session_state["_pending_rr"]       = float(best["R:R Ratio"])
             try:
                 import ast as _ast
                 p_dict = _ast.literal_eval(best["Strategy Params"])
-                if "fast" in p_dict:
-                    st.session_state["sb_ema_f"]  = int(p_dict["fast"])
-                if "slow" in p_dict:
-                    st.session_state["sb_ema_sl"] = int(p_dict["slow"])
+                if "fast" in p_dict: st.session_state["_pending_ema_f"]  = int(p_dict["fast"])
+                if "slow" in p_dict: st.session_state["_pending_ema_sl"] = int(p_dict["slow"])
             except:
                 pass
-            st.success("✅ Best config applied to sidebar! Switch to Backtesting or Live Trading tab.")
+            st.success("✅ Config queued! Page will reload with new settings in sidebar.")
             st.rerun()
 
         st.info("💡 Click the button above to auto-fill sidebar settings with the best found configuration.")
