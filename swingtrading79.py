@@ -2960,9 +2960,7 @@ with tab_opt:
     opt_df = st.session_state.get("opt_results")
     if opt_df is not None and not opt_df.empty:
         st.markdown("---")
-        st.success(f"✅ Optimization complete — {len(opt_df)} valid configurations found out of tested combos.")
-
-        target_wr_val = st.session_state.get("opt_wr_val", 60.0)
+        st.success(f"✅ Optimization complete — {len(opt_df)} valid configurations found.")
 
         best = opt_df.iloc[0]
         beat_target = best["Win Rate (%)"] >= opt_target_wr
@@ -2981,7 +2979,7 @@ with tab_opt:
         bc_cols[3].metric("Total P&L",     f"{best['Total P&L']:.2f}")
         bc_cols[4].metric("Sharpe",        f"{best['Sharpe']:.2f}")
 
-        st.markdown("#### Best Parameters to Use in Live Trading")
+        st.markdown("#### Best Parameters")
         st.markdown(f"""
 | Parameter | Value |
 |-----------|-------|
@@ -2995,33 +2993,18 @@ with tab_opt:
 | **Strategy Params** | `{best['Strategy Params']}` |
         """)
 
-        if st.button("⚡ Apply Best Config (#1) to Sidebar", key="btn_apply_best"):
+        if st.button("⚡ Apply Best Config to Sidebar", key="btn_apply_best"):
             _apply_opt_row_to_sidebar(best, opt_strategy, opt_ticker, opt_tf_sel, opt_period)
-            st.success("✅ Best config applied to sidebar — switch to Backtesting or Live Trading.")
+            st.success("✅ Best config applied to sidebar — switch to Backtesting or Live Trading tab.")
             st.rerun()
 
-        st.info("💡 Use the button above (or the 'Apply' buttons in Top 30 below) to load any config into the sidebar.")
+        st.info("💡 Click the button above to auto-fill sidebar with the best found configuration.")
 
         # Tabs for results exploration
-        res_tabs = st.tabs(["Top 30 Results","Win Rate Distribution","Parameter Heatmap","Export"])
+        res_tabs = st.tabs(["Top 30 Results", "Win Rate Distribution", "Parameter Heatmap", "Export"])
+
         with res_tabs[0]:
-            st.markdown("#### Top 30 Configurations — click **Apply** to load into sidebar")
-            top30 = opt_df.head(30).reset_index(drop=True)
-            for ridx, row in top30.iterrows():
-                rank = ridx + 1
-                cols = st.columns([0.5, 1.2, 1.2, 1, 1, 1, 1, 1.2, 1.8])
-                cols[0].markdown(f"**#{rank}**")
-                cols[1].markdown(f"WR: **{row['Win Rate (%)']:.1f}%**")
-                cols[2].markdown(f"PF: **{row['Profit Factor']:.2f}**")
-                cols[3].markdown(f"Trades: {int(row['Total Trades'])}")
-                cols[4].markdown(f"P&L: {row['Total P&L']:.1f}")
-                cols[5].markdown(f"SL: {row['SL Type'][:12]}")
-                cols[6].markdown(f"Tgt: {row['Target Type'][:12]}")
-                cols[7].markdown(f"Params: `{row['Strategy Params'][:20]}`")
-                if cols[8].button(f"⚡ Apply #{rank}", key=f"btn_opt_row_{ridx}"):
-                    _apply_opt_row_to_sidebar(row, opt_strategy, opt_ticker, opt_tf_sel, opt_period)
-                    st.success(f"✅ Config #{rank} applied to sidebar!")
-                    st.rerun()
+            st.dataframe(opt_df.head(30), use_container_width=True)
 
         with res_tabs[1]:
             fig_wr = go.Figure()
@@ -3040,11 +3023,10 @@ with tab_opt:
             )
             st.plotly_chart(fig_wr, use_container_width=True)
 
-            # PF vs WR scatter
             fig_pf = go.Figure()
             fig_pf.add_trace(go.Scatter(
                 x=opt_df["Win Rate (%)"],
-                y=opt_df["Profit Factor"].clip(0,10),
+                y=opt_df["Profit Factor"].clip(0, 10),
                 mode="markers",
                 marker=dict(
                     color=opt_df["Total P&L"],
@@ -3054,7 +3036,7 @@ with tab_opt:
                 ),
                 text=[f"WR:{r['Win Rate (%)']:.1f}%  PF:{r['Profit Factor']:.2f}<br>"
                       f"SL:{r['SL Type']}<br>Tgt:{r['Target Type']}"
-                      for _,r in opt_df.iterrows()],
+                      for _, r in opt_df.iterrows()],
                 hovertemplate="%{text}<extra></extra>",
                 name="All Results"
             ))
@@ -3070,10 +3052,7 @@ with tab_opt:
         with res_tabs[2]:
             st.markdown("#### Top SL Types by Average Win Rate")
             sl_grp = opt_df.groupby("SL Type")["Win Rate (%)"].mean().sort_values(ascending=False).reset_index()
-            fig_sl = go.Figure(go.Bar(
-                x=sl_grp["SL Type"], y=sl_grp["Win Rate (%)"],
-                marker_color="#000000"
-            ))
+            fig_sl = go.Figure(go.Bar(x=sl_grp["SL Type"], y=sl_grp["Win Rate (%)"], marker_color="#000000"))
             fig_sl.update_layout(height=300, template="plotly_white",
                                   plot_bgcolor="#fff", paper_bgcolor="#fff",
                                   font=dict(color="#000"),
@@ -3082,10 +3061,7 @@ with tab_opt:
 
             st.markdown("#### Top Target Types by Average Win Rate")
             tgt_grp = opt_df.groupby("Target Type")["Win Rate (%)"].mean().sort_values(ascending=False).reset_index()
-            fig_tgt = go.Figure(go.Bar(
-                x=tgt_grp["Target Type"], y=tgt_grp["Win Rate (%)"],
-                marker_color="#444444"
-            ))
+            fig_tgt = go.Figure(go.Bar(x=tgt_grp["Target Type"], y=tgt_grp["Win Rate (%)"], marker_color="#444444"))
             fig_tgt.update_layout(height=300, template="plotly_white",
                                    plot_bgcolor="#fff", paper_bgcolor="#fff",
                                    font=dict(color="#000"))
