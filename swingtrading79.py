@@ -281,32 +281,37 @@ def _ema(s: pd.Series, n: int) -> pd.Series:
 def _sma(s: pd.Series, n: int) -> pd.Series:
     return s.rolling(n).mean()
 
+def _rma(s: pd.Series, n: int) -> pd.Series:
+    """Wilder's RMA — matches TradingView ta.rma(). alpha = 1/n."""
+    return s.ewm(alpha=1.0/n, adjust=False).mean()
+
 def _rsi(s: pd.Series, n: int = 14) -> pd.Series:
-    d = s.diff()
-    g = d.clip(lower=0)
-    l = -d.clip(upper=0)
-    ag = g.ewm(com=n - 1, adjust=False).mean()
-    al = l.ewm(com=n - 1, adjust=False).mean()
-    rs = ag / al.replace(0, np.nan)
-    return 100 - (100 / (1 + rs))
+    """RSI using Wilder's RMA — identical to TradingView ta.rsi()."""
+    delta = s.diff()
+    avg_gain = _rma(delta.clip(lower=0), n)
+    avg_loss = _rma((-delta).clip(lower=0), n)
+    rs = avg_gain / avg_loss.replace(0, np.nan)
+    return 100.0 - (100.0 / (1.0 + rs))
 
 def _macd(s: pd.Series, fast=12, slow=26, sig=9):
     m = _ema(s, fast) - _ema(s, slow)
     si = _ema(m, sig)
     return m, si, m - si
 
-def _bb(s: pd.Series, n=20, k=2):
-    m = _sma(s, n)
-    std = s.rolling(n).std()
+def _bb(s: pd.Series, n=20, k=2.0):
+    """Bollinger Bands — matches TradingView ta.bb() (sample stdev, ddof=1)."""
+    m   = _sma(s, n)
+    std = s.rolling(n).std(ddof=1)
     return m + k * std, m, m - k * std
 
 def _atr(h: pd.Series, l: pd.Series, c: pd.Series, n=14) -> pd.Series:
+    """ATR using Wilder's RMA — matches TradingView ta.atr()."""
     tr = pd.concat([
         h - l,
         (h - c.shift()).abs(),
         (l - c.shift()).abs()
     ], axis=1).max(axis=1)
-    return tr.ewm(com=n - 1, adjust=False).mean()
+    return _rma(tr, n)
 
 def _stoch(h, l, c, kp=14, dp=3):
     lo = l.rolling(kp).min()
@@ -315,15 +320,16 @@ def _stoch(h, l, c, kp=14, dp=3):
     return k, _sma(k, dp)
 
 def _adx(h, l, c, n=14):
-    pdm = h.diff().clip(lower=0)
-    ndm = (-l.diff()).clip(lower=0)
-    pdm[pdm < ndm] = 0
-    ndm[ndm < pdm] = 0
+    """ADX/DI — matches TradingView ta.adx() using Wilder's RMA."""
+    up   = h.diff()
+    down = -l.diff()
+    pdm  = pd.Series(np.where((up > down) & (up > 0), up, 0.0), index=h.index)
+    ndm  = pd.Series(np.where((down > up) & (down > 0), down, 0.0), index=l.index)
     atr_ = _atr(h, l, c, n)
-    pdi = 100 * _ema(pdm, n) / atr_.replace(0, np.nan)
-    ndi = 100 * _ema(ndm, n) / atr_.replace(0, np.nan)
-    dx = 100 * (pdi - ndi).abs() / (pdi + ndi).replace(0, np.nan)
-    return _ema(dx, n), pdi, ndi
+    pdi  = 100.0 * _rma(pdm, n) / atr_.replace(0, np.nan)
+    ndi  = 100.0 * _rma(ndm, n) / atr_.replace(0, np.nan)
+    dx   = 100.0 * (pdi - ndi).abs() / (pdi + ndi).replace(0, np.nan)
+    return _rma(dx, n), pdi, ndi
 
 def _cci(h, l, c, n=20):
     tp = (h + l + c) / 3
@@ -758,6 +764,82 @@ def update_trail_sl(pos, df, i, sl_type, sp, atr_v):
     return pos
 
 # ─────────────────────────────────────────────────────────────
+# ENTRY / EXIT LOGIC TEXT HELPERS
+# ─────────────────────────────────────────────────────────────
+def _entry_logic_text(strategy: str, direction: int, df, i: int, atr_v: float, ep: float) -> str:
+    d_str = "LONG" if direction==1 else "SHORT"
+    c = df["Close"]; h = df["High"]; l = df["Low"]
+    try:
+        num = int(strategy.split(".")[0].strip())
+    except:
+        num = 0
+
+    try:
+        if num in (1,2,21):
+            ef = _ema(c,9).iloc[i]; es = _ema(c,21).iloc[i]
+            return (f"{d_str}: EMA9({ef:.2f}) crossed {'above' if direction==1 else 'below'} "
+                    f"EMA21({es:.2f}). Price: {ep:.2f}. ATR={atr_v:.2f}.")
+        elif num == 3:
+            return (f"{d_str}: Triple EMA stack {'bullish' if direction==1 else 'bearish'} "
+                    f"(EMA9>EMA21>EMA50 or reverse). Price: {ep:.2f}.")
+        elif num == 4:
+            ml,sl_,_ = _macd(c); mv=ml.iloc[i]; sv=sl_.iloc[i]
+            return (f"{d_str}: MACD({mv:.4f}) crossed {'above' if direction==1 else 'below'} "
+                    f"Signal({sv:.4f}). Price: {ep:.2f}.")
+        elif num == 5:
+            rv = _rsi(c,14).iloc[i]
+            cond = "exited oversold (<30)" if direction==1 else "exited overbought (>70)"
+            return f"{d_str}: RSI({rv:.1f}) {cond}. Price: {ep:.2f}. ATR={atr_v:.2f}."
+        elif num in (6,7):
+            ub,mb,lb_ = _bb(c)
+            return (f"{d_str}: Price {'broke above upper BB' if (num==6 and direction==1) else 'broke below lower BB' if (num==6 and direction==-1) else 'touched lower BB (mean-revert)' if direction==1 else 'touched upper BB (mean-revert)'}. "
+                    f"BB Upper={ub.iloc[i]:.2f} Lower={lb_.iloc[i]:.2f}. Price: {ep:.2f}.")
+        elif num == 8:
+            _,dir_ = _supertrend(h,l,c)
+            return (f"{d_str}: Supertrend flipped to {'bullish' if direction==1 else 'bearish'}. "
+                    f"Price: {ep:.2f}. ATR={atr_v:.2f}.")
+        elif num == 9:
+            adx_,pdi,ndi = _adx(h,l,c)
+            return (f"{d_str}: +DI({pdi.iloc[i]:.1f}) crossed {'above' if direction==1 else 'below'} "
+                    f"-DI({ndi.iloc[i]:.1f}), ADX={adx_.iloc[i]:.1f}. Price: {ep:.2f}.")
+        elif num in (10,11):
+            k,d_ = _stoch(h,l,c)
+            return (f"{d_str}: Stoch %K({k.iloc[i]:.1f}) crossed {'above' if direction==1 else 'below'} "
+                    f"%D({d_.iloc[i]:.1f}). Price: {ep:.2f}.")
+        elif num == 13:
+            vw = _vwap(h,l,c,df["Volume"])
+            return (f"{d_str}: Price({c.iloc[i]:.2f}) crossed {'above' if direction==1 else 'below'} "
+                    f"VWAP({vw.iloc[i]:.2f}). Entry: {ep:.2f}.")
+        elif num == 29:
+            sar,_ = _psar(h,l,c)
+            return (f"{d_str}: SAR flipped {'bullish (price above SAR)' if direction==1 else 'bearish (price below SAR)'}. "
+                    f"SAR={sar.iloc[i]:.2f}. Price: {ep:.2f}.")
+        else:
+            return f"{d_str}: Strategy #{num} signal triggered at {ep:.2f}. ATR={atr_v:.2f}."
+    except:
+        return f"{d_str}: Signal triggered at {ep:.2f}."
+
+def _exit_logic_text(reason: str, pos: dict, exit_price: float, d: int) -> str:
+    ep = pos["entry_price"]
+    pts = (exit_price - ep) * d
+    if reason == "SL Hit":
+        return (f"Stop Loss triggered at {exit_price:.2f}. "
+                f"Lost {abs(pts):.2f} pts. SL was set at {pos['sl']:.2f} "
+                f"({'trailing' if 'Trail' in pos.get('entry_type','') else 'fixed'}).")
+    elif reason == "Target Hit":
+        return (f"Target reached at {exit_price:.2f}. "
+                f"Gained {abs(pts):.2f} pts. Target was {pos['target']:.2f}.")
+    elif reason == "EMA Cross Exit":
+        return (f"EMA crossover reversed — exit at {exit_price:.2f}. "
+                f"P&L: {pts:+.2f} pts.")
+    elif reason == "Opposite Signal":
+        return (f"Opposite signal triggered — exit at {exit_price:.2f}. "
+                f"Strategy flipped direction. P&L: {pts:+.2f} pts.")
+    elif reason == "End of Data":
+        return f"Backtest ended — position closed at {exit_price:.2f}. P&L: {pts:+.2f} pts."
+    return f"Exit at {exit_price:.2f}. P&L: {pts:+.2f} pts."
+
+# ─────────────────────────────────────────────────────────────
 # BACKTEST ENGINE
 # ─────────────────────────────────────────────────────────────
 def run_backtest(df_raw, strategy, sl_type, tgt_type, sp, tp,
@@ -813,15 +895,10 @@ def run_backtest(df_raw, strategy, sl_type, tgt_type, sp, tp,
                 lv1 = pos["entry_price"] + d * tp.get("tgt_pts",40)
                 lv2 = pos["entry_price"] + d * tp.get("tgt_pts",40) * 1.5
                 if not pos.get("lv1_done") and ((d==1 and cur_h>=lv1)or(d==-1 and cur_l<=lv1)):
-                    pnl_partial = (lv1 - pos["entry_price"]) * d * int(qty*0.5)
-                    capital += pnl_partial
                     pos["lv1_done"] = True
-                    pos["qty_remaining"] = int(qty*0.5)
+                    pos["qty_remaining"] = max(1, int(qty * 0.5))
                 elif not pos.get("lv2_done") and pos.get("lv1_done") and \
                      ((d==1 and cur_h>=lv2)or(d==-1 and cur_l<=lv2)):
-                    rem = pos.get("qty_remaining", qty)
-                    pnl_partial = (lv2 - pos["entry_price"]) * d * rem
-                    capital += pnl_partial
                     pos["lv2_done"] = True
                     still_open.append(pos)
                     continue
@@ -846,18 +923,33 @@ def run_backtest(df_raw, strategy, sl_type, tgt_type, sp, tp,
                 exit_reason="Opposite Signal"; exit_price=cur_c
 
             if exit_reason:
-                q = pos.get("qty_remaining", qty)
+                q   = pos.get("qty_remaining", qty)
                 pnl = (exit_price - pos["entry_price"]) * d * q
+                pts = (exit_price - pos["entry_price"]) * d   # points per unit
                 trades.append({
-                    "entry_time"  : pos["entry_time"],
-                    "exit_time"   : cur_t,
-                    "direction"   : "LONG" if d==1 else "SHORT",
-                    "entry_price" : round(pos["entry_price"],4),
-                    "exit_price"  : round(exit_price,4),
-                    "sl"          : round(pos["sl"],4),
-                    "target"      : round(pos["target"],4),
-                    "pnl"         : round(pnl,2),
-                    "exit_reason" : exit_reason,
+                    # ── Timing ──────────────────────────────────────
+                    "entry_time"      : pos["entry_time"],
+                    "exit_time"       : cur_t,
+                    # ── Direction & Type ────────────────────────────
+                    "direction"       : "LONG" if d==1 else "SHORT",
+                    "entry_type"      : pos.get("entry_type","Signal"),
+                    "entry_logic"     : pos.get("entry_logic",""),
+                    # ── Price Levels ────────────────────────────────
+                    "entry_price"     : round(pos["entry_price"],4),
+                    "exit_price"      : round(exit_price,4),
+                    "sl_level"        : round(pos["sl_initial"],4),
+                    "final_sl"        : round(pos["sl"],4),
+                    "target_level"    : round(pos["target"],4),
+                    # ── Points ──────────────────────────────────────
+                    "points_captured" : round(pts,4),
+                    "points_risked"   : round(abs(pos["entry_price"]-pos["sl_initial"]),4),
+                    # ── P&L ─────────────────────────────────────────
+                    "qty"             : q,
+                    "pnl"             : round(pnl,2),
+                    "result"          : "WIN" if pnl>0 else ("LOSS" if pnl<0 else "BE"),
+                    # ── Exit ────────────────────────────────────────
+                    "exit_reason"     : exit_reason,
+                    "exit_logic"      : _exit_logic_text(exit_reason, pos, exit_price, d),
                 })
             else:
                 still_open.append(pos)
@@ -870,15 +962,25 @@ def run_backtest(df_raw, strategy, sl_type, tgt_type, sp, tp,
             if not allow_overlap and open_positions:
                 pass  # skip if position already open
             else:
-                ep  = cur_c
+                # Use NEXT bar open for realistic entry (matches live trading)
+                if i + 1 < len(df):
+                    ep = float(df["Open"].iloc[i+1])
+                    entry_t = df.index[i+1]
+                else:
+                    ep = cur_c
+                    entry_t = cur_t
                 sl_ = calc_sl(df, i, ep, sig, sl_type, sp, atr_v)
                 tg_ = calc_target(df, i, ep, sig, tgt_type, tp, atr_v)
+                entry_logic = _entry_logic_text(strategy, sig, df, i, atr_v, ep)
                 open_positions.append({
                     "direction"   : sig,
                     "entry_price" : ep,
-                    "entry_time"  : cur_t,
+                    "entry_time"  : entry_t,
                     "sl"          : sl_,
+                    "sl_initial"  : sl_,
                     "target"      : tg_,
+                    "entry_type"  : "Signal-Bar+1 Open",
+                    "entry_logic" : entry_logic,
                 })
 
     # Close any remaining open positions
@@ -886,19 +988,28 @@ def run_backtest(df_raw, strategy, sl_type, tgt_type, sp, tp,
         last_c = df["Close"].iloc[-1]
         last_t = df.index[-1]
         for pos in open_positions:
-            d = pos["direction"]
-            q = pos.get("qty_remaining", qty)
+            d   = pos["direction"]
+            q   = pos.get("qty_remaining", qty)
             pnl = (last_c - pos["entry_price"]) * d * q
+            pts = (last_c - pos["entry_price"]) * d
             trades.append({
-                "entry_time"  : pos["entry_time"],
-                "exit_time"   : last_t,
-                "direction"   : "LONG" if d==1 else "SHORT",
-                "entry_price" : round(pos["entry_price"],4),
-                "exit_price"  : round(last_c,4),
-                "sl"          : round(pos["sl"],4),
-                "target"      : round(pos["target"],4),
-                "pnl"         : round(pnl,2),
-                "exit_reason" : "End of Data",
+                "entry_time"      : pos["entry_time"],
+                "exit_time"       : last_t,
+                "direction"       : "LONG" if d==1 else "SHORT",
+                "entry_type"      : pos.get("entry_type","Signal"),
+                "entry_logic"     : pos.get("entry_logic",""),
+                "entry_price"     : round(pos["entry_price"],4),
+                "exit_price"      : round(last_c,4),
+                "sl_level"        : round(pos["sl_initial"],4),
+                "final_sl"        : round(pos["sl"],4),
+                "target_level"    : round(pos["target"],4),
+                "points_captured" : round(pts,4),
+                "points_risked"   : round(abs(pos["entry_price"]-pos["sl_initial"]),4),
+                "qty"             : q,
+                "pnl"             : round(pnl,2),
+                "result"          : "WIN" if pnl>0 else ("LOSS" if pnl<0 else "BE"),
+                "exit_reason"     : "End of Data",
+                "exit_logic"      : "Backtest period ended — position closed at last bar close.",
             })
 
     return trades
@@ -910,53 +1021,74 @@ def calc_metrics(trades, initial_capital=0.0):
     if not trades:
         return {}
     df = pd.DataFrame(trades)
-    n = len(df)
-    wins   = df[df["pnl"]>0]
-    losses = df[df["pnl"]<=0]
-    wr = len(wins)/n*100 if n>0 else 0
-    tot_pnl = df["pnl"].sum()
-    avg_w = wins["pnl"].mean() if len(wins)>0 else 0
-    avg_l = losses["pnl"].mean() if len(losses)>0 else 0
-    gross_w = wins["pnl"].sum(); gross_l = losses["pnl"].sum()
-    pf = abs(gross_w/gross_l) if gross_l!=0 else float("inf")
-    cum = df["pnl"].cumsum()
-    peak = cum.cummax()
-    dd = (cum-peak).min()
-    sh = (df["pnl"].mean()/df["pnl"].std()*np.sqrt(252)
-          if df["pnl"].std()>0 else 0)
-    exp_ = (wr/100)*avg_w + (1-wr/100)*avg_l
+    n  = len(df)
 
-    c_wins=c_loss=mx_cw=mx_cl=0
-    for p in df["pnl"]:
-        if p>0:
-            c_wins+=1; c_loss=0; mx_cw=max(mx_cw,c_wins)
+    # Resolve P&L column robustly
+    pnl_col = "pnl" if "pnl" in df.columns else None
+    if pnl_col is None:
+        return {}
+
+    wins   = df[df[pnl_col] > 0]
+    losses = df[df[pnl_col] <= 0]
+    wr     = len(wins) / n * 100 if n > 0 else 0
+
+    tot_pnl  = df[pnl_col].sum()
+    avg_w    = wins[pnl_col].mean()   if len(wins)   > 0 else 0.0
+    avg_l    = losses[pnl_col].mean() if len(losses) > 0 else 0.0
+    gross_w  = wins[pnl_col].sum()
+    gross_l  = losses[pnl_col].sum()
+    pf       = abs(gross_w / gross_l) if gross_l != 0 else float("inf")
+
+    # Points stats
+    pts_col  = "points_captured" if "points_captured" in df.columns else pnl_col
+    tot_pts  = df[pts_col].sum()
+    pts_won  = df.loc[df[pnl_col]>0,  pts_col].sum() if len(wins)>0   else 0.0
+    pts_lost = df.loc[df[pnl_col]<=0, pts_col].sum() if len(losses)>0 else 0.0
+    avg_pts_w = df.loc[df[pnl_col]>0,  pts_col].mean() if len(wins)>0  else 0.0
+    avg_pts_l = df.loc[df[pnl_col]<=0, pts_col].mean() if len(losses)>0 else 0.0
+
+    cum  = df[pnl_col].cumsum()
+    peak = cum.cummax()
+    dd   = (cum - peak).min()
+    sh   = (df[pnl_col].mean() / df[pnl_col].std() * np.sqrt(252)
+            if df[pnl_col].std() > 0 else 0)
+    exp_ = (wr/100) * avg_w + (1 - wr/100) * avg_l
+
+    c_wins = c_loss = mx_cw = mx_cl = 0
+    for p in df[pnl_col]:
+        if p > 0:
+            c_wins += 1; c_loss = 0; mx_cw = max(mx_cw, c_wins)
         else:
-            c_loss+=1; c_wins=0; mx_cl=max(mx_cl,c_loss)
+            c_loss += 1; c_wins = 0; mx_cl = max(mx_cl, c_loss)
 
     avg_dur = "N/A"
     try:
         df["entry_time"] = pd.to_datetime(df["entry_time"])
         df["exit_time"]  = pd.to_datetime(df["exit_time"])
-        durs = (df["exit_time"] - df["entry_time"]).dt.total_seconds() / 60
+        durs    = (df["exit_time"] - df["entry_time"]).dt.total_seconds() / 60
         avg_dur = f"{durs.mean():.0f} min"
     except:
         pass
 
     return {
-        "Total Trades"      : n,
-        "Win Rate (%)"      : round(wr,2),
-        "Total P&L (pts×qty)": round(tot_pnl,2),
-        "Avg Win (pts×qty)" : round(avg_w,2),
-        "Avg Loss (pts×qty)": round(avg_l,2),
-        "Profit Factor"     : round(pf,2),
-        "Max Drawdown"      : round(dd,2),
-        "Sharpe Ratio"      : round(sh,2),
-        "Expectancy"        : round(exp_,2),
-        "Max Consec Wins"   : mx_cw,
-        "Max Consec Losses" : mx_cl,
-        "Gross Profit"      : round(gross_w,2),
-        "Gross Loss"        : round(gross_l,2),
-        "Avg Trade Duration": avg_dur,
+        "Total Trades"        : n,
+        "Win Rate (%)"        : round(wr, 2),
+        "Accuracy"            : f"{wr:.1f}% ({len(wins)}W / {len(losses)}L)",
+        "Total P&L (pts×qty)" : round(tot_pnl, 2),
+        "Total Points Gained" : round(pts_won, 2),
+        "Total Points Lost"   : round(pts_lost, 2),
+        "Net Points"          : round(tot_pts, 2),
+        "Avg Win (pts)"       : round(avg_pts_w, 2),
+        "Avg Loss (pts)"      : round(avg_pts_l, 2),
+        "Gross Profit"        : round(gross_w, 2),
+        "Gross Loss"          : round(gross_l, 2),
+        "Profit Factor"       : round(pf, 2),
+        "Max Drawdown"        : round(dd, 2),
+        "Sharpe Ratio"        : round(sh, 2),
+        "Expectancy"          : round(exp_, 2),
+        "Max Consec Wins"     : mx_cw,
+        "Max Consec Losses"   : mx_cl,
+        "Avg Trade Duration"  : avg_dur,
     }
 
 # ─────────────────────────────────────────────────────────────
@@ -1498,13 +1630,33 @@ with tab_bt:
             st.plotly_chart(build_chart(df_res, trades, strategy, show_ind),
                             use_container_width=True)
 
-            st.markdown("### Trade Log")
+            st.markdown("### Trade Log — Full Detail")
             tdf = pd.DataFrame(trades)
-            tdf["pnl_color"] = tdf["pnl"].apply(lambda x: "🟢" if x>0 else "🔴")
-            st.dataframe(tdf[["entry_time","exit_time","direction",
-                               "entry_price","exit_price","sl","target",
-                               "pnl_color","pnl","exit_reason","capital"]],
-                         use_container_width=True, height=320)
+            # Cumulative running totals
+            tdf["cum_pnl"]    = tdf["pnl"].cumsum().round(2)
+            tdf["cum_pts"]    = tdf["points_captured"].cumsum().round(2) if "points_captured" in tdf.columns else tdf["pnl"].cumsum().round(2)
+            tdf["result_icon"]= tdf["pnl"].apply(lambda x: "🟢 WIN" if x>0 else ("🔴 LOSS" if x<0 else "⬜ BE"))
+
+            display_cols = [
+                c for c in [
+                    "entry_time","exit_time","direction","entry_type",
+                    "entry_price","exit_price","sl_level","target_level","final_sl",
+                    "points_captured","points_risked","qty","pnl","result_icon",
+                    "cum_pts","cum_pnl","exit_reason","entry_logic","exit_logic"
+                ] if c in tdf.columns
+            ]
+            st.dataframe(tdf[display_cols], use_container_width=True, height=380)
+
+            # Summary totals row
+            if "points_captured" in tdf.columns:
+                pts_won_  = tdf.loc[tdf["pnl"]>0,"points_captured"].sum()
+                pts_lost_ = tdf.loc[tdf["pnl"]<=0,"points_captured"].sum()
+                net_pts_  = tdf["points_captured"].sum()
+                sc1,sc2,sc3,sc4 = st.columns(4)
+                sc1.metric("Total Points Gained", f"{pts_won_:.2f}")
+                sc2.metric("Total Points Lost",   f"{pts_lost_:.2f}")
+                sc3.metric("Net Points",           f"{net_pts_:.2f}")
+                sc4.metric("Total P&L (pts×qty)",  f"{tdf['pnl'].sum():.2f}")
 
 # ═════════════════════════════════════════════════════════════
 # TAB 2 – LIVE TRADING
@@ -1517,7 +1669,7 @@ with tab_live:
     cfg_cols[0].markdown(f"**Ticker:** `{ACTIVE_TICKER}`")
     cfg_cols[1].markdown(f"**Timeframe:** `{tf}`")
     cfg_cols[2].markdown(f"**Strategy:** {strategy[:30]}…")
-    cfg_cols[3].markdown(f"**Capital:** ₹{initial_cap:,}")
+    cfg_cols[3].markdown(f"**Qty:** {qty}")
     cfg_cols2 = st.columns(4)
     cfg_cols2[0].markdown(f"**SL Type:** {sl_type}")
     cfg_cols2[1].markdown(f"**Target Type:** {tgt_type}")
@@ -1566,10 +1718,14 @@ with tab_live:
                     ema_f  = _ema(df_sig["Close"], SL_PARAMS.get("ema_fast",9))
                     ema_sl_ = _ema(df_sig["Close"], SL_PARAMS.get("ema_slow",21))
 
-                    last_sig = int(df_sig["signal"].iloc[-1])
-                    last_c   = float(df_sig["Close"].iloc[-1])
+                    # ── Use CONFIRMED (closed) candle for signal — matches backtest bar+1 ──
+                    # Signal from last CLOSED bar (iloc[-2]), price levels from current bar
+                    sig_bar_idx = -2 if len(df_sig) >= 2 else -1
+                    last_sig = int(df_sig["signal"].iloc[sig_bar_idx])
+                    last_c   = float(df_sig["Close"].iloc[-1])   # current bar close
                     last_h   = float(df_sig["High"].iloc[-1])
                     last_l   = float(df_sig["Low"].iloc[-1])
+                    last_o   = float(df_sig["Open"].iloc[-1])    # current bar open = entry price
                     atr_v    = float(atr_s.iloc[-1]) if not np.isnan(atr_s.iloc[-1]) else last_c*0.01
                     last_t   = df_sig.index[-1]
 
@@ -1596,38 +1752,54 @@ with tab_live:
 
                         if ema_exit or sl_hit or tgt_hit:
                             reason = "EMA Exit" if ema_exit else ("SL Hit" if sl_hit else "Target Hit")
-                            ep = pos["sl"] if sl_hit else (pos["target"] if tgt_hit else last_c)
-                            pnl = (ep - pos["entry_price"]) * d * qty
+                            ep_exit = pos["sl"] if sl_hit else (pos["target"] if tgt_hit else last_c)
+                            pnl  = (ep_exit - pos["entry_price"]) * d * qty
+                            pts  = (ep_exit - pos["entry_price"]) * d
                             st.session_state.live_trades.append({
-                                "entry_time"  : pos["entry_time"],
-                                "exit_time"   : last_t,
-                                "direction"   : "LONG" if d==1 else "SHORT",
-                                "entry_price" : pos["entry_price"],
-                                "exit_price"  : round(ep,4),
-                                "pnl"         : round(pnl,2),
-                                "exit_reason" : reason,
+                                "entry_time"      : pos["entry_time"],
+                                "exit_time"       : last_t,
+                                "direction"       : "LONG" if d==1 else "SHORT",
+                                "entry_type"      : pos.get("entry_type","Signal"),
+                                "entry_logic"     : pos.get("entry_logic",""),
+                                "entry_price"     : pos["entry_price"],
+                                "exit_price"      : round(ep_exit,4),
+                                "sl_level"        : round(pos.get("sl_initial", pos["sl"]),4),
+                                "final_sl"        : round(pos["sl"],4),
+                                "target_level"    : round(pos["target"],4),
+                                "points_captured" : round(pts,4),
+                                "points_risked"   : round(abs(pos["entry_price"]-pos.get("sl_initial",pos["sl"])),4),
+                                "qty"             : qty,
+                                "pnl"             : round(pnl,2),
+                                "result"          : "WIN" if pnl>0 else ("LOSS" if pnl<0 else "BE"),
+                                "exit_reason"     : reason,
+                                "exit_logic"      : _exit_logic_text(reason, pos, ep_exit, d),
                             })
                             st.session_state.live_open_pos = None
                             pnl_color = "win" if pnl>0 else "loss"
                             st.markdown(f'<div class="signal-{"long" if pnl>0 else "short"}">'
                                         f'⚡ Position closed — {reason} | P&L: '
-                                        f'<span class="{pnl_color}">₹{pnl:,.2f}</span></div>',
+                                        f'<span class="{pnl_color}">{pnl:+.2f} pts×qty</span></div>',
                                         unsafe_allow_html=True)
 
                         st.session_state.live_open_pos = pos
 
-                    # Open new position on signal
+                    # Open new position on confirmed signal
                     if last_sig != 0 and st.session_state.live_open_pos is None:
-                        sl_  = calc_sl(df_sig, -1, last_c, last_sig, sl_type, SL_PARAMS, atr_v)
-                        tg_  = calc_target(df_sig, -1, last_c, last_sig, tgt_type, TGT_PARAMS, atr_v)
+                        entry_price_live = last_o   # current bar open = "next bar after signal"
+                        sl_  = calc_sl(df_sig, -1, entry_price_live, last_sig, sl_type, SL_PARAMS, atr_v)
+                        tg_  = calc_target(df_sig, -1, entry_price_live, last_sig, tgt_type, TGT_PARAMS, atr_v)
+                        entry_logic_live = _entry_logic_text(strategy, last_sig, df_sig, sig_bar_idx, atr_v, entry_price_live)
                         st.session_state.live_open_pos = {
-                            "direction"   : last_sig,
-                            "entry_price" : last_c,
-                            "entry_time"  : last_t,
-                            "sl"          : sl_,
-                            "target"      : tg_,
-                            "current_price": last_c,
-                            "unrealized_pnl": 0.0,
+                            "direction"     : last_sig,
+                            "entry_price"   : entry_price_live,
+                            "entry_time"    : last_t,
+                            "sl"            : sl_,
+                            "sl_initial"    : sl_,
+                            "target"        : tg_,
+                            "current_price" : last_c,
+                            "unrealized_pnl": round((last_c - entry_price_live) * last_sig * qty, 2),
+                            "entry_type"    : "Signal-Bar+1 Open (Live)",
+                            "entry_logic"   : entry_logic_live,
                         }
 
                     # ── Signal display ─────────────────────────────────────
@@ -1658,14 +1830,16 @@ with tab_live:
                     pos = st.session_state.live_open_pos
                     if pos:
                         st.markdown("#### Open Position")
-                        p_cols = st.columns(5)
-                        p_cols[0].metric("Direction", "🟢 LONG" if pos["direction"]==1 else "🔴 SHORT")
-                        p_cols[1].metric("Entry", f"{pos['entry_price']:.4f}")
-                        p_cols[2].metric("SL",    f"{pos['sl']:.4f}")
-                        p_cols[3].metric("Target",f"{pos['target']:.4f}")
+                        p_cols = st.columns(6)
+                        p_cols[0].metric("Direction",    "🟢 LONG" if pos["direction"]==1 else "🔴 SHORT")
+                        p_cols[1].metric("Entry Price",  f"{pos['entry_price']:.4f}")
+                        p_cols[2].metric("Current",      f"{last_c:.4f}")
+                        p_cols[3].metric("SL",           f"{pos['sl']:.4f}")
+                        p_cols[4].metric("Target",       f"{pos['target']:.4f}")
                         pnl_v = pos.get("unrealized_pnl",0)
-                        p_cols[4].metric("Unrealized P&L (pts×qty)", f"{pnl_v:+.2f}",
-                                         delta=f"{pnl_v:+.2f}")
+                        p_cols[5].metric("Unrealized (pts×qty)", f"{pnl_v:+.2f}", delta=f"{pnl_v:+.2f}")
+                        if pos.get("entry_logic"):
+                            st.caption(f"📌 Entry Logic: {pos['entry_logic']}")
                     else:
                         st.info("No open position.")
 
@@ -1679,11 +1853,22 @@ with tab_live:
                     if st.session_state.live_trades:
                         st.markdown("#### Live Session Trades")
                         ltd = pd.DataFrame(st.session_state.live_trades)
-                        st.dataframe(ltd, use_container_width=True, height=200)
+                        ltd["cum_pnl"] = ltd["pnl"].cumsum().round(2)
+                        live_display_cols = [c for c in [
+                            "entry_time","exit_time","direction","entry_price","exit_price",
+                            "sl_level","target_level","points_captured","points_risked",
+                            "qty","pnl","result","cum_pnl","exit_reason","entry_logic"
+                        ] if c in ltd.columns]
+                        st.dataframe(ltd[live_display_cols], use_container_width=True, height=220)
                         total_live_pnl = ltd["pnl"].sum()
-                        pnl_cls = "win" if total_live_pnl>0 else "loss"
-                        st.markdown(f'Session P&L: <span class="{pnl_cls}"><b>₹{total_live_pnl:,.2f}</b></span>',
-                                    unsafe_allow_html=True)
+                        total_live_pts = ltd["points_captured"].sum() if "points_captured" in ltd.columns else total_live_pnl
+                        pnl_cls = "win" if total_live_pnl > 0 else "loss"
+                        s1,s2,s3,s4 = st.columns(4)
+                        s1.metric("Session P&L",    f"{total_live_pnl:+.2f}")
+                        s2.metric("Net Points",     f"{total_live_pts:+.2f}")
+                        s3.metric("Session Trades", len(ltd))
+                        wr_live = len(ltd[ltd["pnl"]>0])/len(ltd)*100 if len(ltd)>0 else 0
+                        s4.metric("Session Win Rate", f"{wr_live:.1f}%")
 
         st.info(f"⏱ Next refresh in {refresh_s}s. Press **Stop** to halt. Auto-refreshes require manual page reload or a loop.")
 
