@@ -1727,33 +1727,8 @@ def show_price_ticker(ticker: str):
 # SIDEBAR  –  Global Configuration
 # ─────────────────────────────────────────────────────────────
 with st.sidebar:
-    # ── Apply any pending Best Config from Optimizer ─────────────
-    # Must write to widget keys BEFORE widgets are created.
-    # Streamlit uses session_state[key] if present, ignoring index/value params.
-    if "_pending_sl_type" in st.session_state:
-        _pend = st.session_state
-        if _pend.get("_pending_sl_type") in SL_TYPES:
-            _pend["sb_sl_type"]  = _pend.pop("_pending_sl_type")
-        else:
-            del _pend["_pending_sl_type"]
-        if "_pending_tgt_type" in _pend and _pend["_pending_tgt_type"] in TARGET_TYPES:
-            _pend["sb_tgt_type"] = _pend.pop("_pending_tgt_type")
-        elif "_pending_tgt_type" in _pend:
-            del _pend["_pending_tgt_type"]
-        for _src, _dst, _cast in [
-            ("_pending_sl_pts",  "sb_sl_pts",  int),
-            ("_pending_tgt_pts", "sb_tgt_pts", int),
-            ("_pending_atr_sl",  "sb_atr_sl",  float),
-            ("_pending_rr",      "sb_rr_sl",   float),
-            ("_pending_rr",      "sb_rr_tgt",  float),
-            ("_pending_ema_f",   "sb_ema_f",   int),
-            ("_pending_ema_sl",  "sb_ema_sl",  int),
-        ]:
-            if _src in _pend:
-                _pend[_dst] = _cast(_pend[_src])
-        # Clean up all remaining _pending_ keys
-        for _k in [k for k in list(_pend.keys()) if k.startswith("_pending_")]:
-            del _pend[_k]
+    # ── Note: optimizer writes directly to widget keys (sb_sl_type etc.)
+    # ── before this sidebar block renders, so changes take effect immediately.
 
     st.markdown("## ⚙️ Configuration")
     st.markdown("---")
@@ -2104,137 +2079,131 @@ with tab_live:
 
                     st.session_state.live_last_signal = last_sig
 
-                    # ══════════════════════════════════════════════════════
-                    # STEP 1 — manage any existing open position
-                    # ══════════════════════════════════════════════════════
-                    pos = st.session_state.live_open_pos
-                    just_closed = False   # flag: closed THIS refresh cycle
+                    # ══════════════════════════════════════════════════════════
+                    # LIVE TRADING STATE MACHINE
+                    # State is kept 100% in session_state — no in-memory logic
+                    # that gets wiped on rerun.
+                    #
+                    # Flow per refresh:
+                    #  1. If position open  → check SL / Target / EMA exit
+                    #     • If exit triggered  → record closed trade, clear pos,
+                    #       stamp close_time, set just_closed=True, STOP (do NOT open new pos this refresh)
+                    #     • If no exit         → update unrealized, keep pos open
+                    #  2. If no open pos AND not just_closed:
+                    #     • cooloff=0  → enter whenever signal is live (next refresh after any close)
+                    #     • cooloff>0  → enter only when elapsed >= cooloff since last close
+                    # ══════════════════════════════════════════════════════════
+                    pos        = st.session_state.live_open_pos
+                    just_closed = False  # True only when we close a position THIS refresh
 
+                    # ── helper: record a closed trade ──────────────────────────
+                    def _record_close(pos_, exit_price_, reason_, exit_t_):
+                        d_ = pos_["direction"]
+                        pts_ = (exit_price_ - pos_["entry_price"]) * d_
+                        pnl_ = pts_ * qty
+                        st.session_state.live_trades.append({
+                            "entry_time"      : pos_["entry_time"],
+                            "exit_time"       : exit_t_,
+                            "direction"       : "LONG" if d_==1 else "SHORT",
+                            "entry_type"      : pos_.get("entry_type","Signal"),
+                            "entry_logic"     : pos_.get("entry_logic",""),
+                            "entry_price"     : pos_["entry_price"],
+                            "exit_price"      : round(exit_price_,4),
+                            "sl_level"        : round(pos_.get("sl_initial", pos_["sl"]),4),
+                            "final_sl"        : round(pos_["sl"],4),
+                            "target_level"    : round(pos_["target"],4),
+                            "points_captured" : round(pts_,4),
+                            "points_risked"   : round(abs(pos_["entry_price"]-pos_.get("sl_initial",pos_["sl"])),4),
+                            "qty"             : qty,
+                            "pnl"             : round(pnl_,2),
+                            "result"          : "WIN" if pnl_>0 else ("LOSS" if pnl_<0 else "BE"),
+                            "exit_reason"     : reason_,
+                            "exit_logic"      : _exit_logic_text(reason_, pos_, exit_price_, d_),
+                        })
+                        st.session_state.live_open_pos  = None
+                        st.session_state.last_trade_time = time.time()   # always stamp on close
+
+                    # ─────────────────────────────────────────────────────────
+                    # STEP 1 — manage open position
+                    # ─────────────────────────────────────────────────────────
                     if pos is not None:
                         d = pos["direction"]
                         pos = update_trail_sl(pos, df_sig, -1, sl_type, SL_PARAMS, atr_v)
                         pos["current_price"]  = last_c
                         pos["unrealized_pnl"] = round((last_c - pos["entry_price"]) * d * qty, 2)
 
-                        # EMA exit check
                         ema_exit = False
                         if sl_type == "EMA Reverse Crossover" or tgt_type == "EMA Reverse Crossover":
-                            if d == 1 and float(ema_f.iloc[-1]) < float(ema_sl_.iloc[-1]):
-                                ema_exit = True
-                            elif d == -1 and float(ema_f.iloc[-1]) > float(ema_sl_.iloc[-1]):
-                                ema_exit = True
+                            ef_v  = float(ema_f.iloc[-1]);  es_v  = float(ema_sl_.iloc[-1])
+                            ef_p  = float(ema_f.iloc[-2]) if len(ema_f)>1 else ef_v
+                            es_p  = float(ema_sl_.iloc[-2]) if len(ema_sl_)>1 else es_v
+                            if d == 1 and ef_v < es_v and ef_p >= es_p: ema_exit = True
+                            if d ==-1 and ef_v > es_v and ef_p <= es_p: ema_exit = True
 
-                        sl_hit  = (d == 1 and last_l <= pos["sl"])   or (d == -1 and last_h >= pos["sl"])
-                        tgt_hit = (d == 1 and last_h >= pos["target"]) or (d == -1 and last_l <= pos["target"])
+                        sl_hit  = (d== 1 and last_l <= pos["sl"])    or (d==-1 and last_h >= pos["sl"])
+                        tgt_hit = (d== 1 and last_h >= pos["target"]) or (d==-1 and last_l <= pos["target"])
 
-                        # ── Square-off before new order (direction flip) ──────
-                        direction_flip = sq_before_new and last_sig != 0 and last_sig != d
-                        if direction_flip and not sl_hit and not tgt_hit and not ema_exit:
-                            sl_hit = False; tgt_hit = False; ema_exit = False
-                            exit_reason_sq = "Square-off Before New"
-                            ep_sq   = last_c
-                            pnl_sq  = (ep_sq - pos["entry_price"]) * d * qty
-                            pts_sq  = (ep_sq - pos["entry_price"]) * d
-                            st.session_state.live_trades.append({
-                                "entry_time": pos["entry_time"], "exit_time": last_t,
-                                "direction": "LONG" if d==1 else "SHORT",
-                                "entry_type": pos.get("entry_type","Signal"), "entry_logic": pos.get("entry_logic",""),
-                                "entry_price": pos["entry_price"], "exit_price": round(ep_sq,4),
-                                "sl_level": round(pos.get("sl_initial",pos["sl"]),4), "final_sl": round(pos["sl"],4),
-                                "target_level": round(pos["target"],4),
-                                "points_captured": round(pts_sq,4),
-                                "points_risked": round(abs(pos["entry_price"]-pos.get("sl_initial",pos["sl"])),4),
-                                "qty": qty, "pnl": round(pnl_sq,2),
-                                "result": "WIN" if pnl_sq>0 else ("LOSS" if pnl_sq<0 else "BE"),
-                                "exit_reason": exit_reason_sq,
-                                "exit_logic": f"Squared off at {ep_sq:.2f} — signal flipped direction.",
-                            })
-                            st.session_state.live_open_pos = None
-                            st.session_state.last_trade_time = time.time()
+                        # Square-off before direction flip
+                        sq_flip = sq_before_new and last_sig != 0 and last_sig != d
+
+                        if sl_hit or tgt_hit or ema_exit or sq_flip:
+                            if sq_flip and not sl_hit and not tgt_hit and not ema_exit:
+                                reason = "Square-off Before New"
+                                ep_exit = last_c
+                            elif ema_exit:
+                                reason  = "EMA Cross Exit";  ep_exit = last_c
+                            elif sl_hit:
+                                reason  = "SL Hit";          ep_exit = pos["sl"]
+                            else:
+                                reason  = "Target Hit";      ep_exit = pos["target"]
+                            _record_close(pos, ep_exit, reason, last_t)
                             just_closed = True
                             pos = None
-                            st.warning(f"🔄 Square-off before new: P&L {pnl_sq:+.2f}")
-
-                        elif ema_exit or sl_hit or tgt_hit:
-                            reason   = "EMA Exit" if ema_exit else ("SL Hit" if sl_hit else "Target Hit")
-                            ep_exit  = pos["sl"] if sl_hit else (pos["target"] if tgt_hit else last_c)
-                            pnl      = (ep_exit - pos["entry_price"]) * d * qty
-                            pts      = (ep_exit - pos["entry_price"]) * d
-                            st.session_state.live_trades.append({
-                                "entry_time"      : pos["entry_time"],
-                                "exit_time"       : last_t,
-                                "direction"       : "LONG" if d==1 else "SHORT",
-                                "entry_type"      : pos.get("entry_type","Signal"),
-                                "entry_logic"     : pos.get("entry_logic",""),
-                                "entry_price"     : pos["entry_price"],
-                                "exit_price"      : round(ep_exit,4),
-                                "sl_level"        : round(pos.get("sl_initial", pos["sl"]),4),
-                                "final_sl"        : round(pos["sl"],4),
-                                "target_level"    : round(pos["target"],4),
-                                "points_captured" : round(pts,4),
-                                "points_risked"   : round(abs(pos["entry_price"]-pos.get("sl_initial",pos["sl"])),4),
-                                "qty"             : qty,
-                                "pnl"             : round(pnl,2),
-                                "result"          : "WIN" if pnl>0 else ("LOSS" if pnl<0 else "BE"),
-                                "exit_reason"     : reason,
-                                "exit_logic"      : _exit_logic_text(reason, pos, ep_exit, d),
-                            })
-                            st.session_state.live_open_pos = None
-                            st.session_state.last_trade_time = time.time()
-                            just_closed = True
-                            pos = None
-                            pnl_color = "win" if pnl>0 else "loss"
+                            pnl_show = (ep_exit - st.session_state.live_trades[-1]["entry_price"]) * \
+                                       (1 if st.session_state.live_trades[-1]["direction"]=="LONG" else -1) * qty
                             st.markdown(
-                                f'<div class="signal-{"long" if pnl>0 else "short"}">'
-                                f'⚡ Closed — {reason} | P&L: '
-                                f'<span class="{pnl_color}">{pnl:+.2f} pts×qty</span></div>',
-                                unsafe_allow_html=True)
+                                f'<div class="signal-{"long" if pnl_show>=0 else "short"}">'
+                                f'⚡ {reason} @ {ep_exit:.2f} | P&L: '
+                                f'<span class="{"win" if pnl_show>=0 else "loss"}">{pnl_show:+.2f}</span>'
+                                f'</div>', unsafe_allow_html=True)
                         else:
-                            # Still open — write updated pos back
-                            st.session_state.live_open_pos = pos
+                            st.session_state.live_open_pos = pos   # still open, write updated SL back
 
-                    # ══════════════════════════════════════════════════════
-                    # STEP 2 — open new position if signal active and no open pos
-                    # Cooloff rules:
-                    #   cooloff_s == 0  → re-enter immediately (every refresh)
-                    #   cooloff_s >  0  → wait N seconds after last close
-                    # ══════════════════════════════════════════════════════
-                    if last_sig != 0 and st.session_state.live_open_pos is None:
-                        now_ts         = time.time()
-                        last_trade_ts  = float(st.session_state.get("last_trade_time", 0))
-                        elapsed        = now_ts - last_trade_ts
-                        cooloff_val    = float(cooloff_s)
+                    # ─────────────────────────────────────────────────────────
+                    # STEP 2 — open new position
+                    # Rules:
+                    #   • NEVER open in same refresh that a close happened (just_closed gate)
+                    #   • cooloff = 0 → enter on very next refresh after any close (no wait)
+                    #   • cooloff > 0 → elapsed seconds since last close must be >= cooloff
+                    # ─────────────────────────────────────────────────────────
+                    if last_sig != 0 and st.session_state.live_open_pos is None and not just_closed:
+                        elapsed_since_close = time.time() - float(st.session_state.get("last_trade_time", 0))
+                        cooloff_val = float(cooloff_s)
 
-                        # cooloff=0 → always enter; cooloff>0 → must wait
-                        can_enter = (cooloff_val == 0) or (elapsed >= cooloff_val)
+                        can_enter = (cooloff_val == 0) or (elapsed_since_close >= cooloff_val)
 
                         if can_enter:
-                            entry_price_live = last_c   # current bar close = best live entry
-                            sl_live  = calc_sl(df_sig, -1, entry_price_live, last_sig, sl_type, SL_PARAMS, atr_v)
-                            tg_live  = calc_target(df_sig, -1, entry_price_live, last_sig, tgt_type, TGT_PARAMS, atr_v)
-                            entry_logic_live = _entry_logic_text(strategy, last_sig, df_sig, sig_bar_idx, atr_v, entry_price_live)
+                            ep_new    = last_c
+                            sl_new    = calc_sl(df_sig,  -1, ep_new, last_sig, sl_type,  SL_PARAMS, atr_v)
+                            tg_new    = calc_target(df_sig, -1, ep_new, last_sig, tgt_type, TGT_PARAMS, atr_v)
+                            el_new    = _entry_logic_text(strategy, last_sig, df_sig, sig_bar_idx, atr_v, ep_new)
                             st.session_state.live_open_pos = {
-                                "direction"      : last_sig,
-                                "entry_price"    : entry_price_live,
-                                "entry_time"     : last_t,
-                                "sl"             : sl_live,
-                                "sl_initial"     : sl_live,
-                                "target"         : tg_live,
-                                "current_price"  : last_c,
-                                "unrealized_pnl" : 0.0,
-                                "entry_type"     : "Live Signal Entry",
-                                "entry_logic"    : entry_logic_live,
+                                "direction"     : last_sig,
+                                "entry_price"   : ep_new,
+                                "entry_time"    : last_t,
+                                "sl"            : sl_new,
+                                "sl_initial"    : sl_new,
+                                "target"        : tg_new,
+                                "current_price" : last_c,
+                                "unrealized_pnl": 0.0,
+                                "entry_type"    : "Live Signal Entry",
+                                "entry_logic"   : el_new,
                             }
                             dir_lbl = "🟢 LONG" if last_sig==1 else "🔴 SHORT"
-                            st.success(f"📥 NEW POSITION: {dir_lbl} @ {entry_price_live:.2f} | SL: {sl_live:.2f} | Tgt: {tg_live:.2f}"
-                                       + (f"  *(re-entry after close)*" if just_closed else ""))
-                            # Reset last_trade_time only for cooloff>0 so we measure from entry, not close
-                            if cooloff_val > 0:
-                                st.session_state.last_trade_time = now_ts
+                            st.success(f"📥 {dir_lbl} ENTRY @ {ep_new:.2f} | SL: {sl_new:.2f} | Tgt: {tg_new:.2f}")
                         else:
-                            remaining = int(cooloff_val - elapsed)
-                            st.warning(f"⏳ Cooloff: {remaining}s remaining before next entry. "
-                                       f"(cooloff={int(cooloff_val)}s, elapsed={int(elapsed)}s)")
+                            remaining = max(0, int(cooloff_val - elapsed_since_close))
+                            st.warning(f"⏳ Cooloff: {remaining}s remaining  (set={int(cooloff_val)}s, elapsed={int(elapsed_since_close)}s)")
 
                     # ── Signal display ─────────────────────────────────────
                     st.markdown("#### Latest Signal")
@@ -2913,6 +2882,45 @@ with tab_opt:
                     f"that generates more signals (e.g. Strategy 1, 4, or 8)."
                 )
 
+    # ── Helper: push a result row into sidebar session_state ─────
+    def _apply_opt_row_to_sidebar(row, strat, ticker, tf_sel, per):
+        """Write optimized config directly into sidebar widget keys."""
+        _p = st.session_state
+        # SL / Target types and params
+        if row["SL Type"] in SL_TYPES:
+            _p["sb_sl_type"]  = row["SL Type"]
+        if row["Target Type"] in TARGET_TYPES:
+            _p["sb_tgt_type"] = row["Target Type"]
+        _p["sb_sl_pts"]  = int(float(row["SL Points"]))
+        _p["sb_tgt_pts"] = int(float(row["Target Points"]))
+        _p["sb_atr_sl"]  = float(row["ATR SL Mult"])
+        _p["sb_rr_sl"]   = float(row["R:R Ratio"])
+        _p["sb_rr_tgt"]  = float(row["R:R Ratio"])
+        # Strategy indicator params
+        try:
+            import ast as _ast2
+            p_dict = _ast2.literal_eval(row["Strategy Params"])
+            if "fast" in p_dict: _p["sb_ema_f"]  = int(p_dict["fast"])
+            if "slow" in p_dict: _p["sb_ema_sl"] = int(p_dict["slow"])
+        except:
+            pass
+        # Also sync sidebar instrument / strategy / timeframe / period
+        if strat in STRATEGIES:
+            _p["sb_strategy"] = strat
+        if tf_sel in TIMEFRAMES:
+            _p["sb_tf"] = tf_sel
+        # Ticker: set custom if not in preset list
+        preset_tickers = {v: k for k, v in TICKERS.items()}
+        if ticker in preset_tickers:
+            _p["sb_ticker"] = preset_tickers[ticker]
+        else:
+            _p["sb_ticker"]  = "Custom Ticker"
+            _p["sb_custom"]  = ticker
+        # Period
+        valid_p = TF_PERIOD_MAP.get(tf_sel, ALL_PERIODS)
+        if per in valid_p:
+            _p["sb_period"] = per
+
     # ── Display results ──────────────────────────────────────
     opt_df = st.session_state.get("opt_results")
     if opt_df is not None and not opt_df.empty:
@@ -2952,30 +2960,33 @@ with tab_opt:
 | **Strategy Params** | `{best['Strategy Params']}` |
         """)
 
-        if st.button("⚡ Apply Best Config to Sidebar (Use for Live/Backtest)", key="btn_apply_best"):
-            # Store pending values — sidebar reads these on next rerun BEFORE widget creation
-            st.session_state["_pending_sl_type"]  = best["SL Type"]
-            st.session_state["_pending_tgt_type"] = best["Target Type"]
-            st.session_state["_pending_sl_pts"]   = int(float(best["SL Points"]))
-            st.session_state["_pending_tgt_pts"]  = int(float(best["Target Points"]))
-            st.session_state["_pending_atr_sl"]   = float(best["ATR SL Mult"])
-            st.session_state["_pending_rr"]       = float(best["R:R Ratio"])
-            try:
-                import ast as _ast
-                p_dict = _ast.literal_eval(best["Strategy Params"])
-                if "fast" in p_dict: st.session_state["_pending_ema_f"]  = int(p_dict["fast"])
-                if "slow" in p_dict: st.session_state["_pending_ema_sl"] = int(p_dict["slow"])
-            except:
-                pass
-            st.success("✅ Config queued! Page will reload with new settings in sidebar.")
+        if st.button("⚡ Apply Best Config (#1) to Sidebar", key="btn_apply_best"):
+            _apply_opt_row_to_sidebar(best, opt_strategy, opt_ticker, opt_tf_sel, opt_period)
+            st.success("✅ Best config applied to sidebar — switch to Backtesting or Live Trading.")
             st.rerun()
 
-        st.info("💡 Click the button above to auto-fill sidebar settings with the best found configuration.")
+        st.info("💡 Use the button above (or the 'Apply' buttons in Top 30 below) to load any config into the sidebar.")
 
         # Tabs for results exploration
         res_tabs = st.tabs(["Top 30 Results","Win Rate Distribution","Parameter Heatmap","Export"])
         with res_tabs[0]:
-            st.dataframe(opt_df.head(30), use_container_width=True)
+            st.markdown("#### Top 30 Configurations — click **Apply** to load into sidebar")
+            top30 = opt_df.head(30).reset_index(drop=True)
+            for ridx, row in top30.iterrows():
+                rank = ridx + 1
+                cols = st.columns([0.5, 1.2, 1.2, 1, 1, 1, 1, 1.2, 1.8])
+                cols[0].markdown(f"**#{rank}**")
+                cols[1].markdown(f"WR: **{row['Win Rate (%)']:.1f}%**")
+                cols[2].markdown(f"PF: **{row['Profit Factor']:.2f}**")
+                cols[3].markdown(f"Trades: {int(row['Total Trades'])}")
+                cols[4].markdown(f"P&L: {row['Total P&L']:.1f}")
+                cols[5].markdown(f"SL: {row['SL Type'][:12]}")
+                cols[6].markdown(f"Tgt: {row['Target Type'][:12]}")
+                cols[7].markdown(f"Params: `{row['Strategy Params'][:20]}`")
+                if cols[8].button(f"⚡ Apply #{rank}", key=f"btn_opt_row_{ridx}"):
+                    _apply_opt_row_to_sidebar(row, opt_strategy, opt_ticker, opt_tf_sel, opt_period)
+                    st.success(f"✅ Config #{rank} applied to sidebar!")
+                    st.rerun()
 
         with res_tabs[1]:
             fig_wr = go.Figure()
