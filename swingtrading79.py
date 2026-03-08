@@ -264,7 +264,8 @@ def init_session():
         "live_running"     : False,
         "live_last_signal" : None,
         "last_trade_time"  : 0.0,
-        "live_last_sig_bar_ts" : None,   # timestamp of signal bar that triggered last entry
+        "live_last_sig_bar_ts"  : None,   # signal bar timestamp that triggered last entry
+        "live_last_exit_bar_ts" : None,   # completed candle timestamp last used for BT-match exit check
         "trade_history"    : [],
         "opt_results"      : None,
         "data_cache"       : {},
@@ -910,36 +911,49 @@ def calc_sl(df, idx, entry, direction, sl_type, sp, atr_v=None):
         atr_v = entry * 0.01
 
     if sl_type == "Custom Points":
-        return entry - d * sp.get("sl_pts", 20)
+        sl = entry - d * sp.get("sl_pts", 20)
     elif sl_type == "Trailing SL (Fixed Points)":
-        return entry - d * sp.get("sl_pts", 20)
+        sl = entry - d * sp.get("sl_pts", 20)
     elif sl_type == "Previous Candle Low/High":
-        return df["Low"].iloc[idx-1] if d==1 else df["High"].iloc[idx-1]
+        sl = df["Low"].iloc[idx-1] if d==1 else df["High"].iloc[idx-1]
     elif sl_type == "Current Candle Low/High":
-        return df["Low"].iloc[idx] if d==1 else df["High"].iloc[idx]
+        sl = df["Low"].iloc[idx] if d==1 else df["High"].iloc[idx]
     elif sl_type == "Prev/Curr Swing Low/High":
         lb = sp.get("swing_lb",5); st=max(0,idx-lb*4)
         sub = df.iloc[st:idx+1]
-        return sub["Low"].min() if d==1 else sub["High"].max()
+        sl = sub["Low"].min() if d==1 else sub["High"].max()
     elif sl_type == "ATR Based":
-        return entry - d * sp.get("atr_sl_mult",2.0) * atr_v
+        sl = entry - d * sp.get("atr_sl_mult",2.0) * atr_v
     elif sl_type == "Risk/Reward Based":
         tgt_pts = sp.get("rr_target_pts",40); rr = sp.get("rr_ratio",2.0)
-        return entry - d * (tgt_pts/rr)
+        sl = entry - d * (tgt_pts/rr)
     elif sl_type == "EMA Reverse Crossover":
-        return entry - d * sp.get("sl_pts",20)   # fallback; checked live
+        sl = entry - d * sp.get("sl_pts",20)
     elif sl_type == "Volatility Based":
-        return entry - d * 1.5 * atr_v
+        sl = entry - d * 1.5 * atr_v
     elif sl_type == "Cost to Cost (Breakeven)":
-        return entry - d * atr_v  # initial; moves to breakeven
+        sl = entry - d * atr_v
     elif sl_type == "Strategy Based":
-        return entry - d * 2.0 * atr_v
+        sl = entry - d * 2.0 * atr_v
     elif sl_type == "Auto (AI Managed)":
-        # Dynamic: 1.5x ATR, never exceed 2% of price
         raw = 1.5 * atr_v
         cap = entry * 0.02
-        return entry - d * min(raw, cap)
-    return entry - d * atr_v
+        sl = entry - d * min(raw, cap)
+    else:
+        sl = entry - d * atr_v
+
+    # ── Safety clamp ─────────────────────────────────────────────
+    # SL must ALWAYS be on the correct side of entry price.
+    # LONG:  SL must be strictly below entry  (sl < entry)
+    # SHORT: SL must be strictly above entry  (sl > entry)
+    # If a lookup-based SL (prev candle, swing, etc.) ends up on the
+    # wrong side due to a gap, fall back to 1×ATR from entry.
+    if d == 1 and sl >= entry:
+        sl = entry - atr_v          # 1 ATR below entry
+    elif d == -1 and sl <= entry:
+        sl = entry + atr_v          # 1 ATR above entry
+
+    return sl
 
 def calc_target(df, idx, entry, direction, tgt_type, tp, atr_v=None):
     d = direction
@@ -1164,8 +1178,8 @@ def run_backtest(df_raw, strategy, sl_type, tgt_type, sp, tp,
                     still_open.append(pos)
                     continue
 
-            # Check SL
-            sl_hit = (d==1 and cur_l <= pos["sl"]) or (d==-1 and cur_h >= pos["sl"])
+            # Check SL first (conservative — SL takes priority over target on same bar)
+            sl_hit  = (d==1 and cur_l <= pos["sl"]) or (d==-1 and cur_h >= pos["sl"])
             # Check Target
             tgt_hit = (d==1 and cur_h >= pos["target"]) or (d==-1 and cur_l <= pos["target"])
             # Check opposite signal
@@ -1175,13 +1189,28 @@ def run_backtest(df_raw, strategy, sl_type, tgt_type, sp, tp,
             exit_price  = cur_c
 
             if ema_exit:
-                exit_reason="EMA Cross Exit"; exit_price=cur_c
+                exit_reason = "EMA Cross Exit"
+                exit_price  = cur_c
             elif sl_hit:
-                exit_reason="SL Hit";         exit_price=pos["sl"]
+                # SL evaluated first — if both SL and Target breach same bar, SL wins
+                exit_reason = "SL Hit"
+                # Exit at SL price, clamped within candle range (defence-in-depth)
+                # LONG:  exit at SL, but SL must be >= cur_l (already guaranteed by trigger)
+                #        and <= cur_h (guaranteed by calc_sl clamp — SL < entry <= open)
+                # SHORT: symmetric
+                if d == 1:
+                    exit_price = max(pos["sl"], cur_l)   # can't exit below the actual low
+                else:
+                    exit_price = min(pos["sl"], cur_h)   # can't exit above the actual high
             elif tgt_hit:
-                exit_reason="Target Hit";     exit_price=pos["target"]
+                exit_reason = "Target Hit"
+                if d == 1:
+                    exit_price = min(pos["target"], cur_h)  # can't exit above actual high
+                else:
+                    exit_price = max(pos["target"], cur_l)  # can't exit below actual low
             elif opp_sig and not allow_overlap:
-                exit_reason="Opposite Signal"; exit_price=cur_c
+                exit_reason = "Opposite Signal"
+                exit_price  = cur_c
 
             if exit_reason:
                 q   = pos.get("qty_remaining", qty)
@@ -1191,27 +1220,42 @@ def run_backtest(df_raw, strategy, sl_type, tgt_type, sp, tp,
                     # ── Timing ──────────────────────────────────────
                     "entry_time"      : pos["entry_time"],
                     "exit_time"       : cur_t,
+                    "sig_bar_time"    : pos.get("sig_bar_time", pos["entry_time"]),
                     # ── Direction & Type ────────────────────────────
                     "direction"       : "LONG" if d==1 else "SHORT",
                     "entry_type"      : pos.get("entry_type","Signal"),
                     "entry_logic"     : pos.get("entry_logic",""),
+                    # ── Signal bar OHLCV (candle that triggered) ────
+                    "sig_O"           : pos.get("sig_bar_open",  ""),
+                    "sig_H"           : pos.get("sig_bar_high",  ""),
+                    "sig_L"           : pos.get("sig_bar_low",   ""),
+                    "sig_C"           : pos.get("sig_bar_close", ""),
+                    # ── Entry bar OHLCV (bar where we entered) ──────
+                    "entry_O"         : pos.get("eb_open",  ""),
+                    "entry_H"         : pos.get("eb_high",  ""),
+                    "entry_L"         : pos.get("eb_low",   ""),
+                    "entry_C"         : pos.get("eb_close", ""),
+                    # ── Exit bar OHLCV (bar where we exited) ────────
+                    "exit_O"          : round(float(df["Open"].iloc[i]),  4),
+                    "exit_H"          : round(cur_h, 4),
+                    "exit_L"          : round(cur_l, 4),
+                    "exit_C"          : round(cur_c, 4),
                     # ── Price Levels ────────────────────────────────
                     "entry_price"     : round(pos["entry_price"],4),
                     "exit_price"      : round(exit_price,4),
                     "sl_level"        : round(pos["sl_initial"],4),
                     "final_sl"        : round(pos["sl"],4),
                     "target_level"    : round(pos["target"],4),
-                    # ── High / Low during trade ──────────────────────
+                    # ── High / Low during full trade ─────────────────
                     "trade_high"      : round(pos.get("trade_high", cur_h),4),
                     "trade_low"       : round(pos.get("trade_low",  cur_l),4),
-                    # ── Points ──────────────────────────────────────
+                    # ── Points / P&L ─────────────────────────────────
                     "points_captured" : round(pts,4),
                     "points_risked"   : round(abs(pos["entry_price"]-pos["sl_initial"]),4),
-                    # ── P&L ─────────────────────────────────────────
                     "qty"             : q,
                     "pnl"             : round(pnl,2),
                     "result"          : "WIN" if pnl>0 else ("LOSS" if pnl<0 else "BE"),
-                    # ── Exit ────────────────────────────────────────
+                    # ── Exit reason ──────────────────────────────────
                     "exit_reason"     : exit_reason,
                     "exit_logic"      : _exit_logic_text(exit_reason, pos, exit_price, d),
                 })
@@ -1234,25 +1278,45 @@ def run_backtest(df_raw, strategy, sl_type, tgt_type, sp, tp,
                     ep        = float(df["Open"].iloc[i + 1])   # entry = next bar OPEN
                     entry_t   = df.index[i + 1]
                     entry_bar_idx = i + 1
+                    # Store entry bar's full OHLCV for display in trade log
+                    _eb_o = float(df["Open"].iloc[i + 1])
+                    _eb_h = float(df["High"].iloc[i + 1])
+                    _eb_l = float(df["Low"].iloc[i + 1])
+                    _eb_c = float(df["Close"].iloc[i + 1])
                 else:
                     ep        = cur_c
                     entry_t   = cur_t
                     entry_bar_idx = i
+                    _eb_o = float(df["Open"].iloc[i])
+                    _eb_h = float(df["High"].iloc[i])
+                    _eb_l = float(df["Low"].iloc[i])
+                    _eb_c = cur_c
                 sl_ = calc_sl(df, i, ep, sig, sl_type, sp, atr_v)
                 tg_ = calc_target(df, i, ep, sig, tgt_type, tp, atr_v)
                 entry_logic = _entry_logic_text(strategy, sig, df, i, atr_v, ep)
                 open_positions.append({
-                    "direction"    : sig,
-                    "entry_price"  : ep,
-                    "entry_time"   : entry_t,
-                    "entry_bar"    : entry_bar_idx,
-                    "sl"           : sl_,
-                    "sl_initial"   : sl_,
-                    "target"       : tg_,
-                    "entry_type"   : "Next Bar Open",
-                    "entry_logic"  : entry_logic,
-                    "trade_high"   : ep,
-                    "trade_low"    : ep,
+                    "direction"      : sig,
+                    "entry_price"    : ep,
+                    "entry_time"     : entry_t,
+                    "entry_bar"      : entry_bar_idx,
+                    "sl"             : sl_,
+                    "sl_initial"     : sl_,
+                    "target"         : tg_,
+                    "entry_type"     : "Next Bar Open",
+                    "entry_logic"    : entry_logic,
+                    "trade_high"     : ep,
+                    "trade_low"      : ep,
+                    # Entry bar raw OHLCV (bar where position opened)
+                    "eb_open"        : round(_eb_o, 4),
+                    "eb_high"        : round(_eb_h, 4),
+                    "eb_low"         : round(_eb_l, 4),
+                    "eb_close"       : round(_eb_c, 4),
+                    # Signal bar raw OHLCV (bar that generated the signal, bar i)
+                    "sig_bar_open"   : round(float(df["Open"].iloc[i]),  4),
+                    "sig_bar_high"   : round(float(df["High"].iloc[i]),  4),
+                    "sig_bar_low"    : round(float(df["Low"].iloc[i]),   4),
+                    "sig_bar_close"  : round(float(df["Close"].iloc[i]), 4),
+                    "sig_bar_time"   : df.index[i],
                 })
 
     # Close any remaining open positions
@@ -1267,9 +1331,22 @@ def run_backtest(df_raw, strategy, sl_type, tgt_type, sp, tp,
             trades.append({
                 "entry_time"      : pos["entry_time"],
                 "exit_time"       : last_t,
+                "sig_bar_time"    : pos.get("sig_bar_time", pos["entry_time"]),
                 "direction"       : "LONG" if d==1 else "SHORT",
                 "entry_type"      : pos.get("entry_type","Signal"),
                 "entry_logic"     : pos.get("entry_logic",""),
+                "sig_O"           : pos.get("sig_bar_open",  ""),
+                "sig_H"           : pos.get("sig_bar_high",  ""),
+                "sig_L"           : pos.get("sig_bar_low",   ""),
+                "sig_C"           : pos.get("sig_bar_close", ""),
+                "entry_O"         : pos.get("eb_open",  ""),
+                "entry_H"         : pos.get("eb_high",  ""),
+                "entry_L"         : pos.get("eb_low",   ""),
+                "entry_C"         : pos.get("eb_close", ""),
+                "exit_O"          : round(float(df["Open"].iloc[-1]),  4),
+                "exit_H"          : round(float(df["High"].iloc[-1]),  4),
+                "exit_L"          : round(float(df["Low"].iloc[-1]),   4),
+                "exit_C"          : round(last_c, 4),
                 "entry_price"     : round(pos["entry_price"],4),
                 "exit_price"      : round(last_c,4),
                 "sl_level"        : round(pos["sl_initial"],4),
@@ -2001,21 +2078,42 @@ with tab_bt:
 
             st.markdown("### Trade Log — Full Detail")
             tdf = pd.DataFrame(trades)
-            # Cumulative running totals
-            tdf["cum_pnl"]    = tdf["pnl"].cumsum().round(2)
-            tdf["cum_pts"]    = tdf["points_captured"].cumsum().round(2) if "points_captured" in tdf.columns else tdf["pnl"].cumsum().round(2)
-            tdf["result_icon"]= tdf["pnl"].apply(lambda x: "🟢 WIN" if x>0 else ("🔴 LOSS" if x<0 else "⬜ BE"))
+            tdf["cum_pnl"]     = tdf["pnl"].cumsum().round(2)
+            tdf["cum_pts"]     = tdf["points_captured"].cumsum().round(2) if "points_captured" in tdf.columns else tdf["pnl"].cumsum().round(2)
+            tdf["result_icon"] = tdf["pnl"].apply(lambda x: "🟢 WIN" if x>0 else ("🔴 LOSS" if x<0 else "⬜ BE"))
 
-            display_cols = [
-                c for c in [
-                    "entry_time","exit_time","direction","entry_type",
-                    "entry_price","exit_price","trade_high","trade_low",
-                    "sl_level","target_level","final_sl",
-                    "points_captured","points_risked","qty","pnl","result_icon",
-                    "cum_pts","cum_pnl","exit_reason","entry_logic","exit_logic"
-                ] if c in tdf.columns
-            ]
-            st.dataframe(tdf[display_cols], use_container_width=True, height=380)
+            # Validate: exit_price must be within [exit_L, exit_H] — flag any anomalies
+            if "exit_H" in tdf.columns and "exit_L" in tdf.columns:
+                bad_exits = tdf[
+                    (tdf["exit_price"] > tdf["exit_H"] + 0.01) |
+                    (tdf["exit_price"] < tdf["exit_L"] - 0.01)
+                ]
+                if len(bad_exits) > 0:
+                    st.warning(f"⚠️ {len(bad_exits)} trade(s) have exit price outside candle range — check SL/Target config.")
+
+            display_cols = [c for c in [
+                # ── Identity ──────────────────────────────
+                "result_icon", "direction", "exit_reason",
+                # ── Timing ────────────────────────────────
+                "sig_bar_time", "entry_time", "exit_time",
+                # ── Signal bar raw OHLCV ──────────────────
+                "sig_O", "sig_H", "sig_L", "sig_C",
+                # ── Entry bar raw OHLCV ───────────────────
+                "entry_O", "entry_H", "entry_L", "entry_C",
+                # ── Exit bar raw OHLCV ────────────────────
+                "exit_O", "exit_H", "exit_L", "exit_C",
+                # ── Trade levels ──────────────────────────
+                "entry_price", "sl_level", "target_level", "final_sl",
+                "exit_price",
+                # ── Range during trade ────────────────────
+                "trade_high", "trade_low",
+                # ── Result ────────────────────────────────
+                "points_captured", "points_risked", "qty",
+                "pnl", "cum_pts", "cum_pnl",
+                # ── Detail ────────────────────────────────
+                "entry_type", "entry_logic", "exit_logic",
+            ] if c in tdf.columns]
+            st.dataframe(tdf[display_cols], use_container_width=True, height=420)
 
             # Summary totals row
             if "points_captured" in tdf.columns:
@@ -2055,7 +2153,7 @@ with tab_live:
                                    value=1.5, step=0.5, format="%.1f", key="live_refresh")
 
     # ── Cooloff + Squareoff options ───────────────────────────────
-    lo1, lo2, lo3 = st.columns(3)
+    lo1, lo2, lo3, lo4 = st.columns(4)
     cooloff_s   = lo1.number_input("Cooloff between trades (sec)", min_value=0, max_value=3600,
                                     value=12, step=1, key="live_cooloff",
                                     help="Min seconds to wait after closing a trade before opening another.")
@@ -2063,6 +2161,13 @@ with tab_live:
                                   help="If time filter is ON, force-close any open position when time window ends.")
     sq_before_new = lo3.checkbox("Square-off Before Placing New Order", value=False, key="live_sq_new",
                                   help="Close any open position before opening a new signal trade.")
+    bt_match_mode = lo4.checkbox("Approx Match Backtesting", value=False, key="live_bt_match",
+                                  help=(
+                                      "When ON: SL/Target exits are checked only on the last COMPLETED "
+                                      "candle (using its High/Low), exactly like backtesting. "
+                                      "When OFF (default): checks happen every refresh using the current "
+                                      "live bar's tick-by-tick High/Low."
+                                  ))
 
     if stop_live:
         st.session_state.live_running = False
@@ -2072,9 +2177,10 @@ with tab_live:
         st.session_state.live_running          = True
         st.session_state.live_open_pos         = None
         st.session_state.live_last_signal      = None
-        st.session_state.live_trades           = []        # fresh session — clear old trades
-        st.session_state.last_trade_time       = 0.0       # reset cooloff timer
-        st.session_state.live_last_sig_bar_ts  = None      # reset signal-bar freshness tracker
+        st.session_state.live_trades           = []
+        st.session_state.last_trade_time       = 0.0
+        st.session_state.live_last_sig_bar_ts  = None
+        st.session_state.live_last_exit_bar_ts = None
 
     live_placeholder = st.empty()
     signal_box       = st.empty()
@@ -2200,18 +2306,46 @@ with tab_live:
 
                     # ─────────────────────────────────────────────────────────
                     # STEP 1 — manage existing open position
+                    #
+                    # bt_match_mode OFF (default — tick-by-tick):
+                    #   Use current live bar's High/Low every refresh.
+                    #   Exits fire as soon as price crosses SL/Target intrabar.
+                    #
+                    # bt_match_mode ON (approx backtest match):
+                    #   Only check exits on the last COMPLETED candle (iloc[-2]).
+                    #   Use that candle's High/Low — identical to backtest logic.
+                    #   Only runs once per new completed candle (dedup by timestamp).
                     # ─────────────────────────────────────────────────────────
                     if pos is not None:
                         d = pos["direction"]
 
-                        # Update trailing SL (modifies pos["sl"] in-place)
+                        # Update trailing SL
                         pos = update_trail_sl(pos, df_sig, -1, sl_type, SL_PARAMS, atr_v)
 
-                        # Unrealized = distance from FIXED entry_price to CURRENT price
+                        # Unrealized always uses current price regardless of mode
                         pos["current_price"]  = last_c
                         pos["unrealized_pnl"] = round((last_c - pos["entry_price"]) * d * qty, 2)
 
-                        # EMA crossover exit — only on fresh cross
+                        # ── Determine which candle's H/L to use for exit check ──
+                        if bt_match_mode:
+                            # Backtest-match: use completed candle (iloc[-2])
+                            # Only check once per new completed candle
+                            completed_bar_ts = df_sig.index[-2] if len(df_sig) >= 2 else df_sig.index[-1]
+                            last_checked_ts  = st.session_state.get("live_last_exit_bar_ts")
+                            run_exit_check   = (completed_bar_ts != last_checked_ts)
+                            chk_h = float(df_sig["High"].iloc[-2])  if len(df_sig) >= 2 else last_h
+                            chk_l = float(df_sig["Low"].iloc[-2])   if len(df_sig) >= 2 else last_l
+                            chk_c = float(df_sig["Close"].iloc[-2]) if len(df_sig) >= 2 else last_c
+                            chk_t = completed_bar_ts
+                        else:
+                            # Tick-by-tick: use current live bar every refresh
+                            run_exit_check = True
+                            chk_h = last_h
+                            chk_l = last_l
+                            chk_c = last_c
+                            chk_t = last_t
+
+                        # EMA crossover exit
                         ema_exit = False
                         if sl_type == "EMA Reverse Crossover" or tgt_type == "EMA Reverse Crossover":
                             ef_now = float(ema_f.iloc[-1]);   es_now = float(ema_sl_.iloc[-1])
@@ -2220,13 +2354,21 @@ with tab_live:
                             if d == 1  and ef_now < es_now and ef_pre >= es_pre: ema_exit = True
                             if d == -1 and ef_now > es_now and ef_pre <= es_pre: ema_exit = True
 
-                        sl_hit  = (d ==  1 and last_l <= pos["sl"])    or (d == -1 and last_h >= pos["sl"])
-                        tgt_hit = (d ==  1 and last_h >= pos["target"]) or (d == -1 and last_l <= pos["target"])
                         sq_flip = sq_before_new and last_sig != 0 and last_sig != d
+
+                        # Only evaluate SL/Target when allowed by mode
+                        sl_hit  = False
+                        tgt_hit = False
+                        if run_exit_check:
+                            sl_hit  = (d ==  1 and chk_l <= pos["sl"])    or (d == -1 and chk_h >= pos["sl"])
+                            tgt_hit = (d ==  1 and chk_h >= pos["target"]) or (d == -1 and chk_l <= pos["target"])
+                            if bt_match_mode:
+                                # Mark this candle as checked — won't re-check same bar
+                                st.session_state.live_last_exit_bar_ts = completed_bar_ts
 
                         if sl_hit or tgt_hit or ema_exit or sq_flip:
                             if ema_exit:
-                                reason = "EMA Cross Exit";        ep_exit = last_c
+                                reason = "EMA Cross Exit";        ep_exit = chk_c
                             elif sl_hit:
                                 reason = "SL Hit";                ep_exit = pos["sl"]
                             elif tgt_hit:
@@ -2234,20 +2376,24 @@ with tab_live:
                             else:
                                 reason = "Square-off Before New"; ep_exit = last_c
 
-                            _record_close(pos, ep_exit, reason, last_t)
+                            _record_close(pos, ep_exit, reason, chk_t)
                             just_closed = True
                             pos         = None
                             closed_pnl  = st.session_state.live_trades[-1]["pnl"]
                             color_cls   = "long" if closed_pnl >= 0 else "short"
                             pnl_cls     = "win"  if closed_pnl >= 0 else "loss"
+                            mode_badge  = " 🔁[BT-Match]" if bt_match_mode else ""
                             st.markdown(
                                 f'<div class="signal-{color_cls}">'
-                                f'⚡ {reason} @ {ep_exit:.2f} | Realized P&L: '
+                                f'⚡ {reason}{mode_badge} @ {ep_exit:.2f} | Realized P&L: '
                                 f'<span class="{pnl_cls}">{closed_pnl:+.2f}</span>'
                                 f'</div>', unsafe_allow_html=True)
                         else:
                             # Still open — save pos with updated SL / unrealized
                             st.session_state.live_open_pos = pos
+                            if bt_match_mode and not run_exit_check:
+                                st.caption(f"⏳ BT-Match: waiting for next completed candle "
+                                           f"(last checked: {st.session_state.get('live_last_exit_bar_ts')})")
 
                     # ─────────────────────────────────────────────────────────
                     # STEP 2 — open new position
