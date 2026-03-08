@@ -1735,17 +1735,51 @@ def show_price_ticker(ticker: str):
 # SIDEBAR  –  Global Configuration
 # ─────────────────────────────────────────────────────────────
 with st.sidebar:
-    # ── Note: optimizer writes directly to widget keys (sb_sl_type etc.)
-    # ── before this sidebar block renders, so changes take effect immediately.
+    # ── Consume any pending config from Optimizer (MUST run before widgets) ──
+    # Strategy: pop _pending_* into local variables, then DELETE the widget keys.
+    # When a widget key is absent, Streamlit uses the index=/value= parameter.
+    # This avoids the "cannot modify after instantiation" error entirely.
+    _new_sl_type  = st.session_state.pop("_pending_sl_type",  None)
+    _new_tgt_type = st.session_state.pop("_pending_tgt_type", None)
+    _new_sl_pts   = st.session_state.pop("_pending_sl_pts",   None)
+    _new_tgt_pts  = st.session_state.pop("_pending_tgt_pts",  None)
+    _new_atr_sl   = st.session_state.pop("_pending_atr_sl",   None)
+    _new_rr       = st.session_state.pop("_pending_rr",       None)
+    _new_ema_f    = st.session_state.pop("_pending_ema_f",    None)
+    _new_ema_sl   = st.session_state.pop("_pending_ema_sl",   None)
+    _new_strategy = st.session_state.pop("_pending_strategy", None)
+    _new_tf       = st.session_state.pop("_pending_tf",       None)
+    _new_ticker   = st.session_state.pop("_pending_ticker",   None)
+    _new_custom   = st.session_state.pop("_pending_custom",   None)
+    _new_period   = st.session_state.pop("_pending_period",   None)
+    # Wipe any stray _pending_ keys
+    for _k in [k for k in list(st.session_state.keys()) if k.startswith("_pending_")]:
+        del st.session_state[_k]
+    # If new values arrived, delete the corresponding widget keys so Streamlit
+    # uses the index=/value= defaults we pass below instead of stale session_state
+    _applying = any(v is not None for v in [
+        _new_sl_type, _new_tgt_type, _new_sl_pts, _new_tgt_pts,
+        _new_atr_sl, _new_rr, _new_ema_f, _new_ema_sl,
+        _new_strategy, _new_tf, _new_ticker
+    ])
+    if _applying:
+        for _wk in ["sb_sl_type","sb_tgt_type","sb_sl_pts","sb_tgt_pts",
+                    "sb_atr_sl","sb_rr_sl","sb_rr_tgt","sb_ema_f","sb_ema_sl",
+                    "sb_strategy","sb_tf","sb_ticker","sb_custom","sb_period"]:
+            st.session_state.pop(_wk, None)
 
     st.markdown("## ⚙️ Configuration")
     st.markdown("---")
 
     # ── Instrument ────────────────────────────────────────────
     st.markdown("### Instrument")
-    ticker_name = st.selectbox("Select Instrument", list(TICKERS.keys()), key="sb_ticker")
+    _tk_list = list(TICKERS.keys())
+    _tk_cur  = _new_ticker if (_new_ticker in _tk_list) else st.session_state.get("sb_ticker", _tk_list[0])
+    _tk_idx  = _tk_list.index(_tk_cur) if _tk_cur in _tk_list else 0
+    ticker_name = st.selectbox("Select Instrument", _tk_list, index=_tk_idx, key="sb_ticker")
     if ticker_name == "Custom Ticker":
-        custom_ticker = st.text_input("Custom Yahoo Finance Ticker", "RELIANCE.NS", key="sb_custom")
+        _cx_def = _new_custom if _new_custom else "RELIANCE.NS"
+        custom_ticker = st.text_input("Custom Yahoo Finance Ticker", _cx_def, key="sb_custom")
         ACTIVE_TICKER = custom_ticker
     else:
         ACTIVE_TICKER = TICKERS[ticker_name]
@@ -1753,14 +1787,19 @@ with st.sidebar:
 
     # ── Timeframe / Period ────────────────────────────────────
     st.markdown("### Timeframe & Period")
-    tf = st.selectbox("Timeframe", TIMEFRAMES, index=2, key="sb_tf")
+    _tf_cur = _new_tf if (_new_tf in TIMEFRAMES) else st.session_state.get("sb_tf", TIMEFRAMES[2])
+    _tf_idx = TIMEFRAMES.index(_tf_cur) if _tf_cur in TIMEFRAMES else 2
+    tf = st.selectbox("Timeframe", TIMEFRAMES, index=_tf_idx, key="sb_tf")
     valid_periods = TF_PERIOD_MAP.get(tf, ALL_PERIODS)
-    period = st.selectbox("Period", valid_periods,
-                          index=min(3, len(valid_periods)-1), key="sb_period")
+    _pr_cur = _new_period if (_new_period in valid_periods) else st.session_state.get("sb_period")
+    _pr_idx = valid_periods.index(_pr_cur) if _pr_cur in valid_periods else min(3, len(valid_periods)-1)
+    period = st.selectbox("Period", valid_periods, index=_pr_idx, key="sb_period")
 
     # ── Strategy ─────────────────────────────────────────────
     st.markdown("### Strategy")
-    strategy = st.selectbox("Strategy", STRATEGIES, key="sb_strategy")
+    _st_cur = _new_strategy if (_new_strategy in STRATEGIES) else st.session_state.get("sb_strategy", STRATEGIES[0])
+    _st_idx = STRATEGIES.index(_st_cur) if _st_cur in STRATEGIES else 0
+    strategy = st.selectbox("Strategy", STRATEGIES, index=_st_idx, key="sb_strategy")
 
     # ── Quantity ──────────────────────────────────────────────
     st.markdown("### Quantity")
@@ -1782,21 +1821,21 @@ with st.sidebar:
 
     # ── Stop Loss ─────────────────────────────────────────────
     st.markdown("### Stop Loss")
-    _sl_cur = st.session_state.get("sb_sl_type", SL_TYPES[5])
+    _sl_cur = _new_sl_type if (_new_sl_type in SL_TYPES) else st.session_state.get("sb_sl_type", SL_TYPES[5])
     _sl_idx = SL_TYPES.index(_sl_cur) if _sl_cur in SL_TYPES else 5
     sl_type    = st.selectbox("SL Type", SL_TYPES, index=_sl_idx, key="sb_sl_type")
-    sl_pts     = st.number_input("SL Points (Custom/Trailing)", 1, 10_000,
-                                  st.session_state.get("sb_sl_pts", 20), key="sb_sl_pts")
+    _slp_def   = int(_new_sl_pts) if _new_sl_pts is not None else st.session_state.get("sb_sl_pts", 20)
+    sl_pts     = st.number_input("SL Points (Custom/Trailing)", 1, 10_000, int(_slp_def), key="sb_sl_pts")
+    _asl_def   = float(_new_atr_sl) if _new_atr_sl is not None else float(st.session_state.get("sb_atr_sl", 2.0))
     atr_sl_m   = st.number_input("ATR SL Multiplier", min_value=0.1, max_value=10.0,
-                                  value=float(st.session_state.get("sb_atr_sl", 2.0)),
-                                  step=0.1, format="%.1f", key="sb_atr_sl")
+                                  value=_asl_def, step=0.1, format="%.1f", key="sb_atr_sl")
+    _rr_def    = float(_new_rr) if _new_rr is not None else float(st.session_state.get("sb_rr_sl", 2.0))
     rr_ratio_sl= st.number_input("R:R Ratio (RR-based SL)", min_value=0.5, max_value=20.0,
-                                  value=float(st.session_state.get("sb_rr_sl", 2.0)),
-                                  step=0.5, format="%.1f", key="sb_rr_sl")
-    ema_fast_s = st.number_input("EMA Fast (Crossover SL)", 3, 100,
-                                  st.session_state.get("sb_ema_f", 9),  key="sb_ema_f")
-    ema_slow_s = st.number_input("EMA Slow (Crossover SL)", 5, 200,
-                                  st.session_state.get("sb_ema_sl", 21), key="sb_ema_sl")
+                                  value=_rr_def, step=0.5, format="%.1f", key="sb_rr_sl")
+    _ef_def    = int(_new_ema_f) if _new_ema_f is not None else st.session_state.get("sb_ema_f", 9)
+    ema_fast_s = st.number_input("EMA Fast (Crossover SL)", 3, 100, int(_ef_def), key="sb_ema_f")
+    _es_def    = int(_new_ema_sl) if _new_ema_sl is not None else st.session_state.get("sb_ema_sl", 21)
+    ema_slow_s = st.number_input("EMA Slow (Crossover SL)", 5, 200, int(_es_def), key="sb_ema_sl")
     swing_lb_s = st.number_input("Swing Lookback (bars)", 3, 50, 5, key="sb_swing_sl")
 
     SL_PARAMS = {
@@ -1811,16 +1850,16 @@ with st.sidebar:
 
     # ── Target ────────────────────────────────────────────────
     st.markdown("### Target")
-    _tgt_cur = st.session_state.get("sb_tgt_type", TARGET_TYPES[6])
+    _tgt_cur = _new_tgt_type if (_new_tgt_type in TARGET_TYPES) else st.session_state.get("sb_tgt_type", TARGET_TYPES[6])
     _tgt_idx = TARGET_TYPES.index(_tgt_cur) if _tgt_cur in TARGET_TYPES else 6
     tgt_type   = st.selectbox("Target Type", TARGET_TYPES, index=_tgt_idx, key="sb_tgt_type")
-    tgt_pts    = st.number_input("Target Points", 1, 50_000,
-                                  st.session_state.get("sb_tgt_pts", 40), key="sb_tgt_pts")
+    _tgp_def   = int(_new_tgt_pts) if _new_tgt_pts is not None else st.session_state.get("sb_tgt_pts", 40)
+    tgt_pts    = st.number_input("Target Points", 1, 50_000, int(_tgp_def), key="sb_tgt_pts")
     atr_tgt_m  = st.number_input("ATR Target Multiplier", min_value=0.5, max_value=20.0,
                                   value=3.0, step=0.5, format="%.1f", key="sb_atr_tgt")
+    _rrt_def   = float(_new_rr) if _new_rr is not None else float(st.session_state.get("sb_rr_tgt", 2.0))
     rr_ratio_t = st.number_input("R:R Ratio (Target)", min_value=0.5, max_value=20.0,
-                                  value=float(st.session_state.get("sb_rr_tgt", 2.0)),
-                                  step=0.5, format="%.1f", key="sb_rr_tgt")
+                                  value=_rrt_def, step=0.5, format="%.1f", key="sb_rr_tgt")
     swing_lb_t = st.number_input("Swing Lookback (Target)", 3, 50, 5, key="sb_swing_tgt")
 
     TGT_PARAMS = {
@@ -2919,42 +2958,41 @@ with tab_opt:
 
     # ── Helper: push a result row into sidebar session_state ─────
     def _apply_opt_row_to_sidebar(row, strat, ticker, tf_sel, per):
-        """Write optimized config directly into sidebar widget keys."""
+        """Stage optimized config via _pending_ keys.
+        The sidebar block reads and pops these BEFORE widgets are instantiated,
+        so Streamlit never sees a post-instantiation write to a widget key.
+        """
         _p = st.session_state
-        # SL / Target types and params
+        # SL / Target types and params — written as _pending_, consumed by sidebar on rerun
         if row["SL Type"] in SL_TYPES:
-            _p["sb_sl_type"]  = row["SL Type"]
+            _p["_pending_sl_type"]  = row["SL Type"]
         if row["Target Type"] in TARGET_TYPES:
-            _p["sb_tgt_type"] = row["Target Type"]
-        _p["sb_sl_pts"]  = int(float(row["SL Points"]))
-        _p["sb_tgt_pts"] = int(float(row["Target Points"]))
-        _p["sb_atr_sl"]  = float(row["ATR SL Mult"])
-        _p["sb_rr_sl"]   = float(row["R:R Ratio"])
-        _p["sb_rr_tgt"]  = float(row["R:R Ratio"])
+            _p["_pending_tgt_type"] = row["Target Type"]
+        _p["_pending_sl_pts"]  = int(float(row["SL Points"]))
+        _p["_pending_tgt_pts"] = int(float(row["Target Points"]))
+        _p["_pending_atr_sl"]  = float(row["ATR SL Mult"])
+        _p["_pending_rr"]      = float(row["R:R Ratio"])
         # Strategy indicator params
         try:
             import ast as _ast2
             p_dict = _ast2.literal_eval(row["Strategy Params"])
-            if "fast" in p_dict: _p["sb_ema_f"]  = int(p_dict["fast"])
-            if "slow" in p_dict: _p["sb_ema_sl"] = int(p_dict["slow"])
+            if "fast" in p_dict: _p["_pending_ema_f"]  = int(p_dict["fast"])
+            if "slow" in p_dict: _p["_pending_ema_sl"] = int(p_dict["slow"])
         except:
             pass
-        # Also sync sidebar instrument / strategy / timeframe / period
-        if strat in STRATEGIES:
-            _p["sb_strategy"] = strat
-        if tf_sel in TIMEFRAMES:
-            _p["sb_tf"] = tf_sel
-        # Ticker: set custom if not in preset list
+        # Sidebar instrument / strategy / timeframe / period — these are safe to
+        # write directly only if NOT yet rendered; use _pending_ pattern for safety
+        _p["_pending_strategy"] = strat if strat in STRATEGIES else None
+        _p["_pending_tf"]       = tf_sel if tf_sel in TIMEFRAMES else None
         preset_tickers = {v: k for k, v in TICKERS.items()}
         if ticker in preset_tickers:
-            _p["sb_ticker"] = preset_tickers[ticker]
+            _p["_pending_ticker"]  = preset_tickers[ticker]
+            _p["_pending_custom"]  = None
         else:
-            _p["sb_ticker"]  = "Custom Ticker"
-            _p["sb_custom"]  = ticker
-        # Period
+            _p["_pending_ticker"]  = "Custom Ticker"
+            _p["_pending_custom"]  = ticker
         valid_p = TF_PERIOD_MAP.get(tf_sel, ALL_PERIODS)
-        if per in valid_p:
-            _p["sb_period"] = per
+        _p["_pending_period"] = per if per in valid_p else None
 
     # ── Display results ──────────────────────────────────────
     opt_df = st.session_state.get("opt_results")
