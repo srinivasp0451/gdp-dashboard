@@ -285,6 +285,42 @@ def init_session():
 init_session()
 
 # ─────────────────────────────────────────────────────────────
+# APPLY OPTIMIZER CONFIG  — runs at module level, before ANY
+# widget is ever instantiated.  Writing to session_state[widget_key]
+# here is ALWAYS safe and is the only bulletproof location.
+# ─────────────────────────────────────────────────────────────
+if "_pending_sl_type" in st.session_state or "_pending_strategy" in st.session_state:
+    _cfg = st.session_state
+    def _pop(k, cast=None, default=None):
+        v = _cfg.pop(k, default)
+        if v is not None and cast is not None:
+            try: return cast(v)
+            except: return default
+        return v
+    _v = _pop("_pending_sl_type");   (_cfg.__setitem__("sb_sl_type",  _v) if _v in SL_TYPES else None)
+    _v = _pop("_pending_tgt_type");  (_cfg.__setitem__("sb_tgt_type", _v) if _v in TARGET_TYPES else None)
+    _v = _pop("_pending_sl_pts",  int);   (_cfg.__setitem__("sb_sl_pts",  _v) if _v is not None else None)
+    _v = _pop("_pending_tgt_pts", int);   (_cfg.__setitem__("sb_tgt_pts", _v) if _v is not None else None)
+    _v = _pop("_pending_atr_sl",  float); (_cfg.__setitem__("sb_atr_sl",  _v) if _v is not None else None)
+    _v = _pop("_pending_rr",      float)
+    if _v is not None:
+        _cfg["sb_rr_sl"]  = _v
+        _cfg["sb_rr_tgt"] = _v
+    _v = _pop("_pending_ema_f",   int);   (_cfg.__setitem__("sb_ema_f",  _v) if _v is not None else None)
+    _v = _pop("_pending_ema_sl",  int);   (_cfg.__setitem__("sb_ema_sl", _v) if _v is not None else None)
+    _v = _pop("_pending_strategy"); (_cfg.__setitem__("sb_strategy", _v) if _v in STRATEGIES else None)
+    _v = _pop("_pending_tf");       (_cfg.__setitem__("sb_tf",       _v) if _v in TIMEFRAMES else None)
+    _v = _pop("_pending_ticker")
+    if _v and _v in list(TICKERS.keys()): _cfg["sb_ticker"] = _v
+    _v = _pop("_pending_custom")
+    if _v: _cfg["sb_custom"] = _v
+    _v = _pop("_pending_period")
+    if _v: _cfg["sb_period"] = _v
+    # wipe any stray _pending_ keys
+    for _k in [k for k in list(_cfg.keys()) if k.startswith("_pending_")]:
+        del _cfg[_k]
+
+# ─────────────────────────────────────────────────────────────
 # RATE-LIMITED DATA FETCHER
 # ─────────────────────────────────────────────────────────────
 def fetch_data(ticker: str, period: str, interval: str, force_fresh=False) -> pd.DataFrame | None:
@@ -1184,22 +1220,23 @@ def run_backtest(df_raw, strategy, sl_type, tgt_type, sp, tp,
 
         open_positions = still_open
 
-        # ── Open new position ──────────────────────────────────
+        # ── Open new position on signal ─────────────────────────
+        # Industry-standard backtesting:
+        #   Signal fires on bar i (confirmed closed candle)
+        #   Entry at OPEN of bar i+1  (avoid look-ahead bias)
+        #   Exit:  iterate bars i+1 onward, check Low vs SL and High vs Target
         sig = int(row["signal"])
         if sig != 0:
             if not allow_overlap and open_positions:
-                pass  # skip if position already open
+                pass  # already in a position — skip
             else:
-                # Entry at NEXT bar's close — exactly mirrors live trading:
-                #   live:  signal from iloc[-2] → entry at iloc[-1] close (last_c)
-                #   bt:    signal from bar i    → entry at bar i+1 close
                 if i + 1 < len(df):
-                    ep      = float(df["Close"].iloc[i + 1])
-                    entry_t = df.index[i + 1]
-                    entry_bar_idx = i + 1   # exit checks start FROM this bar
+                    ep        = float(df["Open"].iloc[i + 1])   # entry = next bar OPEN
+                    entry_t   = df.index[i + 1]
+                    entry_bar_idx = i + 1
                 else:
-                    ep      = cur_c
-                    entry_t = cur_t
+                    ep        = cur_c
+                    entry_t   = cur_t
                     entry_bar_idx = i
                 sl_ = calc_sl(df, i, ep, sig, sl_type, sp, atr_v)
                 tg_ = calc_target(df, i, ep, sig, tgt_type, tp, atr_v)
@@ -1212,10 +1249,10 @@ def run_backtest(df_raw, strategy, sl_type, tgt_type, sp, tp,
                     "sl"           : sl_,
                     "sl_initial"   : sl_,
                     "target"       : tg_,
-                    "entry_type"   : "Signal Bar+1 Close",
+                    "entry_type"   : "Next Bar Open",
                     "entry_logic"  : entry_logic,
-                    "trade_high"   : ep,   # track highest price during trade
-                    "trade_low"    : ep,   # track lowest price during trade
+                    "trade_high"   : ep,
+                    "trade_low"    : ep,
                 })
 
     # Close any remaining open positions
@@ -1735,51 +1772,17 @@ def show_price_ticker(ticker: str):
 # SIDEBAR  –  Global Configuration
 # ─────────────────────────────────────────────────────────────
 with st.sidebar:
-    # ── Consume any pending config from Optimizer (MUST run before widgets) ──
-    # Strategy: pop _pending_* into local variables, then DELETE the widget keys.
-    # When a widget key is absent, Streamlit uses the index=/value= parameter.
-    # This avoids the "cannot modify after instantiation" error entirely.
-    _new_sl_type  = st.session_state.pop("_pending_sl_type",  None)
-    _new_tgt_type = st.session_state.pop("_pending_tgt_type", None)
-    _new_sl_pts   = st.session_state.pop("_pending_sl_pts",   None)
-    _new_tgt_pts  = st.session_state.pop("_pending_tgt_pts",  None)
-    _new_atr_sl   = st.session_state.pop("_pending_atr_sl",   None)
-    _new_rr       = st.session_state.pop("_pending_rr",       None)
-    _new_ema_f    = st.session_state.pop("_pending_ema_f",    None)
-    _new_ema_sl   = st.session_state.pop("_pending_ema_sl",   None)
-    _new_strategy = st.session_state.pop("_pending_strategy", None)
-    _new_tf       = st.session_state.pop("_pending_tf",       None)
-    _new_ticker   = st.session_state.pop("_pending_ticker",   None)
-    _new_custom   = st.session_state.pop("_pending_custom",   None)
-    _new_period   = st.session_state.pop("_pending_period",   None)
-    # Wipe any stray _pending_ keys
-    for _k in [k for k in list(st.session_state.keys()) if k.startswith("_pending_")]:
-        del st.session_state[_k]
-    # If new values arrived, delete the corresponding widget keys so Streamlit
-    # uses the index=/value= defaults we pass below instead of stale session_state
-    _applying = any(v is not None for v in [
-        _new_sl_type, _new_tgt_type, _new_sl_pts, _new_tgt_pts,
-        _new_atr_sl, _new_rr, _new_ema_f, _new_ema_sl,
-        _new_strategy, _new_tf, _new_ticker
-    ])
-    if _applying:
-        for _wk in ["sb_sl_type","sb_tgt_type","sb_sl_pts","sb_tgt_pts",
-                    "sb_atr_sl","sb_rr_sl","sb_rr_tgt","sb_ema_f","sb_ema_sl",
-                    "sb_strategy","sb_tf","sb_ticker","sb_custom","sb_period"]:
-            st.session_state.pop(_wk, None)
+    # Config from optimizer is applied at module level (before this block).
+    # No pending-key processing needed here.
 
     st.markdown("## ⚙️ Configuration")
     st.markdown("---")
 
     # ── Instrument ────────────────────────────────────────────
     st.markdown("### Instrument")
-    _tk_list = list(TICKERS.keys())
-    _tk_cur  = _new_ticker if (_new_ticker in _tk_list) else st.session_state.get("sb_ticker", _tk_list[0])
-    _tk_idx  = _tk_list.index(_tk_cur) if _tk_cur in _tk_list else 0
-    ticker_name = st.selectbox("Select Instrument", _tk_list, index=_tk_idx, key="sb_ticker")
+    ticker_name = st.selectbox("Select Instrument", list(TICKERS.keys()), key="sb_ticker")
     if ticker_name == "Custom Ticker":
-        _cx_def = _new_custom if _new_custom else "RELIANCE.NS"
-        custom_ticker = st.text_input("Custom Yahoo Finance Ticker", _cx_def, key="sb_custom")
+        custom_ticker = st.text_input("Custom Yahoo Finance Ticker", "RELIANCE.NS", key="sb_custom")
         ACTIVE_TICKER = custom_ticker
     else:
         ACTIVE_TICKER = TICKERS[ticker_name]
@@ -1787,19 +1790,15 @@ with st.sidebar:
 
     # ── Timeframe / Period ────────────────────────────────────
     st.markdown("### Timeframe & Period")
-    _tf_cur = _new_tf if (_new_tf in TIMEFRAMES) else st.session_state.get("sb_tf", TIMEFRAMES[2])
-    _tf_idx = TIMEFRAMES.index(_tf_cur) if _tf_cur in TIMEFRAMES else 2
-    tf = st.selectbox("Timeframe", TIMEFRAMES, index=_tf_idx, key="sb_tf")
+    tf = st.selectbox("Timeframe", TIMEFRAMES, index=2, key="sb_tf")
     valid_periods = TF_PERIOD_MAP.get(tf, ALL_PERIODS)
-    _pr_cur = _new_period if (_new_period in valid_periods) else st.session_state.get("sb_period")
+    _pr_cur = st.session_state.get("sb_period")
     _pr_idx = valid_periods.index(_pr_cur) if _pr_cur in valid_periods else min(3, len(valid_periods)-1)
     period = st.selectbox("Period", valid_periods, index=_pr_idx, key="sb_period")
 
     # ── Strategy ─────────────────────────────────────────────
     st.markdown("### Strategy")
-    _st_cur = _new_strategy if (_new_strategy in STRATEGIES) else st.session_state.get("sb_strategy", STRATEGIES[0])
-    _st_idx = STRATEGIES.index(_st_cur) if _st_cur in STRATEGIES else 0
-    strategy = st.selectbox("Strategy", STRATEGIES, index=_st_idx, key="sb_strategy")
+    strategy = st.selectbox("Strategy", STRATEGIES, key="sb_strategy")
 
     # ── Quantity ──────────────────────────────────────────────
     st.markdown("### Quantity")
@@ -1821,22 +1820,34 @@ with st.sidebar:
 
     # ── Stop Loss ─────────────────────────────────────────────
     st.markdown("### Stop Loss")
-    _sl_cur = _new_sl_type if (_new_sl_type in SL_TYPES) else st.session_state.get("sb_sl_type", SL_TYPES[5])
-    _sl_idx = SL_TYPES.index(_sl_cur) if _sl_cur in SL_TYPES else 5
-    sl_type    = st.selectbox("SL Type", SL_TYPES, index=_sl_idx, key="sb_sl_type")
-    _slp_def   = int(_new_sl_pts) if _new_sl_pts is not None else st.session_state.get("sb_sl_pts", 20)
-    sl_pts     = st.number_input("SL Points (Custom/Trailing)", 1, 10_000, int(_slp_def), key="sb_sl_pts")
-    _asl_def   = float(_new_atr_sl) if _new_atr_sl is not None else float(st.session_state.get("sb_atr_sl", 2.0))
-    atr_sl_m   = st.number_input("ATR SL Multiplier", min_value=0.1, max_value=10.0,
-                                  value=_asl_def, step=0.1, format="%.1f", key="sb_atr_sl")
-    _rr_def    = float(_new_rr) if _new_rr is not None else float(st.session_state.get("sb_rr_sl", 2.0))
-    rr_ratio_sl= st.number_input("R:R Ratio (RR-based SL)", min_value=0.5, max_value=20.0,
-                                  value=_rr_def, step=0.5, format="%.1f", key="sb_rr_sl")
-    _ef_def    = int(_new_ema_f) if _new_ema_f is not None else st.session_state.get("sb_ema_f", 9)
-    ema_fast_s = st.number_input("EMA Fast (Crossover SL)", 3, 100, int(_ef_def), key="sb_ema_f")
-    _es_def    = int(_new_ema_sl) if _new_ema_sl is not None else st.session_state.get("sb_ema_sl", 21)
-    ema_slow_s = st.number_input("EMA Slow (Crossover SL)", 5, 200, int(_es_def), key="sb_ema_sl")
-    swing_lb_s = st.number_input("Swing Lookback (bars)", 3, 50, 5, key="sb_swing_sl")
+    sl_type = st.selectbox("SL Type", SL_TYPES, key="sb_sl_type")
+
+    # Show only the sub-params relevant to the chosen SL type
+    sl_pts = 20
+    atr_sl_m = 2.0
+    rr_ratio_sl = 2.0
+    ema_fast_s = 9
+    ema_slow_s = 21
+    swing_lb_s = 5
+
+    if sl_type in ("Custom Points", "Trailing SL (Fixed Points)", "Breakeven + Trail"):
+        sl_pts = st.number_input("SL Points", 1, 10_000,
+                                  st.session_state.get("sb_sl_pts", 20), key="sb_sl_pts")
+    if sl_type in ("ATR Based", "Volatility Based", "Auto (AI Managed)"):
+        atr_sl_m = st.number_input("ATR SL Multiplier", 0.1, 10.0,
+                                    float(st.session_state.get("sb_atr_sl", 2.0)),
+                                    step=0.1, format="%.1f", key="sb_atr_sl")
+    if sl_type in ("Risk/Reward Based",):
+        rr_ratio_sl = st.number_input("R:R Ratio (SL)", 0.5, 20.0,
+                                       float(st.session_state.get("sb_rr_sl", 2.0)),
+                                       step=0.5, format="%.1f", key="sb_rr_sl")
+    if sl_type == "EMA Reverse Crossover":
+        ema_fast_s = st.number_input("EMA Fast period", 3, 100,
+                                      st.session_state.get("sb_ema_f", 9), key="sb_ema_f")
+        ema_slow_s = st.number_input("EMA Slow period", 5, 200,
+                                      st.session_state.get("sb_ema_sl", 21), key="sb_ema_sl")
+    if sl_type in ("Swing High/Low", "Previous Candle Low/High"):
+        swing_lb_s = st.number_input("Swing Lookback (bars)", 3, 50, 5, key="sb_swing_sl")
 
     SL_PARAMS = {
         "sl_pts"       : sl_pts,
@@ -1850,17 +1861,31 @@ with st.sidebar:
 
     # ── Target ────────────────────────────────────────────────
     st.markdown("### Target")
-    _tgt_cur = _new_tgt_type if (_new_tgt_type in TARGET_TYPES) else st.session_state.get("sb_tgt_type", TARGET_TYPES[6])
-    _tgt_idx = TARGET_TYPES.index(_tgt_cur) if _tgt_cur in TARGET_TYPES else 6
-    tgt_type   = st.selectbox("Target Type", TARGET_TYPES, index=_tgt_idx, key="sb_tgt_type")
-    _tgp_def   = int(_new_tgt_pts) if _new_tgt_pts is not None else st.session_state.get("sb_tgt_pts", 40)
-    tgt_pts    = st.number_input("Target Points", 1, 50_000, int(_tgp_def), key="sb_tgt_pts")
-    atr_tgt_m  = st.number_input("ATR Target Multiplier", min_value=0.5, max_value=20.0,
-                                  value=3.0, step=0.5, format="%.1f", key="sb_atr_tgt")
-    _rrt_def   = float(_new_rr) if _new_rr is not None else float(st.session_state.get("sb_rr_tgt", 2.0))
-    rr_ratio_t = st.number_input("R:R Ratio (Target)", min_value=0.5, max_value=20.0,
-                                  value=_rrt_def, step=0.5, format="%.1f", key="sb_rr_tgt")
-    swing_lb_t = st.number_input("Swing Lookback (Target)", 3, 50, 5, key="sb_swing_tgt")
+    tgt_type = st.selectbox("Target Type", TARGET_TYPES, key="sb_tgt_type")
+
+    tgt_pts = 40
+    atr_tgt_m = 3.0
+    rr_ratio_t = 2.0
+    swing_lb_t = 5
+
+    if tgt_type in ("Custom Points", "Trailing Target (Fixed Points)"):
+        tgt_pts = st.number_input("Target Points", 1, 50_000,
+                                   st.session_state.get("sb_tgt_pts", 40), key="sb_tgt_pts")
+    if tgt_type in ("ATR Based",):
+        atr_tgt_m = st.number_input("ATR Target Multiplier", 0.5, 20.0, 3.0,
+                                     step=0.5, format="%.1f", key="sb_atr_tgt")
+    if tgt_type in ("Risk/Reward Based",):
+        rr_ratio_t = st.number_input("R:R Ratio (Target)", 0.5, 20.0,
+                                      float(st.session_state.get("sb_rr_tgt", 2.0)),
+                                      step=0.5, format="%.1f", key="sb_rr_tgt")
+    if tgt_type == "EMA Reverse Crossover":
+        if sl_type != "EMA Reverse Crossover":   # avoid duplicate widgets
+            ema_fast_s = st.number_input("EMA Fast period", 3, 100,
+                                          st.session_state.get("sb_ema_f", 9), key="sb_ema_f")
+            ema_slow_s = st.number_input("EMA Slow period", 5, 200,
+                                          st.session_state.get("sb_ema_sl", 21), key="sb_ema_sl")
+    if tgt_type in ("Swing High/Low",):
+        swing_lb_t = st.number_input("Swing Lookback Target (bars)", 3, 50, 5, key="sb_swing_tgt")
 
     TGT_PARAMS = {
         "tgt_pts"      : tgt_pts,
@@ -2250,7 +2275,7 @@ with tab_live:
                             gate_fresh = (last_used_sig_ts is None) or (sig_bar_ts != last_used_sig_ts)
 
                         if gate_cooloff and gate_fresh:
-                            ep_new  = last_c       # entry at current bar close
+                            ep_new  = last_c  # current bar close ≈ next bar open in live trading
                             sl_new  = calc_sl(df_sig, -1, ep_new, last_sig, sl_type, SL_PARAMS, atr_v)
                             tg_new  = calc_target(df_sig, -1, ep_new, last_sig, tgt_type, TGT_PARAMS, atr_v)
                             el_new  = _entry_logic_text(strategy, last_sig, df_sig, sig_bar_idx, atr_v, ep_new)
