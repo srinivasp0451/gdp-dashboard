@@ -329,7 +329,7 @@ if "_pending_sl_type" in st.session_state or "_pending_strategy" in st.session_s
     if _v:                 _cfg["sb_period"]   = _v
     for _k in [k for k in list(_cfg.keys()) if k.startswith("_pending_")]:
         del _cfg[_k]
-    del _cpop, _v, _k
+    del _cpop
 
 # ─────────────────────────────────────────────────────────────
 # RATE-LIMITED DATA FETCHER
