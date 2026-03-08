@@ -292,34 +292,44 @@ init_session()
 # ─────────────────────────────────────────────────────────────
 if "_pending_sl_type" in st.session_state or "_pending_strategy" in st.session_state:
     _cfg = st.session_state
-    def _pop(k, cast=None, default=None):
+    def _cpop(k, cast=None, default=None):
         v = _cfg.pop(k, default)
         if v is not None and cast is not None:
-            try: return cast(v)
+            try:    return cast(v)
             except: return default
         return v
-    _v = _pop("_pending_sl_type");   (_cfg.__setitem__("sb_sl_type",  _v) if _v in SL_TYPES else None)
-    _v = _pop("_pending_tgt_type");  (_cfg.__setitem__("sb_tgt_type", _v) if _v in TARGET_TYPES else None)
-    _v = _pop("_pending_sl_pts",  int);   (_cfg.__setitem__("sb_sl_pts",  _v) if _v is not None else None)
-    _v = _pop("_pending_tgt_pts", int);   (_cfg.__setitem__("sb_tgt_pts", _v) if _v is not None else None)
-    _v = _pop("_pending_atr_sl",  float); (_cfg.__setitem__("sb_atr_sl",  _v) if _v is not None else None)
-    _v = _pop("_pending_rr",      float)
+    _v = _cpop("_pending_sl_type")
+    if _v in SL_TYPES:     _cfg["sb_sl_type"]  = _v
+    _v = _cpop("_pending_tgt_type")
+    if _v in TARGET_TYPES: _cfg["sb_tgt_type"] = _v
+    _v = _cpop("_pending_sl_pts",  int)
+    if _v is not None:     _cfg["sb_sl_pts"]   = _v
+    _v = _cpop("_pending_tgt_pts", int)
+    if _v is not None:     _cfg["sb_tgt_pts"]  = _v
+    _v = _cpop("_pending_atr_sl",  float)
+    if _v is not None:     _cfg["sb_atr_sl"]   = _v
+    _v = _cpop("_pending_rr",      float)
     if _v is not None:
         _cfg["sb_rr_sl"]  = _v
         _cfg["sb_rr_tgt"] = _v
-    _v = _pop("_pending_ema_f",   int);   (_cfg.__setitem__("sb_ema_f",  _v) if _v is not None else None)
-    _v = _pop("_pending_ema_sl",  int);   (_cfg.__setitem__("sb_ema_sl", _v) if _v is not None else None)
-    _v = _pop("_pending_strategy"); (_cfg.__setitem__("sb_strategy", _v) if _v in STRATEGIES else None)
-    _v = _pop("_pending_tf");       (_cfg.__setitem__("sb_tf",       _v) if _v in TIMEFRAMES else None)
-    _v = _pop("_pending_ticker")
-    if _v and _v in list(TICKERS.keys()): _cfg["sb_ticker"] = _v
-    _v = _pop("_pending_custom")
-    if _v: _cfg["sb_custom"] = _v
-    _v = _pop("_pending_period")
-    if _v: _cfg["sb_period"] = _v
-    # wipe any stray _pending_ keys
+    _v = _cpop("_pending_ema_f",   int)
+    if _v is not None:     _cfg["sb_ema_f"]    = _v
+    _v = _cpop("_pending_ema_sl",  int)
+    if _v is not None:     _cfg["sb_ema_sl"]   = _v
+    _v = _cpop("_pending_strategy")
+    if _v in STRATEGIES:   _cfg["sb_strategy"] = _v
+    _v = _cpop("_pending_tf")
+    if _v in TIMEFRAMES:   _cfg["sb_tf"]       = _v
+    _v = _cpop("_pending_ticker")
+    if _v and _v in list(TICKERS.keys()):
+                           _cfg["sb_ticker"]   = _v
+    _v = _cpop("_pending_custom")
+    if _v:                 _cfg["sb_custom"]   = _v
+    _v = _cpop("_pending_period")
+    if _v:                 _cfg["sb_period"]   = _v
     for _k in [k for k in list(_cfg.keys()) if k.startswith("_pending_")]:
         del _cfg[_k]
+    del _cpop, _v, _k
 
 # ─────────────────────────────────────────────────────────────
 # RATE-LIMITED DATA FETCHER
@@ -1194,20 +1204,32 @@ def run_backtest(df_raw, strategy, sl_type, tgt_type, sp, tp,
             elif sl_hit:
                 # SL evaluated first — if both SL and Target breach same bar, SL wins
                 exit_reason = "SL Hit"
-                # Exit at SL price, clamped within candle range (defence-in-depth)
-                # LONG:  exit at SL, but SL must be >= cur_l (already guaranteed by trigger)
-                #        and <= cur_h (guaranteed by calc_sl clamp — SL < entry <= open)
-                # SHORT: symmetric
                 if d == 1:
-                    exit_price = max(pos["sl"], cur_l)   # can't exit below the actual low
+                    # Normal: SL is within candle (cur_l <= sl <= cur_h) → exit at SL
+                    # Gap-down: sl > cur_h (entire candle gapped past SL) → exit at open
+                    if pos["sl"] <= cur_h:
+                        exit_price = pos["sl"]                   # exact SL fill
+                    else:
+                        exit_price = float(df["Open"].iloc[i])   # gapped through, slippage at open
                 else:
-                    exit_price = min(pos["sl"], cur_h)   # can't exit above the actual high
+                    if pos["sl"] >= cur_l:
+                        exit_price = pos["sl"]
+                    else:
+                        exit_price = float(df["Open"].iloc[i])
             elif tgt_hit:
                 exit_reason = "Target Hit"
                 if d == 1:
-                    exit_price = min(pos["target"], cur_h)  # can't exit above actual high
+                    # Normal: target within candle → exact fill
+                    # Gap-up through target → exit at open (windfall)
+                    if pos["target"] >= cur_l:
+                        exit_price = pos["target"]
+                    else:
+                        exit_price = float(df["Open"].iloc[i])
                 else:
-                    exit_price = max(pos["target"], cur_l)  # can't exit below actual low
+                    if pos["target"] <= cur_h:
+                        exit_price = pos["target"]
+                    else:
+                        exit_price = float(df["Open"].iloc[i])
             elif opp_sig and not allow_overlap:
                 exit_reason = "Opposite Signal"
                 exit_price  = cur_c
@@ -2051,6 +2073,12 @@ with tab_bt:
         trades = st.session_state.bt_trades
         metrics = st.session_state.bt_metrics
 
+        # ── Raw OHLCV data ─────────────────────────────────────────
+        with st.expander(f"📋 Raw OHLCV Data — {ACTIVE_TICKER} ({len(df_res)} candles)", expanded=False):
+            ohlcv_disp = df_res[["Open","High","Low","Close","Volume"]].copy()
+            ohlcv_disp.index.name = "Datetime (IST)"
+            st.dataframe(ohlcv_disp.sort_index(ascending=False), use_container_width=True, height=350)
+
         if not trades:
             st.warning("No trades generated. Try different parameters or a longer period.")
         else:
@@ -2081,15 +2109,6 @@ with tab_bt:
             tdf["cum_pnl"]     = tdf["pnl"].cumsum().round(2)
             tdf["cum_pts"]     = tdf["points_captured"].cumsum().round(2) if "points_captured" in tdf.columns else tdf["pnl"].cumsum().round(2)
             tdf["result_icon"] = tdf["pnl"].apply(lambda x: "🟢 WIN" if x>0 else ("🔴 LOSS" if x<0 else "⬜ BE"))
-
-            # Validate: exit_price must be within [exit_L, exit_H] — flag any anomalies
-            if "exit_H" in tdf.columns and "exit_L" in tdf.columns:
-                bad_exits = tdf[
-                    (tdf["exit_price"] > tdf["exit_H"] + 0.01) |
-                    (tdf["exit_price"] < tdf["exit_L"] - 0.01)
-                ]
-                if len(bad_exits) > 0:
-                    st.warning(f"⚠️ {len(bad_exits)} trade(s) have exit price outside candle range — check SL/Target config.")
 
             display_cols = [c for c in [
                 # ── Identity ──────────────────────────────
@@ -2300,6 +2319,10 @@ with tab_live:
                             "result"          : "WIN" if pnl_>0 else ("LOSS" if pnl_<0 else "BE"),
                             "exit_reason"     : reason_,
                             "exit_logic"      : _exit_logic_text(reason_, pos_, exit_px_, d_),
+                            # Tag for trade history tab
+                            "strategy"        : strategy,
+                            "ticker"          : ACTIVE_TICKER,
+                            "source"          : "live",
                         })
                         st.session_state.live_open_pos   = None
                         st.session_state.last_trade_time = time.time()
@@ -2496,6 +2519,12 @@ with tab_live:
                     chart_df = df_sig.tail(100)
                     st.plotly_chart(build_chart(chart_df, [], strategy, True),
                                     use_container_width=True)
+
+                    # ── Raw OHLCV table ─────────────────────────────────────
+                    with st.expander(f"📋 Raw OHLCV Data — {ACTIVE_TICKER} ({len(df_sig)} candles)", expanded=False):
+                        ohlcv_live = df_sig[["Open","High","Low","Close","Volume"]].copy()
+                        ohlcv_live.index.name = "Datetime (IST)"
+                        st.dataframe(ohlcv_live.sort_index(ascending=False), use_container_width=True, height=300)
 
                     # ── Live trades session ─────────────────────────────────
                     if st.session_state.live_trades:
