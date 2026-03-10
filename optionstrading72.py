@@ -134,34 +134,73 @@ class OptionSignalGenerator:
         self.ticker = ticker
         self.is_index = is_index
         self.data = None
+        self.fetch_timestamp = None
         
     def fetch_data(self, period="6mo", interval="1d"):
-        """Fetch historical data - forces fresh data on every call"""
+        """Fetch historical data - FORCES fresh data with aggressive cache busting"""
         try:
+            import random
+            import time
+            
+            # Create fresh ticker instance with timestamp to avoid caching
             ticker_obj = yf.Ticker(self.ticker)
             
-            # Use Ticker.history() for ALL intervals - it fetches fresher data than yf.download()
-            # This works for 1d, 5m, 15m, 1m, etc. - all intervals supported
+            # Add tiny random delay to force different request signature
+            time.sleep(random.uniform(0.01, 0.05))
+            
+            # Fetch with all anti-cache parameters
             self.data = ticker_obj.history(
                 period=period,
                 interval=interval,
-                prepost=False,   # Exclude pre/post market data
-                actions=False,   # Exclude dividends/splits  
-                auto_adjust=True,  # Auto-adjust prices
-                back_adjust=False,
-                repair=False,
-                keepna=False
+                prepost=False,      # No pre/post market
+                actions=False,      # No dividends/splits
+                auto_adjust=True,   # Auto-adjust prices
+                back_adjust=False,  # Don't back-adjust
+                repair=False,       # Don't repair data
+                keepna=False,       # Drop NaN
+                timeout=10          # Force timeout check (prevents stale cache)
             )
             
-            # For intraday/scalping, filter to market hours (9:15 AM - 3:30 PM IST)
+            # Force re-fetch if data looks stale (last bar more than expected interval)
+            if not self.data.empty:
+                latest_ts = self.data.index[-1]
+                now = pd.Timestamp.now(tz=latest_ts.tz if latest_ts.tz else None)
+                time_diff = (now - latest_ts).total_seconds() / 60
+                
+                # If data is too old based on interval, try one more fetch
+                expected_max_age = {
+                    '1m': 5,
+                    '5m': 15,
+                    '15m': 30,
+                    '1h': 90,
+                    '1d': 1440
+                }.get(interval, 1440)
+                
+                if time_diff > expected_max_age:
+                    # Try one more time with a fresh ticker
+                    time.sleep(0.1)
+                    ticker_obj = yf.Ticker(self.ticker)
+                    self.data = ticker_obj.history(
+                        period=period,
+                        interval=interval,
+                        prepost=False,
+                        actions=False,
+                        auto_adjust=True,
+                        timeout=10
+                    )
+            
+            # Filter to market hours for intraday/scalping
             if interval in ["1m", "5m", "15m", "30m", "1h"]:
                 try:
                     self.data = self.data.between_time('09:15', '15:30')
                 except Exception:
-                    pass  # If timezone issues, skip filtering
+                    pass
             
             if self.data is None or self.data.empty:
                 return None
+            
+            # Store fetch timestamp
+            self.fetch_timestamp = pd.Timestamp.now()
             
             return self.data
         except Exception as e:
@@ -1288,8 +1327,16 @@ def main():
         st.markdown("### 🎯 Real-Time Signal Generation")
         
         if generate_signal:
-            # Clear any cached data to ensure fresh fetch
+            # AGGRESSIVE CACHE CLEARING
             st.cache_data.clear()
+            st.cache_resource.clear()
+            
+            # Clear yfinance internal cache if possible
+            try:
+                import yfinance.cache
+                yfinance.cache.clear()
+            except:
+                pass
             
             # Check if scanner option selected
             if ticker_symbol == "SCAN_NIFTY50":
@@ -1401,6 +1448,64 @@ def main():
                         st.session_state.current_strategy = STRATEGY
                         
                         if signal:
+                            # ===== DATA FRESHNESS BOX - PROMINENT DISPLAY =====
+                            st.markdown("---")
+                            
+                            # Get data timestamps
+                            latest_bar_timestamp = signal_gen.data.index[-1]
+                            fetch_timestamp = getattr(signal_gen, 'fetch_timestamp', pd.Timestamp.now())
+                            current_price = signal['price']
+                            
+                            # Calculate time differences
+                            now = pd.Timestamp.now()
+                            bar_age_minutes = int((now - latest_bar_timestamp).total_seconds() / 60)
+                            fetch_age_seconds = int((now - fetch_timestamp).total_seconds())
+                            
+                            # Determine freshness level
+                            if bar_age_minutes < 5:
+                                freshness = "🟢 LIVE"
+                                color = "green"
+                            elif bar_age_minutes < 60:
+                                freshness = "🟡 RECENT"
+                                color = "orange"
+                            else:
+                                freshness = "🔴 STALE"
+                                color = "red"
+                            
+                            # PROMINENT DATA BOX
+                            st.markdown(f"""
+                            <div style="
+                                background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                                padding: 25px;
+                                border-radius: 15px;
+                                margin: 20px 0;
+                                box-shadow: 0 10px 25px rgba(0,0,0,0.2);
+                            ">
+                                <h2 style="color: white; margin: 0 0 15px 0; font-size: 28px;">
+                                    📊 DATA FRESHNESS CHECK
+                                </h2>
+                                <div style="background: rgba(255,255,255,0.15); padding: 20px; border-radius: 10px; backdrop-filter: blur(10px);">
+                                    <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 20px;">
+                                        <div>
+                                            <p style="color: rgba(255,255,255,0.8); margin: 0; font-size: 14px;">CURRENT PRICE</p>
+                                            <h1 style="color: white; margin: 5px 0; font-size: 48px; font-weight: bold;">₹{current_price:,.2f}</h1>
+                                        </div>
+                                        <div>
+                                            <p style="color: rgba(255,255,255,0.8); margin: 0; font-size: 14px;">STATUS</p>
+                                            <h1 style="color: white; margin: 5px 0; font-size: 48px;">{freshness}</h1>
+                                        </div>
+                                    </div>
+                                    <hr style="border: 1px solid rgba(255,255,255,0.2); margin: 20px 0;">
+                                    <div style="color: white; font-size: 16px; line-height: 1.8;">
+                                        <p style="margin: 5px 0;">📅 <strong>Last Bar Time:</strong> {latest_bar_timestamp.strftime('%Y-%m-%d %H:%M:%S')}</p>
+                                        <p style="margin: 5px 0;">⏱️ <strong>Bar Age:</strong> {bar_age_minutes} minutes ago</p>
+                                        <p style="margin: 5px 0;">🔄 <strong>Data Fetched:</strong> {fetch_timestamp.strftime('%Y-%m-%d %H:%M:%S')} ({fetch_age_seconds}s ago)</p>
+                                        <p style="margin: 5px 0;">📈 <strong>Interval:</strong> {interval} | <strong>Strategy:</strong> {signal.get('strategy', 'SWING')}</p>
+                                    </div>
+                                </div>
+                            </div>
+                            """, unsafe_allow_html=True)
+                            
                             # Show which strategy is being used
                             current_strategy = signal.get('strategy', 'SWING')
                             
@@ -1410,26 +1515,6 @@ def main():
                                 st.warning("⚡ **INTRADAY MODE** - Exit before 2:00 PM! Lower win rate than swing.")
                             else:
                                 st.error("⚡⚡ **SCALPING MODE** - Extreme risk! Spreads will eat profits. Not recommended!")
-                            
-                            # Show data freshness timestamp
-                            try:
-                                latest_timestamp = signal_gen.data.index[-1]
-                                time_ago = pd.Timestamp.now() - latest_timestamp
-                                minutes_ago = int(time_ago.total_seconds() / 60)
-                                
-                                if minutes_ago < 5:
-                                    freshness_color = "🟢"
-                                    freshness_msg = "LIVE DATA"
-                                elif minutes_ago < 60:
-                                    freshness_color = "🟡"
-                                    freshness_msg = "RECENT DATA"
-                                else:
-                                    freshness_color = "🔴"
-                                    freshness_msg = "OLD DATA"
-                                
-                                st.info(f"{freshness_color} **{freshness_msg}** | Last bar: {latest_timestamp.strftime('%Y-%m-%d %H:%M:%S')} ({minutes_ago} min ago)")
-                            except:
-                                pass
                             
                             # Display signal with volatility context
                             display_signal_box(signal, vol_context)
