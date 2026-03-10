@@ -164,7 +164,12 @@ class OptionSignalGenerator:
             # Force re-fetch if data looks stale (last bar more than expected interval)
             if not self.data.empty:
                 latest_ts = self.data.index[-1]
-                now = pd.Timestamp.now(tz=latest_ts.tz if latest_ts.tz else None)
+                
+                # Convert to timezone-naive for comparison
+                if hasattr(latest_ts, 'tz') and latest_ts.tz is not None:
+                    latest_ts = latest_ts.tz_localize(None)
+                
+                now = pd.Timestamp.now()
                 time_diff = (now - latest_ts).total_seconds() / 60
                 
                 # If data is too old based on interval, try one more fetch
@@ -1451,60 +1456,70 @@ def main():
                             # ===== DATA FRESHNESS BOX - PROMINENT DISPLAY =====
                             st.markdown("---")
                             
-                            # Get data timestamps
-                            latest_bar_timestamp = signal_gen.data.index[-1]
-                            fetch_timestamp = getattr(signal_gen, 'fetch_timestamp', pd.Timestamp.now())
-                            current_price = signal['price']
-                            
-                            # Calculate time differences
-                            now = pd.Timestamp.now()
-                            bar_age_minutes = int((now - latest_bar_timestamp).total_seconds() / 60)
-                            fetch_age_seconds = int((now - fetch_timestamp).total_seconds())
-                            
-                            # Determine freshness level
-                            if bar_age_minutes < 5:
-                                freshness = "🟢 LIVE"
-                                color = "green"
-                            elif bar_age_minutes < 60:
-                                freshness = "🟡 RECENT"
-                                color = "orange"
-                            else:
-                                freshness = "🔴 STALE"
-                                color = "red"
-                            
-                            # PROMINENT DATA BOX
-                            st.markdown(f"""
-                            <div style="
-                                background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-                                padding: 25px;
-                                border-radius: 15px;
-                                margin: 20px 0;
-                                box-shadow: 0 10px 25px rgba(0,0,0,0.2);
-                            ">
-                                <h2 style="color: white; margin: 0 0 15px 0; font-size: 28px;">
-                                    📊 DATA FRESHNESS CHECK
-                                </h2>
-                                <div style="background: rgba(255,255,255,0.15); padding: 20px; border-radius: 10px; backdrop-filter: blur(10px);">
-                                    <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 20px;">
-                                        <div>
-                                            <p style="color: rgba(255,255,255,0.8); margin: 0; font-size: 14px;">CURRENT PRICE</p>
-                                            <h1 style="color: white; margin: 5px 0; font-size: 48px; font-weight: bold;">₹{current_price:,.2f}</h1>
+                            try:
+                                # Get data timestamps and normalize to timezone-naive
+                                latest_bar_timestamp = signal_gen.data.index[-1]
+                                fetch_timestamp = getattr(signal_gen, 'fetch_timestamp', pd.Timestamp.now())
+                                current_price = signal['price']
+                                
+                                # Convert to timezone-naive if needed
+                                if hasattr(latest_bar_timestamp, 'tz') and latest_bar_timestamp.tz is not None:
+                                    latest_bar_timestamp = latest_bar_timestamp.tz_localize(None)
+                                if hasattr(fetch_timestamp, 'tz') and fetch_timestamp.tz is not None:
+                                    fetch_timestamp = fetch_timestamp.tz_localize(None)
+                                
+                                # Calculate time differences (all timezone-naive now)
+                                now = pd.Timestamp.now()
+                                bar_age_minutes = int((now - latest_bar_timestamp).total_seconds() / 60)
+                                fetch_age_seconds = int((now - fetch_timestamp).total_seconds())
+                                
+                                # Determine freshness level
+                                if bar_age_minutes < 5:
+                                    freshness = "🟢 LIVE"
+                                    color = "green"
+                                elif bar_age_minutes < 60:
+                                    freshness = "🟡 RECENT"
+                                    color = "orange"
+                                else:
+                                    freshness = "🔴 STALE"
+                                    color = "red"
+                                
+                                # PROMINENT DATA BOX
+                                st.markdown(f"""
+                                <div style="
+                                    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                                    padding: 25px;
+                                    border-radius: 15px;
+                                    margin: 20px 0;
+                                    box-shadow: 0 10px 25px rgba(0,0,0,0.2);
+                                ">
+                                    <h2 style="color: white; margin: 0 0 15px 0; font-size: 28px;">
+                                        📊 DATA FRESHNESS CHECK
+                                    </h2>
+                                    <div style="background: rgba(255,255,255,0.15); padding: 20px; border-radius: 10px; backdrop-filter: blur(10px);">
+                                        <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 20px;">
+                                            <div>
+                                                <p style="color: rgba(255,255,255,0.8); margin: 0; font-size: 14px;">CURRENT PRICE</p>
+                                                <h1 style="color: white; margin: 5px 0; font-size: 48px; font-weight: bold;">₹{current_price:,.2f}</h1>
+                                            </div>
+                                            <div>
+                                                <p style="color: rgba(255,255,255,0.8); margin: 0; font-size: 14px;">STATUS</p>
+                                                <h1 style="color: white; margin: 5px 0; font-size: 48px;">{freshness}</h1>
+                                            </div>
                                         </div>
-                                        <div>
-                                            <p style="color: rgba(255,255,255,0.8); margin: 0; font-size: 14px;">STATUS</p>
-                                            <h1 style="color: white; margin: 5px 0; font-size: 48px;">{freshness}</h1>
+                                        <hr style="border: 1px solid rgba(255,255,255,0.2); margin: 20px 0;">
+                                        <div style="color: white; font-size: 16px; line-height: 1.8;">
+                                            <p style="margin: 5px 0;">📅 <strong>Last Bar Time:</strong> {latest_bar_timestamp.strftime('%Y-%m-%d %H:%M:%S')}</p>
+                                            <p style="margin: 5px 0;">⏱️ <strong>Bar Age:</strong> {bar_age_minutes} minutes ago</p>
+                                            <p style="margin: 5px 0;">🔄 <strong>Data Fetched:</strong> {fetch_timestamp.strftime('%Y-%m-%d %H:%M:%S')} ({fetch_age_seconds}s ago)</p>
+                                            <p style="margin: 5px 0;">📈 <strong>Interval:</strong> {interval} | <strong>Strategy:</strong> {signal.get('strategy', 'SWING')}</p>
                                         </div>
-                                    </div>
-                                    <hr style="border: 1px solid rgba(255,255,255,0.2); margin: 20px 0;">
-                                    <div style="color: white; font-size: 16px; line-height: 1.8;">
-                                        <p style="margin: 5px 0;">📅 <strong>Last Bar Time:</strong> {latest_bar_timestamp.strftime('%Y-%m-%d %H:%M:%S')}</p>
-                                        <p style="margin: 5px 0;">⏱️ <strong>Bar Age:</strong> {bar_age_minutes} minutes ago</p>
-                                        <p style="margin: 5px 0;">🔄 <strong>Data Fetched:</strong> {fetch_timestamp.strftime('%Y-%m-%d %H:%M:%S')} ({fetch_age_seconds}s ago)</p>
-                                        <p style="margin: 5px 0;">📈 <strong>Interval:</strong> {interval} | <strong>Strategy:</strong> {signal.get('strategy', 'SWING')}</p>
                                     </div>
                                 </div>
-                            </div>
-                            """, unsafe_allow_html=True)
+                                """, unsafe_allow_html=True)
+                            except Exception as e:
+                                # Fallback display if timestamp conversion fails
+                                st.info(f"📊 Current Price: ₹{signal['price']:,.2f} | Strategy: {signal.get('strategy', 'SWING')}")
                             
                             # Show which strategy is being used
                             current_strategy = signal.get('strategy', 'SWING')
