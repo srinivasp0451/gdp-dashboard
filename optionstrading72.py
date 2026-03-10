@@ -136,33 +136,25 @@ class OptionSignalGenerator:
         self.data = None
         
     def fetch_data(self, period="6mo", interval="1d"):
-        """Fetch historical data - supports different intervals for intraday/scalping"""
+        """Fetch historical data - forces fresh data on every call"""
         try:
             ticker_obj = yf.Ticker(self.ticker)
             
-            # For swing trading (interval="1d"), use the original method
-            if interval == "1d":
-                # ORIGINAL SWING TRADING CODE (UNCHANGED!)
-                self.data = ticker_obj.history(period=period)
-            else:
-                # For intraday/scalping, use download with interval support
-                self.data = yf.download(
-                    self.ticker,
-                    period=period,
-                    interval=interval,
-                    progress=False,
-                    auto_adjust=True
-                )
-                
-                # Flatten MultiIndex columns that yf.download creates
-                # e.g. ('Close', '^NSEI') → 'Close'
-                if isinstance(self.data.columns, pd.MultiIndex):
-                    self.data.columns = self.data.columns.get_level_values(0)
-                
-                # Remove duplicate columns if any
-                self.data = self.data.loc[:, ~self.data.columns.duplicated()]
-                
-                # Filter to market hours for intraday (9:15 AM - 3:30 PM IST)
+            # Use Ticker.history() for ALL intervals - it fetches fresher data than yf.download()
+            # This works for 1d, 5m, 15m, 1m, etc. - all intervals supported
+            self.data = ticker_obj.history(
+                period=period,
+                interval=interval,
+                prepost=False,   # Exclude pre/post market data
+                actions=False,   # Exclude dividends/splits  
+                auto_adjust=True,  # Auto-adjust prices
+                back_adjust=False,
+                repair=False,
+                keepna=False
+            )
+            
+            # For intraday/scalping, filter to market hours (9:15 AM - 3:30 PM IST)
+            if interval in ["1m", "5m", "15m", "30m", "1h"]:
                 try:
                     self.data = self.data.between_time('09:15', '15:30')
                 except Exception:
@@ -1285,6 +1277,8 @@ def main():
         st.markdown("---")
         
         # Generate signal button
+        st.markdown("### 🎯 Generate Signal")
+        st.info("📡 **Live Data:** Each click fetches fresh market data")
         generate_signal = st.button("🚀 Generate Signal", use_container_width=True, type="primary")
     
     # Main tabs
@@ -1294,6 +1288,9 @@ def main():
         st.markdown("### 🎯 Real-Time Signal Generation")
         
         if generate_signal:
+            # Clear any cached data to ensure fresh fetch
+            st.cache_data.clear()
+            
             # Check if scanner option selected
             if ticker_symbol == "SCAN_NIFTY50":
                 # Run Nifty 50 stock scanner
@@ -1413,6 +1410,26 @@ def main():
                                 st.warning("⚡ **INTRADAY MODE** - Exit before 2:00 PM! Lower win rate than swing.")
                             else:
                                 st.error("⚡⚡ **SCALPING MODE** - Extreme risk! Spreads will eat profits. Not recommended!")
+                            
+                            # Show data freshness timestamp
+                            try:
+                                latest_timestamp = signal_gen.data.index[-1]
+                                time_ago = pd.Timestamp.now() - latest_timestamp
+                                minutes_ago = int(time_ago.total_seconds() / 60)
+                                
+                                if minutes_ago < 5:
+                                    freshness_color = "🟢"
+                                    freshness_msg = "LIVE DATA"
+                                elif minutes_ago < 60:
+                                    freshness_color = "🟡"
+                                    freshness_msg = "RECENT DATA"
+                                else:
+                                    freshness_color = "🔴"
+                                    freshness_msg = "OLD DATA"
+                                
+                                st.info(f"{freshness_color} **{freshness_msg}** | Last bar: {latest_timestamp.strftime('%Y-%m-%d %H:%M:%S')} ({minutes_ago} min ago)")
+                            except:
+                                pass
                             
                             # Display signal with volatility context
                             display_signal_box(signal, vol_context)
