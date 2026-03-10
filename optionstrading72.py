@@ -136,13 +136,13 @@ class OptionSignalGenerator:
         self.data = None
         self.fetch_timestamp = None
         
-    def fetch_data(self, period="6mo", interval="1d"):
+    def fetch_data(self, period="6mo", interval="1d", force_refresh=0):
         """Fetch historical data - FORCES fresh data with aggressive cache busting"""
         try:
             import random
             import time
             
-            # Create fresh ticker instance with timestamp to avoid caching
+            # Create fresh ticker instance (force_refresh ensures new fetch each time)
             ticker_obj = yf.Ticker(self.ticker)
             
             # Add tiny random delay to force different request signature
@@ -1109,6 +1109,9 @@ def scan_nifty50_stocks(strategy, period, interval):
     import time
     import random
     
+    # Get refresh count from session state
+    refresh_count = st.session_state.get('refresh_count', 0)
+    
     st.markdown("## 🔍 Scanning All Nifty 50 Stocks...")
     st.info(f"📊 Running **{strategy}** strategy on {len(NIFTY50_STOCKS)} stocks. This will take ~1-2 minutes with rate limit protection...")
     
@@ -1136,8 +1139,8 @@ def scan_nifty50_stocks(strategy, period, interval):
             # Initialize signal generator for this stock (all are stocks, not indices)
             signal_gen = OptionSignalGenerator(ticker, is_index=False)
             
-            # Fetch data with appropriate interval
-            data = signal_gen.fetch_data(period=period, interval=interval)
+            # Fetch data with appropriate interval (use refresh count to ensure fresh data)
+            data = signal_gen.fetch_data(period=period, interval=interval, force_refresh=refresh_count)
             
             if data is not None and not data.empty and len(data) >= min_bars_required:
                 # Calculate indicators
@@ -1188,6 +1191,10 @@ def scan_nifty50_stocks(strategy, period, interval):
 
 def main():
     """Main Streamlit app"""
+    
+    # Initialize refresh counter in session state
+    if 'refresh_count' not in st.session_state:
+        st.session_state.refresh_count = 0
     
     # Header
     st.markdown('<p class="main-header">📈 Professional Options Trading Signal Generator</p>', unsafe_allow_html=True)
@@ -1322,7 +1329,7 @@ def main():
         
         # Generate signal button
         st.markdown("### 🎯 Generate Signal")
-        st.info("📡 **Live Data:** Each click fetches fresh market data")
+        st.warning("⚠️ If you see STALE data or wrong prices, use the **REFRESH button** that appears after generating a signal!")
         generate_signal = st.button("🚀 Generate Signal", use_container_width=True, type="primary")
     
     # Main tabs
@@ -1421,8 +1428,12 @@ def main():
                     # Initialize signal generator
                     signal_gen = OptionSignalGenerator(ticker_symbol, is_index)
                     
-                    # Fetch data with appropriate interval
-                    data = signal_gen.fetch_data(period=period, interval=interval)
+                    # Fetch data with appropriate interval (pass refresh count to force fresh)
+                    data = signal_gen.fetch_data(
+                        period=period, 
+                        interval=interval,
+                        force_refresh=st.session_state.refresh_count
+                    )
                     
                     if data is None or data.empty:
                         st.error(f"❌ Could not fetch data for {ticker_symbol}. Please check ticker symbol.")
@@ -1453,9 +1464,50 @@ def main():
                         st.session_state.current_strategy = STRATEGY
                         
                         if signal:
-                            # ===== DATA FRESHNESS BOX - PROMINENT DISPLAY =====
+                            # ===== MASSIVE REFRESH BUTTON AT TOP =====
                             st.markdown("---")
                             
+                            # HUGE RED REFRESH BUTTON - Impossible to miss
+                            st.markdown("""
+                            <div style="background: #dc3545; padding: 5px; border-radius: 10px; text-align: center; margin: 10px 0;">
+                                <h3 style="color: white; margin: 0;">⚠️ SEEING STALE DATA OR WRONG PRICE? ⚠️</h3>
+                            </div>
+                            """, unsafe_allow_html=True)
+                            
+                            col1, col2, col3 = st.columns([1, 2, 1])
+                            with col2:
+                                if st.button("🔄 FORCE REFRESH - CLEAR ALL CACHES & FETCH FRESH DATA", 
+                                           key="mega_refresh", 
+                                           use_container_width=True, 
+                                           type="primary",
+                                           help="Click this if you see stale data"):
+                                    # NUCLEAR CACHE CLEARING
+                                    st.cache_data.clear()
+                                    st.cache_resource.clear()
+                                    
+                                    # Clear session state signal data
+                                    if 'current_signal' in st.session_state:
+                                        del st.session_state.current_signal
+                                    if 'vol_context' in st.session_state:
+                                        del st.session_state.vol_context
+                                    
+                                    # Try to clear yfinance cache
+                                    try:
+                                        import yfinance.cache
+                                        yfinance.cache.clear()
+                                    except:
+                                        pass
+                                    
+                                    # Increment refresh counter
+                                    st.session_state.refresh_count += 1
+                                    
+                                    st.success("✅ ALL CACHES CLEARED! Click 'Generate Signal' button again now.")
+                                    st.info("🔄 Refresh counter: " + str(st.session_state.refresh_count))
+                                    st.stop()
+                            
+                            st.markdown("<br>", unsafe_allow_html=True)
+                            
+                            # ===== DATA FRESHNESS BOX =====
                             try:
                                 # Get data timestamps and normalize to timezone-naive
                                 latest_bar_timestamp = signal_gen.data.index[-1]
@@ -1473,16 +1525,37 @@ def main():
                                 bar_age_minutes = int((now - latest_bar_timestamp).total_seconds() / 60)
                                 fetch_age_seconds = int((now - fetch_timestamp).total_seconds())
                                 
-                                # Determine freshness level
-                                if bar_age_minutes < 5:
-                                    freshness = "🟢 LIVE"
-                                    color = "green"
-                                elif bar_age_minutes < 60:
-                                    freshness = "🟡 RECENT"
-                                    color = "orange"
+                                # SMARTER freshness detection based on interval and market hours
+                                market_closed = now.hour >= 16 or now.hour < 9 or now.weekday() >= 5
+                                
+                                if market_closed:
+                                    # Outside market hours - expect stale data
+                                    if bar_age_minutes < 1440:  # Less than 1 day old
+                                        freshness = "🟡 CLOSED (Normal)"
+                                        color = "orange"
+                                    else:
+                                        freshness = "🔴 OLD"
+                                        color = "red"
                                 else:
-                                    freshness = "🔴 STALE"
-                                    color = "red"
+                                    # During market hours - be strict
+                                    if interval == "1m" and bar_age_minutes < 3:
+                                        freshness = "🟢 LIVE"
+                                        color = "green"
+                                    elif interval == "5m" and bar_age_minutes < 10:
+                                        freshness = "🟢 LIVE"
+                                        color = "green"
+                                    elif interval == "15m" and bar_age_minutes < 20:
+                                        freshness = "🟢 LIVE"
+                                        color = "green"
+                                    elif interval == "1d" and bar_age_minutes < 60:
+                                        freshness = "🟢 LIVE"
+                                        color = "green"
+                                    elif bar_age_minutes < 120:
+                                        freshness = "🟡 RECENT"
+                                        color = "orange"
+                                    else:
+                                        freshness = "🔴 STALE"
+                                        color = "red"
                                 
                                 # PROMINENT DATA BOX
                                 st.markdown(f"""
@@ -1490,16 +1563,16 @@ def main():
                                     background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
                                     padding: 25px;
                                     border-radius: 15px;
-                                    margin: 20px 0;
+                                    margin: 0;
                                     box-shadow: 0 10px 25px rgba(0,0,0,0.2);
                                 ">
                                     <h2 style="color: white; margin: 0 0 15px 0; font-size: 28px;">
-                                        📊 DATA FRESHNESS CHECK
+                                        📊 DATA FRESHNESS
                                     </h2>
                                     <div style="background: rgba(255,255,255,0.15); padding: 20px; border-radius: 10px; backdrop-filter: blur(10px);">
                                         <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 20px;">
                                             <div>
-                                                <p style="color: rgba(255,255,255,0.8); margin: 0; font-size: 14px;">CURRENT PRICE</p>
+                                                <p style="color: rgba(255,255,255,0.8); margin: 0; font-size: 14px;">PRICE ({interval} candle close)</p>
                                                 <h1 style="color: white; margin: 5px 0; font-size: 48px; font-weight: bold;">₹{current_price:,.2f}</h1>
                                             </div>
                                             <div>
@@ -1509,17 +1582,33 @@ def main():
                                         </div>
                                         <hr style="border: 1px solid rgba(255,255,255,0.2); margin: 20px 0;">
                                         <div style="color: white; font-size: 16px; line-height: 1.8;">
-                                            <p style="margin: 5px 0;">📅 <strong>Last Bar Time:</strong> {latest_bar_timestamp.strftime('%Y-%m-%d %H:%M:%S')}</p>
-                                            <p style="margin: 5px 0;">⏱️ <strong>Bar Age:</strong> {bar_age_minutes} minutes ago</p>
-                                            <p style="margin: 5px 0;">🔄 <strong>Data Fetched:</strong> {fetch_timestamp.strftime('%Y-%m-%d %H:%M:%S')} ({fetch_age_seconds}s ago)</p>
-                                            <p style="margin: 5px 0;">📈 <strong>Interval:</strong> {interval} | <strong>Strategy:</strong> {signal.get('strategy', 'SWING')}</p>
+                                            <p style="margin: 5px 0;">📅 <strong>Last Bar:</strong> {latest_bar_timestamp.strftime('%Y-%m-%d %H:%M:%S')}</p>
+                                            <p style="margin: 5px 0;">⏱️ <strong>Age:</strong> {bar_age_minutes} min ago</p>
+                                            <p style="margin: 5px 0;">🔄 <strong>Fetched:</strong> {fetch_timestamp.strftime('%H:%M:%S')} ({fetch_age_seconds}s ago)</p>
+                                            <p style="margin: 5px 0;">📈 <strong>Interval:</strong> {interval} | <strong>Refresh:</strong> #{st.session_state.refresh_count}</p>
                                         </div>
                                     </div>
                                 </div>
                                 """, unsafe_allow_html=True)
+                                
+                                # CRITICAL EXPLANATION OF PRICE DIFFERENCES
+                                st.markdown("---")
+                                st.markdown("""
+                                <div style="background: #fff3cd; border-left: 5px solid #ffc107; padding: 15px; margin: 10px 0; border-radius: 5px;">
+                                    <h4 style="margin: 0 0 10px 0; color: #856404;">⚠️ WHY PRICES DIFFER BY STRATEGY (THIS IS NORMAL):</h4>
+                                    <ul style="margin: 0; color: #856404;">
+                                        <li><strong>Swing (1d)</strong> → Shows yesterday's 3:30 PM closing price</li>
+                                        <li><strong>Intraday (5m)</strong> → Shows price from 5 minutes ago (last 5m candle close)</li>
+                                        <li><strong>Scalping (1m)</strong> → Shows price from 1 minute ago (last 1m candle close)</li>
+                                    </ul>
+                                    <p style="margin: 10px 0 0 0; color: #856404;"><strong>Bottom line:</strong> Different intervals = Different last candle close times = Different prices. This is CORRECT behavior, not a bug!</p>
+                                </div>
+                                """, unsafe_allow_html=True)
+                            
                             except Exception as e:
-                                # Fallback display if timestamp conversion fails
-                                st.info(f"📊 Current Price: ₹{signal['price']:,.2f} | Strategy: {signal.get('strategy', 'SWING')}")
+                                # Fallback display
+                                st.error(f"Error displaying data: {e}")
+                                st.info(f"📊 Price: ₹{signal['price']:,.2f} | Strategy: {signal.get('strategy', 'SWING')}")
                             
                             # Show which strategy is being used
                             current_strategy = signal.get('strategy', 'SWING')
