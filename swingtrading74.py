@@ -4150,10 +4150,10 @@ def render_config_ui():
     
     # Target Configuration
     st.sidebar.subheader("🎯 Target")
-    config['target_type'] = st.sidebar.selectbox("Target Type", TARGET_TYPES, index=0)
+    config['target_type'] = st.sidebar.selectbox("Target Type", TARGET_TYPES, index=2)
     
     if 'Points' in config['target_type'] or config['target_type'] in ['Custom Points', 'Trailing Target (Points)']:
-        config['target_points'] = st.sidebar.number_input("Target Points", min_value=1, value=20)
+        config['target_points'] = st.sidebar.number_input("Target Points", min_value=1, value=200)
     
     if config['target_type'] == 'P&L Based (Rupees)':
         config['target_rupees'] = st.sidebar.number_input("Target Rupees", min_value=1, value=200)
