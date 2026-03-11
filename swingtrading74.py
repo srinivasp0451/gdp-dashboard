@@ -4128,7 +4128,7 @@ def render_config_ui():
     
     # Stop Loss Configuration
     st.sidebar.subheader("🛡️ Stop Loss")
-    config['sl_type'] = st.sidebar.selectbox("SL Type", SL_TYPES, index=0)
+    config['sl_type'] = st.sidebar.selectbox("SL Type", SL_TYPES, index=9)
     
     if 'Points' in config['sl_type'] or config['sl_type'] in ['Custom Points', 'ATR-based', 
                                                                 'Trailing SL (Points)', 
@@ -4176,7 +4176,7 @@ def render_config_ui():
         config['dynamic_trail_target_points'] = st.sidebar.number_input(
             "Target Distance (Points)", 
             min_value=1, 
-            value=20,
+            value=200,
             help="Distance from current price to Target (trails with price)"
         )
         st.sidebar.caption(
@@ -4191,9 +4191,9 @@ def render_config_ui():
     
     if config['dhan_enabled']:
         config['dhan_client_id'] = st.sidebar.text_input("Client ID", value="1104779876")
-        config['dhan_access_token'] = st.sidebar.text_input("Access Token", type="password", value="eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzUxMiJ9.eyJpc3MiOiJkaGFuIiwicGFydG5lcklkIjoiIiwiZXhwIjoxNzczMTk3NDUwLCJpYXQiOjE3NzMxMTEwNTAsInRva2VuQ29uc3VtZXJUeXBlIjoiU0VMRiIsIndlYmhvb2tVcmwiOiIiLCJkaGFuQ2xpZW50SWQiOiIxMTA0Nzc5ODc2In0.pU7W4lDpC0o4dQrkeTUPPIh_nPh2stWdiqq-X8R1iDb1g5syN7JVZjJVKgT-Lumt6xNu1lrL6cOumZvbdt345Q")
+        config['dhan_access_token'] = st.sidebar.text_input("Access Token", type="password", value="eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzUxMiJ9.eyJpc3MiOiJkaGFuIiwicGFydG5lcklkIjoiIiwiZXhwIjoxNzczMjgzOTQ2LCJpYXQiOjE3NzMxOTc1NDYsInRva2VuQ29uc3VtZXJUeXBlIjoiU0VMRiIsIndlYmhvb2tVcmwiOiIiLCJkaGFuQ2xpZW50SWQiOiIxMTA0Nzc5ODc2In0.Mf7-J4nyfESklUm5-6Hcf-WZ7oySzWuBOdteevXy84-EGYkSP7gAytEzbnlrhMi4trfWwT3hWVxmnNhU8nYW_Q")
         
-        config['dhan_is_options'] = st.sidebar.checkbox("Is Options", value=True)
+        config['dhan_is_options'] = st.sidebar.checkbox("Is Options", value=False)
         
         if config['dhan_is_options']:
             # ── Options trading ──
