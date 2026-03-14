@@ -516,7 +516,9 @@ def plot_ohlc(df,trades=None,indics=None,title="OHLC"):
 
 def plot_equity(trades,title="Equity Curve"):
     if not trades: return None
-    cum=np.cumsum([t["PnL"] for t in trades]); times=[t["Exit DateTime"] for t in trades]
+    cum=np.cumsum([t["PnL"] for t in trades])
+    # handle both backtest ("Exit DateTime") and live trade ("Exit Time") dicts
+    times=[t.get("Exit DateTime", t.get("Exit Time", "")) for t in trades]
     color="#00E676" if cum[-1]>=0 else "#FF5252"; fill="rgba(0,230,118,0.1)" if cum[-1]>=0 else "rgba(255,82,82,0.1)"
     fig=go.Figure(go.Scatter(x=times,y=cum,mode="lines+markers",fill="tozeroy",fillcolor=fill,
         line=dict(color=color,width=2),name="PnL"))
@@ -630,7 +632,9 @@ def config_banner(strategy,interval,period,sym,sl_type,sl_pts,tgt_type,tgt_pts,e
         for k,v in list(extra.items())[:4]: items.append((k,v))
     for col,(label,val) in zip(st.columns(len(items)),items): col.metric(label,val)
 # ── SESSION STATE ─────────────────────────────────────────────────────────────
-for _k,_v in {"live_active":False,"live_trades":[],"live_position":None,"live_tick":0,"opt_applied":None}.items():
+for _k,_v in {"live_active":False,"live_trades":[],"live_position":None,"live_tick":0,
+               "opt_applied":None,"opt_results":None,"opt_res_meta":None,
+               "opt_df":None}.items():
     if _k not in st.session_state: st.session_state[_k]=_v
 
 def _idx(lst,val,default=0): return lst.index(val) if val in lst else default
@@ -701,15 +705,22 @@ with tab_bt:
                      "Exit Reason","SL Type","Target Type",
                      "Points Gained","Points Lost","PnL","Signal Bar"]
                 tdf=tdf[[c for c in COL if c in tdf.columns]]
-                def _rs(row):
-                    clr="#1b3a1b" if row["PnL"]>0 else "#3a1b1b"
-                    return [f"background-color:{clr}"]*len(row)
-                st.dataframe(tdf.style.apply(_rs,axis=1),use_container_width=True,height=430)
+                # Only color the PnL / points columns — no full-row background
+                def _cell_color(v):
+                    if isinstance(v,(int,float)): return "color:#00E676;font-weight:bold" if v>0 else ("color:#FF5252;font-weight:bold" if v<0 else "")
+                    return ""
+                style_cols=[c for c in ["PnL","Points Gained","Points Lost"] if c in tdf.columns]
+                st.dataframe(tdf.style.map(_cell_color,subset=style_cols),use_container_width=True,height=430)
                 with st.expander("📂 Raw OHLC Data"): st.dataframe(df_bt,use_container_width=True)
                 # ── VERIFICATION ──────────────────────────────────────────
                 st.markdown("---")
                 st.markdown("### 🔍 Backtest Logic Verification")
-                st.caption("Audits every bar confirming SL/Target fired correctly. SL checked first (conservative).")
+                st.caption(
+                    "This section checks whether the backtest engine correctly exited trades at SL and Target levels. "
+                    "**✅ Green = results are correct** (no missed exits). "
+                    "**❌ Red = a bug was found** (trade continued even after candle Low/High crossed SL or Target). "
+                    "SL is always checked first (conservative — if both breach same candle, SL wins)."
+                )
                 if audit_bt:
                     adf=pd.DataFrame(audit_bt)
                     # SL check
@@ -919,51 +930,117 @@ with tab_opt:
                 opt_res=optimize(df_opt,opt_st,opt_sl,opt_slp,opt_tgt,opt_tgtp,
                     opt_acc,float(opt_pts),opt_mt,progress_cb=prog.progress)
             prog.empty()
-            if not opt_res:
-                st.warning("No combinations produced enough trades. Try longer period, lower min-trades, or different SL/Target.")
-            else:
-                meets=[r for r in opt_res if r.get("Meets_Accuracy") and r.get("Meets_Pts",True)]
-                st.success(f"✅ **{len(opt_res)}** results found  |  **{len(meets)}** meet Accuracy≥{opt_acc}%"
-                    + (f" & Pts≥{int(opt_pts)}" if opt_pts>0 else ""))
-                rows=[]
-                for r in opt_res:
-                    row={}
-                    for k,v in r["params"].items():
-                        if k not in("atr_mult_sl","atr_mult_tgt","rr_ratio","swing_lookback"): row[k]=v
-                    for k,v in r.items():
-                        if k not in("params","Meets_Accuracy","Meets_Pts"): row[k]=v
-                    row["✓ Meets"]=("✅" if r.get("Meets_Accuracy") and r.get("Meets_Pts",True) else "—")
-                    rows.append(row)
-                res_df=pd.DataFrame(rows); res_df.insert(0,"Select",False)
-                st.markdown("#### 📊 All Results (top by accuracy) — check rows to apply")
-                edited=st.data_editor(res_df,
-                    column_config={"Select":st.column_config.CheckboxColumn("☑",default=False)},
-                    hide_index=True,use_container_width=True,height=430,key="opt_editor")
-                sel=edited[edited["Select"]==True]
-                if len(sel)>0:
-                    st.markdown(f"**{len(sel)} row(s) selected.**")
-                    first=sel.iloc[0]
-                    if st.button("⚡ Apply Selected to Config (Sidebar)",type="primary",key="btn_apply_opt"):
-                        param_keys=list(PARAM_GRIDS.get(opt_st,{}).keys())
-                        applied_params={pk:first[pk] for pk in param_keys if pk in first}
-                        st.session_state.opt_applied={
-                            "strategy":opt_st,"instrument":opt_t,"interval":opt_iv,"period":opt_pd,
-                            "sl_type":opt_sl,"sl_pts":opt_slp,"tgt_type":opt_tgt,"tgt_pts":opt_tgtp,
-                            "params":applied_params,"accuracy":first.get("Accuracy (%)","?"),"pnl":first.get("Total PnL","?"),
-                        }
-                        st.success(f"✅ Applied {opt_st} with accuracy {first.get('Accuracy (%)','?')}% → go to 📊 Backtesting!")
-                        st.rerun()
-                else:
-                    st.info("☑ Check a row then click Apply to Config.")
-                # Best result preview
-                st.markdown("---"); st.markdown("### 🥇 Best Result Preview")
+            # ── Store results + metadata in session state so they survive reruns ──
+            st.session_state.opt_results = opt_res
+            st.session_state.opt_df      = df_opt
+            st.session_state.opt_res_meta= {
+                "strategy":opt_st,"instrument":opt_t,"interval":opt_iv,"period":opt_pd,
+                "sl":opt_sl,"slp":opt_slp,"tgt":opt_tgt,"tgtp":opt_tgtp,
+                "acc":opt_acc,"pts":opt_pts,
+            }
+
+    # ── Display results from session state (persists across reruns / checkbox ticks) ──
+    opt_res   = st.session_state.get("opt_results")
+    _meta     = st.session_state.get("opt_res_meta") or {}
+    df_opt_ss = st.session_state.get("opt_df")
+
+    if opt_res is not None:
+        _opt_acc  = _meta.get("acc", opt_acc)
+        _opt_pts  = _meta.get("pts", opt_pts)
+        _opt_st   = _meta.get("strategy", opt_st)
+        _opt_sl   = _meta.get("sl", opt_sl)
+        _opt_slp  = _meta.get("slp", opt_slp)
+        _opt_tgt  = _meta.get("tgt", opt_tgt)
+        _opt_tgtp = _meta.get("tgtp", opt_tgtp)
+        _opt_t    = _meta.get("instrument", opt_t)
+        _opt_iv   = _meta.get("interval", opt_iv)
+        _opt_pd   = _meta.get("period", opt_pd)
+
+        if not opt_res:
+            st.warning("No combinations produced enough trades. Try longer period, lower min-trades, or different SL/Target.")
+        else:
+            meets=[r for r in opt_res if r.get("Meets_Accuracy") and r.get("Meets_Pts",True)]
+            st.success(f"✅ **{len(opt_res)}** results found  |  **{len(meets)}** meet Accuracy≥{_opt_acc}%"
+                + (f" & Pts≥{int(_opt_pts)}" if _opt_pts>0 else ""))
+            rows=[]
+            for r in opt_res:
+                row={}
+                for k,v in r["params"].items():
+                    if k not in("atr_mult_sl","atr_mult_tgt","rr_ratio","swing_lookback"): row[k]=v
+                for k,v in r.items():
+                    if k not in("params","Meets_Accuracy","Meets_Pts"): row[k]=v
+                row["✓ Meets"]=("✅" if r.get("Meets_Accuracy") and r.get("Meets_Pts",True) else "—")
+                rows.append(row)
+            res_df=pd.DataFrame(rows)
+
+            # Highlight rows that meet criteria (background on ✓ Meets col only)
+            def _hl_meets(v): return "background-color:#0d3b0d;color:white" if v=="✅" else ""
+
+            st.markdown("#### 📊 All Results (sorted by accuracy) — ☑ check a row then click Apply")
+            # Use a unique key that does NOT include the button click so it persists
+            edited=st.data_editor(
+                res_df,
+                column_config={c: st.column_config.Column(disabled=True)
+                               for c in res_df.columns},
+                hide_index=True, use_container_width=True, height=450,
+                key="opt_editor",
+                # We manage selection via a separate checkboxes approach below
+            )
+
+            # ── Row selection via separate checkbox list (stable across reruns) ──
+            st.markdown("**Select a row to apply:**")
+            sel_idx = st.selectbox(
+                "Choose result row # (0 = best)",
+                options=list(range(len(opt_res))),
+                format_func=lambda i: (
+                    f"Row {i} | Acc={opt_res[i].get('Accuracy (%)','?')}% | "
+                    f"PnL={opt_res[i].get('Total PnL','?')} | "
+                    f"Trades={opt_res[i].get('Total Trades','?')} | "
+                    f"Params={dict(list(opt_res[i]['params'].items())[:3])} {'✅' if opt_res[i].get('Meets_Accuracy') else ''}"
+                ),
+                key="opt_sel_idx",
+            )
+
+            sel_result = opt_res[sel_idx]
+            # Show selected row details
+            with st.expander(f"📌 Selected Row {sel_idx} — details", expanded=True):
+                sc=st.columns(4)
+                sc[0].metric("Accuracy", f"{sel_result.get('Accuracy (%)','?')}%")
+                sc[1].metric("Total PnL", sel_result.get("Total PnL","?"))
+                sc[2].metric("Total Trades", sel_result.get("Total Trades","?"))
+                sc[3].metric("Meets Targets", "✅ Yes" if sel_result.get("Meets_Accuracy") else "— No")
+                param_disp={k:v for k,v in sel_result["params"].items()
+                            if k not in("atr_mult_sl","atr_mult_tgt","rr_ratio","swing_lookback")}
+                st.write("**Parameters:**", param_disp)
+
+            if st.button("⚡ Apply Selected Row to Config (Sidebar + Backtest)",
+                         type="primary", key="btn_apply_opt"):
+                param_keys=list(PARAM_GRIDS.get(_opt_st,{}).keys())
+                applied_params={pk:sel_result["params"][pk] for pk in param_keys if pk in sel_result["params"]}
+                st.session_state.opt_applied={
+                    "strategy":_opt_st,"instrument":_opt_t,"interval":_opt_iv,"period":_opt_pd,
+                    "sl_type":_opt_sl,"sl_pts":_opt_slp,"tgt_type":_opt_tgt,"tgt_pts":_opt_tgtp,
+                    "params":applied_params,
+                    "accuracy":sel_result.get("Accuracy (%)","?"),
+                    "pnl":sel_result.get("Total PnL","?"),
+                }
+                st.success(f"✅ Row {sel_idx} applied: {_opt_st}  Accuracy={sel_result.get('Accuracy (%)','?')}%  "
+                           f"→ Switch to 📊 Backtesting tab to run it!")
+                st.rerun()
+
+            # Best result preview
+            if df_opt_ss is not None:
+                st.markdown("---"); st.markdown("### 🥇 Best Result Preview (Row 0)")
                 best=opt_res[0]; best_p={**best["params"],**_BP}
-                bt2,ind2,_=run_backtest(df_opt,opt_st,best_p,opt_sl,opt_slp,opt_tgt,opt_tgtp)
+                bt2,ind2,_=run_backtest(df_opt_ss,_opt_st,best_p,_opt_sl,_opt_slp,_opt_tgt,_opt_tgtp)
                 bp2=calc_perf(bt2)
                 if bp2:
                     bmc=st.columns(len(bp2))
                     for col,(k,v) in zip(bmc,bp2.items()): col.metric(k,v)
-                st.plotly_chart(plot_ohlc(df_opt,bt2,ind2,title=f"Best:{best['params']}  Acc={best.get('Accuracy (%)','?'):.1f}%"),use_container_width=True)
+                acc_lbl=f"{best.get('Accuracy (%)','?'):.1f}%" if isinstance(best.get('Accuracy (%)'),float) else str(best.get('Accuracy (%)','?'))
+                st.plotly_chart(plot_ohlc(df_opt_ss,bt2,ind2,
+                    title=f"Best Params: {dict(list(best['params'].items())[:4])} | Acc={acc_lbl}"),
+                    use_container_width=True)
                 eq_b=plot_equity(bt2)
                 if eq_b: st.plotly_chart(eq_b,use_container_width=True)
                 if bt2:
@@ -974,6 +1051,7 @@ with tab_opt:
                             "Exit Reason","Points Gained","Points Lost","PnL"]
                         CO=[c for c in CO if c in btdf.columns]
                         def _sp(v):
-                            if isinstance(v,(int,float)): return "color:#00E676" if v>0 else ("color:#FF5252" if v<0 else "")
+                            if isinstance(v,(int,float)): return "color:#00E676;font-weight:bold" if v>0 else ("color:#FF5252;font-weight:bold" if v<0 else "")
                             return ""
-                        st.dataframe(btdf[CO].style.map(_sp,subset=["PnL","Points Gained","Points Lost"]),use_container_width=True)
+                        style_co=[c for c in ["PnL","Points Gained","Points Lost"] if c in btdf.columns]
+                        st.dataframe(btdf[CO].style.map(_sp,subset=style_co),use_container_width=True)
