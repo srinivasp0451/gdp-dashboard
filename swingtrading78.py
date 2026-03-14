@@ -16,6 +16,20 @@ import time
 from datetime import datetime
 from itertools import product as itertools_product
 import warnings
+try:
+    import pytz
+    _IST = pytz.timezone("Asia/Kolkata")
+    def to_ist(dt):
+        try:
+            if pd.isna(dt): return ""
+            dt = pd.Timestamp(dt)
+            if dt.tzinfo is None: dt = dt.tz_localize("UTC")
+            return dt.tz_convert(_IST).strftime("%d-%b-%Y %H:%M IST")
+        except: return str(dt)[:19]
+except ImportError:
+    def to_ist(dt):
+        try: return str(pd.Timestamp(dt))[:19]
+        except: return str(dt)[:19]
 warnings.filterwarnings("ignore")
 
 st.set_page_config(page_title="AlgoTrader Pro", layout="wide", initial_sidebar_state="expanded")
@@ -181,9 +195,26 @@ def sig_rsi_osob(df,period=14,ob=70,os_=30,**_):
 def sig_simple_buy(df,**_): s=pd.Series(0,index=df.index); s.iloc[:-1]=1; return s,{}
 def sig_simple_sell(df,**_): s=pd.Series(0,index=df.index); s.iloc[:-1]=-1; return s,{}
 
-def sig_price_thresh(df,threshold=0.,**_):
-    th=_cs(threshold,df.index); s=pd.Series(0,index=df.index)
-    s[_cup(df["Close"],th)]=1; s[_cdn(df["Close"],th)]=-1; return s,{"Threshold":th}
+def sig_price_thresh(df, threshold=0., thresh_dir="Above", thresh_action="Buy", **_):
+    """
+    Threshold strategy:
+      thresh_dir:    "Above" = fires when price crosses ABOVE threshold
+                     "Below" = fires when price crosses BELOW threshold
+      thresh_action: "Buy"  = generate BUY  (long) signal
+                     "Sell" = generate SELL (short) signal
+                     "Both" = Above→BUY, Below→SELL (original behavior)
+    """
+    th = _cs(threshold, df.index)
+    s  = pd.Series(0, index=df.index)
+    if thresh_action == "Both":
+        s[_cup(df["Close"], th)] = 1; s[_cdn(df["Close"], th)] = -1
+    elif thresh_dir == "Above":
+        sig_val = 1 if thresh_action == "Buy" else -1
+        s[_cup(df["Close"], th)] = sig_val
+    else:  # Below
+        sig_val = 1 if thresh_action == "Buy" else -1
+        s[_cdn(df["Close"], th)] = sig_val
+    return s, {"Threshold": th}
 
 def sig_bb(df,period=20,std=2.0,**_):
     lo,mid,hi=bollinger(df["Close"],period,std); s=pd.Series(0,index=df.index)
@@ -526,103 +557,123 @@ def plot_equity(trades,title="Equity Curve"):
         yaxis_title="Cumulative PnL (Points)",margin=dict(t=40,b=20))
     return fig
 
-# ── STRATEGY PARAMS UI ────────────────────────────────────────────────────────
-def strategy_params_ui(strategy,prefix,applied=None):
-    def _n(label,lo,hi,default,key,step=1,fmt="%.4g"):
-        try: v=float(applied.get(key.split("_",1)[-1],default)) if applied else float(default)
-        except: v=float(default)
-        return st.number_input(label,float(lo),float(hi),v,step=float(step),format=fmt,key=key)
-    p={}
-    if strategy=="EMA Crossover":
-        c1,c2=st.columns(2)
-        with c1: p["fast"]=int(_n("EMA Fast",2,200,9,f"{prefix}_fast"))
-        with c2: p["slow"]=int(_n("EMA Slow",2,500,15,f"{prefix}_slow"))
-    elif strategy=="RSI Overbought/Oversold":
-        st.caption("**OR condition:** 🟢 BUY — RSI crosses **above** Oversold  |  🔴 SELL — RSI crosses **below** Overbought")
-        c1,c2,c3=st.columns(3)
-        with c1: p["period"]=int(_n("RSI Period",2,100,14,f"{prefix}_rp"))
-        with c2: p["ob"]=int(_n("Overbought (sell trigger)",50,95,70,f"{prefix}_ob"))
-        with c3: p["os_"]=int(_n("Oversold (buy trigger)",5,50,30,f"{prefix}_os"))
-    elif strategy=="Price Threshold Cross":
-        p["threshold"]=float(_n("Threshold Price",0,1e9,0,f"{prefix}_thresh",step=0.01,fmt="%.2f"))
-    elif strategy=="Bollinger Bands":
-        c1,c2=st.columns(2)
-        with c1: p["period"]=int(_n("BB Period",5,200,20,f"{prefix}_bbp"))
-        with c2: p["std"]=float(_n("Std Dev",0.5,5,2,f"{prefix}_bbs",step=0.1))
-    elif strategy=="RSI Divergence":
-        c1,c2=st.columns(2)
-        with c1: p["period"]=int(_n("RSI Period",2,100,14,f"{prefix}_rp2"))
-        with c2: p["lookback"]=int(_n("Lookback",2,50,5,f"{prefix}_lb"))
-    elif strategy=="MACD Crossover":
-        c1,c2,c3=st.columns(3)
-        with c1: p["fast"]=int(_n("Fast",2,100,12,f"{prefix}_mf"))
-        with c2: p["slow"]=int(_n("Slow",5,200,26,f"{prefix}_ms"))
-        with c3: p["signal"]=int(_n("Signal",2,100,9,f"{prefix}_msig"))
-    elif strategy=="Supertrend":
-        c1,c2=st.columns(2)
-        with c1: p["period"]=int(_n("Period",2,50,7,f"{prefix}_stp"))
-        with c2: p["multiplier"]=float(_n("Multiplier",0.5,10,3,f"{prefix}_stm",step=0.5))
-    elif strategy=="ADX + DI Crossover":
-        c1,c2=st.columns(2)
-        with c1: p["period"]=int(_n("ADX Period",2,50,14,f"{prefix}_ap"))
-        with c2: p["adx_thresh"]=int(_n("ADX Threshold",10,50,25,f"{prefix}_at"))
-    elif strategy=="Stochastic Oscillator":
-        c1,c2,c3,c4=st.columns(4)
-        with c1: p["k"]=int(_n("%K",2,50,14,f"{prefix}_k"))
-        with c2: p["d"]=int(_n("%D",2,20,3,f"{prefix}_d"))
-        with c3: p["ob"]=int(_n("OB",50,95,80,f"{prefix}_so"))
-        with c4: p["os_"]=int(_n("OS",5,50,20,f"{prefix}_su"))
-    elif strategy=="VWAP Deviation":
-        p["dev_pct"]=float(_n("Deviation %",0.1,10,1,f"{prefix}_vd",step=0.1))
-    elif strategy=="Ichimoku Cloud":
-        c1,c2=st.columns(2)
-        with c1: p["tenkan"]=int(_n("Tenkan",2,50,9,f"{prefix}_it"))
-        with c2: p["kijun"]=int(_n("Kijun",5,100,26,f"{prefix}_ik"))
-    elif strategy=="BB + RSI Mean Reversion":
-        c1,c2=st.columns(2)
-        with c1: p["bb_period"]=int(_n("BB Period",5,100,20,f"{prefix}_brbbp"))
-        with c2: p["bb_std"]=float(_n("BB Std",0.5,5,2,f"{prefix}_brbbs",step=0.1))
-        c3,c4,c5=st.columns(3)
-        with c3: p["rsi_period"]=int(_n("RSI Period",2,50,14,f"{prefix}_brrp"))
-        with c4: p["rsi_os"]=int(_n("RSI OS",5,50,35,f"{prefix}_bro"))
-        with c5: p["rsi_ob"]=int(_n("RSI OB",50,95,65,f"{prefix}_brob"))
-    elif strategy=="Donchian Breakout":
-        p["period"]=int(_n("Channel Period",5,200,20,f"{prefix}_dp"))
-    elif strategy=="Triple EMA Trend":
-        c1,c2,c3=st.columns(3)
-        with c1: p["f"]=int(_n("EMA1",2,50,9,f"{prefix}_tf"))
-        with c2: p["m"]=int(_n("EMA2",5,100,21,f"{prefix}_tm"))
-        with c3: p["s_"]=int(_n("EMA3",10,300,50,f"{prefix}_ts"))
-    elif strategy=="Heikin Ashi EMA":
-        p["ema_period"]=int(_n("EMA Period",5,200,20,f"{prefix}_hap"))
-    elif strategy=="Volume Price Trend (VPT)":
-        p["vpt_ema_period"]=int(_n("Signal EMA",2,100,14,f"{prefix}_vp"))
-    elif strategy=="Keltner Channel Breakout":
-        c1,c2,c3=st.columns(3)
-        with c1: p["ema_p"]=int(_n("EMA Period",5,100,20,f"{prefix}_kep"))
-        with c2: p["atr_p"]=int(_n("ATR Period",2,50,10,f"{prefix}_kap"))
-        with c3: p["mult"]=float(_n("Multiplier",0.5,5,2,f"{prefix}_km",step=0.25))
-    elif strategy=="Williams %R Reversal":
-        c1,c2,c3=st.columns(3)
-        with c1: p["period"]=int(_n("Period",2,50,14,f"{prefix}_wrp"))
-        with c2: p["ob"]=int(_n("OB(e.g.-20)",-5,-1,-20,f"{prefix}_wrob"))
-        with c3: p["os_"]=int(_n("OS(e.g.-80)",-99,-50,-80,f"{prefix}_wros"))
-    elif strategy=="Swing Trend + Pullback":
+# ── STRATEGY PARAMS UI  (single-column, sidebar-safe) ────────────────────────
+def strategy_params_ui(strategy, prefix, applied=None):
+    """
+    Renders strategy parameter inputs.
+    Uses FULL-WIDTH inputs (no st.columns) so it works in the sidebar
+    without truncation on desktop or mobile.
+    """
+    def _n(label, lo, hi, default, key, step=1, fmt="%.4g"):
+        try: v = float(applied.get(key.split("_",1)[-1], default)) if applied else float(default)
+        except: v = float(default)
+        return st.number_input(label, float(lo), float(hi), v, step=float(step), format=fmt, key=key)
+
+    def _sel(label, opts, default, key):
+        idx = opts.index(default) if default in opts else 0
+        cur = st.session_state.get(key, default)
+        idx = opts.index(cur) if cur in opts else idx
+        return st.selectbox(label, opts, index=idx, key=key)
+
+    p = {}
+    if strategy == "EMA Crossover":
+        p["fast"] = int(_n("EMA Fast period", 2, 200, 9,  f"{prefix}_fast"))
+        p["slow"] = int(_n("EMA Slow period", 2, 500, 15, f"{prefix}_slow"))
+
+    elif strategy == "RSI Overbought/Oversold":
+        st.caption("🟢 BUY: RSI crosses **above** Oversold  |  🔴 SELL: RSI crosses **below** Overbought")
+        p["period"] = int(_n("RSI Period",          2, 100, 14, f"{prefix}_rp"))
+        p["ob"]     = int(_n("Overbought (sell ↓)", 50, 95, 70, f"{prefix}_ob"))
+        p["os_"]    = int(_n("Oversold  (buy ↑)",   5,  50, 30, f"{prefix}_os"))
+
+    elif strategy == "Price Threshold Cross":
+        p["threshold"]     = float(_n("Threshold Price", 0, 1e9, 0, f"{prefix}_thresh", step=0.01, fmt="%.2f"))
+        p["thresh_dir"]    = _sel("Trigger Direction", ["Above","Below","Both"], "Above", f"{prefix}_tdir")
+        p["thresh_action"] = _sel("Signal Action",     ["Buy","Sell","Both"],    "Buy",   f"{prefix}_tact")
+        st.caption(
+            f"When price crosses **{p['thresh_dir']}** {p['threshold']:.2f} → **{p['thresh_action']}** signal"
+        )
+
+    elif strategy == "Bollinger Bands":
+        p["period"] = int  (_n("BB Period", 5, 200, 20, f"{prefix}_bbp"))
+        p["std"]    = float(_n("Std Dev",  0.5, 5,  2,  f"{prefix}_bbs", step=0.1))
+
+    elif strategy == "RSI Divergence":
+        p["period"]   = int(_n("RSI Period",    2, 100, 14, f"{prefix}_rp2"))
+        p["lookback"] = int(_n("Lookback bars", 2,  50,  5, f"{prefix}_lb"))
+
+    elif strategy == "MACD Crossover":
+        p["fast"]   = int(_n("MACD Fast",   2, 100, 12, f"{prefix}_mf"))
+        p["slow"]   = int(_n("MACD Slow",   5, 200, 26, f"{prefix}_ms"))
+        p["signal"] = int(_n("MACD Signal", 2, 100,  9, f"{prefix}_msig"))
+
+    elif strategy == "Supertrend":
+        p["period"]     = int  (_n("Period",     2,  50,  7, f"{prefix}_stp"))
+        p["multiplier"] = float(_n("Multiplier", 0.5,10,  3, f"{prefix}_stm", step=0.5))
+
+    elif strategy == "ADX + DI Crossover":
+        p["period"]     = int(_n("ADX Period",    2,  50, 14, f"{prefix}_ap"))
+        p["adx_thresh"] = int(_n("ADX Threshold",10,  50, 25, f"{prefix}_at"))
+
+    elif strategy == "Stochastic Oscillator":
+        p["k"]   = int(_n("Stoch %K",   2,  50, 14, f"{prefix}_k"))
+        p["d"]   = int(_n("Stoch %D",   2,  20,  3, f"{prefix}_d"))
+        p["ob"]  = int(_n("Overbought", 50, 95, 80, f"{prefix}_so"))
+        p["os_"] = int(_n("Oversold",    5, 50, 20, f"{prefix}_su"))
+
+    elif strategy == "VWAP Deviation":
+        p["dev_pct"] = float(_n("Deviation %", 0.1, 10, 1, f"{prefix}_vd", step=0.1))
+
+    elif strategy == "Ichimoku Cloud":
+        p["tenkan"] = int(_n("Tenkan period",  2,  50,  9, f"{prefix}_it"))
+        p["kijun"]  = int(_n("Kijun period",   5, 100, 26, f"{prefix}_ik"))
+
+    elif strategy == "BB + RSI Mean Reversion":
+        p["bb_period"]  = int  (_n("BB Period",  5, 100, 20, f"{prefix}_brbbp"))
+        p["bb_std"]     = float(_n("BB Std Dev", 0.5, 5,  2, f"{prefix}_brbbs", step=0.1))
+        p["rsi_period"] = int  (_n("RSI Period", 2,  50, 14, f"{prefix}_brrp"))
+        p["rsi_os"]     = int  (_n("RSI Oversold",  5, 50, 35, f"{prefix}_bro"))
+        p["rsi_ob"]     = int  (_n("RSI Overbought",50, 95, 65, f"{prefix}_brob"))
+
+    elif strategy == "Donchian Breakout":
+        p["period"] = int(_n("Channel Period", 5, 200, 20, f"{prefix}_dp"))
+
+    elif strategy == "Triple EMA Trend":
+        p["f"]  = int(_n("EMA1 Fast",  2,  50,  9, f"{prefix}_tf"))
+        p["m"]  = int(_n("EMA2 Mid",   5, 100, 21, f"{prefix}_tm"))
+        p["s_"] = int(_n("EMA3 Slow", 10, 300, 50, f"{prefix}_ts"))
+
+    elif strategy == "Heikin Ashi EMA":
+        p["ema_period"] = int(_n("EMA Period", 5, 200, 20, f"{prefix}_hap"))
+
+    elif strategy == "Volume Price Trend (VPT)":
+        p["vpt_ema_period"] = int(_n("Signal EMA", 2, 100, 14, f"{prefix}_vp"))
+
+    elif strategy == "Keltner Channel Breakout":
+        p["ema_p"] = int  (_n("EMA Period",  5, 100, 20, f"{prefix}_kep"))
+        p["atr_p"] = int  (_n("ATR Period",  2,  50, 10, f"{prefix}_kap"))
+        p["mult"]  = float(_n("Multiplier", 0.5,  5,  2, f"{prefix}_km", step=0.25))
+
+    elif strategy == "Williams %R Reversal":
+        p["period"] = int(_n("Period",   2,  50,  14, f"{prefix}_wrp"))
+        p["ob"]     = int(_n("OB level", -5,  -1, -20, f"{prefix}_wrob"))
+        p["os_"]    = int(_n("OS level",-99, -50, -80, f"{prefix}_wros"))
+
+    elif strategy == "Swing Trend + Pullback":
         st.caption("Trend EMA filter + pullback to Entry EMA + RSI zone + volume surge")
-        c1,c2,c3=st.columns(3)
-        with c1:
-            p["trend_ema"]=int(_n("Trend EMA",10,200,50,f"{prefix}_ste"))
-            p["entry_ema"]=int(_n("Entry EMA",2,50,9,f"{prefix}_see"))
-            p["rsi_period"]=int(_n("RSI Period",2,50,14,f"{prefix}_srp"))
-        with c2:
-            p["rsi_bull_min"]=int(_n("RSI Bull Min",20,60,40,f"{prefix}_sbmin"))
-            p["rsi_bull_max"]=int(_n("RSI Bull Max",50,90,65,f"{prefix}_sbmax"))
-            p["vol_mult"]=float(_n("Vol Mult",0.5,5,1.2,f"{prefix}_svm",step=0.1))
-        with c3:
-            p["rsi_bear_min"]=int(_n("RSI Bear Min",20,60,35,f"{prefix}_snmin"))
-            p["rsi_bear_max"]=int(_n("RSI Bear Max",50,90,60,f"{prefix}_snmax"))
-    p.setdefault("atr_mult_sl",1.5); p.setdefault("atr_mult_tgt",2.0)
-    p.setdefault("rr_ratio",2.0); p.setdefault("swing_lookback",5)
+        p["trend_ema"]    = int  (_n("Trend EMA period", 10, 200, 50, f"{prefix}_ste"))
+        p["entry_ema"]    = int  (_n("Entry EMA period",  2,  50,  9, f"{prefix}_see"))
+        p["rsi_period"]   = int  (_n("RSI Period",        2,  50, 14, f"{prefix}_srp"))
+        p["rsi_bull_min"] = int  (_n("RSI Bull Min",     20,  60, 40, f"{prefix}_sbmin"))
+        p["rsi_bull_max"] = int  (_n("RSI Bull Max",     50,  90, 65, f"{prefix}_sbmax"))
+        p["rsi_bear_min"] = int  (_n("RSI Bear Min",     20,  60, 35, f"{prefix}_snmin"))
+        p["rsi_bear_max"] = int  (_n("RSI Bear Max",     50,  90, 60, f"{prefix}_snmax"))
+        p["vol_mult"]     = float(_n("Volume Multiplier",0.5,   5,1.2, f"{prefix}_svm", step=0.1))
+
+    p.setdefault("atr_mult_sl",    1.5)
+    p.setdefault("atr_mult_tgt",   2.0)
+    p.setdefault("rr_ratio",       2.0)
+    p.setdefault("swing_lookback", 5)
     return p
 
 def config_banner(strategy,interval,period,sym,sl_type,sl_pts,tgt_type,tgt_pts,extra=None):
@@ -635,55 +686,50 @@ def config_banner(strategy,interval,period,sym,sl_type,sl_pts,tgt_type,tgt_pts,e
 for _k,_v in {"live_active":False,"live_trades":[],"live_position":None,"live_tick":0,
                "opt_applied":None,"opt_results":None,"opt_res_meta":None,"opt_df":None,
                "_oa_hash_prev":"","no_overlap":True,"time_filter":False,
-               "dhan_enabled":False}.items():
+               "dhan_enabled":False,"cooldown_enabled":True,"cooldown_secs":5,
+               "last_trade_close_ts":0.0}.items():
     if _k not in st.session_state: st.session_state[_k]=_v
 
 def _idx(lst,val,default=0): return lst.index(val) if val in lst else default
 
 # ── PRE-POPULATE SIDEBAR + STRATEGY WIDGET STATES FROM APPLIED OPTIMIZATION ──
-# Must run BEFORE widgets render so Streamlit picks up the new values
 _oa_cur = st.session_state.get("opt_applied")
 _oa_hash_new = str(_oa_cur) if _oa_cur else ""
 if _oa_cur and _oa_hash_new != st.session_state.get("_oa_hash_prev",""):
     st.session_state["_oa_hash_prev"] = _oa_hash_new
-    # Override sidebar widget keys
-    if _oa_cur.get("instrument") in TICKER_MAP:
-        st.session_state["g_ticker"]  = _oa_cur["instrument"]
-    if _oa_cur.get("interval") in TIMEFRAMES:
-        st.session_state["g_interval"]= _oa_cur["interval"]
-    if _oa_cur.get("period") in PERIODS:
-        st.session_state["g_period"]  = _oa_cur["period"]
-    if _oa_cur.get("strategy") in STRATEGIES:
-        st.session_state["g_strategy"]= _oa_cur["strategy"]
-    if _oa_cur.get("sl_type") in SL_TYPES:
-        st.session_state["g_sl_type"] = _oa_cur["sl_type"]
-    if _oa_cur.get("tgt_type") in TARGET_TYPES:
-        st.session_state["g_tgt_type"]= _oa_cur["tgt_type"]
+    if _oa_cur.get("instrument") in TICKER_MAP:  st.session_state["g_ticker"]  = _oa_cur["instrument"]
+    if _oa_cur.get("interval")   in TIMEFRAMES:  st.session_state["g_interval"]= _oa_cur["interval"]
+    if _oa_cur.get("period")     in PERIODS:     st.session_state["g_period"]  = _oa_cur["period"]
+    if _oa_cur.get("strategy")   in STRATEGIES:  st.session_state["g_strategy"]= _oa_cur["strategy"]
+    if _oa_cur.get("sl_type")    in SL_TYPES:    st.session_state["g_sl_type"] = _oa_cur["sl_type"]
+    if _oa_cur.get("tgt_type")   in TARGET_TYPES:st.session_state["g_tgt_type"]= _oa_cur["tgt_type"]
     st.session_state["g_sl_pts"]  = float(_oa_cur.get("sl_pts",10))
     st.session_state["g_tgt_pts"] = float(_oa_cur.get("tgt_pts",20))
-    # Override backtest strategy param widget keys
+    # Override sidebar strategy param widget keys (prefix="sb")
     _ap = _oa_cur.get("params",{})
     _PKMAP = {
-        "EMA Crossover":           {"fast":"bt_fast","slow":"bt_slow"},
-        "RSI Overbought/Oversold": {"period":"bt_rp","ob":"bt_ob","os_":"bt_os"},
-        "Bollinger Bands":         {"period":"bt_bbp","std":"bt_bbs"},
-        "MACD Crossover":          {"fast":"bt_mf","slow":"bt_ms","signal":"bt_msig"},
-        "Supertrend":              {"period":"bt_stp","multiplier":"bt_stm"},
-        "ADX + DI Crossover":      {"period":"bt_ap","adx_thresh":"bt_at"},
-        "Stochastic Oscillator":   {"k":"bt_k","d":"bt_d","ob":"bt_so","os_":"bt_su"},
-        "Donchian Breakout":       {"period":"bt_dp"},
-        "Triple EMA Trend":        {"f":"bt_tf","m":"bt_tm","s_":"bt_ts"},
-        "BB + RSI Mean Reversion": {"bb_period":"bt_brbbp","bb_std":"bt_brbbs","rsi_period":"bt_brrp","rsi_os":"bt_bro","rsi_ob":"bt_brob"},
-        "Keltner Channel Breakout":{"ema_p":"bt_kep","atr_p":"bt_kap","mult":"bt_km"},
-        "Williams %R Reversal":    {"period":"bt_wrp","ob":"bt_wrob","os_":"bt_wros"},
-        "Swing Trend + Pullback":  {"trend_ema":"bt_ste","entry_ema":"bt_see","rsi_period":"bt_srp",
-                                    "rsi_bull_min":"bt_sbmin","rsi_bull_max":"bt_sbmax",
-                                    "vol_mult":"bt_svm","rsi_bear_min":"bt_snmin","rsi_bear_max":"bt_snmax"},
-        "VWAP Deviation":          {"dev_pct":"bt_vd"},
-        "Ichimoku Cloud":          {"tenkan":"bt_it","kijun":"bt_ik"},
-        "Heikin Ashi EMA":         {"ema_period":"bt_hap"},
-        "Volume Price Trend (VPT)":{"vpt_ema_period":"bt_vp"},
-        "RSI Divergence":          {"period":"bt_rp2","lookback":"bt_lb"},
+        "EMA Crossover":           {"fast":"sb_fast","slow":"sb_slow"},
+        "RSI Overbought/Oversold": {"period":"sb_rp","ob":"sb_ob","os_":"sb_os"},
+        "Bollinger Bands":         {"period":"sb_bbp","std":"sb_bbs"},
+        "MACD Crossover":          {"fast":"sb_mf","slow":"sb_ms","signal":"sb_msig"},
+        "Supertrend":              {"period":"sb_stp","multiplier":"sb_stm"},
+        "ADX + DI Crossover":      {"period":"sb_ap","adx_thresh":"sb_at"},
+        "Stochastic Oscillator":   {"k":"sb_k","d":"sb_d","ob":"sb_so","os_":"sb_su"},
+        "Donchian Breakout":       {"period":"sb_dp"},
+        "Triple EMA Trend":        {"f":"sb_tf","m":"sb_tm","s_":"sb_ts"},
+        "BB + RSI Mean Reversion": {"bb_period":"sb_brbbp","bb_std":"sb_brbbs",
+                                    "rsi_period":"sb_brrp","rsi_os":"sb_bro","rsi_ob":"sb_brob"},
+        "Keltner Channel Breakout":{"ema_p":"sb_kep","atr_p":"sb_kap","mult":"sb_km"},
+        "Williams %R Reversal":    {"period":"sb_wrp","ob":"sb_wrob","os_":"sb_wros"},
+        "Swing Trend + Pullback":  {"trend_ema":"sb_ste","entry_ema":"sb_see","rsi_period":"sb_srp",
+                                    "rsi_bull_min":"sb_sbmin","rsi_bull_max":"sb_sbmax",
+                                    "vol_mult":"sb_svm","rsi_bear_min":"sb_snmin","rsi_bear_max":"sb_snmax"},
+        "VWAP Deviation":          {"dev_pct":"sb_vd"},
+        "Ichimoku Cloud":          {"tenkan":"sb_it","kijun":"sb_ik"},
+        "Heikin Ashi EMA":         {"ema_period":"sb_hap"},
+        "Volume Price Trend (VPT)":{"vpt_ema_period":"sb_vp"},
+        "RSI Divergence":          {"period":"sb_rp2","lookback":"sb_lb"},
+        "Price Threshold Cross":   {"threshold":"sb_thresh"},
     }
     _st = _oa_cur.get("strategy","")
     for pname, wkey in _PKMAP.get(_st,{}).items():
@@ -702,6 +748,10 @@ with st.sidebar:
     st.markdown("---")
     st.subheader("📈 Strategy")
     strategy=st.selectbox("Strategy",STRATEGIES,key="g_strategy")
+    # ── Strategy parameters live in sidebar so both Backtest + Live share them ─
+    with st.expander("⚙️ Strategy Parameters", expanded=True):
+        sb_params = strategy_params_ui(strategy, prefix="sb",
+                                        applied=_oa.get("params") if _oa else None)
     st.subheader("🛡 Stop Loss")
     sl_type=st.selectbox("SL Type",SL_TYPES,key="g_sl_type")
     sl_pts=st.number_input("SL Value (pts)",0.01,1e6,10.,step=0.5,key="g_sl_pts")
@@ -747,6 +797,12 @@ with st.sidebar:
     st.subheader("⚙️ Trade Management")
     no_overlap =st.checkbox("Prevent Overlapping Trades",value=True,key="no_overlap",
         help="If a position is already open, ignore new signals until it closes.")
+    cooldown_enabled=st.checkbox("Cooldown Between Trades",value=True,key="cooldown_enabled",
+        help="Minimum wait time after a trade closes before a new one can open.")
+    if cooldown_enabled:
+        cooldown_secs=st.number_input("Cooldown (seconds)",1,300,5,step=1,key="cooldown_secs")
+    else:
+        cooldown_secs=0
     time_filter=st.checkbox("Time Window Filter (IST)",value=False,key="time_filter",
         help="Only place/exit orders within the specified IST time window.")
     if time_filter:
@@ -769,11 +825,12 @@ tab_bt,tab_live,tab_opt=st.tabs(["📊 Backtesting","⚡ Live Trading","🔬 Opt
 # ═══════════════════════════════════════════════════════════════════════════════
 with tab_bt:
     st.subheader(f"Backtesting · {t_choice} [{interval}/{period}]")
-    _app=st.session_state.get("opt_applied")
-    with st.expander("⚙️ Strategy Parameters",expanded=True):
-        bt_params=strategy_params_ui(strategy,prefix="bt",applied=_app.get("params") if _app else None)
+    # Strategy params come from sidebar (sb_params) — shared with Live Trading
+    bt_params = sb_params
+    st.caption("⚙️ Strategy parameters are configured in the **sidebar** and shared with Live Trading.")
     config_banner(strategy,interval,period,sym,sl_type,sl_pts,tgt_type,tgt_pts,
-        extra={k:v for k,v in bt_params.items() if k not in("atr_mult_sl","atr_mult_tgt","rr_ratio","swing_lookback")})
+        extra={k:v for k,v in bt_params.items() if k not in("atr_mult_sl","atr_mult_tgt","rr_ratio","swing_lookback",
+                                                               "thresh_dir","thresh_action")})
 
     if st.button("▶ Run Backtest",type="primary",key="btn_bt"):
         with st.spinner("Fetching data…"): df_bt=fetch_data(sym,period,interval)
@@ -845,10 +902,16 @@ with tab_bt:
                     "crossed the SL level, or when High/Low crossed the Target level. "
                     "'End of Data' exits mean neither SL nor Target was hit before the data ended — "
                     "**this is correct behavior, not a missed exit.**  "
-                    "All values are accurate and match what live trading would show."
+                    "All values are accurate and match what live trading would show.  "
+                    "Gap-up/gap-down: entry uses bar Open price (already reflects the gap). "
+                    "Prev-candle SL uses prior bar Low/High regardless of gap — correct for Indian markets."
                 )
                 correct_idx=[i for i in range(len(trades_bt)) if i not in _anom_ids]
-                tdf_ok=tdf_all.iloc[correct_idx]
+                tdf_ok=tdf_all.iloc[correct_idx].copy()
+                # Convert datetime columns to IST for display
+                for _dc in ["Entry DateTime","Exit DateTime","Signal Bar"]:
+                    if _dc in tdf_ok.columns:
+                        tdf_ok[_dc]=tdf_ok[_dc].apply(to_ist)
                 def _pnl_color(v):
                     if isinstance(v,(int,float)):
                         if v>0: return "color:#2e7d32;font-weight:bold"
@@ -937,10 +1000,12 @@ of bar-based backtesting vs. tick data — live trading will be more precise.
 # ═══════════════════════════════════════════════════════════════════════════════
 with tab_live:
     st.subheader(f"⚡ Live Trading · {t_choice} [{interval}]")
-    with st.expander("⚙️ Strategy Parameters (Live)",expanded=False):
-        live_params=strategy_params_ui(strategy,prefix="lv")
+    # Use sidebar params — same as backtesting
+    live_params = sb_params
+    st.caption("⚙️ Strategy parameters are configured in the **sidebar** — same as Backtesting tab.")
     config_banner(strategy,interval,"—",sym,sl_type,sl_pts,tgt_type,tgt_pts,
-        extra={k:v for k,v in live_params.items() if k not in("atr_mult_sl","atr_mult_tgt","rr_ratio","swing_lookback")})
+        extra={k:v for k,v in live_params.items() if k not in("atr_mult_sl","atr_mult_tgt","rr_ratio","swing_lookback",
+                                                                "thresh_dir","thresh_action")})
     st.markdown("---")
     _bc=st.columns([1,1,1,5])
     if _bc[0].button("▶ Start",type="primary",disabled=st.session_state.live_active,key="btn_lv_start"):
@@ -959,14 +1024,23 @@ with tab_live:
         _now=datetime.now()
         st.caption(f"Tick **#{tick}** — {_now.strftime('%H:%M:%S IST')}  |  1.5s rate-limit enforced")
 
-        # ── Time window check ────────────────────────────────────────────────
+        # ── Time window check ─────────────────────────────────────────────────
         _in_window=True
         if st.session_state.get("time_filter",False):
             _ct=_now.time()
             _in_window = tw_from <= _ct <= tw_to
             if not _in_window:
                 st.warning(f"⏰ Outside trading window ({tw_from.strftime('%H:%M')} – {tw_to.strftime('%H:%M')} IST). "
-                           "Monitoring only — no new orders will be placed.")
+                           "Monitoring only — no new orders.")
+
+        # ── Cooldown check ────────────────────────────────────────────────────
+        _cooldown_ok = True
+        _cd_secs = int(st.session_state.get("cooldown_secs",5)) if st.session_state.get("cooldown_enabled",True) else 0
+        if _cd_secs > 0:
+            _elapsed = time.time() - st.session_state.get("last_trade_close_ts",0.0)
+            if _elapsed < _cd_secs:
+                _cooldown_ok = False
+                st.info(f"⏳ Cooldown: {_cd_secs-int(_elapsed)}s remaining before next entry.")
 
         lv_df=fetch_live(sym,interval)
         if lv_df is None or lv_df.empty: st.warning("No data. Retrying…"); return
@@ -979,7 +1053,7 @@ with tab_live:
         except Exception as e: lv_sigs=pd.Series(0,index=lv_df.index); lv_indics={}; st.warning(f"Strategy error:{e}")
         last_sig=int(lv_sigs.iloc[-2]) if len(lv_sigs)>1 else 0
 
-        # ── Price row ────────────────────────────────────────────────────────
+        # ── Price row ─────────────────────────────────────────────────────────
         m=st.columns(6)
         m[0].metric("LTP",f"{cl:.2f}")
         m[1].metric("High",f"{bh_cur:.2f}")
@@ -987,21 +1061,33 @@ with tab_live:
         m[3].metric("Spread",f"{bh_cur-bl_cur:.2f}")
         sig_txt="🟢 BUY" if last_sig==1 else ("🔴 SELL" if last_sig==-1 else "⚪ FLAT")
         m[4].metric("Signal",sig_txt)
-        m[5].metric("Last Bar",str(last_bar)[:19])
+        m[5].metric("Last Bar",to_ist(last_bar))
 
-        # ── Live indicator values (calculated, not just chart) ────────────────
+        # ── Indicator values including EMA labels ─────────────────────────────
         _ov_indics={k:v for k,v in lv_indics.items()
                     if isinstance(v,pd.Series) and k not in _SKIP and len(v)>0}
         if _ov_indics:
             st.markdown("**📐 Indicator Values (current bar)**")
-            _ic=st.columns(min(len(_ov_indics),6))
+            _ic_cols=st.columns(min(len(_ov_indics),6))
             for ci,(name,ser) in enumerate(_ov_indics.items()):
                 try:
-                    val=float(ser.iloc[-1])
-                    prev=float(ser.iloc[-2]) if len(ser)>1 else val
+                    val=float(ser.iloc[-1]); prev=float(ser.iloc[-2]) if len(ser)>1 else val
                     if not np.isnan(val):
-                        _ic[ci%len(_ic)].metric(name,f"{val:.2f}",
-                            delta=f"{val-prev:.2f}" if not np.isnan(prev) else None)
+                        # Build descriptive label: "EMA 9", "EMA 15", "BB Upper", etc.
+                        _lbl = name.replace("_"," ")
+                        # Append period if derivable from params
+                        if name=="EMA_fast" and "fast" in live_params:    _lbl=f"EMA {live_params['fast']}"
+                        elif name=="EMA_slow" and "slow" in live_params:  _lbl=f"EMA {live_params['slow']}"
+                        elif name=="EMA_trend" and "trend_ema" in live_params: _lbl=f"EMA {live_params['trend_ema']} (Trend)"
+                        elif name=="EMA_entry" and "entry_ema" in live_params: _lbl=f"EMA {live_params['entry_ema']} (Entry)"
+                        elif name=="EMA" and "ema_period" in live_params:  _lbl=f"EMA {live_params['ema_period']}"
+                        elif name=="EMA_mid" and "m" in live_params:       _lbl=f"EMA {live_params['m']} (Mid)"
+                        elif name=="RSI" and "period" in live_params:      _lbl=f"RSI({live_params.get('period',14)})"
+                        elif name=="VWAP":                                  _lbl="VWAP"
+                        elif name=="Supertrend":                            _lbl="Supertrend"
+                        _ic_cols[ci%len(_ic_cols)].metric(
+                            _lbl, f"{val:.2f}",
+                            delta=f"{val-prev:+.2f}" if not np.isnan(prev) else None)
                 except: pass
 
         # ── Dhan order helper (inner scope has access to sidebar vars) ────────
@@ -1072,19 +1158,20 @@ with tab_live:
 
         # ── Position management ──────────────────────────────────────────────
         pos=st.session_state.live_position
-        _allow_new = _in_window and (not st.session_state.get("no_overlap",True) or pos is None)
+        _allow_new = (_in_window and _cooldown_ok and
+                      (not st.session_state.get("no_overlap",True) or pos is None))
 
         if pos is None and last_sig!=0 and _allow_new:
             d=last_sig; ep=cl
             lv_sl =init_sl(lv_df,lv_n-1,ep,d,sl_type,sl_pts,live_params)
             lv_tgt=init_tgt(lv_df,lv_n-1,ep,d,tgt_type,tgt_pts,lv_sl,live_params)
+            # Fully reset position state
             st.session_state.live_position={"entry":ep,"direction":d,"sl":lv_sl,"target":lv_tgt,
                 "disp_tgt":lv_tgt,"entry_time":last_bar,"highest":ep,"lowest":ep}
             _dhan_place(d)
-            st.success(f"🚀 NEW {'LONG' if d==1 else 'SHORT'}  Entry:{ep:.2f}  SL:{lv_sl:.2f}  Target:{lv_tgt:.2f}")
-        elif pos is None and last_sig!=0 and not _allow_new:
-            if st.session_state.get("no_overlap",True) and pos is not None:
-                st.info("🔒 Signal detected but overlap prevention active — position already open.")
+            st.success(f"🚀 NEW {'LONG' if d==1 else 'SHORT'}  Entry:{ep:.2f}  "
+                       f"SL:{lv_sl:.2f}  Target:{lv_tgt:.2f}  "
+                       f"[{to_ist(last_bar)}]")
 
         elif pos is not None:
             d=pos["direction"]; ep=pos["entry"]
@@ -1100,18 +1187,23 @@ with tab_live:
             else:
                 if bh_cur>=pos["sl"]:            exited,exit_px,exit_why=True,pos["sl"],"SL Hit"
                 elif tf and bl_cur<=pos["target"]:exited,exit_px,exit_why=True,pos["target"],"Target Hit"
-            # Also exit if outside time window and filter enabled
             if not exited and st.session_state.get("time_filter",False) and not _in_window:
                 exited,exit_px,exit_why=True,cl,"Time Window Close"
             if exited:
                 pnl=round((exit_px-ep)*d,4)
-                st.session_state.live_trades.append({"Entry Time":pos["entry_time"],"Entry Price":ep,
-                    "Direction":"LONG" if d==1 else "SHORT","Exit Time":last_bar,"Exit Price":exit_px,
-                    "Exit Reason":exit_why,"SL":pos["sl"],"Target":pos["disp_tgt"],
-                    "Highest":pos["highest"],"Lowest":pos["lowest"],"PnL":pnl})
-                st.session_state.live_position=None
+                st.session_state.live_trades.append({
+                    "Entry Time":to_ist(pos["entry_time"]),"Entry Price":ep,
+                    "Direction":"LONG" if d==1 else "SHORT",
+                    "Exit Time":to_ist(last_bar),"Exit Price":exit_px,
+                    "Exit Reason":exit_why,"SL":round(pos["sl"],2),"Target":round(pos["disp_tgt"],2),
+                    "Highest":round(pos["highest"],2),"Lowest":round(pos["lowest"],2),"PnL":pnl,
+                })
+                # ── Graceful full reset ───────────────────────────────────
+                st.session_state.live_position = None
+                st.session_state.last_trade_close_ts = time.time()
                 _dhan_exit(d)
-                (st.success if pnl>0 else st.error)(f"CLOSED {exit_why} | PnL: {'+'if pnl>0 else ''}{pnl:.2f}")
+                (st.success if pnl>0 else st.error)(
+                    f"CLOSED {exit_why} | PnL: {'+'if pnl>0 else ''}{pnl:.2f} | {to_ist(last_bar)}")
             else:
                 unreal=round((cl-ep)*d,4)
                 st.markdown("#### 📌 Open Position")
@@ -1119,13 +1211,12 @@ with tab_live:
                 p_[0].metric("Direction","🟢 LONG" if d==1 else "🔴 SHORT")
                 p_[1].metric("Entry",f"{ep:.2f}")
                 p_[2].metric("LTP",f"{cl:.2f}")
-                p_[3].metric("SL",f"{pos['sl']:.2f}",delta=f"dist {abs(cl-pos['sl']):.2f}",delta_color="inverse")
-                p_[4].metric("Target",f"{pos['disp_tgt']:.2f}",delta=f"dist {abs(pos['disp_tgt']-cl):.2f}")
+                p_[3].metric("SL",f"{pos['sl']:.2f}",delta=f"↓{abs(cl-pos['sl']):.2f}",delta_color="inverse")
+                p_[4].metric("Target",f"{pos['disp_tgt']:.2f}",delta=f"↑{abs(pos['disp_tgt']-cl):.2f}")
                 p_[5].metric("Highest",f"{pos['highest']:.2f}")
                 p_[6].metric("Lowest",f"{pos['lowest']:.2f}")
-                p_[7].metric("Unrealised",f"{unreal:.2f}",delta=f"{unreal:.2f}",delta_color="normal" if unreal>=0 else "inverse")
-        elif pos is None and last_sig!=0 and st.session_state.get("no_overlap",True):
-            pass  # no position and no_overlap doesn't block when pos is None
+                p_[7].metric("Unrealised",f"{unreal:.2f}",delta=f"{unreal:+.2f}",
+                              delta_color="normal" if unreal>=0 else "inverse")
 
         st.plotly_chart(plot_ohlc(lv_df,indics=lv_indics,title=f"LIVE:{t_choice}({interval}) Tick#{tick}"),use_container_width=True)
 
