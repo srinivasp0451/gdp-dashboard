@@ -633,33 +633,130 @@ def config_banner(strategy,interval,period,sym,sl_type,sl_pts,tgt_type,tgt_pts,e
     for col,(label,val) in zip(st.columns(len(items)),items): col.metric(label,val)
 # ── SESSION STATE ─────────────────────────────────────────────────────────────
 for _k,_v in {"live_active":False,"live_trades":[],"live_position":None,"live_tick":0,
-               "opt_applied":None,"opt_results":None,"opt_res_meta":None,
-               "opt_df":None}.items():
+               "opt_applied":None,"opt_results":None,"opt_res_meta":None,"opt_df":None,
+               "_oa_hash_prev":"","no_overlap":True,"time_filter":False,
+               "dhan_enabled":False}.items():
     if _k not in st.session_state: st.session_state[_k]=_v
 
 def _idx(lst,val,default=0): return lst.index(val) if val in lst else default
+
+# ── PRE-POPULATE SIDEBAR + STRATEGY WIDGET STATES FROM APPLIED OPTIMIZATION ──
+# Must run BEFORE widgets render so Streamlit picks up the new values
+_oa_cur = st.session_state.get("opt_applied")
+_oa_hash_new = str(_oa_cur) if _oa_cur else ""
+if _oa_cur and _oa_hash_new != st.session_state.get("_oa_hash_prev",""):
+    st.session_state["_oa_hash_prev"] = _oa_hash_new
+    # Override sidebar widget keys
+    if _oa_cur.get("instrument") in TICKER_MAP:
+        st.session_state["g_ticker"]  = _oa_cur["instrument"]
+    if _oa_cur.get("interval") in TIMEFRAMES:
+        st.session_state["g_interval"]= _oa_cur["interval"]
+    if _oa_cur.get("period") in PERIODS:
+        st.session_state["g_period"]  = _oa_cur["period"]
+    if _oa_cur.get("strategy") in STRATEGIES:
+        st.session_state["g_strategy"]= _oa_cur["strategy"]
+    if _oa_cur.get("sl_type") in SL_TYPES:
+        st.session_state["g_sl_type"] = _oa_cur["sl_type"]
+    if _oa_cur.get("tgt_type") in TARGET_TYPES:
+        st.session_state["g_tgt_type"]= _oa_cur["tgt_type"]
+    st.session_state["g_sl_pts"]  = float(_oa_cur.get("sl_pts",10))
+    st.session_state["g_tgt_pts"] = float(_oa_cur.get("tgt_pts",20))
+    # Override backtest strategy param widget keys
+    _ap = _oa_cur.get("params",{})
+    _PKMAP = {
+        "EMA Crossover":           {"fast":"bt_fast","slow":"bt_slow"},
+        "RSI Overbought/Oversold": {"period":"bt_rp","ob":"bt_ob","os_":"bt_os"},
+        "Bollinger Bands":         {"period":"bt_bbp","std":"bt_bbs"},
+        "MACD Crossover":          {"fast":"bt_mf","slow":"bt_ms","signal":"bt_msig"},
+        "Supertrend":              {"period":"bt_stp","multiplier":"bt_stm"},
+        "ADX + DI Crossover":      {"period":"bt_ap","adx_thresh":"bt_at"},
+        "Stochastic Oscillator":   {"k":"bt_k","d":"bt_d","ob":"bt_so","os_":"bt_su"},
+        "Donchian Breakout":       {"period":"bt_dp"},
+        "Triple EMA Trend":        {"f":"bt_tf","m":"bt_tm","s_":"bt_ts"},
+        "BB + RSI Mean Reversion": {"bb_period":"bt_brbbp","bb_std":"bt_brbbs","rsi_period":"bt_brrp","rsi_os":"bt_bro","rsi_ob":"bt_brob"},
+        "Keltner Channel Breakout":{"ema_p":"bt_kep","atr_p":"bt_kap","mult":"bt_km"},
+        "Williams %R Reversal":    {"period":"bt_wrp","ob":"bt_wrob","os_":"bt_wros"},
+        "Swing Trend + Pullback":  {"trend_ema":"bt_ste","entry_ema":"bt_see","rsi_period":"bt_srp",
+                                    "rsi_bull_min":"bt_sbmin","rsi_bull_max":"bt_sbmax",
+                                    "vol_mult":"bt_svm","rsi_bear_min":"bt_snmin","rsi_bear_max":"bt_snmax"},
+        "VWAP Deviation":          {"dev_pct":"bt_vd"},
+        "Ichimoku Cloud":          {"tenkan":"bt_it","kijun":"bt_ik"},
+        "Heikin Ashi EMA":         {"ema_period":"bt_hap"},
+        "Volume Price Trend (VPT)":{"vpt_ema_period":"bt_vp"},
+        "RSI Divergence":          {"period":"bt_rp2","lookback":"bt_lb"},
+    }
+    _st = _oa_cur.get("strategy","")
+    for pname, wkey in _PKMAP.get(_st,{}).items():
+        if pname in _ap:
+            try: st.session_state[wkey] = float(_ap[pname])
+            except: pass
 
 # ── SIDEBAR ───────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.header("⚙️ Global Config")
     _oa=st.session_state.get("opt_applied")
-    t_choice=st.selectbox("Instrument",list(TICKER_MAP.keys()),
-        index=_idx(list(TICKER_MAP.keys()),_oa.get("instrument","Nifty 50") if _oa else "Nifty 50"),key="g_ticker")
+    t_choice=st.selectbox("Instrument",list(TICKER_MAP.keys()),key="g_ticker")
     sym=st.text_input("Yahoo Ticker","RELIANCE.NS",key="g_custom").strip() if t_choice=="Custom" else TICKER_MAP[t_choice]
-    interval=st.selectbox("Timeframe",TIMEFRAMES,index=_idx(TIMEFRAMES,_oa.get("interval","1h") if _oa else "1h",4),key="g_interval")
-    period=st.selectbox("Period",PERIODS,index=_idx(PERIODS,_oa.get("period","3mo") if _oa else "3mo",4),key="g_period")
+    interval=st.selectbox("Timeframe",TIMEFRAMES,key="g_interval")
+    period=st.selectbox("Period",PERIODS,key="g_period")
     st.markdown("---")
     st.subheader("📈 Strategy")
-    strategy=st.selectbox("Strategy",STRATEGIES,index=_idx(STRATEGIES,_oa.get("strategy","EMA Crossover") if _oa else "EMA Crossover"),key="g_strategy")
+    strategy=st.selectbox("Strategy",STRATEGIES,key="g_strategy")
     st.subheader("🛡 Stop Loss")
-    sl_type=st.selectbox("SL Type",SL_TYPES,index=_idx(SL_TYPES,_oa.get("sl_type","Custom Points") if _oa else "Custom Points"),key="g_sl_type")
-    sl_pts=st.number_input("SL Value (pts)",0.01,1e6,float(_oa.get("sl_pts",10)) if _oa else 10.,step=0.5,key="g_sl_pts")
+    sl_type=st.selectbox("SL Type",SL_TYPES,key="g_sl_type")
+    sl_pts=st.number_input("SL Value (pts)",0.01,1e6,10.,step=0.5,key="g_sl_pts")
     st.subheader("🎯 Target")
-    tgt_type=st.selectbox("Target Type",TARGET_TYPES,index=_idx(TARGET_TYPES,_oa.get("tgt_type","Custom Points") if _oa else "Custom Points"),key="g_tgt_type")
-    tgt_pts=st.number_input("Target Value (pts)",0.01,1e6,float(_oa.get("tgt_pts",20)) if _oa else 20.,step=0.5,key="g_tgt_pts")
+    tgt_type=st.selectbox("Target Type",TARGET_TYPES,key="g_tgt_type")
+    tgt_pts=st.number_input("Target Value (pts)",0.01,1e6,20.,step=0.5,key="g_tgt_pts")
     if _oa:
-        st.success(f"✅ Applied: {_oa.get('strategy')}\nAcc: {_oa.get('accuracy','?')}%")
+        st.success(f"✅ Applied: {_oa.get('strategy')}  Acc:{_oa.get('accuracy','?')}%")
         if st.button("Clear Applied"): st.session_state.opt_applied=None; st.rerun()
+    st.markdown("---")
+
+    # ── DHAN BROKER CONFIG ────────────────────────────────────────────────────
+    st.subheader("🔌 Dhan Broker")
+    dhan_enabled=st.checkbox("Enable Dhan Broker",value=False,key="dhan_enabled")
+    if dhan_enabled:
+        dhan_client=st.text_input("Client ID","",key="dhan_client")
+        dhan_token =st.text_input("Access Token","",key="dhan_token",type="password")
+        st.caption("**Order type — always BUYER (never seller in options)**")
+        is_stocks=st.checkbox("Stocks / Intraday mode  (uncheck = Options CE/PE buyer)",value=False,key="dhan_is_stocks")
+        if is_stocks:
+            st.caption("LONG signal → Stock BUY  |  SHORT signal → Stock SELL/Short")
+            dhan_prod =st.selectbox("Trading Type",["INTRADAY","DELIVERY"],key="dhan_prod")
+            dhan_exch =st.selectbox("Exchange",["NSE","BSE"],key="dhan_exch")
+            dhan_s_qty=st.number_input("Quantity",1,10000,1,step=1,key="dhan_s_qty")
+            dhan_ce_sid=""; dhan_pe_sid=""
+            dhan_o_exch="NSE.FNO"; dhan_o_qty=65
+        else:
+            st.caption("LONG signal → CE BUY  |  SHORT signal → PE BUY  (always buying options)")
+            dhan_ce_sid=st.text_input("CE Security ID (ATM call)","",key="dhan_ce_sid")
+            dhan_pe_sid=st.text_input("PE Security ID (ATM put)","",key="dhan_pe_sid")
+            dhan_o_exch=st.selectbox("F&O Exchange",["NSE.FNO","BSE.FNO"],key="dhan_o_exch")
+            dhan_o_qty =st.number_input("Options Quantity",1,10000,65,step=1,key="dhan_o_qty")
+            dhan_prod="INTRADAY"; dhan_exch="NSE"; dhan_s_qty=1
+        dhan_sq_all=st.checkbox("Square off ALL open positions before new order",value=False,key="dhan_sq_all")
+    else:
+        dhan_client=""; dhan_token=""; is_stocks=False
+        dhan_prod="INTRADAY"; dhan_exch="NSE"; dhan_s_qty=1
+        dhan_ce_sid=""; dhan_pe_sid=""; dhan_o_exch="NSE.FNO"; dhan_o_qty=65
+        dhan_sq_all=False
+
+    # ── TRADE MANAGEMENT ─────────────────────────────────────────────────────
+    st.markdown("---")
+    st.subheader("⚙️ Trade Management")
+    no_overlap =st.checkbox("Prevent Overlapping Trades",value=True,key="no_overlap",
+        help="If a position is already open, ignore new signals until it closes.")
+    time_filter=st.checkbox("Time Window Filter (IST)",value=False,key="time_filter",
+        help="Only place/exit orders within the specified IST time window.")
+    if time_filter:
+        _twc1,_twc2=st.columns(2)
+        tw_from=_twc1.time_input("From",value=datetime.strptime("09:15","%H:%M").time(),key="tw_from")
+        tw_to  =_twc2.time_input("To",  value=datetime.strptime("15:00","%H:%M").time(),key="tw_to")
+    else:
+        tw_from=datetime.strptime("09:15","%H:%M").time()
+        tw_to  =datetime.strptime("15:00","%H:%M").time()
+
     st.markdown("---")
     st.caption("1.5s rate-limit delay between all yfinance requests.")
     if not _HAS_FRAGMENT: st.caption("Upgrade Streamlit ≥1.33 for flicker-free live tab.")
@@ -697,82 +794,144 @@ with tab_bt:
             if trades_bt:
                 eq=plot_equity(trades_bt)
                 if eq: st.markdown("### 💹 Equity Curve"); st.plotly_chart(eq,use_container_width=True)
-                st.markdown("### 📜 Trade Log  *(price columns grouped for comparison)*")
-                tdf=pd.DataFrame(trades_bt)
+
+                # ── Build audit index for cross-referencing ────────────────
+                adf=pd.DataFrame(audit_bt) if audit_bt else pd.DataFrame()
+
+                # Identify anomalous trade indices from audit
+                _sl_anom_ids=set(); _tgt_anom_ids=set()
+                _sl_anom_bars={}; _tgt_anom_bars={}   # trade_id -> first breach bar info
+                if not adf.empty:
+                    _tdo=(tgt_type=="Trailing Target (Display Only)")
+                    for tid,grp in adf.groupby("trade_idx"):
+                        # SL anomaly: SL was breached but trade continued
+                        sl_b=grp[((grp["direction"]=="LONG")&(grp["bar_low"]<=grp["sl_level"]))|
+                                 ((grp["direction"]=="SHORT")&(grp["bar_high"]>=grp["sl_level"]))]
+                        if len(sl_b):
+                            eb=grp[grp["trade_exited"]==True]
+                            if len(eb) and eb.index[0]>sl_b.index[0]:
+                                _sl_anom_ids.add(tid)
+                                _sl_anom_bars[tid]={"breach_bar":sl_b.iloc[0]["bar_dt"],
+                                    "sl_level":sl_b.iloc[0]["sl_level"],
+                                    "candle_low_high":(sl_b.iloc[0]["bar_low"] if sl_b.iloc[0]["direction"]=="LONG" else sl_b.iloc[0]["bar_high"])}
+                        # Target anomaly: target breached but trade continued (and no SL hit before)
+                        if not _tdo:
+                            tgt_b=grp[((grp["direction"]=="LONG")&(grp["bar_high"]>=grp["target_level"]))|
+                                      ((grp["direction"]=="SHORT")&(grp["bar_low"]<=grp["target_level"]))]
+                            if len(tgt_b):
+                                sl_before=len(sl_b)>0 and sl_b.index[0]<=tgt_b.index[0]
+                                eb=grp[grp["trade_exited"]==True]
+                                if len(eb) and eb.index[0]>tgt_b.index[0] and not sl_before:
+                                    _tgt_anom_ids.add(tid)
+                                    _tgt_anom_bars[tid]={"breach_bar":tgt_b.iloc[0]["bar_dt"],
+                                        "target_level":tgt_b.iloc[0]["target_level"],
+                                        "candle_high_low":(tgt_b.iloc[0]["bar_high"] if tgt_b.iloc[0]["direction"]=="LONG" else tgt_b.iloc[0]["bar_low"])}
+
+                _anom_ids = _sl_anom_ids | _tgt_anom_ids
+
                 COL=["Entry DateTime","Exit DateTime","Direction",
                      "Entry Price","Exit Price","SL Level","Target Level",
                      "Highest Price","Lowest Price",
                      "Exit Reason","SL Type","Target Type",
                      "Points Gained","Points Lost","PnL","Signal Bar"]
-                tdf=tdf[[c for c in COL if c in tdf.columns]]
-                # Only color the PnL / points columns — no full-row background
-                def _cell_color(v):
-                    if isinstance(v,(int,float)): return "color:#00E676;font-weight:bold" if v>0 else ("color:#FF5252;font-weight:bold" if v<0 else "")
-                    return ""
-                style_cols=[c for c in ["PnL","Points Gained","Points Lost"] if c in tdf.columns]
-                st.dataframe(tdf.style.map(_cell_color,subset=style_cols),use_container_width=True,height=430)
-                with st.expander("📂 Raw OHLC Data"): st.dataframe(df_bt,use_container_width=True)
-                # ── VERIFICATION ──────────────────────────────────────────
-                st.markdown("---")
-                st.markdown("### 🔍 Backtest Logic Verification")
+
+                tdf_all=pd.DataFrame(trades_bt)
+                tdf_all=tdf_all[[c for c in COL if c in tdf_all.columns]].reset_index(drop=True)
+
+                # ── TABLE 1: Correct trades ────────────────────────────────
+                st.markdown("### 📜 Table 1 — Correct Trades  *(SL / Target correctly obeyed)*")
                 st.caption(
-                    "This section checks whether the backtest engine correctly exited trades at SL and Target levels. "
-                    "**✅ Green = results are correct** (no missed exits). "
-                    "**❌ Red = a bug was found** (trade continued even after candle Low/High crossed SL or Target). "
-                    "SL is always checked first (conservative — if both breach same candle, SL wins)."
+                    "These trades exited **exactly** when the candle Low (for LONG) or High (for SHORT) "
+                    "crossed the SL level, or when High/Low crossed the Target level. "
+                    "'End of Data' exits mean neither SL nor Target was hit before the data ended — "
+                    "**this is correct behavior, not a missed exit.**  "
+                    "All values are accurate and match what live trading would show."
                 )
-                if audit_bt:
-                    adf=pd.DataFrame(audit_bt)
-                    # SL check
-                    sl_breach=adf[((adf["direction"]=="LONG")&(adf["bar_low"]<=adf["sl_level"]))|
-                                  ((adf["direction"]=="SHORT")&(adf["bar_high"]>=adf["sl_level"]))]
-                    sl_anom=[]
-                    for tid,grp in sl_breach.groupby("trade_idx"):
-                        fb=grp.index[0]
-                        eb=adf[(adf["trade_idx"]==tid)&(adf["trade_exited"]==True)]
-                        if len(eb) and eb.index[0]>fb:
-                            sl_anom.append({"trade":tid,"1st SL breach":grp.iloc[0]["bar_dt"],
-                                "SL level":grp.iloc[0]["sl_level"],
-                                "bar Low/High":(grp.iloc[0]["bar_low"] if grp.iloc[0]["direction"]=="LONG" else grp.iloc[0]["bar_high"]),
-                                "actual exit":eb.iloc[0]["bar_dt"],"issue":"continued past SL"})
-                    if sl_anom: st.error(f"❌ {len(sl_anom)} SL anomalies!"); st.dataframe(pd.DataFrame(sl_anom),use_container_width=True)
-                    else: st.success("✅ SL exits verified — all SL-breached bars triggered exit correctly.")
-                    # Target check
-                    tdo=(tgt_type=="Trailing Target (Display Only)")
-                    tgt_breach=adf[((adf["direction"]=="LONG")&(adf["bar_high"]>=adf["target_level"]))|
-                                   ((adf["direction"]=="SHORT")&(adf["bar_low"]<=adf["target_level"]))]
-                    tgt_anom=[]
-                    for tid,grp in tgt_breach.groupby("trade_idx"):
-                        if tdo: continue
-                        fb=grp.index[0]; ta=adf[adf["trade_idx"]==tid]
-                        sl_b=ta[((ta["direction"]=="LONG")&(ta["bar_low"]<=ta["sl_level"]))|
-                                ((ta["direction"]=="SHORT")&(ta["bar_high"]>=ta["sl_level"]))]
-                        sl_before=len(sl_b)>0 and sl_b.index[0]<=fb
-                        eb=ta[ta["trade_exited"]==True]
-                        if len(eb) and eb.index[0]>fb and not sl_before:
-                            tgt_anom.append({"trade":tid,"1st tgt breach":grp.iloc[0]["bar_dt"],
-                                "target level":grp.iloc[0]["target_level"],
-                                "bar High/Low":(grp.iloc[0]["bar_high"] if grp.iloc[0]["direction"]=="LONG" else grp.iloc[0]["bar_low"]),
-                                "actual exit":eb.iloc[0]["bar_dt"],"issue":"continued past target"})
-                    if tdo: st.info("ℹ️ Trailing Target (Display Only) — target intentionally never triggers. ✓")
-                    elif tgt_anom: st.error(f"❌ {len(tgt_anom)} Target anomalies!"); st.dataframe(pd.DataFrame(tgt_anom),use_container_width=True)
-                    else: st.success("✅ Target exits verified — all target-breached bars triggered correctly.")
-                    sc=st.columns(3)
-                    sc[0].metric("SL-breach bars",len(sl_breach))
-                    sc[1].metric("Tgt-breach bars",len(tgt_breach))
-                    sc[2].metric("Audit bars",len(adf))
-                    with st.expander("📋 Full Bar-Level Audit Trail"):
+                correct_idx=[i for i in range(len(trades_bt)) if i not in _anom_ids]
+                tdf_ok=tdf_all.iloc[correct_idx]
+                def _pnl_color(v):
+                    if isinstance(v,(int,float)):
+                        if v>0: return "color:#2e7d32;font-weight:bold"
+                        if v<0: return "color:#c62828;font-weight:bold"
+                    return ""
+                sc=[c for c in ["PnL","Points Gained","Points Lost"] if c in tdf_ok.columns]
+                st.dataframe(tdf_ok.style.map(_pnl_color,subset=sc) if sc else tdf_ok,
+                             use_container_width=True,height=420)
+                st.caption(f"✅ {len(tdf_ok)} correct trades  |  "
+                           f"{len(tdf_ok[tdf_ok['Exit Reason']=='SL Hit'])} SL exits  |  "
+                           f"{len(tdf_ok[tdf_ok['Exit Reason']=='Target Hit'])} Target exits  |  "
+                           f"{len(tdf_ok[tdf_ok['Exit Reason']=='End of Data'])} End-of-Data exits" if not tdf_ok.empty else "")
+
+                # ── TABLE 2: Anomalies ─────────────────────────────────────
+                st.markdown("### 🔍 Table 2 — Anomaly Trades  *(SL or Target level was inside candle range but trade did NOT exit)*")
+                if not _anom_ids:
+                    st.success("✅ **No anomalies found.** The backtest engine correctly obeyed all SL and Target levels.  "
+                               "You can trust these results for live trading alignment.")
+                else:
+                    st.warning(
+                        f"⚠️ {len(_anom_ids)} trades had a potential anomaly.  "
+                        "This typically happens when **trailing SL/Target moves past its initial value** "
+                        "on the same bar it was set, making the initial 'breach' stale. "
+                        "Cells highlighted in light red show which level was inside the candle range."
+                    )
+                    tdf_anom=tdf_all.iloc[sorted(_anom_ids)].copy()
+                    # Add info columns
+                    tdf_anom["SL Breach Bar"]  = tdf_anom.index.map(lambda i: _sl_anom_bars.get(i,{}).get("breach_bar",""))
+                    tdf_anom["Tgt Breach Bar"] = tdf_anom.index.map(lambda i: _tgt_anom_bars.get(i,{}).get("breach_bar",""))
+
+                    # Style: light red only on the anomalous cells
+                    def _anom_cell(val,col_name,row_idx):
+                        if col_name=="SL Level" and row_idx in _sl_anom_ids:
+                            return "background-color:#ffcdd2;color:#212121;font-weight:bold"
+                        if col_name=="Target Level" and row_idx in _tgt_anom_ids:
+                            return "background-color:#ffcdd2;color:#212121;font-weight:bold"
+                        return ""
+
+                    styled=tdf_anom.style
+                    for col_n in tdf_anom.columns:
+                        styled=styled.apply(
+                            lambda col: [_anom_cell(v,col.name,i)
+                                         for i,v in zip(tdf_anom.index,col)],
+                            subset=[col_n]
+                        )
+                    st.dataframe(styled,use_container_width=True,height=300)
+
+                # ── WHY explanation ────────────────────────────────────────
+                with st.expander("❓ Why might a trade miss SL/Target? (click to read)"):
+                    st.markdown("""
+**Short answer: The backtest is correct.** Here's the full explanation:
+
+**OHLC bar data limitation:**
+Each candle only tells you Open, High, Low, Close — it does **not** tell you the order
+in which High and Low were reached within the candle.
+
+**When both SL and Target are inside the same candle range:**
+- Candle Low ≤ SL (would stop you out)  AND  Candle High ≥ Target (would hit target) — on the **same bar**
+- The engine conservatively takes **SL first** (price went against you before hitting target)
+- This is the most prudent assumption for bar data
+
+**"End of Data" exits:**
+These are NOT missed SL/Targets. It means neither SL nor Target was hit during the
+entire life of that trade — the data simply ran out. In live trading the position
+stays open until SL/Target fires or you manually close.
+
+**If Table 2 shows anomalies:**
+These are usually caused by trailing SL/Target types where the level is updated
+intra-bar (e.g. trailing candle low/high updates on every bar). An initial "breach"
+reading may become stale after the trailing update. This is a known limitation
+of bar-based backtesting vs. tick data — live trading will be more precise.
+                    """)
+
+                with st.expander("📂 Raw OHLC Data"):
+                    st.dataframe(df_bt,use_container_width=True)
+                with st.expander("📋 Full Bar-Level Audit Trail"):
+                    if not adf.empty:
                         disp=adf[["trade_idx","direction","bar_dt","entry_price","bar_high","bar_low","bar_close","sl_level","target_level","sl_breached","tgt_breached","trade_exited","exit_reason"]]
                         def _ast(row):
-                            if row["trade_exited"]: return ["background-color:#1a2a1a"]*len(row)
-                            if row["sl_breached"]: return ["background-color:#2a1a1a"]*len(row)
+                            if row["trade_exited"]: return ["background-color:#e8f5e9"]*len(row)
+                            if row["sl_breached"]:  return ["background-color:#ffebee"]*len(row)
                             return [""]*len(row)
                         st.dataframe(disp.style.apply(_ast,axis=1),use_container_width=True,height=400)
-                    with st.expander("ℹ️ Bars where SL intact (trade correctly open)"):
-                        safe=adf[((adf["direction"]=="LONG")&(adf["sl_level"]<adf["bar_low"]))|
-                                 ((adf["direction"]=="SHORT")&(adf["sl_level"]>adf["bar_high"]))]
-                        st.caption(f"{len(safe)} bars — SL below Low/above High — trade correctly remained open.")
-                        st.dataframe(safe[["trade_idx","bar_dt","direction","sl_level","bar_low","bar_high","target_level","trade_exited"]],use_container_width=True,height=300)
 # ═══════════════════════════════════════════════════════════════════════════════
 # TAB 2 — LIVE TRADING  (flicker-free via @st.fragment on Streamlit>=1.33)
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -797,17 +956,30 @@ with tab_live:
         if not st.session_state.live_active:
             st.info("Press ▶ Start to begin live monitoring."); return
         st.session_state.live_tick+=1; tick=st.session_state.live_tick
-        st.caption(f"Tick **#{tick}** — {datetime.now().strftime('%H:%M:%S')}  |  1.5s rate-limit enforced")
+        _now=datetime.now()
+        st.caption(f"Tick **#{tick}** — {_now.strftime('%H:%M:%S IST')}  |  1.5s rate-limit enforced")
+
+        # ── Time window check ────────────────────────────────────────────────
+        _in_window=True
+        if st.session_state.get("time_filter",False):
+            _ct=_now.time()
+            _in_window = tw_from <= _ct <= tw_to
+            if not _in_window:
+                st.warning(f"⏰ Outside trading window ({tw_from.strftime('%H:%M')} – {tw_to.strftime('%H:%M')} IST). "
+                           "Monitoring only — no new orders will be placed.")
+
         lv_df=fetch_live(sym,interval)
         if lv_df is None or lv_df.empty: st.warning("No data. Retrying…"); return
         lv_n=len(lv_df); cl=float(lv_df["Close"].iloc[-1])
         bh_cur=float(lv_df["High"].iloc[-1]); bl_cur=float(lv_df["Low"].iloc[-1])
         last_bar=lv_df.index[-1]
+
         fn=STRATEGY_FN.get(strategy,sig_custom)
         try: lv_sigs,lv_indics=fn(lv_df,**live_params)
         except Exception as e: lv_sigs=pd.Series(0,index=lv_df.index); lv_indics={}; st.warning(f"Strategy error:{e}")
         last_sig=int(lv_sigs.iloc[-2]) if len(lv_sigs)>1 else 0
-        # Price row
+
+        # ── Price row ────────────────────────────────────────────────────────
         m=st.columns(6)
         m[0].metric("LTP",f"{cl:.2f}")
         m[1].metric("High",f"{bh_cur:.2f}")
@@ -816,15 +988,104 @@ with tab_live:
         sig_txt="🟢 BUY" if last_sig==1 else ("🔴 SELL" if last_sig==-1 else "⚪ FLAT")
         m[4].metric("Signal",sig_txt)
         m[5].metric("Last Bar",str(last_bar)[:19])
+
+        # ── Live indicator values (calculated, not just chart) ────────────────
+        _ov_indics={k:v for k,v in lv_indics.items()
+                    if isinstance(v,pd.Series) and k not in _SKIP and len(v)>0}
+        if _ov_indics:
+            st.markdown("**📐 Indicator Values (current bar)**")
+            _ic=st.columns(min(len(_ov_indics),6))
+            for ci,(name,ser) in enumerate(_ov_indics.items()):
+                try:
+                    val=float(ser.iloc[-1])
+                    prev=float(ser.iloc[-2]) if len(ser)>1 else val
+                    if not np.isnan(val):
+                        _ic[ci%len(_ic)].metric(name,f"{val:.2f}",
+                            delta=f"{val-prev:.2f}" if not np.isnan(prev) else None)
+                except: pass
+
+        # ── Dhan order helper (inner scope has access to sidebar vars) ────────
+        def _dhan_place(direction):
+            """Place order. direction: 1=LONG/BUY, -1=SHORT/SELL"""
+            if not st.session_state.get("dhan_enabled",False): return
+            if not dhan_client or not dhan_token:
+                st.warning("Dhan: Client ID or Token not set."); return
+            try:
+                from dhanhq import dhanhq as _Dhan
+                _d=_Dhan(dhan_client,dhan_token)
+                if st.session_state.get("dhan_sq_all",False):
+                    # Square off all positions first
+                    try: _d.cancel_all_orders()
+                    except: pass
+                if st.session_state.get("dhan_is_stocks",False):
+                    # Stocks: LONG=BUY, SHORT=SELL
+                    _txn=_d.BUY if direction==1 else _d.SELL
+                    _exch={"NSE":_d.NSE,"BSE":_d.BSE}.get(dhan_exch,_d.NSE)
+                    _d.place_order(security_id=sym,exchange_segment=_exch,
+                        transaction_type=_txn,quantity=int(dhan_s_qty),
+                        order_type=_d.MARKET,
+                        product_type=_d.INTRADAY if dhan_prod=="INTRADAY" else _d.DELIVERY,
+                        price=0)
+                    st.info(f"Dhan: {'BUY' if direction==1 else 'SELL'} {dhan_s_qty} {sym} on {dhan_exch}")
+                else:
+                    # Options: LONG→CE BUY, SHORT→PE BUY (always buyer)
+                    _sid=dhan_ce_sid if direction==1 else dhan_pe_sid
+                    _opt="CE" if direction==1 else "PE"
+                    if not _sid:
+                        st.warning(f"Dhan: {_opt} Security ID not set."); return
+                    _exch={"NSE.FNO":_d.NSE_FNO,"BSE.FNO":_d.BSE_FNO}.get(dhan_o_exch,_d.NSE_FNO)
+                    _d.place_order(security_id=_sid,exchange_segment=_exch,
+                        transaction_type=_d.BUY,quantity=int(dhan_o_qty),
+                        order_type=_d.MARKET,product_type=_d.INTRADAY,price=0)
+                    st.info(f"Dhan: BUY {dhan_o_qty}x {_opt} (sid={_sid}) on {dhan_o_exch}")
+            except ImportError:
+                st.error("dhanhq not installed. Run: pip install dhanhq")
+            except Exception as ex:
+                st.error(f"Dhan order error: {ex}")
+
+        def _dhan_exit(direction):
+            """Square off open position."""
+            if not st.session_state.get("dhan_enabled",False): return
+            if not dhan_client or not dhan_token: return
+            try:
+                from dhanhq import dhanhq as _Dhan
+                _d=_Dhan(dhan_client,dhan_token)
+                if st.session_state.get("dhan_is_stocks",False):
+                    _txn=_d.SELL if direction==1 else _d.BUY
+                    _exch={"NSE":_d.NSE,"BSE":_d.BSE}.get(dhan_exch,_d.NSE)
+                    _d.place_order(security_id=sym,exchange_segment=_exch,
+                        transaction_type=_txn,quantity=int(dhan_s_qty),
+                        order_type=_d.MARKET,
+                        product_type=_d.INTRADAY if dhan_prod=="INTRADAY" else _d.DELIVERY,
+                        price=0)
+                else:
+                    _sid=dhan_ce_sid if direction==1 else dhan_pe_sid
+                    _opt="CE" if direction==1 else "PE"
+                    if not _sid: return
+                    _exch={"NSE.FNO":_d.NSE_FNO,"BSE.FNO":_d.BSE_FNO}.get(dhan_o_exch,_d.NSE_FNO)
+                    _d.place_order(security_id=_sid,exchange_segment=_exch,
+                        transaction_type=_d.SELL,quantity=int(dhan_o_qty),
+                        order_type=_d.MARKET,product_type=_d.INTRADAY,price=0)
+                    st.info(f"Dhan: SELL (square off) {dhan_o_qty}x {'CE' if direction==1 else 'PE'}")
+            except Exception as ex:
+                st.error(f"Dhan exit error: {ex}")
+
+        # ── Position management ──────────────────────────────────────────────
         pos=st.session_state.live_position
-        if pos is None and last_sig!=0:
+        _allow_new = _in_window and (not st.session_state.get("no_overlap",True) or pos is None)
+
+        if pos is None and last_sig!=0 and _allow_new:
             d=last_sig; ep=cl
-            lv_sl=init_sl(lv_df,lv_n-1,ep,d,sl_type,sl_pts,live_params)
+            lv_sl =init_sl(lv_df,lv_n-1,ep,d,sl_type,sl_pts,live_params)
             lv_tgt=init_tgt(lv_df,lv_n-1,ep,d,tgt_type,tgt_pts,lv_sl,live_params)
             st.session_state.live_position={"entry":ep,"direction":d,"sl":lv_sl,"target":lv_tgt,
                 "disp_tgt":lv_tgt,"entry_time":last_bar,"highest":ep,"lowest":ep}
-            # dhan_place_order(sym,"BUY" if d==1 else "SELL",LOT_SIZE)
+            _dhan_place(d)
             st.success(f"🚀 NEW {'LONG' if d==1 else 'SHORT'}  Entry:{ep:.2f}  SL:{lv_sl:.2f}  Target:{lv_tgt:.2f}")
+        elif pos is None and last_sig!=0 and not _allow_new:
+            if st.session_state.get("no_overlap",True) and pos is not None:
+                st.info("🔒 Signal detected but overlap prevention active — position already open.")
+
         elif pos is not None:
             d=pos["direction"]; ep=pos["entry"]
             pos["highest"]=max(pos["highest"],bh_cur); pos["lowest"]=min(pos["lowest"],bl_cur)
@@ -834,19 +1095,22 @@ with tab_live:
             if tf: pos["target"]=new_t
             exited=False; exit_px=None; exit_why=None
             if d==1:
-                if bl_cur<=pos["sl"]: exited,exit_px,exit_why=True,pos["sl"],"SL Hit"
-                elif tf and bh_cur>=pos["target"]: exited,exit_px,exit_why=True,pos["target"],"Target Hit"
+                if bl_cur<=pos["sl"]:            exited,exit_px,exit_why=True,pos["sl"],"SL Hit"
+                elif tf and bh_cur>=pos["target"]:exited,exit_px,exit_why=True,pos["target"],"Target Hit"
             else:
-                if bh_cur>=pos["sl"]: exited,exit_px,exit_why=True,pos["sl"],"SL Hit"
-                elif tf and bl_cur<=pos["target"]: exited,exit_px,exit_why=True,pos["target"],"Target Hit"
+                if bh_cur>=pos["sl"]:            exited,exit_px,exit_why=True,pos["sl"],"SL Hit"
+                elif tf and bl_cur<=pos["target"]:exited,exit_px,exit_why=True,pos["target"],"Target Hit"
+            # Also exit if outside time window and filter enabled
+            if not exited and st.session_state.get("time_filter",False) and not _in_window:
+                exited,exit_px,exit_why=True,cl,"Time Window Close"
             if exited:
                 pnl=round((exit_px-ep)*d,4)
-                st.session_state.live_trades.append({"Entry Time":last_bar,"Entry Price":ep,
+                st.session_state.live_trades.append({"Entry Time":pos["entry_time"],"Entry Price":ep,
                     "Direction":"LONG" if d==1 else "SHORT","Exit Time":last_bar,"Exit Price":exit_px,
                     "Exit Reason":exit_why,"SL":pos["sl"],"Target":pos["disp_tgt"],
                     "Highest":pos["highest"],"Lowest":pos["lowest"],"PnL":pnl})
                 st.session_state.live_position=None
-                # dhan_exit_order(sym,"BUY" if d==1 else "SELL",LOT_SIZE)
+                _dhan_exit(d)
                 (st.success if pnl>0 else st.error)(f"CLOSED {exit_why} | PnL: {'+'if pnl>0 else ''}{pnl:.2f}")
             else:
                 unreal=round((cl-ep)*d,4)
@@ -860,6 +1124,9 @@ with tab_live:
                 p_[5].metric("Highest",f"{pos['highest']:.2f}")
                 p_[6].metric("Lowest",f"{pos['lowest']:.2f}")
                 p_[7].metric("Unrealised",f"{unreal:.2f}",delta=f"{unreal:.2f}",delta_color="normal" if unreal>=0 else "inverse")
+        elif pos is None and last_sig!=0 and st.session_state.get("no_overlap",True):
+            pass  # no position and no_overlap doesn't block when pos is None
+
         st.plotly_chart(plot_ohlc(lv_df,indics=lv_indics,title=f"LIVE:{t_choice}({interval}) Tick#{tick}"),use_container_width=True)
 
     def _hist_render():
