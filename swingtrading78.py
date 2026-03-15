@@ -35,43 +35,47 @@ warnings.filterwarnings("ignore")
 st.set_page_config(page_title="AlgoTrader Pro", layout="wide", initial_sidebar_state="expanded")
 _HAS_FRAGMENT = hasattr(st, "fragment")
 
-# ── CSS: fix sidebar text truncation on desktop ───────────────────────────────
+# ── CSS: sidebar scroll + no overflow into main content ──────────────────────
 st.markdown("""
 <style>
-/* Prevent ellipsis on all sidebar text/labels/inputs */
-[data-testid="stSidebar"] * {
-    white-space: normal !important;
-    overflow: visible !important;
-    text-overflow: unset !important;
-    word-break: break-word !important;
-    min-width: 0 !important;
+/* ── Sidebar container: fixed width, scrollable, never overflows ── */
+[data-testid="stSidebar"] {
+    overflow-y: auto !important;
+    overflow-x: hidden !important;
 }
-/* Sidebar number/text input — full width, readable */
-[data-testid="stSidebar"] input {
-    min-width: 80px !important;
-    font-size: 13px !important;
-}
-/* Fix selectbox label truncation */
-[data-testid="stSidebar"] label {
-    white-space: normal !important;
-    font-size: 13px !important;
-    line-height: 1.4 !important;
-}
-/* Metric value — don't clip */
-[data-testid="stMetricValue"] {
-    font-size: 14px !important;
-    white-space: nowrap;
-}
-[data-testid="stMetricLabel"] {
-    font-size: 11px !important;
-    white-space: normal !important;
-    overflow: visible !important;
-}
-/* Make sidebar slightly wider on desktop */
 [data-testid="stSidebar"] > div:first-child {
-    width: 340px !important;
-    min-width: 280px;
+    width: 320px !important;
+    max-width: 320px !important;
+    min-width: 280px !important;
+    overflow-x: hidden !important;
+    overflow-y: auto !important;
+    padding-right: 6px !important;
 }
+/* All sidebar content wraps, doesn't overflow */
+[data-testid="stSidebar"] * {
+    box-sizing: border-box !important;
+    max-width: 100% !important;
+}
+[data-testid="stSidebar"] label,
+[data-testid="stSidebar"] p,
+[data-testid="stSidebar"] span {
+    white-space: normal !important;
+    word-break: break-word !important;
+    font-size: 13px !important;
+    overflow-wrap: break-word !important;
+}
+/* selectbox and inputs stay inside sidebar */
+[data-testid="stSidebar"] select,
+[data-testid="stSidebar"] input {
+    width: 100% !important;
+    max-width: 100% !important;
+    font-size: 13px !important;
+}
+/* Metric cards in config banner */
+[data-testid="stMetricValue"] { font-size: 13px !important; }
+[data-testid="stMetricLabel"] { font-size: 11px !important; white-space: normal !important; }
+/* Config banner table scrolls horizontally without overflowing */
+.config-banner-wrap { overflow-x: auto; width: 100%; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -911,27 +915,79 @@ PARAM_GRIDS={
 }
 _BP={"atr_mult_sl":1.5,"atr_mult_tgt":2.0,"rr_ratio":2.0,"swing_lookback":5}
 
+# Full default params for every strategy — optimization uses these as base so
+# results exactly match what backtesting produces with sidebar defaults.
+_STRATEGY_DEFAULTS = {
+    "EMA Crossover":            {"fast":9,"slow":15},
+    "RSI Overbought/Oversold":  {"period":14,"ob":70,"os_":30},
+    "Simple Buy":               {},
+    "Simple Sell":              {},
+    "Price Threshold Cross":    {"threshold":0.,"thresh_dir":"Above","thresh_action":"Buy"},
+    "Bollinger Bands":          {"period":20,"std":2.0},
+    "RSI Divergence":           {"period":14,"lookback":5},
+    "MACD Crossover":           {"fast":12,"slow":26,"signal":9},
+    "Supertrend":               {"period":7,"multiplier":3.0},
+    "ADX + DI Crossover":       {"period":14,"adx_thresh":25},
+    "Stochastic Oscillator":    {"k":14,"d":3,"ob":80,"os_":20},
+    "VWAP Deviation":           {"dev_pct":1.0},
+    "Ichimoku Cloud":           {"tenkan":9,"kijun":26},
+    "BB + RSI Mean Reversion":  {"bb_period":20,"bb_std":2.0,"rsi_period":14,"rsi_os":35,"rsi_ob":65},
+    "Donchian Breakout":        {"period":20},
+    "Triple EMA Trend":         {"f":9,"m":21,"s_":50},
+    "Heikin Ashi EMA":          {"ema_period":20},
+    "Volume Price Trend (VPT)": {"vpt_ema_period":14},
+    "Keltner Channel Breakout": {"ema_p":20,"atr_p":10,"mult":2.0},
+    "Williams %R Reversal":     {"period":14,"ob":-20,"os_":-80},
+    "Swing Trend + Pullback":   {"trend_ema":50,"entry_ema":9,"rsi_period":14,
+                                  "rsi_bull_min":40,"rsi_bull_max":65,
+                                  "rsi_bear_min":35,"rsi_bear_max":60,"vol_mult":1.2},
+    "Elliott Wave (Simplified)":{"swing_lookback_ew":10,"min_wave_pct":1.0},
+    "HV Percentile (IV Proxy)": {"hv_period":20,"lookback":252,"ob_pct":80,"os_pct":20},
+    "SMC Order Blocks":         {"ob_lookback":10,"fvg_min_pct":0.05},
+    "Price Action Patterns":    {"pin_bar_ratio":2.0,"engulf_pct":0.5},
+    "Breakout Strategy":        {"lookback":20,"break_pct":0.2,"vol_mult":1.5},
+    "Support & Resistance + EMA":{"sr_lookback":20,"ema_period":50,"touch_pct":0.3},
+}
+
 def optimize(df,strategy,sl_type,sl_pts,tgt_type,tgt_pts,desired_acc,min_pts,min_trades,progress_cb=None,
              tw_from_str=None,tw_to_str=None):
-    grid=PARAM_GRIDS.get(strategy)
+    """
+    Uses same run_backtest logic as the Backtesting tab.
+    Base params = _STRATEGY_DEFAULTS[strategy] merged with _BP,
+    then individual grid params override — ensures exact match with backtest.
+    """
+    # Build full base params: strategy defaults + common defaults
+    _strat_defaults = {**_STRATEGY_DEFAULTS.get(strategy, {}), **_BP}
+
+    grid = PARAM_GRIDS.get(strategy)
     if not grid:
-        t,_,_=run_backtest(df,strategy,_BP,sl_type,sl_pts,tgt_type,tgt_pts,tw_from_str,tw_to_str)
-        p=calc_perf(t)
-        if p: return [{"params":_BP,**p,"Meets_Accuracy":p.get("Accuracy (%)",0)>=desired_acc,"Meets_Pts":p.get("Total Pts Won",0)>=min_pts}]
+        # No grid: run single backtest with full defaults
+        t,_,_ = run_backtest(df, strategy, _strat_defaults, sl_type, sl_pts, tgt_type, tgt_pts,
+                              tw_from_str, tw_to_str)
+        p = calc_perf(t)
+        if p: return [{"params":_strat_defaults,**p,
+                       "Meets_Accuracy":p.get("Accuracy (%)",0)>=desired_acc,
+                       "Meets_Pts":p.get("Total Pts Won",0)>=min_pts}]
         return []
-    keys=list(grid.keys()); combos=list(itertools_product(*[grid[k] for k in keys])); total=len(combos); results=[]
-    for idx,combo in enumerate(combos):
-        p={**dict(zip(keys,combo)),**_BP}
+
+    keys   = list(grid.keys())
+    combos = list(itertools_product(*[grid[k] for k in keys]))
+    total  = len(combos)
+    results = []
+    for idx, combo in enumerate(combos):
+        # Start from full strategy defaults, then override with grid combo values
+        p = {**_strat_defaults, **dict(zip(keys, combo))}
         try:
-            t,_,_=run_backtest(df,strategy,p,sl_type,sl_pts,tgt_type,tgt_pts,tw_from_str,tw_to_str)
-            perf=calc_perf(t)
-            if perf.get("Total Trades",0)>=min_trades:
-                results.append({"params":p,**perf,
-                    "Meets_Accuracy":perf.get("Accuracy (%)",0)>=desired_acc,
-                    "Meets_Pts":perf.get("Total Pts Won",0)>=min_pts})
+            t,_,_ = run_backtest(df, strategy, p, sl_type, sl_pts, tgt_type, tgt_pts,
+                                  tw_from_str, tw_to_str)
+            perf = calc_perf(t)
+            if perf.get("Total Trades",0) >= min_trades:
+                results.append({"params":p, **perf,
+                    "Meets_Accuracy": perf.get("Accuracy (%)",0)   >= desired_acc,
+                    "Meets_Pts":      perf.get("Total Pts Won",0)  >= min_pts})
         except: pass
-        if progress_cb: progress_cb(min((idx+1)/total,1.0))
-    results.sort(key=lambda r:(-r.get("Accuracy (%)",0),-r.get("Total PnL",0)))
+        if progress_cb: progress_cb(min((idx+1)/total, 1.0))
+    results.sort(key=lambda r:(-r.get("Accuracy (%)",0), -r.get("Total PnL",0)))
     return results
 # ── PLOTTING ──────────────────────────────────────────────────────────────────
 _SKIP={"RSI","RSI_OB","RSI_OS","MACD","MACD_Signal","ADX","+DI","-DI","Stoch_K","Stoch_D","Williams_%R"}
@@ -1244,45 +1300,63 @@ for _k,_v in {"live_active":False,"live_trades":[],"live_position":None,"live_ti
 
 def _idx(lst,val,default=0): return lst.index(val) if val in lst else default
 
-# ── PRE-POPULATE SIDEBAR + STRATEGY WIDGET STATES FROM APPLIED OPTIMIZATION ──
-_oa_cur = st.session_state.get("opt_applied")
-_oa_hash_new = str(_oa_cur) if _oa_cur else ""
+# ── PRE-POPULATE SIDEBAR WIDGET STATES FROM APPLIED OPTIMIZATION ─────────────
+# Runs every render; only writes widget states when opt_applied changes.
+# This ensures sidebar, backtest AND live trading all reflect the same params.
+_oa_cur      = st.session_state.get("opt_applied")
+_oa_hash_new = str(id(_oa_cur)) + str(_oa_cur) if _oa_cur else ""
 if _oa_cur and _oa_hash_new != st.session_state.get("_oa_hash_prev",""):
     st.session_state["_oa_hash_prev"] = _oa_hash_new
-    if _oa_cur.get("instrument") in TICKER_MAP:  st.session_state["g_ticker"]  = _oa_cur["instrument"]
-    if _oa_cur.get("interval")   in TIMEFRAMES:  st.session_state["g_interval"]= _oa_cur["interval"]
-    if _oa_cur.get("period")     in PERIODS:     st.session_state["g_period"]  = _oa_cur["period"]
-    if _oa_cur.get("strategy")   in STRATEGIES:  st.session_state["g_strategy"]= _oa_cur["strategy"]
-    if _oa_cur.get("sl_type")    in SL_TYPES:    st.session_state["g_sl_type"] = _oa_cur["sl_type"]
-    if _oa_cur.get("tgt_type")   in TARGET_TYPES:st.session_state["g_tgt_type"]= _oa_cur["tgt_type"]
-    st.session_state["g_sl_pts"]  = float(_oa_cur.get("sl_pts",10))
-    st.session_state["g_tgt_pts"] = float(_oa_cur.get("tgt_pts",20))
-    # Override sidebar strategy param widget keys (prefix="sb")
-    _ap = _oa_cur.get("params",{})
+
+    # ── Instrument / ticker ────────────────────────────────────────────────
+    _inst = _oa_cur.get("instrument","")
+    if _inst in TICKER_MAP:
+        st.session_state["g_ticker"] = _inst
+    elif _inst not in TICKER_MAP and _inst:
+        # It's a raw Yahoo symbol (e.g. "KAYNES.NS") — set Custom mode
+        st.session_state["g_ticker"] = "Custom"
+        st.session_state["g_custom"] = _inst
+
+    # Also handle explicit custom_sym stored during apply
+    _csym = _oa_cur.get("custom_sym","")
+    if _csym:
+        st.session_state["g_ticker"] = "Custom"
+        st.session_state["g_custom"] = _csym
+
+    # ── Timeframe / Period / Strategy / SL / Target ────────────────────────
+    if _oa_cur.get("interval") in TIMEFRAMES:  st.session_state["g_interval"] = _oa_cur["interval"]
+    if _oa_cur.get("period")   in PERIODS:     st.session_state["g_period"]   = _oa_cur["period"]
+    if _oa_cur.get("strategy") in STRATEGIES:  st.session_state["g_strategy"] = _oa_cur["strategy"]
+    if _oa_cur.get("sl_type")  in SL_TYPES:    st.session_state["g_sl_type"]  = _oa_cur["sl_type"]
+    if _oa_cur.get("tgt_type") in TARGET_TYPES:st.session_state["g_tgt_type"] = _oa_cur["tgt_type"]
+    st.session_state["g_sl_pts"]  = float(_oa_cur.get("sl_pts",  10))
+    st.session_state["g_tgt_pts"] = float(_oa_cur.get("tgt_pts", 20))
+
+    # ── Strategy param widgets (prefix="sb") ──────────────────────────────
+    _ap = _oa_cur.get("params", {})
     _PKMAP = {
-        "EMA Crossover":           {"fast":"sb_fast","slow":"sb_slow"},
-        "RSI Overbought/Oversold": {"period":"sb_rp","ob":"sb_ob","os_":"sb_os"},
-        "Bollinger Bands":         {"period":"sb_bbp","std":"sb_bbs"},
-        "MACD Crossover":          {"fast":"sb_mf","slow":"sb_ms","signal":"sb_msig"},
-        "Supertrend":              {"period":"sb_stp","multiplier":"sb_stm"},
-        "ADX + DI Crossover":      {"period":"sb_ap","adx_thresh":"sb_at"},
-        "Stochastic Oscillator":   {"k":"sb_k","d":"sb_d","ob":"sb_so","os_":"sb_su"},
-        "Donchian Breakout":       {"period":"sb_dp"},
-        "Triple EMA Trend":        {"f":"sb_tf","m":"sb_tm","s_":"sb_ts"},
-        "BB + RSI Mean Reversion": {"bb_period":"sb_brbbp","bb_std":"sb_brbbs",
-                                    "rsi_period":"sb_brrp","rsi_os":"sb_bro","rsi_ob":"sb_brob"},
-        "Keltner Channel Breakout":{"ema_p":"sb_kep","atr_p":"sb_kap","mult":"sb_km"},
-        "Williams %R Reversal":    {"period":"sb_wrp","ob":"sb_wrob","os_":"sb_wros"},
-        "Swing Trend + Pullback":  {"trend_ema":"sb_ste","entry_ema":"sb_see","rsi_period":"sb_srp",
-                                    "rsi_bull_min":"sb_sbmin","rsi_bull_max":"sb_sbmax",
-                                    "vol_mult":"sb_svm","rsi_bear_min":"sb_snmin","rsi_bear_max":"sb_snmax"},
-        "VWAP Deviation":          {"dev_pct":"sb_vd"},
-        "Ichimoku Cloud":          {"tenkan":"sb_it","kijun":"sb_ik"},
-        "Heikin Ashi EMA":         {"ema_period":"sb_hap"},
-        "Volume Price Trend (VPT)":{"vpt_ema_period":"sb_vp"},
-        "RSI Divergence":          {"period":"sb_rp2","lookback":"sb_lb"},
-        "Price Threshold Cross":   {"threshold":"sb_thresh"},
-        # ── New strategies ────────────────────────────────────────
+        "EMA Crossover":            {"fast":"sb_fast","slow":"sb_slow"},
+        "RSI Overbought/Oversold":  {"period":"sb_rp","ob":"sb_ob","os_":"sb_os"},
+        "Bollinger Bands":          {"period":"sb_bbp","std":"sb_bbs"},
+        "MACD Crossover":           {"fast":"sb_mf","slow":"sb_ms","signal":"sb_msig"},
+        "Supertrend":               {"period":"sb_stp","multiplier":"sb_stm"},
+        "ADX + DI Crossover":       {"period":"sb_ap","adx_thresh":"sb_at"},
+        "Stochastic Oscillator":    {"k":"sb_k","d":"sb_d","ob":"sb_so","os_":"sb_su"},
+        "Donchian Breakout":        {"period":"sb_dp"},
+        "Triple EMA Trend":         {"f":"sb_tf","m":"sb_tm","s_":"sb_ts"},
+        "BB + RSI Mean Reversion":  {"bb_period":"sb_brbbp","bb_std":"sb_brbbs",
+                                     "rsi_period":"sb_brrp","rsi_os":"sb_bro","rsi_ob":"sb_brob"},
+        "Keltner Channel Breakout": {"ema_p":"sb_kep","atr_p":"sb_kap","mult":"sb_km"},
+        "Williams %R Reversal":     {"period":"sb_wrp","ob":"sb_wrob","os_":"sb_wros"},
+        "Swing Trend + Pullback":   {"trend_ema":"sb_ste","entry_ema":"sb_see","rsi_period":"sb_srp",
+                                     "rsi_bull_min":"sb_sbmin","rsi_bull_max":"sb_sbmax",
+                                     "vol_mult":"sb_svm","rsi_bear_min":"sb_snmin","rsi_bear_max":"sb_snmax"},
+        "VWAP Deviation":           {"dev_pct":"sb_vd"},
+        "Ichimoku Cloud":           {"tenkan":"sb_it","kijun":"sb_ik"},
+        "Heikin Ashi EMA":          {"ema_period":"sb_hap"},
+        "Volume Price Trend (VPT)": {"vpt_ema_period":"sb_vp"},
+        "RSI Divergence":           {"period":"sb_rp2","lookback":"sb_lb"},
+        "Price Threshold Cross":    {"threshold":"sb_thresh"},
         "Elliott Wave (Simplified)":{"swing_lookback_ew":"sb_ewlb","min_wave_pct":"sb_ewpct"},
         "HV Percentile (IV Proxy)": {"hv_period":"sb_hvp","ob_pct":"sb_hvob","os_pct":"sb_hvos"},
         "SMC Order Blocks":         {"ob_lookback":"sb_smcob","fvg_min_pct":"sb_smcfvg"},
@@ -1290,8 +1364,8 @@ if _oa_cur and _oa_hash_new != st.session_state.get("_oa_hash_prev",""):
         "Breakout Strategy":        {"lookback":"sb_bklb","break_pct":"sb_bkpct","vol_mult":"sb_bkvol"},
         "Support & Resistance + EMA":{"sr_lookback":"sb_srlb","ema_period":"sb_srema","touch_pct":"sb_srtp"},
     }
-    _st = _oa_cur.get("strategy","")
-    for pname, wkey in _PKMAP.get(_st,{}).items():
+    _st_key = _oa_cur.get("strategy","")
+    for pname, wkey in _PKMAP.get(_st_key, {}).items():
         if pname in _ap:
             try: st.session_state[wkey] = float(_ap[pname])
             except: pass
@@ -1367,6 +1441,9 @@ with st.sidebar:
     # ── TRADE MANAGEMENT ─────────────────────────────────────────────────────
     st.markdown("---")
     st.subheader("⚙️ Trade Management")
+    main_qty = st.number_input("Position Quantity (main algo)", 1, 100000, 1, step=1,
+                                key="g_main_qty",
+                                help="Quantity used by main algo signals. Default=1.")
     no_overlap =st.checkbox("Prevent Overlapping Trades",value=True,key="no_overlap",
         help="If a position is already open, ignore new signals until it closes.")
     cooldown_enabled=st.checkbox("Cooldown Between Trades",value=True,key="cooldown_enabled",
@@ -1894,7 +1971,9 @@ with tab_opt:
             st.session_state.opt_results = opt_res
             st.session_state.opt_df      = df_opt
             st.session_state.opt_res_meta= {
-                "strategy":opt_st,"instrument":opt_t,"interval":opt_iv,"period":opt_pd,
+                "strategy":opt_st,"instrument":opt_t,
+                "custom_sym": opt_sym if opt_t=="Custom" else "",
+                "interval":opt_iv,"period":opt_pd,
                 "sl":opt_sl,"slp":opt_slp,"tgt":opt_tgt,"tgtp":opt_tgtp,
                 "acc":opt_acc,"pts":opt_pts,
                 "tw_from":_otw_from_str,"tw_to":_otw_to_str,
@@ -1916,6 +1995,9 @@ with tab_opt:
         _opt_t    = _meta.get("instrument", opt_t)
         _opt_iv   = _meta.get("interval", opt_iv)
         _opt_pd   = _meta.get("period", opt_pd)
+        _opt_csym = _meta.get("custom_sym", "")
+        # Resolve actual Yahoo symbol
+        opt_sym_resolved = _opt_csym if (_opt_t=="Custom" and _opt_csym) else (TICKER_MAP.get(_opt_t, _opt_t))
 
         if not opt_res:
             st.warning("No combinations produced enough trades. Try longer period, lower min-trades, or different SL/Target.")
@@ -1974,23 +2056,44 @@ with tab_opt:
                             if k not in("atr_mult_sl","atr_mult_tgt","rr_ratio","swing_lookback")}
                 st.write("**Parameters:**", param_disp)
 
-            if st.button("⚡ Apply Selected Row to Config (Sidebar + Backtest)",
+            if st.button("⚡ Apply Selected Row to Config (Sidebar + Backtest + Live)",
                          type="primary", key="btn_apply_opt"):
-                param_keys=list(PARAM_GRIDS.get(_opt_st,{}).keys())
-                applied_params={pk:sel_result["params"][pk] for pk in param_keys if pk in sel_result["params"]}
-                st.session_state.opt_applied={
-                    "strategy":_opt_st,"instrument":_opt_t,"interval":_opt_iv,"period":_opt_pd,
-                    "sl_type":_opt_sl,"sl_pts":_opt_slp,"tgt_type":_opt_tgt,"tgt_pts":_opt_tgtp,
-                    "params":applied_params,
-                    "accuracy":sel_result.get("Accuracy (%)","?"),
-                    "pnl":sel_result.get("Total PnL","?"),
+                param_keys = list(PARAM_GRIDS.get(_opt_st, {}).keys())
+                # Store FULL params (defaults + grid override) so backtest matches exactly
+                _full_p = {**_STRATEGY_DEFAULTS.get(_opt_st, {}), **_BP}
+                applied_params = {**_full_p,
+                                  **{pk: sel_result["params"][pk]
+                                     for pk in param_keys if pk in sel_result["params"]}}
+                # Store custom symbol if needed
+                _csym_val = ""
+                if _opt_t == "Custom":
+                    _csym_val = opt_sym  # the actual Yahoo symbol string
+                elif _opt_t not in TICKER_MAP:
+                    _csym_val = _opt_t
+
+                st.session_state.opt_applied = {
+                    "strategy":   _opt_st,
+                    "instrument": _opt_t,
+                    "custom_sym": _csym_val,   # e.g. "KAYNES.NS"
+                    "interval":   _opt_iv,
+                    "period":     _opt_pd,
+                    "sl_type":    _opt_sl,
+                    "sl_pts":     _opt_slp,
+                    "tgt_type":   _opt_tgt,
+                    "tgt_pts":    _opt_tgtp,
+                    "params":     applied_params,
+                    "accuracy":   sel_result.get("Accuracy (%)", "?"),
+                    "pnl":        sel_result.get("Total PnL", "?"),
                 }
                 st.session_state["opt_apply_msg"] = (
-                    f"✅ Applied Row {sel_idx}: **{_opt_st}** | "
+                    f"✅ Applied Row {sel_idx} → **{_opt_st}** | "
+                    f"Ticker={_opt_t}{(' ('+_csym_val+')') if _csym_val else ''} | "
+                    f"Interval={_opt_iv} | Period={_opt_pd} | "
                     f"Accuracy={sel_result.get('Accuracy (%)','?')}% | "
-                    f"PnL={sel_result.get('Total PnL','?')} | "
-                    f"Params: {applied_params}"
+                    f"PnL={sel_result.get('Total PnL','?')}"
                 )
+                # Reset hash so pre-populate fires on next rerun
+                st.session_state["_oa_hash_prev"] = ""
                 st.rerun()
 
             # Show green confirmation if recently applied
@@ -2001,8 +2104,14 @@ with tab_opt:
             # Best result preview
             if df_opt_ss is not None:
                 st.markdown("---"); st.markdown("### 🥇 Best Result Preview (Row 0)")
-                best=opt_res[0]; best_p={**best["params"],**_BP}
-                bt2,ind2,_=run_backtest(df_opt_ss,_opt_st,best_p,_opt_sl,_opt_slp,_opt_tgt,_opt_tgtp)
+                best   = opt_res[0]
+                # Use full strategy defaults merged with best params for exact match
+                best_p = {**_STRATEGY_DEFAULTS.get(_opt_st,{}), **_BP, **best["params"]}
+                _meta_tw_from = _meta.get("tw_from")
+                _meta_tw_to   = _meta.get("tw_to")
+                bt2,ind2,_ = run_backtest(df_opt_ss, _opt_st, best_p,
+                                           _opt_sl, _opt_slp, _opt_tgt, _opt_tgtp,
+                                           _meta_tw_from, _meta_tw_to)
                 bp2=calc_perf(bt2)
                 if bp2:
                     bmc=st.columns(len(bp2))
