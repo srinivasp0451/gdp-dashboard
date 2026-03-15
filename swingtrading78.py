@@ -86,6 +86,28 @@ TICKER_MAP = {
     "Silver":"SI=F","EUR/USD":"EURUSD=X","GBP/USD":"GBPUSD=X","USD/JPY":"JPYUSD=X",
     "Crude Oil":"CL=F","Custom":"CUSTOM",
 }
+
+# ── Nifty 50 Constituent Stocks ───────────────────────────────────────────────
+NIFTY50_STOCKS = {
+    "Reliance":"RELIANCE.NS","TCS":"TCS.NS","HDFC Bank":"HDFCBANK.NS",
+    "Infosys":"INFY.NS","ICICI Bank":"ICICIBANK.NS","HUL":"HINDUNILVR.NS",
+    "ITC":"ITC.NS","SBI":"SBIN.NS","Bajaj Finance":"BAJFINANCE.NS",
+    "Bharti Airtel":"BHARTIARTL.NS","Kotak Mahindra":"KOTAKBANK.NS",
+    "L&T":"LT.NS","Asian Paints":"ASIANPAINT.NS","HCL Tech":"HCLTECH.NS",
+    "Axis Bank":"AXISBANK.NS","Wipro":"WIPRO.NS","Maruti Suzuki":"MARUTI.NS",
+    "Sun Pharma":"SUNPHARMA.NS","Titan":"TITAN.NS","UltraTech Cement":"ULTRACEMCO.NS",
+    "Power Grid":"POWERGRID.NS","NTPC":"NTPC.NS","Nestle India":"NESTLEIND.NS",
+    "Tech Mahindra":"TECHM.NS","M&M":"M&M.NS","Bajaj Auto":"BAJAJ-AUTO.NS",
+    "JSW Steel":"JSWSTEEL.NS","Tata Steel":"TATASTEEL.NS","Adani Ports":"ADANIPORTS.NS",
+    "ONGC":"ONGC.NS","Coal India":"COALINDIA.NS","Cipla":"CIPLA.NS",
+    "Hindalco":"HINDALCO.NS","Dr Reddy":"DRREDDY.NS","IndusInd Bank":"INDUSINDBK.NS",
+    "Bajaj Finserv":"BAJAJFINSV.NS","HDFC Life":"HDFCLIFE.NS","SBI Life":"SBILIFE.NS",
+    "Divis Labs":"DIVISLAB.NS","Eicher Motors":"EICHERMOT.NS","Apollo Hospitals":"APOLLOHOSP.NS",
+    "Grasim":"GRASIM.NS","BEL":"BEL.NS","BPCL":"BPCL.NS","Shriram Finance":"SHRIRAMFIN.NS",
+    "Tata Consumer":"TATACONSUM.NS","Tata Motors":"TATAMOTORS.NS",
+    "Hero MotoCorp":"HEROMOTOCO.NS","Britannia":"BRITANNIA.NS","HDFC AMC":"HDFCAMC.NS",
+}
+NIFTY50_SYMBOLS = list(NIFTY50_STOCKS.values())
 TIMEFRAMES = ["1m","5m","15m","30m","1h","4h","1d","1wk"]
 PERIODS    = ["1d","5d","7d","1mo","3mo","6mo","1y","2y","5y","10y","max"]
 STRATEGIES = [
@@ -1467,7 +1489,9 @@ with st.sidebar:
     if not _HAS_FRAGMENT: st.caption("Upgrade Streamlit ≥1.33 for flicker-free live tab.")
 
 # ── MAIN TABS ─────────────────────────────────────────────────────────────────
-tab_bt,tab_live,tab_opt=st.tabs(["📊 Backtesting","⚡ Live Trading","🔬 Optimization"])
+tab_bt,tab_live,tab_opt,tab_nte=st.tabs(
+    ["📊 Backtesting","⚡ Live Trading","🔬 Optimization","🎯 Near to Entry"]
+)
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # TAB 1 — BACKTESTING
@@ -1521,10 +1545,10 @@ with tab_bt:
                     col.metric(k,v,delta=f"{v:.1f}%" if k=="Accuracy (%)" else None)
             else: st.info("No trades generated.")
             st.markdown("### 📈 Price Chart")
-            st.plotly_chart(plot_ohlc(df_bt,trades_bt,indics_bt,title=f"{t_choice}—{strategy}[{interval}]"),use_container_width=True)
+            st.plotly_chart(plot_ohlc(df_bt,trades_bt,indics_bt,title=f"{t_choice}—{strategy}[{interval}]"),use_container_width=True,key="bt_ohlc_chart")
             if trades_bt:
                 eq=plot_equity(trades_bt)
-                if eq: st.markdown("### 💹 Equity Curve"); st.plotly_chart(eq,use_container_width=True)
+                if eq: st.markdown("### 💹 Equity Curve"); st.plotly_chart(eq,use_container_width=True,key="bt_equity_chart")
 
                 # ── Build audit index for cross-referencing ────────────────
                 adf=pd.DataFrame(audit_bt) if audit_bt else pd.DataFrame()
@@ -1884,7 +1908,7 @@ with tab_live:
                 p_[7].metric("Unrealised",f"{unreal:.2f}",delta=f"{unreal:+.2f}",
                               delta_color="normal" if unreal>=0 else "inverse")
 
-        st.plotly_chart(plot_ohlc(lv_df,indics=lv_indics,title=f"LIVE:{t_choice}({interval}) Tick#{tick}"),use_container_width=True)
+        st.plotly_chart(plot_ohlc(lv_df,indics=lv_indics,title=f"LIVE:{t_choice}({interval}) Tick#{tick}"),use_container_width=True,key=f"lv_ohlc_{tick}")
 
     def _hist_render():
         t_=st.session_state.live_trades
@@ -1900,7 +1924,7 @@ with tab_live:
                 return ""
             st.dataframe(hdf.style.map(_sc,subset=["PnL"]),use_container_width=True)
             eq_=plot_equity(t_,"Live Equity")
-            if eq_: st.plotly_chart(eq_,use_container_width=True)
+            if eq_: st.plotly_chart(eq_,use_container_width=True,key="lv_hist_equity")
         else: st.info("No completed live trades yet.")
 
     with sub_mon:
@@ -2119,9 +2143,9 @@ with tab_opt:
                 acc_lbl=f"{best.get('Accuracy (%)','?'):.1f}%" if isinstance(best.get('Accuracy (%)'),float) else str(best.get('Accuracy (%)','?'))
                 st.plotly_chart(plot_ohlc(df_opt_ss,bt2,ind2,
                     title=f"Best Params: {dict(list(best['params'].items())[:4])} | Acc={acc_lbl}"),
-                    use_container_width=True)
+                    use_container_width=True,key="opt_best_ohlc")
                 eq_b=plot_equity(bt2)
-                if eq_b: st.plotly_chart(eq_b,use_container_width=True)
+                if eq_b: st.plotly_chart(eq_b,use_container_width=True,key="opt_best_equity")
                 if bt2:
                     with st.expander("📜 Trade Log (Best Params)"):
                         btdf=pd.DataFrame(bt2)
@@ -2134,3 +2158,270 @@ with tab_opt:
                             return ""
                         style_co=[c for c in ["PnL","Points Gained","Points Lost"] if c in btdf.columns]
                         st.dataframe(btdf[CO].style.map(_sp,subset=style_co),use_container_width=True)
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# TAB 4 — NEAR TO ENTRY
+# Scans Nifty 50 stocks (or custom list) for upcoming signals on chosen strategy.
+# For each ticker: fetches OHLCV, computes strategy signals, checks last N bars
+# to see if a signal just fired (already triggered) or is "approaching" based on
+# indicator proximity to crossover / threshold.
+# ═══════════════════════════════════════════════════════════════════════════════
+with tab_nte:
+    st.subheader("🎯 Near to Entry — Signal Scanner")
+    st.markdown(
+        "Scans selected tickers using the chosen strategy and flags stocks that have "
+        "**just fired a signal** or are **approaching a signal** (indicators nearly crossing). "
+        "1.5 s rate-limit delay between each ticker fetch."
+    )
+
+    # ── Inputs ──────────────────────────────────────────────────────────────
+    with st.expander("🔧 Scanner Inputs", expanded=True):
+        _nc1, _nc2, _nc3 = st.columns(3)
+
+        _nte_universe = _nc1.selectbox(
+            "Universe",
+            ["All Nifty 50 Stocks", "Custom Tickers"] + list(TICKER_MAP.keys()),
+            key="nte_universe",
+        )
+        if _nte_universe == "Custom Tickers":
+            _nte_custom_raw = _nc1.text_area(
+                "Enter Yahoo symbols (one per line)",
+                "RELIANCE.NS\nINFY.NS\nHDFCBANK.NS",
+                key="nte_custom_tickers", height=100,
+            )
+            _nte_symbols = [s.strip() for s in _nte_custom_raw.splitlines() if s.strip()]
+        elif _nte_universe == "All Nifty 50 Stocks":
+            _nte_symbols = NIFTY50_SYMBOLS
+            _nc1.caption(f"Will scan {len(_nte_symbols)} Nifty 50 stocks.")
+        else:
+            _nte_symbols = [TICKER_MAP[_nte_universe]]
+            _nc1.caption(f"Single ticker: {_nte_symbols[0]}")
+
+        _nte_iv  = _nc2.selectbox("Timeframe", TIMEFRAMES, index=4, key="nte_iv")
+        _nte_pd  = _nc2.selectbox("Period",    PERIODS,    index=4, key="nte_pd")
+        _nte_st  = _nc2.selectbox("Strategy",  STRATEGIES, key="nte_strategy")
+        _nte_sl_type  = _nc3.selectbox("SL Type",     SL_TYPES,     key="nte_sl")
+        _nte_sl_pts   = _nc3.number_input("SL Pts",  0.01,1e6,10.,step=0.5,key="nte_slp")
+        _nte_tgt_type = _nc3.selectbox("Target Type",TARGET_TYPES,  key="nte_tgt")
+        _nte_tgt_pts  = _nc3.number_input("Tgt Pts", 0.01,1e6,20.,step=0.5,key="nte_tgtp")
+
+        _nte_lookback = st.slider(
+            "Near-signal lookback (bars) — how recently a signal fired counts as 'fresh'",
+            1, 10, 3, key="nte_lookback",
+        )
+        _nte_prox_pct = st.slider(
+            "Proximity threshold % — indicators within this % of crossover count as 'approaching'",
+            0.1, 5.0, 1.0, step=0.1, key="nte_prox",
+        )
+        _nte_run_opt = st.checkbox(
+            "Also run optimization on each ticker (finds best params, slower)",
+            value=False, key="nte_run_opt",
+        )
+        if _nte_run_opt:
+            _nte_min_acc = st.slider("Min accuracy for best params (%)", 40, 99, 55, key="nte_minacc")
+        else:
+            _nte_min_acc = 55
+
+    if st.button("🔍 Scan Now", type="primary", key="btn_nte_scan"):
+        if not _nte_symbols:
+            st.error("No tickers selected.")
+        else:
+            # Use sidebar strategy params as defaults for the scan
+            _nte_params = {**sb_params}
+
+            _nte_results  = []   # dicts for fired signals
+            _nte_approach = []   # dicts for approaching signals
+            _nte_errors   = []
+
+            _prog = st.progress(0)
+            _status = st.empty()
+            _total  = len(_nte_symbols)
+
+            for _ti, _sym in enumerate(_nte_symbols):
+                _status.caption(f"Scanning {_sym} ({_ti+1}/{_total})…")
+                _prog.progress((_ti+1)/_total)
+
+                try:
+                    time.sleep(1.5)
+                    _raw = yf.download(_sym, period=_nte_pd,
+                                       interval=YF_IV.get(_nte_iv,_nte_iv),
+                                       progress=False, auto_adjust=True)
+                    if _raw is None or _raw.empty:
+                        _nte_errors.append({"Ticker":_sym,"Issue":"No data"})
+                        continue
+                    _df = _flatten(_raw)
+                    if _nte_iv=="4h": _df=_r4h(_df)
+                    if len(_df)<20:
+                        _nte_errors.append({"Ticker":_sym,"Issue":"Too few bars"})
+                        continue
+
+                    # Compute signals
+                    _fn = STRATEGY_FN.get(_nte_st, sig_custom)
+                    try:
+                        _sigs, _indics = _fn(_df, **_nte_params)
+                    except Exception as _e:
+                        _nte_errors.append({"Ticker":_sym,"Issue":f"Strategy error: {_e}"})
+                        continue
+
+                    _last_close = float(_df["Close"].iloc[-1])
+                    _last_bar   = to_ist(_df.index[-1])
+                    _n          = len(_df)
+
+                    # Check last _nte_lookback bars for fired signals
+                    _recent_sigs = _sigs.iloc[max(0,_n-_nte_lookback-1):_n-1]
+                    _fired_long  = int((_recent_sigs==1).sum())
+                    _fired_short = int((_recent_sigs==-1).sum())
+                    _last_sig_val= int(_sigs.iloc[-2]) if _n>1 else 0
+
+                    # Estimate "bars since last signal" (most recent)
+                    _bars_since = None
+                    for _bi in range(_n-2, max(_n-20,0)-1, -1):
+                        if _sigs.iloc[_bi]!=0:
+                            _bars_since=_n-2-_bi; break
+
+                    # Optimization (optional)
+                    _best_acc = None
+                    _best_p   = None
+                    if _nte_run_opt and _nte_st in PARAM_GRIDS:
+                        try:
+                            _or = optimize(_df,_nte_st,_nte_sl_type,_nte_sl_pts,
+                                           _nte_tgt_type,_nte_tgt_pts,
+                                           _nte_min_acc,0,3)
+                            if _or:
+                                _best_acc = _or[0].get("Accuracy (%)","?")
+                                _best_p   = {k:v for k,v in _or[0]["params"].items()
+                                             if k not in("atr_mult_sl","atr_mult_tgt","rr_ratio","swing_lookback")}
+                        except: pass
+
+                    # ── Indicator proximity check ─────────────────────────────
+                    # For EMA Crossover: check how close fast EMA is to slow EMA
+                    _proximity_note = ""
+                    _is_approaching = False
+                    if "EMA_fast" in _indics and "EMA_slow" in _indics:
+                        _fe_now  = float(_indics["EMA_fast"].iloc[-1])
+                        _se_now  = float(_indics["EMA_slow"].iloc[-1])
+                        _fe_prev = float(_indics["EMA_fast"].iloc[-2]) if _n>1 else _fe_now
+                        _se_prev = float(_indics["EMA_slow"].iloc[-2]) if _n>1 else _se_now
+                        _gap_pct = abs(_fe_now-_se_now)/max(abs(_se_now),0.01)*100
+                        _narrowing= (abs(_fe_now-_se_now) < abs(_fe_prev-_se_prev))
+                        if _gap_pct <= _nte_prox_pct:
+                            _is_approaching = True
+                            _dir_hint = "LONG" if _fe_now>_se_now else "SHORT"
+                            _proximity_note = (f"EMA gap={_gap_pct:.2f}% "
+                                               f"({'narrowing ↘' if _narrowing else 'widening'}) "
+                                               f"→ possible {_dir_hint}")
+                    elif "RSI" in _indics:
+                        _r_now = float(_indics["RSI"].iloc[-1]) if not _indics["RSI"].empty else 50
+                        _ob    = _nte_params.get("ob",70)
+                        _os    = _nte_params.get("os_",30)
+                        if abs(_r_now-_os)/_os*100 <= _nte_prox_pct*5:
+                            _is_approaching=True; _proximity_note=f"RSI={_r_now:.1f} near Oversold({_os}) → BUY soon"
+                        elif abs(_r_now-_ob)/_ob*100 <= _nte_prox_pct*5:
+                            _is_approaching=True; _proximity_note=f"RSI={_r_now:.1f} near Overbought({_ob}) → SELL soon"
+                    elif "MACD" in _indics and "MACD_Signal" in _indics:
+                        _m_now  = float(_indics["MACD"].iloc[-1])
+                        _ms_now = float(_indics["MACD_Signal"].iloc[-1])
+                        _m_prev = float(_indics["MACD"].iloc[-2]) if _n>1 else _m_now
+                        _ms_prev= float(_indics["MACD_Signal"].iloc[-2]) if _n>1 else _ms_now
+                        _gap_now  = _m_now - _ms_now
+                        _gap_prev = _m_prev- _ms_prev
+                        if abs(_gap_now) < abs(_gap_prev)*0.3:
+                            _is_approaching=True
+                            _proximity_note=f"MACD hist={_gap_now:.3f} converging → crossover imminent"
+
+                    _row = {
+                        "Ticker":      _sym,
+                        "Last Close":  round(_last_close,2),
+                        "Last Bar":    _last_bar,
+                        "Last Signal": "🟢 BUY" if _last_sig_val==1 else ("🔴 SELL" if _last_sig_val==-1 else "⚪"),
+                        "Fired Long (last N)":  _fired_long,
+                        "Fired Short (last N)": _fired_short,
+                        "Bars Since Signal": _bars_since if _bars_since is not None else "—",
+                        "Approaching":   "✅ YES" if _is_approaching else "—",
+                        "Proximity Note": _proximity_note,
+                        "Best Acc (opt)": f"{_best_acc:.1f}%" if isinstance(_best_acc,(int,float)) else ("—" if not _nte_run_opt else "—"),
+                        "Best Params": str(_best_p)[:60] if _best_p else "—",
+                    }
+
+                    if _fired_long>0 or _fired_short>0 or _last_sig_val!=0:
+                        _nte_results.append(_row)
+                    elif _is_approaching:
+                        _nte_approach.append(_row)
+
+                except Exception as _ex:
+                    _nte_errors.append({"Ticker":_sym,"Issue":str(_ex)[:80]})
+
+            _prog.empty(); _status.empty()
+
+            # ── Display results ────────────────────────────────────────────
+            st.markdown(f"**Scan complete.** {len(_nte_symbols)} tickers scanned.")
+            _r1, _r2, _r3 = st.columns(3)
+            _r1.metric("Fired Signals", len(_nte_results))
+            _r2.metric("Approaching",   len(_nte_approach))
+            _r3.metric("Errors",        len(_nte_errors))
+
+            # Fired signals
+            st.markdown("### 🔴🟢 Fired Signals  *(signal generated in last N bars)*")
+            if _nte_results:
+                _rdf = pd.DataFrame(_nte_results)
+                # Style Last Signal column
+                def _sig_color(v):
+                    if "BUY"  in str(v): return "color:#2e7d32;font-weight:bold"
+                    if "SELL" in str(v): return "color:#c62828;font-weight:bold"
+                    return ""
+                st.dataframe(_rdf.style.map(_sig_color,subset=["Last Signal"]),
+                             use_container_width=True, height=min(400, 60+len(_nte_results)*38))
+
+                # Inline mini-charts for top 5 fired
+                st.markdown("#### 📈 Preview Charts (top 5 fired)")
+                for _pi, _row in enumerate(_nte_results[:5]):
+                    _psym = _row["Ticker"]
+                    try:
+                        time.sleep(1.5)
+                        _praw = yf.download(_psym, period=_nte_pd,
+                                            interval=YF_IV.get(_nte_iv,_nte_iv),
+                                            progress=False, auto_adjust=True)
+                        if not _praw.empty:
+                            _pdf = _flatten(_praw)
+                            if _nte_iv=="4h": _pdf=_r4h(_pdf)
+                            _fn2 = STRATEGY_FN.get(_nte_st, sig_custom)
+                            _s2,_i2=_fn2(_pdf,**_nte_params)
+                            _t2,_,_=run_backtest(_pdf,_nte_st,_nte_params,
+                                                  _nte_sl_type,_nte_sl_pts,
+                                                  _nte_tgt_type,_nte_tgt_pts)
+                            with st.expander(f"📊 {_psym} — {_row['Last Signal']}", expanded=(_pi==0)):
+                                st.plotly_chart(plot_ohlc(_pdf,_t2,_i2,
+                                    title=f"{_psym} | {_nte_st} | {_nte_iv}"),
+                                    use_container_width=True,
+                                    key=f"nte_chart_{_psym}_{_pi}")
+                    except Exception as _ce:
+                        st.caption(f"Chart error for {_psym}: {_ce}")
+            else:
+                st.info("No fired signals found. Try a larger lookback or different strategy/period.")
+
+            # Approaching
+            st.markdown("### 🔔 Approaching Signals  *(indicators near crossover — get ready)*")
+            if _nte_approach:
+                _adf = pd.DataFrame(_nte_approach)
+                st.dataframe(_adf, use_container_width=True, height=min(350, 60+len(_nte_approach)*38))
+            else:
+                st.info("No stocks approaching a signal with current proximity threshold.")
+
+            # Errors
+            if _nte_errors:
+                with st.expander(f"⚠️ {len(_nte_errors)} fetch/processing errors"):
+                    st.dataframe(pd.DataFrame(_nte_errors), use_container_width=True)
+
+            # Summary insight
+            st.markdown("---")
+            _long_count  = sum(1 for r in _nte_results if "BUY"  in r.get("Last Signal",""))
+            _short_count = sum(1 for r in _nte_results if "SELL" in r.get("Last Signal",""))
+            _appr_count  = len(_nte_approach)
+            st.info(
+                f"**Market Bias:** {_long_count} BUY signals · {_short_count} SELL signals · "
+                f"{_appr_count} approaching.  "
+                f"Strategy: **{_nte_st}** | Timeframe: **{_nte_iv}** | Universe: **{_nte_universe}**"
+            )
+
+    else:
+        st.info("Configure scanner inputs above and click **🔍 Scan Now** to find near-entry opportunities.")
