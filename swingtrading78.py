@@ -35,6 +35,46 @@ warnings.filterwarnings("ignore")
 st.set_page_config(page_title="AlgoTrader Pro", layout="wide", initial_sidebar_state="expanded")
 _HAS_FRAGMENT = hasattr(st, "fragment")
 
+# ── CSS: fix sidebar text truncation on desktop ───────────────────────────────
+st.markdown("""
+<style>
+/* Prevent ellipsis on all sidebar text/labels/inputs */
+[data-testid="stSidebar"] * {
+    white-space: normal !important;
+    overflow: visible !important;
+    text-overflow: unset !important;
+    word-break: break-word !important;
+    min-width: 0 !important;
+}
+/* Sidebar number/text input — full width, readable */
+[data-testid="stSidebar"] input {
+    min-width: 80px !important;
+    font-size: 13px !important;
+}
+/* Fix selectbox label truncation */
+[data-testid="stSidebar"] label {
+    white-space: normal !important;
+    font-size: 13px !important;
+    line-height: 1.4 !important;
+}
+/* Metric value — don't clip */
+[data-testid="stMetricValue"] {
+    font-size: 14px !important;
+    white-space: nowrap;
+}
+[data-testid="stMetricLabel"] {
+    font-size: 11px !important;
+    white-space: normal !important;
+    overflow: visible !important;
+}
+/* Make sidebar slightly wider on desktop */
+[data-testid="stSidebar"] > div:first-child {
+    width: 340px !important;
+    min-width: 280px;
+}
+</style>
+""", unsafe_allow_html=True)
+
 # ── CONSTANTS ─────────────────────────────────────────────────────────────────
 TICKER_MAP = {
     "Nifty 50":"^NSEI","Bank Nifty":"^NSEBANK","Nifty IT":"^CNXIT","Sensex":"^BSESN",
@@ -54,7 +94,7 @@ STRATEGIES = [
     "Swing Trend + Pullback",
     # ── Advanced ────────────────────────────────
     "Elliott Wave (Simplified)","HV Percentile (IV Proxy)","SMC Order Blocks",
-    "Price Action Patterns","Breakdown Strategy","Support & Resistance + EMA",
+    "Price Action Patterns","Breakout Strategy","Support & Resistance + EMA",
     # ── Custom builder ──────────────────────────
     "Custom Strategy Builder","Custom Strategy",
 ]
@@ -497,11 +537,11 @@ def sig_price_action(df, pin_bar_ratio=2.0, engulf_pct=0.5, **_):
     return s,{"EMA_20":e20}
 
 # ── ADVANCED STRATEGY: Breakdown Strategy ───────────────────────────────────
-def sig_breakdown(df, lookback=20, break_pct=0.2, vol_mult=1.5, **_):
+def sig_breakout(df, lookback=20, break_pct=0.2, vol_mult=1.5, **_):
     """
-    Breakdown/Breakout:
-    BUY  when price breaks ABOVE the `lookback`-bar high with volume surge.
-    SELL when price breaks BELOW the `lookback`-bar low with volume surge.
+    Breakout Strategy:
+    BUY  when price closes ABOVE the `lookback`-bar high with volume surge.
+    SELL when price closes BELOW the `lookback`-bar low with volume surge.
     """
     hi_l=df["High"].rolling(lookback).max().shift(1)
     lo_l=df["Low"].rolling(lookback).min().shift(1)
@@ -627,7 +667,7 @@ STRATEGY_FN={
     "HV Percentile (IV Proxy)":sig_hv_percentile,
     "SMC Order Blocks":sig_smc_order_blocks,
     "Price Action Patterns":sig_price_action,
-    "Breakdown Strategy":sig_breakdown,
+    "Breakout Strategy":sig_breakout,
     "Support & Resistance + EMA":sig_sr_ema,
     "Custom Strategy Builder":sig_custom_builder,
     "Custom Strategy":sig_custom,
@@ -855,6 +895,19 @@ PARAM_GRIDS={
     "Keltner Channel Breakout":{"ema_p":[14,20,26],"atr_p":[10,14],"mult":[1.5,2.0,2.5]},
     "Williams %R Reversal":{"period":[9,14,21],"ob":[-20,-25],"os_":[-75,-80]},
     "Swing Trend + Pullback":{"trend_ema":[20,50,100],"entry_ema":[5,9,15],"rsi_period":[10,14],"vol_mult":[1.0,1.2,1.5]},
+    # ── Advanced strategies ─────────────────────────────────────────────────
+    "Elliott Wave (Simplified)":{"swing_lookback_ew":[5,10,15],"min_wave_pct":[0.5,1.0,1.5]},
+    "HV Percentile (IV Proxy)":{"hv_period":[10,20,30],"ob_pct":[70,80],"os_pct":[20,30]},
+    "SMC Order Blocks":{"ob_lookback":[5,10,20],"fvg_min_pct":[0.03,0.05,0.1]},
+    "Price Action Patterns":{"pin_bar_ratio":[1.5,2.0,3.0],"engulf_pct":[0.3,0.5,0.7]},
+    "Breakout Strategy":{"lookback":[10,15,20,30],"break_pct":[0.1,0.2,0.3],"vol_mult":[1.2,1.5,2.0]},
+    "Support & Resistance + EMA":{"sr_lookback":[10,20,30],"ema_period":[20,50,100],"touch_pct":[0.2,0.3,0.5]},
+    "VWAP Deviation":{"dev_pct":[0.5,1.0,1.5,2.0]},
+    "Ichimoku Cloud":{"tenkan":[7,9,12],"kijun":[20,26,30]},
+    "RSI Divergence":{"period":[10,14,21],"lookback":[3,5,8]},
+    "Heikin Ashi EMA":{"ema_period":[10,20,30,50]},
+    "Volume Price Trend (VPT)":{"vpt_ema_period":[9,14,21]},
+    "Price Threshold Cross":{"threshold":[0.0]},   # threshold set by user; grid over direction
 }
 _BP={"atr_mult_sl":1.5,"atr_mult_tgt":2.0,"rr_ratio":2.0,"swing_lookback":5}
 
@@ -1062,38 +1115,91 @@ def strategy_params_ui(strategy, prefix, applied=None):
         p["engulf_pct"]    = float(_n("Doji body threshold %",0.1,10,0.5,f"{prefix}_epct",step=0.1))
 
     elif strategy == "Breakdown Strategy":
-        p["lookback"]   = int  (_n("Channel Period",5,100,20,f"{prefix}_bdlb"))
-        p["break_pct"]  = float(_n("Break Threshold %",0.01,5,0.2,f"{prefix}_bdpct",step=0.05))
-        p["vol_mult"]   = float(_n("Volume Multiplier",1.0,5,1.5,f"{prefix}_bdvol",step=0.1))
+        # kept for backward compat — redirects to Breakout Strategy
+        p["lookback"]  = int  (_n("Channel Period",5,100,20,f"{prefix}_bdlb"))
+        p["break_pct"] = float(_n("Break Threshold %",0.01,5,0.2,f"{prefix}_bdpct",step=0.05))
+        p["vol_mult"]  = float(_n("Volume Multiplier",1.0,5,1.5,f"{prefix}_bdvol",step=0.1))
+
+    elif strategy == "Breakout Strategy":
+        p["lookback"]  = int  (_n("Channel Period (bars)",5,100,20,f"{prefix}_bklb"))
+        p["break_pct"] = float(_n("Break Threshold %",0.01,5,0.2,f"{prefix}_bkpct",step=0.05))
+        p["vol_mult"]  = float(_n("Volume Multiplier",1.0,5,1.5,f"{prefix}_bkvol",step=0.1))
+        st.caption("BUY: close above N-bar high with volume surge. SELL: close below N-bar low.")
 
     elif strategy == "Support & Resistance + EMA":
-        p["sr_lookback"]  = int  (_n("S&R Period",5,200,20,f"{prefix}_srlb"))
-        p["ema_period"]   = int  (_n("EMA Period", 5,200,50,f"{prefix}_srema"))
-        p["touch_pct"]    = float(_n("Touch threshold %",0.01,5,0.3,f"{prefix}_srtp",step=0.05))
+        p["sr_lookback"] = int  (_n("S&R Period",5,200,20,f"{prefix}_srlb"))
+        p["ema_period"]  = int  (_n("EMA Period", 5,200,50,f"{prefix}_srema"))
+        p["touch_pct"]   = float(_n("Touch threshold %",0.01,5,0.3,f"{prefix}_srtp",step=0.05))
+
+    elif strategy == "Custom Strategy":
+        st.markdown("""
+**Manual Custom Strategy** — edit `sig_custom()` in the source file.
+
+Available helpers: `ema(s,p)`, `sma(s,p)`, `rsi(s,p)`, `atr(df,p)`,
+`bollinger(s,p,k)`, `macd(s,f,sl,sig)`, `stoch(df,k,d)`, `vwap_calc(df)`,
+`_cup(a,b)` *(cross up)*, `_cdn(a,b)` *(cross down)*
+
+**Example in sig_custom:**
+```python
+fe=ema(df['Close'],9); se=ema(df['Close'],21); r=rsi(df['Close'],14)
+s=pd.Series(0,index=df.index)
+s[_cup(fe,se)&(r<60)]=1    # LONG
+s[_cdn(fe,se)&(r>40)]=-1   # SHORT
+return s, {'EMA9':fe,'EMA21':se}
+```
+        """)
+        st.info("No parameters here — configure logic in code, then click **Run Backtest**.")
 
     elif strategy == "Custom Strategy Builder":
-        st.caption("Build your own signal: Condition 1 (required) + optional Condition 2")
-        _INDS = _BUILDER_INDS
+        st.caption("Build signal rules visually — up to 5 conditions with AND/OR logic.")
+        _INDS  = _BUILDER_INDS
         _CONDS = ["crosses above","crosses below","is above","is below"]
-        p["ind1"]       = st.selectbox("Indicator A", _INDS, key=f"{prefix}_cb_i1")
-        p["ind1_period"]= int(_n("Period A",2,500,14,f"{prefix}_cb_ip1"))
-        p["ind1_fixed"] = float(_n("Fixed Value A (if Fixed Value)",0,1e9,0,f"{prefix}_cb_if1",step=0.01,fmt="%.2f"))
-        p["condition"]  = st.selectbox("Condition",_CONDS,key=f"{prefix}_cb_cond")
-        p["ind2"]       = st.selectbox("Indicator B",_INDS,key=f"{prefix}_cb_i2")
-        p["ind2_period"]= int(_n("Period B",2,500,14,f"{prefix}_cb_ip2"))
-        p["ind2_fixed"] = float(_n("Fixed Value B (if Fixed Value)",0,1e9,0,f"{prefix}_cb_if2",step=0.01,fmt="%.2f"))
-        p["signal_dir"] = st.selectbox("Signal Direction",["Long","Short"],key=f"{prefix}_cb_dir")
-        st.caption(f"→ When {p['ind1']} **{p['condition']}** {p['ind2']} → **{p['signal_dir']}**")
-        p["use_cond2"]  = st.checkbox("Add 2nd Condition (AND/OR)",value=False,key=f"{prefix}_cb_uc2")
-        if p["use_cond2"]:
-            p["logic"]      = st.selectbox("Logic",["AND","OR"],key=f"{prefix}_cb_lg")
-            p["ind1b"]      = st.selectbox("Indicator C",_INDS,key=f"{prefix}_cb_i1b")
-            p["ind1b_period"]= int(_n("Period C",2,500,14,f"{prefix}_cb_ip1b"))
-            p["ind1b_fixed"]= float(_n("Fixed C",0,1e9,0,f"{prefix}_cb_if1b",step=0.01,fmt="%.2f"))
-            p["cond2_op"]   = st.selectbox("Condition 2",_CONDS,key=f"{prefix}_cb_c2op")
-            p["ind2b"]      = st.selectbox("Indicator D",_INDS,key=f"{prefix}_cb_i2b")
-            p["ind2b_period"]= int(_n("Period D",2,500,14,f"{prefix}_cb_ip2b"))
-            p["ind2b_fixed"]= float(_n("Fixed D",0,1e9,0,f"{prefix}_cb_if2b",step=0.01,fmt="%.2f"))
+
+        _nckey = f"{prefix}_cb_nconds"
+        if _nckey not in st.session_state:
+            st.session_state[_nckey] = 1
+
+        _ca, _cb = st.columns(2)
+        if _ca.button("➕ Add condition", key=f"{prefix}_cb_add"):
+            if st.session_state[_nckey] < 5:
+                st.session_state[_nckey] = int(st.session_state[_nckey]) + 1
+        if _cb.button("➖ Remove last",   key=f"{prefix}_cb_rem"):
+            if st.session_state[_nckey] > 1:
+                st.session_state[_nckey] = int(st.session_state[_nckey]) - 1
+
+        n_conds  = int(st.session_state[_nckey])
+        cond_list = []
+        for ci in range(n_conds):
+            with st.expander(f"Condition {ci+1}", expanded=(ci == 0)):
+                logic = st.selectbox(f"Logic (join cond {ci} → {ci+1})",
+                                      ["AND","OR"], key=f"{prefix}_lg{ci}") if ci>0 else "AND"
+                a_ind    = st.selectbox(f"Indicator A",    _INDS,  key=f"{prefix}_ai{ci}")
+                a_period = int  (_n(f"Period A",  2,500,14, f"{prefix}_ap{ci}"))
+                a_fixed  = float(_n(f"Fixed A",   0,1e9, 0, f"{prefix}_af{ci}",step=0.01,fmt="%.2f"))
+                cond_op  = st.selectbox(f"Condition", _CONDS, key=f"{prefix}_op{ci}")
+                b_ind    = st.selectbox(f"Indicator B",    _INDS,  key=f"{prefix}_bi{ci}")
+                b_period = int  (_n(f"Period B",  2,500,14, f"{prefix}_bp{ci}"))
+                b_fixed  = float(_n(f"Fixed B",   0,1e9, 0, f"{prefix}_bf{ci}",step=0.01,fmt="%.2f"))
+                st.caption(f"**{a_ind}** {cond_op} **{b_ind}**")
+                cond_list.append({"logic":logic,"a_ind":a_ind,"a_period":a_period,"a_fixed":a_fixed,
+                                   "cond_op":cond_op,"b_ind":b_ind,"b_period":b_period,"b_fixed":b_fixed})
+
+        p["signal_dir"] = st.selectbox("Overall Signal Direction",["Long","Short"],key=f"{prefix}_cb_dir")
+        p["_cond_list"] = cond_list
+        # Flatten first two conditions for sig_custom_builder compatibility
+        if cond_list:
+            c0=cond_list[0]
+            p["ind1"]=c0["a_ind"]; p["ind1_period"]=c0["a_period"]; p["ind1_fixed"]=c0["a_fixed"]
+            p["condition"]=c0["cond_op"]
+            p["ind2"]=c0["b_ind"]; p["ind2_period"]=c0["b_period"]; p["ind2_fixed"]=c0["b_fixed"]
+        if len(cond_list)>1:
+            c1=cond_list[1]
+            p["use_cond2"]=True; p["logic"]=c1["logic"]
+            p["ind1b"]=c1["a_ind"]; p["ind1b_period"]=c1["a_period"]; p["ind1b_fixed"]=c1["a_fixed"]
+            p["cond2_op"]=c1["cond_op"]
+            p["ind2b"]=c1["b_ind"]; p["ind2b_period"]=c1["b_period"]; p["ind2b_fixed"]=c1["b_fixed"]
+        else:
+            p["use_cond2"]=False
 
     p.setdefault("atr_mult_sl",    1.5)
     p.setdefault("atr_mult_tgt",   2.0)
@@ -1102,11 +1208,32 @@ def strategy_params_ui(strategy, prefix, applied=None):
     return p
 
 def config_banner(strategy,interval,period,sym,sl_type,sl_pts,tgt_type,tgt_pts,extra=None):
-    items=[("Strategy",strategy[:16]),("Interval",interval),("Period",period),("Ticker",sym),
-           ("SL Type",sl_type[:14]),("SL Pts",sl_pts),("Tgt Type",tgt_type[:14]),("Tgt Pts",tgt_pts)]
+    """Render a compact config summary as HTML table — never truncates on desktop."""
+    items = [
+        ("Strategy",  str(strategy)),
+        ("Interval",  str(interval)),
+        ("Period",    str(period)),
+        ("Ticker",    str(sym)),
+        ("SL Type",   str(sl_type)),
+        ("SL Pts",    str(sl_pts)),
+        ("Tgt Type",  str(tgt_type)),
+        ("Tgt Pts",   str(tgt_pts)),
+    ]
     if extra:
-        for k,v in list(extra.items())[:4]: items.append((k,v))
-    for col,(label,val) in zip(st.columns(len(items)),items): col.metric(label,val)
+        for k,v in list(extra.items())[:6]:
+            items.append((str(k), str(v)))
+    cells = "".join(
+        f'<td style="padding:4px 10px;border:1px solid #444;white-space:nowrap;">'
+        f'<span style="font-size:10px;color:#aaa;">{k}</span><br>'
+        f'<b style="font-size:13px;">{v}</b></td>'
+        for k,v in items
+    )
+    html = (
+        '<div style="overflow-x:auto;margin-bottom:8px;">'
+        f'<table style="border-collapse:collapse;width:100%;"><tr>{cells}</tr></table>'
+        '</div>'
+    )
+    st.markdown(html, unsafe_allow_html=True)
 # ── SESSION STATE ─────────────────────────────────────────────────────────────
 for _k,_v in {"live_active":False,"live_trades":[],"live_position":None,"live_tick":0,
                "opt_applied":None,"opt_results":None,"opt_res_meta":None,"opt_df":None,
@@ -1155,6 +1282,13 @@ if _oa_cur and _oa_hash_new != st.session_state.get("_oa_hash_prev",""):
         "Volume Price Trend (VPT)":{"vpt_ema_period":"sb_vp"},
         "RSI Divergence":          {"period":"sb_rp2","lookback":"sb_lb"},
         "Price Threshold Cross":   {"threshold":"sb_thresh"},
+        # ── New strategies ────────────────────────────────────────
+        "Elliott Wave (Simplified)":{"swing_lookback_ew":"sb_ewlb","min_wave_pct":"sb_ewpct"},
+        "HV Percentile (IV Proxy)": {"hv_period":"sb_hvp","ob_pct":"sb_hvob","os_pct":"sb_hvos"},
+        "SMC Order Blocks":         {"ob_lookback":"sb_smcob","fvg_min_pct":"sb_smcfvg"},
+        "Price Action Patterns":    {"pin_bar_ratio":"sb_pbr","engulf_pct":"sb_epct"},
+        "Breakout Strategy":        {"lookback":"sb_bklb","break_pct":"sb_bkpct","vol_mult":"sb_bkvol"},
+        "Support & Resistance + EMA":{"sr_lookback":"sb_srlb","ema_period":"sb_srema","touch_pct":"sb_srtp"},
     }
     _st = _oa_cur.get("strategy","")
     for pname, wkey in _PKMAP.get(_st,{}).items():
@@ -1720,7 +1854,7 @@ with tab_opt:
         opt_sym=oc1.text_input("Custom Ticker","RELIANCE.NS",key="opt_csym").strip() if opt_t=="Custom" else TICKER_MAP[opt_t]
         opt_iv=oc1.selectbox("Timeframe",TIMEFRAMES,index=4,key="opt_iv")
         opt_pd=oc2.selectbox("Period",PERIODS,index=5,key="opt_pd")
-        opt_st=oc2.selectbox("Strategy",[s for s in STRATEGIES if s in PARAM_GRIDS],key="opt_strat")
+        opt_st=oc2.selectbox("Strategy", STRATEGIES, key="opt_strat")
         opt_acc=oc3.slider("Desired Accuracy (%)",40,99,60,key="opt_acc")
         opt_pts=oc3.number_input("Min Total Pts Won",0.,1e6,0.,step=10.,key="opt_pts")
         opt_mt=int(oc3.number_input("Min Trades",1,50,3,step=1,key="opt_mt"))
