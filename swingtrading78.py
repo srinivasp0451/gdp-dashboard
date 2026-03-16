@@ -1809,7 +1809,8 @@ with st.sidebar:
     dhan_enabled=st.checkbox("Enable Dhan Broker",value=False,key="dhan_enabled")
     if dhan_enabled:
         dhan_client=st.text_input("Client ID","1104779876",key="dhan_client")
-        dhan_token =st.text_input("Access Token",value="eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzUxMiJ9.eyJpc3MiOiJkaGFuIiwicGFydG5lcklkIjoiIiwiZXhwIjoxNzczNzE5NTM0LCJpYXQiOjE3NzM2MzMxMzQsInRva2VuQ29uc3VtZXJUeXBlIjoiU0VMRiIsIndlYmhvb2tVcmwiOiIiLCJkaGFuQ2xpZW50SWQiOiIxMTA0Nzc5ODc2In0.fqZhkfd_RYDSwhxyNbuQ-WpB8x_25lLmdggsZGPcELD_wknrmNrhPrLUXkU5kIFC8UtqeAK15hJKh9Xr5QAC6g",key="dhan_token",type="password")
+        _DEFAULT_TOKEN = ("eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzUxMiJ9.eyJpc3MiOiJkaGFuIiwicGFydG5lcklkIjoiIiwiZXhwIjoxNzczNzE5NTM0LCJpYXQiOjE3NzM2MzMxMzQsInRva2VuQ29uc3VtZXJUeXBlIjoiU0VMRiJ9")
+        dhan_token =st.text_input("Access Token",_DEFAULT_TOKEN,key="dhan_token",type="password")
         st.caption("**Order type — always BUYER (never seller in options)**")
         is_stocks=st.checkbox("Stocks / Intraday mode  (uncheck = Options CE/PE buyer)",value=False,key="dhan_is_stocks")
         if is_stocks:
@@ -2254,11 +2255,19 @@ with tab_live:
                         _sid=dhan_ce_sid if direction==1 else dhan_pe_sid
                         _opt="CE" if direction==1 else "PE"
                         if not _sid: st.warning(f"Dhan {_acc_label}: {_opt} Security ID not set."); continue
-                        _exch={"NSE.FNO":_d.NSE_FNO,"BSE.FNO":_d.BSE_FNO}.get(dhan_o_exch,_d.NSE_FNO)
-                        _d.place_order(security_id=_sid,exchange_segment=_exch,
-                            transaction_type=_d.BUY,quantity=int(dhan_o_qty),
-                            order_type=_ot,product_type=_d.INTRADAY,price=_lp)
-                        st.info(f"Dhan {_acc_label} ({dhan_entry_ot}): BUY {dhan_o_qty}x {_opt}")
+                        # Options: always use NSE_OPT (not NSE_FNO) per Dhan API
+                        _exch = _d.NSE_OPT if "NSE" in dhan_o_exch else _d.BSE_OPT if hasattr(_d,"BSE_OPT") else _d.NSE_OPT
+                        _d.place_order(
+                            security_id      = _sid,
+                            exchange_segment = _exch,
+                            transaction_type = _d.BUY,
+                            quantity         = int(dhan_o_qty),
+                            order_type       = _ot,
+                            product_type     = _d.INTRA,
+                            price            = _lp,
+                            trigger_price    = 0,
+                        )
+                        st.info(f"Dhan {_acc_label} ({dhan_entry_ot}): BUY {dhan_o_qty}x {_opt} sid={_sid} NSE_OPT")
                 except ImportError: st.error("pip install dhanhq"); break
                 except Exception as ex: st.error(f"Dhan {_acc_label} order error: {ex}")
 
@@ -2290,11 +2299,18 @@ with tab_live:
                     _sid=dhan_ce_sid if direction==1 else dhan_pe_sid
                     _opt="CE" if direction==1 else "PE"
                     if not _sid: return
-                    _exch={"NSE.FNO":_d.NSE_FNO,"BSE.FNO":_d.BSE_FNO}.get(dhan_o_exch,_d.NSE_FNO)
-                    _d.place_order(security_id=_sid,exchange_segment=_exch,
-                        transaction_type=_d.SELL,quantity=int(dhan_o_qty),
-                        order_type=_ot,product_type=_d.INTRADAY,price=_lp)
-                    st.info(f"Dhan ({dhan_exit_ot}): SELL {dhan_o_qty}x {_opt} (exit)")
+                    _exch = _d.NSE_OPT if "NSE" in dhan_o_exch else _d.BSE_OPT if hasattr(_d,"BSE_OPT") else _d.NSE_OPT
+                    _d.place_order(
+                        security_id      = _sid,
+                        exchange_segment = _exch,
+                        transaction_type = _d.SELL,
+                        quantity         = int(dhan_o_qty),
+                        order_type       = _ot,
+                        product_type     = _d.INTRA,
+                        price            = _lp,
+                        trigger_price    = 0,
+                    )
+                    st.info(f"Dhan ({dhan_exit_ot}): SELL {dhan_o_qty}x {_opt} (exit) NSE_OPT")
             except Exception as ex: st.error(f"Dhan exit error: {ex}")
 
         # ── Position management ──────────────────────────────────────────────
@@ -3115,18 +3131,15 @@ with tab_opt:
             # Highlight rows that meet criteria (background on ✓ Meets col only)
             def _hl_meets(v): return "background-color:#0d3b0d;color:white" if v=="✅" else ""
 
-            st.markdown("#### 📊 All Results (sorted by accuracy) — ☑ check a row then click Apply")
-            # Use a unique key that does NOT include the button click so it persists
+            st.markdown("#### 📊 All Results (sorted by accuracy)")
             edited=st.data_editor(
                 res_df,
-                column_config={c: st.column_config.Column(disabled=True)
-                               for c in res_df.columns},
+                column_config={c: st.column_config.Column(disabled=True) for c in res_df.columns},
                 hide_index=True, use_container_width=True, height=450,
                 key="opt_editor",
-                # We manage selection via a separate checkboxes approach below
             )
 
-            # ── Row selection via separate checkbox list (stable across reruns) ──
+            # ── Row selection ─────────────────────────────────────────────────
             st.markdown("**Select a row to apply:**")
             sel_idx = st.selectbox(
                 "Choose result row # (0 = best)",
@@ -3135,23 +3148,36 @@ with tab_opt:
                     f"Row {i} | Acc={opt_res[i].get('Accuracy (%)','?')}% | "
                     f"PnL={opt_res[i].get('Total PnL','?')} | "
                     f"Trades={opt_res[i].get('Total Trades','?')} | "
-                    f"Params={dict(list(opt_res[i]['params'].items())[:3])} {'✅' if opt_res[i].get('Meets_Accuracy') else ''}"
+                    f"Params={dict(list(opt_res[i]['params'].items())[:3])} "
+                    f"{'✅' if opt_res[i].get('Meets_Accuracy') else ''}"
                 ),
                 key="opt_sel_idx",
             )
 
             sel_result = opt_res[sel_idx]
-            # Show selected row details
+            # ── Selected row detail (original format restored) ────────────────
             with st.expander(f"📌 Selected Row {sel_idx} — details", expanded=True):
-                sc=st.columns(4)
-                sc[0].metric("Accuracy", f"{sel_result.get('Accuracy (%)','?')}%")
-                sc[1].metric("Total PnL", sel_result.get("Total PnL","?"))
-                sc[2].metric("Total Trades", sel_result.get("Total Trades","?"))
-                sc[3].metric("Meets Targets", "✅ Yes" if sel_result.get("Meets_Accuracy") else "— No")
-                param_disp={k:v for k,v in sel_result["params"].items()
-                            if k not in("atr_mult_sl","atr_mult_tgt","rr_ratio","swing_lookback")}
-                st.write("**Parameters:**", param_disp)
+                _dc = st.columns(5)
+                _dc[0].metric("Accuracy",      f"{sel_result.get('Accuracy (%)','?')}%")
+                _dc[1].metric("Total PnL",     sel_result.get("Total PnL","?"))
+                _dc[2].metric("Total Trades",  sel_result.get("Total Trades","?"))
+                _dc[3].metric("Wins",          sel_result.get("Wins","?"))
+                _dc[4].metric("Meets Targets", "✅ Yes" if sel_result.get("Meets_Accuracy") else "— No")
+                # Parameters table
+                _p_disp = {k:v for k,v in sel_result["params"].items()
+                           if k not in("atr_mult_sl","atr_mult_tgt","rr_ratio","swing_lookback")}
+                if _p_disp:
+                    _pc_cols = st.columns(min(len(_p_disp),6))
+                    for _pci,(pk,pv) in enumerate(list(_p_disp.items())[:12]):
+                        _pc_cols[_pci%len(_pc_cols)].metric(pk, pv)
+                # Full stats row
+                _stats_keys = ["Total Pts Won","Total Pts Lost","Avg Win","Avg Loss",
+                               "Max Win","Max Loss","Profit Factor"]
+                _sc2 = st.columns(len([k for k in _stats_keys if k in sel_result]))
+                for _sci,_sk in enumerate([k for k in _stats_keys if k in sel_result]):
+                    _sc2[_sci].metric(_sk, sel_result[_sk])
 
+            # ── Apply button (just adds button, original display unchanged) ───
             if st.button("⚡ Apply Selected Row to Config (Sidebar + Backtest + Live)",
                          type="primary", key="btn_apply_opt"):
                 param_keys = list(PARAM_GRIDS.get(_opt_st, {}).keys())
@@ -3241,31 +3267,39 @@ with tab_opt:
 with tab_nte:
     st.subheader("🎯 Near to Entry — Signal Scanner")
 
-    # ── Helper: apply a ticker+strategy+timeframe to sidebar (and backtest/live) ──
+    # ── Helper: apply a ticker+strategy+timeframe to sidebar via pending state ──
+    # We CANNOT write to g_ticker/g_interval/g_period/g_strategy directly after
+    # their widgets are instantiated — Streamlit raises StreamlitAPIException.
+    # Solution: store in a "pending" dict in session_state; the pre-populate block
+    # (which runs BEFORE widgets are rendered on next rerun) applies it.
     def _nte_apply_to_live(ticker_sym, ticker_label, sig_direction, iv, pd_val, strat=None):
-        """
-        Push a ticker, signal direction, timeframe and period to session state
-        so sidebar, backtesting, and live trading all pick it up immediately.
-        sig_direction: "BUY" or "SELL"
-        """
-        # Determine which TICKER_MAP entry to use, or Custom
-        if ticker_sym in TICKER_MAP.values():
-            _tk_label = [k for k,v in TICKER_MAP.items() if v==ticker_sym][0]
-            st.session_state["g_ticker"] = _tk_label
-        else:
-            st.session_state["g_ticker"] = "Custom"
-            st.session_state["g_custom"] = ticker_sym
-
-        if iv in TIMEFRAMES:   st.session_state["g_interval"] = iv
-        if pd_val in PERIODS:  st.session_state["g_period"]   = pd_val
-
-        # Strategy: use Simple Buy / Simple Sell unless a specific strategy is given
         _apply_strat = strat if strat and strat in STRATEGIES else (
             "Simple Buy" if sig_direction=="BUY" else "Simple Sell"
         )
-        st.session_state["g_strategy"] = _apply_strat
+        # Resolve instrument label
+        if ticker_sym in TICKER_MAP.values():
+            _tk_label = [k for k,v in TICKER_MAP.items() if v==ticker_sym][0]
+            _custom   = ""
+        else:
+            _tk_label = "Custom"
+            _custom   = ticker_sym
 
-        # Store a human-readable confirmation
+        # Store as opt_applied so the existing pre-populate block handles it
+        st.session_state["opt_applied"] = {
+            "strategy":   _apply_strat,
+            "instrument": _tk_label,
+            "custom_sym": _custom,
+            "interval":   iv if iv in TIMEFRAMES else "1h",
+            "period":     pd_val if pd_val in PERIODS else "1mo",
+            "sl_type":    SL_TYPES[0],
+            "sl_pts":     10.0,
+            "tgt_type":   TARGET_TYPES[0],
+            "tgt_pts":    20.0,
+            "params":     {**_STRATEGY_DEFAULTS.get(_apply_strat,{}), **_BP},
+            "accuracy":   "—",
+            "pnl":        "—",
+        }
+        st.session_state["_oa_hash_prev"] = ""   # force pre-populate to fire
         st.session_state["nte_applied_msg"] = (
             f"✅ Applied: **{ticker_sym}** | Signal: **{sig_direction}** | "
             f"Strategy: **{_apply_strat}** | TF: **{iv}** | Period: **{pd_val}** → "
@@ -3277,7 +3311,9 @@ with tab_nte:
         st.success(st.session_state["nte_applied_msg"])
 
     # ── Sub-tabs: Scanner | Quick Search ──────────────────────────────────────
-    nte_scan_tab, nte_quick_tab = st.tabs(["🔍 Strategy Scanner", "⚡ Quick Signal Search"])
+    nte_scan_tab, nte_quick_tab, nte_ew_tab = st.tabs([
+        "🔍 Strategy Scanner", "⚡ Quick Signal Search", "🌊 Elliott Wave Monitor"
+    ])
 
     # ══════════════════════════════════════════════════════════════════════════
     # SUB-TAB 1: Strategy Scanner (existing scanner with Apply buttons)
@@ -3698,3 +3734,173 @@ with tab_nte:
                         "Try a different strategy or increase the lookback slider.")
         else:
             st.info("Select tickers above and click ⚡ Quick Scan All Timeframes.")
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # SUB-TAB 3: Elliott Wave Monitor — continuous EW signal scanner
+    # ══════════════════════════════════════════════════════════════════════════
+    with nte_ew_tab:
+        st.markdown(
+            "**Continuously monitor Elliott Wave signals across selected tickers.** "
+            "Shows exact wave stage, progress toward next signal, and fires an Apply button "
+            "the moment a pattern completes. No need to watch manually — run this tab and "
+            "it tells you exactly which stock is closest to an EW entry."
+        )
+
+        _ew_c1, _ew_c2, _ew_c3 = st.columns(3)
+        _ew_universe = _ew_c1.selectbox(
+            "Universe",
+            ["All Nifty 50 Stocks","Custom Tickers"] + list(TICKER_MAP.keys()),
+            key="ewm_universe"
+        )
+        if _ew_universe == "Custom Tickers":
+            _ew_raw = _ew_c1.text_area("Tickers (one per line)",
+                                        "RELIANCE.NS\nINFY.NS\nHDFCBANK.NS",
+                                        key="ewm_tickers", height=80)
+            _ew_symbols = [s.strip() for s in _ew_raw.splitlines() if s.strip()]
+        elif _ew_universe == "All Nifty 50 Stocks":
+            _ew_symbols = NIFTY50_SYMBOLS
+            _ew_c1.caption(f"{len(_ew_symbols)} stocks")
+        else:
+            _ew_symbols = [TICKER_MAP[_ew_universe]]
+
+        _ew_iv  = _ew_c2.selectbox("Timeframe", TIMEFRAMES, index=4, key="ewm_iv")
+        _ew_pd  = _ew_c2.selectbox("Period",    PERIODS,    index=4, key="ewm_pd")
+        _ew_mwp = _ew_c2.slider("Min Wave % (pivot threshold)", 0.2, 5.0, 1.0, step=0.1, key="ewm_mwp")
+        _ew_show_all = _ew_c3.checkbox("Show all tickers (not just signals)", value=False, key="ewm_show_all")
+
+        if st.button("🌊 Scan Elliott Waves", type="primary", key="btn_ew_scan"):
+            _ew_results = []
+            _ew_prog = st.progress(0); _ew_stat = st.empty()
+            _ew_total = len(_ew_symbols)
+
+            for _ewi, _ewsym in enumerate(_ew_symbols):
+                _ew_stat.caption(f"Scanning EW: {_ewsym} ({_ewi+1}/{_ew_total})…")
+                _ew_prog.progress((_ewi+1)/_ew_total)
+                try:
+                    time.sleep(1.5)
+                    _ewraw = yf.download(_ewsym, period=_ew_pd,
+                                         interval=YF_IV.get(_ew_iv,_ew_iv),
+                                         progress=False, auto_adjust=True)
+                    if _ewraw is None or _ewraw.empty: continue
+                    _ewdf = _flatten(_ewraw)
+                    if _ew_iv=="4h": _ewdf=_r4h(_ewdf)
+                    if len(_ewdf)<20: continue
+
+                    # Run EW diagnostics
+                    _ewd = _ew_diagnostics(_ewdf, min_wave_pct=float(_ew_mwp))
+
+                    # Run signal to check if one fired on last bar
+                    _ew_sigs, _ = sig_elliott_wave(_ewdf, swing_lookback=10, min_wave_pct=float(_ew_mwp))
+                    _ew_last_sig = int(_ew_sigs.iloc[-2]) if len(_ew_sigs)>1 else 0
+                    _ew_close    = float(_ewdf["Close"].iloc[-1])
+
+                    # Progress toward next pivot flip
+                    _prog_pct = min(100, int(_ewd["pivot_flip_pct"]))
+                    _pivot_remaining = _ewd["pct_remaining"]
+
+                    # Categorize: FIRED / VERY CLOSE / CLOSE / BUILDING
+                    if _ew_last_sig != 0:
+                        _ew_status = "🚨 SIGNAL FIRED"
+                        _ew_priority = 0
+                    elif _prog_pct >= 80:
+                        _ew_status = "🔥 VERY CLOSE"
+                        _ew_priority = 1
+                    elif _prog_pct >= 50:
+                        _ew_status = "⚡ APPROACHING"
+                        _ew_priority = 2
+                    else:
+                        _ew_status = "🔨 BUILDING"
+                        _ew_priority = 3
+
+                    _ew_results.append({
+                        "_priority": _ew_priority,
+                        "Ticker":      _ewsym,
+                        "Status":      _ew_status,
+                        "Signal":      "🟢 LONG" if _ew_last_sig==1 else ("🔴 SHORT" if _ew_last_sig==-1 else "—"),
+                        "Pivot Progress": f"{_prog_pct}%",
+                        "Pts to Next Pivot": f"{_pivot_remaining:.2f}%",
+                        "Confirmed Pivots": _ewd["confirmed_pivots"],
+                        "Last Pivot Type": "HIGH ↑" if _ewd["last_confirmed_dir"]==1 else ("LOW ↓" if _ewd["last_confirmed_dir"]==-1 else "—"),
+                        "Last Pivot Px": f"{_ewd['last_confirmed_px']:.2f}",
+                        "LTP":         round(_ew_close, 2),
+                        "Move from Last": f"{_ewd['move_from_last_pct']:+.2f}%",
+                        "Retrace %":   f"{_ewd['retrace_pct']:.1f}%" if _ewd["retrace_pct"] else "—",
+                        "Last Fired":  _ewd["last_signal"] or "None",
+                        "Bar Time":    to_ist(_ewdf.index[-1]),
+                        "_sig_dir":    "BUY" if _ew_last_sig==1 else ("SELL" if _ew_last_sig==-1 else
+                                       "BUY" if _ewd["last_confirmed_dir"]==-1 else "SELL"),
+                    })
+                except Exception as _ewex:
+                    pass
+
+            _ew_prog.empty(); _ew_stat.empty()
+
+            # Sort by priority then progress
+            _ew_results.sort(key=lambda r: (r["_priority"], -int(r["Pivot Progress"].rstrip("%"))))
+            st.session_state["ew_scan_results"] = _ew_results
+            st.session_state["ew_scan_meta"]    = {"iv":_ew_iv,"pd":_ew_pd,"mwp":_ew_mwp}
+
+        # ── Display EW scan results ───────────────────────────────────────────
+        _ewr = st.session_state.get("ew_scan_results")
+        _ewm = st.session_state.get("ew_scan_meta",{})
+
+        if _ewr is not None:
+            # Filter if not showing all
+            _ewr_disp = _ewr if _ew_show_all else [r for r in _ewr if r["_priority"]<=2]
+            st.markdown(f"**Scan complete.** {len(_ewr)} tickers. Showing {len(_ewr_disp)} (priority: fired+close+approaching).")
+
+            # Summary counts
+            _ew_s1,_ew_s2,_ew_s3,_ew_s4 = st.columns(4)
+            _ew_s1.metric("🚨 Signal Fired", sum(1 for r in _ewr if r["_priority"]==0))
+            _ew_s2.metric("🔥 Very Close",   sum(1 for r in _ewr if r["_priority"]==1))
+            _ew_s3.metric("⚡ Approaching",  sum(1 for r in _ewr if r["_priority"]==2))
+            _ew_s4.metric("🔨 Building",     sum(1 for r in _ewr if r["_priority"]==3))
+
+            st.markdown("---")
+            for _ewri, _erow in enumerate(_ewr_disp):
+                _prio = _erow["_priority"]
+                _bg   = {"0":"#1b5e20","1":"#b71c1c","2":"#e65100","3":""}
+                _ec1,_ec2,_ec3,_ec4,_ec5,_ec6,_ec7,_ec8 = st.columns([1.5,1,1,1,1,1,1,1.8])
+                _ec1.markdown(f"**{_erow['Ticker']}**")
+                _ec2.markdown(f"{_erow['Status']}")
+                _ec3.markdown(f"{_erow.get('Signal','—')}")
+                _ec4.markdown(f"Progress: **{_erow['Pivot Progress']}**")
+                _ec5.markdown(f"Pivots: {_erow['Confirmed Pivots']}")
+                _ec6.markdown(f"LTP: {_erow['LTP']}")
+                _ec7.markdown(f"Move: {_erow['Move from Last']}")
+
+                _ewsig_dir = _erow["_sig_dir"]
+                if _ec8.button(
+                    f"{'🟢 Apply BUY' if _ewsig_dir=='BUY' else '🔴 Apply SELL'} → Live",
+                    key=f"ew_apply_{_ewri}_{_erow['Ticker']}",
+                    type="primary" if _prio<=1 else "secondary",
+                ):
+                    _nte_apply_to_live(
+                        ticker_sym  = _erow["Ticker"],
+                        ticker_label= _erow["Ticker"],
+                        sig_direction= _ewsig_dir,
+                        iv          = _ewm.get("iv","1h"),
+                        pd_val      = _ewm.get("pd","3mo"),
+                        strat       = "Elliott Wave (Simplified)",
+                    )
+                    st.rerun()
+
+                # Expandable detail row
+                if _prio <= 1:
+                    with st.expander(f"📊 {_erow['Ticker']} — full wave detail", expanded=(_ewri==0 and _prio==0)):
+                        _ed1,_ed2,_ed3,_ed4 = st.columns(4)
+                        _ed1.metric("Last Pivot",   f"{_erow['Last Pivot Type']} @ {_erow['Last Pivot Px']}")
+                        _ed2.metric("Retrace",      _erow["Retrace %"])
+                        _ed3.metric("Last Signal",  _erow["Last Fired"])
+                        _ed4.metric("Bar Time",     _erow["Bar Time"][:16])
+                        _prog_int = int(_erow["Pivot Progress"].rstrip("%"))
+                        _bar = "█"*int(_prog_int/5) + "░"*(20-int(_prog_int/5))
+                        st.markdown(f"**Pivot confirmation:** `[{_bar}]` {_prog_int}% — "
+                                    f"need **{_erow['Pts to Next Pivot']}** more move")
+            if not _ewr_disp:
+                st.info("No tickers in fired/approaching state. All waves are still in early building phase. "
+                        "Enable 'Show all tickers' to see the full list.")
+        else:
+            st.info("Click 🌊 Scan Elliott Waves to start monitoring. "
+                    "Re-run periodically (every few minutes) to catch new signals. "
+                    "Tickers with 🚨 SIGNAL FIRED or 🔥 VERY CLOSE (>80%) are the ones to watch immediately.")
