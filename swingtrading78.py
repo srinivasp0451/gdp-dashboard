@@ -2103,125 +2103,420 @@ with tab_live:
         st.plotly_chart(plot_ohlc(lv_df,indics=lv_indics,title=f"LIVE:{t_choice}({interval}) Tick#{tick}"),use_container_width=True,key=f"lv_ohlc_{tick}")
 
         # ── Signal Progress Expander ─────────────────────────────────────────────
-        # Shows current indicator values, where they are vs signal trigger,
-        # and an estimate of how close we are to firing a signal.
-        with st.expander("📊 Signal Progress — How close is the next signal?", expanded=False):
+        with st.expander("📊 Signal Progress — Current indicator state & distance to signal", expanded=False):
             st.caption(
-                "No need to watch the screen all day. This panel shows the **current state** of "
-                "every indicator and how far it is from triggering a signal. "
-                "Refresh rate = your tick interval (currently every 2s with fragment)."
+                "Shows **every indicator** for the selected strategy with current values, "
+                "direction of movement, and distance to the next signal trigger. "
+                "Updated every tick — no need to watch the screen all day."
             )
+
+            # ── Helper: safely get last 2 values from a Series ───────────────
+            def _last2(ser):
+                """Return (current, previous) floats from a Series. None if unavailable."""
+                try:
+                    clean = ser.dropna()
+                    if len(clean) == 0: return None, None
+                    cur  = float(clean.iloc[-1])
+                    prev = float(clean.iloc[-2]) if len(clean) > 1 else cur
+                    return cur, prev
+                except:
+                    return None, None
+
+            def _trend_arrow(cur, prev):
+                if cur is None or prev is None: return "—"
+                if cur > prev:  return "rising ↗"
+                if cur < prev:  return "falling ↘"
+                return "flat →"
+
+            def _est_bars(gap, delta, label="crossover"):
+                """Rough estimate of bars until gap closes."""
+                if delta is None or delta == 0 or gap is None: return "—"
+                if gap <= 0: return "Signal may fire now"
+                bars = abs(gap) / max(abs(delta), 1e-6)
+                if bars < 1:   return "< 1 bar"
+                if bars < 3:   return f"~{int(bars)+1} bars"
+                if bars < 10:  return f"~{int(bars)} bars"
+                return f"~{int(bars)} bars (distant)"
+
             _sp_items = []
 
-            # ── EMA Crossover ─────────────────────────────────────────────────
-            if "EMA_fast" in lv_indics and "EMA_slow" in lv_indics:
-                _fe = float(lv_indics["EMA_fast"].dropna().iloc[-1]) if len(lv_indics["EMA_fast"].dropna())>0 else None
-                _se = float(lv_indics["EMA_slow"].dropna().iloc[-1]) if len(lv_indics["EMA_slow"].dropna())>0 else None
-                if _fe and _se:
-                    _gap = _fe - _se
-                    _gap_pct = abs(_gap) / max(abs(_se),0.01) * 100
-                    _prev_fe = float(lv_indics["EMA_fast"].dropna().iloc[-2]) if len(lv_indics["EMA_fast"].dropna())>1 else _fe
-                    _prev_se = float(lv_indics["EMA_slow"].dropna().iloc[-2]) if len(lv_indics["EMA_slow"].dropna())>1 else _se
-                    _prev_gap = _prev_fe - _prev_se
-                    _narrowing = abs(_gap) < abs(_prev_gap)
-                    _dir = "Fast ABOVE Slow → LONG bias" if _gap>0 else "Fast BELOW Slow → SHORT bias"
-                    _action = "approaching crossover ⚡" if _narrowing else "diverging"
-                    _sp_items.append({
-                        "Indicator": f"EMA Fast({live_params.get('fast',9)})",
-                        "Value": f"{_fe:.2f}",
-                        "Reference": f"EMA Slow({live_params.get('slow',15)}) = {_se:.2f}",
-                        "Gap": f"{_gap:+.2f} ({_gap_pct:.2f}%)",
-                        "Status": _dir,
-                        "Trend": f"{'🔽 narrowing' if _narrowing else '🔼 widening'} → {_action}",
-                        "Est. Bars": "< 3 bars" if _gap_pct < 0.5 else (f"~{int(_gap_pct/max(abs(_gap-_prev_gap),0.001))} bars" if _narrowing and abs(_gap-_prev_gap)>0 else "—"),
-                    })
+            # ════════════════════════════════════════════════════════════════
+            # STRATEGY-SPECIFIC SMART ANALYSIS
+            # Each block computes signal distance for the indicators it knows
+            # ════════════════════════════════════════════════════════════════
 
-            # ── RSI ────────────────────────────────────────────────────────────
+            _handled_keys = set()  # track which indic keys got smart treatment
+
+            # ── EMA pairs (crossover strategies) ─────────────────────────────
+            _ema_pairs = [
+                ("EMA_fast","EMA_slow","fast","slow"),
+                ("EMA_trend","EMA_entry","trend_ema","entry_ema"),
+                ("EMA_fast","EMA_mid","f","m"),
+                ("EMA_mid","EMA_slow","m","s_"),
+            ]
+            for _ek1, _ek2, _pk1, _pk2 in _ema_pairs:
+                if _ek1 in lv_indics and _ek2 in lv_indics:
+                    _v1,_p1 = _last2(lv_indics[_ek1])
+                    _v2,_p2 = _last2(lv_indics[_ek2])
+                    if _v1 and _v2:
+                        _gap      = _v1 - _v2
+                        _prev_gap = (_p1 - _p2) if _p1 and _p2 else _gap
+                        _delta    = abs(_gap) - abs(_prev_gap)   # negative = narrowing
+                        _narrowing= abs(_gap) < abs(_prev_gap)
+                        _n1 = live_params.get(_pk1, _ek1)
+                        _n2 = live_params.get(_pk2, _ek2)
+                        _sp_items.append({
+                            "Indicator":  f"{_ek1}({_n1})",
+                            "Value":      f"{_v1:.4f}",
+                            "vs":         f"{_ek2}({_n2}) = {_v2:.4f}",
+                            "Gap":        f"{_gap:+.4f} ({abs(_gap)/max(abs(_v2),0.001)*100:.2f}%)",
+                            "Direction":  "Fast > Slow (LONG side)" if _gap>0 else "Fast < Slow (SHORT side)",
+                            "Momentum":   ("narrowing ↘ — crossover approaching!" if _narrowing else "widening ↗"),
+                            "Est. Bars":  _est_bars(abs(_gap), abs(_delta)/max(1,abs(_prev_gap))*abs(_gap), "crossover") if _narrowing else "—",
+                            "Signal":     "🟢 LONG imminent" if (_narrowing and _gap<0.5) else ("🔴 SHORT imminent" if (_narrowing and _gap>-0.5) else "Monitoring"),
+                        })
+                        _handled_keys.update({_ek1, _ek2})
+
+            # Single EMA (trend reference vs price) ───────────────────────────
+            for _ek in ["EMA","EMA_20","EMA_50"]:
+                if _ek in lv_indics and _ek not in _handled_keys:
+                    _v,_pv = _last2(lv_indics[_ek])
+                    if _v:
+                        _dist = cl - _v
+                        _sp_items.append({
+                            "Indicator":  f"{_ek}({live_params.get('ema_period',live_params.get('trend_ema',20))})",
+                            "Value":      f"{_v:.4f}",
+                            "vs":         f"LTP = {cl:.4f}",
+                            "Gap":        f"{_dist:+.4f} ({abs(_dist)/cl*100:.2f}%)",
+                            "Direction":  "Price above EMA (bullish)" if _dist>0 else "Price below EMA (bearish)",
+                            "Momentum":   _trend_arrow(_v,_pv),
+                            "Est. Bars":  "—",
+                            "Signal":     "🟢 Bullish" if _dist>0 else "🔴 Bearish",
+                        })
+                        _handled_keys.add(_ek)
+
+            # ── RSI ───────────────────────────────────────────────────────────
             if "RSI" in lv_indics:
-                _rv = float(lv_indics["RSI"].dropna().iloc[-1]) if len(lv_indics["RSI"].dropna())>0 else None
-                if _rv:
-                    _ob = live_params.get("ob",70); _os = live_params.get("os_",30)
-                    _to_ob = _ob - _rv; _to_os = _rv - _os
-                    _prev_rv = float(lv_indics["RSI"].dropna().iloc[-2]) if len(lv_indics["RSI"].dropna())>1 else _rv
-                    _rv_dir = "rising ↗" if _rv > _prev_rv else "falling ↘"
-                    if _rv < _os:
-                        _status = f"🟢 OVERSOLD — BUY signal may have already fired"
-                    elif _rv > _ob:
-                        _status = f"🔴 OVERBOUGHT — SELL signal may have already fired"
-                    elif _to_ob < 10:
-                        _status = f"⚠️ Near Overbought ({_rv:.1f} vs {_ob}) — SELL approaching"
-                    elif _to_os < 10:
-                        _status = f"⚠️ Near Oversold ({_rv:.1f} vs {_os}) — BUY approaching"
-                    else:
-                        _status = f"Neutral ({_rv:.1f}), {_rv_dir}"
+                _rv, _rpv = _last2(lv_indics["RSI"])
+                if _rv is not None:
+                    _ob  = live_params.get("ob",   live_params.get("rsi_ob",   70))
+                    _os  = live_params.get("os_",  live_params.get("rsi_os",   30))
+                    _bull_min = live_params.get("rsi_bull_min", _os)
+                    _bull_max = live_params.get("rsi_bull_max", _ob)
+                    _to_ob = _ob - _rv;  _to_os = _rv - _os
+                    _delta_rv = (_rv - _rpv) if _rpv else 0
+                    if _rv <= _os:         _sig = "🟢 OVERSOLD — BUY signal triggered"
+                    elif _rv >= _ob:       _sig = "🔴 OVERBOUGHT — SELL signal triggered"
+                    elif _to_ob < 8:       _sig = f"⚠️ Approaching Overbought ({_rv:.1f}/{_ob}) — SELL soon"
+                    elif _to_os < 8:       _sig = f"⚠️ Approaching Oversold ({_rv:.1f}/{_os}) — BUY soon"
+                    elif _bull_min <= _rv <= _bull_max:
+                        _sig = f"In Bull zone ({_bull_min}-{_bull_max}) — valid for LONG entry"
+                    else:                  _sig = f"Neutral ({_rv:.1f})"
                     _sp_items.append({
-                        "Indicator": f"RSI({live_params.get('period',14)})",
-                        "Value": f"{_rv:.2f}",
-                        "Reference": f"OB={_ob} / OS={_os}",
-                        "Gap": f"{_to_ob:+.1f} to OB | {_to_os:+.1f} to OS",
-                        "Status": _status,
-                        "Trend": _rv_dir,
-                        "Est. Bars": f"~{max(1,int(_to_ob/max(abs(_rv-_prev_rv),0.5)))} bars to OB" if _rv>50 and _rv<_ob else "—",
+                        "Indicator":  f"RSI({live_params.get('period',live_params.get('rsi_period',14))})",
+                        "Value":      f"{_rv:.2f}",
+                        "vs":         f"OB={_ob} | OS={_os}",
+                        "Gap":        f"{_to_ob:+.1f} to OB  |  {_to_os:+.1f} to OS",
+                        "Direction":  _trend_arrow(_rv,_rpv),
+                        "Momentum":   f"Change: {_delta_rv:+.2f}/bar",
+                        "Est. Bars":  _est_bars(min(abs(_to_ob),abs(_to_os)), abs(_delta_rv), "threshold"),
+                        "Signal":     _sig,
                     })
+                    _handled_keys.add("RSI")
 
-            # ── MACD ───────────────────────────────────────────────────────────
+            # RSI_OB / RSI_OS threshold lines (display only)
+            for _rk in ["RSI_OB","RSI_OS"]:
+                if _rk in lv_indics: _handled_keys.add(_rk)
+
+            # ── MACD ──────────────────────────────────────────────────────────
             if "MACD" in lv_indics and "MACD_Signal" in lv_indics:
-                _mv = float(lv_indics["MACD"].dropna().iloc[-1]) if len(lv_indics["MACD"].dropna())>0 else None
-                _msv = float(lv_indics["MACD_Signal"].dropna().iloc[-1]) if len(lv_indics["MACD_Signal"].dropna())>0 else None
+                _mv,_mpv   = _last2(lv_indics["MACD"])
+                _msv,_mspv = _last2(lv_indics["MACD_Signal"])
                 if _mv is not None and _msv is not None:
-                    _hist = _mv - _msv
-                    _prev_mv  = float(lv_indics["MACD"].dropna().iloc[-2]) if len(lv_indics["MACD"].dropna())>1 else _mv
-                    _prev_msv = float(lv_indics["MACD_Signal"].dropna().iloc[-2]) if len(lv_indics["MACD_Signal"].dropna())>1 else _msv
-                    _prev_hist= _prev_mv - _prev_msv
-                    _converging = abs(_hist) < abs(_prev_hist)
+                    _hist      = _mv - _msv
+                    _prev_hist = (_mpv-_mspv) if _mpv and _mspv else _hist
+                    _conv      = abs(_hist) < abs(_prev_hist)
+                    _delta_h   = abs(_hist) - abs(_prev_hist)
                     _sp_items.append({
                         "Indicator": "MACD",
-                        "Value": f"MACD={_mv:.3f} | Signal={_msv:.3f}",
-                        "Reference": "Crossover when histogram = 0",
-                        "Gap": f"Histogram={_hist:+.4f}",
-                        "Status": f"{'🟢 Bullish' if _hist>0 else '🔴 Bearish'} histogram",
-                        "Trend": f"{'converging ↘ (crossover near!)' if _converging else 'diverging'}",
-                        "Est. Bars": "< 2 bars" if abs(_hist) < abs(_prev_hist)*0.2 else "—",
+                        "Value":     f"MACD={_mv:.4f}",
+                        "vs":        f"Signal={_msv:.4f}",
+                        "Gap":       f"Histogram={_hist:+.5f}",
+                        "Direction": "Bullish" if _hist>0 else "Bearish",
+                        "Momentum":  "converging — crossover near! ⚡" if _conv else "diverging",
+                        "Est. Bars": _est_bars(abs(_hist), abs(_delta_h), "crossover") if _conv else "—",
+                        "Signal":    "🟢 MACD above Signal (LONG bias)" if _hist>0 else "🔴 MACD below Signal (SHORT bias)",
                     })
+                    _handled_keys.update({"MACD","MACD_Signal"})
 
-            # ── Supertrend ─────────────────────────────────────────────────────
+            # ── Supertrend ────────────────────────────────────────────────────
             if "Supertrend" in lv_indics:
-                _stv = float(lv_indics["Supertrend"].dropna().iloc[-1]) if len(lv_indics["Supertrend"].dropna())>0 else None
+                _stv,_stpv = _last2(lv_indics["Supertrend"])
                 if _stv:
-                    _dist = cl - _stv
+                    _dist  = cl - _stv
+                    _prev_dist = (cl - _stpv) if _stpv else _dist
+                    _approaching = abs(_dist) < abs(_prev_dist)
                     _sp_items.append({
-                        "Indicator": f"Supertrend",
-                        "Value": f"{_stv:.2f}",
-                        "Reference": f"LTP = {cl:.2f}",
-                        "Gap": f"{_dist:+.2f} ({abs(_dist)/cl*100:.2f}%)",
-                        "Status": f"{'🟢 Bullish (price above)' if _dist>0 else '🔴 Bearish (price below)'}",
-                        "Trend": "Flip imminent!" if abs(_dist)/cl*100 < 0.3 else "Stable",
-                        "Est. Bars": "< 1 bar" if abs(_dist)/cl*100 < 0.15 else "—",
+                        "Indicator": f"Supertrend(p={live_params.get('period',7)},m={live_params.get('multiplier',3.0)})",
+                        "Value":     f"{_stv:.2f}",
+                        "vs":        f"LTP={cl:.2f}",
+                        "Gap":       f"{_dist:+.2f} ({abs(_dist)/cl*100:.2f}%)",
+                        "Direction": "Bullish — price above line" if _dist>0 else "Bearish — price below line",
+                        "Momentum":  "price approaching line — flip possible!" if _approaching else "moving away",
+                        "Est. Bars": "< 2 bars (flip imminent!)" if abs(_dist)/cl*100 < 0.25 else "—",
+                        "Signal":    "🟢 Bullish trend active" if _dist>0 else "🔴 Bearish trend active",
                     })
+                    _handled_keys.add("Supertrend")
 
-            # ── Bollinger Bands ────────────────────────────────────────────────
+            # ── Bollinger Bands ───────────────────────────────────────────────
             if "BB_upper" in lv_indics and "BB_lower" in lv_indics:
-                _bu = float(lv_indics["BB_upper"].dropna().iloc[-1]) if len(lv_indics["BB_upper"].dropna())>0 else None
-                _bl_ = float(lv_indics["BB_lower"].dropna().iloc[-1]) if len(lv_indics["BB_lower"].dropna())>0 else None
-                if _bu and _bl_:
-                    _bw = _bu - _bl_
-                    _to_upper = _bu - cl; _to_lower = cl - _bl_
+                _bu,_bup = _last2(lv_indics["BB_upper"])
+                _bl2,_blp= _last2(lv_indics["BB_lower"])
+                if _bu and _bl2:
+                    _bw = _bu - _bl2
+                    _to_u = _bu - cl;  _to_l = cl - _bl2
+                    _mid_val = (_bu+_bl2)/2
                     _sp_items.append({
-                        "Indicator": f"BB(±{live_params.get('std',2)}σ)",
-                        "Value": f"Upper={_bu:.2f} | Lower={_bl_:.2f}",
-                        "Reference": f"LTP={cl:.2f}, Width={_bw:.2f}",
-                        "Gap": f"{_to_upper:+.2f} to upper | {_to_lower:+.2f} to lower",
-                        "Status": ("🔴 Near upper — SELL zone" if _to_upper/cl*100<0.5
-                                   else "🟢 Near lower — BUY zone" if _to_lower/cl*100<0.5 else "Mid range"),
-                        "Trend": "—","Est. Bars": "—",
+                        "Indicator": f"BB(p={live_params.get('period',20)},σ={live_params.get('std',2)})",
+                        "Value":     f"Upper={_bu:.2f} | Mid={_mid_val:.2f} | Lower={_bl2:.2f}",
+                        "vs":        f"LTP={cl:.2f}, Width={_bw:.2f}",
+                        "Gap":       f"{_to_u:+.2f} to upper | {_to_l:+.2f} to lower",
+                        "Direction": "—",
+                        "Momentum":  f"Band width {'contracting (squeeze)' if _bw<(_bup-_blp if _bup and _blp else _bw)*0.9 else 'expanding'}",
+                        "Est. Bars": "—",
+                        "Signal":    ("🔴 Near upper band — SELL zone" if _to_u/cl*100 < 0.4
+                                      else "🟢 Near lower band — BUY zone" if _to_l/cl*100 < 0.4 else "Mid range — wait"),
                     })
+                    _handled_keys.update({"BB_upper","BB_lower","BB_mid"})
 
+            # ── ADX / DI ──────────────────────────────────────────────────────
+            if "ADX" in lv_indics:
+                _av,_apv = _last2(lv_indics["ADX"])
+                _pdi_v,_ = _last2(lv_indics.get("+DI", pd.Series(dtype=float)))
+                _ndi_v,_ = _last2(lv_indics.get("-DI", pd.Series(dtype=float)))
+                _thresh   = live_params.get("adx_thresh",25)
+                if _av is not None:
+                    _sp_items.append({
+                        "Indicator": f"ADX({live_params.get('period',14)})",
+                        "Value":     f"ADX={_av:.2f}" + (f" | +DI={_pdi_v:.2f} | -DI={_ndi_v:.2f}" if _pdi_v else ""),
+                        "vs":        f"Threshold={_thresh}",
+                        "Gap":       f"{_av-_thresh:+.2f} from threshold",
+                        "Direction": _trend_arrow(_av,_apv),
+                        "Momentum":  f"Trend {'STRONG' if _av>_thresh else 'weak — waiting for ' + str(_thresh)}",
+                        "Est. Bars": _est_bars(_thresh-_av, abs((_av-_apv) if _apv else 0), f"ADX={_thresh}") if _av<_thresh else "—",
+                        "Signal":    ("🟢 Strong bullish (+DI>-DI)" if (_pdi_v and _ndi_v and _pdi_v>_ndi_v and _av>_thresh)
+                                      else "🔴 Strong bearish (-DI>+DI)" if (_pdi_v and _ndi_v and _ndi_v>_pdi_v and _av>_thresh)
+                                      else f"Weak trend (ADX={_av:.1f} < {_thresh})"),
+                    })
+                    _handled_keys.update({"ADX","+DI","-DI"})
+
+            # ── Stochastic ────────────────────────────────────────────────────
+            if "Stoch_K" in lv_indics and "Stoch_D" in lv_indics:
+                _kv,_kpv = _last2(lv_indics["Stoch_K"])
+                _dv,_dpv = _last2(lv_indics["Stoch_D"])
+                _sob = live_params.get("ob",80); _sos = live_params.get("os_",20)
+                if _kv is not None and _dv is not None:
+                    _gap_kd   = _kv - _dv
+                    _prev_gap = (_kpv-_dpv) if _kpv and _dpv else _gap_kd
+                    _conv     = abs(_gap_kd) < abs(_prev_gap)
+                    _sp_items.append({
+                        "Indicator": f"Stoch(%K={live_params.get('k',14)},%D={live_params.get('d',3)})",
+                        "Value":     f"%K={_kv:.2f} | %D={_dv:.2f}",
+                        "vs":        f"OB={_sob} | OS={_sos}",
+                        "Gap":       f"%K−%D={_gap_kd:+.2f}",
+                        "Direction": _trend_arrow(_kv,_kpv),
+                        "Momentum":  "converging — crossover near!" if _conv else "diverging",
+                        "Est. Bars": "< 2 bars" if _conv and abs(_gap_kd)<2 else "—",
+                        "Signal":    ("🟢 Oversold & %K crossing up — BUY soon" if _kv<_sos and _conv and _kv>_dv
+                                      else "🔴 Overbought & %K crossing down — SELL soon" if _kv>_sob and _conv and _kv<_dv
+                                      else f"Neutral (%K={_kv:.1f})"),
+                    })
+                    _handled_keys.update({"Stoch_K","Stoch_D"})
+
+            # ── VWAP ──────────────────────────────────────────────────────────
+            for _vk in ["VWAP","VWAP_hi","VWAP_lo"]:
+                if _vk == "VWAP" and _vk in lv_indics and _vk not in _handled_keys:
+                    _vv,_vpv = _last2(lv_indics["VWAP"])
+                    if _vv:
+                        _vdist = cl - _vv
+                        _vhi = float(lv_indics["VWAP_hi"].dropna().iloc[-1]) if "VWAP_hi" in lv_indics and len(lv_indics["VWAP_hi"].dropna())>0 else None
+                        _vlo = float(lv_indics["VWAP_lo"].dropna().iloc[-1]) if "VWAP_lo" in lv_indics and len(lv_indics["VWAP_lo"].dropna())>0 else None
+                        _sp_items.append({
+                            "Indicator": "VWAP",
+                            "Value":     f"{_vv:.2f}",
+                            "vs":        f"LTP={cl:.2f}" + (f" | Hi={_vhi:.2f} | Lo={_vlo:.2f}" if _vhi else ""),
+                            "Gap":       f"{_vdist:+.2f} ({abs(_vdist)/cl*100:.2f}%)",
+                            "Direction": "Price above VWAP (bullish)" if _vdist>0 else "Price below VWAP (bearish)",
+                            "Momentum":  _trend_arrow(_vv,_vpv),
+                            "Est. Bars": "—",
+                            "Signal":    ("🟢 Above VWAP — buy bias" if _vdist>0 else "🔴 Below VWAP — sell bias"),
+                        })
+                        _handled_keys.update({"VWAP","VWAP_hi","VWAP_lo"})
+
+            # ── Ichimoku ──────────────────────────────────────────────────────
+            if "Tenkan" in lv_indics and "Kijun" in lv_indics:
+                _tv,_tpv = _last2(lv_indics["Tenkan"])
+                _kv,_kpv = _last2(lv_indics["Kijun"])
+                if _tv and _kv:
+                    _gap = _tv - _kv
+                    _sp_items.append({
+                        "Indicator": f"Ichimoku Tenkan({live_params.get('tenkan',9)})/Kijun({live_params.get('kijun',26)})",
+                        "Value":     f"Tenkan={_tv:.2f} | Kijun={_kv:.2f}",
+                        "vs":        f"LTP={cl:.2f}",
+                        "Gap":       f"T−K={_gap:+.2f}",
+                        "Direction": "Bullish (T>K)" if _gap>0 else "Bearish (K>T)",
+                        "Momentum":  _trend_arrow(_tv,_tpv),
+                        "Est. Bars": "—",
+                        "Signal":    "🟢 Price above cloud" if cl>max(_tv,_kv) else "🔴 Price below cloud" if cl<min(_tv,_kv) else "⚠️ Price inside cloud",
+                    })
+                    _handled_keys.update({"Tenkan","Kijun","Senkou_A","Senkou_B"})
+
+            # ── Williams %R ───────────────────────────────────────────────────
+            if "Williams_%R" in lv_indics:
+                _wrv,_wrpv = _last2(lv_indics["Williams_%R"])
+                if _wrv is not None:
+                    _wob = live_params.get("ob",-20); _wos = live_params.get("os_",-80)
+                    _sp_items.append({
+                        "Indicator": f"Williams %R({live_params.get('period',14)})",
+                        "Value":     f"{_wrv:.2f}",
+                        "vs":        f"OB={_wob} | OS={_wos}",
+                        "Gap":       f"{_wrv-_wob:+.1f} to OB | {_wos-_wrv:+.1f} to OS",
+                        "Direction": _trend_arrow(_wrv,_wrpv),
+                        "Momentum":  "—",
+                        "Est. Bars": "—",
+                        "Signal":    ("🟢 Oversold — BUY zone" if _wrv<_wos else "🔴 Overbought — SELL zone" if _wrv>_wob else "Neutral"),
+                    })
+                    _handled_keys.add("Williams_%R")
+
+            # ── HV% (IV Proxy) ────────────────────────────────────────────────
+            if "HV%" in lv_indics:
+                _hvv,_hvpv = _last2(lv_indics["HV%"])
+                _hvraw,_   = _last2(lv_indics.get("HV", pd.Series(dtype=float)))
+                if _hvv is not None:
+                    _ob_pct = live_params.get("ob_pct",80); _os_pct = live_params.get("os_pct",20)
+                    _sp_items.append({
+                        "Indicator": f"HV Percentile({live_params.get('hv_period',20)}-bar)",
+                        "Value":     f"{_hvv:.1f}%" + (f" | HV={_hvraw:.2f}%" if _hvraw else ""),
+                        "vs":        f"High={_ob_pct}% | Low={_os_pct}%",
+                        "Gap":       f"{_hvv-_ob_pct:+.1f}% from high | {_os_pct-_hvv:+.1f}% from low",
+                        "Direction": _trend_arrow(_hvv,_hvpv),
+                        "Momentum":  "—",
+                        "Est. Bars": "—",
+                        "Signal":    (f"🟢 IV Rank LOW ({_hvv:.0f}%) — good to BUY options" if _hvv<_os_pct
+                                      else f"🔴 IV Rank HIGH ({_hvv:.0f}%) — option buying expensive" if _hvv>_ob_pct
+                                      else f"Neutral IV rank ({_hvv:.0f}%)"),
+                    })
+                    _handled_keys.update({"HV%","HV"})
+
+            # ── S&R Levels ────────────────────────────────────────────────────
+            for _sk, _label in [("Support","Support"), ("Resistance","Resistance")]:
+                if _sk in lv_indics and _sk not in _handled_keys:
+                    _sv,_spv = _last2(lv_indics[_sk])
+                    if _sv:
+                        _dist = cl - _sv if _label=="Support" else _sv - cl
+                        _sp_items.append({
+                            "Indicator": f"{_label}(p={live_params.get('sr_lookback',20)})",
+                            "Value":     f"{_sv:.2f}",
+                            "vs":        f"LTP={cl:.2f}",
+                            "Gap":       f"{_dist:+.2f} ({abs(_dist)/cl*100:.2f}%)",
+                            "Direction": _trend_arrow(_sv,_spv),
+                            "Momentum":  "—",
+                            "Est. Bars": "—",
+                            "Signal":    (f"⚠️ Price near {_label}!" if abs(_dist)/cl*100 < 0.5 else f"Away from {_label}"),
+                        })
+                        _handled_keys.add(_sk)
+
+            # ── Donchian / Breakout levels ─────────────────────────────────────
+            for _dk, _label2 in [("Don_upper","Donchian Upper"),("Don_lower","Donchian Lower"),
+                                   ("Breakout_Hi","Breakout High"),("Breakout_Lo","Breakout Low"),
+                                   ("OR_Hi","ORB High"),("OR_Lo","ORB Low")]:
+                if _dk in lv_indics and _dk not in _handled_keys:
+                    _dv,_ = _last2(lv_indics[_dk])
+                    if _dv:
+                        _dist_d = _dv - cl if "upper" in _dk.lower() or "hi" in _dk.lower() or "High" in _label2 else cl - _dv
+                        _sp_items.append({
+                            "Indicator": f"{_label2}(p={live_params.get('period',live_params.get('lookback',20))})",
+                            "Value":     f"{_dv:.2f}",
+                            "vs":        f"LTP={cl:.2f}",
+                            "Gap":       f"{_dist_d:+.2f} ({abs(_dist_d)/cl*100:.2f}%)",
+                            "Direction": "—",
+                            "Momentum":  "—",
+                            "Est. Bars": "—",
+                            "Signal":    "⚡ Price at breakout level!" if abs(_dist_d)/cl*100 < 0.3 else f"{abs(_dist_d)/cl*100:.2f}% away",
+                        })
+                        _handled_keys.add(_dk)
+
+            # ════════════════════════════════════════════════════════════════
+            # GENERIC FALLBACK: show any remaining indicator not yet handled
+            # ════════════════════════════════════════════════════════════════
+            for _ik, _iser in lv_indics.items():
+                if _ik in _handled_keys:
+                    continue
+                if not isinstance(_iser, pd.Series):
+                    continue
+                _gv, _gpv = _last2(_iser)
+                if _gv is None:
+                    continue
+                _delta_g = _gv - _gpv if _gpv is not None else 0
+                _sp_items.append({
+                    "Indicator": _ik,
+                    "Value":     f"{_gv:.4f}",
+                    "vs":        f"vs LTP={cl:.4f}",
+                    "Gap":       f"delta={_delta_g:+.4f}/bar",
+                    "Direction": _trend_arrow(_gv, _gpv),
+                    "Momentum":  "—",
+                    "Est. Bars": "—",
+                    "Signal":    "Above price" if _gv > cl else ("Below price" if _gv < cl else "At price"),
+                })
+
+            # ── Strategy parameter summary (always shown) ─────────────────────
+            st.markdown("**Strategy Parameters (active)**")
+            _param_show = {k: v for k, v in live_params.items()
+                           if k not in ("atr_mult_sl","atr_mult_tgt","rr_ratio","swing_lookback",
+                                        "thresh_dir","thresh_action","kshift_n","kshift_k",
+                                        "tgt_pts_for_sl","use_cond2","_cond_list")}
+            if _param_show:
+                _pc = st.columns(min(len(_param_show), 6))
+                for _ci, (k, v) in enumerate(list(_param_show.items())[:12]):
+                    _pc[_ci % len(_pc)].metric(k, v)
+
+            # ── Last signal status ────────────────────────────────────────────
+            st.markdown("**Signal State**")
+            _sc1, _sc2, _sc3 = st.columns(3)
+            _sc1.metric("Last Completed Bar", to_ist(lv_df.index[-1]))
+            _sc2.metric("Current Signal", "🟢 BUY" if last_sig==1 else ("🔴 SELL" if last_sig==-1 else "⚪ FLAT"))
+            # Count bars since last signal
+            _bars_since_sig = 0
+            for _bi in range(len(lv_sigs)-2, max(len(lv_sigs)-20,0)-1, -1):
+                if lv_sigs.iloc[_bi] != 0: break
+                _bars_since_sig += 1
+            _sc3.metric("Bars since last signal", _bars_since_sig if _bars_since_sig < 19 else "20+")
+
+            st.markdown("---")
+
+            # ── Indicator progress table ──────────────────────────────────────
             if _sp_items:
+                st.markdown("**Indicator Progress**")
                 _sp_df = pd.DataFrame(_sp_items)
-                st.dataframe(_sp_df, use_container_width=True, hide_index=True)
+                # Color the Signal column
+                def _sig_cell(v):
+                    if "🟢" in str(v): return "color:#2e7d32;font-weight:bold"
+                    if "🔴" in str(v): return "color:#c62828;font-weight:bold"
+                    if "⚠️" in str(v): return "color:#e65100;font-weight:bold"
+                    if "⚡" in str(v): return "color:#0277bd;font-weight:bold"
+                    return ""
+                st.dataframe(
+                    _sp_df.style.map(_sig_cell, subset=["Signal"]),
+                    use_container_width=True, hide_index=True,
+                )
             else:
-                st.info(f"No indicator progress data available for **{strategy}** yet. "
-                        "Indicators appear after enough data bars are loaded.")
+                # Even if no indicators, show raw price data and strategy name
+                st.info(
+                    f"Strategy **{strategy}** does not produce chartable indicator series "
+                    f"(e.g. pattern-only strategies like Elliott Wave compute patterns internally). "
+                    f"The signal state above shows whether a signal was generated. "
+                    f"Current LTP: **{cl:.2f}** | Last bar: **{to_ist(lv_df.index[-1])}**"
+                )
 
     def _hist_render():
         t_=st.session_state.live_trades
