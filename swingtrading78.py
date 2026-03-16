@@ -1809,7 +1809,7 @@ with st.sidebar:
     dhan_enabled=st.checkbox("Enable Dhan Broker",value=False,key="dhan_enabled")
     if dhan_enabled:
         dhan_client=st.text_input("Client ID","1104779876",key="dhan_client")
-        dhan_token =st.text_input("Access Token",key="dhan_token",type="password", value="eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzUxMiJ9.eyJpc3MiOiJkaGFuIiwicGFydG5lcklkIjoiIiwiZXhwIjoxNzczNzE5NTM0LCJpYXQiOjE3NzM2MzMxMzQsInRva2VuQ29uc3VtZXJUeXBlIjoiU0VMRiIsIndlYmhvb2tVcmwiOiIiLCJkaGFuQ2xpZW50SWQiOiIxMTA0Nzc5ODc2In0.fqZhkfd_RYDSwhxyNbuQ-WpB8x_25lLmdggsZGPcELD_wknrmNrhPrLUXkU5kIFC8UtqeAK15hJKh9Xr5QAC6g")
+        dhan_token =st.text_input("Access Token","",key="dhan_token",type="password")
         st.caption("**Order type — always BUYER (never seller in options)**")
         is_stocks=st.checkbox("Stocks / Intraday mode  (uncheck = Options CE/PE buyer)",value=False,key="dhan_is_stocks")
         if is_stocks:
@@ -2337,12 +2337,23 @@ with tab_live:
             pos["disp_tgt"]=new_t
             if tf: pos["target"]=new_t
             exited=False; exit_px=None; exit_why=None
-            if d==1:
-                if bl_cur<=pos["sl"]:            exited,exit_px,exit_why=True,pos["sl"],"SL Hit"
-                elif tf and bh_cur>=pos["target"]:exited,exit_px,exit_why=True,pos["target"],"Target Hit"
-            else:
-                if bh_cur>=pos["sl"]:            exited,exit_px,exit_why=True,pos["sl"],"SL Hit"
-                elif tf and bl_cur<=pos["target"]:exited,exit_px,exit_why=True,pos["target"],"Target Hit"
+
+            # ── Strategy Signal Exit: exit when strategy fires opposite signal ──
+            # This mirrors the same logic in run_backtest (was missing in live trading)
+            _live_sig_exit = (sl_type in ("EMA Reverse Crossover","Strategy Signal Exit") or
+                              tgt_type in ("Reverse EMA Crossover","Strategy Signal Exit"))
+            if _live_sig_exit:
+                _rev_sig = int(lv_sigs.iloc[-2]) if len(lv_sigs)>1 else 0
+                if _rev_sig != 0 and _rev_sig != d:
+                    exited,exit_px,exit_why = True, cl, "Strategy Signal Exit"
+
+            if not exited:
+                if d==1:
+                    if bl_cur<=pos["sl"]:             exited,exit_px,exit_why=True,pos["sl"],"SL Hit"
+                    elif tf and bh_cur>=pos["target"]:exited,exit_px,exit_why=True,pos["target"],"Target Hit"
+                else:
+                    if bh_cur>=pos["sl"]:             exited,exit_px,exit_why=True,pos["sl"],"SL Hit"
+                    elif tf and bl_cur<=pos["target"]:exited,exit_px,exit_why=True,pos["target"],"Target Hit"
             if not exited and st.session_state.get("time_filter",False) and not _in_window:
                 exited,exit_px,exit_why=True,cl,"Time Window Close"
             if exited:
@@ -2750,10 +2761,24 @@ with tab_live:
 
                 st.markdown("---")
                 st.markdown("### Elliott Wave Live Analysis")
+
+                # ── Key explanation for why live trading hasn't entered ────────
+                st.info(
+                    "**When will live trading enter a position?**\n\n"
+                    "The live engine enters ONLY when a new Elliott Wave signal fires on "
+                    "the **most recently closed bar** (the bar just before the current forming bar). "
+                    "A message like *'SELL signal already fired at pivot C'* means that pattern "
+                    "completed several bars ago — the live system correctly did NOT enter late on "
+                    "a stale signal.\n\n"
+                    "**What to watch for:** When the in-progress swing below reaches "
+                    f"**{_mwp:.2f}% move** and flips to a new pivot, completing a fresh "
+                    "LOW→HIGH→LOW (for LONG) or HIGH→LOW→HIGH (for SHORT) pattern on the most "
+                    "recent bar — that is when live trading will automatically open a position."
+                )
+
                 st.caption(
-                    f"Zigzag pivot detection — a move of **{_mwp:.2f}%** or more "
-                    "qualifies as a wave leg. Signal fires when a 3-pivot A-B-C corrective "
-                    "sequence completes (higher-low for LONG, lower-high for SHORT)."
+                    f"Zigzag pivot detection — a move of **{_mwp:.2f}%** qualifies as a wave leg. "
+                    "Signal fires when a fresh 3-pivot A-B-C corrective sequence completes on the last closed bar."
                 )
 
                 # ── Summary metrics row ──────────────────────────────────────
