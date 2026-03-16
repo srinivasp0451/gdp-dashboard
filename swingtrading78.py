@@ -1809,7 +1809,7 @@ with st.sidebar:
     dhan_enabled=st.checkbox("Enable Dhan Broker",value=False,key="dhan_enabled")
     if dhan_enabled:
         dhan_client=st.text_input("Client ID","1104779876",key="dhan_client")
-        dhan_token =st.text_input("Access Token","",key="dhan_token",type="password", value="eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzUxMiJ9.eyJpc3MiOiJkaGFuIiwicGFydG5lcklkIjoiIiwiZXhwIjoxNzczNzE5NTM0LCJpYXQiOjE3NzM2MzMxMzQsInRva2VuQ29uc3VtZXJUeXBlIjoiU0VMRiIsIndlYmhvb2tVcmwiOiIiLCJkaGFuQ2xpZW50SWQiOiIxMTA0Nzc5ODc2In0.fqZhkfd_RYDSwhxyNbuQ-WpB8x_25lLmdggsZGPcELD_wknrmNrhPrLUXkU5kIFC8UtqeAK15hJKh9Xr5QAC6g")
+        dhan_token =st.text_input("Access Token",key="dhan_token",type="password", value="eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzUxMiJ9.eyJpc3MiOiJkaGFuIiwicGFydG5lcklkIjoiIiwiZXhwIjoxNzczNzE5NTM0LCJpYXQiOjE3NzM2MzMxMzQsInRva2VuQ29uc3VtZXJUeXBlIjoiU0VMRiIsIndlYmhvb2tVcmwiOiIiLCJkaGFuQ2xpZW50SWQiOiIxMTA0Nzc5ODc2In0.fqZhkfd_RYDSwhxyNbuQ-WpB8x_25lLmdggsZGPcELD_wknrmNrhPrLUXkU5kIFC8UtqeAK15hJKh9Xr5QAC6g")
         st.caption("**Order type — always BUYER (never seller in options)**")
         is_stocks=st.checkbox("Stocks / Intraday mode  (uncheck = Options CE/PE buyer)",value=False,key="dhan_is_stocks")
         if is_stocks:
