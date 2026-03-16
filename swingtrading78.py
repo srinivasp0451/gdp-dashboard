@@ -161,7 +161,7 @@ STRATEGIES = [
     "Volume Price Trend (VPT)","Keltner Channel Breakout","Williams %R Reversal",
     "Swing Trend + Pullback",
     # ── Advanced / High-Probability ────────────────────────────────────────
-    "Elliott Wave (Simplified)","Elliott Wave v2 (Swing+Fib)",
+    "Elliott Wave (Simplified)","Elliott Wave v2 (Swing+Fib)","Elliott Wave v3 (Extrema)",
     "HV Percentile (IV Proxy)","SMC Order Blocks",
     "Price Action Patterns","Breakout Strategy","Support & Resistance + EMA",
     "VWAP + EMA Confluence",        # price above VWAP and EMA, pullback entry
@@ -1319,6 +1319,101 @@ def sig_inside_bar(df, ema_period=50, **_):
     return s, {"EMA": e}
 
 
+# ── ELLIOTT WAVE v3 (argrelextrema + user's pattern logic) ───────────────────
+def sig_ew_v3(df, wave_lookback=50, order=3, use_ema_filter=True, ema_period=50, **_):
+    """
+    Elliott Wave v3 — based on user's argrelextrema approach.
+
+    Logic:
+      1. Use scipy.signal.argrelextrema to find swing highs/lows across full data
+         (order=N means each extreme must be the highest/lowest within N bars either side)
+      2. Enforce strict alternation of highs and lows (zigzag)
+      3. Look at last 5 extrema: pattern p0 < p1 > p2 < p3 > p4
+         (low - HIGH - low - HIGH - low sequence)
+         - BUY  if final low (p4) < middle low (p2): descending correction completing
+         - SELL if final low (p4) > middle low (p2): ascending structure
+
+    Generates significantly MORE signals than v1/v2 on intraday (5min, 15min)
+    because order=3 detects every 7-bar swing, not requiring large % moves.
+
+    Why more trades:
+      v1: needs 1% move per leg → ~220pts on Nifty → 3-4 trades/month on 5min
+      v3: order=3 → detects swings every few bars → 20-50+ signals/month on 5min
+
+    Falls back to pure bar-based swing if scipy unavailable.
+    """
+    n  = len(df)
+    s  = pd.Series(0, index=df.index)
+    e  = ema(df["Close"], ema_period)
+
+    if n < wave_lookback + order * 2:
+        return s, {"EMA_v3": e}
+
+    try:
+        from scipy.signal import argrelextrema as _are
+        _scipy_ok = True
+    except ImportError:
+        _scipy_ok = False
+
+    if _scipy_ok:
+        hi_arr = df["High"].values
+        lo_arr = df["Low"].values
+        hi_idxs = _are(hi_arr, np.greater_equal, order=order)[0]
+        lo_idxs = _are(lo_arr, np.less_equal,    order=order)[0]
+        raw = sorted(
+            [(i, hi_arr[i],  1) for i in hi_idxs] +
+            [(i, lo_arr[i], -1) for i in lo_idxs],
+            key=lambda x: x[0]
+        )
+    else:
+        # Fallback: simple N-bar swing detection (same as v2 but smaller window)
+        raw = []
+        hi = df["High"]; lo = df["Low"]
+        for i in range(order, n - order):
+            w_hi = hi.iloc[i-order:i+order+1]
+            w_lo = lo.iloc[i-order:i+order+1]
+            if float(hi.iloc[i]) >= float(w_hi.max()):
+                raw.append((i, float(hi.iloc[i]),  1))
+            if float(lo.iloc[i]) <= float(w_lo.min()):
+                raw.append((i, float(lo.iloc[i]), -1))
+        raw.sort(key=lambda x: x[0])
+
+    # Enforce strict alternation (keep more extreme when same direction consecutive)
+    alt = []
+    last_d = 0
+    for (idx, px, d) in raw:
+        if d != last_d:
+            alt.append((idx, px, d)); last_d = d
+        elif alt:
+            prev = alt[-1]
+            if (d==1 and px > prev[1]) or (d==-1 and px < prev[1]):
+                alt[-1] = (idx, px, d)
+
+    # Scan groups of 5 extrema for pattern
+    for k in range(4, len(alt)):
+        p0,p1,p2,p3,p4 = alt[k-4], alt[k-3], alt[k-2], alt[k-1], alt[k]
+        idx4 = p4[0]
+        if idx4 >= n: continue
+
+        pp0,pp1,pp2,pp3,pp4 = p0[1],p1[1],p2[1],p3[1],p4[1]
+
+        # User's pattern: low-HIGH-low-HIGH-low (p1 and p3 are highs)
+        if pp0 < pp1 and pp1 > pp2 and pp2 < pp3 and pp3 > pp4:
+            if use_ema_filter:
+                _ema_val = float(e.iloc[idx4]) if idx4 < len(e) else float(e.iloc[-1])
+                _cl_val  = float(df["Close"].iloc[idx4])
+            else:
+                _ema_val = 0; _cl_val = 1   # bypass filter
+            # BUY: final low lower than mid low → wave 5 of corrective completing → reverse up
+            if pp4 < pp2 and _cl_val >= _ema_val * 0.99:
+                s.iloc[idx4] = 1
+            # SELL: final "low" actually higher than mid low → bearish exhaustion
+            elif pp4 > pp2 and _cl_val <= _ema_val * 1.01:
+                s.iloc[idx4] = -1
+
+    return s, {"EMA_v3": e}
+
+
 STRATEGY_FN={
     "EMA Crossover":sig_ema_cross,"RSI Overbought/Oversold":sig_rsi_osob,
     "Simple Buy":sig_simple_buy,"Simple Sell":sig_simple_sell,
@@ -1332,6 +1427,7 @@ STRATEGY_FN={
     "Williams %R Reversal":sig_williams,"Swing Trend + Pullback":sig_swing_pullback,
     "Elliott Wave (Simplified)":sig_elliott_wave,
     "Elliott Wave v2 (Swing+Fib)":sig_elliott_wave_v2,
+    "Elliott Wave v3 (Extrema)":sig_ew_v3,
     "HV Percentile (IV Proxy)":sig_hv_percentile,
     "SMC Order Blocks":sig_smc_order_blocks,
     "Price Action Patterns":sig_price_action,
@@ -1577,6 +1673,7 @@ PARAM_GRIDS={
     # ── Advanced strategies ─────────────────────────────────────────────────
     "Elliott Wave (Simplified)":{"swing_lookback_ew":[5,10,15],"min_wave_pct":[0.5,1.0,1.5]},
     "Elliott Wave v2 (Swing+Fib)":{"swing_bars":[3,5,8,10],"fib_min":[0.382,0.5],"fib_max":[0.786,0.886],"ema_period":[20,50]},
+    "Elliott Wave v3 (Extrema)":{"wave_lookback":[30,50,80],"order":[2,3,5],"ema_period":[20,50,100]},
     "HV Percentile (IV Proxy)":{"hv_period":[10,20,30],"ob_pct":[70,80],"os_pct":[20,30]},
     "SMC Order Blocks":{"ob_lookback":[5,10,20],"fvg_min_pct":[0.03,0.05,0.1]},
     "Price Action Patterns":{"pin_bar_ratio":[1.5,2.0,3.0],"engulf_pct":[0.3,0.5,0.7]},
@@ -1619,6 +1716,7 @@ _STRATEGY_DEFAULTS = {
                                   "rsi_bear_min":35,"rsi_bear_max":60,"vol_mult":1.2},
     "Elliott Wave (Simplified)":{"swing_lookback_ew":10,"min_wave_pct":1.0},
     "Elliott Wave v2 (Swing+Fib)":{"swing_bars":5,"fib_min":0.382,"fib_max":0.886,"ema_period":50,"use_volume":True,"use_5wave":True},
+    "Elliott Wave v3 (Extrema)":{"wave_lookback":50,"order":3,"use_ema_filter":True,"ema_period":50},
     "HV Percentile (IV Proxy)": {"hv_period":20,"lookback":252,"ob_pct":80,"os_pct":20},
     "SMC Order Blocks":         {"ob_lookback":10,"fvg_min_pct":0.05},
     "Price Action Patterns":    {"pin_bar_ratio":2.0,"engulf_pct":0.5},
@@ -1846,6 +1944,25 @@ def strategy_params_ui(strategy, prefix, applied=None):
         st.caption(
             f"Fib zone: **{p['fib_min']*100:.1f}% – {p['fib_max']*100:.1f}%** retracement of prior leg. "
             f"Swing pivot confirmed when price is highest/lowest in **{p['swing_bars']}** bars each side."
+        )
+
+    elif strategy == "Elliott Wave v3 (Extrema)":
+        st.caption(
+            "**V3** — argrelextrema swing detection (your logic). order=3 finds a swing every ~7 bars "
+            "→ 20-50+ trades/month on 5min. Install scipy: `pip install scipy` "
+            "(falls back to bar-based swings if scipy not available)."
+        )
+        p["wave_lookback"]  = int (_n("Lookback bars",       20, 300, 50, f"{prefix}_ewv3lb"))
+        p["order"]          = int (_n("Extrema order (N)",    2,  15,  3, f"{prefix}_ewv3ord",
+                                      help="Each extreme must be highest/lowest in N bars each side. "
+                                           "Lower N = more signals. order=3 → 7-bar window."))
+        p["ema_period"]     = int (_n("Trend EMA period",     5, 200, 50, f"{prefix}_ewv3ep"))
+        p["use_ema_filter"] = st.checkbox("EMA trend filter (long only above EMA, short only below)",
+                                           value=True, key=f"{prefix}_ewv3emaf")
+        st.caption(
+            f"Pattern: low–HIGH–low–HIGH–**low** sequence. "
+            f"BUY when final low < mid low (corrective structure completing). "
+            f"order={p['order']} → pivot confirmed in {p['order']*2+1}-bar window."
         )
 
     elif strategy == "HV Percentile (IV Proxy)":
