@@ -438,20 +438,16 @@ def sig_swing_pullback(df,trend_ema=50,entry_ema=9,rsi_period=14,
     return s,{"EMA_trend":te,"EMA_entry":ee,"RSI":r}
 
 # ── ADVANCED STRATEGY: Elliott Wave (Simplified zigzag wave count) ──────────
-def sig_elliott_wave(df, swing_lookback=10, min_wave_pct=1.0, **_):
+def _ew_build_pivots(df, min_wave_pct=1.0):
     """
-    Simplified Elliott Wave: uses zigzag to count alternating waves.
-    BUY  at completion of corrective wave 2/4 in uptrend (retracement of prior up-move).
-    SELL at completion of corrective wave 2/4 in downtrend.
-    min_wave_pct: minimum % move to qualify as a wave leg.
+    Build zigzag pivot list from Close prices.
+    Returns list of (bar_idx, price, direction)  direction: 1=swing-high, -1=swing-low
+    Also returns (last_dir, last_px, last_idx) — the in-progress (unconfirmed) swing.
     """
-    cl = df["Close"]
-    n  = len(cl)
-    s  = pd.Series(0, index=df.index)
+    cl     = df["Close"]
+    n      = len(cl)
     min_mv = min_wave_pct / 100.0
-
-    # Build zigzag pivots
-    pivots = []   # (idx, price, direction)  direction: 1=high -1=low
+    pivots = []
     last_dir = 0
     last_px  = float(cl.iloc[0])
     last_idx = 0
@@ -459,11 +455,11 @@ def sig_elliott_wave(df, swing_lookback=10, min_wave_pct=1.0, **_):
     for i in range(1, n):
         p = float(cl.iloc[i])
         if last_dir == 0:
-            if p > last_px * (1 + min_mv): last_dir = 1
+            if   p > last_px * (1 + min_mv): last_dir = 1
             elif p < last_px * (1 - min_mv): last_dir = -1
         elif last_dir == 1:
             if p < float(cl.iloc[last_idx]) * (1 - min_mv):
-                pivots.append((last_idx, float(cl.iloc[last_idx]),  1))
+                pivots.append((last_idx, float(cl.iloc[last_idx]), 1))
                 last_dir, last_px, last_idx = -1, p, i
             elif p > last_px: last_px, last_idx = p, i
         else:
@@ -472,21 +468,212 @@ def sig_elliott_wave(df, swing_lookback=10, min_wave_pct=1.0, **_):
                 last_dir, last_px, last_idx = 1, p, i
             elif p < last_px: last_px, last_idx = p, i
 
-    # Signal: after 3 pivots (completed A-B-C correction)
-    # If pivot sequence = high→low→high (retrace of downmove) → potential LONG
-    # If pivot sequence = low→high→low (retrace of upmove) → potential SHORT
+    return pivots, (last_dir, last_px, last_idx)
+
+
+def _ew_diagnostics(df, min_wave_pct=1.0):
+    """
+    Returns a dict with rich Elliott Wave diagnostic state for live display:
+      - pivots: full list
+      - confirmed_count: number of confirmed zigzag pivots
+      - last_3: last 3 confirmed pivots (wave labels)
+      - current_wave_dir: direction of in-progress (unconfirmed) swing
+      - current_swing_pct: % move of in-progress swing so far
+      - needed_for_long / needed_for_short: conditions + current values
+      - last_signal_type: LONG / SHORT / None
+      - retrace_pct: how far current pullback has retraced prior leg
+    """
+    cl = df["Close"]
+    n  = len(cl)
+    cur_price = float(cl.iloc[-1])
+    min_mv = min_wave_pct / 100.0
+
+    pivots, (last_dir, last_px, last_idx) = _ew_build_pivots(df, min_wave_pct)
+
+    # Current in-progress swing stats
+    if last_idx < n and last_idx >= 0:
+        swing_start_px = float(cl.iloc[last_idx])
+    else:
+        swing_start_px = cur_price
+
+    current_swing_pct = (cur_price - swing_start_px) / max(abs(swing_start_px), 0.001) * 100
+
+    # In-progress: how far has price moved from last confirmed pivot?
+    if pivots:
+        last_confirmed_px  = pivots[-1][1]
+        last_confirmed_dir = pivots[-1][2]
+        move_from_last     = (cur_price - last_confirmed_px) / max(abs(last_confirmed_px), 0.001) * 100
+        needed_pct         = min_wave_pct
+        pct_done           = abs(move_from_last)
+        pct_remaining      = max(0, needed_pct - pct_done)
+        pivot_flip_pct     = pct_done / max(needed_pct, 0.001) * 100
+    else:
+        last_confirmed_px  = float(cl.iloc[0])
+        last_confirmed_dir = 0
+        move_from_last     = 0.0
+        pct_done           = 0.0
+        pct_remaining      = min_wave_pct
+        pivot_flip_pct     = 0.0
+
+    # Last signal type
+    last_signal = None
+    for k in range(2, len(pivots)):
+        p0, p1, p2 = pivots[k-2], pivots[k-1], pivots[k]
+        if p0[2]==-1 and p1[2]==1 and p2[2]==-1 and p2[1]>p0[1]:
+            last_signal = "LONG"
+        elif p0[2]==1 and p1[2]==-1 and p2[2]==1 and p2[1]<p0[1]:
+            last_signal = "SHORT"
+
+    # Last 3 pivots for wave labelling
+    last_3 = pivots[-3:] if len(pivots)>=3 else pivots
+
+    # Retracement of most recent completed leg
+    retrace_pct = None
+    if len(pivots) >= 2:
+        leg_start = pivots[-2][1]
+        leg_end   = pivots[-1][1]
+        leg_size  = abs(leg_end - leg_start)
+        retrace   = abs(cur_price - leg_end)
+        retrace_pct = retrace / max(leg_size, 0.001) * 100
+
+    # Describe next signal conditions
+    # LONG setup needs: pivot sequence low→high→low with p2 > p0
+    # SHORT setup needs: pivot sequence high→low→high with p2 < p0
+    long_conditions  = []
+    short_conditions = []
+
+    if len(pivots) >= 2:
+        p_last     = pivots[-1]
+        p_prev     = pivots[-2]
+        leg_dir    = p_last[2]   # direction of most recent confirmed pivot
+
+        # For LONG: last pivot should be a swing-high (1), current move should go down to form swing-low
+        if leg_dir == 1:  # last confirmed pivot was a high → next should be a low → then we check sequence
+            req_low_px = p_last[1] * (1 - min_mv)
+            long_conditions = [
+                {
+                    "Condition": "A) Current price must DROP below prior high × (1 - min_wave_pct%)",
+                    "Required":  f"< {req_low_px:.2f}  (= {p_last[1]:.2f} × {100-min_wave_pct:.2f}%)",
+                    "Current":   f"{cur_price:.2f}",
+                    "Met":       "✅ YES" if cur_price < req_low_px else f"❌ Need {req_low_px-cur_price:.2f} pts more drop",
+                    "Progress":  f"{min(100, (p_last[1]-cur_price)/max(p_last[1]-req_low_px,0.001)*100):.0f}%",
+                },
+                {
+                    "Condition": "B) After new low forms, price must RALLY ≥ min_wave_pct% from that low",
+                    "Required":  f"+{min_wave_pct:.2f}% from new low",
+                    "Current":   "Waiting for new low to form first",
+                    "Met":       "⏳ Pending",
+                    "Progress":  "—",
+                },
+                {
+                    "Condition": "C) New low must be HIGHER than the pivot-low 2 steps ago (higher low = bullish structure)",
+                    "Required":  f"> {p_prev[1]:.2f}  (prior low pivot)",
+                    "Current":   f"{cur_price:.2f}",
+                    "Met":       "✅ YES" if cur_price > p_prev[1] else f"❌ Price below prior low — structure broken",
+                    "Progress":  f"{(cur_price-p_prev[1])/max(abs(p_prev[1]),0.001)*100:+.2f}%",
+                },
+            ]
+            short_conditions = [
+                {
+                    "Condition": "A) Price must stay ABOVE last confirmed high (current high must hold)",
+                    "Required":  f"> {p_last[1]:.2f}",
+                    "Current":   f"{cur_price:.2f}",
+                    "Met":       "✅ YES" if cur_price > p_last[1] else "❌ Price below last high",
+                    "Progress":  f"{(cur_price-p_last[1])/max(abs(p_last[1]),0.001)*100:+.2f}%",
+                },
+                {
+                    "Condition": "B) Price must then DROP ≥ min_wave_pct% from new high to form a lower high",
+                    "Required":  f"−{min_wave_pct:.2f}% from new high to be set",
+                    "Current":   "HIGH sequence not yet formed",
+                    "Met":       "⏳ Pending",
+                    "Progress":  "—",
+                },
+            ]
+        else:  # leg_dir == -1 → last confirmed pivot was a low → possible long setup forming
+            req_high_px = p_last[1] * (1 + min_mv)
+            long_conditions = [
+                {
+                    "Condition": "A) Price must RALLY above prior low × (1 + min_wave_pct%)",
+                    "Required":  f"> {req_high_px:.2f}  (= {p_last[1]:.2f} × {100+min_wave_pct:.2f}%)",
+                    "Current":   f"{cur_price:.2f}",
+                    "Met":       "✅ YES (rally confirmed)" if cur_price > req_high_px else f"❌ Need {req_high_px-cur_price:.2f} pts more rally",
+                    "Progress":  f"{min(100,(cur_price-p_last[1])/max(req_high_px-p_last[1],0.001)*100):.0f}%",
+                },
+                {
+                    "Condition": "B) Price must then PULL BACK ≥ min_wave_pct% from new high (forms corrective low)",
+                    "Required":  f"−{min_wave_pct:.2f}% from new high",
+                    "Current":   "Waiting for rally to complete first",
+                    "Met":       "⏳ Pending",
+                    "Progress":  "—",
+                },
+                {
+                    "Condition": "C) Pullback low must be HIGHER than prior low (higher low = bullish structure)",
+                    "Required":  f"> {p_last[1]:.2f}",
+                    "Current":   f"{cur_price:.2f}",
+                    "Met":       "✅ YES" if cur_price > p_last[1] else "❌ Below prior low",
+                    "Progress":  f"{(cur_price-p_last[1])/max(abs(p_last[1]),0.001)*100:+.2f}%",
+                },
+            ]
+            req_low_short = p_last[1] * (1 - min_mv)
+            short_conditions = [
+                {
+                    "Condition": "A) Price must DROP below prior low × (1 - min_wave_pct%)",
+                    "Required":  f"< {req_low_short:.2f}",
+                    "Current":   f"{cur_price:.2f}",
+                    "Met":       "✅ YES" if cur_price < req_low_short else f"❌ Need {cur_price-req_low_short:.2f} pts more drop",
+                    "Progress":  f"{min(100,(p_last[1]-cur_price)/max(p_last[1]-req_low_short,0.001)*100):.0f}%",
+                },
+                {
+                    "Condition": "B) After new low, a bounce ≥ min_wave_pct% then another lower low confirms SHORT",
+                    "Required":  f"Bounce +{min_wave_pct:.2f}% then lower low",
+                    "Current":   "Awaiting next pivot",
+                    "Met":       "⏳ Pending",
+                    "Progress":  "—",
+                },
+            ]
+
+    return {
+        "confirmed_pivots":   len(pivots),
+        "last_3_pivots":      last_3,
+        "current_wave_dir":   last_dir,
+        "current_swing_pct":  current_swing_pct,
+        "move_from_last_pct": move_from_last,
+        "pct_done":           pct_done,
+        "pct_remaining":      pct_remaining,
+        "pivot_flip_pct":     pivot_flip_pct,
+        "last_confirmed_px":  last_confirmed_px,
+        "last_confirmed_dir": last_confirmed_dir,
+        "retrace_pct":        retrace_pct,
+        "last_signal":        last_signal,
+        "long_conditions":    long_conditions,
+        "short_conditions":   short_conditions,
+        "cur_price":          cur_price,
+        "min_wave_pct":       min_wave_pct,
+    }
+
+
+def sig_elliott_wave(df, swing_lookback=10, min_wave_pct=1.0, **_):
+    """
+    Simplified Elliott Wave: uses zigzag to count alternating waves.
+    BUY  at completion of corrective wave 2/4 in uptrend (retracement of prior up-move).
+    SELL at completion of corrective wave 2/4 in downtrend.
+    min_wave_pct: minimum % move to qualify as a wave leg.
+    """
+    cl  = df["Close"]
+    n   = len(cl)
+    s   = pd.Series(0, index=df.index)
+
+    pivots, _ = _ew_build_pivots(df, min_wave_pct)
+
     for k in range(2, len(pivots)):
         p0, p1, p2 = pivots[k-2], pivots[k-1], pivots[k]
         idx2 = p2[0]
         if idx2 >= n: continue
-        # Bullish: low→high→low retracement (wave 2 or 4 in uptrend)
         if p0[2]==-1 and p1[2]==1 and p2[2]==-1 and p2[1]>p0[1]:
             s.iloc[idx2] = 1
-        # Bearish: high→low→high retracement
         elif p0[2]==1 and p1[2]==-1 and p2[2]==1 and p2[1]<p0[1]:
             s.iloc[idx2] = -1
 
-    # Plot EMA for reference
     e20 = ema(df["Close"], 20)
     return s, {"EMA_20": e20}
 
@@ -2445,6 +2632,152 @@ with tab_live:
                             "Signal":    "⚡ Price at breakout level!" if abs(_dist_d)/cl*100 < 0.3 else f"{abs(_dist_d)/cl*100:.2f}% away",
                         })
                         _handled_keys.add(_dk)
+
+            # ════════════════════════════════════════════════════════════════
+            # ELLIOTT WAVE: dedicated rich diagnostic panel
+            # ════════════════════════════════════════════════════════════════
+            if strategy == "Elliott Wave (Simplified)":
+                _ew_d = _ew_diagnostics(lv_df,
+                                         min_wave_pct=float(live_params.get("min_wave_pct",1.0)))
+                _mwp  = _ew_d["min_wave_pct"]
+                _cpx  = _ew_d["cur_price"]
+
+                st.markdown("---")
+                st.markdown("### Elliott Wave Live Analysis")
+                st.caption(
+                    f"Zigzag pivot detection — a move of **{_mwp:.2f}%** or more "
+                    "qualifies as a wave leg. Signal fires when a 3-pivot A-B-C corrective "
+                    "sequence completes (higher-low for LONG, lower-high for SHORT)."
+                )
+
+                # ── Summary metrics row ──────────────────────────────────────
+                _em1,_em2,_em3,_em4,_em5 = st.columns(5)
+                _em1.metric("Confirmed Pivots",   _ew_d["confirmed_pivots"])
+                _em2.metric("LTP",                f"{_cpx:.2f}")
+                _em3.metric("Last Pivot Price",   f"{_ew_d['last_confirmed_px']:.2f}")
+                _em4.metric("Last Pivot Type",    "Swing HIGH ↑" if _ew_d["last_confirmed_dir"]==1 else
+                                                   ("Swing LOW ↓" if _ew_d["last_confirmed_dir"]==-1 else "None yet"))
+                _em5.metric("Last Fired Signal",  _ew_d["last_signal"] or "None yet")
+
+                # ── Current in-progress swing ────────────────────────────────
+                st.markdown("#### Current In-Progress Swing (unconfirmed)")
+                _ew_c1,_ew_c2,_ew_c3,_ew_c4 = st.columns(4)
+                _ew_c1.metric("Direction", "Upward ↑" if _ew_d["current_wave_dir"]==1 else
+                                            ("Downward ↓" if _ew_d["current_wave_dir"]==-1 else "Not started"))
+                _ew_c2.metric("Move so far", f"{_ew_d['move_from_last_pct']:+.2f}%")
+                _ew_c3.metric(f"Needed for pivot ({_mwp:.2f}%)",
+                               f"{_ew_d['pct_done']:.2f}% done",
+                               delta=f"{_ew_d['pct_remaining']:.2f}% remaining",
+                               delta_color="inverse")
+                _ew_c4.metric("Pivot confirmation", f"{min(100,_ew_d['pivot_flip_pct']):.0f}% there")
+
+                # Visual progress bar for pivot confirmation
+                _prog_pct = min(int(_ew_d["pivot_flip_pct"]), 100)
+                _bar_filled = int(_prog_pct / 5)
+                _prog_bar = "█" * _bar_filled + "░" * (20 - _bar_filled)
+                st.markdown(
+                    f"**Pivot progress:** `[{_prog_bar}]` {_prog_pct}%  "
+                    f"— need price to move **{_ew_d['pct_remaining']:.2f}% more** "
+                    f"({_mwp:.2f}% total) to confirm next pivot"
+                )
+
+                if _ew_d["retrace_pct"] is not None:
+                    st.markdown(
+                        f"**Current retracement of last completed leg:** "
+                        f"**{_ew_d['retrace_pct']:.1f}%**  "
+                        f"(typical Elliott corrective waves retrace 38–62% of prior leg)"
+                    )
+
+                # ── Last 3 confirmed pivots (wave structure) ─────────────────
+                if _ew_d["last_3_pivots"]:
+                    st.markdown("#### Last Confirmed Pivot Structure")
+                    _piv_rows = []
+                    _wave_labels_long  = ["Wave A (Low)", "Wave B (High)", "Wave C (Low)"]
+                    _wave_labels_short = ["Wave A (High)", "Wave B (Low)", "Wave C (High)"]
+                    _lp3 = _ew_d["last_3_pivots"]
+                    for _pi, (_pidx, _ppx, _pdir) in enumerate(_lp3):
+                        _plabel = f"Pivot {_pi+1} of {len(_lp3)}"
+                        try:
+                            _pdt = to_ist(lv_df.index[_pidx])
+                        except: _pdt = str(_pidx)
+                        _piv_rows.append({
+                            "Pivot":     _plabel,
+                            "Type":      "Swing HIGH ↑" if _pdir==1 else "Swing LOW ↓",
+                            "Price":     f"{_ppx:.2f}",
+                            "Bar Index": _pidx,
+                            "Time (IST)":_pdt,
+                        })
+                    _piv_df = pd.DataFrame(_piv_rows)
+                    st.dataframe(_piv_df, use_container_width=True, hide_index=True)
+
+                    # Describe the pattern formed
+                    if len(_lp3) == 3:
+                        _p0d = _lp3[0][2]; _p1d = _lp3[1][2]; _p2d = _lp3[2][2]
+                        _p0p = _lp3[0][1]; _p1p = _lp3[1][1]; _p2p = _lp3[2][1]
+                        if _p0d==-1 and _p1d==1 and _p2d==-1:
+                            _leg1 = abs(_p1p-_p0p); _leg2 = abs(_p2p-_p1p)
+                            _ret  = _leg2/_leg1*100 if _leg1>0 else 0
+                            if _p2p > _p0p:
+                                st.success(f"Pattern: LOW → HIGH → LOW (higher low = bullish). "
+                                           f"Leg1={_leg1:.2f} pts, Retrace={_ret:.1f}%. "
+                                           f"**BUY signal already fired at pivot C ({_p2p:.2f}). "
+                                           f"Watch for next corrective structure to re-enter.**")
+                            else:
+                                st.warning(f"Pattern: LOW → HIGH → LOWER LOW (lower low = bearish continuation). "
+                                           f"Leg1={_leg1:.2f}, Retrace={_ret:.1f}%. No LONG signal — structure bearish.")
+                        elif _p0d==1 and _p1d==-1 and _p2d==1:
+                            _leg1 = abs(_p1p-_p0p); _leg2 = abs(_p2p-_p1p)
+                            _ret  = _leg2/_leg1*100 if _leg1>0 else 0
+                            if _p2p < _p0p:
+                                st.error(f"Pattern: HIGH → LOW → HIGH (lower high = bearish). "
+                                         f"Leg1={_leg1:.2f} pts, Retrace={_ret:.1f}%. "
+                                         f"**SELL signal already fired at pivot C ({_p2p:.2f}). "
+                                         f"Watch for next corrective structure to re-enter.**")
+                            else:
+                                st.warning(f"Pattern: HIGH → LOW → HIGHER HIGH (higher high = bullish continuation). "
+                                           f"Leg1={_leg1:.2f}, Retrace={_ret:.1f}%. No SHORT signal — structure bullish.")
+
+                # ── What is needed to fire next signal ───────────────────────
+                st.markdown("---")
+                _long_tab, _short_tab = st.tabs(["🟢 Conditions for LONG signal", "🔴 Conditions for SHORT signal"])
+
+                with _long_tab:
+                    st.caption(
+                        "LONG fires when: Low pivot → High pivot → **Higher Low pivot** "
+                        "(corrective pullback in an uptrend). All 3 conditions below must be true simultaneously."
+                    )
+                    if _ew_d["long_conditions"]:
+                        _lc_df = pd.DataFrame(_ew_d["long_conditions"])
+                        def _met_color(v):
+                            if "✅" in str(v): return "color:#2e7d32;font-weight:bold"
+                            if "❌" in str(v): return "color:#c62828;font-weight:bold"
+                            if "⏳" in str(v): return "color:#e65100"
+                            return ""
+                        st.dataframe(_lc_df.style.map(_met_color, subset=["Met"]),
+                                     use_container_width=True, hide_index=True)
+                        _long_met = sum(1 for c in _ew_d["long_conditions"] if "✅" in c["Met"])
+                        st.info(f"**{_long_met}/{len(_ew_d['long_conditions'])} conditions currently met** "
+                                f"for a LONG signal.")
+                    else:
+                        st.info("Need at least 2 confirmed pivots to show LONG conditions.")
+
+                with _short_tab:
+                    st.caption(
+                        "SHORT fires when: High pivot → Low pivot → **Lower High pivot** "
+                        "(corrective rally in a downtrend). All conditions below must be true."
+                    )
+                    if _ew_d["short_conditions"]:
+                        _sc_df = pd.DataFrame(_ew_d["short_conditions"])
+                        st.dataframe(_sc_df.style.map(_met_color, subset=["Met"]),
+                                     use_container_width=True, hide_index=True)
+                        _short_met = sum(1 for c in _ew_d["short_conditions"] if "✅" in c["Met"])
+                        st.info(f"**{_short_met}/{len(_ew_d['short_conditions'])} conditions currently met** "
+                                f"for a SHORT signal.")
+                    else:
+                        st.info("Need at least 2 confirmed pivots to show SHORT conditions.")
+
+                # Mark EMA_20 as handled (it's the only indicator EW returns)
+                _handled_keys.update({"EMA_20"})
 
             # ════════════════════════════════════════════════════════════════
             # GENERIC FALLBACK: show any remaining indicator not yet handled
