@@ -102,6 +102,33 @@ TICKER_MAP = {
     "Crude Oil":"CL=F","Custom":"CUSTOM",
 }
 
+# ── EMAIL ALERT HELPER ────────────────────────────────────────────────────────
+def send_alert(subject: str, body: str, sender: str, app_password: str, to: str):
+    """
+    Send a plain-text email via Gmail SMTP.
+    Uses TLS (port 587). Requires a Gmail App Password
+    (Account → Security → 2-Step Verification → App Passwords).
+    Silently does nothing if any credential is empty.
+    """
+    if not sender or not app_password or not to:
+        return
+    try:
+        import smtplib
+        from email.mime.text import MIMEText
+        msg = MIMEText(body, "plain")
+        msg["Subject"] = subject
+        msg["From"]    = sender
+        msg["To"]      = to
+        with smtplib.SMTP("smtp.gmail.com", 587, timeout=10) as server:
+            server.ehlo()
+            server.starttls()
+            server.login(sender, app_password)
+            server.sendmail(sender, [to], msg.as_string())
+    except Exception as _email_err:
+        # Don't crash the app if email fails; log silently
+        print(f"[Email alert error] {_email_err}")
+
+
 # ── Nifty 50 Constituent Stocks ───────────────────────────────────────────────
 NIFTY50_STOCKS = {
     "Reliance":"RELIANCE.NS","TCS":"TCS.NS","HDFC Bank":"HDFCBANK.NS",
@@ -1781,12 +1808,16 @@ with st.sidebar:
     st.subheader("🔌 Dhan Broker")
     dhan_enabled=st.checkbox("Enable Dhan Broker",value=False,key="dhan_enabled")
     if dhan_enabled:
-        dhan_client=st.text_input("Client ID","",key="dhan_client")
-        dhan_token =st.text_input("Access Token","",key="dhan_token",type="password")
+        dhan_client=st.text_input("Client ID","1104779876",key="dhan_client")
+        dhan_token =st.text_input("Access Token","",key="dhan_token",type="password", value="eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzUxMiJ9.eyJpc3MiOiJkaGFuIiwicGFydG5lcklkIjoiIiwiZXhwIjoxNzczNzE5NTM0LCJpYXQiOjE3NzM2MzMxMzQsInRva2VuQ29uc3VtZXJUeXBlIjoiU0VMRiIsIndlYmhvb2tVcmwiOiIiLCJkaGFuQ2xpZW50SWQiOiIxMTA0Nzc5ODc2In0.fqZhkfd_RYDSwhxyNbuQ-WpB8x_25lLmdggsZGPcELD_wknrmNrhPrLUXkU5kIFC8UtqeAK15hJKh9Xr5QAC6g")
         st.caption("**Order type — always BUYER (never seller in options)**")
         is_stocks=st.checkbox("Stocks / Intraday mode  (uncheck = Options CE/PE buyer)",value=False,key="dhan_is_stocks")
         if is_stocks:
             st.caption("LONG signal → Stock BUY  |  SHORT signal → Stock SELL/Short")
+            dhan_s_sid=st.text_input("Stock Security ID","12092",key="dhan_s_sid",
+                                      help="Dhan Security ID for the stock (e.g. 12092 = Kaynes Technology). "
+                                           "Find in Dhan instrument master CSV.")
+            st.caption("Default: 12092 = Kaynes Technology (NSE)")
             dhan_prod =st.selectbox("Trading Type",["INTRADAY","DELIVERY"],key="dhan_prod")
             dhan_exch =st.selectbox("Exchange",["NSE","BSE"],key="dhan_exch")
             dhan_s_qty=st.number_input("Quantity",1,10000,1,step=1,key="dhan_s_qty")
@@ -1794,16 +1825,20 @@ with st.sidebar:
             dhan_o_exch="NSE.FNO"; dhan_o_qty=65
         else:
             st.caption("LONG signal → CE BUY  |  SHORT signal → PE BUY  (always buying options)")
+            dhan_s_sid=""
             dhan_ce_sid=st.text_input("CE Security ID (ATM call)","",key="dhan_ce_sid")
             dhan_pe_sid=st.text_input("PE Security ID (ATM put)","",key="dhan_pe_sid")
             dhan_o_exch=st.selectbox("F&O Exchange",["NSE.FNO","BSE.FNO"],key="dhan_o_exch")
             dhan_o_qty =st.number_input("Options Quantity",1,10000,65,step=1,key="dhan_o_qty")
             dhan_prod="INTRADAY"; dhan_exch="NSE"; dhan_s_qty=1
         dhan_sq_all=st.checkbox("Square off ALL open positions before new order",value=False,key="dhan_sq_all")
-        dhan_entry_ot=st.selectbox("Entry Order Type",["MARKET","LIMIT"],index=0,key="dhan_entry_ot")
+        # Default: Entry = LIMIT (price control), Exit = MARKET (fast fill)
+        dhan_entry_ot=st.selectbox("Entry Order Type",["LIMIT","MARKET"],index=0,key="dhan_entry_ot")
         dhan_exit_ot =st.selectbox("Exit Order Type", ["MARKET","LIMIT"],index=0,key="dhan_exit_ot")
-        if dhan_entry_ot=="LIMIT" or dhan_exit_ot=="LIMIT":
-            st.caption("⚠️ LTP will be used as limit price — adjust in Dhan app if needed.")
+        if dhan_entry_ot=="LIMIT":
+            st.caption("LIMIT entry: LTP at signal time will be used as limit price.")
+        if dhan_exit_ot=="LIMIT":
+            st.caption("LIMIT exit: LTP at exit time will be used as limit price.")
         # ── Multi-account support ─────────────────────────────────────────
         multi_acc = st.checkbox("Enable Multi-Account (place orders in multiple Dhan accounts)",
                                 value=False, key="dhan_multi_acc")
@@ -1827,10 +1862,11 @@ with st.sidebar:
         else:
             st.session_state["dhan_extra_accounts"] = []
     else:
-        dhan_client=""; dhan_token=""; is_stocks=False
+        dhan_client="1104779876"; dhan_token=""; is_stocks=False
         dhan_prod="INTRADAY"; dhan_exch="NSE"; dhan_s_qty=1
+        dhan_s_sid="12092"
         dhan_ce_sid=""; dhan_pe_sid=""; dhan_o_exch="NSE.FNO"; dhan_o_qty=65
-        dhan_sq_all=False; dhan_entry_ot="MARKET"; dhan_exit_ot="MARKET"
+        dhan_sq_all=False; dhan_entry_ot="LIMIT"; dhan_exit_ot="MARKET"
 
     # ── TRADE MANAGEMENT ─────────────────────────────────────────────────────
     st.markdown("---")
@@ -1855,6 +1891,24 @@ with st.sidebar:
     else:
         tw_from=datetime.strptime("09:15","%H:%M").time()
         tw_to  =datetime.strptime("15:00","%H:%M").time()
+
+    # ── EMAIL NOTIFICATIONS ───────────────────────────────────────────────────
+    st.markdown("---")
+    st.subheader("📧 Email Notifications")
+    email_enabled = st.checkbox("Enable Email Alerts (Gmail)",value=False,key="email_enabled",
+        help="Sends email when a BUY/SELL signal fires or a trade exits.")
+    if email_enabled:
+        email_sender  = st.text_input("Gmail sender address","",key="email_sender",
+                                       help="Your Gmail address (e.g. you@gmail.com)")
+        email_apppass = st.text_input("Gmail App Password","",key="email_apppass",type="password",
+                                       help="Use a Gmail App Password (not your login password). "
+                                            "Enable 2FA → Google Account → Security → App Passwords.")
+        email_to      = st.text_input("Send alerts to","",key="email_to",
+                                       help="Recipient email (can be same as sender)")
+        st.caption("Alerts sent for: BUY signal, SELL signal, Trade exit (SL/Target/Strategy). "
+                   "Uses Gmail SMTP (port 587).")
+    else:
+        email_sender=""; email_apppass=""; email_to=""
 
     st.markdown("---")
     st.caption("1.5s rate-limit delay between all yfinance requests.")
@@ -2182,11 +2236,20 @@ with tab_live:
                     if st.session_state.get("dhan_is_stocks",False):
                         _txn=_d.BUY if direction==1 else _d.SELL
                         _exch={"NSE":_d.NSE,"BSE":_d.BSE}.get(dhan_exch,_d.NSE)
-                        _d.place_order(security_id=sym,exchange_segment=_exch,
-                            transaction_type=_txn,quantity=int(dhan_s_qty),
-                            order_type=_ot,product_type=_d.INTRADAY if dhan_prod=="INTRADAY" else _d.DELIVERY,
-                            price=_lp)
-                        st.info(f"Dhan {_acc_label} ({dhan_entry_ot}): {'BUY' if direction==1 else 'SELL'} {dhan_s_qty}x {sym}")
+                        _stock_sid = dhan_s_sid if dhan_s_sid else sym
+                        _d.place_order(
+                            security_id   = _stock_sid,
+                            exchange_segment = _exch,
+                            transaction_type = _txn,
+                            quantity      = int(dhan_s_qty),
+                            order_type    = _ot,
+                            product_type  = _d.INTRA if dhan_prod=="INTRADAY" else _d.DELIVERY,
+                            price         = _lp,
+                            validity      = "DAY",
+                        )
+                        st.info(f"Dhan {_acc_label} ({dhan_entry_ot}): "
+                                f"{'BUY' if direction==1 else 'SELL'} {dhan_s_qty}x "
+                                f"sid={_stock_sid} on {dhan_exch}")
                     else:
                         _sid=dhan_ce_sid if direction==1 else dhan_pe_sid
                         _opt="CE" if direction==1 else "PE"
@@ -2210,10 +2273,19 @@ with tab_live:
                 if st.session_state.get("dhan_is_stocks",False):
                     _txn=_d.SELL if direction==1 else _d.BUY
                     _exch={"NSE":_d.NSE,"BSE":_d.BSE}.get(dhan_exch,_d.NSE)
-                    _d.place_order(security_id=sym,exchange_segment=_exch,
-                        transaction_type=_txn,quantity=int(dhan_s_qty),
-                        order_type=_ot,product_type=_d.INTRADAY if dhan_prod=="INTRADAY" else _d.DELIVERY,
-                        price=_lp)
+                    _stock_sid = dhan_s_sid if dhan_s_sid else sym
+                    _d.place_order(
+                        security_id      = _stock_sid,
+                        exchange_segment = _exch,
+                        transaction_type = _txn,
+                        quantity         = int(dhan_s_qty),
+                        order_type       = _ot,
+                        product_type     = _d.INTRA if dhan_prod=="INTRADAY" else _d.DELIVERY,
+                        price            = _lp,
+                        validity         = "DAY",
+                    )
+                    st.info(f"Dhan exit ({dhan_exit_ot}): "
+                            f"{'SELL' if direction==1 else 'BUY'} {dhan_s_qty}x sid={_stock_sid}")
                 else:
                     _sid=dhan_ce_sid if direction==1 else dhan_pe_sid
                     _opt="CE" if direction==1 else "PE"
@@ -2238,9 +2310,24 @@ with tab_live:
             st.session_state.live_position={"entry":ep,"direction":d,"sl":lv_sl,"target":lv_tgt,
                 "disp_tgt":lv_tgt,"entry_time":last_bar,"highest":ep,"lowest":ep}
             _dhan_place(d)
+            _sig_label = "BUY (LONG)" if d==1 else "SELL (SHORT)"
             st.success(f"🚀 NEW {'LONG' if d==1 else 'SHORT'}  Entry:{ep:.2f}  "
                        f"SL:{lv_sl:.2f}  Target:{lv_tgt:.2f}  "
                        f"[{to_ist(last_bar)}]")
+            # ── Email alert: new signal ───────────────────────────────────
+            if st.session_state.get("email_enabled",False):
+                send_alert(
+                    subject=f"AlgoTrader: {_sig_label} Signal — {sym}",
+                    body=(f"Strategy: {strategy}\n"
+                          f"Ticker:   {sym}\n"
+                          f"Signal:   {_sig_label}\n"
+                          f"Entry:    {ep:.2f}\n"
+                          f"SL:       {lv_sl:.2f}\n"
+                          f"Target:   {lv_tgt:.2f}\n"
+                          f"Time:     {to_ist(last_bar)}\n"
+                          f"Interval: {interval}\n"),
+                    sender=email_sender, app_password=email_apppass, to=email_to,
+                )
 
         elif pos is not None:
             d=pos["direction"]; ep=pos["entry"]
@@ -2273,6 +2360,25 @@ with tab_live:
                 _dhan_exit(d)
                 (st.success if pnl>0 else st.error)(
                     f"CLOSED {exit_why} | PnL: {'+'if pnl>0 else ''}{pnl:.2f} | {to_ist(last_bar)}")
+                # ── Email alert: trade exit ───────────────────────────────
+                if st.session_state.get("email_enabled",False):
+                    send_alert(
+                        subject=f"AlgoTrader: Trade EXIT ({exit_why}) — {sym}  PnL:{'+' if pnl>0 else ''}{pnl:.2f}",
+                        body=(f"Strategy:    {strategy}\n"
+                              f"Ticker:      {sym}\n"
+                              f"Direction:   {'LONG' if d==1 else 'SHORT'}\n"
+                              f"Entry Price: {ep:.2f}\n"
+                              f"Exit Price:  {exit_px:.2f}\n"
+                              f"Exit Reason: {exit_why}\n"
+                              f"PnL:         {'+' if pnl>0 else ''}{pnl:.2f} pts\n"
+                              f"SL Level:    {pos['sl']:.2f}\n"
+                              f"Target:      {pos['disp_tgt']:.2f}\n"
+                              f"Highest:     {pos['highest']:.2f}\n"
+                              f"Lowest:      {pos['lowest']:.2f}\n"
+                              f"Exit Time:   {to_ist(last_bar)}\n"
+                              f"Interval:    {interval}\n"),
+                        sender=email_sender, app_password=email_apppass, to=email_to,
+                    )
             else:
                 unreal=round((cl-ep)*d,4)
                 st.markdown("#### 📌 Open Position")
