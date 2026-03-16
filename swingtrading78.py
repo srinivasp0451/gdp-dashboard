@@ -35,47 +35,62 @@ warnings.filterwarnings("ignore")
 st.set_page_config(page_title="AlgoTrader Pro", layout="wide", initial_sidebar_state="expanded")
 _HAS_FRAGMENT = hasattr(st, "fragment")
 
-# ── CSS: sidebar scroll + no overflow into main content ──────────────────────
+# ── CSS: sidebar strict containment + scrolling ──────────────────────────────
 st.markdown("""
 <style>
-/* ── Sidebar container: fixed width, scrollable, never overflows ── */
-[data-testid="stSidebar"] {
+/* Main layout: ensure main area is never pushed by sidebar overflow */
+.main .block-container { overflow-x: hidden !important; }
+
+/* Sidebar strict containment */
+section[data-testid="stSidebar"] {
+    overflow: hidden !important;
+    position: relative !important;
+}
+section[data-testid="stSidebar"] > div {
     overflow-y: auto !important;
     overflow-x: hidden !important;
+    width: 300px !important;
+    max-width: 300px !important;
+    min-width: 240px !important;
 }
-[data-testid="stSidebar"] > div:first-child {
-    width: 320px !important;
-    max-width: 320px !important;
-    min-width: 280px !important;
-    overflow-x: hidden !important;
-    overflow-y: auto !important;
-    padding-right: 6px !important;
-}
-/* All sidebar content wraps, doesn't overflow */
-[data-testid="stSidebar"] * {
+/* Every element inside sidebar is clipped to sidebar width */
+section[data-testid="stSidebar"] * {
     box-sizing: border-box !important;
     max-width: 100% !important;
+    overflow-x: hidden !important;
 }
-[data-testid="stSidebar"] label,
-[data-testid="stSidebar"] p,
-[data-testid="stSidebar"] span {
+/* Text wraps, never overflows */
+section[data-testid="stSidebar"] label,
+section[data-testid="stSidebar"] p,
+section[data-testid="stSidebar"] span,
+section[data-testid="stSidebar"] div {
     white-space: normal !important;
     word-break: break-word !important;
+    overflow-wrap: anywhere !important;
     font-size: 13px !important;
-    overflow-wrap: break-word !important;
 }
-/* selectbox and inputs stay inside sidebar */
-[data-testid="stSidebar"] select,
-[data-testid="stSidebar"] input {
+/* Inputs and selects fill sidebar width exactly */
+section[data-testid="stSidebar"] input,
+section[data-testid="stSidebar"] select,
+section[data-testid="stSidebar"] textarea {
     width: 100% !important;
     max-width: 100% !important;
+    min-width: 0 !important;
     font-size: 13px !important;
 }
-/* Metric cards in config banner */
+/* Streamlit's internal stSelectbox/stNumberInput wrappers */
+section[data-testid="stSidebar"] .stSelectbox,
+section[data-testid="stSidebar"] .stNumberInput,
+section[data-testid="stSidebar"] .stTextInput,
+section[data-testid="stSidebar"] .stCheckbox {
+    width: 100% !important;
+    max-width: 100% !important;
+}
+/* Metric values */
 [data-testid="stMetricValue"] { font-size: 13px !important; }
 [data-testid="stMetricLabel"] { font-size: 11px !important; white-space: normal !important; }
-/* Config banner table scrolls horizontally without overflowing */
-.config-banner-wrap { overflow-x: auto; width: 100%; }
+/* Expanders inside sidebar */
+section[data-testid="stSidebar"] details { width: 100% !important; max-width: 100% !important; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -118,9 +133,15 @@ STRATEGIES = [
     "Donchian Breakout","Triple EMA Trend","Heikin Ashi EMA",
     "Volume Price Trend (VPT)","Keltner Channel Breakout","Williams %R Reversal",
     "Swing Trend + Pullback",
-    # ── Advanced ────────────────────────────────
+    # ── Advanced / High-Probability ────────────────────────────────────────
     "Elliott Wave (Simplified)","HV Percentile (IV Proxy)","SMC Order Blocks",
     "Price Action Patterns","Breakout Strategy","Support & Resistance + EMA",
+    "VWAP + EMA Confluence",        # price above VWAP and EMA, pullback entry
+    "Opening Range Breakout (ORB)", # first N-min high/low break with volume
+    "Mean Reversion Bollinger",     # BB squeeze then expansion trade
+    "Trend Momentum (ADX+EMA)",     # ADX strong trend + EMA pullback
+    "Gap & Go",                     # gap-up/gap-down continuation trade
+    "Inside Bar Breakout",          # inside bar pattern breakout
     # ── Custom builder ──────────────────────────
     "Custom Strategy Builder","Custom Strategy",
 ]
@@ -130,12 +151,13 @@ SL_TYPES = [
     "Trailing Curr Swing Low/High","Cost to Cost (Breakeven)",
     "Cost-to-Cost K-Shift Trailing","EMA Reverse Crossover",
     "ATR Based","Risk/Reward Based SL",
+    "Strategy Signal Exit",   # exit when strategy fires opposite signal
 ]
 TARGET_TYPES = [
     "Custom Points","Trailing Target (Display Only)","Trailing Prev Candle High/Low",
     "Trailing Curr Candle High/Low","Trailing Prev Swing High/Low",
     "Trailing Curr Swing High/Low","ATR Based","Risk/Reward Based",
-    "Reverse EMA Crossover",
+    "Reverse EMA Crossover","Strategy Signal Exit",  # exit on strategy reversal
 ]
 YF_IV = {"1m":"1m","5m":"5m","15m":"15m","30m":"30m","1h":"1h","4h":"1h","1d":"1d","1wk":"1wk"}
 
@@ -678,6 +700,110 @@ def sig_custom(df, **_):
     """
     return pd.Series(0,index=df.index),{}
 
+# ── NEW HIGH-PROBABILITY STRATEGIES ──────────────────────────────────────────
+
+def sig_vwap_ema_confluence(df, ema_period=20, dev_pct=0.5, **_):
+    """VWAP + EMA Confluence: price above both VWAP and EMA on pullback."""
+    vw = vwap_calc(df); e = ema(df["Close"], ema_period)
+    d  = dev_pct/100
+    s  = pd.Series(0, index=df.index)
+    # Long: price dips to EMA from above, VWAP also below price, bullish close
+    bull=(df["Low"]<=e)&(df["Close"]>e)&(df["Close"]>vw)&(df["Close"]>df["Open"])
+    bear=(df["High"]>=e)&(df["Close"]<e)&(df["Close"]<vw)&(df["Close"]<df["Open"])
+    s[bull]=1; s[bear]=-1
+    return s,{"VWAP":vw,"EMA":e}
+
+def sig_orb(df, orb_minutes=15, vol_mult=1.3, **_):
+    """
+    Opening Range Breakout (ORB):
+    First orb_minutes of session form the range (approx first N bars).
+    BUY  on break above opening range high with volume.
+    SELL on break below opening range low with volume.
+    Uses first 3 bars as proxy opening range for bar-based data.
+    """
+    n_orb = max(1, orb_minutes // 5)   # ~3 bars for 5m
+    s = pd.Series(0, index=df.index)
+    vol = df.get("Volume", pd.Series(1, index=df.index))
+    avg_v = vol.rolling(20).mean().replace(0, np.nan)
+    # Rolling opening range: high/low of past n_orb bars
+    or_hi = df["High"].rolling(n_orb).max().shift(1)
+    or_lo = df["Low"].rolling(n_orb).min().shift(1)
+    vol_ok = vol > avg_v * vol_mult
+    s[_cup(df["Close"], or_hi) & vol_ok] =  1
+    s[_cdn(df["Close"], or_lo) & vol_ok] = -1
+    return s, {"OR_Hi": or_hi, "OR_Lo": or_lo}
+
+def sig_mean_reversion_bb(df, period=20, std=2.0, rsi_period=14, **_):
+    """
+    Mean Reversion BB: BB squeeze (width < threshold) then expansion.
+    BUY  when price closes above lower band after touching it + RSI oversold.
+    SELL when price closes below upper band after touching it + RSI overbought.
+    """
+    lo, mid, hi = bollinger(df["Close"], period, std)
+    r = rsi(df["Close"], rsi_period)
+    bw = (hi - lo) / mid.replace(0, np.nan)   # BB width
+    squeeze = bw < bw.rolling(50).mean() * 0.8
+    s = pd.Series(0, index=df.index)
+    s[_cup(df["Close"], lo) & (r < 40) & ~squeeze] =  1
+    s[_cdn(df["Close"], hi) & (r > 60) & ~squeeze] = -1
+    return s, {"BB_upper": hi, "BB_mid": mid, "BB_lower": lo, "RSI": r}
+
+def sig_trend_momentum(df, ema_period=50, adx_period=14, adx_thresh=25, **_):
+    """
+    Trend Momentum: ADX confirms strong trend, EMA pullback for entry.
+    Long  when ADX>thresh, price>EMA, last candle pulls back to EMA and closes bullish.
+    Short when ADX>thresh, price<EMA, last candle rallies to EMA and closes bearish.
+    """
+    e = ema(df["Close"], ema_period)
+    _adx, pdi, ndi = adx_di(df, adx_period)
+    at = _cs(adx_thresh, df.index)
+    touch_bull = (df["Low"] <= e) & (df["Close"] > e) & (df["Close"] > df["Open"])
+    touch_bear = (df["High"] >= e) & (df["Close"] < e) & (df["Close"] < df["Open"])
+    s = pd.Series(0, index=df.index)
+    s[(_adx > at) & (pdi > ndi) & touch_bull] =  1
+    s[(_adx > at) & (ndi > pdi) & touch_bear] = -1
+    return s, {"EMA": e, "ADX": _adx}
+
+def sig_gap_and_go(df, gap_pct=0.3, vol_mult=1.5, **_):
+    """
+    Gap & Go: trades gap-up/gap-down continuation.
+    Gap-up (today Open > yesterday Close by gap_pct%) + bullish candle + volume → BUY.
+    Gap-down → SELL.
+    """
+    prev_close = df["Close"].shift(1)
+    gap_up   = (df["Open"] - prev_close) / prev_close.replace(0, np.nan) * 100 >= gap_pct
+    gap_down = (prev_close - df["Open"]) / prev_close.replace(0, np.nan) * 100 >= gap_pct
+    vol = df.get("Volume", pd.Series(1, index=df.index))
+    avg_v = vol.rolling(20).mean().replace(0, np.nan)
+    vol_ok = vol > avg_v * vol_mult
+    bull_candle = df["Close"] > df["Open"]
+    bear_candle = df["Close"] < df["Open"]
+    s = pd.Series(0, index=df.index)
+    s[gap_up   & bull_candle & vol_ok] =  1
+    s[gap_down & bear_candle & vol_ok] = -1
+    e20 = ema(df["Close"], 20)
+    return s, {"EMA_20": e20}
+
+def sig_inside_bar(df, ema_period=50, **_):
+    """
+    Inside Bar Breakout:
+    Inside bar = High < prev High AND Low > prev Low (contained within prior candle).
+    Breakout: next candle breaks above inside bar High → BUY.
+               next candle breaks below inside bar Low → SELL.
+    Trend filter: price above EMA for longs, below EMA for shorts.
+    """
+    prev_hi = df["High"].shift(1); prev_lo = df["Low"].shift(1)
+    is_inside = (df["High"] < prev_hi) & (df["Low"] > prev_lo)
+    # Signal fires when current bar breaks out of prior inside bar
+    ib_hi = df["High"].shift(1).where(is_inside.shift(1))
+    ib_lo = df["Low"].shift(1).where(is_inside.shift(1))
+    e = ema(df["Close"], ema_period)
+    s = pd.Series(0, index=df.index)
+    s[_cup(df["High"], ib_hi.ffill()) & (df["Close"] > e)] =  1
+    s[_cdn(df["Low"],  ib_lo.ffill()) & (df["Close"] < e)] = -1
+    return s, {"EMA": e}
+
+
 STRATEGY_FN={
     "EMA Crossover":sig_ema_cross,"RSI Overbought/Oversold":sig_rsi_osob,
     "Simple Buy":sig_simple_buy,"Simple Sell":sig_simple_sell,
@@ -695,6 +821,14 @@ STRATEGY_FN={
     "Price Action Patterns":sig_price_action,
     "Breakout Strategy":sig_breakout,
     "Support & Resistance + EMA":sig_sr_ema,
+    # ── New high-probability strategies ──────────────────────────────────────
+    "VWAP + EMA Confluence":    sig_vwap_ema_confluence,
+    "Opening Range Breakout (ORB)": sig_orb,
+    "Mean Reversion Bollinger": sig_mean_reversion_bb,
+    "Trend Momentum (ADX+EMA)": sig_trend_momentum,
+    "Gap & Go":                 sig_gap_and_go,
+    "Inside Bar Breakout":      sig_inside_bar,
+    # ── Custom ───────────────────────────────────────────────────────────────
     "Custom Strategy Builder":sig_custom_builder,
     "Custom Strategy":sig_custom,
 }
@@ -723,6 +857,7 @@ def init_sl(df,idx,entry,direction,sl_type,sl_pts,params):
         # SL derived from target / RR ratio; tgt_pts passed via params
         tgt_pts=params.get("tgt_pts_for_sl", sl_pts*rr)
         return entry-d*(tgt_pts/rr)
+    if sl_type=="Strategy Signal Exit":      return entry-d*sl_pts  # placeholder; exit handled via signal
     return entry-d*sl_pts
 
 def update_sl(df,j,entry,direction,sl_type,sl_pts,cur_sl,params):
@@ -778,9 +913,9 @@ def init_tgt(df,idx,entry,direction,tgt_type,tgt_pts,sl,params):
         return float(df["High"].iloc[idx]) if d==1 else float(df["Low"].iloc[idx])
     if tgt_type in("Trailing Prev Swing High/Low","Trailing Curr Swing High/Low"):
         return _sw_hi(df,idx,lb) if d==1 else _sw_lo(df,idx,lb)
-    if tgt_type=="ATR Based":            return entry+d*am*av
-    if tgt_type=="Risk/Reward Based":    return entry+d*rr*abs(entry-sl)
-    if tgt_type=="Reverse EMA Crossover": return entry+d*tgt_pts   # placeholder; exit driven by signal
+    if tgt_type in("ATR Based","Risk/Reward Based"): return entry+d*am*av if tgt_type=="ATR Based" else entry+d*rr*abs(entry-sl)
+    if tgt_type=="Reverse EMA Crossover":  return entry+d*tgt_pts   # placeholder; exit driven by signal
+    if tgt_type=="Strategy Signal Exit":   return entry+d*tgt_pts   # placeholder; exit driven by signal
     return entry+d*tgt_pts
 
 def update_tgt(df,j,direction,tgt_type,tgt_pts,cur_tgt,params,sigs=None):
@@ -794,9 +929,9 @@ def update_tgt(df,j,direction,tgt_type,tgt_pts,cur_tgt,params,sigs=None):
     if tgt_type in("Trailing Prev Swing High/Low","Trailing Curr Swing High/Low"):
         return (max(cur_tgt,_sw_hi(df,j,lb)) if d==1 else min(cur_tgt,_sw_lo(df,j,lb))),True
     if tgt_type in("ATR Based","Risk/Reward Based"): return cur_tgt,True
-    if tgt_type=="Reverse EMA Crossover":
-        # Exit when strategy signal reverses (handled in backtest loop externally)
-        return cur_tgt, False   # never hits target; exits via EMA reverse crossover
+    if tgt_type in("Reverse EMA Crossover","Strategy Signal Exit"):
+        # Exit when strategy signal reverses — handled externally in backtest loop
+        return cur_tgt, False   # never triggers via price; exits via signal reversal
     return cur_tgt,True
 
 # ── BACKTEST ENGINE ────────────────────────────────────────────────────────────
@@ -852,11 +987,13 @@ def run_backtest(df, strategy, params, sl_type, sl_pts, tgt_type, tgt_pts,
             sl=update_sl(df,j,entry,direction,sl_type,sl_pts,sl,params)
             disp_tgt,tf=update_tgt(df,j,direction,tgt_type,tgt_pts,disp_tgt,params,sigs)
             if tf: tgt=disp_tgt
-            # EMA/Signal reverse crossover for SL or Target
-            if sl_type=="EMA Reverse Crossover" or tgt_type=="Reverse EMA Crossover":
+            # Signal-based exit: fires when strategy signal reverses direction
+            _sig_exit = (sl_type in ("EMA Reverse Crossover","Strategy Signal Exit") or
+                         tgt_type in ("Reverse EMA Crossover","Strategy Signal Exit"))
+            if _sig_exit:
                 rev=int(sigs.iloc[j])
                 if rev!=0 and rev!=direction:
-                    exit_bar,exit_px,exit_why=j,float(df["Open"].iloc[j]),"Reverse Crossover"; exited=True
+                    exit_bar,exit_px,exit_why=j,float(df["Open"].iloc[j]),"Strategy Signal Exit"; exited=True
             # Time window: force exit if outside hours
             if not exited and _tw_active and not _bar_in_window(df.index[j]):
                 exit_bar,exit_px,exit_why=j,float(df["Close"].iloc[j]),"Time Window Exit"; exited=True
@@ -1209,24 +1346,50 @@ def strategy_params_ui(strategy, prefix, applied=None):
         p["ema_period"]  = int  (_n("EMA Period", 5,200,50,f"{prefix}_srema"))
         p["touch_pct"]   = float(_n("Touch threshold %",0.01,5,0.3,f"{prefix}_srtp",step=0.05))
 
+    elif strategy == "VWAP + EMA Confluence":
+        p["ema_period"] = int  (_n("EMA Period",5,200,20,f"{prefix}_vece"))
+        p["dev_pct"]    = float(_n("VWAP Deviation %",0.1,5,0.5,f"{prefix}_vedev",step=0.1))
+
+    elif strategy == "Opening Range Breakout (ORB)":
+        p["orb_minutes"] = int  (_n("Opening Range (minutes)",5,60,15,f"{prefix}_orbm",step=5))
+        p["vol_mult"]    = float(_n("Volume Multiplier",1.0,5,1.3,f"{prefix}_orbv",step=0.1))
+        st.caption("ORB: BUY above first N-min high, SELL below first N-min low with volume surge.")
+
+    elif strategy == "Mean Reversion Bollinger":
+        p["period"]     = int  (_n("BB Period",5,200,20,f"{prefix}_mrbp"))
+        p["std"]        = float(_n("Std Dev",0.5,5,2.0,f"{prefix}_mrbs",step=0.1))
+        p["rsi_period"] = int  (_n("RSI Period",2,50,14,f"{prefix}_mrrp"))
+
+    elif strategy == "Trend Momentum (ADX+EMA)":
+        p["ema_period"]  = int(_n("EMA Period",5,200,50,f"{prefix}_tmep"))
+        p["adx_period"]  = int(_n("ADX Period",2,50,14,f"{prefix}_tmap"))
+        p["adx_thresh"]  = int(_n("ADX Threshold",10,50,25,f"{prefix}_tmat"))
+
+    elif strategy == "Gap & Go":
+        p["gap_pct"]  = float(_n("Gap % threshold",0.1,10,0.3,f"{prefix}_ggpct",step=0.1))
+        p["vol_mult"] = float(_n("Volume Multiplier",1.0,5,1.5,f"{prefix}_ggvol",step=0.1))
+        st.caption("Gap-up/gap-down continuation. Filters with volume surge.")
+
+    elif strategy == "Inside Bar Breakout":
+        p["ema_period"] = int(_n("Trend EMA Period",5,200,50,f"{prefix}_ibep"))
+        st.caption("Inside bar forms => breakout above/below triggers with trend filter.")
+
     elif strategy == "Custom Strategy":
         st.markdown("""
-**Manual Custom Strategy** — edit `sig_custom()` in the source file.
+**Manual Custom Strategy** - edit sig_custom() in the source file.
 
-Available helpers: `ema(s,p)`, `sma(s,p)`, `rsi(s,p)`, `atr(df,p)`,
-`bollinger(s,p,k)`, `macd(s,f,sl,sig)`, `stoch(df,k,d)`, `vwap_calc(df)`,
-`_cup(a,b)` *(cross up)*, `_cdn(a,b)` *(cross down)*
+Available helpers: ema(s,p), sma(s,p), rsi(s,p), atr(df,p),
+bollinger(s,p,k), macd(s,f,sl,sig), stoch(df,k,d), vwap_calc(df),
+_cup(a,b) (cross up), _cdn(a,b) (cross down)
 
-**Example in sig_custom:**
-```python
-fe=ema(df['Close'],9); se=ema(df['Close'],21); r=rsi(df['Close'],14)
-s=pd.Series(0,index=df.index)
-s[_cup(fe,se)&(r<60)]=1    # LONG
-s[_cdn(fe,se)&(r>40)]=-1   # SHORT
-return s, {'EMA9':fe,'EMA21':se}
-```
+Example in sig_custom:
+    fe=ema(df['Close'],9); se=ema(df['Close'],21); r=rsi(df['Close'],14)
+    s=pd.Series(0,index=df.index)
+    s[_cup(fe,se)&(r<60)]=1
+    s[_cdn(fe,se)&(r>40)]=-1
+    return s, {'EMA9':fe,'EMA21':se}
         """)
-        st.info("No parameters here — configure logic in code, then click **Run Backtest**.")
+        st.info("No parameters here - configure logic in code, then click Run Backtest.")
 
     elif strategy == "Custom Strategy Builder":
         st.caption("Build signal rules visually — up to 5 conditions with AND/OR logic.")
@@ -1453,7 +1616,29 @@ with st.sidebar:
         dhan_entry_ot=st.selectbox("Entry Order Type",["MARKET","LIMIT"],index=0,key="dhan_entry_ot")
         dhan_exit_ot =st.selectbox("Exit Order Type", ["MARKET","LIMIT"],index=0,key="dhan_exit_ot")
         if dhan_entry_ot=="LIMIT" or dhan_exit_ot=="LIMIT":
-            st.caption("⚠️ Limit orders require you to set price. LTP will be used as limit price — adjust in Dhan app if needed.")
+            st.caption("⚠️ LTP will be used as limit price — adjust in Dhan app if needed.")
+        # ── Multi-account support ─────────────────────────────────────────
+        multi_acc = st.checkbox("Enable Multi-Account (place orders in multiple Dhan accounts)",
+                                value=False, key="dhan_multi_acc")
+        if multi_acc:
+            st.caption("Add extra Dhan accounts below. Orders placed simultaneously in ALL accounts.")
+            _n_extra = st.session_state.get("dhan_n_extra", 0)
+            _ca1, _ca2 = st.columns(2)
+            if _ca1.button("➕ Add Account", key="dhan_add_acc"):
+                st.session_state["dhan_n_extra"] = min(_n_extra + 1, 5)
+                st.rerun()
+            if _ca2.button("➖ Remove Last", key="dhan_rem_acc"):
+                st.session_state["dhan_n_extra"] = max(_n_extra - 1, 0)
+                st.rerun()
+            _extra_accounts = []
+            for _ai in range(int(st.session_state.get("dhan_n_extra", 0))):
+                with st.expander(f"Account {_ai+2}", expanded=True):
+                    _ecid = st.text_input(f"Client ID (acc{_ai+2})", "", key=f"dhan_ecid_{_ai}")
+                    _etok = st.text_input(f"Token (acc{_ai+2})", "", key=f"dhan_etok_{_ai}", type="password")
+                    _extra_accounts.append({"client":_ecid, "token":_etok})
+            st.session_state["dhan_extra_accounts"] = _extra_accounts
+        else:
+            st.session_state["dhan_extra_accounts"] = []
     else:
         dhan_client=""; dhan_token=""; is_stocks=False
         dhan_prod="INTRADAY"; dhan_exch="NSE"; dhan_s_qty=1
@@ -1792,33 +1977,40 @@ with tab_live:
         def _dhan_place(direction):
             if not st.session_state.get("dhan_enabled",False): return
             if not dhan_client or not dhan_token: st.warning("Dhan: credentials not set."); return
-            try:
-                from dhanhq import dhanhq as _Dhan
-                _d=_Dhan(dhan_client,dhan_token)
-                if st.session_state.get("dhan_sq_all",False):
-                    try: _d.cancel_all_orders()
-                    except: pass
-                _ot=_d.MARKET if dhan_entry_ot=="MARKET" else _d.LIMIT
-                _lp=cl if dhan_entry_ot=="LIMIT" else 0
-                if st.session_state.get("dhan_is_stocks",False):
-                    _txn=_d.BUY if direction==1 else _d.SELL
-                    _exch={"NSE":_d.NSE,"BSE":_d.BSE}.get(dhan_exch,_d.NSE)
-                    _d.place_order(security_id=sym,exchange_segment=_exch,
-                        transaction_type=_txn,quantity=int(dhan_s_qty),
-                        order_type=_ot,product_type=_d.INTRADAY if dhan_prod=="INTRADAY" else _d.DELIVERY,
-                        price=_lp)
-                    st.info(f"Dhan ({dhan_entry_ot}): {'BUY' if direction==1 else 'SELL'} {dhan_s_qty}x {sym}")
-                else:
-                    _sid=dhan_ce_sid if direction==1 else dhan_pe_sid
-                    _opt="CE" if direction==1 else "PE"
-                    if not _sid: st.warning(f"Dhan: {_opt} Security ID not set."); return
-                    _exch={"NSE.FNO":_d.NSE_FNO,"BSE.FNO":_d.BSE_FNO}.get(dhan_o_exch,_d.NSE_FNO)
-                    _d.place_order(security_id=_sid,exchange_segment=_exch,
-                        transaction_type=_d.BUY,quantity=int(dhan_o_qty),
-                        order_type=_ot,product_type=_d.INTRADAY,price=_lp)
-                    st.info(f"Dhan ({dhan_entry_ot}): BUY {dhan_o_qty}x {_opt}")
-            except ImportError: st.error("pip install dhanhq")
-            except Exception as ex: st.error(f"Dhan order error: {ex}")
+            # Build list of all accounts: primary + extra
+            _accounts = [{"client":dhan_client,"token":dhan_token}]
+            for _ea in st.session_state.get("dhan_extra_accounts",[]):
+                if _ea.get("client") and _ea.get("token"):
+                    _accounts.append(_ea)
+            for _acc_idx, _acc in enumerate(_accounts):
+                try:
+                    from dhanhq import dhanhq as _Dhan
+                    _d=_Dhan(_acc["client"],_acc["token"])
+                    _acc_label = f"Acc{_acc_idx+1}"
+                    if st.session_state.get("dhan_sq_all",False):
+                        try: _d.cancel_all_orders()
+                        except: pass
+                    _ot=_d.MARKET if dhan_entry_ot=="MARKET" else _d.LIMIT
+                    _lp=cl if dhan_entry_ot=="LIMIT" else 0
+                    if st.session_state.get("dhan_is_stocks",False):
+                        _txn=_d.BUY if direction==1 else _d.SELL
+                        _exch={"NSE":_d.NSE,"BSE":_d.BSE}.get(dhan_exch,_d.NSE)
+                        _d.place_order(security_id=sym,exchange_segment=_exch,
+                            transaction_type=_txn,quantity=int(dhan_s_qty),
+                            order_type=_ot,product_type=_d.INTRADAY if dhan_prod=="INTRADAY" else _d.DELIVERY,
+                            price=_lp)
+                        st.info(f"Dhan {_acc_label} ({dhan_entry_ot}): {'BUY' if direction==1 else 'SELL'} {dhan_s_qty}x {sym}")
+                    else:
+                        _sid=dhan_ce_sid if direction==1 else dhan_pe_sid
+                        _opt="CE" if direction==1 else "PE"
+                        if not _sid: st.warning(f"Dhan {_acc_label}: {_opt} Security ID not set."); continue
+                        _exch={"NSE.FNO":_d.NSE_FNO,"BSE.FNO":_d.BSE_FNO}.get(dhan_o_exch,_d.NSE_FNO)
+                        _d.place_order(security_id=_sid,exchange_segment=_exch,
+                            transaction_type=_d.BUY,quantity=int(dhan_o_qty),
+                            order_type=_ot,product_type=_d.INTRADAY,price=_lp)
+                        st.info(f"Dhan {_acc_label} ({dhan_entry_ot}): BUY {dhan_o_qty}x {_opt}")
+                except ImportError: st.error("pip install dhanhq"); break
+                except Exception as ex: st.error(f"Dhan {_acc_label} order error: {ex}")
 
         def _dhan_exit(direction):
             if not st.session_state.get("dhan_enabled",False): return
@@ -1909,6 +2101,127 @@ with tab_live:
                               delta_color="normal" if unreal>=0 else "inverse")
 
         st.plotly_chart(plot_ohlc(lv_df,indics=lv_indics,title=f"LIVE:{t_choice}({interval}) Tick#{tick}"),use_container_width=True,key=f"lv_ohlc_{tick}")
+
+        # ── Signal Progress Expander ─────────────────────────────────────────────
+        # Shows current indicator values, where they are vs signal trigger,
+        # and an estimate of how close we are to firing a signal.
+        with st.expander("📊 Signal Progress — How close is the next signal?", expanded=False):
+            st.caption(
+                "No need to watch the screen all day. This panel shows the **current state** of "
+                "every indicator and how far it is from triggering a signal. "
+                "Refresh rate = your tick interval (currently every 2s with fragment)."
+            )
+            _sp_items = []
+
+            # ── EMA Crossover ─────────────────────────────────────────────────
+            if "EMA_fast" in lv_indics and "EMA_slow" in lv_indics:
+                _fe = float(lv_indics["EMA_fast"].dropna().iloc[-1]) if len(lv_indics["EMA_fast"].dropna())>0 else None
+                _se = float(lv_indics["EMA_slow"].dropna().iloc[-1]) if len(lv_indics["EMA_slow"].dropna())>0 else None
+                if _fe and _se:
+                    _gap = _fe - _se
+                    _gap_pct = abs(_gap) / max(abs(_se),0.01) * 100
+                    _prev_fe = float(lv_indics["EMA_fast"].dropna().iloc[-2]) if len(lv_indics["EMA_fast"].dropna())>1 else _fe
+                    _prev_se = float(lv_indics["EMA_slow"].dropna().iloc[-2]) if len(lv_indics["EMA_slow"].dropna())>1 else _se
+                    _prev_gap = _prev_fe - _prev_se
+                    _narrowing = abs(_gap) < abs(_prev_gap)
+                    _dir = "Fast ABOVE Slow → LONG bias" if _gap>0 else "Fast BELOW Slow → SHORT bias"
+                    _action = "approaching crossover ⚡" if _narrowing else "diverging"
+                    _sp_items.append({
+                        "Indicator": f"EMA Fast({live_params.get('fast',9)})",
+                        "Value": f"{_fe:.2f}",
+                        "Reference": f"EMA Slow({live_params.get('slow',15)}) = {_se:.2f}",
+                        "Gap": f"{_gap:+.2f} ({_gap_pct:.2f}%)",
+                        "Status": _dir,
+                        "Trend": f"{'🔽 narrowing' if _narrowing else '🔼 widening'} → {_action}",
+                        "Est. Bars": "< 3 bars" if _gap_pct < 0.5 else (f"~{int(_gap_pct/max(abs(_gap-_prev_gap),0.001))} bars" if _narrowing and abs(_gap-_prev_gap)>0 else "—"),
+                    })
+
+            # ── RSI ────────────────────────────────────────────────────────────
+            if "RSI" in lv_indics:
+                _rv = float(lv_indics["RSI"].dropna().iloc[-1]) if len(lv_indics["RSI"].dropna())>0 else None
+                if _rv:
+                    _ob = live_params.get("ob",70); _os = live_params.get("os_",30)
+                    _to_ob = _ob - _rv; _to_os = _rv - _os
+                    _prev_rv = float(lv_indics["RSI"].dropna().iloc[-2]) if len(lv_indics["RSI"].dropna())>1 else _rv
+                    _rv_dir = "rising ↗" if _rv > _prev_rv else "falling ↘"
+                    if _rv < _os:
+                        _status = f"🟢 OVERSOLD — BUY signal may have already fired"
+                    elif _rv > _ob:
+                        _status = f"🔴 OVERBOUGHT — SELL signal may have already fired"
+                    elif _to_ob < 10:
+                        _status = f"⚠️ Near Overbought ({_rv:.1f} vs {_ob}) — SELL approaching"
+                    elif _to_os < 10:
+                        _status = f"⚠️ Near Oversold ({_rv:.1f} vs {_os}) — BUY approaching"
+                    else:
+                        _status = f"Neutral ({_rv:.1f}), {_rv_dir}"
+                    _sp_items.append({
+                        "Indicator": f"RSI({live_params.get('period',14)})",
+                        "Value": f"{_rv:.2f}",
+                        "Reference": f"OB={_ob} / OS={_os}",
+                        "Gap": f"{_to_ob:+.1f} to OB | {_to_os:+.1f} to OS",
+                        "Status": _status,
+                        "Trend": _rv_dir,
+                        "Est. Bars": f"~{max(1,int(_to_ob/max(abs(_rv-_prev_rv),0.5)))} bars to OB" if _rv>50 and _rv<_ob else "—",
+                    })
+
+            # ── MACD ───────────────────────────────────────────────────────────
+            if "MACD" in lv_indics and "MACD_Signal" in lv_indics:
+                _mv = float(lv_indics["MACD"].dropna().iloc[-1]) if len(lv_indics["MACD"].dropna())>0 else None
+                _msv = float(lv_indics["MACD_Signal"].dropna().iloc[-1]) if len(lv_indics["MACD_Signal"].dropna())>0 else None
+                if _mv is not None and _msv is not None:
+                    _hist = _mv - _msv
+                    _prev_mv  = float(lv_indics["MACD"].dropna().iloc[-2]) if len(lv_indics["MACD"].dropna())>1 else _mv
+                    _prev_msv = float(lv_indics["MACD_Signal"].dropna().iloc[-2]) if len(lv_indics["MACD_Signal"].dropna())>1 else _msv
+                    _prev_hist= _prev_mv - _prev_msv
+                    _converging = abs(_hist) < abs(_prev_hist)
+                    _sp_items.append({
+                        "Indicator": "MACD",
+                        "Value": f"MACD={_mv:.3f} | Signal={_msv:.3f}",
+                        "Reference": "Crossover when histogram = 0",
+                        "Gap": f"Histogram={_hist:+.4f}",
+                        "Status": f"{'🟢 Bullish' if _hist>0 else '🔴 Bearish'} histogram",
+                        "Trend": f"{'converging ↘ (crossover near!)' if _converging else 'diverging'}",
+                        "Est. Bars": "< 2 bars" if abs(_hist) < abs(_prev_hist)*0.2 else "—",
+                    })
+
+            # ── Supertrend ─────────────────────────────────────────────────────
+            if "Supertrend" in lv_indics:
+                _stv = float(lv_indics["Supertrend"].dropna().iloc[-1]) if len(lv_indics["Supertrend"].dropna())>0 else None
+                if _stv:
+                    _dist = cl - _stv
+                    _sp_items.append({
+                        "Indicator": f"Supertrend",
+                        "Value": f"{_stv:.2f}",
+                        "Reference": f"LTP = {cl:.2f}",
+                        "Gap": f"{_dist:+.2f} ({abs(_dist)/cl*100:.2f}%)",
+                        "Status": f"{'🟢 Bullish (price above)' if _dist>0 else '🔴 Bearish (price below)'}",
+                        "Trend": "Flip imminent!" if abs(_dist)/cl*100 < 0.3 else "Stable",
+                        "Est. Bars": "< 1 bar" if abs(_dist)/cl*100 < 0.15 else "—",
+                    })
+
+            # ── Bollinger Bands ────────────────────────────────────────────────
+            if "BB_upper" in lv_indics and "BB_lower" in lv_indics:
+                _bu = float(lv_indics["BB_upper"].dropna().iloc[-1]) if len(lv_indics["BB_upper"].dropna())>0 else None
+                _bl_ = float(lv_indics["BB_lower"].dropna().iloc[-1]) if len(lv_indics["BB_lower"].dropna())>0 else None
+                if _bu and _bl_:
+                    _bw = _bu - _bl_
+                    _to_upper = _bu - cl; _to_lower = cl - _bl_
+                    _sp_items.append({
+                        "Indicator": f"BB(±{live_params.get('std',2)}σ)",
+                        "Value": f"Upper={_bu:.2f} | Lower={_bl_:.2f}",
+                        "Reference": f"LTP={cl:.2f}, Width={_bw:.2f}",
+                        "Gap": f"{_to_upper:+.2f} to upper | {_to_lower:+.2f} to lower",
+                        "Status": ("🔴 Near upper — SELL zone" if _to_upper/cl*100<0.5
+                                   else "🟢 Near lower — BUY zone" if _to_lower/cl*100<0.5 else "Mid range"),
+                        "Trend": "—","Est. Bars": "—",
+                    })
+
+            if _sp_items:
+                _sp_df = pd.DataFrame(_sp_items)
+                st.dataframe(_sp_df, use_container_width=True, hide_index=True)
+            else:
+                st.info(f"No indicator progress data available for **{strategy}** yet. "
+                        "Indicators appear after enough data bars are loaded.")
 
     def _hist_render():
         t_=st.session_state.live_trades
