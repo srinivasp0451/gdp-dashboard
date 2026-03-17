@@ -634,58 +634,56 @@ def _ew_diagnostics(df, min_wave_pct=1.0):
 
         else:  # leg_dir == -1 → last confirmed pivot was a SWING LOW
             # LONG setup: price is currently rallying from the low.
-            # Step 1: rally must reach req_high_px to confirm Pivot B (swing high)
+            # KEY FIX: Use the HIGHEST candle High seen since the last confirmed pivot,
+            # NOT cur_price. This prevents Step 1 from flickering on/off as price wiggles
+            # around the threshold tick-by-tick.
             req_high_px = p_last[1] * (1 + min_mv)
-            step1_done  = cur_price > req_high_px
-            # Step 2: after Pivot B is confirmed, price must pull back ≥ min_wave_pct% to form Pivot C
-            # We don't know the pullback low yet — it only exists once the pivot forms
-            # Step 3: Pivot C must stay above p_last[1] (the prior low = Pivot A)
+            # Rolling high from last pivot to current bar (uses High column, not Close)
+            _pivot_bar_idx = last_idx if last_idx >= 0 and last_idx < n else max(0, n-50)
+            _high_since_pivot = float(df["High"].iloc[_pivot_bar_idx:].max())
+            step1_done  = _high_since_pivot > req_high_px   # STABLE — only goes True, never reverts
             prior_low   = p_last[1]
 
-            # How far into the pullback are we (only meaningful once step1 done)?
-            peak_so_far = float(df["High"].iloc[-1]) if step1_done else cur_price
-            # Rough pullback progress: how much has price dropped from recent peak
-            _recent_high = float(df["High"].iloc[max(0,len(df)-20):].max()) if step1_done else cur_price
-            _pullback_so_far = (_recent_high - cur_price) / max(abs(_recent_high), 0.001) * 100
+            # Pullback: how much has price dropped from the highest point since pivot
+            _recent_high     = _high_since_pivot if step1_done else cur_price
+            _pullback_so_far = max(0, (_recent_high - cur_price) / max(abs(_recent_high), 0.001) * 100) if step1_done else 0
             _pullback_needed = min_wave_pct
             step2_progress   = min(100, _pullback_so_far / max(_pullback_needed, 0.001) * 100) if step1_done else 0
-            # Step 2 done only if price has already pulled back the required amount AND
-            # new pivot has been confirmed (price then bounced back up). Approximate: step2_progress >= 100
-            step2_monitoring = step1_done and _pullback_so_far < _pullback_needed
             step2_done_approx = step1_done and _pullback_so_far >= _pullback_needed
+
+            _step1_pct = min(100,(_high_since_pivot-p_last[1])/max(req_high_px-p_last[1],0.001)*100)
 
             long_conditions = [
                 {
                     "Step":      "CURRENT → Step 1 of 3",
-                    "Condition": "Price must RALLY ≥ min_wave_pct% above the prior swing LOW to confirm Pivot B (swing high)",
-                    "Required":  f"> {req_high_px:.2f}  (prior low {p_last[1]:.2f} + {min_wave_pct:.2f}%)",
-                    "Current":   f"{cur_price:.2f}",
-                    "Met":       "✅ Pivot B HIGH confirmed — now watching for pullback (Step 2)" if step1_done
-                                 else f"❌ Need {req_high_px - cur_price:.2f} pts more rally  ({min(100,(cur_price-p_last[1])/max(req_high_px-p_last[1],0.001)*100):.0f}% there)",
-                    "Progress":  f"{min(100,(cur_price-p_last[1])/max(req_high_px-p_last[1],0.001)*100):.0f}%",
+                    "Condition": "Highest candle High since pivot A must exceed pivot A × (1 + min_wave_pct%)",
+                    "Required":  f"> {req_high_px:.2f}  (pivot A {p_last[1]:.2f} + {min_wave_pct:.2f}%)",
+                    "Current":   f"Highest High since pivot: {_high_since_pivot:.2f}  |  LTP: {cur_price:.2f}",
+                    "Met":       "✅ Rally confirmed (Pivot B set) — now watching for pullback" if step1_done
+                                 else f"❌ Need {req_high_px-_high_since_pivot:.2f} pts more  ({_step1_pct:.0f}% there)",
+                    "Progress":  f"{_step1_pct:.0f}%",
                 },
                 {
                     "Step":      "Step 2 of 3" + (" ← ACTIVE NOW" if step1_done else " (locked until Step 1 done)"),
-                    "Condition": "Price must PULL BACK ≥ min_wave_pct% from Pivot B high — this forms Pivot C (corrective low) = THE SIGNAL BAR",
-                    "Required":  f"−{min_wave_pct:.2f}% drop from recent high ({_recent_high:.2f} → need price ≤ {_recent_high*(1-min_mv/100):.2f})" if step1_done
-                                 else f"−{min_wave_pct:.2f}% drop from Pivot B (once formed)",
-                    "Current":   f"Pullback so far: {_pullback_so_far:.2f}% (need {_pullback_needed:.2f}%)" if step1_done
+                    "Condition": "LTP must drop ≥ min_wave_pct% from Pivot B high — forms Pivot C (corrective low) = SIGNAL BAR",
+                    "Required":  f"Price ≤ {_recent_high*(1-min_mv/100):.2f}  (= {_recent_high:.2f} − {min_wave_pct:.2f}%)" if step1_done
+                                 else f"−{min_wave_pct:.2f}% from Pivot B",
+                    "Current":   f"Pullback so far: {_pullback_so_far:.2f}% / {_pullback_needed:.2f}% needed" if step1_done
                                  else "⏳ Complete Step 1 first",
-                    "Met":       "✅ Pullback sufficient — Pivot C forming!" if step2_done_approx
-                                 else ("⏳ Watching pullback ({:.0f}% of needed {:.2f}%)".format(step2_progress, _pullback_needed) if step1_done
-                                       else "⏳ Locked — complete Step 1 first"),
+                    "Met":       "✅ Pullback complete — Pivot C formed!" if step2_done_approx
+                                 else (f"⏳ Watching: {step2_progress:.0f}% of {_pullback_needed:.2f}% done" if step1_done
+                                       else "⏳ Locked"),
                     "Progress":  f"{step2_progress:.0f}%" if step1_done else "—",
                 },
                 {
-                    "Step":      "Step 3 of 3 (checked only after Step 2 completes)",
-                    "Condition": "Pivot C low must be HIGHER than Pivot A ({:.2f}) — confirms bullish higher-low → 🚀 LONG signal fires".format(prior_low),
-                    "Required":  f"> {prior_low:.2f}  (Pivot A = prior swing low)",
-                    "Current":   f"~{cur_price:.2f} (estimated — actual Pivot C low determined by market)" if step1_done
-                                 else "Checked after Steps 1 & 2 complete",
-                    "Met":       "⏳ Locked — Steps 1 & 2 must complete first" if not step2_done_approx
-                                 else ("✅ Higher-low confirmed → LONG signal will fire!" if cur_price > prior_low
-                                       else f"❌ Below Pivot A ({prior_low:.2f}) — bullish structure broken"),
-                    "Progress":  f"{(cur_price-prior_low)/max(abs(prior_low),0.001)*100:+.2f}% above Pivot A" if step2_done_approx else "—",
+                    "Step":      "Step 3 of 3 (auto-checked after Step 2)",
+                    "Condition": "Pivot C low must stay ABOVE pivot A ({:.2f}) → higher-low = bullish → LONG signal fires".format(prior_low),
+                    "Required":  f"> {prior_low:.2f}  (pivot A)",
+                    "Current":   f"~{cur_price:.2f}  (approx — Pivot C = actual reversal low)" if step1_done else "—",
+                    "Met":       "⏳ Locked (Steps 1+2 first)" if not step2_done_approx
+                                 else ("✅ Higher-low confirmed → LONG fires!" if cur_price > prior_low
+                                       else f"❌ Below pivot A ({prior_low:.2f}) — structure broken"),
+                    "Progress":  f"{(cur_price-prior_low)/max(abs(prior_low),0.001)*100:+.2f}% above pivot A" if step2_done_approx else "—",
                 },
             ]
             # SHORT conditions when last pivot was a LOW
@@ -757,32 +755,10 @@ def sig_elliott_wave(df, swing_lookback=10, min_wave_pct=1.0, **_):
     return s, {"EMA_20": e20}
 
 # ── ADVANCED STRATEGY: Elliott Wave v2 (Bar-Based Swing + Fibonacci) ─────────
-"""
-Elliott Wave v2 — KEY DIFFERENCES FROM v1:
-
-v1 Problem on 5-min charts:
-  min_wave_pct=1.0% means each leg needs a 1% move (e.g. 220pts on Nifty 22000).
-  You need 3 legs = 660pts minimum. On 5-min this happens 3-4x/month → too few trades.
-
-v2 Solution:
-  Uses BAR-COUNT swing detection instead of %-move threshold.
-  A swing high = price is highest in N bars before AND N bars after (confirmed pivot).
-  This works like TradingView's built-in Zigzag — produces 10-30x more signals intraday.
-
-v2 also adds:
-  1. Fibonacci retracement filter — wave C must retrace 38.2%–88.6% of wave AB
-     (filters low-quality setups, keeps high-probability ones)
-  2. 5-wave impulse detection — not just 3-wave corrections (A-B-C) but full
-     Elliott impulse (1-2-3-4-5): waves 1,3,5 in trend direction, 2,4 corrections
-  3. EMA trend filter — only take LONG setups when above trend EMA and vice versa
-  4. Volume confirmation — signal bar has above-average volume
-
-Signal logic:
-  - 3-wave correction LONG:  sw-low → sw-high → higher sw-low + Fib retrace + above EMA
-  - 3-wave correction SHORT: sw-high → sw-low → lower sw-high + Fib retrace + below EMA
-  - 5-wave impulse LONG:     detect waves 1-2-3-4-5 up sequence
-  - 5-wave impulse SHORT:    detect waves 1-2-3-4-5 down sequence
-"""
+# v1 Problem on 5-min: min_wave_pct=1.0% → needs 1% per leg → 660pts for 3 legs → 3-4 trades/month
+# v2 Solution: BAR-COUNT swing detection (N-bar pivot confirmation), not %-move threshold.
+# v2 adds: Fibonacci retracement filter (38.2-88.6%), 5-wave impulse detection,
+#          EMA trend filter, volume confirmation.
 
 def _ew2_build_swings(df, swing_bars=5):
     """
@@ -2665,7 +2641,34 @@ with tab_live:
         fn=STRATEGY_FN.get(strategy,sig_custom)
         try: lv_sigs,lv_indics=fn(lv_df,**live_params)
         except Exception as e: lv_sigs=pd.Series(0,index=lv_df.index); lv_indics={}; st.warning(f"Strategy error:{e}")
-        last_sig=int(lv_sigs.iloc[-2]) if len(lv_sigs)>1 else 0
+
+        # ── Signal detection: lookback window matched to strategy type ────────
+        # BACKTEST: scans every bar sequentially → sees every historical signal
+        # LIVE:     re-runs strategy each tick → must check recent bars for fresh signal
+        #
+        # Non-pattern strategies: signal fires ON the bar (EMA cross, RSI cross etc.)
+        #   → 1 bar lookback is enough (just closed bar)
+        # Pattern strategies: confirmation requires price to move away from the signal bar
+        #   → need wider lookback (Elliott Wave pivot confirmed after N bars of opposite move)
+        #
+        # Rule: use the most recent non-zero signal within the lookback window.
+        # If that signal is older than the window, it is stale — do NOT enter.
+        _WIDE_LOOKBACK  = {"Elliott Wave (Simplified)":5,
+                           "Elliott Wave v2 (Swing+Fib)":3,
+                           "Elliott Wave v3 (Extrema)":3,
+                           "SMC Order Blocks":3,
+                           "Price Action Patterns":2,
+                           "Inside Bar Breakout":2,
+                           "Breakout Strategy":2,
+                           "Support & Resistance + EMA":2}
+        _sig_lookback = _WIDE_LOOKBACK.get(strategy, 1)
+        last_sig = 0
+        for _si in range(1, _sig_lookback + 2):   # +2: include current forming bar for patterns
+            if len(lv_sigs) > _si:
+                _sv = int(lv_sigs.iloc[-_si])
+                if _sv != 0:
+                    last_sig = _sv
+                    break
 
         # ── Price row ─────────────────────────────────────────────────────────
         m=st.columns(6)
