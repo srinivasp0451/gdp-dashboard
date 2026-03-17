@@ -2830,6 +2830,37 @@ with tab_live:
         _allow_new = (_in_window and _cooldown_ok and
                       (not st.session_state.get("no_overlap",True) or pos is None))
 
+        # ── Entry Gate Diagnostic — shows exactly why algo did/didn't enter ──
+        with st.expander("🔑 Entry Gate Status — why algo entered or didn't", expanded=(last_sig!=0)):
+            _g1,_g2,_g3,_g4 = st.columns(4)
+            _g1.metric("Strategy Signal", "🟢 BUY" if last_sig==1 else ("🔴 SELL" if last_sig==-1 else "⚪ FLAT (0)"),
+                       help="0 = no signal on last closed bar(s). Entry requires non-zero.")
+            _g2.metric("Time Window", "✅ In window" if _in_window else "❌ Outside window",
+                       help="Time window filter in Trade Management. If disabled always ✅.")
+            _g3.metric("Cooldown", "✅ Ready" if _cooldown_ok else "⏳ Waiting",
+                       help="Cooldown between trades. Counts down after each exit.")
+            _g4.metric("Position Slot", "✅ Free" if pos is None else "🔒 Position open",
+                       help="Overlap prevention. Only one position at a time when enabled.")
+            if last_sig == 0:
+                st.warning(
+                    "**No entry because: strategy signal = 0 on last closed bar(s).** "
+                    "The Signal Progress expander shows *approximate diagnostic conditions* — "
+                    "they are display helpers, not the exact signal computation. "
+                    "The actual entry fires when `sig_elliott_wave()` (or whichever strategy) "
+                    "places a non-zero value at a recent bar. "
+                    "If the Signal Progress shows all conditions met but signal is still 0, "
+                    "it means the pivot hasn't been *confirmed and placed* at a bar within the "
+                    f"lookback window ({_WIDE_LOOKBACK.get(strategy, 1)} bars for {strategy}). "
+                    "Keep watching — once the pattern completes on a closed bar the algo WILL enter."
+                )
+            elif not _allow_new:
+                st.warning("Signal detected but entry blocked — check gate status above.")
+            else:
+                if pos is None:
+                    st.success(f"✅ All gates open — entry triggered! Signal={last_sig}")
+                else:
+                    st.info("Position already open — monitoring for exit.")
+
         if pos is None and last_sig!=0 and _allow_new:
             d=last_sig; ep=cl
             lv_sl =init_sl(lv_df,lv_n-1,ep,d,sl_type,sl_pts,live_params)
@@ -2933,6 +2964,26 @@ with tab_live:
                               delta_color="normal" if unreal>=0 else "inverse")
 
         st.plotly_chart(plot_ohlc(lv_df,indics=lv_indics,title=f"LIVE:{t_choice}({interval}) Tick#{tick}"),use_container_width=True,key=f"lv_ohlc_{tick}")
+
+        # ── Compact closed-trade summary — always visible without switching tabs ──
+        _closed = st.session_state.get("live_trades", [])
+        if _closed:
+            _ct=len(_closed); _cw=sum(1 for x in _closed if x["PnL"]>0)
+            _cp=sum(x["PnL"] for x in _closed)
+            st.markdown("---")
+            _sm1,_sm2,_sm3,_sm4 = st.columns(4)
+            _sm1.metric("Closed Trades", _ct)
+            _sm2.metric("Win Rate",  f"{_cw/_ct*100:.1f}%")
+            _sm3.metric("Total PnL", f"{_cp:+.2f}", delta=f"{_cp:+.2f}",
+                        delta_color="normal" if _cp>=0 else "inverse")
+            _sm4.metric("Last Exit", _closed[-1].get("Exit Reason","—"))
+            with st.expander(f"📜 Last 5 trades (full list in Trade History tab)", expanded=False):
+                _last5 = pd.DataFrame(_closed[-5:])
+                def _sc2(v):
+                    if isinstance(v,(int,float)): return "color:#00E676" if v>0 else ("color:#FF5252" if v<0 else "")
+                    return ""
+                st.dataframe(_last5.style.map(_sc2,subset=["PnL"]), use_container_width=True,
+                             key=f"lv_last5_{_ct}")
 
         # ── Signal Progress Expander ─────────────────────────────────────────────
         with st.expander("📊 Signal Progress — Current indicator state & distance to signal", expanded=False):
@@ -3536,21 +3587,32 @@ with tab_live:
                 )
 
     def _hist_render():
-        t_=st.session_state.live_trades
+        t_ = st.session_state.get("live_trades", [])
         if t_:
-            tot=len(t_); wins=sum(1 for x in t_ if x["PnL"]>0); pnl_=sum(x["PnL"] for x in t_)
-            pw=sum(x["PnL"] for x in t_ if x["PnL"]>0); pl=abs(sum(x["PnL"] for x in t_ if x["PnL"]<0))
-            hc=st.columns(5)
-            hc[0].metric("Trades",tot); hc[1].metric("Accuracy",f"{wins/tot*100:.1f}%")
-            hc[2].metric("Total PnL",f"{pnl_:.2f}"); hc[3].metric("Pts Won",f"{pw:.2f}"); hc[4].metric("Pts Lost",f"{pl:.2f}")
-            hdf=pd.DataFrame(t_)
+            tot  = len(t_)
+            wins = sum(1 for x in t_ if x["PnL"] > 0)
+            pnl_ = sum(x["PnL"] for x in t_)
+            pw   = sum(x["PnL"] for x in t_ if x["PnL"] > 0)
+            pl   = abs(sum(x["PnL"] for x in t_ if x["PnL"] < 0))
+            hc   = st.columns(5)
+            hc[0].metric("Trades",     tot)
+            hc[1].metric("Accuracy",   f"{wins/tot*100:.1f}%")
+            hc[2].metric("Total PnL",  f"{pnl_:.2f}", delta=f"{pnl_:+.2f}",
+                         delta_color="normal" if pnl_ >= 0 else "inverse")
+            hc[3].metric("Pts Won",    f"{pw:.2f}")
+            hc[4].metric("Pts Lost",   f"{pl:.2f}")
+            hdf = pd.DataFrame(t_)
             def _sc(v):
                 if isinstance(v,(int,float)): return "color:#00E676" if v>0 else ("color:#FF5252" if v<0 else "")
                 return ""
-            st.dataframe(hdf.style.map(_sc,subset=["PnL"]),use_container_width=True)
-            eq_=plot_equity(t_,"Live Equity")
-            if eq_: st.plotly_chart(eq_,use_container_width=True,key="lv_hist_equity")
-        else: st.info("No completed live trades yet.")
+            st.dataframe(hdf.style.map(_sc, subset=["PnL"]), use_container_width=True)
+            # Use a dynamic key based on trade count so it never conflicts across reruns
+            eq_ = plot_equity(t_, "Live Equity")
+            if eq_:
+                st.plotly_chart(eq_, use_container_width=True,
+                                key=f"lv_hist_equity_{tot}_{int(pnl_*100)}")
+        else:
+            st.info("No completed live trades yet. Trades appear here as soon as they close.")
 
     with sub_mon:
         if _HAS_FRAGMENT and st.session_state.live_active:
@@ -3560,12 +3622,17 @@ with tab_live:
         else:
             _live_render()
             if st.session_state.live_active: time.sleep(1.5); st.rerun()
+
     with sub_hist:
+        # Always render trade history regardless of fragment state
+        # so trades show immediately when closed without needing to stop live trading.
+        # The fragment auto-refreshes every 3s; if fragment unavailable, render directly.
         if _HAS_FRAGMENT and st.session_state.live_active:
             @st.fragment(run_every=3)
             def _hist_frag(): _hist_render()
             _hist_frag()
-        else: _hist_render()
+        else:
+            _hist_render()
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # TAB 3 — OPTIMIZATION
