@@ -1954,8 +1954,20 @@ def strategy_params_ui(strategy, prefix, applied=None):
         p["vol_mult"]     = float(_n("Volume Multiplier",0.5,   5,1.2, f"{prefix}_svm", step=0.1))
 
     elif strategy == "Elliott Wave (Simplified)":
-        p["swing_lookback_ew"] = int(_n("Swing lookback",3,30,10,f"{prefix}_ewlb"))
-        p["min_wave_pct"]  = float(_n("Min wave move %",0.1,10,1.0,f"{prefix}_ewpct",step=0.1))
+        st.success(
+            "✅ **Works for BOTH LONG and SHORT signals.**\n\n"
+            "LONG: LOW → HIGH → HIGHER LOW (bullish correction completing).\n\n"
+            "SHORT: HIGH → LOW → LOWER HIGH (bearish correction completing)."
+        )
+        st.caption(
+            "**For 5-min charts:** Use min_wave_pct = 0.3–0.5% (not 1.0%). "
+            "At 1.0%, Nifty needs ~220pts per leg → very few signals. "
+            "At 0.3%, you get 5-10x more signals. "
+            "Live trading lookback = 20 bars, so signals up to ~20 closed bars ago are caught."
+        )
+        p["swing_lookback_ew"] = int  (_n("Swing lookback",3,30,10,f"{prefix}_ewlb"))
+        p["min_wave_pct"]      = float(_n("Min wave move % (use 0.3-0.5 for 5min, 1.0 for daily)",
+                                           0.05,10,0.5,f"{prefix}_ewpct",step=0.05))
 
     elif strategy == "Elliott Wave v2 (Swing+Fib)":
         st.caption(
@@ -2656,9 +2668,12 @@ with tab_live:
         #
         # Rule: use the most recent non-zero signal within the lookback window.
         # If that signal is older than the window, it is stale — do NOT enter.
-        _WIDE_LOOKBACK  = {"Elliott Wave (Simplified)":5,
-                           "Elliott Wave v2 (Swing+Fib)":3,
-                           "Elliott Wave v3 (Extrema)":3,
+        # EW v1 (Simplified): pivot confirmation requires price to move min_wave_pct% AWAY
+        # from the extreme point. On Nifty 5min (0.1% typical bar), 1% threshold = ~10 bars lag.
+        # Lookback must be ≥ (min_wave_pct / typical_bar_move). Use 20 to be safe.
+        _WIDE_LOOKBACK  = {"Elliott Wave (Simplified)":20,   # ~10-15 bar confirmation lag
+                           "Elliott Wave v2 (Swing+Fib)":10,
+                           "Elliott Wave v3 (Extrema)":5,
                            "SMC Order Blocks":3,
                            "Price Action Patterns":2,
                            "Inside Bar Breakout":2,
@@ -3511,6 +3526,80 @@ with tab_live:
                     else:
                         st.info("Need at least 2 confirmed pivots to show SHORT steps.")
 
+                # ── EW Wave Structure Plot ────────────────────────────────────
+                st.markdown("---")
+                st.markdown("#### 📈 Current Wave Structure (zigzag chart)")
+                try:
+                    _ew_pivots_plot = _ew_d.get("last_3_pivots", [])
+                    # Get all pivots from full diagnostics
+                    _all_pivots, _ = _ew_build_pivots(lv_df, min_wave_pct=float(live_params.get("min_wave_pct",0.5)))
+                    _last_n_pivots = _all_pivots[-8:] if len(_all_pivots)>=8 else _all_pivots
+
+                    if _last_n_pivots:
+                        # Build a simple zigzag line plot over last N bars
+                        _plot_bars = min(100, lv_n)
+                        _plot_df   = lv_df.iloc[-_plot_bars:].copy()
+                        _ew_fig    = go.Figure()
+
+                        # Candlestick base
+                        _ew_fig.add_trace(go.Candlestick(
+                            x=_plot_df.index, open=_plot_df["Open"], high=_plot_df["High"],
+                            low=_plot_df["Low"],  close=_plot_df["Close"],
+                            name="Price", increasing_line_color="#26a69a",
+                            decreasing_line_color="#ef5350", showlegend=False
+                        ))
+
+                        # Zigzag pivot line
+                        _visible_pivots = [(idx, px, d) for idx, px, d in _last_n_pivots
+                                           if 0 <= idx < lv_n and idx >= lv_n - _plot_bars]
+                        if _visible_pivots:
+                            _px_list  = [lv_df.index[idx] for idx, px, d in _visible_pivots]
+                            _py_list  = [px for idx, px, d in _visible_pivots]
+                            _ew_fig.add_trace(go.Scatter(
+                                x=_px_list, y=_py_list, mode="lines+markers+text",
+                                line=dict(color="#FF9800", width=2, dash="dash"),
+                                marker=dict(size=10, color=["#2196F3" if d==-1 else "#F44336"
+                                                             for idx, px, d in _visible_pivots]),
+                                text=[f"{'L' if d==-1 else 'H'}{i+1}" for i,(idx,px,d) in enumerate(_visible_pivots)],
+                                textposition="top center",
+                                name="EW Zigzag"
+                            ))
+
+                        # Mark signal bars
+                        _sig_bars = [(i, lv_df.index[i]) for i in range(max(0,lv_n-_plot_bars), lv_n)
+                                     if int(lv_sigs.iloc[i]) != 0]
+                        for _si, _sdt in _sig_bars:
+                            _sv = int(lv_sigs.iloc[_si])
+                            _ew_fig.add_trace(go.Scatter(
+                                x=[_sdt], y=[float(lv_df["Low"].iloc[_si]) if _sv==1
+                                             else float(lv_df["High"].iloc[_si])],
+                                mode="markers+text",
+                                marker=dict(size=14, color="#00E676" if _sv==1 else "#FF5252",
+                                            symbol="triangle-up" if _sv==1 else "triangle-down"),
+                                text=["BUY" if _sv==1 else "SELL"],
+                                textposition="bottom center" if _sv==1 else "top center",
+                                showlegend=False
+                            ))
+
+                        _ew_fig.update_layout(
+                            height=350, title=f"EW Wave Structure — last {_plot_bars} bars",
+                            xaxis_rangeslider_visible=False,
+                            margin=dict(l=10,r=10,t=40,b=10),
+                            legend=dict(orientation="h",y=-0.15),
+                        )
+                        st.plotly_chart(_ew_fig, use_container_width=True,
+                                        key=f"ew_wave_plot_{tick}")
+                        st.caption(
+                            "🔵 Blue markers = swing LOWS (support pivots)  |  "
+                            "🔴 Red markers = swing HIGHS (resistance pivots)  |  "
+                            "Orange dashed line = zigzag wave structure  |  "
+                            "▲ BUY / ▼ SELL = signal bars"
+                        )
+                    else:
+                        st.info("Not enough pivot data for wave plot yet. More data needed.")
+                except Exception as _ewplot_err:
+                    st.caption(f"Wave plot: {_ewplot_err}")
+
                 # Mark EMA_20 as handled (it's the only indicator EW returns)
                 _handled_keys.update({"EMA_20"})
 
@@ -3915,8 +4004,9 @@ with tab_nte:
         st.success(st.session_state["nte_applied_msg"])
 
     # ── Sub-tabs: Scanner | Quick Search ──────────────────────────────────────
-    nte_scan_tab, nte_quick_tab, nte_ew_tab = st.tabs([
-        "🔍 Strategy Scanner", "⚡ Quick Signal Search", "🌊 Elliott Wave Monitor"
+    nte_scan_tab, nte_quick_tab, nte_ew_tab, nte_pos_tab = st.tabs([
+        "🔍 Strategy Scanner", "⚡ Quick Signal Search",
+        "🌊 Elliott Wave Monitor", "📍 Position Tracker"
     ])
 
     # ══════════════════════════════════════════════════════════════════════════
@@ -4517,3 +4607,228 @@ with tab_nte:
             st.info("Click 🌊 Scan Elliott Waves to start monitoring. "
                     "Re-run periodically (every few minutes) to catch new signals. "
                     "Tickers with 🚨 SIGNAL FIRED or 🔥 VERY CLOSE (>80%) are the ones to watch immediately.")
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # SUB-TAB 4: Position Tracker — what's entered, what's about to enter
+    # Shows live position status, recent EW signals across tickers, and
+    # an EW "proximity alert" so you don't have to watch all day.
+    # ══════════════════════════════════════════════════════════════════════════
+    with nte_pos_tab:
+        st.markdown(
+            "**Central dashboard:** Shows your current open position (if any), "
+            "recently fired EW signals across watched tickers, and which tickers "
+            "are within N bars of generating an EW signal — so you only need to "
+            "monitor at the right time."
+        )
+
+        # ── Section 1: Current open position from live trading ────────────────
+        st.markdown("### 📌 Current Live Position")
+        _lv_pos = st.session_state.get("live_position")
+        _lv_active = st.session_state.get("live_active", False)
+        if not _lv_active:
+            st.info("Live trading is not running. Start it in the ⚡ Live Trading tab.")
+        elif _lv_pos is None:
+            st.success("✅ Live trading is running — **no open position** right now. Waiting for signal.")
+        else:
+            _d = _lv_pos["direction"]
+            _ep = _lv_pos["entry"]
+            # Get current LTP from last known lv_df (not available here — use sidebar sym)
+            _pos_cols = st.columns(6)
+            _pos_cols[0].metric("Direction",  "🟢 LONG" if _d==1 else "🔴 SHORT")
+            _pos_cols[1].metric("Entry Price", f"{_ep:.2f}")
+            _pos_cols[2].metric("SL",          f"{_lv_pos['sl']:.2f}")
+            _pos_cols[3].metric("Target",      f"{_lv_pos['disp_tgt']:.2f}")
+            _pos_cols[4].metric("Highest",     f"{_lv_pos['highest']:.2f}")
+            _pos_cols[5].metric("Lowest",      f"{_lv_pos['lowest']:.2f}")
+            st.caption(f"Entry time: {to_ist(_lv_pos['entry_time'])}")
+
+        # ── Section 2: Trade History Summary ─────────────────────────────────
+        st.markdown("### 📜 Completed Trades (this session)")
+        _hist = st.session_state.get("live_trades", [])
+        if _hist:
+            _tot  = len(_hist); _wins = sum(1 for x in _hist if x["PnL"]>0)
+            _pnl  = sum(x["PnL"] for x in _hist)
+            _hc   = st.columns(4)
+            _hc[0].metric("Total Trades", _tot)
+            _hc[1].metric("Wins",         f"{_wins} ({_wins/_tot*100:.0f}%)")
+            _hc[2].metric("PnL",          f"{_pnl:+.2f}", delta_color="normal" if _pnl>=0 else "inverse")
+            _hc[3].metric("Last Exit",    _hist[-1].get("Exit Reason","—"))
+            _hdf = pd.DataFrame(_hist)
+            def _pnl_c(v):
+                if isinstance(v,(int,float)): return "color:#00E676" if v>0 else ("color:#FF5252" if v<0 else "")
+                return ""
+            st.dataframe(_hdf.style.map(_pnl_c, subset=["PnL"]), use_container_width=True)
+        else:
+            st.info("No completed trades this session.")
+
+        st.markdown("---")
+
+        # ── Section 3: EW Proximity Alert — smart monitoring ─────────────────
+        st.markdown("### 🎯 Elliott Wave Proximity Alert")
+        st.caption(
+            "Scan multiple tickers to find which are CLOSE to generating an EW signal. "
+            "Instead of watching all day, check this every 15-30 minutes. "
+            "When a ticker shows 🔥 VERY CLOSE, start monitoring that ticker actively."
+        )
+
+        _pt_c1, _pt_c2, _pt_c3 = st.columns(3)
+        _pt_universe = _pt_c1.selectbox(
+            "Tickers to watch",
+            ["All Nifty 50 Stocks","Custom Tickers"] + list(TICKER_MAP.keys()),
+            key="pt_universe"
+        )
+        if _pt_universe == "Custom Tickers":
+            _pt_raw = _pt_c1.text_area("Symbols (one per line)",
+                                        "RELIANCE.NS\nINFY.NS\nHDFCBANK.NS",
+                                        key="pt_tickers", height=80)
+            _pt_symbols = [s.strip() for s in _pt_raw.splitlines() if s.strip()]
+        elif _pt_universe == "All Nifty 50 Stocks":
+            _pt_symbols = NIFTY50_SYMBOLS
+        else:
+            _pt_symbols = [TICKER_MAP[_pt_universe]]
+
+        _pt_iv      = _pt_c2.selectbox("Timeframe", TIMEFRAMES, index=2, key="pt_iv")   # 15m default
+        _pt_pd      = _pt_c2.selectbox("Period",    PERIODS,    index=2, key="pt_pd")   # 7d default
+        _pt_mwp     = _pt_c2.slider("Min Wave %", 0.1, 3.0, 0.5, step=0.1, key="pt_mwp")
+        _pt_alert   = _pt_c3.slider("Alert when progress ≥ (%)", 50, 95, 70, key="pt_alert")
+        _pt_lookback= _pt_c3.slider("Signal lookback (bars)", 3, 30, 15, key="pt_lb")
+
+        st.info(
+            f"**How to use:** Click Scan every 15-30 mins. Tickers at ≥{_pt_alert}% progress "
+            "are worth monitoring actively. 🚨 FIRED = signal already in recent bars — "
+            "switch to Live Trading immediately and check Entry Gate."
+        )
+
+        if st.button("🔍 Scan for EW Proximity", type="primary", key="btn_pt_scan"):
+            _pt_results = []
+            _pt_prog = st.progress(0); _pt_stat = st.empty()
+            for _pti, _ptsym in enumerate(_pt_symbols):
+                _pt_stat.caption(f"Scanning {_ptsym} ({_pti+1}/{len(_pt_symbols)})…")
+                _pt_prog.progress((_pti+1)/max(len(_pt_symbols),1))
+                try:
+                    time.sleep(1.5)
+                    _ptraw = yf.download(_ptsym, period=_pt_pd,
+                                          interval=YF_IV.get(_pt_iv,_pt_iv),
+                                          progress=False, auto_adjust=True)
+                    if _ptraw is None or _ptraw.empty: continue
+                    _ptdf = _flatten(_ptraw)
+                    if _pt_iv=="4h": _ptdf=_r4h(_ptdf)
+                    if len(_ptdf)<20: continue
+
+                    # Run EW signal and diagnostics
+                    _pt_sigs, _ = sig_elliott_wave(_ptdf,
+                                                    swing_lookback=10,
+                                                    min_wave_pct=float(_pt_mwp))
+                    _pt_ewd = _ew_diagnostics(_ptdf, min_wave_pct=float(_pt_mwp))
+                    _pt_n   = len(_ptdf)
+                    _pt_close = float(_ptdf["Close"].iloc[-1])
+                    _pt_bar   = to_ist(_ptdf.index[-1])
+
+                    # Check recent signal (within lookback)
+                    _pt_last_sig = 0
+                    for _psi in range(1, _pt_lookback+2):
+                        if _pt_n > _psi and int(_pt_sigs.iloc[-_psi]) != 0:
+                            _pt_last_sig = int(_pt_sigs.iloc[-_psi]); break
+
+                    _prog_pct  = min(100, int(_pt_ewd["pivot_flip_pct"]))
+                    _bars_wait = int(_pt_ewd.get("bars_since_pivot", 0))
+
+                    # Status
+                    if _pt_last_sig != 0:
+                        _pt_status = "🚨 SIGNAL FIRED"; _pt_pri = 0
+                    elif _prog_pct >= _pt_alert:
+                        _pt_status = "🔥 VERY CLOSE";   _pt_pri = 1
+                    elif _prog_pct >= 50:
+                        _pt_status = "⚡ APPROACHING";  _pt_pri = 2
+                    else:
+                        _pt_status = "🔨 BUILDING";     _pt_pri = 3
+
+                    # Estimate bars to signal
+                    _move_per_bar = abs(_pt_ewd.get("current_swing_pct",0)) / max(_bars_wait,1)
+                    _needed       = max(0, _pt_mwp - abs(_pt_ewd.get("move_from_last_pct",0)))
+                    _est_bars     = int(_needed / max(_move_per_bar, 0.01)) if _move_per_bar > 0 else 999
+                    _est_time_str = (f"~{_est_bars} bars" if _est_bars < 999 else "unclear") + (
+                        f" (~{_est_bars*_pt_iv_mins(_pt_iv)} min)" if _pt_iv in ("1m","5m","15m","30m") else ""
+                    )
+
+                    _pt_results.append({
+                        "_pri":          _pt_pri,
+                        "Ticker":        _ptsym,
+                        "Status":        _pt_status,
+                        "Signal":        "🟢 LONG" if _pt_last_sig==1 else ("🔴 SHORT" if _pt_last_sig==-1 else "—"),
+                        "Progress":      f"{_prog_pct}%",
+                        "Est. Time":     _est_time_str,
+                        "LTP":           round(_pt_close, 2),
+                        "Pivots":        _pt_ewd["confirmed_pivots"],
+                        "Last Pivot":    "HIGH" if _pt_ewd["last_confirmed_dir"]==1 else ("LOW" if _pt_ewd["last_confirmed_dir"]==-1 else "—"),
+                        "Bars Since Pv": _bars_wait,
+                        "Last Signal":   _pt_ewd.get("last_signal","—") or "—",
+                        "Bar Time":      _pt_bar[:16],
+                        "_sig_dir":      "BUY" if _pt_last_sig==1 else ("SELL" if _pt_last_sig==-1 else
+                                         "BUY" if _pt_ewd["last_confirmed_dir"]==-1 else "SELL"),
+                    })
+                except: pass
+
+            _pt_prog.empty(); _pt_stat.empty()
+            _pt_results.sort(key=lambda r: (r["_pri"], -int(r["Progress"].rstrip("%"))))
+            st.session_state["pt_scan_results"] = _pt_results
+            st.session_state["pt_scan_meta"]    = {"iv":_pt_iv,"pd":_pt_pd,"mwp":_pt_mwp}
+
+        # helper
+        def _pt_iv_mins(iv):
+            return {"1m":1,"5m":5,"15m":15,"30m":30,"1h":60,"4h":240}.get(iv,0)
+
+        # Display
+        _ptr = st.session_state.get("pt_scan_results")
+        _ptm = st.session_state.get("pt_scan_meta",{})
+        if _ptr is not None:
+            _fired   = [r for r in _ptr if r["_pri"]==0]
+            _close   = [r for r in _ptr if r["_pri"]==1]
+            _appr    = [r for r in _ptr if r["_pri"]==2]
+            _build   = [r for r in _ptr if r["_pri"]==3]
+
+            _ps1,_ps2,_ps3,_ps4 = st.columns(4)
+            _ps1.metric("🚨 Fired",      len(_fired))
+            _ps2.metric("🔥 Very Close", len(_close))
+            _ps3.metric("⚡ Approaching",len(_appr))
+            _ps4.metric("🔨 Building",   len(_build))
+
+            # Show fired + very close + approaching
+            _show_r = _fired + _close + _appr
+            if _show_r:
+                st.markdown(f"#### Tickers requiring attention ({len(_show_r)})")
+                for _pri, _prow in enumerate(_show_r):
+                    _pc1,_pc2,_pc3,_pc4,_pc5,_pc6,_pc7 = st.columns([1.5,1.2,1,1,1,1,2])
+                    _pc1.markdown(f"**{_prow['Ticker']}**")
+                    _pc2.markdown(f"{_prow['Status']}")
+                    _pc3.markdown(f"`{_prow['Signal']}`")
+                    _pc4.markdown(f"**{_prow['Progress']}**")
+                    _pc5.markdown(f"Est: {_prow['Est. Time']}")
+                    _pc6.markdown(f"LTP: {_prow['LTP']}")
+                    _psig = _prow["_sig_dir"]
+                    if _pc7.button(
+                        f"{'🟢' if _psig=='BUY' else '🔴'} Apply → Live",
+                        key=f"pt_apply_{_pri}_{_prow['Ticker']}",
+                        type="primary" if _prow["_pri"]<=1 else "secondary"
+                    ):
+                        _nte_apply_to_live(_prow["Ticker"],_prow["Ticker"],_psig,
+                                           _ptm.get("iv","15m"),_ptm.get("pd","7d"),
+                                           "Elliott Wave (Simplified)")
+                        st.rerun()
+
+                # Full table
+                with st.expander("📊 Full results table"):
+                    _ptdf_disp = pd.DataFrame([{k:v for k,v in r.items() if not k.startswith("_")}
+                                                for r in _show_r])
+                    st.dataframe(_ptdf_disp, use_container_width=True)
+            else:
+                st.info(f"No tickers reached {_pt_alert}% progress. All waves are still building. "
+                        "Check back in 15-30 mins.")
+
+            if _build:
+                with st.expander(f"🔨 {len(_build)} tickers in building phase"):
+                    _ptdf_b = pd.DataFrame([{k:v for k,v in r.items() if not k.startswith("_")}
+                                             for r in _build])
+                    st.dataframe(_ptdf_b, use_container_width=True)
+        else:
+            st.info("Click 🔍 Scan for EW Proximity to see which tickers are close to a signal.")
