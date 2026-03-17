@@ -2292,10 +2292,13 @@ with st.sidebar:
         else:
             st.caption("LONG signal → CE BUY  |  SHORT signal → PE BUY  (always buying options)")
             dhan_s_sid=""
-            dhan_ce_sid=st.text_input("CE Security ID (ATM call)","",key="dhan_ce_sid")
-            dhan_pe_sid=st.text_input("PE Security ID (ATM put)","",key="dhan_pe_sid")
-            dhan_o_exch=st.selectbox("F&O Exchange",["NSE.FNO","BSE.FNO"],key="dhan_o_exch")
+            dhan_ce_sid=st.text_input("CE Security ID (ATM call)","57749",key="dhan_ce_sid",
+                                       help="Default 57749 — update to current ATM CE security_id from Dhan instrument master")
+            dhan_pe_sid=st.text_input("PE Security ID (ATM put)","57716",key="dhan_pe_sid",
+                                       help="Default 57716 — update to current ATM PE security_id from Dhan instrument master")
+            dhan_o_exch=st.selectbox("F&O Exchange",["NSE_OPT","BSE_OPT"],key="dhan_o_exch")
             dhan_o_qty =st.number_input("Options Quantity",1,10000,65,step=1,key="dhan_o_qty")
+            st.caption("CE sid=57749 | PE sid=57716 | qty=65 (Nifty lot size). Update sids daily to current ATM strike.")
             dhan_prod="INTRADAY"; dhan_exch="NSE"; dhan_s_qty=1
         dhan_sq_all=st.checkbox("Square off ALL open positions before new order",value=False,key="dhan_sq_all")
         # Default: Entry = LIMIT (price control), Exit = MARKET (fast fill)
@@ -2331,7 +2334,7 @@ with st.sidebar:
         dhan_client="1104779876"; dhan_token=""; is_stocks=False
         dhan_prod="INTRADAY"; dhan_exch="NSE"; dhan_s_qty=1
         dhan_s_sid="12092"
-        dhan_ce_sid=""; dhan_pe_sid=""; dhan_o_exch="NSE.FNO"; dhan_o_qty=65
+        dhan_ce_sid="57749"; dhan_pe_sid="57716"; dhan_o_exch="NSE_OPT"; dhan_o_qty=65
         dhan_sq_all=False; dhan_entry_ot="LIMIT"; dhan_exit_ot="MARKET"
 
     # ── TRADE MANAGEMENT ─────────────────────────────────────────────────────
@@ -2744,22 +2747,33 @@ with tab_live:
                                 f"{'BUY' if direction==1 else 'SELL'} {dhan_s_qty}x "
                                 f"sid={_stock_sid} on {dhan_exch}")
                     else:
-                        _sid=dhan_ce_sid if direction==1 else dhan_pe_sid
-                        _opt="CE" if direction==1 else "PE"
-                        if not _sid: st.warning(f"Dhan {_acc_label}: {_opt} Security ID not set."); continue
-                        # Options: always use NSE_OPT (not NSE_FNO) per Dhan API
-                        _exch = _d.NSE_OPT if "NSE" in dhan_o_exch else _d.BSE_OPT if hasattr(_d,"BSE_OPT") else _d.NSE_OPT
-                        _d.place_order(
-                            security_id      = _sid,
-                            exchange_segment = _exch,
-                            transaction_type = _d.BUY,
+                        # ── OPTIONS: BUY CE on LONG signal, BUY PE on SHORT signal ──────
+                        _sid  = dhan_ce_sid if direction==1 else dhan_pe_sid
+                        _opt  = "CE"        if direction==1 else "PE"
+                        if not _sid:
+                            st.warning(f"Dhan {_acc_label}: {_opt} Security ID not set. "
+                                       "Enter CE/PE security_id in sidebar."); continue
+                        # Exchange segment: NSE_OPT for NSE options
+                        # Try attribute first (dhanhq ≥2.x), fall back to string constant
+                        try:    _exch = _d.NSE_OPT
+                        except AttributeError: _exch = "NSE_OPT"
+                        # Order type and price per user setting
+                        _ot   = _d.LIMIT  if dhan_entry_ot == "LIMIT"  else _d.MARKET
+                        _price= float(cl) if dhan_entry_ot == "LIMIT"  else 0
+                        # Product type: INTRA for intraday options
+                        try:    _prod = _d.INTRA
+                        except AttributeError: _prod = "INTRA"
+                        _resp = _d.place_order(
+                            security_id      = int(_sid),       # must be int
+                            exchange_segment = _exch,           # NSE_OPT
+                            transaction_type = _d.BUY,          # always buying options
                             quantity         = int(dhan_o_qty),
-                            order_type       = _ot,
-                            product_type     = _d.INTRA,
-                            price            = _lp,
-                            trigger_price    = 0,
+                            order_type       = _ot,             # LIMIT or MARKET
+                            product_type     = _prod,           # INTRA
+                            price            = _price,          # LTP for LIMIT, 0 for MARKET
                         )
-                        st.info(f"Dhan {_acc_label} ({dhan_entry_ot}): BUY {dhan_o_qty}x {_opt} sid={_sid} NSE_OPT")
+                        st.info(f"Dhan {_acc_label}: BUY {dhan_o_qty}x {_opt} "
+                                f"sid={_sid} | {dhan_entry_ot} @ {_price:.2f if _price else 'MKT'} | resp={_resp}")
                 except ImportError: st.error("pip install dhanhq"); break
                 except Exception as ex: st.error(f"Dhan {_acc_label} order error: {ex}")
 
@@ -2788,21 +2802,27 @@ with tab_live:
                     st.info(f"Dhan exit ({dhan_exit_ot}): "
                             f"{'SELL' if direction==1 else 'BUY'} {dhan_s_qty}x sid={_stock_sid}")
                 else:
-                    _sid=dhan_ce_sid if direction==1 else dhan_pe_sid
-                    _opt="CE" if direction==1 else "PE"
+                    # ── OPTIONS EXIT: SELL the option we bought ──────────────────
+                    _sid  = dhan_ce_sid if direction==1 else dhan_pe_sid
+                    _opt  = "CE"        if direction==1 else "PE"
                     if not _sid: return
-                    _exch = _d.NSE_OPT if "NSE" in dhan_o_exch else _d.BSE_OPT if hasattr(_d,"BSE_OPT") else _d.NSE_OPT
-                    _d.place_order(
-                        security_id      = _sid,
-                        exchange_segment = _exch,
-                        transaction_type = _d.SELL,
+                    try:    _exch = _d.NSE_OPT
+                    except AttributeError: _exch = "NSE_OPT"
+                    _ot   = _d.MARKET if dhan_exit_ot == "MARKET" else _d.LIMIT
+                    _price= float(cl)  if dhan_exit_ot == "LIMIT"  else 0
+                    try:    _prod = _d.INTRA
+                    except AttributeError: _prod = "INTRA"
+                    _resp = _d.place_order(
+                        security_id      = int(_sid),   # must be int
+                        exchange_segment = _exch,       # NSE_OPT
+                        transaction_type = _d.SELL,     # square off by selling
                         quantity         = int(dhan_o_qty),
                         order_type       = _ot,
-                        product_type     = _d.INTRA,
-                        price            = _lp,
-                        trigger_price    = 0,
+                        product_type     = _prod,
+                        price            = _price,
                     )
-                    st.info(f"Dhan ({dhan_exit_ot}): SELL {dhan_o_qty}x {_opt} (exit) NSE_OPT")
+                    st.info(f"Dhan exit: SELL {dhan_o_qty}x {_opt} sid={_sid} | "
+                            f"{dhan_exit_ot} @ {_price:.2f if _price else 'MKT'} | resp={_resp}")
             except Exception as ex: st.error(f"Dhan exit error: {ex}")
 
         # ── Position management ──────────────────────────────────────────────
