@@ -564,98 +564,149 @@ def _ew_diagnostics(df, min_wave_pct=1.0):
         retrace   = abs(cur_price - leg_end)
         retrace_pct = retrace / max(leg_size, 0.001) * 100
 
-    # Describe next signal conditions
-    # LONG setup needs: pivot sequence low→high→low with p2 > p0
-    # SHORT setup needs: pivot sequence high→low→high with p2 < p0
+    # Describe next signal conditions — SEQUENTIAL steps, not parallel checks.
+    # Later conditions must NOT show ✅ until all prior conditions are complete.
     long_conditions  = []
     short_conditions = []
 
     if len(pivots) >= 2:
-        p_last     = pivots[-1]
-        p_prev     = pivots[-2]
-        leg_dir    = p_last[2]   # direction of most recent confirmed pivot
+        p_last  = pivots[-1]
+        p_prev  = pivots[-2]
+        leg_dir = p_last[2]   # direction of most recent confirmed pivot
 
-        # For LONG: last pivot should be a swing-high (1), current move should go down to form swing-low
-        if leg_dir == 1:  # last confirmed pivot was a high → next should be a low → then we check sequence
-            req_low_px = p_last[1] * (1 - min_mv)
+        if leg_dir == 1:
+            # Last confirmed pivot was a SWING HIGH.
+            # LONG setup: price needs to pull back → form a HIGHER LOW → then signal fires.
+            # Step 1: price drops enough to confirm Pivot C (corrective low)
+            req_low_px  = p_last[1] * (1 - min_mv)
+            step1_done  = cur_price < req_low_px
+            # Step 2: only relevant after step 1 — price bounces back up (confirms Pivot C as low)
+            # Step 3: Pivot C must be above prior Pivot A (p_prev, the prior low)
+            prior_low   = p_prev[1]
+
             long_conditions = [
                 {
-                    "Condition": "A) Current price must DROP below prior high × (1 - min_wave_pct%)",
-                    "Required":  f"< {req_low_px:.2f}  (= {p_last[1]:.2f} × {100-min_wave_pct:.2f}%)",
+                    "Step":      "CURRENT → Step 1 of 3",
+                    "Condition": "Price must drop ≥ min_wave_pct% from the last HIGH to form Pivot C (corrective low)",
+                    "Required":  f"< {req_low_px:.2f}  (last high {p_last[1]:.2f} × {100-min_wave_pct:.2f}%)",
                     "Current":   f"{cur_price:.2f}",
-                    "Met":       "✅ YES" if cur_price < req_low_px else f"❌ Need {req_low_px-cur_price:.2f} pts more drop",
-                    "Progress":  f"{min(100, (p_last[1]-cur_price)/max(p_last[1]-req_low_px,0.001)*100):.0f}%",
+                    "Met":       "✅ Pivot C low confirmed — move to Step 2" if step1_done
+                                 else f"❌ Need {req_low_px - cur_price:.2f} pts more drop",
+                    "Progress":  f"{min(100,(p_last[1]-cur_price)/max(p_last[1]-req_low_px,0.001)*100):.0f}%",
                 },
                 {
-                    "Condition": "B) After new low forms, price must RALLY ≥ min_wave_pct% from that low",
-                    "Required":  f"+{min_wave_pct:.2f}% from new low",
-                    "Current":   "Waiting for new low to form first",
-                    "Met":       "⏳ Pending",
+                    "Step":      "Step 2 of 3 (active only after Step 1)",
+                    "Condition": "After Pivot C low forms, price must BOUNCE back up ≥ min_wave_pct% — this confirms the signal bar",
+                    "Required":  f"+{min_wave_pct:.2f}% bounce from Pivot C low",
+                    "Current":   "Waiting for Step 1 to complete first" if not step1_done else f"Current low: {cur_price:.2f} — watching for bounce",
+                    "Met":       "⏳ Locked — complete Step 1 first" if not step1_done else "⏳ Watching for bounce confirmation",
                     "Progress":  "—",
                 },
                 {
-                    "Condition": "C) New low must be HIGHER than the pivot-low 2 steps ago (higher low = bullish structure)",
-                    "Required":  f"> {p_prev[1]:.2f}  (prior low pivot)",
-                    "Current":   f"{cur_price:.2f}",
-                    "Met":       "✅ YES" if cur_price > p_prev[1] else f"❌ Price below prior low — structure broken",
-                    "Progress":  f"{(cur_price-p_prev[1])/max(abs(p_prev[1]),0.001)*100:+.2f}%",
+                    "Step":      "Step 3 of 3 (checked simultaneously with Step 2)",
+                    "Condition": "Pivot C low must be HIGHER than prior swing low (= Pivot A). This makes it a higher-low → bullish structure",
+                    "Required":  f"> {prior_low:.2f}  (Pivot A, the prior swing low)",
+                    "Current":   f"Will be checked after Step 1 completes" if not step1_done else f"{cur_price:.2f}",
+                    "Met":       "⏳ Locked — complete Step 1 first" if not step1_done
+                                 else ("✅ YES — higher low structure intact" if cur_price > prior_low
+                                       else f"❌ Below Pivot A ({prior_low:.2f}) — bullish structure broken"),
+                    "Progress":  "—" if not step1_done else f"{(cur_price-prior_low)/max(abs(prior_low),0.001)*100:+.2f}%",
                 },
             ]
             short_conditions = [
                 {
-                    "Condition": "A) Price must stay ABOVE last confirmed high (current high must hold)",
-                    "Required":  f"> {p_last[1]:.2f}",
+                    "Step":      "CURRENT → Step 1 of 2",
+                    "Condition": "Price must RALLY further above the last confirmed HIGH to set a new high (Pivot B extension)",
+                    "Required":  f"> {p_last[1]:.2f}  (extend beyond last high)",
                     "Current":   f"{cur_price:.2f}",
-                    "Met":       "✅ YES" if cur_price > p_last[1] else "❌ Price below last high",
+                    "Met":       "✅ Extended above last high" if cur_price > p_last[1] else "❌ Not yet above last high",
                     "Progress":  f"{(cur_price-p_last[1])/max(abs(p_last[1]),0.001)*100:+.2f}%",
                 },
                 {
-                    "Condition": "B) Price must then DROP ≥ min_wave_pct% from new high to form a lower high",
-                    "Required":  f"−{min_wave_pct:.2f}% from new high to be set",
-                    "Current":   "HIGH sequence not yet formed",
-                    "Met":       "⏳ Pending",
+                    "Step":      "Step 2 of 2 (active after Step 1)",
+                    "Condition": "Then price must DROP ≥ min_wave_pct% from the new high → forming a LOWER HIGH → SHORT signal",
+                    "Required":  f"−{min_wave_pct:.2f}% drop from new high",
+                    "Current":   "Waiting for Step 1 first" if cur_price <= p_last[1] else f"New high set — watching for drop",
+                    "Met":       "⏳ Watching",
                     "Progress":  "—",
                 },
             ]
-        else:  # leg_dir == -1 → last confirmed pivot was a low → possible long setup forming
+
+        else:  # leg_dir == -1 → last confirmed pivot was a SWING LOW
+            # LONG setup: price is currently rallying from the low.
+            # Step 1: rally must reach req_high_px to confirm Pivot B (swing high)
             req_high_px = p_last[1] * (1 + min_mv)
+            step1_done  = cur_price > req_high_px
+            # Step 2: after Pivot B is confirmed, price must pull back ≥ min_wave_pct% to form Pivot C
+            # We don't know the pullback low yet — it only exists once the pivot forms
+            # Step 3: Pivot C must stay above p_last[1] (the prior low = Pivot A)
+            prior_low   = p_last[1]
+
+            # How far into the pullback are we (only meaningful once step1 done)?
+            peak_so_far = float(df["High"].iloc[-1]) if step1_done else cur_price
+            # Rough pullback progress: how much has price dropped from recent peak
+            _recent_high = float(df["High"].iloc[max(0,len(df)-20):].max()) if step1_done else cur_price
+            _pullback_so_far = (_recent_high - cur_price) / max(abs(_recent_high), 0.001) * 100
+            _pullback_needed = min_wave_pct
+            step2_progress   = min(100, _pullback_so_far / max(_pullback_needed, 0.001) * 100) if step1_done else 0
+            # Step 2 done only if price has already pulled back the required amount AND
+            # new pivot has been confirmed (price then bounced back up). Approximate: step2_progress >= 100
+            step2_monitoring = step1_done and _pullback_so_far < _pullback_needed
+            step2_done_approx = step1_done and _pullback_so_far >= _pullback_needed
+
             long_conditions = [
                 {
-                    "Condition": "A) Price must RALLY above prior low × (1 + min_wave_pct%)",
-                    "Required":  f"> {req_high_px:.2f}  (= {p_last[1]:.2f} × {100+min_wave_pct:.2f}%)",
+                    "Step":      "CURRENT → Step 1 of 3",
+                    "Condition": "Price must RALLY ≥ min_wave_pct% above the prior swing LOW to confirm Pivot B (swing high)",
+                    "Required":  f"> {req_high_px:.2f}  (prior low {p_last[1]:.2f} + {min_wave_pct:.2f}%)",
                     "Current":   f"{cur_price:.2f}",
-                    "Met":       "✅ YES (rally confirmed)" if cur_price > req_high_px else f"❌ Need {req_high_px-cur_price:.2f} pts more rally",
+                    "Met":       "✅ Pivot B HIGH confirmed — now watching for pullback (Step 2)" if step1_done
+                                 else f"❌ Need {req_high_px - cur_price:.2f} pts more rally  ({min(100,(cur_price-p_last[1])/max(req_high_px-p_last[1],0.001)*100):.0f}% there)",
                     "Progress":  f"{min(100,(cur_price-p_last[1])/max(req_high_px-p_last[1],0.001)*100):.0f}%",
                 },
                 {
-                    "Condition": "B) Price must then PULL BACK ≥ min_wave_pct% from new high (forms corrective low)",
-                    "Required":  f"−{min_wave_pct:.2f}% from new high",
-                    "Current":   "Waiting for rally to complete first",
-                    "Met":       "⏳ Pending",
-                    "Progress":  "—",
+                    "Step":      "Step 2 of 3" + (" ← ACTIVE NOW" if step1_done else " (locked until Step 1 done)"),
+                    "Condition": "Price must PULL BACK ≥ min_wave_pct% from Pivot B high — this forms Pivot C (corrective low) = THE SIGNAL BAR",
+                    "Required":  f"−{min_wave_pct:.2f}% drop from recent high ({_recent_high:.2f} → need price ≤ {_recent_high*(1-min_mv/100):.2f})" if step1_done
+                                 else f"−{min_wave_pct:.2f}% drop from Pivot B (once formed)",
+                    "Current":   f"Pullback so far: {_pullback_so_far:.2f}% (need {_pullback_needed:.2f}%)" if step1_done
+                                 else "⏳ Complete Step 1 first",
+                    "Met":       "✅ Pullback sufficient — Pivot C forming!" if step2_done_approx
+                                 else ("⏳ Watching pullback ({:.0f}% of needed {:.2f}%)".format(step2_progress, _pullback_needed) if step1_done
+                                       else "⏳ Locked — complete Step 1 first"),
+                    "Progress":  f"{step2_progress:.0f}%" if step1_done else "—",
                 },
                 {
-                    "Condition": "C) Pullback low must be HIGHER than prior low (higher low = bullish structure)",
-                    "Required":  f"> {p_last[1]:.2f}",
-                    "Current":   f"{cur_price:.2f}",
-                    "Met":       "✅ YES" if cur_price > p_last[1] else "❌ Below prior low",
-                    "Progress":  f"{(cur_price-p_last[1])/max(abs(p_last[1]),0.001)*100:+.2f}%",
+                    "Step":      "Step 3 of 3 (checked only after Step 2 completes)",
+                    "Condition": "Pivot C low must be HIGHER than Pivot A ({:.2f}) — confirms bullish higher-low → 🚀 LONG signal fires".format(prior_low),
+                    "Required":  f"> {prior_low:.2f}  (Pivot A = prior swing low)",
+                    "Current":   f"~{cur_price:.2f} (estimated — actual Pivot C low determined by market)" if step1_done
+                                 else "Checked after Steps 1 & 2 complete",
+                    "Met":       "⏳ Locked — Steps 1 & 2 must complete first" if not step2_done_approx
+                                 else ("✅ Higher-low confirmed → LONG signal will fire!" if cur_price > prior_low
+                                       else f"❌ Below Pivot A ({prior_low:.2f}) — bullish structure broken"),
+                    "Progress":  f"{(cur_price-prior_low)/max(abs(prior_low),0.001)*100:+.2f}% above Pivot A" if step2_done_approx else "—",
                 },
             ]
+            # SHORT conditions when last pivot was a LOW
             req_low_short = p_last[1] * (1 - min_mv)
+            step1s_done   = cur_price < req_low_short
             short_conditions = [
                 {
-                    "Condition": "A) Price must DROP below prior low × (1 - min_wave_pct%)",
+                    "Step":      "CURRENT → Step 1 of 2",
+                    "Condition": "Price must DROP ≥ min_wave_pct% below the prior swing LOW to confirm a new lower low → SHORT structure",
                     "Required":  f"< {req_low_short:.2f}",
                     "Current":   f"{cur_price:.2f}",
-                    "Met":       "✅ YES" if cur_price < req_low_short else f"❌ Need {cur_price-req_low_short:.2f} pts more drop",
+                    "Met":       "✅ New lower low confirmed" if step1s_done
+                                 else f"❌ Need {cur_price - req_low_short:.2f} pts more drop",
                     "Progress":  f"{min(100,(p_last[1]-cur_price)/max(p_last[1]-req_low_short,0.001)*100):.0f}%",
                 },
                 {
-                    "Condition": "B) After new low, a bounce ≥ min_wave_pct% then another lower low confirms SHORT",
-                    "Required":  f"Bounce +{min_wave_pct:.2f}% then lower low",
-                    "Current":   "Awaiting next pivot",
-                    "Met":       "⏳ Pending",
+                    "Step":      "Step 2 of 2 (active after Step 1)",
+                    "Condition": "Bounce ≥ min_wave_pct% from new low, then another lower low → SHORT signal fires",
+                    "Required":  f"+{min_wave_pct:.2f}% bounce then lower low",
+                    "Current":   "Waiting for Step 1" if not step1s_done else "Watching for bounce then lower low",
+                    "Met":       "⏳ Watching",
                     "Progress":  "—",
                 },
             ]
@@ -1820,10 +1871,10 @@ def strategy_params_ui(strategy, prefix, applied=None):
     Uses FULL-WIDTH inputs (no st.columns) so it works in the sidebar
     without truncation on desktop or mobile.
     """
-    def _n(label, lo, hi, default, key, step=1, fmt="%.4g"):
+    def _n(label, lo, hi, default, key, step=1, fmt="%.4g", help=None):
         try: v = float(applied.get(key.split("_",1)[-1], default)) if applied else float(default)
         except: v = float(default)
-        return st.number_input(label, float(lo), float(hi), v, step=float(step), format=fmt, key=key)
+        return st.number_input(label, float(lo), float(hi), v, step=float(step), format=fmt, key=key, help=help)
 
     def _sel(label, opts, default, key):
         idx = opts.index(default) if default in opts else 0
@@ -1953,9 +2004,9 @@ def strategy_params_ui(strategy, prefix, applied=None):
             "(falls back to bar-based swings if scipy not available)."
         )
         p["wave_lookback"]  = int (_n("Lookback bars",       20, 300, 50, f"{prefix}_ewv3lb"))
-        p["order"]          = int (_n("Extrema order (N)",    2,  15,  3, f"{prefix}_ewv3ord",
-                                      help="Each extreme must be highest/lowest in N bars each side. "
-                                           "Lower N = more signals. order=3 → 7-bar window."))
+        p["order"]          = int (_n("Extrema order N (bars each side, lower=more signals)", 2, 15, 3, f"{prefix}_ewv3ord"))
+        st.caption(f"order={p.get('order',3)} → pivot confirmed in a {p.get('order',3)*2+1}-bar window. "
+                   "Lower = more signals. order=2 gives ~5-bar swings; order=3 gives ~7-bar swings.")
         p["ema_period"]     = int (_n("Trend EMA period",     5, 200, 50, f"{prefix}_ewv3ep"))
         p["use_ema_filter"] = st.checkbox("EMA trend filter (long only above EMA, short only below)",
                                            value=True, key=f"{prefix}_ewv3emaf")
@@ -3334,12 +3385,16 @@ with tab_live:
 
                 # ── What is needed to fire next signal ───────────────────────
                 st.markdown("---")
-                _long_tab, _short_tab = st.tabs(["🟢 Conditions for LONG signal", "🔴 Conditions for SHORT signal"])
+                _long_tab, _short_tab = st.tabs(["🟢 Steps for LONG signal", "🔴 Steps for SHORT signal"])
 
                 with _long_tab:
                     st.caption(
-                        "LONG fires when: Low pivot → High pivot → **Higher Low pivot** "
-                        "(corrective pullback in an uptrend). All 3 conditions below must be true simultaneously."
+                        "**How to read this table:** These are strictly sequential steps. "
+                        "Step 2 only activates after Step 1 finishes. Step 3 only activates after Step 2 finishes. "
+                        "A step showing ⏳ Locked means it is NOT checkable yet — you must complete the prior step first. "
+                        "The signal fires the moment ALL steps complete on a single closed bar. "
+                        "If Step 1 shows ✅ (rally confirmed) but Step 2 shows ⏳ (watching for pullback), "
+                        "you simply need to wait for price to pull back the required % — Step 3 will be verified automatically then."
                     )
                     if _ew_d["long_conditions"]:
                         _lc_df = pd.DataFrame(_ew_d["long_conditions"])
@@ -3350,26 +3405,37 @@ with tab_live:
                             return ""
                         st.dataframe(_lc_df.style.map(_met_color, subset=["Met"]),
                                      use_container_width=True, hide_index=True)
-                        _long_met = sum(1 for c in _ew_d["long_conditions"] if "✅" in c["Met"])
-                        st.info(f"**{_long_met}/{len(_ew_d['long_conditions'])} conditions currently met** "
-                                f"for a LONG signal.")
+                        _long_done  = sum(1 for c in _ew_d["long_conditions"] if "✅" in c["Met"])
+                        _long_total = len(_ew_d["long_conditions"])
+                        _cur_step   = next((i+1 for i,c in enumerate(_ew_d["long_conditions"])
+                                            if "✅" not in c["Met"] and "Locked" not in c["Met"]), _long_total)
+                        if _long_done == _long_total:
+                            st.success(f"🚀 ALL {_long_total} steps complete — LONG signal should have fired!")
+                        else:
+                            st.info(f"**Currently on Step {_cur_step} of {_long_total}.** "
+                                    f"Complete Step {_cur_step} to advance. Signal fires when all {_long_total} steps are done.")
                     else:
-                        st.info("Need at least 2 confirmed pivots to show LONG conditions.")
+                        st.info("Need at least 2 confirmed pivots to show LONG steps.")
 
                 with _short_tab:
                     st.caption(
-                        "SHORT fires when: High pivot → Low pivot → **Lower High pivot** "
-                        "(corrective rally in a downtrend). All conditions below must be true."
+                        "Sequential steps — each must complete before the next is checked."
                     )
                     if _ew_d["short_conditions"]:
                         _sc_df = pd.DataFrame(_ew_d["short_conditions"])
                         st.dataframe(_sc_df.style.map(_met_color, subset=["Met"]),
                                      use_container_width=True, hide_index=True)
-                        _short_met = sum(1 for c in _ew_d["short_conditions"] if "✅" in c["Met"])
-                        st.info(f"**{_short_met}/{len(_ew_d['short_conditions'])} conditions currently met** "
-                                f"for a SHORT signal.")
+                        _short_done  = sum(1 for c in _ew_d["short_conditions"] if "✅" in c["Met"])
+                        _short_total = len(_ew_d["short_conditions"])
+                        if _short_done == _short_total:
+                            st.error(f"🔴 ALL {_short_total} steps complete — SHORT signal should have fired!")
+                        else:
+                            _cur_step_s = next((i+1 for i,c in enumerate(_ew_d["short_conditions"])
+                                                if "✅" not in c["Met"] and "Locked" not in c["Met"]), _short_total)
+                            st.info(f"**Currently on Step {_cur_step_s} of {_short_total}.** "
+                                    f"Signal fires when all {_short_total} steps complete.")
                     else:
-                        st.info("Need at least 2 confirmed pivots to show SHORT conditions.")
+                        st.info("Need at least 2 confirmed pivots to show SHORT steps.")
 
                 # Mark EMA_20 as handled (it's the only indicator EW returns)
                 _handled_keys.update({"EMA_20"})
