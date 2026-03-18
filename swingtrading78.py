@@ -2170,7 +2170,7 @@ for _k,_v in {"live_active":False,"live_trades":[],"live_position":None,"live_ti
                "opt_applied":None,"opt_results":None,"opt_res_meta":None,"opt_df":None,
                "_oa_hash_prev":"","no_overlap":True,"time_filter":False,
                "dhan_enabled":False,"cooldown_enabled":True,"cooldown_secs":5,
-               "last_trade_close_ts":0.0,"_last_trade_fp":""}.items():
+               "last_trade_close_ts":0.0}.items():
     if _k not in st.session_state: st.session_state[_k]=_v
 
 def _idx(lst,val,default=0): return lst.index(val) if val in lst else default
@@ -2614,13 +2614,11 @@ with tab_live:
     st.markdown("---")
     _bc=st.columns([1,1,1,5])
     if _bc[0].button("▶ Start",type="primary",disabled=st.session_state.live_active,key="btn_lv_start"):
-        st.session_state.update({"live_active":True,"live_trades":[],"live_position":None,
-                                  "live_tick":0,"_last_trade_fp":"","last_trade_close_ts":0.0}); st.rerun()
+        st.session_state.update({"live_active":True,"live_trades":[],"live_position":None,"live_tick":0}); st.rerun()
     if _bc[1].button("⏹ Stop",disabled=not st.session_state.live_active,key="btn_lv_stop"):
         st.session_state.live_active=False; st.rerun()
     if _bc[2].button("🗑 Clear",key="btn_lv_clear"):
-        st.session_state.update({"live_trades":[],"live_position":None,
-                                  "_last_trade_fp":"","last_trade_close_ts":0.0}); st.rerun()
+        st.session_state.update({"live_trades":[],"live_position":None}); st.rerun()
     _bc[3].info("Smooth updates: " + ("✅ Active (Streamlit≥1.33)" if _HAS_FRAGMENT else "⚠️ Upgrade Streamlit≥1.33"))
     sub_mon,sub_hist=st.tabs(["📡 Live Monitor","📜 Trade History"])
 
@@ -2651,20 +2649,9 @@ with tab_live:
 
         lv_df=fetch_live(sym,interval)
         if lv_df is None or lv_df.empty: st.warning("No data. Retrying…"); return
-        lv_n=len(lv_df)
-
-        # ── Price references ───────────────────────────────────────────────────
-        # cl  = LTP (last tick price from forming/current bar) — for display & entry price
-        # bh_cur / bl_cur = High/Low of the LAST FULLY CLOSED bar (iloc[-2])
-        #   This matches backtest logic exactly: backtest checks bar[j] High/Low
-        #   only after that bar is complete. Using forming bar's High/Low causes
-        #   false SL hits — e.g. a SHORT at 71194 with SL=71204 exits immediately
-        #   because the forming bar's High touches 71204 intrabar even while falling.
-        cl      = float(lv_df["Close"].iloc[-1])    # LTP (forming bar close = current price)
-        _closed_bar_idx = max(0, lv_n - 2)          # last FULLY closed bar
-        bh_cur  = float(lv_df["High"].iloc[_closed_bar_idx])   # SL/Target check
-        bl_cur  = float(lv_df["Low"].iloc[_closed_bar_idx])    # SL/Target check
-        last_bar= lv_df.index[_closed_bar_idx]      # timestamp of last closed bar
+        lv_n=len(lv_df); cl=float(lv_df["Close"].iloc[-1])
+        bh_cur=float(lv_df["High"].iloc[-1]); bl_cur=float(lv_df["Low"].iloc[-1])
+        last_bar=lv_df.index[-1]
 
         fn=STRATEGY_FN.get(strategy,sig_custom)
         try: lv_sigs,lv_indics=fn(lv_df,**live_params)
@@ -2893,13 +2880,9 @@ with tab_live:
             d=last_sig; ep=cl
             lv_sl =init_sl(lv_df,lv_n-1,ep,d,sl_type,sl_pts,live_params)
             lv_tgt=init_tgt(lv_df,lv_n-1,ep,d,tgt_type,tgt_pts,lv_sl,live_params)
-            # Fully reset position state; store entry bar index so we skip
-            # SL/target check on the very same bar (candle High/Low already includes
-            # price action before entry — would cause immediate false SL hit)
+            # Fully reset position state
             st.session_state.live_position={"entry":ep,"direction":d,"sl":lv_sl,"target":lv_tgt,
-                "disp_tgt":lv_tgt,"entry_time":last_bar,"entry_bar_time":last_bar,
-                "entry_tick":tick,   # used to skip SL check on the exact entry tick only
-                "highest":ep,"lowest":ep}
+                "disp_tgt":lv_tgt,"entry_time":last_bar,"highest":ep,"lowest":ep}
             _dhan_place(d)
             _sig_label = "BUY (LONG)" if d==1 else "SELL (SHORT)"
             st.success(f"🚀 NEW {'LONG' if d==1 else 'SHORT'}  Entry:{ep:.2f}  "
@@ -2939,16 +2922,7 @@ with tab_live:
                     exited,exit_px,exit_why = True, cl, "Strategy Signal Exit"
 
             if not exited:
-                # ── Entry tick guard: skip SL/target check on the SINGLE TICK we entered ──
-                # Problem: on entry tick, bh_cur/bl_cur is the FULL last-closed-bar range,
-                # which includes price action BEFORE our entry price. For a SHORT at 71280
-                # on a bar whose High was 71306, checking bh_cur≥SL(71290) fires immediately.
-                # Fix: skip only the exact tick we entered (entry_tick == tick).
-                # From the NEXT tick onward, SL/target checks run normally.
-                _is_entry_tick = (tick == pos.get("entry_tick", -1))
-                if _is_entry_tick:
-                    pass  # skip this one tick only — next tick checks normally
-                elif d==1:
+                if d==1:
                     if bl_cur<=pos["sl"]:             exited,exit_px,exit_why=True,pos["sl"],"SL Hit"
                     elif tf and bh_cur>=pos["target"]:exited,exit_px,exit_why=True,pos["target"],"Target Hit"
                 else:
@@ -2958,37 +2932,27 @@ with tab_live:
                 exited,exit_px,exit_why=True,cl,"Time Window Close"
             if exited:
                 pnl=round((exit_px-ep)*d,4)
-                # ── DEDUP: create a fingerprint of this trade to prevent double-recording ──
-                # The fragment can re-render mid-execution causing the same exit to be
-                # appended multiple times. Guard with a unique key in session state.
-                _trade_fp = f"{sym}_{ep:.4f}_{to_ist(pos['entry_time'])}_{d}"
-                _already_recorded = st.session_state.get("_last_trade_fp","") == _trade_fp
-                if not _already_recorded:
-                    st.session_state["_last_trade_fp"] = _trade_fp
-                    st.session_state.live_trades.append({
-                        "Ticker":     sym,
-                        "Strategy":   strategy,
-                        "Entry Time": to_ist(pos["entry_time"]),
-                        "Entry Price":round(ep,2),
-                        "Direction":  "LONG" if d==1 else "SHORT",
-                        "Exit Time":  to_ist(last_bar),
-                        "Exit Price": round(exit_px,2),
-                        "Exit Reason":exit_why,
-                        "SL":         round(pos["sl"],2),
-                        "Target":     round(pos["disp_tgt"],2),
-                        "Highest":    round(pos["highest"],2),
-                        "Lowest":     round(pos["lowest"],2),
-                        "PnL":        pnl,
-                    })
-                # ── Graceful full reset — MUST happen before any st.* call ────
-                # Setting live_position=None here prevents the fragment from
-                # re-reading the same pos dict if it re-renders before this tick ends.
+                st.session_state.live_trades.append({
+                    "Ticker":     sym,          # track ticker so history can be filtered
+                    "Strategy":   strategy,     # track strategy
+                    "Entry Time": to_ist(pos["entry_time"]),
+                    "Entry Price":ep,
+                    "Direction":  "LONG" if d==1 else "SHORT",
+                    "Exit Time":  to_ist(last_bar),
+                    "Exit Price": exit_px,
+                    "Exit Reason":exit_why,
+                    "SL":         round(pos["sl"],2),
+                    "Target":     round(pos["disp_tgt"],2),
+                    "Highest":    round(pos["highest"],2),
+                    "Lowest":     round(pos["lowest"],2),
+                    "PnL":        pnl,
+                })
+                # ── Graceful full reset ───────────────────────────────────
                 st.session_state.live_position = None
                 st.session_state.last_trade_close_ts = time.time()
                 _dhan_exit(d)
-                if not _already_recorded:
-                    (st.success if pnl>0 else st.error)(
-                        f"CLOSED {exit_why} | PnL: {'+'if pnl>0 else ''}{pnl:.2f} | {to_ist(last_bar)}")
+                (st.success if pnl>0 else st.error)(
+                    f"CLOSED {exit_why} | PnL: {'+'if pnl>0 else ''}{pnl:.2f} | {to_ist(last_bar)}")
                 # ── Email alert: trade exit ───────────────────────────────
                 if st.session_state.get("email_enabled",False):
                     send_alert(
