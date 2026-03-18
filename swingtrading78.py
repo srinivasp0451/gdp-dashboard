@@ -2887,6 +2887,7 @@ with tab_live:
             # price action before entry — would cause immediate false SL hit)
             st.session_state.live_position={"entry":ep,"direction":d,"sl":lv_sl,"target":lv_tgt,
                 "disp_tgt":lv_tgt,"entry_time":last_bar,"entry_bar_time":last_bar,
+                "entry_tick":tick,   # used to skip SL check on the exact entry tick only
                 "highest":ep,"lowest":ep}
             _dhan_place(d)
             _sig_label = "BUY (LONG)" if d==1 else "SELL (SHORT)"
@@ -2927,14 +2928,15 @@ with tab_live:
                     exited,exit_px,exit_why = True, cl, "Strategy Signal Exit"
 
             if not exited:
-                # ── Entry bar guard: skip SL/target check on the bar we entered ──
-                # Reason: entry uses LTP (Close) but bh_cur/bl_cur is the FULL bar range,
-                # which includes price action BEFORE our entry. Checking immediately would
-                # cause false SL hits when the bar's High/Low is already beyond SL/target.
-                # We wait for the NEXT bar (last_bar != entry_bar_time) before checking.
-                _is_entry_bar = (last_bar == pos.get("entry_bar_time"))
-                if _is_entry_bar:
-                    pass  # skip SL/target check — we just entered this bar
+                # ── Entry tick guard: skip SL/target check on the SINGLE TICK we entered ──
+                # Problem: on entry tick, bh_cur/bl_cur is the FULL last-closed-bar range,
+                # which includes price action BEFORE our entry price. For a SHORT at 71280
+                # on a bar whose High was 71306, checking bh_cur≥SL(71290) fires immediately.
+                # Fix: skip only the exact tick we entered (entry_tick == tick).
+                # From the NEXT tick onward, SL/target checks run normally.
+                _is_entry_tick = (tick == pos.get("entry_tick", -1))
+                if _is_entry_tick:
+                    pass  # skip this one tick only — next tick checks normally
                 elif d==1:
                     if bl_cur<=pos["sl"]:             exited,exit_px,exit_why=True,pos["sl"],"SL Hit"
                     elif tf and bh_cur>=pos["target"]:exited,exit_px,exit_why=True,pos["target"],"Target Hit"
