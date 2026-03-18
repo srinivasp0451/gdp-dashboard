@@ -2933,11 +2933,19 @@ with tab_live:
             if exited:
                 pnl=round((exit_px-ep)*d,4)
                 st.session_state.live_trades.append({
-                    "Entry Time":to_ist(pos["entry_time"]),"Entry Price":ep,
-                    "Direction":"LONG" if d==1 else "SHORT",
-                    "Exit Time":to_ist(last_bar),"Exit Price":exit_px,
-                    "Exit Reason":exit_why,"SL":round(pos["sl"],2),"Target":round(pos["disp_tgt"],2),
-                    "Highest":round(pos["highest"],2),"Lowest":round(pos["lowest"],2),"PnL":pnl,
+                    "Ticker":     sym,          # track ticker so history can be filtered
+                    "Strategy":   strategy,     # track strategy
+                    "Entry Time": to_ist(pos["entry_time"]),
+                    "Entry Price":ep,
+                    "Direction":  "LONG" if d==1 else "SHORT",
+                    "Exit Time":  to_ist(last_bar),
+                    "Exit Price": exit_px,
+                    "Exit Reason":exit_why,
+                    "SL":         round(pos["sl"],2),
+                    "Target":     round(pos["disp_tgt"],2),
+                    "Highest":    round(pos["highest"],2),
+                    "Lowest":     round(pos["lowest"],2),
+                    "PnL":        pnl,
                 })
                 # ── Graceful full reset ───────────────────────────────────
                 st.session_state.live_position = None
@@ -2981,24 +2989,40 @@ with tab_live:
         st.plotly_chart(plot_ohlc(lv_df,indics=lv_indics,title=f"LIVE:{t_choice}({interval}) Tick#{tick}"),use_container_width=True,key=f"lv_ohlc_{tick}")
 
         # ── Compact closed-trade summary — always visible without switching tabs ──
-        _closed = st.session_state.get("live_trades", [])
+        # Filter by current ticker so other-ticker trades never pollute display
+        _all_closed  = st.session_state.get("live_trades", [])
+        _closed      = [t for t in _all_closed if t.get("Ticker","") == sym]
+        _other_count = len(_all_closed) - len(_closed)
         if _closed:
             _ct=len(_closed); _cw=sum(1 for x in _closed if x["PnL"]>0)
             _cp=sum(x["PnL"] for x in _closed)
             st.markdown("---")
             _sm1,_sm2,_sm3,_sm4 = st.columns(4)
-            _sm1.metric("Closed Trades", _ct)
+            _sm1.metric("Closed Trades", _ct, help=f"For {sym} only. {_other_count} trades for other tickers hidden.")
             _sm2.metric("Win Rate",  f"{_cw/_ct*100:.1f}%")
             _sm3.metric("Total PnL", f"{_cp:+.2f}", delta=f"{_cp:+.2f}",
                         delta_color="normal" if _cp>=0 else "inverse")
             _sm4.metric("Last Exit", _closed[-1].get("Exit Reason","—"))
-            with st.expander(f"📜 Last 5 trades (full list in Trade History tab)", expanded=False):
+            with st.expander(f"📜 Last 5 trades for {sym} (full list in Trade History tab)", expanded=False):
                 _last5 = pd.DataFrame(_closed[-5:])
+                # Show full datetime — not truncated
+                _disp_cols = [c for c in ["Entry Time","Exit Time","Direction","Entry Price",
+                                          "Exit Price","SL","Target","PnL","Exit Reason"]
+                              if c in _last5.columns]
                 def _sc2(v):
                     if isinstance(v,(int,float)): return "color:#00E676" if v>0 else ("color:#FF5252" if v<0 else "")
                     return ""
-                st.dataframe(_last5.style.map(_sc2,subset=["PnL"]), use_container_width=True,
-                             key=f"lv_last5_{_ct}")
+                st.dataframe(
+                    _last5[_disp_cols].style.map(_sc2, subset=["PnL"]),
+                    use_container_width=True,
+                    key=f"lv_last5_{_ct}_{sym}",
+                    column_config={
+                        "Entry Time": st.column_config.TextColumn("Entry Time", width="large"),
+                        "Exit Time":  st.column_config.TextColumn("Exit Time",  width="large"),
+                    }
+                )
+        elif _other_count:
+            st.info(f"No trades for **{sym}** yet. ({_other_count} trades exist for other tickers — switch ticker to view them.)")
 
         # ── Signal Progress Expander ─────────────────────────────────────────────
         with st.expander("📊 Signal Progress — Current indicator state & distance to signal", expanded=False):
@@ -3676,7 +3700,16 @@ with tab_live:
                 )
 
     def _hist_render():
-        t_ = st.session_state.get("live_trades", [])
+        _all_t = st.session_state.get("live_trades", [])
+        # Show trades for current ticker; allow toggle to see all
+        _show_all_tickers = st.checkbox("Show trades for ALL tickers", value=False, key="hist_show_all")
+        t_ = _all_t if _show_all_tickers else [t for t in _all_t if t.get("Ticker","") == sym]
+        _other = len(_all_t) - len(t_) if not _show_all_tickers else 0
+
+        if _other:
+            st.caption(f"Showing {len(t_)} trades for **{sym}**. "
+                       f"{_other} trades for other tickers hidden — enable 'Show all tickers' above.")
+
         if t_:
             tot  = len(t_)
             wins = sum(1 for x in t_ if x["PnL"] > 0)
@@ -3694,7 +3727,17 @@ with tab_live:
             def _sc(v):
                 if isinstance(v,(int,float)): return "color:#00E676" if v>0 else ("color:#FF5252" if v<0 else "")
                 return ""
-            st.dataframe(hdf.style.map(_sc, subset=["PnL"]), use_container_width=True)
+            # Full datetime columns — never truncated
+            st.dataframe(
+                hdf.style.map(_sc, subset=["PnL"]),
+                use_container_width=True,
+                column_config={
+                    "Entry Time": st.column_config.TextColumn("Entry Time (IST)", width="large"),
+                    "Exit Time":  st.column_config.TextColumn("Exit Time (IST)",  width="large"),
+                    "Ticker":     st.column_config.TextColumn("Ticker", width="small"),
+                    "Strategy":   st.column_config.TextColumn("Strategy", width="medium"),
+                }
+            )
             # Use a dynamic key based on trade count so it never conflicts across reruns
             eq_ = plot_equity(t_, "Live Equity")
             if eq_:
@@ -4595,7 +4638,7 @@ with tab_nte:
                         _ed1.metric("Last Pivot",   f"{_erow['Last Pivot Type']} @ {_erow['Last Pivot Px']}")
                         _ed2.metric("Retrace",      _erow["Retrace %"])
                         _ed3.metric("Last Signal",  _erow["Last Fired"])
-                        _ed4.metric("Bar Time",     _erow["Bar Time"][:16])
+                        _ed4.metric("Bar Time",     _erow["Bar Time"])
                         _prog_int = int(_erow["Pivot Progress"].rstrip("%"))
                         _bar = "█"*int(_prog_int/5) + "░"*(20-int(_prog_int/5))
                         st.markdown(f"**Pivot confirmation:** `[{_bar}]` {_prog_int}% — "
@@ -4645,21 +4688,32 @@ with tab_nte:
         # ── Section 2: Trade History Summary ─────────────────────────────────
         st.markdown("### 📜 Completed Trades (this session)")
         _hist = st.session_state.get("live_trades", [])
-        if _hist:
-            _tot  = len(_hist); _wins = sum(1 for x in _hist if x["PnL"]>0)
-            _pnl  = sum(x["PnL"] for x in _hist)
+        # Filter to current sidebar ticker for clean display
+        _hist_sym = [t for t in _hist if t.get("Ticker","") == sym]
+        _hist_other = len(_hist) - len(_hist_sym)
+        if _hist_sym:
+            _tot  = len(_hist_sym); _wins = sum(1 for x in _hist_sym if x["PnL"]>0)
+            _pnl  = sum(x["PnL"] for x in _hist_sym)
             _hc   = st.columns(4)
             _hc[0].metric("Total Trades", _tot)
             _hc[1].metric("Wins",         f"{_wins} ({_wins/_tot*100:.0f}%)")
             _hc[2].metric("PnL",          f"{_pnl:+.2f}", delta_color="normal" if _pnl>=0 else "inverse")
-            _hc[3].metric("Last Exit",    _hist[-1].get("Exit Reason","—"))
-            _hdf = pd.DataFrame(_hist)
+            _hc[3].metric("Last Exit",    _hist_sym[-1].get("Exit Reason","—"))
+            if _hist_other:
+                st.caption(f"Showing {_tot} trades for **{sym}**. {_hist_other} trades for other tickers in session — see Trade History tab.")
+            _hdf = pd.DataFrame(_hist_sym)
             def _pnl_c(v):
                 if isinstance(v,(int,float)): return "color:#00E676" if v>0 else ("color:#FF5252" if v<0 else "")
                 return ""
-            st.dataframe(_hdf.style.map(_pnl_c, subset=["PnL"]), use_container_width=True)
+            st.dataframe(_hdf.style.map(_pnl_c, subset=["PnL"]),
+                         use_container_width=True,
+                         column_config={
+                             "Entry Time": st.column_config.TextColumn("Entry Time (IST)", width="large"),
+                             "Exit Time":  st.column_config.TextColumn("Exit Time (IST)",  width="large"),
+                         })
         else:
-            st.info("No completed trades this session.")
+            st.info(f"No completed trades for **{sym}** this session." +
+                    (f" ({_hist_other} trades for other tickers exist.)" if _hist_other else ""))
 
         st.markdown("---")
 
@@ -4763,7 +4817,7 @@ with tab_nte:
                         "Last Pivot":    "HIGH" if _pt_ewd["last_confirmed_dir"]==1 else ("LOW" if _pt_ewd["last_confirmed_dir"]==-1 else "—"),
                         "Bars Since Pv": _bars_wait,
                         "Last Signal":   _pt_ewd.get("last_signal","—") or "—",
-                        "Bar Time":      _pt_bar[:16],
+                        "Bar Time":      _pt_bar,
                         "_sig_dir":      "BUY" if _pt_last_sig==1 else ("SELL" if _pt_last_sig==-1 else
                                          "BUY" if _pt_ewd["last_confirmed_dir"]==-1 else "SELL"),
                     })
@@ -4820,7 +4874,11 @@ with tab_nte:
                 with st.expander("📊 Full results table"):
                     _ptdf_disp = pd.DataFrame([{k:v for k,v in r.items() if not k.startswith("_")}
                                                 for r in _show_r])
-                    st.dataframe(_ptdf_disp, use_container_width=True)
+                    st.dataframe(_ptdf_disp, use_container_width=True,
+                                 column_config={
+                                     "Bar Time": st.column_config.TextColumn("Bar Time (IST)", width="large"),
+                                     "Est. Time": st.column_config.TextColumn("Est. Time to Signal", width="medium"),
+                                 })
             else:
                 st.info(f"No tickers reached {_pt_alert}% progress. All waves are still building. "
                         "Check back in 15-30 mins.")
