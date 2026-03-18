@@ -2651,9 +2651,20 @@ with tab_live:
 
         lv_df=fetch_live(sym,interval)
         if lv_df is None or lv_df.empty: st.warning("No data. Retrying…"); return
-        lv_n=len(lv_df); cl=float(lv_df["Close"].iloc[-1])
-        bh_cur=float(lv_df["High"].iloc[-1]); bl_cur=float(lv_df["Low"].iloc[-1])
-        last_bar=lv_df.index[-1]
+        lv_n=len(lv_df)
+
+        # ── Price references ───────────────────────────────────────────────────
+        # cl  = LTP (last tick price from forming/current bar) — for display & entry price
+        # bh_cur / bl_cur = High/Low of the LAST FULLY CLOSED bar (iloc[-2])
+        #   This matches backtest logic exactly: backtest checks bar[j] High/Low
+        #   only after that bar is complete. Using forming bar's High/Low causes
+        #   false SL hits — e.g. a SHORT at 71194 with SL=71204 exits immediately
+        #   because the forming bar's High touches 71204 intrabar even while falling.
+        cl      = float(lv_df["Close"].iloc[-1])    # LTP (forming bar close = current price)
+        _closed_bar_idx = max(0, lv_n - 2)          # last FULLY closed bar
+        bh_cur  = float(lv_df["High"].iloc[_closed_bar_idx])   # SL/Target check
+        bl_cur  = float(lv_df["Low"].iloc[_closed_bar_idx])    # SL/Target check
+        last_bar= lv_df.index[_closed_bar_idx]      # timestamp of last closed bar
 
         fn=STRATEGY_FN.get(strategy,sig_custom)
         try: lv_sigs,lv_indics=fn(lv_df,**live_params)
@@ -2882,7 +2893,10 @@ with tab_live:
             d=last_sig; ep=cl
             lv_sl =init_sl(lv_df,lv_n-1,ep,d,sl_type,sl_pts,live_params)
             lv_tgt=init_tgt(lv_df,lv_n-1,ep,d,tgt_type,tgt_pts,lv_sl,live_params)
-            # Fully reset position state
+            # Fully reset position state; store entry bar index so we skip
+            # SL/target check on the very same bar (candle High/Low already includes
+            # With LTP-based SL/Target checking there's no false immediate trigger,
+            # so we don't need an entry_tick guard anymore.
             st.session_state.live_position={"entry":ep,"direction":d,"sl":lv_sl,"target":lv_tgt,
                 "disp_tgt":lv_tgt,"entry_time":last_bar,"highest":ep,"lowest":ep}
             _dhan_place(d)
@@ -2924,12 +2938,24 @@ with tab_live:
                     exited,exit_px,exit_why = True, cl, "Strategy Signal Exit"
 
             if not exited:
+                # ── LIVE TRADING: use LTP (last traded price = cl) for SL/Target ──
+                # BACKTEST uses candle High/Low because it processes closed bars where the
+                # full range is known. LIVE TRADING processes tick-by-tick where the current
+                # candle is still forming — its High/Low includes price action from the entire
+                # bar so far, which can falsely trigger SL on a spike even while trend continues.
+                #
+                # Example (your data): SHORT at 71194, SL=71204. Current candle High=71252
+                # (accumulated from bar start). Even though price is now at 71170 and falling,
+                # bh_cur=71252 > SL=71204 → SL fires wrongly. Using cl=71170 → no SL hit ✓
+                #
+                # Rule: compare SL/Target against the LAST TRADED PRICE (cl) only.
+                # The position tracks `highest` and `lowest` for display — still updated.
                 if d==1:
-                    if bl_cur<=pos["sl"]:             exited,exit_px,exit_why=True,pos["sl"],"SL Hit"
-                    elif tf and bh_cur>=pos["target"]:exited,exit_px,exit_why=True,pos["target"],"Target Hit"
+                    if cl <= pos["sl"]:             exited,exit_px,exit_why=True,pos["sl"],"SL Hit"
+                    elif tf and cl >= pos["target"]:exited,exit_px,exit_why=True,pos["target"],"Target Hit"
                 else:
-                    if bh_cur>=pos["sl"]:             exited,exit_px,exit_why=True,pos["sl"],"SL Hit"
-                    elif tf and bl_cur<=pos["target"]:exited,exit_px,exit_why=True,pos["target"],"Target Hit"
+                    if cl >= pos["sl"]:             exited,exit_px,exit_why=True,pos["sl"],"SL Hit"
+                    elif tf and cl <= pos["target"]:exited,exit_px,exit_why=True,pos["target"],"Target Hit"
             if not exited and st.session_state.get("time_filter",False) and not _in_window:
                 exited,exit_px,exit_why=True,cl,"Time Window Close"
             if exited:
