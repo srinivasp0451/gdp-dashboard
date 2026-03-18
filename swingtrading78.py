@@ -2170,7 +2170,7 @@ for _k,_v in {"live_active":False,"live_trades":[],"live_position":None,"live_ti
                "opt_applied":None,"opt_results":None,"opt_res_meta":None,"opt_df":None,
                "_oa_hash_prev":"","no_overlap":True,"time_filter":False,
                "dhan_enabled":False,"cooldown_enabled":True,"cooldown_secs":5,
-               "last_trade_close_ts":0.0}.items():
+               "last_trade_close_ts":0.0,"_last_trade_fp":""}.items():
     if _k not in st.session_state: st.session_state[_k]=_v
 
 def _idx(lst,val,default=0): return lst.index(val) if val in lst else default
@@ -2614,11 +2614,13 @@ with tab_live:
     st.markdown("---")
     _bc=st.columns([1,1,1,5])
     if _bc[0].button("▶ Start",type="primary",disabled=st.session_state.live_active,key="btn_lv_start"):
-        st.session_state.update({"live_active":True,"live_trades":[],"live_position":None,"live_tick":0}); st.rerun()
+        st.session_state.update({"live_active":True,"live_trades":[],"live_position":None,
+                                  "live_tick":0,"_last_trade_fp":"","last_trade_close_ts":0.0}); st.rerun()
     if _bc[1].button("⏹ Stop",disabled=not st.session_state.live_active,key="btn_lv_stop"):
         st.session_state.live_active=False; st.rerun()
     if _bc[2].button("🗑 Clear",key="btn_lv_clear"):
-        st.session_state.update({"live_trades":[],"live_position":None}); st.rerun()
+        st.session_state.update({"live_trades":[],"live_position":None,
+                                  "_last_trade_fp":"","last_trade_close_ts":0.0}); st.rerun()
     _bc[3].info("Smooth updates: " + ("✅ Active (Streamlit≥1.33)" if _HAS_FRAGMENT else "⚠️ Upgrade Streamlit≥1.33"))
     sub_mon,sub_hist=st.tabs(["📡 Live Monitor","📜 Trade History"])
 
@@ -2932,27 +2934,37 @@ with tab_live:
                 exited,exit_px,exit_why=True,cl,"Time Window Close"
             if exited:
                 pnl=round((exit_px-ep)*d,4)
-                st.session_state.live_trades.append({
-                    "Ticker":     sym,          # track ticker so history can be filtered
-                    "Strategy":   strategy,     # track strategy
-                    "Entry Time": to_ist(pos["entry_time"]),
-                    "Entry Price":ep,
-                    "Direction":  "LONG" if d==1 else "SHORT",
-                    "Exit Time":  to_ist(last_bar),
-                    "Exit Price": exit_px,
-                    "Exit Reason":exit_why,
-                    "SL":         round(pos["sl"],2),
-                    "Target":     round(pos["disp_tgt"],2),
-                    "Highest":    round(pos["highest"],2),
-                    "Lowest":     round(pos["lowest"],2),
-                    "PnL":        pnl,
-                })
-                # ── Graceful full reset ───────────────────────────────────
+                # ── DEDUP: create a fingerprint of this trade to prevent double-recording ──
+                # The fragment can re-render mid-execution causing the same exit to be
+                # appended multiple times. Guard with a unique key in session state.
+                _trade_fp = f"{sym}_{ep:.4f}_{to_ist(pos['entry_time'])}_{d}"
+                _already_recorded = st.session_state.get("_last_trade_fp","") == _trade_fp
+                if not _already_recorded:
+                    st.session_state["_last_trade_fp"] = _trade_fp
+                    st.session_state.live_trades.append({
+                        "Ticker":     sym,
+                        "Strategy":   strategy,
+                        "Entry Time": to_ist(pos["entry_time"]),
+                        "Entry Price":round(ep,2),
+                        "Direction":  "LONG" if d==1 else "SHORT",
+                        "Exit Time":  to_ist(last_bar),
+                        "Exit Price": round(exit_px,2),
+                        "Exit Reason":exit_why,
+                        "SL":         round(pos["sl"],2),
+                        "Target":     round(pos["disp_tgt"],2),
+                        "Highest":    round(pos["highest"],2),
+                        "Lowest":     round(pos["lowest"],2),
+                        "PnL":        pnl,
+                    })
+                # ── Graceful full reset — MUST happen before any st.* call ────
+                # Setting live_position=None here prevents the fragment from
+                # re-reading the same pos dict if it re-renders before this tick ends.
                 st.session_state.live_position = None
                 st.session_state.last_trade_close_ts = time.time()
                 _dhan_exit(d)
-                (st.success if pnl>0 else st.error)(
-                    f"CLOSED {exit_why} | PnL: {'+'if pnl>0 else ''}{pnl:.2f} | {to_ist(last_bar)}")
+                if not _already_recorded:
+                    (st.success if pnl>0 else st.error)(
+                        f"CLOSED {exit_why} | PnL: {'+'if pnl>0 else ''}{pnl:.2f} | {to_ist(last_bar)}")
                 # ── Email alert: trade exit ───────────────────────────────
                 if st.session_state.get("email_enabled",False):
                     send_alert(
