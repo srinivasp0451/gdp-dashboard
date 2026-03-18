@@ -2651,9 +2651,20 @@ with tab_live:
 
         lv_df=fetch_live(sym,interval)
         if lv_df is None or lv_df.empty: st.warning("No data. Retrying…"); return
-        lv_n=len(lv_df); cl=float(lv_df["Close"].iloc[-1])
-        bh_cur=float(lv_df["High"].iloc[-1]); bl_cur=float(lv_df["Low"].iloc[-1])
-        last_bar=lv_df.index[-1]
+        lv_n=len(lv_df)
+
+        # ── Price references ───────────────────────────────────────────────────
+        # cl  = LTP (last tick price from forming/current bar) — for display & entry price
+        # bh_cur / bl_cur = High/Low of the LAST FULLY CLOSED bar (iloc[-2])
+        #   This matches backtest logic exactly: backtest checks bar[j] High/Low
+        #   only after that bar is complete. Using forming bar's High/Low causes
+        #   false SL hits — e.g. a SHORT at 71194 with SL=71204 exits immediately
+        #   because the forming bar's High touches 71204 intrabar even while falling.
+        cl      = float(lv_df["Close"].iloc[-1])    # LTP (forming bar close = current price)
+        _closed_bar_idx = max(0, lv_n - 2)          # last FULLY closed bar
+        bh_cur  = float(lv_df["High"].iloc[_closed_bar_idx])   # SL/Target check
+        bl_cur  = float(lv_df["Low"].iloc[_closed_bar_idx])    # SL/Target check
+        last_bar= lv_df.index[_closed_bar_idx]      # timestamp of last closed bar
 
         fn=STRATEGY_FN.get(strategy,sig_custom)
         try: lv_sigs,lv_indics=fn(lv_df,**live_params)
@@ -2882,9 +2893,13 @@ with tab_live:
             d=last_sig; ep=cl
             lv_sl =init_sl(lv_df,lv_n-1,ep,d,sl_type,sl_pts,live_params)
             lv_tgt=init_tgt(lv_df,lv_n-1,ep,d,tgt_type,tgt_pts,lv_sl,live_params)
-            # Fully reset position state
+            # Fully reset position state; store entry bar index so we skip
+            # SL/target check on the very same bar (candle High/Low already includes
+            # price action before entry — would cause immediate false SL hit)
             st.session_state.live_position={"entry":ep,"direction":d,"sl":lv_sl,"target":lv_tgt,
-                "disp_tgt":lv_tgt,"entry_time":last_bar,"highest":ep,"lowest":ep}
+                "disp_tgt":lv_tgt,"entry_time":last_bar,"entry_bar_time":last_bar,
+                "entry_tick":tick,   # used to skip SL check on the exact entry tick only
+                "highest":ep,"lowest":ep}
             _dhan_place(d)
             _sig_label = "BUY (LONG)" if d==1 else "SELL (SHORT)"
             st.success(f"🚀 NEW {'LONG' if d==1 else 'SHORT'}  Entry:{ep:.2f}  "
@@ -2924,7 +2939,16 @@ with tab_live:
                     exited,exit_px,exit_why = True, cl, "Strategy Signal Exit"
 
             if not exited:
-                if d==1:
+                # ── Entry tick guard: skip SL/target check on the SINGLE TICK we entered ──
+                # Problem: on entry tick, bh_cur/bl_cur is the FULL last-closed-bar range,
+                # which includes price action BEFORE our entry price. For a SHORT at 71280
+                # on a bar whose High was 71306, checking bh_cur≥SL(71290) fires immediately.
+                # Fix: skip only the exact tick we entered (entry_tick == tick).
+                # From the NEXT tick onward, SL/target checks run normally.
+                _is_entry_tick = (tick == pos.get("entry_tick", -1))
+                if _is_entry_tick:
+                    pass  # skip this one tick only — next tick checks normally
+                elif d==1:
                     if bl_cur<=pos["sl"]:             exited,exit_px,exit_why=True,pos["sl"],"SL Hit"
                     elif tf and bh_cur>=pos["target"]:exited,exit_px,exit_why=True,pos["target"],"Target Hit"
                 else:
