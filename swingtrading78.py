@@ -147,7 +147,7 @@ NIFTY50_STOCKS = {
     "Divis Labs":"DIVISLAB.NS","Eicher Motors":"EICHERMOT.NS","Apollo Hospitals":"APOLLOHOSP.NS",
     "Grasim":"GRASIM.NS","BEL":"BEL.NS","BPCL":"BPCL.NS","Shriram Finance":"SHRIRAMFIN.NS",
     "Tata Consumer":"TATACONSUM.NS","Tata Motors":"TATAMOTORS.NS",
-    "Hero MotoCorp":"HEROMOTOCO.NS","Britannia":"BRITANNIA.NS","HDFC AMC":"HDFCAMC.NS","KAYNES.NS"
+    "Hero MotoCorp":"HEROMOTOCO.NS","Britannia":"BRITANNIA.NS","HDFC AMC":"HDFCAMC.NS","Kaynes":"KAYNES.NS"
 }
 NIFTY50_SYMBOLS = list(NIFTY50_STOCKS.values())
 TIMEFRAMES = ["1m","5m","15m","30m","1h","4h","1d","1wk"]
