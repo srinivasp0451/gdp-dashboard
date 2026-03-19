@@ -147,7 +147,7 @@ NIFTY50_STOCKS = {
     "Divis Labs":"DIVISLAB.NS","Eicher Motors":"EICHERMOT.NS","Apollo Hospitals":"APOLLOHOSP.NS",
     "Grasim":"GRASIM.NS","BEL":"BEL.NS","BPCL":"BPCL.NS","Shriram Finance":"SHRIRAMFIN.NS",
     "Tata Consumer":"TATACONSUM.NS","Tata Motors":"TATAMOTORS.NS",
-    "Hero MotoCorp":"HEROMOTOCO.NS","Britannia":"BRITANNIA.NS","HDFC AMC":"HDFCAMC.NS",
+    "Hero MotoCorp":"HEROMOTOCO.NS","Britannia":"BRITANNIA.NS","HDFC AMC":"HDFCAMC.NS","KAYNES.NS"
 }
 NIFTY50_SYMBOLS = list(NIFTY50_STOCKS.values())
 TIMEFRAMES = ["1m","5m","15m","30m","1h","4h","1d","1wk"]
@@ -2286,7 +2286,7 @@ with st.sidebar:
     dhan_enabled=st.checkbox("Enable Dhan Broker",value=False,key="dhan_enabled")
     if dhan_enabled:
         dhan_client=st.text_input("Client ID","1104779876",key="dhan_client")
-        _DEFAULT_TOKEN = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzUxMiJ9.eyJpc3MiOiJkaGFuIiwicGFydG5lcklkIjoiIiwiZXhwIjoxNzczODAyMDg2LCJpYXQiOjE3NzM3MTU2ODYsInRva2VuQ29uc3VtZXJUeXBlIjoiU0VMRiIsIndlYmhvb2tVcmwiOiIiLCJkaGFuQ2xpZW50SWQiOiIxMTA0Nzc5ODc2In0.L5ULyf8AfeaoZS_kn95rtQZ6qNRJF3EUimCJw_8q12k2FZHEGEPNySKrYOBP9vRfBHKvEqWoB0ZC7GRUd7zyMg"
+        _DEFAULT_TOKEN = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzUxMiJ9.eyJpc3MiOiJkaGFuIiwicGFydG5lcklkIjoiIiwiZXhwIjoxNzczOTc3MzIzLCJpYXQiOjE3NzM4OTA5MjMsInRva2VuQ29uc3VtZXJUeXBlIjoiU0VMRiIsIndlYmhvb2tVcmwiOiIiLCJkaGFuQ2xpZW50SWQiOiIxMTA0Nzc5ODc2In0.jQQQUE5pTKN1Jo4S1t61ZnujMr1yqWi91xd_cq3VA9V4ADrJb02Cu6cW1xP_YTvm6ZxmvniUR3dPUjh6Rcjkvw"
         dhan_token =st.text_input("Access Token",_DEFAULT_TOKEN,key="dhan_token",type="password")
         st.caption("**Order type — always BUYER (never seller in options)**")
         is_stocks=st.checkbox("Stocks / Intraday mode  (uncheck = Options CE/PE buyer)",value=False,key="dhan_is_stocks")
@@ -3814,7 +3814,7 @@ with tab_opt:
     with st.expander("📥 Optimization Inputs",expanded=True):
         oc1,oc2,oc3=st.columns(3)
         opt_t=oc1.selectbox("Instrument",list(TICKER_MAP.keys()),key="opt_t")
-        opt_sym=oc1.text_input("Custom Ticker","RELIANCE.NS",key="opt_csym").strip() if opt_t=="Custom" else TICKER_MAP[opt_t]
+        opt_sym=oc1.text_input("Custom Ticker","Kaynes.NS",key="opt_csym").strip() if opt_t=="Custom" else TICKER_MAP[opt_t]
         opt_iv=oc1.selectbox("Timeframe",TIMEFRAMES,index=4,key="opt_iv")
         opt_pd=oc2.selectbox("Period",PERIODS,index=5,key="opt_pd")
         opt_st=oc2.selectbox("Strategy", STRATEGIES, key="opt_strat")
