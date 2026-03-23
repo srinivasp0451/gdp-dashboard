@@ -2286,7 +2286,7 @@ with st.sidebar:
     dhan_enabled=st.checkbox("Enable Dhan Broker",value=False,key="dhan_enabled")
     if dhan_enabled:
         dhan_client=st.text_input("Client ID","1104779876",key="dhan_client")
-        _DEFAULT_TOKEN = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzUxMiJ9.eyJpc3MiOiJkaGFuIiwicGFydG5lcklkIjoiIiwiZXhwIjoxNzczOTc3MzIzLCJpYXQiOjE3NzM4OTA5MjMsInRva2VuQ29uc3VtZXJUeXBlIjoiU0VMRiIsIndlYmhvb2tVcmwiOiIiLCJkaGFuQ2xpZW50SWQiOiIxMTA0Nzc5ODc2In0.jQQQUE5pTKN1Jo4S1t61ZnujMr1yqWi91xd_cq3VA9V4ADrJb02Cu6cW1xP_YTvm6ZxmvniUR3dPUjh6Rcjkvw"
+        _DEFAULT_TOKEN = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzUxMiJ9.eyJpc3MiOiJkaGFuIiwicGFydG5lcklkIjoiIiwiZXhwIjoxNzc0MzIxNTIxLCJpYXQiOjE3NzQyMzUxMjEsInRva2VuQ29uc3VtZXJUeXBlIjoiU0VMRiIsIndlYmhvb2tVcmwiOiIiLCJkaGFuQ2xpZW50SWQiOiIxMTA0Nzc5ODc2In0.AaUkMzDtfkRCxcN3wZVMKogmXi8Z6D9MSKlh9dHw0sip4EBE2GLw3ZbQM6UetSfyQDIbvjXp1A-Kazqr_8Au0g"
         dhan_token =st.text_input("Access Token",_DEFAULT_TOKEN,key="dhan_token",type="password")
         st.caption("**Order type — always BUYER (never seller in options)**")
         is_stocks=st.checkbox("Stocks / Intraday mode  (uncheck = Options CE/PE buyer)",value=False,key="dhan_is_stocks")
