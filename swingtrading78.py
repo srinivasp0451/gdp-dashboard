@@ -2363,6 +2363,20 @@ with st.sidebar:
         cooldown_secs=st.number_input("Cooldown (seconds)",1,300,5,step=1,key="cooldown_secs")
     else:
         cooldown_secs=0
+    # Adjusted target: when entering late, reduce target by already-captured move
+    adj_target_enabled = st.checkbox(
+        "Adjusted Target (Late Entry Mode)",
+        value=False, key="adj_target_enabled",
+        help="When you enter after the signal already fired and price has moved in signal direction, "
+             "the remaining target is reduced to (original_target - already_captured_move). "
+             "Example: Signal fired, target=20pts, price already moved 8pts → your target = 12pts. "
+             "This keeps your exit realistic for the remaining move available."
+    )
+    if adj_target_enabled:
+        st.caption(
+            "✅ Active — target will be set to the REMAINING portion of the original signal target. "
+            "If entering fresh (0 bars elapsed), target is unchanged."
+        )
     time_filter=st.checkbox("Time Window Filter (IST)",value=False,key="time_filter",
         help="Only place/exit orders within the specified IST time window.")
     if time_filter:
@@ -2694,20 +2708,50 @@ with tab_live:
                            "Support & Resistance + EMA":2}
         _sig_lookback = _WIDE_LOOKBACK.get(strategy, 1)
         last_sig        = 0
-        _sig_bars_ago   = 0       # how many bars ago the signal fired
-        _sig_bar_dt     = None    # datetime of the signal bar
-        _sig_bar_price  = None    # close price at the signal bar
+        _sig_bars_ago   = 0
+        _sig_bar_dt     = None
+        _sig_bar_price  = None
         for _si in range(1, _sig_lookback + 2):
             if len(lv_sigs) > _si:
                 _sv = int(lv_sigs.iloc[-_si])
                 if _sv != 0:
                     last_sig      = _sv
-                    _sig_bars_ago = _si - 1   # 0 = last closed bar, 1 = 2 bars ago, etc.
+                    _sig_bars_ago = _si - 1
                     try:
-                        _sig_bar_dt    = lv_df.index[-(  _si)]
+                        _sig_bar_dt    = lv_df.index[-_si]
                         _sig_bar_price = float(lv_df["Close"].iloc[-_si])
                     except: pass
                     break
+
+        # ── Persist signal state so the panel survives page redraws ──────────
+        # Each tick we update the stored signal. The panel reads from session_state
+        # so it shows the last known signal even if last_sig momentarily reads 0
+        # due to a data fetch that returned slightly different data.
+        _sig_key = f"_live_sig_{sym}"
+        if last_sig != 0 and _sig_bar_dt is not None:
+            # Fresh or known signal — store it
+            st.session_state[_sig_key] = {
+                "sig":        last_sig,
+                "bars_ago":   _sig_bars_ago,
+                "bar_dt":     _sig_bar_dt,
+                "bar_price":  _sig_bar_price,
+                "bar_low":    float(lv_df["Low"].iloc[-(_sig_bars_ago+1)]) if lv_n > _sig_bars_ago+1 else _sig_bar_price - 10,
+                "bar_high":   float(lv_df["High"].iloc[-(_sig_bars_ago+1)]) if lv_n > _sig_bars_ago+1 else _sig_bar_price + 10,
+                "stored_tick":tick,
+            }
+        # Use stored signal if current scan returned nothing (transient data gap)
+        _stored_sig = st.session_state.get(_sig_key, {})
+        if last_sig == 0 and _stored_sig and pos is None:
+            # Re-use stored signal; update bars_ago relative to current bar count
+            _stored_bars_ago = _stored_sig.get("bars_ago", 0)
+            _ticks_since_store = tick - _stored_sig.get("stored_tick", tick)
+            last_sig        = _stored_sig["sig"]
+            _sig_bars_ago   = _stored_bars_ago + _ticks_since_store
+            _sig_bar_dt     = _stored_sig["bar_dt"]
+            _sig_bar_price  = _stored_sig["bar_price"]
+        # Clear stored signal once position opens (so it doesn't show after entry)
+        if pos is not None:
+            st.session_state[_sig_key] = {}
 
         # ── Price row ─────────────────────────────────────────────────────────
         # pos must be read before the signal timing panel which checks it
@@ -2919,8 +2963,41 @@ with tab_live:
                     f"The strategy will fire again — patience is more profitable than chasing."
                 )
 
-            # ── EW-specific structure note ─────────────────────────────────────
-            if "Elliott Wave" in strategy:
+            # ── Late-start handler: if user just started monitoring ───────────
+            # If the signal fired many bars ago and user just opened the app,
+            # show a dedicated guidance section.
+            _just_started = tick <= 3   # first 3 ticks = user probably just started
+            if _sig_bars_ago >= 3 and _just_started:
+                st.markdown("#### 🆕 You Started Late — Here's What To Do")
+                _late_start_adj = st.session_state.get("adj_target_enabled", False)
+                if _verdict in ("TOO LATE", "INVALIDATED"):
+                    st.error(
+                        f"**You opened this app after the signal already fired and the move has largely happened.**\n\n"
+                        f"Signal fired at **{to_ist(_sig_bar_dt)}** — that was **{_sig_bars_ago} candles** "
+                        f"({_mins_elapsed} min) ago. Price has already moved **{abs(_price_move):.2f} pts** "
+                        f"which is **{_move_vs_sl*100:.0f}%** of your SL distance.\n\n"
+                        f"**Do NOT enter this signal.** Chasing it now is a FOMO trade.\n\n"
+                        f"✅ **What to do:** Keep live trading running. The strategy will fire the next "
+                        f"signal on a fresh candle. When it does, the freshness gauge will show 🟢 FRESH "
+                        f"and you'll have a clean entry. Patience here saves money."
+                    )
+                elif _verdict in ("BORDERLINE", "VALID"):
+                    st.warning(
+                        f"**You started monitoring after the signal fired, but it may still be tradeable.**\n\n"
+                        f"Signal at **{to_ist(_sig_bar_dt)}** ({_sig_bars_ago} candles ago, ~{_mins_elapsed} min). "
+                        f"Price moved **{abs(_price_move):.2f} pts** in signal direction — "
+                        f"**{_move_vs_sl*100:.0f}%** of SL consumed.\n\n"
+                        f"{'✅ Adjusted Target is ON — your target will be reduced to the remaining move.' if _late_start_adj else '⚠️ Consider enabling **Adjusted Target (Late Entry Mode)** in Trade Management sidebar — it will automatically set your target to the remaining move portion, not the original full target.'}\n\n"
+                        f"**If you enter:** SL = **{_sl_now:.2f}**, Target = **{_tgt_now:.2f}** "
+                        f"({'adjusted' if _late_start_adj else 'original — consider enabling Adjusted Target'}). "
+                        f"Use reduced position size (50% normal)."
+                    )
+                else:
+                    st.success(
+                        f"**You started monitoring recently and the signal is still fresh enough.**\n\n"
+                        f"Signal at **{to_ist(_sig_bar_dt)}** ({_sig_bars_ago} candle(s) ago). "
+                        f"Price barely moved — you haven't missed much. Enter at full size."
+                    )
                 try:
                     _sig_bar_low  = float(lv_df["Low"].iloc[-(_sig_bars_ago+1)])
                     _sig_bar_high = float(lv_df["High"].iloc[-(_sig_bars_ago+1)])
@@ -3132,17 +3209,30 @@ with tab_live:
             d=last_sig; ep=cl
             lv_sl =init_sl(lv_df,lv_n-1,ep,d,sl_type,sl_pts,live_params)
             lv_tgt=init_tgt(lv_df,lv_n-1,ep,d,tgt_type,tgt_pts,lv_sl,live_params)
-            # Fully reset position state; store entry bar index so we skip
-            # SL/target check on the very same bar (candle High/Low already includes
-            # With LTP-based SL/Target checking there's no false immediate trigger,
-            # so we don't need an entry_tick guard anymore.
+
+            # ── Adjusted Target (Late Entry Mode) ─────────────────────────────
+            # When price has already moved in signal direction, reduce target by
+            # the amount already captured so exit is realistic for remaining move.
+            _adj_tgt_note = ""
+            if st.session_state.get("adj_target_enabled", False) and _sig_bar_price is not None:
+                _already_moved = (ep - _sig_bar_price) * d   # positive if price moved in signal dir
+                if _already_moved > 0:
+                    _remaining_tgt_pts = max(tgt_pts - _already_moved, sl_pts * 0.5)  # floor at 0.5×SL
+                    _adj_lv_tgt = ep + d * _remaining_tgt_pts
+                    _adj_tgt_note = (
+                        f" [Adjusted: signal moved {_already_moved:.1f}pts already, "
+                        f"remaining target = {_remaining_tgt_pts:.1f}pts → {_adj_lv_tgt:.2f}]"
+                    )
+                    lv_tgt = _adj_lv_tgt
+
+            # With LTP-based SL/Target checking there's no false immediate trigger.
             st.session_state.live_position={"entry":ep,"direction":d,"sl":lv_sl,"target":lv_tgt,
                 "disp_tgt":lv_tgt,"entry_time":last_bar,"highest":ep,"lowest":ep}
             _dhan_place(d)
             _sig_label = "BUY (LONG)" if d==1 else "SELL (SHORT)"
             st.success(f"🚀 NEW {'LONG' if d==1 else 'SHORT'}  Entry:{ep:.2f}  "
                        f"SL:{lv_sl:.2f}  Target:{lv_tgt:.2f}  "
-                       f"[{to_ist(last_bar)}]")
+                       f"[{to_ist(last_bar)}]{_adj_tgt_note}")
             # ── Email alert: new signal ───────────────────────────────────
             if st.session_state.get("email_enabled",False):
                 send_alert(
