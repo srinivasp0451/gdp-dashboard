@@ -2722,95 +2722,233 @@ with tab_live:
         m[4].metric("Signal",sig_txt)
         m[5].metric("Last Bar",to_ist(last_bar))
 
-        # ── Signal Timing Panel — should I enter now or is it too late? ───────
+        # ── Signal Timing Panel — detailed, anti-FOMO entry guidance ────────
         if last_sig != 0 and _sig_bar_dt is not None and pos is None:
-            _sig_dir_label = "BUY (LONG)" if last_sig==1 else "SELL (SHORT)"
-            _price_move    = cl - _sig_bar_price                 # how much price moved since signal
-            _move_vs_sl    = abs(_price_move) / max(sl_pts, 0.01) # fraction of SL already consumed
+            _sig_dir_label = "🟢 BUY (LONG)" if last_sig==1 else "🔴 SELL (SHORT)"
+            _price_move    = cl - _sig_bar_price
+            _move_vs_sl    = abs(_price_move) / max(sl_pts, 0.01)
             _favorable     = (_price_move > 0 and last_sig==1) or (_price_move < 0 and last_sig==-1)
+            _mins_map      = {"1m":1,"5m":5,"15m":15,"30m":30,"1h":60,"4h":240,"1d":1440}
+            _mins_per_bar  = _mins_map.get(interval, 5)
+            _mins_elapsed  = _sig_bars_ago * _mins_per_bar
 
-            # Interval → approximate minutes per bar
-            _mins_map = {"1m":1,"5m":5,"15m":15,"30m":30,"1h":60,"4h":240,"1d":1440,"1wk":10080}
-            _mins_per_bar = _mins_map.get(interval, 5)
-            _mins_elapsed = _sig_bars_ago * _mins_per_bar
+            # SL/Target levels if entering right now at cl
+            _sl_now  = cl - last_sig * sl_pts
+            _tgt_now = cl + last_sig * tgt_pts
+            _rr_now  = tgt_pts / max(sl_pts, 0.01)
 
-            # Decide entry quality
+            # Original SL/Target at signal bar price
+            _sl_orig  = _sig_bar_price - last_sig * sl_pts
+            _tgt_orig = _sig_bar_price + last_sig * tgt_pts
+
+            # How much of target already captured by price moving in signal direction
+            _tgt_consumed_pct = abs(_price_move) / max(tgt_pts, 0.01) * 100 if _favorable else 0
+
+            # Freshness score 0-100 (100 = just fired, 0 = very stale)
+            # Degrades with bars elapsed and SL consumed
+            _freshness = max(0, 100 - _sig_bars_ago * 8 - _move_vs_sl * 60)
+
+            # ── Verdict logic ─────────────────────────────────────────────────
             if _sig_bars_ago == 0:
-                _entry_verdict  = "🟢 FRESH — signal just fired on the last closed bar. Best time to enter."
-                _verdict_color  = "success"
-            elif _favorable and _move_vs_sl < 0.30:
-                _entry_verdict  = (f"🟡 STILL VALID — signal fired {_sig_bars_ago} bar(s) ago (~{_mins_elapsed} min). "
-                                   f"Price moved {abs(_price_move):.2f} pts in your favor. "
-                                   f"SL not meaningfully consumed ({_move_vs_sl*100:.0f}% of SL distance). OK to enter.")
-                _verdict_color  = "warning"
-            elif _favorable and _move_vs_sl < 0.60:
-                _entry_verdict  = (f"⚠️ BORDERLINE — signal fired {_sig_bars_ago} bar(s) ago (~{_mins_elapsed} min). "
-                                   f"Price moved {abs(_price_move):.2f} pts in your favor ({_move_vs_sl*100:.0f}% of SL gone). "
-                                   f"Entry possible but risk/reward reduced. Consider smaller size.")
-                _verdict_color  = "warning"
-            elif _favorable and _move_vs_sl >= 0.60:
-                _entry_verdict  = (f"🔴 TOO LATE — signal fired {_sig_bars_ago} bar(s) ago (~{_mins_elapsed} min). "
-                                   f"Price already moved {abs(_price_move):.2f} pts ({_move_vs_sl*100:.0f}% of your SL). "
-                                   f"Risk/reward is poor. Wait for the next signal.")
-                _verdict_color  = "error"
-            elif not _favorable and abs(_price_move) < sl_pts * 0.5:
-                _entry_verdict  = (f"🟡 MODERATE — signal fired {_sig_bars_ago} bar(s) ago (~{_mins_elapsed} min). "
-                                   f"Price moved {abs(_price_move):.2f} pts AGAINST signal direction but within SL. "
-                                   f"Signal still alive — entry is valid but price is less favorable.")
-                _verdict_color  = "warning"
+                _verdict = "FRESH"
+                _action  = "ENTER NOW"
+                _color   = "success"
+            elif _favorable and _move_vs_sl < 0.25:
+                _verdict = "VALID"
+                _action  = "ENTER — still good"
+                _color   = "success"
+            elif _favorable and _move_vs_sl < 0.55:
+                _verdict = "BORDERLINE"
+                _action  = "ENTER CAREFULLY — reduced R:R"
+                _color   = "warning"
+            elif _favorable and _move_vs_sl >= 0.55:
+                _verdict = "TOO LATE"
+                _action  = "SKIP — wait for next signal"
+                _color   = "error"
+            elif not _favorable and _move_vs_sl < 0.30:
+                _verdict = "PULLBACK"
+                _action  = "MONITOR — price pulling back, may still be OK"
+                _color   = "warning"
             else:
-                _entry_verdict  = (f"🔴 STALE/RISKY — signal fired {_sig_bars_ago} bar(s) ago (~{_mins_elapsed} min). "
-                                   f"Price moved {abs(_price_move):.2f} pts against signal. "
-                                   f"SL likely compromised. Skip this signal — wait for next.")
-                _verdict_color  = "error"
+                _verdict = "INVALIDATED"
+                _action  = "DO NOT ENTER — signal broken"
+                _color   = "error"
 
-            # Projected outcome if entering now
-            _entry_now_sl_dist  = abs(cl - (cl - last_sig * sl_pts))   # = sl_pts
-            _entry_now_tgt_dist = abs(cl - (cl + last_sig * tgt_pts))  # = tgt_pts
-            _rr_ratio_now       = tgt_pts / max(sl_pts, 0.01)
+            # Freshness bar
+            _fresh_filled = int(_freshness / 5)
+            _fresh_bar    = "█" * _fresh_filled + "░" * (20 - _fresh_filled)
+            _fresh_label  = ("🟢 Very Fresh" if _freshness > 75 else
+                             "🟡 Moderately Fresh" if _freshness > 45 else
+                             "🟠 Getting Stale" if _freshness > 20 else
+                             "🔴 Stale")
 
-            # Display the panel
-            _tp_box = st.container()
-            with _tp_box:
-                st.markdown("---")
-                st.markdown("#### ⏱️ Signal Timing — Should you enter now?")
-                _t1,_t2,_t3,_t4 = st.columns(4)
-                _t1.metric("Signal Direction",  _sig_dir_label)
-                _t2.metric("Signal Bar Time",   to_ist(_sig_bar_dt))
-                _t3.metric("Now (Current Tick)", _now.strftime("%d-%b-%Y %H:%M:%S IST"))
-                _t4.metric("Bars Since Signal",  f"{_sig_bars_ago} bar(s) ≈ {_mins_elapsed} min")
+            st.markdown("---")
+            st.markdown("## ⏱️ Signal Entry Intelligence")
+            st.caption("Updated every tick — tells you exactly whether to enter, wait, or skip.")
 
-                _t5,_t6,_t7,_t8 = st.columns(4)
-                _t5.metric("Price at Signal",  f"{_sig_bar_price:.2f}")
-                _t6.metric("Current Price",    f"{cl:.2f}")
-                _t7.metric("Price Move",       f"{_price_move:+.2f} pts",
-                           delta_color="normal" if _favorable else "inverse")
-                _t8.metric("R:R if Enter Now", f"1:{_rr_ratio_now:.1f}",
-                           help=f"Risk {sl_pts:.0f} pts to make {tgt_pts:.0f} pts")
+            # ── Big verdict banner ─────────────────────────────────────────────
+            _banner_text = (
+                f"**{_verdict}** — {_action}  |  "
+                f"Signal: {_sig_dir_label}  |  "
+                f"Fired: {to_ist(_sig_bar_dt)}  |  "
+                f"{_sig_bars_ago} bar(s) ago (~{_mins_elapsed} min elapsed)"
+            )
+            if _color == "success": st.success(_banner_text)
+            elif _color == "warning": st.warning(_banner_text)
+            else: st.error(_banner_text)
 
-                # Verdict box
-                if _verdict_color == "success":
-                    st.success(_entry_verdict)
-                elif _verdict_color == "warning":
-                    st.warning(_entry_verdict)
-                else:
-                    st.error(_entry_verdict)
+            # ── Freshness gauge ───────────────────────────────────────────────
+            st.markdown(
+                f"**Signal Freshness:** `[{_fresh_bar}]` {_freshness:.0f}/100  —  {_fresh_label}"
+            )
 
-                # Extra context for Elliott Wave
-                if "Elliott Wave" in strategy:
+            # ── Row 1: Signal origin ───────────────────────────────────────────
+            st.markdown("#### 📍 When & Where the Signal Fired")
+            _r1c1,_r1c2,_r1c3,_r1c4,_r1c5 = st.columns(5)
+            _r1c1.metric("Signal",        _sig_dir_label)
+            _r1c2.metric("Signal Date",   to_ist(_sig_bar_dt).split(" ")[0])
+            _r1c3.metric("Signal Time",   " ".join(to_ist(_sig_bar_dt).split(" ")[1:]))
+            _r1c4.metric("Signal Candle", f"Bar {_sig_bars_ago} back" if _sig_bars_ago > 0 else "Last closed bar")
+            _r1c5.metric("Timeframe",     interval)
+
+            # ── Row 2: Price context ───────────────────────────────────────────
+            st.markdown("#### 💰 Price Context")
+            _r2c1,_r2c2,_r2c3,_r2c4,_r2c5 = st.columns(5)
+            _r2c1.metric("Price at Signal",   f"{_sig_bar_price:.2f}",
+                         help="Close price of the candle where signal fired")
+            _r2c2.metric("Current LTP",        f"{cl:.2f}")
+            _r2c3.metric("Price Moved",         f"{abs(_price_move):.2f} pts",
+                         delta=f"{'in your favor ✅' if _favorable else 'against signal ⚠️'}",
+                         delta_color="normal" if _favorable else "inverse")
+            _r2c4.metric("Direction of Move",
+                         f"{'↓ Down' if cl < _sig_bar_price else '↑ Up'}",
+                         help="Has price moved in the signal direction since it fired?")
+            _r2c5.metric("SL Consumed",       f"{_move_vs_sl*100:.0f}%",
+                         delta=f"{'Safe' if _move_vs_sl < 0.4 else 'Caution' if _move_vs_sl < 0.65 else 'DANGER'}",
+                         delta_color="normal" if _move_vs_sl < 0.4 else "inverse")
+
+            # ── Row 3: Entry-now levels ────────────────────────────────────────
+            st.markdown("#### 🎯 If You Enter RIGHT NOW at LTP")
+            _r3c1,_r3c2,_r3c3,_r3c4,_r3c5 = st.columns(5)
+            _r3c1.metric("Entry Price (LTP)",   f"{cl:.2f}")
+            _r3c2.metric("SL if Enter Now",     f"{_sl_now:.2f}",
+                         help=f"{sl_pts:.0f} pts {'below' if last_sig==1 else 'above'} LTP")
+            _r3c3.metric("Target if Enter Now", f"{_tgt_now:.2f}",
+                         help=f"{tgt_pts:.0f} pts {'above' if last_sig==1 else 'below'} LTP")
+            _r3c4.metric("R:R Ratio",           f"1 : {_rr_now:.1f}",
+                         help=f"Risk {sl_pts:.0f} pts to make {tgt_pts:.0f} pts")
+            _r3c5.metric("Target % Remaining",  f"{max(0,100-_tgt_consumed_pct):.0f}%",
+                         help="How much of the original target move is still left to capture")
+
+            # ── Row 4: Original signal levels (for reference) ──────────────────
+            with st.expander("📊 Original signal-bar levels (for reference)", expanded=False):
+                _r4c1,_r4c2,_r4c3,_r4c4 = st.columns(4)
+                _r4c1.metric("Signal-bar Entry",  f"{_sig_bar_price:.2f}")
+                _r4c2.metric("Original SL",        f"{_sl_orig:.2f}",
+                             help=f"SL if you had entered AT the signal bar")
+                _r4c3.metric("Original Target",    f"{_tgt_orig:.2f}",
+                             help=f"Target if you had entered AT the signal bar")
+                _r4c4.metric("Missed move",        f"{abs(_price_move):.2f} pts",
+                             help="Price already captured since signal — you missed this portion")
+
+            # ── Detailed guidance text ─────────────────────────────────────────
+            st.markdown("#### 📋 Entry Guidance")
+            if _verdict == "FRESH":
+                st.success(
+                    f"✅ **ENTER NOW — Signal is brand new (just fired on the last closed candle).**\n\n"
+                    f"The {_sig_dir_label} signal fired at **{to_ist(_sig_bar_dt)}** on the candle that just closed. "
+                    f"Price at signal: **{_sig_bar_price:.2f}** | Current LTP: **{cl:.2f}**.\n\n"
+                    f"You are entering at the ideal time — 0 bars of delay. "
+                    f"Set SL at **{_sl_now:.2f}** ({sl_pts:.0f} pts) and Target at **{_tgt_now:.2f}** ({tgt_pts:.0f} pts). "
+                    f"R:R = 1:{_rr_now:.1f}."
+                )
+            elif _verdict == "VALID":
+                st.success(
+                    f"✅ **ENTER — Signal is still fresh and valid.**\n\n"
+                    f"Signal fired **{_sig_bars_ago} candle(s) ago** at **{to_ist(_sig_bar_dt)}** (~{_mins_elapsed} min elapsed). "
+                    f"Price has moved **{abs(_price_move):.2f} pts** {'in your favor' if _favorable else 'against signal'} since then.\n\n"
+                    f"Only **{_move_vs_sl*100:.0f}%** of your SL distance has been consumed — there is still meaningful room. "
+                    f"Enter at **{cl:.2f}**, SL **{_sl_now:.2f}**, Target **{_tgt_now:.2f}**. R:R = 1:{_rr_now:.1f}.\n\n"
+                    f"*Note: You missed {abs(_price_move):.2f} pts of the move. Your target is still fully reachable.*"
+                )
+            elif _verdict == "BORDERLINE":
+                st.warning(
+                    f"⚠️ **ENTER WITH CAUTION — Signal is {_sig_bars_ago} candle(s) old (~{_mins_elapsed} min).**\n\n"
+                    f"Price has moved **{abs(_price_move):.2f} pts** in signal direction, consuming **{_move_vs_sl*100:.0f}%** "
+                    f"of your SL distance. The R:R is reduced from 1:{_rr_now:.1f} to approximately "
+                    f"1:{(_tgt_now - cl)*last_sig / max(sl_pts,0.01):.1f} adjusted for missed move.\n\n"
+                    f"**If you enter:** SL = **{_sl_now:.2f}**, Target = **{_tgt_now:.2f}**.\n\n"
+                    f"**Recommendation:** Enter with reduced position size (50% of normal). "
+                    f"If the next candle closes in signal direction, that's additional confirmation. "
+                    f"Do NOT chase if price spikes further — wait for a small pullback to the **{_sig_bar_price:.2f}** level."
+                )
+            elif _verdict == "TOO LATE":
+                st.error(
+                    f"🔴 **DO NOT ENTER — Signal is too old and the move has largely happened.**\n\n"
+                    f"Signal fired **{_sig_bars_ago} candle(s) ago** at **{to_ist(_sig_bar_dt)}** (~{_mins_elapsed} min ago). "
+                    f"Price moved **{abs(_price_move):.2f} pts** — that is **{_move_vs_sl*100:.0f}%** of your SL already used up.\n\n"
+                    f"If you enter at **{cl:.2f}** with SL at **{_sl_now:.2f}**, your actual risk (SL distance) is the same "
+                    f"{sl_pts:.0f} pts, but the remaining target move is only ~{max(0, tgt_pts - abs(_price_move)):.0f} pts "
+                    f"— R:R has collapsed.\n\n"
+                    f"**What to do:** Do NOT enter. The FOMO urge is strong here — resist it. "
+                    f"Monitor for the next corrective pullback. If price pulls back close to **{_sig_bar_price:.2f}** "
+                    f"and holds, that might be a secondary entry. Or wait for the strategy to fire a fresh signal."
+                )
+            elif _verdict == "PULLBACK":
+                st.warning(
+                    f"🟡 **MONITOR — Price pulled back against signal direction after firing.**\n\n"
+                    f"Signal fired at **{to_ist(_sig_bar_dt)}** (candle {_sig_bars_ago} back). "
+                    f"Price has moved **{abs(_price_move):.2f} pts AGAINST** the signal direction — "
+                    f"this is a pullback, NOT necessarily a signal failure.\n\n"
+                    f"**Pullback context:** In Elliott Wave, a pullback after the signal bar is expected and normal. "
+                    f"The signal remains valid as long as price stays {'above' if last_sig==1 else 'below'} "
+                    f"the original signal-bar {'low' if last_sig==1 else 'high'}.\n\n"
+                    f"**Action:** Watch the current candle. If it closes {'above' if last_sig==1 else 'below'} "
+                    f"**{_sig_bar_price:.2f}** (signal close), the pattern is intact — enter on the next bar open. "
+                    f"If it closes {'below' if last_sig==1 else 'above'} that level, skip this signal."
+                )
+            else:  # INVALIDATED
+                st.error(
+                    f"🔴 **DO NOT ENTER — Signal has been invalidated by price action.**\n\n"
+                    f"Signal fired at **{to_ist(_sig_bar_dt)}** ({_sig_bars_ago} candles ago). "
+                    f"Price has since moved **{abs(_price_move):.2f} pts against** the signal direction, "
+                    f"exceeding **{_move_vs_sl*100:.0f}%** of your SL.\n\n"
+                    f"The wave structure that generated this signal is no longer reliable. "
+                    f"Entering now would be a FOMO trade with very poor risk-reward.\n\n"
+                    f"**What to do:** Close this panel mentally, wait for the next fresh signal. "
+                    f"The strategy will fire again — patience is more profitable than chasing."
+                )
+
+            # ── EW-specific structure note ─────────────────────────────────────
+            if "Elliott Wave" in strategy:
+                try:
+                    _sig_bar_low  = float(lv_df["Low"].iloc[-(_sig_bars_ago+1)])
+                    _sig_bar_high = float(lv_df["High"].iloc[-(_sig_bars_ago+1)])
+                    _invalidation = _sig_bar_low if last_sig==1 else _sig_bar_high
+                    _still_valid  = (cl > _invalidation) if last_sig==1 else (cl < _invalidation)
                     st.info(
-                        f"**Elliott Wave note:** The signal at {to_ist(_sig_bar_dt)} marks the completion of "
-                        f"a {'bullish A-B-C correction (higher low)' if last_sig==1 else 'bearish A-B-C correction (lower high)'}. "
-                        f"This pattern does NOT immediately invalidate — the wave structure remains valid "
-                        f"as long as price stays above the signal-bar low (for LONG) or below the signal-bar high (for SHORT). "
-                        f"Signal-bar close: **{_sig_bar_price:.2f}**. "
-                        f"{'LONG valid while price > signal low.' if last_sig==1 else 'SHORT valid while price < signal high.'}"
+                        f"**Elliott Wave structure validity check:**\n\n"
+                        f"Signal candle: Open {lv_df['Open'].iloc[-(_sig_bars_ago+1)]:.2f} | "
+                        f"High {_sig_bar_high:.2f} | Low {_sig_bar_low:.2f} | Close {_sig_bar_price:.2f}\n\n"
+                        f"**Invalidation level: {_invalidation:.2f}** "
+                        f"({'signal-bar Low — if price breaks below this the BUY is invalid' if last_sig==1 else 'signal-bar High — if price breaks above this the SELL is invalid'})\n\n"
+                        f"Current price {cl:.2f} is {'✅ ABOVE' if last_sig==1 and _still_valid else '✅ BELOW' if last_sig==-1 and _still_valid else '❌ BREACHED'} "
+                        f"the invalidation level → Wave pattern is "
+                        f"{'✅ STILL VALID' if _still_valid else '❌ INVALIDATED — do not enter'}."
                     )
-                st.markdown("---")
+                except: pass
+
+            st.markdown("---")
 
         elif last_sig != 0 and pos is not None:
-            st.info(f"Position already open ({('LONG' if pos['direction']==1 else 'SHORT')} from {pos['entry']:.2f}). "
-                    f"Signal panel shown only when flat.")
+            _dir_str = "LONG" if pos["direction"]==1 else "SHORT"
+            _pos_pnl = round((cl - pos["entry"]) * pos["direction"], 2)
+            st.info(
+                f"**Position open — {_dir_str} from {pos['entry']:.2f}.** "
+                f"Unrealised P&L: **{_pos_pnl:+.2f} pts**. "
+                f"Signal timing panel is shown only when flat (no open position). "
+                f"SL: {pos['sl']:.2f} | Target: {pos['disp_tgt']:.2f}"
+            )
 
         # ── Indicator values including EMA labels ─────────────────────────────
         _ov_indics={k:v for k,v in lv_indics.items()
