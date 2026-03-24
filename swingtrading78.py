@@ -2710,6 +2710,9 @@ with tab_live:
                     break
 
         # ── Price row ─────────────────────────────────────────────────────────
+        # pos must be read before the signal timing panel which checks it
+        pos=st.session_state.live_position
+
         m=st.columns(6)
         m[0].metric("LTP",f"{cl:.2f}")
         m[1].metric("High",f"{bh_cur:.2f}")
@@ -2952,7 +2955,7 @@ with tab_live:
             except Exception as ex: st.error(f"Dhan exit error: {ex}")
 
         # ── Position management ──────────────────────────────────────────────
-        pos=st.session_state.live_position
+        # pos was already read above (before signal timing panel)
         _allow_new = (_in_window and _cooldown_ok and
                       (not st.session_state.get("no_overlap",True) or pos is None))
 
