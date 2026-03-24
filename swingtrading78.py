@@ -2723,6 +2723,9 @@ with tab_live:
                     except: pass
                     break
 
+        # ── pos must be assigned first — referenced throughout this function ──
+        pos = st.session_state.live_position
+
         # ── Persist signal state so the panel survives page redraws ──────────
         # Each tick we update the stored signal. The panel reads from session_state
         # so it shows the last known signal even if last_sig momentarily reads 0
@@ -2754,9 +2757,6 @@ with tab_live:
             st.session_state[_sig_key] = {}
 
         # ── Price row ─────────────────────────────────────────────────────────
-        # pos must be read before the signal timing panel which checks it
-        pos=st.session_state.live_position
-
         m=st.columns(6)
         m[0].metric("LTP",f"{cl:.2f}")
         m[1].metric("High",f"{bh_cur:.2f}")
