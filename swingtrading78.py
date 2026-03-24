@@ -147,7 +147,7 @@ NIFTY50_STOCKS = {
     "Divis Labs":"DIVISLAB.NS","Eicher Motors":"EICHERMOT.NS","Apollo Hospitals":"APOLLOHOSP.NS",
     "Grasim":"GRASIM.NS","BEL":"BEL.NS","BPCL":"BPCL.NS","Shriram Finance":"SHRIRAMFIN.NS",
     "Tata Consumer":"TATACONSUM.NS","Tata Motors":"TATAMOTORS.NS",
-    "Hero MotoCorp":"HEROMOTOCO.NS","Britannia":"BRITANNIA.NS","HDFC AMC":"HDFCAMC.NS","Kaynes":"KAYNES.NS"
+    "Hero MotoCorp":"HEROMOTOCO.NS","Britannia":"BRITANNIA.NS","HDFC AMC":"HDFCAMC.NS",
 }
 NIFTY50_SYMBOLS = list(NIFTY50_STOCKS.values())
 TIMEFRAMES = ["1m","5m","15m","30m","1h","4h","1d","1wk"]
@@ -2286,7 +2286,7 @@ with st.sidebar:
     dhan_enabled=st.checkbox("Enable Dhan Broker",value=False,key="dhan_enabled")
     if dhan_enabled:
         dhan_client=st.text_input("Client ID","1104779876",key="dhan_client")
-        _DEFAULT_TOKEN = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzUxMiJ9.eyJpc3MiOiJkaGFuIiwicGFydG5lcklkIjoiIiwiZXhwIjoxNzc0MzIxNTIxLCJpYXQiOjE3NzQyMzUxMjEsInRva2VuQ29uc3VtZXJUeXBlIjoiU0VMRiIsIndlYmhvb2tVcmwiOiIiLCJkaGFuQ2xpZW50SWQiOiIxMTA0Nzc5ODc2In0.AaUkMzDtfkRCxcN3wZVMKogmXi8Z6D9MSKlh9dHw0sip4EBE2GLw3ZbQM6UetSfyQDIbvjXp1A-Kazqr_8Au0g"
+        _DEFAULT_TOKEN = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzUxMiJ9.eyJpc3MiOiJkaGFuIiwicGFydG5lcklkIjoiIiwiZXhwIjoxNzc0NDAzNjM3LCJpYXQiOjE3NzQzMTcyMzcsInRva2VuQ29uc3VtZXJUeXBlIjoiU0VMRiIsIndlYmhvb2tVcmwiOiIiLCJkaGFuQ2xpZW50SWQiOiIxMTA0Nzc5ODc2In0.BlilwvLFsyJSbJAMdMiIqlgjI7GoO8u5dJ5VOJYMx4NmfD3TauwjvMMk2hNp_rG3gZY6QmFGSTc7r407jnThdg"
         dhan_token =st.text_input("Access Token",_DEFAULT_TOKEN,key="dhan_token",type="password")
         st.caption("**Order type — always BUYER (never seller in options)**")
         is_stocks=st.checkbox("Stocks / Intraday mode  (uncheck = Options CE/PE buyer)",value=False,key="dhan_is_stocks")
@@ -2693,12 +2693,20 @@ with tab_live:
                            "Breakout Strategy":2,
                            "Support & Resistance + EMA":2}
         _sig_lookback = _WIDE_LOOKBACK.get(strategy, 1)
-        last_sig = 0
-        for _si in range(1, _sig_lookback + 2):   # +2: include current forming bar for patterns
+        last_sig        = 0
+        _sig_bars_ago   = 0       # how many bars ago the signal fired
+        _sig_bar_dt     = None    # datetime of the signal bar
+        _sig_bar_price  = None    # close price at the signal bar
+        for _si in range(1, _sig_lookback + 2):
             if len(lv_sigs) > _si:
                 _sv = int(lv_sigs.iloc[-_si])
                 if _sv != 0:
-                    last_sig = _sv
+                    last_sig      = _sv
+                    _sig_bars_ago = _si - 1   # 0 = last closed bar, 1 = 2 bars ago, etc.
+                    try:
+                        _sig_bar_dt    = lv_df.index[-(  _si)]
+                        _sig_bar_price = float(lv_df["Close"].iloc[-_si])
+                    except: pass
                     break
 
         # ── Price row ─────────────────────────────────────────────────────────
@@ -2710,6 +2718,96 @@ with tab_live:
         sig_txt="🟢 BUY" if last_sig==1 else ("🔴 SELL" if last_sig==-1 else "⚪ FLAT")
         m[4].metric("Signal",sig_txt)
         m[5].metric("Last Bar",to_ist(last_bar))
+
+        # ── Signal Timing Panel — should I enter now or is it too late? ───────
+        if last_sig != 0 and _sig_bar_dt is not None and pos is None:
+            _sig_dir_label = "BUY (LONG)" if last_sig==1 else "SELL (SHORT)"
+            _price_move    = cl - _sig_bar_price                 # how much price moved since signal
+            _move_vs_sl    = abs(_price_move) / max(sl_pts, 0.01) # fraction of SL already consumed
+            _favorable     = (_price_move > 0 and last_sig==1) or (_price_move < 0 and last_sig==-1)
+
+            # Interval → approximate minutes per bar
+            _mins_map = {"1m":1,"5m":5,"15m":15,"30m":30,"1h":60,"4h":240,"1d":1440,"1wk":10080}
+            _mins_per_bar = _mins_map.get(interval, 5)
+            _mins_elapsed = _sig_bars_ago * _mins_per_bar
+
+            # Decide entry quality
+            if _sig_bars_ago == 0:
+                _entry_verdict  = "🟢 FRESH — signal just fired on the last closed bar. Best time to enter."
+                _verdict_color  = "success"
+            elif _favorable and _move_vs_sl < 0.30:
+                _entry_verdict  = (f"🟡 STILL VALID — signal fired {_sig_bars_ago} bar(s) ago (~{_mins_elapsed} min). "
+                                   f"Price moved {abs(_price_move):.2f} pts in your favor. "
+                                   f"SL not meaningfully consumed ({_move_vs_sl*100:.0f}% of SL distance). OK to enter.")
+                _verdict_color  = "warning"
+            elif _favorable and _move_vs_sl < 0.60:
+                _entry_verdict  = (f"⚠️ BORDERLINE — signal fired {_sig_bars_ago} bar(s) ago (~{_mins_elapsed} min). "
+                                   f"Price moved {abs(_price_move):.2f} pts in your favor ({_move_vs_sl*100:.0f}% of SL gone). "
+                                   f"Entry possible but risk/reward reduced. Consider smaller size.")
+                _verdict_color  = "warning"
+            elif _favorable and _move_vs_sl >= 0.60:
+                _entry_verdict  = (f"🔴 TOO LATE — signal fired {_sig_bars_ago} bar(s) ago (~{_mins_elapsed} min). "
+                                   f"Price already moved {abs(_price_move):.2f} pts ({_move_vs_sl*100:.0f}% of your SL). "
+                                   f"Risk/reward is poor. Wait for the next signal.")
+                _verdict_color  = "error"
+            elif not _favorable and abs(_price_move) < sl_pts * 0.5:
+                _entry_verdict  = (f"🟡 MODERATE — signal fired {_sig_bars_ago} bar(s) ago (~{_mins_elapsed} min). "
+                                   f"Price moved {abs(_price_move):.2f} pts AGAINST signal direction but within SL. "
+                                   f"Signal still alive — entry is valid but price is less favorable.")
+                _verdict_color  = "warning"
+            else:
+                _entry_verdict  = (f"🔴 STALE/RISKY — signal fired {_sig_bars_ago} bar(s) ago (~{_mins_elapsed} min). "
+                                   f"Price moved {abs(_price_move):.2f} pts against signal. "
+                                   f"SL likely compromised. Skip this signal — wait for next.")
+                _verdict_color  = "error"
+
+            # Projected outcome if entering now
+            _entry_now_sl_dist  = abs(cl - (cl - last_sig * sl_pts))   # = sl_pts
+            _entry_now_tgt_dist = abs(cl - (cl + last_sig * tgt_pts))  # = tgt_pts
+            _rr_ratio_now       = tgt_pts / max(sl_pts, 0.01)
+
+            # Display the panel
+            _tp_box = st.container()
+            with _tp_box:
+                st.markdown("---")
+                st.markdown("#### ⏱️ Signal Timing — Should you enter now?")
+                _t1,_t2,_t3,_t4 = st.columns(4)
+                _t1.metric("Signal Direction",  _sig_dir_label)
+                _t2.metric("Signal Bar Time",   to_ist(_sig_bar_dt))
+                _t3.metric("Now (Current Tick)", _now.strftime("%d-%b-%Y %H:%M:%S IST"))
+                _t4.metric("Bars Since Signal",  f"{_sig_bars_ago} bar(s) ≈ {_mins_elapsed} min")
+
+                _t5,_t6,_t7,_t8 = st.columns(4)
+                _t5.metric("Price at Signal",  f"{_sig_bar_price:.2f}")
+                _t6.metric("Current Price",    f"{cl:.2f}")
+                _t7.metric("Price Move",       f"{_price_move:+.2f} pts",
+                           delta_color="normal" if _favorable else "inverse")
+                _t8.metric("R:R if Enter Now", f"1:{_rr_ratio_now:.1f}",
+                           help=f"Risk {sl_pts:.0f} pts to make {tgt_pts:.0f} pts")
+
+                # Verdict box
+                if _verdict_color == "success":
+                    st.success(_entry_verdict)
+                elif _verdict_color == "warning":
+                    st.warning(_entry_verdict)
+                else:
+                    st.error(_entry_verdict)
+
+                # Extra context for Elliott Wave
+                if "Elliott Wave" in strategy:
+                    st.info(
+                        f"**Elliott Wave note:** The signal at {to_ist(_sig_bar_dt)} marks the completion of "
+                        f"a {'bullish A-B-C correction (higher low)' if last_sig==1 else 'bearish A-B-C correction (lower high)'}. "
+                        f"This pattern does NOT immediately invalidate — the wave structure remains valid "
+                        f"as long as price stays above the signal-bar low (for LONG) or below the signal-bar high (for SHORT). "
+                        f"Signal-bar close: **{_sig_bar_price:.2f}**. "
+                        f"{'LONG valid while price > signal low.' if last_sig==1 else 'SHORT valid while price < signal high.'}"
+                    )
+                st.markdown("---")
+
+        elif last_sig != 0 and pos is not None:
+            st.info(f"Position already open ({('LONG' if pos['direction']==1 else 'SHORT')} from {pos['entry']:.2f}). "
+                    f"Signal panel shown only when flat.")
 
         # ── Indicator values including EMA labels ─────────────────────────────
         _ov_indics={k:v for k,v in lv_indics.items()
@@ -3814,7 +3912,7 @@ with tab_opt:
     with st.expander("📥 Optimization Inputs",expanded=True):
         oc1,oc2,oc3=st.columns(3)
         opt_t=oc1.selectbox("Instrument",list(TICKER_MAP.keys()),key="opt_t")
-        opt_sym=oc1.text_input("Custom Ticker","Kaynes.NS",key="opt_csym").strip() if opt_t=="Custom" else TICKER_MAP[opt_t]
+        opt_sym=oc1.text_input("Custom Ticker","RELIANCE.NS",key="opt_csym").strip() if opt_t=="Custom" else TICKER_MAP[opt_t]
         opt_iv=oc1.selectbox("Timeframe",TIMEFRAMES,index=4,key="opt_iv")
         opt_pd=oc2.selectbox("Period",PERIODS,index=5,key="opt_pd")
         opt_st=oc2.selectbox("Strategy", STRATEGIES, key="opt_strat")
