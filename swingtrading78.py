@@ -2286,7 +2286,7 @@ with st.sidebar:
     dhan_enabled=st.checkbox("Enable Dhan Broker",value=False,key="dhan_enabled")
     if dhan_enabled:
         dhan_client=st.text_input("Client ID","1104779876",key="dhan_client")
-        _DEFAULT_TOKEN = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzUxMiJ9.eyJpc3MiOiJkaGFuIiwicGFydG5lcklkIjoiIiwiZXhwIjoxNzc0NDgxNzIzLCJpYXQiOjE3NzQzOTUzMjMsInRva2VuQ29uc3VtZXJUeXBlIjoiU0VMRiIsIndlYmhvb2tVcmwiOiIiLCJkaGFuQ2xpZW50SWQiOiIxMTA0Nzc5ODc2In0.4Zkv0DzUOP24EzqxbaC_wHPnliJqtC0a2FWarJ7IxOJsWKHh5D-zmBPhfFc4LOPKabkp3Rkkp3cHGXKeupY4tw"
+        _DEFAULT_TOKEN = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzUxMiJ9.eyJpc3MiOiJkaGFuIiwicGFydG5lcklkIjoiIiwiZXhwIjoxNzczODAyMDg2LCJpYXQiOjE3NzM3MTU2ODYsInRva2VuQ29uc3VtZXJUeXBlIjoiU0VMRiIsIndlYmhvb2tVcmwiOiIiLCJkaGFuQ2xpZW50SWQiOiIxMTA0Nzc5ODc2In0.L5ULyf8AfeaoZS_kn95rtQZ6qNRJF3EUimCJw_8q12k2FZHEGEPNySKrYOBP9vRfBHKvEqWoB0ZC7GRUd7zyMg"
         dhan_token =st.text_input("Access Token",_DEFAULT_TOKEN,key="dhan_token",type="password")
         st.caption("**Order type — always BUYER (never seller in options)**")
         is_stocks=st.checkbox("Stocks / Intraday mode  (uncheck = Options CE/PE buyer)",value=False,key="dhan_is_stocks")
@@ -2386,6 +2386,34 @@ with st.sidebar:
     else:
         tw_from=datetime.strptime("09:15","%H:%M").time()
         tw_to  =datetime.strptime("15:00","%H:%M").time()
+
+    # ── DATA FRESHNESS HANDLING ───────────────────────────────────────────────
+    st.markdown("---")
+    st.subheader("📡 Data Freshness (yfinance Delay)")
+    freshness_enabled = st.checkbox(
+        "Enable Data Freshness Check & EW Next-Pivot Predictor",
+        value=False, key="freshness_enabled",
+        help="yfinance typically delivers 4-7 min delayed candles on 1m charts. "
+             "When enabled:\n"
+             "1. Compares last candle time vs current IST time — warns if data is stale.\n"
+             "2. Retries fetch up to 3x if delay > threshold to get latest candle.\n"
+             "3. For Elliott Wave: predicts the next expected pivot (High or Low), "
+             "    and shows projected entry/SL/target levels so you can enter manually "
+             "    at the right price in your broker app."
+    )
+    if freshness_enabled:
+        _delay_thresh = st.slider(
+            "Max acceptable candle delay (minutes)",
+            1, 15, 5, key="delay_thresh",
+            help="If last candle is older than this many minutes, trigger a re-fetch."
+        )
+        st.caption(
+            f"⚡ Active — if last 1m candle is > {_delay_thresh} min old, "
+            "the app will retry the data fetch up to 3 times. "
+            "EW Next-Pivot panel will also appear in Live Trading."
+        )
+    else:
+        _delay_thresh = 7
 
     # ── EMAIL NOTIFICATIONS ───────────────────────────────────────────────────
     st.markdown("---")
@@ -2665,6 +2693,60 @@ with tab_live:
 
         lv_df=fetch_live(sym,interval)
         if lv_df is None or lv_df.empty: st.warning("No data. Retrying…"); return
+
+        # ── Data freshness check & retry (when enabled) ───────────────────────
+        _mins_map_fr = {"1m":1,"5m":5,"15m":15,"30m":30,"1h":60,"4h":240,"1d":1440}
+        _bar_mins    = _mins_map_fr.get(interval, 5)
+        if st.session_state.get("freshness_enabled", False):
+            import pytz as _pytz
+            _ist      = _pytz.timezone("Asia/Kolkata")
+            _now_ist  = datetime.now(_ist)
+            try:
+                _last_c = lv_df.index[-1]
+                # Make timezone-aware if needed
+                if hasattr(_last_c, 'tzinfo') and _last_c.tzinfo is None:
+                    _last_c = _ist.localize(_last_c.to_pydatetime())
+                elif hasattr(_last_c, 'tzinfo') and _last_c.tzinfo is not None:
+                    _last_c = _last_c.to_pydatetime().astimezone(_ist)
+                else:
+                    _last_c = _ist.localize(_last_c)
+                _delay_mins = (_now_ist - _last_c).total_seconds() / 60
+            except:
+                _delay_mins = 0
+
+            _thresh = float(st.session_state.get("delay_thresh", 7))
+            if _delay_mins > _thresh + _bar_mins:
+                # Data is stale — retry up to 3 times with cache-busting
+                st.warning(
+                    f"⚠️ **Data delay detected**: last candle is "
+                    f"**{_delay_mins:.0f} min old** (threshold: {_thresh:.0f} min). "
+                    f"Retrying fetch to get latest data…"
+                )
+                for _retry in range(3):
+                    time.sleep(2)
+                    _new_df = fetch_live(sym, interval)
+                    if _new_df is not None and not _new_df.empty:
+                        try:
+                            _new_last = _new_df.index[-1]
+                            if hasattr(_new_last,'tzinfo') and _new_last.tzinfo is None:
+                                _new_last = _ist.localize(_new_last.to_pydatetime())
+                            elif hasattr(_new_last,'tzinfo') and _new_last.tzinfo is not None:
+                                _new_last = _new_last.to_pydatetime().astimezone(_ist)
+                            _new_delay = (_now_ist - _new_last).total_seconds() / 60
+                        except:
+                            _new_delay = _delay_mins
+                        if _new_delay < _delay_mins:
+                            lv_df = _new_df
+                            _delay_mins = _new_delay
+                            st.info(f"✅ Retry {_retry+1}: updated data — delay now {_delay_mins:.0f} min.")
+                            break
+                        st.caption(f"Retry {_retry+1}: delay still {_new_delay:.0f} min…")
+            else:
+                _delay_mins_disp = max(0, _delay_mins)
+                if _delay_mins_disp <= _thresh:
+                    st.caption(f"📡 Data freshness: last candle **{_delay_mins_disp:.0f} min** old — ✅ within threshold.")
+                else:
+                    st.caption(f"📡 Data freshness: last candle **{_delay_mins_disp:.0f} min** old — ⚠️ slightly stale.")
         lv_n=len(lv_df)
 
         # ── Price references ───────────────────────────────────────────────────
@@ -3026,6 +3108,171 @@ with tab_live:
                 f"Signal timing panel is shown only when flat (no open position). "
                 f"SL: {pos['sl']:.2f} | Target: {pos['disp_tgt']:.2f}"
             )
+
+        # ── EW Next-Pivot Predictor (when freshness enabled + EW strategy) ────
+        if (st.session_state.get("freshness_enabled", False) and
+                "Elliott Wave" in strategy):
+            _ew_pred_mwp = float(live_params.get("min_wave_pct", 0.5))
+            try:
+                _ew_all_pivots, (last_dir_raw, last_px_raw, last_idx_raw) = \
+                    _ew_build_pivots(lv_df, _ew_pred_mwp)
+
+                st.markdown("---")
+                st.markdown("### 🔮 Elliott Wave — Next Pivot Predictor")
+                st.caption(
+                    "Because yfinance delivers 4-7 min delayed candles, you often cannot "
+                    "act on the CLOSED bar signal in time. This panel predicts **where the "
+                    "next pivot will form** and gives you exact entry/SL/target levels to "
+                    "enter MANUALLY in your broker app — before the signal bar even closes."
+                )
+
+                if len(_ew_all_pivots) >= 2:
+                    _lp    = _ew_all_pivots[-1]   # last confirmed pivot
+                    _lp2   = _ew_all_pivots[-2]   # pivot before that
+                    _lp_dir  = _lp[2]             # 1=High, -1=Low
+                    _lp_px   = _lp[1]
+                    _lp2_px  = _lp2[1]
+                    _leg_sz  = abs(_lp_px - _lp2_px)
+
+                    # ── Current in-progress swing info ─────────────────────────
+                    _cur_move_pct = (_ew_pred_mwp / 100) * _lp_px
+                    _next_pivot_dir = "LOW ↓" if _lp_dir == 1 else "HIGH ↑"
+                    _next_pivot_side = -1 if _lp_dir == 1 else 1
+
+                    # Price needs to move _cur_move_pct in _next_pivot_side direction
+                    # from current extreme to confirm next pivot
+                    if last_dir_raw == _lp_dir:
+                        # In-progress swing is same direction as last pivot — tracking current extreme
+                        _swing_extreme = last_px_raw
+                    else:
+                        _swing_extreme = cl
+
+                    # Next pivot confirmation threshold
+                    _pivot_confirm_px = _swing_extreme * (
+                        1 - _ew_pred_mwp/100 if _lp_dir == 1 else 1 + _ew_pred_mwp/100
+                    )
+                    _dist_to_pivot    = abs(cl - _pivot_confirm_px)
+                    _pct_to_pivot     = abs(cl - _pivot_confirm_px) / max(abs(_pivot_confirm_px),0.01) * 100
+
+                    # What signal will fire when next pivot confirms?
+                    # Pattern needs 3 pivots: check last 2 + what the next will be
+                    _next_sig_type = None
+                    if len(_ew_all_pivots) >= 2:
+                        # After next pivot forms, we have triplet: _lp2, _lp, next_pivot
+                        # LONG fires if: _lp2=LOW, _lp=HIGH, next=HIGHER LOW
+                        # SHORT fires if: _lp2=HIGH, _lp=LOW, next=LOWER HIGH
+                        if _lp2[2]==-1 and _lp[2]==1:
+                            # Next will be LOW — LONG if higher than _lp2
+                            _proj_low_px = cl - _dist_to_pivot
+                            if _proj_low_px > _lp2_px:
+                                _next_sig_type = "LONG 🟢"
+                                _next_sig_entry = _proj_low_px
+                            else:
+                                _next_sig_type = "No signal (lower low = bearish)"
+                                _next_sig_entry = None
+                        elif _lp2[2]==1 and _lp[2]==-1:
+                            # Next will be HIGH — SHORT if lower than _lp2
+                            _proj_high_px = cl + _dist_to_pivot
+                            if _proj_high_px < _lp2_px:
+                                _next_sig_type = "SHORT 🔴"
+                                _next_sig_entry = _proj_high_px
+                            else:
+                                _next_sig_type = "No signal (higher high = bullish)"
+                                _next_sig_entry = None
+                        else:
+                            _next_sig_type = "Pattern building…"
+                            _next_sig_entry = None
+                    else:
+                        _next_sig_type = "Need more pivots"
+                        _next_sig_entry = None
+
+                    # ── Display ───────────────────────────────────────────────
+                    _pred_c1,_pred_c2,_pred_c3,_pred_c4 = st.columns(4)
+                    _pred_c1.metric("Last Confirmed Pivot",
+                                    f"{'HIGH' if _lp_dir==1 else 'LOW'} @ {_lp_px:.2f}")
+                    _pred_c2.metric("Next Pivot Expected",  _next_pivot_dir)
+                    _pred_c3.metric("Pivot Confirm at LTP", f"{_pivot_confirm_px:.2f}",
+                                    help=f"Price needs to reach {_pivot_confirm_px:.2f} "
+                                         f"(= {_swing_extreme:.2f} ± {_ew_pred_mwp:.2f}%) "
+                                         f"to confirm next pivot")
+                    _pred_c4.metric("Distance to Confirm",
+                                    f"{_dist_to_pivot:.2f} pts  ({_pct_to_pivot:.2f}%)")
+
+                    _pred_c5,_pred_c6,_pred_c7,_pred_c8 = st.columns(4)
+                    _pred_c5.metric("Expected Signal",      _next_sig_type or "—")
+                    _pred_c6.metric("Projected Entry",
+                                    f"{_next_sig_entry:.2f}" if _next_sig_entry else "—")
+                    _pred_c7.metric("Projected SL",
+                                    f"{_next_sig_entry - sl_pts if _next_sig_entry and last_sig!=0 else '—'}" if _next_sig_entry
+                                    else "—",
+                                    help=f"Entry ± {sl_pts:.0f} pts (your SL setting)")
+                    _pred_c8.metric("Projected Target",
+                                    f"{_next_sig_entry + tgt_pts if _next_sig_entry and last_sig!=0 else '—'}" if _next_sig_entry
+                                    else "—",
+                                    help=f"Entry ± {tgt_pts:.0f} pts (your Target setting)")
+
+                    # Progress bar to next pivot
+                    _prog_to_pivot = min(100, max(0,
+                        (abs(cl - _lp_px) / max(_dist_to_pivot + abs(cl - _lp_px), 0.01)) * 100
+                    ))
+                    _bar_f = int(_prog_to_pivot / 5)
+                    _bar_s = "█" * _bar_f + "░" * (20 - _bar_f)
+                    st.markdown(
+                        f"**Progress to next pivot confirmation:** `[{_bar_s}]` {_prog_to_pivot:.0f}%  "
+                        f"— need price to reach **{_pivot_confirm_px:.2f}** "
+                        f"({_dist_to_pivot:.2f} pts away)"
+                    )
+
+                    # ── Manual entry guidance ─────────────────────────────────
+                    if _next_sig_entry:
+                        _proj_sl  = _next_sig_entry + (_lp_dir * sl_pts)   # opposite of signal direction
+                        _proj_tgt = _next_sig_entry - (_lp_dir * tgt_pts)
+                        _sig_d    = "LONG 🟢" in (_next_sig_type or "")
+
+                        st.markdown("#### 📋 Manual Entry Plan (for broker app)")
+                        if _sig_d:
+                            st.success(
+                                f"**Projected LONG entry near {_next_sig_entry:.2f}**\n\n"
+                                f"yfinance data is delayed — by the time the signal bar closes and the app detects it, "
+                                f"price may have already moved away. Use this plan to enter MANUALLY:\n\n"
+                                f"• **Watch price:** When LTP approaches **{_pivot_confirm_px:.2f}** and starts reversing up\n"
+                                f"• **Enter (BUY):** Around **{_next_sig_entry:.2f} – {_next_sig_entry + 5:.2f}** "
+                                f"(allow ±5pt buffer from projected pivot)\n"
+                                f"• **SL:** **{_proj_tgt:.2f}** ({sl_pts:.0f} pts below entry)\n"
+                                f"• **Target:** **{_next_sig_entry + tgt_pts:.2f}** ({tgt_pts:.0f} pts above entry)\n"
+                                f"• **Trigger:** Enter when a 1m candle CLOSES above the pivot confirmation price "
+                                f"({_pivot_confirm_px:.2f}) after touching the low\n\n"
+                                f"⏱️ Remaining distance: **{_dist_to_pivot:.2f} pts** — "
+                                f"{'imminent, watch closely!' if _dist_to_pivot < sl_pts * 0.5 else 'not yet, monitor.'}"
+                            )
+                        else:
+                            st.error(
+                                f"**Projected SHORT entry near {_next_sig_entry:.2f}**\n\n"
+                                f"• **Watch price:** When LTP approaches **{_pivot_confirm_px:.2f}** and starts reversing down\n"
+                                f"• **Enter (SELL):** Around **{_next_sig_entry:.2f} – {_next_sig_entry - 5:.2f}**\n"
+                                f"• **SL:** **{_proj_tgt:.2f}** ({sl_pts:.0f} pts above entry)\n"
+                                f"• **Target:** **{_next_sig_entry - tgt_pts:.2f}** ({tgt_pts:.0f} pts below entry)\n"
+                                f"• **Trigger:** Enter when a 1m candle CLOSES below {_pivot_confirm_px:.2f} after touching the high\n\n"
+                                f"⏱️ Remaining distance: **{_dist_to_pivot:.2f} pts** — "
+                                f"{'imminent!' if _dist_to_pivot < sl_pts * 0.5 else 'monitor.'}"
+                            )
+                    else:
+                        st.info(
+                            f"**{_next_sig_type}** — The upcoming pivot will not immediately generate a "
+                            f"tradeable signal. Watch for the pattern to complete over the next few pivots."
+                        )
+
+                    # Delay context note
+                    st.caption(
+                        f"⚠️ yfinance 1m delay is typically 4-7 min. This prediction is based on confirmed pivots "
+                        f"and current LTP ({cl:.2f}). The actual pivot confirmation price may shift slightly as new "
+                        f"candles form. Treat as a guide — not a guarantee. Use your broker's live chart to time "
+                        f"the exact entry candle."
+                    )
+                else:
+                    st.info("Need at least 2 confirmed EW pivots to predict the next one. More data/bars needed.")
+            except Exception as _ew_pred_err:
+                st.caption(f"EW predictor error: {_ew_pred_err}")
 
         # ── Indicator values including EMA labels ─────────────────────────────
         _ov_indics={k:v for k,v in lv_indics.items()
