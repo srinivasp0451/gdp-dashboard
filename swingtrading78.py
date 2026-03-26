@@ -235,21 +235,64 @@ def fetch_data(ticker,period,interval):
         return _r4h(df) if interval=="4h" and not df.empty else df
     except Exception as e: st.error(f"Fetch error: {e}"); return pd.DataFrame()
 
-def fetch_live(ticker,interval):
-    # Fetch enough history for indicator warmup (200+ bars across sessions)
-    # This prevents NaN on gap-up/gap-down days for Indian indices (NSE/BSE)
-    if interval=="1m":     lp="5d"   # ~1875 NSE bars — ample warmup
-    elif interval in("5m","15m"): lp="5d"   # ~375–1875 bars
-    elif interval in("30m","1h"):  lp="1mo"  # ~300+ bars
-    elif interval=="4h":           lp="3mo"
-    else:                          lp="6mo"
+def fetch_live(ticker, interval):
+    """
+    Fetch live data for the given ticker and interval.
+
+    Root cause of stale data: yf.download(period=...) uses yfinance's internal
+    SQLite cache (~/.cache/py-yfinance). The same (ticker, period, interval)
+    combination returns cached data for several minutes — causing the app to
+    show 14:15 candle while standalone script gets 15:29.
+
+    Fix: use explicit start/end datetimes instead of period=. This forces a
+    fresh HTTP request every time, bypassing the period-based cache.
+    Also explicitly call yf.download with auto_adjust=True and enough lookback
+    (same bar count as before) so indicators have sufficient warmup bars.
+    """
+    import pytz as _pytz2
+    from datetime import timedelta as _td
+
+    _ist2 = _pytz2.timezone("Asia/Kolkata")
+    _now2 = datetime.now(_ist2)
+
+    # Lookback durations matching the old period= strings (conservative)
+    _lookback_days = {
+        "1m": 7, "5m": 30, "15m": 30, "30m": 60,
+        "1h": 60, "4h": 90, "1d": 365,
+    }
+    _days = _lookback_days.get(interval, 30)
+    _start = (_now2 - _td(days=_days)).strftime("%Y-%m-%d")
+    # end = tomorrow to ensure today's partial day is fully included
+    _end   = (_now2 + _td(days=1)).strftime("%Y-%m-%d")
+
     try:
         time.sleep(1.5)
-        raw=yf.download(ticker,period=lp,interval=YF_IV.get(interval,interval),progress=False,auto_adjust=True)
-        if raw.empty: return pd.DataFrame()
-        df=_flatten(raw)
-        return _r4h(df) if interval=="4h" and not df.empty else df
-    except Exception as e: st.warning(f"Live fetch: {e}"); return pd.DataFrame()
+        # Clear yfinance's internal SQLite cache before fetching so we never
+        # get a stale period-cached response. This is the primary fix for
+        # "app shows 14:15 candle while market closed at 15:30" issue.
+        try:
+            yf.set_tz_cache_location(None)   # disable tz cache
+        except: pass
+        try:
+            import yfinance.cache as _yfc
+            _yfc.clear_cache()
+        except: pass
+        raw = yf.download(
+            ticker,
+            start    = _start,
+            end      = _end,
+            interval = YF_IV.get(interval, interval),
+            progress = False,
+            auto_adjust = True,
+            prepost  = False,   # regular market hours only
+        )
+        if raw is None or raw.empty:
+            return pd.DataFrame()
+        df = _flatten(raw)
+        return _r4h(df) if interval == "4h" and not df.empty else df
+    except Exception as e:
+        st.warning(f"Live fetch: {e}")
+        return pd.DataFrame()
 
 # ── INDICATORS  (TradingView-compatible) ──────────────────────────────────────
 # EMA: span=p, adjust=False, min_periods=p  → matches TV EMA exactly
@@ -2748,6 +2791,26 @@ with tab_live:
                 else:
                     st.caption(f"📡 Data freshness: last candle **{_delay_mins_disp:.0f} min** old — ⚠️ slightly stale.")
         lv_n=len(lv_df)
+
+        # ── Always show last candle time vs current time (data freshness) ─────
+        import pytz as _pytz_lv
+        _ist_lv   = _pytz_lv.timezone("Asia/Kolkata")
+        _now_lv   = datetime.now(_ist_lv)
+        try:
+            _lc_ts = lv_df.index[-1]
+            if hasattr(_lc_ts, 'tzinfo') and _lc_ts.tzinfo is None:
+                _lc_ts = _ist_lv.localize(_lc_ts.to_pydatetime())
+            elif hasattr(_lc_ts, 'tzinfo') and _lc_ts.tzinfo is not None:
+                _lc_ts = _lc_ts.to_pydatetime().astimezone(_ist_lv)
+            _data_delay_mins = (_now_lv - _lc_ts).total_seconds() / 60
+            _delay_icon = "✅" if _data_delay_mins < 10 else ("⚠️" if _data_delay_mins < 60 else "🔴")
+            st.caption(
+                f"📡 Last candle: **{to_ist(lv_df.index[-1])}**  |  "
+                f"Current time: **{_now_lv.strftime('%d-%b-%Y %H:%M:%S IST')}**  |  "
+                f"Data delay: {_delay_icon} **{_data_delay_mins:.0f} min** "
+                f"({'within 1 candle' if _data_delay_mins < 10 else 'market may be closed or data delayed'})"
+            )
+        except: pass
 
         # ── Price references ───────────────────────────────────────────────────
         # cl  = LTP (last tick price from forming/current bar) — for display & entry price
