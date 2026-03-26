@@ -2213,7 +2213,9 @@ for _k,_v in {"live_active":False,"live_trades":[],"live_position":None,"live_ti
                "opt_applied":None,"opt_results":None,"opt_res_meta":None,"opt_df":None,
                "_oa_hash_prev":"","no_overlap":True,"time_filter":False,
                "dhan_enabled":False,"cooldown_enabled":True,"cooldown_secs":5,
-               "last_trade_close_ts":0.0,"_last_trade_fp":""}.items():
+               "last_trade_close_ts":0.0,"_last_trade_fp":"",
+               "g_interval":"1m","g_period":"7d",
+               "g_strategy":"Elliott Wave (Simplified)"}.items():
     if _k not in st.session_state: st.session_state[_k]=_v
 
 def _idx(lst,val,default=0): return lst.index(val) if val in lst else default
@@ -2464,12 +2466,12 @@ with st.sidebar:
     email_enabled = st.checkbox("Enable Email Alerts (Gmail)",value=False,key="email_enabled",
         help="Sends email when a BUY/SELL signal fires or a trade exits.")
     if email_enabled:
-        email_sender  = st.text_input("Gmail sender address","",key="email_sender",
+        email_sender  = st.text_input("Gmail sender address","srinivas.trml@gmail.com",key="email_sender",
                                        help="Your Gmail address (e.g. you@gmail.com)")
         email_apppass = st.text_input("Gmail App Password","",key="email_apppass",type="password",
                                        help="Use a Gmail App Password (not your login password). "
                                             "Enable 2FA → Google Account → Security → App Passwords.")
-        email_to      = st.text_input("Send alerts to","",key="email_to",
+        email_to      = st.text_input("Send alerts to","srinivas.trml@gmail.com",key="email_to",
                                        help="Recipient email (can be same as sender)")
         st.caption("Alerts sent for: BUY signal, SELL signal, Trade exit (SL/Target/Strategy). "
                    "Uses Gmail SMTP (port 587).")
@@ -2741,49 +2743,28 @@ with tab_live:
         _mins_map_fr = {"1m":1,"5m":5,"15m":15,"30m":30,"1h":60,"4h":240,"1d":1440}
         _bar_mins    = _mins_map_fr.get(interval, 5)
         if st.session_state.get("freshness_enabled", False):
-            import pytz as _pytz
-            _ist      = _pytz.timezone("Asia/Kolkata")
-            _now_ist  = datetime.now(_ist)
+            _now_ist  = datetime.now(_IST)
             try:
                 _last_c = lv_df.index[-1]
-                # Make timezone-aware if needed
                 if hasattr(_last_c, 'tzinfo') and _last_c.tzinfo is None:
-                    _last_c = _ist.localize(_last_c.to_pydatetime())
+                    _last_c = _IST.localize(_last_c.to_pydatetime())
                 elif hasattr(_last_c, 'tzinfo') and _last_c.tzinfo is not None:
-                    _last_c = _last_c.to_pydatetime().astimezone(_ist)
+                    _last_c = _last_c.to_pydatetime().astimezone(_IST)
                 else:
-                    _last_c = _ist.localize(_last_c)
+                    _last_c = _IST.localize(_last_c)
                 _delay_mins = (_now_ist - _last_c).total_seconds() / 60
             except:
                 _delay_mins = 0
 
             _thresh = float(st.session_state.get("delay_thresh", 7))
             if _delay_mins > _thresh + _bar_mins:
-                # Data is stale — retry up to 3 times with cache-busting
+                # Data is stale — warn but do NOT retry here (retries cause freeze).
+                # The next auto-refresh tick will fetch fresh data naturally.
                 st.warning(
-                    f"⚠️ **Data delay detected**: last candle is "
-                    f"**{_delay_mins:.0f} min old** (threshold: {_thresh:.0f} min). "
-                    f"Retrying fetch to get latest data…"
+                    f"⚠️ Last candle is **{_delay_mins:.0f} min** old "
+                    f"(threshold: {_thresh:.0f} min). "
+                    f"Data may be stale — will refresh on next tick."
                 )
-                for _retry in range(3):
-                    time.sleep(2)
-                    _new_df = fetch_live(sym, interval)
-                    if _new_df is not None and not _new_df.empty:
-                        try:
-                            _new_last = _new_df.index[-1]
-                            if hasattr(_new_last,'tzinfo') and _new_last.tzinfo is None:
-                                _new_last = _ist.localize(_new_last.to_pydatetime())
-                            elif hasattr(_new_last,'tzinfo') and _new_last.tzinfo is not None:
-                                _new_last = _new_last.to_pydatetime().astimezone(_ist)
-                            _new_delay = (_now_ist - _new_last).total_seconds() / 60
-                        except:
-                            _new_delay = _delay_mins
-                        if _new_delay < _delay_mins:
-                            lv_df = _new_df
-                            _delay_mins = _new_delay
-                            st.info(f"✅ Retry {_retry+1}: updated data — delay now {_delay_mins:.0f} min.")
-                            break
-                        st.caption(f"Retry {_retry+1}: delay still {_new_delay:.0f} min…")
             else:
                 _delay_mins_disp = max(0, _delay_mins)
                 if _delay_mins_disp <= _thresh:
@@ -2793,15 +2774,13 @@ with tab_live:
         lv_n=len(lv_df)
 
         # ── Always show last candle time vs current time (data freshness) ─────
-        import pytz as _pytz_lv
-        _ist_lv   = _pytz_lv.timezone("Asia/Kolkata")
-        _now_lv   = datetime.now(_ist_lv)
+        _now_lv   = datetime.now(_IST)
         try:
             _lc_ts = lv_df.index[-1]
             if hasattr(_lc_ts, 'tzinfo') and _lc_ts.tzinfo is None:
-                _lc_ts = _ist_lv.localize(_lc_ts.to_pydatetime())
+                _lc_ts = _IST.localize(_lc_ts.to_pydatetime())
             elif hasattr(_lc_ts, 'tzinfo') and _lc_ts.tzinfo is not None:
-                _lc_ts = _lc_ts.to_pydatetime().astimezone(_ist_lv)
+                _lc_ts = _lc_ts.to_pydatetime().astimezone(_IST)
             _data_delay_mins = (_now_lv - _lc_ts).total_seconds() / 60
             _delay_icon = "✅" if _data_delay_mins < 10 else ("⚠️" if _data_delay_mins < 60 else "🔴")
             st.caption(
@@ -2822,15 +2801,13 @@ with tab_live:
         _mins_per_bar_pr = {"1m":1,"5m":5,"15m":15,"30m":30,"1h":60,"4h":240,"1d":1440}.get(interval,5)
         try:
             _last_bar_ts = lv_df.index[-1]
-            import pytz as _pytz_pr
-            _ist_pr = _pytz_pr.timezone("Asia/Kolkata")
-            _now_pr = datetime.now(_ist_pr)
+            _now_pr = datetime.now(_IST)
             if hasattr(_last_bar_ts,'tzinfo') and _last_bar_ts.tzinfo is None:
-                _last_bar_ts_tz = _ist_pr.localize(_last_bar_ts.to_pydatetime())
+                _last_bar_ts_tz = _IST.localize(_last_bar_ts.to_pydatetime())
             elif hasattr(_last_bar_ts,'tzinfo') and _last_bar_ts.tzinfo is not None:
-                _last_bar_ts_tz = _last_bar_ts.to_pydatetime().astimezone(_ist_pr)
+                _last_bar_ts_tz = _last_bar_ts.to_pydatetime().astimezone(_IST)
             else:
-                _last_bar_ts_tz = _ist_pr.localize(_last_bar_ts)
+                _last_bar_ts_tz = _IST.localize(_last_bar_ts)
             _bar_age_mins = (_now_pr - _last_bar_ts_tz).total_seconds() / 60
             # If last bar is older than 1.5 bars → no forming bar → market closed
             _market_closed = _bar_age_mins > _mins_per_bar_pr * 1.5
@@ -2933,7 +2910,30 @@ with tab_live:
         m[3].metric("Spread",f"{bh_cur-bl_cur:.2f}")
         sig_txt="🟢 BUY" if last_sig==1 else ("🔴 SELL" if last_sig==-1 else "⚪ FLAT")
         m[4].metric("Signal",sig_txt)
-        m[5].metric("Last Bar",to_ist(last_bar))
+        m[5].metric("Last Candle", to_ist(lv_df.index[-1]),
+                    help="Timestamp of the most recent candle fetched from yfinance. "
+                         "If this is old, data may be delayed.")
+
+        # ── Last candle full OHLCV row ────────────────────────────────────────
+        try:
+            _lc = lv_df.iloc[-1]
+            _lc_o = float(_lc["Open"]); _lc_h = float(_lc["High"])
+            _lc_l = float(_lc["Low"]);  _lc_c = float(_lc["Close"])
+            _lc_v = float(_lc.get("Volume", 0))
+            _lc_dir = "🟢" if _lc_c >= _lc_o else "🔴"
+            _lc_chg = _lc_c - _lc_o
+            _lc_cols = st.columns(7)
+            _lc_cols[0].metric("Candle",  f"{_lc_dir} {to_ist(lv_df.index[-1])[10:16]}",
+                               help="Last fetched candle — may be delayed by 4-7 min on 1m.")
+            _lc_cols[1].metric("Open",    f"{_lc_o:.2f}")
+            _lc_cols[2].metric("High",    f"{_lc_h:.2f}")
+            _lc_cols[3].metric("Low",     f"{_lc_l:.2f}")
+            _lc_cols[4].metric("Close",   f"{_lc_c:.2f}",
+                               delta=f"{_lc_chg:+.2f}",
+                               delta_color="normal" if _lc_chg >= 0 else "inverse")
+            _lc_cols[5].metric("Range",   f"{_lc_h-_lc_l:.2f}")
+            _lc_cols[6].metric("Volume",  f"{int(_lc_v):,}" if _lc_v else "—")
+        except: pass
 
         # ── Signal Timing Panel — detailed, anti-FOMO entry guidance ────────
         if last_sig != 0 and _sig_bar_dt is not None and pos is None:
@@ -5799,14 +5799,57 @@ with tab_nte:
                                     "Remaining Tgt":round(_remaining_tgt,2),
                                     "SL if Enter": round(_sl_now,2),
                                     "Tgt if Enter":round(_tgt_now,2),
+                                    "Accuracy":    "—",
+                                    "Total Trades":"—",
+                                    "Total PnL":   "—",
                                     "_sig_dir":    "BUY" if _fslast_sig==1 else "SELL",
                                 })
                             except: pass
 
                 _fs_prog.empty(); _fs_stat.empty()
 
-                # Sort by score ascending (best first)
-                _fs_results.sort(key=lambda r: r["_score"])
+                # ── Run mini backtest on each result to get Accuracy/PnL ────────
+                if _fs_results:
+                    _bt_prog = st.progress(0); _bt_stat = st.empty()
+                    _bt_total = len(_fs_results)
+                    for _bi, _br in enumerate(_fs_results):
+                        _bt_stat.caption(f"Backtesting {_br['Ticker']} {_br['Timeframe']}/{_br['Period']} "
+                                         f"({_bi+1}/{_bt_total})…")
+                        _bt_prog.progress((_bi+1)/_bt_total)
+                        try:
+                            time.sleep(1.5)
+                            _bt_raw = yf.download(_br["Ticker"], period=_br["Period"],
+                                interval=YF_IV.get(_br["Timeframe"],_br["Timeframe"]),
+                                progress=False, auto_adjust=True)
+                            if _bt_raw is not None and not _bt_raw.empty:
+                                _bt_df = _flatten(_bt_raw)
+                                if _br["Timeframe"]=="4h": _bt_df=_r4h(_bt_df)
+                                if len(_bt_df) >= 20:
+                                    _bt_res, _, _ = run_backtest(
+                                        _bt_df, _fs_strategy, _fs_params,
+                                        "Custom Points", _fs_sl,
+                                        "Custom Points", _fs_tgt
+                                    )
+                                    if not _bt_res.empty:
+                                        _bt_wins  = int((_bt_res["PnL"]>0).sum())
+                                        _bt_total_t = len(_bt_res)
+                                        _bt_acc   = round(_bt_wins/_bt_total_t*100,1) if _bt_total_t>0 else 0
+                                        _bt_pnl   = round(_bt_res["PnL"].sum(),2)
+                                        _br["Accuracy"]     = f"{_bt_acc}%"
+                                        _br["Total Trades"] = _bt_total_t
+                                        _br["Total PnL"]    = _bt_pnl
+                                        # Boost score for high accuracy (subtract up to 3 from score)
+                                        if _bt_acc >= 60:
+                                            _br["_score"] = max(0, _br["_score"] - (_bt_acc-50)/50*3)
+                        except: pass
+                    _bt_prog.empty(); _bt_stat.empty()
+
+                # Sort: primary = score ascending (lower=better freshness),
+                # secondary = accuracy descending (higher=better backtest)
+                def _fs_sort_key(r):
+                    _acc = float(r["Accuracy"].rstrip("%")) if r["Accuracy"] not in ("—","") else 0
+                    return (r["_score"], -_acc)
+                _fs_results.sort(key=_fs_sort_key)
                 st.session_state["fs_results"]  = _fs_results
                 st.session_state["fs_scan_meta"] = {
                     "strategy": _fs_strategy, "sl": _fs_sl, "tgt": _fs_tgt,
@@ -5847,24 +5890,26 @@ with tab_nte:
                 )
 
                 for _fri, _frow in enumerate(_fsr):
-                    # Color-code by freshness
                     _fr = _frow["_freshness"]
                     _badge = "🟢" if _fr >= 75 else ("🟡" if _fr >= 45 else "🟠")
+                    _acc_str = _frow.get("Accuracy","—")
+                    _acc_badge = ("✅" if _acc_str not in ("—","") and float(_acc_str.rstrip("%"))>=60
+                                  else ("⚠️" if _acc_str not in ("—","") else ""))
 
-                    # Row display
-                    _rc1,_rc2,_rc3,_rc4,_rc5,_rc6,_rc7,_rc8,_rc9 = st.columns(
-                        [1.2,0.8,0.8,1,1,1,1,1,2])
+                    _rc1,_rc2,_rc3,_rc4,_rc5,_rc6,_rc7,_rc8,_rc9,_rc10 = st.columns(
+                        [1.2,0.7,0.7,0.9,0.9,0.8,0.8,0.9,0.9,2])
                     _rc1.markdown(f"**{_frow['Ticker']}**")
                     _rc2.markdown(f"`{_frow['Timeframe']}`")
                     _rc3.markdown(f"_{_frow['Period']}_")
                     _rc4.markdown(f"{_frow['Signal']}")
                     _rc5.markdown(f"{_badge} **{_fr}/100**")
-                    _rc6.markdown(f"{_frow['Bars Since']}bar / {_frow['Age (min)']}min")
-                    _rc7.markdown(f"LTP:{_frow['LTP']}")
-                    _rc8.markdown(f"Moved:{_frow['Moved (pts)']}pts")
+                    _rc6.markdown(f"{_frow['Bars Since']}bar/{_frow['Age (min)']}m")
+                    _rc7.markdown(f"Mv:{_frow['Moved (pts)']}pt")
+                    _rc8.markdown(f"{_acc_badge} {_acc_str}")
+                    _rc9.markdown(f"PnL:{_frow.get('Total PnL','—')}")
 
                     _fsd = _frow["_sig_dir"]
-                    if _rc9.button(
+                    if _rc10.button(
                         f"{'🟢' if _fsd=='BUY' else '🔴'} Apply → Live+BT",
                         key=f"fs_apply_{_fri}_{_frow['Ticker']}_{_frow['Timeframe']}_{_frow['Period']}",
                         type="primary" if _fr >= 75 else "secondary",
@@ -5885,13 +5930,17 @@ with tab_nte:
                             f"📊 {_frow['Ticker']} {_frow['Timeframe']}/{_frow['Period']} — entry details",
                             expanded=(_fri == 0)
                         ):
-                            _dc1,_dc2,_dc3,_dc4,_dc5,_dc6 = st.columns(6)
+                            _dc1,_dc2,_dc3,_dc4,_dc5,_dc6,_dc7,_dc8 = st.columns(8)
                             _dc1.metric("Signal Time",     _frow["Signal Time"][:16])
                             _dc2.metric("Signal Price",    _frow["Signal Price"])
                             _dc3.metric("LTP Now",         _frow["LTP"])
                             _dc4.metric("SL if Enter",     _frow["SL if Enter"])
                             _dc5.metric("Tgt if Enter",    _frow["Tgt if Enter"])
-                            _dc6.metric("Remaining Target",f"{_frow['Remaining Tgt']:.1f} pts")
+                            _dc6.metric("Remaining Tgt",   f"{_frow['Remaining Tgt']:.1f} pts")
+                            _dc7.metric("Backtest Acc",    _frow.get("Accuracy","—"),
+                                        help="Historical accuracy of this strategy on this ticker/TF/period")
+                            _dc8.metric("Backtest PnL",    str(_frow.get("Total PnL","—")),
+                                        help="Total points profit/loss in backtest")
 
                             _sig_d = _frow["_sig_dir"]
                             if _sig_d == "BUY":
