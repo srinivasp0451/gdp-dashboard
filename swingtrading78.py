@@ -2813,17 +2813,41 @@ with tab_live:
         except: pass
 
         # ── Price references ───────────────────────────────────────────────────
-        # cl  = LTP (last tick price from forming/current bar) — for display & entry price
-        # bh_cur / bl_cur = High/Low of the LAST FULLY CLOSED bar (iloc[-2])
-        #   This matches backtest logic exactly: backtest checks bar[j] High/Low
-        #   only after that bar is complete. Using forming bar's High/Low causes
-        #   false SL hits — e.g. a SHORT at 71194 with SL=71204 exits immediately
-        #   because the forming bar's High touches 71204 intrabar even while falling.
-        cl      = float(lv_df["Close"].iloc[-1])    # LTP (forming bar close = current price)
-        _closed_bar_idx = max(0, lv_n - 2)          # last FULLY closed bar
-        bh_cur  = float(lv_df["High"].iloc[_closed_bar_idx])   # SL/Target check
-        bl_cur  = float(lv_df["Low"].iloc[_closed_bar_idx])    # SL/Target check
-        last_bar= lv_df.index[_closed_bar_idx]      # timestamp of last closed bar
+        # During live market: iloc[-1] = forming/current bar (incomplete)
+        #                     iloc[-2] = last FULLY closed bar  ← use for SL/Target
+        # When market is CLOSED: iloc[-1] IS a fully closed bar (no forming bar).
+        #   Using iloc[-2] in this case shows the PREVIOUS bar (e.g. 14:15 instead of 15:15).
+        # Fix: detect market-closed by comparing last candle time to current time.
+        #   If delay > 1.5× bar duration → market closed → use iloc[-1] as last closed bar.
+        _mins_per_bar_pr = {"1m":1,"5m":5,"15m":15,"30m":30,"1h":60,"4h":240,"1d":1440}.get(interval,5)
+        try:
+            _last_bar_ts = lv_df.index[-1]
+            import pytz as _pytz_pr
+            _ist_pr = _pytz_pr.timezone("Asia/Kolkata")
+            _now_pr = datetime.now(_ist_pr)
+            if hasattr(_last_bar_ts,'tzinfo') and _last_bar_ts.tzinfo is None:
+                _last_bar_ts_tz = _ist_pr.localize(_last_bar_ts.to_pydatetime())
+            elif hasattr(_last_bar_ts,'tzinfo') and _last_bar_ts.tzinfo is not None:
+                _last_bar_ts_tz = _last_bar_ts.to_pydatetime().astimezone(_ist_pr)
+            else:
+                _last_bar_ts_tz = _ist_pr.localize(_last_bar_ts)
+            _bar_age_mins = (_now_pr - _last_bar_ts_tz).total_seconds() / 60
+            # If last bar is older than 1.5 bars → no forming bar → market closed
+            _market_closed = _bar_age_mins > _mins_per_bar_pr * 1.5
+        except:
+            _market_closed = False
+
+        cl      = float(lv_df["Close"].iloc[-1])    # LTP / most recent close
+        if _market_closed:
+            # Market closed: all bars are complete — use the very last bar as the closed bar
+            _closed_bar_idx = lv_n - 1
+        else:
+            # Market open: iloc[-1] is forming — use iloc[-2] as last complete bar
+            _closed_bar_idx = max(0, lv_n - 2)
+
+        bh_cur  = float(lv_df["High"].iloc[_closed_bar_idx])
+        bl_cur  = float(lv_df["Low"].iloc[_closed_bar_idx])
+        last_bar= lv_df.index[_closed_bar_idx]
 
         fn=STRATEGY_FN.get(strategy,sig_custom)
         try: lv_sigs,lv_indics=fn(lv_df,**live_params)
