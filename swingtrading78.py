@@ -4748,9 +4748,9 @@ with tab_nte:
         st.success(st.session_state["nte_applied_msg"])
 
     # ── Sub-tabs: Scanner | Quick Search ──────────────────────────────────────
-    nte_scan_tab, nte_quick_tab, nte_ew_tab, nte_pos_tab = st.tabs([
+    nte_scan_tab, nte_quick_tab, nte_ew_tab, nte_pos_tab, nte_fresh_tab = st.tabs([
         "🔍 Strategy Scanner", "⚡ Quick Signal Search",
-        "🌊 Elliott Wave Monitor", "📍 Position Tracker"
+        "🌊 Elliott Wave Monitor", "📍 Position Tracker", "🎯 Fresh Signal Finder"
     ])
 
     # ══════════════════════════════════════════════════════════════════════════
@@ -5591,3 +5591,355 @@ with tab_nte:
                     st.dataframe(_ptdf_b, use_container_width=True)
         else:
             st.info("Click 🔍 Scan for EW Proximity to see which tickers are close to a signal.")
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # SUB-TAB 5: Fresh Signal Finder
+    # Finds the BEST combination of (ticker × timeframe × period × strategy)
+    # where the signal fired very recently, price hasn't run away, and you're
+    # not late — so you can apply it directly and start live trading NOW.
+    # ══════════════════════════════════════════════════════════════════════════
+    with nte_fresh_tab:
+        st.markdown(
+            "**Find fresh, actionable signals right now.** "
+            "Scans combinations of tickers, timeframes and periods to find signals that:\n"
+            "- Fired within your max bars threshold (you're not late)\n"
+            "- Price hasn't moved more than your max-pts limit toward target (move still available)\n"
+            "- Minimal time delay between signal bar and now\n\n"
+            "Click **Apply** on any result to instantly configure sidebar, backtesting and live trading."
+        )
+
+        # ── Inputs ────────────────────────────────────────────────────────────
+        with st.expander("⚙️ Search Parameters", expanded=True):
+            _fc1, _fc2, _fc3 = st.columns(3)
+
+            # Tickers
+            _fs_univ = _fc1.selectbox("Universe",
+                ["All Nifty 50 Stocks","Custom Tickers"] + list(TICKER_MAP.keys()),
+                key="fs_universe")
+            if _fs_univ == "Custom Tickers":
+                _fs_raw = _fc1.text_area("Symbols (one per line)",
+                                          "RELIANCE.NS\nINFY.NS\nHDFCBANK.NS",
+                                          key="fs_tickers", height=80)
+                _fs_symbols = [s.strip() for s in _fs_raw.splitlines() if s.strip()]
+            elif _fs_univ == "All Nifty 50 Stocks":
+                _fs_symbols = NIFTY50_SYMBOLS
+                _fc1.caption(f"{len(_fs_symbols)} Nifty 50 stocks")
+            else:
+                _fs_symbols = [TICKER_MAP[_fs_univ]]
+                _fc1.caption(f"Ticker: {_fs_symbols[0]}")
+
+            # Timeframes to scan
+            _fs_ivs_opts = ["1m","5m","15m","30m","1h"]
+            _fs_ivs = _fc1.multiselect("Timeframes to scan",
+                _fs_ivs_opts, default=["1m","5m","15m"], key="fs_ivs")
+
+            # Periods to scan
+            _fs_pds_opts = ["1d","5d","7d","1mo"]
+            _fs_pds = _fc1.multiselect("Periods to scan",
+                _fs_pds_opts, default=["1d","5d","7d"], key="fs_pds")
+
+            # Strategy
+            _fs_strategy = _fc2.selectbox("Strategy", STRATEGIES,
+                index=STRATEGIES.index("Elliott Wave (Simplified)") if "Elliott Wave (Simplified)" in STRATEGIES else 0,
+                key="fs_strategy")
+
+            # Key thresholds
+            _fs_max_bars = _fc2.number_input(
+                "Max bars since signal fired",
+                min_value=1, max_value=50, value=2, step=1,
+                key="fs_max_bars",
+                help="Only show signals that fired within this many bars. "
+                     "2 bars on 1m = signal fired within 2 minutes. "
+                     "2 bars on 5m = within 10 minutes."
+            )
+            _fs_max_pts = _fc2.number_input(
+                "Max price move toward target (pts)",
+                min_value=0.0, max_value=500.0, value=10.0, step=0.5,
+                key="fs_max_pts",
+                help="Skip signals where price already moved more than this many points "
+                     "in the signal direction. Keeps entries where the move is still available."
+            )
+            _fs_max_delay_mins = _fc2.number_input(
+                "Max acceptable signal age (minutes)",
+                min_value=1, max_value=480, value=30, step=1,
+                key="fs_max_delay",
+                help="Skip signals where signal bar time vs current time gap exceeds this. "
+                     "Prevents acting on very old signals."
+            )
+
+            # SL/Target for scoring
+            _fs_sl  = _fc3.number_input("SL (pts)",  0.1, 1e6, 10., step=0.5, key="fs_sl")
+            _fs_tgt = _fc3.number_input("Tgt (pts)", 0.1, 1e6, 20., step=0.5, key="fs_tgt")
+            _fs_params = {**sb_params}
+
+            # Min bars of data needed
+            _fc3.markdown("**Scoring weights:**")
+            _fs_w_bars  = _fc3.slider("Weight: Freshness (fewer bars = better)", 0, 10, 5, key="fs_w_bars")
+            _fs_w_pts   = _fc3.slider("Weight: Price move (less moved = better)", 0, 10, 5, key="fs_w_pts")
+            _fs_w_delay = _fc3.slider("Weight: Time delay (less delay = better)", 0, 10, 3, key="fs_w_delay")
+
+        st.caption(
+            f"Will scan: **{len(_fs_symbols)} ticker(s)** × "
+            f"**{len(_fs_ivs)} timeframe(s)** × "
+            f"**{len(_fs_pds)} period(s)** = "
+            f"**{len(_fs_symbols)*len(_fs_ivs)*len(_fs_pds)} combinations**. "
+            f"Rate-limited to 1.5s per fetch. Estimate: "
+            f"~{len(_fs_symbols)*len(_fs_ivs)*len(_fs_pds)*2:.0f}s total."
+        )
+
+        if st.button("🎯 Find Fresh Signals", type="primary", key="btn_fs_scan"):
+            if not _fs_ivs or not _fs_pds:
+                st.error("Select at least one timeframe and one period.")
+            elif not _fs_symbols:
+                st.error("No tickers selected.")
+            else:
+                _fs_results = []
+                _fs_fn = STRATEGY_FN.get(_fs_strategy, sig_custom)
+                _total_combos = len(_fs_symbols) * len(_fs_ivs) * len(_fs_pds)
+                _fs_prog = st.progress(0); _fs_stat = st.empty(); _fs_idx = 0
+
+                import pytz as _pytz_fs
+                _ist_fs = _pytz_fs.timezone("Asia/Kolkata")
+                _now_fs = datetime.now(_ist_fs)
+                _mins_map_fs = {"1m":1,"5m":5,"15m":15,"30m":30,"1h":60,"4h":240,"1d":1440}
+
+                for _fssym in _fs_symbols:
+                    for _fsiv in _fs_ivs:
+                        for _fspd in _fs_pds:
+                            _fs_idx += 1
+                            _fs_stat.caption(f"Scanning {_fssym} | {_fsiv} | {_fspd} "
+                                             f"({_fs_idx}/{_total_combos})…")
+                            _fs_prog.progress(_fs_idx / _total_combos)
+                            try:
+                                time.sleep(1.5)
+                                _fsraw = yf.download(_fssym, period=_fspd,
+                                    interval=YF_IV.get(_fsiv,_fsiv),
+                                    progress=False, auto_adjust=True)
+                                if _fsraw is None or _fsraw.empty: continue
+                                _fsdf = _flatten(_fsraw)
+                                if _fsiv == "4h": _fsdf = _r4h(_fsdf)
+                                if len(_fsdf) < 20: continue
+
+                                # Run strategy
+                                try:
+                                    _fssigs, _ = _fs_fn(_fsdf, **_fs_params)
+                                except: continue
+
+                                _fsn      = len(_fsdf)
+                                _fsltp    = float(_fsdf["Close"].iloc[-1])
+                                _fsmins   = _mins_map_fs.get(_fsiv, 5)
+                                _fs_wide  = {"Elliott Wave (Simplified)":20,
+                                             "Elliott Wave v2 (Swing+Fib)":10,
+                                             "Elliott Wave v3 (Extrema)":5}.get(_fs_strategy, 3)
+
+                                # Find most recent signal within lookback
+                                _fslast_sig = 0; _fsbars_ago = 0
+                                _fssig_px = None; _fssig_dt = None
+                                for _fsi in range(1, _fs_wide + 2):
+                                    if _fsn > _fsi and int(_fssigs.iloc[-_fsi]) != 0:
+                                        _fslast_sig = int(_fssigs.iloc[-_fsi])
+                                        _fsbars_ago = _fsi - 1
+                                        try:
+                                            _fssig_dt = _fsdf.index[-_fsi]
+                                            _fssig_px = float(_fsdf["Close"].iloc[-_fsi])
+                                        except: pass
+                                        break
+
+                                if _fslast_sig == 0 or _fssig_dt is None: continue
+
+                                # Filter 1: bars since signal
+                                if _fsbars_ago > _fs_max_bars: continue
+
+                                # Filter 2: time since signal
+                                try:
+                                    _sig_ts = _fssig_dt
+                                    if hasattr(_sig_ts,'tzinfo') and _sig_ts.tzinfo is None:
+                                        _sig_ts = _ist_fs.localize(_sig_ts.to_pydatetime())
+                                    elif hasattr(_sig_ts,'tzinfo') and _sig_ts.tzinfo is not None:
+                                        _sig_ts = _sig_ts.to_pydatetime().astimezone(_ist_fs)
+                                    _signal_age_mins = (_now_fs - _sig_ts).total_seconds() / 60
+                                except: _signal_age_mins = _fsbars_ago * _fsmins
+
+                                if _signal_age_mins > _fs_max_delay_mins: continue
+
+                                # Filter 3: price move toward target
+                                _price_moved = (_fsltp - _fssig_px) * _fslast_sig
+                                if _price_moved > _fs_max_pts: continue
+
+                                # Compute score (lower = better entry opportunity)
+                                # Score: weighted sum of: bars_ago, price_moved_pct_of_tgt, signal_age
+                                _score_bars  = (_fsbars_ago / max(_fs_max_bars, 1)) * _fs_w_bars
+                                _score_pts   = (max(0, _price_moved) / max(_fs_max_pts, 0.01)) * _fs_w_pts
+                                _score_delay = (_signal_age_mins / max(_fs_max_delay_mins, 1)) * _fs_w_delay
+                                _total_score = _score_bars + _score_pts + _score_delay
+                                # Freshness rank: 100 = perfect entry, 0 = at threshold
+                                _freshness_rank = max(0, 100 - int(_total_score / max(_fs_w_bars+_fs_w_pts+_fs_w_delay,1) * 100))
+
+                                # Projected SL/Target if entering now
+                                _entry_now = _fsltp
+                                _sl_now    = _entry_now - _fslast_sig * _fs_sl
+                                _tgt_now   = _entry_now + _fslast_sig * _fs_tgt
+                                # Adjusted target if price already moved
+                                _remaining_tgt = _fs_tgt - max(0, _price_moved)
+
+                                _fs_results.append({
+                                    "_score":      _total_score,
+                                    "_freshness":  _freshness_rank,
+                                    "Ticker":      _fssym,
+                                    "Timeframe":   _fsiv,
+                                    "Period":      _fspd,
+                                    "Signal":      "🟢 BUY" if _fslast_sig==1 else "🔴 SELL",
+                                    "Freshness":   f"{'🟢' if _freshness_rank>=75 else '🟡' if _freshness_rank>=45 else '🟠'} {_freshness_rank}/100",
+                                    "Bars Since":  _fsbars_ago,
+                                    "Age (min)":   round(_signal_age_mins,1),
+                                    "Signal Time": to_ist(_fssig_dt),
+                                    "Signal Price":round(_fssig_px,2) if _fssig_px else "—",
+                                    "LTP":         round(_fsltp,2),
+                                    "Moved (pts)": round(_price_moved,2),
+                                    "Remaining Tgt":round(_remaining_tgt,2),
+                                    "SL if Enter": round(_sl_now,2),
+                                    "Tgt if Enter":round(_tgt_now,2),
+                                    "_sig_dir":    "BUY" if _fslast_sig==1 else "SELL",
+                                })
+                            except: pass
+
+                _fs_prog.empty(); _fs_stat.empty()
+
+                # Sort by score ascending (best first)
+                _fs_results.sort(key=lambda r: r["_score"])
+                st.session_state["fs_results"]  = _fs_results
+                st.session_state["fs_scan_meta"] = {
+                    "strategy": _fs_strategy, "sl": _fs_sl, "tgt": _fs_tgt,
+                    "max_bars": _fs_max_bars, "max_pts": _fs_max_pts,
+                }
+
+        # ── Display results ────────────────────────────────────────────────────
+        _fsr  = st.session_state.get("fs_results")
+        _fsmeta = st.session_state.get("fs_scan_meta", {})
+
+        if _fsr is not None:
+            if not _fsr:
+                st.warning(
+                    "No fresh signals found matching your criteria. Try:\n"
+                    "- Increasing **Max bars since signal fired** (e.g. 5 or 10)\n"
+                    "- Increasing **Max price move toward target** (e.g. 20 pts)\n"
+                    "- Increasing **Max acceptable signal age** (e.g. 60 min)\n"
+                    "- Adding more timeframes or periods to scan\n"
+                    "- Switching strategy (e.g. EMA Crossover generates more frequent signals)"
+                )
+            else:
+                st.success(f"✅ Found **{len(_fsr)}** fresh signal(s). Sorted by Freshness (best first).")
+
+                # Summary metrics
+                _fsr_buy  = [r for r in _fsr if r["_sig_dir"]=="BUY"]
+                _fsr_sell = [r for r in _fsr if r["_sig_dir"]=="SELL"]
+                _s1,_s2,_s3,_s4 = st.columns(4)
+                _s1.metric("Total Results",    len(_fsr))
+                _s2.metric("🟢 BUY Signals",   len(_fsr_buy))
+                _s3.metric("🔴 SELL Signals",  len(_fsr_sell))
+                _s4.metric("Best Freshness",   _fsr[0]["Freshness"] if _fsr else "—")
+
+                st.markdown("---")
+                st.markdown("### 🎯 Results — Best entry opportunities (sorted best first)")
+                st.caption(
+                    "Each row is a unique (Ticker × Timeframe × Period) combination. "
+                    "Click **Apply → Live** to configure sidebar, backtesting and live trading instantly."
+                )
+
+                for _fri, _frow in enumerate(_fsr):
+                    # Color-code by freshness
+                    _fr = _frow["_freshness"]
+                    _badge = "🟢" if _fr >= 75 else ("🟡" if _fr >= 45 else "🟠")
+
+                    # Row display
+                    _rc1,_rc2,_rc3,_rc4,_rc5,_rc6,_rc7,_rc8,_rc9 = st.columns(
+                        [1.2,0.8,0.8,1,1,1,1,1,2])
+                    _rc1.markdown(f"**{_frow['Ticker']}**")
+                    _rc2.markdown(f"`{_frow['Timeframe']}`")
+                    _rc3.markdown(f"_{_frow['Period']}_")
+                    _rc4.markdown(f"{_frow['Signal']}")
+                    _rc5.markdown(f"{_badge} **{_fr}/100**")
+                    _rc6.markdown(f"{_frow['Bars Since']}bar / {_frow['Age (min)']}min")
+                    _rc7.markdown(f"LTP:{_frow['LTP']}")
+                    _rc8.markdown(f"Moved:{_frow['Moved (pts)']}pts")
+
+                    _fsd = _frow["_sig_dir"]
+                    if _rc9.button(
+                        f"{'🟢' if _fsd=='BUY' else '🔴'} Apply → Live+BT",
+                        key=f"fs_apply_{_fri}_{_frow['Ticker']}_{_frow['Timeframe']}_{_frow['Period']}",
+                        type="primary" if _fr >= 75 else "secondary",
+                    ):
+                        _nte_apply_to_live(
+                            ticker_sym   = _frow["Ticker"],
+                            ticker_label = _frow["Ticker"],
+                            sig_direction= _fsd,
+                            iv           = _frow["Timeframe"],
+                            pd_val       = _frow["Period"],
+                            strat        = _fsmeta.get("strategy", _fs_strategy),
+                        )
+                        st.rerun()
+
+                    # Detail expander for top results
+                    if _fri < 5:
+                        with st.expander(
+                            f"📊 {_frow['Ticker']} {_frow['Timeframe']}/{_frow['Period']} — entry details",
+                            expanded=(_fri == 0)
+                        ):
+                            _dc1,_dc2,_dc3,_dc4,_dc5,_dc6 = st.columns(6)
+                            _dc1.metric("Signal Time",     _frow["Signal Time"][:16])
+                            _dc2.metric("Signal Price",    _frow["Signal Price"])
+                            _dc3.metric("LTP Now",         _frow["LTP"])
+                            _dc4.metric("SL if Enter",     _frow["SL if Enter"])
+                            _dc5.metric("Tgt if Enter",    _frow["Tgt if Enter"])
+                            _dc6.metric("Remaining Target",f"{_frow['Remaining Tgt']:.1f} pts")
+
+                            _sig_d = _frow["_sig_dir"]
+                            if _sig_d == "BUY":
+                                st.success(
+                                    f"**BUY opportunity:** Signal fired {_frow['Bars Since']} bar(s) ago "
+                                    f"at {_frow['Signal Time'][:16]}. "
+                                    f"Price moved only {_frow['Moved (pts)']} pts in signal direction — "
+                                    f"{_frow['Remaining Tgt']:.1f} pts of target still available.\n\n"
+                                    f"**Enter:** {_frow['LTP']} | **SL:** {_frow['SL if Enter']} | "
+                                    f"**Target:** {_frow['Tgt if Enter']} | "
+                                    f"**R:R:** 1:{_fsmeta.get('tgt',20)/_fsmeta.get('sl',10):.1f}"
+                                )
+                            else:
+                                st.error(
+                                    f"**SELL opportunity:** Signal fired {_frow['Bars Since']} bar(s) ago "
+                                    f"at {_frow['Signal Time'][:16]}. "
+                                    f"Price moved only {_frow['Moved (pts)']} pts — "
+                                    f"{_frow['Remaining Tgt']:.1f} pts of downside still available.\n\n"
+                                    f"**Enter:** {_frow['LTP']} | **SL:** {_frow['SL if Enter']} | "
+                                    f"**Target:** {_frow['Tgt if Enter']} | "
+                                    f"**R:R:** 1:{_fsmeta.get('tgt',20)/_fsmeta.get('sl',10):.1f}"
+                                )
+
+                # Full table
+                with st.expander("📋 Full results table"):
+                    _fs_disp = pd.DataFrame([
+                        {k:v for k,v in r.items() if not k.startswith("_")}
+                        for r in _fsr
+                    ])
+                    def _fs_sig_col(v):
+                        if "BUY"  in str(v): return "color:#2e7d32;font-weight:bold"
+                        if "SELL" in str(v): return "color:#c62828;font-weight:bold"
+                        return ""
+                    st.dataframe(
+                        _fs_disp.style.map(_fs_sig_col, subset=["Signal"]),
+                        use_container_width=True,
+                        column_config={
+                            "Signal Time": st.column_config.TextColumn("Signal Time (IST)", width="large"),
+                        }
+                    )
+        else:
+            st.info(
+                "Configure your criteria above and click **🎯 Find Fresh Signals**.\n\n"
+                "**Tip:** Start with:\n"
+                "- Timeframes: 1m, 5m, 15m\n"
+                "- Periods: 1d, 5d\n"
+                "- Max bars since signal: 2\n"
+                "- Max price move: 10 pts\n"
+                "- Max signal age: 30 min\n\n"
+                "The scanner will return only the combinations where you're genuinely not late."
+            )
