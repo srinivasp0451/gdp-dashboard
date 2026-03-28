@@ -2331,7 +2331,7 @@ with st.sidebar:
     dhan_enabled=st.checkbox("Enable Dhan Broker",value=False,key="dhan_enabled")
     if dhan_enabled:
         dhan_client=st.text_input("Client ID","1104779876",key="dhan_client")
-        _DEFAULT_TOKEN = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzUxMiJ9.eyJpc3MiOiJkaGFuIiwicGFydG5lcklkIjoiIiwiZXhwIjoxNzc0NjY3MTA4LCJpYXQiOjE3NzQ1ODA3MDgsInRva2VuQ29uc3VtZXJUeXBlIjoiU0VMRiIsIndlYmhvb2tVcmwiOiIiLCJkaGFuQ2xpZW50SWQiOiIxMTA0Nzc5ODc2In0.tkaJSjQTuku8cS_lDrI6Y__7grZv6lsA_Sc4BGuRA_T4yMlj_hCNtXQRYB4g3uMVva6z66nYDgpy6z6nibBo8Q"
+        _DEFAULT_TOKEN = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzUxMiJ9.eyJpc3MiOiJkaGFuIiwicGFydG5lcklkIjoiIiwiZXhwIjoxNzczODAyMDg2LCJpYXQiOjE3NzM3MTU2ODYsInRva2VuQ29uc3VtZXJUeXBlIjoiU0VMRiIsIndlYmhvb2tVcmwiOiIiLCJkaGFuQ2xpZW50SWQiOiIxMTA0Nzc5ODc2In0.L5ULyf8AfeaoZS_kn95rtQZ6qNRJF3EUimCJw_8q12k2FZHEGEPNySKrYOBP9vRfBHKvEqWoB0ZC7GRUd7zyMg"
         dhan_token =st.text_input("Access Token",_DEFAULT_TOKEN,key="dhan_token",type="password")
         st.caption("**Order type — always BUYER (never seller in options)**")
         is_stocks=st.checkbox("Stocks / Intraday mode  (uncheck = Options CE/PE buyer)",value=False,key="dhan_is_stocks")
@@ -4748,9 +4748,10 @@ with tab_nte:
         st.success(st.session_state["nte_applied_msg"])
 
     # ── Sub-tabs: Scanner | Quick Search ──────────────────────────────────────
-    nte_scan_tab, nte_quick_tab, nte_ew_tab, nte_pos_tab, nte_fresh_tab = st.tabs([
+    nte_scan_tab, nte_quick_tab, nte_ew_tab, nte_pos_tab, nte_fresh_tab, nte_dive_tab = st.tabs([
         "🔍 Strategy Scanner", "⚡ Quick Signal Search",
-        "🌊 Elliott Wave Monitor", "📍 Position Tracker", "🎯 Fresh Signal Finder"
+        "🌊 Elliott Wave Monitor", "📍 Position Tracker",
+        "🎯 Fresh Signal Finder", "🔎 Signal Deep Dive"
     ])
 
     # ══════════════════════════════════════════════════════════════════════════
@@ -5991,4 +5992,417 @@ with tab_nte:
                 "- Max price move: 10 pts\n"
                 "- Max signal age: 30 min\n\n"
                 "The scanner will return only the combinations where you're genuinely not late."
+            )
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # SUB-TAB 6: Signal Deep Dive
+    # Pick a ticker + strategy, scan ALL meaningful TF/period combos.
+    # For each combo: find the most recent signal, show complete trade details
+    # so you can decide whether to enter the remaining move or skip.
+    # ══════════════════════════════════════════════════════════════════════════
+    with nte_dive_tab:
+        st.markdown(
+            "**Deep dive into a single ticker across ALL timeframe/period combinations.** "
+            "Finds every fired or approaching signal and tells you exactly:\n"
+            "- When the signal fired, entry price, direction, SL, target\n"
+            "- How much has already moved and how much is still left\n"
+            "- Whether to still enter or skip\n"
+            "- One-click Apply to configure sidebar + live trading immediately"
+        )
+
+        # ── Inputs ────────────────────────────────────────────────────────────
+        _dd_c1, _dd_c2, _dd_c3 = st.columns(3)
+
+        _dd_ticker_choice = _dd_c1.selectbox(
+            "Ticker", ["Custom"] + list(TICKER_MAP.keys()),
+            index=0, key="dd_ticker_choice"
+        )
+        if _dd_ticker_choice == "Custom":
+            _dd_sym = _dd_c1.text_input("Yahoo Symbol", "INFY.NS", key="dd_custom_sym").strip()
+        else:
+            _dd_sym = TICKER_MAP[_dd_ticker_choice]
+        _dd_c1.caption(f"Scanning: **{_dd_sym}**")
+
+        _dd_strategy = _dd_c2.selectbox(
+            "Strategy",
+            STRATEGIES,
+            index=STRATEGIES.index("Elliott Wave (Simplified)") if "Elliott Wave (Simplified)" in STRATEGIES else 0,
+            key="dd_strategy"
+        )
+        _dd_sl  = _dd_c2.number_input("SL (pts)",  0.1, 1e6, 10.0, step=0.5, key="dd_sl")
+        _dd_tgt = _dd_c2.number_input("Tgt (pts)", 0.1, 1e6, 20.0, step=0.5, key="dd_tgt")
+        _dd_params = {**sb_params}
+
+        _dd_lookback = _dd_c3.slider("Signal lookback (bars)", 1, 50, 20, key="dd_lookback",
+            help="How many recent bars to search for the most recent signal.")
+        _dd_show_approaching = _dd_c3.checkbox("Also show approaching signals", value=True,
+            key="dd_show_appr",
+            help="Show combos where signal hasn't fired yet but is within 30% of triggering.")
+        _dd_c3.markdown("**All TF × Period combos scanned:**")
+        _dd_c3.caption(
+            "1m: 1d,5d,7d | 5m: 1d,5d,7d,1mo | 15m: 1d,5d,7d,1mo | "
+            "1h: 1d,5d,7d,1mo,3mo,6mo,1y,2y | 4h: 1d,5d,7d,1mo,3mo,6mo,1y,2y | "
+            "1d: 5d,7d,1mo,3mo,6mo,1y,2y,5y | 1wk: 1d,5d,7d,1mo,3mo,6mo,1y,2y,5y,10y"
+        )
+
+        # Full scan matrix
+        _DD_MATRIX = {
+            "1m":  ["1d","5d","7d"],
+            "5m":  ["1d","5d","7d","1mo"],
+            "15m": ["1d","5d","7d","1mo"],
+            "1h":  ["1d","5d","7d","1mo","3mo","6mo","1y","2y"],
+            "4h":  ["1d","5d","7d","1mo","3mo","6mo","1y","2y"],
+            "1d":  ["5d","7d","1mo","3mo","6mo","1y","2y","5y"],
+            "1wk": ["1d","5d","7d","1mo","3mo","6mo","1y","2y","5y","10y"],
+        }
+        _dd_total_combos = sum(len(v) for v in _DD_MATRIX.values())
+        st.caption(f"Total combinations to scan: **{_dd_total_combos}** — rate-limited 1.5s each. "
+                   f"Est. time: ~{_dd_total_combos*3}s")
+
+        if st.button("🔎 Deep Scan", type="primary", key="btn_dd_scan"):
+            _dd_fn = STRATEGY_FN.get(_dd_strategy, sig_custom)
+            _dd_results = []   # fired signals
+            _dd_approaching = []  # near signals
+
+            _dd_prog = st.progress(0); _dd_stat = st.empty(); _dd_idx = 0
+            _mins_map_dd = {"1m":1,"5m":5,"15m":15,"30m":30,"1h":60,"4h":240,"1d":1440,"1wk":10080}
+            _wide_lb_dd  = {"Elliott Wave (Simplified)":20,"Elliott Wave v2 (Swing+Fib)":10,
+                             "Elliott Wave v3 (Extrema)":5}
+            _sig_lb_dd   = _wide_lb_dd.get(_dd_strategy, 3)
+
+            _now_dd = datetime.now(_IST)
+
+            for _ddiv, _ddpds in _DD_MATRIX.items():
+                for _ddpd in _ddpds:
+                    _dd_idx += 1
+                    _dd_stat.caption(f"Scanning {_dd_sym} | {_ddiv} | {_ddpd} "
+                                     f"({_dd_idx}/{_dd_total_combos})…")
+                    _dd_prog.progress(_dd_idx / _dd_total_combos)
+                    try:
+                        time.sleep(1.5)
+                        _ddraw = yf.download(_dd_sym, period=_ddpd,
+                            interval=YF_IV.get(_ddiv, _ddiv),
+                            progress=False, auto_adjust=True)
+                        if _ddraw is None or _ddraw.empty: continue
+                        _dddf = _flatten(_ddraw)
+                        if _ddiv == "4h": _dddf = _r4h(_dddf)
+                        if len(_dddf) < 10: continue
+
+                        try:
+                            _ddsigs, _ddindics = _dd_fn(_dddf, **_dd_params)
+                        except: continue
+
+                        _ddn       = len(_dddf)
+                        _ddltp     = float(_dddf["Close"].iloc[-1])
+                        _dd_bar_mins = _mins_map_dd.get(_ddiv, 5)
+
+                        # ── Market-closed detection ────────────────────────────
+                        try:
+                            _dd_last_ts = _dddf.index[-1]
+                            if hasattr(_dd_last_ts,'tzinfo') and _dd_last_ts.tzinfo is None:
+                                _dd_last_ts = _IST.localize(_dd_last_ts.to_pydatetime())
+                            elif hasattr(_dd_last_ts,'tzinfo') and _dd_last_ts.tzinfo is not None:
+                                _dd_last_ts = _dd_last_ts.to_pydatetime().astimezone(_IST)
+                            _dd_bar_age = (_now_dd - _dd_last_ts).total_seconds() / 60
+                            _dd_mkt_closed = _dd_bar_age > _dd_bar_mins * 1.5
+                        except: _dd_mkt_closed = True
+
+                        # ── Find most recent signal ────────────────────────────
+                        _dd_last_sig = 0; _dd_bars_ago = 0
+                        _dd_sig_dt = None; _dd_sig_px = None
+                        _dd_sig_lo = None; _dd_sig_hi = None
+                        for _ddi in range(1, max(_sig_lb_dd, _dd_lookback) + 2):
+                            if _ddn > _ddi and int(_ddsigs.iloc[-_ddi]) != 0:
+                                _dd_last_sig = int(_ddsigs.iloc[-_ddi])
+                                _dd_bars_ago = _ddi - 1
+                                try:
+                                    _dd_sig_dt  = _dddf.index[-_ddi]
+                                    _dd_sig_px  = float(_dddf["Close"].iloc[-_ddi])
+                                    _dd_sig_lo  = float(_dddf["Low"].iloc[-_ddi])
+                                    _dd_sig_hi  = float(_dddf["High"].iloc[-_ddi])
+                                except: pass
+                                break
+
+                        if _dd_last_sig != 0 and _dd_sig_dt is not None:
+                            # Signal age
+                            try:
+                                _ddts = _dd_sig_dt
+                                if hasattr(_ddts,'tzinfo') and _ddts.tzinfo is None:
+                                    _ddts = _IST.localize(_ddts.to_pydatetime())
+                                elif hasattr(_ddts,'tzinfo') and _ddts.tzinfo is not None:
+                                    _ddts = _ddts.to_pydatetime().astimezone(_IST)
+                                _dd_age_mins  = (_now_dd - _ddts).total_seconds() / 60
+                                _dd_age_str   = (f"{int(_dd_age_mins//60)}h {int(_dd_age_mins%60)}m"
+                                                 if _dd_age_mins >= 60 else f"{int(_dd_age_mins)}m")
+                            except: _dd_age_mins=0; _dd_age_str="?"
+
+                            # Signal levels (at signal bar)
+                            _dd_sl_at_sig  = _dd_sig_px - _dd_last_sig * _dd_sl
+                            _dd_tgt_at_sig = _dd_sig_px + _dd_last_sig * _dd_tgt
+
+                            # Price movement since signal in signal direction
+                            _dd_moved      = (_ddltp - _dd_sig_px) * _dd_last_sig  # +ve = favorable
+                            _dd_moved_pts  = round(_dd_moved, 2)
+
+                            # How far from current price to original SL and Target
+                            _dd_dist_sl  = (_ddltp - _dd_sl_at_sig) * _dd_last_sig   # +ve = SL not yet hit
+                            _dd_dist_tgt = (_dd_tgt_at_sig - _ddltp) * _dd_last_sig  # +ve = target not hit
+                            _dd_dist_sl  = round(_dd_dist_sl, 2)
+                            _dd_dist_tgt = round(_dd_dist_tgt, 2)
+
+                            # If you enter NOW at LTP
+                            _dd_sl_now  = _ddltp - _dd_last_sig * _dd_sl
+                            _dd_tgt_now = _ddltp + _dd_last_sig * _dd_tgt
+                            _dd_remaining_tgt = max(0, _dd_tgt - max(0, _dd_moved_pts))
+                            _dd_tgt_pct_left  = round(_dd_remaining_tgt / max(_dd_tgt,0.01) * 100, 1)
+
+                            # Status: has SL been hit? Target hit?
+                            _dd_sl_hit  = _dd_dist_sl < 0
+                            _dd_tgt_hit = _dd_dist_tgt < 0
+                            if _dd_tgt_hit:
+                                _dd_status = "🎯 TARGET HIT"
+                                _dd_color  = "success"
+                            elif _dd_sl_hit:
+                                _dd_status = "🛑 SL HIT"
+                                _dd_color  = "error"
+                            elif _dd_moved_pts > _dd_tgt * 0.6:
+                                _dd_status = "🔥 ALMOST TARGET"
+                                _dd_color  = "success"
+                            elif _dd_moved_pts > 0:
+                                _dd_status = "✅ IN PROFIT"
+                                _dd_color  = "success"
+                            elif _dd_moved_pts > -_dd_sl * 0.5:
+                                _dd_status = "⚠️ SMALL PULLBACK"
+                                _dd_color  = "warning"
+                            else:
+                                _dd_status = "❌ NEAR SL"
+                                _dd_color  = "error"
+
+                            # Entry advice
+                            if _dd_tgt_hit or _dd_sl_hit:
+                                _dd_advice = "SKIP — trade already closed"
+                            elif _dd_tgt_pct_left < 20:
+                                _dd_advice = "SKIP — only {:.0f}% of target left".format(_dd_tgt_pct_left)
+                            elif _dd_tgt_pct_left >= 70:
+                                _dd_advice = "ENTER — most of target still available"
+                            else:
+                                _dd_advice = "CONSIDER — {:.0f}% target remaining".format(_dd_tgt_pct_left)
+
+                            _dd_results.append({
+                                "_iv":          _ddiv,
+                                "_pd":          _ddpd,
+                                "_sig":         _dd_last_sig,
+                                "_moved":       _dd_moved_pts,
+                                "_tgt_pct":     _dd_tgt_pct_left,
+                                "_color":       _dd_color,
+                                "_sl_hit":      _dd_sl_hit,
+                                "_tgt_hit":     _dd_tgt_hit,
+                                "Timeframe":    _ddiv,
+                                "Period":       _ddpd,
+                                "Direction":    "🟢 LONG" if _dd_last_sig==1 else "🔴 SHORT",
+                                "Status":       _dd_status,
+                                "Signal Time":  to_ist(_dd_sig_dt),
+                                "Age":          _dd_age_str,
+                                "Age (min)":    round(_dd_age_mins,1),
+                                "Signal Price": round(_dd_sig_px, 2),
+                                "SL at Signal": round(_dd_sl_at_sig, 2),
+                                "Tgt at Signal":round(_dd_tgt_at_sig, 2),
+                                "Current LTP":  round(_ddltp, 2),
+                                "Moved (pts)":  _dd_moved_pts,
+                                "Dist to SL":   _dd_dist_sl,
+                                "Dist to Tgt":  _dd_dist_tgt,
+                                "Bars Ago":     _dd_bars_ago,
+                                "SL if Enter":  round(_dd_sl_now, 2),
+                                "Tgt if Enter": round(_dd_tgt_now, 2),
+                                "Tgt % Left":   _dd_tgt_pct_left,
+                                "Remaining Tgt":round(_dd_remaining_tgt, 2),
+                                "Advice":       _dd_advice,
+                            })
+
+                        elif _dd_show_approaching and _dd_last_sig == 0:
+                            # Check EW approach progress
+                            if "Elliott Wave" in _dd_strategy:
+                                try:
+                                    _dd_ewd = _ew_diagnostics(_dddf,
+                                        min_wave_pct=float(_dd_params.get("min_wave_pct",0.5)))
+                                    _pf = min(100, int(_dd_ewd["pivot_flip_pct"]))
+                                    if _pf >= 40:
+                                        _dd_approaching.append({
+                                            "_iv": _ddiv, "_pd": _ddpd,
+                                            "Timeframe": _ddiv, "Period": _ddpd,
+                                            "Progress": f"{_pf}%",
+                                            "Next Pivot": "LOW ↓" if _dd_ewd["last_confirmed_dir"]==1 else "HIGH ↑",
+                                            "Last Confirmed Pivot": f"{_dd_ewd['last_confirmed_px']:.2f}",
+                                            "LTP": round(_ddltp,2),
+                                            "Move Needed": f"{_dd_ewd['pct_remaining']:.2f}%",
+                                        })
+                                except: pass
+
+                    except: pass
+
+            _dd_prog.empty(); _dd_stat.empty()
+
+            # Sort: active trades first (not sl/tgt hit), then by target % left desc
+            _dd_results.sort(key=lambda r: (
+                1 if (r["_sl_hit"] or r["_tgt_hit"]) else 0,
+                -r["_tgt_pct"]
+            ))
+            st.session_state["dd_results"]   = _dd_results
+            st.session_state["dd_approach"]  = _dd_approaching
+            st.session_state["dd_meta"]      = {
+                "sym":_dd_sym,"strategy":_dd_strategy,"sl":_dd_sl,"tgt":_dd_tgt
+            }
+
+        # ── Display ────────────────────────────────────────────────────────────
+        _ddr  = st.session_state.get("dd_results")
+        _dda  = st.session_state.get("dd_approach",[])
+        _ddm  = st.session_state.get("dd_meta",{})
+
+        if _ddr is not None:
+            _ddm_sym  = _ddm.get("sym","")
+            _ddm_strat= _ddm.get("strategy","")
+            _ddm_sl   = _ddm.get("sl",10)
+            _ddm_tgt  = _ddm.get("tgt",20)
+
+            # Summary
+            _active  = [r for r in _ddr if not r["_sl_hit"] and not r["_tgt_hit"]]
+            _sl_hit  = [r for r in _ddr if r["_sl_hit"]]
+            _tgt_hit = [r for r in _ddr if r["_tgt_hit"]]
+
+            st.markdown(f"### 📊 Scan results for **{_ddm_sym}** using **{_ddm_strat}**")
+            _s1,_s2,_s3,_s4,_s5 = st.columns(5)
+            _s1.metric("Total Fired",   len(_ddr))
+            _s2.metric("✅ Active",      len(_active))
+            _s3.metric("🎯 Target Hit", len(_tgt_hit))
+            _s4.metric("🛑 SL Hit",     len(_sl_hit))
+            _s5.metric("⚡ Approaching", len(_dda))
+
+            if not _ddr:
+                st.info("No signals found. Try increasing the lookback slider or choosing a different strategy.")
+            else:
+                # ── Active signals (most valuable) ──────────────────────────────
+                st.markdown("---")
+                st.markdown("### 🟢🔴 Active Signals — Trade Still Running")
+                if _active:
+                    st.caption("Signals where neither SL nor Target has been hit yet. "
+                               "Green advice = still worth entering. Red = skip.")
+                    for _ri, _row in enumerate(_active):
+                        _clr = _row["_color"]
+                        # Header row
+                        _hd = st.columns([0.8,0.8,1,1,1,1,1,1,1,2])
+                        _hd[0].markdown(f"**{_row['Timeframe']}**")
+                        _hd[1].markdown(f"_{_row['Period']}_")
+                        _hd[2].markdown(f"{_row['Direction']}")
+                        _hd[3].markdown(f"{_row['Status']}")
+                        _hd[4].markdown(f"Age: **{_row['Age']}**")
+                        _hd[5].markdown(f"Moved: **{_row['Moved (pts)']:+.1f}pts**")
+                        _hd[6].markdown(f"Tgt left: **{_row['Tgt % Left']:.0f}%**")
+                        _hd[7].markdown(f"LTP: {_row['Current LTP']}")
+                        _hd[8].markdown(f"Dist SL: {_row['Dist to SL']:.1f}pt")
+                        _ddsd = "BUY" if _row["_sig"]==1 else "SELL"
+                        if _hd[9].button(
+                            f"{'🟢' if _ddsd=='BUY' else '🔴'} Apply → Live",
+                            key=f"dd_apply_{_ri}_{_row['Timeframe']}_{_row['Period']}",
+                            type="primary" if _row['_tgt_pct']>=50 else "secondary"
+                        ):
+                            _nte_apply_to_live(
+                                ticker_sym  =_ddm_sym, ticker_label=_ddm_sym,
+                                sig_direction=_ddsd,
+                                iv=_row["Timeframe"], pd_val=_row["Period"],
+                                strat=_ddm_strat,
+                            )
+                            st.rerun()
+
+                        # Detail expander
+                        with st.expander(
+                            f"📋 {_row['Timeframe']}/{_row['Period']} — Full Details",
+                            expanded=(_ri==0 and _row['_tgt_pct']>=50)
+                        ):
+                            _dc = st.columns(4)
+                            _dc[0].markdown(f"**Signal Fired**")
+                            _dc[0].markdown(f"Time: `{_row['Signal Time']}`")
+                            _dc[0].markdown(f"Price: `{_row['Signal Price']}`")
+                            _dc[0].markdown(f"Bars ago: `{_row['Bars Ago']}`")
+
+                            _dc[1].markdown(f"**At Signal**")
+                            _dc[1].markdown(f"SL: `{_row['SL at Signal']}`")
+                            _dc[1].markdown(f"Target: `{_row['Tgt at Signal']}`")
+                            _dc[1].markdown(f"R:R: `1:{_ddm_tgt/_ddm_sl:.1f}`")
+
+                            _dc[2].markdown(f"**Right Now**")
+                            _dc[2].markdown(f"LTP: `{_row['Current LTP']}`")
+                            _dc[2].markdown(f"Dist to SL: `{_row['Dist to SL']:.2f}pts`")
+                            _dc[2].markdown(f"Dist to Tgt: `{_row['Dist to Tgt']:.2f}pts`")
+                            _dc[2].markdown(f"Tgt % Left: `{_row['Tgt % Left']:.1f}%`")
+
+                            _dc[3].markdown(f"**If You Enter Now**")
+                            _dc[3].markdown(f"Entry: `{_row['Current LTP']}`")
+                            _dc[3].markdown(f"SL: `{_row['SL if Enter']}`")
+                            _dc[3].markdown(f"Tgt: `{_row['Tgt if Enter']}`")
+                            _dc[3].markdown(f"Remaining Tgt: `{_row['Remaining Tgt']:.1f}pts`")
+
+                            # Advice box
+                            _adv = _row["Advice"]
+                            if "ENTER" in _adv:
+                                st.success(
+                                    f"✅ **{_adv}**\n\n"
+                                    f"Signal fired **{_row['Age']} ago** at `{_row['Signal Price']}`. "
+                                    f"Price moved **{_row['Moved (pts)']:+.1f} pts** in signal direction — "
+                                    f"**{_row['Tgt % Left']:.0f}% of target ({_row['Remaining Tgt']:.1f}pts) still available**.\n\n"
+                                    f"Enter at `{_row['Current LTP']}` | "
+                                    f"SL: `{_row['SL if Enter']}` | "
+                                    f"Target: `{_row['Tgt if Enter']}` | "
+                                    f"Remaining R:R ≈ 1:{_row['Remaining Tgt']/_ddm_sl:.1f}"
+                                )
+                            elif "CONSIDER" in _adv:
+                                st.warning(
+                                    f"⚠️ **{_adv}**\n\n"
+                                    f"Signal fired **{_row['Age']} ago**. Only **{_row['Tgt % Left']:.0f}%** "
+                                    f"of target left ({_row['Remaining Tgt']:.1f}pts). "
+                                    f"Enter with **50% position size** only. "
+                                    f"SL: `{_row['SL if Enter']}` | Target: `{_row['Tgt if Enter']}`"
+                                )
+                            else:
+                                st.error(
+                                    f"🔴 **{_adv}**\n\n"
+                                    f"Less than 20% of target remaining or trade effectively over. "
+                                    f"Wait for the next fresh signal on this combo."
+                                )
+                else:
+                    st.info("No active (open) signals found — all signals on this ticker have either hit SL, hit Target, or are too stale.")
+
+                # ── Completed trades (SL/Target hit) ────────────────────────────
+                if _tgt_hit or _sl_hit:
+                    with st.expander(f"📜 Completed Signals (🎯 {len(_tgt_hit)} target hit | 🛑 {len(_sl_hit)} SL hit)"):
+                        _completed = sorted(_tgt_hit + _sl_hit,
+                                            key=lambda r: r["Age (min)"])
+                        _cpdf = pd.DataFrame([
+                            {k:v for k,v in r.items() if not k.startswith("_")}
+                            for r in _completed
+                        ])
+                        def _cp_color(v):
+                            if "TARGET" in str(v) or "PROFIT" in str(v): return "color:#2e7d32;font-weight:bold"
+                            if "SL" in str(v) or "NEAR" in str(v): return "color:#c62828;font-weight:bold"
+                            return ""
+                        st.dataframe(_cpdf.style.map(_cp_color, subset=["Status"]),
+                                     use_container_width=True,
+                                     column_config={
+                                         "Signal Time": st.column_config.TextColumn("Signal Time (IST)", width="large"),
+                                     })
+
+            # ── Approaching signals ─────────────────────────────────────────────
+            if _dda:
+                st.markdown("---")
+                st.markdown("### ⚡ Approaching Signals (Elliott Wave progress ≥ 40%)")
+                _adf = pd.DataFrame(_dda)
+                st.dataframe(_adf, use_container_width=True)
+
+        else:
+            st.info(
+                "Select a ticker and strategy above, then click **🔎 Deep Scan**.\n\n"
+                "The scanner will check every timeframe/period combination and show you:\n"
+                "- Every signal that fired recently and whether it's still worth entering\n"
+                "- How much the price has already moved and how much target is left\n"
+                "- Exact entry/SL/target levels if you enter right now\n"
+                "- One-click Apply to configure sidebar and live trading"
             )
