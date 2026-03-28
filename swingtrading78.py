@@ -32,6 +32,20 @@ except ImportError:
         except: return str(dt)[:19]
 warnings.filterwarnings("ignore")
 
+# ══════════════════════════════════════════════════════════════════════════════
+# ██  EDIT THESE TWO LINES TO UPDATE YOUR DHAN CREDENTIALS  ██████████████████
+# ══════════════════════════════════════════════════════════════════════════════
+DHAN_CLIENT_ID = "1104779876"
+DHAN_ACCESS_TOKEN = (
+    "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzUxMiJ9"
+    ".eyJpc3MiOiJkaGFuIiwicGFydG5lcklkIjoiIiwiZXhwIjoxNzczODAyMDg2"
+    ",\"aWF0IjoxNzczNzE1Njg2LCJ0b2tlbkNvbnN1bWVyVHlwZSI6IlNFTEYiLCJ3"
+    "ZWJob29rVXJsIjoiIiwiZGhhbkNsaWVudElkIjoiMTEwNDc3OTg3NiJ9"
+    ".L5ULyf8AfeaoZS_kn95rtQZ6qNRJF3EUimCJw_8q12k2FZHEGEPNySKrYOBP9"
+    "vRfBHKvEqWoB0ZC7GRUd7zyMg"
+)
+# ══════════════════════════════════════════════════════════════════════════════
+
 st.set_page_config(page_title="AlgoTrader Pro", layout="wide", initial_sidebar_state="expanded")
 _HAS_FRAGMENT = hasattr(st, "fragment")
 
@@ -2330,9 +2344,9 @@ with st.sidebar:
     st.subheader("🔌 Dhan Broker")
     dhan_enabled=st.checkbox("Enable Dhan Broker",value=False,key="dhan_enabled")
     if dhan_enabled:
-        dhan_client=st.text_input("Client ID","1104779876",key="dhan_client")
-        _DEFAULT_TOKEN = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzUxMiJ9.eyJpc3MiOiJkaGFuIiwicGFydG5lcklkIjoiIiwiZXhwIjoxNzczODAyMDg2LCJpYXQiOjE3NzM3MTU2ODYsInRva2VuQ29uc3VtZXJUeXBlIjoiU0VMRiIsIndlYmhvb2tVcmwiOiIiLCJkaGFuQ2xpZW50SWQiOiIxMTA0Nzc5ODc2In0.L5ULyf8AfeaoZS_kn95rtQZ6qNRJF3EUimCJw_8q12k2FZHEGEPNySKrYOBP9vRfBHKvEqWoB0ZC7GRUd7zyMg"
-        dhan_token =st.text_input("Access Token",_DEFAULT_TOKEN,key="dhan_token",type="password")
+        dhan_client=st.text_input("Client ID", DHAN_CLIENT_ID, key="dhan_client")
+        dhan_token =st.text_input("Access Token", DHAN_ACCESS_TOKEN, key="dhan_token", type="password")
+        st.caption(f"💡 Edit `DHAN_CLIENT_ID` and `DHAN_ACCESS_TOKEN` at the top of the .py file to change credentials permanently.")
         st.caption("**Order type — always BUYER (never seller in options)**")
         is_stocks=st.checkbox("Stocks / Intraday mode  (uncheck = Options CE/PE buyer)",value=False,key="dhan_is_stocks")
         if is_stocks:
@@ -2873,12 +2887,13 @@ with tab_live:
         pos = st.session_state.live_position
 
         # ── Persist signal state so the panel survives page redraws ──────────
-        # Each tick we update the stored signal. The panel reads from session_state
-        # so it shows the last known signal even if last_sig momentarily reads 0
-        # due to a data fetch that returned slightly different data.
+        # Signal state is stored in session_state keyed by ticker.
+        # It is preserved across ALL ticks including when pos is open,
+        # so the timing panel stays visible throughout the position life.
+        # It is only cleared when a new trade is LOGGED (fingerprint changes).
         _sig_key = f"_live_sig_{sym}"
         if last_sig != 0 and _sig_bar_dt is not None:
-            # Fresh or known signal — store it
+            # Store/update the latest signal
             st.session_state[_sig_key] = {
                 "sig":        last_sig,
                 "bars_ago":   _sig_bars_ago,
@@ -2886,21 +2901,21 @@ with tab_live:
                 "bar_price":  _sig_bar_price,
                 "bar_low":    float(lv_df["Low"].iloc[-(_sig_bars_ago+1)]) if lv_n > _sig_bars_ago+1 else _sig_bar_price - 10,
                 "bar_high":   float(lv_df["High"].iloc[-(_sig_bars_ago+1)]) if lv_n > _sig_bars_ago+1 else _sig_bar_price + 10,
-                "stored_tick":tick,
+                "stored_tick": tick,
             }
-        # Use stored signal if current scan returned nothing (transient data gap)
+        # Use stored signal when current scan returns 0 (transient data gap)
+        # — works whether flat OR in a position so panel stays visible
         _stored_sig = st.session_state.get(_sig_key, {})
-        if last_sig == 0 and _stored_sig and pos is None:
-            # Re-use stored signal; update bars_ago relative to current bar count
-            _stored_bars_ago = _stored_sig.get("bars_ago", 0)
+        if last_sig == 0 and _stored_sig:
+            _stored_bars_ago   = _stored_sig.get("bars_ago", 0)
             _ticks_since_store = tick - _stored_sig.get("stored_tick", tick)
             last_sig        = _stored_sig["sig"]
             _sig_bars_ago   = _stored_bars_ago + _ticks_since_store
             _sig_bar_dt     = _stored_sig["bar_dt"]
             _sig_bar_price  = _stored_sig["bar_price"]
-        # Clear stored signal once position opens (so it doesn't show after entry)
-        if pos is not None:
-            st.session_state[_sig_key] = {}
+        # Clear only when a NEW TRADE fingerprint is logged (i.e. a fresh signal on
+        # a different bar replaces the old one — handled naturally by the store above)
+        # Do NOT clear just because pos is not None — that caused the panel to disappear.
 
         # ── Price row ─────────────────────────────────────────────────────────
         m=st.columns(6)
@@ -6031,7 +6046,18 @@ with tab_nte:
         )
         _dd_sl  = _dd_c2.number_input("SL (pts)",  0.1, 1e6, 10.0, step=0.5, key="dd_sl")
         _dd_tgt = _dd_c2.number_input("Tgt (pts)", 0.1, 1e6, 20.0, step=0.5, key="dd_tgt")
+        _dd_mwp = _dd_c2.number_input(
+            "Min Wave % (EW only)",
+            min_value=0.05, max_value=10.0, value=0.5, step=0.05,
+            key="dd_mwp",
+            help="Min wave percentage for Elliott Wave zigzag detection. "
+                 "Default 0.5% matches Elliott Wave (Simplified) default. "
+                 "Lower = more signals. Use 0.2-0.5% for 1m/5m, 0.5-1.0% for 15m/1h."
+        )
         _dd_params = {**sb_params}
+        # Override min_wave_pct in params with the DD-specific value when using EW
+        if "Elliott Wave" in _dd_strategy:
+            _dd_params["min_wave_pct"] = _dd_mwp
 
         _dd_lookback = _dd_c3.slider("Signal lookback (bars)", 1, 50, 20, key="dd_lookback",
             help="How many recent bars to search for the most recent signal.")
@@ -6224,7 +6250,7 @@ with tab_nte:
                             if "Elliott Wave" in _dd_strategy:
                                 try:
                                     _dd_ewd = _ew_diagnostics(_dddf,
-                                        min_wave_pct=float(_dd_params.get("min_wave_pct",0.5)))
+                                        min_wave_pct=float(_dd_mwp))
                                     _pf = min(100, int(_dd_ewd["pivot_flip_pct"]))
                                     if _pf >= 40:
                                         _dd_approaching.append({
@@ -6250,7 +6276,7 @@ with tab_nte:
             st.session_state["dd_results"]   = _dd_results
             st.session_state["dd_approach"]  = _dd_approaching
             st.session_state["dd_meta"]      = {
-                "sym":_dd_sym,"strategy":_dd_strategy,"sl":_dd_sl,"tgt":_dd_tgt
+                "sym":_dd_sym,"strategy":_dd_strategy,"sl":_dd_sl,"tgt":_dd_tgt,"mwp":_dd_mwp
             }
 
         # ── Display ────────────────────────────────────────────────────────────
@@ -6394,8 +6420,38 @@ with tab_nte:
             if _dda:
                 st.markdown("---")
                 st.markdown("### ⚡ Approaching Signals (Elliott Wave progress ≥ 40%)")
-                _adf = pd.DataFrame(_dda)
-                st.dataframe(_adf, use_container_width=True)
+                st.caption("These combos haven't fired yet but are building toward a signal. "
+                           "Apply one to Live Trading and monitor — signal may fire soon.")
+                for _dai, _darow in enumerate(_dda):
+                    _da_cols = st.columns([1,1,1,1.5,1.5,1.5,2])
+                    _da_cols[0].markdown(f"**{_darow['Timeframe']}**")
+                    _da_cols[1].markdown(f"_{_darow['Period']}_")
+                    _da_cols[2].markdown(f"Progress: **{_darow['Progress']}**")
+                    _da_cols[3].markdown(f"Next: {_darow['Next Pivot']}")
+                    _da_cols[4].markdown(f"Last pivot: {_darow['Last Confirmed Pivot']}")
+                    _da_cols[5].markdown(f"Need: {_darow['Move Needed']} more")
+                    if _da_cols[6].button(
+                        f"📡 Apply → Live+BT",
+                        key=f"dd_appr_{_dai}_{_darow['Timeframe']}_{_darow['Period']}",
+                        type="secondary"
+                    ):
+                        # Determine expected signal direction from next pivot type
+                        _appr_dir = "BUY" if _darow["Next Pivot"] == "LOW ↓" else "SELL"
+                        _nte_apply_to_live(
+                            ticker_sym   = _ddm_sym,
+                            ticker_label = _ddm_sym,
+                            sig_direction= _appr_dir,
+                            iv           = _darow["Timeframe"],
+                            pd_val       = _darow["Period"],
+                            strat        = _ddm_strat,
+                        )
+                        # Also set min_wave_pct in session state for EW
+                        if "Elliott Wave" in _ddm_strat:
+                            st.session_state["sb_ewpct"] = _ddm.get("mwp", 0.5)
+                        st.success(f"✅ Applied {_darow['Timeframe']}/{_darow['Period']} → "
+                                   f"Switch to ⚡ Live Trading and start monitoring. "
+                                   f"Signal is {_darow['Progress']} of the way to firing.")
+                        st.rerun()
 
         else:
             st.info(
