@@ -6019,6 +6019,18 @@ with tab_nte:
         # ── Inputs ────────────────────────────────────────────────────────────
         _dd_c1, _dd_c2, _dd_c3 = st.columns(3)
 
+        # Define scan matrix FIRST so _dd_total_combos is available for the info message
+        _DD_MATRIX = {
+            "1m":  ["1d","5d","7d"],
+            "5m":  ["1d","5d","7d","1mo"],
+            "15m": ["1d","5d","7d","1mo"],
+            "1h":  ["1d","5d","7d","1mo","3mo","6mo","1y","2y"],
+            "4h":  ["1d","5d","7d","1mo","3mo","6mo","1y","2y"],
+            "1d":  ["5d","7d","1mo","3mo","6mo","1y","2y","5y"],
+            "1wk": ["1d","5d","7d","1mo","3mo","6mo","1y","2y","5y","10y"],
+        }
+        _dd_total_combos = sum(len(v) for v in _DD_MATRIX.values())
+
         # Build dropdown: All Nifty 50 (new) + Custom + TICKER_MAP + individual Nifty50 stocks
         _dd_all_choices = (
             ["All Nifty 50 Stocks", "Custom"]
@@ -6030,8 +6042,8 @@ with tab_nte:
             index=0, key="dd_ticker_choice"
         )
         if _dd_ticker_choice == "All Nifty 50 Stocks":
-            _dd_symbols = list(NIFTY50_STOCKS.values())   # list of Yahoo symbols
-            _dd_sym     = "All Nifty 50"                  # display label
+            _dd_symbols = list(NIFTY50_STOCKS.values())
+            _dd_sym     = "All Nifty 50"
             _dd_c1.caption(f"Will scan all **{len(_dd_symbols)} Nifty 50 stocks** × every TF/period combo.")
             _dd_c1.info(
                 f"⚠️ **Large scan** — {len(_dd_symbols)} stocks × {_dd_total_combos} combos = "
@@ -6084,17 +6096,6 @@ with tab_nte:
             "1d: 5d,7d,1mo,3mo,6mo,1y,2y,5y | 1wk: 1d,5d,7d,1mo,3mo,6mo,1y,2y,5y,10y"
         )
 
-        # Full scan matrix
-        _DD_MATRIX = {
-            "1m":  ["1d","5d","7d"],
-            "5m":  ["1d","5d","7d","1mo"],
-            "15m": ["1d","5d","7d","1mo"],
-            "1h":  ["1d","5d","7d","1mo","3mo","6mo","1y","2y"],
-            "4h":  ["1d","5d","7d","1mo","3mo","6mo","1y","2y"],
-            "1d":  ["5d","7d","1mo","3mo","6mo","1y","2y","5y"],
-            "1wk": ["1d","5d","7d","1mo","3mo","6mo","1y","2y","5y","10y"],
-        }
-        _dd_total_combos = sum(len(v) for v in _DD_MATRIX.values())
         _dd_total_fetches = _dd_total_combos * len(_dd_symbols)
         st.caption(
             f"TF/Period combos per ticker: **{_dd_total_combos}** | "
