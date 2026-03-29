@@ -2951,7 +2951,8 @@ with tab_live:
         except: pass
 
         # ── Signal Timing Panel — detailed, anti-FOMO entry guidance ────────
-        if last_sig != 0 and _sig_bar_dt is not None and pos is None:
+        # Shows whenever there's a known signal — whether flat OR in a position.
+        if last_sig != 0 and _sig_bar_dt is not None:
             _sig_dir_label = "🟢 BUY (LONG)" if last_sig==1 else "🔴 SELL (SHORT)"
             _price_move    = cl - _sig_bar_price
             _move_vs_sl    = abs(_price_move) / max(sl_pts, 0.01)
@@ -3200,16 +3201,6 @@ with tab_live:
                 except: pass
 
             st.markdown("---")
-
-        elif last_sig != 0 and pos is not None:
-            _dir_str = "LONG" if pos["direction"]==1 else "SHORT"
-            _pos_pnl = round((cl - pos["entry"]) * pos["direction"], 2)
-            st.info(
-                f"**Position open — {_dir_str} from {pos['entry']:.2f}.** "
-                f"Unrealised P&L: **{_pos_pnl:+.2f} pts**. "
-                f"Signal timing panel is shown only when flat (no open position). "
-                f"SL: {pos['sl']:.2f} | Target: {pos['disp_tgt']:.2f}"
-            )
 
         # ── EW Next-Pivot Predictor (when freshness enabled + EW strategy) ────
         if (st.session_state.get("freshness_enabled", False) and
@@ -6028,12 +6019,22 @@ with tab_nte:
         # ── Inputs ────────────────────────────────────────────────────────────
         _dd_c1, _dd_c2, _dd_c3 = st.columns(3)
 
+        # Build dropdown: Custom + TICKER_MAP instruments + all Nifty50 stocks
+        _dd_all_choices = (
+            ["Custom"]
+            + list(TICKER_MAP.keys())
+            + [f"NSE: {name}" for name, sym in sorted(NIFTY50_STOCKS.items())]
+        )
         _dd_ticker_choice = _dd_c1.selectbox(
-            "Ticker", ["Custom"] + list(TICKER_MAP.keys()),
+            "Ticker", _dd_all_choices,
             index=0, key="dd_ticker_choice"
         )
         if _dd_ticker_choice == "Custom":
             _dd_sym = _dd_c1.text_input("Yahoo Symbol", "INFY.NS", key="dd_custom_sym").strip()
+        elif _dd_ticker_choice.startswith("NSE: "):
+            # Extract symbol from NIFTY50_STOCKS dict
+            _dd_nse_name = _dd_ticker_choice[5:]
+            _dd_sym = NIFTY50_STOCKS.get(_dd_nse_name, "INFY.NS")
         else:
             _dd_sym = TICKER_MAP[_dd_ticker_choice]
         _dd_c1.caption(f"Scanning: **{_dd_sym}**")
@@ -6435,22 +6436,41 @@ with tab_nte:
                         key=f"dd_appr_{_dai}_{_darow['Timeframe']}_{_darow['Period']}",
                         type="secondary"
                     ):
-                        # Determine expected signal direction from next pivot type
                         _appr_dir = "BUY" if _darow["Next Pivot"] == "LOW ↓" else "SELL"
-                        _nte_apply_to_live(
-                            ticker_sym   = _ddm_sym,
-                            ticker_label = _ddm_sym,
-                            sig_direction= _appr_dir,
-                            iv           = _darow["Timeframe"],
-                            pd_val       = _darow["Period"],
-                            strat        = _ddm_strat,
+                        # Build opt_applied dict so pre-populate block handles it correctly
+                        _appr_strat = _ddm_strat
+                        _appr_sym   = _ddm_sym
+                        _appr_iv    = _darow["Timeframe"]
+                        _appr_pd    = _darow["Period"]
+                        if _appr_sym in TICKER_MAP.values():
+                            _appr_tk = [k for k,v in TICKER_MAP.items() if v==_appr_sym][0]
+                            _appr_custom = ""
+                        else:
+                            _appr_tk = "Custom"; _appr_custom = _appr_sym
+                        # Build full params including mwp override
+                        _appr_params = {**_STRATEGY_DEFAULTS.get(_appr_strat,{}), **_BP}
+                        if "Elliott Wave" in _appr_strat:
+                            _appr_params["min_wave_pct"] = _ddm.get("mwp", 0.5)
+                        st.session_state["opt_applied"] = {
+                            "strategy":   _appr_strat,
+                            "instrument": _appr_tk,
+                            "custom_sym": _appr_custom,
+                            "interval":   _appr_iv,
+                            "period":     _appr_pd,
+                            "sl_type":    SL_TYPES[0],
+                            "sl_pts":     _ddm.get("sl", 10.0),
+                            "tgt_type":   TARGET_TYPES[0],
+                            "tgt_pts":    _ddm.get("tgt", 20.0),
+                            "params":     _appr_params,
+                            "accuracy":   "—",
+                            "pnl":        "—",
+                        }
+                        st.session_state["_oa_hash_prev"] = ""
+                        st.session_state["nte_applied_msg"] = (
+                            f"✅ Applied {_appr_iv}/{_appr_pd} {_appr_strat} → "
+                            f"Switch to ⚡ Live Trading and start monitoring. "
+                            f"Signal is {_darow['Progress']} of the way to firing."
                         )
-                        # Also set min_wave_pct in session state for EW
-                        if "Elliott Wave" in _ddm_strat:
-                            st.session_state["sb_ewpct"] = _ddm.get("mwp", 0.5)
-                        st.success(f"✅ Applied {_darow['Timeframe']}/{_darow['Period']} → "
-                                   f"Switch to ⚡ Live Trading and start monitoring. "
-                                   f"Signal is {_darow['Progress']} of the way to firing.")
                         st.rerun()
 
         else:
