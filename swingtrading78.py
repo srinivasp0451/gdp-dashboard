@@ -6019,9 +6019,9 @@ with tab_nte:
         # ── Inputs ────────────────────────────────────────────────────────────
         _dd_c1, _dd_c2, _dd_c3 = st.columns(3)
 
-        # Build dropdown: Custom + TICKER_MAP instruments + all Nifty50 stocks
+        # Build dropdown: All Nifty 50 (new) + Custom + TICKER_MAP + individual Nifty50 stocks
         _dd_all_choices = (
-            ["Custom"]
+            ["All Nifty 50 Stocks", "Custom"]
             + list(TICKER_MAP.keys())
             + [f"NSE: {name}" for name, sym in sorted(NIFTY50_STOCKS.items())]
         )
@@ -6029,15 +6029,27 @@ with tab_nte:
             "Ticker", _dd_all_choices,
             index=0, key="dd_ticker_choice"
         )
-        if _dd_ticker_choice == "Custom":
-            _dd_sym = _dd_c1.text_input("Yahoo Symbol", "INFY.NS", key="dd_custom_sym").strip()
+        if _dd_ticker_choice == "All Nifty 50 Stocks":
+            _dd_symbols = list(NIFTY50_STOCKS.values())   # list of Yahoo symbols
+            _dd_sym     = "All Nifty 50"                  # display label
+            _dd_c1.caption(f"Will scan all **{len(_dd_symbols)} Nifty 50 stocks** × every TF/period combo.")
+            _dd_c1.info(
+                f"⚠️ **Large scan** — {len(_dd_symbols)} stocks × {_dd_total_combos} combos = "
+                f"{len(_dd_symbols)*_dd_total_combos} fetches. Est. ~{len(_dd_symbols)*_dd_total_combos*3}s. "
+                "Only the best (most target % remaining) results per combo shown."
+            )
+        elif _dd_ticker_choice == "Custom":
+            _dd_sym     = _dd_c1.text_input("Yahoo Symbol", "INFY.NS", key="dd_custom_sym").strip()
+            _dd_symbols = [_dd_sym]
         elif _dd_ticker_choice.startswith("NSE: "):
-            # Extract symbol from NIFTY50_STOCKS dict
             _dd_nse_name = _dd_ticker_choice[5:]
-            _dd_sym = NIFTY50_STOCKS.get(_dd_nse_name, "INFY.NS")
+            _dd_sym      = NIFTY50_STOCKS.get(_dd_nse_name, "INFY.NS")
+            _dd_symbols  = [_dd_sym]
         else:
-            _dd_sym = TICKER_MAP[_dd_ticker_choice]
-        _dd_c1.caption(f"Scanning: **{_dd_sym}**")
+            _dd_sym     = TICKER_MAP[_dd_ticker_choice]
+            _dd_symbols = [_dd_sym]
+        if len(_dd_symbols) == 1:
+            _dd_c1.caption(f"Scanning: **{_dd_sym}**")
 
         _dd_strategy = _dd_c2.selectbox(
             "Strategy",
@@ -6083,189 +6095,199 @@ with tab_nte:
             "1wk": ["1d","5d","7d","1mo","3mo","6mo","1y","2y","5y","10y"],
         }
         _dd_total_combos = sum(len(v) for v in _DD_MATRIX.values())
-        st.caption(f"Total combinations to scan: **{_dd_total_combos}** — rate-limited 1.5s each. "
-                   f"Est. time: ~{_dd_total_combos*3}s")
+        _dd_total_fetches = _dd_total_combos * len(_dd_symbols)
+        st.caption(
+            f"TF/Period combos per ticker: **{_dd_total_combos}** | "
+            f"Tickers: **{len(_dd_symbols)}** | "
+            f"Total fetches: **{_dd_total_fetches}** | "
+            f"Est. time: ~{_dd_total_fetches*3}s"
+        )
 
         if st.button("🔎 Deep Scan", type="primary", key="btn_dd_scan"):
             _dd_fn = STRATEGY_FN.get(_dd_strategy, sig_custom)
-            _dd_results = []   # fired signals
-            _dd_approaching = []  # near signals
+            _dd_results = []
+            _dd_approaching = []
 
             _dd_prog = st.progress(0); _dd_stat = st.empty(); _dd_idx = 0
             _mins_map_dd = {"1m":1,"5m":5,"15m":15,"30m":30,"1h":60,"4h":240,"1d":1440,"1wk":10080}
             _wide_lb_dd  = {"Elliott Wave (Simplified)":20,"Elliott Wave v2 (Swing+Fib)":10,
                              "Elliott Wave v3 (Extrema)":5}
             _sig_lb_dd   = _wide_lb_dd.get(_dd_strategy, 3)
-
             _now_dd = datetime.now(_IST)
+            _dd_total_all = _dd_total_combos * len(_dd_symbols)
 
-            for _ddiv, _ddpds in _DD_MATRIX.items():
-                for _ddpd in _ddpds:
-                    _dd_idx += 1
-                    _dd_stat.caption(f"Scanning {_dd_sym} | {_ddiv} | {_ddpd} "
-                                     f"({_dd_idx}/{_dd_total_combos})…")
-                    _dd_prog.progress(_dd_idx / _dd_total_combos)
-                    try:
-                        time.sleep(1.5)
-                        _ddraw = yf.download(_dd_sym, period=_ddpd,
-                            interval=YF_IV.get(_ddiv, _ddiv),
-                            progress=False, auto_adjust=True)
-                        if _ddraw is None or _ddraw.empty: continue
-                        _dddf = _flatten(_ddraw)
-                        if _ddiv == "4h": _dddf = _r4h(_dddf)
-                        if len(_dddf) < 10: continue
-
+            for _ddsym_cur in _dd_symbols:
+                for _ddiv, _ddpds in _DD_MATRIX.items():
+                    for _ddpd in _ddpds:
+                        _dd_idx += 1
+                        _dd_stat.caption(
+                            f"Scanning **{_ddsym_cur}** | {_ddiv} | {_ddpd} "
+                            f"({_dd_idx}/{_dd_total_all})…"
+                        )
+                        _dd_prog.progress(_dd_idx / _dd_total_all)
                         try:
-                            _ddsigs, _ddindics = _dd_fn(_dddf, **_dd_params)
-                        except: continue
+                            time.sleep(1.5)
+                            _ddraw = yf.download(_ddsym_cur, period=_ddpd,
+                                interval=YF_IV.get(_ddiv, _ddiv),
+                                progress=False, auto_adjust=True)
+                            if _ddraw is None or _ddraw.empty: continue
+                            _dddf = _flatten(_ddraw)
+                            if _ddiv == "4h": _dddf = _r4h(_dddf)
+                            if len(_dddf) < 10: continue
 
-                        _ddn       = len(_dddf)
-                        _ddltp     = float(_dddf["Close"].iloc[-1])
-                        _dd_bar_mins = _mins_map_dd.get(_ddiv, 5)
+                            try:
+                                _ddsigs, _ddindics = _dd_fn(_dddf, **_dd_params)
+                            except: continue
 
-                        # ── Market-closed detection ────────────────────────────
-                        try:
-                            _dd_last_ts = _dddf.index[-1]
-                            if hasattr(_dd_last_ts,'tzinfo') and _dd_last_ts.tzinfo is None:
-                                _dd_last_ts = _IST.localize(_dd_last_ts.to_pydatetime())
-                            elif hasattr(_dd_last_ts,'tzinfo') and _dd_last_ts.tzinfo is not None:
-                                _dd_last_ts = _dd_last_ts.to_pydatetime().astimezone(_IST)
-                            _dd_bar_age = (_now_dd - _dd_last_ts).total_seconds() / 60
-                            _dd_mkt_closed = _dd_bar_age > _dd_bar_mins * 1.5
-                        except: _dd_mkt_closed = True
+                            _ddn       = len(_dddf)
+                            _ddltp     = float(_dddf["Close"].iloc[-1])
+                            _dd_bar_mins = _mins_map_dd.get(_ddiv, 5)
+
+                            # ── Market-closed detection ──────────────────────────
+                            try:
+                                _dd_last_ts = _dddf.index[-1]
+                                if hasattr(_dd_last_ts,'tzinfo') and _dd_last_ts.tzinfo is None:
+                                    _dd_last_ts = _IST.localize(_dd_last_ts.to_pydatetime())
+                                elif hasattr(_dd_last_ts,'tzinfo') and _dd_last_ts.tzinfo is not None:
+                                    _dd_last_ts = _dd_last_ts.to_pydatetime().astimezone(_IST)
+                                _dd_bar_age = (_now_dd - _dd_last_ts).total_seconds() / 60
+                                _dd_mkt_closed = _dd_bar_age > _dd_bar_mins * 1.5
+                            except: _dd_mkt_closed = True
 
                         # ── Find most recent signal ────────────────────────────
-                        _dd_last_sig = 0; _dd_bars_ago = 0
-                        _dd_sig_dt = None; _dd_sig_px = None
-                        _dd_sig_lo = None; _dd_sig_hi = None
-                        for _ddi in range(1, max(_sig_lb_dd, _dd_lookback) + 2):
-                            if _ddn > _ddi and int(_ddsigs.iloc[-_ddi]) != 0:
-                                _dd_last_sig = int(_ddsigs.iloc[-_ddi])
-                                _dd_bars_ago = _ddi - 1
+                            _dd_last_sig = 0; _dd_bars_ago = 0
+                            _dd_sig_dt = None; _dd_sig_px = None
+                            _dd_sig_lo = None; _dd_sig_hi = None
+                            for _ddi in range(1, max(_sig_lb_dd, _dd_lookback) + 2):
+                                if _ddn > _ddi and int(_ddsigs.iloc[-_ddi]) != 0:
+                                    _dd_last_sig = int(_ddsigs.iloc[-_ddi])
+                                    _dd_bars_ago = _ddi - 1
+                                    try:
+                                        _dd_sig_dt  = _dddf.index[-_ddi]
+                                        _dd_sig_px  = float(_dddf["Close"].iloc[-_ddi])
+                                        _dd_sig_lo  = float(_dddf["Low"].iloc[-_ddi])
+                                        _dd_sig_hi  = float(_dddf["High"].iloc[-_ddi])
+                                    except: pass
+                                    break
+    
+                            if _dd_last_sig != 0 and _dd_sig_dt is not None:
+                                # Signal age
                                 try:
-                                    _dd_sig_dt  = _dddf.index[-_ddi]
-                                    _dd_sig_px  = float(_dddf["Close"].iloc[-_ddi])
-                                    _dd_sig_lo  = float(_dddf["Low"].iloc[-_ddi])
-                                    _dd_sig_hi  = float(_dddf["High"].iloc[-_ddi])
-                                except: pass
-                                break
-
-                        if _dd_last_sig != 0 and _dd_sig_dt is not None:
-                            # Signal age
-                            try:
-                                _ddts = _dd_sig_dt
-                                if hasattr(_ddts,'tzinfo') and _ddts.tzinfo is None:
-                                    _ddts = _IST.localize(_ddts.to_pydatetime())
-                                elif hasattr(_ddts,'tzinfo') and _ddts.tzinfo is not None:
-                                    _ddts = _ddts.to_pydatetime().astimezone(_IST)
-                                _dd_age_mins  = (_now_dd - _ddts).total_seconds() / 60
-                                _dd_age_str   = (f"{int(_dd_age_mins//60)}h {int(_dd_age_mins%60)}m"
-                                                 if _dd_age_mins >= 60 else f"{int(_dd_age_mins)}m")
-                            except: _dd_age_mins=0; _dd_age_str="?"
-
-                            # Signal levels (at signal bar)
-                            _dd_sl_at_sig  = _dd_sig_px - _dd_last_sig * _dd_sl
-                            _dd_tgt_at_sig = _dd_sig_px + _dd_last_sig * _dd_tgt
-
-                            # Price movement since signal in signal direction
-                            _dd_moved      = (_ddltp - _dd_sig_px) * _dd_last_sig  # +ve = favorable
-                            _dd_moved_pts  = round(_dd_moved, 2)
-
-                            # How far from current price to original SL and Target
-                            _dd_dist_sl  = (_ddltp - _dd_sl_at_sig) * _dd_last_sig   # +ve = SL not yet hit
-                            _dd_dist_tgt = (_dd_tgt_at_sig - _ddltp) * _dd_last_sig  # +ve = target not hit
-                            _dd_dist_sl  = round(_dd_dist_sl, 2)
-                            _dd_dist_tgt = round(_dd_dist_tgt, 2)
-
-                            # If you enter NOW at LTP
-                            _dd_sl_now  = _ddltp - _dd_last_sig * _dd_sl
-                            _dd_tgt_now = _ddltp + _dd_last_sig * _dd_tgt
-                            _dd_remaining_tgt = max(0, _dd_tgt - max(0, _dd_moved_pts))
-                            _dd_tgt_pct_left  = round(_dd_remaining_tgt / max(_dd_tgt,0.01) * 100, 1)
-
-                            # Status: has SL been hit? Target hit?
-                            _dd_sl_hit  = _dd_dist_sl < 0
-                            _dd_tgt_hit = _dd_dist_tgt < 0
-                            if _dd_tgt_hit:
-                                _dd_status = "🎯 TARGET HIT"
-                                _dd_color  = "success"
-                            elif _dd_sl_hit:
-                                _dd_status = "🛑 SL HIT"
-                                _dd_color  = "error"
-                            elif _dd_moved_pts > _dd_tgt * 0.6:
-                                _dd_status = "🔥 ALMOST TARGET"
-                                _dd_color  = "success"
-                            elif _dd_moved_pts > 0:
-                                _dd_status = "✅ IN PROFIT"
-                                _dd_color  = "success"
-                            elif _dd_moved_pts > -_dd_sl * 0.5:
-                                _dd_status = "⚠️ SMALL PULLBACK"
-                                _dd_color  = "warning"
-                            else:
-                                _dd_status = "❌ NEAR SL"
-                                _dd_color  = "error"
-
-                            # Entry advice
-                            if _dd_tgt_hit or _dd_sl_hit:
-                                _dd_advice = "SKIP — trade already closed"
-                            elif _dd_tgt_pct_left < 20:
-                                _dd_advice = "SKIP — only {:.0f}% of target left".format(_dd_tgt_pct_left)
-                            elif _dd_tgt_pct_left >= 70:
-                                _dd_advice = "ENTER — most of target still available"
-                            else:
-                                _dd_advice = "CONSIDER — {:.0f}% target remaining".format(_dd_tgt_pct_left)
-
-                            _dd_results.append({
-                                "_iv":          _ddiv,
-                                "_pd":          _ddpd,
-                                "_sig":         _dd_last_sig,
-                                "_moved":       _dd_moved_pts,
-                                "_tgt_pct":     _dd_tgt_pct_left,
-                                "_color":       _dd_color,
-                                "_sl_hit":      _dd_sl_hit,
-                                "_tgt_hit":     _dd_tgt_hit,
-                                "Timeframe":    _ddiv,
-                                "Period":       _ddpd,
-                                "Direction":    "🟢 LONG" if _dd_last_sig==1 else "🔴 SHORT",
-                                "Status":       _dd_status,
-                                "Signal Time":  to_ist(_dd_sig_dt),
-                                "Age":          _dd_age_str,
-                                "Age (min)":    round(_dd_age_mins,1),
-                                "Signal Price": round(_dd_sig_px, 2),
-                                "SL at Signal": round(_dd_sl_at_sig, 2),
-                                "Tgt at Signal":round(_dd_tgt_at_sig, 2),
-                                "Current LTP":  round(_ddltp, 2),
-                                "Moved (pts)":  _dd_moved_pts,
-                                "Dist to SL":   _dd_dist_sl,
-                                "Dist to Tgt":  _dd_dist_tgt,
-                                "Bars Ago":     _dd_bars_ago,
-                                "SL if Enter":  round(_dd_sl_now, 2),
-                                "Tgt if Enter": round(_dd_tgt_now, 2),
-                                "Tgt % Left":   _dd_tgt_pct_left,
-                                "Remaining Tgt":round(_dd_remaining_tgt, 2),
-                                "Advice":       _dd_advice,
-                            })
-
-                        elif _dd_show_approaching and _dd_last_sig == 0:
-                            # Check EW approach progress
-                            if "Elliott Wave" in _dd_strategy:
-                                try:
-                                    _dd_ewd = _ew_diagnostics(_dddf,
-                                        min_wave_pct=float(_dd_mwp))
-                                    _pf = min(100, int(_dd_ewd["pivot_flip_pct"]))
-                                    if _pf >= 40:
-                                        _dd_approaching.append({
-                                            "_iv": _ddiv, "_pd": _ddpd,
-                                            "Timeframe": _ddiv, "Period": _ddpd,
-                                            "Progress": f"{_pf}%",
-                                            "Next Pivot": "LOW ↓" if _dd_ewd["last_confirmed_dir"]==1 else "HIGH ↑",
-                                            "Last Confirmed Pivot": f"{_dd_ewd['last_confirmed_px']:.2f}",
-                                            "LTP": round(_ddltp,2),
-                                            "Move Needed": f"{_dd_ewd['pct_remaining']:.2f}%",
-                                        })
-                                except: pass
-
-                    except: pass
+                                    _ddts = _dd_sig_dt
+                                    if hasattr(_ddts,'tzinfo') and _ddts.tzinfo is None:
+                                        _ddts = _IST.localize(_ddts.to_pydatetime())
+                                    elif hasattr(_ddts,'tzinfo') and _ddts.tzinfo is not None:
+                                        _ddts = _ddts.to_pydatetime().astimezone(_IST)
+                                    _dd_age_mins  = (_now_dd - _ddts).total_seconds() / 60
+                                    _dd_age_str   = (f"{int(_dd_age_mins//60)}h {int(_dd_age_mins%60)}m"
+                                                     if _dd_age_mins >= 60 else f"{int(_dd_age_mins)}m")
+                                except: _dd_age_mins=0; _dd_age_str="?"
+    
+                                # Signal levels (at signal bar)
+                                _dd_sl_at_sig  = _dd_sig_px - _dd_last_sig * _dd_sl
+                                _dd_tgt_at_sig = _dd_sig_px + _dd_last_sig * _dd_tgt
+    
+                                # Price movement since signal in signal direction
+                                _dd_moved      = (_ddltp - _dd_sig_px) * _dd_last_sig  # +ve = favorable
+                                _dd_moved_pts  = round(_dd_moved, 2)
+    
+                                # How far from current price to original SL and Target
+                                _dd_dist_sl  = (_ddltp - _dd_sl_at_sig) * _dd_last_sig   # +ve = SL not yet hit
+                                _dd_dist_tgt = (_dd_tgt_at_sig - _ddltp) * _dd_last_sig  # +ve = target not hit
+                                _dd_dist_sl  = round(_dd_dist_sl, 2)
+                                _dd_dist_tgt = round(_dd_dist_tgt, 2)
+    
+                                # If you enter NOW at LTP
+                                _dd_sl_now  = _ddltp - _dd_last_sig * _dd_sl
+                                _dd_tgt_now = _ddltp + _dd_last_sig * _dd_tgt
+                                _dd_remaining_tgt = max(0, _dd_tgt - max(0, _dd_moved_pts))
+                                _dd_tgt_pct_left  = round(_dd_remaining_tgt / max(_dd_tgt,0.01) * 100, 1)
+    
+                                # Status: has SL been hit? Target hit?
+                                _dd_sl_hit  = _dd_dist_sl < 0
+                                _dd_tgt_hit = _dd_dist_tgt < 0
+                                if _dd_tgt_hit:
+                                    _dd_status = "🎯 TARGET HIT"
+                                    _dd_color  = "success"
+                                elif _dd_sl_hit:
+                                    _dd_status = "🛑 SL HIT"
+                                    _dd_color  = "error"
+                                elif _dd_moved_pts > _dd_tgt * 0.6:
+                                    _dd_status = "🔥 ALMOST TARGET"
+                                    _dd_color  = "success"
+                                elif _dd_moved_pts > 0:
+                                    _dd_status = "✅ IN PROFIT"
+                                    _dd_color  = "success"
+                                elif _dd_moved_pts > -_dd_sl * 0.5:
+                                    _dd_status = "⚠️ SMALL PULLBACK"
+                                    _dd_color  = "warning"
+                                else:
+                                    _dd_status = "❌ NEAR SL"
+                                    _dd_color  = "error"
+    
+                                # Entry advice
+                                if _dd_tgt_hit or _dd_sl_hit:
+                                    _dd_advice = "SKIP — trade already closed"
+                                elif _dd_tgt_pct_left < 20:
+                                    _dd_advice = "SKIP — only {:.0f}% of target left".format(_dd_tgt_pct_left)
+                                elif _dd_tgt_pct_left >= 70:
+                                    _dd_advice = "ENTER — most of target still available"
+                                else:
+                                    _dd_advice = "CONSIDER — {:.0f}% target remaining".format(_dd_tgt_pct_left)
+    
+                                _dd_results.append({
+                                    "_iv":          _ddiv,
+                                    "_pd":          _ddpd,
+                                    "_sig":         _dd_last_sig,
+                                    "_moved":       _dd_moved_pts,
+                                    "_tgt_pct":     _dd_tgt_pct_left,
+                                    "_color":       _dd_color,
+                                    "_sl_hit":      _dd_sl_hit,
+                                    "_tgt_hit":     _dd_tgt_hit,
+                                    "Ticker":       _ddsym_cur,
+                                    "Timeframe":    _ddiv,
+                                    "Period":       _ddpd,
+                                    "Direction":    "🟢 LONG" if _dd_last_sig==1 else "🔴 SHORT",
+                                    "Status":       _dd_status,
+                                    "Signal Time":  to_ist(_dd_sig_dt),
+                                    "Age":          _dd_age_str,
+                                    "Age (min)":    round(_dd_age_mins,1),
+                                    "Signal Price": round(_dd_sig_px, 2),
+                                    "SL at Signal": round(_dd_sl_at_sig, 2),
+                                    "Tgt at Signal":round(_dd_tgt_at_sig, 2),
+                                    "Current LTP":  round(_ddltp, 2),
+                                    "Moved (pts)":  _dd_moved_pts,
+                                    "Dist to SL":   _dd_dist_sl,
+                                    "Dist to Tgt":  _dd_dist_tgt,
+                                    "Bars Ago":     _dd_bars_ago,
+                                    "SL if Enter":  round(_dd_sl_now, 2),
+                                    "Tgt if Enter": round(_dd_tgt_now, 2),
+                                    "Tgt % Left":   _dd_tgt_pct_left,
+                                    "Remaining Tgt":round(_dd_remaining_tgt, 2),
+                                    "Advice":       _dd_advice,
+                                })
+    
+                            elif _dd_show_approaching and _dd_last_sig == 0:
+                                # Check EW approach progress
+                                if "Elliott Wave" in _dd_strategy:
+                                    try:
+                                        _dd_ewd = _ew_diagnostics(_dddf,
+                                            min_wave_pct=float(_dd_mwp))
+                                        _pf = min(100, int(_dd_ewd["pivot_flip_pct"]))
+                                        if _pf >= 40:
+                                            _dd_approaching.append({
+                                                "_iv": _ddiv, "_pd": _ddpd,
+                                                "Ticker":    _ddsym_cur,
+                                                "Timeframe": _ddiv, "Period": _ddpd,
+                                                "Progress": f"{_pf}%",
+                                                "Next Pivot": "LOW ↓" if _dd_ewd["last_confirmed_dir"]==1 else "HIGH ↑",
+                                                "Last Confirmed Pivot": f"{_dd_ewd['last_confirmed_px']:.2f}",
+                                                "LTP": round(_ddltp,2),
+                                                "Move Needed": f"{_dd_ewd['pct_remaining']:.2f}%",
+                                            })
+                                    except: pass
+    
+                        except: pass
 
             _dd_prog.empty(); _dd_stat.empty()
 
