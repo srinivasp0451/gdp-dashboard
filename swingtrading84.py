@@ -11,6 +11,7 @@ import plotly.graph_objects as plotly_go
 # ==========================================
 st.set_page_config(page_title="Smart Investing", layout="wide")
 
+# Initialize persistent history if not exists
 if "trade_history" not in st.session_state:
     st.session_state.trade_history = pd.DataFrame(columns=[
         "Entry Time", "Exit Time", "Type", "Entry Price", "Exit Price", 
@@ -75,6 +76,9 @@ slow_ema_val = st.sidebar.number_input("Slow EMA", value=15)
 sl_val = st.sidebar.number_input("SL Points", value=10.0)
 tgt_val = st.sidebar.number_input("Target Points", value=20.0)
 
+st.sidebar.markdown("---")
+use_dhan = st.sidebar.checkbox("Enable Dhan Broker", value=False)
+
 # ==========================================
 # MAIN UI
 # ==========================================
@@ -103,11 +107,12 @@ with tab1:
                         elif row['Low'] <= tgt_p: exit_p, reason = tgt_p, "Target Hit"
                     
                     if exit_p != 0:
-                        pnl = (exit_p - entry_p) if pos_type == 'Buy' else (entry_p - exit_p)
+                        pnl_pts = (exit_p - entry_p) if pos_type == 'Buy' else (entry_p - exit_p)
                         trades.append({
                             "Entry Time": entry_t, "Exit Time": idx, "Type": pos_type, 
                             "Entry Price": entry_p, "Exit Price": exit_p, "SL": sl_p, "Target": tgt_p,
-                            "High": row['High'], "Low": row['Low'], "PnL": pnl * qty, "Result": "Win" if pnl > 0 else "Loss"
+                            "High": row['High'], "Low": row['Low'], "Points": pnl_pts, "PnL": pnl_pts * qty, 
+                            "Result": "Win" if pnl_pts > 0 else "Loss"
                         })
                         in_pos = False
 
@@ -125,7 +130,27 @@ with tab1:
                         tgt_p = entry_p + (tgt_val * m)
 
             if trades:
-                st.dataframe(pd.DataFrame(trades), use_container_width=True)
+                tdf = pd.DataFrame(trades)
+                # Summary Calculations
+                win_trades = tdf[tdf['Points'] > 0]
+                loss_trades = tdf[tdf['Points'] <= 0]
+                
+                st.subheader("Backtesting Summary")
+                c1, c2, c3, c4 = st.columns(4)
+                c1.metric("Total Trades", len(tdf))
+                c2.metric("Accuracy", f"{(len(win_trades)/len(tdf))*100:.2f}%")
+                c3.metric("Total PnL (Pts)", f"{tdf['Points'].sum():.2f}")
+                c4.metric("Total PnL (Amt)", f"{tdf['PnL'].sum():.2f}")
+
+                c5, c6, c7, c8 = st.columns(4)
+                c5.metric("Profit Trades", len(win_trades))
+                c6.metric("Loss Trades", len(loss_trades))
+                c7.metric("Avg Profit (Pts)", f"{win_trades['Points'].mean():.2f}" if not win_trades.empty else "0")
+                c8.metric("Avg Loss (Pts)", f"{loss_trades['Points'].mean():.2f}" if not loss_trades.empty else "0")
+
+                st.markdown("---")
+                st.subheader("Detailed Results")
+                st.dataframe(tdf, use_container_width=True)
 
 # ------------------------------------------
 # TAB 2: LIVE TRADING
@@ -153,14 +178,13 @@ with tab2:
                     c2.metric(f"EMA {fast_ema_val}", f"{latest['EMA_Fast']:.2f}")
                     c3.metric(f"EMA {slow_ema_val}", f"{latest['EMA_Slow']:.2f}")
                     
-                    # --- ENTRY LOGIC ---
+                    # Entry Logic
                     if st.session_state.current_position is None:
                         trigger = False
                         if "Simple" in strategy:
-                            trigger = True # Instant entry for Simple strategies
-                            sig = 'Buy' if "Buy" in strategy else 'Sell'
+                            trigger, sig = True, ('Buy' if "Buy" in strategy else 'Sell')
                         else:
-                            # Timeframe check for EMA Crossover
+                            # Candle-close logic for EMA
                             min_now = datetime.now().minute
                             int_num = int(''.join(filter(str.isdigit, interval))) if interval[0].isdigit() else 1
                             if min_now % int_num == 0:
@@ -175,16 +199,16 @@ with tab2:
                             }
                             st.toast(f"Entered {sig} at {cur_p}")
 
-                    # --- ACTIVE POSITION & PNL DISPLAY ---
+                    # Position Tracking
                     if st.session_state.current_position:
                         pos = st.session_state.current_position
                         pnl = (cur_p - pos['price']) * qty if pos['type'] == 'Buy' else (pos['price'] - cur_p) * qty
                         color = "green" if pnl >= 0 else "red"
                         
                         st.markdown(f"### Live PnL: <span style='color:{color};'>{pnl:.2f}</span>", unsafe_allow_html=True)
-                        st.write(f"Entry: {pos['price']} | SL: {pos['sl']:.2f} | TGT: {pos['tgt']:.2f}")
+                        st.write(f"**Trade Info:** {pos['type']} | Entry: {pos['price']} | SL: {pos['sl']:.2f} | TGT: {pos['tgt']:.2f}")
                         
-                        # --- EXIT CHECK ---
+                        # Exit Logic
                         exit_now = False
                         if pos['type'] == 'Buy':
                             if cur_p <= pos['sl']: exit_now, res, reason = True, "Loss", "SL Hit"
@@ -199,16 +223,19 @@ with tab2:
                                 "Entry Price": pos['price'], "Exit Price": cur_p, "SL": pos['sl'], "Target": pos['tgt'],
                                 "High": latest['High'], "Low": latest['Low'], "PnL": pnl, "Result": res, "Reason": reason
                             }
-                            st.session_state.trade_history.loc[len(st.session_state.trade_history)] = new_trade
+                            # Save to persistent history
+                            st.session_state.trade_history = pd.concat([st.session_state.trade_history, pd.DataFrame([new_trade])], ignore_index=True)
+                            # CLEAR SESSION PROPERLY
                             st.session_state.current_position = None
-                            st.toast("Trade Closed!")
+                            st.toast(f"Trade Closed: {reason}")
+                            st.rerun() # Forces UI refresh to clear PnL display immediately
+                    else:
+                        st.info("Scanning for next signal...")
 
                 with live_chart.container():
                     fig = plotly_go.Figure()
                     df_plot = df_l.tail(30)
                     fig.add_trace(plotly_go.Candlestick(x=df_plot.index, open=df_plot['Open'], high=df_plot['High'], low=df_plot['Low'], close=df_plot['Close'], name="Price"))
-                    fig.add_trace(plotly_go.Scatter(x=df_plot.index, y=df_plot['EMA_Fast'], name="Fast EMA", line=dict(color='orange')))
-                    fig.add_trace(plotly_go.Scatter(x=df_plot.index, y=df_plot['EMA_Slow'], name="Slow EMA", line=dict(color='blue')))
                     fig.update_layout(height=450, template="plotly_dark", xaxis_rangeslider_visible=False)
                     st.plotly_chart(fig, use_container_width=True, key=f"live_chart_{time.time()}")
             
@@ -218,11 +245,16 @@ with tab2:
 # TAB 3: TRADE HISTORY
 # ------------------------------------------
 with tab3:
-    st.subheader("Trade Logs")
+    st.subheader("Trade Ledger (Live Session)")
     if not st.session_state.trade_history.empty:
-        # Pandas styling fix for dynamic coloring
+        # Use newer .map for styling to avoid deprecation errors
         def style_pnl(val):
             return 'color: green' if val > 0 else 'color: red'
+        
         st.dataframe(st.session_state.trade_history.style.applymap(style_pnl, subset=['PnL']), use_container_width=True)
+        
+        if st.button("Clear History"):
+            st.session_state.trade_history = pd.DataFrame(columns=st.session_state.trade_history.columns)
+            st.rerun()
     else:
-        st.info("No trades taken yet.")
+        st.info("No trades saved. History will populate once a Live Trade is closed.")
