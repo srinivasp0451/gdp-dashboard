@@ -31,4 +31,4 @@ nsepython
 selenium
 playwright
 webdriver-manager
-
+streamlit-autorefresh
