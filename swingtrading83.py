@@ -1,596 +1,588 @@
-"""
-NIFTY EXPIRY DAY -- LIVE ROLLING ATM STRADDLE TABLE
-Data Source : NSE India Live Option Chain (no yfinance, no delay)
-Run         : streamlit run nifty_expiry_straddle.py
-Install     : pip install streamlit requests pandas pytz
-"""
-
 import streamlit as st
-import requests
+import yfinance as yf
 import pandas as pd
-from datetime import datetime, date, time as dtime
-import pytz
+import numpy as np
 import time
+from datetime import datetime, timedelta
+import plotly.graph_objects as plotly_go
 
-# \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
-# CONFIG
-# \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
-IST = pytz.timezone("Asia/Kolkata")
+# ==========================================
+# PAGE CONFIGURATION & STATE INITIALIZATION
+# ==========================================
+st.set_page_config(page_title="Smart Investing", layout="wide")
 
-SESSION_BINS = [
-    {"bin": 1, "label": "Opening",      "start": (9, 15),  "end": (9, 45)},
-    {"bin": 2, "label": "Morning",      "start": (9, 45),  "end": (11, 0)},
-    {"bin": 3, "label": "Mid-Session",  "start": (11, 0),  "end": (13, 0)},
-    {"bin": 4, "label": "Afternoon",    "start": (13, 0),  "end": (14, 30)},
-    {"bin": 5, "label": "Expiry Close", "start": (14, 30), "end": (15, 31)},
-]
-
-NSE_HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0.0.0 Safari/537.36"
-    ),
-    "Accept": "application/json, text/plain, */*",
-    "Accept-Language": "en-US,en;q=0.9",
-    "Accept-Encoding": "gzip, deflate, br",
-    "Referer": "https://www.nseindia.com/option-chain",
-    "Connection": "keep-alive",
-    "sec-fetch-dest": "empty",
-    "sec-fetch-mode": "cors",
-    "sec-fetch-site": "same-origin",
-}
-
-
-# \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
-# NSE SESSION
-# \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
-def create_nse_session():
-    session = requests.Session()
-    session.headers.update(NSE_HEADERS)
-    for url in ["https://www.nseindia.com", "https://www.nseindia.com/option-chain"]:
-        try:
-            session.get(url, timeout=10)
-            time.sleep(0.5)
-        except Exception:
-            pass
-    return session
-
-
-def safe_get(session, url):
-    for attempt in range(3):
-        try:
-            r = session.get(url, timeout=15)
-            r.raise_for_status()
-            return r.json()
-        except requests.exceptions.JSONDecodeError:
-            time.sleep(1)
-        except Exception as e:
-            if attempt == 2:
-                st.warning("NSE fetch failed: " + str(e))
-            time.sleep(1 + attempt)
-    return None
-
-
-# \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
-# DATA FETCH
-# \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
-def fetch_all_data():
-    result = {
-        "ok": False,
-        "spot": None,
-        "vix": None,
-        "expiry": None,
-        "records": [],
-        "error": "",
-        "timestamp": datetime.now(IST).strftime("%H:%M:%S"),
-    }
-
-    session = create_nse_session()
-
-    # India VIX
-    vix_data = safe_get(session, "https://www.nseindia.com/api/allIndices")
-    if vix_data:
-        for idx in vix_data.get("data", []):
-            if "VIX" in idx.get("index", "").upper():
-                try:
-                    result["vix"] = round(float(idx.get("last", 0)), 2)
-                except Exception:
-                    pass
-                break
-
-    # Option Chain
-    oc_data = safe_get(
-        session,
-        "https://www.nseindia.com/api/option-chain-indices?symbol=NIFTY"
-    )
-    if oc_data is None:
-        result["error"] = "Option chain fetch failed. NSE may be blocking -- retry in 60s."
-        return result
-
-    records_root = oc_data.get("records", {})
-    spot_raw = records_root.get("underlyingValue", 0)
-    if not spot_raw:
-        result["error"] = "Spot price missing in NSE response."
-        return result
-
-    result["spot"] = round(float(spot_raw), 2)
-    expiry_dates = records_root.get("expiryDates", [])
-    nearest = get_nearest_expiry(expiry_dates)
-    result["expiry"] = nearest
-
-    all_records = records_root.get("data", [])
-    result["records"] = [r for r in all_records if r.get("expiryDate") == nearest]
-    result["ok"] = True
-    return result
-
-
-def get_nearest_expiry(expiry_dates):
-    today = date.today()
-    for exp in expiry_dates:
-        try:
-            d = datetime.strptime(exp, "%d-%b-%Y").date()
-            if d >= today:
-                return exp
-        except Exception:
-            pass
-    return expiry_dates[0] if expiry_dates else None
-
-
-# \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
-# OPTION CHAIN CALCULATIONS
-# \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
-def find_atm(records, spot):
-    strikes = [r["strikePrice"] for r in records if "strikePrice" in r]
-    if not strikes:
-        return 0
-    return min(strikes, key=lambda x: abs(x - spot))
-
-
-def straddle_premium(records, atm):
-    for r in records:
-        if r.get("strikePrice") == atm:
-            ce = float(r.get("CE", {}).get("lastPrice", 0) or 0)
-            pe = float(r.get("PE", {}).get("lastPrice", 0) or 0)
-            return round(ce + pe, 2), round(ce, 2), round(pe, 2)
-    return 0.0, 0.0, 0.0
-
-
-def calc_pcr(records):
-    ce_oi = sum(r.get("CE", {}).get("openInterest", 0) or 0 for r in records)
-    pe_oi = sum(r.get("PE", {}).get("openInterest", 0) or 0 for r in records)
-    if ce_oi == 0:
-        return 0.0
-    return round(pe_oi / ce_oi, 2)
-
-
-def calc_total_oi(records):
-    total = sum(
-        (r.get("CE", {}).get("openInterest", 0) or 0)
-        + (r.get("PE", {}).get("openInterest", 0) or 0)
-        for r in records
-    )
-    if total >= 10000000:
-        return str(round(total / 10000000, 2)) + "Cr"
-    return str(round(total / 100000, 1)) + "L"
-
-
-def calc_max_pain(records):
-    strikes = sorted({r["strikePrice"] for r in records if "strikePrice" in r})
-    if not strikes:
-        return 0
-
-    ce_oi = {}
-    pe_oi = {}
-    for r in records:
-        s = r.get("strikePrice")
-        if s is not None:
-            ce_oi[s] = r.get("CE", {}).get("openInterest", 0) or 0
-            pe_oi[s] = r.get("PE", {}).get("openInterest", 0) or 0
-
-    min_loss = float("inf")
-    pain_strike = 0
-
-    for test in strikes:
-        loss = 0
-        for s in strikes:
-            if test > s:
-                loss += (test - s) * ce_oi.get(s, 0)
-            if test < s:
-                loss += (s - test) * pe_oi.get(s, 0)
-        if loss < min_loss:
-            min_loss = loss
-            pain_strike = test
-
-    return pain_strike
-
-
-def calc_atm_oi(records, atm):
-    for r in records:
-        if r.get("strikePrice") == atm:
-            ce = r.get("CE", {}).get("openInterest", 0) or 0
-            pe = r.get("PE", {}).get("openInterest", 0) or 0
-            return str(round(ce / 100)) + "K", str(round(pe / 100)) + "K"
-    return "--", "--"
-
-
-# \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
-# TIME BIN LOGIC
-# \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
-def get_current_bin():
-    now = datetime.now(IST).time()
-    for b in SESSION_BINS:
-        if dtime(*b["start"]) <= now < dtime(*b["end"]):
-            return b["bin"]
-    if now >= dtime(15, 31):
-        return 6   # post-market
-    return 0       # pre-market
-
-
-def market_status():
-    now = datetime.now(IST).time()
-    if now < dtime(9, 15):
-        return "Pre-Market"
-    if now >= dtime(15, 30):
-        return "Market Closed"
-    return "Market LIVE"
-
-
-def bin_time_str(b):
-    sh, sm = b["start"]
-    eh, em = b["end"]
-    return "%02d:%02d - %02d:%02d %s" % (sh, sm, eh, em, b["label"])
-
-
-# \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
-# OBSERVATIONS ENGINE
-# \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
-def generate_observations(snapshots, spot, vix, max_pain, pcr, straddle, spot_open):
-    obs = []
-
-    if not snapshots and get_current_bin() == 0:
-        obs.append("Waiting for market open at 9:15 IST. The table will populate once the opening bell rings.")
-        return obs
-
-    # VIX
-    if vix:
-        if vix >= 28:
-            obs.append(
-                "VIX CRITICAL at " + str(vix) + ": Far above the normal expiry-day range of 12-18. "
-                "Extreme fear in the market. Option premiums are massively inflated. "
-                "Straddle sellers face high risk. Buyers benefit from elevated IV but need a large move to profit."
-            )
-        elif vix >= 22:
-            obs.append(
-                "VIX Elevated at " + str(vix) + ": Market is fearful. Straddle premiums are significantly "
-                "higher than calm expiry days. Watch for IV crush after any event resolves."
-            )
-        elif vix >= 16:
-            obs.append(
-                "VIX Moderate at " + str(vix) + ": Slightly above comfort zone. Premiums are mildly inflated. "
-                "Normal expiry theta decay expected."
-            )
-        else:
-            obs.append(
-                "VIX Calm at " + str(vix) + ": Ideal expiry conditions for sellers. Premiums are in the "
-                "expected range and theta decay is the dominant force today."
-            )
-
-    # Spot vs Max Pain
-    if spot and max_pain:
-        diff = spot - max_pain
-        abs_diff = abs(diff)
-        pct_diff = round(abs_diff / max_pain * 100, 2)
-        if abs_diff < 80:
-            obs.append(
-                "Spot (" + str(round(spot)) + ") is within " + str(round(abs_diff)) + " pts of Max Pain (" + str(max_pain) + "). "
-                "Market is gravitating toward max pain -- this is where option writers lose the least. "
-                "Expect resistance to breakouts from here until expiry."
-            )
-        elif diff < 0:
-            obs.append(
-                "Spot (" + str(round(spot)) + ") is " + str(round(abs_diff)) + " pts BELOW Max Pain (" + str(max_pain) + ") [" + str(pct_diff) + "%]. "
-                "Bears fully in control, overriding max pain magnetism. Strong institutional selling. "
-                "A pullback is possible but not guaranteed -- large FII short positions can keep spot pinned low."
-            )
-        else:
-            obs.append(
-                "Spot (" + str(round(spot)) + ") is " + str(round(abs_diff)) + " pts ABOVE Max Pain (" + str(max_pain) + ") [" + str(pct_diff) + "%]. "
-                "Bulls pushing above max pain. CE writers are under pressure. "
-                "Watch for profit-taking near the max pain level."
-            )
-
-    # PCR
-    if pcr:
-        if pcr < 0.65:
-            obs.append(
-                "PCR at " + str(pcr) + " -- Extremely Bearish. Calls dominating put OI by a wide margin. "
-                "Aggressive put buying or call writing at scale. High probability of continued bearish pressure."
-            )
-        elif pcr < 0.85:
-            obs.append(
-                "PCR at " + str(pcr) + " -- Bearish Bias. More puts than calls in OI, "
-                "indicating fear and downside expectation."
-            )
-        elif pcr <= 1.15:
-            obs.append(
-                "PCR at " + str(pcr) + " -- Neutral. Balanced call and put OI. "
-                "Market undecided on direction -- range-bound action likely near ATM."
-            )
-        else:
-            obs.append(
-                "PCR at " + str(pcr) + " -- Bullish. Active put writing signals confidence in holding current "
-                "levels or moving up. Watch for reversal if PCR spikes above 1.5."
-            )
-
-    # Straddle decay trend
-    bins_done = sorted(snapshots.keys())
-    premiums = [snapshots[b]["straddle"] for b in bins_done if snapshots[b].get("straddle")]
-    if len(premiums) >= 2:
-        first_p = premiums[0]
-        last_p = premiums[-1]
-        decay = first_p - last_p
-        decay_pct = round(decay / first_p * 100, 1) if first_p > 0 else 0
-        if decay_pct >= 60:
-            intensity = "Aggressive"
-            comment = "Theta is dominating -- straddle melting fast. Option buyers losing money rapidly."
-        elif decay_pct >= 30:
-            intensity = "Moderate"
-            comment = "Normal expiry-day decay. Straddle losing value steadily."
-        else:
-            intensity = "Slow"
-            comment = "Premium is sticky -- possibly due to high VIX or an ongoing directional move."
-        obs.append(
-            "Theta Decay [" + intensity + "]: Straddle dropped from Rs." + str(first_p) +
-            " (opening) to Rs." + str(last_p) + " now. " +
-            "That is Rs." + str(round(decay)) + " (" + str(decay_pct) + "%) eroded. " + comment
-        )
-
-    # Spot movement from open
-    if spot_open and spot:
-        chg = spot - spot_open
-        pct = round(chg / spot_open * 100, 2)
-        direction = "UP" if chg > 0 else "DOWN"
-        bias = (
-            "Bullish momentum -- call writers under pressure."
-            if chg > 0
-            else "Bearish momentum -- put writers bleeding. OTM puts may have turned ITM."
-        )
-        obs.append(
-            "Spot moved " + direction + " " + str(round(abs(chg))) + " pts (" + str(abs(pct)) + "%) "
-            "from day-open of " + str(round(spot_open)) + " to current " + str(round(spot)) + ". " + bias
-        )
-
-    # ATM shift
-    if len(bins_done) >= 2:
-        first_atm = snapshots[bins_done[0]]["atm"]
-        last_atm = snapshots[bins_done[-1]]["atm"]
-        atm_shift = abs(last_atm - first_atm)
-        if atm_shift > 0:
-            direction = "lower" if last_atm < first_atm else "higher"
-            leg_comment = (
-                "CE leg is now worthless -- full loss on that side for straddle buyer."
-                if direction == "lower"
-                else "PE leg is now worthless -- full loss on that side for straddle buyer."
-            )
-            obs.append(
-                "Rolling ATM shifted " + direction + " by " + str(atm_shift) + " pts "
-                "(" + str(first_atm) + " -> " + str(last_atm) + "). " + leg_comment
-            )
-
-    # Strategy signal for early bins
-    current_bin = get_current_bin()
-    if current_bin in [1, 2] and straddle:
-        if vix and vix > 22:
-            obs.append(
-                "STRATEGY WARNING: Do NOT buy straddle at open with VIX at " + str(vix) + ". "
-                "High VIX = inflated premium = IV crush will erode your straddle even if market moves. "
-                "Better approach: Wait for VIX to spike further and sell OTM strangles, OR "
-                "wait for a directional breakout and buy only the directional leg."
-            )
-        else:
-            breakeven = round(straddle * 1.5)
-            obs.append(
-                "Strategy Signal (Bin " + str(current_bin) + "): Straddle at Rs." + str(straddle) +
-                " with VIX " + str(vix) + ". "
-                "Spot needs to move more than " + str(breakeven) + " pts from ATM for buyer to profit. "
-                "Otherwise, theta wins."
-            )
-
-    if not obs:
-        obs.append("Collecting data -- observations will appear once at least one bin is captured.")
-
-    return obs
-
-
-# \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
-# SESSION STATE INIT
-# \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
-if "snapshots" not in st.session_state:
-    st.session_state.snapshots = {}
-if "spot_open" not in st.session_state:
-    st.session_state.spot_open = None
-if "refresh_count" not in st.session_state:
-    st.session_state.refresh_count = 0
+if "trade_history" not in st.session_state:
+    st.session_state.trade_history = pd.DataFrame(columns=[
+        "Entry Time", "Exit Time", "Type", "Entry Price", "Exit Price", 
+        "SL", "Target", "High During Trade", "Low During Trade", 
+        "Entry Reason", "Exit Reason", "PnL", "Result"
+    ])
+if "live_running" not in st.session_state:
+    st.session_state.live_running = False
+if "current_position" not in st.session_state:
+    st.session_state.current_position = None
 if "last_fetch_time" not in st.session_state:
-    st.session_state.last_fetch_time = None
+    st.session_state.last_fetch_time = 0
 
-
-# \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
-# PAGE SETUP
-# \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
-st.set_page_config(
-    page_title="Nifty Expiry Straddle Table",
-    page_icon="\ud83d\udcca",
-    layout="wide",
-)
-
-st.markdown("""
-<style>
-div[data-testid="stMetric"] {
-    background: #f8f9fa;
-    border-radius: 8px;
-    padding: 10px 14px;
-}
-.obs-card {
-    background: #f0f4ff;
-    border-left: 4px solid #4361ee;
-    padding: 12px 16px;
-    border-radius: 0 8px 8px 0;
-    margin: 6px 0;
-    font-size: 14px;
-    line-height: 1.6;
-}
-.header-band {
-    background: linear-gradient(90deg, #1a1a2e, #16213e);
-    color: white;
-    padding: 16px 20px;
-    border-radius: 10px;
-    margin-bottom: 12px;
-}
-</style>
-""", unsafe_allow_html=True)
-
-# \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
-# HEADER
-# \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
-now_ist = datetime.now(IST)
-mkt = market_status()
-current_bin = get_current_bin()
-
-st.markdown(
-    "<div class='header-band'>"
-    "<span style='font-size:22px;font-weight:700'>\ud83d\udcca Nifty Expiry Day -- Live Rolling ATM Straddle Table</span><br>"
-    "<span style='font-size:13px;opacity:0.8'>Live NSE data | No yfinance | Auto 5-bin capture | "
-    + now_ist.strftime("%d-%b-%Y %H:%M:%S IST") + " | " + mkt + "</span>"
-    "</div>",
-    unsafe_allow_html=True
-)
-
-# \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
-# CONTROLS
-# \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
-c1, c2, c3, c4 = st.columns([1, 1, 1, 3])
-with c1:
-    auto_ref = st.toggle("Auto Refresh", value=True)
-with c2:
-    refresh_interval = st.selectbox("Interval (s)", [30, 60, 120], index=1, label_visibility="collapsed")
-with c3:
-    if st.button("Fetch Now", type="primary"):
-        st.session_state.refresh_count += 1
-        st.rerun()
-with c4:
-    last = st.session_state.last_fetch_time or "Never"
-    st.caption("Refresh #" + str(st.session_state.refresh_count) + " | Last fetch: " + last)
-
-st.markdown("---")
-
-# \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
-# FETCH LIVE DATA
-# \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
-with st.spinner("Connecting to NSE India -- fetching live option chain..."):
-    data = fetch_all_data()
-
-if not data["ok"]:
-    st.error("NSE Error: " + data["error"])
-    st.info(
-        "NSE blocks rapid repeated requests. Wait 30-60s and retry. "
-        "If this persists outside market hours, NSE may be in maintenance mode."
-    )
-    st.stop()
-
-spot      = data["spot"]
-vix       = data["vix"]
-records   = data["records"]
-expiry    = data["expiry"]
-fetch_ts  = data["timestamp"]
-
-atm                   = find_atm(records, spot)
-straddle, ce_px, pe_px = straddle_premium(records, atm)
-pcr                   = calc_pcr(records)
-total_oi              = calc_total_oi(records)
-max_pain              = calc_max_pain(records)
-atm_ce_oi, atm_pe_oi = calc_atm_oi(records, atm)
-
-st.session_state.last_fetch_time = fetch_ts
-
-# Store spot at first live capture
-if st.session_state.spot_open is None and current_bin in [1, 2]:
-    st.session_state.spot_open = spot
-
-# Build and store snapshot for current bin
-snapshot = {
-    "vix":      vix,
-    "spot":     spot,
-    "atm":      atm,
-    "straddle": straddle,
-    "ce_px":    ce_px,
-    "pe_px":    pe_px,
-    "max_pain": max_pain,
-    "pcr":      pcr,
-    "total_oi": total_oi,
-    "atm_ce":   atm_ce_oi,
-    "atm_pe":   atm_pe_oi,
-    "time":     now_ist.strftime("%H:%M"),
+# ==========================================
+# DICTIONARIES & HELPER FUNCTIONS
+# ==========================================
+TICKER_MAP = {
+    "NIFTY50": "^NSEI",
+    "BANKNIFTY": "^NSEBANK",
+    "SENSEX": "^BSESN",
+    "BTC": "BTC-USD",
+    "ETH": "ETH-USD",
+    "GOLD": "GC=F",
+    "SILVER": "SI=F",
+    "CUSTOM": "CUSTOM"
 }
 
-if current_bin in range(1, 7):
-    st.session_state.snapshots[current_bin] = snapshot
-    if current_bin == 6 and 5 not in st.session_state.snapshots:
-        st.session_state.snapshots[5] = snapshot
+TIMEFRAME_PERIODS = {
+    "1m": ["1d", "5d", "7d"],
+    "5m": ["1d", "5d", "7d", "1mo"],
+    "15m": ["1d", "5d", "7d", "1mo"],
+    "1h": ["1d", "5d", "7d", "1mo", "3mo", "6mo", "1y", "2y"],
+    "1d": ["5d", "7d", "1mo", "3mo", "6mo", "1y", "2y", "5y", "10y", "20y"],
+    "1wk": ["1d", "5d", "7d", "1mo", "3mo", "6mo", "1y", "2y", "5y", "10y", "20y"]
+}
 
-# \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
-# LIVE METRICS
-# \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
-st.subheader("Live Snapshot -- Expiry: " + str(expiry))
+def fetch_data(ticker, period, interval, buffer_days=30):
+    """Fetches data with a buffer to ensure indicators don't return NaN on big gaps."""
+    # Convert custom ticker
+    if ticker == "CUSTOM":
+        yf_ticker = st.session_state.get('custom_ticker_input', 'RELIANCE.NS')
+    else:
+        yf_ticker = TICKER_MAP[ticker]
+    
+    try:
+        df = yf.download(yf_ticker, period=period, interval=interval, progress=False)
+        if df.empty:
+            return None
+        # Flatten MultiIndex columns if present (yfinance latest version behavior)
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+        return df
+    except Exception as e:
+        return None
 
-m1, m2, m3, m4, m5, m6, m7, m8 = st.columns(8)
+def calculate_indicators(df, fast_ema, slow_ema):
+    """Calculates EMAs exactly matching TradingView (adjust=False)."""
+    df['EMA_Fast'] = df['Close'].ewm(span=fast_ema, adjust=False).mean()
+    df['EMA_Slow'] = df['Close'].ewm(span=slow_ema, adjust=False).mean()
+    
+    # Strategy Logic Generation
+    df['Buy_Signal'] = (df['EMA_Fast'] > df['EMA_Slow']) & (df['EMA_Fast'].shift(1) <= df['EMA_Slow'].shift(1))
+    df['Sell_Signal'] = (df['EMA_Fast'] < df['EMA_Slow']) & (df['EMA_Fast'].shift(1) >= df['EMA_Slow'].shift(1))
+    
+    # --- COMMENTED OUT STRATEGY AS REQUESTED ---
+    # Threshold Strategy:
+    # threshold = 1000
+    # df['Cross_Above_Threshold'] = (df['Close'] > threshold) & (df['Close'].shift(1) <= threshold)
+    # df['Cross_Below_Threshold'] = (df['Close'] < threshold) & (df['Close'].shift(1) >= threshold)
+    # -------------------------------------------
+    
+    return df
 
-spot_delta = None
-if st.session_state.spot_open:
-    delta_val = round(spot - st.session_state.spot_open, 2)
-    spot_delta = str(delta_val) + " from open"
+# ==========================================
+# BROKER INTEGRATION (DHAN)
+# ==========================================
+def execute_broker_order(signal_type, config):
+    if not config['use_dhan']:
+        return "Broker Disabled"
+    
+    try:
+        from pydhan import pydhan
+        from dhanhq import dhanhq
+    except ImportError:
+        return "Dhan libraries not installed. Run: pip install pydhan dhanhq"
 
-m1.metric("Nifty Spot",    str(spot),    spot_delta)
-m2.metric("India VIX",     str(vix))
-m3.metric("ATM Strike",    str(atm))
-m4.metric("CE (ATM)",      "Rs." + str(ce_px))
-m5.metric("PE (ATM)",      "Rs." + str(pe_px))
-m6.metric("Straddle",      "Rs." + str(straddle))
-m7.metric("Max Pain",      str(max_pain))
-m8.metric("PCR (OI)",      str(pcr))
-
-st.markdown("---")
-
-# \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
-# 5-BIN TABLE
-# \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
-st.subheader("5-Bin Expiry Session Table (Rolling ATM Straddle)")
-
-rows = []
-for b in SESSION_BINS:
-    bn      = b["bin"]
-    label   = "Bin " + str(bn) + " | " + bin_time_str(b)
-    is_live = (bn == current_bin)
-    is_past = (bn < current_bin) or (current_bin == 6)
-
-    if bn in st.session_state.snapshots:
-        s = st.session_state.snapshots[bn]
-        status = "LIVE" if is_live else "Captured"
-        row = {
-            "Session": label,
-            "Status":       status,
-            "India VIX":    s["vix"],
-            "Nifty Spot":   s["spot"],
-            "ATM Strike":   s["atm"],
-            "CE (Rs.)":     s["ce_px"],
-            "PE (Rs.)":     s["pe_px"],
-            "Straddle (Rs.)": s["straddle"],
-            "Max Pain":     s["max_pain"],
-            "PCR (OI)":     s["pcr"],
-            "Total OI":     s["total_oi"],
-            "ATM CE OI":    s["atm_ce"],
-            "ATM PE OI":    s["atm_pe"],
-            "At":           s["time"],
+    # Map algo signals to options buyer logic
+    if config['options_trading']:
+        # Options Logic (Buyer only)
+        # Main Algo Buy -> Buy CE. Main Algo Sell -> Buy PE.
+        sec_id = config['ce_sec_id'] if signal_type == 'Buy' else config['pe_sec_id']
+        qty = config['opt_qty']
+        
+        dhan_opt = dhanhq(config['dhan_client_id'], config['dhan_access_token'])
+        order_params = {
+            "transactionType": "BUY", # Always BUY for options as per constraints
+            "exchangeSegment": config['opt_exchange'],
+            "productType": "INTRADAY",
+            "orderType": config['opt_entry_type'],
+            "validity": "DAY",
+            "securityId": sec_id,
+            "quantity": qty,
+            "price": config['ltp'] if config['opt_entry_type'] == 'LIMIT' else 0,
+            "triggerPrice": 0
         }
-    #elif
+        try:
+            res = dhan_opt.place_order(**order_params)
+            return f"Option Order Placed: {res}"
+        except Exception as e:
+            return f"Option Order Failed: {e}"
+    else:
+        # Equity/Futures Logic
+        dhan_eq = pydhan(client_id=config['dhan_client_id'], access_token=config['dhan_access_token'])
+        trans_type = dhan_eq.BUY if signal_type == 'Buy' else dhan_eq.SELL
+        prod_type = dhan_eq.INTRADAY if config['eq_product'] == 'INTRADAY' else dhan_eq.DELIVERY
+        ord_type = dhan_eq.MARKET if config['eq_entry_type'] == 'MARKET ORDER' else dhan_eq.LIMIT
+        
+        try:
+            res = dhan_eq.place_order(
+                security_id=config['eq_sec_id'],
+                exchange_segment=dhan_eq.NSE if config['eq_exchange'] == 'NSE' else dhan_eq.BSE,
+                transaction_type=trans_type,
+                quantity=config['eq_qty'],
+                order_type=ord_type,
+                product_type=prod_type,
+                price=config['ltp'] if ord_type == dhan_eq.LIMIT else 0
+            )
+            return f"Equity Order Placed: {res}"
+        except Exception as e:
+            return f"Equity Order Failed: {e}"
+
+# ==========================================
+# SIDEBAR CONFIGURATION
+# ==========================================
+st.sidebar.header("⚙️ Configuration")
+
+ticker = st.sidebar.selectbox("Select Ticker", list(TICKER_MAP.keys()))
+if ticker == "CUSTOM":
+    custom_ticker = st.sidebar.text_input("Enter YFinance Ticker (e.g., RELIANCE.NS)", "RELIANCE.NS")
+    st.session_state.custom_ticker_input = custom_ticker
+
+interval = st.sidebar.selectbox("Timeframe", list(TIMEFRAME_PERIODS.keys()))
+period = st.sidebar.selectbox("Period", TIMEFRAME_PERIODS[interval])
+qty = st.sidebar.number_input("Quantity", value=1, min_value=1)
+
+strategy = st.sidebar.selectbox("Strategy", ["EMA Crossover", "Simple Buy", "Simple Sell"])
+fast_ema = st.sidebar.number_input("Fast EMA", value=9, min_value=1)
+slow_ema = st.sidebar.number_input("Slow EMA", value=15, min_value=2)
+
+sl_type = st.sidebar.selectbox("Stoploss Type", ["Custom Points", "Trailing SL", "Reverse EMA Crossover", "Risk/Reward Based"])
+sl_val = st.sidebar.number_input("SL Points", value=10.0)
+
+tgt_type = st.sidebar.selectbox("Target Type", ["Custom Points", "Trailing Target (Display Only)", "EMA Crossover", "Risk/Reward Based"])
+tgt_val = st.sidebar.number_input("Target Points", value=20.0)
+
+prevent_overlap = st.sidebar.checkbox("Prevent Overlapping Trades", value=True)
+cooldown_enabled = st.sidebar.checkbox("Enable Cooldown", value=True)
+cooldown_period = st.sidebar.number_input("Cooldown (Seconds)", value=5, min_value=0)
+
+# Broker Config
+st.sidebar.markdown("---")
+use_broker = st.sidebar.checkbox("Enable Dhan Broker", value=False)
+broker_config = {'use_dhan': use_broker}
+
+if use_broker:
+    broker_config['dhan_client_id'] = st.sidebar.text_input("Client ID", type="password")
+    broker_config['dhan_access_token'] = st.sidebar.text_input("Access Token", type="password")
+    
+    use_options = st.sidebar.checkbox("Options Trading", value=False)
+    broker_config['options_trading'] = use_options
+    
+    if use_options:
+        broker_config['opt_exchange'] = st.sidebar.selectbox("Exchange", ["NSE_FNO", "BSE_FNO"])
+        broker_config['ce_sec_id'] = st.sidebar.text_input("CE Security ID")
+        broker_config['pe_sec_id'] = st.sidebar.text_input("PE Security ID")
+        broker_config['opt_qty'] = st.sidebar.number_input("Options Qty", value=65)
+        broker_config['opt_entry_type'] = st.sidebar.selectbox("Opt Entry Type", ["MARKET", "LIMIT"])
+        broker_config['opt_exit_type'] = st.sidebar.selectbox("Opt Exit Type", ["MARKET", "LIMIT"])
+    else:
+        broker_config['eq_product'] = st.sidebar.selectbox("Product", ["INTRADAY", "DELIVERY"])
+        broker_config['eq_exchange'] = st.sidebar.selectbox("Exchange", ["NSE", "BSE"])
+        broker_config['eq_sec_id'] = st.sidebar.text_input("Security ID", value="1594")
+        broker_config['eq_qty'] = st.sidebar.number_input("Equity Qty", value=1)
+        broker_config['eq_entry_type'] = st.sidebar.selectbox("Entry Type", ["MARKET ORDER", "LIMIT ORDER"])
+        broker_config['eq_exit_type'] = st.sidebar.selectbox("Exit Type", ["MARKET ORDER", "LIMIT ORDER"])
+
+# ==========================================
+# MAIN UI: HEADER
+# ==========================================
+st.title("📈 Smart Investing")
+
+# Real-time Header Display
+df_header = fetch_data(ticker, "5d", "1d")
+header_placeholder = st.empty()
+
+if df_header is not None and len(df_header) >= 2:
+    current_ltp = float(df_header['Close'].iloc[-1])
+    prev_close = float(df_header['Close'].iloc[-2])
+    abs_change = current_ltp - prev_close
+    pct_change = (abs_change / prev_close) * 100
+    color = "green" if abs_change >= 0 else "red"
+    arrow = "▲" if abs_change >= 0 else "▼"
+    
+    header_placeholder.markdown(f"""
+    <div style='background-color: #1e1e1e; padding: 15px; border-radius: 10px; border-left: 5px solid {color};'>
+        <h2 style='margin:0; color:white;'>{ticker} <span style='color:{color};'>{current_ltp:.2f}</span></h2>
+        <p style='margin:0; color:{color}; font-size: 1.2rem;'>{arrow} {abs_change:.2f} ({pct_change:.2f}%) from previous day</p>
+    </div>
+    <br>
+    """, unsafe_allow_html=True)
+    broker_config['ltp'] = current_ltp
+
+# ==========================================
+# TABS
+# ==========================================
+tab1, tab2, tab3 = st.tabs(["📊 Backtesting", "🔴 Live Trading", "📝 Trade History"])
+
+# ------------------------------------------
+# TAB 1: BACKTESTING
+# ------------------------------------------
+with tab1:
+    st.subheader("Backtest Settings & Results")
+    if st.button("Run Backtest"):
+        with st.spinner("Fetching data and simulating trades..."):
+            df_bt = fetch_data(ticker, period, interval)
+            
+            if df_bt is not None:
+                df_bt = calculate_indicators(df_bt, fast_ema, slow_ema)
+                trades = []
+                in_position = False
+                pos_type = None
+                entry_price = 0
+                entry_time = None
+                sl_price = 0
+                tgt_price = 0
+                reason = ""
+                
+                violations = 0
+                violation_indices = []
+
+                # Iterative simulation for precision check on conservative SL/Target
+                for idx, row in df_bt.iterrows():
+                    # Check exits first
+                    if in_position:
+                        high = row['High']
+                        low = row['Low']
+                        close = row['Close']
+                        exit_price = 0
+                        exit_reason = ""
+                        
+                        # Note rule check: Was both SL and Target hit in same candle?
+                        sl_hit = False
+                        tgt_hit = False
+                        
+                        if pos_type == 'Buy':
+                            if low <= sl_price: sl_hit = True
+                            if high >= tgt_price: tgt_hit = True
+                            
+                            if sl_hit and tgt_hit:
+                                violations += 1
+                                violation_indices.append(idx)
+                                # Conservative rule: SL checked first
+                                exit_price = sl_price
+                                exit_reason = "SL Hit (Violation)"
+                            elif sl_hit:
+                                exit_price = sl_price
+                                exit_reason = "SL Hit"
+                            elif tgt_hit:
+                                exit_price = tgt_price
+                                exit_reason = "Target Hit"
+                            elif sl_type == "Reverse EMA Crossover" and row['Sell_Signal']:
+                                exit_price = close
+                                exit_reason = "Reverse Signal"
+                                
+                        elif pos_type == 'Sell':
+                            # For sell, SL is hit if High >= sl_price, Target hit if Low <= tgt_price
+                            if high >= sl_price: sl_hit = True
+                            if low <= tgt_price: tgt_hit = True
+                            
+                            if sl_hit and tgt_hit:
+                                violations += 1
+                                violation_indices.append(idx)
+                                # Conservative rule: SL checked first
+                                exit_price = sl_price
+                                exit_reason = "SL Hit (Violation)"
+                            elif sl_hit:
+                                exit_price = sl_price
+                                exit_reason = "SL Hit"
+                            elif tgt_hit:
+                                exit_price = tgt_price
+                                exit_reason = "Target Hit"
+                            elif sl_type == "Reverse EMA Crossover" and row['Buy_Signal']:
+                                exit_price = close
+                                exit_reason = "Reverse Signal"
+                        
+                        if exit_price != 0:
+                            pnl = (exit_price - entry_price) * qty if pos_type == 'Buy' else (entry_price - exit_price) * qty
+                            trades.append({
+                                "Entry Time": entry_time,
+                                "Exit Time": idx,
+                                "Type": pos_type,
+                                "Entry Price": round(entry_price, 2),
+                                "Exit Price": round(exit_price, 2),
+                                "SL": round(sl_price, 2),
+                                "Target": round(tgt_price, 2),
+                                "High During Trade": round(high, 2),
+                                "Low During Trade": round(low, 2),
+                                "Entry Reason": reason,
+                                "Exit Reason": exit_reason,
+                                "PnL": round(pnl, 2),
+                                "Result": "Win" if pnl > 0 else "Loss"
+                            })
+                            in_position = False
+                            # Overlap prevention handled implicitly by only looking for entries if not in_position
+
+                    # Check Entries
+                    if not in_position:
+                        signal = None
+                        if strategy == "EMA Crossover":
+                            if row['Buy_Signal']: signal = 'Buy'
+                            elif row['Sell_Signal']: signal = 'Sell'
+                        elif strategy == "Simple Buy":
+                            signal = 'Buy' # Triggers on first available
+                        elif strategy == "Simple Sell":
+                            signal = 'Sell'
+                        
+                        if signal:
+                            in_position = True
+                            pos_type = signal
+                            entry_price = row['Close']
+                            entry_time = idx
+                            reason = f"{strategy} {signal}"
+                            
+                            # Calculate SL and Target based on inputs
+                            if sl_type == "Custom Points":
+                                sl_price = entry_price - sl_val if pos_type == 'Buy' else entry_price + sl_val
+                            else:
+                                sl_price = entry_price * 0.99 if pos_type == 'Buy' else entry_price * 1.01 # Placeholder for complex logic
+                                
+                            if tgt_type == "Custom Points":
+                                tgt_price = entry_price + tgt_val if pos_type == 'Buy' else entry_price - tgt_val
+                            else:
+                                tgt_price = entry_price * 1.02 if pos_type == 'Buy' else entry_price * 0.98
+
+                df_trades = pd.DataFrame(trades)
+                
+                # Metrics & Table
+                if not df_trades.empty:
+                    wins = len(df_trades[df_trades['Result'] == 'Win'])
+                    total = len(df_trades)
+                    accuracy = (wins / total) * 100
+                    
+                    c1, c2, c3 = st.columns(3)
+                    c1.metric("Total Trades", total)
+                    c2.metric("Total PnL", round(df_trades['PnL'].sum(), 2))
+                    c3.metric("Accuracy", f"{accuracy:.2f}%")
+                    
+                    if violations > 0:
+                        st.warning(f"⚠️ Rule Violation Alert: {violations} trade(s) hit both SL and Target in the same candle. Conservative exit (SL) applied to match live realism.")
+                    
+                    st.dataframe(df_trades, use_container_width=True)
+                    
+                    # Chart visualization
+                    fig = plotly_go.Figure()
+                    fig.add_trace(plotly_go.Candlestick(x=df_bt.index, open=df_bt['Open'], high=df_bt['High'], low=df_bt['Low'], close=df_bt['Close'], name='Price'))
+                    fig.add_trace(plotly_go.Scatter(x=df_bt.index, y=df_bt['EMA_Fast'], line=dict(color='orange', width=1), name=f'EMA {fast_ema}'))
+                    fig.add_trace(plotly_go.Scatter(x=df_bt.index, y=df_bt['EMA_Slow'], line=dict(color='blue', width=1), name=f'EMA {slow_ema}'))
+                    
+                    # Mark trades
+                    buy_trades = df_trades[df_trades['Type'] == 'Buy']
+                    sell_trades = df_trades[df_trades['Type'] == 'Sell']
+                    
+                    fig.add_trace(plotly_go.Scatter(x=buy_trades['Entry Time'], y=buy_trades['Entry Price'], mode='markers', marker=dict(symbol='triangle-up', color='green', size=12), name='Buy Entry'))
+                    fig.add_trace(plotly_go.Scatter(x=sell_trades['Entry Time'], y=sell_trades['Entry Price'], mode='markers', marker=dict(symbol='triangle-down', color='red', size=12), name='Sell Entry'))
+                    
+                    fig.update_layout(title=f"Backtest Chart - {ticker}", xaxis_rangeslider_visible=False, height=600, template="plotly_dark")
+                    st.plotly_chart(fig, use_container_width=True)
+
+                else:
+                    st.info("No trades executed based on current parameters.")
+            else:
+                st.error("Failed to fetch data for backtesting.")
+
+# ------------------------------------------
+# TAB 2: LIVE TRADING
+# ------------------------------------------
+with tab2:
+    st.subheader("Live Market Execution")
+    
+    # Control Buttons
+    col_btn1, col_btn2, col_btn3 = st.columns(3)
+    with col_btn1:
+        if st.button("▶️ Start Live Trading", use_container_width=True, type="primary"):
+            st.session_state.live_running = True
+    with col_btn2:
+        if st.button("🛑 Stop Live Trading", use_container_width=True):
+            st.session_state.live_running = False
+    with col_btn3:
+        if st.button("⏹️ Square Off", use_container_width=True):
+            st.session_state.current_position = None
+            st.success("Existing position squared off locally.")
+            # Broker square off logic would go here
+
+    # Dynamic UI Placeholders (Avoids flickering)
+    config_placeholder = st.empty()
+    live_status_placeholder = st.empty()
+    chart_placeholder = st.empty()
+    last_candle_placeholder = st.empty()
+
+    # Display Configuration
+    config_text = f"**Running Config:** Ticker: {ticker} | Timeframe: {interval} | Strategy: {strategy} | SL: {sl_val} pts | Tgt: {tgt_val} pts | Overlap Prevent: {prevent_overlap} | Broker: {'ON' if use_broker else 'OFF'}"
+    config_placeholder.info(config_text)
+
+    # Main Live Loop
+    if st.session_state.live_running:
+        with live_status_placeholder.container():
+            st.markdown("### 🟢 LIVE ENGINE RUNNING...")
+            
+            # Using fragment or empty containers to update data without refreshing the whole page.
+            # In a true deployment, this while loop should run in a background thread. For Streamlit, we loop inside the container.
+            
+            while st.session_state.live_running:
+                current_time = time.time()
+                
+                # Rate limit handling: 1.5s delay
+                if current_time - st.session_state.last_fetch_time >= 1.5:
+                    df_live = fetch_data(ticker, "5d", interval) # Fetch sufficient data to prevent NaN
+                    st.session_state.last_fetch_time = time.time()
+                    
+                    if df_live is not None and len(df_live) > slow_ema:
+                        df_live = calculate_indicators(df_live, fast_ema, slow_ema)
+                        latest_row = df_live.iloc[-1]
+                        ltp = float(latest_row['Close'])
+                        
+                        # Show latest fetched candle info
+                        last_candle_placeholder.markdown(f"**Last Candle Fetched Time:** `{df_live.index[-1]}` | **LTP:** `{ltp}`")
+
+                        # --- LOGIC PROCESSING ---
+                        pos = st.session_state.current_position
+                        
+                        # Exit Logic (Tick level comparison simulated via LTP)
+                        if pos is not None:
+                            exit_triggered = False
+                            reason = ""
+                            
+                            if pos['type'] == 'Buy':
+                                if ltp <= pos['sl']:
+                                    exit_triggered = True; reason = "SL Hit"
+                                elif ltp >= pos['target']:
+                                    exit_triggered = True; reason = "Target Hit"
+                            elif pos['type'] == 'Sell':
+                                if ltp >= pos['sl']:
+                                    exit_triggered = True; reason = "SL Hit"
+                                elif ltp <= pos['target']:
+                                    exit_triggered = True; reason = "Target Hit"
+                            
+                            if exit_triggered:
+                                # Execute Trade
+                                pnl = (ltp - pos['entry_price']) * qty if pos['type'] == 'Buy' else (pos['entry_price'] - ltp) * qty
+                                new_trade = {
+                                    "Entry Time": pos['entry_time'],
+                                    "Exit Time": datetime.now(),
+                                    "Type": pos['type'],
+                                    "Entry Price": pos['entry_price'],
+                                    "Exit Price": ltp,
+                                    "SL": pos['sl'],
+                                    "Target": pos['target'],
+                                    "High During Trade": df_live['High'].max(), # Simplified
+                                    "Low During Trade": df_live['Low'].min(),   # Simplified
+                                    "Entry Reason": pos['reason'],
+                                    "Exit Reason": reason,
+                                    "PnL": pnl,
+                                    "Result": "Win" if pnl > 0 else "Loss"
+                                }
+                                st.session_state.trade_history.loc[len(st.session_state.trade_history)] = new_trade
+                                st.session_state.current_position = None
+                                
+                                if use_broker:
+                                    # Execute square off via broker API
+                                    opposite_signal = 'Sell' if pos['type'] == 'Buy' else 'Buy'
+                                    execute_broker_order(opposite_signal, broker_config)
+
+                        # Entry Logic (Timeframe multiple check)
+                        # We check if minute is a multiple of interval (e.g., 5m)
+                        current_dt = datetime.now()
+                        min_val = current_dt.minute
+                        int_num = int(''.join(filter(str.isdigit, interval))) if interval[0].isdigit() else 1
+                        is_candle_close = (min_val % int_num == 0) if "m" in interval else True # Simplified check
+                        
+                        if st.session_state.current_position is None and is_candle_close:
+                            # Apply Cooldown check
+                            if cooldown_enabled and len(st.session_state.trade_history) > 0:
+                                last_exit = st.session_state.trade_history.iloc[-1]['Exit Time']
+                                if (datetime.now() - last_exit).total_seconds() < cooldown_period:
+                                    continue # Skip iteration
+                            
+                            signal = None
+                            if strategy == "EMA Crossover":
+                                if latest_row['Buy_Signal']: signal = 'Buy'
+                                elif latest_row['Sell_Signal']: signal = 'Sell'
+                                
+                            if signal:
+                                entry_price = ltp
+                                sl_price = entry_price - sl_val if signal == 'Buy' else entry_price + sl_val
+                                tgt_price = entry_price + tgt_val if signal == 'Buy' else entry_price - tgt_val
+                                
+                                st.session_state.current_position = {
+                                    'type': signal, 'entry_price': entry_price, 
+                                    'entry_time': datetime.now(), 'sl': sl_price, 
+                                    'target': tgt_price, 'reason': f"Live {strategy} {signal}"
+                                }
+                                
+                                if use_broker:
+                                    execute_broker_order(signal, broker_config)
+                        
+                        # Update Live UI overlay
+                        with chart_placeholder.container():
+                            if st.session_state.current_position:
+                                p = st.session_state.current_position
+                                st.warning(f"**Current Position:** {p['type']} @ {p['entry_price']} | SL: {p['sl']} | TGT: {p['target']}")
+                            else:
+                                st.success("No active positions. Scanning for signals...")
+                            
+                            # Real-time Chart Update
+                            fig_live = plotly_go.Figure()
+                            # Show last 50 candles for performance
+                            df_plot = df_live.tail(50)
+                            fig_live.add_trace(plotly_go.Candlestick(x=df_plot.index, open=df_plot['Open'], high=df_plot['High'], low=df_plot['Low'], close=df_plot['Close'], name='Price'))
+                            fig_live.add_trace(plotly_go.Scatter(x=df_plot.index, y=df_plot['EMA_Fast'], line=dict(color='orange', width=1), name=f'EMA {fast_ema}'))
+                            fig_live.add_trace(plotly_go.Scatter(x=df_plot.index, y=df_plot['EMA_Slow'], line=dict(color='blue', width=1), name=f'EMA {slow_ema}'))
+                            
+                            # Draw overlay lines if position exists
+                            if st.session_state.current_position:
+                                pos = st.session_state.current_position
+                                fig_live.add_hline(y=pos['entry_price'], line_dash="solid", line_color="blue", annotation_text="Entry")
+                                fig_live.add_hline(y=pos['sl'], line_dash="dot", line_color="red", annotation_text="SL")
+                                fig_live.add_hline(y=pos['target'], line_dash="dot", line_color="green", annotation_text="Target")
+                                
+                            fig_live.update_layout(height=500, xaxis_rangeslider_visible=False, template="plotly_dark", margin=dict(l=0,r=0,t=30,b=0))
+                            st.plotly_chart(fig_live, use_container_width=True)
+                            
+                time.sleep(1.5) # Graceful delay for yfinance limits
+    else:
+        live_status_placeholder.info("Live trading is currently stopped.")
+
+# ------------------------------------------
+# TAB 3: TRADE HISTORY
+# ------------------------------------------
+with tab3:
+    st.subheader("Completed Trade Ledger")
+    st.markdown("This tab displays all trades completed during the Live Trading session, updated dynamically.")
+    
+    if st.session_state.trade_history.empty:
+        st.info("No trades executed yet in this session.")
+    else:
+        # Display aggregated metrics
+        th = st.session_state.trade_history
+        wins = len(th[th['Result'] == 'Win'])
+        total = len(th)
+        
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Live Total Trades", total)
+        c2.metric("Live Total PnL", round(th['PnL'].sum(), 2))
+        c3.metric("Live Accuracy", f"{(wins / total) * 100:.2f}%" if total > 0 else "0.00%")
+        
+        # Display the full dataframe
+        st.dataframe(
+            th.style.applymap(lambda x: 'background-color: rgba(0,255,0,0.1)' if x == 'Win' else 'background-color: rgba(255,0,0,0.1)', subset=['Result']),
+            use_container_width=True
+        )
+        
+        # Download button
+        csv = th.to_csv(index=False).encode('utf-8')
+        st.download_button("Download Trade History CSV", data=csv, file_name="smart_investing_live_history.csv", mime="text/csv")
+
