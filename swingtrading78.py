@@ -36,7 +36,7 @@ warnings.filterwarnings("ignore")
 # ██  EDIT THESE TWO LINES TO UPDATE YOUR DHAN CREDENTIALS  ██████████████████
 # ══════════════════════════════════════════════════════════════════════════════
 DHAN_CLIENT_ID = "1104779876"
-DHAN_ACCESS_TOKEN = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzUxMiJ9.eyJpc3MiOiJkaGFuIiwicGFydG5lcklkIjoiIiwiZXhwIjoxNzc0OTI1NDU0LCJpYXQiOjE3NzQ4MzkwNTQsInRva2VuQ29uc3VtZXJUeXBlIjoiU0VMRiIsIndlYmhvb2tVcmwiOiIiLCJkaGFuQ2xpZW50SWQiOiIxMTA0Nzc5ODc2In0.S73HbJo2w3u6APCUK0W7ckcFvdmbz0HMwHQ4_39EPT-pdieyyY1tkXBs1ZnTqjov4By7MD4FZv6eCfj9ddgQhg"
+DHAN_ACCESS_TOKEN = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzUxMiJ9.eyJpc3MiOiJkaGFuIiwicGFydG5lcklkIjoiIiwiZXhwIjoxNzc1MTAwODA3LCJpYXQiOjE3NzUwMTQ0MDcsInRva2VuQ29uc3VtZXJUeXBlIjoiU0VMRiIsIndlYmhvb2tVcmwiOiIiLCJkaGFuQ2xpZW50SWQiOiIxMTA0Nzc5ODc2In0.KjRB4-T3G95_BrjnpWFX3H6h0IYSSKh1vUyfq-mri_eUGK0eJIa91IB_4K0IrNByxDSB56vwuFePTb8MBGjILw"
 # ══════════════════════════════════════════════════════════════════════════════
 
 st.set_page_config(page_title="AlgoTrader Pro", layout="wide", initial_sidebar_state="expanded")
