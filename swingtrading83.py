@@ -3649,8 +3649,8 @@ def render_config_ui():
         config['custom_ticker'] = st.sidebar.text_input("Enter Ticker Symbol", value="KAYNES.NS", help="e.g., KAYNES.NS, RELIANCE.NS, TCS.NS")
     
     # Timeframe
-    config['interval'] = st.sidebar.selectbox("Interval", list(INTERVAL_MAPPING.keys()), index=0)  # Default to 1 minute
-    config['period'] = st.sidebar.selectbox("Period", list(PERIOD_MAPPING.keys()), index=0)  # Default to 1 day
+    config['interval'] = st.sidebar.selectbox("Interval", list(INTERVAL_MAPPING.keys()), index=1)  # Default to 1 minute
+    config['period'] = st.sidebar.selectbox("Period", list(PERIOD_MAPPING.keys()), index=2)  # Default to 1 day
     
     # Quantity
     config['quantity'] = st.sidebar.number_input("Quantity", min_value=1, value=1)
@@ -3681,7 +3681,7 @@ def render_config_ui():
     # ── Trade Direction Filter ───────────────────────────────────────────────
     config['trade_direction'] = st.sidebar.selectbox(
         "Trade Direction Filter",
-        ["Both (LONG + SHORT)", "LONG Only", "SHORT Only"],
+        ["Both (BUY + SELL)", "BUY Only", "SELL Only"],
         index=0,
         help="Filters which trade directions the algo will take"
     )
@@ -3729,7 +3729,7 @@ def render_config_ui():
     # ── Entry Cooldown (Live Trading) ────────────────────────────────────────
     config['enable_entry_cooldown'] = st.sidebar.checkbox(
         "⏱️ Enable Entry Cooldown",
-        value=False,
+        value=True,
         help="Prevents immediate re-entry after exit (Live Trading only). Useful to avoid duplicate orders on same signal."
     )
     
@@ -3738,7 +3738,7 @@ def render_config_ui():
             "Cooldown Duration (seconds)",
             min_value=0,
             max_value=300,
-            value=60,
+            value=20,
             step=5,
             help="Number of seconds to wait after exit before allowing new entry"
         )
@@ -3749,7 +3749,7 @@ def render_config_ui():
     # ── Enhanced Live Trading Mode ────────────────────────────────────────────
     config['enhanced_live_trading'] = st.sidebar.checkbox(
         "🔄 Enhanced Live Trading (TradingView Match)",
-        value=False,
+        value=True,
         help=(
             "When enabled, fetches candlestick data at round time intervals matching your timeframe "
             "(e.g., 10:30:00, 10:31:00 for 1min; 10:30:00, 10:35:00 for 5min). "
@@ -3768,7 +3768,7 @@ def render_config_ui():
     # Display Last Candle Details
     config['show_last_candle'] = st.sidebar.checkbox(
         "📊 Show Last Candle Details",
-        value=False,
+        value=True,
         help="Display the last received candle with all calculated indicator values in Live Trading tab"
     )
     
@@ -3779,7 +3779,7 @@ def render_config_ui():
     # Strategy-specific parameters
     if config['strategy'] == 'EMA Crossover':
         config['ema_fast'] = st.sidebar.number_input("EMA Fast Period", min_value=1, value=9)
-        config['ema_slow'] = st.sidebar.number_input("EMA Slow Period", min_value=1, value=21)
+        config['ema_slow'] = st.sidebar.number_input("EMA Slow Period", min_value=1, value=15)
         config['ema_min_angle'] = st.sidebar.number_input("Min Angle (ABSOLUTE)", min_value=0.0, value=0.0, step=0.1)
         
         config['ema_entry_filter'] = st.sidebar.selectbox("Entry Filter", EMA_ENTRY_FILTERS, index=0)
