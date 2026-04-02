@@ -118,19 +118,27 @@ with tab1:
                 if in_trade:
                     h_sl = (c_low <= sl if t_type == 'Buy' else c_high >= sl)
                     h_tg = (c_high >= tg if t_type == 'Buy' else c_low <= tg)
-                    if h_sl and h_tg: violation_count += 1; h_tg = False # Conservative
+                    if h_sl and h_tg: violation_count += 1; h_tg = False
                     if h_sl or h_tg:
                         ex_p = sl if h_sl else tg
                         pnl = (ex_p - en_p) if t_type == 'Buy' else (en_p - ex_p)
-                        trades.append({'Type': t_type, 'Entry': en_p, 'Exit': ex_p, 'PnL': pnl, 'Time': df.index[i], 'Reason': 'SL' if h_sl else 'Tgt'})
+                        trades.append({
+                            'Entry Time': en_time, 
+                            'Exit Time': df.index[i],
+                            'Type': t_type, 'Entry': en_p, 'Exit': ex_p, 'PnL': pnl, 'Reason': 'SL' if h_sl else 'Tgt'
+                        })
                         in_trade, last_exit_time = False, df.index[i]
                 else:
                     if cooldown_enabled and last_exit_time and (df.index[i] - last_exit_time).total_seconds() < cooldown_sec: continue
-                    if (p_f < p_s and c_f > c_s) or strategy == "Simple Buy":
-                        in_trade, t_type, en_p = True, 'Buy', c_close
+                    
+                    buy_sig = (p_f < p_s and c_f > c_s) or strategy == "Simple Buy"
+                    sell_sig = (p_f > p_s and c_f < c_s) or strategy == "Simple Sell"
+
+                    if buy_sig:
+                        in_trade, t_type, en_p, en_time = True, 'Buy', c_close, df.index[i]
                         sl, tg = en_p - sl_val, en_p + tgt_val
-                    elif (p_f > p_s and c_f < c_s) or strategy == "Simple Sell":
-                        in_trade, t_type, en_p = True, 'Sell', c_close
+                    elif sell_sig:
+                        in_trade, t_type, en_p, en_time = True, 'Sell', c_close, df.index[i]
                         sl, tg = en_p + sl_val, en_p - tgt_val
 
             if trades:
@@ -138,7 +146,6 @@ with tab1:
                 won = tdf[tdf['PnL'] > 0]
                 lost = tdf[tdf['PnL'] <= 0]
                 
-                # --- Metrics Display ---
                 m1, m2, m3, m4, m5 = st.columns(5)
                 m1.metric("Total Trades", len(tdf))
                 m2.metric("Won / Lost", f"{len(won)} / {len(lost)}")
@@ -156,10 +163,28 @@ with tab1:
 # --- Tab 2: Live Trading ---
 with tab2:
     l_c1, l_c2 = st.columns(2)
-    if l_c1.button("▶ START LIVE", use_container_width=True, key="live_start"): st.session_state.live_running = True
-    if l_c2.button("🛑 STOP LIVE", use_container_width=True, key="live_stop"): st.session_state.live_running = False
+    if l_c1.button("▶ START LIVE", use_container_width=True, key="live_start"):
+        st.session_state.live_running = True
+        # IMMEDIATE ENTRY FOR SIMPLE STRATEGIES
+        if not st.session_state.current_position:
+            if strategy == "Simple Buy" or strategy == "Simple Sell":
+                temp_df = fetch_data(current_ticker, '1d', tf)
+                if temp_df is not None:
+                    current_ltp = float(temp_df['Close'].iloc[-1])
+                    t_type = "Buy" if strategy == "Simple Buy" else "Sell"
+                    sl = current_ltp - sl_val if t_type == "Buy" else current_ltp + sl_val
+                    tg = current_ltp + tgt_val if t_type == "Buy" else current_ltp - tgt_val
+                    
+                    st.session_state.current_position = {
+                        'type': t_type, 'entry_price': current_ltp,
+                        'sl': sl, 'tgt': tg, 'entry_time': datetime.now(IST)
+                    }
+                    place_order(t_type, config['opt_enabled'], config, current_ltp)
+                    st.toast(f"Immediate {t_type} Entry Executed!")
+
+    if l_c2.button("🛑 STOP LIVE", use_container_width=True, key="live_stop"): 
+        st.session_state.live_running = False
     
-    # Placeholders to prevent flickering and ID conflicts
     live_stat_container = st.empty()
     live_chart_container = st.empty()
 
@@ -172,26 +197,50 @@ with tab2:
                 ltp = float(last_candle['Close'])
                 f_val, s_val = float(last_candle['EMA_Fast']), float(last_candle['EMA_Slow'])
                 
-                # Update Info Header
-                live_stat_container.success(f"LIVE: {current_ticker} | LTP: {ltp:.2f} | EMA({fast_ema}): {f_val:.2f} | EMA({slow_ema}): {s_val:.2f}")
-                
-                # Generate Chart
-                fig_l = go.Figure()
-                # Use last 50 candles for visibility
+                # Check Exit Logic
+                if st.session_state.current_position:
+                    pos = st.session_state.current_position
+                    live_pnl = (ltp - pos['entry_price']) if pos['type'] == 'Buy' else (pos['entry_price'] - ltp)
+                    
+                    exit_flag, reason = False, ""
+                    if pos['type'] == 'Buy':
+                        if ltp <= pos['sl']: exit_flag, reason = True, "SL"
+                        elif ltp >= pos['tgt']: exit_flag, reason = True, "Target"
+                    else:
+                        if ltp >= pos['sl']: exit_flag, reason = True, "SL"
+                        elif ltp <= pos['tgt']: exit_flag, reason = True, "Target"
+                    
+                    if exit_flag:
+                        st.session_state.trade_history.append({
+                            'Entry Time': pos['entry_time'], 'Exit Time': datetime.now(IST),
+                            'Type': pos['type'], 'Entry': pos['entry_price'], 'Exit': ltp, 'PnL': live_pnl, 'Reason': reason
+                        })
+                        st.session_state.current_position = None
+                        st.toast(f"Position Closed: {reason}")
+                    
+                    live_stat_container.warning(f"ACTIVE TRADE: {pos['type']} @ {pos['entry_price']:.2f} | LIVE PnL: {live_pnl:.2f}")
+                else:
+                    live_stat_container.info(f"SCANNING: {current_ticker} | LTP: {ltp:.2f} | EMA({fast_ema}): {f_val:.2f}")
+
+                # Live Chart Generation
                 view_df = df_live.iloc[-50:]
+                fig_l = go.Figure()
                 fig_l.add_trace(go.Scatter(x=view_df.index, y=view_df['Close'], name="LTP", line=dict(color='white')))
                 fig_l.add_trace(go.Scatter(x=view_df.index, y=view_df['EMA_Fast'], name=f"EMA {fast_ema}", line=dict(color='cyan')))
                 fig_l.add_trace(go.Scatter(x=view_df.index, y=view_df['EMA_Slow'], name=f"EMA {slow_ema}", line=dict(color='magenta')))
                 
-                # Labels and Values overlay
-                fig_l.add_annotation(x=view_df.index[-1], y=f_val, text=f"EMA {fast_ema}: {f_val:.2f}", showarrow=True, arrowhead=1, font=dict(color="cyan"))
-                fig_l.add_annotation(x=view_df.index[-1], y=s_val, text=f"EMA {slow_ema}: {s_val:.2f}", showarrow=True, arrowhead=1, font=dict(color="magenta"))
+                # Plot active trade levels
+                if st.session_state.current_position:
+                    cp = st.session_state.current_position
+                    fig_l.add_hline(y=cp['entry_price'], line_dash="dot", line_color="yellow", annotation_text="ENTRY")
+                    fig_l.add_hline(y=cp['sl'], line_dash="dash", line_color="red", annotation_text="SL")
+                    fig_l.add_hline(y=cp['tgt'], line_dash="dash", line_color="green", annotation_text="TGT")
+
+                fig_l.add_annotation(x=view_df.index[-1], y=f_val, text=f"EMA {fast_ema}: {f_val:.2f}", showarrow=True, font=dict(color="cyan"))
+                fig_l.add_annotation(x=view_df.index[-1], y=s_val, text=f"EMA {slow_ema}: {s_val:.2f}", showarrow=True, font=dict(color="magenta"))
                 
-                fig_l.update_layout(template="plotly_dark", xaxis_rangeslider_visible=False, height=600, uirevision='constant', margin=dict(l=10, r=10, t=30, b=10))
-                
-                # UPDATE CONTENT INSIDE THE PLACEHOLDER
-                # This avoids the DuplicateKey error because the chart is being replaced in a container, not re-declared
-                live_chart_container.plotly_chart(fig_l, use_container_width=True, key=f"live_chart_{time.time()}") # Dynamic sub-key helps force refresh if needed, but placeholder is the primary fix
+                fig_l.update_layout(template="plotly_dark", xaxis_rangeslider_visible=False, height=600, uirevision='constant')
+                live_chart_container.plotly_chart(fig_l, use_container_width=True, key=f"live_chart_{time.time()}")
                 
             time.sleep(1.5)
 
@@ -199,6 +248,6 @@ with tab2:
 with tab3:
     st.subheader("Executed Live Trades")
     if st.session_state.trade_history: 
-        st.table(pd.DataFrame(st.session_state.trade_history))
+        st.dataframe(pd.DataFrame(st.session_state.trade_history), use_container_width=True)
     else: 
         st.info("No live trades recorded in this session.")
