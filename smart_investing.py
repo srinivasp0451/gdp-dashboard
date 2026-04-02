@@ -652,7 +652,8 @@ def live_loop(stop_evt: threading.Event):
                                 _log(f"📤 Dhan entry: {str(resp)[:80]}")
             time.sleep(1.5)
         except Exception as e:
-            _log(f"⚠️ {e}"); time.sleep(3)
+            _log(f"⚠️ Loop error: {type(e).__name__}: {e}")
+            time.sleep(3)
 
     with _LOCK: _LIVE["active"]=False
     _log("⏹ Live stopped")
@@ -682,11 +683,13 @@ def _base(df, cfg, h=640):
             name=f"EMA {cfg['slow_ema']}",
             line=dict(color=C["es"],width=1.7),connectgaps=False),row=1,col=1)
     if "Volume" in df.columns:
-        vc=[C["cup"] if float(df["Close"].iloc[k])>=float(df["Open"].iloc[k])
-            else C["cdn"] for k in range(len(df))]
-        fig.add_trace(go.Bar(x=df.index,y=df["Volume"],name="Vol",
-            marker_color=[c.replace(")",",0.4)").replace("rgb","rgba") if "rgb" in c
-                          else c+"88" for c in vc],showlegend=False),row=2,col=1)
+        # Use proper rgba — never append hex digits (Plotly rejects 8-digit hex)
+        VOL_UP = "rgba(0,212,170,0.45)"
+        VOL_DN = "rgba(255,75,92,0.45)"
+        vc = [VOL_UP if float(df["Close"].iloc[k]) >= float(df["Open"].iloc[k])
+              else VOL_DN for k in range(len(df))]
+        fig.add_trace(go.Bar(x=df.index, y=df["Volume"], name="Vol",
+            marker_color=vc, showlegend=False), row=2, col=1)
     fig.update_layout(**_LAY,height=h,
         yaxis=dict(showgrid=True,gridcolor=C["gr"]),
         yaxis2=dict(showgrid=True,gridcolor=C["gr"]),
@@ -1187,9 +1190,11 @@ Configure in the sidebar and click <b>Start</b> to begin live trading.</div>
     log_text = "\n".join(reversed(logs[-50:]))
     st.code(log_text or "Waiting for events…", language="")
 
-    # Auto-refresh every 2 s while live
+    # Auto-refresh every 3 s while live.
+    # IMPORTANT: sleep must be long enough that Streamlit's rerun-rate-limiter
+    # does not kill the session. 0.1 s causes an instant crash loop.
     if is_active:
-        time.sleep(0.1)
+        time.sleep(3)
         st.rerun()
 
 
@@ -1282,9 +1287,9 @@ def tab_history(cfg):
                            file_name="smart_investing_trades.csv",
                            mime="text/csv",use_container_width=True)
 
-    # Auto refresh while live
+    # Auto refresh while live (3 s — same guard as live tab)
     if is_active:
-        time.sleep(0.5)
+        time.sleep(3)
         st.rerun()
 
 
@@ -1317,4 +1322,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
