@@ -129,14 +129,14 @@ period = st.sidebar.selectbox("Period", TIMEFRAME_PERIODS[tf])
 
 st.sidebar.markdown("### Strategy Parameters")
 strategy = st.sidebar.selectbox("Strategy", ["EMA Crossover", "Simple Buy", "Simple Sell"])
-"""
+
 # Hidden/Commented Strategy Setup for Threshold Crossover
 # strategy = st.sidebar.selectbox("Strategy", ["EMA Crossover", "Threshold Cross"])
 # if strategy == "Threshold Cross":
 #    threshold_val = st.sidebar.number_input("Threshold Price", value=20000)
 #    cross_above_action = st.sidebar.selectbox("If Crosses Above", ["Buy", "Sell"])
 #    cross_below_action = st.sidebar.selectbox("If Crosses Below", ["Sell", "Buy"])
-"""
+
 fast_ema = st.sidebar.number_input("Fast EMA", value=9)
 slow_ema = st.sidebar.number_input("Slow EMA", value=15)
 
