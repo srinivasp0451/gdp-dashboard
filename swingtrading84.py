@@ -3,7 +3,7 @@ import pandas as pd
 import yfinance as yf
 import numpy as np
 import time
-from datetime import datetime, timedelta
+from datetime import datetime
 import pytz
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
@@ -52,9 +52,8 @@ def place_order(algo_signal, is_options, config, ltp):
     try:
         if not config['enable_dhan']: return "Paper Trade Success"
         
-        # Determine actual transaction type based on Options Buyer rule
         if is_options:
-            transaction_type = dhan.BUY # Always buy for options (CE or PE)
+            transaction_type = dhan.BUY 
             security_id = config['ce_id'] if algo_signal == 'Buy' else config['pe_id']
             exchange = config['opt_exchange']
             qty = config['opt_qty']
@@ -70,7 +69,6 @@ def place_order(algo_signal, is_options, config, ltp):
             
         price = ltp if o_type == "LIMIT" else 0
         
-        # Dhan Order call
         res = dhan.place_order(
             security_id=security_id, exchange_segment=exchange, transaction_type=transaction_type,
             quantity=qty, order_type=o_type, product_type=product, price=price
@@ -81,20 +79,25 @@ def place_order(algo_signal, is_options, config, ltp):
 
 # --- Data Fetching & Indicators ---
 def fetch_data(ticker, period, interval, warmup_days=20):
-    """Fetches data with a warmup period to ensure EMA accuracy"""
+    """Fetches data and enforces a flat 1D column structure to prevent Series ambiguity"""
     try:
-        # Extend period slightly to warmup EMAs if possible, yfinance strings are tricky, handling gracefully
         df = yf.download(ticker, period=period, interval=interval, progress=False)
-        if df.empty: return None
+        if df is None or df.empty: return None
+        
+        # FIX: Flatten MultiIndex columns (yfinance >= 0.2.40 behavior)
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = [col[0] for col in df.columns]
+            
+        # Ensure no duplicate columns
+        df = df.loc[:, ~df.columns.duplicated()]
+        
         df.index = df.index.tz_convert(IST) if df.index.tzinfo else df.index.tz_localize('UTC').tz_convert(IST)
         return df
-    except:
+    except Exception as e:
         return None
 
 def apply_indicators(df, fast_ema, slow_ema):
-    """Exact TradingView EMA Calculation"""
     if df is None or len(df) == 0: return df
-    # adjust=False makes it match TradingView's recursive calculation
     df['EMA_Fast'] = df['Close'].ewm(span=fast_ema, adjust=False).mean()
     df['EMA_Slow'] = df['Close'].ewm(span=slow_ema, adjust=False).mean()
     return df
@@ -104,11 +107,12 @@ def get_ltp_stats(ticker):
         tkr = yf.Ticker(ticker)
         todays_data = tkr.history(period='2d')
         if len(todays_data) >= 2:
-            prev_close = todays_data['Close'].iloc[-2]
-            ltp = todays_data['Close'].iloc[-1]
-            diff = float(ltp - prev_close)
-            pct = float((diff / prev_close) * 100)
-            return float(ltp), diff, pct
+            # Safely extract floats
+            prev_close = float(np.squeeze(todays_data['Close'].iloc[-2]))
+            ltp = float(np.squeeze(todays_data['Close'].iloc[-1]))
+            diff = ltp - prev_close
+            pct = (diff / prev_close) * 100
+            return ltp, diff, pct
         return None, None, None
     except:
         return None, None, None
@@ -206,28 +210,34 @@ with tab1:
                 violation_count = 0
                 last_exit_time = None
                 
-                # Single pass vectorised-style iteration
                 for i in range(1, len(df)):
                     row = df.iloc[i]
                     prev_row = df.iloc[i-1]
                     current_time = df.index[i]
                     
+                    # FIX: Safely extract purely scalar python floats from rows to prevent Series Truth Ambiguity
+                    c_close = float(np.squeeze(row['Close']))
+                    c_high = float(np.squeeze(row['High']))
+                    c_low = float(np.squeeze(row['Low']))
+                    
+                    p_fast = float(np.squeeze(prev_row['EMA_Fast']))
+                    p_slow = float(np.squeeze(prev_row['EMA_Slow']))
+                    c_fast = float(np.squeeze(row['EMA_Fast']))
+                    c_slow = float(np.squeeze(row['EMA_Slow']))
+                    
                     if in_trade:
-                        high, low = row['High'].item(), row['Low'].item()
                         hit_sl = False
                         hit_tgt = False
                         
-                        # Conservative SL check
                         if trade_type == 'Buy':
-                            if low <= sl: hit_sl = True
-                            if high >= tgt: hit_tgt = True
+                            if c_low <= sl: hit_sl = True
+                            if c_high >= tgt: hit_tgt = True
                         else:
-                            if high >= sl: hit_sl = True
-                            if low <= tgt: hit_tgt = True
+                            if c_high >= sl: hit_sl = True
+                            if c_low <= tgt: hit_tgt = True
                             
                         if hit_sl and hit_tgt:
                             violation_count += 1
-                            # Assume SL hit first in conservative approach
                             hit_tgt = False 
 
                         if hit_sl or hit_tgt:
@@ -236,7 +246,7 @@ with tab1:
                             trades.append({
                                 'Entry Time': entry_time, 'Exit Time': current_time,
                                 'Trade Type': trade_type, 'Entry Price': entry_price, 'Exit Price': exit_price,
-                                'SL': sl, 'Target': tgt, 'High': high, 'Low': low,
+                                'SL': sl, 'Target': tgt, 'High': c_high, 'Low': c_low,
                                 'Entry Reason': f"{strategy}", 'Exit Reason': 'SL' if hit_sl else 'Target',
                                 'PnL': pnl, 'Violation': 'Yes' if (hit_sl and hit_tgt) else 'No'
                             })
@@ -244,13 +254,11 @@ with tab1:
                             last_exit_time = current_time
                     
                     else:
-                        # Entry Logic
                         if cooldown_enabled and last_exit_time:
                             if (current_time - last_exit_time).total_seconds() < cooldown_sec: continue
                             
-                        # Signal Generation
-                        buy_signal = prev_row['EMA_Fast'] < prev_row['EMA_Slow'] and row['EMA_Fast'] > row['EMA_Slow']
-                        sell_signal = prev_row['EMA_Fast'] > prev_row['EMA_Slow'] and row['EMA_Fast'] < row['EMA_Slow']
+                        buy_signal = (p_fast < p_slow) and (c_fast > c_slow)
+                        sell_signal = (p_fast > p_slow) and (c_fast < c_slow)
                         
                         if strategy == "Simple Buy": buy_signal, sell_signal = True, False
                         if strategy == "Simple Sell": buy_signal, sell_signal = False, True
@@ -258,7 +266,7 @@ with tab1:
                         if buy_signal or sell_signal:
                             in_trade = True
                             trade_type = 'Buy' if buy_signal else 'Sell'
-                            entry_price = row['Close'].item()
+                            entry_price = c_close
                             entry_time = current_time
                             if trade_type == 'Buy':
                                 sl = entry_price - sl_val
@@ -267,7 +275,6 @@ with tab1:
                                 sl = entry_price + sl_val
                                 tgt = entry_price - tgt_val
                 
-                # Render Results
                 if trades:
                     tdf = pd.DataFrame(trades)
                     tdf['Accuracy'] = np.where(tdf['PnL'] > 0, 1, 0)
@@ -278,7 +285,6 @@ with tab1:
                         st.warning(f"⚠️ {violation_count} trades violated the High/Low rule (Candle crossed both SL and Target). Counted as SL conservatively.")
                     st.dataframe(tdf)
                     
-                    # Plot
                     fig = make_subplots(rows=1, cols=1)
                     fig.add_trace(go.Candlestick(x=df.index, open=df['Open'], high=df['High'], low=df['Low'], close=df['Close'], name='Price'))
                     fig.add_trace(go.Scatter(x=df.index, y=df['EMA_Fast'], line=dict(color='blue'), name='Fast EMA'))
@@ -300,11 +306,9 @@ with tab2:
     if stop_btn: st.session_state.live_running = False
     if sq_btn and st.session_state.current_position:
         st.toast("Squaring off position...")
-        # Fire dhan exit order
         place_order('Sell' if st.session_state.current_position['type'] == 'Buy' else 'Buy', config['opt_enabled'], config, ltp)
         st.session_state.current_position = None
 
-    # Placeholders for UI updates to prevent full-page flicker
     config_placeholder = st.empty()
     status_placeholder = st.empty()
     chart_placeholder = st.empty()
@@ -314,25 +318,28 @@ with tab2:
         
         while st.session_state.live_running:
             try:
-                # 1. Fetch live tick/candle data
                 df = fetch_data(current_ticker, '5d', tf)
                 if df is not None:
                     df = apply_indicators(df, fast_ema, slow_ema)
                     last_row = df.iloc[-1]
                     prev_row = df.iloc[-2]
-                    current_ltp = last_row['Close'].item()
+                    
+                    # FIX: Isolate safe floats
+                    current_ltp = float(np.squeeze(last_row['Close']))
+                    p_fast = float(np.squeeze(prev_row['EMA_Fast']))
+                    p_slow = float(np.squeeze(prev_row['EMA_Slow']))
+                    c_fast = float(np.squeeze(last_row['EMA_Fast']))
+                    c_slow = float(np.squeeze(last_row['EMA_Slow']))
+                    
                     current_time_dt = datetime.now(IST)
                     
-                    # Update status
-                    status_placeholder.write(f"Last Fetched: {current_time_dt.strftime('%H:%M:%S')} | LTP: {current_ltp:.2f} | Fast EMA: {last_row['EMA_Fast']:.2f}")
+                    status_placeholder.write(f"Last Fetched: {current_time_dt.strftime('%H:%M:%S')} | LTP: {current_ltp:.2f} | Fast EMA: {c_fast:.2f}")
 
-                    # 2. Position Management (Tick-level checking)
                     if st.session_state.current_position:
                         pos = st.session_state.current_position
                         exit_signal = False
                         exit_reason = ""
                         
-                        # Check LTP against SL/TGT
                         if pos['type'] == 'Buy':
                             if current_ltp <= pos['sl']: exit_signal, exit_reason = True, "SL"
                             elif current_ltp >= pos['tgt']: exit_signal, exit_reason = True, "Target"
@@ -344,7 +351,6 @@ with tab2:
                             pnl = (pos['sl'] if exit_reason == "SL" else pos['tgt']) - pos['entry_price']
                             if pos['type'] == 'Sell': pnl = -pnl
                             
-                            # Fire Broker Exit
                             place_order('Sell' if pos['type'] == 'Buy' else 'Buy', config['opt_enabled'], config, current_ltp)
                             
                             st.session_state.trade_history.append({
@@ -356,28 +362,27 @@ with tab2:
                             st.session_state.last_signal_time = current_time_dt
                             st.toast(f"Position Exited: {exit_reason}")
 
-                    # 3. Signal Generation (Candle Close Check)
-                    # For a 5m timeframe, only check logic if minute is multiple of 5
-                    tf_mins = int(tf.replace('m','')) if 'm' in tf else 60 # Simplified parser
+                    # Determine minutes for timeframe logic
+                    if tf.endswith('m'): tf_mins = int(tf.replace('m', ''))
+                    elif tf.endswith('h'): tf_mins = int(tf.replace('h', '')) * 60
+                    else: tf_mins = 1440 # Default fallback for days/weeks
+                    
                     if current_time_dt.minute % tf_mins == 0 and current_time_dt.second < 5: 
-                        
                         if not st.session_state.current_position or not no_overlap:
-                            # Cooldown check
                             cooldown_ok = True
                             if cooldown_enabled and st.session_state.last_signal_time:
                                 if (current_time_dt - st.session_state.last_signal_time).total_seconds() < cooldown_sec:
                                     cooldown_ok = False
                                     
                             if cooldown_ok:
-                                buy_sig = prev_row['EMA_Fast'] < prev_row['EMA_Slow'] and last_row['EMA_Fast'] > last_row['EMA_Slow']
-                                sell_sig = prev_row['EMA_Fast'] > prev_row['EMA_Slow'] and last_row['EMA_Fast'] < last_row['EMA_Slow']
+                                buy_sig = (p_fast < p_slow) and (c_fast > c_slow)
+                                sell_sig = (p_fast > p_slow) and (c_fast < c_slow)
                                 
                                 if buy_sig or sell_sig:
                                     trade_type = 'Buy' if buy_sig else 'Sell'
                                     sl = current_ltp - sl_val if trade_type == 'Buy' else current_ltp + sl_val
                                     tgt = current_ltp + tgt_val if trade_type == 'Buy' else current_ltp - tgt_val
                                     
-                                    # Fire Broker Entry
                                     place_order(trade_type, config['opt_enabled'], config, current_ltp)
                                     
                                     st.session_state.current_position = {
@@ -386,7 +391,6 @@ with tab2:
                                     }
                                     st.toast(f"New Position Entered: {trade_type}")
 
-                    # 4. Chart Update
                     fig_live = go.Figure()
                     fig_live.add_trace(go.Scatter(x=df.index[-50:], y=df['Close'].iloc[-50:], mode='lines', name='Price'))
                     fig_live.add_trace(go.Scatter(x=df.index[-50:], y=df['EMA_Fast'].iloc[-50:], line=dict(color='blue'), name='Fast EMA'))
@@ -401,7 +405,6 @@ with tab2:
             except Exception as e:
                 status_placeholder.error(f"Live loop error: {e}")
             
-            # API Rate Limit Protection
             time.sleep(1.5)
 
 # --- Tab 3: Trade History ---
