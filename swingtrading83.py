@@ -4128,7 +4128,7 @@ def render_config_ui():
     
     # Stop Loss Configuration
     st.sidebar.subheader("🛡️ Stop Loss")
-    config['sl_type'] = st.sidebar.selectbox("SL Type", SL_TYPES, index=9)
+    config['sl_type'] = st.sidebar.selectbox("SL Type", SL_TYPES, index=0)
     
     if 'Points' in config['sl_type'] or config['sl_type'] in ['Custom Points', 'ATR-based', 
                                                                 'Trailing SL (Points)', 
@@ -4150,10 +4150,10 @@ def render_config_ui():
     
     # Target Configuration
     st.sidebar.subheader("🎯 Target")
-    config['target_type'] = st.sidebar.selectbox("Target Type", TARGET_TYPES, index=2)
+    config['target_type'] = st.sidebar.selectbox("Target Type", TARGET_TYPES, index=0)
     
     if 'Points' in config['target_type'] or config['target_type'] in ['Custom Points', 'Trailing Target (Points)']:
-        config['target_points'] = st.sidebar.number_input("Target Points", min_value=1, value=200)
+        config['target_points'] = st.sidebar.number_input("Target Points", min_value=1, value=20)
     
     if config['target_type'] == 'P&L Based (Rupees)':
         config['target_rupees'] = st.sidebar.number_input("Target Rupees", min_value=1, value=200)
