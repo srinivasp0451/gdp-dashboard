@@ -547,6 +547,13 @@ def run_backtest(df_raw, cfg, bt_start_ts):
     return {"trades":trades,"violations":violations,"stats":stats,"df":df}
 
 
+# ─── CHART BUILDERS ──────────────────────────────────────────────────────────
+_LAY = dict(template="plotly_dark",paper_bgcolor=C["bg"],plot_bgcolor=C["bg"],
+            font=dict(color="#ccd6f6",size=11),
+            margin=dict(l=8,r=8,t=28,b=8),
+            legend=dict(orientation="h",y=1.04,x=0,bgcolor="rgba(0,0,0,0)"),
+            xaxis_rangeslider_visible=False)
+
 # ─── LIVE TRADING THREAD ─────────────────────────────────────────────────────
 def _log(msg):
     ts = datetime.datetime.now(IST).strftime("%H:%M:%S")
