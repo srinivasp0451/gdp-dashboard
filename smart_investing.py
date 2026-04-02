@@ -109,19 +109,38 @@ C = {"cup":"#00d4aa","cdn":"#ff4b5c","ef":"#ffd166","es":"#a78bfa",
      "bg":"#0d1117","gr":"rgba(255,255,255,0.05)"}
 
 # ─── GLOBAL LIVE STATE ───────────────────────────────────────────────────────
-_LOCK = threading.Lock()
-_LIVE: dict = {
-    "active":False,"position":None,"completed_trades":[],
-    "log":[],"last_ltp":None,"prev_close":None,
-    "last_candle":None,"df":None,"config":None,
-}
+# CRITICAL: @st.cache_resource makes these survive Streamlit reruns.
+# Plain module-level dicts get RE-CREATED on every rerun → resets active=False
+# → live loop appears to stop after first refresh. cache_resource fixes this.
+@st.cache_resource
+def _get_live_state():
+    return {
+        "active":           False,
+        "position":         None,
+        "completed_trades": [],
+        "log":              [],
+        "last_ltp":         None,
+        "prev_close":       None,
+        "last_candle":      None,
+        "df":               None,
+        "config":           None,
+        "_thread":          None,
+        "_stop_evt":        None,
+    }
+
+@st.cache_resource
+def _get_lock():
+    return threading.Lock()
+
+_LIVE = _get_live_state()
+_LOCK = _get_lock()
 
 # ─── SESSION STATE ────────────────────────────────────────────────────────────
 def _init():
-    defs = {"live_thread":None,"live_stop":None,"live_active":False,
-            "bt_results":None,"bt_cfg":None}
-    for k,v in defs.items():
-        if k not in st.session_state: st.session_state[k]=v
+    defs = {"bt_results": None, "bt_cfg": None}
+    for k, v in defs.items():
+        if k not in st.session_state:
+            st.session_state[k] = v
 _init()
 
 
@@ -535,136 +554,6 @@ def _log(msg):
         _LIVE["log"].append(f"[{ts}] {msg}")
         if len(_LIVE["log"])>200: _LIVE["log"]=_LIVE["log"][-200:]
 
-def live_loop(stop_evt: threading.Event):
-    """
-    Runs every ~1.5 s.
-    Tick: SL/Target checked against LTP on every iteration.
-    Bar : New signal checked only when last closed bar changes
-          (signal on closed bar N → entry at current forming bar open).
-    """
-    with _LOCK: cfg = dict(_LIVE["config"])
-    ticker    = cfg["ticker"]; tf = cfg["timeframe"]
-    last_bt   = None; last_fetch = 0.0; cooldown_until = 0.0
-
-    dhan = None
-    if cfg.get("dhan_enabled") and cfg.get("dhan_client_id"):
-        dhan = _dhan_client(cfg["dhan_client_id"], cfg["dhan_access_token"])
-        if dhan: _log("✅ Dhan connected")
-        else:    _log("⚠️ Dhan init failed")
-
-    _log(f"▶ Started | {ticker} | {tf} | {cfg['strategy']}")
-
-    while not stop_evt.is_set():
-        try:
-            now = time.time()
-            if now - last_fetch < 1.5: time.sleep(0.1); continue
-            last_fetch = now
-
-            # fetch
-            df = fetch_data(ticker, tf, cfg["period"], cfg["slow_ema"])
-            if df.empty: time.sleep(2); continue
-            df_i = build_indicators(df, cfg)
-
-            ltp,prev,_,_ = get_ltp(ticker)
-            if ltp is None: ltp = float(df_i["Close"].iloc[-1])
-
-            with _LOCK:
-                _LIVE["last_ltp"]   = ltp
-                _LIVE["prev_close"] = prev
-                _LIVE["df"]         = df_i
-                row = df_i.iloc[-1].to_dict()
-                row["Time"] = str(df_i.index[-1])
-                _LIVE["last_candle"] = row
-
-            # ── Tick-level SL / Target check (LTP, not OHLC) ───────────
-            with _LOCK: pos = _LIVE["position"]
-            if pos:
-                sig=pos["signal"]; sl=pos["sl_price"]; tgt=pos["tgt_price"]
-                ex_p=ex_r=None
-
-                if sig=="BUY":
-                    if ltp<=sl:   ex_p,ex_r=ltp,"Stop Loss"
-                    elif ltp>=tgt and cfg["tgt_type"]!="Trailing Target":
-                        ex_p,ex_r=ltp,"Target"
-                else:
-                    if ltp>=sl:   ex_p,ex_r=ltp,"Stop Loss"
-                    elif ltp<=tgt and cfg["tgt_type"]!="Trailing Target":
-                        ex_p,ex_r=ltp,"Target"
-
-                # Trailing SL
-                if cfg["sl_type"]=="Trailing SL" and ex_p is None:
-                    trail=cfg.get("custom_sl_pts",10.0)
-                    with _LOCK:
-                        if sig=="BUY":
-                            _LIVE["position"]["sl_price"]=max(_LIVE["position"]["sl_price"],ltp-trail)
-                        else:
-                            _LIVE["position"]["sl_price"]=min(_LIVE["position"]["sl_price"],ltp+trail)
-
-                # Reverse EMA on closed bar
-                if ex_p is None and len(df_i)>=2:
-                    ci = len(df_i)-2
-                    if cfg["sl_type"]=="Reverse EMA Crossover" and _rev_ema(df_i,ci,sig):
-                        ex_p,ex_r=ltp,"Reverse EMA Crossover"
-                    elif cfg["tgt_type"]=="EMA Crossover" and _rev_ema(df_i,ci,sig):
-                        ex_p,ex_r=ltp,"EMA Target (Reverse Cross)"
-
-                if ex_p is not None:
-                    with _LOCK:
-                        p2 = _LIVE["position"]
-                        raw = ex_p-p2["entry_price"]
-                        pnl = raw*cfg["qty"] if sig=="BUY" else -raw*cfg["qty"]
-                        done={**p2,"exit_time":datetime.datetime.now(IST),
-                              "exit_price":round(ex_p,2),"exit_reason":ex_r,
-                              "pnl":round(pnl,2),"result":"✅ Win" if pnl>0 else "❌ Loss"}
-                        _LIVE["completed_trades"].append(done)
-                        _LIVE["position"]=None
-                    _log(f"🔴 EXIT {sig}@{ex_p:.2f} | {ex_r} | PnL:{pnl:+.2f}")
-                    if dhan and cfg.get("dhan_enabled"):
-                        resp=_exit_order(dhan,cfg,p2,ex_p)
-                        _log(f"📤 Dhan exit: {str(resp)[:80]}")
-                    if cfg.get("use_cooldown",True):
-                        cooldown_until=time.time()+cfg.get("cooldown_secs",5)
-
-            # ── Bar-level: check for new signal ─────────────────────────
-            if len(df_i)>=2:
-                closed_bt = df_i.index[-2]
-                if last_bt is None or closed_bt!=last_bt:
-                    last_bt=closed_bt; ci=len(df_i)-2
-                    with _LOCK: has_pos=_LIVE["position"] is not None
-                    if not has_pos and time.time()>=cooldown_until:
-                        sig=get_signal(df_i, ci, cfg)
-                        if sig:
-                            if cfg["strategy"]=="EMA Crossover":
-                                ep=float(df_i["Open"].iloc[-1])
-                                rsn=f"EMA {cfg['fast_ema']}/{cfg['slow_ema']} {'Bullish' if sig=='BUY' else 'Bearish'} Cross"
-                            else:
-                                ep=float(df_i["Close"].iloc[-2]); rsn=cfg["strategy"]
-                            sl  = _compute_sl(ep,sig,df_i,ci,cfg)
-                            tgt = _compute_tgt(ep,sig,df_i,ci,cfg,sl)
-                            np2 = {"signal":sig,"entry_time":datetime.datetime.now(IST),
-                                   "entry_price":round(ep,2),"sl_price":round(sl,2),
-                                   "tgt_price":round(tgt,2),"init_sl":round(sl,2),
-                                   "init_tgt":round(tgt,2),"reason_in":rsn}
-                            with _LOCK: _LIVE["position"]=np2
-                            _log(f"🟢 ENTRY {sig}@{ep:.2f}|SL:{sl:.2f}|Tgt:{tgt:.2f}")
-                            if dhan and cfg.get("dhan_enabled"):
-                                resp = (_option_order if cfg.get("dhan_options_enabled") else _equity_order)(dhan,cfg,sig,ep)
-                                _log(f"📤 Dhan entry: {str(resp)[:80]}")
-            time.sleep(1.5)
-        except Exception as e:
-            _log(f"⚠️ Loop error: {type(e).__name__}: {e}")
-            time.sleep(3)
-
-    with _LOCK: _LIVE["active"]=False
-    _log("⏹ Live stopped")
-
-
-# ─── CHART BUILDERS ──────────────────────────────────────────────────────────
-_LAY = dict(template="plotly_dark",paper_bgcolor=C["bg"],plot_bgcolor=C["bg"],
-            font=dict(color="#ccd6f6",size=11),
-            margin=dict(l=8,r=8,t=28,b=8),
-            legend=dict(orientation="h",y=1.04,x=0,bgcolor="rgba(0,0,0,0)"),
-            xaxis_rangeslider_visible=False)
 
 def _base(df, cfg, h=640):
     fig = make_subplots(rows=2,cols=1,shared_xaxes=True,
@@ -1076,126 +965,322 @@ This is the fundamental gap between backtesting and live trading.</span>
         st.plotly_chart(fig2,use_container_width=True)
 
 
+# ─── LIVE TRADING THREAD ─────────────────────────────────────────────────────
+def _log(msg: str):
+    ts = datetime.datetime.now(IST).strftime("%H:%M:%S")
+    with _LOCK:
+        _LIVE["log"].append(f"[{ts}] {msg}")
+        if len(_LIVE["log"]) > 200:
+            _LIVE["log"] = _LIVE["log"][-200:]
+
+def live_loop(stop_evt: threading.Event):
+    """
+    Background thread — runs every ~2 s.
+    Tick : SL/Target checked against live LTP on every iteration.
+    Bar  : New signal checked only when the last closed bar changes.
+           EMA Crossover: signal on closed bar N → entry at forming bar open.
+           Simple Buy/Sell: entry at last closed bar close.
+    """
+    with _LOCK:
+        cfg = dict(_LIVE["config"])
+    ticker   = cfg["ticker"]
+    tf       = cfg["timeframe"]
+    last_bt  = None
+    last_fetch = 0.0
+    cooldown_until = 0.0
+
+    # Dhan init
+    dhan = None
+    if cfg.get("dhan_enabled") and cfg.get("dhan_client_id"):
+        dhan = _dhan_client(cfg["dhan_client_id"], cfg["dhan_access_token"])
+        _log("✅ Dhan connected" if dhan else "⚠️ Dhan init failed")
+
+    _log(f"▶ Started | {ticker} | {tf} | {cfg['strategy']}")
+
+    while not stop_evt.is_set():
+        try:
+            now = time.time()
+            # Rate-limit: one fetch per 2 s
+            if now - last_fetch < 2.0:
+                time.sleep(0.2)
+                continue
+            last_fetch = now
+
+            # ── Fetch OHLCV + build indicators ──────────────────────────
+            df = fetch_data(ticker, tf, cfg["period"], cfg["slow_ema"])
+            if df is None or df.empty:
+                _log("⚠️ Empty data, retrying…")
+                time.sleep(3)
+                continue
+            df_i = build_indicators(df, cfg)
+
+            # ── Get LTP ─────────────────────────────────────────────────
+            ltp, prev, _, _ = get_ltp(ticker)
+            if ltp is None:
+                ltp = float(df_i["Close"].iloc[-1])
+
+            with _LOCK:
+                _LIVE["last_ltp"]    = ltp
+                _LIVE["prev_close"]  = prev
+                _LIVE["df"]          = df_i
+                row = {k: (float(v) if isinstance(v, (int, float, np.floating, np.integer))
+                           else str(v))
+                       for k, v in df_i.iloc[-1].items()}
+                row["Time"] = str(df_i.index[-1])
+                _LIVE["last_candle"] = row
+
+            # ── Tick: check SL/Target against LTP (not OHLC) ────────────
+            with _LOCK:
+                pos = _LIVE["position"]
+
+            if pos:
+                sig = pos["signal"]
+                sl  = pos["sl_price"]
+                tgt = pos["tgt_price"]
+                ex_p = ex_r = None
+
+                if sig == "BUY":
+                    if ltp <= sl:
+                        ex_p, ex_r = ltp, "Stop Loss"
+                    elif ltp >= tgt and cfg["tgt_type"] != "Trailing Target":
+                        ex_p, ex_r = ltp, "Target"
+                else:
+                    if ltp >= sl:
+                        ex_p, ex_r = ltp, "Stop Loss"
+                    elif ltp <= tgt and cfg["tgt_type"] != "Trailing Target":
+                        ex_p, ex_r = ltp, "Target"
+
+                # Trailing SL update
+                if cfg["sl_type"] == "Trailing SL" and ex_p is None:
+                    trail = cfg.get("custom_sl_pts", 10.0)
+                    with _LOCK:
+                        cur = _LIVE["position"]["sl_price"]
+                        new_sl = (ltp - trail) if sig == "BUY" else (ltp + trail)
+                        _LIVE["position"]["sl_price"] = max(cur, new_sl) if sig == "BUY" else min(cur, new_sl)
+
+                # Reverse EMA on last closed bar
+                if ex_p is None and len(df_i) >= 2:
+                    ci = len(df_i) - 2
+                    if cfg["sl_type"] == "Reverse EMA Crossover" and _rev_ema(df_i, ci, sig):
+                        ex_p, ex_r = ltp, "Reverse EMA Crossover"
+                    elif cfg["tgt_type"] == "EMA Crossover" and _rev_ema(df_i, ci, sig):
+                        ex_p, ex_r = ltp, "EMA Target (Reverse Cross)"
+
+                # Close trade
+                if ex_p is not None:
+                    with _LOCK:
+                        p2  = _LIVE["position"]
+                        raw = ex_p - p2["entry_price"]
+                        pnl = raw * cfg["qty"] if sig == "BUY" else -raw * cfg["qty"]
+                        done = {
+                            **p2,
+                            "exit_time":   datetime.datetime.now(IST),
+                            "exit_price":  round(ex_p, 2),
+                            "exit_reason": ex_r,
+                            "pnl":         round(pnl, 2),
+                            "result":      "✅ Win" if pnl > 0 else "❌ Loss",
+                        }
+                        _LIVE["completed_trades"].append(done)
+                        _LIVE["position"] = None
+                    _log(f"🔴 EXIT {sig} @ {ex_p:.2f} | {ex_r} | PnL: {pnl:+.2f}")
+                    if dhan and cfg.get("dhan_enabled"):
+                        resp = _exit_order(dhan, cfg, p2, ex_p)
+                        _log(f"📤 Dhan exit: {str(resp)[:80]}")
+                    if cfg.get("use_cooldown", True):
+                        cooldown_until = time.time() + cfg.get("cooldown_secs", 5)
+
+            # ── Bar: new entry signal on closed bar ──────────────────────
+            if len(df_i) >= 2:
+                closed_bt = df_i.index[-2]
+                if last_bt is None or closed_bt != last_bt:
+                    last_bt = closed_bt
+                    ci = len(df_i) - 2
+                    with _LOCK:
+                        has_pos = _LIVE["position"] is not None
+                    if not has_pos and time.time() >= cooldown_until:
+                        sig = get_signal(df_i, ci, cfg)
+                        if sig:
+                            if cfg["strategy"] == "EMA Crossover":
+                                ep  = float(df_i["Open"].iloc[-1])
+                                rsn = (f"EMA {cfg['fast_ema']}/{cfg['slow_ema']} "
+                                       f"{'Bullish' if sig == 'BUY' else 'Bearish'} Cross")
+                            else:
+                                ep  = float(df_i["Close"].iloc[-2])
+                                rsn = cfg["strategy"]
+                            sl  = _compute_sl(ep, sig, df_i, ci, cfg)
+                            tgt = _compute_tgt(ep, sig, df_i, ci, cfg, sl)
+                            new_pos = {
+                                "signal":      sig,
+                                "entry_time":  datetime.datetime.now(IST),
+                                "entry_price": round(ep, 2),
+                                "sl_price":    round(sl, 2),
+                                "tgt_price":   round(tgt, 2),
+                                "init_sl":     round(sl, 2),
+                                "init_tgt":    round(tgt, 2),
+                                "reason_in":   rsn,
+                            }
+                            with _LOCK:
+                                _LIVE["position"] = new_pos
+                            _log(f"🟢 ENTRY {sig} @ {ep:.2f} | SL:{sl:.2f} | Tgt:{tgt:.2f}")
+                            if dhan and cfg.get("dhan_enabled"):
+                                fn   = _option_order if cfg.get("dhan_options_enabled") else _equity_order
+                                resp = fn(dhan, cfg, sig, ep)
+                                _log(f"📤 Dhan entry: {str(resp)[:80]}")
+
+            time.sleep(2.0)
+
+        except Exception as e:
+            _log(f"⚠️ {type(e).__name__}: {e}")
+            time.sleep(3)
+
+    with _LOCK:
+        _LIVE["active"] = False
+    _log("⏹ Stopped")
+
+
 # ─── LIVE TRADING TAB ─────────────────────────────────────────────────────────
 def tab_live(cfg):
-    # LTP placeholder — updates without full rerun
-    ltp_ph  = st.empty()
-    with _LOCK: ltp_now = _LIVE["last_ltp"]
-    cur_ltp = ltp_card(cfg["ticker"], ltp_ph)
+    # ── LTP header ──────────────────────────────────────────────────────────
+    ltp_ph = st.empty()
+    ltp_card(cfg["ticker"], ltp_ph)
 
-    # Status badge
-    with _LOCK: is_active = _LIVE["active"]
-    badge = '<span class="badge-live">🟢 LIVE</span>' if is_active else '<span class="badge-idle">⚫ IDLE</span>'
-    st.markdown(badge,unsafe_allow_html=True)
+    # ── Read shared state once at top of this render ─────────────────────────
+    with _LOCK:
+        is_active = _LIVE["active"]
+        pos       = _LIVE["position"]
+        ltp_now   = _LIVE["last_ltp"]
+        live_cfg  = _LIVE["config"] or cfg
+        logs      = list(_LIVE["log"])
+        lc        = _LIVE["last_candle"]
+        df_live   = _LIVE["df"]
 
-    # Control buttons
-    bc1,bc2,bc3 = st.columns(3)
-    start_btn   = bc1.button("▶️  Start",  type="primary",  use_container_width=True,
-                             disabled=is_active)
-    stop_btn    = bc2.button("⏹  Stop",   type="secondary", use_container_width=True,
-                             disabled=not is_active)
-    sq_btn      = bc3.button("⚡ Square Off", use_container_width=True,
-                             disabled=not is_active)
+    # ── Status ───────────────────────────────────────────────────────────────
+    if is_active:
+        st.markdown('<span class="badge-live">🟢 LIVE — refreshing every 3 s</span>',
+                    unsafe_allow_html=True)
+    else:
+        st.markdown('<span class="badge-idle">⚫ IDLE</span>', unsafe_allow_html=True)
 
-    # START
+    # ── Control buttons ──────────────────────────────────────────────────────
+    bc1, bc2, bc3 = st.columns(3)
+    start_btn = bc1.button("▶️  Start",      type="primary",    use_container_width=True,
+                           disabled=is_active)
+    stop_btn  = bc2.button("⏹  Stop",        type="secondary",  use_container_width=True,
+                           disabled=not is_active)
+    sq_btn    = bc3.button("⚡ Square Off",                       use_container_width=True,
+                           disabled=not is_active)
+
+    # ── START ────────────────────────────────────────────────────────────────
     if start_btn:
-        stop_evt = threading.Event()
         with _LOCK:
-            _LIVE["active"]=True; _LIVE["config"]=cfg.copy()
-            _LIVE["position"]=None; _LIVE["log"]=[]
+            # Clean slate for new run
+            _LIVE["active"]            = True
+            _LIVE["config"]            = cfg.copy()
+            _LIVE["position"]          = None
+            _LIVE["log"]               = []
+            _LIVE["last_ltp"]          = None
+            _LIVE["prev_close"]        = None
+            _LIVE["last_candle"]       = None
+            _LIVE["df"]                = None
+        # Start thread
+        stop_evt = threading.Event()
         t = threading.Thread(target=live_loop, args=(stop_evt,), daemon=True)
         t.start()
-        st.session_state.live_thread = t
-        st.session_state.live_stop   = stop_evt
-        st.session_state.live_active = True
+        with _LOCK:
+            _LIVE["_thread"]   = t
+            _LIVE["_stop_evt"] = stop_evt
         st.rerun()
 
-    # STOP
+    # ── STOP ─────────────────────────────────────────────────────────────────
     if stop_btn:
-        ev = st.session_state.get("live_stop")
-        if ev: ev.set()
-        with _LOCK: _LIVE["active"]=False
-        st.session_state.live_active=False
+        with _LOCK:
+            ev = _LIVE.get("_stop_evt")
+        if ev:
+            ev.set()
+        with _LOCK:
+            _LIVE["active"] = False
         st.rerun()
 
-    # SQUARE OFF
+    # ── SQUARE OFF ───────────────────────────────────────────────────────────
     if sq_btn:
         with _LOCK:
-            pos=_LIVE["position"]; lcfg=_LIVE["config"] or cfg
-        if pos:
-            ltp2,_,_,_ = get_ltp(cfg["ticker"])
-            ltp2 = ltp2 or pos["entry_price"]
-            sig  = pos["signal"]
-            raw  = ltp2-pos["entry_price"]
-            pnl  = raw*cfg["qty"] if sig=="BUY" else -raw*cfg["qty"]
+            pos2    = _LIVE["position"]
+            lcfg2   = _LIVE["config"] or cfg
+        if pos2:
+            ltp2, _, _, _ = get_ltp(cfg["ticker"])
+            ltp2 = ltp2 or pos2["entry_price"]
+            sig  = pos2["signal"]
+            raw  = ltp2 - pos2["entry_price"]
+            pnl  = raw * lcfg2["qty"] if sig == "BUY" else -raw * lcfg2["qty"]
             with _LOCK:
-                done={**pos,"exit_time":datetime.datetime.now(IST),
-                      "exit_price":round(ltp2,2),"exit_reason":"Manual Square Off",
-                      "pnl":round(pnl,2),"result":"✅ Win" if pnl>0 else "❌ Loss"}
+                done = {**pos2,
+                        "exit_time":   datetime.datetime.now(IST),
+                        "exit_price":  round(ltp2, 2),
+                        "exit_reason": "Manual Square Off",
+                        "pnl":         round(pnl, 2),
+                        "result":      "✅ Win" if pnl > 0 else "❌ Loss"}
                 _LIVE["completed_trades"].append(done)
-                _LIVE["position"]=None
-            _log(f"⚡ SQUARE OFF {sig}@{ltp2:.2f} | PnL:{pnl:+.2f}")
-            if lcfg.get("dhan_enabled"):
-                dhan=_dhan_client(lcfg.get("dhan_client_id",""),lcfg.get("dhan_access_token",""))
-                if dhan: _exit_order(dhan,lcfg,pos,ltp2)
-            st.success(f"Position squared off @ ₹{ltp2:.2f}"); st.rerun()
+                _LIVE["position"] = None
+            _log(f"⚡ SQUARE OFF {sig} @ {ltp2:.2f} | PnL: {pnl:+.2f}")
+            if lcfg2.get("dhan_enabled"):
+                dh = _dhan_client(lcfg2.get("dhan_client_id", ""), lcfg2.get("dhan_access_token", ""))
+                if dh:
+                    _exit_order(dh, lcfg2, pos2, ltp2)
+            st.success(f"Position squared off @ ₹{ltp2:.2f}")
+            st.rerun()
         else:
-            st.info("No open position to square off.")
+            st.warning("No open position.")
 
+    # ── IDLE STATE ───────────────────────────────────────────────────────────
     if not is_active:
-        st.markdown("""<div style="text-align:center;padding:50px 0;color:#8892b0">
-<div style="font-size:3rem">🚀</div>
-<div style="font-size:1rem;margin-top:8px">
-Configure in the sidebar and click <b>Start</b> to begin live trading.</div>
-</div>""",unsafe_allow_html=True)
+        st.markdown("""
+<div style="text-align:center;padding:55px 0;color:#8892b0">
+  <div style="font-size:3rem">🚀</div>
+  <div style="font-size:1rem;margin-top:8px">
+    Configure in the sidebar, then click <b>Start</b>.</div>
+</div>""", unsafe_allow_html=True)
         return
 
-    # Config display
+    # ── Active: show everything ──────────────────────────────────────────────
+    st.divider()
+
+    # Config cards
     st.markdown("#### ⚙️ Active Configuration")
-    with _LOCK: live_cfg = _LIVE["config"] or cfg
     cfg_cards(live_cfg)
 
     # Open position
     st.markdown("#### 📌 Open Position")
-    with _LOCK:
-        pos    = _LIVE["position"]
-        ltp_d  = _LIVE["last_ltp"]
     if pos:
-        pos_card(pos, ltp_d)
+        pos_card(pos, ltp_now)
     else:
-        st.info("💤 No open position — waiting for signal…")
+        st.info("💤 No open position — scanning for signal…")
 
     # Chart
     st.markdown("#### 📈 Live Chart")
-    with _LOCK: df_live = _LIVE["df"]
     if df_live is not None and not df_live.empty:
-        disp_df = df_live.iloc[-300:] if len(df_live)>300 else df_live
-        st.plotly_chart(live_chart(disp_df, pos, live_cfg),
-                        use_container_width=True, config={"scrollZoom":True})
+        disp = df_live.iloc[-300:] if len(df_live) > 300 else df_live
+        st.plotly_chart(live_chart(disp, pos, live_cfg),
+                        use_container_width=True, config={"scrollZoom": True})
     else:
-        st.caption("⏳ Waiting for first data fetch…")
+        st.caption("⏳ Waiting for first data fetch from background thread…")
 
     # Last fetched candle
-    st.markdown("#### 🕯️ Last Fetched Candle (yfinance delayed)")
-    with _LOCK: lc = _LIVE["last_candle"]
+    st.markdown("#### 🕯️ Last Fetched Candle (yfinance data)")
     if lc:
-        lc_df = pd.DataFrame([lc])
-        st.dataframe(lc_df, use_container_width=True)
+        st.dataframe(pd.DataFrame([lc]), use_container_width=True)
     else:
-        st.caption("No candle data yet.")
+        st.caption("No candle yet.")
 
     # Log
     st.markdown("#### 📝 Activity Log")
-    with _LOCK: logs = list(_LIVE["log"])
-    log_text = "\n".join(reversed(logs[-50:]))
+    log_text = "\n".join(reversed(logs[-60:]))
     st.code(log_text or "Waiting for events…", language="")
 
-    # Auto-refresh every 3 s while live.
-    # IMPORTANT: sleep must be long enough that Streamlit's rerun-rate-limiter
-    # does not kill the session. 0.1 s causes an instant crash loop.
-    if is_active:
-        time.sleep(3)
-        st.rerun()
+    # ── Auto-refresh: sleep 3 s then rerun ──────────────────────────────────
+    # sleep(3) means the UI is locked for 3 s — acceptable for a trading dashboard.
+    # Do NOT use a shorter value; Streamlit's rate limiter will kill the session.
+    time.sleep(3)
+    st.rerun()
 
 
 # ─── TRADE HISTORY TAB ────────────────────────────────────────────────────────
