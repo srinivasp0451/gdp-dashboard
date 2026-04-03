@@ -277,10 +277,10 @@ def _cross(fast, slow, i, bull):
     if i < 1: return False
     f0,f1,s0,s1 = fast[i-1],fast[i],slow[i-1],slow[i]
     if any(np.isnan(v) for v in [f0,f1,s0,s1]): return False
-    # Exact TradingView ta.crossover / ta.crossunder definition:
-    # crossover (bull)  : prev fast < prev slow  AND  curr fast >= curr slow
-    # crossunder (bear) : prev fast > prev slow  AND  curr fast <= curr slow
-    return (f0 < s0 and f1 >= s1) if bull else (f0 > s0 and f1 <= s1)
+    # Exact TradingView ta.crossover / ta.crossunder (Pine Script source):
+    #   crossover(a,b)  = a[1] < b[1]  and  a[0] > b[0]   -- STRICT both sides
+    #   crossunder(a,b) = a[1] > b[1]  and  a[0] < b[0]   -- STRICT both sides
+    return (f0 < s0 and f1 > s1) if bull else (f0 > s0 and f1 < s1)
 
 def get_signal(df: pd.DataFrame, i: int, cfg: dict):
     """
@@ -467,7 +467,17 @@ def run_backtest(df_raw, cfg, bt_start_ts):
         bar  = df.iloc[i]
         ts   = df.index[i]
 
-        # ── Enter pending EMA trade at N+1 open ─────────────────────────
+        # ── Skip warmup bars — stay BEFORE pending-entry so warmup
+        #    signals don't open positions with wrong prices.
+        # NOTE: a signal on the very last warmup bar IS valid — its
+        #       pending is preserved and fires on the first real bar below.
+        if ts < bt_start_ts:
+            continue
+
+        # ── Enter pending EMA trade at N+1 open (within real window) ────
+        # This fires on the bar immediately after the crossover bar.
+        # Because we skip above, the earliest this can fire is the first
+        # bar of the actual requested period — correct and consistent.
         if pending and pos is None:
             ep   = float(bar["Open"])
             sig  = pending["signal"]
@@ -477,10 +487,6 @@ def run_backtest(df_raw, cfg, bt_start_ts):
                     "sl_price":sl,"tgt_price":tgt,
                     "init_sl":sl,"init_tgt":tgt,"reason_in":pending["reason"]}
             pending = None
-
-        # ── Skip warmup bars before requested window ──────────────────
-        if ts < bt_start_ts:
-            continue
 
         h = float(bar["High"]); l = float(bar["Low"])
 
