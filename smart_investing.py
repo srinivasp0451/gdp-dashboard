@@ -722,6 +722,62 @@ def cfg_cards(cfg):
                  f'<div class="cfg-v">{v}</div></div>' for k,v in items)
     st.markdown(f'<div class="cfg-grid">{html}</div>',unsafe_allow_html=True)
 
+def ema_pill_row(df, cfg):
+    """Render a compact EMA value pill strip. Call after stats_bar or cfg_cards."""
+    if df is None or df.empty:
+        return
+    strat = cfg.get("strategy","")
+    # Only meaningful for EMA Crossover; for Simple Buy/Sell still show for info
+    fe = cfg.get("fast_ema", 9)
+    se = cfg.get("slow_ema", 15)
+    ef_val = es_val = None
+    if "EMA_Fast" in df.columns:
+        s = df["EMA_Fast"].dropna()
+        if not s.empty: ef_val = float(s.iloc[-1])
+    if "EMA_Slow" in df.columns:
+        s = df["EMA_Slow"].dropna()
+        if not s.empty: es_val = float(s.iloc[-1])
+    if ef_val is None and es_val is None:
+        return
+    # Determine crossover state for colour hint
+    cross_lbl = ""
+    cross_col = "#8892b0"
+    if ef_val is not None and es_val is not None:
+        if ef_val > es_val:
+            cross_lbl = "▲ Bullish"; cross_col = "#00d4aa"
+        elif ef_val < es_val:
+            cross_lbl = "▼ Bearish"; cross_col = "#ff4b5c"
+        else:
+            cross_lbl = "◆ Crossing"; cross_col = "#ffd166"
+    parts = []
+    if ef_val is not None:
+        parts.append(
+            f'<span style="background:#1a1f35;border:1px solid {C["ef"]}33;'
+            f'border-radius:6px;padding:4px 12px;font-size:.82rem;">'
+            f'<span style="color:#8892b0;font-size:.7rem;margin-right:4px;">EMA {fe}</span>'
+            f'<span style="color:{C["ef"]};font-weight:700;">{ef_val:,.2f}</span>'
+            f'</span>')
+    if es_val is not None:
+        parts.append(
+            f'<span style="background:#1a1f35;border:1px solid {C["es"]}33;'
+            f'border-radius:6px;padding:4px 12px;font-size:.82rem;">'
+            f'<span style="color:#8892b0;font-size:.7rem;margin-right:4px;">EMA {se}</span>'
+            f'<span style="color:{C["es"]};font-weight:700;">{es_val:,.2f}</span>'
+            f'</span>')
+    if cross_lbl:
+        parts.append(
+            f'<span style="background:#1a1f35;border:1px solid {cross_col}44;'
+            f'border-radius:6px;padding:4px 12px;font-size:.82rem;">'
+            f'<span style="color:{cross_col};font-weight:700;">{cross_lbl}</span>'
+            f'</span>')
+    html = (
+        '<div style="display:flex;flex-wrap:wrap;gap:8px;'
+        'align-items:center;margin:6px 0 10px 0;">'
+        '<span style="color:#8892b0;font-size:.75rem;font-weight:600;'
+        'letter-spacing:.5px;text-transform:uppercase;">EMA Values</span>'
+        + "".join(parts) + "</div>")
+    st.markdown(html, unsafe_allow_html=True)
+
 def pos_card(pos, ltp):
     if not pos: return
     sig=pos["signal"]; ep=pos["entry_price"]; sl=pos["sl_price"]; tgt=pos["tgt_price"]
@@ -941,6 +997,7 @@ def tab_backtest(cfg):
     # Stats bar
     st.markdown("#### 📊 Backtest Summary")
     stats_bar(stats)
+    ema_pill_row(df_ind, cfg)   # EMA values right below summary cards
 
     if not trades:
         st.info("No trades generated. Adjust strategy or timeframe."); return
@@ -1294,6 +1351,8 @@ def tab_live(cfg):
     # Config cards
     st.markdown("#### ⚙️ Active Configuration")
     cfg_cards(live_cfg)
+    with _LOCK: _df_for_ema = _LIVE["df"]
+    ema_pill_row(_df_for_ema, live_cfg)   # EMA values right below config cards
 
     # Open position
     st.markdown("#### 📌 Open Position")
