@@ -203,7 +203,7 @@ def cross_angle(fast: pd.Series, idx: int) -> float:
     return math.degrees(math.atan((c-p)/p*5000))
 
 # ─── DATA FETCHING ────────────────────────────────────────────────────────────
-def fetch_data(ticker: str, tf: str, period: str, slow_ema: int = 50) -> pd.DataFrame:
+def _fetch_raw(ticker: str, tf: str, period: str, slow_ema: int = 50) -> pd.DataFrame:
     """
     Fetches OHLCV with warmup candles so EMA seed is always accurate,
     even after a big gapup/gapdown.
@@ -245,6 +245,14 @@ def fetch_data(ticker: str, tf: str, period: str, slow_ema: int = 50) -> pd.Data
         pass
     return df
 
+@st.cache_data(ttl=60, show_spinner=False)
+def fetch_data(ticker: str, tf: str, period: str, slow_ema: int = 50) -> pd.DataFrame:
+    """Cached wrapper (60 s TTL) for UI / backtest use.
+    The live trading thread calls _fetch_raw() directly to always get fresh data."""
+    return _fetch_raw(ticker, tf, period, slow_ema)
+
+
+@st.cache_data(ttl=12, show_spinner=False)
 def get_ltp(ticker: str) -> tuple:
     try:
         fi   = yf.Ticker(ticker).fast_info
@@ -547,12 +555,15 @@ def run_backtest(df_raw, cfg, bt_start_ts):
     return {"trades":trades,"violations":violations,"stats":stats,"df":df}
 
 
-# ─── CHART BUILDERS ──────────────────────────────────────────────────────────
-_LAY = dict(template="plotly_dark",paper_bgcolor=C["bg"],plot_bgcolor=C["bg"],
-            font=dict(color="#ccd6f6",size=11),
-            margin=dict(l=8,r=8,t=28,b=8),
-            legend=dict(orientation="h",y=1.04,x=0,bgcolor="rgba(0,0,0,0)"),
-            xaxis_rangeslider_visible=False)
+# ─── CHART LAYOUT TEMPLATE ──────────────────────────────────────────────────
+_LAY = dict(
+    template="plotly_dark",
+    paper_bgcolor=C["bg"], plot_bgcolor=C["bg"],
+    font=dict(color="#ccd6f6", size=11),
+    margin=dict(l=8, r=8, t=28, b=8),
+    legend=dict(orientation="h", y=1.04, x=0, bgcolor="rgba(0,0,0,0)"),
+    xaxis_rangeslider_visible=False,
+)
 
 # ─── LIVE TRADING THREAD ─────────────────────────────────────────────────────
 def _log(msg):
@@ -571,19 +582,42 @@ def _base(df, cfg, h=640):
         increasing_line_color=C["cup"],decreasing_line_color=C["cdn"],
         increasing_fillcolor=C["cup"],decreasing_fillcolor=C["cdn"]),row=1,col=1)
     if "EMA_Fast" in df.columns:
-        fig.add_trace(go.Scatter(x=df.index,y=df["EMA_Fast"],
-            name=f"EMA {cfg['fast_ema']}",
-            line=dict(color=C["ef"],width=1.7),connectgaps=False),row=1,col=1)
+        last_ef = df["EMA_Fast"].dropna().iloc[-1] if not df["EMA_Fast"].dropna().empty else None
+        ef_label = f"EMA {cfg['fast_ema']}  {last_ef:,.2f}" if last_ef is not None else f"EMA {cfg['fast_ema']}"
+        fig.add_trace(go.Scatter(x=df.index, y=df["EMA_Fast"],
+            name=ef_label,
+            line=dict(color=C["ef"], width=1.7), connectgaps=False,
+            hovertemplate="EMA " + str(cfg["fast_ema"]) + ": %{y:,.2f}<extra></extra>"),
+            row=1, col=1)
+        if last_ef is not None:
+            fig.add_annotation(
+                x=df.index[-1], y=float(last_ef),
+                text=f" {last_ef:,.2f}",
+                font=dict(color=C["ef"], size=10),
+                showarrow=False, xanchor="left",
+                bgcolor="rgba(13,17,23,0.7)",
+                row=1, col=1)
     if "EMA_Slow" in df.columns:
-        fig.add_trace(go.Scatter(x=df.index,y=df["EMA_Slow"],
-            name=f"EMA {cfg['slow_ema']}",
-            line=dict(color=C["es"],width=1.7),connectgaps=False),row=1,col=1)
+        last_es = df["EMA_Slow"].dropna().iloc[-1] if not df["EMA_Slow"].dropna().empty else None
+        es_label = f"EMA {cfg['slow_ema']}  {last_es:,.2f}" if last_es is not None else f"EMA {cfg['slow_ema']}"
+        fig.add_trace(go.Scatter(x=df.index, y=df["EMA_Slow"],
+            name=es_label,
+            line=dict(color=C["es"], width=1.7), connectgaps=False,
+            hovertemplate="EMA " + str(cfg["slow_ema"]) + ": %{y:,.2f}<extra></extra>"),
+            row=1, col=1)
+        if last_es is not None:
+            fig.add_annotation(
+                x=df.index[-1], y=float(last_es),
+                text=f" {last_es:,.2f}",
+                font=dict(color=C["es"], size=10),
+                showarrow=False, xanchor="left",
+                bgcolor="rgba(13,17,23,0.7)",
+                row=1, col=1)
     if "Volume" in df.columns:
-        # Use proper rgba — never append hex digits (Plotly rejects 8-digit hex)
         VOL_UP = "rgba(0,212,170,0.45)"
         VOL_DN = "rgba(255,75,92,0.45)"
-        vc = [VOL_UP if float(df["Close"].iloc[k]) >= float(df["Open"].iloc[k])
-              else VOL_DN for k in range(len(df))]
+        is_up  = (df["Close"].values >= df["Open"].values)   # vectorised, no per-row cast
+        vc     = [VOL_UP if u else VOL_DN for u in is_up]
         fig.add_trace(go.Bar(x=df.index, y=df["Volume"], name="Vol",
             marker_color=vc, showlegend=False), row=2, col=1)
     fig.update_layout(**_LAY,height=h,
@@ -886,8 +920,9 @@ def tab_backtest(cfg):
             except Exception:
                 bts = df_raw.index[0]
             res = run_backtest(df_raw, cfg, bts)
-            st.session_state.bt_results = res
-            st.session_state.bt_cfg     = cfg.copy()
+            st.session_state.bt_results    = res
+            st.session_state.bt_cfg        = cfg.copy()
+            st.session_state["bt_chart_stale"] = True   # force chart rebuild
 
     res = st.session_state.get("bt_results")
     if not res:
@@ -910,12 +945,14 @@ def tab_backtest(cfg):
     if not trades:
         st.info("No trades generated. Adjust strategy or timeframe."); return
 
-    # Chart
+    # Chart — built once per backtest run, cached in session_state
     st.markdown("#### 📈 Trade Chart")
-    # Only show last 500 bars for performance
-    disp_df = df_ind.iloc[-500:] if len(df_ind)>500 else df_ind
-    st.plotly_chart(bt_chart(disp_df, trades, cfg),
-                    use_container_width=True, config={"scrollZoom":True})
+    if "bt_chart_fig" not in st.session_state or st.session_state.get("bt_chart_stale", True):
+        disp_df = df_ind.iloc[-500:] if len(df_ind) > 500 else df_ind
+        st.session_state["bt_chart_fig"]   = bt_chart(disp_df, trades, cfg)
+        st.session_state["bt_chart_stale"] = False
+    st.plotly_chart(st.session_state["bt_chart_fig"],
+                    use_container_width=True, config={"scrollZoom": True})
 
     # Trade Table
     st.markdown("#### 📋 Trade Log")
@@ -925,15 +962,18 @@ def tab_backtest(cfg):
                         "SL","Target","Candle High","Candle Low",
                         "Entry Reason","Exit Reason","PnL","Result","Qty","Violation"]
         df_show = df_trades[[c for c in display_cols if c in df_trades.columns]]
-        def _color(row):
-            base = [""] * len(row)
-            if row.get("PnL",0)>0:
-                return ["background-color:#0d2620;color:#00d4aa"]*len(row)
-            elif row.get("PnL",0)<0:
-                return ["background-color:#2a0f0f;color:#ff4b5c"]*len(row)
-            return base
-        st.dataframe(df_show.style.apply(_color,axis=1),
-                     use_container_width=True, height=400)
+        # Fast styling: only apply Styler when ≤200 rows to keep renders snappy
+        if len(df_show) <= 200:
+            def _color(row):
+                if row.get("PnL", 0) > 0:
+                    return ["background-color:#0d2620;color:#00d4aa"] * len(row)
+                elif row.get("PnL", 0) < 0:
+                    return ["background-color:#2a0f0f;color:#ff4b5c"] * len(row)
+                return [""] * len(row)
+            st.dataframe(df_show.style.apply(_color, axis=1),
+                         use_container_width=True, height=400)
+        else:
+            st.dataframe(df_show, use_container_width=True, height=400)
 
     # Violations section
     st.markdown("#### ⚠️ Violation Analysis")
@@ -1014,7 +1054,7 @@ def live_loop(stop_evt: threading.Event):
             last_fetch = now
 
             # ── Fetch OHLCV + build indicators ──────────────────────────
-            df = fetch_data(ticker, tf, cfg["period"], cfg["slow_ema"])
+            df = _fetch_raw(ticker, tf, cfg["period"], cfg["slow_ema"])  # always fresh
             if df is None or df.empty:
                 _log("⚠️ Empty data, retrying…")
                 time.sleep(3)
@@ -1345,15 +1385,18 @@ def tab_history(cfg):
 
     df_h = pd.DataFrame(rows)
     if not df_h.empty:
-        def _hcol(row):
-            try:
-                pnl=float(row["PnL"])
-                if pnl>0:  return ["background-color:#0d2620;color:#00d4aa"]*len(row)
-                elif pnl<0:return ["background-color:#2a0f0f;color:#ff4b5c"]*len(row)
-            except: pass
-            return [""]*len(row)
-        st.dataframe(df_h.style.apply(_hcol,axis=1),
-                     use_container_width=True, height=450)
+        if len(df_h) <= 200:
+            def _hcol(row):
+                try:
+                    pnl = float(row["PnL"])
+                    if pnl > 0:   return ["background-color:#0d2620;color:#00d4aa"] * len(row)
+                    elif pnl < 0: return ["background-color:#2a0f0f;color:#ff4b5c"] * len(row)
+                except: pass
+                return [""] * len(row)
+            st.dataframe(df_h.style.apply(_hcol, axis=1),
+                         use_container_width=True, height=450)
+        else:
+            st.dataframe(df_h, use_container_width=True, height=450)
 
         # Equity curve
         if len(completed)>1:
