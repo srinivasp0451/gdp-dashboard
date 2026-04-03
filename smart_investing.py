@@ -277,7 +277,10 @@ def _cross(fast, slow, i, bull):
     if i < 1: return False
     f0,f1,s0,s1 = fast[i-1],fast[i],slow[i-1],slow[i]
     if any(np.isnan(v) for v in [f0,f1,s0,s1]): return False
-    return (f0<=s0 and f1>s1) if bull else (f0>=s0 and f1<s1)
+    # Exact TradingView ta.crossover / ta.crossunder definition:
+    # crossover (bull)  : prev fast < prev slow  AND  curr fast >= curr slow
+    # crossunder (bear) : prev fast > prev slow  AND  curr fast <= curr slow
+    return (f0 < s0 and f1 >= s1) if bull else (f0 > s0 and f1 <= s1)
 
 def get_signal(df: pd.DataFrame, i: int, cfg: dict):
     """
@@ -507,7 +510,12 @@ def run_backtest(df_raw, cfg, bt_start_ts):
 
             # Reverse EMA exit
             if ex_p is None:
-                if cfg["sl_type"]=="Reverse EMA Crossover" and _rev_ema(df,i,sig):
+                # EMA Crossover strategy: ALWAYS exit on reverse cross regardless of SL/Target type.
+                # This makes every crossover produce a trade (matches TradingView behaviour).
+                # SL / Target still fire first if hit before the reverse cross arrives.
+                if cfg["strategy"] == "EMA Crossover" and _rev_ema(df, i, sig):
+                    ex_p, ex_r = float(bar["Close"]), "EMA Reverse Crossover"
+                elif cfg["sl_type"]=="Reverse EMA Crossover" and _rev_ema(df,i,sig):
                     ex_p,ex_r=float(bar["Close"]),"Reverse EMA Crossover"
                 elif cfg["tgt_type"]=="EMA Crossover" and _rev_ema(df,i,sig):
                     ex_p,ex_r=float(bar["Close"]),"EMA Target (Reverse Cross)"
@@ -844,13 +852,19 @@ def sidebar() -> dict:
             fe=c1.number_input("Fast EMA",2,500,9)
             se=c2.number_input("Slow EMA",2,500,15)
             if fe>=se: st.warning("⚠️ Fast EMA must be < Slow EMA")
-            ct2=st.selectbox("Crossover Filter",CROSS_TYPES,index=0)
-            if ct2=="Custom Candle Size":
-                ccs=st.number_input("Min Candle Body",0.01,1e6,10.0,1.0)
-            elif ct2=="ATR Based Candle Size":
-                st.caption("ℹ️ Candle body ≥ ATR(14) required")
-            uma=st.checkbox("Minimum Angle Filter",value=False)
-            if uma: ma=st.slider("Min Angle (°)",0.0,89.0,0.0,0.5)
+            use_adv = st.checkbox(
+                "🔬 Advanced Crossover Filters", value=False,
+                help="Enable min-angle and candle-size filters on top of the crossover signal")
+            if use_adv:
+                ct2 = st.selectbox("Crossover Filter", CROSS_TYPES, index=0)
+                if ct2 == "Custom Candle Size":
+                    ccs = st.number_input("Min Candle Body", 0.01, 1e6, 10.0, 1.0)
+                elif ct2 == "ATR Based Candle Size":
+                    st.caption("ℹ️ Candle body ≥ ATR(14) required")
+                uma = st.checkbox("Minimum Angle Filter", value=False,
+                                  help="Ignore weak crossovers below this EMA angle")
+                if uma:
+                    ma = st.slider("Min Angle (°)", 0.0, 89.0, 0.0, 0.5)
 
         # Stop Loss
         st.markdown('<div class="sbs">🛡️ Stop Loss</div>',unsafe_allow_html=True)
@@ -1165,7 +1179,10 @@ def live_loop(stop_evt: threading.Event):
                 # Reverse EMA on last closed bar
                 if ex_p is None and len(df_i) >= 2:
                     ci = len(df_i) - 2
-                    if cfg["sl_type"] == "Reverse EMA Crossover" and _rev_ema(df_i, ci, sig):
+                    # EMA Crossover strategy: ALWAYS exit on reverse cross (same logic as backtest)
+                    if cfg["strategy"] == "EMA Crossover" and _rev_ema(df_i, ci, sig):
+                        ex_p, ex_r = ltp, "EMA Reverse Crossover"
+                    elif cfg["sl_type"] == "Reverse EMA Crossover" and _rev_ema(df_i, ci, sig):
                         ex_p, ex_r = ltp, "Reverse EMA Crossover"
                     elif cfg["tgt_type"] == "EMA Crossover" and _rev_ema(df_i, ci, sig):
                         ex_p, ex_r = ltp, "EMA Target (Reverse Cross)"
