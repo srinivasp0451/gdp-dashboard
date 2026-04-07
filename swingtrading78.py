@@ -36,7 +36,14 @@ warnings.filterwarnings("ignore")
 # ██  EDIT THESE TWO LINES TO UPDATE YOUR DHAN CREDENTIALS  ██████████████████
 # ══════════════════════════════════════════════════════════════════════════════
 DHAN_CLIENT_ID = "1104779876"
-DHAN_ACCESS_TOKEN = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzUxMiJ9.eyJpc3MiOiJkaGFuIiwicGFydG5lcklkIjoiIiwiZXhwIjoxNzc1MTAwODA3LCJpYXQiOjE3NzUwMTQ0MDcsInRva2VuQ29uc3VtZXJUeXBlIjoiU0VMRiIsIndlYmhvb2tVcmwiOiIiLCJkaGFuQ2xpZW50SWQiOiIxMTA0Nzc5ODc2In0.KjRB4-T3G95_BrjnpWFX3H6h0IYSSKh1vUyfq-mri_eUGK0eJIa91IB_4K0IrNByxDSB56vwuFePTb8MBGjILw"
+DHAN_ACCESS_TOKEN = (
+    "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzUxMiJ9"
+    ".eyJpc3MiOiJkaGFuIiwicGFydG5lcklkIjoiIiwiZXhwIjoxNzczODAyMDg2"
+    ",\"aWF0IjoxNzczNzE1Njg2LCJ0b2tlbkNvbnN1bWVyVHlwZSI6IlNFTEYiLCJ3"
+    "ZWJob29rVXJsIjoiIiwiZGhhbkNsaWVudElkIjoiMTEwNDc3OTg3NiJ9"
+    ".L5ULyf8AfeaoZS_kn95rtQZ6qNRJF3EUimCJw_8q12k2FZHEGEPNySKrYOBP9"
+    "vRfBHKvEqWoB0ZC7GRUd7zyMg"
+)
 # ══════════════════════════════════════════════════════════════════════════════
 
 st.set_page_config(page_title="AlgoTrader Pro", layout="wide", initial_sidebar_state="expanded")
@@ -3359,6 +3366,178 @@ with tab_live:
                     st.info("Need at least 2 confirmed EW pivots to predict the next one. More data/bars needed.")
             except Exception as _ew_pred_err:
                 st.caption(f"EW predictor error: {_ew_pred_err}")
+
+        # ── Elliott Wave Map Card (always shown when EW strategy selected) ─────
+        if "Elliott Wave" in strategy:
+            _ewm_mwp = float(live_params.get("min_wave_pct", 0.5))
+            try:
+                _ewm_pivots, (_, _, _) = _ew_build_pivots(lv_df, _ewm_mwp)
+                _ewm_n = len(_ewm_pivots)
+
+                if _ewm_n >= 2:
+                    st.markdown("---")
+                    st.markdown("### 🌊 Elliott Wave Map")
+                    st.caption(
+                        "Live wave-by-wave breakdown — where each swing started, how far it moved, "
+                        "Fibonacci ratios, and which wave you're currently in. "
+                        "Use this to enter even on stale data — the wave structure stays valid."
+                    )
+
+                    # Use last 8 pivots max for display (last full wave sequence)
+                    _ewm_show = _ewm_pivots[-8:] if _ewm_n >= 8 else _ewm_pivots
+
+                    # Label waves — try to identify impulse (1-2-3-4-5) or corrective (A-B-C)
+                    # Alternating pivots: even=lows (wave lows), odd=highs
+                    _ewm_wave_labels = []
+                    _ewm_impulse_labels = ["W1","W2","W3","W4","W5","WA","WB","WC"]
+                    _ewm_corr_labels   = ["WA","WB","WC"]
+
+                    # Build wave cards
+                    _ewm_cards = []
+                    for _wi in range(len(_ewm_show)):
+                        _piv = _ewm_show[_wi]
+                        _piv_idx, _piv_px, _piv_dir = _piv
+
+                        if _wi == 0:
+                            # First pivot — just record it
+                            _ewm_cards.append({
+                                "wave": f"W{_wi+1}",
+                                "type": "Swing HIGH" if _piv_dir==1 else "Swing LOW",
+                                "start_px": _piv_px,
+                                "end_px":   None,
+                                "start_dt": to_ist(lv_df.index[min(_piv_idx, lv_n-1)]),
+                                "end_dt":   None,
+                                "move_pts": None,
+                                "move_pct": None,
+                                "direction": "↑" if _piv_dir==1 else "↓",
+                                "fib_retrace": None,
+                                "is_current": False,
+                            })
+                        else:
+                            _prev = _ewm_show[_wi-1]
+                            _leg_start = _prev[1]
+                            _leg_end   = _piv_px
+                            _leg_pts   = _leg_end - _leg_start
+                            _leg_pct   = _leg_pts / max(abs(_leg_start), 0.001) * 100
+
+                            # Fib retrace vs prior leg
+                            _fib_str = None
+                            if _wi >= 2:
+                                _prior_leg_sz = abs(_ewm_show[_wi-1][1] - _ewm_show[_wi-2][1])
+                                _this_leg_sz  = abs(_leg_pts)
+                                _fib_ratio    = _this_leg_sz / max(_prior_leg_sz, 0.001)
+                                # Label common Fibonacci levels
+                                if   0.30 <= _fib_ratio <= 0.45: _fib_str = f"≈ 38.2% retrace ({_fib_ratio*100:.0f}%)"
+                                elif 0.45 <= _fib_ratio <= 0.60: _fib_str = f"≈ 50% retrace ({_fib_ratio*100:.0f}%)"
+                                elif 0.60 <= _fib_ratio <= 0.70: _fib_str = f"≈ 61.8% retrace ({_fib_ratio*100:.0f}%)"
+                                elif 0.70 <= _fib_ratio <= 0.92: _fib_str = f"≈ 78.6% retrace ({_fib_ratio*100:.0f}%)"
+                                elif _fib_ratio > 1.30:          _fib_str = f"Extension ({_fib_ratio*100:.0f}%)"
+                                else:                             _fib_str = f"{_fib_ratio*100:.0f}% of prior leg"
+
+                            # Update previous card's end
+                            if _ewm_cards:
+                                _ewm_cards[-1]["end_px"]  = _leg_start
+                                _ewm_cards[-1]["end_dt"]  = to_ist(lv_df.index[min(_prev[0], lv_n-1)])
+
+                            _ewm_cards.append({
+                                "wave": f"W{_wi+1}",
+                                "type": "Swing HIGH ↑" if _piv_dir==1 else "Swing LOW ↓",
+                                "start_px": _leg_start,
+                                "end_px":   _leg_end,
+                                "start_dt": to_ist(lv_df.index[min(_prev[0], lv_n-1)]),
+                                "end_dt":   to_ist(lv_df.index[min(_piv_idx, lv_n-1)]),
+                                "move_pts": round(_leg_pts, 2),
+                                "move_pct": round(_leg_pct, 3),
+                                "direction": "↑ Rally" if _leg_pts > 0 else "↓ Decline",
+                                "fib_retrace": _fib_str,
+                                "is_current": False,
+                            })
+
+                    # Mark the last wave as current (in-progress)
+                    if _ewm_cards:
+                        _ewm_cards[-1]["is_current"] = True
+                        # Add the in-progress (unconfirmed) leg from last pivot to LTP
+                        _last_confirmed_px = _ewm_pivots[-1][1]
+                        _inprog_pts = cl - _last_confirmed_px
+                        _inprog_pct = _inprog_pts / max(abs(_last_confirmed_px), 0.001) * 100
+                        _inprog_dir = "↑" if _inprog_pts > 0 else "↓"
+                        # Extension target: project using largest prior leg × 1.618
+                        _prior_legs = [abs(c["move_pts"]) for c in _ewm_cards if c["move_pts"] is not None]
+                        _max_leg    = max(_prior_legs) if _prior_legs else abs(_inprog_pts)
+                        _ext_1618   = round(_last_confirmed_px + (_inprog_dir=="↑" and 1 or -1) * _max_leg * 1.618, 2)
+                        _ext_100    = round(_last_confirmed_px + (_inprog_dir=="↑" and 1 or -1) * _max_leg, 2)
+                        _ext_618    = round(_last_confirmed_px + (_inprog_dir=="↑" and 1 or -1) * _max_leg * 0.618, 2)
+
+                    # ── Display wave cards ────────────────────────────────────────
+                    # Historical completed waves
+                    st.markdown("#### 📊 Completed Waves (confirmed pivots)")
+                    _completed_cards = [c for c in _ewm_cards if not c["is_current"] and c["move_pts"] is not None]
+                    if _completed_cards:
+                        _wc_cols = st.columns(min(len(_completed_cards), 4))
+                        for _wci, _wcard in enumerate(_completed_cards):
+                            _col = _wc_cols[_wci % len(_wc_cols)]
+                            _is_up = (_wcard["move_pts"] or 0) > 0
+                            _bg = "🟢" if _is_up else "🔴"
+                            _col.markdown(
+                                f"**{_bg} {_wcard['wave']}**  \n"
+                                f"**{_wcard['start_px']:.2f} → {_wcard['end_px']:.2f}**  \n"
+                                f"**{_wcard['direction']}  {abs(_wcard['move_pts']):.2f} pts  "
+                                f"({_wcard['move_pct']:+.2f}%)**  \n"
+                                f"Start: {_wcard['start_dt'][10:16] if _wcard['start_dt'] else '—'}  \n"
+                                f"End: {_wcard['end_dt'][10:16] if _wcard['end_dt'] else '—'}  \n"
+                                + (f"Fib: _{_wcard['fib_retrace']}_" if _wcard['fib_retrace'] else "")
+                            )
+                    else:
+                        st.caption("Not enough confirmed pivots yet.")
+
+                    st.markdown("#### 🔥 Current Wave (in-progress — unconfirmed)")
+                    _cur_col1, _cur_col2, _cur_col3, _cur_col4 = st.columns(4)
+                    _cur_col1.markdown(
+                        f"**Wave {len(_ewm_cards)}** (forming)  \n"
+                        f"**From: {_last_confirmed_px:.2f}**  \n"
+                        f"**Now: {cl:.2f}**  \n"
+                        f"**{_inprog_dir} {abs(_inprog_pts):.2f} pts ({_inprog_pct:+.2f}%)**"
+                    )
+                    _cur_col2.metric("Started from", f"{_last_confirmed_px:.2f}",
+                                     help="Last confirmed pivot price")
+                    _cur_col3.metric("Current LTP", f"{cl:.2f}",
+                                     delta=f"{_inprog_pts:+.2f}",
+                                     delta_color="normal" if _inprog_pts >= 0 else "inverse")
+                    _cur_col4.metric("Move so far", f"{abs(_inprog_pts):.2f} pts ({abs(_inprog_pct):.2f}%)")
+
+                    st.markdown("#### 🎯 Projection Levels (Fibonacci extensions from largest prior wave)")
+                    _proj_c1,_proj_c2,_proj_c3,_proj_c4 = st.columns(4)
+                    _proj_c1.metric("61.8% extension", f"{_ext_618:.2f}",
+                                    help="Weak extension target — common reversal zone")
+                    _proj_c2.metric("100% extension (=1:1)", f"{_ext_100:.2f}",
+                                    help="Equal-wave extension — strong target")
+                    _proj_c3.metric("161.8% extension", f"{_ext_1618:.2f}",
+                                    help="Strong Fibonacci extension — typical Wave 3 / impulse target")
+                    _proj_c4.metric("Remaining to 100% ext", f"{abs(_ext_100 - cl):.2f} pts",
+                                    help="How far LTP is from the 1:1 extension target")
+
+                    # ── Practical guide ───────────────────────────────────────────
+                    with st.expander("📋 How to use this Wave Map for late entries", expanded=False):
+                        st.markdown(
+                            "**Even if you missed the original signal or data is delayed — use this map:**\n\n"
+                            f"1. **Current wave started at {_last_confirmed_px:.2f}** — "
+                            f"that is your reference point for this leg.\n\n"
+                            f"2. **Wave so far:** {_inprog_dir} {abs(_inprog_pts):.2f} pts "
+                            f"({abs(_inprog_pct):.2f}%). If this wave is corrective (pullback), "
+                            f"it typically stops at **38.2%–61.8%** of the prior impulse leg.\n\n"
+                            f"3. **If entering now:** Watch for the current wave to pause/reverse near "
+                            f"**{_ext_618:.2f}** (61.8% ext) or **{_ext_100:.2f}** (1:1 ext) or "
+                            f"**{_ext_1618:.2f}** (1.618 ext). Enter on reversal confirmation.\n\n"
+                            f"4. **SL suggestion:** Below the last confirmed pivot "
+                            f"({_last_confirmed_px:.2f}) for LONG, or above it for SHORT.\n\n"
+                            "5. **Each wave card shows** when it started (time), from what price, "
+                            "to what price, how many points, and the Fibonacci ratio vs prior wave — "
+                            "so you can judge if the current wave is impulsive (>100% of prior) or "
+                            "corrective (38-88% of prior)."
+                        )
+
+            except Exception as _ewm_err:
+                st.caption(f"Wave map error: {_ewm_err}")
 
         # ── Indicator values including EMA labels ─────────────────────────────
         _ov_indics={k:v for k,v in lv_indics.items()
