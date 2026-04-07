@@ -3451,6 +3451,20 @@ with tab_live:
                                 "direction": "↑ Rally" if _leg_pts > 0 else "↓ Decline",
                                 "fib_retrace": _fib_str,
                                 "is_current": False,
+                                # Wave nature classification based on Fib ratio vs prior leg
+                                # Impulsive: extends beyond prior leg (>100%) OR is the first leg
+                                # Corrective: retraces 38.2-88.6% of prior leg
+                                "wave_nature": (
+                                    "🚀 Impulsive" if _wi == 1 or (
+                                        _wi >= 2 and
+                                        abs(_leg_pts) / max(abs(_ewm_show[_wi-1][1] - _ewm_show[_wi-2][1]), 0.001) > 0.95
+                                    ) else
+                                    "🔄 Corrective" if _wi >= 2 and
+                                        abs(_leg_pts) / max(abs(_ewm_show[_wi-1][1] - _ewm_show[_wi-2][1]), 0.001) <= 0.90
+                                    else "🚀 Impulsive"
+                                ),
+                                # Current direction status: from where to where
+                                "flow": "LOW → HIGH (Bullish leg)" if _leg_pts > 0 else "HIGH → LOW (Bearish leg)",
                             })
 
                     # Mark the last wave as current (in-progress)
@@ -3480,6 +3494,7 @@ with tab_live:
                             _bg = "🟢" if _is_up else "🔴"
                             _col.markdown(
                                 f"**{_bg} {_wcard['wave']}**  \n"
+                                f"**{_wcard['wave_nature']}  |  {_wcard['flow']}**  \n"
                                 f"**{_wcard['start_px']:.2f} → {_wcard['end_px']:.2f}**  \n"
                                 f"**{_wcard['direction']}  {abs(_wcard['move_pts']):.2f} pts  "
                                 f"({_wcard['move_pct']:+.2f}%)**  \n"
@@ -3491,9 +3506,16 @@ with tab_live:
                         st.caption("Not enough confirmed pivots yet.")
 
                     st.markdown("#### 🔥 Current Wave (in-progress — unconfirmed)")
+                    # Classify current in-progress wave
+                    _prior_sz_for_cur = max([abs(c["move_pts"]) for c in _ewm_cards[:-1] if c.get("move_pts") is not None], default=1)
+                    _cur_fib_ratio    = abs(_inprog_pts) / max(_prior_sz_for_cur, 0.001)
+                    _cur_nature = "🚀 Impulsive" if _cur_fib_ratio >= 0.95 else "🔄 Corrective"
+                    _cur_flow   = "LOW → HIGH (Bullish — price rising)" if _inprog_pts >= 0 else "HIGH → LOW (Bearish — price falling)"
                     _cur_col1, _cur_col2, _cur_col3, _cur_col4 = st.columns(4)
                     _cur_col1.markdown(
                         f"**Wave {len(_ewm_cards)}** (forming)  \n"
+                        f"**{_cur_nature}**  \n"
+                        f"**{_cur_flow}**  \n"
                         f"**From: {_last_confirmed_px:.2f}**  \n"
                         f"**Now: {cl:.2f}**  \n"
                         f"**{_inprog_dir} {abs(_inprog_pts):.2f} pts ({_inprog_pct:+.2f}%)**"
