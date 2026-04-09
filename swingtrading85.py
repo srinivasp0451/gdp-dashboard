@@ -560,7 +560,7 @@ def _log(msg):
 # ════════════════════════════════════════════════════════════════════
 # LIVE THREAD  — ALL exceptions caught; never stops unless user stops
 # ════════════════════════════════════════════════════════════════════
-def live_thread(cfg, symbol):
+def live_thread(cfg, symbol, dhan_client=None):
     _log(f"▶ START {symbol} {cfg['timeframe']} {cfg['strategy']}")
     tf_min = TF_MIN.get(cfg["timeframe"],5)
     fast   = int(cfg.get("fast_ema",9))
@@ -569,7 +569,7 @@ def live_thread(cfg, symbol):
     sl_t   = cfg.get("sl_type","Custom Points")
     tg_t   = cfg.get("target_type","Custom Points")
     qty    = int(cfg.get("quantity",1))
-    dhan   = st.session_state.get("dhan_client")
+    dhan   = dhan_client
     use_dhan = cfg.get("enable_dhan",False)
     pending = None
     last_sig_bar = None
@@ -1069,7 +1069,7 @@ def tab_live(cfg):
 
     if start and not _g("running",False):
         _s("running",True); _s("status","RUNNING"); _s("log",[]); _s("pos",None)
-        t=threading.Thread(target=live_thread,args=(cfg,cfg["symbol"]),daemon=True)
+        t=threading.Thread(target=live_thread,args=(cfg,cfg["symbol"],st.session_state.get("dhan_client")),daemon=True)
         st.session_state.live_thread=t; t.start()
         st.success("✅ Started! First data tick in ~2 seconds…")
 
