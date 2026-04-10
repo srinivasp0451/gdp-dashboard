@@ -1,10 +1,3 @@
-"""
-╔══════════════════════════════════════════════════════════════════════════════╗
-║              SMART INVESTING - Professional Algorithmic Trading Platform     ║
-║      EMA Crossover · Elliott Wave · Live Trading · Dhan Broker Integration   ║
-╚══════════════════════════════════════════════════════════════════════════════╝
-"""
-
 import streamlit as st
 import pandas as pd
 import numpy as np
