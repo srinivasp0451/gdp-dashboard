@@ -1,135 +1,92 @@
-# ╔══════════════════════════════════════════════════════════════════╗
-# ║       SMART INVESTING  –  Professional Algo Trading  v7         ║
-# ║                                                                  ║
-# ║  ARCHITECTURE:                                                   ║
-# ║  • Module-level singleton _STORE — created once per process,    ║
-# ║    survives all Streamlit reruns (Python module is cached)       ║
-# ║  • Background thread writes ONLY to _STORE — zero Streamlit     ║
-# ║    calls, zero session_state access from thread                  ║
-# ║  • Auto-refresh via st.rerun() after 1.5s sleep (metrics only)   ║
-# ║  • dhan_client captured in main thread, passed as plain arg      ║
-# ╚══════════════════════════════════════════════════════════════════╝
+"""
+╔══════════════════════════════════════════════════════════════════════╗
+║          SMART INVESTING — Advanced Algo Trading Platform            ║
+║   Backtesting · Live Trading · Dhan Broker · EMA Strategies          ║
+╚══════════════════════════════════════════════════════════════════════╝
+Install: pip install streamlit yfinance pandas numpy plotly pytz dhanhq requests
+Run    : streamlit run smart_investing.py
+"""
 
+# ─── IMPORTS ────────────────────────────────────────────────────────────────
 import streamlit as st
+import yfinance as yf
 import pandas as pd
 import numpy as np
-import yfinance as yf
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
-import time, threading, math, warnings, requests, itertools
-from datetime import datetime
-import pytz
+import time, datetime, threading, math, warnings, requests, json
+from datetime import timedelta
+
+try:
+    import pytz
+    IST = pytz.timezone("Asia/Kolkata")
+except ImportError:
+    IST = datetime.timezone(datetime.timedelta(hours=5, minutes=30))
 
 warnings.filterwarnings("ignore")
+pd.options.mode.chained_assignment = None
 
-st.set_page_config(
-    page_title="Smart Investing",
-    page_icon="📈",
-    layout="wide",
-    initial_sidebar_state="expanded",
-)
-IST = pytz.timezone("Asia/Kolkata")
+# ─── PAGE CONFIG ─────────────────────────────────────────────────────────────
+st.set_page_config(page_title="Smart Investing", page_icon="📈",
+                   layout="wide", initial_sidebar_state="expanded")
 
-# ════════════════════════════════════════════════════════════════════
-# MODULE-LEVEL SINGLETON  (persists across all Streamlit reruns)
-# Python caches imported modules. This block runs ONCE per server
-# process, not once per rerun. The thread and the UI share this object.
-# ════════════════════════════════════════════════════════════════════
-_LOCK = threading.Lock()
-
-# _STORE is never re-assigned — only its contents change via _set/_get
-# This guarantees thread and UI always see the same object.
-_STORE = {
-    "running"    : False,
-    "status"     : "STOPPED",
-    "pos"        : None,       # current open position dict or None
-    "trades"     : [],         # list of completed trade dicts
-    "log"        : [],         # activity log strings
-    "df"         : None,       # latest OHLCV DataFrame
-    "ltp"        : None,       # latest price float
-    "prev_close" : None,       # previous day close
-    "last_ts"    : None,       # datetime of last fetch
-    "ind"        : {},         # {"ef":…, "es":…, "atr":…, …}
-    "ew"         : {},         # Elliott Wave analysis dict
-    "_rl_ts"     : 0.0,        # rate-limit timestamp for yfinance
-}
-
-def _get(key, default=None):
-    with _LOCK: return _STORE.get(key, default)
-
-def _set(key, val):
-    with _LOCK: _STORE[key] = val
-
-def _push(key, val, maxlen=500):
-    with _LOCK:
-        _STORE[key].append(val)
-        if len(_STORE[key]) > maxlen:
-            _STORE[key] = _STORE[key][-maxlen:]
-
-def _log(msg):
-    ts = datetime.now(IST).strftime("%H:%M:%S")
-    _push("log", f"[{ts}] {msg}")
-
-# ════════════════════════════════════════════════════════════════════
-# SESSION STATE  (UI-only, survives reruns via Streamlit session)
-# ════════════════════════════════════════════════════════════════════
-for _k, _v in {
-    "bt_trades": [], "bt_viol": [], "bt_df": None, "bt_ran": False,
-    "dhan_client": None, "opt_results": [], "opt_ran": False,
-    "_aFE": 9, "_aSE": 15, "_aSL": 10.0, "_aTG": 20.0, "_aRR": 2.0,
-}.items():
-    if _k not in st.session_state:
-        st.session_state[_k] = _v
-
-# ════════════════════════════════════════════════════════════════════
-# CSS
-# ════════════════════════════════════════════════════════════════════
+# ─── CSS ─────────────────────────────────────────────────────────────────────
 st.markdown("""
 <style>
-.main{background:#0e1117}
-html,body,[class*="css"]{font-family:'Inter','Segoe UI',sans-serif}
-.hdr{background:linear-gradient(90deg,#0f2027,#203a43,#2c5364);padding:12px 22px;
-  border-radius:12px;margin-bottom:12px;border:1px solid #2d4a6e;
-  display:flex;align-items:center;justify-content:space-between}
-.hdr h1{margin:0;color:#e2e8f0;font-size:21px}
-.hdr p{margin:0;color:#90cdf4;font-size:11px}
-.ltpbar{background:linear-gradient(135deg,#1a1f2e,#252b3d);border:1px solid #2d4a6e;
-  border-radius:10px;padding:9px 18px;display:flex;align-items:center;
-  gap:16px;margin-bottom:10px}
-.ltpval{color:#e2e8f0;font-size:24px;font-weight:700}
-.ltpup{color:#48bb78;font-size:13px;font-weight:600}
-.ltpdn{color:#fc8181;font-size:13px;font-weight:600}
-.ltpmeta{color:#718096;font-size:10px;margin-left:auto}
-.card{background:#1a1f2e;border:1px solid #2d3748;border-radius:9px;padding:12px;margin:4px 0}
-.ecard{background:#141d2b;border:1px solid #2d4a6e;border-radius:8px;
-  padding:10px;text-align:center}
-.cfgb{background:#1a1f2e;border-radius:8px;padding:11px;border-left:3px solid #4299e1;
-  margin:7px 0;font-size:12px;line-height:1.8;color:#cbd5e0}
-.ewrec{background:#111d2e;border:1px solid #2d5a8e;border-radius:10px;
-  padding:14px;margin:8px 0}
-.wrow{background:#1a2535;border:1px solid #2d3748;border-radius:7px;
-  padding:9px 12px;margin:4px 0}
-.logb{background:#0d1117;border-radius:8px;padding:8px;height:185px;
-  overflow-y:auto;font-family:'Courier New',monospace;font-size:11px;color:#a0aec0}
-.bdg{display:inline-block;padding:3px 12px;border-radius:16px;
-  font-size:11px;font-weight:700;color:white;margin-bottom:6px}
-.pos-box{border-radius:10px;padding:14px;border:1px solid}
-.stTabs [data-baseweb="tab-list"]{gap:6px;background:transparent}
-.stTabs [data-baseweb="tab"]{background:#1a1f2e;border-radius:8px;
-  padding:7px 18px;border:1px solid #2d3748;color:#a0aec0}
-.stTabs [aria-selected="true"]{background:#2b6cb0!important;color:white!important}
-section[data-testid="stSidebar"]{background:#0d1117}
-section[data-testid="stSidebar"] label{color:#a0aec0!important;font-size:12px}
-</style>
-""", unsafe_allow_html=True)
+.block-container{padding-top:.5rem!important}
+[data-testid="stSidebarContent"]{background:#0d1117}
+.app-hdr{font-size:1.85rem;font-weight:900;letter-spacing:-1px;
+  background:linear-gradient(90deg,#64ffda,#00b4d8,#a78bfa);
+  -webkit-background-clip:text;-webkit-text-fill-color:transparent;margin:0}
+.ltp-wrap{display:flex;align-items:center;gap:18px;
+  background:linear-gradient(135deg,#1a1f35,#20263e);
+  border:1px solid #2d3560;border-radius:12px;padding:10px 20px;margin-bottom:12px}
+.ltp-sym{color:#8892b0;font-size:.75rem;font-weight:700;letter-spacing:1px;text-transform:uppercase}
+.ltp-px{color:#e0e6f0;font-size:1.85rem;font-weight:700;line-height:1.1}
+.ltp-up{color:#00d4aa;font-weight:700}
+.ltp-dn{color:#ff4b5c;font-weight:700}
+.ltp-meta{margin-left:auto;color:#8892b0;font-size:.75rem;text-align:right}
+.stTabs [data-baseweb="tab-list"]{gap:5px;background:#0d1117;
+  border-radius:10px;padding:3px;border:1px solid #1e2340}
+.stTabs [data-baseweb="tab"]{border-radius:7px;color:#8892b0;
+  font-weight:600;font-size:.87rem;height:34px}
+.stTabs [aria-selected="true"]{background:#1e2b50!important;color:#64ffda!important}
+.mrow{display:flex;flex-wrap:wrap;gap:8px;margin:8px 0}
+.mc{background:#1a1f35;border:1px solid #2d3258;border-radius:10px;
+  padding:10px 14px;min-width:100px;flex:1;text-align:center}
+.mc-v{font-size:1.2rem;font-weight:700;margin:0}
+.mc-l{font-size:.7rem;color:#8892b0;margin-top:2px}
+.c-g .mc-v{color:#00d4aa} .c-r .mc-v{color:#ff4b5c}
+.c-b .mc-v{color:#64b5f6} .c-gold .mc-v{color:#ffd166}
+.cfg-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:7px;margin:7px 0}
+.cfg-item{background:#151a2d;border-left:3px solid #64ffda;
+  border-radius:7px;padding:7px 11px;font-size:.8rem}
+.cfg-k{color:#8892b0;font-size:.7rem;text-transform:uppercase;letter-spacing:.5px}
+.cfg-v{color:#ccd6f6;font-weight:600}
+.pos-card{background:linear-gradient(135deg,#13273f,#1a2040);
+  border:1px solid #2d6a4f;border-radius:12px;padding:14px 18px;margin:8px 0}
+.pos-buy{border-left:4px solid #00d4aa} .pos-sell{border-left:4px solid #ff4b5c}
+.pos-detail{display:flex;flex-wrap:wrap;gap:14px;margin-top:7px}
+.pos-f{font-size:.81rem}
+.pos-fl{color:#8892b0} .pos-fv{color:#ccd6f6;font-weight:600}
+.badge-live{background:#00d4aa22;color:#00d4aa;border:1px solid #00d4aa55;
+  border-radius:20px;padding:3px 14px;font-size:.8rem;font-weight:700;display:inline-block}
+.badge-idle{background:#8892b022;color:#8892b0;border:1px solid #8892b044;
+  border-radius:20px;padding:3px 14px;font-size:.8rem;display:inline-block}
+.sbs{color:#64ffda;font-size:.76rem;font-weight:700;letter-spacing:1px;
+  text-transform:uppercase;margin:10px 0 3px 0;
+  border-bottom:1px solid #1e2340;padding-bottom:3px}
+.viol-box{background:#2a0f0f;border:1px solid #ff4b5c55;
+  border-radius:8px;padding:10px 14px;margin:6px 0}
+[data-testid="stDataFrame"]{border-radius:8px;overflow:hidden}
+</style>""", unsafe_allow_html=True)
 
-# ════════════════════════════════════════════════════════════════════
-# CONSTANTS
-# ════════════════════════════════════════════════════════════════════
-TICKERS = {
-    "Nifty 50": "^NSEI", "BankNifty": "^NSEBANK", "Sensex": "^BSESN",
-    "BTC": "BTC-USD", "ETH": "ETH-USD", "Gold": "GC=F", "Silver": "SI=F",
-    "Custom": None,
+
+# ─── CONSTANTS ───────────────────────────────────────────────────────────────
+TICKER_MAP = {
+    "Nifty 50":"^NSEI","Bank Nifty":"^NSEBANK","Sensex":"^BSESN",
+    "Bitcoin (BTC)":"BTC-USD","Ethereum (ETH)":"ETH-USD",
+    "Gold":"GC=F","Silver":"SI=F","Custom":None
 }
 TF_PERIODS = {
     "1m":  ["1d","5d","7d"],
@@ -137,1384 +94,1448 @@ TF_PERIODS = {
     "15m": ["1d","5d","7d","1mo"],
     "1h":  ["1d","5d","7d","1mo","3mo","6mo","1y","2y"],
     "1d":  ["5d","7d","1mo","3mo","6mo","1y","2y","5y","10y","20y"],
-    "1wk": ["5d","7d","1mo","3mo","6mo","1y","2y","5y","10y","20y"],
+    "1wk": ["1d","5d","7d","1mo","3mo","6mo","1y","2y","5y","10y","20y"],
 }
-MAX_FETCH = {"1m":"7d","5m":"60d","15m":"60d","1h":"730d","1d":"max","1wk":"max"}
-TF_MIN    = {"1m":1,"5m":5,"15m":15,"1h":60,"1d":1440,"1wk":10080}
+PERIOD_DAYS = {"1d":1,"5d":5,"7d":7,"1mo":30,"3mo":90,"6mo":180,
+               "1y":365,"2y":730,"5y":1825,"10y":3650,"20y":7300}
+TF_MIN = {"1m":1,"5m":5,"15m":15,"1h":60,"1d":1440,"1wk":10080}
+STRATEGIES  = ["EMA Crossover","Simple Buy","Simple Sell"]
+SL_TYPES    = ["Custom Points","ATR Based","Trailing SL","Reverse EMA Crossover","Risk Reward Based"]
+TGT_TYPES   = ["Custom Points","Trailing Target","EMA Crossover","Risk Reward Based"]
+CROSS_TYPES = ["Simple Crossover","Custom Candle Size","ATR Based Candle Size"]
 
-# ════════════════════════════════════════════════════════════════════
-# DATA FETCH
-# ════════════════════════════════════════════════════════════════════
-def _rate_wait():
-    """Min 1.5s between yfinance calls. Thread-safe via _LOCK."""
-    with _LOCK:
-        gap = time.time() - _STORE["_rl_ts"]
-        if gap < 1.5:
-            time.sleep(1.5 - gap)
-        _STORE["_rl_ts"] = time.time()
+C = {"cup":"#00d4aa","cdn":"#ff4b5c","ef":"#ffd166","es":"#a78bfa",
+     "bm":"#00d4aa","sm":"#ff4b5c","sl":"#ff4b5c","tg":"#00d4aa",
+     "bg":"#0d1117","gr":"rgba(255,255,255,0.05)"}
 
-def _clean(raw):
-    if raw is None or raw.empty:
-        return None
-    df = raw.copy()
-    df.index = pd.to_datetime(df.index)
-    df.index = (df.index.tz_convert(IST) if df.index.tz
-                else df.index.tz_localize("UTC").tz_convert(IST))
-    df.columns = [c.lower() for c in df.columns]
-    keep = [c for c in ["open","high","low","close","volume"] if c in df.columns]
-    df = df[keep].dropna(subset=["close"])
-    return df[~df.index.duplicated(keep="last")].sort_index()
+# ─── GLOBAL LIVE STATE ───────────────────────────────────────────────────────
+# CRITICAL: @st.cache_resource makes these survive Streamlit reruns.
+# Plain module-level dicts get RE-CREATED on every rerun → resets active=False
+# → live loop appears to stop after first refresh. cache_resource fixes this.
+@st.cache_resource
+def _get_live_state():
+    return {
+        "active":           False,
+        "position":         None,
+        "completed_trades": [],
+        "log":              [],
+        "last_ltp":         None,
+        "prev_close":       None,
+        "last_candle":      None,
+        "df":               None,
+        "config":           None,
+        "_thread":          None,
+        "_stop_evt":        None,
+    }
 
-def fetch_live(symbol, interval, period):
-    """Call from background thread only."""
-    _rate_wait()
-    try:
-        raw = yf.Ticker(symbol).history(
-            period=MAX_FETCH.get(interval, period),
-            interval=interval, auto_adjust=True, prepost=False)
-        df = _clean(raw)
-        if df is None or df.empty:
-            _rate_wait()
-            raw = yf.Ticker(symbol).history(
-                period=period, interval=interval,
-                auto_adjust=True, prepost=False)
-            df = _clean(raw)
-        return df
-    except Exception as e:
-        _log(f"[fetch] {e}")
-        return None
+@st.cache_resource
+def _get_lock():
+    return threading.Lock()
 
-def fetch_ui(symbol, interval, period):
-    """Call from main thread (backtest / optimization) — no rate-wait."""
-    try:
-        raw = yf.Ticker(symbol).history(
-            period=MAX_FETCH.get(interval, period),
-            interval=interval, auto_adjust=True, prepost=False)
-        df = _clean(raw)
-        if df is None or df.empty:
-            raw = yf.Ticker(symbol).history(
-                period=period, interval=interval,
-                auto_adjust=True, prepost=False)
-            df = _clean(raw)
-        return df
-    except Exception as e:
-        st.error(f"Fetch error: {e}")
-        return None
+_LIVE = _get_live_state()
+_LOCK = _get_lock()
 
-# ════════════════════════════════════════════════════════════════════
-# INDICATORS  (TradingView-accurate EMA)
-# ════════════════════════════════════════════════════════════════════
-def ema_tv(series, n):
-    if len(series) < n:
-        return pd.Series(np.nan, index=series.index)
-    a    = 2.0 / (n + 1)
-    vals = series.ffill().values.astype(float)
-    out  = np.full(len(vals), np.nan)
-    out[n - 1] = np.nanmean(vals[:n])
-    for i in range(n, len(vals)):
-        v      = vals[i] if not np.isnan(vals[i]) else out[i - 1]
-        out[i] = a * v + (1 - a) * out[i - 1]
-    return pd.Series(out, index=series.index)
+# ─── SESSION STATE ────────────────────────────────────────────────────────────
+def _init():
+    defs = {"bt_results": None, "bt_cfg": None}
+    for k, v in defs.items():
+        if k not in st.session_state:
+            st.session_state[k] = v
+_init()
 
-def atr_s(df, n=14):
-    h, l, c = df["high"], df["low"], df["close"]
-    tr = pd.concat(
-        [h - l, (h - c.shift(1)).abs(), (l - c.shift(1)).abs()], axis=1
-    ).max(axis=1)
-    return ema_tv(tr, n)
 
-def add_ind(df, fast, slow):
-    if df is None or df.empty:
-        return df
-    df       = df.copy()
-    df["ef"] = ema_tv(df["close"], fast)
-    df["es"] = ema_tv(df["close"], slow)
-    df["atr"]= atr_s(df)
-    df["cu"] = (df["ef"] > df["es"]) & (df["ef"].shift(1) <= df["es"].shift(1))
-    df["cd"] = (df["ef"] < df["es"]) & (df["ef"].shift(1) >= df["es"].shift(1))
+# ─── EMA / ATR CALCULATIONS (TradingView-accurate) ───────────────────────────
+def ema_tv(series: pd.Series, period: int) -> pd.Series:
+    """
+    Exact TradingView EMA:
+      Seed = SMA of first `period` non-NaN bars, then k=2/(period+1).
+      Gaps (NaN) are carried forward so that a big gapup/gapdown never
+      breaks the calculation mid-series.
+    """
+    result = pd.Series(np.nan, index=series.index, dtype=float)
+    if len(series) < period:
+        return result
+    vals = series.values.astype(float)
+    n    = len(vals)
+    k    = 2.0 / (period + 1)
+    streak_start = None
+    streak_count = 0
+    for i in range(n):
+        if not np.isnan(vals[i]):
+            if streak_start is None: streak_start = i
+            streak_count += 1
+        else:
+            streak_start = None
+            streak_count = 0
+        if streak_count == period:
+            result.iloc[i] = float(np.nanmean(vals[streak_start:i+1]))
+            for j in range(i+1, n):
+                prev = result.iloc[j-1]
+                if np.isnan(vals[j]):
+                    result.iloc[j] = prev
+                elif np.isnan(prev):
+                    result.iloc[j] = vals[j]
+                else:
+                    result.iloc[j] = vals[j]*k + prev*(1.0-k)
+            break
+    return result
+
+def atr_series(df: pd.DataFrame, period: int = 14) -> pd.Series:
+    """Wilder ATR via RMA (same as TradingView ATR)."""
+    h = df["High"].astype(float)
+    l = df["Low"].astype(float)
+    p = df["Close"].astype(float).shift(1)
+    tr = pd.concat([h-l,(h-p).abs(),(l-p).abs()],axis=1).max(axis=1)
+    return ema_tv(tr, period)
+
+def build_indicators(df: pd.DataFrame, cfg: dict) -> pd.DataFrame:
+    df = df.copy()
+    cl = df["Close"].astype(float)
+    df["EMA_Fast"] = ema_tv(cl, int(cfg["fast_ema"]))
+    df["EMA_Slow"] = ema_tv(cl, int(cfg["slow_ema"]))
+    df["ATR"]      = atr_series(df, 14)
     return df
 
-def ema_angle(s, lb=3):
-    v = s.dropna()
-    if len(v) < lb + 1: return 0.0
-    b = v.iloc[-lb]
-    return 0.0 if b == 0 else abs(math.degrees(math.atan((v.iloc[-1]-b)/b*100/lb)))
+def cross_angle(fast: pd.Series, idx: int) -> float:
+    if idx < 1 or idx >= len(fast): return 0.0
+    p, c = fast.iloc[idx-1], fast.iloc[idx]
+    if pd.isna(p) or pd.isna(c) or p == 0: return 0.0
+    return math.degrees(math.atan((c-p)/p*5000))
 
-# ════════════════════════════════════════════════════════════════════
-# SIGNALS
-# ════════════════════════════════════════════════════════════════════
-def ema_sig(df, idx, cfg):
-    if idx < 1 or idx >= len(df): return None, None
-    r, p = df.iloc[idx], df.iloc[idx - 1]
-    ef, es, pf, ps = r.get("ef",np.nan), r.get("es",np.nan), p.get("ef",np.nan), p.get("es",np.nan)
-    if any(np.isnan([ef, es, pf, ps])): return None, None
-    if cfg.get("use_angle", False):
-        if ema_angle(df["ef"].iloc[:idx+1]) < float(cfg.get("min_angle", 0)): return None, None
-    ct   = cfg.get("crossover_type", "Simple")
-    body = abs(r["close"] - r["open"])
-    def ok():
-        if ct == "Simple":        return True
-        if ct == "Custom Candle": return body >= float(cfg.get("custom_candle", 10))
-        if ct == "ATR Candle":
-            a = float(r.get("atr", 0) or 0); return a == 0 or body >= a
-        return True
-    f, s = int(cfg.get("fast_ema", 9)), int(cfg.get("slow_ema", 15))
-    if ef > es and pf <= ps and ok(): return "buy",  f"EMA({f}) crossed ABOVE EMA({s})"
-    if ef < es and pf >= ps and ok(): return "sell", f"EMA({f}) crossed BELOW EMA({s})"
-    return None, None
-
-def ema_rev(df, idx, pt):
-    if idx < 1: return False
-    r, p = df.iloc[idx], df.iloc[idx - 1]
-    ef, es, pf, ps = r.get("ef",np.nan), r.get("es",np.nan), p.get("ef",np.nan), p.get("es",np.nan)
-    if any(np.isnan([ef, es, pf, ps])): return False
-    if pt == "buy"  and ef < es and pf >= ps: return True
-    if pt == "sell" and ef > es and pf <= ps: return True
-    return False
-
-def fdt(dt):
-    if hasattr(dt, "strftime"): return dt.strftime("%Y-%m-%d %H:%M")
-    return str(dt)
-
-# ════════════════════════════════════════════════════════════════════
-# ELLIOTT WAVE ANALYSIS  — fully automated, detailed output
-# ════════════════════════════════════════════════════════════════════
-def _zigzag(df, win=5):
-    h, l = df["high"].values, df["low"].values
-    pts  = []
-    for i in range(win, len(df) - win):
-        lo, hi = max(0, i-win), min(len(df), i+win+1)
-        if h[i] == h[lo:hi].max(): pts.append({"dt": df.index[i], "px": h[i], "i": i, "t": "H"})
-        if l[i] == l[lo:hi].min(): pts.append({"dt": df.index[i], "px": l[i], "i": i, "t": "L"})
-    pts.sort(key=lambda x: x["i"])
-    cl = []
-    for p in pts:
-        if not cl: cl.append(p); continue
-        if cl[-1]["t"] == p["t"]:
-            if ((p["t"]=="H" and p["px"]>cl[-1]["px"]) or
-                    (p["t"]=="L" and p["px"]<cl[-1]["px"])):
-                cl[-1] = p
+# ─── DATA FETCHING ────────────────────────────────────────────────────────────
+def _fetch_raw(ticker: str, tf: str, period: str, slow_ema: int = 50) -> pd.DataFrame:
+    """
+    Fetches OHLCV with warmup candles so EMA seed is always accurate,
+    even after a big gapup/gapdown.
+    '7d' handled via explicit start/end since yfinance doesn't support it natively.
+    """
+    warmup  = max(int(slow_ema) * 4, 300)
+    tf_min  = TF_MIN.get(tf, 60)
+    end_dt  = datetime.datetime.now()
+    days    = PERIOD_DAYS.get(period, 30)
+    st_dt   = end_dt - timedelta(days=days)
+    wu_dt   = st_dt  - timedelta(minutes=tf_min*warmup)
+    fmt     = "%Y-%m-%d"
+    try:
+        df = yf.download(
+            ticker,
+            start       = wu_dt.strftime(fmt),
+            end         = (end_dt+timedelta(days=1)).strftime(fmt),
+            interval    = tf,
+            progress    = False,
+            auto_adjust = True,
+            prepost     = False,
+        )
+    except Exception as e:
+        st.error(f"yfinance error: {e}")
+        return pd.DataFrame()
+    if df is None or df.empty:
+        return pd.DataFrame()
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = [c[0] for c in df.columns]
+    cols = [c for c in ["Open","High","Low","Close","Volume"] if c in df.columns]
+    df = df[cols].copy()
+    df.dropna(subset=["Open","High","Low","Close"], inplace=True)
+    try:
+        if df.index.tz is None:
+            df.index = df.index.tz_localize("UTC").tz_convert(IST)
         else:
-            cl.append(p)
-    return cl
-
-def _fq(ratio, targets):
-    """Fibonacci quality: 1.0 = perfect, 0.0 = far from all targets."""
-    if ratio <= 0: return 0.0
-    return max(0.0, 1.0 - min(abs(ratio - t) / t for t in targets) / 0.15)
-
-def detect_ew(df):
-    """
-    Returns rich dict describing detected wave pattern.
-    Handles: 5-wave impulse, ABC correction, or 'forming'.
-    Always includes automated trade signal when pattern is clear.
-    """
-    EMPTY = {
-        "ok": False, "label": "Analysing…", "direction": "UNCLEAR",
-        "wave_type": "—", "waves_plot": [], "rules": [],
-        "confidence": 0, "current_wave": "—", "wave_rows": [],
-        "projections": {}, "signal": None, "signal_reason": "—",
-        "sl": None, "target": None, "after": "Waiting for data…",
-        "current_price": 0, "bias": "",
-    }
-    if df is None or len(df) < 25:
-        return {**EMPTY, "label": "Need ≥25 candles"}
-    cp  = float(df["close"].iloc[-1])
-    pts = _zigzag(df, win=max(3, len(df)//40))
-    if len(pts) < 4:
-        return {**EMPTY, "ok": True, "label": "Forming pivots", "current_price": cp,
-                "after": "Wait for more swing highs/lows"}
-
-    # ── Try 5-wave impulse (needs 6 pivot points) ─────────────────
-    if len(pts) >= 6:
-        for st0, direction, sign in [("L","BULLISH",1), ("H","BEARISH",-1)]:
-            s = pts[-6:]
-            if s[0]["t"] != st0: continue
-            P = [p["px"] for p in s]
-            W = [sign*(P[i+1]-P[i]) for i in range(5)]   # W[0]=W1, W[4]=W5
-            if W[0] <= 0 or W[2] <= 0: continue
-            w2r = abs(W[1])/W[0]; w3x = W[2]/W[0]; w4r = abs(W[3])/W[2]
-
-            rules = [
-                ("W3 not shortest",        W[2] >= min(W[0], max(W[4], 0.001)),
-                 f"W1={W[0]:.1f}  W3={W[2]:.1f}  W5={W[4]:.1f}"),
-                ("W2 retraces <100% W1",   w2r < 1.0,
-                 f"W2 retrace = {w2r*100:.1f}%  (ideal 38.2–61.8%)"),
-                ("W4 no overlap W1 end",   (P[4]>P[1]) if sign==1 else (P[4]<P[1]),
-                 f"W4 end={P[4]:.0f}  W1 end={P[1]:.0f}"),
-                ("W3 ≥ 61.8% of W1",       W[2] >= W[0]*0.618,
-                 f"W3/W1 = {w3x:.2f}x  (ideal ≥1.618x)"),
-                ("W4 retrace <100% W3",    w4r < 1.0,
-                 f"W4 retrace = {w4r*100:.1f}%  (ideal 23.6–38.2%)"),
-            ]
-            n_pass = sum(1 for r in rules if r[1])
-            if n_pass < 3: continue
-
-            fib_qual = (_fq(w2r,[0.382,0.5,0.618]) +
-                        _fq(w3x,[1.0,1.382,1.618,2.0,2.618]) +
-                        _fq(w4r,[0.236,0.382,0.5])) / 3
-            conf = min(100, int(n_pass/5*60 + fib_qual*40))
-
-            wc = ["#f6ad55","#fc8181","#48bb78","#f6ad55","#76e4f7"]
-            wave_rows = [
-                ("1","Impulse",  "UP" if sign==1 else "DOWN", P[0], P[1],
-                 round(abs(P[1]-P[0]),2), "—  (impulse start)", wc[0]),
-                ("2","Correction","DOWN" if sign==1 else "UP",  P[1], P[2],
-                 round(abs(P[2]-P[1]),2),
-                 f"{w2r*100:.1f}% retrace of W1  (ideal 38.2–61.8%)", wc[1]),
-                ("3","Impulse",  "UP" if sign==1 else "DOWN", P[2], P[3],
-                 round(abs(P[3]-P[2]),2),
-                 f"{w3x:.2f}× W1  (ideal ≥1.618×, strongest wave)", wc[2]),
-                ("4","Correction","DOWN" if sign==1 else "UP",  P[3], P[4],
-                 round(abs(P[4]-P[3]),2),
-                 f"{w4r*100:.1f}% retrace of W3  (ideal 23.6–38.2%)", wc[3]),
-                ("5","Impulse (forming)","UP" if sign==1 else "DOWN", P[4], P[5],
-                 round(abs(P[5]-P[4]),2), "Currently forming — see targets below", wc[4]),
-            ]
-            projs = {
-                f"W5 = 61.8% of W1":  round(P[4] + sign*W[0]*0.618, 2),
-                f"W5 = 100% of W1":   round(P[4] + sign*W[0],       2),
-                f"W5 = 161.8% of W1": round(P[4] + sign*W[0]*1.618, 2),
-            }
-            sl_price  = round(P[4] - sign * W[0] * 0.05, 2)   # just beyond W4
-            tgt_price = round(P[4] + sign * W[0],          2)  # W5 = W1
-
-            return {
-                "ok": True,
-                "label": f"5-Wave Impulse ({'Bullish' if sign==1 else 'Bearish'})",
-                "direction": direction,
-                "wave_type": "5-Wave Impulse",
-                "waves_plot": [{"label":str(n+1),"start":s[n],"end":s[n+1]} for n in range(5)],
-                "rules":  [{"rule":r,"passed":p,"detail":d} for r,p,d in rules],
-                "confidence": conf,
-                "current_wave": "Wave 5  (entering now)",
-                "wave_rows": wave_rows,
-                "projections": projs,
-                "signal": "BUY" if sign == 1 else "SELL",
-                "signal_reason": f"EW Wave 5 entry  ({direction}  5-wave impulse)",
-                "sl":     sl_price,
-                "target": tgt_price,
-                "after":  "Expect ABC correction once Wave 5 completes",
-                "current_price": cp,
-                "bias": "BUY" if sign == 1 else "SELL",
-            }
-
-    # ── Try ABC correction (needs 4 pivot points) ─────────────────
-    if len(pts) >= 4:
-        for st0, direction, sign in [("H","CORRECTIVE_DOWN",-1), ("L","CORRECTIVE_UP",1)]:
-            s = pts[-4:]
-            if s[0]["t"] != st0: continue
-            P  = [p["px"] for p in s]
-            A  = sign * (P[0] - P[1])
-            B  = sign * (P[2] - P[1])
-            C  = sign * (P[2] - P[3])
-            if A <= 0: continue
-            bret = abs(B) / A; cpct = C / A
-            rules = [
-                ("B retraces A (20–100%)", 0.2 < bret < 1.0,
-                 f"B = {bret*100:.1f}% of A  (ideal 38.2–78.6%)"),
-                ("C moves in A direction", C > 0,
-                 f"C = {C:.1f} pts  (same direction as A)"),
-            ]
-            fib_q = (_fq(bret,[0.382,0.5,0.618,0.786]) +
-                     _fq(cpct,[0.618,1.0,1.272,1.618])) / 2
-            conf  = min(100, int(fib_q * 100))
-
-            wave_rows = [
-                ("A","Impulse", "DOWN" if sign==-1 else "UP", P[0], P[1],
-                 round(abs(P[1]-P[0]),2), "First leg of ABC correction", "#fc8181"),
-                ("B","Correction","UP" if sign==-1 else "DOWN", P[1], P[2],
-                 round(abs(P[2]-P[1]),2),
-                 f"{bret*100:.1f}% retrace of A  (ideal 38.2–78.6%)", "#48bb78"),
-                ("C","Impulse (forming)","DOWN" if sign==-1 else "UP", P[2], P[3],
-                 round(abs(P[3]-P[2]),2),
-                 f"Currently {cpct*100:.1f}% of A  (ideal 61.8–161.8%)", "#fc8181"),
-            ]
-            c_eq_a = round(P[2] - sign * A, 2)
-            projs  = {
-                "C = 61.8% A": round(P[2] - sign*A*0.618, 2),
-                "C = 100% A":  c_eq_a,
-                "C = 127.2% A":round(P[2] - sign*A*1.272, 2),
-            }
-            sl_price  = round(P[2] + sign * A * 0.1, 2)
-            tgt_price = c_eq_a
-
-            return {
-                "ok": True,
-                "label": f"ABC Correction ({'Bearish' if sign==-1 else 'Bullish'})",
-                "direction": direction,
-                "wave_type": "ABC Correction",
-                "waves_plot": [{"label":lb,"start":s[i],"end":s[i+1]}
-                               for i,lb in enumerate(["A","B","C"])],
-                "rules":  [{"rule":r,"passed":p,"detail":d} for r,p,d in rules],
-                "confidence": conf,
-                "current_wave": "Wave C  (forming now)",
-                "wave_rows": wave_rows,
-                "projections": projs,
-                "signal": "SELL" if sign == -1 else "BUY",
-                "signal_reason": f"EW Wave C entry  ({'Bearish' if sign==-1 else 'Bullish'} ABC)",
-                "sl":     sl_price,
-                "target": tgt_price,
-                "after":  "Expect new impulse wave after ABC completes",
-                "current_price": cp,
-                "bias": "SELL" if sign == -1 else "BUY",
-            }
-
-    return {**EMPTY, "ok": True, "label": "Pivots forming",
-            "current_price": cp, "after": "More candles needed for pattern"}
-
-# ════════════════════════════════════════════════════════════════════
-# SL / TARGET
-# ════════════════════════════════════════════════════════════════════
-def calc_sl_tgt(entry, tt, row, cfg):
-    atr  = float(row.get("atr", entry*0.01) or entry*0.01)
-    if np.isnan(atr) or atr == 0: atr = entry * 0.01
-    sl_t = cfg.get("sl_type", "Custom Points")
-    tg_t = cfg.get("target_type", "Custom Points")
-    slp  = float(cfg.get("sl_points", 10))
-    tgp  = float(cfg.get("target_points", 20))
-    sign = 1 if tt == "buy" else -1
-    sl   = (entry - sign*atr*float(cfg.get("atr_sl_mult", 1.5))
-            if sl_t == "ATR Based" else entry - sign * slp)
-    sld  = abs(entry - sl)
-    if tg_t == "ATR Based Target": tgt = entry + sign*atr*float(cfg.get("atr_tgt_mult", 3.0))
-    elif tg_t == "Risk-Reward":    tgt = entry + sign * sld * float(cfg.get("rr_ratio", 2.0))
-    else:                          tgt = entry + sign * tgp
-    return round(sl, 4), round(tgt, 4)
-
-# ════════════════════════════════════════════════════════════════════
-# BACKTEST ENGINE
-# ════════════════════════════════════════════════════════════════════
-def run_backtest(df, cfg):
-    if df is None or df.empty: return [], []
-    strat = cfg.get("strategy", "EMA Crossover")
-    fast  = int(cfg.get("fast_ema", 9)); slow = int(cfg.get("slow_ema", 15))
-    qty   = int(cfg.get("quantity", 1))
-    sl_t  = cfg.get("sl_type", "Custom Points")
-    tg_t  = cfg.get("target_type", "Custom Points")
-    df    = add_ind(df.copy(), fast, slow)
-    trades=[]; viol=[]; pos=None; pending=None; tnum=0
-
-    for i in range(1, len(df)):
-        row = df.iloc[i]
-        if pos:
-            sl=pos["sl"]; tgt=pos["tgt"]; pt=pos["type"]
-            if sl_t == "Trailing SL":
-                tr = float(cfg.get("sl_points", 10))
-                ns = row["high"]-tr if pt=="buy" else row["low"]+tr
-                if (pt=="buy" and ns>sl) or (pt=="sell" and ns<sl): sl=pos["sl"]=ns
-            if tg_t == "Trailing Target":
-                tp = float(cfg.get("target_points", 20))
-                nt = row["high"]+tp if pt=="buy" else row["low"]-tp
-                if (pt=="buy" and nt>pos["tgt"]) or (pt=="sell" and nt<pos["tgt"]):
-                    pos["tgt"] = nt
-            ema_ex = (sl_t in ("Reverse EMA Cross",) or tg_t=="EMA Cross") and ema_rev(df,i,pt)
-            ep=None; er=None; vd=False
-            if pt == "buy":
-                if row["low"] <= sl:
-                    ep=sl; er=f"SL Low≤{sl:.2f}"; vd = tg_t!="Trailing Target" and row["high"]>=tgt
-                elif tg_t!="Trailing Target" and row["high"]>=tgt: ep=tgt; er=f"Tgt Hi≥{tgt:.2f}"
-                elif ema_ex: ep=row["open"]; er="EMA Rev exit"
-            else:
-                if row["high"] >= sl:
-                    ep=sl; er=f"SL Hi≥{sl:.2f}"; vd = tg_t!="Trailing Target" and row["low"]<=tgt
-                elif tg_t!="Trailing Target" and row["low"]<=tgt: ep=tgt; er=f"Tgt Lo≤{tgt:.2f}"
-                elif ema_ex: ep=row["open"]; er="EMA Rev exit"
-            if ep is None and i == len(df)-1: ep=row["close"]; er="End of data"
-            if ep is not None:
-                pnl = round(((ep-pos["e"]) if pt=="buy" else (pos["e"]-ep))*qty, 2)
-                t = {"#":tnum,"Type":pt.upper(),"Entry":fdt(pos["et"]),"Exit":fdt(row.name),
-                     "Entry Price":round(pos["e"],4),"Exit Price":round(ep,4),
-                     "SL":round(pos["si"],4),"Target":round(pos["ti"],4),
-                     "Bar High":round(row["high"],4),"Bar Low":round(row["low"],4),
-                     "Entry Reason":pos["r"],"Exit Reason":er,"PnL":pnl,"Qty":qty,"Viol":vd}
-                trades.append(t); viol.append(t) if vd else None; pos=None
-        if pos is None and pending:
-            sg,rsn=pending; pending=None; ep=float(row["open"])
-            sl,tgt=calc_sl_tgt(ep,sg,row,cfg); tnum+=1
-            pos={"type":sg,"e":ep,"et":row.name,"sl":sl,"si":sl,"tgt":tgt,"ti":tgt,"r":rsn}
-        if pos is None:
-            if strat == "EMA Crossover":
-                sg,rsn=ema_sig(df,i,cfg)
-                if sg: pending=(sg,rsn)
-            elif strat == "Simple Buy":
-                ep=float(row["close"]); sl,tgt=calc_sl_tgt(ep,"buy",row,cfg); tnum+=1
-                pos={"type":"buy","e":ep,"et":row.name,"sl":sl,"si":sl,"tgt":tgt,"ti":tgt,"r":"Simple Buy"}
-            elif strat == "Simple Sell":
-                ep=float(row["close"]); sl,tgt=calc_sl_tgt(ep,"sell",row,cfg); tnum+=1
-                pos={"type":"sell","e":ep,"et":row.name,"sl":sl,"si":sl,"tgt":tgt,"ti":tgt,"r":"Simple Sell"}
-            elif strat == "Elliott Wave" and i >= 20:
-                ew = detect_ew(df.iloc[:i+1])
-                if ew.get("signal") and ew.get("confidence",0) >= 50:
-                    sg = "buy" if ew["signal"]=="BUY" else "sell"
-                    pending = (sg, ew.get("signal_reason","EW signal"))
-    return trades, viol
-
-# ════════════════════════════════════════════════════════════════════
-# OPTIMIZATION
-# ════════════════════════════════════════════════════════════════════
-def run_opt(df, base_cfg, grid, metric="Accuracy%", min_tr=5, cb=None):
-    results=[]; keys=list(grid.keys()); combos=list(itertools.product(*grid.values()))
-    total=len(combos)
-    for idx, combo in enumerate(combos):
-        cfg={**base_cfg,"sl_type":"Custom Points","target_type":"Custom Points"}
-        for k,v in zip(keys,combo): cfg[k]=v
-        try:
-            f=int(cfg.get("fast_ema",9)); s=int(cfg.get("slow_ema",15))
-            if f>=s:
-                if cb: cb(idx+1,total); continue
-            df_i=add_ind(df.copy(),f,s)
-            trades,_=run_backtest(df_i,cfg)
-            if len(trades)<min_tr:
-                if cb: cb(idx+1,total); continue
-            tdf=pd.DataFrame(trades); wins=len(tdf[tdf["PnL"]>0]); tot=len(tdf)
-            acc=wins/tot*100; pnl=tdf["PnL"].sum()
-            aw=tdf[tdf["PnL"]>0]["PnL"].mean() if wins else 0
-            al=tdf[tdf["PnL"]<=0]["PnL"].mean() if tot-wins else 0
-            rr=abs(aw/al) if al and al!=0 else 0
-            sc=acc*0.4+min(rr,5)*4*0.3+(20 if pnl>0 else 0)*0.3
-            row_d={"Trades":tot,"Wins":wins,"Losses":tot-wins,
-                   "Accuracy%":round(acc,1),"TotalPnL":round(pnl,2),
-                   "AvgWin":round(aw,2),"AvgLoss":round(al,2),
-                   "RR":round(rr,2),"Score":round(sc,2)}
-            for k2,v2 in zip(keys,combo): row_d[k2]=v2
-            results.append(row_d)
-        except Exception: pass
-        if cb: cb(idx+1,total)
-    results.sort(key=lambda x:x.get(metric,0),reverse=True)
-    return results[:25]
-
-# ════════════════════════════════════════════════════════════════════
-# DHAN BROKER
-# ════════════════════════════════════════════════════════════════════
-def init_dhan(cid, tok):
-    try:
-        from dhanhq import dhanhq; return dhanhq(cid, tok)
-    except ImportError: st.warning("pip install dhanhq"); return None
-    except Exception as e: st.error(f"Dhan: {e}"); return None
-
-def get_ip():
-    try: return requests.get("https://api.ipify.org?format=json",timeout=4).json().get("ip","?")
+            df.index = df.index.tz_convert(IST)
     except Exception:
-        try: return requests.get("https://ifconfig.me/ip",timeout=4).text.strip()
-        except: return "N/A"
+        pass
+    return df
 
-def place_order(dhan, cfg, sig, ltp, is_exit=False):
-    if not dhan: return {"error":"Not connected"}
+@st.cache_data(ttl=60, show_spinner=False)
+def fetch_data(ticker: str, tf: str, period: str, slow_ema: int = 50) -> pd.DataFrame:
+    """Cached wrapper (60 s TTL) for UI / backtest use.
+    The live trading thread calls _fetch_raw() directly to always get fresh data."""
+    return _fetch_raw(ticker, tf, period, slow_ema)
+
+
+@st.cache_data(ttl=12, show_spinner=False)
+def get_ltp(ticker: str) -> tuple:
     try:
-        if cfg.get("options_trading", False):
-            ot  = cfg.get("opt_exit_type" if is_exit else "opt_entry_type","MARKET")
-            sid = cfg.get("ce_id") if sig=="buy" else cfg.get("pe_id")
-            return dhan.place_order(
-                transactionType="SELL" if is_exit else "BUY",
-                exchangeSegment=cfg.get("fno_exc","NSE_FNO"),
-                productType="INTRADAY", orderType=ot, validity="DAY",
-                securityId=str(sid), quantity=int(cfg.get("opts_qty",65)),
-                price=round(ltp,2) if ot=="LIMIT" else 0, triggerPrice=0)
-        ot  = cfg.get("exit_order" if is_exit else "entry_order","MARKET")
-        txn = ("SELL" if is_exit else "BUY") if sig=="buy" else ("BUY" if is_exit else "SELL")
-        return dhan.place_order(
-            security_id=str(cfg.get("sec_id","1594")),
-            exchange_segment=cfg.get("exchange","NSE"),
-            transaction_type=txn, quantity=int(cfg.get("dhan_qty",1)),
-            order_type=ot, product_type=cfg.get("product","INTRADAY"),
-            price=round(ltp,2) if ot=="LIMIT" else 0)
+        fi   = yf.Ticker(ticker).fast_info
+        ltp  = fi.last_price
+        prev = fi.previous_close
+        if ltp is None or prev is None:
+            h = yf.Ticker(ticker).history(period="5d",interval="1d")
+            if len(h) >= 2:
+                prev,ltp = float(h["Close"].iloc[-2]),float(h["Close"].iloc[-1])
+            elif len(h)==1:
+                ltp=prev=float(h["Close"].iloc[-1])
+        ltp,prev = float(ltp),float(prev)
+        chg  = ltp-prev
+        pct  = chg/prev*100 if prev else 0.0
+        return ltp,prev,chg,pct
+    except Exception:
+        return None,None,0.0,0.0
+
+
+# ─── SIGNAL / SL / TARGET LOGIC ──────────────────────────────────────────────
+def _cross(fast, slow, i, bull):
+    if i < 1: return False
+    f0,f1,s0,s1 = fast[i-1],fast[i],slow[i-1],slow[i]
+    if any(np.isnan(v) for v in [f0,f1,s0,s1]): return False
+    # Exact TradingView ta.crossover / ta.crossunder (Pine Script source):
+    #   crossover(a,b)  = a[1] < b[1]  and  a[0] > b[0]   -- STRICT both sides
+    #   crossunder(a,b) = a[1] > b[1]  and  a[0] < b[0]   -- STRICT both sides
+    return (f0 < s0 and f1 > s1) if bull else (f0 > s0 and f1 < s1)
+
+def get_signal(df: pd.DataFrame, i: int, cfg: dict):
+    """
+    Returns 'BUY', 'SELL', or None.
+    EMA Crossover  : signal on bar i, caller must enter on bar i+1 open.
+    Simple Buy/Sell: signal and entry on bar i close immediately.
+
+    # ── COMMENTED STRATEGIES (not in dropdown) ──────────────────────────────
+    # strategy = "Price Crosses Above Threshold"
+    #   thr    = cfg.get("price_threshold", 0)
+    #   action = cfg.get("thresh_action_above","BUY")   # dropdown: BUY or SELL
+    #   prev_c = df["Close"].iloc[i-1] if i>0 else 0
+    #   if df["Close"].iloc[i] > thr and prev_c <= thr:
+    #       return action
+    #
+    # strategy = "Price Crosses Below Threshold"
+    #   thr    = cfg.get("price_threshold", 0)
+    #   action = cfg.get("thresh_action_below","SELL")  # dropdown: BUY or SELL
+    #   prev_c = df["Close"].iloc[i-1] if i>0 else 0
+    #   if df["Close"].iloc[i] < thr and prev_c >= thr:
+    #       return action
+    # ─────────────────────────────────────────────────────────────────────────
+    """
+    strat = cfg["strategy"]
+    if strat == "Simple Buy":  return "BUY"
+    if strat == "Simple Sell": return "SELL"
+
+    if strat == "EMA Crossover":
+        if "EMA_Fast" not in df.columns: return None
+        fast = df["EMA_Fast"].values.astype(float)
+        slow = df["EMA_Slow"].values.astype(float)
+        bull = _cross(fast,slow,i,True)
+        bear = _cross(fast,slow,i,False)
+        if not bull and not bear: return None
+        sig = "BUY" if bull else "SELL"
+
+        # crossover type filter
+        ct = cfg.get("crossover_type","Simple Crossover")
+        if ct == "Custom Candle Size":
+            body = abs(float(df["Close"].iloc[i])-float(df["Open"].iloc[i]))
+            if body < cfg.get("custom_candle_size",10.0): return None
+        elif ct == "ATR Based Candle Size":
+            if "ATR" not in df.columns or pd.isna(df["ATR"].iloc[i]): return None
+            body = abs(float(df["Close"].iloc[i])-float(df["Open"].iloc[i]))
+            if body < float(df["ATR"].iloc[i]): return None
+
+        # angle filter
+        if cfg.get("use_min_angle",False) and cfg.get("min_angle",0)>0:
+            if abs(cross_angle(df["EMA_Fast"],i)) < cfg["min_angle"]: return None
+        return sig
+    return None
+
+def _compute_sl(entry, sig, df, idx, cfg):
+    t   = cfg["sl_type"]
+    pts = cfg.get("custom_sl_pts",10.0)
+    sgn = -1.0 if sig=="BUY" else 1.0
+    if t=="Custom Points":       return entry + sgn*pts
+    if t=="ATR Based":
+        av = float(df["ATR"].iloc[idx]) if "ATR" in df.columns and not pd.isna(df["ATR"].iloc[idx]) else pts
+        return entry + sgn*av
+    if t=="Trailing SL":         return entry + sgn*pts
+    if t=="Reverse EMA Crossover": return entry + sgn*pts
+    if t=="Risk Reward Based":
+        tp = cfg.get("custom_tgt_pts",20.0)
+        return entry + sgn*(tp / max(cfg.get("rr_ratio",2.0),0.01))
+    return entry + sgn*pts
+
+def _compute_tgt(entry, sig, df, idx, cfg, sl):
+    t   = cfg["tgt_type"]
+    pts = cfg.get("custom_tgt_pts",20.0)
+    sgn = 1.0 if sig=="BUY" else -1.0
+    if t in ("Custom Points","Trailing Target","EMA Crossover"):
+        return entry + sgn*pts
+    if t=="Risk Reward Based":
+        return entry + sgn*abs(entry-sl)*cfg.get("rr_ratio",2.0)
+    return entry + sgn*pts
+
+def _update_trail(pos, bar_close, cfg):
+    trail = cfg.get("custom_sl_pts",10.0)
+    sl    = pos["sl_price"]
+    if pos["signal"]=="BUY":  return max(sl, bar_close-trail)
+    else:                      return min(sl, bar_close+trail)
+
+def _rev_ema(df, idx, sig):
+    if "EMA_Fast" not in df.columns or idx<1: return False
+    fast = df["EMA_Fast"].values.astype(float)
+    slow = df["EMA_Slow"].values.astype(float)
+    return _cross(fast,slow,idx, sig=="SELL")   # reverse of current signal
+
+
+# ─── DHAN BROKER ─────────────────────────────────────────────────────────────
+try:
+    from dhanhq import dhanhq as DhanHQ
+    DHAN_OK = True
+except ImportError:
+    DHAN_OK = False; DhanHQ = None
+
+def _dhan_client(cid, tok):
+    if not DHAN_OK: return None
+    try: return DhanHQ(cid, tok)
+    except: return None
+
+def register_ip(cid, tok):
+    out = {}
+    try:
+        out["public_ip"] = requests.get("https://api.ipify.org",timeout=5).text.strip()
+    except: out["public_ip"]="unavailable"
+    try:
+        r = requests.post("https://api.dhan.co/edis/tpin",
+            headers={"access-token":tok,"client-id":cid,"Content-Type":"application/json"},
+            timeout=10)
+        out["status"]=r.status_code; out["body"]=r.text[:300]
+    except Exception as e: out["err"]=str(e)
+    return out
+
+def _equity_order(dhan, cfg, sig, ltp):
+    if dhan is None: return {"error":"Dhan not init"}
+    try:
+        tx  = "BUY" if sig=="BUY" else "SELL"
+        prd = "INTRADAY" if cfg.get("dhan_product","Intraday")=="Intraday" else "CNC"
+        ot  = "MARKET" if "Market" in cfg.get("dhan_entry_order","Limit Order") else "LIMIT"
+        ex  = "NSE" if cfg.get("dhan_exchange","NSE")=="NSE" else "BSE"
+        px  = round(ltp,2) if ot=="LIMIT" else 0
+        return dhan.place_order(security_id=str(cfg.get("dhan_security_id","1594")),
+            exchange_segment=ex, transaction_type=tx,
+            quantity=int(cfg.get("dhan_qty",1)), order_type=ot,
+            product_type=prd, price=px)
     except Exception as e: return {"error":str(e)}
 
-# ════════════════════════════════════════════════════════════════════
-# LIVE THREAD  — pure Python, zero Streamlit, zero session_state
-# ════════════════════════════════════════════════════════════════════
-def live_thread(cfg: dict, symbol: str, dhan_client):
-    """
-    Runs independently of Streamlit. Writes only to _STORE (singleton).
-    Never calls st.* or session_state — those crash background threads.
-    """
-    _log(f"▶ START  {symbol}  TF={cfg['timeframe']}  Strategy={cfg['strategy']}")
-    tf_min   = TF_MIN.get(cfg["timeframe"], 5)
-    fast     = int(cfg.get("fast_ema", 9))
-    slow     = int(cfg.get("slow_ema", 15))
-    strat    = cfg.get("strategy", "EMA Crossover")
-    sl_t     = cfg.get("sl_type", "Custom Points")
-    tg_t     = cfg.get("target_type", "Custom Points")
-    qty      = int(cfg.get("quantity", 1))
-    use_dhan = bool(cfg.get("enable_dhan", False)) and (dhan_client is not None)
-
-    pending      = None
-    last_sig_bar = None
-    last_bdy     = -1
-
-    # fetch prev_close once
+def _option_order(dhan, cfg, sig, ltp):
+    """BUY CE when algo says BUY; BUY PE when algo says SELL (buyer only)."""
+    if dhan is None: return {"error":"Dhan not init"}
     try:
-        _rate_wait()
-        raw = yf.Ticker(symbol).history(period="5d",interval="1d",auto_adjust=True,prepost=False)
-        df2 = _clean(raw)
-        if df2 is not None and len(df2) >= 2:
-            _set("prev_close", float(df2["close"].iloc[-2]))
-    except Exception as e:
-        _log(f"[prev_close] {e}")
+        sid = str(cfg.get("dhan_ce_id","")) if sig=="BUY" else str(cfg.get("dhan_pe_id",""))
+        ot  = "MARKET" if "Market" in cfg.get("dhan_opt_entry_order","Market Order") else "LIMIT"
+        px  = round(ltp,2) if ot=="LIMIT" else 0
+        return dhan.place_order(
+            transactionType="BUY",
+            exchangeSegment=cfg.get("dhan_opt_exchange","NSE_FNO"),
+            productType="INTRADAY", orderType=ot, validity="DAY",
+            securityId=sid, quantity=int(cfg.get("dhan_opt_qty",65)),
+            price=px, triggerPrice=0)
+    except Exception as e: return {"error":str(e)}
 
-    # ── main loop ─────────────────────────────────────────────────
-    while _get("running", False):
+def _exit_order(dhan, cfg, pos, ltp):
+    if dhan is None: return {"error":"Dhan not init"}
+    sig = pos.get("signal","BUY")
+    if cfg.get("dhan_options_enabled",False):
         try:
-            just_exited = False             # reset each tick
-            df = fetch_live(symbol, cfg["timeframe"], cfg["period"])
+            sid = str(cfg.get("dhan_ce_id","")) if sig=="BUY" else str(cfg.get("dhan_pe_id",""))
+            ot  = "MARKET" if "Market" in cfg.get("dhan_opt_exit_order","Market Order") else "LIMIT"
+            px  = round(ltp,2) if ot=="LIMIT" else 0
+            return dhan.place_order(
+                transactionType="SELL",
+                exchangeSegment=cfg.get("dhan_opt_exchange","NSE_FNO"),
+                productType="INTRADAY", orderType=ot, validity="DAY",
+                securityId=sid, quantity=int(cfg.get("dhan_opt_qty",65)),
+                price=px, triggerPrice=0)
+        except Exception as e: return {"error":str(e)}
+    else:
+        c2 = {**cfg,"dhan_entry_order":cfg.get("dhan_exit_order","Market Order")}
+        return _equity_order(dhan, c2, "SELL" if sig=="BUY" else "BUY", ltp)
+
+
+# ─── BACKTESTING ENGINE ───────────────────────────────────────────────────────
+def run_backtest(df_raw, cfg, bt_start_ts):
+    """
+    Conservative SL-first backtest engine.
+    BUY  : check candle LOW  vs SL first → then candle HIGH vs Target.
+    SELL : check candle HIGH vs SL first → then candle LOW  vs Target.
+    Violation = both SL & Target hit on same candle (SL wins).
+    EMA Crossover signal on bar N → entry on bar N+1 OPEN.
+    Simple Buy/Sell → immediate entry on bar close.
+    No cooldown in backtesting.
+    """
+    if df_raw.empty: return {"trades":[],"violations":[],"stats":{},"df":df_raw}
+    df      = build_indicators(df_raw, cfg)
+    strat   = cfg["strategy"]
+    trades  = []; violations = []
+    pos     = None  # open trade
+    pending = None  # EMA signal waiting for N+1 open
+
+    for i in range(1, len(df)):
+        bar  = df.iloc[i]
+        ts   = df.index[i]
+
+        # ── Skip warmup bars — stay BEFORE pending-entry so warmup
+        #    signals don't open positions with wrong prices.
+        # NOTE: a signal on the very last warmup bar IS valid — its
+        #       pending is preserved and fires on the first real bar below.
+        if ts < bt_start_ts:
+            continue
+
+        # ── Enter pending EMA trade at N+1 open (within real window) ────
+        # This fires on the bar immediately after the crossover bar.
+        # Because we skip above, the earliest this can fire is the first
+        # bar of the actual requested period — correct and consistent.
+        if pending and pos is None:
+            ep   = float(bar["Open"])
+            sig  = pending["signal"]
+            sl   = _compute_sl(ep, sig, df, i, cfg)
+            tgt  = _compute_tgt(ep, sig, df, i, cfg, sl)
+            pos  = {"signal":sig,"entry_time":ts,"entry_price":ep,
+                    "sl_price":sl,"tgt_price":tgt,
+                    "init_sl":sl,"init_tgt":tgt,"reason_in":pending["reason"]}
+            pending = None
+
+        h = float(bar["High"]); l = float(bar["Low"])
+
+        # ── Manage open position ──────────────────────────────────────
+        if pos:
+            sig  = pos["signal"]
+            sl   = pos["sl_price"]
+            tgt  = pos["tgt_price"]
+            ex_p = ex_r = None; viol = False
+
+            if sig == "BUY":
+                sl_hit  = l <= sl
+                tgt_hit = h >= tgt and cfg["tgt_type"] != "Trailing Target"
+                if sl_hit and tgt_hit: viol=True; ex_p,ex_r=sl,"Stop Loss (Violation ⚠)"
+                elif sl_hit:           ex_p,ex_r=sl,"Stop Loss"
+                elif tgt_hit:          ex_p,ex_r=tgt,"Target"
+            else:  # SELL
+                sl_hit  = h >= sl
+                tgt_hit = l <= tgt and cfg["tgt_type"] != "Trailing Target"
+                if sl_hit and tgt_hit: viol=True; ex_p,ex_r=sl,"Stop Loss (Violation ⚠)"
+                elif sl_hit:           ex_p,ex_r=sl,"Stop Loss"
+                elif tgt_hit:          ex_p,ex_r=tgt,"Target"
+
+            # Trailing SL
+            if cfg["sl_type"]=="Trailing SL" and ex_p is None:
+                pos["sl_price"] = _update_trail(pos, float(bar["Close"]), cfg)
+
+            # Reverse EMA exit
+            if ex_p is None:
+                # EMA Crossover strategy: ALWAYS exit on reverse cross regardless of SL/Target type.
+                # This makes every crossover produce a trade (matches TradingView behaviour).
+                # SL / Target still fire first if hit before the reverse cross arrives.
+                if cfg["strategy"] == "EMA Crossover" and _rev_ema(df, i, sig):
+                    ex_p, ex_r = float(bar["Close"]), "EMA Reverse Crossover"
+                elif cfg["sl_type"]=="Reverse EMA Crossover" and _rev_ema(df,i,sig):
+                    ex_p,ex_r=float(bar["Close"]),"Reverse EMA Crossover"
+                elif cfg["tgt_type"]=="EMA Crossover" and _rev_ema(df,i,sig):
+                    ex_p,ex_r=float(bar["Close"]),"EMA Target (Reverse Cross)"
+
+            if ex_p is not None:
+                raw = ex_p - pos["entry_price"]
+                pnl = raw*cfg["qty"] if sig=="BUY" else -raw*cfg["qty"]
+                t = {"Type":sig,
+                     "Entry Time":pos["entry_time"],"Entry Price":round(pos["entry_price"],2),
+                     "Exit Time":ts,"Exit Price":round(ex_p,2),
+                     "SL":round(pos["init_sl"],2),"Target":round(pos["init_tgt"],2),
+                     "Candle High":round(h,2),"Candle Low":round(l,2),
+                     "Entry Reason":pos["reason_in"],"Exit Reason":ex_r,
+                     "PnL":round(pnl,2),"Result":"✅ Win" if pnl>0 else "❌ Loss",
+                     "Violation":viol,"Qty":cfg["qty"]}
+                trades.append(t)
+                if viol: violations.append(t)
+                pos = None
+
+        # ── Look for new entry ────────────────────────────────────────
+        if pos is None and pending is None:
+            sig = get_signal(df, i, cfg)
+            if sig:
+                if strat in ("Simple Buy","Simple Sell"):
+                    ep  = float(bar["Close"])
+                    sl  = _compute_sl(ep, sig, df, i, cfg)
+                    tgt = _compute_tgt(ep, sig, df, i, cfg, sl)
+                    pos = {"signal":sig,"entry_time":ts,"entry_price":ep,
+                           "sl_price":sl,"tgt_price":tgt,
+                           "init_sl":sl,"init_tgt":tgt,"reason_in":strat}
+                elif strat=="EMA Crossover" and i < len(df)-1:
+                    pending = {"signal":sig,
+                               "reason":f"EMA {cfg['fast_ema']}/{cfg['slow_ema']} "
+                                        f"{'Bullish' if sig=='BUY' else 'Bearish'} Crossover"}
+
+    total = len(trades)
+    if total==0: return {"trades":[],"violations":[],"stats":{"Total Trades":0},"df":df}
+    wins  = sum(1 for t in trades if t["PnL"]>0)
+    tpnl  = sum(t["PnL"] for t in trades)
+    pnls  = [t["PnL"] for t in trades]
+    stats = {"Total Trades":total,"Wins":wins,"Losses":total-wins,
+             "Accuracy (%)":round(wins/total*100,1),"Total PnL":round(tpnl,2),
+             "Avg PnL":round(tpnl/total,2),"Best Trade":round(max(pnls),2),
+             "Worst Trade":round(min(pnls),2),"Violations":len(violations)}
+    return {"trades":trades,"violations":violations,"stats":stats,"df":df}
+
+
+# ─── CHART LAYOUT TEMPLATE ──────────────────────────────────────────────────
+_LAY = dict(
+    template="plotly_dark",
+    paper_bgcolor=C["bg"], plot_bgcolor=C["bg"],
+    font=dict(color="#ccd6f6", size=11),
+    margin=dict(l=8, r=8, t=28, b=8),
+    legend=dict(orientation="h", y=1.04, x=0, bgcolor="rgba(0,0,0,0)"),
+    xaxis_rangeslider_visible=False,
+)
+
+# ─── LIVE TRADING THREAD ─────────────────────────────────────────────────────
+def _log(msg):
+    ts = datetime.datetime.now(IST).strftime("%H:%M:%S")
+    with _LOCK:
+        _LIVE["log"].append(f"[{ts}] {msg}")
+        if len(_LIVE["log"])>200: _LIVE["log"]=_LIVE["log"][-200:]
+
+
+def _base(df, cfg, h=640):
+    fig = make_subplots(rows=2,cols=1,shared_xaxes=True,
+                        row_heights=[0.76,0.24],vertical_spacing=0.02)
+    fig.add_trace(go.Candlestick(
+        x=df.index,open=df["Open"],high=df["High"],low=df["Low"],close=df["Close"],
+        name="Price",
+        increasing_line_color=C["cup"],decreasing_line_color=C["cdn"],
+        increasing_fillcolor=C["cup"],decreasing_fillcolor=C["cdn"]),row=1,col=1)
+    if "EMA_Fast" in df.columns:
+        last_ef = df["EMA_Fast"].dropna().iloc[-1] if not df["EMA_Fast"].dropna().empty else None
+        ef_label = f"EMA {cfg['fast_ema']}  {last_ef:,.2f}" if last_ef is not None else f"EMA {cfg['fast_ema']}"
+        fig.add_trace(go.Scatter(x=df.index, y=df["EMA_Fast"],
+            name=ef_label,
+            line=dict(color=C["ef"], width=1.7), connectgaps=False,
+            hovertemplate="EMA " + str(cfg["fast_ema"]) + ": %{y:,.2f}<extra></extra>"),
+            row=1, col=1)
+        if last_ef is not None:
+            fig.add_annotation(
+                x=df.index[-1], y=float(last_ef),
+                text=f" {last_ef:,.2f}",
+                font=dict(color=C["ef"], size=10),
+                showarrow=False, xanchor="left",
+                bgcolor="rgba(13,17,23,0.7)",
+                row=1, col=1)
+    if "EMA_Slow" in df.columns:
+        last_es = df["EMA_Slow"].dropna().iloc[-1] if not df["EMA_Slow"].dropna().empty else None
+        es_label = f"EMA {cfg['slow_ema']}  {last_es:,.2f}" if last_es is not None else f"EMA {cfg['slow_ema']}"
+        fig.add_trace(go.Scatter(x=df.index, y=df["EMA_Slow"],
+            name=es_label,
+            line=dict(color=C["es"], width=1.7), connectgaps=False,
+            hovertemplate="EMA " + str(cfg["slow_ema"]) + ": %{y:,.2f}<extra></extra>"),
+            row=1, col=1)
+        if last_es is not None:
+            fig.add_annotation(
+                x=df.index[-1], y=float(last_es),
+                text=f" {last_es:,.2f}",
+                font=dict(color=C["es"], size=10),
+                showarrow=False, xanchor="left",
+                bgcolor="rgba(13,17,23,0.7)",
+                row=1, col=1)
+    if "Volume" in df.columns:
+        VOL_UP = "rgba(0,212,170,0.45)"
+        VOL_DN = "rgba(255,75,92,0.45)"
+        is_up  = (df["Close"].values >= df["Open"].values)   # vectorised, no per-row cast
+        vc     = [VOL_UP if u else VOL_DN for u in is_up]
+        fig.add_trace(go.Bar(x=df.index, y=df["Volume"], name="Vol",
+            marker_color=vc, showlegend=False), row=2, col=1)
+    fig.update_layout(**_LAY,height=h,
+        yaxis=dict(showgrid=True,gridcolor=C["gr"]),
+        yaxis2=dict(showgrid=True,gridcolor=C["gr"]),
+        xaxis2=dict(showgrid=True,gridcolor=C["gr"]))
+    return fig
+
+def bt_chart(df, trades, cfg):
+    fig = _base(df, cfg, 700)
+    for t in trades:
+        ib = t["Type"]=="BUY"
+        ce = C["bm"] if ib else C["sm"]
+        cx = C["cup"] if t["PnL"]>0 else C["cdn"]
+        sym= "triangle-up" if ib else "triangle-down"
+        fig.add_trace(go.Scatter(
+            x=[t["Entry Time"]],y=[t["Entry Price"]],mode="markers+text",
+            marker=dict(symbol=sym,size=13,color=ce,line=dict(width=1,color="#fff")),
+            text=[t["Type"]],textposition="bottom center" if ib else "top center",
+            textfont=dict(color=ce,size=8),showlegend=False,
+            hovertemplate=f"<b>{t['Type']} Entry</b><br>@ {t['Entry Price']}<br>"
+                          f"SL:{t['SL']} | Tgt:{t['Target']}<br>{t['Entry Reason']}"),row=1,col=1)
+        for y,col in [(t["SL"],C["sl"]),(t["Target"],C["tg"])]:
+            fig.add_shape(type="line",x0=t["Entry Time"],x1=t["Exit Time"],
+                y0=y,y1=y,line=dict(color=col,width=1,dash="dot"),row=1,col=1)
+        fig.add_trace(go.Scatter(
+            x=[t["Exit Time"]],y=[t["Exit Price"]],mode="markers",
+            marker=dict(symbol="x",size=10,color=cx,line=dict(width=2,color=cx)),
+            showlegend=False,
+            hovertemplate=f"<b>Exit</b><br>@ {t['Exit Price']}<br>"
+                          f"PnL:{t['PnL']:+.2f}<br>{t['Exit Reason']}"),row=1,col=1)
+    return fig
+
+def live_chart(df, pos, cfg):
+    fig = _base(df, cfg, 560)
+    if pos:
+        sig=pos["signal"]; ep=pos["entry_price"]
+        sl=pos["sl_price"]; tgt=pos["tgt_price"]
+        ce=C["bm"] if sig=="BUY" else C["sm"]
+        sym="triangle-up" if sig=="BUY" else "triangle-down"
+        x0=pos["entry_time"]; x1=df.index[-1]
+        fig.add_trace(go.Scatter(x=[x0],y=[ep],mode="markers+text",
+            marker=dict(symbol=sym,size=15,color=ce,line=dict(width=1.5,color="#fff")),
+            text=[sig],textposition="bottom center" if sig=="BUY" else "top center",
+            textfont=dict(color=ce,size=9),showlegend=False,
+            hovertemplate=f"Entry:{ep} | SL:{sl} | Tgt:{tgt}"),row=1,col=1)
+        for y,col,lbl in [(sl,C["sl"],f"SL {sl:.2f}"),(tgt,C["tg"],f"TGT {tgt:.2f}")]:
+            fig.add_shape(type="line",x0=x0,x1=x1,y0=y,y1=y,
+                line=dict(color=col,width=1.5,dash="dashdot"),row=1,col=1)
+            fig.add_annotation(x=x1,y=y,text=f" {lbl}",
+                font=dict(color=col,size=10),showarrow=False,xanchor="left",row=1,col=1)
+    return fig
+
+
+# ─── UI HELPERS ──────────────────────────────────────────────────────────────
+def ltp_card(ticker, ph=None):
+    ltp,prev,chg,pct = get_ltp(ticker)
+    if ltp is None:
+        html='<div class="ltp-wrap"><span style="color:#8892b0">LTP unavailable</span></div>'
+    else:
+        arrow="▲" if chg>=0 else "▼"; cls="ltp-up" if chg>=0 else "ltp-dn"
+        html=f"""<div class="ltp-wrap">
+  <div><div class="ltp-sym">{ticker}</div>
+       <div class="ltp-px">{ltp:,.2f}</div></div>
+  <div class="{cls}" style="margin-left:10px;font-size:1rem">
+    {arrow} {abs(chg):,.2f} &nbsp;({abs(pct):.2f}%)</div>
+  <div class="ltp-meta">Prev Close <b>{prev:,.2f}</b><br>
+    <span style="font-size:.7rem">{datetime.datetime.now(IST).strftime('%H:%M:%S IST')}</span>
+  </div></div>"""
+    (ph or st).markdown(html,unsafe_allow_html=True)
+    return ltp
+
+def _mc(v,l,cls=""):
+    return f'<div class="mc {cls}"><div class="mc-v">{v}</div><div class="mc-l">{l}</div></div>'
+
+def stats_bar(stats):
+    if not stats or stats.get("Total Trades",0)==0:
+        st.info("No trades for this configuration."); return
+    a=stats.get("Accuracy (%)",0); p=stats.get("Total PnL",0); v=stats.get("Violations",0)
+    html=(_mc(stats["Total Trades"],"Total Trades","c-b")
+         +_mc(f"{stats['Wins']} / {stats['Losses']}","Wins / Losses","c-g")
+         +_mc(f"{a}%","Accuracy","c-gold" if a>=50 else "c-r")
+         +_mc(f"₹{p:+,.2f}","Total PnL","c-g" if p>=0 else "c-r")
+         +_mc(f"₹{stats.get('Avg PnL',0):+,.2f}","Avg PnL",
+              "c-g" if stats.get("Avg PnL",0)>=0 else "c-r")
+         +_mc(f"₹{stats.get('Best Trade',0):+,.2f}","Best Trade","c-g")
+         +_mc(f"₹{stats.get('Worst Trade',0):+,.2f}","Worst Trade","c-r")
+         +_mc(v,"Violations ⚠","c-r" if v>0 else ""))
+    st.markdown(f'<div class="mrow">{html}</div>',unsafe_allow_html=True)
+
+def cfg_cards(cfg):
+    items=[("Ticker",cfg.get("ticker_name",cfg.get("ticker","—"))),
+           ("Timeframe",cfg.get("timeframe","—")),("Period",cfg.get("period","—")),
+           ("Strategy",cfg.get("strategy","—")),
+           ("Fast EMA",cfg.get("fast_ema","—")),("Slow EMA",cfg.get("slow_ema","—")),
+           ("SL Type",cfg.get("sl_type","—")),("Target",cfg.get("tgt_type","—")),
+           ("SL Pts",cfg.get("custom_sl_pts","—")),("Tgt Pts",cfg.get("custom_tgt_pts","—")),
+           ("Qty",cfg.get("qty","—")),("R:R",cfg.get("rr_ratio","—")),
+           ("Crossover",cfg.get("crossover_type","—")),
+           ("Dhan","✅ ON" if cfg.get("dhan_enabled") else "❌ OFF")]
+    html="".join(f'<div class="cfg-item"><div class="cfg-k">{k}</div>'
+                 f'<div class="cfg-v">{v}</div></div>' for k,v in items)
+    st.markdown(f'<div class="cfg-grid">{html}</div>',unsafe_allow_html=True)
+
+def ema_pill_row(df, cfg):
+    """Render a compact EMA value pill strip. Call after stats_bar or cfg_cards."""
+    if df is None or df.empty:
+        return
+    strat = cfg.get("strategy","")
+    # Only meaningful for EMA Crossover; for Simple Buy/Sell still show for info
+    fe = cfg.get("fast_ema", 9)
+    se = cfg.get("slow_ema", 15)
+    ef_val = es_val = None
+    if "EMA_Fast" in df.columns:
+        s = df["EMA_Fast"].dropna()
+        if not s.empty: ef_val = float(s.iloc[-1])
+    if "EMA_Slow" in df.columns:
+        s = df["EMA_Slow"].dropna()
+        if not s.empty: es_val = float(s.iloc[-1])
+    if ef_val is None and es_val is None:
+        return
+    # Determine crossover state for colour hint
+    cross_lbl = ""
+    cross_col = "#8892b0"
+    if ef_val is not None and es_val is not None:
+        if ef_val > es_val:
+            cross_lbl = "▲ Bullish"; cross_col = "#00d4aa"
+        elif ef_val < es_val:
+            cross_lbl = "▼ Bearish"; cross_col = "#ff4b5c"
+        else:
+            cross_lbl = "◆ Crossing"; cross_col = "#ffd166"
+    parts = []
+    if ef_val is not None:
+        parts.append(
+            f'<span style="background:#1a1f35;border:1px solid {C["ef"]}33;'
+            f'border-radius:6px;padding:4px 12px;font-size:.82rem;">'
+            f'<span style="color:#8892b0;font-size:.7rem;margin-right:4px;">EMA {fe}</span>'
+            f'<span style="color:{C["ef"]};font-weight:700;">{ef_val:,.2f}</span>'
+            f'</span>')
+    if es_val is not None:
+        parts.append(
+            f'<span style="background:#1a1f35;border:1px solid {C["es"]}33;'
+            f'border-radius:6px;padding:4px 12px;font-size:.82rem;">'
+            f'<span style="color:#8892b0;font-size:.7rem;margin-right:4px;">EMA {se}</span>'
+            f'<span style="color:{C["es"]};font-weight:700;">{es_val:,.2f}</span>'
+            f'</span>')
+    if cross_lbl:
+        parts.append(
+            f'<span style="background:#1a1f35;border:1px solid {cross_col}44;'
+            f'border-radius:6px;padding:4px 12px;font-size:.82rem;">'
+            f'<span style="color:{cross_col};font-weight:700;">{cross_lbl}</span>'
+            f'</span>')
+    html = (
+        '<div style="display:flex;flex-wrap:wrap;gap:8px;'
+        'align-items:center;margin:6px 0 10px 0;">'
+        '<span style="color:#8892b0;font-size:.75rem;font-weight:600;'
+        'letter-spacing:.5px;text-transform:uppercase;">EMA Values</span>'
+        + "".join(parts) + "</div>")
+    st.markdown(html, unsafe_allow_html=True)
+
+def pos_card(pos, ltp):
+    if not pos: return
+    sig=pos["signal"]; ep=pos["entry_price"]; sl=pos["sl_price"]; tgt=pos["tgt_price"]
+    et=pos["entry_time"]
+    unr="—"
+    if ltp:
+        raw=(ltp-ep) if sig=="BUY" else (ep-ltp)
+        col="color:#00d4aa" if raw>=0 else "color:#ff4b5c"
+        unr=f'<span style="{col};font-weight:700">₹{raw:+.2f}</span>'
+    cls="pos-buy" if sig=="BUY" else "pos-sell"
+    clr="#00d4aa" if sig=="BUY" else "#ff4b5c"
+    ts_str = et.strftime("%H:%M:%S IST") if hasattr(et,"strftime") else str(et)
+    st.markdown(f"""<div class="pos-card {cls}">
+<div style="color:{clr};font-weight:700;font-size:1rem">
+  {'▲' if sig=='BUY' else '▼'} {sig} Position &nbsp;
+  <span style="color:#8892b0;font-size:.82rem">| {ts_str}</span>
+</div>
+<div class="pos-detail">
+  <div class="pos-f"><div class="pos-fl">Entry</div><div class="pos-fv">₹{ep:,.2f}</div></div>
+  <div class="pos-f"><div class="pos-fl">LTP</div>
+    <div class="pos-fv">{'₹{:,.2f}'.format(ltp) if ltp else '—'}</div></div>
+  <div class="pos-f"><div class="pos-fl">Stop Loss</div>
+    <div class="pos-fv" style="color:#ff4b5c">₹{sl:,.2f}</div></div>
+  <div class="pos-f"><div class="pos-fl">Target</div>
+    <div class="pos-fv" style="color:#00d4aa">₹{tgt:,.2f}</div></div>
+  <div class="pos-f"><div class="pos-fl">Unrealised</div>
+    <div class="pos-fv">{unr}</div></div>
+  <div class="pos-f"><div class="pos-fl">Reason</div>
+    <div class="pos-fv">{pos.get('reason_in','—')}</div></div>
+</div></div>""",unsafe_allow_html=True)
+
+
+# ─── SIDEBAR ─────────────────────────────────────────────────────────────────
+def sidebar() -> dict:
+    with st.sidebar:
+        st.markdown("""<div style="text-align:center;padding:8px 0">
+<span style="font-size:2rem">📈</span><br>
+<span style="font-size:1.1rem;font-weight:900;
+  background:linear-gradient(90deg,#64ffda,#00b4d8);
+  -webkit-background-clip:text;-webkit-text-fill-color:transparent">
+  Smart Investing</span><br>
+<span style="color:#8892b0;font-size:.7rem">Advanced Algo Trading Platform</span>
+</div>""",unsafe_allow_html=True)
+        st.divider()
+
+        # Asset & TF
+        st.markdown('<div class="sbs">📊 Asset & Timeframe</div>',unsafe_allow_html=True)
+        tn  = st.selectbox("Ticker",list(TICKER_MAP.keys()),index=0)
+        if tn=="Custom":
+            ct = st.text_input("Yahoo Symbol","RELIANCE.NS",placeholder="e.g. TCS.NS, AAPL")
+            tk = ct.strip() or "^NSEI"
+        else:
+            tk = TICKER_MAP[tn]
+        tf     = st.selectbox("Timeframe",list(TF_PERIODS.keys()),index=1)
+        period = st.selectbox("Period",TF_PERIODS[tf],index=0)
+
+        # Strategy
+        st.markdown('<div class="sbs">🎯 Strategy</div>',unsafe_allow_html=True)
+        strat = st.selectbox("Strategy",STRATEGIES,index=0)
+        fe=9; se=15; ct2="Simple Crossover"; ccs=10.0; uma=False; ma=0.0
+
+        if strat=="EMA Crossover":
+            c1,c2=st.columns(2)
+            fe=c1.number_input("Fast EMA",2,500,9)
+            se=c2.number_input("Slow EMA",2,500,15)
+            if fe>=se: st.warning("⚠️ Fast EMA must be < Slow EMA")
+            use_adv = st.checkbox(
+                "🔬 Advanced Crossover Filters", value=False,
+                help="Enable min-angle and candle-size filters on top of the crossover signal")
+            if use_adv:
+                ct2 = st.selectbox("Crossover Filter", CROSS_TYPES, index=0)
+                if ct2 == "Custom Candle Size":
+                    ccs = st.number_input("Min Candle Body", 0.01, 1e6, 10.0, 1.0)
+                elif ct2 == "ATR Based Candle Size":
+                    st.caption("ℹ️ Candle body ≥ ATR(14) required")
+                uma = st.checkbox("Minimum Angle Filter", value=False,
+                                  help="Ignore weak crossovers below this EMA angle")
+                if uma:
+                    ma = st.slider("Min Angle (°)", 0.0, 89.0, 0.0, 0.5)
+
+        # Stop Loss
+        st.markdown('<div class="sbs">🛡️ Stop Loss</div>',unsafe_allow_html=True)
+        sl_t=st.selectbox("SL Type",SL_TYPES,index=0)
+        sl_pts=10.0; rr=2.0
+        if sl_t=="Custom Points":
+            sl_pts=st.number_input("SL Points",0.01,1e6,10.0,1.0)
+        elif sl_t=="Trailing SL":
+            sl_pts=st.number_input("Trail Distance (pts)",0.01,1e6,10.0,1.0)
+        elif sl_t=="ATR Based":
+            st.caption("SL = Entry ± ATR(14)")
+        elif sl_t=="Reverse EMA Crossover":
+            sl_pts=st.number_input("Fallback SL pts",0.01,1e6,10.0,1.0)
+            st.caption("Exits on reverse EMA cross. Fallback for non-EMA strategies.")
+        elif sl_t=="Risk Reward Based":
+            st.caption("SL = Target ÷ R:R")
+            rr=st.number_input("R:R Ratio",0.1,100.0,2.0,0.5,key="rr_sl")
+
+        # Target
+        st.markdown('<div class="sbs">🎯 Target</div>',unsafe_allow_html=True)
+        tgt_t=st.selectbox("Target Type",TGT_TYPES,index=0)
+        tgt_pts=20.0
+        if tgt_t=="Custom Points":
+            tgt_pts=st.number_input("Target Points",0.01,1e6,20.0,1.0)
+        elif tgt_t=="Trailing Target":
+            tgt_pts=st.number_input("Trailing Distance (display)",0.01,1e6,20.0,1.0)
+            st.caption("ℹ️ Displayed on chart — does NOT trigger exit.")
+        elif tgt_t=="EMA Crossover":
+            tgt_pts=st.number_input("Display Target pts",0.01,1e6,20.0,1.0)
+            st.caption("Exits on reverse EMA crossover.")
+        elif tgt_t=="Risk Reward Based":
+            tgt_pts=st.number_input("Base Target pts",0.01,1e6,20.0,1.0)
+            if sl_t!="Risk Reward Based":
+                rr=st.number_input("R:R Ratio",0.1,100.0,2.0,0.5,key="rr_tgt")
+
+        # Trade settings
+        st.markdown('<div class="sbs">⚙️ Trade Settings</div>',unsafe_allow_html=True)
+        qty=st.number_input("Quantity",min_value=1,value=1,step=1)
+        use_cd=st.checkbox("Cooldown Between Trades (Live only)",value=True,
+                           help="Not applied in backtesting")
+        cd_sec=5
+        if use_cd: cd_sec=st.number_input("Cooldown (sec)",1,600,5,1)
+        prev_ol=st.checkbox("Prevent Overlapping Trades",value=True,
+                            help="One position must fully close before the next opens")
+
+        # Dhan
+        st.divider()
+        st.markdown('<div class="sbs">🏦 Dhan Broker</div>',unsafe_allow_html=True)
+        dhan_en=st.checkbox("Enable Dhan Broker",value=False)
+        dc: dict = {"dhan_enabled":dhan_en}
+
+        if dhan_en:
+            if not DHAN_OK:
+                st.error("dhanhq not installed. Run: pip install dhanhq")
+            cid = st.text_input("Client ID",  type="password")
+            tok = st.text_input("Access Token",type="password")
+            dc.update({"dhan_client_id":cid,"dhan_access_token":tok})
+
+            if st.button("🔐 Register IP (SEBI Mandate)",use_container_width=True):
+                with st.spinner("Detecting IP…"):
+                    res=register_ip(cid,tok)
+                st.info(f"**Public IP:** `{res.get('public_ip','N/A')}`\n\n"
+                        f"Also whitelist in [Dhan Developer Portal](https://developer.dhan.co/).\n\n"
+                        f"API: `{res.get('status','N/A')}` — {res.get('body','')[:100]}")
+
+            opt_en=st.checkbox("Options Trading",value=False)
+            dc["dhan_options_enabled"]=opt_en
+
+            if not opt_en:
+                prd=st.selectbox("Product",["Intraday","Delivery"],index=0)
+                exch=st.selectbox("Exchange",["NSE","BSE"],index=0)
+                sid=st.text_input("Security ID","1594")
+                dq=st.number_input("Dhan Qty",min_value=1,value=1,step=1)
+                eno=st.selectbox("Entry Order",["Limit Order","Market Order"],index=0)
+                exo=st.selectbox("Exit Order", ["Market Order","Limit Order"],index=0)
+                dc.update({"dhan_product":prd,"dhan_exchange":exch,
+                           "dhan_security_id":sid,"dhan_qty":dq,
+                           "dhan_entry_order":eno,"dhan_exit_order":exo})
+            else:
+                oe=st.selectbox("Options Exchange",["NSE_FNO","BSE_FNO"],index=0)
+                ce=st.text_input("CE Security ID","")
+                pe=st.text_input("PE Security ID","")
+                oq=st.number_input("Qty/Lots",min_value=1,value=65,step=1)
+                oeno=st.selectbox("Entry Order",["Market Order","Limit Order"],index=0)
+                oexo=st.selectbox("Exit Order", ["Market Order","Limit Order"],index=0)
+                dc.update({"dhan_opt_exchange":oe,"dhan_ce_id":ce,"dhan_pe_id":pe,
+                           "dhan_opt_qty":oq,"dhan_opt_entry_order":oeno,
+                           "dhan_opt_exit_order":oexo})
+
+        return {"ticker":tk,"ticker_name":tn,"timeframe":tf,"period":period,
+                "strategy":strat,"fast_ema":fe,"slow_ema":se,
+                "crossover_type":ct2,"custom_candle_size":ccs,
+                "use_min_angle":uma,"min_angle":ma,
+                "sl_type":sl_t,"tgt_type":tgt_t,
+                "custom_sl_pts":sl_pts,"custom_tgt_pts":tgt_pts,
+                "rr_ratio":rr,"qty":qty,"use_cooldown":use_cd,
+                "cooldown_secs":cd_sec,"prevent_overlap":prev_ol,**dc}
+
+
+# ─── BACKTEST TAB ─────────────────────────────────────────────────────────────
+def tab_backtest(cfg):
+    ph = st.empty()
+    ltp_card(cfg["ticker"], ph)
+
+    c1,c2 = st.columns([2,6])
+    run = c1.button("▶️  Run Backtest",type="primary",use_container_width=True)
+    c2.caption("Conservative SL-first: For BUY, candle LOW checked vs SL before HIGH vs Target. "
+               "For SELL, candle HIGH vs SL before LOW vs Target. "
+               "Violations = same candle hits both SL & Target (SL wins).")
+
+    if run:
+        with st.spinner("⏳ Fetching data & running backtest…"):
+            df_raw = fetch_data(cfg["ticker"],cfg["timeframe"],cfg["period"],cfg["slow_ema"])
+            if df_raw.empty:
+                st.error("❌ No data returned. Check ticker symbol."); return
+            days = PERIOD_DAYS.get(cfg["period"],30)
+            try:
+                bt_s = datetime.datetime.now(IST)-timedelta(days=days)
+                if df_raw.index.tz:
+                    bts = pd.Timestamp(bt_s).tz_convert(df_raw.index.tz)
+                else:
+                    bts = pd.Timestamp(bt_s.replace(tzinfo=None))
+            except Exception:
+                bts = df_raw.index[0]
+            res = run_backtest(df_raw, cfg, bts)
+            st.session_state.bt_results    = res
+            st.session_state.bt_cfg        = cfg.copy()
+            st.session_state["bt_chart_stale"] = True   # force chart rebuild
+
+    res = st.session_state.get("bt_results")
+    if not res:
+        st.markdown("""<div style="text-align:center;padding:55px 0;color:#8892b0">
+<div style="font-size:3rem">📊</div>
+<div style="font-size:1rem;margin-top:8px">
+  Configure parameters in the sidebar and click <b>Run Backtest</b></div>
+</div>""",unsafe_allow_html=True)
+        return
+
+    stats  = res["stats"]
+    trades = res["trades"]
+    viols  = res["violations"]
+    df_ind = res["df"]
+
+    # Stats bar
+    st.markdown("#### 📊 Backtest Summary")
+    stats_bar(stats)
+    ema_pill_row(df_ind, cfg)   # EMA values right below summary cards
+
+    if not trades:
+        st.info("No trades generated. Adjust strategy or timeframe."); return
+
+    # Chart — built once per backtest run, cached in session_state
+    st.markdown("#### 📈 Trade Chart")
+    if "bt_chart_fig" not in st.session_state or st.session_state.get("bt_chart_stale", True):
+        disp_df = df_ind.iloc[-500:] if len(df_ind) > 500 else df_ind
+        st.session_state["bt_chart_fig"]   = bt_chart(disp_df, trades, cfg)
+        st.session_state["bt_chart_stale"] = False
+    st.plotly_chart(st.session_state["bt_chart_fig"],
+                    use_container_width=True, config={"scrollZoom": True})
+
+    # Trade Table
+    st.markdown("#### 📋 Trade Log")
+    df_trades = pd.DataFrame(trades)
+    if not df_trades.empty:
+        display_cols = ["Type","Entry Time","Entry Price","Exit Time","Exit Price",
+                        "SL","Target","Candle High","Candle Low",
+                        "Entry Reason","Exit Reason","PnL","Result","Qty","Violation"]
+        df_show = df_trades[[c for c in display_cols if c in df_trades.columns]]
+        # Fast styling: only apply Styler when ≤200 rows to keep renders snappy
+        if len(df_show) <= 200:
+            def _color(row):
+                if row.get("PnL", 0) > 0:
+                    return ["background-color:#0d2620;color:#00d4aa"] * len(row)
+                elif row.get("PnL", 0) < 0:
+                    return ["background-color:#2a0f0f;color:#ff4b5c"] * len(row)
+                return [""] * len(row)
+            st.dataframe(df_show.style.apply(_color, axis=1),
+                         use_container_width=True, height=400)
+        else:
+            st.dataframe(df_show, use_container_width=True, height=400)
+
+    # Violations section
+    st.markdown("#### ⚠️ Violation Analysis")
+    vcount = len(viols)
+    if vcount==0:
+        st.success("✅ No violations — SL and Target were never hit on the same candle.")
+    else:
+        st.markdown(f"""<div class="viol-box">
+<b style="color:#ff4b5c">⚠️ {vcount} violation(s) detected</b><br>
+<span style="color:#ccd6f6;font-size:.85rem">
+These are trades where both SL and Target were hit on the same candle.
+In live trading these would be resolved tick-by-tick (SL hit first with conservative approach).
+This is the fundamental gap between backtesting and live trading.</span>
+</div>""",unsafe_allow_html=True)
+        df_v = pd.DataFrame(viols)
+        if not df_v.empty:
+            st.dataframe(df_v[[c for c in ["Type","Entry Time","Entry Price",
+                "Exit Price","SL","Target","Candle High","Candle Low","PnL","Exit Reason"]
+                if c in df_v.columns]],
+                use_container_width=True)
+
+    # Equity curve
+    if len(trades)>1:
+        st.markdown("#### 💰 Equity Curve")
+        pnls = [t["PnL"] for t in trades]
+        cum  = pd.Series(pnls).cumsum().tolist()
+        times= [str(t["Exit Time"]) for t in trades]
+        fig2 = go.Figure()
+        fig2.add_trace(go.Scatter(x=times,y=cum,mode="lines",
+            fill="tozeroy",
+            line=dict(color=C["cup"] if cum[-1]>=0 else C["cdn"],width=2),
+            fillcolor="rgba(0,212,170,0.1)" if cum[-1]>=0 else "rgba(255,75,92,0.1)"))
+        fig2.update_layout(**_LAY,height=260,
+            yaxis=dict(title="Cumulative PnL ₹",showgrid=True,gridcolor=C["gr"]),
+            xaxis=dict(showgrid=True,gridcolor=C["gr"]))
+        st.plotly_chart(fig2,use_container_width=True)
+
+
+# ─── LIVE TRADING THREAD ─────────────────────────────────────────────────────
+def _log(msg: str):
+    ts = datetime.datetime.now(IST).strftime("%H:%M:%S")
+    with _LOCK:
+        _LIVE["log"].append(f"[{ts}] {msg}")
+        if len(_LIVE["log"]) > 200:
+            _LIVE["log"] = _LIVE["log"][-200:]
+
+def live_loop(stop_evt: threading.Event):
+    """
+    Background thread — runs every ~2 s.
+    Tick : SL/Target checked against live LTP on every iteration.
+    Bar  : New signal checked only when the last closed bar changes.
+           EMA Crossover: signal on closed bar N → entry at forming bar open.
+           Simple Buy/Sell: entry at last closed bar close.
+    """
+    with _LOCK:
+        cfg = dict(_LIVE["config"])
+    ticker   = cfg["ticker"]
+    tf       = cfg["timeframe"]
+    last_bt  = None
+    last_fetch = 0.0
+    cooldown_until = 0.0
+
+    # Dhan init
+    dhan = None
+    if cfg.get("dhan_enabled") and cfg.get("dhan_client_id"):
+        dhan = _dhan_client(cfg["dhan_client_id"], cfg["dhan_access_token"])
+        _log("✅ Dhan connected" if dhan else "⚠️ Dhan init failed")
+
+    _log(f"▶ Started | {ticker} | {tf} | {cfg['strategy']}")
+
+    while not stop_evt.is_set():
+        try:
+            now = time.time()
+            # Rate-limit: one fetch per 2 s
+            if now - last_fetch < 2.0:
+                time.sleep(0.2)
+                continue
+            last_fetch = now
+
+            # ── Fetch OHLCV + build indicators ──────────────────────────
+            df = _fetch_raw(ticker, tf, cfg["period"], cfg["slow_ema"])  # always fresh
             if df is None or df.empty:
-                _log("[WARN] No data — retrying in 3s")
-                time.sleep(3); continue
+                _log("⚠️ Empty data, retrying…")
+                time.sleep(3)
+                continue
+            df_i = build_indicators(df, cfg)
 
-            df  = add_ind(df, fast, slow)
-            ltp = float(df["close"].iloc[-1])
-            now = datetime.now(IST)
-            lr  = df.iloc[-1]
+            # ── Get LTP ─────────────────────────────────────────────────
+            ltp, prev, _, _ = get_ltp(ticker)
+            if ltp is None:
+                ltp = float(df_i["Close"].iloc[-1])
 
-            # store indicators for UI
-            def _fv(v): return float(v) if v is not None and not (isinstance(v,float) and np.isnan(v)) else float("nan")
-            ef_v  = _fv(lr.get("ef"))
-            es_v  = _fv(lr.get("es"))
-            atr_v = _fv(lr.get("atr"))
-            ef_p  = _fv(df.iloc[-2].get("ef") if len(df)>=2 else None)
-            es_p  = _fv(df.iloc[-2].get("es") if len(df)>=2 else None)
-            _set("ind", {
-                "ef": ef_v, "es": es_v, "atr": atr_v,
-                "ef_p": ef_p, "es_p": es_p,
-                "fast": fast, "slow": slow, "ltp": ltp,
-                "bt": df.index[-1],
-                "bo": float(lr["open"]), "bh": float(lr["high"]), "bl": float(lr["low"]),
-            })
-            _set("df",      df)
-            _set("ltp",     ltp)
-            _set("last_ts", now)
-            if len(df) >= 20:
-                _set("ew", detect_ew(df))
+            with _LOCK:
+                _LIVE["last_ltp"]    = ltp
+                _LIVE["prev_close"]  = prev
+                _LIVE["df"]          = df_i
+                row = {k: (float(v) if isinstance(v, (int, float, np.floating, np.integer))
+                           else str(v))
+                       for k, v in df_i.iloc[-1].items()}
+                row["Time"] = str(df_i.index[-1])
+                _LIVE["last_candle"] = row
 
-            pos = _get("pos")
+            # ── Tick: check SL/Target against LTP (not OHLC) ────────────
+            with _LOCK:
+                pos = _LIVE["position"]
 
-            # ── EXIT CHECK (vs LTP, every tick) ──────────────────
             if pos:
-                sl=pos["sl"]; tgt=pos["tgt"]; pt=pos["type"]
-                # Trailing SL
-                if sl_t == "Trailing SL":
-                    tr = float(cfg.get("sl_points", 10))
-                    ns = ltp - tr if pt=="buy" else ltp + tr
-                    if (pt=="buy" and ns>sl) or (pt=="sell" and ns<sl):
-                        pos = dict(pos, sl=ns); _set("pos", pos); sl = ns
-                # Trailing Target (display only)
-                if tg_t == "Trailing Target":
-                    tp = float(cfg.get("target_points", 20))
-                    nt = ltp + tp if pt=="buy" else ltp - tp
-                    if (pt=="buy" and nt>tgt) or (pt=="sell" and nt<tgt):
-                        pos = dict(pos, tgt=nt); _set("pos", pos)
+                sig = pos["signal"]
+                sl  = pos["sl_price"]
+                tgt = pos["tgt_price"]
+                ex_p = ex_r = None
 
-                ep=None; er=None
-                if pt == "buy":
-                    if ltp <= sl:                                   ep=sl;  er=f"SL {ltp:.2f}≤{sl:.2f}"
-                    elif tg_t!="Trailing Target" and ltp >= tgt:   ep=tgt; er=f"Tgt {ltp:.2f}≥{tgt:.2f}"
+                if sig == "BUY":
+                    if ltp <= sl:
+                        ex_p, ex_r = ltp, "Stop Loss"
+                    elif ltp >= tgt and cfg["tgt_type"] != "Trailing Target":
+                        ex_p, ex_r = ltp, "Target"
                 else:
-                    if ltp >= sl:                                   ep=sl;  er=f"SL {ltp:.2f}≥{sl:.2f}"
-                    elif tg_t!="Trailing Target" and ltp <= tgt:   ep=tgt; er=f"Tgt {ltp:.2f}≤{tgt:.2f}"
-                if ep is None and (sl_t=="Reverse EMA Cross" or tg_t=="EMA Cross"):
-                    if ema_rev(df, len(df)-1, pt): ep=ltp; er="EMA Reverse Cross exit"
+                    if ltp >= sl:
+                        ex_p, ex_r = ltp, "Stop Loss"
+                    elif ltp <= tgt and cfg["tgt_type"] != "Trailing Target":
+                        ex_p, ex_r = ltp, "Target"
 
-                if ep is not None:
-                    pnl = round(((ep-pos["e"]) if pt=="buy" else (pos["e"]-ep))*qty, 2)
-                    t   = {"#": len(_get("trades",[]))+1, "Type": pt.upper(),
-                           "Entry": fdt(pos["et"]),
-                           "Exit":  now.strftime("%Y-%m-%d %H:%M:%S"),
-                           "Entry Price": round(pos["e"],4), "Exit Price": round(ep,4),
-                           "SL": round(pos["si"],4), "Target": round(pos["ti"],4),
-                           "Entry Reason": pos["r"], "Exit Reason": er,
-                           "PnL": pnl, "Qty": qty, "Source": "Live"}
-                    _push("trades", t)
-                    _set("pos", None)
-                    pending = None          # ← clear any pending signal so it
-                                            #   doesn't fire in the same tick
-                    just_exited = True      # ← skip entry this tick
-                    if use_dhan:
-                        resp = place_order(dhan_client, cfg, pt, ltp, is_exit=True)
-                        _log(f"EXIT order: {resp}")
-                    _log(f"✖ EXIT {pt.upper()} @{ep:.2f} | {er} | PnL: {pnl:+.2f}")
+                # Trailing SL update
+                if cfg["sl_type"] == "Trailing SL" and ex_p is None:
+                    trail = cfg.get("custom_sl_pts", 10.0)
+                    with _LOCK:
+                        cur = _LIVE["position"]["sl_price"]
+                        new_sl = (ltp - trail) if sig == "BUY" else (ltp + trail)
+                        _LIVE["position"]["sl_price"] = max(cur, new_sl) if sig == "BUY" else min(cur, new_sl)
 
-            # ── ENTRY LOGIC ───────────────────────────────────────
-            # just_exited guard: never re-enter in the same tick as an exit.
-            # This prevents Simple Buy/Sell from immediately re-opening after
-            # SL/Target, and prevents pending EMA signals from firing the same
-            # tick a position closes.
-            if _get("pos") is None and not just_exited:
-                cd_ok = True
-                if cfg.get("cooldown_enabled", True):
-                    trd = _get("trades", [])
-                    if trd:
-                        try:
-                            le = datetime.strptime(
-                                trd[-1].get("Exit","2000-01-01 00:00:00"),
-                                "%Y-%m-%d %H:%M:%S")
-                            le = IST.localize(le)
-                            if (now - le).total_seconds() < int(cfg.get("cooldown_s",5)):
-                                cd_ok = False
-                        except Exception: pass
+                # Reverse EMA on last closed bar
+                if ex_p is None and len(df_i) >= 2:
+                    ci = len(df_i) - 2
+                    # EMA Crossover strategy: ALWAYS exit on reverse cross (same logic as backtest)
+                    if cfg["strategy"] == "EMA Crossover" and _rev_ema(df_i, ci, sig):
+                        ex_p, ex_r = ltp, "EMA Reverse Crossover"
+                    elif cfg["sl_type"] == "Reverse EMA Crossover" and _rev_ema(df_i, ci, sig):
+                        ex_p, ex_r = ltp, "Reverse EMA Crossover"
+                    elif cfg["tgt_type"] == "EMA Crossover" and _rev_ema(df_i, ci, sig):
+                        ex_p, ex_r = ltp, "EMA Target (Reverse Cross)"
 
-                # Simple Buy/Sell → IMMEDIATE on first tick
-                if strat == "Simple Buy" and cd_ok:
-                    sl, tgt = calc_sl_tgt(ltp, "buy", lr, cfg)
-                    _set("pos", {"type":"buy","e":ltp,"et":now,"sl":sl,"si":sl,"tgt":tgt,"ti":tgt,"r":"Simple Buy"})
-                    if use_dhan: _log(f"ENTRY: {place_order(dhan_client,cfg,'buy',ltp)}")
-                    _log(f"▲ BUY @{ltp:.2f}  SL:{sl:.2f}  Tgt:{tgt:.2f}")
+                # Close trade
+                if ex_p is not None:
+                    with _LOCK:
+                        p2  = _LIVE["position"]
+                        raw = ex_p - p2["entry_price"]
+                        pnl = raw * cfg["qty"] if sig == "BUY" else -raw * cfg["qty"]
+                        done = {
+                            **p2,
+                            "exit_time":   datetime.datetime.now(IST),
+                            "exit_price":  round(ex_p, 2),
+                            "exit_reason": ex_r,
+                            "pnl":         round(pnl, 2),
+                            "result":      "✅ Win" if pnl > 0 else "❌ Loss",
+                        }
+                        _LIVE["completed_trades"].append(done)
+                        _LIVE["position"] = None
+                    _log(f"🔴 EXIT {sig} @ {ex_p:.2f} | {ex_r} | PnL: {pnl:+.2f}")
+                    if dhan and cfg.get("dhan_enabled"):
+                        resp = _exit_order(dhan, cfg, p2, ex_p)
+                        _log(f"📤 Dhan exit: {str(resp)[:80]}")
+                    if cfg.get("use_cooldown", True):
+                        cooldown_until = time.time() + cfg.get("cooldown_secs", 5)
 
-                elif strat == "Simple Sell" and cd_ok:
-                    sl, tgt = calc_sl_tgt(ltp, "sell", lr, cfg)
-                    _set("pos", {"type":"sell","e":ltp,"et":now,"sl":sl,"si":sl,"tgt":tgt,"ti":tgt,"r":"Simple Sell"})
-                    if use_dhan: _log(f"ENTRY: {place_order(dhan_client,cfg,'sell',ltp)}")
-                    _log(f"▼ SELL @{ltp:.2f}  SL:{sl:.2f}  Tgt:{tgt:.2f}")
+            # ── Bar: new entry signal on closed bar ──────────────────────
+            if len(df_i) >= 2:
+                closed_bt = df_i.index[-2]
+                if last_bt is None or closed_bt != last_bt:
+                    last_bt = closed_bt
+                    ci = len(df_i) - 2
+                    with _LOCK:
+                        has_pos = _LIVE["position"] is not None
+                    if not has_pos and time.time() >= cooldown_until:
+                        sig = get_signal(df_i, ci, cfg)
+                        if sig:
+                            if cfg["strategy"] == "EMA Crossover":
+                                ep  = float(df_i["Open"].iloc[-1])
+                                rsn = (f"EMA {cfg['fast_ema']}/{cfg['slow_ema']} "
+                                       f"{'Bullish' if sig == 'BUY' else 'Bearish'} Cross")
+                            else:
+                                ep  = float(df_i["Close"].iloc[-2])
+                                rsn = cfg["strategy"]
+                            sl  = _compute_sl(ep, sig, df_i, ci, cfg)
+                            tgt = _compute_tgt(ep, sig, df_i, ci, cfg, sl)
+                            new_pos = {
+                                "signal":      sig,
+                                "entry_time":  datetime.datetime.now(IST),
+                                "entry_price": round(ep, 2),
+                                "sl_price":    round(sl, 2),
+                                "tgt_price":   round(tgt, 2),
+                                "init_sl":     round(sl, 2),
+                                "init_tgt":    round(tgt, 2),
+                                "reason_in":   rsn,
+                            }
+                            with _LOCK:
+                                _LIVE["position"] = new_pos
+                            _log(f"🟢 ENTRY {sig} @ {ep:.2f} | SL:{sl:.2f} | Tgt:{tgt:.2f}")
+                            if dhan and cfg.get("dhan_enabled"):
+                                fn   = _option_order if cfg.get("dhan_options_enabled") else _equity_order
+                                resp = fn(dhan, cfg, sig, ep)
+                                _log(f"📤 Dhan entry: {str(resp)[:80]}")
 
-                # Pending from previous candle
-                elif pending and cd_ok:
-                    sg, rsn = pending; pending = None
-                    ep = float(df["open"].iloc[-1])
-                    sl, tgt = calc_sl_tgt(ep, sg, lr, cfg)
-                    _set("pos", {"type":sg,"e":ep,"et":now,"sl":sl,"si":sl,"tgt":tgt,"ti":tgt,"r":rsn})
-                    if use_dhan: _log(f"ENTRY: {place_order(dhan_client,cfg,sg,ep)}")
-                    _log(f"▲ ENTRY {sg.upper()} @{ep:.2f}  SL:{sl:.2f}  Tgt:{tgt:.2f}")
-
-                else:
-                    tm     = now.hour*60 + now.minute
-                    at_bdy = (tm % tf_min == 0) and (tm != last_bdy)
-                    if at_bdy and cd_ok:
-                        last_bdy = tm
-                        if strat == "EMA Crossover":
-                            sg, rsn = ema_sig(df, len(df)-1, cfg)
-                            if sg and df.index[-1] != last_sig_bar:
-                                last_sig_bar = df.index[-1]
-                                pending = (sg, rsn)
-                                _log(f"◆ EMA SIGNAL {sg.upper()} → entering next candle open")
-                        elif strat == "Elliott Wave":
-                            ew   = _get("ew", {})
-                            sig2 = ew.get("signal", "")
-                            conf = ew.get("confidence", 0)
-                            if sig2 and conf >= 50 and cd_ok:
-                                sg = "buy" if sig2=="BUY" else "sell"
-                                pending = (sg, ew.get("signal_reason","EW signal"))
-                                _log(f"◆ EW SIGNAL {sg.upper()} conf={conf}% → entering next candle")
-
-            time.sleep(1.5)
+            time.sleep(2.0)
 
         except Exception as e:
-            _log(f"[ERR] {e}")
-            time.sleep(2)   # short pause, keep thread alive
+            _log(f"⚠️ {type(e).__name__}: {e}")
+            time.sleep(3)
 
-    _log("■ STOPPED.")
+    with _LOCK:
+        _LIVE["active"] = False
+    _log("⏹ Stopped")
 
-# ════════════════════════════════════════════════════════════════════
-# CHARTS
-# ════════════════════════════════════════════════════════════════════
-def make_chart(df, trades=None, title="", fast=9, slow=15, pos=None, h=500):
-    if df is None or df.empty: return go.Figure()
-    fig = make_subplots(rows=2, cols=1, shared_xaxes=True,
-                        vertical_spacing=0.03, row_heights=[0.78,0.22])
-    fig.add_trace(go.Candlestick(
-        x=df.index, open=df["open"], high=df["high"], low=df["low"], close=df["close"],
-        name="Price", increasing_line_color="#48bb78", decreasing_line_color="#fc8181",
-        increasing_fillcolor="#48bb78", decreasing_fillcolor="#fc8181"), row=1, col=1)
-    if "ef" in df.columns:
-        fig.add_trace(go.Scatter(x=df.index, y=df["ef"], name=f"EMA({fast})",
-            line=dict(color="#f6ad55", width=1.5)), row=1, col=1)
-    if "es" in df.columns:
-        fig.add_trace(go.Scatter(x=df.index, y=df["es"], name=f"EMA({slow})",
-            line=dict(color="#76e4f7", width=1.5)), row=1, col=1)
-    if "volume" in df.columns:
-        vc = ["#48bb78" if c>=o else "#fc8181" for c,o in zip(df["close"],df["open"])]
-        fig.add_trace(go.Bar(x=df.index, y=df["volume"], name="Vol",
-            marker_color=vc, opacity=0.45), row=2, col=1)
-    for t in (trades or [])[:60]:
-        try:
-            et = pd.to_datetime(t.get("Entry","")); xt = pd.to_datetime(t.get("Exit",""))
-            ep_v = t.get("Entry Price",0); xp_v = t.get("Exit Price",0)
-            sl_v = t.get("SL",0);          tg_v = t.get("Target",0)
-            c   = "#48bb78" if t["Type"]=="BUY" else "#fc8181"
-            sym = "triangle-up" if t["Type"]=="BUY" else "triangle-down"
-            pc  = "#48bb78" if t.get("PnL",0)>=0 else "#fc8181"
-            fig.add_trace(go.Scatter(x=[et],y=[ep_v],mode="markers+text",
-                marker=dict(symbol=sym,size=11,color=c),showlegend=False,
-                text=[f"{ep_v:.0f}"],textposition="top center",
-                textfont=dict(size=7,color=c)),row=1,col=1)
-            fig.add_trace(go.Scatter(x=[xt],y=[xp_v],mode="markers",
-                marker=dict(symbol="x",size=8,color=pc),showlegend=False),row=1,col=1)
-            fig.add_shape(type="line",x0=et,x1=xt,y0=sl_v,y1=sl_v,
-                line=dict(color="#fc8181",width=1,dash="dot"),row=1,col=1)
-            fig.add_shape(type="line",x0=et,x1=xt,y0=tg_v,y1=tg_v,
-                line=dict(color="#48bb78",width=1,dash="dot"),row=1,col=1)
-        except Exception: pass
-    if pos:
-        try:
-            c   = "#48bb78" if pos["type"]=="buy" else "#fc8181"
-            sym = "triangle-up" if pos["type"]=="buy" else "triangle-down"
-            fig.add_trace(go.Scatter(x=[pos["et"]],y=[pos["e"]],mode="markers+text",
-                marker=dict(symbol=sym,size=16,color=c,line=dict(color="white",width=2)),
-                text=[f"ENTRY {pos['e']:.2f}"],textposition="top center"),row=1,col=1)
-            fig.add_hline(y=pos["sl"],line=dict(color="#fc8181",width=2,dash="dot"),
-                annotation_text=f"SL {pos['sl']:.2f}",
-                annotation_font=dict(color="#fc8181"),row=1,col=1)
-            fig.add_hline(y=pos["tgt"],line=dict(color="#48bb78",width=2,dash="dot"),
-                annotation_text=f"Tgt {pos['tgt']:.2f}",
-                annotation_font=dict(color="#48bb78"),row=1,col=1)
-        except Exception: pass
-    fig.update_layout(template="plotly_dark",paper_bgcolor="#0e1117",plot_bgcolor="#0e1117",
-        font=dict(color="#e2e8f0",size=11),
-        legend=dict(orientation="h",yanchor="bottom",y=1.02,xanchor="right",x=1,bgcolor="rgba(0,0,0,0)"),
-        margin=dict(l=0,r=0,t=36,b=0),height=h,xaxis_rangeslider_visible=False,
-        xaxis2=dict(showgrid=True,gridcolor="#1a1f2e"),
-        yaxis=dict(showgrid=True,gridcolor="#1a1f2e"),
-        yaxis2=dict(showgrid=True,gridcolor="#1a1f2e"))
-    if title: fig.update_layout(title=dict(text=title,font=dict(size=13,color="#90cdf4")))
-    return fig
 
-def make_ew_chart(df, ew, fast, slow):
-    fig = make_chart(df.tail(120), fast=fast, slow=slow, h=400, title="Elliott Wave Chart")
-    wc  = {"1":"#f6ad55","2":"#fc8181","3":"#48bb78","4":"#f6ad55","5":"#76e4f7",
-           "A":"#fc8181","B":"#48bb78","C":"#fc8181"}
-    for w in ew.get("waves_plot", []):
-        s=w["start"]; e=w["end"]; c=wc.get(w["label"],"#a0aec0")
-        fig.add_trace(go.Scatter(x=[s["dt"],e["dt"]],y=[s["px"],e["px"]],
-            mode="lines+markers+text",line=dict(color=c,width=2.5),
-            marker=dict(size=8,color=c),text=["",f"W{w['label']}"],
-            textposition="top center",textfont=dict(color=c,size=12),
-            name=f"W{w['label']}"),row=1,col=1)
-    return fig
-
-def pnl_chart(trades):
-    pnls = [t.get("PnL",0) for t in trades]; cum = [0]+list(np.cumsum(pnls))
-    c    = "#48bb78" if cum[-1]>=0 else "#fc8181"
-    fill = "rgba(72,187,120,0.1)" if c=="#48bb78" else "rgba(252,129,129,0.1)"
-    fig  = go.Figure(go.Scatter(x=list(range(len(cum))),y=cum,mode="lines+markers",
-        fill="tozeroy",fillcolor=fill,line=dict(color=c,width=2),name="P&L"))
-    fig.update_layout(template="plotly_dark",paper_bgcolor="#0e1117",
-        plot_bgcolor="#0e1117",height=220,
-        margin=dict(l=0,r=0,t=20,b=0),font=dict(color="#e2e8f0"))
-    return fig
-
-# ════════════════════════════════════════════════════════════════════
-# SIDEBAR
-# ════════════════════════════════════════════════════════════════════
-def sidebar():
-    cfg = {}
-    with st.sidebar:
-        st.markdown("## 📈 Smart Investing"); st.markdown("---")
-        tn  = st.selectbox("🎯 Ticker", list(TICKERS.keys()), key="s_tn")
-        sym = (st.text_input("Symbol","RELIANCE.NS",key="s_sym").strip()
-               if tn=="Custom" else TICKERS[tn])
-        cfg.update(ticker_name=tn, symbol=sym)
-        tf = st.selectbox("⏱ Interval", list(TF_PERIODS.keys()), index=2, key="s_tf")
-        pr = TF_PERIODS[tf]
-        per= st.selectbox("Period", pr, index=min(1,len(pr)-1), key="s_per")
-        cfg.update(timeframe=tf, period=per)
-        strat = st.selectbox("🧠 Strategy",
-            ["EMA Crossover","Simple Buy","Simple Sell","Elliott Wave"], key="s_str")
-        cfg["strategy"] = strat
-        if strat == "EMA Crossover":
-            c1,c2 = st.columns(2)
-            fe = c1.number_input("Fast EMA",1,500,int(st.session_state.get("_aFE",9)),  key="s_fe")
-            se = c2.number_input("Slow EMA",1,500,int(st.session_state.get("_aSE",15)), key="s_se")
-            cfg.update(fast_ema=fe,slow_ema=se)
-            uang = st.checkbox("Angle Filter",False,key="s_ang")
-            mang = st.number_input("Min Angle°",0.0,90.0,0.0,0.5,key="s_mang") if uang else 0.0
-            cfg.update(use_angle=uang,min_angle=mang)
-            ct = st.selectbox("Crossover",["Simple","Custom Candle","ATR Candle"],key="s_ct")
-            cfg["crossover_type"]=ct
-            if ct=="Custom Candle":
-                cfg["custom_candle"]=st.number_input("Min Body",0.0,value=10.0,key="s_cb")
-        else:
-            cfg.update(fast_ema=9,slow_ema=15,use_angle=False,min_angle=0.0,
-                       crossover_type="Simple",custom_candle=10.0)
-        cfg["quantity"] = st.number_input("📦 Qty",1,1_000_000,1,key="s_qty")
-        sl_t = st.selectbox("🛡 SL",
-            ["Custom Points","ATR Based","Trailing SL","Reverse EMA Cross","Risk-Reward"],key="s_slt")
-        cfg["sl_type"] = sl_t
-        slp = float(st.session_state.get("_aSL",10.0))
-        if sl_t == "ATR Based":
-            cfg["atr_sl_mult"] = st.number_input("ATR Mult SL",0.1,10.0,1.5,0.1,key="s_asm")
-            cfg["sl_points"]   = slp
-        else:
-            cfg["sl_points"]   = st.number_input("SL Points",0.1,value=slp,step=0.5,key="s_slp")
-            cfg["atr_sl_mult"] = 1.5
-        tg_t = st.selectbox("🎯 Target",
-            ["Custom Points","ATR Based Target","Trailing Target","EMA Cross","Risk-Reward"],key="s_tgt")
-        cfg["target_type"] = tg_t
-        tgp = float(st.session_state.get("_aTG",20.0))
-        if tg_t == "ATR Based Target":
-            cfg["atr_tgt_mult"]  = st.number_input("ATR Mult Tgt",0.1,20.0,3.0,0.1,key="s_atm")
-            cfg["target_points"] = tgp
-        elif tg_t == "Risk-Reward":
-            cfg["rr_ratio"]      = st.number_input("R:R",0.1,20.0,
-                float(st.session_state.get("_aRR",2.0)),0.1,key="s_rr")
-            cfg["target_points"] = tgp; cfg["atr_tgt_mult"] = 3.0
-        elif tg_t == "Trailing Target":
-            cfg["target_points"] = st.number_input("Trail Dist",0.1,value=tgp,step=0.5,key="s_tgp")
-            cfg["atr_tgt_mult"]  = 3.0; st.caption("Display only")
-        else:
-            cfg["target_points"] = st.number_input("Target Pts",0.1,value=tgp,step=0.5,key="s_tgp2")
-            cfg["atr_tgt_mult"]  = 3.0
-        cfg.setdefault("rr_ratio",2.0)
-        cd  = st.checkbox("🔄 Cooldown",True,key="s_cd")
-        cds = st.number_input("Cooldown s",1,3600,5,key="s_cds") if cd else 5
-        cfg.update(cooldown_enabled=cd,cooldown_s=cds)
-        en = st.checkbox("🏦 Enable Dhan",False,key="s_dhan"); cfg["enable_dhan"]=en
-        if en:
-            cid=st.text_input("Client ID",key="s_cid")
-            tok=st.text_input("Token",key="s_tok",type="password")
-            cfg.update(dhan_cid=cid,dhan_tok=tok)
-            if st.button("Connect & Show IP",use_container_width=True,key="s_conn"):
-                cl=init_dhan(cid,tok)
-                if cl:
-                    st.session_state.dhan_client=cl
-                    ip=get_ip()
-                    st.info(f"Your IP: **{ip}** — whitelist at Dhan Console → Profile → API → IP Whitelist")
-                    st.success("Connected!")
-                else: st.error("Failed")
-            opts=st.checkbox("Options",False,key="s_opts"); cfg["options_trading"]=opts
-            if opts:
-                cfg["fno_exc"]=st.selectbox("FNO",["NSE_FNO","BSE_FNO"],key="s_fno")
-                cfg["ce_id"]=st.text_input("CE ID",key="s_ceid"); cfg["pe_id"]=st.text_input("PE ID",key="s_peid")
-                cfg["opts_qty"]=st.number_input("Opts Qty",1,value=65,key="s_oq")
-                cfg["opt_entry_type"]=st.selectbox("Entry",["MARKET","LIMIT"],key="s_oent")
-                cfg["opt_exit_type"] =st.selectbox("Exit", ["MARKET","LIMIT"],key="s_oext")
-            else:
-                cfg["product"]     =st.selectbox("Product", ["INTRADAY","DELIVERY"],key="s_prod")
-                cfg["exchange"]    =st.selectbox("Exchange",["NSE","BSE"],           key="s_exc")
-                cfg["sec_id"]      =st.text_input("Security ID","1594",              key="s_sid")
-                cfg["dhan_qty"]    =st.number_input("Order Qty",1,value=1,           key="s_dqty")
-                cfg["entry_order"] =st.selectbox("Entry Order",["LIMIT","MARKET"],   key="s_eord")
-                cfg["exit_order"]  =st.selectbox("Exit Order", ["MARKET","LIMIT"],   key="s_xord")
-    return cfg
-
-# ════════════════════════════════════════════════════════════════════
-# SHARED WIDGETS
-# ════════════════════════════════════════════════════════════════════
-def ltp_banner(cfg):
-    ltp  = _get("ltp")  or 0.0
-    prev = _get("prev_close") or ltp
-    chg  = ltp - prev; pct = chg/prev*100 if prev else 0
-    arrow= "▲" if chg>=0 else "▼"; cls="ltpup" if chg>=0 else "ltpdn"
-    ts   = datetime.now(IST).strftime("%H:%M:%S IST")
-    st.markdown(
-        f'<div class="ltpbar">'
-        f'<div style="color:#90cdf4;font-size:11px">📈 {cfg.get("ticker_name","—")} · {cfg.get("symbol","")}</div>'
-        f'<div class="ltpval">₹ {ltp:,.2f}</div>'
-        f'<div class="{cls}">{arrow} {abs(chg):.2f} ({abs(pct):.2f}%)</div>'
-        f'<div class="ltpmeta">{cfg.get("timeframe","")} · {cfg.get("period","")} · {cfg.get("strategy","")} | {ts}</div>'
-        f'</div>', unsafe_allow_html=True)
-
-def cfg_box(cfg):
-    st.markdown(
-        f'<div class="cfgb">'
-        f'<b>Ticker:</b> {cfg.get("ticker_name","—")} ({cfg.get("symbol","—")}) | '
-        f'<b>TF:</b> {cfg.get("timeframe","—")}/{cfg.get("period","—")} | '
-        f'<b>Strategy:</b> {cfg.get("strategy","—")} | <b>Qty:</b> {cfg.get("quantity",1)}<br>'
-        f'<b>Fast EMA:</b> {cfg.get("fast_ema",9)} | <b>Slow EMA:</b> {cfg.get("slow_ema",15)}<br>'
-        f'<b>SL:</b> {cfg.get("sl_type","—")} ({cfg.get("sl_points",10)} pts) | '
-        f'<b>Target:</b> {cfg.get("target_type","—")} ({cfg.get("target_points",20)} pts)'
-        f'</div>', unsafe_allow_html=True)
-
-def style_df(df):
-    if df.empty: return df.style
-    def rc(row):
-        pnl=row.get("PnL",0)
-        c="rgba(72,187,120,0.10)" if pnl>0 else ("rgba(252,129,129,0.10)" if pnl<0 else "")
-        return [f"background-color:{c}"]*len(row)
-    styled=df.style.apply(rc,axis=1)
-    if "PnL" in df.columns:
-        styled=styled.map(lambda v:(
-            f"color:{'#48bb78' if v>0 else '#fc8181'};font-weight:700"
-            if isinstance(v,(int,float)) else ""),subset=["PnL"])
-    if "Viol" in df.columns:
-        styled=styled.map(lambda v:(
-            "background-color:#2d1515;color:#fc8181;font-weight:700"
-            if v is True else ""),subset=["Viol"])
-    return styled
-
-def trade_stats(trades):
-    if not trades: return
-    df  = pd.DataFrame(trades)
-    w   = df[df["PnL"]>0]; l = df[df["PnL"]<=0]
-    tot = df["PnL"].sum(); acc = len(w)/len(df)*100 if len(df) else 0
-    aw  = w["PnL"].mean() if len(w) else 0; al = l["PnL"].mean() if len(l) else 0
-    cols= st.columns(6)
-    for col,lbl,val,clr in [
-        (cols[0],"Trades",   len(df),          "#e2e8f0"),
-        (cols[1],"Winners",  len(w),            "#48bb78"),
-        (cols[2],"Losers",   len(l),            "#fc8181"),
-        (cols[3],"Accuracy", f"{acc:.1f}%",     "#f6ad55"),
-        (cols[4],"Total P&L",f"₹{tot:+.2f}",   "#48bb78" if tot>=0 else "#fc8181"),
-        (cols[5],"Avg W/L",  f"₹{aw:.1f}/₹{al:.1f}","#76e4f7"),
-    ]:
-        col.markdown(
-            f'<div class="card"><div style="color:#a0aec0;font-size:11px">{lbl}</div>'
-            f'<div style="color:{clr};font-size:16px;font-weight:700;margin-top:2px">{val}</div>'
-            f'</div>', unsafe_allow_html=True)
-
-# ════════════════════════════════════════════════════════════════════
-# EW DISPLAY
-# ════════════════════════════════════════════════════════════════════
-def show_ew_panel(ew, cfg, df=None, fast=9, slow=15):
-    if not ew or not ew.get("ok"): return
-    label  = ew.get("label","—"); d = ew.get("direction","UNCLEAR")
-    wtype  = ew.get("wave_type","—"); cw = ew.get("current_wave","—")
-    conf   = ew.get("confidence",0); cp = ew.get("current_price",0)
-    sig    = ew.get("signal",""); reason = ew.get("signal_reason","")
-    sl_ew  = ew.get("sl"); tgt_ew = ew.get("target")
-    projs  = ew.get("projections",{}); after = ew.get("after","")
-    rows   = ew.get("wave_rows",[]); rules = ew.get("rules",[])
-
-    dc = {"BULLISH":"#48bb78","BEARISH":"#fc8181",
-          "CORRECTIVE_DOWN":"#f6ad55","CORRECTIVE_UP":"#76e4f7",
-          "UNCLEAR":"#a0aec0"}.get(d,"#a0aec0")
-    cc = "#48bb78" if conf>=70 else "#f6ad55" if conf>=40 else "#fc8181"
-
-    # Top status row
-    c1,c2,c3,c4,c5 = st.columns(5)
-    for col,lbl,val,clr in [
-        (c1,"Pattern",   label,  dc),
-        (c2,"Wave Type", wtype,  dc),
-        (c3,"Direction", d,      dc),
-        (c4,"Now",       cw,     "#e2e8f0"),
-        (c5,"Confidence",f"{conf}%",cc),
-    ]:
-        col.markdown(
-            f'<div class="card"><div style="color:#a0aec0;font-size:11px">{lbl}</div>'
-            f'<div style="color:{clr};font-size:13px;font-weight:700;margin-top:2px">{val}</div>'
-            f'</div>', unsafe_allow_html=True)
-
-    # Automated signal box
-    if sig:
-        sig_c = "#48bb78" if sig=="BUY" else "#fc8181"
-        arr   = "🔼" if sig=="BUY" else "🔽"
-        sl_str  = f"₹{sl_ew:,.2f}"  if sl_ew  else "—"
-        tgt_str = f"₹{tgt_ew:,.2f}" if tgt_ew else "—"
-        rr_str  = "—"
-        if sl_ew and tgt_ew and sl_ew != 0:
-            rr_val = round(abs(tgt_ew - cp) / abs(cp - sl_ew),2) if cp != sl_ew else 0
-            rr_str = f"{rr_val}x"
-        strat_sl  = cfg.get("sl_points",10); strat_sl_t = cfg.get("sl_type","—")
-        strat_tg  = cfg.get("target_points",20); strat_tg_t= cfg.get("target_type","—")
-        st.markdown(
-            f'<div class="ewrec">'
-            f'<div style="font-size:16px;font-weight:700;color:{sig_c};margin-bottom:10px">'
-            f'{arr} AUTO SIGNAL: {sig} &nbsp;·&nbsp; '
-            f'<span style="font-size:12px;color:#a0aec0;font-weight:normal">{reason}</span></div>'
-            f'<div style="display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-bottom:10px">'
-            f'<div style="background:#0e1117;border-radius:8px;padding:10px;text-align:center">'
-            f'<div style="color:#a0aec0;font-size:11px">Entry (LTP)</div>'
-            f'<div style="color:#e2e8f0;font-size:16px;font-weight:700">₹{cp:,.2f}</div></div>'
-            f'<div style="background:#0e1117;border-radius:8px;padding:10px;text-align:center">'
-            f'<div style="color:#a0aec0;font-size:11px">EW Stop Loss</div>'
-            f'<div style="color:#fc8181;font-size:16px;font-weight:700">{sl_str}</div></div>'
-            f'<div style="background:#0e1117;border-radius:8px;padding:10px;text-align:center">'
-            f'<div style="color:#a0aec0;font-size:11px">EW Target</div>'
-            f'<div style="color:#48bb78;font-size:16px;font-weight:700">{tgt_str}</div></div>'
-            f'<div style="background:#0e1117;border-radius:8px;padding:10px;text-align:center">'
-            f'<div style="color:#a0aec0;font-size:11px">EW R:R</div>'
-            f'<div style="color:#f6ad55;font-size:16px;font-weight:700">{rr_str}</div></div></div>'
-            f'<div style="background:#0e1117;border-radius:6px;padding:7px 12px;font-size:12px;color:#a0aec0">'
-            f'💡 Your SL: {strat_sl}pts ({strat_sl_t}) | Target: {strat_tg}pts ({strat_tg_t}) — '
-            f'adjust sidebar to match EW levels if desired'
-            f'</div></div>', unsafe_allow_html=True)
-        st.success(f"📊 EW Confidence: {conf}%  {'(High confidence — good setup!)' if conf>=70 else '(Medium — use with EMA confirmation)' if conf>=40 else '(Low — wait for better setup)'}")
-
-    # Wave breakdown table
-    if rows:
-        st.markdown("##### 📊 Wave-by-Wave Breakdown")
-        for lbl,wtp,wdir,spx,epx,sz,fib,wclr in rows:
-            darr = "🔼" if "UP" in wdir else "🔽"
-            ibg  = "#1a3a1a" if "Impulse" in wtp else "#3a1a1a"
-            ibdg = "⚡ Impulse" if "Impulse" in wtp else "↩ Correction"
-            st.markdown(
-                f'<div class="wrow">'
-                f'<span style="color:{wclr};font-weight:700;font-size:14px">Wave {lbl}</span> &nbsp;'
-                f'<span style="background:{ibg};color:{wclr};padding:2px 8px;border-radius:4px;font-size:11px">'
-                f'{ibdg} {darr}</span> &nbsp;'
-                f'<b style="color:#e2e8f0">{spx:.2f} → {epx:.2f}</b> &nbsp;'
-                f'<span style="color:#a0aec0;font-size:12px">({sz:.1f} pts)</span><br>'
-                f'<span style="color:#718096;font-size:11px">📐 {fib}</span>'
-                f'</div>', unsafe_allow_html=True)
-
-    # Projections
-    if projs:
-        st.markdown("##### 🎯 Wave Projections (Next Targets)")
-        tcols = st.columns(len(projs))
-        for i,(n,v) in enumerate(projs.items()):
-            cl = "#48bb78" if v>cp else "#fc8181"
-            tcols[i].markdown(
-                f'<div class="card" style="text-align:center">'
-                f'<div style="color:#a0aec0;font-size:11px">{n}</div>'
-                f'<div style="color:{cl};font-size:14px;font-weight:700">₹{v:,.2f}</div>'
-                f'</div>', unsafe_allow_html=True)
-
-    # Rules check
-    if rules:
-        st.markdown("##### ✅ EW Rules Checklist")
-        bar = "█"*int(conf/5) + "░"*(20-int(conf/5))
-        st.markdown(
-            f'<div class="card">'
-            f'Confidence: <span style="color:{cc};font-size:18px;font-weight:700">{conf}%</span>'
-            f' &nbsp; <span style="color:{cc};letter-spacing:1px">{bar}</span><br>'
-            f'<span style="color:#718096;font-size:11px">'
-            f'≥70% = textbook quality  |  40–70% = acceptable  |  &lt;40% = wait for better setup</span>'
-            f'</div>', unsafe_allow_html=True)
-        rcols = st.columns(2)
-        for i, r in enumerate(rules):
-            icon = "✅" if r["passed"] else "❌"; clr2="#48bb78" if r["passed"] else "#fc8181"
-            rcols[i%2].markdown(
-                f'<div style="background:#0e1117;border-radius:6px;padding:6px 10px;margin:3px;font-size:11px">'
-                f'{icon} <b style="color:{clr2}">{r["rule"]}</b><br>'
-                f'<span style="color:#718096">{r["detail"]}</span>'
-                f'</div>', unsafe_allow_html=True)
-
-    if after: st.info(f"💡 {after}")
-
-    # EW chart
-    if df is not None and not df.empty and len(ew.get("waves_plot",[])) > 0:
-        st.plotly_chart(make_ew_chart(df, ew, fast, slow),
-                        use_container_width=True, key="ew_chart")
-
-# ════════════════════════════════════════════════════════════════════
-# TAB 1 — BACKTESTING
-# ════════════════════════════════════════════════════════════════════
-def tab_backtest(cfg):
-    ltp_banner(cfg); st.markdown("## 🔬 Backtesting")
-    st.info("EMA: signal on candle N → entry at N+1 open  |  Buy: Low vs SL first (conservative)")
-    if st.button("▶ Run Backtest", type="primary", key="btn_bt"):
-        with st.spinner(f"Fetching {cfg.get('symbol')} …"):
-            df = fetch_ui(cfg["symbol"], cfg["timeframe"], cfg["period"])
-        if df is None or df.empty: st.error("No data — check symbol/interval."); return
-        df = add_ind(df, int(cfg.get("fast_ema",9)), int(cfg.get("slow_ema",15)))
-        with st.spinner("Running…"): trades, viol = run_backtest(df, cfg)
-        st.session_state.bt_trades = trades
-        st.session_state.bt_viol   = viol
-        st.session_state.bt_df     = df
-        st.session_state.bt_ran    = True
-    if not st.session_state.bt_ran:
-        st.markdown('<div style="color:#718096;text-align:center;padding:60px">Click ▶ Run Backtest</div>',
-                    unsafe_allow_html=True); return
-    trades = st.session_state.bt_trades; viol = st.session_state.bt_viol
-    df = st.session_state.bt_df
-    fast = int(cfg.get("fast_ema",9)); slow = int(cfg.get("slow_ema",15))
-    if not trades: st.warning("No trades. Try wider timeframe/period."); return
-    trade_stats(trades); st.markdown("---")
-    if viol:
-        st.error(f"⚠️ {len(viol)} SL/Target violations (both hit same candle)")
-        with st.expander("View"): st.dataframe(style_df(pd.DataFrame(viol)),use_container_width=True)
-    else: st.success("✅ No violations!")
-    st.plotly_chart(make_chart(df.tail(500),trades=trades,
-        title=f"Backtest — {cfg.get('ticker_name')}",fast=fast,slow=slow,h=560),
-        use_container_width=True, key="bt_chart")
-    st.plotly_chart(pnl_chart(trades),use_container_width=True,key="bt_pnl")
-    tdf = pd.DataFrame(trades)
-    co  = ["#","Type","Entry","Exit","Entry Price","Exit Price","SL","Target",
-           "Bar High","Bar Low","Entry Reason","Exit Reason","PnL","Qty","Viol"]
-    st.dataframe(style_df(tdf[[c for c in co if c in tdf.columns]]),
-                 use_container_width=True, height=400)
-    st.download_button("⬇ CSV",tdf.to_csv(index=False).encode(),"bt.csv","text/csv",key="bt_dl")
-
-# ════════════════════════════════════════════════════════════════════
-# TAB 2 — LIVE TRADING
-# ════════════════════════════════════════════════════════════════════
+# ─── LIVE TRADING TAB ─────────────────────────────────────────────────────────
 def tab_live(cfg):
-    ltp_banner(cfg); st.markdown("## 🚀 Live Trading")
-    c1,c2,c3,_ = st.columns([1,1,1,3])
-    start = c1.button("▶ Start",    type="primary", use_container_width=True, key="btn_start")
-    stop  = c2.button("⏹ Stop",                    use_container_width=True, key="btn_stop")
-    sq    = c3.button("✖ Squareoff",                use_container_width=True, key="btn_sq")
+    # ── LTP header ──────────────────────────────────────────────────────────
+    ltp_ph = st.empty()
+    ltp_card(cfg["ticker"], ltp_ph)
 
-    if start and not _get("running", False):
-        _set("running", True); _set("status","RUNNING")
-        _set("log",[]); _set("pos",None)
-        # capture dhan_client in main thread before passing to thread
-        dhan_c = st.session_state.get("dhan_client")
-        t = threading.Thread(
-            target=live_thread,
-            args=(cfg, cfg["symbol"], dhan_c),
-            daemon=True)
+    # ── Read shared state once at top of this render ─────────────────────────
+    with _LOCK:
+        is_active = _LIVE["active"]
+        pos       = _LIVE["position"]
+        ltp_now   = _LIVE["last_ltp"]
+        live_cfg  = _LIVE["config"] or cfg
+        logs      = list(_LIVE["log"])
+        lc        = _LIVE["last_candle"]
+        df_live   = _LIVE["df"]
+
+    # ── Status ───────────────────────────────────────────────────────────────
+    if is_active:
+        st.markdown('<span class="badge-live">🟢 LIVE — refreshing every 3 s</span>',
+                    unsafe_allow_html=True)
+    else:
+        st.markdown('<span class="badge-idle">⚫ IDLE</span>', unsafe_allow_html=True)
+
+    # ── Control buttons ──────────────────────────────────────────────────────
+    bc1, bc2, bc3 = st.columns(3)
+    start_btn = bc1.button("▶️  Start",      type="primary",    use_container_width=True,
+                           disabled=is_active)
+    stop_btn  = bc2.button("⏹  Stop",        type="secondary",  use_container_width=True,
+                           disabled=not is_active)
+    sq_btn    = bc3.button("⚡ Square Off",                       use_container_width=True,
+                           disabled=not is_active)
+
+    # ── START ────────────────────────────────────────────────────────────────
+    if start_btn:
+        with _LOCK:
+            # Clean slate for new run
+            _LIVE["active"]            = True
+            _LIVE["config"]            = cfg.copy()
+            _LIVE["position"]          = None
+            _LIVE["log"]               = []
+            _LIVE["last_ltp"]          = None
+            _LIVE["prev_close"]        = None
+            _LIVE["last_candle"]       = None
+            _LIVE["df"]                = None
+        # Start thread
+        stop_evt = threading.Event()
+        t = threading.Thread(target=live_loop, args=(stop_evt,), daemon=True)
         t.start()
-        st.success("✅ Live trading started!  (refreshes every 3 seconds)")
+        with _LOCK:
+            _LIVE["_thread"]   = t
+            _LIVE["_stop_evt"] = stop_evt
+        st.rerun()
 
-    if stop and _get("running", False):
-        _set("running", False); _set("status","STOPPED")
-        st.info("⏹ Stopping…")
+    # ── STOP ─────────────────────────────────────────────────────────────────
+    if stop_btn:
+        with _LOCK:
+            ev = _LIVE.get("_stop_evt")
+        if ev:
+            ev.set()
+        with _LOCK:
+            _LIVE["active"] = False
+        st.rerun()
 
-    if sq and _get("pos"):
-        pos=_get("pos"); ltp=_get("ltp") or pos["e"]
-        pnl=round(((ltp-pos["e"]) if pos["type"]=="buy" else (pos["e"]-ltp))*int(cfg.get("quantity",1)),2)
-        t2={"#":len(_get("trades",[]))+1,"Type":pos["type"].upper(),
-            "Entry":fdt(pos["et"]),"Exit":datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S"),
-            "Entry Price":round(pos["e"],4),"Exit Price":round(ltp,4),
-            "SL":round(pos["si"],4),"Target":round(pos["ti"],4),
-            "Entry Reason":pos["r"],"Exit Reason":"Manual Squareoff",
-            "PnL":pnl,"Qty":cfg.get("quantity",1),"Source":"Live"}
-        _push("trades",t2); _set("pos",None)
-        if cfg.get("enable_dhan") and st.session_state.dhan_client:
-            place_order(st.session_state.dhan_client,cfg,pos["type"],ltp,is_exit=True)
-        st.success(f"✅ Squared off!  PnL: ₹{pnl:+.2f}")
+    # ── SQUARE OFF ───────────────────────────────────────────────────────────
+    if sq_btn:
+        with _LOCK:
+            pos2    = _LIVE["position"]
+            lcfg2   = _LIVE["config"] or cfg
+        if pos2:
+            ltp2, _, _, _ = get_ltp(cfg["ticker"])
+            ltp2 = ltp2 or pos2["entry_price"]
+            sig  = pos2["signal"]
+            raw  = ltp2 - pos2["entry_price"]
+            pnl  = raw * lcfg2["qty"] if sig == "BUY" else -raw * lcfg2["qty"]
+            with _LOCK:
+                done = {**pos2,
+                        "exit_time":   datetime.datetime.now(IST),
+                        "exit_price":  round(ltp2, 2),
+                        "exit_reason": "Manual Square Off",
+                        "pnl":         round(pnl, 2),
+                        "result":      "✅ Win" if pnl > 0 else "❌ Loss"}
+                _LIVE["completed_trades"].append(done)
+                _LIVE["position"] = None
+            _log(f"⚡ SQUARE OFF {sig} @ {ltp2:.2f} | PnL: {pnl:+.2f}")
+            if lcfg2.get("dhan_enabled"):
+                dh = _dhan_client(lcfg2.get("dhan_client_id", ""), lcfg2.get("dhan_access_token", ""))
+                if dh:
+                    _exit_order(dh, lcfg2, pos2, ltp2)
+            st.success(f"Position squared off @ ₹{ltp2:.2f}")
+            st.rerun()
+        else:
+            st.warning("No open position.")
 
-    # Status
-    status = _get("status","STOPPED"); bc = "#48bb78" if status=="RUNNING" else "#fc8181"
-    dot    = "🟢" if status=="RUNNING" else "🔴"
-    st.markdown(f'<div class="bdg" style="background:{bc}">{dot} {status}</div>',
-                unsafe_allow_html=True)
-    cfg_box(cfg)
+    # ── IDLE STATE ───────────────────────────────────────────────────────────
+    if not is_active:
+        st.markdown("""
+<div style="text-align:center;padding:55px 0;color:#8892b0">
+  <div style="font-size:3rem">🚀</div>
+  <div style="font-size:1rem;margin-top:8px">
+    Configure in the sidebar, then click <b>Start</b>.</div>
+</div>""", unsafe_allow_html=True)
+        return
 
-    # EMA values
-    ind = _get("ind",{})
-    if ind:
-        ef_v=ind.get("ef",float("nan")); es_v=ind.get("es",float("nan"))
-        atr_v=ind.get("atr",float("nan")); ef_p=ind.get("ef_p",float("nan"))
-        es_p=ind.get("es_p",float("nan")); fast=ind.get("fast",9); slow=ind.get("slow",15)
-        ltp_v=ind.get("ltp",0)
-        ef_s  = f"{ef_v:.2f}"  if not np.isnan(ef_v)  else "—"
-        es_s  = f"{es_v:.2f}"  if not np.isnan(es_v)  else "—"
-        atr_s2= f"{atr_v:.2f}" if not np.isnan(atr_v) else "—"
-        spd   = ef_v-es_v if (not np.isnan(ef_v) and not np.isnan(es_v)) else 0.0
-        spd_s = f"{spd:.2f}"; spd_c = "#48bb78" if spd>=0 else "#fc8181"
-        if not any(np.isnan([ef_v,es_v,ef_p,es_p])):
-            if   ef_v>es_v and ef_p<=es_p: xst="🔀 JUST CROSSED UP (Bullish)"
-            elif ef_v<es_v and ef_p>=es_p: xst="🔀 JUST CROSSED DOWN (Bearish)"
-            elif ef_v>es_v:                xst="▲ Fast > Slow (Bullish)"
-            else:                          xst="▼ Fast < Slow (Bearish)"
-        else: xst="Calculating…"
-        st.markdown("#### ⚡ EMA Values")
-        ec=st.columns(5)
-        ec[0].markdown(f'<div class="ecard"><div style="color:#a0aec0;font-size:11px">EMA({fast})</div><div style="color:#f6ad55;font-size:20px;font-weight:700">{ef_s}</div></div>',unsafe_allow_html=True)
-        ec[1].markdown(f'<div class="ecard"><div style="color:#a0aec0;font-size:11px">EMA({slow})</div><div style="color:#76e4f7;font-size:20px;font-weight:700">{es_s}</div></div>',unsafe_allow_html=True)
-        ec[2].markdown(f'<div class="ecard"><div style="color:#a0aec0;font-size:11px">Spread</div><div style="color:{spd_c};font-size:20px;font-weight:700">{spd_s}</div></div>',unsafe_allow_html=True)
-        ec[3].markdown(f'<div class="ecard"><div style="color:#a0aec0;font-size:11px">ATR(14)</div><div style="color:#e9d8a6;font-size:20px;font-weight:700">{atr_s2}</div></div>',unsafe_allow_html=True)
-        ec[4].markdown(f'<div class="ecard"><div style="color:#a0aec0;font-size:11px">Status</div><div style="color:#e2e8f0;font-size:12px;font-weight:700;margin-top:6px">{xst}</div></div>',unsafe_allow_html=True)
-        ts_s = _get("last_ts"); ts_str = ts_s.strftime("%H:%M:%S") if ts_s else "—"
-        bt   = ind.get("bt","")
-        st.markdown(
-            f'<div style="background:#1a1f2e;border:1px solid #2d3748;border-radius:8px;'
-            f'padding:7px 14px;font-size:12px;color:#a0aec0;margin:5px 0">'
-            f'📡 Last Bar [{fdt(bt)}]: O:{ind.get("bo",0):.2f} H:{ind.get("bh",0):.2f} '
-            f'L:{ind.get("bl",0):.2f} C:{ltp_v:.2f} | Fetched: '
-            f'<b style="color:#48bb78">{ts_str} IST</b>'
-            f'</div>', unsafe_allow_html=True)
-    elif _get("running",False):
-        st.info("⏳ Waiting for first data tick (~2 seconds)…")
+    # ── Active: show everything ──────────────────────────────────────────────
+    st.divider()
 
-    # Position
-    pos=_get("pos"); st.markdown("#### 📌 Position")
+    # Config cards
+    st.markdown("#### ⚙️ Active Configuration")
+    cfg_cards(live_cfg)
+    with _LOCK: _df_for_ema = _LIVE["df"]
+    ema_pill_row(_df_for_ema, live_cfg)   # EMA values right below config cards
+
+    # Open position
+    st.markdown("#### 📌 Open Position")
     if pos:
-        ltp=_get("ltp") or pos["e"]
-        upnl=round(((ltp-pos["e"]) if pos["type"]=="buy" else (pos["e"]-ltp))*int(cfg.get("quantity",1)),2)
-        bc2="#48bb78" if upnl>=0 else "#fc8181"; ptc="#48bb78" if pos["type"]=="buy" else "#fc8181"
-        bg="rgba(72,187,120,0.12)" if upnl>=0 else "rgba(252,129,129,0.12)"
-        arr="🔼 BUY" if pos["type"]=="buy" else "🔽 SELL"
-        st.markdown(
-            f'<div style="background:{bg};border:1px solid {bc2};border-radius:10px;padding:14px">'
-            f'<b style="color:{ptc};font-size:16px">{arr}</b> &nbsp; '
-            f'Entry: <b>{pos["e"]:.2f}</b> | LTP: <b style="color:{bc2}">{ltp:.2f}</b> | '
-            f'SL: <b style="color:#fc8181">{pos["sl"]:.2f}</b> | '
-            f'Target: <b style="color:#48bb78">{pos["tgt"]:.2f}</b> | '
-            f'P&L: <b style="color:{bc2}">₹{upnl:+.2f}</b> | '
-            f'Time: {fdt(pos["et"])}<br>'
-            f'<span style="color:#a0aec0;font-size:11px">{pos["r"]}</span>'
-            f'</div>', unsafe_allow_html=True)
-    else: st.info("📭 No open position")
+        pos_card(pos, ltp_now)
+    else:
+        st.info("💤 No open position — scanning for signal…")
 
     # Chart
-    df=_get("df")
-    if df is not None and not df.empty:
-        fast=int(cfg.get("fast_ema",9)); slow=int(cfg.get("slow_ema",15))
-        st.plotly_chart(make_chart(df.tail(300),
-            title=f"Live — {cfg.get('ticker_name')}",fast=fast,slow=slow,pos=pos,h=480),
-            use_container_width=True, key="live_chart")
-
-    # Elliott Wave
-    st.markdown("---")
-    ew=_get("ew",{})
-    if ew and ew.get("ok"):
-        st.markdown("#### 🌊 Elliott Wave (Automated Signal)")
-        show_ew_panel(ew, cfg, df if df is not None else None,
-                      int(cfg.get("fast_ema",9)), int(cfg.get("slow_ema",15)))
-    elif _get("running",False):
-        st.info("🌊 Elliott Wave will appear once ≥25 candles load…")
+    st.markdown("#### 📈 Live Chart")
+    if df_live is not None and not df_live.empty:
+        disp = df_live.iloc[-300:] if len(df_live) > 300 else df_live
+        st.plotly_chart(live_chart(disp, pos, live_cfg),
+                        use_container_width=True, config={"scrollZoom": True})
     else:
-        st.info("🌊 Start live trading to see Elliott Wave analysis.")
+        st.caption("⏳ Waiting for first data fetch from background thread…")
+
+    # Last fetched candle
+    st.markdown("#### 🕯️ Last Fetched Candle (yfinance data)")
+    if lc:
+        st.dataframe(pd.DataFrame([lc]), use_container_width=True)
+    else:
+        st.caption("No candle yet.")
 
     # Log
-    st.markdown("#### 📟 Log")
-    logs=_get("log",[]); log_html='<div class="logb">'
-    for ln in reversed(logs[-80:]):
-        c=("#fc8181"   if "ERR" in ln or "WARN" in ln
-           else "#48bb78" if any(x in ln for x in ["BUY","SELL","START","▲","▼"])
-           else "#f6ad55" if any(x in ln for x in ["EXIT","SIGNAL","◆"])
-           else "#a0aec0")
-        log_html += f'<div style="color:{c}">{ln}</div>'
-    st.markdown(log_html+"</div>", unsafe_allow_html=True)
+    st.markdown("#### 📝 Activity Log")
+    log_text = "\n".join(reversed(logs[-60:]))
+    st.code(log_text or "Waiting for events…", language="")
 
-    # Completed trades
-    lt=_get("trades",[])
-    if lt:
-        st.markdown(f"#### ✅ Trades ({len(lt)})")
-        trade_stats(lt)
-        ltd=pd.DataFrame(lt); cs=["#","Type","Entry","Exit","Entry Price","Exit Price",
-                                    "SL","Target","Entry Reason","Exit Reason","PnL","Qty"]
-        st.dataframe(style_df(ltd[[c for c in cs if c in ltd.columns]]),
-                     use_container_width=True, height=260)
-        st.plotly_chart(pnl_chart(lt),use_container_width=True,key="live_pnl")
+    # ── Auto-refresh: sleep 3 s then rerun ──────────────────────────────────
+    # sleep(3) means the UI is locked for 3 s — acceptable for a trading dashboard.
+    # Do NOT use a shorter value; Streamlit's rate limiter will kill the session.
+    time.sleep(3)
+    st.rerun()
 
-# ════════════════════════════════════════════════════════════════════
-# TAB 3 — TRADE HISTORY
-# ════════════════════════════════════════════════════════════════════
+
+# ─── TRADE HISTORY TAB ────────────────────────────────────────────────────────
 def tab_history(cfg):
-    ltp_banner(cfg); st.markdown("## 📚 Trade History")
-    all_t=[]
-    for t in st.session_state.bt_trades: tc=t.copy(); tc["Source"]="🔬 BT"; all_t.append(tc)
-    for t in _get("trades",[]): tc=t.copy(); tc.setdefault("Source","🚀 Live"); all_t.append(tc)
-    if not all_t:
-        st.markdown('<div style="color:#718096;text-align:center;padding:60px">No trades yet.</div>',
-                    unsafe_allow_html=True); return
-    df=pd.DataFrame(all_t)
-    f1,f2,f3=st.columns(3)
-    src=f1.selectbox("Source",["All"]+sorted(df["Source"].unique().tolist()),key="h_src")
-    typ=f2.selectbox("Type",["All","BUY","SELL"],key="h_typ")
-    sv =f3.checkbox("Only Violations",False,key="h_v")
-    if src!="All": df=df[df["Source"]==src]
-    if typ!="All": df=df[df["Type"]==typ]
-    if sv and "Viol" in df.columns: df=df[df["Viol"]==True]
-    trade_stats(df.to_dict("records"))
-    if not df.empty:
-        st.plotly_chart(pnl_chart(df.to_dict("records")),use_container_width=True,key="hist_pnl")
-        co=["#","Source","Type","Entry","Exit","Entry Price","Exit Price","SL","Target",
-            "Entry Reason","Exit Reason","PnL","Qty","Viol"]
-        sc=[c for c in co if c in df.columns]
-        st.dataframe(style_df(df[sc]),use_container_width=True,height=450)
-        st.download_button("⬇ CSV",df[sc].to_csv(index=False).encode(),"hist.csv","text/csv",key="h_dl")
+    ltp_ph = st.empty()
+    ltp_card(cfg["ticker"], ltp_ph)
 
-# ════════════════════════════════════════════════════════════════════
-# TAB 4 — OPTIMIZATION
-# ════════════════════════════════════════════════════════════════════
-def tab_optimize(cfg):
-    ltp_banner(cfg); st.markdown("## 🔧 Optimization")
-    st.info("Grid-search → click ✅ Apply to load best parameters into sidebar.")
-    with st.expander("⚙️ Setup", expanded=True):
-        oc1,oc2=st.columns(2)
-        with oc1:
-            opt_s  =st.selectbox("Strategy",["EMA Crossover","Simple Buy","Simple Sell","Elliott Wave"],key="opt_str")
-            opt_m  =st.selectbox("Optimize For",["Accuracy%","TotalPnL","Score","RR"],key="opt_m")
-            min_tr =int(st.number_input("Min Trades",1,1000,5,key="opt_mt"))
-            opt_qty=int(st.number_input("Qty",1,1_000_000,int(cfg.get("quantity",1)),key="opt_qty"))
-        with oc2:
-            opt_tf =st.selectbox("Interval",list(TF_PERIODS.keys()),
-                index=list(TF_PERIODS.keys()).index(cfg.get("timeframe","15m")),key="opt_tf")
-            opt_per=st.selectbox("Period",TF_PERIODS[opt_tf],key="opt_per")
-            desired=float(st.number_input("Desired Accuracy %",0.0,100.0,60.0,key="opt_acc"))
-            st.markdown(f"**Symbol:** `{cfg.get('symbol','—')}`")
-        st.markdown("**Ranges:**"); pc1,pc2,pc3=st.columns(3)
-        if opt_s=="EMA Crossover":
-            fem=int(pc1.number_input("Fast min",1,100,5,key="opt_fem"))
-            feM=int(pc2.number_input("Fast max",1,200,20,key="opt_feM"))
-            feS=max(1,int(pc3.number_input("Fast step",1,50,2,key="opt_feS")))
-            sem=int(pc1.number_input("Slow min",5,500,10,key="opt_sem"))
-            seM=int(pc2.number_input("Slow max",5,500,50,key="opt_seM"))
-            seS=max(1,int(pc3.number_input("Slow step",1,50,5,key="opt_seS")))
-        slm=float(pc1.number_input("SL min",1.0,5000.0,5.0,key="opt_slm"))
-        slM=float(pc2.number_input("SL max",1.0,5000.0,50.0,key="opt_slM"))
-        slS=float(pc3.number_input("SL step",0.5,500.0,5.0,key="opt_slS"))
-        tgm=float(pc1.number_input("Tgt min",1.0,10000.0,10.0,key="opt_tgm"))
-        tgM=float(pc2.number_input("Tgt max",1.0,10000.0,100.0,key="opt_tgM"))
-        tgS=float(pc3.number_input("Tgt step",0.5,500.0,10.0,key="opt_tgS"))
+    with _LOCK:
+        completed = list(_LIVE["completed_trades"])
+        is_active = _LIVE["active"]
 
-    if st.button("🚀 Run Optimization",type="primary",use_container_width=True,key="btn_opt"):
-        with st.spinner("Fetching…"):
-            df_o=fetch_ui(cfg.get("symbol","^NSEI"),opt_tf,opt_per)
-        if df_o is None or df_o.empty: st.error("No data."); return
-        def frange(a,b,s):
-            out=[]; v=a
-            while v<=b+1e-9: out.append(round(v,4)); v=round(v+s,8)
-            return out or [a]
-        grid={"sl_points":frange(slm,slM,slS),"target_points":frange(tgm,tgM,tgS)}
-        if opt_s=="EMA Crossover":
-            grid["fast_ema"]=list(range(fem,feM+1,feS))
-            grid["slow_ema"]=list(range(sem,seM+1,seS))
-        total_c=1
-        for v in grid.values(): total_c*=len(v)
-        st.info(f"Testing {total_c:,} combinations…")
-        pb=st.progress(0); pt=st.empty()
-        def cb(d,t): pb.progress(d/t); pt.markdown(f"**{d:,}/{t:,}** ({d/t*100:.0f}%)")
-        base={**cfg,"strategy":opt_s,"quantity":opt_qty}
-        results=run_opt(df_o,base,grid,metric=opt_m,min_tr=min_tr,cb=cb)
-        pb.empty(); pt.empty()
-        st.session_state.opt_results=results; st.session_state.opt_ran=True
-        st.success(f"✅ Done! {len(results)} valid results.")
+    st.markdown("#### 📚 Completed Trades")
+    if is_active:
+        st.markdown('<span class="badge-live">🟢 LIVE — history updates in real-time</span>',
+                    unsafe_allow_html=True)
 
-    if not st.session_state.opt_ran: return
-    results=st.session_state.opt_results
-    if not results: st.warning("No valid results. Widen ranges."); return
-    des=float(st.session_state.get("opt_acc",60.0))
-    fil=[r for r in results if r.get("Accuracy%",0)>=des]
-    disp=fil if fil else results
-    if fil: st.success(f"{len(fil)} results ≥{des:.0f}% accuracy")
-    else:   st.warning(f"No results at {des:.0f}%. Showing best available.")
-    st.markdown(f"### 🏆 Top {min(len(disp),15)} Results")
-    hc=st.columns([3,1,1,1,1,1,1])
-    for col,lbl in zip(hc,["Parameters","Accuracy","P&L","Trades","R:R","Score",""]):
-        col.markdown(f'<span style="color:#90cdf4;font-size:11px;font-weight:700">{lbl}</span>',
-                     unsafe_allow_html=True)
-    for i,res in enumerate(disp[:15]):
-        parts=[]
-        if res.get("fast_ema") is not None: parts.append(f"F={int(res['fast_ema'])} S={int(res['slow_ema'])}")
-        if res.get("sl_points") is not None: parts.append(f"SL={res['sl_points']}")
-        if res.get("target_points") is not None: parts.append(f"Tgt={res['target_points']}")
-        ps=" | ".join(parts) or "—"
-        ac=float(res.get("Accuracy%",0)); pnl=float(res.get("TotalPnL",0))
-        rr=float(res.get("RR",0)); sc=float(res.get("Score",0)); tr=int(res.get("Trades",0))
-        ac2="#48bb78" if ac>=des else "#f6ad55"; pc2="#48bb78" if pnl>=0 else "#fc8181"
-        rc=st.columns([3,1,1,1,1,1,1])
-        rc[0].markdown(f'<div style="font-size:12px;color:#e2e8f0;padding:3px">{ps}</div>',unsafe_allow_html=True)
-        rc[1].markdown(f'<div style="text-align:center;font-size:13px;color:{ac2};font-weight:700;padding:3px">{ac:.1f}%</div>',unsafe_allow_html=True)
-        rc[2].markdown(f'<div style="text-align:center;font-size:13px;color:{pc2};font-weight:700;padding:3px">₹{pnl:+.0f}</div>',unsafe_allow_html=True)
-        rc[3].markdown(f'<div style="text-align:center;font-size:12px;color:#a0aec0;padding:3px">{tr}</div>',unsafe_allow_html=True)
-        rc[4].markdown(f'<div style="text-align:center;font-size:12px;color:#76e4f7;padding:3px">{rr:.2f}</div>',unsafe_allow_html=True)
-        rc[5].markdown(f'<div style="text-align:center;font-size:12px;color:#f6ad55;padding:3px">{sc:.1f}</div>',unsafe_allow_html=True)
-        if rc[6].button("✅ Apply",key=f"oa_{i}",use_container_width=True):
-            if res.get("fast_ema") is not None:
-                st.session_state["_aFE"]=int(res["fast_ema"]); st.session_state["_aSE"]=int(res["slow_ema"])
-                st.session_state["s_fe"]=int(res["fast_ema"]); st.session_state["s_se"]=int(res["slow_ema"])
-            if res.get("sl_points") is not None:
-                st.session_state["_aSL"]=float(res["sl_points"]); st.session_state["s_slp"]=float(res["sl_points"])
-            if res.get("target_points") is not None:
-                st.session_state["_aTG"]=float(res["target_points"]); st.session_state["s_tgp2"]=float(res["target_points"])
-            st.success(f"✅ Applied: {ps}"); st.rerun()
-    rdf=pd.DataFrame(disp)
-    sc2=[c for c in ["fast_ema","slow_ema","sl_points","target_points","Trades",
-                     "Accuracy%","TotalPnL","AvgWin","AvgLoss","RR","Score"]
-         if c in rdf.columns and rdf[c].notna().any()]
-    if sc2: st.dataframe(style_df(rdf[sc2]),use_container_width=True,height=340)
-    if not rdf.empty:
-        st.download_button("⬇ CSV",rdf.to_csv(index=False).encode(),"opt.csv","text/csv",key="opt_dl")
+    if not completed:
+        st.markdown("""<div style="text-align:center;padding:50px 0;color:#8892b0">
+<div style="font-size:3rem">📂</div>
+<div style="font-size:1rem;margin-top:8px">
+  No completed trades yet. Run live trading or backtest to see history here.</div>
+</div>""",unsafe_allow_html=True)
+        return
 
-# ════════════════════════════════════════════════════════════════════
-# MAIN
-# Auto-refresh: updates live metrics. Does NOT reload the tab.
-# ════════════════════════════════════════════════════════════════════
+    # Summary
+    wins   = sum(1 for t in completed if t.get("pnl",0)>0)
+    total  = len(completed)
+    tpnl   = sum(t.get("pnl",0) for t in completed)
+    acc    = round(wins/total*100,1) if total else 0
+
+    html=(_mc(total,"Total Trades","c-b")
+         +_mc(f"{wins} / {total-wins}","Wins / Losses","c-g")
+         +_mc(f"{acc}%","Accuracy","c-gold" if acc>=50 else "c-r")
+         +_mc(f"₹{tpnl:+,.2f}","Total PnL","c-g" if tpnl>=0 else "c-r"))
+    st.markdown(f'<div class="mrow">{html}</div>',unsafe_allow_html=True)
+
+    # Table
+    rows=[]
+    for t in reversed(completed):
+        et = t.get("entry_time","—")
+        xt = t.get("exit_time","—")
+        rows.append({
+            "Type":         t.get("signal","—"),
+            "Entry Time":   et.strftime("%Y-%m-%d %H:%M:%S") if hasattr(et,"strftime") else str(et),
+            "Entry Price":  t.get("entry_price","—"),
+            "Exit Time":    xt.strftime("%Y-%m-%d %H:%M:%S") if hasattr(xt,"strftime") else str(xt),
+            "Exit Price":   t.get("exit_price","—"),
+            "SL":           t.get("init_sl","—"),
+            "Target":       t.get("init_tgt","—"),
+            "Entry Reason": t.get("reason_in","—"),
+            "Exit Reason":  t.get("exit_reason","—"),
+            "PnL":          t.get("pnl","—"),
+            "Result":       t.get("result","—"),
+        })
+
+    df_h = pd.DataFrame(rows)
+    if not df_h.empty:
+        if len(df_h) <= 200:
+            def _hcol(row):
+                try:
+                    pnl = float(row["PnL"])
+                    if pnl > 0:   return ["background-color:#0d2620;color:#00d4aa"] * len(row)
+                    elif pnl < 0: return ["background-color:#2a0f0f;color:#ff4b5c"] * len(row)
+                except: pass
+                return [""] * len(row)
+            st.dataframe(df_h.style.apply(_hcol, axis=1),
+                         use_container_width=True, height=450)
+        else:
+            st.dataframe(df_h, use_container_width=True, height=450)
+
+        # Equity curve
+        if len(completed)>1:
+            st.markdown("#### 💰 Live Equity Curve")
+            pnls = [t.get("pnl",0) for t in completed]
+            cum  = pd.Series(pnls).cumsum().tolist()
+            fig3 = go.Figure()
+            fig3.add_trace(go.Scatter(
+                x=list(range(1,len(cum)+1)),y=cum,mode="lines+markers",
+                line=dict(color=C["cup"] if cum[-1]>=0 else C["cdn"],width=2),
+                marker=dict(size=6,
+                    color=[C["cup"] if p>=0 else C["cdn"] for p in pnls]),
+                fill="tozeroy",
+                fillcolor="rgba(0,212,170,0.08)" if cum[-1]>=0 else "rgba(255,75,92,0.08)"))
+            fig3.update_layout(**_LAY,height=260,
+                xaxis=dict(title="Trade #",showgrid=True,gridcolor=C["gr"]),
+                yaxis=dict(title="Cumulative PnL ₹",showgrid=True,gridcolor=C["gr"]))
+            st.plotly_chart(fig3,use_container_width=True)
+
+        # Export
+        csv = df_h.to_csv(index=False)
+        st.download_button("⬇️ Export as CSV",data=csv,
+                           file_name="smart_investing_trades.csv",
+                           mime="text/csv",use_container_width=True)
+
+    # Auto refresh while live (3 s — same guard as live tab)
+    if is_active:
+        time.sleep(3)
+        st.rerun()
+
+
+# ─── MAIN ─────────────────────────────────────────────────────────────────────
 def main():
-    st.markdown(
-        '<div class="hdr">'
-        '<div><h1>📈 Smart Investing</h1>'
-        '<p>Full Automation · NSE · BSE · Crypto · Commodities · Dhan Broker</p></div>'
-        '<div style="color:#90cdf4;font-size:12px;text-align:right">'
-        'EMA · Elliott Wave · Auto-Trade · Optimized</div>'
-        '</div>', unsafe_allow_html=True)
+    # Header
+    st.markdown("""
+<div style="display:flex;align-items:center;gap:12px;margin-bottom:4px">
+  <span style="font-size:2rem">📈</span>
+  <div>
+    <div class="app-hdr">Smart Investing</div>
+    <div style="color:#8892b0;font-size:.78rem">
+      Advanced Algorithmic Trading · EMA Strategies · Backtesting · Live Trading
+    </div>
+  </div>
+</div>
+""",unsafe_allow_html=True)
 
     cfg = sidebar()
-    tab1,tab2,tab3,tab4 = st.tabs(
-        ["🔬 Backtest","🚀 Live Trading","📚 History","🔧 Optimize"])
+
+    tab1, tab2, tab3 = st.tabs([
+        "📊  Backtesting",
+        "🚀  Live Trading",
+        "📚  Trade History",
+    ])
+
     with tab1: tab_backtest(cfg)
     with tab2: tab_live(cfg)
     with tab3: tab_history(cfg)
-    with tab4: tab_optimize(cfg)
-
-    # ── Auto-refresh: only live metrics, no full tab reload ─────────
-    if _get("running", False):
-        time.sleep(2)
-        st.rerun()
 
 if __name__ == "__main__":
     main()
