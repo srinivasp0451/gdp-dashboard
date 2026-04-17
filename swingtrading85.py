@@ -260,6 +260,9 @@ TARGET_TYPES = [
 
 CROSSOVER_TYPES = ["Simple Crossover", "Custom Candle Size", "ATR Based Candle Size"]
 
+ORDER_TYPES  = ["Market Order", "Limit Order"]
+FNO_SEGMENTS = ["NSE_FNO", "BSE_FNO"]
+
 
 # ================================================================
 # 4. THREAD-SAFE STATE
@@ -322,9 +325,23 @@ def get_yf_symbol(ticker_name: str, custom: str = "") -> str:
     return TICKERS.get(ticker_name, ticker_name)
 
 def _flatten_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """Flatten MultiIndex columns from yfinance."""
+    """
+    Flatten MultiIndex columns from yfinance (handles both old and new API formats).
+    yfinance >=0.2.x returns columns as MultiIndex: ('Close','AAPL'), ('Open','AAPL')...
+    We want just the first level: 'Close', 'Open', ...
+    """
     if isinstance(df.columns, pd.MultiIndex):
-        df.columns = [c[0] if c[1] == "" else c[0] for c in df.columns]
+        new_cols = [str(c[0]) for c in df.columns]
+        df = df.copy()
+        df.columns = new_cols
+    else:
+        flat = []
+        for c in df.columns:
+            flat.append(str(c[0]) if isinstance(c, tuple) else str(c))
+        df = df.copy()
+        df.columns = flat
+    # Remove any duplicate columns (keep first occurrence)
+    df = df.loc[:, ~df.columns.duplicated(keep="first")]
     return df
 
 def fetch_ohlcv(symbol: str, interval: str, period: str,
@@ -343,14 +360,29 @@ def fetch_ohlcv(symbol: str, interval: str, period: str,
             df = yf.download(symbol, interval=interval, period=period,
                              auto_adjust=True, progress=False, threads=False)
 
-        if df is None or len(df) == 0:
+        # yfinance always returns a DataFrame — use .empty not `is None`
+        if df is None:
+            return None
+        if isinstance(df, pd.DataFrame) and df.empty:
             return None
 
         df = _flatten_columns(df)
 
-        # Keep only OHLCV
-        cols = [c for c in ["Open","High","Low","Close","Volume"] if c in df.columns]
+        # Keep only OHLCV columns that exist
+        want = ["Open", "High", "Low", "Close", "Volume"]
+        cols = [c for c in want if c in df.columns]
+        if not cols:
+            return None
         df = df[cols].copy()
+
+        # Ensure all price columns are scalar float (not nested Series/DataFrame)
+        for col in ["Open", "High", "Low", "Close"]:
+            if col in df.columns:
+                # If column is a DataFrame (mis-flattened), take first column
+                if isinstance(df[col], pd.DataFrame):
+                    df[col] = df[col].iloc[:, 0]
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+
         df.dropna(subset=["Close"], inplace=True)
 
         if len(df) == 0:
@@ -358,7 +390,7 @@ def fetch_ohlcv(symbol: str, interval: str, period: str,
 
         return df
 
-    except Exception as e:
+    except Exception:
         return None
 
 def fetch_ohlcv_with_slice(symbol: str, interval: str, period: str) -> Tuple[Optional[pd.DataFrame], Optional[pd.DataFrame]]:
@@ -377,22 +409,35 @@ def fetch_ohlcv_with_slice(symbol: str, interval: str, period: str) -> Tuple[Opt
     return full_df, display_df
 
 def get_ltp(symbol: str) -> Optional[float]:
-    """Get latest price quickly."""
+    """Get latest price quickly — always returns a Python float or None."""
     try:
         ticker = yf.Ticker(symbol)
-        data = ticker.fast_info
-        price = getattr(data, 'last_price', None)
-        if price is not None and not math.isnan(float(price)):
-            return float(price)
-        # Fallback
+        data   = ticker.fast_info
+        price  = getattr(data, "last_price", None)
+        if price is not None:
+            fv = float(price)
+            if not math.isnan(fv):
+                return fv
+    except Exception:
+        pass
+
+    # Fallback: download 1-min data and take last Close
+    try:
         df = yf.download(symbol, interval="1m", period="1d",
                          auto_adjust=True, progress=False, threads=False)
-        if df is not None and len(df) > 0:
-            df = _flatten_columns(df)
-            return float(df['Close'].iloc[-1])
-    except:
-        pass
-    return None
+        if df is None or (isinstance(df, pd.DataFrame) and df.empty):
+            return None
+        df = _flatten_columns(df)
+        if "Close" not in df.columns:
+            return None
+        close_col = df["Close"]
+        # Guard against nested DataFrame
+        if isinstance(close_col, pd.DataFrame):
+            close_col = close_col.iloc[:, 0]
+        val = close_col.dropna().iloc[-1]
+        return float(val)
+    except Exception:
+        return None
 
 
 # ================================================================
@@ -2064,9 +2109,9 @@ def build_wave_chart(df: pd.DataFrame, wave_res: Dict) -> go.Figure:
 # ================================================================
 def ltp_bar_html(ticker_name: str, ltp: Optional[float],
                  prev: Optional[float] = None) -> str:
-    price_str = f"{ltp:,.2f}" if ltp else "—"
+    price_str = f"{ltp:,.2f}" if ltp is not None else "—"
     chg_str   = ""
-    if ltp and prev and prev != 0:
+    if ltp is not None and prev is not None and prev != 0:
         chg  = ltp - prev
         pct  = chg / prev * 100
         cls  = "ltp-change-pos" if chg >= 0 else "ltp-change-neg"
@@ -2620,13 +2665,17 @@ def render_live_tab(cfg: Dict):
     )
 
     # Quick metrics row
+    ltp_str  = f"{ltp:.2f}"  if ltp  is not None else "—"
+    emaf_str = f"{ema_f:.2f}" if ema_f is not None else "—"
+    emas_str = f"{ema_s:.2f}" if ema_s is not None else "—"
+
     m1, m2, m3, m4 = st.columns(4)
     with m1:
-        st.markdown(f'<div class="metric-card"><div class="metric-label">LTP</div><div class="metric-value">{ltp:.2f if ltp else "—"}</div></div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="metric-card"><div class="metric-label">LTP</div><div class="metric-value">{ltp_str}</div></div>', unsafe_allow_html=True)
     with m2:
-        st.markdown(f'<div class="metric-card"><div class="metric-label">EMA {cfg["ema_fast"]}</div><div class="metric-value">{ema_f:.2f if ema_f else "—"}</div></div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="metric-card"><div class="metric-label">EMA {cfg["ema_fast"]}</div><div class="metric-value">{emaf_str}</div></div>', unsafe_allow_html=True)
     with m3:
-        st.markdown(f'<div class="metric-card"><div class="metric-label">EMA {cfg["ema_slow"]}</div><div class="metric-value">{ema_s:.2f if ema_s else "—"}</div></div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="metric-card"><div class="metric-label">EMA {cfg["ema_slow"]}</div><div class="metric-value">{emas_str}</div></div>', unsafe_allow_html=True)
     with m4:
         status_badge = badge("RUNNING","run") if is_running else badge("STOPPED","stop")
         tick_str = f"Tick #{tick}" if is_running else "—"
@@ -2652,10 +2701,11 @@ def render_live_tab(cfg: Dict):
         """, unsafe_allow_html=True)
 
     # ── Active Position ───────────────────────────────────────
-    if position and ltp:
+    pos_ltp = ltp if ltp is not None else 0.0
+    if position is not None and ltp is not None:
         st.markdown("#### 💼 Active Position")
-        st.markdown(position_card_html(position, ltp), unsafe_allow_html=True)
-    elif not position and is_running:
+        st.markdown(position_card_html(position, pos_ltp), unsafe_allow_html=True)
+    elif position is None and is_running:
         st.markdown(alert_html("No active position — waiting for signal.", "info"), unsafe_allow_html=True)
 
     st.markdown("---")
@@ -2668,41 +2718,49 @@ def render_live_tab(cfg: Dict):
         with col_w:
             st.markdown(wave_cards_html(wave_res), unsafe_allow_html=True)
         with col_i:
+            _wnt  = wave_res.get("next_target")
+            _wsl  = wave_res.get("sl")
+            _wtp1 = wave_res.get("tp1")
+            _wtp2 = wave_res.get("tp2")
+            _wnt_s  = f"{_wnt:.2f}"  if _wnt  is not None else "—"
+            _wsl_s  = f"{_wsl:.2f}"  if _wsl  is not None else "—"
+            _wtp1_s = f"{_wtp1:.2f}" if _wtp1 is not None else "—"
+            _wtp2_s = f"{_wtp2:.2f}" if _wtp2 is not None else "—"
             st.markdown(f"""
             <div class="config-box">
               <div class="config-row"><span class="config-key">Status</span><span class="config-val">{wave_res.get('status','—')}</span></div>
               <div class="config-row"><span class="config-key">Current Wave</span><span class="config-val">{wave_res.get('current_wave','—')}</span></div>
               <div class="config-row"><span class="config-key">Direction</span><span class="config-val">{wave_res.get('direction','—')}</span></div>
-              <div class="config-row"><span class="config-key">Next Target</span><span class="config-val">{f"{wave_res['next_target']:.2f}" if wave_res.get('next_target') else '—'}</span></div>
+              <div class="config-row"><span class="config-key">Next Target</span><span class="config-val">{_wnt_s}</span></div>
               <div class="config-row"><span class="config-key">Wave Signal</span><span class="config-val">{wave_res.get('signal','—')}</span></div>
-              <div class="config-row"><span class="config-key">Wave SL</span><span class="config-val">{f"{wave_res['sl']:.2f}" if wave_res.get('sl') else '—'}</span></div>
-              <div class="config-row"><span class="config-key">TP1</span><span class="config-val">{f"{wave_res['tp1']:.2f}" if wave_res.get('tp1') else '—'}</span></div>
-              <div class="config-row"><span class="config-key">TP2</span><span class="config-val">{f"{wave_res['tp2']:.2f}" if wave_res.get('tp2') else '—'}</span></div>
+              <div class="config-row"><span class="config-key">Wave SL</span><span class="config-val">{_wsl_s}</span></div>
+              <div class="config-row"><span class="config-key">TP1</span><span class="config-val">{_wtp1_s}</span></div>
+              <div class="config-row"><span class="config-key">TP2</span><span class="config-val">{_wtp2_s}</span></div>
             </div>
             """, unsafe_allow_html=True)
 
         # Wave chart
-        if is_running or ltp:
+        if is_running or ltp is not None:
             try:
                 df_live = fetch_ohlcv(cfg["symbol"], cfg["interval"], cfg["period"], warmup=True)
                 if df_live is not None and len(df_live) > 10:
                     df_live = add_indicators(df_live, cfg)
                     wfig = build_wave_chart(df_live, wave_res)
                     st.plotly_chart(wfig, use_container_width=True, config={"displayModeBar": False})
-            except:
+            except Exception:
                 pass
 
     st.markdown("---")
 
     # ── Live chart ────────────────────────────────────────────
-    if is_running or ltp:
+    if is_running or ltp is not None:
         try:
             df_live = fetch_ohlcv(cfg["symbol"], cfg["interval"], cfg["period"], warmup=True)
             if df_live is not None and len(df_live) > 5:
                 df_live = add_indicators(df_live, cfg)
                 lfig    = build_live_chart(df_live, position, cfg)
                 st.plotly_chart(lfig, use_container_width=True, config={"displayModeBar": False})
-        except:
+        except Exception:
             pass
 
     # ── Live log ──────────────────────────────────────────────
