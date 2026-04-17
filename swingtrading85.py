@@ -1701,19 +1701,66 @@ def live_trading_loop(stop_event: threading.Event):
                             ts_set("cooldown_until",
                                    datetime.now(IST) + timedelta(seconds=cooldown_secs))
 
-            # ── 5. Generate new entry signal at candle boundary ───
+            # ── 5. Generate new entry signal ─────────────────────
             if ts_get("live_position") is None and pending_entry_signal is None:
-                candle_closed = _is_candle_closed(interval)
-                if candle_closed or immediate_entry:
-                    # Avoid re-checking same candle
-                    if last_signal_check_time != last_time:
+
+                # ── Simple Buy / Simple Sell: enter on EVERY tick, no candle wait ──
+                if immediate_entry:
+                    if ltp is None:
+                        pass  # data not yet loaded — skip
+                    else:
+                        cooldown_until = ts_get("cooldown_until")
+                        if cooldown_until and datetime.now(IST) < cooldown_until:
+                            pass  # still in cooldown
+                        else:
+                            sig         = 1 if strategy == "Simple Buy" else -1
+                            trade_type  = "buy" if sig == 1 else "sell"
+                            entry_price = ltp
+
+                            sl  = calc_initial_sl(entry_price, trade_type, df_full, cfg, len(df_full)-1)
+                            tp1, tp2, tp3 = calc_initial_target(entry_price, trade_type, df_full, cfg, len(df_full)-1, sl)
+
+                            pos = {
+                                "entry_time":    datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S"),
+                                "entry_price":   round(entry_price, 2),
+                                "type":          trade_type,
+                                "sl":            round(sl,  2),
+                                "tp1":           round(tp1, 2),
+                                "tp2":           round(tp2, 2),
+                                "tp3":           round(tp3, 2),
+                                "quantity":      cfg.get("quantity", 1),
+                                "signal_reason": strategy,
+                            }
+                            ts_set("live_position", pos)
+                            ts_log(
+                                f"ENTRY {trade_type.upper()} @ {entry_price:.2f} | SL:{sl:.2f} | TP1:{tp1:.2f}",
+                                "buy" if trade_type == "buy" else "sell"
+                            )
+
+                            if dhan_enabled and dhan_client:
+                                if cfg.get("options_enabled", False):
+                                    res = place_dhan_options_order(dhan_client, cfg, trade_type, entry_price)
+                                    if res.get("success"):
+                                        pos["option_security_id"] = (
+                                            cfg.get("ce_security_id") if trade_type == "buy"
+                                            else cfg.get("pe_security_id")
+                                        )
+                                else:
+                                    res = place_dhan_equity_order(dhan_client, cfg, trade_type, entry_price)
+                                ts_log(f"Dhan entry order: {res.get('msg', 'placed')}", "info")
+
+                            if cfg.get("cooldown_enabled", True):
+                                ts_set("cooldown_until",
+                                       datetime.now(IST) + timedelta(seconds=cfg.get("cooldown_seconds", 5)))
+
+                # ── Other strategies: signal only at candle close boundary ──
+                else:
+                    candle_closed = _is_candle_closed(interval)
+                    if candle_closed and last_signal_check_time != last_time:
                         last_signal_check_time = last_time
 
-                        if immediate_entry:
-                            sig = 1 if strategy == "Simple Buy" else -1
-                        else:
-                            sigs, _ = get_signals(df_full, cfg)
-                            sig = int(sigs.iloc[-1])
+                        sigs, _ = get_signals(df_full, cfg)
+                        sig = int(sigs.iloc[-1])
 
                         if sig != 0:
                             # Overlap check
@@ -1728,50 +1775,17 @@ def live_trading_loop(stop_event: threading.Event):
                                             ts_log("Overlap prevented — last trade not yet exited", "warn")
                                             time.sleep(1.5)
                                             continue
-                                    except:
+                                    except Exception:
                                         pass
 
                             trade_type = "buy" if sig == 1 else "sell"
-                            ts_log(f"Signal: {trade_type.upper()} generated on {interval} candle", "info")
+                            ts_log(f"Signal: {trade_type.upper()} on {interval} candle — queued for next open", "info")
 
-                            if immediate_entry:
-                                # Enter immediately
-                                entry_price = ltp
-                                cooldown_until = ts_get("cooldown_until")
-                                if not (cooldown_until and datetime.now(IST) < cooldown_until):
-                                    sl  = calc_initial_sl(entry_price, trade_type, df_full, cfg, len(df_full)-1)
-                                    tp1, tp2, tp3 = calc_initial_target(entry_price, trade_type, df_full, cfg, len(df_full)-1, sl)
-                                    pos = {
-                                        "entry_time":  datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S"),
-                                        "entry_price": round(entry_price, 2),
-                                        "type":        trade_type,
-                                        "sl":          round(sl, 2),
-                                        "tp1":         round(tp1, 2),
-                                        "tp2":         round(tp2, 2),
-                                        "tp3":         round(tp3, 2),
-                                        "quantity":    cfg.get("quantity", 1),
-                                        "signal_reason": strategy,
-                                    }
-                                    ts_set("live_position", pos)
-                                    ts_log(f"ENTRY {trade_type.upper()} @ {entry_price:.2f} | SL:{sl:.2f}", "buy" if trade_type == "buy" else "sell")
-
-                                    if dhan_enabled and dhan_client:
-                                        if cfg.get("options_enabled", False):
-                                            res = place_dhan_options_order(dhan_client, cfg, trade_type, entry_price)
-                                        else:
-                                            res = place_dhan_equity_order(dhan_client, cfg, trade_type, entry_price)
-                                        ts_log(f"Dhan entry order: {res.get('msg', 'placed')}", "info")
-
-                                    if cfg.get("cooldown_enabled", True):
-                                        ts_set("cooldown_until",
-                                               datetime.now(IST) + timedelta(seconds=cfg.get("cooldown_seconds", 5)))
-                            else:
-                                # Queue entry at next candle open
-                                pending_entry_signal = {
-                                    "type":             trade_type,
-                                    "signal_candle_time": last_time,
-                                }
-                                ts_log(f"Signal queued: {trade_type.upper()} — waiting for next candle open", "info")
+                            # Queue entry at next candle open
+                            pending_entry_signal = {
+                                "type":               trade_type,
+                                "signal_candle_time": last_time,
+                            }
 
         except Exception as e:
             ts_log(f"Live loop error: {str(e)}", "warn")
@@ -2536,10 +2550,10 @@ def render_backtest_tab(cfg: Dict):
                 st.error("Failed to fetch data. Check ticker symbol and period.")
                 return
 
-            result = run_backtest(df_full, df_display or df_full, cfg)
+            result = run_backtest(df_full, df_display if df_display is not None else df_full, cfg)
             st.session_state.bt_result  = result
             st.session_state.bt_df      = df_full
-            st.session_state.bt_display = df_display or df_full
+            st.session_state.bt_display = df_display if df_display is not None else df_full
 
     # ── LTP ─────────────────────────────────────────────────
     ltp = get_ltp(cfg["symbol"])
@@ -2596,9 +2610,10 @@ def render_live_tab(cfg: Dict):
     ltp_ph = st.empty()
 
     # ── Control buttons ──────────────────────────────────────
+    # Read running state BEFORE buttons so disabled state is correct
     is_running = ts_get("live_running", False)
-    b1, b2, b3, b4 = st.columns(4)
 
+    b1, b2, b3, b4 = st.columns(4)
     with b1:
         start_clicked = st.button("▶ Start", key="lv_start", disabled=is_running,
                                    use_container_width=True, type="primary")
@@ -2621,6 +2636,9 @@ def render_live_tab(cfg: Dict):
     if sq_clicked:
         squareoff_position()
         st.info("Position squared off.")
+
+    # Re-read AFTER handling clicks so status badge is always fresh
+    is_running = ts_get("live_running", False)
 
     st.markdown("---")
 
@@ -2852,7 +2870,7 @@ def render_optimization_tab(cfg: Dict):
                 return
 
             results = run_optimization(
-                df_full, df_display or df_full, cfg, float(target_acc)
+                df_full, df_display if df_display is not None else df_full, cfg, float(target_acc)
             )
             st.session_state.opt_results = results
 
