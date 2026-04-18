@@ -1509,22 +1509,39 @@ def _get_candle_interval_seconds(interval: str) -> int:
 
 def _is_candle_closed(interval: str) -> bool:
     """
-    Check if the current time is at a candle boundary (multiple of interval).
-    Only check strategy signals at exact candle close boundaries.
+    Returns True when a new candle has just closed.
+    Uses a generous 10-second window around each boundary so that
+    1.5s polling never misses a candle close.
     """
-    now = datetime.now(IST)
+    now     = datetime.now(IST)
+    minute  = now.minute
+    second  = now.second
+    hour    = now.hour
+    weekday = now.weekday()   # 0=Mon … 6=Sun
+
     if interval == "1m":
-        return True  # every tick = 1 candle
+        return True   # check every tick; de-duped by last_signal_check_time
+
     elif interval == "5m":
-        return now.second == 0 and now.minute % 5 == 0
+        # within 10s after a 5-min boundary
+        return (minute % 5 == 0 and second <= 10) or \
+               (minute % 5 == 4 and second >= 50)
+
     elif interval == "15m":
-        return now.second == 0 and now.minute % 15 == 0
+        return (minute % 15 == 0 and second <= 10) or \
+               (minute % 15 == 14 and second >= 50)
+
     elif interval == "1h":
-        return now.second == 0 and now.minute == 0
+        return (minute == 0 and second <= 10) or \
+               (minute == 59 and second >= 50)
+
     elif interval == "1d":
-        return now.second == 0 and now.minute == 0 and now.hour == 15  # NSE close
+        # NSE closes at 15:30 IST; check within 30s
+        return hour == 15 and minute == 30 and second <= 30
+
     elif interval == "1wk":
-        return now.weekday() == 4 and now.hour == 15 and now.minute == 0 and now.second == 0
+        return weekday == 4 and hour == 15 and minute == 30 and second <= 30
+
     return True
 
 def live_trading_loop(stop_event: threading.Event):
@@ -1770,26 +1787,38 @@ def live_trading_loop(stop_event: threading.Event):
                                 ts_set("cooldown_until",
                                        datetime.now(IST) + timedelta(seconds=cfg.get("cooldown_seconds", 5)))
 
-                # ── Other strategies: signal only at candle close boundary ──
+                # ── Other strategies: signal on NEW candle (index change) ──
                 else:
-                    candle_closed = _is_candle_closed(interval)
-                    if candle_closed and last_signal_check_time != last_time:
+                    # A new candle has appeared when last_time changed from prev
+                    new_candle = (last_signal_check_time != last_time)
+                    if new_candle:
                         last_signal_check_time = last_time
 
-                        sigs, _ = get_signals(df_full, cfg)
+                        # df_full already has indicators — call signal functions directly
+                        strategy_name = cfg.get("strategy", "EMA Crossover")
+                        if strategy_name == "EMA Crossover":
+                            sigs = signals_ema_crossover(df_full, cfg)
+                        elif strategy_name == "Anticipatory EMA Crossover":
+                            sigs = signals_anticipatory_ema(df_full, cfg)
+                        elif strategy_name == "Elliott Wave Auto":
+                            sigs = signals_elliott_wave(df_full, cfg)
+                        else:
+                            sigs = pd.Series(0, index=df_full.index)
+
                         sig = int(sigs.iloc[-1])
+                        ts_log(f"Candle closed [{last_time}] | EMA {ema_f:.2f}/{ema_s_val:.2f} | sig={sig}", "info")
 
                         if sig != 0:
                             # Overlap check
                             if cfg.get("no_overlap", True):
                                 last_trades = ts_get("live_trades", [])
                                 if last_trades:
-                                    last_trade = last_trades[-1]
                                     try:
-                                        lt_exit = datetime.strptime(str(last_trade["exit_time"]), "%Y-%m-%d %H:%M:%S")
-                                        lt_exit = IST.localize(lt_exit)
-                                        if datetime.now(IST) < lt_exit:
-                                            ts_log("Overlap prevented — last trade not yet exited", "warn")
+                                        lt_exit = datetime.strptime(
+                                            str(last_trades[-1]["exit_time"]), "%Y-%m-%d %H:%M:%S"
+                                        )
+                                        if datetime.now(IST) < IST.localize(lt_exit):
+                                            ts_log("Overlap prevented", "warn")
                                             time.sleep(1.5)
                                             continue
                                     except Exception:
@@ -1797,8 +1826,6 @@ def live_trading_loop(stop_event: threading.Event):
 
                             trade_type = "buy" if sig == 1 else "sell"
                             ts_log(f"Signal: {trade_type.upper()} on {interval} candle — queued for next open", "info")
-
-                            # Queue entry at next candle open
                             pending_entry_signal = {
                                 "type":               trade_type,
                                 "signal_candle_time": last_time,
@@ -2698,14 +2725,11 @@ def render_sidebar() -> Dict:
 # 17. TAB 1 — BACKTESTING
 # ================================================================
 def render_backtest_tab(cfg: Dict):
-    # ── LTP bar ────────────────────────────────────────────────
-    ltp_ph = st.empty()
-
     col1, col2 = st.columns([3, 1])
     with col2:
         run_btn = st.button("▶ Run Backtest", key="bt_run", use_container_width=True, type="primary")
     with col1:
-        st.markdown(f"**{cfg['ticker_name']}** | {cfg['interval']} | {cfg['period']} | Strategy: **{cfg['strategy']}**")
+        st.markdown(f"**{cfg['ticker_name']}** | `{cfg['interval']}` | `{cfg['period']}` | Strategy: **{cfg['strategy']}**")
 
     if "bt_result" not in st.session_state:
         st.session_state.bt_result = None
@@ -2720,10 +2744,6 @@ def render_backtest_tab(cfg: Dict):
             st.session_state.bt_result  = result
             st.session_state.bt_df      = df_full
             st.session_state.bt_display = df_display if df_display is not None else df_full
-
-    # ── LTP (cached — no extra API call) ─────────────────────
-    ltp = ui_ltp(cfg["symbol"])
-    ltp_ph.markdown(ltp_bar_html(cfg["ticker_name"], ltp), unsafe_allow_html=True)
 
     result = st.session_state.get("bt_result")
     if result is None:
@@ -2983,9 +3003,6 @@ def render_live_tab(cfg: Dict):
 # 19. TAB 3 — TRADE HISTORY
 # ================================================================
 def render_history_tab(cfg: Dict):
-    ltp = ui_ltp(cfg["symbol"])
-    st.markdown(ltp_bar_html(cfg["ticker_name"], ltp), unsafe_allow_html=True)
-
     st.markdown("### 📚 Trade History")
     st.markdown(alert_html("Trade history updates in real-time — even while live trading is running.", "info"),
                 unsafe_allow_html=True)
@@ -3028,9 +3045,6 @@ def render_history_tab(cfg: Dict):
 # 20. TAB 4 — OPTIMIZATION
 # ================================================================
 def render_optimization_tab(cfg: Dict):
-    ltp = ui_ltp(cfg["symbol"])
-    st.markdown(ltp_bar_html(cfg["ticker_name"], ltp), unsafe_allow_html=True)
-
     st.markdown("### ⚙️ Strategy Optimization")
     st.markdown(alert_html(
         "Grid search over EMA periods, SL points, and Target points. "
