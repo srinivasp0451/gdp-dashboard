@@ -22,6 +22,18 @@ import pytz
 
 warnings.filterwarnings("ignore")
 
+# ── Safe scalar extraction — guards against pandas Series/DataFrame cells ──
+def _s(val) -> float:
+    """Convert any pandas scalar, 0-d array, or Series → plain Python float."""
+    try:
+        if hasattr(val, "iloc"):          # Series or DataFrame column
+            val = val.iloc[0]
+        if hasattr(val, "item"):          # numpy scalar / 0-d array
+            return float(val.item())
+        return float(val)
+    except Exception:
+        return float("nan")
+
 # ================================================================
 # PAGE CONFIG
 # ================================================================
@@ -1562,26 +1574,31 @@ def live_trading_loop(stop_event: threading.Event):
 
             df_full = add_indicators(df_full, cfg)
 
-            # Last candle
-            last_row   = df_full.iloc[-1]
-            ltp        = float(last_row["Close"])
-            ema_f      = float(last_row["ema_fast"])
-            ema_s      = float(last_row["ema_slow"])
-            last_time  = df_full.index[-1]
+            # Last candle — use _s() to safely extract scalar floats
+            last_row  = df_full.iloc[-1]
+            ltp       = _s(last_row["Close"])
+            ema_f     = _s(last_row["ema_fast"])
+            ema_s_val = _s(last_row["ema_slow"])
+            last_time = df_full.index[-1]
+
+            if math.isnan(ltp):
+                ts_log("LTP is NaN — skipping tick", "warn")
+                time.sleep(1.5)
+                continue
 
             ts_set("ltp",          ltp)
             ts_set("ema_fast_val", ema_f)
-            ts_set("ema_slow_val", ema_s)
+            ts_set("ema_slow_val", ema_s_val)
             ts_set("last_candle", {
-                "time":   str(last_time),
-                "open":   round(float(last_row["Open"]),  2),
-                "high":   round(float(last_row["High"]),  2),
-                "low":    round(float(last_row["Low"]),   2),
-                "close":  round(ltp, 2),
-                "volume": int(last_row.get("Volume", 0)),
-                "ema_fast": round(ema_f, 4),
-                "ema_slow": round(ema_s, 4),
-                "atr":    round(float(last_row["atr"]), 4),
+                "time":     str(last_time),
+                "open":     round(_s(last_row["Open"]),    2),
+                "high":     round(_s(last_row["High"]),    2),
+                "low":      round(_s(last_row["Low"]),     2),
+                "close":    round(ltp, 2),
+                "volume":   int(_s(last_row.get("Volume", 0)) if not math.isnan(_s(last_row.get("Volume", 0))) else 0),
+                "ema_fast": round(ema_f,     4),
+                "ema_slow": round(ema_s_val, 4),
+                "atr":      round(_s(last_row["atr"]), 4),
             })
 
             # ── 2. Elliott Wave analysis ──────────────────────────
@@ -1788,13 +1805,166 @@ def live_trading_loop(stop_event: threading.Event):
                             }
 
         except Exception as e:
-            ts_log(f"Live loop error: {str(e)}", "warn")
-            ts_set("live_error", str(e))
+            import traceback
+            err_msg = f"{type(e).__name__}: {e}"
+            ts_log(f"Live loop error: {err_msg}", "warn")
+            ts_set("live_error", err_msg)
+            # Do NOT break — keep the thread alive through transient errors
 
         time.sleep(1.5)  # Respect yfinance API rate limits
 
     ts_log("Live trading stopped", "warn")
     ts_set("live_running", False)
+
+@st.cache_data(ttl=6)
+def _get_ltp_cached(symbol: str) -> Optional[float]:
+    """Cached LTP — max one real API call every 6 seconds per symbol."""
+    return get_ltp(symbol)
+
+def ui_ltp(symbol: str) -> Optional[float]:
+    """
+    Return LTP for UI rendering.
+    When live trading is running the background thread already keeps _TS['ltp']
+    fresh every 1.5s — use that directly to avoid any extra API call.
+    When idle, use the short-TTL cached fetcher.
+    """
+    if ts_get("live_running", False):
+        v = ts_get("ltp")
+        if v is not None:
+            return v
+    return _get_ltp_cached(symbol)
+
+
+# ================================================================
+# BACKTEST NATURAL-LANGUAGE SUMMARY
+# ================================================================
+def generate_backtest_summary(trades: List[Dict], summary: Dict, cfg: Dict) -> str:
+    """Plain-English advisor analysing backtest results and recommending SL/target tweaks."""
+    if not trades:
+        return "No trades were generated. Try a longer period or different strategy."
+
+    total   = summary["total_trades"]
+    acc     = summary["accuracy"]
+    pf      = summary["profit_factor"]
+    tot_pnl = summary["total_pnl"]
+    avg_win = summary["avg_win"]
+    avg_loss= summary["avg_loss"]
+    viol    = summary["violation_count"]
+    sl_pts  = cfg.get("sl_points",    10)
+    tgt_pts = cfg.get("target_points", 20)
+    sl_type = cfg.get("sl_type",  "Custom Points")
+    strategy= cfg.get("strategy", "")
+
+    wins  = [t for t in trades if t["pnl"] > 0]
+    loses = [t for t in trades if t["pnl"] <= 0]
+    lines = []
+
+    # ── Overall verdict ──────────────────────────────────────────
+    if acc >= 60 and pf >= 1.5:
+        verdict = "✅ **Strong setup.**"
+    elif acc >= 50 and pf >= 1.0:
+        verdict = "🟡 **Moderate setup — room to improve.**"
+    else:
+        verdict = "🔴 **Weak setup — significant adjustments needed.**"
+    lines.append(f"{verdict} {total} trades · {acc}% accuracy · Profit Factor {pf:.2f} · Total P&L **{tot_pnl:+.2f}**")
+
+    # ── R:R analysis ─────────────────────────────────────────────
+    if wins and loses and avg_loss != 0:
+        rr = abs(avg_win / avg_loss)
+        if rr < 1.0:
+            lines.append(
+                f"⚠️ **Inverted R:R ({rr:.2f}×).** Avg win {avg_win:.2f} < avg loss {abs(avg_loss):.2f}. "
+                f"Raise target to at least **{round(abs(avg_loss)*1.8, 1)} pts** (1.8× your avg loss) "
+                f"or tighten SL so losses are smaller."
+            )
+        elif rr < 1.5:
+            lines.append(
+                f"🟡 R:R is {rr:.2f}×. To be robustly profitable, aim for ≥ 2×. "
+                f"Either widen target to **{round(abs(avg_loss)*2.0, 1)} pts** or tighten SL."
+            )
+        else:
+            lines.append(f"✅ Good R:R of {rr:.2f}× (avg win {avg_win:.2f} / avg loss {abs(avg_loss):.2f}).")
+
+    # ── SL analysis ───────────────────────────────────────────────
+    sl_hits = [t for t in loses if "SL" in t.get("exit_reason", "")]
+    if sl_hits:
+        pct_sl = len(sl_hits)/total*100
+        lines.append(f"📉 **{len(sl_hits)} SL hits ({pct_sl:.0f}% of trades).**")
+
+        buy_sl = [t for t in sl_hits if t.get("type") == "buy"]
+        sell_sl= [t for t in sl_hits if t.get("type") == "sell"]
+
+        if buy_sl and sl_type == "Custom Points":
+            avg_gap = sum(abs(t["entry_price"] - t.get("entry_low", t["entry_price"])) for t in buy_sl) / len(buy_sl)
+            if avg_gap > sl_pts * 1.15:
+                lines.append(
+                    f"💡 **SL too tight on BUY entries.** Candle Low averages **{avg_gap:.1f} pts** below entry "
+                    f"but SL = {sl_pts} pts → candle wicks are stopping you out. "
+                    f"**Set SL ≥ {round(avg_gap*1.15, 1)} pts** (15% buffer) or switch to **ATR Based SL**."
+                )
+        if sell_sl and sl_type == "Custom Points":
+            avg_gap = sum(abs(t["entry_price"] - t.get("entry_high", t["entry_price"])) for t in sell_sl) / len(sell_sl)
+            if avg_gap > sl_pts * 1.15:
+                lines.append(
+                    f"💡 **SL too tight on SELL entries.** Candle High averages **{avg_gap:.1f} pts** above entry "
+                    f"but SL = {sl_pts} pts. **Set SL ≥ {round(avg_gap*1.15, 1)} pts**."
+                )
+        if pct_sl > 40 and sl_type not in ("ATR Based","Auto SL","Trail with Swing Low/High"):
+            lines.append(
+                "💡 With >40% SL hits, consider **ATR Based SL** (multiplier 1.5–2.0) or "
+                "**Trail with Swing Low/High** for dynamic placement."
+            )
+
+    # ── Target analysis ───────────────────────────────────────────
+    tp_hits = [t for t in wins if "TP" in t.get("exit_reason","")]
+    if tp_hits:
+        buy_tp = [t for t in tp_hits if t.get("type") == "buy"]
+        if buy_tp:
+            avg_extra = sum(t.get("exit_high", t["exit_price"]) - t.get("tp1", t["exit_price"]) for t in buy_tp) / len(buy_tp)
+            if avg_extra > tgt_pts * 0.4:
+                lines.append(
+                    f"💡 **Target too conservative on BUY trades.** After hitting TP1 price ran another "
+                    f"**{avg_extra:.1f} pts** on average. "
+                    f"**Raise target to {round(tgt_pts + avg_extra*0.7, 1)} pts** or use **Trailing Target** "
+                    f"to capture more of the move."
+                )
+
+    # ── Violation conflicts ───────────────────────────────────────
+    if viol > 0:
+        pct_v = viol/total*100
+        lines.append(
+            f"⚡ **{viol} ambiguous bars ({pct_v:.0f}%)** — both SL and target hit in same candle. "
+            f"{'Widen SL to reduce conflicts.' if pct_v>15 else 'Acceptable level.'} "
+            f"In live trading these typically resolve as TP hits (tick-level data)."
+        )
+
+    # ── Strategy tips ─────────────────────────────────────────────
+    if strategy == "EMA Crossover" and acc < 50:
+        fast, slow = cfg.get("ema_fast",9), cfg.get("ema_slow",15)
+        lines.append(
+            f"📊 EMA({fast},{slow}) below 50% accuracy. Try **EMA(9,21)** or **EMA(13,34)** "
+            f"for wider separation. Enable **Min Angle Filter ≥ 5°** to filter weak crossovers."
+        )
+    elif strategy == "Elliott Wave Auto":
+        lines.append("🌊 Elliott Wave performs best on **1h/1d** timeframes with ≥ 3 months data. Use **ATR Based SL** below Wave 4.")
+    elif strategy == "Anticipatory EMA Crossover" and acc < 55:
+        lines.append("🔮 Anticipatory signals are higher-risk. Reduce position size 50% and use tighter SL (ATR × 1.0) until confidence builds.")
+
+    # ── Final recommended parameters ─────────────────────────────
+    if loses and avg_loss != 0:
+        rec_sl  = max(round(abs(avg_loss) * 0.75, 1), 1.0)
+        rec_tgt = round(rec_sl * 2.0, 1)
+        breakeven_wr = round(1 / (1 + abs(avg_win/avg_loss)) * 100, 0) if avg_win else 50
+        lines.append(
+            f"\n**📌 Recommended parameters for this setup:** "
+            f"SL = **{rec_sl} pts**, Target = **{rec_tgt} pts** (2× SL). "
+            f"At 2× R:R you only need **{breakeven_wr:.0f}% win rate** to break even. "
+            f"Current accuracy is {acc}% — "
+            f"{'above breakeven ✅' if acc >= breakeven_wr else 'below breakeven ❌ — tighten SL or widen target'}."
+        )
+
+    return "\n\n".join(lines)
+
 
 def start_live_trading(cfg: Dict):
     ts_set("config",        cfg)
@@ -2533,8 +2703,7 @@ def render_backtest_tab(cfg: Dict):
 
     col1, col2 = st.columns([3, 1])
     with col2:
-        run_btn = st.button("▶ Run Backtest", key="bt_run", use_container_width=True,
-                            type="primary")
+        run_btn = st.button("▶ Run Backtest", key="bt_run", use_container_width=True, type="primary")
     with col1:
         st.markdown(f"**{cfg['ticker_name']}** | {cfg['interval']} | {cfg['period']} | Strategy: **{cfg['strategy']}**")
 
@@ -2543,20 +2712,17 @@ def render_backtest_tab(cfg: Dict):
 
     if run_btn:
         with st.spinner("Fetching data and running backtest..."):
-            df_full, df_display = fetch_ohlcv_with_slice(
-                cfg["symbol"], cfg["interval"], cfg["period"]
-            )
+            df_full, df_display = fetch_ohlcv_with_slice(cfg["symbol"], cfg["interval"], cfg["period"])
             if df_full is None:
                 st.error("Failed to fetch data. Check ticker symbol and period.")
                 return
-
             result = run_backtest(df_full, df_display if df_display is not None else df_full, cfg)
             st.session_state.bt_result  = result
             st.session_state.bt_df      = df_full
             st.session_state.bt_display = df_display if df_display is not None else df_full
 
-    # ── LTP ─────────────────────────────────────────────────
-    ltp = get_ltp(cfg["symbol"])
+    # ── LTP (cached — no extra API call) ─────────────────────
+    ltp = ui_ltp(cfg["symbol"])
     ltp_ph.markdown(ltp_bar_html(cfg["ticker_name"], ltp), unsafe_allow_html=True)
 
     result = st.session_state.get("bt_result")
@@ -2571,18 +2737,41 @@ def render_backtest_tab(cfg: Dict):
 
     # ── Summary cards ────────────────────────────────────────
     st.markdown(summary_grid_html({
-        "Total Trades":   summary["total_trades"],
-        "Winners":        summary["winners"],
-        "Losers":         summary["losers"],
-        "Accuracy":       f"{summary['accuracy']}%",
-        "Total P&L":      summary["total_pnl"],
-        "Avg Win":        summary["avg_win"],
-        "Avg Loss":       summary["avg_loss"],
-        "Profit Factor":  summary["profit_factor"],
-        "Max Win":        summary["max_win"],
-        "Max Loss":       summary["max_loss"],
+        "Total Trades":     summary["total_trades"],
+        "Winners":          summary["winners"],
+        "Losers":           summary["losers"],
+        "Accuracy":         f"{summary['accuracy']}%",
+        "Total P&L":        summary["total_pnl"],
+        "Avg Win":          summary["avg_win"],
+        "Avg Loss":         summary["avg_loss"],
+        "Profit Factor":    summary["profit_factor"],
+        "Max Win":          summary["max_win"],
+        "Max Loss":         summary["max_loss"],
         "SL/TGT Conflicts": summary["violation_count"],
     }), unsafe_allow_html=True)
+
+    st.markdown("---")
+
+    # ── AI Advisor Summary ───────────────────────────────────
+    st.markdown("#### 🧠 Strategy Advisor")
+    advisor_text = generate_backtest_summary(trades, summary, cfg)
+    # Render each paragraph as a distinct block
+    for para in advisor_text.split("\n\n"):
+        para = para.strip()
+        if not para:
+            continue
+        if para.startswith("📌"):
+            st.markdown(
+                f'<div class="alert alert-info">{para}</div>',
+                unsafe_allow_html=True
+            )
+        elif para.startswith(("✅","🟡","🔴")):
+            kind = "success" if para.startswith("✅") else ("warn" if para.startswith("🟡") else "error")
+            st.markdown(f'<div class="alert alert-{kind}">{para}</div>', unsafe_allow_html=True)
+        elif para.startswith(("💡","📊","🌊","🔮","⚡","📉","📌")):
+            st.markdown(f'<div class="alert alert-info">{para}</div>', unsafe_allow_html=True)
+        else:
+            st.markdown(para)
 
     st.markdown("---")
 
@@ -2606,196 +2795,195 @@ def render_backtest_tab(cfg: Dict):
 # 18. TAB 2 — LIVE TRADING
 # ================================================================
 def render_live_tab(cfg: Dict):
-    # ── LTP bar ────────────────────────────────────────────────
-    ltp_ph = st.empty()
-
-    # ── Control buttons ──────────────────────────────────────
-    # Read running state BEFORE buttons so disabled state is correct
+    """
+    Live Trading tab.
+    Control buttons (Start/Stop/Squareoff) are outside the fragment — they fire instantly.
+    All live metrics live inside @st.fragment(run_every=1.5) which auto-updates
+    without refreshing the whole page (no flickering).
+    """
+    # ── Control buttons (OUTSIDE fragment — instant click response) ──
     is_running = ts_get("live_running", False)
 
-    b1, b2, b3, b4 = st.columns(4)
+    b1, b2, b3 = st.columns(3)
     with b1:
-        start_clicked = st.button("▶ Start", key="lv_start", disabled=is_running,
+        start_clicked = st.button("▶ Start",      key="lv_start", disabled=is_running,
                                    use_container_width=True, type="primary")
     with b2:
-        stop_clicked  = st.button("⏹ Stop",  key="lv_stop",  disabled=not is_running,
+        stop_clicked  = st.button("⏹ Stop",       key="lv_stop",  disabled=not is_running,
                                    use_container_width=True)
     with b3:
-        sq_clicked    = st.button("⚡ Squareoff", key="lv_sq", use_container_width=True)
-    with b4:
-        refresh       = st.button("🔄 Refresh",   key="lv_ref", use_container_width=True)
+        sq_clicked    = st.button("⚡ Squareoff",  key="lv_sq",    use_container_width=True)
 
     if start_clicked:
         start_live_trading(cfg)
-        st.success("Live trading started!")
+        st.session_state["lv_just_started"] = True
+        st.rerun()
 
     if stop_clicked:
         stop_live_trading()
-        st.warning("Live trading stopped.")
+        st.rerun()
 
     if sq_clicked:
         squareoff_position()
-        st.info("Position squared off.")
 
-    # Re-read AFTER handling clicks so status badge is always fresh
-    is_running = ts_get("live_running", False)
+    # ── Config display (shown once after start — static, no flicker) ──
+    is_running = ts_get("live_running", False)   # re-read after button handlers
+    if is_running:
+        with st.expander("⚙️ Active Configuration", expanded=False):
+            c1, c2 = st.columns(2)
+            with c1:
+                st.markdown(config_box_html({
+                    "Ticker":    cfg["ticker_name"],
+                    "Symbol":    cfg["symbol"],
+                    "Timeframe": cfg["interval"],
+                    "Period":    cfg["period"],
+                    "Strategy":  cfg["strategy"],
+                    "Quantity":  cfg["quantity"],
+                }), unsafe_allow_html=True)
+            with c2:
+                st.markdown(config_box_html({
+                    "EMA Fast":   cfg["ema_fast"],
+                    "EMA Slow":   cfg["ema_slow"],
+                    "SL Type":    cfg["sl_type"],
+                    "SL Points":  cfg["sl_points"],
+                    "Target":     cfg["target_type"],
+                    "Tgt Points": cfg["target_points"],
+                    "Cooldown":   f"{cfg['cooldown_seconds']}s" if cfg["cooldown_enabled"] else "Off",
+                    "No Overlap": "Yes" if cfg["no_overlap"] else "No",
+                    "Dhan":       "Enabled" if cfg["dhan_enabled"] else "Disabled",
+                }), unsafe_allow_html=True)
 
     st.markdown("---")
 
-    # ── Config display (shown when live) ─────────────────────
-    if is_running:
-        st.markdown("#### ⚙️ Active Configuration")
-        c1, c2 = st.columns(2)
-        with c1:
-            st.markdown(config_box_html({
-                "Ticker":     cfg["ticker_name"],
-                "Symbol":     cfg["symbol"],
-                "Timeframe":  cfg["interval"],
-                "Period":     cfg["period"],
-                "Strategy":   cfg["strategy"],
-                "Quantity":   cfg["quantity"],
-            }), unsafe_allow_html=True)
-        with c2:
-            st.markdown(config_box_html({
-                "EMA Fast":   cfg["ema_fast"],
-                "EMA Slow":   cfg["ema_slow"],
-                "SL Type":    cfg["sl_type"],
-                "SL Points":  cfg["sl_points"],
-                "Target":     cfg["target_type"],
-                "Tgt Points": cfg["target_points"],
-                "Cooldown":   f"{cfg['cooldown_seconds']}s" if cfg["cooldown_enabled"] else "Off",
-                "No Overlap": "Yes" if cfg["no_overlap"] else "No",
-                "Dhan":       "Enabled" if cfg["dhan_enabled"] else "Disabled",
-            }), unsafe_allow_html=True)
+    # ──────────────────────────────────────────────────────────────
+    # AUTO-REFRESHING FRAGMENT — updates every 1.5 s independently
+    # without touching the control buttons above (zero flicker)
+    # ──────────────────────────────────────────────────────────────
+    @st.fragment(run_every=1.5)
+    def _live_metrics_fragment():
+        running  = ts_get("live_running", False)
+        ltp      = ts_get("ltp")
+        ema_f    = ts_get("ema_fast_val")
+        ema_s    = ts_get("ema_slow_val")
+        last_c   = ts_get("last_candle")
+        position = ts_get("live_position")
+        tick     = ts_get("tick_count", 0)
+        err      = ts_get("live_error")
+
+        # ── LTP bar ──────────────────────────────────────────
+        st.markdown(ltp_bar_html(cfg["ticker_name"], ltp), unsafe_allow_html=True)
+
+        # ── Quick metric row ─────────────────────────────────
+        ltp_str  = f"{ltp:.2f}"  if ltp   is not None else "—"
+        emaf_str = f"{ema_f:.2f}" if ema_f is not None else "—"
+        emas_str = f"{ema_s:.2f}" if ema_s is not None else "—"
+        status_badge = badge("RUNNING","run") if running else badge("STOPPED","stop")
+        tick_str     = f"Tick #{tick}" if running else "—"
+
+        # Unrealized P&L for the metric row
+        unreal_pnl = None
+        if position is not None and ltp is not None:
+            sign = 1 if position["type"] == "buy" else -1
+            unreal_pnl = sign * (ltp - position["entry_price"]) * position.get("quantity", 1)
+
+        m1, m2, m3, m4, m5 = st.columns(5)
+        with m1:
+            st.markdown(f'<div class="metric-card"><div class="metric-label">LTP</div><div class="metric-value">{ltp_str}</div></div>', unsafe_allow_html=True)
+        with m2:
+            st.markdown(f'<div class="metric-card"><div class="metric-label">EMA {cfg["ema_fast"]}</div><div class="metric-value" style="color:#f0a500">{emaf_str}</div></div>', unsafe_allow_html=True)
+        with m3:
+            st.markdown(f'<div class="metric-card"><div class="metric-label">EMA {cfg["ema_slow"]}</div><div class="metric-value" style="color:#58a6ff">{emas_str}</div></div>', unsafe_allow_html=True)
+        with m4:
+            pnl_str   = f"{unreal_pnl:+.2f}" if unreal_pnl is not None else "—"
+            pnl_color = "#3fb950" if (unreal_pnl or 0) >= 0 else "#f85149"
+            st.markdown(f'<div class="metric-card"><div class="metric-label">Unrealized P&L</div><div class="metric-value" style="color:{pnl_color}">{pnl_str}</div></div>', unsafe_allow_html=True)
+        with m5:
+            st.markdown(f'<div class="metric-card"><div class="metric-label">Status</div><div class="metric-value" style="font-size:13px">{status_badge}<br><small>{tick_str}</small></div></div>', unsafe_allow_html=True)
+
         st.markdown("---")
 
-    # ── Live metrics ─────────────────────────────────────────
-    ltp      = ts_get("ltp")
-    ema_f    = ts_get("ema_fast_val")
-    ema_s    = ts_get("ema_slow_val")
-    last_c   = ts_get("last_candle")
-    position = ts_get("live_position")
-    tick     = ts_get("tick_count", 0)
-
-    ltp_ph.markdown(
-        ltp_bar_html(cfg["ticker_name"], ltp),
-        unsafe_allow_html=True
-    )
-
-    # Quick metrics row
-    ltp_str  = f"{ltp:.2f}"  if ltp  is not None else "—"
-    emaf_str = f"{ema_f:.2f}" if ema_f is not None else "—"
-    emas_str = f"{ema_s:.2f}" if ema_s is not None else "—"
-
-    m1, m2, m3, m4 = st.columns(4)
-    with m1:
-        st.markdown(f'<div class="metric-card"><div class="metric-label">LTP</div><div class="metric-value">{ltp_str}</div></div>', unsafe_allow_html=True)
-    with m2:
-        st.markdown(f'<div class="metric-card"><div class="metric-label">EMA {cfg["ema_fast"]}</div><div class="metric-value">{emaf_str}</div></div>', unsafe_allow_html=True)
-    with m3:
-        st.markdown(f'<div class="metric-card"><div class="metric-label">EMA {cfg["ema_slow"]}</div><div class="metric-value">{emas_str}</div></div>', unsafe_allow_html=True)
-    with m4:
-        status_badge = badge("RUNNING","run") if is_running else badge("STOPPED","stop")
-        tick_str = f"Tick #{tick}" if is_running else "—"
-        st.markdown(f'<div class="metric-card"><div class="metric-label">Status</div><div class="metric-value" style="font-size:14px">{status_badge} {tick_str}</div></div>', unsafe_allow_html=True)
-
-    st.markdown("---")
-
-    # ── Last fetched candle ───────────────────────────────────
-    if last_c:
-        st.markdown("#### 📊 Last Fetched Candle")
-        st.markdown(f"""
-        <div class="candle-row">
-          <div class="candle-field"><div class="candle-flabel">Time</div><div class="candle-fval" style="font-size:12px">{last_c['time'][:16]}</div></div>
-          <div class="candle-field"><div class="candle-flabel">Open</div><div class="candle-fval">{last_c['open']}</div></div>
-          <div class="candle-field"><div class="candle-flabel">High</div><div class="candle-fval" style="color:#3fb950">{last_c['high']}</div></div>
-          <div class="candle-field"><div class="candle-flabel">Low</div><div class="candle-fval" style="color:#f85149">{last_c['low']}</div></div>
-          <div class="candle-field"><div class="candle-flabel">Close</div><div class="candle-fval">{last_c['close']}</div></div>
-          <div class="candle-field"><div class="candle-flabel">EMA {cfg['ema_fast']}</div><div class="candle-fval" style="color:#f0a500">{last_c.get('ema_fast','—')}</div></div>
-          <div class="candle-field"><div class="candle-flabel">EMA {cfg['ema_slow']}</div><div class="candle-fval" style="color:#58a6ff">{last_c.get('ema_slow','—')}</div></div>
-          <div class="candle-field"><div class="candle-flabel">ATR</div><div class="candle-fval">{last_c.get('atr','—')}</div></div>
-          <div class="candle-field"><div class="candle-flabel">Volume</div><div class="candle-fval" style="font-size:11px">{last_c.get('volume',0):,}</div></div>
-        </div>
-        """, unsafe_allow_html=True)
-
-    # ── Active Position ───────────────────────────────────────
-    pos_ltp = ltp if ltp is not None else 0.0
-    if position is not None and ltp is not None:
-        st.markdown("#### 💼 Active Position")
-        st.markdown(position_card_html(position, pos_ltp), unsafe_allow_html=True)
-    elif position is None and is_running:
-        st.markdown(alert_html("No active position — waiting for signal.", "info"), unsafe_allow_html=True)
-
-    st.markdown("---")
-
-    # ── Elliott Wave display ──────────────────────────────────
-    wave_res = ts_get("wave_data", {})
-    if wave_res:
-        st.markdown("#### 🌊 Elliott Wave Analysis")
-        col_w, col_i = st.columns([2, 1])
-        with col_w:
-            st.markdown(wave_cards_html(wave_res), unsafe_allow_html=True)
-        with col_i:
-            _wnt  = wave_res.get("next_target")
-            _wsl  = wave_res.get("sl")
-            _wtp1 = wave_res.get("tp1")
-            _wtp2 = wave_res.get("tp2")
-            _wnt_s  = f"{_wnt:.2f}"  if _wnt  is not None else "—"
-            _wsl_s  = f"{_wsl:.2f}"  if _wsl  is not None else "—"
-            _wtp1_s = f"{_wtp1:.2f}" if _wtp1 is not None else "—"
-            _wtp2_s = f"{_wtp2:.2f}" if _wtp2 is not None else "—"
+        # ── Last fetched candle ───────────────────────────────
+        if last_c:
+            st.markdown("#### 📊 Last Fetched Candle")
             st.markdown(f"""
-            <div class="config-box">
-              <div class="config-row"><span class="config-key">Status</span><span class="config-val">{wave_res.get('status','—')}</span></div>
-              <div class="config-row"><span class="config-key">Current Wave</span><span class="config-val">{wave_res.get('current_wave','—')}</span></div>
-              <div class="config-row"><span class="config-key">Direction</span><span class="config-val">{wave_res.get('direction','—')}</span></div>
-              <div class="config-row"><span class="config-key">Next Target</span><span class="config-val">{_wnt_s}</span></div>
-              <div class="config-row"><span class="config-key">Wave Signal</span><span class="config-val">{wave_res.get('signal','—')}</span></div>
-              <div class="config-row"><span class="config-key">Wave SL</span><span class="config-val">{_wsl_s}</span></div>
-              <div class="config-row"><span class="config-key">TP1</span><span class="config-val">{_wtp1_s}</span></div>
-              <div class="config-row"><span class="config-key">TP2</span><span class="config-val">{_wtp2_s}</span></div>
+            <div class="candle-row">
+              <div class="candle-field"><div class="candle-flabel">Time</div><div class="candle-fval" style="font-size:12px">{last_c['time'][:16]}</div></div>
+              <div class="candle-field"><div class="candle-flabel">Open</div><div class="candle-fval">{last_c['open']}</div></div>
+              <div class="candle-field"><div class="candle-flabel">High</div><div class="candle-fval" style="color:#3fb950">{last_c['high']}</div></div>
+              <div class="candle-field"><div class="candle-flabel">Low</div><div class="candle-fval" style="color:#f85149">{last_c['low']}</div></div>
+              <div class="candle-field"><div class="candle-flabel">Close</div><div class="candle-fval">{last_c['close']}</div></div>
+              <div class="candle-field"><div class="candle-flabel">EMA {cfg['ema_fast']}</div><div class="candle-fval" style="color:#f0a500">{last_c.get('ema_fast','—')}</div></div>
+              <div class="candle-field"><div class="candle-flabel">EMA {cfg['ema_slow']}</div><div class="candle-fval" style="color:#58a6ff">{last_c.get('ema_slow','—')}</div></div>
+              <div class="candle-field"><div class="candle-flabel">ATR</div><div class="candle-fval">{last_c.get('atr','—')}</div></div>
+              <div class="candle-field"><div class="candle-flabel">Volume</div><div class="candle-fval" style="font-size:11px">{last_c.get('volume',0):,}</div></div>
             </div>
             """, unsafe_allow_html=True)
 
-        # Wave chart
-        if is_running or ltp is not None:
-            try:
-                df_live = fetch_ohlcv(cfg["symbol"], cfg["interval"], cfg["period"], warmup=True)
-                if df_live is not None and len(df_live) > 10:
-                    df_live = add_indicators(df_live, cfg)
-                    wfig = build_wave_chart(df_live, wave_res)
-                    st.plotly_chart(wfig, use_container_width=True, config={"displayModeBar": False})
-            except Exception:
-                pass
+        # ── Active Position card ──────────────────────────────
+        if position is not None and ltp is not None:
+            st.markdown("#### 💼 Active Position")
+            st.markdown(position_card_html(position, ltp), unsafe_allow_html=True)
+        elif position is None and running:
+            st.markdown(alert_html("No active position — waiting for signal.", "info"), unsafe_allow_html=True)
 
-    st.markdown("---")
+        # ── Session P&L summary (running totals) ─────────────
+        live_trades = ts_get("live_trades", [])
+        if live_trades:
+            sess_pnl  = sum(t["pnl"] for t in live_trades)
+            sess_wins = sum(1 for t in live_trades if t["pnl"] > 0)
+            sess_acc  = round(sess_wins / len(live_trades) * 100, 1)
+            pnl_col   = "#3fb950" if sess_pnl >= 0 else "#f85149"
+            st.markdown(f"""
+            <div class="candle-row" style="margin-top:8px">
+              <div class="candle-field"><div class="candle-flabel">Session Trades</div><div class="candle-fval">{len(live_trades)}</div></div>
+              <div class="candle-field"><div class="candle-flabel">Wins</div><div class="candle-fval" style="color:#3fb950">{sess_wins}</div></div>
+              <div class="candle-field"><div class="candle-flabel">Win Rate</div><div class="candle-fval">{sess_acc}%</div></div>
+              <div class="candle-field"><div class="candle-flabel">Session P&L</div><div class="candle-fval" style="color:{pnl_col};font-weight:700">{sess_pnl:+.2f}</div></div>
+            </div>
+            """, unsafe_allow_html=True)
 
-    # ── Live chart ────────────────────────────────────────────
-    if is_running or ltp is not None:
-        try:
-            df_live = fetch_ohlcv(cfg["symbol"], cfg["interval"], cfg["period"], warmup=True)
-            if df_live is not None and len(df_live) > 5:
-                df_live = add_indicators(df_live, cfg)
-                lfig    = build_live_chart(df_live, position, cfg)
-                st.plotly_chart(lfig, use_container_width=True, config={"displayModeBar": False})
-        except Exception:
-            pass
+        st.markdown("---")
 
-    # ── Live log ──────────────────────────────────────────────
-    st.markdown("#### 📝 Live Log")
-    log_entries = ts_get("live_log", [])
-    st.markdown(log_html(log_entries), unsafe_allow_html=True)
+        # ── Elliott Wave ──────────────────────────────────────
+        wave_res = ts_get("wave_data", {})
+        if wave_res and wave_res.get("status") != "Analyzing...":
+            st.markdown("#### 🌊 Elliott Wave Analysis")
+            col_w, col_i = st.columns([2, 1])
+            with col_w:
+                st.markdown(wave_cards_html(wave_res), unsafe_allow_html=True)
+            with col_i:
+                _wnt  = wave_res.get("next_target")
+                _wsl  = wave_res.get("sl")
+                _wtp1 = wave_res.get("tp1")
+                _wtp2 = wave_res.get("tp2")
+                st.markdown(config_box_html({
+                    "Status":       wave_res.get("status", "—"),
+                    "Current Wave": wave_res.get("current_wave", "—"),
+                    "Direction":    wave_res.get("direction",    "—"),
+                    "Next Target":  f"{_wnt:.2f}"  if _wnt  is not None else "—",
+                    "Signal":       wave_res.get("signal",       "—"),
+                    "Wave SL":      f"{_wsl:.2f}"  if _wsl  is not None else "—",
+                    "TP1":          f"{_wtp1:.2f}" if _wtp1 is not None else "—",
+                    "TP2":          f"{_wtp2:.2f}" if _wtp2 is not None else "—",
+                }), unsafe_allow_html=True)
 
-    err = ts_get("live_error")
-    if err:
-        st.markdown(alert_html(f"⚠️ Last error: {err}", "error"), unsafe_allow_html=True)
+        # ── Live log ─────────────────────────────────────────
+        st.markdown("#### 📝 Live Log")
+        log_entries = ts_get("live_log", [])
+        st.markdown(log_html(log_entries), unsafe_allow_html=True)
+
+        if err:
+            st.markdown(alert_html(f"⚠️ Last error: {err}", "error"), unsafe_allow_html=True)
+
+    # Call the fragment (it auto-schedules its own 1.5s re-runs)
+    _live_metrics_fragment()
 
 
 # ================================================================
 # 19. TAB 3 — TRADE HISTORY
 # ================================================================
 def render_history_tab(cfg: Dict):
-    ltp = get_ltp(cfg["symbol"])
+    ltp = ui_ltp(cfg["symbol"])
     st.markdown(ltp_bar_html(cfg["ticker_name"], ltp), unsafe_allow_html=True)
 
     st.markdown("### 📚 Trade History")
@@ -2840,7 +3028,7 @@ def render_history_tab(cfg: Dict):
 # 20. TAB 4 — OPTIMIZATION
 # ================================================================
 def render_optimization_tab(cfg: Dict):
-    ltp = get_ltp(cfg["symbol"])
+    ltp = ui_ltp(cfg["symbol"])
     st.markdown(ltp_bar_html(cfg["ticker_name"], ltp), unsafe_allow_html=True)
 
     st.markdown("### ⚙️ Strategy Optimization")
