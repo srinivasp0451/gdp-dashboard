@@ -1500,81 +1500,112 @@ def place_exit_order(dhan_client, cfg: Dict, position: Dict,
 
 
 # ================================================================
-# 12. LIVE TRADING ENGINE  (runs in background thread)
+# 12. LIVE TRADING ENGINE  (background thread)
 # ================================================================
-def _get_candle_interval_seconds(interval: str) -> int:
-    """Return interval in seconds."""
-    mapping = {"1m": 60, "5m": 300, "15m": 900, "1h": 3600, "1d": 86400, "1wk": 604800}
-    return mapping.get(interval, 300)
 
-def _is_candle_closed(interval: str) -> bool:
+def _safe_vol(row) -> int:
+    """Safely extract Volume as int from a pandas row."""
+    try:
+        v = row["Volume"]
+        if hasattr(v, "iloc"):
+            v = v.iloc[0]
+        v = float(v)
+        return int(v) if not math.isnan(v) else 0
+    except Exception:
+        return 0
+
+def _compute_signal(df: pd.DataFrame, cfg: Dict, strategy: str) -> int:
+    """Return +1 buy, -1 sell, 0 hold for last candle."""
+    try:
+        if strategy == "EMA Crossover":
+            sigs = signals_ema_crossover(df, cfg)
+        elif strategy == "Anticipatory EMA Crossover":
+            sigs = signals_anticipatory_ema(df, cfg)
+        elif strategy == "Elliott Wave Auto":
+            sigs = signals_elliott_wave(df, cfg)
+        else:
+            return 0
+        return int(sigs.iloc[-1])
+    except Exception:
+        return 0
+
+def _do_entry(trade_type: str, entry_price: float,
+              df: pd.DataFrame, cfg: Dict,
+              dhan_enabled: bool, dhan_client) -> None:
+    """Create position, store in _TS, place Dhan order."""
+    idx = len(df) - 1
+    sl  = calc_initial_sl(entry_price, trade_type, df, cfg, idx)
+    tp1, tp2, tp3 = calc_initial_target(entry_price, trade_type, df, cfg, idx, sl)
+
+    pos = {
+        "entry_time":    datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S"),
+        "entry_price":   round(entry_price, 2),
+        "type":          trade_type,
+        "sl":            round(sl,  2),
+        "tp1":           round(tp1, 2),
+        "tp2":           round(tp2, 2),
+        "tp3":           round(tp3, 2),
+        "quantity":      cfg.get("quantity", 1),
+        "signal_reason": cfg.get("strategy", ""),
+    }
+    ts_set("live_position", pos)
+    ts_log(
+        f"ENTRY {trade_type.upper()} @ {entry_price:.2f} | "
+        f"SL:{sl:.2f} | TP1:{tp1:.2f} | TP2:{tp2:.2f}",
+        "buy" if trade_type == "buy" else "sell",
+    )
+
+    if dhan_enabled and dhan_client:
+        try:
+            if cfg.get("options_enabled", False):
+                res = place_dhan_options_order(dhan_client, cfg, trade_type, entry_price)
+                if res.get("success"):
+                    pos["option_security_id"] = (
+                        cfg.get("ce_security_id") if trade_type == "buy"
+                        else cfg.get("pe_security_id")
+                    )
+            else:
+                res = place_dhan_equity_order(dhan_client, cfg, trade_type, entry_price)
+            ts_log(f"Dhan order: {res.get('msg','placed')}", "info")
+        except Exception as ex:
+            ts_log(f"Dhan order error: {ex}", "warn")
+
+    # Set cooldown AFTER placing entry
+    if cfg.get("cooldown_enabled", True):
+        cd_secs = max(int(cfg.get("cooldown_seconds", 5)), 1)
+        ts_set("cooldown_until", datetime.now(IST) + timedelta(seconds=cd_secs))
+
+def live_trading_loop(stop_event: threading.Event) -> None:
     """
-    Returns True when a new candle has just closed.
-    Uses a generous 10-second window around each boundary so that
-    1.5s polling never misses a candle close.
-    """
-    now     = datetime.now(IST)
-    minute  = now.minute
-    second  = now.second
-    hour    = now.hour
-    weekday = now.weekday()   # 0=Mon … 6=Sun
+    Background thread — runs every 1.5 s.
 
-    if interval == "1m":
-        return True   # check every tick; de-duped by last_signal_check_time
-
-    elif interval == "5m":
-        # within 10s after a 5-min boundary
-        return (minute % 5 == 0 and second <= 10) or \
-               (minute % 5 == 4 and second >= 50)
-
-    elif interval == "15m":
-        return (minute % 15 == 0 and second <= 10) or \
-               (minute % 15 == 14 and second >= 50)
-
-    elif interval == "1h":
-        return (minute == 0 and second <= 10) or \
-               (minute == 59 and second >= 50)
-
-    elif interval == "1d":
-        # NSE closes at 15:30 IST; check within 30s
-        return hour == 15 and minute == 30 and second <= 30
-
-    elif interval == "1wk":
-        return weekday == 4 and hour == 15 and minute == 30 and second <= 30
-
-    return True
-
-def live_trading_loop(stop_event: threading.Event):
-    """
-    Background thread for live trading.
-    - Fetches data every 1.5s (respects yfinance rate limits)
-    - Checks SL/Target against LTP (tick-by-tick)
-    - Generates entry signals only at candle close boundaries
-    - Entry at next candle's open (simulated from LTP)
+    Simple Buy / Simple Sell  → enter on the FIRST tick with no position.
+    EMA / Wave strategies     → detect new candle by index change,
+                                queue entry at the NEXT candle's open price.
+    SL / TP                   → checked against LTP on every tick.
     """
     cfg      = ts_get("config", {})
-    symbol   = cfg.get("symbol", "^NSEI")
+    symbol   = cfg.get("symbol",   "^NSEI")
     interval = cfg.get("interval", "5m")
-    period   = cfg.get("period", "1d")
+    period   = cfg.get("period",   "1d")
     strategy = cfg.get("strategy", "EMA Crossover")
-    immediate_entry = strategy in ("Simple Buy", "Simple Sell")
+    is_simple = strategy in ("Simple Buy", "Simple Sell")
 
     dhan_enabled = cfg.get("dhan_enabled", False)
     dhan_client  = None
     if dhan_enabled:
         dhan_client = build_dhan_client(
             cfg.get("dhan_client_id", ""),
-            cfg.get("dhan_access_token", "")
+            cfg.get("dhan_access_token", ""),
         )
         if dhan_client:
-            ts_log("Dhan client initialized", "info")
+            ts_log("Dhan client initialised", "info")
             register_dhan_ip(dhan_client)
 
-    # State for this session
-    pending_entry_signal = None  # {type: 'buy'/'sell', at_next_open: True}
-    last_signal_check_time = None
+    last_candle_time = None   # track new-candle detection
+    entry_queued     = None   # {"type": "buy"/"sell", "candle_time": ts}
 
-    ts_log(f"Live trading started | {symbol} | {interval} | {period} | {strategy}", "info")
+    ts_log(f"Live started ▶ {symbol} | {interval} | {period} | {strategy}", "info")
 
     tick = 0
     while not stop_event.is_set():
@@ -1582,279 +1613,215 @@ def live_trading_loop(stop_event: threading.Event):
         ts_set("tick_count", tick)
 
         try:
-            # ── 1. Fetch latest data ──────────────────────────────
-            df_full = fetch_ohlcv(symbol, interval, period, warmup=True)
-            if df_full is None or len(df_full) < 5:
-                ts_log("Data fetch returned empty — retrying...", "warn")
+            # ── 1. Fetch data ─────────────────────────────────────
+            df = fetch_ohlcv(symbol, interval, period, warmup=True)
+            if df is None or len(df) < 5:
+                ts_log("Empty data — will retry", "warn")
                 time.sleep(1.5)
                 continue
 
-            df_full = add_indicators(df_full, cfg)
+            df = add_indicators(df, cfg)
 
-            # Last candle — use _s() to safely extract scalar floats
-            last_row  = df_full.iloc[-1]
-            ltp       = _s(last_row["Close"])
-            ema_f     = _s(last_row["ema_fast"])
-            ema_s_val = _s(last_row["ema_slow"])
-            last_time = df_full.index[-1]
+            row         = df.iloc[-1]
+            ltp         = _s(row["Close"])
+            candle_time = df.index[-1]
 
             if math.isnan(ltp):
-                ts_log("LTP is NaN — skipping tick", "warn")
+                ts_log("LTP NaN — skipping", "warn")
                 time.sleep(1.5)
                 continue
 
+            ema_f = _s(row["ema_fast"])
+            ema_s = _s(row["ema_slow"])
+            atr_v = _s(row["atr"]) if "atr" in df.columns else 0.0
+
+            # ── 2. Update shared state (UI reads from here) ───────
             ts_set("ltp",          ltp)
             ts_set("ema_fast_val", ema_f)
-            ts_set("ema_slow_val", ema_s_val)
+            ts_set("ema_slow_val", ema_s)
             ts_set("last_candle", {
-                "time":     str(last_time),
-                "open":     round(_s(last_row["Open"]),    2),
-                "high":     round(_s(last_row["High"]),    2),
-                "low":      round(_s(last_row["Low"]),     2),
+                "time":     str(candle_time)[:19],
+                "open":     round(_s(row["Open"]), 2),
+                "high":     round(_s(row["High"]), 2),
+                "low":      round(_s(row["Low"]),  2),
                 "close":    round(ltp, 2),
-                "volume":   int(_s(last_row.get("Volume", 0)) if not math.isnan(_s(last_row.get("Volume", 0))) else 0),
-                "ema_fast": round(ema_f,     4),
-                "ema_slow": round(ema_s_val, 4),
-                "atr":      round(_s(last_row["atr"]), 4),
+                "volume":   _safe_vol(row),
+                "ema_fast": round(ema_f, 2),
+                "ema_slow": round(ema_s, 2),
+                "atr":      round(float(atr_v), 4),
             })
 
-            # ── 2. Elliott Wave analysis ──────────────────────────
-            if strategy == "Elliott Wave Auto" or cfg.get("show_waves", True):
-                wave_res = analyze_elliott_waves(df_full)
-                ts_set("wave_data", wave_res)
+            # ── 3. Elliott Wave (background, non-blocking) ────────
+            if strategy == "Elliott Wave Auto":
+                try:
+                    ts_set("wave_data", analyze_elliott_waves(df))
+                except Exception:
+                    pass
 
-            # ── 3. Check SL/Target against LTP (tick-by-tick) ────
-            position = ts_get("live_position")
-            if position is not None:
-                trade_type = position["type"]
-                sl         = position["sl"]
-                tp1        = position["tp1"]
-                tp2        = position["tp2"]
+            # ── 4. Manage open position — SL / TP vs LTP ─────────
+            pos = ts_get("live_position")
+            if pos is not None:
+                tt  = pos["type"]
+                sl  = pos["sl"]
+                tp1 = pos["tp1"]
 
-                # Update trailing SL against LTP
-                sl = update_trailing_sl(sl, ltp, trade_type, df_full, cfg, len(df_full)-1)
-                position["sl"] = sl
-                ts_set("live_position", position)
+                # Trail SL
+                new_sl = update_trailing_sl(sl, ltp, tt, df, cfg, len(df) - 1)
+                if abs(new_sl - sl) > 0.0001:
+                    pos["sl"] = round(new_sl, 2)
+                    ts_set("live_position", pos)
 
-                exit_price  = None
-                exit_reason = None
-
-                if trade_type == "buy":
-                    if ltp <= sl:
-                        exit_price  = ltp
-                        exit_reason = "SL Hit (LTP)"
+                hit_reason = None
+                hit_price  = ltp
+                if tt == "buy":
+                    if ltp <= pos["sl"]:
+                        hit_reason = "SL Hit"
                     elif ltp >= tp1:
-                        exit_price  = ltp
-                        exit_reason = "TP1 Hit (LTP)"
+                        hit_reason = "TP1 Hit"
                 else:
-                    if ltp >= sl:
-                        exit_price  = ltp
-                        exit_reason = "SL Hit (LTP)"
+                    if ltp >= pos["sl"]:
+                        hit_reason = "SL Hit"
                     elif ltp <= tp1:
-                        exit_price  = ltp
-                        exit_reason = "TP1 Hit (LTP)"
+                        hit_reason = "TP1 Hit"
 
-                # EMA reversal check at candle boundary
-                if exit_reason is None and cfg.get("target_type") == "EMA Crossover Exit":
-                    if check_ema_reversal_exit(df_full, len(df_full)-1, trade_type):
-                        exit_price  = ltp
-                        exit_reason = "EMA Reversal Exit"
+                # EMA reversal exit
+                if hit_reason is None and cfg.get("target_type") == "EMA Crossover Exit":
+                    if check_ema_reversal_exit(df, len(df) - 1, tt):
+                        hit_reason = "EMA Reversal Exit"
 
-                if exit_price is not None:
-                    sign = 1 if trade_type == "buy" else -1
-                    pnl  = sign * (exit_price - position["entry_price"]) * position.get("quantity", 1)
-                    trade = {
-                        **position,
+                if hit_reason:
+                    sign = 1 if tt == "buy" else -1
+                    pnl  = round(sign * (hit_price - pos["entry_price"]) * pos.get("quantity", 1), 2)
+                    pct  = round(sign * (hit_price - pos["entry_price"]) / pos["entry_price"] * 100, 2)
+                    closed = {
+                        **pos,
                         "exit_time":   datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S"),
-                        "exit_price":  round(exit_price, 2),
-                        "exit_reason": exit_reason,
-                        "pnl":         round(pnl, 2),
-                        "pnl_pct":     round(sign * (exit_price - position["entry_price"]) / position["entry_price"] * 100, 2),
+                        "exit_price":  round(hit_price, 2),
+                        "exit_reason": hit_reason,
+                        "pnl":         pnl,
+                        "pnl_pct":     pct,
                         "source":      "live",
                     }
-                    ts_append("live_trades", trade)
+                    ts_append("live_trades", closed)
                     ts_set("live_position", None)
-                    ts_log(f"EXIT {trade_type.upper()} @ {exit_price:.2f} | {exit_reason} | PnL: {pnl:.2f}", "exit")
-
-                    # Place exit order via Dhan
+                    ts_log(
+                        f"EXIT {tt.upper()} @ {hit_price:.2f} | {hit_reason} | P&L: {pnl:+.2f}",
+                        "exit",
+                    )
+                    entry_queued = None
                     if dhan_enabled and dhan_client:
-                        ex_res = place_exit_order(dhan_client, cfg, position, exit_price)
-                        ts_log(f"Dhan exit order: {ex_res.get('msg', 'OK')}", "info")
+                        try:
+                            place_exit_order(dhan_client, cfg, pos, hit_price)
+                        except Exception:
+                            pass
 
-                    pending_entry_signal = None
+            # ── 5. Entry logic ────────────────────────────────────
+            current_pos = ts_get("live_position")
+            if current_pos is None and entry_queued is None:
 
-            # ── 4. Execute pending entry (at open of new candle) ──
-            if pending_entry_signal is not None and ts_get("live_position") is None:
-                # Check candle has advanced
-                if last_time != pending_entry_signal.get("signal_candle_time"):
-                    # New candle opened — enter at LTP (approximates next open)
-                    trade_type = pending_entry_signal["type"]
-                    entry_price = ltp
+                # cooldown guard
+                cd = ts_get("cooldown_until")
+                in_cd = (cd is not None) and (datetime.now(IST) < cd)
 
-                    # Cooldown check
-                    cooldown_until = ts_get("cooldown_until")
-                    if cooldown_until and datetime.now(IST) < cooldown_until:
-                        ts_log("Cooldown active — skipping entry", "warn")
-                        pending_entry_signal = None
+                if not in_cd:
+                    if is_simple:
+                        # ── Simple Buy/Sell: immediate on every tick ──
+                        tt = "buy" if strategy == "Simple Buy" else "sell"
+                        ts_log(f"Simple {tt.upper()} signal → entering immediately @ {ltp:.2f}", "info")
+                        _do_entry(tt, ltp, df, cfg, dhan_enabled, dhan_client)
+
                     else:
-                        sl  = calc_initial_sl(entry_price, trade_type, df_full, cfg, len(df_full)-1)
-                        tp1, tp2, tp3 = calc_initial_target(entry_price, trade_type, df_full, cfg, len(df_full)-1, sl)
-
-                        pos = {
-                            "entry_time":  datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S"),
-                            "entry_price": round(entry_price, 2),
-                            "type":        trade_type,
-                            "sl":          round(sl, 2),
-                            "tp1":         round(tp1, 2),
-                            "tp2":         round(tp2, 2),
-                            "tp3":         round(tp3, 2),
-                            "quantity":    cfg.get("quantity", 1),
-                            "signal_reason": strategy,
-                        }
-                        ts_set("live_position", pos)
-                        ts_log(f"ENTRY {trade_type.upper()} @ {entry_price:.2f} | SL:{sl:.2f} | TP1:{tp1:.2f}", "buy" if trade_type == "buy" else "sell")
-
-                        # Place entry order via Dhan
-                        if dhan_enabled and dhan_client:
-                            if cfg.get("options_enabled", False):
-                                res = place_dhan_options_order(dhan_client, cfg, trade_type, entry_price)
-                                if res.get("success"):
-                                    pos["option_security_id"] = (
-                                        cfg.get("ce_security_id") if trade_type == "buy"
-                                        else cfg.get("pe_security_id")
-                                    )
-                            else:
-                                res = place_dhan_equity_order(dhan_client, cfg, trade_type, entry_price)
-                            ts_log(f"Dhan entry order: {res.get('msg', 'placed')}", "info")
-
-                        pending_entry_signal = None
-
-                        # Set cooldown
-                        if cfg.get("cooldown_enabled", True):
-                            cooldown_secs = cfg.get("cooldown_seconds", 5)
-                            ts_set("cooldown_until",
-                                   datetime.now(IST) + timedelta(seconds=cooldown_secs))
-
-            # ── 5. Generate new entry signal ─────────────────────
-            if ts_get("live_position") is None and pending_entry_signal is None:
-
-                # ── Simple Buy / Simple Sell: enter on EVERY tick, no candle wait ──
-                if immediate_entry:
-                    if ltp is None:
-                        pass  # data not yet loaded — skip
-                    else:
-                        cooldown_until = ts_get("cooldown_until")
-                        if cooldown_until and datetime.now(IST) < cooldown_until:
-                            pass  # still in cooldown
-                        else:
-                            sig         = 1 if strategy == "Simple Buy" else -1
-                            trade_type  = "buy" if sig == 1 else "sell"
-                            entry_price = ltp
-
-                            sl  = calc_initial_sl(entry_price, trade_type, df_full, cfg, len(df_full)-1)
-                            tp1, tp2, tp3 = calc_initial_target(entry_price, trade_type, df_full, cfg, len(df_full)-1, sl)
-
-                            pos = {
-                                "entry_time":    datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S"),
-                                "entry_price":   round(entry_price, 2),
-                                "type":          trade_type,
-                                "sl":            round(sl,  2),
-                                "tp1":           round(tp1, 2),
-                                "tp2":           round(tp2, 2),
-                                "tp3":           round(tp3, 2),
-                                "quantity":      cfg.get("quantity", 1),
-                                "signal_reason": strategy,
-                            }
-                            ts_set("live_position", pos)
+                        # ── Indicator strategies: trigger on new candle ──
+                        if candle_time != last_candle_time:
+                            last_candle_time = candle_time
+                            sig = _compute_signal(df, cfg, strategy)
                             ts_log(
-                                f"ENTRY {trade_type.upper()} @ {entry_price:.2f} | SL:{sl:.2f} | TP1:{tp1:.2f}",
-                                "buy" if trade_type == "buy" else "sell"
+                                f"Candle {str(candle_time)[:16]} | "
+                                f"EMA {ema_f:.2f}/{ema_s:.2f} | sig={sig}",
+                                "info",
                             )
+                            if sig != 0:
+                                tt = "buy" if sig == 1 else "sell"
+                                entry_queued = {"type": tt, "candle_time": candle_time}
+                                ts_log(
+                                    f"{tt.upper()} signal on {interval} candle — "
+                                    f"queued for next candle open",
+                                    "info",
+                                )
 
-                            if dhan_enabled and dhan_client:
-                                if cfg.get("options_enabled", False):
-                                    res = place_dhan_options_order(dhan_client, cfg, trade_type, entry_price)
-                                    if res.get("success"):
-                                        pos["option_security_id"] = (
-                                            cfg.get("ce_security_id") if trade_type == "buy"
-                                            else cfg.get("pe_security_id")
-                                        )
-                                else:
-                                    res = place_dhan_equity_order(dhan_client, cfg, trade_type, entry_price)
-                                ts_log(f"Dhan entry order: {res.get('msg', 'placed')}", "info")
+            # ── 6. Execute queued entry at next candle open ───────
+            if entry_queued is not None and ts_get("live_position") is None:
+                if candle_time != entry_queued["candle_time"]:
+                    cd = ts_get("cooldown_until")
+                    in_cd = (cd is not None) and (datetime.now(IST) < cd)
+                    if not in_cd:
+                        tt = entry_queued["type"]
+                        ts_log(f"Executing queued {tt.upper()} entry @ {ltp:.2f} (new candle open)", "info")
+                        _do_entry(tt, ltp, df, cfg, dhan_enabled, dhan_client)
+                    else:
+                        ts_log("Queued entry skipped — cooldown active", "warn")
+                    entry_queued = None
 
-                            if cfg.get("cooldown_enabled", True):
-                                ts_set("cooldown_until",
-                                       datetime.now(IST) + timedelta(seconds=cfg.get("cooldown_seconds", 5)))
+        except Exception as exc:
+            err = f"{type(exc).__name__}: {exc}"
+            ts_log(f"Loop error: {err}", "warn")
+            ts_set("live_error", err)
+            # Never exit the loop on a recoverable error
 
-                # ── Other strategies: signal on NEW candle (index change) ──
-                else:
-                    # A new candle has appeared when last_time changed from prev
-                    new_candle = (last_signal_check_time != last_time)
-                    if new_candle:
-                        last_signal_check_time = last_time
+        time.sleep(1.5)
 
-                        # df_full already has indicators — call signal functions directly
-                        strategy_name = cfg.get("strategy", "EMA Crossover")
-                        if strategy_name == "EMA Crossover":
-                            sigs = signals_ema_crossover(df_full, cfg)
-                        elif strategy_name == "Anticipatory EMA Crossover":
-                            sigs = signals_anticipatory_ema(df_full, cfg)
-                        elif strategy_name == "Elliott Wave Auto":
-                            sigs = signals_elliott_wave(df_full, cfg)
-                        else:
-                            sigs = pd.Series(0, index=df_full.index)
-
-                        sig = int(sigs.iloc[-1])
-                        ts_log(f"Candle closed [{last_time}] | EMA {ema_f:.2f}/{ema_s_val:.2f} | sig={sig}", "info")
-
-                        if sig != 0:
-                            # Overlap check
-                            if cfg.get("no_overlap", True):
-                                last_trades = ts_get("live_trades", [])
-                                if last_trades:
-                                    try:
-                                        lt_exit = datetime.strptime(
-                                            str(last_trades[-1]["exit_time"]), "%Y-%m-%d %H:%M:%S"
-                                        )
-                                        if datetime.now(IST) < IST.localize(lt_exit):
-                                            ts_log("Overlap prevented", "warn")
-                                            time.sleep(1.5)
-                                            continue
-                                    except Exception:
-                                        pass
-
-                            trade_type = "buy" if sig == 1 else "sell"
-                            ts_log(f"Signal: {trade_type.upper()} on {interval} candle — queued for next open", "info")
-                            pending_entry_signal = {
-                                "type":               trade_type,
-                                "signal_candle_time": last_time,
-                            }
-
-        except Exception as e:
-            import traceback
-            err_msg = f"{type(e).__name__}: {e}"
-            ts_log(f"Live loop error: {err_msg}", "warn")
-            ts_set("live_error", err_msg)
-            # Do NOT break — keep the thread alive through transient errors
-
-        time.sleep(1.5)  # Respect yfinance API rate limits
-
-    ts_log("Live trading stopped", "warn")
     ts_set("live_running", False)
+    ts_log("Live trading stopped ⏹", "warn")
+
+
+def start_live_trading(cfg: Dict) -> None:
+    # Clear any leftover position/cooldown from previous session
+    ts_set("live_position",  None)
+    ts_set("cooldown_until", None)
+    ts_set("live_error",     None)
+    ts_set("config",         cfg)
+    ts_set("live_running",   True)
+    stop_ev = threading.Event()
+    ts_set("stop_event", stop_ev)
+    t = threading.Thread(target=live_trading_loop, args=(stop_ev,), daemon=True)
+    ts_set("live_thread", t)
+    t.start()
+
+
+def stop_live_trading() -> None:
+    ev = ts_get("stop_event")
+    if ev:
+        ev.set()
+    ts_set("live_running", False)
+
+
+def squareoff_position() -> None:
+    pos = ts_get("live_position")
+    if pos is None:
+        return
+    ltp  = ts_get("ltp") or pos["entry_price"]
+    sign = 1 if pos["type"] == "buy" else -1
+    pnl  = round(sign * (ltp - pos["entry_price"]) * pos.get("quantity", 1), 2)
+    trade = {
+        **pos,
+        "exit_time":   datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S"),
+        "exit_price":  round(float(ltp), 2),
+        "exit_reason": "Manual Squareoff",
+        "pnl":         pnl,
+        "pnl_pct":     round(sign * (ltp - pos["entry_price"]) / pos["entry_price"] * 100, 2),
+        "source":      "live",
+    }
+    ts_append("live_trades", trade)
+    ts_set("live_position", None)
+    ts_log(f"Manual SQUAREOFF {pos['type'].upper()} @ {ltp:.2f} | P&L: {pnl:+.2f}", "exit")
+
 
 @st.cache_data(ttl=6)
 def _get_ltp_cached(symbol: str) -> Optional[float]:
-    """Cached LTP — max one real API call every 6 seconds per symbol."""
     return get_ltp(symbol)
 
+
 def ui_ltp(symbol: str) -> Optional[float]:
-    """
-    Return LTP for UI rendering.
-    When live trading is running the background thread already keeps _TS['ltp']
-    fresh every 1.5s — use that directly to avoid any extra API call.
-    When idle, use the short-TTL cached fetcher.
-    """
     if ts_get("live_running", False):
         v = ts_get("ltp")
         if v is not None:
@@ -1863,170 +1830,130 @@ def ui_ltp(symbol: str) -> Optional[float]:
 
 
 # ================================================================
-# BACKTEST NATURAL-LANGUAGE SUMMARY
+# LIVE DASHBOARD FRAGMENT  (module-level so Streamlit tracks it)
+# Must be defined OUTSIDE any render function for stable identity.
 # ================================================================
-def generate_backtest_summary(trades: List[Dict], summary: Dict, cfg: Dict) -> str:
-    """Plain-English advisor analysing backtest results and recommending SL/target tweaks."""
-    if not trades:
-        return "No trades were generated. Try a longer period or different strategy."
+@st.fragment(run_every=1.5)
+def _live_dashboard():
+    """Auto-refreshing fragment — reads from _TS (thread memory, zero API calls)."""
+    cfg      = ts_get("config") or {}
+    running  = ts_get("live_running", False)
+    ltp      = ts_get("ltp")
+    ema_f    = ts_get("ema_fast_val")
+    ema_s    = ts_get("ema_slow_val")
+    last_c   = ts_get("last_candle")
+    position = ts_get("live_position")
+    tick     = ts_get("tick_count", 0)
+    err      = ts_get("live_error")
+    live_trades = ts_get("live_trades", [])
 
-    total   = summary["total_trades"]
-    acc     = summary["accuracy"]
-    pf      = summary["profit_factor"]
-    tot_pnl = summary["total_pnl"]
-    avg_win = summary["avg_win"]
-    avg_loss= summary["avg_loss"]
-    viol    = summary["violation_count"]
-    sl_pts  = cfg.get("sl_points",    10)
-    tgt_pts = cfg.get("target_points", 20)
-    sl_type = cfg.get("sl_type",  "Custom Points")
-    strategy= cfg.get("strategy", "")
+    ticker_name = cfg.get("ticker_name", cfg.get("symbol", "—"))
 
-    wins  = [t for t in trades if t["pnl"] > 0]
-    loses = [t for t in trades if t["pnl"] <= 0]
-    lines = []
+    # ── Status bar ───────────────────────────────────────────
+    status_badge = badge("● RUNNING", "run") if running else badge("■ STOPPED", "stop")
+    ltp_str  = f"{ltp:.2f}"  if ltp   is not None else "—"
+    emaf_str = f"{ema_f:.2f}" if ema_f is not None else "—"
+    emas_str = f"{ema_s:.2f}" if ema_s is not None else "—"
 
-    # ── Overall verdict ──────────────────────────────────────────
-    if acc >= 60 and pf >= 1.5:
-        verdict = "✅ **Strong setup.**"
-    elif acc >= 50 and pf >= 1.0:
-        verdict = "🟡 **Moderate setup — room to improve.**"
-    else:
-        verdict = "🔴 **Weak setup — significant adjustments needed.**"
-    lines.append(f"{verdict} {total} trades · {acc}% accuracy · Profit Factor {pf:.2f} · Total P&L **{tot_pnl:+.2f}**")
+    # Unrealized P&L
+    unreal_pnl = None
+    if position is not None and ltp is not None:
+        sign = 1 if position["type"] == "buy" else -1
+        unreal_pnl = sign * (ltp - position["entry_price"]) * position.get("quantity", 1)
 
-    # ── R:R analysis ─────────────────────────────────────────────
-    if wins and loses and avg_loss != 0:
-        rr = abs(avg_win / avg_loss)
-        if rr < 1.0:
-            lines.append(
-                f"⚠️ **Inverted R:R ({rr:.2f}×).** Avg win {avg_win:.2f} < avg loss {abs(avg_loss):.2f}. "
-                f"Raise target to at least **{round(abs(avg_loss)*1.8, 1)} pts** (1.8× your avg loss) "
-                f"or tighten SL so losses are smaller."
-            )
-        elif rr < 1.5:
-            lines.append(
-                f"🟡 R:R is {rr:.2f}×. To be robustly profitable, aim for ≥ 2×. "
-                f"Either widen target to **{round(abs(avg_loss)*2.0, 1)} pts** or tighten SL."
-            )
-        else:
-            lines.append(f"✅ Good R:R of {rr:.2f}× (avg win {avg_win:.2f} / avg loss {abs(avg_loss):.2f}).")
+    # Session totals
+    sess_pnl  = sum(t["pnl"] for t in live_trades) if live_trades else 0.0
+    sess_wins = sum(1 for t in live_trades if t["pnl"] > 0)
+    sess_tot  = len(live_trades)
+    sess_acc  = round(sess_wins / sess_tot * 100, 1) if sess_tot > 0 else 0.0
 
-    # ── SL analysis ───────────────────────────────────────────────
-    sl_hits = [t for t in loses if "SL" in t.get("exit_reason", "")]
-    if sl_hits:
-        pct_sl = len(sl_hits)/total*100
-        lines.append(f"📉 **{len(sl_hits)} SL hits ({pct_sl:.0f}% of trades).**")
+    # ── Metric row ────────────────────────────────────────────
+    c1, c2, c3, c4, c5, c6 = st.columns(6)
+    pnl_col  = "#3fb950" if (unreal_pnl or 0) >= 0 else "#f85149"
+    spnl_col = "#3fb950" if sess_pnl >= 0 else "#f85149"
+    pnl_disp = f"{unreal_pnl:+.2f}" if unreal_pnl is not None else "—"
+    with c1:
+        st.markdown(f'<div class="metric-card"><div class="metric-label">LTP ({ticker_name})</div><div class="metric-value">{ltp_str}</div></div>', unsafe_allow_html=True)
+    with c2:
+        st.markdown(f'<div class="metric-card"><div class="metric-label">EMA {cfg.get("ema_fast",9)}</div><div class="metric-value" style="color:#f0a500">{emaf_str}</div></div>', unsafe_allow_html=True)
+    with c3:
+        st.markdown(f'<div class="metric-card"><div class="metric-label">EMA {cfg.get("ema_slow",15)}</div><div class="metric-value" style="color:#58a6ff">{emas_str}</div></div>', unsafe_allow_html=True)
+    with c4:
+        st.markdown(f'<div class="metric-card"><div class="metric-label">Unrealized P&L</div><div class="metric-value" style="color:{pnl_col}">{pnl_disp}</div></div>', unsafe_allow_html=True)
+    with c5:
+        st.markdown(f'<div class="metric-card"><div class="metric-label">Session P&L</div><div class="metric-value" style="color:{spnl_col}">{sess_pnl:+.2f}</div></div>', unsafe_allow_html=True)
+    with c6:
+        st.markdown(f'<div class="metric-card"><div class="metric-label">Status | Tick</div><div class="metric-value" style="font-size:12px">{status_badge} #{tick}</div></div>', unsafe_allow_html=True)
 
-        buy_sl = [t for t in sl_hits if t.get("type") == "buy"]
-        sell_sl= [t for t in sl_hits if t.get("type") == "sell"]
+    st.markdown("---")
 
-        if buy_sl and sl_type == "Custom Points":
-            avg_gap = sum(abs(t["entry_price"] - t.get("entry_low", t["entry_price"])) for t in buy_sl) / len(buy_sl)
-            if avg_gap > sl_pts * 1.15:
-                lines.append(
-                    f"💡 **SL too tight on BUY entries.** Candle Low averages **{avg_gap:.1f} pts** below entry "
-                    f"but SL = {sl_pts} pts → candle wicks are stopping you out. "
-                    f"**Set SL ≥ {round(avg_gap*1.15, 1)} pts** (15% buffer) or switch to **ATR Based SL**."
-                )
-        if sell_sl and sl_type == "Custom Points":
-            avg_gap = sum(abs(t["entry_price"] - t.get("entry_high", t["entry_price"])) for t in sell_sl) / len(sell_sl)
-            if avg_gap > sl_pts * 1.15:
-                lines.append(
-                    f"💡 **SL too tight on SELL entries.** Candle High averages **{avg_gap:.1f} pts** above entry "
-                    f"but SL = {sl_pts} pts. **Set SL ≥ {round(avg_gap*1.15, 1)} pts**."
-                )
-        if pct_sl > 40 and sl_type not in ("ATR Based","Auto SL","Trail with Swing Low/High"):
-            lines.append(
-                "💡 With >40% SL hits, consider **ATR Based SL** (multiplier 1.5–2.0) or "
-                "**Trail with Swing Low/High** for dynamic placement."
-            )
+    # ── Last candle ───────────────────────────────────────────
+    if last_c:
+        st.markdown("##### 📊 Last Fetched Candle")
+        st.markdown(f"""
+        <div class="candle-row">
+          <div class="candle-field"><div class="candle-flabel">Time</div><div class="candle-fval" style="font-size:11px">{last_c.get('time','—')}</div></div>
+          <div class="candle-field"><div class="candle-flabel">Open</div><div class="candle-fval">{last_c.get('open','—')}</div></div>
+          <div class="candle-field"><div class="candle-flabel">High</div><div class="candle-fval" style="color:#3fb950">{last_c.get('high','—')}</div></div>
+          <div class="candle-field"><div class="candle-flabel">Low</div><div class="candle-fval" style="color:#f85149">{last_c.get('low','—')}</div></div>
+          <div class="candle-field"><div class="candle-flabel">Close</div><div class="candle-fval">{last_c.get('close','—')}</div></div>
+          <div class="candle-field"><div class="candle-flabel">EMA {cfg.get('ema_fast',9)}</div><div class="candle-fval" style="color:#f0a500">{last_c.get('ema_fast','—')}</div></div>
+          <div class="candle-field"><div class="candle-flabel">EMA {cfg.get('ema_slow',15)}</div><div class="candle-fval" style="color:#58a6ff">{last_c.get('ema_slow','—')}</div></div>
+          <div class="candle-field"><div class="candle-flabel">ATR</div><div class="candle-fval">{last_c.get('atr','—')}</div></div>
+          <div class="candle-field"><div class="candle-flabel">Volume</div><div class="candle-fval" style="font-size:11px">{last_c.get('volume',0):,}</div></div>
+        </div>
+        """, unsafe_allow_html=True)
 
-    # ── Target analysis ───────────────────────────────────────────
-    tp_hits = [t for t in wins if "TP" in t.get("exit_reason","")]
-    if tp_hits:
-        buy_tp = [t for t in tp_hits if t.get("type") == "buy"]
-        if buy_tp:
-            avg_extra = sum(t.get("exit_high", t["exit_price"]) - t.get("tp1", t["exit_price"]) for t in buy_tp) / len(buy_tp)
-            if avg_extra > tgt_pts * 0.4:
-                lines.append(
-                    f"💡 **Target too conservative on BUY trades.** After hitting TP1 price ran another "
-                    f"**{avg_extra:.1f} pts** on average. "
-                    f"**Raise target to {round(tgt_pts + avg_extra*0.7, 1)} pts** or use **Trailing Target** "
-                    f"to capture more of the move."
-                )
+    # ── Active position card ──────────────────────────────────
+    if position is not None and ltp is not None:
+        st.markdown("##### 💼 Active Position")
+        st.markdown(position_card_html(position, ltp), unsafe_allow_html=True)
+    elif position is None and running:
+        st.markdown(alert_html("No active position — waiting for signal.", "info"), unsafe_allow_html=True)
 
-    # ── Violation conflicts ───────────────────────────────────────
-    if viol > 0:
-        pct_v = viol/total*100
-        lines.append(
-            f"⚡ **{viol} ambiguous bars ({pct_v:.0f}%)** — both SL and target hit in same candle. "
-            f"{'Widen SL to reduce conflicts.' if pct_v>15 else 'Acceptable level.'} "
-            f"In live trading these typically resolve as TP hits (tick-level data)."
-        )
+    # ── Session summary row ───────────────────────────────────
+    if sess_tot > 0:
+        st.markdown(f"""
+        <div class="candle-row" style="margin-top:6px">
+          <div class="candle-field"><div class="candle-flabel">Trades</div><div class="candle-fval">{sess_tot}</div></div>
+          <div class="candle-field"><div class="candle-flabel">Winners</div><div class="candle-fval" style="color:#3fb950">{sess_wins}</div></div>
+          <div class="candle-field"><div class="candle-flabel">Win Rate</div><div class="candle-fval">{sess_acc}%</div></div>
+          <div class="candle-field"><div class="candle-flabel">Session P&L</div><div class="candle-fval" style="color:{spnl_col};font-weight:700">{sess_pnl:+.2f}</div></div>
+        </div>
+        """, unsafe_allow_html=True)
 
-    # ── Strategy tips ─────────────────────────────────────────────
-    if strategy == "EMA Crossover" and acc < 50:
-        fast, slow = cfg.get("ema_fast",9), cfg.get("ema_slow",15)
-        lines.append(
-            f"📊 EMA({fast},{slow}) below 50% accuracy. Try **EMA(9,21)** or **EMA(13,34)** "
-            f"for wider separation. Enable **Min Angle Filter ≥ 5°** to filter weak crossovers."
-        )
-    elif strategy == "Elliott Wave Auto":
-        lines.append("🌊 Elliott Wave performs best on **1h/1d** timeframes with ≥ 3 months data. Use **ATR Based SL** below Wave 4.")
-    elif strategy == "Anticipatory EMA Crossover" and acc < 55:
-        lines.append("🔮 Anticipatory signals are higher-risk. Reduce position size 50% and use tighter SL (ATR × 1.0) until confidence builds.")
+    st.markdown("---")
 
-    # ── Final recommended parameters ─────────────────────────────
-    if loses and avg_loss != 0:
-        rec_sl  = max(round(abs(avg_loss) * 0.75, 1), 1.0)
-        rec_tgt = round(rec_sl * 2.0, 1)
-        breakeven_wr = round(1 / (1 + abs(avg_win/avg_loss)) * 100, 0) if avg_win else 50
-        lines.append(
-            f"\n**📌 Recommended parameters for this setup:** "
-            f"SL = **{rec_sl} pts**, Target = **{rec_tgt} pts** (2× SL). "
-            f"At 2× R:R you only need **{breakeven_wr:.0f}% win rate** to break even. "
-            f"Current accuracy is {acc}% — "
-            f"{'above breakeven ✅' if acc >= breakeven_wr else 'below breakeven ❌ — tighten SL or widen target'}."
-        )
+    # ── Elliott Wave (only when running that strategy) ────────
+    wave_res = ts_get("wave_data", {})
+    if wave_res and wave_res.get("waves"):
+        st.markdown("##### 🌊 Elliott Wave Status")
+        col_w, col_i = st.columns([2, 1])
+        with col_w:
+            st.markdown(wave_cards_html(wave_res), unsafe_allow_html=True)
+        with col_i:
+            _wnt  = wave_res.get("next_target")
+            _wsl  = wave_res.get("sl")
+            _wtp1 = wave_res.get("tp1")
+            _wtp2 = wave_res.get("tp2")
+            st.markdown(config_box_html({
+                "Status":       wave_res.get("status", "—"),
+                "Current Wave": wave_res.get("current_wave", "—"),
+                "Direction":    wave_res.get("direction",    "—"),
+                "Next Target":  f"{_wnt:.2f}"  if _wnt  is not None else "—",
+                "Signal":       wave_res.get("signal",       "—"),
+                "Wave SL":      f"{_wsl:.2f}"  if _wsl  is not None else "—",
+                "TP1":          f"{_wtp1:.2f}" if _wtp1 is not None else "—",
+                "TP2":          f"{_wtp2:.2f}" if _wtp2 is not None else "—",
+            }), unsafe_allow_html=True)
 
-    return "\n\n".join(lines)
+    # ── Live log ──────────────────────────────────────────────
+    st.markdown("##### 📝 Live Log")
+    log_entries = ts_get("live_log", [])
+    st.markdown(log_html(log_entries), unsafe_allow_html=True)
 
-
-def start_live_trading(cfg: Dict):
-    ts_set("config",        cfg)
-    ts_set("live_running",  True)
-    ts_set("live_error",    None)
-    stop_ev = threading.Event()
-    ts_set("stop_event",    stop_ev)
-    t = threading.Thread(target=live_trading_loop, args=(stop_ev,), daemon=True)
-    ts_set("live_thread",   t)
-    t.start()
-
-def stop_live_trading():
-    ev = ts_get("stop_event")
-    if ev:
-        ev.set()
-    ts_set("live_running", False)
-
-def squareoff_position():
-    pos = ts_get("live_position")
-    if pos:
-        ltp = ts_get("ltp") or pos["entry_price"]
-        sign = 1 if pos["type"] == "buy" else -1
-        pnl  = sign * (ltp - pos["entry_price"]) * pos.get("quantity", 1)
-        trade = {
-            **pos,
-            "exit_time":   datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S"),
-            "exit_price":  round(float(ltp), 2),
-            "exit_reason": "Manual Squareoff",
-            "pnl":         round(pnl, 2),
-            "pnl_pct":     round(sign * (ltp - pos["entry_price"]) / pos["entry_price"] * 100, 2),
-            "source":      "live",
-        }
-        ts_append("live_trades", trade)
-        ts_set("live_position", None)
-        ts_log(f"Manual SQUAREOFF {pos['type'].upper()} @ {ltp:.2f} | PnL: {pnl:.2f}", "exit")
+    if err:
+        st.markdown(alert_html(f"⚠️ {err}", "error"), unsafe_allow_html=True)
 
 
 # ================================================================
@@ -2817,26 +2744,33 @@ def render_backtest_tab(cfg: Dict):
 def render_live_tab(cfg: Dict):
     """
     Live Trading tab.
-    Control buttons (Start/Stop/Squareoff) are outside the fragment — they fire instantly.
-    All live metrics live inside @st.fragment(run_every=1.5) which auto-updates
-    without refreshing the whole page (no flickering).
+    Control buttons are outside the fragment (instant response).
+    _live_dashboard() is a module-level fragment that auto-refreshes every 1.5s.
     """
-    # ── Control buttons (OUTSIDE fragment — instant click response) ──
+    # ── Control buttons ──────────────────────────────────────
     is_running = ts_get("live_running", False)
 
     b1, b2, b3 = st.columns(3)
     with b1:
-        start_clicked = st.button("▶ Start",      key="lv_start", disabled=is_running,
-                                   use_container_width=True, type="primary")
+        start_clicked = st.button(
+            "▶ Start", key="lv_start",
+            disabled=is_running,
+            use_container_width=True, type="primary",
+        )
     with b2:
-        stop_clicked  = st.button("⏹ Stop",       key="lv_stop",  disabled=not is_running,
-                                   use_container_width=True)
+        stop_clicked = st.button(
+            "⏹ Stop", key="lv_stop",
+            disabled=not is_running,
+            use_container_width=True,
+        )
     with b3:
-        sq_clicked    = st.button("⚡ Squareoff",  key="lv_sq",    use_container_width=True)
+        sq_clicked = st.button(
+            "⚡ Squareoff", key="lv_sq",
+            use_container_width=True,
+        )
 
     if start_clicked:
         start_live_trading(cfg)
-        st.session_state["lv_just_started"] = True
         st.rerun()
 
     if stop_clicked:
@@ -2845,158 +2779,42 @@ def render_live_tab(cfg: Dict):
 
     if sq_clicked:
         squareoff_position()
+        st.rerun()
 
-    # ── Config display (shown once after start — static, no flicker) ──
-    is_running = ts_get("live_running", False)   # re-read after button handlers
+    # Show config when running (static — no flicker)
+    is_running = ts_get("live_running", False)
     if is_running:
         with st.expander("⚙️ Active Configuration", expanded=False):
             c1, c2 = st.columns(2)
             with c1:
                 st.markdown(config_box_html({
-                    "Ticker":    cfg["ticker_name"],
-                    "Symbol":    cfg["symbol"],
-                    "Timeframe": cfg["interval"],
-                    "Period":    cfg["period"],
-                    "Strategy":  cfg["strategy"],
-                    "Quantity":  cfg["quantity"],
+                    "Ticker":    cfg.get("ticker_name", "—"),
+                    "Symbol":    cfg.get("symbol", "—"),
+                    "Timeframe": cfg.get("interval", "—"),
+                    "Period":    cfg.get("period", "—"),
+                    "Strategy":  cfg.get("strategy", "—"),
+                    "Quantity":  cfg.get("quantity", 1),
                 }), unsafe_allow_html=True)
             with c2:
                 st.markdown(config_box_html({
-                    "EMA Fast":   cfg["ema_fast"],
-                    "EMA Slow":   cfg["ema_slow"],
-                    "SL Type":    cfg["sl_type"],
-                    "SL Points":  cfg["sl_points"],
-                    "Target":     cfg["target_type"],
-                    "Tgt Points": cfg["target_points"],
-                    "Cooldown":   f"{cfg['cooldown_seconds']}s" if cfg["cooldown_enabled"] else "Off",
-                    "No Overlap": "Yes" if cfg["no_overlap"] else "No",
-                    "Dhan":       "Enabled" if cfg["dhan_enabled"] else "Disabled",
+                    "EMA Fast":   cfg.get("ema_fast", 9),
+                    "EMA Slow":   cfg.get("ema_slow", 15),
+                    "SL Type":    cfg.get("sl_type", "—"),
+                    "SL Points":  cfg.get("sl_points", 10),
+                    "Target":     cfg.get("target_type", "—"),
+                    "Tgt Points": cfg.get("target_points", 20),
+                    "Cooldown":   f"{cfg.get('cooldown_seconds',5)}s"
+                                   if cfg.get("cooldown_enabled") else "Off",
+                    "No Overlap": "Yes" if cfg.get("no_overlap") else "No",
+                    "Dhan":       "Enabled" if cfg.get("dhan_enabled") else "Disabled",
                 }), unsafe_allow_html=True)
 
     st.markdown("---")
 
-    # ──────────────────────────────────────────────────────────────
-    # AUTO-REFRESHING FRAGMENT — updates every 1.5 s independently
-    # without touching the control buttons above (zero flicker)
-    # ──────────────────────────────────────────────────────────────
-    @st.fragment(run_every=1.5)
-    def _live_metrics_fragment():
-        running  = ts_get("live_running", False)
-        ltp      = ts_get("ltp")
-        ema_f    = ts_get("ema_fast_val")
-        ema_s    = ts_get("ema_slow_val")
-        last_c   = ts_get("last_candle")
-        position = ts_get("live_position")
-        tick     = ts_get("tick_count", 0)
-        err      = ts_get("live_error")
+    # ── Auto-refreshing dashboard (module-level fragment) ─────
+    _live_dashboard()
 
-        # ── LTP bar ──────────────────────────────────────────
-        st.markdown(ltp_bar_html(cfg["ticker_name"], ltp), unsafe_allow_html=True)
 
-        # ── Quick metric row ─────────────────────────────────
-        ltp_str  = f"{ltp:.2f}"  if ltp   is not None else "—"
-        emaf_str = f"{ema_f:.2f}" if ema_f is not None else "—"
-        emas_str = f"{ema_s:.2f}" if ema_s is not None else "—"
-        status_badge = badge("RUNNING","run") if running else badge("STOPPED","stop")
-        tick_str     = f"Tick #{tick}" if running else "—"
-
-        # Unrealized P&L for the metric row
-        unreal_pnl = None
-        if position is not None and ltp is not None:
-            sign = 1 if position["type"] == "buy" else -1
-            unreal_pnl = sign * (ltp - position["entry_price"]) * position.get("quantity", 1)
-
-        m1, m2, m3, m4, m5 = st.columns(5)
-        with m1:
-            st.markdown(f'<div class="metric-card"><div class="metric-label">LTP</div><div class="metric-value">{ltp_str}</div></div>', unsafe_allow_html=True)
-        with m2:
-            st.markdown(f'<div class="metric-card"><div class="metric-label">EMA {cfg["ema_fast"]}</div><div class="metric-value" style="color:#f0a500">{emaf_str}</div></div>', unsafe_allow_html=True)
-        with m3:
-            st.markdown(f'<div class="metric-card"><div class="metric-label">EMA {cfg["ema_slow"]}</div><div class="metric-value" style="color:#58a6ff">{emas_str}</div></div>', unsafe_allow_html=True)
-        with m4:
-            pnl_str   = f"{unreal_pnl:+.2f}" if unreal_pnl is not None else "—"
-            pnl_color = "#3fb950" if (unreal_pnl or 0) >= 0 else "#f85149"
-            st.markdown(f'<div class="metric-card"><div class="metric-label">Unrealized P&L</div><div class="metric-value" style="color:{pnl_color}">{pnl_str}</div></div>', unsafe_allow_html=True)
-        with m5:
-            st.markdown(f'<div class="metric-card"><div class="metric-label">Status</div><div class="metric-value" style="font-size:13px">{status_badge}<br><small>{tick_str}</small></div></div>', unsafe_allow_html=True)
-
-        st.markdown("---")
-
-        # ── Last fetched candle ───────────────────────────────
-        if last_c:
-            st.markdown("#### 📊 Last Fetched Candle")
-            st.markdown(f"""
-            <div class="candle-row">
-              <div class="candle-field"><div class="candle-flabel">Time</div><div class="candle-fval" style="font-size:12px">{last_c['time'][:16]}</div></div>
-              <div class="candle-field"><div class="candle-flabel">Open</div><div class="candle-fval">{last_c['open']}</div></div>
-              <div class="candle-field"><div class="candle-flabel">High</div><div class="candle-fval" style="color:#3fb950">{last_c['high']}</div></div>
-              <div class="candle-field"><div class="candle-flabel">Low</div><div class="candle-fval" style="color:#f85149">{last_c['low']}</div></div>
-              <div class="candle-field"><div class="candle-flabel">Close</div><div class="candle-fval">{last_c['close']}</div></div>
-              <div class="candle-field"><div class="candle-flabel">EMA {cfg['ema_fast']}</div><div class="candle-fval" style="color:#f0a500">{last_c.get('ema_fast','—')}</div></div>
-              <div class="candle-field"><div class="candle-flabel">EMA {cfg['ema_slow']}</div><div class="candle-fval" style="color:#58a6ff">{last_c.get('ema_slow','—')}</div></div>
-              <div class="candle-field"><div class="candle-flabel">ATR</div><div class="candle-fval">{last_c.get('atr','—')}</div></div>
-              <div class="candle-field"><div class="candle-flabel">Volume</div><div class="candle-fval" style="font-size:11px">{last_c.get('volume',0):,}</div></div>
-            </div>
-            """, unsafe_allow_html=True)
-
-        # ── Active Position card ──────────────────────────────
-        if position is not None and ltp is not None:
-            st.markdown("#### 💼 Active Position")
-            st.markdown(position_card_html(position, ltp), unsafe_allow_html=True)
-        elif position is None and running:
-            st.markdown(alert_html("No active position — waiting for signal.", "info"), unsafe_allow_html=True)
-
-        # ── Session P&L summary (running totals) ─────────────
-        live_trades = ts_get("live_trades", [])
-        if live_trades:
-            sess_pnl  = sum(t["pnl"] for t in live_trades)
-            sess_wins = sum(1 for t in live_trades if t["pnl"] > 0)
-            sess_acc  = round(sess_wins / len(live_trades) * 100, 1)
-            pnl_col   = "#3fb950" if sess_pnl >= 0 else "#f85149"
-            st.markdown(f"""
-            <div class="candle-row" style="margin-top:8px">
-              <div class="candle-field"><div class="candle-flabel">Session Trades</div><div class="candle-fval">{len(live_trades)}</div></div>
-              <div class="candle-field"><div class="candle-flabel">Wins</div><div class="candle-fval" style="color:#3fb950">{sess_wins}</div></div>
-              <div class="candle-field"><div class="candle-flabel">Win Rate</div><div class="candle-fval">{sess_acc}%</div></div>
-              <div class="candle-field"><div class="candle-flabel">Session P&L</div><div class="candle-fval" style="color:{pnl_col};font-weight:700">{sess_pnl:+.2f}</div></div>
-            </div>
-            """, unsafe_allow_html=True)
-
-        st.markdown("---")
-
-        # ── Elliott Wave ──────────────────────────────────────
-        wave_res = ts_get("wave_data", {})
-        if wave_res and wave_res.get("status") != "Analyzing...":
-            st.markdown("#### 🌊 Elliott Wave Analysis")
-            col_w, col_i = st.columns([2, 1])
-            with col_w:
-                st.markdown(wave_cards_html(wave_res), unsafe_allow_html=True)
-            with col_i:
-                _wnt  = wave_res.get("next_target")
-                _wsl  = wave_res.get("sl")
-                _wtp1 = wave_res.get("tp1")
-                _wtp2 = wave_res.get("tp2")
-                st.markdown(config_box_html({
-                    "Status":       wave_res.get("status", "—"),
-                    "Current Wave": wave_res.get("current_wave", "—"),
-                    "Direction":    wave_res.get("direction",    "—"),
-                    "Next Target":  f"{_wnt:.2f}"  if _wnt  is not None else "—",
-                    "Signal":       wave_res.get("signal",       "—"),
-                    "Wave SL":      f"{_wsl:.2f}"  if _wsl  is not None else "—",
-                    "TP1":          f"{_wtp1:.2f}" if _wtp1 is not None else "—",
-                    "TP2":          f"{_wtp2:.2f}" if _wtp2 is not None else "—",
-                }), unsafe_allow_html=True)
-
-        # ── Live log ─────────────────────────────────────────
-        st.markdown("#### 📝 Live Log")
-        log_entries = ts_get("live_log", [])
-        st.markdown(log_html(log_entries), unsafe_allow_html=True)
-
-        if err:
-            st.markdown(alert_html(f"⚠️ Last error: {err}", "error"), unsafe_allow_html=True)
-
-    # Call the fragment (it auto-schedules its own 1.5s re-runs)
-    _live_metrics_fragment()
 
 
 # ================================================================
