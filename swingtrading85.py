@@ -666,45 +666,75 @@ def _log(msg):
 
 def live_engine(cfg):
     """
-    Background thread.
-    ─ Simple Buy/Sell → fire immediately on FIRST loop iteration.
-    ─ EMA strategies  → wait for candle boundary, entry on N+1 open.
-    ─ SL/Target       → checked vs LTP every tick (not candle low/high).
-    ─ Rate limit      → ≥1.5s between yfinance requests.
+    Background thread – runs until ts_get('running') is False.
+
+    KEY RULES:
+    • Simple Buy/Sell  → enter IMMEDIATELY on first loop, no candle boundary wait.
+    • EMA strategies   → wait for candle boundary; entry price = N+1 candle open.
+    • SL / Target      → monitored vs LTP every tick (not vs candle high/low).
+    • Rate limit       → ≥ 1.5 s between yfinance requests.
+    • ts_set('running',True) is already set by UI before thread starts — do NOT
+      clear/reset here to avoid race condition.
     """
-    ticker   = cfg["ticker"];        tf       = cfg["timeframe"]
-    strategy = cfg["strategy"];      fast     = cfg["fast_ema"];  slow  = cfg["slow_ema"]
-    sl_type  = cfg["sl_type"];       tgt_type = cfg["target_type"]
-    csl      = cfg["custom_sl"];     ctgt     = cfg["custom_target"]
-    asl      = cfg.get("atr_mult_sl",2.0); atgt=cfg.get("atr_mult_target",3.0); rr=cfg.get("rr_ratio",2.0)
-    qty      = cfg["quantity"];      cd_on    = cfg.get("cooldown_enabled",True); cd_s=cfg.get("cooldown_secs",5)
-    no_ovlp  = cfg.get("no_overlap",True); dhan_on=cfg.get("dhan_enabled",False); opts_on=cfg.get("options_enabled",False)
-    tf_min   = TF_MINUTES.get(tf,5)
-    immediate= strategy in ("Simple Buy","Simple Sell")
-    first_run= True
+    ticker   = cfg["ticker"]
+    tf       = cfg["timeframe"]
+    strategy = cfg["strategy"]
+    fast     = cfg["fast_ema"]
+    slow     = cfg["slow_ema"]
+    sl_type  = cfg["sl_type"]
+    tgt_type = cfg["target_type"]
+    csl      = cfg["custom_sl"]
+    ctgt     = cfg["custom_target"]
+    asl      = cfg.get("atr_mult_sl", 2.0)
+    atgt     = cfg.get("atr_mult_target", 3.0)
+    rr       = cfg.get("rr_ratio", 2.0)
+    qty      = cfg["quantity"]
+    cd_on    = cfg.get("cooldown_enabled", True)
+    cd_s     = cfg.get("cooldown_secs", 5)
+    no_ovlp  = cfg.get("no_overlap", True)
+    dhan_on  = cfg.get("dhan_enabled", False)
+    opts_on  = cfg.get("options_enabled", False)
+    tf_min   = TF_MINUTES.get(tf, 5)
+    immediate = strategy in ("Simple Buy", "Simple Sell")
 
-    ts_set("running",True); ts_set("position",None)
-    ts_clear("log"); ts_clear("completed_trades")
-    ts_set("last_trade_time",None)
-    _log(f"🚀 STARTED  {ticker} | {tf} | {strategy}")
-    _log(f"   SL:{sl_type}  TGT:{tgt_type}  QTY:{qty}")
+    # ── Reset state (logs already cleared by UI before thread started) ──
+    ts_set("position", None)
+    ts_set("last_trade_time", None)
+    ts_set("engine_loop", 0)          # debug counter
 
-    last_fetch   = 0.0
+    _log(f"🚀 ENGINE STARTED")
+    _log(f"   Ticker   : {ticker}")
+    _log(f"   Timeframe: {tf}  |  Strategy: {strategy}")
+    _log(f"   SL: {sl_type} ({csl} pts)  |  TGT: {tgt_type} ({ctgt} pts)")
+    _log(f"   Qty: {qty}  |  Immediate: {immediate}")
+
+    last_fetch      = 0.0
     last_sig_candle = None
+    loop_count      = 0
+    entered_once    = False  # for Simple Buy/Sell: track if we've entered at least once
 
     while ts_get("running"):
+        loop_count += 1
+        ts_set("engine_loop", loop_count)
+
         try:
-            # ── Rate limit ──
-            wait=max(0.0, 1.5-(time.time()-last_fetch))
-            if wait>0: time.sleep(wait)
+            # ── Rate-limit: ≥ 1.5 s between fetches ──
+            elapsed = time.time() - last_fetch
+            if elapsed < 1.5:
+                time.sleep(1.5 - elapsed)
+
+            _log(f"⟳ Loop #{loop_count} – fetching {ticker} [{tf}]…")
 
             fetch_p = "5d" if tf in ("1m","5m","15m") else "1mo"
-            df=fetch_data(ticker, tf, fetch_p, warmup=True)
-            last_fetch=time.time()
+            df = fetch_data(ticker, tf, fetch_p, warmup=True)
+            last_fetch = time.time()
 
-            if df is None or len(df)<10:
-                _log("⚠️ No data – retrying…"); time.sleep(3); continue
+            if df is None or df.empty or len(df) < 10:
+                _log(f"⚠️ No data returned (len={len(df) if df is not None else 'None'}) – retrying in 3 s")
+                time.sleep(3)
+                continue
 
+            # ── Compute indicators ──
             df["ema_fast"] = calc_ema(df["Close"], fast)
             df["ema_slow"] = calc_ema(df["Close"], slow)
             df["atr"]      = calc_atr(df)
@@ -717,137 +747,242 @@ def live_engine(cfg):
             ts_set("ema_slow_val", float(df["ema_slow"].iloc[-1]))
             ts_set("atr_val",      float(df["atr"].iloc[-1]))
 
-            if strategy=="Elliott Wave (Auto)":
+            _log(f"   LTP={ltp:.2f}  EMA{fast}={df['ema_fast'].iloc[-1]:.2f}  EMA{slow}={df['ema_slow'].iloc[-1]:.2f}  Rows={len(df)}")
+
+            if strategy == "Elliott Wave (Auto)":
                 ts_set("ew_status", detect_elliott_waves(df))
 
-            # ── Monitor open position (vs LTP every tick) ──
-            pos=ts_get("position")
+            # ────────────────────────────────────────────────
+            # A) MONITOR OPEN POSITION vs LTP every tick
+            # ────────────────────────────────────────────────
+            pos = ts_get("position")
             if pos is not None:
-                sl=pos["sl"]; tgt=pos["target"]; tt=pos["type"]
-                sl_hit  = ltp<=sl  if tt=="buy" else ltp>=sl
-                tgt_hit = (ltp>=tgt if tt=="buy" else ltp<=tgt) and "Display Only" not in tgt_type
-                ep=None; er=None
-                if sl_hit:  ep=sl;  er="SL Hit (LTP)"
-                elif tgt_hit: ep=tgt; er="Target Hit (LTP)"
-                if ep is None and tgt_type=="EMA Crossover Exit" and len(df)>2:
-                    ef_n=float(df["ema_fast"].iloc[-1]); es_n=float(df["ema_slow"].iloc[-1])
-                    ef_p=float(df["ema_fast"].iloc[-2]); es_p=float(df["ema_slow"].iloc[-2])
-                    if tt=="buy"  and ef_p>=es_p and ef_n<es_n: ep=ltp; er="EMA Reverse Cross"
-                    if tt=="sell" and ef_p<=es_p and ef_n>es_n: ep=ltp; er="EMA Reverse Cross"
+                sl  = pos["sl"]
+                tgt = pos["target"]
+                tt  = pos["type"]
+                upnl = round((ltp - pos["entry_price"]) * (1 if tt=="buy" else -1) * qty, 2)
+
+                sl_hit  = (ltp <= sl)  if tt == "buy"  else (ltp >= sl)
+                tgt_hit = ((ltp >= tgt) if tt == "buy" else (ltp <= tgt)) \
+                          and "Display Only" not in tgt_type
+
+                _log(f"   Position: {tt.upper()} entry={pos['entry_price']:.2f} "
+                     f"SL={sl:.2f} TGT={tgt:.2f} LTP={ltp:.2f} "
+                     f"uPnL=₹{upnl:.2f}  SL_hit={sl_hit}  TGT_hit={tgt_hit}")
+
+                ep = None; er = None
+
+                # Conservative: SL first
+                if sl_hit:
+                    ep = sl;  er = "SL Hit (LTP)"
+                elif tgt_hit:
+                    ep = tgt; er = "Target Hit (LTP)"
+
+                # EMA crossover exit
+                if ep is None and tgt_type == "EMA Crossover Exit" and len(df) > 2:
+                    ef_n = float(df["ema_fast"].iloc[-1]); es_n = float(df["ema_slow"].iloc[-1])
+                    ef_p = float(df["ema_fast"].iloc[-2]); es_p = float(df["ema_slow"].iloc[-2])
+                    if tt == "buy"  and ef_p >= es_p and ef_n < es_n: ep = ltp; er = "EMA Reverse Cross"
+                    if tt == "sell" and ef_p <= es_p and ef_n > es_n: ep = ltp; er = "EMA Reverse Cross"
+
                 if ep is not None:
-                    pnl=round((ep-pos["entry_price"])*(1 if tt=="buy" else -1)*qty,2)
-                    rec={"entry_datetime":pos["entry_time"],"exit_datetime":datetime.now(IST),
-                         "type":tt,"entry_price":pos["entry_price"],"exit_price":ep,
-                         "sl":pos["initial_sl"],"target":pos["target"],
-                         "entry_reason":pos["entry_reason"],"exit_reason":er,
-                         "pnl":pnl,"quantity":qty}
-                    ts_append("completed_trades",rec); ts_set("position",None)
-                    emoji="✅" if pnl>=0 else "🔴"
+                    pnl = round((ep - pos["entry_price"]) * (1 if tt=="buy" else -1) * qty, 2)
+                    now_ist = datetime.now(IST)
+                    rec = {
+                        "entry_datetime": pos["entry_time"],
+                        "exit_datetime":  now_ist,
+                        "type":           tt,
+                        "entry_price":    pos["entry_price"],
+                        "exit_price":     round(ep, 2),
+                        "sl":             pos["initial_sl"],
+                        "target":         pos["target"],
+                        "entry_reason":   pos["entry_reason"],
+                        "exit_reason":    er,
+                        "pnl":            pnl,
+                        "quantity":       qty,
+                    }
+                    ts_append("completed_trades", rec)
+                    ts_set("position", None)
+                    emoji = "✅" if pnl >= 0 else "🔴"
                     _log(f"{emoji} EXIT {tt.upper()} @ {ep:.2f} | P&L ₹{pnl:.2f} | {er}")
+
                     if dhan_on:
                         if opts_on:
-                            sec=cfg.get("ce_security_id" if tt=="buy" else "pe_security_id","")
-                            place_options(sec,"SELL",cfg.get("options_qty",65),cfg.get("exchange_segment","NSE_FNO"),cfg.get("opt_exit_order","MARKET"),ltp)
+                            sec = cfg.get("ce_security_id" if tt=="buy" else "pe_security_id", "")
+                            place_options(sec, "SELL", cfg.get("options_qty",65),
+                                          cfg.get("exchange_segment","NSE_FNO"),
+                                          cfg.get("opt_exit_order","MARKET"), ltp)
                         else:
-                            etxn="SELL" if tt=="buy" else "BUY"
-                            place_equity(cfg.get("security_id","1594"),etxn,qty,cfg.get("product_type","INTRADAY"),cfg.get("exit_order_type","MARKET"),cfg.get("exchange","NSE"),ltp)
+                            etxn = "SELL" if tt=="buy" else "BUY"
+                            place_equity(cfg.get("security_id","1594"), etxn, qty,
+                                         cfg.get("product_type","INTRADAY"),
+                                         cfg.get("exit_order_type","MARKET"),
+                                         cfg.get("exchange","NSE"), ltp)
                 else:
-                    new_sl=update_trailing_sl(sl,ltp,tt,sl_type,df,len(df)-1,asl)
-                    if new_sl!=sl: pos["sl"]=new_sl; ts_set("position",pos)
-                continue  # don't look for entries while in trade
+                    # Update trailing SL
+                    new_sl = update_trailing_sl(sl, ltp, tt, sl_type, df, len(df)-1, asl)
+                    if new_sl != sl:
+                        pos["sl"] = new_sl
+                        ts_set("position", pos)
+                        _log(f"   ↕ Trailing SL updated: {sl:.2f} → {new_sl:.2f}")
 
-            # ── Candle boundary check ──
+                continue  # stay in monitoring loop; don't look for new entry
+
+            # ────────────────────────────────────────────────
+            # B) NO OPEN POSITION – look for entry signal
+            # ────────────────────────────────────────────────
             now_ist = datetime.now(IST)
+
+            # ── Candle boundary gate ──
             if immediate:
-                is_boundary = first_run  # only fire once immediately
+                # Simple Buy/Sell: fire on EVERY loop (re-enters after exit)
+                is_boundary = True
+                _log(f"   [immediate mode] is_boundary=True")
             else:
                 cur_candle = df.index[-2]
                 if tf_min < 1440:
-                    total_min = now_ist.hour*60 + now_ist.minute
+                    total_min  = now_ist.hour * 60 + now_ist.minute
                     is_boundary = (total_min % tf_min == 0 and
                                    now_ist.second < 15 and
                                    last_sig_candle != cur_candle)
                 else:
-                    is_boundary = last_sig_candle != cur_candle
+                    is_boundary = (last_sig_candle != cur_candle)
+                _log(f"   [candle boundary] is_boundary={is_boundary}  "
+                     f"time={now_ist.strftime('%H:%M:%S')}  "
+                     f"last_sig={last_sig_candle}  cur={cur_candle}")
 
             if not is_boundary:
-                first_run = False
-                time.sleep(1.5); continue
+                continue   # no sleep here – rate-limit at top handles timing
 
             if not immediate:
                 last_sig_candle = df.index[-2]
 
-            # ── Cooldown ──
+            # ── Cooldown (EMA strategies only) ──
             if cd_on and not immediate:
-                lt=ts_get("last_trade_time")
-                if lt and (now_ist-lt).total_seconds()<cd_s:
-                    _log(f"⏳ Cooldown ({cd_s}s)"); first_run=False; continue
+                lt = ts_get("last_trade_time")
+                if lt:
+                    elapsed_cd = (now_ist - lt).total_seconds()
+                    if elapsed_cd < cd_s:
+                        _log(f"   ⏳ Cooldown: {cd_s - elapsed_cd:.0f}s remaining")
+                        continue
 
-            # ── No-overlap ──
+            # ── No-overlap (EMA strategies only) ──
             if no_ovlp and not immediate:
-                done=ts_get("completed_trades") or []
+                done = ts_get("completed_trades") or []
                 if done:
-                    xt=done[-1].get("exit_datetime")
+                    xt = done[-1].get("exit_datetime")
                     if xt:
-                        if isinstance(xt,datetime) and xt.tzinfo is None: xt=IST.localize(xt)
-                        if (now_ist-xt).total_seconds()<30: first_run=False; continue
+                        if isinstance(xt, datetime) and xt.tzinfo is None:
+                            xt = IST.localize(xt)
+                        gap = (now_ist - xt).total_seconds()
+                        if gap < 30:
+                            _log(f"   🚫 No-overlap: last trade closed {gap:.0f}s ago (<30s)")
+                            continue
 
             # ── Generate signal ──
-            signal=None; entry_price=ltp
+            signal      = None
+            entry_price = ltp
 
-            if strategy=="Simple Buy":
-                signal="buy"; entry_price=ltp; _log("📌 Simple Buy triggered immediately")
-            elif strategy=="Simple Sell":
-                signal="sell"; entry_price=ltp; _log("📌 Simple Sell triggered immediately")
-            elif strategy=="EMA Crossover":
-                if len(df)>=3:
-                    ef_n=float(df["ema_fast"].iloc[-2]); es_n=float(df["ema_slow"].iloc[-2])
-                    ef_p=float(df["ema_fast"].iloc[-3]); es_p=float(df["ema_slow"].iloc[-3])
-                    if ef_p<=es_p and ef_n>es_n:   signal="buy"
-                    elif ef_p>=es_p and ef_n<es_n: signal="sell"
-                    if signal: entry_price=float(df["Open"].iloc[-1])
-            elif strategy=="Anticipatory EMA Crossover":
-                sig_df=gen_anticipatory_signals(df,fast,slow)
-                s=sig_df["signal"].iloc[-2] if len(sig_df)>=2 else ""
-                if s in ("buy","sell"): signal=s; entry_price=float(df["Open"].iloc[-1])
-            elif strategy=="Elliott Wave (Auto)":
-                ew=ts_get("ew_status") or {}
-                if ew.get("signal"): signal=ew["signal"]; entry_price=ltp
+            if strategy == "Simple Buy":
+                signal      = "buy"
+                entry_price = ltp
+                _log(f"   📌 Simple Buy → signal=buy @ {ltp:.2f}")
 
-            first_run=False
+            elif strategy == "Simple Sell":
+                signal      = "sell"
+                entry_price = ltp
+                _log(f"   📌 Simple Sell → signal=sell @ {ltp:.2f}")
 
-            if not signal: continue
+            elif strategy == "EMA Crossover":
+                if len(df) >= 3:
+                    ef_n = float(df["ema_fast"].iloc[-2]); es_n = float(df["ema_slow"].iloc[-2])
+                    ef_p = float(df["ema_fast"].iloc[-3]); es_p = float(df["ema_slow"].iloc[-3])
+                    _log(f"   EMA check: fast_prev={ef_p:.2f} slow_prev={es_p:.2f} "
+                         f"fast_now={ef_n:.2f} slow_now={es_n:.2f}")
+                    if ef_p <= es_p and ef_n > es_n:
+                        signal      = "buy"
+                        entry_price = float(df["Open"].iloc[-1])
+                        _log(f"   ✳ Bullish crossover detected → buy @ {entry_price:.2f}")
+                    elif ef_p >= es_p and ef_n < es_n:
+                        signal      = "sell"
+                        entry_price = float(df["Open"].iloc[-1])
+                        _log(f"   ✳ Bearish crossover detected → sell @ {entry_price:.2f}")
+                    else:
+                        _log(f"   No crossover this candle")
+                else:
+                    _log(f"   ⚠️ Not enough rows for EMA check (len={len(df)})")
 
-            tf_filter=cfg.get("trade_filter","Both")
-            if tf_filter=="Buy Only"  and signal!="buy":  continue
-            if tf_filter=="Sell Only" and signal!="sell": continue
+            elif strategy == "Anticipatory EMA Crossover":
+                sig_df = gen_anticipatory_signals(df, fast, slow)
+                s = sig_df["signal"].iloc[-2] if len(sig_df) >= 2 else ""
+                _log(f"   Anticipatory signal on candle[-2]: '{s}'")
+                if s in ("buy","sell"):
+                    signal      = s
+                    entry_price = float(df["Open"].iloc[-1])
 
-            # ── SL / Target ──
-            sl=calc_sl(df,len(df)-1,signal,sl_type,csl,asl,rr)
-            tgt=calc_target(df,len(df)-1,signal,tgt_type,entry_price,sl,ctgt,atgt,rr)
-            if strategy=="Elliott Wave (Auto)":
-                ew=ts_get("ew_status") or {}
-                if ew.get("auto_sl"):     sl=ew["auto_sl"]
-                if ew.get("auto_target"): tgt=ew["auto_target"]
+            elif strategy == "Elliott Wave (Auto)":
+                ew = ts_get("ew_status") or {}
+                _log(f"   Elliott Wave signal: {ew.get('signal','none')}")
+                if ew.get("signal"):
+                    signal      = ew["signal"]
+                    entry_price = ltp
 
-            pos={"entry_time":now_ist,"entry_price":entry_price,"type":signal,
-                 "sl":sl,"initial_sl":sl,"target":tgt,"entry_reason":f"{strategy} Signal","quantity":qty}
-            ts_set("position",pos); ts_set("last_trade_time",now_ist)
-            _log(f"📈 ENTRY {signal.upper()} @ {entry_price:.2f} | SL {sl:.2f} | TGT {tgt:.2f}")
+            # ── Direction filter ──
+            tf_filter = cfg.get("trade_filter","Both")
+            if signal and tf_filter == "Buy Only"  and signal != "buy":
+                _log(f"   Direction filter (Buy Only) blocked {signal}"); signal = None
+            if signal and tf_filter == "Sell Only" and signal != "sell":
+                _log(f"   Direction filter (Sell Only) blocked {signal}"); signal = None
+
+            if not signal:
+                _log(f"   No signal this cycle – waiting…")
+                continue
+
+            # ── Compute SL / Target ──
+            sl  = calc_sl(df, len(df)-1, signal, sl_type, csl, asl, rr)
+            tgt = calc_target(df, len(df)-1, signal, tgt_type, entry_price, sl, ctgt, atgt, rr)
+
+            if strategy == "Elliott Wave (Auto)":
+                ew = ts_get("ew_status") or {}
+                if ew.get("auto_sl"):     sl  = ew["auto_sl"]
+                if ew.get("auto_target"): tgt = ew["auto_target"]
+
+            # ── Open position ──
+            pos = {
+                "entry_time":   now_ist,
+                "entry_price":  round(entry_price, 2),
+                "type":         signal,
+                "sl":           round(sl, 2),
+                "initial_sl":   round(sl, 2),
+                "target":       round(tgt, 2),
+                "entry_reason": f"{strategy} Signal",
+                "quantity":     qty,
+            }
+            ts_set("position", pos)
+            ts_set("last_trade_time", now_ist)
+            _log(f"📈 ENTRY {signal.upper()} @ {entry_price:.2f} | SL={sl:.2f} | TGT={tgt:.2f}")
 
             if dhan_on:
                 if opts_on:
-                    sec=cfg.get("ce_security_id","") if signal=="buy" else cfg.get("pe_security_id","")
-                    r=place_options(sec,"BUY",cfg.get("options_qty",65),cfg.get("exchange_segment","NSE_FNO"),cfg.get("opt_entry_order","MARKET"),ltp)
+                    sec = cfg.get("ce_security_id","") if signal=="buy" else cfg.get("pe_security_id","")
+                    r = place_options(sec, "BUY", cfg.get("options_qty",65),
+                                      cfg.get("exchange_segment","NSE_FNO"),
+                                      cfg.get("opt_entry_order","MARKET"), ltp)
                 else:
-                    txn="BUY" if signal=="buy" else "SELL"
-                    r=place_equity(cfg.get("security_id","1594"),txn,qty,cfg.get("product_type","INTRADAY"),cfg.get("entry_order_type","LIMIT"),cfg.get("exchange","NSE"),ltp)
-                _log(f"   Order: {r.get('status','?')} – {r.get('message',r.get('error',''))}")
+                    txn = "BUY" if signal=="buy" else "SELL"
+                    r = place_equity(cfg.get("security_id","1594"), txn, qty,
+                                     cfg.get("product_type","INTRADAY"),
+                                     cfg.get("entry_order_type","LIMIT"),
+                                     cfg.get("exchange","NSE"), ltp)
+                _log(f"   Order: {r.get('status','?')} – {r.get('message', r.get('error',''))}")
 
-        except Exception as e:
-            _log(f"❌ Engine error: {e}"); time.sleep(3)
+        except Exception as exc:
+            import traceback
+            _log(f"❌ ENGINE ERROR: {exc}")
+            _log(f"   Traceback: {traceback.format_exc().splitlines()[-1]}")
+            time.sleep(3)
 
-    _log("🛑 STOPPED")
+    _log("🛑 ENGINE STOPPED")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # HELPERS
@@ -1114,10 +1249,21 @@ def main():
                 options_qty=opts_qty, exchange_segment=exc_segment,
                 opt_entry_order=opt_entry, opt_exit_order=opt_exit,
             )
+            # ── CRITICAL: set running=True and clear state BEFORE thread starts
+            #    so UI shows LIVE on the very next rerun (no race condition)
+            ts_set("running", True)
             ts_set("config", live_cfg)
+            ts_set("position", None)
+            ts_set("ltp", None)
+            ts_set("df", None)
+            ts_clear("log")
+            ts_clear("completed_trades")
+            ts_set("engine_loop", 0)
+
             t = threading.Thread(target=live_engine, args=(live_cfg,), daemon=True)
             t.start()
             st.session_state["live_thread"] = t
+            time.sleep(0.15)   # brief yield so thread can log its startup messages
             st.rerun()
 
         if stop_clicked and is_running:
@@ -1262,25 +1408,53 @@ def main():
                 st.markdown("<br>", unsafe_allow_html=True)
                 st.markdown(mcard("ATR", f"{atr_v:.2f}", "#FFD93D"), unsafe_allow_html=True)
 
-        # ── Live Log ──
+        # ── Activity Log ──
         st.markdown("#### 📋 Activity Log")
         logs = ts_get("log") or []
         if logs:
-            lines=""
-            for e in reversed(logs[-80:]):
-                clr=("#00E5CC" if "ENTRY" in e or "started" in e.lower()
-                     else "#ff4d6d" if "❌" in e or "🔴" in e
-                     else "#FFD93D" if "⚠️" in e
-                     else "#FF9F43" if "STOP" in e
-                     else "#00c896" if "✅" in e
-                     else "#5a7fa8")
-                lines+=f'<div class="log-entry" style="color:{clr};margin:1px 0">{e}</div>'
+            lines = ""
+            for e in reversed(logs[-100:]):
+                if   "ENTRY" in e or "🚀" in e:   clr = "#00E5CC"
+                elif "❌" in e or "🔴" in e:       clr = "#ff4d6d"
+                elif "⚠️" in e:                    clr = "#FFD93D"
+                elif "STOP" in e or "🛑" in e:     clr = "#FF9F43"
+                elif "✅" in e:                    clr = "#00c896"
+                elif "⟳" in e or "Loop" in e:     clr = "#2a4060"   # dim fetch logs
+                elif "📌" in e or "✳" in e:       clr = "#a0cfff"
+                else:                              clr = "#5a7fa8"
+                lines += f'<div class="log-entry" style="color:{clr};margin:1px 0">{e}</div>'
             st.markdown(f'<div class="log-box">{lines}</div>', unsafe_allow_html=True)
         else:
-            st.markdown('<div class="log-box"><span style="color:#1a3060">Log empty – press START</span></div>',
-                         unsafe_allow_html=True)
+            st.markdown(
+                '<div class="log-box"><span style="color:#1a3060">Log empty – press START to begin</span></div>',
+                unsafe_allow_html=True)
 
-        # ── Auto-refresh every 1.5 s (only while running, no full flicker) ──
+        # ── Debug panel (always visible while running to diagnose issues) ──
+        if is_running or ts_get("engine_loop", 0) > 0:
+            with st.expander("🔬 Debug Panel", expanded=False):
+                dc1, dc2, dc3 = st.columns(3)
+                dc1.metric("Engine Loop #",   str(ts_get("engine_loop", 0)))
+                dc2.metric("Running flag",     str(ts_get("running", False)))
+                dc3.metric("Log entries",      str(len(ts_get("log") or [])))
+
+                pos_d = ts_get("position")
+                st.write("**Open Position:**", pos_d if pos_d else "None")
+
+                done_d = ts_get("completed_trades") or []
+                st.write(f"**Completed Trades:** {len(done_d)}")
+
+                ltp_d = ts_get("ltp")
+                st.write(f"**LTP:** {ltp_d}")
+
+                st.write("**Thread alive:**",
+                          st.session_state.get("live_thread") is not None and
+                          st.session_state["live_thread"].is_alive()
+                          if st.session_state.get("live_thread") else "No thread")
+
+                if st.button("🔄 Force Refresh", key="force_refresh"):
+                    st.rerun()
+
+        # ── Auto-refresh every 1.5 s while engine is running ──
         if is_running:
             time.sleep(1.5)
             st.rerun()
