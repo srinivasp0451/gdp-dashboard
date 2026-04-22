@@ -1,958 +1,1790 @@
 """
-DocMind — Production-Grade RAG Chatbot
-======================================
-Features:
-  • Hybrid retrieval  : FAISS (dense) + BM25 (lexical) + Cross-encoder reranking
-  • Multi-query       : Generates N query variants for richer recall
-  • HyDE              : Hypothetical Document Embedding (toggle via ENABLE_HYDE)
-  • RAGAS eval        : Faithfulness + Answer Relevancy → console + sidebar + DB
-  • SQLite history    : Full persistence — sessions, messages, feedback, metrics
-  • Like / Dislike    : Per-message feedback stored to DB
-  • st.status loader  : Step-by-step live progress while bot responds
-  • Dark theme        : White readable fonts, indigo accents
-
-Install:
-    pip install streamlit langchain langchain-community langchain-openai
-               sentence-transformers rank-bm25 faiss-cpu tiktoken ragas datasets
-               python-dotenv
-
-Run:
-    streamlit run rag_chatbot.py
+Smart Investing - Professional Algorithmic Trading Platform
+Author: Smart Investing
+Version: 2.0
 """
 
-import os, time, re, uuid, json, sqlite3
 import streamlit as st
-import tiktoken
-from datetime import datetime
-from dotenv import load_dotenv
-from rank_bm25 import BM25Okapi
-from sentence_transformers import CrossEncoder
-from langchain_openai import ChatOpenAI
-from langchain_community.document_loaders import PyPDFLoader
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain_community.vectorstores import FAISS
-from langchain_community.embeddings import HuggingFaceEmbeddings
+import pandas as pd
+import numpy as np
+import yfinance as yf
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+import threading
+import time
+from datetime import datetime, timedelta
+import pytz
+import math
+import warnings
+warnings.filterwarnings("ignore")
 
-load_dotenv()
+# ═══════════════════════════════════════════════════════════════
+# CONSTANTS & CONFIG
+# ═══════════════════════════════════════════════════════════════
+IST = pytz.timezone("Asia/Kolkata")
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  CONFIGURATION
-# ─────────────────────────────────────────────────────────────────────────────
-DATA_PATH         = "data"
-FAISS_PATH        = "faiss_index"
-SQLITE_PATH       = "chat_history.db"
-OPENAI_API_KEY    = os.getenv("OPENAI_API_KEY",  "abcd")
-OPENAI_API_BASE   = os.getenv("OPENAI_API_BASE", "https://api.groq.com/openai/v1")
-MODEL_NAME        = os.getenv("MODEL_NAME",      "meta-llama/llama-4-scout-17b-16e-instruct")
-MAX_HISTORY_TURNS = 6
-TOP_K_RETRIEVE    = 5
-ENABLE_MULTI_QUERY = True
-ENABLE_HYDE        = False   # extra LLM call — enable for better semantic match
-ENABLE_RAGAS       = True    # set False to skip evaluation (faster responses)
+TICKER_MAP = {
+    "Nifty 50":    "^NSEI",
+    "BankNifty":   "^NSEBANK",
+    "Sensex":      "^BSESN",
+    "BTC/USD":     "BTC-USD",
+    "ETH/USD":     "ETH-USD",
+    "Gold":        "GC=F",
+    "Silver":      "SI=F",
+    "Custom":      None,
+}
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  PAGE CONFIG
-# ─────────────────────────────────────────────────────────────────────────────
-st.set_page_config(
-    page_title="DocMind · RAG Assistant",
-    page_icon="🧠",
-    layout="wide",
-    initial_sidebar_state="expanded",
+TIMEFRAME_PERIOD_MAP = {
+    "1m":  ["1d", "5d", "7d"],
+    "5m":  ["1d", "5d", "7d", "1mo"],
+    "15m": ["1d", "5d", "7d", "1mo"],
+    "1h":  ["1d", "5d", "7d", "1mo", "3mo", "6mo", "1y", "2y"],
+    "1d":  ["5d", "7d", "1mo", "3mo", "6mo", "1y", "2y", "5y", "10y", "20y"],
+    "1wk": ["1d", "5d", "7d", "1mo", "3mo", "6mo", "1y", "2y", "5y", "10y", "20y"],
+}
+
+WARMUP_PERIOD = {
+    "1m": "7d", "5m": "1mo", "15m": "1mo",
+    "1h": "3mo", "1d": "2y", "1wk": "5y",
+}
+
+SL_TYPES = [
+    "Custom Points", "ATR Based", "Risk Reward Based",
+    "Trailing SL", "EMA Reverse Crossover",
+    "Swing Low/High", "Candle Low/High",
+    "Support/Resistance", "Volatility Based",
+]
+
+TARGET_TYPES = [
+    "Custom Points", "ATR Based", "Risk Reward Based",
+    "Trailing Target (Display)", "EMA Crossover Target",
+    "Swing High/Low", "Auto Target",
+    "Volatility Based",
+]
+
+STRATEGIES = [
+    "EMA Crossover",
+    "EMA Anticipation",
+    "Elliott Wave",
+    "Simple Buy",
+    "Simple Sell",
+]
+
+# ═══════════════════════════════════════════════════════════════
+# THREAD-SAFE GLOBAL STATE
+# ═══════════════════════════════════════════════════════════════
+_TS_LOCK = threading.Lock()
+_TS: dict = {
+    "running":      False,
+    "position":     None,
+    "trades":       [],
+    "last_ltp":     None,
+    "last_candle":  None,
+    "ema_fast_val": None,
+    "ema_slow_val": None,
+    "atr_val":      None,
+    "stop_event":   None,
+    "log":          [],
+    "wave_info":    {},
+    "current_pnl":  0.0,
+    "last_signal":  None,
+    "fetch_count":  0,
+}
+
+def _ts_get(key):
+    with _TS_LOCK:
+        return _TS.get(key)
+
+def _ts_set(key, val):
+    with _TS_LOCK:
+        _TS[key] = val
+
+def _ts_append(key, val):
+    with _TS_LOCK:
+        if key not in _TS:
+            _TS[key] = []
+        _TS[key].append(val)
+
+def _sync() -> dict:
+    with _TS_LOCK:
+        import copy
+        return copy.deepcopy(_TS)
+
+# ═══════════════════════════════════════════════════════════════
+# DATA FETCHING  (rate-limited, warmup-aware)
+# ═══════════════════════════════════════════════════════════════
+_api_lock = threading.Lock()
+_last_api_time = 0.0
+
+def _rate_limited_fetch(ticker: str, interval: str, period: str) -> pd.DataFrame:
+    """Fetch with ≥1.5s spacing between calls."""
+    global _last_api_time
+    with _api_lock:
+        gap = time.time() - _last_api_time
+        if gap < 1.5:
+            time.sleep(1.5 - gap)
+        _last_api_time = time.time()
+
+    try:
+        df = yf.download(ticker, period=period, interval=interval,
+                         progress=False, auto_adjust=True)
+        if df is None or df.empty:
+            return pd.DataFrame()
+
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+
+        df.dropna(inplace=True)
+        df.index = pd.to_datetime(df.index)
+        if df.index.tz is None:
+            df.index = df.index.tz_localize("UTC").tz_convert(IST)
+        else:
+            df.index = df.index.tz_convert(IST)
+        return df
+    except Exception as e:
+        return pd.DataFrame()
+
+
+def fetch_data(ticker: str, interval: str, period: str,
+               warmup: bool = True) -> pd.DataFrame:
+    """
+    Fetch data with optional warmup for EMA accuracy.
+    Always fetches warmup period to avoid NaN indicators on gapup/gapdown days.
+    Then trims index to what's needed for display — but returns full for calcs.
+    """
+    fetch_period = WARMUP_PERIOD.get(interval, period) if warmup else period
+    return _rate_limited_fetch(ticker, interval, fetch_period)
+
+# ═══════════════════════════════════════════════════════════════
+# INDICATOR CALCULATIONS  (TradingView-accurate)
+# ═══════════════════════════════════════════════════════════════
+
+def tv_ema(series: pd.Series, period: int) -> pd.Series:
+    """
+    TradingView-accurate EMA:
+      • First `period` values seeded with SMA
+      • Then standard Wilder/EWM(span=period, adjust=False)
+    """
+    if len(series) < period:
+        return pd.Series(np.nan, index=series.index)
+    result = series.ewm(span=period, adjust=False, min_periods=period).mean()
+    return result
+
+
+def calc_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
+    high  = df["High"]
+    low   = df["Low"]
+    prev  = df["Close"].shift(1)
+    tr = pd.concat([
+        high - low,
+        (high - prev).abs(),
+        (low  - prev).abs(),
+    ], axis=1).max(axis=1)
+    return tr.ewm(span=period, adjust=False, min_periods=period).mean()
+
+
+def calc_pivot_highs(series: pd.Series, left: int = 3, right: int = 3) -> pd.Series:
+    out = pd.Series(np.nan, index=series.index)
+    for i in range(left, len(series) - right):
+        if series.iloc[i] == series.iloc[i-left:i+right+1].max():
+            out.iloc[i] = series.iloc[i]
+    return out
+
+
+def calc_pivot_lows(series: pd.Series, left: int = 3, right: int = 3) -> pd.Series:
+    out = pd.Series(np.nan, index=series.index)
+    for i in range(left, len(series) - right):
+        if series.iloc[i] == series.iloc[i-left:i+right+1].min():
+            out.iloc[i] = series.iloc[i]
+    return out
+
+# ═══════════════════════════════════════════════════════════════
+# SL / TARGET CALCULATORS
+# ═══════════════════════════════════════════════════════════════
+
+def _atr_at(df: pd.DataFrame, idx: int, fallback: float) -> float:
+    atr = calc_atr(df)
+    if idx < len(atr) and not np.isnan(atr.iloc[idx]):
+        return float(atr.iloc[idx])
+    return fallback
+
+
+def _swing_low_near(df: pd.DataFrame, idx: int, lookback: int = 30) -> float:
+    sub = df["Low"].iloc[max(0, idx - lookback): idx + 1]
+    lows = calc_pivot_lows(sub, 2, 2).dropna()
+    return float(lows.iloc[-1]) if len(lows) > 0 else float(sub.min())
+
+
+def _swing_high_near(df: pd.DataFrame, idx: int, lookback: int = 30) -> float:
+    sub = df["High"].iloc[max(0, idx - lookback): idx + 1]
+    highs = calc_pivot_highs(sub, 2, 2).dropna()
+    return float(highs.iloc[-1]) if len(highs) > 0 else float(sub.max())
+
+
+def get_sl(entry: float, side: str, sl_type: str, sl_pts: float,
+           df: pd.DataFrame, idx: int,
+           atr_m: float = 1.5, rr: float = 2.0, tgt: float = None) -> float:
+
+    if side == "buy":
+        base = {
+            "Custom Points":        entry - sl_pts,
+            "ATR Based":            entry - _atr_at(df, idx, sl_pts) * atr_m,
+            "Risk Reward Based":    entry - (tgt - entry) / rr if tgt else entry - sl_pts,
+            "Trailing SL":          entry - sl_pts,
+            "EMA Reverse Crossover":entry - sl_pts,
+            "Swing Low/High":       _swing_low_near(df, idx) - 0.5,
+            "Candle Low/High":      float(df["Low"].iloc[idx]),
+            "Support/Resistance":   entry - sl_pts,
+            "Volatility Based":     entry - _atr_at(df, idx, sl_pts) * 2,
+        }
+    else:
+        base = {
+            "Custom Points":        entry + sl_pts,
+            "ATR Based":            entry + _atr_at(df, idx, sl_pts) * atr_m,
+            "Risk Reward Based":    entry + (entry - tgt) / rr if tgt else entry + sl_pts,
+            "Trailing SL":          entry + sl_pts,
+            "EMA Reverse Crossover":entry + sl_pts,
+            "Swing Low/High":       _swing_high_near(df, idx) + 0.5,
+            "Candle Low/High":      float(df["High"].iloc[idx]),
+            "Support/Resistance":   entry + sl_pts,
+            "Volatility Based":     entry + _atr_at(df, idx, sl_pts) * 2,
+        }
+    return round(base.get(sl_type, entry - sl_pts if side == "buy" else entry + sl_pts), 2)
+
+
+def get_tgt(entry: float, side: str, tgt_type: str, tgt_pts: float,
+            df: pd.DataFrame, idx: int,
+            atr_m: float = 2.0, rr: float = 2.0, sl: float = None) -> float:
+
+    if side == "buy":
+        base = {
+            "Custom Points":          entry + tgt_pts,
+            "ATR Based":              entry + _atr_at(df, idx, tgt_pts) * atr_m,
+            "Risk Reward Based":      entry + (entry - sl) * rr if sl else entry + tgt_pts,
+            "Trailing Target (Display)": entry + tgt_pts,
+            "EMA Crossover Target":   entry + tgt_pts,
+            "Swing High/Low":         _swing_high_near(df, idx),
+            "Auto Target":            entry + (entry - sl) * rr if sl else entry + tgt_pts,
+            "Volatility Based":       entry + _atr_at(df, idx, tgt_pts) * atr_m,
+        }
+    else:
+        base = {
+            "Custom Points":          entry - tgt_pts,
+            "ATR Based":              entry - _atr_at(df, idx, tgt_pts) * atr_m,
+            "Risk Reward Based":      entry - (sl - entry) * rr if sl else entry - tgt_pts,
+            "Trailing Target (Display)": entry - tgt_pts,
+            "EMA Crossover Target":   entry - tgt_pts,
+            "Swing High/Low":         _swing_low_near(df, idx),
+            "Auto Target":            entry - (sl - entry) * rr if sl else entry - tgt_pts,
+            "Volatility Based":       entry - _atr_at(df, idx, tgt_pts) * atr_m,
+        }
+    return round(base.get(tgt_type, entry + tgt_pts if side == "buy" else entry - tgt_pts), 2)
+
+# ═══════════════════════════════════════════════════════════════
+# ELLIOTT WAVE ANALYSIS
+# ═══════════════════════════════════════════════════════════════
+
+def analyze_elliott_waves(df: pd.DataFrame) -> dict:
+    """Full Elliott Wave analysis with Fibonacci projections."""
+    if len(df) < 30:
+        return {"status": "Insufficient data"}
+
+    high  = df["High"]
+    low   = df["Low"]
+    close = df["Close"]
+
+    ph = calc_pivot_highs(high, 4, 4)
+    pl = calc_pivot_lows (low,  4, 4)
+
+    pivot_h = ph.dropna()
+    pivot_l = pl.dropna()
+
+    if len(pivot_h) < 2 or len(pivot_l) < 2:
+        return {"status": "Not enough pivots"}
+
+    # Build combined zigzag
+    pivots = []
+    for t, v in pivot_h.items():
+        pivots.append({"time": t, "price": float(v), "ptype": "H"})
+    for t, v in pivot_l.items():
+        pivots.append({"time": t, "price": float(v), "ptype": "L"})
+    pivots.sort(key=lambda x: x["time"])
+
+    # Deduplicate consecutive same types
+    dedup = [pivots[0]]
+    for p in pivots[1:]:
+        if p["ptype"] == dedup[-1]["ptype"]:
+            # Keep the extreme
+            if p["ptype"] == "H" and p["price"] > dedup[-1]["price"]:
+                dedup[-1] = p
+            elif p["ptype"] == "L" and p["price"] < dedup[-1]["price"]:
+                dedup[-1] = p
+        else:
+            dedup.append(p)
+
+    if len(dedup) < 5:
+        return {"status": "Not enough alternating pivots"}
+
+    last5 = dedup[-5:]
+    cur   = float(close.iloc[-1])
+    last_h= float(pivot_h.iloc[-1])
+    last_l= float(pivot_l.iloc[-1])
+
+    # Determine wave trend
+    trend = "bullish" if last5[0]["ptype"] == "L" else "bearish"
+
+    # Label W0..W5 (or best effort)
+    wave_labels = ["W0", "W1", "W2", "W3", "W4"]
+    waves = {}
+    for lbl, p in zip(wave_labels, last5):
+        waves[lbl] = {"price": p["price"], "time": str(p["time"]), "type": p["ptype"]}
+
+    # Fibonacci projections
+    fib_range = abs(last_h - last_l)
+    if trend == "bullish":
+        fib_levels = {
+            "Ext 0.618": last_h + fib_range * 0.618,
+            "Ext 1.000": last_h + fib_range * 1.000,
+            "Ext 1.618": last_h + fib_range * 1.618,
+            "Ret 0.236": last_h - fib_range * 0.236,
+            "Ret 0.382": last_h - fib_range * 0.382,
+            "Ret 0.500": last_h - fib_range * 0.500,
+            "Ret 0.618": last_h - fib_range * 0.618,
+            "Ret 0.786": last_h - fib_range * 0.786,
+        }
+    else:
+        fib_levels = {
+            "Ext 0.618": last_l - fib_range * 0.618,
+            "Ext 1.000": last_l - fib_range * 1.000,
+            "Ext 1.618": last_l - fib_range * 1.618,
+            "Ret 0.236": last_l + fib_range * 0.236,
+            "Ret 0.382": last_l + fib_range * 0.382,
+            "Ret 0.500": last_l + fib_range * 0.500,
+            "Ret 0.618": last_l + fib_range * 0.618,
+            "Ret 0.786": last_l + fib_range * 0.786,
+        }
+
+    # Determine current wave position & signal
+    last_pivot = dedup[-1]
+    if trend == "bullish":
+        if last_pivot["ptype"] == "L":
+            current_wave = "Wave 5 (or new impulse) — Rising"
+            next_target  = fib_levels["Ext 1.000"]
+            signal       = "buy"
+        else:
+            current_wave = "Correction (ABC) — Falling"
+            next_target  = fib_levels["Ret 0.382"]
+            signal       = "sell"
+    else:
+        if last_pivot["ptype"] == "H":
+            current_wave = "Wave 5 (or new impulse) — Falling"
+            next_target  = fib_levels["Ext 1.000"]
+            signal       = "sell"
+        else:
+            current_wave = "Correction (ABC) — Rising"
+            next_target  = fib_levels["Ret 0.382"]
+            signal       = "buy"
+
+    # Completed waves summary
+    completed = []
+    for lbl in wave_labels:
+        if lbl in waves:
+            completed.append(f"{lbl} @ {waves[lbl]['price']:.2f}")
+
+    return {
+        "status":        "OK",
+        "trend":         trend,
+        "current_wave":  current_wave,
+        "next_target":   round(next_target, 2),
+        "signal":        signal,
+        "fib_levels":    {k: round(v, 2) for k, v in fib_levels.items()},
+        "waves":         waves,
+        "completed":     completed,
+        "last_high":     round(last_h, 2),
+        "last_low":      round(last_l, 2),
+        "current_price": round(cur, 2),
+        "pivots":        dedup[-10:],
+    }
+
+
+def ew_signal_at(df: pd.DataFrame, idx: int) -> dict:
+    """Walk-forward Elliott Wave signal for backtesting (no lookahead)."""
+    sub = df.iloc[max(0, idx - 80): idx + 1]
+    info = analyze_elliott_waves(sub)
+    if info.get("status") != "OK":
+        return {}
+
+    sig  = info.get("signal")
+    entry= float(df["Close"].iloc[idx])
+    fib  = info.get("fib_levels", {})
+    lh   = info.get("last_high", entry)
+    ll   = info.get("last_low",  entry)
+
+    if sig == "buy":
+        sl     = fib.get("Ret 0.618", entry * 0.98)
+        target = fib.get("Ext 1.000", entry * 1.03)
+    else:
+        sl     = fib.get("Ret 0.618", entry * 1.02)
+        target = fib.get("Ext 1.000", entry * 0.97)
+
+    return {"signal": sig, "entry": entry, "sl": sl, "target": target,
+            "reason": f"EW {info['current_wave']}", "wave_info": info}
+
+# ═══════════════════════════════════════════════════════════════
+# SIGNAL GENERATION
+# ═══════════════════════════════════════════════════════════════
+
+def generate_signals(df: pd.DataFrame, strategy: str,
+                     fast: int = 9, slow: int = 15,
+                     cross_type: str = "Simple Crossover",
+                     min_angle: float = 0.0,
+                     candle_size: float = 10.0) -> pd.DataFrame:
+    """
+    Returns df copy with columns:
+      signal (1=buy, -1=sell, 0=none), signal_reason, ema_fast, ema_slow
+    """
+    df = df.copy()
+    df["signal"] = 0
+    df["signal_reason"] = ""
+
+    if strategy in ("EMA Crossover", "EMA Anticipation"):
+        df["ema_fast"] = tv_ema(df["Close"], fast)
+        df["ema_slow"] = tv_ema(df["Close"], slow)
+
+    if strategy == "EMA Crossover":
+        for i in range(1, len(df)):
+            f0 = df["ema_fast"].iloc[i];   f1 = df["ema_fast"].iloc[i-1]
+            s0 = df["ema_slow"].iloc[i];   s1 = df["ema_slow"].iloc[i-1]
+            if any(pd.isna(v) for v in [f0, f1, s0, s1]):
+                continue
+
+            buy_x  = (f1 <= s1) and (f0 > s0)
+            sell_x = (f1 >= s1) and (f0 < s0)
+
+            # Crossover type filter
+            c_size = abs(float(df["Close"].iloc[i]) - float(df["Open"].iloc[i]))
+            if cross_type == "Custom Candle Size" and c_size < candle_size:
+                buy_x = sell_x = False
+            elif cross_type == "ATR Based Candle Size":
+                atr = calc_atr(df)
+                av = float(atr.iloc[i]) if i < len(atr) and not pd.isna(atr.iloc[i]) else candle_size
+                if c_size < av * 0.5:
+                    buy_x = sell_x = False
+
+            # Angle filter (absolute gap change proxy)
+            if min_angle > 0:
+                if abs(f0 - f1) < min_angle:
+                    buy_x = sell_x = False
+
+            if buy_x:
+                df.loc[df.index[i], "signal"] = 1
+                df.loc[df.index[i], "signal_reason"] = (
+                    f"EMA{fast} crossed ↑ EMA{slow} ({f0:.2f} > {s0:.2f})")
+            elif sell_x:
+                df.loc[df.index[i], "signal"] = -1
+                df.loc[df.index[i], "signal_reason"] = (
+                    f"EMA{fast} crossed ↓ EMA{slow} ({f0:.2f} < {s0:.2f})")
+
+    elif strategy == "EMA Anticipation":
+        # Anticipate crossover before it happens:
+        # When gap is shrinking rapidly + price action confirms
+        for i in range(3, len(df)):
+            f0 = df["ema_fast"].iloc[i];   s0 = df["ema_slow"].iloc[i]
+            f1 = df["ema_fast"].iloc[i-1]; s1 = df["ema_slow"].iloc[i-1]
+            f2 = df["ema_fast"].iloc[i-2]; s2 = df["ema_slow"].iloc[i-2]
+            if any(pd.isna(v) for v in [f0,f1,f2,s0,s1,s2]):
+                continue
+
+            gap0 = f0 - s0
+            gap1 = f1 - s1
+            gap2 = f2 - s2
+
+            # Narrowing gap from below with 2 consecutive candles
+            if gap0 < 0 and gap1 < 0 and gap2 < 0:
+                if abs(gap0) < abs(gap1) < abs(gap2):
+                    # 3-bar convergence below
+                    c_bull = float(df["Close"].iloc[i]) > float(df["Open"].iloc[i])
+                    if c_bull and abs(gap0) < abs(gap2) * 0.35:
+                        df.loc[df.index[i], "signal"] = 1
+                        df.loc[df.index[i], "signal_reason"] = (
+                            f"Anticipated bullish EMA cross (gap {gap0:.2f}, was {gap2:.2f})")
+
+            # Narrowing from above (bearish)
+            elif gap0 > 0 and gap1 > 0 and gap2 > 0:
+                if abs(gap0) < abs(gap1) < abs(gap2):
+                    c_bear = float(df["Close"].iloc[i]) < float(df["Open"].iloc[i])
+                    if c_bear and abs(gap0) < abs(gap2) * 0.35:
+                        df.loc[df.index[i], "signal"] = -1
+                        df.loc[df.index[i], "signal_reason"] = (
+                            f"Anticipated bearish EMA cross (gap {gap0:.2f}, was {gap2:.2f})")
+
+    elif strategy == "Elliott Wave":
+        for i in range(50, len(df)):
+            res = ew_signal_at(df, i)
+            if res.get("signal") == "buy":
+                df.loc[df.index[i], "signal"] = 1
+                df.loc[df.index[i], "signal_reason"] = res.get("reason", "EW Buy")
+            elif res.get("signal") == "sell":
+                df.loc[df.index[i], "signal"] = -1
+                df.loc[df.index[i], "signal_reason"] = res.get("reason", "EW Sell")
+
+    elif strategy == "Simple Buy":
+        # Flag every bar — backtest engine will take only first / per-position
+        df.loc[df.index[0], "signal"] = 1
+        df.loc[df.index[0], "signal_reason"] = "Simple Buy (immediate entry)"
+
+    elif strategy == "Simple Sell":
+        df.loc[df.index[0], "signal"] = -1
+        df.loc[df.index[0], "signal_reason"] = "Simple Sell (immediate entry)"
+
+    return df
+
+# ═══════════════════════════════════════════════════════════════
+# BACKTESTING ENGINE
+# ═══════════════════════════════════════════════════════════════
+
+def run_backtest(df: pd.DataFrame, strategy: str, direction: str,
+                 sl_type: str, tgt_type: str, sl_pts: float, tgt_pts: float,
+                 fast: int, slow: int, rr: float, atr_m_sl: float, atr_m_tgt: float,
+                 qty: int, cross_type: str, min_angle: float, candle_sz: float):
+    """
+    Returns (trades_df, violations_df, signals_df).
+
+    Entry logic:
+      • Simple Buy / Simple Sell : enter at that candle's CLOSE (immediate)
+      • All other strategies     : enter at NEXT candle's OPEN (N+1)
+
+    Exit logic (conservative, no lookahead):
+      • BUY  : check candle Low  ≤ SL first → SL hit; else candle High ≥ Tgt → Tgt hit
+      • SELL : check candle High ≥ SL first → SL hit; else candle Low  ≤ Tgt → Tgt hit
+    """
+    sig_df = generate_signals(df, strategy, fast, slow, cross_type, min_angle, candle_sz)
+
+    trades     = []
+    violations = []
+    pos        = None          # open position
+    immediate  = strategy in ("Simple Buy", "Simple Sell")
+    i = 0
+
+    while i < len(sig_df):
+        bar       = sig_df.iloc[i]
+        c_high    = float(df["High"].iloc[i])
+        c_low     = float(df["Low"].iloc[i])
+        c_close   = float(df["Close"].iloc[i])
+        c_open    = float(df["Open"].iloc[i])
+
+        # ── Manage open position ──────────────────────────────────────
+        if pos is not None:
+            ep    = pos["entry_price"]
+            sl    = pos["sl"]
+            tgt   = pos["tgt"]
+            side  = pos["side"]
+
+            # Trail SL update
+            if sl_type == "Trailing SL":
+                if side == "buy":
+                    new_sl = c_close - sl_pts
+                    if new_sl > sl:
+                        pos["sl"] = new_sl; sl = new_sl
+                else:
+                    new_sl = c_close + sl_pts
+                    if new_sl < sl:
+                        pos["sl"] = new_sl; sl = new_sl
+
+            elif sl_type == "Swing Low/High":
+                if side == "buy":
+                    new_sl = _swing_low_near(df, i) - 0.5
+                    if new_sl > pos["sl"]:
+                        pos["sl"] = new_sl; sl = new_sl
+                else:
+                    new_sl = _swing_high_near(df, i) + 0.5
+                    if new_sl < pos["sl"]:
+                        pos["sl"] = new_sl; sl = new_sl
+
+            elif sl_type == "Candle Low/High":
+                if side == "buy":
+                    new_sl = c_low
+                    if new_sl > pos["sl"]:
+                        pos["sl"] = new_sl; sl = new_sl
+                else:
+                    new_sl = c_high
+                    if new_sl < pos["sl"]:
+                        pos["sl"] = new_sl; sl = new_sl
+
+            # EMA reverse crossover SL
+            elif sl_type == "EMA Reverse Crossover":
+                if "ema_fast" in sig_df.columns and i > 0:
+                    f0 = sig_df["ema_fast"].iloc[i]; s0 = sig_df["ema_slow"].iloc[i]
+                    f1 = sig_df["ema_fast"].iloc[i-1]; s1 = sig_df["ema_slow"].iloc[i-1]
+                    if not any(pd.isna(v) for v in [f0, f1, s0, s1]):
+                        rev_buy  = (side == "buy")  and (f1 >= s1) and (f0 < s0)
+                        rev_sell = (side == "sell") and (f1 <= s1) and (f0 > s0)
+                        if rev_buy or rev_sell:
+                            exit_p = c_open
+                            pnl = (exit_p - ep)*qty if side=="buy" else (ep - exit_p)*qty
+                            trades.append(_make_trade(pos, exit_p, c_high, c_low,
+                                          df.index[i], "EMA Reverse Crossover SL",
+                                          pnl, qty, False))
+                            pos = None; i += 1; continue
+
+            exit_p = exit_r = None
+            violated = False
+
+            if side == "buy":
+                # Conservative: SL (Low) first, then Target (High)
+                if c_low <= sl:
+                    exit_p = sl; exit_r = "Stop Loss Hit"
+                elif c_high >= tgt:
+                    exit_p = tgt; exit_r = "Target Hit"
+                # Violation: both possible in same candle
+                if c_low <= sl and c_high >= tgt:
+                    violated = True
+            else:  # sell
+                # Conservative: SL (High) first, then Target (Low)
+                if c_high >= sl:
+                    exit_p = sl; exit_r = "Stop Loss Hit"
+                elif c_low <= tgt:
+                    exit_p = tgt; exit_r = "Target Hit"
+                if c_high >= sl and c_low <= tgt:
+                    violated = True
+
+            if exit_p is not None:
+                pnl = (exit_p - ep)*qty if side=="buy" else (ep - exit_p)*qty
+                rec = _make_trade(pos, exit_p, c_high, c_low, df.index[i], exit_r, pnl, qty, violated)
+                trades.append(rec)
+                if violated:
+                    violations.append(rec)
+                pos = None
+
+        # ── New signal ────────────────────────────────────────────────
+        if pos is None:
+            sig    = int(bar["signal"])
+            reason = str(bar.get("signal_reason", ""))
+
+            # Direction filter
+            if direction == "Buy Only"  and sig != 1:  i += 1; continue
+            if direction == "Sell Only" and sig != -1: i += 1; continue
+
+            if sig in (1, -1):
+                side = "buy" if sig == 1 else "sell"
+
+                if immediate:
+                    entry_price = c_close
+                    entry_time  = df.index[i]
+                    entry_idx   = i
+                else:
+                    # Enter at next candle open
+                    ni = i + 1
+                    if ni >= len(df): i += 1; continue
+                    entry_price = float(df["Open"].iloc[ni])
+                    entry_time  = df.index[ni]
+                    entry_idx   = ni
+                    i = ni  # advance to entry candle so position is checked starting there
+
+                sl_val  = get_sl(entry_price, side, sl_type, sl_pts, df, entry_idx, atr_m_sl, rr)
+                tgt_val = get_tgt(entry_price, side, tgt_type, tgt_pts, df, entry_idx, atr_m_tgt, rr, sl_val)
+
+                pos = {
+                    "side":        side,
+                    "entry_price": entry_price,
+                    "entry_time":  entry_time,
+                    "sl":          sl_val,
+                    "tgt":         tgt_val,
+                    "reason":      reason,
+                }
+
+        i += 1
+
+    # Close any remaining open position at last close
+    if pos is not None:
+        exit_p = float(df["Close"].iloc[-1])
+        pnl = (exit_p - pos["entry_price"])*qty if pos["side"]=="buy" else (pos["entry_price"] - exit_p)*qty
+        trades.append(_make_trade(pos, exit_p,
+                      float(df["High"].iloc[-1]), float(df["Low"].iloc[-1]),
+                      df.index[-1], "Market Close (Open Trade)", pnl, qty, False))
+
+    t_df = pd.DataFrame(trades)    if trades    else pd.DataFrame()
+    v_df = pd.DataFrame(violations) if violations else pd.DataFrame()
+    return t_df, v_df, sig_df
+
+
+def _make_trade(pos, exit_p, c_high, c_low, exit_time, exit_reason, pnl, qty, violated):
+    return {
+        "Entry Time":    pos["entry_time"],
+        "Exit Time":     exit_time,
+        "Trade Type":    pos["side"].upper(),
+        "Entry Price":   round(pos["entry_price"], 2),
+        "Exit Price":    round(exit_p, 2),
+        "SL":            round(pos["sl"], 2),
+        "Target":        round(pos["tgt"], 2),
+        "Candle High":   round(c_high, 2),
+        "Candle Low":    round(c_low, 2),
+        "Entry Reason":  pos["reason"],
+        "Exit Reason":   exit_reason,
+        "PnL":           round(pnl, 2),
+        "Violated":      violated,
+    }
+
+# ═══════════════════════════════════════════════════════════════
+# LIVE TRADING LOOP  (background thread)
+# ═══════════════════════════════════════════════════════════════
+
+def live_loop(cfg: dict, stop_event: threading.Event):
+    ticker      = cfg["ticker"]
+    interval    = cfg["interval"]
+    period      = cfg["period"]
+    strategy    = cfg["strategy"]
+    sl_type     = cfg["sl_type"]
+    tgt_type    = cfg["tgt_type"]
+    sl_pts      = cfg["sl_pts"]
+    tgt_pts     = cfg["tgt_pts"]
+    fast        = cfg["fast"]
+    slow        = cfg["slow"]
+    rr          = cfg["rr"]
+    atr_m_sl    = cfg["atr_m_sl"]
+    atr_m_tgt   = cfg["atr_m_tgt"]
+    qty         = cfg["qty"]
+    cooldown    = cfg["cooldown"]
+    dhan_en     = cfg["dhan_enabled"]
+    opts_en     = cfg["opts_enabled"]
+    dcfg        = cfg["dhan_cfg"]
+    immediate   = strategy in ("Simple Buy", "Simple Sell")
+
+    _ts_set("running", True)
+    _ts_set("log", [])
+
+    def log(msg):
+        ts = datetime.now(IST).strftime("%H:%M:%S")
+        _ts_append("log", f"[{ts}] {msg}")
+
+    log(f"Started ─ {ticker} | {interval} | {strategy}")
+
+    last_signal_time = None
+    prev_candle_time = None
+
+    while not stop_event.is_set():
+        try:
+            _ts_set("fetch_count", (_ts_get("fetch_count") or 0) + 1)
+            df = fetch_data(ticker, interval, period, warmup=True)
+            if df is None or df.empty:
+                log("⚠ Empty data returned"); stop_event.wait(1.5); continue
+
+            cur_time  = datetime.now(IST)
+            ltp       = float(df["Close"].iloc[-1])
+            ef_series = tv_ema(df["Close"], fast)
+            es_series = tv_ema(df["Close"], slow)
+            atr_v     = calc_atr(df)
+            last_c    = df.iloc[-1]
+
+            _ts_set("last_ltp",     ltp)
+            _ts_set("ema_fast_val", float(ef_series.iloc[-1]) if not pd.isna(ef_series.iloc[-1]) else None)
+            _ts_set("ema_slow_val", float(es_series.iloc[-1]) if not pd.isna(es_series.iloc[-1]) else None)
+            _ts_set("atr_val",      float(atr_v.iloc[-1]) if not pd.isna(atr_v.iloc[-1]) else None)
+            _ts_set("last_candle",  {
+                "Time":   str(df.index[-1].strftime("%Y-%m-%d %H:%M:%S")),
+                "Open":   round(float(last_c["Open"]),  2),
+                "High":   round(float(last_c["High"]),  2),
+                "Low":    round(float(last_c["Low"]),   2),
+                "Close":  round(float(last_c["Close"]), 2),
+                "Volume": int(last_c.get("Volume", 0) or 0),
+            })
+
+            # Elliott Wave analysis
+            wave_info = analyze_elliott_waves(df)
+            _ts_set("wave_info", wave_info)
+
+            # ── Manage open position (tick-by-tick SL/Target vs LTP) ──
+            pos = _ts_get("position")
+            if pos is not None:
+                ep   = pos["entry_price"]
+                sl   = pos["sl"]
+                tgt  = pos["tgt"]
+                side = pos["side"]
+
+                # Update trailing
+                if sl_type == "Trailing SL":
+                    if side == "buy":
+                        new_sl = ltp - sl_pts
+                        if new_sl > sl:
+                            pos["sl"] = new_sl; _ts_set("position", pos)
+                    else:
+                        new_sl = ltp + sl_pts
+                        if new_sl < sl:
+                            pos["sl"] = new_sl; _ts_set("position", pos)
+
+                # Live PnL
+                live_pnl = (ltp - ep)*qty if side=="buy" else (ep - ltp)*qty
+                _ts_set("current_pnl", round(live_pnl, 2))
+
+                # SL/Target check against LTP
+                exit_p = exit_r = None
+                if side == "buy":
+                    if ltp <= sl:    exit_p = ltp; exit_r = "Stop Loss Hit"
+                    elif ltp >= tgt: exit_p = ltp; exit_r = "Target Hit"
+                else:
+                    if ltp >= sl:    exit_p = ltp; exit_r = "Stop Loss Hit"
+                    elif ltp <= tgt: exit_p = ltp; exit_r = "Target Hit"
+
+                if exit_p is not None:
+                    pnl = (exit_p - ep)*qty if side=="buy" else (ep - exit_p)*qty
+                    _ts_append("trades", {
+                        "Entry Time":   pos["entry_time"],
+                        "Exit Time":    cur_time.strftime("%Y-%m-%d %H:%M:%S"),
+                        "Trade Type":   side.upper(),
+                        "Entry Price":  round(ep, 2),
+                        "Exit Price":   round(exit_p, 2),
+                        "SL":           round(sl, 2),
+                        "Target":       round(tgt, 2),
+                        "PnL":          round(pnl, 2),
+                        "Exit Reason":  exit_r,
+                        "Entry Reason": pos.get("reason", ""),
+                    })
+                    _ts_set("position", None)
+                    _ts_set("current_pnl", 0.0)
+                    log(f"✅ {exit_r} | {side.upper()} | PnL: ₹{pnl:.2f}")
+                    if dhan_en:
+                        _place_order(side, dcfg, opts_en, ltp, exit_mode=True)
+
+            # ── New signal check ──────────────────────────────────────
+            if _ts_get("position") is None:
+                # Timeframe alignment (for EMA/EW strategies)
+                if not immediate:
+                    candle_time = df.index[-1]
+                    if candle_time == prev_candle_time:
+                        stop_event.wait(1.5); continue
+                    prev_candle_time = candle_time
+
+                sig_df = generate_signals(df, strategy, fast, slow)
+                last_sig    = int(sig_df["signal"].iloc[-1])
+                last_reason = str(sig_df["signal_reason"].iloc[-1])
+
+                # Cooldown
+                if cooldown > 0 and last_signal_time is not None:
+                    if (cur_time - last_signal_time).total_seconds() < cooldown:
+                        stop_event.wait(1.5); continue
+
+                if last_sig != 0:
+                    side       = "buy" if last_sig == 1 else "sell"
+                    entry_p    = ltp  # Live: enter at LTP
+                    idx_last   = len(df) - 1
+                    sl_val     = get_sl(entry_p, side, sl_type, sl_pts, df, idx_last, atr_m_sl, rr)
+                    tgt_val    = get_tgt(entry_p, side, tgt_type, tgt_pts, df, idx_last, atr_m_tgt, rr, sl_val)
+
+                    new_pos = {
+                        "side":        side,
+                        "entry_price": round(entry_p, 2),
+                        "entry_time":  cur_time.strftime("%Y-%m-%d %H:%M:%S"),
+                        "sl":          sl_val,
+                        "tgt":         tgt_val,
+                        "reason":      last_reason,
+                    }
+                    _ts_set("position", new_pos)
+                    _ts_set("last_signal", {
+                        "side": side, "entry": entry_p, "sl": sl_val, "tgt": tgt_val,
+                        "reason": last_reason, "time": cur_time.strftime("%H:%M:%S")
+                    })
+                    last_signal_time = cur_time
+                    log(f"🔔 {side.upper()} signal | Entry:{entry_p:.2f} SL:{sl_val:.2f} Tgt:{tgt_val:.2f}")
+                    if dhan_en:
+                        _place_order(side, dcfg, opts_en, entry_p, exit_mode=False)
+
+        except Exception as e:
+            _ts_append("log", f"[ERR] {str(e)}")
+
+        stop_event.wait(1.5)
+
+    _ts_set("running", False)
+    log("⏹ Live trading stopped")
+
+
+def _place_order(side: str, dcfg: dict, opts_en: bool, price: float, exit_mode: bool):
+    try:
+        from dhanhq import dhanhq
+        client_id = dcfg.get("client_id", "")
+        token     = dcfg.get("access_token", "")
+        if not client_id or not token:
+            return
+        dhan = dhanhq(client_id, token)
+
+        if opts_en:
+            # Options: always BUY (CE on algo-buy, PE on algo-sell)
+            if exit_mode:
+                # For options exit, sell the same leg
+                sec_id = dcfg.get("ce_security_id") if side=="buy" else dcfg.get("pe_security_id")
+                tx_type = "SELL"
+            else:
+                sec_id  = dcfg.get("ce_security_id") if side == "buy" else dcfg.get("pe_security_id")
+                tx_type = "BUY"
+            exch  = dcfg.get("fno_exchange", "NSE_FNO")
+            qty   = int(dcfg.get("options_qty", 65))
+            otype = dcfg.get("options_entry_type" if not exit_mode else "options_exit_type", "MARKET")
+            lim   = round(price, 2) if otype == "LIMIT" else 0
+            dhan.place_order(transactionType=tx_type, exchangeSegment=exch,
+                             productType="INTRADAY", orderType=otype,
+                             validity="DAY", securityId=str(sec_id),
+                             quantity=qty, price=lim, triggerPrice=0)
+        else:
+            if exit_mode:
+                tx_type = "SELL" if side == "buy" else "BUY"
+            else:
+                tx_type = "BUY" if side == "buy" else "SELL"
+            exch  = dcfg.get("exchange", "NSE")
+            prod  = dcfg.get("product_type", "INTRADAY")
+            sec   = dcfg.get("security_id", "1333")
+            qty   = int(dcfg.get("equity_qty", 1))
+            otype = dcfg.get("equity_entry_type" if not exit_mode else "equity_exit_type", "MARKET")
+            lim   = round(price, 2) if otype == "LIMIT" else 0
+            dhan.place_order(transactionType=tx_type, exchangeSegment=exch,
+                             productType=prod, orderType=otype,
+                             validity="DAY", securityId=str(sec),
+                             quantity=qty, price=lim, triggerPrice=0)
+    except Exception as e:
+        _ts_append("log", f"[DHAN ERR] {str(e)}")
+
+
+def get_my_ip() -> str:
+    try:
+        import requests
+        return requests.get("https://api.ipify.org", timeout=5).text.strip()
+    except:
+        return "Unknown"
+
+# ═══════════════════════════════════════════════════════════════
+# OPTIMIZATION
+# ═══════════════════════════════════════════════════════════════
+
+def run_optimization(df, target_acc, fast_range, slow_range, sl_list, tgt_list, qty, progress_cb=None):
+    results = []
+    total   = sum(1 for f in fast_range for s in slow_range if f < s) * len(sl_list) * len(tgt_list)
+    done    = 0
+
+    for f in fast_range:
+        for s in slow_range:
+            if f >= s:
+                continue
+            for sl_p in sl_list:
+                for tgt_p in tgt_list:
+                    t_df, _, _ = run_backtest(
+                        df, "EMA Crossover", "Both",
+                        "Custom Points", "Custom Points",
+                        sl_p, tgt_p, f, s, 2.0, 1.5, 2.0, qty,
+                        "Simple Crossover", 0.0, 10.0
+                    )
+                    done += 1
+                    if progress_cb:
+                        progress_cb(done / max(total, 1))
+
+                    if t_df.empty:
+                        continue
+                    wins  = len(t_df[t_df["PnL"] > 0])
+                    total_t = len(t_df)
+                    acc   = wins / total_t * 100 if total_t else 0
+                    results.append({
+                        "Fast EMA": f, "Slow EMA": s,
+                        "SL Pts": sl_p, "Tgt Pts": tgt_p,
+                        "Trades": total_t, "Wins": wins,
+                        "Accuracy %": round(acc, 1),
+                        "Total PnL": round(t_df["PnL"].sum(), 2),
+                        "Avg PnL":   round(t_df["PnL"].mean(), 2),
+                    })
+
+    if not results:
+        return pd.DataFrame()
+    res_df = pd.DataFrame(results).sort_values("Accuracy %", ascending=False)
+    filtered = res_df[res_df["Accuracy %"] >= target_acc]
+    return filtered if not filtered.empty else res_df  # Always return something
+
+# ═══════════════════════════════════════════════════════════════
+# PLOTTING
+# ═══════════════════════════════════════════════════════════════
+CHART_THEME = dict(
+    template        = "plotly_dark",
+    paper_bgcolor   = "rgba(13,17,23,1)",
+    plot_bgcolor    = "rgba(13,17,23,1)",
+    margin          = dict(l=0, r=0, t=40, b=0),
+    legend          = dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+    xaxis_rangeslider_visible = False,
 )
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  GLOBAL CSS  — dark theme, white fonts, components
-# ─────────────────────────────────────────────────────────────────────────────
-st.markdown("""
-<style>
-@import url('https://fonts.googleapis.com/css2?family=Sora:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
+def plot_backtest_chart(df, sig_df, t_df, fast, slow):
+    rows = [0.72, 0.28]
+    fig  = make_subplots(rows=2, cols=1, shared_xaxes=True,
+                         row_heights=rows, vertical_spacing=0.02)
 
-/* ── Base reset ─────────────────────────────────── */
-html, body, [class*="css"], .stApp {
-    font-family: 'Sora', sans-serif !important;
-    background: #070c18 !important;
-    color: #dde4f0 !important;
-}
+    # ── Candles
+    fig.add_trace(go.Candlestick(
+        x=df.index, open=df["Open"], high=df["High"],
+        low=df["Low"], close=df["Close"],
+        name="Price",
+        increasing_line_color="#26a69a", increasing_fillcolor="#0d2f27",
+        decreasing_line_color="#ef5350", decreasing_fillcolor="#2d0d0d",
+    ), row=1, col=1)
 
-/* ── Force readable text throughout ────────────── */
-p, li, h1, h2, h3, h4, h5, span, div, label, a {
-    color: #dde4f0;
-}
+    # ── EMAs
+    for col, color, lbl in [
+        ("ema_fast", "#FF6B35", f"EMA {fast}"),
+        ("ema_slow", "#4ECDC4", f"EMA {slow}"),
+    ]:
+        if col in sig_df.columns:
+            fig.add_trace(go.Scatter(
+                x=sig_df.index, y=sig_df[col],
+                name=lbl, line=dict(color=color, width=1.8)
+            ), row=1, col=1)
 
-/* ── Chat message area ──────────────────────────── */
-[data-testid="stChatMessage"] {
-    background: transparent !important;
-    padding: 4px 0 !important;
-}
-[data-testid="stChatMessage"] p,
-[data-testid="stChatMessage"] li,
-[data-testid="stChatMessage"] h1,
-[data-testid="stChatMessage"] h2,
-[data-testid="stChatMessage"] h3,
-[data-testid="stChatMessage"] h4,
-[data-testid="stChatMessage"] span,
-[data-testid="stChatMessage"] div,
-[data-testid="stChatMessage"] strong,
-[data-testid="stChatMessage"] em,
-[data-testid="stChatMessage"] td,
-[data-testid="stChatMessage"] th {
-    color: #dde4f0 !important;
-}
-[data-testid="stChatMessage"] code {
-    background: #111c30 !important;
-    color: #93c5fd !important;
-    border-radius: 4px;
-    padding: 1px 5px;
-    font-family: 'JetBrains Mono', monospace !important;
-    font-size: 12px !important;
-}
-[data-testid="stChatMessage"] pre {
-    background: #0c1728 !important;
-    border: 1px solid #1e3050;
-    border-radius: 8px;
-    padding: 12px !important;
-}
-[data-testid="stChatMessage"] pre code {
-    background: transparent !important;
-    color: #bae6fd !important;
-    font-size: 12px !important;
-}
+    # ── Trade markers
+    if not t_df.empty:
+        for side, sym_e, sym_x, col_e, col_x in [
+            ("BUY",  "triangle-up",   "x",           "#26a69a", "#1565C0"),
+            ("SELL", "triangle-down", "triangle-up", "#ef5350", "#FF9800"),
+        ]:
+            sub = t_df[t_df["Trade Type"] == side]
+            if sub.empty:
+                continue
+            fig.add_trace(go.Scatter(
+                x=sub["Entry Time"], y=sub["Entry Price"], mode="markers",
+                name=f"{side} Entry",
+                marker=dict(symbol=sym_e, size=13, color=col_e,
+                            line=dict(width=1.5, color="white")),
+            ), row=1, col=1)
+            fig.add_trace(go.Scatter(
+                x=sub["Exit Time"], y=sub["Exit Price"], mode="markers",
+                name=f"{side} Exit",
+                marker=dict(symbol=sym_x, size=11, color=col_x,
+                            line=dict(width=1.5, color="white")),
+            ), row=1, col=1)
 
-/* ── Sidebar ─────────────────────────────────────── */
-[data-testid="stSidebar"] {
-    background: #090e1c !important;
-    border-right: 1px solid #131f38 !important;
-}
-[data-testid="stSidebar"] p,
-[data-testid="stSidebar"] div,
-[data-testid="stSidebar"] span,
-[data-testid="stSidebar"] label {
-    color: #6a8ab0 !important;
-}
-[data-testid="stSidebar"] .stButton > button {
-    background: #0e1828 !important;
-    color: #6a8ab0 !important;
-    border: 1px solid #1a2e48 !important;
-    border-radius: 8px !important;
-    font-family: 'Sora', sans-serif !important;
-    font-size: 11px !important;
-    width: 100% !important;
-    transition: all .2s !important;
-}
-[data-testid="stSidebar"] .stButton > button:hover {
-    background: #152240 !important;
-    color: #b8d0f8 !important;
-    border-color: #3b5bdb !important;
-}
+    # ── Volume
+    v_colors = [
+        "rgba(38,166,154,0.55)" if c >= o else "rgba(239,83,80,0.55)"
+        for c, o in zip(df["Close"], df["Open"])
+    ]
+    if "Volume" in df.columns:
+        fig.add_trace(go.Bar(
+            x=df.index, y=df["Volume"], name="Volume", marker_color=v_colors
+        ), row=2, col=1)
 
-/* ── Header ─────────────────────────────────────── */
-.dm-header {
-    display:flex; align-items:center; gap:14px;
-    padding: 14px 0 12px 0;
-    border-bottom: 1px solid #131f38;
-    margin-bottom: 18px;
-}
-.dm-logo {
-    width:46px; height:46px;
-    background: linear-gradient(135deg,#3b5bdb 0%,#7048e8 100%);
-    border-radius:14px;
-    display:flex; align-items:center; justify-content:center;
-    font-size:24px; flex-shrink:0;
-    box-shadow: 0 4px 22px rgba(59,91,219,.45);
-}
-.dm-title {
-    font-size:22px; font-weight:700;
-    background: linear-gradient(90deg,#c5d5ff,#a78bfa);
-    -webkit-background-clip:text; -webkit-text-fill-color:transparent;
-}
-.dm-sub { font-size:11px; color:#2d4060; margin-top:2px; }
-
-/* ── Metric chips ────────────────────────────────── */
-.metric-row { display:flex; gap:7px; flex-wrap:wrap; margin:7px 0 2px 0; }
-.mc {
-    background:#0c1422; border:1px solid #172840;
-    border-radius:6px; padding:2px 9px;
-    font-family:'JetBrains Mono',monospace; font-size:10px; color:#3d5270;
-}
-.mc span { color:#60a5fa; font-weight:600; }
-.mc.good span { color:#34d399; }
-.mc.warn span { color:#fbbf24; }
-.mc.bad  span { color:#f87171; }
-
-/* ── Info block (sidebar) ────────────────────────── */
-.ib {
-    background:#0c1422; border:1px solid #172840;
-    border-radius:8px; padding:9px 12px; margin:5px 0; font-size:11px;
-}
-.ib .ibl {
-    font-size:9px; font-weight:600; letter-spacing:.08em;
-    text-transform:uppercase; color:#3b5bdb !important; margin-bottom:3px;
-}
-.ib .ibv {
-    color:#93c5fd !important;
-    font-family:'JetBrains Mono',monospace; font-size:11px;
-}
-
-/* ── Source card ─────────────────────────────────── */
-.src-card {
-    background:#0a1020; border:1px solid #162436;
-    border-radius:8px; padding:8px 11px; margin:4px 0;
-    border-left:3px solid #3b5bdb;
-}
-.src-card .sf {
-    font-family:'JetBrains Mono',monospace;
-    color:#93c5fd !important; font-size:10px; margin-bottom:3px;
-}
-.src-card .ss { color:#3d5270 !important; font-size:11px; line-height:1.5; }
-
-/* ── Suggestion chips ─────────────────────────────── */
-.sugg-label {
-    font-size:10px; font-weight:600; color:#2d4060;
-    letter-spacing:.08em; text-transform:uppercase; margin:14px 0 8px 0;
-}
-div[data-testid="stHorizontalBlock"] .stButton > button {
-    background: #0c1828 !important;
-    color: #93c5fd !important;
-    border: 1px solid #1a3a5f !important;
-    border-radius: 20px !important;
-    font-family: 'Sora', sans-serif !important;
-    font-size: 11px !important;
-    padding: 5px 13px !important;
-    transition: all .2s !important;
-    height: auto !important;
-    line-height: 1.45 !important;
-    white-space: normal !important;
-    text-align: left !important;
-}
-div[data-testid="stHorizontalBlock"] .stButton > button:hover {
-    background: #132648 !important;
-    color: #dbeafe !important;
-    border-color: #3b82f6 !important;
-    box-shadow: 0 4px 14px rgba(59,130,246,.2) !important;
-    transform: translateY(-1px);
-}
-
-/* ── Like / dislike buttons ──────────────────────── */
-[data-testid^="stButton-like_"] > button,
-[data-testid^="stButton-dislike_"] > button {
-    background: #0c1422 !important;
-    border: 1px solid #172840 !important;
-    border-radius: 6px !important;
-    font-size: 14px !important;
-    padding: 2px 8px !important;
-    transition: all .18s !important;
-    color: #4a6080 !important;
-}
-[data-testid^="stButton-like_"] > button:hover    { background:#0d2210 !important; border-color:#34d399 !important; }
-[data-testid^="stButton-dislike_"] > button:hover { background:#200d0d !important; border-color:#f87171 !important; }
-
-/* ── Empty state ─────────────────────────────────── */
-.empty-state {
-    text-align:center; padding:70px 20px; color:#1a2540;
-}
-.empty-state .ei { font-size:52px; margin-bottom:16px; opacity:.5; }
-.empty-state h3  { color:#243652; font-size:17px; font-weight:600; }
-.empty-state p   { color:#1a2540; font-size:13px; }
-
-/* ── Chat input ──────────────────────────────────── */
-[data-testid="stChatInput"] textarea {
-    background: #0c1422 !important;
-    border: 1px solid #172840 !important;
-    color: #dde4f0 !important;
-    border-radius: 12px !important;
-    font-family: 'Sora', sans-serif !important;
-    font-size: 13px !important;
-}
-[data-testid="stChatInput"] textarea::placeholder { color:#2d4060 !important; }
-[data-testid="stChatInput"] textarea:focus {
-    border-color: #3b5bdb !important;
-    box-shadow: 0 0 0 3px rgba(59,91,219,.12) !important;
-}
-
-/* ── Status widget (loader) ──────────────────────── */
-[data-testid="stStatusWidget"],
-details[data-testid="stStatus"] {
-    background: #0c1828 !important;
-    border: 1px solid #1a2e48 !important;
-    border-radius: 10px !important;
-    color: #6a8ab0 !important;
-}
-details[data-testid="stStatus"] * { color:#6a8ab0 !important; }
-
-/* ── Expander ─────────────────────────────────────── */
-details summary {
-    background: #0c1422 !important;
-    border: 1px solid #172840 !important;
-    border-radius: 8px !important;
-    color: #4a6080 !important;
-    font-size: 11px !important;
-}
-details[open] summary { border-radius:8px 8px 0 0 !important; }
-details > div {
-    background: #080e1c !important;
-    border: 1px solid #172840 !important;
-    border-top: none !important;
-    border-radius: 0 0 8px 8px !important;
-    color: #6a8ab0 !important;
-}
-details > div * { color: #6a8ab0 !important; }
-
-/* ── Divider ─────────────────────────────────────── */
-hr { border-color: #172840 !important; margin: 12px 0 !important; }
-
-/* ── Scrollbar ───────────────────────────────────── */
-::-webkit-scrollbar { width: 4px; }
-::-webkit-scrollbar-track { background: #070c18; }
-::-webkit-scrollbar-thumb { background: #172840; border-radius: 2px; }
-::-webkit-scrollbar-thumb:hover { background: #243654; }
-</style>
-""", unsafe_allow_html=True)
+    fig.update_layout(title="Backtest Chart", height=580, **CHART_THEME)
+    return fig
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  SQLITE  — persistence layer
-# ─────────────────────────────────────────────────────────────────────────────
-def _conn():
-    return sqlite3.connect(SQLITE_PATH, check_same_thread=False)
+def plot_live_chart(df, pos, ef_series, es_series, fast, slow):
+    plot_df = df.iloc[-120:]
+    rows = [0.72, 0.28]
+    fig = make_subplots(rows=2, cols=1, shared_xaxes=True,
+                        row_heights=rows, vertical_spacing=0.02)
 
-def init_sqlite():
-    c = _conn()
-    c.executescript("""
-        CREATE TABLE IF NOT EXISTS sessions (
-            id            TEXT PRIMARY KEY,
-            title         TEXT    DEFAULT 'New Conversation',
-            created_at    TEXT,
-            updated_at    TEXT,
-            total_queries INTEGER DEFAULT 0
-        );
-        CREATE TABLE IF NOT EXISTS messages (
-            id                  INTEGER PRIMARY KEY AUTOINCREMENT,
-            session_id          TEXT NOT NULL,
-            role                TEXT NOT NULL,
-            content             TEXT NOT NULL,
-            timestamp           TEXT NOT NULL,
-            latency             REAL    DEFAULT 0,
-            tokens              INTEGER DEFAULT 0,
-            sources             TEXT    DEFAULT '[]',
-            feedback            INTEGER DEFAULT 0,
-            ragas_faithfulness  REAL    DEFAULT NULL,
-            ragas_relevancy     REAL    DEFAULT NULL,
-            FOREIGN KEY (session_id) REFERENCES sessions(id)
-        );
-    """)
-    c.commit(); c.close()
+    fig.add_trace(go.Candlestick(
+        x=plot_df.index, open=plot_df["Open"], high=plot_df["High"],
+        low=plot_df["Low"], close=plot_df["Close"],
+        name="Price",
+        increasing_line_color="#26a69a", increasing_fillcolor="#0d2f27",
+        decreasing_line_color="#ef5350", decreasing_fillcolor="#2d0d0d",
+    ), row=1, col=1)
 
-def db_new_session(sid: str, title: str = "New Conversation"):
-    c = _conn(); now = datetime.now().isoformat()
-    c.execute("INSERT OR IGNORE INTO sessions (id,title,created_at,updated_at) VALUES(?,?,?,?)",
-              (sid, title, now, now))
-    c.commit(); c.close()
+    for series, color, lbl in [
+        (ef_series, "#FF6B35", f"EMA {fast}"),
+        (es_series, "#4ECDC4", f"EMA {slow}"),
+    ]:
+        if series is not None and len(series) > 0:
+            fig.add_trace(go.Scatter(
+                x=series.iloc[-120:].index, y=series.iloc[-120:],
+                name=lbl, line=dict(color=color, width=1.8)
+            ), row=1, col=1)
 
-def db_save_msg(sid, role, content, latency=0, tokens=0, sources=None) -> int:
-    srcs_json = json.dumps([
-        {"source": d.metadata.get("source","?"),
-         "page":   d.metadata.get("page","?"),
-         "snippet":d.page_content[:200]}
-        for d in (sources or [])
-    ])
-    c = _conn(); cur = c.cursor()
-    cur.execute(
-        "INSERT INTO messages(session_id,role,content,timestamp,latency,tokens,sources)"
-        " VALUES(?,?,?,?,?,?,?)",
-        (sid, role, content, datetime.now().isoformat(), latency, tokens, srcs_json)
+    if pos:
+        ep = pos["entry_price"]
+        sl = pos["sl"]
+        tgt = pos["tgt"]
+        fig.add_hline(y=ep,  line_color="#FFD700", line_width=2, line_dash="solid",
+                      annotation_text=f"Entry {ep:.2f}", row=1, col=1)
+        fig.add_hline(y=sl,  line_color="#ef5350", line_width=1.8, line_dash="dash",
+                      annotation_text=f"SL {sl:.2f}", row=1, col=1)
+        fig.add_hline(y=tgt, line_color="#26a69a", line_width=1.8, line_dash="dash",
+                      annotation_text=f"Tgt {tgt:.2f}", row=1, col=1)
+
+    v_colors = [
+        "rgba(38,166,154,0.55)" if c >= o else "rgba(239,83,80,0.55)"
+        for c, o in zip(plot_df["Close"], plot_df["Open"])
+    ]
+    if "Volume" in plot_df.columns:
+        fig.add_trace(go.Bar(
+            x=plot_df.index, y=plot_df["Volume"], name="Volume", marker_color=v_colors
+        ), row=2, col=1)
+
+    fig.update_layout(title="Live Trading Chart", height=520, **CHART_THEME)
+    return fig
+
+
+def plot_pnl_curve(t_df):
+    cum = t_df["PnL"].cumsum()
+    fig = go.Figure()
+    total = float(cum.iloc[-1]) if len(cum) else 0
+    color = "#26a69a" if total >= 0 else "#ef5350"
+    fig.add_trace(go.Scatter(
+        x=list(range(1, len(cum)+1)), y=cum,
+        mode="lines+markers", fill="tozeroy",
+        line=dict(color=color, width=2),
+        fillcolor=f"rgba(38,166,154,0.15)" if total >= 0 else "rgba(239,83,80,0.15)",
+        marker=dict(size=6, color=[
+            "#26a69a" if p > 0 else "#ef5350" for p in t_df["PnL"]
+        ]),
+        name="Cumulative PnL",
+    ))
+    fig.update_layout(
+        title="Cumulative PnL Curve", height=250,
+        xaxis_title="Trade #", yaxis_title="PnL (₹)",
+        **CHART_THEME
     )
-    mid = cur.lastrowid
-    if role == "assistant":
-        c.execute("UPDATE sessions SET updated_at=?,total_queries=total_queries+1 WHERE id=?",
-                  (datetime.now().isoformat(), sid))
-    c.commit(); c.close(); return mid
+    return fig
 
-def db_set_ragas(mid: int, faith: float, relev: float):
-    c = _conn()
-    c.execute("UPDATE messages SET ragas_faithfulness=?,ragas_relevancy=? WHERE id=?",
-              (faith, relev, mid))
-    c.commit(); c.close()
-
-def db_set_feedback(mid: int, fb: int):
-    c = _conn()
-    c.execute("UPDATE messages SET feedback=? WHERE id=?", (fb, mid))
-    c.commit(); c.close()
-
-def db_set_title(sid: str, title: str):
-    c = _conn()
-    c.execute("UPDATE sessions SET title=? WHERE id=?", (title[:60], sid))
-    c.commit(); c.close()
-
-def db_list_sessions(limit: int = 15):
-    c = _conn()
-    rows = c.execute(
-        "SELECT id,title,created_at,total_queries FROM sessions"
-        " ORDER BY updated_at DESC LIMIT ?", (limit,)
-    ).fetchall()
-    c.close(); return rows
-
-def db_load_session(sid: str):
-    c = _conn()
-    rows = c.execute(
-        "SELECT role,content,latency,tokens,feedback,"
-        "ragas_faithfulness,ragas_relevancy,id"
-        " FROM messages WHERE session_id=? ORDER BY id", (sid,)
-    ).fetchall()
-    c.close(); return rows
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  MODEL LOADERS  (cached once per process)
-# ─────────────────────────────────────────────────────────────────────────────
-@st.cache_resource(show_spinner=False)
-def _reranker():
-    return CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
-
-@st.cache_resource(show_spinner=False)
-def _embeddings():
-    return HuggingFaceEmbeddings(
-        model_name="BAAI/bge-base-en-v1.5",
-        encode_kwargs={"normalize_embeddings": True},
+# ═══════════════════════════════════════════════════════════════
+# UI HELPERS
+# ═══════════════════════════════════════════════════════════════
+def metric_card(label, value, sub=None, color="#FFD700"):
+    sub_html = f"<div style='color:#888;font-size:0.75rem;margin-top:2px'>{sub}</div>" if sub else ""
+    return (
+        f"<div style='background:linear-gradient(135deg,#1a2332,#0f1923);"
+        f"border:1px solid #2a3545;border-radius:10px;padding:14px 18px;"
+        f"margin:4px 0;min-height:70px'>"
+        f"<div style='color:#aaa;font-size:0.75rem;text-transform:uppercase;letter-spacing:1px'>{label}</div>"
+        f"<div style='color:{color};font-size:1.5rem;font-weight:700;line-height:1.2'>{value}</div>"
+        f"{sub_html}</div>"
     )
 
-reranker        = _reranker()
-embedding_model = _embeddings()
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  SESSION STATE
-# ─────────────────────────────────────────────────────────────────────────────
-def init_session():
-    init_sqlite()
-    if "session_id" not in st.session_state:
-        sid = str(uuid.uuid4())
-        st.session_state.session_id = sid
-        db_new_session(sid)
-    for k, v in {
-        "chat_history"  : [],
-        "pending_query" : None,
-        "suggestions"   : [],
-        "last_sources"  : [],
-        "last_latency"  : 0.0,
-        "last_tokens"   : 0,
-        "feedback"      : {},
-        "ragas_cache"   : {},
-    }.items():
-        if k not in st.session_state:
-            st.session_state[k] = v
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  LLM FACTORY
-# ─────────────────────────────────────────────────────────────────────────────
-def llm(temperature: float = 0.1) -> ChatOpenAI:
-    return ChatOpenAI(
-        openai_api_key=OPENAI_API_KEY,
-        openai_api_base=OPENAI_API_BASE,
-        model_name=MODEL_NAME,
-        temperature=temperature,
+def ltp_banner(name, ticker, ltp, change, pct):
+    c = "#26a69a" if change >= 0 else "#ef5350"
+    sign = "+" if change >= 0 else ""
+    arrow = "▲" if change >= 0 else "▼"
+    return (
+        f"<div style='background:linear-gradient(90deg,#1a2332 0%,#0f1923 100%);"
+        f"border:1px solid #2a3545;border-radius:12px;padding:14px 20px;"
+        f"display:flex;align-items:center;gap:20px;margin-bottom:12px'>"
+        f"<div>"
+        f"  <div style='color:#8899aa;font-size:0.8rem;text-transform:uppercase;letter-spacing:1px'>{name}</div>"
+        f"  <div style='color:#aabbcc;font-size:0.9rem'>{ticker}</div>"
+        f"</div>"
+        f"<div style='flex:1'></div>"
+        f"<div style='font-size:2rem;font-weight:800;color:#FFD700'>{ltp:,.2f}</div>"
+        f"<div style='color:{c};font-size:1.1rem;font-weight:600'>{arrow} {sign}{change:.2f} ({sign}{pct:.2f}%)</div>"
+        f"</div>"
     )
 
-def count_tokens(text: str) -> int:
-    return len(tiktoken.get_encoding("cl100k_base").encode(text))
+def apply_table_style(df):
+    if df.empty:
+        return df.style
+    def row_color(row):
+        pnl = row.get("PnL", row.get("Total PnL", 0))
+        if pnl > 0:
+            return ["background-color:rgba(38,166,154,0.12)"] * len(row)
+        elif pnl < 0:
+            return ["background-color:rgba(239,83,80,0.12)"]  * len(row)
+        return [""] * len(row)
+    return df.style.apply(row_color, axis=1)
 
+# ═══════════════════════════════════════════════════════════════
+# MAIN APP
+# ═══════════════════════════════════════════════════════════════
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  PDF loading & splitting
-# ─────────────────────────────────────────────────────────────────────────────
-def load_pdfs():
-    docs = []
-    if not os.path.isdir(DATA_PATH):
-        return docs
-    for fname in os.listdir(DATA_PATH):
-        if fname.lower().endswith(".pdf"):
-            pages = PyPDFLoader(os.path.join(DATA_PATH, fname)).load()
-            for p in pages:
-                p.metadata["source"] = fname
-            docs.extend(pages)
-    return docs
-
-def split_docs(docs):
-    # Smaller chunks (450) + mild overlap (80) → higher precision
-    return RecursiveCharacterTextSplitter(
-        chunk_size=450, chunk_overlap=80
-    ).split_documents(docs)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  VECTOR DB
-# ─────────────────────────────────────────────────────────────────────────────
-def _db_ready() -> bool:
-    return os.path.exists(os.path.join(FAISS_PATH, "index.faiss"))
-
-def build_faiss():
-    db = FAISS.from_documents(split_docs(load_pdfs()), embedding_model)
-    db.save_local(FAISS_PATH)
-    return db
-
-@st.cache_resource(show_spinner=False)
-def load_faiss():
-    return FAISS.load_local(
-        FAISS_PATH, embedding_model, allow_dangerous_deserialization=True
+def main():
+    st.set_page_config(
+        page_title = "Smart Investing",
+        page_icon  = "📈",
+        layout     = "wide",
+        initial_sidebar_state = "expanded",
     )
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  BM25  lexical retrieval
-# ─────────────────────────────────────────────────────────────────────────────
-def bm25_score(docs, query: str):
-    if not docs:
-        return []
-    scores = BM25Okapi([d.page_content.lower().split() for d in docs]
-                       ).get_scores(query.lower().split())
-    return [d for _, d in sorted(zip(scores, docs), key=lambda x: x[0], reverse=True)]
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  CROSS-ENCODER reranker
-# ─────────────────────────────────────────────────────────────────────────────
-def rerank(query: str, docs):
-    if not docs:
-        return []
-    scores = reranker.predict([(query, d.page_content) for d in docs])
-    return [d for _, d in sorted(zip(scores, docs), key=lambda x: x[0], reverse=True)]
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  MULTI-QUERY expansion  — richer recall
-# ─────────────────────────────────────────────────────────────────────────────
-def query_variants(query: str, n: int = 3) -> list:
-    try:
-        prompt = (
-            f"Rephrase this search query in {n} different ways to maximise document recall.\n"
-            "Return ONLY the queries, one per line.\n"
-            f"Query: {query}"
-        )
-        resp = llm(0.4).invoke(prompt).content.strip()
-        variants = [l.strip() for l in resp.split("\n") if len(l.strip()) > 5][:n]
-        return variants + [query]
-    except Exception:
-        return [query]
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  HyDE  — Hypothetical Document Embedding
-# ─────────────────────────────────────────────────────────────────────────────
-def hyde_doc(query: str) -> str:
-    try:
-        return llm(0.5).invoke(
-            f"Write a concise 3-sentence paragraph that directly answers: \"{query}\""
-        ).content
-    except Exception:
-        return query
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  HYBRID RETRIEVAL  pipeline
-# ─────────────────────────────────────────────────────────────────────────────
-def retrieve(query: str, db, status_ref=None) -> list:
-    def log(msg):
-        if status_ref:
-            status_ref.write(msg)
-
-    # 1. Multi-query variants
-    queries = query_variants(query) if ENABLE_MULTI_QUERY else [query]
-    log(f"   ↳ {len(queries)} query variants")
-
-    # 2. Optional HyDE
-    if ENABLE_HYDE:
-        log("   ↳ HyDE hypothetical doc…")
-        queries.append(hyde_doc(query))
-
-    # 3. Dense retrieval (FAISS)
-    seen, candidates = set(), []
-    for q in queries:
-        for d in db.similarity_search(q, k=10):
-            if d.page_content not in seen:
-                candidates.append(d)
-                seen.add(d.page_content)
-    log(f"   ↳ {len(candidates)} dense candidates")
-
-    # 4. BM25 re-score on candidate pool
-    bm25_ranked = bm25_score(candidates, query)
-    for d in bm25_ranked:
-        if d.page_content not in seen:
-            candidates.append(d)
-            seen.add(d.page_content)
-
-    # 5. Cross-encoder reranking
-    log("   ↳ Cross-encoder reranking…")
-    return rerank(query, candidates)[:TOP_K_RETRIEVE]
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  HELPERS
-# ─────────────────────────────────────────────────────────────────────────────
-def fmt_history(history, n: int = MAX_HISTORY_TURNS) -> str:
-    lines = []
-    for role, msg, *_ in history[-(n * 2):]:
-        lines.append(f"{'User' if role == 'user' else 'Assistant'}: {msg}")
-    return "\n".join(lines)
-
-def clean_qs(text: str) -> list:
-    out = []
-    for l in text.strip().split("\n"):
-        l = re.sub(r"^[-•\d.)\s]+", "", l.strip())
-        if len(l) > 8 and "question" not in l.lower():
-            out.append(l)
-    return out[:3]
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  ANSWER GENERATION
-# ─────────────────────────────────────────────────────────────────────────────
-_SYS = """You are DocMind, a precise and expert RAG assistant.
-Rules:
-- Answer using ONLY the provided context. Cite source filenames when useful.
-- Use markdown formatting (bullets, bold, tables, code blocks) where it aids clarity.
-- If context is insufficient, say: "The documents don't contain enough info on this."
-- Never fabricate facts or hallucinate citations."""
-
-def answer_query(query: str, history, db, status_ref=None):
-    status_ref and status_ref.write("📚 Running hybrid retrieval…")
-    docs = retrieve(query, db, status_ref)
-
-    context = "\n\n---\n\n".join([
-        f"[{d.metadata.get('source','?')} p.{d.metadata.get('page','?')}]\n{d.page_content}"
-        for d in docs
-    ])
-    prompt = (
-        f"{_SYS}\n\n"
-        f"### Conversation History\n{fmt_history(history)}\n\n"
-        f"### Retrieved Context\n{context}\n\n"
-        f"### Question\n{query}"
-    )
-    tokens = count_tokens(prompt)
-
-    status_ref and status_ref.write("🧠 Generating answer…")
-    t0   = time.time()
-    resp = llm().invoke(prompt)
-    return resp.content, docs, time.time() - t0, tokens
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  RAGAS  evaluation
-# ─────────────────────────────────────────────────────────────────────────────
-def run_ragas(query: str, answer: str, docs) -> dict:
-    """Faithfulness + Answer Relevancy → printed to console + returned."""
-    if not ENABLE_RAGAS:
-        return {}
-    try:
-        from ragas import evaluate as _eval
-        from ragas.metrics import faithfulness, answer_relevancy
-        from datasets import Dataset
-
-        ds = Dataset.from_dict({
-            "question": [query],
-            "answer":   [answer],
-            "contexts": [[d.page_content for d in docs]],
-        })
-        res = _eval(
-            ds,
-            metrics=[faithfulness, answer_relevancy],
-            llm=llm(),
-            embeddings=embedding_model,
-            raise_exceptions=False,
-        )
-        f = round(float(res["faithfulness"]),     4)
-        r = round(float(res["answer_relevancy"]), 4)
-
-        # ── Console output ────────────────────────────────────────────────
-        bar = "=" * 58
-        print(f"\n{bar}")
-        print(f"  🔬  RAGAS  [{datetime.now().strftime('%H:%M:%S')}]")
-        print(f"  Q              : {query[:65]}")
-        print(f"  Faithfulness   : {f:.4f}  {'✅ OK' if f >= 0.7 else '⚠️  LOW'}")
-        print(f"  Ans Relevancy  : {r:.4f}  {'✅ OK' if r >= 0.7 else '⚠️  LOW'}")
-        print(bar)
-
-        return {"faithfulness": f, "answer_relevancy": r}
-
-    except ImportError:
-        print("[RAGAS] Not installed — pip install ragas datasets")
-        return {}
-    except Exception as e:
-        print(f"[RAGAS] Error: {e}")
-        return {}
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  SUGGESTIONS
-# ─────────────────────────────────────────────────────────────────────────────
-def suggest(query: str, answer: str) -> list:
-    try:
-        resp = llm(0.45).invoke(
-            "Generate exactly 3 short follow-up questions based on this Q&A.\n"
-            "Return ONLY the questions, one per line, no numbers.\n\n"
-            f"Q: {query}\nA: {answer}"
-        ).content
-        return clean_qs(resp)
-    except Exception:
-        return []
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  RAGAS score → CSS class helper
-# ─────────────────────────────────────────────────────────────────────────────
-def _cls(v) -> str:
-    if v is None:
-        return ""
-    return "good" if v >= 0.75 else ("warn" if v >= 0.5 else "bad")
-
-
-# ═════════════════════════════════════════════════════════════════════════════
-#  APP  STARTS  HERE
-# ═════════════════════════════════════════════════════════════════════════════
-init_session()
-
-# ─── SIDEBAR ──────────────────────────────────────────────────────────────────
-with st.sidebar:
+    # ── Global CSS ─────────────────────────────────────────────
     st.markdown("""
-    <div style='padding:10px 0 14px'>
-      <div style='font-size:17px;font-weight:700;
-                  background:linear-gradient(90deg,#c5d5ff,#a78bfa);
-                  -webkit-background-clip:text;-webkit-text-fill-color:transparent'>
-        🧠 DocMind
-      </div>
-      <div style='font-size:10px;color:#1e2d45;margin-top:2px'>
-        RAG-Powered Document Assistant
-      </div>
-    </div>""", unsafe_allow_html=True)
+    <style>
+    @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&family=Space+Grotesk:wght@300;400;500;600;700&display=swap');
 
-    st.divider()
+    html, body, [class*="css"] { font-family: 'Space Grotesk', sans-serif; }
+    code, pre, .stTextInput input { font-family: 'JetBrains Mono', monospace; }
 
-    # ── Controls ──────────────────────────────────────────────────────────
-    c1, c2 = st.columns(2)
-    with c1:
-        if st.button("➕ New Chat", use_container_width=True):
-            sid = str(uuid.uuid4())
-            db_new_session(sid)
-            for k in ("chat_history","suggestions","last_sources","feedback","ragas_cache"):
-                st.session_state[k] = [] if k == "chat_history" else {}
-                if k in ("suggestions","last_sources"):
-                    st.session_state[k] = []
-            st.session_state.session_id   = sid
-            st.session_state.pending_query = None
-            st.rerun()
-    with c2:
-        if st.button("🔄 Rebuild DB", use_container_width=True):
-            with st.spinner("Indexing PDFs…"):
-                build_faiss(); load_faiss.clear()
-            st.success("Done!")
+    .stApp { background-color: #0d1117; }
+    section[data-testid="stSidebar"] { background: #0a0f16 !important; border-right: 1px solid #1e2a38; }
+    .stTabs [data-baseweb="tab-list"] { background: #0f1923; border-radius: 10px; gap: 4px; padding: 4px; }
+    .stTabs [data-baseweb="tab"]      { background: transparent; color: #8899aa; border-radius: 8px; font-weight:500; }
+    .stTabs [aria-selected="true"]    { background: linear-gradient(135deg,#1e3a5f,#162a45) !important; color:#4fc3f7 !important; }
 
-    st.divider()
+    div[data-testid="metric-container"] {
+        background: linear-gradient(135deg,#1a2332,#0f1923);
+        border: 1px solid #2a3545; border-radius: 10px; padding: 12px 16px;
+    }
+    div[data-testid="metric-container"] label { color: #8899aa !important; font-size:0.75rem !important; text-transform:uppercase; letter-spacing:0.8px; }
+    div[data-testid="metric-container"] [data-testid="metric-value"] { color: #e8edf2 !important; font-size:1.4rem !important; font-weight:700 !important; }
 
-    # ── Session stats ──────────────────────────────────────────────────────
-    n_msgs = len([1 for r, *_ in st.session_state.chat_history if r == "assistant"])
-    st.markdown(f"""
-    <div class='ib'><div class='ibl'>Queries this session</div>
-      <div class='ibv'>{n_msgs}</div></div>
-    <div class='ib'><div class='ibl'>Last response time</div>
-      <div class='ibv'>{st.session_state.last_latency:.2f}s</div></div>
-    <div class='ib'><div class='ibl'>Last prompt tokens</div>
-      <div class='ibv'>{st.session_state.last_tokens:,}</div></div>
+    .stButton > button {
+        background: linear-gradient(135deg,#1e3a5f,#0f2040);
+        border: 1px solid #2a4a6f; color: #7ec8e3;
+        border-radius: 8px; font-weight: 600; transition: all 0.2s;
+    }
+    .stButton > button:hover { background: linear-gradient(135deg,#2a4f7f,#1a3060); border-color: #4fc3f7; color: #fff; }
+    button[kind="primary"] { background: linear-gradient(135deg,#0d4f3c,#0a3828) !important; border-color:#26a69a !important; color:#26a69a !important; }
+    button[kind="primary"]:hover { background: linear-gradient(135deg,#1a7a5c,#115040) !important; color:#fff !important; }
+
+    .stDataFrame { border: 1px solid #2a3545; border-radius: 8px; overflow: hidden; }
+    .stTextInput > div > div > input, .stNumberInput > div > div > input, .stSelectbox > div > div { background: #0f1923 !important; border-color: #2a3545 !important; color: #e8edf2 !important; }
+    .stCheckbox label { color: #8899aa !important; }
+    .stSidebar label { color: #7888aa !important; font-size: 0.8rem !important; }
+    hr { border-color: #1e2a38 !important; }
+    .st-expander { background: #0f1923; border: 1px solid #2a3545; border-radius: 8px; }
+
+    .live-running { animation: pulse 2s infinite; }
+    @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.6} }
+    </style>
     """, unsafe_allow_html=True)
 
-    st.divider()
+    # ═══════════════════════════════════════════════════════════
+    # SIDEBAR
+    # ═══════════════════════════════════════════════════════════
+    with st.sidebar:
+        st.markdown(
+            "<div style='text-align:center;padding:12px 0 8px'>"
+            "<span style='font-size:1.6rem;font-weight:800;color:#FFD700'>📈 Smart Investing</span>"
+            "<div style='color:#8899aa;font-size:0.75rem;margin-top:4px'>Algorithmic Trading Platform</div>"
+            "</div>",
+            unsafe_allow_html=True
+        )
+        st.markdown("---")
 
-    # ── Last retrieved sources ─────────────────────────────────────────────
-    if st.session_state.last_sources:
-        st.markdown("<div class='ibl' style='font-size:9px;font-weight:600;letter-spacing:.08em;text-transform:uppercase;color:#3b5bdb;margin-bottom:6px'>Last Sources</div>",
-                    unsafe_allow_html=True)
-        for doc in st.session_state.last_sources:
-            snippet = doc.page_content[:105].replace("\n", " ")
-            st.markdown(f"""
-            <div class='src-card'>
-              <div class='sf'>📄 {doc.metadata.get('source','?')} · p.{doc.metadata.get('page','?')}</div>
-              <div class='ss'>{snippet}…</div>
-            </div>""", unsafe_allow_html=True)
-        st.divider()
+        # Instrument
+        st.markdown("#### 🎯 Instrument")
+        ticker_name = st.selectbox("Select Ticker", list(TICKER_MAP.keys()), label_visibility="collapsed")
+        if ticker_name == "Custom":
+            ticker = st.text_input("Custom Ticker", value="RELIANCE.NS", placeholder="e.g. TCS.NS")
+        else:
+            ticker = TICKER_MAP[ticker_name]
 
-    # ── Past sessions ──────────────────────────────────────────────────────
-    sessions = db_list_sessions()
-    if sessions:
-        st.markdown("<div class='ibl' style='font-size:9px;font-weight:600;letter-spacing:.08em;text-transform:uppercase;color:#3b5bdb;margin-bottom:6px'>Past Sessions</div>",
-                    unsafe_allow_html=True)
-        for sid, title, created, nq in sessions:
-            is_cur   = sid == st.session_state.session_id
-            date_str = (created or "")[:10]
-            label    = f"{'🟢 ' if is_cur else ''}{title or 'Untitled'} · {nq}q · {date_str}"
-            if st.button(label, key=f"sess_{sid}", use_container_width=True):
-                if not is_cur:
-                    rows = db_load_session(sid)
-                    hist, fb_map, rg_map = [], {}, {}
-                    for role, content, lat, tok, fb, rf, rr, mid in rows:
-                        meta = {"latency": lat, "tokens": tok, "msg_id": mid, "feedback": fb}
-                        if rf is not None:
-                            meta["ragas"] = {"faithfulness": rf, "answer_relevancy": rr}
-                            rg_map[mid]   = meta["ragas"]
-                        hist.append([role, content, meta])
-                        if fb: fb_map[mid] = fb
-                    st.session_state.update({
-                        "session_id": sid, "chat_history": hist,
-                        "feedback": fb_map, "ragas_cache": rg_map,
-                        "suggestions": [], "last_sources": [],
-                    })
+        # Timeframe / Period
+        st.markdown("#### ⏱ Timeframe")
+        c1, c2 = st.columns(2)
+        with c1:
+            interval = st.selectbox("Interval", list(TIMEFRAME_PERIOD_MAP.keys()), index=2)
+        with c2:
+            periods = TIMEFRAME_PERIOD_MAP[interval]
+            period  = st.selectbox("Period", periods, index=min(2, len(periods)-1))
+
+        st.markdown("---")
+
+        # Strategy
+        st.markdown("#### 🧠 Strategy")
+        strategy = st.selectbox("Strategy", STRATEGIES)
+
+        fast = slow = 9
+        cross_type = "Simple Crossover"
+        min_angle  = 0.0
+        candle_sz  = 10.0
+
+        if strategy in ("EMA Crossover", "EMA Anticipation"):
+            c1, c2 = st.columns(2)
+            with c1:
+                fast = st.number_input("Fast EMA", value=9,  min_value=2, max_value=200, step=1)
+            with c2:
+                slow = st.number_input("Slow EMA", value=15, min_value=2, max_value=500, step=1)
+
+            cross_type = st.selectbox("Crossover Filter", [
+                "Simple Crossover", "Custom Candle Size", "ATR Based Candle Size"])
+            if cross_type == "Custom Candle Size":
+                candle_sz = st.number_input("Min Candle Size (pts)", value=10.0, min_value=0.1)
+
+            use_angle = st.checkbox("Min Crossover Angle", value=False)
+            if use_angle:
+                min_angle = st.number_input("Min Angle (pts diff)", value=0.0, min_value=0.0, step=0.5)
+
+        direction = st.selectbox("Trade Direction", ["Both", "Buy Only", "Sell Only"])
+
+        st.markdown("---")
+
+        # SL
+        st.markdown("#### 🛡 Stop Loss")
+        sl_type = st.selectbox("SL Type", SL_TYPES)
+        c1, c2  = st.columns(2)
+        with c1:
+            sl_pts  = st.number_input("SL Points", value=10.0, min_value=0.1, step=1.0)
+        with c2:
+            atr_m_sl = st.number_input("ATR Mult", value=1.5, min_value=0.1, step=0.1)
+
+        # Target
+        st.markdown("#### 🎯 Target")
+        tgt_type = st.selectbox("Target Type", TARGET_TYPES)
+        c1, c2   = st.columns(2)
+        with c1:
+            tgt_pts  = st.number_input("Tgt Points", value=20.0, min_value=0.1, step=1.0)
+        with c2:
+            atr_m_tgt= st.number_input("ATR Mult ", value=2.0, min_value=0.1, step=0.1)
+
+        rr = st.number_input("R:R Ratio", value=2.0, min_value=0.1, step=0.5)
+
+        st.markdown("---")
+
+        # Position
+        st.markdown("#### 📦 Position")
+        qty = st.number_input("Quantity", value=1, min_value=1)
+
+        # Live settings
+        st.markdown("#### ⚙ Live Settings")
+        use_cooldown  = st.checkbox("Cooldown Between Trades", value=True)
+        cooldown_secs = st.number_input("Cooldown (seconds)", value=5, min_value=1) if use_cooldown else 0
+        prev_overlap  = st.checkbox("Prevent Overlapping Trades", value=True)
+
+        st.markdown("---")
+
+        # Dhan
+        st.markdown("#### 🏦 Dhan Broker")
+        dhan_en   = st.checkbox("Enable Dhan Broker", value=False)
+        opts_en   = False
+        dhan_cfg  = {}
+
+        if dhan_en:
+            dhan_cfg["client_id"]     = st.text_input("Client ID", value="1104779876")
+            dhan_cfg["access_token"]  = st.text_input("Access Token", type="password")
+
+            opts_en = st.checkbox("Options Trading", value=False)
+
+            if opts_en:
+                dhan_cfg["fno_exchange"]    = st.selectbox("FNO Exchange", ["NSE_FNO", "BSE_FNO"])
+                dhan_cfg["ce_security_id"]  = st.text_input("CE Security ID", value="57749")
+                dhan_cfg["pe_security_id"]  = st.text_input("PE Security ID", value="57716")
+                dhan_cfg["options_qty"]     = st.number_input("Lots Qty", value=65, min_value=1)
+                dhan_cfg["options_entry_type"] = st.selectbox("Entry Type", ["MARKET", "LIMIT"], key="oe")
+                dhan_cfg["options_exit_type"]  = st.selectbox("Exit Type",  ["MARKET", "LIMIT"], key="ox")
+            else:
+                dhan_cfg["exchange"]        = st.selectbox("Exchange",  ["NSE", "BSE"])
+                dhan_cfg["product_type"]    = st.selectbox("Product",   ["INTRADAY", "DELIVERY"])
+                dhan_cfg["security_id"]     = st.text_input("Security ID", value="12092")
+                dhan_cfg["equity_qty"]      = st.number_input("Qty", value=1, min_value=1)
+                dhan_cfg["equity_entry_type"] = st.selectbox("Entry Type", ["MARKET", "LIMIT"], key="ee")
+                dhan_cfg["equity_exit_type"]  = st.selectbox("Exit Type",  ["MARKET", "LIMIT"], key="ex")
+
+            if st.button("🌐 Register IP"):
+                ip = get_my_ip()
+                st.info(f"Your IP: {ip}\n\nDhan auto-registers IP on first API call.\nEnsure this IP is whitelisted in Dhan portal.")
+
+    # ═══════════════════════════════════════════════════════════
+    # LTP BANNER  (top of all tabs)
+    # ═══════════════════════════════════════════════════════════
+    try:
+        ltp_df = _rate_limited_fetch(ticker, "1d", "2d")
+        if not ltp_df.empty and len(ltp_df) >= 2:
+            ltp   = float(ltp_df["Close"].iloc[-1])
+            prev  = float(ltp_df["Close"].iloc[-2])
+            chg   = ltp - prev
+            pct   = chg / prev * 100 if prev else 0
+            st.markdown(ltp_banner(ticker_name, ticker, ltp, chg, pct), unsafe_allow_html=True)
+        else:
+            st.markdown(f"<div style='color:#8899aa;font-size:0.85rem'>LTP unavailable for {ticker}</div>",
+                        unsafe_allow_html=True)
+    except:
+        pass
+
+    # ═══════════════════════════════════════════════════════════
+    # TABS
+    # ═══════════════════════════════════════════════════════════
+    tab_bt, tab_live, tab_hist, tab_opt = st.tabs([
+        "📊  Backtesting", "⚡  Live Trading",
+        "📋  Trade History", "🔧  Optimization",
+    ])
+
+    # ╔══════════════════════════════════════════════════════════╗
+    # ║  TAB 1 — BACKTESTING                                     ║
+    # ╚══════════════════════════════════════════════════════════╝
+    with tab_bt:
+        st.markdown("### 📊 Backtesting Engine")
+        hdr1, hdr2, hdr3 = st.columns([2, 1, 1])
+        with hdr2:
+            run_bt = st.button("▶ Run Backtest", type="primary", use_container_width=True)
+        with hdr3:
+            st.markdown(
+                f"<div style='background:#1a2332;border:1px solid #2a3545;border-radius:8px;"
+                f"padding:8px;text-align:center;color:#8899aa;font-size:0.82rem'>"
+                f"Strategy: <b style='color:#FFD700'>{strategy}</b></div>",
+                unsafe_allow_html=True
+            )
+
+        if strategy in ("Simple Buy", "Simple Sell"):
+            st.info(
+                f"ℹ **{strategy}**: Entry happens **immediately** at the signal candle's "
+                f"close price. SL and Target are calculated right at entry. PnL is shown per trade.",
+                icon=None
+            )
+
+        if run_bt:
+            with st.spinner("Fetching data…"):
+                df_bt = fetch_data(ticker, interval, period, warmup=True)
+
+            if df_bt is None or df_bt.empty:
+                st.error(f"❌ Could not fetch data for {ticker}. Check the ticker symbol.")
+            else:
+                with st.spinner("Running backtest…"):
+                    t_df, v_df, s_df = run_backtest(
+                        df_bt, strategy, direction,
+                        sl_type, tgt_type, sl_pts, tgt_pts,
+                        fast, slow, rr, atr_m_sl, atr_m_tgt,
+                        qty, cross_type, min_angle, candle_sz,
+                    )
+
+                # ── Summary metrics
+                if not t_df.empty:
+                    wins   = int((t_df["PnL"] > 0).sum())
+                    losses = int((t_df["PnL"] < 0).sum())
+                    total  = len(t_df)
+                    acc    = wins / total * 100 if total else 0
+                    tpnl   = float(t_df["PnL"].sum())
+                    avg_w  = float(t_df.loc[t_df["PnL"]>0,"PnL"].mean()) if wins  else 0
+                    avg_l  = float(t_df.loc[t_df["PnL"]<0,"PnL"].mean()) if losses else 0
+                    pf     = abs(t_df.loc[t_df["PnL"]>0,"PnL"].sum() / t_df.loc[t_df["PnL"]<0,"PnL"].sum()) if losses else float("inf")
+
+                    c1,c2,c3,c4,c5,c6,c7 = st.columns(7)
+                    c1.metric("Total Trades", total)
+                    c2.metric("Wins",  wins)
+                    c3.metric("Losses",losses)
+                    c4.metric("Accuracy", f"{acc:.1f}%")
+                    c5.metric("Total PnL", f"₹{tpnl:,.0f}", delta=f"{tpnl:+.0f}")
+                    c6.metric("Profit Factor", f"{pf:.2f}" if pf != float("inf") else "∞")
+                    c7.metric("SL Violations", len(v_df))
+
+                    c1b, c2b, c3b = st.columns(3)
+                    c1b.metric("Avg Win",  f"₹{avg_w:,.1f}")
+                    c2b.metric("Avg Loss", f"₹{avg_l:,.1f}")
+                    c3b.metric("Max PnL",  f"₹{float(t_df['PnL'].max()):,.1f}")
+
+                    # ── Chart
+                    fig_bt = plot_backtest_chart(df_bt, s_df, t_df, fast, slow)
+                    st.plotly_chart(fig_bt, use_container_width=True)
+
+                    # ── PnL curve
+                    st.plotly_chart(plot_pnl_curve(t_df), use_container_width=True)
+
+                    # ── Trades table
+                    st.markdown("#### 📋 All Trades")
+                    disp_cols = ["Entry Time","Exit Time","Trade Type","Entry Price",
+                                 "Exit Price","SL","Target","Candle High","Candle Low",
+                                 "Entry Reason","Exit Reason","PnL"]
+                    avail = [c for c in disp_cols if c in t_df.columns]
+                    st.dataframe(apply_table_style(t_df[avail]), use_container_width=True, height=380)
+
+                    # ── Violations
+                    if not v_df.empty:
+                        st.markdown(
+                            f"<div style='background:rgba(255,160,0,0.1);border:1px solid rgba(255,160,0,0.4);"
+                            f"border-radius:8px;padding:12px;margin:8px 0'>"
+                            f"⚠ <b>{len(v_df)} Violation(s)</b> — Both SL and Target fell within the same candle's range. "
+                            f"Conservative SL-first rule applied. These trades may deviate from live trading results.</div>",
+                            unsafe_allow_html=True
+                        )
+                        st.dataframe(v_df[avail], use_container_width=True, height=250)
+                else:
+                    st.warning("No trades generated with this configuration.")
+
+    # ╔══════════════════════════════════════════════════════════╗
+    # ║  TAB 2 — LIVE TRADING                                    ║
+    # ╚══════════════════════════════════════════════════════════╝
+    with tab_live:
+        is_running = bool(_ts_get("running"))
+
+        # ── Controls
+        st.markdown("### ⚡ Live Trading")
+        bc1, bc2, bc3, bc4 = st.columns([1,1,1,2])
+
+        with bc1:
+            if not is_running:
+                if st.button("▶ START", type="primary", use_container_width=True):
+                    stop_ev = threading.Event()
+                    cfg = dict(
+                        ticker=ticker, interval=interval, period=period,
+                        strategy=strategy, sl_type=sl_type, tgt_type=tgt_type,
+                        sl_pts=sl_pts, tgt_pts=tgt_pts, fast=fast, slow=slow,
+                        rr=rr, atr_m_sl=atr_m_sl, atr_m_tgt=atr_m_tgt,
+                        qty=qty, cooldown=cooldown_secs, dhan_enabled=dhan_en,
+                        opts_enabled=opts_en, dhan_cfg=dhan_cfg,
+                    )
+                    _ts_set("stop_event", stop_ev)
+                    _ts_set("position", None)
+                    _ts_set("trades",   [])
+                    _ts_set("log",      [])
+                    t = threading.Thread(target=live_loop, args=(cfg, stop_ev), daemon=True)
+                    t.start()
+                    st.success("✅ Live trading started!")
+                    time.sleep(0.2); st.rerun()
+            else:
+                if st.button("⏹ STOP", use_container_width=True):
+                    ev = _ts_get("stop_event")
+                    if ev: ev.set()
                     st.rerun()
 
-    st.divider()
-    st.markdown(
-        f"<div style='font-size:9px;color:#172438;text-align:center;line-height:1.8'>"
-        f"Model · {MODEL_NAME.split('/')[-1]}<br>"
-        "Embed · BAAI/bge-base-en-v1.5<br>"
-        "Rerank · ms-marco-MiniLM-L-6</div>",
-        unsafe_allow_html=True,
-    )
+        with bc2:
+            if st.button("⚡ SQUAREOFF", use_container_width=True):
+                pos = _ts_get("position")
+                if pos:
+                    ltp_sq = _ts_get("last_ltp") or pos["entry_price"]
+                    pnl_sq = (ltp_sq - pos["entry_price"])*qty if pos["side"]=="buy" \
+                             else (pos["entry_price"] - ltp_sq)*qty
+                    _ts_append("trades", {
+                        "Entry Time":   pos["entry_time"],
+                        "Exit Time":    datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S"),
+                        "Trade Type":   pos["side"].upper(),
+                        "Entry Price":  pos["entry_price"],
+                        "Exit Price":   round(ltp_sq, 2),
+                        "SL":           pos["sl"], "Target": pos["tgt"],
+                        "PnL":          round(pnl_sq, 2),
+                        "Exit Reason":  "Manual Squareoff",
+                        "Entry Reason": pos.get("reason",""),
+                    })
+                    _ts_set("position", None); _ts_set("current_pnl", 0.0)
+                    st.success(f"Squared off | PnL: ₹{pnl_sq:.2f}")
+                    st.rerun()
+                else:
+                    st.warning("No open position")
 
-# ─── Main header ──────────────────────────────────────────────────────────────
-st.markdown("""
-<div class='dm-header'>
-  <div class='dm-logo'>🧠</div>
-  <div>
-    <div class='dm-title'>DocMind RAG Assistant</div>
-    <div class='dm-sub'>Hybrid retrieval · Multi-query · Cross-encoder reranking · RAGAS evaluation</div>
-  </div>
-</div>""", unsafe_allow_html=True)
+        with bc3:
+            badge_c = "#1a4a2e" if is_running else "#2d0d0d"
+            badge_b = "#26a69a" if is_running else "#ef5350"
+            badge_t = "🟢 LIVE" if is_running else "🔴 OFFLINE"
+            st.markdown(
+                f"<div class='{'live-running' if is_running else ''}' "
+                f"style='background:{badge_c};border:1px solid {badge_b};border-radius:8px;"
+                f"padding:10px;text-align:center;font-weight:700;color:{badge_b};margin-top:4px'>"
+                f"{badge_t}</div>",
+                unsafe_allow_html=True
+            )
 
-# ─── Ensure FAISS DB ───────────────────────────────────────────────────────────
-if not _db_ready():
-    with st.spinner("⚙️ Building FAISS index from PDFs in `data/`…"):
-        build_faiss()
+        st.markdown("---")
 
-try:
-    vec_db = load_faiss()
-except Exception as e:
-    st.error(f"❌ Cannot load index: {e}  →  Click **Rebuild DB** in the sidebar.")
-    st.stop()
+        # ── Active Config Panel
+        with st.expander("⚙ Active Configuration", expanded=False):
+            cfg_rows = {
+                "Ticker": f"{ticker_name}  ({ticker})",
+                "Interval / Period": f"{interval} / {period}",
+                "Strategy": strategy,
+                "Fast EMA / Slow EMA": f"{fast} / {slow}",
+                "SL Type / Points": f"{sl_type} / {sl_pts} pts",
+                "Target Type / Points": f"{tgt_type} / {tgt_pts} pts",
+                "ATR Mult (SL/Tgt)": f"{atr_m_sl} / {atr_m_tgt}",
+                "R:R Ratio": rr,
+                "Quantity": qty,
+                "Cooldown": f"{cooldown_secs}s",
+                "Dhan Broker": "✅ Enabled" if dhan_en else "❌ Disabled",
+                "Options Trading": "✅ Enabled" if opts_en else "❌ Disabled",
+            }
+            cfg_df = pd.DataFrame(list(cfg_rows.items()), columns=["Parameter","Value"])
+            st.dataframe(cfg_df, use_container_width=True, hide_index=True)
 
-# ─── Capture input ─────────────────────────────────────────────────────────────
-user_input = st.chat_input("Ask anything about your documents…")
-query = None
+        # ── Live data
+        state = _sync()
+        ltp_v    = state.get("last_ltp")
+        ef_v     = state.get("ema_fast_val")
+        es_v     = state.get("ema_slow_val")
+        atr_v    = state.get("atr_val")
+        opnl     = state.get("current_pnl", 0.0)
+        fetches  = state.get("fetch_count", 0)
 
-if st.session_state.pending_query:           # suggestion click → takes priority
-    query = st.session_state.pending_query
-    st.session_state.pending_query = None
-elif user_input:
-    query = user_input
+        mc1,mc2,mc3,mc4,mc5 = st.columns(5)
+        mc1.metric("LTP",           f"{ltp_v:,.2f}"  if ltp_v else "—")
+        mc2.metric(f"EMA {fast}",   f"{ef_v:.2f}"    if ef_v  else "—")
+        mc3.metric(f"EMA {slow}",   f"{es_v:.2f}"    if es_v  else "—")
+        mc4.metric("ATR",           f"{atr_v:.2f}"   if atr_v else "—")
+        mc5.metric("Open PnL",      f"₹{opnl:.2f}",
+                   delta=f"{opnl:+.2f}", delta_color="normal")
 
-# ─── Process ───────────────────────────────────────────────────────────────────
-if query:
-    with st.status("⚙️ Processing your question…", expanded=True) as status:
-        status.write("🔍 Expanding query…")
-        resp, docs, latency, tokens = answer_query(
-            query, st.session_state.chat_history, vec_db, status_ref=status
-        )
-        status.write("💡 Generating follow-up suggestions…")
-        suggestions = suggest(query, resp)
-        status.update(label="✅ Answer ready!", state="complete", expanded=False)
+        # ── Last candle
+        last_c = state.get("last_candle")
+        if last_c:
+            st.markdown("#### 📌 Last Fetched Candle")
+            lc_df = pd.DataFrame([last_c])
+            st.dataframe(lc_df, use_container_width=True, hide_index=True)
 
-    # persist to SQLite
-    db_save_msg(st.session_state.session_id, "user", query)
-    asst_id = db_save_msg(
-        st.session_state.session_id, "assistant", resp,
-        latency=latency, tokens=tokens, sources=docs
-    )
+        # ── Open Position
+        pos = state.get("position")
+        st.markdown("#### 📍 Current Position")
+        if pos:
+            side_c = "#26a69a" if pos["side"]=="buy" else "#ef5350"
+            p1,p2,p3,p4,p5 = st.columns(5)
+            p1.markdown(
+                f"<div style='background:rgba(38,166,154,0.1) if buy else;border:1px solid {side_c};"
+                f"border-radius:8px;padding:12px;text-align:center'>"
+                f"<div style='color:{side_c};font-size:1.5rem;font-weight:800'>{pos['side'].upper()}</div>"
+                f"<div style='color:#8899aa;font-size:0.7rem'>SIDE</div></div>",
+                unsafe_allow_html=True
+            )
+            p2.metric("Entry",   f"{pos['entry_price']:,.2f}")
+            p3.metric("SL",      f"{pos['sl']:,.2f}")
+            p4.metric("Target",  f"{pos['tgt']:,.2f}")
+            p5.metric("Qty",     qty)
+            st.caption(f"⏱ {pos['entry_time']}  |  📌 {pos.get('reason','—')}")
 
-    # auto-title on first query
-    if not any(r == "user" for r, *_ in st.session_state.chat_history):
-        db_set_title(st.session_state.session_id, query[:55])
+            # Distance to SL and Target
+            if ltp_v:
+                d_sl  = abs(ltp_v - pos['sl'])
+                d_tgt = abs(ltp_v - pos['tgt'])
+                d1, d2 = st.columns(2)
+                d1.metric("Distance to SL",  f"{d_sl:.2f} pts")
+                d2.metric("Distance to Tgt", f"{d_tgt:.2f} pts")
+        else:
+            st.info("No open position currently.")
 
-    # update in-memory state
-    st.session_state.chat_history.append(["user",      query, {}])
-    st.session_state.chat_history.append(["assistant", resp,  {
-        "latency": latency, "tokens": tokens, "msg_id": asst_id
-    }])
-    st.session_state.last_sources = docs
-    st.session_state.last_latency = latency
-    st.session_state.last_tokens  = tokens
-    st.session_state.suggestions  = suggestions
+        # ── Elliott Wave
+        wave = state.get("wave_info", {})
+        if wave and wave.get("status") == "OK":
+            st.markdown("#### 🌊 Elliott Wave Analysis")
+            w1,w2,w3 = st.columns(3)
+            w1.metric("Trend",        wave.get("trend","—").capitalize())
+            w2.metric("Current Wave", wave.get("current_wave","—"))
+            w3.metric("EW Signal",    wave.get("signal","—").upper() if wave.get("signal") else "—")
 
-    # ── RAGAS evaluation (synchronous; output to console + store to DB) ──
-    if ENABLE_RAGAS:
-        with st.spinner("🔬 Evaluating answer quality (RAGAS)…"):
-            metrics = run_ragas(query, resp, docs)
-        if metrics:
-            db_set_ragas(asst_id, metrics["faithfulness"], metrics["answer_relevancy"])
-            st.session_state.ragas_cache[asst_id] = metrics
-            for entry in st.session_state.chat_history:
-                if entry[0] == "assistant" and entry[2].get("msg_id") == asst_id:
-                    entry[2]["ragas"] = metrics
+            if wave.get("completed"):
+                st.caption("Completed pivots: " + "  →  ".join(wave["completed"]))
 
-# ─── Render chat ───────────────────────────────────────────────────────────────
-if not st.session_state.chat_history:
-    st.markdown("""
-    <div class='empty-state'>
-      <div class='ei'>📂</div>
-      <h3>No conversation yet</h3>
-      <p>Place PDF files in the <code>data/</code> folder, then ask a question below.</p>
-    </div>""", unsafe_allow_html=True)
-else:
-    for idx, (role, msg, meta) in enumerate(st.session_state.chat_history):
-        with st.chat_message(role):
-            st.markdown(msg)
+            fib = wave.get("fib_levels", {})
+            if fib:
+                fib_df = pd.DataFrame([{"Level": k, "Price": v, "Vs LTP": round(v - (ltp_v or 0), 2)}
+                                        for k, v in fib.items()])
+                st.dataframe(fib_df, use_container_width=True, hide_index=True, height=240)
 
-            if role == "assistant":
-                mid     = meta.get("msg_id")
-                latency = meta.get("latency", 0)
-                tokens  = meta.get("tokens",  0)
-                ragas   = meta.get("ragas") or st.session_state.ragas_cache.get(mid, {})
-                fb      = st.session_state.feedback.get(mid, meta.get("feedback", 0))
+            if wave.get("next_target"):
+                st.metric("Next Elliott Target", f"{wave['next_target']:,.2f}")
 
-                # metrics row
-                ragas_html = ""
-                if ragas:
-                    ragas_html = (
-                        f"<div class='mc {_cls(ragas.get('faithfulness'))}'>🎯 Faith "
-                        f"<span>{ragas['faithfulness']:.2f}</span></div>"
-                        f"<div class='mc {_cls(ragas.get('answer_relevancy'))}'>📐 Relev "
-                        f"<span>{ragas['answer_relevancy']:.2f}</span></div>"
+        # ── Live Chart
+        if is_running:
+            try:
+                df_live = fetch_data(ticker, interval, period, warmup=False)
+                if not df_live.empty:
+                    ef_s = tv_ema(df_live["Close"], fast)
+                    es_s = tv_ema(df_live["Close"], slow)
+                    st.plotly_chart(
+                        plot_live_chart(df_live, pos, ef_s, es_s, fast, slow),
+                        use_container_width=True
                     )
-                st.markdown(
-                    f"<div class='metric-row'>"
-                    f"<div class='mc'>⚡ <span>{latency:.2f}s</span></div>"
-                    f"<div class='mc'>🔤 <span>{tokens:,}</span> tk</div>"
-                    f"{ragas_html}</div>",
-                    unsafe_allow_html=True,
-                )
+            except:
+                pass
 
-                # like / dislike  (toggle behaviour)
-                if mid:
-                    fb_col1, fb_col2, _ = st.columns([1, 1, 12])
-                    with fb_col1:
-                        label = "👍✓" if fb == 1 else "👍"
-                        if st.button(label, key=f"like_{mid}_{idx}", help="Helpful"):
-                            new = 0 if fb == 1 else 1
-                            st.session_state.feedback[mid] = new
-                            db_set_feedback(mid, new)
-                            for e in st.session_state.chat_history:
-                                if e[0]=="assistant" and e[2].get("msg_id")==mid:
-                                    e[2]["feedback"] = new
-                            st.rerun()
-                    with fb_col2:
-                        label = "👎✓" if fb == -1 else "👎"
-                        if st.button(label, key=f"dislike_{mid}_{idx}", help="Not helpful"):
-                            new = 0 if fb == -1 else -1
-                            st.session_state.feedback[mid] = new
-                            db_set_feedback(mid, new)
-                            for e in st.session_state.chat_history:
-                                if e[0]=="assistant" and e[2].get("msg_id")==mid:
-                                    e[2]["feedback"] = new
-                            st.rerun()
+        # ── Log
+        logs = state.get("log", [])
+        if logs:
+            st.markdown("#### 📝 Activity Log")
+            log_text = "\n".join(reversed(logs[-30:]))
+            st.text_area("", log_text, height=200, label_visibility="collapsed")
 
-# ─── Suggestion chips  ─────────────────────────────────────────────────────────
-# Rendered OUTSIDE `if query:` — this is the critical fix that makes clicks work
-if st.session_state.suggestions:
-    st.markdown("<div class='sugg-label'>💡 Suggested follow-ups</div>",
-                unsafe_allow_html=True)
-    cols = st.columns(len(st.session_state.suggestions))
-    for i, (col, q) in enumerate(zip(cols, st.session_state.suggestions)):
-        with col:
-            if st.button(q, key=f"sugg_{i}", use_container_width=True):
-                st.session_state.pending_query = q
-                st.session_state.suggestions   = []
-                st.rerun()
+        # Auto-refresh while running
+        if is_running:
+            time.sleep(0.3)
+            st.rerun()
+
+    # ╔══════════════════════════════════════════════════════════╗
+    # ║  TAB 3 — TRADE HISTORY                                   ║
+    # ╚══════════════════════════════════════════════════════════╝
+    with tab_hist:
+        st.markdown("### 📋 Trade History")
+        st.caption("Updated live during trading. No need to stop live trading to view history.")
+
+        all_trades = _ts_get("trades") or []
+
+        if st.button("🔄 Refresh History"):
+            st.rerun()
+
+        if all_trades:
+            hist_df = pd.DataFrame(all_trades)
+
+            wins   = int((hist_df["PnL"] > 0).sum())
+            losses = int((hist_df["PnL"] < 0).sum())
+            total  = len(hist_df)
+            acc    = wins/total*100 if total else 0
+            tpnl   = float(hist_df["PnL"].sum())
+
+            h1,h2,h3,h4,h5 = st.columns(5)
+            h1.metric("Trades",   total)
+            h2.metric("Wins",     wins)
+            h3.metric("Losses",   losses)
+            h4.metric("Accuracy", f"{acc:.1f}%")
+            h5.metric("Total PnL",f"₹{tpnl:,.0f}", delta=f"{tpnl:+.0f}")
+
+            st.plotly_chart(plot_pnl_curve(hist_df), use_container_width=True)
+
+            st.markdown("#### All Trades")
+            hist_cols = ["Entry Time","Exit Time","Trade Type","Entry Price",
+                         "Exit Price","SL","Target","PnL","Exit Reason","Entry Reason"]
+            avail = [c for c in hist_cols if c in hist_df.columns]
+            st.dataframe(apply_table_style(hist_df[avail]), use_container_width=True, height=500)
+
+            # Export
+            csv = hist_df.to_csv(index=False)
+            st.download_button("⬇ Download CSV", csv, "trade_history.csv", "text/csv")
+        else:
+            st.info("No completed trades yet. Trade history will appear here as trades are completed during live trading.")
+
+    # ╔══════════════════════════════════════════════════════════╗
+    # ║  TAB 4 — OPTIMIZATION                                    ║
+    # ╚══════════════════════════════════════════════════════════╝
+    with tab_opt:
+        st.markdown("### 🔧 Strategy Optimization")
+        st.caption("Grid-searches EMA periods, SL & Target points. Always returns best available results even if target accuracy isn't reached.")
+
+        oc1, oc2 = st.columns(2)
+        with oc1:
+            tgt_acc  = st.number_input("Target Accuracy (%)", value=50.0, min_value=0.0, max_value=100.0, step=5.0)
+            fast_min = st.number_input("Fast EMA Min", value=5,  min_value=2, max_value=50)
+            fast_max = st.number_input("Fast EMA Max", value=15, min_value=2, max_value=50)
+            fast_stp = st.number_input("Fast EMA Step",value=2,  min_value=1, max_value=10)
+
+        with oc2:
+            slow_min = st.number_input("Slow EMA Min", value=10, min_value=3,  max_value=200)
+            slow_max = st.number_input("Slow EMA Max", value=30, min_value=3,  max_value=200)
+            slow_stp = st.number_input("Slow EMA Step",value=5,  min_value=1,  max_value=20)
+
+        sl_inp  = st.text_input("SL Points (comma-sep)",  "5,10,15,20")
+        tgt_inp = st.text_input("Tgt Points (comma-sep)", "10,20,30,40")
+
+        if st.button("🚀 Run Optimization", type="primary"):
+            with st.spinner("Running grid search…"):
+                df_opt = fetch_data(ticker, interval, period, warmup=True)
+
+            if df_opt is None or df_opt.empty:
+                st.error("Failed to fetch data.")
+            else:
+                try:
+                    sl_list  = [float(x.strip()) for x in sl_inp.split(",")]
+                    tgt_list = [float(x.strip()) for x in tgt_inp.split(",")]
+                except:
+                    sl_list  = [5.0, 10.0, 15.0, 20.0]
+                    tgt_list = [10.0, 20.0, 30.0, 40.0]
+
+                fast_range = list(range(fast_min, fast_max+1, max(fast_stp,1)))
+                slow_range = list(range(slow_min, slow_max+1, max(slow_stp,1)))
+
+                prog = st.progress(0.0, text="Optimizing…")
+                def progress_cb(v):
+                    prog.progress(min(v, 1.0))
+
+                with st.spinner("Grid searching…"):
+                    res_df = run_optimization(df_opt, tgt_acc, fast_range, slow_range,
+                                              sl_list, tgt_list, qty, progress_cb)
+                prog.empty()
+
+                if not res_df.empty:
+                    best = res_df.iloc[0]
+                    st.success(f"Found {len(res_df)} combinations | Best accuracy: {best['Accuracy %']:.1f}%")
+
+                    b1,b2,b3,b4,b5 = st.columns(5)
+                    b1.metric("Best Accuracy", f"{best['Accuracy %']:.1f}%")
+                    b2.metric("Fast EMA",      int(best["Fast EMA"]))
+                    b3.metric("Slow EMA",      int(best["Slow EMA"]))
+                    b4.metric("SL pts",        best["SL Pts"])
+                    b5.metric("Total PnL",     f"₹{best['Total PnL']:,.0f}")
+
+                    # Highlight rows meeting target accuracy
+                    def style_opt(row):
+                        if row["Accuracy %"] >= tgt_acc:
+                            return ["background-color:rgba(38,166,154,0.15)"] * len(row)
+                        return [""] * len(row)
+
+                    styled_opt = res_df.style.apply(style_opt, axis=1)
+                    st.dataframe(styled_opt, use_container_width=True, height=500)
+
+                    csv_opt = res_df.to_csv(index=False)
+                    st.download_button("⬇ Download Results", csv_opt, "optimization.csv", "text/csv")
+                else:
+                    st.warning("No valid combinations found. Try a wider parameter range.")
+
+
+if __name__ == "__main__":
+    main()
