@@ -32,4 +32,4 @@ selenium
 playwright
 webdriver-manager
 #streamlit-autorefresh
-tiktoken
+
