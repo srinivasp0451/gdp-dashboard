@@ -634,14 +634,17 @@ def generate_signals(df: pd.DataFrame, config: dict
     strat   = config.get("strategy", "EMA Crossover")
     inds    = {}
 
+    trade_dir_early = config.get("trade_direction", "Both")
     if strat == "Simple Buy":
-        signals.iloc[0] = 1
-        reasons.iloc[0] = "Simple Buy – Immediate Market Entry"
+        if trade_dir_early in ("Both", "Long Only"):
+            signals.iloc[0] = 1
+            reasons.iloc[0] = "Simple Buy – Immediate Market Entry"
         return signals, reasons, inds
 
     if strat == "Simple Sell":
-        signals.iloc[0] = -1
-        reasons.iloc[0] = "Simple Sell – Immediate Market Entry"
+        if trade_dir_early in ("Both", "Short Only"):
+            signals.iloc[0] = -1
+            reasons.iloc[0] = "Simple Sell – Immediate Market Entry"
         return signals, reasons, inds
 
     fast_p  = config.get("fast_ema", 9)
@@ -653,8 +656,12 @@ def generate_signals(df: pd.DataFrame, config: dict
     inds["slow_ema"] = slow_e
     inds["atr"]      = atr_s
 
+    trade_dir    = config.get("trade_direction", "Both")
     if strat == "EMA Crossover":
         min_angle    = config.get("min_angle", 0.0)
+        max_angle    = config.get("max_angle", 90.0)
+        min_delta    = config.get("min_delta", 0.0)
+        max_delta    = config.get("max_delta", 1e9)
         cx_type      = config.get("crossover_type", "Simple Crossover")
         cx_candle_sz = config.get("custom_candle_size", 10)
 
@@ -663,22 +670,25 @@ def generate_signals(df: pd.DataFrame, config: dict
             s0, s1 = slow_e.iloc[i], slow_e.iloc[i - 1]
             candle_sz = abs(df["Close"].iloc[i] - df["Open"].iloc[i])
             angle     = crossover_angle_deg(fast_e, slow_e, i)
+            delta     = abs(f0 - s0)
 
-            if angle < min_angle:
+            if angle < min_angle or angle > max_angle:
+                continue
+            if delta < min_delta or delta > max_delta:
                 continue
             if cx_type == "Custom Candle Size" and candle_sz < cx_candle_sz:
                 continue
             if cx_type == "ATR Based Candle Size" and candle_sz < atr_s.iloc[i]:
                 continue
 
-            if f1 <= s1 and f0 > s0:
+            if trade_dir in ("Both", "Long Only") and f1 <= s1 and f0 > s0:
                 signals.iloc[i] = 1
                 reasons.iloc[i] = (f"EMA Bullish Crossover | Fast={f0:.2f} Slow={s0:.2f} "
-                                   f"Δ={f0-s0:.2f} Angle={angle:.1f}°")
-            elif f1 >= s1 and f0 < s0:
+                                   f"Δ={delta:.2f} Angle={angle:.1f}°")
+            elif trade_dir in ("Both", "Short Only") and f1 >= s1 and f0 < s0:
                 signals.iloc[i] = -1
                 reasons.iloc[i] = (f"EMA Bearish Crossover | Fast={f0:.2f} Slow={s0:.2f} "
-                                   f"Δ={s0-f0:.2f} Angle={angle:.1f}°")
+                                   f"Δ={delta:.2f} Angle={angle:.1f}°")
 
     elif strat == "Anticipatory EMA":
         # Predict imminent crossover: large acceleration towards crossover
@@ -1384,7 +1394,7 @@ def live_thread_fn(ticker: str, period: str, interval: str,
     _ts_set("current_pnl", 0.0)
 
     def log(msg: str):
-        ist = datetime.datetime.now().strftime("%H:%M:%S")
+        ist = now_ist()
         _ts_append("live_log", f"[{ist}] {msg}")
 
     log(f"▶ Started | {ticker} | {interval}/{period} | {config.get('strategy')}")
@@ -1523,7 +1533,7 @@ def live_thread_fn(ticker: str, period: str, interval: str,
 
                     trade_rec = {
                         "Entry DateTime": pos["entry_dt"],
-                        "Exit DateTime":  datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        "Exit DateTime":  datetime.datetime.now(_IST).strftime("%d-%b-%Y %H:%M:%S IST"),
                         "Signal":         "BUY" if sig == 1 else "SELL",
                         "Entry Price":    round(ep, 2),
                         "Exit Price":     round(exit_price, 2),
@@ -1553,28 +1563,50 @@ def live_thread_fn(ticker: str, period: str, interval: str,
                     continue
 
                 strat = config.get("strategy","EMA Crossover")
-                bar_ok = True
-                if strat in ("EMA Crossover","Anticipatory EMA","Elliott Wave"):
-                    bar_ok = _bar_complete(interval)
 
+                # ── Simple Buy / Sell: enter immediately at LTP, no bar wait ─
+                if strat in ("Simple Buy", "Simple Sell"):
+                    sig_val = 1 if strat == "Simple Buy" else -1
+                    entry_price = ltp
+                    sl_price    = calc_sl(entry_price, sig_val, config, df, len(df)-1)
+                    tgt_price   = calc_target(entry_price, sig_val, config, df, len(df)-1)
+                    reason      = f"{strat} – Immediate Entry at {entry_price:.2f}"
+                    log(f"◆ {'BUY' if sig_val==1 else 'SELL'} ({strat}) | "
+                        f"Entry={entry_price:.2f} SL={sl_price:.2f} Tgt={tgt_price:.2f}")
+                    new_pos = {
+                        "entry_dt":      datetime.datetime.now(_IST).strftime("%d-%b-%Y %H:%M:%S IST"),
+                        "entry_price":   entry_price,
+                        "signal_type":   sig_val,
+                        "initial_sl":    sl_price,
+                        "current_sl":    sl_price,
+                        "target":        tgt_price,
+                        "signal_reason": reason,
+                    }
+                    _ts_set("current_position", new_pos)
+                    if dhan_cfg.get("enabled"):
+                        if dhan_cfg.get("options_trading"):
+                            resp = place_options_order(dhan_cfg, sig_val, ltp)
+                        else:
+                            resp = place_equity_order(dhan_cfg, sig_val, ltp)
+                        log(f"  Dhan entry: {resp}")
+                    stop_event.wait(1.5)
+                    continue
+
+                # ── Indicator-based strategies: wait for completed bar ────────
+                bar_ok = _bar_complete(interval)
                 if not bar_ok:
                     stop_event.wait(0.5)
                     continue
 
                 # Don't re-check the same completed bar
                 cur_bar = str(df.index[-2]) if len(df) >= 2 else str(df.index[-1])
-                if cur_bar == last_bar_dt and strat not in ("Simple Buy","Simple Sell"):
+                if cur_bar == last_bar_dt:
                     stop_event.wait(0.5)
                     continue
 
                 # Signal on last COMPLETED bar (df[-2]), entry at current ltp
                 sigs, reas, live_inds = generate_signals(df, config)
-
-                if strat in ("Simple Buy","Simple Sell"):
-                    sig_idx = len(sigs) - 1
-                else:
-                    sig_idx = len(sigs) - 2
-
+                sig_idx = max(len(sigs) - 2, 0)
                 sig_val = int(sigs.iloc[sig_idx])
 
                 # Store Elliott state always
@@ -1589,8 +1621,8 @@ def live_thread_fn(ticker: str, period: str, interval: str,
 
                     if strat == "Elliott Wave" and "elliott" in live_inds:
                         ew = live_inds["elliott"]
-                        if ew.get("sl"):    sl_price  = float(ew["sl"])
-                        if ew.get("target"):tgt_price = float(ew["target"])
+                        if ew.get("sl"):     sl_price  = float(ew["sl"])
+                        if ew.get("target"): tgt_price = float(ew["target"])
 
                     reason = str(reas.iloc[sig_idx])
                     log(f"◆ {'BUY' if sig_val==1 else 'SELL'} Signal | Entry={entry_price:.2f} "
@@ -1598,13 +1630,13 @@ def live_thread_fn(ticker: str, period: str, interval: str,
                     log(f"  {reason}")
 
                     new_pos = {
-                        "entry_dt":     datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                        "entry_price":  entry_price,
-                        "signal_type":  sig_val,
-                        "initial_sl":   sl_price,
-                        "current_sl":   sl_price,
-                        "target":       tgt_price,
-                        "signal_reason":reason,
+                        "entry_dt":      datetime.datetime.now(_IST).strftime("%d-%b-%Y %H:%M:%S IST"),
+                        "entry_price":   entry_price,
+                        "signal_type":   sig_val,
+                        "initial_sl":    sl_price,
+                        "current_sl":    sl_price,
+                        "target":        tgt_price,
+                        "signal_reason": reason,
                     }
                     _ts_set("current_position", new_pos)
 
@@ -1837,6 +1869,466 @@ def _fmt_pnl(v: float) -> str:
 # MAIN APP
 # ══════════════════════════════════════════════════════════════════════════════
 
+
+# ══════════════════════════════════════════════════════════════════════════════
+# BACKTEST ANALYSIS ENGINE
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _parse_trade_df(trades: list) -> pd.DataFrame:
+    """Convert trade list to enriched DataFrame with IST-derived time columns."""
+    df = pd.DataFrame(trades).copy()
+    for col in ["Entry Price","Exit Price","SL","Final SL","Target","Candle High","Candle Low","PnL"]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    # Parse entry datetime → IST
+    df["_entry_dt"] = pd.to_datetime(df["Entry DateTime"], errors="coerce", utc=True)
+    df["_entry_dt"] = df["_entry_dt"].dt.tz_convert("Asia/Kolkata")
+    # Fallback: treat as naive local if tz parsing failed
+    mask = df["_entry_dt"].isna()
+    if mask.any():
+        df.loc[mask, "_entry_dt"] = pd.to_datetime(
+            df.loc[mask, "Entry DateTime"], errors="coerce"
+        ).apply(lambda x: x.replace(tzinfo=zoneinfo.ZoneInfo("Asia/Kolkata")) if pd.notna(x) else x)
+
+    df["Day"]        = df["_entry_dt"].dt.day_name()
+    df["Hour_IST"]   = df["_entry_dt"].dt.hour
+    df["Date"]       = df["_entry_dt"].dt.date.astype(str)
+    df["Week"]       = df["_entry_dt"].dt.isocalendar().week.astype(int)
+    df["Month"]      = df["_entry_dt"].dt.strftime("%b %Y")
+    df["TimeSlot"]   = (df["Hour_IST"].astype(str).str.zfill(2) + ":00–" +
+                        (df["Hour_IST"] + 1).astype(str).str.zfill(2) + ":00 IST")
+
+    # Extract Angle and Delta from entry reason
+    import re
+    def _extract(pattern, text, default=np.nan):
+        try:
+            m = re.search(pattern, str(text))
+            return float(m.group(1)) if m else default
+        except Exception:
+            return default
+
+    df["Angle"] = df["Entry Reason"].apply(lambda x: _extract(r"Angle=([\.\d]+)", x))
+    df["Delta"] = df["Entry Reason"].apply(lambda x: _extract(r"Δ=([\.\d]+)", x))
+
+    # Bin Angle & Delta
+    df["Angle Bin"] = pd.cut(df["Angle"].fillna(0),
+                              bins=[0,5,10,20,30,45,60,90],
+                              labels=["0-5°","5-10°","10-20°","20-30°","30-45°","45-60°","60-90°"],
+                              include_lowest=True)
+    df["Delta Bin"] = pd.cut(df["Delta"].fillna(0),
+                              bins=[0,1,2,5,10,20,50,1000],
+                              labels=["0-1","1-2","2-5","5-10","10-20","20-50","50+"],
+                              include_lowest=True)
+
+    df["Win"] = (df["PnL"] > 0).astype(int)
+    df["Loss"] = (df["PnL"] < 0).astype(int)
+    return df
+
+
+def _bar_chart(title: str, x_vals, y_vals, colors, x_title="", y_title="PnL",
+               height=280) -> go.Figure:
+    fig = go.Figure(go.Bar(
+        x=x_vals, y=y_vals,
+        marker_color=colors,
+        text=[f"{v:+.1f}" for v in y_vals],
+        textposition="outside",
+        textfont=dict(size=10, color="white"),
+    ))
+    fig.update_layout(
+        title=dict(text=title, font=dict(color="white", size=13)),
+        height=height, template="plotly_dark",
+        paper_bgcolor="#0d1117", plot_bgcolor="#0d1117",
+        font=dict(color="white", family="Space Mono, monospace"),
+        xaxis=dict(title=x_title, showgrid=False, tickfont=dict(size=10)),
+        yaxis=dict(title=y_title, showgrid=True, gridcolor="rgba(255,255,255,0.07)"),
+        margin=dict(t=40, b=40, l=40, r=20),
+    )
+    return fig
+
+
+def _heatmap_chart(title: str, z, x, y, height=300) -> go.Figure:
+    fig = go.Figure(go.Heatmap(
+        z=z, x=x, y=y, colorscale="RdYlGn",
+        showscale=True, colorbar=dict(thickness=12),
+        text=[[f"{v:.1f}" if not np.isnan(v) else "" for v in row] for row in z],
+        texttemplate="%{text}", textfont=dict(size=10),
+    ))
+    fig.update_layout(
+        title=dict(text=title, font=dict(color="white", size=13)),
+        height=height, template="plotly_dark",
+        paper_bgcolor="#0d1117", plot_bgcolor="#0d1117",
+        font=dict(color="white", family="Space Mono, monospace"),
+        margin=dict(t=40, b=60, l=70, r=20),
+    )
+    return fig
+
+
+def _scatter_chart(df: pd.DataFrame, x_col: str, title: str) -> go.Figure:
+    colors = [_GREEN if p >= 0 else _RED for p in df["PnL"]]
+    hover  = df.apply(lambda r: f"{r.get('Signal','')} | PnL: {r['PnL']:+.2f}", axis=1)
+    fig    = go.Figure(go.Scatter(
+        x=df[x_col], y=df["PnL"],
+        mode="markers",
+        marker=dict(color=colors, size=8, opacity=0.8,
+                    line=dict(color="rgba(255,255,255,0.2)", width=0.5)),
+        text=hover, hovertemplate="%{text}<extra></extra>",
+    ))
+    fig.add_hline(y=0, line=dict(color="rgba(255,255,255,0.3)", dash="dot", width=1))
+    fig.update_layout(
+        title=dict(text=title, font=dict(color="white", size=13)),
+        height=280, template="plotly_dark",
+        paper_bgcolor="#0d1117", plot_bgcolor="#0d1117",
+        font=dict(color="white", family="Space Mono, monospace"),
+        xaxis=dict(title=x_col, showgrid=True, gridcolor="rgba(255,255,255,0.07)"),
+        yaxis=dict(title="PnL", showgrid=True, gridcolor="rgba(255,255,255,0.07)"),
+        margin=dict(t=40, b=40, l=40, r=20),
+    )
+    return fig
+
+
+def _group_pnl(df: pd.DataFrame, col: str) -> tuple:
+    """Returns (x_labels, net_pnl_list, color_list, win_rate_list)."""
+    g = df.groupby(col)["PnL"].agg(["sum","count","mean"])
+    wins = df.groupby(col)["Win"].sum()
+    g = g.join(wins).rename(columns={"sum":"NetPnL","count":"Trades","mean":"AvgPnL","Win":"Wins"})
+    g["WinRate"] = (g["Wins"] / g["Trades"] * 100).round(1)
+    g = g.sort_index()
+    colors = [_GREEN if v >= 0 else _RED for v in g["NetPnL"]]
+    return list(g.index), list(g["NetPnL"].round(2)), colors, list(g["WinRate"])
+
+
+def _insight_text(label: str, df: pd.DataFrame, col: str) -> str:
+    """Return a one-line actionable insight for a groupby column."""
+    try:
+        g = df.groupby(col)["PnL"].sum().sort_values()
+        best  = g.index[-1]; best_pnl  = g.iloc[-1]
+        worst = g.index[0];  worst_pnl = g.iloc[0]
+        wr    = df.groupby(col)["Win"].mean() * 100
+        best_wr  = wr.get(best,  0)
+        worst_wr = wr.get(worst, 0)
+        return (f"**Best {label}:** {best} (PnL {best_pnl:+.2f}, Win {best_wr:.0f}%) &nbsp;|&nbsp; "
+                f"**Worst {label}:** {worst} (PnL {worst_pnl:+.2f}, Win {worst_wr:.0f}%)")
+    except Exception:
+        return ""
+
+
+def _render_backtest_analysis(trades: list):
+    """Full analysis section rendered below the backtest results table."""
+    st.markdown("---")
+    st.markdown("## 🔬 Trade Analysis & Insights")
+    st.markdown(
+        '<div style="font-size:12px;color:#8b949e;margin-bottom:16px;">'
+        'All times shown in <b>IST (Indian Standard Time)</b>. '
+        'Use these insights to identify your edge and eliminate traps.</div>',
+        unsafe_allow_html=True)
+
+    df = _parse_trade_df(trades)
+
+    # ── Summary insight pills ─────────────────────────────────────────────────
+    total_pnl = df["PnL"].sum()
+    buy_pnl   = df[df["Signal"]=="BUY"]["PnL"].sum()
+    sell_pnl  = df[df["Signal"]=="SELL"]["PnL"].sum()
+    buy_wr    = df[df["Signal"]=="BUY"]["Win"].mean()*100 if (df["Signal"]=="BUY").any() else 0
+    sell_wr   = df[df["Signal"]=="SELL"]["Win"].mean()*100 if (df["Signal"]=="SELL").any() else 0
+
+    pill_html = f"""
+    <div style="display:flex;flex-wrap:wrap;gap:10px;margin-bottom:16px;">
+      <div style="background:#1f2733;border:1px solid rgba(0,230,118,0.3);border-radius:8px;
+                  padding:10px 18px;font-size:12px;">
+        <div style="color:#8b949e;font-size:10px;">TOTAL PnL</div>
+        <div style="color:{'#00e676' if total_pnl>=0 else '#ff1744'};font-size:18px;font-weight:700;">
+          {total_pnl:+.2f}</div>
+      </div>
+      <div style="background:#1f2733;border:1px solid rgba(0,230,118,0.3);border-radius:8px;
+                  padding:10px 18px;font-size:12px;">
+        <div style="color:#8b949e;font-size:10px;">BUY SIDE</div>
+        <div style="color:{'#00e676' if buy_pnl>=0 else '#ff1744'};font-size:18px;font-weight:700;">
+          {buy_pnl:+.2f}</div>
+        <div style="color:#8b949e;font-size:10px;">{buy_wr:.1f}% Win Rate</div>
+      </div>
+      <div style="background:#1f2733;border:1px solid rgba(0,230,118,0.3);border-radius:8px;
+                  padding:10px 18px;font-size:12px;">
+        <div style="color:#8b949e;font-size:10px;">SELL SIDE</div>
+        <div style="color:{'#00e676' if sell_pnl>=0 else '#ff1744'};font-size:18px;font-weight:700;">
+          {sell_pnl:+.2f}</div>
+        <div style="color:#8b949e;font-size:10px;">{sell_wr:.1f}% Win Rate</div>
+      </div>
+    </div>"""
+    st.markdown(pill_html, unsafe_allow_html=True)
+
+    # ── Row 1: Day of week + Hour of day ─────────────────────────────────────
+    st.markdown("### 📅 Time-Based Analysis")
+    day_order = ["Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday"]
+    df_days   = df[df["Day"].isin(day_order)].copy()
+
+    col1, col2 = st.columns(2)
+    with col1:
+        if not df_days.empty and "Day" in df_days.columns:
+            x, y, c, _ = _group_pnl(df_days, "Day")
+            fig = _bar_chart("Net PnL by Day of Week", x, y, c, "Day", "Net PnL")
+            st.plotly_chart(fig, use_container_width=True, key="_an_day")
+            txt = _insight_text("Day", df_days, "Day")
+            if txt: st.markdown(txt)
+
+    with col2:
+        if "Hour_IST" in df.columns and df["Hour_IST"].notna().any():
+            x, y, c, wr = _group_pnl(df, "Hour_IST")
+            x_lab = [f"{h:02d}:00 IST" for h in x]
+            fig = _bar_chart("Net PnL by Hour (IST)", x_lab, y, c, "Hour", "Net PnL")
+            st.plotly_chart(fig, use_container_width=True, key="_an_hour")
+            txt = _insight_text("Hour", df, "Hour_IST")
+            if txt: st.markdown(txt)
+
+    # Time-slot win rate heatmap (Day × Hour)
+    if df_days["Hour_IST"].notna().any():
+        pivot_wr = df_days.pivot_table(
+            values="Win", index="Day", columns="Hour_IST",
+            aggfunc="mean"
+        ).reindex([d for d in day_order if d in df_days["Day"].unique()])
+        if not pivot_wr.empty:
+            cols_h = [f"{h:02d}:00" for h in pivot_wr.columns]
+            z_vals = (pivot_wr.fillna(np.nan) * 100).values.tolist()
+            fig = _heatmap_chart(
+                "Win Rate % Heatmap: Day × Hour (IST)",
+                z_vals, cols_h, list(pivot_wr.index), height=320)
+            st.plotly_chart(fig, use_container_width=True, key="_an_hmap")
+
+    # ── Row 2: BUY vs SELL ────────────────────────────────────────────────────
+    st.markdown("### 📊 Long vs Short Analysis")
+    col3, col4, col5 = st.columns(3)
+
+    with col3:
+        sides = df.groupby("Signal")["PnL"].sum().reset_index()
+        c_s   = [_GREEN if v >= 0 else _RED for v in sides["PnL"]]
+        fig   = _bar_chart("Net PnL: Long vs Short",
+                           sides["Signal"].tolist(), sides["PnL"].round(2).tolist(), c_s)
+        st.plotly_chart(fig, use_container_width=True, key="_an_side")
+
+    with col4:
+        sides_wr = df.groupby("Signal")["Win"].mean().reset_index()
+        sides_wr["Win"] = sides_wr["Win"] * 100
+        c_wr = [_GREEN if v >= 50 else _RED for v in sides_wr["Win"]]
+        fig = _bar_chart("Win Rate %: Long vs Short",
+                         sides_wr["Signal"].tolist(), sides_wr["Win"].round(1).tolist(),
+                         c_wr, y_title="Win Rate %")
+        st.plotly_chart(fig, use_container_width=True, key="_an_side_wr")
+
+    with col5:
+        # Trap analysis: trades where signal was right direction but exited at SL
+        traps = df[df["Exit Reason"].str.contains("SL", na=False)]
+        if not traps.empty:
+            trap_counts = traps.groupby("Signal").size().reset_index(name="Traps")
+            fig = _bar_chart("SL Traps by Side",
+                             trap_counts["Signal"].tolist(),
+                             trap_counts["Traps"].tolist(),
+                             [_RED]*len(trap_counts), y_title="# Traps")
+            st.plotly_chart(fig, use_container_width=True, key="_an_traps")
+        else:
+            st.info("No SL traps detected.")
+
+    # ── Row 3: Angle Analysis ─────────────────────────────────────────────────
+    has_angle = df["Angle"].notna().any()
+    has_delta = df["Delta"].notna().any()
+
+    if has_angle:
+        st.markdown("### 📐 Crossover Angle Analysis")
+        col6, col7 = st.columns(2)
+        with col6:
+            x, y, c, _ = _group_pnl(df.dropna(subset=["Angle Bin"]), "Angle Bin")
+            fig = _bar_chart("Net PnL by Crossover Angle",
+                             [str(v) for v in x], y, c, "Angle Bin", "Net PnL")
+            st.plotly_chart(fig, use_container_width=True, key="_an_angle")
+            txt = _insight_text("Angle Bin", df.dropna(subset=["Angle Bin"]), "Angle Bin")
+            if txt: st.markdown(txt)
+
+        with col7:
+            fig2 = _scatter_chart(df.dropna(subset=["Angle"]), "Angle",
+                                  "PnL vs Crossover Angle (°)")
+            st.plotly_chart(fig2, use_container_width=True, key="_an_angle_sc")
+
+    # ── Row 4: Delta Analysis ─────────────────────────────────────────────────
+    if has_delta:
+        st.markdown("### ↔️ EMA Delta (|Fast−Slow|) Analysis")
+        col8, col9 = st.columns(2)
+        with col8:
+            x, y, c, _ = _group_pnl(df.dropna(subset=["Delta Bin"]), "Delta Bin")
+            fig = _bar_chart("Net PnL by EMA Delta",
+                             [str(v) for v in x], y, c, "Delta Bin", "Net PnL")
+            st.plotly_chart(fig, use_container_width=True, key="_an_delta")
+            txt = _insight_text("Delta Bin", df.dropna(subset=["Delta Bin"]), "Delta Bin")
+            if txt: st.markdown(txt)
+
+        with col9:
+            fig2 = _scatter_chart(df.dropna(subset=["Delta"]), "Delta",
+                                  "PnL vs EMA Delta")
+            st.plotly_chart(fig2, use_container_width=True, key="_an_delta_sc")
+
+    # ── Row 5: Angle × Delta heatmap ─────────────────────────────────────────
+    if has_angle and has_delta:
+        df_ad = df.dropna(subset=["Angle Bin","Delta Bin"])
+        if len(df_ad) >= 4:
+            pivot_ad = df_ad.pivot_table(
+                values="PnL", index="Angle Bin", columns="Delta Bin",
+                aggfunc="sum")
+            z_vals = pivot_ad.fillna(0).values.tolist()
+            fig = _heatmap_chart(
+                "Net PnL Heatmap: Angle × Delta",
+                z_vals,
+                [str(c) for c in pivot_ad.columns],
+                [str(i) for i in pivot_ad.index], height=320)
+            st.plotly_chart(fig, use_container_width=True, key="_an_ad_heat")
+
+    # ── Row 6: Exit reason breakdown ─────────────────────────────────────────
+    st.markdown("### 🚪 Exit Reason Analysis")
+    col10, col11 = st.columns(2)
+    with col10:
+        er = df.groupby("Exit Reason")["PnL"].agg(["sum","count","mean"]).reset_index()
+        er.columns = ["Exit Reason","Net PnL","Trades","Avg PnL"]
+        er = er.sort_values("Net PnL", ascending=False)
+        colors_er = [_GREEN if v >= 0 else _RED for v in er["Net PnL"]]
+        fig = _bar_chart("Net PnL by Exit Reason",
+                         er["Exit Reason"].tolist(), er["Net PnL"].round(2).tolist(),
+                         colors_er, height=300)
+        st.plotly_chart(fig, use_container_width=True, key="_an_exit")
+
+    with col11:
+        # Exit reason pie
+        exit_counts = df["Exit Reason"].value_counts().reset_index()
+        exit_counts.columns = ["Reason","Count"]
+        fig_pie = go.Figure(go.Pie(
+            labels=exit_counts["Reason"], values=exit_counts["Count"],
+            hole=0.45,
+            marker=dict(colors=[_GREEN, _RED, _ORANGE, _BLUE, _YELLOW, _PURPLE][:len(exit_counts)]),
+            textfont=dict(size=11),
+        ))
+        fig_pie.update_layout(
+            title=dict(text="Exit Reason Distribution", font=dict(color="white", size=13)),
+            height=300, template="plotly_dark",
+            paper_bgcolor="#0d1117", font=dict(color="white"),
+            margin=dict(t=40, b=10, l=10, r=10),
+            legend=dict(font=dict(size=10)),
+        )
+        st.plotly_chart(fig_pie, use_container_width=True, key="_an_pie")
+
+    # ── Row 7: Consecutive wins / losses ─────────────────────────────────────
+    st.markdown("### 📈 Equity Curve & Drawdown")
+    col12, col13 = st.columns(2)
+    with col12:
+        cum_pnl = df["PnL"].cumsum()
+        fig_eq  = go.Figure()
+        fig_eq.add_trace(go.Scatter(
+            y=cum_pnl.values, mode="lines", name="Equity",
+            line=dict(color=_BLUE, width=2),
+            fill="tozeroy", fillcolor="rgba(64,196,255,0.07)",
+        ))
+        fig_eq.update_layout(
+            title=dict(text="Equity Curve (IST Ordered)", font=dict(color="white", size=13)),
+            height=260, template="plotly_dark",
+            paper_bgcolor="#0d1117", plot_bgcolor="#0d1117",
+            font=dict(color="white"),
+            xaxis=dict(showgrid=False),
+            yaxis=dict(showgrid=True, gridcolor="rgba(255,255,255,0.07)"),
+            margin=dict(t=40, b=30, l=40, r=20),
+        )
+        st.plotly_chart(fig_eq, use_container_width=True, key="_an_eq")
+
+    with col13:
+        peak   = cum_pnl.cummax()
+        drawdn = cum_pnl - peak
+        fig_dd = go.Figure(go.Scatter(
+            y=drawdn.values, mode="lines", name="Drawdown",
+            line=dict(color=_RED, width=1.5),
+            fill="tozeroy", fillcolor="rgba(255,23,68,0.1)",
+        ))
+        fig_dd.update_layout(
+            title=dict(text="Drawdown Curve", font=dict(color="white", size=13)),
+            height=260, template="plotly_dark",
+            paper_bgcolor="#0d1117", plot_bgcolor="#0d1117",
+            font=dict(color="white"),
+            xaxis=dict(showgrid=False),
+            yaxis=dict(showgrid=True, gridcolor="rgba(255,255,255,0.07)"),
+            margin=dict(t=40, b=30, l=40, r=20),
+        )
+        st.plotly_chart(fig_dd, use_container_width=True, key="_an_dd")
+
+    # ── Key Insights Summary ──────────────────────────────────────────────────
+    st.markdown("### 💡 Key Actionable Insights")
+    insights = []
+
+    # Best/worst day
+    if not df_days.empty:
+        day_pnl = df_days.groupby("Day")["PnL"].sum()
+        if not day_pnl.empty:
+            bd = day_pnl.idxmax(); bd_v = day_pnl.max()
+            wd = day_pnl.idxmin(); wd_v = day_pnl.min()
+            insights.append(f"🗓️ **Best trading day:** {bd} (Net PnL: **{bd_v:+.2f}**) — "
+                             f"**Worst day:** {wd} ({wd_v:+.2f}) → consider avoiding {wd}")
+
+    # Best/worst hour
+    hr_pnl = df.groupby("Hour_IST")["PnL"].sum()
+    if not hr_pnl.empty:
+        bh = hr_pnl.idxmax(); bh_v = hr_pnl.max()
+        wh = hr_pnl.idxmin(); wh_v = hr_pnl.min()
+        insights.append(f"⏰ **Best hour:** {bh:02d}:00–{bh+1:02d}:00 IST ({bh_v:+.2f}) — "
+                         f"**Worst hour:** {wh:02d}:00–{wh+1:02d}:00 IST ({wh_v:+.2f})")
+
+    # Side dominance
+    if buy_pnl != 0 or sell_pnl != 0:
+        better_side = "BUY (Long)" if buy_pnl > sell_pnl else "SELL (Short)"
+        insights.append(f"📊 **Dominant profitable side:** {better_side} — "
+                         f"BUY PnL {buy_pnl:+.2f} | SELL PnL {sell_pnl:+.2f}")
+
+    # Angle insight
+    if has_angle:
+        df_ang = df.dropna(subset=["Angle Bin"])
+        if not df_ang.empty:
+            ab_pnl = df_ang.groupby("Angle Bin")["PnL"].sum()
+            if not ab_pnl.empty:
+                best_ab = ab_pnl.idxmax(); best_ab_v = ab_pnl.max()
+                insights.append(f"📐 **Best crossover angle:** {best_ab} (Net PnL: {best_ab_v:+.2f})"
+                                 f" → Use angle filter to focus on this range")
+
+    # Delta insight
+    if has_delta:
+        df_dlt = df.dropna(subset=["Delta Bin"])
+        if not df_dlt.empty:
+            db_pnl = df_dlt.groupby("Delta Bin")["PnL"].sum()
+            if not db_pnl.empty:
+                best_db = db_pnl.idxmax(); best_db_v = db_pnl.max()
+                insights.append(f"↔️ **Best EMA delta range:** {best_db} (Net PnL: {best_db_v:+.2f})"
+                                 f" → Set Min/Max Delta filter to this range for higher quality entries")
+
+    # Max consecutive loss
+    streak = max_consec = cur_streak = 0
+    for pnl in df["PnL"]:
+        if pnl < 0:
+            cur_streak += 1
+            max_consec = max(max_consec, cur_streak)
+        else:
+            cur_streak = 0
+    if max_consec > 0:
+        insights.append(f"⚠️ **Max consecutive losses:** {max_consec} trades in a row — "
+                         f"ensure your risk per trade accounts for this streak")
+
+    # SL trap rate
+    sl_exits = (df["Exit Reason"].str.contains("SL", na=False)).sum()
+    tgt_exits = (df["Exit Reason"].str.contains("Target", na=False)).sum()
+    if sl_exits + tgt_exits > 0:
+        trap_pct = sl_exits / (sl_exits + tgt_exits) * 100
+        insights.append(f"🪤 **SL trap rate:** {trap_pct:.1f}% of exits hit SL "
+                         f"({sl_exits} SL hits vs {tgt_exits} Target hits) — "
+                         + ("consider wider SL or tighter entries" if trap_pct > 50 else
+                            "good target hit rate, maintain current SL levels"))
+
+    for ins in insights:
+        st.markdown(
+            f'<div style="background:#1f2733;border-left:3px solid #40c4ff;'
+            f'border-radius:4px;padding:10px 14px;margin:6px 0;font-size:12px;">'
+            f'{ins}</div>',
+            unsafe_allow_html=True)
+
+
 def main():
     st.set_page_config(
         page_title="Smart Investing",
@@ -1879,6 +2371,12 @@ def main():
 
         fast_ema = slow_ema = 9
         min_angle = 0.0
+        max_angle = 90.0
+        min_delta = 0.0
+        max_delta = 1e9
+        use_angle = False
+        use_delta = False
+        trade_direction  = "Both"
         crossover_type   = "Simple Crossover"
         custom_candle_sz = 10
         min_wave_pct     = 0.5
@@ -1888,10 +2386,26 @@ def main():
             fast_ema = c1.number_input("Fast EMA", 2, 50, 9, key="_fe")
             slow_ema = c2.number_input("Slow EMA", 3, 200, 15, key="_se")
 
+        if strategy in ("EMA Crossover","Anticipatory EMA","Elliott Wave","Simple Buy","Simple Sell"):
+            trade_direction = st.selectbox("Trade Direction", ["Both","Long Only","Short Only"], key="_tdir")
+        else:
+            trade_direction = "Both"
+
         if strategy in ("EMA Crossover","Anticipatory EMA"):
-            use_angle = st.checkbox("Min Crossover Angle Filter", False, key="_ua")
+            use_angle = st.checkbox("Crossover Angle Filter", False, key="_ua")
+            min_angle = 0.0
+            max_angle = 90.0
             if use_angle:
-                min_angle = st.number_input("Min Angle (°)", 0.0, 89.0, 0.0, 1.0, key="_ma")
+                _ac1, _ac2 = st.columns(2)
+                min_angle = _ac1.number_input("Min Angle (°)", 0.0, 89.0, 0.0, 1.0, key="_ma")
+                max_angle = _ac2.number_input("Max Angle (°)", 1.0, 90.0, 90.0, 1.0, key="_maxa")
+            use_delta = st.checkbox("EMA Delta Filter (|Fast−Slow|)", False, key="_ud")
+            min_delta = 0.0
+            max_delta = 1e9
+            if use_delta:
+                _dc1, _dc2 = st.columns(2)
+                min_delta = _dc1.number_input("Min Delta", 0.0, 10000.0, 0.0, 0.5, key="_mind")
+                max_delta = _dc2.number_input("Max Delta", 0.0, 10000.0, 9999.0, 0.5, key="_maxd")
             crossover_type = st.selectbox("Crossover Type", CROSSOVER_TYPES, key="_cxt")
             if crossover_type == "Custom Candle Size":
                 custom_candle_sz = st.number_input("Min Candle Size (pts)", 1, 1000, 10, key="_ccs")
@@ -1991,7 +2505,11 @@ def main():
         "enable_cooldown": enable_cool,
         "cooldown":        cooldown_secs,
         "prevent_overlap": prevent_overlap,
+        "trade_direction": trade_direction,
         "min_angle":       min_angle,
+        "max_angle":       max_angle,
+        "min_delta":       min_delta,
+        "max_delta":       max_delta,
         "crossover_type":  crossover_type,
         "custom_candle_size": custom_candle_sz,
         "min_wave_pct":    min_wave_pct,
@@ -2097,17 +2615,38 @@ def main():
             st.markdown("#### 📋 Trade Log")
             if trades:
                 df_tr = pd.DataFrame(trades)
-                # Color coding
+                # Sanitize numeric cols so pandas never gets string values like "—"
+                _num_cols = ["Entry Price","Exit Price","SL","Final SL",
+                             "Target","Candle High","Candle Low","PnL"]
+                for _c in _num_cols:
+                    if _c in df_tr.columns:
+                        df_tr[_c] = pd.to_numeric(df_tr[_c], errors="coerce")
+                if "Is Violation" in df_tr.columns:
+                    df_tr["Is Violation"] = df_tr["Is Violation"].astype(bool)
+
                 def style_row(row):
-                    clr = "background-color:rgba(0,230,118,0.08)" if row["PnL"] >= 0 \
-                          else "background-color:rgba(255,23,68,0.08)"
-                    if row.get("Is Violation"):
-                        clr += ";border-left:3px solid #ff9800"
+                    try:
+                        pnl = float(row["PnL"]) if pd.notna(row["PnL"]) else 0.0
+                    except Exception:
+                        pnl = 0.0
+                    clr = ("background-color:rgba(0,230,118,0.08)" if pnl >= 0
+                           else "background-color:rgba(255,23,68,0.08)")
+                    try:
+                        if bool(row.get("Is Violation", False)):
+                            clr += ";border-left:3px solid #ff9800"
+                    except Exception:
+                        pass
                     return [clr] * len(row)
-                styled = df_tr.style.apply(style_row, axis=1)\
-                               .format({"PnL": "{:+.2f}", "Entry Price": "{:.2f}",
-                                        "Exit Price": "{:.2f}", "SL": "{:.2f}",
-                                        "Target": "{:.2f}"})
+
+                _fmt = {}
+                for _c, _f in [("PnL","{:+.2f}"),("Entry Price","{:.2f}"),
+                                ("Exit Price","{:.2f}"),("SL","{:.2f}"),
+                                ("Final SL","{:.2f}"),("Target","{:.2f}"),
+                                ("Candle High","{:.2f}"),("Candle Low","{:.2f}")]:
+                    if _c in df_tr.columns:
+                        _fmt[_c] = _f
+
+                styled = df_tr.style.apply(style_row, axis=1).format(_fmt, na_rep="N/A")
                 st.dataframe(styled, use_container_width=True, height=380)
 
             # Violation table
@@ -2120,6 +2659,10 @@ def main():
                 ew = inds["elliott"]
                 st.markdown("#### 🌊 Elliott Wave Analysis")
                 _render_ew_info(ew)
+
+            # ── ANALYSIS SECTION ─────────────────────────────────────────
+            if trades and len(trades) >= 3:
+                _render_backtest_analysis(trades)
 
     # ══════════════════════════════════════════════════════════════════════════
     # TAB 2 – LIVE TRADING
