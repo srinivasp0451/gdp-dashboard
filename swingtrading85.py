@@ -15,10 +15,37 @@ import threading
 import time
 import datetime
 import requests
+try:
+    import zoneinfo
+    _IST = zoneinfo.ZoneInfo("Asia/Kolkata")
+except ImportError:
+    from backports import zoneinfo
+    _IST = zoneinfo.ZoneInfo("Asia/Kolkata")
+
+def now_ist() -> str:
+    return datetime.datetime.now(_IST).strftime("%H:%M:%S IST")
+
+def now_ist_full() -> str:
+    return datetime.datetime.now(_IST).strftime("%d-%b-%Y %H:%M:%S IST")
+
+def to_ist_str(dt) -> str:
+    try:
+        if isinstance(dt, str):
+            dt = pd.to_datetime(dt, errors="coerce")
+            if pd.isna(dt):
+                return str(dt)
+        if hasattr(dt, 'tzinfo') and dt.tzinfo is not None:
+            dt = dt.astimezone(_IST)
+        else:
+            dt = dt.replace(tzinfo=datetime.timezone.utc).astimezone(_IST)
+        return dt.strftime("%d-%b-%Y %H:%M:%S IST")
+    except Exception:
+        return str(dt)
 import warnings
 import math
 from collections import deque
 import json
+import re
 
 warnings.filterwarnings("ignore")
 
@@ -1402,6 +1429,39 @@ def live_thread_fn(ticker: str, period: str, interval: str,
 
     cooldown    = config.get("cooldown", 5)
     use_cool    = config.get("enable_cooldown", True)
+
+    # ── Daily PnL cap state ─────────────────────────────────────────────
+    enable_pnl_cap  = config.get("enable_pnl_cap", False)
+    max_day_loss    = config.get("max_day_loss",   -1000.0)
+    max_day_profit  = config.get("max_day_profit",  1000.0)
+
+    # ── Time filter ─────────────────────────────────────────────────────
+    enable_time_filter = config.get("enable_time_filter", False)
+    _tst_str = config.get("trade_start_time", "09:15:00")
+    _tet_str = config.get("trade_end_time",   "15:20:00")
+    def _in_trade_window() -> bool:
+        if not enable_time_filter:
+            return True
+        now_t = datetime.datetime.now(_IST).time()
+        try:
+            start_t = datetime.time(*[int(x) for x in str(_tst_str).split(":")[:2]])
+            end_t   = datetime.time(*[int(x) for x in str(_tet_str).split(":")[:2]])
+            return start_t <= now_t <= end_t
+        except Exception:
+            return True
+
+    def _day_pnl_ok() -> bool:
+        if not enable_pnl_cap:
+            return True
+        hist = _ts_get("trade_history", [])
+        today_str = datetime.datetime.now(_IST).strftime("%d-%b-%Y")
+        day_pnl = sum(t.get("PnL", 0) for t in hist
+                      if today_str in str(t.get("Exit DateTime", "")))
+        if day_pnl <= max_day_loss:
+            return False   # Max loss hit
+        if day_pnl >= max_day_profit:
+            return False   # Max profit hit
+        return True
     last_exit   = 0.0
     last_bar_dt = None
     cached_df: pd.DataFrame | None = None
@@ -1533,7 +1593,7 @@ def live_thread_fn(ticker: str, period: str, interval: str,
 
                     trade_rec = {
                         "Entry DateTime": pos["entry_dt"],
-                        "Exit DateTime":  datetime.datetime.now(_IST).strftime("%d-%b-%Y %H:%M:%S IST"),
+                        "Exit DateTime":  now_ist_full(),
                         "Signal":         "BUY" if sig == 1 else "SELL",
                         "Entry Price":    round(ep, 2),
                         "Exit Price":     round(exit_price, 2),
@@ -1558,6 +1618,17 @@ def live_thread_fn(ticker: str, period: str, interval: str,
                 continue
 
             if pos is None:
+                # Guard: trade time window (IST)
+                if not _in_trade_window():
+                    stop_event.wait(2.0)
+                    continue
+                # Guard: daily PnL cap
+                if not _day_pnl_ok():
+                    log("⛔ Daily PnL cap reached – no new trades today")
+                    stop_event.wait(30.0)
+                    continue
+
+            if pos is None:
                 if use_cool and (time.time() - last_exit) < cooldown:
                     stop_event.wait(0.5)
                     continue
@@ -1566,6 +1637,10 @@ def live_thread_fn(ticker: str, period: str, interval: str,
 
                 # ── Simple Buy / Sell: enter immediately at LTP, no bar wait ─
                 if strat in ("Simple Buy", "Simple Sell"):
+                    if _ts_get("simple_entered", False):
+                        # Already entered once this session – wait for SL/target to manage
+                        stop_event.wait(1.5)
+                        continue
                     sig_val = 1 if strat == "Simple Buy" else -1
                     entry_price = ltp
                     sl_price    = calc_sl(entry_price, sig_val, config, df, len(df)-1)
@@ -1574,7 +1649,7 @@ def live_thread_fn(ticker: str, period: str, interval: str,
                     log(f"◆ {'BUY' if sig_val==1 else 'SELL'} ({strat}) | "
                         f"Entry={entry_price:.2f} SL={sl_price:.2f} Tgt={tgt_price:.2f}")
                     new_pos = {
-                        "entry_dt":      datetime.datetime.now(_IST).strftime("%d-%b-%Y %H:%M:%S IST"),
+                        "entry_dt":      now_ist_full(),
                         "entry_price":   entry_price,
                         "signal_type":   sig_val,
                         "initial_sl":    sl_price,
@@ -1583,6 +1658,7 @@ def live_thread_fn(ticker: str, period: str, interval: str,
                         "signal_reason": reason,
                     }
                     _ts_set("current_position", new_pos)
+                    _ts_set("simple_entered", True)
                     if dhan_cfg.get("enabled"):
                         if dhan_cfg.get("options_trading"):
                             resp = place_options_order(dhan_cfg, sig_val, ltp)
@@ -1630,7 +1706,7 @@ def live_thread_fn(ticker: str, period: str, interval: str,
                     log(f"  {reason}")
 
                     new_pos = {
-                        "entry_dt":      datetime.datetime.now(_IST).strftime("%d-%b-%Y %H:%M:%S IST"),
+                        "entry_dt":      now_ist_full(),
                         "entry_price":   entry_price,
                         "signal_type":   sig_val,
                         "initial_sl":    sl_price,
@@ -1889,7 +1965,7 @@ def _parse_trade_df(trades: list) -> pd.DataFrame:
     if mask.any():
         df.loc[mask, "_entry_dt"] = pd.to_datetime(
             df.loc[mask, "Entry DateTime"], errors="coerce"
-        ).apply(lambda x: x.replace(tzinfo=zoneinfo.ZoneInfo("Asia/Kolkata")) if pd.notna(x) else x)
+        ).apply(lambda x: x.replace(tzinfo=_IST) if pd.notna(x) else x)
 
     df["Day"]        = df["_entry_dt"].dt.day_name()
     df["Hour_IST"]   = df["_entry_dt"].dt.hour
@@ -1900,7 +1976,6 @@ def _parse_trade_df(trades: list) -> pd.DataFrame:
                         (df["Hour_IST"] + 1).astype(str).str.zfill(2) + ":00 IST")
 
     # Extract Angle and Delta from entry reason
-    import re
     def _extract(pattern, text, default=np.nan):
         try:
             m = re.search(pattern, str(text))
@@ -2067,7 +2142,7 @@ def _render_backtest_analysis(trades: list):
         if not df_days.empty and "Day" in df_days.columns:
             x, y, c, _ = _group_pnl(df_days, "Day")
             fig = _bar_chart("Net PnL by Day of Week", x, y, c, "Day", "Net PnL")
-            st.plotly_chart(fig, use_container_width=True, key="_an_day")
+            st.plotly_chart(fig, key="_an_day")
             txt = _insight_text("Day", df_days, "Day")
             if txt: st.markdown(txt)
 
@@ -2076,7 +2151,7 @@ def _render_backtest_analysis(trades: list):
             x, y, c, wr = _group_pnl(df, "Hour_IST")
             x_lab = [f"{h:02d}:00 IST" for h in x]
             fig = _bar_chart("Net PnL by Hour (IST)", x_lab, y, c, "Hour", "Net PnL")
-            st.plotly_chart(fig, use_container_width=True, key="_an_hour")
+            st.plotly_chart(fig, key="_an_hour")
             txt = _insight_text("Hour", df, "Hour_IST")
             if txt: st.markdown(txt)
 
@@ -2092,7 +2167,7 @@ def _render_backtest_analysis(trades: list):
             fig = _heatmap_chart(
                 "Win Rate % Heatmap: Day × Hour (IST)",
                 z_vals, cols_h, list(pivot_wr.index), height=320)
-            st.plotly_chart(fig, use_container_width=True, key="_an_hmap")
+            st.plotly_chart(fig, key="_an_hmap")
 
     # ── Row 2: BUY vs SELL ────────────────────────────────────────────────────
     st.markdown("### 📊 Long vs Short Analysis")
@@ -2103,7 +2178,7 @@ def _render_backtest_analysis(trades: list):
         c_s   = [_GREEN if v >= 0 else _RED for v in sides["PnL"]]
         fig   = _bar_chart("Net PnL: Long vs Short",
                            sides["Signal"].tolist(), sides["PnL"].round(2).tolist(), c_s)
-        st.plotly_chart(fig, use_container_width=True, key="_an_side")
+        st.plotly_chart(fig, key="_an_side")
 
     with col4:
         sides_wr = df.groupby("Signal")["Win"].mean().reset_index()
@@ -2112,7 +2187,7 @@ def _render_backtest_analysis(trades: list):
         fig = _bar_chart("Win Rate %: Long vs Short",
                          sides_wr["Signal"].tolist(), sides_wr["Win"].round(1).tolist(),
                          c_wr, y_title="Win Rate %")
-        st.plotly_chart(fig, use_container_width=True, key="_an_side_wr")
+        st.plotly_chart(fig, key="_an_side_wr")
 
     with col5:
         # Trap analysis: trades where signal was right direction but exited at SL
@@ -2123,7 +2198,7 @@ def _render_backtest_analysis(trades: list):
                              trap_counts["Signal"].tolist(),
                              trap_counts["Traps"].tolist(),
                              [_RED]*len(trap_counts), y_title="# Traps")
-            st.plotly_chart(fig, use_container_width=True, key="_an_traps")
+            st.plotly_chart(fig, key="_an_traps")
         else:
             st.info("No SL traps detected.")
 
@@ -2138,14 +2213,14 @@ def _render_backtest_analysis(trades: list):
             x, y, c, _ = _group_pnl(df.dropna(subset=["Angle Bin"]), "Angle Bin")
             fig = _bar_chart("Net PnL by Crossover Angle",
                              [str(v) for v in x], y, c, "Angle Bin", "Net PnL")
-            st.plotly_chart(fig, use_container_width=True, key="_an_angle")
+            st.plotly_chart(fig, key="_an_angle")
             txt = _insight_text("Angle Bin", df.dropna(subset=["Angle Bin"]), "Angle Bin")
             if txt: st.markdown(txt)
 
         with col7:
             fig2 = _scatter_chart(df.dropna(subset=["Angle"]), "Angle",
                                   "PnL vs Crossover Angle (°)")
-            st.plotly_chart(fig2, use_container_width=True, key="_an_angle_sc")
+            st.plotly_chart(fig2, key="_an_angle_sc")
 
     # ── Row 4: Delta Analysis ─────────────────────────────────────────────────
     if has_delta:
@@ -2155,14 +2230,14 @@ def _render_backtest_analysis(trades: list):
             x, y, c, _ = _group_pnl(df.dropna(subset=["Delta Bin"]), "Delta Bin")
             fig = _bar_chart("Net PnL by EMA Delta",
                              [str(v) for v in x], y, c, "Delta Bin", "Net PnL")
-            st.plotly_chart(fig, use_container_width=True, key="_an_delta")
+            st.plotly_chart(fig, key="_an_delta")
             txt = _insight_text("Delta Bin", df.dropna(subset=["Delta Bin"]), "Delta Bin")
             if txt: st.markdown(txt)
 
         with col9:
             fig2 = _scatter_chart(df.dropna(subset=["Delta"]), "Delta",
                                   "PnL vs EMA Delta")
-            st.plotly_chart(fig2, use_container_width=True, key="_an_delta_sc")
+            st.plotly_chart(fig2, key="_an_delta_sc")
 
     # ── Row 5: Angle × Delta heatmap ─────────────────────────────────────────
     if has_angle and has_delta:
@@ -2177,7 +2252,7 @@ def _render_backtest_analysis(trades: list):
                 z_vals,
                 [str(c) for c in pivot_ad.columns],
                 [str(i) for i in pivot_ad.index], height=320)
-            st.plotly_chart(fig, use_container_width=True, key="_an_ad_heat")
+            st.plotly_chart(fig, key="_an_ad_heat")
 
     # ── Row 6: Exit reason breakdown ─────────────────────────────────────────
     st.markdown("### 🚪 Exit Reason Analysis")
@@ -2190,7 +2265,7 @@ def _render_backtest_analysis(trades: list):
         fig = _bar_chart("Net PnL by Exit Reason",
                          er["Exit Reason"].tolist(), er["Net PnL"].round(2).tolist(),
                          colors_er, height=300)
-        st.plotly_chart(fig, use_container_width=True, key="_an_exit")
+        st.plotly_chart(fig, key="_an_exit")
 
     with col11:
         # Exit reason pie
@@ -2209,7 +2284,7 @@ def _render_backtest_analysis(trades: list):
             margin=dict(t=40, b=10, l=10, r=10),
             legend=dict(font=dict(size=10)),
         )
-        st.plotly_chart(fig_pie, use_container_width=True, key="_an_pie")
+        st.plotly_chart(fig_pie, key="_an_pie")
 
     # ── Row 7: Consecutive wins / losses ─────────────────────────────────────
     st.markdown("### 📈 Equity Curve & Drawdown")
@@ -2231,7 +2306,7 @@ def _render_backtest_analysis(trades: list):
             yaxis=dict(showgrid=True, gridcolor="rgba(255,255,255,0.07)"),
             margin=dict(t=40, b=30, l=40, r=20),
         )
-        st.plotly_chart(fig_eq, use_container_width=True, key="_an_eq")
+        st.plotly_chart(fig_eq, key="_an_eq")
 
     with col13:
         peak   = cum_pnl.cummax()
@@ -2250,7 +2325,7 @@ def _render_backtest_analysis(trades: list):
             yaxis=dict(showgrid=True, gridcolor="rgba(255,255,255,0.07)"),
             margin=dict(t=40, b=30, l=40, r=20),
         )
-        st.plotly_chart(fig_dd, use_container_width=True, key="_an_dd")
+        st.plotly_chart(fig_dd, key="_an_dd")
 
     # ── Key Insights Summary ──────────────────────────────────────────────────
     st.markdown("### 💡 Key Actionable Insights")
@@ -2380,6 +2455,12 @@ def main():
         crossover_type   = "Simple Crossover"
         custom_candle_sz = 10
         min_wave_pct     = 0.5
+        enable_pnl_cap   = False
+        max_day_loss     = -1000.0
+        max_day_profit   = 1000.0
+        enable_time_filter = False
+        trade_start_time   = datetime.time(9, 15)
+        trade_end_time     = datetime.time(15, 20)
 
         if strategy in ("EMA Crossover","Anticipatory EMA","Elliott Wave"):
             c1, c2 = st.columns(2)
@@ -2461,6 +2542,24 @@ def main():
             cooldown_secs = st.number_input("Cooldown (s)", 1, 3600, 5, key="_cls")
         prevent_overlap = st.checkbox("Prevent Overlapping Trades", True, key="_po")
 
+        # ── Daily PnL Cap ────────────────────────────────────────────────
+        enable_pnl_cap = st.checkbox("Daily PnL Cap", False, key="_epnlcap")
+        max_day_loss   = -1000.0
+        max_day_profit = 1000.0
+        if enable_pnl_cap:
+            _pc1, _pc2 = st.columns(2)
+            max_day_loss   = _pc1.number_input("Max Loss/Day", -100000, 0, -1000, 100, key="_mdl")
+            max_day_profit = _pc2.number_input("Max Profit/Day", 0, 100000, 1000, 100, key="_mdp")
+
+        # ── Trade Time Window (IST) ───────────────────────────────────────
+        enable_time_filter = st.checkbox("Trade Time Filter (IST)", False, key="_etf")
+        trade_start_time   = datetime.time(9, 15)
+        trade_end_time     = datetime.time(15, 20)
+        if enable_time_filter:
+            _tf1, _tf2 = st.columns(2)
+            trade_start_time = _tf1.time_input("Start Time (IST)", datetime.time(9, 15), key="_tst")
+            trade_end_time   = _tf2.time_input("End Time (IST)", datetime.time(15, 20), key="_tet")
+
         st.markdown("---")
         st.markdown("### 🏦 Dhan Broker")
         enable_dhan = st.checkbox("Enable Dhan", False, key="_edhan")
@@ -2521,6 +2620,12 @@ def main():
         "vol_target_mult": vol_target_mult,
         "enable_partial":  enable_partial,
         "partial_pct":     partial_pct,
+        "enable_pnl_cap":  enable_pnl_cap,
+        "max_day_loss":    max_day_loss,
+        "max_day_profit":  max_day_profit,
+        "enable_time_filter": enable_time_filter,
+        "trade_start_time":   str(trade_start_time),
+        "trade_end_time":     str(trade_end_time),
     }
 
     # ── HEADER ───────────────────────────────────────────────────────────────
@@ -2724,6 +2829,30 @@ def main():
             f'Qty: <b>{quantity}</b>'
             f'</div>', unsafe_allow_html=True)
 
+        # ── Active guards status bar ────────────────────────────────────
+        _guard_parts = []
+        if config.get("enable_time_filter"):
+            _guard_parts.append(
+                f"⏰ Trade Window: "
+                f"<b>{config.get('trade_start_time','09:15')} – "
+                f"{config.get('trade_end_time','15:20')} IST</b>")
+        if config.get("enable_pnl_cap"):
+            _hist = _ts_get("trade_history", [])
+            _today = datetime.datetime.now(_IST).strftime("%d-%b-%Y")
+            _dpnl  = sum(t.get("PnL",0) for t in _hist
+                         if _today in str(t.get("Exit DateTime","")))
+            _clr   = "#00e676" if _dpnl >= 0 else "#ff1744"
+            _guard_parts.append(
+                f"💰 Day PnL: <b style='color:{_clr};'>{_dpnl:+.2f}</b> "
+                f"(Cap: {config.get('max_day_loss',0):+.0f} / "
+                f"{config.get('max_day_profit',0):+.0f})")
+        if _guard_parts:
+            st.markdown(
+                '<div style="background:#1f2733;border:1px solid rgba(255,255,255,0.1);'
+                'border-radius:6px;padding:8px 14px;font-size:12px;margin-bottom:8px;">'
+                + " &nbsp;|&nbsp; ".join(_guard_parts) + "</div>",
+                unsafe_allow_html=True)
+
         # Live status row
         pos      = _ts_get("current_position")
         live_pnl = _ts_get("current_pnl", 0.0)
@@ -2759,7 +2888,7 @@ def main():
                 if ew_state:
                     live_inds["elliott"] = ew_state
                 fig_live = build_live_chart(df_live, pos, live_inds, config)
-                st.plotly_chart(fig_live, use_container_width=True, key="_livechart")
+                st.plotly_chart(fig_live, key="_livechart")
             else:
                 st.info("⏳ Waiting for live data…")
 
@@ -2859,7 +2988,7 @@ def main():
                 y=pnl_vals, name="Trade PnL",
                 marker_color=bar_clrs), row=1, col=2)
             fig_pnl.update_layout(**_base_layout("PnL Analysis", 320))
-            st.plotly_chart(fig_pnl, use_container_width=True, key="_pnlfig")
+            st.plotly_chart(fig_pnl, key="_pnlfig")
 
             st.dataframe(df_hist.style.apply(
                 lambda row: ["background-color:rgba(0,230,118,0.08)"
@@ -2919,7 +3048,7 @@ def main():
                     text=pivot.values.round(1), texttemplate="%{text}%",
                 ))
                 fig_heat.update_layout(**_base_layout("EMA Accuracy Heatmap", 380))
-                st.plotly_chart(fig_heat, use_container_width=True, key="_heat")
+                st.plotly_chart(fig_heat, key="_heat")
 
                 # Apply best params button
                 if st.button("⚡ Apply Best Parameters to Sidebar", key="_applyopt"):
