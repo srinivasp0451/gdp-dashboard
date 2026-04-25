@@ -748,6 +748,17 @@ def live_thread(ticker,period,interval,cfg,stop_ev,dhan_cfg):
                     _sigs,_reas,_inds=generate_signals(df,cfg)
                     if "elliott" in _inds: _ts_set("elliott_wave_state",_inds["elliott"])
                     sidx=max(len(_sigs)-2,0); sv=int(_sigs.iloc[sidx])
+                    # Store live indicator snapshot for strategy status panel
+                    if len(df)>=2:
+                        _fe_live=ema(df["Close"],cfg.get("fast_ema",9))
+                        _se_live=ema(df["Close"],cfg.get("slow_ema",15))
+                        _f0=float(_fe_live.iloc[-1]); _s0=float(_se_live.iloc[-1])
+                        _ang=cx_angle(_fe_live,_se_live,len(_fe_live)-1)
+                        _ts_set("live_ema_snapshot",{
+                            "fast":round(_f0,4),"slow":round(_s0,4),
+                            "delta":round(_f0-_s0,4),"angle":round(_ang,2),
+                            "ltp":ltp})
+
                     if sv!=0:
                         last_bar_dt=cur_bar; ep=ltp
                         nsl=calc_sl(ep,sv,cfg,df,len(df)-1); ntg=calc_tgt(ep,sv,cfg,df,len(df)-1)
@@ -1153,6 +1164,197 @@ h1,h2,h3,h4{font-family:'Syne',sans-serif!important;color:var(--tx)!important;}
 @keyframes blink{50%{opacity:0;}}
 </style>"""
 
+
+# ── Live Strategy Status Helper ───────────────────────────────────────────────
+def live_strategy_status(strat, cfg, df, pos, pnl):
+    """
+    Returns an HTML string with full strategy-specific live status.
+    Called every fragment refresh — gives the user total clarity.
+    """
+    if df is None or len(df) < 3:
+        return '<div style="color:#8b949e;font-size:12px;padding:8px;">Waiting for data…</div>'
+
+    lines = []
+
+    def row(label, value, color="#e6edf3", bold=False):
+        bstart = "<b>" if bold else ""
+        bend   = "</b>" if bold else ""
+        return (f'<div style="display:flex;justify-content:space-between;'
+                f'font-size:12px;padding:3px 0;border-bottom:1px solid rgba(255,255,255,0.05);">'
+                f'<span style="color:#8b949e;">{label}</span>'
+                f'<span style="color:{color};">{bstart}{value}{bend}</span></div>')
+
+    def section(title):
+        return (f'<div style="font-size:11px;font-weight:700;color:#ffea00;'
+                f'text-transform:uppercase;letter-spacing:1px;margin:10px 0 4px;">{title}</div>')
+
+    # ── EMA Crossover / Anticipatory EMA ─────────────────────────────────────
+    if strat in ("EMA Crossover", "Anticipatory EMA"):
+        fp  = cfg.get("fast_ema", 9)
+        sp  = cfg.get("slow_ema", 15)
+        fe  = ema(df["Close"], fp)
+        se  = ema(df["Close"], sp)
+        atr_v = calc_atr(df)
+        n   = len(df)
+
+        f_cur  = float(fe.iloc[-1]); f_prev = float(fe.iloc[-2]) if n >= 2 else f_cur
+        s_cur  = float(se.iloc[-1]); s_prev = float(se.iloc[-2]) if n >= 2 else s_cur
+        delta  = f_cur - s_cur
+        ang    = cx_angle(fe, se, n-1) if n >= 2 else 0.0
+        atr_now= float(atr_v.iloc[-1])
+        ltp    = float(df["Close"].iloc[-1])
+
+        # Cross state
+        was_above = f_prev > s_prev; is_above = f_cur > s_cur
+        bull_cross = (not was_above) and is_above
+        bear_cross = was_above and (not is_above)
+
+        # Trend
+        trend_clr  = "#00e676" if is_above else "#ff1744"
+        trend_txt  = "FAST ABOVE SLOW (Bullish bias)" if is_above else "FAST BELOW SLOW (Bearish bias)"
+
+        # Filter checks
+        min_a = cfg.get("min_angle", 0.0); max_a = cfg.get("max_angle", 90.0)
+        min_d = cfg.get("min_delta", 0.0); max_d = cfg.get("max_delta", 1e9)
+        angle_ok = min_a <= ang <= max_a
+        delta_ok = min_d <= abs(delta) <= max_d
+
+        lines.append(section("📊 EMA Values"))
+        lines.append(row(f"Fast EMA ({fp})",  f"{f_cur:.4f}", "#ff9800", True))
+        lines.append(row(f"Slow EMA ({sp})",  f"{s_cur:.4f}", "#40c4ff", True))
+        lines.append(row("Δ Delta (F−S)",     f"{delta:+.4f}", "#00e676" if delta > 0 else "#ff1744", True))
+        lines.append(row("Δ |Delta|",          f"{abs(delta):.4f}", "#e6edf3"))
+        lines.append(row("Crossover Angle",   f"{ang:.2f}°", "#ffea00", True))
+        lines.append(row("ATR",               f"{atr_now:.4f}", "#ce93d8"))
+        lines.append(row("LTP",               f"{ltp:.2f}", "#ffffff", True))
+
+        lines.append(section("🔀 Crossover State"))
+        lines.append(row("Trend",             trend_txt, trend_clr))
+        if bull_cross:
+            lines.append(row("⚡ CROSSOVER",  "BULLISH CROSS — BAR JUST HAPPENED", "#00e676", True))
+        elif bear_cross:
+            lines.append(row("⚡ CROSSOVER",  "BEARISH CROSS — BAR JUST HAPPENED", "#ff1744", True))
+        else:
+            dist = abs(delta)
+            lines.append(row("Distance to Cross", f"{dist:.4f} pts", "#8b949e"))
+
+        lines.append(section("✅ Filter Status"))
+        lines.append(row("Angle Filter",  f"{ang:.1f}° → {'✅ PASS' if angle_ok else '❌ FAIL'}", "#00e676" if angle_ok else "#ff1744"))
+        lines.append(row("Delta Filter",  f"|Δ|={abs(delta):.2f} → {'✅ PASS' if delta_ok else '❌ FAIL'}", "#00e676" if delta_ok else "#ff1744"))
+        lines.append(row("Direction",     cfg.get("trade_direction","Both"), "#e6edf3"))
+
+        if pos is None:
+            lines.append(section("⏳ Entry Conditions Needed"))
+            if cfg.get("trade_direction","Both") in ("Both","Long Only"):
+                lines.append(row("BUY  entry when", f"Fast crosses ABOVE Slow", "#00e676"))
+            if cfg.get("trade_direction","Both") in ("Both","Short Only"):
+                lines.append(row("SELL entry when", f"Fast crosses BELOW Slow", "#ff1744"))
+            if cfg.get("min_angle", 0.0) > 0:
+                lines.append(row("AND angle", f"≥ {cfg.get('min_angle',0):.0f}°", "#ffea00"))
+            if cfg.get("min_delta", 0.0) > 0:
+                lines.append(row("AND |delta|", f"≥ {cfg.get('min_delta',0):.2f}", "#ffea00"))
+
+        # Projected SL/Target if no position
+        if pos is None and len(df) >= 3:
+            proj_entry = ltp
+            proj_sl_b  = calc_sl(proj_entry, 1,  cfg, df, len(df)-1)
+            proj_tg_b  = calc_tgt(proj_entry, 1,  cfg, df, len(df)-1)
+            proj_sl_s  = calc_sl(proj_entry, -1, cfg, df, len(df)-1)
+            proj_tg_s  = calc_tgt(proj_entry, -1, cfg, df, len(df)-1)
+            lines.append(section("🎯 Projected Entry Levels (at LTP)"))
+            lines.append(row("BUY  SL / Target",  f"{proj_sl_b:.2f} / {proj_tg_b:.2f}", "#00e676"))
+            lines.append(row("SELL SL / Target",  f"{proj_sl_s:.2f} / {proj_tg_s:.2f}", "#ff1744"))
+
+    # ── Simple Buy / Simple Sell ──────────────────────────────────────────────
+    elif strat in ("Simple Buy", "Simple Sell"):
+        ltp = float(df["Close"].iloc[-1])
+        sv  = 1 if strat == "Simple Buy" else -1
+        if pos is None:
+            proj_sl  = calc_sl(ltp,  sv, cfg, df, len(df)-1)
+            proj_tgt = calc_tgt(ltp, sv, cfg, df, len(df)-1)
+            lines.append(section("⚡ Simple Strategy"))
+            lines.append(row("Mode",        strat, "#ffea00", True))
+            lines.append(row("LTP",         f"{ltp:.2f}", "#ffffff", True))
+            lines.append(row("Proj SL",     f"{proj_sl:.2f}", "#ff1744", True))
+            lines.append(row("Proj Target", f"{proj_tgt:.2f}", "#00e676", True))
+            lines.append(row("Status",      "✅ Will enter on next tick", "#00e676"))
+        else:
+            lines.append(section("⚡ Position Active"))
+            lines.append(row("LTP",    f"{ltp:.2f}",            "#ffffff", True))
+            lines.append(row("Entry",  f"{pos['entry_price']:.2f}", "#e6edf3"))
+            lines.append(row("SL",     f"{pos['current_sl']:.2f}",  "#ff1744", True))
+            lines.append(row("Target", f"{pos['target']:.2f}",      "#00e676", True))
+            clr = "#00e676" if pnl >= 0 else "#ff1744"
+            lines.append(row("Live PnL", f"{pnl:+.2f} pts", clr, True))
+
+    # ── Elliott Wave ──────────────────────────────────────────────────────────
+    elif strat == "Elliott Wave":
+        ltp = float(df["Close"].iloc[-1])
+        ew  = detect_ew(df,
+                        cfg.get("min_wave_pct", 0.5),
+                        cfg.get("ew_left", 4),
+                        cfg.get("ew_right", 4))
+        sig_ew = ew.get("signal", "NONE")
+        pat    = ew.get("pattern", "–")
+        wdir   = ew.get("wave_direction", "–")
+        compl  = ew.get("completed_waves", [])
+        curw   = ew.get("current_wave", "–")
+        fib    = ew.get("fibonacci_levels", {})
+        wpts   = ew.get("wave_points", {})
+        nxt    = ew.get("next_target")
+        ew_sl  = ew.get("sl"); ew_tg = ew.get("target")
+
+        dir_clr = {"Bullish":"#00e676","Bearish":"#ff1744",
+                   "Bullish ABC":"#ffea00","Bearish ABC":"#ff9800"}.get(wdir, "#40c4ff")
+        sig_clr = "#00e676" if sig_ew=="BUY" else ("#ff1744" if sig_ew=="SELL" else "#8b949e")
+
+        lines.append(section("🌊 Wave Pattern"))
+        lines.append(row("Pattern",    pat,  "#ffea00"))
+        lines.append(row("Direction",  wdir, dir_clr, True))
+        lines.append(row("Completed",  " → ".join(compl) if compl else "–", "#8b949e"))
+        lines.append(row("Current",    curw, "#e6edf3", True))
+        lines.append(row("LTP",        f"{ltp:.2f}", "#ffffff", True))
+
+        if wpts:
+            lines.append(section("📍 Wave Price Levels"))
+            for k, v in wpts.items():
+                lines.append(row(k, f"{v:.2f}", "#e6edf3"))
+
+        if fib:
+            lines.append(section("📐 Fibonacci Levels"))
+            for k, v in fib.items():
+                is_near = abs(ltp - v) / max(ltp, 1) < 0.005
+                lines.append(row(k, f"{v:.2f}", "#ffea00" if is_near else "#8b949e"))
+
+        lines.append(section("🎯 Signal & Targets"))
+        lines.append(row("Signal",     sig_ew, sig_clr, True))
+        if nxt:  lines.append(row("Next Target",  f"{nxt:.2f}",  "#ffea00", True))
+        if ew_sl: lines.append(row("EW SL",       f"{ew_sl:.2f}", "#ff1744", True))
+        if ew_tg: lines.append(row("EW Target",   f"{ew_tg:.2f}", "#00e676", True))
+
+        if pos is None:
+            lines.append(section("⏳ Entry Conditions Needed"))
+            if pat == "Insufficient Data":
+                lines.append(row("Status", "Need more candle data", "#ff9800"))
+            elif sig_ew == "NONE":
+                lines.append(row("Status", "No clear EW signal yet — scanning…", "#ff9800"))
+            elif sig_ew == "BUY":
+                lines.append(row("Waiting for", "Bar boundary + BUY signal confirm", "#00e676"))
+                lines.append(row("Entry type", "At next bar open (LTP)", "#e6edf3"))
+            elif sig_ew == "SELL":
+                lines.append(row("Waiting for", "Bar boundary + SELL signal confirm", "#ff1744"))
+                lines.append(row("Entry type", "At next bar open (LTP)", "#e6edf3"))
+        else:
+            lines.append(section("✅ Trade Active"))
+            clr = "#00e676" if pnl >= 0 else "#ff1744"
+            lines.append(row("Live PnL", f"{pnl:+.2f} pts", clr, True))
+
+    # ── Anticipatory EMA (reuse EMA block above but add anticipation state) ──
+    html = ('<div style="background:#1f2733;border:1px solid rgba(255,255,255,0.08);'
+            'border-radius:10px;padding:14px;overflow-y:auto;max-height:680px;">'
+            + "".join(lines) + "</div>")
+    return html
+
 # ── MAIN APP ──────────────────────────────────────────────────────────────────
 def main():
     st.set_page_config(page_title="Smart Investing",page_icon="📈",layout="wide",
@@ -1453,7 +1655,7 @@ def main():
                 lc6.metric("Bar (IST)", str(_lc.get("datetime",""))[-12:])
 
             st.markdown("---")
-            ch_col, info_col = st.columns([2.5, 1])
+            ch_col, info_col = st.columns([2.2, 1])
 
             with ch_col:
                 if _ld and len(_ld.get("close", [])) >= 3:
@@ -1472,26 +1674,43 @@ def main():
                     st.info("⏳ Fetching live data — first load ~3 s…" if _running else "▶ Click Start")
 
             with info_col:
-                st.markdown("**📌 Position**")
+                # ── Active position card ──────────────────────────────────
                 if _pos:
                     pc = "#00e676" if _pnl >= 0 else "#ff1744"
-                    st.markdown(f"""<div style="background:linear-gradient(135deg,rgba(0,230,118,0.06),rgba(64,196,255,0.06));
-                      border:1px solid rgba(0,230,118,0.2);border-radius:10px;padding:14px;">
-                      <div style="font-size:16px;font-weight:700;">{"🟢 BUY" if _pos["signal_type"]==1 else "🔴 SELL"}</div>
-                      <div style="margin-top:8px;font-size:12px;">
-                        <div>Entry: <b>{_pos['entry_price']:.2f}</b></div>
-                        <div>SL: <b style="color:#ff1744;">{_pos['current_sl']:.2f}</b></div>
-                        <div>Target: <b style="color:#00e676;">{_pos['target']:.2f}</b></div>
-                        <div>Since: {_pos.get('entry_dt','')}</div>
-                        <div style="margin-top:8px;font-size:16px;color:{pc};font-weight:800;">P&L: {_pnl:+.2f} pts</div>
-                        <div style="font-size:10px;color:#8b949e;margin-top:4px;">{_pos.get('signal_reason','')[:70]}</div>
-                      </div></div>""", unsafe_allow_html=True)
+                    _arr = "▲" if _pnl >= 0 else "▼"
+                    st.markdown(f"""<div style="background:{'rgba(0,230,118,0.06)' if _pnl>=0 else 'rgba(255,23,68,0.06)'};
+                      border:1px solid {'rgba(0,230,118,0.3)' if _pnl>=0 else 'rgba(255,23,68,0.3)'};
+                      border-radius:10px;padding:12px;margin-bottom:8px;">
+                      <div style="font-size:15px;font-weight:700;margin-bottom:6px;">
+                        {"🟢 LONG" if _pos["signal_type"]==1 else "🔴 SHORT"}</div>
+                      <div style="font-size:11px;color:#8b949e;line-height:1.9;">
+                        Entry:&nbsp;<b style="color:#e6edf3;">{_pos['entry_price']:.2f}</b><br>
+                        SL:&nbsp;<b style="color:#ff1744;">{_pos['current_sl']:.2f}</b><br>
+                        Target:&nbsp;<b style="color:#00e676;">{_pos['target']:.2f}</b><br>
+                        Since:&nbsp;{_pos.get('entry_dt','')}<br>
+                      </div>
+                      <div style="font-size:20px;font-weight:800;color:{pc};margin-top:6px;">
+                        {_arr} {abs(_pnl):.2f} pts</div>
+                      <div style="font-size:15px;color:{pc};">× qty = {_pnl*qty:+.2f}</div>
+                      <div style="font-size:10px;color:#8b949e;margin-top:4px;word-break:break-word;">
+                        {_pos.get('signal_reason','')[:80]}</div>
+                    </div>""", unsafe_allow_html=True)
+
+                # ── Strategy Live Status (always visible) ─────────────────
+                st.markdown('<div style="font-size:11px;font-weight:700;color:#40c4ff;'
+                            'text-transform:uppercase;letter-spacing:1px;margin-bottom:4px;">'
+                            '🔍 Strategy Status</div>', unsafe_allow_html=True)
+                if _ld and len(_ld.get("close",[])) >= 3:
+                    _dfl2 = pd.DataFrame({
+                        "Open": _ld["open"], "High": _ld["high"],
+                        "Low":  _ld["low"],  "Close": _ld["close"], "Volume": _ld["volume"],
+                    }, index=pd.to_datetime(_ld["index"], errors="coerce", utc=False))
+                    st.markdown(
+                        live_strategy_status(strat, cfg, _dfl2, _pos, _pnl),
+                        unsafe_allow_html=True)
                 else:
-                    st.markdown('<div style="color:#8b949e;font-size:12px;padding:10px;">No open position</div>', unsafe_allow_html=True)
-                _ew2 = _ts_get("elliott_wave_state")
-                if _ew2:
-                    st.markdown("**🌊 Elliott Wave**")
-                    ew_panel(_ew2)
+                    st.markdown('<div style="color:#8b949e;font-size:12px;padding:8px;">'
+                                '⏳ Waiting for data…</div>', unsafe_allow_html=True)
 
             st.markdown("**📋 Live Log**")
             log_html = "<br>".join(reversed(_logs[-60:]))
