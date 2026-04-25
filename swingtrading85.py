@@ -91,20 +91,30 @@ def _mkt_filter(df, interval):
         out = df[mask]; return out if len(out)>0 else df
     except Exception: return df
 
-def _yf_dl(ticker, period, interval):
+def _yf_dl(ticker, period, interval, retries=3):
     global _LAST_YF
-    with _YF_LOCK:
-        g = time.time()-_LAST_YF
-        if g<1.5: time.sleep(1.5-g)
-        _LAST_YF = time.time()
-    try:
-        df = yf.download(ticker,period=period,interval=interval,
-                         auto_adjust=True,progress=False,threads=False)
-        if df is None or len(df)==0: return None
-        if isinstance(df.columns,pd.MultiIndex): df.columns = df.columns.get_level_values(0)
-        df = df.dropna(how="all")
-        return _mkt_filter(df,interval)
-    except Exception: return None
+    for attempt in range(retries):
+        with _YF_LOCK:
+            g = time.time()-_LAST_YF
+            if g < 1.5: time.sleep(1.5-g)
+            _LAST_YF = time.time()
+        try:
+            tk = yf.Ticker(ticker)
+            df = tk.history(period=period, interval=interval,
+                            auto_adjust=True, timeout=30)
+            if df is None or len(df) == 0:
+                # Fallback to download()
+                df = yf.download(ticker, period=period, interval=interval,
+                                 auto_adjust=True, progress=False, threads=False)
+            if df is None or len(df) == 0:
+                time.sleep(1.0 * (attempt+1)); continue
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = df.columns.get_level_values(0)
+            df = df.dropna(how="all")
+            return _mkt_filter(df, interval)
+        except Exception:
+            time.sleep(1.5 * (attempt+1))
+    return None
 
 def fetch_data(ticker, period, interval, min_bars=200):
     df = _yf_dl(ticker,period,interval)
@@ -129,6 +139,30 @@ def calc_atr(df, p=14):
     h,l,c = df["High"],df["Low"],df["Close"]; pc=c.shift(1)
     return pd.concat([(h-l),(h-pc).abs(),(l-pc).abs()],axis=1).max(axis=1)\
              .ewm(span=p,adjust=False,min_periods=1).mean()
+
+def calc_rsi(series, period=14):
+    delta = series.diff()
+    gain  = delta.clip(lower=0).ewm(span=period, adjust=False, min_periods=1).mean()
+    loss  = (-delta.clip(upper=0)).ewm(span=period, adjust=False, min_periods=1).mean()
+    rs    = gain / loss.replace(0, 1e-9)
+    return 100 - (100 / (1 + rs))
+
+def calc_adx(df, period=14):
+    """Returns (ADX, +DI, -DI) as a DataFrame."""
+    hi  = df["High"]; lo = df["Low"]; cl = df["Close"]; pc = cl.shift(1)
+    tr  = pd.concat([(hi-lo),(hi-pc).abs(),(lo-pc).abs()],axis=1).max(axis=1)
+    pdm = (hi - hi.shift(1)).clip(lower=0)
+    ndm = (lo.shift(1) - lo).clip(lower=0)
+    # When +DM < -DM, zero it out and vice-versa
+    cond = pdm >= ndm
+    pdm  = pdm.where(cond, 0.0)
+    ndm  = ndm.where(~cond, 0.0)
+    atr14  = tr.ewm(span=period, adjust=False, min_periods=1).mean()
+    pdi    = 100 * pdm.ewm(span=period, adjust=False, min_periods=1).mean() / atr14.replace(0,1e-9)
+    ndi    = 100 * ndm.ewm(span=period, adjust=False, min_periods=1).mean() / atr14.replace(0,1e-9)
+    dx     = (pdi - ndi).abs() / (pdi + ndi).replace(0,1e-9) * 100
+    adx    = dx.ewm(span=period, adjust=False, min_periods=1).mean()
+    return adx, pdi, ndi
 
 def cx_angle(fe,se,i):
     if i<1: return 0.0
@@ -308,10 +342,39 @@ def generate_signals(df, cfg):
             if delta<min_d or delta>max_d: continue
             if cxt=="Custom Candle Size" and csz<cxsz: continue
             if cxt=="ATR Based Candle Size" and csz<float(atr_s.iloc[i]): continue
-            if tdir in ("Both","Long Only") and f1<=s1 and f0>s0:
+            # DOW filter
+            dow_allow = cfg.get("allowed_days", [])
+            if dow_allow:
+                try:
+                    bar_dow = df.index[i]
+                    if hasattr(bar_dow, "tzinfo") and bar_dow.tzinfo is None:
+                        bar_dow = pd.Timestamp(bar_dow).tz_localize("UTC").tz_convert(_IST)
+                    else:
+                        bar_dow = pd.Timestamp(bar_dow).tz_convert(_IST)
+                    if bar_dow.day_name() not in dow_allow: continue
+                except Exception: pass
+            # ADX filter
+            if cfg.get("enable_adx", False):
+                adx_s, pdi_s, ndi_s = calc_adx(df, cfg.get("adx_period",14))
+                adx_val = float(adx_s.iloc[i]); adx_min = cfg.get("adx_min",25)
+                if adx_val < adx_min: continue
+            # RSI filter
+            if cfg.get("enable_rsi", False):
+                rsi_s   = calc_rsi(df["Close"], cfg.get("rsi_period",14))
+                rsi_val = float(rsi_s.iloc[i])
+                rsi_lo  = cfg.get("rsi_oversold",  30)
+                rsi_hi  = cfg.get("rsi_overbought",70)
+                # For BUY: RSI must be rising from oversold region (< 50 + margin)
+                # For SELL: RSI must be falling from overbought region (> 50 - margin)
+                rsi_pass_buy  = rsi_val < rsi_hi   # not overbought — allow longs
+                rsi_pass_sell = rsi_val > rsi_lo    # not oversold — allow shorts
+            else:
+                rsi_pass_buy = rsi_pass_sell = True
+
+            if tdir in ("Both","Long Only") and f1<=s1 and f0>s0 and rsi_pass_buy:
                 sigs.iloc[i]=1
                 reasons.iloc[i]=f"EMA Bull Cross | F={f0:.2f} S={s0:.2f} Δ={delta:.2f} ∠={ang:.1f}°"
-            elif tdir in ("Both","Short Only") and f1>=s1 and f0<s0:
+            elif tdir in ("Both","Short Only") and f1>=s1 and f0<s0 and rsi_pass_sell:
                 sigs.iloc[i]=-1
                 reasons.iloc[i]=f"EMA Bear Cross | F={f0:.2f} S={s0:.2f} Δ={delta:.2f} ∠={ang:.1f}°"
 
@@ -639,19 +702,20 @@ def live_thread(ticker,period,interval,cfg,stop_ev,dhan_cfg):
                     if g<1.5: time.sleep(1.5-g)
                     _LAST_YF=time.time()
                 try:
-                    df=yf.download(ticker,period=period,interval=interval,auto_adjust=True,progress=False,threads=False)
+                    df = _yf_dl(ticker, period, interval, retries=2)
                     if df is not None and len(df)>1:
-                        if isinstance(df.columns,pd.MultiIndex): df.columns=df.columns.get_level_values(0)
-                        df=df.dropna(how="all"); df=_mkt_filter(df,interval)
                         cached_df=df; last_fetch=time.time()
                         lc=df.iloc[-1]
                         _ts_set("last_candle",{"datetime":ts_to_ist(df.index[-1]),
                             "open":round(float(lc["Open"]),2),"high":round(float(lc["High"]),2),
                             "low":round(float(lc["Low"]),2),"close":round(float(lc["Close"]),2),
-                            "volume":int(lc["Volume"]) if not pd.isna(lc["Volume"]) else 0})
+                            "volume":int(lc["Volume"]) if not pd.isna(lc["Volume"]) else 0,
+                            "fetch_ts":now_ist()})
                         _ts_set("live_data",{"open":df["Open"].tolist(),"high":df["High"].tolist(),
                             "low":df["Low"].tolist(),"close":df["Close"].tolist(),
                             "volume":df["Volume"].tolist(),"index":[ts_to_ist(x) for x in df.index]})
+                    else:
+                        log(f"[WARN] Fetch returned empty — will retry")
                 except Exception as e: log(f"[FETCH ERR] {e}"); stop_ev.wait(2.0); continue
 
             if cached_df is None or len(cached_df)<3: stop_ev.wait(1.0); continue
@@ -814,85 +878,298 @@ def _layout(title="",h=680):
                 xaxis_rangeslider_visible=False,
                 legend=dict(bgcolor="rgba(0,0,0,0.4)",bordercolor="rgba(255,255,255,0.1)",borderwidth=1))
 
-def bt_chart(df,trades,inds,cfg):
-    fig=make_subplots(rows=2,cols=1,shared_xaxes=True,row_heights=[0.78,0.22],vertical_spacing=0.02)
-    fig.add_trace(go.Candlestick(x=df.index,open=df["Open"],high=df["High"],low=df["Low"],close=df["Close"],
-        name="Price",increasing=dict(line=dict(color=_G),fillcolor="rgba(0,230,118,0.15)"),
-        decreasing=dict(line=dict(color=_R),fillcolor="rgba(255,23,68,0.15)")),row=1,col=1)
-    if "fast_ema" in inds:
-        fig.add_trace(go.Scatter(x=df.index,y=inds["fast_ema"],name=f"EMA{cfg.get('fast_ema',9)}",
-                                  line=dict(color=_O,width=1.5)),row=1,col=1)
-    if "slow_ema" in inds:
-        fig.add_trace(go.Scatter(x=df.index,y=inds["slow_ema"],name=f"EMA{cfg.get('slow_ema',15)}",
-                                  line=dict(color=_B,width=1.5)),row=1,col=1)
-    if "elliott" in inds and inds["elliott"]:
-        for wl in (inds["elliott"].get("wave_labels") or []):
-            try:
-                fig.add_annotation(x=wl["dt"],y=wl["price"],text=wl["label"],showarrow=True,
-                    arrowhead=2,arrowcolor=_Y,font=dict(color=_Y,size=11),
-                    bgcolor="rgba(0,0,0,0.6)",row=1,col=1)
-            except: pass
-    bx,by,sx,sy,ex,ey,ec,et=[],[],[],[],[],[],[],[]
+def _make_df_clean(df):
+    """Return a copy with clean numeric OHLCV and string index for Plotly."""
+    d = df.copy()
+    for c in ["Open","High","Low","Close","Volume"]:
+        if c in d.columns:
+            d[c] = pd.to_numeric(d[c], errors="coerce")
+    d = d.dropna(subset=["Open","High","Low","Close"])
+    return d
+
+def _idx_to_str(df):
+    """Convert index to string so Plotly uses category axis — prevents gaps."""
+    d = df.copy()
+    d.index = d.index.astype(str)
+    return d
+
+def bt_chart(df, trades, inds, cfg):
+    """Backtest chart: candlestick + EMA + trade markers + SL/target lines + volume."""
+    d = _make_df_clean(df)
+    # Use category axis (string index) to remove weekend/holiday gaps
+    d_str = _idx_to_str(d)
+    idx = list(d_str.index)
+    n_rows = 3 if "atr" in inds else 2
+    row_h  = [0.65, 0.18, 0.17] if n_rows==3 else [0.78, 0.22]
+    specs  = [[{"secondary_y": False}]]*n_rows
+    fig = make_subplots(rows=n_rows, cols=1, shared_xaxes=True,
+                        row_heights=row_h, vertical_spacing=0.02,
+                        subplot_titles=["Price", "Volume"] + (["ATR"] if n_rows==3 else []))
+
+    # ── Candlestick ──────────────────────────────────────────────────
+    fig.add_trace(go.Candlestick(
+        x=idx, open=d_str["Open"], high=d_str["High"],
+        low=d_str["Low"], close=d_str["Close"],
+        name="Price",
+        increasing=dict(line=dict(color=_G, width=1), fillcolor="rgba(0,230,118,0.18)"),
+        decreasing=dict(line=dict(color=_R, width=1), fillcolor="rgba(255,23,68,0.18)"),
+        whiskerwidth=0,
+    ), row=1, col=1)
+
+    # ── EMA overlays ─────────────────────────────────────────────────
+    if "fast_ema" in inds and len(inds["fast_ema"]) == len(d_str):
+        fig.add_trace(go.Scatter(
+            x=idx, y=inds["fast_ema"].values,
+            name=f"EMA {cfg.get('fast_ema',9)}",
+            line=dict(color=_O, width=1.8), mode="lines"),
+            row=1, col=1)
+    if "slow_ema" in inds and len(inds["slow_ema"]) == len(d_str):
+        fig.add_trace(go.Scatter(
+            x=idx, y=inds["slow_ema"].values,
+            name=f"EMA {cfg.get('slow_ema',15)}",
+            line=dict(color=_B, width=1.8), mode="lines"),
+            row=1, col=1)
+
+    # ── Elliott Wave labels ───────────────────────────────────────────
+    ew = inds.get("elliott") or {}
+    for wl in (ew.get("wave_labels") or []):
+        try:
+            wi = wl.get("idx", 0)
+            if 0 <= wi < len(idx):
+                fig.add_annotation(
+                    x=idx[wi], y=float(wl["price"]),
+                    text=f"<b>{wl['label']}</b>",
+                    showarrow=True, arrowhead=2, arrowsize=1,
+                    arrowcolor=_Y, arrowwidth=1.5,
+                    font=dict(color=_Y, size=12, family="Space Mono"),
+                    bgcolor="rgba(10,14,19,0.85)", bordercolor=_Y,
+                    borderwidth=1, ax=0, ay=-30,
+                    row=1, col=1)
+        except Exception: pass
+
+    # ── Trade markers ─────────────────────────────────────────────────
+    # Map trade datetimes to nearest string index position
+    idx_set = set(idx)
+    def _nearest_idx(dt_str):
+        """Find nearest candle string label to a trade datetime string."""
+        # Try exact match first
+        if dt_str in idx_set: return dt_str
+        # Fallback: truncate to date+hour for short timeframes
+        short = str(dt_str)[:16]
+        for s in idx:
+            if s[:16] == short: return s
+        return None
+
+    bx,by,bh = [],[],[]  # buy entries
+    sx,sy,sh = [],[],[]  # sell entries
+    ex,ey,eh,ec = [],[],[],[]  # exits
     for t in trades:
         try:
-            edt=pd.to_datetime(t["Entry DateTime"],errors="coerce")
-            xdt=pd.to_datetime(t["Exit DateTime"],errors="coerce")
-        except: continue
-        if t["Signal"]=="BUY": bx.append(edt); by.append(t["Entry Price"])
-        else: sx.append(edt); sy.append(t["Entry Price"])
-        ec.append("rgba(0,230,118,0.9)" if t["PnL"]>=0 else "rgba(255,23,68,0.9)")
-        ex.append(xdt); ey.append(t["Exit Price"])
-        et.append(f"{t['Signal']}|PnL:{t['PnL']:+.2f}<br>{t['Exit Reason']}")
-    if bx: fig.add_trace(go.Scatter(x=bx,y=by,mode="markers",name="Buy Entry",
-        marker=dict(symbol="triangle-up",size=12,color=_G,line=dict(color="white",width=0.5))),row=1,col=1)
-    if sx: fig.add_trace(go.Scatter(x=sx,y=sy,mode="markers",name="Sell Entry",
-        marker=dict(symbol="triangle-down",size=12,color=_R,line=dict(color="white",width=0.5))),row=1,col=1)
-    if ex: fig.add_trace(go.Scatter(x=ex,y=ey,mode="markers",name="Exit",
-        marker=dict(symbol="x-thin-open",size=11,color=ec,line=dict(width=2)),
-        text=et,hovertemplate="%{text}<extra></extra>"),row=1,col=1)
-    for t in trades[-8:]:
+            ep_str = str(t.get("Entry DateTime",""))
+            xp_str = str(t.get("Exit DateTime",""))
+            ei = _nearest_idx(ep_str)
+            xi = _nearest_idx(xp_str)
+            ep = float(t["Entry Price"]); xp = float(t["Exit Price"])
+            pnl= float(t["PnL"])
+            htxt = (f"{t['Signal']} | Entry:{ep:.2f} Exit:{xp:.2f}<br>"
+                    f"PnL:{pnl:+.2f} | {t.get('Exit Reason','')}")
+            if t["Signal"]=="BUY" and ei:
+                bx.append(ei); by.append(ep); bh.append(htxt)
+            elif ei:
+                sx.append(ei); sy.append(ep); sh.append(htxt)
+            if xi:
+                ec.append("rgba(0,230,118,0.9)" if pnl>=0 else "rgba(255,23,68,0.9)")
+                ex.append(xi); ey.append(xp); eh.append(htxt)
+        except Exception: continue
+
+    if bx:
+        fig.add_trace(go.Scatter(x=bx, y=by, mode="markers", name="Buy Entry",
+            marker=dict(symbol="triangle-up", size=13, color=_G,
+                        line=dict(color="white", width=0.8)),
+            text=bh, hovertemplate="%{text}<extra></extra>"), row=1, col=1)
+    if sx:
+        fig.add_trace(go.Scatter(x=sx, y=sy, mode="markers", name="Sell Entry",
+            marker=dict(symbol="triangle-down", size=13, color=_R,
+                        line=dict(color="white", width=0.8)),
+            text=sh, hovertemplate="%{text}<extra></extra>"), row=1, col=1)
+    if ex:
+        fig.add_trace(go.Scatter(x=ex, y=ey, mode="markers", name="Exit",
+            marker=dict(symbol="x", size=11, color=ec,
+                        line=dict(color=ec, width=2)),
+            text=eh, hovertemplate="%{text}<extra></extra>"), row=1, col=1)
+
+    # ── SL / Target horizontal lines for each trade ───────────────────
+    for t in trades:
         try:
-            e_dt=pd.to_datetime(t["Entry DateTime"],errors="coerce")
-            x_dt=pd.to_datetime(t["Exit DateTime"],errors="coerce")
-            fig.add_shape(type="line",x0=e_dt,x1=x_dt,y0=t["SL"],y1=t["SL"],
-                line=dict(color=_R,width=1,dash="dot"),row=1,col=1)
-            fig.add_shape(type="line",x0=e_dt,x1=x_dt,y0=t["Target"],y1=t["Target"],
-                line=dict(color=_G,width=1,dash="dot"),row=1,col=1)
-        except: pass
-    vc=[_G if c>=o else _R for c,o in zip(df["Close"],df["Open"])]
-    fig.add_trace(go.Bar(x=df.index,y=df["Volume"],name="Vol",marker_color=vc,opacity=0.5),row=2,col=1)
-    fig.update_layout(**_layout("Backtest"))
+            ei = _nearest_idx(str(t.get("Entry DateTime","")))
+            xi = _nearest_idx(str(t.get("Exit DateTime","")))
+            if ei is None or xi is None: continue
+            sl_v  = float(t["SL"]); tgt_v = float(t["Target"])
+            # Use shapes with x-axis category coordinates
+            fig.add_shape(type="line",
+                x0=ei, x1=xi, y0=sl_v,  y1=sl_v,
+                line=dict(color="rgba(255,23,68,0.5)", width=1, dash="dot"),
+                row=1, col=1, xref="x", yref="y")
+            fig.add_shape(type="line",
+                x0=ei, x1=xi, y0=tgt_v, y1=tgt_v,
+                line=dict(color="rgba(0,230,118,0.5)", width=1, dash="dot"),
+                row=1, col=1, xref="x", yref="y")
+        except Exception: continue
+
+    # ── Volume bars ───────────────────────────────────────────────────
+    vc = [_G if float(c) >= float(o) else _R
+          for c, o in zip(d_str["Close"], d_str["Open"])]
+    fig.add_trace(go.Bar(
+        x=idx, y=d_str["Volume"].values,
+        name="Volume", marker_color=vc, opacity=0.6,
+        marker_line_width=0), row=2, col=1)
+
+    # ── ATR subplot (optional) ────────────────────────────────────────
+    if n_rows == 3 and "atr" in inds and len(inds["atr"]) == len(d_str):
+        fig.add_trace(go.Scatter(
+            x=idx, y=inds["atr"].values,
+            name="ATR", line=dict(color=_P, width=1.2), mode="lines"),
+            row=3, col=1)
+
+    # ── Layout ────────────────────────────────────────────────────────
+    lo = _layout("Backtest — EMA Overlay & Trade Markers", 720)
+    lo.update(dict(
+        xaxis=dict(type="category", showgrid=False,
+                   rangeslider=dict(visible=False), tickfont=dict(size=9),
+                   nticks=min(30, len(idx))),
+        xaxis2=dict(type="category", showgrid=False,
+                    rangeslider=dict(visible=False)),
+        yaxis=dict(showgrid=True, gridcolor="rgba(255,255,255,0.07)",
+                   title="Price"),
+        yaxis2=dict(showgrid=True, gridcolor="rgba(255,255,255,0.05)",
+                    title="Volume"),
+        hovermode="x unified",
+        dragmode="pan",
+    ))
+    fig.update_layout(**lo)
+    fig.update_xaxes(rangeslider_visible=False)
     return fig
 
-def live_chart(df,pos,inds,cfg):
-    fig=make_subplots(rows=2,cols=1,shared_xaxes=True,row_heights=[0.78,0.22],vertical_spacing=0.02)
-    fig.add_trace(go.Candlestick(x=df.index,open=df["Open"],high=df["High"],low=df["Low"],close=df["Close"],
-        name="Price",increasing=dict(line=dict(color=_G),fillcolor="rgba(0,230,118,0.12)"),
-        decreasing=dict(line=dict(color=_R),fillcolor="rgba(255,23,68,0.12)")),row=1,col=1)
+
+def live_chart(df, pos, inds, cfg):
+    """Live chart: last 120 candles, EMA overlays, position lines, Elliott labels."""
+    d = _make_df_clean(df)
+    # Show last 120 candles max to keep chart clean
+    d = d.iloc[-120:] if len(d) > 120 else d
+    d_str = _idx_to_str(d)
+    idx = list(d_str.index)
+
+    fig = make_subplots(rows=2, cols=1, shared_xaxes=True,
+                        row_heights=[0.78, 0.22], vertical_spacing=0.02,
+                        subplot_titles=["Price (Live)", "Volume"])
+
+    # ── Candlestick ──────────────────────────────────────────────────
+    fig.add_trace(go.Candlestick(
+        x=idx, open=d_str["Open"], high=d_str["High"],
+        low=d_str["Low"], close=d_str["Close"],
+        name="Price",
+        increasing=dict(line=dict(color=_G, width=1), fillcolor="rgba(0,230,118,0.15)"),
+        decreasing=dict(line=dict(color=_R, width=1), fillcolor="rgba(255,23,68,0.15)"),
+        whiskerwidth=0,
+    ), row=1, col=1)
+
+    # ── EMA overlays ─────────────────────────────────────────────────
     if "fast_ema" in inds:
-        fig.add_trace(go.Scatter(x=df.index,y=inds["fast_ema"],name=f"EMA{cfg.get('fast_ema',9)}",
-                                  line=dict(color=_O,width=1.5)),row=1,col=1)
+        fe_vals = inds["fast_ema"]
+        if hasattr(fe_vals, "values"): fe_vals = fe_vals.values
+        fe_vals = fe_vals[-len(idx):]
+        fig.add_trace(go.Scatter(
+            x=idx, y=fe_vals,
+            name=f"EMA {cfg.get('fast_ema',9)}",
+            line=dict(color=_O, width=2), mode="lines"),
+            row=1, col=1)
     if "slow_ema" in inds:
-        fig.add_trace(go.Scatter(x=df.index,y=inds["slow_ema"],name=f"EMA{cfg.get('slow_ema',15)}",
-                                  line=dict(color=_B,width=1.5)),row=1,col=1)
+        se_vals = inds["slow_ema"]
+        if hasattr(se_vals, "values"): se_vals = se_vals.values
+        se_vals = se_vals[-len(idx):]
+        fig.add_trace(go.Scatter(
+            x=idx, y=se_vals,
+            name=f"EMA {cfg.get('slow_ema',15)}",
+            line=dict(color=_B, width=2), mode="lines"),
+            row=1, col=1)
+
+    # ── Position lines ────────────────────────────────────────────────
     if pos is not None:
-        ep,sl,tgt=pos["entry_price"],pos["current_sl"],pos["target"]
-        fig.add_hline(y=ep,line=dict(color="white",width=1.5,dash="dash"),
-                      annotation_text=f"Entry {ep:.2f}",annotation_position="right",row=1,col=1)
-        fig.add_hline(y=sl,line=dict(color=_R,width=1.5,dash="dash"),
-                      annotation_text=f"SL {sl:.2f}",annotation_position="right",row=1,col=1)
-        fig.add_hline(y=tgt,line=dict(color=_G,width=1.5,dash="dash"),
-                      annotation_text=f"Tgt {tgt:.2f}",annotation_position="right",row=1,col=1)
-    if "elliott" in inds and inds["elliott"]:
-        for wl in (inds["elliott"].get("wave_labels") or []):
-            try:
-                fig.add_annotation(x=pd.to_datetime(wl["dt"],errors="coerce"),y=wl["price"],
-                    text=wl["label"],showarrow=True,arrowhead=2,arrowcolor=_Y,
-                    font=dict(color=_Y,size=10),bgcolor="rgba(0,0,0,0.6)",row=1,col=1)
-            except: pass
-    vc=[_G if c>=o else _R for c,o in zip(df["Close"],df["Open"])]
-    fig.add_trace(go.Bar(x=df.index,y=df["Volume"],name="Vol",marker_color=vc,opacity=0.5),row=2,col=1)
-    fig.update_layout(**_layout("Live",540))
+        ep  = float(pos["entry_price"])
+        sl  = float(pos["current_sl"])
+        tgt = float(pos["target"])
+        # Draw as horizontal scatter lines spanning the full visible range
+        fig.add_hline(y=ep, line=dict(color="rgba(255,255,255,0.8)", width=1.5, dash="dash"),
+                      annotation_text=f" Entry {ep:.2f}",
+                      annotation_position="right",
+                      annotation_font=dict(color="white", size=11),
+                      row=1, col=1)
+        fig.add_hline(y=sl, line=dict(color=_R, width=2, dash="dash"),
+                      annotation_text=f" SL {sl:.2f}",
+                      annotation_position="right",
+                      annotation_font=dict(color=_R, size=11),
+                      row=1, col=1)
+        fig.add_hline(y=tgt, line=dict(color=_G, width=2, dash="dash"),
+                      annotation_text=f" Tgt {tgt:.2f}",
+                      annotation_position="right",
+                      annotation_font=dict(color=_G, size=11),
+                      row=1, col=1)
+
+    # ── Elliott Wave labels ───────────────────────────────────────────
+    ew = inds.get("elliott") or {}
+    for wl in (ew.get("wave_labels") or []):
+        try:
+            wi = wl.get("idx", 0)
+            # Map global idx to local (we sliced last 120)
+            local_wi = wi - (len(df) - len(d))
+            if 0 <= local_wi < len(idx):
+                fig.add_annotation(
+                    x=idx[local_wi], y=float(wl["price"]),
+                    text=f"<b>{wl['label']}</b>",
+                    showarrow=True, arrowhead=2, arrowcolor=_Y, arrowwidth=1.5,
+                    font=dict(color=_Y, size=11),
+                    bgcolor="rgba(10,14,19,0.85)", bordercolor=_Y, borderwidth=1,
+                    ax=0, ay=-25, row=1, col=1)
+        except Exception: pass
+
+    # ── Volume bars ───────────────────────────────────────────────────
+    vc = [_G if float(c) >= float(o) else _R
+          for c, o in zip(d_str["Close"], d_str["Open"])]
+    fig.add_trace(go.Bar(
+        x=idx, y=d_str["Volume"].values,
+        name="Volume", marker_color=vc, opacity=0.6,
+        marker_line_width=0), row=2, col=1)
+
+    # Highlight last candle (most recent data)
+    if len(idx) > 0:
+        last_i  = idx[-1]
+        last_cl = float(d_str["Close"].iloc[-1])
+        last_hi = float(d_str["High"].iloc[-1])
+        fig.add_trace(go.Scatter(
+            x=[last_i], y=[last_hi * 1.0005],
+            mode="markers+text",
+            text=["▼ LIVE"], textposition="top center",
+            textfont=dict(color=_Y, size=10),
+            marker=dict(symbol="circle", size=8, color=_Y, opacity=0.9),
+            name="Latest Bar", showlegend=False,
+            hovertemplate=f"Latest close: {last_cl:.2f}<extra></extra>"),
+            row=1, col=1)
+
+    # ── Layout ────────────────────────────────────────────────────────
+    lo = _layout("Live Chart", 560)
+    lo.update(dict(
+        xaxis=dict(type="category", showgrid=False,
+                   rangeslider=dict(visible=False),
+                   tickfont=dict(size=9), nticks=min(20, len(idx))),
+        xaxis2=dict(type="category", showgrid=False,
+                    rangeslider=dict(visible=False)),
+        yaxis=dict(showgrid=True, gridcolor="rgba(255,255,255,0.07)", title="Price"),
+        yaxis2=dict(showgrid=True, gridcolor="rgba(255,255,255,0.05)", title="Vol"),
+        hovermode="x unified",
+        dragmode="pan",
+    ))
+    fig.update_layout(**lo)
+    fig.update_xaxes(rangeslider_visible=False)
     return fig
 
 # ── Analysis Engine ───────────────────────────────────────────────────────────
@@ -1255,6 +1532,28 @@ def live_strategy_status(strat, cfg, df, pos, pnl):
                 lines.append(row("AND |delta|", f"≥ {cfg.get('min_delta',0):.2f}", "#ffea00"))
 
         # Projected SL/Target if no position
+        # ADX/RSI live values
+        if cfg.get("enable_adx",False) and len(df)>=20:
+            adx_s,pdi_s,ndi_s = calc_adx(df, cfg.get("adx_period",14))
+            adx_now = float(adx_s.iloc[-1]); pdi_now = float(pdi_s.iloc[-1]); ndi_now = float(ndi_s.iloc[-1])
+            adx_thr = cfg.get("adx_min",25); adx_ok = adx_now >= adx_thr
+            lines.append(section("📶 ADX (Trend Strength)"))
+            lines.append(row("ADX", f"{adx_now:.1f}", "#00e676" if adx_ok else "#ff1744", True))
+            lines.append(row("+DI", f"{pdi_now:.1f}", "#00e676"))
+            lines.append(row("-DI", f"{ndi_now:.1f}", "#ff1744"))
+            lines.append(row("Filter", f"ADX≥{adx_thr} → {'✅ PASS' if adx_ok else '❌ FAIL'}", "#00e676" if adx_ok else "#ff1744"))
+
+        if cfg.get("enable_rsi",False) and len(df)>=20:
+            rsi_s  = calc_rsi(df["Close"], cfg.get("rsi_period",14))
+            rsi_now= float(rsi_s.iloc[-1]); rsi_lo=cfg.get("rsi_oversold",30); rsi_hi=cfg.get("rsi_overbought",70)
+            rsi_zone = "OVERBOUGHT" if rsi_now>rsi_hi else ("OVERSOLD" if rsi_now<rsi_lo else "NEUTRAL")
+            rsi_clr  = "#ff1744" if rsi_now>rsi_hi else ("#ff9800" if rsi_now<rsi_lo else "#00e676")
+            lines.append(section("📊 RSI"))
+            lines.append(row("RSI", f"{rsi_now:.1f}", rsi_clr, True))
+            lines.append(row("Zone", rsi_zone, rsi_clr))
+            lines.append(row("BUY  OK",  f"RSI<{rsi_hi} → {'✅' if rsi_now<rsi_hi else '❌'}", "#00e676" if rsi_now<rsi_hi else "#ff1744"))
+            lines.append(row("SELL OK",  f"RSI>{rsi_lo} → {'✅' if rsi_now>rsi_lo else '❌'}", "#00e676" if rsi_now>rsi_lo else "#ff1744"))
+
         if pos is None and len(df) >= 3:
             proj_entry = ltp
             proj_sl_b  = calc_sl(proj_entry, 1,  cfg, df, len(df)-1)
@@ -1383,6 +1682,9 @@ def main():
         fast_ema=9; slow_ema=15; min_ang=0.0; max_ang=90.0
         min_delta=0.0; max_delta=1e9; cx_type="Simple Crossover"
         cx_csz=10; min_wave_pct=0.5
+        en_dow=False; allowed_days=[]
+        en_adx=False; adx_period=14; adx_min=25
+        en_rsi=False; rsi_period=14; rsi_os=30; rsi_ob=70
 
         if strat not in ("Simple Buy","Simple Sell"):
             c1,c2=st.columns(2)
@@ -1405,7 +1707,35 @@ def main():
         if strat=="Elliott Wave":
             min_wave_pct=st.number_input("Min Wave %",0.1,10.0,0.5,0.1,key="_mwp")
 
-        st.markdown("---\n### 🛡️ Stop Loss")
+        st.markdown("---")
+        st.markdown("### 📆 Entry Filters")
+        # Day of week filter
+        en_dow = st.checkbox("Day of Week Filter", False, key="_edow")
+        allowed_days = []
+        if en_dow:
+            all_days = ["Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday"]
+            allowed_days = st.multiselect("Allowed Days", all_days,
+                default=["Monday","Tuesday","Wednesday","Thursday","Friday"], key="_dow")
+        # ADX filter
+        en_adx = st.checkbox("ADX Filter (Trend Strength)", False, key="_eadx")
+        adx_period=14; adx_min=25
+        if en_adx:
+            ac1,ac2=st.columns(2)
+            adx_period=ac1.number_input("ADX Period",5,50,14,key="_adxp")
+            adx_min   =ac2.number_input("Min ADX",5,100,25,key="_adxm")
+            st.caption("ADX > threshold = strong trend → only then entry allowed")
+        # RSI filter
+        en_rsi = st.checkbox("RSI Filter (Avoid Extremes)", False, key="_ersi")
+        rsi_period=14; rsi_os=30; rsi_ob=70
+        if en_rsi:
+            rc1,rc2,rc3=st.columns(3)
+            rsi_period=rc1.number_input("RSI Period",3,50,14,key="_rsip")
+            rsi_os    =rc2.number_input("Oversold",5,49,30,key="_rsiOs")
+            rsi_ob    =rc3.number_input("Overbought",51,95,70,key="_rsiOb")
+            st.caption("BUY only when RSI < overbought | SELL only when RSI > oversold")
+
+        st.markdown("---")
+        st.markdown("### 🛡️ Stop Loss")
         sl_t=st.selectbox("SL Type",SL_TYPES,key="_slt")
         sl_pts=st.number_input("SL Points",1,1000000,10,key="_slp")
         atr_slm=1.5; rr=2.0; sw=20; vol_slm=2.0
@@ -1476,7 +1806,10 @@ def main():
          "min_angle":min_ang,"max_angle":max_ang,"min_delta":min_delta,"max_delta":max_delta,
          "crossover_type":cx_type,"custom_candle_size":cx_csz,"min_wave_pct":min_wave_pct,
          "enable_pnl_cap":en_pnl,"max_day_loss":mdl,"max_day_profit":mdp,
-         "enable_time_filter":en_tf,"trade_start_time":str(ts_),"trade_end_time":str(te_)}
+         "enable_time_filter":en_tf,"trade_start_time":str(ts_),"trade_end_time":str(te_),
+         "allowed_days":allowed_days if en_dow else [],
+         "enable_adx":en_adx,"adx_period":adx_period,"adx_min":adx_min,
+         "enable_rsi":en_rsi,"rsi_period":rsi_period,"rsi_oversold":rsi_os,"rsi_overbought":rsi_ob}
 
     # Header
     ldot='<span class="ldot"></span>' if st.session_state.live_running else ""
@@ -1595,10 +1928,20 @@ def main():
             _dpnl    = _ts_get("day_pnl", 0.0)
             _running = st.session_state.live_running
 
-            # Config bar
-            st.markdown(f'<div class="cfg-bar"><b>Config:</b> {sym} · {iv}/{pd_} · <b>{strat}</b>'
-                        f' · EMA {fast_ema}/{slow_ema} · SL:{sl_t}({sl_pts}pts)'
-                        f' · Tgt:{tgt_t}({tgt_pts}pts) · Qty:{qty}</div>', unsafe_allow_html=True)
+            # Config bar + live LTP + fetch timestamp
+            _fetch_ts  = _lc.get('fetch_ts','–') if _lc else '–'
+            _ltp_disp  = f"{_lc.get('close',0):.2f}" if _lc else '–'
+            _run_badge = '🟢 RUNNING' if _running else '⚪ STOPPED'
+            st.markdown(
+                f'<div class="cfg-bar" style="display:flex;flex-wrap:wrap;gap:10px;align-items:center;">'
+                f'<b>{_run_badge}</b><span style="color:#8b949e;">|</span>'
+                f'<b>{sym}</b> {iv}/{pd_} · <b>{strat}</b>'
+                f'<span style="color:#8b949e;">|</span>EMA {fast_ema}/{slow_ema}'
+                f'<span style="color:#8b949e;">|</span>SL:{sl_t}({sl_pts}pt) Tgt:{tgt_t}({tgt_pts}pt) Qty:{qty}'
+                f'<span style="color:#8b949e;">|</span>'
+                f'<span style="color:#40c4ff;font-size:14px;font-weight:700;">LTP {_ltp_disp}</span>'
+                f'<span style="color:#8b949e;font-size:10px;">fetched {_fetch_ts}</span>'
+                f'</div>', unsafe_allow_html=True)
 
             # Guard bar
             gp = []
