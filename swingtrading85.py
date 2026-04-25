@@ -57,6 +57,7 @@ CX_TYPES     = ["Simple Crossover","Custom Candle Size","ATR Based Candle Size"]
 TRADE_DIRS   = ["Both","Long Only","Short Only"]
 
 # ── Thread-safe state ────────────────────────────────────────────────────────
+# ── Thread-safe state: keyed by session_id so multiple sessions don't clash ──
 _TS_LOCK = threading.Lock()
 _TS: dict = {}
 
@@ -71,13 +72,64 @@ def _ts_append(k, v):
         if k not in _TS: _TS[k] = []
         _TS[k].append(v)
 
-_YF_LOCK = threading.Lock()
-_LAST_YF = 0.0
+# ── Separate lightweight lock only for yfinance full-data downloads ──────────
+# The fragment uses a COMPLETELY DIFFERENT code path (fast_info / no lock)
+# so these two never compete.
+_YF_DL_LOCK = threading.Lock()   # only for background thread full downloads
+_LAST_YF    = 0.0
+
+def _get_ltp_nowait(ticker: str) -> float | None:
+    """
+    Fetch only the last price using fast_info (no disk cache, no lock needed).
+    Falls back to a quick 1-day/1-min download if fast_info unavailable.
+    This is called from the UI fragment — NEVER from the background thread.
+    """
+    try:
+        tk  = yf.Ticker(ticker)
+        fi  = tk.fast_info
+        lp  = getattr(fi, "last_price", None)
+        if lp is not None and not (isinstance(lp, float) and (lp != lp)):
+            return round(float(lp), 2)
+    except Exception:
+        pass
+    # Fallback: tiny 1d/1m download (separate from thread lock)
+    try:
+        df = yf.download(ticker, period="1d", interval="1m",
+                         auto_adjust=True, progress=False, threads=False)
+        if df is not None and len(df) > 0:
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = df.columns.get_level_values(0)
+            return round(float(df["Close"].iloc[-1]), 2)
+    except Exception:
+        pass
+    return None
+
+def _kill_old_thread():
+    """Kill any leftover live thread from a previous run of this session."""
+    old_t = st.session_state.get("live_thread")
+    old_e = st.session_state.get("stop_event")
+    if old_e is not None:
+        try: old_e.set()
+        except Exception: pass
+    if old_t is not None:
+        try: old_t.join(timeout=0.5)
+        except Exception: pass
+    _ts_set("live_running",    False)
+    _ts_set("current_position", None)
+    _ts_set("current_pnl",     0.0)
 
 def init_ss():
+    first_run = "live_running" not in st.session_state
     for k,v in {"live_running":False,"stop_event":None,"live_thread":None,
                 "backtest_results":None,"opt_results":None}.items():
         if k not in st.session_state: st.session_state[k] = v
+    if first_run:
+        # Clear any stale module-level state from previous sessions
+        _kill_old_thread()
+        _ts_set("live_log",      [])
+        _ts_set("trade_history", [])
+        _ts_set("live_data",     None)
+        _ts_set("last_candle",   None)
 
 # ── Data helpers ──────────────────────────────────────────────────────────────
 def _mkt_filter(df, interval):
@@ -94,7 +146,7 @@ def _mkt_filter(df, interval):
 def _yf_dl(ticker, period, interval, retries=3):
     global _LAST_YF
     for attempt in range(retries):
-        with _YF_LOCK:
+        with _YF_DL_LOCK:
             g = time.time()-_LAST_YF
             if g < 1.5: time.sleep(1.5-g)
             _LAST_YF = time.time()
@@ -669,7 +721,7 @@ def live_thread(ticker,period,interval,cfg,stop_ev,dhan_cfg):
     if immediate:
         log(f"⚡ {strat} – fetching price for immediate entry…")
         try:
-            with _YF_LOCK:
+            with _YF_DL_LOCK:
                 g=time.time()-_LAST_YF
                 if g<1.5: time.sleep(1.5-g)
                 _LAST_YF=time.time()
@@ -697,7 +749,7 @@ def live_thread(ticker,period,interval,cfg,stop_ev,dhan_cfg):
         try:
             # Fetch every 2.5s
             if time.time()-last_fetch>=2.5:
-                with _YF_LOCK:
+                with _YF_DL_LOCK:
                     g=time.time()-_LAST_YF
                     if g<1.5: time.sleep(1.5-g)
                     _LAST_YF=time.time()
@@ -706,14 +758,20 @@ def live_thread(ticker,period,interval,cfg,stop_ev,dhan_cfg):
                     if df is not None and len(df)>1:
                         cached_df=df; last_fetch=time.time()
                         lc=df.iloc[-1]
+                        ltp_now=round(float(lc["Close"]),2)
                         _ts_set("last_candle",{"datetime":ts_to_ist(df.index[-1]),
                             "open":round(float(lc["Open"]),2),"high":round(float(lc["High"]),2),
-                            "low":round(float(lc["Low"]),2),"close":round(float(lc["Close"]),2),
+                            "low":round(float(lc["Low"]),2),"close":ltp_now,
                             "volume":int(lc["Volume"]) if not pd.isna(lc["Volume"]) else 0,
                             "fetch_ts":now_ist()})
                         _ts_set("live_data",{"open":df["Open"].tolist(),"high":df["High"].tolist(),
                             "low":df["Low"].tolist(),"close":df["Close"].tolist(),
                             "volume":df["Volume"].tolist(),"index":[ts_to_ist(x) for x in df.index]})
+                        # Immediately update PnL with freshest close
+                        _p=_ts_get("current_position")
+                        if _p is not None:
+                            _pnl_now=(ltp_now-_p["entry_price"]) if _p["signal_type"]==1 else (_p["entry_price"]-ltp_now)
+                            _ts_set("current_pnl",round(_pnl_now,2))
                     else:
                         log(f"[WARN] Fetch returned empty — will retry")
                 except Exception as e: log(f"[FETCH ERR] {e}"); stop_ev.wait(2.0); continue
@@ -1888,15 +1946,26 @@ def main():
         sq_btn    = ctrl[2].button("⚡ Squareoff", type="secondary", key="_sq")
 
         if start_btn and not st.session_state.live_running:
+            # Kill any stale thread from a previous run first
+            _kill_old_thread()
+            time.sleep(0.3)  # brief pause to let old thread exit
+            # Clear all live state
+            _ts_set("trade_history",       [])
+            _ts_set("day_pnl",             0.0)
+            _ts_set("current_position",    None)
+            _ts_set("current_pnl",         0.0)
+            _ts_set("live_log",            [])
+            _ts_set("live_data",           None)
+            _ts_set("last_candle",         None)
+            _ts_set("simple_entered",      False)
+            _ts_set("elliott_wave_state",  None)
+            # Start fresh thread
             se = threading.Event()
             st.session_state.stop_event   = se
             st.session_state.live_running = True
-            _ts_set("trade_history", [])
-            _ts_set("day_pnl", 0.0)
-            _ts_set("elliott_wave_state", None)
             t = threading.Thread(target=live_thread,
                                   args=(sym, pd_, iv, cfg, se, dhan_cfg), daemon=True)
-            st.session_state.live_thread = t
+            st.session_state.live_thread  = t
             t.start()
             st.toast("🟢 Live trading started!", icon="✅")
 
@@ -1920,18 +1989,43 @@ def main():
         # Fragment auto-refreshes every 1.5 s — no tab flicker
         @st.fragment(run_every=1.5)
         def _live_panel():
+
             _pos     = _ts_get("current_position")
-            _pnl     = _ts_get("current_pnl", 0.0)
-            _lc      = _ts_get("last_candle")
             _ld      = _ts_get("live_data")
             _logs    = _ts_get("live_log", [])
             _dpnl    = _ts_get("day_pnl", 0.0)
             _running = st.session_state.live_running
 
-            # Config bar + live LTP + fetch timestamp
-            _fetch_ts  = _lc.get('fetch_ts','–') if _lc else '–'
-            _ltp_disp  = f"{_lc.get('close',0):.2f}" if _lc else '–'
-            _run_badge = '🟢 RUNNING' if _running else '⚪ STOPPED'
+            # ── Direct LTP via fast_info (no lock, no cache) ──────────────
+            # _get_ltp_nowait uses yf.Ticker.fast_info.last_price which bypasses
+            # yfinance disk cache and never touches _YF_DL_LOCK (used by thread).
+            _ltp_live = _get_ltp_nowait(sym)
+            _lc       = _ts_get("last_candle") or {}
+
+            # If we got a fresh LTP, update last_candle and PnL immediately
+            if _ltp_live is not None:
+                _old_lc = dict(_lc)
+                _old_lc["close"]    = _ltp_live
+                _old_lc["fetch_ts"] = now_ist()
+                if "datetime" not in _old_lc:
+                    _old_lc["datetime"] = now_ist_full()
+                _ts_set("last_candle", _old_lc)
+                _lc = _old_lc
+
+            if _ltp_live is not None and _pos is not None:
+                _pnl = round(
+                    (_ltp_live - _pos["entry_price"]) if _pos["signal_type"] == 1
+                    else (_pos["entry_price"] - _ltp_live), 2)
+                _ts_set("current_pnl", _pnl)
+            else:
+                _pnl = _ts_get("current_pnl", 0.0)
+                if _ltp_live is None:
+                    _ltp_live = _lc.get("close")
+
+            _ltp_disp  = f"{_ltp_live:.2f}" if _ltp_live else "–"
+            _fetch_ts  = _lc.get("fetch_ts", "–")
+            _run_badge = "🟢 RUNNING" if _running else "⚪ STOPPED"
+
             st.markdown(
                 f'<div class="cfg-bar" style="display:flex;flex-wrap:wrap;gap:10px;align-items:center;">'
                 f'<b>{_run_badge}</b><span style="color:#8b949e;">|</span>'
@@ -1939,8 +2033,8 @@ def main():
                 f'<span style="color:#8b949e;">|</span>EMA {fast_ema}/{slow_ema}'
                 f'<span style="color:#8b949e;">|</span>SL:{sl_t}({sl_pts}pt) Tgt:{tgt_t}({tgt_pts}pt) Qty:{qty}'
                 f'<span style="color:#8b949e;">|</span>'
-                f'<span style="color:#40c4ff;font-size:14px;font-weight:700;">LTP {_ltp_disp}</span>'
-                f'<span style="color:#8b949e;font-size:10px;">fetched {_fetch_ts}</span>'
+                f'<span style="color:#40c4ff;font-size:16px;font-weight:800;">LTP {_ltp_disp}</span>'
+                f'<span style="color:#8b949e;font-size:10px;"> @ {_fetch_ts}</span>'
                 f'</div>', unsafe_allow_html=True)
 
             # Guard bar
@@ -1987,15 +2081,28 @@ def main():
                             f'border-radius:10px;padding:14px 20px;color:#8b949e;font-size:14px;">{msg}</div>',
                             unsafe_allow_html=True)
 
-            # Last candle metrics
+            # Last candle metrics + row
             if _lc:
                 lc1,lc2,lc3,lc4,lc5,lc6 = st.columns(6)
-                lc1.metric("Close",  f"{_lc.get('close',0):.2f}")
-                lc2.metric("High",   f"{_lc.get('high',0):.2f}")
-                lc3.metric("Low",    f"{_lc.get('low',0):.2f}")
-                lc4.metric("Open",   f"{_lc.get('open',0):.2f}")
-                lc5.metric("Volume", f"{_lc.get('volume',0):,}")
-                lc6.metric("Bar (IST)", str(_lc.get("datetime",""))[-12:])
+                lc1.metric("LTP (Close)",  f"{_lc.get('close',0):.2f}")
+                lc2.metric("High",         f"{_lc.get('high',0):.2f}")
+                lc3.metric("Low",          f"{_lc.get('low',0):.2f}")
+                lc4.metric("Open",         f"{_lc.get('open',0):.2f}")
+                lc5.metric("Volume",       f"{_lc.get('volume',0):,}")
+                lc6.metric("Fetched (IST)",_lc.get("fetch_ts","–"))
+                # Full latest candle data row
+                st.markdown(
+                    f'<div style="background:#1f2733;border:1px solid rgba(255,255,255,0.08);'
+                    f'border-radius:6px;padding:8px 14px;font-size:12px;margin:4px 0;'
+                    f'display:flex;flex-wrap:wrap;gap:16px;">'
+                    f'<span style="color:#8b949e;">📡 Latest Candle:</span>'
+                    f'<span style="color:#ffea00;font-weight:700;">{_lc.get("datetime","–")}</span>'
+                    f'<span>O:<b style="color:#e6edf3;">{_lc.get("open","–")}</b></span>'
+                    f'<span>H:<b style="color:#00e676;">{_lc.get("high","–")}</b></span>'
+                    f'<span>L:<b style="color:#ff1744;">{_lc.get("low","–")}</b></span>'
+                    f'<span>C:<b style="color:#40c4ff;">{_lc.get("close","–")}</b></span>'
+                    f'<span>Vol:<b style="color:#ce93d8;">{_lc.get("volume",0):,}</b></span>'
+                    f'</div>', unsafe_allow_html=True)
 
             st.markdown("---")
             ch_col, info_col = st.columns([2.2, 1])
@@ -2064,48 +2171,84 @@ def main():
     # ══ TAB 3 – TRADE HISTORY ════════════════════════════════════════════════
     with tab_th:
         st.markdown("### Trade History")
-        live_hist = _ts_get("trade_history", [])
-        bt_hist   = st.session_state.backtest_results["trades"] if st.session_state.backtest_results else []
-        mf = st.radio("Show", ["All", "Live", "Backtest"], horizontal=True, key="_hf")
-        all_hist  = (live_hist + bt_hist) if mf == "All" else (live_hist if mf == "Live" else bt_hist)
-        if not all_hist:
-            st.info("No trades recorded yet.")
-        else:
-            wins_h, nt_h, acc_h = calc_acc(all_hist)
-            tot_h   = sum(t["PnL"] for t in all_hist)
-            best_h  = max((t["PnL"] for t in all_hist), default=0)
-            worst_h = min((t["PnL"] for t in all_hist), default=0)
+        # Fragment auto-refreshes so live trades appear without page reload
+        @st.fragment(run_every=2.0)
+        def _history_panel():
+            _live_hist = _ts_get("trade_history", [])
+            _bt_hist   = st.session_state.backtest_results["trades"] if st.session_state.backtest_results else []
+            _mf = st.radio("Show", ["All","Live","Backtest"], horizontal=True, key="_hf")
+            _all = (_live_hist+_bt_hist) if _mf=="All" else (_live_hist if _mf=="Live" else _bt_hist)
+
+            # Latest candle row display (always show)
+            _lc2 = _ts_get("last_candle") or {}
+            if _lc2:
+                st.markdown("**📡 Latest Fetched Candle**")
+                lc_df = pd.DataFrame([{
+                    "DateTime (IST)": _lc2.get("datetime","–"),
+                    "Open":    _lc2.get("open","–"),
+                    "High":    _lc2.get("high","–"),
+                    "Low":     _lc2.get("low","–"),
+                    "Close":   _lc2.get("close","–"),
+                    "Volume":  _lc2.get("volume","–"),
+                    "Fetched": _lc2.get("fetch_ts","–"),
+                }])
+                st.dataframe(lc_df, use_container_width=True, hide_index=True)
+
+            if not _all:
+                st.info("No trades recorded yet.")
+                return
+
+            _wins, _nt, _acc = calc_acc(_all)
+            _tot  = sum(t["PnL"] for t in _all)
+            _best = max((t["PnL"] for t in _all), default=0)
             hc = st.columns(6)
-            hc[0].metric("Trades",    nt_h)
-            hc[1].metric("Wins",      wins_h)
-            hc[2].metric("Losses",    nt_h - wins_h)
-            hc[3].metric("Accuracy",  f"{acc_h}%")
-            hc[4].metric("Total PnL", f"{tot_h:+.2f}")
-            hc[5].metric("Best Trade",f"{best_h:+.2f}")
+            hc[0].metric("Trades",    _nt)
+            hc[1].metric("Wins",      _wins)
+            hc[2].metric("Losses",    _nt-_wins)
+            hc[3].metric("Accuracy",  f"{_acc}%")
+            hc[4].metric("Total PnL", f"{_tot:+.2f}")
+            hc[5].metric("Best",      f"{_best:+.2f}")
 
-            pnl_v  = [t["PnL"] for t in all_hist]
-            cum_v  = list(pd.Series(pnl_v).cumsum())
-            fp2 = make_subplots(rows=1, cols=2, subplot_titles=("Cumulative PnL", "Per-Trade PnL"))
-            fp2.add_trace(go.Scatter(y=cum_v, mode="lines+markers", name="Cum PnL",
-                line=dict(color=_B, width=2),
-                marker=dict(color=[_G if v >= 0 else _R for v in cum_v], size=5)), row=1, col=1)
-            fp2.add_trace(go.Bar(y=pnl_v, name="PnL",
-                marker_color=[_G if v >= 0 else _R for v in pnl_v]), row=1, col=2)
-            fp2.update_layout(**_layout("PnL Analysis", 300))
-            st.plotly_chart(fp2, use_container_width=True, key="_hpnl")
+            # Open position banner (if live trade active)
+            _op = _ts_get("current_position")
+            _op_pnl = _ts_get("current_pnl", 0.0)
+            _ltp_op = _ts_get("last_candle", {})
+            if _op is not None:
+                _op_clr = "#00e676" if _op_pnl>=0 else "#ff1744"
+                st.markdown(
+                    f'<div style="background:rgba(64,196,255,0.07);border:1px solid rgba(64,196,255,0.3);'
+                    f'border-radius:8px;padding:10px 16px;font-size:13px;margin:6px 0;">'
+                    f'⚡ <b>OPEN POSITION</b>: {"BUY" if _op["signal_type"]==1 else "SELL"} '
+                    f'@ {_op["entry_price"]:.2f} | LTP: {_ltp_op.get("close","–")} | '
+                    f'SL: {_op["current_sl"]:.2f} | Tgt: {_op["target"]:.2f} | '
+                    f'PnL: <b style="color:{_op_clr};">{_op_pnl:+.2f} pts</b>'
+                    f'</div>', unsafe_allow_html=True)
 
-            df_h = pd.DataFrame(all_hist)
+            pnl_v = [t["PnL"] for t in _all]
+            cum_v = list(pd.Series(pnl_v).cumsum())
+            fp2 = make_subplots(rows=1,cols=2,subplot_titles=("Cumulative PnL","Per-Trade PnL"))
+            fp2.add_trace(go.Scatter(y=cum_v,mode="lines+markers",name="Cum PnL",
+                line=dict(color=_B,width=2),
+                marker=dict(color=[_G if v>=0 else _R for v in cum_v],size=5)),row=1,col=1)
+            fp2.add_trace(go.Bar(y=pnl_v,name="PnL",
+                marker_color=[_G if v>=0 else _R for v in pnl_v]),row=1,col=2)
+            fp2.update_layout(**_layout("PnL Analysis",300))
+            st.plotly_chart(fp2,use_container_width=True,key="_hpnl")
+
+            df_h = pd.DataFrame(_all)
             for c in ["Entry Price","Exit Price","SL","Final SL","Target","PnL"]:
-                if c in df_h.columns: df_h[c] = pd.to_numeric(df_h[c], errors="coerce")
+                if c in df_h.columns: df_h[c]=pd.to_numeric(df_h[c],errors="coerce")
             def _hs(row):
-                try: v = float(row["PnL"])
-                except: v = 0.0
-                bg = "background-color:rgba(0,230,118,0.07)" if v >= 0 else "background-color:rgba(255,23,68,0.07)"
-                return [bg] * len(row)
-            fmt_h = {c: "{:.2f}" for c in ["Entry Price","Exit Price","SL","Final SL","Target"] if c in df_h.columns}
-            if "PnL" in df_h.columns: fmt_h["PnL"] = "{:+.2f}"
-            st.dataframe(df_h.style.apply(_hs, axis=1).format(fmt_h, na_rep="N/A"),
-                         use_container_width=True, height=400)
+                try: v=float(row["PnL"])
+                except: v=0.0
+                return ["background-color:rgba(0,230,118,0.07)" if v>=0
+                        else "background-color:rgba(255,23,68,0.07)"]*len(row)
+            fmt_h={c:"{:.2f}" for c in ["Entry Price","Exit Price","SL","Final SL","Target"] if c in df_h.columns}
+            if "PnL" in df_h.columns: fmt_h["PnL"]="{:+.2f}"
+            st.dataframe(df_h.style.apply(_hs,axis=1).format(fmt_h,na_rep="N/A"),
+                         use_container_width=True,height=420)
+
+        _history_panel()
 
     # ══ TAB 4 – OPTIMIZATION ═════════════════════════════════════════════════
     with tab_opt:
