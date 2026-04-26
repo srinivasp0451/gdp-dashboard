@@ -552,6 +552,7 @@ def live_thread_fn(ticker,period,iv,cfg,stop_ev,dhan_cfg):
     def log(msg): _append("live_log",f"[{now_ist()}] {msg}")
 
     strat=cfg.get("strategy","EMA Crossover"); qty=cfg.get("quantity",1)
+    td=cfg.get("trade_direction","Both")   # MUST be defined before EW checks
     imm=strat in ("Simple Buy","Simple Sell"); tgt_t=cfg.get("target_type","Custom Points")
     en_pnl=cfg.get("enable_pnl_cap",False); max_loss=cfg.get("max_day_loss",-1000.0)
     max_prof=cfg.get("max_day_profit",1000.0); en_tf=cfg.get("enable_time_filter",False)
@@ -583,10 +584,25 @@ def live_thread_fn(ticker,period,iv,cfg,stop_ev,dhan_cfg):
                 try:
                     _yf_wait()
                     tk=yf.Ticker(ticker)
+                    # Always fetch a short 2-day window for latest tick (bypasses cache)
+                    # Then fallback to full period for strategy signals
                     df_new=tk.history(period=period,interval=iv,auto_adjust=True,timeout=20)
                     if df_new is None or len(df_new)==0:
                         _yf_wait()
                         df_new=yf.download(ticker,period=period,interval=iv,auto_adjust=True,progress=False,threads=False)
+                    # Get absolute latest close via fast_info (no cache, no lock conflict)
+                    try:
+                        fi=tk.fast_info
+                        fi_ltp=getattr(fi,"last_price",None)
+                        if fi_ltp and not (isinstance(fi_ltp,float) and fi_ltp!=fi_ltp):
+                            fi_ltp=round(float(fi_ltp),2)
+                            # Only trust if within 5% of last candle (sanity check)
+                            if df_new is not None and len(df_new)>0:
+                                last_close=float(df_new["Close"].iloc[-1]) if not isinstance(df_new.columns,pd.MultiIndex) else float(df_new["Close"].iloc[-1])
+                                if abs(fi_ltp-last_close)/max(last_close,1)<0.05:
+                                    # Patch the last row close with fresh tick
+                                    df_new.iloc[-1, df_new.columns.get_loc("Close")] = fi_ltp
+                    except Exception: pass
                     if df_new is not None and len(df_new)>1:
                         if isinstance(df_new.columns,pd.MultiIndex): df_new.columns=df_new.columns.get_level_values(0)
                         df_new=df_new.dropna(how="all"); df_new=_mkt_filter(df_new,iv)
@@ -1255,13 +1271,20 @@ def main():
         def _live_panel():
             # READ ONLY from _TS — zero network calls in fragment
             _pos    =_get("current_position")
-            _pnl    =_get("current_pnl",0.0)
             _lc     =_get("last_candle") or {}
             _ld     =_get("live_data")
             _logs   =_get("live_log",[]) or []
             _dpnl   =_get("day_pnl",0.0)
-            _ltp    =_get("live_ltp")
+            _ltp    =_get("live_ltp")   # set by thread every 3s from real download
             _running=st.session_state.live_running
+
+            # Recompute PnL every fragment tick (1.5s) from latest ltp
+            if _ltp is not None and _pos is not None:
+                _pnl = round(
+                    (float(_ltp) - _pos["entry_price"]) if _pos["signal_type"]==1
+                    else (_pos["entry_price"] - float(_ltp)), 2)
+            else:
+                _pnl = _get("current_pnl", 0.0)
 
             ltp_disp=f"{float(_ltp):.2f}" if _ltp is not None else "⏳ fetching…"
             fetch_ts=_lc.get("fetch_ts","–")
@@ -1329,14 +1352,27 @@ def main():
             ch_col,info_col=st.columns([2.3,1])
             with ch_col:
                 if _ld and len(_ld.get("close",[]))>=3:
-                    _dfl=pd.DataFrame({"Open":_ld["open"],"High":_ld["high"],"Low":_ld["low"],"Close":_ld["close"],"Volume":_ld["volume"]},
-                                       index=pd.to_datetime(_ld["index"],errors="coerce",utc=False))
-                    _li={}
-                    if strat not in ("Simple Buy","Simple Sell"):
-                        _li["fast_ema"]=ema(_dfl["Close"],fast_ema); _li["slow_ema"]=ema(_dfl["Close"],slow_ema)
-                    _ew=_get("ew_state")
-                    if _ew: _li["elliott"]=_ew
-                    st.plotly_chart(live_chart(_dfl,_pos,_li,cfg),use_container_width=True,key="_lfig")
+                    try:
+                        # Use IST label strings as index (category axis in chart)
+                        _idx_labels = _ld["index"]
+                        _dfl=pd.DataFrame({
+                            "Open":_ld["open"],"High":_ld["high"],
+                            "Low":_ld["low"],"Close":_ld["close"],"Volume":_ld["volume"]
+                        })
+                        # Numeric index; chart uses string labels from _idx_labels
+                        for _c in ["Open","High","Low","Close","Volume"]:
+                            _dfl[_c]=pd.to_numeric(_dfl[_c],errors="coerce")
+                        _dfl=_dfl.dropna(subset=["Open","High","Low","Close"])
+                        _dfl.index=_idx_labels[:len(_dfl)]
+                        _li={}
+                        if strat not in ("Simple Buy","Simple Sell"):
+                            _li["fast_ema"]=ema(_dfl["Close"],fast_ema)
+                            _li["slow_ema"]=ema(_dfl["Close"],slow_ema)
+                        _ew=_get("ew_state")
+                        if _ew: _li["elliott"]=_ew
+                        st.plotly_chart(live_chart(_dfl,_pos,_li,cfg),use_container_width=True,key="_lfig")
+                    except Exception as _ce:
+                        st.warning(f"Chart error: {_ce}")
                 else:
                     st.info("⏳ Waiting for data…" if _running else "▶ Click Start")
             with info_col:
