@@ -45,12 +45,125 @@ def _clear_all():
         _TS["current_pnl"] = 0.0
         _TS["first_fetch"] = False
 
-# ─── yfinance rate limiter ─────────────────────────────────────────────────
-_RATE = [0.0]   # last call time, list so lambdas can mutate
+# ─── Yahoo Finance direct HTTP fetcher (no in-process cache) ─────────────
+# yfinance Ticker objects cache data in-memory. We bypass this entirely
+# by hitting Yahoo's v8/finance/chart endpoint directly with requests.Session.
+
+import urllib.parse
+
+_YF_SESSION = requests.Session()
+_YF_SESSION.headers.update({
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+    "Accept": "application/json",
+})
+
+_LAST_HTTP = [0.0]
+
+def _http_wait(min_gap=1.5):
+    g = time.time() - _LAST_HTTP[0]
+    if g < min_gap: time.sleep(min_gap - g)
+    _LAST_HTTP[0] = time.time()
+
+# Period/interval → Yahoo Finance API parameters
+_PERIOD_MAP = {
+    "1d":"1d","2d":"2d","5d":"5d","7d":"7d","1mo":"1mo","3mo":"3mo",
+    "6mo":"6mo","1y":"1y","2y":"2y","5y":"5y","10y":"10y","20y":"20y","max":"max"
+}
+_INTERVAL_MAP = {
+    "1m":"1m","2m":"2m","5m":"5m","15m":"15m","30m":"30m",
+    "60m":"60m","1h":"1h","1d":"1d","5d":"5d","1wk":"1wk","1mo":"1mo","3mo":"3mo"
+}
+
+def _fetch_yahoo_http(ticker: str, period: str, interval: str) -> pd.DataFrame | None:
+    """
+    Fetch OHLCV data directly from Yahoo Finance v8 chart API.
+    Returns a DataFrame with UTC-aware DatetimeIndex, or None on failure.
+    This NEVER uses yfinance's internal cache.
+    """
+    try:
+        _http_wait()
+        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{urllib.parse.quote(ticker)}"
+        params = {
+            "period1": 0,  # overridden by range
+            "period2": 9999999999,
+            "interval": _INTERVAL_MAP.get(interval, interval),
+            "range": _PERIOD_MAP.get(period, period),
+            "includePrePost": "false",
+            "events": "div,splits",
+        }
+        resp = _YF_SESSION.get(url, params=params, timeout=15)
+        resp.raise_for_status()
+        data = resp.json()
+        result = data.get("chart", {}).get("result", [])
+        if not result: return None
+        r = result[0]
+        timestamps = r.get("timestamp", [])
+        if not timestamps: return None
+        q = r.get("indicators", {}).get("quote", [{}])[0]
+        adj = r.get("indicators", {}).get("adjclose", [{}])
+        closes = adj[0].get("adjclose", q.get("close", [])) if adj else q.get("close", [])
+        opens   = q.get("open",   [None]*len(timestamps))
+        highs   = q.get("high",   [None]*len(timestamps))
+        lows    = q.get("low",    [None]*len(timestamps))
+        volumes = q.get("volume", [0]*len(timestamps))
+        idx = pd.to_datetime(timestamps, unit="s", utc=True)
+        df = pd.DataFrame({"Open":opens,"High":highs,"Low":lows,
+                            "Close":closes,"Volume":volumes}, index=idx)
+        df = df.dropna(subset=["Open","High","Low","Close"])
+        df = df[~df.index.duplicated(keep="last")].sort_index()
+        return df
+    except Exception:
+        return None
+
+def _fetch_yahoo_fallback(ticker: str, period: str, interval: str) -> pd.DataFrame | None:
+    """yfinance fallback — used only if HTTP fetch fails."""
+    try:
+        _http_wait(2.0)
+        # Force a fresh download by not reusing Ticker object
+        df = yf.download(ticker, period=period, interval=interval,
+                          auto_adjust=True, progress=False, threads=False)
+        if df is None or len(df) == 0: return None
+        if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
+        return df.dropna(how="all")
+    except Exception:
+        return None
+
 def _yf_wait():
-    g = time.time() - _RATE[0]
-    if g < 1.7: time.sleep(1.7 - g)
-    _RATE[0] = time.time()
+    # Legacy compat — no-op, we use _http_wait now
+    pass
+
+def _get_realtime_price(ticker: str) -> float | None:
+    """
+    Get the absolute latest real-time price.
+    Uses yf.Ticker.fast_info.last_price which is tick-level (not OHLCV bar).
+    Falls back to last_close if unavailable.
+    This is called in addition to the OHLCV fetch so LTP updates every tick.
+    """
+    try:
+        # Create a completely fresh Ticker object each call (no reuse)
+        import importlib
+        # Clear yfinance's internal shared state to force fresh fetch
+        try:
+            import yfinance.shared as _yfs
+            if hasattr(_yfs, '_DFS'): _yfs._DFS.clear()
+            if hasattr(_yfs, '_ERRORS'): _yfs._ERRORS.clear()
+        except Exception:
+            pass
+        tk = yf.Ticker(ticker)
+        fi = tk.fast_info
+        lp = getattr(fi, "last_price", None)
+        if lp is not None:
+            lp_f = float(lp)
+            if lp_f > 0 and not (lp_f != lp_f):  # not NaN, not zero
+                return round(lp_f, 2)
+        # Fallback: get last close from info dict
+        lc = getattr(fi, "previous_close", None) or getattr(fi, "regular_market_price", None)
+        if lc:
+            lc_f = float(lc)
+            if lc_f > 0: return round(lc_f, 2)
+    except Exception:
+        pass
+    return None
 
 # ─── Constants ─────────────────────────────────────────────────────────────
 TICKERS = {"Nifty 50":"^NSEI","BankNifty":"^NSEBANK","Sensex":"^BSESN",
@@ -95,20 +208,17 @@ def _mkt_filter(df, iv):
     except: return df
 
 def _yf_dl(ticker, period, iv, retries=3):
+    """Fetch via direct HTTP (no cache), fallback to yfinance download."""
     for attempt in range(retries):
-        try:
-            _yf_wait()
-            tk = yf.Ticker(ticker)
-            df = tk.history(period=period, interval=iv, auto_adjust=True, timeout=20)
-            if df is None or len(df)==0:
-                _yf_wait()
-                df = yf.download(ticker, period=period, interval=iv,
-                                 auto_adjust=True, progress=False, threads=False)
-            if df is None or len(df)==0: time.sleep(2*(attempt+1)); continue
-            if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
-            df = df.dropna(how="all")
+        # Primary: direct HTTP — always fresh
+        df = _fetch_yahoo_http(ticker, period, iv)
+        if df is not None and len(df) > 1:
             return _mkt_filter(df, iv)
-        except: time.sleep(2*(attempt+1))
+        # Fallback
+        df = _fetch_yahoo_fallback(ticker, period, iv)
+        if df is not None and len(df) > 1:
+            return _mkt_filter(df, iv)
+        time.sleep(1.5 * (attempt + 1))
     return None
 
 def fetch_data(ticker, period, iv, min_bars=200):
@@ -579,37 +689,30 @@ def live_thread_fn(ticker,period,iv,cfg,stop_ev,dhan_cfg):
         stop_req=stop_ev.is_set(); has_pos=_get("current_position") is not None
         if stop_req and not has_pos: break
         try:
-            # ── Fetch every 3s ──────────────────────────────────────────
-            if time.time()-last_fetch>=3.0:
+            # ── Fetch every 2.5s via direct HTTP (no yfinance cache) ─────
+            if time.time()-last_fetch>=2.5:
                 try:
-                    _yf_wait()
-                    tk=yf.Ticker(ticker)
-                    # Always fetch a short 2-day window for latest tick (bypasses cache)
-                    # Then fallback to full period for strategy signals
-                    df_new=tk.history(period=period,interval=iv,auto_adjust=True,timeout=20)
-                    if df_new is None or len(df_new)==0:
-                        _yf_wait()
-                        df_new=yf.download(ticker,period=period,interval=iv,auto_adjust=True,progress=False,threads=False)
-                    # Get absolute latest close via fast_info (no cache, no lock conflict)
-                    try:
-                        fi=tk.fast_info
-                        fi_ltp=getattr(fi,"last_price",None)
-                        if fi_ltp and not (isinstance(fi_ltp,float) and fi_ltp!=fi_ltp):
-                            fi_ltp=round(float(fi_ltp),2)
-                            # Only trust if within 5% of last candle (sanity check)
-                            if df_new is not None and len(df_new)>0:
-                                last_close=float(df_new["Close"].iloc[-1]) if not isinstance(df_new.columns,pd.MultiIndex) else float(df_new["Close"].iloc[-1])
-                                if abs(fi_ltp-last_close)/max(last_close,1)<0.05:
-                                    # Patch the last row close with fresh tick
-                                    df_new.iloc[-1, df_new.columns.get_loc("Close")] = fi_ltp
-                    except Exception: pass
+                    # Direct HTTP fetch — never reuses cached Ticker object
+                    df_new = _fetch_yahoo_http(ticker, period, iv)
+                    if df_new is None or len(df_new) < 2:
+                        df_new = _fetch_yahoo_fallback(ticker, period, iv)
                     if df_new is not None and len(df_new)>1:
                         if isinstance(df_new.columns,pd.MultiIndex): df_new.columns=df_new.columns.get_level_values(0)
                         df_new=df_new.dropna(how="all"); df_new=_mkt_filter(df_new,iv)
                         cached_df=df_new; last_fetch=time.time()
                         lc_row=df_new.iloc[-1]
-                        # Verified LTP from actual download — this is the ONLY source
+                        # Start with OHLCV last close
                         ltp_verified=round(float(lc_row["Close"]),2)
+                        # Try to get real-time tick price (updates within bar)
+                        try:
+                            rt_price=_get_realtime_price(ticker)
+                            if rt_price is not None:
+                                # Sanity: must be within 3% of last close
+                                if abs(rt_price-ltp_verified)/max(ltp_verified,1)<0.03:
+                                    ltp_verified=rt_price
+                                    # Also patch last row for consistency
+                                    df_new.iloc[-1, list(df_new.columns).index("Close")] = rt_price
+                        except Exception: pass
                         _set("live_ltp",ltp_verified)
                         _set("last_candle",{"datetime":ts_to_ist(df_new.index[-1]),
                             "open":round(float(lc_row["Open"]),2),"high":round(float(lc_row["High"]),2),
@@ -1267,7 +1370,7 @@ def main():
             else: st.toast("ℹ️ No open position.")
 
         # ── Live panel fragment (auto-refresh every 1.5s) ──────────────────
-        @st.fragment(run_every=1.5)
+        @st.fragment(run_every=1.5 if st.session_state.live_running else None)
         def _live_panel():
             # READ ONLY from _TS — zero network calls in fragment
             _pos    =_get("current_position")
@@ -1404,7 +1507,7 @@ def main():
     # ══ TAB 3 – TRADE HISTORY ════════════════════════════════════════════════
     with tab_th:
         st.markdown("### Trade History")
-        @st.fragment(run_every=2.0)
+        @st.fragment(run_every=3.0 if st.session_state.live_running else None)
         def _history_panel():
             _lh=_get("trade_history") or []
             _bh=st.session_state.bt_results["trades"] if st.session_state.bt_results else []
