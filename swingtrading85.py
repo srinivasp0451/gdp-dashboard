@@ -763,18 +763,23 @@ def live_thread_fn(ticker,period,iv,cfg,stop_ev,dhan_cfg):
                 nsl=ltp-tr if sig==1 else ltp+tr
                 if (sig==1 and nsl>cur) or (sig==-1 and nsl<cur): pos["current_sl"]=round(nsl,2); _set("current_position",pos)
 
-            # SL/Target exit vs LTP (SL checked FIRST)
+            # SL/Target exit vs LTP (SL checked FIRST, conservative)
             pos=_get("current_position")
             if pos is not None:
                 sl=pos["current_sl"]; tgt=pos["target"]; sig=pos["signal_type"]; ep=pos["entry_price"]
                 xp=None; xr=None
+                # Minimum move guard: don't allow target/SL exit until price moves
+                # at least 0.1 pts from entry (prevents immediate exit on entry bar)
+                min_move = 0.1
+                price_moved = abs(ltp - ep) >= min_move
+
                 if cfg.get("sl_type")=="EMA Reverse Crossover" or tgt_t=="EMA Reverse Crossover":
                     fe2=ema(df["Close"],cfg.get("fast_ema",9)); se3=ema(df["Close"],cfg.get("slow_ema",15))
                     if len(fe2)>=2:
                         f0,f1=float(fe2.iloc[-1]),float(fe2.iloc[-2]); s0,s1=float(se3.iloc[-1]),float(se3.iloc[-2])
                         if sig==1 and f1>=s1 and f0<s0: xp=ltp; xr="EMA Rev X Exit"
                         elif sig==-1 and f1<=s1 and f0>s0: xp=ltp; xr="EMA Rev X Exit"
-                if xp is None:
+                if xp is None and price_moved:
                     if sig==1:
                         if ltp<=sl: xp=ltp; xr="SL Hit"
                         elif tgt_t!="Trailing Target (Display Only)" and ltp>=tgt: xp=ltp; xr="Target Hit"
@@ -964,23 +969,45 @@ def live_chart(df,pos,inds,cfg):
     fig.add_trace(go.Candlestick(x=idx,open=d["Open"],high=d["High"],low=d["Low"],close=d["Close"],
         name="Price",increasing=dict(line=dict(color=_G,width=1),fillcolor="rgba(0,230,118,0.15)"),
         decreasing=dict(line=dict(color=_R,width=1),fillcolor="rgba(255,23,68,0.15)"),whiskerwidth=0),row=1,col=1)
-    if "fast_ema" in inds:
-        fv=inds["fast_ema"]; fv=fv.values if hasattr(fv,"values") else np.array(fv); fv=fv[-len(idx):]
-        fig.add_trace(go.Scatter(x=idx,y=fv,name=f"EMA{cfg.get('fast_ema',9)}",line=dict(color=_O,width=2),mode="lines"),row=1,col=1)
-    if "slow_ema" in inds:
-        sv_=inds["slow_ema"]; sv_=sv_.values if hasattr(sv_,"values") else np.array(sv_); sv_=sv_[-len(idx):]
-        fig.add_trace(go.Scatter(x=idx,y=sv_,name=f"EMA{cfg.get('slow_ema',15)}",line=dict(color=_B,width=2),mode="lines"),row=1,col=1)
+    # Always recompute EMAs on the live chart data for accuracy
+    fp_=cfg.get("fast_ema",9); sp_=cfg.get("slow_ema",15)
+    if cfg.get("strategy","EMA Crossover") not in ("Simple Buy","Simple Sell","Elliott Wave") or "fast_ema" in inds:
+        try:
+            fe_lc=ema(d["Close"],fp_)
+            fig.add_trace(go.Scatter(x=idx,y=fe_lc.values,name=f"EMA {fp_}",
+                line=dict(color=_O,width=2),mode="lines"),row=1,col=1)
+        except Exception: pass
+        try:
+            se_lc=ema(d["Close"],sp_)
+            fig.add_trace(go.Scatter(x=idx,y=se_lc.values,name=f"EMA {sp_}",
+                line=dict(color=_B,width=2),mode="lines"),row=1,col=1)
+        except Exception: pass
     if pos is not None:
         ep3=float(pos["entry_price"]); sl3=float(pos["current_sl"]); tgt3=float(pos["target"])
         fig.add_hline(y=ep3,line=dict(color="white",width=1.5,dash="dash"),annotation_text=f"Entry {ep3:.2f}",annotation_position="right",row=1,col=1)
         fig.add_hline(y=sl3,line=dict(color=_R,width=2,dash="dash"),annotation_text=f"SL {sl3:.2f}",annotation_position="right",row=1,col=1)
         fig.add_hline(y=tgt3,line=dict(color=_G,width=2,dash="dash"),annotation_text=f"Tgt {tgt3:.2f}",annotation_position="right",row=1,col=1)
     ew=inds.get("elliott") or {}
+    idx_set_lc=set(idx)
     for wl in (ew.get("wave_labels") or []):
         try:
-            wi=wl.get("idx",0); lo2=wi-(len(df)-len(d))
-            if 0<=lo2<len(idx):
-                fig.add_annotation(x=idx[lo2],y=float(wl["price"]),text=f"<b>{wl['label']}</b>",
+            # Try to find by datetime string first (most reliable)
+            wl_dt=str(wl.get("dt",""))
+            matched_x=None
+            # Exact match
+            if wl_dt in idx_set_lc:
+                matched_x=wl_dt
+            else:
+                # Partial match on first 16 chars (date+hour:min)
+                wl_short=wl_dt[:16]
+                for ix in idx:
+                    if ix[:16]==wl_short: matched_x=ix; break
+            # Fallback: integer offset
+            if matched_x is None:
+                wi=wl.get("idx",0); lo2=wi-(len(df)-len(d))
+                if 0<=lo2<len(idx): matched_x=idx[lo2]
+            if matched_x:
+                fig.add_annotation(x=matched_x,y=float(wl["price"]),text=f"<b>{wl['label']}</b>",
                     showarrow=True,arrowhead=2,arrowcolor=_Y,font=dict(color=_Y,size=10),
                     bgcolor="rgba(10,14,19,0.85)",bordercolor=_Y,borderwidth=1,ax=0,ay=-25,row=1,col=1)
         except: pass
@@ -1495,6 +1522,28 @@ def main():
                     </div>""",unsafe_allow_html=True)
                 else:
                     st.markdown('<div style="color:#8b949e;font-size:12px;padding:10px;">No open position</div>',unsafe_allow_html=True)
+
+                # ── EMA live values (EMA Crossover / Anticipatory EMA) ────────
+                if strat in ("EMA Crossover","Anticipatory EMA") and _ld and len(_ld.get("close",[]))>=3:
+                    try:
+                        _cl=pd.Series(_ld["close"],dtype=float)
+                        _fv=round(float(ema(_cl,fast_ema).iloc[-1]),2)
+                        _sv=round(float(ema(_cl,slow_ema).iloc[-1]),2)
+                        _dlt=round(_fv-_sv,2)
+                        _trend="🟢 Bull" if _dlt>0 else "🔴 Bear"
+                        st.markdown(f"""<div style="background:#1f2733;border:1px solid rgba(255,255,255,0.08);border-radius:8px;padding:12px;margin-top:6px;">
+                          <div style="font-size:11px;font-weight:700;color:#ffea00;margin-bottom:6px;">📊 EMA Values (Live)</div>
+                          <div style="font-size:12px;line-height:2.0;">
+                            <div>Fast EMA ({fast_ema}): <b style="color:#ff9800;">{_fv}</b></div>
+                            <div>Slow EMA ({slow_ema}): <b style="color:#40c4ff;">{_sv}</b></div>
+                            <div>Delta (F-S): <b style="color:{'#00e676' if _dlt>0 else '#ff1744'};">{_dlt:+.2f}</b></div>
+                            <div>Trend: <b>{_trend}</b></div>
+                            <div>LTP: <b style="color:#ffffff;">{ltp_disp}</b></div>
+                          </div>
+                        </div>""",unsafe_allow_html=True)
+                    except Exception: pass
+
+                # ── Elliott Wave panel ────────────────────────────────────────
                 _ew2=_get("ew_state")
                 if _ew2:
                     st.markdown("**🌊 Elliott Wave**"); ew_panel(_ew2)
@@ -1510,9 +1559,7 @@ def main():
         @st.fragment(run_every=3.0 if st.session_state.live_running else None)
         def _history_panel():
             _lh=_get("trade_history") or []
-            _bh=st.session_state.bt_results["trades"] if st.session_state.bt_results else []
-            _mf=st.radio("Show",["All","Live","Backtest"],horizontal=True,key="_hf")
-            _all=(_lh+_bh) if _mf=="All" else (_lh if _mf=="Live" else _bh)
+            _all=_lh  # Live trades only
             # Latest candle
             _lc2=_get("last_candle") or {}
             if _lc2 and st.session_state.live_running:
