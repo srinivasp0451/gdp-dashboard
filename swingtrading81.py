@@ -1058,7 +1058,7 @@ with st.sidebar:
     group_sel=st.selectbox("Category",list(TICKER_GROUPS.keys()),index=0)
     gmap=TICKER_GROUPS[group_sel]
     if group_sel=="✏️ Custom Ticker":
-        symbol=st.text_input("Yahoo Finance ticker","^NSEI")
+        symbol=st.text_input("Yahoo Finance ticker","KAYNES.NS")
     else:
         tn=st.selectbox("Instrument",list(gmap.keys()))
         symbol=gmap[tn]; st.caption(f"Yahoo: `{symbol}`")
@@ -1087,7 +1087,7 @@ with st.sidebar:
     st.markdown("---")
     c1,c2=st.columns(2)
     # Use applied interval/period from full auto if available, else use selectbox
-    iv_idx=TIMEFRAMES.index(st.session_state.applied_interval) if st.session_state.applied_interval in TIMEFRAMES else 6
+    iv_idx=TIMEFRAMES.index(st.session_state.applied_interval) if st.session_state.applied_interval in TIMEFRAMES else 0
     interval=c1.selectbox("⏱ TF",TIMEFRAMES,index=iv_idx)
     vpl=VALID_PERIODS.get(interval,PERIODS)
     ap=st.session_state.applied_period
