@@ -3774,7 +3774,7 @@ def render_config_ui():
     
     # Strategy Selection
     st.sidebar.subheader("📊 Strategy")
-    config['strategy'] = st.sidebar.selectbox("Strategy Type", STRATEGY_LIST, index=0)
+    config['strategy'] = st.sidebar.selectbox("Strategy Type", STRATEGY_LIST, index=11)
     
     # Strategy-specific parameters
     if config['strategy'] == 'EMA Crossover':
