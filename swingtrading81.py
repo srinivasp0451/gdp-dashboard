@@ -1087,7 +1087,7 @@ with st.sidebar:
     st.markdown("---")
     c1,c2=st.columns(2)
     # Use applied interval/period from full auto if available, else use selectbox
-    iv_idx=TIMEFRAMES.index(st.session_state.applied_interval) if st.session_state.applied_interval in TIMEFRAMES else 0
+    iv_idx=TIMEFRAMES.index(st.session_state.applied_interval) if st.session_state.applied_interval in TIMEFRAMES else 1
     interval=c1.selectbox("⏱ TF",TIMEFRAMES,index=iv_idx)
     vpl=VALID_PERIODS.get(interval,PERIODS)
     ap=st.session_state.applied_period
