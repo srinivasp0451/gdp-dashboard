@@ -3650,7 +3650,7 @@ def render_config_ui():
     
     # Timeframe
     config['interval'] = st.sidebar.selectbox("Interval", list(INTERVAL_MAPPING.keys()), index=0)  # Default to 1 minute
-    config['period'] = st.sidebar.selectbox("Period", list(PERIOD_MAPPING.keys()), index=0)  # Default to 1 day
+    config['period'] = st.sidebar.selectbox("Period", list(PERIOD_MAPPING.keys()), index=1)  # Default to 1 day
     
     # Quantity
     config['quantity'] = st.sidebar.number_input("Quantity", min_value=1, value=1)
