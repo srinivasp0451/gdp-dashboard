@@ -597,7 +597,9 @@ def live_thread():
                 position.update({"trailing_sl":trail,"phase":ph,"locked_sl":lk})
                 eff=trail if sl_t in TRAILING_SL_TYPES else sl_p
                 unreal=(ltp-ep)*side*qty
-                ts_update({"live_pnl":round(daily_pnl+unreal,4),"live_pnl_pct":round(unreal/(ep or 1)*100,4),
+                ts_update({"live_pnl":round(daily_pnl+unreal,4),
+                           "daily_pnl":round(daily_pnl,4),
+                           "live_pnl_pct":round(unreal/(ep or 1)*100,4),
                            "trailing_sl":trail,"phase":ph,
                            "live_position":{**{k:v for k,v in position.items() if k!="entry_time"},
                                             "entry_time":position["entry_time"].isoformat() if isinstance(position["entry_time"],datetime) else str(position["entry_time"]),
@@ -624,7 +626,9 @@ def live_thread():
                     pnl=(tgt-ep)*side*qty; _rec_live(position,tgt,"Target",pnl); daily_pnl+=pnl
                     ts_update({"live_pnl":round(daily_pnl,4),"daily_pnl":round(daily_pnl,4),"live_position":None})
                     ts_log(f"Target hit @ {tgt:.4f} PnL={pnl:+.4f}"); position=None
-            if not position and in_window() and dow_ok():
+            # Simple Buy/Sell always enter (ignore time/day filters)
+            simple_strat = strat in ("Simple Buy","Simple Sell")
+            if not position and (simple_strat or (in_window() and dow_ok())):
                 sig=get_live_signal(df,strat,cfg)
                 if sig!=0:
                     side=1 if sig==1 else -1
@@ -867,7 +871,7 @@ def tab_backtest(cfg):
 
 def _render_bt(result,cfg):
     trades=result["trades"]; an=build_analysis(trades)
-    st.plotly_chart(candle_chart(result["df"],result["signals"],trades,title=cfg.get("symbol","",key="pc_1")),use_container_width=True)
+    st.plotly_chart(candle_chart(result["df"],result["signals"],trades,title=cfg.get("symbol","")),use_container_width=True,key="pc_bt_1")
     if not trades: st.warning("No trades generated — adjust strategy params or filters."); return
     if result.get("violations"):
         with st.expander(f"⚠ {len(result['violations'])} violation(s)"):
@@ -883,17 +887,17 @@ def _render_bt(result,cfg):
     c9.metric("Median Win",f"{an['median_win']:.4f}"); c10.metric("Median Loss",f"{an['median_loss']:.4f}")
     rsl=an["rec_sl_pts"]; rtgt=an["rec_tgt_pts"]; impl=f"1:{round(rtgt/rsl,2)}" if rsl>0 else "—"
     st.markdown(f"<div class='rec-card'>📌 <b>Data-driven Recommendations</b>  Suggested SL: <b>{rsl:.4f} pts</b> &nbsp;|&nbsp; Target: <b>{rtgt:.4f} pts</b> &nbsp;|&nbsp; R:R: <b>{impl}</b></div>",unsafe_allow_html=True)
-    st.plotly_chart(eq_chart(an["equity_arr"],an["dd_arr"],key="pc_2"),use_container_width=True)
+    st.plotly_chart(eq_chart(an["equity_arr"],an["dd_arr"]),use_container_width=True,key="pc_bt_2")
     ca,cb=st.columns(2)
-    with ca: st.plotly_chart(heatmap_chart(an["df"],key="pc_3"),use_container_width=True)
-    with cb: st.plotly_chart(ls_chart(an["df"],key="pc_4"),use_container_width=True)
+    with ca: st.plotly_chart(heatmap_chart(an["df"]),use_container_width=True,key="pc_bt_3")
+    with cb: st.plotly_chart(ls_chart(an["df"]),use_container_width=True,key="pc_bt_4")
     cc,cd=st.columns(2)
-    with cc: st.plotly_chart(ang_scatter(result["df"],cfg.get("fast",9,key="pc_5"),cfg.get("slow",21)),use_container_width=True)
-    with cd: st.plotly_chart(ew_chart(trades,key="pc_6"),use_container_width=True)
+    with cc: st.plotly_chart(ang_scatter(result["df"],cfg.get("fast",9),cfg.get("slow",21)),use_container_width=True,key="pc_bt_5")
+    with cd: st.plotly_chart(ew_chart(trades),use_container_width=True,key="pc_bt_6")
     ce,cf=st.columns(2)
-    with ce: st.plotly_chart(reason_chart(an["reason_grp"],key="pc_7"),use_container_width=True)
-    with cf: st.plotly_chart(dur_chart(an["df"],key="pc_8"),use_container_width=True)
-    if len(an["daily_pnl"])>1: st.plotly_chart(daily_chart(an["daily_pnl"],key="pc_9"),use_container_width=True)
+    with ce: st.plotly_chart(reason_chart(an["reason_grp"]),use_container_width=True,key="pc_bt_7")
+    with cf: st.plotly_chart(dur_chart(an["df"]),use_container_width=True,key="pc_bt_8")
+    if len(an["daily_pnl"])>1: st.plotly_chart(daily_chart(an["daily_pnl"]),use_container_width=True,key="pc_bt_9")
     with st.expander("📐 Angle & Delta Distribution"):
         fe=ema(result["df"]["Close"],cfg.get("fast",9)); se_=ema(result["df"]["Close"],cfg.get("slow",21))
         ang=angle_series(fe,se_).dropna(); dlt=((fe-se_)/se_.replace(0,np.nan)*100).dropna()
@@ -912,41 +916,47 @@ def _render_bt(result,cfg):
 def tab_live(cfg):
     st.markdown("<h2 style='font-family:Syne'>⚡ Live Trading</h2>",unsafe_allow_html=True)
 
-    # ── Controls (always rendered first, never inside rerun loop) ──────────────
+    # ── Controls: always visible ──────────────────────────────────────────────
     running = ts_get("running")
-    ctrl1, ctrl2, ctrl3, ctrl4 = st.columns(4)
-    with ctrl1:
+    st.markdown("**Controls**")
+    b1, b2, b3, b4 = st.columns(4)
+    with b1:
         if not running:
-            if st.button("▶ Start Live", use_container_width=True, key="btn_start"):
+            if st.button("▶ START LIVE", use_container_width=True, key="btn_start",
+                         type="primary"):
                 ts_update({"running":True,"config":cfg,"error":None,"live_position":None,
                            "live_ltp":None,"live_df":None,"live_trades":[],"live_pnl":0.0,
                            "daily_pnl":0.0,"candle_count":0,"squareoff_requested":False,
                            "verified_entry":False,"trailing_sl":None,"phase":1,"locked_sl":None,
                            "live_signal":None,"live_ew_info":{},"log":deque(maxlen=300)})
                 threading.Thread(target=live_thread, daemon=True).start()
+                time.sleep(0.3)
                 st.rerun()
-        else:
-            if st.button("⏹ Stop", use_container_width=True, key="btn_stop"):
+    with b2:
+        if running:
+            if st.button("⏹ STOP", use_container_width=True, key="btn_stop"):
                 ts_set("running", False)
+                time.sleep(0.2)
                 st.rerun()
-    with ctrl2:
-        if running and ts_get("live_position"):
-            if st.button("⬛ Squareoff Now", use_container_width=True, key="btn_sq"):
+    with b3:
+        if running:
+            if st.button("⬛ SQUAREOFF", use_container_width=True, key="btn_sq"):
                 ts_set("squareoff_requested", True)
-    with ctrl3:
-        st.info(f"Strategy: **{cfg['strategy']}**")
-    with ctrl4:
-        st.info(f"**{cfg['symbol']}** {cfg['interval']} {cfg['period']}")
+                st.success("Squareoff requested!")
+    with b4:
+        st.info(f"**{cfg['symbol']}** · {cfg['interval']} · {cfg['strategy']}")
 
     err = ts_get("error")
     if err:
-        with st.expander("❌ Last Error"):
+        with st.expander("❌ Thread Error (click to expand)"):
             st.code(err, language="python")
+        if st.button("Clear Error", key="btn_clear_err"):
+            ts_set("error", None)
 
     st.markdown("---")
 
     # ── Live display: reads only from _TS, zero network calls ─────────────────
-    running = ts_get("running")  # re-read after potential rerun
+    running = ts_get("running")
     ltp   = ts_get("live_ltp")
     pos   = ts_get("live_position")
     dp    = ts_get("daily_pnl") or 0.0
@@ -1046,7 +1056,7 @@ def tab_live(cfg):
             st.markdown(html, unsafe_allow_html=True)
 
     # ── Simple 1.5-second auto-refresh when live ──────────────────────────────
-    if running:
+    if ts_get("running"):
         time.sleep(1.5)
         st.rerun()
 
@@ -1087,16 +1097,16 @@ def tab_history():
     st.dataframe(ds[av].style.map(_ps,subset=["pnl"]),use_container_width=True,height=440)
     st.download_button("⬇ Export CSV",ds[av].to_csv(index=False),"trade_history.csv","text/csv")
     st.markdown("---")
-    if len(an["equity_arr"])>1: st.plotly_chart(eq_chart(an["equity_arr"],an["dd_arr"],key="pc_13"),use_container_width=True)
+    if len(an["equity_arr"])>1: st.plotly_chart(eq_chart(an["equity_arr"],an["dd_arr"]),use_container_width=True,key="pc_hi_1")
     if len(trades)>=3:
         ca,cb=st.columns(2)
-        with ca: st.plotly_chart(heatmap_chart(df,key="pc_14"),use_container_width=True)
-        with cb: st.plotly_chart(ls_chart(df,key="pc_15"),use_container_width=True)
+        with ca: st.plotly_chart(heatmap_chart(df),use_container_width=True,key="pc_hi_2")
+        with cb: st.plotly_chart(ls_chart(df),use_container_width=True,key="pc_hi_3")
         cc,cd=st.columns(2)
-        with cc: st.plotly_chart(reason_chart(an["reason_grp"],key="pc_16"),use_container_width=True)
-        with cd: st.plotly_chart(ew_chart(trades,key="pc_17"),use_container_width=True)
-        if len(an["daily_pnl"])>1: st.plotly_chart(daily_chart(an["daily_pnl"],key="pc_18"),use_container_width=True)
-        st.plotly_chart(dur_chart(df,key="pc_19"),use_container_width=True)
+        with cc: st.plotly_chart(reason_chart(an["reason_grp"]),use_container_width=True,key="pc_hi_4")
+        with cd: st.plotly_chart(ew_chart(trades),use_container_width=True,key="pc_hi_5")
+        if len(an["daily_pnl"])>1: st.plotly_chart(daily_chart(an["daily_pnl"]),use_container_width=True,key="pc_hi_6")
+        st.plotly_chart(dur_chart(df),use_container_width=True,key="pc_hi_7")
 
 # ── Tab 4: Optimization ────────────────────────────────────────────────────────
 def tab_optimization(cfg):
