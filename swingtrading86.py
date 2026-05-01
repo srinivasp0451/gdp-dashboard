@@ -79,10 +79,25 @@ a{color:var(--blue)!important;}
 [data-testid="metric-container"]{background-color:var(--surf)!important;border:1px solid var(--border)!important;border-radius:8px!important;padding:14px 16px!important;}
 [data-testid="metric-container"] *,[data-testid="stMetricValue"]{color:var(--text)!important;}
 [data-testid="stMetricLabel"]{color:var(--muted)!important;font-size:.75rem!important;}
-input,select,textarea,[data-baseweb="input"],[data-baseweb="select"]{
-  background-color:var(--surf2)!important;border-color:var(--border)!important;color:var(--text)!important;}
-[data-testid="stNumberInput"] input,[data-testid="stTextInput"] input{color:var(--text)!important;}
-[data-testid="stSelectbox"] *,[data-testid="stMultiSelect"] *{color:var(--text)!important;background-color:var(--surf2)!important;}
+input,select,textarea{background-color:var(--surf2)!important;border-color:var(--border)!important;color:var(--text)!important;}
+[data-baseweb="input"],[data-baseweb="select"],[data-baseweb="textarea"]{background-color:var(--surf2)!important;border-color:var(--border)!important;}
+[data-testid="stNumberInput"] input,[data-testid="stTextInput"] input{color:var(--text)!important;background-color:var(--surf2)!important;}
+/* selectbox trigger */
+[data-testid="stSelectbox"] [data-baseweb="select"] div,[data-testid="stSelectbox"] [data-baseweb="select"] span{color:var(--text)!important;background-color:var(--surf2)!important;}
+/* selectbox/multiselect dropdown popover list */
+[data-baseweb="popover"],[data-baseweb="menu"],[data-baseweb="list"]{background-color:var(--surf2)!important;border:1px solid var(--border)!important;}
+[data-baseweb="popover"] *,[data-baseweb="menu"] *,[data-baseweb="list"] *{background-color:var(--surf2)!important;color:var(--text)!important;}
+[data-baseweb="option"]{background-color:var(--surf2)!important;color:var(--text)!important;}
+[data-baseweb="option"]:hover,[data-baseweb="option"][aria-selected="true"]{background-color:#2d333b!important;color:#58a6ff!important;}
+/* multiselect tags */
+[data-baseweb="tag"]{background-color:#1f3a5f!important;color:#58a6ff!important;}
+[data-baseweb="tag"] span{color:#58a6ff!important;}
+/* radio + checkbox */
+[data-testid="stRadio"] *,[data-testid="stCheckbox"] *{color:var(--text)!important;}
+/* slider */
+[data-testid="stSlider"] *{color:var(--text)!important;}
+/* info/warning boxes text */
+[data-testid="stAlert"] *{color:var(--text)!important;}
 .stButton>button{background-color:var(--blue)!important;color:#0d1117!important;border:none!important;
   border-radius:6px!important;font-family:'Space Mono',monospace!important;font-weight:700!important;}
 .stButton>button:hover{opacity:.82!important;}
@@ -890,7 +905,7 @@ def _render_bt(result,cfg):
     st.markdown("---"); st.markdown("**📋 Trade Log**")
     cols=["entry_time","exit_time","side","entry","exit","sl","target","pnl","exit_reason","duration_m","atr","pattern"]
     df_s=pd.DataFrame(trades); avail=[c for c in cols if c in df_s.columns]
-    st.dataframe(df_s[avail].style.applymap(_ps,subset=["pnl"]),use_container_width=True,height=440)
+    st.dataframe(df_s[avail].style.map(_ps,subset=["pnl"]),use_container_width=True,height=440)
     st.download_button("⬇ Export CSV",df_s[avail].to_csv(index=False),"backtest_trades.csv","text/csv")
 
 # ── Tab 2: Live Trading ────────────────────────────────────────────────────────
@@ -953,7 +968,11 @@ def tab_live(cfg):
             if ew.get("fib") and ew.get("pattern"):
                 ltp2=float(df2["Close"].iloc[-1])
                 st.markdown(f"<b>🌊 {ew.get('pattern','')} </b> Confidence: <b>{ew.get('confidence',0)}%</b>",unsafe_allow_html=True)
-                rows="".join(f"<tr><td>{r}</td><td>{lvl:.4f}</td><td style='color:{"#3fb950" if lvl<ltp2 else "#f85149"}'>{'↓ Below' if lvl<ltp2 else '↑ Above'}</td></tr>" for r,lvl in sorted(ew["fib"].items()))
+                def _fib_row(r,lvl):
+                    c="#3fb950" if lvl<ltp2 else "#f85149"
+                    d="Below" if lvl<ltp2 else "Above"
+                    return "<tr><td>"+str(r)+"</td><td>"+f"{lvl:.4f}"+"</td><td style='color:"+c+"'>"+d+"</td></tr>"
+                rows="".join(_fib_row(r,lvl) for r,lvl in sorted(ew["fib"].items()))
                 st.markdown(f"<table style='font-size:.8rem'><tr><th>Fib</th><th>Level</th><th>vs LTP</th></tr>{rows}</table>",unsafe_allow_html=True)
         else: st.info("⏳ Waiting for first data fetch…")
     _chart()
@@ -963,7 +982,11 @@ def tab_live(cfg):
         logs=list(ts_get("log") or [])
         if logs:
             with st.expander("📜 Activity Log",expanded=True):
-                html="".join(f"<div style='font-size:.81em;padding:2px 0;color:{"#3fb950" if any(x in l for x in ["✅","BUY","SELL","Target"]) else "#f85149" if any(x in l for x in ["Exception","SL","failed"]) else "#8b949e"}'>{l}</div>" for l in logs[:100])
+                def _log_color(l):
+                    if any(x in l for x in ["BUY","SELL","Target","verified","started"]): return "#3fb950"
+                    if any(x in l for x in ["Exception","failed","Error"]): return "#f85149"
+                    return "#8b949e"
+                html="".join("<div style='font-size:.81em;padding:2px 0;color:"+_log_color(l)+"'>"+l+"</div>" for l in logs[:100])
                 st.markdown(html,unsafe_allow_html=True)
     _log()
 
@@ -979,7 +1002,7 @@ def tab_live(cfg):
         lc3.metric("Trades",an["total_trades"]); pfs=f"{an['profit_factor']:.2f}" if np.isfinite(an["profit_factor"]) else "∞"; lc4.metric("PF",pfs)
         df_t=pd.DataFrame(trades); cols_=["entry_time","exit_time","side","entry","exit","sl","target","pnl","exit_reason","atr","pattern"]
         avail=[c for c in cols_ if c in df_t.columns]
-        st.dataframe(df_t[avail].style.applymap(_ps,subset=["pnl"]),use_container_width=True,height=300)
+        st.dataframe(df_t[avail].style.map(_ps,subset=["pnl"]),use_container_width=True,height=300)
     _live_tbl()
 
 # ── Tab 3: Trade History ───────────────────────────────────────────────────────
@@ -1015,7 +1038,7 @@ def tab_history():
     st.markdown(f"Showing **{len(ds)}** of {len(df)} trades")
     vc=["entry_time","exit_time","side","entry","exit","sl","target","pnl","exit_reason","duration_m","atr","pattern","source"]
     av=[c for c in vc if c in ds.columns]
-    st.dataframe(ds[av].style.applymap(_ps,subset=["pnl"]),use_container_width=True,height=440)
+    st.dataframe(ds[av].style.map(_ps,subset=["pnl"]),use_container_width=True,height=440)
     st.download_button("⬇ Export CSV",ds[av].to_csv(index=False),"trade_history.csv","text/csv")
     st.markdown("---")
     if len(an["equity_arr"])>1: st.plotly_chart(eq_chart(an["equity_arr"],an["dd_arr"]),use_container_width=True)
