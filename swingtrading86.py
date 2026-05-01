@@ -528,122 +528,241 @@ def get_live_signal(df,strategy,cfg):
     return 0
 
 # ── Live thread ────────────────────────────────────────────────────────────────
-def _rec_live(pos,ep,reason,pnl):
-    et=pos.get("entry_time")
-    es=et.strftime("%Y-%m-%d %H:%M:%S") if isinstance(et,datetime) else str(et)
+def _rec_live(pos, ep, reason, pnl):
+    et = pos.get("entry_time")
+    es = et.strftime("%Y-%m-%d %H:%M:%S") if isinstance(et, datetime) else str(et)
     with _LOCK:
-        _TS["live_trades"].append({"entry_time":es,"exit_time":datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S"),
-            "side":"BUY" if pos["side"]==1 else "SELL","entry":round(pos["entry"],4),"exit":round(ep,4),
-            "sl":round(pos["sl"],4),"target":round(pos["target"],4),"pnl":round(pnl,4),
-            "exit_reason":reason,"duration_m":0.0,"atr":round(pos.get("atr",0),4),
-            "pattern":pos.get("pattern",""),"source":"live"})
+        _TS["live_trades"].append({
+            "entry_time": es,
+            "exit_time":  datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S"),
+            "side":       "BUY" if pos["side"]==1 else "SELL",
+            "entry":      round(pos["entry"], 4),
+            "exit":       round(ep, 4),
+            "sl":         round(pos["sl"], 4),
+            "target":     round(pos["target"], 4),
+            "pnl":        round(pnl, 4),
+            "exit_reason": reason,
+            "duration_m": 0.0,
+            "atr":        round(pos.get("atr", 0), 4),
+            "pattern":    pos.get("pattern", ""),
+            "source":     "live",
+        })
 
 def live_thread():
-    ts_log("▶ Live thread started")
-    cfg=ts_get("config"); sym=cfg["symbol"]; iv=cfg["interval"]; per=cfg["period"]
-    strat=cfg["strategy"]; sl_type=cfg["sl_type"]
-    sp=float(cfg.get("sl_param",20)); tp=float(cfg.get("target_param",40))
-    rr=float(cfg.get("rr_ratio",2)); qty=int(cfg.get("qty",1))
-    fast=int(cfg.get("fast",9)); slow=int(cfg.get("slow",21))
-    atr_p=int(cfg.get("atr_period",14)); t0=cfg.get("trade_time_start","09:15"); t1=cfg.get("trade_time_end","15:20")
-    max_loss=float(cfg.get("max_daily_loss",0)); max_profit=float(cfg.get("max_daily_profit",0))
-    sleep=_REFRESH.get(iv,30)
-    ts_log("Verifying initial download…")
-    verified=False
-    for att in range(6):
-        df=fetch_ohlcv(sym,iv,per)
-        if df is not None and not df.empty and float(df["Close"].iloc[-1])>0:
-            ltp=float(df["Close"].iloc[-1]); ts_update({"verified_entry":True,"live_ltp":ltp,"live_df":df})
-            ts_log(f"LTP verified {ltp:.4f} ({len(df)} bars)"); verified=True; break
-        ts_log(f"Attempt {att+1} failed, retry 3s…"); time.sleep(3)
-    if not verified:
-        ts_update({"running":False,"error":"Could not verify initial price after 6 attempts."})
-        ts_log("Thread exiting — verification failed"); return
-    position=None; daily_pnl=0.0; last_date=datetime.now(IST).date(); prev_ltp=None
+    ts_log("Thread started")
+    try:
+        cfg      = ts_get("config")
+        sym      = cfg["symbol"]
+        iv       = cfg["interval"]
+        per      = cfg["period"]
+        strat    = cfg["strategy"]
+        sl_type  = cfg["sl_type"]
+        sp       = float(cfg.get("sl_param",    20))
+        tp       = float(cfg.get("target_param", 40))
+        rr       = float(cfg.get("rr_ratio",      2))
+        qty      = int(cfg.get("qty",   1))
+        fast     = int(cfg.get("fast",  9))
+        slow     = int(cfg.get("slow", 21))
+        atr_p    = int(cfg.get("atr_period", 14))
+        sleep_s  = _REFRESH.get(iv, 30)
+        max_loss = float(cfg.get("max_daily_loss",   0))
+        max_prof = float(cfg.get("max_daily_profit", 0))
+        t_start  = cfg.get("trade_time_start", "09:15")
+        t_end    = cfg.get("trade_time_end",   "15:20")
+    except Exception as e:
+        ts_set("error", f"Config error: {e}\n" + traceback.format_exc())
+        ts_set("running", False)
+        return
+
     def in_window():
         try:
-            now=datetime.now(IST); h0,m0=map(int,t0.split(":")); h1,m1=map(int,t1.split(":"))
-            m=now.hour*60+now.minute; return h0*60+m0<=m<=h1*60+m1
-        except: return True
-    def dow_ok(): dows=cfg.get("filter_dow",[]); return not dows or datetime.now(IST).weekday() in dows
+            now = datetime.now(IST)
+            h0,m0 = map(int, t_start.split(":"))
+            h1,m1 = map(int, t_end.split(":"))
+            m = now.hour * 60 + now.minute
+            return h0*60+m0 <= m <= h1*60+m1
+        except:
+            return True
+
+    def dow_ok():
+        dows = cfg.get("filter_dow", [])
+        return not dows or datetime.now(IST).weekday() in dows
+
+    position   = None
+    daily_pnl  = 0.0
+    last_date  = datetime.now(IST).date()
+    ts_log(f"Running: {sym} | {strat} | {sl_type} | qty={qty}")
+
     while ts_get("running"):
         try:
-            ts_set("thread_heartbeat",datetime.now(IST).isoformat())
-            today=datetime.now(IST).date()
-            if today!=last_date: daily_pnl=0.0; last_date=today; ts_set("daily_pnl",0.0); ts_log("Daily PnL reset")
-            if max_loss>0 and daily_pnl<=-max_loss: time.sleep(sleep); continue
-            if max_profit>0 and daily_pnl>=max_profit: time.sleep(sleep); continue
+            ts_set("thread_heartbeat", datetime.now(IST).isoformat())
+
+            # ── Daily reset ───────────────────────────────────────────────────
+            today = datetime.now(IST).date()
+            if today != last_date:
+                daily_pnl = 0.0
+                last_date = today
+                ts_log("Daily PnL reset")
+
+            # ── Daily caps ────────────────────────────────────────────────────
+            if max_loss > 0 and daily_pnl <= -max_loss:
+                ts_log(f"Max loss cap {daily_pnl:.2f} — waiting")
+                time.sleep(sleep_s); continue
+            if max_prof > 0 and daily_pnl >= max_prof:
+                ts_log(f"Max profit cap {daily_pnl:.2f} — waiting")
+                time.sleep(sleep_s); continue
+
+            # ── Fetch fresh data every cycle ──────────────────────────────────
+            df = fetch_ohlcv(sym, iv, per)
+            if df is None or df.empty:
+                ts_log("Data fetch failed — retrying")
+                time.sleep(5); continue
+
+            df["EMA_fast"] = ema(df["Close"], fast)
+            df["EMA_slow"] = ema(df["Close"], slow)
+            df["ATR"]      = calc_atr(df, atr_p)
+
+            ltp   = float(df["Close"].iloc[-1])
+            atr_v = float(df["ATR"].iloc[-1])
+            bar_t = df.index[-1]
+
+            ts_update({
+                "live_ltp":      ltp,
+                "live_df":       df,
+                "last_bar_time": bar_t.strftime("%Y-%m-%d %H:%M:%S"),
+                "candle_count":  (ts_get("candle_count") or 0) + 1,
+                "daily_pnl":     round(daily_pnl, 4),
+            })
+
+            # ── Squareoff ─────────────────────────────────────────────────────
             if ts_get("squareoff_requested") and position:
-                df=fetch_ohlcv(sym,iv,per)
-                if df is not None and not df.empty:
-                    ltp=float(df["Close"].iloc[-1]); pnl=(ltp-position["entry"])*position["side"]*qty
-                    _rec_live(position,ltp,"Squareoff",pnl); daily_pnl+=pnl
-                    ts_update({"live_pnl":round(daily_pnl,4),"daily_pnl":round(daily_pnl,4),"live_position":None,"squareoff_requested":False,"trailing_sl":None,"phase":1})
-                    ts_log(f"Squareoff @ {ltp:.4f} PnL={pnl:+.4f}"); position=None
-                time.sleep(1); continue
-            df=fetch_ohlcv(sym,iv,per)
-            if df is None or df.empty: ts_log("Data fetch failed, skipping"); time.sleep(sleep); continue
-            df["EMA_fast"]=ema(df["Close"],fast); df["EMA_slow"]=ema(df["Close"],slow); df["ATR"]=calc_atr(df,atr_p)
-            ltp=float(df["Close"].iloc[-1]); bar_t=df.index[-1]; atr_v=float(df["ATR"].iloc[-1])
-            if prev_ltp is not None and abs(ltp-prev_ltp)<0.01:
-                ts_update({"live_ltp":ltp,"live_df":df,"last_bar_time":bar_t.isoformat()}); time.sleep(sleep); continue
-            prev_ltp=ltp
-            ts_update({"live_ltp":ltp,"live_df":df,"last_bar_time":bar_t.isoformat(),"candle_count":(ts_get("candle_count") or 0)+1})
+                pnl = (ltp - position["entry"]) * position["side"] * qty
+                _rec_live(position, ltp, "Squareoff", pnl)
+                daily_pnl += pnl
+                position = None
+                ts_update({
+                    "live_pnl":            round(daily_pnl, 4),
+                    "daily_pnl":           round(daily_pnl, 4),
+                    "live_position":       None,
+                    "squareoff_requested": False,
+                    "trailing_sl":         None,
+                })
+                ts_log(f"Squareoff @ {ltp:.4f}  PnL={pnl:+.4f}")
+                time.sleep(sleep_s); continue
+
+            # ── Manage open position ──────────────────────────────────────────
             if position:
-                side=position["side"]; ep=position["entry"]; sl_p=position["sl"]; tgt=position["target"]
-                sl_t=position["sl_type"]; sl_par=position["sl_param"]; atr_v2=position["atr"]
-                trail=position.get("trailing_sl",sl_p); ph=position.get("phase",1); lk=position.get("locked_sl",None)
-                trail,ph,lk=update_trail(trail,ltp,side,sl_t,sl_par,ep,atr_v2,ph,lk)
-                position.update({"trailing_sl":trail,"phase":ph,"locked_sl":lk})
-                eff=trail if sl_t in TRAILING_SL_TYPES else sl_p
-                unreal=(ltp-ep)*side*qty
-                ts_update({"live_pnl":round(daily_pnl+unreal,4),
-                           "daily_pnl":round(daily_pnl,4),
-                           "live_pnl_pct":round(unreal/(ep or 1)*100,4),
-                           "trailing_sl":trail,"phase":ph,
-                           "live_position":{**{k:v for k,v in position.items() if k!="entry_time"},
-                                            "entry_time":position["entry_time"].isoformat() if isinstance(position["entry_time"],datetime) else str(position["entry_time"]),
-                                            "unrealized_pnl":round(unreal,4),"eff_sl":round(eff,4)}})
-                if sl_t=="Strategy Reverse Signal":
-                    rev=get_live_signal(df,strat,cfg)
-                    if rev!=0 and rev!=side:
-                        pnl=(ltp-ep)*side*qty; _rec_live(position,ltp,"Strategy Reverse",pnl); daily_pnl+=pnl
-                        ts_update({"live_pnl":round(daily_pnl,4),"daily_pnl":round(daily_pnl,4),"live_position":None})
-                        ts_log(f"Strategy Reverse exit @ {ltp:.4f} PnL={pnl:+.4f}"); position=None; time.sleep(sleep); continue
-                if sl_t=="EMA Reverse Crossover":
-                    rev=ema_live_check(df,fast,slow)
-                    if rev!=0 and rev!=side:
-                        pnl=(ltp-ep)*side*qty; _rec_live(position,ltp,"EMA Reverse",pnl); daily_pnl+=pnl
-                        ts_update({"live_pnl":round(daily_pnl,4),"daily_pnl":round(daily_pnl,4),"live_position":None})
-                        ts_log(f"EMA Reverse exit @ {ltp:.4f} PnL={pnl:+.4f}"); position=None; time.sleep(sleep); continue
-                sl_hit=(side==1 and ltp<=eff) or (side==-1 and ltp>=eff)
-                tgt_hit=(side==1 and ltp>=tgt) or (side==-1 and ltp<=tgt)
+                side   = position["side"]
+                entry  = position["entry"]
+                sl_p   = position["sl"]
+                tgt_p  = position["target"]
+                sl_t   = position["sl_type"]
+                sp_    = position["sl_param"]
+                atr_p_ = position["atr"]
+                trail  = position.get("trailing_sl", sl_p)
+                phase  = position.get("phase", 1)
+                locked = position.get("locked_sl", None)
+
+                trail, phase, locked = update_trail(trail, ltp, side, sl_t, sp_, entry, atr_p_, phase, locked)
+                position.update({"trailing_sl": trail, "phase": phase, "locked_sl": locked})
+
+                eff_sl = trail if sl_t in TRAILING_SL_TYPES else sl_p
+                unreal = (ltp - entry) * side * qty
+
+                ts_update({
+                    "live_pnl":     round(daily_pnl + unreal, 4),
+                    "daily_pnl":    round(daily_pnl, 4),
+                    "trailing_sl":  round(trail, 4),
+                    "phase":        phase,
+                    "live_position": {
+                        "side":            side,
+                        "entry":           round(entry, 4),
+                        "sl":              round(sl_p, 4),
+                        "target":          round(tgt_p, 4),
+                        "eff_sl":          round(eff_sl, 4),
+                        "trailing_sl":     round(trail, 4),
+                        "unrealized_pnl":  round(unreal, 4),
+                        "pattern":         position.get("pattern", ""),
+                        "entry_time":      str(position.get("entry_time", "")),
+                    },
+                })
+
+                # Strategy / EMA reverse exits
+                if sl_t == "Strategy Reverse Signal":
+                    rev = get_live_signal(df, strat, cfg)
+                    if rev != 0 and rev != side:
+                        pnl = (ltp - entry) * side * qty
+                        _rec_live(position, ltp, "Strategy Reverse", pnl)
+                        daily_pnl += pnl; position = None
+                        ts_update({"live_pnl": round(daily_pnl,4), "daily_pnl": round(daily_pnl,4), "live_position": None, "trailing_sl": None})
+                        ts_log(f"Strategy Reverse @ {ltp:.4f}  PnL={pnl:+.4f}")
+                        time.sleep(sleep_s); continue
+
+                if sl_t == "EMA Reverse Crossover":
+                    rev = ema_live_check(df, fast, slow)
+                    if rev != 0 and rev != side:
+                        pnl = (ltp - entry) * side * qty
+                        _rec_live(position, ltp, "EMA Reverse", pnl)
+                        daily_pnl += pnl; position = None
+                        ts_update({"live_pnl": round(daily_pnl,4), "daily_pnl": round(daily_pnl,4), "live_position": None, "trailing_sl": None})
+                        ts_log(f"EMA Reverse @ {ltp:.4f}  PnL={pnl:+.4f}")
+                        time.sleep(sleep_s); continue
+
+                sl_hit  = (side == 1 and ltp <= eff_sl) or (side == -1 and ltp >= eff_sl)
+                tgt_hit = (side == 1 and ltp >= tgt_p)  or (side == -1 and ltp <= tgt_p)
+
                 if sl_hit:
-                    pnl=(eff-ep)*side*qty; _rec_live(position,eff,"SL",pnl); daily_pnl+=pnl
-                    ts_update({"live_pnl":round(daily_pnl,4),"daily_pnl":round(daily_pnl,4),"live_position":None})
-                    ts_log(f"SL hit @ {eff:.4f} PnL={pnl:+.4f}"); position=None
-                elif tgt_hit:
-                    pnl=(tgt-ep)*side*qty; _rec_live(position,tgt,"Target",pnl); daily_pnl+=pnl
-                    ts_update({"live_pnl":round(daily_pnl,4),"daily_pnl":round(daily_pnl,4),"live_position":None})
-                    ts_log(f"Target hit @ {tgt:.4f} PnL={pnl:+.4f}"); position=None
-            # Simple Buy/Sell always enter (ignore time/day filters)
-            simple_strat = strat in ("Simple Buy","Simple Sell")
-            if not position and (simple_strat or (in_window() and dow_ok())):
-                sig=get_live_signal(df,strat,cfg)
-                if sig!=0:
-                    side=1 if sig==1 else -1
-                    sl_p=calc_sl(ltp,side,sl_type,sp,df,len(df)-1,atr_v,fast,slow)
-                    tgt_p=calc_target(ltp,side,sl_p,sl_type,tp,rr)
-                    ew_inf=detect_ew(df,cfg.get("ew_order",5)) if strat=="Elliott Wave" else {}
-                    position={"side":side,"entry":ltp,"sl":sl_p,"target":tgt_p,"sl_type":sl_type,
-                              "sl_param":sp,"entry_time":datetime.now(IST),"atr":atr_v,"qty":qty,
-                              "trailing_sl":sl_p,"phase":1,"locked_sl":None,"pattern":ew_inf.get("pattern","")}
-                    ts_update({"live_signal":sig,"live_ew_info":ew_inf})
+                    pnl = (eff_sl - entry) * side * qty
+                    _rec_live(position, eff_sl, "SL", pnl)
+                    daily_pnl += pnl; position = None
+                    ts_update({"live_pnl": round(daily_pnl,4), "daily_pnl": round(daily_pnl,4), "live_position": None, "trailing_sl": None})
+                    ts_log(f"SL hit @ {eff_sl:.4f}  PnL={pnl:+.4f}")
+                    time.sleep(sleep_s); continue
+
+                if tgt_hit:
+                    pnl = (tgt_p - entry) * side * qty
+                    _rec_live(position, tgt_p, "Target", pnl)
+                    daily_pnl += pnl; position = None
+                    ts_update({"live_pnl": round(daily_pnl,4), "daily_pnl": round(daily_pnl,4), "live_position": None, "trailing_sl": None})
+                    ts_log(f"Target hit @ {tgt_p:.4f}  PnL={pnl:+.4f}")
+                    time.sleep(sleep_s); continue
+
+            # ── Check for new entry ───────────────────────────────────────────
+            if not position:
+                simple = strat in ("Simple Buy", "Simple Sell")
+                can_enter = simple or (in_window() and dow_ok())
+
+                sig = get_live_signal(df, strat, cfg)
+                ts_set("live_signal", sig)
+
+                if sig != 0 and can_enter:
+                    side  = 1 if sig == 1 else -1
+                    sl_p  = calc_sl(ltp, side, sl_type, sp, df, len(df)-1, atr_v, fast, slow)
+                    tgt_p = calc_target(ltp, side, sl_p, sl_type, tp, rr)
+                    ew_inf = detect_ew(df, cfg.get("ew_order", 5)) if strat == "Elliott Wave" else {}
+                    position = {
+                        "side": side, "entry": ltp, "sl": sl_p, "target": tgt_p,
+                        "sl_type": sl_type, "sl_param": sp,
+                        "entry_time": datetime.now(IST),
+                        "atr": atr_v, "qty": qty,
+                        "trailing_sl": sl_p, "phase": 1, "locked_sl": None,
+                        "pattern": ew_inf.get("pattern", ""),
+                    }
+                    ts_update({"live_ew_info": ew_inf})
                     ts_log(f"{'BUY' if side==1 else 'SELL'} @ {ltp:.4f}  SL={sl_p:.4f}  TGT={tgt_p:.4f}")
+                else:
+                    if sig == 0:
+                        ts_set("live_signal", 0)
+
         except Exception as exc:
-            ts_log(f"Exception: {exc}"); ts_set("error",traceback.format_exc())
-        time.sleep(sleep)
-    ts_log("Live thread stopped"); ts_update({"live_position":None,"trailing_sl":None})
+            ts_log(f"ERROR: {exc}")
+            ts_set("error", traceback.format_exc())
+
+        time.sleep(sleep_s)
+
+    ts_log("Thread stopped")
+    ts_update({"live_position": None, "trailing_sl": None})
+
 
 # ── Analysis ───────────────────────────────────────────────────────────────────
 def build_analysis(trades):
@@ -914,148 +1033,157 @@ def _render_bt(result,cfg):
 
 # ── Tab 2: Live Trading ────────────────────────────────────────────────────────
 def tab_live(cfg):
-    st.markdown("<h2 style='font-family:Syne'>⚡ Live Trading</h2>",unsafe_allow_html=True)
+    st.markdown("<h2 style='font-family:Syne'>⚡ Live Trading</h2>", unsafe_allow_html=True)
 
-    # ── Controls: always visible ──────────────────────────────────────────────
-    running = ts_get("running")
+    # ── Read state ─────────────────────────────────────────────────────────────
+    running  = ts_get("running") or False
+    ltp      = ts_get("live_ltp")
+    pos      = ts_get("live_position")
+    dp       = ts_get("daily_pnl") or 0.0
+    sig      = ts_get("live_signal")
+    trail    = ts_get("trailing_sl")
+    phase    = ts_get("phase") or 1
+    hb       = ts_get("thread_heartbeat") or "—"
+    cnc      = ts_get("candle_count") or 0
+    lbt      = ts_get("last_bar_time") or "—"
+    ew       = ts_get("live_ew_info") or {}
+    logs     = list(ts_get("log") or [])
+    err      = ts_get("error")
+
+    # ── Buttons — always rendered, just disabled/enabled ──────────────────────
     st.markdown("**Controls**")
     b1, b2, b3, b4 = st.columns(4)
-    with b1:
-        if not running:
-            if st.button("▶ START LIVE", use_container_width=True, key="btn_start",
-                         type="primary"):
-                ts_update({"running":True,"config":cfg,"error":None,"live_position":None,
-                           "live_ltp":None,"live_df":None,"live_trades":[],"live_pnl":0.0,
-                           "daily_pnl":0.0,"candle_count":0,"squareoff_requested":False,
-                           "verified_entry":False,"trailing_sl":None,"phase":1,"locked_sl":None,
-                           "live_signal":None,"live_ew_info":{},"log":deque(maxlen=300)})
-                threading.Thread(target=live_thread, daemon=True).start()
-                time.sleep(0.3)
-                st.rerun()
-    with b2:
-        if running:
-            if st.button("⏹ STOP", use_container_width=True, key="btn_stop"):
-                ts_set("running", False)
-                time.sleep(0.2)
-                st.rerun()
-    with b3:
-        if running:
-            if st.button("⬛ SQUAREOFF", use_container_width=True, key="btn_sq"):
-                ts_set("squareoff_requested", True)
-                st.success("Squareoff requested!")
-    with b4:
-        st.info(f"**{cfg['symbol']}** · {cfg['interval']} · {cfg['strategy']}")
+    start_clicked = b1.button("▶  START",      key="btn_start", use_container_width=True, disabled=running)
+    stop_clicked  = b2.button("⏹  STOP",        key="btn_stop",  use_container_width=True, disabled=not running)
+    sq_clicked    = b3.button("⬛  SQUAREOFF",   key="btn_sq",    use_container_width=True, disabled=not running)
+    b4.markdown(f"<div class='card' style='padding:8px 12px;margin:0'><b>{cfg['symbol']}</b> · {cfg['interval']} · {cfg['period']}</div>", unsafe_allow_html=True)
 
-    err = ts_get("error")
+    if start_clicked:
+        ts_update({
+            "running": True, "config": cfg, "error": None,
+            "live_position": None, "live_ltp": None, "live_df": None,
+            "live_trades": [], "live_pnl": 0.0, "daily_pnl": 0.0,
+            "candle_count": 0, "squareoff_requested": False,
+            "verified_entry": False, "trailing_sl": None, "phase": 1,
+            "locked_sl": None, "live_signal": None, "live_ew_info": {},
+            "log": deque(maxlen=300),
+        })
+        threading.Thread(target=live_thread, daemon=True).start()
+        st.rerun()
+
+    if stop_clicked:
+        ts_set("running", False)
+        ts_set("live_position", None)
+        st.rerun()
+
+    if sq_clicked:
+        ts_set("squareoff_requested", True)
+        st.toast("Squareoff requested — will execute on next tick", icon="⬛")
+
+    # ── Error box ─────────────────────────────────────────────────────────────
     if err:
-        with st.expander("❌ Thread Error (click to expand)"):
-            st.code(err, language="python")
+        with st.expander("❌ Thread Error", expanded=True):
+            st.code(err[:2000], language="python")
         if st.button("Clear Error", key="btn_clear_err"):
             ts_set("error", None)
+            st.rerun()
 
     st.markdown("---")
 
-    # ── Live display: reads only from _TS, zero network calls ─────────────────
-    running = ts_get("running")
-    ltp   = ts_get("live_ltp")
-    pos   = ts_get("live_position")
-    dp    = ts_get("daily_pnl") or 0.0
-    sig   = ts_get("live_signal")
-    trail = ts_get("trailing_sl")
-    ph    = ts_get("phase") or 1
-    hb    = ts_get("thread_heartbeat") or "—"
-    cnc   = ts_get("candle_count") or 0
-    lbt   = ts_get("last_bar_time") or "—"
-    ew    = ts_get("live_ew_info") or {}
-    logs  = list(ts_get("log") or [])
-
-    # Status bar
-    dc  = "#3fb950" if dp >= 0 else "#f85149"
+    # ── Status bar ─────────────────────────────────────────────────────────────
     dot = "<span class='live-dot'></span>" if running else "<span class='idle-dot'></span>"
     lbl = "LIVE" if running else "IDLE"
+    dc  = "#3fb950" if dp >= 0 else "#f85149"
     st.markdown(
-        f"<div class='status-bar'>{dot}<b>{lbl}</b>"
-        f"<span style='color:#8b949e'>Heartbeat:</span> <code>{str(hb)[:19]}</code>"
-        f"<span style='color:#8b949e'>Candles:</span> <b>{cnc}</b>"
-        f"<span style='color:#8b949e'>Last bar:</span> <code>{str(lbt)[:16]}</code>"
-        f"<span style='color:#8b949e'>Daily PnL:</span> <b style='color:{dc}'>{dp:+.4f}</b>"
+        f"<div class='status-bar'>"
+        f"{dot}<b>{lbl}</b>"
+        f"&nbsp;&nbsp;<span style='color:#8b949e'>Heartbeat:</span> <code>{str(hb)[:19]}</code>"
+        f"&nbsp;&nbsp;<span style='color:#8b949e'>Candles:</span> <b>{cnc}</b>"
+        f"&nbsp;&nbsp;<span style='color:#8b949e'>Last bar:</span> <code>{str(lbt)[:16]}</code>"
+        f"&nbsp;&nbsp;<span style='color:#8b949e'>Daily PnL:</span>"
+        f"<b style='color:{dc}'> {dp:+.4f}</b>"
         f"</div>", unsafe_allow_html=True)
 
-    # Metrics
-    sig_lbl = "🟢 BUY" if sig==1 else "🔴 SELL" if sig==-1 else "—"
+    # ── Metrics row ────────────────────────────────────────────────────────────
+    sig_lbl = "🟢 BUY" if sig == 1 else ("🔴 SELL" if sig == -1 else "—")
     unreal  = pos.get("unrealized_pnl", 0.0) if pos else 0.0
-    m1,m2,m3,m4,m5,m6 = st.columns(6)
-    m1.metric("LTP",         f"{ltp:.4f}" if ltp else "—")
-    m2.metric("Daily PnL",   f"{dp:+.4f}")
-    m3.metric("Last Signal", sig_lbl)
-    m4.metric("Position",    "OPEN 🔵" if pos else "FLAT ⬜")
-    m5.metric("Trailing SL", f"{trail:.4f}" if trail else "—")
-    m6.metric("SL Phase",    str(ph))
 
+    m1,m2,m3,m4,m5,m6 = st.columns(6)
+    m1.metric("LTP",          f"{ltp:.4f}" if ltp else "—")
+    m2.metric("Daily PnL",    f"{dp:+.4f}")
+    m3.metric("Signal",       sig_lbl)
+    m4.metric("Position",     "OPEN 🔵" if pos else "FLAT ⬜")
+    m5.metric("Trailing SL",  f"{trail:.4f}" if trail else "—")
+    m6.metric("SL Phase",     str(phase))
+
+    # ── Open position ─────────────────────────────────────────────────────────
     if pos:
-        st.markdown("**Open Position**")
+        st.markdown("**── Open Position ──**")
         p1,p2,p3,p4,p5,p6 = st.columns(6)
-        p1.metric("Side",   "BUY" if pos.get("side")==1 else "SELL")
-        p2.metric("Entry",  f"{pos.get('entry',0):.4f}")
-        p3.metric("SL",     f"{pos.get('sl',0):.4f}")
-        p4.metric("Target", f"{pos.get('target',0):.4f}")
-        p5.metric("Eff SL", f"{pos.get('eff_sl',0):.4f}")
-        p6.metric("Unreal.", f"{unreal:+.4f}")
+        p1.metric("Side",        "BUY 🟢" if pos.get("side")==1 else "SELL 🔴")
+        p2.metric("Entry",       f"{pos.get('entry',0):.4f}")
+        p3.metric("SL",          f"{pos.get('sl',0):.4f}")
+        p4.metric("Target",      f"{pos.get('target',0):.4f}")
+        p5.metric("Eff SL",      f"{pos.get('eff_sl',0):.4f}")
+        p6.metric("Unrealised",  f"{unreal:+.4f}")
         if pos.get("pattern"):
             st.markdown(f"<div class='card' style='padding:8px 14px'>🌊 EW Pattern: <b>{pos['pattern']}</b></div>", unsafe_allow_html=True)
 
-    # Live chart
+    # ── Live chart ─────────────────────────────────────────────────────────────
     _df = ts_get("live_df")
     if _df is not None and not _df.empty:
         df2 = _df.copy()
         df2["EMA_fast"] = ema(df2["Close"], cfg["fast"])
         df2["EMA_slow"] = ema(df2["Close"], cfg["slow"])
         df2["ATR"]      = calc_atr(df2, cfg["atr_period"])
-        st.plotly_chart(candle_chart(df2, ew_info=ew,
-            title=f"{cfg['symbol']} (Live {cfg['interval']})"),
+        st.plotly_chart(
+            candle_chart(df2, ew_info=ew, title=f"{cfg['symbol']}  (Live  {cfg['interval']})"),
             use_container_width=True, key="live_candle_chart")
         if ew.get("fib") and ew.get("pattern"):
             ltp2 = float(df2["Close"].iloc[-1])
-            st.markdown(f"<b>🌊 {ew.get('pattern','')} </b> Confidence: <b>{ew.get('confidence',0)}%</b>", unsafe_allow_html=True)
-            def _fib_row(r, lvl):
+            st.markdown(f"🌊 <b>{ew.get('pattern')}</b>  Confidence: <b>{ew.get('confidence',0)}%</b>", unsafe_allow_html=True)
+            def _fr(r, lvl):
                 c = "#3fb950" if lvl < ltp2 else "#f85149"
-                d = "Below" if lvl < ltp2 else "Above"
+                d = "Below LTP" if lvl < ltp2 else "Above LTP"
                 return "<tr><td>"+str(r)+"</td><td>"+f"{lvl:.4f}"+"</td><td style='color:"+c+"'>"+d+"</td></tr>"
-            rows = "".join(_fib_row(r,lvl) for r,lvl in sorted(ew["fib"].items()))
-            st.markdown(f"<table style='font-size:.8rem'><tr><th>Fib</th><th>Level</th><th>vs LTP</th></tr>{rows}</table>", unsafe_allow_html=True)
+            rows = "".join(_fr(r, lvl) for r, lvl in sorted(ew["fib"].items()))
+            st.markdown("<table style='font-size:.8rem'><tr><th>Fib</th><th>Level</th><th>vs LTP</th></tr>"+rows+"</table>", unsafe_allow_html=True)
     else:
-        st.info("⏳ Waiting for first data fetch…")
+        if running:
+            st.info("⏳ Fetching first data…")
 
-    # Live trade table
-    trades = list(ts_get("live_trades") or [])
-    if trades:
+    # ── Live trades table ──────────────────────────────────────────────────────
+    live_trades = list(ts_get("live_trades") or [])
+    if live_trades:
         merge_all()
-        an = build_analysis(trades)
+        an = build_analysis(live_trades)
         if an:
-            st.markdown("**Live Session Trades**")
-            lc1,lc2,lc3,lc4 = st.columns(4)
-            lc1.metric("Session PnL", f"{an['total_pnl']:.4f}")
-            lc2.metric("Win Rate",    f"{an['win_rate']:.1f}%")
-            lc3.metric("Trades",      an["total_trades"])
+            st.markdown("**── Session Trades ──**")
+            t1,t2,t3,t4 = st.columns(4)
+            t1.metric("Session PnL",  f"{an['total_pnl']:.4f}")
+            t2.metric("Win Rate",     f"{an['win_rate']:.1f}%")
+            t3.metric("Trades",       an["total_trades"])
             pfs = f"{an['profit_factor']:.2f}" if np.isfinite(an["profit_factor"]) else "∞"
-            lc4.metric("PF", pfs)
-            df_t  = pd.DataFrame(trades)
+            t4.metric("Profit Factor", pfs)
+            df_t  = pd.DataFrame(live_trades)
             cols_ = ["entry_time","exit_time","side","entry","exit","sl","target","pnl","exit_reason","atr","pattern"]
             avail = [c for c in cols_ if c in df_t.columns]
             st.dataframe(df_t[avail].style.map(_ps, subset=["pnl"]),
                          use_container_width=True, height=300)
 
-    # Activity log
+    # ── Activity log ──────────────────────────────────────────────────────────
     if logs:
-        with st.expander("📜 Activity Log", expanded=True):
-            def _log_color(l):
-                if any(x in l for x in ["BUY","SELL","Target","verified","started"]): return "#3fb950"
-                if any(x in l for x in ["Exception","failed","Error"]): return "#f85149"
+        with st.expander("📜 Activity Log", expanded=running):
+            def _lc(l):
+                if any(x in l for x in ["BUY","SELL","Target","Running","started"]): return "#3fb950"
+                if any(x in l for x in ["ERROR","failed","SL hit"]): return "#f85149"
                 return "#8b949e"
-            html = "".join("<div style='font-size:.81em;padding:2px 0;color:"+_log_color(l)+"'>"+l+"</div>" for l in logs[:100])
+            html = "".join(
+                "<div style='font-size:.80em;font-family:monospace;padding:1px 0;color:"+_lc(l)+"'>"+l+"</div>"
+                for l in logs[:120])
             st.markdown(html, unsafe_allow_html=True)
 
-    # ── Simple 1.5-second auto-refresh when live ──────────────────────────────
+    # ── 1.5 s auto-refresh — only when running ─────────────────────────────────
     if ts_get("running"):
         time.sleep(1.5)
         st.rerun()
