@@ -867,7 +867,7 @@ def tab_backtest(cfg):
 
 def _render_bt(result,cfg):
     trades=result["trades"]; an=build_analysis(trades)
-    st.plotly_chart(candle_chart(result["df"],result["signals"],trades,title=cfg.get("symbol","")),use_container_width=True)
+    st.plotly_chart(candle_chart(result["df"],result["signals"],trades,title=cfg.get("symbol","",key="pc_1")),use_container_width=True)
     if not trades: st.warning("No trades generated — adjust strategy params or filters."); return
     if result.get("violations"):
         with st.expander(f"⚠ {len(result['violations'])} violation(s)"):
@@ -883,25 +883,25 @@ def _render_bt(result,cfg):
     c9.metric("Median Win",f"{an['median_win']:.4f}"); c10.metric("Median Loss",f"{an['median_loss']:.4f}")
     rsl=an["rec_sl_pts"]; rtgt=an["rec_tgt_pts"]; impl=f"1:{round(rtgt/rsl,2)}" if rsl>0 else "—"
     st.markdown(f"<div class='rec-card'>📌 <b>Data-driven Recommendations</b>  Suggested SL: <b>{rsl:.4f} pts</b> &nbsp;|&nbsp; Target: <b>{rtgt:.4f} pts</b> &nbsp;|&nbsp; R:R: <b>{impl}</b></div>",unsafe_allow_html=True)
-    st.plotly_chart(eq_chart(an["equity_arr"],an["dd_arr"]),use_container_width=True)
+    st.plotly_chart(eq_chart(an["equity_arr"],an["dd_arr"],key="pc_2"),use_container_width=True)
     ca,cb=st.columns(2)
-    with ca: st.plotly_chart(heatmap_chart(an["df"]),use_container_width=True)
-    with cb: st.plotly_chart(ls_chart(an["df"]),use_container_width=True)
+    with ca: st.plotly_chart(heatmap_chart(an["df"],key="pc_3"),use_container_width=True)
+    with cb: st.plotly_chart(ls_chart(an["df"],key="pc_4"),use_container_width=True)
     cc,cd=st.columns(2)
-    with cc: st.plotly_chart(ang_scatter(result["df"],cfg.get("fast",9),cfg.get("slow",21)),use_container_width=True)
-    with cd: st.plotly_chart(ew_chart(trades),use_container_width=True)
+    with cc: st.plotly_chart(ang_scatter(result["df"],cfg.get("fast",9,key="pc_5"),cfg.get("slow",21)),use_container_width=True)
+    with cd: st.plotly_chart(ew_chart(trades,key="pc_6"),use_container_width=True)
     ce,cf=st.columns(2)
-    with ce: st.plotly_chart(reason_chart(an["reason_grp"]),use_container_width=True)
-    with cf: st.plotly_chart(dur_chart(an["df"]),use_container_width=True)
-    if len(an["daily_pnl"])>1: st.plotly_chart(daily_chart(an["daily_pnl"]),use_container_width=True)
+    with ce: st.plotly_chart(reason_chart(an["reason_grp"],key="pc_7"),use_container_width=True)
+    with cf: st.plotly_chart(dur_chart(an["df"],key="pc_8"),use_container_width=True)
+    if len(an["daily_pnl"])>1: st.plotly_chart(daily_chart(an["daily_pnl"],key="pc_9"),use_container_width=True)
     with st.expander("📐 Angle & Delta Distribution"):
         fe=ema(result["df"]["Close"],cfg.get("fast",9)); se_=ema(result["df"]["Close"],cfg.get("slow",21))
         ang=angle_series(fe,se_).dropna(); dlt=((fe-se_)/se_.replace(0,np.nan)*100).dropna()
         xa,xb=st.columns(2)
         with xa:
-            fa=go.Figure(go.Histogram(x=ang,nbinsx=40,marker_color="#58a6ff",opacity=0.8)); fa.update_layout(title="Angle Dist °",height=260,**_CL); st.plotly_chart(fa,use_container_width=True)
+            fa=go.Figure(go.Histogram(x=ang,nbinsx=40,marker_color="#58a6ff",opacity=0.8)); fa.update_layout(title="Angle Dist °",height=260,**_CL); st.plotly_chart(fa,use_container_width=True,key="pc_10")
         with xb:
-            fd=go.Figure(go.Histogram(x=dlt,nbinsx=40,marker_color="#d29922",opacity=0.8)); fd.update_layout(title="Delta Dist %",height=260,**_CL); st.plotly_chart(fd,use_container_width=True)
+            fd=go.Figure(go.Histogram(x=dlt,nbinsx=40,marker_color="#d29922",opacity=0.8)); fd.update_layout(title="Delta Dist %",height=260,**_CL); st.plotly_chart(fd,use_container_width=True,key="pc_11")
     st.markdown("---"); st.markdown("**📋 Trade Log**")
     cols=["entry_time","exit_time","side","entry","exit","sl","target","pnl","exit_reason","duration_m","atr","pattern"]
     df_s=pd.DataFrame(trades); avail=[c for c in cols if c in df_s.columns]
@@ -911,99 +911,145 @@ def _render_bt(result,cfg):
 # ── Tab 2: Live Trading ────────────────────────────────────────────────────────
 def tab_live(cfg):
     st.markdown("<h2 style='font-family:Syne'>⚡ Live Trading</h2>",unsafe_allow_html=True)
-    running=ts_get("running"); err=ts_get("error")
-    hb=ts_get("thread_heartbeat") or "—"; cnc=ts_get("candle_count") or 0
-    lbt=ts_get("last_bar_time") or "—"; dpnl=ts_get("daily_pnl") or 0.0
-    dc="#3fb950" if dpnl>=0 else "#f85149"
-    dot="<span class='live-dot'></span>" if running else "<span class='idle-dot'></span>"
-    lbl="LIVE" if running else "IDLE"
-    st.markdown(f"<div class='status-bar'>{dot}<b>{lbl}</b><span style='color:#8b949e'>Heartbeat:</span> <code>{str(hb)[:19]}</code><span style='color:#8b949e'>Candles:</span> <b>{cnc}</b><span style='color:#8b949e'>Last bar:</span> <code>{str(lbt)[:16]}</code><span style='color:#8b949e'>Daily PnL:</span> <b style='color:{dc}'>{dpnl:+.4f}</b></div>",unsafe_allow_html=True)
-    if err:
-        with st.expander("❌ Last Error"): st.code(err,language="python")
-    cc1,cc2,cc3,cc4=st.columns(4)
-    with cc1:
+
+    # ── Controls (always rendered first, never inside rerun loop) ──────────────
+    running = ts_get("running")
+    ctrl1, ctrl2, ctrl3, ctrl4 = st.columns(4)
+    with ctrl1:
         if not running:
-            if st.button("▶ Start Live",use_container_width=True):
+            if st.button("▶ Start Live", use_container_width=True, key="btn_start"):
                 ts_update({"running":True,"config":cfg,"error":None,"live_position":None,
                            "live_ltp":None,"live_df":None,"live_trades":[],"live_pnl":0.0,
                            "daily_pnl":0.0,"candle_count":0,"squareoff_requested":False,
                            "verified_entry":False,"trailing_sl":None,"phase":1,"locked_sl":None,
                            "live_signal":None,"live_ew_info":{},"log":deque(maxlen=300)})
-                threading.Thread(target=live_thread,daemon=True).start(); st.rerun()
+                threading.Thread(target=live_thread, daemon=True).start()
+                st.rerun()
         else:
-            if st.button("⏹ Stop",use_container_width=True): ts_set("running",False); st.rerun()
-    with cc2:
+            if st.button("⏹ Stop", use_container_width=True, key="btn_stop"):
+                ts_set("running", False)
+                st.rerun()
+    with ctrl2:
         if running and ts_get("live_position"):
-            if st.button("⬛ Squareoff Now",use_container_width=True): ts_set("squareoff_requested",True); st.success("Squareoff requested…")
-    with cc3: st.info(f"Strategy: **{cfg['strategy']}**")
-    with cc4: st.info(f"**{cfg['symbol']}** {cfg['interval']} {cfg['period']}")
+            if st.button("⬛ Squareoff Now", use_container_width=True, key="btn_sq"):
+                ts_set("squareoff_requested", True)
+    with ctrl3:
+        st.info(f"Strategy: **{cfg['strategy']}**")
+    with ctrl4:
+        st.info(f"**{cfg['symbol']}** {cfg['interval']} {cfg['period']}")
+
+    err = ts_get("error")
+    if err:
+        with st.expander("❌ Last Error"):
+            st.code(err, language="python")
+
     st.markdown("---")
 
-    @st.fragment(run_every=3)
-    def _metrics():
-        ltp=ts_get("live_ltp"); pos=ts_get("live_position"); dp=ts_get("daily_pnl") or 0.0
-        sig=ts_get("live_signal"); trail=ts_get("trailing_sl"); ph=ts_get("phase") or 1
-        unreal=pos.get("unrealized_pnl",0.0) if pos else 0.0
-        sl="🟢 BUY" if sig==1 else "🔴 SELL" if sig==-1 else "—"
-        m1,m2,m3,m4,m5,m6=st.columns(6)
-        m1.metric("LTP",f"{ltp:.4f}" if ltp else "—"); m2.metric("Daily PnL",f"{dp:+.4f}")
-        m3.metric("Last Signal",sl); m4.metric("Position","OPEN 🔵" if pos else "FLAT ⬜")
-        m5.metric("Trailing SL",f"{trail:.4f}" if trail else "—"); m6.metric("SL Phase",str(ph))
-        if pos:
-            st.markdown("**Open Position**")
-            p1,p2,p3,p4,p5,p6=st.columns(6)
-            p1.metric("Side","BUY" if pos.get("side")==1 else "SELL")
-            p2.metric("Entry",f"{pos.get('entry',0):.4f}"); p3.metric("SL",f"{pos.get('sl',0):.4f}")
-            p4.metric("Target",f"{pos.get('target',0):.4f}"); p5.metric("Eff SL",f"{pos.get('eff_sl',0):.4f}")
-            p6.metric("Unreal.",f"{unreal:+.4f}")
-            if pos.get("pattern"): st.markdown(f"<div class='card' style='padding:8px 14px'>🌊 EW Pattern: <b>{pos['pattern']}</b></div>",unsafe_allow_html=True)
-    _metrics()
+    # ── Live display: reads only from _TS, zero network calls ─────────────────
+    running = ts_get("running")  # re-read after potential rerun
+    ltp   = ts_get("live_ltp")
+    pos   = ts_get("live_position")
+    dp    = ts_get("daily_pnl") or 0.0
+    sig   = ts_get("live_signal")
+    trail = ts_get("trailing_sl")
+    ph    = ts_get("phase") or 1
+    hb    = ts_get("thread_heartbeat") or "—"
+    cnc   = ts_get("candle_count") or 0
+    lbt   = ts_get("last_bar_time") or "—"
+    ew    = ts_get("live_ew_info") or {}
+    logs  = list(ts_get("log") or [])
 
-    @st.fragment(run_every=10)
-    def _chart():
-        _df=ts_get("live_df"); ew=ts_get("live_ew_info") or {}
-        if _df is not None and not _df.empty:
-            df2=_df.copy(); df2["EMA_fast"]=ema(df2["Close"],cfg["fast"]); df2["EMA_slow"]=ema(df2["Close"],cfg["slow"]); df2["ATR"]=calc_atr(df2,cfg["atr_period"])
-            st.plotly_chart(candle_chart(df2,ew_info=ew,title=f"{cfg['symbol']} (Live {cfg['interval']})"),use_container_width=True)
-            if ew.get("fib") and ew.get("pattern"):
-                ltp2=float(df2["Close"].iloc[-1])
-                st.markdown(f"<b>🌊 {ew.get('pattern','')} </b> Confidence: <b>{ew.get('confidence',0)}%</b>",unsafe_allow_html=True)
-                def _fib_row(r,lvl):
-                    c="#3fb950" if lvl<ltp2 else "#f85149"
-                    d="Below" if lvl<ltp2 else "Above"
-                    return "<tr><td>"+str(r)+"</td><td>"+f"{lvl:.4f}"+"</td><td style='color:"+c+"'>"+d+"</td></tr>"
-                rows="".join(_fib_row(r,lvl) for r,lvl in sorted(ew["fib"].items()))
-                st.markdown(f"<table style='font-size:.8rem'><tr><th>Fib</th><th>Level</th><th>vs LTP</th></tr>{rows}</table>",unsafe_allow_html=True)
-        else: st.info("⏳ Waiting for first data fetch…")
-    _chart()
+    # Status bar
+    dc  = "#3fb950" if dp >= 0 else "#f85149"
+    dot = "<span class='live-dot'></span>" if running else "<span class='idle-dot'></span>"
+    lbl = "LIVE" if running else "IDLE"
+    st.markdown(
+        f"<div class='status-bar'>{dot}<b>{lbl}</b>"
+        f"<span style='color:#8b949e'>Heartbeat:</span> <code>{str(hb)[:19]}</code>"
+        f"<span style='color:#8b949e'>Candles:</span> <b>{cnc}</b>"
+        f"<span style='color:#8b949e'>Last bar:</span> <code>{str(lbt)[:16]}</code>"
+        f"<span style='color:#8b949e'>Daily PnL:</span> <b style='color:{dc}'>{dp:+.4f}</b>"
+        f"</div>", unsafe_allow_html=True)
 
-    @st.fragment(run_every=5)
-    def _log():
-        logs=list(ts_get("log") or [])
-        if logs:
-            with st.expander("📜 Activity Log",expanded=True):
-                def _log_color(l):
-                    if any(x in l for x in ["BUY","SELL","Target","verified","started"]): return "#3fb950"
-                    if any(x in l for x in ["Exception","failed","Error"]): return "#f85149"
-                    return "#8b949e"
-                html="".join("<div style='font-size:.81em;padding:2px 0;color:"+_log_color(l)+"'>"+l+"</div>" for l in logs[:100])
-                st.markdown(html,unsafe_allow_html=True)
-    _log()
+    # Metrics
+    sig_lbl = "🟢 BUY" if sig==1 else "🔴 SELL" if sig==-1 else "—"
+    unreal  = pos.get("unrealized_pnl", 0.0) if pos else 0.0
+    m1,m2,m3,m4,m5,m6 = st.columns(6)
+    m1.metric("LTP",         f"{ltp:.4f}" if ltp else "—")
+    m2.metric("Daily PnL",   f"{dp:+.4f}")
+    m3.metric("Last Signal", sig_lbl)
+    m4.metric("Position",    "OPEN 🔵" if pos else "FLAT ⬜")
+    m5.metric("Trailing SL", f"{trail:.4f}" if trail else "—")
+    m6.metric("SL Phase",    str(ph))
 
-    @st.fragment(run_every=15)
-    def _live_tbl():
-        trades=list(ts_get("live_trades") or [])
-        if not trades: return
-        merge_all(); an=build_analysis(trades)
-        if not an: return
-        st.markdown("**Live Session Trades**")
-        lc1,lc2,lc3,lc4=st.columns(4)
-        lc1.metric("Session PnL",f"{an['total_pnl']:.4f}"); lc2.metric("Win Rate",f"{an['win_rate']:.1f}%")
-        lc3.metric("Trades",an["total_trades"]); pfs=f"{an['profit_factor']:.2f}" if np.isfinite(an["profit_factor"]) else "∞"; lc4.metric("PF",pfs)
-        df_t=pd.DataFrame(trades); cols_=["entry_time","exit_time","side","entry","exit","sl","target","pnl","exit_reason","atr","pattern"]
-        avail=[c for c in cols_ if c in df_t.columns]
-        st.dataframe(df_t[avail].style.map(_ps,subset=["pnl"]),use_container_width=True,height=300)
-    _live_tbl()
+    if pos:
+        st.markdown("**Open Position**")
+        p1,p2,p3,p4,p5,p6 = st.columns(6)
+        p1.metric("Side",   "BUY" if pos.get("side")==1 else "SELL")
+        p2.metric("Entry",  f"{pos.get('entry',0):.4f}")
+        p3.metric("SL",     f"{pos.get('sl',0):.4f}")
+        p4.metric("Target", f"{pos.get('target',0):.4f}")
+        p5.metric("Eff SL", f"{pos.get('eff_sl',0):.4f}")
+        p6.metric("Unreal.", f"{unreal:+.4f}")
+        if pos.get("pattern"):
+            st.markdown(f"<div class='card' style='padding:8px 14px'>🌊 EW Pattern: <b>{pos['pattern']}</b></div>", unsafe_allow_html=True)
+
+    # Live chart
+    _df = ts_get("live_df")
+    if _df is not None and not _df.empty:
+        df2 = _df.copy()
+        df2["EMA_fast"] = ema(df2["Close"], cfg["fast"])
+        df2["EMA_slow"] = ema(df2["Close"], cfg["slow"])
+        df2["ATR"]      = calc_atr(df2, cfg["atr_period"])
+        st.plotly_chart(candle_chart(df2, ew_info=ew,
+            title=f"{cfg['symbol']} (Live {cfg['interval']})"),
+            use_container_width=True, key="live_candle_chart")
+        if ew.get("fib") and ew.get("pattern"):
+            ltp2 = float(df2["Close"].iloc[-1])
+            st.markdown(f"<b>🌊 {ew.get('pattern','')} </b> Confidence: <b>{ew.get('confidence',0)}%</b>", unsafe_allow_html=True)
+            def _fib_row(r, lvl):
+                c = "#3fb950" if lvl < ltp2 else "#f85149"
+                d = "Below" if lvl < ltp2 else "Above"
+                return "<tr><td>"+str(r)+"</td><td>"+f"{lvl:.4f}"+"</td><td style='color:"+c+"'>"+d+"</td></tr>"
+            rows = "".join(_fib_row(r,lvl) for r,lvl in sorted(ew["fib"].items()))
+            st.markdown(f"<table style='font-size:.8rem'><tr><th>Fib</th><th>Level</th><th>vs LTP</th></tr>{rows}</table>", unsafe_allow_html=True)
+    else:
+        st.info("⏳ Waiting for first data fetch…")
+
+    # Live trade table
+    trades = list(ts_get("live_trades") or [])
+    if trades:
+        merge_all()
+        an = build_analysis(trades)
+        if an:
+            st.markdown("**Live Session Trades**")
+            lc1,lc2,lc3,lc4 = st.columns(4)
+            lc1.metric("Session PnL", f"{an['total_pnl']:.4f}")
+            lc2.metric("Win Rate",    f"{an['win_rate']:.1f}%")
+            lc3.metric("Trades",      an["total_trades"])
+            pfs = f"{an['profit_factor']:.2f}" if np.isfinite(an["profit_factor"]) else "∞"
+            lc4.metric("PF", pfs)
+            df_t  = pd.DataFrame(trades)
+            cols_ = ["entry_time","exit_time","side","entry","exit","sl","target","pnl","exit_reason","atr","pattern"]
+            avail = [c for c in cols_ if c in df_t.columns]
+            st.dataframe(df_t[avail].style.map(_ps, subset=["pnl"]),
+                         use_container_width=True, height=300)
+
+    # Activity log
+    if logs:
+        with st.expander("📜 Activity Log", expanded=True):
+            def _log_color(l):
+                if any(x in l for x in ["BUY","SELL","Target","verified","started"]): return "#3fb950"
+                if any(x in l for x in ["Exception","failed","Error"]): return "#f85149"
+                return "#8b949e"
+            html = "".join("<div style='font-size:.81em;padding:2px 0;color:"+_log_color(l)+"'>"+l+"</div>" for l in logs[:100])
+            st.markdown(html, unsafe_allow_html=True)
+
+    # ── Simple 1.5-second auto-refresh when live ──────────────────────────────
+    if running:
+        time.sleep(1.5)
+        st.rerun()
+
 
 # ── Tab 3: Trade History ───────────────────────────────────────────────────────
 def tab_history():
@@ -1041,16 +1087,16 @@ def tab_history():
     st.dataframe(ds[av].style.map(_ps,subset=["pnl"]),use_container_width=True,height=440)
     st.download_button("⬇ Export CSV",ds[av].to_csv(index=False),"trade_history.csv","text/csv")
     st.markdown("---")
-    if len(an["equity_arr"])>1: st.plotly_chart(eq_chart(an["equity_arr"],an["dd_arr"]),use_container_width=True)
+    if len(an["equity_arr"])>1: st.plotly_chart(eq_chart(an["equity_arr"],an["dd_arr"],key="pc_13"),use_container_width=True)
     if len(trades)>=3:
         ca,cb=st.columns(2)
-        with ca: st.plotly_chart(heatmap_chart(df),use_container_width=True)
-        with cb: st.plotly_chart(ls_chart(df),use_container_width=True)
+        with ca: st.plotly_chart(heatmap_chart(df,key="pc_14"),use_container_width=True)
+        with cb: st.plotly_chart(ls_chart(df,key="pc_15"),use_container_width=True)
         cc,cd=st.columns(2)
-        with cc: st.plotly_chart(reason_chart(an["reason_grp"]),use_container_width=True)
-        with cd: st.plotly_chart(ew_chart(trades),use_container_width=True)
-        if len(an["daily_pnl"])>1: st.plotly_chart(daily_chart(an["daily_pnl"]),use_container_width=True)
-        st.plotly_chart(dur_chart(df),use_container_width=True)
+        with cc: st.plotly_chart(reason_chart(an["reason_grp"],key="pc_16"),use_container_width=True)
+        with cd: st.plotly_chart(ew_chart(trades,key="pc_17"),use_container_width=True)
+        if len(an["daily_pnl"])>1: st.plotly_chart(daily_chart(an["daily_pnl"],key="pc_18"),use_container_width=True)
+        st.plotly_chart(dur_chart(df,key="pc_19"),use_container_width=True)
 
 # ── Tab 4: Optimization ────────────────────────────────────────────────────────
 def tab_optimization(cfg):
@@ -1094,20 +1140,20 @@ def tab_optimization(cfg):
     try:
         pv=dr.pivot_table(values="pnl",index="slow",columns="fast",aggfunc="mean",fill_value=0)
         fh=go.Figure(go.Heatmap(z=pv.values,x=[str(c) for c in pv.columns],y=[str(r) for r in pv.index],zmid=0,colorscale=[[0,"#f85149"],[0.5,"#161b22"],[1,"#3fb950"]],text=np.round(pv.values,1),texttemplate="%{text}",colorbar=dict(tickfont=dict(color="#e6edf3"))))
-        fh.update_layout(title="PnL Heatmap (Fast × Slow EMA)",xaxis_title="Fast EMA",yaxis_title="Slow EMA",height=440,**_CL); st.plotly_chart(fh,use_container_width=True)
+        fh.update_layout(title="PnL Heatmap (Fast × Slow EMA)",xaxis_title="Fast EMA",yaxis_title="Slow EMA",height=440,**_CL); st.plotly_chart(fh,use_container_width=True,key="pc_20")
     except: pass
     try:
         wr=dr.pivot_table(values="win_rate",index="slow",columns="fast",aggfunc="mean",fill_value=0)
         fw=go.Figure(go.Heatmap(z=wr.values,x=[str(c) for c in wr.columns],y=[str(r) for r in wr.index],colorscale="RdYlGn",text=np.round(wr.values,1),texttemplate="%{text}%",colorbar=dict(tickfont=dict(color="#e6edf3"))))
-        fw.update_layout(title="Win-Rate Heatmap",xaxis_title="Fast EMA",yaxis_title="Slow EMA",height=380,**_CL); st.plotly_chart(fw,use_container_width=True)
+        fw.update_layout(title="Win-Rate Heatmap",xaxis_title="Fast EMA",yaxis_title="Slow EMA",height=380,**_CL); st.plotly_chart(fw,use_container_width=True,key="pc_21")
     except: pass
     try:
         fp=go.Figure(go.Scatter(x=dr["max_dd"],y=dr["pnl"],mode="markers+text",text=[f"{int(r.fast)}/{int(r.slow)}" for _,r in dr.iterrows()],textposition="top center",marker=dict(color=dr["win_rate"],colorscale="RdYlGn",size=8,opacity=0.8,colorbar=dict(title="Win%",tickfont=dict(color="#e6edf3")))))
-        fp.update_layout(title="Pareto — PnL vs Max Drawdown (colour=Win%)",xaxis_title="Max Drawdown",yaxis_title="Total PnL",height=380,**_CL); st.plotly_chart(fp,use_container_width=True)
+        fp.update_layout(title="Pareto — PnL vs Max Drawdown (colour=Win%)",xaxis_title="Max Drawdown",yaxis_title="Total PnL",height=380,**_CL); st.plotly_chart(fp,use_container_width=True,key="pc_22")
     except: pass
     try:
         ftc=go.Figure(go.Histogram(x=dr["trades"],nbinsx=20,marker_color="#58a6ff",opacity=0.8))
-        ftc.update_layout(title="Trade Count Distribution",xaxis_title="# Trades",height=260,**_CL); st.plotly_chart(ftc,use_container_width=True)
+        ftc.update_layout(title="Trade Count Distribution",xaxis_title="# Trades",height=260,**_CL); st.plotly_chart(ftc,use_container_width=True,key="pc_23")
     except: pass
     st.markdown("**Top 20 Combinations**")
     st.dataframe(dr.head(20).style.format({"pnl":".4f","win_rate":".1f","profit_factor":".2f","max_dd":".4f","med_win":".4f","med_loss":".4f"}),use_container_width=True)
