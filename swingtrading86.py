@@ -1,1734 +1,1108 @@
-"""Smart Investing v4.1 - Professional Algorithmic Trading Platform"""
-import streamlit as st, yfinance as yf, pandas as pd, numpy as np
-import plotly.graph_objects as go, threading, time, datetime, requests
-import warnings, re, urllib.parse, math
+#!/usr/bin/env python3
+"""
+Smart Investing — Production-Grade Algorithmic Trading Platform
+Single-file Streamlit app | All timestamps IST | v3.1.0
+Run: streamlit run smart_investing.py --server.address 0.0.0.0
+"""
+
+import streamlit as st
+import pandas as pd
+import numpy as np
+import threading, time, requests, traceback
+from collections import deque
+from datetime import datetime
+from zoneinfo import ZoneInfo
+import plotly.graph_objects as go
 from plotly.subplots import make_subplots
+from scipy.signal import argrelextrema
+
 try:
-    import zoneinfo
+    import yfinance as yf
+    HAS_YF = True
 except ImportError:
-    from backports import zoneinfo
-warnings.filterwarnings("ignore")
-pd.options.mode.chained_assignment = None
+    HAS_YF = False
 
-_IST = zoneinfo.ZoneInfo("Asia/Kolkata")
-def now_ist(): return datetime.datetime.now(_IST).strftime("%H:%M:%S IST")
-def now_ist_full(): return datetime.datetime.now(_IST).strftime("%d-%b-%Y %H:%M:%S IST")
-def ts_to_ist(ts):
-    try:
-        t = pd.Timestamp(ts)
-        if t.tzinfo is None: t = t.tz_localize("UTC")
-        return t.tz_convert(_IST).strftime("%d-%b-%Y %H:%M IST")
-    except: return str(ts)
+IST = ZoneInfo("Asia/Kolkata")
+APP_VERSION = "3.1.0"
 
-_LOCK = threading.Lock()
-_TS: dict = {}
-def _get(k, d=None):
-    with _LOCK: return _TS.get(k, d)
-def _set(k, v):
-    with _LOCK: _TS[k] = v
-def _append(k, v):
-    with _LOCK:
-        if k not in _TS: _TS[k] = []
-        _TS[k].append(v)
-def _clear_live():
-    with _LOCK:
-        for k in ["live_ltp","last_candle","live_data","live_log","current_position",
-                  "current_pnl","trade_history","day_pnl","ew_state","first_fetch","thread_alive"]:
-            _TS[k] = [] if k in ("live_log","trade_history") else (0.0 if k in ("day_pnl","current_pnl") else None)
-        _TS["first_fetch"] = False
-
-_YF_SESS = requests.Session()
-_YF_SESS.headers.update({"User-Agent":"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"})
-_LAST_HTTP = [0.0]
-def _http_wait(g=1.6):
-    d = time.time()-_LAST_HTTP[0]
-    if d < g: time.sleep(g-d)
-    _LAST_HTTP[0] = time.time()
-
-TICKERS = {"Nifty 50":"^NSEI","BankNifty":"^NSEBANK","Sensex":"^BSESN",
-           "BTC/USD":"BTC-USD","ETH/USD":"ETH-USD","Gold":"GC=F","Silver":"SI=F","Custom":"__CUSTOM__"}
-TFP = {"1m":["1d","5d","7d"],"5m":["1d","5d","7d","1mo"],"15m":["1d","5d","7d","1mo"],
-       "1h":["1d","5d","7d","1mo","3mo","6mo","1y","2y"],
-       "1d":["5d","7d","1mo","3mo","6mo","1y","2y","5y","10y","20y"],
-       "1wk":["1d","5d","7d","1mo","3mo","6mo","1y","2y","5y","10y","20y"]}
-WARMUP = {"1m":"7d","5m":"1mo","15m":"1mo","1h":"6mo","1d":"5y","1wk":"10y"}
 STRATEGIES = ["EMA Crossover","Anticipatory EMA","Elliott Wave","Wave Extrema","Simple Buy","Simple Sell"]
-SL_TYPES   = ["Custom Points","ATR Based","Risk Reward Based","Trailing SL","Auto SL",
-               "EMA Reverse Crossover","Swing Low/High","Candle Low/High",
-               "Support/Resistance","Volatility Based","Cost-to-Cost + N Points Trailing SL"]
-TGT_TYPES  = ["Custom Points","ATR Based","Risk Reward Based","Trailing Target (Display Only)",
-               "Auto Target","EMA Reverse Crossover","Swing High/Low","Candle High/Low",
-               "Support/Resistance","Volatility Based"]
-CX_TYPES   = ["Simple Crossover","Custom Candle Size","ATR Based Candle Size"]
-DAYS_LIST  = ["Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday"]
 
-def init_ss():
-    if "initialized" not in st.session_state:
-        st.session_state.initialized = True
-        _clear_live()
-    for k,v in {"bt_results":None,"opt_results":None,"live_running":False,
-                "stop_event":None,"live_thread":None}.items():
-        if k not in st.session_state: st.session_state[k] = v
+SL_TYPES = [
+    "Custom Points","ATR","Risk:Reward","Trailing SL","Auto SL",
+    "EMA Reverse Crossover","Trailing Swing Low/High","Candle Low/High",
+    "Support/Resistance Trailing","Volatility Based","Cost-to-Cost + N Points",
+    "Strategy Reverse Signal","Trailing SL (3-Phase)",
+]
 
-def _mkt_filter(df, iv):
-    if iv in ("1d","1wk") or df is None or len(df)==0: return df
+TRAILING_SL_TYPES = {
+    "Trailing SL","Trailing SL (3-Phase)","Trailing Swing Low/High",
+    "Support/Resistance Trailing","Cost-to-Cost + N Points",
+}
+
+TIMEFRAMES = ["1m","5m","15m","30m","1h","1d"]
+PERIODS    = ["1d","5d","7d","1mo","3mo","6mo","1y"]
+FIB_RATIOS = [0.236,0.382,0.500,0.618,0.786,1.000,1.272,1.618,2.618]
+_REFRESH   = {"1m":15,"5m":30,"15m":60,"30m":120,"1h":300,"1d":600}
+
+NIFTY50 = [
+    "RELIANCE.NS","TCS.NS","HDFCBANK.NS","INFY.NS","ICICIBANK.NS","HINDUNILVR.NS",
+    "SBIN.NS","BHARTIARTL.NS","ITC.NS","KOTAKBANK.NS","LT.NS","AXISBANK.NS",
+    "ASIANPAINT.NS","MARUTI.NS","SUNPHARMA.NS","TITAN.NS","ULTRACEMCO.NS",
+    "BAJFINANCE.NS","WIPRO.NS","HCLTECH.NS","NTPC.NS","POWERGRID.NS","TATAMOTORS.NS",
+    "ONGC.NS","TATASTEEL.NS","M&M.NS","TECHM.NS","ADANIENT.NS","ADANIPORTS.NS",
+    "COALINDIA.NS","DIVISLAB.NS","DRREDDY.NS","EICHERMOT.NS","GRASIM.NS",
+    "HEROMOTOCO.NS","HINDALCO.NS","INDUSINDBK.NS","JSWSTEEL.NS","NESTLEIND.NS",
+    "SBILIFE.NS","SHREECEM.NS","TATACONSUM.NS","CIPLA.NS","APOLLOHOSP.NS",
+    "BAJAJFINSV.NS","BPCL.NS","BRITANNIA.NS","HDFCLIFE.NS","UPL.NS","KAYNES.NS",
+    "^NSEI","BTC-USD","ETH-USD",
+]
+
+# ── Page config ────────────────────────────────────────────────────────────────
+st.set_page_config(page_title="Smart Investing", page_icon="📈",
+                   layout="wide", initial_sidebar_state="expanded")
+
+# ── Dark Theme CSS ─────────────────────────────────────────────────────────────
+st.markdown("""
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Space+Mono:ital,wght@0,400;0,700;1,400&family=Syne:wght@400;600;700;800&display=swap');
+:root{--bg:#0d1117;--surf:#161b22;--surf2:#21262d;--border:#30363d;
+      --text:#e6edf3;--muted:#8b949e;--green:#3fb950;--red:#f85149;
+      --blue:#58a6ff;--yellow:#d29922;--purple:#bc8cff;}
+html,body,[class*="css"],.stApp,.main,.block-container{
+  background-color:var(--bg)!important;color:var(--text)!important;
+  font-family:'Space Mono',monospace!important;}
+h1,h2,h3,h4,h5,h6{font-family:'Syne',sans-serif!important;color:var(--text)!important;}
+div,span,p,label,li,td,th{color:var(--text)!important;}
+a{color:var(--blue)!important;}
+[data-testid="stSidebar"]{background-color:var(--surf)!important;border-right:1px solid var(--border)!important;}
+[data-testid="stSidebar"] *{color:var(--text)!important;}
+[data-testid="metric-container"]{background-color:var(--surf)!important;border:1px solid var(--border)!important;border-radius:8px!important;padding:14px 16px!important;}
+[data-testid="metric-container"] *,[data-testid="stMetricValue"]{color:var(--text)!important;}
+[data-testid="stMetricLabel"]{color:var(--muted)!important;font-size:.75rem!important;}
+input,select,textarea,[data-baseweb="input"],[data-baseweb="select"]{
+  background-color:var(--surf2)!important;border-color:var(--border)!important;color:var(--text)!important;}
+[data-testid="stNumberInput"] input,[data-testid="stTextInput"] input{color:var(--text)!important;}
+[data-testid="stSelectbox"] *,[data-testid="stMultiSelect"] *{color:var(--text)!important;background-color:var(--surf2)!important;}
+.stButton>button{background-color:var(--blue)!important;color:#0d1117!important;border:none!important;
+  border-radius:6px!important;font-family:'Space Mono',monospace!important;font-weight:700!important;}
+.stButton>button:hover{opacity:.82!important;}
+.stTabs [data-baseweb="tab-list"]{background-color:var(--surf)!important;border-bottom:1px solid var(--border)!important;}
+.stTabs [data-baseweb="tab"]{color:var(--muted)!important;font-family:'Syne',sans-serif!important;font-weight:600!important;padding:8px 20px!important;}
+.stTabs [aria-selected="true"]{color:var(--blue)!important;border-bottom:2px solid var(--blue)!important;background-color:var(--surf2)!important;}
+.stDataFrame,[data-testid="stDataFrame"]{background-color:var(--surf)!important;border:1px solid var(--border)!important;border-radius:8px!important;}
+[data-testid="stDataFrameResizable"] *{color:var(--text)!important;}
+.streamlit-expanderHeader{color:var(--text)!important;background-color:var(--surf2)!important;}
+.streamlit-expanderContent{background-color:var(--surf)!important;}
+[data-testid="stAlert"]{background-color:var(--surf2)!important;border-color:var(--border)!important;}
+.stMarkdown *{color:var(--text)!important;}
+hr{border-color:var(--border)!important;margin:12px 0!important;}
+@keyframes pulse{0%{box-shadow:0 0 0 0 rgba(63,185,80,.75);}70%{box-shadow:0 0 0 9px rgba(63,185,80,0);}100%{box-shadow:0 0 0 0 rgba(63,185,80,0);}}
+.live-dot{display:inline-block;width:10px;height:10px;background:#3fb950;border-radius:50%;animation:pulse 1.4s infinite;margin-right:7px;vertical-align:middle;}
+.idle-dot{display:inline-block;width:10px;height:10px;background:#8b949e;border-radius:50%;margin-right:7px;vertical-align:middle;}
+.card{background:var(--surf);border:1px solid var(--border);border-radius:8px;padding:16px 20px;margin-bottom:10px;}
+.rec-card{background:linear-gradient(135deg,#161b22,#21262d);border:1px solid #30363d;border-left:4px solid #58a6ff;border-radius:8px;padding:14px 18px;margin-bottom:10px;}
+.viol-card{background:#1a1010;border:1px solid #5a1f1f;border-radius:6px;padding:8px 14px;margin-bottom:6px;font-size:.84em;}
+.status-bar{background:var(--surf);border:1px solid var(--border);border-radius:8px;padding:10px 16px;font-size:.84rem;display:flex;align-items:center;gap:16px;flex-wrap:wrap;margin-bottom:12px;}
+</style>
+""", unsafe_allow_html=True)
+
+# ── Thread-safe state store ────────────────────────────────────────────────────
+_LOCK = threading.Lock()
+_TS: dict = {
+    "running":False,"live_ltp":None,"live_signal":None,"live_position":None,
+    "live_pnl":0.0,"live_pnl_pct":0.0,"live_trades":[],"live_df":None,
+    "thread_heartbeat":None,"error":None,"log":deque(maxlen=300),
+    "squareoff_requested":False,"trailing_sl":None,"phase":1,"locked_sl":None,
+    "config":{},"verified_entry":False,"candle_count":0,"daily_pnl":0.0,
+    "last_bar_time":None,"live_ew_info":{},
+}
+
+def ts_get(k): 
+    with _LOCK: return _TS.get(k)
+def ts_set(k,v):
+    with _LOCK: _TS[k]=v
+def ts_update(d):
+    with _LOCK: _TS.update(d)
+def ts_log(msg):
+    t=datetime.now(IST).strftime("%H:%M:%S")
+    with _LOCK: _TS["log"].appendleft(f"[{t}]  {msg}")
+
+# ── Session state init ─────────────────────────────────────────────────────────
+for _k,_v in {"bt_trades":[],"bt_result":None,"bt_cfg":None,
+               "opt_fast":None,"opt_slow":None,"all_trades":[]}.items():
+    if _k not in st.session_state: st.session_state[_k]=_v
+
+# ── Data fetch — never reuse cached Ticker ─────────────────────────────────────
+_YF_H={"User-Agent":"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Accept":"application/json"}
+
+def _parse_chart(data):
     try:
-        idx = df.index
-        if idx.tz is None: idx = idx.tz_localize("UTC")
-        idx = idx.tz_convert(_IST)
-        h,m = idx.hour,idx.minute
-        mask = ((h>9)|((h==9)&(m>=15))) & ((h<15)|((h==15)&(m<=30)))
-        out = df[mask]; return out if len(out)>0 else df
-    except: return df
-
-def _fetch_http(ticker, period, iv):
-    try:
-        _http_wait()
-        iv_map={"1m":"1m","5m":"5m","15m":"15m","1h":"60m","1d":"1d","1wk":"1wk"}
-        iv_yf = iv_map.get(iv, iv)
-        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{urllib.parse.quote(ticker)}"
-        r = _YF_SESS.get(url, params={"interval":iv_yf,"range":period,"includePrePost":"false"}, timeout=15)
-        r.raise_for_status()
-        d = r.json()["chart"]["result"][0]
-        ts = d["timestamp"]
-        q  = d["indicators"]["quote"][0]
-        adj= d["indicators"].get("adjclose",[{}])
-        cl = adj[0].get("adjclose",q.get("close",[])) if adj else q.get("close",[])
-        df = pd.DataFrame({"Open":q.get("open",[]),"High":q.get("high",[]),
-                            "Low":q.get("low",[]),"Close":cl,
-                            "Volume":q.get("volume",[])},
-                           index=pd.to_datetime(ts,unit="s",utc=True))
-        df = df.dropna(subset=["Open","High","Low","Close"])
-        df = df[~df.index.duplicated(keep="last")].sort_index()
-        return df
+        r=data["chart"]["result"][0]; q=r["indicators"]["quote"][0]
+        df=pd.DataFrame({"Open":q["open"],"High":q["high"],"Low":q["low"],
+                          "Close":q["close"],"Volume":q["volume"]},
+                         index=pd.to_datetime(r["timestamp"],unit="s",utc=True))
+        df.index=df.index.tz_convert(IST)
+        df.dropna(subset=["Open","High","Low","Close"],inplace=True)
+        df=df[df["Close"]>0]; df.sort_index(inplace=True); return df
     except: return None
 
-def _fetch_yf(ticker, period, iv):
+def fetch_direct(sym,interval,period):
     try:
-        _http_wait(2.0)
-        df = yf.download(ticker,period=period,interval=iv,auto_adjust=True,progress=False,threads=False)
-        if df is None or len(df)==0: return None
+        r=requests.get(f"https://query1.finance.yahoo.com/v8/finance/chart/{sym}",
+                       params={"interval":interval,"range":period,"includePrePost":"false"},
+                       headers=_YF_H,timeout=15)
+        r.raise_for_status(); return _parse_chart(r.json())
+    except: return None
+
+def fetch_yf(sym,interval,period):
+    if not HAS_YF: return None
+    try:
+        df=yf.download(sym,interval=interval,period=period,auto_adjust=True,
+                       progress=False,timeout=15)
+        if df is None or df.empty: return None
         if isinstance(df.columns,pd.MultiIndex): df.columns=df.columns.get_level_values(0)
-        return df.dropna(how="all")
+        if df.index.tz is None: df.index=df.index.tz_localize("UTC")
+        df.index=df.index.tz_convert(IST); df.sort_index(inplace=True); return df
     except: return None
 
-@st.cache_data(ttl=60, show_spinner=False)
-def fetch_data(ticker, period, iv, min_bars=200):
-    df = _fetch_http(ticker,period,iv) or _fetch_yf(ticker,period,iv)
-    if df is None: return None
-    df = _mkt_filter(df, iv)
-    if len(df)>=min_bars: return df
-    wup = WARMUP.get(iv,"1y")
-    if wup==period: return df
-    dfw = _fetch_http(ticker,wup,iv) or _fetch_yf(ticker,wup,iv)
-    if dfw is None or len(dfw)<=len(df): return df
-    try:
-        loc = dfw.index.get_indexer([df.index[0]],method="nearest")[0]
-        pfx = dfw.iloc[max(0,loc-min_bars):loc]
-        c = pd.concat([pfx,df]); return c[~c.index.duplicated(keep="last")].sort_index()
-    except: return df
+def fetch_ohlcv(sym,interval,period):
+    df=fetch_direct(sym,interval,period)
+    if df is None or df.empty: df=fetch_yf(sym,interval,period)
+    return df
 
-def _get_rt_price(ticker):
-    """Real-time last price from fast_info — tick level, not bar close."""
-    try:
-        import yfinance.shared as _yfs
-        if hasattr(_yfs,"_DFS"): _yfs._DFS.clear()
-        if hasattr(_yfs,"_ERRORS"): _yfs._ERRORS.clear()
-    except: pass
-    try:
-        tk = yf.Ticker(ticker); fi = tk.fast_info
-        lp = getattr(fi,"last_price",None)
-        if lp and not math.isnan(float(lp)) and float(lp)>0: return round(float(lp),4)
-    except: pass
-    return None
+# ── Indicators ─────────────────────────────────────────────────────────────────
+def ema(s,p): return s.ewm(span=p,adjust=False,min_periods=1).mean()
 
-# ── Indicators ────────────────────────────────────────────────────────────
-def ema(s, p):
-    """TradingView-accurate EMA: adjust=False, min_periods=1 (matches TV exactly)."""
-    return s.ewm(span=p, adjust=False, min_periods=1).mean()
-
-def calc_atr(df, p=14):
-    h,l,c = df["High"],df["Low"],df["Close"]; pc=c.shift(1)
-    return pd.concat([(h-l),(h-pc).abs(),(l-pc).abs()],axis=1)\
-             .max(axis=1).ewm(span=p,adjust=False,min_periods=1).mean()
-
-def calc_rsi(s, p=14):
-    d=s.diff()
-    g=d.clip(lower=0).ewm(span=p,adjust=False,min_periods=1).mean()
-    l=(-d.clip(upper=0)).ewm(span=p,adjust=False,min_periods=1).mean()
-    return 100-(100/(1+g/l.replace(0,1e-9)))
-
-def calc_adx(df, p=14):
+def calc_atr(df,p=14):
     h,l,c=df["High"],df["Low"],df["Close"]; pc=c.shift(1)
     tr=pd.concat([(h-l),(h-pc).abs(),(l-pc).abs()],axis=1).max(axis=1)
-    pdm=(h-h.shift(1)).clip(lower=0); ndm=(l.shift(1)-l).clip(lower=0)
-    c2=pdm>=ndm; pdm=pdm.where(c2,0.0); ndm=ndm.where(~c2,0.0)
-    a14=tr.ewm(span=p,adjust=False,min_periods=1).mean()
-    pdi=100*pdm.ewm(span=p,adjust=False,min_periods=1).mean()/a14.replace(0,1e-9)
-    ndi=100*ndm.ewm(span=p,adjust=False,min_periods=1).mean()/a14.replace(0,1e-9)
-    dx=(pdi-ndi).abs()/(pdi+ndi).replace(0,1e-9)*100
-    return dx.ewm(span=p,adjust=False,min_periods=1).mean(), pdi, ndi
+    return tr.ewm(span=p,adjust=False,min_periods=1).mean()
 
-def cx_angle(fe, se, i):
-    if i<1: return 0.0
-    return float(np.degrees(np.arctan(abs((fe.iloc[i]-fe.iloc[i-1])-(se.iloc[i]-se.iloc[i-1])))))
+def calc_adx(df,p=14):
+    h,l,c=df["High"],df["Low"],df["Close"]; ph,pl,pc=h.shift(1),l.shift(1),c.shift(1)
+    tr=pd.concat([(h-l),(h-pc).abs(),(l-pc).abs()],axis=1).max(axis=1)
+    dmp=pd.Series(np.where((h-ph)>(pl-l),np.maximum(h-ph,0),0),index=df.index)
+    dmm=pd.Series(np.where((pl-l)>(h-ph),np.maximum(pl-l,0),0),index=df.index)
+    atr_s=tr.ewm(span=p,adjust=False,min_periods=1).mean().replace(0,np.nan)
+    dip=100*dmp.ewm(span=p,adjust=False,min_periods=1).mean()/atr_s
+    dim=100*dmm.ewm(span=p,adjust=False,min_periods=1).mean()/atr_s
+    dx=100*(dip-dim).abs()/(dip+dim).replace(0,np.nan)
+    return dx.ewm(span=p,adjust=False,min_periods=1).mean()
 
-def swing_pivots(df, left=5, right=5):
-    n,h,l=len(df),df["High"].values,df["Low"].values
-    sh,sl_=[],[]
-    for i in range(left,n-right):
-        if all(h[i]>=h[i-j] for j in range(1,left+1)) and all(h[i]>=h[i+j] for j in range(1,right+1)):
-            sh.append((i,df.index[i],float(h[i])))
-        if all(l[i]<=l[i-j] for j in range(1,left+1)) and all(l[i]<=l[i+j] for j in range(1,right+1)):
-            sl_.append((i,df.index[i],float(l[i])))
-    return sh,sl_
+def calc_rsi(s,p=14):
+    d=s.diff(); g=d.clip(lower=0).ewm(span=p,adjust=False,min_periods=1).mean()
+    ls=(-d.clip(upper=0)).ewm(span=p,adjust=False,min_periods=1).mean()
+    return 100-100/(1+g/ls.replace(0,np.nan))
 
-# ── Elliott Wave ──────────────────────────────────────────────────────────
-_EW0 = {"pattern":"Insufficient Data","wave_direction":None,"completed_waves":[],
-        "current_wave":"Analyzing","wave_labels":[],"wave_points":{},"fibonacci_levels":{},
-        "next_target":None,"signal":"NONE","entry":None,"sl":None,"target":None,"pivots":[]}
+def angle_series(fast,slow):
+    diff=fast-slow; sl=diff.diff()
+    return np.degrees(np.arctan(sl/slow.replace(0,np.nan)*100))
 
-def _cp(raw, mp=0.5):
+def sup_res(df,w=20):
+    return (float(df["Low"].rolling(w,min_periods=1).min().iloc[-1]),
+            float(df["High"].rolling(w,min_periods=1).max().iloc[-1]))
+
+# ── Strategies ─────────────────────────────────────────────────────────────────
+def strat_ema(df,fast=9,slow=21):
+    f,s=ema(df["Close"],fast),ema(df["Close"],slow)
+    sig=pd.Series(0,index=df.index,dtype=int)
+    sig[(f>s)&(f.shift(1)<=s.shift(1))]=1
+    sig[(f<s)&(f.shift(1)>=s.shift(1))]=-1
+    return sig
+
+def ema_live_check(df,fast=9,slow=21):
+    need=max(fast,slow)*3
+    if len(df)<need: return 0
+    sig=strat_ema(df.iloc[-need:],fast,slow)
+    v=sig.iloc[-2:].values
+    if 1 in v: return 1
+    if -1 in v: return -1
+    return 0
+
+def strat_ant_ema(df,fast=9,slow=21,ant=3):
+    f,s=ema(df["Close"],fast),ema(df["Close"],slow)
+    g=f-s; gp=g.shift(ant)
+    sig=pd.Series(0,index=df.index,dtype=int)
+    sig[(g>0)&(gp<=0)]=1; sig[(g<0)&(gp>=0)]=-1
+    return sig
+
+def _pivots(s,order=5):
+    hi=argrelextrema(s.values,np.greater_equal,order=order)[0]
+    lo=argrelextrema(s.values,np.less_equal,   order=order)[0]
+    return hi,lo
+
+def _fib(p0,p1):
+    rng=abs(p1-p0)
+    if p1>p0: return {r:round(p1-rng*r,4) for r in FIB_RATIOS}
+    return {r:round(p1+rng*r,4) for r in FIB_RATIOS}
+
+def _merge_pivots(cl,hi,lo):
+    raw=([(i,float(cl.iloc[i]),"H") for i in hi]+
+         [(i,float(cl.iloc[i]),"L") for i in lo])
+    raw.sort(key=lambda x:x[0])
     if not raw: return []
-    out=[raw[0]]
+    f=[list(raw[0])]
     for p in raw[1:]:
-        last=out[-1]
-        if p["type"]==last["type"]:
-            if p["type"]=="H" and p["price"]>last["price"]: out[-1]=p
-            elif p["type"]=="L" and p["price"]<last["price"]: out[-1]=p
-        else:
-            if abs(p["price"]-last["price"])/max(last["price"],1e-9)*100>=mp: out.append(p)
-    return out
+        if p[2]!=f[-1][2]: f.append(list(p))
+        elif p[2]=="H" and p[1]>f[-1][1]: f[-1]=list(p)
+        elif p[2]=="L" and p[1]<f[-1][1]: f[-1]=list(p)
+    return f
 
-def _fib(b,pk):
-    r=pk-b
-    return {"23.6%":round(pk-r*.236,2),"38.2%":round(pk-r*.382,2),"50%":round(pk-r*.5,2),"61.8%":round(pk-r*.618,2)}
+def detect_ew(df,order=5):
+    empty={"pattern":None,"waves":[],"signal":0,"fib":{},"confidence":0,"in_progress":False}
+    if len(df)<order*6: return empty
+    cl=df["Close"]; hi,lo=_pivots(cl,order)
+    if len(hi)<2 or len(lo)<2: return empty
+    pv=_merge_pivots(cl,hi,lo)
+    if len(pv)<4: return empty
+    def b5(s): return (s[0][2]=="L" and s[1][2]=="H" and s[2][2]=="L" and s[3][2]=="H"
+                       and s[4][2]=="L" and s[5][2]=="H" and s[1][1]>s[0][1]
+                       and s[2][1]>s[0][1] and s[3][1]>s[1][1] and s[4][1]>s[2][1]
+                       and s[5][1]>s[3][1] and s[4][1]>s[0][1])
+    def br5(s): return (s[0][2]=="H" and s[1][2]=="L" and s[2][2]=="H" and s[3][2]=="L"
+                        and s[4][2]=="H" and s[5][2]=="L" and s[1][1]<s[0][1]
+                        and s[2][1]<s[0][1] and s[3][1]<s[1][1] and s[4][1]<s[2][1]
+                        and s[5][1]<s[3][1] and s[4][1]<s[0][1])
+    def abc_b(s): return s[0][2]=="L" and s[1][2]=="H" and s[2][2]=="L" and s[2][1]>s[0][1]
+    def abc_br(s): return s[0][2]=="H" and s[1][2]=="L" and s[2][2]=="H" and s[2][1]<s[0][1]
+    if len(pv)>=6:
+        seg=pv[-6:]
+        if b5(seg):  return {"pattern":"Bull Impulse 1-5","waves":[(p[0],p[1]) for p in seg],"signal":1,"confidence":82,"in_progress":False,"fib":_fib(seg[0][1],seg[5][1])}
+        if br5(seg): return {"pattern":"Bear Impulse 1-5","waves":[(p[0],p[1]) for p in seg],"signal":-1,"confidence":82,"in_progress":False,"fib":_fib(seg[0][1],seg[5][1])}
+    if len(pv)>=3:
+        s3=pv[-3:]
+        if abc_b(s3):  return {"pattern":"ABC Corrective Bull","waves":[(p[0],p[1]) for p in s3],"signal":1,"confidence":62,"in_progress":False,"fib":_fib(s3[0][1],s3[2][1])}
+        if abc_br(s3): return {"pattern":"ABC Corrective Bear","waves":[(p[0],p[1]) for p in s3],"signal":-1,"confidence":62,"in_progress":False,"fib":_fib(s3[0][1],s3[2][1])}
+    return {"pattern":"In Progress","waves":[(p[0],p[1],p[2]) for p in pv[-4:]],"signal":0,"confidence":30,"in_progress":True,"fib":{}}
 
-def _lbs(sub, n=None):
-    n=n or len(sub)
-    return [{"label":str(i),"idx":sub[i]["idx"],"price":sub[i]["price"],"dt":sub[i]["dt"]} for i in range(n)]
+def strat_ew(df,order=5):
+    sig=pd.Series(0,index=df.index,dtype=int); ew=detect_ew(df,order)
+    if ew["signal"]!=0 and ew["waves"]:
+        idx=ew["waves"][-1][0]
+        if 0<=idx<len(sig): sig.iloc[idx]=ew["signal"]
+    return sig
 
-def _imp_up(sub):
-    if [p["type"] for p in sub]!=["L","H","L","H","L","H"]: return None
-    p0,p1,p2,p3,p4,p5=[p["price"] for p in sub]
-    if p2<=p0 or p3<=p1 or p4<=p1: return None
-    w1,w3,w5=p1-p0,p3-p2,p5-p4
-    if w3<w1 and w3<w5: return None
-    tgt=round(p5-(p5-p0)*.618,2)
-    return {"wave_direction":"Bullish","pattern":"5-Wave Impulse (Bullish)",
-            "completed_waves":["W1","W2","W3","W4","W5"],"current_wave":"ABC Correction Expected",
-            "wave_points":{"W0":p0,"W1":p1,"W2":p2,"W3":p3,"W4":p4,"W5":p5},
-            "wave_labels":_lbs(sub,6),"fibonacci_levels":{**_fib(p0,p5),"A(38.2%)":round(p5-(p5-p0)*.382,2),"C(61.8%)":tgt},
-            "next_target":tgt,"signal":"SELL","entry":p5,"sl":round(p5+w1*.5,2),"target":tgt}
+def strat_wave_extrema(df,order=5,min_wp=0.5):
+    sig=pd.Series(0,index=df.index,dtype=int); cl=df["Close"]
+    if len(cl)<order*3: return sig
+    hi=argrelextrema(cl.values,np.greater_equal,order=order)[0]
+    lo=argrelextrema(cl.values,np.less_equal,   order=order)[0]
+    if len(lo)>=2:
+        i,pi=lo[-1],lo[-2]
+        if cl.iloc[pi]>0 and abs(cl.iloc[i]-cl.iloc[pi])/cl.iloc[pi]*100>=min_wp: sig.iloc[i]=1
+    if len(hi)>=2:
+        i,pi=hi[-1],hi[-2]
+        if cl.iloc[pi]>0 and abs(cl.iloc[i]-cl.iloc[pi])/cl.iloc[pi]*100>=min_wp: sig.iloc[i]=-1
+    return sig
 
-def _imp_dn(sub):
-    if [p["type"] for p in sub]!=["H","L","H","L","H","L"]: return None
-    p0,p1,p2,p3,p4,p5=[p["price"] for p in sub]
-    if p2>=p0 or p3>=p1 or p4>=p1: return None
-    w1,w3,w5=p0-p1,p2-p3,p4-p5
-    if w3<w1 and w3<w5: return None
-    tgt=round(p5+(p0-p5)*.618,2)
-    return {"wave_direction":"Bearish","pattern":"5-Wave Impulse (Bearish)",
-            "completed_waves":["W1","W2","W3","W4","W5"],"current_wave":"ABC Correction (Up) Expected",
-            "wave_points":{"W0":p0,"W1":p1,"W2":p2,"W3":p3,"W4":p4,"W5":p5},
-            "wave_labels":_lbs(sub,6),"fibonacci_levels":{**_fib(p5,p0),"A(38.2%)":round(p5+(p0-p5)*.382,2),"C(61.8%)":tgt},
-            "next_target":tgt,"signal":"BUY","entry":p5,"sl":round(p5-(p0-p1)*.5,2),"target":tgt}
+def strat_simple_buy(df):
+    s=pd.Series(0,index=df.index,dtype=int)
+    if not df.empty: s.iloc[-1]=1
+    return s
 
-def _inprog(sub, df):
-    if len(sub)<3: return None
-    t=[p["type"] for p in sub[:3]]; lc=float(df["Close"].iloc[-1])
-    if t==["L","H","L"]:
-        p0,p1,p2=sub[0]["price"],sub[1]["price"],sub[2]["price"]
-        if p2<=p0: return None
-        w1=p1-p0; w3t=round(p2+w1*1.618,2)
-        lbs=_lbs(sub,3)
-        if len(sub)>=4 and sub[3]["type"]=="H":
-            lbs.append({"label":"3?","idx":sub[3]["idx"],"price":sub[3]["price"],"dt":sub[3]["dt"]})
-        return {"wave_direction":"Bullish","pattern":"In-Progress W1+W2 Done",
-                "completed_waves":["W1","W2"],"current_wave":"W3 In Progress" if lc>p2 else "W2 Bottom (Buy Zone)",
-                "wave_points":{"W0":p0,"W1":p1,"W2(buy)":p2},"wave_labels":lbs,
-                "fibonacci_levels":{"W3(1.618×W1)":w3t,"W3(2.618×W1)":round(p2+w1*2.618,2)},
-                "next_target":w3t,"signal":"BUY","entry":p2,"sl":round(p0-w1*.1,2),"target":w3t}
-    if t==["H","L","H"]:
-        p0,p1,p2=sub[0]["price"],sub[1]["price"],sub[2]["price"]
-        if p2>=p0: return None
-        w1=p0-p1; w3t=round(p2-w1*1.618,2)
-        return {"wave_direction":"Bearish","pattern":"In-Progress W1+W2 Done (Bear)",
-                "completed_waves":["W1","W2"],"current_wave":"W3 In Progress (Short Zone)",
-                "wave_points":{"W0":p0,"W1":p1,"W2(sell)":p2},"wave_labels":_lbs(sub,3),
-                "fibonacci_levels":{"W3(1.618×W1)":w3t,"W3(2.618×W1)":round(p2-w1*2.618,2)},
-                "next_target":w3t,"signal":"SELL","entry":p2,"sl":round(p0+w1*.1,2),"target":w3t}
-    return None
+def strat_simple_sell(df):
+    s=pd.Series(0,index=df.index,dtype=int)
+    if not df.empty: s.iloc[-1]=-1
+    return s
 
-def _abc(sub):
-    if len(sub)<3: return None
-    if sub[0]["type"]=="L" and sub[1]["type"]=="H" and sub[2]["type"]=="L":
-        a_s,a_e,b_e=sub[0]["price"],sub[1]["price"],sub[2]["price"]
-        wa=a_e-a_s; wb=a_e-b_e
-        if wa<=0 or not(.382<=wb/wa<=.886): return None
-        tgt=round(b_e+wa,2)
-        return {"wave_direction":"Bullish ABC","pattern":"ABC Corrective (C Up)",
-                "completed_waves":["A","B"],"current_wave":"C In Progress (Up)",
-                "wave_points":{"A_start":a_s,"A_end":a_e,"B_end(buy)":b_e},
-                "wave_labels":[{"label":"A","idx":sub[1]["idx"],"price":a_e,"dt":sub[1]["dt"]},
-                                {"label":"B","idx":sub[2]["idx"],"price":b_e,"dt":sub[2]["dt"]}],
-                "fibonacci_levels":{"C=A":tgt,"C=1.618A":round(b_e+wa*1.618,2)},
-                "next_target":tgt,"signal":"BUY","entry":b_e,"sl":round(a_s-wa*.1,2),"target":tgt}
-    if sub[0]["type"]=="H" and sub[1]["type"]=="L" and sub[2]["type"]=="H":
-        a_s,a_e,b_e=sub[0]["price"],sub[1]["price"],sub[2]["price"]
-        wa=a_s-a_e; wb=b_e-a_e
-        if wa<=0 or not(.382<=wb/wa<=.886): return None
-        tgt=round(b_e-wa,2)
-        return {"wave_direction":"Bearish ABC","pattern":"ABC Corrective (C Down)",
-                "completed_waves":["A","B"],"current_wave":"C In Progress (Down)",
-                "wave_points":{"A_start":a_s,"A_end":a_e,"B_end(sell)":b_e},
-                "wave_labels":[{"label":"A","idx":sub[1]["idx"],"price":a_e,"dt":sub[1]["dt"]},
-                                {"label":"B","idx":sub[2]["idx"],"price":b_e,"dt":sub[2]["dt"]}],
-                "fibonacci_levels":{"C=A":tgt,"C=1.618A":round(b_e-wa*1.618,2)},
-                "next_target":tgt,"signal":"SELL","entry":b_e,"sl":round(a_s+wa*.1,2),"target":tgt}
-    return None
+def run_strategy(df,strategy,p):
+    if strategy=="EMA Crossover": return strat_ema(df,p.get("fast",9),p.get("slow",21))
+    if strategy=="Anticipatory EMA": return strat_ant_ema(df,p.get("fast",9),p.get("slow",21),p.get("anticipate_bars",3))
+    if strategy=="Elliott Wave": return strat_ew(df,p.get("ew_order",5))
+    if strategy=="Wave Extrema": return strat_wave_extrema(df,p.get("ew_order",5),p.get("min_wave_pct",0.5))
+    if strategy=="Simple Buy": return strat_simple_buy(df)
+    if strategy=="Simple Sell": return strat_simple_sell(df)
+    return pd.Series(0,index=df.index,dtype=int)
 
-def detect_ew(df, mp=0.5, left=4, right=4):
-    if len(df)<(left+right+1)*2: return dict(_EW0)
-    sh,sl_p=swing_pivots(df,left,right)
-    raw=[{"idx":i,"dt":d,"price":p,"type":"H"} for i,d,p in sh]+\
-        [{"idx":i,"dt":d,"price":p,"type":"L"} for i,d,p in sl_p]
-    raw.sort(key=lambda x:x["idx"]); pivots=_cp(raw,mp)
-    if len(pivots)<4: return {**dict(_EW0),"pivots":pivots}
-    for s in range(max(0,len(pivots)-10),len(pivots)-5):
-        sub=pivots[s:s+6]
-        if len(sub)<6: continue
-        for fn in [_imp_up,_imp_dn]:
-            r=fn(sub)
-            if r: return {**r,"pivots":pivots}
-    for s in range(max(0,len(pivots)-8),len(pivots)-3):
-        r=_inprog(pivots[s:],df)
-        if r: return {**r,"pivots":pivots}
-    for s in range(max(0,len(pivots)-6),len(pivots)-3):
-        r=_abc(pivots[s:])
-        if r: return {**r,"pivots":pivots}
-    return {**dict(_EW0),"pattern":"No Clear Pattern","pivots":pivots}
+# ── Filters ────────────────────────────────────────────────────────────────────
+def apply_filters(df,signals,cfg):
+    sig=signals.copy()
+    dow=cfg.get("filter_dow",[])
+    if dow: sig[~df.index.dayofweek.isin(dow)]=0
+    if cfg.get("filter_adx",False):
+        sig[calc_adx(df,14)<cfg.get("adx_min",20)]=0
+    if cfg.get("filter_rsi",False):
+        rsi=calc_rsi(df["Close"],14)
+        sig[(rsi<cfg.get("rsi_lo",30))|(rsi>cfg.get("rsi_hi",70))]=0
+    try:
+        h0,m0=map(int,cfg.get("trade_time_start","09:15").split(":"))
+        h1,m1=map(int,cfg.get("trade_time_end","15:20").split(":"))
+        mins=df.index.hour*60+df.index.minute
+        sig[~((mins>=h0*60+m0)&(mins<=h1*60+m1))]=0
+    except: pass
+    st=cfg.get("strategy","")
+    if cfg.get("filter_angle",False) and st in ("EMA Crossover","Anticipatory EMA"):
+        ang=angle_series(ema(df["Close"],cfg.get("fast",9)),ema(df["Close"],cfg.get("slow",21)))
+        sig[(ang<cfg.get("angle_min",-90))|(ang>cfg.get("angle_max",90))]=0
+    if cfg.get("filter_delta",False) and st in ("EMA Crossover","Anticipatory EMA"):
+        fe=ema(df["Close"],cfg.get("fast",9)); se=ema(df["Close"],cfg.get("slow",21))
+        dlt=((fe-se)/se.replace(0,np.nan)*100).abs()
+        sig[dlt<cfg.get("delta_min",0)]=0
+        if cfg.get("delta_max",0)>0: sig[dlt>cfg.get("delta_max",100)]=0
+    return sig
 
-# ── SL / Target ────────────────────────────────────────────────────────────
-def calc_sl(entry, sig, cfg, df, idx):
-    t=cfg.get("sl_type","Custom Points"); av=float(calc_atr(df).iloc[min(idx,len(df)-1)])
-    pts=cfg.get("sl_points",10); s=1 if sig==1 else -1
-    if t=="Custom Points": return entry-s*pts
-    if t=="ATR Based": return entry-s*av*cfg.get("atr_sl_mult",1.5)
-    if t=="Risk Reward Based": return entry-s*cfg.get("target_points",20)/max(cfg.get("risk_reward",2.0),.1)
-    if t=="Volatility Based":
-        vol=df["Close"].pct_change().std()*float(df["Close"].iloc[min(idx,len(df)-1)])
-        return entry-s*vol*cfg.get("vol_sl_mult",2.0)
-    if t in ("Swing Low/High","Support/Resistance"):
-        w=cfg.get("swing_window",20); b=max(0,idx-w)
-        return (float(df["Low"].iloc[b:idx+1].min())-av*.3) if sig==1 else (float(df["High"].iloc[b:idx+1].max())+av*.3)
-    if t=="Candle Low/High":
-        return (float(df["Low"].iloc[min(idx,len(df)-1)])-av*.1) if sig==1 else (float(df["High"].iloc[min(idx,len(df)-1)])+av*.1)
-    if t in ("Auto SL","Trailing SL","Cost-to-Cost + N Points Trailing SL"):
-        w=5; b=max(0,idx-w)
-        return (min(float(df["Low"].iloc[b:idx+1].min()),entry-av*1.5)) if sig==1 else (max(float(df["High"].iloc[b:idx+1].max()),entry+av*1.5))
-    return entry-s*pts
+# ── SL helpers ─────────────────────────────────────────────────────────────────
+def calc_sl(entry,side,sl_type,sl_param,df,idx,atr_v,fast=9,slow=21):
+    if sl_type=="Custom Points": return entry-side*sl_param
+    if sl_type=="ATR": return entry-side*atr_v*(sl_param if sl_param>0 else 1.5)
+    if sl_type in ("Risk:Reward","Strategy Reverse Signal"): return entry-side*sl_param
+    if sl_type in ("Trailing SL","Trailing SL (3-Phase)","Auto SL"): return entry-side*atr_v*1.5
+    if sl_type=="EMA Reverse Crossover":
+        return float(ema(df["Close"],slow).iloc[min(idx,len(df)-1)])
+    if sl_type=="Trailing Swing Low/High":
+        w=max(1,int(sl_param) if sl_param>0 else 5); s=max(0,idx-w)
+        return (float(df["Low"].iloc[s:idx+1].min()) if side==1 else float(df["High"].iloc[s:idx+1].max()))
+    if sl_type=="Candle Low/High":
+        return (float(df["Low"].iloc[min(idx,len(df)-1)]) if side==1 else float(df["High"].iloc[min(idx,len(df)-1)]))
+    if sl_type=="Support/Resistance Trailing":
+        sup,res=sup_res(df.iloc[:idx+1]); return sup if side==1 else res
+    if sl_type=="Volatility Based":
+        vol=df["Close"].iloc[max(0,idx-20):idx+1].std()
+        return entry-side*vol*(sl_param if sl_param>0 else 2.0)
+    if sl_type=="Cost-to-Cost + N Points": return entry-side*atr_v*1.5
+    return entry-side*atr_v*1.5
 
-def calc_tgt(entry, sig, cfg, df, idx):
-    t=cfg.get("target_type","Custom Points"); av=float(calc_atr(df).iloc[min(idx,len(df)-1)])
-    pts=cfg.get("target_points",20); s=1 if sig==1 else -1
-    if t in ("Custom Points","Trailing Target (Display Only)"): return entry+s*pts
-    if t=="ATR Based": return entry+s*av*cfg.get("atr_target_mult",2.0)
-    if t=="Risk Reward Based":
-        sl_d=abs(entry-calc_sl(entry,sig,cfg,df,idx)); return entry+s*sl_d*cfg.get("risk_reward",2.0)
-    if t=="Volatility Based":
-        vol=df["Close"].pct_change().std()*float(df["Close"].iloc[min(idx,len(df)-1)])
-        return entry+s*vol*cfg.get("vol_target_mult",3.0)
-    if t in ("Swing High/Low","Support/Resistance"):
-        w=cfg.get("swing_window",20); b=max(0,idx-w)
-        return (max(float(df["High"].iloc[b:idx+1].max()),entry+av)) if sig==1 else (min(float(df["Low"].iloc[b:idx+1].min()),entry-av))
-    if t=="Candle High/Low":
-        return (float(df["High"].iloc[min(idx,len(df)-1)])+av*.1) if sig==1 else (float(df["Low"].iloc[min(idx,len(df)-1)])-av*.1)
-    if t in ("Auto Target","EMA Reverse Crossover"):
-        w=10; b=max(0,idx-w)
-        return (max(float(df["High"].iloc[b:idx+1].max()),entry+av*2.5)) if sig==1 else (min(float(df["Low"].iloc[b:idx+1].min()),entry-av*2.5))
-    return entry+s*pts
+def calc_target(entry,side,sl,sl_type,tp,rr):
+    if sl_type=="Risk:Reward": return entry+side*abs(entry-sl)*rr
+    return entry+side*tp
 
-def ratchet_sl(pos, ltp, cfg, df, bi):
-    t=cfg.get("sl_type","Custom Points"); sig=pos["signal_type"]; cur=pos["current_sl"]
-    av=float(calc_atr(df).iloc[min(bi,len(df)-1)]); ep=pos["entry_price"]
-    if t=="Trailing SL":
-        tr=cfg.get("sl_points",10); nsl=ltp-tr if sig==1 else ltp+tr
-        if (sig==1 and nsl>cur) or (sig==-1 and nsl<cur): pos["current_sl"]=round(nsl,2)
-    elif t=="Swing Low/High":
-        w=cfg.get("swing_window",20); b=max(0,bi-w)
-        if sig==1:
-            nsl=float(df["Low"].iloc[b:bi+1].min())-av*.3
-            if nsl>cur: pos["current_sl"]=round(nsl,2)
-        else:
-            nsl=float(df["High"].iloc[b:bi+1].max())+av*.3
-            if nsl<cur: pos["current_sl"]=round(nsl,2)
-    elif t=="Candle Low/High":
-        if sig==1:
-            nsl=float(df["Low"].iloc[min(bi,len(df)-1)])-av*.1
-            if nsl>cur: pos["current_sl"]=round(nsl,2)
-        else:
-            nsl=float(df["High"].iloc[min(bi,len(df)-1)])+av*.1
-            if nsl<cur: pos["current_sl"]=round(nsl,2)
-    elif t=="Cost-to-Cost + N Points Trailing SL":
-        K=cfg.get("ctc_trigger_points",3); N=cfg.get("ctc_offset_points",2)
-        dist=cfg.get("sl_points",10); pif=(ltp-ep) if sig==1 else (ep-ltp)
-        if sig==1:
-            nsl = ltp-dist if pif<K else (ep+N if pif<dist else ltp-(dist-N))
-            if nsl>cur: pos["current_sl"]=round(nsl,2)
-        else:
-            nsl = ltp+dist if pif<K else (ep-N if pif<dist else ltp+(dist-N))
-            if nsl<cur: pos["current_sl"]=round(nsl,2)
-    return pos
+def update_trail(cur,ltp,side,sl_type,sp,entry,atr_v,phase,locked):
+    ns,np_,nl=cur,phase,locked
+    if sl_type=="Trailing SL":
+        trail=sp if sp>0 else atr_v*1.5; prop=ltp-side*trail
+        ns=max(cur,prop) if side==1 else min(cur,prop)
+    elif sl_type=="Trailing SL (3-Phase)":
+        lp=sp if sp>0 else atr_v; profit=(ltp-entry)*side
+        if np_==1:
+            prop=ltp-side*atr_v*1.5; ns=max(cur,prop) if side==1 else min(cur,prop)
+            if profit>=lp: np_=2; nl=entry+side*lp; ns=max(ns,nl) if side==1 else min(ns,nl)
+        elif np_==2:
+            if nl: ns=max(cur,nl) if side==1 else min(cur,nl)
+            if profit>=lp*2: np_=3
+        elif np_==3:
+            prop=ltp-side*atr_v*0.5; ns=max(cur,prop) if side==1 else min(cur,prop)
+    elif sl_type in ("Trailing Swing Low/High","Support/Resistance Trailing"):
+        prop=ltp-side*atr_v*1.2; ns=max(cur,prop) if side==1 else min(cur,prop)
+    elif sl_type=="Cost-to-Cost + N Points":
+        n=sp if sp>0 else atr_v*0.5
+        if (ltp-entry)*side>=n: lk=entry+side*n; ns=max(cur,lk) if side==1 else min(cur,lk)
+    return ns,np_,nl
 
-def check_exit(pos, row, cfg):
-    sig=pos["signal_type"]; sl=pos["current_sl"]; tgt=pos["target"]
-    tt=cfg.get("target_type","Custom Points"); hi=float(row["High"]); lo=float(row["Low"])
-    if sig==1:
-        sh=lo<=sl; th=hi>=tgt and tt!="Trailing Target (Display Only)"
-        if sh and th: return sl,"SL Hit (violation–SL first)",True
-        if sh: return sl,"SL Hit",False
-        if th: return tgt,"Target Hit",False
+# ── Backtest engine ────────────────────────────────────────────────────────────
+def _append_trade(pos,ep,reason,ets,trades,daily_map,day,qty):
+    side=pos["side"]; ep_=pos.get("entry_time")
+    es=ep_.strftime("%Y-%m-%d %H:%M:%S") if isinstance(ep_,datetime) else str(ep_)
+    ex=ets.strftime("%Y-%m-%d %H:%M:%S") if hasattr(ets,"strftime") else str(ets)
+    try: dur=(pd.Timestamp(ex)-pd.Timestamp(es)).total_seconds()/60
+    except: dur=0.0
+    pnl=(ep-pos["entry"])*side*qty
+    trades.append({"entry_time":es,"exit_time":ex,"side":"BUY" if side==1 else "SELL",
+                   "entry":round(pos["entry"],4),"exit":round(ep,4),
+                   "sl":round(pos["sl"],4),"target":round(pos["target"],4),
+                   "pnl":round(pnl,4),"exit_reason":reason,"duration_m":round(dur,1),
+                   "atr":round(pos.get("atr",0),4),"pattern":pos.get("pattern",""),
+                   "source":"backtest"})
+    daily_map[day]=daily_map.get(day,0.0)+pnl
+
+def run_backtest(df_raw,cfg):
+    strategy=cfg["strategy"]; sl_type=cfg["sl_type"]
+    sp=float(cfg.get("sl_param",20)); tp=float(cfg.get("target_param",40))
+    rr=float(cfg.get("rr_ratio",2)); qty=int(cfg.get("qty",1))
+    fast=int(cfg.get("fast",9)); slow=int(cfg.get("slow",21))
+    ew_order=int(cfg.get("ew_order",5)); min_wp=float(cfg.get("min_wave_pct",0.5))
+    max_loss=float(cfg.get("max_daily_loss",0)); max_profit=float(cfg.get("max_daily_profit",0))
+    ant=int(cfg.get("anticipate_bars",3)); simple_imm=strategy in ("Simple Buy","Simple Sell")
+    df=df_raw.copy()
+    df["EMA_fast"]=ema(df["Close"],fast); df["EMA_slow"]=ema(df["Close"],slow)
+    df["ATR"]=calc_atr(df,int(cfg.get("atr_period",14)))
+    df["ADX"]=calc_adx(df,14); df["RSI"]=calc_rsi(df["Close"],14)
+    if strategy in ("Elliott Wave","Wave Extrema"):
+        mb=len(df); step=max(1,mb//6); raw_sig=pd.Series(0,index=df.index,dtype=int)
+        for start in range(0,mb-step,step):
+            end=min(start+step*2,mb); chunk=df.iloc[start:end]
+            csig=run_strategy(chunk,strategy,{"ew_order":ew_order,"min_wave_pct":min_wp})
+            sl=start; el=min(start+step,mb); n=el-sl; v=csig.values
+            raw_sig.iloc[sl:el]=v[-n:] if len(v)>=n else np.pad(v,(n-len(v),0))
     else:
-        sh=hi>=sl; th=lo<=tgt and tt!="Trailing Target (Display Only)"
-        if sh and th: return sl,"SL Hit (violation–SL first)",True
-        if sh: return sl,"SL Hit",False
-        if th: return tgt,"Target Hit",False
-    return None,None,False
-
-# ── Signal Generation ──────────────────────────────────────────────────────
-def generate_signals(df, cfg):
-    n=len(df); sigs=pd.Series(0,index=df.index,dtype=int)
-    reas=pd.Series("",index=df.index,dtype=str); inds={}
-    strat=cfg.get("strategy","EMA Crossover"); td=cfg.get("trade_direction","Both")
-    if strat=="Simple Buy":
-        if td in ("Both","Long Only"): sigs[:]=1; reas[:] ="Simple Buy"
-        return sigs,reas,inds
-    if strat=="Simple Sell":
-        if td in ("Both","Short Only"): sigs[:] =-1; reas[:] ="Simple Sell"
-        return sigs,reas,inds
-    fp=cfg.get("fast_ema",9); sp=cfg.get("slow_ema",15)
-    fe=ema(df["Close"],fp); se_=ema(df["Close"],sp)
-    atr_s=calc_atr(df); inds["fast_ema"]=fe; inds["slow_ema"]=se_; inds["atr"]=atr_s
-    if strat=="EMA Crossover":
-        mna=cfg.get("min_angle",0.0); mxa=cfg.get("max_angle",90.0)
-        mnd=cfg.get("min_delta",0.0); mxd=cfg.get("max_delta",1e9)
-        cxt=cfg.get("crossover_type","Simple Crossover"); cxsz=cfg.get("custom_candle_size",10)
-        adx_s=None; rsi_s=None
-        if cfg.get("enable_adx",False): adx_s,_,_=calc_adx(df,cfg.get("adx_period",14))
-        if cfg.get("enable_rsi",False): rsi_s=calc_rsi(df["Close"],cfg.get("rsi_period",14))
-        for i in range(1,n):
-            f0,f1=float(fe.iloc[i]),float(fe.iloc[i-1]); s0,s1=float(se_.iloc[i]),float(se_.iloc[i-1])
-            ang=cx_angle(fe,se_,i); delta=abs(f0-s0)
-            csz=abs(float(df["Close"].iloc[i])-float(df["Open"].iloc[i]))
-            if ang<mna or ang>mxa: continue
-            if delta<mnd or delta>mxd: continue
-            if cxt=="Custom Candle Size" and csz<cxsz: continue
-            if cxt=="ATR Based Candle Size" and csz<float(atr_s.iloc[i]): continue
-            if adx_s is not None and float(adx_s.iloc[i])<cfg.get("adx_min",25): continue
-            adow=cfg.get("allowed_days",[])
-            if adow:
-                try:
-                    bd=pd.Timestamp(df.index[i])
-                    if bd.tzinfo is None: bd=bd.tz_localize("UTC")
-                    if bd.tz_convert(_IST).day_name() not in adow: continue
-                except: pass
-            rv=float(rsi_s.iloc[i]) if rsi_s is not None else 50
-            if td in ("Both","Long Only") and f1<=s1 and f0>s0:
-                if rsi_s is not None and rv>=cfg.get("rsi_overbought",70): continue
-                sigs.iloc[i]=1; reas.iloc[i]=f"EMA Bull Cross | F={f0:.4f} S={s0:.4f} Δ={delta:.4f} ∠={ang:.1f}°"
-            elif td in ("Both","Short Only") and f1>=s1 and f0<s0:
-                if rsi_s is not None and rv<=cfg.get("rsi_oversold",30): continue
-                sigs.iloc[i]=-1; reas.iloc[i]=f"EMA Bear Cross | F={f0:.4f} S={s0:.4f} Δ={delta:.4f} ∠={ang:.1f}°"
-    elif strat=="Anticipatory EMA":
-        for i in range(3,n):
-            f0,f1,f2=float(fe.iloc[i]),float(fe.iloc[i-1]),float(fe.iloc[i-2])
-            s0,s1,s2=float(se_.iloc[i]),float(se_.iloc[i-1]),float(se_.iloc[i-2])
-            gn=f0-s0; gp=f1-s1; g2=f2-s2; av=float(atr_s.iloc[i])
-            if g2<0 and gp<0 and gn<0 and (abs(g2)-abs(gn))>0 and abs(gn)<av*1.2 and (f0-f1)-(f1-f2)>0:
-                if td in ("Both","Long Only"): sigs.iloc[i]=1; reas.iloc[i]=f"Anticipatory BUY | Gap={gn:.4f}"; continue
-            if g2>0 and gp>0 and gn>0 and (abs(g2)-abs(gn))>0 and abs(gn)<av*1.2 and (f0-f1)-(f1-f2)<0:
-                if td in ("Both","Short Only"): sigs.iloc[i]=-1; reas.iloc[i]=f"Anticipatory SELL | Gap={gn:.4f}"
-    elif strat=="Wave Extrema":
-        try:
-            from scipy.signal import argrelextrema
-            lb=cfg.get("wave_extrema_lookback",50); order=max(3,cfg.get("wave_order",5))
-            hi_idx=set(argrelextrema(df["High"].values,np.greater,order=order)[0])
-            lo_idx=set(argrelextrema(df["Low"].values,np.less,order=order)[0])
-            ext=sorted(hi_idx|lo_idx)
-            for i in range(lb,n):
-                re2=[e for e in ext if i-lb<=e<=i]
-                if len(re2)<5: continue
-                wp=df["Close"].values[[re2[j] for j in range(-5,0)]]
-                if (wp[0]<wp[1]>wp[2]<wp[3]>wp[4]) and wp[4]<wp[2] and td in ("Both","Long Only"):
-                    sigs.iloc[i]=1; reas.iloc[i]=f"Wave Extrema BUY"
-                elif (wp[0]>wp[1]<wp[2]>wp[3]<wp[4]) and wp[4]>wp[2] and td in ("Both","Short Only"):
-                    sigs.iloc[i]=-1; reas.iloc[i]=f"Wave Extrema SELL"
-        except ImportError: pass
-    elif strat=="Elliott Wave":
-        mwp=cfg.get("min_wave_pct",.5); ewl=cfg.get("ew_left",4); ewr=cfg.get("ew_right",4)
-        mb=(ewl+ewr)*4; step=max(3,mb//6); lb=-9999
-        scan_ends=list(range(mb,n,step))
-        if not scan_ends or scan_ends[-1]<n-1: scan_ends.append(n)
-        for se_end in scan_ends:
-            ew=detect_ew(df.iloc[:se_end],mwp,ewl,ewr); sg=ew.get("signal","NONE")
-            if sg not in ("BUY","SELL") or not ew.get("wave_labels"): continue
-            anc=min(ew["wave_labels"][-1].get("idx",se_end-1),n-1)
-            if anc-lb<mb: continue
-            if sg=="BUY" and td not in ("Both","Long Only"): continue
-            if sg=="SELL" and td not in ("Both","Short Only"): continue
-            sv=1 if sg=="BUY" else -1
-            sigs.iloc[anc]=sv; reas.iloc[anc]=f"EW|{ew.get('pattern','')}|{ew.get('current_wave','')}"; lb=anc
-        inds["elliott"]=detect_ew(df,mwp,ewl,ewr)
-    return sigs,reas,inds
-
-# ── Backtest ──────────────────────────────────────────────────────────────
-def _mkt(pos,row,xdt,xp,xr,qty,iv):
-    sig=pos["signal_type"]; pnl=((xp-pos["entry_price"]) if sig==1 else (pos["entry_price"]-xp))*qty
-    return {"Entry DateTime":ts_to_ist(pos["entry_dt"]),"Exit DateTime":ts_to_ist(xdt),
-            "Signal":"BUY" if sig==1 else "SELL","Entry Price":round(pos["entry_price"],4),
-            "Exit Price":round(xp,4),"SL":round(pos["initial_sl"],4),"Final SL":round(pos["current_sl"],4),
-            "Target":round(pos["target"],4),"Candle High":round(float(row["High"]),4),
-            "Candle Low":round(float(row["Low"]),4),"Entry Reason":pos.get("signal_reason",""),
-            "Exit Reason":xr,"PnL":round(pnl,2),"Is Violation":iv,"Mode":"Backtest"}
-
-def run_backtest(df,cfg,prog=None):
-    strat=cfg.get("strategy","EMA Crossover"); qty=cfg.get("quantity",1)
-    imm=strat in ("Simple Buy","Simple Sell")
-    sigs,reas,inds=generate_signals(df,cfg)
-    fe=inds.get("fast_ema",pd.Series(dtype=float)); se2=inds.get("slow_ema",pd.Series(dtype=float))
-    trades=[]; viols=[]; pos=None; n=len(df); i=0
-    while i<n:
-        row=df.iloc[i]
-        if pos is not None:
-            pos=ratchet_sl(pos,float(row["Close"]),cfg,df,i)
-            if cfg.get("sl_type")=="EMA Reverse Crossover" or cfg.get("target_type")=="EMA Reverse Crossover":
-                if len(fe)>i and len(se2)>i and i>0:
-                    f0,f1=float(fe.iloc[i]),float(fe.iloc[i-1]); s0,s1=float(se2.iloc[i]),float(se2.iloc[i-1])
-                    if (pos["signal_type"]==1 and f1>=s1 and f0<s0) or (pos["signal_type"]==-1 and f1<=s1 and f0>s0):
-                        t=_mkt(pos,row,df.index[i],float(row["Open"]),"EMA Rev X Exit",qty,False)
-                        trades.append(t); pos=None; i+=1; continue
-            xp,xr,iv2=check_exit(pos,row,cfg)
-            if xp is not None:
-                t=_mkt(pos,row,df.index[i],xp,xr,qty,iv2); trades.append(t)
-                if iv2: viols.append(t); pos=None
-        if pos is None and int(sigs.iloc[i])!=0:
-            sv=int(sigs.iloc[i]); reason=str(reas.iloc[i])
-            if imm: eidx=i; edt=df.index[i]; ep=float(df.iloc[i]["Open"])
+        raw_sig=run_strategy(df,strategy,{"fast":fast,"slow":slow,"ew_order":ew_order,
+                                           "min_wave_pct":min_wp,"anticipate_bars":ant})
+    signals=apply_filters(df,raw_sig,{**cfg,"strategy":strategy})
+    trades=[]; position=None; equity=0.0; daily_map={}; violations=[]
+    for i in range(len(df)):
+        row=df.iloc[i]; ts=df.index[i]; sig=signals.iloc[i]; day=ts.date()
+        dpnl=daily_map.get(day,0.0)
+        if max_loss>0 and dpnl<=-max_loss: position=None; continue
+        if max_profit>0 and dpnl>=max_profit: position=None; continue
+        if position:
+            side=position["side"]; ep=position["entry"]; sl_p=position["sl"]
+            tgt=position["target"]; sl_t=position["sl_type"]; sl_par=position["sl_param"]
+            atr_v=position["atr"]; trail=position.get("trailing_sl",sl_p)
+            ph=position.get("phase",1); lk=position.get("locked_sl",None)
+            mid=(row["High"]+row["Low"])/2
+            trail,ph,lk=update_trail(trail,mid,side,sl_t,sl_par,ep,atr_v,ph,lk)
+            position.update({"trailing_sl":trail,"phase":ph,"locked_sl":lk})
+            eff=trail if sl_t in TRAILING_SL_TYPES else sl_p
+            if sl_t=="EMA Reverse Crossover":
+                rev=ema_live_check(df.iloc[:i+1],fast,slow)
+                if rev!=0 and rev!=side:
+                    _append_trade(position,float(row["Close"]),"EMA Reverse",ts,trades,daily_map,day,qty)
+                    equity+=trades[-1]["pnl"]; position=None; continue
+            if sl_t=="Strategy Reverse Signal":
+                rs=run_strategy(df.iloc[:i+1],strategy,{"fast":fast,"slow":slow,"ew_order":ew_order,"min_wave_pct":min_wp,"anticipate_bars":ant})
+                if int(rs.iloc[-1]) not in (0,side):
+                    _append_trade(position,float(row["Close"]),"Strategy Reverse",ts,trades,daily_map,day,qty)
+                    equity+=trades[-1]["pnl"]; position=None; continue
+            exited=False; exit_p=None; exit_r=None
+            if side==1:
+                if row["Low"]<=eff: exit_p,exit_r,exited=eff,"SL",True
+                elif row["High"]>=tgt: exit_p,exit_r,exited=tgt,"Target",True
             else:
-                if i+1>=n: i+=1; continue
-                eidx=i+1; edt=df.index[eidx]; ep=float(df.iloc[eidx]["Open"])
-            sl_p=calc_sl(ep,sv,cfg,df,eidx); tgt_p=calc_tgt(ep,sv,cfg,df,eidx)
-            if strat=="Elliott Wave":
-                ewl=detect_ew(df.iloc[:eidx+1],cfg.get("min_wave_pct",.5),cfg.get("ew_left",4),cfg.get("ew_right",4))
-                if ewl.get("sl") is not None: sl_p=float(ewl["sl"])
-                if ewl.get("target") is not None: tgt_p=float(ewl["target"])
-            pos={"signal_idx":i,"entry_idx":eidx,"entry_dt":edt,"entry_price":ep,"signal_type":sv,
-                 "initial_sl":sl_p,"current_sl":sl_p,"target":tgt_p,"signal_reason":reason}
-            if not imm: i=eidx
-        if prog: prog(i/n)
-        i+=1
-    if pos is not None:
-        lr=df.iloc[-1]; trades.append(_mkt(pos,lr,df.index[-1],float(lr["Close"]),"End of Data",qty,False))
-    return trades,viols,inds
+                if row["High"]>=eff: exit_p,exit_r,exited=eff,"SL",True
+                elif row["Low"]<=tgt: exit_p,exit_r,exited=tgt,"Target",True
+            if exited:
+                _append_trade(position,exit_p,exit_r,ts,trades,daily_map,day,qty)
+                equity+=trades[-1]["pnl"]; position=None
+        if not position and sig!=0:
+            if simple_imm: e_idx,e_ts,e_p=i,ts,float(row["Close"])
+            else:
+                e_idx=i+1
+                if e_idx>=len(df): continue
+                e_ts=df.index[e_idx]; e_p=float(df["Open"].iloc[e_idx])
+            atr_v=float(df["ATR"].iloc[min(i,len(df)-1)]); side=1 if sig==1 else -1
+            sl_p=calc_sl(e_p,side,sl_type,sp,df,min(e_idx,len(df)-1),atr_v,fast,slow)
+            tgt_p=calc_target(e_p,side,sl_p,sl_type,tp,rr)
+            ew_inf=detect_ew(df.iloc[:i+1],ew_order) if strategy=="Elliott Wave" else {}
+            position={"side":side,"entry":e_p,"sl":sl_p,"target":tgt_p,"sl_type":sl_type,
+                      "sl_param":sp,"entry_time":e_ts,"atr":atr_v,"trailing_sl":sl_p,
+                      "phase":1,"locked_sl":None,"qty":qty,"pattern":ew_inf.get("pattern","")}
+            risk=abs(e_p-sl_p)
+            if risk<0.01: violations.append(f"Tiny risk {risk:.4f} @ bar {i} [{e_ts}]")
+            if side==1 and sl_p>=e_p: violations.append(f"LONG SL>=entry @ {e_ts}")
+            if side==-1 and sl_p<=e_p: violations.append(f"SHORT SL<=entry @ {e_ts}")
+    if position:
+        ep=float(df.iloc[-1]["Close"]); side=position["side"]
+        pnl=(ep-position["entry"])*side*qty
+        trades.append({"entry_time":str(position["entry_time"]),"exit_time":str(df.index[-1]),
+                       "side":"BUY" if side==1 else "SELL","entry":round(position["entry"],4),
+                       "exit":round(ep,4),"sl":round(position["sl"],4),"target":round(position["target"],4),
+                       "pnl":round(pnl,4),"exit_reason":"EOD","duration_m":0.0,
+                       "atr":round(position.get("atr",0),4),"pattern":position.get("pattern",""),
+                       "source":"backtest"})
+        equity+=pnl
+    eq_arr=np.array([0.0]+[t["pnl"] for t in trades]).cumsum()
+    pk=np.maximum.accumulate(eq_arr); dd_arr=pk-eq_arr
+    return {"trades":trades,"equity":round(float(eq_arr[-1]),4) if len(eq_arr)>0 else 0.0,
+            "equity_arr":eq_arr,"dd_arr":dd_arr,"violations":violations,"signals":signals,"df":df}
 
-def calc_acc(trades):
-    if not trades: return 0,0,0.0
-    w=sum(1 for t in trades if t["PnL"]>0)
-    return w,len(trades),round(w/len(trades)*100,2)
+# ── Live signal helper ─────────────────────────────────────────────────────────
+def get_live_signal(df,strategy,cfg):
+    f=cfg.get("fast",9); s=cfg.get("slow",21); o=cfg.get("ew_order",5)
+    mw=cfg.get("min_wave_pct",0.5); an=cfg.get("anticipate_bars",3)
+    if strategy=="EMA Crossover": return ema_live_check(df,f,s)
+    if strategy=="Anticipatory EMA":
+        sig=strat_ant_ema(df,f,s,an); v=sig.values[-2:]
+        if 1 in v: return 1
+        if -1 in v: return -1
+        return 0
+    if strategy=="Elliott Wave": return detect_ew(df,o)["signal"]
+    if strategy=="Wave Extrema":
+        sig=strat_wave_extrema(df,o,mw); return int(sig.iloc[-1]) if not sig.empty else 0
+    if strategy=="Simple Buy": return 1
+    if strategy=="Simple Sell": return -1
+    return 0
 
-# ── Dhan Broker ───────────────────────────────────────────────────────────
-def get_ip():
-    try: return requests.get("https://api.ipify.org?format=json",timeout=5).json()["ip"]
-    except: return "Unknown"
-def _dhan(cfg):
-    try:
-        from dhanhq import dhanhq; return dhanhq(cfg["client_id"],cfg["access_token"])
-    except: return None
-def _place(cfg,tx,seg,prod,ot,sec,qty,price=0):
-    d=_dhan(cfg)
-    if d is None: return {"error":"dhanhq not installed"}
-    try:
-        return d.place_order(transactionType=tx,exchangeSegment=seg,productType=prod,
-                             orderType=ot,validity="DAY",securityId=str(sec),
-                             quantity=int(qty),price=float(price),triggerPrice=0)
-    except Exception as e: return {"error":str(e)}
-def place_eq_entry(cfg,sig,ltp=0):
-    tx="BUY" if sig==1 else "SELL"; seg={"NSE":"NSE_EQ","BSE":"BSE_EQ"}.get(cfg.get("exchange","NSE"),"NSE_EQ")
-    ot=cfg.get("entry_order_type","MARKET")
-    return _place(cfg,tx,seg,cfg.get("product_type","INTRADAY"),ot,cfg.get("security_id","1594"),cfg.get("quantity",1),ltp if ot=="LIMIT" else 0)
-def place_opt_entry(cfg,sig,ltp=0):
-    sec=cfg.get("ce_security_id","57749") if sig==1 else cfg.get("pe_security_id","57716")
-    ot=cfg.get("options_entry_order_type","MARKET")
-    return _place(cfg,"BUY",cfg.get("options_exchange","NSE_FNO"),"INTRADAY",ot,sec,cfg.get("options_quantity",65),ltp if ot=="LIMIT" else 0)
-def place_exit_order(cfg,pos,ltp=0,is_opt=False):
-    sig=pos.get("signal_type",1)
-    if is_opt:
-        sec=cfg.get("ce_security_id","57749") if sig==1 else cfg.get("pe_security_id","57716")
-        ot=cfg.get("options_exit_order_type","MARKET")
-        return _place(cfg,"SELL",cfg.get("options_exchange","NSE_FNO"),"INTRADAY",ot,sec,cfg.get("options_quantity",65),ltp if ot=="LIMIT" else 0)
-    tx="SELL" if sig==1 else "BUY"; seg={"NSE":"NSE_EQ","BSE":"BSE_EQ"}.get(cfg.get("exchange","NSE"),"NSE_EQ")
-    ot=cfg.get("exit_order_type","MARKET")
-    return _place(cfg,tx,seg,cfg.get("product_type","INTRADAY"),ot,cfg.get("security_id","1594"),cfg.get("quantity",1),ltp if ot=="LIMIT" else 0)
+# ── Live thread ────────────────────────────────────────────────────────────────
+def _rec_live(pos,ep,reason,pnl):
+    et=pos.get("entry_time")
+    es=et.strftime("%Y-%m-%d %H:%M:%S") if isinstance(et,datetime) else str(et)
+    with _LOCK:
+        _TS["live_trades"].append({"entry_time":es,"exit_time":datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S"),
+            "side":"BUY" if pos["side"]==1 else "SELL","entry":round(pos["entry"],4),"exit":round(ep,4),
+            "sl":round(pos["sl"],4),"target":round(pos["target"],4),"pnl":round(pnl,4),
+            "exit_reason":reason,"duration_m":0.0,"atr":round(pos.get("atr",0),4),
+            "pattern":pos.get("pattern",""),"source":"live"})
 
-# ── Live Thread ────────────────────────────────────────────────────────────
-def live_thread_fn(ticker,period,iv,cfg,stop_ev,dhan_cfg):
-    def log(msg): _append("live_log",f"[{now_ist()}] {msg}")
-    strat=cfg.get("strategy","EMA Crossover"); qty=cfg.get("quantity",1)
-    td=cfg.get("trade_direction","Both"); tgt_t=cfg.get("target_type","Custom Points")
-    imm=strat in ("Simple Buy","Simple Sell")
-    en_pnl=cfg.get("enable_pnl_cap",False); max_loss=cfg.get("max_day_loss",-1000.0); max_prof=cfg.get("max_day_profit",1000.0)
-    en_tf=cfg.get("enable_time_filter",False); tf_s=str(cfg.get("trade_start_time","09:15")); tf_e=str(cfg.get("trade_end_time","15:20"))
-    use_cool=cfg.get("enable_cooldown",True); cooldown=cfg.get("cooldown",5)
+def live_thread():
+    ts_log("▶ Live thread started")
+    cfg=ts_get("config"); sym=cfg["symbol"]; iv=cfg["interval"]; per=cfg["period"]
+    strat=cfg["strategy"]; sl_type=cfg["sl_type"]
+    sp=float(cfg.get("sl_param",20)); tp=float(cfg.get("target_param",40))
+    rr=float(cfg.get("rr_ratio",2)); qty=int(cfg.get("qty",1))
+    fast=int(cfg.get("fast",9)); slow=int(cfg.get("slow",21))
+    atr_p=int(cfg.get("atr_period",14)); t0=cfg.get("trade_time_start","09:15"); t1=cfg.get("trade_time_end","15:20")
+    max_loss=float(cfg.get("max_daily_loss",0)); max_profit=float(cfg.get("max_daily_profit",0))
+    sleep=_REFRESH.get(iv,30)
+    ts_log("Verifying initial download…")
+    verified=False
+    for att in range(6):
+        df=fetch_ohlcv(sym,iv,per)
+        if df is not None and not df.empty and float(df["Close"].iloc[-1])>0:
+            ltp=float(df["Close"].iloc[-1]); ts_update({"verified_entry":True,"live_ltp":ltp,"live_df":df})
+            ts_log(f"LTP verified {ltp:.4f} ({len(df)} bars)"); verified=True; break
+        ts_log(f"Attempt {att+1} failed, retry 3s…"); time.sleep(3)
+    if not verified:
+        ts_update({"running":False,"error":"Could not verify initial price after 6 attempts."})
+        ts_log("Thread exiting — verification failed"); return
+    position=None; daily_pnl=0.0; last_date=datetime.now(IST).date(); prev_ltp=None
     def in_window():
-        if not en_tf: return True
-        now_t=datetime.datetime.now(_IST).time()
         try:
-            sh,sm=int(tf_s.split(":")[0]),int(tf_s.split(":")[1][:2])
-            eh,em=int(tf_e.split(":")[0]),int(tf_e.split(":")[1][:2])
-            return datetime.time(sh,sm)<=now_t<=datetime.time(eh,em)
+            now=datetime.now(IST); h0,m0=map(int,t0.split(":")); h1,m1=map(int,t1.split(":"))
+            m=now.hour*60+now.minute; return h0*60+m0<=m<=h1*60+m1
         except: return True
-    def day_ok():
-        if not en_pnl: return True
-        return max_loss<_get("day_pnl",0.0)<max_prof
-    log(f"▶ STARTED | {ticker} | {iv}/{period} | {strat}")
-    _set("thread_alive",True); last_fetch=0.0; cached_df=None; last_bar_dt=None; last_exit=0.0; first_fetch_done=False
-    while True:
-        _set("thread_last_beat",time.time())
-        stop_req=stop_ev.is_set(); has_pos=_get("current_position") is not None
-        if stop_req and not has_pos: break
+    def dow_ok(): dows=cfg.get("filter_dow",[]); return not dows or datetime.now(IST).weekday() in dows
+    while ts_get("running"):
         try:
-            if time.time()-last_fetch>=2.5:
-                try:
-                    _http_wait()
-                    df_new=_fetch_http(ticker,period,iv)
-                    if df_new is None or len(df_new)<2:
-                        _http_wait(2.0); df_new=_fetch_yf(ticker,period,iv)
-                    if df_new is not None and len(df_new)>1:
-                        df_new=_mkt_filter(df_new,iv); cached_df=df_new; last_fetch=time.time()
-                        lc_row=df_new.iloc[-1]
-                        ltp_v=round(float(lc_row["Close"]),4)
-                        # Try real-time price patch
-                        try:
-                            rt=_get_rt_price(ticker)
-                            if rt and abs(rt-ltp_v)/max(ltp_v,1)<0.03: ltp_v=rt
-                        except: pass
-                        _set("live_ltp",ltp_v)
-                        _set("last_candle",{"datetime":ts_to_ist(df_new.index[-1]),
-                            "open":round(float(lc_row["Open"]),4),"high":round(float(lc_row["High"]),4),
-                            "low":round(float(lc_row["Low"]),4),"close":ltp_v,
-                            "volume":int(lc_row["Volume"]) if not pd.isna(lc_row["Volume"]) else 0,
-                            "fetch_ts":now_ist()})
-                        _set("live_data",{"open":df_new["Open"].tolist(),"high":df_new["High"].tolist(),
-                            "low":df_new["Low"].tolist(),"close":df_new["Close"].tolist(),
-                            "volume":df_new["Volume"].tolist(),"index":[ts_to_ist(x) for x in df_new.index]})
-                        pos_now=_get("current_position")
-                        if pos_now is not None:
-                            pv=(ltp_v-pos_now["entry_price"]) if pos_now["signal_type"]==1 else (pos_now["entry_price"]-ltp_v)
-                            _set("current_pnl",round(pv,4))
-                        if strat=="Elliott Wave" and len(df_new)>=20:
-                            try: _set("ew_state",detect_ew(df_new,cfg.get("min_wave_pct",.5),cfg.get("ew_left",4),cfg.get("ew_right",4)))
-                            except: pass
-                        # Simple entry on first verified fetch
-                        if imm and not first_fetch_done and not has_pos:
-                            sv=1 if strat=="Simple Buy" else -1; ep=ltp_v
-                            nsl=calc_sl(ep,sv,cfg,df_new,len(df_new)-1); ntg=calc_tgt(ep,sv,cfg,df_new,len(df_new)-1)
-                            _set("current_position",{"entry_dt":now_ist_full(),"entry_price":ep,"signal_type":sv,
-                                "initial_sl":nsl,"current_sl":nsl,"target":ntg,"signal_reason":f"{strat} @ {ep:.4f}"})
-                            _set("current_pnl",0.0)
-                            log(f"◆ {'BUY' if sv==1 else 'SELL'} ENTERED | EP={ep:.4f} SL={nsl:.4f} Tgt={ntg:.4f}")
-                            if dhan_cfg.get("enabled"):
-                                r=place_opt_entry(dhan_cfg,sv,ep) if dhan_cfg.get("options_trading") else place_eq_entry(dhan_cfg,sv,ep)
-                                log(f"  Dhan: {r}")
-                        first_fetch_done=True; log(f"[DATA] LTP={ltp_v:.4f} | {ts_to_ist(df_new.index[-1])}")
-                    else: log("[WARN] Fetch empty")
-                except Exception as ex: log(f"[FETCH ERR] {ex}"); stop_ev.wait(2.0); continue
-            if cached_df is None or len(cached_df)<3: stop_ev.wait(1.0); continue
-            df=cached_df; ltp=_get("live_ltp") or float(df["Close"].iloc[-1])
-            # Trailing SL
-            pos=_get("current_position")
-            if pos is not None:
-                pos=ratchet_sl(pos,ltp,cfg,df,len(df)-1); _set("current_position",pos)
-            # Live PnL update
-            pos=_get("current_position")
-            if pos is not None:
-                pv=(ltp-pos["entry_price"]) if pos["signal_type"]==1 else (pos["entry_price"]-ltp)
-                _set("current_pnl",round(pv,4))
-            # Exit check (SL first, conservative)
-            pos=_get("current_position")
-            if pos is not None:
-                sl=pos["current_sl"]; tgt=pos["target"]; sig=pos["signal_type"]; ep=pos["entry_price"]
-                xp=None; xr=None
-                min_move=0.01; price_moved=abs(ltp-ep)>=min_move
-                if cfg.get("sl_type")=="EMA Reverse Crossover" or tgt_t=="EMA Reverse Crossover":
-                    fe2=ema(df["Close"],cfg.get("fast_ema",9)); se3=ema(df["Close"],cfg.get("slow_ema",15))
-                    if len(fe2)>=2:
-                        f0,f1=float(fe2.iloc[-1]),float(fe2.iloc[-2]); s0,s1=float(se3.iloc[-1]),float(se3.iloc[-2])
-                        if sig==1 and f1>=s1 and f0<s0: xp=ltp; xr="EMA Rev X Exit"
-                        elif sig==-1 and f1<=s1 and f0>s0: xp=ltp; xr="EMA Rev X Exit"
-                if xp is None and price_moved:
-                    if sig==1:
-                        if ltp<=sl: xp=ltp; xr="SL Hit"
-                        elif tgt_t!="Trailing Target (Display Only)" and ltp>=tgt: xp=ltp; xr="Target Hit"
-                    else:
-                        if ltp>=sl: xp=ltp; xr="SL Hit"
-                        elif tgt_t!="Trailing Target (Display Only)" and ltp<=tgt: xp=ltp; xr="Target Hit"
-                if xp is not None:
-                    pnl_v=((xp-ep) if sig==1 else (ep-xp))*qty
-                    log(f"◼ EXIT {xr} | EP={ep:.4f} XP={xp:.4f} PnL={pnl_v:+.2f}")
-                    hist=_get("trade_history") or []
-                    hist.append({"Entry DateTime":pos["entry_dt"],"Exit DateTime":now_ist_full(),
-                        "Signal":"BUY" if sig==1 else "SELL","Entry Price":round(ep,4),
-                        "Exit Price":round(xp,4),"SL":round(pos["initial_sl"],4),"Final SL":round(pos["current_sl"],4),
-                        "Target":round(tgt,4),"Entry Reason":pos.get("signal_reason",""),"Exit Reason":xr,
-                        "PnL":round(pnl_v,2),"Mode":"Live"})
-                    _set("trade_history",hist); _set("day_pnl",round(_get("day_pnl",0.0)+pnl_v,2))
-                    if dhan_cfg.get("enabled"): place_exit_order(dhan_cfg,pos,ltp,dhan_cfg.get("options_trading",False))
-                    _set("current_position",None); _set("current_pnl",0.0); last_exit=time.time()
-            # New signal
-            if stop_req: stop_ev.wait(1.0); continue
-            pos=_get("current_position")
-            if pos is None and not imm:
-                if not in_window(): stop_ev.wait(2.0); continue
-                if not day_ok(): log("⛔ PnL cap hit"); stop_ev.wait(30.0); continue
-                if use_cool and (time.time()-last_exit)<cooldown: stop_ev.wait(.5); continue
-                cur_bar=ts_to_ist(df.index[-2]) if len(df)>=2 else ts_to_ist(df.index[-1])
-                if strat=="Elliott Wave": cur_bar=ts_to_ist(df.index[-1])
-                if cur_bar==last_bar_dt: stop_ev.wait(.5); continue
-                if strat=="Elliott Wave":
-                    ew_live=detect_ew(df,cfg.get("min_wave_pct",.5),cfg.get("ew_left",4),cfg.get("ew_right",4))
-                    _set("ew_state",ew_live); sg_live=ew_live.get("signal","NONE")
-                    if sg_live=="BUY" and td not in ("Both","Long Only"): sg_live="NONE"
-                    if sg_live=="SELL" and td not in ("Both","Short Only"): sg_live="NONE"
-                    if sg_live in ("BUY","SELL"):
-                        last_bar_dt=cur_bar; sv2=1 if sg_live=="BUY" else -1; ep=ltp
-                        nsl=float(ew_live["sl"]) if ew_live.get("sl") else calc_sl(ep,sv2,cfg,df,len(df)-1)
-                        ntg=float(ew_live["target"]) if ew_live.get("target") else calc_tgt(ep,sv2,cfg,df,len(df)-1)
-                        reason=f"EW|{ew_live.get('pattern','')}|{ew_live.get('current_wave','')}"
-                        _set("current_position",{"entry_dt":now_ist_full(),"entry_price":ep,"signal_type":sv2,
-                             "initial_sl":nsl,"current_sl":nsl,"target":ntg,"signal_reason":reason})
-                        _set("current_pnl",0.0); log(f"◆ EW {'BUY' if sv2==1 else 'SELL'} | EP={ep:.4f} SL={nsl:.4f} Tgt={ntg:.4f}")
-                        if dhan_cfg.get("enabled"):
-                            r=place_opt_entry(dhan_cfg,sv2,ep) if dhan_cfg.get("options_trading") else place_eq_entry(dhan_cfg,sv2,ep)
-                            log(f"  Dhan: {r}")
-                    else: log(f"[EW] {ew_live.get('pattern','')} Signal={sg_live} — scanning")
-                else:
-                    sgs,rss,idns=generate_signals(df,cfg)
-                    if "elliott" in idns: _set("ew_state",idns["elliott"])
-                    # Check last 2 bars for signal (catches crossover even if we missed exact boundary)
-                    sv2=0; sidx_used=-1
-                    for chk in [max(len(sgs)-2,0), max(len(sgs)-1,0)]:
-                        if int(sgs.iloc[chk])!=0: sv2=int(sgs.iloc[chk]); sidx_used=chk; break
-                    if sv2!=0:
-                        last_bar_dt=cur_bar; ep=ltp
-                        nsl=calc_sl(ep,sv2,cfg,df,len(df)-1); ntg=calc_tgt(ep,sv2,cfg,df,len(df)-1)
-                        reason=str(rss.iloc[sidx_used])
-                        _set("current_position",{"entry_dt":now_ist_full(),"entry_price":ep,"signal_type":sv2,
-                             "initial_sl":nsl,"current_sl":nsl,"target":ntg,"signal_reason":reason})
-                        _set("current_pnl",0.0)
-                        log(f"◆ {'BUY' if sv2==1 else 'SELL'} | EP={ep:.4f} SL={nsl:.4f} Tgt={ntg:.4f}")
-                        log(f"  {reason[:80]}")
-                        if dhan_cfg.get("enabled"):
-                            r=place_opt_entry(dhan_cfg,sv2,ep) if dhan_cfg.get("options_trading") else place_eq_entry(dhan_cfg,sv2,ep)
-                            log(f"  Dhan: {r}")
-            elif pos is None and imm and first_fetch_done:
-                if use_cool and (time.time()-last_exit)<cooldown: stop_ev.wait(.5); continue
-                if not in_window(): stop_ev.wait(2.0); continue
-                sv3=1 if strat=="Simple Buy" else -1; ep=ltp
-                nsl=calc_sl(ep,sv3,cfg,df,len(df)-1); ntg=calc_tgt(ep,sv3,cfg,df,len(df)-1)
-                _set("current_position",{"entry_dt":now_ist_full(),"entry_price":ep,"signal_type":sv3,
-                     "initial_sl":nsl,"current_sl":nsl,"target":ntg,"signal_reason":f"{strat} re-entry @ {ep:.4f}"})
-                _set("current_pnl",0.0); log(f"◆ RE-ENTER {'BUY' if sv3==1 else 'SELL'} | EP={ep:.4f}")
-        except Exception as ex: log(f"[ERR] {ex}")
-        stop_ev.wait(1.5)
-    _set("live_running",False); _set("thread_alive",False); log("⏹ STOPPED.")
+            ts_set("thread_heartbeat",datetime.now(IST).isoformat())
+            today=datetime.now(IST).date()
+            if today!=last_date: daily_pnl=0.0; last_date=today; ts_set("daily_pnl",0.0); ts_log("Daily PnL reset")
+            if max_loss>0 and daily_pnl<=-max_loss: time.sleep(sleep); continue
+            if max_profit>0 and daily_pnl>=max_profit: time.sleep(sleep); continue
+            if ts_get("squareoff_requested") and position:
+                df=fetch_ohlcv(sym,iv,per)
+                if df is not None and not df.empty:
+                    ltp=float(df["Close"].iloc[-1]); pnl=(ltp-position["entry"])*position["side"]*qty
+                    _rec_live(position,ltp,"Squareoff",pnl); daily_pnl+=pnl
+                    ts_update({"live_pnl":round(daily_pnl,4),"daily_pnl":round(daily_pnl,4),"live_position":None,"squareoff_requested":False,"trailing_sl":None,"phase":1})
+                    ts_log(f"Squareoff @ {ltp:.4f} PnL={pnl:+.4f}"); position=None
+                time.sleep(1); continue
+            df=fetch_ohlcv(sym,iv,per)
+            if df is None or df.empty: ts_log("Data fetch failed, skipping"); time.sleep(sleep); continue
+            df["EMA_fast"]=ema(df["Close"],fast); df["EMA_slow"]=ema(df["Close"],slow); df["ATR"]=calc_atr(df,atr_p)
+            ltp=float(df["Close"].iloc[-1]); bar_t=df.index[-1]; atr_v=float(df["ATR"].iloc[-1])
+            if prev_ltp is not None and abs(ltp-prev_ltp)<0.01:
+                ts_update({"live_ltp":ltp,"live_df":df,"last_bar_time":bar_t.isoformat()}); time.sleep(sleep); continue
+            prev_ltp=ltp
+            ts_update({"live_ltp":ltp,"live_df":df,"last_bar_time":bar_t.isoformat(),"candle_count":(ts_get("candle_count") or 0)+1})
+            if position:
+                side=position["side"]; ep=position["entry"]; sl_p=position["sl"]; tgt=position["target"]
+                sl_t=position["sl_type"]; sl_par=position["sl_param"]; atr_v2=position["atr"]
+                trail=position.get("trailing_sl",sl_p); ph=position.get("phase",1); lk=position.get("locked_sl",None)
+                trail,ph,lk=update_trail(trail,ltp,side,sl_t,sl_par,ep,atr_v2,ph,lk)
+                position.update({"trailing_sl":trail,"phase":ph,"locked_sl":lk})
+                eff=trail if sl_t in TRAILING_SL_TYPES else sl_p
+                unreal=(ltp-ep)*side*qty
+                ts_update({"live_pnl":round(daily_pnl+unreal,4),"live_pnl_pct":round(unreal/(ep or 1)*100,4),
+                           "trailing_sl":trail,"phase":ph,
+                           "live_position":{**{k:v for k,v in position.items() if k!="entry_time"},
+                                            "entry_time":position["entry_time"].isoformat() if isinstance(position["entry_time"],datetime) else str(position["entry_time"]),
+                                            "unrealized_pnl":round(unreal,4),"eff_sl":round(eff,4)}})
+                if sl_t=="Strategy Reverse Signal":
+                    rev=get_live_signal(df,strat,cfg)
+                    if rev!=0 and rev!=side:
+                        pnl=(ltp-ep)*side*qty; _rec_live(position,ltp,"Strategy Reverse",pnl); daily_pnl+=pnl
+                        ts_update({"live_pnl":round(daily_pnl,4),"daily_pnl":round(daily_pnl,4),"live_position":None})
+                        ts_log(f"Strategy Reverse exit @ {ltp:.4f} PnL={pnl:+.4f}"); position=None; time.sleep(sleep); continue
+                if sl_t=="EMA Reverse Crossover":
+                    rev=ema_live_check(df,fast,slow)
+                    if rev!=0 and rev!=side:
+                        pnl=(ltp-ep)*side*qty; _rec_live(position,ltp,"EMA Reverse",pnl); daily_pnl+=pnl
+                        ts_update({"live_pnl":round(daily_pnl,4),"daily_pnl":round(daily_pnl,4),"live_position":None})
+                        ts_log(f"EMA Reverse exit @ {ltp:.4f} PnL={pnl:+.4f}"); position=None; time.sleep(sleep); continue
+                sl_hit=(side==1 and ltp<=eff) or (side==-1 and ltp>=eff)
+                tgt_hit=(side==1 and ltp>=tgt) or (side==-1 and ltp<=tgt)
+                if sl_hit:
+                    pnl=(eff-ep)*side*qty; _rec_live(position,eff,"SL",pnl); daily_pnl+=pnl
+                    ts_update({"live_pnl":round(daily_pnl,4),"daily_pnl":round(daily_pnl,4),"live_position":None})
+                    ts_log(f"SL hit @ {eff:.4f} PnL={pnl:+.4f}"); position=None
+                elif tgt_hit:
+                    pnl=(tgt-ep)*side*qty; _rec_live(position,tgt,"Target",pnl); daily_pnl+=pnl
+                    ts_update({"live_pnl":round(daily_pnl,4),"daily_pnl":round(daily_pnl,4),"live_position":None})
+                    ts_log(f"Target hit @ {tgt:.4f} PnL={pnl:+.4f}"); position=None
+            if not position and in_window() and dow_ok():
+                sig=get_live_signal(df,strat,cfg)
+                if sig!=0:
+                    side=1 if sig==1 else -1
+                    sl_p=calc_sl(ltp,side,sl_type,sp,df,len(df)-1,atr_v,fast,slow)
+                    tgt_p=calc_target(ltp,side,sl_p,sl_type,tp,rr)
+                    ew_inf=detect_ew(df,cfg.get("ew_order",5)) if strat=="Elliott Wave" else {}
+                    position={"side":side,"entry":ltp,"sl":sl_p,"target":tgt_p,"sl_type":sl_type,
+                              "sl_param":sp,"entry_time":datetime.now(IST),"atr":atr_v,"qty":qty,
+                              "trailing_sl":sl_p,"phase":1,"locked_sl":None,"pattern":ew_inf.get("pattern","")}
+                    ts_update({"live_signal":sig,"live_ew_info":ew_inf})
+                    ts_log(f"{'BUY' if side==1 else 'SELL'} @ {ltp:.4f}  SL={sl_p:.4f}  TGT={tgt_p:.4f}")
+        except Exception as exc:
+            ts_log(f"Exception: {exc}"); ts_set("error",traceback.format_exc())
+        time.sleep(sleep)
+    ts_log("Live thread stopped"); ts_update({"live_position":None,"trailing_sl":None})
 
-# ── Optimization ──────────────────────────────────────────────────────────
-def run_opt(df,base_cfg,target_acc=0.0,ph=None):
-    rows=[]; total=len(range(5,22,2))*len(range(10,32,2))*5*4; done=0
-    for fp in range(5,22,2):
-        for sp in range(10,32,2):
-            if fp>=sp: done+=20; continue
-            for sl_p in [5,10,15,20,25]:
-                for tgt_p in [10,20,30,50]:
-                    try:
-                        c={**base_cfg,"fast_ema":fp,"slow_ema":sp,"sl_points":sl_p,"target_points":tgt_p}
-                        tr,_,_=run_backtest(df.copy(),c)
-                        if len(tr)>=3:
-                            w,nt,acc=calc_acc(tr); pnl=sum(t["PnL"] for t in tr)
-                            rows.append({"Fast EMA":fp,"Slow EMA":sp,"SL Pts":sl_p,"Tgt Pts":tgt_p,
-                                         "Trades":nt,"Wins":w,"Accuracy %":acc,"Total PnL":round(pnl,2),"Avg PnL":round(pnl/nt,2)})
-                    except: pass
-                    done+=1
-                    if ph and done%20==0: ph.progress(min(done/total,1.0))
-    if not rows: return pd.DataFrame()
-    res=pd.DataFrame(rows).sort_values("Accuracy %",ascending=False).reset_index(drop=True)
-    if target_acc>0:
-        f=res[res["Accuracy %"]>=target_acc]; return f if not f.empty else res
-    return res
+# ── Analysis ───────────────────────────────────────────────────────────────────
+def build_analysis(trades):
+    if not trades: return {}
+    df=pd.DataFrame(trades)
+    df["entry_dt"]=pd.to_datetime(df["entry_time"],errors="coerce")
+    df["exit_dt"] =pd.to_datetime(df["exit_time"], errors="coerce")
+    w=df[df["pnl"]>0]; lo=df[df["pnl"]<=0]
+    total=round(float(df["pnl"].sum()),4); wr=len(w)/len(df)*100 if len(df)>0 else 0
+    aw=float(w["pnl"].mean()) if not w.empty else 0.0
+    al=float(lo["pnl"].mean()) if not lo.empty else 0.0
+    pfd=abs(float(lo["pnl"].sum())); pf=abs(float(w["pnl"].sum()))/pfd if pfd>0 else np.inf
+    mw=float(w["pnl"].median()) if not w.empty else 0.0
+    ml=float(lo["pnl"].median()) if not lo.empty else 0.0
+    eq=np.array([0.0]+list(df["pnl"].cumsum())); pk=np.maximum.accumulate(eq); dd=pk-eq
+    if not lo.empty and "entry" in lo.columns and "sl" in lo.columns:
+        rsl=float((lo["entry"]-lo["sl"]).abs().median())
+    else: rsl=0.0
+    if not w.empty and "entry" in w.columns and "exit" in w.columns:
+        sgn=1 if df["side"].iloc[0]=="BUY" else -1
+        rtgt=float(((w["exit"]-w["entry"])*sgn).abs().median())
+    else: rtgt=0.0
+    rg=df.groupby("exit_reason")["pnl"].agg(["sum","count"]).reset_index()
+    df["date"]=df["entry_dt"].dt.date; dp=df.groupby("date")["pnl"].sum()
+    return {"df":df,"total_pnl":total,"win_rate":wr,"avg_win":aw,"avg_loss":al,
+            "profit_factor":pf,"max_drawdown":float(dd.max()),"total_trades":len(df),
+            "winners":len(w),"losers":len(lo),"median_win":mw,"median_loss":ml,
+            "rec_sl_pts":round(rsl,4),"rec_tgt_pts":round(rtgt,4),
+            "equity_arr":eq,"dd_arr":dd,"reason_grp":rg,"daily_pnl":dp}
 
-# ── Charts ─────────────────────────────────────────────────────────────────
-_G="#00e676";_R="#ff1744";_O="#ff9800";_B="#40c4ff";_Y="#ffea00";_P="#ce93d8"
-def _lo(title="",h=680):
-    return dict(title=dict(text=title,font=dict(color="white",size=13)),height=h,
-                template="plotly_dark",paper_bgcolor="rgba(13,17,23,1)",plot_bgcolor="rgba(13,17,23,1)",
-                font=dict(color="white",family="Space Mono,monospace"),xaxis_rangeslider_visible=False,
-                hovermode="x unified",legend=dict(bgcolor="rgba(0,0,0,0.4)",bordercolor="rgba(255,255,255,0.1)",borderwidth=1))
+# ── Plotly theme ───────────────────────────────────────────────────────────────
+_CL=dict(paper_bgcolor="#0d1117",plot_bgcolor="#161b22",
+         font=dict(family="Space Mono",color="#e6edf3",size=11),
+         xaxis=dict(gridcolor="#30363d",showgrid=True,zeroline=False,color="#e6edf3"),
+         yaxis=dict(gridcolor="#30363d",showgrid=True,zeroline=False,color="#e6edf3"),
+         margin=dict(l=52,r=24,t=46,b=42),
+         legend=dict(bgcolor="#161b22",bordercolor="#30363d",font=dict(color="#e6edf3",size=10)))
 
-def _prep(df):
-    d=df.copy()
-    for c in ["Open","High","Low","Close","Volume"]:
-        if c in d.columns: d[c]=pd.to_numeric(d[c],errors="coerce")
-    d=d.dropna(subset=["Open","High","Low","Close"]); d.index=d.index.astype(str); return d
-
-def bt_chart(df,trades,inds,cfg):
-    d=_prep(df); idx=list(d.index)
-    fig=make_subplots(rows=2,cols=1,shared_xaxes=True,row_heights=[0.78,.22],vertical_spacing=.02)
-    fig.add_trace(go.Candlestick(x=idx,open=d["Open"],high=d["High"],low=d["Low"],close=d["Close"],
-        name="Price",increasing=dict(line=dict(color=_G,width=1),fillcolor="rgba(0,230,118,0.15)"),
-        decreasing=dict(line=dict(color=_R,width=1),fillcolor="rgba(255,23,68,0.15)"),whiskerwidth=0),row=1,col=1)
-    if "fast_ema" in inds and len(inds["fast_ema"])==len(d):
-        fig.add_trace(go.Scatter(x=idx,y=inds["fast_ema"].values,name=f"EMA{cfg.get('fast_ema',9)}",line=dict(color=_O,width=1.8),mode="lines"),row=1,col=1)
-    if "slow_ema" in inds and len(inds["slow_ema"])==len(d):
-        fig.add_trace(go.Scatter(x=idx,y=inds["slow_ema"].values,name=f"EMA{cfg.get('slow_ema',15)}",line=dict(color=_B,width=1.8),mode="lines"),row=1,col=1)
-    ew=inds.get("elliott") or {}
-    for wl in (ew.get("wave_labels") or []):
-        try:
-            wi=wl.get("idx",0)
-            if 0<=wi<len(idx):
-                fig.add_annotation(x=idx[wi],y=float(wl["price"]),text=f"<b>{wl['label']}</b>",
-                    showarrow=True,arrowhead=2,arrowcolor=_Y,font=dict(color=_Y,size=12),
-                    bgcolor="rgba(10,14,19,0.85)",bordercolor=_Y,borderwidth=1,ax=0,ay=-30,row=1,col=1)
-        except: pass
-    idx_set=set(idx)
-    def _ni(s):
-        s=str(s)
-        if s in idx_set: return s
-        for x in idx:
-            if x[:16]==s[:16]: return x
-        return None
-    bx,by,bh=[],[],[]; sx,sy,sh_=[],[],[]; ex,ey,ec,eh=[],[],[],[]
-    for t in trades:
-        try:
-            ei=_ni(t.get("Entry DateTime","")); xi=_ni(t.get("Exit DateTime",""))
-            ep2=float(t["Entry Price"]); xp2=float(t["Exit Price"]); pnl2=float(t["PnL"])
-            ht=f"{t['Signal']} EP:{ep2:.4f} XP:{xp2:.4f} PnL:{pnl2:+.2f}"
-            if t["Signal"]=="BUY" and ei: bx.append(ei);by.append(ep2);bh.append(ht)
-            elif ei: sx.append(ei);sy.append(ep2);sh_.append(ht)
-            if xi: ec.append("rgba(0,230,118,0.9)" if pnl2>=0 else "rgba(255,23,68,0.9)"); ex.append(xi);ey.append(xp2);eh.append(ht)
-        except: continue
-    if bx: fig.add_trace(go.Scatter(x=bx,y=by,mode="markers",name="Buy",marker=dict(symbol="triangle-up",size=13,color=_G,line=dict(color="white",width=.8)),text=bh,hovertemplate="%{text}<extra></extra>"),row=1,col=1)
-    if sx: fig.add_trace(go.Scatter(x=sx,y=sy,mode="markers",name="Sell",marker=dict(symbol="triangle-down",size=13,color=_R,line=dict(color="white",width=.8)),text=sh_,hovertemplate="%{text}<extra></extra>"),row=1,col=1)
-    if ex: fig.add_trace(go.Scatter(x=ex,y=ey,mode="markers",name="Exit",marker=dict(symbol="x",size=11,color=ec,line=dict(color=ec,width=2)),text=eh,hovertemplate="%{text}<extra></extra>"),row=1,col=1)
-    for t in trades:
-        try:
-            ei=_ni(t.get("Entry DateTime","")); xi=_ni(t.get("Exit DateTime",""))
-            if ei and xi:
-                fig.add_shape(type="line",x0=ei,x1=xi,y0=float(t["SL"]),y1=float(t["SL"]),line=dict(color="rgba(255,23,68,0.4)",width=1,dash="dot"),row=1,col=1,xref="x",yref="y")
-                fig.add_shape(type="line",x0=ei,x1=xi,y0=float(t["Target"]),y1=float(t["Target"]),line=dict(color="rgba(0,230,118,0.4)",width=1,dash="dot"),row=1,col=1,xref="x",yref="y")
-        except: continue
-    vc=[_G if float(c)>=float(o) else _R for c,o in zip(d["Close"],d["Open"])]
-    fig.add_trace(go.Bar(x=idx,y=d["Volume"].values,name="Vol",marker_color=vc,opacity=.6,marker_line_width=0),row=2,col=1)
-    lo=_lo("Backtest",720); lo["xaxis"]=dict(type="category",showgrid=False,rangeslider=dict(visible=False),tickfont=dict(size=9),nticks=min(30,len(idx)))
-    lo["xaxis2"]=dict(type="category",showgrid=False,rangeslider=dict(visible=False))
-    lo["yaxis"]=dict(showgrid=True,gridcolor="rgba(255,255,255,0.07)",title="Price")
-    lo["yaxis2"]=dict(showgrid=True,gridcolor="rgba(255,255,255,0.05)",title="Volume")
-    fig.update_layout(**lo); fig.update_xaxes(rangeslider_visible=False); return fig
-
-def live_chart(df,pos,inds,cfg):
-    d=_prep(df); d=d.iloc[-120:] if len(d)>120 else d; idx=list(d.index)
-    fig=make_subplots(rows=2,cols=1,shared_xaxes=True,row_heights=[0.78,.22],vertical_spacing=.02)
-    fig.add_trace(go.Candlestick(x=idx,open=d["Open"],high=d["High"],low=d["Low"],close=d["Close"],
-        name="Price",increasing=dict(line=dict(color=_G,width=1),fillcolor="rgba(0,230,118,0.15)"),
-        decreasing=dict(line=dict(color=_R,width=1),fillcolor="rgba(255,23,68,0.15)"),whiskerwidth=0),row=1,col=1)
-    fp_=cfg.get("fast_ema",9); sp_=cfg.get("slow_ema",15)
-    try:
-        fe_=ema(d["Close"],fp_); fig.add_trace(go.Scatter(x=idx,y=fe_.values,name=f"EMA {fp_}",line=dict(color=_O,width=2),mode="lines"),row=1,col=1)
-        se_=ema(d["Close"],sp_); fig.add_trace(go.Scatter(x=idx,y=se_.values,name=f"EMA {sp_}",line=dict(color=_B,width=2),mode="lines"),row=1,col=1)
-    except: pass
-    if pos is not None:
-        ep3=float(pos["entry_price"]); sl3=float(pos["current_sl"]); tgt3=float(pos["target"])
-        fig.add_hline(y=ep3,line=dict(color="white",width=1.5,dash="dash"),annotation_text=f"Entry {ep3:.4f}",annotation_position="right",row=1,col=1)
-        fig.add_hline(y=sl3,line=dict(color=_R,width=2,dash="dash"),annotation_text=f"SL {sl3:.4f}",annotation_position="right",row=1,col=1)
-        fig.add_hline(y=tgt3,line=dict(color=_G,width=2,dash="dash"),annotation_text=f"Tgt {tgt3:.4f}",annotation_position="right",row=1,col=1)
-    idx_set_lc=set(idx)
-    ew=inds.get("elliott") or {}
-    for wl in (ew.get("wave_labels") or []):
-        try:
-            wl_dt=str(wl.get("dt","")); matched_x=None
-            if wl_dt in idx_set_lc: matched_x=wl_dt
-            else:
-                for ix in idx:
-                    if ix[:16]==wl_dt[:16]: matched_x=ix; break
-            if matched_x is None:
-                wi=wl.get("idx",0); lo2=wi-(len(df)-len(d))
-                if 0<=lo2<len(idx): matched_x=idx[lo2]
-            if matched_x:
-                fig.add_annotation(x=matched_x,y=float(wl["price"]),text=f"<b>{wl['label']}</b>",
-                    showarrow=True,arrowhead=2,arrowcolor=_Y,font=dict(color=_Y,size=10),
-                    bgcolor="rgba(10,14,19,0.85)",bordercolor=_Y,borderwidth=1,ax=0,ay=-25,row=1,col=1)
-        except: pass
-    if idx:
-        fig.add_trace(go.Scatter(x=[idx[-1]],y=[float(d["High"].iloc[-1])*1.001],mode="markers+text",
-            text=["▼ LIVE"],textposition="top center",textfont=dict(color=_Y,size=10),
-            marker=dict(symbol="circle",size=7,color=_Y),name="Latest",showlegend=False),row=1,col=1)
-    vc=[_G if float(c)>=float(o) else _R for c,o in zip(d["Close"],d["Open"])]
-    fig.add_trace(go.Bar(x=idx,y=d["Volume"].values,name="Vol",marker_color=vc,opacity=.6,marker_line_width=0),row=2,col=1)
-    lo3=_lo("Live",540); lo3["xaxis"]=dict(type="category",showgrid=False,rangeslider=dict(visible=False),tickfont=dict(size=9),nticks=min(20,len(idx)))
-    lo3["xaxis2"]=dict(type="category",showgrid=False,rangeslider=dict(visible=False))
-    lo3["yaxis"]=dict(showgrid=True,gridcolor="rgba(255,255,255,0.07)"); lo3["yaxis2"]=dict(showgrid=True,gridcolor="rgba(255,255,255,0.05)")
-    fig.update_layout(**lo3); fig.update_xaxes(rangeslider_visible=False); return fig
-
-# ── Analysis ──────────────────────────────────────────────────────────────
-def _enrich(trades):
-    df=pd.DataFrame(trades).copy()
-    for c in ["Entry Price","Exit Price","SL","Final SL","Target","PnL"]:
-        if c in df.columns: df[c]=pd.to_numeric(df[c],errors="coerce")
-    df["_edt"]=pd.to_datetime(df["Entry DateTime"].str.replace(" IST","",regex=False),errors="coerce")
-    df["Day"]=df["_edt"].dt.day_name().fillna("Unknown"); df["Hour"]=df["_edt"].dt.hour.fillna(-1).astype(int)
-    df["Win"]=(df["PnL"]>0).astype(int)
-    def _ex(pat,txt,d=np.nan):
-        m=re.search(pat,str(txt)); return float(m.group(1)) if m else d
-    df["Angle"]=df["Entry Reason"].apply(lambda x:_ex(r"∠=([\d.]+)",x))
-    df["Delta"]=df["Entry Reason"].apply(lambda x:_ex(r"Δ=([\d.]+)",x))
-    df["AngleBin"]=pd.cut(df["Angle"].fillna(0),bins=[0,5,10,20,30,45,60,90],labels=["0-5°","5-10°","10-20°","20-30°","30-45°","45-60°","60-90°"],include_lowest=True)
-    df["DeltaBin"]=pd.cut(df["Delta"].fillna(0),bins=[0,1,2,5,10,20,50,1e6],labels=["0-1","1-2","2-5","5-10","10-20","20-50","50+"],include_lowest=True)
-    return df
-
-def _bar(x,y,colors,title,ytitle="PnL",h=260):
-    fig=go.Figure(go.Bar(x=x,y=y,marker_color=colors,text=[f"{v:+.1f}" for v in y],textposition="outside",textfont=dict(size=10,color="white")))
-    fig.update_layout(**_lo(title,h),xaxis=dict(showgrid=False,tickfont=dict(size=10)),yaxis=dict(title=ytitle,showgrid=True,gridcolor="rgba(255,255,255,0.07)"),margin=dict(t=40,b=40,l=40,r=20))
+def candle_chart(df,signals=None,trades=None,ew_info=None,title=""):
+    fig=make_subplots(rows=3,cols=1,shared_xaxes=True,row_heights=[0.60,0.20,0.20],vertical_spacing=0.02)
+    fig.add_trace(go.Candlestick(x=df.index,open=df["Open"],high=df["High"],low=df["Low"],close=df["Close"],
+        name="Price",increasing_line_color="#3fb950",decreasing_line_color="#f85149",
+        increasing_fillcolor="#3fb950",decreasing_fillcolor="#f85149"),row=1,col=1)
+    if "EMA_fast" in df.columns: fig.add_trace(go.Scatter(x=df.index,y=df["EMA_fast"],line=dict(color="#58a6ff",width=1.4),name="EMA Fast"),row=1,col=1)
+    if "EMA_slow" in df.columns: fig.add_trace(go.Scatter(x=df.index,y=df["EMA_slow"],line=dict(color="#d29922",width=1.4),name="EMA Slow"),row=1,col=1)
+    if signals is not None:
+        buys=signals[signals==1]; sells=signals[signals==-1]
+        if not buys.empty:
+            by=df["Low"].reindex(buys.index,fill_value=df["Low"].min())*0.999
+            fig.add_trace(go.Scatter(x=buys.index,y=by,mode="markers",marker=dict(symbol="triangle-up",size=11,color="#3fb950"),name="BUY"),row=1,col=1)
+        if not sells.empty:
+            sy=df["High"].reindex(sells.index,fill_value=df["High"].max())*1.001
+            fig.add_trace(go.Scatter(x=sells.index,y=sy,mode="markers",marker=dict(symbol="triangle-down",size=11,color="#f85149"),name="SELL"),row=1,col=1)
+    if trades:
+        for t in trades[:150]:
+            c="rgba(63,185,80,.08)" if t["pnl"]>0 else "rgba(248,81,73,.08)"
+            try: fig.add_vrect(x0=pd.Timestamp(t["entry_time"]),x1=pd.Timestamp(t["exit_time"]),fillcolor=c,line_width=0,row=1,col=1)
+            except: pass
+    if ew_info and ew_info.get("fib"):
+        fc={0.236:"#58a6ff",0.382:"#d29922",0.500:"#e6edf3",0.618:"#d29922",0.786:"#bc8cff",1.000:"#f85149"}
+        for r,lvl in ew_info["fib"].items():
+            if r in fc: fig.add_hline(y=lvl,line_color=fc[r],line_dash="dot",line_width=1,annotation_text=f"Fib {r}",annotation_font_color=fc[r],row=1,col=1)
+    vc=["#3fb950" if c>=o else "#f85149" for c,o in zip(df["Close"],df["Open"])]
+    fig.add_trace(go.Bar(x=df.index,y=df["Volume"],marker_color=vc,name="Volume",opacity=0.7),row=2,col=1)
+    if "ATR" in df.columns: fig.add_trace(go.Scatter(x=df.index,y=df["ATR"],line=dict(color="#bc8cff",width=1.2),name="ATR"),row=3,col=1)
+    fig.update_layout(title=title,xaxis_rangeslider_visible=False,height=640,**_CL,showlegend=True)
     return fig
 
-def _grp(df,col):
-    g=df.groupby(col,observed=True)["PnL"].agg(["sum","count"])
-    w=df.groupby(col,observed=True)["Win"].sum(); g=g.join(w).rename(columns={"sum":"Net","count":"N","Win":"Wins"})
-    g["WR"]=(g["Wins"]/g["N"]*100).round(1)
-    return list(g.index),list(g["Net"].round(2)),[_G if v>=0 else _R for v in g["Net"]],list(g["WR"])
-
-def render_analysis(trades, cfg):
-    st.markdown("---"); st.markdown("## 🔬 Analysis & Insights")
-    df=_enrich(trades)
-    if df.empty: return
-    total=df["PnL"].sum(); bpnl=df[df["Signal"]=="BUY"]["PnL"].sum(); spnl=df[df["Signal"]=="SELL"]["PnL"].sum()
-    bwr=(df[df["Signal"]=="BUY"]["Win"].mean()*100) if (df["Signal"]=="BUY").any() else 0
-    swr=(df[df["Signal"]=="SELL"]["Win"].mean()*100) if (df["Signal"]=="SELL").any() else 0
-    st.markdown(f"""<div style="display:flex;flex-wrap:wrap;gap:10px;margin-bottom:14px;">
-      <div style="background:#1f2733;border:1px solid rgba(0,230,118,0.3);border-radius:8px;padding:10px 16px;">
-        <div style="font-size:10px;color:#8b949e;">TOTAL PnL</div>
-        <div style="font-size:22px;font-weight:700;color:{'#00e676' if total>=0 else '#ff1744'};">{total:+.2f}</div>
-      </div>
-      <div style="background:#1f2733;border:1px solid rgba(0,230,118,0.3);border-radius:8px;padding:10px 16px;">
-        <div style="font-size:10px;color:#8b949e;">BUY SIDE</div>
-        <div style="font-size:22px;font-weight:700;color:{'#00e676' if bpnl>=0 else '#ff1744'};">{bpnl:+.2f}</div>
-        <div style="font-size:10px;color:#8b949e;">{bwr:.1f}% win rate</div>
-      </div>
-      <div style="background:#1f2733;border:1px solid rgba(0,230,118,0.3);border-radius:8px;padding:10px 16px;">
-        <div style="font-size:10px;color:#8b949e;">SELL SIDE</div>
-        <div style="font-size:22px;font-weight:700;color:{'#00e676' if spnl>=0 else '#ff1744'};">{spnl:+.2f}</div>
-        <div style="font-size:10px;color:#8b949e;">{swr:.1f}% win rate</div>
-      </div></div>""",unsafe_allow_html=True)
-    st.markdown("### 📅 Time Analysis")
-    day_ord=["Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday"]
-    df_d=df[df["Day"].isin(day_ord)]; c1,c2=st.columns(2)
-    with c1:
-        if not df_d.empty:
-            x,y,c,_=_grp(df_d,"Day"); st.plotly_chart(_bar(x,y,c,"PnL by Day"),use_container_width=True,key="_ad")
-    with c2:
-        df_h=df[df["Hour"]>=0]
-        if not df_h.empty:
-            x,y,c,_=_grp(df_h,"Hour"); xl=[f"{h:02d}:00 IST" for h in x]
-            st.plotly_chart(_bar(xl,y,c,"PnL by Hour (IST)"),use_container_width=True,key="_ah")
-    st.markdown("### 📊 Long vs Short")
-    c3,c4=st.columns(2)
-    with c3:
-        g=df.groupby("Signal")["PnL"].sum().reset_index(); cc=[_G if v>=0 else _R for v in g["PnL"]]
-        st.plotly_chart(_bar(g["Signal"].tolist(),g["PnL"].round(2).tolist(),cc,"Net PnL by Side"),use_container_width=True,key="_as")
-    with c4:
-        g2=(df.groupby("Signal")["Win"].mean()*100).reset_index(); cc2=[_G if v>=50 else _R for v in g2["Win"]]
-        st.plotly_chart(_bar(g2["Signal"].tolist(),g2["Win"].round(1).tolist(),cc2,"Win Rate %",ytitle="Win%"),use_container_width=True,key="_aw")
-    ha=df["Angle"].notna().any(); hd=df["Delta"].notna().any()
-    if ha:
-        st.markdown("### 📐 Angle Analysis"); ca1,ca2=st.columns(2)
-        with ca1:
-            dfa=df.dropna(subset=["AngleBin"])
-            if not dfa.empty:
-                x,y,c,_=_grp(dfa,"AngleBin"); st.plotly_chart(_bar([str(v) for v in x],y,c,"PnL by Angle"),use_container_width=True,key="_aa")
-        with ca2:
-            dfa2=df.dropna(subset=["Angle"])
-            if not dfa2.empty:
-                c_=[_G if p>=0 else _R for p in dfa2["PnL"]]
-                fig=go.Figure(go.Scatter(x=dfa2["Angle"],y=dfa2["PnL"],mode="markers",marker=dict(color=c_,size=8)))
-                fig.add_hline(y=0,line=dict(color="rgba(255,255,255,0.3)",dash="dot",width=1))
-                fig.update_layout(**_lo("PnL vs Angle",260),margin=dict(t=40,b=40,l=40,r=20))
-                st.plotly_chart(fig,use_container_width=True,key="_aas")
-    if hd:
-        st.markdown("### ↔️ Delta Analysis"); cd1,cd2=st.columns(2)
-        with cd1:
-            dfd=df.dropna(subset=["DeltaBin"])
-            if not dfd.empty:
-                x,y,c,_=_grp(dfd,"DeltaBin"); st.plotly_chart(_bar([str(v) for v in x],y,c,"PnL by Delta"),use_container_width=True,key="_adb")
-        with cd2:
-            dfd2=df.dropna(subset=["Delta"])
-            if not dfd2.empty:
-                c_=[_G if p>=0 else _R for p in dfd2["PnL"]]
-                fig=go.Figure(go.Scatter(x=dfd2["Delta"],y=dfd2["PnL"],mode="markers",marker=dict(color=c_,size=8)))
-                fig.add_hline(y=0,line=dict(color="rgba(255,255,255,0.3)",dash="dot",width=1))
-                fig.update_layout(**_lo("PnL vs Delta",260),margin=dict(t=40,b=40,l=40,r=20))
-                st.plotly_chart(fig,use_container_width=True,key="_ads")
-    st.markdown("### 📈 Equity Curve & Drawdown")
-    cum=df["PnL"].cumsum(); dd=cum-cum.cummax(); ceq1,ceq2=st.columns(2)
-    with ceq1:
-        fig=go.Figure(go.Scatter(y=cum.values,mode="lines",line=dict(color=_B,width=2),fill="tozeroy",fillcolor="rgba(64,196,255,0.07)"))
-        fig.update_layout(**_lo("Equity Curve",240),xaxis=dict(showgrid=False),yaxis=dict(showgrid=True,gridcolor="rgba(255,255,255,0.07)"),margin=dict(t=40,b=30,l=40,r=20))
-        st.plotly_chart(fig,use_container_width=True,key="_aeq")
-    with ceq2:
-        fig=go.Figure(go.Scatter(y=dd.values,mode="lines",line=dict(color=_R,width=1.5),fill="tozeroy",fillcolor="rgba(255,23,68,0.1)"))
-        fig.update_layout(**_lo("Drawdown",240),xaxis=dict(showgrid=False),yaxis=dict(showgrid=True,gridcolor="rgba(255,255,255,0.07)"),margin=dict(t=40,b=30,l=40,r=20))
-        st.plotly_chart(fig,use_container_width=True,key="_add")
-    # ── Insights + Recommendations ────────────────────────────────────────
-    st.markdown("### 💡 Key Insights & Recommendations")
-    ins=[]
-    if not df_d.empty:
-        dp=df_d.groupby("Day")["PnL"].sum()
-        if not dp.empty: ins.append(f"🗓️ Best day: **{dp.idxmax()}** ({dp.max():+.2f}) · Worst: **{dp.idxmin()}** ({dp.min():+.2f}) → avoid trading on {dp.idxmin()}")
-    df_h2=df[df["Hour"]>=0]
-    if not df_h2.empty:
-        hp=df_h2.groupby("Hour")["PnL"].sum()
-        if not hp.empty: ins.append(f"⏰ Best hour: **{hp.idxmax():02d}:00–{hp.idxmax()+1:02d}:00 IST** ({hp.max():+.2f}) · Worst: **{hp.idxmin():02d}:00** ({hp.min():+.2f}) → set Trade Time Filter accordingly")
-    better_side="BUY (Long)" if bpnl>=spnl else "SELL (Short)"
-    ins.append(f"📊 Edge is on **{better_side}** side (BUY {bpnl:+.2f} / {bwr:.0f}% win vs SELL {spnl:+.2f} / {swr:.0f}% win) → enable '{('Long Only' if bpnl>=spnl else 'Short Only')}' in Trade Direction filter")
-    if ha:
-        dfa3=df.dropna(subset=["AngleBin"])
-        if not dfa3.empty:
-            ab=dfa3.groupby("AngleBin",observed=True)["PnL"].sum()
-            if not ab.empty: ins.append(f"📐 Best crossover angle: **{ab.idxmax()}** (PnL {ab.max():+.2f}) → set Angle Filter Min/Max to this range for higher quality entries")
-    if hd:
-        dfd3=df.dropna(subset=["DeltaBin"])
-        if not dfd3.empty:
-            db=dfd3.groupby("DeltaBin",observed=True)["PnL"].sum()
-            if not db.empty: ins.append(f"↔️ Best EMA delta: **{db.idxmax()}** (PnL {db.max():+.2f}) → set Delta Filter to this range to avoid weak crossovers")
-    sl_h=(df["Exit Reason"].str.contains("SL",na=False)).sum(); tgt_h=(df["Exit Reason"].str.contains("Target",na=False)).sum()
-    if sl_h+tgt_h>0:
-        tp=sl_h/(sl_h+tgt_h)*100
-        if tp>60: ins.append(f"🪤 SL trap rate: **{tp:.0f}%** — SL is too tight, consider increasing SL points or switching to ATR-based SL")
-        elif tgt_h>sl_h: ins.append(f"✅ Good target hit rate ({tgt_h} targets vs {sl_h} SLs) — current SL/Target ratio is working well")
-    cs=0; ms=0
-    for p in df["PnL"]: cs=cs+1 if p<0 else 0; ms=max(ms,cs)
-    if ms>=3: ins.append(f"⚠️ Max **{ms} consecutive losses** — consider reducing qty or adding a daily loss limit of {abs(df['PnL'].nsmallest(ms).sum()):.0f} pts in Daily PnL Cap")
-    avg_win=df[df["PnL"]>0]["PnL"].mean() if (df["PnL"]>0).any() else 0
-    avg_loss=abs(df[df["PnL"]<0]["PnL"].mean()) if (df["PnL"]<0).any() else 0
-    rr_actual=round(avg_win/max(avg_loss,1e-9),2)
-    ins.append(f"💰 Actual R:R = **{rr_actual:.2f}** (avg win {avg_win:.2f} / avg loss {avg_loss:.2f}) → {'maintain target size' if rr_actual>=1.5 else 'widen targets or tighten SL to improve R:R above 1.5'}")
-    # SL/Target recommendation
-    if len(df)>=5:
-        med_range=(df["Candle High"]-df["Candle Low"]).median() if "Candle High" in df.columns else 0
-        if med_range>0:
-            ins.append(f"🎯 Recommended SL: **{round(med_range*0.5,2)} pts** (50% of avg candle range {med_range:.2f}) · Recommended Target: **{round(med_range*1.5,2)} pts** (1.5× candle range) for this instrument/timeframe")
-    # EW-specific
-    df_ew=df[df["Entry Reason"].str.contains("EW",na=False)]
-    if not df_ew.empty:
-        ew_wr=round(df_ew["Win"].mean()*100,1); ew_pnl=df_ew["PnL"].sum()
-        ins.append(f"🌊 Elliott Wave trades: **{len(df_ew)}** | Win: **{ew_wr}%** | PnL: **{ew_pnl:+.2f}** → {'EW is adding value' if ew_pnl>0 else 'Consider using larger min_wave_pct to filter weak patterns'}")
-        try:
-            df_ew2=df_ew.copy()
-            df_ew2["Pattern"]=df_ew2["Entry Reason"].str.extract(r"EW[|]([^|]+)[|]")[0].fillna("Unknown")
-            pg=df_ew2.groupby("Pattern")["PnL"].agg(["sum","count"]).sort_values("sum",ascending=False)
-            if not pg.empty:
-                bp2=pg.index[0]; wp3=pg.index[-1]
-                ins.append(f"🌊 Best EW pattern: **{bp2[:40]}** (PnL {pg.loc[bp2,'sum']:+.2f}, {int(pg.loc[bp2,'count'])} trades)")
-                if bp2!=wp3: ins.append(f"🌊 Avoid EW pattern: **{wp3[:40]}** (PnL {pg.loc[wp3,'sum']:+.2f}) → skip this setup")
-        except: pass
-    for ins_item in ins:
-        st.markdown(f'<div style="background:#1f2733;border-left:3px solid {_B};border-radius:4px;padding:10px 14px;margin:5px 0;font-size:12px;color:#e6edf3;">{ins_item}</div>',unsafe_allow_html=True)
-
-def ew_panel(ew):
-    if not ew or ew.get("pattern")=="Insufficient Data": return
-    dc={"Bullish":_G,"Bearish":_R,"Bullish ABC":_Y,"Bearish ABC":_O}.get(ew.get("wave_direction",""),_B)
-    sc=_G if ew.get("signal")=="BUY" else (_R if ew.get("signal")=="SELL" else "#8b949e")
-    fib="".join(f'<div style="display:flex;justify-content:space-between;font-size:11px;padding:1px 0;color:#a0aab4;"><span>{k}</span><span style="color:#e6edf3;">{v}</span></div>' for k,v in (ew.get("fibonacci_levels") or {}).items())
-    wp="".join(f'<div style="display:flex;justify-content:space-between;font-size:11px;padding:1px 0;color:#a0aab4;"><span>{k}</span><span style="color:#e6edf3;">{v}</span></div>' for k,v in (ew.get("wave_points") or {}).items())
-    tgt2=ew.get("next_target"); ts=f"{tgt2:.4f}" if tgt2 else "–"
-    st.markdown(f"""<div style="background:#1f2733;border:1px solid rgba(255,255,255,0.08);border-radius:10px;padding:14px;margin:4px 0;">
-      <div style="font-size:13px;color:{_Y};font-weight:700;margin-bottom:6px;">🌊 {ew.get("pattern","–")}</div>
-      <div style="font-size:11px;color:{dc};font-weight:700;">{ew.get("wave_direction","–")}</div>
-      <div style="font-size:11px;color:#8b949e;margin:3px 0;">Done: {" → ".join(ew.get("completed_waves",[]) or ["–"])}</div>
-      <div style="font-size:12px;color:#e6edf3;margin:3px 0;">▶ {ew.get("current_wave","–")}</div>
-      <div style="font-size:12px;margin:4px 0;">Signal:<b style="color:{sc};"> {ew.get("signal","NONE")}</b> · Next:<b style="color:{_Y};"> {ts}</b></div>
-      <div style="margin-top:6px;">{wp}</div>
-      <div style="margin-top:6px;border-top:1px solid rgba(255,255,255,0.07);padding-top:6px;">{fib}</div>
-    </div>""",unsafe_allow_html=True)
-
-def run_opt(df,base_cfg,target_acc=0.0,ph=None):
-    rows=[]; total=len(range(5,22,2))*len(range(10,32,2))*5*4; done=0
-    for fp in range(5,22,2):
-        for sp in range(10,32,2):
-            if fp>=sp: done+=20; continue
-            for sl_p in [5,10,15,20,25]:
-                for tgt_p in [10,20,30,50]:
-                    try:
-                        c={**base_cfg,"fast_ema":fp,"slow_ema":sp,"sl_points":sl_p,"target_points":tgt_p}
-                        tr,_,_=run_backtest(df.copy(),c)
-                        if len(tr)>=3:
-                            w,nt,acc=calc_acc(tr); pnl=sum(t["PnL"] for t in tr)
-                            rows.append({"Fast EMA":fp,"Slow EMA":sp,"SL Pts":sl_p,"Tgt Pts":tgt_p,
-                                         "Trades":nt,"Wins":w,"Accuracy %":acc,"Total PnL":round(pnl,2),"Avg PnL":round(pnl/nt,2)})
-                    except: pass
-                    done+=1
-                    if ph and done%20==0: ph.progress(min(done/total,1.0))
-    if not rows: return pd.DataFrame()
-    res=pd.DataFrame(rows).sort_values("Accuracy %",ascending=False).reset_index(drop=True)
-    if target_acc>0:
-        f=res[res["Accuracy %"]>=target_acc]; return f if not f.empty else res
-    return res
-
-_G="#00e676";_R="#ff1744";_O="#ff9800";_B="#40c4ff";_Y="#ffea00";_P="#ce93d8"
-
-def _lo(title="",h=680):
-    return dict(title=dict(text=title,font=dict(color="white",size=13)),height=h,
-                template="plotly_dark",paper_bgcolor="rgba(13,17,23,1)",plot_bgcolor="rgba(13,17,23,1)",
-                font=dict(color="white",family="Space Mono,monospace"),xaxis_rangeslider_visible=False,
-                hovermode="x unified",legend=dict(bgcolor="rgba(0,0,0,0.4)",bordercolor="rgba(255,255,255,0.1)",borderwidth=1))
-
-def _prep(df):
-    d=df.copy()
-    for c in ["Open","High","Low","Close","Volume"]:
-        if c in d.columns: d[c]=pd.to_numeric(d[c],errors="coerce")
-    d=d.dropna(subset=["Open","High","Low","Close"]); d.index=d.index.astype(str); return d
-
-def bt_chart(df,trades,inds,cfg):
-    d=_prep(df); idx=list(d.index)
-    fig=make_subplots(rows=2,cols=1,shared_xaxes=True,row_heights=[0.78,.22],vertical_spacing=.02)
-    fig.add_trace(go.Candlestick(x=idx,open=d["Open"],high=d["High"],low=d["Low"],close=d["Close"],
-        name="Price",increasing=dict(line=dict(color=_G,width=1),fillcolor="rgba(0,230,118,0.15)"),
-        decreasing=dict(line=dict(color=_R,width=1),fillcolor="rgba(255,23,68,0.15)"),whiskerwidth=0),row=1,col=1)
-    # EMA overlays — always recompute on chart data for TV accuracy
-    fp_=cfg.get("fast_ema",9); sp_=cfg.get("slow_ema",15)
-    if cfg.get("strategy") not in ("Simple Buy","Simple Sell"):
-        try:
-            fe_c=ema(d["Close"],fp_)
-            fig.add_trace(go.Scatter(x=idx,y=fe_c.values,name=f"EMA {fp_}",line=dict(color=_O,width=1.8),mode="lines"),row=1,col=1)
-            se_c=ema(d["Close"],sp_)
-            fig.add_trace(go.Scatter(x=idx,y=se_c.values,name=f"EMA {sp_}",line=dict(color=_B,width=1.8),mode="lines"),row=1,col=1)
-        except: pass
-    ew=inds.get("elliott") or {}
-    for wl in (ew.get("wave_labels") or []):
-        try:
-            wi=wl.get("idx",0)
-            if 0<=wi<len(idx):
-                fig.add_annotation(x=idx[wi],y=float(wl["price"]),text=f"<b>{wl['label']}</b>",
-                    showarrow=True,arrowhead=2,arrowcolor=_Y,font=dict(color=_Y,size=12),
-                    bgcolor="rgba(10,14,19,0.85)",bordercolor=_Y,borderwidth=1,ax=0,ay=-30,row=1,col=1)
-        except: pass
-    idx_set=set(idx)
-    def _ni(s):
-        s=str(s)
-        if s in idx_set: return s
-        for x in idx:
-            if x[:16]==s[:16]: return x
-        return None
-    bx,by,bh=[],[],[]; sx,sy,sh_=[],[],[]; ex,ey,ec,eh=[],[],[],[]
-    for t in trades:
-        try:
-            ei=_ni(t.get("Entry DateTime","")); xi=_ni(t.get("Exit DateTime",""))
-            ep2=float(t["Entry Price"]); xp2=float(t["Exit Price"]); pnl2=float(t["PnL"])
-            ht=f"{t['Signal']} EP:{ep2:.4f} XP:{xp2:.4f} PnL:{pnl2:+.2f} | {t.get('Exit Reason','')}"
-            if t["Signal"]=="BUY" and ei: bx.append(ei);by.append(ep2);bh.append(ht)
-            elif ei: sx.append(ei);sy.append(ep2);sh_.append(ht)
-            if xi: ec.append("rgba(0,230,118,0.9)" if pnl2>=0 else "rgba(255,23,68,0.9)"); ex.append(xi);ey.append(xp2);eh.append(ht)
-        except: continue
-    if bx: fig.add_trace(go.Scatter(x=bx,y=by,mode="markers",name="Buy",marker=dict(symbol="triangle-up",size=13,color=_G,line=dict(color="white",width=.8)),text=bh,hovertemplate="%{text}<extra></extra>"),row=1,col=1)
-    if sx: fig.add_trace(go.Scatter(x=sx,y=sy,mode="markers",name="Sell",marker=dict(symbol="triangle-down",size=13,color=_R,line=dict(color="white",width=.8)),text=sh_,hovertemplate="%{text}<extra></extra>"),row=1,col=1)
-    if ex: fig.add_trace(go.Scatter(x=ex,y=ey,mode="markers",name="Exit",marker=dict(symbol="x",size=11,color=ec,line=dict(color=ec,width=2)),text=eh,hovertemplate="%{text}<extra></extra>"),row=1,col=1)
-    for t in trades:
-        try:
-            ei=_ni(t.get("Entry DateTime","")); xi=_ni(t.get("Exit DateTime",""))
-            if ei and xi:
-                fig.add_shape(type="line",x0=ei,x1=xi,y0=float(t["SL"]),y1=float(t["SL"]),line=dict(color="rgba(255,23,68,0.4)",width=1,dash="dot"),row=1,col=1,xref="x",yref="y")
-                fig.add_shape(type="line",x0=ei,x1=xi,y0=float(t["Target"]),y1=float(t["Target"]),line=dict(color="rgba(0,230,118,0.4)",width=1,dash="dot"),row=1,col=1,xref="x",yref="y")
-        except: continue
-    vc=[_G if float(c)>=float(o) else _R for c,o in zip(d["Close"],d["Open"])]
-    fig.add_trace(go.Bar(x=idx,y=d["Volume"].values,name="Vol",marker_color=vc,opacity=.6,marker_line_width=0),row=2,col=1)
-    lo=_lo("Backtest",720); lo["xaxis"]=dict(type="category",showgrid=False,rangeslider=dict(visible=False),tickfont=dict(size=9),nticks=min(30,len(idx)))
-    lo["xaxis2"]=dict(type="category",showgrid=False,rangeslider=dict(visible=False))
-    lo["yaxis"]=dict(showgrid=True,gridcolor="rgba(255,255,255,0.07)"); lo["yaxis2"]=dict(showgrid=True,gridcolor="rgba(255,255,255,0.05)")
-    fig.update_layout(**lo); fig.update_xaxes(rangeslider_visible=False); return fig
-
-def live_chart(df,pos,inds,cfg):
-    d=_prep(df); d=d.iloc[-100:] if len(d)>100 else d; idx=list(d.index)
-    fig=make_subplots(rows=2,cols=1,shared_xaxes=True,row_heights=[0.78,.22],vertical_spacing=.02)
-    fig.add_trace(go.Candlestick(x=idx,open=d["Open"],high=d["High"],low=d["Low"],close=d["Close"],
-        name="Price",increasing=dict(line=dict(color=_G,width=1),fillcolor="rgba(0,230,118,0.15)"),
-        decreasing=dict(line=dict(color=_R,width=1),fillcolor="rgba(255,23,68,0.15)"),whiskerwidth=0),row=1,col=1)
-    # Always recompute EMAs on chart data — ensures TV accuracy
-    fp_=cfg.get("fast_ema",9); sp_=cfg.get("slow_ema",15)
-    try:
-        fe_lc=ema(d["Close"],fp_)
-        fig.add_trace(go.Scatter(x=idx,y=fe_lc.values,name=f"EMA {fp_}",line=dict(color=_O,width=2),mode="lines"),row=1,col=1)
-        se_lc=ema(d["Close"],sp_)
-        fig.add_trace(go.Scatter(x=idx,y=se_lc.values,name=f"EMA {sp_}",line=dict(color=_B,width=2),mode="lines"),row=1,col=1)
-    except: pass
-    if pos is not None:
-        ep3=float(pos["entry_price"]); sl3=float(pos["current_sl"]); tgt3=float(pos["target"])
-        fig.add_hline(y=ep3,line=dict(color="white",width=1.5,dash="dash"),annotation_text=f"Entry {ep3:.4f}",annotation_position="right",row=1,col=1)
-        fig.add_hline(y=sl3,line=dict(color=_R,width=2,dash="dash"),annotation_text=f"SL {sl3:.4f}",annotation_position="right",row=1,col=1)
-        fig.add_hline(y=tgt3,line=dict(color=_G,width=2,dash="dash"),annotation_text=f"Tgt {tgt3:.4f}",annotation_position="right",row=1,col=1)
-    ew=inds.get("elliott") or {}
-    idx_set2=set(idx)
-    for wl in (ew.get("wave_labels") or []):
-        try:
-            matched_x=None; wl_dt=str(wl.get("dt",""))
-            if wl_dt in idx_set2: matched_x=wl_dt
-            else:
-                for ix in idx:
-                    if ix[:16]==wl_dt[:16]: matched_x=ix; break
-            if matched_x is None:
-                wi=wl.get("idx",0); lo2=wi-(len(df)-len(d))
-                if 0<=lo2<len(idx): matched_x=idx[lo2]
-            if matched_x:
-                fig.add_annotation(x=matched_x,y=float(wl["price"]),text=f"<b>{wl['label']}</b>",
-                    showarrow=True,arrowhead=2,arrowcolor=_Y,font=dict(color=_Y,size=10),
-                    bgcolor="rgba(10,14,19,0.85)",bordercolor=_Y,borderwidth=1,ax=0,ay=-25,row=1,col=1)
-        except: pass
-    if idx:
-        fig.add_trace(go.Scatter(x=[idx[-1]],y=[float(d["High"].iloc[-1])*1.001],mode="markers+text",
-            text=["▼ LIVE"],textposition="top center",textfont=dict(color=_Y,size=10),
-            marker=dict(symbol="circle",size=7,color=_Y),name="Latest",showlegend=False),row=1,col=1)
-    vc=[_G if float(c)>=float(o) else _R for c,o in zip(d["Close"],d["Open"])]
-    fig.add_trace(go.Bar(x=idx,y=d["Volume"].values,name="Vol",marker_color=vc,opacity=.6,marker_line_width=0),row=2,col=1)
-    lo3=_lo("Live Chart",540); lo3["xaxis"]=dict(type="category",showgrid=False,rangeslider=dict(visible=False),tickfont=dict(size=9),nticks=min(20,len(idx)))
-    lo3["xaxis2"]=dict(type="category",showgrid=False,rangeslider=dict(visible=False))
-    lo3["yaxis"]=dict(showgrid=True,gridcolor="rgba(255,255,255,0.07)"); lo3["yaxis2"]=dict(showgrid=True,gridcolor="rgba(255,255,255,0.05)")
-    fig.update_layout(**lo3); fig.update_xaxes(rangeslider_visible=False); return fig
-
-def _enrich(trades):
-    df=pd.DataFrame(trades).copy()
-    for c in ["Entry Price","Exit Price","SL","Final SL","Target","PnL"]:
-        if c in df.columns: df[c]=pd.to_numeric(df[c],errors="coerce")
-    df["_edt"]=pd.to_datetime(df["Entry DateTime"].str.replace(" IST","",regex=False),errors="coerce")
-    df["Day"]=df["_edt"].dt.day_name().fillna("Unknown"); df["Hour"]=df["_edt"].dt.hour.fillna(-1).astype(int)
-    df["Win"]=(df["PnL"]>0).astype(int)
-    def _ex(pat,txt,d=np.nan):
-        m=re.search(pat,str(txt)); return float(m.group(1)) if m else d
-    df["Angle"]=df["Entry Reason"].apply(lambda x:_ex(r"∠=([\d.]+)",x))
-    df["Delta"]=df["Entry Reason"].apply(lambda x:_ex(r"Δ=([\d.]+)",x))
-    df["AngleBin"]=pd.cut(df["Angle"].fillna(0),bins=[0,5,10,20,30,45,60,90],labels=["0-5°","5-10°","10-20°","20-30°","30-45°","45-60°","60-90°"],include_lowest=True)
-    df["DeltaBin"]=pd.cut(df["Delta"].fillna(0),bins=[0,1,2,5,10,20,50,1e6],labels=["0-1","1-2","2-5","5-10","10-20","20-50","50+"],include_lowest=True)
-    return df
-
-def _bar(x,y,colors,title,ytitle="PnL",h=260):
-    fig=go.Figure(go.Bar(x=x,y=y,marker_color=colors,text=[f"{v:+.1f}" for v in y],textposition="outside",textfont=dict(size=10,color="white")))
-    fig.update_layout(**_lo(title,h),xaxis=dict(showgrid=False,tickfont=dict(size=10)),yaxis=dict(title=ytitle,showgrid=True,gridcolor="rgba(255,255,255,0.07)"),margin=dict(t=40,b=40,l=40,r=20))
+def eq_chart(eq,dd):
+    fig=make_subplots(rows=2,cols=1,shared_xaxes=True,row_heights=[0.6,0.4],vertical_spacing=0.04)
+    x=list(range(len(eq)))
+    fig.add_trace(go.Scatter(x=x,y=eq,line=dict(color="#58a6ff",width=2),fill="tozeroy",fillcolor="rgba(88,166,255,.10)",name="Equity"),row=1,col=1)
+    fig.add_hline(y=0,line_color="#30363d",row=1,col=1)
+    fig.add_trace(go.Scatter(x=x,y=-dd,line=dict(color="#f85149",width=1.5),fill="tozeroy",fillcolor="rgba(248,81,73,.12)",name="Drawdown"),row=2,col=1)
+    fig.update_layout(title="Equity Curve & Drawdown",height=400,**_CL,showlegend=True)
     return fig
 
-def _grp(df,col):
-    g=df.groupby(col,observed=True)["PnL"].agg(["sum","count"])
-    w=df.groupby(col,observed=True)["Win"].sum()
-    g=g.join(w).rename(columns={"sum":"Net","count":"N","Win":"Wins"})
-    g["WR"]=(g["Wins"]/g["N"]*100).round(1)
-    return list(g.index),list(g["Net"].round(2)),[_G if v>=0 else _R for v in g["Net"]],list(g["WR"])
+def heatmap_chart(df_t):
+    df=df_t.copy()
+    df["dow"]=pd.to_datetime(df["entry_time"],errors="coerce").dt.day_name()
+    df["hour"]=pd.to_datetime(df["entry_time"],errors="coerce").dt.hour
+    pv=df.pivot_table(values="pnl",index="dow",columns="hour",aggfunc="sum",fill_value=0)
+    order=[d for d in ["Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday"] if d in pv.index]
+    pv=pv.reindex(order)
+    fig=go.Figure(go.Heatmap(z=pv.values,x=[f"{h}:00" for h in pv.columns],y=pv.index.tolist(),zmid=0,
+        colorscale=[[0,"#f85149"],[0.5,"#161b22"],[1,"#3fb950"]],
+        text=np.round(pv.values,1),texttemplate="%{text}",colorbar=dict(tickfont=dict(color="#e6edf3"))))
+    fig.update_layout(title="PnL Heatmap  (Day × Hour IST)",height=310,**_CL)
+    return fig
 
-def render_analysis(trades):
-    st.markdown("---"); st.markdown("## 🔬 Analysis & Insights")
-    df=_enrich(trades)
-    if df.empty: return
-    total=df["PnL"].sum(); bpnl=df[df["Signal"]=="BUY"]["PnL"].sum(); spnl=df[df["Signal"]=="SELL"]["PnL"].sum()
-    bwr=(df[df["Signal"]=="BUY"]["Win"].mean()*100) if (df["Signal"]=="BUY").any() else 0
-    swr=(df[df["Signal"]=="SELL"]["Win"].mean()*100) if (df["Signal"]=="SELL").any() else 0
-    st.markdown(f"""<div style="display:flex;flex-wrap:wrap;gap:10px;margin-bottom:14px;">
-      <div style="background:#1f2733;border:1px solid rgba(0,230,118,0.3);border-radius:8px;padding:10px 16px;">
-        <div style="font-size:10px;color:#8b949e;">TOTAL PnL</div>
-        <div style="font-size:22px;font-weight:700;color:{'#00e676' if total>=0 else '#ff1744'};">{total:+.2f}</div></div>
-      <div style="background:#1f2733;border:1px solid rgba(0,230,118,0.3);border-radius:8px;padding:10px 16px;">
-        <div style="font-size:10px;color:#8b949e;">BUY SIDE</div>
-        <div style="font-size:22px;font-weight:700;color:{'#00e676' if bpnl>=0 else '#ff1744'};">{bpnl:+.2f}</div>
-        <div style="font-size:10px;color:#8b949e;">{bwr:.1f}% win rate</div></div>
-      <div style="background:#1f2733;border:1px solid rgba(0,230,118,0.3);border-radius:8px;padding:10px 16px;">
-        <div style="font-size:10px;color:#8b949e;">SELL SIDE</div>
-        <div style="font-size:22px;font-weight:700;color:{'#00e676' if spnl>=0 else '#ff1744'};">{spnl:+.2f}</div>
-        <div style="font-size:10px;color:#8b949e;">{swr:.1f}% win rate</div></div>
-    </div>""",unsafe_allow_html=True)
-    st.markdown("### 📅 Time Analysis")
-    day_ord=["Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday"]
-    df_d=df[df["Day"].isin(day_ord)]; c1,c2=st.columns(2)
-    with c1:
-        if not df_d.empty:
-            x,y,c,_=_grp(df_d,"Day"); st.plotly_chart(_bar(x,y,c,"PnL by Day"),use_container_width=True,key="_ad")
-    with c2:
-        df_h=df[df["Hour"]>=0]
-        if not df_h.empty:
-            x,y,c,_=_grp(df_h,"Hour"); xl=[f"{h:02d}:00 IST" for h in x]
-            st.plotly_chart(_bar(xl,y,c,"PnL by Hour (IST)"),use_container_width=True,key="_ah")
-    st.markdown("### 📊 Long vs Short"); c3,c4=st.columns(2)
-    with c3:
-        g=df.groupby("Signal")["PnL"].sum().reset_index(); cc=[_G if v>=0 else _R for v in g["PnL"]]
-        st.plotly_chart(_bar(g["Signal"].tolist(),g["PnL"].round(2).tolist(),cc,"Net PnL by Side"),use_container_width=True,key="_as")
-    with c4:
-        g2=(df.groupby("Signal")["Win"].mean()*100).reset_index(); cc2=[_G if v>=50 else _R for v in g2["Win"]]
-        st.plotly_chart(_bar(g2["Signal"].tolist(),g2["Win"].round(1).tolist(),cc2,"Win Rate %",ytitle="Win%"),use_container_width=True,key="_aw")
-    ha=df["Angle"].notna().any(); hd=df["Delta"].notna().any()
-    if ha:
-        st.markdown("### 📐 Angle Analysis"); ca1,ca2=st.columns(2)
-        with ca1:
-            dfa=df.dropna(subset=["AngleBin"])
-            if not dfa.empty:
-                x,y,c,_=_grp(dfa,"AngleBin"); st.plotly_chart(_bar([str(v) for v in x],y,c,"PnL by Angle"),use_container_width=True,key="_aa")
-        with ca2:
-            dfa2=df.dropna(subset=["Angle"])
-            if not dfa2.empty:
-                c_=[_G if p>=0 else _R for p in dfa2["PnL"]]
-                fig=go.Figure(go.Scatter(x=dfa2["Angle"],y=dfa2["PnL"],mode="markers",marker=dict(color=c_,size=8)))
-                fig.add_hline(y=0,line=dict(color="rgba(255,255,255,0.3)",dash="dot",width=1))
-                fig.update_layout(**_lo("PnL vs Angle",260),margin=dict(t=40,b=40,l=40,r=20))
-                st.plotly_chart(fig,use_container_width=True,key="_aas")
-    if hd:
-        st.markdown("### ↔️ Delta Analysis"); cd1,cd2=st.columns(2)
-        with cd1:
-            dfd=df.dropna(subset=["DeltaBin"])
-            if not dfd.empty:
-                x,y,c,_=_grp(dfd,"DeltaBin"); st.plotly_chart(_bar([str(v) for v in x],y,c,"PnL by Delta"),use_container_width=True,key="_adb")
-        with cd2:
-            dfd2=df.dropna(subset=["Delta"])
-            if not dfd2.empty:
-                c_=[_G if p>=0 else _R for p in dfd2["PnL"]]
-                fig=go.Figure(go.Scatter(x=dfd2["Delta"],y=dfd2["PnL"],mode="markers",marker=dict(color=c_,size=8)))
-                fig.add_hline(y=0,line=dict(color="rgba(255,255,255,0.3)",dash="dot",width=1))
-                fig.update_layout(**_lo("PnL vs Delta",260),margin=dict(t=40,b=40,l=40,r=20))
-                st.plotly_chart(fig,use_container_width=True,key="_ads")
-    st.markdown("### 📈 Equity Curve"); cum=df["PnL"].cumsum(); dd=cum-cum.cummax(); ceq1,ceq2=st.columns(2)
-    with ceq1:
-        fig=go.Figure(go.Scatter(y=cum.values,mode="lines",line=dict(color=_B,width=2),fill="tozeroy",fillcolor="rgba(64,196,255,0.07)"))
-        fig.update_layout(**_lo("Equity Curve",240),xaxis=dict(showgrid=False),yaxis=dict(showgrid=True,gridcolor="rgba(255,255,255,0.07)"),margin=dict(t=40,b=30,l=40,r=20))
-        st.plotly_chart(fig,use_container_width=True,key="_aeq")
-    with ceq2:
-        fig=go.Figure(go.Scatter(y=dd.values,mode="lines",line=dict(color=_R,width=1.5),fill="tozeroy",fillcolor="rgba(255,23,68,0.1)"))
-        fig.update_layout(**_lo("Drawdown",240),xaxis=dict(showgrid=False),yaxis=dict(showgrid=True,gridcolor="rgba(255,255,255,0.07)"),margin=dict(t=40,b=30,l=40,r=20))
-        st.plotly_chart(fig,use_container_width=True,key="_add")
-    # Key insights + EW insights
-    st.markdown("### 💡 Key Insights & Recommendations")
-    ins=[]
-    if not df_d.empty:
-        dp=df_d.groupby("Day")["PnL"].sum()
-        if not dp.empty: ins.append(f"🗓️ Best day: **{dp.idxmax()}** ({dp.max():+.2f}) · Worst: **{dp.idxmin()}** ({dp.min():+.2f}) → avoid {dp.idxmin()}")
-    df_h2=df[df["Hour"]>=0]
-    if not df_h2.empty:
-        hp=df_h2.groupby("Hour")["PnL"].sum()
-        if not hp.empty: ins.append(f"⏰ Best hour: **{hp.idxmax():02d}:00 IST** ({hp.max():+.2f}) · Worst: **{hp.idxmin():02d}:00 IST** ({hp.min():+.2f})")
-    ins.append(f"📊 Side edge: BUY {bpnl:+.2f} ({bwr:.0f}% win) vs SELL {spnl:+.2f} ({swr:.0f}% win) → focus on **{'BUY' if bpnl>spnl else 'SELL'}**")
-    sl_h=(df["Exit Reason"].str.contains("SL",na=False)).sum(); tgt_h=(df["Exit Reason"].str.contains("Target",na=False)).sum()
-    if sl_h+tgt_h>0:
-        tp=sl_h/(sl_h+tgt_h)*100
-        ins.append(f"🪤 SL trap rate: **{tp:.1f}%** ({sl_h} SL vs {tgt_h} Target) — {'⚠️ widen your SL or improve entries' if tp>50 else '✅ good target hit rate'}")
-    # SL/Target recommendations
-    avg_win=df[df["Win"]==1]["PnL"].mean() if df["Win"].sum()>0 else 0
-    avg_loss=df[df["Win"]==0]["PnL"].mean() if (df["Win"]==0).sum()>0 else 0
-    if avg_win>0 and avg_loss<0:
-        rr=abs(avg_win/avg_loss); ins.append(f"💰 Avg Win/Loss Ratio: **{rr:.2f}** — {'✅ positive edge' if rr>1 else '⚠️ losses > wins, tighten entries or widen targets'}")
-    if ha:
-        dfa3=df.dropna(subset=["AngleBin"])
-        if not dfa3.empty:
-            ab=dfa3.groupby("AngleBin",observed=True)["PnL"].sum()
-            if not ab.empty: ins.append(f"📐 Best crossover angle: **{ab.idxmax()}** (PnL {ab.max():+.2f}) → set Min/Max angle filter to this range for better entries")
-    if hd:
-        dfd3=df.dropna(subset=["DeltaBin"])
-        if not dfd3.empty:
-            db=dfd3.groupby("DeltaBin",observed=True)["PnL"].sum()
-            if not db.empty: ins.append(f"↔️ Best delta range: **{db.idxmax()}** (PnL {db.max():+.2f}) → filter entries where |Fast-Slow| is in this range")
-    cs=0; ms=0
-    for p in df["PnL"]: cs=cs+1 if p<0 else 0; ms=max(ms,cs)
-    if ms>0: ins.append(f"⚠️ Max consecutive losses: **{ms}** — risk max {100//max(ms,1)}% per trade to survive worst streak")
-    # EW pattern insights
-    df_ew=df[df["Entry Reason"].str.contains("EW",na=False)]
-    if not df_ew.empty:
-        ew_wr=round(df_ew["Win"].mean()*100,1); ew_pnl=df_ew["PnL"].sum()
-        ins.append(f"🌊 Elliott Wave trades: {len(df_ew)} | Win rate: **{ew_wr}%** | Net PnL: **{ew_pnl:+.2f}**")
-        try:
-            def _pat(r):
-                m=re.search(r"EW\|([^|]+)\|",str(r)); return m.group(1).strip()[:30] if m else "Unknown"
-            df_ew2=df_ew.copy(); df_ew2["Pattern"]=df_ew2["Entry Reason"].apply(_pat)
-            pg=df_ew2.groupby("Pattern")["PnL"].agg(["sum","count"]).sort_values("sum",ascending=False)
-            if not pg.empty:
-                bp=pg.index[0]; ins.append(f"🌊 Best EW pattern: **{bp}** (PnL {pg.loc[bp,'sum']:+.2f}, {int(pg.loc[bp,'count'])} trades)")
-                if len(pg)>1:
-                    wp2=pg.index[-1]; ins.append(f"🌊 Worst EW pattern: **{wp2}** (PnL {pg.loc[wp2,'sum']:+.2f}) → consider skipping")
-        except: pass
-    # Recommended SL/Target based on data
-    st.markdown("### 🎯 Recommended SL & Target Settings")
-    avg_atr=float(df_h2["PnL"].abs().mean()) if not df_h2.empty else 20
-    win_trades=df[df["Win"]==1]
-    if not win_trades.empty:
-        typical_tgt=abs(float(win_trades["PnL"].median()))
-        typical_sl=abs(float(df[df["Win"]==0]["PnL"].median())) if (df["Win"]==0).sum()>0 else typical_tgt/2
-        st.markdown(f"""<div style="background:#1f2733;border:1px solid rgba(0,230,118,0.3);border-radius:8px;padding:14px;margin-bottom:12px;">
-          <div style="font-size:13px;font-weight:700;color:#ffea00;margin-bottom:8px;">📊 Data-Driven Recommendations</div>
-          <div style="font-size:12px;color:#e6edf3;line-height:2.0;">
-            Recommended SL: <b style="color:#ff1744;">{typical_sl:.2f} pts</b> (based on median losing trade)<br>
-            Recommended Target: <b style="color:#00e676;">{typical_tgt:.2f} pts</b> (based on median winning trade)<br>
-            Implied R:R: <b style="color:#ffea00;">{typical_tgt/max(typical_sl,0.1):.1f}</b><br>
-            Best strategy: <b>{'Raise target or lower SL' if typical_tgt/max(typical_sl,0.1)<1.5 else 'Current SL/Target looks balanced ✅'}</b>
-          </div></div>""",unsafe_allow_html=True)
-    for i in ins:
-        st.markdown(f'<div style="background:#1f2733;border-left:3px solid {_B};border-radius:4px;padding:10px 14px;margin:5px 0;font-size:12px;color:#e6edf3;">{i}</div>',unsafe_allow_html=True)
+def ls_chart(df_t):
+    grp=df_t.groupby("side")["pnl"].agg(["sum","count","mean"]).reset_index()
+    fig=go.Figure(go.Bar(x=grp["side"],y=grp["sum"],
+        text=[f"n={int(c)}<br>avg={a:.2f}" for c,a in zip(grp["count"],grp["mean"])],textposition="outside",
+        marker_color=["#3fb950" if v>=0 else "#f85149" for v in grp["sum"]]))
+    fig.update_layout(title="Long vs Short PnL",height=300,**_CL); return fig
 
-def ew_panel(ew):
-    if not ew or ew.get("pattern")=="Insufficient Data": return
-    dc={"Bullish":_G,"Bearish":_R,"Bullish ABC":_Y,"Bearish ABC":_O}.get(ew.get("wave_direction",""),_B)
-    sc=_G if ew.get("signal")=="BUY" else (_R if ew.get("signal")=="SELL" else "#8b949e")
-    fib="".join(f'<div style="display:flex;justify-content:space-between;font-size:11px;padding:1px 0;color:#a0aab4;"><span>{k}</span><span style="color:#e6edf3;">{v}</span></div>' for k,v in (ew.get("fibonacci_levels") or {}).items())
-    wp="".join(f'<div style="display:flex;justify-content:space-between;font-size:11px;padding:1px 0;color:#a0aab4;"><span>{k}</span><span style="color:#e6edf3;">{v}</span></div>' for k,v in (ew.get("wave_points") or {}).items())
-    tgt=ew.get("next_target"); ts=f"{tgt:.4f}" if tgt else "–"
-    st.markdown(f"""<div style="background:#1f2733;border:1px solid rgba(255,255,255,0.08);border-radius:10px;padding:14px;margin:4px 0;">
-      <div style="font-size:13px;color:{_Y};font-weight:700;margin-bottom:6px;">🌊 {ew.get("pattern","–")}</div>
-      <div style="font-size:11px;color:{dc};font-weight:700;">{ew.get("wave_direction","–")}</div>
-      <div style="font-size:11px;color:#8b949e;margin:3px 0;">Done: {" → ".join(ew.get("completed_waves",[]) or ["–"])}</div>
-      <div style="font-size:12px;color:#e6edf3;margin:3px 0;">▶ {ew.get("current_wave","–")}</div>
-      <div style="font-size:12px;margin:4px 0;">Signal:<b style="color:{sc};"> {ew.get("signal","NONE")}</b> · Next:<b style="color:{_Y};"> {ts}</b></div>
-      <div style="margin-top:6px;">{wp}</div>
-      <div style="margin-top:6px;border-top:1px solid rgba(255,255,255,0.07);padding-top:6px;">{fib}</div>
-    </div>""",unsafe_allow_html=True)
+def reason_chart(rg):
+    colors={"SL":"#f85149","Target":"#3fb950","EOD":"#58a6ff","Squareoff":"#d29922","Strategy Reverse":"#bc8cff","EMA Reverse":"#e3b341"}
+    fig=go.Figure(go.Bar(x=rg["exit_reason"],y=rg["sum"],
+        text=[f"n={int(c)}" for c in rg["count"]],textposition="outside",
+        marker_color=[colors.get(r,"#8b949e") for r in rg["exit_reason"]]))
+    fig.update_layout(title="PnL by Exit Reason",height=280,**_CL); return fig
 
-CSS="""<style>
-@import url('https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=Syne:wght@400;700;800&display=swap');
-html,body,[data-testid="stAppViewContainer"]{background:#0d1117!important;color:#e6edf3!important;font-family:'Space Mono',monospace!important;}
-[data-testid="stSidebar"]{background:#161b22!important;border-right:1px solid rgba(255,255,255,0.08)!important;}
-h1,h2,h3,h4{font-family:'Syne',sans-serif!important;color:#e6edf3!important;}
-p,span,div,label,li{color:#e6edf3!important;}
-.stMarkdown p,.stMarkdown span,.stMarkdown div{color:#e6edf3!important;}
-input,select,textarea{color:#e6edf3!important;background:#1f2733!important;}
-.stSelectbox label,.stNumberInput label,.stTextInput label,.stCheckbox label,.stMultiSelect label,.stTimeInput label,.stRadio label{color:#e6edf3!important;}
-[data-testid="metric-container"]{background:#1f2733;border:1px solid rgba(255,255,255,0.08);border-radius:10px;padding:12px!important;}
-[data-testid="metric-container"] label,[data-testid="metric-container"] div{color:#e6edf3!important;}
-.log-box{background:#0a0e13;border:1px solid rgba(255,255,255,0.08);border-radius:8px;padding:12px 16px;height:200px;overflow-y:auto;font-size:11px;color:#a0aab4;line-height:1.7;}
-.cfg-bar{background:#1f2733;border:1px solid rgba(255,255,255,0.08);border-radius:8px;padding:8px 14px;font-size:12px;margin-bottom:8px;color:#e6edf3!important;}
-.stButton>button{font-family:'Space Mono',monospace!important;font-weight:700;border-radius:8px!important;color:#e6edf3!important;}
-.stTabs [data-baseweb="tab"]{font-family:'Syne',sans-serif!important;font-size:14px!important;font-weight:600;color:#e6edf3!important;}
-.ldot{display:inline-block;width:8px;height:8px;border-radius:50%;background:#00e676;animation:blink 1s step-end infinite;margin-right:4px;}
-@keyframes blink{50%{opacity:0;}}
-</style>"""
+def daily_chart(dp):
+    vc=["#3fb950" if v>=0 else "#f85149" for v in dp.values]
+    fig=go.Figure(go.Bar(x=[str(d) for d in dp.index],y=dp.values,marker_color=vc,
+        text=np.round(dp.values,2),textposition="outside"))
+    fig.update_layout(title="Daily PnL",height=280,**_CL); return fig
 
-def main():
-    st.set_page_config(page_title="Smart Investing",page_icon="📈",layout="wide",initial_sidebar_state="expanded")
-    st.markdown(CSS,unsafe_allow_html=True)
-    init_ss()
+def ang_scatter(df,fast,slow):
+    fe=ema(df["Close"],fast); se=ema(df["Close"],slow)
+    ang=angle_series(fe,se); dlt=(fe-se)/se.replace(0,np.nan)*100
+    fig=go.Figure(go.Scatter(x=dlt.values,y=ang.values,mode="markers",
+        marker=dict(color=df["Close"].values,colorscale="Plasma",size=4,opacity=0.55,
+                    colorbar=dict(title="Close",tickfont=dict(color="#e6edf3")))))
+    fig.update_layout(title="Crossover Angle vs EMA Δ%",xaxis_title="Delta %",yaxis_title="Angle °",height=340,**_CL)
+    return fig
+
+def ew_chart(trades):
+    df=pd.DataFrame(trades); fig=go.Figure()
+    if "pattern" in df.columns:
+        df=df[df["pattern"].fillna("").ne("")]
+        if not df.empty:
+            g=df.groupby("pattern")["pnl"].agg(["sum","count"]).reset_index()
+            fig=go.Figure(go.Bar(x=g["pattern"],y=g["sum"],text=[f"n={int(c)}" for c in g["count"]],textposition="outside",
+                marker_color=["#3fb950" if v>=0 else "#f85149" for v in g["sum"]]))
+    fig.update_layout(title="EW Pattern PnL Breakdown",height=280,**_CL); return fig
+
+def dur_chart(df_t):
+    fig=go.Figure(go.Histogram(x=df_t["duration_m"],nbinsx=30,marker_color="#58a6ff",opacity=0.8))
+    fig.update_layout(title="Trade Duration (min)",xaxis_title="Minutes",height=280,**_CL)
+    return fig
+
+# ── Sidebar config ─────────────────────────────────────────────────────────────
+def sidebar_config():
     with st.sidebar:
-        st.markdown("""<div style="text-align:center;padding:6px 0 12px;">
-          <div style="font-family:Syne,sans-serif;font-size:23px;font-weight:800;color:#00e676;">📈 Smart Investing</div>
-          <div style="font-size:10px;color:#8b949e;">v4.1 · Algo Trading Platform</div></div>""",unsafe_allow_html=True)
-        st.markdown("### 🎯 Instrument")
-        tn=st.selectbox("Ticker",list(TICKERS.keys()),key="_tk")
-        sym=st.text_input("Custom Symbol","RELIANCE.NS",key="_cs") if tn=="Custom" else TICKERS[tn]
-        iv=st.selectbox("Timeframe",list(TFP.keys()),index=1,key="_iv")
-        pd_=st.selectbox("Period",TFP[iv],index=min(1,len(TFP[iv])-1),key="_pd")
-        st.markdown("---"); st.markdown("### 📐 Strategy")
-        strat=st.selectbox("Strategy",STRATEGIES,key="_str")
-        tdir=st.selectbox("Trade Direction",["Both","Long Only","Short Only"],key="_tdir")
-        fast_ema=9;slow_ema=15;min_ang=0.0;max_ang=90.0;min_delta=0.0;max_delta=1e9
-        cx_type="Simple Crossover";cx_csz=10;min_wave_pct=0.5
-        ctc_k=3;ctc_n=2;wave_ext_lb=50;wave_order=5
-        if strat not in ("Simple Buy","Simple Sell"):
-            c1,c2=st.columns(2); fast_ema=c1.number_input("Fast EMA",2,50,9,key="_fe"); slow_ema=c2.number_input("Slow EMA",3,200,15,key="_se")
-        if strat in ("EMA Crossover","Anticipatory EMA"):
-            if st.checkbox("Angle Filter",False,key="_ua"):
-                a1,a2=st.columns(2); min_ang=a1.number_input("Min°",0.0,89.0,0.0,1.0,key="_mna"); max_ang=a2.number_input("Max°",1.0,90.0,90.0,1.0,key="_mxa")
-            if st.checkbox("Delta Filter |Fast−Slow|",False,key="_ud"):
-                d1,d2=st.columns(2); min_delta=d1.number_input("Min Δ",0.0,100000.0,0.0,.5,key="_mnd"); max_delta=d2.number_input("Max Δ",0.0,100000.0,9999.0,.5,key="_mxd")
-            cx_type=st.selectbox("Crossover Type",CX_TYPES,key="_cxt")
-            if cx_type=="Custom Candle Size": cx_csz=st.number_input("Min Candle Size",1,10000,10,key="_ccs")
-        if strat=="Elliott Wave": min_wave_pct=st.number_input("Min Wave %",0.1,10.0,0.5,0.1,key="_mwp")
-        if strat=="Wave Extrema":
-            we1,we2=st.columns(2); wave_ext_lb=we1.number_input("Lookback Bars",10,500,50,key="_welb"); wave_order=we2.number_input("Extrema Order",2,20,5,key="_weord")
-        st.markdown("---"); st.markdown("### 📆 Entry Filters")
-        en_dow=st.checkbox("Day of Week Filter",False,key="_edow"); allowed_days=[]
-        if en_dow: allowed_days=st.multiselect("Allowed Days",DAYS_LIST,default=["Monday","Tuesday","Wednesday","Thursday","Friday"],key="_dow")
-        en_adx=st.checkbox("ADX Filter",False,key="_eadx"); adx_period=14; adx_min=25
-        if en_adx:
-            ac1,ac2=st.columns(2); adx_period=ac1.number_input("ADX Period",5,50,14,key="_adxp"); adx_min=ac2.number_input("Min ADX",5,100,25,key="_adxm")
-        en_rsi=st.checkbox("RSI Filter",False,key="_ersi"); rsi_period=14; rsi_os=30; rsi_ob=70
-        if en_rsi:
-            rc1,rc2,rc3=st.columns(3); rsi_period=rc1.number_input("RSI Period",3,50,14,key="_rsip")
-            rsi_os=rc2.number_input("Oversold",5,49,30,key="_rsiOs"); rsi_ob=rc3.number_input("Overbought",51,95,70,key="_rsiOb")
-        st.markdown("---"); st.markdown("### 🛡️ Stop Loss")
-        sl_t=st.selectbox("SL Type",SL_TYPES,key="_slt"); sl_pts=st.number_input("SL Points",1,1000000,10,key="_slp")
-        atr_slm=1.5;rr=2.0;sw=20;vol_slm=2.0
-        if "ATR" in sl_t: atr_slm=st.number_input("ATR SL Mult",0.5,10.0,1.5,.1,key="_asm")
-        if "Risk" in sl_t: rr=st.number_input("Risk:Reward",0.5,20.0,2.0,.5,key="_rr")
-        if "Swing" in sl_t or "Support" in sl_t: sw=st.number_input("Swing Bars",5,100,20,key="_sw")
-        if "Volat" in sl_t: vol_slm=st.number_input("Vol SL Mult",0.5,10.0,2.0,.1,key="_vsm")
-        if "Cost-to-Cost" in sl_t:
-            ck1,ck2=st.columns(2); ctc_k=ck1.number_input("Trigger Pts K",0,10000,3,key="_ctck"); ctc_n=ck2.number_input("Offset Pts N",0,10000,2,key="_ctcn")
-        st.markdown("---"); st.markdown("### 🎯 Target")
-        tgt_t=st.selectbox("Target Type",TGT_TYPES,key="_tgt"); tgt_pts=st.number_input("Target Points",1,1000000,20,key="_tgtp")
-        atr_tgm=2.0;vol_tgm=3.0
-        if "ATR" in tgt_t: atr_tgm=st.number_input("ATR Tgt Mult",0.5,20.0,2.0,.1,key="_atm")
-        if "Risk" in tgt_t: rr=st.number_input("R:R(Tgt)",0.5,20.0,2.0,.5,key="_rrt")
-        if "Volat" in tgt_t: vol_tgm=st.number_input("Vol Tgt Mult",0.5,20.0,3.0,.1,key="_vtm")
-        st.markdown("---"); st.markdown("### ⚙️ Trade Settings")
-        qty=st.number_input("Quantity",1,10000000,1,key="_qty")
-        en_cl=st.checkbox("Cooldown",True,key="_ecl"); cd_s=st.number_input("Cooldown (s)",1,3600,5,key="_cds") if en_cl else 5
-        en_pnl=st.checkbox("Daily PnL Cap",False,key="_epnl"); mdl=-1000.0; mdp=1000.0
-        if en_pnl:
-            pp1,pp2=st.columns(2); mdl=pp1.number_input("Max Loss/Day",-10000000,0,-1000,100,key="_mdl"); mdp=pp2.number_input("Max Profit/Day",0,10000000,1000,100,key="_mdp")
-        en_tf=st.checkbox("Trade Time Filter (IST)",False,key="_etf"); ts_=datetime.time(9,15); te_=datetime.time(15,20)
-        if en_tf:
-            tt1,tt2=st.columns(2); ts_=tt1.time_input("Start",datetime.time(9,15),key="_tsi"); te_=tt2.time_input("End",datetime.time(15,20),key="_tei")
-        st.markdown("---"); st.markdown("### 🏦 Dhan Broker")
-        en_dhan=st.checkbox("Enable Dhan",False,key="_ed"); dhan_cfg={"enabled":False}
-        if en_dhan:
-            dhan_cfg["enabled"]=True; dhan_cfg["client_id"]=st.text_input("Client ID","1104779876",key="_did")
-            dhan_cfg["access_token"]=st.text_input("Access Token","",type="password",key="_dat")
-            is_opt=st.checkbox("Options Trading",False,key="_ot"); dhan_cfg["options_trading"]=is_opt
-            if not is_opt:
-                dhan_cfg["exchange"]=st.selectbox("Exchange",["NSE","BSE"],key="_dex"); dhan_cfg["product_type"]=st.selectbox("Product",["INTRADAY","DELIVERY"],key="_dpt")
-                dhan_cfg["security_id"]=st.text_input("Security ID","1594",key="_dsid"); dhan_cfg["quantity"]=st.number_input("Order Qty",1,10000000,1,key="_dqty")
-                dhan_cfg["entry_order_type"]=st.selectbox("Entry Order",["MARKET","LIMIT"],index=1,key="_det"); dhan_cfg["exit_order_type"]=st.selectbox("Exit Order",["MARKET","LIMIT"],key="_dxt")
-            else:
-                dhan_cfg["options_exchange"]=st.selectbox("Opt Exchange",["NSE_FNO","BSE_FNO"],key="_oex")
-                dhan_cfg["ce_security_id"]=st.text_input("CE Sec ID","57749",key="_ce"); dhan_cfg["pe_security_id"]=st.text_input("PE Sec ID","57716",key="_pe")
-                dhan_cfg["options_quantity"]=st.number_input("Opt Qty",1,10000000,65,key="_oqty")
-                dhan_cfg["options_entry_order_type"]=st.selectbox("Opt Entry",["MARKET","LIMIT"],key="_oet"); dhan_cfg["options_exit_order_type"]=st.selectbox("Opt Exit",["MARKET","LIMIT"],key="_oxt")
-            if st.button("🌐 Register IP (SEBI)",key="_rip"): st.info(f"Your IP: **{get_ip()}** — add to Dhan whitelist")
-    cfg={"strategy":strat,"fast_ema":fast_ema,"slow_ema":slow_ema,"trade_direction":tdir,
-         "sl_type":sl_t,"sl_points":sl_pts,"atr_sl_mult":atr_slm,"target_type":tgt_t,"target_points":tgt_pts,
-         "atr_target_mult":atr_tgm,"risk_reward":rr,"swing_window":sw,"vol_sl_mult":vol_slm,"vol_target_mult":vol_tgm,
-         "quantity":qty,"enable_cooldown":en_cl,"cooldown":cd_s,"min_angle":min_ang,"max_angle":max_ang,
-         "min_delta":min_delta,"max_delta":max_delta,"crossover_type":cx_type,"custom_candle_size":cx_csz,
-         "min_wave_pct":min_wave_pct,"enable_pnl_cap":en_pnl,"max_day_loss":mdl,"max_day_profit":mdp,
-         "enable_time_filter":en_tf,"trade_start_time":str(ts_),"trade_end_time":str(te_),
-         "allowed_days":allowed_days if en_dow else [],"enable_adx":en_adx,"adx_period":adx_period,"adx_min":adx_min,
-         "enable_rsi":en_rsi,"rsi_period":rsi_period,"rsi_oversold":rsi_os,"rsi_overbought":rsi_ob,
-         "ctc_trigger_points":ctc_k,"ctc_offset_points":ctc_n,"wave_extrema_lookback":wave_ext_lb,"wave_order":wave_order}
-    ldot='<span class="ldot"></span>' if st.session_state.live_running else ""
-    st.markdown(f"""<div style="display:flex;align-items:center;gap:12px;padding:10px 0;border-bottom:1px solid rgba(255,255,255,0.08);margin-bottom:14px;">
-      <span style="font-family:Syne,sans-serif;font-size:22px;font-weight:800;color:#00e676;">📈 Smart Investing</span>
-      <span style="font-size:10px;color:#8b949e;border:1px solid rgba(255,255,255,0.1);border-radius:4px;padding:2px 6px;">v4.1</span>
-      {ldot}<span style="font-size:12px;color:#8b949e;">{sym} · {iv} · {pd_}</span></div>""",unsafe_allow_html=True)
-    tab_bt,tab_lt,tab_th,tab_opt=st.tabs(["📊 Backtest","🔴 Live Trading","📋 Trade History","⚙️ Optimization"])
+        st.markdown("<h2 style='font-family:Syne;color:#e6edf3'>⚙ Config</h2>",unsafe_allow_html=True)
+        di=NIFTY50.index("KAYNES.NS") if "KAYNES.NS" in NIFTY50 else 0
+        sym=st.selectbox("Symbol",NIFTY50,index=di)
+        cust=st.text_input("Custom Symbol",placeholder="AAPL, ETH-USD…")
+        if cust.strip(): sym=cust.strip().upper()
+        interval=st.selectbox("Interval",TIMEFRAMES,index=0)
+        period=st.selectbox("Period",PERIODS,index=2)
+        st.markdown("---")
+        strategy=st.selectbox("Strategy",STRATEGIES)
+        qty=st.number_input("Quantity",min_value=1,value=1,step=1)
+        st.markdown("**EMA Parameters**")
+        df_fast=int(st.session_state.get("opt_fast") or 9)
+        df_slow=int(st.session_state.get("opt_slow") or 21)
+        fast=st.number_input("Fast EMA",min_value=2,value=df_fast,step=1)
+        slow=st.number_input("Slow EMA",min_value=3,value=df_slow,step=1)
+        ant=3
+        if strategy=="Anticipatory EMA": ant=st.number_input("Anticipate Bars",min_value=1,value=3,step=1)
+        ew_o=5; min_wp=0.5
+        if strategy in ("Elliott Wave","Wave Extrema"):
+            ew_o=st.number_input("EW Order",min_value=2,value=5,step=1)
+            min_wp=st.number_input("Min Wave %",min_value=0.0,value=0.5,step=0.1)
+        st.markdown("---")
+        st.markdown("**Stop-Loss / Target**")
+        sl_type=st.selectbox("SL Type",SL_TYPES)
+        sl_param=st.number_input("SL Param",min_value=0.0,value=20.0,step=0.5)
+        rr=st.number_input("R:R Ratio",min_value=0.5,value=2.0,step=0.5)
+        tp=st.number_input("Target Points",min_value=0.0,value=40.0,step=0.5)
+        atr_p=st.number_input("ATR Period",min_value=2,value=14,step=1)
+        st.markdown("---")
+        st.markdown("**Filters**")
+        day_opts=["Mon","Tue","Wed","Thu","Fri","Sat","Sun"]
+        sel_days=st.multiselect("Days of Week",day_opts,default=["Mon","Tue","Wed","Thu","Fri"])
+        dow_map={d:i for i,d in enumerate(day_opts)}; dow_ints=[dow_map[d] for d in sel_days]
+        filter_adx=st.checkbox("ADX Filter"); adx_min=st.number_input("ADX Min",0,100,20) if filter_adx else 20
+        filter_rsi=st.checkbox("RSI Filter"); rsi_lo,rsi_hi=30,70
+        if filter_rsi: rsi_lo=st.number_input("RSI Low",0,100,30); rsi_hi=st.number_input("RSI High",0,100,70)
+        filter_ang=st.checkbox("Angle Filter"); amin,amax=-90.0,90.0
+        if filter_ang: amin=st.number_input("Angle Min°",value=-90.0); amax=st.number_input("Angle Max°",value=90.0)
+        filter_dlt=st.checkbox("EMA Delta Filter"); dmin,dmax=0.0,0.0
+        if filter_dlt: dmin=st.number_input("Delta Min%",value=0.0,step=0.1); dmax=st.number_input("Delta Max%",value=5.0,step=0.1)
+        st.markdown("**Trade Window (IST)**")
+        t_start=st.text_input("Start HH:MM",value="09:15"); t_end=st.text_input("End HH:MM",value="15:20")
+        st.markdown("**Daily PnL Caps** (0=disabled)")
+        max_loss=st.number_input("Max Daily Loss",0.0,step=100.0); max_profit=st.number_input("Max Daily Profit",0.0,step=100.0)
+        st.markdown("---")
+        st.markdown(f"<div style='font-size:.74rem;color:#8b949e;text-align:center'>{datetime.now(IST).strftime('%d %b %Y  %H:%M:%S IST')}</div>",unsafe_allow_html=True)
+    return {"symbol":sym,"interval":interval,"period":period,"strategy":strategy,"qty":int(qty),
+            "fast":int(fast),"slow":int(slow),"anticipate_bars":int(ant),"ew_order":int(ew_o),
+            "min_wave_pct":float(min_wp),"sl_type":sl_type,"sl_param":float(sl_param),
+            "rr_ratio":float(rr),"target_param":float(tp),"atr_period":int(atr_p),
+            "filter_dow":dow_ints,"filter_adx":filter_adx,"adx_min":int(adx_min),
+            "filter_rsi":filter_rsi,"rsi_lo":int(rsi_lo),"rsi_hi":int(rsi_hi),
+            "filter_angle":filter_ang,"angle_min":float(amin),"angle_max":float(amax),
+            "filter_delta":filter_dlt,"delta_min":float(dmin),"delta_max":float(dmax),
+            "trade_time_start":t_start,"trade_time_end":t_end,
+            "max_daily_loss":float(max_loss),"max_daily_profit":float(max_profit)}
 
-    with tab_bt:
-        st.markdown("### Backtesting Engine")
-        if st.button("▶ Run Backtest",type="primary",key="_brun"):
-            with st.spinner("Fetching data…"):
-                df_bt=fetch_data(sym,pd_,iv)
-            if df_bt is None or len(df_bt)<5:
-                st.error("❌ No data. Check ticker/period/internet.")
-            else:
-                pb=st.progress(0.0,"Running…")
-                trades,viols,inds=run_backtest(df_bt.copy(),cfg,lambda v:pb.progress(min(v,1.0)))
-                pb.empty()
-                st.session_state.bt_results={"trades":trades,"viols":viols,"inds":inds,"df":df_bt}
-                st.success(f"✅ {len(trades)} trades analysed.")
-        if st.session_state.bt_results:
-            res=st.session_state.bt_results; trades=res["trades"]; viols=res["viols"]; inds=res["inds"]; df_bt=res["df"]
-            w,nt,acc=calc_acc(trades); tp=sum(t["PnL"] for t in trades); ap=tp/nt if nt else 0
-            m1,m2,m3,m4,m5,m6=st.columns(6)
-            m1.metric("Trades",nt); m2.metric("Wins",w); m3.metric("Losses",nt-w)
-            m4.metric("Accuracy",f"{acc}%"); m5.metric("Total PnL",f"{tp:+.2f}"); m6.metric("Avg PnL",f"{ap:+.2f}")
-            if viols:
-                st.markdown(f'<div style="background:rgba(255,23,68,0.1);border:1px solid rgba(255,23,68,0.4);border-radius:6px;padding:8px 14px;font-size:13px;color:#ff1744;">⚠️ {len(viols)} candles: SL & Target both hit — SL taken first (conservative)</div>',unsafe_allow_html=True)
-            st.plotly_chart(bt_chart(df_bt,trades,inds,cfg),use_container_width=True,key="_btfig")
-            st.markdown("#### 📋 Trade Log")
-            if trades:
-                df_tr=pd.DataFrame(trades)
-                for c in ["Entry Price","Exit Price","SL","Final SL","Target","Candle High","Candle Low","PnL"]:
-                    if c in df_tr.columns: df_tr[c]=pd.to_numeric(df_tr[c],errors="coerce")
-                if "Is Violation" in df_tr.columns: df_tr["Is Violation"]=df_tr["Is Violation"].astype(bool)
-                def _sr(row):
-                    try: pnl=float(row["PnL"])
-                    except: pnl=0.0
-                    bg="background-color:rgba(0,230,118,0.07)" if pnl>=0 else "background-color:rgba(255,23,68,0.07)"
-                    try:
-                        if bool(row.get("Is Violation",False)): bg+=";border-left:3px solid #ff9800"
-                    except: pass
-                    return [bg]*len(row)
-                fmt={c:"{:.4f}" for c in ["Entry Price","Exit Price","SL","Final SL","Target","Candle High","Candle Low"] if c in df_tr.columns}
-                if "PnL" in df_tr.columns: fmt["PnL"]="{:+.2f}"
-                st.dataframe(df_tr.style.apply(_sr,axis=1).format(fmt,na_rep="N/A"),use_container_width=True,height=380)
-            if viols:
-                st.markdown(f"#### ⚠️ Violations ({len(viols)})"); st.dataframe(pd.DataFrame(viols),use_container_width=True)
-            if strat=="Elliott Wave" and "elliott" in inds:
-                st.markdown("#### 🌊 Elliott Wave"); ew_panel(inds["elliott"])
-            if len(trades)>=3: render_analysis(trades)
+# ── Merge helper ───────────────────────────────────────────────────────────────
+def merge_all():
+    bt=st.session_state.get("bt_trades",[]); lv=list(ts_get("live_trades") or [])
+    merged=bt+lv; seen=set(); unique=[]
+    for t in merged:
+        k=(t.get("entry_time",""),t.get("exit_time",""),t.get("side",""),t.get("entry",""))
+        if k not in seen: seen.add(k); unique.append(t)
+    st.session_state["all_trades"]=unique
 
-    with tab_lt:
-        st.markdown("### Live Trading")
-        ctrl=st.columns([1.2,1.2,1.4,5])
-        start_btn=ctrl[0].button("▶ Start",type="primary",key="_start")
-        stop_btn =ctrl[1].button("⏹ Stop",type="secondary",key="_stop")
-        sq_btn   =ctrl[2].button("⚡ Squareoff",type="secondary",key="_sq")
-        if start_btn and not st.session_state.live_running:
-            old_ev=st.session_state.get("stop_event")
-            if old_ev:
-                try: old_ev.set()
-                except: pass
-            old_t=st.session_state.get("live_thread")
-            if old_t:
-                try: old_t.join(timeout=1.0)
-                except: pass
-            _clear_live(); time.sleep(0.2)
-            se=threading.Event(); st.session_state.stop_event=se; st.session_state.live_running=True
-            t=threading.Thread(target=live_thread_fn,args=(sym,pd_,iv,cfg,se,dhan_cfg),daemon=True)
-            st.session_state.live_thread=t; t.start()
-            st.toast("🟢 Live trading started!",icon="✅")
-        if stop_btn and st.session_state.live_running:
-            if st.session_state.stop_event: st.session_state.stop_event.set()
-            st.session_state.live_running=False; st.toast("⏹ Stop sent — closes after current trade exits.")
-        if sq_btn:
-            pos=_get("current_position")
-            if pos is not None:
-                ltp_sq=_get("live_ltp") or (_get("last_candle") or {}).get("close",pos["entry_price"])
-                if ltp_sq is None: ltp_sq=pos["entry_price"]
-                ltp_sq=float(ltp_sq); sig=pos.get("signal_type",1); qty_sq=cfg.get("quantity",1)
-                pnl_sq=((ltp_sq-pos["entry_price"]) if sig==1 else (pos["entry_price"]-ltp_sq))*qty_sq
-                hist=_get("trade_history") or []
-                hist.append({"Entry DateTime":pos.get("entry_dt","–"),"Exit DateTime":now_ist_full(),
-                    "Signal":"BUY" if sig==1 else "SELL","Entry Price":round(pos["entry_price"],4),
-                    "Exit Price":round(ltp_sq,4),"SL":round(pos.get("initial_sl",0),4),"Final SL":round(pos.get("current_sl",0),4),
-                    "Target":round(pos.get("target",0),4),"Entry Reason":pos.get("signal_reason",""),"Exit Reason":"Manual Squareoff",
-                    "PnL":round(pnl_sq,2),"Mode":"Live"})
-                _set("trade_history",hist); _set("day_pnl",round(_get("day_pnl",0.0)+pnl_sq,2))
-                if dhan_cfg.get("enabled"): place_exit_order(dhan_cfg,pos,ltp_sq,dhan_cfg.get("options_trading",False))
-                _set("current_position",None); _set("current_pnl",0.0)
-                st.toast(f"✅ Squareoff done. PnL: {pnl_sq:+.2f} pts")
-            else: st.toast("ℹ️ No open position.")
+# ── PnL styler ─────────────────────────────────────────────────────────────────
+def _ps(v):
+    if isinstance(v,(int,float)) and not pd.isna(v):
+        return "color:#3fb950;font-weight:700" if v>0 else "color:#f85149"
+    return ""
 
-        @st.fragment(run_every=2 if st.session_state.live_running else None)
-        def _live_panel():
-            _pos=_get("current_position"); _lc=_get("last_candle") or {}
-            _ld=_get("live_data"); _logs=_get("live_log",[]) or []
-            _dpnl=_get("day_pnl",0.0); _ltp=_get("live_ltp"); _running=st.session_state.live_running
-            if _ltp is not None and _pos is not None:
-                _pnl=round((float(_ltp)-_pos["entry_price"]) if _pos["signal_type"]==1 else (_pos["entry_price"]-float(_ltp)),4)
-            else:
-                _pnl=_get("current_pnl",0.0)
-            ltp_disp=f"{float(_ltp):.4f}" if _ltp is not None else "⏳ fetching…"
-            fetch_ts=_lc.get("fetch_ts","–"); rbadge="🟢 RUNNING" if _running else "⚪ STOPPED"
-            st.markdown(f'<div class="cfg-bar" style="display:flex;flex-wrap:wrap;gap:10px;align-items:center;"><b>{rbadge}</b><span style="color:#8b949e;">|</span><b>{sym}</b> {iv}/{pd_} · <b>{strat}</b><span style="color:#8b949e;">|</span>EMA {fast_ema}/{slow_ema}<span style="color:#8b949e;">|</span>SL:{sl_t}({sl_pts}pt) Tgt:{tgt_t}({tgt_pts}pt) Qty:{qty}<span style="color:#8b949e;">|</span><span style="color:#40c4ff;font-size:16px;font-weight:800;">LTP {ltp_disp}</span><span style="color:#8b949e;font-size:10px;"> @ {fetch_ts}</span></div>',unsafe_allow_html=True)
-            gp=[]
-            if en_tf: gp.append(f"⏰ Window: <b>{ts_}–{te_} IST</b>")
-            if en_pnl:
-                dc="#00e676" if _dpnl>=0 else "#ff1744"
-                gp.append(f"💰 Day PnL: <b style='color:{dc};'>{_dpnl:+.2f}</b> (Cap {mdl:+.0f}/{mdp:+.0f})")
-            if gp: st.markdown(f'<div style="background:#1f2733;border:1px solid rgba(255,255,255,0.08);border-radius:6px;padding:7px 14px;font-size:12px;margin-bottom:8px;color:#e6edf3;">{" &nbsp;·&nbsp; ".join(gp)}</div>',unsafe_allow_html=True)
-            if _pos is not None:
-                _sv="🟢 LONG" if _pos["signal_type"]==1 else "🔴 SHORT"
-                _clr="#00e676" if _pnl>=0 else "#ff1744"; _arr="▲" if _pnl>=0 else "▼"
-                ltp_v=float(_ltp) if _ltp is not None else _pos["entry_price"]
-                st.markdown(f"""<div style="background:{'rgba(0,230,118,0.05)' if _pnl>=0 else 'rgba(255,23,68,0.05)'};border:1px solid {_clr}44;border-radius:10px;padding:14px 20px;display:flex;flex-wrap:wrap;align-items:center;gap:20px;margin-bottom:10px;">
-                  <div><div style="font-size:10px;color:#8b949e;">POSITION</div><div style="font-size:20px;font-weight:700;color:#e6edf3;">{_sv}</div></div>
-                  <div><div style="font-size:10px;color:#8b949e;">ENTRY</div><div style="font-size:20px;font-weight:700;color:#e6edf3;">{_pos['entry_price']:.4f}</div></div>
-                  <div><div style="font-size:10px;color:#8b949e;">LTP</div><div style="font-size:20px;font-weight:700;color:#e6edf3;">{ltp_v:.4f}</div></div>
-                  <div><div style="font-size:10px;color:#8b949e;">UNREALISED P&L (pts)</div><div style="font-size:28px;font-weight:800;color:{_clr};">{_arr} {abs(_pnl):.4f}</div></div>
-                  <div><div style="font-size:10px;color:#8b949e;">P&L × QTY({qty})</div><div style="font-size:22px;font-weight:700;color:{_clr};">{_pnl*qty:+.2f}</div></div>
-                  <div><div style="font-size:10px;color:#8b949e;">SL / TARGET</div><div style="font-size:13px;"><span style="color:#ff1744;">▼ {_pos['current_sl']:.4f}</span>&nbsp;/&nbsp;<span style="color:#00e676;">▲ {_pos['target']:.4f}</span></div></div>
-                  <div><div style="font-size:10px;color:#8b949e;">SINCE (IST)</div><div style="font-size:11px;color:#8b949e;">{_pos.get('entry_dt','')}</div></div>
-                </div>""",unsafe_allow_html=True)
-            else:
-                msg="⏳ No open position — scanning for signal…" if _running else "▶ Click Start to begin"
-                st.markdown(f'<div style="background:#1f2733;border:1px solid rgba(255,255,255,0.08);border-radius:10px;padding:14px 20px;color:#8b949e;font-size:14px;">{msg}</div>',unsafe_allow_html=True)
-            if _lc:
-                lc1,lc2,lc3,lc4,lc5,lc6=st.columns(6)
-                lc1.metric("LTP/Close",f"{_lc.get('close',0):.4f}"); lc2.metric("High",f"{_lc.get('high',0):.4f}")
-                lc3.metric("Low",f"{_lc.get('low',0):.4f}"); lc4.metric("Open",f"{_lc.get('open',0):.4f}")
-                lc5.metric("Volume",f"{_lc.get('volume',0):,}"); lc6.metric("Fetched",_lc.get("fetch_ts","–"))
-                st.markdown(f'<div style="background:#1f2733;border:1px solid rgba(255,255,255,0.08);border-radius:6px;padding:8px 14px;font-size:12px;margin:4px 0;display:flex;flex-wrap:wrap;gap:16px;color:#e6edf3;">📡 <span style="color:#ffea00;font-weight:700;">{_lc.get("datetime","–")}</span> &nbsp; O:<b>{_lc.get("open","–")}</b> &nbsp; H:<b style="color:#00e676;">{_lc.get("high","–")}</b> &nbsp; L:<b style="color:#ff1744;">{_lc.get("low","–")}</b> &nbsp; C:<b style="color:#40c4ff;">{_lc.get("close","–")}</b> &nbsp; Vol:<b style="color:#ce93d8;">{_lc.get("volume",0):,}</b></div>',unsafe_allow_html=True)
-            st.markdown("---")
-            ch_col,info_col=st.columns([2.3,1])
-            with ch_col:
-                if _ld and len(_ld.get("close",[]))>=3:
-                    try:
-                        _idx_labels=_ld["index"]
-                        _dfl=pd.DataFrame({"Open":_ld["open"],"High":_ld["high"],"Low":_ld["low"],"Close":_ld["close"],"Volume":_ld["volume"]})
-                        for _c in ["Open","High","Low","Close","Volume"]: _dfl[_c]=pd.to_numeric(_dfl[_c],errors="coerce")
-                        _dfl=_dfl.dropna(subset=["Open","High","Low","Close"]); _dfl.index=_idx_labels[:len(_dfl)]
-                        _li={"fast_ema":ema(_dfl["Close"],fast_ema),"slow_ema":ema(_dfl["Close"],slow_ema)}
-                        _ew=_get("ew_state")
-                        if _ew: _li["elliott"]=_ew
-                        st.plotly_chart(live_chart(_dfl,_pos,_li,cfg),use_container_width=True,key="_lfig")
-                    except Exception as _ce: st.warning(f"Chart: {_ce}")
-                else: st.info("⏳ Waiting for data…" if _running else "▶ Click Start")
-            with info_col:
-                st.markdown("**📌 Position**")
-                if _pos:
-                    pc="#00e676" if _pnl>=0 else "#ff1744"
-                    st.markdown(f"""<div style="background:{'rgba(0,230,118,0.06)' if _pnl>=0 else 'rgba(255,23,68,0.06)'};border:1px solid {'rgba(0,230,118,0.3)' if _pnl>=0 else 'rgba(255,23,68,0.3)'};border-radius:10px;padding:12px;margin-bottom:8px;">
-                      <div style="font-size:15px;font-weight:700;color:#e6edf3;">{"🟢 BUY" if _pos["signal_type"]==1 else "🔴 SELL"}</div>
-                      <div style="font-size:11px;color:#8b949e;line-height:2.0;">Entry: <b style="color:#e6edf3;">{_pos['entry_price']:.4f}</b><br>SL: <b style="color:#ff1744;">{_pos['current_sl']:.4f}</b><br>Target: <b style="color:#00e676;">{_pos['target']:.4f}</b><br>Since: {_pos.get('entry_dt','')}</div>
-                      <div style="font-size:20px;font-weight:800;color:{pc};margin-top:6px;">{"▲" if _pnl>=0 else "▼"} {abs(_pnl):.4f} pts</div>
-                      <div style="font-size:10px;color:#8b949e;margin-top:4px;word-break:break-word;">{_pos.get('signal_reason','')[:80]}</div></div>""",unsafe_allow_html=True)
-                else: st.markdown('<div style="color:#8b949e;font-size:12px;padding:10px;">No open position</div>',unsafe_allow_html=True)
-                if strat in ("EMA Crossover","Anticipatory EMA") and _ld and len(_ld.get("close",[]))>=3:
-                    try:
-                        _cl=pd.Series(_ld["close"],dtype=float)
-                        _fv=float(ema(_cl,fast_ema).iloc[-1]); _sv2=float(ema(_cl,slow_ema).iloc[-1]); _dlt=_fv-_sv2
-                        st.markdown(f"""<div style="background:#1f2733;border:1px solid rgba(255,255,255,0.08);border-radius:8px;padding:12px;margin-top:6px;">
-                          <div style="font-size:11px;font-weight:700;color:#ffea00;margin-bottom:6px;">📊 EMA Values (Live)</div>
-                          <div style="font-size:12px;line-height:2.0;color:#e6edf3;">Fast EMA ({fast_ema}): <b style="color:#ff9800;">{_fv:.4f}</b><br>Slow EMA ({slow_ema}): <b style="color:#40c4ff;">{_sv2:.4f}</b><br>Delta: <b style="color:{'#00e676' if _dlt>0 else '#ff1744'};">{_dlt:+.4f}</b><br>Trend: <b>{"🟢 Bull" if _dlt>0 else "🔴 Bear"}</b></div></div>""",unsafe_allow_html=True)
-                    except: pass
-                _ew2=_get("ew_state")
-                if _ew2: st.markdown("**🌊 Elliott Wave**"); ew_panel(_ew2)
-            st.markdown("**📋 Live Log**")
-            log_html="<br>".join(reversed((_logs or [])[-60:]))
-            st.markdown(f'<div class="log-box">{log_html}</div>',unsafe_allow_html=True)
-        _live_panel()
+# ── Tab 1: Backtest ────────────────────────────────────────────────────────────
+def tab_backtest(cfg):
+    st.markdown("<h2 style='font-family:Syne'>📊 Backtest</h2>",unsafe_allow_html=True)
+    c1,c2=st.columns([2,3])
+    with c1: run=st.button("▶ Run Backtest",key="run_bt",use_container_width=True)
+    with c2: st.markdown(f"<div class='card' style='padding:8px 14px;margin:0'><b>{cfg['symbol']}</b> · {cfg['interval']} · {cfg['period']} · {cfg['strategy']} · {cfg['sl_type']} · fast={cfg['fast']} slow={cfg['slow']}</div>",unsafe_allow_html=True)
+    if not run:
+        if st.session_state.get("bt_result"): _render_bt(st.session_state["bt_result"],cfg)
+        return
+    with st.spinner("Fetching data…"): df=fetch_ohlcv(cfg["symbol"],cfg["interval"],cfg["period"])
+    if df is None or df.empty: st.error("Could not fetch data. Check symbol / interval / period."); return
+    st.success(f"{len(df)} bars · {df.index[0].strftime('%Y-%m-%d %H:%M')} → {df.index[-1].strftime('%Y-%m-%d %H:%M')} IST")
+    with st.spinner("Running backtest…"): result=run_backtest(df,cfg)
+    st.session_state["bt_result"]=result; st.session_state["bt_trades"]=result["trades"]; st.session_state["bt_cfg"]=cfg; merge_all()
+    _render_bt(result,cfg)
 
-    with tab_th:
-        st.markdown("### Trade History (Live Only)")
-        @st.fragment(run_every=4 if st.session_state.live_running else None)
-        def _history_panel():
-            _lh=_get("trade_history") or []; _all=_lh
-            _lc2=_get("last_candle") or {}
-            if _lc2 and st.session_state.live_running:
-                st.markdown("**📡 Latest Fetched Candle**")
-                st.dataframe(pd.DataFrame([{"DateTime (IST)":_lc2.get("datetime","–"),"Open":_lc2.get("open","–"),"High":_lc2.get("high","–"),"Low":_lc2.get("low","–"),"Close":_lc2.get("close","–"),"Volume":_lc2.get("volume","–"),"Fetched":_lc2.get("fetch_ts","–")}]),use_container_width=True,hide_index=True)
-            _op=_get("current_position"); _op_pnl=_get("current_pnl",0.0); _ltp2=_get("live_ltp")
-            if _op is not None:
-                _oc="#00e676" if _op_pnl>=0 else "#ff1744"
-                st.markdown(f'<div style="background:rgba(64,196,255,0.07);border:1px solid rgba(64,196,255,0.3);border-radius:8px;padding:10px 16px;font-size:13px;margin:6px 0;color:#e6edf3;">⚡ <b>OPEN</b>: {"BUY" if _op["signal_type"]==1 else "SELL"} @ {_op["entry_price"]:.4f} | LTP: {f"{float(_ltp2):.4f}" if _ltp2 else "–"} | SL: {_op["current_sl"]:.4f} | Tgt: {_op["target"]:.4f} | PnL: <b style="color:{_oc};">{_op_pnl:+.4f} pts</b></div>',unsafe_allow_html=True)
-            if not _all: st.info("No live trades yet."); return
-            w2,nt2,acc2=calc_acc(_all); tp2=sum(t["PnL"] for t in _all)
-            hc=st.columns(6); hc[0].metric("Trades",nt2); hc[1].metric("Wins",w2); hc[2].metric("Losses",nt2-w2)
-            hc[3].metric("Accuracy",f"{acc2}%"); hc[4].metric("Total PnL",f"{tp2:+.2f}"); hc[5].metric("Best",f"{max((t['PnL'] for t in _all),default=0):+.2f}")
-            pnl_v=[t["PnL"] for t in _all]; cum_v=list(pd.Series(pnl_v).cumsum())
-            fp3=make_subplots(rows=1,cols=2,subplot_titles=("Cumulative PnL","Per-Trade PnL"))
-            fp3.add_trace(go.Scatter(y=cum_v,mode="lines+markers",name="Cum PnL",line=dict(color=_B,width=2),marker=dict(color=[_G if v>=0 else _R for v in cum_v],size=5)),row=1,col=1)
-            fp3.add_trace(go.Bar(y=pnl_v,name="PnL",marker_color=[_G if v>=0 else _R for v in pnl_v]),row=1,col=2)
-            fp3.update_layout(**_lo("PnL Analysis",300)); st.plotly_chart(fp3,use_container_width=True,key="_hpnl")
-            df_h=pd.DataFrame(_all)
-            for c in ["Entry Price","Exit Price","SL","Final SL","Target","PnL"]:
-                if c in df_h.columns: df_h[c]=pd.to_numeric(df_h[c],errors="coerce")
-            def _hs(row):
-                try: v=float(row["PnL"])
-                except: v=0.0
-                return ["background-color:rgba(0,230,118,0.07)" if v>=0 else "background-color:rgba(255,23,68,0.07)"]*len(row)
-            fmt_h={c:"{:.4f}" for c in ["Entry Price","Exit Price","SL","Final SL","Target"] if c in df_h.columns}
-            if "PnL" in df_h.columns: fmt_h["PnL"]="{:+.2f}"
-            st.dataframe(df_h.style.apply(_hs,axis=1).format(fmt_h,na_rep="N/A"),use_container_width=True,height=420)
-        _history_panel()
+def _render_bt(result,cfg):
+    trades=result["trades"]; an=build_analysis(trades)
+    st.plotly_chart(candle_chart(result["df"],result["signals"],trades,title=cfg.get("symbol","")),use_container_width=True)
+    if not trades: st.warning("No trades generated — adjust strategy params or filters."); return
+    if result.get("violations"):
+        with st.expander(f"⚠ {len(result['violations'])} violation(s)"):
+            for v in result["violations"]: st.markdown(f"<div class='viol-card'>{v}</div>",unsafe_allow_html=True)
+    st.markdown("---")
+    c1,c2,c3,c4,c5,c6=st.columns(6)
+    pfs=f"{an['profit_factor']:.2f}" if np.isfinite(an["profit_factor"]) else "∞"
+    c1.metric("Total PnL",f"{an['total_pnl']:.4f}"); c2.metric("Win Rate",f"{an['win_rate']:.1f}%")
+    c3.metric("Trades",an["total_trades"]); c4.metric("Profit Factor",pfs)
+    c5.metric("Max DD",f"{an['max_drawdown']:.4f}"); c6.metric("Avg W/L",f"{an['avg_win']:.4f} / {an['avg_loss']:.4f}")
+    c7,c8,c9,c10=st.columns(4)
+    c7.metric("Winners",an["winners"]); c8.metric("Losers",an["losers"])
+    c9.metric("Median Win",f"{an['median_win']:.4f}"); c10.metric("Median Loss",f"{an['median_loss']:.4f}")
+    rsl=an["rec_sl_pts"]; rtgt=an["rec_tgt_pts"]; impl=f"1:{round(rtgt/rsl,2)}" if rsl>0 else "—"
+    st.markdown(f"<div class='rec-card'>📌 <b>Data-driven Recommendations</b>  Suggested SL: <b>{rsl:.4f} pts</b> &nbsp;|&nbsp; Target: <b>{rtgt:.4f} pts</b> &nbsp;|&nbsp; R:R: <b>{impl}</b></div>",unsafe_allow_html=True)
+    st.plotly_chart(eq_chart(an["equity_arr"],an["dd_arr"]),use_container_width=True)
+    ca,cb=st.columns(2)
+    with ca: st.plotly_chart(heatmap_chart(an["df"]),use_container_width=True)
+    with cb: st.plotly_chart(ls_chart(an["df"]),use_container_width=True)
+    cc,cd=st.columns(2)
+    with cc: st.plotly_chart(ang_scatter(result["df"],cfg.get("fast",9),cfg.get("slow",21)),use_container_width=True)
+    with cd: st.plotly_chart(ew_chart(trades),use_container_width=True)
+    ce,cf=st.columns(2)
+    with ce: st.plotly_chart(reason_chart(an["reason_grp"]),use_container_width=True)
+    with cf: st.plotly_chart(dur_chart(an["df"]),use_container_width=True)
+    if len(an["daily_pnl"])>1: st.plotly_chart(daily_chart(an["daily_pnl"]),use_container_width=True)
+    with st.expander("📐 Angle & Delta Distribution"):
+        fe=ema(result["df"]["Close"],cfg.get("fast",9)); se_=ema(result["df"]["Close"],cfg.get("slow",21))
+        ang=angle_series(fe,se_).dropna(); dlt=((fe-se_)/se_.replace(0,np.nan)*100).dropna()
+        xa,xb=st.columns(2)
+        with xa:
+            fa=go.Figure(go.Histogram(x=ang,nbinsx=40,marker_color="#58a6ff",opacity=0.8)); fa.update_layout(title="Angle Dist °",height=260,**_CL); st.plotly_chart(fa,use_container_width=True)
+        with xb:
+            fd=go.Figure(go.Histogram(x=dlt,nbinsx=40,marker_color="#d29922",opacity=0.8)); fd.update_layout(title="Delta Dist %",height=260,**_CL); st.plotly_chart(fd,use_container_width=True)
+    st.markdown("---"); st.markdown("**📋 Trade Log**")
+    cols=["entry_time","exit_time","side","entry","exit","sl","target","pnl","exit_reason","duration_m","atr","pattern"]
+    df_s=pd.DataFrame(trades); avail=[c for c in cols if c in df_s.columns]
+    st.dataframe(df_s[avail].style.applymap(_ps,subset=["pnl"]),use_container_width=True,height=440)
+    st.download_button("⬇ Export CSV",df_s[avail].to_csv(index=False),"backtest_trades.csv","text/csv")
 
-    with tab_opt:
-        st.markdown("### Strategy Optimization")
-        oc1,oc2,oc3=st.columns(3)
-        target_acc=oc1.number_input("Min Accuracy %",0.0,100.0,0.0,5.0,key="_tacc")
-        min_trades=oc2.number_input("Min Trades",1,500,5,key="_mtr")
-        if oc3.button("🚀 Run",type="primary",key="_optrun"):
-            with st.spinner("Fetching data…"):
-                df_opt=fetch_data(sym,pd_,iv)
-            if df_opt is None or len(df_opt)<20: st.error("Not enough data.")
-            else:
-                pp=st.progress(0.0,"Optimizing…")
-                res_opt=run_opt(df_opt.copy(),{**cfg,"strategy":"EMA Crossover"},target_acc,pp)
-                pp.empty()
-                if not res_opt.empty: res_opt=res_opt[res_opt["Trades"]>=min_trades]
-                st.session_state.opt_results=res_opt; st.success(f"✅ {len(res_opt)} combinations.")
-        if st.session_state.opt_results is not None and not st.session_state.opt_results.empty:
-            opt_df=st.session_state.opt_results; best=opt_df.iloc[0]
-            b1,b2,b3,b4=st.columns(4)
-            b1.metric("Best Accuracy",f"{best['Accuracy %']:.1f}%"); b2.metric("Fast EMA",int(best["Fast EMA"]))
-            b3.metric("Slow EMA",int(best["Slow EMA"])); b4.metric("Best PnL",f"{best['Total PnL']:+.2f}")
-            pv_h=opt_df.pivot_table(values="Accuracy %",index="Slow EMA",columns="Fast EMA",aggfunc="max")
-            fig_h=go.Figure(go.Heatmap(z=pv_h.values,x=pv_h.columns,y=pv_h.index,colorscale="RdYlGn",showscale=True,text=pv_h.values.round(1),texttemplate="%{text}%",textfont=dict(size=10)))
-            fig_h.update_layout(**_lo("EMA Accuracy Heatmap",360)); st.plotly_chart(fig_h,use_container_width=True,key="_optheat")
-            st.dataframe(opt_df.head(50).style.format({"Accuracy %":"{:.1f}%","Total PnL":"{:+.2f}","Avg PnL":"{:+.2f}"}),use_container_width=True,height=360)
+# ── Tab 2: Live Trading ────────────────────────────────────────────────────────
+def tab_live(cfg):
+    st.markdown("<h2 style='font-family:Syne'>⚡ Live Trading</h2>",unsafe_allow_html=True)
+    running=ts_get("running"); err=ts_get("error")
+    hb=ts_get("thread_heartbeat") or "—"; cnc=ts_get("candle_count") or 0
+    lbt=ts_get("last_bar_time") or "—"; dpnl=ts_get("daily_pnl") or 0.0
+    dc="#3fb950" if dpnl>=0 else "#f85149"
+    dot="<span class='live-dot'></span>" if running else "<span class='idle-dot'></span>"
+    lbl="LIVE" if running else "IDLE"
+    st.markdown(f"<div class='status-bar'>{dot}<b>{lbl}</b><span style='color:#8b949e'>Heartbeat:</span> <code>{str(hb)[:19]}</code><span style='color:#8b949e'>Candles:</span> <b>{cnc}</b><span style='color:#8b949e'>Last bar:</span> <code>{str(lbt)[:16]}</code><span style='color:#8b949e'>Daily PnL:</span> <b style='color:{dc}'>{dpnl:+.4f}</b></div>",unsafe_allow_html=True)
+    if err:
+        with st.expander("❌ Last Error"): st.code(err,language="python")
+    cc1,cc2,cc3,cc4=st.columns(4)
+    with cc1:
+        if not running:
+            if st.button("▶ Start Live",use_container_width=True):
+                ts_update({"running":True,"config":cfg,"error":None,"live_position":None,
+                           "live_ltp":None,"live_df":None,"live_trades":[],"live_pnl":0.0,
+                           "daily_pnl":0.0,"candle_count":0,"squareoff_requested":False,
+                           "verified_entry":False,"trailing_sl":None,"phase":1,"locked_sl":None,
+                           "live_signal":None,"live_ew_info":{},"log":deque(maxlen=300)})
+                threading.Thread(target=live_thread,daemon=True).start(); st.rerun()
+        else:
+            if st.button("⏹ Stop",use_container_width=True): ts_set("running",False); st.rerun()
+    with cc2:
+        if running and ts_get("live_position"):
+            if st.button("⬛ Squareoff Now",use_container_width=True): ts_set("squareoff_requested",True); st.success("Squareoff requested…")
+    with cc3: st.info(f"Strategy: **{cfg['strategy']}**")
+    with cc4: st.info(f"**{cfg['symbol']}** {cfg['interval']} {cfg['period']}")
+    st.markdown("---")
+
+    @st.fragment(run_every=3)
+    def _metrics():
+        ltp=ts_get("live_ltp"); pos=ts_get("live_position"); dp=ts_get("daily_pnl") or 0.0
+        sig=ts_get("live_signal"); trail=ts_get("trailing_sl"); ph=ts_get("phase") or 1
+        unreal=pos.get("unrealized_pnl",0.0) if pos else 0.0
+        sl="🟢 BUY" if sig==1 else "🔴 SELL" if sig==-1 else "—"
+        m1,m2,m3,m4,m5,m6=st.columns(6)
+        m1.metric("LTP",f"{ltp:.4f}" if ltp else "—"); m2.metric("Daily PnL",f"{dp:+.4f}")
+        m3.metric("Last Signal",sl); m4.metric("Position","OPEN 🔵" if pos else "FLAT ⬜")
+        m5.metric("Trailing SL",f"{trail:.4f}" if trail else "—"); m6.metric("SL Phase",str(ph))
+        if pos:
+            st.markdown("**Open Position**")
+            p1,p2,p3,p4,p5,p6=st.columns(6)
+            p1.metric("Side","BUY" if pos.get("side")==1 else "SELL")
+            p2.metric("Entry",f"{pos.get('entry',0):.4f}"); p3.metric("SL",f"{pos.get('sl',0):.4f}")
+            p4.metric("Target",f"{pos.get('target',0):.4f}"); p5.metric("Eff SL",f"{pos.get('eff_sl',0):.4f}")
+            p6.metric("Unreal.",f"{unreal:+.4f}")
+            if pos.get("pattern"): st.markdown(f"<div class='card' style='padding:8px 14px'>🌊 EW Pattern: <b>{pos['pattern']}</b></div>",unsafe_allow_html=True)
+    _metrics()
+
+    @st.fragment(run_every=10)
+    def _chart():
+        _df=ts_get("live_df"); ew=ts_get("live_ew_info") or {}
+        if _df is not None and not _df.empty:
+            df2=_df.copy(); df2["EMA_fast"]=ema(df2["Close"],cfg["fast"]); df2["EMA_slow"]=ema(df2["Close"],cfg["slow"]); df2["ATR"]=calc_atr(df2,cfg["atr_period"])
+            st.plotly_chart(candle_chart(df2,ew_info=ew,title=f"{cfg['symbol']} (Live {cfg['interval']})"),use_container_width=True)
+            if ew.get("fib") and ew.get("pattern"):
+                ltp2=float(df2["Close"].iloc[-1])
+                st.markdown(f"<b>🌊 {ew.get('pattern','')} </b> Confidence: <b>{ew.get('confidence',0)}%</b>",unsafe_allow_html=True)
+                rows="".join(f"<tr><td>{r}</td><td>{lvl:.4f}</td><td style='color:{"#3fb950" if lvl<ltp2 else "#f85149"}'>{'↓ Below' if lvl<ltp2 else '↑ Above'}</td></tr>" for r,lvl in sorted(ew["fib"].items()))
+                st.markdown(f"<table style='font-size:.8rem'><tr><th>Fib</th><th>Level</th><th>vs LTP</th></tr>{rows}</table>",unsafe_allow_html=True)
+        else: st.info("⏳ Waiting for first data fetch…")
+    _chart()
+
+    @st.fragment(run_every=5)
+    def _log():
+        logs=list(ts_get("log") or [])
+        if logs:
+            with st.expander("📜 Activity Log",expanded=True):
+                html="".join(f"<div style='font-size:.81em;padding:2px 0;color:{"#3fb950" if any(x in l for x in ["✅","BUY","SELL","Target"]) else "#f85149" if any(x in l for x in ["Exception","SL","failed"]) else "#8b949e"}'>{l}</div>" for l in logs[:100])
+                st.markdown(html,unsafe_allow_html=True)
+    _log()
+
+    @st.fragment(run_every=15)
+    def _live_tbl():
+        trades=list(ts_get("live_trades") or [])
+        if not trades: return
+        merge_all(); an=build_analysis(trades)
+        if not an: return
+        st.markdown("**Live Session Trades**")
+        lc1,lc2,lc3,lc4=st.columns(4)
+        lc1.metric("Session PnL",f"{an['total_pnl']:.4f}"); lc2.metric("Win Rate",f"{an['win_rate']:.1f}%")
+        lc3.metric("Trades",an["total_trades"]); pfs=f"{an['profit_factor']:.2f}" if np.isfinite(an["profit_factor"]) else "∞"; lc4.metric("PF",pfs)
+        df_t=pd.DataFrame(trades); cols_=["entry_time","exit_time","side","entry","exit","sl","target","pnl","exit_reason","atr","pattern"]
+        avail=[c for c in cols_ if c in df_t.columns]
+        st.dataframe(df_t[avail].style.applymap(_ps,subset=["pnl"]),use_container_width=True,height=300)
+    _live_tbl()
+
+# ── Tab 3: Trade History ───────────────────────────────────────────────────────
+def tab_history():
+    st.markdown("<h2 style='font-family:Syne'>📜 Trade History</h2>",unsafe_allow_html=True)
+    merge_all()
+    src=st.radio("Source",["All (Backtest + Live)","Backtest Only","Live Only"],horizontal=True)
+    all_t=st.session_state.get("all_trades",[])
+    live_t=list(ts_get("live_trades") or [])
+    if src=="Backtest Only": trades=[t for t in all_t if t.get("source","backtest")=="backtest"]
+    elif src=="Live Only": trades=live_t
+    else: trades=all_t
+    if not trades: st.info("No trades yet. Run a Backtest or start Live Trading."); return
+    an=build_analysis(trades)
+    if not an: return
+    df=an["df"]
+    c1,c2,c3,c4,c5,c6=st.columns(6)
+    pfs=f"{an['profit_factor']:.2f}" if np.isfinite(an["profit_factor"]) else "∞"
+    c1.metric("Total PnL",f"{an['total_pnl']:.4f}"); c2.metric("Win Rate",f"{an['win_rate']:.1f}%")
+    c3.metric("Trades",an["total_trades"]); c4.metric("Max DD",f"{an['max_drawdown']:.4f}")
+    c5.metric("PF",pfs); c6.metric("Median Win",f"{an['median_win']:.4f}")
+    rsl=an["rec_sl_pts"]; rtgt=an["rec_tgt_pts"]; impl=f"1:{round(rtgt/rsl,2)}" if rsl>0 else "—"
+    st.markdown(f"<div class='rec-card'>📌 Rec SL: <b>{rsl:.4f}</b> &nbsp;|&nbsp; Target: <b>{rtgt:.4f}</b> &nbsp;|&nbsp; R:R: <b>{impl}</b></div>",unsafe_allow_html=True)
+    st.markdown("---")
+    fc1,fc2,fc3=st.columns(3)
+    with fc1: sf=st.selectbox("Side",["All","BUY","SELL"])
+    with fc2: ro=["All"]+sorted(df["exit_reason"].dropna().unique().tolist()); rf=st.selectbox("Exit Reason",ro)
+    with fc3: po=["All"]+sorted(df["pattern"].dropna().unique().tolist()); pf_=st.selectbox("EW Pattern",po)
+    ds=df.copy()
+    if sf!="All": ds=ds[ds["side"]==sf]
+    if rf!="All": ds=ds[ds["exit_reason"]==rf]
+    if pf_!="All": ds=ds[ds["pattern"]==pf_]
+    st.markdown(f"Showing **{len(ds)}** of {len(df)} trades")
+    vc=["entry_time","exit_time","side","entry","exit","sl","target","pnl","exit_reason","duration_m","atr","pattern","source"]
+    av=[c for c in vc if c in ds.columns]
+    st.dataframe(ds[av].style.applymap(_ps,subset=["pnl"]),use_container_width=True,height=440)
+    st.download_button("⬇ Export CSV",ds[av].to_csv(index=False),"trade_history.csv","text/csv")
+    st.markdown("---")
+    if len(an["equity_arr"])>1: st.plotly_chart(eq_chart(an["equity_arr"],an["dd_arr"]),use_container_width=True)
+    if len(trades)>=3:
+        ca,cb=st.columns(2)
+        with ca: st.plotly_chart(heatmap_chart(df),use_container_width=True)
+        with cb: st.plotly_chart(ls_chart(df),use_container_width=True)
+        cc,cd=st.columns(2)
+        with cc: st.plotly_chart(reason_chart(an["reason_grp"]),use_container_width=True)
+        with cd: st.plotly_chart(ew_chart(trades),use_container_width=True)
+        if len(an["daily_pnl"])>1: st.plotly_chart(daily_chart(an["daily_pnl"]),use_container_width=True)
+        st.plotly_chart(dur_chart(df),use_container_width=True)
+
+# ── Tab 4: Optimization ────────────────────────────────────────────────────────
+def tab_optimization(cfg):
+    st.markdown("<h2 style='font-family:Syne'>🔬 Strategy Optimization</h2>",unsafe_allow_html=True)
+    with st.expander("ℹ How it works",expanded=False):
+        st.markdown("Grid Search over Fast × Slow EMA combinations. Each pair runs a full backtest with current SL/filter settings.")
+    c1,c2=st.columns(2)
+    with c1: fr=st.slider("Fast EMA range",3,50,(5,20)); fs=st.number_input("Fast step",min_value=1,max_value=20,value=2)
+    with c2: sr=st.slider("Slow EMA range",10,120,(15,55)); ss=st.number_input("Slow step",min_value=1,max_value=20,value=3)
+    metric=st.selectbox("Optimise for",["Total PnL","Win Rate","Profit Factor","Max Drawdown (minimise)"])
+    max_c=st.number_input("Max combinations",min_value=4,max_value=500,value=80,step=10)
+    run_=st.button("🚀 Run Grid Search",use_container_width=True)
+    if not run_: return
+    with st.spinner("Fetching data…"): df=fetch_ohlcv(cfg["symbol"],cfg["interval"],cfg["period"])
+    if df is None or df.empty: st.error("Could not fetch data."); return
+    fv=list(range(int(fr[0]),int(fr[1])+1,int(fs))); sv=list(range(int(sr[0]),int(sr[1])+1,int(ss)))
+    combos=[(f,s) for f in fv for s in sv if f<s]
+    if not combos: st.warning("No valid combinations — Fast must be < Slow."); return
+    if len(combos)>max_c:
+        import random; combos=random.sample(combos,int(max_c)); st.info(f"Sampled {len(combos)} combinations.")
+    else: st.info(f"Testing {len(combos)} combinations…")
+    prog=st.progress(0.0); stat=st.empty(); results=[]
+    for idx,(f,s) in enumerate(combos):
+        stat.markdown(f"Testing Fast={f}, Slow={s}…")
+        try:
+            res=run_backtest(df,{**cfg,"fast":f,"slow":s}); an=build_analysis(res["trades"])
+            if an: pf=float(an["profit_factor"]) if np.isfinite(an["profit_factor"]) else 0.0; results.append({"fast":f,"slow":s,"pnl":an["total_pnl"],"win_rate":an["win_rate"],"profit_factor":pf,"max_dd":an["max_drawdown"],"trades":an["total_trades"],"med_win":an["median_win"],"med_loss":an["median_loss"]})
+        except: pass
+        prog.progress((idx+1)/len(combos))
+    stat.empty()
+    if not results: st.warning("No results generated."); return
+    sm={"Total PnL":("pnl",False),"Win Rate":("win_rate",False),"Profit Factor":("profit_factor",False),"Max Drawdown (minimise)":("max_dd",True)}
+    sc,asc=sm[metric]
+    dr=pd.DataFrame(results).sort_values(sc,ascending=asc).reset_index(drop=True)
+    best=dr.iloc[0]
+    st.success(f"🏆 Best: Fast=**{int(best['fast'])}** Slow=**{int(best['slow'])}** | PnL={best['pnl']:.4f} | WR={best['win_rate']:.1f}% | Trades={int(best['trades'])}")
+    if st.button(f"✅ Apply Best (Fast={int(best['fast'])}, Slow={int(best['slow'])})"):
+        st.session_state["opt_fast"]=int(best["fast"]); st.session_state["opt_slow"]=int(best["slow"])
+        st.success("Applied! Sidebar will update on next interaction.")
+    st.markdown("---")
+    try:
+        pv=dr.pivot_table(values="pnl",index="slow",columns="fast",aggfunc="mean",fill_value=0)
+        fh=go.Figure(go.Heatmap(z=pv.values,x=[str(c) for c in pv.columns],y=[str(r) for r in pv.index],zmid=0,colorscale=[[0,"#f85149"],[0.5,"#161b22"],[1,"#3fb950"]],text=np.round(pv.values,1),texttemplate="%{text}",colorbar=dict(tickfont=dict(color="#e6edf3"))))
+        fh.update_layout(title="PnL Heatmap (Fast × Slow EMA)",xaxis_title="Fast EMA",yaxis_title="Slow EMA",height=440,**_CL); st.plotly_chart(fh,use_container_width=True)
+    except: pass
+    try:
+        wr=dr.pivot_table(values="win_rate",index="slow",columns="fast",aggfunc="mean",fill_value=0)
+        fw=go.Figure(go.Heatmap(z=wr.values,x=[str(c) for c in wr.columns],y=[str(r) for r in wr.index],colorscale="RdYlGn",text=np.round(wr.values,1),texttemplate="%{text}%",colorbar=dict(tickfont=dict(color="#e6edf3"))))
+        fw.update_layout(title="Win-Rate Heatmap",xaxis_title="Fast EMA",yaxis_title="Slow EMA",height=380,**_CL); st.plotly_chart(fw,use_container_width=True)
+    except: pass
+    try:
+        fp=go.Figure(go.Scatter(x=dr["max_dd"],y=dr["pnl"],mode="markers+text",text=[f"{int(r.fast)}/{int(r.slow)}" for _,r in dr.iterrows()],textposition="top center",marker=dict(color=dr["win_rate"],colorscale="RdYlGn",size=8,opacity=0.8,colorbar=dict(title="Win%",tickfont=dict(color="#e6edf3")))))
+        fp.update_layout(title="Pareto — PnL vs Max Drawdown (colour=Win%)",xaxis_title="Max Drawdown",yaxis_title="Total PnL",height=380,**_CL); st.plotly_chart(fp,use_container_width=True)
+    except: pass
+    try:
+        ftc=go.Figure(go.Histogram(x=dr["trades"],nbinsx=20,marker_color="#58a6ff",opacity=0.8))
+        ftc.update_layout(title="Trade Count Distribution",xaxis_title="# Trades",height=260,**_CL); st.plotly_chart(ftc,use_container_width=True)
+    except: pass
+    st.markdown("**Top 20 Combinations**")
+    st.dataframe(dr.head(20).style.format({"pnl":".4f","win_rate":".1f","profit_factor":".2f","max_dd":".4f","med_win":".4f","med_loss":".4f"}),use_container_width=True)
+    st.download_button("⬇ Export Optimization CSV",dr.to_csv(index=False),"optimization.csv","text/csv")
+
+# ── Main ───────────────────────────────────────────────────────────────────────
+def main():
+    running=ts_get("running")
+    dot="<span class='live-dot'></span>" if running else "<span class='idle-dot'></span>"
+    now=datetime.now(IST).strftime('%d %b %Y  %H:%M:%S IST')
+    st.markdown(f"<div style='display:flex;align-items:center;gap:14px;margin-bottom:6px'><span style='font-size:2.4rem'>📈</span><div><h1 style='font-family:Syne;font-size:2rem;margin:0'>Smart Investing</h1><span style='color:#8b949e;font-size:.76rem'>Production-Grade Algorithmic Trading Platform &nbsp;·&nbsp; v{APP_VERSION} &nbsp;·&nbsp; {now} &nbsp;{dot}<b style='color:{'#3fb950' if running else '#8b949e'}'>{'LIVE' if running else 'IDLE'}</b></span></div></div>",unsafe_allow_html=True)
+    st.markdown("<hr>",unsafe_allow_html=True)
+    cfg=sidebar_config()
+    t1,t2,t3,t4=st.tabs(["📊  Backtest","⚡  Live Trading","📜  Trade History","🔬  Optimization"])
+    with t1: tab_backtest(cfg)
+    with t2: tab_live(cfg)
+    with t3: tab_history()
+    with t4: tab_optimization(cfg)
 
 if __name__=="__main__":
     main()
