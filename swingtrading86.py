@@ -564,7 +564,8 @@ def live_thread():
         fast     = int(cfg.get("fast",  9))
         slow     = int(cfg.get("slow", 21))
         atr_p    = int(cfg.get("atr_period", 14))
-        sleep_s  = _REFRESH.get(iv, 30)
+        # Always poll every 1.5 s — never use interval-based sleep
+        sleep_s  = 1.5
         max_loss = float(cfg.get("max_daily_loss",   0))
         max_prof = float(cfg.get("max_daily_profit", 0))
         t_start  = cfg.get("trade_time_start", "09:15")
@@ -607,30 +608,50 @@ def live_thread():
             # ── Daily caps ────────────────────────────────────────────────────
             if max_loss > 0 and daily_pnl <= -max_loss:
                 ts_log(f"Max loss cap {daily_pnl:.2f} — waiting")
-                time.sleep(sleep_s); continue
+                time.sleep(1.5); continue
             if max_prof > 0 and daily_pnl >= max_prof:
                 ts_log(f"Max profit cap {daily_pnl:.2f} — waiting")
-                time.sleep(sleep_s); continue
+                time.sleep(1.5); continue
 
-            # ── Fetch fresh data every cycle ──────────────────────────────────
-            df = fetch_ohlcv(sym, iv, per)
-            if df is None or df.empty:
-                ts_log("Data fetch failed — retrying")
-                time.sleep(5); continue
+            # ── Fast LTP fetch every 1.5 s ───────────────────────────────────
+            # Use meta price endpoint — fast, lightweight
+            _ltp_url = f"https://query1.finance.yahoo.com/v8/finance/chart/{sym}"
+            _ltp_params = {"interval":"1m","range":"1d","includePrePost":"false"}
+            ltp = None
+            try:
+                _r = requests.get(_ltp_url, params=_ltp_params, headers=_YF_H, timeout=5)
+                _r.raise_for_status()
+                _meta = _r.json()["chart"]["result"][0].get("meta", {})
+                ltp = float(_meta.get("regularMarketPrice") or _meta.get("previousClose") or 0)
+            except:
+                pass
 
-            df["EMA_fast"] = ema(df["Close"], fast)
-            df["EMA_slow"] = ema(df["Close"], slow)
-            df["ATR"]      = calc_atr(df, atr_p)
+            # Fallback: use last known LTP from df
+            if not ltp or ltp <= 0:
+                _prev = ts_get("live_ltp")
+                if _prev: ltp = _prev
+                else:
+                    ts_log("LTP fetch failed — retrying")
+                    time.sleep(1.5); continue
 
-            ltp   = float(df["Close"].iloc[-1])
-            atr_v = float(df["ATR"].iloc[-1])
-            bar_t = df.index[-1]
+            # ── Full candle fetch every 10 s for signals/chart ────────────────
+            tick_count = (ts_get("candle_count") or 0) + 1
+            if tick_count % 7 == 1 or ts_get("live_df") is None:
+                df = fetch_ohlcv(sym, iv, per)
+                if df is not None and not df.empty:
+                    df["EMA_fast"] = ema(df["Close"], fast)
+                    df["EMA_slow"] = ema(df["Close"], slow)
+                    df["ATR"]      = calc_atr(df, atr_p)
+                    ts_set("live_df", df)
+
+            df    = ts_get("live_df")
+            atr_v = float(df["ATR"].iloc[-1]) if df is not None and not df.empty else 20.0
+            bar_t = df.index[-1] if df is not None and not df.empty else datetime.now(IST)
 
             ts_update({
                 "live_ltp":      ltp,
-                "live_df":       df,
-                "last_bar_time": bar_t.strftime("%Y-%m-%d %H:%M:%S"),
-                "candle_count":  (ts_get("candle_count") or 0) + 1,
+                "last_bar_time": bar_t.strftime("%Y-%m-%d %H:%M:%S") if hasattr(bar_t,"strftime") else str(bar_t),
+                "candle_count":  tick_count,
                 "daily_pnl":     round(daily_pnl, 4),
             })
 
@@ -648,7 +669,7 @@ def live_thread():
                     "trailing_sl":         None,
                 })
                 ts_log(f"Squareoff @ {ltp:.4f}  PnL={pnl:+.4f}")
-                time.sleep(sleep_s); continue
+                time.sleep(1.5); continue
 
             # ── Manage open position ──────────────────────────────────────────
             if position:
@@ -696,7 +717,7 @@ def live_thread():
                         daily_pnl += pnl; position = None
                         ts_update({"live_pnl": round(daily_pnl,4), "daily_pnl": round(daily_pnl,4), "live_position": None, "trailing_sl": None})
                         ts_log(f"Strategy Reverse @ {ltp:.4f}  PnL={pnl:+.4f}")
-                        time.sleep(sleep_s); continue
+                        time.sleep(1.5); continue
 
                 if sl_t == "EMA Reverse Crossover":
                     rev = ema_live_check(df, fast, slow)
@@ -706,7 +727,7 @@ def live_thread():
                         daily_pnl += pnl; position = None
                         ts_update({"live_pnl": round(daily_pnl,4), "daily_pnl": round(daily_pnl,4), "live_position": None, "trailing_sl": None})
                         ts_log(f"EMA Reverse @ {ltp:.4f}  PnL={pnl:+.4f}")
-                        time.sleep(sleep_s); continue
+                        time.sleep(1.5); continue
 
                 sl_hit  = (side == 1 and ltp <= eff_sl) or (side == -1 and ltp >= eff_sl)
                 tgt_hit = (side == 1 and ltp >= tgt_p)  or (side == -1 and ltp <= tgt_p)
@@ -717,7 +738,7 @@ def live_thread():
                     daily_pnl += pnl; position = None
                     ts_update({"live_pnl": round(daily_pnl,4), "daily_pnl": round(daily_pnl,4), "live_position": None, "trailing_sl": None})
                     ts_log(f"SL hit @ {eff_sl:.4f}  PnL={pnl:+.4f}")
-                    time.sleep(sleep_s); continue
+                    time.sleep(1.5); continue
 
                 if tgt_hit:
                     pnl = (tgt_p - entry) * side * qty
@@ -725,21 +746,28 @@ def live_thread():
                     daily_pnl += pnl; position = None
                     ts_update({"live_pnl": round(daily_pnl,4), "daily_pnl": round(daily_pnl,4), "live_position": None, "trailing_sl": None})
                     ts_log(f"Target hit @ {tgt_p:.4f}  PnL={pnl:+.4f}")
-                    time.sleep(sleep_s); continue
+                    time.sleep(1.5); continue
 
             # ── Check for new entry ───────────────────────────────────────────
             if not position:
                 simple = strat in ("Simple Buy", "Simple Sell")
                 can_enter = simple or (in_window() and dow_ok())
 
-                sig = get_live_signal(df, strat, cfg)
+                if simple:
+                    # Simple Buy/Sell: enter immediately on first tick
+                    sig = 1 if strat == "Simple Buy" else -1
+                else:
+                    sig = get_live_signal(df, strat, cfg) if df is not None and not df.empty else 0
                 ts_set("live_signal", sig)
 
                 if sig != 0 and can_enter:
                     side  = 1 if sig == 1 else -1
-                    sl_p  = calc_sl(ltp, side, sl_type, sp, df, len(df)-1, atr_v, fast, slow)
+                    _df_e = df if df is not None and not df.empty else None
+                    sl_p  = calc_sl(ltp, side, sl_type, sp,
+                                    _df_e, (len(_df_e)-1) if _df_e is not None else 0,
+                                    atr_v, fast, slow) if _df_e is not None else ltp - side * sp
                     tgt_p = calc_target(ltp, side, sl_p, sl_type, tp, rr)
-                    ew_inf = detect_ew(df, cfg.get("ew_order", 5)) if strat == "Elliott Wave" else {}
+                    ew_inf = detect_ew(df, cfg.get("ew_order", 5)) if strat == "Elliott Wave" and df is not None else {}
                     position = {
                         "side": side, "entry": ltp, "sl": sl_p, "target": tgt_p,
                         "sl_type": sl_type, "sl_param": sp,
@@ -750,15 +778,12 @@ def live_thread():
                     }
                     ts_update({"live_ew_info": ew_inf})
                     ts_log(f"{'BUY' if side==1 else 'SELL'} @ {ltp:.4f}  SL={sl_p:.4f}  TGT={tgt_p:.4f}")
-                else:
-                    if sig == 0:
-                        ts_set("live_signal", 0)
 
         except Exception as exc:
             ts_log(f"ERROR: {exc}")
             ts_set("error", traceback.format_exc())
 
-        time.sleep(sleep_s)
+        time.sleep(1.5)
 
     ts_log("Thread stopped")
     ts_update({"live_position": None, "trailing_sl": None})
