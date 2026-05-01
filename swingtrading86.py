@@ -121,25 +121,35 @@ hr{border-color:var(--border)!important;margin:12px 0!important;}
 </style>
 """, unsafe_allow_html=True)
 
-# ── Thread-safe state store ────────────────────────────────────────────────────
-_LOCK = threading.Lock()
-_TS: dict = {
-    "running":False,"live_ltp":None,"live_signal":None,"live_position":None,
-    "live_pnl":0.0,"live_pnl_pct":0.0,"live_trades":[],"live_df":None,
-    "thread_heartbeat":None,"error":None,"log":deque(maxlen=300),
-    "squareoff_requested":False,"trailing_sl":None,"phase":1,"locked_sl":None,
-    "config":{},"verified_entry":False,"candle_count":0,"daily_pnl":0.0,
-    "last_bar_time":None,"live_ew_info":{},
-}
+# ── Thread-safe state store — persists across Streamlit module reloads ──────────
+import sys as _sys
 
-def ts_get(k): 
+_SKEY = "__smart_investing_state__"
+if _SKEY not in _sys.modules:
+    import types as _types
+    _m = _types.ModuleType(_SKEY)
+    _m.LOCK = threading.Lock()
+    _m.TS   = {
+        "running":False,"live_ltp":None,"live_signal":None,"live_position":None,
+        "live_pnl":0.0,"live_pnl_pct":0.0,"live_trades":[],"live_df":None,
+        "thread_heartbeat":None,"error":None,"log":deque(maxlen=300),
+        "squareoff_requested":False,"trailing_sl":None,"phase":1,"locked_sl":None,
+        "config":{},"candle_count":0,"daily_pnl":0.0,
+        "last_bar_time":None,"live_ew_info":{},
+    }
+    _sys.modules[_SKEY] = _m
+
+_LOCK = _sys.modules[_SKEY].LOCK
+_TS   = _sys.modules[_SKEY].TS
+
+def ts_get(k):
     with _LOCK: return _TS.get(k)
-def ts_set(k,v):
-    with _LOCK: _TS[k]=v
+def ts_set(k, v):
+    with _LOCK: _TS[k] = v
 def ts_update(d):
     with _LOCK: _TS.update(d)
 def ts_log(msg):
-    t=datetime.now(IST).strftime("%H:%M:%S")
+    t = datetime.now(IST).strftime("%H:%M:%S")
     with _LOCK: _TS["log"].appendleft(f"[{t}]  {msg}")
 
 # ── Session state init ─────────────────────────────────────────────────────────
@@ -573,25 +583,31 @@ def live_thread():
       3. Every 60 s: refresh candles → re-check signal
     """
     ts_log("▶ Thread started")
-
-    cfg      = ts_get("config")
-    sym      = cfg["symbol"]
-    iv       = cfg["interval"]
-    per      = cfg["period"]
-    strat    = cfg["strategy"]
-    sl_type  = cfg["sl_type"]
-    sp       = float(cfg.get("sl_param",     20))
-    tp_pts   = float(cfg.get("target_param", 40))
-    rr       = float(cfg.get("rr_ratio",      2))
-    qty      = int(cfg.get("qty",   1))
-    fast     = int(cfg.get("fast",  9))
-    slow     = int(cfg.get("slow", 21))
-    atr_p    = int(cfg.get("atr_period", 14))
-    max_loss = float(cfg.get("max_daily_loss",   0))
-    max_prof = float(cfg.get("max_daily_profit", 0))
-    t_start  = cfg.get("trade_time_start", "09:15")
-    t_end    = cfg.get("trade_time_end",   "15:20")
-    simple   = strat in ("Simple Buy", "Simple Sell")
+    try:
+        cfg      = ts_get("config") or {}
+        sym      = cfg["symbol"]
+        iv       = cfg["interval"]
+        per      = cfg["period"]
+        strat    = cfg["strategy"]
+        sl_type  = cfg["sl_type"]
+        sp       = float(cfg.get("sl_param",     20))
+        tp_pts   = float(cfg.get("target_param", 40))
+        rr       = float(cfg.get("rr_ratio",      2))
+        qty      = int(cfg.get("qty",   1))
+        fast     = int(cfg.get("fast",  9))
+        slow     = int(cfg.get("slow", 21))
+        atr_p    = int(cfg.get("atr_period", 14))
+        max_loss = float(cfg.get("max_daily_loss",   0))
+        max_prof = float(cfg.get("max_daily_profit", 0))
+        t_start  = cfg.get("trade_time_start", "09:15")
+        t_end    = cfg.get("trade_time_end",   "15:20")
+        simple   = strat in ("Simple Buy", "Simple Sell")
+        ts_log(f"Config OK: {sym} | {strat} | {sl_type} | qty={qty}")
+    except Exception as e:
+        ts_set("error", f"Config parse failed: {e}\n" + traceback.format_exc())
+        ts_set("running", False)
+        ts_log(f"FATAL config error: {e}")
+        return
 
     def in_window():
         try:
@@ -1200,6 +1216,19 @@ def tab_live(cfg):
             avail = [c for c in cols_ if c in df_t.columns]
             st.dataframe(df_t[avail].style.map(_ps, subset=["pnl"]),
                          use_container_width=True, height=280)
+
+    # ── Compact log strip (last 8 lines, always visible when running) ────────────
+    logs = list(ts_get("log") or [])
+    if logs:
+        log_html = " &nbsp;|&nbsp; ".join(
+            f"<span style='color:#8b949e'>{l}</span>" for l in logs[:8]
+        )
+        st.markdown(
+            f"<div style='background:#161b22;border:1px solid #30363d;border-radius:6px;"
+            f"padding:6px 12px;font-size:.75rem;font-family:monospace;"
+            f"overflow:hidden;white-space:nowrap;text-overflow:ellipsis'>"
+            f"{log_html}</div>",
+            unsafe_allow_html=True)
 
     # ── Auto-refresh: 1.5 s when running ─────────────────────────────────────
     if ts_get("running"):
