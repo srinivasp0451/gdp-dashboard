@@ -274,10 +274,17 @@ def _merge_pivots(cl,hi,lo):
         elif p[2]=="L" and p[1]<f[-1][1]: f[-1]=list(p)
     return f
 
-def detect_ew(df,order=5):
+def detect_ew(df,order=5,no_lookahead=True):
+    """
+    no_lookahead=True: trim last `order` bars so argrelextrema cannot
+    use future candles. This makes backtest and live identical.
+    """
     empty={"pattern":None,"waves":[],"signal":0,"fib":{},"confidence":0,"in_progress":False}
     if len(df)<order*6: return empty
-    cl=df["Close"]; hi,lo=_pivots(cl,order)
+    # Remove lookahead: argrelextrema needs `order` bars on each side.
+    # In live we only have confirmed bars, so trim the last `order` bars.
+    safe_df = df.iloc[:-order] if (no_lookahead and len(df)>order*2) else df
+    cl=safe_df["Close"]; hi,lo=_pivots(cl,order)
     if len(hi)<2 or len(lo)<2: return empty
     pv=_merge_pivots(cl,hi,lo)
     if len(pv)<4: return empty
@@ -350,12 +357,13 @@ def apply_filters(df,signals,cfg):
     if cfg.get("filter_rsi",False):
         rsi=calc_rsi(df["Close"],14)
         sig[(rsi<cfg.get("rsi_lo",30))|(rsi>cfg.get("rsi_hi",70))]=0
-    try:
-        h0,m0=map(int,cfg.get("trade_time_start","09:15").split(":"))
-        h1,m1=map(int,cfg.get("trade_time_end","15:20").split(":"))
-        mins=df.index.hour*60+df.index.minute
-        sig[~((mins>=h0*60+m0)&(mins<=h1*60+m1))]=0
-    except: pass
+    if cfg.get("filter_time", False):
+        try:
+            h0,m0=map(int,cfg.get("trade_time_start","09:15").split(":"))
+            h1,m1=map(int,cfg.get("trade_time_end","15:20").split(":"))
+            mins=df.index.hour*60+df.index.minute
+            sig[~((mins>=h0*60+m0)&(mins<=h1*60+m1))]=0
+        except: pass
     st=cfg.get("strategy","")
     if cfg.get("filter_angle",False) and st in ("EMA Crossover","Anticipatory EMA"):
         ang=angle_series(ema(df["Close"],cfg.get("fast",9)),ema(df["Close"],cfg.get("slow",21)))
@@ -686,8 +694,38 @@ def live_thread():
                 "candle_count": (ts_get("candle_count") or 0) + 1,
             })
 
-            # ── Refresh candles every 60 s ────────────────────────────────────
-            if time.time() - last_candle_refresh >= 60:
+            # ── Push live strategy indicator values every tick ─────────────────
+            strat_info = {"strategy": strat, "fast": fast, "slow": slow}
+            if df is not None and not df.empty:
+                try:
+                    fe_val = round(float(df["EMA_fast"].iloc[-1]), 4) if "EMA_fast" in df.columns else None
+                    se_val = round(float(df["EMA_slow"].iloc[-1]),  4) if "EMA_slow" in df.columns else None
+                    atr_val = round(float(df["ATR"].iloc[-1]),       4) if "ATR"      in df.columns else None
+                    gap = round(fe_val - se_val, 4) if fe_val and se_val else None
+                    trend = "Fast > Slow (Bullish)" if gap and gap > 0 else "Fast < Slow (Bearish)" if gap else "—"
+                    strat_info.update({
+                        "ema_fast_val": fe_val, "ema_slow_val": se_val,
+                        "atr_val": atr_val, "ema_gap": gap, "trend": trend,
+                        "bars": len(df), "last_bar": str(df.index[-1])[:16],
+                    })
+                    # EW info
+                    if strat == "Elliott Wave":
+                        ew_now = detect_ew(df, cfg.get("ew_order", 5))
+                        strat_info["ew_pattern"]    = ew_now.get("pattern") or "None detected"
+                        strat_info["ew_confidence"] = ew_now.get("confidence", 0)
+                        strat_info["ew_signal"]     = ew_now.get("signal", 0)
+                except Exception:
+                    pass
+            ts_set("live_strat_info", strat_info)
+
+            # ── Refresh candles every 60 s (or every tick for EMA strategies) ──
+            ema_strat = strat in ("EMA Crossover","Anticipatory EMA")
+            # EMA crossover: check every tick on latest candles so we never miss
+            do_candle_refresh = (
+                time.time() - last_candle_refresh >= 60
+                or (ema_strat and time.time() - last_candle_refresh >= 5)
+            )
+            if do_candle_refresh:
                 new_df = fetch_ohlcv(sym, iv, per)
                 if new_df is not None and not new_df.empty:
                     new_df["EMA_fast"] = ema(new_df["Close"], fast)
@@ -699,6 +737,8 @@ def live_thread():
                     if not simple and not position:
                         pending_signal = get_live_signal(df, strat, cfg)
                         ts_set("live_signal", pending_signal)
+                        if pending_signal != 0:
+                            ts_log(f"Signal detected: {'BUY' if pending_signal==1 else 'SELL'} [{strat}]")
 
             # ── Squareoff ─────────────────────────────────────────────────────
             if ts_get("squareoff_requested") and position:
@@ -789,8 +829,23 @@ def live_thread():
 
             # ── Enter new position ────────────────────────────────────────────
             if not position and pending_signal != 0:
-                can_enter = simple or (in_window() and dow_ok())
-                if can_enter:
+                # Time/day filters only apply to EMA strategies in auto mode
+                # EW / Wave Extrema fire on confirmed pattern — respect signal immediately
+                # Simple Buy/Sell always enter
+                if simple:
+                    can_enter = True
+                elif strat in ("Elliott Wave", "Wave Extrema"):
+                    can_enter = True   # pattern-based: enter on confirmed signal
+                else:
+                    time_ok = (not cfg.get("filter_time", False)) or in_window()
+                    day_ok_ = (not cfg.get("filter_dow",  [])) or dow_ok()
+                    can_enter = time_ok and day_ok_
+
+                if not can_enter:
+                    reason = "Outside trade window" if not in_window() else "Day filter active"
+                    ts_set("live_entry_blocked", reason)
+                else:
+                    ts_set("live_entry_blocked", None)
                     side  = 1 if pending_signal == 1 else -1
                     atr_v = (float(df["ATR"].iloc[-1])
                              if df is not None and not df.empty else abs(ltp * 0.005))
@@ -811,10 +866,11 @@ def live_thread():
                     ts_update({"live_ew_info": ew_inf})
                     ts_log(f"{'BUY' if side==1 else 'SELL'} @ {ltp:.4f}  "
                            f"SL={sl_p:.4f}  TGT={tgt_p:.4f}")
-                    # Clear pending signal after entry (for non-simple strategies)
                     if not simple:
                         pending_signal = 0
                         ts_set("live_signal", 0)
+            else:
+                ts_set("live_entry_blocked", None)
 
         except Exception as exc:
             ts_log(f"ERROR: {exc}")
@@ -990,21 +1046,62 @@ def sidebar_config():
         tp=st.number_input("Target Points",min_value=0.0,value=40.0,step=0.5)
         atr_p=st.number_input("ATR Period",min_value=2,value=14,step=1)
         st.markdown("---")
-        st.markdown("**Filters**")
-        day_opts=["Mon","Tue","Wed","Thu","Fri","Sat","Sun"]
-        sel_days=st.multiselect("Days of Week",day_opts,default=["Mon","Tue","Wed","Thu","Fri"])
-        dow_map={d:i for i,d in enumerate(day_opts)}; dow_ints=[dow_map[d] for d in sel_days]
-        filter_adx=st.checkbox("ADX Filter"); adx_min=st.number_input("ADX Min",0,100,20) if filter_adx else 20
-        filter_rsi=st.checkbox("RSI Filter"); rsi_lo,rsi_hi=30,70
-        if filter_rsi: rsi_lo=st.number_input("RSI Low",0,100,30); rsi_hi=st.number_input("RSI High",0,100,70)
-        filter_ang=st.checkbox("Angle Filter"); amin,amax=-90.0,90.0
-        if filter_ang: amin=st.number_input("Angle Min°",value=-90.0); amax=st.number_input("Angle Max°",value=90.0)
-        filter_dlt=st.checkbox("EMA Delta Filter"); dmin,dmax=0.0,0.0
-        if filter_dlt: dmin=st.number_input("Delta Min%",value=0.0,step=0.1); dmax=st.number_input("Delta Max%",value=5.0,step=0.1)
-        st.markdown("**Trade Window (IST)**")
-        t_start=st.text_input("Start HH:MM",value="09:15"); t_end=st.text_input("End HH:MM",value="15:20")
-        st.markdown("**Daily PnL Caps** (0=disabled)")
-        max_loss=st.number_input("Max Daily Loss",0.0,step=100.0); max_profit=st.number_input("Max Daily Profit",0.0,step=100.0)
+        st.markdown("**Filters** *(all disabled by default)*")
+
+        # Day-of-week filter
+        filter_dow_on = st.checkbox("Day-of-Week Filter", value=False)
+        dow_ints = []
+        if filter_dow_on:
+            day_opts=["Mon","Tue","Wed","Thu","Fri","Sat","Sun"]
+            sel_days=st.multiselect("Days",day_opts,default=["Mon","Tue","Wed","Thu","Fri"])
+            dow_map={d:i for i,d in enumerate(day_opts)}
+            dow_ints=[dow_map[d] for d in sel_days]
+
+        # Trade time window
+        filter_time=st.checkbox("Trade Time Window", value=False)
+        t_start,t_end="09:15","15:30"
+        if filter_time:
+            fc1,fc2=st.columns(2)
+            t_start=fc1.text_input("Start HH:MM",value="09:15",key="ts_start")
+            t_end  =fc2.text_input("End   HH:MM",value="15:30",key="ts_end")
+
+        # ADX filter
+        filter_adx=st.checkbox("ADX Filter", value=False)
+        adx_min=20
+        if filter_adx:
+            adx_min=st.number_input("ADX Min",0,100,20)
+
+        # RSI filter
+        filter_rsi=st.checkbox("RSI Filter", value=False)
+        rsi_lo,rsi_hi=30,70
+        if filter_rsi:
+            fc1,fc2=st.columns(2)
+            rsi_lo=fc1.number_input("RSI Low", 0,100,30)
+            rsi_hi=fc2.number_input("RSI High",0,100,70)
+
+        # Crossover angle filter
+        filter_ang=st.checkbox("Crossover Angle Filter", value=False)
+        amin,amax=-90.0,90.0
+        if filter_ang:
+            fc1,fc2=st.columns(2)
+            amin=fc1.number_input("Angle Min°",value=-90.0)
+            amax=fc2.number_input("Angle Max°",value=90.0)
+
+        # EMA delta filter
+        filter_dlt=st.checkbox("EMA Delta Filter", value=False)
+        dmin,dmax=0.0,0.0
+        if filter_dlt:
+            fc1,fc2=st.columns(2)
+            dmin=fc1.number_input("Delta Min%",value=0.0,step=0.1)
+            dmax=fc2.number_input("Delta Max%",value=5.0,step=0.1)
+
+        # Daily PnL caps
+        filter_caps=st.checkbox("Daily PnL Caps", value=False)
+        max_loss,max_profit=0.0,0.0
+        if filter_caps:
+            fc1,fc2=st.columns(2)
+            max_loss  =fc1.number_input("Max Loss",  0.0,step=100.0)
+            max_profit=fc2.number_input("Max Profit",0.0,step=100.0)
         st.markdown("---")
         st.markdown(f"<div style='font-size:.74rem;color:#8b949e;text-align:center'>{datetime.now(IST).strftime('%d %b %Y  %H:%M:%S IST')}</div>",unsafe_allow_html=True)
     return {"symbol":sym,"interval":interval,"period":period,"strategy":strategy,"qty":int(qty),
@@ -1015,7 +1112,7 @@ def sidebar_config():
             "filter_rsi":filter_rsi,"rsi_lo":int(rsi_lo),"rsi_hi":int(rsi_hi),
             "filter_angle":filter_ang,"angle_min":float(amin),"angle_max":float(amax),
             "filter_delta":filter_dlt,"delta_min":float(dmin),"delta_max":float(dmax),
-            "trade_time_start":t_start,"trade_time_end":t_end,
+            "filter_time":filter_time,"trade_time_start":t_start,"trade_time_end":t_end,
             "max_daily_loss":float(max_loss),"max_daily_profit":float(max_profit)}
 
 # ── Merge helper ───────────────────────────────────────────────────────────────
@@ -1181,6 +1278,29 @@ def tab_live(cfg):
         p4.metric("Target",  f"{pos.get('target',0):.4f}")
         p5.metric("Eff SL",  f"{pos.get('eff_sl',0):.4f}")
         p6.metric("Unreal.", f"{unreal:+.4f}")
+
+    # ── Strategy status panel ─────────────────────────────────────────────────
+    si = ts_get("live_strat_info") or {}
+    blocked = ts_get("live_entry_blocked")
+    if si or running:
+        with st.expander("📡 Strategy Status", expanded=True):
+            sc1,sc2,sc3,sc4 = st.columns(4)
+            sc1.metric("Strategy",  si.get("strategy", cfg["strategy"]))
+            sc2.metric("Fast EMA",  f"{si.get('ema_fast_val','—')}" if si.get('ema_fast_val') else f"Period: {cfg['fast']}")
+            sc3.metric("Slow EMA",  f"{si.get('ema_slow_val','—')}" if si.get('ema_slow_val') else f"Period: {cfg['slow']}")
+            sc4.metric("ATR",       f"{si.get('atr_val','—')}"      if si.get('atr_val')      else "—")
+            sc5,sc6,sc7,sc8 = st.columns(4)
+            sc5.metric("EMA Gap",   f"{si.get('ema_gap','—')}"  if si.get('ema_gap') is not None else "—")
+            sc6.metric("Trend",     si.get("trend","—"))
+            sc7.metric("Bars",      si.get("bars","—"))
+            sc8.metric("Last Bar",  si.get("last_bar","—"))
+            if cfg["strategy"] == "Elliott Wave":
+                ew1,ew2,ew3 = st.columns(3)
+                ew1.metric("EW Pattern",    si.get("ew_pattern","Computing…"))
+                ew2.metric("EW Confidence", f"{si.get('ew_confidence',0)}%")
+                ew3.metric("EW Signal",     "🟢 BUY" if si.get("ew_signal")==1 else "🔴 SELL" if si.get("ew_signal")==-1 else "—")
+            if blocked:
+                st.warning(f"⚠ Entry blocked: {blocked}")
 
     # ── Chart ─────────────────────────────────────────────────────────────────
     _df = ts_get("live_df")
