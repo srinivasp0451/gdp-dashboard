@@ -38,6 +38,10 @@ SL_TYPES = [
     "EMA Reverse Crossover",
     "Trailing Swing Low/High",
     "Candle Low/High",
+    "Trailing Current Candle Low/High",
+    "Trailing Previous Candle Low/High",
+    "Trailing Current Swing Low/High",
+    "Trailing Previous Swing Low/High",
     "Support/Resistance Trailing",
     "Volatility Based",
     "Cost-to-Cost + N Points",
@@ -53,6 +57,11 @@ TARGET_TYPES = [
     "Risk:Reward",
     "ATR Multiple",
     "Adaptive Target",
+    "Trailing Target (display only)",
+    "Trailing Current Candle Low/High",
+    "Trailing Previous Candle Low/High",
+    "Trailing Current Swing Low/High",
+    "Trailing Previous Swing Low/High",
     "Partial Exit + Ride",
     "Exit if Target fell 50%",
     "Smart Target (auto)",
@@ -63,6 +72,17 @@ TRAILING_SL_TYPES = {
     "Support/Resistance Trailing","Cost-to-Cost + N Points",
     "Adaptive SL","ADV Volatility Based","Ratchet SL (50% target → trail)",
     "Shift to Cost-to-Cost - N pts",
+    "Trailing Current Candle Low/High","Trailing Previous Candle Low/High",
+    "Trailing Current Swing Low/High","Trailing Previous Swing Low/High",
+}
+
+# Target types that trail (never get hit — exit only via SL or EOD)
+TRAILING_TARGET_TYPES = {
+    "Trailing Target (display only)",
+    "Trailing Current Candle Low/High",
+    "Trailing Previous Candle Low/High",
+    "Trailing Current Swing Low/High",
+    "Trailing Previous Swing Low/High",
 }
 
 TIMEFRAMES = ["1m","5m","15m","30m","1h","1d"]
@@ -466,13 +486,37 @@ def calc_sl(entry, side, sl_type, sl_param, df, idx, atr_v, fast=9, slow=21):
         return entry - side * atr_v * 1.5
     if sl_type in ("Ratchet SL (50% target → trail)","Exit if SL past N pts stagnant"):
         return entry - side * atr_v * 1.5
+    if sl_type == "Trailing Current Candle Low/High":
+        if df is not None and idx < len(df):
+            return (float(df["Low"].iloc[idx])  if side == 1
+                    else float(df["High"].iloc[idx]))
+        return entry - side * atr_v
+    if sl_type == "Trailing Previous Candle Low/High":
+        prev = max(0, idx - 1)
+        if df is not None and prev < len(df):
+            return (float(df["Low"].iloc[prev])  if side == 1
+                    else float(df["High"].iloc[prev]))
+        return entry - side * atr_v
+    if sl_type == "Trailing Current Swing Low/High":
+        if df is not None and idx >= 3:
+            w = max(1, int(sl_param) if sl_param > 0 else 3)
+            s = max(0, idx - w)
+            return (float(df["Low"].iloc[s:idx+1].min()) if side == 1
+                    else float(df["High"].iloc[s:idx+1].max()))
+        return entry - side * atr_v * 1.2
+    if sl_type == "Trailing Previous Swing Low/High":
+        if df is not None and idx >= 4:
+            w  = max(1, int(sl_param) if sl_param > 0 else 3)
+            s  = max(0, idx - w - 1)
+            e_ = max(0, idx - 1)
+            return (float(df["Low"].iloc[s:e_+1].min()) if side == 1
+                    else float(df["High"].iloc[s:e_+1].max()))
+        return entry - side * atr_v * 1.2
     if sl_type == "Smart SL (auto)":
-        # Auto: use tighter of ATR*1.5 or recent swing low/high
         base = entry - side * atr_v * 1.5
         if df is not None and idx >= 5:
             swing = (float(df["Low"].iloc[max(0,idx-5):idx+1].min()) if side == 1
                      else float(df["High"].iloc[max(0,idx-5):idx+1].max()))
-            # pick the one closer to entry (tighter)
             base = (max(base, swing) if side == 1 else min(base, swing))
         return base
     return entry - side * atr_v * 1.5
@@ -491,8 +535,36 @@ def calc_target(entry, side, sl, target_type, tp, rr, atr_v=None, df=None, idx=0
     if target_type in ("Partial Exit + Ride", "Exit if Target fell 50%"):
         return entry + side * tp
     if target_type == "Smart Target (auto)":
-        # Auto: 2x ATR from entry
         return entry + side * (atr_v or abs(entry - sl)) * 2.0
+    # Trailing targets — initial value (will be updated every tick, never hit directly)
+    if target_type == "Trailing Target (display only)":
+        return entry + side * (atr_v or tp) * 2.0  # initial placeholder
+    if target_type == "Trailing Current Candle Low/High":
+        if df is not None and idx < len(df):
+            return (float(df["High"].iloc[idx]) if side == 1
+                    else float(df["Low"].iloc[idx]))
+        return entry + side * tp
+    if target_type == "Trailing Previous Candle Low/High":
+        prev = max(0, idx - 1)
+        if df is not None and prev < len(df):
+            return (float(df["High"].iloc[prev]) if side == 1
+                    else float(df["Low"].iloc[prev]))
+        return entry + side * tp
+    if target_type == "Trailing Current Swing Low/High":
+        if df is not None and idx >= 3:
+            w = max(1, int(rr) if rr > 1 else 3)
+            s = max(0, idx - w)
+            return (float(df["High"].iloc[s:idx+1].max()) if side == 1
+                    else float(df["Low"].iloc[s:idx+1].min()))
+        return entry + side * tp
+    if target_type == "Trailing Previous Swing Low/High":
+        if df is not None and idx >= 4:
+            w  = max(1, int(rr) if rr > 1 else 3)
+            s  = max(0, idx - w - 1)
+            e_ = max(0, idx - 1)
+            return (float(df["High"].iloc[s:e_+1].max()) if side == 1
+                    else float(df["Low"].iloc[s:e_+1].min()))
+        return entry + side * tp
     return entry + side * tp
 
 def update_trail(cur, ltp, side, sl_type, sp, entry, atr_v, phase, locked,
@@ -576,13 +648,89 @@ def update_trail(cur, ltp, side, sl_type, sp, entry, atr_v, phase, locked,
         if best > stagnant_threshold and (best - profit) >= stagnant_threshold * 0.5:
             extra["force_exit"] = True
 
+    elif sl_type == "Trailing Current Candle Low/High":
+        # Update every tick using latest candle Low (BUY) or High (SELL) from df
+        df_ = extra.get("df")
+        if df_ is not None and not df_.empty:
+            prop = (float(df_["Low"].iloc[-1])  if side == 1
+                    else float(df_["High"].iloc[-1]))
+            ns   = max(cur, prop) if side == 1 else min(cur, prop)
+
+    elif sl_type == "Trailing Previous Candle Low/High":
+        df_ = extra.get("df")
+        if df_ is not None and len(df_) >= 2:
+            prop = (float(df_["Low"].iloc[-2])  if side == 1
+                    else float(df_["High"].iloc[-2]))
+            ns   = max(cur, prop) if side == 1 else min(cur, prop)
+
+    elif sl_type == "Trailing Current Swing Low/High":
+        df_ = extra.get("df")
+        if df_ is not None and len(df_) >= 3:
+            w    = max(1, int(sp) if sp > 0 else 3)
+            prop = (float(df_["Low"].iloc[-w:].min())  if side == 1
+                    else float(df_["High"].iloc[-w:].max()))
+            ns   = max(cur, prop) if side == 1 else min(cur, prop)
+
+    elif sl_type == "Trailing Previous Swing Low/High":
+        df_ = extra.get("df")
+        if df_ is not None and len(df_) >= 4:
+            w    = max(1, int(sp) if sp > 0 else 3)
+            sub  = df_.iloc[-(w+1):-1]
+            prop = (float(sub["Low"].min())  if side == 1
+                    else float(sub["High"].max()))
+            ns   = max(cur, prop) if side == 1 else min(cur, prop)
+
     elif sl_type == "Smart SL (auto)":
-        # Tighten trail as profit increases
         trail = max(atr_v * 0.5, atr_v * 1.5 - profit * 0.1)
         prop  = ltp - side * trail
         ns    = max(cur, prop) if side == 1 else min(cur, prop)
 
     return ns, np_, nl, extra
+
+
+def update_trailing_target(cur_tgt, ltp, side, target_type, sp, atr_v, extra):
+    """
+    Update a trailing target every tick.
+    Returns new target value (always moves in trade direction — ratchet).
+    For 'Trailing Target (display only)' — trails ltp, never actually triggers exit.
+    """
+    df_ = extra.get("df")
+    nt  = cur_tgt
+
+    if target_type == "Trailing Target (display only)":
+        trail = sp if sp > 0 else atr_v * 2.0
+        prop  = ltp + side * trail          # target trails ABOVE ltp for BUY
+        # Ratchet: target only moves further in trade direction
+        nt = (max(cur_tgt, prop) if side == 1 else min(cur_tgt, prop))
+
+    elif target_type == "Trailing Current Candle Low/High":
+        if df_ is not None and not df_.empty:
+            prop = (float(df_["High"].iloc[-1]) if side == 1
+                    else float(df_["Low"].iloc[-1]))
+            nt   = max(cur_tgt, prop) if side == 1 else min(cur_tgt, prop)
+
+    elif target_type == "Trailing Previous Candle Low/High":
+        if df_ is not None and len(df_) >= 2:
+            prop = (float(df_["High"].iloc[-2]) if side == 1
+                    else float(df_["Low"].iloc[-2]))
+            nt   = max(cur_tgt, prop) if side == 1 else min(cur_tgt, prop)
+
+    elif target_type == "Trailing Current Swing Low/High":
+        if df_ is not None and len(df_) >= 3:
+            w    = max(1, int(sp) if sp > 0 else 3)
+            prop = (float(df_["High"].iloc[-w:].max()) if side == 1
+                    else float(df_["Low"].iloc[-w:].min()))
+            nt   = max(cur_tgt, prop) if side == 1 else min(cur_tgt, prop)
+
+    elif target_type == "Trailing Previous Swing Low/High":
+        if df_ is not None and len(df_) >= 4:
+            w    = max(1, int(sp) if sp > 0 else 3)
+            sub  = df_.iloc[-(w+1):-1]
+            prop = (float(sub["High"].max()) if side == 1
+                    else float(sub["Low"].min()))
+            nt   = max(cur_tgt, prop) if side == 1 else min(cur_tgt, prop)
+
+    return nt
 
 # ── Backtest engine ────────────────────────────────────────────────────────────
 def _append_trade(pos,ep,reason,ets,trades,daily_map,day,qty):
@@ -944,10 +1092,18 @@ def live_thread():
                 locked = position.get("locked_sl", None)
 
                 # Update trailing SL using live LTP
-                _extra = position.get("extra", {})
+                _extra       = position.get("extra", {})
+                _extra["df"] = df          # give trail functions access to candles
                 trail, phase, locked, _extra = update_trail(
                     trail, ltp, side, sl_t, sp_, entry, atr_, phase, locked,
                     tgt=tgt_p, extra=_extra)
+                # Update trailing target every tick
+                target_type_pos = position.get("target_type","Custom Points")
+                if target_type_pos in TRAILING_TARGET_TYPES:
+                    tgt_p = update_trailing_target(tgt_p, ltp, side,
+                                                   target_type_pos, sp_,
+                                                   atr_, _extra)
+                    position["target"] = tgt_p
                 position.update({"trailing_sl": trail, "phase": phase,
                                   "locked_sl": locked, "extra": _extra})
                 if _extra.get("force_exit"):
@@ -998,10 +1154,13 @@ def live_thread():
                     time.sleep(1.5); continue
 
                 # Check Target
-                tgt_hit = (side == 1 and ltp >= tgt_p) or (side == -1 and ltp <= tgt_p)
+                target_type_pos = position.get("target_type","Custom Points")
+                if target_type_pos == "Trailing Target (display only)":
+                    tgt_hit = False   # never exit via target — only SL or EOD
+                else:
+                    tgt_hit = (side == 1 and ltp >= tgt_p) or (side == -1 and ltp <= tgt_p)
 
                 # "Exit if Target fell 50%" — if we hit target then fell back 50%
-                target_type_pos = position.get("target_type","Custom Points")
                 if target_type_pos == "Exit if Target fell 50%":
                     best_profit = position.get("extra",{}).get("best_profit",0)
                     if profit > best_profit:
@@ -1078,19 +1237,39 @@ def live_thread():
                     partial_pct  = int(cfg.get("partial_pct", 70))
                     smart_on     = cfg.get("smart_sl_target", False)
                     if smart_on:
-                        # Override: auto SL and target from ATR
-                        sl_p  = entry - side * atr_v * 1.5
-                        tgt_p = entry + side * atr_v * 2.5
-                    position = {
-                        "side": side, "entry": ltp, "sl": sl_p, "target": tgt_p,
-                        "sl_type": sl_type, "sl_param": sp,
-                        "target_type": target_type, "partial_pct": partial_pct,
-                        "entry_time": datetime.now(IST),
-                        "atr": atr_v, "qty": qty,
-                        "trailing_sl": sl_p, "phase": 1, "locked_sl": None,
-                        "pattern": ew_inf.get("pattern", ""),
-                        "extra": {},
-                    }
+                        sl_p  = ltp - side * atr_v * 1.5
+                        tgt_p = ltp + side * atr_v * 2.5
+
+                    # ── Confluence quality check ──────────────────────────────
+                    # Only enter if EMA trend aligns with signal direction
+                    # and ATR is not too small (avoid flat markets)
+                    skip_entry = False
+                    if df is not None and not df.empty and not simple:
+                        try:
+                            fe_ = float(df["EMA_fast"].iloc[-1])
+                            se_ = float(df["EMA_slow"].iloc[-1])
+                            ema_align = (side == 1 and fe_ > se_) or (side == -1 and fe_ < se_)
+                            atr_ok    = atr_v > ltp * 0.0005   # at least 0.05% of price
+                            if not ema_align:
+                                skip_entry = True
+                                ts_log(f"Signal skipped: EMA trend opposes {"BUY" if side==1 else "SELL"}")
+                            elif not atr_ok:
+                                skip_entry = True
+                                ts_log("Signal skipped: market too flat (ATR too small)")
+                        except Exception:
+                            pass
+
+                    if not skip_entry:
+                        position = {
+                            "side": side, "entry": ltp, "sl": sl_p, "target": tgt_p,
+                            "sl_type": sl_type, "sl_param": sp,
+                            "target_type": target_type, "partial_pct": partial_pct,
+                            "entry_time": datetime.now(IST),
+                            "atr": atr_v, "qty": qty,
+                            "trailing_sl": sl_p, "phase": 1, "locked_sl": None,
+                            "pattern": ew_inf.get("pattern", ""),
+                            "extra": {},
+                        }
                     ts_update({"live_ew_info": ew_inf})
                     ts_log(f"{'BUY' if side==1 else 'SELL'} @ {ltp:.4f}  "
                            f"SL={sl_p:.4f}  TGT={tgt_p:.4f}")
@@ -1529,12 +1708,14 @@ def tab_live(cfg):
     if pos:
         st.markdown("**Open Position**")
         p1,p2,p3,p4,p5,p6 = st.columns(6)
-        p1.metric("Side",    "BUY 🟢" if pos.get("side")==1 else "SELL 🔴")
-        p2.metric("Entry",   f"{pos.get('entry',0):.4f}")
-        p3.metric("SL",      f"{pos.get('sl',0):.4f}")
-        p4.metric("Target",  f"{pos.get('target',0):.4f}")
-        p5.metric("Eff SL",  f"{pos.get('eff_sl',0):.4f}")
-        p6.metric("Unreal.", f"{unreal:+.4f}")
+        p1.metric("Side",     "BUY 🟢" if pos.get("side")==1 else "SELL 🔴")
+        p2.metric("Entry",    f"{pos.get('entry',0):.4f}")
+        p3.metric("Eff SL",   f"{pos.get('eff_sl',0):.4f}")
+        tgt_label = ("🎯 Trail Tgt" if pos.get("target_type","") in TRAILING_TARGET_TYPES
+                     else "Target")
+        p4.metric(tgt_label,  f"{pos.get('target',0):.4f}")
+        p5.metric("Static SL",f"{pos.get('sl',0):.4f}")
+        p6.metric("Unreal.",  f"{unreal:+.4f}")
 
     # ── Strategy status panel ─────────────────────────────────────────────────
     si      = ts_get("live_strat_info") or {}
@@ -1679,12 +1860,13 @@ def tab_live(cfg):
 def tab_history():
     st.markdown("<h2 style='font-family:Syne'>📜 Trade History</h2>",unsafe_allow_html=True)
     merge_all()
-    src=st.radio("Source",["All (Backtest + Live)","Backtest Only","Live Only"],horizontal=True)
+    src=st.radio("Source",["Live Only","Backtest Only","All (Backtest + Live)"],
+                 horizontal=True, index=0)   # default = Live Only
     all_t=st.session_state.get("all_trades",[])
     live_t=list(ts_get("live_trades") or [])
     if src=="Backtest Only": trades=[t for t in all_t if t.get("source","backtest")=="backtest"]
-    elif src=="Live Only": trades=live_t
-    else: trades=all_t
+    elif src=="All (Backtest + Live)": trades=all_t
+    else: trades=live_t
     if not trades: st.info("No trades yet. Run a Backtest or start Live Trading."); return
     an=build_analysis(trades)
     if not an: return
