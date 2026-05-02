@@ -28,15 +28,41 @@ APP_VERSION = "3.1.0"
 STRATEGIES = ["EMA Crossover","Anticipatory EMA","Elliott Wave","Wave Extrema","Simple Buy","Simple Sell"]
 
 SL_TYPES = [
-    "Custom Points","ATR","Risk:Reward","Trailing SL","Auto SL",
-    "EMA Reverse Crossover","Trailing Swing Low/High","Candle Low/High",
-    "Support/Resistance Trailing","Volatility Based","Cost-to-Cost + N Points",
-    "Strategy Reverse Signal","Trailing SL (3-Phase)",
+    "Custom Points",
+    "ATR",
+    "Trailing SL",
+    "Trailing SL (3-Phase)",
+    "Auto SL",
+    "Adaptive SL",
+    "ADV Volatility Based",
+    "EMA Reverse Crossover",
+    "Trailing Swing Low/High",
+    "Candle Low/High",
+    "Support/Resistance Trailing",
+    "Volatility Based",
+    "Cost-to-Cost + N Points",
+    "Shift to Cost-to-Cost - N pts",
+    "Ratchet SL (50% target → trail)",
+    "Exit if SL past N pts stagnant",
+    "Strategy Reverse Signal",
+    "Smart SL (auto)",
+]
+
+TARGET_TYPES = [
+    "Custom Points",
+    "Risk:Reward",
+    "ATR Multiple",
+    "Adaptive Target",
+    "Partial Exit + Ride",
+    "Exit if Target fell 50%",
+    "Smart Target (auto)",
 ]
 
 TRAILING_SL_TYPES = {
     "Trailing SL","Trailing SL (3-Phase)","Trailing Swing Low/High",
     "Support/Resistance Trailing","Cost-to-Cost + N Points",
+    "Adaptive SL","ADV Volatility Based","Ratchet SL (50% target → trail)",
+    "Shift to Cost-to-Cost - N pts",
 }
 
 TIMEFRAMES = ["1m","5m","15m","30m","1h","1d"]
@@ -77,8 +103,8 @@ a{color:var(--blue)!important;}
 [data-testid="stSidebar"]{background-color:var(--surf)!important;border-right:1px solid var(--border)!important;}
 [data-testid="stSidebar"] *{color:var(--text)!important;}
 [data-testid="metric-container"]{background-color:var(--surf)!important;border:1px solid var(--border)!important;border-radius:8px!important;padding:14px 16px!important;}
-[data-testid="metric-container"] *,[data-testid="stMetricValue"]{color:var(--text)!important;}
-[data-testid="stMetricLabel"]{color:var(--muted)!important;font-size:.75rem!important;}
+[data-testid="metric-container"] *,[data-testid="stMetricValue"]{color:var(--text)!important;font-size:.95rem!important;overflow:hidden;text-overflow:clip!important;white-space:nowrap}
+[data-testid="stMetricLabel"]{color:var(--muted)!important;font-size:.65rem!important;overflow:hidden;text-overflow:clip!important;white-space:nowrap}
 input,select,textarea{background-color:var(--surf2)!important;border-color:var(--border)!important;color:var(--text)!important;}
 [data-baseweb="input"],[data-baseweb="select"],[data-baseweb="textarea"]{background-color:var(--surf2)!important;border-color:var(--border)!important;}
 [data-testid="stNumberInput"] input,[data-testid="stTextInput"] input{color:var(--text)!important;background-color:var(--surf2)!important;}
@@ -375,52 +401,188 @@ def apply_filters(df,signals,cfg):
         if cfg.get("delta_max",0)>0: sig[dlt>cfg.get("delta_max",100)]=0
     return sig
 
-# ── SL helpers ─────────────────────────────────────────────────────────────────
-def calc_sl(entry,side,sl_type,sl_param,df,idx,atr_v,fast=9,slow=21):
-    if sl_type=="Custom Points": return entry-side*sl_param
-    if sl_type=="ATR": return entry-side*atr_v*(sl_param if sl_param>0 else 1.5)
-    if sl_type in ("Risk:Reward","Strategy Reverse Signal"): return entry-side*sl_param
-    if sl_type in ("Trailing SL","Trailing SL (3-Phase)","Auto SL"): return entry-side*atr_v*1.5
-    if sl_type=="EMA Reverse Crossover":
-        return float(ema(df["Close"],slow).iloc[min(idx,len(df)-1)])
-    if sl_type=="Trailing Swing Low/High":
-        w=max(1,int(sl_param) if sl_param>0 else 5); s=max(0,idx-w)
-        return (float(df["Low"].iloc[s:idx+1].min()) if side==1 else float(df["High"].iloc[s:idx+1].max()))
-    if sl_type=="Candle Low/High":
-        return (float(df["Low"].iloc[min(idx,len(df)-1)]) if side==1 else float(df["High"].iloc[min(idx,len(df)-1)]))
-    if sl_type=="Support/Resistance Trailing":
-        sup,res=sup_res(df.iloc[:idx+1]); return sup if side==1 else res
-    if sl_type=="Volatility Based":
-        vol=df["Close"].iloc[max(0,idx-20):idx+1].std()
-        return entry-side*vol*(sl_param if sl_param>0 else 2.0)
-    if sl_type=="Cost-to-Cost + N Points": return entry-side*atr_v*1.5
-    return entry-side*atr_v*1.5
+# ── SL / Target helpers ────────────────────────────────────────────────────────
+def _adaptive_sl_mult(df, idx, window=20):
+    """Volatility regime ratio: high vol → wider SL, low vol → tighter."""
+    if df is None or idx < window: return 1.5
+    recent = df["Close"].iloc[max(0,idx-window):idx+1]
+    vol    = recent.std()
+    mean   = recent.mean()
+    ratio  = vol / mean if mean > 0 else 0.01
+    # scale between 1.0x (quiet) and 3.0x (volatile)
+    return float(np.clip(ratio * 100, 1.0, 3.0))
 
-def calc_target(entry,side,sl,sl_type,tp,rr):
-    if sl_type=="Risk:Reward": return entry+side*abs(entry-sl)*rr
-    return entry+side*tp
+def _adv_vol(df, idx, window=14):
+    """Average Directional Volatility = mean(|close - prev_close|) * ATR weight."""
+    if df is None or idx < 3: return None
+    cl  = df["Close"].iloc[max(0,idx-window):idx+1]
+    adv = cl.diff().abs().mean()
+    return float(adv) if not np.isnan(adv) else None
 
-def update_trail(cur,ltp,side,sl_type,sp,entry,atr_v,phase,locked):
-    ns,np_,nl=cur,phase,locked
-    if sl_type=="Trailing SL":
-        trail=sp if sp>0 else atr_v*1.5; prop=ltp-side*trail
-        ns=max(cur,prop) if side==1 else min(cur,prop)
-    elif sl_type=="Trailing SL (3-Phase)":
-        lp=sp if sp>0 else atr_v; profit=(ltp-entry)*side
-        if np_==1:
-            prop=ltp-side*atr_v*1.5; ns=max(cur,prop) if side==1 else min(cur,prop)
-            if profit>=lp: np_=2; nl=entry+side*lp; ns=max(ns,nl) if side==1 else min(ns,nl)
-        elif np_==2:
-            if nl: ns=max(cur,nl) if side==1 else min(cur,nl)
-            if profit>=lp*2: np_=3
-        elif np_==3:
-            prop=ltp-side*atr_v*0.5; ns=max(cur,prop) if side==1 else min(cur,prop)
-    elif sl_type in ("Trailing Swing Low/High","Support/Resistance Trailing"):
-        prop=ltp-side*atr_v*1.2; ns=max(cur,prop) if side==1 else min(cur,prop)
-    elif sl_type=="Cost-to-Cost + N Points":
-        n=sp if sp>0 else atr_v*0.5
-        if (ltp-entry)*side>=n: lk=entry+side*n; ns=max(cur,lk) if side==1 else min(cur,lk)
-    return ns,np_,nl
+def calc_sl(entry, side, sl_type, sl_param, df, idx, atr_v, fast=9, slow=21):
+    if sl_type == "Custom Points":
+        return entry - side * sl_param
+    if sl_type == "ATR":
+        return entry - side * atr_v * (sl_param if sl_param > 0 else 1.5)
+    if sl_type == "Strategy Reverse Signal":
+        return entry - side * sl_param
+    if sl_type in ("Trailing SL","Auto SL"):
+        return entry - side * atr_v * 1.5
+    if sl_type == "Trailing SL (3-Phase)":
+        return entry - side * atr_v * 1.5
+    if sl_type == "Adaptive SL":
+        mult = _adaptive_sl_mult(df, idx)
+        return entry - side * atr_v * mult
+    if sl_type == "ADV Volatility Based":
+        adv = _adv_vol(df, idx) or atr_v
+        mult = sl_param if sl_param > 0 else 2.0
+        return entry - side * adv * mult
+    if sl_type == "Volatility Based":
+        vol = (df["Close"].iloc[max(0,idx-20):idx+1].std()
+               if df is not None else atr_v)
+        return entry - side * vol * (sl_param if sl_param > 0 else 2.0)
+    if sl_type == "EMA Reverse Crossover":
+        if df is not None:
+            return float(ema(df["Close"], slow).iloc[min(idx, len(df)-1)])
+        return entry - side * atr_v * 1.5
+    if sl_type == "Trailing Swing Low/High":
+        if df is not None:
+            w = max(1, int(sl_param) if sl_param > 0 else 5)
+            s = max(0, idx - w)
+            return (float(df["Low"].iloc[s:idx+1].min()) if side == 1
+                    else float(df["High"].iloc[s:idx+1].max()))
+        return entry - side * atr_v * 1.5
+    if sl_type == "Candle Low/High":
+        if df is not None:
+            return (float(df["Low"].iloc[min(idx, len(df)-1)]) if side == 1
+                    else float(df["High"].iloc[min(idx, len(df)-1)]))
+        return entry - side * atr_v
+    if sl_type == "Support/Resistance Trailing":
+        if df is not None:
+            sup, res = sup_res(df.iloc[:idx+1])
+            return sup if side == 1 else res
+        return entry - side * atr_v * 1.5
+    if sl_type in ("Cost-to-Cost + N Points","Shift to Cost-to-Cost - N pts"):
+        return entry - side * atr_v * 1.5
+    if sl_type in ("Ratchet SL (50% target → trail)","Exit if SL past N pts stagnant"):
+        return entry - side * atr_v * 1.5
+    if sl_type == "Smart SL (auto)":
+        # Auto: use tighter of ATR*1.5 or recent swing low/high
+        base = entry - side * atr_v * 1.5
+        if df is not None and idx >= 5:
+            swing = (float(df["Low"].iloc[max(0,idx-5):idx+1].min()) if side == 1
+                     else float(df["High"].iloc[max(0,idx-5):idx+1].max()))
+            # pick the one closer to entry (tighter)
+            base = (max(base, swing) if side == 1 else min(base, swing))
+        return base
+    return entry - side * atr_v * 1.5
+
+def calc_target(entry, side, sl, target_type, tp, rr, atr_v=None, df=None, idx=0):
+    if target_type == "Custom Points":
+        return entry + side * tp
+    if target_type == "Risk:Reward":
+        return entry + side * abs(entry - sl) * rr
+    if target_type == "ATR Multiple":
+        mult = rr if rr > 0 else 2.0
+        return entry + side * (atr_v or abs(entry - sl)) * mult
+    if target_type == "Adaptive Target":
+        mult = _adaptive_sl_mult(df, idx) * rr if df is not None else rr
+        return entry + side * abs(entry - sl) * mult
+    if target_type in ("Partial Exit + Ride", "Exit if Target fell 50%"):
+        return entry + side * tp
+    if target_type == "Smart Target (auto)":
+        # Auto: 2x ATR from entry
+        return entry + side * (atr_v or abs(entry - sl)) * 2.0
+    return entry + side * tp
+
+def update_trail(cur, ltp, side, sl_type, sp, entry, atr_v, phase, locked,
+                 tgt=None, extra=None):
+    """
+    extra = dict with trade-level state (best_profit, sl_stagnant_count, etc.)
+    Returns: (new_sl, new_phase, new_locked, extra)
+    """
+    ns, np_, nl = cur, phase, locked
+    if extra is None: extra = {}
+
+    profit = (ltp - entry) * side
+
+    if sl_type == "Trailing SL":
+        trail = sp if sp > 0 else atr_v * 1.5
+        prop  = ltp - side * trail
+        ns    = max(cur, prop) if side == 1 else min(cur, prop)
+
+    elif sl_type == "Trailing SL (3-Phase)":
+        lp = sp if sp > 0 else atr_v
+        if np_ == 1:
+            prop = ltp - side * atr_v * 1.5
+            ns   = max(cur, prop) if side == 1 else min(cur, prop)
+            if profit >= lp:
+                np_ = 2; nl = entry + side * lp
+                ns  = max(ns, nl) if side == 1 else min(ns, nl)
+        elif np_ == 2:
+            if nl: ns = max(cur, nl) if side == 1 else min(cur, nl)
+            if profit >= lp * 2: np_ = 3
+        elif np_ == 3:
+            prop = ltp - side * atr_v * 0.5
+            ns   = max(cur, prop) if side == 1 else min(cur, prop)
+
+    elif sl_type == "Adaptive SL":
+        # Widen in volatile moves, tighten as profit grows
+        vol_mult = max(0.5, 1.5 - profit / (atr_v * 3) if atr_v > 0 else 1.5)
+        prop = ltp - side * atr_v * vol_mult
+        ns   = max(cur, prop) if side == 1 else min(cur, prop)
+
+    elif sl_type == "ADV Volatility Based":
+        prop = ltp - side * atr_v * 1.2
+        ns   = max(cur, prop) if side == 1 else min(cur, prop)
+
+    elif sl_type in ("Trailing Swing Low/High", "Support/Resistance Trailing"):
+        prop = ltp - side * atr_v * 1.2
+        ns   = max(cur, prop) if side == 1 else min(cur, prop)
+
+    elif sl_type == "Cost-to-Cost + N Points":
+        n = sp if sp > 0 else atr_v * 0.5
+        if profit >= n:
+            lk = entry + side * n
+            ns = max(cur, lk) if side == 1 else min(cur, lk)
+
+    elif sl_type == "Shift to Cost-to-Cost - N pts":
+        # When 50% of target reached, shift SL to entry - N pts
+        if tgt is not None:
+            half_tgt = abs(tgt - entry) * 0.5
+            n_pts    = sp if sp > 0 else 5.0
+            if profit >= half_tgt and not extra.get("shifted"):
+                ns = entry - side * n_pts
+                extra["shifted"] = True
+                # Still ratchet if already better
+                ns = max(cur, ns) if side == 1 else min(cur, ns)
+
+    elif sl_type == "Ratchet SL (50% target → trail)":
+        # After 50% target reached: trail by sp points every tick
+        if tgt is not None:
+            half_tgt = abs(tgt - entry) * 0.5
+            trail_pts = sp if sp > 0 else atr_v
+            if profit >= half_tgt:
+                prop = ltp - side * trail_pts
+                ns   = max(cur, prop) if side == 1 else min(cur, prop)
+
+    elif sl_type == "Exit if SL past N pts stagnant":
+        # Track best profit; if profit retreats by sp from peak, exit signal
+        best = extra.get("best_profit", profit)
+        if profit > best:
+            extra["best_profit"] = profit
+        # SL stays fixed — exit logic handled in main loop via extra flag
+        stagnant_threshold = sp if sp > 0 else atr_v * 2
+        if best > stagnant_threshold and (best - profit) >= stagnant_threshold * 0.5:
+            extra["force_exit"] = True
+
+    elif sl_type == "Smart SL (auto)":
+        # Tighten trail as profit increases
+        trail = max(atr_v * 0.5, atr_v * 1.5 - profit * 0.1)
+        prop  = ltp - side * trail
+        ns    = max(cur, prop) if side == 1 else min(cur, prop)
+
+    return ns, np_, nl, extra
 
 # ── Backtest engine ────────────────────────────────────────────────────────────
 def _append_trade(pos,ep,reason,ets,trades,daily_map,day,qty):
@@ -473,8 +635,12 @@ def run_backtest(df_raw,cfg):
             atr_v=position["atr"]; trail=position.get("trailing_sl",sl_p)
             ph=position.get("phase",1); lk=position.get("locked_sl",None)
             mid=(row["High"]+row["Low"])/2
-            trail,ph,lk=update_trail(trail,mid,side,sl_t,sl_par,ep,atr_v,ph,lk)
-            position.update({"trailing_sl":trail,"phase":ph,"locked_sl":lk})
+            trail,ph,lk,extra_=update_trail(trail,mid,side,sl_t,sl_par,ep,atr_v,ph,lk,
+                                              tgt=tgt,extra=position.get("extra",{}))
+            position.update({"trailing_sl":trail,"phase":ph,"locked_sl":lk,"extra":extra_})
+            if extra_.get("force_exit"):
+                _append_trade(position,float(row["Close"]),"Stagnant Exit",ts,trades,daily_map,day,qty)
+                equity+=trades[-1]["pnl"]; position=None; continue
             eff=trail if sl_t in TRAILING_SL_TYPES else sl_p
             if sl_t=="EMA Reverse Crossover":
                 rev=ema_live_check(df.iloc[:i+1],fast,slow)
@@ -703,10 +869,18 @@ def live_thread():
                     atr_val = round(float(df["ATR"].iloc[-1]),       4) if "ATR"      in df.columns else None
                     gap = round(fe_val - se_val, 4) if fe_val and se_val else None
                     trend = "Fast > Slow (Bullish)" if gap and gap > 0 else "Fast < Slow (Bearish)" if gap else "—"
+                    # Crossover angle
+                    ang_val = None
+                    try:
+                        ang_s   = angle_series(df["EMA_fast"], df["EMA_slow"])
+                        ang_val = round(float(ang_s.iloc[-1]), 2)
+                    except Exception:
+                        pass
                     strat_info.update({
                         "ema_fast_val": fe_val, "ema_slow_val": se_val,
                         "atr_val": atr_val, "ema_gap": gap, "trend": trend,
-                        "bars": len(df), "last_bar": str(df.index[-1])[:16],
+                        "angle": ang_val, "bars": len(df),
+                        "last_bar": str(df.index[-1])[:16],
                     })
                     # EW info
                     if strat == "Elliott Wave":
@@ -770,8 +944,20 @@ def live_thread():
                 locked = position.get("locked_sl", None)
 
                 # Update trailing SL using live LTP
-                trail, phase, locked = update_trail(trail, ltp, side, sl_t, sp_, entry, atr_, phase, locked)
-                position.update({"trailing_sl": trail, "phase": phase, "locked_sl": locked})
+                _extra = position.get("extra", {})
+                trail, phase, locked, _extra = update_trail(
+                    trail, ltp, side, sl_t, sp_, entry, atr_, phase, locked,
+                    tgt=tgt_p, extra=_extra)
+                position.update({"trailing_sl": trail, "phase": phase,
+                                  "locked_sl": locked, "extra": _extra})
+                if _extra.get("force_exit"):
+                    pnl = round((ltp - entry) * side * qty, 4)
+                    _rec_live(position, ltp, "Stagnant Exit", pnl)
+                    daily_pnl += pnl; position = None
+                    ts_update({"daily_pnl": round(daily_pnl,4), "live_pnl": round(daily_pnl,4),
+                               "live_position": None, "trailing_sl": None})
+                    ts_log(f"Stagnant exit @ {ltp:.4f}  PnL={pnl:+.4f}")
+                    time.sleep(1.5); continue
 
                 eff_sl = trail if sl_t in TRAILING_SL_TYPES else sl_p
                 unreal = round((ltp - entry) * side * qty, 4)
@@ -812,11 +998,44 @@ def live_thread():
                     time.sleep(1.5); continue
 
                 # Check Target
-                if (side == 1 and ltp >= tgt_p) or (side == -1 and ltp <= tgt_p):
-                    pnl = round((tgt_p - entry) * side * qty, 4)
-                    _rec_live(position, tgt_p, "Target", pnl)
-                    daily_pnl += pnl
-                    position = None
+                tgt_hit = (side == 1 and ltp >= tgt_p) or (side == -1 and ltp <= tgt_p)
+
+                # "Exit if Target fell 50%" — if we hit target then fell back 50%
+                target_type_pos = position.get("target_type","Custom Points")
+                if target_type_pos == "Exit if Target fell 50%":
+                    best_profit = position.get("extra",{}).get("best_profit",0)
+                    if profit > best_profit:
+                        if "extra" not in position: position["extra"] = {}
+                        position["extra"]["best_profit"] = profit
+                    half_tgt_profit = abs(tgt_p - entry) * 0.5
+                    if best_profit >= half_tgt_profit and profit <= best_profit * 0.5:
+                        tgt_hit = True
+
+                if tgt_hit:
+                    # Partial Exit: exit partial_pct % now, ride rest
+                    p_pct = position.get("partial_pct", 100)
+                    if target_type_pos == "Partial Exit + Ride" and not position.get("partial_done"):
+                        exit_qty  = max(1, int(round(qty * p_pct / 100)))
+                        ride_qty  = max(0, qty - exit_qty)
+                        pnl = round((tgt_p - entry) * side * exit_qty, 4)
+                        _rec_live({**position,"qty":exit_qty}, tgt_p, f"Partial Exit {p_pct}%", pnl)
+                        daily_pnl += pnl
+                        if ride_qty > 0:
+                            position["qty"]          = ride_qty
+                            position["partial_done"] = True
+                            # New target = entry + 2x original distance
+                            position["target"]       = entry + side * abs(tgt_p - entry) * 2
+                            position["extra"]        = position.get("extra", {})
+                            ts_log(f"Partial exit {exit_qty} @ {tgt_p:.4f}  Riding {ride_qty}")
+                            ts_update({"daily_pnl": round(daily_pnl,4), "live_pnl": round(daily_pnl,4)})
+                            time.sleep(1.5); continue
+                        else:
+                            position = None
+                    else:
+                        pnl = round((tgt_p - entry) * side * qty, 4)
+                        _rec_live(position, tgt_p, "Target", pnl)
+                        daily_pnl += pnl
+                        position = None
                     ts_update({"daily_pnl": round(daily_pnl,4), "live_pnl": round(daily_pnl,4),
                                "live_position": None, "trailing_sl": None})
                     ts_log(f"Target hit @ {tgt_p:.4f}  PnL={pnl:+.4f}")
@@ -855,13 +1074,22 @@ def live_thread():
                     tgt_p = calc_target(ltp, side, sl_p, sl_type, tp_pts, rr)
                     ew_inf = (detect_ew(df, cfg.get("ew_order", 5))
                               if strat == "Elliott Wave" and df is not None else {})
+                    target_type = cfg.get("target_type", "Custom Points")
+                    partial_pct  = int(cfg.get("partial_pct", 70))
+                    smart_on     = cfg.get("smart_sl_target", False)
+                    if smart_on:
+                        # Override: auto SL and target from ATR
+                        sl_p  = entry - side * atr_v * 1.5
+                        tgt_p = entry + side * atr_v * 2.5
                     position = {
                         "side": side, "entry": ltp, "sl": sl_p, "target": tgt_p,
                         "sl_type": sl_type, "sl_param": sp,
+                        "target_type": target_type, "partial_pct": partial_pct,
                         "entry_time": datetime.now(IST),
                         "atr": atr_v, "qty": qty,
                         "trailing_sl": sl_p, "phase": 1, "locked_sl": None,
                         "pattern": ew_inf.get("pattern", ""),
+                        "extra": {},
                     }
                     ts_update({"live_ew_info": ew_inf})
                     ts_log(f"{'BUY' if side==1 else 'SELL'} @ {ltp:.4f}  "
@@ -871,6 +1099,22 @@ def live_thread():
                         ts_set("live_signal", 0)
             else:
                 ts_set("live_entry_blocked", None)
+
+            # ── Auto EOD exit ─────────────────────────────────────────────
+            if position and cfg.get("filter_time", False):
+                try:
+                    now2 = datetime.now(IST)
+                    h1e, m1e = map(int, t_end.split(":"))
+                    if now2.hour * 60 + now2.minute >= h1e * 60 + m1e:
+                        pnl = round((ltp - position["entry"]) * position["side"] * qty, 4)
+                        _rec_live(position, ltp, "EOD Auto Exit", pnl)
+                        daily_pnl += pnl
+                        position = None
+                        ts_update({"daily_pnl": round(daily_pnl,4), "live_pnl": round(daily_pnl,4),
+                                   "live_position": None, "trailing_sl": None})
+                        ts_log(f"Auto EOD exit @ {ltp:.4f}  PnL={pnl:+.4f}")
+                except Exception:
+                    pass
 
         except Exception as exc:
             ts_log(f"ERROR: {exc}")
@@ -1039,12 +1283,24 @@ def sidebar_config():
             ew_o=st.number_input("EW Order",min_value=2,value=5,step=1)
             min_wp=st.number_input("Min Wave %",min_value=0.0,value=0.5,step=0.1)
         st.markdown("---")
-        st.markdown("**Stop-Loss / Target**")
-        sl_type=st.selectbox("SL Type",SL_TYPES)
-        sl_param=st.number_input("SL Param",min_value=0.0,value=20.0,step=0.5)
-        rr=st.number_input("R:R Ratio",min_value=0.5,value=2.0,step=0.5)
-        tp=st.number_input("Target Points",min_value=0.0,value=40.0,step=0.5)
-        atr_p=st.number_input("ATR Period",min_value=2,value=14,step=1)
+        st.markdown("**Stop-Loss**")
+        sl_type  = st.selectbox("SL Type",  SL_TYPES,  key="sl_type_sel")
+        sl_param = st.number_input("SL Points / Param", min_value=0.0, value=20.0, step=0.5)
+
+        st.markdown("**Target**")
+        target_type = st.selectbox("Target Type", TARGET_TYPES, key="tgt_type_sel")
+        tp          = st.number_input("Target Points", min_value=0.0, value=40.0, step=0.5)
+        rr          = st.number_input("R:R Ratio",     min_value=0.1, value=2.0,  step=0.5)
+        if target_type == "Partial Exit + Ride":
+            partial_pct = st.number_input("Exit % at 1st target", min_value=10, max_value=90, value=70, step=5)
+        else:
+            partial_pct = 70
+
+        atr_p = st.number_input("ATR Period", min_value=2, value=14, step=1)
+
+        smart_sl_target = st.checkbox("🧠 Smart SL + Target (auto, overrides above)", value=False)
+        if smart_sl_target:
+            st.caption("SL = ATR×1.5 below/above entry. Target = ATR×2.5 above/below entry. Fully automatic.")
         st.markdown("---")
         st.markdown("**Filters** *(all disabled by default)*")
 
@@ -1107,7 +1363,8 @@ def sidebar_config():
     return {"symbol":sym,"interval":interval,"period":period,"strategy":strategy,"qty":int(qty),
             "fast":int(fast),"slow":int(slow),"anticipate_bars":int(ant),"ew_order":int(ew_o),
             "min_wave_pct":float(min_wp),"sl_type":sl_type,"sl_param":float(sl_param),
-            "rr_ratio":float(rr),"target_param":float(tp),"atr_period":int(atr_p),
+            "rr_ratio":float(rr),"target_param":float(tp),"target_type":target_type,
+            "partial_pct":int(partial_pct),"smart_sl_target":smart_sl_target,"atr_period":int(atr_p),
             "filter_dow":dow_ints,"filter_adx":filter_adx,"adx_min":int(adx_min),
             "filter_rsi":filter_rsi,"rsi_lo":int(rsi_lo),"rsi_hi":int(rsi_hi),
             "filter_angle":filter_ang,"angle_min":float(amin),"angle_max":float(amax),
@@ -1280,25 +1537,85 @@ def tab_live(cfg):
         p6.metric("Unreal.", f"{unreal:+.4f}")
 
     # ── Strategy status panel ─────────────────────────────────────────────────
-    si = ts_get("live_strat_info") or {}
+    si      = ts_get("live_strat_info") or {}
     blocked = ts_get("live_entry_blocked")
     if si or running:
         with st.expander("📡 Strategy Status", expanded=True):
-            sc1,sc2,sc3,sc4 = st.columns(4)
-            sc1.metric("Strategy",  si.get("strategy", cfg["strategy"]))
-            sc2.metric("Fast EMA",  f"{si.get('ema_fast_val','—')}" if si.get('ema_fast_val') else f"Period: {cfg['fast']}")
-            sc3.metric("Slow EMA",  f"{si.get('ema_slow_val','—')}" if si.get('ema_slow_val') else f"Period: {cfg['slow']}")
-            sc4.metric("ATR",       f"{si.get('atr_val','—')}"      if si.get('atr_val')      else "—")
-            sc5,sc6,sc7,sc8 = st.columns(4)
-            sc5.metric("EMA Gap",   f"{si.get('ema_gap','—')}"  if si.get('ema_gap') is not None else "—")
-            sc6.metric("Trend",     si.get("trend","—"))
-            sc7.metric("Bars",      si.get("bars","—"))
-            sc8.metric("Last Bar",  si.get("last_bar","—"))
+            sc1,sc2,sc3,sc4,sc5 = st.columns(5)
+            sc1.metric("Strategy",   si.get("strategy", cfg["strategy"]))
+            fv = si.get("ema_fast_val")
+            sv = si.get("ema_slow_val")
+            sc2.metric(f"Fast EMA({cfg['fast']})", f"{fv:.4f}" if fv else "—")
+            sc3.metric(f"Slow EMA({cfg['slow']})", f"{sv:.4f}" if sv else "—")
+            av = si.get("atr_val")
+            sc4.metric("ATR",        f"{av:.4f}" if av else "—")
+            ang = si.get("angle")
+            sc5.metric("Crossover°", f"{ang:.1f}°" if ang is not None else "—")
+
+            sc6,sc7,sc8,sc9 = st.columns(4)
+            gv = si.get("ema_gap")
+            sc6.metric("EMA Gap",  f"{gv:.4f}" if gv is not None else "—")
+            sc7.metric("Trend",    si.get("trend","—"))
+            sc8.metric("Bars",     str(si.get("bars","—")))
+            sc9.metric("Last Bar", si.get("last_bar","—"))
+
             if cfg["strategy"] == "Elliott Wave":
+                st.markdown("**🌊 Elliott Wave Analysis**")
                 ew1,ew2,ew3 = st.columns(3)
-                ew1.metric("EW Pattern",    si.get("ew_pattern","Computing…"))
-                ew2.metric("EW Confidence", f"{si.get('ew_confidence',0)}%")
-                ew3.metric("EW Signal",     "🟢 BUY" if si.get("ew_signal")==1 else "🔴 SELL" if si.get("ew_signal")==-1 else "—")
+                pat  = si.get("ew_pattern","Computing…")
+                ewsig = si.get("ew_signal",0)
+                conf  = si.get("ew_confidence",0)
+                ew1.metric("Pattern",    pat)
+                ew2.metric("Confidence", f"{conf}%")
+                ew3.metric("EW Signal",  "🟢 BUY" if ewsig==1 else "🔴 SELL" if ewsig==-1 else "—")
+
+                # EW wave range table
+                ew_live = ts_get("live_ew_info") or {}
+                waves = ew_live.get("waves",[])
+                fib   = ew_live.get("fib",{})
+                if waves:
+                    _df_live = ts_get("live_df")
+                    wave_rows = ""
+                    for wi, w in enumerate(waves):
+                        bar_i = w[0] if len(w)>0 else "—"
+                        price = f"{w[1]:.4f}" if len(w)>1 else "—"
+                        wtype = w[2] if len(w)>2 else ("H" if wi%2==0 else "L")
+                        bar_t = "—"
+                        if _df_live is not None and isinstance(bar_i,int) and bar_i < len(_df_live):
+                            bar_t = str(_df_live.index[bar_i])[:16]
+                        wave_rows += (f"<tr><td>W{wi+1}</td><td>{wtype}</td>"
+                                      f"<td>{bar_t}</td><td>{price}</td></tr>")
+                    st.markdown(
+                        f"<table style='font-size:.75rem;width:100%'>"
+                        f"<tr><th>Wave</th><th>Type</th><th>Time</th><th>Price</th></tr>"
+                        f"{wave_rows}</table>",
+                        unsafe_allow_html=True)
+                if fib:
+                    ltp_now = ts_get("live_ltp") or 0
+                    fib_rows = ""
+                    for r,lvl in sorted(fib.items()):
+                        c = "#3fb950" if lvl < ltp_now else "#f85149"
+                        d = "↓ Below" if lvl < ltp_now else "↑ Above"
+                        fib_rows += (f"<tr><td>{r}</td><td style='color:{c}'>"
+                                     f"{lvl:.4f}</td><td style='color:{c}'>{d}</td></tr>")
+                    st.markdown(
+                        f"<table style='font-size:.75rem'>"
+                        f"<tr><th>Fib</th><th>Level</th><th>vs LTP</th></tr>"
+                        f"{fib_rows}</table>",
+                        unsafe_allow_html=True)
+
+                # Buy/Sell suitability
+                suit_color = "#3fb950" if ewsig==1 else "#f85149" if ewsig==-1 else "#8b949e"
+                suit_text  = ("✅ BUY suitable now" if ewsig==1
+                              else "✅ SELL suitable now" if ewsig==-1
+                              else "⏳ No clear directional signal")
+                st.markdown(
+                    f"<div style='background:#161b22;border-left:4px solid {suit_color};"
+                    f"padding:8px 14px;border-radius:4px;font-size:.88rem;margin-top:6px'>"
+                    f"<b style='color:{suit_color}'>{suit_text}</b> "
+                    f"(Pattern: {pat}  |  Confidence: {conf}%)</div>",
+                    unsafe_allow_html=True)
+
             if blocked:
                 st.warning(f"⚠ Entry blocked: {blocked}")
 
@@ -1337,17 +1654,20 @@ def tab_live(cfg):
             st.dataframe(df_t[avail].style.map(_ps, subset=["pnl"]),
                          use_container_width=True, height=280)
 
-    # ── Compact log strip (last 8 lines, always visible when running) ────────────
+    # ── Compact scrollable log (last 12 lines) ───────────────────────────────────
     logs = list(ts_get("log") or [])
     if logs:
-        log_html = " &nbsp;|&nbsp; ".join(
-            f"<span style='color:#8b949e'>{l}</span>" for l in logs[:8]
-        )
+        def _lc(l):
+            if any(x in l for x in ["BUY","SELL","Target","started","Config","loaded"]): return "#3fb950"
+            if any(x in l for x in ["ERROR","SL hit","Stagnant","EOD"]): return "#f85149"
+            return "#8b949e"
+        rows = "".join(
+            f"<div style='color:{_lc(l)};padding:1px 0;white-space:nowrap'>{l}</div>"
+            for l in logs[:12])
         st.markdown(
-            f"<div style='background:#161b22;border:1px solid #30363d;border-radius:6px;"
-            f"padding:6px 12px;font-size:.75rem;font-family:monospace;"
-            f"overflow:hidden;white-space:nowrap;text-overflow:ellipsis'>"
-            f"{log_html}</div>",
+            f"<div style='background:#0d1117;border:1px solid #30363d;border-radius:6px;"
+            f"padding:6px 10px;font-size:.72rem;font-family:monospace;"
+            f"max-height:120px;overflow-y:auto'>{rows}</div>",
             unsafe_allow_html=True)
 
     # ── Auto-refresh: 1.5 s when running ─────────────────────────────────────
