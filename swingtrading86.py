@@ -1040,12 +1040,13 @@ def live_thread():
                     pass
             ts_set("live_strat_info", strat_info)
 
-            # ── Refresh candles every 60 s (or every tick for EMA strategies) ──
+            # ── Refresh candles every 60 s (EMA: 5 s, EW/WE: 15 s) ───────────
             ema_strat = strat in ("EMA Crossover","Anticipatory EMA")
-            # EMA crossover: check every tick on latest candles so we never miss
+            ew_strat  = strat in ("Elliott Wave","Wave Extrema")
             do_candle_refresh = (
                 time.time() - last_candle_refresh >= 60
                 or (ema_strat and time.time() - last_candle_refresh >= 5)
+                or (ew_strat  and time.time() - last_candle_refresh >= 15)
             )
             if do_candle_refresh:
                 new_df = fetch_ohlcv(sym, iv, per)
@@ -1056,11 +1057,15 @@ def live_thread():
                     df = new_df
                     ts_set("live_df", df)
                     last_candle_refresh = time.time()
+                    # Always re-check signal when flat (no position)
                     if not simple and not position:
-                        pending_signal = get_live_signal(df, strat, cfg)
-                        ts_set("live_signal", pending_signal)
-                        if pending_signal != 0:
-                            ts_log(f"Signal detected: {'BUY' if pending_signal==1 else 'SELL'} [{strat}]")
+                        new_sig = get_live_signal(df, strat, cfg)
+                        if new_sig != 0:
+                            pending_signal = new_sig
+                            ts_set("live_signal", pending_signal)
+                            ts_log(f"Signal: {'BUY' if pending_signal==1 else 'SELL'} [{strat}]")
+                        elif pending_signal == 0:
+                            ts_set("live_signal", 0)
 
             # ── Squareoff ─────────────────────────────────────────────────────
             if ts_get("squareoff_requested") and position:
@@ -1241,18 +1246,20 @@ def live_thread():
                         tgt_p = ltp + side * atr_v * 2.5
 
                     # ── Confluence quality check ──────────────────────────────
-                    # Only enter if EMA trend aligns with signal direction
-                    # and ATR is not too small (avoid flat markets)
+                    # EMA alignment only makes sense for EMA-based strategies.
+                    # Elliott Wave / Wave Extrema are pattern-based — never block them.
                     skip_entry = False
-                    if df is not None and not df.empty and not simple:
+                    ema_based  = strat in ("EMA Crossover", "Anticipatory EMA")
+
+                    if df is not None and not df.empty and not simple and ema_based:
                         try:
                             fe_ = float(df["EMA_fast"].iloc[-1])
                             se_ = float(df["EMA_slow"].iloc[-1])
                             ema_align = (side == 1 and fe_ > se_) or (side == -1 and fe_ < se_)
-                            atr_ok    = atr_v > ltp * 0.0005   # at least 0.05% of price
+                            atr_ok    = atr_v > ltp * 0.0003   # at least 0.03% of price
                             if not ema_align:
                                 skip_entry = True
-                                ts_log(f"Signal skipped: EMA trend opposes {"BUY" if side==1 else "SELL"}")
+                                ts_log(f"Signal skipped: EMA trend opposes {'BUY' if side==1 else 'SELL'}")
                             elif not atr_ok:
                                 skip_entry = True
                                 ts_log("Signal skipped: market too flat (ATR too small)")
@@ -1270,12 +1277,16 @@ def live_thread():
                             "pattern": ew_inf.get("pattern", ""),
                             "extra": {},
                         }
-                    ts_update({"live_ew_info": ew_inf})
-                    ts_log(f"{'BUY' if side==1 else 'SELL'} @ {ltp:.4f}  "
-                           f"SL={sl_p:.4f}  TGT={tgt_p:.4f}")
-                    if not simple:
-                        pending_signal = 0
-                        ts_set("live_signal", 0)
+                        ts_update({"live_ew_info": ew_inf})
+                        ts_log(f"{'BUY' if side==1 else 'SELL'} @ {ltp:.4f}  "
+                               f"SL={sl_p:.4f}  TGT={tgt_p:.4f}  [{strat}]")
+                        # Clear pending signal only after successful entry
+                        if not simple:
+                            pending_signal = 0
+                            ts_set("live_signal", 0)
+                    else:
+                        # Signal was skipped but keep pending so we retry next tick
+                        ts_set("live_entry_blocked", f"Confluence filter: {strat}")
             else:
                 ts_set("live_entry_blocked", None)
 
