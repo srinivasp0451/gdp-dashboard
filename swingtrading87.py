@@ -40,7 +40,7 @@ _STORE = {
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# UNIVERSE
+# UNIVERSE — all instruments supported via yfinance
 # ─────────────────────────────────────────────────────────────────────────────
 NIFTY_50 = [
     "RELIANCE","TCS","HDFCBANK","INFY","ICICIBANK",
@@ -54,6 +54,43 @@ NIFTY_50 = [
     "ADANIENT","ADANIPORTS","ONGC","M&M","APOLLOHOSP",
     "BAJAJ-AUTO","SBILIFE","HDFCLIFE","UPL","LTIM",
 ]
+
+# Full instrument universe — label → yfinance ticker
+INSTRUMENTS = {
+    # ── Indian Indices ─────────────────────────────────────────────────
+    "🇮🇳 Nifty 50":        "^NSEI",
+    "🇮🇳 Bank Nifty":      "^NSEBANK",
+    "🇮🇳 Nifty IT":        "^CNXIT",
+    "🇮🇳 Nifty Midcap 50": "^NSEMDCP50",
+    "🇮🇳 Sensex":          "^BSESN",
+    # ── Crypto ────────────────────────────────────────────────────────
+    "₿ Bitcoin (BTC-USD)":   "BTC-USD",
+    "Ξ Ethereum (ETH-USD)":  "ETH-USD",
+    "◎ Solana (SOL-USD)":    "SOL-USD",
+    # ── Commodities ───────────────────────────────────────────────────
+    "🥇 Gold (MCX proxy)":   "GC=F",
+    "🥈 Silver (MCX proxy)": "SI=F",
+    "🛢 Crude Oil (WTI)":    "CL=F",
+    "🛢 Crude Oil (Brent)":  "BZ=F",
+    "⚡ Natural Gas":         "NG=F",
+    # ── Forex ─────────────────────────────────────────────────────────
+    "💱 USD/INR":            "USDINR=X",
+    "💱 EUR/USD":            "EURUSD=X",
+    "💱 GBP/USD":            "GBPUSD=X",
+    "💱 USD/JPY":            "JPY=X",
+    # ── US Indices ────────────────────────────────────────────────────
+    "🇺🇸 S&P 500":          "^GSPC",
+    "🇺🇸 NASDAQ":           "^IXIC",
+    "🇺🇸 Dow Jones":        "^DJI",
+    # ── ETFs ──────────────────────────────────────────────────────────
+    "📦 Nifty BeES":         "NIFTYBEES.NS",
+    "📦 Gold BeES":          "GOLDBEES.NS",
+}
+# Reverse lookup: ticker → label
+TICKER_LABEL = {v: k for k, v in INSTRUMENTS.items()}
+
+# NSE Stocks get ".NS" appended automatically
+NSE_STOCKS = NIFTY_50  # displayed separately in dropdowns
 
 # ─────────────────────────────────────────────────────────────────────────────
 # REALISTIC NSE TRANSACTION COSTS
@@ -80,6 +117,8 @@ def fetch_daily(symbol_ns: str, period: str = "3y") -> pd.DataFrame:
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = df.columns.droplevel(1)
     df.dropna(inplace=True)
+    df.index.name = "Date"
+    df = df.reset_index()          # Date becomes a column — preserved through WFO
     return df
 
 @st.cache_data(ttl=300, show_spinner=False)
@@ -212,7 +251,7 @@ def strategy_ema_swing(df: pd.DataFrame, params: dict = None) -> pd.DataFrame:
     SL = entry - 2×ATR. Target = entry + 3×risk. Max hold = 10 bars.
     """
     p = {**DEFAULT_EMA_SWING, **(params or {})}
-    df = df.copy().reset_index(drop=True)
+    df = df.copy().reset_index(drop=True)  # Date col preserved as column
     df["ef"] = ema(df["Close"], p["fast"])
     df["es"] = ema(df["Close"], p["slow"])
     df["a"]  = atr(df, 14)
@@ -239,13 +278,13 @@ def strategy_ema_swing(df: pd.DataFrame, params: dict = None) -> pd.DataFrame:
         else:
             bars = i - ei
             if r["Low"] <= sl:
-                trades.append(_trade(ei, i, ep, sl, "SL", "swing"))
+                trades.append(_trade(ei, i, ep, sl, "SL", "swing", df, sl, tgt, "EMA Swing"))
                 in_trade = False
             elif r["High"] >= tgt:
-                trades.append(_trade(ei, i, ep, tgt, "Target", "swing"))
+                trades.append(_trade(ei, i, ep, tgt, "Target", "swing", df, sl, tgt, "EMA Swing"))
                 in_trade = False
             elif bars >= p["max_hold"]:
-                trades.append(_trade(ei, i, ep, r["Close"], "MaxHold", "swing"))
+                trades.append(_trade(ei, i, ep, r["Close"], "MaxHold", "swing", df, sl, tgt, "EMA Swing"))
                 in_trade = False
 
     return pd.DataFrame(trades)
@@ -264,7 +303,7 @@ def strategy_momentum_breakout(df: pd.DataFrame, params: dict = None) -> pd.Data
     SL = entry - 1.5×ATR. Target = entry + 2.5×risk. Max hold = 5 bars.
     """
     p = {**DEFAULT_BREAKOUT, **(params or {})}
-    df = df.copy().reset_index(drop=True)
+    df = df.copy().reset_index(drop=True)  # Date col preserved as column
     df["a"]    = atr(df, 14)
     adx_, _, _ = adx(df, 14)
     df["adx_"] = adx_
@@ -288,13 +327,13 @@ def strategy_momentum_breakout(df: pd.DataFrame, params: dict = None) -> pd.Data
         else:
             bars = i - ei
             if r["Low"] <= sl:
-                trades.append(_trade(ei, i, ep, sl, "SL", "intraday"))
+                trades.append(_trade(ei, i, ep, sl, "SL", "intraday", df, sl, tgt, "Momentum Breakout"))
                 in_trade = False
             elif r["High"] >= tgt:
-                trades.append(_trade(ei, i, ep, tgt, "Target", "intraday"))
+                trades.append(_trade(ei, i, ep, tgt, "Target", "intraday", df, sl, tgt, "Momentum Breakout"))
                 in_trade = False
             elif bars >= p["max_hold"]:
-                trades.append(_trade(ei, i, ep, r["Close"], "MaxHold", "intraday"))
+                trades.append(_trade(ei, i, ep, r["Close"], "MaxHold", "intraday", df, sl, tgt, "Momentum Breakout"))
                 in_trade = False
 
     return pd.DataFrame(trades)
@@ -312,7 +351,7 @@ def strategy_mean_reversion(df: pd.DataFrame, params: dict = None) -> pd.DataFra
     SL = entry - 1×ATR. Target = BB-mid. Max hold = 5 bars.
     """
     p = {**DEFAULT_REVERSION, **(params or {})}
-    df = df.copy().reset_index(drop=True)
+    df = df.copy().reset_index(drop=True)  # Date col preserved as column
     df["a"]      = atr(df, 14)
     adx_, _, _   = adx(df, 14)
     df["adx_"]   = adx_
@@ -339,23 +378,38 @@ def strategy_mean_reversion(df: pd.DataFrame, params: dict = None) -> pd.DataFra
         else:
             bars = i - ei
             if r["Low"] <= sl:
-                trades.append(_trade(ei, i, ep, sl, "SL", "swing"))
+                trades.append(_trade(ei, i, ep, sl, "SL", "swing", df, sl, tgt, "Mean Reversion"))
                 in_trade = False
             elif r["High"] >= tgt:
-                trades.append(_trade(ei, i, ep, tgt, "Target", "swing"))
+                trades.append(_trade(ei, i, ep, tgt, "Target", "swing", df, sl, tgt, "Mean Reversion"))
                 in_trade = False
             elif bars >= p["max_hold"]:
-                trades.append(_trade(ei, i, ep, r["Close"], "MaxHold", "swing"))
+                trades.append(_trade(ei, i, ep, r["Close"], "MaxHold", "swing", df, sl, tgt, "Mean Reversion"))
                 in_trade = False
 
     return pd.DataFrame(trades)
 
 
-def _trade(ei, xi, ep, xp, reason, ttype):
+def _trade(ei, xi, ep, xp, reason, ttype, df=None, sl=None, tgt=None, strategy=""):
     pct = (xp - ep) / ep
-    return {"entry_bar": ei, "exit_bar": xi,
-            "entry": round(ep, 2), "exit": round(xp, 2),
-            "pnl_gross": pct, "trade_type": ttype, "exit_reason": reason}
+    entry_date = str(df.iloc[ei]["Date"])[:10] if df is not None and "Date" in df.columns else ""
+    exit_date  = str(df.iloc[xi]["Date"])[:10] if df is not None and "Date" in df.columns else ""
+    hold_days  = xi - ei
+    return {
+        "entry_bar":   ei,
+        "exit_bar":    xi,
+        "entry_date":  entry_date,
+        "exit_date":   exit_date,
+        "hold_days":   hold_days,
+        "entry":       round(ep, 4),
+        "exit":        round(xp, 4),
+        "sl":          round(sl, 4) if sl is not None else "",
+        "target":      round(tgt, 4) if tgt is not None else "",
+        "pnl_gross":   pct,
+        "trade_type":  ttype,
+        "exit_reason": reason,
+        "strategy":    strategy,
+    }
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -386,7 +440,7 @@ def walk_forward_backtest(df: pd.DataFrame, strategy_func,
       - Rolls forward by test_bars each iteration
     Returns (all_oos_trades_df, windows_summary_df)
     """
-    df = df.reset_index(drop=True)
+    df = df.reset_index(drop=True)  # integer index only; Date column stays intact
     oos_blocks, windows = [], []
     start, w = 0, 0
 
@@ -1000,16 +1054,49 @@ def page_backtest(settings: dict):
     st.title("📈 Walk-Forward Backtest")
     st.caption("Pure OOS results only — no in-sample data is ever reported")
 
+    # ── Timeframe & Period info banner ────────────────────────────────────────
+    with st.expander("ℹ️ Timeframe, Period & Strategy Reference — click to expand", expanded=False):
+        st.markdown("""
+| Strategy | Timeframe | Data Period | Typical Trades/Year | Hold Period | Regime Required |
+|---|---|---|---|---|---|
+| **EMA Swing** | **Daily (1D)** | 5 years | 6–15 per stock | 3–10 days | ADX>22 + Trend |
+| **Momentum Breakout** | **Daily (1D)** | 5 years | 8–20 per stock | 1–5 days | ADX>20 |
+| **Mean Reversion** | **Daily (1D)** | 5 years | 10–25 per stock | 2–5 days | ADX<22 (ranging) |
+
+**Why daily timeframe?**  Intraday (1m/5m) requires exchange tick data. Daily gives clean signals, lower costs (delivery STT), and avoids noise.
+
+**Why 5 years?** Need enough regime cycles (bull + bear + ranging) to test strategy robustness.  
+Minimum recommended: 3 years (750 bars). Less = not enough OOS windows.
+
+**EMA Swing gives 0 trades?** — Normal. This strategy only fires when ADX>22 AND price above EMA50 AND +DI>-DI simultaneously. A stock can spend months ranging (ADX<20) with zero signals — **that's the regime filter protecting you**, not a bug.
+
+**Other strategies give 0 trades?** — Also normal for the same reason. Mean Reversion only fires when ADX<22. In a strong trend both EMA Swing and Mean Reversion can go silent at the same time. **This is expected behaviour.**
+        """)
+
+    # ── Instrument selector ───────────────────────────────────────────────────
+    inst_type = st.radio("Instrument Type", [
+        "📈 NSE Stock (Nifty 50)", "🔢 Index / Crypto / Commodity / Forex", "✏️ Custom Ticker"
+    ], horizontal=True)
+
     c1,c2,c3 = st.columns(3)
     with c1:
-        use_custom = st.toggle("Custom Ticker", value=False)
-        if use_custom:
-            custom_sym = st.text_input("Enter NSE symbol (e.g. KAYNES, ZOMATO, IRFC)",
-                                       placeholder="KAYNES").strip().upper()
-            sym = custom_sym if custom_sym else "RELIANCE"
-            st.caption(f"Will fetch: `{sym}.NS` from yfinance")
+        if inst_type == "📈 NSE Stock (Nifty 50)":
+            raw_sym = st.selectbox("Stock (NSE)", NIFTY_50, index=0)
+            ticker  = raw_sym + ".NS"
+            sym     = raw_sym
+        elif inst_type == "🔢 Index / Crypto / Commodity / Forex":
+            label   = st.selectbox("Instrument", list(INSTRUMENTS.keys()))
+            ticker  = INSTRUMENTS[label]
+            sym     = label
         else:
-            sym = st.selectbox("Stock", NIFTY_50, index=0)
+            raw_sym = st.text_input("Custom yfinance Ticker",
+                                    placeholder="e.g. KAYNES.NS  |  BTC-USD  |  GC=F  |  ^NSEI",
+                                    value="KAYNES.NS").strip()
+            ticker  = raw_sym
+            sym     = raw_sym
+
+        st.caption(f"yfinance ticker: `{ticker}`")
+
     with c2:
         strat_name = st.selectbox("Strategy", [
             "EMA Swing", "Momentum Breakout", "Mean Reversion"
@@ -1020,10 +1107,10 @@ def page_backtest(settings: dict):
     c4,c5 = st.columns(2)
     with c4:
         train_bars = st.slider("In-sample window (trading days)", 126, 504, 252, 63,
-                               help="252 = ~1 year. Model is fit on this window but results NOT shown.")
+                               help="252 ≈ 1 year. Strategy fit here — NOT reported.")
     with c5:
         test_bars = st.slider("Out-of-sample window (trading days)", 21, 126, 63, 21,
-                              help="63 = ~3 months. Only these results are reported.")
+                              help="63 ≈ 3 months. Only OOS results shown.")
 
     strat_map = {
         "EMA Swing":          strategy_ema_swing,
@@ -1032,14 +1119,15 @@ def page_backtest(settings: dict):
     }
 
     if st.button("▶ Run Walk-Forward Backtest", type="primary", use_container_width=True):
-        with st.spinner(f"Fetching data & running WFO for {sym}…"):
-            df = fetch_daily(sym + ".NS", period="5y")
+        with st.spinner(f"Fetching data for {sym} ({ticker})…"):
+            df = fetch_daily(ticker, period="5y")
 
         if df.empty:
-            st.error("Failed to fetch data. Check ticker symbol.")
+            st.error(f"No data for `{ticker}`. Check the ticker and try again.")
             return
         if len(df) < train_bars + test_bars + 60:
-            st.warning(f"Not enough data ({len(df)} bars). Need ≥ {train_bars+test_bars+60}.")
+            st.warning(f"Only {len(df)} bars available. Need ≥ {train_bars+test_bars+60}. "
+                       f"Try reducing in-sample window or use a longer-listed instrument.")
             return
 
         with st.spinner("Running walk-forward…"):
@@ -1049,7 +1137,11 @@ def page_backtest(settings: dict):
             )
 
         if trades.empty:
-            st.warning("No trades generated in OOS periods. Try a different stock or strategy.")
+            st.warning(
+                f"⚠️ No trades in OOS periods for **{sym}** with **{strat_name}**.  \n"
+                f"This is **normal** — regime filter blocked all entries. "
+                f"Try: Mean Reversion on a ranging stock, or a different instrument."
+            )
             return
 
         m = compute_metrics(trades, bt_cap)
@@ -1148,18 +1240,57 @@ def page_backtest(settings: dict):
         if not windows.empty:
             st.dataframe(windows, use_container_width=True, hide_index=True)
 
-        # ── Raw trades ───────────────────────────────────────────────────
-        with st.expander("📋 All OOS Trades"):
-            disp = trades[["entry_bar","exit_bar","entry","exit",
-                            "pnl_gross","pnl_net","exit_reason","window"]].copy()
-            disp["pnl_gross"] = (disp["pnl_gross"]*100).round(3)
-            disp["pnl_net"]   = (disp["pnl_net"]*100).round(3)
-            disp.columns = ["Entry Bar","Exit Bar","Entry ₹","Exit ₹",
-                             "Gross %","Net %","Exit Reason","Window"]
-            st.dataframe(disp, use_container_width=True, hide_index=True)
+        # ── Full Trade History ────────────────────────────────────────────
+        st.markdown("### 📋 Full Trade History")
+        hist_cols = ["entry_date","exit_date","hold_days","strategy",
+                     "entry","sl","target","exit",
+                     "pnl_gross","pnl_net","exit_reason","trade_type","window"]
+        # Only include columns that exist
+        hist_cols = [c for c in hist_cols if c in trades.columns]
+        hist = trades[hist_cols].copy()
+        hist["pnl_gross"] = (hist["pnl_gross"] * 100).round(3)
+        hist["pnl_net"]   = (hist["pnl_net"]   * 100).round(3)
+        # Add ₹ P&L column
+        hist["pnl_rs"]    = (hist["pnl_net"] / 100 * bt_cap).round(0).astype(int)
+        hist["win"]       = hist["pnl_net"] > 0
+
+        rename = {
+            "entry_date":  "Entry Date",
+            "exit_date":   "Exit Date",
+            "hold_days":   "Hold Days",
+            "strategy":    "Strategy",
+            "entry":       "Entry ₹",
+            "sl":          "Stop Loss ₹",
+            "target":      "Target ₹",
+            "exit":        "Exit ₹",
+            "pnl_gross":   "Gross %",
+            "pnl_net":     "Net %",
+            "pnl_rs":      "P&L ₹",
+            "exit_reason": "Exit Reason",
+            "trade_type":  "Type",
+            "win":         "Win",
+            "window":      "WF Window",
+        }
+        hist = hist.rename(columns={k:v for k,v in rename.items() if k in hist.columns})
+
+        # Colour winning rows green, losing rows red
+        def colour_row(row):
+            clr = "background-color: rgba(0,200,83,0.12)" if row.get("Win", False) \
+                  else "background-color: rgba(255,23,68,0.10)"
+            return [clr] * len(row)
+
+        st.dataframe(
+            hist.style.apply(colour_row, axis=1),
+            use_container_width=True, hide_index=True, height=380
+        )
+
+        csv_data = hist.to_csv(index=False).encode()
+        st.download_button("⬇️ Download Trade History CSV", csv_data,
+                           file_name=f"{sym}_{strat_name}_trades.csv",
+                           mime="text/csv")
 
         # ── Regime breakdown ─────────────────────────────────────────────
-        st.markdown("### 🌡 Strategy by Regime")
+        st.markdown("### 🌡 Historical Regime Distribution")
         df_ind = add_indicators(df)
         df_reg = detect_regime(df_ind)
         regime_dist = df_reg["regime"].value_counts(normalize=True) * 100
@@ -1175,6 +1306,116 @@ def page_backtest(settings: dict):
         )
         st.plotly_chart(fig4, use_container_width=True)
 
+    # ── PORTFOLIO BACKTEST ────────────────────────────────────────────────────
+    st.markdown("---")
+    st.markdown("### 🗂 Portfolio Walk-Forward (All Selected Stocks)")
+    st.caption(
+        "Runs the chosen strategy across multiple stocks simultaneously. "
+        "This is where real trade frequency comes from — single stocks rarely give enough trades."
+    )
+
+    port_stocks = st.multiselect(
+        "Stocks to include", NIFTY_50,
+        default=["HINDUNILVR","NESTLEIND","BRITANNIA","ASIANPAINT","TITAN",
+                 "INFY","TCS","HCLTECH","WIPRO","TECHM"],
+        key="port_stocks"
+    )
+    port_strat = st.selectbox("Strategy", list(strat_map.keys()),
+                               key="port_strat", index=0)
+    port_cap   = st.number_input("Portfolio Capital (₹)", 100_000, 50_000_000,
+                                  int(settings["capital"]), 10_000, key="port_cap")
+
+    if st.button("▶ Run Portfolio Backtest", type="secondary", use_container_width=True):
+        if not port_stocks:
+            st.warning("Select at least one stock.")
+        else:
+            all_port_trades = []
+            prog = st.progress(0, text="Fetching & running…")
+            for idx, psym in enumerate(port_stocks):
+                try:
+                    pdf = fetch_daily(psym + ".NS", period="5y")
+                    if pdf.empty or len(pdf) < train_bars + test_bars + 60:
+                        continue
+                    pt, _ = walk_forward_backtest(
+                        pdf, strat_map[port_strat],
+                        train_bars=train_bars, test_bars=test_bars
+                    )
+                    if not pt.empty:
+                        pt["symbol"] = psym
+                        all_port_trades.append(pt)
+                except Exception:
+                    pass
+                prog.progress((idx+1)/len(port_stocks),
+                              text=f"Processed {psym} ({idx+1}/{len(port_stocks)})")
+
+            prog.empty()
+
+            if not all_port_trades:
+                st.warning("No trades found across portfolio. Try different stocks/strategy.")
+            else:
+                port_df = pd.concat(all_port_trades, ignore_index=True)
+                pm = compute_metrics(port_df, port_cap)
+
+                st.success(
+                    f"✅ Portfolio: **{pm['total_trades']} trades** across "
+                    f"{len(port_stocks)} stocks — statistically meaningful!"
+                )
+
+                pm1,pm2,pm3,pm4,pm5,pm6 = st.columns(6)
+                pm1.metric("Total Trades",    pm["total_trades"])
+                pm2.metric("Win Rate",        f"{pm['win_rate']*100:.1f}%")
+                pm3.metric("Profit Factor",   f"{pm['profit_factor']:.2f}")
+                pm4.metric("Sharpe",          f"{pm['sharpe']:.2f}")
+                pm5.metric("Max Drawdown",    f"{pm['max_drawdown_pct']:.1f}%")
+                pm6.metric("Total Return",    f"{pm['total_return_pct']:.1f}%")
+
+                pa,pb,pc,pd_ = st.columns(4)
+                pa.metric("Avg Win",          f"{pm['avg_win_pct']:.2f}%")
+                pb.metric("Avg Loss",         f"{pm['avg_loss_pct']:.2f}%")
+                pc.metric("Expectancy/trade", f"{pm['expectancy_pct']:.3f}%")
+                pd_.metric("Max Consec Loss", pm["max_consec_loss"])
+
+                # Per-symbol breakdown
+                sym_summary = []
+                for s in port_df["symbol"].unique():
+                    sdf = port_df[port_df["symbol"] == s]
+                    sm  = compute_metrics(sdf, port_cap / len(port_stocks))
+                    if sm:
+                        sym_summary.append({
+                            "Symbol":       s,
+                            "Trades":       sm["total_trades"],
+                            "Win %":        f"{sm['win_rate']*100:.0f}%",
+                            "PF":           f"{sm['profit_factor']:.2f}",
+                            "Return %":     f"{sm['total_return_pct']:.1f}%",
+                            "MaxDD %":      f"{sm['max_drawdown_pct']:.1f}%",
+                            "Expectancy":   f"{sm['expectancy_pct']:.3f}%",
+                        })
+
+                if sym_summary:
+                    st.markdown("#### Per-Symbol Breakdown")
+                    st.dataframe(
+                        pd.DataFrame(sym_summary).sort_values("Return %", ascending=False),
+                        use_container_width=True, hide_index=True
+                    )
+
+                # Portfolio equity curve (equal-weight allocation)
+                port_eq = np.array(pm["equity_curve"])
+                fig_p = go.Figure()
+                fig_p.add_trace(go.Scatter(
+                    y=port_eq, mode="lines", name="Portfolio Equity",
+                    line=dict(color="#69ff47", width=2),
+                    fill="tozeroy", fillcolor="rgba(105,255,71,0.07)"
+                ))
+                fig_p.add_hline(y=port_cap, line_dash="dot", line_color="#666",
+                                annotation_text="Starting capital")
+                fig_p.update_layout(
+                    title=f"Portfolio Equity — {port_strat} across {len(port_stocks)} stocks",
+                    yaxis_title="₹", xaxis_title="Trade #",
+                    template="plotly_dark", height=340,
+                    margin=dict(l=0,r=0,t=50,b=0)
+                )
+                st.plotly_chart(fig_p, use_container_width=True)
+
 
 def page_live(settings: dict):
     st.title("🤖 Live Trading Engine")
@@ -1188,21 +1429,23 @@ def page_live(settings: dict):
     # Status + controls
     status_col, c1, c2, c3 = st.columns([3,1,1,1])
     with status_col:
+        mode_badge = "📄 PAPER" if settings.get("paper_mode") else "💰 LIVE"
         if live_on:
-            st.success("🟢 Engine is RUNNING")
+            st.success(f"🟢 Engine RUNNING — {mode_badge}")
         elif cb:
             st.error("🔴 Circuit Breaker Active — daily loss limit hit")
         else:
-            st.info("⚪ Engine is stopped")
+            st.info(f"⚪ Engine stopped — {mode_badge} mode")
 
-    dhan_token = settings.get("dhan_token", "")
+    dhan_token  = settings.get("dhan_token", "")
     dhan_client = settings.get("dhan_client", "")
+    paper_mode  = settings.get("paper_mode", True)
 
     with c1:
         start_disabled = live_on
         if st.button("▶ Start", disabled=start_disabled, use_container_width=True, type="primary"):
-            if not dhan_token:
-                st.error("Enter Dhan token in sidebar")
+            if not paper_mode and not dhan_token:
+                st.error("Enter Dhan token or enable Paper mode")
             else:
                 dhan = DhanAPI(dhan_client, dhan_token)
                 with _STORE["lock"]:
@@ -1242,7 +1485,7 @@ def page_live(settings: dict):
     lm1.metric("Daily P&L",      f"₹{daily_pnl:+,.0f}",
                delta=f"{daily_pnl/settings['capital']*100:+.2f}%")
     lm2.metric("Open Positions",  len(positions))
-    lm3.metric("Auto Trade",     "ON ✅" if settings.get("auto_trade") else "OFF ❌")
+    lm3.metric("Mode",           "📄 Paper" if settings.get("paper_mode") else "💰 Live")
     lm4.metric("Scan Interval",  f"{settings.get('scan_interval',60)}s")
 
     # Latest signals
@@ -1440,15 +1683,23 @@ def main():
         max_deploy    = st.slider("Max Deployment (%)", 30, 90, 60, 10) / 100
 
         st.markdown("---")
-        st.subheader("🔑 Dhan API")
-        dhan_client = st.text_input("Client ID", value="1104779876")
-        dhan_token  = st.text_input("Access Token", type="password",
-                                     placeholder="Paste your Dhan token")
-
-        st.markdown("---")
         st.subheader("🤖 Live Settings")
-        auto_trade    = st.toggle("Auto Place Orders", value=False,
-                                   help="If OFF, signals are shown but orders NOT placed")
+        paper_mode = st.toggle("📄 Paper Trading Mode", value=True,
+                               help="ON = no real orders, full simulation. OFF = live Dhan orders.")
+        if paper_mode:
+            st.success("Paper mode: no real money at risk")
+            dhan_client = "PAPER"
+            dhan_token  = "PAPER"
+            auto_trade  = False
+        else:
+            st.warning("⚠️ Real order mode — enter Dhan credentials")
+            st.subheader("🔑 Dhan API")
+            dhan_client = st.text_input("Client ID", value="1104779876")
+            dhan_token  = st.text_input("Access Token", type="password",
+                                         placeholder="Paste your Dhan token")
+            auto_trade  = st.toggle("Auto Place Orders", value=False,
+                                    help="Places real orders via Dhan API")
+
         scan_interval = st.select_slider("Scan Interval",
                                           options=[30, 60, 120, 300], value=60)
 
@@ -1465,6 +1716,7 @@ def main():
         "daily_loss_limit": daily_limit,
         "max_deployment":   max_deploy,
         "auto_trade":       auto_trade,
+        "paper_mode":       paper_mode,
         "scan_interval":    scan_interval,
         "watchlist":        watchlist,
         "dhan_client":      dhan_client,
