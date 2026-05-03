@@ -57,6 +57,7 @@ TARGET_TYPES = [
     "Risk:Reward",
     "ATR Multiple",
     "Adaptive Target",
+    "EMA Reverse Crossover",
     "Trailing Target (display only)",
     "Trailing Current Candle Low/High",
     "Trailing Previous Candle Low/High",
@@ -536,6 +537,9 @@ def calc_target(entry, side, sl, target_type, tp, rr, atr_v=None, df=None, idx=0
         return entry + side * tp
     if target_type == "Smart Target (auto)":
         return entry + side * (atr_v or abs(entry - sl)) * 2.0
+    if target_type == "EMA Reverse Crossover":
+        # Initial target = R:R 2:1; actual exit handled by EMA cross check in thread
+        return entry + side * abs(entry - sl) * 2.0
     # Trailing targets — initial value (will be updated every tick, never hit directly)
     if target_type == "Trailing Target (display only)":
         return entry + side * (atr_v or tp) * 2.0  # initial placeholder
@@ -1162,6 +1166,10 @@ def live_thread():
                 target_type_pos = position.get("target_type","Custom Points")
                 if target_type_pos == "Trailing Target (display only)":
                     tgt_hit = False   # never exit via target — only SL or EOD
+                elif target_type_pos == "EMA Reverse Crossover":
+                    # Exit when EMA crosses against trade direction
+                    rev = ema_live_check(df, fast, slow) if df is not None else 0
+                    tgt_hit = (rev != 0 and rev != side)
                 else:
                     tgt_hit = (side == 1 and ltp >= tgt_p) or (side == -1 and ltp <= tgt_p)
 
@@ -1245,24 +1253,25 @@ def live_thread():
                         sl_p  = ltp - side * atr_v * 1.5
                         tgt_p = ltp + side * atr_v * 2.5
 
-                    # ── Confluence quality check ──────────────────────────────
-                    # EMA alignment only makes sense for EMA-based strategies.
-                    # Elliott Wave / Wave Extrema are pattern-based — never block them.
-                    skip_entry = False
-                    ema_based  = strat in ("EMA Crossover", "Anticipatory EMA")
+                    # ── Confluence quality check (opt-in, EMA strategies only) ──
+                    # EW/Wave Extrema are pattern-based — NEVER apply EMA filter to them.
+                    # confluence_filter checkbox must be ON for this to run.
+                    skip_entry  = False
+                    ema_based   = strat in ("EMA Crossover", "Anticipatory EMA")
+                    conf_on     = cfg.get("confluence_filter", False)
 
-                    if df is not None and not df.empty and not simple and ema_based:
+                    if conf_on and ema_based and df is not None and not df.empty:
                         try:
                             fe_ = float(df["EMA_fast"].iloc[-1])
                             se_ = float(df["EMA_slow"].iloc[-1])
                             ema_align = (side == 1 and fe_ > se_) or (side == -1 and fe_ < se_)
-                            atr_ok    = atr_v > ltp * 0.0003   # at least 0.03% of price
+                            atr_ok    = atr_v > ltp * 0.0003
                             if not ema_align:
                                 skip_entry = True
-                                ts_log(f"Signal skipped: EMA trend opposes {'BUY' if side==1 else 'SELL'}")
+                                ts_log(f"Confluence: EMA trend opposes {'BUY' if side==1 else 'SELL'} — skipped")
                             elif not atr_ok:
                                 skip_entry = True
-                                ts_log("Signal skipped: market too flat (ATR too small)")
+                                ts_log("Confluence: market too flat — skipped")
                         except Exception:
                             pass
 
@@ -1491,6 +1500,10 @@ def sidebar_config():
         smart_sl_target = st.checkbox("🧠 Smart SL + Target (auto, overrides above)", value=False)
         if smart_sl_target:
             st.caption("SL = ATR×1.5 below/above entry. Target = ATR×2.5 above/below entry. Fully automatic.")
+
+        confluence_filter = st.checkbox("🔬 Confluence Guard (EMA align check, EMA strategies only)", value=False)
+        if confluence_filter:
+            st.caption("Only enter EMA Crossover trades when Fast/Slow EMA trend agrees with signal direction.")
         st.markdown("---")
         st.markdown("**Filters** *(all disabled by default)*")
 
@@ -1560,7 +1573,8 @@ def sidebar_config():
             "filter_angle":filter_ang,"angle_min":float(amin),"angle_max":float(amax),
             "filter_delta":filter_dlt,"delta_min":float(dmin),"delta_max":float(dmax),
             "filter_time":filter_time,"trade_time_start":t_start,"trade_time_end":t_end,
-            "max_daily_loss":float(max_loss),"max_daily_profit":float(max_profit)}
+            "max_daily_loss":float(max_loss),"max_daily_profit":float(max_profit),
+            "smart_sl_target":smart_sl_target,"confluence_filter":confluence_filter}
 
 # ── Merge helper ───────────────────────────────────────────────────────────────
 def merge_all():
