@@ -39,6 +39,40 @@ _STORE = {
     "lock":            threading.Lock(),
 }
 
+STATE_FILE = "algo_positions.json"
+
+def _save_state():
+    """Persist positions + closed trades to disk so app restarts don't lose state."""
+    try:
+        with _STORE["lock"]:
+            data = {
+                "positions":     _STORE["positions"],
+                "closed_trades": _STORE["closed_trades"],
+                "daily_pnl":     _STORE["daily_pnl"],
+                "saved_at":      datetime.now().isoformat(),
+            }
+        with open(STATE_FILE, "w") as f:
+            json.dump(data, f, indent=2, default=str)
+    except Exception as e:
+        pass  # never crash the trading loop over a save error
+
+def _load_state():
+    """Load persisted state on startup if file exists."""
+    try:
+        if not __import__("os").path.exists(STATE_FILE):
+            return
+        with open(STATE_FILE) as f:
+            data = json.load(f)
+        with _STORE["lock"]:
+            _STORE["positions"]     = data.get("positions", {})
+            _STORE["closed_trades"] = data.get("closed_trades", [])
+            _STORE["daily_pnl"]     = data.get("daily_pnl", 0.0)
+    except Exception:
+        pass
+
+# Load persisted state once at module import time
+_load_state()
+
 # ─────────────────────────────────────────────────────────────────────────────
 # UNIVERSE — all instruments supported via yfinance
 # ─────────────────────────────────────────────────────────────────────────────
@@ -244,11 +278,14 @@ REGIME_EMOJI = {
 # ─────────────────────────────────────────────────────────────────────────────
 DEFAULT_EMA_SWING = {"fast": 9, "slow": 21, "atr_sl": 2.0, "rr": 3.0, "max_hold": 10}
 
-def strategy_ema_swing(df: pd.DataFrame, params: dict = None) -> pd.DataFrame:
+def strategy_ema_swing(df: pd.DataFrame, params: dict = None,
+                       oos_start_bar: int = 0) -> pd.DataFrame:
     """
-    Edge: EMA-9 crosses above EMA-21 in a confirmed uptrend.
+    Edge: EMA-9 crosses above EMA-21 in confirmed uptrend.
+    Entry: NEXT bar's Open after signal (realistic — signal fires on close, enter next open).
     Regime filter: ADX>22, +DI>-DI, price>EMA-50.
     SL = entry - 2×ATR. Target = entry + 3×risk. Max hold = 10 bars.
+    oos_start_bar: only trades with entry_bar >= this are reported (WFO warmup fix).
     """
     p = {**DEFAULT_EMA_SWING, **(params or {})}
     df = df.copy().reset_index(drop=True)  # Date col preserved as column
@@ -260,9 +297,9 @@ def strategy_ema_swing(df: pd.DataFrame, params: dict = None) -> pd.DataFrame:
     df["adx_"], df["pdi_"], df["mdi_"] = adx_, pdi_, mdi_
 
     trades, in_trade = [], False
-    ep = sl = tgt = ei = 0
+    ep = sl = tgt = ei = signal_reason = 0
 
-    for i in range(50, len(df)):
+    for i in range(50, len(df) - 1):   # -1 so i+1 always exists for next-open entry
         r, prev = df.iloc[i], df.iloc[i-1]
         trending = (r["adx_"] > 22 and r["pdi_"] > r["mdi_"]
                     and r["Close"] > r["e50"])
@@ -270,21 +307,26 @@ def strategy_ema_swing(df: pd.DataFrame, params: dict = None) -> pd.DataFrame:
         if not in_trade:
             cross_up = prev["ef"] <= prev["es"] and r["ef"] > r["es"]
             if cross_up and trending:
-                ep  = r["Close"]
+                ep  = df.iloc[i+1]["Open"]       # ← enter next bar open (realistic)
                 sl  = ep - p["atr_sl"] * r["a"]
                 tgt = ep + p["rr"] * (ep - sl)
-                in_trade, ei = True, i
+                signal_reason = (f"EMA9 crossed above EMA21 | "
+                                 f"ADX={r['adx_']:.1f} | Close ₹{r['Close']:.2f} > EMA50 ₹{r['e50']:.2f}")
+                in_trade, ei = True, i+1          # entry bar is i+1
 
         else:
             bars = i - ei
             if r["Low"] <= sl:
-                trades.append(_trade(ei, i, ep, sl, "SL", "swing", df, sl, tgt, "EMA Swing"))
+                if ei >= oos_start_bar:
+                    trades.append(_trade(ei, i, ep, sl, "SL", "swing", df, sl, tgt, "EMA Swing", signal_reason))
                 in_trade = False
             elif r["High"] >= tgt:
-                trades.append(_trade(ei, i, ep, tgt, "Target", "swing", df, sl, tgt, "EMA Swing"))
+                if ei >= oos_start_bar:
+                    trades.append(_trade(ei, i, ep, tgt, "Target", "swing", df, sl, tgt, "EMA Swing", signal_reason))
                 in_trade = False
             elif bars >= p["max_hold"]:
-                trades.append(_trade(ei, i, ep, r["Close"], "MaxHold", "swing", df, sl, tgt, "EMA Swing"))
+                if ei >= oos_start_bar:
+                    trades.append(_trade(ei, i, ep, r["Close"], "MaxHold", "swing", df, sl, tgt, "EMA Swing", signal_reason))
                 in_trade = False
 
     return pd.DataFrame(trades)
@@ -296,9 +338,11 @@ def strategy_ema_swing(df: pd.DataFrame, params: dict = None) -> pd.DataFrame:
 DEFAULT_BREAKOUT = {"lookback": 20, "vol_mult": 1.3, "atr_sl": 1.5,
                     "rr": 2.5, "max_hold": 5}
 
-def strategy_momentum_breakout(df: pd.DataFrame, params: dict = None) -> pd.DataFrame:
+def strategy_momentum_breakout(df: pd.DataFrame, params: dict = None,
+                               oos_start_bar: int = 0) -> pd.DataFrame:
     """
     Edge: Price closes above 20-bar high on volume surge (>1.3× avg).
+    Entry: NEXT bar's Open after signal.
     Regime filter: ADX>20.
     SL = entry - 1.5×ATR. Target = entry + 2.5×risk. Max hold = 5 bars.
     """
@@ -311,29 +355,34 @@ def strategy_momentum_breakout(df: pd.DataFrame, params: dict = None) -> pd.Data
     df["hh"]   = df["High"].shift(1).rolling(p["lookback"]).max()  # prior bars only
 
     trades, in_trade = [], False
-    ep = sl = tgt = ei = 0
+    ep = sl = tgt = ei = signal_reason = 0
 
-    for i in range(50, len(df)):
+    for i in range(50, len(df) - 1):
         r = df.iloc[i]
         if not in_trade:
             breakout = (r["Close"] > r["hh"]
                         and r["Volume"] > p["vol_mult"] * r["vma"]
                         and r["adx_"] > 20)
-            if breakout:
-                ep  = r["Close"]
+            if breakout and not pd.isna(r["hh"]):
+                ep  = df.iloc[i+1]["Open"]
                 sl  = ep - p["atr_sl"] * r["a"]
                 tgt = ep + p["rr"] * (ep - sl)
-                in_trade, ei = True, i
+                signal_reason = (f"Close ₹{r['Close']:.2f} > 20d-High ₹{r['hh']:.2f} | "
+                                 f"Vol {r['Volume']/r['vma']:.1f}× avg | ADX={r['adx_']:.1f}")
+                in_trade, ei = True, i+1
         else:
             bars = i - ei
             if r["Low"] <= sl:
-                trades.append(_trade(ei, i, ep, sl, "SL", "intraday", df, sl, tgt, "Momentum Breakout"))
+                if ei >= oos_start_bar:
+                    trades.append(_trade(ei, i, ep, sl, "SL", "intraday", df, sl, tgt, "Momentum Breakout", signal_reason))
                 in_trade = False
             elif r["High"] >= tgt:
-                trades.append(_trade(ei, i, ep, tgt, "Target", "intraday", df, sl, tgt, "Momentum Breakout"))
+                if ei >= oos_start_bar:
+                    trades.append(_trade(ei, i, ep, tgt, "Target", "intraday", df, sl, tgt, "Momentum Breakout", signal_reason))
                 in_trade = False
             elif bars >= p["max_hold"]:
-                trades.append(_trade(ei, i, ep, r["Close"], "MaxHold", "intraday", df, sl, tgt, "Momentum Breakout"))
+                if ei >= oos_start_bar:
+                    trades.append(_trade(ei, i, ep, r["Close"], "MaxHold", "intraday", df, sl, tgt, "Momentum Breakout", signal_reason))
                 in_trade = False
 
     return pd.DataFrame(trades)
@@ -344,9 +393,11 @@ def strategy_momentum_breakout(df: pd.DataFrame, params: dict = None) -> pd.Data
 # ─────────────────────────────────────────────────────────────────────────────
 DEFAULT_REVERSION = {"rsi_thresh": 35, "atr_sl": 1.0, "max_hold": 5}
 
-def strategy_mean_reversion(df: pd.DataFrame, params: dict = None) -> pd.DataFrame:
+def strategy_mean_reversion(df: pd.DataFrame, params: dict = None,
+                            oos_start_bar: int = 0) -> pd.DataFrame:
     """
     Edge: RSI<35 AND Close<BB-lower in a ranging market.
+    Entry: NEXT bar's Open after signal.
     Regime filter: ADX<22.
     SL = entry - 1×ATR. Target = BB-mid. Max hold = 5 bars.
     """
@@ -361,54 +412,61 @@ def strategy_mean_reversion(df: pd.DataFrame, params: dict = None) -> pd.DataFra
     df["bblower"] = df["bbmid"] - 2 * bb_std
 
     trades, in_trade = [], False
-    ep = sl = tgt = ei = 0
+    ep = sl = tgt = ei = signal_reason = 0
 
-    for i in range(50, len(df)):
+    for i in range(50, len(df) - 1):
         r = df.iloc[i]
         if not in_trade:
             ranging  = r["adx_"] < 22
             oversold = r["rsi_"] < p["rsi_thresh"] and r["Close"] < r["bblower"]
             if oversold and ranging:
-                ep  = r["Close"]
+                ep  = df.iloc[i+1]["Open"]
                 sl  = ep - p["atr_sl"] * r["a"]
                 tgt = r["bbmid"]
                 if tgt <= ep:
                     continue
-                in_trade, ei = True, i
+                signal_reason = (f"RSI={r['rsi_']:.1f} < {p['rsi_thresh']} | "
+                                 f"Close ₹{r['Close']:.2f} < BB-Lower ₹{r['bblower']:.2f} | "
+                                 f"ADX={r['adx_']:.1f} (ranging)")
+                in_trade, ei = True, i+1
         else:
             bars = i - ei
             if r["Low"] <= sl:
-                trades.append(_trade(ei, i, ep, sl, "SL", "swing", df, sl, tgt, "Mean Reversion"))
+                if ei >= oos_start_bar:
+                    trades.append(_trade(ei, i, ep, sl, "SL", "swing", df, sl, tgt, "Mean Reversion", signal_reason))
                 in_trade = False
             elif r["High"] >= tgt:
-                trades.append(_trade(ei, i, ep, tgt, "Target", "swing", df, sl, tgt, "Mean Reversion"))
+                if ei >= oos_start_bar:
+                    trades.append(_trade(ei, i, ep, tgt, "Target", "swing", df, sl, tgt, "Mean Reversion", signal_reason))
                 in_trade = False
             elif bars >= p["max_hold"]:
-                trades.append(_trade(ei, i, ep, r["Close"], "MaxHold", "swing", df, sl, tgt, "Mean Reversion"))
+                if ei >= oos_start_bar:
+                    trades.append(_trade(ei, i, ep, r["Close"], "MaxHold", "swing", df, sl, tgt, "Mean Reversion", signal_reason))
                 in_trade = False
 
     return pd.DataFrame(trades)
 
 
-def _trade(ei, xi, ep, xp, reason, ttype, df=None, sl=None, tgt=None, strategy=""):
+def _trade(ei, xi, ep, xp, reason, ttype, df=None, sl=None, tgt=None, strategy="", signal_reason=""):
     pct = (xp - ep) / ep
     entry_date = str(df.iloc[ei]["Date"])[:10] if df is not None and "Date" in df.columns else ""
     exit_date  = str(df.iloc[xi]["Date"])[:10] if df is not None and "Date" in df.columns else ""
     hold_days  = xi - ei
     return {
-        "entry_bar":   ei,
-        "exit_bar":    xi,
-        "entry_date":  entry_date,
-        "exit_date":   exit_date,
-        "hold_days":   hold_days,
-        "entry":       round(ep, 4),
-        "exit":        round(xp, 4),
-        "sl":          round(sl, 4) if sl is not None else "",
-        "target":      round(tgt, 4) if tgt is not None else "",
-        "pnl_gross":   pct,
-        "trade_type":  ttype,
-        "exit_reason": reason,
-        "strategy":    strategy,
+        "entry_bar":     ei,
+        "exit_bar":      xi,
+        "entry_date":    entry_date,
+        "exit_date":     exit_date,
+        "hold_days":     hold_days,
+        "entry":         round(ep, 4),
+        "exit":          round(xp, 4),
+        "sl":            round(sl, 4) if sl is not None else "",
+        "target":        round(tgt, 4) if tgt is not None else "",
+        "pnl_gross":     pct,
+        "trade_type":    ttype,
+        "exit_reason":   reason,
+        "strategy":      strategy,
+        "signal_reason": signal_reason,
     }
 
 
@@ -434,10 +492,12 @@ def walk_forward_backtest(df: pd.DataFrame, strategy_func,
                           train_bars: int = 252,
                           test_bars:  int = 63):
     """
-    Pure out-of-sample walk-forward:
-      - Trains on [start : start+train_bars]  (in-sample — not reported)
-      - Tests  on [start+train_bars : +test_bars]  (OOS — reported)
-      - Rolls forward by test_bars each iteration
+    Corrected Walk-Forward:
+      - Passes FULL [start : start+train_bars+test_bars] to strategy so indicators
+        like EMA200, ATR, ADX have proper warmup history (fixes warmup bias).
+      - oos_start_bar = train_bars tells the strategy to only REPORT trades whose
+        entry falls in the OOS window.
+      - Rolls forward by test_bars each iteration.
     Returns (all_oos_trades_df, windows_summary_df)
     """
     df = df.reset_index(drop=True)  # integer index only; Date column stays intact
@@ -447,19 +507,21 @@ def walk_forward_backtest(df: pd.DataFrame, strategy_func,
     while start + train_bars + test_bars <= len(df):
         te = start + train_bars
         xt = te + test_bars
-        test_df = df.iloc[te:xt].copy().reset_index(drop=True)
+        # ← KEY FIX: pass full window [start:xt] so indicators use train period as warmup
+        full_window = df.iloc[start:xt].copy().reset_index(drop=True)
+        oos_start   = train_bars   # relative index within full_window
 
-        trades = strategy_func(test_df, params)
+        trades = strategy_func(full_window, params, oos_start_bar=oos_start)
         if not trades.empty:
             trades = apply_costs(trades)
-            trades["window"] = w
+            trades["window"]    = w
             trades["oos_start"] = te
             trades["oos_end"]   = xt
             oos_blocks.append(trades)
 
         windows.append({"window": w,
                          "train_start": start, "train_end": te,
-                         "oos_start": te,       "oos_end": xt,
+                         "oos_start": te, "oos_end": xt,
                          "n_trades": len(trades)})
         start += test_bars
         w += 1
@@ -790,21 +852,24 @@ def live_loop(dhan: DhanAPI, settings: dict, store: dict):
                         # Paper-track position
                         with store["lock"]:
                             store["positions"][sig["symbol"]] = {
-                                "strategy": sig["strategy"],
-                                "entry":    sig["entry"],
-                                "sl":       sig["sl"],
-                                "target":   sig["target"],
-                                "qty":      sig["qty"],
-                                "ltp":      sig["entry"],
-                                "pnl_pct":  0.0,
+                                "strategy":   sig["strategy"],
+                                "entry":      sig["entry"],
+                                "sl":         sig["sl"],
+                                "target":     sig["target"],
+                                "qty":        sig["qty"],
+                                "ltp":        sig["entry"],
+                                "pnl_pct":    0.0,
                                 "entry_time": datetime.now().strftime("%H:%M:%S"),
+                                "entry_date": datetime.now().strftime("%Y-%m-%d"),
                             }
+                        _save_state()
                         break  # one new position per scan cycle
 
             # ── Monitor existing positions ────────────────────────────────
             with store["lock"]:
                 pos_copy = dict(store["positions"])
 
+            state_changed = False
             for sym, pos in pos_copy.items():
                 ltp = get_ltp_yf(sym)
                 if ltp <= 0:
@@ -826,9 +891,10 @@ def live_loop(dhan: DhanAPI, settings: dict, store: dict):
                             "entry": pos["entry"], "exit": ltp,
                             "pnl_rs": (ltp - pos["entry"]) * pos["qty"],
                             "pnl_pct": pnl_pct * 100,
-                            "time": datetime.now().strftime("%H:%M:%S"),
+                            "time": datetime.now().isoformat(),
                         })
                         store["positions"].pop(sym, None)
+                    state_changed = True
 
                 elif ltp >= pos["target"]:
                     _log(store, f"🟢 Target hit: {sym} @ ₹{ltp:.2f} | P&L: {pnl_pct*100:+.2f}%")
@@ -839,9 +905,13 @@ def live_loop(dhan: DhanAPI, settings: dict, store: dict):
                             "entry": pos["entry"], "exit": ltp,
                             "pnl_rs": (ltp - pos["entry"]) * pos["qty"],
                             "pnl_pct": pnl_pct * 100,
-                            "time": datetime.now().strftime("%H:%M:%S"),
+                            "time": datetime.now().isoformat(),
                         })
                         store["positions"].pop(sym, None)
+                    state_changed = True
+
+            if state_changed:
+                _save_state()
 
             # Update portfolio P&L
             with store["lock"]:
@@ -1426,10 +1496,41 @@ def page_live(settings: dict):
         log     = list(_STORE["live_log"])
         sigs    = list(_STORE["signals"])
 
-    # Status + controls
-    status_col, c1, c2, c3 = st.columns([3,1,1,1])
-    with status_col:
-        mode_badge = "📄 PAPER" if settings.get("paper_mode") else "💰 LIVE"
+    paper_mode  = settings.get("paper_mode", True)
+    dhan_token  = settings.get("dhan_token", "")
+    dhan_client = settings.get("dhan_client", "")
+
+    # ── Ticker & strategy config ─────────────────────────────────────────────
+    st.markdown("### ⚙️ Watchlist & Strategy for Live Engine")
+    lv1, lv2, lv3 = st.columns([2, 2, 1])
+    with lv1:
+        live_extra = st.text_input(
+            "Add custom tickers to live scan (comma-separated)",
+            placeholder="KAYNES.NS, ZOMATO.NS, BTC-USD",
+            key="live_extra_tickers"
+        )
+        extra_live = [s.strip() for s in live_extra.split(",") if s.strip()]
+        live_watchlist = list(dict.fromkeys(
+            [s + ".NS" for s in settings["watchlist"]] + extra_live
+        ))
+    with lv2:
+        live_strats = st.multiselect(
+            "Active Strategies",
+            ["EMA Swing", "Momentum Breakout", "Mean Reversion"],
+            default=["EMA Swing", "Momentum Breakout", "Mean Reversion"],
+            key="live_strats"
+        )
+    with lv3:
+        st.caption(f"**{len(live_watchlist)}** tickers in scan")
+        st.caption(f"Interval: **{settings.get('scan_interval',60)}s**")
+        st.caption(f"Mode: **{'📄 Paper' if paper_mode else '💰 LIVE'}**")
+
+    st.markdown("---")
+
+    # ── Engine controls ──────────────────────────────────────────────────────
+    mode_badge = "📄 PAPER" if paper_mode else "💰 LIVE"
+    sc, c1, c2, c3 = st.columns([3,1,1,1])
+    with sc:
         if live_on:
             st.success(f"🟢 Engine RUNNING — {mode_badge}")
         elif cb:
@@ -1437,79 +1538,160 @@ def page_live(settings: dict):
         else:
             st.info(f"⚪ Engine stopped — {mode_badge} mode")
 
-    dhan_token  = settings.get("dhan_token", "")
-    dhan_client = settings.get("dhan_client", "")
-    paper_mode  = settings.get("paper_mode", True)
-
     with c1:
-        start_disabled = live_on
-        if st.button("▶ Start", disabled=start_disabled, use_container_width=True, type="primary"):
+        if st.button("▶ Start", disabled=live_on, use_container_width=True, type="primary"):
             if not paper_mode and not dhan_token:
                 st.error("Enter Dhan token or enable Paper mode")
             else:
                 dhan = DhanAPI(dhan_client, dhan_token)
+                live_settings = {**settings,
+                                 "watchlist":    live_watchlist,
+                                 "live_strats":  live_strats}
                 with _STORE["lock"]:
                     _STORE["live_running"]    = True
                     _STORE["circuit_breaker"] = False
                     _STORE["daily_pnl"]       = 0.0
                 t = threading.Thread(
-                    target=live_loop, args=(dhan, settings, _STORE), daemon=True
+                    target=live_loop, args=(dhan, live_settings, _STORE), daemon=True
                 )
                 t.start()
                 with _STORE["lock"]:
                     _STORE["live_thread"] = t
                 st.rerun()
-
     with c2:
         if st.button("⏹ Stop", disabled=not live_on, use_container_width=True):
             with _STORE["lock"]:
                 _STORE["live_running"] = False
             st.rerun()
-
     with c3:
         if st.button("🔄 Reset CB", use_container_width=True):
             with _STORE["lock"]:
                 _STORE["circuit_breaker"] = False
-                _STORE["daily_pnl"] = 0.0
+                _STORE["daily_pnl"]       = 0.0
             st.rerun()
 
     st.markdown("---")
 
-    # Live metrics
+    # ── Live metrics ─────────────────────────────────────────────────────────
     with _STORE["lock"]:
         daily_pnl = _STORE["daily_pnl"]
         positions = dict(_STORE["positions"])
-        port_pnl  = _STORE["portfolio_pnl"]
+        closed    = list(_STORE["closed_trades"])
 
-    lm1,lm2,lm3,lm4 = st.columns(4)
-    lm1.metric("Daily P&L",      f"₹{daily_pnl:+,.0f}",
+    lm1,lm2,lm3,lm4,lm5 = st.columns(5)
+    lm1.metric("Daily P&L",     f"₹{daily_pnl:+,.0f}",
                delta=f"{daily_pnl/settings['capital']*100:+.2f}%")
-    lm2.metric("Open Positions",  len(positions))
-    lm3.metric("Mode",           "📄 Paper" if settings.get("paper_mode") else "💰 Live")
-    lm4.metric("Scan Interval",  f"{settings.get('scan_interval',60)}s")
+    lm2.metric("Open Positions", len(positions))
+    lm3.metric("Closed Today",   len(closed))
+    lm4.metric("Mode",           "📄 Paper" if paper_mode else "💰 Live")
+    lm5.metric("Active Strats",  len(live_strats))
 
-    # Latest signals
-    if sigs:
-        st.markdown("### 🎯 Latest Scan Results")
-        df_sig = pd.DataFrame([{
-            "Symbol":   s["symbol"],
-            "Strategy": s["strategy"],
-            "Entry ₹":  s["entry"],
-            "SL ₹":     s["sl"],
-            "Target ₹": s["target"],
-            "Qty":       s["qty"],
-            "R:R":       f"{s['rr']}:1",
-            "Regime":    REGIME_EMOJI.get(s["regime"],"") + " " + s["regime"],
-            "Style":     s["style"],
-        } for s in sigs])
-        st.dataframe(df_sig, use_container_width=True, hide_index=True)
+    # ── Strategy Status Cards ────────────────────────────────────────────────
+    st.markdown("### 📡 Strategy Status Monitor")
+    st.caption("Scans last available data for each strategy — shows current state per ticker")
 
-    # Squareoff all
-    if positions:
-        st.markdown("---")
-        if st.button("⚠️ Squareoff ALL Positions (Paper)", type="secondary"):
+    if sigs or st.button("🔍 Check Strategy Status Now", key="check_strat_status"):
+        if not sigs:
+            with st.spinner("Scanning…"):
+                fresh = scan_signals(live_watchlist[:15], settings["capital"],
+                                     settings["risk_pct"])
             with _STORE["lock"]:
-                for sym, pos in _STORE["positions"].items():
+                _STORE["signals"] = fresh
+            sigs = fresh
+
+        # Group by strategy
+        strat_groups = {}
+        for s in sigs:
+            strat_groups.setdefault(s["strategy"], []).append(s)
+
+        all_strats = ["EMA Swing", "Momentum Breakout", "Mean Reversion"]
+        cols = st.columns(len(all_strats))
+        for col, sname in zip(cols, all_strats):
+            group = strat_groups.get(sname, [])
+            with col:
+                if group:
+                    st.success(f"**{sname}**  \n🟢 {len(group)} signal(s)")
+                    for g in group[:3]:
+                        st.markdown(
+                            f"**{g['symbol']}**  \n"
+                            f"Entry: ₹{g['entry']} | SL: ₹{g['sl']} | Tgt: ₹{g['target']}  \n"
+                            f"R:R {g['rr']}:1 | {REGIME_EMOJI.get(g['regime'],'')} {g['regime']}"
+                        )
+                else:
+                    reason = {
+                        "EMA Swing":         "Waiting for ADX>22 + EMA9 cross above EMA21 in uptrend",
+                        "Momentum Breakout": "Waiting for close above 20-day high + volume surge",
+                        "Mean Reversion":    "Waiting for RSI<35 + close below BB-lower in ranging market",
+                    }.get(sname, "")
+                    st.warning(f"**{sname}**  \n⚪ No signal  \n_{reason}_")
+
+    st.markdown("---")
+
+    # ── Open Positions — detailed tracker ────────────────────────────────────
+    st.markdown("### 📋 Open Positions (Multi-Day Tracker)")
+    st.caption("Positions persist across app restarts via `algo_positions.json`")
+
+    if positions:
+        now_date = datetime.now().date()
+        pos_rows = []
+        for sym, pos in positions.items():
+            ltp       = pos.get("ltp", pos["entry"])
+            pnl_rs    = (ltp - pos["entry"]) * pos["qty"]
+            pnl_pct   = (ltp - pos["entry"]) / pos["entry"] * 100
+            entry_dt  = pos.get("entry_time", "—")
+            # Days held: compute from entry_date if stored
+            entry_date_str = pos.get("entry_date", "")
+            days_held = "—"
+            if entry_date_str:
+                try:
+                    ed = datetime.strptime(entry_date_str[:10], "%Y-%m-%d").date()
+                    days_held = (now_date - ed).days
+                except Exception:
+                    pass
+            sl_dist    = ((ltp - pos["sl"])   / ltp * 100) if pos.get("sl")     else "—"
+            tgt_dist   = ((pos["target"] - ltp) / ltp * 100) if pos.get("target") else "—"
+            pos_rows.append({
+                "Symbol":       sym,
+                "Strategy":     pos.get("strategy", "—"),
+                "Entry Date":   entry_date_str[:10] if entry_date_str else entry_dt,
+                "Days Held":    days_held,
+                "Entry ₹":      f"₹{pos['entry']:,.2f}",
+                "LTP ₹":        f"₹{ltp:,.2f}",
+                "SL ₹":         f"₹{pos.get('sl',0):,.2f}",
+                "Target ₹":     f"₹{pos.get('target',0):,.2f}",
+                "Qty":           pos["qty"],
+                "P&L ₹":        f"₹{pnl_rs:+,.0f}",
+                "P&L %":        f"{pnl_pct:+.2f}%",
+                "% to SL":      f"-{sl_dist:.1f}%" if isinstance(sl_dist, float) else sl_dist,
+                "% to Target":  f"+{tgt_dist:.1f}%" if isinstance(tgt_dist, float) else tgt_dist,
+            })
+        st.dataframe(pd.DataFrame(pos_rows), use_container_width=True, hide_index=True)
+
+        # Individual squareoff buttons
+        st.markdown("**Manual Squareoff:**")
+        sq_cols = st.columns(min(len(positions), 6))
+        for col, sym in zip(sq_cols, list(positions.keys())):
+            with col:
+                if st.button(f"❌ {sym}", key=f"sq_{sym}"):
+                    with _STORE["lock"]:
+                        pos = _STORE["positions"].get(sym, {})
+                        if pos:
+                            ltp = pos.get("ltp", pos["entry"])
+                            _STORE["daily_pnl"] += (ltp - pos["entry"]) * pos["qty"]
+                            _STORE["closed_trades"].append({
+                                "symbol": sym, "exit_reason": "Manual",
+                                "entry": pos["entry"], "exit": ltp,
+                                "pnl_rs": (ltp - pos["entry"]) * pos["qty"],
+                                "pnl_pct": pnl_pct,
+                                "time": datetime.now().isoformat(),
+                            })
+                            _STORE["positions"].pop(sym, None)
+                    _save_state()
+                    st.rerun()
+
+        if st.button("⚠️ Squareoff ALL", type="secondary"):
+            with _STORE["lock"]:
+                for sym, pos in list(_STORE["positions"].items()):
                     ltp = pos.get("ltp", pos["entry"])
                     _STORE["daily_pnl"] += (ltp - pos["entry"]) * pos["qty"]
                     _STORE["closed_trades"].append({
@@ -1517,21 +1699,41 @@ def page_live(settings: dict):
                         "entry": pos["entry"], "exit": ltp,
                         "pnl_rs": (ltp - pos["entry"]) * pos["qty"],
                         "pnl_pct": (ltp - pos["entry"]) / pos["entry"] * 100,
-                        "time": datetime.now().strftime("%H:%M:%S"),
+                        "time": datetime.now().isoformat(),
                     })
                 _STORE["positions"].clear()
+            _save_state()
             st.success("All positions squared off")
             st.rerun()
+    else:
+        st.info("No open positions. Positions persist to disk — they'll survive app restarts.")
 
-    # Activity log
+    # ── Closed trades today ───────────────────────────────────────────────────
+    if closed:
+        st.markdown("---")
+        st.markdown("### ✅ Closed Trades")
+        df_closed = pd.DataFrame(closed)
+        st.dataframe(df_closed, use_container_width=True, hide_index=True)
+        tot = sum(t.get("pnl_rs", 0) for t in closed)
+        st.metric("Closed P&L", f"₹{tot:+,.0f}")
+
+    # ── Activity log ─────────────────────────────────────────────────────────
+    st.markdown("---")
     st.markdown("### 📝 Activity Log")
     if log:
-        st.text_area("", value="\n".join(reversed(log[-40:])),
-                     height=350, disabled=True)
+        st.text_area("", value="\n".join(reversed(log[-50:])),
+                     height=300, disabled=True)
     else:
         st.info("Start the engine to see live logs here.")
 
-    # Auto-refresh when live
+    # ── Persistence info ─────────────────────────────────────────────────────
+    import os
+    if os.path.exists(STATE_FILE):
+        mtime = datetime.fromtimestamp(os.path.getmtime(STATE_FILE))
+        st.caption(f"💾 State file: `{STATE_FILE}` — last saved {mtime.strftime('%d %b %Y %H:%M:%S')}")
+    else:
+        st.caption(f"💾 State file `{STATE_FILE}` will be created when first position is opened.")
+
     if live_on:
         time.sleep(2)
         st.rerun()
