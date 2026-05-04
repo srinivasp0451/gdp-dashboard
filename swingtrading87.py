@@ -24,6 +24,23 @@ import plotly.express as px
 warnings.filterwarnings("ignore")
 
 # ─────────────────────────────────────────────────────────────────────────────
+# IST TIMEZONE HELPER
+# ─────────────────────────────────────────────────────────────────────────────
+IST_OFFSET = timedelta(hours=5, minutes=30)
+
+def now_ist() -> datetime:
+    """Return current datetime in IST."""
+    return datetime.utcnow() + IST_OFFSET
+
+def fmt_ist(dt=None, include_date=True) -> str:
+    """Format a datetime (or now) as IST string."""
+    if dt is None:
+        dt = now_ist()
+    if include_date:
+        return dt.strftime("%d %b %Y %H:%M:%S IST")
+    return dt.strftime("%H:%M:%S IST")
+
+# ─────────────────────────────────────────────────────────────────────────────
 # MODULE-LEVEL SINGLETON — survives Streamlit reruns via Python module cache
 # ─────────────────────────────────────────────────────────────────────────────
 _STORE = {
@@ -49,7 +66,7 @@ def _save_state():
                 "positions":     _STORE["positions"],
                 "closed_trades": _STORE["closed_trades"],
                 "daily_pnl":     _STORE["daily_pnl"],
-                "saved_at":      datetime.now().isoformat(),
+                "saved_at":      fmt_ist(),
             }
         with open(STATE_FILE, "w") as f:
             json.dump(data, f, indent=2, default=str)
@@ -586,16 +603,29 @@ def compute_metrics(trades: pd.DataFrame, capital: float = 200_000) -> dict:
 # ─────────────────────────────────────────────────────────────────────────────
 # STOCK SCREENER
 # ─────────────────────────────────────────────────────────────────────────────
-def scan_signals(symbols: list, capital: float, risk_pct: float) -> list:
+def scan_signals(tickers: list, capital: float, risk_pct: float) -> list:
     """
-    Scans each symbol for live signals from all 3 strategies.
+    Scans each ticker for live signals from all 3 strategies.
+    Accepts full yfinance tickers (RELIANCE.NS, BTC-USD, ^NSEI etc.)
+    or bare NSE symbols (RELIANCE → auto-appends .NS).
     Returns sorted list of signal dicts (best R:R first).
     """
     signals = []
 
-    for sym in symbols:
+    for raw in tickers:
+        raw = raw.strip()
+        if not raw:
+            continue
+        # Determine yfinance ticker and display symbol
+        if "." in raw or "-" in raw or raw.startswith("^"):
+            yf_ticker = raw          # already a full yfinance ticker
+            display   = raw
+        else:
+            yf_ticker = raw + ".NS"  # bare NSE symbol
+            display   = raw
+
         try:
-            df = fetch_daily(sym + ".NS", period="1y")
+            df = fetch_daily(yf_ticker, period="1y")
             if df.empty or len(df) < 60:
                 continue
             df = add_indicators(df)
@@ -614,20 +644,20 @@ def scan_signals(symbols: list, capital: float, risk_pct: float) -> list:
                 sl  = ep - 2.0 * last["atr14"]
                 tgt = ep + 3.0 * (ep - sl)
                 qty = max(1, int((capital * risk_pct) / (ep - sl)))
-                signals.append(_signal(sym, "EMA Swing", "Swing (3-10d)",
+                signals.append(_signal(display, "EMA Swing", "Swing (3-10d)",
                                        regime, ep, sl, tgt, qty, last, 3.0))
 
             # ── Strategy 2: Momentum Breakout ─────────────────────────────
             hh20 = df["High"].iloc[-21:-1].max()
-            vol_ok   = last["vol_ratio"] > 1.3
-            adx_ok   = last["adx14"] > 20
-            brk_up   = last["Close"] > hh20 and vol_ok and adx_ok
-            if brk_up:
+            vol_ok = last["vol_ratio"] > 1.3
+            adx_ok = last["adx14"] > 20
+            brk_up = last["Close"] > hh20 and vol_ok and adx_ok
+            if brk_up and not pd.isna(hh20):
                 ep  = last["Close"]
                 sl  = ep - 1.5 * last["atr14"]
                 tgt = ep + 2.5 * (ep - sl)
                 qty = max(1, int((capital * risk_pct) / (ep - sl)))
-                signals.append(_signal(sym, "Momentum Breakout", "Intraday/Swing (1-5d)",
+                signals.append(_signal(display, "Momentum Breakout", "Intraday/Swing (1-5d)",
                                        regime, ep, sl, tgt, qty, last, 2.5))
 
             # ── Strategy 3: Mean Reversion ────────────────────────────────
@@ -640,7 +670,7 @@ def scan_signals(symbols: list, capital: float, risk_pct: float) -> list:
                 if tgt > ep:
                     rr  = (tgt - ep) / (ep - sl)
                     qty = max(1, int((capital * risk_pct) / (ep - sl)))
-                    signals.append(_signal(sym, "Mean Reversion", "Swing (2-5d)",
+                    signals.append(_signal(display, "Mean Reversion", "Swing (2-5d)",
                                            regime, ep, sl, tgt, qty, last, round(rr, 2)))
 
         except Exception:
@@ -768,7 +798,7 @@ class DhanAPI:
 # LIVE TRADING LOOP (background thread)
 # ─────────────────────────────────────────────────────────────────────────────
 def _log(store, msg: str):
-    ts = datetime.now().strftime("%H:%M:%S")
+    ts = fmt_ist(include_date=False)
     with store["lock"]:
         store["live_log"].append(f"[{ts}] {msg}")
         if len(store["live_log"]) > 150:
@@ -780,7 +810,7 @@ def live_loop(dhan: DhanAPI, settings: dict, store: dict):
 
     while store["live_running"]:
         try:
-            now = datetime.now()
+            now = now_ist()
             mo  = now.replace(hour=9,  minute=15, second=0, microsecond=0)
             mc  = now.replace(hour=15, minute=20, second=0, microsecond=0)
 
@@ -797,8 +827,8 @@ def live_loop(dhan: DhanAPI, settings: dict, store: dict):
                     continue
 
             # ── Scan for signals ──────────────────────────────────────────
-            watchlist = settings.get("watchlist", NIFTY_50[:15])
-            _log(store, f"🔍 Scanning {len(watchlist)} stocks…")
+            watchlist = settings.get("watchlist", NIFTY_50[:5])
+            _log(store, f"🔍 Scanning {len(watchlist)} ticker(s): {', '.join(watchlist[:5])}{'…' if len(watchlist)>5 else ''}")
             signals = scan_signals(watchlist, settings["capital"], settings["risk_pct"])
 
             with store["lock"]:
@@ -859,8 +889,8 @@ def live_loop(dhan: DhanAPI, settings: dict, store: dict):
                                 "qty":        sig["qty"],
                                 "ltp":        sig["entry"],
                                 "pnl_pct":    0.0,
-                                "entry_time": datetime.now().strftime("%H:%M:%S"),
-                                "entry_date": datetime.now().strftime("%Y-%m-%d"),
+                                "entry_time": fmt_ist(include_date=False),
+                                "entry_date": now_ist().strftime("%Y-%m-%d"),
                             }
                         _save_state()
                         break  # one new position per scan cycle
@@ -891,7 +921,7 @@ def live_loop(dhan: DhanAPI, settings: dict, store: dict):
                             "entry": pos["entry"], "exit": ltp,
                             "pnl_rs": (ltp - pos["entry"]) * pos["qty"],
                             "pnl_pct": pnl_pct * 100,
-                            "time": datetime.now().isoformat(),
+                            "time": fmt_ist(),
                         })
                         store["positions"].pop(sym, None)
                     state_changed = True
@@ -905,7 +935,7 @@ def live_loop(dhan: DhanAPI, settings: dict, store: dict):
                             "entry": pos["entry"], "exit": ltp,
                             "pnl_rs": (ltp - pos["entry"]) * pos["qty"],
                             "pnl_pct": pnl_pct * 100,
-                            "time": datetime.now().isoformat(),
+                            "time": fmt_ist(),
                         })
                         store["positions"].pop(sym, None)
                     state_changed = True
@@ -1057,8 +1087,9 @@ def page_screener(settings: dict):
     if run_btn:
         base_list = settings["watchlist"][:n_scan]
         # Merge custom tickers, deduplicate, preserve order
+        # base_list = bare NSE symbols; extra_syms = full yfinance tickers
         watchlist = list(dict.fromkeys(base_list + extra_syms))
-        with st.spinner(f"Scanning {len(watchlist)} stocks…"):
+        with st.spinner(f"Scanning {len(watchlist)} ticker(s)…"):
             sigs = scan_signals(watchlist, settings["capital"], settings["risk_pct"])
         with _STORE["lock"]:
             _STORE["signals"] = sigs
@@ -1115,7 +1146,7 @@ def page_screener(settings: dict):
                         "qty":        sig["qty"],
                         "ltp":        sig["entry"],
                         "pnl_pct":    0.0,
-                        "entry_time": datetime.now().strftime("%H:%M:%S"),
+                        "entry_time": fmt_ist(include_date=False),
                     }
                 st.success(f"Paper-position added for {sig['symbol']}")
 
@@ -1500,19 +1531,32 @@ def page_live(settings: dict):
     dhan_token  = settings.get("dhan_token", "")
     dhan_client = settings.get("dhan_client", "")
 
-    # ── Ticker & strategy config ─────────────────────────────────────────────
-    st.markdown("### ⚙️ Watchlist & Strategy for Live Engine")
-    lv1, lv2, lv3 = st.columns([2, 2, 1])
+    # ── Standalone Live Ticker & Strategy Config ──────────────────────────────
+    st.markdown("### ⚙️ Live Engine Configuration")
+    st.caption("These settings are independent of the Screener / Backtest tabs.")
+
+    lv1, lv2 = st.columns([3, 2])
     with lv1:
-        live_extra = st.text_input(
-            "Add custom tickers to live scan (comma-separated)",
-            placeholder="KAYNES.NS, ZOMATO.NS, BTC-USD",
-            key="live_extra_tickers"
+        live_nifty = st.multiselect(
+            "Nifty 50 Stocks to scan",
+            options=NIFTY_50,
+            default=["RELIANCE", "INFY", "TCS", "HDFCBANK", "ICICIBANK"],
+            key="live_nifty_select",
+            help="Select stocks from Nifty 50"
         )
-        extra_live = [s.strip() for s in live_extra.split(",") if s.strip()]
-        live_watchlist = list(dict.fromkeys(
-            [s + ".NS" for s in settings["watchlist"]] + extra_live
-        ))
+        live_custom_raw = st.text_input(
+            "Additional custom tickers (comma-separated, full yfinance format)",
+            placeholder="KAYNES.NS, ZOMATO.NS, BTC-USD, GC=F, USDINR=X",
+            key="live_custom_tickers"
+        )
+        live_custom = [t.strip() for t in live_custom_raw.split(",") if t.strip()]
+
+        # Build final watchlist — stocks as bare symbols, custom as-is
+        live_watchlist = list(dict.fromkeys(live_nifty + live_custom))
+
+        st.info(f"**{len(live_watchlist)}** ticker(s) queued: "
+                f"{', '.join(live_watchlist[:8])}{'…' if len(live_watchlist) > 8 else ''}")
+
     with lv2:
         live_strats = st.multiselect(
             "Active Strategies",
@@ -1520,10 +1564,14 @@ def page_live(settings: dict):
             default=["EMA Swing", "Momentum Breakout", "Mean Reversion"],
             key="live_strats"
         )
-    with lv3:
-        st.caption(f"**{len(live_watchlist)}** tickers in scan")
-        st.caption(f"Interval: **{settings.get('scan_interval',60)}s**")
+        live_interval = st.select_slider(
+            "Scan Interval (seconds)",
+            options=[30, 60, 120, 300],
+            value=settings.get("scan_interval", 60),
+            key="live_interval"
+        )
         st.caption(f"Mode: **{'📄 Paper' if paper_mode else '💰 LIVE'}**")
+        st.caption(f"Market hours: 09:15–15:20 IST")
 
     st.markdown("---")
 
@@ -1540,17 +1588,31 @@ def page_live(settings: dict):
 
     with c1:
         if st.button("▶ Start", disabled=live_on, use_container_width=True, type="primary"):
-            if not paper_mode and not dhan_token:
+            if not live_watchlist:
+                st.error("Select at least one ticker above before starting.")
+            elif not paper_mode and not dhan_token:
                 st.error("Enter Dhan token or enable Paper mode")
             else:
+                # ── Clean up stale JSON state file on every fresh start ──
+                import os
+                if os.path.exists(STATE_FILE):
+                    os.remove(STATE_FILE)
+
                 dhan = DhanAPI(dhan_client, dhan_token)
-                live_settings = {**settings,
-                                 "watchlist":    live_watchlist,
-                                 "live_strats":  live_strats}
+                live_settings = {
+                    **settings,
+                    "watchlist":     live_watchlist,
+                    "live_strats":   live_strats,
+                    "scan_interval": live_interval,
+                }
                 with _STORE["lock"]:
                     _STORE["live_running"]    = True
                     _STORE["circuit_breaker"] = False
                     _STORE["daily_pnl"]       = 0.0
+                    _STORE["positions"]       = {}
+                    _STORE["closed_trades"]   = []
+                    _STORE["live_log"]        = []
+                    _STORE["signals"]         = []
                 t = threading.Thread(
                     target=live_loop, args=(dhan, live_settings, _STORE), daemon=True
                 )
@@ -1592,9 +1654,12 @@ def page_live(settings: dict):
 
     if sigs or st.button("🔍 Check Strategy Status Now", key="check_strat_status"):
         if not sigs:
-            with st.spinner("Scanning…"):
-                fresh = scan_signals(live_watchlist[:15], settings["capital"],
-                                     settings["risk_pct"])
+            with st.spinner(f"Scanning {len(live_watchlist)} ticker(s)…"):
+                fresh = scan_signals(
+                    live_watchlist,
+                    settings["capital"],
+                    settings["risk_pct"]
+                )
             with _STORE["lock"]:
                 _STORE["signals"] = fresh
             sigs = fresh
@@ -1632,7 +1697,7 @@ def page_live(settings: dict):
     st.caption("Positions persist across app restarts via `algo_positions.json`")
 
     if positions:
-        now_date = datetime.now().date()
+        now_date = now_ist().date()
         pos_rows = []
         for sym, pos in positions.items():
             ltp       = pos.get("ltp", pos["entry"])
@@ -1683,7 +1748,7 @@ def page_live(settings: dict):
                                 "entry": pos["entry"], "exit": ltp,
                                 "pnl_rs": (ltp - pos["entry"]) * pos["qty"],
                                 "pnl_pct": pnl_pct,
-                                "time": datetime.now().isoformat(),
+                                "time": fmt_ist(),
                             })
                             _STORE["positions"].pop(sym, None)
                     _save_state()
@@ -1699,7 +1764,7 @@ def page_live(settings: dict):
                         "entry": pos["entry"], "exit": ltp,
                         "pnl_rs": (ltp - pos["entry"]) * pos["qty"],
                         "pnl_pct": (ltp - pos["entry"]) / pos["entry"] * 100,
-                        "time": datetime.now().isoformat(),
+                        "time": fmt_ist(),
                     })
                 _STORE["positions"].clear()
             _save_state()
@@ -1729,8 +1794,8 @@ def page_live(settings: dict):
     # ── Persistence info ─────────────────────────────────────────────────────
     import os
     if os.path.exists(STATE_FILE):
-        mtime = datetime.fromtimestamp(os.path.getmtime(STATE_FILE))
-        st.caption(f"💾 State file: `{STATE_FILE}` — last saved {mtime.strftime('%d %b %Y %H:%M:%S')}")
+        mtime = datetime.utcfromtimestamp(os.path.getmtime(STATE_FILE)) + IST_OFFSET
+        st.caption(f"💾 State file: `{STATE_FILE}` — last saved {mtime.strftime('%d %b %Y %H:%M:%S IST')}")
     else:
         st.caption(f"💾 State file `{STATE_FILE}` will be created when first position is opened.")
 
