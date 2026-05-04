@@ -47,14 +47,22 @@ _STORE = {
     "live_running":    False,
     "live_thread":     None,
     "live_log":        [],
-    "positions":       {},       # symbol → position dict
-    "closed_trades":   [],       # list of closed trade dicts
+    "positions":       {},
+    "closed_trades":   [],
     "daily_pnl":       0.0,
     "portfolio_pnl":   0.0,
-    "signals":         [],       # latest screener output
+    "signals":         [],
     "circuit_breaker": False,
+    "last_scan_time":  None,
+    "last_error":      None,
+    "ticker_status":   {},   # sym → {adx, rsi, regime, vol_ratio, signal_str}
     "lock":            threading.Lock(),
 }
+
+def _is_engine_alive() -> bool:
+    """Check if background thread is actually running."""
+    t = _STORE.get("live_thread")
+    return t is not None and t.is_alive()
 
 STATE_FILE = "algo_positions.json"
 
@@ -603,6 +611,116 @@ def compute_metrics(trades: pd.DataFrame, capital: float = 200_000) -> dict:
 # ─────────────────────────────────────────────────────────────────────────────
 # STOCK SCREENER
 # ─────────────────────────────────────────────────────────────────────────────
+def _scan_with_health(tickers: list, capital: float, risk_pct: float):
+    """
+    Runs scan_signals and simultaneously builds per-ticker health dict showing
+    raw indicator values and which condition blocked each strategy.
+    Returns (signals_list, ticker_health_dict)
+    """
+    signals = scan_signals(tickers, capital, risk_pct)
+    sig_syms = {s["symbol"] for s in signals}
+    ticker_status = {}
+
+    for raw in tickers:
+        raw = raw.strip()
+        if not raw:
+            continue
+        yf_ticker = raw if ("." in raw or "-" in raw or raw.startswith("^")) else raw + ".NS"
+        display   = raw
+        try:
+            df = fetch_daily(yf_ticker, period="1y")
+            if df.empty or len(df) < 60:
+                ticker_status[display] = {"error": "No data / too short", "blocked_by": "data"}
+                continue
+            df = add_indicators(df)
+            df = detect_regime(df)
+            last = df.iloc[-1]
+            prev = df.iloc[-2]
+
+            adx_v   = round(float(last["adx14"]), 1)
+            rsi_v   = round(float(last["rsi14"]), 1)
+            pdi_v   = round(float(last["pdi"]),   1)
+            mdi_v   = round(float(last["mdi"]),   1)
+            ema9_v  = round(float(last["ema9"]),  2)
+            ema21_v = round(float(last["ema21"]), 2)
+            ema50_v = round(float(last["ema50"]), 2)
+            close_v = round(float(last["Close"]), 2)
+            vol_r   = round(float(last["vol_ratio"]), 2)
+            bbl_v   = round(float(last["bb_lower"]), 2)
+            bbm_v   = round(float(last["bb_mid"]),   2)
+            regime  = last["regime"]
+
+            # Check each strategy condition
+            strat_status = {}
+
+            # EMA Swing
+            cross_up = prev["ema9"] <= prev["ema21"] and last["ema9"] > last["ema21"]
+            trend_ok = adx_v > 22 and pdi_v > mdi_v and close_v > ema50_v
+            if display in sig_syms:
+                ema_status = "✅ SIGNAL"
+            elif not cross_up and not trend_ok:
+                ema_status = f"⛔ No cross (EMA9 {ema9_v:.0f} vs EMA21 {ema21_v:.0f}) & ADX {adx_v}<22"
+            elif not cross_up:
+                ema_status = f"⛔ No EMA9/21 cross (EMA9={ema9_v:.0f}, EMA21={ema21_v:.0f})"
+            elif not trend_ok:
+                ema_status = f"⛔ Trend fail: ADX={adx_v} +DI={pdi_v} -DI={mdi_v} vs EMA50={ema50_v:.0f}"
+            else:
+                ema_status = "✅ SIGNAL"
+            strat_status["EMA Swing"] = ema_status
+
+            # Momentum Breakout
+            hh20    = float(df["High"].iloc[-21:-1].max())
+            brk     = close_v > hh20
+            vol_ok  = vol_r > 1.3
+            adx_ok  = adx_v > 20
+            if display in sig_syms:
+                brk_status = "✅ SIGNAL"
+            elif not brk:
+                brk_status = f"⛔ No breakout: Close {close_v} ≤ 20d-High {hh20:.2f}"
+            elif not vol_ok:
+                brk_status = f"⛔ Low volume: {vol_r}× (need >1.3×)"
+            elif not adx_ok:
+                brk_status = f"⛔ ADX {adx_v} < 20 (weak trend)"
+            else:
+                brk_status = "✅ SIGNAL"
+            strat_status["Breakout"] = brk_status
+
+            # Mean Reversion
+            rng  = adx_v < 22
+            ovs  = rsi_v < 35 and close_v < bbl_v
+            if display in sig_syms:
+                rev_status = "✅ SIGNAL"
+            elif not rng:
+                rev_status = f"⛔ Not ranging: ADX {adx_v} ≥ 22 (need <22)"
+            elif rsi_v >= 35:
+                rev_status = f"⛔ RSI {rsi_v} not oversold (need <35)"
+            elif close_v >= bbl_v:
+                rev_status = f"⛔ Close {close_v} > BB-Lower {bbl_v:.2f}"
+            else:
+                rev_status = "✅ SIGNAL"
+            strat_status["Mean Reversion"] = rev_status
+
+            has_signal = display in sig_syms
+            blocked_by = "signal!" if has_signal else (
+                "no-cross" if "No EMA" in ema_status else
+                "no-breakout" if "No breakout" in brk_status else
+                "trend/ADX" if not trend_ok else "ranging/RSI"
+            )
+            ticker_status[display] = {
+                "close": close_v, "adx": adx_v, "rsi": rsi_v,
+                "pdi": pdi_v, "mdi": mdi_v, "vol_ratio": vol_r,
+                "regime": regime, "ema9": ema9_v, "ema21": ema21_v,
+                "ema50": ema50_v, "bb_lower": bbl_v, "bb_mid": bbm_v,
+                "strat_status": strat_status,
+                "has_signal": has_signal,
+                "blocked_by": blocked_by,
+            }
+        except Exception as e:
+            ticker_status[display] = {"error": str(e), "blocked_by": "error"}
+
+    return signals, ticker_status
+
+
 def scan_signals(tickers: list, capital: float, risk_pct: float) -> list:
     """
     Scans each ticker for live signals from all 3 strategies.
@@ -806,18 +924,24 @@ def _log(store, msg: str):
 
 
 def live_loop(dhan: DhanAPI, settings: dict, store: dict):
-    _log(store, "🟢 Live trading engine started")
+    _log(store, f"🟢 Live trading engine started at {fmt_ist()}")
+    paper_mode = settings.get("paper_mode", True)
 
     while store["live_running"]:
         try:
             now = now_ist()
             mo  = now.replace(hour=9,  minute=15, second=0, microsecond=0)
             mc  = now.replace(hour=15, minute=20, second=0, microsecond=0)
+            market_open = mo <= now <= mc
 
-            if not (mo <= now <= mc):
-                _log(store, "⏳ Market closed — waiting 60s")
+            # Paper mode runs 24/7; live mode only during market hours
+            if not paper_mode and not market_open:
+                _log(store, f"⏳ Market closed (IST {now.strftime('%H:%M')}) — next open 09:15 IST")
                 time.sleep(60)
                 continue
+
+            if paper_mode and not market_open:
+                _log(store, f"📄 Paper mode — scanning outside market hours ({now.strftime('%H:%M IST')})")
 
             # Circuit breaker check
             with store["lock"]:
@@ -826,16 +950,31 @@ def live_loop(dhan: DhanAPI, settings: dict, store: dict):
                     time.sleep(60)
                     continue
 
-            # ── Scan for signals ──────────────────────────────────────────
-            watchlist = settings.get("watchlist", NIFTY_50[:5])
-            _log(store, f"🔍 Scanning {len(watchlist)} ticker(s): {', '.join(watchlist[:5])}{'…' if len(watchlist)>5 else ''}")
-            signals = scan_signals(watchlist, settings["capital"], settings["risk_pct"])
+            # ── Scan for signals + build ticker health ────────────────────
+            watchlist = settings.get("watchlist", [])
+            if not watchlist:
+                _log(store, "⚠️ No tickers configured. Add tickers in the Live tab.")
+                time.sleep(30)
+                continue
+
+            _log(store, f"🔍 Scanning {len(watchlist)} ticker(s): {', '.join(str(w) for w in watchlist[:6])}{'…' if len(watchlist)>6 else ''}")
+
+            signals, ticker_status = _scan_with_health(
+                watchlist, settings["capital"], settings["risk_pct"]
+            )
 
             with store["lock"]:
-                store["signals"] = signals
+                store["signals"]         = signals
+                store["ticker_status"]   = ticker_status
+                store["last_scan_time"]  = fmt_ist()
+
+            _log(store, f"📊 Scan complete — {len(signals)} signal(s) found across {len(ticker_status)} tickers")
+            if not signals:
+                blocked = [f"{s}({v['blocked_by']})" for s,v in ticker_status.items() if v.get("blocked_by")]
+                if blocked:
+                    _log(store, f"   No signal reasons: {', '.join(blocked[:6])}")
 
             if signals:
-                _log(store, f"📊 {len(signals)} signal(s) found")
                 with store["lock"]:
                     positions = dict(store["positions"])
                     daily_pnl = store["daily_pnl"]
@@ -846,40 +985,29 @@ def live_loop(dhan: DhanAPI, settings: dict, store: dict):
                     with store["lock"]:
                         store["circuit_breaker"] = True
                     _log(store, f"🔴 Daily loss limit hit ({rc['daily_loss_pct']:.2f}%). CB activated.")
-
                 elif not rc["positions_ok"]:
-                    _log(store, f"⚠️ Max positions ({rc['position_count']}) reached — skipping new entries")
-
+                    _log(store, f"⚠️ Max positions ({rc['position_count']}) reached")
                 elif not rc["deployment_ok"]:
                     _log(store, f"⚠️ Max deployment ({rc['deployment_pct']:.1f}%) reached")
-
                 else:
                     with store["lock"]:
                         existing = set(store["positions"].keys())
-
                     for sig in signals[:3]:
                         if sig["symbol"] in existing:
                             continue
-
                         _log(store, (f"📈 {sig['symbol']} | {sig['strategy']} | "
                                      f"Entry ₹{sig['entry']} | SL ₹{sig['sl']} | "
                                      f"Tgt ₹{sig['target']} | Qty {sig['qty']} | "
                                      f"Risk ₹{sig['max_risk']:,.0f}"))
-
-                        if settings.get("auto_trade", False):
+                        if settings.get("auto_trade", False) and not paper_mode:
                             _log(store, f"  ↳ Placing BUY order for {sig['symbol']}…")
-                            # Place order via Dhan
                             resp = dhan.place_order(
-                                symbol=sig["symbol"],
-                                security_id="0",   # map symbol→securityId in production
-                                qty=sig["qty"],
-                                txn="BUY",
+                                symbol=sig["symbol"], security_id="0",
+                                qty=sig["qty"], txn="BUY",
                                 order_type="MARKET",
                                 product="CNC" if "Swing" in sig["style"] else "INTRADAY",
                             )
                             _log(store, f"  ↳ Order response: {resp}")
-
-                        # Paper-track position
                         with store["lock"]:
                             store["positions"][sig["symbol"]] = {
                                 "strategy":   sig["strategy"],
@@ -893,7 +1021,7 @@ def live_loop(dhan: DhanAPI, settings: dict, store: dict):
                                 "entry_date": now_ist().strftime("%Y-%m-%d"),
                             }
                         _save_state()
-                        break  # one new position per scan cycle
+                        break
 
             # ── Monitor existing positions ────────────────────────────────
             with store["lock"]:
@@ -904,37 +1032,34 @@ def live_loop(dhan: DhanAPI, settings: dict, store: dict):
                 ltp = get_ltp_yf(sym)
                 if ltp <= 0:
                     ltp = pos["entry"]
-
                 pnl_pct = (ltp - pos["entry"]) / pos["entry"]
-
                 with store["lock"]:
                     if sym in store["positions"]:
                         store["positions"][sym]["ltp"]     = ltp
                         store["positions"][sym]["pnl_pct"] = pnl_pct
 
-                if ltp <= pos["sl"]:
+                if pos.get("sl") and ltp <= pos["sl"]:
                     _log(store, f"🔴 SL hit: {sym} @ ₹{ltp:.2f} | P&L: {pnl_pct*100:+.2f}%")
                     with store["lock"]:
                         store["daily_pnl"] += (ltp - pos["entry"]) * pos["qty"]
                         store["closed_trades"].append({
                             "symbol": sym, "exit_reason": "SL",
-                            "entry": pos["entry"], "exit": ltp,
-                            "pnl_rs": (ltp - pos["entry"]) * pos["qty"],
-                            "pnl_pct": pnl_pct * 100,
+                            "entry": pos["entry"], "exit": round(ltp, 2),
+                            "pnl_rs": round((ltp - pos["entry"]) * pos["qty"], 2),
+                            "pnl_pct": round(pnl_pct * 100, 3),
                             "time": fmt_ist(),
                         })
                         store["positions"].pop(sym, None)
                     state_changed = True
-
-                elif ltp >= pos["target"]:
+                elif pos.get("target") and ltp >= pos["target"]:
                     _log(store, f"🟢 Target hit: {sym} @ ₹{ltp:.2f} | P&L: {pnl_pct*100:+.2f}%")
                     with store["lock"]:
                         store["daily_pnl"] += (ltp - pos["entry"]) * pos["qty"]
                         store["closed_trades"].append({
                             "symbol": sym, "exit_reason": "Target",
-                            "entry": pos["entry"], "exit": ltp,
-                            "pnl_rs": (ltp - pos["entry"]) * pos["qty"],
-                            "pnl_pct": pnl_pct * 100,
+                            "entry": pos["entry"], "exit": round(ltp, 2),
+                            "pnl_rs": round((ltp - pos["entry"]) * pos["qty"], 2),
+                            "pnl_pct": round(pnl_pct * 100, 3),
                             "time": fmt_ist(),
                         })
                         store["positions"].pop(sym, None)
@@ -943,7 +1068,6 @@ def live_loop(dhan: DhanAPI, settings: dict, store: dict):
             if state_changed:
                 _save_state()
 
-            # Update portfolio P&L
             with store["lock"]:
                 unrealised = sum(
                     p.get("pnl_pct", 0) * p["entry"] * p["qty"]
@@ -952,14 +1076,18 @@ def live_loop(dhan: DhanAPI, settings: dict, store: dict):
                 store["portfolio_pnl"] = store["daily_pnl"] + unrealised
 
             interval = settings.get("scan_interval", 60)
-            _log(store, f"💼 Portfolio P&L: ₹{store['portfolio_pnl']:+,.0f} | next scan in {interval}s")
+            _log(store, f"💼 P&L ₹{store['portfolio_pnl']:+,.0f} | next scan in {interval}s")
 
         except Exception as e:
-            _log(store, f"❌ Error: {e}")
+            import traceback
+            err_msg = traceback.format_exc()
+            with store["lock"]:
+                store["last_error"] = f"{fmt_ist()} — {err_msg}"
+            _log(store, f"❌ Thread error: {e}")
 
         time.sleep(settings.get("scan_interval", 60))
 
-    _log(store, "🔴 Live trading engine stopped")
+    _log(store, f"🔴 Live trading engine stopped at {fmt_ist()}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1522,10 +1650,19 @@ def page_live(settings: dict):
     st.title("🤖 Live Trading Engine")
 
     with _STORE["lock"]:
-        live_on = _STORE["live_running"]
-        cb      = _STORE["circuit_breaker"]
-        log     = list(_STORE["live_log"])
-        sigs    = list(_STORE["signals"])
+        live_on      = _STORE["live_running"] and _is_engine_alive()
+        cb           = _STORE["circuit_breaker"]
+        log          = list(_STORE["live_log"])
+        sigs         = list(_STORE["signals"])
+        last_scan    = _STORE.get("last_scan_time")
+        last_error   = _STORE.get("last_error")
+        ticker_health= dict(_STORE.get("ticker_status", {}))
+
+    # Sync: if thread died unexpectedly, reset flag
+    if _STORE["live_running"] and not _is_engine_alive():
+        with _STORE["lock"]:
+            _STORE["live_running"] = False
+        live_on = False
 
     paper_mode  = settings.get("paper_mode", True)
     dhan_token  = settings.get("dhan_token", "")
@@ -1634,6 +1771,11 @@ def page_live(settings: dict):
 
     st.markdown("---")
 
+    # ── Show last error prominently if any ───────────────────────────────────
+    if last_error:
+        with st.expander("❌ Last Thread Error — click to expand", expanded=True):
+            st.code(last_error, language="text")
+
     # ── Live metrics ─────────────────────────────────────────────────────────
     with _STORE["lock"]:
         daily_pnl = _STORE["daily_pnl"]
@@ -1646,49 +1788,79 @@ def page_live(settings: dict):
     lm2.metric("Open Positions", len(positions))
     lm3.metric("Closed Today",   len(closed))
     lm4.metric("Mode",           "📄 Paper" if paper_mode else "💰 Live")
-    lm5.metric("Active Strats",  len(live_strats))
+    lm5.metric("Last Scan",      last_scan or "—")
 
-    # ── Strategy Status Cards ────────────────────────────────────────────────
-    st.markdown("### 📡 Strategy Status Monitor")
-    st.caption("Scans last available data for each strategy — shows current state per ticker")
+    # ── Ticker Health Dashboard ───────────────────────────────────────────────
+    st.markdown("### 🩺 Ticker Health — Why No Signals?")
+    st.caption("Shows raw indicator values and which condition is blocking each strategy signal.")
 
-    if sigs or st.button("🔍 Check Strategy Status Now", key="check_strat_status"):
-        if not sigs:
-            with st.spinner(f"Scanning {len(live_watchlist)} ticker(s)…"):
-                fresh = scan_signals(
-                    live_watchlist,
-                    settings["capital"],
-                    settings["risk_pct"]
-                )
-            with _STORE["lock"]:
-                _STORE["signals"] = fresh
-            sigs = fresh
+    if st.button("🔬 Check Ticker Health Now", key="health_check", use_container_width=False):
+        with st.spinner(f"Fetching indicators for {len(live_watchlist)} ticker(s)…"):
+            _, fresh_health = _scan_with_health(
+                live_watchlist, settings["capital"], settings["risk_pct"]
+            )
+        with _STORE["lock"]:
+            _STORE["ticker_status"] = fresh_health
+        ticker_health = fresh_health
 
-        # Group by strategy
-        strat_groups = {}
-        for s in sigs:
-            strat_groups.setdefault(s["strategy"], []).append(s)
+    if ticker_health:
+        health_rows = []
+        for sym, h in ticker_health.items():
+            if "error" in h:
+                health_rows.append({
+                    "Ticker": sym, "Close": "—", "ADX": "—", "RSI": "—",
+                    "Regime": "—", "Vol×": "—",
+                    "EMA Swing": f"❌ {h['error'][:35]}",
+                    "Breakout": "—", "Mean Rev": "—", "Signal?": "❌",
+                })
+            else:
+                ss = h.get("strat_status", {})
+                health_rows.append({
+                    "Ticker":   sym,
+                    "Close":    h.get("close","—"),
+                    "ADX":      h.get("adx","—"),
+                    "RSI":      h.get("rsi","—"),
+                    "Regime":   REGIME_EMOJI.get(h.get("regime",""),"") + " " + h.get("regime","").replace("_"," "),
+                    "Vol×":     h.get("vol_ratio","—"),
+                    "EMA Swing": ss.get("EMA Swing","—"),
+                    "Breakout":  ss.get("Breakout","—"),
+                    "Mean Rev":  ss.get("Mean Reversion","—"),
+                    "Signal?":   "✅" if h.get("has_signal") else "⛔",
+                })
+        st.dataframe(pd.DataFrame(health_rows), use_container_width=True, hide_index=True, height=320)
 
-        all_strats = ["EMA Swing", "Momentum Breakout", "Mean Reversion"]
-        cols = st.columns(len(all_strats))
-        for col, sname in zip(cols, all_strats):
-            group = strat_groups.get(sname, [])
-            with col:
-                if group:
-                    st.success(f"**{sname}**  \n🟢 {len(group)} signal(s)")
-                    for g in group[:3]:
-                        st.markdown(
-                            f"**{g['symbol']}**  \n"
-                            f"Entry: ₹{g['entry']} | SL: ₹{g['sl']} | Tgt: ₹{g['target']}  \n"
-                            f"R:R {g['rr']}:1 | {REGIME_EMOJI.get(g['regime'],'')} {g['regime']}"
-                        )
-                else:
-                    reason = {
-                        "EMA Swing":         "Waiting for ADX>22 + EMA9 cross above EMA21 in uptrend",
-                        "Momentum Breakout": "Waiting for close above 20-day high + volume surge",
-                        "Mean Reversion":    "Waiting for RSI<35 + close below BB-lower in ranging market",
-                    }.get(sname, "")
-                    st.warning(f"**{sname}**  \n⚪ No signal  \n_{reason}_")
+        sig_count = sum(1 for h in ticker_health.values() if h.get("has_signal"))
+        if sig_count == 0:
+            adx_vals = [h["adx"] for h in ticker_health.values() if isinstance(h.get("adx"),(int,float))]
+            rsi_vals = [h["rsi"] for h in ticker_health.values() if isinstance(h.get("rsi"),(int,float))]
+            avg_adx = sum(adx_vals)/len(adx_vals) if adx_vals else 0
+            avg_rsi = sum(rsi_vals)/len(rsi_vals) if rsi_vals else 50
+            if avg_adx > 22:
+                advice = "Market is trending. EMA Swing / Breakout signals expected — wait for EMA9 to cross EMA21 or a 20-day high breakout with volume."
+            elif avg_adx < 18:
+                advice = "Market is ranging (ADX<18). Mean Reversion is your strategy — wait for RSI to drop below 35 and close below BB-Lower."
+            else:
+                advice = "Market in transition (ADX 18–22). Best to wait 1–2 days for regime to clarify before trading."
+            st.info(f"**No signals right now — this is normal.**  \n"
+                    f"Avg ADX: **{avg_adx:.1f}** | Avg RSI: **{avg_rsi:.1f}**  \n{advice}")
+    else:
+        st.info("Click **Check Ticker Health Now** to see real-time indicator values and why each ticker isn't generating a signal.")
+
+    st.markdown("---")
+
+    # ── Strategy Signal Status ────────────────────────────────────────────────
+    st.markdown("### 📡 Active Signals")
+    if sigs:
+        df_sig = pd.DataFrame([{
+            "Symbol":   s["symbol"], "Strategy": s["strategy"],
+            "Entry ₹":  s["entry"],  "SL ₹": s["sl"], "Target ₹": s["target"],
+            "Qty": s["qty"], "R:R": f"{s['rr']}:1",
+            "Regime": REGIME_EMOJI.get(s["regime"],"") + " " + s["regime"],
+            "Style": s["style"],
+        } for s in sigs])
+        st.dataframe(df_sig, use_container_width=True, hide_index=True)
+    else:
+        st.info("No active signals. Run ticker health check above to understand current market conditions.")
 
     st.markdown("---")
 
