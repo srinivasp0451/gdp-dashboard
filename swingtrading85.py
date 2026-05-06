@@ -55,10 +55,18 @@ WARMUP = {"1m":"7d","5m":"1mo","15m":"1mo","1h":"6mo","1d":"5y","1wk":"10y"}
 STRATEGIES = ["EMA Crossover","Anticipatory EMA","Elliott Wave","Wave Extrema","Simple Buy","Simple Sell"]
 SL_TYPES   = ["Custom Points","ATR Based","Risk Reward Based","Trailing SL","Auto SL",
                "EMA Reverse Crossover","Swing Low/High","Candle Low/High",
-               "Support/Resistance","Volatility Based","Cost-to-Cost + N Points Trailing SL"]
+               "Support/Resistance","Volatility Based","Cost-to-Cost + N Points Trailing SL",
+               "Trail Current Candle Low/High","Trail Previous Candle Low/High",
+               "Trail Current Swing Low/High","Trail Previous Swing Low/High",
+               "Trail ATR","Exit 70% at TP1 then Trail","Exit 50% C2C then Trail",
+               "Exit if SL Crosses & Not Improving"]
 TGT_TYPES  = ["Custom Points","ATR Based","Risk Reward Based","Trailing Target (Display Only)",
                "Auto Target","EMA Reverse Crossover","Swing High/Low","Candle High/Low",
-               "Support/Resistance","Volatility Based"]
+               "Support/Resistance","Volatility Based",
+               "Trail Current Candle High/Low","Trail Previous Candle High/Low",
+               "Trail Current Swing High/Low","Trail Previous Swing High/Low",
+               "Trail ATR","Exit 70% at TP1 then Trail","Exit 50% C2C then Trail",
+               "Exit if Profit Falls 50%"]
 CX_TYPES   = ["Simple Crossover","Custom Candle Size","ATR Based Candle Size"]
 DAYS_LIST  = ["Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday"]
 
@@ -370,6 +378,45 @@ def ratchet_sl(pos, ltp, cfg, df, bi):
         else:
             nsl=float(df["High"].iloc[min(bi,len(df)-1)])+av*.1
             if nsl<cur: pos["current_sl"]=round(nsl,2)
+    elif t in ("Trail Current Candle Low/High","Trail Previous Candle Low/High",
+                "Trail Current Swing Low/High","Trail Previous Swing Low/High","Trail ATR"):
+        # Which bar index to use for trail reference
+        if "Previous Candle" in t:
+            ref_i = max(0, bi-1)
+        elif "Previous Swing" in t:
+            # Find the most recent swing low/high before current bar
+            w = cfg.get("swing_window",20); s = max(0, bi-w)
+            ref_i = bi  # default
+            if sig==1:
+                # Find previous swing low (lowest of last w bars before current)
+                ref_i = max(0, bi-1)
+            else:
+                ref_i = max(0, bi-1)
+        else:
+            ref_i = bi  # current candle/swing
+        if "Candle" in t:
+            if sig==1:
+                nsl = float(df["Low"].iloc[ref_i]) - av*0.1
+                if nsl > cur: pos["current_sl"] = round(nsl, 2)
+            else:
+                nsl = float(df["High"].iloc[ref_i]) + av*0.1
+                if nsl < cur: pos["current_sl"] = round(nsl, 2)
+        elif "Swing" in t:
+            w = cfg.get("swing_window",20); s = max(0, bi-w)
+            if sig==1:
+                nsl = float(df["Low"].iloc[s:bi+1].min()) - av*0.2
+                if nsl > cur: pos["current_sl"] = round(nsl, 2)
+            else:
+                nsl = float(df["High"].iloc[s:bi+1].max()) + av*0.2
+                if nsl < cur: pos["current_sl"] = round(nsl, 2)
+        elif t == "Trail ATR":
+            mult = cfg.get("atr_sl_mult", 1.5)
+            if sig==1:
+                nsl = ltp - av*mult
+                if nsl > cur: pos["current_sl"] = round(nsl, 2)
+            else:
+                nsl = ltp + av*mult
+                if nsl < cur: pos["current_sl"] = round(nsl, 2)
     elif t=="Cost-to-Cost + N Points Trailing SL":
         K=cfg.get("ctc_trigger_points",3); N=cfg.get("ctc_offset_points",2)
         dist=cfg.get("sl_points",10); pif=(ltp-ep) if sig==1 else (ep-ltp)
@@ -379,6 +426,11 @@ def ratchet_sl(pos, ltp, cfg, df, bi):
         else:
             nsl = ltp+dist if pif<K else (ep-N if pif<dist else ltp+(dist-N))
             if nsl<cur: pos["current_sl"]=round(nsl,2)
+    # Safety: clamp SL so it never jumps more than 10*ATR in one update (prevents corrupt exit)
+    _max_jump = av * 10
+    new_cur = pos["current_sl"]
+    if sig==1 and new_cur < cur - _max_jump: pos["current_sl"] = cur  # revert
+    if sig==-1 and new_cur > cur + _max_jump: pos["current_sl"] = cur  # revert
     return pos
 
 def check_exit(pos, row, cfg):
@@ -415,8 +467,13 @@ def generate_signals(df, cfg):
         mnd=cfg.get("min_delta",0.0); mxd=cfg.get("max_delta",1e9)
         cxt=cfg.get("crossover_type","Simple Crossover"); cxsz=cfg.get("custom_candle_size",10)
         adx_s=None; rsi_s=None
-        if cfg.get("enable_adx",False): adx_s,_,_=calc_adx(df,cfg.get("adx_period",14))
-        if cfg.get("enable_rsi",False): rsi_s=calc_rsi(df["Close"],cfg.get("rsi_period",14))
+        if cfg.get("enable_adx",False):
+            _adx_res=calc_adx(df,cfg.get("adx_period",14))
+            adx_s=_adx_res[0] if isinstance(_adx_res,tuple) else _adx_res
+            adx_s=adx_s.squeeze() if hasattr(adx_s,"squeeze") else adx_s
+        if cfg.get("enable_rsi",False):
+            rsi_s=calc_rsi(df["Close"],cfg.get("rsi_period",14))
+            rsi_s=rsi_s.squeeze() if hasattr(rsi_s,"squeeze") else rsi_s
         for i in range(1,n):
             f0,f1=float(fe.iloc[i]),float(fe.iloc[i-1]); s0,s1=float(se_.iloc[i]),float(se_.iloc[i-1])
             ang=cx_angle(fe,se_,i); delta=abs(f0-s0)
@@ -451,7 +508,7 @@ def generate_signals(df, cfg):
                 if td in ("Both","Short Only"): sigs.iloc[i]=-1; reas.iloc[i]=f"Anticipatory SELL | Gap={gn:.4f}"
     elif strat=="Wave Extrema":
         try:
-            from scipy.signal import argrelextrema
+            from scipy.signal import argrelextrema  # pip install scipy
             lb=cfg.get("wave_extrema_lookback",50); order=max(3,cfg.get("wave_order",5))
             hi_idx=set(argrelextrema(df["High"].values,np.greater,order=order)[0])
             lo_idx=set(argrelextrema(df["Low"].values,np.less,order=order)[0])
@@ -595,6 +652,7 @@ def live_thread_fn(ticker,period,iv,cfg,stop_ev,dhan_cfg):
     _set("thread_alive",True); last_fetch=0.0; cached_df=None; last_bar_dt=None; last_exit=0.0; first_fetch_done=False
     while True:
         _set("thread_last_beat",time.time())
+        _set("thread_last_beat",time.time())
         stop_req=stop_ev.is_set(); has_pos=_get("current_position") is not None
         if stop_req and not has_pos: break
         try:
@@ -660,12 +718,16 @@ def live_thread_fn(ticker,period,iv,cfg,stop_ev,dhan_cfg):
                 sl=pos["current_sl"]; tgt=pos["target"]; sig=pos["signal_type"]; ep=pos["entry_price"]
                 xp=None; xr=None
                 min_move=0.01; price_moved=abs(ltp-ep)>=min_move
-                if cfg.get("sl_type")=="EMA Reverse Crossover" or tgt_t=="EMA Reverse Crossover":
-                    fe2=ema(df["Close"],cfg.get("fast_ema",9)); se3=ema(df["Close"],cfg.get("slow_ema",15))
-                    if len(fe2)>=2:
-                        f0,f1=float(fe2.iloc[-1]),float(fe2.iloc[-2]); s0,s1=float(se3.iloc[-1]),float(se3.iloc[-2])
-                        if sig==1 and f1>=s1 and f0<s0: xp=ltp; xr="EMA Rev X Exit"
-                        elif sig==-1 and f1<=s1 and f0>s0: xp=ltp; xr="EMA Rev X Exit"
+                _sl_is_ema_rev = cfg.get("sl_type")=="EMA Reverse Crossover"
+                _tgt_is_ema_rev = tgt_t=="EMA Reverse Crossover"
+                if _sl_is_ema_rev or _tgt_is_ema_rev:
+                    try:
+                        fe2=ema(df["Close"],cfg.get("fast_ema",9)); se3=ema(df["Close"],cfg.get("slow_ema",15))
+                        if len(fe2)>=2:
+                            f0,f1=float(fe2.iloc[-1]),float(fe2.iloc[-2]); s0,s1=float(se3.iloc[-1]),float(se3.iloc[-2])
+                            if sig==1 and f1>=s1 and f0<s0: xp=ltp; xr="EMA Rev X Exit"
+                            elif sig==-1 and f1<=s1 and f0>s0: xp=ltp; xr="EMA Rev X Exit"
+                    except: pass
                 if xp is None and price_moved:
                     if sig==1:
                         if ltp<=sl: xp=ltp; xr="SL Hit"
@@ -1395,6 +1457,14 @@ h1,h2,h3,h4{font-family:'Syne',sans-serif!important;color:#e6edf3!important;}
 p,span,div,label,li{color:#e6edf3!important;}
 .stMarkdown p,.stMarkdown span,.stMarkdown div{color:#e6edf3!important;}
 input,select,textarea{color:#e6edf3!important;background:#1f2733!important;}
+[data-baseweb="select"] *,[data-baseweb="select"] input,[data-baseweb="select"] span{color:#e6edf3!important;}
+[data-baseweb="select"] [role="option"]{color:#e6edf3!important;background:#1f2733!important;}
+[data-baseweb="popover"] li,[data-baseweb="popover"] [role="option"]{color:#e6edf3!important;background:#1f2733!important;}
+[data-baseweb="popover"] li:hover,[data-baseweb="popover"] [role="option"]:hover{background:#2d3748!important;}
+.stSelectbox [data-baseweb="select"] div{color:#e6edf3!important;}
+[role="listbox"] li,[role="listbox"] span,[role="option"]{color:#e6edf3!important;background:#161b22!important;}
+.stMultiSelect [data-baseweb="tag"]{background:#2d3748!important;color:#e6edf3!important;}
+[data-testid="stTimeInput"] input{color:#e6edf3!important;}
 .stSelectbox label,.stNumberInput label,.stTextInput label,.stCheckbox label,.stMultiSelect label,.stTimeInput label,.stRadio label{color:#e6edf3!important;}
 [data-testid="metric-container"]{background:#1f2733;border:1px solid rgba(255,255,255,0.08);border-radius:10px;padding:12px!important;}
 [data-testid="metric-container"] label,[data-testid="metric-container"] div{color:#e6edf3!important;}
@@ -1569,9 +1639,11 @@ def main():
             t=threading.Thread(target=live_thread_fn,args=(sym,pd_,iv,cfg,se,dhan_cfg),daemon=True)
             st.session_state.live_thread=t; t.start()
             st.toast("🟢 Live trading started!",icon="✅")
+            st.rerun()
         if stop_btn and st.session_state.live_running:
             if st.session_state.stop_event: st.session_state.stop_event.set()
             st.session_state.live_running=False; st.toast("⏹ Stop sent — closes after current trade exits.")
+            st.rerun()
         if sq_btn:
             pos=_get("current_position")
             if pos is not None:
@@ -1591,7 +1663,7 @@ def main():
                 st.toast(f"✅ Squareoff done. PnL: {pnl_sq:+.2f} pts")
             else: st.toast("ℹ️ No open position.")
 
-        @st.fragment(run_every=2 if st.session_state.live_running else None)
+        @st.fragment(run_every=2)
         def _live_panel():
             _pos=_get("current_position"); _lc=_get("last_candle") or {}
             _ld=_get("live_data"); _logs=_get("live_log",[]) or []
@@ -1601,7 +1673,13 @@ def main():
             else:
                 _pnl=_get("current_pnl",0.0)
             ltp_disp=f"{float(_ltp):.4f}" if _ltp is not None else "⏳ fetching…"
-            fetch_ts=_lc.get("fetch_ts","–"); rbadge="🟢 RUNNING" if _running else "⚪ STOPPED"
+            fetch_ts=_lc.get("fetch_ts","–")
+            _t_alive=_get("thread_alive",False); _t_beat=_get("thread_last_beat",0)
+            _t_lag=time.time()-_t_beat if _t_beat else 999
+            if _running and _t_lag>20: rbadge=f"⚠️ THREAD LAG {_t_lag:.0f}s — data stale"
+            elif _running and not _t_alive and _t_lag>10: rbadge="🔴 THREAD DIED — Stop & Start again"
+            elif _running: rbadge="🟢 RUNNING"
+            else: rbadge="⚪ STOPPED"
             st.markdown(f'<div class="cfg-bar" style="display:flex;flex-wrap:wrap;gap:10px;align-items:center;"><b>{rbadge}</b><span style="color:#8b949e;">|</span><b>{sym}</b> {iv}/{pd_} · <b>{strat}</b><span style="color:#8b949e;">|</span>EMA {fast_ema}/{slow_ema}<span style="color:#8b949e;">|</span>SL:{sl_t}({sl_pts}pt) Tgt:{tgt_t}({tgt_pts}pt) Qty:{qty}<span style="color:#8b949e;">|</span><span style="color:#40c4ff;font-size:16px;font-weight:800;">LTP {ltp_disp}</span><span style="color:#8b949e;font-size:10px;"> @ {fetch_ts}</span></div>',unsafe_allow_html=True)
             gp=[]
             if en_tf: gp.append(f"⏰ Window: <b>{ts_}–{te_} IST</b>")
@@ -1673,7 +1751,7 @@ def main():
 
     with tab_th:
         st.markdown("### Trade History (Live Only)")
-        @st.fragment(run_every=4 if st.session_state.live_running else None)
+        @st.fragment(run_every=4)
         def _history_panel():
             _lh=_get("trade_history") or []; _all=_lh
             _lc2=_get("last_candle") or {}
