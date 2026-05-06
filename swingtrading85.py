@@ -78,8 +78,12 @@ def init_ss():
                 "stop_event":None,"live_thread":None}.items():
         if k not in st.session_state: st.session_state[k] = v
 
-def _mkt_filter(df, iv):
+def _mkt_filter(df, iv, ticker=""):
+    """Only apply NSE/BSE market hours filter for Indian market symbols."""
     if iv in ("1d","1wk") or df is None or len(df)==0: return df
+    # Skip filter for global/crypto assets
+    _is_indian = any(x in str(ticker).upper() for x in ["NSEI","NSEBANK","BSESN","NSE","BSE"])
+    if not _is_indian: return df
     try:
         idx = df.index
         if idx.tz is None: idx = idx.tz_localize("UTC")
@@ -122,13 +126,15 @@ def _fetch_yf(ticker, period, iv):
 
 @st.cache_data(ttl=60, show_spinner=False)
 def fetch_data(ticker, period, iv, min_bars=200):
-    df = _fetch_http(ticker,period,iv) or _fetch_yf(ticker,period,iv)
-    if df is None: return None
-    df = _mkt_filter(df, iv)
+    df = _fetch_http(ticker,period,iv)
+    if df is None or len(df)==0: df = _fetch_yf(ticker,period,iv)
+    if df is None or len(df)==0: return None
+    df = _mkt_filter(df, iv, ticker)
     if len(df)>=min_bars: return df
     wup = WARMUP.get(iv,"1y")
     if wup==period: return df
-    dfw = _fetch_http(ticker,wup,iv) or _fetch_yf(ticker,wup,iv)
+    dfw = _fetch_http(ticker,wup,iv)
+    if dfw is None or len(dfw)==0: dfw = _fetch_yf(ticker,wup,iv)
     if dfw is None or len(dfw)<=len(df): return df
     try:
         loc = dfw.index.get_indexer([df.index[0]],method="nearest")[0]
@@ -468,12 +474,14 @@ def generate_signals(df, cfg):
         cxt=cfg.get("crossover_type","Simple Crossover"); cxsz=cfg.get("custom_candle_size",10)
         adx_s=None; rsi_s=None
         if cfg.get("enable_adx",False):
-            _adx_res=calc_adx(df,cfg.get("adx_period",14))
-            adx_s=_adx_res[0] if isinstance(_adx_res,tuple) else _adx_res
-            adx_s=adx_s.squeeze() if hasattr(adx_s,"squeeze") else adx_s
+            try:
+                _adx_res=calc_adx(df,cfg.get("adx_period",14))
+                adx_s=pd.Series(_adx_res[0].values if isinstance(_adx_res,tuple) else _adx_res.values, index=df.index)
+            except: adx_s=None
         if cfg.get("enable_rsi",False):
-            rsi_s=calc_rsi(df["Close"],cfg.get("rsi_period",14))
-            rsi_s=rsi_s.squeeze() if hasattr(rsi_s,"squeeze") else rsi_s
+            try:
+                rsi_s=pd.Series(calc_rsi(df["Close"],cfg.get("rsi_period",14)).values, index=df.index)
+            except: rsi_s=None
         for i in range(1,n):
             f0,f1=float(fe.iloc[i]),float(fe.iloc[i-1]); s0,s1=float(se_.iloc[i]),float(se_.iloc[i-1])
             ang=cx_angle(fe,se_,i); delta=abs(f0-s0)
@@ -656,14 +664,15 @@ def live_thread_fn(ticker,period,iv,cfg,stop_ev,dhan_cfg):
         stop_req=stop_ev.is_set(); has_pos=_get("current_position") is not None
         if stop_req and not has_pos: break
         try:
-            if time.time()-last_fetch>=2.5:
+            if time.time()-last_fetch>=3.0:
                 try:
-                    _http_wait()
                     df_new=_fetch_http(ticker,period,iv)
-                    if df_new is None or len(df_new)<2:
-                        _http_wait(2.0); df_new=_fetch_yf(ticker,period,iv)
+                    if df_new is None or (hasattr(df_new,'__len__') and len(df_new)<2):
+                        _http_wait(2.0)
+                        df_new2=_fetch_yf(ticker,period,iv)
+                        if df_new2 is not None and len(df_new2)>1: df_new=df_new2
                     if df_new is not None and len(df_new)>1:
-                        df_new=_mkt_filter(df_new,iv); cached_df=df_new; last_fetch=time.time()
+                        df_new=_mkt_filter(df_new,iv,ticker); cached_df=df_new; last_fetch=time.time()
                         lc_row=df_new.iloc[-1]
                         ltp_v=round(float(lc_row["Close"]),4)
                         # Try real-time price patch
@@ -700,7 +709,9 @@ def live_thread_fn(ticker,period,iv,cfg,stop_ev,dhan_cfg):
                                 log(f"  Dhan: {r}")
                         first_fetch_done=True; log(f"[DATA] LTP={ltp_v:.4f} | {ts_to_ist(df_new.index[-1])}")
                     else: log("[WARN] Fetch empty")
-                except Exception as ex: log(f"[FETCH ERR] {ex}"); stop_ev.wait(2.0); continue
+                except Exception as ex:
+                    log(f"[FETCH ERR] {type(ex).__name__}: {ex}")
+                    stop_ev.wait(1.0); continue
             if cached_df is None or len(cached_df)<3: stop_ev.wait(1.0); continue
             df=cached_df; ltp=_get("live_ltp") or float(df["Close"].iloc[-1])
             # Trailing SL
@@ -1453,18 +1464,31 @@ CSS="""<style>
 @import url('https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=Syne:wght@400;700;800&display=swap');
 html,body,[data-testid="stAppViewContainer"]{background:#0d1117!important;color:#e6edf3!important;font-family:'Space Mono',monospace!important;}
 [data-testid="stSidebar"]{background:#161b22!important;border-right:1px solid rgba(255,255,255,0.08)!important;}
+[data-testid="stSidebar"] *{color:#e6edf3!important;}
 h1,h2,h3,h4{font-family:'Syne',sans-serif!important;color:#e6edf3!important;}
 p,span,div,label,li{color:#e6edf3!important;}
 .stMarkdown p,.stMarkdown span,.stMarkdown div{color:#e6edf3!important;}
 input,select,textarea{color:#e6edf3!important;background:#1f2733!important;}
-[data-baseweb="select"] *,[data-baseweb="select"] input,[data-baseweb="select"] span{color:#e6edf3!important;}
-[data-baseweb="select"] [role="option"]{color:#e6edf3!important;background:#1f2733!important;}
-[data-baseweb="popover"] li,[data-baseweb="popover"] [role="option"]{color:#e6edf3!important;background:#1f2733!important;}
-[data-baseweb="popover"] li:hover,[data-baseweb="popover"] [role="option"]:hover{background:#2d3748!important;}
-.stSelectbox [data-baseweb="select"] div{color:#e6edf3!important;}
-[role="listbox"] li,[role="listbox"] span,[role="option"]{color:#e6edf3!important;background:#161b22!important;}
+/* Dropdowns - aggressive white text */
+[data-baseweb="select"],[data-baseweb="select"] *{color:#e6edf3!important;background-color:#1f2733!important;}
+[data-baseweb="select"] input{color:#e6edf3!important;}
+[data-baseweb="select"] [data-testid="stMarkdownContainer"]{color:#e6edf3!important;}
+[data-baseweb="popover"] *{color:#e6edf3!important;background:#1a1f2e!important;}
+[data-baseweb="popover"] li{color:#e6edf3!important;background:#1a1f2e!important;padding:8px 12px!important;}
+[data-baseweb="popover"] li:hover{background:#2d3748!important;}
+[role="listbox"],[role="listbox"] *{color:#e6edf3!important;background:#1a1f2e!important;}
+[role="option"]{color:#e6edf3!important;background:#1a1f2e!important;}
+[aria-selected="true"]{background:#2d3748!important;color:#00e676!important;}
+.stSelectbox > div > div{background:#1f2733!important;color:#e6edf3!important;border-color:rgba(255,255,255,0.1)!important;}
+.stSelectbox > div > div > div{color:#e6edf3!important;}
+.stMultiSelect > div > div{background:#1f2733!important;color:#e6edf3!important;}
 .stMultiSelect [data-baseweb="tag"]{background:#2d3748!important;color:#e6edf3!important;}
-[data-testid="stTimeInput"] input{color:#e6edf3!important;}
+[data-testid="stTimeInput"] input{color:#e6edf3!important;background:#1f2733!important;}
+/* Force all sidebar text white */
+section[data-testid="stSidebar"] label{color:#e6edf3!important;}
+section[data-testid="stSidebar"] p{color:#e6edf3!important;}
+section[data-testid="stSidebar"] span{color:#e6edf3!important;}
+section[data-testid="stSidebar"] div{color:#e6edf3!important;}
 .stSelectbox label,.stNumberInput label,.stTextInput label,.stCheckbox label,.stMultiSelect label,.stTimeInput label,.stRadio label{color:#e6edf3!important;}
 [data-testid="metric-container"]{background:#1f2733;border:1px solid rgba(255,255,255,0.08);border-radius:10px;padding:12px!important;}
 [data-testid="metric-container"] label,[data-testid="metric-container"] div{color:#e6edf3!important;}
