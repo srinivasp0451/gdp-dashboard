@@ -22,6 +22,12 @@ try:
 except ImportError:
     HAS_YF = False
 
+try:
+    from dhanhq import dhanhq as _dhanhq
+    HAS_DHAN = True
+except ImportError:
+    HAS_DHAN = False
+
 IST = ZoneInfo("Asia/Kolkata")
 APP_VERSION = "3.1.0"
 
@@ -864,6 +870,121 @@ def get_live_signal(df,strategy,cfg):
     return 0
 
 
+# ── Dhan Broker Integration ────────────────────────────────────────────────────
+_dhan_client = None   # cached dhanhq instance, reset on credential change
+
+def _get_dhan(cfg: dict):
+    """Return a dhanhq client from cfg credentials. Cache per session."""
+    global _dhan_client
+    cid   = cfg.get("dhan_client_id","").strip()
+    token = cfg.get("dhan_access_token","").strip()
+    if not HAS_DHAN:
+        return None, "dhanhq not installed. Run: pip install dhanhq"
+    if not cid or not token:
+        return None, "Dhan Client ID / Access Token missing"
+    try:
+        if _dhan_client is None:
+            _dhan_client = _dhanhq(cid, token)
+        return _dhan_client, None
+    except Exception as e:
+        return None, str(e)
+
+
+def dhan_place_entry(cfg: dict, side: int, ltp: float) -> dict:
+    """
+    Place entry order on Dhan.
+    side: 1=BUY signal, -1=SELL signal
+    Returns dict with order_id or error.
+    """
+    dhan, err = _get_dhan(cfg)
+    if err:
+        return {"status": "error", "message": err}
+
+    opts_on    = cfg.get("dhan_options", False)
+    order_type = cfg.get("dhan_entry_order_type", "MARKET")
+    price      = round(float(ltp), 2) if order_type == "LIMIT" else 0.0
+    qty        = int(cfg.get("dhan_qty", 1))
+
+    if opts_on:
+        # Options: BUY signal → CE BUY, SELL signal → PE BUY (pure buyer)
+        seg        = cfg.get("dhan_fno_exchange", "NSE_FNO")
+        sec_id     = cfg.get("dhan_ce_sec_id") if side == 1 else cfg.get("dhan_pe_sec_id")
+        tx_type    = "BUY"  # always buyer
+        prod_type  = "INTRADAY"
+    else:
+        seg        = cfg.get("dhan_exchange", "NSE_EQ") + "_EQ" if "_EQ" not in cfg.get("dhan_exchange","NSE_EQ") else cfg.get("dhan_exchange","NSE_EQ")
+        sec_id     = cfg.get("dhan_security_id", "1594")
+        tx_type    = "BUY" if side == 1 else "SELL"
+        prod_type  = cfg.get("dhan_product_type", "INTRADAY")
+
+    if not sec_id:
+        return {"status": "error", "message": "Security ID not configured"}
+
+    try:
+        resp = dhan.place_order(
+            transactionType = tx_type,
+            exchangeSegment = seg,
+            productType     = prod_type,
+            orderType       = order_type,
+            validity        = "DAY",
+            securityId      = str(sec_id),
+            quantity        = qty,
+            price           = price,
+            triggerPrice    = 0,
+        )
+        return {"status": "ok", "response": resp, "side": tx_type, "sec_id": sec_id,
+                "seg": seg, "prod": prod_type, "order_type": order_type, "price": price}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+
+def dhan_place_exit(cfg: dict, position: dict, ltp: float) -> dict:
+    """
+    Place exit order on Dhan.
+    For equity: reverses direction. For options: SELL the position we hold.
+    """
+    dhan, err = _get_dhan(cfg)
+    if err:
+        return {"status": "error", "message": err}
+
+    side       = position.get("side", 1)
+    opts_on    = cfg.get("dhan_options", False)
+    order_type = cfg.get("dhan_exit_order_type", "MARKET")
+    price      = round(float(ltp), 2) if order_type == "LIMIT" else 0.0
+    qty        = int(cfg.get("dhan_qty", 1))
+
+    if opts_on:
+        # Exit options position: sell the CE or PE we bought
+        seg     = cfg.get("dhan_fno_exchange", "NSE_FNO")
+        sec_id  = cfg.get("dhan_ce_sec_id") if side == 1 else cfg.get("dhan_pe_sec_id")
+        tx_type = "SELL"   # exit the long option position
+        prod    = "INTRADAY"
+    else:
+        seg     = cfg.get("dhan_exchange", "NSE_EQ") + "_EQ" if "_EQ" not in cfg.get("dhan_exchange","NSE_EQ") else cfg.get("dhan_exchange","NSE_EQ")
+        sec_id  = cfg.get("dhan_security_id", "1594")
+        tx_type = "SELL" if side == 1 else "BUY"   # reverse the entry direction
+        prod    = cfg.get("dhan_product_type", "INTRADAY")
+
+    if not sec_id:
+        return {"status": "error", "message": "Security ID not configured"}
+
+    try:
+        resp = dhan.place_order(
+            transactionType = tx_type,
+            exchangeSegment = seg,
+            productType     = prod,
+            orderType       = order_type,
+            validity        = "DAY",
+            securityId      = str(sec_id),
+            quantity        = qty,
+            price           = price,
+            triggerPrice    = 0,
+        )
+        return {"status": "ok", "response": resp}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+
 # ── Live thread ────────────────────────────────────────────────────────────────
 def _rec_live(pos, ep, reason, pnl):
     et = pos.get("entry_time")
@@ -1084,6 +1205,13 @@ def live_thread():
                     "trailing_sl":         None,
                     "squareoff_requested": False,
                 })
+                if cfg.get("dhan_enabled"):
+                    _dr = dhan_place_exit(cfg, {"side":position.get("side",1) if position else 1}, ltp)
+                    ts_log(f"Dhan Squareoff: {_dr.get('status')} {_dr.get('message','')}")
+                if cfg.get("dhan_enabled"):
+                    _sq_pos = {"side": position.get("side",1)} if position else {"side":1}
+                    _dr = dhan_place_exit(cfg, _sq_pos, ltp)
+                    ts_log(f"Dhan Squareoff: {_dr.get('status')} {_dr.get('message','')}")
                 ts_log(f"Squareoff @ {ltp:.4f}  PnL={pnl:+.4f}")
                 time.sleep(1.5); continue
 
@@ -1149,6 +1277,9 @@ def live_thread():
                 if (side == 1 and ltp <= eff_sl) or (side == -1 and ltp >= eff_sl):
                     pnl = round((eff_sl - entry) * side * qty, 4)
                     _rec_live(position, eff_sl, "SL", pnl)
+                    if cfg.get("dhan_enabled"):
+                        _dr = dhan_place_exit(cfg, position, eff_sl)
+                        ts_log(f"Dhan SL exit: {_dr.get('status')} {_dr.get('message','')}")
                     daily_pnl += pnl
                     position = None
                     ts_update({"daily_pnl": round(daily_pnl,4), "live_pnl": round(daily_pnl,4),
@@ -1206,6 +1337,9 @@ def live_thread():
                     else:
                         pnl = round((tgt_p - entry) * side * qty, 4)
                         _rec_live(position, tgt_p, "Target", pnl)
+                        if cfg.get("dhan_enabled"):
+                            _dr = dhan_place_exit(cfg, {"side":side}, tgt_p)
+                            ts_log(f"Dhan Tgt exit: {_dr.get('status')} {_dr.get('message','')}")
                         daily_pnl += pnl
                         position = None
                     ts_update({"daily_pnl": round(daily_pnl,4), "live_pnl": round(daily_pnl,4),
@@ -1289,6 +1423,15 @@ def live_thread():
                         ts_update({"live_ew_info": ew_inf})
                         ts_log(f"{'BUY' if side==1 else 'SELL'} @ {ltp:.4f}  "
                                f"SL={sl_p:.4f}  TGT={tgt_p:.4f}  [{strat}]")
+                        # ── Dhan entry order ──────────────────────────────────
+                        if cfg.get("dhan_enabled"):
+                            _dhan_resp = dhan_place_entry(cfg, side, ltp)
+                            if _dhan_resp.get("status") == "ok":
+                                ts_log(f"Dhan order placed: {_dhan_resp.get('side')} "
+                                       f"sec={_dhan_resp.get('sec_id')} "
+                                       f"type={_dhan_resp.get('order_type')}")
+                            else:
+                                ts_log(f"Dhan order FAILED: {_dhan_resp.get('message','')}")
                         # Clear pending signal only after successful entry
                         if not simple:
                             pending_signal = 0
@@ -1311,6 +1454,12 @@ def live_thread():
                         position = None
                         ts_update({"daily_pnl": round(daily_pnl,4), "live_pnl": round(daily_pnl,4),
                                    "live_position": None, "trailing_sl": None})
+                        if cfg.get("dhan_enabled"):
+                            _dr = dhan_place_exit(cfg, position, ltp)
+                            ts_log(f"Dhan EOD exit: {_dr.get('status')} {_dr.get('message','')}")
+                        if cfg.get("dhan_enabled"):
+                            _dr = dhan_place_exit(cfg, position or {}, ltp)
+                            ts_log(f"Dhan EOD: {_dr.get('status')} {_dr.get('message','')}")
                         ts_log(f"Auto EOD exit @ {ltp:.4f}  PnL={pnl:+.4f}")
                 except Exception:
                     pass
@@ -1505,6 +1654,83 @@ def sidebar_config():
         if confluence_filter:
             st.caption("Only enter EMA Crossover trades when Fast/Slow EMA trend agrees with signal direction.")
         st.markdown("---")
+        st.markdown("**🏦 Dhan Broker**")
+        dhan_enabled = st.checkbox("Enable Dhan Broker", value=False, key="dhan_en")
+        dhan_client_id=""; dhan_access_token=""
+        dhan_options=False; dhan_ce_sec_id="57749"; dhan_pe_sec_id="57716"
+        dhan_security_id="1594"; dhan_qty=1; dhan_exchange="NSE"
+        dhan_product_type="INTRADAY"; dhan_fno_exchange="NSE_FNO"
+        dhan_entry_order_type="MARKET"; dhan_exit_order_type="MARKET"
+
+        if dhan_enabled:
+            if not HAS_DHAN:
+                st.error("dhanhq not installed. Run: `pip install dhanhq`")
+            dc1,dc2 = st.columns(2)
+            dhan_client_id    = dc1.text_input("Client ID",    value="",  type="password", key="d_cid")
+            dhan_access_token = dc2.text_input("Access Token", value="",  type="password", key="d_tok")
+
+            dhan_options = st.checkbox("Options Trading", value=False, key="dhan_opt")
+
+            if dhan_options:
+                # ── Options settings ────────────────────────────────────────────
+                st.caption("BUY signal → CE Buy  |  SELL signal → PE Buy  (pure buyer)")
+                dhan_fno_exchange  = st.selectbox("FNO Exchange", ["NSE_FNO","BSE_FNO"],  key="d_fno")
+                do1,do2 = st.columns(2)
+                dhan_ce_sec_id = do1.text_input("CE Security ID", value="57749", key="d_ce")
+                dhan_pe_sec_id = do2.text_input("PE Security ID", value="57716", key="d_pe")
+                dhan_qty = st.number_input("Lot Qty", min_value=1, value=65, step=1, key="d_oqty")
+                do3,do4 = st.columns(2)
+                dhan_entry_order_type = do3.selectbox("Entry Order", ["MARKET","LIMIT"], key="d_oent")
+                dhan_exit_order_type  = do4.selectbox("Exit  Order", ["MARKET","LIMIT"], key="d_oexi")
+            else:
+                # ── Equity / Intraday / Delivery ────────────────────────────────
+                de1,de2 = st.columns(2)
+                dhan_product_type  = de1.selectbox("Product", ["INTRADAY","CNC"], key="d_prod")
+                dhan_exchange      = de2.selectbox("Exchange",["NSE","BSE"],      key="d_exc")
+                dhan_security_id   = st.text_input("Security ID", value="1594",   key="d_sec")
+                dhan_qty           = st.number_input("Quantity", min_value=1, value=1, step=1, key="d_qty")
+                de3,de4 = st.columns(2)
+                dhan_entry_order_type = de3.selectbox("Entry Order",["MARKET","LIMIT"], key="d_ent")
+                dhan_exit_order_type  = de4.selectbox("Exit  Order",["MARKET","LIMIT"], key="d_exi")
+
+        st.markdown("---")
+        st.markdown("**🏦 Dhan Broker**")
+        dhan_enabled = st.checkbox("Enable Dhan Broker", value=False, key="dhan_en")
+        dhan_client_id=""; dhan_access_token=""
+        dhan_options=False; dhan_ce_sec_id="57749"; dhan_pe_sec_id="57716"
+        dhan_security_id="1594"; dhan_qty=1; dhan_exchange="NSE_EQ"
+        dhan_product_type="INTRADAY"; dhan_fno_exchange="NSE_FNO"
+        dhan_entry_order_type="MARKET"; dhan_exit_order_type="MARKET"
+
+        if dhan_enabled:
+            if not HAS_DHAN:
+                st.error("Install dhanhq:  pip install dhanhq")
+            dc1,dc2 = st.columns(2)
+            dhan_client_id    = dc1.text_input("Client ID",    value="", type="password", key="d_cid")
+            dhan_access_token = dc2.text_input("Access Token", value="", type="password", key="d_tok")
+            dhan_options = st.checkbox("Enable Options Trading", value=False, key="dhan_opt")
+            if dhan_options:
+                st.caption("BUY signal → CE Buy  |  SELL signal → PE Buy  (pure buyer, never short)")
+                dhan_fno_exchange  = st.selectbox("FNO Exchange",["NSE_FNO","BSE_FNO"], key="d_fno")
+                do1,do2 = st.columns(2)
+                dhan_ce_sec_id = do1.text_input("CE Security ID", value="57749", key="d_ce")
+                dhan_pe_sec_id = do2.text_input("PE Security ID", value="57716", key="d_pe")
+                dhan_qty = st.number_input("Lot Qty", min_value=1, value=65, step=1, key="d_oqty")
+                do3,do4 = st.columns(2)
+                dhan_entry_order_type = do3.selectbox("Entry Order Type",["MARKET","LIMIT"], key="d_oent")
+                dhan_exit_order_type  = do4.selectbox("Exit  Order Type",["MARKET","LIMIT"], key="d_oexi")
+            else:
+                de1,de2 = st.columns(2)
+                dhan_product_type  = de1.selectbox("Product Type",["INTRADAY","CNC"], key="d_prod")
+                dhan_exchange_raw  = de2.selectbox("Exchange",    ["NSE","BSE"],      key="d_exc")
+                dhan_exchange      = dhan_exchange_raw + "_EQ"
+                dhan_security_id   = st.text_input("Security ID", value="1594", key="d_sec")
+                dhan_qty = st.number_input("Quantity", min_value=1, value=1, step=1, key="d_qty")
+                de3,de4 = st.columns(2)
+                dhan_entry_order_type = de3.selectbox("Entry Order Type",["MARKET","LIMIT"], key="d_ent")
+                dhan_exit_order_type  = de4.selectbox("Exit  Order Type",["MARKET","LIMIT"], key="d_exi")
+
+        st.markdown("---")
         st.markdown("**Filters** *(all disabled by default)*")
 
         # Day-of-week filter
@@ -1574,7 +1800,15 @@ def sidebar_config():
             "filter_delta":filter_dlt,"delta_min":float(dmin),"delta_max":float(dmax),
             "filter_time":filter_time,"trade_time_start":t_start,"trade_time_end":t_end,
             "max_daily_loss":float(max_loss),"max_daily_profit":float(max_profit),
-            "smart_sl_target":smart_sl_target,"confluence_filter":confluence_filter}
+            "smart_sl_target":smart_sl_target,"confluence_filter":confluence_filter,
+            "dhan_enabled":dhan_enabled,"dhan_client_id":dhan_client_id,
+            "dhan_access_token":dhan_access_token,"dhan_options":dhan_options,
+            "dhan_exchange":dhan_exchange+"_EQ","dhan_fno_exchange":dhan_fno_exchange,
+            "dhan_security_id":dhan_security_id,"dhan_ce_sec_id":dhan_ce_sec_id,
+            "dhan_pe_sec_id":dhan_pe_sec_id,"dhan_qty":int(dhan_qty),
+            "dhan_product_type":dhan_product_type,
+            "dhan_entry_order_type":dhan_entry_order_type,
+            "dhan_exit_order_type":dhan_exit_order_type}
 
 # ── Merge helper ───────────────────────────────────────────────────────────────
 def merge_all():
@@ -1714,12 +1948,17 @@ def tab_live(cfg):
     dpc  = "#3fb950" if dp >= 0 else "#f85149"
     sigl = "🟢 BUY" if sig == 1 else ("🔴 SELL" if sig == -1 else "—")
 
+    dhan_badge = ""
+    if cfg.get("dhan_enabled"):
+        dhan_mode  = "Options" if cfg.get("dhan_options") else cfg.get("dhan_product_type","INTRADAY")
+        dhan_badge = f"&nbsp;&nbsp;🏦 <b style='color:#3fb950'>Dhan {dhan_mode}</b>"
     st.markdown(
         f"<div class='status-bar'>"
         f"{dot}<b>{'LIVE' if running else 'IDLE'}</b>"
         f"&nbsp;&nbsp;Heartbeat: <code>{hb}</code>"
         f"&nbsp;&nbsp;Ticks: <b>{cnc}</b>"
         f"&nbsp;&nbsp;Daily PnL: <b style='color:{dpc}'>{dp:+.4f}</b>"
+        f"{dhan_badge}"
         f"</div>", unsafe_allow_html=True)
 
     m1,m2,m3,m4,m5,m6 = st.columns(6)
