@@ -22,6 +22,12 @@ try:
 except ImportError:
     HAS_YF = False
 
+try:
+    from dhanhq import dhanhq as _dhanhq
+    HAS_DHAN = True
+except ImportError:
+    HAS_DHAN = False
+
 IST = ZoneInfo("Asia/Kolkata")
 APP_VERSION = "3.1.0"
 
@@ -864,6 +870,149 @@ def get_live_signal(df,strategy,cfg):
     return 0
 
 
+# ── Dhan Broker Integration ────────────────────────────────────────────────────
+_dhan_client = None   # cached dhanhq instance, reset on credential change
+
+def _get_dhan(cfg: dict):
+    """Return a dhanhq client from cfg credentials. Cache per session."""
+    global _dhan_client
+    cid   = cfg.get("dhan_client_id","").strip()
+    token = cfg.get("dhan_access_token","").strip()
+    if not HAS_DHAN:
+        return None, "dhanhq not installed. Run: pip install dhanhq"
+    if not cid or not token:
+        return None, "Dhan Client ID / Access Token missing"
+    try:
+        if _dhan_client is None:
+            _dhan_client = _dhanhq(cid, token)
+        return _dhan_client, None
+    except Exception as e:
+        return None, str(e)
+
+
+def dhan_place_entry(cfg: dict, side: int, ltp: float) -> dict:
+    """
+    Place entry order on ALL configured Dhan accounts.
+    side: 1=BUY signal, -1=SELL signal
+    Returns summary dict.
+    """
+    accounts = cfg.get("dhan_accounts") or []
+    # Fallback: single account from primary credentials
+    if not accounts:
+        cid   = cfg.get("dhan_client_id","").strip()
+        token = cfg.get("dhan_access_token","").strip()
+        if cid and token:
+            accounts = [{"label":"Primary","client_id":cid,"access_token":token}]
+    if not accounts:
+        return {"status":"error","message":"No Dhan accounts configured"}
+
+    opts_on    = cfg.get("dhan_options", False)
+    order_type = cfg.get("dhan_entry_order_type", "MARKET")
+    price      = round(float(ltp), 2) if order_type == "LIMIT" else 0.0
+    qty        = int(cfg.get("dhan_qty", 1))
+
+    if opts_on:
+        seg     = cfg.get("dhan_fno_exchange","NSE_FNO")
+        sec_id  = cfg.get("dhan_ce_sec_id") if side == 1 else cfg.get("dhan_pe_sec_id")
+        tx_type = "BUY"
+        prod    = "INTRADAY"
+    else:
+        seg     = cfg.get("dhan_exchange","NSE_EQ")
+        sec_id  = cfg.get("dhan_security_id","1594")
+        tx_type = "BUY" if side == 1 else "SELL"
+        prod    = cfg.get("dhan_product_type","INTRADAY")
+
+    if not sec_id:
+        return {"status":"error","message":"Security ID not configured"}
+
+    results = []
+    for acc in accounts:
+        cid   = acc.get("client_id","").strip()
+        token = acc.get("access_token","").strip()
+        label = acc.get("label","Account")
+        if not cid or not token:
+            results.append({"label":label,"status":"skip","message":"No credentials"})
+            continue
+        if not HAS_DHAN:
+            results.append({"label":label,"status":"error","message":"dhanhq not installed"})
+            continue
+        try:
+            client = _dhanhq(cid, token)
+            resp = client.place_order(
+                transactionType=tx_type, exchangeSegment=seg,
+                productType=prod, orderType=order_type,
+                validity="DAY", securityId=str(sec_id),
+                quantity=qty, price=price, triggerPrice=0,
+            )
+            results.append({"label":label,"status":"ok","response":resp})
+        except Exception as e:
+            results.append({"label":label,"status":"error","message":str(e)})
+
+    ok_count = sum(1 for r in results if r["status"]=="ok")
+    return {"status":"ok" if ok_count>0 else "error",
+            "results": results,
+            "summary": f"{ok_count}/{len(results)} accounts filled"}
+
+
+def dhan_place_exit(cfg: dict, position: dict, ltp: float) -> dict:
+    """Place exit order on ALL configured Dhan accounts."""
+    accounts = cfg.get("dhan_accounts") or []
+    if not accounts:
+        cid   = cfg.get("dhan_client_id","").strip()
+        token = cfg.get("dhan_access_token","").strip()
+        if cid and token:
+            accounts = [{"label":"Primary","client_id":cid,"access_token":token}]
+    if not accounts:
+        return {"status":"error","message":"No Dhan accounts configured"}
+
+    side       = position.get("side", 1)
+    opts_on    = cfg.get("dhan_options", False)
+    order_type = cfg.get("dhan_exit_order_type", "MARKET")
+    price      = round(float(ltp), 2) if order_type == "LIMIT" else 0.0
+    qty        = int(cfg.get("dhan_qty", 1))
+
+    if opts_on:
+        seg     = cfg.get("dhan_fno_exchange","NSE_FNO")
+        sec_id  = cfg.get("dhan_ce_sec_id") if side == 1 else cfg.get("dhan_pe_sec_id")
+        tx_type = "SELL"
+        prod    = "INTRADAY"
+    else:
+        seg     = cfg.get("dhan_exchange","NSE_EQ")
+        sec_id  = cfg.get("dhan_security_id","1594")
+        tx_type = "SELL" if side == 1 else "BUY"
+        prod    = cfg.get("dhan_product_type","INTRADAY")
+
+    if not sec_id:
+        return {"status":"error","message":"Security ID not configured"}
+
+    results = []
+    for acc in accounts:
+        cid   = acc.get("client_id","").strip()
+        token = acc.get("access_token","").strip()
+        label = acc.get("label","Account")
+        if not cid or not token:
+            results.append({"label":label,"status":"skip"})
+            continue
+        if not HAS_DHAN:
+            results.append({"label":label,"status":"error","message":"dhanhq not installed"})
+            continue
+        try:
+            client = _dhanhq(cid, token)
+            resp = client.place_order(
+                transactionType=tx_type, exchangeSegment=seg,
+                productType=prod, orderType=order_type,
+                validity="DAY", securityId=str(sec_id),
+                quantity=qty, price=price, triggerPrice=0,
+            )
+            results.append({"label":label,"status":"ok","response":resp})
+        except Exception as e:
+            results.append({"label":label,"status":"error","message":str(e)})
+
+    ok_count = sum(1 for r in results if r["status"]=="ok")
+    return {"status":"ok" if ok_count>0 else "error",
+            "results": results,
+            "summary": f"{ok_count}/{len(results)} accounts exited"}
+
 # ── Live thread ────────────────────────────────────────────────────────────────
 def _rec_live(pos, ep, reason, pnl):
     et = pos.get("entry_time")
@@ -1084,6 +1233,13 @@ def live_thread():
                     "trailing_sl":         None,
                     "squareoff_requested": False,
                 })
+                if cfg.get("dhan_enabled"):
+                    _dr = dhan_place_exit(cfg, {"side":position.get("side",1) if position else 1}, ltp)
+                    ts_log(f"Dhan Squareoff: {_dr.get('status')} {_dr.get('message','')}")
+                if cfg.get("dhan_enabled"):
+                    _sq_pos = {"side": position.get("side",1)} if position else {"side":1}
+                    _dr = dhan_place_exit(cfg, _sq_pos, ltp)
+                    ts_log(f"Dhan Squareoff: {_dr.get('status')} {_dr.get('message','')}")
                 ts_log(f"Squareoff @ {ltp:.4f}  PnL={pnl:+.4f}")
                 time.sleep(1.5); continue
 
@@ -1149,6 +1305,9 @@ def live_thread():
                 if (side == 1 and ltp <= eff_sl) or (side == -1 and ltp >= eff_sl):
                     pnl = round((eff_sl - entry) * side * qty, 4)
                     _rec_live(position, eff_sl, "SL", pnl)
+                    if cfg.get("dhan_enabled"):
+                        _dr = dhan_place_exit(cfg, position, eff_sl)
+                        ts_log(f"Dhan SL exit: {_dr.get('status')} {_dr.get('message','')}")
                     daily_pnl += pnl
                     position = None
                     ts_update({"daily_pnl": round(daily_pnl,4), "live_pnl": round(daily_pnl,4),
@@ -1206,6 +1365,9 @@ def live_thread():
                     else:
                         pnl = round((tgt_p - entry) * side * qty, 4)
                         _rec_live(position, tgt_p, "Target", pnl)
+                        if cfg.get("dhan_enabled"):
+                            _dr = dhan_place_exit(cfg, {"side":side}, tgt_p)
+                            ts_log(f"Dhan Tgt exit: {_dr.get('status')} {_dr.get('message','')}")
                         daily_pnl += pnl
                         position = None
                     ts_update({"daily_pnl": round(daily_pnl,4), "live_pnl": round(daily_pnl,4),
@@ -1289,6 +1451,13 @@ def live_thread():
                         ts_update({"live_ew_info": ew_inf})
                         ts_log(f"{'BUY' if side==1 else 'SELL'} @ {ltp:.4f}  "
                                f"SL={sl_p:.4f}  TGT={tgt_p:.4f}  [{strat}]")
+                        # ── Dhan entry order ──────────────────────────────────
+                        if cfg.get("dhan_enabled"):
+                            _dhan_resp = dhan_place_entry(cfg, side, ltp)
+                            if _dhan_resp.get("status") == "ok":
+                                ts_log(f"Dhan entry: {_dhan_resp.get('summary',_dhan_resp.get('status'))}")
+                            else:
+                                ts_log(f"Dhan entry FAILED: {_dhan_resp.get('message','')}")
                         # Clear pending signal only after successful entry
                         if not simple:
                             pending_signal = 0
@@ -1311,6 +1480,12 @@ def live_thread():
                         position = None
                         ts_update({"daily_pnl": round(daily_pnl,4), "live_pnl": round(daily_pnl,4),
                                    "live_position": None, "trailing_sl": None})
+                        if cfg.get("dhan_enabled"):
+                            _dr = dhan_place_exit(cfg, position, ltp)
+                            ts_log(f"Dhan EOD exit: {_dr.get('status')} {_dr.get('message','')}")
+                        if cfg.get("dhan_enabled"):
+                            _dr = dhan_place_exit(cfg, position or {}, ltp)
+                            ts_log(f"Dhan EOD: {_dr.get('status')} {_dr.get('message','')}")
                         ts_log(f"Auto EOD exit @ {ltp:.4f}  PnL={pnl:+.4f}")
                 except Exception:
                     pass
@@ -1505,6 +1680,94 @@ def sidebar_config():
         if confluence_filter:
             st.caption("Only enter EMA Crossover trades when Fast/Slow EMA trend agrees with signal direction.")
         st.markdown("---")
+        st.markdown("**🏦 Dhan Broker**")
+        if not HAS_DHAN:
+            st.warning("Install: `pip install dhanhq`")
+
+        dhan_enabled = st.checkbox("Enable Dhan Broker", value=False, key="sb_dhan_en")
+
+        # ── Defaults ────────────────────────────────────────────────────────────
+        dhan_options=False; dhan_ce_sec_id="57749"; dhan_pe_sec_id="57716"
+        dhan_security_id="1594"; dhan_qty=1; dhan_exchange="NSE_EQ"
+        dhan_product_type="INTRADAY"; dhan_fno_exchange="NSE_FNO"
+        dhan_entry_order_type="MARKET"; dhan_exit_order_type="MARKET"
+        dhan_accounts = []   # list of {label, client_id, access_token}
+
+        if dhan_enabled:
+            # ── Multi-account manager ──────────────────────────────────────────
+            # Stored in session_state so accounts persist across reruns
+            if "dhan_accounts" not in st.session_state:
+                st.session_state["dhan_accounts"] = [
+                    {"label": "Account 1", "client_id": "", "access_token": ""}
+                ]
+
+            accs = st.session_state["dhan_accounts"]
+            st.markdown(f"**Accounts ({len(accs)})**")
+
+            to_remove = []
+            for ai, acc in enumerate(accs):
+                with st.expander(acc.get("label","Account") or f"Account {ai+1}",
+                                 expanded=(ai == 0)):
+                    ax1, ax2 = st.columns([2,1])
+                    acc["label"]        = ax1.text_input("Label",        value=acc.get("label",""),
+                                                         key=f"da_lbl_{ai}")
+                    acc["client_id"]    = st.text_input("Client ID",    value=acc.get("client_id",""),
+                                                        type="password", key=f"da_cid_{ai}")
+                    acc["access_token"] = st.text_input("Access Token", value=acc.get("access_token",""),
+                                                        type="password", key=f"da_tok_{ai}")
+                    if ax2.button("🗑 Remove", key=f"da_rm_{ai}", use_container_width=True):
+                        to_remove.append(ai)
+
+            for i in reversed(to_remove):
+                accs.pop(i)
+                st.rerun()
+
+            if st.button("➕ Add Account", key="sb_dhan_add"):
+                accs.append({"label": f"Account {len(accs)+1}",
+                             "client_id": "", "access_token": ""})
+                st.rerun()
+
+            st.session_state["dhan_accounts"] = accs
+            dhan_accounts = [a for a in accs if a.get("client_id") and a.get("access_token")]
+
+            # Use first account as primary for cfg (all accounts get the same trade settings)
+            if accs:
+                dhan_client_id    = accs[0].get("client_id","")
+                dhan_access_token = accs[0].get("access_token","")
+
+            # ── Trade settings (shared across all accounts) ────────────────────
+            st.markdown("**Trade Settings**")
+            dhan_options = st.checkbox("Options Trading", value=False, key="sb_dhan_opt")
+
+            if dhan_options:
+                st.caption("🟢 BUY signal → CE Buy  🔴 SELL signal → PE Buy  (pure buyer)")
+                dhan_fno_exchange = st.selectbox("FNO Exchange",["NSE_FNO","BSE_FNO"],
+                                                  key="sb_d_fno")
+                dq1, dq2 = st.columns(2)
+                dhan_ce_sec_id = dq1.text_input("CE Security ID", value="57749", key="sb_d_ce")
+                dhan_pe_sec_id = dq2.text_input("PE Security ID", value="57716", key="sb_d_pe")
+                dhan_qty = st.number_input("Lot Qty", min_value=1, value=65, step=1,
+                                            key="sb_d_oqty")
+                dq3,dq4 = st.columns(2)
+                dhan_entry_order_type = dq3.selectbox("Entry Order",["MARKET","LIMIT"],
+                                                       key="sb_d_oent")
+                dhan_exit_order_type  = dq4.selectbox("Exit  Order",["MARKET","LIMIT"],
+                                                       key="sb_d_oexi")
+            else:
+                ds1,ds2 = st.columns(2)
+                dhan_product_type = ds1.selectbox("Product",["INTRADAY","CNC"], key="sb_d_prod")
+                dhan_exchange_raw = ds2.selectbox("Exchange",["NSE","BSE"],     key="sb_d_exc")
+                dhan_exchange     = dhan_exchange_raw + "_EQ"
+                dhan_security_id  = st.text_input("Security ID", value="1594",  key="sb_d_sec")
+                dhan_qty = st.number_input("Quantity", min_value=1, value=1, step=1,
+                                            key="sb_d_qty")
+                ds3,ds4 = st.columns(2)
+                dhan_entry_order_type = ds3.selectbox("Entry Order",["MARKET","LIMIT"],
+                                                       key="sb_d_ent")
+                dhan_exit_order_type  = ds4.selectbox("Exit  Order",["MARKET","LIMIT"],
+                                                       key="sb_d_exi")
+
+        st.markdown("---")
         st.markdown("**Filters** *(all disabled by default)*")
 
         # Day-of-week filter
@@ -1574,7 +1837,16 @@ def sidebar_config():
             "filter_delta":filter_dlt,"delta_min":float(dmin),"delta_max":float(dmax),
             "filter_time":filter_time,"trade_time_start":t_start,"trade_time_end":t_end,
             "max_daily_loss":float(max_loss),"max_daily_profit":float(max_profit),
-            "smart_sl_target":smart_sl_target,"confluence_filter":confluence_filter}
+            "smart_sl_target":smart_sl_target,"confluence_filter":confluence_filter,
+            "dhan_accounts":dhan_accounts,
+            "dhan_enabled":dhan_enabled,"dhan_client_id":dhan_client_id,
+            "dhan_access_token":dhan_access_token,"dhan_options":dhan_options,
+            "dhan_exchange":dhan_exchange+"_EQ","dhan_fno_exchange":dhan_fno_exchange,
+            "dhan_security_id":dhan_security_id,"dhan_ce_sec_id":dhan_ce_sec_id,
+            "dhan_pe_sec_id":dhan_pe_sec_id,"dhan_qty":int(dhan_qty),
+            "dhan_product_type":dhan_product_type,
+            "dhan_entry_order_type":dhan_entry_order_type,
+            "dhan_exit_order_type":dhan_exit_order_type}
 
 # ── Merge helper ───────────────────────────────────────────────────────────────
 def merge_all():
@@ -1714,12 +1986,17 @@ def tab_live(cfg):
     dpc  = "#3fb950" if dp >= 0 else "#f85149"
     sigl = "🟢 BUY" if sig == 1 else ("🔴 SELL" if sig == -1 else "—")
 
+    dhan_badge = ""
+    if cfg.get("dhan_enabled"):
+        dhan_mode  = "Options" if cfg.get("dhan_options") else cfg.get("dhan_product_type","INTRADAY")
+        dhan_badge = f"&nbsp;&nbsp;🏦 <b style='color:#3fb950'>Dhan {dhan_mode}</b>"
     st.markdown(
         f"<div class='status-bar'>"
         f"{dot}<b>{'LIVE' if running else 'IDLE'}</b>"
         f"&nbsp;&nbsp;Heartbeat: <code>{hb}</code>"
         f"&nbsp;&nbsp;Ticks: <b>{cnc}</b>"
         f"&nbsp;&nbsp;Daily PnL: <b style='color:{dpc}'>{dp:+.4f}</b>"
+        f"{dhan_badge}"
         f"</div>", unsafe_allow_html=True)
 
     m1,m2,m3,m4,m5,m6 = st.columns(6)
