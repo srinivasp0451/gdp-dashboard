@@ -4,7 +4,7 @@ Smart Investing — Production-Grade Algorithmic Trading Platform
 Single-file Streamlit app | All timestamps IST | v3.1.0
 Run: streamlit run smart_investing.py --server.address 0.0.0.0
 """
-dhan_client_id ='1234'
+
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -1687,11 +1687,12 @@ def sidebar_config():
         dhan_enabled = st.checkbox("Enable Dhan Broker", value=False, key="sb_dhan_en")
 
         # ── Defaults ────────────────────────────────────────────────────────────
+        dhan_client_id=""; dhan_access_token=""   # always defined
         dhan_options=False; dhan_ce_sec_id="57749"; dhan_pe_sec_id="57716"
         dhan_security_id="1594"; dhan_qty=1; dhan_exchange="NSE_EQ"
         dhan_product_type="INTRADAY"; dhan_fno_exchange="NSE_FNO"
         dhan_entry_order_type="MARKET"; dhan_exit_order_type="MARKET"
-        dhan_accounts = []   # list of {label, client_id, access_token}
+        dhan_accounts = []
 
         if dhan_enabled:
             # ── Multi-account manager ──────────────────────────────────────────
