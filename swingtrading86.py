@@ -4,7 +4,7 @@ Smart Investing — Production-Grade Algorithmic Trading Platform
 Single-file Streamlit app | All timestamps IST | v3.1.0
 Run: streamlit run smart_investing.py --server.address 0.0.0.0
 """
-
+dhan_client_id ='1234'
 import streamlit as st
 import pandas as pd
 import numpy as np
