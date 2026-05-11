@@ -875,40 +875,92 @@ def explain_signal_reason(reason_str, direction, entry, sl, tp, accuracy=None):
 # Candlestick chart
 # ─────────────────────────────────────────────────────────────────────────────
 
-def draw_candlestick_chart(df, title='', sl=None, tp=None, entry=None, n_candles=80):
-    """Dark-theme OHLC candlestick chart with optional SL/TP/entry overlay lines."""
-    df  = df.tail(n_candles).reset_index(drop=True)
+def draw_candlestick_chart(df, title='', sl=None, tp=None, entry=None,
+                           trailing_sl=None, trailing_tp=None, n_candles=80):
+    """
+    Fast vectorized dark-theme OHLC candlestick chart.
+    Uses bar() + vlines() array calls instead of per-row iteration.
+    Optional overlays: entry (blue), SL (red), TP (green),
+    trailing SL (orange dashed), trailing TP (purple dashed, display only).
+    """
+    if df is None or df.empty:
+        fig, ax = plt.subplots(figsize=(12, 4))
+        ax.text(0.5, 0.5, 'No data', ha='center', va='center', transform=ax.transAxes, color='grey')
+        return fig
+
+    df   = df.tail(n_candles).copy().reset_index(drop=True)
+    n    = len(df)
+    xs   = np.arange(n, dtype=float)
+
+    opens   = df['Open'].values.astype(float)
+    closes  = df['Close'].values.astype(float)
+    highs   = df['High'].values.astype(float)
+    lows    = df['Low'].values.astype(float)
+
+    is_up   = closes >= opens
+    bottoms = np.minimum(opens, closes)
+    heights = np.maximum(np.abs(closes - opens), (highs - lows) * 0.001)
+
+    plt.style.use('default')          # reset any global style that could cause issues
     fig, ax = plt.subplots(figsize=(12, 4))
     fig.patch.set_facecolor('#0e1117')
     ax.set_facecolor('#161b22')
-    for i, row in df.iterrows():
-        is_up  = row['Close'] >= row['Open']
-        color  = '#26a69a' if is_up else '#ef5350'
-        bottom = min(row['Open'], row['Close'])
-        height = max(abs(row['Close'] - row['Open']), (row['High'] - row['Low']) * 0.001)
-        ax.bar(i, height, bottom=bottom, color=color, width=0.6, alpha=0.92, zorder=2)
-        ax.plot([i, i], [row['Low'],          bottom],         color=color, linewidth=0.9, zorder=1)
-        ax.plot([i, i], [bottom + height,     row['High']],    color=color, linewidth=0.9, zorder=1)
-    if entry is not None:
-        ax.axhline(entry, color='#2196F3', linestyle='--', linewidth=1.3, label=f'Entry {entry:.2f}', zorder=3)
-    if sl is not None:
-        ax.axhline(sl,    color='#f44336', linestyle='--', linewidth=1.3, label=f'SL {sl:.2f}',    zorder=3)
-    if tp is not None:
-        ax.axhline(tp,    color='#4CAF50', linestyle='--', linewidth=1.3, label=f'TP {tp:.2f}',    zorder=3)
-    if any(x is not None for x in [entry, sl, tp]):
-        ax.legend(fontsize=8, facecolor='#1e2130', labelcolor='white', edgecolor='#444')
-    n    = len(df); step = max(1, n // 8); ticks = list(range(0, n, step))
-    lbls = []
+
+    # ── Draw bodies (two bar calls: up candles + down candles) ───────────────
+    up_mask   = is_up
+    down_mask = ~is_up
+
+    if up_mask.any():
+        ax.bar(xs[up_mask], heights[up_mask], bottom=bottoms[up_mask],
+               color='#26a69a', width=0.6, alpha=0.92, zorder=2)
+    if down_mask.any():
+        ax.bar(xs[down_mask], heights[down_mask], bottom=bottoms[down_mask],
+               color='#ef5350', width=0.6, alpha=0.92, zorder=2)
+
+    # ── Draw wicks (two vlines calls) ────────────────────────────────────────
+    if up_mask.any():
+        ax.vlines(xs[up_mask],   lows[up_mask],   highs[up_mask],
+                  colors='#26a69a', linewidth=0.9, zorder=1)
+    if down_mask.any():
+        ax.vlines(xs[down_mask], lows[down_mask], highs[down_mask],
+                  colors='#ef5350', linewidth=0.9, zorder=1)
+
+    # ── Overlay lines ─────────────────────────────────────────────────────────
+    def _hline(val, color, style, lw, label):
+        ax.axhline(val, color=color, linestyle=style, linewidth=lw, label=label, zorder=3)
+
+    if entry       is not None: _hline(entry,       '#2196F3', '--', 1.4, f'Entry {entry:.2f}')
+    if sl          is not None: _hline(sl,           '#f44336', '--', 1.4, f'SL {sl:.2f}')
+    if tp          is not None: _hline(tp,           '#4CAF50', '--', 1.4, f'TP {tp:.2f}')
+    if trailing_sl is not None: _hline(trailing_sl,  '#FF9800', '-',  1.2, f'Trail SL {trailing_sl:.2f}')
+    if trailing_tp is not None: _hline(trailing_tp,  '#CE93D8', ':',  1.2, f'Trail TP* {trailing_tp:.2f}')
+
+    if any(x is not None for x in [entry, sl, tp, trailing_sl, trailing_tp]):
+        legend = ax.legend(fontsize=7, facecolor='#1e2130', labelcolor='white',
+                           edgecolor='#555', loc='upper left')
+
+    # ── X-axis labels ─────────────────────────────────────────────────────────
+    step  = max(1, n // 8)
+    ticks = list(range(0, n, step))
+    lbls  = []
     for j in ticks:
-        try:    lbls.append(df.loc[j, 'Date'].strftime('%m-%d %H:%M'))
-        except: lbls.append(str(j))
-    ax.set_xticks(ticks); ax.set_xticklabels(lbls, rotation=45, ha='right', fontsize=7, color='#aaaaaa')
+        try:
+            d = df.loc[j, 'Date']
+            lbls.append(d.strftime('%m-%d %H:%M') if hasattr(d, 'strftime') else str(d)[:16])
+        except Exception:
+            lbls.append(str(j))
+
+    ax.set_xticks(ticks)
+    ax.set_xticklabels(lbls, rotation=45, ha='right', fontsize=7, color='#aaaaaa')
     ax.tick_params(axis='y', colors='#aaaaaa', labelsize=7)
-    ax.set_title(title, fontsize=9, color='#dddddd')
+    ax.set_title(title, fontsize=9, color='#dddddd', pad=6)
     ax.grid(axis='y', alpha=0.15, color='#555')
+    ax.set_xlim(-1, n + 1)
+
     for sp in ['bottom', 'left']:  ax.spines[sp].set_color('#444')
-    for sp in ['top',    'right']: ax.spines[sp].set_visible(False)
-    plt.tight_layout()
+    for sp in ['top', 'right']:    ax.spines[sp].set_visible(False)
+
+    fig.tight_layout(pad=0.5)
     return fig
 
 
@@ -1050,8 +1102,122 @@ def render_dhan_config(key_prefix='live'):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Default params (used when no optimisation has been run yet)
+# Trailing SL / TP helpers
 # ─────────────────────────────────────────────────────────────────────────────
+
+TRAILING_MODES = [
+    'None (fixed)',
+    'Fixed %',
+    'Previous Candle Low/High',
+    'Current Candle Low/High',
+    'Previous Swing Low/High',
+    'Current Swing Low/High',
+]
+
+
+def compute_trailing_sl(df_completed, position, mode, trailing_pct=0.5):
+    """
+    Compute updated trailing SL.
+    Long  → SL trails using Low-side levels (never moves below original).
+    Short → SL trails using High-side levels (never moves above original).
+    SL can only move in the favourable direction (ratchet).
+    """
+    d        = position['direction']
+    orig_sl  = position.get('orig_sl', position['sl'])
+
+    if mode == 'None (fixed)':
+        return position['sl']
+
+    lc  = df_completed.iloc[-1]
+    plc = df_completed.iloc[-2] if len(df_completed) >= 2 else lc
+
+    if mode == 'Fixed %':
+        ltp_now = float(lc['Close'])
+        if d == 'long':
+            candidate = ltp_now * (1.0 - trailing_pct / 100.0)
+        else:
+            candidate = ltp_now * (1.0 + trailing_pct / 100.0)
+
+    elif mode == 'Current Candle Low/High':
+        candidate = float(lc['Low']) if d == 'long' else float(lc['High'])
+
+    elif mode == 'Previous Candle Low/High':
+        candidate = float(plc['Low']) if d == 'long' else float(plc['High'])
+
+    elif mode in ('Current Swing Low/High', 'Previous Swing Low/High'):
+        ph, pl = get_pivots(df_completed['Close'], left=3, right=3)
+        if d == 'long':
+            pool = [p for _, p in pl]
+        else:
+            pool = [p for _, p in ph]
+        if len(pool) == 0:
+            return position['sl']
+        if mode == 'Current Swing Low/High':
+            candidate = pool[-1]
+        else:
+            candidate = pool[-2] if len(pool) >= 2 else pool[-1]
+    else:
+        return position['sl']
+
+    # Ratchet: SL can only move towards entry (favourable direction)
+    current_sl = position['sl']
+    if d == 'long':
+        return max(current_sl, candidate)   # SL only moves UP for longs
+    else:
+        return min(current_sl, candidate)   # SL only moves DOWN for shorts
+
+
+def compute_trailing_tp(df_completed, position, mode, trailing_pct=1.0):
+    """
+    Compute display-only trailing TP.
+    Long  → TP trails using High-side levels (never moves below original).
+    Short → TP trails using Low-side levels (never moves above original).
+    NOTE: This value is NEVER used to exit a trade — display only.
+    """
+    d       = position['direction']
+    orig_tp = position.get('orig_tp', position['tp'])
+
+    if mode == 'None (fixed)':
+        return position['tp']
+
+    lc  = df_completed.iloc[-1]
+    plc = df_completed.iloc[-2] if len(df_completed) >= 2 else lc
+
+    if mode == 'Fixed %':
+        ltp_now = float(lc['Close'])
+        if d == 'long':
+            candidate = ltp_now * (1.0 + trailing_pct / 100.0)
+        else:
+            candidate = ltp_now * (1.0 - trailing_pct / 100.0)
+
+    elif mode == 'Current Candle Low/High':
+        candidate = float(lc['High']) if d == 'long' else float(lc['Low'])
+
+    elif mode == 'Previous Candle Low/High':
+        candidate = float(plc['High']) if d == 'long' else float(plc['Low'])
+
+    elif mode in ('Current Swing Low/High', 'Previous Swing Low/High'):
+        ph, pl = get_pivots(df_completed['Close'], left=3, right=3)
+        if d == 'long':
+            pool = [p for _, p in ph]
+        else:
+            pool = [p for _, p in pl]
+        if len(pool) == 0:
+            return position['tp']
+        if mode == 'Current Swing Low/High':
+            candidate = pool[-1]
+        else:
+            candidate = pool[-2] if len(pool) >= 2 else pool[-1]
+    else:
+        return position['tp']
+
+    if d == 'long':
+        return max(position['tp'], candidate)
+    else:
+        return min(position['tp'], candidate)
+
+
+
 
 DEFAULT_PARAMS = {
     'pivot_window': 3, 'cluster_tol': 0.005, 'zone_width': 0.005,
@@ -1069,14 +1235,21 @@ DEFAULT_PARAMS = {
 # Live Trading Tab  (no-flicker cached approach)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _open_position(direction, ltp, params, capital, risk_pct, symbol, timeframe, dhan_enabled, dhan_cfg):
-    """Create a position dict and optionally fire a Dhan entry order."""
-    sl_v = ltp * (1 - params['sl_pct']) if direction == 'long' else ltp * (1 + params['sl_pct'])
-    tp_v = ltp * (1 + params['tp_pct']) if direction == 'long' else ltp * (1 - params['tp_pct'])
+def _open_position(direction, ltp, params, capital, risk_pct, symbol, timeframe,
+                   dhan_enabled, dhan_cfg, sl_override=None, tp_override=None):
+    """Create a position dict and optionally fire a Dhan entry order.
+    sl_override / tp_override: absolute price levels; if None, computed from params %.
+    """
+    sl_v = sl_override if (sl_override is not None and sl_override > 0) else (
+        ltp * (1 - params['sl_pct']) if direction == 'long' else ltp * (1 + params['sl_pct']))
+    tp_v = tp_override if (tp_override is not None and tp_override > 0) else (
+        ltp * (1 + params['tp_pct']) if direction == 'long' else ltp * (1 - params['tp_pct']))
     qty  = 1
     if capital > 0 and abs(ltp - sl_v) > 0:
         qty = max(1, int((capital * risk_pct / 100) // abs(ltp - sl_v)))
-    pos = {'direction': direction, 'entry_price': ltp, 'sl': sl_v, 'tp': tp_v, 'qty': qty,
+    pos = {'direction': direction, 'entry_price': ltp, 'sl': sl_v, 'tp': tp_v,
+           'orig_sl': sl_v, 'orig_tp': tp_v,
+           'qty': qty,
            'entry_time': pd.Timestamp.now(tz=IST).strftime('%Y-%m-%d %H:%M:%S %Z'),
            'symbol': symbol, 'timeframe': timeframe, 'dhan_entry_response': None}
     if dhan_enabled and dhan_cfg:
@@ -1086,7 +1259,7 @@ def _open_position(direction, ltp, params, capital, risk_pct, symbol, timeframe,
             dhan_cfg['open_opt_security_id'] = (dhan_cfg['ce_security_id'] if direction == 'long'
                                                 else dhan_cfg['pe_security_id'])
             st.session_state['dhan_cfg'] = dhan_cfg
-        st.toast(f"Dhan entry order sent ✅", icon="📤")
+        st.toast("Dhan entry order sent ✅", icon="📤")
     return pos
 
 
@@ -1108,175 +1281,212 @@ def _close_position(pos, exit_price, exit_reason, dhan_enabled, dhan_cfg):
 
 def live_trading_section():
     """
-    Live monitoring tab.
-    - Fetches data only when needed (cache-guarded → no full-page flicker).
-    - Displays last completed candle row prominently.
-    - Candlestick chart with SL/TP/Entry overlay.
-    - Start / Stop / Take Position / Square Off buttons.
-    - Dhan broker integration (equity & options).
+    Live monitoring tab — all config inherited from Backtest tab.
+    Memory-safe: auto-refresh uses 1-second polling loop ONLY when
+    live_monitoring=True. Stop button sets it False; loop ends immediately.
     """
     st.header("🔴 Live Trading Monitor")
-    st.caption("Signal detected on the last **completed** candle. Entry = OPEN of the next candle.")
 
-    # ── Session-state initialisation ──────────────────────────────────────────
+    # ── Session-state defaults ────────────────────────────────────────────────
     for k, v in [('live_monitoring', False), ('live_position', None),
                  ('trade_history', []),       ('live_cache', None),
                  ('live_last_fetch_ts', 0.0), ('live_manual_refresh', False)]:
         if k not in st.session_state:
             st.session_state[k] = v
 
-    # ── Instrument / TF / Period ──────────────────────────────────────────────
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        instr_name = st.selectbox("Instrument", list(INSTRUMENTS.keys()), key='live_instr')
-        if INSTRUMENTS[instr_name] == '__custom__':
-            symbol       = st.text_input("Custom Symbol (e.g. TATAMOTORS.NS, AAPL)",
-                                          value='TATAMOTORS.NS', key='live_custom_sym').strip().upper()
-            display_name = symbol
-        else:
-            symbol       = INSTRUMENTS[instr_name]
-            display_name = instr_name
-    with col2:
-        timeframe = st.selectbox("Timeframe", TIMEFRAMES, index=4, key='live_tf')
-    with col3:
-        max_days_tf    = _INTERVAL_MAX_DAYS.get(timeframe, 99999)
-        compat_periods = [p for p in PERIODS if _PERIOD_DAYS[p] <= max_days_tf] or ['1d']
-        period = st.selectbox("Period (strategy context)", compat_periods,
-                               index=min(2, len(compat_periods) - 1), key='live_period')
+    # ── Check backtest context ────────────────────────────────────────────────
+    bt_symbol  = st.session_state.get('bt_symbol')
+    bt_display = st.session_state.get('bt_display_name', bt_symbol)
+    bt_tf      = st.session_state.get('bt_timeframe')
+    bt_period  = st.session_state.get('bt_period')
+    bt_capital = st.session_state.get('bt_capital', 0)
+    bt_risk    = st.session_state.get('bt_risk_pct', 1.0)
+    params     = st.session_state.get('best_params', DEFAULT_PARAMS.copy())
 
-    # ── Strategy params ───────────────────────────────────────────────────────
-    best_params = st.session_state.get('best_params')
-    if best_params:
-        st.success("✅ Using optimised params from Backtest tab.")
-        params = best_params.copy()
-    else:
-        st.info("ℹ️ Using default params. Run optimisation in the Backtest tab for best results.")
-        params = DEFAULT_PARAMS.copy()
+    if not bt_symbol or not bt_tf:
+        st.warning("⚠️ Run the Backtest tab first — load data and optimise. "
+                   "Live tab inherits all settings automatically.")
+        return
 
-    d1, d2, d3 = st.columns(3)
-    with d1:
-        side_live = st.selectbox("Direction filter", ['both', 'long only', 'short only'], key='live_side')
-        params['allowed_dirs'] = (['long', 'short'] if side_live == 'both'
-                                   else ['long'] if 'long' in side_live else ['short'])
-    with d2:
-        live_capital  = st.number_input("Capital for sizing (0 = off)", min_value=0, value=0, key='live_cap')
-    with d3:
-        live_risk_pct = st.number_input("Risk %", min_value=0.1, max_value=10.0, value=1.0, step=0.1, key='live_risk')
+    # ── Inherited context (read-only banner) ──────────────────────────────────
+    st.success(
+        f"✅ Inherited from Backtest — **{bt_display}** | "
+        f"TF: `{bt_tf}` | Period: `{bt_period}` | "
+        f"SL: `{params['sl_pct']*100:.2f}%` | TP: `{params['tp_pct']*100:.2f}%` | "
+        f"Capital: `{bt_capital}` | Risk: `{bt_risk}%`"
+    )
 
-    # ── Dhan broker config ────────────────────────────────────────────────────
+    # ── SL / TP override + Trailing settings ─────────────────────────────────
+    with st.expander("⚙️ Override SL / Target & Trailing Settings", expanded=False):
+        ov1, ov2 = st.columns(2)
+        with ov1:
+            override_sl = st.checkbox("Override Stop Loss", value=False, key='live_ov_sl')
+            sl_override = st.number_input("SL (absolute price)", value=0.0, format="%.4f",
+                                          key='live_sl_abs',
+                                          disabled=not override_sl,
+                                          help="Enter exact price level. 0 = use backtest %.")
+        with ov2:
+            override_tp = st.checkbox("Override Target", value=False, key='live_ov_tp')
+            tp_override = st.number_input("TP (absolute price)", value=0.0, format="%.4f",
+                                          key='live_tp_abs',
+                                          disabled=not override_tp,
+                                          help="Enter exact price level. 0 = use backtest %.")
+
+        st.markdown("**Trailing Stop Loss** *(ratchets in your favour each refresh)*")
+        ts1, ts2 = st.columns(2)
+        with ts1:
+            trailing_sl_mode = st.selectbox("Trailing SL Mode", TRAILING_MODES,
+                                            key='live_tsl_mode')
+        with ts2:
+            trailing_sl_pct = st.number_input("Trailing SL % (Fixed % mode only)",
+                                              min_value=0.1, max_value=20.0,
+                                              value=0.5, step=0.1, key='live_tsl_pct')
+
+        st.markdown("**Trailing Target** *(🟣 display-only — never triggers exit)*")
+        tt1, tt2 = st.columns(2)
+        with tt1:
+            trailing_tp_mode = st.selectbox("Trailing TP Mode", TRAILING_MODES,
+                                            key='live_ttp_mode')
+        with tt2:
+            trailing_tp_pct = st.number_input("Trailing TP % (Fixed % mode only)",
+                                              min_value=0.1, max_value=50.0,
+                                              value=1.0, step=0.1, key='live_ttp_pct')
+
+    # ── Dhan broker ───────────────────────────────────────────────────────────
     dhan_enabled, dhan_cfg = render_dhan_config(key_prefix='live')
     if dhan_cfg:
         st.session_state['dhan_cfg'] = dhan_cfg
 
     st.markdown("---")
 
-    # ── Refresh controls ──────────────────────────────────────────────────────
-    ref1, ref2, ref3 = st.columns([1, 1, 2])
-    with ref1:
+    # ── Control row ───────────────────────────────────────────────────────────
+    bc0, bc1, bc2, bc3, bc4 = st.columns([1.2, 1, 1, 1, 1])
+    with bc0:
         refresh_interval = st.number_input(
             "Refresh (sec)", min_value=1.5, max_value=3600.0,
-            value=10.0, step=0.5, key='live_refresh_interval',
-            help="Minimum 1.5 s (yfinance rate limit).")
-    with ref2:
-        st.write("")  # vertical spacer
-        manual_refresh_btn = st.button("🔄 Refresh Now", use_container_width=True)
+            value=10.0, step=0.5, key='live_refresh_interval')
 
-    # ── Monitoring / position control buttons ─────────────────────────────────
-    mc1, mc2, mc3, mc4 = st.columns(4)
-    cache_snap = st.session_state.get('live_cache')
-    sig_snap   = cache_snap['sig'] if cache_snap else 0
-    position   = st.session_state.get('live_position')
-
-    with mc1:
+    with bc1:
         if not st.session_state['live_monitoring']:
-            if st.button("▶ Start Monitoring", use_container_width=True):
+            if st.button("▶ Start", use_container_width=True, type='primary'):
                 st.session_state['live_monitoring']     = True
                 st.session_state['live_manual_refresh'] = True
                 st.rerun()
         else:
-            if st.button("⏹ Stop Monitoring", use_container_width=True):
+            if st.button("⏹ Stop", use_container_width=True):
                 st.session_state['live_monitoring'] = False
                 st.rerun()
 
-    with mc2:
+    with bc2:
+        if st.button("🔄 Refresh", use_container_width=True):
+            st.session_state['live_manual_refresh'] = True
+            st.rerun()
+
+    cache_snap = st.session_state.get('live_cache')
+    sig_snap   = cache_snap['sig'] if cache_snap else 0
+    position   = st.session_state.get('live_position')
+
+    with bc3:
         if sig_snap != 0 and position is None:
-            lbl = "🟢 Take LONG" if sig_snap == 1 else "🔴 Take SHORT"
+            lbl = "🟢 Go LONG" if sig_snap == 1 else "🔴 Go SHORT"
             if st.button(lbl, use_container_width=True):
                 ltp_now = cache_snap.get('ltp', cache_snap.get('entry_est', 0))
+                _sl = sl_override if (override_sl and sl_override > 0) else None
+                _tp = tp_override if (override_tp and tp_override > 0) else None
                 pos = _open_position('long' if sig_snap == 1 else 'short', ltp_now,
-                                     params, live_capital, live_risk_pct, symbol, timeframe,
-                                     dhan_enabled, dhan_cfg)
+                                     params, bt_capital, bt_risk,
+                                     bt_symbol, bt_tf,
+                                     dhan_enabled, dhan_cfg,
+                                     sl_override=_sl, tp_override=_tp)
                 st.session_state['live_position'] = pos
                 st.rerun()
         else:
             st.button("Take Position", disabled=True, use_container_width=True)
 
-    with mc3:
+    with bc4:
         if position is not None:
             if st.button("🟥 Square Off", use_container_width=True):
-                sq_price = (cache_snap['ltp'] if cache_snap else position['entry_price'])
-                _close_position(position, sq_price, 'manual_squareoff',
+                sq_ltp = cache_snap['ltp'] if cache_snap else position['entry_price']
+                _close_position(position, sq_ltp, 'manual_squareoff',
                                 dhan_enabled, st.session_state.get('dhan_cfg'))
                 st.rerun()
         else:
             st.button("Square Off", disabled=True, use_container_width=True)
 
-    with mc4:
-        mon_label = "🟢 ACTIVE" if st.session_state['live_monitoring'] else "⚫ STOPPED"
-        pos_label = (f"📌 {position['direction'].upper()} @ {position['entry_price']:.4f}"
-                     if position else "💤 No position")
-        st.markdown(f"**Monitor:** {mon_label}  \n**Position:** {pos_label}")
+    # Status
+    mon_lbl = "🟢 ACTIVE" if st.session_state['live_monitoring'] else "⚫ STOPPED"
+    pos_lbl = (f"📌 {position['direction'].upper()} @ {position['entry_price']:.4f}"
+               if position else "💤 No open position")
+    last_ft  = cache_snap['fetch_time'] if cache_snap else 'never'
+    st.caption(f"Monitor: {mon_lbl}  |  Position: {pos_lbl}  |  Last fetch: {last_ft}")
 
     st.markdown("---")
 
-    # ── Decide if fetch is needed ─────────────────────────────────────────────
+    # ── Decide if fetch needed ────────────────────────────────────────────────
     now_ts     = time.time()
     last_fetch = float(st.session_state.get('live_last_fetch_ts', 0.0))
     need_fetch = (
-        manual_refresh_btn
-        or st.session_state.get('live_manual_refresh', False)
-        or st.session_state.get('live_cache') is None
+        st.session_state.get('live_manual_refresh', False)
+        or (st.session_state.get('live_cache') is None)
         or (st.session_state['live_monitoring']
             and (now_ts - last_fetch) >= float(refresh_interval))
     )
-    if manual_refresh_btn or st.session_state.get('live_manual_refresh'):
-        st.session_state['live_manual_refresh'] = False
+    st.session_state['live_manual_refresh'] = False
 
     if need_fetch:
+        df_live = None
         try:
-            df_live = fetch_yfinance_data(symbol, timeframe, period, rate_limit_sleep=1.5)
+            df_live = fetch_yfinance_data(bt_symbol, bt_tf, bt_period, rate_limit_sleep=1.5)
         except Exception as exc:
             st.error(f"Fetch error: {exc}")
-            df_live = None
 
         if df_live is not None and len(df_live) >= 10:
-            df_completed   = df_live.iloc[:-1].reset_index(drop=True)
-            current_candle = df_live.iloc[-1]
-            last_candle    = df_completed.iloc[-1]
-            df_sig, _      = generate_signals(df_completed, params)
-            last_sig_row   = df_sig.iloc[-1]
-            sig            = int(last_sig_row['signal'])
-            ltp            = float(current_candle['Close'])
-            entry_est      = float(last_candle['Close'])
-            sl_v = entry_est * (1 - params['sl_pct']) if sig == 1 else entry_est * (1 + params['sl_pct'])
-            tp_v = entry_est * (1 + params['tp_pct']) if sig == 1 else entry_est * (1 - params['tp_pct'])
+            df_comp  = df_live.iloc[:-1].reset_index(drop=True)
+            curr_c   = df_live.iloc[-1]
+            last_c   = df_comp.iloc[-1]
+            df_sig, _= generate_signals(df_comp, params)
+            lsr      = df_sig.iloc[-1]
+            sig      = int(lsr['signal'])
+            ltp      = float(curr_c['Close'])
+            e_est    = float(last_c['Close'])
+
+            # SL/TP for signal display (may be overridden)
+            if sig == 1:
+                sl_b = (sl_override if (override_sl and sl_override > 0)
+                        else e_est * (1 - params['sl_pct']))
+                tp_b = (tp_override if (override_tp and tp_override > 0)
+                        else e_est * (1 + params['tp_pct']))
+            elif sig == -1:
+                sl_b = (sl_override if (override_sl and sl_override > 0)
+                        else e_est * (1 + params['sl_pct']))
+                tp_b = (tp_override if (override_tp and tp_override > 0)
+                        else e_est * (1 - params['tp_pct']))
+            else:
+                sl_b = e_est * (1 - params['sl_pct'])
+                tp_b = e_est * (1 + params['tp_pct'])
 
             st.session_state['live_cache'] = {
-                'df_live': df_live, 'df_completed': df_completed,
-                'df_sig': df_sig, 'last_candle': last_candle,
-                'current_candle': current_candle,
-                'sig': sig, 'reason': last_sig_row.get('reason', ''),
-                'ltp': ltp, 'entry_est': entry_est, 'sl': sl_v, 'tp': tp_v,
+                'df_live': df_live, 'df_completed': df_comp,
+                'df_sig': df_sig, 'last_candle': last_c, 'current_candle': curr_c,
+                'sig': sig, 'reason': lsr.get('reason', ''),
+                'ltp': ltp, 'entry_est': e_est, 'sl': sl_b, 'tp': tp_b,
                 'fetch_time': pd.Timestamp.now(tz=IST).strftime('%Y-%m-%d %H:%M:%S %Z'),
-                'symbol': symbol, 'timeframe': timeframe, 'display_name': display_name,
             }
             st.session_state['live_last_fetch_ts'] = time.time()
 
-            # Auto SL/TP check on open position
+            # Update trailing SL on open position
+            pos = st.session_state.get('live_position')
+            if pos and trailing_sl_mode != 'None (fixed)':
+                new_sl = compute_trailing_sl(df_comp, pos, trailing_sl_mode, trailing_sl_pct)
+                if new_sl != pos['sl']:
+                    st.session_state['live_position'] = {**pos, 'sl': new_sl}
+                    st.toast(f"Trailing SL → {new_sl:.4f}", icon="📐")
+                    pos = st.session_state['live_position']
+
+            # Auto SL/TP exit check
             pos = st.session_state.get('live_position')
             if pos:
-                d, ep = pos['direction'], pos['entry_price']
-                hit = None
+                d, hit = pos['direction'], None
                 if d == 'long':
                     if ltp <= pos['sl']:   hit = 'sl_hit'
                     elif ltp >= pos['tp']: hit = 'tp_hit'
@@ -1284,138 +1494,157 @@ def live_trading_section():
                     if ltp >= pos['sl']:   hit = 'sl_hit'
                     elif ltp <= pos['tp']: hit = 'tp_hit'
                 if hit:
-                    _close_position(pos, ltp, hit, dhan_enabled, st.session_state.get('dhan_cfg'))
-                    st.toast(f"Position auto-closed: {hit} @ {ltp:.4f}", icon="🔔")
+                    _close_position(pos, ltp, hit, dhan_enabled,
+                                    st.session_state.get('dhan_cfg'))
+                    st.toast(f"Auto-closed: {hit} @ {ltp:.4f}", icon="🔔")
 
-            # Auto-execute new signal when monitoring is on and no position
+            # Auto-execute new signal if monitoring active and no position
             if (st.session_state['live_monitoring']
                     and sig != 0
                     and st.session_state.get('live_position') is None):
-                direction = 'long' if sig == 1 else 'short'
-                pos = _open_position(direction, ltp, params, live_capital, live_risk_pct,
-                                     symbol, timeframe, dhan_enabled, dhan_cfg)
-                st.session_state['live_position'] = pos
-                st.toast(f"Auto-entry: {direction.upper()} @ {ltp:.4f}", icon="🚀")
+                d2 = 'long' if sig == 1 else 'short'
+                _sl2 = sl_override if (override_sl and sl_override > 0) else None
+                _tp2 = tp_override if (override_tp and tp_override > 0) else None
+                pos2 = _open_position(d2, ltp, params, bt_capital, bt_risk,
+                                      bt_symbol, bt_tf, dhan_enabled, dhan_cfg,
+                                      sl_override=_sl2, tp_override=_tp2)
+                st.session_state['live_position'] = pos2
+                st.toast(f"Auto-entry: {d2.upper()} @ {ltp:.4f}", icon="🚀")
 
-    # ── Render from cache ─────────────────────────────────────────────────────
+    # ── Render ────────────────────────────────────────────────────────────────
     cache    = st.session_state.get('live_cache')
-    position = st.session_state.get('live_position')   # may have been updated above
+    position = st.session_state.get('live_position')
 
     if cache is None:
-        st.info("Press **▶ Start Monitoring** or **🔄 Refresh Now** to load data.")
+        st.info("Press **▶ Start** or **🔄 Refresh** to load live data.")
     else:
-        ltp      = cache['ltp']
-        entry_e  = cache['entry_est']
-        sl_disp  = position['sl']          if position else cache['sl']
-        tp_disp  = position['tp']          if position else cache['tp']
-        ep_disp  = position['entry_price'] if position else entry_e
-        sig      = cache['sig']
-        reason   = cache.get('reason', '')
-        last_c   = cache['last_candle']
-        curr_c   = cache['current_candle']
+        ltp     = cache['ltp']
+        e_est   = cache['entry_est']
+        sl_disp = position['sl']          if position else cache['sl']
+        tp_disp = position['tp']          if position else cache['tp']
+        ep_disp = position['entry_price'] if position else e_est
+        sig     = cache['sig']
+        reason  = cache.get('reason', '')
+        last_c  = cache['last_candle']
 
-        st.markdown(
-            f"**Fetched (IST):** `{cache['fetch_time']}`  |  "
-            f"**Symbol:** `{cache['display_name']}` [{cache['timeframe']}]")
+        # Compute trailing displays
+        df_comp_c    = cache.get('df_completed')
+        trail_sl_disp = None
+        trail_tp_disp = None
+        if position and df_comp_c is not None:
+            if trailing_sl_mode != 'None (fixed)':
+                trail_sl_disp = position['sl']   # already ratcheted above
+            if trailing_tp_mode != 'None (fixed)':
+                trail_tp_disp = compute_trailing_tp(
+                    df_comp_c, position, trailing_tp_mode, trailing_tp_pct)
 
-        # ── Last completed candle row ─────────────────────────────────────────
-        candle_date_str = last_c['Date'].strftime('%Y-%m-%d %H:%M:%S %Z') if hasattr(last_c['Date'], 'strftime') else str(last_c['Date'])
-        with st.container():
-            st.markdown("##### 🕯️ Last Completed Candle")
-            lc1, lc2, lc3, lc4, lc5, lc6, lc7 = st.columns(7)
-            lc1.metric("Date / Time", candle_date_str[:16])
-            lc2.metric("Open",   f"{last_c['Open']:.4f}")
-            lc3.metric("High",   f"{last_c['High']:.4f}")
-            lc4.metric("Low",    f"{last_c['Low']:.4f}")
-            lc5.metric("Close",  f"{last_c['Close']:.4f}",
-                       delta=f"{last_c['Close'] - last_c['Open']:+.4f}")
-            vol_val = last_c.get('Volume', float('nan'))
-            lc6.metric("Volume", f"{vol_val:,.0f}" if not pd.isna(vol_val) else "—")
-            sig_labels = {1: "🟢 LONG", -1: "🔴 SHORT", 0: "⏸ NONE"}
-            lc7.metric("Signal", sig_labels.get(sig, "—"))
+        # 🕯 Last completed candle
+        st.markdown("##### 🕯️ Last Completed Candle")
+        try:
+            cdate = last_c['Date'].strftime('%Y-%m-%d %H:%M %Z')
+        except Exception:
+            cdate = str(last_c['Date'])[:16]
+        lc1,lc2,lc3,lc4,lc5,lc6,lc7 = st.columns(7)
+        lc1.metric("Date/Time", cdate)
+        lc2.metric("Open",  f"{float(last_c['Open']):.4f}")
+        lc3.metric("High",  f"{float(last_c['High']):.4f}")
+        lc4.metric("Low",   f"{float(last_c['Low']):.4f}")
+        lc5.metric("Close", f"{float(last_c['Close']):.4f}",
+                   delta=f"{float(last_c['Close'])-float(last_c['Open']):+.4f}")
+        vol = last_c.get('Volume', float('nan'))
+        try:    vs = f"{float(vol):,.0f}" if not pd.isna(vol) else "—"
+        except: vs = "—"
+        lc6.metric("Volume", vs)
+        lc7.metric("Signal", {1:"🟢 LONG",-1:"🔴 SHORT",0:"⏸ NONE"}.get(sig,"—"))
 
         st.markdown("---")
 
-        # ── Live metrics bar ──────────────────────────────────────────────────
+        # 📊 Live metrics
         st.markdown("##### 📊 Live Metrics")
-        m1, m2, m3, m4, m5 = st.columns(5)
-        m1.metric("LTP (forming candle)", f"{ltp:.4f}")
-        m2.metric("Est. Entry",           f"{ep_disp:.4f}", help="Next candle open estimate")
-        m3.metric("Stop Loss",  f"{sl_disp:.4f}",
-                  delta=f"{((sl_disp / ep_disp) - 1) * 100:.2f}%" if ep_disp else None,
-                  delta_color='inverse')
-        m4.metric("Target",     f"{tp_disp:.4f}",
-                  delta=f"{((tp_disp / ep_disp) - 1) * 100:.2f}%" if ep_disp else None)
-
+        m1,m2,m3,m4,m5 = st.columns(5)
+        m1.metric("LTP (forming)", f"{ltp:.4f}")
+        m2.metric("Est. Entry",    f"{ep_disp:.4f}", help="Next candle open estimate")
+        sd = f"{((sl_disp/ep_disp)-1)*100:.2f}%" if ep_disp > 0 else None
+        td = f"{((tp_disp/ep_disp)-1)*100:.2f}%" if ep_disp > 0 else None
+        m3.metric("Stop Loss", f"{sl_disp:.4f}", delta=sd, delta_color='inverse')
+        m4.metric("Target",    f"{tp_disp:.4f}", delta=td)
         if position:
-            d   = position['direction']
-            ep  = position['entry_price']
-            qty = position.get('qty', 1)
-            pnl_pts = (ltp - ep) if d == 'long' else (ep - ltp)
-            pnl_pct = pnl_pts / ep * 100
-            pnl_amt = pnl_pts * qty
-            m5.metric("Live P&L", f"₹ {pnl_amt:+.2f}",
-                      delta=f"{pnl_pts:+.4f} pts ({pnl_pct:+.2f}%)",
-                      delta_color='normal' if pnl_pts >= 0 else 'inverse')
+            d,ep,qty = position['direction'], position['entry_price'], position.get('qty',1)
+            pp = (ltp-ep) if d=='long' else (ep-ltp)
+            m5.metric("Live P&L", f"₹ {pp*qty:+.2f}",
+                      delta=f"{pp:+.4f} pts ({pp/ep*100:+.2f}%)",
+                      delta_color='normal' if pp>=0 else 'inverse')
         else:
             m5.metric("Live P&L", "—")
 
-        # Dhan response
+        if trail_sl_disp is not None or trail_tp_disp is not None:
+            t1,t2,_ = st.columns(3)
+            if trail_sl_disp is not None:
+                t1.metric("Trailing SL", f"{trail_sl_disp:.4f}",
+                          help="Ratcheted SL — only moves in your favour")
+            if trail_tp_disp is not None:
+                t2.metric("Trailing TP ★ (display only)", f"{trail_tp_disp:.4f}",
+                          help="Never used to exit. Purple line on chart.")
+
         if position and position.get('dhan_entry_response'):
             with st.expander("📤 Dhan Entry Response", expanded=False):
                 st.json(position['dhan_entry_response'])
 
-        # ── Signal box ───────────────────────────────────────────────────────
+        # Signal box
         st.markdown("---")
         if sig == 0:
-            st.warning("⏸ No signal on last completed candle. Watching for next opportunity…")
+            st.warning("⏸ No signal on last completed candle. Watching…")
         else:
-            dir_label = "🟢 LONG (Buy)" if sig == 1 else "🔴 SHORT (Sell)"
-            st.subheader(f"Signal: {dir_label}")
-            rr = abs(cache['tp'] - entry_e) / max(abs(entry_e - cache['sl']), 1e-9)
-            qty_hint = ""
-            if live_capital > 0 and abs(entry_e - cache['sl']) > 0:
-                qty_hint = (f"  |  Suggested Qty: **"
-                            f"{max(1, int((live_capital * live_risk_pct / 100) // abs(entry_e - cache['sl'])))}**")
-            st.caption(f"R:R ≈ 1:{rr:.2f}{qty_hint}  |  Reason: `{reason or 'N/A'}`")
+            dl = "🟢 LONG (Buy)" if sig==1 else "🔴 SHORT (Sell)"
+            st.subheader(f"Signal: {dl}")
+            rr = abs(cache['tp']-e_est)/max(abs(e_est-cache['sl']),1e-9)
+            qh = ""
+            if bt_capital>0 and abs(e_est-cache['sl'])>0:
+                qh = f"  |  Qty: **{max(1,int((bt_capital*bt_risk/100)//abs(e_est-cache['sl'])))}**"
+            st.caption(f"R:R ≈ 1:{rr:.2f}{qh}  |  Reason: `{reason or 'N/A'}`")
             with st.expander("📖 Why this signal?", expanded=False):
-                st.markdown(explain_signal_reason(reason, 'long' if sig == 1 else 'short',
-                                                   entry_e, cache['sl'], cache['tp']))
-            st.info("⚡ **Entry rule:** Wait for the next candle to OPEN, then place your order.")
+                st.markdown(explain_signal_reason(reason,'long' if sig==1 else 'short',
+                                                  e_est,cache['sl'],cache['tp']))
+            st.info("⚡ Entry = OPEN of the next candle. Do not chase current close.")
 
-        # ── Candlestick chart ─────────────────────────────────────────────────
+        # Candlestick chart
         st.markdown("---")
-        chart_entry = position['entry_price'] if position else None
-        chart_sl    = position['sl']          if position else None
-        chart_tp    = position['tp']          if position else None
         fig = draw_candlestick_chart(
             cache['df_live'],
-            title=f"{display_name} — {timeframe}  |  LTP: {ltp:.4f}",
-            sl=chart_sl, tp=chart_tp, entry=chart_entry, n_candles=80)
+            title=f"{bt_display} [{bt_tf}]  |  LTP: {ltp:.4f}",
+            sl=sl_disp if position else None,
+            tp=tp_disp if position else None,
+            entry=position['entry_price'] if position else None,
+            trailing_sl=trail_sl_disp,
+            trailing_tp=trail_tp_disp,
+            n_candles=80,
+        )
         st.pyplot(fig, use_container_width=True)
         plt.close(fig)
 
-        # ── Recent candles table ──────────────────────────────────────────────
+        # Recent candles table
         with st.expander("📋 Recent completed candles (last 20)", expanded=False):
-            disp     = cache['df_completed'].tail(20).copy()
+            disp = cache['df_completed'].tail(20).copy()
             disp['Date'] = disp['Date'].dt.strftime('%Y-%m-%d %H:%M %Z')
-            sig_tail = cache['df_sig'].tail(20)[['signal', 'reason']].reset_index(drop=True)
-            disp     = disp.reset_index(drop=True)
-            disp['signal'] = sig_tail['signal']
-            disp['reason'] = sig_tail['reason']
-            # Highlight the last row
-            def highlight_last(row):
-                return ['background-color: #1a3a1a' if row.name == len(disp) - 1 else '' for _ in row]
-            st.dataframe(disp.style.apply(highlight_last, axis=1), use_container_width=True)
+            st_tail = cache['df_sig'].tail(20)[['signal','reason']].reset_index(drop=True)
+            disp    = disp.reset_index(drop=True)
+            disp['signal'] = st_tail['signal']
+            disp['reason'] = st_tail['reason']
+            st.dataframe(disp, use_container_width=True)
 
-    # ── Auto-refresh scheduling ───────────────────────────────────────────────
-    if st.session_state['live_monitoring']:
+    # ─────────────────────────────────────────────────────────────────────────
+    # STRICT AUTO-REFRESH
+    # 1-second sleep loop runs ONLY when monitoring=True.
+    # Stop button sets monitoring=False → next rerun skips this block → STOPS.
+    # No dangling threads, no memory build-up.
+    # ─────────────────────────────────────────────────────────────────────────
+    if st.session_state.get('live_monitoring', False):
         elapsed   = time.time() - float(st.session_state.get('live_last_fetch_ts', 0.0))
-        remaining = max(1.5, float(refresh_interval) - elapsed)
-        st.caption(f"⏳ Next refresh in ~{remaining:.0f} s")
-        time.sleep(remaining)
+        remaining = max(0.0, float(refresh_interval) - elapsed)
+        st.caption(f"⏳ Next data fetch in ~{remaining:.0f} s  (monitoring active)")
+        time.sleep(1.0)    # always just 1 second — never holds thread for full interval
         st.rerun()
-
+    # else: monitoring OFF → no sleep, no rerun → execution STOPS ✅
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Trade History Tab
@@ -1540,6 +1769,13 @@ def app():
                 try:
                     df = fetch_yfinance_data(yfin_symbol, yfin_tf, yfin_period)
                     st.success(f"Loaded {len(df)} candles — {yfin_display} [{yfin_tf}] period={yfin_period}")
+                    # Store context for Live tab to inherit
+                    st.session_state['bt_symbol']      = yfin_symbol
+                    st.session_state['bt_display_name']= yfin_display
+                    st.session_state['bt_timeframe']   = yfin_tf
+                    st.session_state['bt_period']      = yfin_period
+                    st.session_state['bt_capital']     = capital
+                    st.session_state['bt_risk_pct']    = risk_pct
                 except Exception as exc:
                     st.error(f"Fetch failed: {exc}"); st.stop()
         else:
@@ -1550,6 +1786,13 @@ def app():
                        else pd.read_excel(upload))
                 df, mapping = standardize_df(raw)
                 st.subheader("Detected columns"); st.json(mapping)
+                # Store context for Live tab
+                st.session_state['bt_symbol']       = upload.name
+                st.session_state['bt_display_name'] = upload.name
+                st.session_state['bt_timeframe']    = 'uploaded'
+                st.session_state['bt_period']       = 'N/A'
+                st.session_state['bt_capital']      = capital
+                st.session_state['bt_risk_pct']     = risk_pct
             except Exception as exc:
                 st.error(f"File error: {exc}"); st.stop()
 
