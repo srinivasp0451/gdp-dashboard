@@ -138,9 +138,6 @@ EMA_ENTRY_FILTERS = [
     "ATR-based Candle"
 ]
 
-dhan_client_id_value = "1104779876"
-dhan_token_value = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzUxMiJ9.eyJpc3MiOiJkaGFuIiwicGFydG5lcklkIjoiIiwiZXhwIjoxNzc4OTEyNTExLCJpYXQiOjE3Nzg4MjYxMTEsInRva2VuQ29uc3VtZXJUeXBlIjoiU0VMRiIsIndlYmhvb2tVcmwiOiIiLCJkaGFuQ2xpZW50SWQiOiIxMTA0Nzc5ODc2In0.l2C0nxeZnxqjN6qBvcOK17DpqYgJIfdIrfhdA1B9pqRDZeyHjyoJD3kuAIPmlYWGXaWlkHLz3x0RDZ5U7p-0WQ"
-
 # ================================
 # DHAN BROKER INTEGRATION CLASS
 # ================================
@@ -838,8 +835,8 @@ def fetch_data(ticker_symbol, interval, period, is_live_trading=False, custom_ti
             instrument_type  = config.get('dhan_data_instrument_type', 'INDEX'),
             interval         = interval,
             period           = period,
-            client_id        = config.get('dhan_data_client_id') or config.get('dhan_client_id', '1104779876'),
-            access_token     = config.get('dhan_data_access_token') or config.get('dhan_access_token', 'eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzUxMiJ9.eyJpc3MiOiJkaGFuIiwicGFydG5lcklkIjoiIiwiZXhwIjoxNzc4OTEyNTExLCJpYXQiOjE3Nzg4MjYxMTEsInRva2VuQ29uc3VtZXJUeXBlIjoiU0VMRiIsIndlYmhvb2tVcmwiOiIiLCJkaGFuQ2xpZW50SWQiOiIxMTA0Nzc5ODc2In0.l2C0nxeZnxqjN6qBvcOK17DpqYgJIfdIrfhdA1B9pqRDZeyHjyoJD3kuAIPmlYWGXaWlkHLz3x0RDZ5U7p-0WQ'),
+            client_id        = config.get('dhan_data_client_id') or config.get('dhan_client_id', ''),
+            access_token     = config.get('dhan_data_access_token') or config.get('dhan_access_token', ''),
             is_live_trading  = is_live_trading,
         )
 
@@ -3868,10 +3865,10 @@ def render_config_ui():
         st.sidebar.markdown("**DhanHQ Data Feed**")
         st.sidebar.caption("Leave blank to reuse the broker credentials entered below.")
         config['dhan_data_client_id'] = st.sidebar.text_input(
-            "Client ID (data feed)", value=dhan_client_id_value, key="dhan_data_client_id_in",
+            "Client ID (data feed)", value="", key="dhan_data_client_id_in",
         )
         config['dhan_data_access_token'] = st.sidebar.text_input(
-            "Access Token (data feed)", type="password", key="dhan_data_token_in",value=dhan_token_value
+            "Access Token (data feed)", type="password", key="dhan_data_token_in",
         )
         config['dhan_data_security_id'] = st.sidebar.text_input(
             "Security ID", value="13", key="dhan_data_sec_id_in",
@@ -5041,6 +5038,126 @@ def render_backtest_ui(config):
             if filter_market_hours:
                 st.write(f"- Trades after same-day filter (9:15 AM–3:00 PM IST): {len(trades)}")
 
+@st.fragment(run_every=1.5)
+def render_live_values_panel(config):
+    """Refresh only live trading values, not the full tab."""
+    if st.session_state.get('trading_active', False):
+        live_trading_iteration()
+
+    current_data = st.session_state.get('current_data')
+
+    if current_data is not None:
+        st.subheader("📈 Current Market Data")
+        
+        col1, col2, col3, col4, col5 = st.columns(5)
+        with col1:
+            st.metric("Current Price", f"₹{current_data['Close']:.2f}")
+        with col2:
+            if not pd.isna(current_data.get('EMA_Fast')):
+                st.metric("Fast EMA", f"₹{current_data['EMA_Fast']:.2f}")
+            else:
+                st.metric("Fast EMA", "N/A")
+        with col3:
+            if not pd.isna(current_data.get('EMA_Slow')):
+                st.metric("Slow EMA", f"₹{current_data['EMA_Slow']:.2f}")
+            else:
+                st.metric("Slow EMA", "N/A")
+        with col4:
+            if not pd.isna(current_data.get('EMA_Fast_Angle')):
+                st.metric("EMA Angle", f"{current_data['EMA_Fast_Angle']:.2f}°")
+            else:
+                st.metric("EMA Angle", "N/A")
+        with col5:
+            if not pd.isna(current_data.get('EMA_Fast')) and not pd.isna(current_data.get('EMA_Slow')):
+                crossover = "Bullish" if current_data['EMA_Fast'] > current_data['EMA_Slow'] else "Bearish"
+                st.metric("Crossover", crossover)
+            else:
+                st.metric("Crossover", "N/A")
+
+    st.subheader("Current Position")
+    position = st.session_state.get('position')
+
+    if position:
+        current_price = current_data['Close'] if current_data is not None else None
+
+        col1, col2, col3, col4, col5 = st.columns(5)
+        with col1:
+            st.metric("Type", position['type'])
+        with col2:
+            st.metric("Entry Price", f"Rs {position['entry_price']:.2f}")
+        with col3:
+            st.metric("Current Price", f"Rs {current_price:.2f}" if current_price is not None else "N/A")
+        with col4:
+            sl_display = f"Rs {position['sl_price']:.2f}" if position['sl_price'] is not None else "Not Set"
+            st.metric("Stop Loss", sl_display)
+        with col5:
+            target_display = f"Rs {position['target_price']:.2f}" if position['target_price'] is not None else "Not Set"
+            st.metric("Target", target_display)
+
+        col1, col2, col3, col4, col5 = st.columns(5)
+        with col1:
+            st.metric("Quantity", position['quantity'])
+        with col2:
+            st.metric("Locked Ticker", position.get('ticker', 'N/A'))
+        with col3:
+            if current_price is not None:
+                if position['type'] == 'LONG':
+                    current_pnl = (current_price - position['entry_price']) * position['quantity']
+                else:
+                    current_pnl = (position['entry_price'] - current_price) * position['quantity']
+                st.metric("Current P&L", f"Rs {current_pnl:.2f}", delta=f"Rs {current_pnl:.2f}")
+            else:
+                st.metric("Current P&L", "N/A")
+        with col4:
+            st.metric("Highest Price", f"Rs {position.get('highest_price', 0):.2f}")
+        with col5:
+            st.metric("Lowest Price", f"Rs {position.get('lowest_price', 0):.2f}")
+
+        if position.get('ticker') != config.get('asset'):
+            st.warning(f"Position locked to {position.get('ticker')}. Config changes won't affect active position.")
+
+        st.info(f"Entry Time: {position['entry_time'].strftime('%Y-%m-%d %H:%M:%S')}")
+    else:
+        st.info("No active position")
+
+    if config.get('dhan_enabled', False) and st.session_state.get('broker_position'):
+        st.subheader("Broker Position")
+        broker_pos = st.session_state['broker_position']
+        col1, col2, col3, col4 = st.columns(4)
+        with col1:
+            st.metric("Order ID", broker_pos['order_id'])
+        with col2:
+            st.metric("Transaction", broker_pos.get('transaction_type', broker_pos.get('option_type', 'N/A')))
+        with col3:
+            st.metric("Security ID", broker_pos['security_id'])
+        with col4:
+            st.metric("Status", broker_pos['status'])
+
+    st.subheader("Completed Trades")
+    trade_history = st.session_state.get('trade_history', [])
+    if trade_history:
+        df_history = pd.DataFrame(trade_history)
+        df_display = df_history.copy()
+        for col in ['entry_price', 'exit_price', 'highest_price', 'lowest_price', 'pnl',
+                    'net_pnl', 'brokerage', 'sl_price', 'target_price']:
+            if col in df_display.columns:
+                df_display[col] = df_display[col].apply(lambda x: f"Rs {x:.2f}" if pd.notna(x) else "-")
+
+        display_cols = ['entry_time', 'exit_time', 'ticker', 'type', 'entry_price', 'exit_price',
+                        'highest_price', 'lowest_price', 'pnl', 'net_pnl', 'exit_reason']
+        st.dataframe(df_display[[c for c in display_cols if c in df_display.columns]], width="stretch", height=200)
+    else:
+        st.info("No completed trades yet. Trades will appear here immediately after exit.")
+
+    st.subheader("Trading Logs")
+    logs = st.session_state.get('live_logs', [])
+    if logs:
+        log_text = "\n".join(reversed(logs[-50:]))
+        st.text_area("Trading Logs", value=log_text, height=300, disabled=True, label_visibility="collapsed")
+    else:
+        st.info("No logs yet")
+
+
 def render_live_trading_ui(config):
     """Render live trading interface with comprehensive information"""
     st.header("🔴 Live Trading")
@@ -5285,6 +5402,9 @@ def render_live_trading_ui(config):
     except Exception as e:
         st.warning(f"⚠️ Chart error: {e}")
     
+    render_live_values_panel(config)
+    return
+
     # Display current indicators and prices
     current_data = st.session_state.get('current_data')
     if current_data is not None:
@@ -5573,15 +5693,6 @@ def render_live_trading_ui(config):
     else:
         st.info("No logs yet")
     
-    # Auto-refresh and iteration
-    if st.session_state.get('trading_active', False):
-        # Run iteration
-        live_trading_iteration()
-        
-        # Auto-refresh every 1.5 seconds
-        time.sleep(1.5)
-        st.rerun()
-
 def render_trade_logs_ui():
     """Render comprehensive trade history and statistics"""
     st.header("📊 Trade History & Statistics")
