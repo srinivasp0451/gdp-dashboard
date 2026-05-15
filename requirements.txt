@@ -13,7 +13,7 @@ scipy
 scikit-learn
 statsmodels
 seaborn
-dhanhq
+dhanhq==2.0.2
 nest-asyncio
 Dhan-Tradehull
 #sqlite3
