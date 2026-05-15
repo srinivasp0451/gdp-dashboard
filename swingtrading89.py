@@ -138,6 +138,9 @@ EMA_ENTRY_FILTERS = [
     "ATR-based Candle"
 ]
 
+dhan_client_id_value = "1104779876"
+dhan_token_value = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzUxMiJ9.eyJpc3MiOiJkaGFuIiwicGFydG5lcklkIjoiIiwiZXhwIjoxNzc4OTEyNTExLCJpYXQiOjE3Nzg4MjYxMTEsInRva2VuQ29uc3VtZXJUeXBlIjoiU0VMRiIsIndlYmhvb2tVcmwiOiIiLCJkaGFuQ2xpZW50SWQiOiIxMTA0Nzc5ODc2In0.l2C0nxeZnxqjN6qBvcOK17DpqYgJIfdIrfhdA1B9pqRDZeyHjyoJD3kuAIPmlYWGXaWlkHLz3x0RDZ5U7p-0WQ"
+
 # ================================
 # DHAN BROKER INTEGRATION CLASS
 # ================================
@@ -835,8 +838,8 @@ def fetch_data(ticker_symbol, interval, period, is_live_trading=False, custom_ti
             instrument_type  = config.get('dhan_data_instrument_type', 'INDEX'),
             interval         = interval,
             period           = period,
-            client_id        = config.get('dhan_data_client_id') or config.get('dhan_client_id', ''),
-            access_token     = config.get('dhan_data_access_token') or config.get('dhan_access_token', ''),
+            client_id        = config.get('dhan_data_client_id') or config.get('dhan_client_id', '1104779876'),
+            access_token     = config.get('dhan_data_access_token') or config.get('dhan_access_token', 'eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzUxMiJ9.eyJpc3MiOiJkaGFuIiwicGFydG5lcklkIjoiIiwiZXhwIjoxNzc4OTEyNTExLCJpYXQiOjE3Nzg4MjYxMTEsInRva2VuQ29uc3VtZXJUeXBlIjoiU0VMRiIsIndlYmhvb2tVcmwiOiIiLCJkaGFuQ2xpZW50SWQiOiIxMTA0Nzc5ODc2In0.l2C0nxeZnxqjN6qBvcOK17DpqYgJIfdIrfhdA1B9pqRDZeyHjyoJD3kuAIPmlYWGXaWlkHLz3x0RDZ5U7p-0WQ'),
             is_live_trading  = is_live_trading,
         )
 
@@ -3865,10 +3868,10 @@ def render_config_ui():
         st.sidebar.markdown("**DhanHQ Data Feed**")
         st.sidebar.caption("Leave blank to reuse the broker credentials entered below.")
         config['dhan_data_client_id'] = st.sidebar.text_input(
-            "Client ID (data feed)", value="", key="dhan_data_client_id_in",
+            "Client ID (data feed)", value=dhan_client_id_value, key="dhan_data_client_id_in",
         )
         config['dhan_data_access_token'] = st.sidebar.text_input(
-            "Access Token (data feed)", type="password", key="dhan_data_token_in",
+            "Access Token (data feed)", type="password", key="dhan_data_token_in",value=dhan_token_value
         )
         config['dhan_data_security_id'] = st.sidebar.text_input(
             "Security ID", value="13", key="dhan_data_sec_id_in",
