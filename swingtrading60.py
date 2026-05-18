@@ -372,7 +372,8 @@ class DhanBrokerIntegration:
 
         else:
             security_id = config.get('dhan_security_id', '1234')
-            txn = 'BUY' if signal in ('BUY', 'LONG') else 'SELL'
+            #txn = 'BUY' if signal in ('BUY', 'LONG') else 'SELL'
+            txn = 'SELL' if signal in ('BUY', 'LONG') else 'BUY'
             log_func(f"🏦 {'Delivery' if trading_type=='Delivery (CNC)' else 'Intraday'} → {txn} | Security: {security_id}")
             op = _build_bo_params(txn, price)
             order_response = self.place_order(txn, security_id, quantity, signal, op)
