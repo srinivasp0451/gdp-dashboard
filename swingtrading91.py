@@ -835,25 +835,37 @@ def calc_stats(trades: pd.DataFrame, initial_capital: float) -> dict:
     losses = pnl[pnl <= 0]
     cap    = trades["Capital"]
 
-    total_ret = (float(cap.iloc[-1]) - initial_capital) / initial_capital * 100
+    final_cap = float(cap.iloc[-1])
+    total_ret = (final_cap - initial_capital) / initial_capital * 100
     win_rate  = len(wins) / len(pnl) * 100 if len(pnl) else 0
     pf        = abs(wins.sum() / losses.sum()) if losses.sum() != 0 else float("inf")
     max_dd    = ((cap - cap.cummax()) / cap.cummax() * 100).min()
     sharpe    = pnl.mean() / pnl.std() * (252 ** 0.5) if pnl.std() > 0 else 0
 
+    # Consecutive loss streak
+    streak, best_streak = 0, 0
+    for v in (pnl > 0):
+        if not v:
+            streak += 1
+            best_streak = max(best_streak, streak)
+        else:
+            streak = 0
+
     return {
-        "Total Trades":   int(len(pnl)),
-        "Win Rate":        f"{win_rate:.1f}%",
-        "Total PnL":       round(float(pnl.sum()), 2),
-        "Total Return":    f"{total_ret:.2f}%",
-        "Avg Win":         round(float(wins.mean()), 2) if len(wins) else 0.0,
-        "Avg Loss":        round(float(losses.mean()), 2) if len(losses) else 0.0,
-        "Profit Factor":   round(float(pf), 2),
-        "Max Drawdown":    f"{max_dd:.2f}%",
-        "Winning Trades":  int(len(wins)),
-        "Losing Trades":   int(len(losses)),
-        "Expectancy":      round(float(pnl.mean()), 2),
-        "Sharpe Proxy":    round(float(sharpe), 2),
+        "Total Trades":    int(len(pnl)),
+        "Win Rate":         f"{win_rate:.1f}%",
+        "Total PnL":        round(float(pnl.sum()), 2),
+        "Total Return":     f"{total_ret:.2f}%",
+        "Final Capital":    round(final_cap, 2),
+        "Avg Win":          round(float(wins.mean()), 2) if len(wins) else 0.0,
+        "Avg Loss":         round(float(losses.mean()), 2) if len(losses) else 0.0,
+        "Profit Factor":    round(float(pf), 2),
+        "Max Drawdown":     f"{max_dd:.2f}%",
+        "Winning Trades":   int(len(wins)),
+        "Losing Trades":    int(len(losses)),
+        "Expectancy":       round(float(pnl.mean()), 2),
+        "Sharpe Proxy":     round(float(sharpe), 2),
+        "Max Loss Streak":  int(best_streak),
     }
 
 
@@ -1016,6 +1028,200 @@ def build_chart(df: pd.DataFrame, signals: pd.DataFrame,
 
 
 # ─────────────────────────────────────────────────────────────
+# INSIGHTS & RECOMMENDATIONS ENGINE
+# ─────────────────────────────────────────────────────────────
+def generate_insights(trades: pd.DataFrame, stats: dict,
+                      strategy: str, interval: str) -> Tuple[list, list]:
+    """
+    Analyse backtest trades and return (insights, recommendations).
+    Each element is a (emoji, title, detail) tuple.
+    """
+    if trades.empty or not stats:
+        return [], []
+
+    insights: list        = []
+    recommendations: list = []
+
+    pnl        = trades["PnL"]
+    win_rate   = float(stats["Win Rate"].replace("%", ""))
+    pf         = float(stats["Profit Factor"]) if stats["Profit Factor"] != "inf" else 99.0
+    total_ret  = float(stats["Total Return"].replace("%", ""))
+    max_dd     = float(stats["Max Drawdown"].replace("%", ""))
+    avg_win    = float(stats["Avg Win"])
+    avg_loss   = float(stats["Avg Loss"]) if stats["Avg Loss"] != 0 else -1e-9
+    max_streak = int(stats["Max Loss Streak"])
+    n_trades   = int(stats["Total Trades"])
+
+    # ── 1. Win-rate pattern ──────────────────────────────
+    if win_rate >= 60:
+        insights.append(("✅", "High Win Rate",
+                          f"{win_rate:.1f}% of trades are winners — strategy finds good entries."))
+    elif win_rate >= 45:
+        insights.append(("🟡", "Moderate Win Rate",
+                          f"{win_rate:.1f}% win rate. Gains rely on avg-win > avg-loss ratio."))
+    else:
+        insights.append(("🔴", "Low Win Rate",
+                          f"Only {win_rate:.1f}% wins. Strategy wins rarely — needs large RR to be profitable."))
+        recommendations.append(("💡", "Tighten entry filters",
+                                  "Add a trend-confirmation indicator (e.g. 200 EMA direction) "
+                                  "so you only trade in the dominant direction."))
+
+    # ── 2. Risk-reward pattern ───────────────────────────
+    rr = abs(avg_win / avg_loss) if avg_loss != 0 else 0
+    if rr >= 2:
+        insights.append(("✅", "Strong Risk-Reward",
+                          f"Avg win ₹{avg_win:.2f} vs avg loss ₹{abs(avg_loss):.2f} → RR ≈ {rr:.1f}x"))
+    elif rr >= 1:
+        insights.append(("🟡", "Acceptable Risk-Reward",
+                          f"RR ≈ {rr:.1f}x. Slight edge but requires consistent win rate."))
+    else:
+        insights.append(("🔴", "Poor Risk-Reward",
+                          f"Losses ({abs(avg_loss):.2f}) exceed wins ({avg_win:.2f}). RR < 1."))
+        recommendations.append(("💡", "Widen take-profit or tighten stop-loss",
+                                  "Try ATR-based TP (2–3× ATR) with a 1× ATR stop-loss "
+                                  "to push RR above 1.5."))
+
+    # ── 3. Profit factor ────────────────────────────────
+    if pf >= 2:
+        insights.append(("✅", "Excellent Profit Factor",
+                          f"PF {pf:.2f} — total winnings are {pf:.1f}× total losses."))
+    elif pf >= 1:
+        insights.append(("🟡", "Marginal Profit Factor",
+                          f"PF {pf:.2f} — strategy is profitable but edge is narrow."))
+        recommendations.append(("💡", "Reduce number of low-quality trades",
+                                  "Filter out signals that occur in low-volume or ranging markets "
+                                  "to concentrate on higher-quality setups."))
+    else:
+        insights.append(("🔴", "Unprofitable Profit Factor",
+                          f"PF {pf:.2f} — total losses exceed total wins."))
+
+    # ── 4. Drawdown risk ────────────────────────────────
+    if abs(max_dd) <= 10:
+        insights.append(("✅", "Low Drawdown",
+                          f"Max drawdown {max_dd:.1f}% — capital is well preserved."))
+    elif abs(max_dd) <= 25:
+        insights.append(("🟡", "Moderate Drawdown",
+                          f"Max drawdown {max_dd:.1f}% — acceptable but monitor closely."))
+        recommendations.append(("🛡️", "Add a daily loss limit",
+                                  "If intraday losses exceed 2–3% of capital, pause trading "
+                                  "for the day to prevent runaway drawdowns."))
+    else:
+        insights.append(("🔴", "High Drawdown Risk",
+                          f"Max drawdown {max_dd:.1f}% — strategy risks significant capital loss."))
+        recommendations.append(("🛡️", "Reduce position sizing",
+                                  f"With {abs(max_dd):.0f}% max drawdown, cut qty by 30–50% "
+                                  "or add a trailing stop to limit losses per trade."))
+
+    # ── 5. Consecutive loss streak ──────────────────────
+    if max_streak >= 5:
+        insights.append(("⚠️", f"Max {max_streak} Consecutive Losses",
+                          "Strategy can lose several times in a row — psychological & capital risk."))
+        recommendations.append(("💡", "Implement a circuit-breaker rule",
+                                  f"After {min(max_streak, 3)} consecutive losses, "
+                                  "pause and wait for the next confirmed signal before re-entering."))
+    elif max_streak >= 3:
+        insights.append(("🟡", f"Up to {max_streak} consecutive losses observed",
+                          "Normal for most strategies; ensure capital allocation handles this."))
+
+    # ── 6. Exit-reason analysis ──────────────────────────
+    if "Exit Reason" in trades.columns:
+        er = trades.groupby("Exit Reason")["PnL"].agg(["count", "mean", "sum"])
+        sl_row  = er[er.index.str.contains("SL",  case=False)] if not er.empty else None
+        tp_row  = er[er.index.str.contains("TP1", case=False)] if not er.empty else None
+        sig_row = er[er.index.str.contains("Signal|Switch", case=False)] if not er.empty else None
+
+        if sl_row is not None and not sl_row.empty:
+            sl_pct = sl_row["count"].sum() / n_trades * 100
+            if sl_pct > 55:
+                insights.append(("🔴", f"SL Hit on {sl_pct:.0f}% of Trades",
+                                   "Stop-loss is triggered too frequently — it may be too tight."))
+                recommendations.append(("💡", "Widen or reposition your stop-loss",
+                                          "Try placing SL below the previous swing low (for longs) "
+                                          "instead of a fixed-point SL."))
+
+        if tp_row is not None and not tp_row.empty:
+            tp_pct = tp_row["count"].sum() / n_trades * 100
+            if tp_pct > 40:
+                insights.append(("✅", f"TP1 Reached on {tp_pct:.0f}% of Trades",
+                                   "Strategy consistently hits initial targets — consider partial exits "
+                                   "and trailing the remainder for larger gains."))
+                recommendations.append(("📈", "Use Partial Exit at TP1 then Trail",
+                                          "Exit 60–70% at TP1, then trail the remaining position "
+                                          "to capture extended moves."))
+
+        if sig_row is not None and not sig_row.empty:
+            sig_pct = sig_row["count"].sum() / n_trades * 100
+            avg_sig_pnl = float(sig_row["sum"].sum() / max(sig_row["count"].sum(), 1))
+            if sig_pct > 30:
+                color = "positive" if avg_sig_pnl > 0 else "negative"
+                insights.append(("🔄", f"{sig_pct:.0f}% Exits via Signal Reversal",
+                                   f"Many trades exit on reversal signals (avg PnL ₹{avg_sig_pnl:.1f}). "
+                                   f"This is {'working well' if avg_sig_pnl > 0 else 'losing money'}."))
+
+    # ── 7. Monthly pattern ───────────────────────────────
+    try:
+        td = trades.copy()
+        td["Month"]  = pd.to_datetime(td["Exit Date"]).dt.month_name()
+        td["MonthN"] = pd.to_datetime(td["Exit Date"]).dt.month
+        monthly = td.groupby(["MonthN", "Month"])["PnL"].agg(
+            Total="sum", WinRate=lambda x: (x > 0).mean() * 100
+        ).reset_index().sort_values("MonthN")
+        if len(monthly) >= 3:
+            best  = monthly.loc[monthly["Total"].idxmax()]
+            worst = monthly.loc[monthly["Total"].idxmin()]
+            insights.append(("📅", "Seasonal Pattern Detected",
+                               f"Best month: {best['Month']} (₹{best['Total']:.0f}, "
+                               f"{best['WinRate']:.0f}% win rate).  "
+                               f"Worst month: {worst['Month']} (₹{worst['Total']:.0f}, "
+                               f"{worst['WinRate']:.0f}% win rate)."))
+            if float(worst["Total"]) < 0:
+                recommendations.append(("📅", f"Avoid or reduce size in {worst['Month']}",
+                                          f"{worst['Month']} has been consistently unprofitable "
+                                          "in this dataset. Consider sitting out or halving position size."))
+    except Exception:
+        pass
+
+    # ── 8. Trade frequency ───────────────────────────────
+    try:
+        date_range = (pd.to_datetime(trades["Exit Date"].iloc[-1]) -
+                      pd.to_datetime(trades["Entry Date"].iloc[0])).days
+        if date_range > 0:
+            trades_per_month = n_trades / max(date_range / 30, 1)
+            if trades_per_month < 1:
+                insights.append(("📉", "Very Low Trade Frequency",
+                                   f"~{trades_per_month:.1f} trades/month. "
+                                   "Strategy signals are rare — long periods of no activity."))
+                recommendations.append(("💡", "Consider a shorter interval",
+                                          f"Try switching from '{interval}' to a shorter timeframe "
+                                          "to generate more signals if capital is idle too long."))
+            elif trades_per_month > 20:
+                insights.append(("⚡", "High Trade Frequency",
+                                   f"~{trades_per_month:.0f} trades/month. "
+                                   "Watch out for transaction costs eroding profits."))
+                recommendations.append(("💡", "Account for brokerage costs",
+                                          "At this frequency, brokerage fees can significantly impact "
+                                          "net returns. Add a cost buffer to your SL/TP calculations."))
+    except Exception:
+        pass
+
+    # ── 9. Overall verdict recommendation ────────────────
+    if total_ret > 0 and pf >= 1.5 and abs(max_dd) <= 20:
+        recommendations.append(("🚀", "Strategy is deployment-ready",
+                                  "Positive returns, healthy profit factor, and controlled drawdown. "
+                                  "Paper-trade for 2–4 weeks before going live."))
+    elif total_ret > 0:
+        recommendations.append(("🔧", "Optimise before going live",
+                                  "Strategy is profitable but has weaknesses. "
+                                  "Focus on the recommendations above, then re-backtest."))
+    else:
+        recommendations.append(("🛑", "Do not deploy yet",
+                                  "Strategy is not profitable in this configuration. "
+                                  "Revisit entry logic, SL/TP method, and timeframe."))
+
+    return insights, recommendations
+
+
+# ─────────────────────────────────────────────────────────────
 # MAIN APPLICATION
 # ─────────────────────────────────────────────────────────────
 def main():
@@ -1099,13 +1305,10 @@ def main():
 
         st.markdown('<div class="section-header">Capital & Quantity</div>', unsafe_allow_html=True)
         initial_capital = st.number_input("Initial Capital (₹)", 1_000, 50_000_000, 100_000, step=5_000)
-        use_fixed_qty   = st.checkbox("Use fixed quantity", value=False,
-                                       help="If checked, every trade uses exactly this qty.\n"
-                                            "If unchecked, qty is auto-sized from capital.")
-        fixed_qty = 1
-        if use_fixed_qty:
-            fixed_qty = st.number_input("Quantity (units)", min_value=1, max_value=100_000,
-                                         value=1, step=1)
+        fixed_qty     = st.number_input("Quantity per trade (units)", min_value=1,
+                                         max_value=100_000, value=1, step=1,
+                                         help="Number of units per trade. Set to 0 to auto-size from capital.")
+        use_fixed_qty = fixed_qty > 0
 
         # ── Dhan Broker Integration ──────────────────────────
         st.markdown('<div class="section-header">Broker Integration</div>',
@@ -1158,11 +1361,10 @@ def main():
             dhan_order_type = "MARKET"
 
     # ══════════════════════════════════════════════════════
-    # FETCH DATA  (cached)
+    # FETCH DATA  (cached – no spinner, returns instantly after first load)
     # ══════════════════════════════════════════════════════
-    with st.spinner("⏳ Fetching market data…"):
-        df1 = fetch_data(t1_sym, interval, period)
-        df2 = fetch_data(t2_sym, interval, period) if t2_sym else None
+    df1 = fetch_data(t1_sym, interval, period)
+    df2 = fetch_data(t2_sym, interval, period) if t2_sym else None
 
     if df1 is None or df1.empty:
         st.error(f"❌ No data for **{t1_sym}** ({interval} / {period}). "
@@ -1302,6 +1504,68 @@ def main():
                  ("Expectancy",     stats["Expectancy"])]
             ):
                 col.metric(lab, val)
+
+            # ── Final capital always shown prominently ─────
+            fc = stats["Final Capital"]
+            fc_delta = fc - initial_capital
+            fc_col = "#26a69a" if fc_delta >= 0 else "#ef5350"
+            st.markdown(
+                f'<div style="background:#0d1117;border:1px solid {fc_col}55;'
+                f'border-radius:8px;padding:10px 18px;display:inline-block;margin:6px 0">'
+                f'<span style="color:#667788;font-size:0.72rem;text-transform:uppercase;'
+                f'letter-spacing:0.08em">Final Capital</span><br>'
+                f'<span style="font-size:1.4rem;font-weight:700;color:{fc_col}">'
+                f'₹{fc:,.2f}</span>'
+                f'<span style="color:{fc_col};font-size:0.85rem;margin-left:10px">'
+                f'({fc_delta:+,.2f} / {(fc_delta/initial_capital*100):+.2f}%)</span>'
+                f'</div>',
+                unsafe_allow_html=True
+            )
+
+            st.divider()
+
+            # ── Insights & Recommendations ─────────────────
+            insights, recs = generate_insights(
+                trades_df, stats, strategy, interval
+            )
+            if insights or recs:
+                ins_tab, rec_tab = st.tabs(["🔍 Pattern Insights", "💡 Recommendations"])
+
+                with ins_tab:
+                    if insights:
+                        for emoji, title, detail in insights:
+                            color = ("#26a69a" if emoji in ("✅",)
+                                     else "#e2b86e" if emoji in ("🟡", "📅", "⚡", "🔄")
+                                     else "#ef5350" if emoji in ("🔴",)
+                                     else "#8899bb")
+                            st.markdown(
+                                f'<div style="background:#0d1117;border-left:3px solid {color};'
+                                f'border-radius:0 8px 8px 0;padding:10px 14px;margin:6px 0">'
+                                f'<span style="font-weight:600;color:{color}">{emoji} {title}</span>'
+                                f'<div style="color:#99aabb;font-size:0.83rem;margin-top:3px">{detail}</div>'
+                                f'</div>',
+                                unsafe_allow_html=True
+                            )
+                    else:
+                        st.info("Not enough trade data to extract patterns.")
+
+                with rec_tab:
+                    if recs:
+                        for i, (emoji, title, detail) in enumerate(recs, 1):
+                            color = ("#26a69a" if "ready" in title.lower() or "partial" in title.lower()
+                                     else "#ef5350" if "not" in title.lower() or "stop" in title.lower()
+                                     else "#e2b86e")
+                            st.markdown(
+                                f'<div style="background:#0d1117;border:1px solid #1c2434;'
+                                f'border-radius:8px;padding:12px 16px;margin:6px 0">'
+                                f'<span style="font-weight:600;color:{color}">'
+                                f'{emoji} {i}. {title}</span>'
+                                f'<div style="color:#99aabb;font-size:0.83rem;margin-top:4px">{detail}</div>'
+                                f'</div>',
+                                unsafe_allow_html=True
+                            )
+                    else:
+                        st.info("No specific recommendations generated.")
 
             st.divider()
         elif not st.session_state.bt_ran:
