@@ -549,6 +549,8 @@ def run_backtest(df: pd.DataFrame, signals: pd.DataFrame,
     trail_pts    = float(p.get("trailing_pts", 10.0))
     shift_pct    = float(p.get("shift_pct",    30.0)) / 100.0
     exit_qty_pct = float(p.get("exit_pct",     70.0)) / 100.0
+    use_fq       = bool(p.get("use_fixed_qty", False))
+    fixed_q      = int(p.get("fixed_qty",      1))
     n = len(df)
 
     def close_pos(px: float, dt, reason: str, qty: Optional[int] = None):
@@ -588,7 +590,7 @@ def run_backtest(df: pd.DataFrame, signals: pd.DataFrame,
                 close_pos(float(opens[i + 1]), dates[i + 1], "Signal Reversal")
             entry_px = float(opens[i + 1])
             sl, tp1, tp2, tp3 = calc_sl_tp(df, i + 1, entry_px, new_dir, sl_method, **p)
-            qty = max(1, int(capital * 0.95 / entry_px))
+            qty = fixed_q if use_fq else max(1, int(capital * 0.95 / entry_px))
             pos = {
                 "entry":    entry_px, "entry_dt": dates[i + 1],
                 "dir":      new_dir,
@@ -721,7 +723,9 @@ def run_backtest(df: pd.DataFrame, signals: pd.DataFrame,
 
 def run_ratio_backtest(df1: pd.DataFrame, df2: pd.DataFrame,
                        signals: pd.DataFrame,
-                       initial_capital: float) -> Tuple[pd.DataFrame, float]:
+                       initial_capital: float,
+                       use_fixed_qty: bool = False,
+                       fixed_qty: int = 1) -> Tuple[pd.DataFrame, float]:
     """
     Ratio Strategy – switching long-only between two assets.
     ─────────────────────────────────────────────────────────
@@ -781,7 +785,7 @@ def run_ratio_backtest(df1: pd.DataFrame, df2: pd.DataFrame,
             else:
                 entry_px = float(opens2[idx])
                 ticker   = "Goldbees"
-            qty = max(1, int(capital * 0.95 / entry_px))
+            qty = fixed_qty if use_fixed_qty else max(1, int(capital * 0.95 / entry_px))
             pos = {
                 "asset":    new_asset,
                 "ticker":   ticker,
@@ -1093,8 +1097,15 @@ def main():
         if "Partial Exit" in sl_method:
             sl_params["exit_pct"] = st.number_input("Exit % at TP1", 1.0, 99.0, 70.0)
 
-        st.markdown('<div class="section-header">Capital</div>', unsafe_allow_html=True)
+        st.markdown('<div class="section-header">Capital & Quantity</div>', unsafe_allow_html=True)
         initial_capital = st.number_input("Initial Capital (₹)", 1_000, 50_000_000, 100_000, step=5_000)
+        use_fixed_qty   = st.checkbox("Use fixed quantity", value=False,
+                                       help="If checked, every trade uses exactly this qty.\n"
+                                            "If unchecked, qty is auto-sized from capital.")
+        fixed_qty = 1
+        if use_fixed_qty:
+            fixed_qty = st.number_input("Quantity (units)", min_value=1, max_value=100_000,
+                                         value=1, step=1)
 
         # ── Dhan Broker Integration ──────────────────────────
         st.markdown('<div class="section-header">Broker Integration</div>',
@@ -1167,34 +1178,32 @@ def main():
             df1 = df1.loc[common]
             df2 = df2.loc[common]
 
-    # ── Signals & Backtest ──────────────────────────────────
-    sig_kw = {"lookback": ratio_lb, "fast": ema_fast, "slow": ema_slow}
-    sigs   = generate_signals(df1, strategy, df2=df2, **sig_kw)
-
-    is_ratio_strat = (strategy == "Ratio Strategy" and df2 is not None)
-
-    if is_ratio_strat:
-        trades_df, final_cap = run_ratio_backtest(
-            df1, df2, sigs, float(initial_capital)
-        )
-    else:
-        trades_df, final_cap = run_backtest(
-            df1, sigs, sl_method=sl_method,
-            initial_capital=float(initial_capital),
-            df2=df2, **sl_params, **sig_kw
-        )
-    stats = calc_stats(trades_df, float(initial_capital))
-
-    # ── Session state for live trading ──────────────────────
-    for key, default in [
+    # ── Session state initialisation ────────────────────────
+    for _k, _v in [
         ("live_running",  False),
         ("live_position", None),
         ("live_trades",   []),
         ("live_capital",  float(initial_capital)),
         ("square_off",    False),
+        # Backtest cache
+        ("bt_ran",        False),
+        ("bt_trades",     None),
+        ("bt_stats",      None),
+        ("bt_sigs",       None),
+        ("bt_final_cap",  None),
     ]:
-        if key not in st.session_state:
-            st.session_state[key] = default
+        if _k not in st.session_state:
+            st.session_state[_k] = _v
+
+    is_ratio_strat = (strategy == "Ratio Strategy" and df2 is not None)
+
+    # ── Always generate signals (fast, needed for chart) ────
+    sig_kw = {"lookback": ratio_lb, "fast": ema_fast, "slow": ema_slow}
+    sigs   = generate_signals(df1, strategy, df2=df2, **sig_kw)
+
+    # ── Shorthand from session state ────────────────────────
+    trades_df = st.session_state.bt_trades if st.session_state.bt_ran else pd.DataFrame()
+    stats     = st.session_state.bt_stats  if st.session_state.bt_ran else {}
 
     # ══════════════════════════════════════════════════════
     # TABS
@@ -1208,8 +1217,51 @@ def main():
     # ──────────────────────────────────────────────────────
     with tab_bt:
 
-        if stats:
-            ret_val      = float(stats["Total Return"].replace("%", ""))
+        # ── Run Backtest button ──────────────────────────
+        rb_col, info_col = st.columns([1, 4])
+        with rb_col:
+            run_bt = st.button("▶  Run Backtest", type="primary")
+        with info_col:
+            if st.session_state.bt_ran:
+                st.caption(f"Last run: {st.session_state.get('bt_timestamp','—')}  |  "
+                            f"Strategy: {st.session_state.get('bt_strategy_label','—')}")
+            else:
+                st.caption("Configure settings in the sidebar then click **Run Backtest**.")
+
+        if run_bt:
+            with st.spinner("⚙️ Running backtest…"):
+                if is_ratio_strat:
+                    _td, _fc = run_ratio_backtest(
+                        df1, df2, sigs, float(initial_capital),
+                        use_fixed_qty=use_fixed_qty, fixed_qty=fixed_qty
+                    )
+                else:
+                    _td, _fc = run_backtest(
+                        df1, sigs, sl_method=sl_method,
+                        initial_capital=float(initial_capital),
+                        df2=df2,
+                        use_fixed_qty=use_fixed_qty, fixed_qty=fixed_qty,
+                        **sl_params, **sig_kw
+                    )
+                st.session_state.bt_trades    = _td
+                st.session_state.bt_stats     = calc_stats(_td, float(initial_capital))
+                st.session_state.bt_final_cap = _fc
+                st.session_state.bt_sigs      = sigs
+                st.session_state.bt_ran       = True
+                st.session_state.bt_timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                st.session_state.bt_strategy_label = (
+                    f"{strategy}  |  {interval}/{period}  |  {t1_choice}"
+                    + (f"/{t2_choice}" if use_ratio else "")
+                )
+            # Refresh shorthand
+            trades_df = st.session_state.bt_trades
+            stats     = st.session_state.bt_stats
+
+        st.divider()
+
+        # ── Verdict + stats (only after run) ─────────────
+        if st.session_state.bt_ran and stats:
+            ret_val       = float(stats["Total Return"].replace("%", ""))
             is_profitable = ret_val > 0
             bg_col   = "#0d2318" if is_profitable else "#1e0d0d"
             bdr_col  = "#26a69a" if is_profitable else "#ef5350"
@@ -1228,7 +1280,6 @@ def main():
                 unsafe_allow_html=True
             )
 
-            # Metrics row 1
             c1, c2, c3, c4, c5, c6 = st.columns(6)
             for col, (lab, val) in zip(
                 [c1, c2, c3, c4, c5, c6],
@@ -1241,7 +1292,6 @@ def main():
             ):
                 col.metric(lab, val)
 
-            # Metrics row 2
             c1, c2, c3, c4, c5 = st.columns(5)
             for col, (lab, val) in zip(
                 [c1, c2, c3, c4, c5],
@@ -1252,20 +1302,22 @@ def main():
                  ("Expectancy",     stats["Expectancy"])]
             ):
                 col.metric(lab, val)
-        else:
-            st.info("ℹ️ No trades generated. Try adjusting the strategy parameters or period.")
 
-        # Main chart
+            st.divider()
+        elif not st.session_state.bt_ran:
+            st.info("ℹ️  Click **▶ Run Backtest** above to see results.")
+
+        # ── Chart (always visible once data loaded) ───────
         chart = build_chart(
             df1, sigs, t1_choice, df2, t2_choice,
             use_ratio, strategy, ema_fast, ema_slow,
             trades_df if not trades_df.empty else None,
             ratio_lb=ratio_lb
         )
-        st.plotly_chart(chart, use_container_width=True)
+        st.plotly_chart(chart, width='stretch')
 
-        # Equity curve
-        if not trades_df.empty:
+        # ── Equity curve (only after run) ─────────────────
+        if st.session_state.bt_ran and not trades_df.empty:
             st.markdown("**Equity Curve**")
             eq_fig = go.Figure()
             eq_fig.add_trace(go.Scatter(
@@ -1285,7 +1337,7 @@ def main():
                 xaxis=dict(showgrid=True, gridcolor="#151e2c"),
                 yaxis=dict(showgrid=True, gridcolor="#151e2c"),
             )
-            st.plotly_chart(eq_fig, use_container_width=True)
+            st.plotly_chart(eq_fig, width='stretch')
 
     # ──────────────────────────────────────────────────────
     # LIVE TRADING TAB
@@ -1311,7 +1363,7 @@ def main():
                 "▶  START",
                 type="primary",
                 disabled=st.session_state.live_running,
-                use_container_width=True,
+                width='stretch',
             ):
                 st.session_state.live_running = True
                 st.session_state.live_capital = float(initial_capital)
@@ -1322,7 +1374,7 @@ def main():
             if st.button(
                 "⏹  STOP",
                 disabled=not st.session_state.live_running,
-                use_container_width=True,
+                width='stretch',
             ):
                 st.session_state.live_running = False
                 st.rerun()
@@ -1332,7 +1384,7 @@ def main():
                 "🔴  SQUARE OFF",
                 type="secondary",
                 disabled=st.session_state.live_position is None,
-                use_container_width=True,
+                width='stretch',
             ):
                 st.session_state.square_off = True
                 st.rerun()
@@ -1373,7 +1425,7 @@ def main():
                                          ldf2_static, t2_choice,
                                          use_ratio, strategy, ema_fast, ema_slow,
                                          ratio_lb=eff_lb_s)
-                    st.plotly_chart(lfig_s, use_container_width=True, key="live_chart_static")
+                    st.plotly_chart(lfig_s, width='stretch', key="live_chart_static")
                 return
 
             ldf1 = fetch_live(t1_sym, live_iv)
@@ -1584,8 +1636,8 @@ def main():
                         return "color:#26a69a;font-weight:600" if v > 0 else (
                                "color:#ef5350;font-weight:600" if v < 0 else "")
                     return ""
-                styled_log = log_df.style.applymap(_log_color, subset=["PnL"])
-                st.dataframe(styled_log, use_container_width=True, height=160)
+                styled_log = log_df.style.map(_log_color, subset=["PnL"])
+                st.dataframe(styled_log, width='stretch', height=160)
 
             # ── Dhan positions / order book ───────────────────
             if use_dhan and dhan_connected and dhan_client:
@@ -1596,7 +1648,7 @@ def main():
                     if pos_df.empty:
                         st.info("No open positions on Dhan.")
                     else:
-                        st.dataframe(pos_df, use_container_width=True)
+                        st.dataframe(pos_df, width='stretch')
                         # Total unrealised P&L
                         if "unrealizedProfit" in pos_df.columns:
                             total_unrl = pd.to_numeric(
@@ -1614,7 +1666,7 @@ def main():
                     if ord_df.empty:
                         st.info("No orders today.")
                     else:
-                        st.dataframe(ord_df, use_container_width=True)
+                        st.dataframe(ord_df, width='stretch')
 
                 with dhan_tabs[2]:
                     funds = dhan_get_funds(dhan_client)
@@ -1636,7 +1688,7 @@ def main():
                 use_ratio, strategy, ema_fast, ema_slow,
                 ratio_lb=eff_lb,
             )
-            st.plotly_chart(lfig, use_container_width=True, key="live_chart")
+            st.plotly_chart(lfig, width='stretch', key="live_chart")
             st.caption(f"🕐 Last update: {datetime.now().strftime('%H:%M:%S.%f')[:-3]}")
 
         live_panel()
@@ -1693,9 +1745,9 @@ def main():
             fmt_dict.update({"PnL": "{:.2f}", "Capital": "{:.2f}"})
 
             styled = (ftd.style
-                       .applymap(_pnl_color, subset=["PnL"])
+                       .map(_pnl_color, subset=["PnL"])
                        .format(fmt_dict, na_rep="—"))
-            st.dataframe(styled, use_container_width=True, height=420)
+            st.dataframe(styled, width='stretch', height=420)
 
             # ── Exit reason breakdown ─────────────────────
             st.markdown("**Exit Reason Breakdown**")
@@ -1704,7 +1756,7 @@ def main():
                                 Avg_PnL="mean",
                                 Win_Rate=lambda x: (x > 0).mean() * 100)
                            .round(2))
-            st.dataframe(reason_grp, use_container_width=True)
+            st.dataframe(reason_grp, width='stretch')
 
             # ── Monthly PnL bar chart ─────────────────────
             try:
@@ -1728,7 +1780,7 @@ def main():
                         xaxis=dict(showgrid=False),
                         yaxis=dict(showgrid=True, gridcolor="#151e2c"),
                     )
-                    st.plotly_chart(m_fig, use_container_width=True)
+                    st.plotly_chart(m_fig, width='stretch')
             except Exception:
                 pass
 
