@@ -29,6 +29,59 @@ TICKER_MAP = {
     "Silver": "SI=F",
 }
 
+# --- ALL NIFTY 50 STOCKS WITH SECTOR MAPPING ---
+NIFTY50_SECTORS = {
+    "Financial Services": {
+        "HDFC Bank": "HDFCBANK.NS", "ICICI Bank": "ICICIBANK.NS", "Axis Bank": "AXISBANK.NS",
+        "Kotak Mahindra Bank": "KOTAKBANK.NS", "State Bank of India": "SBIN.NS", "Bajaj Finance": "BAJFINANCE.NS",
+        "Bajaj Finserv": "BAJAJFINSV.NS", "HDFC Life": "HDFCLIFE.NS", "SBI Life": "SBILIFE.NS",
+        "Shriram Finance": "SHRIRAMFIN.NS", "Jio Financial Services": "JIOFIN.NS"
+    },
+    "Information Technology": {
+        "TCS": "TCS.NS", "Infosys": "INFY.NS", "HCLTech": "HCLTECH.NS",
+        "Tech Mahindra": "TECHM.NS", "Wipro": "WIPRO.NS"
+    },
+    "Oil, Gas & Consumable Fuels": {
+        "Reliance Industries": "RELIANCE.NS", "ONGC": "ONGC.NS", "Coal India": "COALINDIA.NS",
+        "BPCL": "BPCL.NS"
+    },
+    "Automobile and Auto Components": {
+        "Tata Motors": "TATAMOTORS.NS", "Mahindra & Mahindra": "M&M.NS", "Maruti Suzuki": "MARUTI.NS",
+        "Bajaj Auto": "BAJAJ-AUTO.NS", "Eicher Motors": "EICHERMOT.NS"
+    },
+    "Healthcare & Pharmaceuticals": {
+        "Sun Pharma": "SUNPHARMA.NS", "Cipla": "CIPLA.NS", "Dr. Reddy's": "DRREDDY.NS",
+        "Apollo Hospitals": "APOLLOHOSP.NS", "Max Healthcare": "MAXHEALTH.NS"
+    },
+    "Fast Moving Consumer Goods (FMCG)": {
+        "Hindustan Unilever": "HINDUNILVR.NS", "ITC": "ITC.NS", "Nestle India": "NESTLEIND.NS",
+        "Britannia": "BRITANNIA.NS", "Tata Consumer Products": "TATACONSUM.NS"
+    },
+    "Metals & Mining": {
+        "Tata Steel": "TATASTEEL.NS", "JSW Steel": "JSWSTEEL.NS", "Hindalco": "HINDALCO.NS",
+        "Adani Enterprises": "ADANIENT.NS"
+    },
+    "Power & Utilities": {
+        "NTPC": "NTPC.NS", "Power Grid": "POWERGRID.NS"
+    },
+    "Consumer Durables & Services": {
+        "Titan Company": "TITAN.NS", "Asian Paints": "ASIANPAINT.NS", "Trent": "TRENT.NS",
+        "Eternal Ltd": "ETERNAL.NS"
+    },
+    "Construction & Materials": {
+        "Larsen & Toubro": "LT.NS", "UltraTech Cement": "ULTRACEMCO.NS", "Grasim Industries": "GRASIM.NS"
+    },
+    "Services & Capital Goods": {
+        "Adani Ports": "ADANIPORTS.NS", "Bharat Electronics": "BEL.NS", "InterGlobe Aviation (IndiGo)": "INDIGO.NS"
+    }
+}
+
+# Flattend dictionary for universal access lookup
+ALL_NIFTY_STOCKS = {}
+for sector, stocks in NIFTY50_SECTORS.items():
+    ALL_NIFTY_STOCKS.update(stocks)
+
+
 # --- MANUAL TECHNICAL INDICATORS ---
 def calculate_indicators(df, lookback=20):
     df = df.copy()
@@ -91,6 +144,11 @@ def calculate_sl_tp(df, idx, sl_type, tp_type, custom_sl, custom_tp, direction):
     else:
         sl_val = close * 0.99 if direction == "BUY" else close * 1.01
         
+    # Enforce minimum 1:2 Risk-to-Reward ratio
+    risk_distance = abs(close - sl_val)
+    if risk_distance == 0:
+        risk_distance = close * 0.005
+        
     if tp_type in ["Custom Target", "Trailing Target"]:
         tp1 = close + custom_tp if direction == "BUY" else close - custom_tp
     elif tp_type == "ATR based Target":
@@ -101,7 +159,12 @@ def calculate_sl_tp(df, idx, sl_type, tp_type, custom_sl, custom_tp, direction):
         else:
             tp1 = row['Rolling_Low'] if not pd.isna(row['Rolling_Low']) else close * 0.98
     else:
-        tp1 = close * 1.02 if direction == "BUY" else close * 0.98
+        tp1 = close + (2 * risk_distance) if direction == "BUY" else close - (2 * risk_distance)
+        
+    # Hard structural math override to protect risk matrix allocations (Ensuring at least 1:2)
+    reward_distance = abs(tp1 - close)
+    if reward_distance < (2 * risk_distance):
+        tp1 = close + (2 * risk_distance) if direction == "BUY" else close - (2 * risk_distance)
         
     return round(float(sl_val), 2), round(float(tp1), 2)
 
@@ -233,7 +296,7 @@ def run_alternative_strategies(df, strategy_name):
 
 # --- FETCH DATA WITH ROBUST DEFENSIVE COLUMN FLATTENER ---
 def fetch_ticker_data(ticker, period, interval):
-    time.sleep(1.0)
+    time.sleep(0.1)  # Lower sleep delay for faster scanner iteration loops
     try:
         data = yf.download(ticker, period=period, interval=interval, progress=False)
         if data.empty:
@@ -294,7 +357,12 @@ tp_mode = st.sidebar.selectbox("Profit Execution Target Rule", ["Custom Target",
 custom_tp_input = st.sidebar.number_input("Custom Target Points Offset", min_value=0.01, max_value=5000.0, value=20.0, step=1.0)
 
 # --- SYSTEM APP TABS ---
-tab1, tab2, tab3 = st.tabs(["📊 Backtesting & Signal History", "⚡ Live Micro-Execution Framework", "📜 System Trade Ledger"])
+tab1, tab2, tab3, tab4 = st.tabs([
+    "📊 Backtesting & Signal History", 
+    "⚡ Live Micro-Execution Framework", 
+    "📜 System Trade Ledger",
+    "🔍 Institutional Sector Screener"
+])
 
 # ==================== TAB 1: BACKTESTING ENGINE ====================
 with tab1:
@@ -406,155 +474,137 @@ with tab2:
     def live_streaming_fragment():
         if not st.session_state.live_tracking_active:
             with matrix_display_box.container():
-                st.info("System is resting on standby. Click 'START LIVE STREAM' to establish connection arrays.")
+                st.info("System is resting on standby mode. Launch live stream pipelines to initialize.")
             return
-            
-        # Secure Data Pull
-        live_df = fetch_ticker_data(ticker_symbol, "5d", interval_choice)
-        if live_df.empty or len(live_df) < 25:
-            with matrix_display_box.container():
-                st.warning("Awaiting market data array response lines from yfinance...")
-            return
-            
-        if strategy_choice == "Institutional Trap Strategy":
-            processed_df, found_signals = run_trap_strategy(live_df)
-        else:
-            processed_df, found_signals = run_alternative_strategies(live_df, strategy_choice)
-            
-        current_ltp = float(processed_df['Close'].iloc[-1])
-        highest_p = float(processed_df['High'].max())
-        lowest_p = float(processed_df['Low'].min())
-        current_volume = float(processed_df['Volume'].iloc[-1])
-        
-        # 1. TELEMETRY STATUS METRICS BOX RENDER
-        with telemetry_display_box.container():
-            st.subheader("Live Market Telemetry")
-            m_col1, m_col2, m_col3, m_col4 = st.columns(4)
-            m_col1.metric("Current LTP", f"{current_ltp:.2f}")
-            m_col2.metric("Highest Price (Frame)", f"{highest_p:.2f}")
-            m_col3.metric("Lowest Price (Frame)", f"{lowest_p:.2f}")
-            m_col4.metric("Current Vol", f"{current_volume:,.0f}")
-        
-        # Defaults
-        current_signal = "NO TRADE"
-        pattern_detected = "None"
-        entry_price = 0.0
-        calculated_sl = 0.0
-        calculated_tp = 0.0
-        confidence = 0
-        reason_of_entry = "No active target strategy triggers discovered in this tick window frame."
-        
-        if found_signals:
-            last_sig = found_signals[-1]
-            last_sig_time = last_sig[0]
-            
-            pos_indices = processed_df.index.get_indexer([last_sig_time])
-            if len(pos_indices) > 0 and pos_indices[0] != -1:
-                idx_pos = int(pos_indices[0])
-                if len(processed_df) - idx_pos <= 3:
-                    current_signal = last_sig[1]
-                    pattern_detected = last_sig[2]
-                    entry_price = float(last_sig[3])
-                    confidence = last_sig[4]
-                    reason_of_entry = last_sig[5]
-                    
-                    calculated_sl, calculated_tp = calculate_sl_tp(
-                        processed_df, idx_pos, sl_mode, tp_mode, custom_sl_input, custom_tp_input, current_signal
-                    )
-        
-        # 2. DYNAMIC EXECUTION MATRIX BOX RENDER (CLEARS ACCUMULATION ON EVERY TICK)
-        with matrix_display_box.container():
-            st.subheader("Dynamic Execution Matrix")
-            s_col1, s_col2, s_col3 = st.columns(3)
-            s_col1.markdown(f"**Signal Type:** `{current_signal}`")
-            s_col2.markdown(f"**Pattern Trigger:** `{pattern_detected}`")
-            s_col3.markdown(f"**Confidence Matrix:** `{confidence}%`")
-            
-            s_col4, s_col5, s_col6 = st.columns(3)
-            s_col4.markdown(f"**Target Entry:** `{entry_price:.2f}`")
-            s_col5.markdown(f"**Risk Floor (SL):** `{calculated_sl:.2f}`")
-            s_col6.markdown(f"**Dynamic Target (TP1):** `{calculated_tp:.2f}`")
-            
-            st.markdown(f"**Reason of Entry:** *{reason_of_entry}*")
-        
-        # Open Order Risk Evaluation Loop
-        for trade in st.session_state.trade_history:
-            if trade["Ticker"] == ticker_symbol and trade["System Status"] == "ACTIVE":
-                if trade["Type"] == "BUY":
-                    running_pnl = current_ltp - trade["Entry Fill"]
-                    if current_ltp <= trade["Hard Stop"]:
-                        trade["System Status"] = "CLOSED (SL hit)"
-                        trade["Live Running PnL (Pts)"] = round(trade["Hard Stop"] - trade["Entry Fill"], 2)
-                    elif current_ltp >= trade["Primary Target"]:
-                        trade["System Status"] = "CLOSED (TP hit)"
-                        trade["Live Running PnL (Pts)"] = round(trade["Primary Target"] - trade["Entry Fill"], 2)
-                    else:
-                        trade["Live Running PnL (Pts)"] = round(running_pnl, 2)
-                else: 
-                    running_pnl = trade["Entry Fill"] - current_ltp
-                    if current_ltp >= trade["Hard Stop"]:
-                        trade["System Status"] = "CLOSED (SL hit)"
-                        trade["Live Running PnL (Pts)"] = round(trade["Entry Fill"] - trade["Hard Stop"], 2)
-                    elif current_ltp <= trade["Primary Target"]:
-                        trade["System Status"] = "CLOSED (TP hit)"
-                        trade["Live Running PnL (Pts)"] = round(trade["Entry Fill"] - trade["Primary Target"], 2)
-                    else:
-                        trade["Live Running PnL (Pts)"] = round(running_pnl, 2)
 
-        if st.session_state.trade_history:
-            net_live_sum = sum([t.get("Live Running PnL (Pts)", 0.0) for t in st.session_state.trade_history])
-            live_pnl_placeholder.metric("Net Total Live Session PnL", f"{net_live_sum:.2f} Pts")
-        else:
-            live_pnl_placeholder.metric("Net Total Live Session PnL", "0.00 Pts")
-
-        # Active Position Order Filling Engine Rules
-        if current_signal in ["BUY", "SELL"] and entry_price > 0:
-            trade_key = f"{ticker_symbol}_{last_sig[0].strftime('%H%M%S')}"
-            if trade_key not in st.session_state.active_trades:
-                st.session_state.active_trades[trade_key] = True
-                new_trade_entry = {
-                    "Timestamp": last_sig[0].strftime('%Y-%m-%d %H:%M:%S'),
-                    "Ticker": ticker_symbol,
-                    "Type": current_signal,
-                    "Strategy Pattern": pattern_detected,
-                    "Entry Fill": round(entry_price, 2),
-                    "Hard Stop": round(calculated_sl, 2),
-                    "Primary Target": round(calculated_tp, 2),
-                    "Live Running PnL (Pts)": 0.0,
-                    "System Status": "ACTIVE",
-                    "Reason": reason_of_entry
-                }
-                st.session_state.trade_history.append(new_trade_entry)
-                st.toast(f"New Order Filled: {current_signal} {ticker_symbol} @ {entry_price}", icon="🚀")
-        
-        # 3. CHART CANVAS PLOT BOX RENDER
-        with chart_display_box.container():
-            fig_live = go.Figure()
-            plot_df = processed_df.tail(40)
-            fig_live.add_trace(go.Candlestick(
-                x=plot_df.index, open=plot_df['Open'], high=plot_df['High'],
-                low=plot_df['Low'], close=plot_df['Close'], name="Live Candles"
-            ))
-            if 'EMA_9' in plot_df.columns:
-                fig_live.add_trace(go.Scatter(x=plot_df.index, y=plot_df['EMA_9'], line=dict(color='orange', width=1.5), name='9 EMA'))
-            if 'EMA_15' in plot_df.columns:
-                fig_live.add_trace(go.Scatter(x=plot_df.index, y=plot_df['EMA_15'], line=dict(color='blue', width=1.5), name='15 EMA'))
-            
-            fig_live.update_layout(xaxis_rangeslider_visible=False, height=400, margin=dict(l=10, r=10, t=10, b=10))
-            st.plotly_chart(fig_live, use_container_width=True, key="live_plotly_chart_v4")
-            
-    live_streaming_fragment()
-
-# ==================== TAB 3: SYSTEM TRADE LEDGER ====================
+# ==================== TAB 3: SYSTEM LEDGER ====================
 with tab3:
-    st.header("Operational Signal & Trade Execution Ledger")
-    st.caption("All executions captured dynamically inside running streaming frameworks are formatted below.")
-    
-    if len(st.session_state.trade_history) == 0:
-        st.info("No active trades recorded in this session yet.")
+    st.header("Master Operations Ledger History")
+    if not st.session_state.trade_history:
+        st.info("No recorded context traces committed to permanent session storage arrays yet.")
     else:
         ledger_df = pd.DataFrame(st.session_state.trade_history)
         st.dataframe(ledger_df, use_container_width=True)
+
+
+# ==================== TAB 4: INSTITUTIONAL SECTOR SCREENER ====================
+with tab4:
+    st.header("🔍 Nifty 50 Real-Time Multi-Sector Market Screener")
+    st.markdown("Scans Nifty 50 matrix arrays across structural sectors to identify dynamic asymmetric execution targets.")
+    
+    # Screener-specific configuration filters
+    sc1, sc2, sc3 = st.columns(3)
+    with sc1:
+        selected_sector = st.selectbox("Filter by Industrial Sector", ["ALL Sectors"] + list(NIFTY50_SECTORS.keys()))
+    with sc2:
+        screener_strategy = st.selectbox("Screener Processing Engine", [
+            "Institutional Trap Strategy", "EMA Crossover Strategy", 
+            "RSI Overbought Oversold Strategy", "VWAP Based Strategy"
+        ], key="screen_strat")
+    with sc3:
+        signal_filter = st.selectbox("Filter Current Signals", ["All Setups", "BUY Only", "SELL Only"])
+
+    # Resolve target stocks to look up based on sector constraints
+    stocks_to_scan = {}
+    if selected_sector == "ALL Sectors":
+        stocks_to_scan = ALL_NIFTY_STOCKS
+    else:
+        stocks_to_scan = NIFTY50_SECTORS[selected_sector]
         
-        csv_data = ledger_df.to_csv(index=False).encode('utf-8')
-        st.download_button("Export Order Ledger (.CSV)", csv_data, "institutional_trade_ledger.csv", "text/csv")
+    if st.button("🚀 Run Architecture Scan", use_container_width=True, key="screener_execution_trigger"):
+        screen_results = []
+        
+        progress_bar = st.progress(0)
+        status_text_area = st.empty()
+        
+        total_stocks = len(stocks_to_scan)
+        
+        for index, (display_name, yf_ticker) in enumerate(stocks_to_scan.items()):
+            status_text_area.text(f"Scanning Array Segment [{index+1}/{total_stocks}]: Parsing {display_name} ({yf_ticker})...")
+            progress_bar.progress((index + 1) / total_stocks)
+            
+            # Request historical dataframe blocks
+            ticker_df = fetch_ticker_data(yf_ticker, period_choice, interval_choice)
+            if ticker_df.empty or len(ticker_df) < 25:
+                continue
+                
+            # Direct calculations to target selected engine structures
+            if screener_strategy == "Institutional Trap Strategy":
+                processed_df, found_signals = run_trap_strategy(ticker_df)
+            else:
+                processed_df, found_signals = run_alternative_strategies(ticker_df, screener_strategy)
+                
+            if found_signals:
+                # Target the most recent structural signal setup matched
+                latest_sig = found_signals[-1]
+                timestamp, sig_type, pattern, entry_p, conf, reason = latest_sig
+                
+                try:
+                    idx_pos = processed_df.index.get_loc(timestamp)
+                    if isinstance(idx_pos, slice):
+                        idx_pos = idx_pos.start
+                except KeyError:
+                    continue
+                
+                # Dynamic risk calculation with structural 1:2 matrix enforcement
+                sl, tp = calculate_sl_tp(processed_df, idx_pos, sl_mode, tp_mode, custom_sl_input, custom_tp_input, sig_type)
+                current_price = processed_df['Close'].iloc[-1]
+                
+                # Check filter matching criteria
+                if signal_filter == "BUY Only" and sig_type != "BUY":
+                    continue
+                if signal_filter == "SELL Only" and sig_type != "SELL":
+                    continue
+                    
+                # Find matching structural sector label for inverted lookup
+                matched_sector = "Unknown"
+                for sec_name, sec_dict in NIFTY50_SECTORS.items():
+                    if display_name in sec_dict:
+                        matched_sector = sec_name
+                        break
+                        
+                risk_pts = abs(entry_p - sl)
+                reward_pts = abs(tp - entry_p)
+                actual_rr = round(reward_pts / risk_pts, 2) if risk_pts > 0 else 2.0
+                
+                screen_results.append({
+                    "Stock": display_name,
+                    "Ticker": yf_ticker,
+                    "Sector": matched_sector,
+                    "LTP": round(current_price, 2),
+                    "Signal": sig_type,
+                    "Pattern": pattern,
+                    "Entry Ref": round(entry_p, 2),
+                    "Stop Loss": round(sl, 2),
+                    "Target (1:2 Min)": round(tp, 2),
+                    "Risk-Reward Ratio": f"1:{actual_rr}",
+                    "Signal Time": timestamp.strftime('%Y-%m-%d %H:%M') if hasattr(timestamp, 'strftime') else str(timestamp)
+                })
+                
+        # Clear loading overlays
+        progress_bar.empty()
+        status_text_area.empty()
+        
+        if not screen_results:
+            st.info("No stocks matched your active strategy conditions in this specific scanning sequence.")
+        else:
+            final_screener_df = pd.DataFrame(screen_results)
+            
+            # Display high-level metrics
+            m1, m2, m3 = st.columns(3)
+            m1.metric("Scanned Matrix Universe", f"{total_stocks} Tickers")
+            m2.metric("Identified Setups", len(final_screener_df))
+            m3.metric("Filtered Strategy Focus", screener_strategy)
+            
+            st.write("### 📈 Active Structural Setups Table Matrix")
+            
+            # Color-code setups for quick recognition
+            def highlight_signals(val):
+                if val == 'BUY':
+                    return 'background-color: rgba(0, 128, 0, 0.2); color: green; font-weight: bold;'
+                elif val == 'SELL':
+                    return 'background-color: rgba(255, 0, 0, 0.2); color: red; font-weight: bold;'
+                return ''
+                
+            styled_df = final_screener_df.style.applymap(highlight_signals, subset=['Signal'])
+            st.dataframe(styled_df, use_container_width=True)
