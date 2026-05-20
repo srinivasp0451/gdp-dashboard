@@ -9,11 +9,13 @@ import plotly.graph_objects as go
 # --- PAGE CONFIG ---
 st.set_page_config(layout="wide", page_title="Smart Money Institutional Trading System")
 
-# --- INITIALIZE SESSION STATE FOR TRADE HISTORY ---
+# --- INITIALIZE SESSION STATE ---
 if "trade_history" not in st.session_state:
     st.session_state.trade_history = []
 if "active_trades" not in st.session_state:
     st.session_state.active_trades = {}
+if "live_tracking_active" not in st.session_state:
+    st.session_state.live_tracking_active = False
 
 # --- TICKER DICTIONARY MAP ---
 TICKER_MAP = {
@@ -77,27 +79,23 @@ def calculate_sl_tp(df, idx, strategy_type, sl_type, tp_type, custom_sl, custom_
     close = row['Close']
     atr = row['ATR_14'] if 'ATR_14' in df.columns and not pd.isna(row['ATR_14']) else close * 0.01
     
-    # Base SL calculation
-    if sl_type == "Custom SL" or sl_type == "Trailing SL":
+    if sl_type in ["Custom SL", "Trailing SL"]:
         sl_val = close - custom_sl if direction == "BUY" else close + custom_sl
     elif sl_type == "ATR based SL":
         sl_val = close - (1.5 * atr) if direction == "BUY" else close + (1.5 * atr)
-    elif sl_type == "Signal based SL" or sl_type == "Logical SL":
+    elif sl_type in ["Signal based SL", "Logical SL", "Support Resistance based SL"]:
         if direction == "BUY":
             sl_val = row['Rolling_Low'] if not pd.isna(row['Rolling_Low']) else close * 0.99
         else:
             sl_val = row['Rolling_High'] if not pd.isna(row['Rolling_High']) else close * 1.01
-    elif sl_type == "Support Resistance based SL":
-        sl_val = row['Rolling_Low'] if direction == "BUY" else row['Rolling_High']
     else:
         sl_val = close * 0.99 if direction == "BUY" else close * 1.01
         
-    # Base TP calculation
-    if tp_type == "Custom Target" or tp_type == "Trailing Target":
+    if tp_type in ["Custom Target", "Trailing Target"]:
         tp1 = close + custom_tp if direction == "BUY" else close - custom_tp
     elif tp_type == "ATR based Target":
         tp1 = close + (3 * atr) if direction == "BUY" else close - (3 * atr)
-    elif tp_type == "Signal based Target" or tp_type == "Logical Target" or tp_type == "Support Resistance based Target":
+    elif tp_type in ["Signal based Target", "Logical Target", "Support Resistance based Target"]:
         if direction == "BUY":
             tp1 = row['Rolling_High'] if not pd.isna(row['Rolling_High']) else close * 1.02
         else:
@@ -108,7 +106,7 @@ def calculate_sl_tp(df, idx, strategy_type, sl_type, tp_type, custom_sl, custom_
     return round(float(sl_val), 2), round(float(tp1), 2)
 
 # --- BACKTEST PNL SIMULATOR ---
-def simulate_backtest_pnl(processed_df, found_signals, sl_mode, tp_mode, custom_sl_input, custom_tp_input):
+def simulate_backtest_pnl(processed_df, found_signals, sl_mode, tp_mode, custom_sl_input, custom_tp_input, strategy_choice):
     records = []
     for sig_idx, (timestamp, sig_type, pattern, entry_p, conf) in enumerate(found_signals):
         try:
@@ -120,7 +118,6 @@ def simulate_backtest_pnl(processed_df, found_signals, sl_mode, tp_mode, custom_
             
         sl, tp = calculate_sl_tp(processed_df, idx_pos, strategy_choice, sl_mode, tp_mode, custom_sl_input, custom_tp_input, sig_type)
         
-        # Look ahead to calculate simulated PnL outcome
         pnl = 0.0
         status = "Closed (Target)"
         exit_price = tp
@@ -134,24 +131,22 @@ def simulate_backtest_pnl(processed_df, found_signals, sl_mode, tp_mode, custom_
                     status = "Closed (Stop Loss)"
                     break
                 elif f_row['High'] >= tp:
-                    # 70% Book near TP1 rule adjustment calculation
                     pnl = (tp - entry_p)
                     exit_price = tp
                     status = "Closed (Target)"
                     break
             elif sig_type == "SELL":
-                if f_row['High'] <= sl: # Fixed index short mapping logic
+                if f_row['High'] >= sl:
                     pnl = entry_p - sl
                     exit_price = sl
                     status = "Closed (Stop Loss)"
                     break
-                elif f_row['Low'] >= tp:
+                elif f_row['Low'] <= tp:
                     pnl = entry_p - tp
                     exit_price = tp
                     status = "Closed (Target)"
                     break
                     
-        # If trade is still running by end of dataset
         if pnl == 0.0:
             last_close = processed_df['Close'].iloc[-1]
             pnl = (last_close - entry_p) if sig_type == "BUY" else (entry_p - last_close)
@@ -233,29 +228,37 @@ def run_alternative_strategies(df, strategy_name):
                 
     return df, signals
 
-# --- FETCH DATA WITH RATE LIMIT SAFETY & MULTI-INDEX FIX ---
+# --- FETCH DATA WITH ROBUST DEFENSIVE COLUMN FLATTENER ---
 def fetch_ticker_data(ticker, period, interval):
-    time.sleep(1.0) # Rate limit security buffer rule
+    time.sleep(1.0)
     try:
         data = yf.download(ticker, period=period, interval=interval, progress=False)
         if data.empty:
             return pd.DataFrame()
             
-        # Hard Fix for Multi-Indexed data structure drops to stop Fragment crashes
+        # Robust multi-index structural resolution
         if isinstance(data.columns, pd.MultiIndex):
-            data.columns = data.columns.get_level_values(0)
+            data.columns = [col[0] for col in data.columns]
             
-        # Clean duplicate column structures or formatting mismatches safely
         data = data.loc[:, ~data.columns.duplicated()].copy()
         
-        # Ensure structural float mappings
-        for col in ['Open', 'High', 'Low', 'Close', 'Volume']:
+        # Verify columns exist before casting to numeric types
+        required_cols = ['Open', 'High', 'Low', 'Close', 'Volume']
+        for col in required_cols:
             if col in data.columns:
                 data[col] = pd.to_numeric(data[col], errors='coerce')
-                
+            else:
+                # Fallback if yfinance formats anomalies as lower-case
+                alternate_col = col.lower()
+                if alternate_col in data.columns:
+                    data[col] = pd.to_numeric(data[alternate_col], errors='coerce')
+                    
+        # Confirm minimal dataframe schema compliance
+        if 'Close' not in data.columns or data['Close'].isnull().all():
+            return pd.DataFrame()
+            
         return data.dropna(subset=['Close'])
     except Exception as e:
-        st.error(f"Error fetching data from yfinance API: {e}")
         return pd.DataFrame()
 
 # --- SIDEBAR CONTROL PANEL ---
@@ -312,14 +315,12 @@ with tab1:
                 if not found_signals:
                     st.info("No system-aligned operational setups matched your confirmation definitions for this period.")
                 else:
-                    # Run comprehensive Backtest Log with clear simulated performance data outputs
-                    simulated_records = simulate_backtest_pnl(processed_df, found_signals, sl_mode, tp_mode, custom_sl_input, custom_tp_input)
+                    simulated_records = simulate_backtest_pnl(processed_df, found_signals, sl_mode, tp_mode, custom_sl_input, custom_tp_input, strategy_choice)
                     df_rec = pd.DataFrame(simulated_records)
                     
-                    # Calculate cumulative backtest performance summary matrix values
                     total_pnl = df_rec["Simulated PnL (Pts)"].sum()
                     win_trades = len(df_rec[df_rec["Simulated PnL (Pts)"] > 0])
-                    win_rate = (win_trades / len(df_rec)) * 100
+                    win_rate = (win_trades / len(df_rec)) * 100 if len(df_rec) > 0 else 0
                     
                     c1, c2, c3 = st.columns(3)
                     c1.metric("Net Aggregated PnL", f"{total_pnl:.2f} Pts", delta=f"{total_pnl:.2f}")
@@ -328,7 +329,6 @@ with tab1:
                     
                     st.dataframe(df_rec, use_container_width=True)
                     
-                    # Plotly chart canvas setup
                     fig = go.Figure()
                     fig.add_trace(go.Candlestick(
                         x=processed_df.index, open=processed_df['Open'], high=processed_df['High'],
@@ -352,29 +352,50 @@ with tab1:
 # ==================== TAB 2: LIVE MICRO-EXECUTION ====================
 with tab2:
     st.header("Live Micro-Execution Tracker Framework")
-    st.caption("Auto-refresh cycle uses optimized isolated fragments to calculate Real-time Running PnL metrics safely.")
+    
+    # --- HARDWARE STATE INTERACTION CONTROLS ---
+    btn_col1, btn_col2, btn_col3 = st.columns(3)
+    
+    if btn_col1.button("🟢 START LIVE STREAM", use_container_width=True):
+        st.session_state.live_tracking_active = True
+        st.toast("Telemetry Pipelines Initialized Safely.", icon="🛰️")
+        
+    if btn_col2.button("🔴 STOP LIVE STREAM", use_container_width=True):
+        st.session_state.live_tracking_active = False
+        st.toast("Telemetry Pipelines Suspended Gracefully.", icon="🛑")
+        
+    if btn_col3.button("💥 EMERGENCY SQUARE OFF ALL", use_container_width=True):
+        st.session_state.live_tracking_active = False
+        active_count = 0
+        for trade in st.session_state.trade_history:
+            if trade["System Status"] == "ACTIVE":
+                trade["System Status"] = "MANUAL SQUARE OFF"
+                active_count += 1
+        st.session_state.active_trades.clear()
+        st.success(f"Emergency Intercept Active. closed {active_count} market positions.")
+
+    st.write("---")
     
     col1, col2 = st.columns([1, 3])
     
     with col1:
-        is_live = st.toggle("Activate Live Tracking Feeds", value=False)
+        status_text = "🟢 ENGINE SCANNING" if st.session_state.live_tracking_active else "⚪ STANDBY"
+        st.metric("System Core Engine State", status_text)
         st.metric("Monitoring Target Asset", ticker_symbol)
         st.metric("Assigned Logic Routine", strategy_choice)
-        
-        # Cumulative running summary inside panel
         live_pnl_placeholder = st.empty()
     
-    # Isolated streaming component to mitigate full UI redraw overhead
-    @st.fragment(run_every=1.0 if is_live else None)
+    # Isolated streaming fragment with explicit runtime checking logic
+    @st.fragment(run_every=2.0 if st.session_state.live_tracking_active else None)
     def live_streaming_fragment():
-        if not is_live:
-            st.info("Switch the toggle above to connect live streaming engines.")
+        if not st.session_state.live_tracking_active:
+            st.info("System is resting on standby. Click 'START LIVE STREAM' to establish connection arrays.")
             return
             
-        # Data Pull
+        # Secure Data Pull
         live_df = fetch_ticker_data(ticker_symbol, "5d", interval_choice)
-        if live_df.empty:
-            st.error("No active market telemetry lines returned.")
+        if live_df.empty or len(live_df) < 25:
+            st.warning("Awaiting market data array response lines. Retrying cycle context...")
             return
             
         if strategy_choice == "Institutional Trap Strategy":
@@ -386,12 +407,11 @@ with tab2:
         highest_p = float(processed_df['High'].max())
         lowest_p = float(processed_df['Low'].min())
         
-        st.subheader("Telemetry Status Blocks")
+        st.subheader("Telemetry Metrics")
         m_col1, m_col2 = st.columns(2)
         m_col1.metric("Current Asset LTP", f"{current_ltp:.2f}")
         m_col2.metric("Frame Highest / Lowest", f"{highest_p:.2f} / {lowest_p:.2f}")
         
-        # Determine tracking states safely without .get_loc dependencies
         current_signal = "NO TRADE"
         pattern_detected = "None"
         entry_price = 0.0
@@ -401,53 +421,54 @@ with tab2:
         
         if found_signals:
             last_sig = found_signals[-1]
-            # Verify recency via relative index matrix offsets instead of string checks to stop crash triggers
-            if len(processed_df) - processed_df.index.get_indexer([last_sig[0]])[0] <= 4:
-                current_signal = last_sig[1]
-                pattern_detected = last_sig[2]
-                entry_price = float(last_sig[3])
-                confidence = last_sig[4]
-                
-                # Safe position indexing parsing fallback
-                idx_pos = int(processed_df.index.get_indexer([last_sig[0]])[0])
-                calculated_sl, calculated_tp = calculate_sl_tp(
-                    processed_df, idx_pos, strategy_choice, sl_mode, tp_mode, custom_sl_input, custom_tp_input, current_signal
-                )
+            last_sig_time = last_sig[0]
+            
+            # Position offset calculation strategy
+            pos_indices = processed_df.index.get_indexer([last_sig_time])
+            if len(pos_indices) > 0 and pos_indices[0] != -1:
+                idx_pos = int(pos_indices[0])
+                # Check if signal occurred within last 3 intervals
+                if len(processed_df) - idx_pos <= 3:
+                    current_signal = last_sig[1]
+                    pattern_detected = last_sig[2]
+                    entry_price = float(last_sig[3])
+                    confidence = last_sig[4]
+                    
+                    calculated_sl, calculated_tp = calculate_sl_tp(
+                        processed_df, idx_pos, strategy_choice, sl_mode, tp_mode, custom_sl_input, custom_tp_input, current_signal
+                    )
         
-        # Dynamically evaluate open running active positions to update running Session Ledger states
+        # Open Order Risk Evaluation Loop
         for trade in st.session_state.trade_history:
             if trade["Ticker"] == ticker_symbol and trade["System Status"] == "ACTIVE":
-                # Real-Time Live Running PnL Equation Calculation Block
                 if trade["Type"] == "BUY":
                     running_pnl = current_ltp - trade["Entry Fill"]
-                    # Risk validation boundary breaches
                     if current_ltp <= trade["Hard Stop"]:
                         trade["System Status"] = "CLOSED (SL hit)"
-                        trade["Live Running PnL (Pts)"] = trade["Hard Stop"] - trade["Entry Fill"]
+                        trade["Live Running PnL (Pts)"] = round(trade["Hard Stop"] - trade["Entry Fill"], 2)
                     elif current_ltp >= trade["Primary Target"]:
                         trade["System Status"] = "CLOSED (TP hit)"
-                        trade["Live Running PnL (Pts)"] = trade["Primary Target"] - trade["Entry Fill"]
+                        trade["Live Running PnL (Pts)"] = round(trade["Primary Target"] - trade["Entry Fill"], 2)
                     else:
                         trade["Live Running PnL (Pts)"] = round(running_pnl, 2)
-                else: # Short trade mapping execution rules path
+                else: # Short execution tracks
                     running_pnl = trade["Entry Fill"] - current_ltp
                     if current_ltp >= trade["Hard Stop"]:
                         trade["System Status"] = "CLOSED (SL hit)"
-                        trade["Live Running PnL (Pts)"] = trade["Entry Fill"] - trade["Hard Stop"]
+                        trade["Live Running PnL (Pts)"] = round(trade["Entry Fill"] - trade["Hard Stop"], 2)
                     elif current_ltp <= trade["Primary Target"]:
                         trade["System Status"] = "CLOSED (TP hit)"
-                        trade["Live Running PnL (Pts)"] = trade["Entry Fill"] - trade["Primary Target"]
+                        trade["Live Running PnL (Pts)"] = round(trade["Entry Fill"] - trade["Primary Target"], 2)
                     else:
                         trade["Live Running PnL (Pts)"] = round(running_pnl, 2)
 
-        # Update Sidebar/Main component display metric for Cumulative Profile Net Tracking
         if st.session_state.trade_history:
             net_live_sum = sum([t.get("Live Running PnL (Pts)", 0.0) for t in st.session_state.trade_history])
             live_pnl_placeholder.metric("Net Total Live Session PnL", f"{net_live_sum:.2f} Pts")
         else:
             live_pnl_placeholder.metric("Net Total Live Session PnL", "0.00 Pts")
 
-        # Display Live Execution Metrics Matrix
+        # Dynamic Execution Matrix Displays
         with col2:
             st.subheader("Dynamic Execution Matrix")
             s_col1, s_col2, s_col3, s_col4 = st.columns(4)
@@ -459,7 +480,7 @@ with tab2:
             s_col1.markdown(f"**Risk Floor (SL):** `{calculated_sl:.2f}`")
             s_col2.markdown(f"**Dynamic Target (TP1):** `{calculated_tp:.2f}`")
             
-            # Active Position Logic Loop
+            # Active Position Order Filling Engine Rules
             if current_signal in ["BUY", "SELL"] and entry_price > 0:
                 trade_key = f"{ticker_symbol}_{last_sig[0].strftime('%H%M%S')}"
                 if trade_key not in st.session_state.active_trades:
@@ -478,7 +499,7 @@ with tab2:
                     st.session_state.trade_history.append(new_trade_entry)
                     st.toast(f"New Order Filled: {current_signal} {ticker_symbol} @ {entry_price}", icon="🚀")
             
-            # Render Live Candlestick Graph Map Engine Window
+            # Plotly Canvas Chart Render Block
             fig_live = go.Figure()
             plot_df = processed_df.tail(40)
             fig_live.add_trace(go.Candlestick(
@@ -491,23 +512,20 @@ with tab2:
                 fig_live.add_trace(go.Scatter(x=plot_df.index, y=plot_df['EMA_15'], line=dict(color='blue', width=1.5), name='15 EMA'))
             
             fig_live.update_layout(xaxis_rangeslider_visible=False, height=450, margin=dict(l=10, r=10, t=10, b=10))
-            st.plotly_chart(fig_live, use_container_width=True, key="live_plotly_chart")
+            st.plotly_chart(fig_live, use_container_width=True, key="live_plotly_chart_v3")
             
     live_streaming_fragment()
 
 # ==================== TAB 3: SYSTEM TRADE LEDGER ====================
 with tab3:
     st.header("Operational Signal & Trade Execution Ledger")
-    st.caption("All executions captured dynamically inside running streaming frameworks are formatted below with instant calculated realization targets.")
+    st.caption("All executions captured dynamically inside running streaming frameworks are formatted below.")
     
     if len(st.session_state.trade_history) == 0:
         st.info("No active trades recorded in this session yet.")
     else:
         ledger_df = pd.DataFrame(st.session_state.trade_history)
-        
-        # Display formatted trade logs
         st.dataframe(ledger_df, use_container_width=True)
         
-        # Download ledger functionality
         csv_data = ledger_df.to_csv(index=False).encode('utf-8')
         st.download_button("Export Order Ledger (.CSV)", csv_data, "institutional_trade_ledger.csv", "text/csv")
