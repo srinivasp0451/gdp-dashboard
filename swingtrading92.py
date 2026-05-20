@@ -3,19 +3,19 @@ import pandas as pd
 import numpy as np
 import yfinance as yf
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 import plotly.graph_objects as go
 
 # --- PAGE CONFIG ---
 st.set_page_config(layout="wide", page_title="Smart Money Institutional Trading System")
 
 # --- INITIALIZE SESSION STATE ---
-if "trade_history" not in st.session_state:
-    st.session_state.trade_history = []
-if "active_trades" not in st.session_state:
-    st.session_state.active_trades = {}
 if "live_tracking_active" not in st.session_state:
     st.session_state.live_tracking_active = False
+if "simulated_position" not in st.session_state:
+    st.session_state.simulated_position = None
+if "trade_ledger" not in st.session_state:
+    st.session_state.trade_ledger = []
 
 # --- TICKER DICTIONARY MAP ---
 TICKER_MAP = {
@@ -33,91 +33,57 @@ TICKER_MAP = {
 NIFTY50_SECTORS = {
     "Financial Services": {
         "HDFC Bank": "HDFCBANK.NS", "ICICI Bank": "ICICIBANK.NS", "Axis Bank": "AXISBANK.NS",
-        "Kotak Mahindra Bank": "KOTAKBANK.NS", "State Bank of India": "SBIN.NS", "Bajaj Finance": "BAJFINANCE.NS",
-        "Bajaj Finserv": "BAJAJFINSV.NS", "HDFC Life": "HDFCLIFE.NS", "SBI Life": "SBILIFE.NS",
-        "Shriram Finance": "SHRIRAMFIN.NS", "Jio Financial Services": "JIOFIN.NS"
+        "Kotak Mahindra Bank": "KOTAKBANK.NS", "State Bank of India": "SBIN.NS", "Bajaj Finance": "BAJFINANCE.NS"
     },
     "Information Technology": {
-        "TCS": "TCS.NS", "Infosys": "INFY.NS", "HCLTech": "HCLTECH.NS",
-        "Tech Mahindra": "TECHM.NS", "Wipro": "WIPRO.NS"
+        "TCS": "TCS.NS", "Infosys": "INFY.NS", "HCLTech": "HCLTECH.NS", "Wipro": "WIPRO.NS"
     },
     "Oil, Gas & Consumable Fuels": {
-        "Reliance Industries": "RELIANCE.NS", "ONGC": "ONGC.NS", "Coal India": "COALINDIA.NS",
-        "BPCL": "BPCL.NS"
+        "Reliance Industries": "RELIANCE.NS", "ONGC": "ONGC.NS", "Coal India": "COALINDIA.NS"
     },
     "Automobile and Auto Components": {
-        "Tata Motors": "TATAMOTORS.NS", "Mahindra & Mahindra": "M&M.NS", "Maruti Suzuki": "MARUTI.NS",
-        "Bajaj Auto": "BAJAJ-AUTO.NS", "Eicher Motors": "EICHERMOT.NS"
+        "Tata Motors": "TATAMOTORS.NS", "Mahindra & Mahindra": "M&M.NS", "Maruti Suzuki": "MARUTI.NS"
     },
     "Healthcare & Pharmaceuticals": {
-        "Sun Pharma": "SUNPHARMA.NS", "Cipla": "CIPLA.NS", "Dr. Reddy's": "DRREDDY.NS",
-        "Apollo Hospitals": "APOLLOHOSP.NS", "Max Healthcare": "MAXHEALTH.NS"
+        "Sun Pharma": "SUNPHARMA.NS", "Cipla": "CIPLA.NS", "Apollo Hospitals": "APOLLOHOSP.NS"
     },
     "Fast Moving Consumer Goods (FMCG)": {
-        "Hindustan Unilever": "HINDUNILVR.NS", "ITC": "ITC.NS", "Nestle India": "NESTLEIND.NS",
-        "Britannia": "BRITANNIA.NS", "Tata Consumer Products": "TATACONSUM.NS"
+        "Hindustan Unilever": "HINDUNILVR.NS", "ITC": "ITC.NS", "Nestle India": "NESTLEIND.NS"
     },
     "Metals & Mining": {
-        "Tata Steel": "TATASTEEL.NS", "JSW Steel": "JSWSTEEL.NS", "Hindalco": "HINDALCO.NS",
-        "Adani Enterprises": "ADANIENT.NS"
-    },
-    "Power & Utilities": {
-        "NTPC": "NTPC.NS", "Power Grid": "POWERGRID.NS"
-    },
-    "Consumer Durables & Services": {
-        "Titan Company": "TITAN.NS", "Asian Paints": "ASIANPAINT.NS", "Trent": "TRENT.NS",
-        "Eternal Ltd": "ETERNAL.NS"
-    },
-    "Construction & Materials": {
-        "Larsen & Toubro": "LT.NS", "UltraTech Cement": "ULTRACEMCO.NS", "Grasim Industries": "GRASIM.NS"
-    },
-    "Services & Capital Goods": {
-        "Adani Ports": "ADANIPORTS.NS", "Bharat Electronics": "BEL.NS", "InterGlobe Aviation (IndiGo)": "INDIGO.NS"
+        "Tata Steel": "TATASTEEL.NS", "JSW Steel": "JSWSTEEL.NS", "Adani Enterprises": "ADANIENT.NS"
     }
 }
 
-# Flattend dictionary for universal access lookup
 ALL_NIFTY_STOCKS = {}
 for sector, stocks in NIFTY50_SECTORS.items():
     ALL_NIFTY_STOCKS.update(stocks)
 
-
 # --- MANUAL TECHNICAL INDICATORS ---
 def calculate_indicators(df, lookback=20):
     df = df.copy()
-    if len(df) < lookback + 10:
+    if len(df) < lookback:
         return df
     
     # 1. Moving Averages (EMA)
-    def calc_ema(series, period):
-        return series.ewm(span=period, adjust=False).mean()
-        
-    df['EMA_9'] = calc_ema(df['Close'], 9)
-    df['EMA_15'] = calc_ema(df['Close'], 15)
+    df['EMA_9'] = df['Close'].ewm(span=9, adjust=False).mean()
+    df['EMA_15'] = df['Close'].ewm(span=15, adjust=False).mean()
     
     # 2. VWAP Calculation
-    typical_price = (df['High'] + df['Low'] + df['Close']) / 3
-    df['VWAP'] = (typical_price * df['Volume']).cumsum() / df['Volume'].cumsum()
+    tp = (df['High'] + df['Low'] + df['Close']) / 3
+    df['VWAP'] = (tp * df['Volume']).cumsum() / df['Volume'].cumsum().replace(0, 1)
     
-    # 3. Rolling Highs/Lows & Ranges
+    # 3. Structural Highs/Lows
     df['Rolling_High'] = df['High'].shift(1).rolling(window=lookback).max()
     df['Rolling_Low'] = df['Low'].shift(1).rolling(window=lookback).min()
     df['Candle_Range'] = (df['High'] - df['Low']).abs()
     df['Avg_Range_10'] = df['Candle_Range'].shift(1).rolling(window=10).mean()
-    
-    # 4. Volume Features
     df['Avg_Volume_10'] = df['Volume'].shift(1).rolling(window=10).mean()
-    df['Volume_Per_Point'] = df['Volume'] / (df['Close'] - df['Open']).abs().replace(0, 0.0001)
     
-    # 5. ATR (Average True Range)
-    high_low = df['High'] - df['Low']
-    high_close = (df['High'] - df['Close'].shift()).abs()
-    low_close = (df['Low'] - df['Close'].shift()).abs()
-    ranges = pd.concat([high_low, high_close, low_close], axis=1)
-    true_range = ranges.max(axis=1)
-    df['ATR_14'] = true_range.rolling(window=14).mean()
+    # 4. ATR & RSI
+    tr = pd.concat([df['High']-df['Low'], (df['High']-df['Close'].shift()).abs(), (df['Low']-df['Close'].shift()).abs()], axis=1).max(axis=1)
+    df['ATR_14'] = tr.rolling(window=14).mean()
     
-    # 6. RSI (Relative Strength Index)
     delta = df['Close'].diff()
     gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
     loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
@@ -126,485 +92,307 @@ def calculate_indicators(df, lookback=20):
     
     return df
 
-# --- DYNAMIC RISK MANAGEMENT ENGINE ---
-def calculate_sl_tp(df, idx, sl_type, tp_type, custom_sl, custom_tp, direction):
-    row = df.iloc[idx]
-    close = row['Close']
-    atr = row['ATR_14'] if 'ATR_14' in df.columns and not pd.isna(row['ATR_14']) else close * 0.01
-    
-    if sl_type in ["Custom SL", "Trailing SL"]:
-        sl_val = close - custom_sl if direction == "BUY" else close + custom_sl
-    elif sl_type == "ATR based SL":
-        sl_val = close - (1.5 * atr) if direction == "BUY" else close + (1.5 * atr)
-    elif sl_type in ["Signal based SL", "Logical SL", "Support Resistance based SL"]:
-        if direction == "BUY":
-            sl_val = row['Rolling_Low'] if not pd.isna(row['Rolling_Low']) else close * 0.99
-        else:
-            sl_val = row['Rolling_High'] if not pd.isna(row['Rolling_High']) else close * 1.01
-    else:
-        sl_val = close * 0.99 if direction == "BUY" else close * 1.01
-        
-    # Enforce minimum 1:2 Risk-to-Reward ratio
-    risk_distance = abs(close - sl_val)
-    if risk_distance == 0:
-        risk_distance = close * 0.005
-        
-    if tp_type in ["Custom Target", "Trailing Target"]:
-        tp1 = close + custom_tp if direction == "BUY" else close - custom_tp
-    elif tp_type == "ATR based Target":
-        tp1 = close + (3 * atr) if direction == "BUY" else close - (3 * atr)
-    elif tp_type in ["Signal based Target", "Logical Target", "Support Resistance based Target"]:
-        if direction == "BUY":
-            tp1 = row['Rolling_High'] if not pd.isna(row['Rolling_High']) else close * 1.02
-        else:
-            tp1 = row['Rolling_Low'] if not pd.isna(row['Rolling_Low']) else close * 0.98
-    else:
-        tp1 = close + (2 * risk_distance) if direction == "BUY" else close - (2 * risk_distance)
-        
-    # Hard structural math override to protect risk matrix allocations (Ensuring at least 1:2)
-    reward_distance = abs(tp1 - close)
-    if reward_distance < (2 * risk_distance):
-        tp1 = close + (2 * risk_distance) if direction == "BUY" else close - (2 * risk_distance)
-        
-    return round(float(sl_val), 2), round(float(tp1), 2)
-
-# --- BACKTEST PNL SIMULATOR ---
-def simulate_backtest_pnl(processed_df, found_signals, sl_mode, tp_mode, custom_sl_input, custom_tp_input, strategy_choice):
-    records = []
-    for sig_idx, (timestamp, sig_type, pattern, entry_p, conf, reason) in enumerate(found_signals):
-        try:
-            idx_pos = processed_df.index.get_loc(timestamp)
-            if isinstance(idx_pos, slice):
-                idx_pos = idx_pos.start
-        except KeyError:
-            continue
-            
-        sl, tp = calculate_sl_tp(processed_df, idx_pos, sl_mode, tp_mode, custom_sl_input, custom_tp_input, sig_type)
-        
-        pnl = 0.0
-        status = "Closed (Target)"
-        exit_price = tp
-        
-        for forward_idx in range(idx_pos + 1, len(processed_df)):
-            f_row = processed_df.iloc[forward_idx]
-            if sig_type == "BUY":
-                if f_row['Low'] <= sl:
-                    pnl = sl - entry_p
-                    exit_price = sl
-                    status = "Closed (Stop Loss)"
-                    break
-                elif f_row['High'] >= tp:
-                    pnl = (tp - entry_p)
-                    exit_price = tp
-                    status = "Closed (Target)"
-                    break
-            elif sig_type == "SELL":
-                if f_row['High'] >= sl:
-                    pnl = entry_p - sl
-                    exit_price = sl
-                    status = "Closed (Stop Loss)"
-                    break
-                elif f_row['Low'] <= tp:
-                    pnl = entry_p - tp
-                    exit_price = tp
-                    status = "Closed (Target)"
-                    break
-                    
-        if pnl == 0.0:
-            last_close = processed_df['Close'].iloc[-1]
-            pnl = (last_close - entry_p) if sig_type == "BUY" else (entry_p - last_close)
-            exit_price = last_close
-            status = "End of Data Default"
-            
-        records.append({
-            "Timestamp": timestamp.strftime('%Y-%m-%d %H:%M:%S') if hasattr(timestamp, 'strftime') else str(timestamp),
-            "Signal Type": sig_type,
-            "Pattern Core": pattern,
-            "Entry Reference": round(entry_p, 2),
-            "Stop Loss Assignment": round(sl, 2),
-            "Target (TP1 70%)": round(tp, 2),
-            "Exit Price": round(exit_price, 2),
-            "Trade Status": status,
-            "Simulated PnL (Pts)": round(pnl, 2),
-            "Confidence Score": f"{conf}%",
-            "Reason of Entry": reason
-        })
-    return records
-
-# --- ENGINE: TRAP STRATEGY SCORER ---
+# --- STRATEGY ENGINE MATRIX ---
 def run_trap_strategy(df, lookback=20):
     df = calculate_indicators(df, lookback)
     signals = []
-    if len(df) < lookback + 5:
-        return df, signals
+    if len(df) < lookback + 5: return df, signals
     
-    for i in range(lookback + 5, len(df)):
-        row = df.iloc[i]
+    for i in range(lookback + 2, len(df)):
         prev_row = df.iloc[i-1]
+        row = df.iloc[i]
         
-        is_bull_breakout = prev_row['Close'] > prev_row['Rolling_High']
-        is_bear_breakdown = prev_row['Close'] < prev_row['Rolling_Low']
-        large_range = prev_row['Candle_Range'] > (1.2 * prev_row['Avg_Range_10'])
-        weak_volume = prev_row['Volume'] <= prev_row['Avg_Volume_10']
-        
-        if is_bull_breakout and large_range and weak_volume:
+        if prev_row['Close'] > prev_row['Rolling_High'] and prev_row['Volume'] <= prev_row['Avg_Volume_10']:
             if row['Close'] < prev_row['Rolling_High']:
-                score = 65
-                if row['High'] > prev_row['High']: score += 15
-                if row['Close'] < row['Open']: score += 10
-                reason = "Breakout above resistance with weak volume failed and closed back below."
-                signals.append((df.index[i], "SELL", "Bull Trap", row['Close'], score, reason))
-                
-        elif is_bear_breakdown and large_range and weak_volume:
+                signals.append((df.index[i], "SELL", "Bull Trap", row['Close'], 85, "Institutional Trap Above Resistance"))
+        elif prev_row['Close'] < prev_row['Rolling_Low'] and prev_row['Volume'] <= prev_row['Avg_Volume_10']:
             if row['Close'] > prev_row['Rolling_Low']:
-                score = 65
-                if row['Low'] < prev_row['Low']: score += 15
-                if row['Close'] > row['Open']: score += 10
-                reason = "Breakdown below support with weak volume failed and closed back above."
-                signals.append((df.index[i], "BUY", "Bear Trap", row['Close'], score, reason))
-                
+                signals.append((df.index[i], "BUY", "Bear Trap", row['Close'], 85, "Institutional Trap Below Support"))
     return df, signals
 
-# --- ALTERNATIVE STRATEGY RUNNERS ---
 def run_alternative_strategies(df, strategy_name):
     df = calculate_indicators(df)
     signals = []
     if len(df) < 20: return df, signals
     
-    if strategy_name == "EMA Crossover Strategy":
-        for i in range(1, len(df)):
+    for i in range(1, len(df)):
+        if strategy_name == "EMA Crossover Strategy":
             if df['EMA_9'].iloc[i-1] <= df['EMA_15'].iloc[i-1] and df['EMA_9'].iloc[i] > df['EMA_15'].iloc[i]:
-                signals.append((df.index[i], "BUY", "EMA Gold Cross", df['Close'].iloc[i], 80, "9 EMA crossed above 15 EMA."))
+                signals.append((df.index[i], "BUY", "EMA Cross", df['Close'].iloc[i], 80, "9 EMA Crossed Above 15 EMA"))
             elif df['EMA_9'].iloc[i-1] >= df['EMA_15'].iloc[i-1] and df['EMA_9'].iloc[i] < df['EMA_15'].iloc[i]:
-                signals.append((df.index[i], "SELL", "EMA Death Cross", df['Close'].iloc[i], 80, "9 EMA crossed below 15 EMA."))
-                
-    elif strategy_name == "RSI Overbought Oversold Strategy":
-        for i in range(1, len(df)):
-            if df['RSI_14'].iloc[i-1] >= 30 and df['RSI_14'].iloc[i] < 30:
-                signals.append((df.index[i], "BUY", "RSI Oversold Pivot", df['Close'].iloc[i], 70, "RSI crossed below 30 threshold."))
-            elif df['RSI_14'].iloc[i-1] <= 70 and df['RSI_14'].iloc[i] > 70:
-                signals.append((df.index[i], "SELL", "RSI Overbought Pivot", df['Close'].iloc[i], 70, "RSI crossed above 70 threshold."))
-                
-    elif strategy_name == "VWAP Based Strategy":
-        for i in range(1, len(df)):
+                signals.append((df.index[i], "SELL", "EMA Cross", df['Close'].iloc[i], 80, "9 EMA Crossed Below 15 EMA"))
+        elif strategy_name == "VWAP Based Strategy":
             if df['Close'].iloc[i-1] <= df['VWAP'].iloc[i-1] and df['Close'].iloc[i] > df['VWAP'].iloc[i]:
-                signals.append((df.index[i], "BUY", "VWAP Reclaim", df['Close'].iloc[i], 75, "Price crossed above historical anchor VWAP line."))
+                signals.append((df.index[i], "BUY", "VWAP Reclaim", df['Close'].iloc[i], 75, "Price crossed above Anchor VWAP"))
             elif df['Close'].iloc[i-1] >= df['VWAP'].iloc[i-1] and df['Close'].iloc[i] < df['VWAP'].iloc[i]:
-                signals.append((df.index[i], "SELL", "VWAP Breakdown", df['Close'].iloc[i], 75, "Price crossed below historical anchor VWAP line."))
-                
+                signals.append((df.index[i], "SELL", "VWAP Breakdown", df['Close'].iloc[i], 75, "Price dropped below Anchor VWAP"))
     return df, signals
 
-# --- FETCH DATA WITH ROBUST DEFENSIVE COLUMN FLATTENER ---
+# --- FETCH DATA ---
 def fetch_ticker_data(ticker, period, interval):
-    time.sleep(0.1)  # Lower sleep delay for faster scanner iteration loops
     try:
         data = yf.download(ticker, period=period, interval=interval, progress=False)
-        if data.empty:
-            return pd.DataFrame()
-            
+        if data.empty: return pd.DataFrame()
         if isinstance(data.columns, pd.MultiIndex):
             data.columns = [col[0] for col in data.columns]
-            
         data = data.loc[:, ~data.columns.duplicated()].copy()
-        
-        required_cols = ['Open', 'High', 'Low', 'Close', 'Volume']
-        for col in required_cols:
-            if col in data.columns:
-                data[col] = pd.to_numeric(data[col], errors='coerce')
-            else:
-                alternate_col = col.lower()
-                if alternate_col in data.columns:
-                    data[col] = pd.to_numeric(data[alternate_col], errors='coerce')
-                    
-        if 'Close' not in data.columns or data['Close'].isnull().all():
-            return pd.DataFrame()
-            
         return data.dropna(subset=['Close'])
     except Exception:
         return pd.DataFrame()
 
-# --- SIDEBAR CONTROL PANEL ---
-st.sidebar.title("🛡️ Institutional Control")
-ticker_selection = st.sidebar.selectbox("Select Core Asset Group", list(TICKER_MAP.keys()) + ["Custom Ticker"])
+# --- SIDEBAR MANUVER PANEL ---
+st.sidebar.title("🛡️ Institutional Risk Desk")
+ticker_selection = st.sidebar.selectbox("Select Active Asset Framework", list(TICKER_MAP.keys()) + ["Custom Ticker"])
+ticker_symbol = st.sidebar.text_input("Symbol Code", "AAPL") if ticker_selection == "Custom Ticker" else TICKER_MAP[ticker_selection]
 
-if ticker_selection == "Custom Ticker":
-    ticker_symbol = st.sidebar.text_input("Enter Custom Symbol (e.g., AAPL, EURUSD=X)", "AAPL")
-else:
-    ticker_symbol = TICKER_MAP[ticker_selection]
-
-strategy_choice = st.sidebar.selectbox("Market Strategy Engine", [
-    "Institutional Trap Strategy", "EMA Crossover Strategy", 
-    "RSI Overbought Oversold Strategy", "VWAP Based Strategy"
+strategy_choice = st.sidebar.selectbox("Dashboard Analytics Strategy", [
+    "Institutional Trap Strategy", "EMA Crossover Strategy", "VWAP Based Strategy"
 ])
+interval_choice = st.sidebar.selectbox("Timeframe Frame", ["1m", "5m", "15m", "1h", "1d"], index=2)
+period_choice = st.sidebar.selectbox("Lookback Limit", ["1d", "5d", "1mo", "3mo", "1y"], index=1)
 
-intervals_configs = {
-    "1m": ["1d", "5d", "7d"],
-    "5m": ["1d", "5d", "7d", "1mo"],
-    "15m": ["1d", "5d", "7d", "1mo"],
-    "1h": ["1d", "5d", "7d", "1mo", "3mo", "6mo", "1y"],
-    "1d": ["5d", "7d", "1mo", "3mo", "6mo", "1y", "2y", "5y", "10y"],
-    "1wk": ["1mo", "3mo", "6mo", "1y", "2y", "5y", "10y"]
-}
+st.sidebar.subheader("Risk Constraints")
+sl_points = st.sidebar.number_input("Stop Loss points allocation", min_value=0.5, value=15.0)
+target_multiplier = st.sidebar.selectbox("Enforced Risk-Reward Matrix", [2.0, 3.0, 4.0], index=0)
 
-interval_choice = st.sidebar.selectbox("Execution Candlestick TF", list(intervals_configs.keys()), index=2)
-period_choice = st.sidebar.selectbox("Historical Framework Window", intervals_configs[interval_choice])
-
-st.sidebar.subheader("Risk Matrix Framework")
-sl_mode = st.sidebar.selectbox("Stop Loss Risk Rule", ["Custom SL", "Trailing SL", "Signal based SL", "ATR based SL", "Logical SL", "Support Resistance based SL"])
-custom_sl_input = st.sidebar.number_input("Custom/Trailing SL Points Offset", min_value=0.01, max_value=5000.0, value=10.0, step=1.0)
-
-tp_mode = st.sidebar.selectbox("Profit Execution Target Rule", ["Custom Target", "Trailing Target", "Signal based Target", "ATR based Target", "Logical Target", "Support Resistance based Target"])
-custom_tp_input = st.sidebar.number_input("Custom Target Points Offset", min_value=0.01, max_value=5000.0, value=20.0, step=1.0)
-
-# --- SYSTEM APP TABS ---
+# --- CORE APP NAVIGATION TABS ---
 tab1, tab2, tab3, tab4 = st.tabs([
-    "📊 Backtesting & Signal History", 
+    "📊 Backtesting Analytics", 
     "⚡ Live Micro-Execution Framework", 
-    "📜 System Trade Ledger",
-    "🔍 Institutional Sector Screener"
+    "📜 Structural History Ledger",
+    "🔍 Institutional Sector Screener (ORB Setup)"
 ])
 
-# ==================== TAB 1: BACKTESTING ENGINE ====================
+# ==================== TAB 1: HISTORICAL BACKTEST ENGINE ====================
 with tab1:
-    st.header("Historical Engine Backtesting Performance")
-    if st.button("Execute Backtest Simulation", key="bt_run"):
-        with st.spinner("Processing architectural market arrays..."):
-            raw_data = fetch_ticker_data(ticker_symbol, period_choice, interval_choice)
-            
-            if raw_data.empty:
-                st.warning("No standard architectural frame found for data parsing.")
+    st.header("Historical Engine Diagnostic Board")
+    if st.button("Execute System Backtest Analysis", use_container_width=True):
+        df = fetch_ticker_data(ticker_symbol, period_choice, interval_choice)
+        if not df.empty:
+            df, signals = run_trap_strategy(df) if strategy_choice == "Institutional Trap Strategy" else run_alternative_strategies(df, strategy_choice)
+            if signals:
+                st.success(f"Successfully tracked {len(signals)} matching execution setups.")
+                st.dataframe(pd.DataFrame(signals, columns=["Time", "Type", "Pattern", "Price", "Score", "Description"]), use_container_width=True)
             else:
-                if strategy_choice == "Institutional Trap Strategy":
-                    processed_df, found_signals = run_trap_strategy(raw_data)
-                else:
-                    processed_df, found_signals = run_alternative_strategies(raw_data, strategy_choice)
-                
-                if not found_signals:
-                    st.info("No system-aligned operational setups matched your confirmation definitions for this period.")
-                else:
-                    simulated_records = simulate_backtest_pnl(processed_df, found_signals, sl_mode, tp_mode, custom_sl_input, custom_tp_input, strategy_choice)
-                    df_rec = pd.DataFrame(simulated_records)
-                    
-                    total_pnl = df_rec["Simulated PnL (Pts)"].sum()
-                    win_trades = len(df_rec[df_rec["Simulated PnL (Pts)"] > 0])
-                    win_rate = (win_trades / len(df_rec)) * 100 if len(df_rec) > 0 else 0
-                    
-                    c1, c2, c3 = st.columns(3)
-                    c1.metric("Net Aggregated PnL", f"{total_pnl:.2f} Pts", delta=f"{total_pnl:.2f}")
-                    c2.metric("Total Generated Trades", len(df_rec))
-                    c3.metric("Win-Rate Ratio Profile", f"{win_rate:.1f}%")
-                    
-                    st.dataframe(df_rec, use_container_width=True)
-                    
-                    fig = go.Figure()
-                    fig.add_trace(go.Candlestick(
-                        x=processed_df.index, open=processed_df['Open'], high=processed_df['High'],
-                        low=processed_df['Low'], close=processed_df['Close'], name="Price Candle Action"
-                    ))
-                    if 'EMA_9' in processed_df.columns:
-                        fig.add_trace(go.Scatter(x=processed_df.index, y=processed_df['EMA_9'], line=dict(color='orange', width=1), name='EMA 9'))
-                    if 'EMA_15' in processed_df.columns:
-                        fig.add_trace(go.Scatter(x=processed_df.index, y=processed_df['EMA_15'], line=dict(color='blue', width=1), name='EMA 15'))
-                        
-                    for rec in simulated_records:
-                        color = 'green' if rec['Signal Type'] == 'BUY' else 'red'
-                        fig.add_trace(go.Scatter(
-                            x=[pd.to_datetime(rec['Timestamp'])], y=[rec['Entry Reference']], mode='markers',
-                            marker=dict(color=color, size=12, symbol='triangle-up' if color=='green' else 'triangle-down'),
-                            name=f"{rec['Signal Type']} Entry"
-                        ))
-                    fig.update_layout(title=f"{ticker_symbol} Historical Backtest Architecture Map", xaxis_rangeslider_visible=False, height=600)
-                    st.plotly_chart(fig, use_container_width=True)
+                st.info("No patterns matched configuration metrics within this historical window block.")
 
-# ==================== TAB 2: LIVE MICRO-EXECUTION ====================
+# ==================== TAB 2: LIVE MICRO-EXECUTION CONTROLLER ====================
 with tab2:
-    st.header("Live Micro-Execution Tracker Framework")
+    st.header("Live Micro-Execution Matrix Stream")
     
-    # --- HARDWARE STATE INTERACTION CONTROLS ---
-    btn_col1, btn_col2, btn_col3 = st.columns(3)
-    
-    if btn_col1.button("🟢 START LIVE STREAM", use_container_width=True):
+    # Hardware Interface Control Switches
+    c_btn1, c_btn2, c_btn3 = st.columns(3)
+    if c_btn1.button("🟢 START REAL-TIME STREAM PIPELINE", use_container_width=True):
         st.session_state.live_tracking_active = True
-        st.toast("Telemetry Pipelines Initialized Safely.", icon="🛰️")
-        
-    if btn_col2.button("🔴 STOP LIVE STREAM", use_container_width=True):
+    if c_btn2.button("🔴 SHUT DOWN TELEMETRY STREAM", use_container_width=True):
         st.session_state.live_tracking_active = False
-        st.toast("Telemetry Pipelines Suspended Gracefully.", icon="🛑")
-        
-    if btn_col3.button("💥 EMERGENCY SQUARE OFF ALL", use_container_width=True):
+    if c_btn3.button("💥 EMERGENCY SQUARE-OFF ALL RUNS", use_container_width=True):
         st.session_state.live_tracking_active = False
-        active_count = 0
-        for trade in st.session_state.trade_history:
-            if trade["System Status"] == "ACTIVE":
-                trade["System Status"] = "MANUAL SQUARE OFF"
-                active_count += 1
-        st.session_state.active_trades.clear()
-        st.success(f"Emergency Intercept Active. Closed {active_count} market positions.")
+        if st.session_state.simulated_position:
+            st.session_state.simulated_position["Status"] = "SQUARED_OFF"
+            st.session_state.trade_ledger.append(st.session_state.simulated_position)
+            st.session_state.simulated_position = None
+            st.toast("Positions liquidated safely.", icon="🚨")
 
-    st.write("---")
-    
-    # MASTER CONTENT CONTAINERS FOR AUTO-CLEAN REFRESH HOOKS
-    col1, col2 = st.columns([1, 3])
-    
-    with col1:
-        status_text = "🟢 ENGINE SCANNING" if st.session_state.live_tracking_active else "⚪ STANDBY"
-        st.metric("System Core Engine State", status_text)
-        st.metric("Monitoring Target Asset", ticker_symbol)
-        st.metric("Assigned Logic Routine", strategy_choice)
-        live_pnl_placeholder = st.empty()
-        
-        st.write("---")
-        st.subheader("Nav Configurations")
-        st.markdown(f"""
-        - **Asset**: `{ticker_symbol}`
-        - **Strategy**: `{strategy_choice}`
-        - **Timeframe**: `{interval_choice}` (`{period_choice}`)
-        - **SL Rule**: `{sl_mode}` (`{custom_sl_input} Pts`)
-        - **Target Rule**: `{tp_mode}` (`{custom_tp_input} Pts`)
-        """)
-        
-    # RIGHT SIDE BLOCKS OUTSIDE THE LOOP TO FIX ACCUMULATION BUG
-    with col2:
-        telemetry_display_box = st.empty()
-        matrix_display_box = st.empty()
-        chart_display_box = st.empty()
+    st.markdown("---")
 
-    # Isolated streaming fragment running every 2.0 seconds
-    @st.fragment(run_every=2.0 if st.session_state.live_tracking_active else None)
-    def live_streaming_fragment():
+    # Dynamic Fragment Update Container Block
+    @st.fragment(run_every=1.0 if st.session_state.live_tracking_active else None)
+    def render_live_telemetry():
         if not st.session_state.live_tracking_active:
-            with matrix_display_box.container():
-                st.info("System is resting on standby mode. Launch live stream pipelines to initialize.")
+            st.warning("Core engine pipelines running inside structural Standby Status. Initiate Stream to calculate logs.")
             return
+            
+        # Download data stream array blocks safely
+        df = fetch_ticker_data(ticker_symbol, "5d", interval_choice)
+        if df.empty:
+            st.error("Telemetry Sync Error: No usable asset price rows parsed safely.")
+            return
+            
+        df = calculate_indicators(df)
+        ltp = round(float(df['Close'].iloc[-1]), 2)
+        highest_p = round(float(df['High'].max()), 2)
+        lowest_p = round(float(df['Low'].min()), 2)
+        
+        # Check active signal logic validation runs
+        df, live_sigs = run_trap_strategy(df) if strategy_choice == "Institutional Trap Strategy" else run_alternative_strategies(df, strategy_choice)
+        signal_found = "MATCHED SETUP" if live_sigs else "SCANNING FOR PATTERN"
+        
+        # Setup position simulator rules if active setup signals exist
+        if live_sigs and st.session_state.simulated_position is None:
+            latest = live_sigs[-1]
+            direction = latest[1]
+            sl_calc = ltp - sl_points if direction == "BUY" else ltp + sl_points
+            tp_calc = ltp + (sl_points * target_multiplier) if direction == "BUY" else ltp - (sl_points * target_multiplier)
+            
+            st.session_state.simulated_position = {
+                "Asset": ticker_symbol, "Time": datetime.now().strftime("%H:%M:%S"),
+                "Direction": direction, "Entry": ltp, "SL": round(sl_calc, 2), "TP": round(tp_calc, 2),
+                "Status": "OPEN"
+            }
+            st.toast(f"Executed live structural position logic framework: {direction}", icon="📈")
 
-# ==================== TAB 3: SYSTEM LEDGER ====================
+        # Position Monitoring Matrix and Real-time PnL Calculation Loops
+        live_pnl = 0.0
+        if st.session_state.simulated_position and st.session_state.simulated_position["Status"] == "OPEN":
+            pos = st.session_state.simulated_position
+            if pos["Direction"] == "BUY":
+                live_pnl = ltp - pos["Entry"]
+                if df['Low'].iloc[-1] <= pos["SL"]: pos["Status"] = "STOPPED_OUT"
+                elif df['High'].iloc[-1] >= pos["TP"]: pos["Status"] = "TARGET_HIT"
+            else:
+                live_pnl = pos["Entry"] - ltp
+                if df['High'].iloc[-1] <= pos["SL"]: pos["Status"] = "STOPPED_OUT"
+                elif df['Low'].iloc[-1] >= pos["TP"]: pos["Status"] = "TARGET_HIT"
+                
+            if pos["Status"] in ["STOPPED_OUT", "TARGET_HIT"]:
+                st.session_state.trade_ledger.append(pos)
+                st.session_state.simulated_position = None
+                st.toast("Position hit execution target boundary limit and moved cleanly to ledger records.", icon="📥")
+
+        # Visual Dashboard layout layers
+        m_col1, m_col2, m_col3, m_col4 = st.columns(4)
+        m_col1.metric("LTP (Last Traded Price)", f"{ltp:.2f}", delta=f"{df['Close'].diff().iloc[-1]:.2f}")
+        m_col2.metric("Highest Trading High Window", f"{highest_p:.2f}")
+        m_col3.metric("Lowest Trading Low Window", f"{lowest_p:.2f}")
+        
+        pnl_color = "inverse" if live_pnl < 0 else "normal"
+        m_col4.metric("Real-Time Running PnL", f"{live_pnl:.2f} Pts", delta=f"{live_pnl:.2f} Pts", delta_color=pnl_color)
+
+        st.markdown("---")
+        
+        layout_left, layout_right = st.columns([2, 3])
+        with layout_left:
+            st.subheader("Nav Control Matrix Allocations")
+            st.markdown(f"""
+            - **Monitored Asset Key**: `{ticker_symbol}`
+            - **Strategic Rule Logic**: `{strategy_choice}`
+            - **Assigned Frame Time**: `{interval_choice}`
+            - **Calculated Engine Loop Status**: `{signal_found}`
+            """)
+            
+            st.subheader("Active Position Parameters")
+            if st.session_state.simulated_position:
+                st.json(st.session_state.simulated_position)
+            else:
+                st.info("System currently scanning neutral. No open position traces verified.")
+                
+        with layout_right:
+            st.subheader("Live Operational Overlay Canvas")
+            fig = go.Figure()
+            # Keep only the last 40 bars for scannable high-speed visualization
+            plot_df = df.tail(40)
+            fig.add_trace(go.Candlestick(
+                x=plot_df.index, open=plot_df['Open'], high=plot_df['High'],
+                low=plot_df['Low'], close=plot_df['Close'], name="Candles"
+            ))
+            fig.add_trace(go.Scatter(x=plot_df.index, y=plot_df['EMA_9'], line=dict(color='orange', width=1), name='9 EMA'))
+            fig.add_trace(go.Scatter(x=plot_df.index, y=plot_df['EMA_15'], line=dict(color='cyan', width=1), name='15 EMA'))
+            fig.update_layout(margin=dict(l=10, r=10, t=10, b=10), height=380, xaxis_rangeslider_visible=False)
+            st.plotly_chart(fig, use_container_width=True)
+
+    render_live_telemetry()
+
+# ==================== TAB 3: SYSTEM AUDIT LEDGER ====================
 with tab3:
-    st.header("Master Operations Ledger History")
-    if not st.session_state.trade_history:
-        st.info("No recorded context traces committed to permanent session storage arrays yet.")
+    st.header("Master Operational Account Ledger Records")
+    if st.session_state.trade_ledger:
+        st.dataframe(pd.DataFrame(st.session_state.trade_ledger), use_container_width=True)
     else:
-        ledger_df = pd.DataFrame(st.session_state.trade_history)
-        st.dataframe(ledger_df, use_container_width=True)
+        st.info("No recorded real-time positions committed to memory records during this run.")
 
-
-# ==================== TAB 4: INSTITUTIONAL SECTOR SCREENER ====================
+# ==================== TAB 4: INDEPENDENT SECTOR ORB SCREENER ====================
 with tab4:
-    st.header("🔍 Nifty 50 Real-Time Multi-Sector Market Screener")
-    st.markdown("Scans Nifty 50 matrix arrays across structural sectors to identify dynamic asymmetric execution targets.")
-    
-    # Screener-specific configuration filters
+    st.header("🔍 Autonomic Intraday Opening Range Breakout (ORB) Screener")
+    st.markdown("Independent institutional framework module scanning asset lists for 15-Minute range breakouts.")
+
     sc1, sc2, sc3 = st.columns(3)
     with sc1:
-        selected_sector = st.selectbox("Filter by Industrial Sector", ["ALL Sectors"] + list(NIFTY50_SECTORS.keys()))
+        scr_sector = st.selectbox("Screener Segment Sector Filter", ["ALL Assets"] + list(NIFTY50_SECTORS.keys()))
     with sc2:
-        screener_strategy = st.selectbox("Screener Processing Engine", [
-            "Institutional Trap Strategy", "EMA Crossover Strategy", 
-            "RSI Overbought Oversold Strategy", "VWAP Based Strategy"
-        ], key="screen_strat")
+        orb_target_rr = st.selectbox("Execution Target Risk-Reward Metric", ["1:2 Target Layout", "1:4 Risk Matrix Acceleration"])
     with sc3:
-        signal_filter = st.selectbox("Filter Current Signals", ["All Setups", "BUY Only", "SELL Only"])
+        direction_filter = st.selectbox("Breakout Direction Lookups", ["All Breakouts", "Bullish Breakouts Only", "Bearish Breakouts Only"])
 
-    # Resolve target stocks to look up based on sector constraints
-    stocks_to_scan = {}
-    if selected_sector == "ALL Sectors":
-        stocks_to_scan = ALL_NIFTY_STOCKS
-    else:
-        stocks_to_scan = NIFTY50_SECTORS[selected_sector]
+    # Map stock ticker scope allocation matrices
+    scan_pool = ALL_NIFTY_STOCKS if scr_sector == "ALL Assets" else NIFTY50_SECTORS[scr_sector]
+    rr_multiplier = 2.0 if "1:2" in orb_target_rr else 4.0
+
+    if st.button("🚀 EXECUTE AUTONOMOUS STRATEGY MATRIX DISCOVERY", use_container_width=True):
+        screener_records = []
+        progress_slot = st.progress(0)
+        status_slot = st.empty()
         
-    if st.button("🚀 Run Architecture Scan", use_container_width=True, key="screener_execution_trigger"):
-        screen_results = []
+        pool_len = len(scan_pool)
         
-        progress_bar = st.progress(0)
-        status_text_area = st.empty()
-        
-        total_stocks = len(stocks_to_scan)
-        
-        for index, (display_name, yf_ticker) in enumerate(stocks_to_scan.items()):
-            status_text_area.text(f"Scanning Array Segment [{index+1}/{total_stocks}]: Parsing {display_name} ({yf_ticker})...")
-            progress_bar.progress((index + 1) / total_stocks)
+        for idx, (name, symbol) in enumerate(scan_pool.items()):
+            status_slot.text(f"Processing Array Node [{idx+1}/{pool_len}]: Querying Data Stream for {name} ({symbol})...")
+            progress_slot.progress((idx + 1) / pool_len)
             
-            # Request historical dataframe blocks
-            ticker_df = fetch_ticker_data(yf_ticker, period_choice, interval_choice)
-            if ticker_df.empty or len(ticker_df) < 25:
+            # Fetch intraday data required for calculation mapping
+            hist_df = fetch_ticker_data(symbol, "5d", "15m")
+            if hist_df.empty or len(hist_df) < 5:
                 continue
                 
-            # Direct calculations to target selected engine structures
-            if screener_strategy == "Institutional Trap Strategy":
-                processed_df, found_signals = run_trap_strategy(ticker_df)
-            else:
-                processed_df, found_signals = run_alternative_strategies(ticker_df, screener_strategy)
+            # Filter rows for the most recent trading session to locate opening values cleanly
+            last_date = hist_df.index[-1].date()
+            day_df = hist_df[hist_df.index.date == last_date]
+            if len(day_df) < 2: 
+                continue
                 
-            if found_signals:
-                # Target the most recent structural signal setup matched
-                latest_sig = found_signals[-1]
-                timestamp, sig_type, pattern, entry_p, conf, reason = latest_sig
+            # Define Opening Range boundaries based on the initial 15-minute bar
+            first_candle = day_df.iloc[0]
+            orb_high = float(first_candle['High'])
+            orb_low = float(first_candle['Low'])
+            
+            current_row = day_df.iloc[-1]
+            ltp = float(current_row['Close'])
+            
+            setup_status = "Neutral"
+            entry_ref = 0.0
+            sl_val = 0.0
+            tp_val = 0.0
+            
+            # Evaluate range break rules across the remaining intraday matrix rows
+            for bar_idx in range(1, len(day_df)):
+                check_row = day_df.iloc[bar_idx]
+                if check_row['Close'] > orb_high:
+                    setup_status = "BULLISH BREAKOUT"
+                    entry_ref = orb_high
+                    sl_val = orb_low
+                    tp_val = entry_ref + ((entry_ref - sl_val) * rr_multiplier)
+                    break
+                elif check_row['Close'] < orb_low:
+                    setup_status = "BEARISH BREAKDOWN"
+                    entry_ref = orb_low
+                    sl_val = orb_high
+                    tp_val = entry_ref - ((sl_val - entry_ref) * rr_multiplier)
+                    break
+            
+            # Filter results based on selected direction criteria
+            if direction_filter == "Bullish Breakouts Only" and setup_status != "BULLISH BREAKOUT": continue
+            if direction_filter == "Bearish Breakouts Only" and setup_status != "BEARISH BREAKDOWN": continue
+            if setup_status == "Neutral": continue
+            
+            screener_records.append({
+                "Asset Name": name, "Ticker Symbol": symbol, "Intraday LTP": round(ltp, 2),
+                "ORB Status": setup_status, "Opening High (15m)": round(orb_high, 2), "Opening Low (15m)": round(orb_low, 2),
+                "Trigger Entry": round(entry_ref, 2), "Calculated SL": round(sl_val, 2), "Target Profit Line": round(tp_val, 2)
+            })
+
+        progress_slot.empty()
+        status_slot.empty()
+
+        if screener_records:
+            res_df = pd.DataFrame(screener_records)
+            
+            # Modern element styling updates mapped via Styler.map() to fix the structural bug
+            def highlight_orb_status(val):
+                if val == "BULLISH BREAKOUT": return "background-color: rgba(0, 128, 0, 0.15); color: green; font-weight: bold;"
+                if val == "BEARISH BREAKDOWN": return "background-color: rgba(255, 0, 0, 0.15); color: red; font-weight: bold;"
+                return ""
                 
-                try:
-                    idx_pos = processed_df.index.get_loc(timestamp)
-                    if isinstance(idx_pos, slice):
-                        idx_pos = idx_pos.start
-                except KeyError:
-                    continue
-                
-                # Dynamic risk calculation with structural 1:2 matrix enforcement
-                sl, tp = calculate_sl_tp(processed_df, idx_pos, sl_mode, tp_mode, custom_sl_input, custom_tp_input, sig_type)
-                current_price = processed_df['Close'].iloc[-1]
-                
-                # Check filter matching criteria
-                if signal_filter == "BUY Only" and sig_type != "BUY":
-                    continue
-                if signal_filter == "SELL Only" and sig_type != "SELL":
-                    continue
-                    
-                # Find matching structural sector label for inverted lookup
-                matched_sector = "Unknown"
-                for sec_name, sec_dict in NIFTY50_SECTORS.items():
-                    if display_name in sec_dict:
-                        matched_sector = sec_name
-                        break
-                        
-                risk_pts = abs(entry_p - sl)
-                reward_pts = abs(tp - entry_p)
-                actual_rr = round(reward_pts / risk_pts, 2) if risk_pts > 0 else 2.0
-                
-                screen_results.append({
-                    "Stock": display_name,
-                    "Ticker": yf_ticker,
-                    "Sector": matched_sector,
-                    "LTP": round(current_price, 2),
-                    "Signal": sig_type,
-                    "Pattern": pattern,
-                    "Entry Ref": round(entry_p, 2),
-                    "Stop Loss": round(sl, 2),
-                    "Target (1:2 Min)": round(tp, 2),
-                    "Risk-Reward Ratio": f"1:{actual_rr}",
-                    "Signal Time": timestamp.strftime('%Y-%m-%d %H:%M') if hasattr(timestamp, 'strftime') else str(timestamp)
-                })
-                
-        # Clear loading overlays
-        progress_bar.empty()
-        status_text_area.empty()
-        
-        if not screen_results:
-            st.info("No stocks matched your active strategy conditions in this specific scanning sequence.")
+            styled_output = res_df.style.map(highlight_orb_status, subset=["ORB Status"])
+            st.dataframe(styled_output, use_container_width=True)
         else:
-            final_screener_df = pd.DataFrame(screen_results)
-            
-            # Display high-level metrics
-            m1, m2, m3 = st.columns(3)
-            m1.metric("Scanned Matrix Universe", f"{total_stocks} Tickers")
-            m2.metric("Identified Setups", len(final_screener_df))
-            m3.metric("Filtered Strategy Focus", screener_strategy)
-            
-            st.write("### 📈 Active Structural Setups Table Matrix")
-            
-            # Color-code setups for quick recognition
-            def highlight_signals(val):
-                if val == 'BUY':
-                    return 'background-color: rgba(0, 128, 0, 0.2); color: green; font-weight: bold;'
-                elif val == 'SELL':
-                    return 'background-color: rgba(255, 0, 0, 0.2); color: red; font-weight: bold;'
-                return ''
-                
-            styled_df = final_screener_df.style.applymap(highlight_signals, subset=['Signal'])
-            st.dataframe(styled_df, use_container_width=True)
+            st.info("No underlying sector assets triggered an internal 15-minute Opening Range break matrix verification during this tracking pass.")
