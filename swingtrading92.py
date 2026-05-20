@@ -1,412 +1,619 @@
 import streamlit as st
+import yfinance as yf
 import pandas as pd
 import numpy as np
-import yfinance as yf
-import time
-from datetime import datetime
-import plotly.graph_objects as go
+from datetime import datetime, timedelta
 
-# --- PAGE CONFIG ---
-st.set_page_config(layout="wide", page_title="Smart Money Institutional Trading System")
+# ─── Page Config ────────────────────────────────────────────────────────────────
+st.set_page_config(
+    page_title="ORB Scanner — Nifty 50",
+    page_icon="📈",
+    layout="wide",
+)
 
-# --- INITIALIZE SESSION STATE ---
-if "live_tracking_active" not in st.session_state:
-    st.session_state.live_tracking_active = False
-if "simulated_position" not in st.session_state:
-    st.session_state.simulated_position = None
-if "trade_ledger" not in st.session_state:
-    st.session_state.trade_ledger = []
+# ─── Custom CSS ─────────────────────────────────────────────────────────────────
+st.markdown("""
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=Syne:wght@400;600;800&display=swap');
 
-# --- TICKER DICTIONARY MAP ---
-TICKER_MAP = {
-    "Nifty 50": "^NSEI",
-    "Bank Nifty": "^NSEBANK",
-    "Sensex": "^BSESN",
-    "Bitcoin (BTC)": "BTC-USD",
-    "Ethereum (ETH)": "ETH-USD",
-    "USD/INR": "INR=X",
-    "Gold": "GC=F",
-    "Silver": "SI=F",
+html, body, [class*="css"] {
+    font-family: 'Syne', sans-serif;
+    background-color: #0a0e1a;
+    color: #e0e6f0;
 }
 
-# --- ALL NIFTY 50 STOCKS WITH SECTOR MAPPING ---
-NIFTY50_SECTORS = {
-    "Financial Services": {
-        "HDFC Bank": "HDFCBANK.NS", "ICICI Bank": "ICICIBANK.NS", "Axis Bank": "AXISBANK.NS",
-        "Kotak Mahindra Bank": "KOTAKBANK.NS", "State Bank of India": "SBIN.NS", "Bajaj Finance": "BAJFINANCE.NS"
-    },
-    "Information Technology": {
-        "TCS": "TCS.NS", "Infosys": "INFY.NS", "HCLTech": "HCLTECH.NS", "Wipro": "WIPRO.NS"
-    },
-    "Oil, Gas & Consumable Fuels": {
-        "Reliance Industries": "RELIANCE.NS", "ONGC": "ONGC.NS", "Coal India": "COALINDIA.NS"
-    },
-    "Automobile and Auto Components": {
-        "Tata Motors": "TATAMOTORS.NS", "Mahindra & Mahindra": "M&M.NS", "Maruti Suzuki": "MARUTI.NS"
-    },
-    "Healthcare & Pharmaceuticals": {
-        "Sun Pharma": "SUNPHARMA.NS", "Cipla": "CIPLA.NS", "Apollo Hospitals": "APOLLOHOSP.NS"
-    },
-    "Fast Moving Consumer Goods (FMCG)": {
-        "Hindustan Unilever": "HINDUNILVR.NS", "ITC": "ITC.NS", "Nestle India": "NESTLEIND.NS"
-    },
-    "Metals & Mining": {
-        "Tata Steel": "TATASTEEL.NS", "JSW Steel": "JSWSTEEL.NS", "Adani Enterprises": "ADANIENT.NS"
-    }
+.stApp { background-color: #0a0e1a; }
+
+/* Header */
+.orb-header {
+    background: linear-gradient(135deg, #0d1b2a 0%, #112240 60%, #0a192f 100%);
+    border: 1px solid #1e3a5f;
+    border-radius: 12px;
+    padding: 28px 36px;
+    margin-bottom: 24px;
+    position: relative;
+    overflow: hidden;
+}
+.orb-header::before {
+    content: '';
+    position: absolute;
+    top: -50%;
+    right: -10%;
+    width: 300px;
+    height: 300px;
+    background: radial-gradient(circle, rgba(0,200,150,0.06) 0%, transparent 70%);
+    border-radius: 50%;
+}
+.orb-title {
+    font-family: 'Syne', sans-serif;
+    font-weight: 800;
+    font-size: 2.2rem;
+    color: #00e5a0;
+    margin: 0;
+    letter-spacing: -0.5px;
+}
+.orb-subtitle {
+    font-family: 'Space Mono', monospace;
+    font-size: 0.78rem;
+    color: #4a7fa5;
+    margin-top: 6px;
+    letter-spacing: 1px;
+    text-transform: uppercase;
 }
 
-ALL_NIFTY_STOCKS = {}
-for sector, stocks in NIFTY50_SECTORS.items():
-    ALL_NIFTY_STOCKS.update(stocks)
+/* Metric Cards */
+.metric-row { display: flex; gap: 16px; margin-bottom: 24px; flex-wrap: wrap; }
+.metric-card {
+    background: #0d1b2a;
+    border: 1px solid #1e3a5f;
+    border-radius: 10px;
+    padding: 18px 24px;
+    flex: 1;
+    min-width: 140px;
+}
+.metric-card .label {
+    font-family: 'Space Mono', monospace;
+    font-size: 0.68rem;
+    color: #4a7fa5;
+    text-transform: uppercase;
+    letter-spacing: 1.2px;
+    margin-bottom: 6px;
+}
+.metric-card .value {
+    font-family: 'Syne', sans-serif;
+    font-size: 1.7rem;
+    font-weight: 800;
+    color: #00e5a0;
+}
+.metric-card .value.warn { color: #f59e0b; }
+.metric-card .value.danger { color: #f87171; }
 
-# --- MANUAL TECHNICAL INDICATORS ---
-def calculate_indicators(df, lookback=20):
-    df = df.copy()
-    if len(df) < lookback:
-        return df
-    df['EMA_9'] = df['Close'].ewm(span=9, adjust=False).mean()
-    df['EMA_15'] = df['Close'].ewm(span=15, adjust=False).mean()
+/* Signal table */
+.signal-table-wrap {
+    background: #0d1b2a;
+    border: 1px solid #1e3a5f;
+    border-radius: 12px;
+    padding: 0;
+    overflow: hidden;
+}
+.signal-table-wrap table { border-collapse: collapse; width: 100%; }
+.signal-table-wrap th {
+    background: #112240;
+    font-family: 'Space Mono', monospace;
+    font-size: 0.7rem;
+    color: #4a7fa5;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    padding: 14px 16px;
+    text-align: left;
+    border-bottom: 1px solid #1e3a5f;
+}
+.signal-table-wrap td {
+    font-family: 'Space Mono', monospace;
+    font-size: 0.82rem;
+    padding: 12px 16px;
+    border-bottom: 1px solid #0f2035;
+    vertical-align: middle;
+}
+.signal-table-wrap tr:last-child td { border-bottom: none; }
+.signal-table-wrap tr:hover td { background: #0f2035; }
+
+/* Badges */
+.badge {
+    display: inline-block;
+    padding: 3px 10px;
+    border-radius: 20px;
+    font-size: 0.7rem;
+    font-weight: 700;
+    letter-spacing: 0.5px;
+    font-family: 'Space Mono', monospace;
+}
+.badge-green  { background: rgba(0,229,160,0.15); color: #00e5a0; border: 1px solid rgba(0,229,160,0.3); }
+.badge-yellow { background: rgba(245,158,11,0.15);  color: #f59e0b; border: 1px solid rgba(245,158,11,0.3); }
+.badge-red    { background: rgba(248,113,113,0.15); color: #f87171; border: 1px solid rgba(248,113,113,0.3); }
+
+/* Filter sidebar */
+section[data-testid="stSidebar"] {
+    background: #0d1b2a;
+    border-right: 1px solid #1e3a5f;
+}
+section[data-testid="stSidebar"] .css-1d391kg { padding-top: 2rem; }
+
+/* Buttons */
+.stButton > button {
+    background: linear-gradient(135deg, #00e5a0, #00b07a);
+    color: #0a0e1a;
+    font-family: 'Syne', sans-serif;
+    font-weight: 700;
+    font-size: 0.9rem;
+    border: none;
+    border-radius: 8px;
+    padding: 10px 28px;
+    cursor: pointer;
+    transition: opacity 0.2s;
+    width: 100%;
+}
+.stButton > button:hover { opacity: 0.85; }
+
+/* Progress */
+.stProgress > div > div { background: linear-gradient(90deg, #00e5a0, #00b07a); }
+
+/* Divider */
+hr { border-color: #1e3a5f; }
+
+/* Info box */
+.info-box {
+    background: rgba(0,229,160,0.06);
+    border: 1px solid rgba(0,229,160,0.2);
+    border-radius: 8px;
+    padding: 14px 18px;
+    font-family: 'Space Mono', monospace;
+    font-size: 0.75rem;
+    color: #7ec8a4;
+    line-height: 1.7;
+    margin-bottom: 20px;
+}
+.warn-box {
+    background: rgba(245,158,11,0.06);
+    border: 1px solid rgba(245,158,11,0.2);
+    border-radius: 8px;
+    padding: 12px 18px;
+    font-family: 'Space Mono', monospace;
+    font-size: 0.75rem;
+    color: #f59e0b;
+    margin-bottom: 14px;
+}
+
+/* Stock detail expander */
+.detail-grid { display: grid; grid-template-columns: repeat(3,1fr); gap: 12px; margin-top: 10px; }
+.detail-cell {
+    background: #112240;
+    border-radius: 8px;
+    padding: 12px 16px;
+    border: 1px solid #1e3a5f;
+}
+.detail-cell .d-label { font-family: 'Space Mono', monospace; font-size: 0.65rem; color: #4a7fa5; text-transform: uppercase; letter-spacing: 1px; }
+.detail-cell .d-val   { font-family: 'Syne', sans-serif; font-size: 1.1rem; font-weight: 700; color: #e0e6f0; margin-top: 4px; }
+
+/* Scrollbar */
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-track { background: #0a0e1a; }
+::-webkit-scrollbar-thumb { background: #1e3a5f; border-radius: 3px; }
+</style>
+""", unsafe_allow_html=True)
+
+# ─── Nifty 50 Symbols ────────────────────────────────────────────────────────────
+NIFTY50 = [
+    "RELIANCE","TCS","HDFCBANK","BHARTIARTL","ICICIBANK","INFOSYS","SBIN",
+    "HINDUNILVR","ITC","BAJFINANCE","LT","KOTAKBANK","HCLTECH","MARUTI",
+    "AXISBANK","ASIANPAINT","SUNPHARMA","TITAN","WIPRO","ONGC","NTPC","POWERGRID",
+    "ULTRACEMCO","BAJAJFINSV","TECHM","ADANIPORTS","NESTLE","TATASTEEL","JSWSTEEL",
+    "TATAMOTORS","INDUSINDBK","CIPLA","DRREDDY","HINDALCO","M&M",
+    "BPCL","GRASIM","COALINDIA","EICHERMOT","SBILIFE","HDFCLIFE","DIVISLAB",
+    "APOLLOHOSP","BAJAJ-AUTO","HEROMOTOCO","BRITANNIA","TATACONSUM",
+    "ADANIENT","BEL","SHRIRAMFIN"
+]
+
+# ─── Helper Functions ────────────────────────────────────────────────────────────
+
+def compute_vwap(df: pd.DataFrame) -> pd.Series:
+    """Compute cumulative VWAP from intraday data."""
     tp = (df['High'] + df['Low'] + df['Close']) / 3
-    df['VWAP'] = (tp * df['Volume']).cumsum() / df['Volume'].cumsum().replace(0, 1)
-    df['Rolling_High'] = df['High'].shift(1).rolling(window=lookback).max()
-    df['Rolling_Low'] = df['Low'].shift(1).rolling(window=lookback).min()
-    df['Candle_Range'] = (df['High'] - df['Low']).abs()
-    df['Avg_Range_10'] = df['Candle_Range'].shift(1).rolling(window=10).mean()
-    df['Avg_Volume_10'] = df['Volume'].shift(1).rolling(window=10).mean()
-    
-    tr = pd.concat([df['High']-df['Low'], (df['High']-df['Close'].shift()).abs(), (df['Low']-df['Close'].shift()).abs()], axis=1).max(axis=1)
-    df['ATR_14'] = tr.rolling(window=14).mean()
-    return df
+    cum_tpv = (tp * df['Volume']).cumsum()
+    cum_vol  = df['Volume'].cumsum()
+    return cum_tpv / cum_vol.replace(0, np.nan)
 
-# --- STRATEGY ENGINE MATRIX ---
-def run_trap_strategy(df, lookback=20):
-    df = calculate_indicators(df, lookback)
-    signals = []
-    if len(df) < lookback + 5: return df, signals
-    for i in range(lookback + 2, len(df)):
-        prev_row = df.iloc[i-1]
-        row = df.iloc[i]
-        if prev_row['Close'] > prev_row['Rolling_High'] and prev_row['Volume'] <= prev_row['Avg_Volume_10']:
-            if row['Close'] < prev_row['Rolling_High']:
-                signals.append((df.index[i], "SELL", "Bull Trap", row['Close'], 85, "Institutional Trap Above Resistance"))
-        elif prev_row['Close'] < prev_row['Rolling_Low'] and prev_row['Volume'] <= prev_row['Avg_Volume_10']:
-            if row['Close'] > prev_row['Rolling_Low']:
-                signals.append((df.index[i], "BUY", "Bear Trap", row['Close'], 85, "Institutional Trap Below Support"))
-    return df, signals
+def compute_rvol(df: pd.DataFrame, window: int = 20) -> pd.Series:
+    """Relative Volume vs rolling mean."""
+    rolling_avg = df['Volume'].rolling(window=window, min_periods=1).mean().shift(1)
+    return df['Volume'] / rolling_avg.replace(0, np.nan)
 
-def run_alternative_strategies(df, strategy_name):
-    df = calculate_indicators(df)
-    signals = []
-    if len(df) < 20: return df, signals
-    for i in range(1, len(df)):
-        if strategy_name == "EMA Crossover Strategy":
-            if df['EMA_9'].iloc[i-1] <= df['EMA_15'].iloc[i-1] and df['EMA_9'].iloc[i] > df['EMA_15'].iloc[i]:
-                signals.append((df.index[i], "BUY", "EMA Cross", df['Close'].iloc[i], 80, "9 EMA Crossed Above 15 EMA"))
-            elif df['EMA_9'].iloc[i-1] >= df['EMA_15'].iloc[i-1] and df['EMA_9'].iloc[i] < df['EMA_15'].iloc[i]:
-                signals.append((df.index[i], "SELL", "EMA Cross", df['Close'].iloc[i], 80, "9 EMA Crossed Below 15 EMA"))
-        elif strategy_name == "VWAP Based Strategy":
-            if df['Close'].iloc[i-1] <= df['VWAP'].iloc[i-1] and df['Close'].iloc[i] > df['VWAP'].iloc[i]:
-                signals.append((df.index[i], "BUY", "VWAP Reclaim", df['Close'].iloc[i], 75, "Price crossed above Anchor VWAP"))
-            elif df['Close'].iloc[i-1] >= df['VWAP'].iloc[i-1] and df['Close'].iloc[i] < df['VWAP'].iloc[i]:
-                signals.append((df.index[i], "SELL", "VWAP Breakdown", df['Close'].iloc[i], 75, "Price dropped below Anchor VWAP"))
-    return df, signals
+def get_opening_range(df: pd.DataFrame, candles: int = 3) -> tuple:
+    """Return (OR_High, OR_Low) based on first `candles` bars of the latest day."""
+    if df.empty:
+        return None, None
+    latest_day = df.index.normalize().max()
+    day_df = df[df.index.normalize() == latest_day].head(candles)
+    if day_df.empty:
+        return None, None
+    return day_df['High'].max(), day_df['Low'].min()
 
-# --- FETCH DATA ---
-def fetch_ticker_data(ticker, period, interval):
+def analyze_stock(ticker_ns: str, params: dict) -> dict | None:
+    """
+    Download 1-month 15m data, compute indicators, check ORB signal.
+    Returns a result dict or None if data unavailable / no signal.
+    """
     try:
-        data = yf.download(ticker, period=period, interval=interval, progress=False)
-        if data.empty: return pd.DataFrame()
-        if isinstance(data.columns, pd.MultiIndex):
-            data.columns = [col[0] for col in data.columns]
-        data = data.loc[:, ~data.columns.duplicated()].copy()
-        return data.dropna(subset=['Close'])
+        df = yf.download(
+            ticker_ns, period="1mo", interval="15m",
+            progress=False, auto_adjust=True
+        )
+        if df is None or df.empty or len(df) < 10:
+            return None
+
+        # Flatten multi-level columns if present
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+
+        df = df[['Open','High','Low','Close','Volume']].copy()
+        df.dropna(inplace=True)
+        df.index = pd.to_datetime(df.index)
+
+        # ── Indicators ──────────────────────────────────────────────────────
+        df['VWAP']      = compute_vwap(df)
+        df['RVOL']      = compute_rvol(df, window=params['rvol_window'])
+        df['VWAP_Dist'] = ((df['Close'] - df['VWAP']) / df['VWAP']) * 100
+
+        # ── Opening Range (latest trading day) ──────────────────────────────
+        or_high, or_low = get_opening_range(df, candles=params['or_candles'])
+        if or_high is None:
+            return None
+
+        # Latest day candles
+        latest_day = df.index.normalize().max()
+        day_df = df[df.index.normalize() == latest_day].copy()
+        if len(day_df) < params['or_candles'] + 2:
+            return None
+
+        # Post-OR candles
+        post_or = day_df.iloc[params['or_candles']:]
+        if post_or.empty:
+            return None
+
+        # ── Breakout Detection ───────────────────────────────────────────────
+        breakout_idx = None
+        for i in range(len(post_or)):
+            if post_or['Close'].iloc[i] > or_high:
+                breakout_idx = i
+                break
+
+        if breakout_idx is None:
+            return None
+
+        bo_row    = post_or.iloc[breakout_idx]
+        bo_rvol   = bo_row['RVOL']
+        bo_vwap_d = bo_row['VWAP_Dist']
+
+        # ── Filter I: RVOL ───────────────────────────────────────────────────
+        rvol_pass = (not np.isnan(bo_rvol)) and (bo_rvol >= params['min_rvol'])
+
+        # ── Filter II: VWAP Distance ─────────────────────────────────────────
+        vwap_pass = (not np.isnan(bo_vwap_d)) and (bo_vwap_d <= params['max_vwap_dist'])
+
+        # ── Filter III: Momentum (volume-price divergence check) ─────────────
+        if breakout_idx >= 1:
+            prev_vol   = post_or['Volume'].iloc[breakout_idx - 1]
+            curr_vol   = post_or['Volume'].iloc[breakout_idx]
+            prev_close = post_or['Close'].iloc[breakout_idx - 1]
+            curr_close = post_or['Close'].iloc[breakout_idx]
+            momentum_pass = (curr_close > prev_close) and \
+                            (curr_vol >= prev_vol * params['momentum_ratio'])
+        else:
+            momentum_pass = True  # first post-OR candle — no prior to compare
+
+        # ── Pullback / Retest Check ──────────────────────────────────────────
+        retest_pass = False
+        retest_note = "No retest yet"
+        if breakout_idx + 1 < len(post_or):
+            retest_row = post_or.iloc[breakout_idx + 1]
+            body_size  = abs(retest_row['Close'] - retest_row['Open'])
+            atr_proxy  = (bo_row['High'] - bo_row['Low'])
+            low_vol    = retest_row['Volume'] < bo_row['Volume'] * 0.6
+            holds_orh  = retest_row['Close'] >= or_high * 0.995   # within 0.5%
+            small_body = body_size <= atr_proxy * 0.5
+            retest_pass = low_vol and holds_orh and small_body
+            retest_note = "✓ Clean retest" if retest_pass else "✗ Weak / no retest"
+
+        # ── Signal Score (0-4) ───────────────────────────────────────────────
+        score = sum([rvol_pass, vwap_pass, momentum_pass, retest_pass])
+
+        # ── Only return if at least 2 filters pass ───────────────────────────
+        if score < 2:
+            return None
+
+        current_price = day_df['Close'].iloc[-1]
+        or_pct_above  = ((current_price - or_high) / or_high) * 100
+
+        return {
+            "ticker":        ticker_ns.replace(".NS", ""),
+            "score":         score,
+            "current_price": round(float(current_price), 2),
+            "or_high":       round(float(or_high), 2),
+            "or_low":        round(float(or_low), 2),
+            "or_pct_above":  round(float(or_pct_above), 2),
+            "rvol":          round(float(bo_rvol), 2) if not np.isnan(bo_rvol) else 0,
+            "rvol_pass":     rvol_pass,
+            "vwap_dist":     round(float(bo_vwap_d), 2) if not np.isnan(bo_vwap_d) else 0,
+            "vwap_pass":     vwap_pass,
+            "momentum_pass": momentum_pass,
+            "retest_pass":   retest_pass,
+            "retest_note":   retest_note,
+            "vwap_price":    round(float(bo_row['VWAP']), 2),
+            "breakout_vol":  int(bo_row['Volume']),
+        }
+
     except Exception:
-        return pd.DataFrame()
+        return None
 
-# --- SIDEBAR MANUVER PANEL ---
-st.sidebar.title("🛡️ Institutional Risk Desk")
-ticker_selection = st.sidebar.selectbox("Select Active Asset Framework", list(TICKER_MAP.keys()) + ["Custom Ticker"])
-ticker_symbol = st.sidebar.text_input("Symbol Code", "AAPL") if ticker_selection == "Custom Ticker" else TICKER_MAP[ticker_selection]
 
-strategy_choice = st.sidebar.selectbox("Dashboard Analytics Strategy", [
-    "Institutional Trap Strategy", "EMA Crossover Strategy", "VWAP Based Strategy"
-])
-interval_choice = st.sidebar.selectbox("Timeframe Frame", ["1m", "5m", "15m", "1h", "1d"], index=2)
-period_choice = st.sidebar.selectbox("Lookback Limit", ["1d", "5d", "1mo", "3mo", "1y"], index=1)
-
-st.sidebar.subheader("Risk & Target Framework Rules")
-sl_mode = st.sidebar.selectbox("Stop Loss Risk Rule", [
-    "Custom SL", "Trailing SL", "Signal based SL", "ATR based SL", "Logical SL", "Support Resistance based SL"
-])
-custom_sl_input = st.sidebar.number_input("Custom/Trailing SL Points Offset", min_value=0.01, max_value=5000.0, value=10.0, step=1.0)
-
-tp_mode = st.sidebar.selectbox("Profit Execution Target Rule", [
-    "Custom Target", "Trailing Target", "Signal based Target", "ATR based Target", "Logical Target", "Support Resistance based Target"
-])
-custom_tp_input = st.sidebar.number_input("Custom Target Points Offset", min_value=0.01, max_value=5000.0, value=20.0, step=1.0)
-target_multiplier = st.sidebar.selectbox("Enforced Live Risk-Reward Matrix Multiplier", [1.0, 2.0, 3.0, 4.0, 5.0], index=1)
-
-# --- CORE APP NAVIGATION TABS ---
-tab1, tab2, tab3, tab4 = st.tabs([
-    "📊 Backtesting Analytics", 
-    "⚡ Live Micro-Execution Framework", 
-    "📜 Structural History Ledger",
-    "🔍 Institutional Sector Screener (ORB Setup)"
-])
-
-# ==================== TAB 1: HISTORICAL BACKTEST ENGINE ====================
-with tab1:
-    st.header("Historical Engine Diagnostic Board")
-    if st.button("Execute System Backtest Analysis", use_container_width=True):
-        df = fetch_ticker_data(ticker_symbol, period_choice, interval_choice)
-        if not df.empty:
-            df, signals = run_trap_strategy(df) if strategy_choice == "Institutional Trap Strategy" else run_alternative_strategies(df, strategy_choice)
-            if signals:
-                st.success(f"Successfully tracked {len(signals)} matching execution setups.")
-                st.dataframe(pd.DataFrame(signals, columns=["Time", "Type", "Pattern", "Price", "Score", "Description"]), use_container_width=True)
-            else:
-                st.info("No patterns matched configuration metrics within this historical window block.")
-
-# ==================== TAB 2: LIVE MICRO-EXECUTION CONTROLLER ====================
-with tab2:
-    st.header("Live Micro-Execution Matrix Stream")
-    
-    c_btn1, c_btn2, c_btn3 = st.columns(3)
-    if c_btn1.button("🟢 START REAL-TIME STREAM PIPELINE", use_container_width=True):
-        st.session_state.live_tracking_active = True
-    if c_btn2.button("🔴 SHUT DOWN TELEMETRY STREAM", use_container_width=True):
-        st.session_state.live_tracking_active = False
-    if c_btn3.button("💥 EMERGENCY SQUARE-OFF ALL RUNS", use_container_width=True):
-        st.session_state.live_tracking_active = False
-        if st.session_state.simulated_position:
-            st.session_state.simulated_position["Status"] = "SQUARED_OFF"
-            st.session_state.trade_ledger.append(st.session_state.simulated_position)
-            st.session_state.simulated_position = None
-            st.toast("Positions liquidated safely.", icon="🚨")
-
+# ─── Sidebar ─────────────────────────────────────────────────────────────────────
+with st.sidebar:
+    st.markdown("## ⚙️ Scanner Settings")
     st.markdown("---")
 
-    @st.fragment(run_every=1.0 if st.session_state.live_tracking_active else None)
-    def render_live_telemetry():
-        if not st.session_state.live_tracking_active:
-            st.warning("Core engine pipelines running inside structural Standby Status. Initiate Stream to calculate logs.")
-            return
-            
-        df = fetch_ticker_data(ticker_symbol, "5d", interval_choice)
-        if df.empty:
-            st.error("Telemetry Sync Error: No usable asset price rows parsed safely.")
-            return
-            
-        df = calculate_indicators(df)
-        ltp = round(float(df['Close'].iloc[-1]), 2)
-        highest_p = round(float(df['High'].max()), 2)
-        lowest_p = round(float(df['Low'].min()), 2)
-        
-        df, live_sigs = run_trap_strategy(df) if strategy_choice == "Institutional Trap Strategy" else run_alternative_strategies(df, strategy_choice)
-        signal_found = "MATCHED SETUP" if live_sigs else "SCANNING FOR PATTERN"
-        
-        if live_sigs and st.session_state.simulated_position is None:
-            latest = live_sigs[-1]
-            direction = latest[1]
-            sl_calc = ltp - custom_sl_input if direction == "BUY" else ltp + custom_sl_input
-            tp_calc = ltp + (custom_sl_input * target_multiplier) if direction == "BUY" else ltp - (custom_sl_input * target_multiplier)
-            
-            st.session_state.simulated_position = {
-                "Asset": ticker_symbol, "Time": datetime.now().strftime("%H:%M:%S"),
-                "Direction": direction, "Entry": ltp, "SL": round(sl_calc, 2), "TP": round(tp_calc, 2),
-                "Status": "OPEN"
-            }
-            st.toast(f"Executed live structural position logic framework: {direction}", icon="📈")
+    st.markdown("**Opening Range**")
+    or_candles = st.slider("OR Candles (15m bars)", 1, 6, 3,
+                           help="How many 15-min candles form the Opening Range")
 
-        live_pnl = 0.0
-        if st.session_state.simulated_position and st.session_state.simulated_position["Status"] == "OPEN":
-            pos = st.session_state.simulated_position
-            if pos["Direction"] == "BUY":
-                live_pnl = ltp - pos["Entry"]
-                if df['Low'].iloc[-1] <= pos["SL"]: pos["Status"] = "STOPPED_OUT"
-                elif df['High'].iloc[-1] >= pos["TP"]: pos["Status"] = "TARGET_HIT"
-            else:
-                live_pnl = pos["Entry"] - ltp
-                if df['High'].iloc[-1] <= pos["SL"]: pos["Status"] = "STOPPED_OUT"
-                elif df['Low'].iloc[-1] >= pos["TP"]: pos["Status"] = "TARGET_HIT"
-                
-            if pos["Status"] in ["STOPPED_OUT", "TARGET_HIT"]:
-                st.session_state.trade_ledger.append(pos)
-                st.session_state.simulated_position = None
-                st.toast("Position hit execution target boundary limit cleanly.", icon="📥")
+    st.markdown("**Filter Thresholds**")
+    min_rvol = st.slider("Min RVOL (Relative Volume)", 1.0, 5.0, 2.0, 0.1,
+                         help="Breakout candle must show this multiple of avg volume")
+    max_vwap_dist = st.slider("Max VWAP Distance (%)", 0.5, 4.0, 1.5, 0.1,
+                               help="Reject if price is overextended beyond VWAP")
+    momentum_ratio = st.slider("Momentum Vol Ratio", 0.7, 1.0, 0.9, 0.05,
+                                help="2nd breakout candle vol ≥ this × 1st candle vol")
 
-        m_col1, m_col2, m_col3, m_col4 = st.columns(4)
-        m_col1.metric("LTP (Last Traded Price)", f"{ltp:.2f}", delta=f"{df['Close'].diff().iloc[-1]:.2f}")
-        m_col2.metric("Highest Trading High Window", f"{highest_p:.2f}")
-        m_col3.metric("Lowest Trading Low Window", f"{lowest_p:.2f}")
-        pnl_color = "inverse" if live_pnl < 0 else "normal"
-        m_col4.metric("Real-Time Running PnL", f"{live_pnl:.2f} Pts", delta=f"{live_pnl:.2f} Pts", delta_color=pnl_color)
+    st.markdown("**Stock Universe**")
+    selected = st.multiselect("Select stocks (default = all Nifty 50)",
+                               NIFTY50, default=[], placeholder="All 50 if empty")
+    scan_list = selected if selected else NIFTY50
 
-        st.markdown("---")
-        
-        layout_left, layout_right = st.columns([2, 3])
-        with layout_left:
-            st.subheader("Nav Control Matrix Allocations")
-            st.markdown(f"""
-            - **Monitored Asset Key**: `{ticker_symbol}`
-            - **Strategic Rule Logic**: `{strategy_choice}`
-            - **Assigned Frame Time**: `{interval_choice}`
-            - **SL Configuration Mode**: `{sl_mode}` (`{custom_sl_input} Pts`)
-            - **TP Configuration Mode**: `{tp_mode}` (`{custom_tp_input} Pts`)
-            - **Calculated Engine Loop Status**: `{signal_found}`
-            """)
-            
-            st.subheader("Active Position Parameters")
-            if st.session_state.simulated_position:
-                st.json(st.session_state.simulated_position)
-            else:
-                st.info("System currently scanning neutral. No open position traces verified.")
-                
-        with layout_right:
-            st.subheader("Live Operational Overlay Canvas")
-            fig = go.Figure()
-            plot_df = df.tail(40)
-            fig.add_trace(go.Candlestick(
-                x=plot_df.index, open=plot_df['Open'], high=plot_df['High'],
-                low=plot_df['Low'], close=plot_df['Close'], name="Candles"
-            ))
-            fig.add_trace(go.Scatter(x=plot_df.index, y=plot_df['EMA_9'], line=dict(color='orange', width=1), name='9 EMA'))
-            fig.add_trace(go.Scatter(x=plot_df.index, y=plot_df['EMA_15'], line=dict(color='cyan', width=1), name='15 EMA'))
-            fig.update_layout(margin=dict(l=10, r=10, t=10, b=10), height=380, xaxis_rangeslider_visible=False)
-            st.plotly_chart(fig, use_container_width=True)
+    st.markdown("---")
+    st.markdown('<div class="info-box">📌 Data: yfinance 15m / 1 month<br>⏱ Scan may take 1–2 min for all 50<br>🔄 No TA-Lib / pandas-ta dependency</div>', unsafe_allow_html=True)
+    run_scan = st.button("🚀 Run ORB Scan")
 
-    render_live_telemetry()
+# ─── Main Panel ──────────────────────────────────────────────────────────────────
+st.markdown("""
+<div class="orb-header">
+    <div class="orb-title">⚡ ORB Scanner — Nifty 50</div>
+    <div class="orb-subtitle">Opening Range Breakout · VWAP · RVOL · Momentum · Retest Filter</div>
+</div>
+""", unsafe_allow_html=True)
 
-# ==================== TAB 3: SYSTEM AUDIT LEDGER ====================
-with tab3:
-    st.header("Master Operational Account Ledger Records")
-    if st.session_state.trade_ledger:
-        st.dataframe(pd.DataFrame(st.session_state.trade_ledger), use_container_width=True)
+# Legend
+st.markdown("""
+<div class="info-box">
+<b>Signal Score:</b> Each stock is scored 0–4 across four independent filters.
+&nbsp;🟢 Score 4 = All filters pass (Highest Confidence) &nbsp;|&nbsp;
+🟡 Score 3 = Strong Setup &nbsp;|&nbsp; 🟠 Score 2 = Marginal — review manually
+</div>
+""", unsafe_allow_html=True)
+
+if not run_scan:
+    st.markdown("""
+    <div style="text-align:center; padding: 60px 20px; color: #4a7fa5;">
+        <div style="font-size:3rem;">📊</div>
+        <div style="font-family:'Space Mono',monospace; font-size:0.9rem; margin-top:12px;">
+            Configure filters in the sidebar, then click <b style="color:#00e5a0;">Run ORB Scan</b>
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
+    st.stop()
+
+# ─── Run Scan ─────────────────────────────────────────────────────────────────────
+params = {
+    "or_candles":     or_candles,
+    "min_rvol":       min_rvol,
+    "max_vwap_dist":  max_vwap_dist,
+    "momentum_ratio": momentum_ratio,
+    "rvol_window":    20,
+}
+
+results      = []
+errors       = []
+progress_bar = st.progress(0, text="Initializing scan…")
+status_text  = st.empty()
+
+for idx, sym in enumerate(scan_list):
+    ticker_ns = f"{sym}.NS"
+    status_text.markdown(
+        f'<span style="font-family:Space Mono,monospace;font-size:0.78rem;color:#4a7fa5;">'
+        f'Scanning {ticker_ns}… ({idx+1}/{len(scan_list)})</span>',
+        unsafe_allow_html=True
+    )
+    res = analyze_stock(ticker_ns, params)
+    if res:
+        results.append(res)
     else:
-        st.info("No recorded real-time positions committed to memory records during this run.")
+        errors.append(sym)
+    progress_bar.progress((idx + 1) / len(scan_list),
+                           text=f"Scanned {idx+1}/{len(scan_list)}")
 
-# ==================== TAB 4: INDEPENDENT SECTOR ORB SCREENER ====================
-with tab4:
-    st.header("🔍 Autonomic Intraday Opening Range Breakout (ORB) Screener")
-    
-    # Human Readable Strategy Blueprint Explainer Block
-    with st.expander("📖 System Blueprint: How the 15-Minute ORB Strategy Works", expanded=True):
-        st.markdown("""
-        The **Opening Range Breakout (ORB)** is an institutional high-momentum trading strategy designed to catch the intraday trend direction set during initial market volatility.
-        
-        **Execution Rules & Filtration Steps:**
-        1. **Establish the Boundaries**: The engine isolates the **very first 15-minute candlestick** of the current market session to lock in the **Opening Range High** and **Opening Range Low**.
-        2. **Scanning for Breakout/Breakdown**: 
-           - **Bullish Setup**: If any subsequent intraday candlestick **closes completely above** the 15-minute Opening High, a buy trigger is flagged.
-           - **Bearish Setup**: If any subsequent intraday candlestick **closes completely below** the 15-minute Opening Low, a short-sell trigger is flagged.
-        3. **Risk & Target Structural Assignment**:
-           - **Trigger Entry**: Set at the broken High or Low boundary lines.
-           - **Stop Loss (SL)**: Set at the opposite side of the initial 15-minute range (Opening Low for Buys, Opening High for Sells).
-           - **Target Profit Line**: Extrapolated mechanically out using your selected asymmetric Risk-to-Reward multiplier matrix configuration (`1:1` up to `1:5`).
-        """)
+progress_bar.empty()
+status_text.empty()
 
-    st.markdown("### 🎛️ Screener Engine Matrix Controls")
-    sc1, sc2, sc3 = st.columns(3)
-    with sc1:
-        scr_sector = st.selectbox("Screener Segment Sector Filter", ["ALL Nifty 50 Stocks", "Custom Asset Input"] + list(NIFTY50_SECTORS.keys()))
-    with sc2:
-        orb_target_rr = st.selectbox("Execution Target Risk-Reward Metric", [
-            "1:1 Risk-Reward Balance", "1:2 Target Layout", "1:3 Matrix Risk Extension", 
-            "1:4 Risk Matrix Acceleration", "1:5 Advanced Asymmetric Target"
-        ], index=1)
-    with sc3:
-        direction_filter = st.selectbox("Breakout Direction Lookups", ["All Breakouts", "Bullish Breakouts Only", "Bearish Breakouts Only"])
+# ─── Summary Metrics ──────────────────────────────────────────────────────────────
+total        = len(scan_list)
+signals      = len(results)
+high_conf    = sum(1 for r in results if r['score'] == 4)
+strong       = sum(1 for r in results if r['score'] == 3)
+marginal     = sum(1 for r in results if r['score'] == 2)
 
-    # Independent Timeframe and Period Config Layout Blocks for Screener Module Isolation
-    sc4, sc5, sc6 = st.columns(3)
-    with sc4:
-        scr_interval = st.selectbox("Screener Candlestick Frame (ORB Base)", ["1m", "5m", "15m", "1h", "1d"], index=2, key="scr_tf")
-    with sc5:
-        scr_period = st.selectbox("Screener Data Fetch Lookback", ["1d", "5d", "1mo", "3mo"], index=1, key="scr_per")
-    with sc6:
-        custom_scr_ticker = st.text_input("Custom Ticker Code Entry (Active if Custom Asset Selected)", "RELIANCE.NS")
+st.markdown(f"""
+<div class="metric-row">
+    <div class="metric-card">
+        <div class="label">Stocks Scanned</div>
+        <div class="value">{total}</div>
+    </div>
+    <div class="metric-card">
+        <div class="label">ORB Signals</div>
+        <div class="value {'warn' if signals==0 else ''}">{signals}</div>
+    </div>
+    <div class="metric-card">
+        <div class="label">🟢 Score 4</div>
+        <div class="value">{high_conf}</div>
+    </div>
+    <div class="metric-card">
+        <div class="label">🟡 Score 3</div>
+        <div class="value warn">{strong}</div>
+    </div>
+    <div class="metric-card">
+        <div class="label">🟠 Score 2</div>
+        <div class="value danger">{marginal}</div>
+    </div>
+    <div class="metric-card">
+        <div class="label">No Signal</div>
+        <div class="value danger">{total - signals}</div>
+    </div>
+</div>
+""", unsafe_allow_html=True)
 
-    # Resolve target ticker asset pools matching configuration selections
-    if scr_sector == "ALL Nifty 50 Stocks":
-        scan_pool = ALL_NIFTY_STOCKS
-    elif scr_sector == "Custom Asset Input":
-        scan_pool = {"Custom Asset": custom_scr_ticker.strip()}
+if not results:
+    st.markdown("""
+    <div class="warn-box">
+    ⚠️ No ORB signals found with current filter settings.
+    Try lowering the Min RVOL threshold or relaxing the VWAP Distance limit.
+    </div>
+    """, unsafe_allow_html=True)
+    st.stop()
+
+# ─── Sort Results ─────────────────────────────────────────────────────────────────
+results.sort(key=lambda x: (-x['score'], -x['rvol']))
+
+# ─── Results Table ────────────────────────────────────────────────────────────────
+def score_badge(score):
+    if score == 4:
+        return f'<span class="badge badge-green">★★★★ {score}/4</span>'
+    elif score == 3:
+        return f'<span class="badge badge-yellow">★★★☆ {score}/4</span>'
     else:
-        scan_pool = NIFTY50_SECTORS[scr_sector]
+        return f'<span class="badge badge-red">★★☆☆ {score}/4</span>'
 
-    # Map selected Risk-to-Reward matrix multiplier indexes
-    rr_map = {"1:1": 1.0, "1:2": 2.0, "1:3": 3.0, "1:4": 4.0, "1:5": 5.0}
-    rr_multiplier = 2.0  # Default fallback
-    for key, val in rr_map.items():
-        if key in orb_target_rr:
-            rr_multiplier = val
-            break
+def check(val):
+    return "✅" if val else "❌"
 
-    if st.button("🚀 EXECUTE AUTONOMOUS STRATEGY MATRIX DISCOVERY", use_container_width=True):
-        screener_records = []
-        progress_slot = st.progress(0)
-        status_slot = st.empty()
-        pool_len = len(scan_pool)
-        
-        for idx, (name, symbol) in enumerate(scan_pool.items()):
-            status_slot.text(f"Processing Array Node [{idx+1}/{pool_len}]: Querying Data Stream for {name} ({symbol})...")
-            progress_slot.progress((idx + 1) / pool_len)
-            
-            # Request intraday history rows dynamically using decoupled parameters
-            hist_df = fetch_ticker_data(symbol, scr_period, scr_interval)
-            if hist_df.empty or len(hist_df) < 5:
-                continue
-                
-            last_date = hist_df.index[-1].date()
-            day_df = hist_df[hist_df.index.date == last_date]
-            if len(day_df) < 2: 
-                continue
-                
-            first_candle = day_df.iloc[0]
-            orb_high = float(first_candle['High'])
-            orb_low = float(first_candle['Low'])
-            ltp = float(day_df['Close'].iloc[-1])
-            
-            setup_status = "Neutral"
-            entry_ref = 0.0
-            sl_val = 0.0
-            tp_val = 0.0
-            
-            for bar_idx in range(1, len(day_df)):
-                check_row = day_df.iloc[bar_idx]
-                if check_row['Close'] > orb_high:
-                    setup_status = "BULLISH BREAKOUT"
-                    entry_ref = orb_high
-                    sl_val = orb_low
-                    tp_val = entry_ref + ((entry_ref - sl_val) * rr_multiplier)
-                    break
-                elif check_row['Close'] < orb_low:
-                    setup_status = "BEARISH BREAKDOWN"
-                    entry_ref = orb_low
-                    sl_val = orb_high
-                    tp_val = entry_ref - ((sl_val - entry_ref) * rr_multiplier)
-                    break
-            
-            if direction_filter == "Bullish Breakouts Only" and setup_status != "BULLISH BREAKOUT": continue
-            if direction_filter == "Bearish Breakouts Only" and setup_status != "BEARISH BREAKDOWN": continue
-            if setup_status == "Neutral": continue
-            
-            screener_records.append({
-                "Asset Name": name, "Ticker Symbol": symbol, "Intraday LTP": round(ltp, 2),
-                "ORB Status": setup_status, "Opening High (15m)": round(orb_high, 2), "Opening Low (15m)": round(orb_low, 2),
-                "Trigger Entry": round(entry_ref, 2), "Calculated SL": round(sl_val, 2), "Target Profit Line": round(tp_val, 2)
-            })
+rows_html = ""
+for r in results:
+    rows_html += f"""
+    <tr>
+        <td><b style="color:#e0e6f0;font-family:'Syne',sans-serif;">{r['ticker']}</b></td>
+        <td>{score_badge(r['score'])}</td>
+        <td style="color:#e0e6f0;">₹{r['current_price']}</td>
+        <td style="color:#4a7fa5;">₹{r['or_high']}</td>
+        <td style="color:{'#00e5a0' if r['or_pct_above']>=0 else '#f87171'};">
+            {'+' if r['or_pct_above']>=0 else ''}{r['or_pct_above']}%
+        </td>
+        <td style="color:{'#00e5a0' if r['rvol_pass'] else '#f87171'};">{r['rvol']}x {check(r['rvol_pass'])}</td>
+        <td style="color:{'#00e5a0' if r['vwap_pass'] else '#f87171'};">{r['vwap_dist']}% {check(r['vwap_pass'])}</td>
+        <td>{check(r['momentum_pass'])}</td>
+        <td style="font-size:0.72rem;color:#7ec8a4;">{r['retest_note']}</td>
+    </tr>
+    """
 
-        progress_slot.empty()
-        status_slot.empty()
+st.markdown(f"""
+<div class="signal-table-wrap">
+<table>
+<thead>
+<tr>
+    <th>Ticker</th>
+    <th>Score</th>
+    <th>Price (₹)</th>
+    <th>OR High</th>
+    <th>% Above OR</th>
+    <th>RVOL</th>
+    <th>VWAP Dist</th>
+    <th>Momentum</th>
+    <th>Retest</th>
+</tr>
+</thead>
+<tbody>
+{rows_html}
+</tbody>
+</table>
+</div>
+""", unsafe_allow_html=True)
 
-        if screener_records:
-            res_df = pd.DataFrame(screener_records)
-            def highlight_orb_status(val):
-                if val == "BULLISH BREAKOUT": return "background-color: rgba(0, 128, 0, 0.15); color: green; font-weight: bold;"
-                if val == "BEARISH BREAKDOWN": return "background-color: rgba(255, 0, 0, 0.15); color: red; font-weight: bold;"
-                return ""
-            styled_output = res_df.style.map(highlight_orb_status, subset=["ORB Status"])
-            st.dataframe(styled_output, use_container_width=True)
-        else:
-            st.info("No underlying assets triggered an internal opening range break condition during this historical tracking pass.")
+# ─── Detailed Drill-Down ─────────────────────────────────────────────────────────
+st.markdown("<br>", unsafe_allow_html=True)
+st.markdown("### 🔍 Stock Detail Drill-Down")
+
+ticker_choices = [r['ticker'] for r in results]
+selected_ticker = st.selectbox("Select a stock for details", ticker_choices)
+
+if selected_ticker:
+    det = next(r for r in results if r['ticker'] == selected_ticker)
+    st.markdown(f"""
+    <div class="detail-grid">
+        <div class="detail-cell">
+            <div class="d-label">Current Price</div>
+            <div class="d-val">₹{det['current_price']}</div>
+        </div>
+        <div class="detail-cell">
+            <div class="d-label">OR High</div>
+            <div class="d-val">₹{det['or_high']}</div>
+        </div>
+        <div class="detail-cell">
+            <div class="d-label">OR Low</div>
+            <div class="d-val">₹{det['or_low']}</div>
+        </div>
+        <div class="detail-cell">
+            <div class="d-label">VWAP at Breakout</div>
+            <div class="d-val">₹{det['vwap_price']}</div>
+        </div>
+        <div class="detail-cell">
+            <div class="d-label">Relative Volume</div>
+            <div class="d-val" style="color:{'#00e5a0' if det['rvol_pass'] else '#f87171'};">{det['rvol']}x</div>
+        </div>
+        <div class="detail-cell">
+            <div class="d-label">VWAP Distance</div>
+            <div class="d-val" style="color:{'#00e5a0' if det['vwap_pass'] else '#f87171'};">{det['vwap_dist']}%</div>
+        </div>
+        <div class="detail-cell">
+            <div class="d-label">Breakout Volume</div>
+            <div class="d-val">{det['breakout_vol']:,}</div>
+        </div>
+        <div class="detail-cell">
+            <div class="d-label">% Above OR High</div>
+            <div class="d-val" style="color:#00e5a0;">+{det['or_pct_above']}%</div>
+        </div>
+        <div class="detail-cell">
+            <div class="d-label">Signal Score</div>
+            <div class="d-val" style="color:#00e5a0;">{det['score']} / 4</div>
+        </div>
+    </div>
+    <br>
+    <div class="info-box">
+    <b>Filter Summary for {det['ticker']}</b><br>
+    {'✅' if det['rvol_pass'] else '❌'} RVOL ≥ {min_rvol}x &nbsp;|&nbsp;
+    {'✅' if det['vwap_pass'] else '❌'} VWAP Dist ≤ {max_vwap_dist}% &nbsp;|&nbsp;
+    {'✅' if det['momentum_pass'] else '❌'} Momentum Confirmed &nbsp;|&nbsp;
+    {'✅' if det['retest_pass'] else '❌'} {det['retest_note']}
+    </div>
+    """, unsafe_allow_html=True)
+
+# ─── Failed stocks note ───────────────────────────────────────────────────────────
+if errors:
+    with st.expander(f"⚠️ {len(errors)} stocks with no data / no signal"):
+        st.markdown(
+            f'<span style="font-family:Space Mono,monospace;font-size:0.78rem;color:#4a7fa5;">'
+            f'{", ".join(errors)}</span>',
+            unsafe_allow_html=True
+        )
+
+# ─── Disclaimer ──────────────────────────────────────────────────────────────────
+st.markdown("---")
+st.markdown("""
+<div style="font-family:Space Mono,monospace;font-size:0.68rem;color:#2d5070;text-align:center;padding:10px;">
+⚠️ FOR EDUCATIONAL & RESEARCH PURPOSES ONLY. NOT FINANCIAL ADVICE. ALWAYS DO YOUR OWN DUE DILIGENCE.
+</div>
+""", unsafe_allow_html=True)
