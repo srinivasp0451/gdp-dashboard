@@ -5001,7 +5001,7 @@ def _live_trading_fragment(config):
     logs = st.session_state.get('live_logs', [])
     if logs:
         st.text_area("Logs", label_visibility="collapsed", value="\n".join(reversed(logs[-50:])),
-                     height=200, disabled=True, label_visibility="collapsed")
+                     height=200, disabled=True)
     else:
         st.info("No logs yet")
 
