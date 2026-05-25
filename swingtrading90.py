@@ -996,15 +996,18 @@ def start_ltp_feed(config):
             st.session_state['_ltp_box'] = ltp_box
 
             def _on_tick(_, data):
+                # DEBUG: log the FULL raw data so we can see what Dhan sends
+                add_log(f"🔍 RAW TICK DATA: {data}")
                 try:
                     if isinstance(data, dict):
-                        # LTP comes as formatted string e.g. "76150.25"
                         val = data.get('LTP') or data.get('ltp') or data.get('last_price')
                         if val:
                             ltp_box[0] = float(val)
-                            add_log(f"📡 Tick: ₹{float(val):.2f} seg={data.get('exchange_segment')} sec={data.get('security_id')}")
-                except Exception:
-                    pass
+                            add_log(f"📡 LTP set to ₹{float(val):.2f} | full dict: {data}")
+                    else:
+                        add_log(f"⚠️ Tick not a dict — type: {type(data)} | value: {str(data)[:200]}")
+                except Exception as ex:
+                    add_log(f"❌ Tick parse error: {ex} | data: {str(data)[:200]}")
 
             feed = marketfeed.MarketFeed(ctx, instruments, on_ticks=_on_tick)
             feed.start()   # ← MarketFeed handles its own daemon thread
@@ -3368,13 +3371,11 @@ def live_trading_iteration():
         if _last_exit is not None:
             _elapsed  = (now - _last_exit).total_seconds()
             # Hard floor = one full candle period regardless of user settings
-            _min_cool = max(
-                interval_secs,
-                config.get('entry_cooldown_seconds', 0)
-                if config.get('enable_entry_cooldown', False) else 0
-            )
+            _user_cool = config.get('entry_cooldown_seconds', 0) \
+                         if config.get('enable_entry_cooldown', False) else 0
+            _min_cool  = max(5, _user_cool)  # 5s prevents duplicate, not full interval
             if _elapsed < _min_cool:
-                add_log(f"🔒 Post-exit lock: {int(_min_cool - _elapsed)}s remaining — blocking re-entry")
+                add_log(f"🔒 Cooldown: {int(_min_cool - _elapsed)}s remaining")
                 return
 
         # ── Check trade window ─────────────────────────────────────────────────
