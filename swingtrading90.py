@@ -995,12 +995,14 @@ def start_ltp_feed(config):
             ltp_box = [None]
             st.session_state['_ltp_box'] = ltp_box
 
-            def _on_tick(data):
+            def _on_tick(_, data):
                 try:
                     if isinstance(data, dict):
+                        # LTP comes as formatted string e.g. "76150.25"
                         val = data.get('LTP') or data.get('ltp') or data.get('last_price')
                         if val:
                             ltp_box[0] = float(val)
+                            add_log(f"📡 Tick: ₹{float(val):.2f} seg={data.get('exchange_segment')} sec={data.get('security_id')}")
                 except Exception:
                     pass
 
