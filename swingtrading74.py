@@ -652,12 +652,21 @@ def fetch_data(ticker_symbol, interval, period, is_live_trading=False, custom_ti
             st.error(f"❌ No data returned for {ticker_symbol}")
             return None
             
-        # Ensure proper column names
+        # ── Handle newer yfinance MultiIndex columns ──────────────────
+        # e.g. ("Close","^NSEI") → "Close"
         if isinstance(df.columns, pd.MultiIndex):
-            df.columns = df.columns.get_level_values(0)
-            
-        # Reset index to make Datetime a column
+            df.columns = [c[0] if isinstance(c, tuple) else c for c in df.columns]
+            # Drop duplicate column names that can occur with MultiIndex
+            df = df.loc[:, ~df.columns.duplicated()]
+
+        # ── Move date index into a column named "Datetime" ────────────
         df = df.reset_index()
+        # After reset_index the date col may be "Date", "Datetime", or index 0
+        if 'Datetime' not in df.columns:
+            if 'Date' in df.columns:
+                df.rename(columns={'Date': 'Datetime'}, inplace=True)
+            else:
+                df.rename(columns={df.columns[0]: 'Datetime'}, inplace=True)
         
         # Convert to IST timezone
         ist = pytz.timezone('Asia/Kolkata')
