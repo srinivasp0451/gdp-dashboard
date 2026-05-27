@@ -3393,13 +3393,28 @@ def live_trading_iteration():
                 add_log(f"🚫 Signal {signal} blocked by direction filter")
                 return
 
-            entry_price = entry_price or current_price
-            position_type = 'LONG' if signal in ('BUY', 'LONG') else 'SHORT'
+            # ── Always enter at current LTP, not old candle close ──────────────
+            # Using a stale candle close as entry price causes immediate SL hits
+            # when price has already moved past the SL level.
+            entry_price = current_price  # current LTP — always fresh
 
-            sl_price     = calculate_initial_sl(position_type, entry_price, df, idx, config)
-            target_price = calculate_initial_target(position_type, entry_price, df, idx, config)
+            # ── Staleness guard: skip if price already past SL ──────────────────
+            _sl_dist = config.get('sl_points', 30)
+            _pos_type_check = 'LONG' if signal in ('BUY','LONG') else 'SHORT'
+            if _pos_type_check == 'LONG' and current_price < (entry_price - _sl_dist):
+                add_log(f'⚠️ Price ₹{current_price:.2f} already below SL level — skipping stale entry')
+                signal = None
+            elif _pos_type_check == 'SHORT' and current_price > (entry_price + _sl_dist):
+                add_log(f'⚠️ Price ₹{current_price:.2f} already above SL level — skipping stale entry')
+                signal = None
 
-            position = {
+            if signal:
+                position_type = 'LONG' if signal in ('BUY', 'LONG') else 'SHORT'
+
+                sl_price     = calculate_initial_sl(position_type, entry_price, df, idx, config)
+                target_price = calculate_initial_target(position_type, entry_price, df, idx, config)
+
+                position = {
                 'type':          position_type,
                 'entry_price':   entry_price,
                 'entry_time':    now,
@@ -5064,6 +5079,7 @@ def render_live_trading_ui(config):
             st.session_state.pop('current_data', None)
 
             add_log("🚀 Trading started")
+            st.session_state['_last_signal_candle_dt'] = ''
             start_ltp_feed(config)
             add_log(f"📋 Strategy: {config.get('strategy')} | Asset: {config.get('asset')} | Interval: {config.get('interval')}")
             add_log(f"📋 SL: {config.get('sl_type')} {config.get('sl_points','')} | Target: {config.get('target_type')} {config.get('target_points','')}")
