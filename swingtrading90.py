@@ -29,6 +29,13 @@ import warnings
 # Suppress SyntaxWarning from dhanhq library (invalid escape sequence in their code)
 warnings.filterwarnings('ignore', category=SyntaxWarning, module='dhanhq')
 
+# =============================================================================
+# CREDENTIALS — change these here instead of entering in the sidebar each time
+# =============================================================================
+DHAN_CLIENT_ID    = ""   # ← paste your Dhan client ID here
+DHAN_ACCESS_TOKEN = ""   # ← paste your Dhan access token here
+# =============================================================================
+
 # ================================
 # CONSTANTS & MAPPINGS
 # ================================
@@ -2117,6 +2124,71 @@ def check_support_resistance_bounce(df, idx, config, current_position):
     return None, None
 
 
+
+def check_universal_filters(config, df, idx, signal):
+    """
+    Check all universal trade filters (ADX, RSI, Loss, Profit, Trade Count).
+    Returns (allowed: bool, reason: str).
+    """
+    check_idx = max(0, idx - 1)   # use last completed candle
+    row = df.iloc[check_idx] if check_idx < len(df) else df.iloc[-1]
+    qty = config.get('quantity', 1)
+
+    # ── ADX Filter ─────────────────────────────────────────────────────────
+    if config.get('use_adx_filter', False):
+        adx = row.get('ADX') if hasattr(row, 'get') else row['ADX'] if 'ADX' in row.index else None
+        if adx is not None and not pd.isna(adx):
+            adx_min = config.get('adx_filter_min', 20)
+            adx_max = config.get('adx_filter_max', 100)
+            if not (adx_min <= float(adx) <= adx_max):
+                return False, f"ADX {float(adx):.1f} outside [{adx_min}–{adx_max}]"
+
+    # ── RSI Filter ─────────────────────────────────────────────────────────
+    if config.get('use_rsi_filter', False):
+        rsi = row.get('RSI') if hasattr(row, 'get') else row['RSI'] if 'RSI' in row.index else None
+        if rsi is not None and not pd.isna(rsi):
+            rsi = float(rsi)
+            if signal in ('BUY', 'LONG'):
+                rmin = config.get('rsi_long_min',  40)
+                rmax = config.get('rsi_long_max',  70)
+            else:
+                rmin = config.get('rsi_short_min', 30)
+                rmax = config.get('rsi_short_max', 60)
+            if not (rmin <= rsi <= rmax):
+                return False, f"RSI {rsi:.1f} outside {signal} range [{rmin}–{rmax}]"
+
+    # ── Daily P&L filters (loss + profit) ──────────────────────────────────
+    if config.get('use_loss_limit', False) or config.get('use_profit_limit', False):
+        import pytz as _pytz
+        today = datetime.now(_pytz.timezone('Asia/Kolkata')).date()
+        hist  = st.session_state.get('trade_history', [])
+        today_trades = [t for t in hist
+                        if pd.Timestamp(t.get('entry_time', '')).date() == today]
+        daily_pnl_pts = sum(t.get('pnl', 0) / qty for t in today_trades if qty > 0)
+
+        if config.get('use_loss_limit', False):
+            lmax = config.get('loss_limit_max', 100)
+            if daily_pnl_pts < -lmax:
+                return False, f"Daily loss limit hit ({daily_pnl_pts:.0f} pts, max -{lmax})"
+
+        if config.get('use_profit_limit', False):
+            pmax = config.get('profit_limit_max', 200)
+            if daily_pnl_pts >= pmax:
+                return False, f"Daily profit target reached ({daily_pnl_pts:.0f} pts, target {pmax})"
+
+    # ── Daily trade count ───────────────────────────────────────────────────
+    if config.get('use_trade_count_limit', False):
+        import pytz as _pytz
+        today  = datetime.now(_pytz.timezone('Asia/Kolkata')).date()
+        hist   = st.session_state.get('trade_history', [])
+        n_today = sum(1 for t in hist
+                      if pd.Timestamp(t.get('entry_time', '')).date() == today)
+        tmax   = config.get('trade_count_max', 5)
+        if n_today >= tmax:
+            return False, f"Max trades/day reached ({n_today}/{tmax})"
+
+    return True, ""
+
 # HELPER FUNCTIONS
 # ================================
 
@@ -3393,6 +3465,12 @@ def live_trading_iteration():
                 add_log(f"🚫 Signal {signal} blocked by direction filter")
                 return
 
+            # ── Universal trade filters ───────────────────────────────
+            _allowed, _reason = check_universal_filters(config, df, idx, signal)
+            if not _allowed:
+                add_log(f"🚫 Filter blocked entry: {_reason}")
+                return
+
             # ── Always enter at current LTP, not old candle close ──────────────
             # Using a stale candle close as entry price causes immediate SL hits
             # when price has already moved past the SL level.
@@ -3627,10 +3705,10 @@ def render_config_ui():
         st.sidebar.markdown("**DhanHQ Data Feed**")
         st.sidebar.caption("Leave blank to reuse the broker credentials entered below.")
         config['dhan_data_client_id'] = st.sidebar.text_input(
-            "Client ID (data feed)", value="", key="dhan_data_client_id_in",
+            "Client ID (data feed)", value=DHAN_CLIENT_ID, key="dhan_data_client_id_in",
         )
         config['dhan_data_access_token'] = st.sidebar.text_input(
-            "Access Token (data feed)", type="password", key="dhan_data_token_in",
+            "Access Token (data feed)", type="password", value=DHAN_ACCESS_TOKEN, key="dhan_data_token_in",
         )
         config['dhan_data_security_id'] = st.sidebar.text_input(
             "Security ID", value="13", key="dhan_data_sec_id_in",
@@ -4112,7 +4190,60 @@ def render_config_ui():
             config['custom_cross_type']     = first.get('cross_type', 'Above Indicator')
             config['custom_indicator_period'] = first.get('period', 20)
     
-    # Stop Loss Configuration
+
+    # ── Universal Trade Filters ──────────────────────────────────────────────
+    st.sidebar.markdown("---")
+    st.sidebar.subheader("🎯 Trade Filters")
+    st.sidebar.caption("Apply to all strategies. Disabled by default.")
+
+    # ADX Filter
+    config['use_adx_filter'] = st.sidebar.checkbox("📊 ADX Filter", value=False,
+        help="Only trade when ADX is in the specified range")
+    if config['use_adx_filter']:
+        _c1, _c2 = st.sidebar.columns(2)
+        config['adx_filter_min'] = _c1.number_input("Min ADX", 0, 100, 20, key="adx_f_min")
+        config['adx_filter_max'] = _c2.number_input("Max ADX", 0, 100, 100, key="adx_f_max")
+
+    # RSI Filter
+    config['use_rsi_filter'] = st.sidebar.checkbox("📈 RSI Filter", value=False,
+        help="Filter trades by RSI range separately for Long and Short")
+    if config['use_rsi_filter']:
+        st.sidebar.markdown("**Long trades (BUY):**")
+        _c1, _c2 = st.sidebar.columns(2)
+        config['rsi_long_min'] = _c1.number_input("Long Min RSI", 0, 100, 40, key="rsi_lmin")
+        config['rsi_long_max'] = _c2.number_input("Long Max RSI", 0, 100, 70, key="rsi_lmax")
+        st.sidebar.markdown("**Short trades (SELL):**")
+        _c3, _c4 = st.sidebar.columns(2)
+        config['rsi_short_min'] = _c3.number_input("Short Min RSI", 0, 100, 30, key="rsi_smin")
+        config['rsi_short_max'] = _c4.number_input("Short Max RSI", 0, 100, 60, key="rsi_smax")
+
+    # Daily Loss Limit
+    config['use_loss_limit'] = st.sidebar.checkbox("🔴 Daily Loss Limit", value=False,
+        help="Stop trading for the day when cumulative loss exceeds max loss")
+    if config['use_loss_limit']:
+        _c1, _c2 = st.sidebar.columns(2)
+        config['loss_limit_min'] = _c1.number_input("Min Loss (pts)", 0, 10000, 0,  key="loss_min")
+        config['loss_limit_max'] = _c2.number_input("Max Loss (pts)", 0, 10000, 100, key="loss_max")
+
+    # Daily Profit Target
+    config['use_profit_limit'] = st.sidebar.checkbox("🟢 Daily Profit Limit", value=False,
+        help="Stop taking new trades when cumulative profit reaches max profit")
+    if config['use_profit_limit']:
+        _c1, _c2 = st.sidebar.columns(2)
+        config['profit_limit_min'] = _c1.number_input("Min Profit (pts)", 0, 10000, 0,   key="prof_min")
+        config['profit_limit_max'] = _c2.number_input("Max Profit (pts)", 0, 10000, 200, key="prof_max")
+
+    # Daily Trade Count
+    config['use_trade_count_limit'] = st.sidebar.checkbox("🔢 Daily Trade Limit", value=False,
+        help="Limit the number of trades per day")
+    if config['use_trade_count_limit']:
+        _c1, _c2 = st.sidebar.columns(2)
+        config['trade_count_min'] = _c1.number_input("Min Trades/Day", 0, 100, 1, key="trd_min")
+        config['trade_count_max'] = _c2.number_input("Max Trades/Day", 1, 100, 5, key="trd_max")
+
+    st.sidebar.markdown("---")
+
+        # Stop Loss Configuration
     st.sidebar.subheader("🛡️ Stop Loss")
 
     # Stop Loss Configuration
@@ -4791,7 +4922,7 @@ def _live_trading_fragment(config):
     current_data = st.session_state.get('current_data')
     if current_data is not None:
         st.markdown("#### 📈 Live Market Data")
-        col1, col2, col3, col4, col5 = st.columns(5)
+        col1, col2, col3, col4, col5, col6, col7 = st.columns(7)
         with col1:
             st.metric("LTP", f"₹{float(current_data['Close']):.2f}")
         with col2:
@@ -4810,6 +4941,14 @@ def _live_trading_fragment(config):
                 st.metric("Crossover", "Bullish ⬆️" if float(ef) > float(es) else "Bearish ⬇️")
             else:
                 st.metric("Crossover", "N/A")
+        with col6:
+            adx = current_data.get('ADX')
+            adx_val = f"{float(adx):.1f}" if adx is not None and not pd.isna(adx) else "N/A"
+            st.metric("ADX", adx_val)
+        with col7:
+            rsi = current_data.get('RSI')
+            rsi_val = f"{float(rsi):.1f}" if rsi is not None and not pd.isna(rsi) else "N/A"
+            st.metric("RSI", rsi_val)
 
     # ── Live Chart with real-time forming candle ─────────────────────────
     df_plot = st.session_state.get('indicator_df')
