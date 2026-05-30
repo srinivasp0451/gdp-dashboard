@@ -4989,6 +4989,15 @@ def _live_trading_fragment(config):
                 else:
                     plot_df = pd.concat([plot_df, forming_row], ignore_index=True)
 
+            # Normalise all Datetime values to same string format
+            # so Plotly sees equal category spacing — prevents thin/dot candles
+            try:
+                plot_df['Datetime'] = pd.to_datetime(
+                    plot_df['Datetime']
+                ).dt.strftime('%d-%b %H:%M')
+            except Exception:
+                plot_df['Datetime'] = plot_df['Datetime'].astype(str).str[:16]
+
             fig_live = go.Figure()
 
             # Candlestick
@@ -5055,10 +5064,16 @@ def _live_trading_fragment(config):
             fig_live.update_layout(
                 title=f"Live: {config.get('asset', '')} | {config.get('interval', '')}",
                 xaxis_rangeslider_visible=False,
+                xaxis=dict(
+                    type='category',         # equal-width candles, no time gaps
+                    tickangle=-45,
+                    nticks=10,
+                ),
                 height=420,
                 legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1),
                 hovermode='x unified',
-                template='plotly_dark'
+                template='plotly_dark',
+                margin=dict(l=0, r=80, t=40, b=60),
             )
 
             # ── Forming candle overlay (visual only, no zero-width shapes) ─
