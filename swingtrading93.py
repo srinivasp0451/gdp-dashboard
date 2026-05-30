@@ -41,38 +41,6 @@ section[data-testid="stSidebar"] {
     border-right: 1px solid #0e2040;
 }
 
-/* Sidebar button — broad selectors cover all Streamlit versions */
-[data-testid="stSidebar"] button,
-[data-testid="stSidebar"] .stButton button,
-[data-testid="stSidebar"] [data-testid="stButton"] button,
-[data-testid="stSidebar"] .stButton > button {
-    background: linear-gradient(135deg, #0e2a44, #163550) !important;
-    color: #00e5ff !important;
-    border: 1px solid #1e5070 !important;
-    border-radius: 8px !important;
-    font-weight: 700 !important;
-    font-size: 0.88rem !important;
-    padding: 10px 16px !important;
-    width: 100% !important;
-    cursor: pointer !important;
-    transition: all 0.2s ease !important;
-    letter-spacing: 0.4px !important;
-    display: inline-flex !important;
-    align-items: center !important;
-    justify-content: center !important;
-    min-height: 42px !important;
-    opacity: 1 !important;
-    visibility: visible !important;
-}
-[data-testid="stSidebar"] button:hover,
-[data-testid="stSidebar"] .stButton button:hover,
-[data-testid="stSidebar"] [data-testid="stButton"] button:hover {
-    background: linear-gradient(135deg, #123358, #1c4268) !important;
-    border-color: #00e5ff !important;
-    box-shadow: 0 0 14px rgba(0,229,255,0.25) !important;
-    color: #ffffff !important;
-}
-
 .app-title {
     text-align: center;
     font-size: 2.8rem;
@@ -143,17 +111,6 @@ section[data-testid="stSidebar"] {
 .stTabs [aria-selected="true"] { background: #0a1e35 !important; color: #00e5ff !important; }
 
 div[data-testid="stDataFrame"] > div { border-radius: 8px !important; }
-
-/* Primary button global override */
-.stButton [kind="primary"],
-button[kind="primary"],
-[data-testid="stBaseButton-primary"],
-[data-testid="baseButton-primary"] {
-    background: linear-gradient(135deg, #0e2a44, #163550) !important;
-    color: #00e5ff !important;
-    border: 1px solid #1e5070 !important;
-    font-weight: 700 !important;
-}
 
 .div { height:1px; background:linear-gradient(90deg,transparent,#0e2a42,transparent); margin:16px 0; }
 .tbox {
@@ -924,38 +881,18 @@ def run_intraday_analysis(ticker: str) -> dict:
 # ──────────────────────────────────────────────────────────────────
 def monthly_heatmap(daily: pd.DataFrame, name: str) -> go.Figure:
     df = daily.copy()
-    df.index = pd.to_datetime(df.index)
-    df["_yr"] = df.index.year
-    df["_mo"] = df.index.month
-
-    # Last close of each (year, month) — sorted so pct_change is chronological
-    monthly_close = (
-        df.groupby(["_yr", "_mo"])["Close"]
-        .last()
-        .sort_index()          # ensures Jan follows Dec of prior year
-    )
-    # Month-over-month return: Jan correctly = Jan_close / Dec_prev_close - 1
-    monthly_ret = monthly_close.pct_change() * 100
-    # Reshape to year × month matrix
-    mr = monthly_ret.unstack(level="_mo")   # index=year, columns=1..12
+    df["Year"] = df.index.year; df["Month"] = df.index.month
+    ml = df.groupby(["Year","Month"])["Close"].last().unstack()
+    mr = ml.pct_change(axis=1) * 100
     years = sorted(mr.index.tolist())
-
-    def _safe(yr, m):
-        try:
-            if yr not in mr.index or m not in mr.columns:
-                return np.nan
-            v = mr.at[yr, m]
-            return float(v) if pd.notna(v) else np.nan
-        except Exception:
-            return np.nan
 
     z, txt = [], []
     for yr in years:
         row, trow = [], []
         for m in range(1, 13):
-            v = _safe(yr, m)
-            row.append(None if np.isnan(v) else v)
-            trow.append(f"{v:.1f}%" if not np.isnan(v) else "")
+            v = mr.loc[yr, m] if yr in mr.index and m in mr.columns else np.nan
+            row.append(None if (isinstance(v, float) and np.isnan(v)) else v)
+            trow.append(f"{v:.1f}%" if not (isinstance(v, float) and np.isnan(v)) else "")
         z.append(row); txt.append(trow)
 
     fig = go.Figure(go.Heatmap(
@@ -982,28 +919,18 @@ def monthly_heatmap(daily: pd.DataFrame, name: str) -> go.Figure:
 
 def dow_heatmap(daily: pd.DataFrame, name: str) -> go.Figure:
     df = daily.copy()
-    df.index = pd.to_datetime(df.index)
-    df["_dow"] = df.index.dayofweek
-    df["_mo"]  = df.index.month
-    df["_ret"] = df["Close"].pct_change() * 100
-    piv = df.groupby(["_dow", "_mo"])["_ret"].mean().unstack()
-
-    def _safe(d, m):
-        try:
-            if d not in piv.index or m not in piv.columns:
-                return np.nan
-            v = piv.at[d, m]
-            return float(v) if pd.notna(v) else np.nan
-        except Exception:
-            return np.nan
+    df["DOW"]   = df.index.dayofweek
+    df["Month"] = df.index.month
+    df["Ret"]   = df["Close"].pct_change() * 100
+    piv = df.groupby(["DOW","Month"])["Ret"].mean().unstack()
 
     z, txt = [], []
     for d in range(5):
         row, trow = [], []
         for m in range(1, 13):
-            v = _safe(d, m)
-            row.append(None if np.isnan(v) else v)
-            trow.append(f"{v:.2f}%" if not np.isnan(v) else "")
+            v = piv.loc[d, m] if d in piv.index and m in piv.columns else np.nan
+            row.append(None if (isinstance(v, float) and np.isnan(v)) else v)
+            trow.append(f"{v:.2f}%" if not (isinstance(v, float) and np.isnan(v)) else "")
         z.append(row); txt.append(trow)
 
     fig = go.Figure(go.Heatmap(
@@ -1093,7 +1020,7 @@ def main():
                                index=min(3, len(period_list)-1))
 
         st.markdown('<div class="div"></div>', unsafe_allow_html=True)
-        if st.button("🔄  Refresh All Data", use_container_width=True, type="primary"):
+        if st.button("🔄 Refresh All Data", use_container_width=True):
             st.cache_data.clear()
             st.rerun()
 
@@ -1732,8 +1659,7 @@ def main():
             st.markdown('<div class="sh">📊 Year-by-Year Performance</div>',
                         unsafe_allow_html=True)
             heat_df2 = heat_df.copy()
-            heat_df2["Year"]  = heat_df2.index.year
-            heat_df2["Month"] = heat_df2.index.month
+            heat_df2["Year"] = heat_df2.index.year
             ann = heat_df2.groupby("Year")["Close"].agg(First="first", Last="last")
             ann["Annual Return (%)"] = (ann["Last"] / ann["First"] - 1) * 100
             ann["Year High"] = heat_df2.groupby("Year")["High"].max()
@@ -1761,17 +1687,12 @@ def main():
             # DoW heatmap
             st.plotly_chart(dow_heatmap(heat_df, ticker_label), use_container_width=True)
 
-            # Seasonality insights — derive everything from index, not extra columns
+            # Seasonality insights
             st.markdown('<div class="sh">💡 Seasonality Insights</div>',
                         unsafe_allow_html=True)
-            _h = heat_df.copy()
-            _h.index = pd.to_datetime(_h.index)
-            _h["_ret"] = _h["Close"].pct_change() * 100
-            _h["_mo"]  = _h.index.month
-            _h["_dow"] = _h.index.dayofweek
-
-            monthly_avg = _h.groupby("_mo")["_ret"].mean()
-            dow_avg     = _h.groupby("_dow")["_ret"].mean()
+            heat_df2["Ret"] = heat_df2["Close"].pct_change() * 100
+            monthly_avg = heat_df2.groupby("Month")["Ret"].mean()
+            dow_avg     = heat_df2.groupby(heat_df2.index.dayofweek)["Ret"].mean()
             best_m  = int(monthly_avg.idxmax()); worst_m = int(monthly_avg.idxmin())
             best_d  = int(dow_avg.idxmax());     worst_d = int(dow_avg.idxmin())
 
