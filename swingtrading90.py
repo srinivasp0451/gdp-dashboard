@@ -4985,26 +4985,10 @@ def _live_trading_fragment(config):
                 # Compare strings directly — both now use same _dt_fmt format
                 _last_dt    = str(plot_df.iloc[-1]["Datetime"]) if len(plot_df) > 0 else ''
                 same_candle = (len(plot_df) > 0 and _last_dt == _lc_str)
-                add_log(f"🔗 Merge: hist_last='{_last_dt}' forming='{_lc_str}' replacing={same_candle}")
                 if same_candle:
                     plot_df = pd.concat([plot_df.iloc[:-1], forming_row], ignore_index=True)
                 else:
                     plot_df = pd.concat([plot_df, forming_row], ignore_index=True)
-
-            # ── Debug: log last 3 candles + forming candle state ─────────
-            try:
-                _debug_rows = []
-                for _di in range(max(0, len(df_live)-3), len(df_live)):
-                    _r = df_live.iloc[_di]
-                    _debug_rows.append(
-                        f"[{_di}] O={float(_r['Open']):.2f} "
-                        f"H={float(_r['High']):.2f} "
-                        f"L={float(_r['Low']):.2f} "
-                        f"C={float(_r['Close']):.2f}"
-                    )
-                add_log('📊 Last candles: ' + ' | '.join(_debug_rows))
-            except Exception as _e:
-                add_log(f'📊 candle debug err: {_e}')
 
             # Normalise all Datetime values to HH:MM string
             # so Plotly treats them as equal-width categories
