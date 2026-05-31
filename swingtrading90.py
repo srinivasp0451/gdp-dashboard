@@ -4960,31 +4960,6 @@ def _live_trading_fragment(config):
         try:
             plot_df = df_plot.tail(150).copy()
 
-            # ── Debug: log last 3 candles + forming candle state ─────────
-            try:
-                _debug_rows = []
-                for _di in range(max(0, len(df_live)-3), len(df_live)):
-                    _r = plot_df.iloc[_di]
-                    _debug_rows.append(
-                        f"[{_di}] O={float(_r['Open']):.2f} "
-                        f"H={float(_r['High']):.2f} "
-                        f"L={float(_r['Low']):.2f} "
-                        f"C={float(_r['Close']):.2f}"
-                    )
-                add_log('📊 Last candles: ' + ' | '.join(_debug_rows))
-            except Exception as _e:
-                add_log(f'📊 candle debug err: {_e}')
-
-            # Normalise all Datetime values to HH:MM string
-            # so Plotly treats them as equal-width categories
-            _dt_fmt = '%H:%M'   # intraday: time only — clean, short labels
-            try:
-                plot_df['Datetime'] = pd.to_datetime(
-                    plot_df['Datetime']
-                ).dt.strftime(_dt_fmt)
-            except Exception:
-                plot_df['Datetime'] = plot_df['Datetime'].astype(str).str[11:16]
-
             # ── Append the LIVE FORMING candle as the last bar ────────────
             lc_start = st.session_state.get('live_candle_start')
             lc_open  = st.session_state.get('live_candle_open')
@@ -4993,15 +4968,9 @@ def _live_trading_fragment(config):
             lc_close = st.session_state.get('live_candle_close')
 
             if all(v is not None for v in [lc_start, lc_open, lc_high, lc_low, lc_close]):
-                # Convert lc_start to IST then same string format as plot_df
+                # Convert lc_start to SAME string format as plot_df Datetime column
                 try:
-                    import pytz as _ptz
-                    _lc_ts = pd.Timestamp(lc_start)
-                    if _lc_ts.tzinfo is None:
-                        _lc_ts = _lc_ts.tz_localize(_ptz.timezone("Asia/Kolkata"))
-                    else:
-                        _lc_ts = _lc_ts.tz_convert(_ptz.timezone("Asia/Kolkata"))
-                    _lc_str = _lc_ts.strftime(_dt_fmt)
+                    _lc_str = pd.Timestamp(lc_start).strftime(_dt_fmt)
                 except Exception:
                     _lc_str = str(lc_start)[11:16]
                 forming_row = pd.DataFrame([{
@@ -5014,14 +4983,23 @@ def _live_trading_fragment(config):
                 # If last completed candle has the same timestamp, replace it;
                 # otherwise append so the forming candle grows at the right edge.
                 # Compare strings directly — both now use same _dt_fmt format
-                # plot_df Datetime is already normalised to _dt_fmt string
-                _last_dt = str(plot_df.iloc[-1]["Datetime"]).strip() if len(plot_df) > 0 else ""
+                _last_dt    = str(plot_df.iloc[-1]["Datetime"]) if len(plot_df) > 0 else ''
                 same_candle = (len(plot_df) > 0 and _last_dt == _lc_str)
-                add_log(f"🔗 Merge: hist_last='{_last_dt}' forming='{_lc_str}' replacing={same_candle}")
                 if same_candle:
                     plot_df = pd.concat([plot_df.iloc[:-1], forming_row], ignore_index=True)
                 else:
                     plot_df = pd.concat([plot_df, forming_row], ignore_index=True)
+
+            # Normalise all Datetime values to HH:MM string
+            # so Plotly treats them as equal-width categories
+            _dt_fmt = '%H:%M'   # intraday: time only — clean, short labels
+            try:
+                plot_df['Datetime'] = pd.to_datetime(
+                    plot_df['Datetime']
+                ).dt.strftime(_dt_fmt)
+            except Exception:
+                plot_df['Datetime'] = plot_df['Datetime'].astype(str).str[11:16]
+
             fig_live = go.Figure()
 
             # Candlestick
