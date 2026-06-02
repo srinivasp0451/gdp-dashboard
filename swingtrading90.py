@@ -32,7 +32,7 @@ warnings.filterwarnings('ignore', category=SyntaxWarning, module='dhanhq')
 # =============================================================================
 # CREDENTIALS — change these here instead of entering in the sidebar each time
 # =============================================================================
-DHAN_CLIENT_ID    = ""   # ← paste your Dhan client ID here
+DHAN_CLIENT_ID    = "1104779876"   # ← paste your Dhan client ID here
 DHAN_ACCESS_TOKEN = ""   # ← paste your Dhan access token here
 # =============================================================================
 
