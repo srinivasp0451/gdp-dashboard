@@ -32,7 +32,7 @@ warnings.filterwarnings('ignore', category=SyntaxWarning, module='dhanhq')
 # =============================================================================
 # CREDENTIALS — change these here instead of entering in the sidebar each time
 # =============================================================================
-DHAN_CLIENT_ID    = "1104779876"   # ← paste your Dhan client ID here
+DHAN_CLIENT_ID    = ""   # ← paste your Dhan client ID here
 DHAN_ACCESS_TOKEN = ""   # ← paste your Dhan access token here
 # =============================================================================
 
@@ -330,7 +330,9 @@ class DhanBrokerIntegration:
     
     def enter_broker_position(self, signal, price, config, log_func):
         """Enter broker position - Options, Intraday, Delivery. Bracket Order when broker SL enabled."""
-        is_options   = config.get('dhan_is_options', True)
+        _order_type  = config.get('dhan_order_type', 'Stock (Intraday/Delivery)')
+        is_options   = (_order_type == 'Options') or config.get('dhan_is_options', False)
+        is_futures   = (_order_type == 'Futures') or config.get('dhan_is_futures', False)
         quantity     = config.get('dhan_quantity', 10)
         trading_type = config.get('dhan_trading_type', 'Intraday')
         use_broker_sl = config.get('broker_use_own_sl', False)
@@ -353,6 +355,7 @@ class DhanBrokerIntegration:
                 'trailStopLoss':  trail
             }
 
+
         if is_options:
             security_id, option_type = self._resolve_security(signal)
             log_func(f"🏦 Options [{option_type}] Security ID: {security_id}")
@@ -368,6 +371,30 @@ class DhanBrokerIntegration:
                 'status': order_response['status'],
                 'raw_response': order_response['raw_response'],
                 'is_options': True, 'trading_type': 'Options',
+                'broker_sl_active': use_broker_sl
+            }
+
+        elif is_futures:
+            # ── Futures: BUY for long, SELL for short ────────────────────────
+            security_id  = config.get('dhan_futures_security_id', '')
+            exch_segment = config.get('dhan_futures_exchange', 'NSE_FNO')
+            txn = 'BUY' if signal in ('BUY', 'LONG') else 'SELL'
+            log_func(f"🏦 Futures [{exch_segment}] Security: {security_id} | {txn}")
+            op = _build_bo_params(txn, price)
+            order_response = self.place_order(
+                txn, security_id, quantity, signal, op,
+                exchange_segment=exch_segment
+            )
+            broker_position = {
+                'order_id': order_response['order_id'],
+                'signal_type': signal, 'option_type': f'FUT-{txn}',
+                'security_id': security_id, 'transaction_type': txn,
+                'entry_price': price, 'quantity': quantity,
+                'timestamp': datetime.now(pytz.timezone('Asia/Kolkata')),
+                'status': order_response['status'],
+                'raw_response': order_response['raw_response'],
+                'is_options': False, 'is_futures': True,
+                'trading_type': 'Futures',
                 'broker_sl_active': use_broker_sl
             }
 
@@ -524,7 +551,7 @@ class DhanBrokerIntegration:
                                 market_response = self.dhan.place_order(
                                     tag=order.get('tag', ''),
                                     transaction_type=order.get('transactionType'),
-                                    exchange_segment=order.get('exchangeSegment'),
+                                    exchange_segment=exchange_segment or order.get('exchangeSegment'),
                                     product_type=order.get('productType'),
                                     order_type=self.dhanhq_module.MARKET,
                                     security_id=str(order.get('securityId', '')),
@@ -575,7 +602,7 @@ class DhanBrokerIntegration:
                             close_response = self.dhan.place_order(
                                 tag=order.get('tag', ''),
                                 transaction_type=opposite_txn,
-                                exchange_segment=order.get('exchangeSegment'),
+                                exchange_segment=exchange_segment or order.get('exchangeSegment'),
                                 product_type=order.get('productType'),
                                 order_type=self.dhanhq_module.MARKET,
                                 security_id=str(order.get('securityId', '')),
@@ -2186,6 +2213,17 @@ def check_universal_filters(config, df, idx, signal):
         tmax   = config.get('trade_count_max', 5)
         if n_today >= tmax:
             return False, f"Max trades/day reached ({n_today}/{tmax})"
+
+    # ── Duration filter: min minutes to market close ──────────────────────────
+    if config.get('use_duration_filter', False):
+        import pytz as _ptz2
+        _ist      = _ptz2.timezone('Asia/Kolkata')
+        _now_ist  = datetime.now(_ist)
+        _close    = _now_ist.replace(hour=15, minute=30, second=0, microsecond=0)
+        _mins_left = (_close - _now_ist).total_seconds() / 60
+        _min_dur  = config.get('min_duration_minutes', 100)
+        if _mins_left < _min_dur:
+            return False, f"Only {int(_mins_left)}min to session close (need {_min_dur}min)"
 
     return True, ""
 
@@ -4241,6 +4279,16 @@ def render_config_ui():
         config['trade_count_min'] = _c1.number_input("Min Trades/Day", 0, 100, 1, key="trd_min")
         config['trade_count_max'] = _c2.number_input("Max Trades/Day", 1, 100, 5, key="trd_max")
 
+
+    # Duration Filter (min remaining session time before entry)
+    config['use_duration_filter'] = st.sidebar.checkbox("⏱ Duration Filter", value=True,
+        help="Only enter trades when at least N minutes remain in the trading session")
+    if config['use_duration_filter']:
+        config['min_duration_minutes'] = st.sidebar.number_input(
+            "Min minutes to session close", min_value=1, max_value=375, value=100,
+            help="Block new entries if less than this many minutes remain before 3:30 PM IST"
+        )
+
     st.sidebar.markdown("---")
 
         # Stop Loss Configuration
@@ -4316,30 +4364,69 @@ def render_config_ui():
         config['dhan_client_id'] = st.sidebar.text_input("Client ID", value="1104779876")
         config['dhan_access_token'] = st.sidebar.text_input("Access Token", type="password", value="eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzUxMiJ9.eyJpc3MiOiJkaGFuIiwicGFydG5lcklkIjoiIiwiZXhwIjoxNzc1MTg4NDYyLCJpYXQiOjE3NzUxMDIwNjIsInRva2VuQ29uc3VtZXJUeXBlIjoiU0VMRiIsIndlYmhvb2tVcmwiOiIiLCJkaGFuQ2xpZW50SWQiOiIxMTA0Nzc5ODc2In0.WhHvZIgy_Wj1SVT-3j43UWCnGTZ9ZBK9Spjmze-wW6LpcrTwY7pzkDRkkM4kCh8jrc883QqYnVuQ-zW8qBXF5A")
         
-        config['dhan_is_options'] = st.sidebar.checkbox("Is Options", value=False)
-        
-        if config['dhan_is_options']:
-            # ── Options trading ──
+        # ── Order Type: Stock | Options | Futures (mutually exclusive) ─────────
+        config['dhan_order_type'] = st.sidebar.radio(
+            "Order Type",
+            ["Stock (Intraday/Delivery)", "Options", "Futures"],
+            index=0,
+            help="Select one: Stock for equity, Options for CE/PE, Futures for F&O contracts"
+        )
+        _order_type = config['dhan_order_type']
+
+        if _order_type == "Stock (Intraday/Delivery)":
+            # ── Stock / Equity ────────────────────────────────────────────────
+            config['dhan_is_options'] = False
+            config['dhan_is_futures'] = False
+            config['dhan_trading_type'] = st.sidebar.selectbox(
+                "Trading Type", ["Intraday", "Delivery (CNC)"],
+                help="Intraday = MIS/INTRA  |  Delivery = CNC positional"
+            )
+            config['dhan_security_id'] = st.sidebar.text_input("Security ID", value="12092")
+            config['dhan_exchange']    = st.sidebar.selectbox("Exchange", ["NSE", "BSE"], index=0)
+            config['dhan_quantity']    = st.sidebar.number_input("Quantity", min_value=1, value=10)
+            _prod = "CNC" if config['dhan_trading_type'] == 'Delivery (CNC)' else "INTRA"
+            st.sidebar.info(f"Order Type: MARKET | Product: {_prod}")
+
+        elif _order_type == "Options":
+            # ── Options (CE / PE) ─────────────────────────────────────────────
+            config['dhan_is_options'] = True
+            config['dhan_is_futures'] = False
             config['dhan_ce_security_id'] = st.sidebar.text_input("CE Security ID", value="48228")
             config['dhan_pe_security_id'] = st.sidebar.text_input("PE Security ID", value="48229")
             config['dhan_strike_price']   = st.sidebar.number_input("Strike Price", min_value=0, value=25000)
             config['dhan_expiry_date']    = st.sidebar.date_input("Expiry Date", value=datetime.now().date())
             config['dhan_quantity']       = st.sidebar.number_input("Dhan Quantity", min_value=1, value=65)
             st.sidebar.info("Order Type: MARKET | Product: INTRA (options)")
+
         else:
-            # ── Stock/Equity trading ──
-            config['dhan_trading_type'] = st.sidebar.selectbox(
-                "Trading Type",
-                ["Intraday", "Delivery (CNC)"],
-                help="Intraday = MIS/INTRA  |  Delivery = CNC positional"
+            # ── Futures ───────────────────────────────────────────────────────
+            config['dhan_is_options'] = False
+            config['dhan_is_futures'] = True
+            config['dhan_futures_exchange'] = st.sidebar.selectbox(
+                "Futures Exchange", ['NSE_FNO', 'BSE_FNO'],
+                help="NSE_FNO for NIFTY/BANKNIFTY  |  BSE_FNO for SENSEX/BANKEX"
             )
-            config['dhan_security_id'] = st.sidebar.text_input("Security ID", value="12092")
-            config['dhan_exchange']    = st.sidebar.selectbox("Exchange", ["NSE", "BSE"], index=0)
-            config['dhan_quantity']    = st.sidebar.number_input("Quantity", min_value=1, value=10)
-            if config['dhan_trading_type'] == 'Delivery (CNC)':
-                st.sidebar.info("Order Type: MARKET | Product: CNC")
-            else:
-                st.sidebar.info("Order Type: MARKET | Product: INTRA")
+            config['dhan_futures_security_id'] = st.sidebar.text_input(
+                "Futures Security ID", value="",
+                help=(
+                    "Futures security IDs change every expiry.\n"
+                    "Download instrument master:\n"
+                    "https://api.dhan.co/data/api-scrip-master\n"
+                    "Filter by NSE_FNO / BSE_FNO + instrument type FUT.\n"
+                    "Common examples (verify current expiry):\n"
+                    "  NIFTY50 FUT  → NSE_FNO\n"
+                    "  BANKNIFTY FUT → NSE_FNO\n"
+                    "  SENSEX FUT   → BSE_FNO"
+                )
+            )
+            config['dhan_quantity'] = st.sidebar.number_input(
+                "Futures Quantity (lots)", min_value=1, value=1
+            )
+            st.sidebar.info(
+                "BUY signal → BUY futures  |  SELL signal → SELL futures\n"
+                "Order Type: MARKET | Product: INTRA"
+            )
+
 
         # ── Broker SL / Target (Bracket Order) — available for ALL order types ──
         st.sidebar.markdown("---")
@@ -4960,6 +5047,31 @@ def _live_trading_fragment(config):
         try:
             plot_df = df_plot.tail(150).copy()
 
+            # ── Debug: log last 3 candles + forming candle state ─────────
+            try:
+                _debug_rows = []
+                for _di in range(max(0, len(df_live)-3), len(df_live)):
+                    _r = plot_df.iloc[_di]
+                    _debug_rows.append(
+                        f"[{_di}] O={float(_r['Open']):.2f} "
+                        f"H={float(_r['High']):.2f} "
+                        f"L={float(_r['Low']):.2f} "
+                        f"C={float(_r['Close']):.2f}"
+                    )
+                add_log('📊 Last candles: ' + ' | '.join(_debug_rows))
+            except Exception as _e:
+                add_log(f'📊 candle debug err: {_e}')
+
+            # Normalise all Datetime values to HH:MM string
+            # so Plotly treats them as equal-width categories
+            _dt_fmt = '%H:%M'   # intraday: time only — clean, short labels
+            try:
+                plot_df['Datetime'] = pd.to_datetime(
+                    plot_df['Datetime']
+                ).dt.strftime(_dt_fmt)
+            except Exception:
+                plot_df['Datetime'] = plot_df['Datetime'].astype(str).str[11:16]
+
             # ── Append the LIVE FORMING candle as the last bar ────────────
             lc_start = st.session_state.get('live_candle_start')
             lc_open  = st.session_state.get('live_candle_open')
@@ -4968,9 +5080,15 @@ def _live_trading_fragment(config):
             lc_close = st.session_state.get('live_candle_close')
 
             if all(v is not None for v in [lc_start, lc_open, lc_high, lc_low, lc_close]):
-                # Convert lc_start to SAME string format as plot_df Datetime column
+                # Convert lc_start to IST then same string format as plot_df
                 try:
-                    _lc_str = pd.Timestamp(lc_start).strftime(_dt_fmt)
+                    import pytz as _ptz
+                    _lc_ts = pd.Timestamp(lc_start)
+                    if _lc_ts.tzinfo is None:
+                        _lc_ts = _lc_ts.tz_localize(_ptz.timezone("Asia/Kolkata"))
+                    else:
+                        _lc_ts = _lc_ts.tz_convert(_ptz.timezone("Asia/Kolkata"))
+                    _lc_str = _lc_ts.strftime(_dt_fmt)
                 except Exception:
                     _lc_str = str(lc_start)[11:16]
                 forming_row = pd.DataFrame([{
@@ -4983,23 +5101,14 @@ def _live_trading_fragment(config):
                 # If last completed candle has the same timestamp, replace it;
                 # otherwise append so the forming candle grows at the right edge.
                 # Compare strings directly — both now use same _dt_fmt format
-                _last_dt    = str(plot_df.iloc[-1]["Datetime"]) if len(plot_df) > 0 else ''
+                # plot_df Datetime is already normalised to _dt_fmt string
+                _last_dt = str(plot_df.iloc[-1]["Datetime"]).strip() if len(plot_df) > 0 else ""
                 same_candle = (len(plot_df) > 0 and _last_dt == _lc_str)
+                add_log(f"🔗 Merge: hist_last='{_last_dt}' forming='{_lc_str}' replacing={same_candle}")
                 if same_candle:
                     plot_df = pd.concat([plot_df.iloc[:-1], forming_row], ignore_index=True)
                 else:
                     plot_df = pd.concat([plot_df, forming_row], ignore_index=True)
-
-            # Normalise all Datetime values to HH:MM string
-            # so Plotly treats them as equal-width categories
-            _dt_fmt = '%H:%M'   # intraday: time only — clean, short labels
-            try:
-                plot_df['Datetime'] = pd.to_datetime(
-                    plot_df['Datetime']
-                ).dt.strftime(_dt_fmt)
-            except Exception:
-                plot_df['Datetime'] = plot_df['Datetime'].astype(str).str[11:16]
-
             fig_live = go.Figure()
 
             # Candlestick
