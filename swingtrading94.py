@@ -711,13 +711,17 @@ def auto_trade_fragment(cfg,conf):
     if no_vol and strat in VOLUME_REQUIRED:
         st.markdown(f"<div class='warn-box'>⚠️ <b>{strat}</b>: no volume — running price-only fallback.</div>",unsafe_allow_html=True)
 
+    _sig_clr = "#3fb950" if last_sig==1 else "#f85149" if last_sig==-1 else "#8b949e"
+    _sig_txt = "▲BUY" if last_sig==1 else "▼SELL" if last_sig==-1 else "NONE"
+    _pnl_clr2 = "#3fb950" if ds["pnl"]>=0 else "#f85149"
     st.markdown(f"""<div style='display:flex;gap:12px;align-items:center;background:#161b22;border:1px solid #30363d;border-radius:8px;padding:7px 12px;margin-bottom:6px;font-size:.81rem'>
-      <span style='color:#3fb950;font-weight:700'>● LIVE AUTO-TRADE</span><span style='color:#8b949e'>|</span>
+      <span style='color:#3fb950;font-weight:700'>● LIVE AUTO-TRADE</span>
+      <span style='color:#8b949e'>|</span>
       <span style='color:#e6edf3'>LTP: <b style='color:#58a6ff'>{ltp:,.2f}</b></span>
-      <span style='color:#8b949e'>Signal: <b style='color:{"#3fb950" if last_sig==1 else "#f85149" if last_sig==-1 else "#8b949e"}'>{"▲BUY" if last_sig==1 else "▼SELL" if last_sig==-1 else "NONE"}</b></span>
-      <span style='color:#8b949e'>Daily PnL: <b style='color:{"#3fb950" if ds["pnl"]>=0 else "#f85149"}'>{ds["pnl"]:+.1f}pts</b> | Trades: {ds["trades"]}</span>
+      <span style='color:#8b949e'>Signal: <b style='color:{_sig_clr}'>{_sig_txt}</b></span>
+      <span style='color:#8b949e'>Daily PnL: <b style='color:{_pnl_clr2}'>{ds["pnl"]:+.1f}pts</b> | Trades: {ds["trades"]}</span>
       <span style='color:#8b949e;margin-left:auto;font-size:.68rem'>{datetime.now().strftime("%H:%M:%S")}</span>
-    </div>""",unsafe_allow_html=True)
+    </div>""", unsafe_allow_html=True)
 
     pos=st.session_state.live_position
     if pos is None and strat not in MANUAL_ONLY:
@@ -997,7 +1001,7 @@ def tab_backtest(cfg):
         st.markdown(f"""<div style='background:#161b22;border:1px solid #30363d;border-radius:6px;padding:8px 12px;font-size:.81rem;display:flex;gap:12px;align-items:center'>
           <span style='color:#8b949e'>{len(df):,} candles</span><span style='color:#3fb950'>▲{bc} BUY</span><span style='color:#f85149'>▼{sc} SELL</span>
           <span style='color:#8b949e'>| {cfg["strat"][:24]}</span>
-          {"<span style='color:#58a6ff'>· "+str(active_cf)+" filters ON</span>" if active_cf else ""}
+          {('<span style="color:#58a6ff">· '+str(active_cf)+' filters ON</span>') if active_cf else ''}
           <span style='color:#58a6ff;font-size:.73rem'>· {entry_note}</span>
         </div>""",unsafe_allow_html=True)
     if run_bt:
@@ -1172,6 +1176,262 @@ def tab_leaderboard(cfg):
                 pf=row["Profit Factor"]; clr="#f0883e" if i==0 else "#8b949e"
                 st.markdown(f"<div class='icard' style='border-top:3px solid {clr};text-align:center'><div style='font-size:1.4rem'>{medal}</div><div style='color:#e6edf3;font-size:.82rem;font-weight:700;margin:4px 0'>{row['Strategy'][:28]}</div><div style='color:#8b949e;font-size:.77rem;line-height:1.8'>PF: <b style='color:{'#3fb950' if pf>=1.5 else '#f85149'}'>{pf}</b><br>Win: <b style='color:#e6edf3'>{row['Win Rate']}</b><br>P&L: <b style='color:{'#3fb950' if row['Net P&L (₹)']>=0 else '#f85149'}'>₹{row['Net P&L (₹)']:,.0f}</b></div></div>",unsafe_allow_html=True)
 
+
+
+# ── ANALYSIS TAB ──────────────────────────────────────────────
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_analysis_data(ticker, years):
+    time.sleep(0.3)
+    try:
+        raw = yf.download(ticker, period=f"{years}y", interval="1d",
+                          progress=False, auto_adjust=True)
+        if raw.empty: return pd.DataFrame()
+        if isinstance(raw.columns, pd.MultiIndex): raw.columns = raw.columns.get_level_values(0)
+        raw.columns = [str(c).strip() for c in raw.columns]
+        return raw[["Open","High","Low","Close","Volume"]].dropna()
+    except: return pd.DataFrame()
+
+def _monthly_pivot(df_daily):
+    """Build Month x Year pivot of monthly returns (%)."""
+    monthly = df_daily["Close"].resample("ME").last().pct_change() * 100
+    df_m = pd.DataFrame({"year": monthly.index.year,
+                          "month": monthly.index.month,
+                          "ret": monthly.values}).dropna()
+    pivot = df_m.pivot(index="month", columns="year", values="ret")
+    mn = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"]
+    pivot.index = [mn[m-1] for m in pivot.index]
+    return pivot
+
+def _tf_heatmap_pivot(df, interval):
+    """Build heatmap pivot appropriate for the selected timeframe."""
+    df2 = df.copy(); df2["ret"] = df2["Close"].pct_change() * 100
+    df2 = df2.dropna(subset=["ret"])
+    try:
+        if interval in ("1m","5m","15m"):
+            df2["row"] = df2.index.hour
+            df2["col"] = df2.index.dayofweek
+            col_names = ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"]
+            title = "Avg Return % — Hour of Day × Day of Week"
+        elif interval == "1h":
+            df2["row"] = df2.index.dayofweek
+            df2["col"] = df2.index.hour
+            col_names = [f"{h:02d}:00" for h in range(24)]
+            title = "Avg Return % — Day of Week × Hour"
+        elif interval == "1d":
+            df2["row"] = df2.index.month
+            df2["col"] = df2.index.dayofweek
+            col_names = ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"]
+            mn = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"]
+            title = "Avg Return % — Month × Day of Week"
+        else:  # 1wk or wider
+            df2["row"] = df2.index.year
+            df2["col"] = df2.index.quarter
+            col_names = ["Q1","Q2","Q3","Q4"]
+            title = "Avg Return % — Year × Quarter"
+        pivot = df2.groupby(["row","col"])["ret"].mean().unstack()
+        if interval == "1d":
+            mn = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"]
+            pivot.index = [mn[m-1] for m in pivot.index]
+        elif interval in ("1m","5m","15m"):
+            pivot.index = [f"{h:02d}:00" for h in pivot.index]
+        pivot.columns = [col_names[c] if c < len(col_names) else str(c) for c in pivot.columns]
+        return pivot, title
+    except Exception as e:
+        return pd.DataFrame(), f"Could not build heatmap: {e}"
+
+def _heat_fig(pivot, title, fmt=".1f"):
+    """Build a plotly diverging heatmap (red=negative, green=positive)."""
+    if pivot.empty: return go.Figure()
+    z = pivot.values.tolist()
+    text = [[f"{v:{fmt}}%" if not (isinstance(v, float) and np.isnan(v)) else ""
+             for v in row] for row in pivot.values]
+    zmax = max(abs(np.nanmin(pivot.values)), abs(np.nanmax(pivot.values))) or 1
+    fig = go.Figure(go.Heatmap(
+        z=z, x=list(pivot.columns), y=list(pivot.index),
+        colorscale=[[0,"#c62828"],[0.35,"#ef5350"],[0.5,"#21262d"],
+                    [0.65,"#26a69a"],[1,"#00695c"]],
+        zmid=0, zmin=-zmax, zmax=zmax,
+        text=text, texttemplate="%{text}", textfont={"size": 9, "color": "#e6edf3"},
+        colorbar=dict(title="Return %", tickfont=dict(color="#8b949e"),
+                      titlefont=dict(color="#8b949e")),
+    ))
+    fig.update_layout(
+        template="plotly_dark", paper_bgcolor="#0d1117", plot_bgcolor="#0d1117",
+        title=dict(text=f"<b>{title}</b>", font=dict(size=13, color="#e6edf3"), x=0.5),
+        font=dict(family="monospace", size=11, color="#8b949e"),
+        xaxis=dict(gridcolor="#21262d", tickfont=dict(color="#8b949e")),
+        yaxis=dict(gridcolor="#21262d", tickfont=dict(color="#8b949e")),
+        margin=dict(l=0, r=0, t=40, b=0), height=420,
+    )
+    return fig
+
+def _style_returns(v):
+    if not isinstance(v, (int, float)): return ""
+    if v > 0:  return "color:#3fb950;font-weight:600"
+    if v < 0:  return "color:#f85149;font-weight:600"
+    return "color:#8b949e"
+
+def tab_analysis(cfg):
+    st.markdown("### 📊 Market Analysis")
+    df_live = st.session_state.current_data
+
+    # ── Settings bar ─────────────────────────────────────────
+    c1, c2, c3 = st.columns(3)
+    with c1: years = st.number_input("Years of history for heatmaps", 1, 30, 10, key="ana_years")
+    with c2: rows_show = st.number_input("OHLC rows to display", 10, 500, 100, key="ana_rows")
+    with c3: st.markdown(f"""<div class='icard' style='margin-top:4px'>
+        <div class='ml'>Instrument</div>
+        <div style='color:#e6edf3;font-size:.9rem;font-weight:700'>{cfg["tname"]}</div>
+        <div class='ms'>{cfg["tsym"]}</div></div>""", unsafe_allow_html=True)
+
+    # ── OHLC Table ────────────────────────────────────────────
+    st.markdown("#### 📋 OHLC Data with Returns")
+    df_src = df_live if df_live is not None and not df_live.empty else None
+    if df_src is None:
+        st.info("👈 Select instrument in sidebar — data loads automatically.")
+    else:
+        df_tbl = df_src.copy().tail(rows_show)
+        df_tbl["Return %"]      = df_tbl["Close"].pct_change() * 100
+        df_tbl["Cumul. Return %"] = (df_tbl["Close"] / df_src["Close"].iloc[0] - 1) * 100
+        df_tbl.index = df_tbl.index.strftime("%Y-%m-%d %H:%M") if hasattr(df_tbl.index[0], "hour") else df_tbl.index.strftime("%Y-%m-%d")
+        df_tbl = df_tbl.round({"Open":2,"High":2,"Low":2,"Close":2,
+                                "Volume":0,"Return %":3,"Cumul. Return %":3})
+
+        def style_df(df):
+            style = pd.DataFrame("", index=df.index, columns=df.columns)
+            for col in ["Return %", "Cumul. Return %"]:
+                if col in df.columns:
+                    style[col] = df[col].map(_style_returns)
+            # Color Close relative to Open
+            if "Close" in df.columns and "Open" in df.columns:
+                style["Close"] = (df["Close"] >= df["Open"]).map(
+                    {True: "color:#26a69a;font-weight:600", False: "color:#ef5350;font-weight:600"})
+            return style
+
+        try:
+            styled = df_tbl.style.apply(style_df, axis=None)
+            st.dataframe(styled, use_container_width=True, height=380, key="ana_tbl")
+        except Exception:
+            st.dataframe(df_tbl, use_container_width=True, height=380, key="ana_tbl2")
+
+        # Quick stats
+        ret = df_tbl["Return %"].dropna()
+        sc1,sc2,sc3,sc4,sc5 = st.columns(5)
+        for col,lbl,val,clr in zip([sc1,sc2,sc3,sc4,sc5],
+            ["Avg Daily Ret","Best Day","Worst Day","Positive Days","Volatility (σ)"],
+            [f"{ret.mean():.3f}%", f"{ret.max():.2f}%", f"{ret.min():.2f}%",
+             f"{(ret>0).sum()}/{len(ret)}", f"{ret.std():.3f}%"],
+            ["#58a6ff","#3fb950","#f85149","#3fb950" if (ret>0).mean()>=0.5 else "#f85149","#f0883e"]):
+            with col:
+                st.markdown(f"""<div class='mc' style='border-top:3px solid {clr}'>
+                  <div class='ml'>{lbl}</div>
+                  <div class='mv' style='color:{clr};font-size:.88rem'>{val}</div>
+                </div>""", unsafe_allow_html=True)
+
+    st.divider()
+
+    # ── Monthly Returns Heatmap (Month × Year) ───────────────
+    st.markdown(f"#### 🗓️ Monthly Returns Heatmap — {cfg['tname']} (last {years} years)")
+    with st.spinner("Loading historical data…"):
+        df_hist = fetch_analysis_data(cfg["tsym"], int(years))
+
+    if df_hist is None or df_hist.empty:
+        st.warning("Could not load historical data. Check ticker symbol.")
+    else:
+        pivot_my = _monthly_pivot(df_hist)
+        if not pivot_my.empty:
+            fig_my = _heat_fig(pivot_my,
+                f"Monthly Returns % — {cfg['tname']} (Month × Year, last {years}y)")
+            st.plotly_chart(fig_my, use_container_width=True, key="ana_heat_my")
+
+            # Annual summary bar
+            ann = df_hist["Close"].resample("YE").last().pct_change() * 100
+            ann = ann.dropna()
+            fig_ann = go.Figure(go.Bar(
+                x=ann.index.year, y=ann.values,
+                marker_color=["#3fb950" if v >= 0 else "#f85149" for v in ann.values],
+                text=[f"{v:.1f}%" for v in ann.values],
+                textposition="outside", textfont=dict(size=9, color="#e6edf3"),
+            ))
+            fig_ann.add_hline(y=0, line=dict(color="#555", dash="dash", width=1))
+            fig_ann.update_layout(
+                template="plotly_dark", paper_bgcolor="#0d1117", plot_bgcolor="#0d1117",
+                title=dict(text=f"<b>Annual Returns % — {cfg['tname']}</b>",
+                           font=dict(size=12, color="#e6edf3"), x=0.5),
+                font=dict(color="#8b949e"), height=280,
+                margin=dict(l=0, r=0, t=34, b=0),
+                xaxis=dict(gridcolor="#21262d"), yaxis=dict(gridcolor="#21262d"),
+            )
+            st.plotly_chart(fig_ann, use_container_width=True, key="ana_annual")
+        else:
+            st.warning("Not enough data for monthly heatmap.")
+
+    st.divider()
+
+    # ── Timeframe Returns Heatmap ─────────────────────────────
+    st.markdown(f"#### ⏱️ Timeframe Heatmap — {cfg['tname']} ({cfg['interval']}/{cfg['period']})")
+    st.caption("Shows average return % per cell based on time patterns in the loaded data.")
+    df_tf = st.session_state.current_data
+    if df_tf is None or df_tf.empty:
+        st.info("Load data first via sidebar selection.")
+    else:
+        pivot_tf, tf_title = _tf_heatmap_pivot(df_tf, cfg["interval"])
+        if not pivot_tf.empty:
+            fig_tf = _heat_fig(pivot_tf, tf_title, fmt=".2f")
+            fig_tf.update_layout(height=360)
+            st.plotly_chart(fig_tf, use_container_width=True, key="ana_heat_tf")
+
+            # Return distribution histogram
+            rets = df_tf["Close"].pct_change().dropna() * 100
+            fig_dist = go.Figure()
+            fig_dist.add_trace(go.Histogram(
+                x=rets, nbinsx=50, name="Return %",
+                marker_color=["#3fb950" if v >= 0 else "#f85149" for v in rets],
+                marker_line=dict(color="#0d1117", width=0.5),
+            ))
+            fig_dist.add_vline(x=0, line=dict(color="#555", dash="dash", width=1))
+            fig_dist.add_vline(x=float(rets.mean()), line=dict(color="#58a6ff", dash="dot", width=1),
+                               annotation_text=f"Mean {rets.mean():.3f}%",
+                               annotation_font_color="#58a6ff")
+            fig_dist.update_layout(
+                template="plotly_dark", paper_bgcolor="#0d1117", plot_bgcolor="#0d1117",
+                title=dict(text=f"<b>Return Distribution — {cfg['interval']}/{cfg['period']}</b>",
+                           font=dict(size=12, color="#e6edf3"), x=0.5),
+                font=dict(color="#8b949e"), height=260,
+                margin=dict(l=0, r=0, t=34, b=0),
+                xaxis=dict(title="Return %", gridcolor="#21262d"),
+                yaxis=dict(title="Frequency", gridcolor="#21262d"),
+            )
+            st.plotly_chart(fig_dist, use_container_width=True, key="ana_dist")
+
+            # Stats table for the pivot
+            st.markdown("**Pivot Statistics**")
+            stats_rows = []
+            for col in pivot_tf.columns:
+                col_data = pivot_tf[col].dropna()
+                if not col_data.empty:
+                    stats_rows.append({
+                        "Period": str(col),
+                        "Avg Ret %": round(float(col_data.mean()), 3),
+                        "Best %":   round(float(col_data.max()), 3),
+                        "Worst %":  round(float(col_data.min()), 3),
+                        "Win Rate": f"{(col_data>0).mean()*100:.0f}%",
+                    })
+            if stats_rows:
+                df_stats = pd.DataFrame(stats_rows).set_index("Period")
+                def style_stats(df):
+                    sty = pd.DataFrame("", index=df.index, columns=df.columns)
+                    for c in ["Avg Ret %","Best %","Worst %"]:
+                        if c in df.columns: sty[c] = df[c].map(_style_returns)
+                    return sty
+                try:
+                    st.dataframe(df_stats.style.apply(style_stats, axis=None),
+                                 use_container_width=True, height=220, key="ana_stats")
+                except Exception:
+                    st.dataframe(df_stats, use_container_width=True, height=220, key="ana_stats2")
+        else:
+            st.warning(f"Could not build timeframe heatmap: {tf_title}")
+
 def recommendations():
     with st.expander("📖 How to use Confirmation Filters + Honest Assessment",expanded=False):
         st.markdown("""<div class='icard'>
@@ -1202,32 +1462,4 @@ def main():
         <div style='font-size:.61rem;color:#8b949e;letter-spacing:2px'>v6.0 · 14 STRATEGIES · 17 CONFIRMATION FILTERS · 3 SMART SL/TGT TYPES</div></div>
       <div style='margin-left:auto;display:flex;gap:7px'>
         <div style='background:#1a4731;color:#3fb950;padding:2px 9px;border-radius:20px;font-size:.66rem;font-weight:700'>● PAPER MODE</div>
-        <div style='background:#1c2128;color:#58a6ff;padding:2px 9px;border-radius:20px;font-size:.66rem'>Auto-load on change</div>
-      </div></div>""",unsafe_allow_html=True)
-
-    cfg=sidebar(); recommendations()
-
-    # Auto-load data when instrument/TF changes (no button needed)
-    data_key=f"{cfg['tsym']}|{cfg['interval']}|{cfg['period']}"
-    if data_key!=st.session_state.last_data_key:
-        df=fetch_data(cfg["tsym"],cfg["interval"],cfg["period"])
-        if df is not None and not df.empty:
-            st.session_state.current_data=df; st.session_state.last_data_key=data_key
-            st.session_state.last_strat_key=""; st.session_state.backtest_results=None; st.session_state.leaderboard_results=None
-
-    # Auto rerun strategy when strategy/params/conf change
-    sp_key=str(sorted(cfg["sp"].items())); cf_key=str(sorted(cfg["conf"].items()))
-    strat_key=f"{data_key}|{cfg['strat']}|{sp_key}|{cf_key}"
-    df=st.session_state.current_data
-    if df is not None and not df.empty and strat_key!=st.session_state.last_strat_key:
-        sigs,inds=run_strategy(df,cfg["strat"],cfg["sp"],cfg["conf"])
-        st.session_state.signals=sigs; st.session_state.indicators=inds; st.session_state.last_strat_key=strat_key
-
-    tab1,tab2,tab3,tab4=st.tabs(["📈 Backtest","📡 Live Trading","📋 Live History","🏆 Leaderboard"])
-    with tab1: tab_backtest(cfg)
-    with tab2: tab_live(cfg)
-    with tab3: tab_history()
-    with tab4: tab_leaderboard(cfg)
-
-if __name__=="__main__":
-    main()
+        <div style='background:#1c2128;color:#58a
