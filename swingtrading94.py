@@ -512,9 +512,28 @@ def run_strategy(df, strat, p, conf=None) -> Tuple[pd.Series, dict]:
             }
 
     except Exception as e: pass
+    # Hybrid strategy: combine signals from multiple selected strategies
+    if strat=="Hybrid (Multi-Strategy)":
+        selected=p.get("hybrid_selected",[])
+        min_agree=int(p.get("hybrid_min_agree",1))
+        if selected:
+            buy_votes=pd.Series(0,index=df.index)
+            sell_votes=pd.Series(0,index=df.index)
+            for _hs in selected:
+                try:
+                    _hsig,_=run_strategy(df,_hs,{}); 
+                    buy_votes+=(_hsig==1).astype(int)
+                    sell_votes+=(_hsig==-1).astype(int)
+                except Exception: pass
+            sig[buy_votes>=min_agree]=1
+            sig[sell_votes>=min_agree]=-1
+            sig[(buy_votes>=min_agree)&(sell_votes>=min_agree)]=0
     # Apply confirmation filters
     if conf:
         sig=apply_confirmations(df,sig,no_vol,conf)
+    # Apply trade direction filter — ONLY the selected direction's signals pass
+    if direction=="Long Only":   sig[sig==-1]=0
+    elif direction=="Short Only": sig[sig==1]=0
     return sig,ind
 
 # ── PROXIMITY ─────────────────────────────────────────────────
@@ -876,7 +895,7 @@ def auto_trade_fragment(cfg,conf):
 
     df=fetch_data(ticker,cfg["interval"],cfg["period"]); ltp,day_hi,day_lo=fetch_ltp(ticker)
     if df is None or df.empty: st.caption("⚠️ Data unavailable"); return
-    sigs,inds=run_strategy(df,strat,sp,conf)
+    sigs,inds=run_strategy(df,strat,sp,conf,cfg.get("direction","Both (Long & Short)"))
     last_sig=int(sigs.iloc[-1]) if not sigs.empty else 0; cur_candle=df.index[-1]
     no_vol=not has_volume(df)
 
@@ -1058,6 +1077,17 @@ def sidebar():
                            "Higher wick ratio = stronger rejection required. "
                            "Equal-level >0 = only double-top/bottom sweeps (fewer, higher quality).")
 
+            elif strat=="Hybrid (Multi-Strategy)":
+                sp["hybrid_min_agree"]=int(st.number_input("Min strategies that must agree",1,8,1,step=1,key="hyb_min"))
+                st.caption("Signal fires when N or more selected strategies agree on same direction.")
+                _non_hyb=[s for s in STRATEGIES if s not in ("Hybrid (Multi-Strategy)","Simple Buy (Immediate)","Simple Sell (Immediate)")]
+                sp["hybrid_selected"]=[]
+                _hc1,_hc2=st.columns(2)
+                for _si,_sn in enumerate(_non_hyb):
+                    _col=_hc1 if _si%2==0 else _hc2
+                    if _col.checkbox(_sn[:32],value=False,key=f"hyb_{_si}"):
+                        sp["hybrid_selected"].append(_sn)
+                if not sp["hybrid_selected"]: st.warning("⚠️ Select at least one strategy.")
             elif "Kalman" in strat: sp["kf_thr"]=st.number_input("Z Thr",.5,4.,1.5,step=.1,key="kft")
             elif "Order Flow" in strat: sp["ofi_lb"]=st.number_input("Lookback",3,50,10,key="ofil"); sp["ofi_thr"]=st.number_input("Imbalance",.5,.95,.60,step=.01,key="ofit")
             elif "Volatility Regime" in strat: sp["vrm_fast"]=st.number_input("Fast",3,50,10,key="vrmf"); sp["vrm_slow"]=st.number_input("Slow",10,100,30,key="vrms")
@@ -1172,6 +1202,13 @@ def sidebar():
                 conf["daily_trades_max"]=st.number_input("Max trades/day",5,100,10,step=1,key="dtm")
                 st.caption(f"Max {conf.get('daily_trades_max',10)} trades per day.")
 
+        st.divider()
+        st.divider()
+        st.markdown("**↕️ TRADE DIRECTION**")
+        direction=st.selectbox("Direction",
+            ["Both (Long & Short)","Long Only","Short Only"],
+            index=0,key="trade_dir",label_visibility="collapsed")
+        st.caption("Long Only → only BUY signals entered. Short Only → only SELL signals. Applies everywhere.")
         st.divider()
         st.markdown("**🏦 DHAN**")
         dhan_on=st.checkbox("Enable Live Orders",value=False,key="dhan_on")
@@ -1356,7 +1393,7 @@ def tab_leaderboard(cfg):
         for idx,s_ in enumerate(strats_to_run):
             prog.progress((idx+1)/len(strats_to_run),f"Testing: {s_[:36]}")
             try:
-                sg,_=run_strategy(df,s_,{},cfg["conf"])
+                sg,_=run_strategy(df,s_,{},cfg["conf"],cfg.get("direction","Both (Long & Short)"))
                 if (sg!=0).sum()==0: continue
                 bt=run_backtest(df,sg,cfg["sl_type"],cfg["sl_p"],cfg["tgt_type"],cfg["tgt_p"],cfg["qty"],s_,cfg["conf"])
                 if bt.empty: continue
@@ -2201,7 +2238,7 @@ def main():
     strat_key=f"{data_key}|{cfg['strat']}|{sp_key}|{cf_key}"
     df=st.session_state.current_data
     if df is not None and not df.empty and strat_key!=st.session_state.last_strat_key:
-        sigs,inds=run_strategy(df,cfg["strat"],cfg["sp"],cfg["conf"])
+        sigs,inds=run_strategy(df,cfg["strat"],cfg["sp"],cfg["conf"],cfg.get("direction","Both (Long & Short)"))
         st.session_state.signals=sigs; st.session_state.indicators=inds; st.session_state.last_strat_key=strat_key
 
     tab1,tab2,tab3,tab4,tab5,tab6=st.tabs(["📈 Backtest","📡 Live Trading","📋 Live History","🏆 Leaderboard","📊 Analysis","⚗️ Quant Models"])
