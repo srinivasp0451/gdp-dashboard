@@ -86,7 +86,7 @@ for _k,_v in {
     "backtest_results":None,"live_trades":[],"live_position":None,
     "live_running":False,"current_data":None,"signals":None,"indicators":{},
     "last_data_key":"","last_strat_key":"","last_signal_candle":None,
-    "dhan_connected":False,"leaderboard_results":None,"lb_ran_for":"","opt_results":None,"opt_best":None,
+    "dhan_connected":False,"leaderboard_results":None,"lb_ran_for":"","opt_results":None,"opt_best":None,"_opt_pending":None,
     "daily_stats":{"pnl":0.0,"trades":0,"date":None},"trade_paused_reason":"",
 }.items():
     if _k not in st.session_state: st.session_state[_k]=_v
@@ -2201,21 +2201,42 @@ _OPT_TF_COMBOS = [
     ("1d","1mo"),("1d","6mo"),("1d","1y"),("1d","2y"),
 ]
 _OPT_SL = [
-    ("ATR Based SL",          {"sl_atr_mult":1.0}),
-    ("ATR Based SL",          {"sl_atr_mult":1.5}),
-    ("ATR Based SL",          {"sl_atr_mult":2.0}),
-    ("Trail – Current Candle Low/High", {}),
-    ("Trail – Previous Candle Low/High",{}),
-    ("🤖 Autopilot SL",       {"vol_scale":1.0}),
-    ("🤖 Autopilot SL",       {"vol_scale":1.5}),
+    ("ATR Based SL",                         {"sl_atr_mult":1.0}),
+    ("ATR Based SL",                         {"sl_atr_mult":1.5}),
+    ("ATR Based SL",                         {"sl_atr_mult":2.0}),
+    ("ATR Based SL",                         {"sl_atr_mult":2.5}),
+    ("Trail SL",                             {}),
+    ("Trail – Current Candle Low/High",      {}),
+    ("Trail – Previous Candle Low/High",     {}),
+    ("Trail – Current Swing High/Low",       {}),
+    ("Trail – Previous Swing High/Low",      {}),
+    ("🤖 Autopilot SL",                      {"vol_scale":0.8}),
+    ("🤖 Autopilot SL",                      {"vol_scale":1.0}),
+    ("🤖 Autopilot SL",                      {"vol_scale":1.5}),
+    ("Risk Reward (min 1:2)",                {"sl_points":10.}),
+    ("Step Trail SL (N pts lock K pts)",     {"step_n":10.,"step_k":5.}),
+    ("Step Trail SL (N pts lock K pts)",     {"step_n":15.,"step_k":8.}),
+    ("Step Trail SL (N pts lock K pts)",     {"step_n":20.,"step_k":10.}),
+    ("Drawdown Recovery Exit (loss+recovery%)",{"sl_points":10.,"recovery_pct":40.}),
+    ("Drawdown Recovery Exit (loss+recovery%)",{"sl_points":15.,"recovery_pct":35.}),
 ]
 _OPT_TGT = [
-    ("Risk Reward (min 1:2)", {"rr_ratio":2.0}),
-    ("Risk Reward (min 1:2)", {"rr_ratio":2.5}),
-    ("Risk Reward (min 1:2)", {"rr_ratio":3.0}),
-    ("ATR Based Target",      {"target_atr_mult":2.0}),
-    ("ATR Based Target",      {"target_atr_mult":3.0}),
-    ("🤖 Autopilot Target",   {}),
+    ("Risk Reward (min 1:2)",                    {"rr_ratio":2.0}),
+    ("Risk Reward (min 1:2)",                    {"rr_ratio":2.5}),
+    ("Risk Reward (min 1:2)",                    {"rr_ratio":3.0}),
+    ("Risk Reward (min 1:2)",                    {"rr_ratio":4.0}),
+    ("ATR Based Target",                         {"target_atr_mult":2.0}),
+    ("ATR Based Target",                         {"target_atr_mult":3.0}),
+    ("ATR Based Target",                         {"target_atr_mult":4.0}),
+    ("🤖 Autopilot Target",                      {}),
+    ("Trail – Current Candle Low/High",          {}),
+    ("Trail – Previous Candle Low/High",         {}),
+    ("Trail – Current Swing High/Low",           {}),
+    ("Trail – Previous Swing High/Low",          {}),
+    ("Strategy Signal Exit",                     {}),
+    ("Profit Erosion Exit (peak-erosion%)",      {"peak_profit_pts":20.,"erosion_pct":40.}),
+    ("Profit Erosion Exit (peak-erosion%)",      {"peak_profit_pts":30.,"erosion_pct":30.}),
+    ("Profit Erosion Exit (peak-erosion%)",      {"peak_profit_pts":40.,"erosion_pct":35.}),
 ]
 _OPT_FILTERS = [
     {},
@@ -2242,37 +2263,58 @@ def _opt_score(s):
     return round(acc * pf * (1 - min(dd_r, 0.8)) * cnt, 4)
 
 def _apply_opt_to_sidebar(row):
-    """Write optimized params into st.session_state so sidebar widgets pick them up."""
-    interval = row["Interval"]; period = row["Period"]
-    sl_type  = row["SL Type"];  sl_p   = row.get("_sl_p", {})
-    tgt_type = row["Target"];   tgt_p  = row.get("_tgt_p", {})
-    conf     = row.get("_conf", {})
+    """Store pending params — applied in main() BEFORE widgets render (avoids StreamlitAPIException)."""
+    st.session_state["_opt_pending"] = {
+        "interval":  row["Interval"],
+        "period":    row["Period"],
+        "sl_type":   row["SL Type"],
+        "tgt_type":  row["Target"],
+        "_sl_p":     row.get("_sl_p", {}),
+        "_tgt_p":    row.get("_tgt_p", {}),
+        "_conf":     row.get("_conf", {}),
+    }
 
-    # ── Timeframe ───────────────────────────────────────────────
+def _flush_opt_pending():
+    """Called in main() before sidebar() so widget keys can be safely updated."""
+    pending = st.session_state.pop("_opt_pending", None)
+    if not pending: return
+    interval = pending["interval"]; period = pending["period"]
+    sl_type  = pending["sl_type"];  sl_p   = pending.get("_sl_p", {})
+    tgt_type = pending["tgt_type"]; tgt_p  = pending.get("_tgt_p", {})
+    conf     = pending.get("_conf", {})
+
+    # Timeframe
     st.session_state["interval"] = interval
     plist = TIMEFRAME_PERIODS.get(interval, [])
     if period in plist: st.session_state["period"] = period
 
-    # ── SL ──────────────────────────────────────────────────────
+    # SL type + params
     if sl_type in SL_TYPES: st.session_state["sl_type"] = sl_type
-    if "sl_atr_mult"   in sl_p: st.session_state["slam"] = float(sl_p["sl_atr_mult"])
-    if "sl_points"     in sl_p: st.session_state["slp"]  = float(sl_p["sl_points"])
-    if "vol_scale"     in sl_p: st.session_state["vs"]   = float(sl_p["vol_scale"])
+    if sl_type == "Custom Points"                          and "sl_points"    in sl_p: st.session_state["slp"]  = float(sl_p["sl_points"])
+    if sl_type == "ATR Based SL"                          and "sl_atr_mult"  in sl_p: st.session_state["slam"] = float(sl_p["sl_atr_mult"])
+    if sl_type == "🤖 Autopilot SL"                       and "vol_scale"    in sl_p: st.session_state["vs"]   = float(sl_p["vol_scale"])
+    if sl_type == "Risk Reward (min 1:2)"                 and "sl_points"    in sl_p: st.session_state["rrsl"] = float(sl_p["sl_points"])
+    if sl_type == "Step Trail SL (N pts lock K pts)":
+        if "step_n" in sl_p: st.session_state["sn"] = float(sl_p["step_n"])
+        if "step_k" in sl_p: st.session_state["sk"] = float(sl_p["step_k"])
+    if sl_type == "Drawdown Recovery Exit (loss+recovery%)":
+        if "sl_points"    in sl_p: st.session_state["drl"] = float(sl_p["sl_points"])
+        if "recovery_pct" in sl_p: st.session_state["drp"] = float(sl_p["recovery_pct"])
 
-    # ── Target ──────────────────────────────────────────────────
+    # Target type + params
     if tgt_type in TARGET_TYPES: st.session_state["tgt_type"] = tgt_type
-    if "rr_ratio"          in tgt_p: st.session_state["rr"]  = float(tgt_p["rr_ratio"])
-    if "target_atr_mult"   in tgt_p: st.session_state["tam"] = float(tgt_p["target_atr_mult"])
-    if "target_points"     in tgt_p: st.session_state["tgtp"]= float(tgt_p["target_points"])
+    if tgt_type == "Custom Points"                              and "target_points"   in tgt_p: st.session_state["tgtp"] = float(tgt_p["target_points"])
+    if tgt_type == "ATR Based Target"                          and "target_atr_mult" in tgt_p: st.session_state["tam"]  = float(tgt_p["target_atr_mult"])
+    if tgt_type == "Risk Reward (min 1:2)"                     and "rr_ratio"        in tgt_p: st.session_state["rr"]   = float(tgt_p["rr_ratio"])
+    if tgt_type == "Profit Erosion Exit (peak-erosion%)":
+        if "peak_profit_pts" in tgt_p: st.session_state["pep"]  = float(tgt_p["peak_profit_pts"])
+        if "erosion_pct"     in tgt_p: st.session_state["erop"] = float(tgt_p["erosion_pct"])
 
-    # ── Filters ─────────────────────────────────────────────────
-    _fmap = {
-        "adx_enabled":"adx_en","rsi_cf_enabled":"rsi_cf","ema20_enabled":"ema20_en",
-        "sma20_enabled":"sma20_en","bb_cf_enabled":"bb_cf","st_enabled":"st_en",
-        "macd_enabled":"macd_en","sr_cf_enabled":"sr_cf","vol_cf_enabled":"vol_cf",
-    }
-    for fk,sk in _fmap.items():
-        st.session_state[sk] = conf.get(fk, False)
+    # Filters
+    _fmap = {"adx_enabled":"adx_en","rsi_cf_enabled":"rsi_cf","ema20_enabled":"ema20_en",
+             "sma20_enabled":"sma20_en","bb_cf_enabled":"bb_cf","st_enabled":"st_en",
+             "macd_enabled":"macd_en","sr_cf_enabled":"sr_cf","vol_cf_enabled":"vol_cf"}
+    for fk,sk in _fmap.items(): st.session_state[sk] = conf.get(fk, False)
     if conf.get("adx_enabled"):
         st.session_state["adxmn"] = float(conf.get("adx_min", 20.))
         st.session_state["adxmx"] = float(conf.get("adx_max", 100.))
@@ -2285,7 +2327,7 @@ def _apply_opt_to_sidebar(row):
         st.session_state["rsmin"] = float(conf.get("rsi_short_min", 30.))
         st.session_state["rsmax"] = float(conf.get("rsi_short_max", 70.))
 
-    # Force data reload with new params
+    # Reset cache so new params load fresh data
     st.session_state["last_data_key"]  = ""
     st.session_state["last_strat_key"] = ""
     st.session_state["backtest_results"] = None
@@ -2579,6 +2621,7 @@ def main():
         <div style='background:#1c2128;color:#58a6ff;padding:2px 9px;border-radius:20px;font-size:.66rem'>Auto-load on change</div>
       </div></div>""",unsafe_allow_html=True)
 
+    _flush_opt_pending()   # apply optimizer params before widgets render
     cfg=sidebar(); recommendations()
 
     # Auto-load data when instrument/TF changes (no button needed)
