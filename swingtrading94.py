@@ -1237,12 +1237,19 @@ def tab_backtest(cfg):
         bc=int((sigs==1).sum()); sc=int((sigs==-1).sum())
         entry_note="Immediate (signal close)" if cfg["strat"] in IMMEDIATE_ENTRY else "Standard (next candle open)"
         active_cf=sum(1 for k,v in cfg["conf"].items() if k.endswith("_enabled") and v)
-        st.markdown(f"""<div style='background:#161b22;border:1px solid #30363d;border-radius:6px;padding:8px 12px;font-size:.81rem;display:flex;gap:12px;align-items:center'>
-          <span style='color:#8b949e'>{len(df):,} candles</span><span style='color:#3fb950'>▲{bc} BUY</span><span style='color:#f85149'>▼{sc} SELL</span>
-          <span style='color:#8b949e'>| {cfg["strat"][:24]}</span>
-          {('<span style="color:#58a6ff">· '+str(active_cf)+' filters ON</span>') if active_cf else ''}
-          <span style='color:#58a6ff;font-size:.73rem'>· {entry_note}</span>
-        </div>""",unsafe_allow_html=True)
+        _cf_span = f'<span style="color:#58a6ff">· {active_cf} filters ON</span>' if active_cf else ''
+        _info_html = (
+            f"<div style='background:#161b22;border:1px solid #30363d;border-radius:6px;"
+            f"padding:8px 12px;font-size:.81rem;display:flex;flex-wrap:wrap;gap:10px;align-items:center'>"
+            f"<span style='color:#8b949e'>{len(df):,} candles</span>"
+            f"<span style='color:#3fb950'>▲{bc} BUY</span>"
+            f"<span style='color:#f85149'>▼{sc} SELL</span>"
+            f"<span style='color:#8b949e'>| {cfg['strat'][:24]}</span>"
+            f"{_cf_span}"
+            f"<span style='color:#58a6ff;font-size:.73rem'>· {entry_note}</span>"
+            f"</div>"
+        )
+        st.markdown(_info_html, unsafe_allow_html=True)
     if run_bt:
         with st.spinner("Backtesting…"):
             bt=run_backtest(df,sigs,cfg["sl_type"],cfg["sl_p"],cfg["tgt_type"],cfg["tgt_p"],cfg["qty"],cfg["strat"],cfg["conf"])
@@ -2200,43 +2207,63 @@ _OPT_TF_COMBOS = [
     ("1h","7d"),("1h","1mo"),("1h","3mo"),
     ("1d","1mo"),("1d","6mo"),("1d","1y"),("1d","2y"),
 ]
+# SL options — fixed-point types use _atr_mult keys so they scale with instrument.
+# E.g. Nifty ATR≈80, BTC ATR≈1500: "step_n"=1.0×ATR gives 80 or 1500 appropriately.
+# Types excluded from opt: "EMA Reverse Crossover","Strategy Signal Exit"
+# (need next signal — backtest can't simulate correctly).
 _OPT_SL = [
+    # ── ATR-based (auto-scale, best for optimization) ─────────
+    ("ATR Based SL",                         {"sl_atr_mult":0.8}),
     ("ATR Based SL",                         {"sl_atr_mult":1.0}),
     ("ATR Based SL",                         {"sl_atr_mult":1.5}),
     ("ATR Based SL",                         {"sl_atr_mult":2.0}),
     ("ATR Based SL",                         {"sl_atr_mult":2.5}),
+    # ── Candle-based trail (uses OHLC Low/High — valid in backtest) ─
     ("Trail SL",                             {}),
     ("Trail – Current Candle Low/High",      {}),
     ("Trail – Previous Candle Low/High",     {}),
     ("Trail – Current Swing High/Low",       {}),
     ("Trail – Previous Swing High/Low",      {}),
+    # ── Autopilot (ATR-derived internally) ───────────────────
     ("🤖 Autopilot SL",                      {"vol_scale":0.8}),
     ("🤖 Autopilot SL",                      {"vol_scale":1.0}),
     ("🤖 Autopilot SL",                      {"vol_scale":1.5}),
-    ("Risk Reward (min 1:2)",                {"sl_points":10.}),
-    ("Step Trail SL (N pts lock K pts)",     {"step_n":10.,"step_k":5.}),
-    ("Step Trail SL (N pts lock K pts)",     {"step_n":15.,"step_k":8.}),
-    ("Step Trail SL (N pts lock K pts)",     {"step_n":20.,"step_k":10.}),
-    ("Drawdown Recovery Exit (loss+recovery%)",{"sl_points":10.,"recovery_pct":40.}),
-    ("Drawdown Recovery Exit (loss+recovery%)",{"sl_points":15.,"recovery_pct":35.}),
+    # ── Step Trail — uses _atr_n/_atr_k multipliers, scaled per ticker ─
+    ("Step Trail SL (N pts lock K pts)",     {"_atr_n":1.0,"_atr_k":0.5}),   # N=1×ATR, K=0.5×ATR
+    ("Step Trail SL (N pts lock K pts)",     {"_atr_n":1.5,"_atr_k":0.7}),
+    ("Step Trail SL (N pts lock K pts)",     {"_atr_n":2.0,"_atr_k":1.0}),
+    # ── Drawdown Recovery — uses _atr_pts multiplier ──────────
+    ("Drawdown Recovery Exit (loss+recovery%)",{"_atr_pts":1.5,"recovery_pct":40.}),
+    ("Drawdown Recovery Exit (loss+recovery%)",{"_atr_pts":2.0,"recovery_pct":35.}),
+    ("Drawdown Recovery Exit (loss+recovery%)",{"_atr_pts":1.0,"recovery_pct":50.}),
+    # ── Risk Reward — uses _atr_pts for risk size ─────────────
+    ("Risk Reward (min 1:2)",                {"_atr_pts":1.0}),
+    ("Risk Reward (min 1:2)",                {"_atr_pts":1.5}),
 ]
+# Target options — Profit Erosion uses _atr_peak so it scales per ticker.
+# "Strategy Signal Exit"/"EMA Reverse Crossover" excluded (need live strategy signals).
+# "Trail Target (display only)" excluded (never exits — misleads backtest).
 _OPT_TGT = [
+    # ── Risk Reward (most robust in backtest) ─────────────────
     ("Risk Reward (min 1:2)",                    {"rr_ratio":2.0}),
     ("Risk Reward (min 1:2)",                    {"rr_ratio":2.5}),
     ("Risk Reward (min 1:2)",                    {"rr_ratio":3.0}),
     ("Risk Reward (min 1:2)",                    {"rr_ratio":4.0}),
+    # ── ATR Target ────────────────────────────────────────────
     ("ATR Based Target",                         {"target_atr_mult":2.0}),
     ("ATR Based Target",                         {"target_atr_mult":3.0}),
     ("ATR Based Target",                         {"target_atr_mult":4.0}),
+    # ── Autopilot (Fibonacci 2.618×risk) ──────────────────────
     ("🤖 Autopilot Target",                      {}),
+    # ── Candle trail (OHLC-valid in backtest) ─────────────────
     ("Trail – Current Candle Low/High",          {}),
     ("Trail – Previous Candle Low/High",         {}),
     ("Trail – Current Swing High/Low",           {}),
     ("Trail – Previous Swing High/Low",          {}),
-    ("Strategy Signal Exit",                     {}),
-    ("Profit Erosion Exit (peak-erosion%)",      {"peak_profit_pts":20.,"erosion_pct":40.}),
-    ("Profit Erosion Exit (peak-erosion%)",      {"peak_profit_pts":30.,"erosion_pct":30.}),
-    ("Profit Erosion Exit (peak-erosion%)",      {"peak_profit_pts":40.,"erosion_pct":35.}),
+    # ── Profit Erosion — _atr_peak scales with instrument ─────
+    ("Profit Erosion Exit (peak-erosion%)",      {"_atr_peak":3.0,"erosion_pct":40.}),
+    ("Profit Erosion Exit (peak-erosion%)",      {"_atr_peak":4.0,"erosion_pct":30.}),
+    ("Profit Erosion Exit (peak-erosion%)",      {"_atr_peak":5.0,"erosion_pct":35.}),
 ]
 _OPT_FILTERS = [
     {},
@@ -2360,6 +2387,15 @@ def tab_optimization(cfg):
         Direction: <b style='color:#58a6ff'>{cfg.get("direction","Both (Long & Short)")}</b>
       </div></div>""", unsafe_allow_html=True)
 
+    st.markdown("""<div class='warn-box' style='margin:6px 0'>
+      ⚠️ <b>Backtest reliability notes:</b><br>
+      · All <b>SL/Target point sizes auto-scale to the instrument's ATR</b>
+        — Nifty ATR≈80pts gets different absolute values than BTC ATR≈1500pts.<br>
+      · Trailing SL types (Candle/Swing) are simulated <b>candle-by-candle using OHLC High/Low</b> —
+        valid for 15m+ charts; less accurate on 1m/5m where intra-candle swings matter.<br>
+      · <b>"Strategy Signal Exit"</b> and <b>"EMA Reverse Crossover"</b> are excluded
+        (they need a live next signal — can't be reliably backtested).
+    </div>""", unsafe_allow_html=True)
     run_opt = st.button("🚀 Run Optimization", type="primary", key="run_opt",
                          use_container_width=False)
 
@@ -2396,11 +2432,24 @@ def tab_optimization(cfg):
                 df = data_cache[dk]
                 if df is None or df.empty or len(df) < 40: continue
 
+                # ── Scale fixed-point params to ATR of this instrument/TF ──
+                # This ensures 10pts for Nifty ≠ 10pts for BTC — both scale correctly.
+                _atr_now = float(_atr(df).dropna().iloc[-20:].mean()) if len(df) >= 20 else 10.
+                actual_sl_p = dict(sl_p)
+                if "_atr_n" in actual_sl_p:
+                    actual_sl_p["step_n"] = round(_atr_now * actual_sl_p.pop("_atr_n"), 4)
+                    actual_sl_p["step_k"] = round(_atr_now * actual_sl_p.pop("_atr_k"), 4)
+                if "_atr_pts" in actual_sl_p:
+                    actual_sl_p["sl_points"] = round(_atr_now * actual_sl_p.pop("_atr_pts"), 4)
+                actual_tgt_p = dict(tgt_p)
+                if "_atr_peak" in actual_tgt_p:
+                    actual_tgt_p["peak_profit_pts"] = round(_atr_now * actual_tgt_p.pop("_atr_peak"), 4)
+
                 sig, _inds = run_strategy(df, cfg["strat"], cfg["sp"], conf,
                                           cfg.get("direction","Both (Long & Short)"))
                 if (sig != 0).sum() < 3: continue
 
-                bt = run_backtest(df, sig, sl_type, sl_p, tgt_type, tgt_p, 1,
+                bt = run_backtest(df, sig, sl_type, actual_sl_p, tgt_type, actual_tgt_p, 1,
                                   cfg["strat"], conf)
                 if bt.empty or len(bt) < int(min_trades): continue
 
@@ -2422,10 +2471,11 @@ def tab_optimization(cfg):
                     "Trades":       s["total"],
                     "Drawdown":     round(s["dd"],0),
                     "Expectancy":   round(s.get("exp",0),2),
-                    # Hidden cols for apply
-                    "_sl_p":        sl_p,
-                    "_tgt_p":       tgt_p,
+                    # Hidden cols for apply — use ATR-scaled actual params
+                    "_sl_p":        actual_sl_p,
+                    "_tgt_p":       actual_tgt_p,
                     "_conf":        conf,
+                    "_atr_used":    round(_atr_now, 4),
                 })
             except Exception: continue
 
