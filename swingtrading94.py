@@ -2403,28 +2403,15 @@ def tab_optimization(cfg):
       · <b>"Strategy Signal Exit"</b> and <b>"EMA Reverse Crossover"</b> are excluded
         (they need a live next signal — can't be reliably backtested).
     </div>""", unsafe_allow_html=True)
-    _rb1, _rb2, _rb3 = st.columns([1, 1, 2])
-    with _rb1:
-        run_opt = st.button("🚀 Run Selected Strategy", type="primary",
-                             key="run_opt", use_container_width=True)
-    with _rb2:
-        run_all = st.button("🌐 Run ALL Strategies", type="secondary",
-                             key="run_all_opt", use_container_width=True,
-                             help="Tests every strategy separately and shows one results table per strategy")
-    with _rb3:
-        st.markdown("""<div style='padding:6px 10px;background:#161b22;border:1px solid #30363d;
-            border-radius:6px;font-size:.78rem;color:#8b949e'>
-          <b style='color:#58a6ff'>🚀 Selected Strategy</b> — fast, tests only the chosen strategy<br>
-          <b style='color:#3fb950'>🌐 ALL Strategies</b> — runs each strategy separately, one table each
-        </div>""", unsafe_allow_html=True)
+    run_opt = st.button("🚀 Run Optimization", type="primary", key="run_opt",
+                         use_container_width=False)
 
-    _run_all_mode = st.session_state.get("run_all_opt", False) or locals().get("run_all", False)
-    if run_opt or run_all:
+    if run_opt:
         import random; random.seed(int(seed))
         tf_pool = [(iv,pd) for iv,pd in _OPT_TF_COMBOS if iv in (opt_tfs or ["15m","1h"])]
         if not tf_pool: st.error("Select at least one timeframe."); return
         dir_pool = opt_dirs if opt_dirs else ["Both (Long & Short)"]
-        _all_strats_mode = run_all  # True when "Run ALL Strategies" clicked
+        _all_strats_mode = st.session_state.get("opt_all_strats", False)
         _strats_to_run = ([s for s in STRATEGIES
                            if s not in IMMEDIATE_ENTRY and "Hybrid" not in s]
                           if _all_strats_mode else [cfg["strat"]])
@@ -2440,7 +2427,7 @@ def tab_optimization(cfg):
             results = []; tested = set(); trial = 0
             max_combos = (len(tf_pool)*len(_OPT_SL)*len(_OPT_TGT)
                           *len(_OPT_FILTERS)*len(dir_pool))
-            while trial < _nt and trial < max_combos:
+            while trial < int(n_trials) and trial < max_combos:
                 tf, period      = random.choice(tf_pool)
                 sl_type, sl_p   = random.choice(_OPT_SL)
                 tgt_type, tgt_p = random.choice(_OPT_TGT)
@@ -2450,7 +2437,7 @@ def tab_optimization(cfg):
                 if key in tested: continue
                 tested.add(key); trial += 1
                 if not _all_strats_mode:
-                    prog.progress(trial/max(_nt,1),
+                    prog.progress(trial/int(n_trials),
                                   f"Trial {trial}/{int(n_trials)}  [{tf}/{period}]")
                 try:
                     dk = f"{cfg['tsym']}|{tf}|{period}"
@@ -2521,8 +2508,7 @@ def tab_optimization(cfg):
         st.session_state["opt_best"]              = df_opt.iloc[0].to_dict()
         st.session_state["opt_all_strat_results"] = _all_strat_results
         _nb = len(_all_strat_results); _nc = len(df_opt)
-        _mode_label = "ALL strategies" if _all_strats_mode else f"'{cfg['strat']}'"
-        st.success(f"✅ Tested {_mode_label} — {_nc} combinations across {_nb} strategy(s). "
+        st.success(f"✅ {_nc} combinations across {_nb} strategy(s). "
                    f"Best score {df_opt['Score'].iloc[0]:.4f} | "
                    f"WR {df_opt['Win Rate'].iloc[0]} | PF {df_opt['PF'].iloc[0]}")
 
@@ -2591,7 +2577,7 @@ def tab_optimization(cfg):
 
     # ── Per-strategy tables (when all-strats mode was used) ─────────
     _all_sr = st.session_state.get("opt_all_strat_results")
-    if _all_sr and len(_all_sr) >= 1:
+    if _all_sr and len(_all_sr) > 1:
         st.markdown(f"#### 📋 Optimized Results per Strategy ({len(_all_sr)} strategies tested)")
         _disp = ["Score","Direction","Interval","Period","SL Type","Target","Filters","Win Rate","PF","Net P&L","Trades"]
         _sorted_strats = sorted(_all_sr.items(), key=lambda x: x[1]["Score"].iloc[0], reverse=True)
