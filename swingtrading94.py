@@ -1106,6 +1106,7 @@ def auto_trade_fragment(cfg,conf):
     if pos is not None and ltp>0:
         d=pos["direction"]; cur_pnl=(ltp-pos["entry_price"])*d; exited=False
         pos["mae"]=min(pos.get("mae",0.),cur_pnl); pos["mfe"]=max(pos.get("mfe",0.),cur_pnl)
+        _entry_age=(now_ist()-pos["entry_dt"]).total_seconds()  # seconds since entry (grace period gate)
 
         # Max duration losing trade
         if not exited and conf.get("max_duration_enabled") and cur_pnl<0:
