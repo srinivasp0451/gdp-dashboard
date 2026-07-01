@@ -758,19 +758,22 @@ def calc_sl(df,entry,direction,sl_type,p,idx):
         pts=p.get("sl_points",10.); return entry-pts if direction==1 else entry+pts
     elif sl_type in("Trail SL","Trail – Current Candle Low/High"):
         i=min(idx,len(df)-1)
-        return float(df["Low"].iloc[i]) if direction==1 else float(df["High"].iloc[i])
+        sl_raw=float(df["Low"].iloc[i]) if direction==1 else float(df["High"].iloc[i])
+        return _validate_sl_direction(sl_raw, entry, direction, df, idx)
     elif sl_type=="Trail – Previous Candle Low/High":
         i=max(0,idx-1)
-        return float(df["Low"].iloc[i]) if direction==1 else float(df["High"].iloc[i])
+        sl_raw=float(df["Low"].iloc[i]) if direction==1 else float(df["High"].iloc[i])
+        return _validate_sl_direction(sl_raw, entry, direction, df, idx)
     elif "Swing" in sl_type:
         ph,pl=_pivots(df); offset=1 if "Previous" in sl_type else 0
+        sl_raw = entry*(.99 if direction==1 else 1.01)
         if direction==1:
             lows=df["Low"][pl].dropna(); lows=lows[lows.index<=df.index[min(idx,len(df)-1)]]
-            if len(lows)>offset: return float(lows.iloc[-(1+offset)])
+            if len(lows)>offset: sl_raw = float(lows.iloc[-(1+offset)])
         else:
             highs=df["High"][ph].dropna(); highs=highs[highs.index<=df.index[min(idx,len(df)-1)]]
-            if len(highs)>offset: return float(highs.iloc[-(1+offset)])
-        return entry*(.99 if direction==1 else 1.01)
+            if len(highs)>offset: sl_raw = float(highs.iloc[-(1+offset)])
+        return _validate_sl_direction(sl_raw, entry, direction, df, idx)
     elif sl_type=="ATR Based SL":
         m=p.get("sl_atr_mult",1.5); return entry-m*a_val if direction==1 else entry+m*a_val
     elif sl_type=="Risk Reward (min 1:2)":
@@ -784,7 +787,24 @@ def calc_sl(df,entry,direction,sl_type,p,idx):
         return (entry-N+K) if direction==1 else (entry+N-K)
     elif sl_type in("Drawdown Recovery Exit (loss+recovery%)","Strategy Signal Exit","EMA Reverse Crossover"):
         pts=p.get("sl_points",10.); return entry-pts if direction==1 else entry+pts
-    return entry*(.99 if direction==1 else 1.01)
+    sl_raw = entry*(.99 if direction==1 else 1.01)
+    return _validate_sl_direction(sl_raw, entry, direction, df, idx)
+
+def _validate_sl_direction(sl, entry, direction, df, idx):
+    """Critical: ensure SL is ALWAYS on the loss side.
+    LONG SL must be < entry (stops loss when price falls).
+    SHORT SL must be > entry (stops loss when price rises).
+    If swing/candle SL lands on the wrong side (profit territory),
+    fall back to 1.5×ATR which is always correctly directional."""
+    if sl is None: return sl
+    a_val = float(_atr(df).iloc[min(idx, len(df)-1)])
+    if direction == 1 and sl >= entry:
+        # LONG SL is ABOVE entry — wrong direction, use ATR fallback
+        return entry - max(a_val * 1.5, entry * 0.005)
+    if direction == -1 and sl <= entry:
+        # SHORT SL is BELOW entry — wrong direction, use ATR fallback
+        return entry + max(a_val * 1.5, entry * 0.005)
+    return sl
 
 def calc_target(entry,sl,direction,tgt_type,p,atr_val=0.):
     risk=abs(entry-sl) if sl else (atr_val or entry*.01)
@@ -799,7 +819,12 @@ def calc_target(entry,sl,direction,tgt_type,p,atr_val=0.):
         rr=max(p.get("rr_ratio",2.),2.); return entry+rr*risk if direction==1 else entry-rr*risk
     elif tgt_type=="🤖 Autopilot Target": return entry+risk*2.618 if direction==1 else entry-risk*2.618
     elif tgt_type in("EMA Reverse Crossover","Strategy Signal Exit","Profit Erosion Exit (peak-erosion%)"): return None
-    return entry+risk*2 if direction==1 else entry-risk*2
+    tgt_raw = entry+risk*2 if direction==1 else entry-risk*2
+    # Validate target is on profit side
+    if tgt_raw is not None:
+        if direction==1 and tgt_raw <= entry: tgt_raw = entry + risk*2
+        if direction==-1 and tgt_raw >= entry: tgt_raw = entry - risk*2
+    return tgt_raw
 
 def update_trail_sl(cur_sl,candle,direction,sl_type):
     if "Current Candle" in sl_type or sl_type=="Trail SL":
@@ -841,6 +866,8 @@ def exit_position(exit_price,exit_reason,cfg):
         "Initial SL":round(pos["sl"],2),
         "Target":round(pos["target"],2) if pos.get("target") else "—",
         "Qty":pos["qty"],"P&L (pts)":round(pnl_pts,2),"P&L (₹)":round(pnl_pts*pos["qty"],2),
+        "Max Adverse (pts)":round(pos.get("mae",0),2),
+        "Max Favour (pts)":round(pos.get("mfe",0),2),
         "Result":"WIN" if pnl_pts>0 else "LOSS","Exit Reason":exit_reason,
         "Duration":str(now_ist()-pos["entry_dt"]),
     })
@@ -1093,14 +1120,16 @@ def auto_trade_fragment(cfg,conf):
     </div>""", unsafe_allow_html=True)
 
     pos=st.session_state.live_position
-    # Cooldown: prevent rapid re-entry after exit (30-second minimum between trades)
+    # Configurable cooldown — prevents rapid re-entry after exit
     _last_exit_t = st.session_state.get("last_exit_time")
-    _cooldown_secs = 30
-    _in_cooldown = (_last_exit_t is not None and
+    _cd_enabled  = conf.get("cooldown_enabled", False)
+    _cooldown_secs = int(conf.get("cooldown_secs", 1)) if _cd_enabled else 0
+    _in_cooldown = (_cd_enabled and _last_exit_t is not None and
                     (now_ist()-_last_exit_t).total_seconds() < _cooldown_secs)
     if _in_cooldown:
         _rem = int(_cooldown_secs - (now_ist()-_last_exit_t).total_seconds())
-        st.markdown(f"<div class='swait' style='padding:5px;font-size:.79rem'>⏳ Cooldown: {_rem}s before next trade (prevents rapid accumulation)</div>",unsafe_allow_html=True)
+        st.markdown(f"<div class='swait' style='padding:5px;font-size:.79rem'>"
+                    f"⏳ Cooldown: {_rem}s remaining before next entry</div>",unsafe_allow_html=True)
     if pos is None and strat not in MANUAL_ONLY and not _in_cooldown:
         if last_sig!=0 and cur_candle!=st.session_state.last_signal_candle:
             pos_new=enter_position(last_sig,cfg,df)
@@ -1407,6 +1436,13 @@ def sidebar():
             if conf["daily_trades_enabled"]:
                 conf["daily_trades_max"]=st.number_input("Max trades/day",5,100,10,step=1,key="dtm")
                 st.caption(f"Max {conf.get('daily_trades_max',10)} trades per day.")
+            st.divider()
+            conf["cooldown_enabled"]=st.checkbox("Trade Entry Cooldown",value=False,key="cd_en",
+                help="Prevents new entry for N seconds after any exit. Stops rapid trade accumulation.")
+            if conf["cooldown_enabled"]:
+                conf["cooldown_secs"]=st.number_input("Cooldown seconds",1,10000,1,step=1,key="cd_secs")
+                st.caption(f"After each exit, waits {conf.get('cooldown_secs',1)}s before next entry. "
+                           f"Blocks same-candle re-entry even when disabled.")
 
         st.divider()
         st.divider()
