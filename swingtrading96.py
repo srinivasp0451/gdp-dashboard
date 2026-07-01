@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-NSE Intraday Rally Screener
-============================
+NSE Intraday Rally Screener -- single-file Streamlit app
+==========================================================
 Scans a universe of liquid NSE stocks at/near market open and returns the
 SINGLE best long (bullish) intraday candidate, ranked by a composite score
 of momentum, relative volume, trend, relative strength vs Nifty, and
@@ -13,8 +13,19 @@ rolled with pandas/numpy so you can see and tweak every formula.
 
 HOW TO RUN
 ----------
-    pip install yfinance pandas numpy requests
-    python nse_intraday_screener.py
+Local:
+    pip install -r requirements.txt
+    streamlit run app_single_file.py
+
+Streamlit Cloud:
+    Push this file + requirements.txt to a repo, set the main file path
+    to this file's name, deploy.
+
+Note: this is a Streamlit app now, not a plain CLI script -- it must be
+launched with `streamlit run`, not `python app_single_file.py`. If you
+also want a terminal/cron-friendly version (prints to console, no
+browser needed), ask for the two-file version back and keep this one
+for the browser.
 
 Best run between 9:20 AM and 9:45 AM IST (after the opening 5-10 minutes
 of noise settle, before the move you want to catch is over).
@@ -27,8 +38,8 @@ IMPORTANT / HONEST DISCLAIMER
   delayed or occasionally miss NSE bars intraday. For live/production
   trading, wire this into a broker feed (Zerodha Kite Connect, Upstox,
   Angel One SmartAPI, etc.) instead of yfinance -- swap out the
-  `fetch_daily_batch` / `fetch_intraday` functions only, the scoring
-  logic below stays the same.
+  `run_stage1` / `fetch_intraday_one` functions only, the scoring logic
+  below stays the same.
 - Past price behaviour (momentum, volume, breakout proximity) is
   correlative, not predictive. A high score means "this fits the profile
   of setups that have historically had a good chance of continuing" --
@@ -488,101 +499,165 @@ def score_candidates(candidates: dict) -> pd.DataFrame:
 
 
 # ============================================================================
-# REPORTING
+# STREAMLIT UI (single-file build: run with  streamlit run app.py)
 # ============================================================================
 
-def print_report(ranked: pd.DataFrame, run_time: dt.datetime):
-    print("\n" + "=" * 72)
-    print(f"  NSE INTRADAY RALLY SCREENER -- {run_time:%Y-%m-%d %H:%M} IST")
-    print("=" * 72)
+import streamlit as st
 
-    if ranked.empty:
-        print("\nNo stock cleared all filters today (liquidity, trend, and "
-              f"minimum {MIN_RR}:1 risk-reward). That's a valid outcome --  "
-              "no trade is better than a forced, bad-R:R trade. Try again "
-              "closer to 9:30-9:45 once the open settles.")
-        print("=" * 72)
-        return
+st.set_page_config(page_title="NSE Intraday Rally Screener", page_icon="📈",
+                    layout="wide")
 
-    top = ranked.iloc[0]
-    print(f"\n>>> TODAY'S PICK: {top['ticker'].replace('.NS','')}  "
-          f"(score {top['composite_score']:.1f}/100)\n")
-    print(f"  Current price      : Rs. {top['price']:.2f}")
-    print(f"  Gap from prev close: {top['gap_pct']:+.2f}%")
-    print(f"  Move since open    : {top['intraday_change_pct']:+.2f}%")
-    print(f"  Relative volume    : {top['rel_volume']:.2f}x expected-for-time-of-day")
-    print(f"  Trend (EMA20>EMA50): {'Yes' if top['trend_ok'] else 'No'}")
-    print(f"  Above VWAP today   : {'Yes' if top['above_vwap'] else 'No'}")
-    print(f"  Opening-range break: {'Yes' if top['orb_breakout'] else 'No'}")
-    print(f"  Rel. strength vs Nifty (5d): {top['rel_strength_5d']:+.2f}%")
-    print()
-    print(f"  --- TRADE PLAN ---")
-    print(f"  Entry (~market)    : Rs. {top['entry']:.2f}")
-    print(f"  Stop loss          : Rs. {top['stop']:.2f}  "
-          f"({(top['stop']/top['entry']-1)*100:+.2f}%)")
-    print(f"  Target             : Rs. {top['target']:.2f}  "
-          f"({(top['target']/top['entry']-1)*100:+.2f}%)")
-    print(f"  Risk:Reward        : 1 : {top['rr']:.2f}")
-    print()
-    print("  WHY THIS ONE: it ranks at the top of the scan on a blend of "
-          "relative volume, gap/early momentum, uptrend + VWAP position, "
-          "relative strength vs the Nifty, and proximity to a breakout "
-          "level -- and it's the highest-scoring setup that still clears "
-          f"the {MIN_RR}:1 minimum risk-reward bar.")
+st.title("📈 NSE Intraday Rally Screener")
+st.caption(
+    "Scans a liquid NSE universe and returns the single best long setup "
+    "by composite score, filtered to a minimum risk:reward. "
+    "**Research tool, not investment advice.**"
+)
 
-    print("\n" + "-" * 72)
-    print(f"  Full ranked shortlist (top {min(10, len(ranked))} of "
-          f"{len(ranked)} that passed all filters):")
-    print("-" * 72)
-    show = ranked.head(10)[["ticker", "composite_score", "gap_pct", "rel_volume",
-                             "rr", "entry", "stop", "target"]].copy()
-    show["ticker"] = show["ticker"].str.replace(".NS", "", regex=False)
-    show.columns = ["Ticker", "Score", "Gap%", "RelVol", "R:R", "Entry", "Stop", "Target"]
-    with pd.option_context("display.float_format", lambda v: f"{v:.2f}"):
-        print(show.to_string(index=False))
+# ----------------------------------------------------------------------------
+# Sidebar controls
+# ----------------------------------------------------------------------------
+with st.sidebar:
+    st.header("Settings")
+    min_rr = st.slider("Minimum Risk:Reward to accept", 1.0, 3.0,
+                        float(MIN_RR), 0.1)
+    min_price = st.number_input("Minimum price (Rs.)", value=float(MIN_PRICE),
+                                 step=5.0)
+    min_turnover = st.number_input("Minimum avg daily turnover (Rs. crore)",
+                                    value=float(MIN_AVG_TURNOVER_CR), step=1.0)
+    shortlist_size = st.slider("Stage-2 shortlist size", 5, 40,
+                                SHORTLIST_SIZE, 1)
+    st.markdown("---")
+    st.caption(
+        "Best run between 9:20-9:45 AM IST, after the opening 5-10 minutes "
+        "of noise settle."
+    )
+    run_clicked = st.button("🔍 Run Screener Now", type="primary",
+                             use_container_width=True)
 
-    print("\n" + "=" * 72)
-    print("  DISCLAIMER: Research tool output, not investment advice. "
-          "Data via Yahoo Finance (yfinance) can be delayed intraday -- "
-          "confirm price/volume on your broker terminal before executing. "
-          "Always honor the stop-loss. Size the position so a stop-out "
-          "costs you an amount you're fully comfortable losing.")
-    print("=" * 72 + "\n")
+# Push sidebar overrides into the module-level config the core logic reads
+MIN_RR = min_rr
+MIN_PRICE = min_price
+MIN_AVG_TURNOVER_CR = min_turnover
+SHORTLIST_SIZE = shortlist_size
 
+if "ranked" not in st.session_state:
+    st.session_state.ranked = None
+    st.session_state.run_time = None
 
-# ============================================================================
-# MAIN
-# ============================================================================
-
-def main():
+# ----------------------------------------------------------------------------
+# Run pipeline
+# ----------------------------------------------------------------------------
+if run_clicked:
     run_time = dt.datetime.now()
+
     if run_time.weekday() >= 5:
-        print("Today is a weekend -- NSE is closed. Run this on a trading day.")
-        return
+        st.warning("Today is a weekend — NSE is closed. This is fine to "
+                   "test with, but live results won't mean much until "
+                   "a trading day.")
 
+    status = st.status("Running screener...", expanded=True)
+
+    status.write("Loading stock universe...")
     universe = get_universe()
+    status.write(f"Universe size: {len(universe)} symbols")
 
-    t0 = time.time()
+    status.write("Stage 1 — batched daily-data scan (liquidity, trend, gap, "
+                 "relative volume, relative strength)...")
     candidates = run_stage1(universe, run_time)
+    status.write(f"{len(candidates)} stocks passed liquidity/price filters.")
+
     if not candidates:
-        print("Stage 1 returned no candidates -- check your internet connection "
-              "or try again in a few minutes (Yahoo Finance can rate-limit).")
-        return
+        status.update(label="No data returned", state="error")
+        st.error(
+            "Stage 1 returned no candidates. This usually means Yahoo "
+            "Finance rate-limited the batch request. Wait a minute and "
+            "click Run again — if it keeps happening, the universe list "
+            "may need trimming."
+        )
+        st.session_state.ranked = None
+    else:
+        shortlist = prescore_and_shortlist(candidates, shortlist_size)
+        status.write(f"Stage 2 — pulling live 5-min intraday bars for "
+                     f"{len(shortlist)} shortlisted stocks...")
+        run_stage2(candidates, shortlist)
 
-    shortlist = prescore_and_shortlist(candidates, SHORTLIST_SIZE)
-    run_stage2(candidates, shortlist)
+        shortlisted = {t: candidates[t] for t in shortlist if t in candidates}
+        ranked = score_candidates(shortlisted)
 
-    shortlisted_candidates = {t: candidates[t] for t in shortlist if t in candidates}
-    ranked = score_candidates(shortlisted_candidates)
+        status.update(label="Done", state="complete")
+        st.session_state.ranked = ranked
+        st.session_state.run_time = run_time
 
-    print_report(ranked, run_time)
-    print(f"[Done in {time.time()-t0:.1f}s]")
+# ----------------------------------------------------------------------------
+# Display results
+# ----------------------------------------------------------------------------
+ranked = st.session_state.ranked
+run_time = st.session_state.run_time
 
-    if not ranked.empty:
-        log_path = f"screener_log_{run_time:%Y%m%d_%H%M}.csv"
-        ranked.to_csv(log_path, index=False)
-        print(f"Full scored shortlist saved to {log_path}")
+if ranked is None:
+    st.info("Click **Run Screener Now** in the sidebar to scan the market.")
+elif ranked.empty:
+    st.warning(
+        f"No stock cleared all filters as of {run_time:%H:%M} IST "
+        f"(liquidity, trend, and minimum {MIN_RR}:1 risk-reward). "
+        "That's a valid outcome — no trade beats a forced, bad-R:R trade. "
+        "Try again closer to 9:30-9:45 once the open settles."
+    )
+else:
+    top = ranked.iloc[0]
+    ticker_clean = top["ticker"].replace(".NS", "")
 
+    st.success(f"### 🏆 Today's Pick: **{ticker_clean}**  "
+               f"(score {top['composite_score']:.1f}/100)")
 
-if __name__ == "__main__":
-    main()
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Entry (~market)", f"₹{top['entry']:.2f}")
+    c2.metric("Stop Loss", f"₹{top['stop']:.2f}",
+              f"{(top['stop']/top['entry']-1)*100:+.2f}%")
+    c3.metric("Target", f"₹{top['target']:.2f}",
+              f"{(top['target']/top['entry']-1)*100:+.2f}%")
+    c4.metric("Risk : Reward", f"1 : {top['rr']:.2f}")
+
+    st.markdown("#### Why this one")
+    st.write(
+        f"- Gap from previous close: **{top['gap_pct']:+.2f}%**\n"
+        f"- Move since open: **{top['intraday_change_pct']:+.2f}%**\n"
+        f"- Relative volume: **{top['rel_volume']:.2f}x** expected for time of day\n"
+        f"- Trend (EMA20 > EMA50): **{'Yes' if top['trend_ok'] else 'No'}**\n"
+        f"- Above VWAP today: **{'Yes' if top['above_vwap'] else 'No'}**\n"
+        f"- Opening-range breakout: **{'Yes' if top['orb_breakout'] else 'No'}**\n"
+        f"- Relative strength vs Nifty (5d): **{top['rel_strength_5d']:+.2f}%**"
+    )
+
+    st.markdown("#### Full ranked shortlist")
+    show = ranked.head(10)[[
+        "ticker", "composite_score", "gap_pct", "rel_volume", "rr",
+        "entry", "stop", "target"
+    ]].copy()
+    show["ticker"] = show["ticker"].str.replace(".NS", "", regex=False)
+    show.columns = ["Ticker", "Score", "Gap %", "Rel. Volume", "R:R",
+                    "Entry", "Stop", "Target"]
+    st.dataframe(show.style.format({
+        "Score": "{:.1f}", "Gap %": "{:+.2f}", "Rel. Volume": "{:.2f}x",
+        "R:R": "{:.2f}", "Entry": "₹{:.2f}", "Stop": "₹{:.2f}",
+        "Target": "₹{:.2f}",
+    }), use_container_width=True, hide_index=True)
+
+    st.download_button(
+        "⬇️ Download full results (CSV)",
+        data=ranked.to_csv(index=False).encode("utf-8"),
+        file_name=f"screener_{run_time:%Y%m%d_%H%M}.csv",
+        mime="text/csv",
+    )
+
+    st.caption(f"Scanned as of {run_time:%Y-%m-%d %H:%M} IST")
+
+st.markdown("---")
+st.caption(
+    "⚠️ **Disclaimer:** Research tool output, not investment advice. "
+    "Data via Yahoo Finance (yfinance) can be delayed intraday — confirm "
+    "price/volume on your broker terminal before executing. Always honor "
+    "the stop-loss. Size the position so a stop-out costs you an amount "
+    "you're fully comfortable losing."
+)
