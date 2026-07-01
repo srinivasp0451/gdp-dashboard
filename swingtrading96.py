@@ -106,8 +106,7 @@ INTRADAY_PERIOD = "1d"
 # getting your IP temporarily blocked. Don't remove the delays just to make
 # this faster -- that's exactly what causes multi-day blocks.
 CHUNK_SIZE = 15                # tickers per batched daily-data request
-DELAY_BETWEEN_CHUNKS_SEC = 2.0
-DELAY_BETWEEN_INTRADAY_CALLS_SEC = 0.6
+DELAY_BETWEEN_REQUESTS_SEC = 0.8   # applied after EVERY actual yfinance call
 MAX_RETRIES = 2
 RETRY_BACKOFF_BASE_SEC = 3.0
 # -----------------------------------------------------------------------------
@@ -158,16 +157,23 @@ def _looks_rate_limited(err: Exception) -> bool:
 
 
 def safe_download(**kwargs):
-    """Wrapper around yf.download with retry/backoff. Raises RateLimited
-    (instead of silently returning empty data) if Yahoo appears to be
-    throttling us, so the caller can stop immediately instead of hammering
-    a block into a longer one."""
+    """Wrapper around yf.download with retry/backoff, PLUS a fixed delay
+    after every successful call (DELAY_BETWEEN_REQUESTS_SEC). This is the
+    single place all Yahoo Finance requests go through, so every call --
+    whether it's a Stage-1 chunk or a Stage-2 single-ticker intraday pull --
+    is automatically throttled without callers needing to remember to
+    sleep themselves.
+
+    Raises RateLimited (instead of silently returning empty data) if Yahoo
+    appears to be throttling us, so the caller can stop immediately instead
+    of hammering a block into a longer one."""
     last_err = None
     for attempt in range(MAX_RETRIES + 1):
         try:
             df = yf.download(**kwargs, progress=False)
             if df is None or df.empty:
                 raise ValueError("empty response")
+            time.sleep(DELAY_BETWEEN_REQUESTS_SEC)
             return df
         except Exception as e:
             last_err = e
@@ -340,8 +346,6 @@ def run_stage1(universe: list, now: dt.datetime):
             )
             print(f"[Stage 1] {warning}")
             break
-        if i < len(chunks) - 1:
-            time.sleep(DELAY_BETWEEN_CHUNKS_SEC)
 
     if not raw_parts:
         return {}, (warning or "Could not fetch any data from Yahoo Finance.")
@@ -506,9 +510,6 @@ def run_stage2(candidates: dict, shortlist: list):
                 c.orb_breakout = bool(last_price > c.opening_range_high)
             except Exception as e:
                 c.rejected_reason = f"intraday calc failed: {e}"
-
-        if i < len(shortlist) - 1:
-            time.sleep(DELAY_BETWEEN_INTRADAY_CALLS_SEC)
 
     return warning
 
