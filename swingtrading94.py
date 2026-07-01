@@ -830,6 +830,10 @@ def exit_position(exit_price,exit_reason,cfg):
     if pos is None: return  # already closed (race condition guard)
     if not isinstance(pos,dict): return
     d=pos["direction"]; pnl_pts=(exit_price-pos["entry_price"])*d
+    # Rename misleading "Stop Loss" when trade is actually profitable
+    # (happens with trailing SL already in profit zone at entry)
+    if pnl_pts > 0 and "Stop Loss" in exit_reason:
+        exit_reason = exit_reason.replace("Stop Loss", "Trail Stop (Profit Locked)")
     st.session_state.live_trades.append({
         "Entry Date":pos["entry_dt"],"Exit Date":now_ist(),
         "Direction":"LONG" if d==1 else "SHORT",
@@ -944,13 +948,15 @@ def run_backtest(df,signals,sl_type,sl_p,tgt_type,tgt_p,qty,strat_name="",conf=N
             if ep is not None:
                 pp=(ep-trade["entry_price"])*d
                 daily_pnl+=pp; daily_count+=1
+                # Fix misleading "Stop Loss" label when SL exits are profitable
+                _er_display = er.replace("Stop Loss","Trail Stop (Profit Locked)") if (pp>0 and "Stop Loss" in er) else er
                 trades.append({"Entry Date":trade["entry_dt"],"Exit Date":df.index[i],
                     "Direction":"LONG" if d==1 else "SHORT",
                     "Entry Price":round(trade["entry_price"],2),"Exit Price":round(ep,2),
                     "Initial SL":round(trade["initial_sl"],2),
                     "Target":round(tgt_now,2) if tgt_now else "—","Qty":qty,
                     "P&L (pts)":round(pp,2),"P&L (₹)":round(pp*qty,2),
-                    "Result":"WIN" if pp>0 else "LOSS","Exit Reason":er,
+                    "Result":"WIN" if pp>0 else "LOSS","Exit Reason":_er_display,
                     "Duration":str(df.index[i]-trade["entry_dt"])})
                 in_trade=False; trade={}
     if in_trade and trade:
@@ -1099,7 +1105,14 @@ def auto_trade_fragment(cfg,conf):
         if last_sig!=0 and cur_candle!=st.session_state.last_signal_candle:
             pos_new=enter_position(last_sig,cfg,df)
             st.session_state.live_position=pos_new; st.session_state.last_signal_candle=cur_candle
-            st.success(f"🤖 AUTO-ENTERED {'🟢LONG' if last_sig==1 else '🔴SHORT'} @ {pos_new['entry_price']:.2f} | SL {pos_new['sl']:.2f}")
+            _ep=pos_new["entry_price"]; _sl=pos_new["sl"]; _d=pos_new["direction"]
+            _sl_profitable = (_d==1 and _sl>_ep) or (_d==-1 and _sl<_ep)
+            _dir_txt = "🟢LONG" if _d==1 else "🔴SHORT"
+            st.success(f"🤖 AUTO-ENTERED {_dir_txt} @ {_ep:.2f} | SL {_sl:.2f}")
+            if _sl_profitable:
+                st.info(f"ℹ️ SL ({_sl:.2f}) is already in profitable territory from entry ({_ep:.2f}). "
+                        f"Trade will exit with profit if price reaches SL. "
+                        f"Exit reason will show 'Trail Stop (Profit Locked)' instead of 'Stop Loss'.")
             pos=st.session_state.live_position
 
     # Auto-exit checks
@@ -1559,6 +1572,19 @@ def tab_history():
     live=st.session_state.live_trades
     if not live: st.info("No live trades yet. Enter trades via Live Trading tab."); return
     df_h=pd.DataFrame(live); s=compute_stats(df_h); pf_txt=f"{s['pf']:.2f}" if s["pf"]!=float("inf") else "∞"
+    # Check for repeated exit prices (swing-level clustering)
+    if "Exit Price" in df_h.columns:
+        _dup_exits = df_h["Exit Price"].value_counts()
+        _dup = _dup_exits[_dup_exits>2]
+        if not _dup.empty:
+            _dup_str = ", ".join(f"{p:.2f} ({n}×)" for p,n in _dup.items())
+            st.markdown(f"""<div class='warn-box' style='margin-bottom:10px'>
+              ℹ️ <b>Repeated exit prices detected:</b> {_dup_str}<br>
+              This is expected when using <b>Trail – Previous Swing High/Low</b> SL — multiple
+              trades exit at the same swing level because that level hasn't moved between entries.
+              Also note: exits labelled <b>Trail Stop (Profit Locked)</b> are SL hits where price
+              already moved in your favour — the "SL" was already in profit territory at entry.
+            </div>""", unsafe_allow_html=True)
     st.markdown("### 📊 Live Portfolio")
     c1,c2,c3,c4=st.columns(4)
     for col,(lbl,val,sub,clr) in zip([c1,c2,c3,c4],[("Live Trades",str(s["total"]),f"W:{s['wins']} L:{s['losses']}","#58a6ff"),("Win Rate",f"{s['acc']:.1f}%","Accuracy","#3fb950" if s["acc"]>=50 else "#f85149"),("Net P&L",f"₹{s['tp']:,.0f}",f"{s['tpts']:+.1f}pts","#3fb950" if s["tp"]>=0 else "#f85149"),("Profit Factor",pf_txt,f"Exp ₹{s['exp']:,.1f}","#3fb950" if s["pf"]>=1.5 else "#f0883e")]):
