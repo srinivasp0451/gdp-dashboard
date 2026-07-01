@@ -1461,29 +1461,59 @@ def tab_backtest(cfg):
             bt=run_backtest(df,sigs,cfg["sl_type"],cfg["sl_p"],cfg["tgt_type"],cfg["tgt_p"],cfg["qty"],cfg["strat"],cfg["conf"])
         st.session_state.backtest_results=bt
     bt_res=st.session_state.backtest_results
-    fig=build_chart(df,sigs,inds,bt_res,title=f"{cfg['tname']} | {cfg['strat']} | {cfg['interval']}/{cfg['period']}")
+
+    # ── RESULTS FIRST — above the chart ─────────────────────────────
+    if bt_res is not None and not bt_res.empty:
+        s=compute_stats(bt_res); pf_txt=f"{s['pf']:.2f}" if s["pf"]!=float("inf") else "∞"
+        st.markdown("### 📊 Backtest Results")
+        cols=st.columns(7)
+        for col,lbl,val,clr in zip(cols,
+            ["Trades","Accuracy","Net P&L","Points","Profit Factor","Drawdown","Expectancy"],
+            [str(s["total"]),f"{s['acc']:.1f}%",f"₹{s['tp']:,.0f}",f"{s['tpts']:+.1f}",
+             pf_txt,f"₹{s['dd']:,.0f}",f"₹{s['exp']:,.1f}"],
+            ["#58a6ff","#3fb950" if s["acc"]>=50 else "#f85149",
+             "#3fb950" if s["tp"]>=0 else "#f85149",
+             "#3fb950" if s["tpts"]>=0 else "#f85149",
+             "#3fb950" if s["pf"]>=1.5 else "#f0883e","#f85149","#58a6ff"]):
+            sub_acc=f"<div class='ms'>W:{s['wins']} L:{s['losses']}</div>" if lbl=="Accuracy" else ""
+            with col:
+                st.markdown(f"<div class='mc' style='border-top:3px solid {clr}'>"
+                            f"<div class='ml'>{lbl}</div>"
+                            f"<div class='mv' style='color:{clr};font-size:.93rem'>{val}</div>"
+                            f"{sub_acc}</div>",unsafe_allow_html=True)
+        ca,cb=st.columns([3,1])
+        with ca: st.plotly_chart(eq_fig(bt_res),use_container_width=True,key="bt_eq")
+        with cb:
+            pie=go.Figure(go.Pie(labels=["Wins","Losses"],values=[s["wins"],s["losses"]],
+                marker_colors=["#3fb950","#f85149"],hole=.55,textinfo="label+percent"))
+            pie.update_layout(template="plotly_dark",paper_bgcolor="#0d1117",height=185,
+                margin=dict(l=0,r=0,t=0,b=0),showlegend=False)
+            st.plotly_chart(pie,use_container_width=True,key="bt_pie")
+            st.markdown(f"<div style='font-size:.77rem;color:#8b949e;line-height:1.8'>"
+                        f"Max Win Streak: <span style='color:#3fb950'>{s['mw']}</span><br>"
+                        f"Max Loss Streak: <span style='color:#f85149'>{s['ml']}</span><br>"
+                        f"Avg Win: <span style='color:#3fb950'>₹{s['aw']:,.0f}</span><br>"
+                        f"Avg Loss: <span style='color:#f85149'>₹{s['al']:,.0f}</span></div>",
+                        unsafe_allow_html=True)
+        st.divider()
+    elif bt_res is not None and bt_res.empty:
+        st.warning("No trades generated — widen period or adjust strategy parameters.")
+    else:
+        st.caption("▶ Click Run Backtest to see results. Chart shows signals on loaded data.")
+
+    # ── CHART — always visible with signal markers ───────────────────
+    fig=build_chart(df,sigs,inds,bt_res,
+        title=f"{cfg['tname']} | {cfg['strat']} | {cfg['interval']}/{cfg['period']}")
     st.plotly_chart(fig,use_container_width=True,key="bt_chart")
-    if bt_res is None: st.caption("Click ▶ Run Backtest to see results."); return
-    if bt_res.empty: st.warning("No trades — widen period or adjust parameters."); return
-    s=compute_stats(bt_res); pf_txt=f"{s['pf']:.2f}" if s["pf"]!=float("inf") else "∞"
-    st.markdown("### 📊 Results")
-    cols=st.columns(7)
-    for col,lbl,val,clr in zip(cols,["Trades","Accuracy","Net P&L","Points","Profit Factor","Drawdown","Expectancy"],
-        [str(s["total"]),f"{s['acc']:.1f}%",f"₹{s['tp']:,.0f}",f"{s['tpts']:+.1f}",pf_txt,f"₹{s['dd']:,.0f}",f"₹{s['exp']:,.1f}"],
-        ["#58a6ff","#3fb950" if s["acc"]>=50 else "#f85149","#3fb950" if s["tp"]>=0 else "#f85149","#3fb950" if s["tpts"]>=0 else "#f85149","#3fb950" if s["pf"]>=1.5 else "#f0883e","#f85149","#58a6ff"]):
-        sub_acc = f"<div class='ms'>W:{s['wins']} L:{s['losses']}</div>" if lbl=='Accuracy' else ''
-        with col: st.markdown(f"<div class='mc' style='border-top:3px solid {clr}'><div class='ml'>{lbl}</div><div class='mv' style='color:{clr};font-size:.93rem'>{val}</div>{sub_acc}</div>",unsafe_allow_html=True)
-    st.markdown("<br>",unsafe_allow_html=True)
-    ca,cb=st.columns([3,1])
-    with ca: st.plotly_chart(eq_fig(bt_res),use_container_width=True,key="bt_eq")
-    with cb:
-        pie=go.Figure(go.Pie(labels=["Wins","Losses"],values=[s["wins"],s["losses"]],marker_colors=["#3fb950","#f85149"],hole=.55,textinfo="label+percent"))
-        pie.update_layout(template="plotly_dark",paper_bgcolor="#0d1117",height=185,margin=dict(l=0,r=0,t=0,b=0),showlegend=False)
-        st.plotly_chart(pie,use_container_width=True,key="bt_pie")
-        st.markdown(f"<div style='font-size:.77rem;color:#8b949e;line-height:1.8'>Max Win Str: <span style='color:#3fb950'>{s['mw']}</span><br>Max Loss Str: <span style='color:#f85149'>{s['ml']}</span><br>Avg Win: <span style='color:#3fb950'>₹{s['aw']:,.0f}</span><br>Avg Loss: <span style='color:#f85149'>₹{s['al']:,.0f}</span></div>",unsafe_allow_html=True)
-    st.markdown("**📋 Trade Log**")
-    st.dataframe(bt_res.style.apply(_hl,axis=1),use_container_width=True,height=280,key="bt_df")
-    st.download_button("📥 Export CSV",bt_res.to_csv(index=False),file_name=f"bt_{now_ist():%Y%m%d_%H%M}_IST.csv",mime="text/csv",key="bt_dl")
+
+    # ── TRADE LOG — below chart ──────────────────────────────────────
+    if bt_res is not None and not bt_res.empty:
+        st.markdown("**📋 Trade Log**")
+        st.dataframe(bt_res.style.apply(_hl,axis=1),
+                     use_container_width=True,height=280,key="bt_df")
+        st.download_button("📥 Export CSV",bt_res.to_csv(index=False),
+            file_name=f"bt_{now_ist():%Y%m%d_%H%M}_IST.csv",
+            mime="text/csv",key="bt_dl")
 
 def tab_live(cfg):
     df=st.session_state.current_data; sigs=st.session_state.signals; pos=st.session_state.live_position
