@@ -55,7 +55,6 @@ import warnings
 import datetime as dt
 from io import StringIO
 from dataclasses import dataclass, field
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import numpy as np
 import pandas as pd
@@ -73,7 +72,8 @@ except ImportError:
 
 INDEX_TICKER = "^NSEI"                 # Nifty 50 index, used for relative strength
 
-NSE_INDEX_CSV_URL = "https://nsearchives.nseindia.com/content/indices/ind_nifty200list.csv"
+NSE_NIFTY50_CSV_URL = "https://nsearchives.nseindia.com/content/indices/ind_nifty50list.csv"
+NSE_NIFTY200_CSV_URL = "https://nsearchives.nseindia.com/content/indices/ind_nifty200list.csv"
 
 # Liquidity / quality filters -- these protect you from garbage setups
 MIN_PRICE = 30.0                       # skip ultra low-price / penny stocks
@@ -82,7 +82,7 @@ MIN_RR = 1.5                           # HARD floor -- reject any setup below th
 
 # How many stocks survive the cheap Stage-1 (daily-data) filter and get the
 # expensive Stage-2 (intraday-data) deep dive
-SHORTLIST_SIZE = 20
+SHORTLIST_SIZE = 10
 
 # Composite score weights (must sum to 1.0)
 WEIGHTS = {
@@ -97,60 +97,122 @@ WEIGHTS = {
 DAILY_PERIOD = "9mo"
 INTRADAY_INTERVAL = "5m"
 INTRADAY_PERIOD = "1d"
-MAX_WORKERS = 8
+
+# ---- RATE-LIMIT SAFETY -----------------------------------------------------
+# yfinance is NOT an official API -- it's Yahoo Finance's internal website
+# endpoint. Yahoo has no published rate limit; it silently blocks an IP that
+# it thinks looks automated (a burst of requests, especially concurrent
+# ones). These settings trade a bit of speed for a much lower chance of
+# getting your IP temporarily blocked. Don't remove the delays just to make
+# this faster -- that's exactly what causes multi-day blocks.
+CHUNK_SIZE = 15                # tickers per batched daily-data request
+DELAY_BETWEEN_CHUNKS_SEC = 2.0
+DELAY_BETWEEN_INTRADAY_CALLS_SEC = 0.6
+MAX_RETRIES = 2
+RETRY_BACKOFF_BASE_SEC = 3.0
+# -----------------------------------------------------------------------------
 
 MARKET_OPEN = dt.time(9, 15)
 MARKET_CLOSE = dt.time(15, 30)
 TRADING_MINUTES_PER_DAY = 375
 
-# Curated, liquid fallback universe (Nifty ~100 constituents) used only if
-# the live NSE index-constituents CSV can't be fetched (blocked network,
-# NSE site change, etc.)
-FALLBACK_UNIVERSE = [
+# Curated, liquid fallback universe used only if the live NSE
+# index-constituents CSV can't be fetched (blocked network, NSE site
+# change, etc). Kept intentionally short by default (see UNIVERSE_MODE in
+# the UI) -- a smaller universe means far fewer requests to Yahoo, which is
+# the single biggest lever against getting rate-limited.
+FALLBACK_UNIVERSE_NIFTY50 = [
     "RELIANCE", "TCS", "HDFCBANK", "ICICIBANK", "INFY", "HINDUNILVR", "ITC",
     "SBIN", "BHARTIARTL", "BAJFINANCE", "LT", "KOTAKBANK", "AXISBANK",
     "ASIANPAINT", "MARUTI", "TITAN", "SUNPHARMA", "ULTRACEMCO", "WIPRO",
     "NESTLEIND", "ONGC", "NTPC", "POWERGRID", "M&M", "HCLTECH", "ADANIENT",
     "ADANIPORTS", "TATASTEEL", "TATAMOTORS", "JSWSTEEL", "BAJAJFINSV",
     "HDFCLIFE", "SBILIFE", "INDUSINDBK", "GRASIM", "DRREDDY", "CIPLA",
-    "DIVISLAB", "EICHERMOT", "HEROMOTOCO", "BAJAJ-AUTO", "BRITANNIA",
-    "DABUR", "GODREJCP", "PIDILITIND", "HAVELLS", "SIEMENS", "DLF",
-    "VEDANTA", "COALINDIA", "IOC", "BPCL", "GAIL", "HINDALCO", "SHREECEM",
-    "AMBUJACEM", "ACC", "UPL", "BOSCHLTD", "MOTHERSON", "TVSMOTOR",
-    "PAGEIND", "MARICO", "COLPAL", "TATACONSUM", "TECHM", "LTIM", "MPHASIS",
-    "PERSISTENT", "COFORGE", "PIIND", "SRF", "TATAPOWER", "TORNTPHARM",
-    "LUPIN", "AUROPHARMA", "ALKEM", "BIOCON", "ZYDUSLIFE", "ICICIPRULI",
-    "ICICIGI", "BAJAJHLDNG", "CHOLAFIN", "MUTHOOTFIN", "SHRIRAMFIN", "PFC",
-    "RECLTD", "IRFC", "BANKBARODA", "PNB", "CANBK", "IDFCFIRSTB",
-    "FEDERALBNK", "AUBANK", "NAUKRI", "DMART", "TRENT", "ZOMATO", "NYKAA",
-    "POLICYBZR", "IRCTC", "INDIGO", "INDHOTEL", "JUBLFOOD", "PVRINOX",
+    "EICHERMOT", "HEROMOTOCO", "BAJAJ-AUTO", "BRITANNIA",
 ]
+FALLBACK_UNIVERSE_EXTRA = [
+    "DIVISLAB", "DABUR", "GODREJCP", "PIDILITIND", "HAVELLS", "SIEMENS",
+    "DLF", "VEDANTA", "COALINDIA", "IOC", "BPCL", "GAIL", "HINDALCO",
+    "SHREECEM", "AMBUJACEM", "ACC", "UPL", "BOSCHLTD", "MOTHERSON",
+    "TVSMOTOR", "PAGEIND", "MARICO", "COLPAL", "TATACONSUM", "TECHM",
+    "LTIM", "MPHASIS", "PERSISTENT", "COFORGE", "PIIND", "SRF", "TATAPOWER",
+    "TORNTPHARM", "LUPIN", "AUROPHARMA", "ALKEM", "BIOCON", "ZYDUSLIFE",
+    "ICICIPRULI", "ICICIGI", "BAJAJHLDNG", "CHOLAFIN", "MUTHOOTFIN",
+    "SHRIRAMFIN", "PFC", "RECLTD", "IRFC", "BANKBARODA", "PNB", "CANBK",
+    "IDFCFIRSTB", "FEDERALBNK", "AUBANK", "NAUKRI", "DMART", "TRENT",
+    "ZOMATO", "NYKAA", "POLICYBZR", "IRCTC", "INDIGO", "INDHOTEL",
+    "JUBLFOOD", "PVRINOX",
+]
+
+
+class RateLimited(Exception):
+    """Raised when Yahoo Finance appears to be throttling/blocking us."""
+    pass
+
+
+def _looks_rate_limited(err: Exception) -> bool:
+    msg = str(err).lower()
+    signals = ["429", "too many requests", "rate limit", "expecting value",
+               "not in allowlist", "connection reset", "temporarily"]
+    return any(s in msg for s in signals)
+
+
+def safe_download(**kwargs):
+    """Wrapper around yf.download with retry/backoff. Raises RateLimited
+    (instead of silently returning empty data) if Yahoo appears to be
+    throttling us, so the caller can stop immediately instead of hammering
+    a block into a longer one."""
+    last_err = None
+    for attempt in range(MAX_RETRIES + 1):
+        try:
+            df = yf.download(**kwargs, progress=False)
+            if df is None or df.empty:
+                raise ValueError("empty response")
+            return df
+        except Exception as e:
+            last_err = e
+            if _looks_rate_limited(e):
+                raise RateLimited(str(e))
+            if attempt < MAX_RETRIES:
+                time.sleep(RETRY_BACKOFF_BASE_SEC * (attempt + 1))
+    raise RateLimited(f"repeated failures, likely rate-limited: {last_err}")
 
 
 # ============================================================================
 # UNIVERSE
 # ============================================================================
 
-def get_universe() -> list:
-    """Try to pull the live Nifty200 constituent list from NSE. Fall back
-    to a curated liquid-stock list if that fails for any reason."""
+def get_universe(mode: str = "safe") -> list:
+    """Try to pull the live Nifty50 (mode='safe') or Nifty200 (mode='full')
+    constituent list from NSE. Fall back to a curated liquid-stock list if
+    that fails for any reason.
+
+    mode='safe' (default, ~40 stocks) keeps the number of requests to Yahoo
+    low -- this is the main defense against getting rate-limited. mode='full'
+    (~150-200 stocks) scans more of the market but sends far more requests
+    and carries real risk of a temporary Yahoo IP block.
+    """
+    url = NSE_NIFTY50_CSV_URL if mode == "safe" else NSE_NIFTY200_CSV_URL
+    fallback = (FALLBACK_UNIVERSE_NIFTY50 if mode == "safe"
+                else FALLBACK_UNIVERSE_NIFTY50 + FALLBACK_UNIVERSE_EXTRA)
     try:
         import requests
         headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                                   "AppleWebKit/537.36 (KHTML, like Gecko) "
                                   "Chrome/124.0 Safari/537.36"}
-        resp = requests.get(NSE_INDEX_CSV_URL, headers=headers, timeout=10)
+        resp = requests.get(url, headers=headers, timeout=10)
         resp.raise_for_status()
         df = pd.read_csv(StringIO(resp.text))
         symbols = [f"{s.strip()}.NS" for s in df["Symbol"].tolist() if isinstance(s, str)]
-        if len(symbols) > 50:
-            print(f"[Universe] Loaded {len(symbols)} live symbols from NSE Nifty200 list.")
+        min_expected = 30 if mode == "safe" else 100
+        if len(symbols) >= min_expected:
+            print(f"[Universe] Loaded {len(symbols)} live symbols from NSE ({mode} mode).")
             return symbols
         raise ValueError("CSV parsed but too few symbols")
     except Exception as e:
         print(f"[Universe] Could not fetch live NSE list ({e}). Using fallback list "
-              f"of {len(FALLBACK_UNIVERSE)} liquid stocks.")
-        return [f"{s}.NS" for s in FALLBACK_UNIVERSE]
+              f"of {len(fallback)} liquid stocks.")
+        return [f"{s}.NS" for s in fallback]
 
 
 # ============================================================================
@@ -242,13 +304,49 @@ def minutes_elapsed_today(now: dt.datetime) -> int:
     return int(min(max(elapsed, 1), TRADING_MINUTES_PER_DAY))
 
 
-def run_stage1(universe: list, now: dt.datetime) -> dict:
+def _chunked(lst, n):
+    for i in range(0, len(lst), n):
+        yield lst[i:i + n]
+
+
+def run_stage1(universe: list, now: dt.datetime):
+    """Returns (candidates: dict, warning: str|None). Downloads daily data
+    in small chunks with a delay between each, so we never fire a single
+    burst of 100+ simultaneous requests at Yahoo. If a rate-limit signal is
+    detected, stops immediately and returns whatever was already gathered
+    rather than continuing to hammer a block into a longer one."""
     all_tickers = universe + [INDEX_TICKER]
+    chunks = list(_chunked(all_tickers, CHUNK_SIZE))
     print(f"[Stage 1] Downloading daily data for {len(all_tickers)} symbols "
-          f"(batched)...")
-    raw = yf.download(tickers=all_tickers, period=DAILY_PERIOD, interval="1d",
-                       group_by="ticker", threads=True, progress=False,
-                       auto_adjust=False)
+          f"in {len(chunks)} chunks of ~{CHUNK_SIZE}...")
+
+    raw_parts = []
+    warning = None
+    for i, chunk in enumerate(chunks):
+        try:
+            part = safe_download(tickers=chunk, period=DAILY_PERIOD, interval="1d",
+                                  group_by="ticker", threads=False, auto_adjust=False)
+            if not isinstance(part.columns, pd.MultiIndex):
+                # yfinance flattens columns when a chunk has only 1 ticker
+                part = pd.concat({chunk[0]: part}, axis=1)
+            raw_parts.append(part)
+        except RateLimited as e:
+            warning = (
+                f"Yahoo Finance appears to be rate-limiting requests "
+                f"(stopped after {i}/{len(chunks)} chunks). Using the "
+                f"{i * CHUNK_SIZE} stocks already fetched instead of "
+                f"pushing further and risking a longer block. "
+                f"Try again later, or use a smaller universe next time."
+            )
+            print(f"[Stage 1] {warning}")
+            break
+        if i < len(chunks) - 1:
+            time.sleep(DELAY_BETWEEN_CHUNKS_SEC)
+
+    if not raw_parts:
+        return {}, (warning or "Could not fetch any data from Yahoo Finance.")
+
+    raw = pd.concat(raw_parts, axis=1)
 
     elapsed_min = minutes_elapsed_today(now)
     day_fraction = elapsed_min / TRADING_MINUTES_PER_DAY
@@ -265,6 +363,8 @@ def run_stage1(universe: list, now: dt.datetime) -> dict:
     candidates = {}
     for t in universe:
         try:
+            if t not in raw.columns.get_level_values(0):
+                continue  # not fetched, e.g. chunk was skipped after a rate-limit stop
             df = raw[t].dropna(how="all")
             if len(df) < 40:
                 continue
@@ -323,7 +423,7 @@ def run_stage1(universe: list, now: dt.datetime) -> dict:
             continue
 
     print(f"[Stage 1] {len(candidates)} stocks passed liquidity/price filters.")
-    return candidates
+    return candidates, warning
 
 
 def prescore_and_shortlist(candidates: dict, n: int) -> list:
@@ -360,30 +460,39 @@ def prescore_and_shortlist(candidates: dict, n: int) -> list:
 # ============================================================================
 
 def fetch_intraday_one(ticker: str):
-    try:
-        df = yf.download(ticker, period=INTRADAY_PERIOD, interval=INTRADAY_INTERVAL,
-                          progress=False, auto_adjust=False)
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = df.columns.get_level_values(0)
-        df = df.dropna(how="all")
-        return ticker, df
-    except Exception:
-        return ticker, None
+    df = safe_download(tickers=ticker, period=INTRADAY_PERIOD, interval=INTRADAY_INTERVAL,
+                        auto_adjust=False)
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
+    return df.dropna(how="all")
 
 
-def run_stage2(candidates: dict, shortlist: list) -> None:
+def run_stage2(candidates: dict, shortlist: list):
+    """Sequential, throttled -- deliberately NOT multi-threaded. Hitting
+    Yahoo with several simultaneous connections is one of the most common
+    ways this unofficial endpoint flags an IP as a bot and blocks it.
+    Returns a warning string if it had to stop early due to rate-limiting."""
     print(f"[Stage 2] Pulling 5-min intraday data for shortlisted "
-          f"{len(shortlist)} stocks...")
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
-        futures = [ex.submit(fetch_intraday_one, t) for t in shortlist]
-        for fut in as_completed(futures):
-            ticker, idf = fut.result()
-            c = candidates.get(ticker)
-            if c is None:
-                continue
-            if idf is None or len(idf) < 2:
-                c.rejected_reason = "no usable intraday data"
-                continue
+          f"{len(shortlist)} stocks (sequential, throttled)...")
+    warning = None
+    for i, ticker in enumerate(shortlist):
+        c = candidates.get(ticker)
+        if c is None:
+            continue
+        try:
+            idf = fetch_intraday_one(ticker)
+        except RateLimited as e:
+            warning = (
+                f"Yahoo Finance rate-limited us during Stage 2 (after "
+                f"{i}/{len(shortlist)} stocks). Ranking is based on the "
+                f"{i} stocks already fetched. Try again later if you want "
+                f"the full shortlist re-checked."
+            )
+            print(f"[Stage 2] {warning}")
+            break
+        if idf is None or len(idf) < 2:
+            c.rejected_reason = "no usable intraday data"
+        else:
             try:
                 opening_bars = idf.iloc[:3]  # first ~15 minutes
                 c.opening_range_high = opening_bars["High"].max()
@@ -397,6 +506,11 @@ def run_stage2(candidates: dict, shortlist: list) -> None:
                 c.orb_breakout = bool(last_price > c.opening_range_high)
             except Exception as e:
                 c.rejected_reason = f"intraday calc failed: {e}"
+
+        if i < len(shortlist) - 1:
+            time.sleep(DELAY_BETWEEN_INTRADAY_CALLS_SEC)
+
+    return warning
 
 
 # ============================================================================
@@ -519,18 +633,34 @@ st.caption(
 # ----------------------------------------------------------------------------
 with st.sidebar:
     st.header("Settings")
+    universe_mode_label = st.radio(
+        "Universe size",
+        ["Safe (~40 stocks, low rate-limit risk)", "Full (~150-200 stocks, higher risk)"],
+        index=0,
+    )
+    universe_mode = "safe" if universe_mode_label.startswith("Safe") else "full"
+    if universe_mode == "full":
+        st.warning(
+            "⚠️ Full mode sends far more requests to Yahoo Finance and can "
+            "get your IP temporarily rate-limited (sometimes for a day or "
+            "more). Only use this if Safe mode has been working fine for "
+            "you and you understand the risk.",
+            icon="⚠️",
+        )
     min_rr = st.slider("Minimum Risk:Reward to accept", 1.0, 3.0,
                         float(MIN_RR), 0.1)
     min_price = st.number_input("Minimum price (Rs.)", value=float(MIN_PRICE),
                                  step=5.0)
     min_turnover = st.number_input("Minimum avg daily turnover (Rs. crore)",
                                     value=float(MIN_AVG_TURNOVER_CR), step=1.0)
-    shortlist_size = st.slider("Stage-2 shortlist size", 5, 40,
+    shortlist_size = st.slider("Stage-2 shortlist size", 5, 25,
                                 SHORTLIST_SIZE, 1)
     st.markdown("---")
     st.caption(
         "Best run between 9:20-9:45 AM IST, after the opening 5-10 minutes "
-        "of noise settle."
+        "of noise settle. Avoid clicking Run repeatedly within the same "
+        "few minutes -- each run makes real requests to Yahoo Finance, "
+        "and running it back-to-back is what triggers rate limits."
     )
     run_clicked = st.button("🔍 Run Screener Now", type="primary",
                              use_container_width=True)
@@ -559,28 +689,32 @@ if run_clicked:
     status = st.status("Running screener...", expanded=True)
 
     status.write("Loading stock universe...")
-    universe = get_universe()
+    universe = get_universe(mode=universe_mode)
     status.write(f"Universe size: {len(universe)} symbols")
 
-    status.write("Stage 1 — batched daily-data scan (liquidity, trend, gap, "
-                 "relative volume, relative strength)...")
-    candidates = run_stage1(universe, run_time)
+    status.write("Stage 1 — chunked, throttled daily-data scan (liquidity, "
+                 "trend, gap, relative volume, relative strength)...")
+    candidates, stage1_warning = run_stage1(universe, run_time)
     status.write(f"{len(candidates)} stocks passed liquidity/price filters.")
+    if stage1_warning:
+        st.warning(stage1_warning, icon="⏳")
 
     if not candidates:
         status.update(label="No data returned", state="error")
         st.error(
-            "Stage 1 returned no candidates. This usually means Yahoo "
-            "Finance rate-limited the batch request. Wait a minute and "
-            "click Run again — if it keeps happening, the universe list "
-            "may need trimming."
+            "No data came back from Yahoo Finance at all. This almost "
+            "always means your IP is currently rate-limited. Try again "
+            "later, or from a different network (mobile hotspot/VPN)."
         )
         st.session_state.ranked = None
     else:
         shortlist = prescore_and_shortlist(candidates, shortlist_size)
         status.write(f"Stage 2 — pulling live 5-min intraday bars for "
-                     f"{len(shortlist)} shortlisted stocks...")
-        run_stage2(candidates, shortlist)
+                     f"{len(shortlist)} shortlisted stocks (one at a time, "
+                     f"throttled)...")
+        stage2_warning = run_stage2(candidates, shortlist)
+        if stage2_warning:
+            st.warning(stage2_warning, icon="⏳")
 
         shortlisted = {t: candidates[t] for t in shortlist if t in candidates}
         ranked = score_candidates(shortlisted)
@@ -588,6 +722,7 @@ if run_clicked:
         status.update(label="Done", state="complete")
         st.session_state.ranked = ranked
         st.session_state.run_time = run_time
+
 
 # ----------------------------------------------------------------------------
 # Display results
