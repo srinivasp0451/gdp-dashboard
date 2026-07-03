@@ -1983,6 +1983,17 @@ with tab_live:
             st.caption("No new signal on the latest closed candle.")
         return sig_df
 
+    @st.fragment(run_every=5)
+    def live_signal_loop_fragment():
+        """
+        Wraps _evaluate_live_signal() so it actually re-executes every ~5s
+        while live monitoring is on — this is the piece that was missing
+        before: entries/exits only fired once, at the moment Start was
+        clicked, because everything outside a fragment only runs again on a
+        full script rerun (a button click), not on a timer.
+        """
+        _evaluate_live_signal()
+
     # ---- Start / Stop / Square-off controls ----
     ctrl1, ctrl2, ctrl3, ctrl4 = st.columns(4)
     with ctrl1:
@@ -2042,8 +2053,18 @@ with tab_live:
             "Dhan Live Orders": dhan_enabled,
         })
 
-    if manual_eval or st.session_state.live_running:
+    if manual_eval:
         _evaluate_live_signal()
+
+    if st.session_state.live_running:
+        # THIS is what makes trade entry/exit actually keep happening while
+        # monitoring is on. Without wrapping it in its own fragment, this
+        # logic would only ever run once — at the moment Start was clicked —
+        # because the rest of the script only re-executes on a full rerun
+        # (a button click), while the LTP/dashboard fragments above silently
+        # keep refreshing every few seconds giving the illusion of "live"
+        # even though no new signal was ever being acted on underneath.
+        live_signal_loop_fragment()
 
     if st.session_state.live_running:
         live_dashboard_fragment(ticker, interval, period, strategy, params, filters)
