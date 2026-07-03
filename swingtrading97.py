@@ -46,7 +46,8 @@ TF_PERIOD_MAP = {
 
 STRATEGIES = [
     "EMA Crossover",
-    "Simple Buy/Sell",
+    "Simple Buy Only",
+    "Simple Sell Only",
     "Threshold Cross",
     "Price Action Support/Resistance",
     "Liquidity Grab Reversal",
@@ -72,7 +73,8 @@ PRO_STRATEGIES = {
 # opposite (a non-trending / ranging tape). "neutral" strategies aren't gated.
 STRATEGY_FAMILY = {
     "EMA Crossover": "trend",
-    "Simple Buy/Sell": "neutral",
+    "Simple Buy Only": "neutral",
+    "Simple Sell Only": "neutral",
     "Threshold Cross": "neutral",
     "Price Action Support/Resistance": "trend",
     "Liquidity Grab Reversal": "mean_reversion",
@@ -376,8 +378,10 @@ def generate_signals(df, strategy, params):
         df.loc[(ef > es) & (ef.shift(1) <= es.shift(1)), "signal"] = 1
         df.loc[(ef < es) & (ef.shift(1) >= es.shift(1)), "signal"] = -1
 
-    elif strategy == "Simple Buy/Sell":
+    elif strategy == "Simple Buy Only":
         df.loc[df["Close"] > df["Close"].shift(1), "signal"] = 1
+
+    elif strategy == "Simple Sell Only":
         df.loc[df["Close"] < df["Close"].shift(1), "signal"] = -1
 
     elif strategy == "Threshold Cross":
@@ -1173,19 +1177,20 @@ ticker_choice = st.sidebar.selectbox(
     index=ticker_names.index(ov.get("ticker_choice")) if ov.get("ticker_choice") in ticker_names else 0,
 )
 if ticker_choice == "Custom":
-    ticker = st.sidebar.text_input("Custom Ticker (Yahoo Finance symbol)", ov.get("ticker", "RELIANCE.NS"))
+    ticker = st.sidebar.text_input("Custom Ticker (Yahoo Finance symbol)", ov.get("ticker", "KAYNES.NS"))
 else:
     ticker = TICKER_MAP[ticker_choice]
 
 intervals = list(TF_PERIOD_MAP.keys())
 interval = st.sidebar.selectbox(
     "Timeframe", intervals,
-    index=intervals.index(ov.get("interval")) if ov.get("interval") in intervals else 4,
+    index=intervals.index(ov.get("interval")) if ov.get("interval") in intervals else intervals.index("1m"),
 )
 periods_available = TF_PERIOD_MAP[interval]
+_default_period_idx = periods_available.index("7d") if "7d" in periods_available else 0
 period = st.sidebar.selectbox(
     "Period", periods_available,
-    index=periods_available.index(ov.get("period")) if ov.get("period") in periods_available else 0,
+    index=periods_available.index(ov.get("period")) if ov.get("period") in periods_available else _default_period_idx,
 )
 
 qty = st.sidebar.number_input("Quantity", min_value=1, value=int(ov.get("qty", 1)), step=1)
@@ -1664,7 +1669,7 @@ def render_range_insight_section(ticker, interval, period, section_title):
         st.write(line)
 
 
-
+def render_bin_analysis_section(t1, t2, t1_name, t2_name, p1, diff, fetch_interval, fetch_period, section_label, fwd_n=5):
     """
     Renders one full historical-bin-analysis block (bin table + empirical bias +
     ATR-sized reference levels) for a given timeframe/period. Used twice in the
@@ -2200,9 +2205,9 @@ with tab_opt:
     st.subheader("Strategy Optimizer")
     st.caption("Runs backtests across chosen strategy / timeframe / period / stoploss / target / filter combinations. Each combo triggers a rate-limited yfinance call and its own backtest loop — bigger grids take longer.")
 
-    EXCLUDE_FROM_SELECT_ALL = {"Simple Buy/Sell", "Threshold Cross"}
+    EXCLUDE_FROM_SELECT_ALL = {"Simple Buy Only", "Simple Sell Only", "Threshold Cross"}
 
-    if st.button("⚡ Select all strategies (except Simple Buy/Sell & Threshold Cross)"):
+    if st.button("⚡ Select all strategies (except Simple Buy Only, Simple Sell Only & Threshold Cross)"):
         st.session_state["opt_strategies_ms"] = [s for s in STRATEGIES if s not in EXCLUDE_FROM_SELECT_ALL]
         st.rerun()
 
