@@ -88,6 +88,13 @@ STRATEGY_FAMILY = {
     "Pro: EMA50 Trend + EMA9/15 Pullback": "trend",
 }
 
+# These strategies react to a condition that's true or false AT A SINGLE
+# PRICE POINT (previous close vs current price, or a price crossing a fixed
+# threshold) — there's no "candle shape" to wait for, unlike an EMA/RSI/BB
+# cross which genuinely needs a closed bar to compute reliably. So these fire
+# immediately at the current price instead of waiting for next-candle-open.
+IMMEDIATE_EXECUTION_STRATEGIES = {"Simple Buy Only", "Simple Sell Only", "Threshold Cross"}
+
 SL_TYPES = [
     "Custom Points", "Trailing SL (Points)", "Trail Candle Low/High (Current)",
     "Trail Candle Low/High (Previous)", "Trail Swing Low/High (Current)",
@@ -855,10 +862,17 @@ def run_backtest(raw_df, strategy, sl_type, target_type, params, filters, qty, r
         if open_trade is None:
             sig = df["signal"].iloc[i]
             if sig != 0:
-                entry_idx = i + 1
-                if entry_idx >= len(df):
-                    break
-                entry_price = float(df["Open"].iloc[entry_idx])
+                if strategy in IMMEDIATE_EXECUTION_STRATEGIES:
+                    # No candle shape to wait for — the condition (price vs
+                    # prev close, or price crossing a threshold) is already
+                    # fully known at this candle's close, so fill right here.
+                    entry_idx = i
+                    entry_price = float(df["Close"].iloc[i])
+                else:
+                    entry_idx = i + 1
+                    if entry_idx >= len(df):
+                        break
+                    entry_price = float(df["Open"].iloc[entry_idx])
                 a_val = atr_series.iloc[i]
                 a_val = a_val if not np.isnan(a_val) else entry_price * 0.005
                 sl, target, sl_dist, target_dist = calc_initial_sl_target(sig, entry_price, a_val, params, sl_type, target_type)
@@ -1595,6 +1609,168 @@ def live_dashboard_fragment(ticker, interval, period, strategy, params, filters)
         st.write("• " + line)
 
 
+def evaluate_live_signal(ticker, interval, period, strategy, params, filters, sl_type, target_type, qty,
+                          dhan_enabled, dhan_client_id, dhan_access_token, product_cfg, risk_ctrl):
+    """
+    Top-level (not nested-closure) live signal evaluator. This is deliberately
+    a plain module-level function taking every input explicitly, rather than
+    a function-inside-a-function relying on captured variables — nesting it
+    inside `with tab_live:` and wrapping THAT in a fragment was fragile and is
+    exactly what caused positions to silently stop updating. This version, and
+    its fragment wrapper right below, follow the same plain top-level pattern
+    already working fine for live_dashboard_fragment / live_position_fragment.
+    """
+    raw = fetch_data(ticker, interval, period)
+    if raw.empty or len(raw) < 30:
+        st.error("Not enough data to evaluate a signal.")
+        return None
+    live_filters = dict(filters)
+    live_filters["current_strategy"] = strategy
+    sig_df = apply_filters(generate_signals(raw, strategy, params), live_filters, params)
+    a_series = atr(sig_df, 14)
+    open_pos = st.session_state.live_positions
+
+    # Immediate-execution strategies (Simple Buy/Sell Only, Threshold Cross)
+    # check the CURRENT price against the last CLOSED candle directly — no
+    # "wait for this candle to close" delay, since there's no candle shape to
+    # confirm, just a price level.
+    if strategy in IMMEDIATE_EXECUTION_STRATEGIES:
+        current_price = float(sig_df["Close"].iloc[-1])
+        prev_close = float(sig_df["Close"].iloc[-2])
+        if strategy == "Simple Buy Only":
+            last_sig = 1 if current_price > prev_close else 0
+        elif strategy == "Simple Sell Only":
+            last_sig = -1 if current_price < prev_close else 0
+        else:  # Threshold Cross
+            thr = params.get("threshold", prev_close)
+            if current_price > thr and prev_close <= thr:
+                last_sig = 1
+            elif current_price < thr and prev_close >= thr:
+                last_sig = -1
+            else:
+                last_sig = 0
+        entry_reference_price = current_price
+    else:
+        last_sig = int(sig_df["signal"].iloc[-2])  # last CLOSED candle's signal
+        entry_reference_price = float(sig_df["Open"].iloc[-1])  # next candle's open
+
+    if open_pos:
+        pos = open_pos[0]
+        i = len(sig_df) - 1
+        candle = sig_df.iloc[i]
+        pos = update_trade_levels(pos, i, sig_df, params, a_series)
+
+        exited, exit_price, reason = False, None, None
+        if pos.get("pending_exit_reason"):
+            exited, exit_price, reason = True, candle["Open"], pos["pending_exit_reason"]
+        if not exited:
+            sp_exit, sp_price, sp_reason = check_special_exit_conditions(pos, candle)
+            if sp_exit:
+                exited, exit_price, reason = True, sp_price, sp_reason
+        if not exited and risk_ctrl.get("loss_duration_enabled"):
+            td_exit, td_price, td_reason = check_time_based_exit(
+                pos, sig_df.index[-1], candle["Close"],
+                risk_ctrl.get("loss_duration_min_minutes", 1), risk_ctrl.get("loss_duration_max_minutes", 5),
+            )
+            if td_exit:
+                exited, exit_price, reason = True, td_price, td_reason
+        if not exited:
+            hard_exit, hard_price, hard_reason = check_hard_exit(pos, candle)
+            if hard_exit:
+                if pos["target_type"] == "Partial Book + Trail Remainder" and hard_reason == "Target Hit" and not pos["partial_booked"]:
+                    book_qty = max(1, round(pos["original_qty"] * pos["partial_book_pct"] / 100.0))
+                    book_qty = min(book_qty, pos["remaining_qty"])
+                    partial_points = (hard_price - pos["entry_price"]) * pos["direction"]
+                    st.session_state.live_history.append({
+                        "Entry Time": pos["entry_time"], "Entry Price": round(pos["entry_price"], 2),
+                        "Direction": "LONG" if pos["direction"] == 1 else "SHORT",
+                        "Exit Time": sig_df.index[-1], "Exit Price": round(float(hard_price), 2),
+                        "SL": round(pos["initial_sl"], 2), "Target": round(pos["initial_target"], 2),
+                        "Highest": round(pos["highest"], 2), "Lowest": round(pos["lowest"], 2),
+                        "Points": round(partial_points, 2), "PnL": round(partial_points * book_qty, 2),
+                        "Exit Reason": f"Partial Book ({book_qty}/{pos['original_qty']} qty @ Target 1)", "Qty": book_qty,
+                    })
+                    pos["remaining_qty"] -= book_qty
+                    pos["partial_booked"] = True
+                    if dhan_enabled:
+                        leg_id, side = resolve_dhan_order_leg(pos["direction"], False, ticker, product_cfg)
+                        st.json(place_dhan_order(dhan_client_id, dhan_access_token, leg_id, side, product_cfg, book_qty, hard_price))
+                    if pos["remaining_qty"] <= 0:
+                        st.session_state.live_positions = []
+                        st.success(f"Fully booked at Target 1 @ {hard_price:.2f}")
+                        return sig_df
+                    else:
+                        pos["target_type"] = "Trailing Target (Display Only)"
+                        if pos["sl_type"] not in ("Trailing SL (Points)", "ATR Based SL", "Autopilot SL"):
+                            pos["sl_type"] = "ATR Based SL"
+                        st.session_state.live_positions = [pos]
+                        st.success(f"Partial booked ({book_qty} qty) @ {hard_price:.2f} — remaining {pos['remaining_qty']} qty now trailing.")
+                        return sig_df
+                else:
+                    exited, exit_price, reason = True, hard_price, hard_reason
+        if not exited:
+            sig_exit, sig_reason = detect_signal_exit_condition(pos, i, sig_df, params)
+            if sig_exit:
+                pos["pending_exit_reason"] = sig_reason
+
+        pos["current_price"] = float(sig_df["Close"].iloc[-1])
+        if exited:
+            points = (exit_price - pos["entry_price"]) * pos["direction"]
+            st.session_state.live_history.append({
+                "Entry Time": pos["entry_time"], "Entry Price": round(pos["entry_price"], 2),
+                "Direction": "LONG" if pos["direction"] == 1 else "SHORT",
+                "Exit Time": sig_df.index[-1], "Exit Price": round(float(exit_price), 2),
+                "SL": round(pos["initial_sl"], 2), "Target": round(pos["initial_target"], 2),
+                "Highest": round(pos["highest"], 2), "Lowest": round(pos["lowest"], 2),
+                "Points": round(points, 2), "PnL": round(points * pos["remaining_qty"], 2),
+                "Exit Reason": reason, "Qty": pos["remaining_qty"],
+            })
+            st.session_state.live_positions = []
+            st.success(f"Position closed: {reason} @ {exit_price:.2f}")
+            if dhan_enabled:
+                leg_id, side = resolve_dhan_order_leg(pos["direction"], False, ticker, product_cfg)
+                st.json(place_dhan_order(dhan_client_id, dhan_access_token, leg_id, side, product_cfg, pos["remaining_qty"], exit_price))
+        else:
+            st.session_state.live_positions = [pos]
+            st.info("Position still open — levels updated.")
+    elif last_sig != 0:
+        entry_price = entry_reference_price
+        a_val = a_series.iloc[-1] if not np.isnan(a_series.iloc[-1]) else entry_price * 0.005
+        sl, target, sl_dist, target_dist = calc_initial_sl_target(last_sig, entry_price, a_val, params, sl_type, target_type)
+        new_pos = {
+            "entry_time": sig_df.index[-1], "entry_price": entry_price, "direction": last_sig,
+            "qty": qty, "sl": sl, "target": target, "initial_sl": sl, "initial_target": target,
+            "sl_dist": sl_dist, "target_dist": target_dist, "sl_type": sl_type, "target_type": target_type,
+            "highest": entry_price, "lowest": entry_price, "current_price": entry_price,
+            "pending_exit_reason": None,
+            "peak_pl_points": 0.0, "worst_pl_points": 0.0, "loss_since": None,
+            "original_qty": qty, "remaining_qty": qty, "partial_booked": False,
+            "loss_trigger_points": params.get("loss_trigger_points", 20.0),
+            "min_recovery_pct": params.get("min_recovery_pct", 50.0),
+            "profit_trigger_points": params.get("profit_trigger_points", 50.0),
+            "giveback_pct": params.get("giveback_pct", 30.0),
+            "partial_book_pct": params.get("partial_book_pct", 50.0),
+        }
+        st.session_state.live_positions = [new_pos]
+        st.success(f"New {'LONG' if last_sig == 1 else 'SHORT'} position opened @ {entry_price:.2f}")
+        if dhan_enabled:
+            leg_id, side = resolve_dhan_order_leg(last_sig, True, ticker, product_cfg)
+            st.json(place_dhan_order(dhan_client_id, dhan_access_token, leg_id, side, product_cfg, qty, entry_price))
+    else:
+        st.caption("No new signal on the latest closed candle.")
+    return sig_df
+
+
+@st.fragment(run_every=5)
+def live_signal_loop_fragment(ticker, interval, period, strategy, params, filters, sl_type, target_type, qty,
+                               dhan_enabled, dhan_client_id, dhan_access_token, product_cfg, risk_ctrl):
+    """Re-runs evaluate_live_signal() every ~5s on its own, independent of the
+    rest of the page — this is what makes entries/exits keep happening while
+    Live Monitoring is on, instead of firing only once at the Start click."""
+    evaluate_live_signal(ticker, interval, period, strategy, params, filters, sl_type, target_type, qty,
+                          dhan_enabled, dhan_client_id, dhan_access_token, product_cfg, risk_ctrl)
+
+
 def apply_config_to_sidebar(cfg_row):
     """Push a chosen optimization result row into sidebar_overrides and rerun."""
     st.session_state.sidebar_overrides = {
@@ -1865,135 +2041,6 @@ with tab_live:
     st.subheader(f"Live (Paper) Trading — {ticker_choice} ({ticker})")
     st.caption("This is a simulation layer driven by the latest candle signal. Nothing polls the API until you click Start — Stop (or leaving/closing this browser tab) halts it again.")
 
-    def _evaluate_live_signal():
-        raw = fetch_data(ticker, interval, period)
-        if raw.empty or len(raw) < 30:
-            st.error("Not enough data to evaluate a signal.")
-            return
-        live_filters = dict(filters)
-        live_filters["current_strategy"] = strategy
-        sig_df = apply_filters(generate_signals(raw, strategy, params), live_filters, params)
-        a_series = atr(sig_df, 14)
-        last_sig = int(sig_df["signal"].iloc[-2])  # last CLOSED candle's signal
-        open_pos = st.session_state.live_positions
-
-        if open_pos:
-            pos = open_pos[0]
-            i = len(sig_df) - 1
-            candle = sig_df.iloc[i]
-            pos = update_trade_levels(pos, i, sig_df, params, a_series)
-
-            exited, exit_price, reason = False, None, None
-            if pos.get("pending_exit_reason"):
-                exited, exit_price, reason = True, candle["Open"], pos["pending_exit_reason"]
-            if not exited:
-                sp_exit, sp_price, sp_reason = check_special_exit_conditions(pos, candle)
-                if sp_exit:
-                    exited, exit_price, reason = True, sp_price, sp_reason
-            if not exited and risk_ctrl.get("loss_duration_enabled"):
-                td_exit, td_price, td_reason = check_time_based_exit(
-                    pos, sig_df.index[-1], candle["Close"],
-                    risk_ctrl.get("loss_duration_min_minutes", 1), risk_ctrl.get("loss_duration_max_minutes", 5),
-                )
-                if td_exit:
-                    exited, exit_price, reason = True, td_price, td_reason
-            if not exited:
-                hard_exit, hard_price, hard_reason = check_hard_exit(pos, candle)
-                if hard_exit:
-                    if pos["target_type"] == "Partial Book + Trail Remainder" and hard_reason == "Target Hit" and not pos["partial_booked"]:
-                        book_qty = max(1, round(pos["original_qty"] * pos["partial_book_pct"] / 100.0))
-                        book_qty = min(book_qty, pos["remaining_qty"])
-                        partial_points = (hard_price - pos["entry_price"]) * pos["direction"]
-                        st.session_state.live_history.append({
-                            "Entry Time": pos["entry_time"], "Entry Price": round(pos["entry_price"], 2),
-                            "Direction": "LONG" if pos["direction"] == 1 else "SHORT",
-                            "Exit Time": sig_df.index[-1], "Exit Price": round(float(hard_price), 2),
-                            "SL": round(pos["initial_sl"], 2), "Target": round(pos["initial_target"], 2),
-                            "Highest": round(pos["highest"], 2), "Lowest": round(pos["lowest"], 2),
-                            "Points": round(partial_points, 2), "PnL": round(partial_points * book_qty, 2),
-                            "Exit Reason": f"Partial Book ({book_qty}/{pos['original_qty']} qty @ Target 1)", "Qty": book_qty,
-                        })
-                        pos["remaining_qty"] -= book_qty
-                        pos["partial_booked"] = True
-                        if dhan_enabled:
-                            leg_id, side = resolve_dhan_order_leg(pos["direction"], False, ticker, product_cfg)
-                            st.json(place_dhan_order(dhan_client_id, dhan_access_token, leg_id, side, product_cfg, book_qty, hard_price))
-                        if pos["remaining_qty"] <= 0:
-                            st.session_state.live_positions = []
-                            st.success(f"Fully booked at Target 1 @ {hard_price:.2f}")
-                            return sig_df
-                        else:
-                            pos["target_type"] = "Trailing Target (Display Only)"
-                            if pos["sl_type"] not in ("Trailing SL (Points)", "ATR Based SL", "Autopilot SL"):
-                                pos["sl_type"] = "ATR Based SL"
-                            st.session_state.live_positions = [pos]
-                            st.success(f"Partial booked ({book_qty} qty) @ {hard_price:.2f} — remaining {pos['remaining_qty']} qty now trailing.")
-                            return sig_df
-                    else:
-                        exited, exit_price, reason = True, hard_price, hard_reason
-            if not exited:
-                sig_exit, sig_reason = detect_signal_exit_condition(pos, i, sig_df, params)
-                if sig_exit:
-                    pos["pending_exit_reason"] = sig_reason
-
-            pos["current_price"] = float(sig_df["Close"].iloc[-1])
-            if exited:
-                points = (exit_price - pos["entry_price"]) * pos["direction"]
-                st.session_state.live_history.append({
-                    "Entry Time": pos["entry_time"], "Entry Price": round(pos["entry_price"], 2),
-                    "Direction": "LONG" if pos["direction"] == 1 else "SHORT",
-                    "Exit Time": sig_df.index[-1], "Exit Price": round(float(exit_price), 2),
-                    "SL": round(pos["initial_sl"], 2), "Target": round(pos["initial_target"], 2),
-                    "Highest": round(pos["highest"], 2), "Lowest": round(pos["lowest"], 2),
-                    "Points": round(points, 2), "PnL": round(points * pos["remaining_qty"], 2),
-                    "Exit Reason": reason, "Qty": pos["remaining_qty"],
-                })
-                st.session_state.live_positions = []
-                st.success(f"Position closed: {reason} @ {exit_price:.2f}")
-                if dhan_enabled:
-                    leg_id, side = resolve_dhan_order_leg(pos["direction"], False, ticker, product_cfg)
-                    st.json(place_dhan_order(dhan_client_id, dhan_access_token, leg_id, side, product_cfg, pos["remaining_qty"], exit_price))
-            else:
-                st.session_state.live_positions = [pos]
-                st.info("Position still open — levels updated.")
-        elif last_sig != 0:
-            entry_price = float(sig_df["Open"].iloc[-1])
-            a_val = a_series.iloc[-2] if not np.isnan(a_series.iloc[-2]) else entry_price * 0.005
-            sl, target, sl_dist, target_dist = calc_initial_sl_target(last_sig, entry_price, a_val, params, sl_type, target_type)
-            new_pos = {
-                "entry_time": sig_df.index[-1], "entry_price": entry_price, "direction": last_sig,
-                "qty": qty, "sl": sl, "target": target, "initial_sl": sl, "initial_target": target,
-                "sl_dist": sl_dist, "target_dist": target_dist, "sl_type": sl_type, "target_type": target_type,
-                "highest": entry_price, "lowest": entry_price, "current_price": entry_price,
-                "pending_exit_reason": None,
-                "peak_pl_points": 0.0, "worst_pl_points": 0.0, "loss_since": None,
-                "original_qty": qty, "remaining_qty": qty, "partial_booked": False,
-                "loss_trigger_points": params.get("loss_trigger_points", 20.0),
-                "min_recovery_pct": params.get("min_recovery_pct", 50.0),
-                "profit_trigger_points": params.get("profit_trigger_points", 50.0),
-                "giveback_pct": params.get("giveback_pct", 30.0),
-                "partial_book_pct": params.get("partial_book_pct", 50.0),
-            }
-            st.session_state.live_positions = [new_pos]
-            st.success(f"New {'LONG' if last_sig == 1 else 'SHORT'} position opened @ {entry_price:.2f}")
-            if dhan_enabled:
-                leg_id, side = resolve_dhan_order_leg(last_sig, True, ticker, product_cfg)
-                st.json(place_dhan_order(dhan_client_id, dhan_access_token, leg_id, side, product_cfg, qty, entry_price))
-        else:
-            st.caption("No new signal on the latest closed candle.")
-        return sig_df
-
-    @st.fragment(run_every=5)
-    def live_signal_loop_fragment():
-        """
-        Wraps _evaluate_live_signal() so it actually re-executes every ~5s
-        while live monitoring is on — this is the piece that was missing
-        before: entries/exits only fired once, at the moment Start was
-        clicked, because everything outside a fragment only runs again on a
-        full script rerun (a button click), not on a timer.
-        """
-        _evaluate_live_signal()
-
     # ---- Start / Stop / Square-off controls ----
     ctrl1, ctrl2, ctrl3, ctrl4 = st.columns(4)
     with ctrl1:
@@ -2054,17 +2101,17 @@ with tab_live:
         })
 
     if manual_eval:
-        _evaluate_live_signal()
+        evaluate_live_signal(ticker, interval, period, strategy, params, filters, sl_type, target_type, qty,
+                              dhan_enabled, dhan_client_id, dhan_access_token, product_cfg, risk_ctrl)
 
     if st.session_state.live_running:
         # THIS is what makes trade entry/exit actually keep happening while
-        # monitoring is on. Without wrapping it in its own fragment, this
-        # logic would only ever run once — at the moment Start was clicked —
-        # because the rest of the script only re-executes on a full rerun
-        # (a button click), while the LTP/dashboard fragments above silently
-        # keep refreshing every few seconds giving the illusion of "live"
-        # even though no new signal was ever being acted on underneath.
-        live_signal_loop_fragment()
+        # monitoring is on: a plain TOP-LEVEL fragment (same pattern as
+        # live_dashboard_fragment / live_position_fragment below), not a
+        # closure nested inside this tab — nesting it was fragile and is
+        # exactly what caused positions to silently stop updating before.
+        live_signal_loop_fragment(ticker, interval, period, strategy, params, filters, sl_type, target_type, qty,
+                                   dhan_enabled, dhan_client_id, dhan_access_token, product_cfg, risk_ctrl)
 
     if st.session_state.live_running:
         live_dashboard_fragment(ticker, interval, period, strategy, params, filters)
