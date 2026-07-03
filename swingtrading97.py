@@ -91,6 +91,7 @@ SL_TYPES = [
     "Trail Candle Low/High (Previous)", "Trail Swing Low/High (Current)",
     "Trail Swing Low/High (Previous)", "Strategy Signal Exit", "EMA Reverse Crossover Exit",
     "ATR Based SL", "Risk:Reward Based (min 1:2)", "Autopilot SL",
+    "Loss Recovery SL (Give-back)",
 ]
 
 TARGET_TYPES = [
@@ -98,6 +99,7 @@ TARGET_TYPES = [
     "Trail Candle Low/High (Previous)", "Trail Swing Low/High (Current)",
     "Trail Swing Low/High (Previous)", "Strategy Signal Exit", "EMA Reverse Crossover Exit",
     "ATR Based Target", "Risk:Reward Based (min 1:2)", "Autopilot Target",
+    "Profit Giveback Target", "Partial Book + Trail Remainder",
 ]
 
 RATE_LIMIT_DELAY = 0.3  # seconds, mandatory pause between yfinance calls
@@ -153,7 +155,10 @@ def atr(df, period=14):
 
 def bollinger(series, period=20, std_mult=2):
     mid = series.rolling(period).mean()
-    std = series.rolling(period).std()
+    # ddof=0 (population stdev) matches TradingView's ta.stdev default (biased=true).
+    # pandas' own default is ddof=1 (sample stdev) which gives slightly WIDER bands
+    # than TradingView at the same settings — this is the #1 cause of BB mismatches.
+    std = series.rolling(period).std(ddof=0)
     return mid + std_mult * std, mid, mid - std_mult * std
 
 
@@ -217,6 +222,33 @@ def swing_points(df, lookback=3):
     return swing_high, swing_low
 
 
+# Gap handling note: True Range (used by atr()/adx()/supertrend()) is defined as
+# max(high-low, |high-prev_close|, |low-prev_close|) — the prev_close terms are
+# exactly what captures a gap-up/gap-down correctly, so ATR/ADX/Supertrend here
+# already reflect gaps properly without special-casing. What DOES need explicit
+# handling is simply not having enough bars yet (e.g. right after a fresh
+# fetch, or a low-period intraday pull) — that's what MIN_BARS_REQUIRED and
+# safe_indicator_value() below are for: show "N/A — insufficient data" instead
+# of silently returning/using a NaN or a misleading half-warmed-up value.
+MIN_BARS_REQUIRED = {
+    "ema9": 9 * 3, "ema15": 15 * 3, "ema20": 20 * 3, "ema50": 50 * 3,
+    "rsi": 14 * 3, "atr": 14 * 3, "adx": 14 * 4, "bollinger": 20 * 2, "supertrend": 10 * 4,
+}
+
+
+def safe_indicator_value(series, min_bars, label=""):
+    """Returns (value, is_reliable). If there isn't enough history for the
+    indicator to have warmed up, or the latest value is NaN, returns
+    (None, False) so callers can render 'N/A — insufficient data' instead of
+    a silently wrong number."""
+    if series is None or len(series) < min_bars:
+        return None, False
+    val = series.iloc[-1]
+    if pd.isna(val):
+        return None, False
+    return float(val), True
+
+
 # ============================================================================
 # DATA FETCH (rate-limited)
 # ============================================================================
@@ -233,9 +265,57 @@ def fetch_data(ticker, interval, period):
     return df
 
 
-@st.fragment(run_every=2)
-def live_ltp_fragment(ticker, label="LTP"):
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_vix_series(period="5y"):
+    """Fetches India VIX (^INDIAVIX) daily closes. Used only to align against
+    whatever timeframe the user is trading — VIX itself only publishes daily."""
     time.sleep(RATE_LIMIT_DELAY)
+    try:
+        d = yf.download("^INDIAVIX", interval="1d", period=period, progress=False, auto_adjust=True)
+    except Exception:
+        return pd.Series(dtype=float)
+    if d is None or d.empty:
+        return pd.Series(dtype=float)
+    if isinstance(d.columns, pd.MultiIndex):
+        d.columns = d.columns.get_level_values(0)
+    return d["Close"].dropna()
+
+
+def get_vix_aligned(target_index):
+    """Maps each candle's timestamp in target_index to the most recent known
+    India VIX daily close on/before that date (forward-fill by date)."""
+    vix = fetch_vix_series("5y")
+    if vix is None or vix.empty or len(target_index) == 0:
+        return pd.Series(np.nan, index=target_index)
+
+    vix = vix.sort_index()
+    vix_idx = pd.DatetimeIndex(vix.index)
+    if vix_idx.tz is not None:
+        vix_idx = vix_idx.tz_localize(None)
+    vix_clean = pd.Series(vix.values, index=vix_idx).sort_index()
+
+    tgt_idx = pd.DatetimeIndex(target_index)
+    tgt_naive = tgt_idx.tz_localize(None) if tgt_idx.tz is not None else tgt_idx
+
+    left = pd.DataFrame({"t": tgt_naive})
+    right = pd.DataFrame({"t": vix_clean.index, "vix": vix_clean.values}).sort_values("t")
+    merged = pd.merge_asof(left, right, on="t", direction="backward")
+
+    result = pd.Series(merged["vix"].values, index=target_index)
+    return result
+
+
+@st.fragment(run_every=2)
+def live_position_fragment(ticker, label="LTP"):
+    """
+    Refreshes every ~2s on its own: live price, and — if a paper position is
+    open — live points/PnL color-coded green (profit) or red (loss), plus
+    Entry/SL/Target with their configured types, running highs/lows, and
+    remaining quantity. This is the minimum live-trading readout; before this
+    fix you'd have had to compute PnL in your head from LTP vs entry.
+    """
+    time.sleep(RATE_LIMIT_DELAY)
+    ltp = None
     try:
         data = yf.Ticker(ticker).history(period="1d", interval="1m")
         if data is None or data.empty:
@@ -243,13 +323,43 @@ def live_ltp_fragment(ticker, label="LTP"):
         if data is not None and not data.empty:
             ltp = float(data["Close"].iloc[-1])
             prev = float(data["Close"].iloc[-2]) if len(data) > 1 else ltp
-            delta = ltp - prev
-            st.metric(label, f"{ltp:,.2f}", f"{delta:+.2f}")
-            return ltp
-        st.info("No live data returned yet.")
+            st.metric(label, f"{ltp:,.2f}", f"{ltp - prev:+.2f}")
+        else:
+            st.info("No live data returned yet.")
     except Exception as exc:
         st.warning(f"Fetch issue (rate limit or symbol): {exc}")
-    return None
+
+    positions = st.session_state.get("live_positions", [])
+    if positions and ltp is not None:
+        pos = positions[0]
+        direction = pos["direction"]
+        points = (ltp - pos["entry_price"]) * direction
+        pnl = points * pos["remaining_qty"]
+
+        st.markdown("###### 💰 Live Position P&L")
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Entry Type", "LONG" if direction == 1 else "SHORT")
+        c2.metric("Entry Price", f"{pos['entry_price']:.2f}")
+        c3.metric("LTP", f"{ltp:,.2f}")
+
+        c4, c5 = st.columns(2)
+        c4.metric(f"SL ({pos['sl_type']})", f"{pos['sl']:.2f}")
+        c5.metric(f"Target ({pos['target_type']})", f"{pos['target']:.2f}")
+
+        # st.metric's delta is auto-colored green/red by sign — that IS the
+        # green/red live PnL indicator, no manual color logic needed.
+        c6, c7 = st.columns(2)
+        c6.metric("Live Points", f"{points:+.2f}", f"{points:+.2f}")
+        c7.metric("Live PnL", f"{pnl:+.2f}", f"{pnl:+.2f}")
+
+        c8, c9, c10 = st.columns(3)
+        c8.metric("Highest since entry", f"{pos['highest']:.2f}")
+        c9.metric("Lowest since entry", f"{pos['lowest']:.2f}")
+        c10.metric("Qty remaining", f"{pos['remaining_qty']}/{pos['original_qty']}")
+    elif positions and ltp is None:
+        st.caption("Position is open but couldn't fetch a live price this cycle — PnL will resume once the next tick comes in.")
+
+    return ltp
 
 
 # ============================================================================
@@ -363,7 +473,8 @@ def generate_signals(df, strategy, params):
     return df
 
 
-def apply_filters(df, filters):
+def apply_filters(df, filters, params=None):
+    params = params or {}
     df = df.copy()
     mask_buy = df["signal"] == 1
     mask_sell = df["signal"] == -1
@@ -433,6 +544,56 @@ def apply_filters(df, filters):
             mask_sell &= range_ok.fillna(False)
         # "neutral" strategies are left ungated by regime
 
+    if filters.get("vix_enabled"):
+        vix_aligned = get_vix_aligned(df.index)
+        df["vix_f"] = vix_aligned.values
+        ok = (vix_aligned >= filters.get("vix_min", 0)) & (vix_aligned <= filters.get("vix_max", 100))
+        ok = pd.Series(ok.values, index=df.index).fillna(False)
+        mask_buy &= ok
+        mask_sell &= ok
+
+    # --- Crossover Angle / Crossover Quality filters ---
+    # These only constrain entries that coincide with an actual EMA{fast}/{slow}
+    # crossover in the SAME bar (using the fast/slow periods set for the main
+    # strategy). If a signal fires from a strategy/bar where no such crossover
+    # is happening, these two filters have no effect on it — "angle" and
+    # "crossover candle size" are only meaningful at the moment of a cross.
+    if filters.get("angle_enabled") or filters.get("crossover_quality_enabled"):
+        f, s = params.get("ema_fast", 9), params.get("ema_slow", 15)
+        ef, es = ema(df["Close"], f), ema(df["Close"], s)
+        cross_up = (ef > es) & (ef.shift(1) <= es.shift(1))
+        cross_dn = (ef < es) & (ef.shift(1) >= es.shift(1))
+        a_series_for_angle = atr(df, 14)
+
+        angle_ok = pd.Series(True, index=df.index)
+        if filters.get("angle_enabled"):
+            # Angle is scale-dependent by nature (a raw price-difference slope has
+            # no inherent "degrees"), so it's normalized against ATR — the
+            # steepness of the EMA move relative to the instrument's own typical
+            # bar range. This is a disclosed heuristic, not a standardized
+            # industry figure; absolute value is used since a valid crossover in
+            # either direction can produce a negative raw slope depending on sign
+            # convention.
+            ema_fast_delta = ef.diff()
+            angle_deg = np.degrees(np.arctan2(ema_fast_delta.abs(), a_series_for_angle.replace(0, np.nan)))
+            df["crossover_angle_deg"] = angle_deg
+            angle_ok = (angle_deg >= filters.get("angle_min_deg", 0)).fillna(False)
+
+        quality_ok = pd.Series(True, index=df.index)
+        if filters.get("crossover_quality_enabled"):
+            mode = filters.get("crossover_quality_mode", "Simple Crossover")
+            candle_range = (df["High"] - df["Low"])
+            if mode == "Crossover with Candle Size":
+                quality_ok = (candle_range >= filters.get("crossover_min_points", 1.0)).fillna(False)
+            elif mode == "Crossover with ATR-based Candle Size":
+                quality_ok = (candle_range >= a_series_for_angle * filters.get("crossover_atr_mult", 1.0)).fillna(False)
+            # "Simple Crossover" = no extra size requirement, quality_ok stays True
+
+        cross_condition_ok = angle_ok & quality_ok
+        # Only gate the bars that ARE crossovers; leave all other bars untouched.
+        mask_buy &= (~cross_up) | (cross_up & cross_condition_ok)
+        mask_sell &= (~cross_dn) | (cross_dn & cross_condition_ok)
+
     new_signal = pd.Series(0, index=df.index)
     new_signal[mask_buy] = 1
     new_signal[mask_sell] = -1
@@ -453,6 +614,11 @@ def calc_initial_sl_target(direction, entry_price, atr_val, params, sl_type, tar
         sl_dist = atr_val * params.get("atr_mult_sl", 1.5)
     elif sl_type == "Autopilot SL":
         sl_dist = max(atr_val * 1.2, sl_points)
+    elif sl_type == "Loss Recovery SL (Give-back)":
+        # This SL type's real exit logic is the give-back check in
+        # check_special_exit_conditions(); this hard level is only a wide
+        # backstop in case price gaps straight through it.
+        sl_dist = max(atr_val * 3.0, params.get("loss_trigger_points", 20.0) * 1.5)
     else:
         sl_dist = sl_points
 
@@ -462,6 +628,15 @@ def calc_initial_sl_target(direction, entry_price, atr_val, params, sl_type, tar
         target_dist = sl_dist * rr_ratio
     elif target_type == "Autopilot Target":
         target_dist = max(atr_val * 2.5, sl_dist * 2)
+    elif target_type == "Profit Giveback Target":
+        # Real exit logic is the give-back check; this is a wide backstop.
+        target_dist = max(atr_val * 4.0, params.get("profit_trigger_points", 50.0) * 1.5)
+    elif target_type == "Partial Book + Trail Remainder":
+        # This IS the real, actionable level — it's Target 1, the point at
+        # which the first tranche gets booked (checked via the normal hard-exit
+        # path, then intercepted in run_backtest to book partially instead of
+        # closing fully).
+        target_dist = params.get("partial_target1_points", target_points)
     else:
         target_dist = target_points
 
@@ -473,6 +648,69 @@ def calc_initial_sl_target(direction, entry_price, atr_val, params, sl_type, tar
     else:
         sl, target = entry_price + sl_dist, entry_price - target_dist
     return sl, target, sl_dist, target_dist
+
+
+def check_special_exit_conditions(trade, candle):
+    """Stateful exits that can't be expressed as a single fixed level:
+    Loss Recovery SL (cut losers that don't bounce back enough) and Profit
+    Giveback Target (lock in winners that give back too much of their peak)."""
+    direction = trade["direction"]
+    current_pl = (candle["Close"] - trade["entry_price"]) * direction
+
+    if trade["sl_type"] == "Loss Recovery SL (Give-back)":
+        trigger = trade.get("loss_trigger_points", 20.0)
+        recovery_pct = trade.get("min_recovery_pct", 50.0) / 100.0
+        prev_worst = trade.get("worst_pl_points", 0.0)
+        worst = min(prev_worst, current_pl)
+        trade["worst_pl_points"] = worst
+        is_fresh_low = current_pl <= prev_worst
+        # Only judge "did it recover enough" on candles where price has
+        # actually ticked UP from its worst point — checking on the very
+        # candle that SETS a new worst is tautological (current == worst
+        # there), which would cut every loser the instant it first touched
+        # the trigger with no chance to bounce at all.
+        if worst <= -trigger and not is_fresh_low:
+            required_level = worst + recovery_pct * trigger
+            if current_pl <= required_level:
+                return True, float(candle["Close"]), (
+                    f"Loss Recovery SL (down {abs(worst):.1f} pts, recovered < {trade.get('min_recovery_pct',50):.0f}%)"
+                )
+
+    if trade["target_type"] == "Profit Giveback Target":
+        trigger = trade.get("profit_trigger_points", 50.0)
+        giveback_pct = trade.get("giveback_pct", 30.0) / 100.0
+        peak = max(trade.get("peak_pl_points", 0.0), current_pl)
+        trade["peak_pl_points"] = peak
+        if peak >= trigger:
+            giveback_level = peak * (1 - giveback_pct)
+            if current_pl <= giveback_level:
+                return True, float(candle["Close"]), (
+                    f"Profit Giveback (peak {peak:.1f} pts, gave back > {trade.get('giveback_pct',30):.0f}%)"
+                )
+
+    return False, None, None
+
+
+def check_time_based_exit(trade, candle_time, candle_close, min_minutes, max_minutes):
+    """
+    Exits a position once it has been in a continuous floating loss for at
+    least `min_minutes`. `max_minutes` is a documented upper safety bound
+    (mainly relevant to live polling where checks may lag) — set it >=
+    min_minutes. Resets the loss-timer the instant the trade turns flat/green.
+    """
+    direction = trade["direction"]
+    current_pl = (candle_close - trade["entry_price"]) * direction
+    if current_pl < 0:
+        if trade.get("loss_since") is None:
+            trade["loss_since"] = candle_time
+        elapsed_min = (candle_time - trade["loss_since"]).total_seconds() / 60.0
+        if elapsed_min >= min_minutes:
+            return True, float(candle_close), f"Time-Based Loss Exit (in loss {elapsed_min:.1f}m, threshold {min_minutes:.0f}-{max_minutes:.0f}m)"
+    else:
+        trade["loss_since"] = None
+    return False, None, None
+
+
 
 
 def update_trade_levels(trade, i, df, params, atr_series):
@@ -582,29 +820,30 @@ def check_hard_exit(trade, candle):
 # BACKTEST ENGINE
 # ============================================================================
 
-def run_backtest(raw_df, strategy, sl_type, target_type, params, filters, qty):
+def run_backtest(raw_df, strategy, sl_type, target_type, params, filters, qty, risk_ctrl=None):
     if raw_df.empty or len(raw_df) < 30:
         return pd.DataFrame(), raw_df
 
+    risk_ctrl = risk_ctrl or {}
     filters = dict(filters or {})
     filters["current_strategy"] = strategy
 
     df = generate_signals(raw_df, strategy, params)
-    df = apply_filters(df, filters)
+    df = apply_filters(df, filters, params)
     atr_series = atr(df, 14)
 
     trades = []
     open_trade = None
 
-    def close_trade(exit_price, exit_time, reason):
+    def close_trade(exit_price, exit_time, reason, qty_to_close):
         points = (exit_price - open_trade["entry_price"]) * open_trade["direction"]
         trades.append({
             "Entry Time": open_trade["entry_time"], "Entry Price": round(open_trade["entry_price"], 2),
             "Direction": "LONG" if open_trade["direction"] == 1 else "SHORT",
             "Exit Time": exit_time, "Exit Price": round(float(exit_price), 2),
             "SL": round(open_trade["initial_sl"], 2), "Target": round(open_trade["initial_target"], 2),
-            "Points": round(points, 2), "PnL": round(points * qty, 2),
-            "Exit Reason": reason, "Qty": qty,
+            "Points": round(points, 2), "PnL": round(points * qty_to_close, 2),
+            "Exit Reason": reason, "Qty": qty_to_close,
         })
 
     for i in range(1, len(df) - 1):
@@ -627,6 +866,13 @@ def run_backtest(raw_df, strategy, sl_type, target_type, params, filters, qty):
                     "highest": entry_price, "lowest": entry_price,
                     "signal_candle": df.index[i], "entry_idx": entry_idx,
                     "pending_exit_reason": None,
+                    "peak_pl_points": 0.0, "worst_pl_points": 0.0, "loss_since": None,
+                    "original_qty": qty, "remaining_qty": qty, "partial_booked": False,
+                    "loss_trigger_points": params.get("loss_trigger_points", 20.0),
+                    "min_recovery_pct": params.get("min_recovery_pct", 50.0),
+                    "profit_trigger_points": params.get("profit_trigger_points", 50.0),
+                    "giveback_pct": params.get("giveback_pct", 30.0),
+                    "partial_book_pct": params.get("partial_book_pct", 50.0),
                 }
         else:
             if i < open_trade["entry_idx"]:
@@ -637,31 +883,75 @@ def run_backtest(raw_df, strategy, sl_type, target_type, params, filters, qty):
             exited, exit_price, reason = False, None, None
 
             # 1) A signal/EMA-reverse exit detected on the PREVIOUS candle's
-            #    close is executed here, at THIS candle's open — mirrors how
-            #    entries are delayed one candle, so no look-ahead.
+            #    close is executed here, at THIS candle's open.
             if open_trade.get("pending_exit_reason"):
                 exited, exit_price, reason = True, candle["Open"], open_trade["pending_exit_reason"]
 
-            # 2) Hard SL/Target check on this candle (safe — never depends on
-            #    this candle's own close).
+            # 2) Stateful special exits (Loss Recovery SL / Profit Giveback Target).
             if not exited:
-                exited, exit_price, reason = check_hard_exit(open_trade, candle)
+                sp_exit, sp_price, sp_reason = check_special_exit_conditions(open_trade, candle)
+                if sp_exit:
+                    exited, exit_price, reason = True, sp_price, sp_reason
+
+            # 2b) Time-based loss-holding-duration exit (if enabled).
+            if not exited and risk_ctrl.get("loss_duration_enabled"):
+                td_exit, td_price, td_reason = check_time_based_exit(
+                    open_trade, df.index[i], candle["Close"],
+                    risk_ctrl.get("loss_duration_min_minutes", 1), risk_ctrl.get("loss_duration_max_minutes", 5),
+                )
+                if td_exit:
+                    exited, exit_price, reason = True, td_price, td_reason
+
+            # 3) Hard SL/Target on this candle. For "Partial Book + Trail
+            #    Remainder", a Target Hit here means Target 1 — book part of
+            #    the quantity and keep the rest running under a trailing stop
+            #    instead of a full close.
+            if not exited:
+                hard_exit, hard_price, hard_reason = check_hard_exit(open_trade, candle)
+                if hard_exit:
+                    if (open_trade["target_type"] == "Partial Book + Trail Remainder"
+                            and hard_reason == "Target Hit" and not open_trade["partial_booked"]):
+                        book_qty = max(1, round(open_trade["original_qty"] * open_trade["partial_book_pct"] / 100.0))
+                        book_qty = min(book_qty, open_trade["remaining_qty"])
+                        partial_points = (hard_price - open_trade["entry_price"]) * open_trade["direction"]
+                        trades.append({
+                            "Entry Time": open_trade["entry_time"], "Entry Price": round(open_trade["entry_price"], 2),
+                            "Direction": "LONG" if open_trade["direction"] == 1 else "SHORT",
+                            "Exit Time": df.index[i], "Exit Price": round(float(hard_price), 2),
+                            "SL": round(open_trade["initial_sl"], 2), "Target": round(open_trade["initial_target"], 2),
+                            "Points": round(partial_points, 2), "PnL": round(partial_points * book_qty, 2),
+                            "Exit Reason": f"Partial Book ({book_qty}/{open_trade['original_qty']} qty @ Target 1)",
+                            "Qty": book_qty,
+                        })
+                        open_trade["remaining_qty"] -= book_qty
+                        open_trade["partial_booked"] = True
+                        if open_trade["remaining_qty"] <= 0:
+                            open_trade = None
+                        else:
+                            # Remainder now runs on a trailing stop only — no
+                            # fixed second target — and the SL is forced onto
+                            # an ATR trail if it wasn't already trailing, so
+                            # the remainder is never left unprotected.
+                            open_trade["target_type"] = "Trailing Target (Display Only)"
+                            if open_trade["sl_type"] not in ("Trailing SL (Points)", "ATR Based SL", "Autopilot SL"):
+                                open_trade["sl_type"] = "ATR Based SL"
+                        continue
+                    else:
+                        exited, exit_price, reason = True, hard_price, hard_reason
 
             if exited:
-                close_trade(exit_price, df.index[i], reason)
+                close_trade(exit_price, df.index[i], reason, open_trade["remaining_qty"])
                 open_trade = None
-            else:
-                # 3) Detect (but don't act on) a new signal/EMA-reverse exit
+            elif open_trade is not None:
+                # 4) Detect (but don't act on) a new signal/EMA-reverse exit
                 #    using this candle's own close — scheduled for next candle.
                 sig_exit, sig_reason = detect_signal_exit_condition(open_trade, i, df, params)
                 if sig_exit:
                     open_trade["pending_exit_reason"] = sig_reason
 
     if open_trade is not None:
-        # Ran out of data with a position still open — close it out at the
-        # last available close so it's counted, flagged distinctly.
         last_i = len(df) - 1
-        close_trade(df["Close"].iloc[last_i], df.index[last_i], "End of Data (Forced Close)")
+        close_trade(df["Close"].iloc[last_i], df.index[last_i], "End of Data (Forced Close)", open_trade["remaining_qty"])
 
     return pd.DataFrame(trades), df
 
@@ -835,6 +1125,36 @@ def place_dhan_order(client_id, access_token, security_id, txn_type, product_cfg
             "note": "Live Dhan order call is disabled in this build — replace this stub with a requests.post call."}
 
 
+def resolve_dhan_order_leg(direction, is_entry, fallback_ticker, product_cfg):
+    """
+    Decides WHICH instrument to trade and which side (BUY/SELL) to send.
+
+    If "Auto-select CE/PE by signal direction" is on and both security IDs are
+    filled in: a LONG signal buys the CE leg, a SHORT signal buys the PE leg —
+    both are entered by BUYING (not selling) an option, which keeps risk
+    defined (no naked option writing baked into this default). Exiting always
+    SELLs whichever leg is currently open.
+
+    Otherwise, falls back to trading the underlying ticker directly: BUY to
+    open long / SELL to close it, SELL to open short / BUY to close it.
+    """
+    use_ce_pe = (
+        product_cfg.get("auto_ce_pe")
+        and product_cfg.get("ce_security_id")
+        and product_cfg.get("pe_security_id")
+    )
+    if use_ce_pe:
+        security_id = product_cfg["ce_security_id"] if direction == 1 else product_cfg["pe_security_id"]
+        txn_type = "BUY" if is_entry else "SELL"
+        return security_id, txn_type
+
+    if is_entry:
+        txn_type = "BUY" if direction == 1 else "SELL"
+    else:
+        txn_type = "SELL" if direction == 1 else "BUY"
+    return fallback_ticker, txn_type
+
+
 # ============================================================================
 # SIDEBAR
 # ============================================================================
@@ -912,6 +1232,11 @@ sl_type = st.sidebar.selectbox(
 params["sl_points"] = st.sidebar.number_input("SL Points (base)", 0.1, 100000.0, float(ov.get("sl_points", 10.0)))
 if sl_type == "ATR Based SL":
     params["atr_mult_sl"] = st.sidebar.number_input("ATR Multiplier (SL)", 0.5, 5.0, float(ov.get("atr_mult_sl", 1.5)))
+if sl_type == "Loss Recovery SL (Give-back)":
+    c1, c2 = st.sidebar.columns(2)
+    params["loss_trigger_points"] = c1.number_input("Loss trigger (points)", 1.0, 100000.0, 20.0)
+    params["min_recovery_pct"] = c2.number_input("Min recovery required (%)", 1.0, 100.0, 50.0)
+    st.sidebar.caption(f"Once floating loss reaches {params['loss_trigger_points']:.0f} pts, exit if price hasn't recovered at least {params['min_recovery_pct']:.0f}% of that loss back toward entry.")
 
 st.sidebar.markdown("### 🎯 Target")
 target_type = st.sidebar.selectbox(
@@ -921,8 +1246,40 @@ target_type = st.sidebar.selectbox(
 params["target_points"] = st.sidebar.number_input("Target Points (base)", 0.1, 200000.0, float(ov.get("target_points", 20.0)))
 if target_type == "ATR Based Target":
     params["atr_mult_target"] = st.sidebar.number_input("ATR Multiplier (Target)", 1.0, 8.0, float(ov.get("atr_mult_target", 3.0)))
+if target_type == "Profit Giveback Target":
+    c1, c2 = st.sidebar.columns(2)
+    params["profit_trigger_points"] = c1.number_input("Profit trigger (points)", 1.0, 100000.0, 50.0)
+    params["giveback_pct"] = c2.number_input("Max giveback allowed (%)", 1.0, 100.0, 30.0)
+    st.sidebar.caption(f"Once floating profit peaks at ≥{params['profit_trigger_points']:.0f} pts, exit if it falls back by more than {params['giveback_pct']:.0f}% from that peak.")
+if target_type == "Partial Book + Trail Remainder":
+    c1, c2 = st.sidebar.columns(2)
+    params["partial_target1_points"] = c1.number_input("Target 1 (points)", 0.1, 200000.0, float(params.get("target_points", 20.0)))
+    params["partial_book_pct"] = c2.number_input("Qty % to book at Target 1", 1.0, 99.0, 50.0)
+    st.sidebar.caption(
+        f"Books {params['partial_book_pct']:.0f}% of quantity when Target 1 ({params['partial_target1_points']:.0f} pts) is hit; "
+        "the remainder keeps running under an ATR trailing stop with no fixed second target. "
+        "⚠️ With Quantity = 1, there's nothing left to trail after rounding — increase Quantity in the sidebar to actually see partial-booking behavior."
+    )
 if sl_type == "Risk:Reward Based (min 1:2)" or target_type == "Risk:Reward Based (min 1:2)":
     params["rr_ratio"] = st.sidebar.number_input("Risk:Reward Ratio (min 2)", 2.0, 10.0, float(ov.get("rr_ratio", 2.0)))
+
+st.sidebar.markdown("### ⏱ Time-Based Risk Control")
+loss_duration_enabled = st.sidebar.checkbox("Loss Holding Duration Exit", value=False)
+loss_duration_min_minutes, loss_duration_max_minutes = 1.0, 5.0
+if loss_duration_enabled:
+    c1, c2 = st.sidebar.columns(2)
+    loss_duration_min_minutes = c1.number_input("Min minutes in loss before acting", min_value=0.0, value=1.0, step=1.0)
+    loss_duration_max_minutes = c2.number_input("Safety ceiling (minutes)", min_value=0.0, value=5.0, step=1.0)
+    st.sidebar.caption(
+        "Exits as soon as the position has been continuously in a floating loss for at least the first number "
+        "of minutes. The second number is just an upper safety bound (mainly relevant to live polling delays) — "
+        "keep it ≥ the first. No cap is applied to how high you can set either value."
+    )
+risk_ctrl = {
+    "loss_duration_enabled": loss_duration_enabled,
+    "loss_duration_min_minutes": loss_duration_min_minutes,
+    "loss_duration_max_minutes": loss_duration_max_minutes,
+}
 
 st.sidebar.markdown("### 🔍 Additional Entry Filters")
 filters = {
@@ -964,6 +1321,42 @@ if filters["regime_enabled"]:
         "it stops your chosen strategy from firing in the regime it's known to perform badly in."
     )
 
+filters["angle_enabled"] = st.sidebar.checkbox("Angle of Crossover Filter", value=False)
+if filters["angle_enabled"]:
+    filters["angle_min_deg"] = st.sidebar.number_input(
+        "Minimum crossover angle (degrees, absolute value)", min_value=0.0, value=0.0, step=1.0,
+    )
+    st.sidebar.caption(
+        f"Only accepts an EMA{params.get('ema_fast',9)}/{params.get('ema_slow',15)} crossover if it's steep enough. "
+        "Angle is normalized against ATR (there's no universal 'degrees' for a raw price slope), so treat it as a "
+        "relative steepness score, not a standardized industry figure. Absolute value is used since valid crosses "
+        "can produce a negative raw slope depending on direction."
+    )
+
+filters["crossover_quality_enabled"] = st.sidebar.checkbox("Crossover Confirmation Filter", value=False)
+if filters["crossover_quality_enabled"]:
+    filters["crossover_quality_mode"] = st.sidebar.selectbox(
+        "Confirmation type", ["Simple Crossover", "Crossover with Candle Size", "Crossover with ATR-based Candle Size"],
+    )
+    if filters["crossover_quality_mode"] == "Crossover with Candle Size":
+        filters["crossover_min_points"] = st.sidebar.number_input("Min candle range (points)", min_value=0.0, value=1.0, step=0.5)
+    elif filters["crossover_quality_mode"] == "Crossover with ATR-based Candle Size":
+        filters["crossover_atr_mult"] = st.sidebar.number_input("Min candle range (× ATR)", min_value=0.1, value=1.0, step=0.1)
+    st.sidebar.caption(f"Only accepts an EMA{params.get('ema_fast',9)}/{params.get('ema_slow',15)} crossover bar that also clears this candle-size bar — filters out crosses on tiny, indecisive candles.")
+
+filters["vix_enabled"] = st.sidebar.checkbox("India VIX Filter", value=False)
+if filters["vix_enabled"]:
+    c1, c2 = st.sidebar.columns(2)
+    filters["vix_min"] = c1.number_input("VIX Min", 0.0, 100.0, 10.0)
+    filters["vix_max"] = c2.number_input("VIX Max", 0.0, 100.0, 25.0)
+    st.sidebar.caption(
+        "India VIX is a fear/expected-volatility gauge, not a price indicator — you don't need to be an expert to "
+        "use it as a simple filter here. Rough rule of thumb: below ~15 = calm (often better for trend-following), "
+        "15–20 = normal, 20–30 = elevated/nervous (often better for mean-reversion or smaller size), above ~30 = "
+        "panic (many systems sit out entirely). Defaults above (10–25) are a conservative 'avoid extremes' band — "
+        "adjust to taste. VIX only publishes daily, so intraday timeframes reuse the latest known daily value."
+    )
+
 st.sidebar.markdown("### 🧠 Smart Evaluation (Recommended Before Going Live)")
 st.sidebar.caption("Off by default. Turn these on to get a more honest read on whether a config is likely to hold up out-of-sample and after real costs.")
 
@@ -999,6 +1392,17 @@ if dhan_enabled:
         c1, c2 = st.sidebar.columns(2)
         product_cfg["strike"] = c1.number_input("Strike Price", 0.0, 200000.0, 0.0)
         product_cfg["expiry"] = c2.text_input("Expiry (YYYY-MM-DD)")
+
+        auto_ce_pe = st.sidebar.checkbox("Auto-select CE/PE by signal direction", value=False)
+        product_cfg["auto_ce_pe"] = auto_ce_pe
+        if auto_ce_pe:
+            product_cfg["ce_security_id"] = st.sidebar.text_input("CE Security ID (used on LONG signals)")
+            product_cfg["pe_security_id"] = st.sidebar.text_input("PE Security ID (used on SHORT signals)")
+            st.sidebar.caption(
+                "When a LONG signal fires, the app BUYs the CE leg; when a SHORT signal fires, it BUYs the PE leg "
+                "(buying options both ways keeps risk defined — no naked option selling). Exits SELL whichever leg "
+                "is open. You still need to update these IDs yourself when the strike/expiry rolls."
+            )
     product_cfg["exchange_segment"] = st.sidebar.selectbox("Exchange Segment", ["NSE_EQ", "NSE_FNO", "BSE_EQ", "MCX_COMM"])
     product_cfg["product"] = st.sidebar.selectbox("Product Type", ["INTRADAY", "CNC", "MARGIN", "MTF"])
     product_cfg["order_mode"] = st.sidebar.selectbox("Order Mode", ["Buy then Buy (allow same-side re-entry)", "Flip only (Buy⇄Sell)"])
@@ -1009,6 +1413,7 @@ config = dict(
     ticker=ticker, ticker_choice=ticker_choice, interval=interval, period=period, qty=qty,
     strategy=strategy, sl_type=sl_type, target_type=target_type, params=params, filters=filters,
     wf_enabled=wf_enabled, wf_folds=wf_folds, cost_enabled=cost_enabled, cost_cfg=cost_cfg,
+    risk_ctrl=risk_ctrl,
 )
 
 # ============================================================================
@@ -1045,57 +1450,141 @@ def describe_signal_status(df, strategy, params, filters):
     Human-readable read of exactly where the current (latest closed) candle
     stands relative to what each active condition needs to fire a buy or a
     sell. Not a guarantee of a signal — just a transparent status board.
+    Any indicator without enough warm-up history reports 'N/A' instead of a
+    misleading half-computed number.
     """
     lines = []
     close = df["Close"]
     f, s = params.get("ema_fast", 9), params.get("ema_slow", 15)
     ef, es = ema(close, f), ema(close, s)
-    ef_now, es_now, ef_prev, es_prev = ef.iloc[-1], es.iloc[-1], ef.iloc[-2], es.iloc[-2]
-    gap = ef_now - es_now
+    ef_val, ef_ok = safe_indicator_value(ef, max(f * 3, f + 5))
+    es_val, es_ok = safe_indicator_value(es, max(s * 3, s + 5))
+    a_series = atr(df, 14)
 
     if strategy in ("EMA Crossover", "Pro: EMA50 Trend + EMA9/15 Pullback"):
-        state = "🟢 BULLISH (fast > slow)" if ef_now > es_now else "🔴 BEARISH (fast < slow)"
-        lines.append(f"EMA{f}={ef_now:.2f} vs EMA{s}={es_now:.2f} → {state}, gap = {gap:+.2f}")
-        if ef_now > es_now:
-            lines.append(f"Needs EMA{f} to cross BELOW EMA{s} for a fresh SELL signal (currently {gap:+.2f} above).")
+        if ef_ok and es_ok:
+            gap = ef_val - es_val
+            state = "🟢 BULLISH (fast > slow)" if ef_val > es_val else "🔴 BEARISH (fast < slow)"
+            lines.append(f"EMA{f}={ef_val:.2f} vs EMA{s}={es_val:.2f} → {state}, gap = {gap:+.2f}")
+            if ef_val > es_val:
+                lines.append(f"Needs EMA{f} to cross BELOW EMA{s} for a fresh SELL signal (currently {gap:+.2f} above).")
+            else:
+                lines.append(f"Needs EMA{f} to cross ABOVE EMA{s} for a fresh BUY signal (currently {gap:+.2f} below).")
         else:
-            lines.append(f"Needs EMA{f} to cross ABOVE EMA{s} for a fresh BUY signal (currently {gap:+.2f} below).")
+            lines.append(f"EMA{f}/EMA{s}: N/A — need at least {max(f,s)*3} candles of history to warm up reliably, only have {len(df)}.")
 
     if strategy == "RSI Cross" or filters.get("rsi_enabled"):
         r = rsi(close, params.get("rsi_period", 14))
-        r_now = r.iloc[-1]
-        lines.append(f"RSI({params.get('rsi_period',14)}) = {r_now:.1f}. Buy needs RSI to cross UP through 30 (distance: {r_now-30:+.1f}). "
-                     f"Sell needs RSI to cross DOWN through 70 (distance: {70-r_now:+.1f}).")
+        r_val, r_ok = safe_indicator_value(r, params.get("rsi_period", 14) * 3)
+        if r_ok:
+            lines.append(f"RSI({params.get('rsi_period',14)}) = {r_val:.1f}. Buy needs RSI to cross UP through 30 (distance: {r_val-30:+.1f}). "
+                         f"Sell needs RSI to cross DOWN through 70 (distance: {70-r_val:+.1f}).")
+        else:
+            lines.append(f"RSI: N/A — insufficient warm-up history ({len(df)} candles available).")
 
     if strategy in ("Bollinger Bands", "Pro: BB+RSI Mean Reversion (ATR filtered)") or filters.get("bb_enabled"):
         upper, mid, lower = bollinger(close, params.get("bb_period", 20), params.get("bb_std", 2))
-        lines.append(f"Close {close.iloc[-1]:.2f} vs Bollinger band [{lower.iloc[-1]:.2f} , {upper.iloc[-1]:.2f}] "
-                     f"(mid {mid.iloc[-1]:.2f}). Distance to lower band: {close.iloc[-1]-lower.iloc[-1]:+.2f}, to upper: {upper.iloc[-1]-close.iloc[-1]:+.2f}.")
+        u_val, u_ok = safe_indicator_value(upper, params.get("bb_period", 20) * 2)
+        l_val, l_ok = safe_indicator_value(lower, params.get("bb_period", 20) * 2)
+        m_val, m_ok = safe_indicator_value(mid, params.get("bb_period", 20) * 2)
+        if u_ok and l_ok and m_ok:
+            c_now = float(close.iloc[-1])
+            lines.append(f"Close {c_now:.2f} vs Bollinger band [{l_val:.2f} , {u_val:.2f}] (mid {m_val:.2f}). "
+                         f"Distance to lower band: {c_now-l_val:+.2f}, to upper: {u_val-c_now:+.2f}.")
+        else:
+            lines.append("Bollinger Bands: N/A — insufficient warm-up history.")
 
     if filters.get("adx_enabled"):
-        a_now = adx(df, 14).iloc[-1]
-        ok = filters["adx_min"] <= a_now <= filters["adx_max"]
-        lines.append(f"ADX filter: current ADX = {a_now:.1f}, needs [{filters['adx_min']}, {filters['adx_max']}] → {'✅ OK' if ok else '❌ blocking entries right now'}")
+        a_val, a_ok = safe_indicator_value(adx(df, 14), 14 * 4)
+        if a_ok:
+            ok = filters["adx_min"] <= a_val <= filters["adx_max"]
+            lines.append(f"ADX filter: current ADX = {a_val:.1f}, needs [{filters['adx_min']}, {filters['adx_max']}] → {'✅ OK' if ok else '❌ blocking entries right now'}")
+        else:
+            lines.append("ADX filter: N/A — insufficient warm-up history (ADX needs roughly 3-4x its period to stabilize).")
 
     if filters.get("supertrend_enabled"):
         st_line, st_dir = supertrend(df, filters.get("st_filter_period", 10), filters.get("st_filter_mult", 3.0))
-        d_now = st_dir.iloc[-1]
-        lines.append(f"Supertrend filter: currently {'🟢 Bullish' if d_now == 1 else '🔴 Bearish'} → {'only BUY' if d_now==1 else 'only SELL'} entries allowed.")
+        if len(df) >= filters.get("st_filter_period", 10) * 4:
+            d_now = st_dir.iloc[-1]
+            lines.append(f"Supertrend filter: currently {'🟢 Bullish' if d_now == 1 else '🔴 Bearish'} → {'only BUY' if d_now==1 else 'only SELL'} entries allowed.")
+        else:
+            lines.append("Supertrend filter: N/A — insufficient warm-up history.")
 
     if filters.get("regime_enabled"):
-        a_now = adx(df, 14).iloc[-1]
+        a_val, a_ok = safe_indicator_value(adx(df, 14), 14 * 4)
         family = STRATEGY_FAMILY.get(strategy, "neutral")
-        if family == "trend":
-            ok = a_now >= filters["regime_trend_min"]
-            lines.append(f"Regime filter (trend strategy): ADX {a_now:.1f} needs ≥ {filters['regime_trend_min']} → {'✅ trending, OK' if ok else '❌ not trending enough, blocking entries'}")
+        if not a_ok:
+            lines.append("Regime filter: N/A — insufficient warm-up history for ADX.")
+        elif family == "trend":
+            ok = a_val >= filters["regime_trend_min"]
+            lines.append(f"Regime filter (trend strategy): ADX {a_val:.1f} needs ≥ {filters['regime_trend_min']} → {'✅ trending, OK' if ok else '❌ not trending enough, blocking entries'}")
         elif family == "mean_reversion":
-            ok = a_now <= filters["regime_range_max"]
-            lines.append(f"Regime filter (mean-reversion strategy): ADX {a_now:.1f} needs ≤ {filters['regime_range_max']} → {'✅ ranging, OK' if ok else '❌ trending too hard, blocking entries'}")
+            ok = a_val <= filters["regime_range_max"]
+            lines.append(f"Regime filter (mean-reversion strategy): ADX {a_val:.1f} needs ≤ {filters['regime_range_max']} → {'✅ ranging, OK' if ok else '❌ trending too hard, blocking entries'}")
+
+    if filters.get("angle_enabled") and ef_ok and es_ok:
+        a_now = a_series.iloc[-1] if not pd.isna(a_series.iloc[-1]) else None
+        if a_now:
+            ema_fast_delta = ef.diff().iloc[-1]
+            angle_now = np.degrees(np.arctan2(abs(ema_fast_delta), a_now)) if a_now > 0 else None
+            if angle_now is not None:
+                ok = angle_now >= filters.get("angle_min_deg", 0)
+                lines.append(f"Crossover angle (ATR-normalized): {angle_now:.1f}°, needs ≥ {filters.get('angle_min_deg',0):.1f}° → {'✅ OK' if ok else '❌ too shallow right now'}")
+
+    if filters.get("vix_enabled"):
+        vix_aligned = get_vix_aligned(df.index)
+        vix_val = vix_aligned.iloc[-1] if len(vix_aligned) else np.nan
+        if pd.isna(vix_val):
+            lines.append("India VIX filter: N/A — couldn't fetch VIX data right now.")
+        else:
+            ok = filters["vix_min"] <= vix_val <= filters["vix_max"]
+            lines.append(f"India VIX: {vix_val:.2f}, needs [{filters['vix_min']}, {filters['vix_max']}] → {'✅ OK' if ok else '❌ blocking entries right now'}")
 
     return lines
 
 
-def apply_config_to_sidebar(cfg_row):
+@st.fragment(run_every=3)
+def live_dashboard_fragment(ticker, interval, period, strategy, params, filters):
+    """
+    Everything here re-renders on its own every ~3s WITHOUT rerunning the rest
+    of the page — this is what makes the signal status board (RSI/EMA/ADX/etc.
+    values) update live instead of only on button click or full page refresh.
+    Only ever mounted while Live Monitoring is ON, so it costs zero extra API
+    calls while stopped.
+    """
+    raw_status = fetch_data(ticker, interval, period)
+    if raw_status.empty or len(raw_status) < 30:
+        st.caption("Not enough data yet to compute signal status.")
+        return
+
+    st.markdown("###### 📊 Indicator Dashboard")
+    close = raw_status["Close"]
+    f, s = params.get("ema_fast", 9), params.get("ema_slow", 15)
+    ef_val, ef_ok = safe_indicator_value(ema(close, f), max(f * 3, f + 5))
+    es_val, es_ok = safe_indicator_value(ema(close, s), max(s * 3, s + 5))
+
+    cols = st.columns(4)
+    cols[0].metric(f"EMA {f} (fast)", f"{ef_val:.2f}" if ef_ok else "N/A")
+    cols[1].metric(f"EMA {s} (slow)", f"{es_val:.2f}" if es_ok else "N/A")
+    cols[2].metric("Gap", f"{(ef_val-es_val):+.2f}" if ef_ok and es_ok else "N/A")
+    if filters.get("adx_enabled") or filters.get("regime_enabled"):
+        adx_val, adx_ok = safe_indicator_value(adx(raw_status, 14), 14 * 4)
+        cols[3].metric("ADX", f"{adx_val:.1f}" if adx_ok else "N/A")
+    elif filters.get("vix_enabled"):
+        vix_series = get_vix_aligned(raw_status.index)
+        vix_val = vix_series.iloc[-1] if len(vix_series) else np.nan
+        cols[3].metric("India VIX", f"{vix_val:.2f}" if not pd.isna(vix_val) else "N/A")
+    else:
+        rsi_val, rsi_ok = safe_indicator_value(rsi(close, params.get("rsi_period", 14)), params.get("rsi_period", 14) * 3)
+        cols[3].metric("RSI", f"{rsi_val:.1f}" if rsi_ok else "N/A")
+
+    st.markdown("###### 📟 Signal Status Board")
+    st.caption("What the current (last closed) candle is showing vs. what's needed to trigger a fresh buy or sell. Updates automatically every ~3s while live monitoring is on.")
+    for line in describe_signal_status(raw_status, strategy, params, filters):
+        st.write("• " + line)
+
+
+
     """Push a chosen optimization result row into sidebar_overrides and rerun."""
     st.session_state.sidebar_overrides = {
         "ticker_choice": cfg_row.get("ticker_choice", ticker_choice),
@@ -1239,7 +1728,7 @@ with tab_bt:
             if raw.empty:
                 st.error("No data returned. Check ticker/timeframe/period combination.")
             else:
-                trades_df, sig_df = run_backtest(raw, strategy, sl_type, target_type, params, filters, qty)
+                trades_df, sig_df = run_backtest(raw, strategy, sl_type, target_type, params, filters, qty, risk_ctrl)
                 st.session_state.last_backtest = trades_df
                 st.session_state.last_backtest_df = sig_df
 
@@ -1303,7 +1792,7 @@ with tab_bt:
 # ------------------------------------------------------------- LIVE TRADE -
 with tab_live:
     st.subheader(f"Live (Paper) Trading — {ticker_choice} ({ticker})")
-    st.caption("This is a simulation layer driven by the latest candle signal. Refreshing does not auto-trade by itself — click Evaluate (or Start) to act on new candles.")
+    st.caption("This is a simulation layer driven by the latest candle signal. Nothing polls the API until you click Start — Stop (or leaving/closing this browser tab) halts it again.")
 
     def _evaluate_live_signal():
         raw = fetch_data(ticker, interval, period)
@@ -1312,7 +1801,7 @@ with tab_live:
             return
         live_filters = dict(filters)
         live_filters["current_strategy"] = strategy
-        sig_df = apply_filters(generate_signals(raw, strategy, params), live_filters)
+        sig_df = apply_filters(generate_signals(raw, strategy, params), live_filters, params)
         a_series = atr(sig_df, 14)
         last_sig = int(sig_df["signal"].iloc[-2])  # last CLOSED candle's signal
         open_pos = st.session_state.live_positions
@@ -1327,7 +1816,49 @@ with tab_live:
             if pos.get("pending_exit_reason"):
                 exited, exit_price, reason = True, candle["Open"], pos["pending_exit_reason"]
             if not exited:
-                exited, exit_price, reason = check_hard_exit(pos, candle)
+                sp_exit, sp_price, sp_reason = check_special_exit_conditions(pos, candle)
+                if sp_exit:
+                    exited, exit_price, reason = True, sp_price, sp_reason
+            if not exited and risk_ctrl.get("loss_duration_enabled"):
+                td_exit, td_price, td_reason = check_time_based_exit(
+                    pos, sig_df.index[-1], candle["Close"],
+                    risk_ctrl.get("loss_duration_min_minutes", 1), risk_ctrl.get("loss_duration_max_minutes", 5),
+                )
+                if td_exit:
+                    exited, exit_price, reason = True, td_price, td_reason
+            if not exited:
+                hard_exit, hard_price, hard_reason = check_hard_exit(pos, candle)
+                if hard_exit:
+                    if pos["target_type"] == "Partial Book + Trail Remainder" and hard_reason == "Target Hit" and not pos["partial_booked"]:
+                        book_qty = max(1, round(pos["original_qty"] * pos["partial_book_pct"] / 100.0))
+                        book_qty = min(book_qty, pos["remaining_qty"])
+                        partial_points = (hard_price - pos["entry_price"]) * pos["direction"]
+                        st.session_state.live_history.append({
+                            "Entry Time": pos["entry_time"], "Entry Price": round(pos["entry_price"], 2),
+                            "Direction": "LONG" if pos["direction"] == 1 else "SHORT",
+                            "Exit Time": sig_df.index[-1], "Exit Price": round(float(hard_price), 2),
+                            "SL": round(pos["initial_sl"], 2), "Target": round(pos["initial_target"], 2),
+                            "Points": round(partial_points, 2), "PnL": round(partial_points * book_qty, 2),
+                            "Exit Reason": f"Partial Book ({book_qty}/{pos['original_qty']} qty @ Target 1)", "Qty": book_qty,
+                        })
+                        pos["remaining_qty"] -= book_qty
+                        pos["partial_booked"] = True
+                        if dhan_enabled:
+                            leg_id, side = resolve_dhan_order_leg(pos["direction"], False, ticker, product_cfg)
+                            st.json(place_dhan_order(dhan_client_id, dhan_access_token, leg_id, side, product_cfg, book_qty, hard_price))
+                        if pos["remaining_qty"] <= 0:
+                            st.session_state.live_positions = []
+                            st.success(f"Fully booked at Target 1 @ {hard_price:.2f}")
+                            return sig_df
+                        else:
+                            pos["target_type"] = "Trailing Target (Display Only)"
+                            if pos["sl_type"] not in ("Trailing SL (Points)", "ATR Based SL", "Autopilot SL"):
+                                pos["sl_type"] = "ATR Based SL"
+                            st.session_state.live_positions = [pos]
+                            st.success(f"Partial booked ({book_qty} qty) @ {hard_price:.2f} — remaining {pos['remaining_qty']} qty now trailing.")
+                            return sig_df
+                    else:
+                        exited, exit_price, reason = True, hard_price, hard_reason
             if not exited:
                 sig_exit, sig_reason = detect_signal_exit_condition(pos, i, sig_df, params)
                 if sig_exit:
@@ -1341,14 +1872,14 @@ with tab_live:
                     "Direction": "LONG" if pos["direction"] == 1 else "SHORT",
                     "Exit Time": sig_df.index[-1], "Exit Price": round(float(exit_price), 2),
                     "SL": round(pos["initial_sl"], 2), "Target": round(pos["initial_target"], 2),
-                    "Points": round(points, 2), "PnL": round(points * pos["qty"], 2),
-                    "Exit Reason": reason, "Qty": pos["qty"],
+                    "Points": round(points, 2), "PnL": round(points * pos["remaining_qty"], 2),
+                    "Exit Reason": reason, "Qty": pos["remaining_qty"],
                 })
                 st.session_state.live_positions = []
                 st.success(f"Position closed: {reason} @ {exit_price:.2f}")
                 if dhan_enabled:
-                    side = "SELL" if pos["direction"] == 1 else "BUY"
-                    st.json(place_dhan_order(dhan_client_id, dhan_access_token, ticker, side, product_cfg, pos["qty"], exit_price))
+                    leg_id, side = resolve_dhan_order_leg(pos["direction"], False, ticker, product_cfg)
+                    st.json(place_dhan_order(dhan_client_id, dhan_access_token, leg_id, side, product_cfg, pos["remaining_qty"], exit_price))
             else:
                 st.session_state.live_positions = [pos]
                 st.info("Position still open — levels updated.")
@@ -1362,12 +1893,19 @@ with tab_live:
                 "sl_dist": sl_dist, "target_dist": target_dist, "sl_type": sl_type, "target_type": target_type,
                 "highest": entry_price, "lowest": entry_price, "current_price": entry_price,
                 "pending_exit_reason": None,
+                "peak_pl_points": 0.0, "worst_pl_points": 0.0, "loss_since": None,
+                "original_qty": qty, "remaining_qty": qty, "partial_booked": False,
+                "loss_trigger_points": params.get("loss_trigger_points", 20.0),
+                "min_recovery_pct": params.get("min_recovery_pct", 50.0),
+                "profit_trigger_points": params.get("profit_trigger_points", 50.0),
+                "giveback_pct": params.get("giveback_pct", 30.0),
+                "partial_book_pct": params.get("partial_book_pct", 50.0),
             }
             st.session_state.live_positions = [new_pos]
             st.success(f"New {'LONG' if last_sig == 1 else 'SHORT'} position opened @ {entry_price:.2f}")
             if dhan_enabled:
-                side = "BUY" if last_sig == 1 else "SELL"
-                st.json(place_dhan_order(dhan_client_id, dhan_access_token, ticker, side, product_cfg, qty, entry_price))
+                leg_id, side = resolve_dhan_order_leg(last_sig, True, ticker, product_cfg)
+                st.json(place_dhan_order(dhan_client_id, dhan_access_token, leg_id, side, product_cfg, qty, entry_price))
         else:
             st.caption("No new signal on the latest closed candle.")
         return sig_df
@@ -1391,9 +1929,10 @@ with tab_live:
         squareoff_clicked = st.button("🟥 Square Off Now", use_container_width=True, disabled=not st.session_state.live_positions)
 
     if st.session_state.live_running:
-        st.success("🟢 Live monitoring is ON — click Stop to pause. Each app refresh (or Evaluate Once) checks for new signals / manages the open position.")
+        st.success("🟢 Live monitoring is ON — polling the API and re-checking signals every few seconds. Click Stop to halt it.")
     else:
-        st.caption("⚪ Live monitoring is OFF. Click Start to arm it, or use Evaluate Once for a manual single check.")
+        st.caption("⚪ Live monitoring is OFF — no background API calls are being made. Click Start to arm it, or use Evaluate Once for a single manual check.")
+    st.caption("Note: a full browser close / new session always resets this to OFF. A plain in-tab refresh (F5) may preserve the ON state since Streamlit keeps the same session — click Stop first if you want a hard reset before refreshing.")
 
     if squareoff_clicked and st.session_state.live_positions:
         pos = st.session_state.live_positions[0]
@@ -1405,22 +1944,23 @@ with tab_live:
             "Direction": "LONG" if pos["direction"] == 1 else "SHORT",
             "Exit Time": datetime.now(), "Exit Price": round(exit_price, 2),
             "SL": round(pos["initial_sl"], 2), "Target": round(pos["initial_target"], 2),
-            "Points": round(points, 2), "PnL": round(points * pos["qty"], 2),
-            "Exit Reason": "Manual Square Off", "Qty": pos["qty"],
+            "Points": round(points, 2), "PnL": round(points * pos["remaining_qty"], 2),
+            "Exit Reason": "Manual Square Off", "Qty": pos["remaining_qty"],
         })
         st.session_state.live_positions = []
         st.warning(f"Manually squared off @ {exit_price:.2f}")
         if dhan_enabled:
-            side = "SELL" if pos["direction"] == 1 else "BUY"
-            st.json(place_dhan_order(dhan_client_id, dhan_access_token, ticker, side, product_cfg, pos["qty"], exit_price))
+            leg_id, side = resolve_dhan_order_leg(pos["direction"], False, ticker, product_cfg)
+            st.json(place_dhan_order(dhan_client_id, dhan_access_token, leg_id, side, product_cfg, pos["remaining_qty"], exit_price))
         st.rerun()
 
-    colA, colB = st.columns([1, 2])
-    with colA:
-        st.markdown("**Live Price**")
-        ltp = live_ltp_fragment(ticker, "LTP")
-    with colB:
-        st.markdown("**Selected Configuration**")
+    st.markdown("**Live Price & Position P&L**")
+    if st.session_state.live_running:
+        live_position_fragment(ticker, "LTP")
+    else:
+        st.caption("Stopped — no LTP polling. Click Start to resume live price and P&L updates.")
+
+    with st.expander("Selected Configuration"):
         st.json({
             "Ticker": ticker, "Timeframe": interval, "Period": period, "Quantity": qty,
             "Strategy": strategy, "Stoploss Type": sl_type, "Target Type": target_type,
@@ -1431,17 +1971,18 @@ with tab_live:
     if manual_eval or st.session_state.live_running:
         _evaluate_live_signal()
 
-    st.markdown("#### 📟 Signal Status Board")
-    st.caption("What the current (last closed) candle is showing vs. what's needed to trigger a fresh buy or sell.")
-    raw_status = fetch_data(ticker, interval, period)
-    if not raw_status.empty and len(raw_status) >= 30:
-        status_lines = describe_signal_status(raw_status, strategy, params, filters)
-        for line in status_lines:
-            st.write("• " + line)
+    if st.session_state.live_running:
+        live_dashboard_fragment(ticker, interval, period, strategy, params, filters)
     else:
-        st.caption("Not enough data yet to compute signal status.")
+        st.caption("📊 Indicator Dashboard / 📟 Signal Status Board are paused while monitoring is OFF. Click Start to see them update live, or Evaluate Once for a single snapshot below.")
+        if manual_eval:
+            raw_status = fetch_data(ticker, interval, period)
+            if not raw_status.empty and len(raw_status) >= 30:
+                for line in describe_signal_status(raw_status, strategy, params, filters):
+                    st.write("• " + line)
 
-    st.markdown("#### Chart — EMA 9/15 Overlay")
+    st.markdown("#### Chart — EMA Overlay")
+    raw_status = fetch_data(ticker, interval, period)
     if not raw_status.empty:
         chart_df = raw_status.tail(150)
         extra_lines = []
@@ -1453,22 +1994,26 @@ with tab_live:
                 ("Target", pos["target"], "lime", "dash"),
             ]
         st.plotly_chart(
-            price_chart(chart_df, None, "Recent Price Action", ema_overlay=[(9, "#3399ff"), (15, "#ff9933")], extra_lines=extra_lines),
+            price_chart(chart_df, None, "Recent Price Action",
+                        ema_overlay=[(params.get("ema_fast", 9), "#3399ff"), (params.get("ema_slow", 15), "#ff9933")],
+                        extra_lines=extra_lines),
             use_container_width=True,
         )
 
-    st.markdown("#### Open Position")
-    if st.session_state.live_positions:
-        pos = st.session_state.live_positions[0]
-        c1, c2, c3, c4, c5, c6 = st.columns(6)
-        c1.metric("Entry Type", "LONG" if pos["direction"] == 1 else "SHORT")
-        c2.metric("Entry Price", f"{pos['entry_price']:.2f}")
-        c3.metric("SL (live)", f"{pos['sl']:.2f}")
-        c4.metric("Target (live)", f"{pos['target']:.2f}")
-        c5.metric("Highest", f"{pos['highest']:.2f}")
-        c6.metric("Lowest", f"{pos['lowest']:.2f}")
-    else:
-        st.caption("No open paper position.")
+    if not st.session_state.live_running:
+        st.markdown("#### Open Position (static snapshot — start live monitoring for live P&L)")
+        if st.session_state.live_positions:
+            pos = st.session_state.live_positions[0]
+            c1, c2, c3, c4, c5, c6, c7 = st.columns(7)
+            c1.metric("Entry Type", "LONG" if pos["direction"] == 1 else "SHORT")
+            c2.metric("Entry Price", f"{pos['entry_price']:.2f}")
+            c3.metric(f"SL ({pos['sl_type']})", f"{pos['sl']:.2f}")
+            c4.metric(f"Target ({pos['target_type']})", f"{pos['target']:.2f}")
+            c5.metric("Highest", f"{pos['highest']:.2f}")
+            c6.metric("Lowest", f"{pos['lowest']:.2f}")
+            c7.metric("Remaining Qty", f"{pos['remaining_qty']}/{pos['original_qty']}")
+        else:
+            st.caption("No open paper position.")
 
     st.markdown("#### Recent Trades")
     if st.session_state.live_history:
@@ -1518,7 +2063,7 @@ with tab_heat:
             month_order = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
             pivot = monthly.pivot_table(index="Year", columns="Month", values="ret_pct")
             pivot = pivot.reindex(columns=month_order)
-            fig = px.imshow(pivot, text_auto=".1f", color_continuous_scale="RdYlGn", aspect="auto",
+            fig = px.imshow(pivot, text_auto=".1f", color_continuous_scale="RdYlGn", color_continuous_midpoint=0, aspect="auto",
                              labels=dict(color="% return"))
             fig.update_layout(height=max(400, 32 * len(pivot) + 150), title=f"{ticker_choice} — Monthly % Returns ({int(heatmap_years)}Y)")
             st.plotly_chart(fig, use_container_width=True)
@@ -1558,7 +2103,7 @@ with tab_heat:
                 pivot2 = pivot2.reindex(columns=[m for m in month_order if m in pivot2.columns])
                 x_label, y_label = "Month", "Year"
 
-            fig2 = px.imshow(pivot2, text_auto=".2f", color_continuous_scale="RdYlGn", aspect="auto",
+            fig2 = px.imshow(pivot2, text_auto=".2f", color_continuous_scale="RdYlGn", color_continuous_midpoint=0, aspect="auto",
                               labels=dict(color="avg % return", x=x_label, y=y_label))
             fig2.update_layout(height=550, title=f"{ticker_choice} — Avg % Return · {interval}/{period}")
             st.plotly_chart(fig2, use_container_width=True)
@@ -1658,7 +2203,7 @@ with tab_opt:
                 data_cache[cache_key] = fetch_data(ticker, iv, p)
             raw = data_cache[cache_key]
             if not raw.empty and len(raw) >= 30:
-                tdf, _ = run_backtest(raw, s, slt, tgt, params, fv, qty)
+                tdf, _ = run_backtest(raw, s, slt, tgt, params, fv, qty, risk_ctrl)
                 m = compute_metrics(tdf)
                 rows.append({
                     "Strategy": s, "Timeframe": iv, "Period": p, "SL Type": slt, "Target Type": tgt,
