@@ -482,7 +482,7 @@ def apply_filters(df, filters, params=None):
     if filters.get("adx_enabled"):
         a = adx(df, 14)
         df["adx_f"] = a
-        ok = (a >= filters["adx_min"]) & (a <= filters["adx_max"])
+        ok = (a >= filters.get("adx_min", 0)) & (a <= filters.get("adx_max", 100))
         mask_buy &= ok.fillna(False)
         mask_sell &= ok.fillna(False)
 
@@ -520,7 +520,7 @@ def apply_filters(df, filters, params=None):
     if filters.get("atr_enabled"):
         a = atr(df, 14)
         df["atr_f"] = a
-        ok = (a >= filters["atr_min"]) & (a <= filters["atr_max"])
+        ok = (a >= filters.get("atr_min", 0.0)) & (a <= filters.get("atr_max", 1e9))
         mask_buy &= ok.fillna(False)
         mask_sell &= ok.fillna(False)
 
@@ -842,6 +842,7 @@ def run_backtest(raw_df, strategy, sl_type, target_type, params, filters, qty, r
             "Direction": "LONG" if open_trade["direction"] == 1 else "SHORT",
             "Exit Time": exit_time, "Exit Price": round(float(exit_price), 2),
             "SL": round(open_trade["initial_sl"], 2), "Target": round(open_trade["initial_target"], 2),
+            "Highest": round(open_trade["highest"], 2), "Lowest": round(open_trade["lowest"], 2),
             "Points": round(points, 2), "PnL": round(points * qty_to_close, 2),
             "Exit Reason": reason, "Qty": qty_to_close,
         })
@@ -919,6 +920,7 @@ def run_backtest(raw_df, strategy, sl_type, target_type, params, filters, qty, r
                             "Direction": "LONG" if open_trade["direction"] == 1 else "SHORT",
                             "Exit Time": df.index[i], "Exit Price": round(float(hard_price), 2),
                             "SL": round(open_trade["initial_sl"], 2), "Target": round(open_trade["initial_target"], 2),
+                            "Highest": round(open_trade["highest"], 2), "Lowest": round(open_trade["lowest"], 2),
                             "Points": round(partial_points, 2), "PnL": round(partial_points * book_qty, 2),
                             "Exit Reason": f"Partial Book ({book_qty}/{open_trade['original_qty']} qty @ Target 1)",
                             "Qty": book_qty,
@@ -1496,9 +1498,10 @@ def describe_signal_status(df, strategy, params, filters):
 
     if filters.get("adx_enabled"):
         a_val, a_ok = safe_indicator_value(adx(df, 14), 14 * 4)
+        adx_min, adx_max = filters.get("adx_min", 0), filters.get("adx_max", 100)
         if a_ok:
-            ok = filters["adx_min"] <= a_val <= filters["adx_max"]
-            lines.append(f"ADX filter: current ADX = {a_val:.1f}, needs [{filters['adx_min']}, {filters['adx_max']}] → {'✅ OK' if ok else '❌ blocking entries right now'}")
+            ok = adx_min <= a_val <= adx_max
+            lines.append(f"ADX filter: current ADX = {a_val:.1f}, needs [{adx_min}, {adx_max}] → {'✅ OK' if ok else '❌ blocking entries right now'}")
         else:
             lines.append("ADX filter: N/A — insufficient warm-up history (ADX needs roughly 3-4x its period to stabilize).")
 
@@ -1516,11 +1519,13 @@ def describe_signal_status(df, strategy, params, filters):
         if not a_ok:
             lines.append("Regime filter: N/A — insufficient warm-up history for ADX.")
         elif family == "trend":
-            ok = a_val >= filters["regime_trend_min"]
-            lines.append(f"Regime filter (trend strategy): ADX {a_val:.1f} needs ≥ {filters['regime_trend_min']} → {'✅ trending, OK' if ok else '❌ not trending enough, blocking entries'}")
+            trend_min = filters.get("regime_trend_min", 25)
+            ok = a_val >= trend_min
+            lines.append(f"Regime filter (trend strategy): ADX {a_val:.1f} needs ≥ {trend_min} → {'✅ trending, OK' if ok else '❌ not trending enough, blocking entries'}")
         elif family == "mean_reversion":
-            ok = a_val <= filters["regime_range_max"]
-            lines.append(f"Regime filter (mean-reversion strategy): ADX {a_val:.1f} needs ≤ {filters['regime_range_max']} → {'✅ ranging, OK' if ok else '❌ trending too hard, blocking entries'}")
+            range_max = filters.get("regime_range_max", 20)
+            ok = a_val <= range_max
+            lines.append(f"Regime filter (mean-reversion strategy): ADX {a_val:.1f} needs ≤ {range_max} → {'✅ ranging, OK' if ok else '❌ trending too hard, blocking entries'}")
 
     if filters.get("angle_enabled") and ef_ok and es_ok:
         a_now = a_series.iloc[-1] if not pd.isna(a_series.iloc[-1]) else None
@@ -1534,11 +1539,12 @@ def describe_signal_status(df, strategy, params, filters):
     if filters.get("vix_enabled"):
         vix_aligned = get_vix_aligned(df.index)
         vix_val = vix_aligned.iloc[-1] if len(vix_aligned) else np.nan
+        vix_min, vix_max = filters.get("vix_min", 0), filters.get("vix_max", 100)
         if pd.isna(vix_val):
             lines.append("India VIX filter: N/A — couldn't fetch VIX data right now.")
         else:
-            ok = filters["vix_min"] <= vix_val <= filters["vix_max"]
-            lines.append(f"India VIX: {vix_val:.2f}, needs [{filters['vix_min']}, {filters['vix_max']}] → {'✅ OK' if ok else '❌ blocking entries right now'}")
+            ok = vix_min <= vix_val <= vix_max
+            lines.append(f"India VIX: {vix_val:.2f}, needs [{vix_min}, {vix_max}] → {'✅ OK' if ok else '❌ blocking entries right now'}")
 
     return lines
 
@@ -1584,7 +1590,7 @@ def live_dashboard_fragment(ticker, interval, period, strategy, params, filters)
         st.write("• " + line)
 
 
-
+def apply_config_to_sidebar(cfg_row):
     """Push a chosen optimization result row into sidebar_overrides and rerun."""
     st.session_state.sidebar_overrides = {
         "ticker_choice": cfg_row.get("ticker_choice", ticker_choice),
@@ -1599,7 +1605,66 @@ def live_dashboard_fragment(ticker, interval, period, strategy, params, filters)
     st.rerun()
 
 
-def render_bin_analysis_section(t1, t2, t1_name, t2_name, p1, diff, fetch_interval, fetch_period, section_label, fwd_n=5):
+def render_range_insight_section(ticker, interval, period, section_title):
+    """
+    Fetches OHLC data for the given timeframe/period, shows a table with
+    per-bar % and absolute change, and a plain-language read of where price
+    currently sits within that period's range plus whether the latest move
+    is unusually large. This is descriptive/statistical framing, not a
+    prediction — phrased with appropriate hedging.
+    """
+    st.markdown(f"##### {section_title}")
+    with st.spinner(f"Fetching {period} of {interval} data…"):
+        raw = fetch_data(ticker, interval, period)
+
+    if raw.empty or len(raw) < 5:
+        st.warning("Not enough data returned for this timeframe/period.")
+        return
+
+    df = raw.copy()
+    df["Change"] = df["Close"].diff()
+    df["Change %"] = df["Close"].pct_change() * 100
+
+    display_df = df[["Open", "High", "Low", "Close", "Volume", "Change", "Change %"]].round(2)
+    st.dataframe(display_df.sort_index(ascending=False), use_container_width=True)
+
+    period_high = float(df["High"].max())
+    period_low = float(df["Low"].min())
+    current_close = float(df["Close"].iloc[-1])
+    latest_change_pct = float(df["Change %"].iloc[-1]) if not pd.isna(df["Change %"].iloc[-1]) else 0.0
+    latest_change_abs = float(df["Change"].iloc[-1]) if not pd.isna(df["Change"].iloc[-1]) else 0.0
+
+    rng = period_high - period_low
+    position_pct = ((current_close - period_low) / rng * 100) if rng > 0 else 50.0
+
+    if position_pct >= 80:
+        position_desc = f"near the TOP of its range for this period ({position_pct:.0f}th percentile) — stretched to the upside"
+    elif position_pct <= 20:
+        position_desc = f"near the BOTTOM of its range for this period ({position_pct:.0f}th percentile) — stretched to the downside"
+    else:
+        position_desc = f"roughly in the MIDDLE of its range for this period ({position_pct:.0f}th percentile)"
+
+    pct_std = df["Change %"].std()
+    is_unusual = pct_std > 0 and abs(latest_change_pct) > 1.5 * pct_std
+
+    lines = [
+        f"**Range for this period:** Low `{period_low:.2f}` → High `{period_high:.2f}` (spread {rng:.2f}). Current close `{current_close:.2f}` is {position_desc}.",
+        f"**Latest bar move:** {latest_change_abs:+.2f} ({latest_change_pct:+.2f}%)"
+        + (f" — unusually large versus the typical ±{pct_std:.2f}% swing for this data, worth noting." if is_unusual else " — within a typical range for this data, nothing statistically unusual."),
+    ]
+
+    if position_pct >= 80:
+        lines.append("Statistically, prices stretched to the top of a recent range sometimes see a pause or partial pullback before continuing — but strong trends can also keep extending. This isn't a sell signal by itself; treat it as one input alongside whatever strategy/indicators you're using.")
+    elif position_pct <= 20:
+        lines.append("Statistically, prices stretched to the bottom of a recent range sometimes see a bounce or basing period before continuing lower — but downtrends can also keep extending. This isn't a buy signal by itself.")
+    else:
+        lines.append("Sitting mid-range generally means less positional bias either way — range-bound/choppy behavior is at least as likely as a decisive breakout from here.")
+
+    for line in lines:
+        st.write(line)
+
+
+
     """
     Renders one full historical-bin-analysis block (bin table + empirical bias +
     ATR-sized reference levels) for a given timeframe/period. Used twice in the
@@ -1712,8 +1777,8 @@ def render_bin_analysis_section(t1, t2, t1_name, t2_name, p1, diff, fetch_interv
 # TABS
 # ============================================================================
 
-tab_bt, tab_live, tab_hist, tab_heat, tab_opt, tab_spread = st.tabs(
-    ["📊 Backtest", "🔴 Live Trading", "📜 Trade History", "🔥 Heatmaps", "🧪 Optimization", "🔀 Spread Tool"]
+tab_bt, tab_live, tab_hist, tab_heat, tab_opt, tab_spread, tab_ohlc = st.tabs(
+    ["📊 Backtest", "🔴 Live Trading", "📜 Trade History", "🔥 Heatmaps", "🧪 Optimization", "🔀 Spread Tool", "📅 OHLC & Range"]
 )
 
 # ---------------------------------------------------------------- BACKTEST -
@@ -1736,12 +1801,6 @@ with tab_bt:
     sig_df = st.session_state.last_backtest_df
 
     if trades_df is not None and sig_df is not None and not sig_df.empty:
-        st.plotly_chart(
-            price_chart(sig_df, trades_df, "Price with Entries/Exits",
-                        ema_overlay=[(params.get("ema_fast", 9), "#3399ff"), (params.get("ema_slow", 15), "#ff9933")]),
-            use_container_width=True,
-        )
-
         m = compute_metrics(trades_df)
         c1, c2, c3, c4, c5, c6 = st.columns(6)
         c1.metric("Trades", m["total_trades"])
@@ -1786,6 +1845,13 @@ with tab_bt:
 
         st.markdown("#### Trade Log")
         st.dataframe(trades_display, use_container_width=True, hide_index=True)
+
+        st.markdown("#### Chart — Price with Entries/Exits")
+        st.plotly_chart(
+            price_chart(sig_df, trades_df, "Price with Entries/Exits",
+                        ema_overlay=[(params.get("ema_fast", 9), "#3399ff"), (params.get("ema_slow", 15), "#ff9933")]),
+            use_container_width=True,
+        )
     else:
         st.caption("Run a backtest to see results here. (This never writes into Live Trading or Trade History.)")
 
@@ -1838,6 +1904,7 @@ with tab_live:
                             "Direction": "LONG" if pos["direction"] == 1 else "SHORT",
                             "Exit Time": sig_df.index[-1], "Exit Price": round(float(hard_price), 2),
                             "SL": round(pos["initial_sl"], 2), "Target": round(pos["initial_target"], 2),
+                            "Highest": round(pos["highest"], 2), "Lowest": round(pos["lowest"], 2),
                             "Points": round(partial_points, 2), "PnL": round(partial_points * book_qty, 2),
                             "Exit Reason": f"Partial Book ({book_qty}/{pos['original_qty']} qty @ Target 1)", "Qty": book_qty,
                         })
@@ -1872,6 +1939,7 @@ with tab_live:
                     "Direction": "LONG" if pos["direction"] == 1 else "SHORT",
                     "Exit Time": sig_df.index[-1], "Exit Price": round(float(exit_price), 2),
                     "SL": round(pos["initial_sl"], 2), "Target": round(pos["initial_target"], 2),
+                    "Highest": round(pos["highest"], 2), "Lowest": round(pos["lowest"], 2),
                     "Points": round(points, 2), "PnL": round(points * pos["remaining_qty"], 2),
                     "Exit Reason": reason, "Qty": pos["remaining_qty"],
                 })
@@ -1944,6 +2012,7 @@ with tab_live:
             "Direction": "LONG" if pos["direction"] == 1 else "SHORT",
             "Exit Time": datetime.now(), "Exit Price": round(exit_price, 2),
             "SL": round(pos["initial_sl"], 2), "Target": round(pos["initial_target"], 2),
+            "Highest": round(pos["highest"], 2), "Lowest": round(pos["lowest"], 2),
             "Points": round(points, 2), "PnL": round(points * pos["remaining_qty"], 2),
             "Exit Reason": "Manual Square Off", "Qty": pos["remaining_qty"],
         })
@@ -2063,7 +2132,14 @@ with tab_heat:
             month_order = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
             pivot = monthly.pivot_table(index="Year", columns="Month", values="ret_pct")
             pivot = pivot.reindex(columns=month_order)
-            fig = px.imshow(pivot, text_auto=".1f", color_continuous_scale="RdYlGn", color_continuous_midpoint=0, aspect="auto",
+            # Symmetric zmin/zmax around 0 (rather than relying on autorange)
+            # so a red-to-green diverging scale is centered correctly even
+            # when one outlier month skews the raw min/max — otherwise
+            # ordinary negative months can render as pale yellow instead of
+            # a clearly-red color.
+            vmax = np.nanmax(np.abs(pivot.values)) if np.isfinite(pivot.values).any() else 1.0
+            vmax = vmax if vmax > 0 else 1.0
+            fig = px.imshow(pivot, text_auto=".1f", color_continuous_scale="RdYlGn", zmin=-vmax, zmax=vmax, aspect="auto",
                              labels=dict(color="% return"))
             fig.update_layout(height=max(400, 32 * len(pivot) + 150), title=f"{ticker_choice} — Monthly % Returns ({int(heatmap_years)}Y)")
             st.plotly_chart(fig, use_container_width=True)
@@ -2103,7 +2179,9 @@ with tab_heat:
                 pivot2 = pivot2.reindex(columns=[m for m in month_order if m in pivot2.columns])
                 x_label, y_label = "Month", "Year"
 
-            fig2 = px.imshow(pivot2, text_auto=".2f", color_continuous_scale="RdYlGn", color_continuous_midpoint=0, aspect="auto",
+            vmax2 = np.nanmax(np.abs(pivot2.values)) if np.isfinite(pivot2.values).any() else 1.0
+            vmax2 = vmax2 if vmax2 > 0 else 1.0
+            fig2 = px.imshow(pivot2, text_auto=".2f", color_continuous_scale="RdYlGn", zmin=-vmax2, zmax=vmax2, aspect="auto",
                               labels=dict(color="avg % return", x=x_label, y=y_label))
             fig2.update_layout(height=550, title=f"{ticker_choice} — Avg % Return · {interval}/{period}")
             st.plotly_chart(fig2, use_container_width=True)
@@ -2178,8 +2256,8 @@ with tab_opt:
     st.caption(f"Estimated backtest runs: **{n_combos}** (≈{n_combos * RATE_LIMIT_DELAY:.1f}s+ just for data-fetch delays, plus backtest compute time per run).")
 
     MAX_COMBOS = st.number_input(
-        "Safety cap on number of combinations (raise with caution — large grids can run for a long time and hit yfinance rate limits)",
-        min_value=50, max_value=5000, value=400, step=50,
+        "Safety cap on number of combinations (no upper limit — raise as high as you want, but large grids can run for a long time and are more likely to hit yfinance rate limits)",
+        min_value=50, value=400, step=50,
     )
     if n_combos > MAX_COMBOS:
         st.error(f"That's {n_combos} combinations — over your current cap of {int(MAX_COMBOS)}. Either narrow your selections or raise the cap above.")
@@ -2303,6 +2381,16 @@ with tab_spread:
             st.markdown("---")
             render_bin_analysis_section(t1, t2, t1_name, t2_name, p1, diff, interval, period,
                                          section_label=f"Matched to your sidebar selection: {interval} candles, {period} history", fwd_n=5)
+
+# ---------------------------------------------------------------- OHLC/RANGE
+with tab_ohlc:
+    st.subheader(f"OHLC & Range Insights — {ticker_choice} ({ticker})")
+    st.caption("Raw candle data with per-bar % and absolute change, plus a plain-language read on where price sits in its range. Descriptive/statistical framing, not a prediction.")
+
+    render_range_insight_section(ticker, "1d", "1y", "1) Fixed baseline: Daily candles, past 1 year")
+
+    st.markdown("---")
+    render_range_insight_section(ticker, interval, period, f"2) Matched to your sidebar selection: {interval} candles, {period}")
 
 # ============================================================================
 # FOOTER / GLOBAL DISCLAIMER
