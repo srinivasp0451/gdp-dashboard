@@ -804,11 +804,19 @@ def detect_signal_exit_condition(trade, i, df, params):
 
 def check_hard_exit(trade, candle):
     """
-    Hard SL/Target check using only the CURRENT candle's own high/low against
-    levels set from PAST data (entry price, ATR at signal time, trailing
-    updates). No look-ahead here — these levels never depend on this candle's
-    own close. Conservative fill order: longs check SL(low) before
-    Target(high); shorts check SL(high) before Target(low).
+    BACKTEST-ONLY. Hard SL/Target check using only the CURRENT candle's own
+    high/low against levels set from PAST data (entry price, ATR at signal
+    time, trailing updates). No look-ahead here — these levels never depend
+    on this candle's own close. Conservative fill order: longs check SL(low)
+    before Target(high); shorts check SL(high) before Target(low).
+
+    This candle-range approach exists because a backtest has no live ticks —
+    only OHLC bars — so it can't know the exact path price took inside a
+    candle, hence the conservative "assume the worse touch happened first"
+    rule. Live trading uses check_hard_exit_ltp() below instead, which
+    compares directly against the last-traded price — see that function's
+    docstring for why that's the correct approach once you have real tick
+    data (e.g. via Dhan) instead of polled candles.
     """
     direction = trade["direction"]
     target_display_only = trade["target_type"] == "Trailing Target (Display Only)"
@@ -825,6 +833,57 @@ def check_hard_exit(trade, candle):
             return True, trade["target"], "Target Hit"
 
     return False, None, None
+
+
+def check_hard_exit_ltp(trade, ltp):
+    """
+    LIVE-ONLY. Compares SL/Target directly against the last-traded price
+    instead of a candle's high/low. SL is checked before Target for both
+    directions — same conservative "risk first" ordering as backtest, just
+    evaluated against a single live price point rather than a candle range,
+    since with a real tick feed there's no ambiguity about what price was
+    actually touched (unlike a completed OHLC bar, where the touch order of
+    two levels hit in the same candle is genuinely unknowable).
+    """
+    direction = trade["direction"]
+    target_display_only = trade["target_type"] == "Trailing Target (Display Only)"
+
+    if direction == 1:
+        if ltp <= trade["sl"]:
+            return True, trade["sl"], "Stoploss Hit (LTP)"
+        if not target_display_only and ltp >= trade["target"]:
+            return True, trade["target"], "Target Hit (LTP)"
+    else:
+        if ltp >= trade["sl"]:
+            return True, trade["sl"], "Stoploss Hit (LTP)"
+        if not target_display_only and ltp <= trade["target"]:
+            return True, trade["target"], "Target Hit (LTP)"
+
+    return False, None, None
+
+
+def get_live_ltp(ticker):
+    """
+    Fetches the freshest possible last-traded price, bypassing the cached
+    fetch_data() used for candle/indicator data (that cache has a 30s TTL,
+    fine for indicators, too stale for a live SL/Target trigger check).
+
+    *** PLUG POINT FOR YOUR DHAN INTEGRATION ***
+    Replace the body of this function with a call to Dhan's live market-data
+    feed/quote endpoint and every SL/Target check in evaluate_live_signal()
+    will automatically use that real tick instead of this yfinance fallback —
+    nothing else needs to change.
+    """
+    time.sleep(RATE_LIMIT_DELAY)
+    try:
+        data = yf.Ticker(ticker).history(period="1d", interval="1m")
+        if data is None or data.empty:
+            data = yf.Ticker(ticker).history(period="5d", interval="15m")
+        if data is not None and not data.empty:
+            return float(data["Close"].iloc[-1])
+    except Exception:
+        pass
+    return None
 
 
 # ============================================================================
@@ -1630,26 +1689,33 @@ def evaluate_live_signal(ticker, interval, period, strategy, params, filters, sl
     a_series = atr(sig_df, 14)
     open_pos = st.session_state.live_positions
 
+    # Fresh, uncached last-traded price — this is what SL/Target/exit checks
+    # below are compared against, not the (possibly ~30s stale, cached)
+    # candle data used for indicators/signals. Falls back to the last candle
+    # close only if a live tick genuinely couldn't be fetched this cycle.
+    ltp = get_live_ltp(ticker)
+    if ltp is None:
+        ltp = float(sig_df["Close"].iloc[-1])
+
     # Immediate-execution strategies (Simple Buy/Sell Only, Threshold Cross)
     # check the CURRENT price against the last CLOSED candle directly — no
     # "wait for this candle to close" delay, since there's no candle shape to
     # confirm, just a price level.
     if strategy in IMMEDIATE_EXECUTION_STRATEGIES:
-        current_price = float(sig_df["Close"].iloc[-1])
         prev_close = float(sig_df["Close"].iloc[-2])
         if strategy == "Simple Buy Only":
-            last_sig = 1 if current_price > prev_close else 0
+            last_sig = 1 if ltp > prev_close else 0
         elif strategy == "Simple Sell Only":
-            last_sig = -1 if current_price < prev_close else 0
+            last_sig = -1 if ltp < prev_close else 0
         else:  # Threshold Cross
             thr = params.get("threshold", prev_close)
-            if current_price > thr and prev_close <= thr:
+            if ltp > thr and prev_close <= thr:
                 last_sig = 1
-            elif current_price < thr and prev_close >= thr:
+            elif ltp < thr and prev_close >= thr:
                 last_sig = -1
             else:
                 last_sig = 0
-        entry_reference_price = current_price
+        entry_reference_price = ltp
     else:
         last_sig = int(sig_df["signal"].iloc[-2])  # last CLOSED candle's signal
         entry_reference_price = float(sig_df["Open"].iloc[-1])  # next candle's open
@@ -1659,25 +1725,27 @@ def evaluate_live_signal(ticker, interval, period, strategy, params, filters, sl
         i = len(sig_df) - 1
         candle = sig_df.iloc[i]
         pos = update_trade_levels(pos, i, sig_df, params, a_series)
+        pos["highest"] = max(pos["highest"], ltp)
+        pos["lowest"] = min(pos["lowest"], ltp)
 
         exited, exit_price, reason = False, None, None
         if pos.get("pending_exit_reason"):
             exited, exit_price, reason = True, candle["Open"], pos["pending_exit_reason"]
         if not exited:
-            sp_exit, sp_price, sp_reason = check_special_exit_conditions(pos, candle)
+            sp_exit, sp_price, sp_reason = check_special_exit_conditions(pos, {"Close": ltp})
             if sp_exit:
                 exited, exit_price, reason = True, sp_price, sp_reason
         if not exited and risk_ctrl.get("loss_duration_enabled"):
             td_exit, td_price, td_reason = check_time_based_exit(
-                pos, sig_df.index[-1], candle["Close"],
+                pos, sig_df.index[-1], ltp,
                 risk_ctrl.get("loss_duration_min_minutes", 1), risk_ctrl.get("loss_duration_max_minutes", 5),
             )
             if td_exit:
                 exited, exit_price, reason = True, td_price, td_reason
         if not exited:
-            hard_exit, hard_price, hard_reason = check_hard_exit(pos, candle)
+            hard_exit, hard_price, hard_reason = check_hard_exit_ltp(pos, ltp)
             if hard_exit:
-                if pos["target_type"] == "Partial Book + Trail Remainder" and hard_reason == "Target Hit" and not pos["partial_booked"]:
+                if pos["target_type"] == "Partial Book + Trail Remainder" and "Target Hit" in hard_reason and not pos["partial_booked"]:
                     book_qty = max(1, round(pos["original_qty"] * pos["partial_book_pct"] / 100.0))
                     book_qty = min(book_qty, pos["remaining_qty"])
                     partial_points = (hard_price - pos["entry_price"]) * pos["direction"]
@@ -1713,7 +1781,7 @@ def evaluate_live_signal(ticker, interval, period, strategy, params, filters, sl
             if sig_exit:
                 pos["pending_exit_reason"] = sig_reason
 
-        pos["current_price"] = float(sig_df["Close"].iloc[-1])
+        pos["current_price"] = ltp
         if exited:
             points = (exit_price - pos["entry_price"]) * pos["direction"]
             st.session_state.live_history.append({
