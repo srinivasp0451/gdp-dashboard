@@ -87,10 +87,25 @@ TIMEFRAME_MAP = {
     "1 Week": "1wk", "1 Month": "1mo",
 }
 
-MAX_PERIOD_FOR_INTERVAL = {
-    "1m": "5d", "5m": "60d", "15m": "60d", "30m": "60d", "60m": "730d",
-    "1d": "max", "1wk": "max", "1mo": "max",
+MAX_DAYS_FOR_INTERVAL = {
+    "1m": 5, "5m": 60, "15m": 60, "30m": 60, "60m": 730,
+    "1d": 10 ** 6, "1wk": 10 ** 6, "1mo": 10 ** 6,
 }
+PERIOD_TO_DAYS = {
+    "5d": 5, "1mo": 30, "3mo": 90, "6mo": 180, "1y": 365,
+    "2y": 730, "5y": 1825, "10y": 3650, "max": 10 ** 6,
+}
+PERIOD_ORDER = ["5d", "1mo", "3mo", "6mo", "1y", "2y", "5y", "10y", "max"]
+
+
+def clamp_period(interval, period):
+    """Cap the requested period to what Yahoo Finance actually allows for this interval,
+    without ever indexing into a list that might not contain the value (that was the bug)."""
+    max_days = MAX_DAYS_FOR_INTERVAL.get(interval, 10 ** 6)
+    if PERIOD_TO_DAYS.get(period, 10 ** 6) <= max_days:
+        return period
+    allowed = [p for p in PERIOD_ORDER if PERIOD_TO_DAYS[p] <= max_days]
+    return allowed[-1] if allowed else "5d"
 
 PERIOD_OPTIONS = ["5d", "1mo", "3mo", "6mo", "1y", "2y", "5y", "10y", "max"]
 
@@ -511,20 +526,14 @@ def _fetch_yf_with_retries(ticker, interval, period, attempts=3):
 
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_data(ticker, interval, period):
-    max_p = MAX_PERIOD_FOR_INTERVAL.get(interval, "max")
-    order = ["5d", "1mo", "3mo", "6mo", "1y", "2y", "5y", "10y", "max"]
-    if max_p != "max" and period in order and order.index(period) > order.index(max_p):
-        period = max_p
+    period = clamp_period(interval, period)
     df, _ = _fetch_yf_with_retries(ticker, interval, period)
     return df
 
 
 def diagnose_fetch(ticker, interval, period):
     """Uncached, on-demand fetch that surfaces the *real* error instead of a bare empty table."""
-    max_p = MAX_PERIOD_FOR_INTERVAL.get(interval, "max")
-    order = ["5d", "1mo", "3mo", "6mo", "1y", "2y", "5y", "10y", "max"]
-    if max_p != "max" and period in order and order.index(period) > order.index(max_p):
-        period = max_p
+    period = clamp_period(interval, period)
     return _fetch_yf_with_retries(ticker, interval, period, attempts=2)
 
 
@@ -704,10 +713,11 @@ def calc_metrics(trades_df, equity_series, capital):
 # HEATMAP HELPERS
 # =====================================================================================
 def monthly_returns_heatmap_data(ticker, n_years):
-    period = f"{min(n_years + 1, 20)}y"
-    df = fetch_data(ticker, "1d", period)
+    df = fetch_data(ticker, "1d", "max")
     if df.empty:
         return None
+    cutoff = df.index.max() - pd.DateOffset(years=n_years + 1)
+    df = df[df.index >= cutoff]
     monthly = df["Close"].resample("ME").last()
     monthly_ret = monthly.pct_change().dropna() * 100
     table = pd.DataFrame({"Year": monthly_ret.index.year, "Month": monthly_ret.index.month, "Return": monthly_ret.values})
@@ -718,10 +728,11 @@ def monthly_returns_heatmap_data(ticker, n_years):
 
 
 def daily_range_heatmap_data(ticker, n_years):
-    period = f"{min(n_years + 1, 20)}y"
-    df = fetch_data(ticker, "1d", period)
+    df = fetch_data(ticker, "1d", "max")
     if df.empty:
         return None
+    cutoff = df.index.max() - pd.DateOffset(years=n_years + 1)
+    df = df[df.index >= cutoff]
     rng_pct = (df["High"] - df["Low"]) / df["Close"] * 100
     table = pd.DataFrame({"Year": df.index.year, "Month": df.index.month, "Range": rng_pct.values})
     pivot = table.pivot_table(index="Year", columns="Month", values="Range", aggfunc="mean")
@@ -936,8 +947,8 @@ with st.expander("📚 All 20 Strategies — Rationale"):
     for s in STRATEGIES:
         st.markdown(f"**{s}** — {STRATEGY_NOTES[s]}")
 
-tab_bt, tab_live, tab_opt, tab_hist, tab_heat = st.tabs(
-    ["📊 Backtest", "🔴 Live Trading", "🧪 Optimization", "🕘 Trade History", "🌡️ Heatmaps"]
+tab_bt, tab_live, tab_opt, tab_insights, tab_hist, tab_heat = st.tabs(
+    ["📊 Backtest", "🔴 Live Trading", "🧪 Optimization", "🔍 Insights", "🕘 Trade History", "🌡️ Heatmaps"]
 )
 
 # -------------------------------------------------------------------------------------
@@ -1056,6 +1067,18 @@ with tab_bt:
         if trades_df.empty:
             st.info("No trades were generated for this configuration.")
         else:
+            reason_counts = trades_df["reason"].value_counts()
+            rc1, rc2, rc3, rc4 = st.columns(4)
+            rc1.metric("Hit Target", int(reason_counts.get("Target", 0)))
+            rc2.metric("Hit Stop Loss", int(reason_counts.get("SL", 0)))
+            rc3.metric("Exited on Signal Flip", int(reason_counts.get("Signal Flip", 0)))
+            rc4.metric("End of Data", int(reason_counts.get("End of Data", 0)))
+            if reason_counts.get("Signal Flip", 0) > 0.5 * len(trades_df):
+                st.caption("📌 Most trades exited on a signal flip before ever reaching your SL or "
+                           "Target — the strategy is changing its mind faster than price is moving "
+                           "to either level. That dilutes whatever R:R you set in the sidebar down to "
+                           "whatever smaller move happened before the next flip.")
+
             show = trades_df.copy()
             show["gross_pnl"] = show["gross_pnl"].round(2)
             show["pnl"] = show["pnl"].round(2)
@@ -1350,6 +1373,151 @@ with tab_opt:
                 st.session_state[f"p_{opt['param_y']}"] = best_y_val
                 st.success("Applied — check the sidebar Strategy Parameters, then go rerun the Backtest tab.")
                 st.rerun()
+
+# -------------------------------------------------------------------------------------
+# TAB: INSIGHTS / PATTERN MINING
+# -------------------------------------------------------------------------------------
+def wilson_note(pct, n, baseline=50.0):
+    """Quick 'is this different from a coin flip' check using a normal approximation."""
+    if n <= 1:
+        return "n too small to judge"
+    se = np.sqrt((baseline / 100) * (1 - baseline / 100) / n) * 100
+    z = abs(pct - baseline) / se if se > 0 else 0
+    if n < 30:
+        return f"n={n} is small — treat as noisy regardless of z"
+    return f"n={n}, z={z:.1f} vs {baseline:.0f}% baseline — {'likely real signal' if z > 2 else 'could easily be chance'}"
+
+
+with tab_insights:
+    st.markdown("""
+    **What this does:** mines the historical data for repeatable, empirical patterns — the kind
+    professional researchers start with, like *"how often does the day's high form in the first
+    15 minutes"* or *"do Mondays behave differently from Fridays."*
+
+    ⚠️ **Read this before trusting any number below:**
+    - **Sample size is everything.** A pattern computed from 40 days can easily show "70% of the
+      time" purely by chance. Check the **n** shown next to every stat.
+    - **This tab tests many patterns at once on purpose** — which means some will look
+      "significant" by pure luck (the multiple-comparisons problem). Treat any single number here
+      as a *hypothesis to test further*, not a finished edge.
+    - Validate anything promising on a time period you haven't looked at yet before trusting it.
+    - Everything here describes the past. None of it is a guarantee about tomorrow.
+    """)
+
+    insight_years = st.slider("Years of daily history for seasonality patterns", 1, 15, 5, key="insight_years")
+    run_insights = st.button("🔍 Run Pattern Analysis", type="primary")
+
+    if run_insights:
+        with st.spinner("Fetching data and mining patterns..."):
+            daily_df = fetch_data(yf_ticker, "1d", "max")
+            if not daily_df.empty:
+                cutoff = daily_df.index.max() - pd.DateOffset(years=insight_years)
+                daily_df = daily_df[daily_df.index >= cutoff]
+            intraday_df = fetch_data(yf_ticker, interval, period) if interval in ("1m", "5m", "15m", "30m", "60m") else pd.DataFrame()
+            st.session_state["insights_result"] = dict(daily=daily_df, intraday=intraday_df, ticker=yf_ticker, interval=interval)
+
+    ins = st.session_state.get("insights_result")
+    if ins is None:
+        st.info("Click **Run Pattern Analysis** to compute stats for the current sidebar ticker.")
+    elif ins["daily"].empty:
+        st.warning("No daily data available for this ticker.")
+    else:
+        daily_df, intraday_df = ins["daily"], ins["intraday"]
+
+        # ---- Day-of-week seasonality ----
+        st.subheader("📅 Day-of-Week Seasonality")
+        dow = daily_df.copy()
+        dow["ret"] = dow["Close"].pct_change()
+        dow = dow.dropna(subset=["ret"])
+        dow["weekday"] = dow.index.day_name()
+        dow_stats = dow.groupby("weekday")["ret"].agg(n="count", avg_return_pct=lambda x: x.mean() * 100,
+                                                        pct_positive=lambda x: (x > 0).mean() * 100)
+        order_days = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"]
+        dow_stats = dow_stats.reindex([d for d in order_days if d in dow_stats.index]).round(2)
+        dow_stats = dow_stats.rename(columns={"n": "Sample Size", "avg_return_pct": "Avg Return %", "pct_positive": "% Days Positive"})
+        st.dataframe(dow_stats, use_container_width=True)
+        best_day = dow_stats["Avg Return %"].idxmax() if not dow_stats.empty else None
+        if best_day:
+            st.caption(f"Best average day historically: **{best_day}** "
+                       f"({wilson_note(dow_stats.loc[best_day, '% Days Positive'], int(dow_stats.loc[best_day, 'Sample Size']))})")
+
+        # ---- Opening gap behavior ----
+        st.subheader("📊 Opening Gap Behavior")
+        g = daily_df.copy()
+        g["prev_close"] = g["Close"].shift(1)
+        g["gap_pct"] = (g["Open"] - g["prev_close"]) / g["prev_close"] * 100
+        g = g.dropna(subset=["gap_pct"])
+        gap_up = g[g["gap_pct"] > 0.1]
+        gap_down = g[g["gap_pct"] < -0.1]
+        up_fill = (gap_up["Low"] <= gap_up["prev_close"]).mean() * 100 if len(gap_up) else 0
+        down_fill = (gap_down["High"] >= gap_down["prev_close"]).mean() * 100 if len(gap_down) else 0
+        gc1, gc2 = st.columns(2)
+        gc1.metric("Gap-Up Days that Filled", f"{up_fill:.1f}%")
+        gc1.caption(wilson_note(up_fill, len(gap_up)))
+        gc2.metric("Gap-Down Days that Filled", f"{down_fill:.1f}%")
+        gc2.caption(wilson_note(down_fill, len(gap_down)))
+
+        # ---- Streak persistence (momentum vs mean reversion) ----
+        st.subheader("🔁 After N Up/Down Days, What Happens Next?")
+        up = (daily_df["Close"].pct_change() > 0)
+        rows = []
+        for n_streak in (1, 2, 3):
+            up_streak = up.rolling(n_streak).sum() == n_streak
+            down_streak = (~up).rolling(n_streak).sum() == n_streak
+            next_up_after_up = up.shift(-1)[up_streak].mean() * 100 if up_streak.sum() else np.nan
+            next_up_after_down = up.shift(-1)[down_streak].mean() * 100 if down_streak.sum() else np.nan
+            rows.append({"Streak Length": n_streak,
+                        "After N Up Days -> % Next Day Up": round(next_up_after_up, 1) if pd.notna(next_up_after_up) else None,
+                        "n (up streaks)": int(up_streak.sum()),
+                        "After N Down Days -> % Next Day Up": round(next_up_after_down, 1) if pd.notna(next_up_after_down) else None,
+                        "n (down streaks)": int(down_streak.sum())})
+        st.dataframe(pd.DataFrame(rows), use_container_width=True)
+        st.caption("If 'After Up -> % Next Day Up' is consistently **above** ~52-55%, that hints at "
+                   "momentum (trends persist). If it's consistently **below** ~45-48%, that hints at "
+                   "mean reversion (moves tend to snap back). Near 50% either way = no detectable edge.")
+
+        # ---- Intraday: time-of-day for daily high/low ----
+        st.subheader("⏱ When Does the Day's High/Low Typically Form?")
+        if intraday_df.empty:
+            st.info("Select an intraday timeframe (1m–60m) in the sidebar, then re-run, to see "
+                     "time-of-day high/low timing patterns.")
+        else:
+            idf = intraday_df.copy()
+            idf["date"] = idf.index.date
+            recs = []
+            for d, grp in idf.groupby("date"):
+                if len(grp) < 3:
+                    continue
+                session_start = grp.index[0]
+                mins_to_high = (grp["High"].idxmax() - session_start).total_seconds() / 60
+                mins_to_low = (grp["Low"].idxmin() - session_start).total_seconds() / 60
+                recs.append((mins_to_high, mins_to_low))
+            timing_df = pd.DataFrame(recs, columns=["min_to_high", "min_to_low"])
+            n_days = len(timing_df)
+            if n_days == 0:
+                st.info("Not enough intraday days in the current selection to compute this.")
+            else:
+                pct_high_15 = (timing_df["min_to_high"] <= 15).mean() * 100
+                pct_low_15 = (timing_df["min_to_low"] <= 15).mean() * 100
+                pct_high_30 = (timing_df["min_to_high"] <= 30).mean() * 100
+                pct_low_30 = (timing_df["min_to_low"] <= 30).mean() * 100
+                tc1, tc2, tc3, tc4 = st.columns(4)
+                tc1.metric("Day High in first 15 min", f"{pct_high_15:.1f}%")
+                tc2.metric("Day Low in first 15 min", f"{pct_low_15:.1f}%")
+                tc3.metric("Day High in first 30 min", f"{pct_high_30:.1f}%")
+                tc4.metric("Day Low in first 30 min", f"{pct_low_30:.1f}%")
+                st.caption(f"Based on {n_days} trading days of {TIMEFRAME_MAP.get(ins['interval'], ins['interval'])} "
+                           f"data (Yahoo Finance's max lookback for this interval).")
+                if n_days < 30:
+                    st.warning(f"⚠️ Only {n_days} days available for this interval — Yahoo Finance's own "
+                               f"lookback limit for intraday bars is the constraint here, not this app. "
+                               f"You'd normally want 100+ days before trusting a timing pattern like this; "
+                               f"consider using 15m/30m/60m (60-day lookback) instead of 1m (5-day lookback) "
+                               f"to get a larger sample.")
+
+        st.divider()
+        st.caption("This tab surfaces candidate patterns for you to investigate further — it does not "
+                   "place trades or claim any of these are tradeable edges on their own.")
 
 # -------------------------------------------------------------------------------------
 # TAB 4: TRADE HISTORY (live orders actually placed this session)
