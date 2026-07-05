@@ -503,6 +503,14 @@ def get_position(df, strategy, p):
     return pd.Series(0, index=df.index)
 
 
+def get_position_final(df, strategy, p, invert=False):
+    """Wraps get_position, optionally flipping Long<->Short to empirically test whether
+    inverting a strategy's calls turns a no-edge result into a real one (it usually doesn't —
+    see the sidebar checkbox tooltip)."""
+    pos = get_position(df, strategy, p)
+    return -pos if invert else pos
+
+
 # =====================================================================================
 # DATA FETCH
 # =====================================================================================
@@ -842,6 +850,11 @@ period = st.sidebar.selectbox("History Period", PERIOD_OPTIONS, index=4)
 
 strategy = st.sidebar.selectbox("Strategy", STRATEGIES)
 st.sidebar.caption(STRATEGY_NOTES.get(strategy, ""))
+invert_signal = st.sidebar.checkbox(
+    "🔄 Invert Signal (test the 'just flip it' theory)", value=False, key="invert_signal",
+    help="Flips every Long call to Short and vice versa. If a strategy has no real edge (random), "
+         "this will NOT reliably turn losses into profits — it'll just produce a different random "
+         "result. Use this to test that empirically rather than take anyone's word for it.")
 
 with st.sidebar.expander("Strategy Parameters", expanded=False):
     st.caption("Changed by 'Apply Best Config' on the Optimization tab too.")
@@ -941,7 +954,12 @@ effective_qty = qty * lot_size if segment in ("Futures (FUT)", "Options (CE/PE)"
 st.title("📈 Algo Trader Pro")
 st.caption(f"{display_name}  •  {segment}"
            + (f" ({option_side})" if option_side else "")
-           + f"  •  {timeframe_label}  •  {strategy}")
+           + f"  •  {timeframe_label}  •  {strategy}"
+           + ("  •  🔄 **INVERTED**" if invert_signal else ""))
+if invert_signal:
+    st.info("🔄 Signal inversion is ON — every Long call from this strategy becomes Short and "
+            "vice versa. Run a backtest with this on vs off on the same settings and compare "
+            "the Gross P&L (before costs) on each — that's the actual test of whether flipping helps.")
 
 with st.expander("📚 All 20 Strategies — Rationale"):
     for s in STRATEGIES:
@@ -967,7 +985,7 @@ with tab_bt:
                 st.session_state["bt_fetch_failed"] = (yf_ticker, interval, period)
             else:
                 st.session_state["bt_fetch_failed"] = None
-                position = get_position(df, strategy, p)
+                position = get_position_final(df, strategy, p, invert_signal)
                 atr_series = ATR(df, p["atr_period"])
                 trades_df, equity_series = run_backtest(
                     df, position, atr_series, effective_qty,
@@ -1135,7 +1153,7 @@ with tab_live:
         live_df = fetch_data(yf_ticker, interval, period)
 
     if live_df is not None and not live_df.empty:
-        pos_live = get_position(live_df, strategy, p)
+        pos_live = get_position_final(live_df, strategy, p, invert_signal)
         last_pos = int(pos_live.iloc[-1])
         badge = {1: ("🟢 LONG / BUY", "green"), -1: ("🔴 SHORT / SELL", "red"), 0: ("⚪ FLAT / HOLD", "gray")}
         label, color = badge[last_pos]
@@ -1311,7 +1329,7 @@ with tab_opt:
                         p_test = dict(p)
                         p_test[param_x] = xv
                         p_test[param_y] = yv
-                        pos_test = get_position(df_opt, strategy, p_test)
+                        pos_test = get_position_final(df_opt, strategy, p_test, invert_signal)
                         tdf, eq = run_backtest(df_opt, pos_test, atr_series_opt, effective_qty,
                                                 sl_type, sl_value, target_type, target_value,
                                                 trailing_enabled, trail_type, trail_value,
