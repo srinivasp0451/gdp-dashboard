@@ -2217,7 +2217,12 @@ def render_range_insight_section(ticker, interval, period, section_title):
             return ""
         return "color: #16c784; font-weight: 600;" if val > 0 else "color: #ea3943; font-weight: 600;"
 
-    styled = display_df.sort_index(ascending=False).style.applymap(_color_change, subset=["Change", "Change %"])
+    sorted_df = display_df.sort_index(ascending=False)
+    styler = sorted_df.style
+    # pandas >=2.1 renamed Styler.applymap -> Styler.map (and removed applymap
+    # entirely in some newer releases) — support both instead of assuming one.
+    style_fn = getattr(styler, "map", None) or styler.applymap
+    styled = style_fn(_color_change, subset=["Change", "Change %"])
     st.dataframe(styled, use_container_width=True)
 
     period_high = float(df["High"].max())
