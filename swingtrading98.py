@@ -62,6 +62,7 @@ def init_state():
         "live_running": False,     # auto-trading engine armed?
         "open_position": [],       # list of leg dicts currently open (live)
         "trade_history": [],       # list of dicts: every live order/close this session
+        "bt_fetch_failed": None,   # (ticker, interval, period) if last backtest fetch returned empty
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -490,21 +491,41 @@ def get_position(df, strategy, p):
 # =====================================================================================
 # DATA FETCH
 # =====================================================================================
+def _fetch_yf_with_retries(ticker, interval, period, attempts=3):
+    """Try a few times before giving up — Yahoo Finance intermittently hiccups on individual
+    requests, and without a retry those transient failures get cached as if the timeframe
+    itself were broken."""
+    last_err = None
+    for attempt in range(attempts):
+        try:
+            time.sleep(YF_REQUEST_DELAY_SECONDS)
+            df = yf.Ticker(ticker).history(period=period, interval=interval, auto_adjust=True)
+            if df is not None and not df.empty:
+                return df[["Open", "High", "Low", "Close", "Volume"]].dropna(), None
+            last_err = "Yahoo Finance returned zero rows for this ticker/interval/period combination."
+        except Exception as e:
+            last_err = f"{type(e).__name__}: {e}"
+        time.sleep(0.5 * (attempt + 1))
+    return pd.DataFrame(), last_err
+
+
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_data(ticker, interval, period):
     max_p = MAX_PERIOD_FOR_INTERVAL.get(interval, "max")
     order = ["5d", "1mo", "3mo", "6mo", "1y", "2y", "5y", "10y", "max"]
     if max_p != "max" and period in order and order.index(period) > order.index(max_p):
         period = max_p
-    try:
-        time.sleep(YF_REQUEST_DELAY_SECONDS)  # throttle to avoid Yahoo Finance rate limits
-        df = yf.Ticker(ticker).history(period=period, interval=interval, auto_adjust=True)
-        if df.empty:
-            return df
-        df = df[["Open", "High", "Low", "Close", "Volume"]].dropna()
-        return df
-    except Exception:
-        return pd.DataFrame()
+    df, _ = _fetch_yf_with_retries(ticker, interval, period)
+    return df
+
+
+def diagnose_fetch(ticker, interval, period):
+    """Uncached, on-demand fetch that surfaces the *real* error instead of a bare empty table."""
+    max_p = MAX_PERIOD_FOR_INTERVAL.get(interval, "max")
+    order = ["5d", "1mo", "3mo", "6mo", "1y", "2y", "5y", "10y", "max"]
+    if max_p != "max" and period in order and order.index(period) > order.index(max_p):
+        period = max_p
+    return _fetch_yf_with_retries(ticker, interval, period, attempts=2)
 
 
 def bar_minutes_from_interval(interval):
@@ -604,7 +625,8 @@ def run_backtest(df, position, atr_series, qty, sl_type, sl_value, target_type, 
                 net = gross - brokerage_per_trade
                 cash += net
                 trades.append(dict(entry_date=entry_date, exit_date=ts, side="LONG" if side == 1 else "SHORT",
-                                    entry_price=entry_price_exec, exit_price=exit_price, qty=qty, pnl=net, reason=reason))
+                                    entry_price=entry_price_exec, exit_price=exit_price, qty=qty,
+                                    gross_pnl=gross, pnl=net, reason=reason))
                 in_trade = False
 
         if pos != pos_prev:
@@ -614,7 +636,8 @@ def run_backtest(df, position, atr_series, qty, sl_type, sl_value, target_type, 
                 net = gross - brokerage_per_trade
                 cash += net
                 trades.append(dict(entry_date=entry_date, exit_date=ts, side="LONG" if side == 1 else "SHORT",
-                                    entry_price=entry_price_exec, exit_price=exit_price, qty=qty, pnl=net, reason="Signal Flip"))
+                                    entry_price=entry_price_exec, exit_price=exit_price, qty=qty,
+                                    gross_pnl=gross, pnl=net, reason="Signal Flip"))
                 in_trade = False
             if pos != 0:
                 in_trade = True
@@ -637,7 +660,8 @@ def run_backtest(df, position, atr_series, qty, sl_type, sl_value, target_type, 
         net = gross - brokerage_per_trade
         cash += net
         trades.append(dict(entry_date=entry_date, exit_date=last_ts, side="LONG" if side == 1 else "SHORT",
-                            entry_price=entry_price_exec, exit_price=exit_price, qty=qty, pnl=net, reason="End of Data"))
+                            entry_price=entry_price_exec, exit_price=exit_price, qty=qty,
+                            gross_pnl=gross, pnl=net, reason="End of Data"))
 
     trades_df = pd.DataFrame(trades)
     equity_series = pd.Series(equity_curve, index=df.index)
@@ -647,11 +671,13 @@ def run_backtest(df, position, atr_series, qty, sl_type, sl_value, target_type, 
 def calc_metrics(trades_df, equity_series, capital):
     if trades_df is None or len(trades_df) == 0:
         return dict(total_trades=0, win_rate=0, total_pnl=0, total_return_pct=0,
-                    profit_factor=0, sharpe=0, max_dd=0, cagr=0)
+                    profit_factor=0, sharpe=0, max_dd=0, cagr=0, total_gross_pnl=0, total_costs=0)
 
     wins = trades_df[trades_df["pnl"] > 0]
     losses = trades_df[trades_df["pnl"] <= 0]
     total_pnl = trades_df["pnl"].sum()
+    total_gross_pnl = trades_df["gross_pnl"].sum() if "gross_pnl" in trades_df.columns else total_pnl
+    total_costs = total_gross_pnl - total_pnl
     win_rate = len(wins) / len(trades_df) * 100
     loss_sum = abs(losses["pnl"].sum())
     profit_factor = (wins["pnl"].sum() / loss_sum) if loss_sum > 0 else np.inf
@@ -670,7 +696,8 @@ def calc_metrics(trades_df, equity_series, capital):
 
     return dict(total_trades=len(trades_df), win_rate=win_rate, total_pnl=total_pnl,
                 total_return_pct=total_pnl / capital * 100, profit_factor=profit_factor,
-                sharpe=sharpe, max_dd=max_dd, cagr=cagr)
+                sharpe=sharpe, max_dd=max_dd, cagr=cagr,
+                total_gross_pnl=total_gross_pnl, total_costs=total_costs)
 
 
 # =====================================================================================
@@ -926,9 +953,9 @@ with tab_bt:
             df = fetch_data(yf_ticker, interval, period)
             if df.empty:
                 st.session_state.backtest_result = None
-                st.warning("No data returned. Try a different ticker/timeframe/period "
-                           "(intraday intervals have short max lookback on Yahoo Finance).")
+                st.session_state["bt_fetch_failed"] = (yf_ticker, interval, period)
             else:
+                st.session_state["bt_fetch_failed"] = None
                 position = get_position(df, strategy, p)
                 atr_series = ATR(df, p["atr_period"])
                 trades_df, equity_series = run_backtest(
@@ -940,6 +967,20 @@ with tab_bt:
                 st.session_state.backtest_result = dict(
                     df=df, trades_df=trades_df, equity_series=equity_series, metrics=metrics,
                     strategy=strategy, ticker=yf_ticker)
+
+    if st.session_state.get("bt_fetch_failed"):
+        st.warning("No data returned for this ticker/timeframe/period.")
+        if st.button("🔍 Show the real error"):
+            _t, _i, _p = st.session_state["bt_fetch_failed"]
+            _df2, _err = diagnose_fetch(_t, _i, _p)
+            if _err:
+                st.code(_err)
+                st.caption("If this mentions rate limiting, cookies, or crumbs: run "
+                           "`pip install -U yfinance` — Yahoo has changed its backend auth "
+                           "requirements multiple times and older yfinance versions fail "
+                           "unpredictably per-request until upgraded.")
+            else:
+                st.success("Fetch succeeded on retry — click Run Backtest again.")
 
     result = st.session_state.backtest_result
     if result is None:
@@ -968,11 +1009,24 @@ with tab_bt:
         c5.metric("Sharpe", f"{metrics['sharpe']:.2f}")
         c6.metric("Max Drawdown", f"{metrics['max_dd']:.1f}%")
 
-        if metrics["total_trades"] > 0 and metrics["total_pnl"] <= 0:
-            st.info("This configuration is net negative after brokerage/slippage. Try the "
-                    "**Optimization** tab to search for better parameters, or a different "
-                    "SL/Target model (e.g. ATR-based or R-Multiple) — fixed tiny SL% on a "
-                    "noisy timeframe is a common reason strategies bleed on costs.")
+        g1, g2, g3 = st.columns(3)
+        g1.metric("Gross P&L (before costs)", f"₹{metrics['total_gross_pnl']:,.0f}")
+        g2.metric("Total Costs (brokerage+slippage)", f"₹{metrics['total_costs']:,.0f}")
+        g3.metric("Avg Cost per Trade", f"₹{metrics['total_costs']/max(metrics['total_trades'],1):,.1f}")
+
+        if metrics["total_trades"] > 0:
+            if metrics["total_gross_pnl"] > 0 and metrics["total_pnl"] <= 0:
+                st.warning(f"📌 The raw signal was actually **profitable before costs** "
+                           f"(₹{metrics['total_gross_pnl']:,.0f} gross) — brokerage and slippage "
+                           f"(₹{metrics['total_costs']:,.0f} total) flipped it negative. This is a "
+                           f"cost-sizing problem, not a bad signal: increase quantity so a typical "
+                           f"win covers the fixed brokerage by a wider margin, or trade a timeframe "
+                           f"with fewer, larger moves per trade.")
+            elif metrics["total_gross_pnl"] <= 0:
+                st.info(f"📌 The raw signal itself lost money before any costs were applied "
+                        f"(₹{metrics['total_gross_pnl']:,.0f} gross). Costs aren't the problem here — "
+                        f"the entries/exits themselves aren't predicting direction well enough on "
+                        f"this ticker/timeframe/strategy combination.")
 
         fig = go.Figure()
         fig.add_trace(go.Candlestick(x=df.index, open=df["Open"], high=df["High"],
@@ -1003,7 +1057,11 @@ with tab_bt:
             st.info("No trades were generated for this configuration.")
         else:
             show = trades_df.copy()
+            show["gross_pnl"] = show["gross_pnl"].round(2)
             show["pnl"] = show["pnl"].round(2)
+            cols_order = ["entry_date", "exit_date", "side", "entry_price", "exit_price",
+                          "qty", "gross_pnl", "pnl", "reason"]
+            show = show[[c for c in cols_order if c in show.columns]]
             st.dataframe(show, use_container_width=True, height=300)
             st.download_button("Download Trades CSV", show.to_csv(index=False), "backtest_trades.csv", "text/csv")
 
