@@ -59,6 +59,16 @@ STRATEGIES = [
     "Pro: Opening Range Breakout + Volume",
     "Pro: BB+RSI Mean Reversion (ATR filtered)",
     "Pro: EMA50 Trend + EMA9/15 Pullback",
+    "Pro: MACD Crossover",
+    "Pro: Donchian Channel Breakout",
+    "Pro: Keltner Squeeze Breakout",
+    "Pro: Stochastic Reversal",
+    "Pro: TEMA Trend Flip",
+    "Pro: CCI Extreme Reversal",
+    "Pro: Parabolic SAR Flip",
+    "Pro: ADX/DI Directional Entry",
+    "Pro: Heikin-Ashi Trend Continuation",
+    "Pro: Ichimoku Cloud Breakout",
 ]
 
 PRO_STRATEGIES = {
@@ -66,6 +76,16 @@ PRO_STRATEGIES = {
     "Pro: Opening Range Breakout + Volume",
     "Pro: BB+RSI Mean Reversion (ATR filtered)",
     "Pro: EMA50 Trend + EMA9/15 Pullback",
+    "Pro: MACD Crossover",
+    "Pro: Donchian Channel Breakout",
+    "Pro: Keltner Squeeze Breakout",
+    "Pro: Stochastic Reversal",
+    "Pro: TEMA Trend Flip",
+    "Pro: CCI Extreme Reversal",
+    "Pro: Parabolic SAR Flip",
+    "Pro: ADX/DI Directional Entry",
+    "Pro: Heikin-Ashi Trend Continuation",
+    "Pro: Ichimoku Cloud Breakout",
 }
 
 # Rough family classification used by the Regime Filter — trend-following
@@ -86,6 +106,16 @@ STRATEGY_FAMILY = {
     "Pro: Opening Range Breakout + Volume": "trend",
     "Pro: BB+RSI Mean Reversion (ATR filtered)": "mean_reversion",
     "Pro: EMA50 Trend + EMA9/15 Pullback": "trend",
+    "Pro: MACD Crossover": "trend",
+    "Pro: Donchian Channel Breakout": "trend",
+    "Pro: Keltner Squeeze Breakout": "trend",
+    "Pro: Stochastic Reversal": "mean_reversion",
+    "Pro: TEMA Trend Flip": "trend",
+    "Pro: CCI Extreme Reversal": "mean_reversion",
+    "Pro: Parabolic SAR Flip": "trend",
+    "Pro: ADX/DI Directional Entry": "trend",
+    "Pro: Heikin-Ashi Trend Continuation": "trend",
+    "Pro: Ichimoku Cloud Breakout": "trend",
 }
 
 # These strategies react to a condition that's true or false AT A SINGLE
@@ -125,6 +155,7 @@ for key, default in {
     "last_backtest": None,
     "last_backtest_df": None,
     "live_running": False,
+    "last_acted_signal_marker": None,
 }.items():
     if key not in st.session_state:
         st.session_state[key] = default
@@ -229,6 +260,114 @@ def swing_points(df, lookback=3):
         if lows.iloc[i] == wl.min():
             swing_low.iloc[i] = True
     return swing_high, swing_low
+
+
+def macd(series, fast=12, slow=26, signal=9):
+    macd_line = ema(series, fast) - ema(series, slow)
+    signal_line = ema(macd_line, signal)
+    return macd_line, signal_line, macd_line - signal_line
+
+
+def donchian(df, period=20):
+    upper = df["High"].rolling(period).max()
+    lower = df["Low"].rolling(period).min()
+    return upper, (upper + lower) / 2, lower
+
+
+def keltner(df, period=20, atr_mult=1.5):
+    mid = ema(df["Close"], period)
+    a = atr(df, period)
+    return mid + atr_mult * a, mid, mid - atr_mult * a
+
+
+def stochastic(df, k_period=14, d_period=3):
+    low_min = df["Low"].rolling(k_period).min()
+    high_max = df["High"].rolling(k_period).max()
+    k = 100 * (df["Close"] - low_min) / (high_max - low_min).replace(0, np.nan)
+    return k, k.rolling(d_period).mean()
+
+
+def tema(series, period=20):
+    e1 = ema(series, period)
+    e2 = ema(e1, period)
+    e3 = ema(e2, period)
+    return 3 * e1 - 3 * e2 + e3
+
+
+def cci(df, period=20):
+    tp = (df["High"] + df["Low"] + df["Close"]) / 3
+    sma_tp = tp.rolling(period).mean()
+    mad = tp.rolling(period).apply(lambda x: np.mean(np.abs(x - x.mean())), raw=True)
+    return (tp - sma_tp) / (0.015 * mad.replace(0, np.nan))
+
+
+def adx_di(df, period=14):
+    """Like adx() but also returns +DI/-DI separately, needed for directional
+    (not just strength) entries."""
+    high, low, close = df["High"], df["Low"], df["Close"]
+    up_move, down_move = high.diff(), -low.diff()
+    plus_dm = up_move.where((up_move > down_move) & (up_move > 0), 0.0)
+    minus_dm = down_move.where((down_move > up_move) & (down_move > 0), 0.0)
+    tr = pd.concat([high - low, (high - close.shift()).abs(), (low - close.shift()).abs()], axis=1).max(axis=1)
+    atr_ = tr.ewm(alpha=1 / period, adjust=False).mean()
+    plus_di = 100 * (plus_dm.ewm(alpha=1 / period, adjust=False).mean() / atr_.replace(0, np.nan))
+    minus_di = 100 * (minus_dm.ewm(alpha=1 / period, adjust=False).mean() / atr_.replace(0, np.nan))
+    dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)
+    return plus_di, minus_di, dx.ewm(alpha=1 / period, adjust=False).mean()
+
+
+def parabolic_sar(df, af_start=0.02, af_step=0.02, af_max=0.2):
+    high, low = df["High"].values, df["Low"].values
+    n = len(df)
+    sar = np.zeros(n)
+    trend = np.zeros(n, dtype=int)
+    ep = np.zeros(n)
+    af = np.zeros(n)
+    trend[0], sar[0], ep[0], af[0] = 1, low[0], high[0], af_start
+    for i in range(1, n):
+        prev_sar = sar[i - 1]
+        if trend[i - 1] == 1:
+            s = prev_sar + af[i - 1] * (ep[i - 1] - prev_sar)
+            s = min(s, low[i - 1], low[i - 2] if i >= 2 else low[i - 1])
+            if low[i] < s:
+                trend[i], sar[i], ep[i], af[i] = -1, ep[i - 1], low[i], af_start
+            else:
+                trend[i], sar[i] = 1, s
+                if high[i] > ep[i - 1]:
+                    ep[i], af[i] = high[i], min(af[i - 1] + af_step, af_max)
+                else:
+                    ep[i], af[i] = ep[i - 1], af[i - 1]
+        else:
+            s = prev_sar + af[i - 1] * (ep[i - 1] - prev_sar)
+            s = max(s, high[i - 1], high[i - 2] if i >= 2 else high[i - 1])
+            if high[i] > s:
+                trend[i], sar[i], ep[i], af[i] = 1, ep[i - 1], high[i], af_start
+            else:
+                trend[i], sar[i] = -1, s
+                if low[i] < ep[i - 1]:
+                    ep[i], af[i] = low[i], min(af[i - 1] + af_step, af_max)
+                else:
+                    ep[i], af[i] = ep[i - 1], af[i - 1]
+    return pd.Series(sar, index=df.index), pd.Series(trend, index=df.index)
+
+
+def heikin_ashi(df):
+    ha_close = (df["Open"] + df["High"] + df["Low"] + df["Close"]) / 4
+    ha_open = pd.Series(index=df.index, dtype=float)
+    ha_open.iloc[0] = (df["Open"].iloc[0] + df["Close"].iloc[0]) / 2
+    for i in range(1, len(df)):
+        ha_open.iloc[i] = (ha_open.iloc[i - 1] + ha_close.iloc[i - 1]) / 2
+    ha_high = pd.concat([df["High"], ha_open, ha_close], axis=1).max(axis=1)
+    ha_low = pd.concat([df["Low"], ha_open, ha_close], axis=1).min(axis=1)
+    return ha_open, ha_high, ha_low, ha_close
+
+
+def ichimoku(df, tenkan_p=9, kijun_p=26, senkou_b_p=52):
+    tenkan = (df["High"].rolling(tenkan_p).max() + df["Low"].rolling(tenkan_p).min()) / 2
+    kijun = (df["High"].rolling(kijun_p).max() + df["Low"].rolling(kijun_p).min()) / 2
+    senkou_a = ((tenkan + kijun) / 2).shift(kijun_p)
+    senkou_b = ((df["High"].rolling(senkou_b_p).max() + df["Low"].rolling(senkou_b_p).min()) / 2).shift(kijun_p)
+    return tenkan, kijun, senkou_a, senkou_b
 
 
 # Gap handling note: True Range (used by atr()/adx()/supertrend()) is defined as
@@ -371,6 +510,43 @@ def live_position_fragment(ticker, label="LTP"):
     return ltp
 
 
+@st.fragment(run_every=3)
+def recent_trades_fragment():
+    """
+    Renders the last 10 completed live trades. Wrapped in its own fragment so
+    it reflects a trade the instant SL/Target/manual-close fires — without
+    this, a trade closed by live_signal_loop_fragment (a separate fragment)
+    wouldn't show up here until a full page rerun happened (e.g. clicking
+    Stop), even though it was already correctly recorded in session_state.
+    """
+    st.markdown("#### Recent Trades")
+    if st.session_state.live_history:
+        st.dataframe(pd.DataFrame(st.session_state.live_history[-10:]), use_container_width=True, hide_index=True)
+    else:
+        st.caption("No live trades yet.")
+
+
+@st.fragment(run_every=5)
+def trade_history_fragment():
+    """Same reasoning as recent_trades_fragment — the whole Trade History tab
+    now updates on its own instead of only reflecting reality after Stop."""
+    hist_df = pd.DataFrame(st.session_state.live_history)
+    if hist_df.empty:
+        st.caption("No completed live trades yet.")
+        return
+    m = compute_metrics(hist_df)
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("No. of Trades", m["total_trades"])
+    c2.metric("Accuracy", f"{m['accuracy']}%")
+    c3.metric("Points Gained/Lost", m["total_points"])
+    c4.metric("Total PnL", m["total_pnl"])
+    c5.metric("Expectancy", m["expectancy"])
+    st.dataframe(hist_df, use_container_width=True, hide_index=True)
+    if st.button("🗑️ Clear Trade History"):
+        st.session_state.live_history = []
+        st.rerun()
+
+
 # ============================================================================
 # STRATEGY SIGNAL GENERATION  (no look-ahead: signal at i uses data up to i)
 # ============================================================================
@@ -477,6 +653,83 @@ def generate_signals(df, strategy, params):
         uptrend, downtrend = df["Close"] > e50, df["Close"] < e50
         buy = uptrend & (e9 > e15) & (e9.shift(1) <= e15.shift(1))
         sell = downtrend & (e9 < e15) & (e9.shift(1) >= e15.shift(1))
+        df.loc[buy, "signal"] = 1
+        df.loc[sell, "signal"] = -1
+
+    elif strategy == "Pro: MACD Crossover":
+        macd_line, signal_line, hist = macd(df["Close"], params.get("macd_fast", 12), params.get("macd_slow", 26), params.get("macd_signal", 9))
+        df["macd"], df["macd_signal"] = macd_line, signal_line
+        buy = (macd_line > signal_line) & (macd_line.shift(1) <= signal_line.shift(1))
+        sell = (macd_line < signal_line) & (macd_line.shift(1) >= signal_line.shift(1))
+        df.loc[buy, "signal"] = 1
+        df.loc[sell, "signal"] = -1
+
+    elif strategy == "Pro: Donchian Channel Breakout":
+        upper, mid, lower = donchian(df, params.get("donchian_period", 20))
+        buy = df["Close"] > upper.shift(1)
+        sell = df["Close"] < lower.shift(1)
+        df.loc[buy, "signal"] = 1
+        df.loc[sell, "signal"] = -1
+
+    elif strategy == "Pro: Keltner Squeeze Breakout":
+        k_upper, k_mid, k_lower = keltner(df, params.get("keltner_period", 20), params.get("keltner_atr_mult", 1.5))
+        bb_upper, bb_mid, bb_lower = bollinger(df["Close"], 20, 2)
+        squeeze = (bb_upper < k_upper) & (bb_lower > k_lower)
+        buy = squeeze.shift(1).fillna(False) & (df["Close"] > k_upper)
+        sell = squeeze.shift(1).fillna(False) & (df["Close"] < k_lower)
+        df.loc[buy, "signal"] = 1
+        df.loc[sell, "signal"] = -1
+
+    elif strategy == "Pro: Stochastic Reversal":
+        k, d = stochastic(df, params.get("stoch_k", 14), params.get("stoch_d", 3))
+        buy = (k > d) & (k.shift(1) <= d.shift(1)) & (k < 30)
+        sell = (k < d) & (k.shift(1) >= d.shift(1)) & (k > 70)
+        df.loc[buy, "signal"] = 1
+        df.loc[sell, "signal"] = -1
+
+    elif strategy == "Pro: TEMA Trend Flip":
+        t = tema(df["Close"], params.get("tema_period", 20))
+        buy = (df["Close"] > t) & (df["Close"].shift(1) <= t.shift(1))
+        sell = (df["Close"] < t) & (df["Close"].shift(1) >= t.shift(1))
+        df.loc[buy, "signal"] = 1
+        df.loc[sell, "signal"] = -1
+
+    elif strategy == "Pro: CCI Extreme Reversal":
+        c = cci(df, params.get("cci_period", 20))
+        buy = (c > -100) & (c.shift(1) <= -100)
+        sell = (c < 100) & (c.shift(1) >= 100)
+        df.loc[buy, "signal"] = 1
+        df.loc[sell, "signal"] = -1
+
+    elif strategy == "Pro: Parabolic SAR Flip":
+        sar, trend = parabolic_sar(df)
+        df["sar"] = sar
+        buy = (trend == 1) & (trend.shift(1) == -1)
+        sell = (trend == -1) & (trend.shift(1) == 1)
+        df.loc[buy, "signal"] = 1
+        df.loc[sell, "signal"] = -1
+
+    elif strategy == "Pro: ADX/DI Directional Entry":
+        plus_di, minus_di, adx_val = adx_di(df, 14)
+        buy = (plus_di > minus_di) & (plus_di.shift(1) <= minus_di.shift(1)) & (adx_val > 20)
+        sell = (plus_di < minus_di) & (plus_di.shift(1) >= minus_di.shift(1)) & (adx_val > 20)
+        df.loc[buy, "signal"] = 1
+        df.loc[sell, "signal"] = -1
+
+    elif strategy == "Pro: Heikin-Ashi Trend Continuation":
+        ha_open, ha_high, ha_low, ha_close = heikin_ashi(df)
+        bullish, bearish = ha_close > ha_open, ha_close < ha_open
+        buy = bullish & bullish.shift(1).fillna(False) & ~bullish.shift(2).fillna(False)
+        sell = bearish & bearish.shift(1).fillna(False) & ~bearish.shift(2).fillna(False)
+        df.loc[buy, "signal"] = 1
+        df.loc[sell, "signal"] = -1
+
+    elif strategy == "Pro: Ichimoku Cloud Breakout":
+        tenkan, kijun, senkou_a, senkou_b = ichimoku(df)
+        cloud_top = pd.concat([senkou_a, senkou_b], axis=1).max(axis=1)
+        cloud_bottom = pd.concat([senkou_a, senkou_b], axis=1).min(axis=1)
+        buy = (df["Close"] > cloud_top) & (df["Close"].shift(1) <= cloud_top.shift(1))
+        sell = (df["Close"] < cloud_bottom) & (df["Close"].shift(1) >= cloud_bottom.shift(1))
         df.loc[buy, "signal"] = 1
         df.loc[sell, "signal"] = -1
 
@@ -1035,6 +1288,55 @@ def run_backtest(raw_df, strategy, sl_type, target_type, params, filters, qty, r
     return pd.DataFrame(trades), df
 
 
+def recommend_sl_target_from_mae_mfe(sig_df, trades_df, lookahead=20):
+    """
+    Recommends SL/Target distances from the ACTUAL adverse/favorable price
+    excursions your signals produced — not a guess, and not the same as
+    "whatever SL/Target you happened to backtest with". For every trade:
+      MAE (Max Adverse Excursion)  = worst move against you before exit/lookahead
+      MFE (Max Favorable Excursion) = best move in your favor before exit/lookahead
+    SL is suggested at a percentile of the MAE distribution (tight enough to
+    matter, loose enough to survive normal noise). Target is suggested at a
+    more conservative percentile of MFE (a realistically reachable level, not
+    the best-case outlier). This is standard MAE/MFE analysis, a real
+    technique used to size stops/targets off a strategy's own behavior.
+    """
+    if trades_df is None or trades_df.empty or sig_df is None or sig_df.empty:
+        return None
+
+    mae_list, mfe_list = [], []
+    for _, row in trades_df.iterrows():
+        entry_time = row["Entry Time"]
+        if entry_time not in sig_df.index:
+            continue
+        entry_idx = sig_df.index.get_loc(entry_time)
+        direction = 1 if row["Direction"] == "LONG" else -1
+        entry_price = row["Entry Price"]
+        window = sig_df.iloc[entry_idx: entry_idx + lookahead]
+        if window.empty:
+            continue
+        if direction == 1:
+            mae = entry_price - window["Low"].min()
+            mfe = window["High"].max() - entry_price
+        else:
+            mae = window["High"].max() - entry_price
+            mfe = entry_price - window["Low"].min()
+        mae_list.append(max(mae, 0))
+        mfe_list.append(max(mfe, 0))
+
+    if len(mae_list) < 5:
+        return None
+
+    mae_arr, mfe_arr = np.array(mae_list), np.array(mfe_list)
+    return {
+        "n_trades": len(mae_arr),
+        "mae_p50": float(np.percentile(mae_arr, 50)), "mae_p70": float(np.percentile(mae_arr, 70)), "mae_p90": float(np.percentile(mae_arr, 90)),
+        "mfe_p50": float(np.percentile(mfe_arr, 50)), "mfe_p70": float(np.percentile(mfe_arr, 70)), "mfe_p90": float(np.percentile(mfe_arr, 90)),
+        "suggested_sl": float(np.percentile(mae_arr, 70)),
+        "suggested_target": float(np.percentile(mfe_arr, 50)),
+    }
+
+
 def compute_metrics(trades_df):
     if trades_df is None or trades_df.empty:
         return dict(total_trades=0, wins=0, losses=0, accuracy=0.0, total_points=0.0, total_pnl=0.0,
@@ -1300,9 +1602,28 @@ if strategy == "Pro: VWAP + Supertrend Trend":
     params["st_mult"] = st.sidebar.number_input("Supertrend Multiplier", 1.0, 6.0, float(ov.get("st_mult", 3.0)))
 if strategy == "Pro: Opening Range Breakout + Volume":
     params["orb_candles"] = st.sidebar.number_input("ORB Candles", 1, 30, int(ov.get("orb_candles", 5)))
+if strategy == "Pro: MACD Crossover":
+    c1, c2, c3 = st.sidebar.columns(3)
+    params["macd_fast"] = c1.number_input("MACD Fast", 2, 50, 12)
+    params["macd_slow"] = c2.number_input("MACD Slow", 5, 100, 26)
+    params["macd_signal"] = c3.number_input("MACD Signal", 2, 30, 9)
+if strategy == "Pro: Donchian Channel Breakout":
+    params["donchian_period"] = st.sidebar.number_input("Donchian Period", 5, 100, 20)
+if strategy == "Pro: Keltner Squeeze Breakout":
+    c1, c2 = st.sidebar.columns(2)
+    params["keltner_period"] = c1.number_input("Keltner Period", 5, 50, 20)
+    params["keltner_atr_mult"] = c2.number_input("Keltner ATR Mult", 0.5, 4.0, 1.5)
+if strategy == "Pro: Stochastic Reversal":
+    c1, c2 = st.sidebar.columns(2)
+    params["stoch_k"] = c1.number_input("Stochastic %K Period", 2, 50, 14)
+    params["stoch_d"] = c2.number_input("Stochastic %D Period", 2, 20, 3)
+if strategy == "Pro: TEMA Trend Flip":
+    params["tema_period"] = st.sidebar.number_input("TEMA Period", 5, 100, 20)
+if strategy == "Pro: CCI Extreme Reversal":
+    params["cci_period"] = st.sidebar.number_input("CCI Period", 5, 100, 20)
 
 if strategy in PRO_STRATEGIES:
-    st.sidebar.caption("💡 Professional-grade composite strategy (trend/volatility/liquidity confluence).")
+    st.sidebar.caption("💡 Professional-grade composite strategy (trend/volatility/liquidity confluence). Not a guarantee of profitability — validate in the Optimization tab first.")
 
 st.sidebar.markdown("### 🛑 Stoploss")
 sl_type = st.sidebar.selectbox(
@@ -1802,28 +2123,43 @@ def evaluate_live_signal(ticker, interval, period, strategy, params, filters, sl
             st.session_state.live_positions = [pos]
             st.info("Position still open — levels updated.")
     elif last_sig != 0:
-        entry_price = entry_reference_price
-        a_val = a_series.iloc[-1] if not np.isnan(a_series.iloc[-1]) else entry_price * 0.005
-        sl, target, sl_dist, target_dist = calc_initial_sl_target(last_sig, entry_price, a_val, params, sl_type, target_type)
-        new_pos = {
-            "entry_time": sig_df.index[-1], "entry_price": entry_price, "direction": last_sig,
-            "qty": qty, "sl": sl, "target": target, "initial_sl": sl, "initial_target": target,
-            "sl_dist": sl_dist, "target_dist": target_dist, "sl_type": sl_type, "target_type": target_type,
-            "highest": entry_price, "lowest": entry_price, "current_price": entry_price,
-            "pending_exit_reason": None,
-            "peak_pl_points": 0.0, "worst_pl_points": 0.0, "loss_since": None,
-            "original_qty": qty, "remaining_qty": qty, "partial_booked": False,
-            "loss_trigger_points": params.get("loss_trigger_points", 20.0),
-            "min_recovery_pct": params.get("min_recovery_pct", 50.0),
-            "profit_trigger_points": params.get("profit_trigger_points", 50.0),
-            "giveback_pct": params.get("giveback_pct", 30.0),
-            "partial_book_pct": params.get("partial_book_pct", 50.0),
-        }
-        st.session_state.live_positions = [new_pos]
-        st.success(f"New {'LONG' if last_sig == 1 else 'SHORT'} position opened @ {entry_price:.2f}")
-        if dhan_enabled:
-            leg_id, side = resolve_dhan_order_leg(last_sig, True, ticker, product_cfg)
-            st.json(place_dhan_order(dhan_client_id, dhan_access_token, leg_id, side, product_cfg, qty, entry_price))
+        # The candle/tick that produced this signal — used to make sure we
+        # only ever act on it ONCE. Without this, a fast target-hit followed
+        # by a re-check (every ~5s) would keep seeing the SAME unchanged
+        # crossover as "last closed candle's signal" until a genuinely new
+        # candle closes, and would re-open a fresh position every cycle —
+        # which is exactly the bug that produced repeated instant re-entries.
+        if strategy in IMMEDIATE_EXECUTION_STRATEGIES:
+            signal_marker = (sig_df.index[-1], last_sig)
+        else:
+            signal_marker = (sig_df.index[-2], last_sig)
+
+        if st.session_state.get("last_acted_signal_marker") == signal_marker:
+            st.caption(f"Signal at {signal_marker[0]} already acted on — waiting for a genuinely new signal before re-entering.")
+        else:
+            entry_price = entry_reference_price
+            a_val = a_series.iloc[-1] if not np.isnan(a_series.iloc[-1]) else entry_price * 0.005
+            sl, target, sl_dist, target_dist = calc_initial_sl_target(last_sig, entry_price, a_val, params, sl_type, target_type)
+            new_pos = {
+                "entry_time": sig_df.index[-1], "entry_price": entry_price, "direction": last_sig,
+                "qty": qty, "sl": sl, "target": target, "initial_sl": sl, "initial_target": target,
+                "sl_dist": sl_dist, "target_dist": target_dist, "sl_type": sl_type, "target_type": target_type,
+                "highest": entry_price, "lowest": entry_price, "current_price": entry_price,
+                "pending_exit_reason": None,
+                "peak_pl_points": 0.0, "worst_pl_points": 0.0, "loss_since": None,
+                "original_qty": qty, "remaining_qty": qty, "partial_booked": False,
+                "loss_trigger_points": params.get("loss_trigger_points", 20.0),
+                "min_recovery_pct": params.get("min_recovery_pct", 50.0),
+                "profit_trigger_points": params.get("profit_trigger_points", 50.0),
+                "giveback_pct": params.get("giveback_pct", 30.0),
+                "partial_book_pct": params.get("partial_book_pct", 50.0),
+            }
+            st.session_state.live_positions = [new_pos]
+            st.session_state.last_acted_signal_marker = signal_marker
+            st.success(f"New {'LONG' if last_sig == 1 else 'SHORT'} position opened @ {entry_price:.2f}")
+            if dhan_enabled:
+                leg_id, side = resolve_dhan_order_leg(last_sig, True, ticker, product_cfg)
+                st.json(place_dhan_order(dhan_client_id, dhan_access_token, leg_id, side, product_cfg, qty, entry_price))
     else:
         st.caption("No new signal on the latest closed candle.")
     return sig_df
@@ -1875,7 +2211,14 @@ def render_range_insight_section(ticker, interval, period, section_title):
     df["Change %"] = df["Close"].pct_change() * 100
 
     display_df = df[["Open", "High", "Low", "Close", "Volume", "Change", "Change %"]].round(2)
-    st.dataframe(display_df.sort_index(ascending=False), use_container_width=True)
+
+    def _color_change(val):
+        if pd.isna(val) or val == 0:
+            return ""
+        return "color: #16c784; font-weight: 600;" if val > 0 else "color: #ea3943; font-weight: 600;"
+
+    styled = display_df.sort_index(ascending=False).style.applymap(_color_change, subset=["Change", "Change %"])
+    st.dataframe(styled, use_container_width=True)
 
     period_high = float(df["High"].max())
     period_low = float(df["Low"].min())
@@ -2095,6 +2438,27 @@ with tab_bt:
         st.markdown("#### Trade Log")
         st.dataframe(trades_display, use_container_width=True, hide_index=True)
 
+        st.markdown("#### 📐 SL/Target Recommendation (MAE/MFE Analysis)")
+        mae_mfe = recommend_sl_target_from_mae_mfe(sig_df, trades_df, lookahead=20)
+        if mae_mfe is None:
+            st.caption("Need at least 5 trades to compute a reliable recommendation.")
+        else:
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Suggested SL (70th pct. of adverse moves)", f"{mae_mfe['suggested_sl']:.2f} pts")
+            c2.metric("Suggested Target (50th pct. of favorable moves)", f"{mae_mfe['suggested_target']:.2f} pts")
+            c3.metric("Based on", f"{mae_mfe['n_trades']} trades")
+            st.caption(
+                f"MAE (adverse move before things went right/wrong) distribution: 50th pct {mae_mfe['mae_p50']:.2f}, "
+                f"70th pct {mae_mfe['mae_p70']:.2f}, 90th pct {mae_mfe['mae_p90']:.2f}. "
+                f"MFE (favorable move available) distribution: 50th pct {mae_mfe['mfe_p50']:.2f}, "
+                f"70th pct {mae_mfe['mfe_p70']:.2f}, 90th pct {mae_mfe['mfe_p90']:.2f}. "
+                "SL is set loose enough to survive most normal noise (70th percentile of adverse excursion) without "
+                "being so wide it erases the point of having a stop. Target is set at the 50th percentile of favorable "
+                "excursion — a realistically reachable level roughly half your winners could hit, not the best-case "
+                "90th-percentile outlier. This is descriptive of what THIS strategy on THIS data actually did — re-run "
+                "it after changing timeframe, period, or filters, since the right SL/Target changes with all of those."
+            )
+
         st.markdown("#### Chart — Price with Entries/Exits")
         st.plotly_chart(
             price_chart(sig_df, trades_df, "Price with Entries/Exits",
@@ -2225,30 +2589,12 @@ with tab_live:
         else:
             st.caption("No open paper position.")
 
-    st.markdown("#### Recent Trades")
-    if st.session_state.live_history:
-        st.dataframe(pd.DataFrame(st.session_state.live_history[-10:]), use_container_width=True, hide_index=True)
-    else:
-        st.caption("No live trades yet.")
+    recent_trades_fragment()
 
 # ------------------------------------------------------------- TRADE HIST -
 with tab_hist:
     st.subheader("Trade History (Live/Paper only — never mixed with backtest)")
-    hist_df = pd.DataFrame(st.session_state.live_history)
-    if hist_df.empty:
-        st.caption("No completed live trades yet.")
-    else:
-        m = compute_metrics(hist_df)
-        c1, c2, c3, c4, c5 = st.columns(5)
-        c1.metric("No. of Trades", m["total_trades"])
-        c2.metric("Accuracy", f"{m['accuracy']}%")
-        c3.metric("Points Gained/Lost", m["total_points"])
-        c4.metric("Total PnL", m["total_pnl"])
-        c5.metric("Expectancy", m["expectancy"])
-        st.dataframe(hist_df, use_container_width=True, hide_index=True)
-        if st.button("🗑️ Clear Trade History"):
-            st.session_state.live_history = []
-            st.rerun()
+    trade_history_fragment()
 
 # ---------------------------------------------------------------- HEATMAP -
 with tab_heat:
