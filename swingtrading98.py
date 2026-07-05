@@ -3,18 +3,33 @@
  ALGO TRADER PRO  —  Single-file Streamlit Algorithmic Trading Workbench
 =====================================================================================
 Tabs:
-    1. Backtest      -> Run any of 20 strategies on Index/Stock/F&O with SL/Target
-    2. Live Trading  -> Signal panel + guarded Dhan order placement (CE/PE/Both, FUT, EQ)
-    3. Optimization  -> 2D parameter grid-search with Sharpe/Return heatmap
-    4. Heatmaps      -> Yearly monthly-returns heatmap, OHLC daily-range heatmap,
-                         and a heatmap for the currently selected timeframe/period
+    1. Backtest      -> Click "Run Backtest" to test any of 20 strategies with
+                         percentage / points / ATR-multiple / R-multiple / trailing
+                         SL & Target, plus brokerage + slippage cost modelling.
+    2. Live Trading  -> Manual "Refresh Signal", "Start/Stop Auto-Trading Engine",
+                         and "Manual Square Off" controls, wired to guarded Dhan
+                         order placement (CE/PE/Both, FUT, EQ).
+    3. Optimization  -> 2D parameter grid-search with a minimum-accuracy (win rate)
+                         filter, a ranked results table, and an "Apply Best Config
+                         to Sidebar" button.
+    4. Trade History -> Every order this session actually placed (manual or auto),
+                         independent of the Backtest tab's simulated trade log.
 
-Data source for historical bars: yfinance (free, no auth). Dhan is used ONLY for
-order execution (guarded behind an explicit checkbox + credentials).
+Data source for historical bars: yfinance (rate-limited to 1 request / 0.3s and
+cached). Dhan is used ONLY for order execution (guarded behind an explicit
+checkbox + credentials, and nothing fires until you click a button).
 
-DISCLAIMER: Educational tool. Not investment advice. Verify Dhan scrip-master
-column names against the current API version before going live. Trading involves
-risk of loss.
+IMPORTANT HONESTY NOTES (read before using real money):
+  - No strategy here is guaranteed profitable. A high win rate is NOT the same as
+    profitability — a few large losing trades can outweigh many small winners.
+    Always look at win rate *together with* Sharpe/CAGR/max drawdown/profit factor.
+  - The "Auto-Trading Engine" uses a Streamlit rerun-and-sleep loop, which only
+    works while this browser tab stays open and the process stays alive. It is a
+    convenience wrapper, not a resilient production scheduler — for real unattended
+    automation, run the same signal/order logic from a standalone script under
+    cron/systemd/APScheduler.
+  - Verify Dhan's scrip-master column names and API parameters against current
+    documentation before going live; they can change between API versions.
 =====================================================================================
 """
 
@@ -26,9 +41,8 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 import plotly.graph_objects as go
-import plotly.express as px
 import yfinance as yf
-from datetime import datetime, timedelta
+from datetime import datetime
 
 try:
     from dhanhq import dhanhq
@@ -37,6 +51,24 @@ except Exception:
     DHAN_AVAILABLE = False
 
 st.set_page_config(page_title="Algo Trader Pro", layout="wide", page_icon="📈")
+
+# =====================================================================================
+# SESSION STATE
+# =====================================================================================
+def init_state():
+    defaults = {
+        "backtest_result": None,   # dict: df, trades_df, equity_series, metrics
+        "opt_result": None,        # dict: pivot tables, top table, best combo
+        "live_running": False,     # auto-trading engine armed?
+        "open_position": [],       # list of leg dicts currently open (live)
+        "trade_history": [],       # list of dicts: every live order/close this session
+    }
+    for k, v in defaults.items():
+        if k not in st.session_state:
+            st.session_state[k] = v
+
+
+init_state()
 
 # =====================================================================================
 # CONSTANTS
@@ -54,7 +86,6 @@ TIMEFRAME_MAP = {
     "1 Week": "1wk", "1 Month": "1mo",
 }
 
-# yfinance intraday history limits (approx, enforced by Yahoo)
 MAX_PERIOD_FOR_INTERVAL = {
     "1m": "5d", "5m": "60d", "15m": "60d", "30m": "60d", "60m": "730d",
     "1d": "max", "1wk": "max", "1mo": "max",
@@ -116,6 +147,10 @@ SEGMENT_TO_PRODUCT = {
 }
 
 EXCHANGE_SEGMENTS = ["NSE_EQ", "NSE_FNO", "BSE_EQ", "BSE_FNO", "MCX_COMM", "IDX_I"]
+
+SL_TYPES = ["Percentage", "Points (Absolute)", "ATR Multiple"]
+TARGET_TYPES = ["Percentage", "Points (Absolute)", "ATR Multiple", "R-Multiple (of Stop Loss)"]
+TRAIL_TYPES = ["Points (Absolute)", "ATR Multiple"]
 
 # Yahoo Finance is rate-limited; pause briefly before every real network call to it.
 # (st.cache_data means this only fires on genuine cache misses, not on every rerun.)
@@ -257,7 +292,6 @@ def PSAR(df, af_step=0.02, af_max=0.2):
     psar = close.copy().astype(float)
     bull = True
     af = af_step
-    ep = low[0]
     hp, lp = high[0], low[0]
     psar[0] = close[0]
     for i in range(1, n):
@@ -315,7 +349,7 @@ def ZSCORE(s, window=20):
 
 def HEIKIN_ASHI(df):
     ha_close = (df["Open"] + df["High"] + df["Low"] + df["Close"]) / 4
-    ha_open = [ (df["Open"].iloc[0] + df["Close"].iloc[0]) / 2 ]
+    ha_open = [(df["Open"].iloc[0] + df["Close"].iloc[0]) / 2]
     for i in range(1, len(df)):
         ha_open.append((ha_open[i - 1] + ha_close.iloc[i - 1]) / 2)
     ha_open = pd.Series(ha_open, index=df.index)
@@ -351,9 +385,7 @@ def get_position(df, strategy, p):
 
     if strategy == STRATEGIES[1]:  # RSI Mean Reversion
         rsi = RSI(close, p["rsi_period"])
-        long_c = rsi < p["rsi_lower"]
-        short_c = rsi > p["rsi_upper"]
-        return build_position(long_c, short_c)
+        return build_position(rsi < p["rsi_lower"], rsi > p["rsi_upper"])
 
     if strategy == STRATEGIES[2]:  # MACD Crossover
         macd_line, signal_line, _ = MACD(close)
@@ -361,15 +393,11 @@ def get_position(df, strategy, p):
 
     if strategy == STRATEGIES[3]:  # Bollinger Mean Reversion
         upper, mid, lower = BBANDS(close, p["bb_window"], p["bb_std"])
-        long_c = close < lower
-        short_c = close > upper
-        return build_position(long_c, short_c)
+        return build_position(close < lower, close > upper)
 
     if strategy == STRATEGIES[4]:  # Bollinger Breakout
         upper, mid, lower = BBANDS(close, p["bb_window"], p["bb_std"])
-        long_c = close > upper
-        short_c = close < lower
-        return build_position(long_c, short_c)
+        return build_position(close > upper, close < lower)
 
     if strategy == STRATEGIES[5]:  # Supertrend
         _, direction = SUPERTREND(df, p["atr_period"], p["st_mult"])
@@ -383,9 +411,7 @@ def get_position(df, strategy, p):
 
     if strategy == STRATEGIES[7]:  # VWAP Reversion
         vwap = VWAP(df)
-        long_c = close < vwap * 0.998
-        short_c = close > vwap * 1.002
-        return build_position(long_c, short_c)
+        return build_position(close < vwap * 0.998, close > vwap * 1.002)
 
     if strategy == STRATEGIES[8]:  # Opening Range Breakout
         df2 = df.copy()
@@ -397,15 +423,13 @@ def get_position(df, strategy, p):
             or_low[d] = grp["Low"].iloc[:n_bars].min()
         oh = df2["date"].map(or_high)
         ol = df2["date"].map(or_low)
-        long_c = close > oh.values
-        short_c = close < ol.values
-        return build_position(pd.Series(long_c, index=df.index), pd.Series(short_c, index=df.index))
+        long_c = pd.Series(close.values > oh.values, index=df.index)
+        short_c = pd.Series(close.values < ol.values, index=df.index)
+        return build_position(long_c, short_c)
 
     if strategy == STRATEGIES[9]:  # Donchian Breakout
         upper, mid, lower = DONCHIAN(df, p["donchian_window"])
-        long_c = close >= upper.shift(1)
-        short_c = close <= lower.shift(1)
-        return build_position(long_c, short_c)
+        return build_position(close >= upper.shift(1), close <= lower.shift(1))
 
     if strategy == STRATEGIES[10]:  # Ichimoku
         tenkan, kijun, senkou_a, senkou_b = ICHIMOKU(df)
@@ -431,9 +455,7 @@ def get_position(df, strategy, p):
 
     if strategy == STRATEGIES[14]:  # Keltner Breakout
         upper, mid, lower = KELTNER(df, p["slow"], p["atr_period"], p["keltner_mult"])
-        long_c = close > upper
-        short_c = close < lower
-        return build_position(long_c, short_c)
+        return build_position(close > upper, close < lower)
 
     if strategy == STRATEGIES[15]:  # ROC Momentum
         roc = ROC(close, p["roc_period"])
@@ -441,9 +463,7 @@ def get_position(df, strategy, p):
 
     if strategy == STRATEGIES[16]:  # Z-score Mean Reversion
         z = ZSCORE(close, p["zscore_window"])
-        long_c = z < -p["zscore_threshold"]
-        short_c = z > p["zscore_threshold"]
-        return build_position(long_c, short_c)
+        return build_position(z < -p["zscore_threshold"], z > p["zscore_threshold"])
 
     if strategy == STRATEGIES[17]:  # RSI + MACD Confluence
         rsi = RSI(close, p["rsi_period"])
@@ -454,9 +474,7 @@ def get_position(df, strategy, p):
 
     if strategy == STRATEGIES[18]:  # Heikin Ashi Trend
         ha_open, ha_high, ha_low, ha_close = HEIKIN_ASHI(df)
-        long_c = ha_close > ha_open
-        short_c = ha_close < ha_open
-        return build_position(long_c, short_c)
+        return build_position(ha_close > ha_open, ha_close < ha_open)
 
     if strategy == STRATEGIES[19]:  # CCI + Volume Spike
         cci = CCI(df, p["cci_period"])
@@ -494,69 +512,132 @@ def bar_minutes_from_interval(interval):
 
 
 # =====================================================================================
+# SL / TARGET MODELS  (percentage / points / ATR-multiple / R-multiple / trailing)
+# =====================================================================================
+def compute_initial_sl_target(entry_price, side, atr_val, sl_type, sl_value, target_type, target_value):
+    """side: +1 long, -1 short. Returns (sl_price, target_price, sl_distance)."""
+    atr_val = atr_val if pd.notna(atr_val) and atr_val > 0 else entry_price * 0.005
+
+    if sl_type == "Percentage":
+        sl_dist = entry_price * sl_value / 100
+    elif sl_type == "Points (Absolute)":
+        sl_dist = sl_value
+    else:  # ATR Multiple
+        sl_dist = atr_val * sl_value
+    sl_dist = max(sl_dist, 1e-6)
+    sl_price = entry_price - sl_dist * side
+
+    if target_type == "Percentage":
+        tgt_dist = entry_price * target_value / 100
+    elif target_type == "Points (Absolute)":
+        tgt_dist = target_value
+    elif target_type == "ATR Multiple":
+        tgt_dist = atr_val * target_value
+    else:  # R-Multiple of Stop Loss
+        tgt_dist = sl_dist * target_value
+    target_price = entry_price + tgt_dist * side
+
+    return sl_price, target_price, sl_dist
+
+
+def update_trailing_sl(sl_price, side, extreme_price, trail_type, trail_value, atr_val):
+    if trail_type == "Points (Absolute)":
+        candidate = extreme_price - trail_value * side
+    else:  # ATR Multiple
+        atr_val = atr_val if pd.notna(atr_val) and atr_val > 0 else 0
+        candidate = extreme_price - trail_value * atr_val * side
+    return max(sl_price, candidate) if side == 1 else min(sl_price, candidate)
+
+
+# =====================================================================================
 # BACKTEST ENGINE
 # =====================================================================================
-def run_backtest(df, position, qty=1, sl_pct=0.0, target_pct=0.0, capital=100000.0):
+def run_backtest(df, position, atr_series, qty, sl_type, sl_value, target_type, target_value,
+                  trailing_enabled, trail_type, trail_value, brokerage_per_trade, slippage_pct, capital):
     df = df.copy()
     df["position"] = position.reindex(df.index).fillna(0)
+    atr_series = atr_series.reindex(df.index)
 
     trades = []
     equity_curve = []
     cash = capital
     in_trade = False
     side = 0
-    entry_price = 0.0
+    entry_price = entry_price_exec = 0.0
     entry_date = None
+    sl_price = target_price = 0.0
+    extreme_price = 0.0
     pos_prev = 0
+
+    def slip(px, direction):
+        # direction=+1 means we are BUYING at px (pay slightly more); -1 means SELLING (receive slightly less)
+        return px * (1 + slippage_pct / 100 * direction)
 
     for ts, row in df.iterrows():
         price, high, low = row["Close"], row["High"], row["Low"]
         pos = row["position"]
+        atr_val = atr_series.loc[ts] if ts in atr_series.index else np.nan
 
         if in_trade:
-            hit, exit_price, reason = False, None, None
+            if trailing_enabled:
+                if side == 1:
+                    extreme_price = max(extreme_price, high)
+                else:
+                    extreme_price = min(extreme_price, low)
+                sl_price = update_trailing_sl(sl_price, side, extreme_price, trail_type, trail_value, atr_val)
+
+            hit, exit_price_raw, reason = False, None, None
             if side == 1:
-                if sl_pct > 0 and low <= entry_price * (1 - sl_pct / 100):
-                    hit, exit_price, reason = True, entry_price * (1 - sl_pct / 100), "SL"
-                elif target_pct > 0 and high >= entry_price * (1 + target_pct / 100):
-                    hit, exit_price, reason = True, entry_price * (1 + target_pct / 100), "Target"
+                if low <= sl_price:
+                    hit, exit_price_raw, reason = True, sl_price, "SL"
+                elif high >= target_price:
+                    hit, exit_price_raw, reason = True, target_price, "Target"
             else:
-                if sl_pct > 0 and high >= entry_price * (1 + sl_pct / 100):
-                    hit, exit_price, reason = True, entry_price * (1 + sl_pct / 100), "SL"
-                elif target_pct > 0 and low <= entry_price * (1 - target_pct / 100):
-                    hit, exit_price, reason = True, entry_price * (1 - target_pct / 100), "Target"
+                if high >= sl_price:
+                    hit, exit_price_raw, reason = True, sl_price, "SL"
+                elif low <= target_price:
+                    hit, exit_price_raw, reason = True, target_price, "Target"
+
             if hit:
-                pnl = (exit_price - entry_price) * qty * side
-                cash += pnl
+                exit_price = slip(exit_price_raw, -side)
+                gross = (exit_price - entry_price_exec) * qty * side
+                net = gross - brokerage_per_trade
+                cash += net
                 trades.append(dict(entry_date=entry_date, exit_date=ts, side="LONG" if side == 1 else "SHORT",
-                                    entry_price=entry_price, exit_price=exit_price, qty=qty, pnl=pnl, reason=reason))
+                                    entry_price=entry_price_exec, exit_price=exit_price, qty=qty, pnl=net, reason=reason))
                 in_trade = False
 
         if pos != pos_prev:
             if in_trade:
-                exit_price = price
-                pnl = (exit_price - entry_price) * qty * side
-                cash += pnl
+                exit_price = slip(price, -side)
+                gross = (exit_price - entry_price_exec) * qty * side
+                net = gross - brokerage_per_trade
+                cash += net
                 trades.append(dict(entry_date=entry_date, exit_date=ts, side="LONG" if side == 1 else "SHORT",
-                                    entry_price=entry_price, exit_price=exit_price, qty=qty, pnl=pnl, reason="Signal Flip"))
+                                    entry_price=entry_price_exec, exit_price=exit_price, qty=qty, pnl=net, reason="Signal Flip"))
                 in_trade = False
             if pos != 0:
                 in_trade = True
                 side = int(pos)
                 entry_price = price
+                entry_price_exec = slip(price, side)
                 entry_date = ts
+                sl_price, target_price, _ = compute_initial_sl_target(
+                    entry_price_exec, side, atr_val, sl_type, sl_value, target_type, target_value)
+                extreme_price = entry_price_exec
 
-        unrealized = (price - entry_price) * qty * side if in_trade else 0
+        unrealized = (price - entry_price_exec) * qty * side if in_trade else 0
         equity_curve.append(cash + unrealized)
         pos_prev = pos
 
     if in_trade:
         last_ts = df.index[-1]
-        last_price = df["Close"].iloc[-1]
-        pnl = (last_price - entry_price) * qty * side
-        cash += pnl
+        exit_price = slip(df["Close"].iloc[-1], -side)
+        gross = (exit_price - entry_price_exec) * qty * side
+        net = gross - brokerage_per_trade
+        cash += net
         trades.append(dict(entry_date=entry_date, exit_date=last_ts, side="LONG" if side == 1 else "SHORT",
-                            entry_price=entry_price, exit_price=last_price, qty=qty, pnl=pnl, reason="End of Data"))
+                            entry_price=entry_price_exec, exit_price=exit_price, qty=qty, pnl=net, reason="End of Data"))
 
     trades_df = pd.DataFrame(trades)
     equity_series = pd.Series(equity_curve, index=df.index)
@@ -623,7 +704,6 @@ def daily_range_heatmap_data(ticker, n_years):
 
 
 def selected_timeframe_heatmap(df, interval):
-    """Heatmap of returns for the currently loaded timeframe/period."""
     rets = df["Close"].pct_change().dropna() * 100
     if interval in ("1m", "5m", "15m", "30m", "60m"):
         hour = rets.index.hour
@@ -642,13 +722,13 @@ def selected_timeframe_heatmap(df, interval):
     return pivot
 
 
-def plot_heatmap(pivot, title, colorscale="RdYlGn", fmt=".2f"):
+def plot_heatmap(pivot, title, colorscale="RdYlGn", zmid=None):
     if pivot is None or pivot.empty:
         st.info("Not enough data to build this heatmap.")
         return
     fig = go.Figure(data=go.Heatmap(
         z=pivot.values, x=[str(c) for c in pivot.columns], y=[str(i) for i in pivot.index],
-        colorscale=colorscale, zmid=0 if colorscale == "RdYlGn" else None,
+        colorscale=colorscale, zmid=zmid,
         text=np.round(pivot.values, 2), texttemplate="%{text}", hoverongaps=False,
     ))
     fig.update_layout(title=title, height=420, margin=dict(l=10, r=10, t=40, b=10))
@@ -689,6 +769,15 @@ def place_dhan_order(client_id, token, security_id, exchange_segment, transactio
         return {"error": str(e)}
 
 
+def log_trade(entry_time, exit_time, side, security_id, qty, entry_price, exit_price, reason, order_resp=None):
+    pnl = (exit_price - entry_price) * qty * (1 if side == "LONG" else -1) if exit_price is not None else None
+    st.session_state.trade_history.append(dict(
+        entry_time=entry_time, exit_time=exit_time, side=side, security_id=security_id,
+        qty=qty, entry_price=entry_price, exit_price=exit_price, pnl=pnl, reason=reason,
+        order_response=str(order_resp)[:200] if order_resp else "",
+    ))
+
+
 # =====================================================================================
 # SIDEBAR — GLOBAL CONFIG
 # =====================================================================================
@@ -717,35 +806,56 @@ strategy = st.sidebar.selectbox("Strategy", STRATEGIES)
 st.sidebar.caption(STRATEGY_NOTES.get(strategy, ""))
 
 with st.sidebar.expander("Strategy Parameters", expanded=False):
+    st.caption("Changed by 'Apply Best Config' on the Optimization tab too.")
     p = {}
-    p["fast"] = st.number_input("Fast Period", 2, 100, 9)
-    p["slow"] = st.number_input("Slow Period", 5, 300, 21)
-    p["rsi_period"] = st.number_input("RSI Period", 2, 50, 14)
-    p["rsi_upper"] = st.number_input("RSI Overbought", 50, 95, 70)
-    p["rsi_lower"] = st.number_input("RSI Oversold", 5, 50, 30)
-    p["bb_window"] = st.number_input("Bollinger/Keltner Window", 5, 100, 20)
-    p["bb_std"] = st.number_input("Bollinger Std Dev", 1.0, 4.0, 2.0)
-    p["atr_period"] = st.number_input("ATR Period", 5, 50, 14)
-    p["st_mult"] = st.number_input("Supertrend Multiplier", 1.0, 6.0, 3.0)
-    p["adx_period"] = st.number_input("ADX Period", 5, 50, 14)
-    p["adx_threshold"] = st.number_input("ADX Threshold", 10, 50, 25)
-    p["orb_minutes"] = st.number_input("ORB Minutes", 5, 60, 15)
-    p["donchian_window"] = st.number_input("Donchian Window", 5, 100, 20)
-    p["stoch_k"] = st.number_input("Stochastic %K", 5, 30, 14)
-    p["stoch_d"] = st.number_input("Stochastic %D", 2, 10, 3)
-    p["keltner_mult"] = st.number_input("Keltner Multiplier", 1.0, 4.0, 2.0)
-    p["roc_period"] = st.number_input("ROC Period", 5, 50, 12)
-    p["zscore_window"] = st.number_input("Z-Score Window", 5, 100, 20)
-    p["zscore_threshold"] = st.number_input("Z-Score Threshold", 1.0, 4.0, 2.0)
-    p["cci_period"] = st.number_input("CCI Period", 5, 50, 20)
+    p["fast"] = st.number_input("Fast Period", 2, 100, 9, key="p_fast")
+    p["slow"] = st.number_input("Slow Period", 5, 300, 21, key="p_slow")
+    p["rsi_period"] = st.number_input("RSI Period", 2, 50, 14, key="p_rsi_period")
+    p["rsi_upper"] = st.number_input("RSI Overbought", 50, 95, 70, key="p_rsi_upper")
+    p["rsi_lower"] = st.number_input("RSI Oversold", 5, 50, 30, key="p_rsi_lower")
+    p["bb_window"] = st.number_input("Bollinger/Keltner Window", 5, 100, 20, key="p_bb_window")
+    p["bb_std"] = st.number_input("Bollinger Std Dev", 1.0, 4.0, 2.0, key="p_bb_std")
+    p["atr_period"] = st.number_input("ATR Period", 5, 50, 14, key="p_atr_period")
+    p["st_mult"] = st.number_input("Supertrend Multiplier", 1.0, 6.0, 3.0, key="p_st_mult")
+    p["adx_period"] = st.number_input("ADX Period", 5, 50, 14, key="p_adx_period")
+    p["adx_threshold"] = st.number_input("ADX Threshold", 10, 50, 25, key="p_adx_threshold")
+    p["orb_minutes"] = st.number_input("ORB Minutes", 5, 60, 15, key="p_orb_minutes")
+    p["donchian_window"] = st.number_input("Donchian Window", 5, 100, 20, key="p_donchian_window")
+    p["stoch_k"] = st.number_input("Stochastic %K", 5, 30, 14, key="p_stoch_k")
+    p["stoch_d"] = st.number_input("Stochastic %D", 2, 10, 3, key="p_stoch_d")
+    p["keltner_mult"] = st.number_input("Keltner Multiplier", 1.0, 4.0, 2.0, key="p_keltner_mult")
+    p["roc_period"] = st.number_input("ROC Period", 5, 50, 12, key="p_roc_period")
+    p["zscore_window"] = st.number_input("Z-Score Window", 5, 100, 20, key="p_zscore_window")
+    p["zscore_threshold"] = st.number_input("Z-Score Threshold", 1.0, 4.0, 2.0, key="p_zscore_threshold")
+    p["cci_period"] = st.number_input("CCI Period", 5, 50, 20, key="p_cci_period")
     p["_bar_minutes"] = bar_minutes_from_interval(interval)
 
 st.sidebar.subheader("💰 Trade Setup")
 qty = st.sidebar.number_input("Quantity / Lots", 1, 100000, 1)
 lot_size = st.sidebar.number_input("Lot Size (F&O)", 1, 10000, 25)
 capital = st.sidebar.number_input("Capital (₹)", 1000, 100_000_000, 100000, step=5000)
-sl_pct = st.sidebar.number_input("Stop Loss (%)", 0.0, 50.0, 1.0, step=0.1)
-target_pct = st.sidebar.number_input("Target (%)", 0.0, 100.0, 2.0, step=0.1)
+
+st.sidebar.markdown("**Stop Loss**")
+sl_type = st.sidebar.selectbox("SL Type", SL_TYPES, key="sl_type",
+                                help="Percentage of entry price, fixed points, or a multiple of ATR (volatility-adjusted).")
+sl_value = st.sidebar.number_input("SL Value", 0.0, 10000.0, 1.0, key="sl_value",
+                                    help="Meaning depends on SL Type above (e.g. 1.0 = 1% or 1.0 = 1x ATR).")
+
+st.sidebar.markdown("**Target**")
+target_type = st.sidebar.selectbox("Target Type", TARGET_TYPES, key="target_type",
+                                    help="R-Multiple = a multiple of your Stop Loss distance (e.g. 2 = 2:1 reward:risk).")
+target_value = st.sidebar.number_input("Target Value", 0.0, 10000.0, 2.0, key="target_value")
+
+trailing_enabled = st.sidebar.checkbox("Enable Trailing Stop Loss", value=False, key="trailing_enabled")
+if trailing_enabled:
+    trail_type = st.sidebar.selectbox("Trailing Type", TRAIL_TYPES, key="trail_type")
+    trail_value = st.sidebar.number_input("Trailing Value", 0.0, 1000.0, 1.0, key="trail_value")
+else:
+    trail_type, trail_value = "Points (Absolute)", 0.0
+
+st.sidebar.markdown("**Costs** (pro traders always model these — they're often why a 'winning' strategy loses money)")
+brokerage = st.sidebar.number_input("Brokerage per Round-Trip (₹)", 0.0, 1000.0, 20.0, key="brokerage")
+slippage_pct = st.sidebar.number_input("Slippage (%)", 0.0, 5.0, 0.05, step=0.01, key="slippage_pct")
 
 st.sidebar.subheader("🔴 Dhan Live Trading")
 enable_dhan = st.sidebar.checkbox("Enable Dhan Order Placement", value=False)
@@ -770,30 +880,61 @@ with st.expander("📚 All 20 Strategies — Rationale"):
     for s in STRATEGIES:
         st.markdown(f"**{s}** — {STRATEGY_NOTES[s]}")
 
-tab_bt, tab_live, tab_opt, tab_heat = st.tabs(
-    ["📊 Backtest", "🔴 Live Trading", "🧪 Optimization", "🌡️ Heatmaps"]
+tab_bt, tab_live, tab_opt, tab_hist, tab_heat = st.tabs(
+    ["📊 Backtest", "🔴 Live Trading", "🧪 Optimization", "🕘 Trade History", "🌡️ Heatmaps"]
 )
 
 # -------------------------------------------------------------------------------------
 # TAB 1: BACKTEST
 # -------------------------------------------------------------------------------------
 with tab_bt:
-    df = fetch_data(yf_ticker, interval, period)
-    if df.empty:
-        st.warning("No data returned. Try a different ticker/timeframe/period "
-                   "(intraday intervals have short max lookback on Yahoo Finance).")
+    st.caption("Nothing runs until you click the button below — this avoids hammering the "
+               "Yahoo Finance API on every widget interaction.")
+    run_clicked = st.button("▶️ Run Backtest", type="primary")
+
+    if run_clicked:
+        with st.spinner("Fetching data and running backtest..."):
+            df = fetch_data(yf_ticker, interval, period)
+            if df.empty:
+                st.session_state.backtest_result = None
+                st.warning("No data returned. Try a different ticker/timeframe/period "
+                           "(intraday intervals have short max lookback on Yahoo Finance).")
+            else:
+                position = get_position(df, strategy, p)
+                atr_series = ATR(df, p["atr_period"])
+                trades_df, equity_series = run_backtest(
+                    df, position, atr_series, effective_qty,
+                    sl_type, sl_value, target_type, target_value,
+                    trailing_enabled, trail_type, trail_value,
+                    brokerage, slippage_pct, capital)
+                metrics = calc_metrics(trades_df, equity_series, capital)
+                st.session_state.backtest_result = dict(
+                    df=df, trades_df=trades_df, equity_series=equity_series, metrics=metrics,
+                    strategy=strategy, ticker=yf_ticker)
+
+    result = st.session_state.backtest_result
+    if result is None:
+        st.info("Configure the sidebar, then click **Run Backtest** to see results here.")
     else:
-        position = get_position(df, strategy, p)
-        trades_df, equity_series = run_backtest(df, position, effective_qty, sl_pct, target_pct, capital)
-        metrics = calc_metrics(trades_df, equity_series, capital)
+        if result["ticker"] != yf_ticker or result["strategy"] != strategy:
+            st.warning("⚠️ Sidebar settings have changed since this backtest ran — click "
+                       "**Run Backtest** again to refresh the results below.")
+
+        df, trades_df, equity_series, metrics = result["df"], result["trades_df"], result["equity_series"], result["metrics"]
 
         c1, c2, c3, c4, c5, c6 = st.columns(6)
         c1.metric("Total Trades", metrics["total_trades"])
         c2.metric("Win Rate", f"{metrics['win_rate']:.1f}%")
-        c3.metric("Net P&L", f"₹{metrics['total_pnl']:,.0f}")
+        c3.metric("Net P&L (after costs)", f"₹{metrics['total_pnl']:,.0f}")
         c4.metric("CAGR", f"{metrics['cagr']:.1f}%")
         c5.metric("Sharpe", f"{metrics['sharpe']:.2f}")
         c6.metric("Max Drawdown", f"{metrics['max_dd']:.1f}%")
+
+        if metrics["total_trades"] > 0 and metrics["total_pnl"] <= 0:
+            st.info("This configuration is net negative after brokerage/slippage. Try the "
+                    "**Optimization** tab to search for better parameters, or a different "
+                    "SL/Target model (e.g. ATR-based or R-Multiple) — fixed tiny SL% on a "
+                    "noisy timeframe is a common reason strategies bleed on costs.")
 
         fig = go.Figure()
         fig.add_trace(go.Candlestick(x=df.index, open=df["Open"], high=df["High"],
@@ -819,151 +960,335 @@ with tab_bt:
         fig_eq.update_layout(title="Equity Curve", height=350, margin=dict(l=10, r=10, t=40, b=10))
         st.plotly_chart(fig_eq, use_container_width=True)
 
-        st.subheader("Trade Log")
+        st.subheader("Simulated Trade Log")
         if trades_df.empty:
             st.info("No trades were generated for this configuration.")
         else:
             show = trades_df.copy()
             show["pnl"] = show["pnl"].round(2)
             st.dataframe(show, use_container_width=True, height=300)
-            st.download_button("Download Trades CSV", show.to_csv(index=False), "trades.csv", "text/csv")
+            st.download_button("Download Trades CSV", show.to_csv(index=False), "backtest_trades.csv", "text/csv")
 
 # -------------------------------------------------------------------------------------
 # TAB 2: LIVE TRADING
 # -------------------------------------------------------------------------------------
+def get_leg_config():
+    """Which security_id(s) apply, based on segment/option_side, read from widget state."""
+    if segment == "Options (CE/PE)":
+        legs = []
+        if option_side in ("CE", "Both (Straddle/Strangle)"):
+            legs.append(("CE", st.session_state.get("ce_security_id", "")))
+        if option_side in ("PE", "Both (Straddle/Strangle)"):
+            legs.append(("PE", st.session_state.get("pe_security_id", "")))
+        return legs
+    return [("EQ", st.session_state.get("single_security_id", ""))]
+
+
+def square_off_leg(leg, exit_price, ts, reason, exch_seg, product_type):
+    txn = "SELL" if leg["side"] == "LONG" else "BUY"
+    resp = place_dhan_order(dhan_client_id, dhan_token, leg["security_id"], exch_seg,
+                             txn, leg["qty"], product_type, "MARKET", 0)
+    log_trade(leg["entry_time"], ts, leg["side"], leg["security_id"], leg["qty"],
+              leg["entry_price"], exit_price, reason, resp)
+    st.session_state.open_position = [l for l in st.session_state.open_position if l is not leg]
+    return resp
+
+
+def open_leg(label, side, price, ts, security_id, qty_, exch_seg, product_type):
+    txn = "BUY" if side == "LONG" else "SELL"
+    resp = place_dhan_order(dhan_client_id, dhan_token, security_id, exch_seg,
+                             txn, qty_, product_type, "MARKET", 0)
+    st.session_state.open_position.append(dict(
+        label=label, side=side, entry_price=price, entry_time=ts,
+        security_id=security_id, qty=qty_, sl_price=None, target_price=None))
+    return resp
+
+
 with tab_live:
-    st.subheader("Current Signal")
-    df_live = fetch_data(yf_ticker, interval, period)
-    if df_live.empty:
-        st.warning("No live data available.")
-    else:
-        pos_live = get_position(df_live, strategy, p)
+    st.caption("Nothing is fetched or executed until you click a button below — protects "
+               "against accidental API hammering and accidental live orders.")
+
+    colr1, colr2 = st.columns([1, 3])
+    refresh_clicked = colr1.button("🔄 Refresh Signal")
+
+    live_df = None
+    if refresh_clicked or st.session_state.live_running:
+        live_df = fetch_data(yf_ticker, interval, period)
+
+    if live_df is not None and not live_df.empty:
+        pos_live = get_position(live_df, strategy, p)
         last_pos = int(pos_live.iloc[-1])
         badge = {1: ("🟢 LONG / BUY", "green"), -1: ("🔴 SHORT / SELL", "red"), 0: ("⚪ FLAT / HOLD", "gray")}
         label, color = badge[last_pos]
         st.markdown(f"### :{color}[{label}]")
-        st.write(f"Last Close: **{df_live['Close'].iloc[-1]:.2f}**  |  As of: {df_live.index[-1]}")
+        st.write(f"Last Close: **{live_df['Close'].iloc[-1]:.2f}**  |  As of: {live_df.index[-1]}  "
+                 f"|  (cached up to 5 min to respect API limits)")
+    elif refresh_clicked:
+        st.warning("No live data available for this ticker/timeframe.")
+    else:
+        st.info("Click **Refresh Signal** to check the latest signal, or start the auto engine below.")
+
+    st.divider()
+    st.subheader("Dhan Order Ticket & Automation")
+    if not enable_dhan:
+        st.info("Tick **'Enable Dhan Order Placement'** in the sidebar and enter your Client ID / "
+                 "Access Token to arm this panel.")
+    else:
+        exch_seg = st.selectbox("Exchange Segment", EXCHANGE_SEGMENTS,
+                                 index=1 if segment in ("Futures (FUT)", "Options (CE/PE)") else 0)
+        product_type = SEGMENT_TO_PRODUCT[segment]
+
+        with st.expander("🔍 Look up Dhan Security ID (scrip master)"):
+            scrip_df = load_dhan_scrip_master()
+            if scrip_df.empty:
+                st.error("Could not load Dhan scrip master (network/columns may differ). Enter Security ID manually below.")
+            else:
+                search = st.text_input("Search symbol (e.g. NIFTY, BANKNIFTY, RELIANCE)")
+                if search:
+                    cols = [c for c in scrip_df.columns if scrip_df[c].dtype == object]
+                    mask = False
+                    for c in cols:
+                        mask = mask | scrip_df[c].astype(str).str.contains(search, case=False, na=False)
+                    st.dataframe(scrip_df[mask].head(30), use_container_width=True, height=250)
+
+        if segment == "Options (CE/PE)":
+            col1, col2 = st.columns(2)
+            with col1:
+                st.text_input("CE Security ID", key="ce_security_id")
+            with col2:
+                st.text_input("PE Security ID", key="pe_security_id")
+        else:
+            st.text_input("Security ID", key="single_security_id")
+
+        st.markdown("**Manual Order Buttons**")
+        mb1, mb2, mb3 = st.columns(3)
+        legs_cfg = get_leg_config()
+        if mb1.button("🟢 Manual BUY"):
+            ts_now = datetime.now()
+            price_now = live_df["Close"].iloc[-1] if live_df is not None and not live_df.empty else 0.0
+            for label, sec_id in legs_cfg:
+                if sec_id:
+                    resp = open_leg(label, "LONG", price_now, ts_now, sec_id, effective_qty, exch_seg, product_type)
+                    st.json({label: resp})
+        if mb2.button("🔴 Manual SELL"):
+            ts_now = datetime.now()
+            price_now = live_df["Close"].iloc[-1] if live_df is not None and not live_df.empty else 0.0
+            for label, sec_id in legs_cfg:
+                if sec_id:
+                    resp = open_leg(label, "SHORT", price_now, ts_now, sec_id, effective_qty, exch_seg, product_type)
+                    st.json({label: resp})
+        if mb3.button("🟥 Manual Square Off (All Open)"):
+            ts_now = datetime.now()
+            price_now = live_df["Close"].iloc[-1] if live_df is not None and not live_df.empty else 0.0
+            for leg in list(st.session_state.open_position):
+                resp = square_off_leg(leg, price_now, ts_now, "Manual Square Off", exch_seg, product_type)
+                st.json({leg["label"]: resp})
+            st.success("All open legs squared off.")
 
         st.divider()
-        st.subheader("Dhan Order Ticket")
-        if not enable_dhan:
-            st.info("Tick **'Enable Dhan Order Placement'** in the sidebar and enter your Client ID / Access Token to arm this panel.")
+        st.markdown("**Automation Engine**")
+        st.caption("Auto mode reruns this app every N seconds while the tab stays open, checks the "
+                   "signal, and executes entries/exits automatically. This is a convenience loop, "
+                   "not a hardened production scheduler — for unattended trading, run the same "
+                   "logic from a standalone script (cron/systemd/APScheduler).")
+        refresh_secs = st.number_input("Auto-check interval (seconds)", 5, 300, 20)
+
+        eng1, eng2 = st.columns(2)
+        if not st.session_state.live_running:
+            if eng1.button("▶️ Start Auto-Trading Engine", type="primary"):
+                st.session_state.live_running = True
+                st.rerun()
         else:
-            exch_seg = st.selectbox("Exchange Segment", EXCHANGE_SEGMENTS,
-                                     index=1 if segment in ("Futures (FUT)", "Options (CE/PE)") else 0)
-            product_type = SEGMENT_TO_PRODUCT[segment]
-            order_type = st.selectbox("Order Type", ["MARKET", "LIMIT"])
-            limit_price = st.number_input("Limit Price (if LIMIT)", 0.0, 1_000_000.0, 0.0) if order_type == "LIMIT" else 0
+            if eng1.button("⏹ Stop Auto-Trading Engine"):
+                st.session_state.live_running = False
+                st.rerun()
+        eng2.write("🟢 **Engine: ARMED**" if st.session_state.live_running else "⚪ Engine: stopped")
 
-            with st.expander("🔍 Look up Dhan Security ID (scrip master)"):
-                scrip_df = load_dhan_scrip_master()
-                if scrip_df.empty:
-                    st.error("Could not load Dhan scrip master (network/columns may differ). Enter Security ID manually below.")
-                else:
-                    search = st.text_input("Search symbol (e.g. NIFTY, BANKNIFTY, RELIANCE)")
-                    if search:
-                        cols = [c for c in scrip_df.columns if scrip_df[c].dtype == object]
-                        mask = False
-                        for c in cols:
-                            mask = mask | scrip_df[c].astype(str).str.contains(search, case=False, na=False)
-                        st.dataframe(scrip_df[mask].head(30), use_container_width=True, height=250)
+        if st.session_state.open_position:
+            st.markdown("**Open Position(s)**")
+            open_df = pd.DataFrame(st.session_state.open_position)
+            st.dataframe(open_df[["label", "side", "entry_price", "qty", "security_id", "entry_time"]],
+                         use_container_width=True)
 
-            if segment == "Options (CE/PE)":
-                col1, col2 = st.columns(2)
-                with col1:
-                    ce_security_id = st.text_input("CE Security ID")
-                with col2:
-                    pe_security_id = st.text_input("PE Security ID")
+        if st.session_state.live_running:
+            if live_df is not None and not live_df.empty:
+                ts_now = live_df.index[-1]
+                price_now = live_df["Close"].iloc[-1]
+                desired_side = last_pos
+                open_legs = st.session_state.open_position
+                current_side = 1 if (open_legs and open_legs[0]["side"] == "LONG") else (
+                    -1 if (open_legs and open_legs[0]["side"] == "SHORT") else 0)
 
-                txn_type = st.radio("Transaction Type", ["BUY", "SELL"], horizontal=True)
-                b1, b2, b3 = st.columns(3)
-                if option_side in ("CE", "Both (Straddle/Strangle)") and b1.button("Place CE Order"):
-                    resp = place_dhan_order(dhan_client_id, dhan_token, ce_security_id, exch_seg,
-                                             txn_type, effective_qty, product_type, order_type, limit_price)
-                    st.json(resp)
-                if option_side in ("PE", "Both (Straddle/Strangle)") and b2.button("Place PE Order"):
-                    resp = place_dhan_order(dhan_client_id, dhan_token, pe_security_id, exch_seg,
-                                             txn_type, effective_qty, product_type, order_type, limit_price)
-                    st.json(resp)
-                if option_side == "Both (Straddle/Strangle)" and b3.button("Place BOTH Legs Simultaneously"):
-                    resp_ce = place_dhan_order(dhan_client_id, dhan_token, ce_security_id, exch_seg,
-                                                txn_type, effective_qty, product_type, order_type, limit_price)
-                    resp_pe = place_dhan_order(dhan_client_id, dhan_token, pe_security_id, exch_seg,
-                                                txn_type, effective_qty, product_type, order_type, limit_price)
-                    st.json({"CE": resp_ce, "PE": resp_pe})
-            else:
-                security_id = st.text_input("Security ID")
-                colb, cols = st.columns(2)
-                if colb.button("🟢 Place BUY Order"):
-                    resp = place_dhan_order(dhan_client_id, dhan_token, security_id, exch_seg,
-                                             "BUY", effective_qty, product_type, order_type, limit_price)
-                    st.json(resp)
-                if cols.button("🔴 Place SELL Order"):
-                    resp = place_dhan_order(dhan_client_id, dhan_token, security_id, exch_seg,
-                                             "SELL", effective_qty, product_type, order_type, limit_price)
-                    st.json(resp)
+                if desired_side != current_side:
+                    for leg in list(open_legs):
+                        square_off_leg(leg, price_now, ts_now, "Signal Flip", exch_seg, product_type)
+                    if desired_side != 0:
+                        for label, sec_id in legs_cfg:
+                            if sec_id:
+                                want_long = (desired_side == 1 and label in ("EQ", "CE")) or (desired_side == -1 and label == "PE")
+                                if segment != "Options (CE/PE)":
+                                    open_leg(label, "LONG" if desired_side == 1 else "SHORT",
+                                             price_now, ts_now, sec_id, effective_qty, exch_seg, product_type)
+                                elif want_long:
+                                    open_leg(label, "LONG", price_now, ts_now, sec_id, effective_qty, exch_seg, product_type)
+                st.caption(f"Last auto-check: {ts_now}")
+            time.sleep(refresh_secs)
+            st.rerun()
 
 # -------------------------------------------------------------------------------------
 # TAB 3: OPTIMIZATION
 # -------------------------------------------------------------------------------------
 with tab_opt:
-    st.subheader("2D Parameter Grid Search")
-    df_opt = fetch_data(yf_ticker, interval, period)
-    if df_opt.empty:
-        st.warning("No data available for optimization.")
+    st.markdown("""
+    **What this does:** for the currently selected strategy, pick two of its parameters,
+    give each a min/max/step range, and this will re-run a full backtest for every
+    combination (a grid search) over your selected ticker/timeframe/period. Results are
+    ranked by whichever performance metric you choose, optionally filtered so only
+    combinations that hit your minimum win rate are shown.
+
+    ⚠️ **A high win rate is not the same as profitability.** A strategy can win 90% of
+    trades and still lose money overall if the losing 10% are large. Check win rate
+    *together with* net P&L, Sharpe, and max drawdown before trusting a result.
+    """)
+
+    param_options = ["fast", "slow", "rsi_period", "rsi_upper", "rsi_lower", "bb_window", "bb_std",
+                      "atr_period", "st_mult", "adx_period", "adx_threshold", "donchian_window",
+                      "stoch_k", "keltner_mult", "roc_period", "zscore_window", "zscore_threshold", "cci_period"]
+
+    colA, colB = st.columns(2)
+    with colA:
+        param_x = st.selectbox("Parameter X (rows)", param_options, index=0)
+        x_min = st.number_input(f"{param_x} min", value=5.0)
+        x_max = st.number_input(f"{param_x} max", value=25.0)
+        x_step = st.number_input(f"{param_x} step", value=5.0, min_value=0.1)
+    with colB:
+        param_y = st.selectbox("Parameter Y (cols)", param_options, index=1)
+        y_min = st.number_input(f"{param_y} min", value=15.0)
+        y_max = st.number_input(f"{param_y} max", value=50.0)
+        y_step = st.number_input(f"{param_y} step", value=5.0, min_value=0.1)
+
+    metric_choice = st.selectbox("Rank combinations by", ["sharpe", "cagr", "total_return_pct", "win_rate", "profit_factor"])
+    min_accuracy = st.slider("Minimum Accuracy / Win Rate Required (%)", 0, 100, 0,
+                              help="Set e.g. 90 to only consider combinations whose win rate is at least 90%.")
+
+    if st.button("🚀 Run Optimization", type="primary"):
+        with st.spinner("Fetching data and running grid search..."):
+            df_opt = fetch_data(yf_ticker, interval, period)
+            if df_opt.empty:
+                st.session_state.opt_result = None
+                st.warning("No data available for optimization.")
+            else:
+                atr_series_opt = ATR(df_opt, p["atr_period"])
+                x_vals = np.arange(x_min, x_max + x_step / 2, x_step)
+                y_vals = np.arange(y_min, y_max + y_step / 2, y_step)
+                metric_grid = np.zeros((len(x_vals), len(y_vals)))
+                winrate_grid = np.zeros((len(x_vals), len(y_vals)))
+                rows = []
+                progress = st.progress(0.0)
+                total_iters = max(len(x_vals) * len(y_vals), 1)
+                done = 0
+                for i, xv in enumerate(x_vals):
+                    for j, yv in enumerate(y_vals):
+                        p_test = dict(p)
+                        p_test[param_x] = xv
+                        p_test[param_y] = yv
+                        pos_test = get_position(df_opt, strategy, p_test)
+                        tdf, eq = run_backtest(df_opt, pos_test, atr_series_opt, effective_qty,
+                                                sl_type, sl_value, target_type, target_value,
+                                                trailing_enabled, trail_type, trail_value,
+                                                brokerage, slippage_pct, capital)
+                        m = calc_metrics(tdf, eq, capital)
+                        val = m[metric_choice]
+                        val = 0 if not np.isfinite(val) else val
+                        metric_grid[i, j] = val
+                        winrate_grid[i, j] = m["win_rate"]
+                        rows.append({param_x: round(xv, 2), param_y: round(yv, 2),
+                                     "trades": m["total_trades"], "win_rate": round(m["win_rate"], 1),
+                                     "sharpe": round(m["sharpe"], 2), "cagr": round(m["cagr"], 1),
+                                     "total_return_pct": round(m["total_return_pct"], 1),
+                                     "profit_factor": round(m["profit_factor"], 2) if np.isfinite(m["profit_factor"]) else None})
+                        done += 1
+                        progress.progress(done / total_iters)
+                progress.empty()
+
+                results_table = pd.DataFrame(rows)
+                metric_pivot = pd.DataFrame(metric_grid, index=[round(v, 2) for v in x_vals], columns=[round(v, 2) for v in y_vals])
+                winrate_pivot = pd.DataFrame(winrate_grid, index=[round(v, 2) for v in x_vals], columns=[round(v, 2) for v in y_vals])
+
+                meets_threshold = results_table[results_table["win_rate"] >= min_accuracy]
+                threshold_met = len(meets_threshold) > 0
+                ranked = (meets_threshold if threshold_met else results_table).sort_values(
+                    "win_rate" if not threshold_met else metric_choice, ascending=False)
+
+                st.session_state.opt_result = dict(
+                    param_x=param_x, param_y=param_y, metric_choice=metric_choice,
+                    min_accuracy=min_accuracy, threshold_met=threshold_met,
+                    results_table=results_table, ranked=ranked,
+                    metric_pivot=metric_pivot, winrate_pivot=winrate_pivot,
+                )
+
+    opt = st.session_state.opt_result
+    if opt is None:
+        st.info("Set your ranges above and click **Run Optimization**.")
     else:
-        param_options = ["fast", "slow", "rsi_period", "rsi_upper", "rsi_lower", "bb_window", "bb_std",
-                          "atr_period", "st_mult", "adx_period", "adx_threshold", "donchian_window",
-                          "stoch_k", "keltner_mult", "roc_period", "zscore_window", "zscore_threshold", "cci_period"]
-        colA, colB = st.columns(2)
-        with colA:
-            param_x = st.selectbox("Parameter X (rows)", param_options, index=0)
-            x_min = st.number_input(f"{param_x} min", value=5.0)
-            x_max = st.number_input(f"{param_x} max", value=25.0)
-            x_step = st.number_input(f"{param_x} step", value=5.0, min_value=0.1)
-        with colB:
-            param_y = st.selectbox("Parameter Y (cols)", param_options, index=1)
-            y_min = st.number_input(f"{param_y} min", value=15.0)
-            y_max = st.number_input(f"{param_y} max", value=50.0)
-            y_step = st.number_input(f"{param_y} step", value=5.0, min_value=0.1)
-        metric_choice = st.selectbox("Optimize for", ["sharpe", "cagr", "total_return_pct", "win_rate"])
+        if not opt["threshold_met"]:
+            best_wr = opt["results_table"]["win_rate"].max()
+            st.warning(f"No parameter combination reached {opt['min_accuracy']}% win rate. "
+                       f"Showing the top combinations by win rate instead (best achieved: {best_wr:.1f}%).")
+        else:
+            st.success(f"{len(opt['ranked'])} combination(s) met the {opt['min_accuracy']}% accuracy threshold. "
+                       f"Showing the top ones ranked by **{opt['metric_choice']}**.")
 
-        if st.button("🚀 Run Optimization"):
-            x_vals = np.arange(x_min, x_max + x_step / 2, x_step)
-            y_vals = np.arange(y_min, y_max + y_step / 2, y_step)
-            results = np.zeros((len(x_vals), len(y_vals)))
-            best = (-np.inf, None, None)
-            progress = st.progress(0.0)
-            total_iters = len(x_vals) * len(y_vals)
-            done = 0
-            for i, xv in enumerate(x_vals):
-                for j, yv in enumerate(y_vals):
-                    p_test = dict(p)
-                    p_test[param_x] = xv
-                    p_test[param_y] = yv
-                    pos_test = get_position(df_opt, strategy, p_test)
-                    tdf, eq = run_backtest(df_opt, pos_test, effective_qty, sl_pct, target_pct, capital)
-                    m = calc_metrics(tdf, eq, capital)
-                    val = m[metric_choice]
-                    results[i, j] = 0 if not np.isfinite(val) else val
-                    if val > best[0]:
-                        best = (val, xv, yv)
-                    done += 1
-                    progress.progress(done / total_iters)
-            progress.empty()
+        top_n = opt["ranked"].head(10).reset_index(drop=True)
+        st.dataframe(top_n, use_container_width=True)
 
-            pivot = pd.DataFrame(results, index=[round(v, 2) for v in x_vals], columns=[round(v, 2) for v in y_vals])
-            plot_heatmap(pivot, f"{metric_choice} heatmap ({param_x} vs {param_y})", colorscale="Viridis")
-            st.success(f"Best {metric_choice}: **{best[0]:.2f}** at {param_x} = {best[1]}, {param_y} = {best[2]}")
+        plot_heatmap(opt["winrate_pivot"], f"Win Rate % ({opt['param_x']} vs {opt['param_y']})", colorscale="Blues")
+        plot_heatmap(opt["metric_pivot"], f"{opt['metric_choice']} ({opt['param_x']} vs {opt['param_y']})", colorscale="Viridis")
+
+        if len(top_n) > 0:
+            best_x_val = top_n.iloc[0][opt["param_x"]]
+            best_y_val = top_n.iloc[0][opt["param_y"]]
+            st.write(f"Best available combo: **{opt['param_x']} = {best_x_val}**, **{opt['param_y']} = {best_y_val}**")
+            if st.button("✅ Apply Best Config to Sidebar"):
+                st.session_state[f"p_{opt['param_x']}"] = best_x_val
+                st.session_state[f"p_{opt['param_y']}"] = best_y_val
+                st.success("Applied — check the sidebar Strategy Parameters, then go rerun the Backtest tab.")
+                st.rerun()
 
 # -------------------------------------------------------------------------------------
-# TAB 4: HEATMAPS
+# TAB 4: TRADE HISTORY (live orders actually placed this session)
+# -------------------------------------------------------------------------------------
+with tab_hist:
+    st.subheader("Live Trade History (this session)")
+    st.caption("Every manual or auto-engine order placed via Dhan in this session — separate "
+               "from the Backtest tab's simulated trade log.")
+
+    hist = st.session_state.trade_history
+    if not hist:
+        st.info("No live trades placed yet in this session.")
+    else:
+        hist_df = pd.DataFrame(hist)
+        closed = hist_df[hist_df["exit_price"].notna()]
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Total Round-Trips", len(closed))
+        if len(closed) > 0:
+            win_rate_live = (closed["pnl"] > 0).mean() * 100
+            c2.metric("Win Rate", f"{win_rate_live:.1f}%")
+            c3.metric("Net P&L", f"₹{closed['pnl'].sum():,.0f}")
+        st.dataframe(hist_df, use_container_width=True, height=350)
+        st.download_button("Download Trade History CSV", hist_df.to_csv(index=False), "live_trade_history.csv", "text/csv")
+        if st.button("🗑️ Clear Trade History"):
+            st.session_state.trade_history = []
+            st.rerun()
+
+# -------------------------------------------------------------------------------------
+# TAB 5: HEATMAPS
 # -------------------------------------------------------------------------------------
 with tab_heat:
     st.subheader("Monthly Returns Heatmap (Daily Timeframe)")
     n_years = st.slider("Years of history", 3, 20, 10)
     pivot_ret = monthly_returns_heatmap_data(yf_ticker, n_years)
-    plot_heatmap(pivot_ret, f"{display_name} — Monthly Returns (%) by Year", colorscale="RdYlGn")
+    plot_heatmap(pivot_ret, f"{display_name} — Monthly Returns (%) by Year", colorscale="RdYlGn", zmid=0)
 
     st.subheader("Daily OHLC Range Heatmap (Volatility by Month/Year)")
     pivot_rng = daily_range_heatmap_data(yf_ticker, n_years)
@@ -976,9 +1301,10 @@ with tab_heat:
     else:
         pivot_sel = selected_timeframe_heatmap(df_heat, interval)
         note = "Hour vs Weekday (avg % return)" if interval in ("1m","5m","15m","30m","60m") else "Month vs Year (sum % return)"
-        plot_heatmap(pivot_sel, f"{display_name} — {note}", colorscale="RdYlGn")
+        plot_heatmap(pivot_sel, f"{display_name} — {note}", colorscale="RdYlGn", zmid=0)
 
 st.divider()
-st.caption("⚠️ Educational tool only — not investment advice. Verify Dhan API field names/limits "
+st.caption("⚠️ Educational tool only — not investment advice. No strategy shown here is guaranteed "
+           "profitable; a high win rate does not equal profitability. Verify Dhan API field names/limits "
            "against current documentation before live trading. Past backtest performance does not "
            "guarantee future results.")
