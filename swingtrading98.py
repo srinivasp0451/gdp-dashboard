@@ -831,13 +831,40 @@ with st.sidebar.expander("Strategy Parameters", expanded=False):
     p["_bar_minutes"] = bar_minutes_from_interval(interval)
 
 st.sidebar.subheader("💰 Trade Setup")
-qty = st.sidebar.number_input("Quantity / Lots", 1, 100000, 1)
-lot_size = st.sidebar.number_input("Lot Size (F&O)", 1, 10000, 25)
+if segment in ("Futures (FUT)", "Options (CE/PE)"):
+    qty = st.sidebar.number_input("Number of Lots", 1, 100000, 1)
+    lot_size = st.sidebar.number_input(
+        "Lot Size (shares per lot)", 1, 100000, 1,
+        help="⚠️ NSE sets and periodically revises this per instrument. There is no safe generic "
+             "default — look up the current lot size for this specific contract on the NSE F&O "
+             "website before entering a number here.")
+    st.sidebar.caption("⚠️ Verify the real lot size on NSE — don't trust a guessed default.")
+else:
+    qty = st.sidebar.number_input("Quantity (shares)", 1, 100000, 1)
+    lot_size = 1
 capital = st.sidebar.number_input("Capital (₹)", 1000, 100_000_000, 100000, step=5000)
 
 st.sidebar.markdown("**Stop Loss**")
+with st.sidebar.expander("📏 Check this instrument's actual volatility first", expanded=False):
+    st.caption("A fixed-points SL that isn't sized to the instrument's real movement gets stopped "
+               "out by noise almost every trade, no matter how good the entry signal is.")
+    if st.button("Check current ATR", key="check_atr_btn"):
+        _atr_df = fetch_data(yf_ticker, interval, period)
+        if _atr_df.empty:
+            st.warning("No data returned for this ticker/timeframe.")
+        else:
+            _atr_val = ATR(_atr_df, p["atr_period"]).iloc[-1]
+            _last_px = _atr_df["Close"].iloc[-1]
+            st.write(f"**ATR({p['atr_period']}) on {timeframe_label}: {_atr_val:.1f} points** "
+                     f"(~{_atr_val / _last_px * 100:.2f}% of last price {_last_px:.1f})")
+            st.caption(f"A 10-point SL here is ~{10 / _atr_val:.2f}x ATR — "
+                       f"if that's well under 0.5x, expect near-constant stop-outs. "
+                       f"Consider SL Type = 'ATR Multiple' instead of fixed points.")
+
 sl_type = st.sidebar.selectbox("SL Type", SL_TYPES, key="sl_type",
-                                help="Percentage of entry price, fixed points, or a multiple of ATR (volatility-adjusted).")
+                                help="Percentage of entry price, fixed points, or a multiple of ATR "
+                                     "(volatility-adjusted — recommended for stocks, since fixed points "
+                                     "that make sense for one stock are meaningless for another).")
 sl_value = st.sidebar.number_input("SL Value", 0.0, 10000.0, 1.0, key="sl_value",
                                     help="Meaning depends on SL Type above (e.g. 1.0 = 1% or 1.0 = 1x ATR).")
 
@@ -854,7 +881,9 @@ else:
     trail_type, trail_value = "Points (Absolute)", 0.0
 
 st.sidebar.markdown("**Costs** (pro traders always model these — they're often why a 'winning' strategy loses money)")
-brokerage = st.sidebar.number_input("Brokerage per Round-Trip (₹)", 0.0, 1000.0, 20.0, key="brokerage")
+brokerage = st.sidebar.number_input("Brokerage per Round-Trip (₹)", 0.0, 1000.0, 20.0, key="brokerage",
+                                     help="⚠️ This is a placeholder, not Dhan's real published rate. "
+                                          "Check your broker's actual tariff sheet and enter that instead.")
 slippage_pct = st.sidebar.number_input("Slippage (%)", 0.0, 5.0, 0.05, step=0.01, key="slippage_pct")
 
 st.sidebar.subheader("🔴 Dhan Live Trading")
@@ -921,6 +950,15 @@ with tab_bt:
                        "**Run Backtest** again to refresh the results below.")
 
         df, trades_df, equity_series, metrics = result["df"], result["trades_df"], result["equity_series"], result["metrics"]
+
+        atr_now = ATR(df, p["atr_period"]).iloc[-1]
+        last_px = df["Close"].iloc[-1]
+        if sl_type == "Points (Absolute)" and sl_value > 0 and (sl_value / atr_now) < 0.3:
+            st.error(f"⚠️ Your SL of {sl_value} points is only ~{sl_value/atr_now:.2f}x this "
+                     f"instrument's ATR({p['atr_period']}) of {atr_now:.1f} points "
+                     f"(~{atr_now/last_px*100:.2f}% of price). That's inside normal noise for "
+                     f"{display_name} on this timeframe — expect near-constant stop-outs regardless "
+                     f"of strategy. Switch SL Type to 'ATR Multiple' (try 1.0–1.5x) or widen the points value.")
 
         c1, c2, c3, c4, c5, c6 = st.columns(6)
         c1.metric("Total Trades", metrics["total_trades"])
