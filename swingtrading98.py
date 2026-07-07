@@ -1,542 +1,542 @@
 """
-=====================================================================================
- INSIGHTS FINDER  —  Single-file Streamlit Market Pattern-Mining App
-=====================================================================================
-One button, one ticker (Nifty/BankNifty/Sensex/BTC/ETH/Gold/Silver/Forex/custom),
-and a full report across every timeframe: day-of-week seasonality, month-of-year
-seasonality, opening-gap behavior, up/down streak persistence, intraday time-of-day
-patterns, cross-asset correlation, and an India-VIX regime comparison — each with a
-bar chart AND a plain-English narrative, not just raw numbers.
+Algo Trading Platform — NIFTY50 / BANKNIFTY / SENSEX / Custom Indian tickers
+=============================================================================
+Single-file Streamlit app.
 
-MANDATORY 30-SECOND DELAY between every real Yahoo Finance request, as instructed,
-to stay well clear of rate limits. A full report is therefore genuinely slow (the
-sidebar shows an honest time estimate before you click) — that tradeoff is
-deliberate, not a bug.
+Features
+--------
+- Sidebar-driven configuration for everything (instrument, strategy, params, capital, etc.)
+- Backtesting engine with multiple built-in strategies
+- Live (paper) trading loop that polls yfinance
+- Persistent trade history (CSV)
+- yfinance data layer with a 0.3s throttle between every request to avoid rate-limit crashes
 
-HONESTY NOTES (this app prints these in-app too, but worth saying up front):
-  - Every stat here describes the PAST. None of it predicts tomorrow.
-  - This tool deliberately tests many patterns on the same data. Some will look
-    "significant" purely by chance (the multiple-comparisons problem) — check the
-    sample size (n) on every stat, and treat anything here as a hypothesis to
-    validate on data you haven't looked at yet, not a finished trading edge.
-=====================================================================================
+Run
+---
+    pip install streamlit yfinance pandas numpy plotly
+    streamlit run algo_trading_app.py
+
+NOTE: This is a paper-trading / educational tool. It places NO real orders.
 """
 
-import warnings
-warnings.filterwarnings("ignore")
-
+import os
 import time
+import json
+import threading
+from datetime import datetime, timedelta
+
 import numpy as np
 import pandas as pd
 import streamlit as st
-import plotly.graph_objects as go
-import yfinance as yf
 
-st.set_page_config(page_title="Insights Finder", layout="wide", page_icon="🔎")
+try:
+    import yfinance as yf
+except ImportError:
+    st.error("yfinance is not installed. Run:  pip install yfinance")
+    st.stop()
 
-# =====================================================================================
-# CONSTANTS
-# =====================================================================================
-YF_REQUEST_DELAY_SECONDS = 30  # mandatory, per requirement — applied before every real fetch
+try:
+    import plotly.graph_objects as go
+    from plotly.subplots import make_subplots
+    HAS_PLOTLY = True
+except ImportError:
+    HAS_PLOTLY = False
 
+
+# --------------------------------------------------------------------------- #
+#  CONSTANTS & PATHS
+# --------------------------------------------------------------------------- #
+DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "algo_data")
+os.makedirs(DATA_DIR, exist_ok=True)
+TRADES_CSV = os.path.join(DATA_DIR, "trade_history.csv")
+POSITIONS_JSON = os.path.join(DATA_DIR, "open_positions.json")
+
+# Global throttle: enforce >= 0.3s between ANY two yfinance network calls.
+_YF_LOCK = threading.Lock()
+_LAST_YF_CALL = [0.0]
+YF_MIN_INTERVAL = 0.3  # seconds
+
+# Predefined Indian instruments (Yahoo Finance symbols)
 PRESET_TICKERS = {
-    "NIFTY 50": "^NSEI",
-    "BANK NIFTY": "^NSEBANK",
-    "SENSEX": "^BSESN",
-    "Bitcoin (BTC-USD)": "BTC-USD",
-    "Ethereum (ETH-USD)": "ETH-USD",
-    "Gold Futures (GC=F)": "GC=F",
-    "Silver Futures (SI=F)": "SI=F",
-    "USD/INR": "INR=X",
-    "EUR/USD": "EURUSD=X",
-    "India VIX": "^INDIAVIX",
-    "Custom Ticker": None,
+    "NIFTY 50":       "^NSEI",
+    "BANK NIFTY":     "^NSEBANK",
+    "SENSEX":         "^BSESN",
+    "NIFTY IT":       "^CNXIT",
+    "NIFTY FIN":      "NIFTY_FIN_SERVICE.NS",
+    "Reliance":       "RELIANCE.NS",
+    "TCS":            "TCS.NS",
+    "HDFC Bank":      "HDFCBANK.NS",
+    "Infosys":        "INFY.NS",
+    "ICICI Bank":     "ICICIBANK.NS",
+    "SBI":            "SBIN.NS",
 }
 
-CORRELATION_UNIVERSE = {
-    "NIFTY 50": "^NSEI",
-    "BANK NIFTY": "^NSEBANK",
-    "SENSEX": "^BSESN",
-    "Bitcoin": "BTC-USD",
-    "Ethereum": "ETH-USD",
-    "Gold": "GC=F",
-    "Silver": "SI=F",
-    "USD/INR": "INR=X",
-    "India VIX": "^INDIAVIX",
-}
-
-# (label, yfinance interval, yfinance period — all valid Yahoo period tokens, no invented ones, kind)
-SECTION_CONFIGS = [
-    ("1 Minute",  "1m",  "5d",  "intraday"),
-    ("5 Minute",  "5m",  "3mo", "intraday"),
-    ("15 Minute", "15m", "3mo", "intraday"),
-    ("30 Minute", "30m", "3mo", "intraday"),
-    ("1 Hour",    "60m", "2y",  "intraday"),
-    ("1 Day",     "1d",  "max", "daily"),
-    ("1 Week",    "1wk", "max", "weekly"),
-    ("1 Month",   "1mo", "max", "monthly"),
-]
-
-MONTH_NAMES = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"]
-WEEKDAY_ORDER = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"]
+INTERVALS = ["1m", "2m", "5m", "15m", "30m", "60m", "1d", "1wk"]
+STRATEGIES = ["SMA Crossover", "EMA Crossover", "RSI Mean Reversion",
+              "Bollinger Band Breakout", "MACD"]
 
 
-# =====================================================================================
-# DATA FETCH — mandatory 30s delay, retries, real error surfaced (not swallowed)
-# =====================================================================================
-def _fetch_yf_with_retries(ticker, interval, period, attempts=2):
-    last_err = None
-    for attempt in range(attempts):
-        try:
-            time.sleep(YF_REQUEST_DELAY_SECONDS)
-            df = yf.Ticker(ticker).history(period=period, interval=interval, auto_adjust=True)
-            if df is not None and not df.empty:
-                return df[["Open", "High", "Low", "Close", "Volume"]].dropna(), None
-            last_err = "Yahoo Finance returned zero rows for this ticker/interval/period."
-        except Exception as e:
-            last_err = f"{type(e).__name__}: {e}"
-    return pd.DataFrame(), last_err
+# --------------------------------------------------------------------------- #
+#  DATA LAYER  (throttled yfinance)
+# --------------------------------------------------------------------------- #
+def _throttle():
+    """Block until at least YF_MIN_INTERVAL has passed since the last yf call."""
+    with _YF_LOCK:
+        elapsed = time.time() - _LAST_YF_CALL[0]
+        wait = YF_MIN_INTERVAL - elapsed
+        if wait > 0:
+            time.sleep(wait)
+        _LAST_YF_CALL[0] = time.time()
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
-def fetch_data(ticker, interval, period):
-    df, _ = _fetch_yf_with_retries(ticker, interval, period)
+@st.cache_data(show_spinner=False, ttl=30)
+def fetch_history(symbol, period, interval):
+    """Download historical OHLCV with a mandatory 0.3s throttle."""
+    _throttle()
+    df = yf.download(symbol, period=period, interval=interval,
+                     progress=False, auto_adjust=False)
+    if df is None or df.empty:
+        return pd.DataFrame()
+    # Flatten possible multi-index columns
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = [c[0] for c in df.columns]
+    df = df.rename(columns=str.title)
+    keep = [c for c in ["Open", "High", "Low", "Close", "Volume"] if c in df.columns]
+    df = df[keep].dropna()
+    df.index = pd.to_datetime(df.index)
     return df
 
 
-@st.cache_data(ttl=1800, show_spinner=False)
-def fetch_vix_snapshot():
-    return fetch_data("^INDIAVIX", "1d", "5d")
+def fetch_last_price(symbol):
+    """Fetch the most recent price (throttled). Returns (price, timestamp)."""
+    _throttle()
+    df = yf.download(symbol, period="1d", interval="1m",
+                     progress=False, auto_adjust=False)
+    if df is None or df.empty:
+        return None, None
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = [c[0] for c in df.columns]
+    df = df.rename(columns=str.title)
+    price = float(df["Close"].dropna().iloc[-1])
+    ts = df.index[-1]
+    return price, ts
 
 
-def slice_years(df, years):
-    if df.empty:
-        return df
-    cutoff = df.index.max() - pd.DateOffset(years=years)
-    return df[df.index >= cutoff]
+# --------------------------------------------------------------------------- #
+#  INDICATORS
+# --------------------------------------------------------------------------- #
+def sma(s, n):  return s.rolling(n).mean()
+def ema(s, n):  return s.ewm(span=n, adjust=False).mean()
+
+def rsi(s, n=14):
+    delta = s.diff()
+    gain = delta.clip(lower=0).rolling(n).mean()
+    loss = (-delta.clip(upper=0)).rolling(n).mean()
+    rs = gain / loss.replace(0, np.nan)
+    return 100 - (100 / (1 + rs))
+
+def bollinger(s, n=20, k=2.0):
+    mid = s.rolling(n).mean()
+    std = s.rolling(n).std()
+    return mid, mid + k * std, mid - k * std
+
+def macd(s, fast=12, slow=26, signal=9):
+    line = ema(s, fast) - ema(s, slow)
+    sig = ema(line, signal)
+    return line, sig
 
 
-# =====================================================================================
-# NARRATIVE HELPERS
-# =====================================================================================
-def sample_note(n):
-    if n < 20:
-        return f"n={n} — very small sample, likely noisy"
-    if n < 60:
-        return f"n={n} — modest sample, treat cautiously"
-    return f"n={n}"
+# --------------------------------------------------------------------------- #
+#  SIGNAL GENERATION
+#  Returns a Series of position signals: 1 = long, -1 = short, 0 = flat
+# --------------------------------------------------------------------------- #
+def generate_signals(df, strategy, p):
+    close = df["Close"]
+    sig = pd.Series(0, index=df.index, dtype=float)
+
+    if strategy == "SMA Crossover":
+        fast, slow = sma(close, p["fast"]), sma(close, p["slow"])
+        sig[fast > slow] = 1
+        if p["allow_short"]:
+            sig[fast < slow] = -1
+
+    elif strategy == "EMA Crossover":
+        fast, slow = ema(close, p["fast"]), ema(close, p["slow"])
+        sig[fast > slow] = 1
+        if p["allow_short"]:
+            sig[fast < slow] = -1
+
+    elif strategy == "RSI Mean Reversion":
+        r = rsi(close, p["rsi_period"])
+        sig[r < p["rsi_low"]] = 1
+        if p["allow_short"]:
+            sig[r > p["rsi_high"]] = -1
+        # hold until neutral
+        sig = sig.replace(0, np.nan).ffill().fillna(0)
+
+    elif strategy == "Bollinger Band Breakout":
+        mid, up, lo = bollinger(close, p["bb_period"], p["bb_k"])
+        sig[close > up] = 1
+        if p["allow_short"]:
+            sig[close < lo] = -1
+        sig = sig.replace(0, np.nan).ffill().fillna(0)
+
+    elif strategy == "MACD":
+        line, sg = macd(close, p["macd_fast"], p["macd_slow"], p["macd_signal"])
+        sig[line > sg] = 1
+        if p["allow_short"]:
+            sig[line < sg] = -1
+
+    return sig.fillna(0)
 
 
-def tilt_phrase(pct, baseline=50.0):
-    diff = pct - baseline
-    if abs(diff) < 3:
-        return "essentially a coin flip"
-    if abs(diff) < 8:
-        return f"a mild {'bullish' if diff > 0 else 'bearish'} tilt"
-    return f"a notable {'bullish' if diff > 0 else 'bearish'} tilt"
+# --------------------------------------------------------------------------- #
+#  BACKTEST ENGINE
+# --------------------------------------------------------------------------- #
+def run_backtest(df, signals, capital, fee_bps, slippage_bps):
+    """Vectorized long/short backtest on close prices."""
+    close = df["Close"].astype(float)
+    pos = signals.shift(1).fillna(0)          # act on next bar
+    ret = close.pct_change().fillna(0)
+
+    cost_rate = (fee_bps + slippage_bps) / 10000.0
+    trades = pos.diff().abs().fillna(0)        # 0->1, 1->-1 etc.
+    costs = trades * cost_rate
+
+    strat_ret = pos * ret - costs
+    equity = (1 + strat_ret).cumprod() * capital
+    bh_equity = (1 + ret).cumprod() * capital
+
+    # Trade log
+    log = []
+    entry_price = None
+    entry_time = None
+    entry_dir = 0
+    for i in range(len(pos)):
+        d = pos.iloc[i]
+        if d != entry_dir:
+            # close previous
+            if entry_dir != 0 and entry_price is not None:
+                exit_price = close.iloc[i]
+                pnl = (exit_price - entry_price) / entry_price * entry_dir * 100
+                log.append({
+                    "Entry Time": entry_time, "Exit Time": close.index[i],
+                    "Direction": "LONG" if entry_dir > 0 else "SHORT",
+                    "Entry": round(entry_price, 2), "Exit": round(exit_price, 2),
+                    "Return %": round(pnl, 3),
+                })
+            # open new
+            if d != 0:
+                entry_price = close.iloc[i]
+                entry_time = close.index[i]
+            entry_dir = d
+
+    trade_df = pd.DataFrame(log)
+    stats = compute_stats(equity, strat_ret, trade_df, capital)
+    return equity, bh_equity, trade_df, stats
 
 
-# =====================================================================================
-# INSIGHT COMPUTATIONS
-# =====================================================================================
-def weekday_seasonality(df):
-    d = df.copy()
-    d["ret"] = d["Close"].pct_change()
-    d = d.dropna(subset=["ret"])
-    d["weekday"] = d.index.day_name()
-    stats = d.groupby("weekday")["ret"].agg(n="count", avg_return=lambda x: x.mean() * 100,
-                                             pct_positive=lambda x: (x > 0).mean() * 100)
-    return stats.reindex([w for w in WEEKDAY_ORDER if w in stats.index])
+def compute_stats(equity, strat_ret, trade_df, capital):
+    total_ret = (equity.iloc[-1] / capital - 1) * 100 if len(equity) else 0
+    dd = (equity / equity.cummax() - 1).min() * 100 if len(equity) else 0
+    ann = np.sqrt(252) * (strat_ret.mean() / strat_ret.std()) if strat_ret.std() > 0 else 0
+    wins = (trade_df["Return %"] > 0).sum() if len(trade_df) else 0
+    n = len(trade_df)
+    return {
+        "Total Return %": round(total_ret, 2),
+        "Final Equity": round(equity.iloc[-1], 2) if len(equity) else capital,
+        "Max Drawdown %": round(dd, 2),
+        "Sharpe (ann.)": round(ann, 2),
+        "Trades": n,
+        "Win Rate %": round(100 * wins / n, 1) if n else 0,
+    }
 
 
-def month_seasonality(df):
-    d = df.copy()
-    d["ret"] = d["Close"].pct_change()
-    d = d.dropna(subset=["ret"])
-    d["month"] = d.index.month
-    stats = d.groupby("month")["ret"].agg(n="count", avg_return=lambda x: x.mean() * 100,
-                                           pct_positive=lambda x: (x > 0).mean() * 100)
-    stats.index = [MONTH_NAMES[m - 1] for m in stats.index]
-    return stats
+# --------------------------------------------------------------------------- #
+#  TRADE HISTORY PERSISTENCE
+# --------------------------------------------------------------------------- #
+def load_trades():
+    if os.path.exists(TRADES_CSV):
+        try:
+            return pd.read_csv(TRADES_CSV)
+        except Exception:
+            return pd.DataFrame()
+    return pd.DataFrame()
 
 
-def gap_behavior(df):
-    g = df.copy()
-    g["prev_close"] = g["Close"].shift(1)
-    g["gap_pct"] = (g["Open"] - g["prev_close"]) / g["prev_close"] * 100
-    g = g.dropna(subset=["gap_pct"])
-    up = g[g["gap_pct"] > 0.1]
-    down = g[g["gap_pct"] < -0.1]
-    up_fill = (up["Low"] <= up["prev_close"]).mean() * 100 if len(up) else np.nan
-    down_fill = (down["High"] >= down["prev_close"]).mean() * 100 if len(down) else np.nan
-    return dict(n_total=len(g), n_up=len(up), n_down=len(down), up_fill=up_fill, down_fill=down_fill)
+def append_trade(row):
+    df = load_trades()
+    df = pd.concat([df, pd.DataFrame([row])], ignore_index=True)
+    df.to_csv(TRADES_CSV, index=False)
 
 
-def streak_persistence(df):
-    up = (df["Close"].pct_change() > 0)
-    rows = []
-    for n in (1, 2, 3):
-        up_streak = up.rolling(n).sum() == n
-        down_streak = (~up).rolling(n).sum() == n
-        rows.append(dict(
-            streak=n,
-            pct_up_after_up=up.shift(-1)[up_streak].mean() * 100 if up_streak.sum() else np.nan,
-            n_up=int(up_streak.sum()),
-            pct_up_after_down=up.shift(-1)[down_streak].mean() * 100 if down_streak.sum() else np.nan,
-            n_down=int(down_streak.sum())))
-    return pd.DataFrame(rows)
+def load_positions():
+    if os.path.exists(POSITIONS_JSON):
+        try:
+            with open(POSITIONS_JSON) as f:
+                return json.load(f)
+        except Exception:
+            return {}
+    return {}
 
 
-def intraday_timing(df):
-    idf = df.copy()
-    idf["date"] = idf.index.date
-    recs = []
-    for d, grp in idf.groupby("date"):
-        if len(grp) < 3:
-            continue
-        start = grp.index[0]
-        recs.append(((grp["High"].idxmax() - start).total_seconds() / 60,
-                      (grp["Low"].idxmin() - start).total_seconds() / 60))
-    t = pd.DataFrame(recs, columns=["min_to_high", "min_to_low"])
-    if t.empty:
-        return None
-    return dict(n=len(t),
-                high15=(t["min_to_high"] <= 15).mean() * 100, low15=(t["min_to_low"] <= 15).mean() * 100,
-                high30=(t["min_to_high"] <= 30).mean() * 100, low30=(t["min_to_low"] <= 30).mean() * 100)
+def save_positions(pos):
+    with open(POSITIONS_JSON, "w") as f:
+        json.dump(pos, f, indent=2)
 
 
-def hourly_returns(df):
-    r = df["Close"].pct_change().dropna() * 100
-    if r.empty:
-        return None
-    stats = r.groupby(r.index.hour).agg(["mean", "count"])
-    stats.columns = ["avg_return", "n"]
-    return stats
+# --------------------------------------------------------------------------- #
+#  UI  ─  SIDEBAR CONFIG
+# --------------------------------------------------------------------------- #
+st.set_page_config(page_title="Algo Trading Platform", layout="wide",
+                   page_icon="📈")
+
+st.sidebar.title("⚙️ Configuration")
+
+mode = st.sidebar.radio("Mode", ["📊 Backtest", "🔴 Live (Paper)", "🧾 Trade History"])
+
+st.sidebar.markdown("### Instrument")
+src = st.sidebar.radio("Ticker source", ["Preset", "Custom"], horizontal=True)
+if src == "Preset":
+    name = st.sidebar.selectbox("Instrument", list(PRESET_TICKERS.keys()))
+    symbol = PRESET_TICKERS[name]
+else:
+    symbol = st.sidebar.text_input(
+        "Yahoo symbol", value="RELIANCE.NS",
+        help="Use the Yahoo Finance symbol. NSE stocks end in .NS, BSE in .BO")
+    name = symbol
+st.sidebar.caption(f"Resolved symbol: `{symbol}`")
+
+st.sidebar.markdown("### Data")
+interval = st.sidebar.selectbox("Interval", INTERVALS, index=2)
+period = st.sidebar.selectbox(
+    "Look-back period",
+    ["1d", "5d", "1mo", "3mo", "6mo", "1y", "2y", "5y"],
+    index=2)
+
+st.sidebar.markdown("### Strategy")
+strategy = st.sidebar.selectbox("Strategy", STRATEGIES)
+allow_short = st.sidebar.checkbox("Allow short positions", value=False)
+
+p = {"allow_short": allow_short}
+if strategy in ("SMA Crossover", "EMA Crossover"):
+    p["fast"] = st.sidebar.slider("Fast window", 3, 50, 9)
+    p["slow"] = st.sidebar.slider("Slow window", 5, 200, 21)
+elif strategy == "RSI Mean Reversion":
+    p["rsi_period"] = st.sidebar.slider("RSI period", 5, 30, 14)
+    p["rsi_low"] = st.sidebar.slider("Oversold (buy) <", 5, 45, 30)
+    p["rsi_high"] = st.sidebar.slider("Overbought (sell) >", 55, 95, 70)
+elif strategy == "Bollinger Band Breakout":
+    p["bb_period"] = st.sidebar.slider("BB period", 10, 50, 20)
+    p["bb_k"] = st.sidebar.slider("BB std-dev (k)", 1.0, 3.5, 2.0, 0.1)
+elif strategy == "MACD":
+    p["macd_fast"] = st.sidebar.slider("MACD fast", 5, 20, 12)
+    p["macd_slow"] = st.sidebar.slider("MACD slow", 20, 50, 26)
+    p["macd_signal"] = st.sidebar.slider("MACD signal", 5, 20, 9)
+
+st.sidebar.markdown("### Risk & Costs")
+capital = st.sidebar.number_input("Starting capital (₹)", 10000, 100_000_000,
+                                  1_000_000, step=10000)
+qty = st.sidebar.number_input("Order quantity (units)", 1, 100000, 1)
+fee_bps = st.sidebar.number_input("Fee (bps per trade)", 0.0, 100.0, 3.0, 0.5)
+slippage_bps = st.sidebar.number_input("Slippage (bps)", 0.0, 100.0, 2.0, 0.5)
+
+st.sidebar.caption(f"⏱️ yfinance throttle: {YF_MIN_INTERVAL}s between requests")
 
 
-def compute_correlations(main_df, corr_data, years):
-    main_ret = main_df["Close"].pct_change().dropna()
-    cutoff = main_df.index.max() - pd.DateOffset(years=years)
-    main_ret = main_ret[main_ret.index >= cutoff]
-    results = {}
-    for name, cdf in corr_data.items():
-        if cdf.empty:
-            continue
-        cret = cdf["Close"].pct_change().dropna()
-        aligned = pd.concat([main_ret, cret], axis=1, join="inner")
-        aligned.columns = ["main", "other"]
-        aligned = aligned.dropna()
-        if len(aligned) > 20:
-            results[name] = (aligned["main"].corr(aligned["other"]), len(aligned))
-    return results
+# --------------------------------------------------------------------------- #
+#  MAIN PANEL
+# --------------------------------------------------------------------------- #
+st.title("📈 Algo Trading Platform")
+st.caption("Paper-trading & backtesting for Indian indices and equities. "
+           "No real orders are placed.")
 
 
-def vix_regime_analysis(main_df, vix_df):
-    if vix_df is None or vix_df.empty:
-        return None
-    m = main_df["Close"].pct_change().rename("main_ret")
-    v = vix_df["Close"].rename("vix")
-    aligned = pd.concat([m, v], axis=1, join="inner").dropna()
-    if len(aligned) < 30:
-        return None
-    median_vix = aligned["vix"].median()
-    high = aligned[aligned["vix"] >= median_vix]
-    low = aligned[aligned["vix"] < median_vix]
-    return dict(median=median_vix,
-                high_avg=high["main_ret"].mean() * 100, high_vol=high["main_ret"].std() * 100, n_high=len(high),
-                low_avg=low["main_ret"].mean() * 100, low_vol=low["main_ret"].std() * 100, n_low=len(low))
-
-
-# =====================================================================================
-# CHART HELPER
-# =====================================================================================
-def bar_chart(x, y, title, y_title="", color=None):
-    colors = color or ["#2E86AB" if v >= 0 else "#C73E3E" for v in y]
-    fig = go.Figure(go.Bar(x=list(x), y=list(y), marker_color=colors,
-                           text=[f"{v:.2f}" for v in y], textposition="outside"))
-    fig.update_layout(title=title, yaxis_title=y_title, height=350, margin=dict(l=10, r=10, t=40, b=10))
+def price_chart(df, signals=None, title=""):
+    if not HAS_PLOTLY:
+        st.line_chart(df["Close"])
+        return
+    fig = make_subplots(rows=2, cols=1, shared_xaxes=True,
+                        row_heights=[0.75, 0.25], vertical_spacing=0.03)
+    fig.add_trace(go.Candlestick(
+        x=df.index, open=df["Open"], high=df["High"],
+        low=df["Low"], close=df["Close"], name="Price"), row=1, col=1)
+    if signals is not None:
+        longs = df.index[signals.diff() > 0]
+        shorts = df.index[signals.diff() < 0]
+        fig.add_trace(go.Scatter(
+            x=longs, y=df.loc[longs, "Close"], mode="markers",
+            marker=dict(symbol="triangle-up", size=11, color="#16a34a"),
+            name="Buy"), row=1, col=1)
+        fig.add_trace(go.Scatter(
+            x=shorts, y=df.loc[shorts, "Close"], mode="markers",
+            marker=dict(symbol="triangle-down", size=11, color="#dc2626"),
+            name="Sell"), row=1, col=1)
+    if "Volume" in df:
+        fig.add_trace(go.Bar(x=df.index, y=df["Volume"], name="Vol",
+                             marker_color="#94a3b8"), row=2, col=1)
+    fig.update_layout(height=520, margin=dict(l=10, r=10, t=30, b=10),
+                      xaxis_rangeslider_visible=False, title=title,
+                      showlegend=True, template="plotly_white")
     st.plotly_chart(fig, use_container_width=True)
 
 
-# =====================================================================================
-# SIDEBAR
-# =====================================================================================
-st.sidebar.title("🔎 Insights Finder")
-
-st.sidebar.subheader("📟 Market Context")
-with st.sidebar.container():
-    try:
-        vix_df = fetch_vix_snapshot()
-        if not vix_df.empty:
-            last_vix = vix_df["Close"].iloc[-1]
-            prev_vix = vix_df["Close"].iloc[-2] if len(vix_df) > 1 else last_vix
-            chg = last_vix - prev_vix
-            regime = ("Low" if last_vix < 13 else "Normal" if last_vix < 18 else
-                      "Elevated" if last_vix < 25 else "High")
-            st.metric("India VIX", f"{last_vix:.2f}", f"{chg:+.2f}")
-            st.caption(f"Regime: **{regime}** volatility (rule-of-thumb bands, not a signal by itself)")
-        else:
-            st.caption("India VIX unavailable right now.")
-    except Exception:
-        st.caption("India VIX unavailable right now.")
-
-st.sidebar.subheader("🎯 Ticker")
-preset_choice = st.sidebar.selectbox("Preset", list(PRESET_TICKERS.keys()))
-if preset_choice == "Custom Ticker":
-    custom = st.sidebar.text_input("Exact Yahoo Finance ticker", "RELIANCE.NS",
-                                    help="e.g. RELIANCE.NS, TCS.NS, AAPL, TSLA, DOGE-USD")
-    main_ticker = custom.strip()
-    display_name = custom.strip()
-else:
-    main_ticker = PRESET_TICKERS[preset_choice]
-    display_name = preset_choice
-
-years_hist = st.sidebar.slider("Years of history (Daily/Weekly/Monthly sections)", 1, 20, 10)
-
-include_intraday = st.sidebar.checkbox(
-    "Include intraday sections (1m/5m/15m/30m/1h)", value=True,
-    help="Uncheck to skip these 5 sections and save ~2.5 minutes of mandatory delay if you only "
-         "care about daily/weekly/monthly patterns.")
-
-st.sidebar.subheader("🔗 Correlation Instruments")
-corr_choices = st.sidebar.multiselect("Compare against", list(CORRELATION_UNIVERSE.keys()),
-                                       default=list(CORRELATION_UNIVERSE.keys()))
-
-sections_to_run = SECTION_CONFIGS if include_intraday else [s for s in SECTION_CONFIGS if s[3] != "intraday"]
-n_corr = len([c for c in corr_choices if CORRELATION_UNIVERSE[c] != main_ticker])
-total_requests = len(sections_to_run) + n_corr + 1  # +1 for VIX regime series fetch
-est_minutes = total_requests * YF_REQUEST_DELAY_SECONDS / 60
-st.sidebar.info(f"⏱ Estimated run time: **~{est_minutes:.1f} minutes** "
-                f"({total_requests} requests × {YF_REQUEST_DELAY_SECONDS}s mandatory delay each)")
-
-run_btn = st.sidebar.button("🔍 Get Full Insights Report", type="primary")
-
-st.sidebar.divider()
-st.sidebar.caption("⚠️ Every stat in this app describes the past. Testing many patterns at once "
-                   "means some will look significant purely by chance — check the sample size (n) "
-                   "on everything, and validate anything promising on data you haven't seen yet "
-                   "before trusting it.")
-
-# =====================================================================================
-# MAIN
-# =====================================================================================
-st.title("🔎 Insights Finder")
-st.caption(f"{display_name}  •  {main_ticker}")
-
-if run_btn:
-    total_steps = len(sections_to_run) + n_corr + 1
-    progress = st.progress(0.0)
-    status = st.empty()
-    step = 0
-
-    section_data = {}
-    for label, interval, period, kind in sections_to_run:
-        step += 1
-        status.info(f"⏳ Fetching {label} data... (step {step}/{total_steps}, "
-                    f"~{(total_steps - step + 1) * YF_REQUEST_DELAY_SECONDS / 60:.1f} min remaining)")
-        df = fetch_data(main_ticker, interval, period)
-        if kind in ("daily", "weekly", "monthly") and not df.empty:
-            df = slice_years(df, years_hist)
-        section_data[label] = (df, kind)
-        progress.progress(step / total_steps)
-
-    corr_data = {}
-    for name in corr_choices:
-        sym = CORRELATION_UNIVERSE[name]
-        if sym == main_ticker:
-            continue
-        step += 1
-        status.info(f"⏳ Fetching {name} for correlation... (step {step}/{total_steps}, "
-                    f"~{(total_steps - step + 1) * YF_REQUEST_DELAY_SECONDS / 60:.1f} min remaining)")
-        corr_data[name] = fetch_data(sym, "1d", "max")
-        progress.progress(step / total_steps)
-
-    step += 1
-    status.info(f"⏳ Fetching India VIX for regime analysis... (step {step}/{total_steps})")
-    vix_full = fetch_data("^INDIAVIX", "1d", "max")
-    progress.progress(1.0)
-    status.empty()
-    progress.empty()
-
-    st.session_state["insights_report"] = dict(
-        sections=section_data, corr=corr_data, vix_full=vix_full,
-        ticker=main_ticker, display_name=display_name, years_hist=years_hist)
-    st.success("✅ Report ready.")
-
-report = st.session_state.get("insights_report")
-if report is None:
-    st.info("Configure the sidebar and click **🔍 Get Full Insights Report**. Given the mandatory "
-            "30-second delay per request, a full report takes several minutes — the sidebar shows "
-            "an estimate before you commit.")
-else:
-    daily_df_for_corr = report["sections"].get("1 Day", (pd.DataFrame(), None))[0]
-
-    # ---------------------------------------------------------------------------
-    # PER-TIMEFRAME SECTIONS
-    # ---------------------------------------------------------------------------
-    for label, (df, kind) in report["sections"].items():
-        st.header(f"📐 {label} — {kind.capitalize()} Patterns")
+# ============================  BACKTEST  =================================== #
+if mode == "📊 Backtest":
+    st.subheader(f"Backtest — {name}  ({strategy})")
+    if st.button("▶️ Run Backtest", type="primary"):
+        with st.spinner("Fetching data & running backtest…"):
+            df = fetch_history(symbol, period, interval)
         if df.empty:
-            st.warning(f"No data returned for {label}. Yahoo Finance may not offer this "
-                      f"interval/period combination for this ticker.")
-            continue
-
-        st.caption(f"{len(df)} bars covering {df.index.min()} → {df.index.max()}")
-
-        # --- Weekday seasonality (daily bars only) ---
-        if kind == "daily":
-            wk = weekday_seasonality(df)
-            if not wk.empty:
-                st.subheader("📅 Day-of-Week Seasonality")
-                bar_chart(wk.index, wk["avg_return"], "Average Return by Weekday (%)", "Avg Return %")
-                best = wk["avg_return"].idxmax()
-                worst = wk["avg_return"].idxmin()
-                st.markdown(
-                    f"Over **{int(wk['n'].sum())}** trading days in the last **{years_hist}** years, "
-                    f"**{best}** has the best average return (**{wk.loc[best,'avg_return']:+.2f}%**, "
-                    f"positive **{wk.loc[best,'pct_positive']:.0f}%** of the time, "
-                    f"{sample_note(int(wk.loc[best,'n']))}) — {tilt_phrase(wk.loc[best,'pct_positive'])}. "
-                    f"**{worst}** has the worst average return (**{wk.loc[worst,'avg_return']:+.2f}%**, "
-                    f"positive **{wk.loc[worst,'pct_positive']:.0f}%** of the time, "
-                    f"{sample_note(int(wk.loc[worst,'n']))}).")
-
-        # --- Month-of-year seasonality (daily/weekly/monthly) ---
-        if kind in ("daily", "weekly", "monthly") and len(df) > 24:
-            mo = month_seasonality(df)
-            if not mo.empty:
-                st.subheader("🗓️ Month-of-Year Seasonality")
-                mo_ordered = mo.reindex([m for m in MONTH_NAMES if m in mo.index])
-                bar_chart(mo_ordered.index, mo_ordered["avg_return"], "Average Return by Month (%)", "Avg Return %")
-                best_m = mo_ordered["avg_return"].idxmax()
-                worst_m = mo_ordered["avg_return"].idxmin()
-                small_n_flag = " (monthly bars means n here is just years of history — very small sample)" if kind == "monthly" else ""
-                st.markdown(
-                    f"Historically, **{best_m}** has been the strongest month on average "
-                    f"(**{mo_ordered.loc[best_m,'avg_return']:+.2f}%**, positive "
-                    f"**{mo_ordered.loc[best_m,'pct_positive']:.0f}%** of years, "
-                    f"{sample_note(int(mo_ordered.loc[best_m,'n']))}) and **{worst_m}** the weakest "
-                    f"(**{mo_ordered.loc[worst_m,'avg_return']:+.2f}%**){small_n_flag}.")
-
-        # --- Gap behavior (all kinds) ---
-        gap = gap_behavior(df)
-        if gap["n_total"] > 10:
-            st.subheader("📊 Opening Gap Behavior")
-            gc1, gc2 = st.columns(2)
-            with gc1:
-                st.metric("Gap-Up Bars that Filled", f"{gap['up_fill']:.1f}%" if pd.notna(gap["up_fill"]) else "n/a")
-                st.caption(sample_note(gap["n_up"]))
-            with gc2:
-                st.metric("Gap-Down Bars that Filled", f"{gap['down_fill']:.1f}%" if pd.notna(gap["down_fill"]) else "n/a")
-                st.caption(sample_note(gap["n_down"]))
-            if pd.notna(gap["up_fill"]) and pd.notna(gap["down_fill"]):
-                if gap["up_fill"] > 65 and gap["down_fill"] > 65:
-                    interp = "gaps on this instrument/timeframe tend to **mean-revert** (fill back) rather than run away."
-                elif gap["up_fill"] < 35 and gap["down_fill"] < 35:
-                    interp = "gaps here tend to **persist** rather than fill, consistent with trending/momentum behavior around the open."
-                else:
-                    interp = "there's no strong tendency either way for gaps to fill or persist."
-                st.markdown(f"Out of {gap['n_total']} bars, {gap['n_up']} gapped up and {gap['n_down']} gapped down "
-                           f"by more than 0.1%. Taken together, {interp}")
-
-        # --- Streak persistence (all kinds) ---
-        streaks = streak_persistence(df)
-        st.subheader("🔁 After N Up/Down Moves, What Happens Next?")
-        show_streaks = streaks.copy()
-        show_streaks.columns = ["Streak Length", "% Next Up (after Up streak)", "n (up)",
-                                 "% Next Up (after Down streak)", "n (down)"]
-        st.dataframe(show_streaks, use_container_width=True, hide_index=True)
-        row1 = streaks.iloc[0]
-        if pd.notna(row1["pct_up_after_up"]):
-            tilt1 = tilt_phrase(row1["pct_up_after_up"])
-            st.markdown(f"After a single up move, the next bar is up **{row1['pct_up_after_up']:.1f}%** of the time "
-                       f"({sample_note(row1['n_up'])}) — {tilt1}. Consistently **above ~55%** across streak "
-                       f"lengths hints at momentum; consistently **below ~45%** hints at mean reversion.")
-
-        # --- Intraday-only: time-of-day timing + hourly returns ---
-        if kind == "intraday":
-            timing = intraday_timing(df)
-            if timing:
-                st.subheader("⏱ When Does the High/Low Typically Form?")
-                tc1, tc2, tc3, tc4 = st.columns(4)
-                tc1.metric("High in first 15 min", f"{timing['high15']:.1f}%")
-                tc2.metric("Low in first 15 min", f"{timing['low15']:.1f}%")
-                tc3.metric("High in first 30 min", f"{timing['high30']:.1f}%")
-                tc4.metric("Low in first 30 min", f"{timing['low30']:.1f}%")
-                st.caption(f"Based on {timing['n']} sessions. " +
-                          ("⚠️ Small sample — Yahoo Finance's own lookback limit for this interval is the "
-                           "constraint here." if timing["n"] < 30 else ""))
-                if timing["high15"] > 40 or timing["low15"] > 40:
-                    st.markdown("A meaningful share of session extremes form very early — this is the kind of "
-                               "pattern opening-range-breakout approaches are built around, though it needs "
-                               "more than a handful of sessions to trust.")
-
-            hrs = hourly_returns(df)
-            if hrs is not None and len(hrs) > 1:
-                st.subheader("🕐 Average Return by Hour of Day")
-                bar_chart(hrs.index.astype(str), hrs["avg_return"], "Average Return by Hour (%)", "Avg Return %")
-                best_h = hrs["avg_return"].idxmax()
-                worst_h = hrs["avg_return"].idxmin()
-                st.markdown(f"The **{best_h}:00** hour shows the strongest average return "
-                           f"({hrs.loc[best_h,'avg_return']:+.3f}%, {sample_note(int(hrs.loc[best_h,'n']))}); "
-                           f"**{worst_h}:00** the weakest ({hrs.loc[worst_h,'avg_return']:+.3f}%).")
-
-        st.divider()
-
-    # ---------------------------------------------------------------------------
-    # CROSS-ASSET CORRELATION
-    # ---------------------------------------------------------------------------
-    st.header("🔗 Cross-Asset Correlation")
-    if daily_df_for_corr.empty or not report["corr"]:
-        st.info("No daily data or correlation instruments available to compute this.")
-    else:
-        corr_results = compute_correlations(daily_df_for_corr, report["corr"], report["years_hist"])
-        if not corr_results:
-            st.info("Not enough overlapping data to compute correlations.")
+            st.error("No data returned. Try a different symbol / interval / period.")
         else:
-            names = list(corr_results.keys())
-            values = [corr_results[n][0] for n in names]
-            bar_chart(names, values, f"{report['display_name']} — Daily Return Correlation "
-                                     f"(last {report['years_hist']}y)", "Correlation (r)")
-            strongest_pos = max(corr_results, key=lambda k: corr_results[k][0])
-            strongest_neg = min(corr_results, key=lambda k: corr_results[k][0])
-            r_pos, n_pos = corr_results[strongest_pos]
-            r_neg, n_neg = corr_results[strongest_neg]
-            st.markdown(
-                f"**{report['display_name']}**'s daily returns are most positively correlated with "
-                f"**{strongest_pos}** (r = {r_pos:.2f}, n={n_pos}) and least correlated / most negative with "
-                f"**{strongest_neg}** (r = {r_neg:.2f}, n={n_neg}). As a rough guide: |r| above ~0.5 is a "
-                f"meaningfully strong relationship, below ~0.2 is weak-to-negligible. This describes the past "
-                f"relationship only — correlations between assets drift over time and are not stable forever.")
+            signals = generate_signals(df, strategy, p)
+            equity, bh, trades, stats = run_backtest(
+                df, signals, capital, fee_bps, slippage_bps)
 
-    # ---------------------------------------------------------------------------
-    # INDIA VIX REGIME ANALYSIS
-    # ---------------------------------------------------------------------------
-    st.header("📟 India VIX Regime Analysis")
-    if daily_df_for_corr.empty or report["vix_full"].empty:
-        st.info("Need both daily price data and India VIX data to run this comparison.")
+            c = st.columns(6)
+            c[0].metric("Total Return", f"{stats['Total Return %']}%")
+            c[1].metric("Final Equity", f"₹{stats['Final Equity']:,.0f}")
+            c[2].metric("Max Drawdown", f"{stats['Max Drawdown %']}%")
+            c[3].metric("Sharpe", stats["Sharpe (ann.)"])
+            c[4].metric("Trades", stats["Trades"])
+            c[5].metric("Win Rate", f"{stats['Win Rate %']}%")
+
+            price_chart(df, signals, f"{name} — {interval}")
+
+            st.markdown("#### Equity Curve")
+            eq_df = pd.DataFrame({"Strategy": equity, "Buy & Hold": bh})
+            st.line_chart(eq_df)
+
+            st.markdown("#### Trade Log")
+            if trades.empty:
+                st.info("No trades were generated for these parameters.")
+            else:
+                st.dataframe(trades, use_container_width=True, height=300)
+                st.download_button("⬇️ Download trade log (CSV)",
+                                   trades.to_csv(index=False),
+                                   f"backtest_{symbol}.csv", "text/csv")
     else:
-        regime = vix_regime_analysis(daily_df_for_corr, report["vix_full"])
-        if regime is None:
-            st.info("Not enough overlapping data between this ticker and India VIX.")
-        else:
-            bar_chart(["Low VIX days", "High VIX days"], [regime["low_avg"], regime["high_avg"]],
-                     "Average Daily Return by VIX Regime (%)", "Avg Return %")
-            rc1, rc2 = st.columns(2)
-            rc1.metric("Low-VIX days: Avg Return / Volatility", f"{regime['low_avg']:+.3f}% / {regime['low_vol']:.2f}%")
-            rc1.caption(sample_note(regime["n_low"]))
-            rc2.metric("High-VIX days: Avg Return / Volatility", f"{regime['high_avg']:+.3f}% / {regime['high_vol']:.2f}%")
-            rc2.caption(sample_note(regime["n_high"]))
-            vol_note = ("higher realized volatility on high-VIX days, as expected" if regime["high_vol"] > regime["low_vol"]
-                       else "surprisingly similar realized volatility across regimes")
-            st.markdown(
-                f"Splitting history at the median India VIX level ({regime['median']:.1f}): "
-                f"{report['display_name']} shows {vol_note}. The average *return* difference between regimes "
-                f"({regime['high_avg']:+.3f}% vs {regime['low_avg']:+.3f}%) is the more interesting number — "
-                f"a large, consistent gap here (not just a volatility difference) would be the more actionable "
-                f"finding, but check the sample sizes above before leaning on it.")
+        st.info("Configure the strategy in the sidebar, then click **Run Backtest**.")
 
-    st.divider()
-    st.caption("⚠️ Every pattern above describes historical data only. This tab tested many patterns at "
-               "once on purpose — some numbers here will look interesting purely by chance. Treat this as "
-               "a hypothesis generator: note what looks promising, then check whether it still holds on a "
-               "later period of data you haven't looked at yet before trusting it with real money.")
+
+# ============================  LIVE (PAPER)  =============================== #
+elif mode == "🔴 Live (Paper)":
+    st.subheader(f"Live Paper Trading — {name}")
+    st.warning("Paper trading only — simulated fills, no broker connection.")
+
+    poll = st.number_input("Refresh every (seconds)", 5, 300, 15)
+    auto = st.checkbox("🔄 Auto-refresh loop")
+
+    positions = load_positions()
+    cur = positions.get(symbol)
+
+    col1, col2 = st.columns([2, 1])
+
+    with st.spinner("Fetching latest price…"):
+        price, ts = fetch_last_price(symbol)
+        hist = fetch_history(symbol, "5d", interval)
+
+    if price is None:
+        st.error("Could not fetch a live price for this symbol.")
+    else:
+        signals = generate_signals(hist, strategy, p) if not hist.empty else pd.Series()
+        latest_sig = int(signals.iloc[-1]) if len(signals) else 0
+        sig_label = {1: "🟢 LONG", -1: "🔴 SHORT", 0: "⚪ FLAT"}[latest_sig]
+
+        with col1:
+            price_chart(hist, signals, f"{name} — live {interval}")
+        with col2:
+            st.metric("Last Price", f"₹{price:,.2f}")
+            st.caption(f"As of {ts}")
+            st.metric("Strategy Signal", sig_label)
+            if cur:
+                entry = cur["entry_price"]
+                d = 1 if cur["direction"] == "LONG" else -1
+                upnl = (price - entry) / entry * d * 100
+                st.metric("Open Position",
+                          f"{cur['direction']} {cur['qty']} @ ₹{entry:,.2f}",
+                          f"{upnl:+.2f}%")
+            else:
+                st.info("No open position.")
+
+        st.markdown("#### Manual / Signal Order")
+        b1, b2, b3 = st.columns(3)
+
+        def do_open(direction):
+            positions[symbol] = {
+                "direction": direction, "qty": int(qty),
+                "entry_price": price, "entry_time": str(ts), "name": name}
+            save_positions(positions)
+            st.success(f"Opened {direction} {qty} {name} @ ₹{price:,.2f}")
+
+        def do_close():
+            if not cur:
+                st.warning("No open position to close.")
+                return
+            entry = cur["entry_price"]
+            d = 1 if cur["direction"] == "LONG" else -1
+            pnl_pct = (price - entry) / entry * d * 100
+            pnl_abs = (price - entry) * d * cur["qty"]
+            append_trade({
+                "Symbol": symbol, "Name": name,
+                "Direction": cur["direction"], "Qty": cur["qty"],
+                "Entry Time": cur["entry_time"], "Entry Price": entry,
+                "Exit Time": str(ts), "Exit Price": price,
+                "PnL %": round(pnl_pct, 3), "PnL ₹": round(pnl_abs, 2),
+                "Strategy": strategy, "Logged": str(datetime.now()),
+            })
+            del positions[symbol]
+            save_positions(positions)
+            st.success(f"Closed {cur['direction']} — PnL ₹{pnl_abs:,.2f} ({pnl_pct:+.2f}%)")
+
+        if b1.button("🟢 Buy / Long"):
+            do_open("LONG")
+            st.rerun()
+        if b2.button("🔴 Sell / Short"):
+            do_open("SHORT")
+            st.rerun()
+        if b3.button("✖️ Close Position"):
+            do_close()
+            st.rerun()
+
+        st.markdown("#### Recent Trades")
+        th = load_trades()
+        if not th.empty:
+            st.dataframe(th.tail(10), use_container_width=True)
+        else:
+            st.caption("No trades logged yet.")
+
+    if auto:
+        time.sleep(poll)
+        st.rerun()
+
+
+# ============================  TRADE HISTORY  ============================= #
+elif mode == "🧾 Trade History":
+    st.subheader("Trade History")
+    th = load_trades()
+    if th.empty:
+        st.info("No trades logged yet. Trades from Live (Paper) mode appear here.")
+    else:
+        # Summary
+        total_pnl = th["PnL ₹"].sum() if "PnL ₹" in th else 0
+        wins = (th["PnL ₹"] > 0).sum() if "PnL ₹" in th else 0
+        n = len(th)
+        c = st.columns(4)
+        c[0].metric("Total Trades", n)
+        c[1].metric("Net PnL", f"₹{total_pnl:,.2f}")
+        c[2].metric("Win Rate", f"{100*wins/n:.1f}%" if n else "0%")
+        c[3].metric("Avg PnL/Trade", f"₹{total_pnl/n:,.2f}" if n else "₹0")
+
+        if "PnL ₹" in th:
+            st.markdown("#### Cumulative PnL")
+            st.line_chart(th["PnL ₹"].cumsum())
+
+        st.dataframe(th, use_container_width=True, height=400)
+        st.download_button("⬇️ Download full history (CSV)",
+                           th.to_csv(index=False), "trade_history.csv", "text/csv")
+        if st.button("🗑️ Clear history"):
+            if os.path.exists(TRADES_CSV):
+                os.remove(TRADES_CSV)
+            st.rerun()
