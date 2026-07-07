@@ -190,6 +190,12 @@ def generate_signals(df, strat, p):
         ln, sg = macd(c); sig[ln > sg] = 1; sig[ln < sg] = -1 if p["short"] else 0
     elif strat == "Supertrend":
         d = supertrend(df, p["st_n"], p["st_mult"]); sig = d if p["short"] else d.clip(lower=0)
+    sig = sig.fillna(0)
+    # Trend filter: only trade in the direction of the long-term EMA
+    if p.get("trend") and len(c) > 200:
+        te = ema(c, 200)
+        sig[(sig > 0) & (c < te)] = 0     # no longs below trend
+        sig[(sig < 0) & (c > te)] = 0     # no shorts above trend
     return sig.fillna(0)
 
 # --------------------------------------------------------------------------- #
@@ -337,6 +343,28 @@ def price_chart(df, sig=None, positions=None, title=""):
 # =========================================================================== #
 #  SIDEBAR
 # =========================================================================== #
+def kpi(items, per_row=None):
+    """Render metric cards that NEVER truncate (st.metric clips with ellipsis).
+    items = list of (label, value, sub, color)  where color in {None,'g','r'}."""
+    per_row = per_row or len(items)
+    for start in range(0, len(items), per_row):
+        chunk = items[start:start + per_row]
+        cols = st.columns(len(chunk))
+        for col, it in zip(cols, chunk):
+            label, value, sub = it[0], it[1], (it[2] if len(it) > 2 else "")
+            color = it[3] if len(it) > 3 else None
+            vc = {"g": "#16a34a", "r": "#dc2626"}.get(color, "#0f172a")
+            col.markdown(
+                f'<div style="padding:12px 14px;border:1px solid #e5e7eb;'
+                f'border-radius:12px;background:#fff;min-height:78px;">'
+                f'<div style="font-size:11px;font-weight:600;color:#64748b;'
+                f'text-transform:uppercase;letter-spacing:.05em;">{label}</div>'
+                f'<div style="font-size:23px;font-weight:700;color:{vc};'
+                f'line-height:1.25;word-break:break-word;">{value}</div>'
+                f'<div style="font-size:11px;color:#94a3b8;min-height:14px;">{sub}</div>'
+                f'</div>', unsafe_allow_html=True)
+
+
 st.set_page_config(page_title="Algo Trading Terminal", layout="wide", page_icon="📊")
 ss = st.session_state
 st.sidebar.title("⚙️ Configuration")
@@ -358,7 +386,9 @@ period = st.sidebar.selectbox("History window",
 st.sidebar.markdown("### Strategy")
 strat = st.sidebar.selectbox("Strategy", STRATEGIES)
 allow_short = st.sidebar.checkbox("Allow shorts", False)
-p = {"short": allow_short}
+trend_filter = st.sidebar.checkbox("Trend filter (trade only with 200-EMA)", True,
+    help="Blocks longs below the 200-EMA and shorts above it. Cuts chop-driven losses.")
+p = {"short": allow_short, "trend": trend_filter}
 if strat in ("SMA Crossover", "EMA Crossover"):
     p["fast"] = st.sidebar.slider("Fast", 3, 50, 9); p["slow"] = st.sidebar.slider("Slow", 5, 200, 21)
 elif strat == "RSI":
@@ -476,15 +506,16 @@ if mode == "🔴 Live Terminal":
     # ---- MTM header ----
     unreal = sum(unrealised(x) for x in ss.positions)
     net = ss.realised + unreal
-    m = st.columns(6)
-    m[0].metric("LTP", f"₹{ss.last_price:,.2f}" if ss.last_price else "—",
-                f"{ss.last_ts}" if ss.last_ts else None)
     sig_lbl = {1: "🟢 LONG", -1: "🔴 SHORT", 0: "⚪ FLAT"}[ss.signal_state]
-    m[1].metric("Signal", sig_lbl, ss.signal_flip_ts or "")
-    m[2].metric("Open Positions", len(ss.positions))
-    m[3].metric("Realised P&L", f"₹{ss.realised:,.0f}")
-    m[4].metric("Unrealised P&L", f"₹{unreal:,.0f}")
-    m[5].metric("Net Day P&L", f"₹{net:,.0f}", delta=f"{net:,.0f}")
+    kpi([
+        ("LTP", f"₹{ss.last_price:,.2f}" if ss.last_price else "—",
+         f"{ss.last_ts}" if ss.last_ts else ""),
+        ("Signal", sig_lbl, ss.signal_flip_ts or ""),
+        ("Open Positions", len(ss.positions), ""),
+        ("Realised P&L", f"₹{ss.realised:,.0f}", "", "g" if ss.realised >= 0 else "r"),
+        ("Unrealised P&L", f"₹{unreal:,.0f}", "", "g" if unreal >= 0 else "r"),
+        ("Net Day P&L", f"₹{net:,.0f}", "", "g" if net >= 0 else "r"),
+    ], per_row=3)
 
     col1, col2 = st.columns([2, 1])
     with col1:
@@ -557,7 +588,54 @@ if mode == "🔴 Live Terminal":
 elif mode == "📊 Backtest":
     st.title("📊 Strategy Backtest")
     st.caption(f"{name} · {strat} · {interval} · {period}")
-    if st.button("▶️ Run Backtest", type="primary"):
+
+    def _grid(strat):
+        if strat in ("SMA Crossover", "EMA Crossover"):
+            return [{"fast": f, "slow": s} for f in (5, 9, 13, 20) for s in (21, 34, 50, 100) if f < s]
+        if strat == "RSI":
+            return [{"rsi_n": n, "rsi_lo": lo, "rsi_hi": 100 - lo}
+                    for n in (7, 14, 21) for lo in (20, 25, 30, 35)]
+        if strat == "Bollinger":
+            return [{"bb_n": n, "bb_k": k} for n in (14, 20, 30) for k in (1.5, 2.0, 2.5, 3.0)]
+        if strat == "MACD":
+            return [{}]
+        if strat == "Supertrend":
+            return [{"st_n": n, "st_mult": m} for n in (7, 10, 14) for m in (2.0, 3.0, 4.0)]
+        return [{}]
+
+    oc = st.columns([1, 1, 4])
+    run = oc[0].button("▶️ Run Backtest", type="primary")
+    opt = oc[1].button("🔍 Optimize")
+
+    if opt:
+        with st.spinner("Fetching once, grid-searching parameters…"):
+            df = fetch_history(symbol, period, interval)
+        if df.empty:
+            st.error("No data for optimization.")
+        else:
+            rows = []
+            for combo in _grid(strat):
+                pp = {"short": allow_short, "trend": trend_filter, **combo}
+                try:
+                    sig = generate_signals(df, strat, pp)
+                    _, _, tl, s = run_backtest(df, sig, capital, fee_bps, slip_bps)
+                    rows.append({**combo, "Return %": s["ret"], "Sharpe": s["sharpe"],
+                                 "MaxDD %": s["dd"], "Trades": s["n"], "Win %": s["win"]})
+                except Exception:
+                    pass
+            res = pd.DataFrame(rows).sort_values("Sharpe", ascending=False)
+            st.markdown("#### 🔍 Parameter Grid — ranked by Sharpe")
+            if res.empty or res["Return %"].max() <= 0:
+                st.warning("No parameter set was profitable on this data/period. "
+                           "That is a real result — try a different instrument, "
+                           "interval, longer window, or accept this strategy has no "
+                           "edge here. No optimizer can manufacture an edge that "
+                           "isn't in the data.")
+            st.dataframe(res, use_container_width=True, height=340, hide_index=True)
+            st.caption("Set the winning parameters in the sidebar, then Run Backtest. "
+                       "⚠️ In-sample optimization overfits — validate on out-of-sample data before trusting it.")
+
+    if run:
         with st.spinner("Fetching & simulating…"):
             df = fetch_history(symbol, period, interval)
         if df.empty:
@@ -565,13 +643,14 @@ elif mode == "📊 Backtest":
         else:
             sig = generate_signals(df, strat, p)
             eq, bh, tl, s = run_backtest(df, sig, capital, fee_bps, slip_bps)
-            c = st.columns(6)
-            c[0].metric("Total Return", f"{s['ret']}%")
-            c[1].metric("Final Equity", f"₹{s['final']:,.0f}")
-            c[2].metric("Max Drawdown", f"{s['dd']}%")
-            c[3].metric("Sharpe", s["sharpe"])
-            c[4].metric("Trades", s["n"])
-            c[5].metric("Win Rate", f"{s['win']}%")
+            kpi([
+                ("Total Return", f"{s['ret']}%", "", "g" if s['ret'] >= 0 else "r"),
+                ("Final Equity", f"₹{s['final']:,.0f}", ""),
+                ("Max Drawdown", f"{s['dd']}%", "", "r"),
+                ("Sharpe", s["sharpe"], "", "g" if s['sharpe'] >= 0 else "r"),
+                ("Trades", s["n"], ""),
+                ("Win Rate", f"{s['win']}%", ""),
+            ], per_row=3)
             price_chart(df, sig, None, f"{name} — {interval}")
             st.markdown("#### Equity Curve"); st.line_chart(pd.DataFrame({"Strategy": eq, "Buy & Hold": bh}))
             st.markdown("#### Trade Log")
@@ -580,8 +659,8 @@ elif mode == "📊 Backtest":
                 st.dataframe(tl, use_container_width=True, height=300)
                 st.download_button("⬇️ Trade log CSV", tl.to_csv(index=False),
                                    f"backtest_{symbol}.csv", "text/csv")
-    else:
-        st.info("Set parameters in the sidebar and click **Run Backtest**.")
+    if not run and not opt:
+        st.info("Set parameters in the sidebar, then **Run Backtest** — or **Optimize** to grid-search.")
 
 # =========================================================================== #
 #  HISTORY
@@ -595,12 +674,13 @@ else:
         tot = th["PnL ₹"].sum(); n = len(th); wins = (th["PnL ₹"] > 0).sum()
         gp = th.loc[th["PnL ₹"] > 0, "PnL ₹"].sum()
         gl = -th.loc[th["PnL ₹"] < 0, "PnL ₹"].sum()
-        c = st.columns(5)
-        c[0].metric("Trades", n)
-        c[1].metric("Net P&L", f"₹{tot:,.0f}")
-        c[2].metric("Win Rate", f"{100*wins/n:.1f}%")
-        c[3].metric("Profit Factor", f"{gp/gl:.2f}" if gl else "∞")
-        c[4].metric("Avg / Trade", f"₹{tot/n:,.0f}")
+        kpi([
+            ("Trades", n, ""),
+            ("Net P&L", f"₹{tot:,.0f}", "", "g" if tot >= 0 else "r"),
+            ("Win Rate", f"{100*wins/n:.1f}%", ""),
+            ("Profit Factor", f"{gp/gl:.2f}" if gl else "∞", ""),
+            ("Avg / Trade", f"₹{tot/n:,.0f}", "", "g" if tot >= 0 else "r"),
+        ])
         st.markdown("#### Cumulative P&L"); st.line_chart(th["PnL ₹"].cumsum())
         st.dataframe(th, use_container_width=True, height=380)
         cc = st.columns(2)
