@@ -2141,6 +2141,23 @@ def should_allow_trade_direction(signal, config):
     
     return True  # Default to allowing all
 
+def get_entry_position_type(signal, config):
+    """
+    Convert a raw strategy signal ('BUY'/'SELL'/'LONG'/'SHORT') into the actual
+    entry position type ('LONG' or 'SHORT').
+
+    If the "Reverse Entry" option is enabled, the entry is flipped so that a
+    LONG/BUY signal results in a SHORT entry and a SHORT/SELL signal results
+    in a LONG entry (useful e.g. for index option buying where you want to
+    trade opposite to the underlying signal).
+    """
+    position_type = 'LONG' if signal in ('BUY', 'LONG') else 'SHORT'
+    
+    if config.get('reverse_entry', False):
+        position_type = 'SHORT' if position_type == 'LONG' else 'LONG'
+    
+    return position_type
+
 def calculate_brokerage(entry_price, exit_price, quantity, config):
     """
     Calculate brokerage and return Net P&L after brokerage.
@@ -2851,8 +2868,8 @@ def run_backtest(df, config):
                 
                 signals_generated += 1
                 
-                # Convert signal to position type
-                position_type = 'LONG' if signal in ('BUY', 'LONG') else 'SHORT'
+                # Convert signal to position type (applies Reverse Entry if enabled)
+                position_type = get_entry_position_type(signal, config)
                 
                 # ── Method 2: Use next candle's open as entry (more realistic) ─────
                 use_method2 = config.get('use_backtest_method2', False)
@@ -2924,7 +2941,7 @@ def run_backtest(df, config):
                     
                     # Calculate what P&L would have been for this skipped trade
                     # (simulate exit at some future point for analysis)
-                    skipped_position_type = 'LONG' if signal in ('BUY', 'LONG') else 'SHORT'
+                    skipped_position_type = get_entry_position_type(signal, config)
                     skipped_sl = calculate_initial_sl(skipped_position_type, signal_price, df, idx, config)
                     skipped_target = calculate_initial_target(skipped_position_type, signal_price, df, idx, config)
                     
@@ -3379,8 +3396,8 @@ def live_trading_iteration():
             # Store current signal type
             st.session_state['last_signal_type'] = signal
             
-            # Convert to position type
-            position_type = 'LONG' if signal in ('BUY', 'LONG') else 'SHORT'
+            # Convert to position type (applies Reverse Entry if enabled)
+            position_type = get_entry_position_type(signal, config)
             
             # Calculate initial SL and Target
             sl_price = calculate_initial_sl(position_type, entry_price, df, idx, config)
@@ -3695,6 +3712,16 @@ def render_config_ui():
         help="Filters which trade directions the algo will take"
     )
     
+    # ── Reverse Entry (Flip Signal Direction) ────────────────────────────────
+    config['reverse_entry'] = st.sidebar.checkbox(
+        "Reverse Entry (Flip Signal Direction)",
+        value=False,
+        help="When enabled, entries are flipped opposite to the raw signal: "
+             "a LONG/BUY signal enters SHORT and a SHORT/SELL signal enters LONG. "
+             "Useful e.g. for index option buying where the underlying signal "
+             "direction is opposite to the option side you want to trade."
+    )
+    
     # ── Brokerage Configuration (Available Always) ───────────────────────────
     st.sidebar.subheader("💰 Brokerage & Charges")
     config['include_brokerage'] = st.sidebar.checkbox(
@@ -3783,13 +3810,13 @@ def render_config_ui():
     
     # Strategy Selection
     st.sidebar.subheader("📊 Strategy")
-    config['strategy'] = st.sidebar.selectbox("Strategy Type", STRATEGY_LIST, index=11)
+    config['strategy'] = st.sidebar.selectbox("Strategy Type", STRATEGY_LIST, index=0)
     
     # Strategy-specific parameters
     if config['strategy'] == 'EMA Crossover':
         config['ema_fast'] = st.sidebar.number_input("EMA Fast Period", min_value=1, value=9)
         config['ema_slow'] = st.sidebar.number_input("EMA Slow Period", min_value=1, value=21)
-        config['ema_min_angle'] = st.sidebar.number_input("Min Angle (ABSOLUTE)", min_value=0.0, value=0.0, step=0.1)
+        config['ema_min_angle'] = st.sidebar.number_input("Min Angle (ABSOLUTE)", min_value=0.0, value=30.0, step=0.1)
         
         config['ema_entry_filter'] = st.sidebar.selectbox("Entry Filter", EMA_ENTRY_FILTERS, index=0)
         
@@ -3798,7 +3825,7 @@ def render_config_ui():
         elif config['ema_entry_filter'] == 'ATR-based Candle':
             config['ema_atr_multiplier'] = st.sidebar.number_input("ATR Multiplier", min_value=0.1, value=0.3, step=0.1)
         
-        config['ema_use_adx'] = st.sidebar.checkbox("Use ADX Filter", value=False)
+        config['ema_use_adx'] = st.sidebar.checkbox("Use ADX Filter", value=True)
         if config['ema_use_adx']:
             config['ema_adx_threshold'] = st.sidebar.number_input("ADX Threshold", min_value=1, value=20)
             config['adx_period'] = st.sidebar.number_input("ADX Period", min_value=1, value=14)
@@ -4137,7 +4164,7 @@ def render_config_ui():
     
     # Stop Loss Configuration
     st.sidebar.subheader("🛡️ Stop Loss")
-    config['sl_type'] = st.sidebar.selectbox("SL Type", SL_TYPES, index=9)
+    config['sl_type'] = st.sidebar.selectbox("SL Type", SL_TYPES, index=0)
     
     if 'Points' in config['sl_type'] or config['sl_type'] in ['Custom Points', 'ATR-based', 
                                                                 'Trailing SL (Points)', 
@@ -4159,10 +4186,10 @@ def render_config_ui():
     
     # Target Configuration
     st.sidebar.subheader("🎯 Target")
-    config['target_type'] = st.sidebar.selectbox("Target Type", TARGET_TYPES, index=2)
+    config['target_type'] = st.sidebar.selectbox("Target Type", TARGET_TYPES, index=0)
     
     if 'Points' in config['target_type'] or config['target_type'] in ['Custom Points', 'Trailing Target (Points)']:
-        config['target_points'] = st.sidebar.number_input("Target Points", min_value=1, value=200)
+        config['target_points'] = st.sidebar.number_input("Target Points", min_value=1, value=20)
     
     if config['target_type'] == 'P&L Based (Rupees)':
         config['target_rupees'] = st.sidebar.number_input("Target Rupees", min_value=1, value=200)
@@ -4435,7 +4462,7 @@ def render_backtest_ui(config):
 
     if st.button("Run Backtest", type="primary"):
         with st.spinner("Running backtest..."):
-            ticker       = config.get('asset', 'NIFTY 50')
+            ticker       = config.get('asset', 'SENSEX')
             interval     = INTERVAL_MAPPING.get(config.get('interval', '1 day'), '1d')
             period       = PERIOD_MAPPING.get(config.get('period', '1 month'), '1mo')
             custom_ticker = config.get('custom_ticker', None)
