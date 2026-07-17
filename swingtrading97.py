@@ -1409,41 +1409,36 @@ def detect_signal_exit_condition(trade, i, df, params):
     return False, None
 
 
-def check_hard_exit(trade, candle):
+def check_hard_exit(trade, candle, close_fill=False):
     """
     Hard SL/Target check using only the CURRENT candle's own high/low against
     levels set from PAST data (entry price, ATR at signal time, trailing
     updates). No look-ahead — these levels never depend on this candle's own
     close. Conservative order: longs check SL(low) before Target(high);
-    shorts check SL(high) before Target(low). Used by BOTH the backtest and
-    live candle-logic mode so the two engines behave identically.
+    shorts check SL(high) before Target(low).
 
-    SL AND TARGET FILL = CANDLE CLOSE (realistic poll-based fills): a
-    poll-based system only DISCOVERS that the candle's Low/High breached a
-    level when the candle completes — nobody exits at the exact moment the
-    level was touched. The honest fill price for BOTH exits is therefore the
-    candle's CLOSE:
-      LONG:  Low <= SL → exit at Close;  High >= Target → exit at Close.
-      SHORT: High >= SL → exit at Close; Low <= Target → exit at Close.
-    P&L / points are computed from that close, so overshoot beyond the level
-    (favorable on targets, unfavorable on stops — and vice versa when price
-    snaps back before close) is honestly counted. This applies to the
-    backtest AND to live trading when "Backtest-style candle logic" is ON;
-    LTP mode exits at the actually observed live price instead.
+    close_fill=False (DEFAULT — original behavior): a breached level fills AT
+    THE LEVEL PRICE — LONG: Low <= SL → exit at SL; High >= Target → exit at
+    Target (models a resting stop/limit order sitting at the broker).
+
+    close_fill=True ("Candle-Close SL/Target Fills" checkbox ON): a breached
+    level fills at the candle's CLOSE — the honest fill for a poll-based
+    system that only DISCOVERS the breach when the candle completes. P&L /
+    points then include the overshoot beyond the level in both directions.
     """
     direction = trade["direction"]
     target_display_only = trade["target_type"] == "Trailing Target (Display Only)"
 
     if direction == 1:
         if candle["Low"] <= trade["sl"]:
-            return True, float(candle["Close"]), "Stoploss Hit"
+            return True, (float(candle["Close"]) if close_fill else trade["sl"]), "Stoploss Hit"
         if not target_display_only and candle["High"] >= trade["target"]:
-            return True, float(candle["Close"]), "Target Hit"
+            return True, (float(candle["Close"]) if close_fill else trade["target"]), "Target Hit"
     else:
         if candle["High"] >= trade["sl"]:
-            return True, float(candle["Close"]), "Stoploss Hit"
+            return True, (float(candle["Close"]) if close_fill else trade["sl"]), "Stoploss Hit"
         if not target_display_only and candle["Low"] <= trade["target"]:
-            return True, float(candle["Close"]), "Target Hit"
+            return True, (float(candle["Close"]) if close_fill else trade["target"]), "Target Hit"
 
     return False, None, None
 
@@ -1610,7 +1605,8 @@ def run_backtest(raw_df, strategy, sl_type, target_type, params, filters, qty, r
             #    the quantity and keep the rest running under a trailing stop
             #    instead of a full close.
             if not exited:
-                hard_exit, hard_price, hard_reason = check_hard_exit(open_trade, candle)
+                hard_exit, hard_price, hard_reason = check_hard_exit(
+                    open_trade, candle, close_fill=params.get("close_fill_logic", False))
                 if hard_exit:
                     if (open_trade["target_type"] == "Partial Book + Trail Remainder"
                             and hard_reason == "Target Hit" and not open_trade["partial_booked"]):
@@ -2396,21 +2392,23 @@ def render_config_panel(ui, prefix):
     if sl_type == "Risk:Reward Based (min 1:2)" or target_type == "Risk:Reward Based (min 1:2)":
         cfg_number(ui, prefix, "rr_ratio", "Risk:Reward Ratio (min 2)", 2.0, 10.0, 2.0)
 
-    # ------------------------------------------------------ Live exit engine
-    ui.markdown("### 🧮 Live Exit Engine")
-    live_candle_logic = cfg_checkbox(
-        ui, prefix, "live_candle_logic", "Backtest-style candle logic in LIVE trading", default=True,
-        help="ON (default): live trading exits use EXACTLY the backtest rules — entry at candle N+1 open; "
-             "LONG checks SL against the closed candle's LOW first, then Target against its HIGH; "
-             "SHORT checks SL against the HIGH first, then Target against the LOW. "
-             "OFF: the old tick behavior — SL checked against LTP first, then Target against LTP.",
+    # -------------------------------------------------- SL/Target fill logic
+    ui.markdown("### 🧮 SL/Target Fill Logic (Backtest + Live)")
+    close_fill = cfg_checkbox(
+        ui, prefix, "close_fill_logic", "Candle-Close SL/Target Fills (wait for candle close)", default=False,
+        help="OFF (default — original behavior): BACKTEST — LONG checks SL vs candle Low first then Target vs High "
+             "(SHORT: SL vs High then Target vs Low) and a breached level fills AT THE SL/TARGET PRICE; "
+             "LIVE — SL is checked against the LTP first, then Target against the LTP, exits at the observed price. "
+             "ON: both engines wait for the candle to CLOSE, run the same Low/High checks, and a breached SL or "
+             "Target fills at the candle's CLOSING price — P&L and points are then calculated from that close.",
     )
-    if live_candle_logic:
-        ui.caption("🕯️ Live exits mirror the backtest: signal on candle N → entry at candle N+1 open; "
-                   "LONG → SL vs candle Low first, then Target vs candle High; "
-                   "SHORT → SL vs candle High first, then Target vs candle Low.")
+    if close_fill:
+        ui.caption("🕯️ ON — Backtest AND live: signal on candle N → entry at candle N+1 open; LONG → SL vs candle "
+                   "Low first then Target vs candle High (SHORT: SL vs High then Target vs Low); when either level "
+                   "is breached, the exit fills at that candle's CLOSE and P&L/points use the close.")
     else:
-        ui.caption("⚡ LTP tick mode: entry still at candle N+1 open, but SL is checked against the live LTP first, then Target against the LTP (both directions).")
+        ui.caption("⚡ OFF (default) — original logic. Backtest: same Low/High checks, but fills AT the SL/Target "
+                   "price. Live: SL checked against LTP first, then Target against LTP; exits at the observed price.")
 
     # -------------------------------------------------------------- Time risk
     ui.markdown("### ⏱ Time-Based Risk Control")
@@ -2632,7 +2630,7 @@ target_type = cfg.get("target_type", TARGET_TYPES[0])
 
 PARAM_DEFAULTS = {
     "ema_fast": 9, "ema_slow": 15, "threshold": 0.0, "threshold_direction": "Below",
-    "trade_type": "Both", "flip_signals": False, "sr_window": 20, "liq_window": 20,
+    "trade_type": "Both", "flip_signals": False, "close_fill_logic": False, "sr_window": 20, "liq_window": 20,
     "rsi_period": 14, "bb_period": 20, "bb_std": 2.0, "vol_window": 20, "vol_factor": 2.0,
     "zigzag_lookback": 3, "st_period": 10, "st_mult": 3.0, "orb_candles": 5,
     "macd_fast": 12, "macd_slow": 26, "macd_signal": 9, "donchian_period": 20,
@@ -2934,14 +2932,16 @@ def evaluate_live_signal(ticker, interval, period, strategy, params, filters, sl
         ltp = float(sig_df["Close"].iloc[-1])
 
     # ---- Live exit engine selection --------------------------------------
-    # "Backtest-style candle logic" checkbox (ON by default): entries happen at
-    # candle N+1 open (unchanged), and SL/Target are checked EXACTLY like the
-    # backtest — against the last CLOSED candle's Low/High (LONG: SL vs Low
-    # first, then Target vs High; SHORT: SL vs High first, then Target vs Low)
-    # instead of against the LTP tick. Turn it off to get the old LTP behavior.
+    # "Candle-Close SL/Target Fills" checkbox (OFF by default):
+    #   OFF → ORIGINAL behavior: SL checked against LTP first, then Target
+    #         against LTP; exits fill at the actually observed price.
+    #   ON  → backtest-identical candle logic: wait for the candle to close,
+    #         LONG checks SL vs candle Low then Target vs candle High (SHORT:
+    #         SL vs High then Target vs Low), and a breached level fills at
+    #         the candle's CLOSE — same as the backtest with the box ON.
     cfg_live = st.session_state.get("app_cfg", {})
     use_candle_logic = (
-        bool(cfg_live.get("live_candle_logic", True))
+        bool(cfg_live.get("close_fill_logic", False))
         and strategy not in IMMEDIATE_EXECUTION_STRATEGIES
         and len(sig_df) >= 2
     )
@@ -3030,7 +3030,7 @@ def evaluate_live_signal(ticker, interval, period, strategy, params, filters, sl
                 # Backtest-identical conservative fill: LONG checks SL (candle
                 # Low) BEFORE Target (candle High); SHORT checks SL (candle
                 # High) BEFORE Target (candle Low).
-                hard_exit, hard_price, hard_reason = check_hard_exit(pos, candle)
+                hard_exit, hard_price, hard_reason = check_hard_exit(pos, candle, close_fill=True)
             else:
                 hard_exit, hard_price, hard_reason = check_hard_exit_ltp(pos, ltp)
             if hard_exit:
@@ -3490,10 +3490,10 @@ with tab_live:
             st.caption("📡 Data source: **Dhan feed** — no API delay applied.")
     else:
         st.caption("📡 Data source: **yfinance** — a fixed 0.3s delay is applied to every API call (rate-limit protection).")
-    if _cfg_now.get("live_candle_logic", True):
-        st.caption("🧮 Exit engine: **Backtest-style candle logic** — entry at candle N+1 open; LONG: SL vs candle Low → Target vs candle High; SHORT: SL vs candle High → Target vs candle Low.")
+    if _cfg_now.get("close_fill_logic", False):
+        st.caption("🧮 Exit engine: **Candle-Close fills** — waits for candle close; LONG: SL vs Low → Target vs High (SHORT: SL vs High → Target vs Low); breached SL/Target fills at the candle's CLOSE (P&L from close). Matches the backtest with the same box ON.")
     else:
-        st.caption("🧮 Exit engine: **LTP tick logic** — SL checked against live LTP first, then Target.")
+        st.caption("🧮 Exit engine: **LTP logic (default/original)** — SL checked against live LTP first, then Target; exits at the observed price. Backtest fills at the SL/Target level.")
 
     # ---- Start / Stop / Square-off controls ----
     ctrl1, ctrl2, ctrl3, ctrl4 = st.columns(4)
@@ -3566,7 +3566,7 @@ with tab_live:
             "Strategy": strategy, "Stoploss Type": sl_type, "Target Type": target_type,
             "Filters Active": [k for k, v in filters.items() if v is True],
             "Data Source": "Dhan (no delay)" if (_cfg_now.get("use_dhan_data") and _cfg_now.get("dhan_access_token") and dhan_data_meta(ticker)) else "yfinance (0.3s delay)",
-            "Live Exit Logic": "Backtest-style candle logic" if _cfg_now.get("live_candle_logic", True) else "LTP tick logic",
+            "SL/Target Fill Logic": "Candle-Close fills (backtest + live)" if _cfg_now.get("close_fill_logic", False) else "Original: level-price fills (backtest) / LTP checks (live)",
             "Dhan Live Orders": dhan_enabled,
             "Dhan Product Config": {k: v for k, v in product_cfg.items() if not str(k).startswith("_")} if dhan_enabled else "—",
             "Email Notifications": bool(_cfg_now.get("email_enabled")),
