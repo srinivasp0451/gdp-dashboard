@@ -1418,14 +1418,18 @@ def check_hard_exit(trade, candle):
     shorts check SL(high) before Target(low). Used by BOTH the backtest and
     live candle-logic mode so the two engines behave identically.
 
-    SL FILL = CANDLE CLOSE (realistic poll-based fill): a poll-based system
-    only DISCOVERS the SL breach when the candle completes — nobody exits the
-    trade at the exact moment Low touched SL. The honest fill price is
-    therefore the candle's CLOSE, not the SL level. LONG: Low <= SL → exit at
-    Close; SHORT: High >= SL → exit at Close. This makes backtest P&L match
-    what a live close-triggered exit actually achieves (including the
-    overshoot beyond SL when a candle keeps running). Target fills remain at
-    the target price (a resting limit order at target genuinely fills there).
+    SL AND TARGET FILL = CANDLE CLOSE (realistic poll-based fills): a
+    poll-based system only DISCOVERS that the candle's Low/High breached a
+    level when the candle completes — nobody exits at the exact moment the
+    level was touched. The honest fill price for BOTH exits is therefore the
+    candle's CLOSE:
+      LONG:  Low <= SL → exit at Close;  High >= Target → exit at Close.
+      SHORT: High >= SL → exit at Close; Low <= Target → exit at Close.
+    P&L / points are computed from that close, so overshoot beyond the level
+    (favorable on targets, unfavorable on stops — and vice versa when price
+    snaps back before close) is honestly counted. This applies to the
+    backtest AND to live trading when "Backtest-style candle logic" is ON;
+    LTP mode exits at the actually observed live price instead.
     """
     direction = trade["direction"]
     target_display_only = trade["target_type"] == "Trailing Target (Display Only)"
@@ -1434,12 +1438,12 @@ def check_hard_exit(trade, candle):
         if candle["Low"] <= trade["sl"]:
             return True, float(candle["Close"]), "Stoploss Hit"
         if not target_display_only and candle["High"] >= trade["target"]:
-            return True, trade["target"], "Target Hit"
+            return True, float(candle["Close"]), "Target Hit"
     else:
         if candle["High"] >= trade["sl"]:
             return True, float(candle["Close"]), "Stoploss Hit"
         if not target_display_only and candle["Low"] <= trade["target"]:
-            return True, trade["target"], "Target Hit"
+            return True, float(candle["Close"]), "Target Hit"
 
     return False, None, None
 
@@ -2279,15 +2283,6 @@ def render_config_panel(ui, prefix):
     # ---------------------------------------------------------------- Strategy
     ui.markdown("### 📐 Strategy")
     strategy = cfg_selectbox(ui, prefix, "strategy", "Strategy", STRATEGIES)
-    cfg_selectbox(ui, prefix, "trade_type", "Trade Direction", ["Both", "Long Only", "Short Only"], default="Both",
-                  help="Both (default): take long and short signals. Long Only / Short Only: signals in the other "
-                       "direction are ignored everywhere — backtest, optimization, heatmaps AND live trading.")
-    if cfg_checkbox(ui, prefix, "flip_signals", "Flip / Reverse Entries (Long ↔ Short)", default=False,
-                    help="When ON: a long signal enters SHORT, a short signal enters LONG — everywhere (backtest, "
-                         "optimization, live). Useful to trade the inverse of a consistently losing signal."):
-        ui.caption("🔄 Signals are REVERSED. Stocks/futures: flipped long → SELL entry, flipped short → BUY entry. "
-                   "Options: flipped signals just BUY the other leg (long→PE, short→CE) — options are always "
-                   "BOUGHT, never sold, in every mode.")
     if strategy in IMMEDIATE_EXECUTION_STRATEGIES:
         ui.caption("⚡ This is a price condition, not a candle strategy — in LIVE trading it enters IMMEDIATELY "
                    "at LTP the moment the condition is met (no waiting for the next candle open).")
@@ -2344,10 +2339,27 @@ def render_config_panel(ui, prefix):
     if strategy in PRO_STRATEGIES:
         ui.caption("💡 Professional-grade composite strategy (trend/volatility/liquidity confluence). Not a guarantee of profitability — validate in the Optimization tab first.")
 
+    # ------------------------------------------------------- Trade direction
+    ui.markdown("### 🎚 Trade Direction")
+    tt_sel = cfg_selectbox(ui, prefix, "trade_type", "Trade Direction", ["Both", "Long Only", "Short Only"], default="Both",
+                           help="Both (default): take long and short signals. Long Only / Short Only: signals in the "
+                                "other direction are ignored everywhere — backtest, optimization, heatmaps AND live trading.")
+    flip_on = cfg_checkbox(ui, prefix, "flip_signals", "Flip / Reverse Entries (Long ↔ Short)", default=False,
+                           help="When ON: a long signal enters SHORT, a short signal enters LONG — everywhere (backtest, "
+                                "optimization, live). Useful to trade the inverse of a consistently losing signal.")
+    if flip_on:
+        ui.caption("🔄 Signals are REVERSED (flip happens first, then the Trade Direction filter above is applied). "
+                   "Stocks/futures: flipped long → SELL entry, flipped short → BUY entry. Options: flipped signals "
+                   "just BUY the other leg (flipped long → PE BUY, flipped short → CE BUY) — options are always "
+                   "BOUGHT, never sold, in every mode.")
+
     # ---------------------------------------------------------------- Stoploss
     ui.markdown("### 🛑 Stoploss")
     sl_type = cfg_selectbox(ui, prefix, "sl_type", "Stoploss Type", SL_TYPES)
-    cfg_number(ui, prefix, "sl_points", "SL Points (base)", 0.1, 100000.0, 10.0)
+    if sl_type not in ("ATR Based SL", "Loss Recovery SL (Give-back)"):
+        cfg_number(ui, prefix, "sl_points", "SL Points", 0.1, 100000.0, 10.0,
+                   help="The stoploss distance in points for points-based SL types, and the INITIAL SL distance "
+                        "for trailing SL types (the trail then takes over).")
     if sl_type == "ATR Based SL":
         cfg_number(ui, prefix, "atr_mult_sl", "ATR Multiplier (SL)", 0.5, 5.0, 1.5)
     if sl_type == "Loss Recovery SL (Give-back)":
@@ -2359,7 +2371,12 @@ def render_config_panel(ui, prefix):
     # ------------------------------------------------------------------ Target
     ui.markdown("### 🎯 Target")
     target_type = cfg_selectbox(ui, prefix, "target_type", "Target Type", TARGET_TYPES)
-    cfg_number(ui, prefix, "target_points", "Target Points (base)", 0.1, 200000.0, 20.0)
+    if target_type not in ("ATR Based Target", "Risk:Reward Based (min 1:2)", "Autopilot Target",
+                           "Profit Giveback Target", "Partial Book + Trail Remainder"):
+        cfg_number(ui, prefix, "target_points", "Target Points", 0.1, 200000.0, 20.0,
+                   help="The target distance in points for points-based target types, and the INITIAL target "
+                        "distance for trailing target types. Hidden for target types that compute their own "
+                        "level (ATR / R:R / Autopilot / Giveback / Partial Book).")
     if target_type == "ATR Based Target":
         cfg_number(ui, prefix, "atr_mult_target", "ATR Multiplier (Target)", 1.0, 8.0, 3.0)
     if target_type == "Profit Giveback Target":
@@ -2410,11 +2427,11 @@ def render_config_panel(ui, prefix):
     # ------------------------------------------------ Daily limits & timing
     ui.markdown("### 🛡 Daily Risk Limits & Trade Timing (LIVE)")
     ui.caption("All off by default. These gates apply to LIVE trading entries/exits (realized points from today's closed trades).")
-    if cfg_checkbox(ui, prefix, "max_loss_day_enabled", "Max Loss in a Day", default=False):
-        cfg_number(ui, prefix, "max_loss_day_points", "Max loss (points)", min_value=1.0, default=20.0, step=5.0)
+    if cfg_checkbox(ui, prefix, "max_loss_day_enabled", "Max Points Loss in a Day", default=False):
+        cfg_number(ui, prefix, "max_loss_day_points", "Max points loss", min_value=1.0, default=20.0, step=5.0)
         ui.caption("Once today's realized points reach −this value, no new entries are taken for the rest of the day.")
-    if cfg_checkbox(ui, prefix, "max_profit_day_enabled", "Max Profit in a Day", default=False):
-        cfg_number(ui, prefix, "max_profit_day_points", "Max profit (points)", min_value=1.0, default=100.0, step=10.0)
+    if cfg_checkbox(ui, prefix, "max_profit_day_enabled", "Max Points Profit in a Day", default=False):
+        cfg_number(ui, prefix, "max_profit_day_points", "Max points profit", min_value=1.0, default=100.0, step=10.0)
         ui.caption("Once today's realized points reach +this value, trading stops for the day to lock in gains.")
     if cfg_checkbox(ui, prefix, "max_trades_enabled", "Max Number of Trades in a Day", default=False):
         cfg_number(ui, prefix, "max_trades_day", "Max trades", min_value=1, default=10, step=1)
@@ -2501,7 +2518,7 @@ def render_config_panel(ui, prefix):
     ui.caption("Off by default. Turn these on to get a more honest read on whether a config is likely to hold up out-of-sample and after real costs.")
 
     if cfg_checkbox(ui, prefix, "wf_enabled", "Enable Walk-Forward Validation", default=False):
-        cfg_slider(ui, prefix, "wf_folds", "Number of sequential out-of-sample folds", 3, 10, 5)
+        cfg_slider(ui, prefix, "wf_folds", "Number of sequential out-of-sample folds", 3, 20, 5)
         ui.caption("Splits the backtest period into N sequential chunks and checks whether the edge holds up across most of them, not just in aggregate.")
 
     if cfg_checkbox(ui, prefix, "cost_enabled", "Enable Realistic Cost Modeling", default=False):
