@@ -7,10 +7,14 @@ simulation layer unless you explicitly enable the Dhan broker checkbox and
 wire in verified credentials — do that only after testing in a sandbox.
 """
 
+import smtplib
+import ssl
 import time
 from datetime import datetime, timedelta
+from email.mime.text import MIMEText
 
 import numpy as np
+import requests
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
@@ -141,7 +145,39 @@ TARGET_TYPES = [
     "Profit Giveback Target", "Partial Book + Trail Remainder",
 ]
 
-RATE_LIMIT_DELAY = 0.3  # seconds, mandatory pause between yfinance calls
+RATE_LIMIT_DELAY = 0.3  # seconds, mandatory pause between YFINANCE calls only.
+# Dhan has no comparable API rate-limit issue, so the Dhan data path deliberately
+# applies NO delay at all — do not add one there.
+
+# ---------------------------------------------------------------------------
+# DHAN — data feed + order placement constants
+# ---------------------------------------------------------------------------
+DHAN_API_BASE = "https://api.dhan.co/v2"
+DHAN_SCRIP_MASTER_URL = "https://images.dhan.co/api-data/api-scrip-master.csv"
+
+# Well-known Dhan security IDs for the index tickers this app ships with.
+INDEX_SECURITY_MAP = {
+    "^NSEI": {"security_id": "13", "segment": "IDX_I", "instrument": "INDEX"},
+    "^NSEBANK": {"security_id": "25", "segment": "IDX_I", "instrument": "INDEX"},
+    "^BSESN": {"security_id": "51", "segment": "IDX_I", "instrument": "INDEX"},
+}
+
+# Default option quantities requested for index options (current lot sizes
+# as configured by the user — editable in the Dhan section).
+INDEX_OPTION_LOT_DEFAULTS = {"NIFTY": 65, "BANKNIFTY": 35, "SENSEX": 20}
+
+DHAN_INSTRUMENTS = [
+    "Stock Intraday", "Stock Delivery", "Stock Futures",
+    "Index Futures", "Stock Options", "Index Options",
+]
+
+DHAN_INTERVAL_MAP = {"1m": "1", "5m": "5", "15m": "15", "1h": "60"}
+
+PERIOD_DAYS = {
+    "1d": 1, "5d": 5, "7d": 7, "1mo": 31, "3mo": 93, "6mo": 186,
+    "1y": 366, "2y": 732, "3y": 1098, "5y": 1830, "10y": 3660,
+    "20y": 7320, "30y": 10980,
+}
 
 # ============================================================================
 # SESSION STATE
@@ -156,6 +192,8 @@ for key, default in {
     "last_backtest_df": None,
     "live_running": False,
     "last_acted_signal_marker": None,
+    "app_cfg": {},          # single source of truth for ALL config widgets
+    "_ltp_prev": None,      # previous LTP shown, for the live delta readout
 }.items():
     if key not in st.session_state:
         st.session_state[key] = default
@@ -402,7 +440,8 @@ def safe_indicator_value(series, min_bars, label=""):
 # ============================================================================
 
 @st.cache_data(ttl=30, show_spinner=False)
-def fetch_data(ticker, interval, period):
+def fetch_data_yf(ticker, interval, period):
+    """yfinance path — keeps the mandatory 0.3s rate-limit delay intact."""
     time.sleep(RATE_LIMIT_DELAY)
     df = yf.download(ticker, interval=interval, period=period, progress=False, auto_adjust=True)
     if df is None or df.empty:
@@ -411,6 +450,297 @@ def fetch_data(ticker, interval, period):
         df.columns = df.columns.get_level_values(0)
     df = df.dropna(how="all")
     return df
+
+
+# ============================================================================
+# DHAN DATA FEED + SCRIP MASTER + EMAIL HELPERS
+# ============================================================================
+
+def _dhan_headers(client_id, token):
+    return {"access-token": str(token), "client-id": str(client_id), "Content-Type": "application/json"}
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def load_dhan_scrip_master():
+    """Downloads and caches (24h) Dhan's public instrument master CSV. Used to
+    resolve security IDs, F&O expiries, strikes, and lot sizes automatically."""
+    try:
+        df = pd.read_csv(DHAN_SCRIP_MASTER_URL, low_memory=False)
+        df.columns = [str(c).strip() for c in df.columns]
+        return df
+    except Exception:
+        return pd.DataFrame()
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def lookup_equity_security_id(symbol, exchange="NSE"):
+    """NSE/BSE cash-equity security ID for a plain symbol (e.g. 'RELIANCE')."""
+    sm = load_dhan_scrip_master()
+    if sm.empty:
+        return None
+    try:
+        rows = sm[
+            (sm["SEM_EXM_EXCH_ID"].astype(str).str.strip() == exchange)
+            & (sm["SEM_INSTRUMENT_NAME"].astype(str).str.strip() == "EQUITY")
+            & (sm["SEM_TRADING_SYMBOL"].astype(str).str.strip().str.upper() == str(symbol).upper())
+        ]
+        if "SEM_SERIES" in rows.columns:
+            eq = rows[rows["SEM_SERIES"].astype(str).str.strip().isin(["EQ", "A", "B", "BE"])]
+            if not eq.empty:
+                rows = eq
+        if rows.empty:
+            return None
+        return str(int(float(rows.iloc[0]["SEM_SMST_SECURITY_ID"])))
+    except Exception:
+        return None
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def dhan_derivative_table(underlying, kind):
+    """All FUT or OPT scrip-master rows for one underlying (e.g. 'NIFTY').
+    kind: 'FUT' or 'OPT'. Trading symbols look like 'NIFTY-Dec2025-FUT' /
+    'NIFTY-Dec2025-24000-CE', so an 'UNDERLYING-' prefix match is exact enough
+    (it can't accidentally match NIFTYNXT50-, which has its own prefix)."""
+    sm = load_dhan_scrip_master()
+    if sm.empty:
+        return pd.DataFrame()
+    inst_names = {"FUT": ("FUTIDX", "FUTSTK"), "OPT": ("OPTIDX", "OPTSTK")}[kind]
+    try:
+        rows = sm[sm["SEM_INSTRUMENT_NAME"].astype(str).str.strip().isin(inst_names)].copy()
+        pref = str(underlying).upper() + "-"
+        rows = rows[rows["SEM_TRADING_SYMBOL"].astype(str).str.upper().str.startswith(pref)]
+        rows["_expiry"] = pd.to_datetime(rows["SEM_EXPIRY_DATE"], errors="coerce").dt.date
+        rows = rows.dropna(subset=["_expiry"])
+        return rows
+    except Exception:
+        return pd.DataFrame()
+
+
+def dhan_expiry_list(underlying, kind):
+    """Sorted list of upcoming expiry dates ('YYYY-MM-DD') for FUT/OPT."""
+    rows = dhan_derivative_table(underlying, kind)
+    if rows.empty:
+        return []
+    today = datetime.now().date()
+    return [d.isoformat() for d in sorted({d for d in rows["_expiry"] if d >= today})]
+
+
+def dhan_option_strikes(underlying, expiry_str):
+    """Sorted unique strike prices available for one option expiry."""
+    rows = dhan_derivative_table(underlying, "OPT")
+    if rows.empty or not expiry_str:
+        return []
+    try:
+        exp = pd.to_datetime(expiry_str).date()
+        sel = rows[rows["_expiry"] == exp]
+        return sorted({float(s) for s in pd.to_numeric(sel["SEM_STRIKE_PRICE"], errors="coerce").dropna()})
+    except Exception:
+        return []
+
+
+def lookup_future_security_id(underlying, expiry_str):
+    rows = dhan_derivative_table(underlying, "FUT")
+    if rows.empty or not expiry_str:
+        return None
+    try:
+        exp = pd.to_datetime(expiry_str).date()
+        sel = rows[rows["_expiry"] == exp]
+        if sel.empty:
+            return None
+        return str(int(float(sel.iloc[0]["SEM_SMST_SECURITY_ID"])))
+    except Exception:
+        return None
+
+
+def lookup_option_security_id(underlying, expiry_str, strike, opt_type):
+    """Security ID for one exact (underlying, expiry, strike, CE/PE) leg."""
+    rows = dhan_derivative_table(underlying, "OPT")
+    if rows.empty or not expiry_str or not strike:
+        return None
+    try:
+        exp = pd.to_datetime(expiry_str).date()
+        sel = rows[rows["_expiry"] == exp].copy()
+        sel["_strike"] = pd.to_numeric(sel["SEM_STRIKE_PRICE"], errors="coerce")
+        sel = sel[(sel["_strike"] - float(strike)).abs() < 0.01]
+        sel = sel[sel["SEM_OPTION_TYPE"].astype(str).str.strip().str.upper() == str(opt_type).upper()]
+        if sel.empty:
+            return None
+        return str(int(float(sel.iloc[0]["SEM_SMST_SECURITY_ID"])))
+    except Exception:
+        return None
+
+
+def dhan_lot_size(underlying, kind, expiry_str=""):
+    rows = dhan_derivative_table(underlying, kind)
+    if rows.empty:
+        return None
+    try:
+        if expiry_str:
+            exp = pd.to_datetime(expiry_str).date()
+            sel = rows[rows["_expiry"] == exp]
+            if not sel.empty:
+                rows = sel
+        return int(float(rows.iloc[0]["SEM_LOT_UNITS"]))
+    except Exception:
+        return None
+
+
+def dhan_underlying_symbol(ticker_choice, ticker):
+    """Maps the app's ticker selection to a Dhan underlying symbol."""
+    if ticker_choice == "Nifty50":
+        return "NIFTY"
+    if ticker_choice == "BankNifty":
+        return "BANKNIFTY"
+    if ticker_choice == "Sensex":
+        return "SENSEX"
+    base = str(ticker).upper()
+    for suf in (".NS", ".BO"):
+        if base.endswith(suf):
+            base = base[: -len(suf)]
+    return base
+
+
+def dhan_data_meta(ticker):
+    """Returns {security_id, segment, instrument} for tickers Dhan CAN serve,
+    or None for tickers it can't (BTC-USD, ETH-USD, USDINR=X, GC=F, SI=F, …) —
+    those automatically fall back to yfinance."""
+    if ticker in INDEX_SECURITY_MAP:
+        return dict(INDEX_SECURITY_MAP[ticker])
+    t = str(ticker).upper()
+    if t.endswith(".NS") or t.endswith(".BO"):
+        exch = "NSE" if t.endswith(".NS") else "BSE"
+        sid = lookup_equity_security_id(t[:-3], exch)
+        if sid:
+            return {"security_id": sid, "segment": f"{exch}_EQ", "instrument": "EQUITY"}
+    return None
+
+
+def _dhan_arrays_to_df(js):
+    """Converts a Dhan charts API response (arrays of o/h/l/c/v + epoch
+    timestamps) into the same OHLCV DataFrame shape yfinance returns."""
+    try:
+        if not js or "open" not in js or not js.get("open"):
+            return pd.DataFrame()
+        ts = pd.to_datetime(js.get("timestamp", []), unit="s", utc=True).tz_convert("Asia/Kolkata")
+        n = len(js["open"])
+        df = pd.DataFrame(
+            {
+                "Open": pd.to_numeric(js["open"], errors="coerce"),
+                "High": pd.to_numeric(js["high"], errors="coerce"),
+                "Low": pd.to_numeric(js["low"], errors="coerce"),
+                "Close": pd.to_numeric(js["close"], errors="coerce"),
+                "Volume": pd.to_numeric(js.get("volume", [0] * n), errors="coerce"),
+            },
+            index=ts,
+        )
+        return df.dropna(subset=["Open", "High", "Low", "Close"]).sort_index()
+    except Exception:
+        return pd.DataFrame()
+
+
+def dhan_fetch_candles(meta, interval, period, client_id, token):
+    """Fetches OHLCV candles from Dhan's charts API with NO artificial delay.
+    Intraday requests are chunked (Dhan caps a single intraday request at ~90
+    days). '1wk' is built by resampling daily candles."""
+    days = PERIOD_DAYS.get(period, 30)
+    to_d = datetime.now().date() + timedelta(days=1)
+    from_d = to_d - timedelta(days=days + 1)
+    headers = _dhan_headers(client_id, token)
+    try:
+        if interval in ("1d", "1wk"):
+            payload = {
+                "securityId": str(meta["security_id"]), "exchangeSegment": meta["segment"],
+                "instrument": meta["instrument"], "expiryCode": 0, "oi": False,
+                "fromDate": from_d.isoformat(), "toDate": to_d.isoformat(),
+            }
+            r = requests.post(f"{DHAN_API_BASE}/charts/historical", headers=headers, json=payload, timeout=20)
+            df = _dhan_arrays_to_df(r.json() if r.ok else None)
+            if interval == "1wk" and not df.empty:
+                df = df.resample("W-FRI").agg(
+                    {"Open": "first", "High": "max", "Low": "min", "Close": "last", "Volume": "sum"}
+                ).dropna()
+            return df
+
+        iv = DHAN_INTERVAL_MAP.get(interval)
+        if iv is None:
+            return pd.DataFrame()
+        chunks, cur_from = [], from_d
+        while cur_from < to_d:
+            cur_to = min(cur_from + timedelta(days=85), to_d)
+            payload = {
+                "securityId": str(meta["security_id"]), "exchangeSegment": meta["segment"],
+                "instrument": meta["instrument"], "interval": iv, "oi": False,
+                "fromDate": cur_from.isoformat(), "toDate": cur_to.isoformat(),
+            }
+            r = requests.post(f"{DHAN_API_BASE}/charts/intraday", headers=headers, json=payload, timeout=20)
+            part = _dhan_arrays_to_df(r.json() if r.ok else None)
+            if not part.empty:
+                chunks.append(part)
+            cur_from = cur_to
+        if not chunks:
+            return pd.DataFrame()
+        df = pd.concat(chunks)
+        return df[~df.index.duplicated(keep="last")].sort_index()
+    except Exception:
+        return pd.DataFrame()
+
+
+def dhan_fetch_ltp(meta, client_id, token):
+    """Last-traded price via Dhan's market-feed LTP endpoint (no delay)."""
+    try:
+        seg = meta["segment"] if meta.get("instrument") != "INDEX" else "IDX_I"
+        body = {seg: [int(meta["security_id"])]}
+        r = requests.post(f"{DHAN_API_BASE}/marketfeed/ltp", headers=_dhan_headers(client_id, token), json=body, timeout=8)
+        if not r.ok:
+            return None
+        seg_data = (r.json().get("data") or {}).get(seg) or {}
+        row = seg_data.get(str(meta["security_id"]))
+        if row is None and seg_data:
+            row = list(seg_data.values())[0]
+        if row and row.get("last_price") is not None:
+            return float(row["last_price"])
+    except Exception:
+        pass
+    return None
+
+
+def fetch_data(ticker, interval, period):
+    """DATA-SOURCE ROUTER. When 'Use Dhan Data Feed' is enabled (and a token
+    is present) fetches candles from Dhan with NO delay; any ticker Dhan can't
+    serve (BTC/ETH/commodities/…) or any failed Dhan call transparently falls
+    back to the original, rate-limited yfinance path."""
+    cfg = st.session_state.get("app_cfg", {})
+    if cfg.get("use_dhan_data") and cfg.get("dhan_access_token"):
+        meta = dhan_data_meta(ticker)
+        if meta is not None:
+            df = dhan_fetch_candles(meta, interval, period, cfg.get("dhan_client_id", ""), cfg["dhan_access_token"])
+            if df is not None and not df.empty:
+                return df
+    return fetch_data_yf(ticker, interval, period)
+
+
+def send_email_notification(subject, body):
+    """Fires an email via Gmail SMTP (app password) when the email-notification
+    checkbox is enabled. Never raises — a mail failure must not break trading."""
+    cfg = st.session_state.get("app_cfg", {})
+    if not cfg.get("email_enabled"):
+        return
+    sender = str(cfg.get("email_from", "")).strip()
+    to = str(cfg.get("email_to", "")).strip()
+    pwd = str(cfg.get("email_app_password", "")).strip()
+    if not (sender and to and pwd):
+        return
+    try:
+        msg = MIMEText(body)
+        msg["Subject"] = subject
+        msg["From"] = sender
+        msg["To"] = to
+        recipients = [a.strip() for a in to.replace(";", ",").split(",") if a.strip()]
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465, context=ssl.create_default_context(), timeout=15) as server:
+            server.login(sender, pwd)
+            server.sendmail(sender, recipients, msg.as_string())
+    except Exception as exc:
+        st.warning(f"📧 Email notification failed: {exc}")
 
 
 @st.cache_data(ttl=300, show_spinner=False)
@@ -462,20 +792,13 @@ def live_position_fragment(ticker, label="LTP"):
     remaining quantity. This is the minimum live-trading readout; before this
     fix you'd have had to compute PnL in your head from LTP vs entry.
     """
-    time.sleep(RATE_LIMIT_DELAY)
-    ltp = None
-    try:
-        data = yf.Ticker(ticker).history(period="1d", interval="1m")
-        if data is None or data.empty:
-            data = yf.Ticker(ticker).history(period="5d", interval="15m")
-        if data is not None and not data.empty:
-            ltp = float(data["Close"].iloc[-1])
-            prev = float(data["Close"].iloc[-2]) if len(data) > 1 else ltp
-            st.metric(label, f"{ltp:,.2f}", f"{ltp - prev:+.2f}")
-        else:
-            st.info("No live data returned yet.")
-    except Exception as exc:
-        st.warning(f"Fetch issue (rate limit or symbol): {exc}")
+    ltp = get_live_ltp(ticker)  # routes to Dhan (no delay) or yfinance (0.3s delay)
+    if ltp is not None:
+        prev = st.session_state.get("_ltp_prev")
+        st.metric(label, f"{ltp:,.2f}", f"{(ltp - prev):+.2f}" if prev is not None else None)
+        st.session_state["_ltp_prev"] = ltp
+    else:
+        st.info("No live data returned yet.")
 
     positions = st.session_state.get("live_positions", [])
     if positions and ltp is not None:
@@ -1121,12 +1444,18 @@ def get_live_ltp(ticker):
     fetch_data() used for candle/indicator data (that cache has a 30s TTL,
     fine for indicators, too stale for a live SL/Target trigger check).
 
-    *** PLUG POINT FOR YOUR DHAN INTEGRATION ***
-    Replace the body of this function with a call to Dhan's live market-data
-    feed/quote endpoint and every SL/Target check in evaluate_live_signal()
-    will automatically use that real tick instead of this yfinance fallback —
-    nothing else needs to change.
+    When 'Use Dhan Data Feed' is enabled, this hits Dhan's market-feed LTP
+    endpoint with NO delay; otherwise (or on any Dhan failure / unsupported
+    ticker like BTC/ETH) it falls back to the original rate-limited yfinance
+    path — every SL/Target check automatically uses whichever tick came back.
     """
+    cfg = st.session_state.get("app_cfg", {})
+    if cfg.get("use_dhan_data") and cfg.get("dhan_access_token"):
+        meta = dhan_data_meta(ticker)
+        if meta is not None:
+            ltp = dhan_fetch_ltp(meta, cfg.get("dhan_client_id", ""), cfg["dhan_access_token"])
+            if ltp is not None:
+                return ltp
     time.sleep(RATE_LIMIT_DELAY)
     try:
         data = yf.Ticker(ticker).history(period="1d", interval="1m")
@@ -1480,335 +1809,641 @@ def recommend_from_metrics(m):
 # DHAN BROKER PLACEHOLDER
 # ============================================================================
 
-def place_dhan_order(client_id, access_token, security_id, txn_type, product_cfg, qty, price=0.0, order_type="MARKET"):
+def place_dhan_order(client_id, access_token, security_id, txn_type, product_cfg, qty,
+                     price=0.0, order_type="MARKET", is_entry=True):
     """
-    Placeholder for Dhan Broker API (v2) integration.
-    Real endpoint: POST https://api.dhan.co/orders
-    Headers: {"access-token": <token>, "Content-Type": "application/json"}
-    Payload keys typically include dhanClientId, transactionType, exchangeSegment,
-    productType, orderType, securityId, quantity, price.
-
-    This stub NEVER calls the network. Wire in `requests.post(...)` yourself
-    only after validating credentials in Dhan's sandbox environment.
+    Places a REAL order via Dhan Broker API v2 (POST /v2/orders) when the Dhan
+    order-placement checkbox is enabled and an access token is present.
+    - Entry/exit order type (MARKET/LIMIT) comes from the config dropdowns.
+    - LIMIT orders carry the reference price; MARKET orders send price 0.
+    - When 'Use Broker SL/Target (Bracket Order)' is ON, ENTRY orders go out as
+      productType=BO with boStopLossValue / boProfitValue (+ trailingJump when
+      Trail SL Jump > 0 — 0 means trailing off).
+    Without a token, returns the fully-built payload as SIMULATED_NOT_SENT so
+    everything can be dry-run safely.
     """
+    use_bo = bool(product_cfg.get("bo_enabled")) and is_entry
     payload = {
-        "dhanClientId": client_id,
+        "dhanClientId": str(client_id),
+        "correlationId": f"algo{int(time.time() * 1000) % 10**12}",
         "transactionType": txn_type,
-        "exchangeSegment": product_cfg.get("exchange_segment"),
-        "productType": product_cfg.get("product"),
-        "orderType": order_type,
-        "securityId": security_id,
-        "quantity": qty,
-        "price": price,
-        "instrument": product_cfg.get("instrument"),
+        "exchangeSegment": product_cfg.get("exchange_segment", "NSE_EQ"),
+        "productType": "BO" if use_bo else product_cfg.get("product", "INTRADAY"),
+        "orderType": order_type if order_type in ("MARKET", "LIMIT") else "MARKET",
+        "validity": "DAY",
+        "securityId": str(security_id),
+        "quantity": int(qty),
+        "disclosedQuantity": 0,
+        "price": float(price) if order_type == "LIMIT" else 0.0,
+        "afterMarketOrder": False,
     }
-    return {"status": "SIMULATED_NOT_SENT", "payload": payload,
-            "note": "Live Dhan order call is disabled in this build — replace this stub with a requests.post call."}
+    if use_bo:
+        payload["boStopLossValue"] = float(product_cfg.get("bo_sl", 0.0))
+        payload["boProfitValue"] = float(product_cfg.get("bo_target", 0.0))
+        trail = float(product_cfg.get("bo_trail", 0.0))
+        if trail > 0:
+            payload["trailingJump"] = trail  # 0 = trailing off (field omitted)
+    if not access_token:
+        return {"status": "SIMULATED_NOT_SENT", "payload": payload,
+                "note": "No Dhan access token entered — order was built but NOT sent."}
+    try:
+        resp = requests.post(f"{DHAN_API_BASE}/orders",
+                             headers=_dhan_headers(client_id, access_token),
+                             json=payload, timeout=12)
+        try:
+            body = resp.json()
+        except ValueError:
+            body = {"raw": resp.text}
+        return {"status": "SENT", "http_status": resp.status_code, "request": payload, "response": body}
+    except Exception as exc:
+        return {"status": "ERROR", "error": str(exc), "payload": payload}
+
+
+def dhan_order_qty(product_cfg):
+    """Quantity to send on Dhan orders (the 'Dhan Quantity' input — independent
+    of the paper-trading Quantity in the main config)."""
+    try:
+        return max(1, int(product_cfg.get("dhan_qty", 1)))
+    except (TypeError, ValueError):
+        return 1
+
+
+def dhan_should_send_exit(product_cfg, reason):
+    """When a Bracket Order manages SL/Target at the broker, the broker's own
+    legs close the position on SL/Target — sending our own exit order too would
+    double-exit. Manual square-offs / signal exits are still sent."""
+    if product_cfg.get("bo_enabled") and reason and ("Stoploss Hit" in str(reason) or "Target Hit" in str(reason)):
+        return False
+    return True
 
 
 def resolve_dhan_order_leg(direction, is_entry, fallback_ticker, product_cfg):
     """
     Decides WHICH instrument to trade and which side (BUY/SELL) to send.
 
-    If "Auto-select CE/PE by signal direction" is on and both security IDs are
-    filled in: a LONG signal buys the CE leg, a SHORT signal buys the PE leg —
-    both are entered by BUYING (not selling) an option, which keeps risk
-    defined (no naked option writing baked into this default). Exiting always
-    SELLs whichever leg is currently open.
+    Options instruments: a LONG signal BUYs the CE leg, a SHORT signal BUYs the
+    PE leg — both are entered by BUYING (not selling) an option, which keeps
+    risk defined (no naked option writing baked into this default). Exiting
+    always SELLs whichever leg is currently open. CE/PE security IDs are
+    resolved automatically from the scrip master (expiry + strike + type).
 
-    Otherwise, falls back to trading the underlying ticker directly: BUY to
+    Stocks / futures: uses the configured (auto-fetched) security ID — BUY to
     open long / SELL to close it, SELL to open short / BUY to close it.
     """
-    use_ce_pe = (
-        product_cfg.get("auto_ce_pe")
-        and product_cfg.get("ce_security_id")
-        and product_cfg.get("pe_security_id")
-    )
-    if use_ce_pe:
-        security_id = product_cfg["ce_security_id"] if direction == 1 else product_cfg["pe_security_id"]
+    inst = str(product_cfg.get("instrument", ""))
+    if "Options" in inst:
+        security_id = product_cfg.get("ce_security_id") if direction == 1 else product_cfg.get("pe_security_id")
         txn_type = "BUY" if is_entry else "SELL"
-        return security_id, txn_type
+        return (security_id or fallback_ticker), txn_type
 
+    security_id = product_cfg.get("security_id") or fallback_ticker
     if is_entry:
         txn_type = "BUY" if direction == 1 else "SELL"
     else:
         txn_type = "SELL" if direction == 1 else "BUY"
-    return fallback_ticker, txn_type
+    return security_id, txn_type
 
 
 # ============================================================================
-# SIDEBAR
+# CONFIGURATION PANEL — a SINGLE definition rendered in TWO places: the
+# sidebar AND the "🛠 Admin Panel" tab. Every widget is two-way synced through
+# st.session_state.app_cfg, so changing a value in either place instantly
+# updates the other (and everything downstream) — exactly the same controls,
+# exactly the same behavior.
 # ============================================================================
 
-ov = st.session_state.sidebar_overrides
+def _cfg_store(wkey, name):
+    st.session_state.app_cfg[name] = st.session_state[wkey]
+
+
+def _seed_widget(prefix, name, value):
+    """Force the widget's session value from the central config store BEFORE
+    the widget is instantiated — this is what keeps the sidebar copy and the
+    Admin Panel copy of every control perfectly in sync."""
+    wkey = f"{prefix}::{name}"
+    st.session_state[wkey] = value
+    return wkey
+
+
+def cfg_checkbox(ui, prefix, name, label, default=False, help=None):
+    wkey = _seed_widget(prefix, name, bool(st.session_state.app_cfg.get(name, default)))
+    return ui.checkbox(label, key=wkey, on_change=_cfg_store, args=(wkey, name), help=help)
+
+
+def cfg_selectbox(ui, prefix, name, label, options, default=None, help=None):
+    options = list(options)
+    if not options:
+        options = [""]
+    cur = st.session_state.app_cfg.get(name, default if default is not None else options[0])
+    if cur not in options:
+        cur = default if default in options else options[0]
+    wkey = _seed_widget(prefix, name, cur)
+    return ui.selectbox(label, options, key=wkey, on_change=_cfg_store, args=(wkey, name), help=help)
+
+
+def cfg_number(ui, prefix, name, label, min_value=None, max_value=None, default=0.0, step=None, help=None):
+    as_float = any(isinstance(x, float) for x in (min_value, max_value, step, default))
+    cur = st.session_state.app_cfg.get(name, default)
+    try:
+        cur = float(cur) if as_float else int(cur)
+    except (TypeError, ValueError):
+        cur = default
+    if min_value is not None:
+        cur = max(cur, min_value)
+    if max_value is not None:
+        cur = min(cur, max_value)
+    wkey = _seed_widget(prefix, name, cur)
+    return ui.number_input(label, min_value=min_value, max_value=max_value, step=step,
+                           key=wkey, on_change=_cfg_store, args=(wkey, name), help=help)
+
+
+def cfg_text(ui, prefix, name, label, default="", help=None, password=False):
+    wkey = _seed_widget(prefix, name, str(st.session_state.app_cfg.get(name, default)))
+    kwargs = dict(key=wkey, on_change=_cfg_store, args=(wkey, name), help=help)
+    if password:
+        kwargs["type"] = "password"
+    return ui.text_input(label, **kwargs)
+
+
+def cfg_slider(ui, prefix, name, label, min_value, max_value, default):
+    try:
+        cur = int(st.session_state.app_cfg.get(name, default))
+    except (TypeError, ValueError):
+        cur = default
+    cur = min(max(cur, min_value), max_value)
+    wkey = _seed_widget(prefix, name, cur)
+    return ui.slider(label, min_value, max_value, key=wkey, on_change=_cfg_store, args=(wkey, name))
+
+
+def auto_populate_dhan_defaults():
+    """Auto-fetches Dhan defaults whenever the (ticker, instrument, expiry)
+    combination changes: security IDs from the scrip master, nearest F&O
+    expiries, ATM CE/PE strikes (from live LTP), and default quantities
+    (65 Nifty / 35 BankNifty / 20 Sensex for index options; contract lot size
+    for futures/stock options). Everything stays editable afterwards."""
+    cfg = st.session_state.app_cfg
+    if not (cfg.get("dhan_enabled") or cfg.get("use_dhan_data")):
+        return
+    tkr_choice = cfg.get("ticker_choice", "Nifty50")
+    tkr = TICKER_MAP.get(tkr_choice) if tkr_choice != "Custom" else None
+    if tkr is None:
+        tkr = cfg.get("custom_ticker", "KAYNES.NS")
+    inst = cfg.get("dhan_instrument", "Stock Intraday")
+    underlying = dhan_underlying_symbol(tkr_choice, tkr)
+    exch = "BSE" if (tkr_choice == "Sensex" or str(tkr).upper().endswith(".BO")) else "NSE"
+    base_sig = (tkr_choice, tkr, inst)
+    full_sig = base_sig + (cfg.get("dhan_opt_expiry", ""),)
+    if cfg.get("_dhan_auto_sig") == full_sig:
+        return
+    try:
+        if inst in ("Stock Intraday", "Stock Delivery"):
+            sid = lookup_equity_security_id(underlying, exch)
+            if sid and (cfg.get("_dhan_sid_auto_for") != base_sig or not cfg.get("dhan_security_id")):
+                cfg["dhan_security_id"] = sid
+                cfg["_dhan_sid_auto_for"] = base_sig
+        elif inst in ("Stock Futures", "Index Futures"):
+            expiries = dhan_expiry_list(underlying, "FUT")
+            cfg["_dhan_fut_expiries"] = expiries
+            if expiries and cfg.get("dhan_expiry") not in expiries:
+                cfg["dhan_expiry"] = expiries[0]
+            sid = lookup_future_security_id(underlying, cfg.get("dhan_expiry", ""))
+            if sid:
+                cfg["dhan_security_id"] = sid
+                cfg["_dhan_sid_auto_for"] = base_sig
+            if cfg.get("_dhan_qty_auto_for") != base_sig:
+                lot = dhan_lot_size(underlying, "FUT", cfg.get("dhan_expiry", ""))
+                if lot:
+                    cfg["dhan_qty"] = lot
+                cfg["_dhan_qty_auto_for"] = base_sig
+        else:  # Stock Options / Index Options
+            expiries = dhan_expiry_list(underlying, "OPT")
+            cfg["_dhan_opt_expiries"] = expiries
+            if expiries and cfg.get("dhan_opt_expiry") not in expiries:
+                cfg["dhan_opt_expiry"] = expiries[0]
+            strikes = dhan_option_strikes(underlying, cfg.get("dhan_opt_expiry", ""))
+            if cfg.get("_dhan_strike_auto_for") != base_sig:
+                ltp = get_live_ltp(tkr)
+                if strikes and ltp is not None:
+                    atm = float(min(strikes, key=lambda s: abs(s - ltp)))
+                    cfg["dhan_ce_strike"] = atm
+                    cfg["dhan_pe_strike"] = atm
+                cfg["_dhan_strike_auto_for"] = base_sig
+            if cfg.get("_dhan_qty_auto_for") != base_sig:
+                default_lot = INDEX_OPTION_LOT_DEFAULTS.get(underlying)
+                if not default_lot:
+                    default_lot = dhan_lot_size(underlying, "OPT", cfg.get("dhan_opt_expiry", "")) or 1
+                cfg["dhan_qty"] = default_lot
+                cfg["_dhan_qty_auto_for"] = base_sig
+    except Exception:
+        pass
+    cfg["_dhan_auto_sig"] = full_sig
+
+
+def render_config_panel(ui, prefix):
+    """Renders EVERY configuration control into `ui` (st.sidebar or the Admin
+    Panel tab). `prefix` keeps the two copies' widget keys distinct while the
+    shared app_cfg store keeps their VALUES identical."""
+    cfg = st.session_state.app_cfg
+
+    # ------------------------------------------------------------ Data source
+    ui.markdown("### 📡 Data Source")
+    use_dhan_data = cfg_checkbox(
+        ui, prefix, "use_dhan_data", "Use Dhan Data Feed (instead of yfinance)", default=False,
+        help="yfinance keeps its mandatory 0.3s delay per call (API rate limits). "
+             "Dhan has no such limit, so the Dhan path applies NO delay at all.",
+    )
+    if use_dhan_data:
+        ui.caption("⚡ Dhan feed active — zero delay. Tickers Dhan can't serve (BTC-USD, ETH-USD, "
+                   "USDINR, Gold/Silver futures, …) automatically fall back to yfinance.")
+    else:
+        ui.caption("Default: yfinance with a fixed 0.3s delay per API call (rate-limit protection).")
+
+    dhan_creds_needed = use_dhan_data or cfg.get("dhan_enabled", False)
+    if dhan_creds_needed:
+        ui.markdown("**🔐 Dhan Account** (shared by the data feed and order placement)")
+        cfg_text(ui, prefix, "dhan_client_id", "Dhan Client ID", default="1104779876")
+        cfg_text(ui, prefix, "dhan_access_token", "Dhan Access Token", default="", password=True)
+        if use_dhan_data and not cfg.get("dhan_access_token"):
+            ui.warning("Enter a Dhan access token — without it the app silently keeps using yfinance.")
+
+    # -------------------------------------------------------------- Instrument
+    ui.markdown("### 🎯 Instrument & Data")
+    ticker_choice = cfg_selectbox(ui, prefix, "ticker_choice", "Ticker", list(TICKER_MAP.keys()), default="Nifty50")
+    if ticker_choice == "Custom":
+        cfg_text(ui, prefix, "custom_ticker", "Custom Ticker (Yahoo Finance symbol)", default="KAYNES.NS")
+
+    interval = cfg_selectbox(ui, prefix, "interval", "Timeframe", list(TF_PERIOD_MAP.keys()), default="1m")
+    periods_available = TF_PERIOD_MAP[interval]
+    cfg_selectbox(ui, prefix, "period", "Period", periods_available,
+                  default="7d" if "7d" in periods_available else periods_available[0])
+    cfg_number(ui, prefix, "qty", "Quantity", min_value=1, default=1, step=1)
+
+    # ---------------------------------------------------------------- Strategy
+    ui.markdown("### 📐 Strategy")
+    strategy = cfg_selectbox(ui, prefix, "strategy", "Strategy", STRATEGIES)
+
+    if strategy in ("EMA Crossover", "Pro: EMA50 Trend + EMA9/15 Pullback"):
+        cfg_number(ui, prefix, "ema_fast", "EMA Fast", 2, 100, 9)
+        cfg_number(ui, prefix, "ema_slow", "EMA Slow", 3, 200, 15)
+    if strategy == "Threshold Cross":
+        cfg_number(ui, prefix, "threshold", "Threshold Price", default=0.0)
+    if strategy == "Price Action Support/Resistance":
+        cfg_number(ui, prefix, "sr_window", "S/R Lookback", 5, 200, 20)
+    if strategy == "Liquidity Grab Reversal":
+        cfg_number(ui, prefix, "liq_window", "Liquidity Lookback", 5, 200, 20)
+    if strategy == "RSI Cross":
+        cfg_number(ui, prefix, "rsi_period", "RSI Period", 2, 50, 14)
+    if strategy in ("Bollinger Bands", "Pro: BB+RSI Mean Reversion (ATR filtered)"):
+        cfg_number(ui, prefix, "bb_period", "BB Period", 5, 100, 20)
+        cfg_number(ui, prefix, "bb_std", "BB Std Dev", 1.0, 4.0, 2.0)
+    if strategy == "Volume Breakout":
+        cfg_number(ui, prefix, "vol_window", "Volume Lookback", 5, 100, 20)
+        cfg_number(ui, prefix, "vol_factor", "Volume Spike Factor", 1.0, 5.0, 2.0)
+    if strategy == "Elliott Wave (Zigzag)":
+        cfg_number(ui, prefix, "zigzag_lookback", "Zigzag Lookback", 2, 20, 3)
+    if strategy == "Pro: VWAP + Supertrend Trend":
+        cfg_number(ui, prefix, "st_period", "Supertrend Period", 5, 50, 10)
+        cfg_number(ui, prefix, "st_mult", "Supertrend Multiplier", 1.0, 6.0, 3.0)
+    if strategy == "Pro: Opening Range Breakout + Volume":
+        cfg_number(ui, prefix, "orb_candles", "ORB Candles", 1, 30, 5)
+    if strategy == "Pro: MACD Crossover":
+        c1, c2, c3 = ui.columns(3)
+        cfg_number(c1, prefix, "macd_fast", "MACD Fast", 2, 50, 12)
+        cfg_number(c2, prefix, "macd_slow", "MACD Slow", 5, 100, 26)
+        cfg_number(c3, prefix, "macd_signal", "MACD Signal", 2, 30, 9)
+    if strategy == "Pro: Donchian Channel Breakout":
+        cfg_number(ui, prefix, "donchian_period", "Donchian Period", 5, 100, 20)
+    if strategy == "Pro: Keltner Squeeze Breakout":
+        c1, c2 = ui.columns(2)
+        cfg_number(c1, prefix, "keltner_period", "Keltner Period", 5, 50, 20)
+        cfg_number(c2, prefix, "keltner_atr_mult", "Keltner ATR Mult", 0.5, 4.0, 1.5)
+    if strategy == "Pro: Stochastic Reversal":
+        c1, c2 = ui.columns(2)
+        cfg_number(c1, prefix, "stoch_k", "Stochastic %K Period", 2, 50, 14)
+        cfg_number(c2, prefix, "stoch_d", "Stochastic %D Period", 2, 20, 3)
+    if strategy == "Pro: TEMA Trend Flip":
+        cfg_number(ui, prefix, "tema_period", "TEMA Period", 5, 100, 20)
+    if strategy == "Pro: CCI Extreme Reversal":
+        cfg_number(ui, prefix, "cci_period", "CCI Period", 5, 100, 20)
+
+    if strategy in PRO_STRATEGIES:
+        ui.caption("💡 Professional-grade composite strategy (trend/volatility/liquidity confluence). Not a guarantee of profitability — validate in the Optimization tab first.")
+
+    # ---------------------------------------------------------------- Stoploss
+    ui.markdown("### 🛑 Stoploss")
+    sl_type = cfg_selectbox(ui, prefix, "sl_type", "Stoploss Type", SL_TYPES)
+    cfg_number(ui, prefix, "sl_points", "SL Points (base)", 0.1, 100000.0, 10.0)
+    if sl_type == "ATR Based SL":
+        cfg_number(ui, prefix, "atr_mult_sl", "ATR Multiplier (SL)", 0.5, 5.0, 1.5)
+    if sl_type == "Loss Recovery SL (Give-back)":
+        c1, c2 = ui.columns(2)
+        cfg_number(c1, prefix, "loss_trigger_points", "Loss trigger (points)", 1.0, 100000.0, 20.0)
+        cfg_number(c2, prefix, "min_recovery_pct", "Min recovery required (%)", 1.0, 100.0, 50.0)
+        ui.caption(f"Once floating loss reaches {cfg.get('loss_trigger_points', 20.0):.0f} pts, exit if price hasn't recovered at least {cfg.get('min_recovery_pct', 50.0):.0f}% of that loss back toward entry.")
+
+    # ------------------------------------------------------------------ Target
+    ui.markdown("### 🎯 Target")
+    target_type = cfg_selectbox(ui, prefix, "target_type", "Target Type", TARGET_TYPES)
+    cfg_number(ui, prefix, "target_points", "Target Points (base)", 0.1, 200000.0, 20.0)
+    if target_type == "ATR Based Target":
+        cfg_number(ui, prefix, "atr_mult_target", "ATR Multiplier (Target)", 1.0, 8.0, 3.0)
+    if target_type == "Profit Giveback Target":
+        c1, c2 = ui.columns(2)
+        cfg_number(c1, prefix, "profit_trigger_points", "Profit trigger (points)", 1.0, 100000.0, 50.0)
+        cfg_number(c2, prefix, "giveback_pct", "Max giveback allowed (%)", 1.0, 100.0, 30.0)
+        ui.caption(f"Once floating profit peaks at ≥{cfg.get('profit_trigger_points', 50.0):.0f} pts, exit if it falls back by more than {cfg.get('giveback_pct', 30.0):.0f}% from that peak.")
+    if target_type == "Partial Book + Trail Remainder":
+        c1, c2 = ui.columns(2)
+        cfg_number(c1, prefix, "partial_target1_points", "Target 1 (points)", 0.1, 200000.0, 20.0)
+        cfg_number(c2, prefix, "partial_book_pct", "Qty % to book at Target 1", 1.0, 99.0, 50.0)
+        ui.caption(
+            f"Books {cfg.get('partial_book_pct', 50.0):.0f}% of quantity when Target 1 ({cfg.get('partial_target1_points', 20.0):.0f} pts) is hit; "
+            "the remainder keeps running under an ATR trailing stop with no fixed second target. "
+            "⚠️ With Quantity = 1, there's nothing left to trail after rounding — increase Quantity to actually see partial-booking behavior."
+        )
+    if sl_type == "Risk:Reward Based (min 1:2)" or target_type == "Risk:Reward Based (min 1:2)":
+        cfg_number(ui, prefix, "rr_ratio", "Risk:Reward Ratio (min 2)", 2.0, 10.0, 2.0)
+
+    # ------------------------------------------------------ Live exit engine
+    ui.markdown("### 🧮 Live Exit Engine")
+    live_candle_logic = cfg_checkbox(
+        ui, prefix, "live_candle_logic", "Backtest-style candle logic in LIVE trading", default=True,
+        help="ON (default): live trading exits use EXACTLY the backtest rules — entry at candle N+1 open; "
+             "LONG checks SL against the closed candle's LOW first, then Target against its HIGH; "
+             "SHORT checks SL against the HIGH first, then Target against the LOW. "
+             "OFF: the old tick behavior — SL checked against LTP first, then Target against LTP.",
+    )
+    if live_candle_logic:
+        ui.caption("🕯️ Live exits mirror the backtest: signal on candle N → entry at candle N+1 open; "
+                   "LONG → SL vs candle Low first, then Target vs candle High; "
+                   "SHORT → SL vs candle High first, then Target vs candle Low.")
+    else:
+        ui.caption("⚡ LTP tick mode: entry still at candle N+1 open, but SL is checked against the live LTP first, then Target against the LTP (both directions).")
+
+    # -------------------------------------------------------------- Time risk
+    ui.markdown("### ⏱ Time-Based Risk Control")
+    if cfg_checkbox(ui, prefix, "loss_duration_enabled", "Loss Holding Duration Exit", default=False):
+        c1, c2 = ui.columns(2)
+        cfg_number(c1, prefix, "loss_duration_min_minutes", "Min minutes in loss before acting", min_value=0.0, default=1.0, step=1.0)
+        cfg_number(c2, prefix, "loss_duration_max_minutes", "Safety ceiling (minutes)", min_value=0.0, default=5.0, step=1.0)
+        ui.caption(
+            "Exits as soon as the position has been continuously in a floating loss for at least the first number "
+            "of minutes. The second number is just an upper safety bound (mainly relevant to live polling delays) — "
+            "keep it ≥ the first. No cap is applied to how high you can set either value."
+        )
+
+    # ----------------------------------------------------------------- Filters
+    ui.markdown("### 🔍 Additional Entry Filters")
+    if cfg_checkbox(ui, prefix, "adx_enabled", "ADX Filter", default=False):
+        c1, c2 = ui.columns(2)
+        cfg_number(c1, prefix, "adx_min", "ADX Min", 0, 100, 20)
+        cfg_number(c2, prefix, "adx_max", "ADX Max", 0, 100, 100)
+    cfg_checkbox(ui, prefix, "rsi_enabled", "RSI Filter (30 up-cross buy / 70 down-cross sell)", default=False)
+    cfg_checkbox(ui, prefix, "bb_enabled", "Bollinger Band Filter", default=False)
+    cfg_checkbox(ui, prefix, "ema20_enabled", "EMA20 Filter", default=False)
+    cfg_checkbox(ui, prefix, "sma20_enabled", "SMA20 Filter", default=False)
+    cfg_checkbox(ui, prefix, "smc_enabled", "SMC (Structure Break) Filter", default=False)
+
+    if cfg_checkbox(ui, prefix, "atr_enabled", "ATR (Volatility) Filter", default=False):
+        c1, c2 = ui.columns(2)
+        cfg_number(c1, prefix, "atr_min", "ATR Min (points)", 0.0, 100000.0, 0.0)
+        cfg_number(c2, prefix, "atr_max", "ATR Max (points)", 0.0, 100000.0, 100000.0)
+        ui.caption("Only trade when 14-period ATR is inside this band — avoids dead/illiquid tape and blow-off volatility spikes.")
+
+    if cfg_checkbox(ui, prefix, "supertrend_enabled", "Supertrend Filter", default=False):
+        c1, c2 = ui.columns(2)
+        cfg_number(c1, prefix, "st_filter_period", "Supertrend Period (filter)", 5, 50, 10)
+        cfg_number(c2, prefix, "st_filter_mult", "Supertrend Mult (filter)", 1.0, 6.0, 3.0)
+        ui.caption("Only takes buys when Supertrend is bullish, sells when Supertrend is bearish — independent of the main strategy.")
+
+    if cfg_checkbox(ui, prefix, "regime_enabled", "Regime Filter (Trend vs Range, adaptive)", default=False):
+        c1, c2 = ui.columns(2)
+        cfg_number(c1, prefix, "regime_trend_min", "ADX ≥ this = Trending", 10, 60, 25)
+        cfg_number(c2, prefix, "regime_range_max", "ADX ≤ this = Ranging", 5, 40, 20)
+        ui.caption(
+            "Trend-type strategies (EMA/Supertrend/ORB/S-R/EW) only fire when ADX confirms a trend; "
+            "mean-reversion strategies (RSI/Bollinger/Liquidity/BB+RSI) only fire when ADX confirms a range. "
+            "This is the 'adapt to changing market regime' control — it doesn't switch strategies for you, "
+            "it stops your chosen strategy from firing in the regime it's known to perform badly in."
+        )
+
+    if cfg_checkbox(ui, prefix, "angle_enabled", "Angle of Crossover Filter", default=False):
+        cfg_number(ui, prefix, "angle_min_deg", "Minimum crossover angle (degrees, absolute value)", min_value=0.0, default=0.0, step=1.0)
+        ui.caption(
+            f"Only accepts an EMA{cfg.get('ema_fast', 9)}/{cfg.get('ema_slow', 15)} crossover if it's steep enough. "
+            "Angle is normalized against ATR (there's no universal 'degrees' for a raw price slope), so treat it as a "
+            "relative steepness score, not a standardized industry figure. Absolute value is used since valid crosses "
+            "can produce a negative raw slope depending on direction."
+        )
+
+    if cfg_checkbox(ui, prefix, "crossover_quality_enabled", "Crossover Confirmation Filter", default=False):
+        mode = cfg_selectbox(ui, prefix, "crossover_quality_mode", "Confirmation type",
+                             ["Simple Crossover", "Crossover with Candle Size", "Crossover with ATR-based Candle Size"])
+        if mode == "Crossover with Candle Size":
+            cfg_number(ui, prefix, "crossover_min_points", "Min candle range (points)", min_value=0.0, default=1.0, step=0.5)
+        elif mode == "Crossover with ATR-based Candle Size":
+            cfg_number(ui, prefix, "crossover_atr_mult", "Min candle range (× ATR)", min_value=0.1, default=1.0, step=0.1)
+        ui.caption(f"Only accepts an EMA{cfg.get('ema_fast', 9)}/{cfg.get('ema_slow', 15)} crossover bar that also clears this candle-size bar — filters out crosses on tiny, indecisive candles.")
+
+    if cfg_checkbox(ui, prefix, "vix_enabled", "India VIX Filter", default=False):
+        c1, c2 = ui.columns(2)
+        cfg_number(c1, prefix, "vix_min", "VIX Min", 0.0, 100.0, 10.0)
+        cfg_number(c2, prefix, "vix_max", "VIX Max", 0.0, 100.0, 25.0)
+        ui.caption(
+            "India VIX is a fear/expected-volatility gauge, not a price indicator — you don't need to be an expert to "
+            "use it as a simple filter here. Rough rule of thumb: below ~15 = calm (often better for trend-following), "
+            "15–20 = normal, 20–30 = elevated/nervous (often better for mean-reversion or smaller size), above ~30 = "
+            "panic (many systems sit out entirely). Defaults above (10–25) are a conservative 'avoid extremes' band — "
+            "adjust to taste. VIX only publishes daily, so intraday timeframes reuse the latest known daily value."
+        )
+
+    # -------------------------------------------------------------- Smart eval
+    ui.markdown("### 🧠 Smart Evaluation (Recommended Before Going Live)")
+    ui.caption("Off by default. Turn these on to get a more honest read on whether a config is likely to hold up out-of-sample and after real costs.")
+
+    if cfg_checkbox(ui, prefix, "wf_enabled", "Enable Walk-Forward Validation", default=False):
+        cfg_slider(ui, prefix, "wf_folds", "Number of sequential out-of-sample folds", 3, 10, 5)
+        ui.caption("Splits the backtest period into N sequential chunks and checks whether the edge holds up across most of them, not just in aggregate.")
+
+    if cfg_checkbox(ui, prefix, "cost_enabled", "Enable Realistic Cost Modeling", default=False):
+        cfg_number(ui, prefix, "slippage_points", "Slippage per trade (points)", 0.0, 10000.0, 1.0)
+        cfg_number(ui, prefix, "spread_points", "Bid-Ask spread cost (points)", 0.0, 10000.0, 0.5)
+        cfg_number(ui, prefix, "brokerage_flat", "Brokerage per order leg (currency)", 0.0, 10000.0, 20.0)
+        ui.caption("Deducted from every trade: (slippage + spread) in points, plus brokerage charged twice per round trip (entry + exit).")
+
+    # ------------------------------------------------------------- Dhan orders
+    ui.markdown("### 🏦 Dhan Broker — Live Order Placement")
+    dhan_enabled = cfg_checkbox(ui, prefix, "dhan_enabled", "Enable Dhan Order Placement (LIVE)", default=False)
+    if dhan_enabled:
+        ui.warning("⚠️ REAL orders will be sent to Dhan using the credentials above once an access token is entered. Without a token, orders are only simulated (payload shown, nothing sent).")
+        if not use_dhan_data:
+            ui.caption("Using the Dhan Client ID / Access Token from the 🔐 Dhan Account section above.")
+
+        inst = cfg_selectbox(ui, prefix, "dhan_instrument", "Instrument", DHAN_INSTRUMENTS, default="Stock Intraday")
+
+        if inst in ("Stock Intraday", "Stock Delivery", "Stock Futures", "Index Futures"):
+            cfg_text(ui, prefix, "dhan_security_id", "Security ID (auto-fetched from Dhan scrip master — editable)", default="")
+            if "Futures" in inst:
+                fut_opts = cfg.get("_dhan_fut_expiries") or []
+                if fut_opts:
+                    cfg_selectbox(ui, prefix, "dhan_expiry", "Expiry Date (auto-fetched)", fut_opts)
+                else:
+                    cfg_text(ui, prefix, "dhan_expiry", "Expiry Date (YYYY-MM-DD)", default="")
+            c1, c2 = ui.columns(2)
+            cfg_selectbox(c1, prefix, "dhan_entry_order_type", "Entry Order Type", ["MARKET", "LIMIT"], default="MARKET")
+            cfg_selectbox(c2, prefix, "dhan_exit_order_type", "Exit Order Type", ["MARKET", "LIMIT"], default="MARKET")
+            cfg_number(ui, prefix, "dhan_qty", "Dhan Quantity", min_value=1, default=1, step=1)
+            if cfg_checkbox(ui, prefix, "dhan_bo_enabled", "Use Broker SL/Target (Bracket Order)", default=False):
+                b1, b2, b3 = ui.columns(3)
+                cfg_number(b1, prefix, "dhan_bo_sl", "SL Points (boStopLossValue)", min_value=0.0, default=10.0, step=0.5)
+                cfg_number(b2, prefix, "dhan_bo_target", "Target Points (boProfitValue)", min_value=0.0, default=20.0, step=0.5)
+                cfg_number(b3, prefix, "dhan_bo_trail", "Trail SL Jump (0 = off)", min_value=0.0, default=0.0, step=0.5)
+                ui.caption("Entry orders go out as Bracket Orders (productType=BO) — the BROKER then manages SL/Target legs "
+                           "with these point distances. The app skips sending its own exit order on SL/Target hits to avoid "
+                           "double exits (manual square-offs and signal exits are still sent).")
+        else:  # Stock Options / Index Options
+            opt_opts = cfg.get("_dhan_opt_expiries") or []
+            if opt_opts:
+                cfg_selectbox(ui, prefix, "dhan_opt_expiry", "Expiry Date (auto-fetched)", opt_opts)
+            else:
+                cfg_text(ui, prefix, "dhan_opt_expiry", "Expiry Date (YYYY-MM-DD)", default="")
+            c1, c2 = ui.columns(2)
+            cfg_number(c1, prefix, "dhan_ce_strike", "CE Strike Price (default ATM)", min_value=0.0, default=0.0, step=50.0)
+            cfg_number(c2, prefix, "dhan_pe_strike", "PE Strike Price (default ATM)", min_value=0.0, default=0.0, step=50.0)
+            cfg_number(ui, prefix, "dhan_qty", "Dhan Quantity (lot size — 65 Nifty / 35 BankNifty / 20 Sensex by default)",
+                       min_value=1, default=1, step=1)
+            c3, c4 = ui.columns(2)
+            cfg_selectbox(c3, prefix, "dhan_entry_order_type", "Entry Order Type", ["MARKET", "LIMIT"], default="MARKET")
+            cfg_selectbox(c4, prefix, "dhan_exit_order_type", "Exit Order Type", ["MARKET", "LIMIT"], default="MARKET")
+            ui.caption("LONG signal → BUYs the CE leg; SHORT signal → BUYs the PE leg (buying both ways keeps risk defined — "
+                       "no naked option selling). Exits SELL whichever leg is open. Strikes default to ATM (from live LTP) "
+                       "and expiry to the nearest available — both editable.")
+    else:
+        ui.caption("Disabled by default. Live trading tab runs in paper/simulation mode until enabled.")
+
+    # ------------------------------------------------------------------ Email
+    ui.markdown("### 📧 Email Notifications")
+    if cfg_checkbox(ui, prefix, "email_enabled", "Send Email Notification (entries / exits / square-offs)", default=False):
+        cfg_text(ui, prefix, "email_from", "From (Gmail address)", default="srinivas.trml@gmail.com")
+        cfg_text(ui, prefix, "email_to", "To (comma-separated for multiple)", default="")
+        cfg_text(ui, prefix, "email_app_password", "Gmail App Password", default="", password=True)
+        ui.caption("Uses Gmail SMTP with an App Password (Google Account → Security → 2-Step Verification → App passwords). "
+                   "A mail failure never blocks trading — it just shows a warning.")
+
+
+# ---------------------------------------------------------------------------
+# Render the SIDEBAR copy of the config panel, then derive every runtime value
+# the rest of the app uses from the shared store.
+# ---------------------------------------------------------------------------
+
 st.sidebar.title("⚙️ Algo Configuration")
-
-if ov:
+if st.session_state.pop("_cfg_applied_msg", False):
     st.sidebar.success("Optimized config applied ✅")
 
-ticker_names = list(TICKER_MAP.keys())
-ticker_choice = st.sidebar.selectbox(
-    "Ticker", ticker_names,
-    index=ticker_names.index(ov.get("ticker_choice")) if ov.get("ticker_choice") in ticker_names else 0,
-)
-if ticker_choice == "Custom":
-    ticker = st.sidebar.text_input("Custom Ticker (Yahoo Finance symbol)", ov.get("ticker", "KAYNES.NS"))
-else:
-    ticker = TICKER_MAP[ticker_choice]
+auto_populate_dhan_defaults()
+render_config_panel(st.sidebar, "sb")
 
-intervals = list(TF_PERIOD_MAP.keys())
-interval = st.sidebar.selectbox(
-    "Timeframe", intervals,
-    index=intervals.index(ov.get("interval")) if ov.get("interval") in intervals else intervals.index("1m"),
-)
-periods_available = TF_PERIOD_MAP[interval]
-_default_period_idx = periods_available.index("7d") if "7d" in periods_available else 0
-period = st.sidebar.selectbox(
-    "Period", periods_available,
-    index=periods_available.index(ov.get("period")) if ov.get("period") in periods_available else _default_period_idx,
-)
+cfg = st.session_state.app_cfg
 
-qty = st.sidebar.number_input("Quantity", min_value=1, value=int(ov.get("qty", 1)), step=1)
+ticker_choice = cfg.get("ticker_choice", "Nifty50")
+ticker = TICKER_MAP[ticker_choice] if ticker_choice != "Custom" and ticker_choice in TICKER_MAP else None
+if ticker is None:
+    ticker = cfg.get("custom_ticker", "KAYNES.NS")
+interval = cfg.get("interval", "1m")
+_periods_avail = TF_PERIOD_MAP.get(interval, ["7d"])
+period = cfg.get("period") if cfg.get("period") in _periods_avail else ("7d" if "7d" in _periods_avail else _periods_avail[0])
+qty = max(1, int(cfg.get("qty", 1)))
+strategy = cfg.get("strategy", STRATEGIES[0])
+sl_type = cfg.get("sl_type", SL_TYPES[0])
+target_type = cfg.get("target_type", TARGET_TYPES[0])
 
-st.sidebar.markdown("### 📐 Strategy")
-strategy = st.sidebar.selectbox(
-    "Strategy", STRATEGIES,
-    index=STRATEGIES.index(ov.get("strategy")) if ov.get("strategy") in STRATEGIES else 0,
-)
+PARAM_DEFAULTS = {
+    "ema_fast": 9, "ema_slow": 15, "threshold": 0.0, "sr_window": 20, "liq_window": 20,
+    "rsi_period": 14, "bb_period": 20, "bb_std": 2.0, "vol_window": 20, "vol_factor": 2.0,
+    "zigzag_lookback": 3, "st_period": 10, "st_mult": 3.0, "orb_candles": 5,
+    "macd_fast": 12, "macd_slow": 26, "macd_signal": 9, "donchian_period": 20,
+    "keltner_period": 20, "keltner_atr_mult": 1.5, "stoch_k": 14, "stoch_d": 3,
+    "tema_period": 20, "cci_period": 20,
+    "sl_points": 10.0, "atr_mult_sl": 1.5, "loss_trigger_points": 20.0, "min_recovery_pct": 50.0,
+    "target_points": 20.0, "atr_mult_target": 3.0, "profit_trigger_points": 50.0, "giveback_pct": 30.0,
+    "partial_target1_points": 20.0, "partial_book_pct": 50.0, "rr_ratio": 2.0,
+}
+params = {k: cfg.get(k, d) for k, d in PARAM_DEFAULTS.items()}
 
-params = {"ema_fast": ov.get("ema_fast", 9), "ema_slow": ov.get("ema_slow", 15)}
-
-if strategy in ("EMA Crossover", "Pro: EMA50 Trend + EMA9/15 Pullback"):
-    params["ema_fast"] = st.sidebar.number_input("EMA Fast", 2, 100, int(ov.get("ema_fast", 9)))
-    params["ema_slow"] = st.sidebar.number_input("EMA Slow", 3, 200, int(ov.get("ema_slow", 15)))
-if strategy == "Threshold Cross":
-    params["threshold"] = st.sidebar.number_input("Threshold Price", value=float(ov.get("threshold", 0.0)))
-if strategy == "Price Action Support/Resistance":
-    params["sr_window"] = st.sidebar.number_input("S/R Lookback", 5, 200, int(ov.get("sr_window", 20)))
-if strategy == "Liquidity Grab Reversal":
-    params["liq_window"] = st.sidebar.number_input("Liquidity Lookback", 5, 200, int(ov.get("liq_window", 20)))
-if strategy == "RSI Cross":
-    params["rsi_period"] = st.sidebar.number_input("RSI Period", 2, 50, int(ov.get("rsi_period", 14)))
-if strategy in ("Bollinger Bands", "Pro: BB+RSI Mean Reversion (ATR filtered)"):
-    params["bb_period"] = st.sidebar.number_input("BB Period", 5, 100, int(ov.get("bb_period", 20)))
-    params["bb_std"] = st.sidebar.number_input("BB Std Dev", 1.0, 4.0, float(ov.get("bb_std", 2.0)))
-if strategy == "Volume Breakout":
-    params["vol_window"] = st.sidebar.number_input("Volume Lookback", 5, 100, int(ov.get("vol_window", 20)))
-    params["vol_factor"] = st.sidebar.number_input("Volume Spike Factor", 1.0, 5.0, float(ov.get("vol_factor", 2.0)))
-if strategy == "Elliott Wave (Zigzag)":
-    params["zigzag_lookback"] = st.sidebar.number_input("Zigzag Lookback", 2, 20, int(ov.get("zigzag_lookback", 3)))
-if strategy == "Pro: VWAP + Supertrend Trend":
-    params["st_period"] = st.sidebar.number_input("Supertrend Period", 5, 50, int(ov.get("st_period", 10)))
-    params["st_mult"] = st.sidebar.number_input("Supertrend Multiplier", 1.0, 6.0, float(ov.get("st_mult", 3.0)))
-if strategy == "Pro: Opening Range Breakout + Volume":
-    params["orb_candles"] = st.sidebar.number_input("ORB Candles", 1, 30, int(ov.get("orb_candles", 5)))
-if strategy == "Pro: MACD Crossover":
-    c1, c2, c3 = st.sidebar.columns(3)
-    params["macd_fast"] = c1.number_input("MACD Fast", 2, 50, 12)
-    params["macd_slow"] = c2.number_input("MACD Slow", 5, 100, 26)
-    params["macd_signal"] = c3.number_input("MACD Signal", 2, 30, 9)
-if strategy == "Pro: Donchian Channel Breakout":
-    params["donchian_period"] = st.sidebar.number_input("Donchian Period", 5, 100, 20)
-if strategy == "Pro: Keltner Squeeze Breakout":
-    c1, c2 = st.sidebar.columns(2)
-    params["keltner_period"] = c1.number_input("Keltner Period", 5, 50, 20)
-    params["keltner_atr_mult"] = c2.number_input("Keltner ATR Mult", 0.5, 4.0, 1.5)
-if strategy == "Pro: Stochastic Reversal":
-    c1, c2 = st.sidebar.columns(2)
-    params["stoch_k"] = c1.number_input("Stochastic %K Period", 2, 50, 14)
-    params["stoch_d"] = c2.number_input("Stochastic %D Period", 2, 20, 3)
-if strategy == "Pro: TEMA Trend Flip":
-    params["tema_period"] = st.sidebar.number_input("TEMA Period", 5, 100, 20)
-if strategy == "Pro: CCI Extreme Reversal":
-    params["cci_period"] = st.sidebar.number_input("CCI Period", 5, 100, 20)
-
-if strategy in PRO_STRATEGIES:
-    st.sidebar.caption("💡 Professional-grade composite strategy (trend/volatility/liquidity confluence). Not a guarantee of profitability — validate in the Optimization tab first.")
-
-st.sidebar.markdown("### 🛑 Stoploss")
-sl_type = st.sidebar.selectbox(
-    "Stoploss Type", SL_TYPES,
-    index=SL_TYPES.index(ov.get("sl_type")) if ov.get("sl_type") in SL_TYPES else 0,
-)
-params["sl_points"] = st.sidebar.number_input("SL Points (base)", 0.1, 100000.0, float(ov.get("sl_points", 10.0)))
-if sl_type == "ATR Based SL":
-    params["atr_mult_sl"] = st.sidebar.number_input("ATR Multiplier (SL)", 0.5, 5.0, float(ov.get("atr_mult_sl", 1.5)))
-if sl_type == "Loss Recovery SL (Give-back)":
-    c1, c2 = st.sidebar.columns(2)
-    params["loss_trigger_points"] = c1.number_input("Loss trigger (points)", 1.0, 100000.0, 20.0)
-    params["min_recovery_pct"] = c2.number_input("Min recovery required (%)", 1.0, 100.0, 50.0)
-    st.sidebar.caption(f"Once floating loss reaches {params['loss_trigger_points']:.0f} pts, exit if price hasn't recovered at least {params['min_recovery_pct']:.0f}% of that loss back toward entry.")
-
-st.sidebar.markdown("### 🎯 Target")
-target_type = st.sidebar.selectbox(
-    "Target Type", TARGET_TYPES,
-    index=TARGET_TYPES.index(ov.get("target_type")) if ov.get("target_type") in TARGET_TYPES else 0,
-)
-params["target_points"] = st.sidebar.number_input("Target Points (base)", 0.1, 200000.0, float(ov.get("target_points", 20.0)))
-if target_type == "ATR Based Target":
-    params["atr_mult_target"] = st.sidebar.number_input("ATR Multiplier (Target)", 1.0, 8.0, float(ov.get("atr_mult_target", 3.0)))
-if target_type == "Profit Giveback Target":
-    c1, c2 = st.sidebar.columns(2)
-    params["profit_trigger_points"] = c1.number_input("Profit trigger (points)", 1.0, 100000.0, 50.0)
-    params["giveback_pct"] = c2.number_input("Max giveback allowed (%)", 1.0, 100.0, 30.0)
-    st.sidebar.caption(f"Once floating profit peaks at ≥{params['profit_trigger_points']:.0f} pts, exit if it falls back by more than {params['giveback_pct']:.0f}% from that peak.")
-if target_type == "Partial Book + Trail Remainder":
-    c1, c2 = st.sidebar.columns(2)
-    params["partial_target1_points"] = c1.number_input("Target 1 (points)", 0.1, 200000.0, float(params.get("target_points", 20.0)))
-    params["partial_book_pct"] = c2.number_input("Qty % to book at Target 1", 1.0, 99.0, 50.0)
-    st.sidebar.caption(
-        f"Books {params['partial_book_pct']:.0f}% of quantity when Target 1 ({params['partial_target1_points']:.0f} pts) is hit; "
-        "the remainder keeps running under an ATR trailing stop with no fixed second target. "
-        "⚠️ With Quantity = 1, there's nothing left to trail after rounding — increase Quantity in the sidebar to actually see partial-booking behavior."
-    )
-if sl_type == "Risk:Reward Based (min 1:2)" or target_type == "Risk:Reward Based (min 1:2)":
-    params["rr_ratio"] = st.sidebar.number_input("Risk:Reward Ratio (min 2)", 2.0, 10.0, float(ov.get("rr_ratio", 2.0)))
-
-st.sidebar.markdown("### ⏱ Time-Based Risk Control")
-loss_duration_enabled = st.sidebar.checkbox("Loss Holding Duration Exit", value=False)
-loss_duration_min_minutes, loss_duration_max_minutes = 1.0, 5.0
-if loss_duration_enabled:
-    c1, c2 = st.sidebar.columns(2)
-    loss_duration_min_minutes = c1.number_input("Min minutes in loss before acting", min_value=0.0, value=1.0, step=1.0)
-    loss_duration_max_minutes = c2.number_input("Safety ceiling (minutes)", min_value=0.0, value=5.0, step=1.0)
-    st.sidebar.caption(
-        "Exits as soon as the position has been continuously in a floating loss for at least the first number "
-        "of minutes. The second number is just an upper safety bound (mainly relevant to live polling delays) — "
-        "keep it ≥ the first. No cap is applied to how high you can set either value."
-    )
 risk_ctrl = {
-    "loss_duration_enabled": loss_duration_enabled,
-    "loss_duration_min_minutes": loss_duration_min_minutes,
-    "loss_duration_max_minutes": loss_duration_max_minutes,
+    "loss_duration_enabled": bool(cfg.get("loss_duration_enabled", False)),
+    "loss_duration_min_minutes": float(cfg.get("loss_duration_min_minutes", 1.0)),
+    "loss_duration_max_minutes": float(cfg.get("loss_duration_max_minutes", 5.0)),
 }
 
-st.sidebar.markdown("### 🔍 Additional Entry Filters")
-filters = {
-    "adx_enabled": st.sidebar.checkbox("ADX Filter", value=False),
+FILTER_DEFAULTS = {
+    "adx_enabled": False, "adx_min": 20, "adx_max": 100,
+    "rsi_enabled": False, "bb_enabled": False, "ema20_enabled": False,
+    "sma20_enabled": False, "smc_enabled": False,
+    "atr_enabled": False, "atr_min": 0.0, "atr_max": 100000.0,
+    "supertrend_enabled": False, "st_filter_period": 10, "st_filter_mult": 3.0,
+    "regime_enabled": False, "regime_trend_min": 25, "regime_range_max": 20,
+    "angle_enabled": False, "angle_min_deg": 0.0,
+    "crossover_quality_enabled": False, "crossover_quality_mode": "Simple Crossover",
+    "crossover_min_points": 1.0, "crossover_atr_mult": 1.0,
+    "vix_enabled": False, "vix_min": 10.0, "vix_max": 25.0,
 }
-if filters["adx_enabled"]:
-    c1, c2 = st.sidebar.columns(2)
-    filters["adx_min"] = c1.number_input("ADX Min", 0, 100, 20)
-    filters["adx_max"] = c2.number_input("ADX Max", 0, 100, 100)
-filters["rsi_enabled"] = st.sidebar.checkbox("RSI Filter (30 up-cross buy / 70 down-cross sell)", value=False)
-filters["bb_enabled"] = st.sidebar.checkbox("Bollinger Band Filter", value=False)
-filters["ema20_enabled"] = st.sidebar.checkbox("EMA20 Filter", value=False)
-filters["sma20_enabled"] = st.sidebar.checkbox("SMA20 Filter", value=False)
-filters["smc_enabled"] = st.sidebar.checkbox("SMC (Structure Break) Filter", value=False)
+filters = {k: cfg.get(k, d) for k, d in FILTER_DEFAULTS.items()}
 
-filters["atr_enabled"] = st.sidebar.checkbox("ATR (Volatility) Filter", value=False)
-if filters["atr_enabled"]:
-    c1, c2 = st.sidebar.columns(2)
-    filters["atr_min"] = c1.number_input("ATR Min (points)", 0.0, 100000.0, 0.0)
-    filters["atr_max"] = c2.number_input("ATR Max (points)", 0.0, 100000.0, 100000.0)
-    st.sidebar.caption("Only trade when 14-period ATR is inside this band — avoids dead/illiquid tape and blow-off volatility spikes.")
-
-filters["supertrend_enabled"] = st.sidebar.checkbox("Supertrend Filter", value=False)
-if filters["supertrend_enabled"]:
-    c1, c2 = st.sidebar.columns(2)
-    filters["st_filter_period"] = c1.number_input("Supertrend Period (filter)", 5, 50, 10)
-    filters["st_filter_mult"] = c2.number_input("Supertrend Mult (filter)", 1.0, 6.0, 3.0)
-    st.sidebar.caption("Only takes buys when Supertrend is bullish, sells when Supertrend is bearish — independent of the main strategy.")
-
-filters["regime_enabled"] = st.sidebar.checkbox("Regime Filter (Trend vs Range, adaptive)", value=False)
-if filters["regime_enabled"]:
-    c1, c2 = st.sidebar.columns(2)
-    filters["regime_trend_min"] = c1.number_input("ADX ≥ this = Trending", 10, 60, 25)
-    filters["regime_range_max"] = c2.number_input("ADX ≤ this = Ranging", 5, 40, 20)
-    st.sidebar.caption(
-        "Trend-type strategies (EMA/Supertrend/ORB/S-R/EW) only fire when ADX confirms a trend; "
-        "mean-reversion strategies (RSI/Bollinger/Liquidity/BB+RSI) only fire when ADX confirms a range. "
-        "This is the 'adapt to changing market regime' control — it doesn't switch strategies for you, "
-        "it stops your chosen strategy from firing in the regime it's known to perform badly in."
-    )
-
-filters["angle_enabled"] = st.sidebar.checkbox("Angle of Crossover Filter", value=False)
-if filters["angle_enabled"]:
-    filters["angle_min_deg"] = st.sidebar.number_input(
-        "Minimum crossover angle (degrees, absolute value)", min_value=0.0, value=0.0, step=1.0,
-    )
-    st.sidebar.caption(
-        f"Only accepts an EMA{params.get('ema_fast',9)}/{params.get('ema_slow',15)} crossover if it's steep enough. "
-        "Angle is normalized against ATR (there's no universal 'degrees' for a raw price slope), so treat it as a "
-        "relative steepness score, not a standardized industry figure. Absolute value is used since valid crosses "
-        "can produce a negative raw slope depending on direction."
-    )
-
-filters["crossover_quality_enabled"] = st.sidebar.checkbox("Crossover Confirmation Filter", value=False)
-if filters["crossover_quality_enabled"]:
-    filters["crossover_quality_mode"] = st.sidebar.selectbox(
-        "Confirmation type", ["Simple Crossover", "Crossover with Candle Size", "Crossover with ATR-based Candle Size"],
-    )
-    if filters["crossover_quality_mode"] == "Crossover with Candle Size":
-        filters["crossover_min_points"] = st.sidebar.number_input("Min candle range (points)", min_value=0.0, value=1.0, step=0.5)
-    elif filters["crossover_quality_mode"] == "Crossover with ATR-based Candle Size":
-        filters["crossover_atr_mult"] = st.sidebar.number_input("Min candle range (× ATR)", min_value=0.1, value=1.0, step=0.1)
-    st.sidebar.caption(f"Only accepts an EMA{params.get('ema_fast',9)}/{params.get('ema_slow',15)} crossover bar that also clears this candle-size bar — filters out crosses on tiny, indecisive candles.")
-
-filters["vix_enabled"] = st.sidebar.checkbox("India VIX Filter", value=False)
-if filters["vix_enabled"]:
-    c1, c2 = st.sidebar.columns(2)
-    filters["vix_min"] = c1.number_input("VIX Min", 0.0, 100.0, 10.0)
-    filters["vix_max"] = c2.number_input("VIX Max", 0.0, 100.0, 25.0)
-    st.sidebar.caption(
-        "India VIX is a fear/expected-volatility gauge, not a price indicator — you don't need to be an expert to "
-        "use it as a simple filter here. Rough rule of thumb: below ~15 = calm (often better for trend-following), "
-        "15–20 = normal, 20–30 = elevated/nervous (often better for mean-reversion or smaller size), above ~30 = "
-        "panic (many systems sit out entirely). Defaults above (10–25) are a conservative 'avoid extremes' band — "
-        "adjust to taste. VIX only publishes daily, so intraday timeframes reuse the latest known daily value."
-    )
-
-st.sidebar.markdown("### 🧠 Smart Evaluation (Recommended Before Going Live)")
-st.sidebar.caption("Off by default. Turn these on to get a more honest read on whether a config is likely to hold up out-of-sample and after real costs.")
-
-wf_enabled = st.sidebar.checkbox("Enable Walk-Forward Validation", value=False)
-wf_folds = 5
-if wf_enabled:
-    wf_folds = st.sidebar.slider("Number of sequential out-of-sample folds", 3, 10, 5)
-    st.sidebar.caption("Splits the backtest period into N sequential chunks and checks whether the edge holds up across most of them, not just in aggregate.")
-
-cost_enabled = st.sidebar.checkbox("Enable Realistic Cost Modeling", value=False)
+wf_enabled = bool(cfg.get("wf_enabled", False))
+wf_folds = int(cfg.get("wf_folds", 5))
+cost_enabled = bool(cfg.get("cost_enabled", False))
 cost_cfg = {"slippage_points": 0.0, "spread_points": 0.0, "brokerage_flat": 0.0}
 if cost_enabled:
-    cost_cfg["slippage_points"] = st.sidebar.number_input("Slippage per trade (points)", 0.0, 10000.0, 1.0)
-    cost_cfg["spread_points"] = st.sidebar.number_input("Bid-Ask spread cost (points)", 0.0, 10000.0, 0.5)
-    cost_cfg["brokerage_flat"] = st.sidebar.number_input("Brokerage per order leg (currency)", 0.0, 10000.0, 20.0)
-    st.sidebar.caption("Deducted from every trade: (slippage + spread) in points, plus brokerage charged twice per round trip (entry + exit).")
+    cost_cfg = {
+        "slippage_points": float(cfg.get("slippage_points", 1.0)),
+        "spread_points": float(cfg.get("spread_points", 0.5)),
+        "brokerage_flat": float(cfg.get("brokerage_flat", 20.0)),
+    }
 
-st.sidebar.markdown("### 🏦 Dhan Broker — Live Order Placement")
-dhan_enabled = st.sidebar.checkbox("Enable Dhan Order Placement (LIVE)", value=False)
-dhan_client_id, dhan_access_token, product_cfg = "", "", {}
-if dhan_enabled:
-    st.sidebar.warning("Live orders will be attempted using the credentials below. Test in a sandbox first.")
-    dhan_client_id = st.sidebar.text_input("Dhan Client ID")
-    dhan_access_token = st.sidebar.text_input("Dhan Access Token", type="password")
-    instrument_type = st.sidebar.selectbox(
-        "Instrument", [
-            "Stock Intraday", "Stock Delivery", "Stock Futures", "Stock Options",
-            "Index Futures (Nifty/BankNifty/Sensex)", "Index Options CE", "Index Options PE",
-        ],
-    )
-    product_cfg["instrument"] = instrument_type
-    if "Options" in instrument_type:
-        c1, c2 = st.sidebar.columns(2)
-        product_cfg["strike"] = c1.number_input("Strike Price", 0.0, 200000.0, 0.0)
-        product_cfg["expiry"] = c2.text_input("Expiry (YYYY-MM-DD)")
 
-        auto_ce_pe = st.sidebar.checkbox("Auto-select CE/PE by signal direction", value=False)
-        product_cfg["auto_ce_pe"] = auto_ce_pe
-        if auto_ce_pe:
-            product_cfg["ce_security_id"] = st.sidebar.text_input("CE Security ID (used on LONG signals)")
-            product_cfg["pe_security_id"] = st.sidebar.text_input("PE Security ID (used on SHORT signals)")
-            st.sidebar.caption(
-                "When a LONG signal fires, the app BUYs the CE leg; when a SHORT signal fires, it BUYs the PE leg "
-                "(buying options both ways keeps risk defined — no naked option selling). Exits SELL whichever leg "
-                "is open. You still need to update these IDs yourself when the strike/expiry rolls."
-            )
-    product_cfg["exchange_segment"] = st.sidebar.selectbox("Exchange Segment", ["NSE_EQ", "NSE_FNO", "BSE_EQ", "MCX_COMM"])
-    product_cfg["product"] = st.sidebar.selectbox("Product Type", ["INTRADAY", "CNC", "MARGIN", "MTF"])
-    product_cfg["order_mode"] = st.sidebar.selectbox("Order Mode", ["Buy then Buy (allow same-side re-entry)", "Flip only (Buy⇄Sell)"])
-else:
-    st.sidebar.caption("Disabled by default. Live trading tab runs in paper/simulation mode until enabled.")
+def build_product_cfg(cfg, ticker_choice, ticker):
+    """Derives the full Dhan order-routing config (exchange segment, product
+    type, security IDs — incl. auto-resolved CE/PE legs for options) from the
+    shared config store."""
+    inst = cfg.get("dhan_instrument", "Stock Intraday")
+    underlying = dhan_underlying_symbol(ticker_choice, ticker)
+    exch = "BSE" if (ticker_choice == "Sensex" or str(ticker).upper().endswith(".BO")) else "NSE"
+    pc = {
+        "instrument": inst,
+        "underlying": underlying,
+        "entry_order_type": cfg.get("dhan_entry_order_type", "MARKET"),
+        "exit_order_type": cfg.get("dhan_exit_order_type", "MARKET"),
+        "dhan_qty": int(cfg.get("dhan_qty", 1) or 1),
+        "bo_enabled": bool(cfg.get("dhan_bo_enabled", False)),
+        "bo_sl": float(cfg.get("dhan_bo_sl", 10.0) or 0.0),
+        "bo_target": float(cfg.get("dhan_bo_target", 20.0) or 0.0),
+        "bo_trail": float(cfg.get("dhan_bo_trail", 0.0) or 0.0),
+    }
+    if inst in ("Stock Intraday", "Stock Delivery"):
+        pc["exchange_segment"] = f"{exch}_EQ"
+        pc["product"] = "CNC" if inst == "Stock Delivery" else "INTRADAY"
+        pc["security_id"] = str(cfg.get("dhan_security_id", "")).strip()
+    elif inst in ("Stock Futures", "Index Futures"):
+        pc["exchange_segment"] = f"{exch}_FNO"
+        pc["product"] = "MARGIN"
+        pc["security_id"] = str(cfg.get("dhan_security_id", "")).strip()
+        pc["expiry"] = str(cfg.get("dhan_expiry", "")).strip()
+    else:  # Stock Options / Index Options
+        pc["exchange_segment"] = f"{exch}_FNO"
+        pc["product"] = "INTRADAY"
+        pc["expiry"] = str(cfg.get("dhan_opt_expiry", "")).strip()
+        pc["ce_strike"] = float(cfg.get("dhan_ce_strike", 0) or 0)
+        pc["pe_strike"] = float(cfg.get("dhan_pe_strike", 0) or 0)
+        pc["ce_security_id"] = lookup_option_security_id(underlying, pc["expiry"], pc["ce_strike"], "CE") or ""
+        pc["pe_security_id"] = lookup_option_security_id(underlying, pc["expiry"], pc["pe_strike"], "PE") or ""
+    return pc
+
+
+dhan_enabled = bool(cfg.get("dhan_enabled", False))
+dhan_client_id = str(cfg.get("dhan_client_id", "1104779876")).strip()
+dhan_access_token = str(cfg.get("dhan_access_token", "")).strip()
+product_cfg = build_product_cfg(cfg, ticker_choice, ticker) if dhan_enabled else {}
 
 config = dict(
     ticker=ticker, ticker_choice=ticker_choice, interval=interval, period=period, qty=qty,
@@ -1816,6 +2451,7 @@ config = dict(
     wf_enabled=wf_enabled, wf_folds=wf_folds, cost_enabled=cost_enabled, cost_cfg=cost_cfg,
     risk_ctrl=risk_ctrl,
 )
+
 
 # ============================================================================
 # HELPERS SHARED ACROSS TABS
@@ -2018,6 +2654,19 @@ def evaluate_live_signal(ticker, interval, period, strategy, params, filters, sl
     if ltp is None:
         ltp = float(sig_df["Close"].iloc[-1])
 
+    # ---- Live exit engine selection --------------------------------------
+    # "Backtest-style candle logic" checkbox (ON by default): entries happen at
+    # candle N+1 open (unchanged), and SL/Target are checked EXACTLY like the
+    # backtest — against the last CLOSED candle's Low/High (LONG: SL vs Low
+    # first, then Target vs High; SHORT: SL vs High first, then Target vs Low)
+    # instead of against the LTP tick. Turn it off to get the old LTP behavior.
+    cfg_live = st.session_state.get("app_cfg", {})
+    use_candle_logic = (
+        bool(cfg_live.get("live_candle_logic", True))
+        and strategy not in IMMEDIATE_EXECUTION_STRATEGIES
+        and len(sig_df) >= 2
+    )
+
     # Immediate-execution strategies (Simple Buy/Sell Only, Threshold Cross)
     # check the CURRENT price against the last CLOSED candle directly — no
     # "wait for this candle to close" delay, since there's no candle shape to
@@ -2043,28 +2692,46 @@ def evaluate_live_signal(ticker, interval, period, strategy, params, filters, sl
 
     if open_pos:
         pos = open_pos[0]
-        i = len(sig_df) - 1
-        candle = sig_df.iloc[i]
-        pos = update_trade_levels(pos, i, sig_df, params, a_series)
-        pos["highest"] = max(pos["highest"], ltp)
-        pos["lowest"] = min(pos["lowest"], ltp)
+        if use_candle_logic:
+            # Evaluate against the last CLOSED candle — identical to backtest.
+            i = len(sig_df) - 2
+            candle = sig_df.iloc[i]
+            ref_price = float(candle["Close"])
+            pos = update_trade_levels(pos, i, sig_df, params, a_series)
+            pos["highest"] = max(pos["highest"], float(candle["High"]))
+            pos["lowest"] = min(pos["lowest"], float(candle["Low"]))
+        else:
+            i = len(sig_df) - 1
+            candle = sig_df.iloc[i]
+            ref_price = ltp
+            pos = update_trade_levels(pos, i, sig_df, params, a_series)
+            pos["highest"] = max(pos["highest"], ltp)
+            pos["lowest"] = min(pos["lowest"], ltp)
 
         exited, exit_price, reason = False, None, None
         if pos.get("pending_exit_reason"):
-            exited, exit_price, reason = True, candle["Open"], pos["pending_exit_reason"]
+            # Pending signal-exit always executes at the NEXT candle's open —
+            # same as the backtest engine's exit rule.
+            exited, exit_price, reason = True, float(sig_df["Open"].iloc[-1]), pos["pending_exit_reason"]
         if not exited:
-            sp_exit, sp_price, sp_reason = check_special_exit_conditions(pos, {"Close": ltp})
+            sp_exit, sp_price, sp_reason = check_special_exit_conditions(pos, {"Close": ref_price})
             if sp_exit:
                 exited, exit_price, reason = True, sp_price, sp_reason
         if not exited and risk_ctrl.get("loss_duration_enabled"):
             td_exit, td_price, td_reason = check_time_based_exit(
-                pos, sig_df.index[-1], ltp,
+                pos, sig_df.index[i], ref_price,
                 risk_ctrl.get("loss_duration_min_minutes", 1), risk_ctrl.get("loss_duration_max_minutes", 5),
             )
             if td_exit:
                 exited, exit_price, reason = True, td_price, td_reason
         if not exited:
-            hard_exit, hard_price, hard_reason = check_hard_exit_ltp(pos, ltp)
+            if use_candle_logic:
+                # Backtest-identical conservative fill: LONG checks SL (candle
+                # Low) BEFORE Target (candle High); SHORT checks SL (candle
+                # High) BEFORE Target (candle Low).
+                hard_exit, hard_price, hard_reason = check_hard_exit(pos, candle)
+            else:
+                hard_exit, hard_price, hard_reason = check_hard_exit_ltp(pos, ltp)
             if hard_exit:
                 if pos["target_type"] == "Partial Book + Trail Remainder" and "Target Hit" in hard_reason and not pos["partial_booked"]:
                     book_qty = max(1, round(pos["original_qty"] * pos["partial_book_pct"] / 100.0))
@@ -2083,7 +2750,16 @@ def evaluate_live_signal(ticker, interval, period, strategy, params, filters, sl
                     pos["partial_booked"] = True
                     if dhan_enabled:
                         leg_id, side = resolve_dhan_order_leg(pos["direction"], False, ticker, product_cfg)
-                        st.json(place_dhan_order(dhan_client_id, dhan_access_token, leg_id, side, product_cfg, book_qty, hard_price))
+                        dhan_part_qty = max(1, round(dhan_order_qty(product_cfg) * pos["partial_book_pct"] / 100.0))
+                        st.json(place_dhan_order(dhan_client_id, dhan_access_token, leg_id, side, product_cfg,
+                                                 dhan_part_qty, hard_price,
+                                                 order_type=product_cfg.get("exit_order_type", "MARKET"), is_entry=False))
+                    send_email_notification(
+                        f"[AlgoTrader] PARTIAL BOOK {ticker} @ {float(hard_price):.2f}",
+                        f"Booked {book_qty}/{pos['original_qty']} qty at Target 1.\n"
+                        f"Entry: {pos['entry_price']:.2f}\nBooked at: {float(hard_price):.2f}\n"
+                        f"Points: {partial_points:+.2f}\nRemaining qty now trailing: {pos['remaining_qty']}",
+                    )
                     if pos["remaining_qty"] <= 0:
                         st.session_state.live_positions = []
                         st.success(f"Fully booked at Target 1 @ {hard_price:.2f}")
@@ -2116,9 +2792,16 @@ def evaluate_live_signal(ticker, interval, period, strategy, params, filters, sl
             })
             st.session_state.live_positions = []
             st.success(f"Position closed: {reason} @ {exit_price:.2f}")
-            if dhan_enabled:
+            if dhan_enabled and dhan_should_send_exit(product_cfg, reason):
                 leg_id, side = resolve_dhan_order_leg(pos["direction"], False, ticker, product_cfg)
-                st.json(place_dhan_order(dhan_client_id, dhan_access_token, leg_id, side, product_cfg, pos["remaining_qty"], exit_price))
+                st.json(place_dhan_order(dhan_client_id, dhan_access_token, leg_id, side, product_cfg,
+                                         dhan_order_qty(product_cfg), exit_price,
+                                         order_type=product_cfg.get("exit_order_type", "MARKET"), is_entry=False))
+            send_email_notification(
+                f"[AlgoTrader] EXIT {'LONG' if pos['direction'] == 1 else 'SHORT'} {ticker} @ {float(exit_price):.2f}",
+                f"Reason: {reason}\nEntry: {pos['entry_price']:.2f}\nExit: {float(exit_price):.2f}\n"
+                f"Points: {points:+.2f}\nPnL: {points * pos['remaining_qty']:+.2f}\nQty: {pos['remaining_qty']}",
+            )
         else:
             st.session_state.live_positions = [pos]
             st.info("Position still open — levels updated.")
@@ -2159,7 +2842,14 @@ def evaluate_live_signal(ticker, interval, period, strategy, params, filters, sl
             st.success(f"New {'LONG' if last_sig == 1 else 'SHORT'} position opened @ {entry_price:.2f}")
             if dhan_enabled:
                 leg_id, side = resolve_dhan_order_leg(last_sig, True, ticker, product_cfg)
-                st.json(place_dhan_order(dhan_client_id, dhan_access_token, leg_id, side, product_cfg, qty, entry_price))
+                st.json(place_dhan_order(dhan_client_id, dhan_access_token, leg_id, side, product_cfg,
+                                         dhan_order_qty(product_cfg), entry_price,
+                                         order_type=product_cfg.get("entry_order_type", "MARKET"), is_entry=True))
+            send_email_notification(
+                f"[AlgoTrader] ENTRY {'LONG' if last_sig == 1 else 'SHORT'} {ticker} @ {entry_price:.2f}",
+                f"Strategy: {strategy}\nTimeframe: {interval}\nEntry: {entry_price:.2f}\n"
+                f"SL: {sl:.2f}\nTarget: {target:.2f}\nQty: {qty}",
+            )
     else:
         st.caption("No new signal on the latest closed candle.")
     return sig_df
@@ -2176,17 +2866,19 @@ def live_signal_loop_fragment(ticker, interval, period, strategy, params, filter
 
 
 def apply_config_to_sidebar(cfg_row):
-    """Push a chosen optimization result row into sidebar_overrides and rerun."""
-    st.session_state.sidebar_overrides = {
-        "ticker_choice": cfg_row.get("ticker_choice", ticker_choice),
-        "ticker": cfg_row.get("ticker", ticker),
-        "interval": cfg_row["Timeframe"],
-        "period": cfg_row["Period"],
-        "strategy": cfg_row["Strategy"],
-        "sl_type": cfg_row.get("SL Type", sl_type),
-        "target_type": cfg_row.get("Target Type", target_type),
-        "qty": qty,
-    }
+    """Push a chosen optimization result row into the shared config store —
+    both the sidebar AND the Admin Panel instantly reflect it."""
+    cfg = st.session_state.app_cfg
+    row_choice = cfg_row.get("ticker_choice", ticker_choice)
+    cfg["ticker_choice"] = row_choice
+    if row_choice == "Custom":
+        cfg["custom_ticker"] = cfg_row.get("ticker", ticker)
+    cfg["interval"] = cfg_row["Timeframe"]
+    cfg["period"] = cfg_row["Period"]
+    cfg["strategy"] = cfg_row["Strategy"]
+    cfg["sl_type"] = cfg_row.get("SL Type", sl_type)
+    cfg["target_type"] = cfg_row.get("Target Type", target_type)
+    st.session_state["_cfg_applied_msg"] = True
     st.rerun()
 
 
@@ -2374,8 +3066,8 @@ def render_bin_analysis_section(t1, t2, t1_name, t2_name, p1, diff, fetch_interv
 # TABS
 # ============================================================================
 
-tab_bt, tab_live, tab_hist, tab_heat, tab_opt, tab_spread, tab_ohlc = st.tabs(
-    ["📊 Backtest", "🔴 Live Trading", "📜 Trade History", "🔥 Heatmaps", "🧪 Optimization", "🔀 Spread Tool", "📅 OHLC & Range"]
+tab_bt, tab_live, tab_hist, tab_heat, tab_opt, tab_spread, tab_ohlc, tab_admin = st.tabs(
+    ["📊 Backtest", "🔴 Live Trading", "📜 Trade History", "🔥 Heatmaps", "🧪 Optimization", "🔀 Spread Tool", "📅 OHLC & Range", "🛠 Admin Panel"]
 )
 
 # ---------------------------------------------------------------- BACKTEST -
@@ -2478,6 +3170,20 @@ with tab_live:
     st.subheader(f"Live (Paper) Trading — {ticker_choice} ({ticker})")
     st.caption("This is a simulation layer driven by the latest candle signal. Nothing polls the API until you click Start — Stop (or leaving/closing this browser tab) halts it again.")
 
+    _cfg_now = st.session_state.app_cfg
+    if _cfg_now.get("use_dhan_data") and _cfg_now.get("dhan_access_token"):
+        if dhan_data_meta(ticker) is None:
+            st.warning(f"📡 Dhan can't serve **{ticker}** (crypto/commodity/forex) — automatically using yfinance "
+                       "(0.3s rate-limit delay) for this ticker. Dhan will be used again for supported tickers.")
+        else:
+            st.caption("📡 Data source: **Dhan feed** — no API delay applied.")
+    else:
+        st.caption("📡 Data source: **yfinance** — a fixed 0.3s delay is applied to every API call (rate-limit protection).")
+    if _cfg_now.get("live_candle_logic", True):
+        st.caption("🧮 Exit engine: **Backtest-style candle logic** — entry at candle N+1 open; LONG: SL vs candle Low → Target vs candle High; SHORT: SL vs candle High → Target vs candle Low.")
+    else:
+        st.caption("🧮 Exit engine: **LTP tick logic** — SL checked against live LTP first, then Target.")
+
     # ---- Start / Stop / Square-off controls ----
     ctrl1, ctrl2, ctrl3, ctrl4 = st.columns(4)
     with ctrl1:
@@ -2520,7 +3226,14 @@ with tab_live:
         st.warning(f"Manually squared off @ {exit_price:.2f}")
         if dhan_enabled:
             leg_id, side = resolve_dhan_order_leg(pos["direction"], False, ticker, product_cfg)
-            st.json(place_dhan_order(dhan_client_id, dhan_access_token, leg_id, side, product_cfg, pos["remaining_qty"], exit_price))
+            st.json(place_dhan_order(dhan_client_id, dhan_access_token, leg_id, side, product_cfg,
+                                     dhan_order_qty(product_cfg), exit_price,
+                                     order_type=product_cfg.get("exit_order_type", "MARKET"), is_entry=False))
+        send_email_notification(
+            f"[AlgoTrader] MANUAL SQUARE OFF {ticker} @ {exit_price:.2f}",
+            f"Entry: {pos['entry_price']:.2f}\nExit: {exit_price:.2f}\nPoints: {points:+.2f}\n"
+            f"PnL: {points * pos['remaining_qty']:+.2f}",
+        )
         st.rerun()
 
     st.markdown("**Live Price & Position P&L**")
@@ -2534,7 +3247,11 @@ with tab_live:
             "Ticker": ticker, "Timeframe": interval, "Period": period, "Quantity": qty,
             "Strategy": strategy, "Stoploss Type": sl_type, "Target Type": target_type,
             "Filters Active": [k for k, v in filters.items() if v is True],
+            "Data Source": "Dhan (no delay)" if (_cfg_now.get("use_dhan_data") and _cfg_now.get("dhan_access_token") and dhan_data_meta(ticker)) else "yfinance (0.3s delay)",
+            "Live Exit Logic": "Backtest-style candle logic" if _cfg_now.get("live_candle_logic", True) else "LTP tick logic",
             "Dhan Live Orders": dhan_enabled,
+            "Dhan Product Config": {k: v for k, v in product_cfg.items() if not str(k).startswith("_")} if dhan_enabled else "—",
+            "Email Notifications": bool(_cfg_now.get("email_enabled")),
         })
 
     if manual_eval:
@@ -2885,13 +3602,26 @@ with tab_ohlc:
     render_range_insight_section(ticker, interval, period, f"2) Matched to your sidebar selection: {interval} candles, {period}")
 
 # ============================================================================
+# TAB: ADMIN PANEL
+# ============================================================================
+
+with tab_admin:
+    st.subheader("🛠 Admin Panel — Full Configuration")
+    st.caption(
+        "Every control from the sidebar, in one full-width panel. Both are live views of the SAME "
+        "configuration — change a value here and the sidebar updates instantly (and vice versa)."
+    )
+    render_config_panel(st, "adm")
+
+# ============================================================================
 # FOOTER / GLOBAL DISCLAIMER
 # ============================================================================
 
 st.divider()
 st.caption(
-    "⚠️ Educational tool. Backtests use simplified conservative fill logic and ignore slippage, "
-    "brokerage, taxes, and liquidity constraints — real results will differ. Verify any strategy on "
-    "out-of-sample data and paper-trade before committing capital. The Dhan integration is a placeholder "
-    "and performs no live network calls until you implement the `requests.post` call yourself."
+    "⚠️ Educational tool. Backtests use simplified conservative fill logic — real results will differ "
+    "unless realistic cost modeling is enabled, and even then liquidity/queue effects are ignored. "
+    "Verify any strategy on out-of-sample data and paper-trade before committing capital. "
+    "When Dhan order placement is enabled WITH an access token, REAL orders are sent to Dhan's live API "
+    "(api.dhan.co) — without a token, order payloads are only simulated and displayed."
 )
