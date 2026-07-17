@@ -10,7 +10,7 @@ wire in verified credentials — do that only after testing in a sandbox.
 import smtplib
 import ssl
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, time as dt_time
 from email.mime.text import MIMEText
 
 import numpy as np
@@ -194,6 +194,8 @@ for key, default in {
     "last_acted_signal_marker": None,
     "app_cfg": {},          # single source of truth for ALL config widgets
     "_ltp_prev": None,      # previous LTP shown, for the live delta readout
+    "live_day_stats": {},   # {"date": <date>, "entries": n} — for Max Trades/Day
+    "last_trade_event_ts": None,  # time.time() of last entry/exit — entry cooldown
 }.items():
     if key not in st.session_state:
         st.session_state[key] = default
@@ -201,6 +203,14 @@ for key, default in {
 
 # ============================================================================
 # INDICATORS
+# All formulas follow TradingView's conventions so values match TV charts at
+# the same settings: RSI/ATR/ADX/±DI use Wilder's RMA smoothing (ewm alpha=1/n,
+# TV's ta.rma), EMA/MACD/TEMA use standard EMA (span=n, adjust=False), Bollinger
+# uses population stdev (ddof=0, TV's ta.stdev biased=true), CCI uses mean
+# absolute deviation about the SMA (TV's ta.dev), Stochastic matches TV's raw
+# %K with default smoothing=1, and Supertrend uses RMA-ATR with TV's
+# band-carry-forward rules. Residual differences vs a TV chart come from the
+# DATA (session boundaries / feed), not the math.
 # ============================================================================
 
 def ema(series, period):
@@ -892,8 +902,12 @@ def generate_signals(df, strategy, params):
 
     elif strategy == "Threshold Cross":
         thr = params.get("threshold", float(df["Close"].iloc[0]))
-        df.loc[(df["Close"] > thr) & (df["Close"].shift(1) <= thr), "signal"] = 1
-        df.loc[(df["Close"] < thr) & (df["Close"].shift(1) >= thr), "signal"] = -1
+        thr_dir = params.get("threshold_direction", "Below")
+        if thr_dir == "Below":
+            # Price must approach FROM BELOW and cross up through the level.
+            df.loc[(df["Close"] > thr) & (df["Close"].shift(1) <= thr), "signal"] = 1
+        else:  # "Above" — price approaches from above and crosses down.
+            df.loc[(df["Close"] < thr) & (df["Close"].shift(1) >= thr), "signal"] = -1
 
     elif strategy == "Price Action Support/Resistance":
         w = params.get("sr_window", 20)
@@ -1057,6 +1071,15 @@ def generate_signals(df, strategy, params):
         df.loc[sell, "signal"] = -1
 
     df["signal"] = df["signal"].fillna(0)
+
+    # ---- Trade Direction filter (Both / Long Only / Short Only) ----------
+    # Applied centrally so it affects backtests, optimization, heatmaps AND
+    # live trading identically.
+    trade_type = params.get("trade_type", "Both")
+    if trade_type == "Long Only":
+        df.loc[df["signal"] == -1, "signal"] = 0
+    elif trade_type == "Short Only":
+        df.loc[df["signal"] == 1, "signal"] = 0
     return df
 
 
@@ -1877,6 +1900,86 @@ def dhan_should_send_exit(product_cfg, reason):
     return True
 
 
+def _now_ist():
+    try:
+        return pd.Timestamp.now(tz="Asia/Kolkata")
+    except Exception:
+        return pd.Timestamp.now()
+
+
+def _day_realized_points():
+    """Sum of realized Points across today's closed rows in live history
+    (partial-book rows included — they're realized points too)."""
+    today = _now_ist().date()
+    total = 0.0
+    for h in st.session_state.live_history:
+        try:
+            et = pd.Timestamp(h.get("Exit Time"))
+            et_date = et.date()
+        except Exception:
+            continue
+        if et_date == today:
+            total += float(h.get("Points", 0.0) or 0.0)
+    return total
+
+
+def _entries_today():
+    stats = st.session_state.get("live_day_stats") or {}
+    if stats.get("date") != _now_ist().date():
+        return 0
+    return int(stats.get("entries", 0))
+
+
+def _record_entry_taken():
+    today = _now_ist().date()
+    stats = st.session_state.get("live_day_stats") or {}
+    if stats.get("date") != today:
+        stats = {"date": today, "entries": 0}
+    stats["entries"] = int(stats.get("entries", 0)) + 1
+    st.session_state.live_day_stats = stats
+    st.session_state.last_trade_event_ts = time.time()
+
+
+def _is_indian_ticker(ticker):
+    t = str(ticker).upper()
+    return t.endswith(".NS") or t.endswith(".BO") or t in ("^NSEI", "^NSEBANK", "^BSESN", "^INDIAVIX")
+
+
+def check_live_entry_gates(cfg_live, ticker):
+    """All the pre-entry risk gates. Returns (allowed: bool, reason: str).
+    Evaluated fresh on every live cycle so toggling a gate applies instantly."""
+    # Max loss in day
+    if cfg_live.get("max_loss_day_enabled"):
+        day_pts = _day_realized_points()
+        if day_pts <= -abs(float(cfg_live.get("max_loss_day_points", 100.0))):
+            return False, f"Max loss/day hit ({day_pts:+.1f} pts) — no new entries today."
+    # Max profit in day
+    if cfg_live.get("max_profit_day_enabled"):
+        day_pts = _day_realized_points()
+        if day_pts >= abs(float(cfg_live.get("max_profit_day_points", 200.0))):
+            return False, f"Max profit/day reached ({day_pts:+.1f} pts) — locking in gains, no new entries today."
+    # Max number of trades
+    if cfg_live.get("max_trades_enabled"):
+        n = _entries_today()
+        limit = int(cfg_live.get("max_trades_day", 10))
+        if n >= limit:
+            return False, f"Max trades/day reached ({n}/{limit}) — no new entries today."
+    # Trade window (IST) — only enforced for Indian tickers
+    if cfg_live.get("trade_window_enabled") and _is_indian_ticker(ticker):
+        now_t = _now_ist().time()
+        start_t = cfg_live.get("trade_window_start") or dt_time(9, 15)
+        end_t = cfg_live.get("trade_window_end") or dt_time(15, 30)
+        if not (start_t <= now_t <= end_t):
+            return False, f"Outside trade window ({start_t.strftime('%H:%M')}–{end_t.strftime('%H:%M')} IST) — entries paused."
+    # Entry cooldown after the previous entry/exit
+    if cfg_live.get("entry_cooldown_enabled"):
+        last_ts = st.session_state.get("last_trade_event_ts")
+        cd = float(cfg_live.get("entry_cooldown_seconds", 1.0))
+        if last_ts is not None and (time.time() - last_ts) < cd:
+            return False, f"Entry cooldown active ({cd:.0f}s after the last trade event)."
+    return True, ""
+
+
 def resolve_dhan_order_leg(direction, is_entry, fallback_ticker, product_cfg):
     """
     Decides WHICH instrument to trade and which side (BUY/SELL) to send.
@@ -1919,9 +2022,12 @@ def _cfg_store(wkey, name):
 def _seed_widget(prefix, name, value):
     """Force the widget's session value from the central config store BEFORE
     the widget is instantiated — this is what keeps the sidebar copy and the
-    Admin Panel copy of every control perfectly in sync."""
+    Admin Panel copy of every control perfectly in sync. Only writes when the
+    value actually differs: rewriting identical widget state on every rerun
+    creates needless state churn that can make button clicks feel 'lost'."""
     wkey = f"{prefix}::{name}"
-    st.session_state[wkey] = value
+    if wkey not in st.session_state or st.session_state[wkey] != value:
+        st.session_state[wkey] = value
     return wkey
 
 
@@ -1975,12 +2081,23 @@ def cfg_slider(ui, prefix, name, label, min_value, max_value, default):
     return ui.slider(label, min_value, max_value, key=wkey, on_change=_cfg_store, args=(wkey, name))
 
 
+def cfg_time(ui, prefix, name, label, default, help=None):
+    cur = st.session_state.app_cfg.get(name, default)
+    if not isinstance(cur, dt_time):
+        cur = default
+    wkey = _seed_widget(prefix, name, cur)
+    return ui.time_input(label, key=wkey, on_change=_cfg_store, args=(wkey, name), help=help)
+
+
 def auto_populate_dhan_defaults():
-    """Auto-fetches Dhan defaults whenever the (ticker, instrument, expiry)
-    combination changes: security IDs from the scrip master, nearest F&O
-    expiries, ATM CE/PE strikes (from live LTP), and default quantities
-    (65 Nifty / 35 BankNifty / 20 Sensex for index options; contract lot size
-    for futures/stock options). Everything stays editable afterwards."""
+    """Auto-fetches Dhan defaults whenever the (ticker, instrument, exchange,
+    expiry, strikes) combination changes: security IDs from the scrip master
+    (incl. CE/PE option legs), nearest F&O expiries, ATM strikes from live LTP,
+    and default quantities (65 Nifty / 35 BankNifty / 20 Sensex for index
+    options; contract lot size otherwise). Runs only when the Dhan DATA feed is
+    on — with yfinance as data source, the fields stay manual. On a fetch
+    failure it retries (throttled to every 20s) instead of giving up, and a
+    ticker change always forces a refill so IDs can't go stale."""
     cfg = st.session_state.app_cfg
     if not (cfg.get("dhan_enabled") or cfg.get("use_dhan_data")):
         return
@@ -1989,18 +2106,46 @@ def auto_populate_dhan_defaults():
     if tkr is None:
         tkr = cfg.get("custom_ticker", "KAYNES.NS")
     inst = cfg.get("dhan_instrument", "Stock Intraday")
+
+    # Exchange auto-defaults to NSE; flips to BSE automatically when a BSE
+    # ticker (Sensex / *.BO) is picked. Always user-overridable via the
+    # Exchange dropdown afterwards.
+    tkr_sig = (tkr_choice, tkr)
+    if cfg.get("_dhan_exch_auto_for") != tkr_sig:
+        cfg["dhan_exchange"] = "BSE" if (tkr_choice == "Sensex" or str(tkr).upper().endswith(".BO")) else "NSE"
+        cfg["_dhan_exch_auto_for"] = tkr_sig
+
+    # Manual mode note: this function is only reached when the Dhan data feed
+    # or Dhan order placement is enabled — pure-yfinance setups keep all
+    # security-ID fields fully manual (the scrip master is public, no token
+    # needed for the lookups below).
+
     underlying = dhan_underlying_symbol(tkr_choice, tkr)
-    exch = "BSE" if (tkr_choice == "Sensex" or str(tkr).upper().endswith(".BO")) else "NSE"
-    base_sig = (tkr_choice, tkr, inst)
-    full_sig = base_sig + (cfg.get("dhan_opt_expiry", ""),)
+    exch = cfg.get("dhan_exchange", "NSE")
+    base_sig = (tkr_choice, tkr, inst, exch)
+    full_sig = base_sig + (cfg.get("dhan_opt_expiry", ""),
+                           cfg.get("dhan_ce_strike", 0), cfg.get("dhan_pe_strike", 0))
     if cfg.get("_dhan_auto_sig") == full_sig:
         return
+    # Throttle retries after a failure so a broken network can't freeze the UI
+    # on every rerun (this was one cause of buttons needing multiple clicks).
+    last_try = cfg.get("_dhan_auto_last_try", 0.0)
+    if cfg.get("_dhan_auto_failed") and (time.time() - last_try) < 20:
+        return
+    cfg["_dhan_auto_last_try"] = time.time()
+    ok = True
     try:
         if inst in ("Stock Intraday", "Stock Delivery"):
             sid = lookup_equity_security_id(underlying, exch)
-            if sid and (cfg.get("_dhan_sid_auto_for") != base_sig or not cfg.get("dhan_security_id")):
-                cfg["dhan_security_id"] = sid
-                cfg["_dhan_sid_auto_for"] = base_sig
+            if sid:
+                # A ticker/instrument/exchange change ALWAYS overwrites — stale
+                # IDs from the previous ticker were the "sometimes not filled"
+                # bug. Only a user edit on the SAME signature is preserved.
+                if cfg.get("_dhan_sid_auto_for") != base_sig or not cfg.get("dhan_security_id"):
+                    cfg["dhan_security_id"] = sid
+                    cfg["_dhan_sid_auto_for"] = base_sig
+            else:
+                ok = False
         elif inst in ("Stock Futures", "Index Futures"):
             expiries = dhan_expiry_list(underlying, "FUT")
             cfg["_dhan_fut_expiries"] = expiries
@@ -2010,6 +2155,8 @@ def auto_populate_dhan_defaults():
             if sid:
                 cfg["dhan_security_id"] = sid
                 cfg["_dhan_sid_auto_for"] = base_sig
+            else:
+                ok = False
             if cfg.get("_dhan_qty_auto_for") != base_sig:
                 lot = dhan_lot_size(underlying, "FUT", cfg.get("dhan_expiry", ""))
                 if lot:
@@ -2027,7 +2174,26 @@ def auto_populate_dhan_defaults():
                     atm = float(min(strikes, key=lambda s: abs(s - ltp)))
                     cfg["dhan_ce_strike"] = atm
                     cfg["dhan_pe_strike"] = atm
-                cfg["_dhan_strike_auto_for"] = base_sig
+                    cfg["_dhan_strike_auto_for"] = base_sig
+                else:
+                    ok = False
+            # Resolve the CE/PE SECURITY IDs for the current expiry+strikes —
+            # refreshed whenever expiry or either strike changes.
+            leg_sig = (underlying, cfg.get("dhan_opt_expiry", ""),
+                       cfg.get("dhan_ce_strike", 0), cfg.get("dhan_pe_strike", 0))
+            if cfg.get("_dhan_optsid_auto_for") != leg_sig:
+                ce_id = lookup_option_security_id(underlying, cfg.get("dhan_opt_expiry", ""),
+                                                  cfg.get("dhan_ce_strike", 0), "CE")
+                pe_id = lookup_option_security_id(underlying, cfg.get("dhan_opt_expiry", ""),
+                                                  cfg.get("dhan_pe_strike", 0), "PE")
+                if ce_id:
+                    cfg["dhan_ce_security_id"] = ce_id
+                if pe_id:
+                    cfg["dhan_pe_security_id"] = pe_id
+                if ce_id and pe_id:
+                    cfg["_dhan_optsid_auto_for"] = leg_sig
+                else:
+                    ok = False
             if cfg.get("_dhan_qty_auto_for") != base_sig:
                 default_lot = INDEX_OPTION_LOT_DEFAULTS.get(underlying)
                 if not default_lot:
@@ -2035,8 +2201,10 @@ def auto_populate_dhan_defaults():
                 cfg["dhan_qty"] = default_lot
                 cfg["_dhan_qty_auto_for"] = base_sig
     except Exception:
-        pass
-    cfg["_dhan_auto_sig"] = full_sig
+        ok = False
+    cfg["_dhan_auto_failed"] = not ok
+    if ok:
+        cfg["_dhan_auto_sig"] = full_sig  # only lock in on SUCCESS — failures retry
 
 
 def render_config_panel(ui, prefix):
@@ -2081,12 +2249,23 @@ def render_config_panel(ui, prefix):
     # ---------------------------------------------------------------- Strategy
     ui.markdown("### 📐 Strategy")
     strategy = cfg_selectbox(ui, prefix, "strategy", "Strategy", STRATEGIES)
+    cfg_selectbox(ui, prefix, "trade_type", "Trade Direction", ["Both", "Long Only", "Short Only"], default="Both",
+                  help="Both (default): take long and short signals. Long Only / Short Only: signals in the other "
+                       "direction are ignored everywhere — backtest, optimization, heatmaps AND live trading.")
+    if strategy in IMMEDIATE_EXECUTION_STRATEGIES:
+        ui.caption("⚡ This is a price condition, not a candle strategy — in LIVE trading it enters IMMEDIATELY "
+                   "at LTP the moment the condition is met (no waiting for the next candle open).")
 
     if strategy in ("EMA Crossover", "Pro: EMA50 Trend + EMA9/15 Pullback"):
         cfg_number(ui, prefix, "ema_fast", "EMA Fast", 2, 100, 9)
         cfg_number(ui, prefix, "ema_slow", "EMA Slow", 3, 200, 15)
     if strategy == "Threshold Cross":
         cfg_number(ui, prefix, "threshold", "Threshold Price", default=0.0)
+        thr_dir = cfg_selectbox(ui, prefix, "threshold_direction", "Cross Direction", ["Below", "Above"], default="Below",
+                                help="Below: price must approach the threshold FROM BELOW and cross UP through it (long). "
+                                     "Above: price approaches from above and crosses DOWN through it (short).")
+        ui.caption("↗️ Crossing UP from below → LONG entry." if thr_dir == "Below"
+                   else "↘️ Crossing DOWN from above → SHORT entry.")
     if strategy == "Price Action Support/Resistance":
         cfg_number(ui, prefix, "sr_window", "S/R Lookback", 5, 200, 20)
     if strategy == "Liquidity Grab Reversal":
@@ -2192,6 +2371,30 @@ def render_config_panel(ui, prefix):
             "keep it ≥ the first. No cap is applied to how high you can set either value."
         )
 
+    # ------------------------------------------------ Daily limits & timing
+    ui.markdown("### 🛡 Daily Risk Limits & Trade Timing (LIVE)")
+    ui.caption("All off by default. These gates apply to LIVE trading entries/exits (realized points from today's closed trades).")
+    if cfg_checkbox(ui, prefix, "max_loss_day_enabled", "Max Loss in a Day", default=False):
+        cfg_number(ui, prefix, "max_loss_day_points", "Max loss (points)", min_value=1.0, default=100.0, step=10.0)
+        ui.caption("Once today's realized points reach −this value, no new entries are taken for the rest of the day.")
+    if cfg_checkbox(ui, prefix, "max_profit_day_enabled", "Max Profit in a Day", default=False):
+        cfg_number(ui, prefix, "max_profit_day_points", "Max profit (points)", min_value=1.0, default=200.0, step=10.0)
+        ui.caption("Once today's realized points reach +this value, trading stops for the day to lock in gains.")
+    if cfg_checkbox(ui, prefix, "max_trades_enabled", "Max Number of Trades in a Day", default=False):
+        cfg_number(ui, prefix, "max_trades_day", "Max trades", min_value=1, default=10, step=1)
+    if cfg_checkbox(ui, prefix, "max_profit_hold_enabled", "Max Hold Duration of Profitable Trade", default=False):
+        cfg_number(ui, prefix, "max_profit_hold_minutes", "Max hold while in profit (minutes)", min_value=0.1, default=1.0, step=0.5)
+        ui.caption("If the open position has been held at least this long AND is currently in profit, it's booked immediately.")
+    if cfg_checkbox(ui, prefix, "trade_window_enabled", "Trade Window (IST — Indian tickers only)", default=False):
+        c1, c2 = ui.columns(2)
+        cfg_time(c1, prefix, "trade_window_start", "Start time (IST)", dt_time(9, 15))
+        cfg_time(c2, prefix, "trade_window_end", "End time (IST)", dt_time(15, 30))
+        ui.caption("New entries are only taken between these times (IST). Enforced for Indian tickers "
+                   "(.NS / .BO / Nifty / BankNifty / Sensex); non-Indian tickers like BTC-USD ignore it.")
+    if cfg_checkbox(ui, prefix, "entry_cooldown_enabled", "Enable Entry Cooldown", default=False):
+        cfg_number(ui, prefix, "entry_cooldown_seconds", "Cooldown (seconds)", min_value=0.1, default=1.0, step=0.5)
+        ui.caption("After any entry/exit event, new entries are blocked for this many seconds.")
+
     # ----------------------------------------------------------------- Filters
     ui.markdown("### 🔍 Additional Entry Filters")
     if cfg_checkbox(ui, prefix, "adx_enabled", "ADX Filter", default=False):
@@ -2280,9 +2483,19 @@ def render_config_panel(ui, prefix):
             ui.caption("Using the Dhan Client ID / Access Token from the 🔐 Dhan Account section above.")
 
         inst = cfg_selectbox(ui, prefix, "dhan_instrument", "Instrument", DHAN_INSTRUMENTS, default="Stock Intraday")
+        cfg_selectbox(ui, prefix, "dhan_exchange", "Exchange", ["NSE", "BSE"], default="NSE",
+                      help="NSE for Nifty / BankNifty / NSE stocks (default); BSE for Sensex / BSE-listed stocks. "
+                           "Auto-flips to BSE when a Sensex or .BO ticker is selected — always editable.")
+        _auto_note = ("auto-fetched from the Dhan scrip master — editable"
+                      if (cfg.get("use_dhan_data") or cfg.get("dhan_enabled")) and cfg.get("_dhan_auto_failed") is not True
+                      else "enter manually")
 
         if inst in ("Stock Intraday", "Stock Delivery", "Stock Futures", "Index Futures"):
-            cfg_text(ui, prefix, "dhan_security_id", "Security ID (auto-fetched from Dhan scrip master — editable)", default="")
+            cfg_text(ui, prefix, "dhan_security_id", f"Security ID — mandatory ({_auto_note})", default="")
+            if not str(cfg.get("dhan_security_id", "")).strip():
+                ui.error("Security ID is mandatory — orders cannot be routed without it. "
+                         + ("It auto-fills from the scrip master; if it stays empty, check connectivity or enter it manually."
+                            if (cfg.get("use_dhan_data") or cfg.get("dhan_enabled")) else "Enter it manually (yfinance mode does not auto-fill)."))
             if "Futures" in inst:
                 fut_opts = cfg.get("_dhan_fut_expiries") or []
                 if fut_opts:
@@ -2310,6 +2523,13 @@ def render_config_panel(ui, prefix):
             c1, c2 = ui.columns(2)
             cfg_number(c1, prefix, "dhan_ce_strike", "CE Strike Price (default ATM)", min_value=0.0, default=0.0, step=50.0)
             cfg_number(c2, prefix, "dhan_pe_strike", "PE Strike Price (default ATM)", min_value=0.0, default=0.0, step=50.0)
+            s1, s2 = ui.columns(2)
+            cfg_text(s1, prefix, "dhan_ce_security_id", f"CE Security ID — mandatory ({_auto_note})", default="")
+            cfg_text(s2, prefix, "dhan_pe_security_id", f"PE Security ID — mandatory ({_auto_note})", default="")
+            if not str(cfg.get("dhan_ce_security_id", "")).strip() or not str(cfg.get("dhan_pe_security_id", "")).strip():
+                ui.error("CE and PE Security IDs are mandatory — option orders cannot be routed without them. "
+                         + ("They auto-fill for the selected expiry/strikes; if empty, check connectivity or enter manually."
+                            if (cfg.get("use_dhan_data") or cfg.get("dhan_enabled")) else "Enter them manually (yfinance mode does not auto-fill)."))
             cfg_number(ui, prefix, "dhan_qty", "Dhan Quantity (lot size — 65 Nifty / 35 BankNifty / 20 Sensex by default)",
                        min_value=1, default=1, step=1)
             c3, c4 = ui.columns(2)
@@ -2358,7 +2578,8 @@ sl_type = cfg.get("sl_type", SL_TYPES[0])
 target_type = cfg.get("target_type", TARGET_TYPES[0])
 
 PARAM_DEFAULTS = {
-    "ema_fast": 9, "ema_slow": 15, "threshold": 0.0, "sr_window": 20, "liq_window": 20,
+    "ema_fast": 9, "ema_slow": 15, "threshold": 0.0, "threshold_direction": "Below",
+    "trade_type": "Both", "sr_window": 20, "liq_window": 20,
     "rsi_period": 14, "bb_period": 20, "bb_std": 2.0, "vol_window": 20, "vol_factor": 2.0,
     "zigzag_lookback": 3, "st_period": 10, "st_mult": 3.0, "orb_candles": 5,
     "macd_fast": 12, "macd_slow": 26, "macd_signal": 9, "donchian_period": 20,
@@ -2408,7 +2629,7 @@ def build_product_cfg(cfg, ticker_choice, ticker):
     shared config store."""
     inst = cfg.get("dhan_instrument", "Stock Intraday")
     underlying = dhan_underlying_symbol(ticker_choice, ticker)
-    exch = "BSE" if (ticker_choice == "Sensex" or str(ticker).upper().endswith(".BO")) else "NSE"
+    exch = cfg.get("dhan_exchange") or ("BSE" if (ticker_choice == "Sensex" or str(ticker).upper().endswith(".BO")) else "NSE")
     pc = {
         "instrument": inst,
         "underlying": underlying,
@@ -2435,8 +2656,13 @@ def build_product_cfg(cfg, ticker_choice, ticker):
         pc["expiry"] = str(cfg.get("dhan_opt_expiry", "")).strip()
         pc["ce_strike"] = float(cfg.get("dhan_ce_strike", 0) or 0)
         pc["pe_strike"] = float(cfg.get("dhan_pe_strike", 0) or 0)
-        pc["ce_security_id"] = lookup_option_security_id(underlying, pc["expiry"], pc["ce_strike"], "CE") or ""
-        pc["pe_security_id"] = lookup_option_security_id(underlying, pc["expiry"], pc["pe_strike"], "PE") or ""
+        # The CE/PE Security ID input boxes are the source of truth (auto-filled
+        # in Dhan mode, manual in yfinance mode); scrip-master lookup is only a
+        # fallback if they were left empty.
+        pc["ce_security_id"] = str(cfg.get("dhan_ce_security_id", "")).strip() or (
+            lookup_option_security_id(underlying, pc["expiry"], pc["ce_strike"], "CE") or "")
+        pc["pe_security_id"] = str(cfg.get("dhan_pe_security_id", "")).strip() or (
+            lookup_option_security_id(underlying, pc["expiry"], pc["pe_strike"], "PE") or "")
     return pc
 
 
@@ -2668,9 +2894,9 @@ def evaluate_live_signal(ticker, interval, period, strategy, params, filters, sl
     )
 
     # Immediate-execution strategies (Simple Buy/Sell Only, Threshold Cross)
-    # check the CURRENT price against the last CLOSED candle directly — no
-    # "wait for this candle to close" delay, since there's no candle shape to
-    # confirm, just a price level.
+    # check the CURRENT price against the last CLOSED candle directly and enter
+    # IMMEDIATELY at LTP — no "wait for next candle open" delay, since these
+    # aren't candle-shape strategies, just price conditions.
     if strategy in IMMEDIATE_EXECUTION_STRATEGIES:
         prev_close = float(sig_df["Close"].iloc[-2])
         if strategy == "Simple Buy Only":
@@ -2678,13 +2904,20 @@ def evaluate_live_signal(ticker, interval, period, strategy, params, filters, sl
         elif strategy == "Simple Sell Only":
             last_sig = -1 if ltp < prev_close else 0
         else:  # Threshold Cross
-            thr = params.get("threshold", prev_close)
-            if ltp > thr and prev_close <= thr:
-                last_sig = 1
-            elif ltp < thr and prev_close >= thr:
-                last_sig = -1
-            else:
-                last_sig = 0
+            thr = cfg_live.get("threshold", params.get("threshold", prev_close))
+            thr_dir = cfg_live.get("threshold_direction", params.get("threshold_direction", "Below"))
+            last_sig = 0
+            if thr_dir == "Below":
+                # Cross the level from BELOW (upward) → long.
+                if ltp > thr and prev_close <= thr:
+                    last_sig = 1
+            else:  # "Above" — cross from above (downward) → short.
+                if ltp < thr and prev_close >= thr:
+                    last_sig = -1
+        # Trade Direction filter also applies to immediate strategies.
+        tt = cfg_live.get("trade_type", "Both")
+        if (tt == "Long Only" and last_sig == -1) or (tt == "Short Only" and last_sig == 1):
+            last_sig = 0
         entry_reference_price = ltp
     else:
         last_sig = int(sig_df["signal"].iloc[-2])  # last CLOSED candle's signal
@@ -2717,6 +2950,18 @@ def evaluate_live_signal(ticker, interval, period, strategy, params, filters, sl
             sp_exit, sp_price, sp_reason = check_special_exit_conditions(pos, {"Close": ref_price})
             if sp_exit:
                 exited, exit_price, reason = True, sp_price, sp_reason
+        if not exited and cfg_live.get("max_profit_hold_enabled"):
+            # Max hold duration for a PROFITABLE trade: once held ≥ N minutes
+            # AND currently in profit, book it.
+            try:
+                entry_ts = pd.Timestamp(pos["entry_time"])
+                now_ts = pd.Timestamp.now(tz=entry_ts.tz) if entry_ts.tz is not None else pd.Timestamp.now()
+                held_min = (now_ts - entry_ts).total_seconds() / 60.0
+            except Exception:
+                held_min = 0.0
+            pl_pts = (ref_price - pos["entry_price"]) * pos["direction"]
+            if pl_pts > 0 and held_min >= float(cfg_live.get("max_profit_hold_minutes", 1.0)):
+                exited, exit_price, reason = True, ref_price, f"Max Profitable Hold ({held_min:.1f} min in profit)"
         if not exited and risk_ctrl.get("loss_duration_enabled"):
             td_exit, td_price, td_reason = check_time_based_exit(
                 pos, sig_df.index[i], ref_price,
@@ -2791,6 +3036,7 @@ def evaluate_live_signal(ticker, interval, period, strategy, params, filters, sl
                 "Exit Reason": reason, "Qty": pos["remaining_qty"],
             })
             st.session_state.live_positions = []
+            st.session_state.last_trade_event_ts = time.time()
             st.success(f"Position closed: {reason} @ {exit_price:.2f}")
             if dhan_enabled and dhan_should_send_exit(product_cfg, reason):
                 leg_id, side = resolve_dhan_order_leg(pos["direction"], False, ticker, product_cfg)
@@ -2820,6 +3066,10 @@ def evaluate_live_signal(ticker, interval, period, strategy, params, filters, sl
         if st.session_state.get("last_acted_signal_marker") == signal_marker:
             st.caption(f"Signal at {signal_marker[0]} already acted on — waiting for a genuinely new signal before re-entering.")
         else:
+            gate_ok, gate_reason = check_live_entry_gates(cfg_live, ticker)
+            if not gate_ok:
+                st.warning(f"🚧 Entry blocked: {gate_reason}")
+                return sig_df
             entry_price = entry_reference_price
             a_val = a_series.iloc[-1] if not np.isnan(a_series.iloc[-1]) else entry_price * 0.005
             sl, target, sl_dist, target_dist = calc_initial_sl_target(last_sig, entry_price, a_val, params, sl_type, target_type)
@@ -2839,6 +3089,7 @@ def evaluate_live_signal(ticker, interval, period, strategy, params, filters, sl
             }
             st.session_state.live_positions = [new_pos]
             st.session_state.last_acted_signal_marker = signal_marker
+            _record_entry_taken()
             st.success(f"New {'LONG' if last_sig == 1 else 'SHORT'} position opened @ {entry_price:.2f}")
             if dhan_enabled:
                 leg_id, side = resolve_dhan_order_leg(last_sig, True, ticker, product_cfg)
@@ -3223,6 +3474,7 @@ with tab_live:
             "Exit Reason": "Manual Square Off", "Qty": pos["remaining_qty"],
         })
         st.session_state.live_positions = []
+        st.session_state.last_trade_event_ts = time.time()
         st.warning(f"Manually squared off @ {exit_price:.2f}")
         if dhan_enabled:
             leg_id, side = resolve_dhan_order_leg(pos["direction"], False, ticker, product_cfg)
