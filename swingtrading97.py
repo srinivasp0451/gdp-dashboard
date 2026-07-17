@@ -1072,6 +1072,14 @@ def generate_signals(df, strategy, params):
 
     df["signal"] = df["signal"].fillna(0)
 
+    # ---- Flip / Reverse signals (Long ↔ Short) ---------------------------
+    # Off by default. When ON, every long signal becomes a short entry and
+    # vice-versa — applied to backtest AND live identically. For options this
+    # still maps direction→leg downstream (long→CE BUY, short→PE BUY): flipped
+    # signals BUY the other leg — never any option selling.
+    if params.get("flip_signals", False):
+        df["signal"] = -df["signal"]
+
     # ---- Trade Direction filter (Both / Long Only / Short Only) ----------
     # Applied centrally so it affects backtests, optimization, heatmaps AND
     # live trading identically.
@@ -1403,31 +1411,33 @@ def detect_signal_exit_condition(trade, i, df, params):
 
 def check_hard_exit(trade, candle):
     """
-    BACKTEST-ONLY. Hard SL/Target check using only the CURRENT candle's own
-    high/low against levels set from PAST data (entry price, ATR at signal
-    time, trailing updates). No look-ahead here — these levels never depend
-    on this candle's own close. Conservative fill order: longs check SL(low)
-    before Target(high); shorts check SL(high) before Target(low).
+    Hard SL/Target check using only the CURRENT candle's own high/low against
+    levels set from PAST data (entry price, ATR at signal time, trailing
+    updates). No look-ahead — these levels never depend on this candle's own
+    close. Conservative order: longs check SL(low) before Target(high);
+    shorts check SL(high) before Target(low). Used by BOTH the backtest and
+    live candle-logic mode so the two engines behave identically.
 
-    This candle-range approach exists because a backtest has no live ticks —
-    only OHLC bars — so it can't know the exact path price took inside a
-    candle, hence the conservative "assume the worse touch happened first"
-    rule. Live trading uses check_hard_exit_ltp() below instead, which
-    compares directly against the last-traded price — see that function's
-    docstring for why that's the correct approach once you have real tick
-    data (e.g. via Dhan) instead of polled candles.
+    SL FILL = CANDLE CLOSE (realistic poll-based fill): a poll-based system
+    only DISCOVERS the SL breach when the candle completes — nobody exits the
+    trade at the exact moment Low touched SL. The honest fill price is
+    therefore the candle's CLOSE, not the SL level. LONG: Low <= SL → exit at
+    Close; SHORT: High >= SL → exit at Close. This makes backtest P&L match
+    what a live close-triggered exit actually achieves (including the
+    overshoot beyond SL when a candle keeps running). Target fills remain at
+    the target price (a resting limit order at target genuinely fills there).
     """
     direction = trade["direction"]
     target_display_only = trade["target_type"] == "Trailing Target (Display Only)"
 
     if direction == 1:
         if candle["Low"] <= trade["sl"]:
-            return True, trade["sl"], "Stoploss Hit"
+            return True, float(candle["Close"]), "Stoploss Hit"
         if not target_display_only and candle["High"] >= trade["target"]:
             return True, trade["target"], "Target Hit"
     else:
         if candle["High"] >= trade["sl"]:
-            return True, trade["sl"], "Stoploss Hit"
+            return True, float(candle["Close"]), "Stoploss Hit"
         if not target_display_only and candle["Low"] <= trade["target"]:
             return True, trade["target"], "Target Hit"
 
@@ -1512,6 +1522,12 @@ def run_backtest(raw_df, strategy, sl_type, target_type, params, filters, qty, r
 
     def close_trade(exit_price, exit_time, reason, qty_to_close):
         points = (exit_price - open_trade["entry_price"]) * open_trade["direction"]
+        try:
+            _c = df.loc[exit_time]
+            _ohlc = {"Candle Open": round(float(_c["Open"]), 2), "Candle High": round(float(_c["High"]), 2),
+                     "Candle Low": round(float(_c["Low"]), 2), "Candle Close": round(float(_c["Close"]), 2)}
+        except Exception:
+            _ohlc = {"Candle Open": None, "Candle High": None, "Candle Low": None, "Candle Close": None}
         trades.append({
             "Entry Time": open_trade["entry_time"], "Entry Price": round(open_trade["entry_price"], 2),
             "Direction": "LONG" if open_trade["direction"] == 1 else "SHORT",
@@ -1519,7 +1535,7 @@ def run_backtest(raw_df, strategy, sl_type, target_type, params, filters, qty, r
             "SL": round(open_trade["initial_sl"], 2), "Target": round(open_trade["initial_target"], 2),
             "Highest": round(open_trade["highest"], 2), "Lowest": round(open_trade["lowest"], 2),
             "Points": round(points, 2), "PnL": round(points * qty_to_close, 2),
-            "Exit Reason": reason, "Qty": qty_to_close,
+            "Exit Reason": reason, "Qty": qty_to_close, **_ohlc,
         })
 
     for i in range(1, len(df) - 1):
@@ -1597,6 +1613,7 @@ def run_backtest(raw_df, strategy, sl_type, target_type, params, filters, qty, r
                         book_qty = max(1, round(open_trade["original_qty"] * open_trade["partial_book_pct"] / 100.0))
                         book_qty = min(book_qty, open_trade["remaining_qty"])
                         partial_points = (hard_price - open_trade["entry_price"]) * open_trade["direction"]
+                        _pc = df.iloc[i]
                         trades.append({
                             "Entry Time": open_trade["entry_time"], "Entry Price": round(open_trade["entry_price"], 2),
                             "Direction": "LONG" if open_trade["direction"] == 1 else "SHORT",
@@ -1606,6 +1623,8 @@ def run_backtest(raw_df, strategy, sl_type, target_type, params, filters, qty, r
                             "Points": round(partial_points, 2), "PnL": round(partial_points * book_qty, 2),
                             "Exit Reason": f"Partial Book ({book_qty}/{open_trade['original_qty']} qty @ Target 1)",
                             "Qty": book_qty,
+                            "Candle Open": round(float(_pc["Open"]), 2), "Candle High": round(float(_pc["High"]), 2),
+                            "Candle Low": round(float(_pc["Low"]), 2), "Candle Close": round(float(_pc["Close"]), 2),
                         })
                         open_trade["remaining_qty"] -= book_qty
                         open_trade["partial_booked"] = True
@@ -1951,12 +1970,12 @@ def check_live_entry_gates(cfg_live, ticker):
     # Max loss in day
     if cfg_live.get("max_loss_day_enabled"):
         day_pts = _day_realized_points()
-        if day_pts <= -abs(float(cfg_live.get("max_loss_day_points", 100.0))):
+        if day_pts <= -abs(float(cfg_live.get("max_loss_day_points", 20.0))):
             return False, f"Max loss/day hit ({day_pts:+.1f} pts) — no new entries today."
     # Max profit in day
     if cfg_live.get("max_profit_day_enabled"):
         day_pts = _day_realized_points()
-        if day_pts >= abs(float(cfg_live.get("max_profit_day_points", 200.0))):
+        if day_pts >= abs(float(cfg_live.get("max_profit_day_points", 100.0))):
             return False, f"Max profit/day reached ({day_pts:+.1f} pts) — locking in gains, no new entries today."
     # Max number of trades
     if cfg_live.get("max_trades_enabled"):
@@ -2032,7 +2051,9 @@ def _seed_widget(prefix, name, value):
 
 
 def cfg_checkbox(ui, prefix, name, label, default=False, help=None):
-    wkey = _seed_widget(prefix, name, bool(st.session_state.app_cfg.get(name, default)))
+    cur = bool(st.session_state.app_cfg.get(name, default))
+    st.session_state.app_cfg[name] = cur
+    wkey = _seed_widget(prefix, name, cur)
     return ui.checkbox(label, key=wkey, on_change=_cfg_store, args=(wkey, name), help=help)
 
 
@@ -2043,6 +2064,10 @@ def cfg_selectbox(ui, prefix, name, label, options, default=None, help=None):
     cur = st.session_state.app_cfg.get(name, default if default is not None else options[0])
     if cur not in options:
         cur = default if default in options else options[0]
+    # Write the (possibly coerced) value back so the store NEVER disagrees
+    # with what the widget shows — a store/widget mismatch after an option
+    # list changed was the "dropdown change not reflecting" bug.
+    st.session_state.app_cfg[name] = cur
     wkey = _seed_widget(prefix, name, cur)
     return ui.selectbox(label, options, key=wkey, on_change=_cfg_store, args=(wkey, name), help=help)
 
@@ -2058,13 +2083,16 @@ def cfg_number(ui, prefix, name, label, min_value=None, max_value=None, default=
         cur = max(cur, min_value)
     if max_value is not None:
         cur = min(cur, max_value)
+    st.session_state.app_cfg[name] = cur  # keep store == widget after cast/clamp
     wkey = _seed_widget(prefix, name, cur)
     return ui.number_input(label, min_value=min_value, max_value=max_value, step=step,
                            key=wkey, on_change=_cfg_store, args=(wkey, name), help=help)
 
 
 def cfg_text(ui, prefix, name, label, default="", help=None, password=False):
-    wkey = _seed_widget(prefix, name, str(st.session_state.app_cfg.get(name, default)))
+    cur = str(st.session_state.app_cfg.get(name, default))
+    st.session_state.app_cfg[name] = cur
+    wkey = _seed_widget(prefix, name, cur)
     kwargs = dict(key=wkey, on_change=_cfg_store, args=(wkey, name), help=help)
     if password:
         kwargs["type"] = "password"
@@ -2077,6 +2105,7 @@ def cfg_slider(ui, prefix, name, label, min_value, max_value, default):
     except (TypeError, ValueError):
         cur = default
     cur = min(max(cur, min_value), max_value)
+    st.session_state.app_cfg[name] = cur
     wkey = _seed_widget(prefix, name, cur)
     return ui.slider(label, min_value, max_value, key=wkey, on_change=_cfg_store, args=(wkey, name))
 
@@ -2085,6 +2114,7 @@ def cfg_time(ui, prefix, name, label, default, help=None):
     cur = st.session_state.app_cfg.get(name, default)
     if not isinstance(cur, dt_time):
         cur = default
+    st.session_state.app_cfg[name] = cur
     wkey = _seed_widget(prefix, name, cur)
     return ui.time_input(label, key=wkey, on_change=_cfg_store, args=(wkey, name), help=help)
 
@@ -2252,6 +2282,12 @@ def render_config_panel(ui, prefix):
     cfg_selectbox(ui, prefix, "trade_type", "Trade Direction", ["Both", "Long Only", "Short Only"], default="Both",
                   help="Both (default): take long and short signals. Long Only / Short Only: signals in the other "
                        "direction are ignored everywhere — backtest, optimization, heatmaps AND live trading.")
+    if cfg_checkbox(ui, prefix, "flip_signals", "Flip / Reverse Entries (Long ↔ Short)", default=False,
+                    help="When ON: a long signal enters SHORT, a short signal enters LONG — everywhere (backtest, "
+                         "optimization, live). Useful to trade the inverse of a consistently losing signal."):
+        ui.caption("🔄 Signals are REVERSED. Stocks/futures: flipped long → SELL entry, flipped short → BUY entry. "
+                   "Options: flipped signals just BUY the other leg (long→PE, short→CE) — options are always "
+                   "BOUGHT, never sold, in every mode.")
     if strategy in IMMEDIATE_EXECUTION_STRATEGIES:
         ui.caption("⚡ This is a price condition, not a candle strategy — in LIVE trading it enters IMMEDIATELY "
                    "at LTP the moment the condition is met (no waiting for the next candle open).")
@@ -2375,10 +2411,10 @@ def render_config_panel(ui, prefix):
     ui.markdown("### 🛡 Daily Risk Limits & Trade Timing (LIVE)")
     ui.caption("All off by default. These gates apply to LIVE trading entries/exits (realized points from today's closed trades).")
     if cfg_checkbox(ui, prefix, "max_loss_day_enabled", "Max Loss in a Day", default=False):
-        cfg_number(ui, prefix, "max_loss_day_points", "Max loss (points)", min_value=1.0, default=100.0, step=10.0)
+        cfg_number(ui, prefix, "max_loss_day_points", "Max loss (points)", min_value=1.0, default=20.0, step=5.0)
         ui.caption("Once today's realized points reach −this value, no new entries are taken for the rest of the day.")
     if cfg_checkbox(ui, prefix, "max_profit_day_enabled", "Max Profit in a Day", default=False):
-        cfg_number(ui, prefix, "max_profit_day_points", "Max profit (points)", min_value=1.0, default=200.0, step=10.0)
+        cfg_number(ui, prefix, "max_profit_day_points", "Max profit (points)", min_value=1.0, default=100.0, step=10.0)
         ui.caption("Once today's realized points reach +this value, trading stops for the day to lock in gains.")
     if cfg_checkbox(ui, prefix, "max_trades_enabled", "Max Number of Trades in a Day", default=False):
         cfg_number(ui, prefix, "max_trades_day", "Max trades", min_value=1, default=10, step=1)
@@ -2579,7 +2615,7 @@ target_type = cfg.get("target_type", TARGET_TYPES[0])
 
 PARAM_DEFAULTS = {
     "ema_fast": 9, "ema_slow": 15, "threshold": 0.0, "threshold_direction": "Below",
-    "trade_type": "Both", "sr_window": 20, "liq_window": 20,
+    "trade_type": "Both", "flip_signals": False, "sr_window": 20, "liq_window": 20,
     "rsi_period": 14, "bb_period": 20, "bb_std": 2.0, "vol_window": 20, "vol_factor": 2.0,
     "zigzag_lookback": 3, "st_period": 10, "st_mult": 3.0, "orb_candles": 5,
     "macd_fast": 12, "macd_slow": 26, "macd_signal": 9, "donchian_period": 20,
@@ -2914,6 +2950,9 @@ def evaluate_live_signal(ticker, interval, period, strategy, params, filters, sl
             else:  # "Above" — cross from above (downward) → short.
                 if ltp < thr and prev_close >= thr:
                     last_sig = -1
+        # Flip/Reverse applies to immediate strategies too.
+        if cfg_live.get("flip_signals", False):
+            last_sig = -last_sig
         # Trade Direction filter also applies to immediate strategies.
         tt = cfg_live.get("trade_type", "Both")
         if (tt == "Long Only" and last_sig == -1) or (tt == "Short Only" and last_sig == 1):
@@ -2987,6 +3026,8 @@ def evaluate_live_signal(ticker, interval, period, strategy, params, filters, sl
                         "Direction": "LONG" if pos["direction"] == 1 else "SHORT",
                         "Exit Time": sig_df.index[-1], "Exit Price": round(float(hard_price), 2),
                         "SL": round(pos["initial_sl"], 2), "Target": round(pos["initial_target"], 2),
+                        "Candle Open": round(float(candle["Open"]), 2), "Candle High": round(float(candle["High"]), 2),
+                        "Candle Low": round(float(candle["Low"]), 2), "Candle Close": round(float(candle["Close"]), 2),
                         "Highest": round(pos["highest"], 2), "Lowest": round(pos["lowest"], 2),
                         "Points": round(partial_points, 2), "PnL": round(partial_points * book_qty, 2),
                         "Exit Reason": f"Partial Book ({book_qty}/{pos['original_qty']} qty @ Target 1)", "Qty": book_qty,
@@ -3031,6 +3072,8 @@ def evaluate_live_signal(ticker, interval, period, strategy, params, filters, sl
                 "Direction": "LONG" if pos["direction"] == 1 else "SHORT",
                 "Exit Time": sig_df.index[-1], "Exit Price": round(float(exit_price), 2),
                 "SL": round(pos["initial_sl"], 2), "Target": round(pos["initial_target"], 2),
+                "Candle Open": round(float(candle["Open"]), 2), "Candle High": round(float(candle["High"]), 2),
+                "Candle Low": round(float(candle["Low"]), 2), "Candle Close": round(float(candle["Close"]), 2),
                 "Highest": round(pos["highest"], 2), "Lowest": round(pos["lowest"], 2),
                 "Points": round(points, 2), "PnL": round(points * pos["remaining_qty"], 2),
                 "Exit Reason": reason, "Qty": pos["remaining_qty"],
@@ -3463,6 +3506,12 @@ with tab_live:
         pos = st.session_state.live_positions[0]
         raw = fetch_data(ticker, interval, period)
         exit_price = float(raw["Close"].iloc[-1]) if not raw.empty else pos["current_price"]
+        if not raw.empty:
+            _sc = raw.iloc[-1]
+            _so = {"Candle Open": round(float(_sc["Open"]), 2), "Candle High": round(float(_sc["High"]), 2),
+                   "Candle Low": round(float(_sc["Low"]), 2), "Candle Close": round(float(_sc["Close"]), 2)}
+        else:
+            _so = {"Candle Open": None, "Candle High": None, "Candle Low": None, "Candle Close": None}
         points = (exit_price - pos["entry_price"]) * pos["direction"]
         st.session_state.live_history.append({
             "Entry Time": pos["entry_time"], "Entry Price": round(pos["entry_price"], 2),
@@ -3471,7 +3520,7 @@ with tab_live:
             "SL": round(pos["initial_sl"], 2), "Target": round(pos["initial_target"], 2),
             "Highest": round(pos["highest"], 2), "Lowest": round(pos["lowest"], 2),
             "Points": round(points, 2), "PnL": round(points * pos["remaining_qty"], 2),
-            "Exit Reason": "Manual Square Off", "Qty": pos["remaining_qty"],
+            "Exit Reason": "Manual Square Off", "Qty": pos["remaining_qty"], **_so,
         })
         st.session_state.live_positions = []
         st.session_state.last_trade_event_ts = time.time()
