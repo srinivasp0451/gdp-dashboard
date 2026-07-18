@@ -2861,15 +2861,11 @@ def describe_signal_status(df, strategy, params, filters):
     return lines
 
 
-@st.fragment(run_every=3)
-def live_dashboard_fragment(ticker, interval, period, strategy, params, filters):
-    """
-    Everything here re-renders on its own every ~3s WITHOUT rerunning the rest
-    of the page — this is what makes the signal status board (RSI/EMA/ADX/etc.
-    values) update live instead of only on button click or full page refresh.
-    Only ever mounted while Live Monitoring is ON, so it costs zero extra API
-    calls while stopped.
-    """
+def render_live_dashboard(ticker, interval, period, strategy, params, filters, live=True):
+    """Renders the 📊 Indicator Dashboard + 📟 Signal Status Board (all
+    confluence/filter statuses). Called by the auto-refreshing fragment while
+    monitoring is ON, and directly (single static snapshot) while it's OFF —
+    so the board is ALWAYS visible on the Live tab."""
     raw_status = fetch_data(ticker, interval, period)
     if raw_status.empty or len(raw_status) < 30:
         st.caption("Not enough data yet to compute signal status.")
@@ -2897,9 +2893,24 @@ def live_dashboard_fragment(ticker, interval, period, strategy, params, filters)
         cols[3].metric("RSI", f"{rsi_val:.1f}" if rsi_ok else "N/A")
 
     st.markdown("###### 📟 Signal Status Board")
-    st.caption("What the current (last closed) candle is showing vs. what's needed to trigger a fresh buy or sell. Updates automatically every ~3s while live monitoring is on.")
+    if live:
+        st.caption("What the current (last closed) candle is showing vs. what's needed to trigger a fresh buy or sell. Updates automatically every ~3s while live monitoring is on.")
+    else:
+        st.caption("What the current (last closed) candle is showing vs. what's needed to trigger a fresh buy or sell. Static snapshot — click Start for live auto-refresh every ~3s.")
     for line in describe_signal_status(raw_status, strategy, params, filters):
         st.write("• " + line)
+
+
+@st.fragment(run_every=3)
+def live_dashboard_fragment(ticker, interval, period, strategy, params, filters):
+    """
+    Everything here re-renders on its own every ~3s WITHOUT rerunning the rest
+    of the page — this is what makes the signal status board (RSI/EMA/ADX/etc.
+    values) update live instead of only on button click or full page refresh.
+    Only ever mounted while Live Monitoring is ON, so it costs zero extra API
+    calls while stopped.
+    """
+    render_live_dashboard(ticker, interval, period, strategy, params, filters, live=True)
 
 
 def evaluate_live_signal(ticker, interval, period, strategy, params, filters, sl_type, target_type, qty,
@@ -3588,12 +3599,11 @@ with tab_live:
     if st.session_state.live_running:
         live_dashboard_fragment(ticker, interval, period, strategy, params, filters)
     else:
-        st.caption("📊 Indicator Dashboard / 📟 Signal Status Board are paused while monitoring is OFF. Click Start to see them update live, or Evaluate Once for a single snapshot below.")
-        if manual_eval:
-            raw_status = fetch_data(ticker, interval, period)
-            if not raw_status.empty and len(raw_status) >= 30:
-                for line in describe_signal_status(raw_status, strategy, params, filters):
-                    st.write("• " + line)
+        # Monitoring OFF: still show the full Indicator Dashboard + Signal
+        # Status Board as a static snapshot, so the confluence/parameter
+        # status is ALWAYS visible on this tab (it just doesn't auto-refresh
+        # until you click Start).
+        render_live_dashboard(ticker, interval, period, strategy, params, filters, live=False)
 
     st.markdown("#### Chart — EMA Overlay")
     raw_status = fetch_data(ticker, interval, period)
