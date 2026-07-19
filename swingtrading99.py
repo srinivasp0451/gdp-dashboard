@@ -260,154 +260,159 @@ if st.session_state.risk_day_key != _today_key:
 # SHARED CONFIG STORE + TWO-WAY SYNCED WIDGET WRAPPERS
 # ----------------------------------------------------------------------------
 # The Sidebar and the "🛠 Admin Panel" tab are two live views of ONE store:
-# st.session_state.app_cfg. Every control below is rendered through a wrapper
-# that (a) seeds the widget's own session key from the store BEFORE render —
-# and only when the value actually differs, which prevents the state churn
-# that used to make buttons need multiple clicks — and (b) writes the value
-# back into the store via on_change. Whenever a value has to be coerced
-# (option list changed, clamping, casting), the coerced value is immediately
-# written back to the store so the store can never disagree with what the
-# widget shows (this is the fix for "dropdown change not reflecting").
+# st.session_state.app_cfg. Every control is rendered through a wrapper using
+# a deterministic, callback-free sync (see _cfg_sync below): per run, the
+# WIDGET wins when the user changed it since the last render (robust even
+# when Streamlit misses a change event because a rerun was superseded — e.g.
+# toggling a checkbox and clicking "Run Backtest" immediately), otherwise the
+# STORE seeds the widget (cross-view edits, the Optimization tab's
+# apply-config, autofills). Coerced values (option list changed, clamping,
+# casting) are written straight back to the store so the store can never
+# disagree with what the widget shows.
 # ============================================================================
 
 def _cfg_store():
     return st.session_state.app_cfg
 
 
-def _cfg_seed(widget_key, value):
-    """Seed the widget's session key from the store only when it differs."""
-    if st.session_state.get(widget_key) != value:
-        st.session_state[widget_key] = value
+# --- Deterministic two-way sync (no on_change callbacks) -------------------
+# Streamlit callbacks can be MISSED when a rerun is superseded quickly (e.g.
+# toggling a checkbox and clicking "Run Backtest" almost immediately). The
+# old design then re-seeded the widget from the stale store — visibly
+# un-ticking the checkbox and running the backtest with the OLD config.
+# This version never relies on callbacks. Per widget, per run:
+#   1) WIDGET WINS: if the widget's value differs from the snapshot of what
+#      we rendered last time, the USER changed it (even if Streamlit missed
+#      the change event) → write it into the store.
+#   2) STORE SEEDS: otherwise, if the store differs from the widget, the
+#      store was changed programmatically (the other view, the Optimization
+#      tab's apply-config, an autofill) → push store → widget.
+#   3) Render, then snapshot what was rendered and commit it to the store.
+# Result: a fresh user change can never be clobbered, and cross-view edits
+# still propagate instantly.
+
+def _cfg_sync(wkey, cfg_key, default, coerce=None):
+    store = _cfg_store()
+    seen_key = "_seen_" + wkey
+    if cfg_key not in store:
+        store[cfg_key] = default
+    # 1) widget wins over a stale store (covers missed change events)
+    if wkey in st.session_state and seen_key in st.session_state \
+            and st.session_state[wkey] != st.session_state[seen_key]:
+        store[cfg_key] = st.session_state[wkey]
+    cur = store.get(cfg_key, default)
+    if coerce is not None:
+        cur = coerce(cur)
+    if store.get(cfg_key) != cur:
+        store[cfg_key] = cur          # coercion write-back
+    # 2) store seeds the widget (cross-view / programmatic changes)
+    if st.session_state.get(wkey) != cur:
+        st.session_state[wkey] = cur
+    return cur
 
 
-def _cfg_writeback(widget_key, cfg_key):
-    """on_change callback: widget value → shared store (both views update)."""
-    st.session_state.app_cfg[cfg_key] = st.session_state[widget_key]
+def _cfg_commit(wkey, cfg_key, val):
+    st.session_state["_seen_" + wkey] = val
+    _cfg_store()[cfg_key] = val
+    return val
 
 
 def cfg_checkbox(ui, label, cfg_key, default=False, prefix="sb", **kw):
-    store = _cfg_store()
-    cur = bool(store.get(cfg_key, default))
-    if store.get(cfg_key) != cur:
-        store[cfg_key] = cur          # coercion write-back
     wkey = f"w_{prefix}_{cfg_key}"
-    _cfg_seed(wkey, cur)
-    val = ui.checkbox(label, key=wkey, on_change=_cfg_writeback, args=(wkey, cfg_key), **kw)
-    store[cfg_key] = bool(val)
-    return bool(val)
+    _cfg_sync(wkey, cfg_key, bool(default), coerce=lambda v: bool(v))
+    val = ui.checkbox(label, key=wkey, **kw)
+    return _cfg_commit(wkey, cfg_key, bool(val))
 
 
 def cfg_selectbox(ui, label, cfg_key, options, default=None, prefix="sb", **kw):
-    store = _cfg_store()
     options = list(options)
     if not options:
         return None
     if default is None or default not in options:
         default = options[0]
-    cur = store.get(cfg_key, default)
-    if cur not in options:
-        cur = default                 # option list changed → coerce…
-        store[cfg_key] = cur          # …and write the coerced value back
-    else:
-        store[cfg_key] = cur
+
+    def _coerce(v):
+        return v if v in options else default   # option list changed → coerce
+
     wkey = f"w_{prefix}_{cfg_key}"
-    _cfg_seed(wkey, cur)
-    val = ui.selectbox(label, options, key=wkey, on_change=_cfg_writeback, args=(wkey, cfg_key), **kw)
-    store[cfg_key] = val
-    return val
+    _cfg_sync(wkey, cfg_key, default, coerce=_coerce)
+    val = ui.selectbox(label, options, key=wkey, **kw)
+    return _cfg_commit(wkey, cfg_key, val)
 
 
 def cfg_multiselect(ui, label, cfg_key, options, default=None, prefix="sb", **kw):
-    store = _cfg_store()
     options = list(options)
-    cur = store.get(cfg_key, list(default or []))
-    coerced = [c for c in cur if c in options]
-    if coerced != cur:
-        store[cfg_key] = coerced      # coercion write-back
-        cur = coerced
-    else:
-        store[cfg_key] = cur
+
+    def _coerce(v):
+        return [c for c in (v or []) if c in options]
+
     wkey = f"w_{prefix}_{cfg_key}"
-    _cfg_seed(wkey, cur)
-    val = ui.multiselect(label, options, key=wkey, on_change=_cfg_writeback, args=(wkey, cfg_key), **kw)
-    store[cfg_key] = list(val)
-    return list(val)
+    _cfg_sync(wkey, cfg_key, list(default or []), coerce=_coerce)
+    val = ui.multiselect(label, options, key=wkey, **kw)
+    return _cfg_commit(wkey, cfg_key, list(val))
 
 
 def cfg_number(ui, label, cfg_key, default, min_value=None, max_value=None,
                step=None, is_int=False, prefix="sb", **kw):
-    store = _cfg_store()
-    cur = store.get(cfg_key, default)
-    try:
-        cur = int(cur) if is_int else float(cur)
-    except (TypeError, ValueError):
-        cur = int(default) if is_int else float(default)
-    if min_value is not None:
-        cur = max(cur, min_value)     # clamping…
-    if max_value is not None:
-        cur = min(cur, max_value)
-    if store.get(cfg_key) != cur:
-        store[cfg_key] = cur          # …coercion write-back
+    def _coerce(v):
+        try:
+            v = int(v) if is_int else float(v)
+        except (TypeError, ValueError):
+            v = int(default) if is_int else float(default)
+        if min_value is not None:
+            v = max(v, min_value)     # clamping
+        if max_value is not None:
+            v = min(v, max_value)
+        return v
+
     wkey = f"w_{prefix}_{cfg_key}"
-    _cfg_seed(wkey, cur)
-    val = ui.number_input(label, min_value=min_value, max_value=max_value, step=step,
-                          key=wkey, on_change=_cfg_writeback, args=(wkey, cfg_key), **kw)
-    store[cfg_key] = val
-    return val
+    _cfg_sync(wkey, cfg_key, _coerce(default), coerce=_coerce)
+    val = ui.number_input(label, min_value=min_value, max_value=max_value, step=step, key=wkey, **kw)
+    return _cfg_commit(wkey, cfg_key, val)
 
 
 def cfg_text(ui, label, cfg_key, default="", prefix="sb", **kw):
-    store = _cfg_store()
-    cur = store.get(cfg_key, default)
-    cur = "" if cur is None else str(cur)
-    if store.get(cfg_key) != cur:
-        store[cfg_key] = cur          # coercion write-back
     wkey = f"w_{prefix}_{cfg_key}"
-    _cfg_seed(wkey, cur)
-    val = ui.text_input(label, key=wkey, on_change=_cfg_writeback, args=(wkey, cfg_key), **kw)
-    store[cfg_key] = val
-    return val
+    _cfg_sync(wkey, cfg_key, str(default), coerce=lambda v: "" if v is None else str(v))
+    val = ui.text_input(label, key=wkey, **kw)
+    return _cfg_commit(wkey, cfg_key, val)
 
 
 def cfg_slider(ui, label, cfg_key, min_value, max_value, default, step=None, prefix="sb", **kw):
-    store = _cfg_store()
-    cur = store.get(cfg_key, default)
-    try:
-        cur = type(default)(cur)
-    except (TypeError, ValueError):
-        cur = default
-    cur = max(min(cur, max_value), min_value)
-    if store.get(cfg_key) != cur:
-        store[cfg_key] = cur          # coercion write-back
+    def _coerce(v):
+        try:
+            v = type(default)(v)
+        except (TypeError, ValueError):
+            v = default
+        return max(min(v, max_value), min_value)
+
     wkey = f"w_{prefix}_{cfg_key}"
-    _cfg_seed(wkey, cur)
-    val = ui.slider(label, min_value, max_value, key=wkey, step=step,
-                    on_change=_cfg_writeback, args=(wkey, cfg_key), **kw)
-    store[cfg_key] = val
-    return val
+    _cfg_sync(wkey, cfg_key, default, coerce=_coerce)
+    val = ui.slider(label, min_value, max_value, key=wkey, step=step, **kw)
+    return _cfg_commit(wkey, cfg_key, val)
 
 
 def cfg_time(ui, label, cfg_key, default, prefix="sb", **kw):
-    store = _cfg_store()
-    cur = store.get(cfg_key, default)
-    if not isinstance(cur, dtime):
+    def _coerce(v):
+        if isinstance(v, dtime):
+            return v
         try:
-            hh, mm = str(cur).split(":")[:2]
-            cur = dtime(int(hh), int(mm))
+            hh, mm = str(v).split(":")[:2]
+            return dtime(int(hh), int(mm))
         except Exception:
-            cur = default
-    if store.get(cfg_key) != cur:
-        store[cfg_key] = cur          # coercion write-back
+            return default
+
     wkey = f"w_{prefix}_{cfg_key}"
-    _cfg_seed(wkey, cur)
-    val = ui.time_input(label, key=wkey, on_change=_cfg_writeback, args=(wkey, cfg_key), **kw)
-    store[cfg_key] = val
-    return val
+    _cfg_sync(wkey, cfg_key, default, coerce=_coerce)
+    val = ui.time_input(label, key=wkey, **kw)
+    return _cfg_commit(wkey, cfg_key, val)
 
 
 def cfg_set(cfg_key, value):
     """Programmatic write into the shared store (used by the Optimization
-    tab's 'apply config' — replaces the old sidebar_overrides mechanism)."""
+    tab's 'apply config' — replaces the old sidebar_overrides mechanism).
+    The store-seeds step in _cfg_sync propagates it into BOTH views' widgets
+    on the next run."""
     st.session_state.app_cfg[cfg_key] = value
 
 
@@ -893,9 +898,20 @@ def dhan_feed_active():
 
 def dhan_resolve_feed_instrument(ticker):
     """Maps a yfinance-style ticker to Dhan's (security_id, exchange_segment,
-    instrument) for the DATA feed. Returns None for tickers Dhan can't serve."""
-    if ticker in DHAN_UNSUPPORTED_YF or not ticker:
+    instrument) for the DATA feed. Returns None for tickers Dhan can't serve.
+    PREMIUM TRADING: a sentinel ticker "DHANOPT::<segment>::<security_id>::<instr>"
+    resolves straight to that option contract, so fetch_data / get_live_ltp
+    serve the option's OWN premium candles and premium LTP."""
+    if not ticker or ticker in DHAN_UNSUPPORTED_YF:
         return None
+    if ticker.startswith("DHANOPT::"):
+        try:
+            _, segment, sec_id, instr = ticker.split("::")
+            if not sec_id:
+                return None
+            return {"security_id": sec_id, "segment": segment, "instrument": instr}
+        except ValueError:
+            return None
     if ticker == "^NSEI":
         return {"security_id": "13", "segment": "IDX_I", "instrument": "INDEX"}
     if ticker == "^NSEBANK":
@@ -979,7 +995,21 @@ def fetch_data(ticker, interval, period):
     """ROUTER — every candle consumer in the app calls this. Chooses the Dhan
     feed when enabled+tokened+servable, otherwise the original yfinance path
     (with its mandatory 0.3s delay). Falling back for a Dhan-unservable
-    ticker records a notice that the Live tab displays."""
+    ticker records a notice that the Live tab displays.
+    PREMIUM TRADING sentinel tickers (DHANOPT::…) can ONLY be served by Dhan
+    — yfinance has no options data — so without an active Dhan token they
+    return empty with an explanatory notice instead of falling through."""
+    if str(ticker).startswith("DHANOPT::"):
+        if dhan_feed_active():
+            dhan_df = fetch_data_dhan(ticker, interval, period)
+            if dhan_df is not None and not dhan_df.empty:
+                st.session_state.dhan_fallback_notice = None
+                return dhan_df
+        st.session_state.dhan_fallback_notice = (
+            "Premium trading needs the Dhan data feed (option premiums are not available on yfinance) — "
+            "enter a valid Dhan Access Token in '🔐 Dhan Account' to load the option's candles."
+        )
+        return pd.DataFrame()
     if dhan_feed_active():
         dhan_df = fetch_data_dhan(ticker, interval, period)
         if dhan_df is None:
@@ -1844,6 +1874,11 @@ def run_backtest(raw_df, strategy, sl_type, target_type, params, filters, qty, r
     for i in range(1, len(df) - 1):
         if open_trade is None:
             sig = df["signal"].iloc[i]
+            if sig == -1 and params.get("long_entries_only"):
+                # Premium (options-buyer) mode: SHORT signals never OPEN a
+                # position — the signal itself stays in the series so it can
+                # still exit an open long via 'Strategy Signal Exit'.
+                continue
             if sig != 0:
                 if strategy in IMMEDIATE_EXECUTION_STRATEGIES:
                     # No candle shape to wait for — the condition (price vs
@@ -2518,23 +2553,109 @@ def render_config_controls(ui, prefix):
     ticker_choice = cfg_selectbox(ui, "Ticker", "ticker_choice", ticker_names, default="Nifty50", prefix=prefix)
 
     options_mode = ticker_choice == "Options Trading"
+    premium_mode = False
     if options_mode:
-        # ---- OPTIONS TRADING mode: pick an Index or a Stock underlying; the
-        # main algorithm (strategies, SL types, target types) runs on that
-        # underlying, entries/exits BUY the CE/PE leg. Premium comes from
-        # Dhan (zero-delay) — yfinance is NOT used for option premiums since
-        # it has no options data.
+        # ---- OPTIONS TRADING mode with three sub-modes:
+        #  • Index / Stocks — the main algorithm runs on the UNDERLYING's
+        #    candles; a LONG signal buys the CE leg, a SHORT signal buys the
+        #    PE leg (both legs configured below).
+        #  • Premium — you pick ONE leg (CE or PE + strike); the strategy
+        #    runs directly on that option's OWN premium candles from Dhan.
+        #    LONG signal on the premium → BUY that leg. SHORT signal → NO
+        #    position is entered (options are only ever bought here), though
+        #    an opposite signal can still exit an open long via
+        #    'Strategy Signal Exit'.
         opt_underlying_kind = cfg_selectbox(ui, "Options Underlying", "opt_underlying_kind",
-                                            ["Index", "Stocks"], default="Index", prefix=prefix)
+                                            ["Index", "Stocks", "Premium"], default="Index", prefix=prefix)
+        premium_mode = opt_underlying_kind == "Premium"
         if opt_underlying_kind == "Index":
             opt_index = cfg_selectbox(ui, "Index", "opt_index", list(DHAN_INDEX_MAP.keys()),
                                       default="Nifty50", prefix=prefix)
             ticker = TICKER_MAP[opt_index]
             underlying_choice = opt_index
-        else:
+        elif opt_underlying_kind == "Stocks":
             opt_stock = cfg_text(ui, "Stock symbol (NSE, e.g. RELIANCE)", "opt_stock", "RELIANCE", prefix=prefix)
             ticker = f"{_yf_symbol_to_plain(opt_stock)}.NS"
             underlying_choice = "Custom"
+        else:
+            # ---------------- PREMIUM TRADING ----------------
+            ui.markdown("#### 🎯 Premium Trading — trade the option's own candles")
+            prem_u = cfg_selectbox(ui, "Premium Underlying", "prem_underlying",
+                                   ["Nifty50", "BankNifty", "Sensex", "Custom Stock"],
+                                   default="Nifty50", prefix=prefix)
+            if prem_u == "Custom Stock":
+                prem_stock = cfg_text(ui, "Stock symbol (NSE, e.g. RELIANCE)", "prem_stock", "RELIANCE", prefix=prefix)
+                prem_underlying_sym = _yf_symbol_to_plain(prem_stock)
+                prem_underlying_yf = f"{prem_underlying_sym}.NS"
+                prem_exchange, prem_instr, prem_scrip_instr = "NSE", "OPTSTK", "OPTSTK"
+                prem_default_qty = None
+            else:
+                prem_meta = DHAN_INDEX_MAP[prem_u]
+                prem_underlying_sym = prem_meta["underlying"]
+                prem_underlying_yf = TICKER_MAP[prem_u]
+                prem_exchange = prem_meta["exchange"]
+                prem_instr, prem_scrip_instr = "OPTIDX", "OPTIDX"
+                prem_default_qty = prem_meta["default_opt_qty"]
+
+            prem_opt_type = cfg_selectbox(ui, "Option Type (CE or PE — this exact leg is traded)",
+                                          "prem_opt_type", ["CE", "PE"], default="CE", prefix=prefix)
+
+            prem_expiries = dhan_get_expiries(prem_underlying_sym, prem_scrip_instr, prem_exchange)
+            if prem_expiries:
+                prem_expiry = cfg_selectbox(ui, "Expiry Date (auto-fetched, nearest pre-selected)",
+                                            "prem_expiry", prem_expiries, default=prem_expiries[0], prefix=prefix)
+            else:
+                prem_expiry = cfg_text(ui, "Expiry (YYYY-MM-DD — auto-fetch unavailable, enter manually)",
+                                       "prem_expiry_manual", "", prefix=prefix)
+
+            prem_strikes = dhan_get_strikes(prem_underlying_sym, prem_expiry, prem_scrip_instr, prem_exchange) if prem_expiry else []
+            if prem_strikes:
+                prem_atm = round_to_nearest_strike(_current_underlying_ltp(prem_underlying_yf), prem_strikes)
+                prem_strike = cfg_selectbox(ui, "Strike (ATM pre-selected)", "prem_strike", prem_strikes,
+                                            default=prem_atm if prem_atm in prem_strikes else prem_strikes[len(prem_strikes) // 2],
+                                            prefix=prefix)
+            else:
+                prem_strike = cfg_number(ui, "Strike (strike list unavailable — manual)", "prem_strike_manual",
+                                         0.0, 0.0, 10000000.0, prefix=prefix)
+
+            # Auto-fill the single leg's Security ID (same reliability rules:
+            # signature change always overwrites, failures retry every 20s,
+            # signature locks only on success). The box stays editable.
+            prem_sig = ("PREM", prem_underlying_sym, prem_exchange, prem_expiry, prem_opt_type, prem_strike)
+
+            def _fetch_prem_id():
+                info = dhan_lookup_option(prem_underlying_sym, prem_expiry, prem_strike, prem_opt_type,
+                                          prem_scrip_instr, prem_exchange) if (prem_expiry and prem_strike) else None
+                if info:
+                    store["prem_security_id"] = info["security_id"]
+                    store["_prem_lot_size"] = info.get("lot_size")
+                    return True
+                return False
+
+            if st.session_state.get("dhan_opt_autofill_sig") != prem_sig \
+                    and st.session_state.get("_attempted_dhan_opt_autofill_sig") != prem_sig:
+                store["prem_security_id"] = ""      # sig change ALWAYS clears stale IDs
+            _try_autofill(prem_sig, _fetch_prem_id, "dhan_opt_autofill_sig", "dhan_opt_autofill_last_try")
+
+            prem_id = cfg_text(ui, f"{prem_opt_type} Security ID (auto-filled, editable)",
+                               "prem_security_id", "", prefix=prefix).strip()
+            prem_segment = f"{prem_exchange}_FNO"
+            # Sentinel ticker → fetch_data / get_live_ltp serve THIS option's
+            # premium candles + premium LTP straight from Dhan (no delay).
+            ticker = f"DHANOPT::{prem_segment}::{prem_id}::{prem_instr}"
+            underlying_choice = "Options Trading"
+
+            if store.get("_prem_qty_default_sig") != (prem_u, prem_expiry, prem_opt_type):
+                store["dhan_qty"] = int(prem_default_qty or store.get("_prem_lot_size") or 1)
+                store["_prem_qty_default_sig"] = (prem_u, prem_expiry, prem_opt_type)
+
+            if not prem_id:
+                ui.warning("Waiting for the option's Security ID (auto-fill in progress, or enter it manually) — "
+                           "no premium data can load until it's set.")
+            ui.caption(f"⚡ The selected strategy runs on this {prem_opt_type}'s premium candles. "
+                       f"LONG signal → BUY the {prem_opt_type}. SHORT signal → NO entry (you're only an options "
+                       "buyer), but an opposite signal can still EXIT an open position when 'Strategy Signal Exit' "
+                       "is the SL/Target type.")
         ui.caption("🔐 Dhan Client ID / Access Token for options data & orders are entered once in the "
                    "'🔐 Dhan Account' section below — one set serves both the feed and order placement.")
     elif ticker_choice == "Custom":
@@ -2625,10 +2746,33 @@ def render_config_controls(ui, prefix):
                "(flipped signals in options just BUY the other leg).")
     params["trade_direction"] = trade_direction
     params["flip_signals"] = flip_signals
+    # Premium mode is buyer-only: SHORT signals never OPEN a position (they
+    # can still exit an open long via Strategy Signal Exit). Enforced at the
+    # entry points of both the backtest engine and the live engine.
+    params["long_entries_only"] = bool(premium_mode)
+    if premium_mode:
+        ui.caption("🎯 Premium mode note: SHORT entries are disabled here regardless of the Trade Direction "
+                   "setting — as an options buyer you only ever BUY the selected leg on LONG signals.")
 
     # ---------------------------------------------------------- STOPLOSS --
     ui.markdown("### 🛑 Stoploss")
     sl_type = cfg_selectbox(ui, "Stoploss Type", "sl_type", SL_TYPES, default=SL_TYPES[0], prefix=prefix)
+    _sl_explain = {
+        "Custom Points": "Active SL = entry ∓ 'SL Points (base)'. Only that one fixed level exists and that's what hits.",
+        "Trailing SL (Points)": "Initial SL = entry ∓ 'SL Points (base)'; it then trails, always staying that many points behind the best price reached. One level — the trailed one — is what hits.",
+        "Trail Candle Low/High (Current)": "Initial SL = entry ∓ 'SL Points (base)' (a starting backstop). Every candle it RATCHETS to the current candle's low (longs) / high (shorts) whenever that is TIGHTER. There is only ONE active SL at any moment — the tighter of the two — and that single level is what hits.",
+        "Trail Candle Low/High (Previous)": "Initial SL = entry ∓ 'SL Points (base)' (a starting backstop). Every candle it RATCHETS to the PREVIOUS candle's low/high whenever that is tighter. Only the single, current ratcheted level can hit.",
+        "Trail Swing Low/High (Current)": "Initial SL = entry ∓ 'SL Points (base)' (a starting backstop). It then RATCHETS to the 10-bar swing low (longs) / swing high (shorts) including the current bar, whenever that is tighter. One active level — the ratcheted one — is what hits.",
+        "Trail Swing Low/High (Previous)": "Initial SL = entry ∓ 'SL Points (base)' (a starting backstop). It then RATCHETS to the 10-bar swing low/high up to the PREVIOUS bar whenever that is tighter. One active level — the ratcheted one — is what hits.",
+        "Strategy Signal Exit": "The exit fires when the strategy gives the REVERSE signal. 'SL Points (base)' still arms a hard backstop level at entry ∓ that many points, in case price runs before a reverse signal appears.",
+        "EMA Reverse Crossover Exit": "The exit fires on the reverse EMA crossover. 'SL Points (base)' still arms a hard backstop level at entry ∓ that many points.",
+        "ATR Based SL": "'SL Points (base)' is IGNORED for this type — SL = ATR × multiplier, trailed each candle.",
+        "Risk:Reward Based (min 1:2)": "SL = entry ∓ 'SL Points (base)'; the target is then derived from it via the R:R ratio.",
+        "Autopilot SL": "Initial SL distance = max(ATR × 1.2, 'SL Points (base)'), then adaptively tightens as profit builds.",
+        "Loss Recovery SL (Give-back)": "The give-back recovery logic governs the exit; 'SL Points (base)' is IGNORED. A wide emergency backstop (max of 3×ATR and 1.5× the loss trigger) protects against gaps.",
+    }
+    if sl_type in _sl_explain:
+        ui.caption("ℹ️ " + _sl_explain[sl_type])
     params["sl_points"] = cfg_number(ui, "SL Points (base)", "sl_points", 10.0, 0.1, 100000.0, prefix=prefix)
     if sl_type == "ATR Based SL":
         params["atr_mult_sl"] = cfg_number(ui, "ATR Multiplier (SL)", "atr_mult_sl", 1.5, 0.5, 5.0, prefix=prefix)
@@ -2641,6 +2785,23 @@ def render_config_controls(ui, prefix):
     # ------------------------------------------------------------ TARGET --
     ui.markdown("### 🎯 Target")
     target_type = cfg_selectbox(ui, "Target Type", "target_type", TARGET_TYPES, default=TARGET_TYPES[0], prefix=prefix)
+    _tgt_explain = {
+        "Custom Points": "Active target = entry ± 'Target Points (base)'. Only that fixed level exists and that's what hits.",
+        "Trailing Target (Display Only)": "No fixed target hits — the position rides until the SL side (or a signal/risk exit) closes it. 'Target Points (base)' only sets the initial displayed level.",
+        "Trail Candle Low/High (Current)": "Initial target = entry ± 'Target Points (base)'; it then EXTENDS with the current candle's high/low, so it keeps moving away — exits usually come from the SL side.",
+        "Trail Candle Low/High (Previous)": "Initial target = entry ± 'Target Points (base)'; it then EXTENDS with the previous candle's high/low.",
+        "Trail Swing Low/High (Current)": "Initial target = entry ± 'Target Points (base)'; it then EXTENDS to the 10-bar swing high/low including the current bar.",
+        "Trail Swing Low/High (Previous)": "Initial target = entry ± 'Target Points (base)'; it then EXTENDS to the 10-bar swing high/low up to the previous bar.",
+        "Strategy Signal Exit": "The exit fires on the strategy's REVERSE signal. 'Target Points (base)' still arms a hard take-profit level at entry ± that many points.",
+        "EMA Reverse Crossover Exit": "The exit fires on the reverse EMA crossover. 'Target Points (base)' still arms a hard take-profit level.",
+        "ATR Based Target": "'Target Points (base)' is IGNORED for this type — target = ATR × multiplier.",
+        "Risk:Reward Based (min 1:2)": "'Target Points (base)' is IGNORED — target distance = SL distance × the R:R ratio.",
+        "Autopilot Target": "Initial target distance = max(ATR × 2.5, 2× SL distance), then adaptively extends. 'Target Points (base)' is ignored.",
+        "Profit Giveback Target": "The give-back logic governs the exit; 'Target Points (base)' is IGNORED. A wide backstop (max of 4×ATR and 1.5× the profit trigger) still exists.",
+        "Partial Book + Trail Remainder": "'Target 1 (points)' below is the REAL actionable level for the first tranche; the remainder trails with no fixed second target.",
+    }
+    if target_type in _tgt_explain:
+        ui.caption("ℹ️ " + _tgt_explain[target_type])
     params["target_points"] = cfg_number(ui, "Target Points (base)", "target_points", 20.0, 0.1, 200000.0, prefix=prefix)
     if target_type == "ATR Based Target":
         params["atr_mult_target"] = cfg_number(ui, "ATR Multiplier (Target)", "atr_mult_target", 3.0, 1.0, 8.0, prefix=prefix)
@@ -2837,7 +2998,46 @@ def render_config_controls(ui, prefix):
     entry_order_type, exit_order_type, dhan_qty = "MARKET", "MARKET", 1
 
     dhan_touchpoints_on = dhan_enabled or options_mode
-    if dhan_touchpoints_on:
+    if dhan_touchpoints_on and premium_mode:
+        # -------- PREMIUM MODE product config: the single selected leg. All
+        # instrument details were already chosen in the 🎯 Premium Trading
+        # section above; orders always BUY that leg on entry / SELL on exit.
+        if dhan_enabled:
+            ui.warning("Live orders will be attempted using the credentials above. Without a token, orders are only "
+                       "SIMULATED (payload shown, nothing sent). Test in a sandbox first.")
+        _p_exch = "BSE" if store.get("prem_underlying") == "Sensex" else "NSE"
+        product_cfg = {
+            "instrument": "Index Options" if store.get("prem_underlying", "Nifty50") != "Custom Stock" else "Stock Options",
+            "exchange": _p_exch,
+            "exchange_segment": f"{_p_exch}_FNO",
+            "product": "MARGIN",
+            "options_mode": True,
+            "premium_mode": True,
+            "security_id": str(store.get("prem_security_id", "") or "").strip(),
+            "expiry": store.get("prem_expiry", store.get("prem_expiry_manual", "")),
+            "opt_type": store.get("prem_opt_type", "CE"),
+            "strike": store.get("prem_strike", store.get("prem_strike_manual")),
+            "underlying": store.get("prem_underlying", "Nifty50"),
+            "lot_size": store.get("_prem_lot_size"),
+        }
+        c1, c2 = ui.columns(2)
+        entry_order_type = cfg_selectbox(c1, "Entry Order Type", "entry_order_type", ["MARKET", "LIMIT"], default="MARKET", prefix=prefix)
+        exit_order_type = cfg_selectbox(c2, "Exit Order Type", "exit_order_type", ["MARKET", "LIMIT"], default="MARKET", prefix=prefix)
+        dhan_qty = cfg_number(ui, "Dhan Quantity (real orders use this; paper P&L uses the paper Quantity above)",
+                              "dhan_qty", 1, 1, 1000000, is_int=True, prefix=prefix)
+        bo_enabled = cfg_checkbox(ui, "Use Broker SL/Target (Bracket Order)", "bo_enabled", False, prefix=prefix)
+        product_cfg["bo_enabled"] = bo_enabled
+        if bo_enabled:
+            c1, c2, c3 = ui.columns(3)
+            product_cfg["bo_sl_points"] = cfg_number(c1, "SL Points (boStopLossValue)", "bo_sl_points", 10.0, 0.1, 100000.0, prefix=prefix)
+            product_cfg["bo_target_points"] = cfg_number(c2, "Target Points (boProfitValue)", "bo_target_points", 20.0, 0.1, 200000.0, prefix=prefix)
+            product_cfg["bo_trail_jump"] = cfg_number(c3, "Trail SL Jump (0 = off)", "bo_trail_jump", 0.0, 0.0, 100000.0, prefix=prefix)
+            ui.caption("Entries go out as productType \"BO\"; broker-managed Stoploss/Target hits skip the app's own "
+                       "exit order to avoid double exits. Signal exits and manual square-offs are still sent.")
+        if options_mode and not dhan_enabled:
+            ui.info("📄 Premium Trading with Dhan Order Placement OFF = PAPER trading of the leg's premium. "
+                    "Turn order placement ON to send REAL orders for the exact same leg.")
+    elif dhan_touchpoints_on:
         if dhan_enabled:
             ui.warning("Live orders will be attempted using the credentials above. Without a token, orders are only "
                        "SIMULATED (payload shown, nothing sent). Test in a sandbox first.")
@@ -3050,6 +3250,7 @@ def render_config_controls(ui, prefix):
         wf_enabled=wf_enabled, wf_folds=wf_folds, cost_enabled=cost_enabled, cost_cfg=cost_cfg,
         risk_ctrl=risk_ctrl, gates=gates,
         options_mode=options_mode,
+        premium_mode=premium_mode,
         use_dhan_feed=use_dhan_feed,
         dhan_enabled=dhan_enabled, dhan_client_id=dhan_client_id, dhan_access_token=dhan_access_token,
         product_cfg=product_cfg, entry_order_type=entry_order_type, exit_order_type=exit_order_type,
@@ -3207,6 +3408,140 @@ def describe_signal_status(df, strategy, params, filters):
                 ok = angle_now >= filters.get("angle_min_deg", 0)
                 lines.append(f"Crossover angle (ATR-normalized): {angle_now:.1f}°, needs ≥ {filters.get('angle_min_deg',0):.1f}° → {'✅ OK' if ok else '❌ too shallow right now'}")
 
+    # ----- strategy-specific conditions not covered above ------------------
+    c_now = float(close.iloc[-1])
+    if strategy == "Threshold Cross":
+        thr = params.get("threshold", c_now)
+        cd = params.get("threshold_direction", "Below")
+        if cd == "Above":
+            lines.append(f"Threshold Cross (Above): close {c_now:.2f} vs threshold {thr:.2f} → needs price to cross DOWN "
+                         f"through it for a SHORT (distance {c_now - thr:+.2f}).")
+        else:
+            lines.append(f"Threshold Cross (Below): close {c_now:.2f} vs threshold {thr:.2f} → needs price to cross UP "
+                         f"through it for a LONG (distance {thr - c_now:+.2f}).")
+    if strategy == "Simple Buy Only":
+        prev_c = float(close.iloc[-2])
+        lines.append(f"Simple Buy Only: LTP must be above previous close {prev_c:.2f} → currently {c_now:.2f} ({c_now - prev_c:+.2f}).")
+    if strategy == "Simple Sell Only":
+        prev_c = float(close.iloc[-2])
+        lines.append(f"Simple Sell Only: LTP must be below previous close {prev_c:.2f} → currently {c_now:.2f} ({c_now - prev_c:+.2f}).")
+    if strategy == "Pro: MACD Crossover":
+        m_line, m_sig, _ = macd(close, params.get("macd_fast", 12), params.get("macd_slow", 26), params.get("macd_signal", 9))
+        if len(df) >= params.get("macd_slow", 26) * 3:
+            gap = float(m_line.iloc[-1] - m_sig.iloc[-1])
+            lines.append(f"MACD {m_line.iloc[-1]:+.2f} vs signal {m_sig.iloc[-1]:+.2f} → "
+                         f"{'🟢 above (needs cross DOWN for a fresh SELL)' if gap > 0 else '🔴 below (needs cross UP for a fresh BUY)'}, gap {gap:+.2f}.")
+        else:
+            lines.append("MACD: N/A — insufficient warm-up history.")
+    if strategy == "Pro: VWAP + Supertrend Trend":
+        st_line, st_dir = supertrend(df, params.get("st_period", 10), params.get("st_mult", 3.0))
+        if len(df) >= params.get("st_period", 10) * 4:
+            v = vwap(df)
+            lines.append(f"VWAP {float(v.iloc[-1]):.2f} vs close {c_now:.2f}; Supertrend {'🟢 Bullish' if st_dir.iloc[-1]==1 else '🔴 Bearish'} — "
+                         "BUY needs close above VWAP with bullish Supertrend flip; SELL the reverse.")
+    if strategy == "Pro: Donchian Channel Breakout":
+        p = params.get("donchian_period", 20)
+        if len(df) > p + 2:
+            upper, _, lower = donchian(df, p)
+            lines.append(f"Donchian({p}): close {c_now:.2f} vs upper {float(upper.iloc[-2]):.2f} (BUY breakout needs a close above) "
+                         f"/ lower {float(lower.iloc[-2]):.2f} (SELL breakout needs a close below).")
+    if strategy == "Pro: Stochastic Reversal":
+        k, d = stochastic(df, params.get("stoch_k", 14), params.get("stoch_d", 3))
+        if len(df) >= params.get("stoch_k", 14) * 3:
+            lines.append(f"Stochastic %K {float(k.iloc[-1]):.1f} / %D {float(d.iloc[-1]):.1f} — BUY needs %K to cross up "
+                         "through %D from oversold (<20); SELL a cross down from overbought (>80).")
+    if strategy == "Pro: TEMA Trend Flip":
+        t = tema(close, params.get("tema_period", 20))
+        if len(df) >= params.get("tema_period", 20) * 3:
+            lines.append(f"TEMA({params.get('tema_period',20)}) = {float(t.iloc[-1]):.2f} vs close {c_now:.2f} → "
+                         f"{'🟢 price above (SELL needs a flip below)' if c_now > float(t.iloc[-1]) else '🔴 price below (BUY needs a flip above)'}.")
+    if strategy == "Pro: CCI Extreme Reversal":
+        c_ind = cci(df, params.get("cci_period", 20))
+        if len(df) >= params.get("cci_period", 20) * 3:
+            cv = float(c_ind.iloc[-1])
+            lines.append(f"CCI({params.get('cci_period',20)}) = {cv:+.1f} — BUY needs a recover up through −100 "
+                         f"(distance {cv + 100:+.1f}); SELL a fall down through +100 (distance {100 - cv:+.1f}).")
+    if strategy == "Volume Breakout":
+        vw, vf = params.get("vol_window", 20), params.get("vol_factor", 2.0)
+        if "Volume" in df.columns and len(df) > vw + 2:
+            v_now = float(df["Volume"].iloc[-1]); v_avg = float(df["Volume"].rolling(vw).mean().iloc[-1])
+            need = v_avg * vf
+            lines.append(f"Volume Breakout: current vol {v_now:,.0f} vs required {need:,.0f} ({vf}× the {vw}-bar avg {v_avg:,.0f}) → "
+                         f"{'✅ spike present' if v_now >= need else '❌ no spike yet'} (plus a range breakout in price).")
+
+    # ----- ALL remaining active entry filters (complete coverage) ----------
+    if filters.get("ema20_enabled"):
+        e20 = ema(close, 20)
+        e_val, e_ok = safe_indicator_value(e20, 40)
+        if e_ok:
+            lines.append(f"EMA20 filter: close {c_now:.2f} vs EMA20 {e_val:.2f} → "
+                         f"{'✅ BUYs allowed (close above)' if c_now > e_val else '❌ BUYs blocked'} · "
+                         f"{'✅ SELLs allowed (close below)' if c_now < e_val else '❌ SELLs blocked'} (distance {c_now - e_val:+.2f}).")
+        else:
+            lines.append("EMA20 filter: N/A — insufficient warm-up history.")
+    if filters.get("sma20_enabled"):
+        s20 = sma(close, 20)
+        s_val, s_ok = safe_indicator_value(s20, 25)
+        if s_ok:
+            lines.append(f"SMA20 filter: close {c_now:.2f} vs SMA20 {s_val:.2f} → "
+                         f"{'✅ BUYs allowed (close above)' if c_now > s_val else '❌ BUYs blocked'} · "
+                         f"{'✅ SELLs allowed (close below)' if c_now < s_val else '❌ SELLs blocked'} (distance {c_now - s_val:+.2f}).")
+        else:
+            lines.append("SMA20 filter: N/A — insufficient warm-up history.")
+    if filters.get("bb_enabled"):
+        upper_f, _, lower_f = bollinger(close, 20, 2)
+        uf, uf_ok = safe_indicator_value(upper_f, 40)
+        lf, lf_ok = safe_indicator_value(lower_f, 40)
+        if uf_ok and lf_ok:
+            buy_ok, sell_ok = c_now <= uf, c_now >= lf
+            lines.append(f"Bollinger filter: close {c_now:.2f} must be ≤ upper {uf:.2f} for BUYs "
+                         f"({'✅' if buy_ok else '❌'}) and ≥ lower {lf:.2f} for SELLs ({'✅' if sell_ok else '❌'}).")
+        else:
+            lines.append("Bollinger filter: N/A — insufficient warm-up history.")
+    if filters.get("smc_enabled"):
+        try:
+            sh, sl_ = swing_points(df, 3)
+            last_high = df["High"].where(sh).ffill()
+            last_low = df["Low"].where(sl_).ffill()
+            lh = float(last_high.shift(1).iloc[-1]) if not pd.isna(last_high.shift(1).iloc[-1]) else None
+            ll = float(last_low.shift(1).iloc[-1]) if not pd.isna(last_low.shift(1).iloc[-1]) else None
+            if lh is not None and ll is not None:
+                bos_up_now = c_now > lh
+                bos_dn_now = c_now < ll
+                lines.append(f"SMC (Structure Break) filter: close {c_now:.2f} vs last swing high {lh:.2f} "
+                             f"(break above = bullish BOS → {'✅ BUYs allowed NOW' if bos_up_now else f'❌ needs {lh - c_now:+.2f} more'}) "
+                             f"and last swing low {ll:.2f} (break below = bearish BOS → "
+                             f"{'✅ SELLs allowed NOW' if bos_dn_now else f'❌ needs {c_now - ll:+.2f} more down'}).")
+            else:
+                lines.append("SMC filter: N/A — no confirmed swing points yet in this window.")
+        except Exception:
+            lines.append("SMC filter: N/A — could not compute swing structure on this data.")
+    if filters.get("atr_enabled"):
+        a_val_f, a_ok_f = safe_indicator_value(a_series, 14 * 3)
+        atr_min, atr_max = filters.get("atr_min", 0.0), filters.get("atr_max", 1e9)
+        if a_ok_f:
+            ok = atr_min <= a_val_f <= atr_max
+            lines.append(f"ATR (Volatility) filter: ATR(14) = {a_val_f:.2f}, needs [{atr_min:.2f}, {atr_max:.2f}] → "
+                         f"{'✅ OK' if ok else '❌ blocking entries right now'}.")
+        else:
+            lines.append("ATR filter: N/A — insufficient warm-up history.")
+    if filters.get("crossover_quality_enabled"):
+        mode = filters.get("crossover_quality_mode", "Simple Crossover")
+        rng = float(df["High"].iloc[-1] - df["Low"].iloc[-1])
+        if mode == "Crossover with Candle Size":
+            need = filters.get("crossover_min_points", 1.0)
+            lines.append(f"Crossover Confirmation ({mode}): current candle range {rng:.2f} pts, needs ≥ {need:.2f} → "
+                         f"{'✅ OK' if rng >= need else '❌ candle too small'} (only checked on the crossover bar itself).")
+        elif mode == "Crossover with ATR-based Candle Size":
+            a_now2 = float(a_series.iloc[-1]) if not pd.isna(a_series.iloc[-1]) else None
+            if a_now2:
+                need = a_now2 * filters.get("crossover_atr_mult", 1.0)
+                lines.append(f"Crossover Confirmation ({mode}): current candle range {rng:.2f} pts, needs ≥ {need:.2f} "
+                             f"({filters.get('crossover_atr_mult',1.0)}×ATR) → {'✅ OK' if rng >= need else '❌ candle too small'} "
+                             "(only checked on the crossover bar itself).")
+        else:
+            lines.append("Crossover Confirmation (Simple Crossover): no candle-size requirement — any genuine crossover bar passes.")
+
     if filters.get("vix_enabled"):
         vix_aligned = get_vix_aligned(df.index)
         vix_val = vix_aligned.iloc[-1] if len(vix_aligned) else np.nan
@@ -3217,6 +3552,9 @@ def describe_signal_status(df, strategy, params, filters):
             ok = vix_min <= vix_val <= vix_max
             lines.append(f"India VIX: {vix_val:.2f}, needs [{vix_min}, {vix_max}] → {'✅ OK' if ok else '❌ blocking entries right now'}")
 
+    if not lines:
+        lines.append("The selected strategy's condition is evaluated on each candle close — no additional live-readable "
+                     "state to display for it, and no entry filters are active.")
     return lines
 
 
@@ -3480,6 +3818,11 @@ def evaluate_live_signal(ticker, interval, period, strategy, params, filters, sl
             st.session_state.live_positions = [pos]
             st.info("Position still open — levels updated.")
     elif last_sig != 0:
+        if last_sig == -1 and params.get("long_entries_only"):
+            # Premium (options-buyer) mode: never OPEN on a SHORT signal.
+            st.caption("🎯 Premium mode: SHORT signal detected but ignored for entries — options are only ever "
+                       "BOUGHT here. (An opposite signal can still exit an open long via 'Strategy Signal Exit'.)")
+            return sig_df
         # The candle/tick that produced this signal — used to make sure we
         # only ever act on it ONCE. Without this, a fast target-hit followed
         # by a re-check (every ~5s) would keep seeing the SAME unchanged
