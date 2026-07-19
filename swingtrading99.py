@@ -436,6 +436,9 @@ def cfg_set(cfg_key, value):
 #   • Supertrend .............. RMA-smoothed ATR bands with band carry-forward
 #     (upper band can only ratchet down in downtrends / lower band up in
 #     uptrends) — same band logic as TradingView's supertrend().
+#   • VWAP .................... session-anchored: resets at each trading day's
+#     first bar, matching TV's built-in VWAP (a whole-window cumulative VWAP
+#     would drift away from TV on multi-day intraday data).
 # ============================================================================
 
 def ema(series, period):
@@ -490,8 +493,20 @@ def adx(df, period=14):
 
 
 def vwap(df):
+    """Session-anchored VWAP (TradingView convention): the cumulative
+    typical-price×volume / volume RESETS at the start of each trading day,
+    so gap-up/gap-down opens start a fresh session anchor exactly like TV's
+    built-in VWAP. Falls back to a whole-window cumulative VWAP if the index
+    isn't date-aware (shouldn't happen with yfinance/Dhan data)."""
     tp = (df["High"] + df["Low"] + df["Close"]) / 3
-    return (tp * df["Volume"]).cumsum() / df["Volume"].cumsum().replace(0, np.nan)
+    pv = tp * df["Volume"]
+    try:
+        day = pd.Index(df.index).normalize()
+        cum_pv = pv.groupby(day).cumsum()
+        cum_v = df["Volume"].groupby(day).cumsum()
+        return cum_pv / cum_v.replace(0, np.nan)
+    except Exception:
+        return pv.cumsum() / df["Volume"].cumsum().replace(0, np.nan)
 
 
 def supertrend(df, period=10, mult=3):
@@ -1757,16 +1772,31 @@ def check_hard_exit(trade, candle):
     """
     direction = trade["direction"]
     target_display_only = trade["target_type"] == "Trailing Target (Display Only)"
+    o = float(candle["Open"])
 
+    # GAP HANDLING (important for Indian markets): if the candle OPENED
+    # already beyond the level (overnight gap-up / gap-down, or an opening
+    # gap on the first bar of the session), no fill at the level itself was
+    # ever possible — the realistic fill is the gapped open. SLs therefore
+    # fill at the WORSE of (level, open) and targets at the BETTER of
+    # (level, open), with the reason annotated so gap exits are auditable.
     if direction == 1:
         if candle["Low"] <= trade["sl"]:
+            if o < trade["sl"]:
+                return True, o, "Stoploss Hit (gap-down — filled @ open)"
             return True, trade["sl"], "Stoploss Hit"
         if not target_display_only and candle["High"] >= trade["target"]:
+            if o > trade["target"]:
+                return True, o, "Target Hit (gap-up — filled @ open)"
             return True, trade["target"], "Target Hit"
     else:
         if candle["High"] >= trade["sl"]:
+            if o > trade["sl"]:
+                return True, o, "Stoploss Hit (gap-up — filled @ open)"
             return True, trade["sl"], "Stoploss Hit"
         if not target_display_only and candle["Low"] <= trade["target"]:
+            if o < trade["target"]:
+                return True, o, "Target Hit (gap-down — filled @ open)"
             return True, trade["target"], "Target Hit"
 
     return False, None, None
@@ -1787,13 +1817,24 @@ def check_hard_exit_ltp(trade, ltp):
 
     if direction == 1:
         if ltp <= trade["sl"]:
+            if ltp < trade["sl"]:
+                # Price is already BELOW the level (e.g. an overnight gap-down
+                # or a fast move between polls) — a live exit can only fill at
+                # the market price, not back at the level.
+                return True, float(ltp), "Stoploss Hit (LTP gapped past level)"
             return True, trade["sl"], "Stoploss Hit (LTP)"
         if not target_display_only and ltp >= trade["target"]:
+            if ltp > trade["target"]:
+                return True, float(ltp), "Target Hit (LTP gapped past level)"
             return True, trade["target"], "Target Hit (LTP)"
     else:
         if ltp >= trade["sl"]:
+            if ltp > trade["sl"]:
+                return True, float(ltp), "Stoploss Hit (LTP gapped past level)"
             return True, trade["sl"], "Stoploss Hit (LTP)"
         if not target_display_only and ltp <= trade["target"]:
+            if ltp < trade["target"]:
+                return True, float(ltp), "Target Hit (LTP gapped past level)"
             return True, trade["target"], "Target Hit (LTP)"
 
     return False, None, None
