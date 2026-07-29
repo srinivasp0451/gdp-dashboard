@@ -69,6 +69,8 @@ STRATEGIES = [
     "Bollinger Bands",
     "Volume Breakout",
     "Elliott Wave (Zigzag)",
+    "OI Based (CE/PE Open Interest)",
+    "Hybrid (Combine Strategies)",
     "Pro: VWAP + Supertrend Trend",
     "Pro: Opening Range Breakout + Volume",
     "Pro: BB+RSI Mean Reversion (ATR filtered)",
@@ -116,6 +118,8 @@ STRATEGY_FAMILY = {
     "Bollinger Bands": "mean_reversion",
     "Volume Breakout": "trend",
     "Elliott Wave (Zigzag)": "trend",
+    "OI Based (CE/PE Open Interest)": "neutral",
+    "Hybrid (Combine Strategies)": "neutral",
     "Pro: VWAP + Supertrend Trend": "trend",
     "Pro: Opening Range Breakout + Volume": "trend",
     "Pro: BB+RSI Mean Reversion (ATR filtered)": "mean_reversion",
@@ -260,58 +264,104 @@ if st.session_state.risk_day_key != _today_key:
 # SHARED CONFIG STORE + TWO-WAY SYNCED WIDGET WRAPPERS
 # ----------------------------------------------------------------------------
 # The Sidebar and the "🛠 Admin Panel" tab are two live views of ONE store:
-# st.session_state.app_cfg. Every control is rendered through a wrapper using
-# a deterministic, callback-free sync (see _cfg_sync below): per run, the
-# WIDGET wins when the user changed it since the last render (robust even
-# when Streamlit misses a change event because a rerun was superseded — e.g.
-# toggling a checkbox and clicking "Run Backtest" immediately), otherwise the
-# STORE seeds the widget (cross-view edits, the Optimization tab's
-# apply-config, autofills). Coerced values (option list changed, clamping,
-# casting) are written straight back to the store so the store can never
-# disagree with what the widget shows.
+# st.session_state.app_cfg. Synchronisation happens in a SINGLE PRE-PASS —
+# reconcile_config_widgets(), called once before anything renders — which
+# harvests every user edit from both views, settles the store, and pushes the
+# settled value back into both views' widget keys.
+#
+# This replaces an earlier per-widget "sync while rendering" scheme that was
+# genuinely broken: because the sidebar renders before the Admin Panel, that
+# scheme read one view's fresh input before the other view's fresh input
+# existed, so a stale value got written to the store and overwritten a moment
+# later — the two values then ping-ponged across reruns. Symptoms were
+# unchecking one box appearing to re-check another, and a strategy or SL type
+# reverting on its own. With reconciliation done up front, render order is
+# irrelevant and no widget can contradict the store.
 # ============================================================================
+
+_CFG_PREFIXES = ("w_sb_", "w_ad_")
+_MISSING = object()
+
 
 def _cfg_store():
     return st.session_state.app_cfg
 
 
-# --- Deterministic two-way sync (no on_change callbacks) -------------------
-# Streamlit callbacks can be MISSED when a rerun is superseded quickly (e.g.
-# toggling a checkbox and clicking "Run Backtest" almost immediately). The
-# old design then re-seeded the widget from the stale store — visibly
-# un-ticking the checkbox and running the backtest with the OLD config.
-# This version never relies on callbacks. Per widget, per run:
-#   1) WIDGET WINS: if the widget's value differs from the snapshot of what
-#      we rendered last time, the USER changed it (even if Streamlit missed
-#      the change event) → write it into the store.
-#   2) STORE SEEDS: otherwise, if the store differs from the widget, the
-#      store was changed programmatically (the other view, the Optimization
-#      tab's apply-config, an autofill) → push store → widget.
-#   3) Render, then snapshot what was rendered and commit it to the store.
-# Result: a fresh user change can never be clobbered, and cross-view edits
-# still propagate instantly.
+def _cfg_key_of(wkey):
+    for p in _CFG_PREFIXES:
+        if wkey.startswith(p):
+            return wkey[len(p):]
+    return None
 
-def _cfg_sync(wkey, cfg_key, default, coerce=None):
+
+def reconcile_config_widgets():
+    """
+    SINGLE PRE-PASS, run once at the top of the script BEFORE any widget is
+    rendered. This is what makes the Sidebar and the Admin Panel behave like
+    one consistent form.
+
+    Why this exists: the two views render sequentially (sidebar first, Admin
+    Panel later). Any per-widget "sync at render time" scheme reads one
+    view's fresh input before the other view's fresh input exists, so the
+    first view writes a stale value into the shared store and the second view
+    overwrites it a moment later. Across reruns those two values ping-pong —
+    which is exactly what made unchecking one box appear to re-check another,
+    and made a strategy/SL revert on its own.
+
+    The fix: harvest EVERY user edit from BOTH views first, settle the store,
+    then push the settled value back into every widget key. After this runs,
+    the store is authoritative and no widget can contradict it, so rendering
+    order stops mattering entirely.
+    """
     store = _cfg_store()
-    seen_key = "_seen_" + wkey
+
+    # PASS 1 — harvest: a widget whose value differs from the snapshot we
+    # took when we last rendered it is a genuine user edit (this also
+    # catches edits whose change-event Streamlit dropped because a rerun
+    # was superseded, e.g. toggling a box and clicking Run immediately).
+    for wkey in [k for k in st.session_state.keys() if k.startswith(_CFG_PREFIXES)]:
+        cfg_key = _cfg_key_of(wkey)
+        if not cfg_key:
+            continue
+        seen = st.session_state.get("_seen_" + wkey, _MISSING)
+        val = st.session_state.get(wkey, _MISSING)
+        if seen is not _MISSING and val is not _MISSING and val != seen:
+            store[cfg_key] = val
+
+    # PASS 2 — settle: push the agreed value back into every widget key of
+    # BOTH views, and re-snapshot, so neither view can re-report a stale
+    # value as if it were a new edit on the next run.
+    for wkey in [k for k in st.session_state.keys() if k.startswith(_CFG_PREFIXES)]:
+        cfg_key = _cfg_key_of(wkey)
+        if not cfg_key or cfg_key not in store:
+            continue
+        if st.session_state.get(wkey, _MISSING) != store[cfg_key]:
+            st.session_state[wkey] = store[cfg_key]
+        st.session_state["_seen_" + wkey] = store[cfg_key]
+
+
+def _cfg_prepare(wkey, cfg_key, default, coerce=None):
+    """Per-widget preparation AFTER reconciliation: guarantee the store has a
+    value, apply any coercion the live option list demands, and make the
+    widget key agree with the store. Because reconcile_config_widgets() has
+    already harvested every user edit, forcing widget := store here can never
+    clobber a fresh edit."""
+    store = _cfg_store()
     if cfg_key not in store:
         store[cfg_key] = default
-    # 1) widget wins over a stale store (covers missed change events)
-    if wkey in st.session_state and seen_key in st.session_state \
-            and st.session_state[wkey] != st.session_state[seen_key]:
-        store[cfg_key] = st.session_state[wkey]
-    cur = store.get(cfg_key, default)
+    cur = store[cfg_key]
     if coerce is not None:
         cur = coerce(cur)
     if store.get(cfg_key) != cur:
         store[cfg_key] = cur          # coercion write-back
-    # 2) store seeds the widget (cross-view / programmatic changes)
-    if st.session_state.get(wkey) != cur:
+    if st.session_state.get(wkey, _MISSING) != cur:
         st.session_state[wkey] = cur
+        st.session_state["_seen_" + wkey] = cur
     return cur
 
 
 def _cfg_commit(wkey, cfg_key, val):
+    """Snapshot exactly what was rendered, and mirror it into the store."""
     st.session_state["_seen_" + wkey] = val
     _cfg_store()[cfg_key] = val
     return val
@@ -319,7 +369,7 @@ def _cfg_commit(wkey, cfg_key, val):
 
 def cfg_checkbox(ui, label, cfg_key, default=False, prefix="sb", **kw):
     wkey = f"w_{prefix}_{cfg_key}"
-    _cfg_sync(wkey, cfg_key, bool(default), coerce=lambda v: bool(v))
+    _cfg_prepare(wkey, cfg_key, bool(default), coerce=lambda v: bool(v))
     val = ui.checkbox(label, key=wkey, **kw)
     return _cfg_commit(wkey, cfg_key, bool(val))
 
@@ -330,24 +380,17 @@ def cfg_selectbox(ui, label, cfg_key, options, default=None, prefix="sb", **kw):
         return None
     if default is None or default not in options:
         default = options[0]
-
-    def _coerce(v):
-        return v if v in options else default   # option list changed → coerce
-
     wkey = f"w_{prefix}_{cfg_key}"
-    _cfg_sync(wkey, cfg_key, default, coerce=_coerce)
+    _cfg_prepare(wkey, cfg_key, default, coerce=lambda v: v if v in options else default)
     val = ui.selectbox(label, options, key=wkey, **kw)
     return _cfg_commit(wkey, cfg_key, val)
 
 
 def cfg_multiselect(ui, label, cfg_key, options, default=None, prefix="sb", **kw):
     options = list(options)
-
-    def _coerce(v):
-        return [c for c in (v or []) if c in options]
-
     wkey = f"w_{prefix}_{cfg_key}"
-    _cfg_sync(wkey, cfg_key, list(default or []), coerce=_coerce)
+    _cfg_prepare(wkey, cfg_key, list(default or []),
+                 coerce=lambda v: [c for c in (v or []) if c in options])
     val = ui.multiselect(label, options, key=wkey, **kw)
     return _cfg_commit(wkey, cfg_key, list(val))
 
@@ -366,14 +409,14 @@ def cfg_number(ui, label, cfg_key, default, min_value=None, max_value=None,
         return v
 
     wkey = f"w_{prefix}_{cfg_key}"
-    _cfg_sync(wkey, cfg_key, _coerce(default), coerce=_coerce)
+    _cfg_prepare(wkey, cfg_key, _coerce(default), coerce=_coerce)
     val = ui.number_input(label, min_value=min_value, max_value=max_value, step=step, key=wkey, **kw)
     return _cfg_commit(wkey, cfg_key, val)
 
 
 def cfg_text(ui, label, cfg_key, default="", prefix="sb", **kw):
     wkey = f"w_{prefix}_{cfg_key}"
-    _cfg_sync(wkey, cfg_key, str(default), coerce=lambda v: "" if v is None else str(v))
+    _cfg_prepare(wkey, cfg_key, str(default), coerce=lambda v: "" if v is None else str(v))
     val = ui.text_input(label, key=wkey, **kw)
     return _cfg_commit(wkey, cfg_key, val)
 
@@ -387,7 +430,7 @@ def cfg_slider(ui, label, cfg_key, min_value, max_value, default, step=None, pre
         return max(min(v, max_value), min_value)
 
     wkey = f"w_{prefix}_{cfg_key}"
-    _cfg_sync(wkey, cfg_key, default, coerce=_coerce)
+    _cfg_prepare(wkey, cfg_key, default, coerce=_coerce)
     val = ui.slider(label, min_value, max_value, key=wkey, step=step, **kw)
     return _cfg_commit(wkey, cfg_key, val)
 
@@ -403,17 +446,20 @@ def cfg_time(ui, label, cfg_key, default, prefix="sb", **kw):
             return default
 
     wkey = f"w_{prefix}_{cfg_key}"
-    _cfg_sync(wkey, cfg_key, default, coerce=_coerce)
+    _cfg_prepare(wkey, cfg_key, default, coerce=_coerce)
     val = ui.time_input(label, key=wkey, **kw)
     return _cfg_commit(wkey, cfg_key, val)
 
 
 def cfg_set(cfg_key, value):
-    """Programmatic write into the shared store (used by the Optimization
-    tab's 'apply config' — replaces the old sidebar_overrides mechanism).
-    The store-seeds step in _cfg_sync propagates it into BOTH views' widgets
-    on the next run."""
+    """Programmatic write into the shared store (Optimization tab's apply-config).
+    reconcile_config_widgets() propagates it into BOTH views on the next run."""
     st.session_state.app_cfg[cfg_key] = value
+    for p in _CFG_PREFIXES:
+        wkey = f"{p}{cfg_key}"
+        if wkey in st.session_state:
+            st.session_state[wkey] = value
+            st.session_state["_seen_" + wkey] = value
 
 
 # ============================================================================
@@ -548,6 +594,115 @@ def swing_points(df, lookback=3):
         if lows.iloc[i] == wl.min():
             swing_low.iloc[i] = True
     return swing_high, swing_low
+
+
+def elliott_wave_state(df, lookback=3):
+    """
+    Zigzag pivot detection with EXPLICIT confirmation timing plus Elliott
+    wave labelling.
+
+    A swing pivot at bar i is only *knowable* once `lookback` bars have
+    printed to its right. This function therefore returns, separately:
+      • raw_high / raw_low   — where the pivot actually sits (for plotting)
+      • confirm_high/low     — the bar where that pivot became knowable
+                               (this is what signals are allowed to use)
+      • pivot_price/kind     — the confirmed pivot's price and H/L type
+      • wave_label           — running Elliott count (1..5 then A/B/C) applied
+                               to the alternating confirmed pivot sequence
+      • higher_low/lower_high— structure flags for impulse-only filtering
+      • bars_to_confirm      — how many more bars the newest provisional
+                               pivot still needs (drives the status board)
+    """
+    n = len(df)
+    highs, lows = df["High"], df["Low"]
+    raw_high = pd.Series(False, index=df.index)
+    raw_low = pd.Series(False, index=df.index)
+    confirm_high = pd.Series(False, index=df.index)
+    confirm_low = pd.Series(False, index=df.index)
+    pivot_price = pd.Series(np.nan, index=df.index)
+    pivot_kind = pd.Series("", index=df.index)
+    wave_label = pd.Series("", index=df.index)
+    higher_low = pd.Series(False, index=df.index)
+    lower_high = pd.Series(False, index=df.index)
+
+    if n < (2 * lookback + 2):
+        return {"raw_high": raw_high, "raw_low": raw_low,
+                "confirm_high": confirm_high, "confirm_low": confirm_low,
+                "pivot_price": pivot_price, "pivot_kind": pivot_kind,
+                "wave_label": wave_label, "higher_low": higher_low,
+                "lower_high": lower_high, "pivots": [], "bars_to_confirm": None,
+                "provisional": None}
+
+    seq = []          # confirmed alternating pivots: (idx, price, kind)
+    labels = ["1", "2", "3", "4", "5", "A", "B", "C"]
+    lab_i = 0
+
+    for i in range(lookback, n - lookback):
+        win_h = highs.iloc[i - lookback: i + lookback + 1]
+        win_l = lows.iloc[i - lookback: i + lookback + 1]
+        is_h = highs.iloc[i] == win_h.max()
+        is_l = lows.iloc[i] == win_l.min()
+        if is_h and is_l:                       # inside bar cluster — ambiguous
+            continue
+        ci = i + lookback                       # confirmation bar index
+        if ci >= n:
+            continue
+        if is_h:
+            raw_high.iloc[i] = True
+            # enforce alternation: a new high replaces a weaker previous high
+            if seq and seq[-1][2] == "H":
+                if highs.iloc[i] > seq[-1][1]:
+                    seq[-1] = (i, float(highs.iloc[i]), "H")
+                continue
+            prev_h = next((p for p in reversed(seq) if p[2] == "H"), None)
+            if prev_h is not None and highs.iloc[i] < prev_h[1]:
+                lower_high.iloc[ci] = True
+            seq.append((i, float(highs.iloc[i]), "H"))
+            confirm_high.iloc[ci] = True
+            pivot_price.iloc[ci] = float(highs.iloc[i])
+            pivot_kind.iloc[ci] = "H"
+            wave_label.iloc[ci] = labels[lab_i % len(labels)]
+            lab_i += 1
+        elif is_l:
+            raw_low.iloc[i] = True
+            if seq and seq[-1][2] == "L":
+                if lows.iloc[i] < seq[-1][1]:
+                    seq[-1] = (i, float(lows.iloc[i]), "L")
+                continue
+            prev_l = next((p for p in reversed(seq) if p[2] == "L"), None)
+            if prev_l is not None and lows.iloc[i] > prev_l[1]:
+                higher_low.iloc[ci] = True
+            seq.append((i, float(lows.iloc[i]), "L"))
+            confirm_low.iloc[ci] = True
+            pivot_price.iloc[ci] = float(lows.iloc[i])
+            pivot_kind.iloc[ci] = "L"
+            wave_label.iloc[ci] = labels[lab_i % len(labels)]
+            lab_i += 1
+
+    # ---- provisional (not yet confirmed) pivot forming in the final bars ----
+    provisional, bars_to_confirm = None, None
+    tail_start = max(0, n - 1 - 2 * lookback)
+    for i in range(n - 1 - lookback, tail_start - 1, -1):
+        if i < lookback:
+            break
+        win_h = highs.iloc[max(0, i - lookback): i + lookback + 1]
+        win_l = lows.iloc[max(0, i - lookback): i + lookback + 1]
+        right = n - 1 - i
+        if right >= lookback:
+            break
+        if highs.iloc[i] == win_h.max():
+            provisional, bars_to_confirm = ("H", float(highs.iloc[i]), df.index[i]), lookback - right
+            break
+        if lows.iloc[i] == win_l.min():
+            provisional, bars_to_confirm = ("L", float(lows.iloc[i]), df.index[i]), lookback - right
+            break
+
+    return {"raw_high": raw_high, "raw_low": raw_low,
+            "confirm_high": confirm_high, "confirm_low": confirm_low,
+            "pivot_price": pivot_price, "pivot_kind": pivot_kind,
+            "wave_label": wave_label, "higher_low": higher_low,
+            "lower_high": lower_high, "pivots": seq,
+            "bars_to_confirm": bars_to_confirm, "provisional": provisional}
 
 
 def macd(series, fast=12, slow=26, signal=9):
@@ -1055,6 +1210,114 @@ def dhan_get_ltp(security_id, segment):
     return None
 
 
+@st.cache_data(ttl=60, show_spinner=False)
+def dhan_get_option_chain(under_security_id, under_segment, expiry, _token_fp):
+    """
+    Dhan option chain (/v2/optionchain) → aggregate CE/PE Open Interest and
+    change in OI. Cached 60s (Dhan rate-limits this endpoint, and OI is not a
+    tick-level number anyway). Returns None when unavailable.
+    """
+    try:
+        resp = requests.post(
+            f"{DHAN_API_BASE}/optionchain", headers=_dhan_headers(),
+            json={"UnderlyingScrip": int(under_security_id),
+                  "UnderlyingSeg": under_segment, "Expiry": expiry},
+            timeout=20,
+        )
+        resp.raise_for_status()
+        data = (resp.json() or {}).get("data", {}) or {}
+        oc = data.get("oc", {}) or {}
+        ce_oi = pe_oi = ce_prev = pe_prev = 0.0
+        for _strike, legs in oc.items():
+            ce, pe = legs.get("ce") or {}, legs.get("pe") or {}
+            ce_oi += float(ce.get("oi", 0) or 0)
+            pe_oi += float(pe.get("oi", 0) or 0)
+            ce_prev += float(ce.get("previous_oi", ce.get("previousOi", 0)) or 0)
+            pe_prev += float(pe.get("previous_oi", pe.get("previousOi", 0)) or 0)
+        if ce_oi == 0 and pe_oi == 0:
+            return None
+        return {
+            "ce_oi": ce_oi, "pe_oi": pe_oi,
+            "ce_oi_change": ce_oi - ce_prev, "pe_oi_change": pe_oi - pe_prev,
+            "pcr": (pe_oi / ce_oi) if ce_oi else None,
+            "underlying": data.get("last_price"),
+            "fetched_at": ist_now().strftime("%H:%M:%S IST"),
+        }
+    except Exception:
+        return None
+
+
+def get_oi_snapshot():
+    """Resolve the configured OI underlying + expiry and pull a live snapshot."""
+    store = st.session_state.app_cfg
+    meta = DHAN_INDEX_MAP.get(store.get("oi_underlying", "Nifty50"))
+    if not meta:
+        return None
+    _, token = _dhan_creds()
+    if not token:
+        return None
+    expiry = store.get("oi_expiry")
+    if not expiry:
+        exps = dhan_get_expiries(meta["underlying"], "OPTIDX", meta["exchange"])
+        expiry = exps[0] if exps else None
+    if not expiry:
+        return None
+    return dhan_get_option_chain(meta["security_id"], meta["segment"], expiry,
+                                 hash(token) % 10_000_019)
+
+
+def evaluate_oi_signal(params, snap):
+    """
+    OI-based signal from the aggregate option-chain picture.
+
+    Rule: when one side's absolute OI exceeds the other AND that side's
+    CHANGE in OI is also larger, with both sides clearing their configured
+    minimum OI thresholds → that side is 'dominant' and fires a signal.
+
+    Interpretation: OI is written from the SELLER's perspective, so heavy CE
+    writing (CE OI > PE OI with ΔCE > ΔPE) is conventionally read as bearish
+    — resistance being built overhead — which by default BUYS PE. The
+    'Flip OI interpretation' checkbox reverses that mapping so you can trade
+    whichever reading you believe, rather than the app forcing one on you.
+
+    Returns (signal, [explanation lines]).
+    """
+    if not snap:
+        return 0, ["OI data unavailable — needs a valid Dhan token, a resolvable expiry, and live market hours."]
+    ce_oi, pe_oi = snap["ce_oi"], snap["pe_oi"]
+    d_ce, d_pe = snap["ce_oi_change"], snap["pe_oi_change"]
+    min_ce = float(params.get("oi_ce_threshold", 0.0))
+    min_pe = float(params.get("oi_pe_threshold", 0.0))
+    flip = bool(params.get("oi_flip", False))
+
+    base = (f"CE OI {ce_oi:,.0f} (min {min_ce:,.0f}) vs PE OI {pe_oi:,.0f} (min {min_pe:,.0f}); "
+            f"ΔCE {d_ce:+,.0f} vs ΔPE {d_pe:+,.0f}")
+    if snap.get("pcr"):
+        base += f"; PCR {snap['pcr']:.2f}"
+    lines = [base]
+
+    if not (ce_oi >= min_ce and pe_oi >= min_pe):
+        lines.append("❌ Minimum OI thresholds not met → no signal.")
+        return 0, lines
+
+    ce_dominant = (ce_oi > pe_oi) and (d_ce > d_pe)
+    pe_dominant = (pe_oi > ce_oi) and (d_pe > d_ce)
+    reading = "flipped reading" if flip else "standard seller-perspective reading"
+
+    if ce_dominant:
+        sig = 1 if flip else -1
+        lines.append(f"✅ CE side dominant (CE OI > PE OI and ΔCE > ΔPE) → "
+                     f"{'LONG / BUY CE' if flip else 'SHORT bias → BUY PE'} ({reading}).")
+        return sig, lines
+    if pe_dominant:
+        sig = -1 if flip else 1
+        lines.append(f"✅ PE side dominant (PE OI > CE OI and ΔPE > ΔCE) → "
+                     f"{'SHORT bias → BUY PE' if flip else 'LONG / BUY CE'} ({reading}).")
+        return sig, lines
+    lines.append("❌ Neither side dominant on BOTH absolute OI and OI change → no signal.")
+    return 0, lines
+
+
 def dhan_get_ltp_for_ticker(ticker):
     feed = dhan_resolve_feed_instrument(ticker)
     if feed is None:
@@ -1212,11 +1475,52 @@ def trade_history_fragment():
 # STRATEGY SIGNAL GENERATION  (no look-ahead: signal at i uses data up to i)
 # ============================================================================
 
-def generate_signals(df, strategy, params):
+def generate_signals(df, strategy, params, _raw=False):
     df = df.copy()
     df["signal"] = 0
 
-    if strategy == "EMA Crossover":
+    if strategy == "OI Based (CE/PE Open Interest)":
+        # Live option-chain OI is a point-in-time snapshot — there is no
+        # historical OI series available here, so this strategy marks only
+        # the LATEST bar. It is intended for live trading; in a backtest it
+        # can only ever produce the current snapshot's signal on the last bar
+        # (shown honestly rather than fabricated from price data).
+        sig, _lines = evaluate_oi_signal(params, get_oi_snapshot())
+        if sig != 0 and len(df):
+            df.iloc[-1, df.columns.get_loc("signal")] = sig
+
+    elif strategy == "Hybrid (Combine Strategies)":
+        members = list(params.get("hybrid_members", []))
+        mode = params.get("hybrid_mode", "AND")
+        if members:
+            longs, shorts = [], []
+            for m in members:
+                if m == "Hybrid (Combine Strategies)":
+                    continue    # no self-recursion
+                sub = generate_signals(df, m, params, _raw=True)
+                s = sub["signal"].reindex(df.index).fillna(0)
+                longs.append(s == 1)
+                shorts.append(s == -1)
+                # keep each member's indicator columns for charting/status
+                for col in sub.columns:
+                    if col not in df.columns and col != "signal":
+                        df[col] = sub[col]
+            if longs:
+                if str(mode).upper().startswith("AND"):
+                    # ALL selected strategies must agree on the same bar
+                    long_mask = np.logical_and.reduce([m.values for m in longs])
+                    short_mask = np.logical_and.reduce([m.values for m in shorts])
+                else:  # OR — any single member firing is enough
+                    long_mask = np.logical_or.reduce([m.values for m in longs])
+                    short_mask = np.logical_or.reduce([m.values for m in shorts])
+                # A bar where both sides qualify is contradictory → no trade
+                both = long_mask & short_mask
+                long_mask = long_mask & ~both
+                short_mask = short_mask & ~both
+                df.loc[long_mask, "signal"] = 1
+                df.loc[short_mask, "signal"] = -1
+
+    elif strategy == "EMA Crossover":
         f, s = params.get("ema_fast", 9), params.get("ema_slow", 15)
         ef, es = ema(df["Close"], f), ema(df["Close"], s)
         df.loc[(ef > es) & (ef.shift(1) <= es.shift(1)), "signal"] = 1
@@ -1231,14 +1535,28 @@ def generate_signals(df, strategy, params):
     elif strategy == "Threshold Cross":
         thr = params.get("threshold", float(df["Close"].iloc[0]))
         # Cross Direction (identical in backtest and live):
-        #   "Below" (default) → price approaches from BELOW and crosses UP
-        #                       through the threshold → LONG.
-        #   "Above"           → price crosses DOWN from above → SHORT.
+        #   "Below" (default) → LONG when price is/goes ABOVE the threshold.
+        #   "Above"           → SHORT when price is/goes BELOW the threshold.
+        # Trigger Mode:
+        #   "Level (fire whenever price is beyond the threshold)" — DEFAULT.
+        #     This is an order-style trigger: it does NOT require the app to
+        #     have witnessed the exact crossing bar, so it still fires when
+        #     price crossed before you started, or between polls. This is why
+        #     the old cross-only behaviour looked dead.
+        #   "Cross event (needs the actual crossing bar)" — the stricter,
+        #     original behaviour: fires only on the bar where price crossed.
         cross_dir = params.get("threshold_direction", "Below")
-        if cross_dir == "Above":
-            df.loc[(df["Close"] < thr) & (df["Close"].shift(1) >= thr), "signal"] = -1
+        mode = params.get("threshold_trigger_mode", "Level")
+        if str(mode).startswith("Cross"):
+            if cross_dir == "Above":
+                df.loc[(df["Close"] < thr) & (df["Close"].shift(1) >= thr), "signal"] = -1
+            else:
+                df.loc[(df["Close"] > thr) & (df["Close"].shift(1) <= thr), "signal"] = 1
         else:
-            df.loc[(df["Close"] > thr) & (df["Close"].shift(1) <= thr), "signal"] = 1
+            if cross_dir == "Above":
+                df.loc[df["Close"] < thr, "signal"] = -1
+            else:
+                df.loc[df["Close"] > thr, "signal"] = 1
 
     elif strategy == "Price Action Support/Resistance":
         w = params.get("sr_window", 20)
@@ -1260,8 +1578,23 @@ def generate_signals(df, strategy, params):
     elif strategy == "RSI Cross":
         r = rsi(df["Close"], params.get("rsi_period", 14))
         df["rsi"] = r
-        df.loc[(r > 30) & (r.shift(1) <= 30), "signal"] = 1
-        df.loc[(r < 70) & (r.shift(1) >= 70), "signal"] = -1
+        buy_lvl = params.get("rsi_buy_level", 30.0)
+        sell_lvl = params.get("rsi_sell_level", 70.0)
+        # Cross direction is now explicit for each side:
+        #   BUY  "Up-cross (from below)"  → RSI rises THROUGH the buy level
+        #        "Down-cross (from above)" → RSI falls INTO oversold
+        #   SELL "Down-cross (from above)" → RSI falls THROUGH the sell level
+        #        "Up-cross (from below)"   → RSI rises INTO overbought
+        buy_dir = params.get("rsi_buy_cross", "Up-cross (from below)")
+        sell_dir = params.get("rsi_sell_cross", "Down-cross (from above)")
+        if buy_dir.startswith("Up"):
+            df.loc[(r > buy_lvl) & (r.shift(1) <= buy_lvl), "signal"] = 1
+        else:
+            df.loc[(r < buy_lvl) & (r.shift(1) >= buy_lvl), "signal"] = 1
+        if sell_dir.startswith("Down"):
+            df.loc[(r < sell_lvl) & (r.shift(1) >= sell_lvl), "signal"] = -1
+        else:
+            df.loc[(r > sell_lvl) & (r.shift(1) <= sell_lvl), "signal"] = -1
 
     elif strategy == "Bollinger Bands":
         upper, mid, lower = bollinger(df["Close"], params.get("bb_period", 20), params.get("bb_std", 2))
@@ -1279,10 +1612,26 @@ def generate_signals(df, strategy, params):
         df.loc[(df["Close"] < rl) & (df["Volume"] > factor * vol_avg), "signal"] = -1
 
     elif strategy == "Elliott Wave (Zigzag)":
-        sh, sl_ = swing_points(df, params.get("zigzag_lookback", 3))
-        df["swing_high"], df["swing_low"] = sh, sl_
-        df.loc[sl_, "signal"] = 1
-        df.loc[sh, "signal"] = -1
+        lb = params.get("zigzag_lookback", 3)
+        piv = elliott_wave_state(df, lb)
+        df["swing_high"], df["swing_low"] = piv["raw_high"], piv["raw_low"]
+        df["ew_pivot_price"] = piv["pivot_price"]
+        df["ew_pivot_kind"] = piv["pivot_kind"]
+        df["ew_wave_label"] = piv["wave_label"]
+        # Signals fire on the CONFIRMATION bar, never retroactively on the
+        # pivot bar itself. A pivot at bar i can only be known at bar i+lb
+        # (it needs lb bars on its right), so the old version — which marked
+        # the pivot bar — was using future information and could NEVER fire
+        # on the newest bar, which is why it worked in backtest and was dead
+        # in live. Firing at confirmation makes backtest and live identical.
+        df.loc[piv["confirm_low"], "signal"] = 1     # confirmed trough → long
+        df.loc[piv["confirm_high"], "signal"] = -1   # confirmed peak → short
+        if params.get("ew_impulse_only", False):
+            # Optional stricter mode: only trade pivots that continue the
+            # impulse structure (higher-low in an uptrend / lower-high in a
+            # downtrend), i.e. wave 3 / wave 5 starts rather than every swing.
+            df.loc[(df["signal"] == 1) & (~piv["higher_low"]), "signal"] = 0
+            df.loc[(df["signal"] == -1) & (~piv["lower_high"]), "signal"] = 0
 
     elif strategy == "Pro: VWAP + Supertrend Trend":
         vw = vwap(df)
@@ -1402,6 +1751,10 @@ def generate_signals(df, strategy, params):
         df.loc[sell, "signal"] = -1
 
     df["signal"] = df["signal"].fillna(0)
+    if _raw:
+        # Sub-strategy call from the Hybrid combiner: return RAW signals so
+        # flip/direction rules are applied ONCE, to the combined result.
+        return df
     return apply_signal_direction_rules(df, params)
 
 
@@ -2729,22 +3082,91 @@ def render_config_controls(ui, prefix):
         params["threshold"] = cfg_number(ui, "Threshold Price", "threshold", 0.0, prefix=prefix)
         params["threshold_direction"] = cfg_selectbox(
             ui, "Cross Direction", "threshold_direction", ["Below", "Above"], default="Below", prefix=prefix)
-        ui.caption("Below = price approaches from below and crosses UP through the threshold → LONG. "
-                   "Above = price crosses DOWN from above → SHORT. Applied identically in backtest and live.")
+        params["threshold_trigger_mode"] = cfg_selectbox(
+            ui, "Trigger Mode", "threshold_trigger_mode",
+            ["Level (fire whenever price is beyond the threshold)",
+             "Cross event (needs the actual crossing bar)"],
+            default="Level (fire whenever price is beyond the threshold)", prefix=prefix)
+        ui.caption("Below = LONG when price is/goes ABOVE the threshold. Above = SHORT when price is/goes BELOW it. "
+                   "**Level mode (default)** behaves like a resting order: it fires the instant the LIVE LTP is on the "
+                   "trigger side — no candle close needed and no requirement that the app witnessed the exact crossing "
+                   "bar (that requirement is what made this look dead before). Cross-event mode is the stricter "
+                   "original behaviour.")
+    if strategy == "RSI Cross":
+        params["rsi_period"] = cfg_number(ui, "RSI Period", "rsi_period", 14, 2, 50, is_int=True, prefix=prefix)
+        c1, c2 = ui.columns(2)
+        params["rsi_buy_level"] = cfg_number(c1, "RSI Buy Level", "rsi_buy_level", 30.0, 1.0, 99.0, prefix=prefix)
+        params["rsi_sell_level"] = cfg_number(c2, "RSI Sell Level", "rsi_sell_level", 70.0, 1.0, 99.0, prefix=prefix)
+        params["rsi_buy_cross"] = cfg_selectbox(
+            ui, "BUY fires on", "rsi_buy_cross",
+            ["Up-cross (from below)", "Down-cross (from above)"],
+            default="Up-cross (from below)", prefix=prefix)
+        params["rsi_sell_cross"] = cfg_selectbox(
+            ui, "SELL fires on", "rsi_sell_cross",
+            ["Down-cross (from above)", "Up-cross (from below)"],
+            default="Down-cross (from above)", prefix=prefix)
+        ui.caption(f"Default: BUY when RSI rises UP THROUGH {params['rsi_buy_level']:.0f} (recovering out of oversold) "
+                   f"and SELL when RSI falls DOWN THROUGH {params['rsi_sell_level']:.0f}. Switch either dropdown to "
+                   "trade the opposite crossing direction (e.g. buy as RSI drops INTO oversold) — both levels and both "
+                   "directions are fully configurable.")
+    if strategy == "Elliott Wave (Zigzag)":
+        params["zigzag_lookback"] = cfg_number(ui, "Zigzag Lookback (bars each side of a pivot)",
+                                               "zigzag_lookback", 3, 2, 20, is_int=True, prefix=prefix)
+        params["ew_impulse_only"] = cfg_checkbox(ui, "Impulse structure only (higher-lows / lower-highs)",
+                                                 "ew_impulse_only", False, prefix=prefix)
+        ui.caption(f"A pivot needs {params['zigzag_lookback']} bars on each side, so it becomes tradeable "
+                   f"{params['zigzag_lookback']} bars AFTER it forms — signals now fire on that confirmation bar in "
+                   "both backtest and live (previously they were stamped on the pivot bar itself, which used future "
+                   "bars and could never fire on the newest candle — that's why it worked only in backtest). "
+                   "Impulse-only restricts entries to swings that continue the structure.")
+    if strategy == "OI Based (CE/PE Open Interest)":
+        params["oi_underlying"] = cfg_selectbox(ui, "OI Underlying", "oi_underlying",
+                                                list(DHAN_INDEX_MAP.keys()), default="Nifty50", prefix=prefix)
+        _oi_meta = DHAN_INDEX_MAP[params["oi_underlying"]]
+        _oi_exps = dhan_get_expiries(_oi_meta["underlying"], "OPTIDX", _oi_meta["exchange"])
+        if _oi_exps:
+            params["oi_expiry"] = cfg_selectbox(ui, "OI Expiry (nearest pre-selected)", "oi_expiry",
+                                                _oi_exps, default=_oi_exps[0], prefix=prefix)
+        else:
+            params["oi_expiry"] = cfg_text(ui, "OI Expiry (YYYY-MM-DD)", "oi_expiry", "", prefix=prefix)
+        c1, c2 = ui.columns(2)
+        params["oi_ce_threshold"] = cfg_number(c1, "Min CE OI", "oi_ce_threshold", 0.0, 0.0, 1e12, step=100000.0, prefix=prefix)
+        params["oi_pe_threshold"] = cfg_number(c2, "Min PE OI", "oi_pe_threshold", 0.0, 0.0, 1e12, step=100000.0, prefix=prefix)
+        params["oi_flip"] = cfg_checkbox(ui, "Flip OI interpretation (buy the other leg)", "oi_flip", False, prefix=prefix)
+        ui.caption("Rule: a side is dominant when its absolute OI is higher AND its change in OI is larger, with both "
+                   "sides clearing their minimum thresholds. Because OI is written from the SELLER's perspective, "
+                   "heavy CE writing (CE OI > PE OI, ΔCE > ΔPE) reads as bearish by default and BUYS PE. Tick the flip "
+                   "box to trade the opposite interpretation. Needs a Dhan token; OI refreshes every 60s. Note this is "
+                   "a live-only signal — historical OI isn't available, so a backtest can only show the current "
+                   "snapshot on the last bar.")
+        _snap_preview = get_oi_snapshot()
+        if _snap_preview:
+            ui.caption(f"Live OI @ {_snap_preview['fetched_at']}: CE {_snap_preview['ce_oi']:,.0f} "
+                       f"(Δ{_snap_preview['ce_oi_change']:+,.0f}) · PE {_snap_preview['pe_oi']:,.0f} "
+                       f"(Δ{_snap_preview['pe_oi_change']:+,.0f})")
+    if strategy == "Hybrid (Combine Strategies)":
+        _members = [s for s in STRATEGIES if s != "Hybrid (Combine Strategies)"]
+        params["hybrid_members"] = cfg_multiselect(ui, "Strategies to combine", "hybrid_members",
+                                                   _members, default=["EMA Crossover"], prefix=prefix)
+        params["hybrid_mode"] = cfg_selectbox(ui, "Combination Logic", "hybrid_mode",
+                                              ["AND — every selected strategy must fire the same direction",
+                                               "OR — any one selected strategy firing is enough"],
+                                              default="AND — every selected strategy must fire the same direction",
+                                              prefix=prefix)
+        ui.caption("AND is a confluence filter: all selected strategies must signal the SAME direction on the same bar "
+                   "(fewer, higher-conviction entries). OR is a broadener: any single member firing triggers an entry. "
+                   "A bar where the members contradict each other is skipped. Each member uses its own parameters as "
+                   "configured above/below; flip and Trade Direction are applied once to the combined result.")
     if strategy == "Price Action Support/Resistance":
         params["sr_window"] = cfg_number(ui, "S/R Lookback", "sr_window", 20, 5, 200, is_int=True, prefix=prefix)
     if strategy == "Liquidity Grab Reversal":
         params["liq_window"] = cfg_number(ui, "Liquidity Lookback", "liq_window", 20, 5, 200, is_int=True, prefix=prefix)
-    if strategy == "RSI Cross":
-        params["rsi_period"] = cfg_number(ui, "RSI Period", "rsi_period", 14, 2, 50, is_int=True, prefix=prefix)
     if strategy in ("Bollinger Bands", "Pro: BB+RSI Mean Reversion (ATR filtered)"):
         params["bb_period"] = cfg_number(ui, "BB Period", "bb_period", 20, 5, 100, is_int=True, prefix=prefix)
         params["bb_std"] = cfg_number(ui, "BB Std Dev", "bb_std", 2.0, 1.0, 4.0, prefix=prefix)
     if strategy == "Volume Breakout":
         params["vol_window"] = cfg_number(ui, "Volume Lookback", "vol_window", 20, 5, 100, is_int=True, prefix=prefix)
         params["vol_factor"] = cfg_number(ui, "Volume Spike Factor", "vol_factor", 2.0, 1.0, 5.0, prefix=prefix)
-    if strategy == "Elliott Wave (Zigzag)":
-        params["zigzag_lookback"] = cfg_number(ui, "Zigzag Lookback", "zigzag_lookback", 3, 2, 20, is_int=True, prefix=prefix)
     if strategy == "Pro: VWAP + Supertrend Trend":
         params["st_period"] = cfg_number(ui, "Supertrend Period", "st_period", 10, 5, 50, is_int=True, prefix=prefix)
         params["st_mult"] = cfg_number(ui, "Supertrend Multiplier", "st_mult", 3.0, 1.0, 6.0, prefix=prefix)
@@ -3305,6 +3727,9 @@ def render_config_controls(ui, prefix):
 # SIDEBAR (one of the two live views of the shared config store)
 # ============================================================================
 
+# Settle every pending edit from BOTH views BEFORE anything renders.
+reconcile_config_widgets()
+
 config = render_config_controls(st.sidebar, "sb")
 if st.session_state.get("cfg_applied_msg"):
     st.sidebar.success(st.session_state.pop("cfg_applied_msg"))
@@ -3335,9 +3760,54 @@ product_cfg = config["product_cfg"]
 # HELPERS SHARED ACROSS TABS
 # ============================================================================
 
-def price_chart(df, trades_df=None, title="", ema_overlay=None, extra_lines=None):
+def config_fingerprint(cfg):
+    """Stable hash of everything that can change backtest output. Used to tell
+    the user when displayed results predate their current settings."""
+    try:
+        relevant = {
+            k: cfg.get(k) for k in
+            ("ticker", "interval", "period", "qty", "strategy", "sl_type", "target_type",
+             "cost_enabled", "wf_enabled", "wf_folds")
+        }
+        relevant["params"] = cfg.get("params")
+        relevant["filters"] = cfg.get("filters")
+        relevant["risk_ctrl"] = cfg.get("risk_ctrl")
+        relevant["cost_cfg"] = cfg.get("cost_cfg")
+        return json.dumps(relevant, sort_keys=True, default=str)
+    except Exception:
+        return None
+
+
+def price_chart(df, trades_df=None, title="", ema_overlay=None, extra_lines=None, elliott=None):
     fig = go.Figure(data=[go.Candlestick(
         x=df.index, open=df["Open"], high=df["High"], low=df["Low"], close=df["Close"], name="Price")])
+    if elliott:
+        # Zigzag connecting confirmed alternating pivots, annotated with the
+        # running Elliott count (1-2-3-4-5 → A-B-C).
+        try:
+            seq = elliott.get("pivots") or []
+            if len(seq) >= 2:
+                xs = [df.index[i] for i, _p, _k in seq]
+                ys = [p for _i, p, _k in seq]
+                labels = ["1", "2", "3", "4", "5", "A", "B", "C"]
+                texts = [labels[n % len(labels)] for n in range(len(seq))]
+                fig.add_trace(go.Scatter(
+                    x=xs, y=ys, mode="lines+markers+text", text=texts, textposition="top center",
+                    textfont=dict(size=12, color="#8ab4f8"),
+                    line=dict(color="#8ab4f8", width=1.8, dash="dot"),
+                    marker=dict(size=8, color="#8ab4f8", symbol="diamond"),
+                    name="Elliott zigzag"))
+            prov = elliott.get("provisional")
+            if prov:
+                kind, price, when = prov
+                fig.add_trace(go.Scatter(
+                    x=[when], y=[price], mode="markers+text",
+                    text=[f"provisional {'L' if kind == 'L' else 'H'}"], textposition="bottom center",
+                    textfont=dict(size=11, color="#f0a202"),
+                    marker=dict(size=11, color="#f0a202", symbol="circle-open", line=dict(width=2)),
+                    name="Pending pivot"))
+        except Exception:
+            pass
     if ema_overlay:
         for period, color in ema_overlay:
             series = ema(df["Close"], period)
@@ -3392,8 +3862,20 @@ def describe_signal_status(df, strategy, params, filters):
         r = rsi(close, params.get("rsi_period", 14))
         r_val, r_ok = safe_indicator_value(r, params.get("rsi_period", 14) * 3)
         if r_ok:
-            lines.append(f"RSI({params.get('rsi_period',14)}) = {r_val:.1f}. Buy needs RSI to cross UP through 30 (distance: {r_val-30:+.1f}). "
-                         f"Sell needs RSI to cross DOWN through 70 (distance: {70-r_val:+.1f}).")
+            if strategy == "RSI Cross":
+                bl = params.get("rsi_buy_level", 30.0)
+                sl_lvl = params.get("rsi_sell_level", 70.0)
+                bd = params.get("rsi_buy_cross", "Up-cross (from below)")
+                sd = params.get("rsi_sell_cross", "Down-cross (from above)")
+                lines.append(
+                    f"RSI({params.get('rsi_period',14)}) = {r_val:.1f}. "
+                    f"BUY needs RSI to cross {'UP through' if bd.startswith('Up') else 'DOWN through'} {bl:.0f} "
+                    f"(distance {r_val - bl:+.1f}). "
+                    f"SELL needs RSI to cross {'DOWN through' if sd.startswith('Down') else 'UP through'} {sl_lvl:.0f} "
+                    f"(distance {sl_lvl - r_val:+.1f}).")
+            else:
+                lines.append(f"RSI filter({params.get('rsi_period',14)}) = {r_val:.1f}. Buy needs an up-cross through 30 "
+                             f"(distance {r_val-30:+.1f}); sell a down-cross through 70 (distance {70-r_val:+.1f}).")
         else:
             lines.append(f"RSI: N/A — insufficient warm-up history ({len(df)} candles available).")
 
@@ -3451,15 +3933,102 @@ def describe_signal_status(df, strategy, params, filters):
 
     # ----- strategy-specific conditions not covered above ------------------
     c_now = float(close.iloc[-1])
+    if strategy == "Elliott Wave (Zigzag)":
+        lb = params.get("zigzag_lookback", 3)
+        try:
+            piv = elliott_wave_state(df, lb)
+            seq = piv["pivots"]
+            if seq:
+                recent = seq[-4:]
+                chain = " → ".join(f"{'H' if k=='H' else 'L'}@{p:.2f}" for _i, p, k in recent)
+                last_idx, last_price, last_kind = seq[-1]
+                lab = piv["wave_label"].iloc[min(last_idx + lb, len(df) - 1)]
+                lines.append(f"Elliott structure (last {len(recent)} confirmed pivots): {chain}"
+                             + (f" · current wave count ≈ {lab}" if lab else ""))
+                if last_kind == "L":
+                    lines.append(f"Last CONFIRMED pivot was a LOW @ {last_price:.2f} → a LONG already fired on its "
+                                 f"confirmation bar. Next SHORT needs a swing HIGH to form and then survive {lb} bars.")
+                else:
+                    lines.append(f"Last CONFIRMED pivot was a HIGH @ {last_price:.2f} → a SHORT already fired on its "
+                                 f"confirmation bar. Next LONG needs a swing LOW to form and then survive {lb} bars.")
+            else:
+                lines.append(f"Elliott Wave: no confirmed pivots yet — need at least {2*lb+2} candles of history "
+                             f"(have {len(df)}).")
+            prov, btc = piv["provisional"], piv["bars_to_confirm"]
+            if prov and btc:
+                kind, price, when = prov
+                side = "LONG" if kind == "L" else "SHORT"
+                lines.append(f"⏳ PENDING pivot: provisional swing {'LOW' if kind=='L' else 'HIGH'} @ {price:.2f} "
+                             f"(formed {when}). It confirms in {btc} more candle(s) — a {side} fires then, "
+                             f"provided price does not {'break below' if kind=='L' else 'break above'} {price:.2f} "
+                             "first (which would invalidate it and start a new pivot).")
+            else:
+                lines.append(f"⏳ No provisional pivot in the last {lb} candles — price is mid-swing; a new "
+                             "extreme must print before any signal can develop.")
+            if params.get("ew_impulse_only"):
+                lines.append("Impulse-only mode ON: a confirmed low must also be a HIGHER low (and a confirmed high a "
+                             "LOWER high) or the signal is suppressed.")
+        except Exception as exc:
+            lines.append(f"Elliott Wave: could not compute wave state ({exc}).")
+
+    if strategy == "OI Based (CE/PE Open Interest)":
+        snap = get_oi_snapshot()
+        oi_sig, oi_lines = evaluate_oi_signal(params, snap)
+        for l in oi_lines:
+            lines.append("OI — " + l)
+        lines.append(f"OI verdict right now: {'🟢 LONG' if oi_sig==1 else ('🔴 SHORT' if oi_sig==-1 else '⚪ no signal')}"
+                     + (f" (data @ {snap['fetched_at']}, refreshes every 60s)" if snap else ""))
+
+    if strategy == "Hybrid (Combine Strategies)":
+        members = list(params.get("hybrid_members", []))
+        mode = params.get("hybrid_mode", "AND")
+        if not members:
+            lines.append("Hybrid: no member strategies selected — nothing can fire. Pick at least one.")
+        else:
+            lines.append(f"Hybrid mode: {'AND (all must agree)' if str(mode).upper().startswith('AND') else 'OR (any one is enough)'} "
+                         f"across {len(members)} strategies:")
+            fired_long, fired_short = [], []
+            for m in members:
+                try:
+                    sub = generate_signals(df, m, params, _raw=True)
+                    s_now = int(sub["signal"].iloc[-1])
+                except Exception:
+                    s_now = 0
+                mark = "🟢 LONG" if s_now == 1 else ("🔴 SHORT" if s_now == -1 else "⚪ flat")
+                lines.append(f"   • {m}: {mark} on the latest bar")
+                if s_now == 1:
+                    fired_long.append(m)
+                elif s_now == -1:
+                    fired_short.append(m)
+            if str(mode).upper().startswith("AND"):
+                need = len(members)
+                lines.append(f"   → AND needs all {need}: currently {len(fired_long)} long / {len(fired_short)} short. "
+                             + ("✅ LONG would fire." if len(fired_long) == need else
+                                ("✅ SHORT would fire." if len(fired_short) == need else "❌ not unanimous — no entry.")))
+            else:
+                lines.append("   → OR needs any one: "
+                             + ("✅ LONG would fire." if fired_long else
+                                ("✅ SHORT would fire." if fired_short else "❌ none firing — no entry.")))
+
     if strategy == "Threshold Cross":
         thr = params.get("threshold", c_now)
         cd = params.get("threshold_direction", "Below")
+        tm = params.get("threshold_trigger_mode", "Level")
+        level_mode = not str(tm).startswith("Cross")
         if cd == "Above":
-            lines.append(f"Threshold Cross (Above): close {c_now:.2f} vs threshold {thr:.2f} → needs price to cross DOWN "
-                         f"through it for a SHORT (distance {c_now - thr:+.2f}).")
+            armed = c_now < thr
+            lines.append(f"Threshold Cross (Above · {'Level' if level_mode else 'Cross-event'} mode): price {c_now:.2f} "
+                         f"vs threshold {thr:.2f} → "
+                         + (f"{'✅ SHORT condition met NOW' if armed else f'❌ needs {c_now - thr:+.2f} more to fall below'}"
+                            if level_mode else
+                            f"needs an actual DOWN-cross through it (currently {c_now - thr:+.2f} away)"))
         else:
-            lines.append(f"Threshold Cross (Below): close {c_now:.2f} vs threshold {thr:.2f} → needs price to cross UP "
-                         f"through it for a LONG (distance {thr - c_now:+.2f}).")
+            armed = c_now > thr
+            lines.append(f"Threshold Cross (Below · {'Level' if level_mode else 'Cross-event'} mode): price {c_now:.2f} "
+                         f"vs threshold {thr:.2f} → "
+                         + (f"{'✅ LONG condition met NOW' if armed else f'❌ needs {thr - c_now:+.2f} more to rise above'}"
+                            if level_mode else
+                            f"needs an actual UP-cross through it (currently {thr - c_now:+.2f} away)"))
     if strategy == "Simple Buy Only":
         prev_c = float(close.iloc[-2])
         lines.append(f"Simple Buy Only: LTP must be above previous close {prev_c:.2f} → currently {c_now:.2f} ({c_now - prev_c:+.2f}).")
@@ -3720,14 +4289,22 @@ def evaluate_live_signal(ticker, interval, period, strategy, params, filters, sl
             last_sig = 1 if ltp > prev_close else 0
         elif strategy == "Simple Sell Only":
             last_sig = -1 if ltp < prev_close else 0
-        else:  # Threshold Cross — same Cross Direction rule as the backtest:
+        else:  # Threshold Cross — evaluated against the LIVE LTP, no candle close needed
             thr = params.get("threshold", prev_close)
-            if params.get("threshold_direction", "Below") == "Above":
-                # "Above": price crosses DOWN from above → SHORT
-                last_sig = -1 if (ltp < thr and prev_close >= thr) else 0
+            cross_dir = params.get("threshold_direction", "Below")
+            mode = params.get("threshold_trigger_mode", "Level")
+            if str(mode).startswith("Cross"):
+                if cross_dir == "Above":
+                    last_sig = -1 if (ltp < thr and prev_close >= thr) else 0
+                else:
+                    last_sig = 1 if (ltp > thr and prev_close <= thr) else 0
             else:
-                # "Below" (default): approaches from below, crosses UP → LONG
-                last_sig = 1 if (ltp > thr and prev_close <= thr) else 0
+                # Level mode: fires the instant the LTP is on the trigger side,
+                # regardless of when the crossing happened.
+                if cross_dir == "Above":
+                    last_sig = -1 if ltp < thr else 0
+                else:
+                    last_sig = 1 if ltp > thr else 0
         # Flip FIRST, then the Trade Direction filter — same central rule as
         # candle-based strategies get inside generate_signals().
         last_sig = apply_direction_rules_to_scalar(last_sig, params)
@@ -4166,9 +4743,18 @@ with tab_bt:
                 trades_df, sig_df = run_backtest(raw, strategy, sl_type, target_type, params, filters, qty, risk_ctrl)
                 st.session_state.last_backtest = trades_df
                 st.session_state.last_backtest_df = sig_df
+                st.session_state.last_backtest_fp = config_fingerprint(config)
 
     trades_df = st.session_state.last_backtest
     sig_df = st.session_state.last_backtest_df
+
+    # Results are computed on click and then persist. If the configuration has
+    # changed since that click, say so loudly instead of letting old numbers
+    # masquerade as results for the current settings.
+    _cur_fp = config_fingerprint(config)
+    if trades_df is not None and st.session_state.get("last_backtest_fp") not in (None, _cur_fp):
+        st.warning("⚠️ The configuration has changed since these results were produced — they reflect the PREVIOUS "
+                   "settings. Click **Run Backtest** to recompute with the current configuration.")
 
     if trades_df is not None and sig_df is not None and not sig_df.empty:
         m = compute_metrics(trades_df)
@@ -4240,7 +4826,9 @@ with tab_bt:
         st.markdown("#### Chart — Price with Entries/Exits")
         st.plotly_chart(
             price_chart(sig_df, trades_df, "Price with Entries/Exits",
-                        ema_overlay=[(params.get("ema_fast", 9), "#3399ff"), (params.get("ema_slow", 15), "#ff9933")]),
+                        ema_overlay=[(params.get("ema_fast", 9), "#3399ff"), (params.get("ema_slow", 15), "#ff9933")],
+                        elliott=(elliott_wave_state(sig_df, params.get("zigzag_lookback", 3))
+                                 if strategy == "Elliott Wave (Zigzag)" else None)),
             use_container_width=True,
         )
     else:
@@ -4393,7 +4981,9 @@ with tab_live:
         st.plotly_chart(
             price_chart(chart_df, None, "Recent Price Action",
                         ema_overlay=[(params.get("ema_fast", 9), "#3399ff"), (params.get("ema_slow", 15), "#ff9933")],
-                        extra_lines=extra_lines),
+                        extra_lines=extra_lines,
+                        elliott=(elliott_wave_state(chart_df, params.get("zigzag_lookback", 3))
+                                 if strategy == "Elliott Wave (Zigzag)" else None)),
             use_container_width=True,
         )
 
