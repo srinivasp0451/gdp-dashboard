@@ -261,117 +261,87 @@ if st.session_state.risk_day_key != _today_key:
 
 
 # ============================================================================
-# SHARED CONFIG STORE + TWO-WAY SYNCED WIDGET WRAPPERS
+# CONFIG WIDGETS — SINGLE OWNER, SINGLE RENDER
 # ----------------------------------------------------------------------------
-# The Sidebar and the "🛠 Admin Panel" tab are two live views of ONE store:
-# st.session_state.app_cfg. Synchronisation happens in a SINGLE PRE-PASS —
-# reconcile_config_widgets(), called once before anything renders — which
-# harvests every user edit from both views, settles the store, and pushes the
-# settled value back into both views' widget keys.
+# There is exactly ONE set of configuration widgets in this app: the sidebar.
+# Streamlit owns each widget's value through its session key, and this module
+# never re-assigns that key once it exists (see _cfg_init). st.session_state
+# .app_cfg is a read-only MIRROR of those values for non-widget consumers
+# (order routing, the Optimization tab, config snapshots) — the mirror never
+# drives the widgets.
 #
-# This replaces an earlier per-widget "sync while rendering" scheme that was
-# genuinely broken: because the sidebar renders before the Admin Panel, that
-# scheme read one view's fresh input before the other view's fresh input
-# existed, so a stale value got written to the store and overwritten a moment
-# later — the two values then ping-ponged across reruns. Symptoms were
-# unchecking one box appearing to re-check another, and a strategy or SL type
-# reverting on its own. With reconciliation done up front, render order is
-# irrelevant and no widget can contradict the store.
+# Why it's built this way: earlier versions rendered the same controls twice
+# (sidebar + a duplicate Admin Panel) and tried to keep the two in sync by
+# writing widget keys on every run. Because the two views render one after
+# the other, each run wrote a value the user had not chosen, and selections
+# visibly snapped back to their previous state. The duplicate rendering has
+# been removed entirely — the Admin Panel is now a read-only full-width
+# summary — which eliminates that entire class of bug at the source rather
+# than trying to arbitrate a race.
 # ============================================================================
 
-_CFG_PREFIXES = ("w_sb_", "w_ad_")
-_MISSING = object()
+_CFG_PREFIX = "w_"
 
 
 def _cfg_store():
     return st.session_state.app_cfg
 
 
-def _cfg_key_of(wkey):
-    for p in _CFG_PREFIXES:
-        if wkey.startswith(p):
-            return wkey[len(p):]
-    return None
+def _wkey(cfg_key):
+    return _CFG_PREFIX + cfg_key
 
 
-def reconcile_config_widgets():
+def _cfg_init(cfg_key, default, coerce=None):
     """
-    SINGLE PRE-PASS, run once at the top of the script BEFORE any widget is
-    rendered. This is what makes the Sidebar and the Admin Panel behave like
-    one consistent form.
+    Initialise a widget's session key ONCE, then never touch it again.
 
-    Why this exists: the two views render sequentially (sidebar first, Admin
-    Panel later). Any per-widget "sync at render time" scheme reads one
-    view's fresh input before the other view's fresh input exists, so the
-    first view writes a stale value into the shared store and the second view
-    overwrites it a moment later. Across reruns those two values ping-pong —
-    which is exactly what made unchecking one box appear to re-check another,
-    and made a strategy/SL revert on its own.
-
-    The fix: harvest EVERY user edit from BOTH views first, settle the store,
-    then push the settled value back into every widget key. After this runs,
-    the store is authoritative and no widget can contradict it, so rendering
-    order stops mattering entirely.
+    This is the single most important rule in this file. Streamlit already
+    owns a widget's value once the widget exists, and it survives reruns by
+    itself. Any code that re-assigns that key on later runs is fighting the
+    user: whatever they just picked gets overwritten by whatever the code
+    thinks the value should be, which is exactly how a selection appears to
+    "snap back" to the previous one. So the ONLY writes here are:
+      • first-ever creation (seed from the stored value or the default), and
+      • a coercion when the live option list no longer contains the value
+        (e.g. the period list changed with the timeframe) — otherwise
+        Streamlit itself would raise.
+    Everything else is read-only as far as widget state is concerned.
     """
     store = _cfg_store()
-
-    # PASS 1 — harvest: a widget whose value differs from the snapshot we
-    # took when we last rendered it is a genuine user edit (this also
-    # catches edits whose change-event Streamlit dropped because a rerun
-    # was superseded, e.g. toggling a box and clicking Run immediately).
-    for wkey in [k for k in st.session_state.keys() if k.startswith(_CFG_PREFIXES)]:
-        cfg_key = _cfg_key_of(wkey)
-        if not cfg_key:
-            continue
-        seen = st.session_state.get("_seen_" + wkey, _MISSING)
-        val = st.session_state.get(wkey, _MISSING)
-        if seen is not _MISSING and val is not _MISSING and val != seen:
-            store[cfg_key] = val
-
-    # PASS 2 — settle: push the agreed value back into every widget key of
-    # BOTH views, and re-snapshot, so neither view can re-report a stale
-    # value as if it were a new edit on the next run.
-    for wkey in [k for k in st.session_state.keys() if k.startswith(_CFG_PREFIXES)]:
-        cfg_key = _cfg_key_of(wkey)
-        if not cfg_key or cfg_key not in store:
-            continue
-        if st.session_state.get(wkey, _MISSING) != store[cfg_key]:
-            st.session_state[wkey] = store[cfg_key]
-        st.session_state["_seen_" + wkey] = store[cfg_key]
+    wkey = _wkey(cfg_key)
+    if wkey not in st.session_state:
+        seed = store.get(cfg_key, default)
+        st.session_state[wkey] = coerce(seed) if coerce else seed
+    elif coerce is not None:
+        fixed = coerce(st.session_state[wkey])
+        if fixed != st.session_state[wkey]:
+            st.session_state[wkey] = fixed      # option list changed under us
+    return wkey
 
 
-def _cfg_prepare(wkey, cfg_key, default, coerce=None):
-    """Per-widget preparation AFTER reconciliation: guarantee the store has a
-    value, apply any coercion the live option list demands, and make the
-    widget key agree with the store. Because reconcile_config_widgets() has
-    already harvested every user edit, forcing widget := store here can never
-    clobber a fresh edit."""
-    store = _cfg_store()
-    if cfg_key not in store:
-        store[cfg_key] = default
-    cur = store[cfg_key]
-    if coerce is not None:
-        cur = coerce(cur)
-    if store.get(cfg_key) != cur:
-        store[cfg_key] = cur          # coercion write-back
-    if st.session_state.get(wkey, _MISSING) != cur:
-        st.session_state[wkey] = cur
-        st.session_state["_seen_" + wkey] = cur
-    return cur
-
-
-def _cfg_commit(wkey, cfg_key, val):
-    """Snapshot exactly what was rendered, and mirror it into the store."""
-    st.session_state["_seen_" + wkey] = val
+def _cfg_out(cfg_key, val):
+    """Mirror the widget's value into the plain-dict store. The store is a
+    read-only projection used by non-widget code (order routing, the
+    Optimization tab, saved snapshots) — it never drives the widgets."""
     _cfg_store()[cfg_key] = val
     return val
 
 
+def cfg_force(cfg_key, value):
+    """
+    Programmatic write (auto-filled security IDs, exchange auto-flip,
+    apply-optimized-config). Legal because every caller runs BEFORE the
+    corresponding widget is instantiated on this run; Streamlit only forbids
+    assigning to a widget key AFTER its widget has been created in the same
+    run. Used sparingly and only for values the user did not just type.
+    """
+    st.session_state[_wkey(cfg_key)] = value
+    _cfg_store()[cfg_key] = value
+
+
 def cfg_checkbox(ui, label, cfg_key, default=False, prefix="sb", **kw):
-    wkey = f"w_{prefix}_{cfg_key}"
-    _cfg_prepare(wkey, cfg_key, bool(default), coerce=lambda v: bool(v))
-    val = ui.checkbox(label, key=wkey, **kw)
-    return _cfg_commit(wkey, cfg_key, bool(val))
+    wkey = _cfg_init(cfg_key, bool(default), coerce=lambda v: bool(v))
+    return _cfg_out(cfg_key, ui.checkbox(label, key=wkey, **kw))
 
 
 def cfg_selectbox(ui, label, cfg_key, options, default=None, prefix="sb", **kw):
@@ -380,19 +350,15 @@ def cfg_selectbox(ui, label, cfg_key, options, default=None, prefix="sb", **kw):
         return None
     if default is None or default not in options:
         default = options[0]
-    wkey = f"w_{prefix}_{cfg_key}"
-    _cfg_prepare(wkey, cfg_key, default, coerce=lambda v: v if v in options else default)
-    val = ui.selectbox(label, options, key=wkey, **kw)
-    return _cfg_commit(wkey, cfg_key, val)
+    wkey = _cfg_init(cfg_key, default, coerce=lambda v: v if v in options else default)
+    return _cfg_out(cfg_key, ui.selectbox(label, options, key=wkey, **kw))
 
 
 def cfg_multiselect(ui, label, cfg_key, options, default=None, prefix="sb", **kw):
     options = list(options)
-    wkey = f"w_{prefix}_{cfg_key}"
-    _cfg_prepare(wkey, cfg_key, list(default or []),
-                 coerce=lambda v: [c for c in (v or []) if c in options])
-    val = ui.multiselect(label, options, key=wkey, **kw)
-    return _cfg_commit(wkey, cfg_key, list(val))
+    wkey = _cfg_init(cfg_key, list(default or []),
+                     coerce=lambda v: [c for c in (v or []) if c in options])
+    return _cfg_out(cfg_key, list(ui.multiselect(label, options, key=wkey, **kw)))
 
 
 def cfg_number(ui, label, cfg_key, default, min_value=None, max_value=None,
@@ -403,22 +369,19 @@ def cfg_number(ui, label, cfg_key, default, min_value=None, max_value=None,
         except (TypeError, ValueError):
             v = int(default) if is_int else float(default)
         if min_value is not None:
-            v = max(v, min_value)     # clamping
+            v = max(v, min_value)
         if max_value is not None:
             v = min(v, max_value)
         return v
 
-    wkey = f"w_{prefix}_{cfg_key}"
-    _cfg_prepare(wkey, cfg_key, _coerce(default), coerce=_coerce)
-    val = ui.number_input(label, min_value=min_value, max_value=max_value, step=step, key=wkey, **kw)
-    return _cfg_commit(wkey, cfg_key, val)
+    wkey = _cfg_init(cfg_key, _coerce(default), coerce=_coerce)
+    return _cfg_out(cfg_key, ui.number_input(label, min_value=min_value, max_value=max_value,
+                                             step=step, key=wkey, **kw))
 
 
 def cfg_text(ui, label, cfg_key, default="", prefix="sb", **kw):
-    wkey = f"w_{prefix}_{cfg_key}"
-    _cfg_prepare(wkey, cfg_key, str(default), coerce=lambda v: "" if v is None else str(v))
-    val = ui.text_input(label, key=wkey, **kw)
-    return _cfg_commit(wkey, cfg_key, val)
+    wkey = _cfg_init(cfg_key, str(default), coerce=lambda v: "" if v is None else str(v))
+    return _cfg_out(cfg_key, ui.text_input(label, key=wkey, **kw))
 
 
 def cfg_slider(ui, label, cfg_key, min_value, max_value, default, step=None, prefix="sb", **kw):
@@ -429,10 +392,8 @@ def cfg_slider(ui, label, cfg_key, min_value, max_value, default, step=None, pre
             v = default
         return max(min(v, max_value), min_value)
 
-    wkey = f"w_{prefix}_{cfg_key}"
-    _cfg_prepare(wkey, cfg_key, default, coerce=_coerce)
-    val = ui.slider(label, min_value, max_value, key=wkey, step=step, **kw)
-    return _cfg_commit(wkey, cfg_key, val)
+    wkey = _cfg_init(cfg_key, default, coerce=_coerce)
+    return _cfg_out(cfg_key, ui.slider(label, min_value, max_value, key=wkey, step=step, **kw))
 
 
 def cfg_time(ui, label, cfg_key, default, prefix="sb", **kw):
@@ -445,21 +406,13 @@ def cfg_time(ui, label, cfg_key, default, prefix="sb", **kw):
         except Exception:
             return default
 
-    wkey = f"w_{prefix}_{cfg_key}"
-    _cfg_prepare(wkey, cfg_key, default, coerce=_coerce)
-    val = ui.time_input(label, key=wkey, **kw)
-    return _cfg_commit(wkey, cfg_key, val)
+    wkey = _cfg_init(cfg_key, default, coerce=_coerce)
+    return _cfg_out(cfg_key, ui.time_input(label, key=wkey, **kw))
 
 
 def cfg_set(cfg_key, value):
-    """Programmatic write into the shared store (Optimization tab's apply-config).
-    reconcile_config_widgets() propagates it into BOTH views on the next run."""
-    st.session_state.app_cfg[cfg_key] = value
-    for p in _CFG_PREFIXES:
-        wkey = f"{p}{cfg_key}"
-        if wkey in st.session_state:
-            st.session_state[wkey] = value
-            st.session_state["_seen_" + wkey] = value
+    """Programmatic write used by the Optimization tab's apply-config."""
+    cfg_force(cfg_key, value)
 
 
 # ============================================================================
@@ -2878,15 +2831,14 @@ def resolve_dhan_order_leg(direction, is_entry, fallback_ticker, product_cfg):
 
 
 # ============================================================================
-# CONFIGURATION CONTROLS (shared by Sidebar AND the "🛠 Admin Panel" tab)
+# CONFIGURATION CONTROLS — rendered exactly ONCE, into the sidebar
 # ----------------------------------------------------------------------------
-# render_config_controls(ui, prefix) renders EVERY control through the
-# two-way-synced cfg_* wrappers above. The sidebar calls it with
-# (st.sidebar, "sb"); the Admin Panel tab calls it full-width with
-# (container, "ad"). Both are live views of st.session_state.app_cfg —
-# changing a value in either place updates the other instantly.
-# The old sidebar_overrides mechanism is removed; the Optimization tab's
-# "apply config" writes directly into this shared store.
+# render_config_controls() builds every control through the cfg_* wrappers
+# above and returns the assembled config dict. It is called from exactly one
+# place (the sidebar). The "🛠 Admin Panel" tab does NOT re-render these
+# controls — it shows a read-only summary — because rendering two editable
+# copies per run is what previously made selections snap back.
+# The Optimization tab's "apply config" writes through cfg_set() + rerun.
 # ============================================================================
 
 def _underlying_for_fno(ticker_choice_v, ticker_v):
@@ -2932,15 +2884,13 @@ def _try_autofill(sig, fetch_fn, sig_key, try_key):
         st.session_state[sig_key] = sig  # lock in ONLY on success
 
 
-def render_config_controls(ui, prefix):
-    """Renders the full control set into `ui` (sidebar or Admin Panel) and
-    returns the assembled config dict. All original controls, defaults, and
-    captions are preserved — rendered through the synced store."""
+def render_config_controls(ui, prefix="sb"):
+    """Renders the full control set into `ui` (the sidebar) and returns the
+    assembled config dict. All original controls, defaults, and captions are
+    preserved. `prefix` is retained for signature stability but there is only
+    one rendering of these controls, so widget keys never collide."""
     store = _cfg_store()
-    ui.title("⚙️ Algo Configuration" if prefix == "sb" else "🛠 Admin Panel — full configuration")
-    if prefix == "ad":
-        ui.caption("Every sidebar control, full-width. This panel and the sidebar are two live views of the "
-                   "same shared config store — change a value in either place and the other updates instantly.")
+    ui.title("⚙️ Algo Configuration")
 
     # ------------------------------------------------------------ TICKER --
     ticker_names = list(TICKER_MAP.keys())
@@ -3021,14 +2971,14 @@ def render_config_controls(ui, prefix):
                 info = dhan_lookup_option(prem_underlying_sym, prem_expiry, prem_strike, prem_opt_type,
                                           prem_scrip_instr, prem_exchange) if (prem_expiry and prem_strike) else None
                 if info:
-                    store["prem_security_id"] = info["security_id"]
+                    cfg_force("prem_security_id", info["security_id"])
                     store["_prem_lot_size"] = info.get("lot_size")
                     return True
                 return False
 
             if st.session_state.get("dhan_opt_autofill_sig") != prem_sig \
                     and st.session_state.get("_attempted_dhan_opt_autofill_sig") != prem_sig:
-                store["prem_security_id"] = ""      # sig change ALWAYS clears stale IDs
+                cfg_force("prem_security_id", "")   # sig change ALWAYS clears stale IDs
             _try_autofill(prem_sig, _fetch_prem_id, "dhan_opt_autofill_sig", "dhan_opt_autofill_last_try")
 
             prem_id = cfg_text(ui, f"{prem_opt_type} Security ID (auto-filled, editable)",
@@ -3040,7 +2990,7 @@ def render_config_controls(ui, prefix):
             underlying_choice = "Options Trading"
 
             if store.get("_prem_qty_default_sig") != (prem_u, prem_expiry, prem_opt_type):
-                store["dhan_qty"] = int(prem_default_qty or store.get("_prem_lot_size") or 1)
+                cfg_force("dhan_qty", int(prem_default_qty or store.get("_prem_lot_size") or 1))
                 store["_prem_qty_default_sig"] = (prem_u, prem_expiry, prem_opt_type)
 
             if not prem_id:
@@ -3518,7 +3468,7 @@ def render_config_controls(ui, prefix):
                                   or (ticker or "").endswith(".BO")
                                   or (options_mode and store.get("opt_index") == "Sensex")) else "NSE"
         if store.get("_last_auto_exchange") != auto_exchange:
-            store["exchange"] = auto_exchange          # auto-flip writes to store…
+            cfg_force("exchange", auto_exchange)       # auto-flip writes the widget…
             store["_last_auto_exchange"] = auto_exchange
         exchange = cfg_selectbox(ui, "Exchange", "exchange", ["NSE", "BSE"], default="NSE", prefix=prefix)  # …still user-editable
 
@@ -3574,18 +3524,18 @@ def render_config_controls(ui, prefix):
                 ce = dhan_lookup_option(underlying, expiry, ce_strike, "CE", meta["scrip_instrument"], exchange) if expiry and ce_strike else None
                 pe = dhan_lookup_option(underlying, expiry, pe_strike, "PE", meta["scrip_instrument"], exchange) if expiry and pe_strike else None
                 if ce:
-                    store["ce_security_id"] = ce["security_id"]; ok_any = True
+                    cfg_force("ce_security_id", ce["security_id"]); ok_any = True
                     store["_opt_lot_size"] = ce.get("lot_size")
                 if pe:
-                    store["pe_security_id"] = pe["security_id"]; ok_any = True
+                    cfg_force("pe_security_id", pe["security_id"]); ok_any = True
                 return bool(ce and pe) if (expiry and ce_strike and pe_strike) else ok_any
 
             if creds_ok or True:  # scrip master is public — autofill works even in paper mode
                 if st.session_state.get("dhan_opt_autofill_sig") != sig:
                     # a signature change ALWAYS overwrites stale IDs
                     if st.session_state.get("_attempted_dhan_opt_autofill_sig") != sig:
-                        store["ce_security_id"] = ""
-                        store["pe_security_id"] = ""
+                        cfg_force("ce_security_id", "")
+                        cfg_force("pe_security_id", "")
                 _try_autofill(sig, _fetch_opt_ids, "dhan_opt_autofill_sig", "dhan_opt_autofill_last_try")
 
             ce_id = cfg_text(ui, "CE Security ID (auto-filled, editable — used on LONG signals)", "ce_security_id", "", prefix=prefix)
@@ -3603,7 +3553,7 @@ def render_config_controls(ui, prefix):
             else:
                 default_qty = int(lot_size or 1)
             if store.get("_opt_qty_default_sig") != (underlying, instrument_type):
-                store["dhan_qty"] = int(default_qty)
+                cfg_force("dhan_qty", int(default_qty))
                 store["_opt_qty_default_sig"] = (underlying, instrument_type)
 
             ui.caption("Options direction rule (all modes, including flipped signals): LONG signal → BUY the CE leg; "
@@ -3616,16 +3566,16 @@ def render_config_controls(ui, prefix):
             def _fetch_fut_id():
                 info = dhan_lookup_future(underlying, expiry, meta["scrip_instrument"], exchange) if expiry else None
                 if info:
-                    store["dhan_security_id"] = info["security_id"]
+                    cfg_force("dhan_security_id", info["security_id"])
                     if store.get("_fut_qty_default_sig") != sig:
-                        store["dhan_qty"] = int(info.get("lot_size") or 1)   # futures default = contract lot size
+                        cfg_force("dhan_qty", int(info.get("lot_size") or 1))  # futures default = contract lot size
                         store["_fut_qty_default_sig"] = sig
                     return True
                 return False
 
             if st.session_state.get("dhan_autofill_sig") != sig:
                 if st.session_state.get("_attempted_dhan_autofill_sig") != sig:
-                    store["dhan_security_id"] = ""      # sig change ALWAYS clears stale IDs
+                    cfg_force("dhan_security_id", "")   # sig change ALWAYS clears stale IDs
             _try_autofill(sig, _fetch_fut_id, "dhan_autofill_sig", "dhan_autofill_last_try")
 
             sec_id = cfg_text(ui, "Security ID (always visible & mandatory — auto-filled when Dhan is enabled, "
@@ -3638,13 +3588,13 @@ def render_config_controls(ui, prefix):
             def _fetch_eq_id():
                 info = dhan_lookup_equity(_yf_symbol_to_plain(ticker), exchange)
                 if info:
-                    store["dhan_security_id"] = info["security_id"]
+                    cfg_force("dhan_security_id", info["security_id"])
                     return True
                 return False
 
             if st.session_state.get("dhan_autofill_sig") != sig:
                 if st.session_state.get("_attempted_dhan_autofill_sig") != sig:
-                    store["dhan_security_id"] = ""      # sig change ALWAYS clears stale IDs
+                    cfg_force("dhan_security_id", "")   # sig change ALWAYS clears stale IDs
             if use_dhan_feed or dhan_enabled or options_mode:
                 _try_autofill(sig, _fetch_eq_id, "dhan_autofill_sig", "dhan_autofill_last_try")
 
@@ -3726,9 +3676,6 @@ def render_config_controls(ui, prefix):
 # ============================================================================
 # SIDEBAR (one of the two live views of the shared config store)
 # ============================================================================
-
-# Settle every pending edit from BOTH views BEFORE anything renders.
-reconcile_config_widgets()
 
 config = render_config_controls(st.sidebar, "sb")
 if st.session_state.get("cfg_applied_msg"):
@@ -5294,12 +5241,81 @@ with tab_ohlc:
 
 # ---------------------------------------------------------------- ADMIN ----
 with tab_admin:
-    # Full-width rendering of EVERY sidebar control. This tab and the sidebar
-    # are two live views of the same shared config store — changing a value
-    # here updates the sidebar instantly, and vice versa. Widget keys are
-    # prefixed ("ad" vs "sb") so Streamlit never collides, while both write
-    # into st.session_state.app_cfg via the cfg_* wrappers.
-    render_config_controls(st.container(), "ad")
+    # READ-ONLY by design. This panel used to render a second, editable copy
+    # of every sidebar control; because two widget sets rendered per run and
+    # each tried to sync the other, selections snapped back to their previous
+    # values. The duplicate widgets are gone — the sidebar is the single
+    # owner of configuration — and this tab now presents the full active
+    # configuration, full-width, for review.
+    st.subheader("🛠 Admin Panel — active configuration")
+    st.caption("Read-only view of every setting currently in force. Edit anything in the sidebar on the left; "
+               "this panel reflects those values immediately.")
+
+    _dsrc = ("Dhan data feed (no delay)"
+             if (dhan_feed_active() and dhan_resolve_feed_instrument(ticker) is not None)
+             else "yfinance (0.3s delay per call)")
+    a1, a2, a3, a4 = st.columns(4)
+    a1.metric("Ticker", f"{ticker_choice}")
+    a2.metric("Timeframe / Period", f"{interval} / {period}")
+    a3.metric("Paper Quantity", f"{qty}")
+    a4.metric("Data Source", "Dhan" if _dsrc.startswith("Dhan") else "yfinance")
+
+    ac1, ac2 = st.columns(2)
+    with ac1:
+        st.markdown("##### 📐 Strategy & Exits")
+        _strategy_rows = [
+            ("Strategy", strategy),
+            ("Stoploss Type", sl_type),
+            ("Target Type", target_type),
+            ("Trade Direction", params.get("trade_direction", "Both")),
+            ("Flip / Reverse Entries", "ON" if params.get("flip_signals") else "off"),
+        ]
+        if strategy == "Hybrid (Combine Strategies)":
+            _strategy_rows.append(("Hybrid members", ", ".join(params.get("hybrid_members", [])) or "— none —"))
+            _strategy_rows.append(("Hybrid logic", params.get("hybrid_mode", "AND")))
+        if strategy == "OI Based (CE/PE Open Interest)":
+            _strategy_rows.append(("OI underlying / expiry",
+                                   f"{params.get('oi_underlying','')} · {params.get('oi_expiry','')}"))
+            _strategy_rows.append(("OI interpretation", "FLIPPED" if params.get("oi_flip") else "standard"))
+        st.dataframe(pd.DataFrame(_strategy_rows, columns=["Setting", "Value"]),
+                     hide_index=True, use_container_width=True)
+
+        st.markdown("##### 🎛 Strategy Parameters")
+        _pp = {k: v for k, v in params.items() if k not in ("hybrid_members",)}
+        st.dataframe(pd.DataFrame(sorted(_pp.items()), columns=["Parameter", "Value"]),
+                     hide_index=True, use_container_width=True)
+
+    with ac2:
+        st.markdown("##### 🔍 Entry Filters")
+        _active = [k.replace("_enabled", "") for k, v in filters.items() if v is True]
+        st.write(("Active: " + ", ".join(_active)) if _active else "No entry filters active.")
+        st.dataframe(pd.DataFrame(sorted((k, str(v)) for k, v in filters.items()),
+                                  columns=["Filter setting", "Value"]),
+                     hide_index=True, use_container_width=True)
+
+        st.markdown("##### 🚧 Risk Gates")
+        _g = [(k, str(v)) for k, v in (gates or {}).items()]
+        st.dataframe(pd.DataFrame(sorted(_g) or [("(none configured)", "")],
+                                  columns=["Gate", "Value"]),
+                     hide_index=True, use_container_width=True)
+
+    st.markdown("##### 🏦 Broker / Feed / Notifications")
+    st.json({
+        "Data Source": _dsrc,
+        "Dhan Live Orders": dhan_enabled,
+        "Dhan Client ID set": bool(str(dhan_client_id or "").strip()),
+        "Dhan Access Token set": bool(str(dhan_access_token or "").strip()),
+        "Dhan Quantity": config.get("dhan_qty"),
+        "Entry / Exit Order Type": f"{config.get('entry_order_type')} / {config.get('exit_order_type')}",
+        "Options Mode": config.get("options_mode"),
+        "Premium Mode": config.get("premium_mode"),
+        "Dhan Product Config": product_cfg,
+        "Email Notifications": config.get("email_enabled"),
+        "Email To": config.get("email_to") if config.get("email_enabled") else None,
+        "Time-Based Risk Control": risk_ctrl,
+        "Walk-Forward": {"enabled": wf_enabled, "folds": wf_folds},
+        "Cost Model": {"enabled": cost_enabled, **(cost_cfg or {})},
+    })
 
 # ============================================================================
 # FOOTER / GLOBAL DISCLAIMER
