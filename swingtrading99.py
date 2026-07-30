@@ -1265,16 +1265,16 @@ def dhan_get_option_chain(under_security_id, under_segment, expiry, _token_fp):
         return None
 
 
-def get_oi_snapshot():
-    """Resolve the configured OI underlying + expiry and pull a live snapshot."""
-    store = st.session_state.app_cfg
-    meta = DHAN_INDEX_MAP.get(store.get("oi_underlying", "Nifty50"))
+def get_chain_snapshot(underlying_name, expiry=None):
+    """Fetch a chain snapshot for an EXPLICIT underlying/expiry. Used by the
+    Option Chain Analysis tab so it works regardless of which strategy is
+    selected in the sidebar."""
+    meta = DHAN_INDEX_MAP.get(underlying_name)
     if not meta:
         return None
     _, token = _dhan_creds()
     if not token:
         return None
-    expiry = store.get("oi_expiry")
     if not expiry:
         exps = dhan_get_expiries(meta["underlying"], "OPTIDX", meta["exchange"])
         expiry = exps[0] if exps else None
@@ -1282,6 +1282,12 @@ def get_oi_snapshot():
         return None
     return dhan_get_option_chain(meta["security_id"], meta["segment"], expiry,
                                  hash(token) % 10_000_019)
+
+
+def get_oi_snapshot():
+    """Resolve the configured OI underlying + expiry and pull a live snapshot."""
+    store = st.session_state.app_cfg
+    return get_chain_snapshot(store.get("oi_underlying", "Nifty50"), store.get("oi_expiry"))
 
 
 def evaluate_oi_signal(params, snap):
@@ -1480,26 +1486,72 @@ def days_to_expiry(expiry_str):
 # PCR HISTORY TRACKER — feeds the PCR strategy's table and its change columns
 # ---------------------------------------------------------------------------
 
+def _atm_row(snap):
+    """ATM strike and its per-strike row (nearest strike to spot)."""
+    if not snap or not snap.get("strikes"):
+        return None, {}
+    ks = sorted(snap["strikes"].keys())
+    if not ks:
+        return None, {}
+    spot = snap.get("underlying")
+    if spot is None:
+        atm = min(ks, key=lambda s: abs(snap["strikes"][s]["ce_ltp"] - snap["strikes"][s]["pe_ltp"]))
+    else:
+        atm = min(ks, key=lambda s: abs(s - float(spot)))
+    return atm, snap["strikes"][atm]
+
+
 def record_chain_history(snap):
-    """Append one row per distinct snapshot (deduped by fetch timestamp) so the
-    PCR table can show change-vs-previous in absolute, %, and n× terms."""
+    """Append one row per distinct snapshot (deduped by fetch timestamp). This
+    time series is what every plot on the Option Chain Analysis tab draws from,
+    and what the change-vs-previous columns are computed against."""
     if not snap:
         return
     hist = st.session_state.setdefault("chain_history", [])
     stamp = snap.get("fetched_at")
     if hist and hist[-1].get("Time") == stamp:
         return
+    mp, _pain = compute_max_pain(snap.get("strikes") or {})
+    atm, arow = _atm_row(snap)
     hist.append({
         "Time": stamp,
         "PCR": round(snap["pcr"], 4) if snap.get("pcr") else None,
+        "PCR Volume": round(snap["pcr_volume"], 4) if snap.get("pcr_volume") else None,
         "Price": snap.get("underlying"),
         "CE OI": snap.get("ce_oi"), "PE OI": snap.get("pe_oi"),
         "Total OI": (snap.get("ce_oi") or 0) + (snap.get("pe_oi") or 0),
+        "CE ΔOI": snap.get("ce_oi_change"), "PE ΔOI": snap.get("pe_oi_change"),
+        "Net ΔOI (PE−CE)": (snap.get("pe_oi_change") or 0) - (snap.get("ce_oi_change") or 0),
         "CE Volume": snap.get("ce_volume"), "PE Volume": snap.get("pe_volume"),
         "Total Volume": (snap.get("ce_volume") or 0) + (snap.get("pe_volume") or 0),
+        "CE ΔVolume": snap.get("ce_volume_change"), "PE ΔVolume": snap.get("pe_volume_change"),
+        "Max Pain": mp,
+        "ATM Strike": atm,
+        "ATM Gamma": max(arow.get("ce_gamma", 0.0), arow.get("pe_gamma", 0.0)) if arow else None,
+        "ATM Straddle": (arow.get("ce_ltp", 0.0) + arow.get("pe_ltp", 0.0)) if arow else None,
+        "ATM IV": max(arow.get("ce_iv", 0.0), arow.get("pe_iv", 0.0)) if arow else None,
     })
-    if len(hist) > 500:
-        del hist[:-500]
+    if len(hist) > 1000:
+        del hist[:-1000]
+
+
+def chain_history_df():
+    """Chain history as a DataFrame with change columns (absolute, %, n×)."""
+    hist = st.session_state.get("chain_history", [])
+    if not hist:
+        return pd.DataFrame()
+    df = pd.DataFrame(hist)
+    for col, short in (("PCR", "PCR"), ("Price", "Price"), ("Total OI", "OI"),
+                       ("Total Volume", "Volume"), ("Max Pain", "MaxPain"),
+                       ("ATM Gamma", "Gamma")):
+        if col not in df.columns:
+            continue
+        s = pd.to_numeric(df[col], errors="coerce")
+        prev = s.shift(1)
+        df[f"Δ{short} (abs)"] = (s - prev)
+        df[f"Δ{short} (%)"] = ((s - prev) / prev.replace(0, np.nan) * 100)
+        df[f"Δ{short} (n×)"] = (s / prev.replace(0, np.nan))
+    return df
 
 
 def build_chain_history_table():
@@ -1508,25 +1560,383 @@ def build_chain_history_table():
     row expressed three ways — absolute, percentage, and n× multiple — for
     PCR, price, OI and volume.
     """
-    hist = st.session_state.get("chain_history", [])
-    if not hist:
+    df = chain_history_df()
+    if df.empty:
         return pd.DataFrame()
-    df = pd.DataFrame(hist)
-    for col, short in (("PCR", "PCR"), ("Price", "Price"),
-                       ("Total OI", "OI"), ("Total Volume", "Volume")):
-        if col not in df.columns:
-            continue
-        s = pd.to_numeric(df[col], errors="coerce")
-        prev = s.shift(1)
-        df[f"Δ{short} (abs)"] = (s - prev).round(4)
-        df[f"Δ{short} (%)"] = ((s - prev) / prev.replace(0, np.nan) * 100).round(3)
-        df[f"Δ{short} (n×)"] = (s / prev.replace(0, np.nan)).round(4)
+    df = df.copy()
+    for c in df.columns:
+        if df[c].dtype.kind == "f":
+            df[c] = df[c].round(4)
     ordered = ["Time", "PCR", "ΔPCR (abs)", "ΔPCR (%)", "ΔPCR (n×)",
                "Price", "ΔPrice (abs)", "ΔPrice (%)", "ΔPrice (n×)",
                "CE OI", "PE OI", "Total OI", "ΔOI (abs)", "ΔOI (%)", "ΔOI (n×)",
+               "CE ΔOI", "PE ΔOI", "Net ΔOI (PE−CE)",
                "CE Volume", "PE Volume", "Total Volume",
-               "ΔVolume (abs)", "ΔVolume (%)", "ΔVolume (n×)"]
+               "ΔVolume (abs)", "ΔVolume (%)", "ΔVolume (n×)",
+               "Max Pain", "ATM Strike", "ATM Gamma", "ATM Straddle", "ATM IV"]
     return df[[c for c in ordered if c in df.columns]].iloc[::-1]   # newest first
+
+
+# ---------------------------------------------------------------------------
+# CHAIN PLOTTING (Option Chain Analysis tab)
+# ---------------------------------------------------------------------------
+
+# label → (history column, axis family). Metrics sharing a family share a
+# y-axis, so scales that belong together stay directly comparable.
+CHAIN_METRICS = {
+    "Price (index/underlying)": ("Price", "price"),
+    "Max Pain": ("Max Pain", "price"),
+    "ATM Strike": ("ATM Strike", "price"),
+    "PCR (OI)": ("PCR", "ratio"),
+    "PCR (Volume)": ("PCR Volume", "ratio"),
+    "Total OI": ("Total OI", "oi"),
+    "CE OI": ("CE OI", "oi"),
+    "PE OI": ("PE OI", "oi"),
+    "Change in OI (total)": ("ΔOI (abs)", "oi_change"),
+    "Change in CE OI": ("CE ΔOI", "oi_change"),
+    "Change in PE OI": ("PE ΔOI", "oi_change"),
+    "Net ΔOI (PE − CE)": ("Net ΔOI (PE−CE)", "oi_change"),
+    "Total Volume": ("Total Volume", "volume"),
+    "CE Volume": ("CE Volume", "volume"),
+    "PE Volume": ("PE Volume", "volume"),
+    "ATM Gamma": ("ATM Gamma", "greek"),
+    "ATM IV": ("ATM IV", "greek"),
+    "ATM Straddle Premium": ("ATM Straddle", "premium"),
+}
+
+_FAMILY_TITLE = {
+    "price": "Price / Strike", "ratio": "PCR", "oi": "Open Interest",
+    "oi_change": "Change in OI", "volume": "Volume", "greek": "Gamma / IV",
+    "premium": "Premium",
+}
+_SERIES_COLORS = ["#4c9be8", "#f0a202", "#38b000", "#e5383b", "#9d4edd",
+                  "#00b4d8", "#ff7b00", "#c2185b", "#7cb342"]
+
+
+def chain_plot(hist, metric_labels, title, normalize=None, height=430):
+    """
+    Multi-metric time-series plot.
+
+    Metrics are grouped by axis family so like scales share an axis. With one
+    or two families the real values are shown on twin axes; with three or more
+    (e.g. PCR + price + ΔOI + volume, whose magnitudes differ by orders of
+    magnitude) the series are indexed to 100 at the first reading so shape and
+    turning points stay comparable — the raw values remain visible in the
+    tooltip and in the summary beneath. `normalize` overrides that choice.
+    """
+    metric_labels = [m for m in metric_labels if m in CHAIN_METRICS]
+    if hist is None or hist.empty or not metric_labels:
+        return None, False
+    cols = [(m, *CHAIN_METRICS[m]) for m in metric_labels]
+    cols = [(m, c, fam) for m, c, fam in cols if c in hist.columns
+            and pd.to_numeric(hist[c], errors="coerce").notna().any()]
+    if not cols:
+        return None, False
+
+    families = list(dict.fromkeys(fam for _m, _c, fam in cols))
+    auto_norm = len(families) >= 3
+    do_norm = auto_norm if normalize is None else bool(normalize)
+
+    x = hist["Time"] if "Time" in hist.columns else hist.index
+    fig = go.Figure()
+    fam_axis = {}
+    axis_slots = ["y", "y2", "y3", "y4"]
+    for i, fam in enumerate(families[:4]):
+        fam_axis[fam] = axis_slots[i] if not do_norm else "y"
+
+    for i, (label, col, fam) in enumerate(cols):
+        raw = pd.to_numeric(hist[col], errors="coerce")
+        if do_norm:
+            first_valid = raw.dropna()
+            base = first_valid.iloc[0] if len(first_valid) else np.nan
+            plotted = (raw / base * 100.0) if (base and not pd.isna(base) and base != 0) else raw
+        else:
+            plotted = raw
+        fig.add_trace(go.Scatter(
+            x=x, y=plotted, name=label, mode="lines+markers",
+            line=dict(width=2, color=_SERIES_COLORS[i % len(_SERIES_COLORS)]),
+            marker=dict(size=5),
+            yaxis=fam_axis.get(fam, "y"),
+            customdata=np.stack([raw.values], axis=-1),
+            hovertemplate=f"<b>{label}</b><br>%{{x}}<br>value: %{{customdata[0]:,.4f}}<extra></extra>",
+        ))
+
+    layout = dict(title=title, height=height, hovermode="x unified",
+                  margin=dict(l=60, r=60, t=60, b=40),
+                  legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0))
+    if do_norm:
+        layout["yaxis"] = dict(title="Indexed to 100 at first reading")
+    else:
+        side_order = ["left", "right", "left", "right"]
+        for i, fam in enumerate(families[:4]):
+            key = "yaxis" if i == 0 else f"yaxis{i+1}"
+            ax = dict(title=_FAMILY_TITLE.get(fam, fam), side=side_order[i])
+            if i > 0:
+                ax.update(overlaying="y", showgrid=False)
+            if i >= 2:
+                ax["anchor"] = "free"
+                ax["position"] = 0.0 if side_order[i] == "left" else 1.0
+            layout[key] = ax
+        if len(families) >= 3:
+            layout["xaxis"] = dict(domain=[0.08, 0.92])
+    fig.update_layout(**layout)
+    return fig, do_norm
+
+
+def _trend(series, window=6):
+    """Direction and magnitude of a series over the recent window."""
+    s = pd.to_numeric(series, errors="coerce").dropna()
+    if len(s) < 2:
+        return None, None, None
+    recent = s.iloc[-window:] if len(s) > window else s
+    first, last = float(recent.iloc[0]), float(recent.iloc[-1])
+    delta = last - first
+    pct = (delta / first * 100.0) if first else None
+    word = "rising" if delta > 0 else ("falling" if delta < 0 else "flat")
+    return word, delta, pct
+
+
+def chain_recommendation(hist, snap):
+    """
+    Overall CE/PE recommendation from the whole chain picture.
+
+    Six independent votes, each a conventional option-chain read:
+      1. PCR level        — high = heavy put writing = bullish
+      2. PCR direction    — rising ratio = puts being added = bullish
+      3. ΔOI dominance    — which side is being written more right now
+      4. Spot vs max pain — price tends to drift toward max pain near expiry
+      5. Volume PCR       — where today's actual participation is going
+      6. Price trend      — the market's own answer, as confirmation
+    The net score decides, so no single input can carry an entry alone. This
+    is a mechanical reading of positioning, not a forecast.
+    """
+    votes, lines = 0, []
+    if not snap:
+        return "NO DATA", 0, ["Option chain unavailable — cannot form a recommendation."]
+
+    pcr = snap.get("pcr")
+    if pcr:
+        if pcr >= 1.2:
+            votes += 1; lines.append(f"🟢 +1 · PCR {pcr:.3f} ≥ 1.20 — puts written heavily, writers expect support to hold (bullish).")
+        elif pcr <= 0.8:
+            votes -= 1; lines.append(f"🔴 −1 · PCR {pcr:.3f} ≤ 0.80 — calls written heavily, resistance being built (bearish).")
+        else:
+            lines.append(f"⚪ 0 · PCR {pcr:.3f} sits in the neutral 0.80–1.20 band.")
+
+    if hist is not None and not hist.empty and "PCR" in hist.columns:
+        word, delta, _pct = _trend(hist["PCR"])
+        if word == "rising":
+            votes += 1; lines.append(f"🟢 +1 · PCR {word} ({delta:+.3f} over the recent window) — puts being added.")
+        elif word == "falling":
+            votes -= 1; lines.append(f"🔴 −1 · PCR {word} ({delta:+.3f}) — puts unwinding or calls being added.")
+        elif word:
+            lines.append("⚪ 0 · PCR flat over the window.")
+        else:
+            lines.append("⚪ 0 · not enough history yet to read a PCR trend.")
+
+    d_ce, d_pe = snap.get("ce_oi_change", 0.0), snap.get("pe_oi_change", 0.0)
+    if d_pe > d_ce:
+        votes += 1; lines.append(f"🟢 +1 · PE ΔOI {d_pe:+,.0f} exceeds CE ΔOI {d_ce:+,.0f} — put writing dominant (support forming).")
+    elif d_ce > d_pe:
+        votes -= 1; lines.append(f"🔴 −1 · CE ΔOI {d_ce:+,.0f} exceeds PE ΔOI {d_pe:+,.0f} — call writing dominant (resistance forming).")
+
+    mp, _p = compute_max_pain(snap.get("strikes") or {})
+    spot = snap.get("underlying")
+    if mp and spot:
+        if spot < mp:
+            votes += 1; lines.append(f"🟢 +1 · Spot {spot:,.2f} below max pain {mp:,.0f} — pull toward max pain is upward.")
+        elif spot > mp:
+            votes -= 1; lines.append(f"🔴 −1 · Spot {spot:,.2f} above max pain {mp:,.0f} — pull toward max pain is downward.")
+
+    vpcr = snap.get("pcr_volume")
+    if vpcr:
+        if vpcr > 1.0:
+            votes += 1; lines.append(f"🟢 +1 · Volume PCR {vpcr:.3f} > 1 — today's flow is concentrated in puts.")
+        else:
+            votes -= 1; lines.append(f"🔴 −1 · Volume PCR {vpcr:.3f} ≤ 1 — today's flow is concentrated in calls.")
+
+    if hist is not None and not hist.empty and "Price" in hist.columns:
+        word, delta, pct = _trend(hist["Price"])
+        if word == "rising":
+            votes += 1; lines.append(f"🟢 +1 · Price {word} ({delta:+,.2f}"
+                                     + (f", {pct:+.2f}%" if pct is not None else "") + ") over the window.")
+        elif word == "falling":
+            votes -= 1; lines.append(f"🔴 −1 · Price {word} ({delta:+,.2f}"
+                                     + (f", {pct:+.2f}%" if pct is not None else "") + ") over the window.")
+
+    if votes >= 2:
+        verdict = "BUY CE"
+    elif votes <= -2:
+        verdict = "BUY PE"
+    else:
+        verdict = "WAIT / NO EDGE"
+    return verdict, votes, lines
+
+
+def chain_plot_summary(hist, snap, metric_labels, normalized=False):
+    """Per-plot summary: what each plotted series is doing, notable
+    divergences between them, then the overall recommendation."""
+    out = []
+    if hist is None or hist.empty:
+        return ["No snapshots recorded yet."], ("NO DATA", 0, [])
+    for label in metric_labels:
+        col, _fam = CHAIN_METRICS.get(label, (None, None))
+        if not col or col not in hist.columns:
+            continue
+        s = pd.to_numeric(hist[col], errors="coerce").dropna()
+        if s.empty:
+            continue
+        word, delta, pct = _trend(s)
+        latest = float(s.iloc[-1])
+        fmt = f"{latest:,.4f}" if abs(latest) < 100 else f"{latest:,.0f}"
+        piece = f"**{label}**: {fmt}"
+        if word:
+            piece += f" · {word} ({delta:+,.4f}" + (f", {pct:+.2f}%" if pct is not None else "") + " over window)"
+        out.append(piece)
+
+    # divergence checks between price and positioning
+    def _dir(col):
+        if col in hist.columns:
+            w, _d, _p = _trend(hist[col])
+            return w
+        return None
+    p_dir, pcr_dir = _dir("Price"), _dir("PCR")
+    if p_dir and pcr_dir and p_dir != "flat" and pcr_dir != "flat":
+        if p_dir != pcr_dir:
+            out.append(f"⚠️ **Divergence**: price is {p_dir} while PCR is {pcr_dir} — positioning is not confirming "
+                       "the move, which often precedes a stall or reversal.")
+        else:
+            out.append(f"✅ **Confirmation**: price and PCR are both {p_dir} — positioning agrees with the move.")
+    if normalized:
+        out.append("_Series are indexed to 100 at the first reading because their raw scales differ by orders of "
+                   "magnitude; hover any point for the true value._")
+    return out, chain_recommendation(hist, snap)
+
+
+# ---------------------------------------------------------------------------
+# GROQ AI ANALYSIS
+# ---------------------------------------------------------------------------
+
+GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
+GROQ_MODEL_CHOICES = [
+    "llama-3.3-70b-versatile",
+    "llama-3.1-8b-instant",
+    "openai/gpt-oss-120b",
+    "deepseek-r1-distill-llama-70b",
+    "gemma2-9b-it",
+    "(custom — type below)",
+]
+
+
+def build_groq_chain_payload(snap, hist, levels=6, hist_rows=25):
+    """
+    Compact, complete-enough description of the chain for the model: headline
+    aggregates, the ATM band strike by strike, max pain, and the recent
+    snapshot history. Trimmed deliberately — sending 60+ strikes of raw JSON
+    wastes tokens and buries the signal.
+    """
+    if not snap:
+        return None
+    mp, _pain = compute_max_pain(snap.get("strikes") or {})
+    atm, arow = _atm_row(snap)
+    band = multi_strike_band(snap, levels)
+    payload = {
+        "captured_at_ist": snap.get("fetched_at"),
+        "expiry": snap.get("expiry"),
+        "days_to_expiry": days_to_expiry(snap.get("expiry")),
+        "spot": snap.get("underlying"),
+        "atm_strike": atm,
+        "max_pain": mp,
+        "totals": {
+            "ce_oi": snap.get("ce_oi"), "pe_oi": snap.get("pe_oi"),
+            "ce_oi_change": snap.get("ce_oi_change"), "pe_oi_change": snap.get("pe_oi_change"),
+            "ce_volume": snap.get("ce_volume"), "pe_volume": snap.get("pe_volume"),
+            "ce_volume_change": snap.get("ce_volume_change"), "pe_volume_change": snap.get("pe_volume_change"),
+            "pcr_oi": snap.get("pcr"), "pcr_volume": snap.get("pcr_volume"),
+        },
+        "atm_metrics": {
+            "straddle_premium": (arow.get("ce_ltp", 0) + arow.get("pe_ltp", 0)) if arow else None,
+            "ce_iv": arow.get("ce_iv") if arow else None,
+            "pe_iv": arow.get("pe_iv") if arow else None,
+            "ce_gamma": arow.get("ce_gamma") if arow else None,
+            "pe_gamma": arow.get("pe_gamma") if arow else None,
+        },
+        "atm_band": ({
+            "levels_each_side": band["levels"],
+            "band_pcr_oi": band["pcr"], "band_pcr_volume": band["pcr_volume"],
+            "band_ce_oi": band["ce_oi"], "band_pe_oi": band["pe_oi"],
+            "band_ce_oi_change": band["ce_oi_change"], "band_pe_oi_change": band["pe_oi_change"],
+        } if band else None),
+        "strikes": [],
+    }
+    if band:
+        for s in band["band"]:
+            r = snap["strikes"][s]
+            payload["strikes"].append({
+                "strike": s,
+                "ce": {"oi": r["ce_oi"], "oi_chg": r["ce_oi_change"], "vol": r["ce_vol"],
+                       "ltp": r["ce_ltp"], "iv": r["ce_iv"], "gamma": r["ce_gamma"], "delta": r["ce_delta"]},
+                "pe": {"oi": r["pe_oi"], "oi_chg": r["pe_oi_change"], "vol": r["pe_vol"],
+                       "ltp": r["pe_ltp"], "iv": r["pe_iv"], "gamma": r["pe_gamma"], "delta": r["pe_delta"]},
+            })
+    if hist is not None and not hist.empty:
+        keep = [c for c in ("Time", "PCR", "Price", "Total OI", "Total Volume",
+                            "CE ΔOI", "PE ΔOI", "Max Pain", "ATM Gamma") if c in hist.columns]
+        payload["recent_history"] = json.loads(
+            hist[keep].tail(hist_rows).to_json(orient="records", date_format="iso"))
+    return payload
+
+
+def groq_analyze_chain(api_key, model, snap, hist, extra_instructions="", temperature=0.2):
+    """
+    Send the chain to Groq's OpenAI-compatible chat endpoint and return the
+    analysis text. Never raises — any failure comes back as a readable message
+    so a bad key or a rate limit can't interrupt the app.
+    """
+    if not str(api_key or "").strip():
+        return "⚠️ No Groq API key set — enter one to enable AI analysis."
+    payload = build_groq_chain_payload(snap, hist)
+    if not payload:
+        return "⚠️ No option-chain snapshot available to analyse."
+    system = (
+        "You are an experienced Indian index options analyst. You will receive a JSON snapshot of a live NSE/BSE "
+        "option chain plus a short history of previous snapshots. Analyse positioning and produce a concise, "
+        "structured read. Required sections, in order:\n"
+        "1. VERDICT — exactly one of: BUY CE, BUY PE, or WAIT.\n"
+        "2. CONFIDENCE — Low / Medium / High.\n"
+        "3. WHY — 3 to 6 short bullets citing the specific numbers that drive the verdict.\n"
+        "4. KEY LEVELS — support and resistance implied by OI walls, plus max pain.\n"
+        "5. RISKS — what would invalidate this read.\n"
+        "Rules: open interest is written from the SELLER's perspective, so heavy call writing implies resistance and "
+        "heavy put writing implies support. Reason only from the data supplied; never invent numbers. If the data is "
+        "inconclusive, say WAIT rather than forcing a directional call. Be brief and specific."
+    )
+    user = "Option chain snapshot:\n" + json.dumps(payload, default=str)
+    if str(extra_instructions or "").strip():
+        user += "\n\nAdditional analyst instructions: " + extra_instructions.strip()
+    try:
+        resp = requests.post(
+            GROQ_API_URL,
+            headers={"Authorization": f"Bearer {str(api_key).strip()}",
+                     "Content-Type": "application/json"},
+            json={"model": model, "temperature": float(temperature), "max_tokens": 1400,
+                  "messages": [{"role": "system", "content": system},
+                               {"role": "user", "content": user}]},
+            timeout=60,
+        )
+        if resp.status_code != 200:
+            try:
+                err = resp.json().get("error", {}).get("message", resp.text[:400])
+            except ValueError:
+                err = resp.text[:400]
+            return f"⚠️ Groq API error {resp.status_code}: {err}"
+        data = resp.json()
+        choices = data.get("choices") or []
+        if not choices:
+            return "⚠️ Groq returned no choices."
+        return (choices[0].get("message", {}) or {}).get("content", "") or "⚠️ Empty response from Groq."
+    except Exception as exc:
+        return f"⚠️ Groq request failed: {exc}"
 
 
 # ---------------------------------------------------------------------------
@@ -5371,8 +5781,10 @@ def render_bin_analysis_section(t1, t2, t1_name, t2_name, p1, diff, fetch_interv
 # TABS
 # ============================================================================
 
-tab_bt, tab_live, tab_hist, tab_heat, tab_opt, tab_spread, tab_ohlc, tab_admin = st.tabs(
-    ["📊 Backtest", "🔴 Live Trading", "📜 Trade History", "🔥 Heatmaps", "🧪 Optimization", "🔀 Spread Tool", "📅 OHLC & Range", "🛠 Admin Panel"]
+(tab_bt, tab_live, tab_hist, tab_heat, tab_opt, tab_spread, tab_ohlc,
+ tab_chain, tab_admin) = st.tabs(
+    ["📊 Backtest", "🔴 Live Trading", "📜 Trade History", "🔥 Heatmaps", "🧪 Optimization",
+     "🔀 Spread Tool", "📅 OHLC & Range", "🔗 Option Chain Analysis", "🛠 Admin Panel"]
 )
 
 # ---------------------------------------------------------------- BACKTEST -
@@ -5989,6 +6401,286 @@ with tab_ohlc:
 
     st.markdown("---")
     render_range_insight_section(ticker, interval, period, f"2) Matched to your sidebar selection: {interval} candles, {period}")
+
+# -------------------------------------------------- OPTION CHAIN ANALYSIS ---
+with tab_chain:
+    st.subheader("🔗 Option Chain Analysis")
+    st.caption("A full positioning picture built from live Dhan option-chain snapshots. Every plot draws on the "
+               "snapshot history below it, so the charts fill out as analysis runs. Independent of the sidebar "
+               "strategy — pick any underlying and expiry here.")
+
+    # ---------------- source + refresh controls (outside the fragment) -----
+    oc1, oc2, oc3 = st.columns([1, 1, 1])
+    oca_under = cfg_selectbox(oc1, "Underlying", "oca_underlying",
+                              list(DHAN_INDEX_MAP.keys()), default="Nifty50")
+    _oca_meta = DHAN_INDEX_MAP[oca_under]
+    _oca_exps = dhan_get_expiries(_oca_meta["underlying"], "OPTIDX", _oca_meta["exchange"])
+    if _oca_exps:
+        oca_expiry = cfg_selectbox(oc2, "Expiry (nearest pre-selected)", "oca_expiry",
+                                   _oca_exps, default=_oca_exps[0])
+    else:
+        oca_expiry = cfg_text(oc2, "Expiry (YYYY-MM-DD)", "oca_expiry", "")
+    oca_interval = cfg_number(oc3, "Continuous refresh (seconds)", "oca_interval",
+                              60, 15, 900, step=15, is_int=True)
+    st.caption("Dhan caches the chain for 60s and rate-limits that endpoint, so intervals below ~60s will mostly "
+               "re-display the same snapshot rather than fetching a new one.")
+
+    b1, b2, b3, b4 = st.columns(4)
+    _once = b1.button("🔍 Analyze Once", use_container_width=True)
+    _start = b2.button("▶ Analyze Continuously", type="primary", use_container_width=True)
+    _stop = b3.button("⏹ Stop Analysis", use_container_width=True)
+    _clear = b4.button("🗑 Clear History", use_container_width=True)
+
+    if _once:
+        _s = get_chain_snapshot(oca_under, oca_expiry)
+        record_chain_history(_s)
+        st.session_state.oca_last_run = ist_now().strftime("%H:%M:%S IST")
+        if not _s:
+            st.warning("No snapshot returned — check the Dhan Access Token and expiry; the chain endpoint only "
+                       "serves data during market hours.")
+    if _start:
+        st.session_state.oca_running = True
+    if _stop:
+        st.session_state.oca_running = False
+    if _clear:
+        st.session_state.chain_history = []
+        st.session_state.pop("groq_last", None)
+
+    _running = bool(st.session_state.get("oca_running", False))
+    if _running:
+        st.success(f"▶ Continuous analysis ON — every plot and summary refreshes automatically every "
+                   f"{int(oca_interval)}s. Press ⏹ Stop Analysis to halt.")
+    else:
+        st.info("⏹ Continuous analysis is OFF. Use 🔍 Analyze Once for a single snapshot, or ▶ Analyze "
+                "Continuously to keep the charts updating.")
+
+    # ---------------- custom plot metric selection (checkboxes) ------------
+    with st.expander("🎛 Custom plot — tick any metrics to chart together", expanded=False):
+        st.caption("Any combination works. Metrics that share a scale share an axis; if you mix three or more "
+                   "different scales the series are indexed to 100 so their shapes stay comparable (raw values "
+                   "stay in the tooltip).")
+        _labels = list(CHAIN_METRICS.keys())
+        _picked = []
+        _ccols = st.columns(3)
+        for _i, _lbl in enumerate(_labels):
+            _default = _lbl in ("Price (index/underlying)", "PCR (OI)")
+            if cfg_checkbox(_ccols[_i % 3], _lbl, f"oca_m_{_i}", _default):
+                _picked.append(_lbl)
+        _norm_choice = cfg_selectbox(st, "Scaling", "oca_norm",
+                                     ["Auto (index to 100 when scales differ)",
+                                      "Always index to 100", "Never — use real values on twin axes"],
+                                     default="Auto (index to 100 when scales differ)")
+        st.session_state["oca_picked"] = _picked
+
+    # ---------------- Groq controls ----------------------------------------
+    with st.expander("🤖 Groq AI analysis of the option chain", expanded=False):
+        g1, g2 = st.columns([2, 1])
+        groq_key = cfg_text(g1, "Groq API Key", "groq_api_key", "", type="password")
+        groq_model_pick = cfg_selectbox(g2, "Model", "groq_model_pick", GROQ_MODEL_CHOICES,
+                                        default=GROQ_MODEL_CHOICES[0])
+        groq_model = (cfg_text(st, "Custom model id", "groq_model_custom", "")
+                      if groq_model_pick.startswith("(custom") else groq_model_pick)
+        groq_extra = cfg_text(st, "Extra instructions (optional)", "groq_extra", "")
+        groq_auto = cfg_checkbox(st, "Include Groq in continuous analysis (uses API quota every refresh)",
+                                 "groq_auto", False)
+        if st.button("🤖 Ask Groq now"):
+            with st.spinner("Sending the chain to Groq…"):
+                _snap_g = get_chain_snapshot(oca_under, oca_expiry)
+                record_chain_history(_snap_g)
+                st.session_state["groq_last"] = groq_analyze_chain(
+                    groq_key, groq_model, _snap_g, chain_history_df(), groq_extra)
+                st.session_state["groq_last_at"] = ist_now().strftime("%H:%M:%S IST")
+        st.caption("The model receives the headline aggregates, the ATM strike band, max pain, greeks and the recent "
+                   "snapshot history. Model output is an opinion generated from that data — it is not financial "
+                   "advice, and it can be wrong or inconsistent. Treat it as one more input, never as a trade "
+                   "instruction. Your key is used only for these requests and is not stored anywhere by this app.")
+
+    st.divider()
+
+    # ---------------- everything below refreshes on the interval -----------
+    @st.fragment(run_every=(int(oca_interval) if _running else None))
+    def _chain_analysis_body():
+        snap = get_chain_snapshot(oca_under, oca_expiry)
+        record_chain_history(snap)
+        hist = chain_history_df()
+
+        if not snap:
+            st.warning("Option chain unavailable. Requirements: a valid Dhan Access Token in the sidebar's "
+                       "🔐 Dhan Account section, a resolvable expiry, and live market hours.")
+            if hist.empty:
+                return
+
+        # ---- headline metrics ----
+        if snap:
+            mp, _pain = compute_max_pain(snap.get("strikes") or {})
+            atm, arow = _atm_row(snap)
+            k1, k2, k3, k4, k5, k6 = st.columns(6)
+            k1.metric("Spot", f"{snap.get('underlying') or 0:,.2f}")
+            k2.metric("ATM", f"{atm:.0f}" if atm else "n/a")
+            k3.metric("PCR (OI)", f"{snap['pcr']:.3f}" if snap.get("pcr") else "n/a")
+            k4.metric("PCR (Vol)", f"{snap['pcr_volume']:.3f}" if snap.get("pcr_volume") else "n/a")
+            k5.metric("Max Pain", f"{mp:.0f}" if mp else "n/a")
+            k6.metric("Days to Expiry", days_to_expiry(snap.get("expiry")))
+            k1, k2, k3, k4 = st.columns(4)
+            k1.metric("CE OI", f"{snap['ce_oi']:,.0f}", f"{snap['ce_oi_change']:+,.0f}")
+            k2.metric("PE OI", f"{snap['pe_oi']:,.0f}", f"{snap['pe_oi_change']:+,.0f}")
+            k3.metric("CE Volume", f"{snap.get('ce_volume', 0):,.0f}", f"{snap.get('ce_volume_change', 0):+,.0f}")
+            k4.metric("PE Volume", f"{snap.get('pe_volume', 0):,.0f}", f"{snap.get('pe_volume_change', 0):+,.0f}")
+            _atm_bits = []
+            if arow:
+                _atm_bits.append(f"ATM straddle {arow.get('ce_ltp', 0) + arow.get('pe_ltp', 0):,.2f}")
+                _atm_bits.append(f"ATM gamma {max(arow.get('ce_gamma', 0), arow.get('pe_gamma', 0)):.5f}")
+                _atm_bits.append(f"ATM IV {max(arow.get('ce_iv', 0), arow.get('pe_iv', 0)):.2f}")
+            st.caption(f"Snapshot @ {snap.get('fetched_at')} · expiry {snap.get('expiry')}"
+                       + (" · " + " · ".join(_atm_bits) if _atm_bits else "")
+                       + f" · {len(hist)} snapshot(s) in history")
+
+        # ---- overall recommendation banner ----
+        verdict, score, vote_lines = chain_recommendation(hist, snap)
+        vc1, vc2 = st.columns([1, 3])
+        with vc1:
+            if verdict == "BUY CE":
+                st.success(f"### 🟢 {verdict}")
+            elif verdict == "BUY PE":
+                st.error(f"### 🔴 {verdict}")
+            else:
+                st.warning(f"### ⚪ {verdict}")
+            st.caption(f"Net score {score:+d}")
+        with vc2:
+            st.markdown("**Overall option-chain read**")
+            for _l in vote_lines:
+                st.markdown(f"- {_l}")
+
+        if len(hist) < 2:
+            st.info("📈 Plots need at least two snapshots to draw a line. Press 🔍 Analyze Once again in a minute, "
+                    "or start continuous analysis and the charts will build themselves.")
+
+        _norm_mode = st.session_state.app_cfg.get("oca_norm", "Auto (index to 100 when scales differ)")
+        _norm_arg = None if _norm_mode.startswith("Auto") else (_norm_mode.startswith("Always"))
+
+        # ---- preset plots ----
+        PRESETS = [
+            ("1️⃣ PCR vs Price",
+             ["PCR (OI)", "Price (index/underlying)"],
+             "The core relationship: is positioning confirming the price move or fighting it?"),
+            ("2️⃣ PCR vs OI vs Price",
+             ["PCR (OI)", "Total OI", "Price (index/underlying)"],
+             "Adds total open interest — is the move backed by new positions or just existing ones shuffling?"),
+            ("3️⃣ PCR vs Price vs Change in OI",
+             ["PCR (OI)", "Price (index/underlying)", "Change in OI (total)"],
+             "ΔOI shows where fresh positions are being added right now, rather than the accumulated total."),
+            ("4️⃣ Index Price vs OI vs Change in OI",
+             ["Price (index/underlying)", "Total OI", "Change in OI (total)"],
+             "Price against both the stock and the flow of open interest — classic build-up vs unwinding read."),
+            ("5️⃣ PCR vs Price vs Max Pain",
+             ["PCR (OI)", "Price (index/underlying)", "Max Pain"],
+             "Where price sits relative to the strike that hurts writers least, and how that gap is evolving."),
+            ("6️⃣ PCR vs Price vs Change in OI vs Volume",
+             ["PCR (OI)", "Price (index/underlying)", "Change in OI (total)", "Total Volume"],
+             "Volume confirms whether the ΔOI build is backed by genuine participation."),
+            ("7️⃣ PCR vs Change in OI vs Price vs Gamma",
+             ["PCR (OI)", "Change in OI (total)", "Price (index/underlying)", "ATM Gamma"],
+             "Gamma rises into expiry — high gamma with compressing premium is the blast-risk regime."),
+            ("8️⃣ CE vs PE Open Interest",
+             ["CE OI", "PE OI", "Price (index/underlying)"],
+             "The two sides side by side: which wall is being built faster?"),
+        ]
+        for _pi, (_title, _metrics, _why) in enumerate(PRESETS):
+            st.markdown(f"#### {_title}")
+            st.caption(_why)
+            _fig, _was_norm = chain_plot(hist, _metrics, _title, normalize=_norm_arg)
+            if _fig is None:
+                st.info("Not enough data for this plot yet.")
+            else:
+                st.plotly_chart(_fig, use_container_width=True, key=f"oca_preset_{_pi}")
+                _sum_lines, (_v, _s, _vl) = chain_plot_summary(hist, snap, _metrics, _was_norm)
+                with st.container(border=True):
+                    st.markdown("**Summary**")
+                    for _sl in _sum_lines:
+                        st.markdown(f"- {_sl}")
+                    _badge = "🟢" if _v == "BUY CE" else ("🔴" if _v == "BUY PE" else "⚪")
+                    st.markdown(f"**Recommendation: {_badge} {_v}** _(net score {_s:+d} across the six chain votes)_")
+            st.divider()
+
+        # ---- custom plot ----
+        st.markdown("#### 🎛 Custom Plot")
+        _picked = st.session_state.get("oca_picked", [])
+        if not _picked:
+            st.info("Tick metrics in the '🎛 Custom plot' expander above to build your own chart.")
+        else:
+            st.caption("Plotting: " + ", ".join(_picked))
+            _cfig, _cnorm = chain_plot(hist, _picked, "Custom metric comparison", normalize=_norm_arg, height=480)
+            if _cfig is None:
+                st.info("No data yet for the selected metrics.")
+            else:
+                st.plotly_chart(_cfig, use_container_width=True, key="oca_custom")
+                _sum_lines, (_v, _s, _vl) = chain_plot_summary(hist, snap, _picked, _cnorm)
+                with st.container(border=True):
+                    st.markdown("**Summary**")
+                    for _sl in _sum_lines:
+                        st.markdown(f"- {_sl}")
+                    _badge = "🟢" if _v == "BUY CE" else ("🔴" if _v == "BUY PE" else "⚪")
+                    st.markdown(f"**Recommendation: {_badge} {_v}** _(net score {_s:+d})_")
+
+        st.divider()
+
+        # ---- Groq output ----
+        st.markdown("#### 🤖 Groq AI Analysis")
+        if _running and st.session_state.app_cfg.get("groq_auto") and st.session_state.app_cfg.get("groq_api_key"):
+            _model = (st.session_state.app_cfg.get("groq_model_custom")
+                      if str(st.session_state.app_cfg.get("groq_model_pick", "")).startswith("(custom")
+                      else st.session_state.app_cfg.get("groq_model_pick"))
+            st.session_state["groq_last"] = groq_analyze_chain(
+                st.session_state.app_cfg.get("groq_api_key"), _model, snap, hist,
+                st.session_state.app_cfg.get("groq_extra", ""))
+            st.session_state["groq_last_at"] = ist_now().strftime("%H:%M:%S IST")
+        if st.session_state.get("groq_last"):
+            st.caption(f"Generated @ {st.session_state.get('groq_last_at', 'n/a')} · "
+                       "AI-generated opinion, not financial advice.")
+            st.markdown(st.session_state["groq_last"])
+        else:
+            st.info("No AI analysis yet — open the '🤖 Groq AI analysis' expander above, add your API key and "
+                    "press **Ask Groq now** (or tick 'Include Groq in continuous analysis').")
+
+        st.divider()
+
+        # ---- full chain + history tables ----
+        if snap and snap.get("strikes"):
+            with st.expander("📋 Full option chain (all strikes)", expanded=False):
+                _rows = []
+                _mp2, _ = compute_max_pain(snap["strikes"])
+                _atm2, _ = _atm_row(snap)
+                for _s in sorted(snap["strikes"].keys()):
+                    _r = snap["strikes"][_s]
+                    _rows.append({
+                        "CE OI": _r["ce_oi"], "CE ΔOI": _r["ce_oi_change"], "CE Vol": _r["ce_vol"],
+                        "CE IV": _r["ce_iv"], "CE LTP": _r["ce_ltp"],
+                        "Strike": _s,
+                        "PE LTP": _r["pe_ltp"], "PE IV": _r["pe_iv"], "PE Vol": _r["pe_vol"],
+                        "PE ΔOI": _r["pe_oi_change"], "PE OI": _r["pe_oi"],
+                        "PCR": round(_r["pe_oi"] / _r["ce_oi"], 3) if _r["ce_oi"] else None,
+                        "Marker": ("← ATM" if _s == _atm2 else ("← Max Pain" if _s == _mp2 else "")),
+                    })
+                _cdf = pd.DataFrame(_rows)
+                st.dataframe(_cdf, hide_index=True, use_container_width=True)
+                st.download_button("⬇ Download chain (CSV)", _cdf.to_csv(index=False).encode(),
+                                   file_name=f"option_chain_{oca_under}_{oca_expiry}.csv", mime="text/csv",
+                                   key="oca_dl_chain")
+
+        with st.expander("🧾 Snapshot history (absolute / % / n× changes)", expanded=False):
+            _htbl = build_chain_history_table()
+            if _htbl.empty:
+                st.info("No snapshots recorded yet.")
+            else:
+                st.dataframe(_htbl, hide_index=True, use_container_width=True)
+                st.download_button("⬇ Download history (CSV)", _htbl.to_csv(index=False).encode(),
+                                   file_name="chain_history.csv", mime="text/csv", key="oca_dl_hist")
+
+        st.caption(f"Last render {ist_now().strftime('%H:%M:%S IST')}"
+                   + (f" · auto-refreshing every {int(oca_interval)}s" if _running else " · idle"))
+
+    _chain_analysis_body()
+
 
 # ---------------------------------------------------------------- ADMIN ----
 with tab_admin:
