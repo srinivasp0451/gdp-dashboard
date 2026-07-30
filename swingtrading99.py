@@ -141,7 +141,12 @@ STRATEGY_FAMILY = {
 # threshold) — there's no "candle shape" to wait for, unlike an EMA/RSI/BB
 # cross which genuinely needs a closed bar to compute reliably. So these fire
 # immediately at the current price instead of waiting for next-candle-open.
-IMMEDIATE_EXECUTION_STRATEGIES = {"Simple Buy Only", "Simple Sell Only", "Threshold Cross"}
+# The OI strategy belongs here too: option-chain Open Interest is a live
+# snapshot, not a candle-derived series, so there is nothing to wait for —
+# and reading it from the last CLOSED candle (as candle strategies do) would
+# always see zero, which is why it produced a visible signal but no entry.
+IMMEDIATE_EXECUTION_STRATEGIES = {"Simple Buy Only", "Simple Sell Only", "Threshold Cross",
+                                  "OI Based (CE/PE Open Interest)"}
 
 SL_TYPES = [
     "Custom Points", "Trailing SL (Points)", "Trail Candle Low/High (Current)",
@@ -3086,9 +3091,11 @@ def render_config_controls(ui, prefix="sb"):
         ui.caption("Rule: a side is dominant when its absolute OI is higher AND its change in OI is larger, with both "
                    "sides clearing their minimum thresholds. Because OI is written from the SELLER's perspective, "
                    "heavy CE writing (CE OI > PE OI, ΔCE > ΔPE) reads as bearish by default and BUYS PE. Tick the flip "
-                   "box to trade the opposite interpretation. Needs a Dhan token; OI refreshes every 60s. Note this is "
-                   "a live-only signal — historical OI isn't available, so a backtest can only show the current "
-                   "snapshot on the last bar.")
+                   "box to trade the opposite interpretation. Needs a Dhan token; OI refreshes every 60s. "
+                   "⚡ Entries fire IMMEDIATELY at LTP the moment the OI condition is met — no candle close is "
+                   "required, since OI is a live snapshot rather than a candle-derived series. Note this is a "
+                   "live-only signal: historical OI isn't available, so a backtest can only show the current "
+                   "snapshot on the last bar and will not produce trades.")
         _snap_preview = get_oi_snapshot()
         if _snap_preview:
             ui.caption(f"Live OI @ {_snap_preview['fetched_at']}: CE {_snap_preview['ce_oi']:,.0f} "
@@ -4236,6 +4243,14 @@ def evaluate_live_signal(ticker, interval, period, strategy, params, filters, sl
             last_sig = 1 if ltp > prev_close else 0
         elif strategy == "Simple Sell Only":
             last_sig = -1 if ltp < prev_close else 0
+        elif strategy == "OI Based (CE/PE Open Interest)":
+            # Read the LIVE option-chain snapshot directly rather than any
+            # candle column: OI is not a candle-derived series, so there is
+            # no bar to wait for and the entry happens at once, at LTP.
+            last_sig, _oi_lines = evaluate_oi_signal(params, get_oi_snapshot())
+            if last_sig != 0:
+                st.caption("📊 OI condition met → entering immediately at LTP (no candle close required). "
+                           + (_oi_lines[-1] if _oi_lines else ""))
         else:  # Threshold Cross — evaluated against the LIVE LTP, no candle close needed
             thr = params.get("threshold", prev_close)
             cross_dir = params.get("threshold_direction", "Below")
