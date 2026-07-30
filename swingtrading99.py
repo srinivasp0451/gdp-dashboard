@@ -70,6 +70,11 @@ STRATEGIES = [
     "Volume Breakout",
     "Elliott Wave (Zigzag)",
     "OI Based (CE/PE Open Interest)",
+    "OI Change Based (ΔOI)",
+    "OI + Volume Change Based",
+    "PCR Based (Put-Call Ratio)",
+    "Gamma Blast (Expiry Momentum)",
+    "Multi-Strike OI (ATM ± N Levels)",
     "Hybrid (Combine Strategies)",
     "Pro: VWAP + Supertrend Trend",
     "Pro: Opening Range Breakout + Volume",
@@ -119,6 +124,11 @@ STRATEGY_FAMILY = {
     "Volume Breakout": "trend",
     "Elliott Wave (Zigzag)": "trend",
     "OI Based (CE/PE Open Interest)": "neutral",
+    "OI Change Based (ΔOI)": "neutral",
+    "OI + Volume Change Based": "neutral",
+    "PCR Based (Put-Call Ratio)": "neutral",
+    "Gamma Blast (Expiry Momentum)": "neutral",
+    "Multi-Strike OI (ATM ± N Levels)": "neutral",
     "Hybrid (Combine Strategies)": "neutral",
     "Pro: VWAP + Supertrend Trend": "trend",
     "Pro: Opening Range Breakout + Volume": "trend",
@@ -146,7 +156,12 @@ STRATEGY_FAMILY = {
 # and reading it from the last CLOSED candle (as candle strategies do) would
 # always see zero, which is why it produced a visible signal but no entry.
 IMMEDIATE_EXECUTION_STRATEGIES = {"Simple Buy Only", "Simple Sell Only", "Threshold Cross",
-                                  "OI Based (CE/PE Open Interest)"}
+                                  "OI Based (CE/PE Open Interest)",
+                                  "OI Change Based (ΔOI)",
+                                  "OI + Volume Change Based",
+                                  "PCR Based (Put-Call Ratio)",
+                                  "Gamma Blast (Expiry Momentum)",
+                                  "Multi-Strike OI (ATM ± N Levels)"}
 
 SL_TYPES = [
     "Custom Points", "Trailing SL (Points)", "Trail Candle Low/High (Current)",
@@ -1171,9 +1186,12 @@ def dhan_get_ltp(security_id, segment):
 @st.cache_data(ttl=60, show_spinner=False)
 def dhan_get_option_chain(under_security_id, under_segment, expiry, _token_fp):
     """
-    Dhan option chain (/v2/optionchain) → aggregate CE/PE Open Interest and
-    change in OI. Cached 60s (Dhan rate-limits this endpoint, and OI is not a
-    tick-level number anyway). Returns None when unavailable.
+    Dhan option chain (/v2/optionchain) → aggregate CE/PE Open Interest,
+    OI change, VOLUME and volume change, plus the full PER-STRIKE table
+    (OI, previous OI, volume, previous volume, LTP, IV and greeks) that the
+    multi-strike, max-pain and gamma strategies need. Cached 60s (Dhan
+    rate-limits this endpoint and OI is not a tick-level number anyway).
+    Returns None when unavailable.
     """
     try:
         resp = requests.post(
@@ -1185,21 +1203,63 @@ def dhan_get_option_chain(under_security_id, under_segment, expiry, _token_fp):
         resp.raise_for_status()
         data = (resp.json() or {}).get("data", {}) or {}
         oc = data.get("oc", {}) or {}
+
+        def _f(d, *names):
+            for nm in names:
+                if nm in d and d[nm] is not None:
+                    try:
+                        return float(d[nm])
+                    except (TypeError, ValueError):
+                        pass
+            return 0.0
+
+        strikes = {}
         ce_oi = pe_oi = ce_prev = pe_prev = 0.0
-        for _strike, legs in oc.items():
+        ce_vol = pe_vol = ce_pvol = pe_pvol = 0.0
+        for strike_raw, legs in oc.items():
+            try:
+                strike = float(strike_raw)
+            except (TypeError, ValueError):
+                continue
             ce, pe = legs.get("ce") or {}, legs.get("pe") or {}
-            ce_oi += float(ce.get("oi", 0) or 0)
-            pe_oi += float(pe.get("oi", 0) or 0)
-            ce_prev += float(ce.get("previous_oi", ce.get("previousOi", 0)) or 0)
-            pe_prev += float(pe.get("previous_oi", pe.get("previousOi", 0)) or 0)
+            c_greek, p_greek = ce.get("greeks") or {}, pe.get("greeks") or {}
+            row = {
+                "ce_oi": _f(ce, "oi"), "pe_oi": _f(pe, "oi"),
+                "ce_prev_oi": _f(ce, "previous_oi", "previousOi"),
+                "pe_prev_oi": _f(pe, "previous_oi", "previousOi"),
+                "ce_vol": _f(ce, "volume"), "pe_vol": _f(pe, "volume"),
+                "ce_prev_vol": _f(ce, "previous_volume", "previousVolume"),
+                "pe_prev_vol": _f(pe, "previous_volume", "previousVolume"),
+                "ce_ltp": _f(ce, "last_price"), "pe_ltp": _f(pe, "last_price"),
+                "ce_iv": _f(ce, "implied_volatility", "impliedVolatility"),
+                "pe_iv": _f(pe, "implied_volatility", "impliedVolatility"),
+                "ce_gamma": _f(c_greek, "gamma"), "pe_gamma": _f(p_greek, "gamma"),
+                "ce_delta": _f(c_greek, "delta"), "pe_delta": _f(p_greek, "delta"),
+            }
+            row["ce_oi_change"] = row["ce_oi"] - row["ce_prev_oi"]
+            row["pe_oi_change"] = row["pe_oi"] - row["pe_prev_oi"]
+            row["ce_vol_change"] = row["ce_vol"] - row["ce_prev_vol"]
+            row["pe_vol_change"] = row["pe_vol"] - row["pe_prev_vol"]
+            strikes[strike] = row
+            ce_oi += row["ce_oi"]; pe_oi += row["pe_oi"]
+            ce_prev += row["ce_prev_oi"]; pe_prev += row["pe_prev_oi"]
+            ce_vol += row["ce_vol"]; pe_vol += row["pe_vol"]
+            ce_pvol += row["ce_prev_vol"]; pe_pvol += row["pe_prev_vol"]
+
         if ce_oi == 0 and pe_oi == 0:
             return None
         return {
             "ce_oi": ce_oi, "pe_oi": pe_oi,
             "ce_oi_change": ce_oi - ce_prev, "pe_oi_change": pe_oi - pe_prev,
+            "ce_volume": ce_vol, "pe_volume": pe_vol,
+            "ce_volume_change": ce_vol - ce_pvol, "pe_volume_change": pe_vol - pe_pvol,
             "pcr": (pe_oi / ce_oi) if ce_oi else None,
+            "pcr_volume": (pe_vol / ce_vol) if ce_vol else None,
             "underlying": data.get("last_price"),
+            "expiry": expiry,
+            "strikes": strikes,
             "fetched_at": ist_now().strftime("%H:%M:%S IST"),
+            "fetched_ts": time.time(),
         }
     except Exception:
         return None
@@ -1274,6 +1334,521 @@ def evaluate_oi_signal(params, snap):
         return sig, lines
     lines.append("❌ Neither side dominant on BOTH absolute OI and OI change → no signal.")
     return 0, lines
+
+
+# ============================================================================
+# OPTION-CHAIN ANALYTICS (shared by every chain-based strategy)
+# ============================================================================
+
+# Every one of these reads a LIVE option-chain snapshot rather than a candle
+# series, so they all enter immediately at LTP (see
+# IMMEDIATE_EXECUTION_STRATEGIES) and none of them can be backtested — Dhan
+# exposes only the current chain, not historical OI/volume.
+OPTION_CHAIN_STRATEGIES = {
+    "OI Based (CE/PE Open Interest)",
+    "OI Change Based (ΔOI)",
+    "OI + Volume Change Based",
+    "PCR Based (Put-Call Ratio)",
+    "Gamma Blast (Expiry Momentum)",
+    "Multi-Strike OI (ATM ± N Levels)",
+}
+
+
+def _side_dominance(ce_val, pe_val, mode, n_mult):
+    """
+    Which side wins, under either comparison mode:
+      • "Absolute"    → simply the larger value.
+      • "N× multiple" → the winner must be at least n times the other, so
+                        'CE ΔOI is 10× PE ΔOI' is expressible directly.
+    Only positive values can dominate (a side whose OI/volume is FALLING is
+    not building a position). Returns "CE", "PE" or None.
+    """
+    n = max(float(n_mult or 1.0), 1.0)
+    ce_val, pe_val = float(ce_val or 0.0), float(pe_val or 0.0)
+    if str(mode).startswith("N"):
+        if ce_val > 0 and ce_val >= n * max(pe_val, 1e-9):
+            return "CE"
+        if pe_val > 0 and pe_val >= n * max(ce_val, 1e-9):
+            return "PE"
+        return None
+    if ce_val > pe_val and ce_val > 0:
+        return "CE"
+    if pe_val > ce_val and pe_val > 0:
+        return "PE"
+    return None
+
+
+def _ratio_x(a, b):
+    """Safe 'n×' ratio for display."""
+    try:
+        a, b = float(a), float(b)
+        if abs(b) < 1e-9:
+            return None
+        return a / b
+    except (TypeError, ValueError):
+        return None
+
+
+def _chain_side_to_signal(side, flip, ce_reading="bearish"):
+    """
+    Map a dominant chain side to a trade direction.
+
+    OI is written from the SELLER's side, so heavy CE writing is conventionally
+    read as bearish (resistance overhead) → BUY PE → SHORT signal. The flip
+    checkbox inverts that mapping so you can trade the opposite reading.
+    """
+    if side is None:
+        return 0
+    base = -1 if side == "CE" else 1          # CE dominant → short bias
+    if ce_reading == "bullish":
+        base = -base
+    return -base if flip else base
+
+
+def compute_max_pain(strikes):
+    """
+    Max pain = the strike where option WRITERS lose the least if expiry
+    settled there, i.e. the strike minimising total intrinsic payout:
+        pain(K) = Σ_S [ CE_OI(S) · max(0, K−S) ] + Σ_S [ PE_OI(S) · max(0, S−K) ]
+    Price is often argued to gravitate toward it near expiry.
+    """
+    if not strikes:
+        return None, {}
+    ks = sorted(strikes.keys())
+    pain = {}
+    for k in ks:
+        total = 0.0
+        for s in ks:
+            row = strikes[s]
+            if k > s:
+                total += row["ce_oi"] * (k - s)
+            if s > k:
+                total += row["pe_oi"] * (s - k)
+        pain[k] = total
+    best = min(pain, key=pain.get)
+    return best, pain
+
+
+def multi_strike_band(snap, levels, spot=None):
+    """
+    Aggregate the chain across ATM ± `levels` strikes (so levels=3 sums seven
+    strikes: ATM and three either side) and return the band's totals, its own
+    PCR, and the max pain computed over the whole chain.
+    """
+    if not snap or not snap.get("strikes"):
+        return None
+    strikes = snap["strikes"]
+    ks = sorted(strikes.keys())
+    if not ks:
+        return None
+    spot = spot if spot is not None else snap.get("underlying")
+    if spot is None:
+        # Fall back to the strike where CE and PE premiums are closest —
+        # that is effectively the market's own ATM.
+        spot = min(ks, key=lambda s: abs(strikes[s]["ce_ltp"] - strikes[s]["pe_ltp"]))
+    atm = min(ks, key=lambda s: abs(s - float(spot)))
+    ai = ks.index(atm)
+    lo, hi = max(0, ai - int(levels)), min(len(ks) - 1, ai + int(levels))
+    band = ks[lo:hi + 1]
+
+    agg = {k: 0.0 for k in ("ce_oi", "pe_oi", "ce_oi_change", "pe_oi_change",
+                            "ce_vol", "pe_vol", "ce_vol_change", "pe_vol_change")}
+    for s in band:
+        for k in agg:
+            agg[k] += strikes[s][k]
+    mp, _pain = compute_max_pain(strikes)
+    return {
+        "atm": atm, "band": band, "levels": int(levels), "spot": float(spot),
+        "ce_oi": agg["ce_oi"], "pe_oi": agg["pe_oi"],
+        "ce_oi_change": agg["ce_oi_change"], "pe_oi_change": agg["pe_oi_change"],
+        "ce_volume": agg["ce_vol"], "pe_volume": agg["pe_vol"],
+        "ce_volume_change": agg["ce_vol_change"], "pe_volume_change": agg["pe_vol_change"],
+        "pcr": (agg["pe_oi"] / agg["ce_oi"]) if agg["ce_oi"] else None,
+        "pcr_volume": (agg["pe_vol"] / agg["ce_vol"]) if agg["ce_vol"] else None,
+        "max_pain": mp,
+    }
+
+
+def days_to_expiry(expiry_str):
+    try:
+        return (pd.to_datetime(expiry_str).date() - ist_now().date()).days
+    except Exception:
+        return None
+
+
+# ---------------------------------------------------------------------------
+# PCR HISTORY TRACKER — feeds the PCR strategy's table and its change columns
+# ---------------------------------------------------------------------------
+
+def record_chain_history(snap):
+    """Append one row per distinct snapshot (deduped by fetch timestamp) so the
+    PCR table can show change-vs-previous in absolute, %, and n× terms."""
+    if not snap:
+        return
+    hist = st.session_state.setdefault("chain_history", [])
+    stamp = snap.get("fetched_at")
+    if hist and hist[-1].get("Time") == stamp:
+        return
+    hist.append({
+        "Time": stamp,
+        "PCR": round(snap["pcr"], 4) if snap.get("pcr") else None,
+        "Price": snap.get("underlying"),
+        "CE OI": snap.get("ce_oi"), "PE OI": snap.get("pe_oi"),
+        "Total OI": (snap.get("ce_oi") or 0) + (snap.get("pe_oi") or 0),
+        "CE Volume": snap.get("ce_volume"), "PE Volume": snap.get("pe_volume"),
+        "Total Volume": (snap.get("ce_volume") or 0) + (snap.get("pe_volume") or 0),
+    })
+    if len(hist) > 500:
+        del hist[:-500]
+
+
+def build_chain_history_table():
+    """
+    PCR tracking table: each row's value plus its change from the PREVIOUS
+    row expressed three ways — absolute, percentage, and n× multiple — for
+    PCR, price, OI and volume.
+    """
+    hist = st.session_state.get("chain_history", [])
+    if not hist:
+        return pd.DataFrame()
+    df = pd.DataFrame(hist)
+    for col, short in (("PCR", "PCR"), ("Price", "Price"),
+                       ("Total OI", "OI"), ("Total Volume", "Volume")):
+        if col not in df.columns:
+            continue
+        s = pd.to_numeric(df[col], errors="coerce")
+        prev = s.shift(1)
+        df[f"Δ{short} (abs)"] = (s - prev).round(4)
+        df[f"Δ{short} (%)"] = ((s - prev) / prev.replace(0, np.nan) * 100).round(3)
+        df[f"Δ{short} (n×)"] = (s / prev.replace(0, np.nan)).round(4)
+    ordered = ["Time", "PCR", "ΔPCR (abs)", "ΔPCR (%)", "ΔPCR (n×)",
+               "Price", "ΔPrice (abs)", "ΔPrice (%)", "ΔPrice (n×)",
+               "CE OI", "PE OI", "Total OI", "ΔOI (abs)", "ΔOI (%)", "ΔOI (n×)",
+               "CE Volume", "PE Volume", "Total Volume",
+               "ΔVolume (abs)", "ΔVolume (%)", "ΔVolume (n×)"]
+    return df[[c for c in ordered if c in df.columns]].iloc[::-1]   # newest first
+
+
+# ---------------------------------------------------------------------------
+# STRATEGY EVALUATORS
+# ---------------------------------------------------------------------------
+
+def evaluate_oi_change_signal(params, snap):
+    """ΔOI dominance, in either Absolute or N× mode."""
+    if not snap:
+        return 0, ["ΔOI data unavailable — needs a Dhan token, a resolvable expiry, and live market hours."]
+    d_ce, d_pe = snap["ce_oi_change"], snap["pe_oi_change"]
+    mode = params.get("oi_chg_mode", "Absolute")
+    n = params.get("oi_chg_n", 2.0)
+    min_chg = float(params.get("oi_chg_min", 0.0))
+    flip = bool(params.get("oi_chg_flip", False))
+    x = _ratio_x(d_ce, d_pe)
+    lines = [f"ΔCE OI {d_ce:+,.0f} vs ΔPE OI {d_pe:+,.0f}"
+             + (f" → CE/PE = {x:.2f}×" if x else "")
+             + f" · mode: {mode}" + (f" (needs ≥ {float(n):.1f}×)" if str(mode).startswith('N') else "")]
+    if max(abs(d_ce), abs(d_pe)) < min_chg:
+        lines.append(f"❌ Neither side's ΔOI reaches the minimum of {min_chg:,.0f} → no signal.")
+        return 0, lines
+    side = _side_dominance(d_ce, d_pe, mode, n)
+    if side is None:
+        lines.append("❌ No side dominant under this mode → no signal.")
+        return 0, lines
+    sig = _chain_side_to_signal(side, flip)
+    lines.append(f"✅ {side} ΔOI dominant → {'LONG (BUY CE)' if sig == 1 else 'SHORT (BUY PE)'}"
+                 f" ({'flipped' if flip else 'standard seller-perspective'} reading).")
+    return sig, lines
+
+
+def evaluate_oi_volume_signal(params, snap):
+    """ΔOI *and* ΔVolume must point at the same side — fresh positions being
+    built with real participation behind them, not a stale OI drift."""
+    if not snap:
+        return 0, ["ΔOI/ΔVolume data unavailable — needs a Dhan token, a resolvable expiry, and live market hours."]
+    d_ce, d_pe = snap["ce_oi_change"], snap["pe_oi_change"]
+    v_ce, v_pe = snap.get("ce_volume_change", 0.0), snap.get("pe_volume_change", 0.0)
+    oi_mode, oi_n = params.get("oiv_oi_mode", "Absolute"), params.get("oiv_oi_n", 2.0)
+    vol_mode, vol_n = params.get("oiv_vol_mode", "Absolute"), params.get("oiv_vol_n", 2.0)
+    flip = bool(params.get("oiv_flip", False))
+    xo, xv = _ratio_x(d_ce, d_pe), _ratio_x(v_ce, v_pe)
+    lines = [
+        f"ΔOI: CE {d_ce:+,.0f} vs PE {d_pe:+,.0f}" + (f" ({xo:.2f}×)" if xo else "")
+        + f" · mode {oi_mode}" + (f" ≥{float(oi_n):.1f}×" if str(oi_mode).startswith('N') else ""),
+        f"ΔVolume: CE {v_ce:+,.0f} vs PE {v_pe:+,.0f}" + (f" ({xv:.2f}×)" if xv else "")
+        + f" · mode {vol_mode}" + (f" ≥{float(vol_n):.1f}×" if str(vol_mode).startswith('N') else ""),
+    ]
+    oi_side = _side_dominance(d_ce, d_pe, oi_mode, oi_n)
+    vol_side = _side_dominance(v_ce, v_pe, vol_mode, vol_n)
+    if oi_side is None or vol_side is None:
+        lines.append(f"❌ Needs BOTH: ΔOI side = {oi_side or 'none'}, ΔVolume side = {vol_side or 'none'} → no signal.")
+        return 0, lines
+    if oi_side != vol_side:
+        lines.append(f"❌ Disagreement — ΔOI favours {oi_side} but ΔVolume favours {vol_side} → no signal.")
+        return 0, lines
+    sig = _chain_side_to_signal(oi_side, flip)
+    lines.append(f"✅ Both ΔOI and ΔVolume favour {oi_side} → "
+                 f"{'LONG (BUY CE)' if sig == 1 else 'SHORT (BUY PE)'}"
+                 f" ({'flipped' if flip else 'standard'} reading).")
+    return sig, lines
+
+
+def evaluate_pcr_signal(params, snap):
+    """
+    PCR strategy.
+
+    Design rationale: PCR = total PE OI / total CE OI. A HIGH PCR means puts
+    are being written heavily — writers are confident price stays up — which
+    is read as bullish; a LOW PCR is the mirror, bearish. Rather than trading
+    a single line, this uses two bands with a deliberate no-trade zone in the
+    middle (most of the session sits there and is noise), and can additionally
+    require that PCR is moving the right way, which filters the common failure
+    of entering a stretched ratio just as it starts unwinding.
+
+    Optional extreme-reversal mode inverts the logic beyond very high/low
+    readings, where the ratio is usually a crowded-positioning warning rather
+    than a trend confirmation.
+    """
+    if not snap:
+        return 0, ["PCR data unavailable — needs a Dhan token, a resolvable expiry, and live market hours."]
+    pcr = snap.get("pcr")
+    if not pcr:
+        return 0, ["PCR could not be computed (no CE open interest in the chain)."]
+    bull = float(params.get("pcr_bull", 1.2))
+    bear = float(params.get("pcr_bear", 0.8))
+    need_trend = bool(params.get("pcr_require_trend", False))
+    extreme_mode = bool(params.get("pcr_extreme_reversal", False))
+    ex_hi = float(params.get("pcr_extreme_high", 1.8))
+    ex_lo = float(params.get("pcr_extreme_low", 0.5))
+    flip = bool(params.get("pcr_flip", False))
+
+    hist = st.session_state.get("chain_history", [])
+    prev_pcr = None
+    for row in reversed(hist[:-1] if hist else []):
+        if row.get("PCR"):
+            prev_pcr = row["PCR"]
+            break
+    d_pcr = (pcr - prev_pcr) if prev_pcr else None
+
+    lines = [f"PCR = {pcr:.3f} (bullish ≥ {bull:.2f} · bearish ≤ {bear:.2f} · no-trade zone between)"
+             + (f" · ΔPCR vs previous reading {d_pcr:+.3f}" if d_pcr is not None else " · no previous reading yet")]
+    if snap.get("pcr_volume"):
+        lines.append(f"Volume-based PCR = {snap['pcr_volume']:.3f} (context only — OI PCR drives the signal).")
+
+    sig = 0
+    if extreme_mode and pcr >= ex_hi:
+        sig = -1
+        lines.append(f"⚠️ PCR ≥ extreme {ex_hi:.2f} → treated as crowded put-writing, REVERSAL short bias.")
+    elif extreme_mode and pcr <= ex_lo:
+        sig = 1
+        lines.append(f"⚠️ PCR ≤ extreme {ex_lo:.2f} → treated as crowded call-writing, REVERSAL long bias.")
+    elif pcr >= bull:
+        sig = 1
+        lines.append("✅ PCR in the bullish band (heavy put writing) → LONG bias.")
+    elif pcr <= bear:
+        sig = -1
+        lines.append("✅ PCR in the bearish band (heavy call writing) → SHORT bias.")
+    else:
+        lines.append("❌ PCR inside the no-trade zone → no signal.")
+        return 0, lines
+
+    if need_trend:
+        if d_pcr is None:
+            lines.append("❌ 'Require PCR trend confirmation' is ON but there is no previous reading yet → no signal.")
+            return 0, lines
+        if sig == 1 and d_pcr <= 0:
+            lines.append(f"❌ Long bias needs PCR RISING, but ΔPCR is {d_pcr:+.3f} → no signal.")
+            return 0, lines
+        if sig == -1 and d_pcr >= 0:
+            lines.append(f"❌ Short bias needs PCR FALLING, but ΔPCR is {d_pcr:+.3f} → no signal.")
+            return 0, lines
+        lines.append(f"✅ PCR trend confirms ({d_pcr:+.3f}).")
+
+    if flip:
+        sig = -sig
+        lines.append("🔄 Flip enabled → direction inverted.")
+    lines.append(f"Verdict: {'LONG (BUY CE)' if sig == 1 else 'SHORT (BUY PE)'}.")
+    return sig, lines
+
+
+def evaluate_gamma_blast_signal(params, snap, df=None):
+    """
+    Gamma blast.
+
+    The setup this looks for is the expiry-day pattern where ATM options have
+    collapsed to a small premium while gamma is at its highest: the writers'
+    hedges become extremely sensitive to price, so once price breaks out of
+    its compression range the delta-hedging feedback loop can expand the
+    premium several-fold in minutes. All four conditions must line up:
+      1. within N days of expiry (default 0 = expiry day only),
+      2. combined ATM straddle premium below a ceiling (the compression),
+      3. ATM gamma at or above a floor (the fuel),
+      4. price breaking out of its recent range (the trigger, and the
+         direction — a break up buys CE, a break down buys PE).
+    Condition 4 is what makes this directional rather than a guess; without a
+    break there is no signal at all.
+    """
+    lines = []
+    if not snap or not snap.get("strikes"):
+        return 0, ["Gamma Blast: option chain unavailable — needs a Dhan token, an expiry, and live market hours."]
+    max_dte = int(params.get("gb_max_dte", 0))
+    prem_cap = float(params.get("gb_premium_cap", 60.0))
+    gamma_min = float(params.get("gb_gamma_min", 0.0))
+    lookback = int(params.get("gb_range_lookback", 15))
+    buffer_pts = float(params.get("gb_break_buffer", 0.0))
+    flip = bool(params.get("gb_flip", False))
+
+    dte = days_to_expiry(snap.get("expiry"))
+    if dte is None:
+        lines.append("Days-to-expiry unknown — skipping the expiry check.")
+    else:
+        lines.append(f"Days to expiry = {dte} (needs ≤ {max_dte})."
+                     + (" ✅" if dte <= max_dte else " ❌"))
+        if dte > max_dte:
+            return 0, lines + ["❌ Too far from expiry for a gamma blast → no signal."]
+
+    band = multi_strike_band(snap, 0)
+    if not band:
+        return 0, lines + ["Gamma Blast: could not locate the ATM strike."]
+    atm = band["atm"]
+    row = snap["strikes"][atm]
+    straddle = row["ce_ltp"] + row["pe_ltp"]
+    gamma = max(row["ce_gamma"], row["pe_gamma"])
+    lines.append(f"ATM {atm:.0f}: CE {row['ce_ltp']:.2f} + PE {row['pe_ltp']:.2f} = straddle {straddle:.2f} "
+                 f"(needs ≤ {prem_cap:.2f})" + (" ✅" if straddle <= prem_cap else " ❌"))
+    lines.append(f"ATM gamma = {gamma:.5f} (needs ≥ {gamma_min:.5f})" + (" ✅" if gamma >= gamma_min else " ❌"))
+    if straddle > prem_cap:
+        return 0, lines + ["❌ Premium not compressed enough → no signal."]
+    if gamma < gamma_min:
+        return 0, lines + ["❌ ATM gamma below the floor → no signal."]
+
+    if df is None or len(df) < lookback + 2:
+        return 0, lines + [f"❌ Need at least {lookback + 2} candles to measure the compression range → no signal."]
+    window = df.iloc[-(lookback + 1):-1]
+    hi, lo = float(window["High"].max()), float(window["Low"].min())
+    px = float(df["Close"].iloc[-1])
+    lines.append(f"Compression range over last {lookback} candles: {lo:.2f} – {hi:.2f}; price {px:.2f} "
+                 f"(break buffer {buffer_pts:.2f}).")
+    sig = 0
+    if px > hi + buffer_pts:
+        sig = 1
+        lines.append("✅ Upside break → BUY CE (gamma blast long).")
+    elif px < lo - buffer_pts:
+        sig = -1
+        lines.append("✅ Downside break → BUY PE (gamma blast short).")
+    else:
+        lines.append("❌ Still inside the range — waiting for the break that triggers the blast.")
+        return 0, lines
+    if flip:
+        sig = -sig
+        lines.append("🔄 Flip enabled → direction inverted.")
+    return sig, lines
+
+
+def evaluate_multi_strike_signal(params, snap, spot=None):
+    """
+    Multi-strike ATM ± N levels.
+
+    Sums CE and PE open interest, OI change and volume across the ATM strike
+    and N strikes either side (so N=3 covers seven strikes), computes that
+    band's own PCR, and locates max pain over the full chain. Trading only the
+    strikes around the money keeps the read focused on where the action
+    actually is, instead of letting far-OTM legs dominate the totals.
+
+    Scoring combines three independent votes — band PCR, ΔOI dominance, and
+    where spot sits relative to max pain — and requires a configurable minimum
+    net score, so a single ambiguous input cannot trigger an entry on its own.
+    """
+    if not snap:
+        return 0, ["Multi-strike: option chain unavailable — needs a Dhan token, an expiry, and live market hours."]
+    levels = int(params.get("ms_levels", 3))
+    band = multi_strike_band(snap, levels, spot)
+    if not band:
+        return 0, ["Multi-strike: could not build the strike band."]
+    bull_pcr = float(params.get("ms_pcr_bull", 1.2))
+    bear_pcr = float(params.get("ms_pcr_bear", 0.8))
+    oi_mode, oi_n = params.get("ms_oi_mode", "Absolute"), params.get("ms_oi_n", 2.0)
+    min_votes = int(params.get("ms_min_votes", 2))
+    use_maxpain = bool(params.get("ms_use_max_pain", True))
+    flip = bool(params.get("ms_flip", False))
+
+    lines = [
+        f"ATM {band['atm']:.0f} ± {levels} levels → {len(band['band'])} strikes "
+        f"({min(band['band']):.0f}–{max(band['band']):.0f}), spot {band['spot']:.2f}",
+        f"Band CE OI {band['ce_oi']:,.0f} vs PE OI {band['pe_oi']:,.0f} → band PCR "
+        + (f"{band['pcr']:.3f}" if band['pcr'] else "n/a")
+        + f" (bullish ≥ {bull_pcr:.2f} / bearish ≤ {bear_pcr:.2f})",
+        f"Band ΔOI: CE {band['ce_oi_change']:+,.0f} vs PE {band['pe_oi_change']:+,.0f} · mode {oi_mode}"
+        + (f" ≥{float(oi_n):.1f}×" if str(oi_mode).startswith('N') else ""),
+        f"Band volume: CE {band['ce_volume']:,.0f} vs PE {band['pe_volume']:,.0f}"
+        + (f" → volume PCR {band['pcr_volume']:.3f}" if band.get('pcr_volume') else ""),
+        f"Max pain (full chain) = {band['max_pain']:.0f}" if band.get("max_pain") else "Max pain unavailable.",
+    ]
+
+    votes = 0
+    if band["pcr"]:
+        if band["pcr"] >= bull_pcr:
+            votes += 1; lines.append("🟢 Vote +1: band PCR bullish (put writing dominant).")
+        elif band["pcr"] <= bear_pcr:
+            votes -= 1; lines.append("🔴 Vote −1: band PCR bearish (call writing dominant).")
+        else:
+            lines.append("⚪ Vote 0: band PCR inside the neutral zone.")
+
+    oi_side = _side_dominance(band["ce_oi_change"], band["pe_oi_change"], oi_mode, oi_n)
+    if oi_side == "PE":
+        votes += 1; lines.append("🟢 Vote +1: PE ΔOI dominant (puts being written → support building).")
+    elif oi_side == "CE":
+        votes -= 1; lines.append("🔴 Vote −1: CE ΔOI dominant (calls being written → resistance building).")
+    else:
+        lines.append("⚪ Vote 0: no clear ΔOI dominance in the band.")
+
+    if use_maxpain and band.get("max_pain"):
+        if band["spot"] < band["max_pain"]:
+            votes += 1; lines.append(f"🟢 Vote +1: spot {band['spot']:.2f} is BELOW max pain {band['max_pain']:.0f} "
+                                     "(drift toward max pain is upward).")
+        elif band["spot"] > band["max_pain"]:
+            votes -= 1; lines.append(f"🔴 Vote −1: spot {band['spot']:.2f} is ABOVE max pain {band['max_pain']:.0f} "
+                                     "(drift toward max pain is downward).")
+        else:
+            lines.append("⚪ Vote 0: spot sits at max pain.")
+
+    lines.append(f"Net score {votes:+d}, needs |score| ≥ {min_votes}.")
+    sig = 0
+    if votes >= min_votes:
+        sig = 1
+    elif votes <= -min_votes:
+        sig = -1
+    else:
+        lines.append("❌ Not enough agreement → no signal.")
+        return 0, lines
+    if flip:
+        sig = -sig
+        lines.append("🔄 Flip enabled → direction inverted.")
+    lines.append(f"✅ Verdict: {'BUY CE (long)' if sig == 1 else 'BUY PE (short)'}.")
+    return sig, lines
+
+
+def evaluate_option_chain_signal(strategy, params, df=None):
+    """Single dispatcher for every option-chain strategy. Returns (sig, lines)."""
+    snap = get_oi_snapshot()
+    record_chain_history(snap)
+    spot = None
+    if df is not None and len(df):
+        try:
+            spot = float(df["Close"].iloc[-1])
+        except Exception:
+            spot = None
+    if strategy == "OI Based (CE/PE Open Interest)":
+        return evaluate_oi_signal(params, snap)
+    if strategy == "OI Change Based (ΔOI)":
+        return evaluate_oi_change_signal(params, snap)
+    if strategy == "OI + Volume Change Based":
+        return evaluate_oi_volume_signal(params, snap)
+    if strategy == "PCR Based (Put-Call Ratio)":
+        return evaluate_pcr_signal(params, snap)
+    if strategy == "Gamma Blast (Expiry Momentum)":
+        return evaluate_gamma_blast_signal(params, snap, df)
+    if strategy == "Multi-Strike OI (ATM ± N Levels)":
+        return evaluate_multi_strike_signal(params, snap, spot)
+    return 0, []
 
 
 def dhan_get_ltp_for_ticker(ticker):
@@ -1437,13 +2012,14 @@ def generate_signals(df, strategy, params, _raw=False):
     df = df.copy()
     df["signal"] = 0
 
-    if strategy == "OI Based (CE/PE Open Interest)":
-        # Live option-chain OI is a point-in-time snapshot — there is no
-        # historical OI series available here, so this strategy marks only
-        # the LATEST bar. It is intended for live trading; in a backtest it
-        # can only ever produce the current snapshot's signal on the last bar
-        # (shown honestly rather than fabricated from price data).
-        sig, _lines = evaluate_oi_signal(params, get_oi_snapshot())
+    if strategy in OPTION_CHAIN_STRATEGIES:
+        # Live option-chain snapshot — there is no historical OI/volume series
+        # available, so only the LATEST bar can carry a signal. These are
+        # immediate-execution strategies: the live engine reads the snapshot
+        # directly and enters at LTP, so this marking exists for charting and
+        # status display rather than for backtesting (a backtest cannot
+        # reconstruct past chains and will not produce trades).
+        sig, _lines = evaluate_option_chain_signal(strategy, params, df)
         if sig != 0 and len(df):
             df.iloc[-1, df.columns.get_loc("signal")] = sig
 
@@ -3074,33 +3650,142 @@ def render_config_controls(ui, prefix="sb"):
                    "both backtest and live (previously they were stamped on the pivot bar itself, which used future "
                    "bars and could never fire on the newest candle — that's why it worked only in backtest). "
                    "Impulse-only restricts entries to swings that continue the structure.")
-    if strategy == "OI Based (CE/PE Open Interest)":
-        params["oi_underlying"] = cfg_selectbox(ui, "OI Underlying", "oi_underlying",
+    if strategy in OPTION_CHAIN_STRATEGIES:
+        # ---- shared chain source (all option-chain strategies use this) ----
+        params["oi_underlying"] = cfg_selectbox(ui, "Option Chain Underlying", "oi_underlying",
                                                 list(DHAN_INDEX_MAP.keys()), default="Nifty50", prefix=prefix)
         _oi_meta = DHAN_INDEX_MAP[params["oi_underlying"]]
         _oi_exps = dhan_get_expiries(_oi_meta["underlying"], "OPTIDX", _oi_meta["exchange"])
         if _oi_exps:
-            params["oi_expiry"] = cfg_selectbox(ui, "OI Expiry (nearest pre-selected)", "oi_expiry",
+            params["oi_expiry"] = cfg_selectbox(ui, "Chain Expiry (nearest pre-selected)", "oi_expiry",
                                                 _oi_exps, default=_oi_exps[0], prefix=prefix)
         else:
-            params["oi_expiry"] = cfg_text(ui, "OI Expiry (YYYY-MM-DD)", "oi_expiry", "", prefix=prefix)
+            params["oi_expiry"] = cfg_text(ui, "Chain Expiry (YYYY-MM-DD)", "oi_expiry", "", prefix=prefix)
+        ui.caption("⚡ All option-chain strategies enter IMMEDIATELY at LTP the moment their condition is met — no "
+                   "candle close required, since the chain is a live snapshot. They need a Dhan token, and the chain "
+                   "refreshes every 60s (Dhan rate-limits that endpoint). They cannot be backtested: Dhan exposes only "
+                   "the current chain, never historical OI/volume.")
+
+    if strategy == "OI Based (CE/PE Open Interest)":
         c1, c2 = ui.columns(2)
         params["oi_ce_threshold"] = cfg_number(c1, "Min CE OI", "oi_ce_threshold", 0.0, 0.0, 1e12, step=100000.0, prefix=prefix)
         params["oi_pe_threshold"] = cfg_number(c2, "Min PE OI", "oi_pe_threshold", 0.0, 0.0, 1e12, step=100000.0, prefix=prefix)
         params["oi_flip"] = cfg_checkbox(ui, "Flip OI interpretation (buy the other leg)", "oi_flip", False, prefix=prefix)
         ui.caption("Rule: a side is dominant when its absolute OI is higher AND its change in OI is larger, with both "
                    "sides clearing their minimum thresholds. Because OI is written from the SELLER's perspective, "
-                   "heavy CE writing (CE OI > PE OI, ΔCE > ΔPE) reads as bearish by default and BUYS PE. Tick the flip "
-                   "box to trade the opposite interpretation. Needs a Dhan token; OI refreshes every 60s. "
-                   "⚡ Entries fire IMMEDIATELY at LTP the moment the OI condition is met — no candle close is "
-                   "required, since OI is a live snapshot rather than a candle-derived series. Note this is a "
-                   "live-only signal: historical OI isn't available, so a backtest can only show the current "
-                   "snapshot on the last bar and will not produce trades.")
+                   "heavy CE writing reads as bearish by default and BUYS PE — tick the flip box for the opposite "
+                   "interpretation.")
+
+    if strategy == "OI Change Based (ΔOI)":
+        params["oi_chg_mode"] = cfg_selectbox(ui, "Comparison Mode", "oi_chg_mode",
+                                              ["Absolute (larger ΔOI wins)", "N× multiple (must be n times the other)"],
+                                              default="Absolute (larger ΔOI wins)", prefix=prefix)
+        if str(params["oi_chg_mode"]).startswith("N"):
+            params["oi_chg_n"] = cfg_number(ui, "N (multiple required, e.g. 10 = ΔCE must be 10× ΔPE)",
+                                            "oi_chg_n", 2.0, 1.0, 1000.0, step=1.0, prefix=prefix)
+        params["oi_chg_min"] = cfg_number(ui, "Minimum ΔOI to consider (either side)", "oi_chg_min",
+                                          0.0, 0.0, 1e12, step=100000.0, prefix=prefix)
+        params["oi_chg_flip"] = cfg_checkbox(ui, "Flip interpretation (buy the other leg)", "oi_chg_flip", False, prefix=prefix)
+        ui.caption("Trades the CHANGE in open interest rather than its absolute level — fresh positioning, which is "
+                   "usually the more informative signal. In N× mode the winning side's ΔOI must be at least n times "
+                   "the other side's, so 'ΔCE OI is 10× ΔPE OI' is expressed directly. Only a RISING side can "
+                   "dominate: a falling ΔOI is unwinding, not position building.")
+
+    if strategy == "OI + Volume Change Based":
+        ui.markdown("**ΔOI condition**")
+        params["oiv_oi_mode"] = cfg_selectbox(ui, "ΔOI Comparison Mode", "oiv_oi_mode",
+                                              ["Absolute (larger ΔOI wins)", "N× multiple (must be n times the other)"],
+                                              default="Absolute (larger ΔOI wins)", prefix=prefix)
+        if str(params["oiv_oi_mode"]).startswith("N"):
+            params["oiv_oi_n"] = cfg_number(ui, "N for ΔOI", "oiv_oi_n", 2.0, 1.0, 1000.0, step=1.0, prefix=prefix)
+        ui.markdown("**ΔVolume condition**")
+        params["oiv_vol_mode"] = cfg_selectbox(ui, "ΔVolume Comparison Mode", "oiv_vol_mode",
+                                               ["Absolute (larger ΔVolume wins)", "N× multiple (must be n times the other)"],
+                                               default="Absolute (larger ΔVolume wins)", prefix=prefix)
+        if str(params["oiv_vol_mode"]).startswith("N"):
+            params["oiv_vol_n"] = cfg_number(ui, "N for ΔVolume", "oiv_vol_n", 2.0, 1.0, 1000.0, step=1.0, prefix=prefix)
+        params["oiv_flip"] = cfg_checkbox(ui, "Flip interpretation (buy the other leg)", "oiv_flip", False, prefix=prefix)
+        ui.caption("Requires BOTH ΔOI and ΔVolume to favour the SAME side — positions being built with real "
+                   "participation behind them. If the two disagree, no entry is taken, which filters out stale OI "
+                   "drift on thin volume. Each condition has its own Absolute / N× mode and its own n.")
+
+    if strategy == "PCR Based (Put-Call Ratio)":
+        c1, c2 = ui.columns(2)
+        params["pcr_bull"] = cfg_number(c1, "Bullish PCR ≥", "pcr_bull", 1.2, 0.1, 10.0, step=0.05, prefix=prefix)
+        params["pcr_bear"] = cfg_number(c2, "Bearish PCR ≤", "pcr_bear", 0.8, 0.05, 10.0, step=0.05, prefix=prefix)
+        params["pcr_require_trend"] = cfg_checkbox(ui, "Require PCR trend confirmation (rising for long / falling for short)",
+                                                   "pcr_require_trend", False, prefix=prefix)
+        params["pcr_extreme_reversal"] = cfg_checkbox(ui, "Extreme-reading reversal mode", "pcr_extreme_reversal",
+                                                      False, prefix=prefix)
+        if params["pcr_extreme_reversal"]:
+            c1, c2 = ui.columns(2)
+            params["pcr_extreme_high"] = cfg_number(c1, "Extreme HIGH PCR ≥ (short)", "pcr_extreme_high",
+                                                    1.8, 1.0, 20.0, step=0.1, prefix=prefix)
+            params["pcr_extreme_low"] = cfg_number(c2, "Extreme LOW PCR ≤ (long)", "pcr_extreme_low",
+                                                   0.5, 0.01, 2.0, step=0.05, prefix=prefix)
+        params["pcr_flip"] = cfg_checkbox(ui, "Flip interpretation", "pcr_flip", False, prefix=prefix)
+        ui.caption("PCR = total PE OI / total CE OI. A HIGH ratio means puts are being written heavily (writers expect "
+                   "price to hold) → read as bullish; a LOW ratio is the bearish mirror. The gap between the two "
+                   "thresholds is a deliberate no-trade zone, because most of the session sits mid-range and that is "
+                   "noise. Trend confirmation avoids entering a stretched ratio just as it unwinds. Extreme mode "
+                   "inverts the logic beyond very high/low readings, where the ratio usually signals crowded "
+                   "positioning rather than trend. A full PCR tracking table appears on the Live Trading tab.")
+
+    if strategy == "Gamma Blast (Expiry Momentum)":
+        c1, c2 = ui.columns(2)
+        params["gb_max_dte"] = cfg_number(c1, "Max days to expiry (0 = expiry day only)", "gb_max_dte",
+                                          0, 0, 30, is_int=True, prefix=prefix)
+        params["gb_premium_cap"] = cfg_number(c2, "ATM straddle premium ceiling", "gb_premium_cap",
+                                              60.0, 0.5, 100000.0, step=5.0, prefix=prefix)
+        c1, c2 = ui.columns(2)
+        params["gb_gamma_min"] = cfg_number(c1, "Minimum ATM gamma", "gb_gamma_min",
+                                            0.0, 0.0, 10.0, step=0.0005, format="%.5f", prefix=prefix)
+        params["gb_range_lookback"] = cfg_number(c2, "Compression range lookback (candles)", "gb_range_lookback",
+                                                 15, 3, 500, is_int=True, prefix=prefix)
+        params["gb_break_buffer"] = cfg_number(ui, "Breakout buffer (points beyond the range)", "gb_break_buffer",
+                                               0.0, 0.0, 10000.0, step=1.0, prefix=prefix)
+        params["gb_flip"] = cfg_checkbox(ui, "Flip direction", "gb_flip", False, prefix=prefix)
+        ui.caption("Looks for the expiry-day setup where ATM premium has collapsed while gamma is at its peak: "
+                   "writers' hedges become hypersensitive, so a break out of the compression range can expand premium "
+                   "several-fold as delta-hedging feeds on itself. ALL four must align — near expiry, straddle below "
+                   "the ceiling, gamma above the floor, and price breaking the recent range. The break also sets "
+                   "direction: up buys CE, down buys PE. No break means no signal, which is what keeps this "
+                   "directional rather than a coin flip.")
+
+    if strategy == "Multi-Strike OI (ATM ± N Levels)":
+        params["ms_levels"] = cfg_number(ui, "Levels either side of ATM (3 = seven strikes total)", "ms_levels",
+                                         3, 1, 20, is_int=True, prefix=prefix)
+        c1, c2 = ui.columns(2)
+        params["ms_pcr_bull"] = cfg_number(c1, "Band PCR bullish ≥", "ms_pcr_bull", 1.2, 0.1, 10.0, step=0.05, prefix=prefix)
+        params["ms_pcr_bear"] = cfg_number(c2, "Band PCR bearish ≤", "ms_pcr_bear", 0.8, 0.05, 10.0, step=0.05, prefix=prefix)
+        params["ms_oi_mode"] = cfg_selectbox(ui, "Band ΔOI Comparison Mode", "ms_oi_mode",
+                                             ["Absolute (larger ΔOI wins)", "N× multiple (must be n times the other)"],
+                                             default="Absolute (larger ΔOI wins)", prefix=prefix)
+        if str(params["ms_oi_mode"]).startswith("N"):
+            params["ms_oi_n"] = cfg_number(ui, "N for band ΔOI", "ms_oi_n", 2.0, 1.0, 1000.0, step=1.0, prefix=prefix)
+        params["ms_use_max_pain"] = cfg_checkbox(ui, "Include max-pain vote", "ms_use_max_pain", True, prefix=prefix)
+        params["ms_min_votes"] = cfg_number(ui, "Minimum net score to trade (of 3 votes)", "ms_min_votes",
+                                            2, 1, 3, is_int=True, prefix=prefix)
+        params["ms_flip"] = cfg_checkbox(ui, "Flip direction", "ms_flip", False, prefix=prefix)
+        ui.caption("Sums CE/PE open interest, ΔOI and volume across the ATM strike and N strikes either side, computes "
+                   "that band's own PCR, and locates max pain across the full chain. Restricting to strikes around the "
+                   "money keeps the read where the action is instead of letting far-OTM legs dominate. Three "
+                   "independent votes — band PCR, ΔOI dominance, and spot versus max pain — must reach the minimum net "
+                   "score, so one ambiguous input can't trigger an entry alone.")
+
+    if strategy in OPTION_CHAIN_STRATEGIES:
         _snap_preview = get_oi_snapshot()
         if _snap_preview:
-            ui.caption(f"Live OI @ {_snap_preview['fetched_at']}: CE {_snap_preview['ce_oi']:,.0f} "
-                       f"(Δ{_snap_preview['ce_oi_change']:+,.0f}) · PE {_snap_preview['pe_oi']:,.0f} "
-                       f"(Δ{_snap_preview['pe_oi_change']:+,.0f})")
+            _pv = [f"Live chain @ {_snap_preview['fetched_at']}",
+                   f"CE OI {_snap_preview['ce_oi']:,.0f} (Δ{_snap_preview['ce_oi_change']:+,.0f})",
+                   f"PE OI {_snap_preview['pe_oi']:,.0f} (Δ{_snap_preview['pe_oi_change']:+,.0f})"]
+            if _snap_preview.get("pcr"):
+                _pv.append(f"PCR {_snap_preview['pcr']:.3f}")
+            ui.caption(" · ".join(_pv))
+        else:
+            ui.caption("Live chain preview unavailable — check the Dhan Access Token and expiry, and note the chain "
+                       "endpoint only returns data during market hours.")
+
     if strategy == "Hybrid (Combine Strategies)":
         _members = [s for s in STRATEGIES if s != "Hybrid (Combine Strategies)"]
         params["hybrid_members"] = cfg_multiselect(ui, "Strategies to combine", "hybrid_members",
@@ -3925,13 +4610,13 @@ def describe_signal_status(df, strategy, params, filters):
         except Exception as exc:
             lines.append(f"Elliott Wave: could not compute wave state ({exc}).")
 
-    if strategy == "OI Based (CE/PE Open Interest)":
-        snap = get_oi_snapshot()
-        oi_sig, oi_lines = evaluate_oi_signal(params, snap)
-        for l in oi_lines:
-            lines.append("OI — " + l)
-        lines.append(f"OI verdict right now: {'🟢 LONG' if oi_sig==1 else ('🔴 SHORT' if oi_sig==-1 else '⚪ no signal')}"
-                     + (f" (data @ {snap['fetched_at']}, refreshes every 60s)" if snap else ""))
+    if strategy in OPTION_CHAIN_STRATEGIES:
+        oc_sig, oc_lines = evaluate_option_chain_signal(strategy, params, df)
+        for l in oc_lines:
+            lines.append("📊 " + l)
+        lines.append(f"Option-chain verdict right now: "
+                     f"{'🟢 LONG (BUY CE)' if oc_sig == 1 else ('🔴 SHORT (BUY PE)' if oc_sig == -1 else '⚪ no signal')} "
+                     "— entry fires immediately at LTP when this turns non-flat.")
 
     if strategy == "Hybrid (Combine Strategies)":
         members = list(params.get("hybrid_members", []))
@@ -4243,14 +4928,14 @@ def evaluate_live_signal(ticker, interval, period, strategy, params, filters, sl
             last_sig = 1 if ltp > prev_close else 0
         elif strategy == "Simple Sell Only":
             last_sig = -1 if ltp < prev_close else 0
-        elif strategy == "OI Based (CE/PE Open Interest)":
+        elif strategy in OPTION_CHAIN_STRATEGIES:
             # Read the LIVE option-chain snapshot directly rather than any
-            # candle column: OI is not a candle-derived series, so there is
-            # no bar to wait for and the entry happens at once, at LTP.
-            last_sig, _oi_lines = evaluate_oi_signal(params, get_oi_snapshot())
+            # candle column: OI/volume/PCR/gamma are not candle-derived, so
+            # there is no bar to wait for and the entry happens at once, at LTP.
+            last_sig, _oc_lines = evaluate_option_chain_signal(strategy, params, sig_df)
             if last_sig != 0:
-                st.caption("📊 OI condition met → entering immediately at LTP (no candle close required). "
-                           + (_oi_lines[-1] if _oi_lines else ""))
+                st.caption(f"📊 {strategy}: condition met → entering immediately at LTP (no candle close required). "
+                           + (_oc_lines[-1] if _oc_lines else ""))
         else:  # Threshold Cross — evaluated against the LIVE LTP, no candle close needed
             thr = params.get("threshold", prev_close)
             cross_dir = params.get("threshold_direction", "Below")
@@ -4888,6 +5573,57 @@ with tab_live:
         live_position_fragment(ticker, "LTP")
     else:
         st.caption("Stopped — no LTP polling. Click Start to resume live price and P&L updates.")
+
+    # ---- Option-chain panel (all chain strategies) + PCR tracking table ----
+    if strategy in OPTION_CHAIN_STRATEGIES:
+        st.markdown("#### 📊 Live Option Chain")
+        _snap = get_oi_snapshot()
+        record_chain_history(_snap)
+        if not _snap:
+            st.warning("Option chain unavailable — verify the Dhan Access Token and the selected expiry. "
+                       "Dhan's chain endpoint only returns data during market hours.")
+        else:
+            m1, m2, m3, m4, m5 = st.columns(5)
+            m1.metric("Underlying", f"{_snap.get('underlying') or 0:,.2f}")
+            m2.metric("CE OI", f"{_snap['ce_oi']:,.0f}", f"{_snap['ce_oi_change']:+,.0f}")
+            m3.metric("PE OI", f"{_snap['pe_oi']:,.0f}", f"{_snap['pe_oi_change']:+,.0f}")
+            m4.metric("PCR (OI)", f"{_snap['pcr']:.3f}" if _snap.get("pcr") else "n/a")
+            _mp, _ = compute_max_pain(_snap.get("strikes") or {})
+            m5.metric("Max Pain", f"{_mp:.0f}" if _mp else "n/a")
+            v1, v2, v3 = st.columns(3)
+            v1.metric("CE Volume", f"{_snap.get('ce_volume', 0):,.0f}", f"{_snap.get('ce_volume_change', 0):+,.0f}")
+            v2.metric("PE Volume", f"{_snap.get('pe_volume', 0):,.0f}", f"{_snap.get('pe_volume_change', 0):+,.0f}")
+            v3.metric("PCR (Volume)", f"{_snap['pcr_volume']:.3f}" if _snap.get("pcr_volume") else "n/a")
+            st.caption(f"Snapshot @ {_snap['fetched_at']} · expiry {_snap.get('expiry')} · refreshes every 60s "
+                       "(Dhan rate-limits the chain endpoint).")
+
+            if strategy == "Multi-Strike OI (ATM ± N Levels)":
+                _band = multi_strike_band(_snap, int(params.get("ms_levels", 3)))
+                if _band:
+                    st.markdown(f"**ATM {_band['atm']:.0f} ± {_band['levels']} levels "
+                                f"({len(_band['band'])} strikes)**")
+                    _rows = []
+                    for s in _band["band"]:
+                        r = _snap["strikes"][s]
+                        _rows.append({
+                            "Strike": s, "CE OI": r["ce_oi"], "ΔCE OI": r["ce_oi_change"],
+                            "CE Vol": r["ce_vol"], "PE OI": r["pe_oi"], "ΔPE OI": r["pe_oi_change"],
+                            "PE Vol": r["pe_vol"],
+                            "Strike PCR": round(r["pe_oi"] / r["ce_oi"], 3) if r["ce_oi"] else None,
+                        })
+                    st.dataframe(pd.DataFrame(_rows), hide_index=True, use_container_width=True)
+
+        if strategy == "PCR Based (Put-Call Ratio)":
+            st.markdown("#### 📈 PCR Tracking Table")
+            st.caption("One row per chain snapshot (newest first). Each metric shows its change from the PREVIOUS "
+                       "reading three ways: absolute, percentage, and n× multiple.")
+            _tbl = build_chain_history_table()
+            if _tbl.empty:
+                st.info("No snapshots recorded yet — the table fills in as the chain refreshes (every 60s).")
+            else:
+                st.dataframe(_tbl, hide_index=True, use_container_width=True)
+                st.download_button("⬇ Download PCR history (CSV)", _tbl.to_csv(index=False).encode(),
+                                   file_name="pcr_history.csv", mime="text/csv")
 
     with st.expander("Selected Configuration"):
         st.json({
