@@ -1928,6 +1928,31 @@ _YF_PERIOD_LADDER = [(1, "1d"), (5, "5d"), (7, "7d"), (31, "1mo"), (92, "3mo"),
                      (183, "6mo"), (366, "1y"), (731, "2y"), (1827, "5y"), (3653, "10y")]
 
 
+def _norm_ts(values):
+    """
+    Normalise any datetime input to naive datetime64[ns].
+
+    pandas 2/3 preserve the source resolution, so candle indexes can arrive as
+    datetime64[s] while timestamps built from Python datetime objects are
+    datetime64[us]. merge_asof requires both keys to have the SAME unit, so
+    every merge key in this module is pushed through here first.
+    """
+    s = pd.to_datetime(pd.Series(values), errors="coerce")
+    try:
+        if getattr(s.dtype, "tz", None) is not None:
+            s = s.dt.tz_convert("Asia/Kolkata").dt.tz_localize(None)
+    except Exception:
+        try:
+            s = s.dt.tz_localize(None)
+        except Exception:
+            pass
+    try:
+        s = s.astype("datetime64[ns]")
+    except Exception:
+        pass
+    return s
+
+
 def _days_to_period_string(days):
     for lim, label in _YF_PERIOD_LADDER:
         if days <= lim:
@@ -1982,7 +2007,8 @@ def _table_master_timeline(uinfo, timeframe, period):
     df = df.dropna(subset=["Close"])
     cutoff = pd.Timestamp(ist_now()).tz_localize(None) - pd.Timedelta(days=eff_days)
     df = df[df.index >= cutoff]
-    out = pd.DataFrame({"Timestamp": df.index, "Spot": pd.to_numeric(df["Close"], errors="coerce").values})
+    out = pd.DataFrame({"Timestamp": _norm_ts(df.index),
+                        "Spot": pd.to_numeric(df["Close"], errors="coerce").values})
     return out, note
 
 
@@ -2013,7 +2039,8 @@ def _futures_timeline(uinfo, timeframe, period):
         df = df.copy(); df.index = idx
         rule = _TF_RULE.get(timeframe, "1min")
         df = df.resample(rule).agg({"Close": "last"}).dropna()
-        return pd.DataFrame({"Timestamp": df.index, "Future": pd.to_numeric(df["Close"], errors="coerce").values})
+        return pd.DataFrame({"Timestamp": _norm_ts(df.index),
+                             "Future": pd.to_numeric(df["Close"], errors="coerce").values})
     except Exception:
         return pd.DataFrame()
 
@@ -2027,7 +2054,8 @@ def _vix_timeline():
         idx = pd.DatetimeIndex(s.index)
         if idx.tz is not None:
             idx = idx.tz_convert("Asia/Kolkata").tz_localize(None)
-        return pd.DataFrame({"Date": idx.normalize(), "VIX": pd.to_numeric(s.values, errors="coerce")})
+        return pd.DataFrame({"Date": _norm_ts(idx).dt.normalize(),
+                             "VIX": pd.to_numeric(s.values, errors="coerce")})
     except Exception:
         return pd.DataFrame()
 
@@ -2079,7 +2107,7 @@ def build_chain_analysis_table(timeframe, period, underlying_label=None, expiry=
         if snaps is None or snaps.empty or "Timestamp" not in snaps.columns:
             return pd.DataFrame(), " ".join(notes) if notes else None
         work = snaps.copy()
-        work["Timestamp"] = pd.to_datetime(work["Timestamp"], errors="coerce")
+        work["Timestamp"] = _norm_ts(work["Timestamp"])
         work = work.dropna(subset=["Timestamp"]).sort_values("Timestamp").set_index("Timestamp")
         res = work.resample(_TF_RULE.get(timeframe, "1min")).last().dropna(how="all").reset_index()
         grid = pd.DataFrame({"Timestamp": res["Timestamp"],
@@ -2091,18 +2119,14 @@ def build_chain_analysis_table(timeframe, period, underlying_label=None, expiry=
         merged = grid.copy()
         if snaps is not None and not snaps.empty and "Timestamp" in snaps.columns:
             sn = snaps.copy()
-            sn["Timestamp"] = pd.to_datetime(sn["Timestamp"], errors="coerce")
-            try:
-                if getattr(sn["Timestamp"].dtype, "tz", None):
-                    sn["Timestamp"] = sn["Timestamp"].dt.tz_localize(None)
-            except Exception:
-                pass
+            sn["Timestamp"] = _norm_ts(sn["Timestamp"])
             sn = sn.dropna(subset=["Timestamp"]).sort_values("Timestamp")
             keep = [c for c in ["Timestamp", "PCR", "Price", "Futures", "CE OI", "PE OI", "Total OI",
                                 "CE ΔOI", "PE ΔOI", "Total Volume", "Max Pain", "ATM Straddle",
                                 "ATM Gamma", "ATM Vega", "ATM Theta", "ATM IV", "VIX"]
                     if c in sn.columns]
             sn = sn[keep].rename(columns={"Futures": "Future_snap", "VIX": "VIX_snap"})
+            merged["Timestamp"] = _norm_ts(merged["Timestamp"])
             merged = pd.merge_asof(merged.sort_values("Timestamp"), sn,
                                    on="Timestamp", direction="backward")
             merged["_has_snap"] = merged["PCR"].notna() if "PCR" in merged.columns else False
@@ -2116,6 +2140,8 @@ def build_chain_analysis_table(timeframe, period, underlying_label=None, expiry=
     # ---- true futures series where available ----
     fut = _futures_timeline(uinfo, timeframe, period)
     if not fut.empty:
+        merged["Timestamp"] = _norm_ts(merged["Timestamp"])
+        fut["Timestamp"] = _norm_ts(fut["Timestamp"])
         merged = pd.merge_asof(merged.sort_values("Timestamp"), fut.sort_values("Timestamp"),
                                on="Timestamp", direction="backward")
         notes.append("Futures values come from real futures candles.")
@@ -2125,7 +2151,8 @@ def build_chain_analysis_table(timeframe, period, underlying_label=None, expiry=
     # ---- VIX by date ----
     vix = _vix_timeline()
     if not vix.empty:
-        merged["Date"] = pd.to_datetime(merged["Timestamp"]).dt.normalize()
+        merged["Date"] = _norm_ts(merged["Timestamp"]).dt.normalize()
+        vix["Date"] = _norm_ts(vix["Date"]).dt.normalize()
         merged = merged.merge(vix, on="Date", how="left").drop(columns=["Date"])
     elif "VIX_snap" in merged.columns:
         merged["VIX"] = merged["VIX_snap"]
@@ -3280,9 +3307,11 @@ def get_vix_aligned(target_index):
     tgt_idx = pd.DatetimeIndex(target_index)
     tgt_naive = tgt_idx.tz_localize(None) if tgt_idx.tz is not None else tgt_idx
 
-    left = pd.DataFrame({"t": tgt_naive})
-    right = pd.DataFrame({"t": vix_clean.index, "vix": vix_clean.values}).sort_values("t")
-    merged = pd.merge_asof(left, right, on="t", direction="backward")
+    # Both keys must share the same datetime unit — candle indexes and the VIX
+    # series can arrive at different resolutions (s vs us vs ns) in pandas 2/3.
+    left = pd.DataFrame({"t": _norm_ts(tgt_naive)})
+    right = pd.DataFrame({"t": _norm_ts(vix_clean.index), "vix": vix_clean.values}).sort_values("t")
+    merged = pd.merge_asof(left.sort_values("t"), right, on="t", direction="backward")
 
     result = pd.Series(merged["vix"].values, index=target_index)
     return result
