@@ -10,6 +10,7 @@ wire in verified credentials — do that only after testing in a sandbox.
 import io
 import json
 import smtplib
+import sqlite3
 import ssl
 import time
 from datetime import datetime, timedelta, date, time as dtime
@@ -1501,10 +1502,12 @@ def _atm_row(snap):
     return atm, snap["strikes"][atm]
 
 
-def record_chain_history(snap):
+def record_chain_history(snap, futures=None, underlying_label=None):
     """Append one row per distinct snapshot (deduped by fetch timestamp). This
     time series is what every plot on the Option Chain Analysis tab draws from,
-    and what the change-vs-previous columns are computed against."""
+    and what the change-vs-previous columns are computed against. A real
+    Timestamp is stored alongside the display string so the history can be
+    resampled into interval buckets or spanned across days from the database."""
     if not snap:
         return
     hist = st.session_state.setdefault("chain_history", [])
@@ -1515,9 +1518,11 @@ def record_chain_history(snap):
     atm, arow = _atm_row(snap)
     hist.append({
         "Time": stamp,
+        "Timestamp": ist_now(),
         "PCR": round(snap["pcr"], 4) if snap.get("pcr") else None,
         "PCR Volume": round(snap["pcr_volume"], 4) if snap.get("pcr_volume") else None,
         "Price": snap.get("underlying"),
+        "Futures": futures,
         "CE OI": snap.get("ce_oi"), "PE OI": snap.get("pe_oi"),
         "Total OI": (snap.get("ce_oi") or 0) + (snap.get("pe_oi") or 0),
         "CE ΔOI": snap.get("ce_oi_change"), "PE ΔOI": snap.get("pe_oi_change"),
@@ -1533,6 +1538,8 @@ def record_chain_history(snap):
     })
     if len(hist) > 1000:
         del hist[:-1000]
+    if underlying_label:
+        db_save_chain_snapshot(snap, underlying_label, futures)
 
 
 def chain_history_df():
@@ -1585,6 +1592,7 @@ def build_chain_history_table():
 # y-axis, so scales that belong together stay directly comparable.
 CHAIN_METRICS = {
     "Price (index/underlying)": ("Price", "price"),
+    "Futures Price": ("Futures", "price"),
     "Max Pain": ("Max Pain", "price"),
     "ATM Strike": ("ATM Strike", "price"),
     "PCR (OI)": ("PCR", "ratio"),
@@ -1613,7 +1621,11 @@ _SERIES_COLORS = ["#4c9be8", "#f0a202", "#38b000", "#e5383b", "#9d4edd",
                   "#00b4d8", "#ff7b00", "#c2185b", "#7cb342"]
 
 
-def chain_plot(hist, metric_labels, title, normalize=None, height=430):
+CHART_TYPES = ["Line", "Area", "Bar (grouped)", "Bar (stacked)", "Scatter",
+               "Line + Markers", "Pie (latest snapshot)"]
+
+
+def chain_plot(hist, metric_labels, title, normalize=None, height=430, chart_type="Line"):
     """
     Multi-metric time-series plot.
 
@@ -1644,6 +1656,24 @@ def chain_plot(hist, metric_labels, title, normalize=None, height=430):
     for i, fam in enumerate(families[:4]):
         fam_axis[fam] = axis_slots[i] if not do_norm else "y"
 
+    # ---- Pie is a snapshot composition, not a time series ----
+    if str(chart_type).startswith("Pie"):
+        labels_p, values_p = [], []
+        for label, col, _fam in cols:
+            s = pd.to_numeric(hist[col], errors="coerce").dropna()
+            if len(s):
+                labels_p.append(label)
+                values_p.append(abs(float(s.iloc[-1])))
+        if not values_p or sum(values_p) == 0:
+            return None, False
+        fig = go.Figure(data=[go.Pie(labels=labels_p, values=values_p, hole=0.35,
+                                     marker=dict(colors=_SERIES_COLORS[:len(values_p)]),
+                                     textinfo="label+percent")])
+        fig.update_layout(title=f"{title} — latest snapshot composition", height=height,
+                          margin=dict(l=30, r=30, t=60, b=30))
+        return fig, False
+
+    _is_bar = str(chart_type).startswith("Bar")
     for i, (label, col, fam) in enumerate(cols):
         raw = pd.to_numeric(hist[col], errors="coerce")
         if do_norm:
@@ -1652,18 +1682,27 @@ def chain_plot(hist, metric_labels, title, normalize=None, height=430):
             plotted = (raw / base * 100.0) if (base and not pd.isna(base) and base != 0) else raw
         else:
             plotted = raw
-        fig.add_trace(go.Scatter(
-            x=x, y=plotted, name=label, mode="lines+markers",
-            line=dict(width=2, color=_SERIES_COLORS[i % len(_SERIES_COLORS)]),
-            marker=dict(size=5),
-            yaxis=fam_axis.get(fam, "y"),
-            customdata=np.stack([raw.values], axis=-1),
-            hovertemplate=f"<b>{label}</b><br>%{{x}}<br>value: %{{customdata[0]:,.4f}}<extra></extra>",
-        ))
+        colr = _SERIES_COLORS[i % len(_SERIES_COLORS)]
+        common = dict(x=x, y=plotted, name=label, yaxis=fam_axis.get(fam, "y"),
+                      customdata=np.stack([raw.values], axis=-1),
+                      hovertemplate=f"<b>{label}</b><br>%{{x}}<br>value: %{{customdata[0]:,.4f}}<extra></extra>")
+        if _is_bar:
+            fig.add_trace(go.Bar(marker=dict(color=colr), **common))
+        elif chart_type == "Scatter":
+            fig.add_trace(go.Scatter(mode="markers", marker=dict(size=8, color=colr), **common))
+        elif chart_type == "Area":
+            fig.add_trace(go.Scatter(mode="lines", fill="tozeroy", line=dict(width=2, color=colr), **common))
+        elif chart_type == "Line":
+            fig.add_trace(go.Scatter(mode="lines", line=dict(width=2, color=colr), **common))
+        else:  # Line + Markers (default look)
+            fig.add_trace(go.Scatter(mode="lines+markers", line=dict(width=2, color=colr),
+                                     marker=dict(size=5), **common))
 
     layout = dict(title=title, height=height, hovermode="x unified",
                   margin=dict(l=60, r=60, t=60, b=40),
                   legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0))
+    if str(chart_type).startswith("Bar"):
+        layout["barmode"] = "stack" if "stacked" in str(chart_type) else "group"
     if do_norm:
         layout["yaxis"] = dict(title="Indexed to 100 at first reading")
     else:
@@ -1937,6 +1976,527 @@ def groq_analyze_chain(api_key, model, snap, hist, extra_instructions="", temper
         return (choices[0].get("message", {}) or {}).get("content", "") or "⚠️ Empty response from Groq."
     except Exception as exc:
         return f"⚠️ Groq request failed: {exc}"
+
+
+# ============================================================================
+# PERSISTENCE (SQLite) — optional, disabled by default
+# ----------------------------------------------------------------------------
+# Without this everything lives in Streamlit session state, which dies when the
+# browser tab is discarded or the machine sleeps — taking an OPEN position with
+# it. With persistence on, the open position, closed trades, chain snapshots
+# and screener runs are written to disk, so a trade that is still running when
+# the session drops is restored on the next start and continues to be managed
+# until a genuine exit (square-off, SL/target, or a signal exit) closes it.
+# ============================================================================
+
+DB_DEFAULT_PATH = "algotrader.db"
+NIFTY50_SYMBOLS = [
+    "RELIANCE", "HDFCBANK", "ICICIBANK", "INFY", "TCS", "ITC", "LT", "SBIN",
+    "BHARTIARTL", "AXISBANK", "KOTAKBANK", "HINDUNILVR", "BAJFINANCE", "ASIANPAINT",
+    "MARUTI", "SUNPHARMA", "TITAN", "ULTRACEMCO", "WIPRO", "NESTLEIND", "ONGC",
+    "NTPC", "POWERGRID", "TATAMOTORS", "TATASTEEL", "JSWSTEEL", "M&M", "HCLTECH",
+    "TECHM", "ADANIENT", "ADANIPORTS", "COALINDIA", "GRASIM", "HINDALCO",
+    "DRREDDY", "CIPLA", "DIVISLAB", "BRITANNIA", "EICHERMOT", "HEROMOTOCO",
+    "BAJAJ-AUTO", "BAJAJFINSV", "INDUSINDBK", "APOLLOHOSP", "TATACONSUM",
+    "SBILIFE", "HDFCLIFE", "BPCL", "UPL", "LTIM",
+]
+
+
+def db_enabled():
+    return bool(st.session_state.app_cfg.get("db_enabled", False))
+
+
+def db_file():
+    return str(st.session_state.app_cfg.get("db_path", DB_DEFAULT_PATH) or DB_DEFAULT_PATH).strip()
+
+
+def db_connect():
+    conn = sqlite3.connect(db_file(), check_same_thread=False, timeout=15)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def db_init():
+    """Create tables if missing. Safe to call repeatedly."""
+    try:
+        with db_connect() as conn:
+            conn.executescript("""
+                CREATE TABLE IF NOT EXISTS open_position (
+                    id INTEGER PRIMARY KEY CHECK (id = 1),
+                    saved_at TEXT, ticker TEXT, strategy TEXT, payload TEXT);
+                CREATE TABLE IF NOT EXISTS trade_history (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    saved_at TEXT, ticker TEXT, strategy TEXT,
+                    entry_time TEXT, exit_time TEXT, direction TEXT,
+                    entry_price REAL, exit_price REAL, points REAL, pnl REAL,
+                    exit_reason TEXT, qty REAL, payload TEXT);
+                CREATE TABLE IF NOT EXISTS chain_snapshots (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ts TEXT, underlying TEXT, expiry TEXT,
+                    spot REAL, futures REAL, pcr REAL, pcr_volume REAL,
+                    ce_oi REAL, pe_oi REAL, ce_oi_change REAL, pe_oi_change REAL,
+                    ce_volume REAL, pe_volume REAL, max_pain REAL,
+                    atm_strike REAL, atm_gamma REAL, atm_straddle REAL, atm_iv REAL,
+                    payload TEXT);
+                CREATE TABLE IF NOT EXISTS screener_runs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ts TEXT, strategy TEXT, interval TEXT, period TEXT,
+                    universe TEXT, results TEXT);
+                CREATE INDEX IF NOT EXISTS idx_chain_lookup
+                    ON chain_snapshots (underlying, expiry, ts);
+            """)
+        return True, None
+    except Exception as exc:
+        return False, str(exc)
+
+
+def db_save_open_position(pos, ticker, strategy):
+    if not (db_enabled() and pos):
+        return
+    try:
+        with db_connect() as conn:
+            conn.execute("INSERT OR REPLACE INTO open_position (id, saved_at, ticker, strategy, payload) "
+                         "VALUES (1, ?, ?, ?, ?)",
+                         (ist_now().isoformat(), ticker, strategy, json.dumps(pos, default=str)))
+    except Exception as exc:
+        st.session_state["db_last_error"] = f"save position: {exc}"
+
+
+def db_clear_open_position():
+    if not db_enabled():
+        return
+    try:
+        with db_connect() as conn:
+            conn.execute("DELETE FROM open_position WHERE id = 1")
+    except Exception as exc:
+        st.session_state["db_last_error"] = f"clear position: {exc}"
+
+
+def db_load_open_position():
+    try:
+        with db_connect() as conn:
+            row = conn.execute("SELECT * FROM open_position WHERE id = 1").fetchone()
+        if not row:
+            return None, None, None
+        pos = json.loads(row["payload"])
+        for k in ("entry_time",):
+            if pos.get(k):
+                try:
+                    pos[k] = pd.to_datetime(pos[k])
+                except Exception:
+                    pass
+        return pos, row["ticker"], row["strategy"]
+    except Exception:
+        return None, None, None
+
+
+def db_save_trade(row, ticker, strategy):
+    if not db_enabled():
+        return
+    try:
+        with db_connect() as conn:
+            conn.execute(
+                "INSERT INTO trade_history (saved_at, ticker, strategy, entry_time, exit_time, direction, "
+                "entry_price, exit_price, points, pnl, exit_reason, qty, payload) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (ist_now().isoformat(), ticker, strategy,
+                 str(row.get("Entry Time")), str(row.get("Exit Time")), row.get("Direction"),
+                 float(row.get("Entry Price") or 0), float(row.get("Exit Price") or 0),
+                 float(row.get("Points") or 0), float(row.get("PnL") or 0),
+                 row.get("Exit Reason"), float(row.get("Qty") or 0),
+                 json.dumps(row, default=str)))
+    except Exception as exc:
+        st.session_state["db_last_error"] = f"save trade: {exc}"
+
+
+def db_load_trades(limit=1000):
+    try:
+        with db_connect() as conn:
+            rows = conn.execute("SELECT payload FROM trade_history ORDER BY id DESC LIMIT ?",
+                                (int(limit),)).fetchall()
+        return [json.loads(r["payload"]) for r in rows][::-1]
+    except Exception:
+        return []
+
+
+def db_save_chain_snapshot(snap, underlying, futures=None):
+    if not (db_enabled() and snap):
+        return
+    try:
+        mp, _p = compute_max_pain(snap.get("strikes") or {})
+        atm, arow = _atm_row(snap)
+        with db_connect() as conn:
+            conn.execute(
+                "INSERT INTO chain_snapshots (ts, underlying, expiry, spot, futures, pcr, pcr_volume, ce_oi, pe_oi, "
+                "ce_oi_change, pe_oi_change, ce_volume, pe_volume, max_pain, atm_strike, atm_gamma, atm_straddle, "
+                "atm_iv, payload) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (ist_now().isoformat(), underlying, snap.get("expiry"),
+                 snap.get("underlying"), futures, snap.get("pcr"), snap.get("pcr_volume"),
+                 snap.get("ce_oi"), snap.get("pe_oi"), snap.get("ce_oi_change"), snap.get("pe_oi_change"),
+                 snap.get("ce_volume"), snap.get("pe_volume"), mp, atm,
+                 max(arow.get("ce_gamma", 0), arow.get("pe_gamma", 0)) if arow else None,
+                 (arow.get("ce_ltp", 0) + arow.get("pe_ltp", 0)) if arow else None,
+                 max(arow.get("ce_iv", 0), arow.get("pe_iv", 0)) if arow else None,
+                 json.dumps({"strikes_count": len(snap.get("strikes") or {})})))
+    except Exception as exc:
+        st.session_state["db_last_error"] = f"save chain: {exc}"
+
+
+def db_load_chain_history(underlying, expiry=None, since_days=None, limit=20000):
+    """Persisted chain snapshots as a DataFrame shaped like the in-memory
+    history, so plots can span days rather than just the current session."""
+    try:
+        q = "SELECT * FROM chain_snapshots WHERE underlying = ?"
+        args = [underlying]
+        if expiry:
+            q += " AND expiry = ?"; args.append(expiry)
+        if since_days:
+            cutoff = (ist_now() - timedelta(days=int(since_days))).isoformat()
+            q += " AND ts >= ?"; args.append(cutoff)
+        q += " ORDER BY ts ASC LIMIT ?"; args.append(int(limit))
+        with db_connect() as conn:
+            rows = [dict(r) for r in conn.execute(q, args).fetchall()]
+        if not rows:
+            return pd.DataFrame()
+        df = pd.DataFrame(rows)
+        out = pd.DataFrame({
+            "Timestamp": pd.to_datetime(df["ts"], errors="coerce"),
+            "PCR": df["pcr"], "PCR Volume": df["pcr_volume"],
+            "Price": df["spot"], "Futures": df["futures"],
+            "CE OI": df["ce_oi"], "PE OI": df["pe_oi"],
+            "Total OI": df["ce_oi"].fillna(0) + df["pe_oi"].fillna(0),
+            "CE ΔOI": df["ce_oi_change"], "PE ΔOI": df["pe_oi_change"],
+            "Net ΔOI (PE−CE)": df["pe_oi_change"].fillna(0) - df["ce_oi_change"].fillna(0),
+            "CE Volume": df["ce_volume"], "PE Volume": df["pe_volume"],
+            "Total Volume": df["ce_volume"].fillna(0) + df["pe_volume"].fillna(0),
+            "Max Pain": df["max_pain"], "ATM Strike": df["atm_strike"],
+            "ATM Gamma": df["atm_gamma"], "ATM Straddle": df["atm_straddle"],
+            "ATM IV": df["atm_iv"],
+        })
+        out["Time"] = out["Timestamp"].dt.strftime("%d-%b %H:%M:%S")
+        return out
+    except Exception:
+        return pd.DataFrame()
+
+
+def db_save_screener_run(results_df, strategy, interval, period, universe):
+    if not (db_enabled() and results_df is not None and not results_df.empty):
+        return
+    try:
+        with db_connect() as conn:
+            conn.execute("INSERT INTO screener_runs (ts, strategy, interval, period, universe, results) "
+                         "VALUES (?,?,?,?,?,?)",
+                         (ist_now().isoformat(), strategy, interval, period, universe,
+                          results_df.to_json(orient="records", date_format="iso")))
+    except Exception as exc:
+        st.session_state["db_last_error"] = f"save screener: {exc}"
+
+
+def db_stats():
+    try:
+        with db_connect() as conn:
+            def cnt(t):
+                try:
+                    return conn.execute(f"SELECT COUNT(*) c FROM {t}").fetchone()["c"]
+                except Exception:
+                    return 0
+            return {"trades": cnt("trade_history"), "chain_snapshots": cnt("chain_snapshots"),
+                    "screener_runs": cnt("screener_runs"), "open_position": cnt("open_position")}
+    except Exception:
+        return {}
+
+
+def db_bootstrap():
+    """Run once per session: initialise the schema, restore any trade that was
+    still open when the previous session ended, and reload closed trades."""
+    if not db_enabled() or st.session_state.get("_db_booted"):
+        return
+    ok, err = db_init()
+    if not ok:
+        st.session_state["db_last_error"] = err
+        return
+    st.session_state["_db_booted"] = True
+    if not st.session_state.get("live_positions"):
+        pos, tkr, strat = db_load_open_position()
+        if pos:
+            st.session_state.live_positions = [pos]
+            st.session_state["db_restored_note"] = (
+                f"Restored an open {pos.get('direction') == 1 and 'LONG' or 'SHORT'} position on {tkr} "
+                f"(entry {pos.get('entry_price')}) that was still running when the last session ended. "
+                "It will keep being managed until a genuine exit closes it.")
+    if not st.session_state.get("live_history"):
+        trades = db_load_trades()
+        if trades:
+            st.session_state.live_history = trades
+
+
+def db_persist_position_state(ticker, strategy):
+    """Mirror the current open position (or its absence) into the database."""
+    if not db_enabled():
+        return
+    pos_list = st.session_state.get("live_positions") or []
+    if pos_list:
+        db_save_open_position(pos_list[0], ticker, strategy)
+    else:
+        db_clear_open_position()
+
+
+# ============================================================================
+# FUTURES PRICE + STOCK-UNDERLYING CHAIN RESOLUTION
+# ============================================================================
+
+@st.cache_data(ttl=60, show_spinner=False)
+def _dhan_future_ltp_cached(security_id, segment, _token_fp):
+    return dhan_get_ltp(security_id, segment)
+
+
+def resolve_chain_underlying(kind, name):
+    """
+    Resolve either an INDEX (from DHAN_INDEX_MAP) or a STOCK symbol into
+    everything the chain/futures APIs need.
+    """
+    if kind == "Index":
+        meta = DHAN_INDEX_MAP.get(name)
+        if not meta:
+            return None
+        return {"label": name, "underlying": meta["underlying"], "security_id": meta["security_id"],
+                "segment": meta["segment"], "exchange": meta["exchange"],
+                "opt_instrument": "OPTIDX", "fut_instrument": "FUTIDX",
+                "yf": TICKER_MAP.get(name)}
+    sym = _yf_symbol_to_plain(name)
+    eq = dhan_lookup_equity(sym, "NSE")
+    if not eq:
+        return None
+    return {"label": sym, "underlying": sym, "security_id": eq["security_id"],
+            "segment": "NSE_EQ", "exchange": "NSE",
+            "opt_instrument": "OPTSTK", "fut_instrument": "FUTSTK",
+            "yf": f"{sym}.NS"}
+
+
+def get_futures_price(uinfo, expiry=None):
+    """Nearest-expiry futures LTP for the underlying (index or stock)."""
+    if not uinfo:
+        return None
+    _, token = _dhan_creds()
+    if not token:
+        return None
+    try:
+        exps = dhan_get_expiries(uinfo["underlying"], uinfo["fut_instrument"], uinfo["exchange"])
+        fexp = expiry if (expiry and expiry in exps) else (exps[0] if exps else None)
+        if not fexp:
+            return None
+        info = dhan_lookup_future(uinfo["underlying"], fexp, uinfo["fut_instrument"], uinfo["exchange"])
+        if not info:
+            return None
+        return _dhan_future_ltp_cached(info["security_id"], f"{uinfo['exchange']}_FNO",
+                                       hash(token) % 10_000_019)
+    except Exception:
+        return None
+
+
+def get_chain_snapshot_for(uinfo, expiry=None):
+    """Chain snapshot for a resolved underlying (index OR stock)."""
+    if not uinfo:
+        return None
+    _, token = _dhan_creds()
+    if not token:
+        return None
+    if not expiry:
+        exps = dhan_get_expiries(uinfo["underlying"], uinfo["opt_instrument"], uinfo["exchange"])
+        expiry = exps[0] if exps else None
+    if not expiry:
+        return None
+    return dhan_get_option_chain(uinfo["security_id"], uinfo["segment"], expiry,
+                                 hash(token) % 10_000_019)
+
+
+# ============================================================================
+# HISTORY AGGREGATION (interval / multi-day analysis)
+# ============================================================================
+
+CHAIN_AGG_CHOICES = [
+    "Current session (every snapshot)",
+    "1 min", "5 min", "15 min", "30 min", "60 min",
+    "Last 7 days", "Last 30 days", "Last 180 days",
+]
+
+_AGG_RULE = {"1 min": "1min", "5 min": "5min", "15 min": "15min",
+             "30 min": "30min", "60 min": "60min"}
+_AGG_DAYS = {"Last 7 days": (7, "1h"), "Last 30 days": (30, "1D"), "Last 180 days": (180, "1D")}
+
+
+def aggregate_chain_history(df, mode, underlying_label=None, expiry=None):
+    """
+    Reshape chain history for the selected analysis window.
+
+    Intraday buckets resample the recorded snapshots; multi-day windows read
+    from the database instead, because in-memory history only covers the
+    current session. Level metrics (OI, PCR, price) take the LAST value in
+    each bucket — the state at the end of the interval — while flow metrics
+    (ΔOI, volume) are SUMMED, since those are per-period quantities.
+    """
+    if mode.startswith("Current"):
+        return df, None
+
+    note = None
+    if mode in _AGG_DAYS:
+        days, rule = _AGG_DAYS[mode]
+        if not db_enabled():
+            return df, ("Multi-day analysis needs the database enabled (Admin Panel → Data Persistence). "
+                        "Showing the current session only — nothing is stored across sessions yet.")
+        dbdf = db_load_chain_history(underlying_label, expiry, since_days=days)
+        if dbdf.empty:
+            return df, (f"No stored snapshots in the last {days} days for this underlying/expiry yet. "
+                        "History accumulates while analysis runs with the database enabled.")
+        df, note = dbdf, f"Loaded {len(dbdf)} stored snapshots from the database covering up to {days} days."
+    else:
+        rule = _AGG_RULE.get(mode)
+        if not rule:
+            return df, None
+
+    if df is None or df.empty or "Timestamp" not in df.columns:
+        return df, note
+    work = df.copy()
+    work["Timestamp"] = pd.to_datetime(work["Timestamp"], errors="coerce")
+    work = work.dropna(subset=["Timestamp"]).set_index("Timestamp").sort_index()
+    if work.empty:
+        return df, note
+
+    last_cols = ["PCR", "PCR Volume", "Price", "Futures", "CE OI", "PE OI", "Total OI",
+                 "Max Pain", "ATM Strike", "ATM Gamma", "ATM Straddle", "ATM IV"]
+    sum_cols = ["CE ΔOI", "PE ΔOI", "Net ΔOI (PE−CE)", "CE Volume", "PE Volume",
+                "Total Volume", "CE ΔVolume", "PE ΔVolume"]
+    agg = {c: "last" for c in last_cols if c in work.columns}
+    agg.update({c: "sum" for c in sum_cols if c in work.columns})
+    if not agg:
+        return df, note
+    out = work.resample(rule).agg(agg).dropna(how="all").reset_index()
+    out["Time"] = out["Timestamp"].dt.strftime("%d-%b %H:%M")
+    # rebuild change columns on the aggregated series
+    for col, short in (("PCR", "PCR"), ("Price", "Price"), ("Total OI", "OI"),
+                       ("Total Volume", "Volume"), ("Max Pain", "MaxPain"), ("ATM Gamma", "Gamma")):
+        if col in out.columns:
+            s = pd.to_numeric(out[col], errors="coerce"); prev = s.shift(1)
+            out[f"Δ{short} (abs)"] = s - prev
+            out[f"Δ{short} (%)"] = (s - prev) / prev.replace(0, np.nan) * 100
+            out[f"Δ{short} (n×)"] = s / prev.replace(0, np.nan)
+    if note is None:
+        note = f"Resampled {len(df)} snapshots into {len(out)} × {mode} buckets."
+    return out, note
+
+
+# ============================================================================
+# SCREENER
+# ============================================================================
+
+def screener_fetch(symbol, interval, period, source):
+    """
+    Fetch candles for one screener symbol.
+
+    yfinance is deliberately defensive here: a screener hits dozens of symbols
+    in a row, which is exactly the pattern that trips Yahoo's rate limiter. Any
+    failure returns an empty frame with a reason instead of raising, so one bad
+    symbol can never abort the whole scan.
+    """
+    yf_symbol = symbol if symbol.endswith((".NS", ".BO")) else f"{symbol}.NS"
+    try:
+        if source == "Dhan":
+            uinfo = resolve_chain_underlying("Stock", symbol)
+            if not uinfo:
+                return pd.DataFrame(), "not found in Dhan scrip master"
+            _, token = _dhan_creds()
+            if not token:
+                return pd.DataFrame(), "no Dhan token"
+            df = _dhan_fetch_candles_cached(uinfo["security_id"], "NSE_EQ", "EQUITY",
+                                            interval, period, hash(token) % 10_000_019)
+            if df is None or df.empty:
+                return pd.DataFrame(), "no Dhan candles"
+            return df, None
+        if source == "yfinance":
+            df = fetch_data_yf(yf_symbol, interval, period)
+        else:  # Auto — honour the app's data-source setting
+            df = fetch_data(yf_symbol, interval, period)
+        if df is None or df.empty:
+            return pd.DataFrame(), "no data returned"
+        return df, None
+    except Exception as exc:
+        return pd.DataFrame(), f"{type(exc).__name__}: {str(exc)[:80]}"
+
+
+def screener_scan(symbols, strategy, params, filters, interval, period,
+                  source="Auto", before_bars=5, progress=None):
+    """
+    Run the sidebar's strategy + filters across a list of symbols and bucket
+    each result by WHEN its signal fired:
+
+      • Just Now    — signal on the most recently CLOSED candle. This is the
+                      bar the live engine would act on right now.
+      • Just Before — signal fired 2..N candles ago: already triggered, still
+                      recent enough to be worth a look, but the move has begun.
+      • Just After  — signal on the last closed candle AND the currently
+                      forming candle has already moved further in the signal's
+                      direction, i.e. early follow-through is confirming it.
+
+    Every symbol is wrapped so a single failure (rate limit, delisting, bad
+    symbol) is recorded and skipped rather than aborting the scan.
+    """
+    rows, errors = [], []
+    total = max(len(symbols), 1)
+    for i, sym in enumerate(symbols):
+        if progress:
+            progress(i / total, sym)
+        df, err = screener_fetch(sym, interval, period, source)
+        if err or df.empty or len(df) < 5:
+            errors.append({"Symbol": sym, "Reason": err or "insufficient candles"})
+            continue
+        try:
+            sig_df = generate_signals(df, strategy, params)
+            sig_df = apply_filters(sig_df, filters, strategy)
+            sig = sig_df["signal"]
+            if len(sig) < 3:
+                errors.append({"Symbol": sym, "Reason": "too few bars after indicators"})
+                continue
+
+            last_closed = int(sig.iloc[-2])
+            window = sig.iloc[max(0, len(sig) - 2 - int(before_bars)):-2]
+            prior = window[window != 0]
+            close_closed = float(sig_df["Close"].iloc[-2])
+            close_now = float(sig_df["Close"].iloc[-1])
+
+            bucket, direction, when, moved = None, None, None, None
+            if last_closed != 0:
+                direction = "LONG" if last_closed == 1 else "SHORT"
+                moved = (close_now - close_closed) * last_closed
+                if moved > 0:
+                    bucket, when = "Just After", "latest closed bar + follow-through"
+                else:
+                    bucket, when = "Just Now", "latest closed bar"
+            elif len(prior):
+                last_idx = prior.index[-1]
+                direction = "LONG" if int(prior.iloc[-1]) == 1 else "SHORT"
+                bars_ago = len(sig) - 1 - sig.index.get_loc(last_idx)
+                bucket, when = "Just Before", f"{bars_ago} bars ago"
+                moved = (close_now - float(sig_df["Close"].loc[last_idx])) * int(prior.iloc[-1])
+
+            if not bucket:
+                continue
+            atr_now = safe_indicator_value(atr(sig_df, 14), 40)[0]
+            rows.append({
+                "Bucket": bucket, "Symbol": sym, "Direction": direction,
+                "Signal When": when,
+                "Signal Price": round(close_closed, 2),
+                "Last Price": round(close_now, 2),
+                "Move Since Signal": round(moved, 2) if moved is not None else None,
+                "Move %": round((moved / close_closed * 100), 2) if (moved is not None and close_closed) else None,
+                "ATR(14)": round(atr_now, 2) if atr_now else None,
+                "Bars": len(sig_df),
+                "Last Candle": str(sig_df.index[-1]),
+            })
+        except Exception as exc:
+            errors.append({"Symbol": sym, "Reason": f"{type(exc).__name__}: {str(exc)[:80]}"})
+    if progress:
+        progress(1.0, "done")
+    return pd.DataFrame(rows), pd.DataFrame(errors)
 
 
 # ---------------------------------------------------------------------------
@@ -4780,6 +5340,11 @@ def render_config_controls(ui, prefix="sb"):
 # ============================================================================
 
 config = render_config_controls(st.sidebar, "sb")
+
+# Restore any trade that was still open when a previous session ended, before
+# any tab renders, so the live engine picks it up and keeps managing it.
+db_bootstrap()
+
 if st.session_state.get("cfg_applied_msg"):
     st.sidebar.success(st.session_state.pop("cfg_applied_msg"))
 
@@ -5417,6 +5982,8 @@ def evaluate_live_signal(ticker, interval, period, strategy, params, filters, sl
                     pos["remaining_qty"] -= book_qty
                     pos["partial_booked"] = True
                     note_trade_event()  # feeds the entry-cooldown gate
+                    db_save_trade(row, ticker, strategy)
+                    db_persist_position_state(ticker, strategy)
                     if full_cfg:
                         res = dispatch_dhan_event(full_cfg, pos["direction"], False, "Partial Book",
                                                   book_qty, pos["original_qty"], hard_price,
@@ -5455,6 +6022,10 @@ def evaluate_live_signal(ticker, interval, period, strategy, params, filters, sl
                 pos["pending_exit_reason"] = sig_reason
 
         pos["current_price"] = ltp
+        if not exited:
+            # Keep the stored copy in step with trailed SL/target levels so a
+            # restored position resumes with the correct risk, not stale levels.
+            db_persist_position_state(ticker, strategy)
         if exited:
             points = (exit_price - pos["entry_price"]) * pos["direction"]
             exit_candle = sig_df.iloc[-1]
@@ -5473,6 +6044,8 @@ def evaluate_live_signal(ticker, interval, period, strategy, params, filters, sl
             st.session_state.live_history.append(row)
             st.session_state.live_positions = []
             note_trade_event()  # feeds the entry-cooldown gate
+            db_save_trade(row, ticker, strategy)
+            db_clear_open_position()
             st.success(f"Position closed: {reason} @ {exit_price:.2f}")
             if full_cfg:
                 # BO-managed Stoploss/Target hits are automatically SKIPPED
@@ -5548,6 +6121,7 @@ def evaluate_live_signal(ticker, interval, period, strategy, params, filters, sl
             st.session_state.live_positions = [new_pos]
             st.session_state.last_acted_signal_marker = signal_marker
             note_trade_event(entered=True)  # feeds max-trades/day + cooldown gates
+            db_persist_position_state(ticker, strategy)   # survives a session drop
             st.success(f"New {'LONG' if last_sig == 1 else 'SHORT'} position opened @ {entry_price:.2f}")
             if full_cfg:
                 res = dispatch_dhan_event(full_cfg, last_sig, True, "Entry", qty, qty, entry_price)
@@ -5782,9 +6356,9 @@ def render_bin_analysis_section(t1, t2, t1_name, t2_name, p1, diff, fetch_interv
 # ============================================================================
 
 (tab_bt, tab_live, tab_hist, tab_heat, tab_opt, tab_spread, tab_ohlc,
- tab_chain, tab_admin) = st.tabs(
+ tab_chain, tab_screen, tab_admin) = st.tabs(
     ["📊 Backtest", "🔴 Live Trading", "📜 Trade History", "🔥 Heatmaps", "🧪 Optimization",
-     "🔀 Spread Tool", "📅 OHLC & Range", "🔗 Option Chain Analysis", "🛠 Admin Panel"]
+     "🔀 Spread Tool", "📅 OHLC & Range", "🔗 Option Chain Analysis", "🔎 Screener", "🛠 Admin Panel"]
 )
 
 # ---------------------------------------------------------------- BACKTEST -
@@ -5913,6 +6487,8 @@ with tab_live:
         st.warning("⚠️ " + st.session_state.dhan_feed_warning)
     if st.session_state.get("dhan_fallback_notice"):
         st.warning("↩️ " + st.session_state.dhan_fallback_notice)
+    if st.session_state.get("db_restored_note"):
+        st.success("💾 " + st.session_state.pop("db_restored_note"))
     if st.session_state.get("live_blocked_reason"):
         st.warning(f"🚧 Last entry was blocked by a risk gate: {st.session_state.live_blocked_reason}")
 
@@ -5963,6 +6539,8 @@ with tab_live:
         st.session_state.live_history.append(_sq_row)
         st.session_state.live_positions = []
         note_trade_event()  # feeds the entry-cooldown gate
+        db_save_trade(_sq_row, ticker, strategy)
+        db_clear_open_position()
         st.warning(f"Manually squared off @ {exit_price:.2f}")
         # Manual square-offs are ALWAYS sent, even with Bracket Orders on
         # (dispatch only skips broker-managed Stoploss/Target hits).
@@ -6410,11 +6988,19 @@ with tab_chain:
                "strategy — pick any underlying and expiry here.")
 
     # ---------------- source + refresh controls (outside the fragment) -----
-    oc1, oc2, oc3 = st.columns([1, 1, 1])
-    oca_under = cfg_selectbox(oc1, "Underlying", "oca_underlying",
-                              list(DHAN_INDEX_MAP.keys()), default="Nifty50")
-    _oca_meta = DHAN_INDEX_MAP[oca_under]
-    _oca_exps = dhan_get_expiries(_oca_meta["underlying"], "OPTIDX", _oca_meta["exchange"])
+    oc0, oc1, oc2, oc3 = st.columns([1, 1.2, 1.2, 1])
+    oca_kind = cfg_selectbox(oc0, "Underlying type", "oca_kind", ["Index", "Stock"], default="Index")
+    if oca_kind == "Index":
+        oca_name = cfg_selectbox(oc1, "Index", "oca_underlying", list(DHAN_INDEX_MAP.keys()), default="Nifty50")
+    else:
+        oca_name = cfg_text(oc1, "Stock symbol (NSE, e.g. RELIANCE)", "oca_stock", "RELIANCE")
+    _uinfo = resolve_chain_underlying(oca_kind, oca_name)
+    oca_under = _uinfo["label"] if _uinfo else str(oca_name)
+    if not _uinfo:
+        st.warning(f"Could not resolve '{oca_name}' in Dhan's scrip master — check the symbol. "
+                   "Stock option chains require the stock to have listed options (F&O stocks only).")
+    _oca_exps = dhan_get_expiries(_uinfo["underlying"], _uinfo["opt_instrument"],
+                                  _uinfo["exchange"]) if _uinfo else []
     if _oca_exps:
         oca_expiry = cfg_selectbox(oc2, "Expiry (nearest pre-selected)", "oca_expiry",
                                    _oca_exps, default=_oca_exps[0])
@@ -6422,8 +7008,15 @@ with tab_chain:
         oca_expiry = cfg_text(oc2, "Expiry (YYYY-MM-DD)", "oca_expiry", "")
     oca_interval = cfg_number(oc3, "Continuous refresh (seconds)", "oca_interval",
                               60, 15, 900, step=15, is_int=True)
-    st.caption("Dhan caches the chain for 60s and rate-limits that endpoint, so intervals below ~60s will mostly "
-               "re-display the same snapshot rather than fetching a new one.")
+
+    od1, od2 = st.columns(2)
+    oca_chart_type = cfg_selectbox(od1, "Chart type", "oca_chart_type", CHART_TYPES, default="Line")
+    oca_agg = cfg_selectbox(od2, "Analysis window", "oca_agg", CHAIN_AGG_CHOICES,
+                            default=CHAIN_AGG_CHOICES[0])
+    st.caption("Dhan caches the chain for 60s and rate-limits that endpoint, so refresh intervals below ~60s mostly "
+               "re-display the same snapshot. **Analysis window**: interval buckets resample what has been recorded "
+               "this session; the multi-day windows read from the database, so they need Data Persistence enabled "
+               "(Admin Panel) and fill out as snapshots accumulate.")
 
     b1, b2, b3, b4 = st.columns(4)
     _once = b1.button("🔍 Analyze Once", use_container_width=True)
@@ -6432,8 +7025,8 @@ with tab_chain:
     _clear = b4.button("🗑 Clear History", use_container_width=True)
 
     if _once:
-        _s = get_chain_snapshot(oca_under, oca_expiry)
-        record_chain_history(_s)
+        _s = get_chain_snapshot_for(_uinfo, oca_expiry)
+        record_chain_history(_s, get_futures_price(_uinfo), oca_under)
         st.session_state.oca_last_run = ist_now().strftime("%H:%M:%S IST")
         if not _s:
             st.warning("No snapshot returned — check the Dhan Access Token and expiry; the chain endpoint only "
@@ -6485,8 +7078,8 @@ with tab_chain:
                                  "groq_auto", False)
         if st.button("🤖 Ask Groq now"):
             with st.spinner("Sending the chain to Groq…"):
-                _snap_g = get_chain_snapshot(oca_under, oca_expiry)
-                record_chain_history(_snap_g)
+                _snap_g = get_chain_snapshot_for(_uinfo, oca_expiry)
+                record_chain_history(_snap_g, get_futures_price(_uinfo), oca_under)
                 st.session_state["groq_last"] = groq_analyze_chain(
                     groq_key, groq_model, _snap_g, chain_history_df(), groq_extra)
                 st.session_state["groq_last_at"] = ist_now().strftime("%H:%M:%S IST")
@@ -6500,9 +7093,13 @@ with tab_chain:
     # ---------------- everything below refreshes on the interval -----------
     @st.fragment(run_every=(int(oca_interval) if _running else None))
     def _chain_analysis_body():
-        snap = get_chain_snapshot(oca_under, oca_expiry)
-        record_chain_history(snap)
-        hist = chain_history_df()
+        snap = get_chain_snapshot_for(_uinfo, oca_expiry)
+        futures_px = get_futures_price(_uinfo)
+        record_chain_history(snap, futures_px, oca_under)
+        hist_raw = chain_history_df()
+        hist, agg_note = aggregate_chain_history(hist_raw, oca_agg, oca_under, oca_expiry)
+        if agg_note:
+            st.caption("🗂 " + agg_note)
 
         if not snap:
             st.warning("Option chain unavailable. Requirements: a valid Dhan Access Token in the sidebar's "
@@ -6520,7 +7117,9 @@ with tab_chain:
             k3.metric("PCR (OI)", f"{snap['pcr']:.3f}" if snap.get("pcr") else "n/a")
             k4.metric("PCR (Vol)", f"{snap['pcr_volume']:.3f}" if snap.get("pcr_volume") else "n/a")
             k5.metric("Max Pain", f"{mp:.0f}" if mp else "n/a")
-            k6.metric("Days to Expiry", days_to_expiry(snap.get("expiry")))
+            k6.metric("Futures", f"{futures_px:,.2f}" if futures_px else "n/a",
+                      f"{futures_px - (snap.get('underlying') or 0):+,.2f} basis" if futures_px and snap.get("underlying") else None)
+            st.caption(f"Days to expiry: {days_to_expiry(snap.get('expiry'))}")
             k1, k2, k3, k4 = st.columns(4)
             k1.metric("CE OI", f"{snap['ce_oi']:,.0f}", f"{snap['ce_oi_change']:+,.0f}")
             k2.metric("PE OI", f"{snap['pe_oi']:,.0f}", f"{snap['pe_oi_change']:+,.0f}")
@@ -6559,6 +7158,54 @@ with tab_chain:
         _norm_arg = None if _norm_mode.startswith("Auto") else (_norm_mode.startswith("Always"))
 
         # ---- preset plots ----
+        # ---- dedicated comparison plots (fixed chart types where the shape
+        # ---- of the data makes one type clearly right) ----
+        FIXED_PLOTS = [
+            ("📊 CE OI vs PE OI", ["CE OI", "PE OI"], "Bar (grouped)",
+             "The two OI walls side by side — which side carries more written positions."),
+            ("📊 Change in CE OI vs Change in PE OI", ["CE ΔOI", "PE ΔOI"], "Bar (grouped)",
+             "Fresh writing this period. Bars make the sign and relative size obvious."),
+            ("📈 PCR vs Spot", ["PCR (OI)", "Price (index/underlying)"], "Line",
+             "Positioning ratio against the cash index/stock."),
+            ("📈 Max Pain vs Spot", ["Max Pain", "Price (index/underlying)"], "Line",
+             "How far price sits from the writers' least-pain strike, and whether the gap is closing."),
+            ("📈 Futures vs PCR", ["Futures Price", "PCR (OI)"], "Line",
+             "Futures lead the cash market; read against PCR this shows whether leverage agrees with positioning."),
+            ("📈 Futures vs Spot", ["Futures Price", "Price (index/underlying)"], "Line",
+             "The basis. A widening premium is bullish carry, a discount is bearish."),
+            ("📉 Futures vs Volume (line)", ["Futures Price", "Total Volume"], "Line",
+             "Is the futures move backed by option-market participation?"),
+            ("📊 Futures vs Volume (bar)", ["Futures Price", "Total Volume"], "Bar (grouped)",
+             "Same pair as bars, where per-bucket volume is easier to compare."),
+            ("📈 Futures vs CE OI vs PE OI", ["Futures Price", "CE OI", "PE OI"], "Line",
+             "Which wall builds as futures move."),
+            ("📊 Futures vs ΔCE OI vs ΔPE OI (bar)", ["Futures Price", "CE ΔOI", "PE ΔOI"], "Bar (grouped)",
+             "Fresh writing on each side against the futures move."),
+            ("📈 Futures vs ΔCE OI vs ΔPE OI (line)", ["Futures Price", "CE ΔOI", "PE ΔOI"], "Line",
+             "Same three series as lines, for reading the trend rather than the per-bucket size."),
+            ("📈 Futures vs Max Pain", ["Futures Price", "Max Pain"], "Line",
+             "Futures against the max-pain magnet — the pull is usually most visible here near expiry."),
+        ]
+        st.markdown("### 🎯 Dedicated comparisons")
+        for _fi, (_ftitle, _fmetrics, _fchart, _fwhy) in enumerate(FIXED_PLOTS):
+            st.markdown(f"#### {_ftitle}")
+            st.caption(_fwhy)
+            _ffig, _fnorm = chain_plot(hist, _fmetrics, _ftitle, normalize=_norm_arg, chart_type=_fchart)
+            if _ffig is None:
+                st.info("Not enough data for this plot yet"
+                        + (" — futures price needs a Dhan token." if "Futures" in " ".join(_fmetrics) else "."))
+            else:
+                st.plotly_chart(_ffig, use_container_width=True, key=f"oca_fixed_{_fi}")
+                _sl, (_v, _s, _vl) = chain_plot_summary(hist, snap, _fmetrics, _fnorm)
+                with st.container(border=True):
+                    st.markdown("**Summary**")
+                    for _x in _sl:
+                        st.markdown(f"- {_x}")
+                    _b = "🟢" if _v == "BUY CE" else ("🔴" if _v == "BUY PE" else "⚪")
+                    st.markdown(f"**Recommendation: {_b} {_v}** _(net score {_s:+d})_")
+            st.divider()
+
+        st.markdown("### 🧭 Composite views")
         PRESETS = [
             ("1️⃣ PCR vs Price",
              ["PCR (OI)", "Price (index/underlying)"],
@@ -6588,7 +7235,8 @@ with tab_chain:
         for _pi, (_title, _metrics, _why) in enumerate(PRESETS):
             st.markdown(f"#### {_title}")
             st.caption(_why)
-            _fig, _was_norm = chain_plot(hist, _metrics, _title, normalize=_norm_arg)
+            _fig, _was_norm = chain_plot(hist, _metrics, _title, normalize=_norm_arg,
+                                         chart_type=oca_chart_type)
             if _fig is None:
                 st.info("Not enough data for this plot yet.")
             else:
@@ -6609,7 +7257,8 @@ with tab_chain:
             st.info("Tick metrics in the '🎛 Custom plot' expander above to build your own chart.")
         else:
             st.caption("Plotting: " + ", ".join(_picked))
-            _cfig, _cnorm = chain_plot(hist, _picked, "Custom metric comparison", normalize=_norm_arg, height=480)
+            _cfig, _cnorm = chain_plot(hist, _picked, "Custom metric comparison", normalize=_norm_arg,
+                                       height=480, chart_type=oca_chart_type)
             if _cfig is None:
                 st.info("No data yet for the selected metrics.")
             else:
@@ -6682,6 +7331,124 @@ with tab_chain:
     _chain_analysis_body()
 
 
+# -------------------------------------------------------------- SCREENER ----
+with tab_screen:
+    st.subheader("🔎 Screener")
+    st.caption("Runs the EXACT configuration selected in the sidebar — strategy, its parameters, timeframe, period, "
+               "entry filters, flip and Trade Direction — across a list of stocks, then groups the hits by how "
+               "recently the signal fired.")
+
+    sc1, sc2, sc3 = st.columns([1.2, 1, 1])
+    scr_universe = cfg_selectbox(sc1, "Universe", "scr_universe",
+                                 ["Nifty 50", "Custom list"], default="Nifty 50")
+    scr_source = cfg_selectbox(sc2, "Data source", "scr_source",
+                               ["Auto (follow Data Source setting)", "yfinance", "Dhan"],
+                               default="Auto (follow Data Source setting)")
+    scr_before = cfg_number(sc3, "'Just Before' window (candles)", "scr_before_bars",
+                            5, 1, 100, is_int=True)
+
+    if scr_universe == "Custom list":
+        scr_custom = cfg_text(st, "Symbols (comma-separated, NSE — e.g. RELIANCE, TCS, INFY)",
+                              "scr_custom", "RELIANCE, TCS, INFY, HDFCBANK, ICICIBANK")
+        _symbols = [s.strip().upper() for s in str(scr_custom).split(",") if s.strip()]
+    else:
+        _symbols = list(NIFTY50_SYMBOLS)
+
+    scr_limit = cfg_number(st, "Maximum symbols to scan (protects against rate limits)", "scr_limit",
+                           50, 1, 500, is_int=True)
+    _symbols = _symbols[:int(scr_limit)]
+
+    _src_label = ("Dhan" if scr_source == "Dhan"
+                  else ("yfinance" if scr_source == "yfinance"
+                        else ("Dhan" if dhan_feed_active() else "yfinance")))
+    st.info(f"Ready to scan **{len(_symbols)}** symbols on **{interval} / {period}** using **{strategy}** "
+            f"via **{_src_label}**."
+            + (f"  ⏱ yfinance enforces a {RATE_LIMIT_DELAY}s pause per symbol, so this will take roughly "
+               f"{len(_symbols) * RATE_LIMIT_DELAY:.0f}–{len(_symbols) * (RATE_LIMIT_DELAY + 0.7):.0f}s. "
+               "Failures are skipped and listed rather than crashing the scan."
+               if _src_label == "yfinance" else "  Dhan has no artificial delay, so this runs quickly."))
+
+    b1, b2 = st.columns([1, 3])
+    _run_scan = b1.button("▶ Run Analysis", type="primary", use_container_width=True)
+
+    if _run_scan:
+        _prog = st.progress(0.0, text="Starting scan…")
+
+        def _cb(frac, sym):
+            _prog.progress(min(max(frac, 0.0), 1.0), text=f"Scanning {sym} … ({int(frac * 100)}%)")
+
+        with st.spinner("Screening…"):
+            _res, _errs = screener_scan(
+                _symbols, strategy, params, filters, interval, period,
+                source=("Dhan" if scr_source == "Dhan" else
+                        ("yfinance" if scr_source == "yfinance" else "Auto")),
+                before_bars=int(scr_before), progress=_cb)
+        _prog.empty()
+        st.session_state["scr_results"] = _res
+        st.session_state["scr_errors"] = _errs
+        st.session_state["scr_run_at"] = ist_now().strftime("%d-%b-%Y %H:%M:%S IST")
+        db_save_screener_run(_res, strategy, interval, period, scr_universe)
+
+    _res = st.session_state.get("scr_results")
+    _errs = st.session_state.get("scr_errors")
+
+    if _res is None:
+        st.info("Press **▶ Run Analysis** to scan. Change the strategy, timeframe, period or filters in the sidebar "
+                "first — the screener uses whatever is configured there.")
+    else:
+        st.caption(f"Last run: {st.session_state.get('scr_run_at', 'n/a')} · {len(_symbols)} symbols requested · "
+                   f"{0 if _res.empty else len(_res)} signals found · "
+                   f"{0 if (_errs is None or _errs.empty) else len(_errs)} skipped")
+
+        st.markdown("""
+**How the three groups are defined**
+- 🟢 **Just Now** — the signal is on the most recently *closed* candle. This is the bar the live engine would act on right now.
+- 🔵 **Just After** — the signal is on that same closed candle **and** the currently forming candle has already moved further in the signal's direction, so early follow-through is confirming it.
+- 🟡 **Just Before** — the signal fired within the previous few candles (your window above). Already triggered and the move has begun, so entry is later than ideal.
+""")
+
+        if _res.empty:
+            st.warning("No symbol produced a signal in any of the three windows with the current configuration. "
+                       "That is a normal outcome for a selective strategy — try a longer 'Just Before' window, a "
+                       "different timeframe, or fewer entry filters.")
+        else:
+            _tot = st.columns(3)
+            for _i, (_bk, _emoji) in enumerate([("Just Now", "🟢"), ("Just After", "🔵"), ("Just Before", "🟡")]):
+                _tot[_i].metric(f"{_emoji} {_bk}", int((_res["Bucket"] == _bk).sum()))
+
+            for _bk, _emoji, _blurb in [
+                ("Just Now", "🟢", "Signal on the latest closed candle — actionable right now."),
+                ("Just After", "🔵", "Signal on the latest closed candle with follow-through already underway."),
+                ("Just Before", "🟡", "Signal fired in the last few candles — the move has already started."),
+            ]:
+                _sub = _res[_res["Bucket"] == _bk].drop(columns=["Bucket"])
+                st.markdown(f"#### {_emoji} {_bk} — {len(_sub)} stock(s)")
+                st.caption(_blurb)
+                if _sub.empty:
+                    st.caption("_None in this group._")
+                else:
+                    _sub = _sub.sort_values("Move %", ascending=False, na_position="last")
+                    st.dataframe(_sub, hide_index=True, use_container_width=True)
+                st.divider()
+
+            st.download_button("⬇ Download screener results (CSV)",
+                               _res.to_csv(index=False).encode(),
+                               file_name=f"screener_{strategy.replace(' ', '_')}_{interval}.csv",
+                               mime="text/csv", key="scr_dl")
+
+        if _errs is not None and not _errs.empty:
+            with st.expander(f"⚠️ {len(_errs)} symbol(s) skipped", expanded=False):
+                st.caption("Common causes: yfinance rate limiting on a long scan, a symbol not listed on the chosen "
+                           "source, or not enough candles for the strategy's indicators to warm up. The scan "
+                           "continues past every one of these rather than aborting.")
+                st.dataframe(_errs, hide_index=True, use_container_width=True)
+
+    if strategy in OPTION_CHAIN_STRATEGIES:
+        st.warning("⚠️ The selected strategy reads a live option chain, which exists per-underlying rather than "
+                   "per-candle. Screening many stocks with it is not meaningful — pick a price-based strategy for "
+                   "the screener, or use the Option Chain Analysis tab for chain work.")
+
+
 # ---------------------------------------------------------------- ADMIN ----
 with tab_admin:
     # READ-ONLY by design. This panel used to render a second, editable copy
@@ -6741,6 +7508,35 @@ with tab_admin:
         st.dataframe(pd.DataFrame(sorted(_g) or [("(none configured)", "")],
                                   columns=["Gate", "Value"]),
                      hide_index=True, use_container_width=True)
+
+    st.markdown("##### 💾 Data Persistence (SQLite)")
+    st.caption("These controls are editable here. They live only in this panel — they are not duplicated in the "
+               "sidebar, so there is exactly one widget per setting and no chance of the two fighting each other.")
+    dp1, dp2 = st.columns([1, 2])
+    _db_on = cfg_checkbox(dp1, "Store all data in a database", "db_enabled", False)
+    _db_path = cfg_text(dp2, "Database file (SQLite)", "db_path", DB_DEFAULT_PATH)
+    if _db_on:
+        _ok, _err = db_init()
+        if not _ok:
+            st.error(f"Could not open the database: {_err}")
+        else:
+            db_bootstrap()
+            _stats = db_stats()
+            s1, s2, s3, s4 = st.columns(4)
+            s1.metric("Closed trades stored", _stats.get("trades", 0))
+            s2.metric("Chain snapshots", _stats.get("chain_snapshots", 0))
+            s3.metric("Screener runs", _stats.get("screener_runs", 0))
+            s4.metric("Open position saved", _stats.get("open_position", 0))
+            st.success("Persistence is ON. The open position, closed trades, option-chain snapshots and screener "
+                       "runs are written to disk. If the session drops while a trade is still running, that trade "
+                       "is restored on the next start and keeps being managed until a genuine exit closes it — "
+                       "instead of vanishing at end of day.")
+            if st.session_state.get("db_last_error"):
+                st.warning(f"Last database error: {st.session_state['db_last_error']}")
+    else:
+        st.info("Persistence is OFF (default): everything lives in memory only, so an open position is lost if the "
+                "browser tab is discarded or the machine sleeps. Enable it to survive restarts and to unlock the "
+                "multi-day analysis windows on the Option Chain tab.")
 
     st.markdown("##### 🏦 Broker / Feed / Notifications")
     st.json({
