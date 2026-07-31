@@ -189,6 +189,7 @@ DHAN_API_BASE = "https://api.dhan.co/v2"
 DHAN_SCRIP_MASTER_URL = "https://images.dhan.co/api-data/api-scrip-master.csv"
 DHAN_DEFAULT_CLIENT_ID = "1104779876"
 EMAIL_DEFAULT_FROM = "srinivas.trml@gmail.com"
+EMAIL_DEFAULT_TO = "srinivasp451@gmail.com"
 
 # Index underlyings Dhan can serve directly (index spot for data, FNO for orders)
 DHAN_INDEX_MAP = {
@@ -1236,6 +1237,8 @@ def dhan_get_option_chain(under_security_id, under_segment, expiry, _token_fp):
                 "pe_iv": _f(pe, "implied_volatility", "impliedVolatility"),
                 "ce_gamma": _f(c_greek, "gamma"), "pe_gamma": _f(p_greek, "gamma"),
                 "ce_delta": _f(c_greek, "delta"), "pe_delta": _f(p_greek, "delta"),
+                "ce_vega": _f(c_greek, "vega"), "pe_vega": _f(p_greek, "vega"),
+                "ce_theta": _f(c_greek, "theta"), "pe_theta": _f(p_greek, "theta"),
             }
             row["ce_oi_change"] = row["ce_oi"] - row["ce_prev_oi"]
             row["pe_oi_change"] = row["pe_oi"] - row["pe_prev_oi"]
@@ -1502,12 +1505,30 @@ def _atm_row(snap):
     return atm, snap["strikes"][atm]
 
 
+@st.cache_data(ttl=300, show_spinner=False)
+def get_current_vix():
+    """Latest India VIX close. VIX only publishes daily, so this is cached for
+    5 minutes — it is context for the chain, not a tick-level input."""
+    try:
+        s = fetch_vix_series("1mo")
+        if s is not None and len(s):
+            return float(s.iloc[-1])
+    except Exception:
+        pass
+    return None
+
+
 def record_chain_history(snap, futures=None, underlying_label=None):
     """Append one row per distinct snapshot (deduped by fetch timestamp). This
     time series is what every plot on the Option Chain Analysis tab draws from,
     and what the change-vs-previous columns are computed against. A real
     Timestamp is stored alongside the display string so the history can be
-    resampled into interval buckets or spanned across days from the database."""
+    resampled into interval buckets or spanned across days from the database.
+
+    Greeks note: CE and PE at the same strike share gamma and vega (put-call
+    parity), so those take the ATM value directly; theta differs between the
+    legs, so the STRADDLE theta (CE + PE) is stored, which is the decay number
+    that actually matters to an ATM straddle buyer."""
     if not snap:
         return
     hist = st.session_state.setdefault("chain_history", [])
@@ -1533,8 +1554,11 @@ def record_chain_history(snap, futures=None, underlying_label=None):
         "Max Pain": mp,
         "ATM Strike": atm,
         "ATM Gamma": max(arow.get("ce_gamma", 0.0), arow.get("pe_gamma", 0.0)) if arow else None,
+        "ATM Vega": max(arow.get("ce_vega", 0.0), arow.get("pe_vega", 0.0)) if arow else None,
+        "ATM Theta": (arow.get("ce_theta", 0.0) + arow.get("pe_theta", 0.0)) if arow else None,
         "ATM Straddle": (arow.get("ce_ltp", 0.0) + arow.get("pe_ltp", 0.0)) if arow else None,
         "ATM IV": max(arow.get("ce_iv", 0.0), arow.get("pe_iv", 0.0)) if arow else None,
+        "VIX": get_current_vix(),
     })
     if len(hist) > 1000:
         del hist[:-1000]
@@ -1608,7 +1632,10 @@ CHAIN_METRICS = {
     "CE Volume": ("CE Volume", "volume"),
     "PE Volume": ("PE Volume", "volume"),
     "ATM Gamma": ("ATM Gamma", "greek"),
+    "ATM Vega": ("ATM Vega", "greek"),
+    "ATM Theta": ("ATM Theta", "greek"),
     "ATM IV": ("ATM IV", "greek"),
+    "India VIX": ("VIX", "greek"),
     "ATM Straddle Premium": ("ATM Straddle", "premium"),
 }
 
@@ -1853,6 +1880,215 @@ def chain_plot_summary(hist, snap, metric_labels, normalized=False):
 
 
 # ---------------------------------------------------------------------------
+# ANALYSIS TABLE (own timeframe/period, selectable + orderable columns)
+# ---------------------------------------------------------------------------
+
+TABLE_TIMEFRAMES = ["1m", "2m", "3m", "5m", "10m", "15m", "30m", "60m", "1h", "4h", "1d", "1wk"]
+TABLE_PERIODS = ["1d", "5d", "7d", "1mo", "3mo", "6mo", "1y", "2y", "3y", "4y", "5y",
+                 "6y", "7y", "8y", "9y", "10y"]
+_TF_RULE = {"1m": "1min", "2m": "2min", "3m": "3min", "5m": "5min", "10m": "10min",
+            "15m": "15min", "30m": "30min", "60m": "60min", "1h": "1h", "4h": "4h",
+            "1d": "1D", "1wk": "1W"}
+_PERIOD_DAYS = {"1d": 1, "5d": 5, "7d": 7, "1mo": 31, "3mo": 92, "6mo": 183, "1y": 366,
+                "2y": 731, "3y": 1096, "4y": 1461, "5y": 1827, "6y": 2192, "7y": 2557,
+                "8y": 2922, "9y": 3287, "10y": 3653}
+
+# display column → source column in the history frame
+TABLE_COLUMN_SOURCE = {
+    "PCR": "PCR", "Spot": "Price", "Future": "Futures",
+    "Total OI": "Total OI", "CE OI": "CE OI", "PE OI": "PE OI",
+    "CE ΔOI": "CE ΔOI", "PE ΔOI": "PE ΔOI",
+    "Volume": "Total Volume", "Max Pain": "Max Pain",
+    "Straddle": "ATM Straddle", "Gamma": "ATM Gamma", "Vega": "ATM Vega",
+    "Theta": "ATM Theta", "IV": "ATM IV", "VIX": "VIX",
+}
+# columns that also get a period-over-period change column
+TABLE_DELTA_OF = ["PCR", "Spot", "Future", "Total OI", "CE OI", "PE OI", "Volume",
+                  "Max Pain", "Straddle", "Gamma", "Vega", "Theta", "IV", "VIX"]
+
+TABLE_ALL_COLUMNS = ["Time"]
+for _c in ["PCR", "Spot", "Future", "Total OI", "CE OI", "PE OI", "CE ΔOI", "PE ΔOI",
+           "Volume", "Max Pain", "Straddle", "Gamma", "Vega", "Theta", "IV", "VIX"]:
+    TABLE_ALL_COLUMNS.append(_c)
+    if _c in TABLE_DELTA_OF:
+        TABLE_ALL_COLUMNS.append(f"Δ {_c}")
+
+TABLE_DEFAULT_COLUMNS = ["Time", "PCR", "Δ PCR", "Spot", "Δ Spot", "Future", "Δ Future",
+                         "Total OI", "CE ΔOI", "PE ΔOI", "Volume", "Max Pain", "Straddle", "IV"]
+
+
+def build_chain_analysis_table(timeframe, period, underlying_label=None, expiry=None):
+    """
+    Build the analysis table at its OWN timeframe and period, independent of
+    anything else on the page.
+
+    Source: the current session's snapshots, or the database when the period
+    reaches beyond today and persistence is enabled (Dhan has no historical
+    option-chain API, so multi-day depth can only come from what this app has
+    recorded). Level metrics take the last value in each bucket; flow metrics
+    (ΔOI, volume) are summed. Each Δ column is that column's change from the
+    PREVIOUS bucket, so the change always matches the chosen timeframe.
+    """
+    days = _PERIOD_DAYS.get(period, 1)
+    src_df = chain_history_df()
+    note = None
+    if days > 1:
+        if db_enabled():
+            dbdf = db_load_chain_history(underlying_label, expiry, since_days=days)
+            if not dbdf.empty:
+                src_df, note = dbdf, f"Loaded {len(dbdf)} stored snapshots covering up to {period}."
+            else:
+                note = (f"No stored snapshots yet for the last {period}. Showing this session only — "
+                        "history builds up as analysis runs with the database enabled.")
+        else:
+            note = ("Periods beyond 1d need Data Persistence enabled (Admin Panel) — Dhan has no historical "
+                    "option-chain API, so multi-day depth comes from what this app has recorded. "
+                    "Showing the current session only.")
+    if src_df is None or src_df.empty:
+        return pd.DataFrame(), note
+
+    work = src_df.copy()
+    if "Timestamp" not in work.columns:
+        return pd.DataFrame(), note
+    work["Timestamp"] = pd.to_datetime(work["Timestamp"], errors="coerce")
+    work = work.dropna(subset=["Timestamp"]).sort_values("Timestamp")
+    cutoff = ist_now() - timedelta(days=days)
+    try:
+        ts = work["Timestamp"]
+        ts_naive = ts.dt.tz_localize(None) if getattr(ts.dtype, "tz", None) else ts
+        work = work[ts_naive >= pd.Timestamp(cutoff).tz_localize(None)]
+    except Exception:
+        pass
+    if work.empty:
+        return pd.DataFrame(), note
+    work = work.set_index("Timestamp")
+
+    rule = _TF_RULE.get(timeframe, "1min")
+    last_cols = [c for c in ["PCR", "Price", "Futures", "Total OI", "CE OI", "PE OI",
+                             "Max Pain", "ATM Straddle", "ATM Gamma", "ATM Vega",
+                             "ATM Theta", "ATM IV", "VIX"] if c in work.columns]
+    sum_cols = [c for c in ["CE ΔOI", "PE ΔOI", "Total Volume"] if c in work.columns]
+    agg = {c: "last" for c in last_cols}
+    agg.update({c: "sum" for c in sum_cols})
+    if not agg:
+        return pd.DataFrame(), note
+    res = work.resample(rule).agg(agg).dropna(how="all")
+    if res.empty:
+        return pd.DataFrame(), note
+    res = res.reset_index()
+
+    out = pd.DataFrame()
+    out["Time"] = res["Timestamp"].dt.strftime("%d-%b %H:%M")
+    for disp, srccol in TABLE_COLUMN_SOURCE.items():
+        out[disp] = pd.to_numeric(res[srccol], errors="coerce") if srccol in res.columns else np.nan
+    for disp in TABLE_DELTA_OF:
+        if disp in out.columns:
+            out[f"Δ {disp}"] = out[disp].diff()
+    out = out[[c for c in TABLE_ALL_COLUMNS if c in out.columns]]
+    return out.iloc[::-1].reset_index(drop=True), note   # newest first
+
+
+def table_plot(table_df, columns, chart_type="Line", height=430, title="Table metrics"):
+    """Plot selected TABLE columns. Because these columns can mix wildly
+    different scales (VIX ~12, OI ~10^7), three or more selected columns are
+    indexed to 100 at the first reading; raw values stay in the tooltip."""
+    cols = [c for c in columns if c in table_df.columns and c != "Time"]
+    if table_df is None or table_df.empty or not cols:
+        return None
+    plot_df = table_df.iloc[::-1].reset_index(drop=True)   # chronological for plotting
+    x = plot_df["Time"] if "Time" in plot_df.columns else plot_df.index
+
+    if str(chart_type).startswith("Pie"):
+        vals, labs = [], []
+        for c in cols:
+            s = pd.to_numeric(plot_df[c], errors="coerce").dropna()
+            if len(s):
+                labs.append(c); vals.append(abs(float(s.iloc[-1])))
+        if not vals or sum(vals) == 0:
+            return None
+        fig = go.Figure(data=[go.Pie(labels=labs, values=vals, hole=0.35,
+                                     marker=dict(colors=_SERIES_COLORS[:len(vals)]),
+                                     textinfo="label+percent")])
+        fig.update_layout(title=f"{title} — latest row composition", height=height)
+        return fig
+
+    do_norm = len(cols) >= 3
+    fig = go.Figure()
+    for i, c in enumerate(cols):
+        raw = pd.to_numeric(plot_df[c], errors="coerce")
+        if do_norm:
+            fv = raw.dropna()
+            base = fv.iloc[0] if len(fv) else np.nan
+            y = (raw / base * 100.0) if (base and not pd.isna(base) and base != 0) else raw
+        else:
+            y = raw
+        colr = _SERIES_COLORS[i % len(_SERIES_COLORS)]
+        common = dict(x=x, y=y, name=c, customdata=np.stack([raw.values], axis=-1),
+                      hovertemplate=f"<b>{c}</b><br>%{{x}}<br>value: %{{customdata[0]:,.4f}}<extra></extra>",
+                      yaxis="y" if (do_norm or i == 0) else "y2")
+        if str(chart_type).startswith("Bar"):
+            fig.add_trace(go.Bar(marker=dict(color=colr), **common))
+        elif chart_type == "Area":
+            fig.add_trace(go.Scatter(mode="lines", fill="tozeroy", line=dict(width=2, color=colr), **common))
+        elif chart_type == "Scatter":
+            fig.add_trace(go.Scatter(mode="markers", marker=dict(size=8, color=colr), **common))
+        else:
+            fig.add_trace(go.Scatter(mode="lines+markers", line=dict(width=2, color=colr),
+                                     marker=dict(size=4), **common))
+    layout = dict(title=title, height=height, hovermode="x unified",
+                  margin=dict(l=60, r=60, t=60, b=40),
+                  legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0))
+    if str(chart_type).startswith("Bar"):
+        layout["barmode"] = "stack" if "stacked" in str(chart_type) else "group"
+    if do_norm:
+        layout["yaxis"] = dict(title="Indexed to 100 at first reading")
+    elif len(cols) == 2:
+        layout["yaxis"] = dict(title=cols[0], side="left")
+        layout["yaxis2"] = dict(title=cols[1], side="right", overlaying="y", showgrid=False)
+    fig.update_layout(**layout)
+    return fig
+
+
+def intraday_slice(hist):
+    """Rows recorded TODAY (IST) — the basis of the intraday section."""
+    if hist is None or hist.empty or "Timestamp" not in hist.columns:
+        return pd.DataFrame()
+    try:
+        ts = pd.to_datetime(hist["Timestamp"], errors="coerce")
+        ts = ts.dt.tz_localize(None) if getattr(ts.dtype, "tz", None) else ts
+        return hist[ts.dt.date == ist_now().date()].copy()
+    except Exception:
+        return hist.copy()
+
+
+def intraday_stats(day_df):
+    """Session-level summary of how positioning has evolved today."""
+    if day_df is None or day_df.empty:
+        return {}
+    def _fl(col):
+        s = pd.to_numeric(day_df.get(col), errors="coerce").dropna() if col in day_df.columns else pd.Series(dtype=float)
+        if s.empty:
+            return None, None, None, None
+        return float(s.iloc[0]), float(s.iloc[-1]), float(s.min()), float(s.max())
+    out = {}
+    for label, col in (("PCR", "PCR"), ("Spot", "Price"), ("Futures", "Futures"),
+                       ("Total OI", "Total OI"), ("Max Pain", "Max Pain"),
+                       ("ATM Straddle", "ATM Straddle"), ("ATM IV", "ATM IV")):
+        o, c, lo, hi = _fl(col)
+        if o is None:
+            continue
+        out[label] = {"open": o, "last": c, "low": lo, "high": hi,
+                      "change": c - o, "change_pct": ((c - o) / o * 100) if o else None}
+    for label, col in (("CE OI built", "CE ΔOI"), ("PE OI built", "PE ΔOI"),
+                       ("Volume", "Total Volume")):
+        if col in day_df.columns:
+            s = pd.to_numeric(day_df[col], errors="coerce").dropna()
+            if len(s):
+                out[label] = {"total": float(s.sum())}
+    return out
+
+
+# ---------------------------------------------------------------------------
 # GROQ AI ANALYSIS
 # ---------------------------------------------------------------------------
 
@@ -2000,6 +2236,19 @@ NIFTY50_SYMBOLS = [
     "BAJAJ-AUTO", "BAJAJFINSV", "INDUSINDBK", "APOLLOHOSP", "TATACONSUM",
     "SBILIFE", "HDFCLIFE", "BPCL", "UPL", "LTIM",
 ]
+
+
+NIFTY_NEXT50_SYMBOLS = [
+    "ADANIGREEN", "ADANIPOWER", "AMBUJACEM", "DMART", "BAJAJHLDNG", "BANKBARODA",
+    "BERGEPAINT", "BEL", "BOSCHLTD", "CANBK", "CHOLAFIN", "COLPAL", "DABUR",
+    "DLF", "GAIL", "GODREJCP", "HAVELLS", "HAL", "ICICIGI", "ICICIPRULI",
+    "IOC", "INDIGO", "NAUKRI", "JINDALSTEL", "JSWENERGY", "LICI", "MARICO",
+    "MOTHERSON", "MUTHOOTFIN", "PIDILITIND", "PFC", "PNB", "RECLTD",
+    "SIEMENS", "SHREECEM", "SHRIRAMFIN", "SRF", "TVSMOTOR", "TATAPOWER",
+    "TORNTPHARM", "TRENT", "UNITDSPR", "VBL", "VEDL", "ZOMATO", "ZYDUSLIFE",
+    "ABB", "IRFC", "JIOFIN", "POLYCAB",
+]
+NIFTY100_SYMBOLS = NIFTY50_SYMBOLS + NIFTY_NEXT50_SYMBOLS
 
 
 def db_enabled():
@@ -5307,16 +5556,16 @@ def render_config_controls(ui, prefix="sb"):
     ui.markdown("### 📧 Email Notifications")
     email_enabled = cfg_checkbox(ui, "Send Email Notification", "email_enabled", False, prefix=prefix)
     email_from = str(store.get("email_from", EMAIL_DEFAULT_FROM) or EMAIL_DEFAULT_FROM)
-    email_to, email_app_password = "", ""
+    email_to, email_app_password = EMAIL_DEFAULT_TO, ""
     if email_enabled:
         email_from = cfg_text(ui, "From (Gmail address)", "email_from", EMAIL_DEFAULT_FROM, prefix=prefix)
-        email_to = cfg_text(ui, "To (comma-separated)", "email_to", "", prefix=prefix)
+        email_to = cfg_text(ui, "To (comma-separated)", "email_to", EMAIL_DEFAULT_TO, prefix=prefix)
         email_app_password = cfg_text(ui, "Gmail App Password", "email_app_password", "", type="password", prefix=prefix)
         ui.caption("Emails via Gmail SMTP (SSL 465) on entry, exit, partial book, and manual square-off — containing "
                    "strategy/entry/SL/target/exit reason/points/PnL. A mail failure never blocks trading, it only "
                    "shows a warning.")
     else:
-        email_to = str(store.get("email_to", "") or "")
+        email_to = str(store.get("email_to", EMAIL_DEFAULT_TO) or EMAIL_DEFAULT_TO)
         email_app_password = str(store.get("email_app_password", "") or "")
 
     return dict(
@@ -7009,14 +7258,8 @@ with tab_chain:
     oca_interval = cfg_number(oc3, "Continuous refresh (seconds)", "oca_interval",
                               60, 15, 900, step=15, is_int=True)
 
-    od1, od2 = st.columns(2)
-    oca_chart_type = cfg_selectbox(od1, "Chart type", "oca_chart_type", CHART_TYPES, default="Line")
-    oca_agg = cfg_selectbox(od2, "Analysis window", "oca_agg", CHAIN_AGG_CHOICES,
-                            default=CHAIN_AGG_CHOICES[0])
-    st.caption("Dhan caches the chain for 60s and rate-limits that endpoint, so refresh intervals below ~60s mostly "
-               "re-display the same snapshot. **Analysis window**: interval buckets resample what has been recorded "
-               "this session; the multi-day windows read from the database, so they need Data Persistence enabled "
-               "(Admin Panel) and fill out as snapshots accumulate.")
+    st.caption("Dhan caches the chain for 60s and rate-limits that endpoint, so refresh intervals below ~60s will "
+               "mostly re-display the same snapshot rather than fetching a new one.")
 
     b1, b2, b3, b4 = st.columns(4)
     _once = b1.button("🔍 Analyze Once", use_container_width=True)
@@ -7096,10 +7339,7 @@ with tab_chain:
         snap = get_chain_snapshot_for(_uinfo, oca_expiry)
         futures_px = get_futures_price(_uinfo)
         record_chain_history(snap, futures_px, oca_under)
-        hist_raw = chain_history_df()
-        hist, agg_note = aggregate_chain_history(hist_raw, oca_agg, oca_under, oca_expiry)
-        if agg_note:
-            st.caption("🗂 " + agg_note)
+        hist = chain_history_df()
 
         if not snap:
             st.warning("Option chain unavailable. Requirements: a valid Dhan Access Token in the sidebar's "
@@ -7205,6 +7445,118 @@ with tab_chain:
                     st.markdown(f"**Recommendation: {_b} {_v}** _(net score {_s:+d})_")
             st.divider()
 
+        # ================= INTRADAY ANALYSIS =================
+        st.markdown("### 📉 Intraday Analysis")
+        st.caption("Today's session only (IST). Shows how positioning has evolved since the open, independent of any "
+                   "longer history held in the database.")
+        _day = intraday_slice(hist)
+        if _day.empty or len(_day) < 1:
+            st.info("No snapshots recorded today yet — run the analysis and this section fills in through the session.")
+        else:
+            _stats = intraday_stats(_day)
+            _order = ["Spot", "Futures", "PCR", "Max Pain", "ATM Straddle", "ATM IV"]
+            _shown = [k for k in _order if k in _stats]
+            if _shown:
+                _cols = st.columns(len(_shown))
+                for _i, _k in enumerate(_shown):
+                    _v = _stats[_k]
+                    _delta = (f"{_v['change']:+,.2f}"
+                              + (f" ({_v['change_pct']:+.2f}%)" if _v.get("change_pct") is not None else ""))
+                    _cols[_i].metric(_k, f"{_v['last']:,.2f}", _delta)
+            _b = []
+            for _k in ("CE OI built", "PE OI built", "Volume"):
+                if _k in _stats:
+                    _b.append(f"{_k}: {_stats[_k]['total']:+,.0f}")
+            for _k in ("Spot", "PCR"):
+                if _k in _stats:
+                    _b.append(f"{_k} range {_stats[_k]['low']:,.2f}–{_stats[_k]['high']:,.2f}")
+            if _b:
+                st.caption("Session totals — " + " · ".join(_b))
+
+            _iL, _iR = st.columns(2)
+            _if1, _ = chain_plot(_day, ["PCR (OI)", "Price (index/underlying)", "Futures Price"],
+                                 "Intraday — PCR vs Spot vs Futures")
+            if _if1:
+                _iL.plotly_chart(_if1, use_container_width=True, key="oca_intraday_1")
+            _if2, _ = chain_plot(_day, ["Change in CE OI", "Change in PE OI"],
+                                 "Intraday — OI built by side", chart_type="Bar (grouped)")
+            if _if2:
+                _iR.plotly_chart(_if2, use_container_width=True, key="oca_intraday_2")
+            _if3, _ = chain_plot(_day, ["Max Pain", "Price (index/underlying)"],
+                                 "Intraday — Max Pain vs Spot")
+            if _if3:
+                st.plotly_chart(_if3, use_container_width=True, key="oca_intraday_3")
+
+            _iv, _is, _ivl = chain_recommendation(_day, snap)
+            _ibadge = "🟢" if _iv == "BUY CE" else ("🔴" if _iv == "BUY PE" else "⚪")
+            with st.container(border=True):
+                st.markdown(f"**Intraday read: {_ibadge} {_iv}** _(net score {_is:+d}, computed on today's rows only)_")
+                for _l in _ivl:
+                    st.markdown(f"- {_l}")
+        st.divider()
+
+        # ================= ANALYSIS TABLE =================
+        st.markdown("### 🧮 Analysis Table")
+        _tt1, _tt2 = st.columns(2)
+        _tf = cfg_selectbox(_tt1, "Table timeframe", "oca_tbl_tf", TABLE_TIMEFRAMES, default="1m")
+        _tp = cfg_selectbox(_tt2, "Table period", "oca_tbl_period", TABLE_PERIODS, default="1d")
+        st.caption("This table has its OWN timeframe and period, independent of the sidebar and of the plots above. "
+                   "Each Δ column is the change from the previous bucket, so it always matches the timeframe chosen "
+                   "here. Level metrics take each bucket's last value; ΔOI and volume are summed across the bucket.")
+
+        _tbl, _tnote = build_chain_analysis_table(_tf, _tp, oca_under, oca_expiry)
+        if _tnote:
+            st.caption("🗂 " + _tnote)
+
+        with st.expander("🧱 Columns — tick to include, then drag to reorder", expanded=False):
+            _tc = st.columns(4)
+            _chosen = []
+            for _ci, _col in enumerate(TABLE_ALL_COLUMNS):
+                _dflt = _col in TABLE_DEFAULT_COLUMNS
+                if cfg_checkbox(_tc[_ci % 4], _col, f"oca_tc_{_ci}", _dflt):
+                    _chosen.append(_col)
+            _ordered = cfg_multiselect(st, "Column order (selection order = display order; "
+                                           "anything ticked but not listed is appended)",
+                                       "oca_tbl_order", _chosen, default=[])
+            _final_cols = [c for c in _ordered if c in _chosen] + [c for c in _chosen if c not in _ordered]
+            st.session_state["oca_tbl_cols"] = _final_cols
+
+        _final_cols = st.session_state.get("oca_tbl_cols", TABLE_DEFAULT_COLUMNS)
+        if _tbl.empty:
+            st.info("No data for this timeframe/period yet.")
+        else:
+            _show = [c for c in _final_cols if c in _tbl.columns] or [c for c in TABLE_DEFAULT_COLUMNS if c in _tbl.columns]
+            _disp = _tbl[_show].copy()
+            for _c in _disp.columns:
+                if _disp[_c].dtype.kind == "f":
+                    _disp[_c] = _disp[_c].round(4)
+            st.dataframe(_disp, hide_index=True, use_container_width=True, height=420)
+            st.download_button("⬇ Download analysis table (CSV)", _disp.to_csv(index=False).encode(),
+                               file_name=f"chain_analysis_{oca_under}_{_tf}_{_tp}.csv",
+                               mime="text/csv", key="oca_dl_tbl")
+
+            st.markdown("##### 📈 Plot from the table")
+            _pc1, _pc2 = st.columns([1, 2])
+            _tbl_chart = cfg_selectbox(_pc1, "Chart type", "oca_tbl_chart", CHART_TYPES, default="Line")
+            _plot_default = [c for c in ("PCR", "Spot") if c in _show]
+            _tbl_plot_cols = cfg_multiselect(_pc2, "Columns to plot (from the table above)",
+                                             "oca_tbl_plot_cols",
+                                             [c for c in _show if c != "Time"], default=_plot_default)
+            if not _tbl_plot_cols:
+                st.info("Pick one or more columns to plot.")
+            else:
+                _tfig = table_plot(_tbl, _tbl_plot_cols, _tbl_chart,
+                                   title=f"Table metrics — {_tf} / {_tp}")
+                if _tfig is None:
+                    st.info("Nothing plottable in the current selection.")
+                else:
+                    st.plotly_chart(_tfig, use_container_width=True, key="oca_tbl_plot")
+                    if len(_tbl_plot_cols) >= 3:
+                        st.caption("_Three or more columns selected, so series are indexed to 100 at the first "
+                                   "reading (their raw scales differ too much to share an axis). Hover for true "
+                                   "values._")
+        st.divider()
+
         st.markdown("### 🧭 Composite views")
         PRESETS = [
             ("1️⃣ PCR vs Price",
@@ -7235,8 +7587,7 @@ with tab_chain:
         for _pi, (_title, _metrics, _why) in enumerate(PRESETS):
             st.markdown(f"#### {_title}")
             st.caption(_why)
-            _fig, _was_norm = chain_plot(hist, _metrics, _title, normalize=_norm_arg,
-                                         chart_type=oca_chart_type)
+            _fig, _was_norm = chain_plot(hist, _metrics, _title, normalize=_norm_arg)
             if _fig is None:
                 st.info("Not enough data for this plot yet.")
             else:
@@ -7257,8 +7608,7 @@ with tab_chain:
             st.info("Tick metrics in the '🎛 Custom plot' expander above to build your own chart.")
         else:
             st.caption("Plotting: " + ", ".join(_picked))
-            _cfig, _cnorm = chain_plot(hist, _picked, "Custom metric comparison", normalize=_norm_arg,
-                                       height=480, chart_type=oca_chart_type)
+            _cfig, _cnorm = chain_plot(hist, _picked, "Custom metric comparison", normalize=_norm_arg, height=480)
             if _cfig is None:
                 st.info("No data yet for the selected metrics.")
             else:
@@ -7340,7 +7690,7 @@ with tab_screen:
 
     sc1, sc2, sc3 = st.columns([1.2, 1, 1])
     scr_universe = cfg_selectbox(sc1, "Universe", "scr_universe",
-                                 ["Nifty 50", "Custom list"], default="Nifty 50")
+                                 ["Nifty 50", "Nifty 100", "Custom list"], default="Nifty 50")
     scr_source = cfg_selectbox(sc2, "Data source", "scr_source",
                                ["Auto (follow Data Source setting)", "yfinance", "Dhan"],
                                default="Auto (follow Data Source setting)")
@@ -7351,11 +7701,16 @@ with tab_screen:
         scr_custom = cfg_text(st, "Symbols (comma-separated, NSE — e.g. RELIANCE, TCS, INFY)",
                               "scr_custom", "RELIANCE, TCS, INFY, HDFCBANK, ICICIBANK")
         _symbols = [s.strip().upper() for s in str(scr_custom).split(",") if s.strip()]
+    elif scr_universe == "Nifty 100":
+        _symbols = list(NIFTY100_SYMBOLS)
     else:
         _symbols = list(NIFTY50_SYMBOLS)
 
     scr_limit = cfg_number(st, "Maximum symbols to scan (protects against rate limits)", "scr_limit",
-                           50, 1, 500, is_int=True)
+                           100, 1, 500, is_int=True)
+    if len(_symbols) > int(scr_limit):
+        st.caption(f"⚠️ {len(_symbols)} symbols in the universe but the cap is {int(scr_limit)} — "
+                   "raise the cap to scan them all.")
     _symbols = _symbols[:int(scr_limit)]
 
     _src_label = ("Dhan" if scr_source == "Dhan"
