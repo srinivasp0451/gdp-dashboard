@@ -1917,75 +1917,246 @@ TABLE_DEFAULT_COLUMNS = ["Time", "PCR", "Δ PCR", "Spot", "Δ Spot", "Future", "
                          "Total OI", "CE ΔOI", "PE ΔOI", "Volume", "Max Pain", "Straddle", "IV"]
 
 
-def build_chain_analysis_table(timeframe, period, underlying_label=None, expiry=None):
-    """
-    Build the analysis table at its OWN timeframe and period, independent of
-    anything else on the page.
+# yfinance history limits by interval: 1m ≈ 7 days, other intraday ≈ 60 days,
+# daily is effectively unlimited. The table fetches at a base interval within
+# those limits and resamples up to the requested timeframe.
+_TF_BASE_INTERVAL = {"1m": "1m", "2m": "2m", "3m": "1m", "5m": "5m", "10m": "5m",
+                     "15m": "15m", "30m": "30m", "60m": "60m", "1h": "60m",
+                     "4h": "60m", "1d": "1d", "1wk": "1d"}
+_BASE_LIMIT_DAYS = {"1m": 7, "2m": 60, "5m": 60, "15m": 60, "30m": 60, "60m": 60, "1d": 3650}
+_YF_PERIOD_LADDER = [(1, "1d"), (5, "5d"), (7, "7d"), (31, "1mo"), (92, "3mo"),
+                     (183, "6mo"), (366, "1y"), (731, "2y"), (1827, "5y"), (3653, "10y")]
 
-    Source: the current session's snapshots, or the database when the period
-    reaches beyond today and persistence is enabled (Dhan has no historical
-    option-chain API, so multi-day depth can only come from what this app has
-    recorded). Level metrics take the last value in each bucket; flow metrics
-    (ΔOI, volume) are summed. Each Δ column is that column's change from the
-    PREVIOUS bucket, so the change always matches the chosen timeframe.
+
+def _days_to_period_string(days):
+    for lim, label in _YF_PERIOD_LADDER:
+        if days <= lim:
+            return label
+    return "10y"
+
+
+def _table_master_timeline(uinfo, timeframe, period):
+    """
+    Build the table's TIME AXIS from real candles rather than from recorded
+    snapshots.
+
+    This is the fix for a sparse table: chain snapshots only exist for the
+    minutes analysis actually ran, so a snapshot-driven table shows a handful
+    of rows. Candles exist for every traded minute, already exclude weekends,
+    holidays and pre/post-market, and give a genuine Spot series — so the
+    candle index becomes the spine, and chain values are attached to it.
+    Returns (DataFrame indexed by Timestamp with a Spot column, note).
+    """
+    if not uinfo or not uinfo.get("yf"):
+        return pd.DataFrame(), "No underlying resolved, so no market timeline could be built."
+    base = _TF_BASE_INTERVAL.get(timeframe, "1m")
+    want_days = _PERIOD_DAYS.get(period, 1)
+    limit = _BASE_LIMIT_DAYS.get(base, 60)
+    eff_days = min(want_days, limit)
+    note = None
+    if eff_days < want_days:
+        note = (f"{timeframe} candles are only available for about {limit} days, so the timeline covers the last "
+                f"{eff_days} days rather than {period}. Use a larger timeframe for longer history.")
+    try:
+        raw = fetch_data(uinfo["yf"], base, _days_to_period_string(eff_days))
+    except Exception as exc:
+        return pd.DataFrame(), f"Could not load candles for the timeline: {exc}"
+    if raw is None or raw.empty:
+        return pd.DataFrame(), "No candles returned for the timeline (check the data source and market hours)."
+
+    df = raw.copy()
+    try:
+        idx = pd.DatetimeIndex(df.index)
+        if idx.tz is not None:
+            idx = idx.tz_convert("Asia/Kolkata").tz_localize(None)
+        df.index = idx
+    except Exception:
+        pass
+    rule = _TF_RULE.get(timeframe, "1min")
+    if rule not in ("1min",) or base != "1m":
+        try:
+            df = df.resample(rule).agg({"Open": "first", "High": "max", "Low": "min",
+                                        "Close": "last", "Volume": "sum"}).dropna(how="all")
+        except Exception:
+            pass
+    df = df.dropna(subset=["Close"])
+    cutoff = pd.Timestamp(ist_now()).tz_localize(None) - pd.Timedelta(days=eff_days)
+    df = df[df.index >= cutoff]
+    out = pd.DataFrame({"Timestamp": df.index, "Spot": pd.to_numeric(df["Close"], errors="coerce").values})
+    return out, note
+
+
+def _futures_timeline(uinfo, timeframe, period):
+    """True futures candles for the same timeline, when Dhan can serve them."""
+    if not uinfo:
+        return pd.DataFrame()
+    _, token = _dhan_creds()
+    if not token:
+        return pd.DataFrame()
+    try:
+        exps = dhan_get_expiries(uinfo["underlying"], uinfo["fut_instrument"], uinfo["exchange"])
+        if not exps:
+            return pd.DataFrame()
+        info = dhan_lookup_future(uinfo["underlying"], exps[0], uinfo["fut_instrument"], uinfo["exchange"])
+        if not info:
+            return pd.DataFrame()
+        base = _TF_BASE_INTERVAL.get(timeframe, "1m")
+        base = base if base in DHAN_INTERVAL_CODE or base == "1d" else "5m"
+        days = min(_PERIOD_DAYS.get(period, 1), _BASE_LIMIT_DAYS.get(base, 60))
+        df = _dhan_fetch_candles_cached(info["security_id"], f"{uinfo['exchange']}_FNO", "FUTIDX",
+                                        base, _days_to_period_string(days), hash(token) % 10_000_019)
+        if df is None or df.empty:
+            return pd.DataFrame()
+        idx = pd.DatetimeIndex(df.index)
+        if idx.tz is not None:
+            idx = idx.tz_convert("Asia/Kolkata").tz_localize(None)
+        df = df.copy(); df.index = idx
+        rule = _TF_RULE.get(timeframe, "1min")
+        df = df.resample(rule).agg({"Close": "last"}).dropna()
+        return pd.DataFrame({"Timestamp": df.index, "Future": pd.to_numeric(df["Close"], errors="coerce").values})
+    except Exception:
+        return pd.DataFrame()
+
+
+def _vix_timeline():
+    """India VIX publishes daily, so it is mapped onto the grid by date."""
+    try:
+        s = fetch_vix_series("1y")
+        if s is None or not len(s):
+            return pd.DataFrame()
+        idx = pd.DatetimeIndex(s.index)
+        if idx.tz is not None:
+            idx = idx.tz_convert("Asia/Kolkata").tz_localize(None)
+        return pd.DataFrame({"Date": idx.normalize(), "VIX": pd.to_numeric(s.values, errors="coerce")})
+    except Exception:
+        return pd.DataFrame()
+
+
+def build_chain_analysis_table(timeframe, period, underlying_label=None, expiry=None,
+                               uinfo=None, carry_forward=True):
+    """
+    Build the analysis table at its OWN timeframe and period.
+
+    The row grid comes from real market candles, so a 1m/5d table has a row for
+    every traded minute (09:15–15:30, trading days only) rather than only the
+    minutes a chain snapshot happened to be taken. Spot — and futures where
+    Dhan can serve them — are true per-bucket values from those candles.
+
+    Chain metrics (PCR, OI, max pain, straddle, greeks) are attached with a
+    backward as-of join: each row carries the most recent snapshot at or before
+    that time. That is the correct treatment because every one of these is a
+    LEVEL or a cumulative day-to-date figure — Dhan's OI change is measured
+    against the previous day's close, and chain volume is the day's running
+    total — so carrying the last known value forward is accurate rather than
+    invented, and the per-bucket Δ columns then fall out correctly. Rows before
+    the first snapshot stay blank, and the caller is told how many rows carry a
+    real snapshot versus a carried one.
     """
     days = _PERIOD_DAYS.get(period, 1)
-    src_df = chain_history_df()
-    note = None
+    notes = []
+
+    # ---- chain snapshots (session, or database for multi-day) ----
+    snaps = chain_history_df()
     if days > 1:
         if db_enabled():
             dbdf = db_load_chain_history(underlying_label, expiry, since_days=days)
             if not dbdf.empty:
-                src_df, note = dbdf, f"Loaded {len(dbdf)} stored snapshots covering up to {period}."
+                snaps = dbdf
+                notes.append(f"{len(dbdf)} stored snapshots loaded from the database.")
             else:
-                note = (f"No stored snapshots yet for the last {period}. Showing this session only — "
-                        "history builds up as analysis runs with the database enabled.")
+                notes.append(f"No stored snapshots yet for the last {period}; using this session only.")
         else:
-            note = ("Periods beyond 1d need Data Persistence enabled (Admin Panel) — Dhan has no historical "
-                    "option-chain API, so multi-day depth comes from what this app has recorded. "
-                    "Showing the current session only.")
-    if src_df is None or src_df.empty:
-        return pd.DataFrame(), note
+            notes.append("Periods beyond 1d need Data Persistence enabled (Admin Panel) for chain history — "
+                         "Dhan has no historical option-chain API. Spot and futures still cover the full period.")
 
-    work = src_df.copy()
-    if "Timestamp" not in work.columns:
-        return pd.DataFrame(), note
-    work["Timestamp"] = pd.to_datetime(work["Timestamp"], errors="coerce")
-    work = work.dropna(subset=["Timestamp"]).sort_values("Timestamp")
-    cutoff = ist_now() - timedelta(days=days)
-    try:
-        ts = work["Timestamp"]
-        ts_naive = ts.dt.tz_localize(None) if getattr(ts.dtype, "tz", None) else ts
-        work = work[ts_naive >= pd.Timestamp(cutoff).tz_localize(None)]
-    except Exception:
-        pass
-    if work.empty:
-        return pd.DataFrame(), note
-    work = work.set_index("Timestamp")
+    # ---- master timeline from candles ----
+    grid, gnote = _table_master_timeline(uinfo, timeframe, period)
+    if gnote:
+        notes.append(gnote)
 
-    rule = _TF_RULE.get(timeframe, "1min")
-    last_cols = [c for c in ["PCR", "Price", "Futures", "Total OI", "CE OI", "PE OI",
-                             "Max Pain", "ATM Straddle", "ATM Gamma", "ATM Vega",
-                             "ATM Theta", "ATM IV", "VIX"] if c in work.columns]
-    sum_cols = [c for c in ["CE ΔOI", "PE ΔOI", "Total Volume"] if c in work.columns]
-    agg = {c: "last" for c in last_cols}
-    agg.update({c: "sum" for c in sum_cols})
-    if not agg:
-        return pd.DataFrame(), note
-    res = work.resample(rule).agg(agg).dropna(how="all")
-    if res.empty:
-        return pd.DataFrame(), note
-    res = res.reset_index()
+    if grid.empty:
+        # No candles: fall back to the old snapshot-only behaviour.
+        if snaps is None or snaps.empty or "Timestamp" not in snaps.columns:
+            return pd.DataFrame(), " ".join(notes) if notes else None
+        work = snaps.copy()
+        work["Timestamp"] = pd.to_datetime(work["Timestamp"], errors="coerce")
+        work = work.dropna(subset=["Timestamp"]).sort_values("Timestamp").set_index("Timestamp")
+        res = work.resample(_TF_RULE.get(timeframe, "1min")).last().dropna(how="all").reset_index()
+        grid = pd.DataFrame({"Timestamp": res["Timestamp"],
+                             "Spot": pd.to_numeric(res.get("Price"), errors="coerce")})
+        notes.append("Falling back to snapshot times because no candles were available for the timeline.")
+        merged = res.rename(columns={"Price": "Spot"})
+        merged["Timestamp"] = grid["Timestamp"]
+    else:
+        merged = grid.copy()
+        if snaps is not None and not snaps.empty and "Timestamp" in snaps.columns:
+            sn = snaps.copy()
+            sn["Timestamp"] = pd.to_datetime(sn["Timestamp"], errors="coerce")
+            try:
+                if getattr(sn["Timestamp"].dtype, "tz", None):
+                    sn["Timestamp"] = sn["Timestamp"].dt.tz_localize(None)
+            except Exception:
+                pass
+            sn = sn.dropna(subset=["Timestamp"]).sort_values("Timestamp")
+            keep = [c for c in ["Timestamp", "PCR", "Price", "Futures", "CE OI", "PE OI", "Total OI",
+                                "CE ΔOI", "PE ΔOI", "Total Volume", "Max Pain", "ATM Straddle",
+                                "ATM Gamma", "ATM Vega", "ATM Theta", "ATM IV", "VIX"]
+                    if c in sn.columns]
+            sn = sn[keep].rename(columns={"Futures": "Future_snap", "VIX": "VIX_snap"})
+            merged = pd.merge_asof(merged.sort_values("Timestamp"), sn,
+                                   on="Timestamp", direction="backward")
+            merged["_has_snap"] = merged["PCR"].notna() if "PCR" in merged.columns else False
+            if not carry_forward:
+                # blank out carried rows, keeping only exact snapshot rows
+                snap_times = set(sn["Timestamp"])
+                mask = ~merged["Timestamp"].isin(snap_times)
+                for c in [c for c in merged.columns if c not in ("Timestamp", "Spot", "_has_snap")]:
+                    merged.loc[mask, c] = np.nan
 
+    # ---- true futures series where available ----
+    fut = _futures_timeline(uinfo, timeframe, period)
+    if not fut.empty:
+        merged = pd.merge_asof(merged.sort_values("Timestamp"), fut.sort_values("Timestamp"),
+                               on="Timestamp", direction="backward")
+        notes.append("Futures values come from real futures candles.")
+    elif "Future_snap" in merged.columns:
+        merged["Future"] = merged["Future_snap"]
+
+    # ---- VIX by date ----
+    vix = _vix_timeline()
+    if not vix.empty:
+        merged["Date"] = pd.to_datetime(merged["Timestamp"]).dt.normalize()
+        merged = merged.merge(vix, on="Date", how="left").drop(columns=["Date"])
+    elif "VIX_snap" in merged.columns:
+        merged["VIX"] = merged["VIX_snap"]
+
+    if merged.empty:
+        return pd.DataFrame(), " ".join(notes) if notes else None
+
+    # ---- assemble display columns ----
     out = pd.DataFrame()
-    out["Time"] = res["Timestamp"].dt.strftime("%d-%b %H:%M")
-    for disp, srccol in TABLE_COLUMN_SOURCE.items():
-        out[disp] = pd.to_numeric(res[srccol], errors="coerce") if srccol in res.columns else np.nan
+    # Time label scales with the window: intraday needs no date, a multi-year
+    # window needs the year to stay unambiguous.
+    _fmt = ("%H:%M" if days <= 1 else ("%d-%b %H:%M" if days <= 366 else "%d-%b-%y %H:%M"))
+    if timeframe in ("1d", "1wk"):
+        _fmt = "%d-%b-%Y"
+    out["Time"] = pd.to_datetime(merged["Timestamp"]).dt.strftime(_fmt)
+    src_map = {"PCR": "PCR", "Spot": "Spot", "Future": "Future", "Total OI": "Total OI",
+               "CE OI": "CE OI", "PE OI": "PE OI", "CE ΔOI": "CE ΔOI", "PE ΔOI": "PE ΔOI",
+               "Volume": "Total Volume", "Max Pain": "Max Pain", "Straddle": "ATM Straddle",
+               "Gamma": "ATM Gamma", "Vega": "ATM Vega", "Theta": "ATM Theta",
+               "IV": "ATM IV", "VIX": "VIX"}
+    for disp, srccol in src_map.items():
+        out[disp] = pd.to_numeric(merged[srccol], errors="coerce") if srccol in merged.columns else np.nan
     for disp in TABLE_DELTA_OF:
         if disp in out.columns:
             out[f"Δ {disp}"] = out[disp].diff()
     out = out[[c for c in TABLE_ALL_COLUMNS if c in out.columns]]
-    return out.iloc[::-1].reset_index(drop=True), note   # newest first
+
+    real = int(merged["_has_snap"].sum()) if "_has_snap" in merged.columns else 0
+    notes.append(f"{len(out)} rows on the {timeframe} market grid; {real} carry a chain snapshot "
+                 f"({'values carried forward between snapshots' if carry_forward else 'gaps left blank'}).")
+    return out.iloc[::-1].reset_index(drop=True), " ".join(notes) if notes else None
 
 
 def table_plot(table_df, columns, chart_type="Line", height=430, title="Table metrics"):
@@ -7501,10 +7672,19 @@ with tab_chain:
         _tf = cfg_selectbox(_tt1, "Table timeframe", "oca_tbl_tf", TABLE_TIMEFRAMES, default="1m")
         _tp = cfg_selectbox(_tt2, "Table period", "oca_tbl_period", TABLE_PERIODS, default="1d")
         st.caption("This table has its OWN timeframe and period, independent of the sidebar and of the plots above. "
-                   "Each Δ column is the change from the previous bucket, so it always matches the timeframe chosen "
-                   "here. Level metrics take each bucket's last value; ΔOI and volume are summed across the bucket.")
+                   "Rows come from real market candles, so 1m/5d gives a row for every traded minute (09:15–15:30, "
+                   "trading days only) — not just the minutes a snapshot happened to be taken. Spot, and futures "
+                   "where Dhan serves them, are true per-bucket values. Chain metrics (PCR, OI, max pain, straddle, "
+                   "greeks) attach to each row from the most recent snapshot at or before it: these are levels or "
+                   "cumulative day-to-date figures, so carrying them forward is accurate rather than invented. "
+                   "Each Δ column is the change from the previous row at this timeframe.")
 
-        _tbl, _tnote = build_chain_analysis_table(_tf, _tp, oca_under, oca_expiry)
+        _tfill = cfg_selectbox(st, "Rows between snapshots", "oca_tbl_fill",
+                               ["Carry last known chain values forward (continuous)",
+                                "Leave blank (only rows with a real snapshot)"],
+                               default="Carry last known chain values forward (continuous)")
+        _tbl, _tnote = build_chain_analysis_table(_tf, _tp, oca_under, oca_expiry, uinfo=_uinfo,
+                                                  carry_forward=_tfill.startswith("Carry"))
         if _tnote:
             st.caption("🗂 " + _tnote)
 
