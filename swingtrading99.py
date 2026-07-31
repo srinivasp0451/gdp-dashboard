@@ -829,6 +829,64 @@ def safe_indicator_value(series, min_bars, label=""):
 # ============================================================================
 
 @st.cache_data(ttl=30, show_spinner=False)
+def _session_fit(idx):
+    """Fraction of timestamps that fall inside the 09:15–15:30 IST session."""
+    try:
+        t = pd.DatetimeIndex(idx).time
+        if len(t) == 0:
+            return 0.0
+        inside = sum(1 for x in t if dtime(9, 15) <= x <= dtime(15, 30))
+        return inside / len(t)
+    except Exception:
+        return 0.0
+
+
+def normalize_index_to_ist(df, ticker):
+    """
+    Force a candle index to NAIVE IST.
+
+    Two different failure modes produced UTC timestamps in the UI:
+      • tz-AWARE data (Dhan, some yfinance responses) simply needs converting.
+      • tz-NAIVE data — yfinance returns this for several interval/ticker
+        combinations — carries no marker at all, and earlier code left it
+        untouched, so UTC values were displayed verbatim (a 13:01 IST bar
+        showing as 07:31).
+
+    A naive index is therefore tested against the actual Indian session rather
+    than trusted: whichever of "as-is" or "shifted by +5:30" puts more bars
+    inside 09:15–15:30 wins. That is self-correcting — if a feed later starts
+    returning proper IST, the as-is reading fits better and nothing is shifted.
+    Daily/weekly bars carry no meaningful time-of-day, so they are left alone.
+    """
+    if df is None or df.empty:
+        return df
+    try:
+        idx = pd.DatetimeIndex(df.index)
+    except Exception:
+        return df
+
+    if idx.tz is not None:
+        df = df.copy()
+        df.index = idx.tz_convert("Asia/Kolkata").tz_localize(None)
+        return df
+
+    # naive: only intraday Indian data can be diagnosed by session fit
+    try:
+        intraday = len(set(idx.time)) > 3
+    except Exception:
+        intraday = False
+    if not (intraday and is_indian_ticker(None, ticker)):
+        return df
+
+    as_is = _session_fit(idx)
+    shifted_idx = idx + pd.Timedelta(hours=5, minutes=30)
+    shifted = _session_fit(shifted_idx)
+    if shifted > as_is + 0.05:          # clearly a UTC series → convert to IST
+        df = df.copy()
+        df.index = shifted_idx
+    return df
+
+
 def fetch_data_yf(ticker, interval, period):
     """Original yfinance candle fetch — logic unchanged, mandatory delay kept."""
     time.sleep(RATE_LIMIT_DELAY)
@@ -1117,7 +1175,12 @@ def _dhan_fetch_candles_cached(security_id, segment, instrument, interval, perio
             "Close": pd.to_numeric(pd.Series(data["close"]), errors="coerce"),
             "Volume": pd.to_numeric(pd.Series(data.get("volume", [0] * len(data["open"]))), errors="coerce").fillna(0),
         })
-        df.index = pd.DatetimeIndex(idx.values, tz="Asia/Kolkata")
+        # `idx` is ALREADY tz-aware IST. Using idx.values here would hand back the
+        # underlying UTC instants as naive values, and DatetimeIndex(..., tz=...)
+        # LOCALISES naive input rather than converting it — stamping UTC wall
+        # times as if they were IST and shifting every candle 5h30m earlier
+        # (a 13:01 IST bar displayed as 07:31). Wrap the tz-aware index directly.
+        df.index = pd.DatetimeIndex(idx)
         df = df.dropna(subset=["Open", "High", "Low", "Close"]).sort_index()
         if interval == "1wk" and not df.empty:
             df = df.resample("W-FRI").agg({"Open": "first", "High": "max", "Low": "min",
@@ -1149,7 +1212,7 @@ def fetch_data(ticker, interval, period):
             dhan_df = fetch_data_dhan(ticker, interval, period)
             if dhan_df is not None and not dhan_df.empty:
                 st.session_state.dhan_fallback_notice = None
-                return dhan_df
+                return normalize_index_to_ist(dhan_df, ticker)
         st.session_state.dhan_fallback_notice = (
             "Premium trading needs the Dhan data feed (option premiums are not available on yfinance) — "
             "enter a valid Dhan Access Token in '🔐 Dhan Account' to load the option's candles."
@@ -1164,9 +1227,9 @@ def fetch_data(ticker, interval, period):
         else:
             st.session_state.dhan_fallback_notice = None
             if not dhan_df.empty:
-                return dhan_df
+                return normalize_index_to_ist(dhan_df, ticker)
             # Empty Dhan response (off-hours gap, API hiccup) → fall through to yfinance
-    return fetch_data_yf(ticker, interval, period)
+    return normalize_index_to_ist(fetch_data_yf(ticker, interval, period), ticker)
 
 
 def dhan_get_ltp(security_id, segment):
@@ -1652,6 +1715,17 @@ CHART_TYPES = ["Line", "Area", "Bar (grouped)", "Bar (stacked)", "Scatter",
                "Line + Markers", "Pie (latest snapshot)"]
 
 
+def _missing_metrics(hist, metric_labels):
+    """Which of these metrics have no usable values — used to explain empty plots."""
+    out = []
+    for lbl in metric_labels:
+        col, _fam = CHAIN_METRICS.get(lbl, (None, None))
+        if hist is None or hist.empty or not col or col not in hist.columns \
+                or pd.to_numeric(hist[col], errors="coerce").notna().sum() == 0:
+            out.append(lbl)
+    return out or ["(no snapshots recorded)"]
+
+
 def chain_plot(hist, metric_labels, title, normalize=None, height=430, chart_type="Line"):
     """
     Multi-metric time-series plot.
@@ -1960,6 +2034,14 @@ def _days_to_period_string(days):
     return "10y"
 
 
+def _is_indian_underlying(uinfo):
+    """Indian equity/index underlyings observe the 09:15–15:30 IST session."""
+    if not uinfo:
+        return False
+    y = str(uinfo.get("yf") or "")
+    return y.endswith((".NS", ".BO")) or y in ("^NSEI", "^NSEBANK", "^BSESN")
+
+
 def _table_master_timeline(uinfo, timeframe, period):
     """
     Build the table's TIME AXIS from real candles rather than from recorded
@@ -2007,6 +2089,16 @@ def _table_master_timeline(uinfo, timeframe, period):
     df = df.dropna(subset=["Close"])
     cutoff = pd.Timestamp(ist_now()).tz_localize(None) - pd.Timedelta(days=eff_days)
     df = df[df.index >= cutoff]
+    # Keep only real Indian trading sessions: weekdays, 09:15–15:30 IST. Even
+    # with correct timezones this drops any pre/post-market or padded rows a
+    # feed might return, so the table can never show a time the market was shut.
+    if timeframe not in ("1d", "1wk") and _is_indian_underlying(uinfo):
+        try:
+            tod = df.index.time
+            in_session = (tod >= dtime(9, 15)) & (tod <= dtime(15, 30))
+            df = df[in_session & (df.index.dayofweek < 5)]
+        except Exception:
+            pass
     out = pd.DataFrame({"Timestamp": _norm_ts(df.index),
                         "Spot": pd.to_numeric(df["Close"], errors="coerce").values})
     return out, note
@@ -2058,6 +2150,37 @@ def _vix_timeline():
                              "VIX": pd.to_numeric(s.values, errors="coerce")})
     except Exception:
         return pd.DataFrame()
+
+
+def chain_readiness(uinfo, expiry):
+    """
+    Explain in plain terms why chain data may be missing, instead of leaving
+    the UI full of None. Returns (ok, list_of_problems).
+    """
+    problems = []
+    client, token = _dhan_creds()
+    if not str(token or "").strip():
+        problems.append(
+            "**No Dhan Access Token.** Every option-chain value — PCR, CE/PE OI, ΔOI, volume, max pain, "
+            "straddle, IV and the greeks — comes from Dhan's option-chain API, which requires a token. "
+            "Without one, those columns stay empty and the chain plots have nothing to draw. "
+            "Add it in the sidebar under **🔐 Dhan Account**. (Spot still works from candles, which is why "
+            "only that column is populated.)")
+    if not uinfo:
+        problems.append("**Underlying not resolved** — the symbol was not found in Dhan's scrip master.")
+    if not expiry:
+        problems.append("**No expiry selected** — the chain endpoint needs one.")
+    if not st.session_state.get("chain_history"):
+        problems.append(
+            "**No snapshots recorded yet.** Press **🔍 Analyze Once** or **▶ Analyze Continuously** above; "
+            "the table and plots fill in from snapshots as they are taken.")
+    now = ist_now()
+    if now.weekday() >= 5 or not (dtime(9, 15) <= now.time() <= dtime(15, 30)):
+        problems.append(
+            f"**Market is closed right now** ({now.strftime('%a %H:%M')} IST). Dhan's chain endpoint generally "
+            "returns nothing outside 09:15–15:30 IST on trading days, so live snapshots will not appear until "
+            "the next session.")
+    return (len(problems) == 0), problems
 
 
 def build_chain_analysis_table(timeframe, period, underlying_label=None, expiry=None,
@@ -7541,10 +7664,15 @@ with tab_chain:
         record_chain_history(snap, futures_px, oca_under)
         hist = chain_history_df()
 
+        _ready, _problems = chain_readiness(_uinfo, oca_expiry)
+        if not _ready:
+            with st.container(border=True):
+                st.markdown("### ⚠️ Why some values are empty")
+                for _p in _problems:
+                    st.markdown(f"- {_p}")
         if not snap:
-            st.warning("Option chain unavailable. Requirements: a valid Dhan Access Token in the sidebar's "
-                       "🔐 Dhan Account section, a resolvable expiry, and live market hours.")
             if hist.empty:
+                st.info("Nothing to display yet — resolve the points above and run the analysis.")
                 return
 
         # ---- headline metrics ----
@@ -7632,8 +7760,8 @@ with tab_chain:
             st.caption(_fwhy)
             _ffig, _fnorm = chain_plot(hist, _fmetrics, _ftitle, normalize=_norm_arg, chart_type=_fchart)
             if _ffig is None:
-                st.info("Not enough data for this plot yet"
-                        + (" — futures price needs a Dhan token." if "Futures" in " ".join(_fmetrics) else "."))
+                st.info("No data yet for: " + ", ".join(_missing_metrics(hist, _fmetrics))
+                        + ". These come from the option chain (Dhan token + a snapshot during market hours).")
             else:
                 st.plotly_chart(_ffig, use_container_width=True, key=f"oca_fixed_{_fi}")
                 _sl, (_v, _s, _vl) = chain_plot_summary(hist, snap, _fmetrics, _fnorm)
@@ -7731,10 +7859,22 @@ with tab_chain:
             st.session_state["oca_tbl_cols"] = _final_cols
 
         _final_cols = st.session_state.get("oca_tbl_cols", TABLE_DEFAULT_COLUMNS)
+        _hide_empty = cfg_checkbox(st, "Hide columns that are completely empty", "oca_tbl_hide_empty", True)
         if _tbl.empty:
             st.info("No data for this timeframe/period yet.")
         else:
             _show = [c for c in _final_cols if c in _tbl.columns] or [c for c in TABLE_DEFAULT_COLUMNS if c in _tbl.columns]
+            _empty_cols = [c for c in _show if c != "Time" and _tbl[c].notna().sum() == 0]
+            if _empty_cols:
+                st.warning(f"**{len(_empty_cols)} column(s) have no data at all:** {', '.join(_empty_cols)}. "
+                           "These come from the option chain, which needs a Dhan Access Token and a snapshot "
+                           "taken during market hours — see the notes at the top of this tab."
+                           + ("  They are hidden below." if _hide_empty else ""))
+                if _hide_empty:
+                    _show = [c for c in _show if c not in _empty_cols]
+            if not _show or _show == ["Time"]:
+                st.info("Every selected column is empty — nothing to tabulate.")
+                _show = [c for c in ["Time", "Spot"] if c in _tbl.columns]
             _disp = _tbl[_show].copy()
             for _c in _disp.columns:
                 if _disp[_c].dtype.kind == "f":
@@ -7798,7 +7938,8 @@ with tab_chain:
             st.caption(_why)
             _fig, _was_norm = chain_plot(hist, _metrics, _title, normalize=_norm_arg)
             if _fig is None:
-                st.info("Not enough data for this plot yet.")
+                st.info("No data yet for: " + ", ".join(_missing_metrics(hist, _metrics))
+                        + ". These come from the option chain (Dhan token + a snapshot during market hours).")
             else:
                 st.plotly_chart(_fig, use_container_width=True, key=f"oca_preset_{_pi}")
                 _sum_lines, (_v, _s, _vl) = chain_plot_summary(hist, snap, _metrics, _was_norm)
