@@ -219,7 +219,59 @@ DHAN_INSTRUMENT_META = {
 DHAN_UNSUPPORTED_YF = {"BTC-USD", "ETH-USD", "USDINR=X", "GC=F", "SI=F"}
 
 # Dhan intraday chart API accepted interval codes
-DHAN_INTERVAL_CODE = {"1m": "1", "5m": "5", "15m": "15", "1h": "60"}
+# Dhan's intraday chart API accepts 1, 5, 15, 25 and 60 minute intervals —
+# finer granularity than yfinance offers. The extra grains are ADDITIVE: the
+# base yfinance timeframes keep working exactly as before, and the Dhan-only
+# ones simply become selectable when the Dhan feed is active.
+DHAN_INTERVAL_CODE = {"1m": "1", "2m": "1", "3m": "1", "5m": "5", "10m": "5",
+                      "15m": "15", "25m": "25", "30m": "15", "45m": "15",
+                      "60m": "60", "1h": "60", "2h": "60", "4h": "60"}
+
+# Dhan-only timeframes → the periods that make sense for them. Merged into
+# TF_PERIOD_MAP only when the Dhan feed is active, so the yfinance-only
+# experience is unchanged.
+DHAN_EXTRA_TF_PERIODS = {
+    "2m": ["1d", "5d", "7d", "1mo"],
+    "3m": ["1d", "5d", "7d", "1mo"],
+    "10m": ["1d", "5d", "7d", "1mo", "3mo"],
+    "25m": ["1d", "5d", "7d", "1mo", "3mo"],
+    "30m": ["1d", "5d", "7d", "1mo", "3mo", "6mo"],
+    "45m": ["1d", "5d", "7d", "1mo", "3mo", "6mo"],
+    "2h": ["5d", "7d", "1mo", "3mo", "6mo", "1y"],
+    "4h": ["7d", "1mo", "3mo", "6mo", "1y", "2y"],
+}
+
+# Timeframes that Dhan serves by resampling a finer base interval, e.g. a 3m
+# candle is built from 1m data. Keyed by timeframe → (base code, pandas rule).
+DHAN_RESAMPLE_TF = {"2m": "2min", "3m": "3min", "10m": "10min", "30m": "30min",
+                    "45m": "45min", "2h": "2h", "4h": "4h"}
+
+
+def available_tf_period_map():
+    """TF_PERIOD_MAP, extended with Dhan-only granularities when that feed is
+    active. Callers keep using one map, so nothing downstream changes."""
+    base = {k: list(v) for k, v in TF_PERIOD_MAP.items()}
+    try:
+        if dhan_feed_active():
+            for tf, periods in DHAN_EXTRA_TF_PERIODS.items():
+                base.setdefault(tf, list(periods))
+    except Exception:
+        pass
+    # keep a sensible ascending order rather than dict insertion order
+    def _mins(tf):
+        try:
+            if tf.endswith("m"):
+                return int(tf[:-1])
+            if tf.endswith("h"):
+                return int(tf[:-1]) * 60
+            if tf == "1d":
+                return 60 * 24
+            if tf == "1wk":
+                return 60 * 24 * 7
+        except Exception:
+            pass
+        return 10 ** 6
+    return {k: base[k] for k in sorted(base, key=_mins)}
 
 # Rough period-string → number of calendar days to request from Dhan
 PERIOD_TO_DAYS = {
@@ -887,8 +939,20 @@ def normalize_index_to_ist(df, ticker):
     return df
 
 
+# Dhan-only grains → (yfinance base interval, resample rule) so that turning
+# the Dhan feed off never leaves a selected timeframe unusable.
+_YF_FALLBACK_TF = {"2m": ("1m", "2min"), "3m": ("1m", "3min"), "10m": ("5m", "10min"),
+                   "25m": ("5m", "25min"), "30m": ("15m", "30min"), "45m": ("15m", "45min"),
+                   "60m": ("1h", None), "2h": ("1h", "2h"), "4h": ("1h", "4h")}
+
+
 def fetch_data_yf(ticker, interval, period):
-    """Original yfinance candle fetch — logic unchanged, mandatory delay kept."""
+    """Original yfinance candle fetch — logic unchanged, mandatory delay kept.
+    Dhan-only granularities are served by resampling the nearest yfinance
+    interval, so switching the feed off never breaks the current selection."""
+    resample_rule = None
+    if interval in _YF_FALLBACK_TF:
+        interval, resample_rule = _YF_FALLBACK_TF[interval]
     time.sleep(RATE_LIMIT_DELAY)
     df = yf.download(ticker, interval=interval, period=period, progress=False, auto_adjust=True)
     if df is None or df.empty:
@@ -896,6 +960,13 @@ def fetch_data_yf(ticker, interval, period):
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = df.columns.get_level_values(0)
     df = df.dropna(how="all")
+    if resample_rule and not df.empty:
+        try:
+            df = df.resample(resample_rule).agg({"Open": "first", "High": "max", "Low": "min",
+                                                 "Close": "last", "Volume": "sum"})
+            df = df.dropna(subset=["Open", "High", "Low", "Close"])
+        except Exception:
+            pass
     return df
 
 
@@ -1087,7 +1158,11 @@ def dhan_feed_active():
     has no options data."""
     cfg = st.session_state.app_cfg
     options_mode = cfg.get("ticker_choice") == "Options Trading"
-    if not (cfg.get("use_dhan_feed") or options_mode):
+    # Option-chain strategies (OI, ΔOI, PCR, gamma, multi-strike) read Dhan's
+    # option-chain API and cannot work without it, so selecting one implies the
+    # feed — the user should not have to tick a separate checkbox first.
+    chain_strategy = cfg.get("strategy") in OPTION_CHAIN_STRATEGIES
+    if not (cfg.get("use_dhan_feed") or options_mode or chain_strategy):
         return False
     _, token = _dhan_creds()
     if not token:
@@ -1185,6 +1260,13 @@ def _dhan_fetch_candles_cached(security_id, segment, instrument, interval, perio
         if interval == "1wk" and not df.empty:
             df = df.resample("W-FRI").agg({"Open": "first", "High": "max", "Low": "min",
                                            "Close": "last", "Volume": "sum"}).dropna()
+        elif interval in DHAN_RESAMPLE_TF and not df.empty:
+            # Dhan serves 1/5/15/25/60m natively; the intermediate grains are
+            # built by resampling the nearest finer base interval.
+            df = df.resample(DHAN_RESAMPLE_TF[interval]).agg(
+                {"Open": "first", "High": "max", "Low": "min",
+                 "Close": "last", "Volume": "sum"}).dropna(how="all")
+            df = df.dropna(subset=["Open", "High", "Low", "Close"])
         return df
     except Exception:
         return pd.DataFrame()
@@ -2663,6 +2745,11 @@ def db_init():
                     ce_volume REAL, pe_volume REAL, max_pain REAL,
                     atm_strike REAL, atm_gamma REAL, atm_straddle REAL, atm_iv REAL,
                     payload TEXT);
+                CREATE TABLE IF NOT EXISTS delivery_positions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    converted_at TEXT, ticker TEXT, strategy TEXT, instrument TEXT,
+                    direction TEXT, entry_price REAL, qty REAL, sl REAL, target REAL,
+                    status TEXT, resumed_at TEXT, closed_at TEXT, payload TEXT);
                 CREATE TABLE IF NOT EXISTS screener_runs (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     ts TEXT, strategy TEXT, interval TEXT, period TEXT,
@@ -2802,6 +2889,54 @@ def db_load_chain_history(underlying, expiry=None, since_days=None, limit=20000)
         return out
     except Exception:
         return pd.DataFrame()
+
+
+def db_save_delivery_position(pos, ticker, strategy, instrument):
+    """Persist a position that was carried overnight as delivery, so it can be
+    reviewed and resumed in the Admin Panel on a later day."""
+    if not db_enabled():
+        return None
+    try:
+        with db_connect() as conn:
+            cur = conn.execute(
+                "INSERT INTO delivery_positions (converted_at, ticker, strategy, instrument, direction, "
+                "entry_price, qty, sl, target, status, payload) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                (ist_now().isoformat(), ticker, strategy, instrument,
+                 "LONG" if pos.get("direction") == 1 else "SHORT",
+                 float(pos.get("entry_price") or 0), float(pos.get("remaining_qty") or 0),
+                 float(pos.get("sl") or 0), float(pos.get("target") or 0),
+                 "OPEN", json.dumps(pos, default=str)))
+            return cur.lastrowid
+    except Exception as exc:
+        st.session_state["db_last_error"] = f"save delivery: {exc}"
+        return None
+
+
+def db_load_delivery_positions(status=None):
+    try:
+        q = "SELECT * FROM delivery_positions"
+        args = []
+        if status:
+            q += " WHERE status = ?"; args.append(status)
+        q += " ORDER BY id DESC"
+        with db_connect() as conn:
+            return [dict(r) for r in conn.execute(q, args).fetchall()]
+    except Exception:
+        return []
+
+
+def db_update_delivery_status(row_id, status, extra_field=None):
+    try:
+        with db_connect() as conn:
+            if extra_field:
+                conn.execute(f"UPDATE delivery_positions SET status = ?, {extra_field} = ? WHERE id = ?",
+                             (status, ist_now().isoformat(), int(row_id)))
+            else:
+                conn.execute("UPDATE delivery_positions SET status = ? WHERE id = ?", (status, int(row_id)))
+        return True
+    except Exception as exc:
+        st.session_state["db_last_error"] = f"update delivery: {exc}"
+        return False
 
 
 def db_save_screener_run(results_df, strategy, interval, period, universe):
@@ -4848,26 +4983,59 @@ def dispatch_dhan_event(cfg, direction, is_entry, event_label, paper_qty, paper_
 # trading, it only surfaces a warning.
 # ============================================================================
 
-def send_trade_email(cfg, subject, body_lines):
-    if not cfg.get("email_enabled"):
-        return
+def _email_status(ok, message):
+    """Record the outcome of the last send so the Live tab can show it —
+    warnings raised inside a fragment are easy to miss entirely."""
+    st.session_state["email_last_status"] = {
+        "ok": ok, "message": message, "at": ist_now().strftime("%d-%b %H:%M:%S IST")}
+    return ok
+
+
+def send_trade_email(cfg, subject, body_lines, force=False):
+    """
+    Gmail SMTP over SSL:465. Never raises — a mail problem must not interrupt
+    trading, so every outcome is recorded via _email_status() and surfaced on
+    the Live tab instead of only being warned about inside a fragment.
+    """
+    if not (cfg.get("email_enabled") or force):
+        return False
     sender = str(cfg.get("email_from") or "").strip()
     recipients = [r.strip() for r in str(cfg.get("email_to") or "").split(",") if r.strip()]
-    app_password = str(cfg.get("email_app_password") or "").strip()
-    if not (sender and recipients and app_password):
-        st.warning("📧 Email notification skipped — From/To/App Password not fully configured.")
-        return
+    # Google DISPLAYS app passwords in four space-separated blocks; pasting
+    # that verbatim is the most common reason login fails, so strip whitespace
+    # rather than rejecting a password the user copied exactly as shown.
+    app_password = "".join(str(cfg.get("email_app_password") or "").split())
+
+    if not sender:
+        return _email_status(False, "No From address set.")
+    if not recipients:
+        return _email_status(False, "No To address set.")
+    if not app_password:
+        return _email_status(False, "No Gmail App Password set.")
+    if len(app_password) != 16:
+        return _email_status(False, (
+            f"App Password is {len(app_password)} characters after removing spaces — Google app passwords are "
+            "exactly 16. This is an App Password from myaccount.google.com/apppasswords, NOT your normal Gmail "
+            "password (which SMTP always rejects)."))
     try:
         msg = MIMEText("\n".join(str(x) for x in body_lines))
         msg["Subject"] = subject
         msg["From"] = sender
         msg["To"] = ", ".join(recipients)
         ctx = ssl.create_default_context()
-        with smtplib.SMTP_SSL("smtp.gmail.com", 465, context=ctx, timeout=15) as server:
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465, context=ctx, timeout=20) as server:
             server.login(sender, app_password)
             server.sendmail(sender, recipients, msg.as_string())
+        return _email_status(True, f"Sent to {', '.join(recipients)} — “{subject}”.")
+    except smtplib.SMTPAuthenticationError as exc:
+        return _email_status(False, (
+            f"Gmail rejected the login ({exc.smtp_code}). Use a 16-character App Password from "
+            "myaccount.google.com/apppasswords with 2-Step Verification enabled, and make sure the From "
+            "address is that same Google account."))
+    except smtplib.SMTPRecipientsRefused:
+        return _email_status(False, f"Recipient address refused: {', '.join(recipients)}.")
     except Exception as exc:
-        st.warning(f"📧 Email notification failed (trading unaffected): {exc}")
+        return _email_status(False, f"{type(exc).__name__}: {exc}")
 
 
 def email_trade_event(cfg, event, details):
@@ -4953,6 +5121,50 @@ def note_trade_event(entered=False):
     if entered:
         st.session_state.risk_day_entries = int(st.session_state.get("risk_day_entries", 0)) + 1
     st.session_state.risk_last_event_ts = time.time()
+
+
+def check_delivery_conversion(cfg, pos, ticker, strategy):
+    """
+    Intraday → delivery carry-over.
+
+    Intraday products are auto-squared-off by the broker near the close, so a
+    position that has hit neither SL nor target would be closed at whatever
+    price the market happens to be at. When enabled (default), at the
+    configured cut-off the position is instead marked as DELIVERY: it stays
+    open, is written to the database, and can be reviewed and resumed from the
+    Admin Panel on a later day.
+
+    Applies to stock intraday, stock options and index options — anything held
+    on an intraday product. Positions already converted are not converted
+    twice, and nothing is converted if SL/target already closed the trade.
+    """
+    if not cfg or not pos:
+        return False, None
+    if not cfg.get("convert_to_delivery", True):
+        return False, None
+    if pos.get("converted_to_delivery"):
+        return False, None
+    cutoff = cfg.get("delivery_cutoff_time", dtime(15, 0))
+    if not isinstance(cutoff, dtime):
+        try:
+            hh, mm = str(cutoff).split(":")[:2]
+            cutoff = dtime(int(hh), int(mm))
+        except Exception:
+            cutoff = dtime(15, 0)
+    now = ist_now()
+    if now.weekday() >= 5 or now.time() < cutoff:
+        return False, None
+    product_cfg = cfg.get("product_cfg") or {}
+    instrument = str(product_cfg.get("instrument") or ("Options" if product_cfg.get("options_mode") else "Equity"))
+    pos["converted_to_delivery"] = True
+    pos["delivery_converted_at"] = now.isoformat()
+    row_id = db_save_delivery_position(pos, ticker, strategy, instrument)
+    pos["delivery_row_id"] = row_id
+    msg = (f"Converted to DELIVERY at {now.strftime('%H:%M IST')} (cut-off {cutoff.strftime('%H:%M')}) — "
+           f"SL/target had not been hit. The position stays open and is stored"
+           + (" in the database; resume it from the Admin Panel." if row_id else
+              " in this session only (enable Data Persistence to store it)."))
+    return True, msg
 
 
 def check_profitable_hold_exit(gates, pos, ltp, now=None):
@@ -5198,9 +5410,13 @@ def render_config_controls(ui, prefix="sb"):
         ticker = TICKER_MAP[ticker_choice]
         underlying_choice = ticker_choice
 
-    intervals = list(TF_PERIOD_MAP.keys())
+    _tf_map = available_tf_period_map()
+    intervals = list(_tf_map.keys())
     interval = cfg_selectbox(ui, "Timeframe", "interval", intervals, default="1m", prefix=prefix)
-    periods_available = TF_PERIOD_MAP[interval]
+    if interval in DHAN_EXTRA_TF_PERIODS:
+        ui.caption(f"⚡ {interval} is a Dhan-only granularity (yfinance does not offer it). It is served from Dhan "
+                   "and will fall back to the nearest supported timeframe if the feed is turned off.")
+    periods_available = _tf_map.get(interval, TF_PERIOD_MAP.get(interval, ["1d"]))
     _default_period = "7d" if "7d" in periods_available else periods_available[0]
     period = cfg_selectbox(ui, "Period", "period", periods_available, default=_default_period, prefix=prefix)
 
@@ -5559,6 +5775,22 @@ def render_config_controls(ui, prefix="sb"):
         "loss_duration_max_minutes": loss_duration_max_minutes,
     }
 
+    # ------------------------------------------- INTRADAY → DELIVERY -----
+    ui.markdown("### 📦 Intraday → Delivery Carry-Over")
+    convert_to_delivery = cfg_checkbox(ui, "Convert unresolved intraday positions to delivery",
+                                       "convert_to_delivery", True, prefix=prefix)
+    delivery_cutoff_time = dtime(15, 0)
+    if convert_to_delivery:
+        delivery_cutoff_time = cfg_time(ui, "Conversion cut-off (IST)", "delivery_cutoff_time",
+                                        dtime(15, 0), prefix=prefix)
+        ui.caption("If neither SL nor target has been hit by this time, the position is NOT squared off — it is "
+                   "marked as delivery, kept open, and written to the database so you can review it and resume "
+                   "trading it later from the Admin Panel. Applies to stock intraday, stock options and index "
+                   "options. Enable Data Persistence (Admin Panel) for it to survive a restart.")
+    else:
+        ui.caption("Positions are left to the normal exit rules; note that brokers auto-square-off intraday "
+                   "products near the close.")
+
     # ------------------------------------------------------------ GATES  --
     ui.markdown("### 🚧 Risk Controls (Live-Trading Gates)")
     ui.caption("All disabled by default. These gate LIVE entries only; blocked entries display the specific "
@@ -5701,7 +5933,8 @@ def render_config_controls(ui, prefix="sb"):
     # -------- shared 🔐 Dhan Account credentials (one set serves both the
     # data feed and order placement) --------
     dhan_client_id, dhan_access_token = "", ""
-    need_creds = use_dhan_feed or dhan_enabled or options_mode
+    chain_strategy = strategy in OPTION_CHAIN_STRATEGIES
+    need_creds = use_dhan_feed or dhan_enabled or options_mode or chain_strategy
     if need_creds:
         ui.markdown("#### 🔐 Dhan Account")
         dhan_client_id = cfg_text(ui, "Dhan Client ID", "dhan_client_id", DHAN_DEFAULT_CLIENT_ID, prefix=prefix)
@@ -5714,8 +5947,96 @@ def render_config_controls(ui, prefix="sb"):
     product_cfg = {}
     entry_order_type, exit_order_type, dhan_qty = "MARKET", "MARKET", 1
 
-    dhan_touchpoints_on = dhan_enabled or options_mode
-    if dhan_touchpoints_on and premium_mode:
+    dhan_touchpoints_on = dhan_enabled or options_mode or chain_strategy
+    if chain_strategy and not options_mode and not premium_mode:
+        # ---- OPTION-CHAIN STRATEGY EXECUTION ----------------------------
+        # These strategies read the chain but their signals must be TRADED as
+        # option legs: a LONG buys CE, a SHORT buys PE. Without this the trade
+        # would be placed on the index itself (and paper P&L tracked on index
+        # points), which is not what the strategy is expressing. The ATM CE and
+        # PE legs of the configured chain are resolved here so both live orders
+        # and paper trading use the correct instrument.
+        ui.markdown("#### 🎯 Option Leg Execution")
+        _cs_trade_opts = cfg_checkbox(ui, "Trade CE/PE legs (LONG → buy CE, SHORT → buy PE)",
+                                      "chain_trade_options", True, prefix=prefix)
+        if _cs_trade_opts:
+            _cs_und = params.get("oi_underlying", store.get("oi_underlying", "Nifty50"))
+            _cs_meta = DHAN_INDEX_MAP.get(_cs_und, DHAN_INDEX_MAP["Nifty50"])
+            _cs_exp = params.get("oi_expiry", store.get("oi_expiry"))
+            _cs_strikes = dhan_get_strikes(_cs_meta["underlying"], _cs_exp, "OPTIDX",
+                                           _cs_meta["exchange"]) if _cs_exp else []
+            _cs_offset = cfg_number(ui, "Strike offset from ATM (0 = ATM, +1 = one strike OTM, −1 = ITM)",
+                                    "chain_strike_offset", 0, -20, 20, is_int=True, prefix=prefix)
+            _cs_atm = None
+            if _cs_strikes:
+                _cs_ltp = _current_underlying_ltp(TICKER_MAP.get(_cs_und, "^NSEI"))
+                _cs_atm = round_to_nearest_strike(_cs_ltp, _cs_strikes)
+            if _cs_atm is not None and _cs_strikes:
+                _ai = _cs_strikes.index(_cs_atm)
+                # An OTM call sits ABOVE spot and an OTM put BELOW, so the
+                # offset is applied in opposite directions for the two legs.
+                _ce_strike = _cs_strikes[min(len(_cs_strikes) - 1, max(0, _ai + int(_cs_offset)))]
+                _pe_strike = _cs_strikes[min(len(_cs_strikes) - 1, max(0, _ai - int(_cs_offset)))]
+                _sig = ("CHAIN", _cs_und, _cs_exp, _ce_strike, _pe_strike)
+
+                def _fetch_chain_legs():
+                    ce = dhan_lookup_option(_cs_meta["underlying"], _cs_exp, _ce_strike, "CE",
+                                            "OPTIDX", _cs_meta["exchange"])
+                    pe = dhan_lookup_option(_cs_meta["underlying"], _cs_exp, _pe_strike, "PE",
+                                            "OPTIDX", _cs_meta["exchange"])
+                    if ce:
+                        cfg_force("ce_security_id", ce["security_id"])
+                        store["_opt_lot_size"] = ce.get("lot_size")
+                    if pe:
+                        cfg_force("pe_security_id", pe["security_id"])
+                    return bool(ce and pe)
+
+                if st.session_state.get("dhan_opt_autofill_sig") != _sig \
+                        and st.session_state.get("_attempted_dhan_opt_autofill_sig") != _sig:
+                    cfg_force("ce_security_id", "")
+                    cfg_force("pe_security_id", "")
+                _try_autofill(_sig, _fetch_chain_legs, "dhan_opt_autofill_sig", "dhan_opt_autofill_last_try")
+                ui.caption(f"ATM {_cs_atm:.0f} · CE strike {_ce_strike:.0f} · PE strike {_pe_strike:.0f} "
+                           f"(expiry {_cs_exp})")
+            else:
+                ui.warning("Could not resolve strikes for this chain — check the Dhan token and expiry. "
+                           "Until the CE/PE IDs are filled, entries would fall back to the underlying.")
+            _ce_id = cfg_text(ui, "CE Security ID (auto-filled, used on LONG signals)",
+                              "ce_security_id", "", prefix=prefix).strip()
+            _pe_id = cfg_text(ui, "PE Security ID (auto-filled, used on SHORT signals)",
+                              "pe_security_id", "", prefix=prefix).strip()
+            _cs_qty_default = _cs_meta.get("default_opt_qty", 65)
+            if store.get("_chain_qty_sig") != _cs_und:
+                cfg_force("dhan_qty", int(_cs_qty_default))
+                store["_chain_qty_sig"] = _cs_und
+            c1, c2 = ui.columns(2)
+            entry_order_type = cfg_selectbox(c1, "Entry Order Type", "entry_order_type",
+                                             ["MARKET", "LIMIT"], default="MARKET", prefix=prefix)
+            exit_order_type = cfg_selectbox(c2, "Exit Order Type", "exit_order_type",
+                                            ["MARKET", "LIMIT"], default="MARKET", prefix=prefix)
+            dhan_qty = cfg_number(ui, "Dhan Quantity (lots × lot size)", "dhan_qty",
+                                  int(_cs_qty_default), 1, 1000000, is_int=True, prefix=prefix)
+            product_cfg = {
+                "instrument": "Index Options",
+                "exchange": _cs_meta["exchange"],
+                "exchange_segment": f"{_cs_meta['exchange']}_FNO",
+                "product": "MARGIN",
+                "options_mode": True,
+                "chain_strategy_mode": True,
+                "ce_security_id": _ce_id,
+                "pe_security_id": _pe_id,
+                "expiry": _cs_exp,
+                "underlying": _cs_meta["underlying"],
+                "lot_size": store.get("_opt_lot_size"),
+                "bo_enabled": False,
+            }
+            ui.caption("Signals are computed from the option chain but EXECUTED on the option legs — a LONG buys the "
+                       "CE, a SHORT buys the PE, and exits sell whichever leg is open. Paper trading records the "
+                       "leg's premium too, so P&L reflects the option rather than index points. Untick the box above "
+                       "to trade the underlying instead.")
+        else:
+            ui.caption("CE/PE execution disabled — signals will be traded on the underlying index instead.")
+    elif dhan_touchpoints_on and premium_mode:
         # -------- PREMIUM MODE product config: the single selected leg. All
         # instrument details were already chosen in the 🎯 Premium Trading
         # section above; orders always BUY that leg on entry / SELL on exit.
@@ -5955,17 +6276,34 @@ def render_config_controls(ui, prefix="sb"):
         email_to = cfg_text(ui, "To (comma-separated)", "email_to", EMAIL_DEFAULT_TO, prefix=prefix)
         email_app_password = cfg_text(ui, "Gmail App Password", "email_app_password", "", type="password", prefix=prefix)
         ui.caption("Emails via Gmail SMTP (SSL 465) on entry, exit, partial book, and manual square-off — containing "
-                   "strategy/entry/SL/target/exit reason/points/PnL. A mail failure never blocks trading, it only "
-                   "shows a warning.")
+                   "strategy/entry/SL/target/exit reason/points/PnL. A mail failure never blocks trading. "
+                   "The password must be a 16-character **App Password** from myaccount.google.com/apppasswords "
+                   "(2-Step Verification required) — a normal Gmail password is always rejected by SMTP. "
+                   "Spaces are stripped automatically, so you can paste it exactly as Google shows it.")
+        if ui.button("📧 Send test email", key=f"btn_{prefix}_email_test"):
+            _ok = send_trade_email(
+                {"email_enabled": True, "email_from": email_from, "email_to": email_to,
+                 "email_app_password": email_app_password},
+                "[AlgoTrader] Test email",
+                ["This is a test from AlgoTrader Pro.",
+                 f"Sent at {ist_now().strftime('%d-%b-%Y %H:%M:%S IST')}.",
+                 "If you received this, trade notifications will work."], force=True)
+            _st = st.session_state.get("email_last_status", {})
+            if _ok:
+                ui.success("✅ " + _st.get("message", "Sent."))
+            else:
+                ui.error("❌ " + _st.get("message", "Failed."))
     else:
         email_to = str(store.get("email_to", EMAIL_DEFAULT_TO) or EMAIL_DEFAULT_TO)
-        email_app_password = str(store.get("email_app_password", "") or "brxj oeae aytp ydgk")
+        email_app_password = str(store.get("email_app_password", "") or "")
 
     return dict(
         ticker=ticker, ticker_choice=ticker_choice, interval=interval, period=period, qty=qty,
         strategy=strategy, sl_type=sl_type, target_type=target_type, params=params, filters=filters,
         wf_enabled=wf_enabled, wf_folds=wf_folds, cost_enabled=cost_enabled, cost_cfg=cost_cfg,
         risk_ctrl=risk_ctrl, gates=gates,
+        convert_to_delivery=convert_to_delivery,
+        delivery_cutoff_time=delivery_cutoff_time,
         options_mode=options_mode,
         premium_mode=premium_mode,
         use_dhan_feed=use_dhan_feed,
@@ -6653,6 +6991,20 @@ def evaluate_live_signal(ticker, interval, period, strategy, params, filters, sl
                 else:
                     exited, exit_price, reason = True, hard_price, hard_reason
         if not exited and full_cfg:
+            _conv, _conv_msg = check_delivery_conversion(full_cfg, pos, ticker, strategy)
+            if _conv:
+                st.session_state["delivery_note"] = _conv_msg
+                st.info("📦 " + _conv_msg)
+                db_persist_position_state(ticker, strategy)
+                if full_cfg.get("email_enabled"):
+                    email_trade_event(full_cfg, "Converted to Delivery", {
+                        "Ticker": ticker, "Strategy": strategy,
+                        "Direction": "LONG" if pos["direction"] == 1 else "SHORT",
+                        "Entry Price": round(pos["entry_price"], 2),
+                        "SL": round(pos["sl"], 2), "Target": round(pos["target"], 2),
+                        "Qty": pos.get("remaining_qty"), "Note": _conv_msg,
+                    })
+        if not exited and full_cfg:
             # 🚧 Risk gate: Max Hold Duration of Profitable Trade — if held
             # ≥ N minutes AND currently in profit → exit immediately.
             ph_exit, ph_price, ph_reason = check_profitable_hold_exit(full_cfg.get("gates"), pos, ltp)
@@ -6998,9 +7350,10 @@ def render_bin_analysis_section(t1, t2, t1_name, t2_name, p1, diff, fetch_interv
 # ============================================================================
 
 (tab_bt, tab_live, tab_hist, tab_heat, tab_opt, tab_spread, tab_ohlc,
- tab_chain, tab_screen, tab_admin) = st.tabs(
+ tab_chain, tab_screen, tab_dl, tab_admin) = st.tabs(
     ["📊 Backtest", "🔴 Live Trading", "📜 Trade History", "🔥 Heatmaps", "🧪 Optimization",
-     "🔀 Spread Tool", "📅 OHLC & Range", "🔗 Option Chain Analysis", "🔎 Screener", "🛠 Admin Panel"]
+     "🔀 Spread Tool", "📅 OHLC & Range", "🔗 Option Chain Analysis", "🔎 Screener",
+     "⬇️ Data Download", "🛠 Admin Panel"]
 )
 
 # ---------------------------------------------------------------- BACKTEST -
@@ -7134,28 +7487,41 @@ with tab_live:
     if st.session_state.get("live_blocked_reason"):
         st.warning(f"🚧 Last entry was blocked by a risk gate: {st.session_state.live_blocked_reason}")
 
-    # ---- Start / Stop / Square-off controls ----
+    # ---- Run Once / Run Continuously / Stop / Square-off controls ----
     ctrl1, ctrl2, ctrl3, ctrl4 = st.columns(4)
     with ctrl1:
+        manual_eval = st.button("🔍 Run Once", use_container_width=True,
+                                help="Evaluate signals and manage any open position exactly once, right now.")
+    with ctrl2:
         if not st.session_state.live_running:
-            if st.button("▶️ Start", type="primary", use_container_width=True):
+            if st.button("▶ Run Continuously", type="primary", use_container_width=True,
+                         help="Keep re-checking signals every few seconds until stopped."):
                 st.session_state.live_running = True
                 st.rerun()
         else:
-            st.button("▶️ Running…", disabled=True, use_container_width=True)
-    with ctrl2:
-        if st.button("⏸ Stop", use_container_width=True, disabled=not st.session_state.live_running):
+            st.button("▶ Running…", disabled=True, use_container_width=True)
+    with ctrl3:
+        if st.button("⏹ Stop", use_container_width=True, disabled=not st.session_state.live_running):
             st.session_state.live_running = False
             st.rerun()
-    with ctrl3:
-        manual_eval = st.button("🔄 Evaluate Once", use_container_width=True)
     with ctrl4:
         squareoff_clicked = st.button("🟥 Square Off Now", use_container_width=True, disabled=not st.session_state.live_positions)
 
     if st.session_state.live_running:
-        st.success("🟢 Live monitoring is ON — polling the API and re-checking signals every few seconds. Click Stop to halt it.")
+        st.success("🟢 Running continuously — polling the API and re-checking signals every few seconds. "
+                   "Click Stop to halt it.")
     else:
-        st.caption("⚪ Live monitoring is OFF — no background API calls are being made. Click Start to arm it, or use Evaluate Once for a single manual check.")
+        st.caption("⚪ Continuous running is OFF — no background API calls are being made. Use **Run Once** for a "
+                   "single check, or **Run Continuously** to keep it evaluating.")
+
+    _em = st.session_state.get("email_last_status")
+    if _em:
+        if _em.get("ok"):
+            st.caption(f"📧 Last email: ✅ {_em['message']} ({_em['at']})")
+        else:
+            st.warning(f"📧 Last email FAILED at {_em['at']}: {_em['message']}")
+    if st.session_state.get("delivery_note"):
+        st.info("📦 " + st.session_state.pop("delivery_note"))
     st.caption("Note: a full browser close / new session always resets this to OFF. A plain in-tab refresh (F5) may preserve the ON state since Streamlit keeps the same session — click Stop first if you want a hard reset before refreshing.")
 
     if squareoff_clicked and st.session_state.live_positions:
@@ -7289,7 +7655,7 @@ with tab_live:
     if st.session_state.live_running:
         live_dashboard_fragment(ticker, interval, period, strategy, params, filters)
     else:
-        st.caption("📊 Indicator Dashboard / 📟 Signal Status Board are paused while monitoring is OFF. Click Start to see them update live, or Evaluate Once for a single snapshot below.")
+        st.caption("📊 Indicator Dashboard / 📟 Signal Status Board are paused while monitoring is OFF. Click Run Continuously to see them update live, or Run Once for a single snapshot below.")
         if manual_eval:
             raw_status = fetch_data(ticker, interval, period)
             if not raw_status.empty and len(raw_status) >= 30:
@@ -7437,8 +7803,8 @@ with tab_opt:
         st.rerun()
 
     opt_strategies = st.multiselect("Strategies to test", STRATEGIES, default=[strategy], key="opt_strategies_ms")
-    opt_intervals = st.multiselect("Timeframes to test", list(TF_PERIOD_MAP.keys()), default=[interval])
-    combo_periods = sorted({p for iv in opt_intervals for p in TF_PERIOD_MAP[iv]}, key=lambda x: x)
+    opt_intervals = st.multiselect("Timeframes to test", list(available_tf_period_map().keys()), default=[interval])
+    combo_periods = sorted({p for iv in opt_intervals for p in available_tf_period_map().get(iv, [])}, key=lambda x: x)
     opt_periods = st.multiselect("Periods to test (only valid ones per timeframe are used)", combo_periods, default=[period] if period in combo_periods else combo_periods[:1])
 
     st.markdown("**Stoploss & Target combinations** (defaults to your current sidebar selection — change here without leaving this tab)")
@@ -7482,7 +7848,7 @@ with tab_opt:
         st.caption("After running, results are filtered to combos meeting this accuracy. If none qualify, you'll still see the best combo(s) actually found, clearly labeled as below target.")
 
     n_combos = (len(opt_strategies) * len(opt_sl_types) * len(opt_target_types) * len(filter_variants)
-                * sum(1 for iv in opt_intervals for p in TF_PERIOD_MAP[iv] if p in opt_periods))
+                * sum(1 for iv in opt_intervals for p in available_tf_period_map().get(iv, []) if p in opt_periods))
     st.caption(f"Estimated backtest runs: **{n_combos}** (≈{n_combos * RATE_LIMIT_DELAY:.1f}s+ just for data-fetch delays, plus backtest compute time per run).")
 
     MAX_COMBOS = st.number_input(
@@ -7499,7 +7865,7 @@ with tab_opt:
         combos = [
             (s, iv, p, slt, tgt, fv)
             for s in opt_strategies
-            for iv in opt_intervals for p in TF_PERIOD_MAP[iv] if p in opt_periods
+            for iv in opt_intervals for p in available_tf_period_map().get(iv, []) if p in opt_periods
             for slt in opt_sl_types
             for tgt in opt_target_types
             for fv in filter_variants
@@ -8224,6 +8590,152 @@ with tab_screen:
                    "the screener, or use the Option Chain Analysis tab for chain work.")
 
 
+# --------------------------------------------------------- DATA DOWNLOAD ----
+with tab_dl:
+    st.subheader("⬇️ Data Download")
+    st.caption("Export candles as CSV or Excel for any instrument — equities, indices, index/stock options, or "
+               "index/stock futures. Options and futures come from Dhan (yfinance has no derivatives data); "
+               "equities and indices work on either source.")
+
+    d1, d2 = st.columns([1, 2])
+    dl_type = cfg_selectbox(d1, "Instrument type", "dl_type",
+                            ["Stock (equity)", "Index", "Index Options", "Stock Options",
+                             "Index Futures", "Stock Futures"], default="Stock (equity)")
+    _is_deriv = dl_type not in ("Stock (equity)", "Index")
+    _is_opt = "Options" in dl_type
+    _is_idx_deriv = dl_type.startswith("Index") and _is_deriv
+
+    dl_ticker, dl_sec_id, dl_segment, dl_instr = None, None, None, None
+    _label = ""
+
+    if dl_type == "Index":
+        _idx = cfg_selectbox(d2, "Index", "dl_index", list(DHAN_INDEX_MAP.keys()), default="Nifty50")
+        dl_ticker = TICKER_MAP.get(_idx)
+        _label = _idx
+    elif dl_type == "Stock (equity)":
+        _sym = cfg_text(d2, "Stock symbol (NSE, e.g. RELIANCE)", "dl_stock", "RELIANCE")
+        dl_ticker = f"{_yf_symbol_to_plain(_sym)}.NS"
+        _label = _yf_symbol_to_plain(_sym)
+    else:
+        if _is_idx_deriv:
+            _u = cfg_selectbox(d2, "Underlying index", "dl_deriv_index", list(DHAN_INDEX_MAP.keys()),
+                               default="Nifty50")
+            _uinfo_dl = resolve_chain_underlying("Index", _u)
+        else:
+            _u = cfg_text(d2, "Underlying stock (NSE, e.g. RELIANCE)", "dl_deriv_stock", "RELIANCE")
+            _uinfo_dl = resolve_chain_underlying("Stock", _u)
+
+        if not _uinfo_dl:
+            st.warning(f"Could not resolve '{_u}' in Dhan's scrip master. Derivatives need a symbol that has "
+                       "listed F&O contracts.")
+        else:
+            _scrip = _uinfo_dl["opt_instrument"] if _is_opt else _uinfo_dl["fut_instrument"]
+            _exps = dhan_get_expiries(_uinfo_dl["underlying"], _scrip, _uinfo_dl["exchange"])
+            e1, e2, e3 = st.columns(3)
+            if _exps:
+                _exp = cfg_selectbox(e1, "Expiry", "dl_expiry", _exps, default=_exps[0])
+            else:
+                _exp = cfg_text(e1, "Expiry (YYYY-MM-DD)", "dl_expiry_manual", "")
+                st.caption("Expiry list unavailable — check the Dhan token, then enter the expiry manually.")
+            if _is_opt:
+                _otype = cfg_selectbox(e2, "Option type", "dl_opt_type", ["CE", "PE"], default="CE")
+                _strikes = dhan_get_strikes(_uinfo_dl["underlying"], _exp, _scrip,
+                                            _uinfo_dl["exchange"]) if _exp else []
+                if _strikes:
+                    _atm_dl = round_to_nearest_strike(_current_underlying_ltp(_uinfo_dl["yf"]), _strikes)
+                    _strike = cfg_selectbox(e3, "Strike (ATM pre-selected)", "dl_strike", _strikes,
+                                            default=_atm_dl if _atm_dl in _strikes else _strikes[len(_strikes) // 2])
+                else:
+                    _strike = cfg_number(e3, "Strike (manual)", "dl_strike_manual", 0.0, 0.0, 1e7)
+                _info = (dhan_lookup_option(_uinfo_dl["underlying"], _exp, _strike, _otype, _scrip,
+                                            _uinfo_dl["exchange"]) if (_exp and _strike) else None)
+                _label = f"{_uinfo_dl['underlying']}_{_exp}_{_strike:g}{_otype}" if _exp and _strike else "option"
+            else:
+                _info = dhan_lookup_future(_uinfo_dl["underlying"], _exp, _scrip,
+                                           _uinfo_dl["exchange"]) if _exp else None
+                _label = f"{_uinfo_dl['underlying']}_{_exp}_FUT" if _exp else "future"
+            if _info:
+                dl_sec_id = _info["security_id"]
+                dl_segment = f"{_uinfo_dl['exchange']}_FNO"
+                dl_instr = _scrip
+                st.caption(f"Resolved security ID **{dl_sec_id}** · segment {dl_segment} · lot size "
+                           f"{_info.get('lot_size', 'n/a')}")
+            else:
+                st.warning("Contract not resolved yet — pick an expiry (and strike) that exists in the scrip master.")
+
+    t1, t2, t3 = st.columns(3)
+    _dl_tf_map = available_tf_period_map()
+    dl_tf = cfg_selectbox(t1, "Timeframe", "dl_timeframe", list(_dl_tf_map.keys()), default="5m")
+    dl_period = cfg_selectbox(t2, "Period", "dl_period", _dl_tf_map.get(dl_tf, ["1d"]),
+                              default=_dl_tf_map.get(dl_tf, ["1d"])[0])
+    dl_fmt = cfg_selectbox(t3, "File format", "dl_format", ["CSV", "Excel (.xlsx)"], default="CSV")
+
+    if _is_deriv:
+        st.info("Derivatives data is served by Dhan and needs a valid Access Token in the sidebar's "
+                "🔐 Dhan Account section. yfinance has no options or futures candles.")
+
+    if st.button("⬇️ Fetch data", type="primary"):
+        _df_dl, _err = None, None
+        try:
+            if _is_deriv:
+                _cid, _tok = _dhan_creds()
+                if not _tok:
+                    _err = "No Dhan Access Token — derivatives cannot be fetched."
+                elif not dl_sec_id:
+                    _err = "The contract has not been resolved yet."
+                else:
+                    _df_dl = _dhan_fetch_candles_cached(dl_sec_id, dl_segment, dl_instr,
+                                                        dl_tf, dl_period, hash(_tok) % 10_000_019)
+                    _df_dl = normalize_index_to_ist(_df_dl, "")
+            else:
+                _df_dl = fetch_data(dl_ticker, dl_tf, dl_period)
+        except Exception as exc:
+            _err = f"{type(exc).__name__}: {exc}"
+
+        if _err:
+            st.error(_err)
+        elif _df_dl is None or _df_dl.empty:
+            st.warning("No data returned. Common causes: the market has never traded this contract, the period "
+                       "exceeds what the source retains for this timeframe, or the token/expiry is wrong.")
+        else:
+            _out = _df_dl.copy()
+            _out.index.name = "Datetime (IST)"
+            _out = _out.reset_index()
+            st.session_state["dl_result"] = _out
+            st.session_state["dl_name"] = f"{_label or 'data'}_{dl_tf}_{dl_period}".replace(" ", "_")
+
+    _res_dl = st.session_state.get("dl_result")
+    if _res_dl is not None and not _res_dl.empty:
+        st.success(f"{len(_res_dl):,} rows fetched.")
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Rows", f"{len(_res_dl):,}")
+        try:
+            c2.metric("From", str(_res_dl.iloc[0, 0])[:16])
+            c3.metric("To", str(_res_dl.iloc[-1, 0])[:16])
+            c4.metric("Last close", f"{float(_res_dl['Close'].iloc[-1]):,.2f}")
+        except Exception:
+            pass
+        st.dataframe(_res_dl.tail(200), hide_index=True, use_container_width=True, height=380)
+        st.caption("Preview shows the most recent 200 rows; the download contains everything fetched.")
+
+        _fname = st.session_state.get("dl_name", "data")
+        if dl_fmt.startswith("CSV"):
+            st.download_button("⬇️ Download CSV", _res_dl.to_csv(index=False).encode(),
+                               file_name=f"{_fname}.csv", mime="text/csv", key="dl_btn_csv")
+        else:
+            try:
+                _buf = io.BytesIO()
+                with pd.ExcelWriter(_buf, engine="xlsxwriter") as _xw:
+                    _res_dl.to_excel(_xw, index=False, sheet_name="Data")
+                st.download_button("⬇️ Download Excel", _buf.getvalue(), file_name=f"{_fname}.xlsx",
+                                   mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                   key="dl_btn_xlsx")
+            except Exception as exc:
+                st.warning(f"Excel export needs the xlsxwriter package ({exc}). Falling back to CSV.")
+                st.download_button("⬇️ Download CSV instead", _res_dl.to_csv(index=False).encode(),
+                                   file_name=f"{_fname}.csv", mime="text/csv", key="dl_btn_csv_fb")
+
+
 # ---------------------------------------------------------------- ADMIN ----
 with tab_admin:
     # READ-ONLY by design. This panel used to render a second, editable copy
@@ -8312,6 +8824,59 @@ with tab_admin:
         st.info("Persistence is OFF (default): everything lives in memory only, so an open position is lost if the "
                 "browser tab is discarded or the machine sleeps. Enable it to survive restarts and to unlock the "
                 "multi-day analysis windows on the Option Chain tab.")
+
+    st.markdown("##### 📦 Delivery Positions (carried over from intraday)")
+    if not _db_on:
+        st.caption("Enable the database above to store and resume delivery conversions across sessions.")
+    else:
+        _dp_open = db_load_delivery_positions("OPEN")
+        _dp_all = db_load_delivery_positions()
+        if not _dp_all:
+            st.caption("No positions have been converted to delivery yet. When an intraday position has hit neither "
+                       "SL nor target by the configured cut-off, it is carried over and listed here.")
+        else:
+            _dp_df = pd.DataFrame([{
+                "ID": r["id"], "Converted": str(r["converted_at"])[:19].replace("T", " "),
+                "Ticker": r["ticker"], "Instrument": r["instrument"], "Strategy": r["strategy"],
+                "Direction": r["direction"], "Entry": r["entry_price"], "Qty": r["qty"],
+                "SL": r["sl"], "Target": r["target"], "Status": r["status"],
+                "Resumed": str(r["resumed_at"] or "")[:19].replace("T", " "),
+            } for r in _dp_all])
+            st.dataframe(_dp_df, hide_index=True, use_container_width=True)
+
+            if _dp_open:
+                _opts = {f"#{r['id']} · {r['ticker']} · {r['direction']} {r['qty']} @ {r['entry_price']}": r
+                         for r in _dp_open}
+                _pick = st.selectbox("Select a delivery position", list(_opts.keys()), key="dp_pick")
+                _row = _opts[_pick]
+                r1, r2, r3 = st.columns(3)
+                if r1.button("▶ Resume trading this position", use_container_width=True, key="dp_resume"):
+                    try:
+                        _pos = json.loads(_row["payload"])
+                        # Clear the conversion flag so the normal exit rules
+                        # (SL, target, signal exits) manage it again from now on.
+                        _pos["converted_to_delivery"] = False
+                        _pos.pop("delivery_converted_at", None)
+                        _pos["resumed_from_delivery"] = True
+                        if _pos.get("entry_time"):
+                            try:
+                                _pos["entry_time"] = pd.to_datetime(_pos["entry_time"])
+                            except Exception:
+                                pass
+                        st.session_state.live_positions = [_pos]
+                        db_update_delivery_status(_row["id"], "RESUMED", "resumed_at")
+                        db_save_open_position(_pos, _row["ticker"], _row["strategy"])
+                        st.success(f"Position #{_row['id']} on {_row['ticker']} is live again — the Live Trading tab "
+                                   "will manage it under the current SL/target rules.")
+                    except Exception as exc:
+                        st.error(f"Could not resume: {exc}")
+                if r2.button("✔ Mark as closed", use_container_width=True, key="dp_close"):
+                    db_update_delivery_status(_row["id"], "CLOSED", "closed_at")
+                    st.success(f"Position #{_row['id']} marked closed.")
+                r3.caption("Resuming loads it as the active live position. Only one position is managed at a time, "
+                           "so any currently open position is replaced.")
+            else:
+                st.caption("No delivery positions are currently open.")
 
     st.markdown("##### 🏦 Broker / Feed / Notifications")
     st.json({
