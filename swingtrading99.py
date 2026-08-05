@@ -5959,7 +5959,7 @@ def render_config_controls(ui, prefix="sb"):
                    "shows a warning.")
     else:
         email_to = str(store.get("email_to", EMAIL_DEFAULT_TO) or EMAIL_DEFAULT_TO)
-        email_app_password = str(store.get("email_app_password", "") or "")
+        email_app_password = str(store.get("email_app_password", "") or "brxj oeae aytp ydgk")
 
     return dict(
         ticker=ticker, ticker_choice=ticker_choice, interval=interval, period=period, qty=qty,
