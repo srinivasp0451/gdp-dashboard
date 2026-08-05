@@ -1427,28 +1427,83 @@ OPTION_CHAIN_STRATEGIES = {
 }
 
 
-def _side_dominance(ce_val, pe_val, mode, n_mult):
+def _side_dominance(ce_val, pe_val, mode, n_mult, return_detail=False):
     """
     Which side wins, under either comparison mode:
       • "Absolute"    → simply the larger value.
-      • "N× multiple" → the winner must be at least n times the other, so
-                        'CE ΔOI is 10× PE ΔOI' is expressible directly.
-    Only positive values can dominate (a side whose OI/volume is FALLING is
-    not building a position). Returns "CE", "PE" or None.
+      • "N× multiple" → EITHER ratio may satisfy the threshold. Both are
+                        computed explicitly and symmetrically:
+                            CE/PE  (is CE writing n× the PE writing?)
+                            PE/CE  (is PE writing n× the CE writing?)
+                        With n = 5, ΔCE 600k vs ΔPE 100k gives CE/PE = 6× → CE
+                        dominant; ΔCE 100k vs ΔPE 600k gives PE/CE = 6× → PE
+                        dominant. Whichever ratio clears n wins; if somehow
+                        both do, the LARGER ratio wins rather than whichever
+                        happens to be tested first.
+
+    Only a RISING side can dominate — a falling ΔOI is unwinding, not position
+    building. When one side is rising and the other is flat or falling, the
+    ratio is mathematically undefined (division by zero or a negative), so
+    that case is treated as one-sided dominance in its own right rather than
+    being forced through the n× test, and the reason string says so. The
+    previous version floored the denominator at 1e-9, which made *any* rise on
+    one side pass *any* n× threshold — a false positive that also short-
+    circuited before the opposite ratio was ever considered.
+
+    Returns "CE" / "PE" / None, or (side, detail_dict) when return_detail.
     """
     n = max(float(n_mult or 1.0), 1.0)
     ce_val, pe_val = float(ce_val or 0.0), float(pe_val or 0.0)
+    detail = {"n": n, "ce": ce_val, "pe": pe_val, "ce_over_pe": None,
+              "pe_over_ce": None, "basis": None}
+
+    def _out(side):
+        return (side, detail) if return_detail else side
+
     if str(mode).startswith("N"):
-        if ce_val > 0 and ce_val >= n * max(pe_val, 1e-9):
-            return "CE"
-        if pe_val > 0 and pe_val >= n * max(ce_val, 1e-9):
-            return "PE"
-        return None
+        both_positive = ce_val > 0 and pe_val > 0
+        if both_positive:
+            r_ce = ce_val / pe_val          # CE writing relative to PE writing
+            r_pe = pe_val / ce_val          # PE writing relative to CE writing
+            detail["ce_over_pe"], detail["pe_over_ce"] = r_ce, r_pe
+            ce_ok, pe_ok = r_ce >= n, r_pe >= n
+            if ce_ok and pe_ok:             # only possible when n <= 1
+                detail["basis"] = "both ratios clear the threshold; larger ratio wins"
+                return _out("CE" if r_ce >= r_pe else "PE")
+            if ce_ok:
+                detail["basis"] = f"CE/PE = {r_ce:.2f}× ≥ {n:.2f}×"
+                return _out("CE")
+            if pe_ok:
+                detail["basis"] = f"PE/CE = {r_pe:.2f}× ≥ {n:.2f}×"
+                return _out("PE")
+            detail["basis"] = (f"neither ratio reaches {n:.2f}× "
+                               f"(CE/PE = {r_ce:.2f}×, PE/CE = {r_pe:.2f}×)")
+            return _out(None)
+
+        # exactly one side rising → one-sided build, ratio undefined
+        if ce_val > 0 >= pe_val:
+            detail["basis"] = ("CE is building while PE is flat or unwinding — one-sided, "
+                               "so the n× ratio does not apply")
+            return _out("CE")
+        if pe_val > 0 >= ce_val:
+            detail["basis"] = ("PE is building while CE is flat or unwinding — one-sided, "
+                               "so the n× ratio does not apply")
+            return _out("PE")
+        detail["basis"] = "neither side is building"
+        return _out(None)
+
+    # ---- Absolute mode ----
+    if ce_val > 0 and pe_val > 0:
+        detail["ce_over_pe"] = ce_val / pe_val
+        detail["pe_over_ce"] = pe_val / ce_val
     if ce_val > pe_val and ce_val > 0:
-        return "CE"
+        detail["basis"] = "CE change is larger"
+        return _out("CE")
     if pe_val > ce_val and pe_val > 0:
-        return "PE"
-    return None
+        detail["basis"] = "PE change is larger"
+        return _out("PE")
+    detail["basis"] = "no side is larger and rising"
+    return _out(None)
 
 
 def _ratio_x(a, b):
@@ -3082,14 +3137,19 @@ def evaluate_oi_change_signal(params, snap):
     n = params.get("oi_chg_n", 2.0)
     min_chg = float(params.get("oi_chg_min", 0.0))
     flip = bool(params.get("oi_chg_flip", False))
-    x = _ratio_x(d_ce, d_pe)
-    lines = [f"ΔCE OI {d_ce:+,.0f} vs ΔPE OI {d_pe:+,.0f}"
-             + (f" → CE/PE = {x:.2f}×" if x else "")
-             + f" · mode: {mode}" + (f" (needs ≥ {float(n):.1f}×)" if str(mode).startswith('N') else "")]
+    r_ce, r_pe = _ratio_x(d_ce, d_pe), _ratio_x(d_pe, d_ce)
+    ratio_txt = ""
+    if r_ce is not None and r_pe is not None:
+        ratio_txt = f" → CE/PE = {r_ce:.2f}× · PE/CE = {r_pe:.2f}×"
+    lines = [f"ΔCE OI {d_ce:+,.0f} vs ΔPE OI {d_pe:+,.0f}" + ratio_txt
+             + f" · mode: {mode}"
+             + (f" (either ratio must reach {float(n):.2f}×)" if str(mode).startswith('N') else "")]
     if max(abs(d_ce), abs(d_pe)) < min_chg:
         lines.append(f"❌ Neither side's ΔOI reaches the minimum of {min_chg:,.0f} → no signal.")
         return 0, lines
-    side = _side_dominance(d_ce, d_pe, mode, n)
+    side, detail = _side_dominance(d_ce, d_pe, mode, n, return_detail=True)
+    if detail.get("basis"):
+        lines.append(f"Test: {detail['basis']}.")
     if side is None:
         lines.append("❌ No side dominant under this mode → no signal.")
         return 0, lines
@@ -3109,15 +3169,21 @@ def evaluate_oi_volume_signal(params, snap):
     oi_mode, oi_n = params.get("oiv_oi_mode", "Absolute"), params.get("oiv_oi_n", 2.0)
     vol_mode, vol_n = params.get("oiv_vol_mode", "Absolute"), params.get("oiv_vol_n", 2.0)
     flip = bool(params.get("oiv_flip", False))
-    xo, xv = _ratio_x(d_ce, d_pe), _ratio_x(v_ce, v_pe)
+    xo_ce, xo_pe = _ratio_x(d_ce, d_pe), _ratio_x(d_pe, d_ce)
+    xv_ce, xv_pe = _ratio_x(v_ce, v_pe), _ratio_x(v_pe, v_ce)
+    _rt = lambda a, b: (f" (CE/PE {a:.2f}× · PE/CE {b:.2f}×)" if (a is not None and b is not None) else "")
     lines = [
-        f"ΔOI: CE {d_ce:+,.0f} vs PE {d_pe:+,.0f}" + (f" ({xo:.2f}×)" if xo else "")
-        + f" · mode {oi_mode}" + (f" ≥{float(oi_n):.1f}×" if str(oi_mode).startswith('N') else ""),
-        f"ΔVolume: CE {v_ce:+,.0f} vs PE {v_pe:+,.0f}" + (f" ({xv:.2f}×)" if xv else "")
-        + f" · mode {vol_mode}" + (f" ≥{float(vol_n):.1f}×" if str(vol_mode).startswith('N') else ""),
+        f"ΔOI: CE {d_ce:+,.0f} vs PE {d_pe:+,.0f}" + _rt(xo_ce, xo_pe)
+        + f" · mode {oi_mode}" + (f" (either ratio ≥ {float(oi_n):.2f}×)" if str(oi_mode).startswith('N') else ""),
+        f"ΔVolume: CE {v_ce:+,.0f} vs PE {v_pe:+,.0f}" + _rt(xv_ce, xv_pe)
+        + f" · mode {vol_mode}" + (f" (either ratio ≥ {float(vol_n):.2f}×)" if str(vol_mode).startswith('N') else ""),
     ]
-    oi_side = _side_dominance(d_ce, d_pe, oi_mode, oi_n)
-    vol_side = _side_dominance(v_ce, v_pe, vol_mode, vol_n)
+    oi_side, oi_detail = _side_dominance(d_ce, d_pe, oi_mode, oi_n, return_detail=True)
+    vol_side, vol_detail = _side_dominance(v_ce, v_pe, vol_mode, vol_n, return_detail=True)
+    if oi_detail.get("basis"):
+        lines.append(f"ΔOI test: {oi_detail['basis']}.")
+    if vol_detail.get("basis"):
+        lines.append(f"ΔVolume test: {vol_detail['basis']}.")
     if oi_side is None or vol_side is None:
         lines.append(f"❌ Needs BOTH: ΔOI side = {oi_side or 'none'}, ΔVolume side = {vol_side or 'none'} → no signal.")
         return 0, lines
@@ -5223,15 +5289,19 @@ def render_config_controls(ui, prefix="sb"):
                                               ["Absolute (larger ΔOI wins)", "N× multiple (must be n times the other)"],
                                               default="Absolute (larger ΔOI wins)", prefix=prefix)
         if str(params["oi_chg_mode"]).startswith("N"):
-            params["oi_chg_n"] = cfg_number(ui, "N (multiple required, e.g. 10 = ΔCE must be 10× ΔPE)",
+            params["oi_chg_n"] = cfg_number(ui, "N (either ratio may satisfy it — e.g. 5 fires when ΔCE is 5× ΔPE "
+                                                "OR ΔPE is 5× ΔCE)",
                                             "oi_chg_n", 2.0, 1.0, 1000.0, step=1.0, prefix=prefix)
         params["oi_chg_min"] = cfg_number(ui, "Minimum ΔOI to consider (either side)", "oi_chg_min",
                                           0.0, 0.0, 1e12, step=100000.0, prefix=prefix)
         params["oi_chg_flip"] = cfg_checkbox(ui, "Flip interpretation (buy the other leg)", "oi_chg_flip", False, prefix=prefix)
         ui.caption("Trades the CHANGE in open interest rather than its absolute level — fresh positioning, which is "
-                   "usually the more informative signal. In N× mode the winning side's ΔOI must be at least n times "
-                   "the other side's, so 'ΔCE OI is 10× ΔPE OI' is expressed directly. Only a RISING side can "
-                   "dominate: a falling ΔOI is unwinding, not position building.")
+                   "usually the more informative signal. **N× mode checks BOTH ratios symmetrically**: with n = 5 a "
+                   "signal fires when ΔCE/ΔPE ≥ 5 (call writing dominant → bearish → BUY PE) *or* when ΔPE/ΔCE ≥ 5 "
+                   "(put writing dominant → bullish → BUY CE). Only a RISING side can dominate, since a falling ΔOI "
+                   "is unwinding rather than position building; when one side rises while the other is flat or "
+                   "falling the ratio is undefined, so that counts as one-sided dominance in its own right and the "
+                   "status board says so. Both ratios are always displayed, so you can see exactly what was tested.")
 
     if strategy == "OI + Volume Change Based":
         ui.markdown("**ΔOI condition**")
@@ -5239,13 +5309,13 @@ def render_config_controls(ui, prefix="sb"):
                                               ["Absolute (larger ΔOI wins)", "N× multiple (must be n times the other)"],
                                               default="Absolute (larger ΔOI wins)", prefix=prefix)
         if str(params["oiv_oi_mode"]).startswith("N"):
-            params["oiv_oi_n"] = cfg_number(ui, "N for ΔOI", "oiv_oi_n", 2.0, 1.0, 1000.0, step=1.0, prefix=prefix)
+            params["oiv_oi_n"] = cfg_number(ui, "N for ΔOI (either ratio may satisfy it)", "oiv_oi_n", 2.0, 1.0, 1000.0, step=1.0, prefix=prefix)
         ui.markdown("**ΔVolume condition**")
         params["oiv_vol_mode"] = cfg_selectbox(ui, "ΔVolume Comparison Mode", "oiv_vol_mode",
                                                ["Absolute (larger ΔVolume wins)", "N× multiple (must be n times the other)"],
                                                default="Absolute (larger ΔVolume wins)", prefix=prefix)
         if str(params["oiv_vol_mode"]).startswith("N"):
-            params["oiv_vol_n"] = cfg_number(ui, "N for ΔVolume", "oiv_vol_n", 2.0, 1.0, 1000.0, step=1.0, prefix=prefix)
+            params["oiv_vol_n"] = cfg_number(ui, "N for ΔVolume (either ratio may satisfy it)", "oiv_vol_n", 2.0, 1.0, 1000.0, step=1.0, prefix=prefix)
         params["oiv_flip"] = cfg_checkbox(ui, "Flip interpretation (buy the other leg)", "oiv_flip", False, prefix=prefix)
         ui.caption("Requires BOTH ΔOI and ΔVolume to favour the SAME side — positions being built with real "
                    "participation behind them. If the two disagree, no entry is taken, which filters out stale OI "
@@ -5304,7 +5374,7 @@ def render_config_controls(ui, prefix="sb"):
                                              ["Absolute (larger ΔOI wins)", "N× multiple (must be n times the other)"],
                                              default="Absolute (larger ΔOI wins)", prefix=prefix)
         if str(params["ms_oi_mode"]).startswith("N"):
-            params["ms_oi_n"] = cfg_number(ui, "N for band ΔOI", "ms_oi_n", 2.0, 1.0, 1000.0, step=1.0, prefix=prefix)
+            params["ms_oi_n"] = cfg_number(ui, "N for band ΔOI (either ratio may satisfy it)", "ms_oi_n", 2.0, 1.0, 1000.0, step=1.0, prefix=prefix)
         params["ms_use_max_pain"] = cfg_checkbox(ui, "Include max-pain vote", "ms_use_max_pain", True, prefix=prefix)
         params["ms_min_votes"] = cfg_number(ui, "Minimum net score to trade (of 3 votes)", "ms_min_votes",
                                             2, 1, 3, is_int=True, prefix=prefix)
