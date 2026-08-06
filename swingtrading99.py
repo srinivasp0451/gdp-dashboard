@@ -3949,23 +3949,56 @@ def zero_hero_state(df, params):
     long_ok = out["expiry"] & out["window"] & out["break_up"] & out["vwap_up"] & out["thrust_up"] & out["volume"]
     short_ok = out["expiry"] & out["window"] & out["break_dn"] & out["vwap_dn"] & out["thrust_dn"] & out["volume"]
 
+    # keep the pre-debounce state so the status board can explain itself
+    out["raw_long"], out["raw_short"] = long_ok.copy(), short_ok.copy()
+
+    # 7 ── FRESH TRIGGER ONLY.
+    # A breakout condition stays true for as long as price remains beyond the
+    # range — often hundreds of bars. Treating every one of those as a new
+    # entry means one setup is counted dozens of times, which both spams
+    # entries and burns the daily cap within a minute or two of the same move.
+    # An entry therefore requires the condition to have been FALSE on the
+    # previous bar (a genuine fresh cross), optionally followed by a cooldown
+    # before the same side can trigger again.
+    cooldown = int(params.get("zh_cooldown_bars", 0))
+    fresh_long = long_ok & (~long_ok.shift(1).fillna(False))
+    fresh_short = short_ok & (~short_ok.shift(1).fillna(False))
+    if cooldown > 0:
+        def _apply_cooldown(mask):
+            kept = pd.Series(False, index=mask.index)
+            last = -10 ** 9
+            for i, (ts, v) in enumerate(mask.items()):
+                if v and (i - last) > cooldown:
+                    kept.iloc[i] = True
+                    last = i
+            return kept
+        fresh_long = _apply_cooldown(fresh_long)
+        fresh_short = _apply_cooldown(fresh_short)
+    long_ok, short_ok = fresh_long, fresh_short
+    out["fresh_long"], out["fresh_short"] = fresh_long.copy(), fresh_short.copy()
+
     # 8 ── cap entries per day so a choppy expiry cannot bleed the account
     max_per_day = int(params.get("zh_max_per_day", 2))
+    out["used_today"] = 0
+    out["cap_blocked"] = False
     if max_per_day > 0:
         try:
             day = pd.Index(pd.DatetimeIndex(idx).normalize())
-            raw = pd.Series(0, index=idx)
-            raw[long_ok] = 1
-            raw[short_ok] = -1
-            fired = (raw != 0)
+            fired = long_ok | short_ok
             rank = fired.groupby(day).cumsum()
             allowed = fired & (rank <= max_per_day)
+            # How many entries the CURRENT day has already used, for the board.
+            last_day = day[-1]
+            same_day = pd.Series(day == last_day, index=idx)
+            out["used_today"] = int((allowed & same_day).sum())
+            out["cap_blocked"] = bool(fired.iloc[-1] and not allowed.iloc[-1])
             long_ok = long_ok & allowed
             short_ok = short_ok & allowed
         except Exception:
             pass
 
     out["long"], out["short"] = long_ok, short_ok
+    out["max_per_day"] = max_per_day
     return out
 
 
@@ -6139,10 +6172,16 @@ def render_config_controls(ui, prefix="sb"):
                    "still carry morning volatility; after ~13:30 theta decay accelerates so sharply that even a "
                    "correct directional call often loses money. Entering late is the most common way to lose the "
                    "whole premium.")
-        params["zh_max_per_day"] = cfg_number(ui, "Maximum entries per day (0 = unlimited)", "zh_max_per_day",
+        c1, c2 = ui.columns(2)
+        params["zh_max_per_day"] = cfg_number(c1, "Maximum entries per day (0 = unlimited)", "zh_max_per_day",
                                               2, 0, 20, is_int=True, prefix=prefix)
-        ui.caption("A hard cap. On a choppy expiry the setup can trigger repeatedly and each failure costs a full "
-                   "premium — over-trading is how small losses stop being small.")
+        params["zh_cooldown_bars"] = cfg_number(c2, "Cooldown between entries (bars, 0 = off)", "zh_cooldown_bars",
+                                                15, 0, 500, is_int=True, prefix=prefix)
+        ui.caption("A breakout condition stays true for as long as price holds beyond the range, so entries fire "
+                   "only on the FIRST qualifying bar of each move — a later bar of the same breakout is a "
+                   "continuation, not a new setup. The cooldown then keeps the same side from re-triggering "
+                   "immediately, and the daily cap is the final backstop: on a choppy expiry each failed attempt "
+                   "costs a full premium, and over-trading is how small losses stop being small.")
 
         ui.markdown("**📈 Entry confluence** (every condition must hold on the same bar)")
         params["zh_use_opening_range"] = cfg_checkbox(ui, "Use opening-range breakout", "zh_use_opening_range",
@@ -7413,10 +7452,42 @@ def describe_signal_status(df, strategy, params, filters):
                              f"(needs {float(params.get('zh_vol_n', 1.5)):.2f}×): {_mark(zh['volume'].iloc[_i])}")
             else:
                 lines.append("   6. Volume: this feed carries no volume for the index — condition auto-passes.")
+            # ---- conditions 7 & 8: these ALSO gate the entry, so they must be
+            # ---- displayed or the board can appear to contradict itself
+            # ---- (all six green yet "no trade").
+            _raw_ok = bool(zh["raw_long"].iloc[_i]) or bool(zh["raw_short"].iloc[_i])
+            _fresh = bool(zh["fresh_long"].iloc[_i]) or bool(zh["fresh_short"].iloc[_i])
+            _cool = int(params.get("zh_cooldown_bars", 0))
+            if _raw_ok and not _fresh:
+                lines.append("   7. Fresh trigger: ❌ — the conditions are met but they were ALREADY met on the "
+                             "previous bar, so this is a continuation of the same breakout rather than a new "
+                             "setup. Entries fire only on the first qualifying bar"
+                             + (f", then after a {_cool}-bar cooldown." if _cool else "."))
+            else:
+                lines.append(f"   7. Fresh trigger: {_mark(_fresh)}"
+                             + (f" (cooldown {_cool} bars)" if _cool else ""))
+            _used, _cap = int(zh.get("used_today", 0)), int(zh.get("max_per_day", 0))
+            if _cap > 0:
+                _cap_left = max(0, _cap - _used)
+                lines.append(f"   8. Daily entry cap: {_used}/{_cap} used today — "
+                             + ("❌ cap reached, no further entries today" if zh.get("cap_blocked") or _cap_left == 0
+                                else f"✅ {_cap_left} remaining"))
+            else:
+                lines.append("   8. Daily entry cap: disabled (unlimited entries)")
+
             _verdict = 1 if bool(zh["long"].iloc[_i]) else (-1 if bool(zh["short"].iloc[_i]) else 0)
+            if _verdict == 0:
+                if _raw_ok and not _fresh:
+                    _why = "all price conditions hold, but this bar continues an existing breakout (see 7)"
+                elif zh.get("cap_blocked"):
+                    _why = "all conditions hold, but today's entry cap is used up (see 8)"
+                else:
+                    _why = "at least one condition is unmet"
+            else:
+                _why = ""
             lines.append("   ➡️ Verdict: " + ("🟢 LONG — buy the CE leg" if _verdict == 1 else
                                               ("🔴 SHORT — buy the PE leg" if _verdict == -1 else
-                                               "⚪ no trade (at least one condition is unmet)")))
+                                               f"⚪ no trade ({_why})")))
             _zsnap = get_zero_hero_snapshot(params)
             _zh_und_lbl = params.get("zh_underlying") or zero_hero_default_underlying()
             if _zsnap:
