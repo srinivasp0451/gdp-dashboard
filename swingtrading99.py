@@ -6679,11 +6679,11 @@ def render_config_controls(ui, prefix="sb"):
         _zh_ce, _zh_ce_msg = select_zero_hero_leg(_zh_snap, 1, params)
         _zh_pe, _zh_pe_msg = select_zero_hero_leg(_zh_snap, -1, params)
         if _zh_ce:
-            ui.caption(f"📈 On a LONG signal → BUY {_zh_ce_msg}")
+            ui.caption(f"📈 LONG signal (upside breakout) → BUY {_zh_ce_msg}")
         else:
             ui.caption(f"📈 LONG leg unresolved — {_zh_ce_msg}")
         if _zh_pe:
-            ui.caption(f"📉 On a SHORT signal → BUY {_zh_pe_msg}")
+            ui.caption(f"📉 SHORT signal (downside breakout) → BUY {_zh_pe_msg}")
         else:
             ui.caption(f"📉 SHORT leg unresolved — {_zh_pe_msg}")
 
@@ -6728,12 +6728,16 @@ def render_config_controls(ui, prefix="sb"):
                                         ["MARKET", "LIMIT"], default="MARKET", prefix=prefix)
         dhan_qty = cfg_number(ui, "Dhan Quantity (lots × lot size)", "dhan_qty",
                               int(_zh_qty_default), 1, 1000000, is_int=True, prefix=prefix)
-        if _zh_ce and _zh_ce.get("premium"):
-            _cost = float(_zh_ce["premium"]) * int(dhan_qty)
-            ui.caption(f"💰 At the current CE premium ₹{_zh_ce['premium']:.2f} × {int(dhan_qty)} qty, one entry "
-                       f"risks about ₹{_cost:,.0f} if the option expires worthless, and ₹"
-                       f"{_cost * float(params.get('zh_sl_pct', 50)) / 100:,.0f} if the "
-                       f"{float(params.get('zh_sl_pct', 50)):.0f}% stop is honoured.")
+        _zh_sl_p = float(params.get("zh_sl_pct", 50.0))
+        _cost_bits = []
+        for _lg, _nm in ((_zh_ce, "CE"), (_zh_pe, "PE")):
+            if _lg and _lg.get("premium"):
+                _c = float(_lg["premium"]) * int(dhan_qty)
+                _cost_bits.append(f"**{_nm}** ₹{_lg['premium']:.2f} × {int(dhan_qty)} = ₹{_c:,.0f} at risk "
+                                  f"(₹{_c * _zh_sl_p / 100:,.0f} if the {_zh_sl_p:.0f}% stop holds)")
+        if _cost_bits:
+            ui.caption("💰 Cost per entry — only ONE leg is bought per signal, whichever way the breakout goes: "
+                       + " · ".join(_cost_bits) + ".")
         product_cfg = {
             "instrument": "Index Options",
             "exchange": _zh_meta2["exchange"],
@@ -6751,8 +6755,11 @@ def render_config_controls(ui, prefix="sb"):
             "zh_target_x": params.get("zh_target_x", 4.0),
             "zh_time_stop_min": params.get("zh_time_stop_min", 45),
         }
-        ui.caption("Contracts are re-resolved whenever the underlying, expiry or selection settings change, so the "
-                   "leg never goes stale. Product is INTRADAY — a zero-hero position is not something to carry.")
+        ui.caption("The strategy is fully symmetric: an upside breakout buys the CE, a downside breakout buys the "
+                   "PE, and only one leg is ever bought per signal. Both are listed above so you can see each "
+                   "candidate and its cost in advance. Contracts are re-resolved whenever the underlying, expiry or "
+                   "selection settings change, so the leg never goes stale. Product is INTRADAY — a zero-hero "
+                   "position is not something to carry.")
     elif chain_strategy and not options_mode and not premium_mode:
         # ---- OPTION-CHAIN STRATEGY EXECUTION ----------------------------
         # These strategies read the chain but their signals must be TRADED as
@@ -7413,16 +7420,44 @@ def describe_signal_status(df, strategy, params, filters):
             _zsnap = get_zero_hero_snapshot(params)
             _zh_und_lbl = params.get("zh_underlying") or zero_hero_default_underlying()
             if _zsnap:
-                _leg, _lmsg = select_zero_hero_leg(_zsnap, _verdict if _verdict else 1, params)
-                lines.append(f"   🎟 Contract that would be bought ({_zh_und_lbl}, expiry "
-                             f"{params.get('zh_expiry', 'n/a')}, spot "
-                             f"{_zsnap.get('underlying') or 0:,.2f}): {_lmsg}")
-                if _leg and _leg.get("premium"):
+                _hdr = (f"({_zh_und_lbl}, expiry {params.get('zh_expiry', 'n/a')}, "
+                        f"spot {_zsnap.get('underlying') or 0:,.2f})")
+
+                def _zh_plan(_leg):
+                    """Premium plan line for a resolved leg."""
+                    if not (_leg and _leg.get("premium")):
+                        return None
                     _p = float(_leg["premium"])
                     _slp = _p * (1 - float(params.get("zh_sl_pct", 50.0)) / 100.0)
                     _tgp = _p * float(params.get("zh_target_x", 4.0))
-                    lines.append(f"   🛡 Premium plan: pay ₹{_p:.2f} → stop ₹{_slp:.2f} · target ₹{_tgp:.2f} "
-                                 f"· time stop {int(params.get('zh_time_stop_min', 45))}m")
+                    return (f"pay ₹{_p:.2f} → stop ₹{_slp:.2f} · target ₹{_tgp:.2f} "
+                            f"· time stop {int(params.get('zh_time_stop_min', 45))}m")
+
+                if _verdict != 0:
+                    # A signal exists, so exactly one leg is actually bought.
+                    _leg, _lmsg = select_zero_hero_leg(_zsnap, _verdict, params)
+                    _side = "CE" if _verdict == 1 else "PE"
+                    lines.append(f"   🎟 Contract being bought NOW {_hdr}: {_lmsg}")
+                    _pl = _zh_plan(_leg)
+                    if _pl:
+                        lines.append(f"   🛡 Premium plan ({_side}): {_pl}")
+                else:
+                    # No signal yet: show BOTH candidates, because which leg is
+                    # bought depends entirely on WHICH WAY the breakout goes.
+                    # Showing only one would imply the strategy is CE-biased,
+                    # which it is not — it is symmetric.
+                    _ce_leg, _ce_msg = select_zero_hero_leg(_zsnap, 1, params)
+                    _pe_leg, _pe_msg = select_zero_hero_leg(_zsnap, -1, params)
+                    lines.append(f"   🎟 Candidate contracts {_hdr} — no signal yet, so NEITHER is bought. "
+                                 "Which one fires depends on the breakout direction:")
+                    lines.append(f"      📈 if the UP condition triggers → BUY {_ce_msg}")
+                    _pl = _zh_plan(_ce_leg)
+                    if _pl:
+                        lines.append(f"           🛡 {_pl}")
+                    lines.append(f"      📉 if the DOWN condition triggers → BUY {_pe_msg}")
+                    _pl = _zh_plan(_pe_leg)
+                    if _pl:
+                        lines.append(f"           🛡 {_pl}")
             else:
                 lines.append(f"   🎟 Contract ({_zh_und_lbl}): chain snapshot unavailable "
                              "(needs a Dhan token and market hours).")
