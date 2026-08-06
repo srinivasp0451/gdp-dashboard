@@ -76,6 +76,7 @@ STRATEGIES = [
     "PCR Based (Put-Call Ratio)",
     "Gamma Blast (Expiry Momentum)",
     "Multi-Strike OI (ATM ± N Levels)",
+    "Zero Hero (Expiry Day OTM Momentum)",
     "Hybrid (Combine Strategies)",
     "Pro: VWAP + Supertrend Trend",
     "Pro: Opening Range Breakout + Volume",
@@ -130,6 +131,7 @@ STRATEGY_FAMILY = {
     "PCR Based (Put-Call Ratio)": "neutral",
     "Gamma Blast (Expiry Momentum)": "neutral",
     "Multi-Strike OI (ATM ± N Levels)": "neutral",
+    "Zero Hero (Expiry Day OTM Momentum)": "trend",
     "Hybrid (Combine Strategies)": "neutral",
     "Pro: VWAP + Supertrend Trend": "trend",
     "Pro: Opening Range Breakout + Volume": "trend",
@@ -3751,6 +3753,245 @@ def trade_history_fragment():
 # STRATEGY SIGNAL GENERATION  (no look-ahead: signal at i uses data up to i)
 # ============================================================================
 
+# ============================================================================
+# ZERO HERO — EXPIRY-DAY DEEP-OTM MOMENTUM
+# ----------------------------------------------------------------------------
+# The "zero to hero" trade: on expiry day a deep-OTM option costs very little
+# because it has almost no time value left, so a decisive directional move can
+# multiply the premium several times over. The trade-off is inherent and must
+# be stated plainly rather than sold as a free lunch:
+#
+#   • ACCURACY IS LOW BY CONSTRUCTION. Most of these options expire worthless.
+#     A win rate around 20–35% is normal and is not a defect of this
+#     implementation — it is what buying a lottery ticket with positive
+#     expectancy looks like. Any description of zero-hero trading as
+#     "high accuracy" is misleading.
+#   • THE EDGE, IF ANY, IS IN THE PAYOFF RATIO, not the hit rate. One 6× win
+#     pays for many total losses; the entire risk model below exists to make
+#     sure the losses stay small and bounded.
+#   • Theta is brutal and accelerates through the day. Entering late in the
+#     session is the single most common way to lose the whole premium, which
+#     is why the entry window closes well before the cash close.
+#
+# Because of this, the strategy is built as a CONFLUENCE filter that says "no"
+# far more often than "yes". Every condition below must hold on the same bar:
+#   1. Expiry day (or within N days of it).
+#   2. Inside the entry window — late enough for a range to form, early enough
+#      that a move still has time to pay.
+#   3. A genuine range breakout (opening range or rolling range).
+#   4. Direction agrees with session VWAP — the institutional reference.
+#   5. Thrust: the move is large relative to ATR, i.e. real displacement
+#      rather than drift.
+#   6. Volume confirmation: the breakout bar trades a multiple of average.
+#   7. Optional chain confirmation: option writers are unwinding on the side
+#      being bought, which is what actually fuels an expiry-day squeeze.
+#   8. A hard cap on entries per day, because over-trading this setup is how
+#      the small losses stop being small.
+# ============================================================================
+
+ZERO_HERO_STRATEGY = "Zero Hero (Expiry Day OTM Momentum)"
+
+
+def _zero_hero_expiry_mask(index, params):
+    """
+    Which bars fall on an expiry day.
+
+    Dhan exposes the CURRENT expiry list, not a historical calendar, so for
+    backtesting the weekday of the configured expiry is used as a proxy (Nifty
+    weeklies on Thursday, Sensex on Tuesday, and so on). That is an
+    approximation and is disclosed in the UI: holiday-shifted expiries will be
+    mislabelled in historical tests, though live trading uses the real date.
+    """
+    dates = pd.DatetimeIndex(index)
+    max_dte = int(params.get("zh_max_dte", 0))
+    expiry_str = params.get("zh_expiry") or params.get("oi_expiry")
+    exp_dt = None
+    if expiry_str:
+        try:
+            exp_dt = pd.to_datetime(expiry_str).date()
+        except Exception:
+            exp_dt = None
+    if exp_dt is None:
+        return pd.Series(True, index=index), "no expiry configured — every day treated as eligible"
+    today = ist_now().date()
+    if max_dte <= 0:
+        mask = pd.Series(dates.weekday == exp_dt.weekday(), index=index)
+        note = f"expiry weekday = {exp_dt.strftime('%A')} (historical proxy)"
+    else:
+        wd = exp_dt.weekday()
+        days_to = (wd - dates.weekday) % 7
+        mask = pd.Series(days_to <= max_dte, index=index)
+        note = f"within {max_dte} day(s) of a {exp_dt.strftime('%A')} expiry"
+    # The live/current day is known exactly, so use the real date for it.
+    real_dte = (exp_dt - today).days
+    if real_dte >= 0:
+        mask = mask | pd.Series(dates.date == today, index=index) & (real_dte <= max_dte)
+    return mask, note
+
+
+def zero_hero_state(df, params):
+    """Evaluate every Zero Hero condition, returning boolean Series per rule
+    plus a diagnostic dict for the status board."""
+    idx = df.index
+    out = {}
+    close, high, low = df["Close"], df["High"], df["Low"]
+
+    # 1 ── expiry day
+    exp_mask, exp_note = _zero_hero_expiry_mask(idx, params)
+    out["expiry"] = exp_mask.fillna(False)
+    out["expiry_note"] = exp_note
+
+    # 2 ── entry window
+    start_t = params.get("zh_start_time", dtime(9, 45))
+    end_t = params.get("zh_end_time", dtime(13, 30))
+    try:
+        tod = pd.Series(pd.DatetimeIndex(idx).time, index=idx)
+        out["window"] = tod.apply(lambda t: start_t <= t <= end_t)
+    except Exception:
+        out["window"] = pd.Series(True, index=idx)
+
+    # 3 ── range breakout (opening range, or rolling range as a fallback)
+    or_minutes = int(params.get("zh_or_minutes", 15))
+    use_or = bool(params.get("zh_use_opening_range", True))
+    if use_or:
+        try:
+            day = pd.Index(pd.DatetimeIndex(idx).normalize())
+            tod_min = pd.Series(pd.DatetimeIndex(idx).hour * 60 + pd.DatetimeIndex(idx).minute, index=idx)
+            open_min = tod_min.groupby(day).transform("min")
+            in_or = tod_min < (open_min + or_minutes)
+            or_high = high.where(in_or).groupby(day).transform("max").ffill()
+            or_low = low.where(in_or).groupby(day).transform("min").ffill()
+            out["ref_high"], out["ref_low"] = or_high, or_low
+            out["range_label"] = f"opening {or_minutes}m range"
+        except Exception:
+            use_or = False
+    if not use_or:
+        lb = int(params.get("zh_range_lookback", 20))
+        out["ref_high"] = high.rolling(lb).max().shift(1)
+        out["ref_low"] = low.rolling(lb).min().shift(1)
+        out["range_label"] = f"rolling {int(params.get('zh_range_lookback', 20))}-bar range"
+
+    buf = float(params.get("zh_break_buffer", 0.0))
+    out["break_up"] = (close > out["ref_high"] + buf).fillna(False)
+    out["break_dn"] = (close < out["ref_low"] - buf).fillna(False)
+
+    # 4 ── VWAP agreement
+    if params.get("zh_use_vwap", True):
+        v = vwap(df)
+        out["vwap"] = v
+        out["vwap_up"] = (close > v).fillna(False)
+        out["vwap_dn"] = (close < v).fillna(False)
+    else:
+        out["vwap"] = pd.Series(np.nan, index=idx)
+        out["vwap_up"] = out["vwap_dn"] = pd.Series(True, index=idx)
+
+    # 5 ── thrust relative to ATR (real displacement, not drift)
+    a = atr(df, 14)
+    k = int(params.get("zh_thrust_bars", 3))
+    thrust_mult = float(params.get("zh_thrust_atr", 1.0))
+    move = close - close.shift(k)
+    out["atr"] = a
+    out["thrust_val"] = (move / a.replace(0, np.nan))
+    out["thrust_up"] = (move >= a * thrust_mult).fillna(False)
+    out["thrust_dn"] = (move <= -a * thrust_mult).fillna(False)
+
+    # 6 ── volume confirmation
+    vol_n = float(params.get("zh_vol_n", 1.5))
+    vw = int(params.get("zh_vol_window", 20))
+    if "Volume" in df.columns and df["Volume"].notna().any() and df["Volume"].sum() > 0:
+        avg = df["Volume"].rolling(vw).mean()
+        out["vol_ratio"] = df["Volume"] / avg.replace(0, np.nan)
+        out["volume"] = (out["vol_ratio"] >= vol_n).fillna(False)
+    else:
+        out["vol_ratio"] = pd.Series(np.nan, index=idx)
+        out["volume"] = pd.Series(True, index=idx)   # index feeds often lack volume
+
+    # 7 ── combine
+    long_ok = out["expiry"] & out["window"] & out["break_up"] & out["vwap_up"] & out["thrust_up"] & out["volume"]
+    short_ok = out["expiry"] & out["window"] & out["break_dn"] & out["vwap_dn"] & out["thrust_dn"] & out["volume"]
+
+    # 8 ── cap entries per day so a choppy expiry cannot bleed the account
+    max_per_day = int(params.get("zh_max_per_day", 2))
+    if max_per_day > 0:
+        try:
+            day = pd.Index(pd.DatetimeIndex(idx).normalize())
+            raw = pd.Series(0, index=idx)
+            raw[long_ok] = 1
+            raw[short_ok] = -1
+            fired = (raw != 0)
+            rank = fired.groupby(day).cumsum()
+            allowed = fired & (rank <= max_per_day)
+            long_ok = long_ok & allowed
+            short_ok = short_ok & allowed
+        except Exception:
+            pass
+
+    out["long"], out["short"] = long_ok, short_ok
+    return out
+
+
+def select_zero_hero_leg(snap, direction, params):
+    """
+    Choose the deep-OTM contract to buy.
+
+    Two selection modes, because traders think about this in two different ways:
+      • Premium band — "buy something between ₹3 and ₹15". This is the more
+        robust choice: it automatically adapts to volatility and to how much
+        time is left, and it directly bounds the risk per lot.
+      • Strike distance — a fixed number of strikes out of the money.
+    Returns (info_dict, explanation) or (None, reason).
+    """
+    if not snap or not snap.get("strikes"):
+        return None, "no option chain snapshot available"
+    strikes = snap["strikes"]
+    ks = sorted(strikes.keys())
+    spot = snap.get("underlying")
+    if spot is None:
+        return None, "underlying price unavailable"
+    atm = min(ks, key=lambda s: abs(s - float(spot)))
+    leg = "CE" if direction == 1 else "PE"
+    ltp_key = "ce_ltp" if leg == "CE" else "pe_ltp"
+
+    mode = params.get("zh_leg_mode", "Premium band")
+    if str(mode).startswith("Strike"):
+        offset = int(params.get("zh_strike_offset", 5))
+        ai = ks.index(atm)
+        # OTM is ABOVE spot for calls and BELOW for puts.
+        ti = ai + offset if leg == "CE" else ai - offset
+        ti = max(0, min(len(ks) - 1, ti))
+        k = ks[ti]
+        row = strikes[k]
+        return ({"strike": k, "leg": leg, "premium": row.get(ltp_key),
+                 "atm": atm, "offset": offset},
+                f"{offset} strikes OTM from ATM {atm:.0f} → {k:.0f} {leg} @ ₹{row.get(ltp_key, 0):.2f}")
+
+    lo = float(params.get("zh_prem_min", 3.0))
+    hi = float(params.get("zh_prem_max", 15.0))
+    # Only genuinely OTM contracts qualify — an ITM option trading cheap is a
+    # different trade entirely.
+    candidates = []
+    for k in ks:
+        if leg == "CE" and k <= atm:
+            continue
+        if leg == "PE" and k >= atm:
+            continue
+        prem = strikes[k].get(ltp_key)
+        if prem is None or prem <= 0:
+            continue
+        if lo <= prem <= hi:
+            candidates.append((k, prem))
+    if not candidates:
+        return None, f"no OTM {leg} priced between ₹{lo:.2f} and ₹{hi:.2f} right now"
+    # Prefer the closest-to-money contract inside the band: it has the highest
+    # delta of the qualifying set, so it responds fastest to the move.
+    k, prem = (min(candidates, key=lambda c: c[0]) if leg == "CE"
+               else max(candidates, key=lambda c: c[0]))
+    return ({"strike": k, "leg": leg, "premium": prem, "atm": atm,
+             "offset": abs(ks.index(k) - ks.index(atm))},
+            f"ATM {atm:.0f} → {k:.0f} {leg} @ ₹{prem:.2f} (band ₹{lo:.0f}–₹{hi:.0f}, "
+            f"{abs(ks.index(k) - ks.index(atm))} strikes OTM)")
+
+
 def generate_signals(df, strategy, params, _raw=False):
     df = df.copy()
     df["signal"] = 0
@@ -3765,6 +4006,29 @@ def generate_signals(df, strategy, params, _raw=False):
         sig, _lines = evaluate_option_chain_signal(strategy, params, df)
         if sig != 0 and len(df):
             df.iloc[-1, df.columns.get_loc("signal")] = sig
+
+    elif strategy == ZERO_HERO_STRATEGY:
+        zh = zero_hero_state(df, params)
+        df["zh_ref_high"], df["zh_ref_low"] = zh["ref_high"], zh["ref_low"]
+        if "vwap" in zh:
+            df["zh_vwap"] = zh["vwap"]
+        # Optional chain confirmation: writers unwinding on the side being
+        # bought is what actually fuels an expiry squeeze. Live-only, so it
+        # gates the latest bar rather than rewriting history.
+        if params.get("zh_use_chain", False) and len(df):
+            snap = get_oi_snapshot()
+            if snap:
+                d_ce, d_pe = snap.get("ce_oi_change", 0.0), snap.get("pe_oi_change", 0.0)
+                # Call OI FALLING while price breaks up = short covering (bullish).
+                if not (d_ce < 0 or d_pe > d_ce):
+                    zh["long"].iloc[-1] = False
+                if not (d_pe < 0 or d_ce > d_pe):
+                    zh["short"].iloc[-1] = False
+            else:
+                zh["long"].iloc[-1] = False
+                zh["short"].iloc[-1] = False
+        df.loc[zh["long"], "signal"] = 1
+        df.loc[zh["short"], "signal"] = -1
 
     elif strategy == "Hybrid (Combine Strategies)":
         members = list(params.get("hybrid_members", []))
@@ -5290,6 +5554,51 @@ def check_delivery_conversion(cfg, pos, ticker, strategy):
     return True, msg
 
 
+def check_zero_hero_premium_exit(cfg, pos):
+    """
+    Zero Hero exits are measured on the OPTION PREMIUM, not on index points,
+    because that is what was actually paid and what can go to zero. Three
+    exits, checked in order of severity:
+      • stop  — premium has fallen by the configured % of what was paid;
+      • target— premium has reached the configured multiple;
+      • time  — the move never started, and every further minute is pure decay.
+    """
+    pc = (cfg or {}).get("product_cfg") or {}
+    if not pc.get("zero_hero_mode") or not pos:
+        return False, None, None
+    entry_prem = pos.get("opt_entry_premium")
+    sec_id = pos.get("opt_security_id")
+    if not entry_prem or not sec_id:
+        return False, None, None
+    now_prem = dhan_get_ltp(sec_id, pc.get("exchange_segment", "NSE_FNO"))
+    if now_prem is None:
+        return False, None, None
+    sl_pct = float(pc.get("zh_sl_pct", 50.0)) / 100.0
+    tgt_x = float(pc.get("zh_target_x", 4.0))
+    stop_prem = entry_prem * (1.0 - sl_pct)
+    target_prem = entry_prem * tgt_x
+    if now_prem <= stop_prem:
+        return True, float(now_prem), (f"Zero Hero premium stop (₹{now_prem:.2f} ≤ ₹{stop_prem:.2f}, "
+                                       f"−{sl_pct * 100:.0f}% of ₹{entry_prem:.2f} paid)")
+    if now_prem >= target_prem:
+        return True, float(now_prem), (f"Zero Hero premium target (₹{now_prem:.2f} ≥ ₹{target_prem:.2f}, "
+                                       f"{tgt_x:.1f}× the ₹{entry_prem:.2f} paid)")
+    mins = int(pc.get("zh_time_stop_min", 0) or 0)
+    if mins > 0 and pos.get("entry_time") is not None:
+        try:
+            et = pd.Timestamp(pos["entry_time"])
+            if et.tzinfo is not None:
+                et = et.tz_convert("Asia/Kolkata").tz_localize(None)
+            held = (pd.Timestamp(ist_now()).tz_localize(None) - et).total_seconds() / 60.0
+            if held >= mins and now_prem <= entry_prem:
+                return True, float(now_prem), (f"Zero Hero time stop ({held:.0f}m ≥ {mins}m with the premium still "
+                                               f"at ₹{now_prem:.2f} vs ₹{entry_prem:.2f} paid — theta is the only "
+                                               "thing moving)")
+        except Exception:
+            pass
+    return False, None, None
+
+
 def check_profitable_hold_exit(gates, pos, ltp, now=None):
     """'Max Hold Duration of Profitable Trade': if the open position has been
     held ≥ N minutes AND is currently in profit → exit immediately."""
@@ -5737,6 +6046,115 @@ def render_config_controls(ui, prefix="sb"):
             ui.caption("Live chain preview unavailable — check the Dhan Access Token and expiry, and note the chain "
                        "endpoint only returns data during market hours.")
 
+    if strategy == ZERO_HERO_STRATEGY:
+        ui.warning("**Read this before using it.** Zero Hero buys deep-OTM options on expiry day, so it is a "
+                   "LOW-ACCURACY / HIGH-PAYOFF trade by construction: most of these options expire worthless and a "
+                   "win rate of roughly 20–35% is normal and expected. The edge lives entirely in the payoff ratio — "
+                   "one 5–10× winner covering many small total losses — never in the hit rate. Anyone describing "
+                   "zero-hero trading as 'high accuracy' is mis-selling it. Size every entry as money you are "
+                   "willing to lose in full, and validate on the Backtest and Optimization tabs first.")
+
+        _zh_u = cfg_selectbox(ui, "Underlying", "zh_underlying", list(DHAN_INDEX_MAP.keys()),
+                              default="Nifty50", prefix=prefix)
+        params["zh_underlying"] = _zh_u
+        _zh_meta = DHAN_INDEX_MAP[_zh_u]
+        _zh_exps = dhan_get_expiries(_zh_meta["underlying"], "OPTIDX", _zh_meta["exchange"])
+        if _zh_exps:
+            params["zh_expiry"] = cfg_selectbox(ui, "Expiry (nearest pre-selected)", "zh_expiry",
+                                                _zh_exps, default=_zh_exps[0], prefix=prefix)
+        else:
+            params["zh_expiry"] = cfg_text(ui, "Expiry (YYYY-MM-DD)", "zh_expiry", "", prefix=prefix)
+
+        ui.markdown("**⏱ When it may trade**")
+        params["zh_max_dte"] = cfg_number(ui, "Max days to expiry (0 = expiry day only)", "zh_max_dte",
+                                          0, 0, 5, is_int=True, prefix=prefix)
+        c1, c2 = ui.columns(2)
+        params["zh_start_time"] = cfg_time(c1, "Entry window start (IST)", "zh_start_time",
+                                           dtime(9, 45), prefix=prefix)
+        params["zh_end_time"] = cfg_time(c2, "Entry window end (IST)", "zh_end_time",
+                                         dtime(13, 30), prefix=prefix)
+        ui.caption("The window matters more than any other setting. Before ~09:45 no range has formed and premiums "
+                   "still carry morning volatility; after ~13:30 theta decay accelerates so sharply that even a "
+                   "correct directional call often loses money. Entering late is the most common way to lose the "
+                   "whole premium.")
+        params["zh_max_per_day"] = cfg_number(ui, "Maximum entries per day (0 = unlimited)", "zh_max_per_day",
+                                              2, 0, 20, is_int=True, prefix=prefix)
+        ui.caption("A hard cap. On a choppy expiry the setup can trigger repeatedly and each failure costs a full "
+                   "premium — over-trading is how small losses stop being small.")
+
+        ui.markdown("**📈 Entry confluence** (every condition must hold on the same bar)")
+        params["zh_use_opening_range"] = cfg_checkbox(ui, "Use opening-range breakout", "zh_use_opening_range",
+                                                      True, prefix=prefix)
+        if params["zh_use_opening_range"]:
+            params["zh_or_minutes"] = cfg_number(ui, "Opening range length (minutes)", "zh_or_minutes",
+                                                 15, 5, 120, is_int=True, prefix=prefix)
+        else:
+            params["zh_range_lookback"] = cfg_number(ui, "Rolling range lookback (bars)", "zh_range_lookback",
+                                                     20, 5, 300, is_int=True, prefix=prefix)
+        params["zh_break_buffer"] = cfg_number(ui, "Breakout buffer (points beyond the range)", "zh_break_buffer",
+                                               0.0, 0.0, 10000.0, prefix=prefix)
+        c1, c2 = ui.columns(2)
+        params["zh_thrust_atr"] = cfg_number(c1, "Thrust (× ATR)", "zh_thrust_atr", 1.0, 0.1, 10.0,
+                                             step=0.1, prefix=prefix)
+        params["zh_thrust_bars"] = cfg_number(c2, "Thrust measured over (bars)", "zh_thrust_bars",
+                                              3, 1, 50, is_int=True, prefix=prefix)
+        c1, c2 = ui.columns(2)
+        params["zh_vol_n"] = cfg_number(c1, "Volume ≥ N× average", "zh_vol_n", 1.5, 1.0, 50.0,
+                                        step=0.1, prefix=prefix)
+        params["zh_vol_window"] = cfg_number(c2, "Volume average window", "zh_vol_window",
+                                             20, 2, 300, is_int=True, prefix=prefix)
+        params["zh_use_vwap"] = cfg_checkbox(ui, "Require agreement with session VWAP", "zh_use_vwap",
+                                             True, prefix=prefix)
+        params["zh_use_chain"] = cfg_checkbox(ui, "Require option-chain confirmation (writers unwinding)",
+                                              "zh_use_chain", False, prefix=prefix)
+        if params["zh_use_chain"]:
+            ui.caption("Only enters when ΔOI shows writers on the bought side unwinding — the short-covering "
+                       "squeeze that actually produces multi-bagger expiry moves. Needs a Dhan token, and being a "
+                       "live snapshot it gates the current bar only (it cannot be backtested).")
+        ui.caption("Thrust normalises the move by ATR, so it means 'real displacement' rather than drift, and it "
+                   "adapts automatically across Nifty, BankNifty and Sensex instead of hard-coding point values. "
+                   "Volume confirms participation; note index feeds often carry no volume, in which case that "
+                   "condition passes automatically rather than blocking every trade.")
+
+        ui.markdown("**🎯 Which contract to buy**")
+        params["zh_leg_mode"] = cfg_selectbox(ui, "Leg selection", "zh_leg_mode",
+                                              ["Premium band", "Strike distance"],
+                                              default="Premium band", prefix=prefix)
+        if str(params["zh_leg_mode"]).startswith("Premium"):
+            c1, c2 = ui.columns(2)
+            params["zh_prem_min"] = cfg_number(c1, "Min premium (₹)", "zh_prem_min", 3.0, 0.05, 10000.0,
+                                               step=0.5, prefix=prefix)
+            params["zh_prem_max"] = cfg_number(c2, "Max premium (₹)", "zh_prem_max", 15.0, 0.1, 10000.0,
+                                               step=0.5, prefix=prefix)
+            ui.caption("Preferred: the band adapts to volatility and to time remaining, and it bounds the risk per "
+                       "lot directly. The closest-to-money contract inside the band is chosen, since it has the "
+                       "highest delta of the qualifying set and so responds fastest.")
+        else:
+            params["zh_strike_offset"] = cfg_number(ui, "Strikes out of the money", "zh_strike_offset",
+                                                    5, 1, 50, is_int=True, prefix=prefix)
+            ui.caption("Fixed distance. Simpler, but on a quiet day this can land on a near-worthless contract and "
+                       "on a volatile day on an expensive one — the premium band avoids both.")
+
+        ui.markdown("**🛡 Risk model**")
+        c1, c2 = ui.columns(2)
+        params["zh_sl_pct"] = cfg_number(c1, "Stop loss (% of premium paid)", "zh_sl_pct",
+                                         50.0, 5.0, 100.0, step=5.0, prefix=prefix)
+        params["zh_target_x"] = cfg_number(c2, "Target (× premium paid)", "zh_target_x",
+                                           4.0, 1.5, 100.0, step=0.5, prefix=prefix)
+        params["zh_time_stop_min"] = cfg_number(ui, "Time stop — exit if flat after (minutes, 0 = off)",
+                                                "zh_time_stop_min", 45, 0, 400, is_int=True, prefix=prefix)
+        _zh_rr = float(params["zh_target_x"]) - 1.0
+        _zh_risk = float(params["zh_sl_pct"]) / 100.0
+        _zh_breakeven = (_zh_risk / (_zh_rr + _zh_risk) * 100.0) if (_zh_rr + _zh_risk) else 0
+        ui.caption(f"Paying ₹P: exit at ₹{_zh_risk:.2f}P on the downside, ₹{float(params['zh_target_x']):.1f}P on "
+                   f"the upside → reward:risk ≈ {_zh_rr / _zh_risk:.1f} : 1. **You need only "
+                   f"{_zh_breakeven:.0f}% of trades to win to break even**, which is the whole point of the "
+                   "structure — and it is why a 30% hit rate can still be profitable. The time stop matters just as "
+                   "much: if the move has not started, theta is taking the premium every minute you hold.")
+        ui.info("💡 These SL/target percentages apply to the OPTION PREMIUM. Set the sidebar Stoploss Type to "
+                "**Custom Points** and Target Type to **Custom Points** for the underlying-based levels to stay out "
+                "of the way, or use the premium-based exits shown on the Live tab.")
+
     if strategy == "Hybrid (Combine Strategies)":
         _members = [s for s in STRATEGIES if s != "Hybrid (Combine Strategies)"]
         params["hybrid_members"] = cfg_multiselect(ui, "Strategies to combine", "hybrid_members",
@@ -6154,7 +6572,8 @@ def render_config_controls(ui, prefix="sb"):
     # data feed and order placement) --------
     dhan_client_id, dhan_access_token = "", ""
     chain_strategy = strategy in OPTION_CHAIN_STRATEGIES
-    need_creds = use_dhan_feed or dhan_enabled or options_mode or chain_strategy
+    zero_hero = strategy == ZERO_HERO_STRATEGY
+    need_creds = use_dhan_feed or dhan_enabled or options_mode or chain_strategy or zero_hero
     if need_creds:
         ui.markdown("#### 🔐 Dhan Account")
         dhan_client_id = cfg_text(ui, "Dhan Client ID", "dhan_client_id", DHAN_DEFAULT_CLIENT_ID, prefix=prefix)
@@ -6167,8 +6586,96 @@ def render_config_controls(ui, prefix="sb"):
     product_cfg = {}
     entry_order_type, exit_order_type, dhan_qty = "MARKET", "MARKET", 1
 
-    dhan_touchpoints_on = dhan_enabled or options_mode or chain_strategy
-    if chain_strategy and not options_mode and not premium_mode:
+    dhan_touchpoints_on = dhan_enabled or options_mode or chain_strategy or zero_hero
+    if zero_hero and not options_mode and not premium_mode:
+        # ---- ZERO HERO EXECUTION -----------------------------------------
+        # Signals are computed on the index, but the trade is a deep-OTM
+        # option, so the contract is resolved live from the chain each time
+        # the configuration changes. Without this the entry would be placed
+        # on the index itself, which is not the trade at all.
+        ui.markdown("#### 🎟 Zero Hero Contract")
+        _zh_meta2 = DHAN_INDEX_MAP.get(params.get("zh_underlying", "Nifty50"), DHAN_INDEX_MAP["Nifty50"])
+        _zh_exp2 = params.get("zh_expiry")
+        _zh_snap = get_chain_snapshot_for(resolve_chain_underlying("Index", params.get("zh_underlying", "Nifty50")),
+                                          _zh_exp2)
+        _zh_ce, _zh_ce_msg = select_zero_hero_leg(_zh_snap, 1, params)
+        _zh_pe, _zh_pe_msg = select_zero_hero_leg(_zh_snap, -1, params)
+        if _zh_ce:
+            ui.caption(f"📈 On a LONG signal → BUY {_zh_ce_msg}")
+        else:
+            ui.caption(f"📈 LONG leg unresolved — {_zh_ce_msg}")
+        if _zh_pe:
+            ui.caption(f"📉 On a SHORT signal → BUY {_zh_pe_msg}")
+        else:
+            ui.caption(f"📉 SHORT leg unresolved — {_zh_pe_msg}")
+
+        _zh_sig = ("ZH", params.get("zh_underlying"), _zh_exp2,
+                   (_zh_ce or {}).get("strike"), (_zh_pe or {}).get("strike"))
+
+        def _fetch_zh_legs():
+            got = False
+            if _zh_ce:
+                _i = dhan_lookup_option(_zh_meta2["underlying"], _zh_exp2, _zh_ce["strike"], "CE",
+                                        "OPTIDX", _zh_meta2["exchange"])
+                if _i:
+                    cfg_force("ce_security_id", _i["security_id"])
+                    store["_zh_lot"] = _i.get("lot_size")
+                    got = True
+            if _zh_pe:
+                _i = dhan_lookup_option(_zh_meta2["underlying"], _zh_exp2, _zh_pe["strike"], "PE",
+                                        "OPTIDX", _zh_meta2["exchange"])
+                if _i:
+                    cfg_force("pe_security_id", _i["security_id"])
+                    got = True
+            return got
+
+        if st.session_state.get("dhan_opt_autofill_sig") != _zh_sig \
+                and st.session_state.get("_attempted_dhan_opt_autofill_sig") != _zh_sig:
+            cfg_force("ce_security_id", "")
+            cfg_force("pe_security_id", "")
+        _try_autofill(_zh_sig, _fetch_zh_legs, "dhan_opt_autofill_sig", "dhan_opt_autofill_last_try")
+
+        _zh_ce_id = cfg_text(ui, "CE Security ID (auto-filled — bought on LONG signals)",
+                             "ce_security_id", "", prefix=prefix).strip()
+        _zh_pe_id = cfg_text(ui, "PE Security ID (auto-filled — bought on SHORT signals)",
+                             "pe_security_id", "", prefix=prefix).strip()
+        _zh_qty_default = _zh_meta2.get("default_opt_qty", 65)
+        if store.get("_zh_qty_sig") != params.get("zh_underlying"):
+            cfg_force("dhan_qty", int(_zh_qty_default))
+            store["_zh_qty_sig"] = params.get("zh_underlying")
+        c1, c2 = ui.columns(2)
+        entry_order_type = cfg_selectbox(c1, "Entry Order Type", "entry_order_type",
+                                         ["MARKET", "LIMIT"], default="MARKET", prefix=prefix)
+        exit_order_type = cfg_selectbox(c2, "Exit Order Type", "exit_order_type",
+                                        ["MARKET", "LIMIT"], default="MARKET", prefix=prefix)
+        dhan_qty = cfg_number(ui, "Dhan Quantity (lots × lot size)", "dhan_qty",
+                              int(_zh_qty_default), 1, 1000000, is_int=True, prefix=prefix)
+        if _zh_ce and _zh_ce.get("premium"):
+            _cost = float(_zh_ce["premium"]) * int(dhan_qty)
+            ui.caption(f"💰 At the current CE premium ₹{_zh_ce['premium']:.2f} × {int(dhan_qty)} qty, one entry "
+                       f"risks about ₹{_cost:,.0f} if the option expires worthless, and ₹"
+                       f"{_cost * float(params.get('zh_sl_pct', 50)) / 100:,.0f} if the "
+                       f"{float(params.get('zh_sl_pct', 50)):.0f}% stop is honoured.")
+        product_cfg = {
+            "instrument": "Index Options",
+            "exchange": _zh_meta2["exchange"],
+            "exchange_segment": f"{_zh_meta2['exchange']}_FNO",
+            "product": "INTRADAY",
+            "options_mode": True,
+            "zero_hero_mode": True,
+            "ce_security_id": _zh_ce_id,
+            "pe_security_id": _zh_pe_id,
+            "expiry": _zh_exp2,
+            "underlying": _zh_meta2["underlying"],
+            "lot_size": store.get("_zh_lot"),
+            "bo_enabled": False,
+            "zh_sl_pct": params.get("zh_sl_pct", 50.0),
+            "zh_target_x": params.get("zh_target_x", 4.0),
+            "zh_time_stop_min": params.get("zh_time_stop_min", 45),
+        }
+        ui.caption("Contracts are re-resolved whenever the underlying, expiry or selection settings change, so the "
+                   "leg never goes stale. Product is INTRADAY — a zero-hero position is not something to carry.")
+    elif chain_strategy and not options_mode and not premium_mode:
         # ---- OPTION-CHAIN STRATEGY EXECUTION ----------------------------
         # These strategies read the chain but their signals must be TRADED as
         # option legs: a LONG buys CE, a SHORT buys PE. Without this the trade
@@ -6785,6 +7292,61 @@ def describe_signal_status(df, strategy, params, filters):
         except Exception as exc:
             lines.append(f"Elliott Wave: could not compute wave state ({exc}).")
 
+    if strategy == ZERO_HERO_STRATEGY:
+        try:
+            zh = zero_hero_state(df, params)
+            _i = -1
+            _mark = lambda ok: "✅" if bool(ok) else "❌"
+            lines.append(f"🎟 **Zero Hero — every condition must hold on the SAME bar** "
+                         f"({zh.get('range_label', 'range')} · {zh.get('expiry_note', '')})")
+            lines.append(f"   1. Expiry day: {_mark(zh['expiry'].iloc[_i])}")
+            _st_t = params.get("zh_start_time", dtime(9, 45))
+            _en_t = params.get("zh_end_time", dtime(13, 30))
+            lines.append(f"   2. Entry window {_st_t.strftime('%H:%M')}–{_en_t.strftime('%H:%M')} IST: "
+                         f"{_mark(zh['window'].iloc[_i])}")
+            _rh = zh["ref_high"].iloc[_i]
+            _rl = zh["ref_low"].iloc[_i]
+            if pd.notna(_rh) and pd.notna(_rl):
+                lines.append(f"   3. Breakout of {float(_rh):.2f} / {float(_rl):.2f} (price {c_now:.2f}): "
+                             f"UP {_mark(zh['break_up'].iloc[_i])} (needs {float(_rh) - c_now:+.2f}) · "
+                             f"DOWN {_mark(zh['break_dn'].iloc[_i])} (needs {float(_rl) - c_now:+.2f})")
+            else:
+                lines.append("   3. Breakout range: not formed yet for this session.")
+            if params.get("zh_use_vwap", True) and pd.notna(zh["vwap"].iloc[_i]):
+                lines.append(f"   4. VWAP {float(zh['vwap'].iloc[_i]):.2f}: LONG {_mark(zh['vwap_up'].iloc[_i])} · "
+                             f"SHORT {_mark(zh['vwap_dn'].iloc[_i])}")
+            _tv = zh["thrust_val"].iloc[_i]
+            if pd.notna(_tv):
+                lines.append(f"   5. Thrust {float(_tv):+.2f}× ATR over {int(params.get('zh_thrust_bars', 3))} bars "
+                             f"(needs ±{float(params.get('zh_thrust_atr', 1.0)):.2f}): "
+                             f"UP {_mark(zh['thrust_up'].iloc[_i])} · DOWN {_mark(zh['thrust_dn'].iloc[_i])}")
+            else:
+                lines.append("   5. Thrust: indicators still warming up.")
+            _vr = zh["vol_ratio"].iloc[_i]
+            if pd.notna(_vr):
+                lines.append(f"   6. Volume {float(_vr):.2f}× the {int(params.get('zh_vol_window', 20))}-bar average "
+                             f"(needs {float(params.get('zh_vol_n', 1.5)):.2f}×): {_mark(zh['volume'].iloc[_i])}")
+            else:
+                lines.append("   6. Volume: this feed carries no volume for the index — condition auto-passes.")
+            _verdict = 1 if bool(zh["long"].iloc[_i]) else (-1 if bool(zh["short"].iloc[_i]) else 0)
+            lines.append("   ➡️ Verdict: " + ("🟢 LONG — buy the CE leg" if _verdict == 1 else
+                                              ("🔴 SHORT — buy the PE leg" if _verdict == -1 else
+                                               "⚪ no trade (at least one condition is unmet)")))
+            _zsnap = get_oi_snapshot()
+            if _zsnap:
+                _leg, _lmsg = select_zero_hero_leg(_zsnap, _verdict if _verdict else 1, params)
+                lines.append(f"   🎟 Contract that would be bought: {_lmsg}")
+                if _leg and _leg.get("premium"):
+                    _p = float(_leg["premium"])
+                    _slp = _p * (1 - float(params.get("zh_sl_pct", 50.0)) / 100.0)
+                    _tgp = _p * float(params.get("zh_target_x", 4.0))
+                    lines.append(f"   🛡 Premium plan: pay ₹{_p:.2f} → stop ₹{_slp:.2f} · target ₹{_tgp:.2f} "
+                                 f"· time stop {int(params.get('zh_time_stop_min', 45))}m")
+            else:
+                lines.append("   🎟 Contract: chain snapshot unavailable (needs a Dhan token and market hours).")
+        except Exception as exc:
+            lines.append(f"Zero Hero: could not evaluate conditions ({exc}).")
+
     if strategy in OPTION_CHAIN_STRATEGIES:
         oc_sig, oc_lines = evaluate_option_chain_signal(strategy, params, df)
         for l in oc_lines:
@@ -7305,6 +7867,11 @@ def evaluate_live_signal(ticker, interval, period, strategy, params, filters, sl
                         return sig_df
                 else:
                     exited, exit_price, reason = True, hard_price, hard_reason
+        if not exited and full_cfg:
+            _zh_exit, _zh_px, _zh_reason = check_zero_hero_premium_exit(full_cfg, pos)
+            if _zh_exit:
+                exited, exit_price, reason = True, ltp, _zh_reason
+                pos["zh_exit_premium"] = _zh_px
         if not exited and full_cfg:
             _conv, _conv_msg = check_delivery_conversion(full_cfg, pos, ticker, strategy)
             if _conv:
