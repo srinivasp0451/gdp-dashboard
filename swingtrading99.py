@@ -164,7 +164,13 @@ IMMEDIATE_EXECUTION_STRATEGIES = {"Simple Buy Only", "Simple Sell Only", "Thresh
                                   "OI + Volume Change Based",
                                   "PCR Based (Put-Call Ratio)",
                                   "Gamma Blast (Expiry Momentum)",
-                                  "Multi-Strike OI (ATM ± N Levels)"}
+                                  "Multi-Strike OI (ATM ± N Levels)",
+                                  # Zero Hero: the breakout is confirmed on a CLOSED bar (no
+                                  # repainting), but waiting for the NEXT candle's open before
+                                  # entering is far too slow on expiry day — the premium can
+                                  # double inside that minute. It therefore enters at LTP the
+                                  # moment the closed bar confirms.
+                                  "Zero Hero (Expiry Day OTM Momentum)"}
 
 SL_TYPES = [
     "Custom Points", "Trailing SL (Points)", "Trail Candle Low/High (Current)",
@@ -4002,6 +4008,31 @@ def zero_hero_state(df, params):
     return out
 
 
+def zero_hero_underlying_levels(direction, entry_price, atr_val, params):
+    """
+    Underlying-price SL/target for a Zero Hero trade.
+
+    The real risk model for this strategy lives on the OPTION PREMIUM (a % stop
+    and an N× target, handled by check_zero_hero_premium_exit). These
+    underlying levels exist only as a CATASTROPHIC BACKSTOP, so they are set
+    deliberately wide.
+
+    This matters more than it sounds: with the sidebar's generic settings a
+    "Custom Points" stop of 10 points on Sensex at 78,800 sits 0.013% away and
+    is hit by ordinary noise within seconds, closing the trade long before the
+    premium stop or target could ever be reached. Letting the strategy own its
+    own levels is what makes the documented risk:reward actually achievable.
+    """
+    atr_val = float(atr_val or 0.0) or float(entry_price) * 0.002
+    sl_mult = float(params.get("zh_backstop_atr", 3.0))
+    tgt_mult = float(params.get("zh_backstop_target_atr", 12.0))
+    sl_dist = max(atr_val * sl_mult, float(entry_price) * 0.0015)
+    target_dist = max(atr_val * tgt_mult, sl_dist * 3.0)
+    if direction == 1:
+        return entry_price - sl_dist, entry_price + target_dist, sl_dist, target_dist
+    return entry_price + sl_dist, entry_price - target_dist, sl_dist, target_dist
+
+
 def zero_hero_chain_gate(params, direction, snap=None):
     """
     Optional option-chain confirmation for a Zero Hero entry.
@@ -6383,9 +6414,28 @@ def render_config_controls(ui, prefix="sb"):
                    f"{_zh_breakeven:.0f}% of trades to win to break even**, which is the whole point of the "
                    "structure — and it is why a 30% hit rate can still be profitable. The time stop matters just as "
                    "much: if the move has not started, theta is taking the premium every minute you hold.")
-        ui.info("💡 These SL/target percentages apply to the OPTION PREMIUM. Set the sidebar Stoploss Type to "
-                "**Custom Points** and Target Type to **Custom Points** for the underlying-based levels to stay out "
-                "of the way, or use the premium-based exits shown on the Live tab.")
+        params["zh_own_risk"] = cfg_checkbox(ui, "Let this strategy own its risk levels (recommended)",
+                                            "zh_own_risk", True, prefix=prefix)
+        if params["zh_own_risk"]:
+            c1, c2 = ui.columns(2)
+            params["zh_backstop_atr"] = cfg_number(c1, "Underlying backstop SL (× ATR)", "zh_backstop_atr",
+                                                   3.0, 0.5, 50.0, step=0.5, prefix=prefix)
+            params["zh_backstop_target_atr"] = cfg_number(c2, "Underlying backstop target (× ATR)",
+                                                          "zh_backstop_target_atr", 12.0, 1.0, 200.0,
+                                                          step=1.0, prefix=prefix)
+            ui.success("✅ With this ON, the premium stop/target above are the REAL exits and the underlying levels "
+                       "are only a wide catastrophic backstop. This matters: the sidebar's generic 'Custom Points' "
+                       "stop of 10 points sits 0.013% away on Sensex at 78,800 and is hit by ordinary noise within "
+                       "seconds — closing the trade long before a 4× premium target could ever be reached. That is "
+                       "the usual reason a zero-hero setup appears to signal but never actually trade.")
+        else:
+            ui.warning("⚠️ OFF: the sidebar Stoploss/Target types govern the trade on the UNDERLYING instead. On an "
+                       "index at 78,000+ make sure those levels are wide enough (ATR-based, or several hundred "
+                       "points) or the position will be stopped out almost immediately and the premium targets "
+                       "will never be reached.")
+        ui.caption("Execution: the breakout is confirmed on a CLOSED bar so nothing repaints, but the entry fires "
+                   "IMMEDIATELY at LTP rather than waiting for the next candle open — on expiry day a premium can "
+                   "move substantially inside one minute.")
 
     if strategy == "Hybrid (Combine Strategies)":
         _members = [s for s in STRATEGIES if s != "Hybrid (Combine Strategies)"]
@@ -8087,6 +8137,26 @@ def evaluate_live_signal(ticker, interval, period, strategy, params, filters, sl
             last_sig = 1 if ltp > prev_close else 0
         elif strategy == "Simple Sell Only":
             last_sig = -1 if ltp < prev_close else 0
+        elif strategy == ZERO_HERO_STRATEGY:
+            # Conditions are read from the last CLOSED bar so nothing repaints,
+            # while the fill happens now at LTP.
+            try:
+                _zst = zero_hero_state(sig_df.iloc[:-1], params)
+                last_sig = 1 if bool(_zst["long"].iloc[-1]) else (-1 if bool(_zst["short"].iloc[-1]) else 0)
+                if last_sig != 0 and (params.get("zh_use_oi_change") or params.get("zh_use_pcr")
+                                      or params.get("zh_use_chain")):
+                    _ok, _cl = zero_hero_chain_gate(params, last_sig)
+                    if not _ok:
+                        st.caption("🎟 Zero Hero: price setup confirmed but the option chain is not confirming — "
+                                   + (_cl[-1] if _cl else "entry skipped."))
+                        last_sig = 0
+                if last_sig != 0:
+                    st.caption(f"🎟 Zero Hero: confirmed on the closed bar → entering IMMEDIATELY at LTP "
+                               f"{ltp:.2f} (no waiting for the next candle open).")
+            except Exception as _zexc:
+                st.caption(f"Zero Hero evaluation issue: {_zexc}")
+                last_sig = 0
+
         elif strategy in OPTION_CHAIN_STRATEGIES:
             # Read the LIVE option-chain snapshot directly rather than any
             # candle column: OI/volume/PCR/gamma are not candle-derived, so
@@ -8304,6 +8374,12 @@ def evaluate_live_signal(ticker, interval, period, strategy, params, filters, sl
             entry_price = entry_reference_price
             a_val = a_series.iloc[-1] if not np.isnan(a_series.iloc[-1]) else entry_price * 0.005
             sl, target, sl_dist, target_dist = calc_initial_sl_target(last_sig, entry_price, a_val, params, sl_type, target_type)
+            if strategy == ZERO_HERO_STRATEGY and params.get("zh_own_risk", True):
+                # The strategy owns its risk: premium-based stop/target are
+                # primary, and the underlying levels become a wide backstop so
+                # they cannot fire first (see zero_hero_underlying_levels).
+                sl, target, sl_dist, target_dist = zero_hero_underlying_levels(
+                    last_sig, entry_price, a_val, params)
             new_pos = {
                 "entry_time": sig_df.index[-1], "entry_price": entry_price, "direction": last_sig,
                 "qty": qty, "sl": sl, "target": target, "initial_sl": sl, "initial_target": target,
@@ -8321,6 +8397,22 @@ def evaluate_live_signal(ticker, interval, period, strategy, params, filters, sl
             # ---- Options mode: capture the leg + its ZERO-DELAY Dhan premium
             # at entry (yfinance is never used for option premiums).
             _live_capture_option_entry(new_pos, last_sig, full_cfg)
+            if strategy == ZERO_HERO_STRATEGY:
+                _ep = new_pos.get("opt_entry_premium")
+                if _ep:
+                    _slp = float(params.get("zh_sl_pct", 50.0)) / 100.0
+                    _tx = float(params.get("zh_target_x", 4.0))
+                    new_pos["zh_premium_stop"] = round(_ep * (1 - _slp), 2)
+                    new_pos["zh_premium_target"] = round(_ep * _tx, 2)
+                    st.info(f"🎟 Zero Hero plan — {new_pos.get('opt_leg', '')} bought at ₹{_ep:.2f}: "
+                            f"premium stop ₹{new_pos['zh_premium_stop']:.2f} · "
+                            f"premium target ₹{new_pos['zh_premium_target']:.2f} · "
+                            f"time stop {int(params.get('zh_time_stop_min', 45))}m. "
+                            f"Underlying {sl:.2f}/{target:.2f} is only a catastrophic backstop.")
+                else:
+                    st.warning("🎟 Zero Hero entered, but the option premium could not be read, so the premium "
+                               "stop/target cannot be enforced — only the wide underlying backstop is active. "
+                               "Check the Dhan token and that the CE/PE Security IDs are filled.")
             st.session_state.live_positions = [new_pos]
             st.session_state.last_acted_signal_marker = signal_marker
             note_trade_event(entered=True)  # feeds max-trades/day + cooldown gates
@@ -8904,6 +8996,25 @@ with tab_live:
             c5.metric("Highest", f"{pos['highest']:.2f}")
             c6.metric("Lowest", f"{pos['lowest']:.2f}")
             c7.metric("Remaining Qty", f"{pos['remaining_qty']}/{pos['original_qty']}")
+            if pos.get("zh_premium_stop") or pos.get("opt_entry_premium"):
+                # For Zero Hero the REAL exits live on the premium, so show them
+                # next to the underlying levels rather than leaving the user to
+                # infer the trade from index points that are only a backstop.
+                _ep = pos.get("opt_entry_premium")
+                _cur = None
+                try:
+                    _cur = dhan_get_ltp(pos.get("opt_security_id"),
+                                        (config.get("product_cfg") or {}).get("exchange_segment", "NSE_FNO"))
+                except Exception:
+                    pass
+                p1, p2, p3, p4 = st.columns(4)
+                p1.metric(f"{pos.get('opt_leg', 'Option')} Premium Paid", f"₹{_ep:.2f}" if _ep else "n/a")
+                p2.metric("Premium Now", f"₹{_cur:.2f}" if _cur else "n/a",
+                          f"{(_cur - _ep):+.2f}" if (_cur and _ep) else None)
+                p3.metric("Premium Stop", f"₹{pos['zh_premium_stop']:.2f}" if pos.get("zh_premium_stop") else "n/a")
+                p4.metric("Premium Target", f"₹{pos['zh_premium_target']:.2f}" if pos.get("zh_premium_target") else "n/a")
+                st.caption("🎟 These premium levels are the ACTIVE exits for this trade; the underlying SL/Target "
+                           "above are only a wide catastrophic backstop.")
         else:
             st.caption("No open paper position.")
 
