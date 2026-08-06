@@ -4145,6 +4145,129 @@ def apply_filters(df, filters, params=None):
         mask_buy &= ok
         mask_sell &= ok
 
+    if filters.get("vwap_enabled"):
+        # Session-anchored VWAP (resets daily, TradingView convention). The
+        # institutional reference price: buys only above it, sells only below,
+        # optionally with a buffer so price must clear VWAP by a margin rather
+        # than hovering on it.
+        v = vwap(df)
+        df["vwap_f"] = v
+        buf = float(filters.get("vwap_buffer_pts", 0.0))
+        mode = filters.get("vwap_mode", "Price above VWAP for buys / below for sells")
+        if str(mode).startswith("Price above"):
+            mask_buy &= (df["Close"] > v + buf).fillna(False)
+            mask_sell &= (df["Close"] < v - buf).fillna(False)
+        else:  # inverted: mean-reversion toward VWAP
+            mask_buy &= (df["Close"] < v - buf).fillna(False)
+            mask_sell &= (df["Close"] > v + buf).fillna(False)
+
+    if filters.get("macd_enabled"):
+        # MACD as a confirmation gate rather than a signal generator.
+        m_line, m_sig, m_hist = macd(df["Close"], filters.get("macd_f_fast", 12),
+                                     filters.get("macd_f_slow", 26), filters.get("macd_f_signal", 9))
+        df["macd_f"], df["macd_signal_f"], df["macd_hist_f"] = m_line, m_sig, m_hist
+        mode = filters.get("macd_mode", "Histogram sign (MACD above/below signal)")
+        if str(mode).startswith("Histogram"):
+            ok_buy, ok_sell = m_hist > 0, m_hist < 0
+        elif str(mode).startswith("Zero"):
+            ok_buy, ok_sell = m_line > 0, m_line < 0
+        else:  # rising / falling histogram — momentum still expanding
+            ok_buy = m_hist > m_hist.shift(1)
+            ok_sell = m_hist < m_hist.shift(1)
+        mask_buy &= ok_buy.fillna(False)
+        mask_sell &= ok_sell.fillna(False)
+
+    if filters.get("volbreak_nx_enabled"):
+        # Volume breakout expressed as an N× multiple of the rolling average,
+        # so "this bar traded 3× its recent average" is stated directly.
+        w = int(filters.get("volbreak_window", 20))
+        n = float(filters.get("volbreak_n", 2.0))
+        if "Volume" in df.columns:
+            avg = df["Volume"].rolling(w).mean()
+            ratio = df["Volume"] / avg.replace(0, np.nan)
+            df["vol_ratio_f"] = ratio
+            ok = (ratio >= n).fillna(False)
+            if filters.get("volbreak_direction_aware", False):
+                # Optionally require the surge to be on a bar that closed in the
+                # signal's own direction — volume alone is directionless.
+                up_bar = df["Close"] >= df["Open"]
+                mask_buy &= (ok & up_bar).fillna(False)
+                mask_sell &= (ok & ~up_bar).fillna(False)
+            else:
+                mask_buy &= ok
+                mask_sell &= ok
+
+    # ---- Option-chain filters ------------------------------------------------
+    # These read a LIVE chain snapshot, which is a single point in time rather
+    # than a per-bar series. They therefore gate the LATEST bar only: in live
+    # trading that is exactly the bar being acted on, while in a backtest they
+    # cannot rewrite history and are deliberately inert on older bars (Dhan
+    # exposes no historical chain). A note is recorded for the status board.
+    _chain_filters_on = any(filters.get(k) for k in
+                            ("oi_change_filter_enabled", "pcr_filter_enabled", "gamma_filter_enabled"))
+    if _chain_filters_on and len(df):
+        _snap = get_oi_snapshot()
+        _allow_buy_now, _allow_sell_now, _reasons = True, True, []
+
+        if filters.get("oi_change_filter_enabled"):
+            if not _snap:
+                _allow_buy_now = _allow_sell_now = False
+                _reasons.append("ΔOI filter: no chain snapshot available")
+            else:
+                d_ce, d_pe = _snap.get("ce_oi_change", 0.0), _snap.get("pe_oi_change", 0.0)
+                side, det = _side_dominance(d_ce, d_pe, filters.get("oi_change_filter_mode", "Absolute"),
+                                            filters.get("oi_change_filter_n", 2.0), return_detail=True)
+                # Seller perspective: PE writing (support) favours longs,
+                # CE writing (resistance) favours shorts. Flip to invert.
+                bull_side = "CE" if filters.get("oi_change_filter_flip") else "PE"
+                _allow_buy_now = side == bull_side
+                _allow_sell_now = side is not None and side != bull_side
+                _reasons.append(f"ΔOI filter: {det.get('basis', 'no dominance')}")
+
+        if filters.get("pcr_filter_enabled"):
+            pcr_now = (_snap or {}).get("pcr")
+            lo = float(filters.get("pcr_filter_min", 0.8))
+            hi = float(filters.get("pcr_filter_max", 1.2))
+            if pcr_now is None:
+                _allow_buy_now = _allow_sell_now = False
+                _reasons.append("PCR filter: PCR unavailable")
+            elif filters.get("pcr_filter_band_mode", "Directional bias") == "Range gate":
+                inside = lo <= pcr_now <= hi
+                _allow_buy_now &= inside
+                _allow_sell_now &= inside
+                _reasons.append(f"PCR filter: {pcr_now:.3f} {'inside' if inside else 'outside'} [{lo:.2f}, {hi:.2f}]")
+            else:
+                _allow_buy_now &= pcr_now >= hi
+                _allow_sell_now &= pcr_now <= lo
+                _reasons.append(f"PCR filter: {pcr_now:.3f} (buys need ≥ {hi:.2f}, sells ≤ {lo:.2f})")
+
+        if filters.get("gamma_filter_enabled"):
+            gb_params = {
+                "gb_max_dte": filters.get("gamma_filter_max_dte", 1),
+                "gb_premium_cap": filters.get("gamma_filter_premium_cap", 60.0),
+                "gb_gamma_min": filters.get("gamma_filter_gamma_min", 0.0),
+                "gb_range_lookback": filters.get("gamma_filter_lookback", 15),
+                "gb_break_buffer": 0.0,
+            }
+            g_sig, g_lines = evaluate_gamma_blast_signal(gb_params, _snap, df)
+            mode = filters.get("gamma_filter_mode", "Only trade in a gamma-blast regime")
+            regime_ok = bool(_snap) and all(x not in " ".join(g_lines) for x in
+                                            ("Too far from expiry", "Premium not compressed",
+                                             "gamma below the floor"))
+            if str(mode).startswith("Only"):
+                _allow_buy_now &= regime_ok
+                _allow_sell_now &= regime_ok
+            else:  # avoid the regime — protects strategies that dislike expiry whipsaw
+                _allow_buy_now &= not regime_ok
+                _allow_sell_now &= not regime_ok
+            _reasons.append(f"Gamma filter: blast regime {'present' if regime_ok else 'absent'}")
+
+        st.session_state["chain_filter_note"] = " · ".join(_reasons)
+        if not _allow_buy_now:
+            mask_buy.iloc[-1] = False
+        if not _allow_sell_now:
+            mask_sell.iloc[-1] = False
+
     # --- Crossover Angle / Crossover Quality filters ---
     # These only constrain entries that coincide with an actual EMA{fast}/{slow}
     # crossover in the SAME bar (using the fast/slow periods set for the main
@@ -5884,6 +6007,103 @@ def render_config_controls(ui, prefix="sb"):
             filters["crossover_atr_mult"] = cfg_number(ui, "Min candle range (× ATR)", "crossover_atr_mult", 1.0, 0.1, step=0.1, prefix=prefix)
         ui.caption(f"Only accepts an EMA{params.get('ema_fast',9)}/{params.get('ema_slow',15)} crossover bar that also clears this candle-size bar — filters out crosses on tiny, indecisive candles.")
 
+    filters["vwap_enabled"] = cfg_checkbox(ui, "VWAP Filter", "vwap_enabled", False, prefix=prefix)
+    if filters["vwap_enabled"]:
+        filters["vwap_mode"] = cfg_selectbox(ui, "VWAP condition", "vwap_mode",
+                                             ["Price above VWAP for buys / below for sells",
+                                              "Price below VWAP for buys / above for sells (mean reversion)"],
+                                             default="Price above VWAP for buys / below for sells", prefix=prefix)
+        filters["vwap_buffer_pts"] = cfg_number(ui, "Buffer beyond VWAP (points, 0 = touch is enough)",
+                                                "vwap_buffer_pts", 0.0, 0.0, 100000.0, prefix=prefix)
+        ui.caption("Session-anchored VWAP (resets each trading day, TradingView convention) — the institutional "
+                   "reference price. The default trend reading only allows buys above it and sells below; the "
+                   "inverted mode suits mean-reversion systems that fade extensions away from VWAP. The buffer "
+                   "requires price to clear VWAP by a margin instead of hovering on it.")
+
+    filters["macd_enabled"] = cfg_checkbox(ui, "MACD Filter", "macd_enabled", False, prefix=prefix)
+    if filters["macd_enabled"]:
+        c1, c2, c3 = ui.columns(3)
+        filters["macd_f_fast"] = cfg_number(c1, "Fast", "macd_f_fast", 12, 2, 50, is_int=True, prefix=prefix)
+        filters["macd_f_slow"] = cfg_number(c2, "Slow", "macd_f_slow", 26, 5, 100, is_int=True, prefix=prefix)
+        filters["macd_f_signal"] = cfg_number(c3, "Signal", "macd_f_signal", 9, 2, 30, is_int=True, prefix=prefix)
+        filters["macd_mode"] = cfg_selectbox(ui, "MACD condition", "macd_mode",
+                                             ["Histogram sign (MACD above/below signal)",
+                                              "Zero line (MACD above/below 0)",
+                                              "Histogram expanding (momentum still building)"],
+                                             default="Histogram sign (MACD above/below signal)", prefix=prefix)
+        ui.caption("Used as confirmation, not as a signal generator: buys are allowed only while MACD agrees. "
+                   "Histogram sign is the standard read; the zero line is stricter (trend rather than momentum); "
+                   "'expanding' additionally requires the histogram to still be growing, which filters entries "
+                   "taken as momentum fades.")
+
+    filters["volbreak_nx_enabled"] = cfg_checkbox(ui, "Volume Breakout (N×) Filter", "volbreak_nx_enabled",
+                                                  False, prefix=prefix)
+    if filters["volbreak_nx_enabled"]:
+        c1, c2 = ui.columns(2)
+        filters["volbreak_window"] = cfg_number(c1, "Average over (bars)", "volbreak_window",
+                                                20, 2, 500, is_int=True, prefix=prefix)
+        filters["volbreak_n"] = cfg_number(c2, "N× the average volume", "volbreak_n",
+                                           2.0, 1.0, 100.0, step=0.5, prefix=prefix)
+        filters["volbreak_direction_aware"] = cfg_checkbox(ui, "Require the surge bar to close in the signal's direction",
+                                                           "volbreak_direction_aware", False, prefix=prefix)
+        ui.caption(f"Only accepts entries on bars trading at least {filters['volbreak_n']:.1f}× the "
+                   f"{filters['volbreak_window']}-bar average volume — participation behind the move. Volume itself "
+                   "is directionless, so the optional second box also requires the surge bar to close up for buys "
+                   "and down for sells.")
+
+    ui.markdown("**📊 Option-Chain Filters** — live chain reads (need a Dhan token)")
+    filters["oi_change_filter_enabled"] = cfg_checkbox(ui, "Change in OI (ΔOI) Filter",
+                                                       "oi_change_filter_enabled", False, prefix=prefix)
+    if filters["oi_change_filter_enabled"]:
+        filters["oi_change_filter_mode"] = cfg_selectbox(ui, "Comparison mode", "oi_change_filter_mode",
+                                                         ["Absolute (larger ΔOI wins)",
+                                                          "N× multiple (must be n times the other)"],
+                                                         default="Absolute (larger ΔOI wins)", prefix=prefix)
+        if str(filters["oi_change_filter_mode"]).startswith("N"):
+            filters["oi_change_filter_n"] = cfg_number(ui, "N (either ratio may satisfy it)",
+                                                       "oi_change_filter_n", 2.0, 1.0, 1000.0, step=0.5, prefix=prefix)
+        filters["oi_change_filter_flip"] = cfg_checkbox(ui, "Flip interpretation", "oi_change_filter_flip",
+                                                        False, prefix=prefix)
+        ui.caption("Only takes entries when fresh option writing agrees with the trade. Seller perspective: PE "
+                   "writing builds support (favours buys), CE writing builds resistance (favours sells). Both "
+                   "ratios are tested symmetrically, same as the ΔOI strategy.")
+
+    filters["pcr_filter_enabled"] = cfg_checkbox(ui, "PCR Filter", "pcr_filter_enabled", False, prefix=prefix)
+    if filters["pcr_filter_enabled"]:
+        filters["pcr_filter_band_mode"] = cfg_selectbox(ui, "PCR condition", "pcr_filter_band_mode",
+                                                        ["Directional bias", "Range gate"],
+                                                        default="Directional bias", prefix=prefix)
+        c1, c2 = ui.columns(2)
+        filters["pcr_filter_min"] = cfg_number(c1, "Lower PCR", "pcr_filter_min", 0.8, 0.01, 20.0,
+                                               step=0.05, prefix=prefix)
+        filters["pcr_filter_max"] = cfg_number(c2, "Upper PCR", "pcr_filter_max", 1.2, 0.01, 20.0,
+                                               step=0.05, prefix=prefix)
+        ui.caption("**Directional bias**: buys need PCR at or above the upper value (heavy put writing = bullish), "
+                   "sells need it at or below the lower value. **Range gate**: trades only while PCR sits between "
+                   "the two, i.e. avoid stretched positioning in either direction.")
+
+    filters["gamma_filter_enabled"] = cfg_checkbox(ui, "Gamma Blast Regime Filter", "gamma_filter_enabled",
+                                                   False, prefix=prefix)
+    if filters["gamma_filter_enabled"]:
+        filters["gamma_filter_mode"] = cfg_selectbox(ui, "Regime handling", "gamma_filter_mode",
+                                                     ["Only trade in a gamma-blast regime",
+                                                      "Avoid trading in a gamma-blast regime"],
+                                                     default="Only trade in a gamma-blast regime", prefix=prefix)
+        c1, c2 = ui.columns(2)
+        filters["gamma_filter_max_dte"] = cfg_number(c1, "Max days to expiry", "gamma_filter_max_dte",
+                                                     1, 0, 30, is_int=True, prefix=prefix)
+        filters["gamma_filter_premium_cap"] = cfg_number(c2, "ATM straddle ceiling", "gamma_filter_premium_cap",
+                                                         60.0, 0.5, 100000.0, step=5.0, prefix=prefix)
+        c1, c2 = ui.columns(2)
+        filters["gamma_filter_gamma_min"] = cfg_number(c1, "Minimum ATM gamma", "gamma_filter_gamma_min",
+                                                       0.0, 0.0, 10.0, step=0.0005, format="%.5f", prefix=prefix)
+        filters["gamma_filter_lookback"] = cfg_number(c2, "Compression lookback (bars)", "gamma_filter_lookback",
+                                                      15, 3, 500, is_int=True, prefix=prefix)
+        ui.caption("Detects the near-expiry regime where ATM premium has collapsed while gamma is at its peak. "
+                   "'Only trade' restricts entries to that regime; 'Avoid trading' does the opposite, which "
+                   "protects trend systems from expiry-day whipsaw. Unlike the Gamma Blast strategy this does not "
+                   "require a breakout — it gates on the regime itself.")
+
     filters["vix_enabled"] = cfg_checkbox(ui, "India VIX Filter", "vix_enabled", False, prefix=prefix)
     if filters["vix_enabled"]:
         c1, c2 = ui.columns(2)
@@ -6745,6 +6965,101 @@ def describe_signal_status(df, strategy, params, filters):
                              "(only checked on the crossover bar itself).")
         else:
             lines.append("Crossover Confirmation (Simple Crossover): no candle-size requirement — any genuine crossover bar passes.")
+
+    if filters.get("vwap_enabled"):
+        v = vwap(df)
+        v_val, v_ok = safe_indicator_value(v, 2)
+        if v_ok:
+            buf = float(filters.get("vwap_buffer_pts", 0.0))
+            inverted = not str(filters.get("vwap_mode", "Price above")).startswith("Price above")
+            if inverted:
+                b_ok, s_ok = c_now < v_val - buf, c_now > v_val + buf
+                rule = "inverted (mean reversion): buys BELOW VWAP, sells ABOVE"
+            else:
+                b_ok, s_ok = c_now > v_val + buf, c_now < v_val - buf
+                rule = "trend: buys ABOVE VWAP, sells BELOW"
+            lines.append(f"VWAP filter: session VWAP {v_val:.2f} vs price {c_now:.2f} ({c_now - v_val:+.2f}"
+                         + (f", buffer {buf:.2f}" if buf else "") + f") · {rule} → "
+                         f"BUYs {'✅' if b_ok else '❌'} · SELLs {'✅' if s_ok else '❌'}.")
+        else:
+            lines.append("VWAP filter: N/A — insufficient data.")
+
+    if filters.get("macd_enabled"):
+        m_line, m_sig, m_hist = macd(close, filters.get("macd_f_fast", 12),
+                                     filters.get("macd_f_slow", 26), filters.get("macd_f_signal", 9))
+        if len(df) >= filters.get("macd_f_slow", 26) * 3:
+            mode = filters.get("macd_mode", "Histogram sign (MACD above/below signal)")
+            h_now, h_prev = float(m_hist.iloc[-1]), float(m_hist.iloc[-2])
+            if str(mode).startswith("Histogram sign"):
+                b_ok, s_ok = h_now > 0, h_now < 0
+            elif str(mode).startswith("Zero"):
+                b_ok, s_ok = float(m_line.iloc[-1]) > 0, float(m_line.iloc[-1]) < 0
+            else:
+                b_ok, s_ok = h_now > h_prev, h_now < h_prev
+            lines.append(f"MACD filter ({mode.split('(')[0].strip()}): MACD {float(m_line.iloc[-1]):+.2f}, signal "
+                         f"{float(m_sig.iloc[-1]):+.2f}, histogram {h_now:+.2f} (prev {h_prev:+.2f}) → "
+                         f"BUYs {'✅' if b_ok else '❌'} · SELLs {'✅' if s_ok else '❌'}.")
+        else:
+            lines.append("MACD filter: N/A — insufficient warm-up history.")
+
+    if filters.get("volbreak_nx_enabled"):
+        w = int(filters.get("volbreak_window", 20))
+        n = float(filters.get("volbreak_n", 2.0))
+        if "Volume" in df.columns and len(df) > w + 1:
+            v_now = float(df["Volume"].iloc[-1])
+            v_avg = float(df["Volume"].rolling(w).mean().iloc[-1])
+            ratio = (v_now / v_avg) if v_avg else 0.0
+            ok = ratio >= n
+            extra = ""
+            if filters.get("volbreak_direction_aware"):
+                up_bar = float(df["Close"].iloc[-1]) >= float(df["Open"].iloc[-1])
+                extra = (f" · bar closed {'UP (buys only)' if up_bar else 'DOWN (sells only)'}")
+            lines.append(f"Volume Breakout (N×): current {v_now:,.0f} vs {w}-bar average {v_avg:,.0f} = "
+                         f"{ratio:.2f}×, needs ≥ {n:.2f}× → {'✅ OK' if ok else '❌ blocking entries'}{extra}.")
+        else:
+            lines.append("Volume Breakout (N×): N/A — no volume data or insufficient history.")
+
+    if any(filters.get(k) for k in ("oi_change_filter_enabled", "pcr_filter_enabled", "gamma_filter_enabled")):
+        _fsnap = get_oi_snapshot()
+        if not _fsnap:
+            lines.append("📊 Option-chain filters: no chain snapshot available (needs a Dhan token and market hours) "
+                         "— these filters are currently BLOCKING all entries.")
+        else:
+            if filters.get("oi_change_filter_enabled"):
+                d_ce, d_pe = _fsnap.get("ce_oi_change", 0.0), _fsnap.get("pe_oi_change", 0.0)
+                side, det = _side_dominance(d_ce, d_pe, filters.get("oi_change_filter_mode", "Absolute"),
+                                            filters.get("oi_change_filter_n", 2.0), return_detail=True)
+                bull_side = "CE" if filters.get("oi_change_filter_flip") else "PE"
+                lines.append(f"📊 ΔOI filter: ΔCE {d_ce:+,.0f} vs ΔPE {d_pe:+,.0f} → {det.get('basis', 'no dominance')} "
+                             f"→ BUYs {'✅' if side == bull_side else '❌'} · "
+                             f"SELLs {'✅' if (side is not None and side != bull_side) else '❌'}.")
+            if filters.get("pcr_filter_enabled"):
+                p_now = _fsnap.get("pcr")
+                lo, hi = float(filters.get("pcr_filter_min", 0.8)), float(filters.get("pcr_filter_max", 1.2))
+                if p_now is None:
+                    lines.append("📊 PCR filter: PCR unavailable → blocking entries.")
+                elif filters.get("pcr_filter_band_mode", "Directional bias") == "Range gate":
+                    inside = lo <= p_now <= hi
+                    lines.append(f"📊 PCR filter (range gate): PCR {p_now:.3f} must sit in [{lo:.2f}, {hi:.2f}] → "
+                                 f"{'✅ inside' if inside else '❌ outside — blocking'}.")
+                else:
+                    lines.append(f"📊 PCR filter (directional): PCR {p_now:.3f} → BUYs need ≥ {hi:.2f} "
+                                 f"{'✅' if p_now >= hi else '❌'} · SELLs need ≤ {lo:.2f} "
+                                 f"{'✅' if p_now <= lo else '❌'}.")
+            if filters.get("gamma_filter_enabled"):
+                gp = {"gb_max_dte": filters.get("gamma_filter_max_dte", 1),
+                      "gb_premium_cap": filters.get("gamma_filter_premium_cap", 60.0),
+                      "gb_gamma_min": filters.get("gamma_filter_gamma_min", 0.0),
+                      "gb_range_lookback": filters.get("gamma_filter_lookback", 15), "gb_break_buffer": 0.0}
+                _gs, _gl = evaluate_gamma_blast_signal(gp, _fsnap, df)
+                regime_ok = all(x not in " ".join(_gl) for x in
+                                ("Too far from expiry", "Premium not compressed", "gamma below the floor"))
+                want = str(filters.get("gamma_filter_mode", "Only")).startswith("Only")
+                lines.append(f"📊 Gamma-blast regime: {'PRESENT' if regime_ok else 'absent'} · mode "
+                             f"{'only trade in it' if want else 'avoid it'} → entries "
+                             f"{'✅ allowed' if regime_ok == want else '❌ blocked'}.")
+                for _g in _gl[:3]:
+                    lines.append(f"    ↳ {_g}")
 
     if filters.get("vix_enabled"):
         vix_aligned = get_vix_aligned(df.index)
