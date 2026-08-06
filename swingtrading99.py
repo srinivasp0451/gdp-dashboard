@@ -4002,6 +4002,101 @@ def zero_hero_state(df, params):
     return out
 
 
+def zero_hero_chain_gate(params, direction, snap=None):
+    """
+    Optional option-chain confirmation for a Zero Hero entry.
+
+    Two independent checks, each switched on separately and both OFF by
+    default (so the strategy behaves exactly as before unless you enable them):
+
+    ── ΔOI / unwinding ──────────────────────────────────────────────────
+    Open interest is written from the SELLER's side, so what actually fuels a
+    violent expiry-day move is writers being forced out. Three readings, in
+    the order they are checked:
+      • SHORT COVERING — the OI of the side blocking the move is FALLING while
+        price pushes through it (call OI falling on an up-move). This is the
+        strongest confirmation available: the people who sold those calls are
+        buying them back, and their hedging accelerates the move.
+      • FRESH WRITING AGAINST — the blocking side's OI is RISING faster than
+        the supporting side's, i.e. writers are confidently defending the
+        level. This is a reason NOT to buy the breakout.
+      • SUPPORT BUILDING — the supporting side is being written more heavily,
+        a milder positive.
+    An optional N× multiple requires the dominance to be decisive rather than
+    marginal.
+
+    ── PCR ──────────────────────────────────────────────────────────────
+    Longs require PCR at or above a bullish threshold (heavy put writing =
+    writers expect support to hold); shorts require it at or below a bearish
+    one. Optionally the RATIO'S OWN DIRECTION must agree too, which filters
+    the common trap of entering a stretched ratio exactly as it unwinds.
+
+    Returns (allowed, [explanation lines]).
+    """
+    use_oi = bool(params.get("zh_use_oi_change", params.get("zh_use_chain", False)))
+    use_pcr = bool(params.get("zh_use_pcr", False))
+    if not (use_oi or use_pcr):
+        return True, []
+
+    snap = snap if snap is not None else get_zero_hero_snapshot(params)
+    if not snap:
+        return False, ["📊 Chain confirmation is ON but no snapshot is available "
+                       "(needs a Dhan token and market hours) — entries are blocked."]
+
+    lines, ok = [], True
+    d_ce = float(snap.get("ce_oi_change", 0.0) or 0.0)
+    d_pe = float(snap.get("pe_oi_change", 0.0) or 0.0)
+
+    if use_oi:
+        # For a LONG the CALL side is the blocker; for a SHORT it is the PUT side.
+        blocking, supporting = (d_ce, d_pe) if direction == 1 else (d_pe, d_ce)
+        b_name, s_name = ("CE", "PE") if direction == 1 else ("PE", "CE")
+        n = float(params.get("zh_oi_n", 1.0) or 1.0)
+        unwind_min = float(params.get("zh_unwind_min", 0.0) or 0.0)
+
+        if blocking < 0 and abs(blocking) >= unwind_min:
+            lines.append(f"📊 ΔOI: {b_name} OI UNWINDING ({blocking:+,.0f}) while price breaks through it — "
+                         f"short covering, the strongest confirmation. ✅")
+        elif blocking > 0 and blocking >= n * max(supporting, 1.0) and supporting <= 0:
+            lines.append(f"📊 ΔOI: fresh {b_name} writing ({blocking:+,.0f}) against the move while {s_name} is "
+                         f"{supporting:+,.0f} — writers are defending this level. ❌")
+            ok = False
+        elif supporting > 0 and supporting >= n * max(blocking, 1.0):
+            lines.append(f"📊 ΔOI: {s_name} writing dominant ({supporting:+,.0f} vs {b_name} {blocking:+,.0f}"
+                         + (f", ≥{n:.1f}×" if n > 1 else "") + ") — support building behind the move. ✅")
+        else:
+            lines.append(f"📊 ΔOI: no decisive read ({b_name} {blocking:+,.0f} vs {s_name} {supporting:+,.0f}"
+                         + (f", needs {n:.1f}×" if n > 1 else "") + ") — not confirming. ❌")
+            ok = False
+
+    if use_pcr:
+        pcr = snap.get("pcr")
+        bull = float(params.get("zh_pcr_bull", 1.1))
+        bear = float(params.get("zh_pcr_bear", 0.9))
+        if pcr is None:
+            lines.append("📊 PCR: unavailable — blocking. ❌")
+            ok = False
+        else:
+            need = bull if direction == 1 else bear
+            good = (pcr >= bull) if direction == 1 else (pcr <= bear)
+            lines.append(f"📊 PCR: {pcr:.3f} vs {'≥' if direction == 1 else '≤'} {need:.2f} "
+                         f"{'✅' if good else '❌'}")
+            ok = ok and good
+            if good and params.get("zh_pcr_trend", False):
+                hist = st.session_state.get("chain_history", [])
+                prev = next((r["PCR"] for r in reversed(hist[:-1]) if r.get("PCR")), None)
+                if prev is None:
+                    lines.append("📊 PCR trend: no previous reading yet — blocking. ❌")
+                    ok = False
+                else:
+                    d = pcr - prev
+                    rising_ok = (d > 0) if direction == 1 else (d < 0)
+                    lines.append(f"📊 PCR trend: {d:+.4f} since the last snapshot, needs "
+                                 f"{'rising' if direction == 1 else 'falling'} {'✅' if rising_ok else '❌'}")
+                    ok = ok and rising_ok
+    return ok, lines
+
+
 def select_zero_hero_leg(snap, direction, params):
     """
     Choose the deep-OTM contract to buy.
@@ -4099,18 +4194,17 @@ def generate_signals(df, strategy, params, _raw=False):
         # Optional chain confirmation: writers unwinding on the side being
         # bought is what actually fuels an expiry squeeze. Live-only, so it
         # gates the latest bar rather than rewriting history.
-        if params.get("zh_use_chain", False) and len(df):
-            snap = get_zero_hero_snapshot(params)
-            if snap:
-                d_ce, d_pe = snap.get("ce_oi_change", 0.0), snap.get("pe_oi_change", 0.0)
-                # Call OI FALLING while price breaks up = short covering (bullish).
-                if not (d_ce < 0 or d_pe > d_ce):
+        if (params.get("zh_use_oi_change") or params.get("zh_use_pcr")
+                or params.get("zh_use_chain")) and len(df):
+            _csnap = get_zero_hero_snapshot(params)
+            if bool(zh["long"].iloc[-1]):
+                _ok, _ = zero_hero_chain_gate(params, 1, _csnap)
+                if not _ok:
                     zh["long"].iloc[-1] = False
-                if not (d_pe < 0 or d_ce > d_pe):
+            if bool(zh["short"].iloc[-1]):
+                _ok, _ = zero_hero_chain_gate(params, -1, _csnap)
+                if not _ok:
                     zh["short"].iloc[-1] = False
-            else:
-                zh["long"].iloc[-1] = False
-                zh["short"].iloc[-1] = False
         df.loc[zh["long"], "signal"] = 1
         df.loc[zh["short"], "signal"] = -1
 
@@ -6173,8 +6267,8 @@ def render_config_controls(ui, prefix="sb"):
                    "correct directional call often loses money. Entering late is the most common way to lose the "
                    "whole premium.")
         c1, c2 = ui.columns(2)
-        params["zh_max_per_day"] = cfg_number(c1, "Maximum entries per day (0 = unlimited)", "zh_max_per_day",
-                                              2, 0, 20, is_int=True, prefix=prefix)
+        params["zh_max_per_day"] = cfg_number(c1, "Maximum entries per day", "zh_max_per_day",
+                                              2, 1, 100, is_int=True, prefix=prefix)
         params["zh_cooldown_bars"] = cfg_number(c2, "Cooldown between entries (bars, 0 = off)", "zh_cooldown_bars",
                                                 15, 0, 500, is_int=True, prefix=prefix)
         ui.caption("A breakout condition stays true for as long as price holds beyond the range, so entries fire "
@@ -6206,12 +6300,37 @@ def render_config_controls(ui, prefix="sb"):
                                              20, 2, 300, is_int=True, prefix=prefix)
         params["zh_use_vwap"] = cfg_checkbox(ui, "Require agreement with session VWAP", "zh_use_vwap",
                                              True, prefix=prefix)
-        params["zh_use_chain"] = cfg_checkbox(ui, "Require option-chain confirmation (writers unwinding)",
-                                              "zh_use_chain", False, prefix=prefix)
-        if params["zh_use_chain"]:
-            ui.caption("Only enters when ΔOI shows writers on the bought side unwinding — the short-covering "
-                       "squeeze that actually produces multi-bagger expiry moves. Needs a Dhan token, and being a "
-                       "live snapshot it gates the current bar only (it cannot be backtested).")
+        ui.markdown("**📊 Option-chain confirmation** (both OFF by default)")
+        params["zh_use_oi_change"] = cfg_checkbox(ui, "Require ΔOI confirmation (unwinding / short covering)",
+                                                  "zh_use_oi_change", False, prefix=prefix)
+        if params["zh_use_oi_change"]:
+            c1, c2 = ui.columns(2)
+            params["zh_oi_n"] = cfg_number(c1, "Dominance multiple (1 = any margin)", "zh_oi_n",
+                                           1.0, 1.0, 100.0, step=0.5, prefix=prefix)
+            params["zh_unwind_min"] = cfg_number(c2, "Minimum unwinding to count", "zh_unwind_min",
+                                                 0.0, 0.0, 1e9, step=10000.0, prefix=prefix)
+            ui.caption("OI is written from the SELLER's side, so a violent expiry move is usually writers being "
+                       "forced out. Best case is **short covering**: the OI of the side blocking the move is "
+                       "FALLING as price pushes through it — those writers are buying back and their hedging "
+                       "accelerates the move. Conversely, fresh writing AGAINST the breakout means writers are "
+                       "defending the level, and the entry is rejected. Support building on the other side counts "
+                       "as a milder positive.")
+        params["zh_use_pcr"] = cfg_checkbox(ui, "Require PCR confirmation", "zh_use_pcr", False, prefix=prefix)
+        if params["zh_use_pcr"]:
+            c1, c2 = ui.columns(2)
+            params["zh_pcr_bull"] = cfg_number(c1, "Longs need PCR ≥", "zh_pcr_bull", 1.1, 0.05, 20.0,
+                                               step=0.05, prefix=prefix)
+            params["zh_pcr_bear"] = cfg_number(c2, "Shorts need PCR ≤", "zh_pcr_bear", 0.9, 0.05, 20.0,
+                                               step=0.05, prefix=prefix)
+            params["zh_pcr_trend"] = cfg_checkbox(ui, "Also require PCR to be moving the right way",
+                                                  "zh_pcr_trend", False, prefix=prefix)
+            ui.caption("High PCR means puts are being written heavily — writers expect support to hold, read as "
+                       "bullish; low PCR is the bearish mirror. The trend option additionally requires the ratio "
+                       "itself to be rising for longs (falling for shorts), which filters the common trap of "
+                       "entering a stretched ratio exactly as it starts unwinding.")
+        if params.get("zh_use_oi_change") or params.get("zh_use_pcr"):
+            ui.info("These read a LIVE chain snapshot, so they need a Dhan token and market hours, and they gate "
+                    "the current bar only — a backtest cannot reconstruct past chains, so they are inert there.")
         ui.caption("Thrust normalises the move by ATR, so it means 'real displacement' rather than drift, and it "
                    "adapts automatically across Nifty, BankNifty and Sensex instead of hard-coding point values. "
                    "Volume confirms participation; note index feeds often carry no volume, in which case that "
@@ -7475,12 +7594,32 @@ def describe_signal_status(df, strategy, params, filters):
             else:
                 lines.append("   8. Daily entry cap: disabled (unlimited entries)")
 
+            # ---- condition 9: optional option-chain confirmation ----
+            _chain_on = bool(params.get("zh_use_oi_change") or params.get("zh_use_pcr")
+                             or params.get("zh_use_chain"))
+            _chain_ok, _chain_lines = True, []
+            if _chain_on:
+                _dir_for_gate = (1 if bool(zh["raw_long"].iloc[_i])
+                                 else (-1 if bool(zh["raw_short"].iloc[_i]) else 0))
+                if _dir_for_gate == 0:
+                    lines.append("   9. Chain confirmation: ⏸ not evaluated — no price setup on this bar yet.")
+                else:
+                    _chain_ok, _chain_lines = zero_hero_chain_gate(params, _dir_for_gate)
+                    lines.append(f"   9. Chain confirmation ({'LONG' if _dir_for_gate == 1 else 'SHORT'}): "
+                                 f"{_mark(_chain_ok)}")
+                    for _cl in _chain_lines:
+                        lines.append(f"        {_cl}")
+            else:
+                lines.append("   9. Chain confirmation: disabled (enable ΔOI and/or PCR in the sidebar)")
+
             _verdict = 1 if bool(zh["long"].iloc[_i]) else (-1 if bool(zh["short"].iloc[_i]) else 0)
             if _verdict == 0:
                 if _raw_ok and not _fresh:
                     _why = "all price conditions hold, but this bar continues an existing breakout (see 7)"
                 elif zh.get("cap_blocked"):
-                    _why = "all conditions hold, but today's entry cap is used up (see 8)"
+                    _why = f"all conditions hold, but today's entry cap of {int(zh.get('max_per_day', 0))} is used up (see 8)"
+                elif _chain_on and _raw_ok and not _chain_ok:
+                    _why = "price conditions hold, but the option chain is not confirming (see 9)"
                 else:
                     _why = "at least one condition is unmet"
             else:
