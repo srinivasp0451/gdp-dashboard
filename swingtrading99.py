@@ -1436,9 +1436,48 @@ def get_chain_snapshot(underlying_name, expiry=None):
 
 
 def get_oi_snapshot():
-    """Resolve the configured OI underlying + expiry and pull a live snapshot."""
+    """Resolve the configured OI underlying + expiry and pull a live snapshot.
+    This is the OPTION-CHAIN STRATEGIES' source (oi_underlying). Zero Hero has
+    its own underlying selector and must NOT use this one — see
+    get_zero_hero_snapshot()."""
     store = st.session_state.app_cfg
     return get_chain_snapshot(store.get("oi_underlying", "Nifty50"), store.get("oi_expiry"))
+
+
+def get_zero_hero_snapshot(params=None):
+    """
+    Chain snapshot for the ZERO HERO underlying specifically.
+
+    Zero Hero carries its own 'Underlying' and 'Expiry' selectors, so reading
+    the option-chain strategies' `oi_underlying` here would silently price the
+    wrong index — e.g. showing a Nifty ATM of 24,650 while Sensex (~80,000) is
+    the selected ticker. Falls back to the sidebar ticker so the two can never
+    drift apart.
+    """
+    store = st.session_state.app_cfg
+    params = params or {}
+    und = (params.get("zh_underlying")
+           or store.get("zh_underlying")
+           or zero_hero_default_underlying())
+    exp = params.get("zh_expiry") or store.get("zh_expiry")
+    return get_chain_snapshot(und, exp)
+
+
+def zero_hero_default_underlying():
+    """The Zero Hero underlying implied by the currently selected ticker, so
+    picking 'Sensex' in the sidebar defaults the strategy to the Sensex chain
+    rather than leaving it on Nifty50."""
+    store = st.session_state.app_cfg
+    tc = store.get("ticker_choice")
+    if tc in DHAN_INDEX_MAP:
+        return tc
+    if tc == "Options Trading":
+        kind = store.get("opt_underlying_kind", "Index")
+        if kind == "Index" and store.get("opt_index") in DHAN_INDEX_MAP:
+            return store["opt_index"]
+        if kind == "Premium" and store.get("prem_underlying") in DHAN_INDEX_MAP:
+            return store["prem_underlying"]
+    return "Nifty50"
 
 
 def evaluate_oi_signal(params, snap):
@@ -3981,7 +4020,19 @@ def select_zero_hero_leg(snap, direction, params):
         if lo <= prem <= hi:
             candidates.append((k, prem))
     if not candidates:
-        return None, f"no OTM {leg} priced between ₹{lo:.2f} and ₹{hi:.2f} right now"
+        # Report the nearest available premium so the band can be corrected —
+        # "nothing matched" alone leaves the user guessing, and the sensible
+        # band differs a lot between Nifty (₹3–15), BankNifty and Sensex.
+        otm = [(k, strikes[k].get(ltp_key)) for k in ks
+               if (k > atm if leg == "CE" else k < atm) and strikes[k].get(ltp_key)]
+        hint = ""
+        if otm:
+            cheap = min(otm, key=lambda c: c[1])
+            near_lo = min(otm, key=lambda c: abs(c[1] - lo))
+            hint = (f" · cheapest OTM {leg} available is ₹{cheap[1]:.2f} at strike {cheap[0]:.0f}; "
+                    f"closest to your lower bound is ₹{near_lo[1]:.2f} at {near_lo[0]:.0f} — "
+                    "widen the band or switch to Strike distance mode")
+        return None, f"no OTM {leg} priced between ₹{lo:.2f} and ₹{hi:.2f} right now{hint}"
     # Prefer the closest-to-money contract inside the band: it has the highest
     # delta of the qualifying set, so it responds fastest to the move.
     k, prem = (min(candidates, key=lambda c: c[0]) if leg == "CE"
@@ -4016,7 +4067,7 @@ def generate_signals(df, strategy, params, _raw=False):
         # bought is what actually fuels an expiry squeeze. Live-only, so it
         # gates the latest bar rather than rewriting history.
         if params.get("zh_use_chain", False) and len(df):
-            snap = get_oi_snapshot()
+            snap = get_zero_hero_snapshot(params)
             if snap:
                 d_ce, d_pe = snap.get("ce_oi_change", 0.0), snap.get("pe_oi_change", 0.0)
                 # Call OI FALLING while price breaks up = short covering (bullish).
@@ -6054,8 +6105,19 @@ def render_config_controls(ui, prefix="sb"):
                    "zero-hero trading as 'high accuracy' is mis-selling it. Size every entry as money you are "
                    "willing to lose in full, and validate on the Backtest and Optimization tabs first.")
 
+        # Follow the sidebar ticker automatically: choosing Sensex should price
+        # the Sensex chain, not leave the strategy on a Nifty default. Still
+        # user-editable — the auto-set only fires when the ticker changes.
+        _zh_auto = zero_hero_default_underlying()
+        if store.get("_zh_ticker_sig") != ticker_choice:
+            cfg_force("zh_underlying", _zh_auto)
+            store["_zh_ticker_sig"] = ticker_choice
         _zh_u = cfg_selectbox(ui, "Underlying", "zh_underlying", list(DHAN_INDEX_MAP.keys()),
-                              default="Nifty50", prefix=prefix)
+                              default=_zh_auto, prefix=prefix)
+        if ticker_choice in DHAN_INDEX_MAP and _zh_u != ticker_choice:
+            ui.warning(f"⚠️ The sidebar ticker is **{ticker_choice}** but this strategy is set to trade the "
+                       f"**{_zh_u}** option chain. Signals would be computed on {ticker_choice} while the contract "
+                       f"came from {_zh_u} — set both to the same index unless you mean to do this.")
         params["zh_underlying"] = _zh_u
         _zh_meta = DHAN_INDEX_MAP[_zh_u]
         _zh_exps = dhan_get_expiries(_zh_meta["underlying"], "OPTIDX", _zh_meta["exchange"])
@@ -6121,11 +6183,23 @@ def render_config_controls(ui, prefix="sb"):
                                               ["Premium band", "Strike distance"],
                                               default="Premium band", prefix=prefix)
         if str(params["zh_leg_mode"]).startswith("Premium"):
+            # Sensible bands differ by index: Sensex options carry larger
+            # rupee premiums than Nifty at the same "cheapness", so a fixed
+            # ₹3–15 default would match nothing on some chains.
+            _band_default = {"Nifty50": (3.0, 15.0), "BankNifty": (5.0, 30.0),
+                             "Sensex": (5.0, 30.0)}.get(_zh_u, (3.0, 15.0))
+            if store.get("_zh_band_sig") != _zh_u:
+                cfg_force("zh_prem_min", _band_default[0])
+                cfg_force("zh_prem_max", _band_default[1])
+                store["_zh_band_sig"] = _zh_u
             c1, c2 = ui.columns(2)
-            params["zh_prem_min"] = cfg_number(c1, "Min premium (₹)", "zh_prem_min", 3.0, 0.05, 10000.0,
-                                               step=0.5, prefix=prefix)
-            params["zh_prem_max"] = cfg_number(c2, "Max premium (₹)", "zh_prem_max", 15.0, 0.1, 10000.0,
-                                               step=0.5, prefix=prefix)
+            params["zh_prem_min"] = cfg_number(c1, "Min premium (₹)", "zh_prem_min", _band_default[0],
+                                               0.05, 10000.0, step=0.5, prefix=prefix)
+            params["zh_prem_max"] = cfg_number(c2, "Max premium (₹)", "zh_prem_max", _band_default[1],
+                                               0.1, 10000.0, step=0.5, prefix=prefix)
+            ui.caption(f"Default band for {_zh_u} is ₹{_band_default[0]:.0f}–₹{_band_default[1]:.0f}; it resets when "
+                       "you change the underlying because the right band differs by index. If nothing matches, the "
+                       "status board reports the cheapest contract actually available so you can adjust.")
             ui.caption("Preferred: the band adapts to volatility and to time remaining, and it bounds the risk per "
                        "lot directly. The closest-to-money contract inside the band is chosen, since it has the "
                        "highest delta of the qualifying set and so responds fastest.")
@@ -6594,10 +6668,14 @@ def render_config_controls(ui, prefix="sb"):
         # the configuration changes. Without this the entry would be placed
         # on the index itself, which is not the trade at all.
         ui.markdown("#### 🎟 Zero Hero Contract")
-        _zh_meta2 = DHAN_INDEX_MAP.get(params.get("zh_underlying", "Nifty50"), DHAN_INDEX_MAP["Nifty50"])
+        _zh_und = params.get("zh_underlying") or zero_hero_default_underlying()
+        _zh_meta2 = DHAN_INDEX_MAP.get(_zh_und, DHAN_INDEX_MAP["Nifty50"])
+        ui.caption(f"Trading the **{_zh_und}** chain ({_zh_meta2['exchange']} · "
+                   f"{_zh_meta2['underlying']}), default lot quantity {_zh_meta2.get('default_opt_qty')}.")
         _zh_exp2 = params.get("zh_expiry")
-        _zh_snap = get_chain_snapshot_for(resolve_chain_underlying("Index", params.get("zh_underlying", "Nifty50")),
-                                          _zh_exp2)
+        _zh_snap = get_chain_snapshot_for(
+            resolve_chain_underlying("Index", params.get("zh_underlying", zero_hero_default_underlying())),
+            _zh_exp2)
         _zh_ce, _zh_ce_msg = select_zero_hero_leg(_zh_snap, 1, params)
         _zh_pe, _zh_pe_msg = select_zero_hero_leg(_zh_snap, -1, params)
         if _zh_ce:
@@ -7332,10 +7410,13 @@ def describe_signal_status(df, strategy, params, filters):
             lines.append("   ➡️ Verdict: " + ("🟢 LONG — buy the CE leg" if _verdict == 1 else
                                               ("🔴 SHORT — buy the PE leg" if _verdict == -1 else
                                                "⚪ no trade (at least one condition is unmet)")))
-            _zsnap = get_oi_snapshot()
+            _zsnap = get_zero_hero_snapshot(params)
+            _zh_und_lbl = params.get("zh_underlying") or zero_hero_default_underlying()
             if _zsnap:
                 _leg, _lmsg = select_zero_hero_leg(_zsnap, _verdict if _verdict else 1, params)
-                lines.append(f"   🎟 Contract that would be bought: {_lmsg}")
+                lines.append(f"   🎟 Contract that would be bought ({_zh_und_lbl}, expiry "
+                             f"{params.get('zh_expiry', 'n/a')}, spot "
+                             f"{_zsnap.get('underlying') or 0:,.2f}): {_lmsg}")
                 if _leg and _leg.get("premium"):
                     _p = float(_leg["premium"])
                     _slp = _p * (1 - float(params.get("zh_sl_pct", 50.0)) / 100.0)
@@ -7343,7 +7424,8 @@ def describe_signal_status(df, strategy, params, filters):
                     lines.append(f"   🛡 Premium plan: pay ₹{_p:.2f} → stop ₹{_slp:.2f} · target ₹{_tgp:.2f} "
                                  f"· time stop {int(params.get('zh_time_stop_min', 45))}m")
             else:
-                lines.append("   🎟 Contract: chain snapshot unavailable (needs a Dhan token and market hours).")
+                lines.append(f"   🎟 Contract ({_zh_und_lbl}): chain snapshot unavailable "
+                             "(needs a Dhan token and market hours).")
         except Exception as exc:
             lines.append(f"Zero Hero: could not evaluate conditions ({exc}).")
 
