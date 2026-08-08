@@ -3281,6 +3281,21 @@ def _search_metrics(trades_df, qty, cost_cfg=None):
     dd = float((cum - cum.cummax()).min())
     # What hit rate this risk:reward actually needs just to break even.
     be = (abs(avg_loss) / (avg_win + abs(avg_loss)) * 100) if (avg_win + abs(avg_loss)) else np.nan
+    # Sharpe here is per-trade: mean return / standard deviation of returns,
+    # scaled by √N. It rewards CONSISTENCY, so a configuration whose profit
+    # comes from one freak trade scores far worse than one earning steadily —
+    # which is exactly the distinction expectancy alone cannot make.
+    sd = float(pts.std())
+    sharpe = float(pts.mean() / sd * np.sqrt(len(pts))) if sd > 0 else 0.0
+    downside = pts[pts < 0]
+    dsd = float(downside.std()) if len(downside) > 1 else 0.0
+    if dsd > 0:
+        sortino = float(pts.mean() / dsd * np.sqrt(len(pts)))
+    else:
+        # No losing trades (or only one) means downside deviation is undefined,
+        # NOT poor performance. Reporting 0 here would rank a flawless run last
+        # on this metric, so fall back to Sharpe, which is defined in that case.
+        sortino = sharpe if pts.mean() > 0 else 0.0
     return {
         "trades": total,
         "accuracy": round(wr * 100, 2),
@@ -3290,8 +3305,67 @@ def _search_metrics(trades_df, qty, cost_cfg=None):
         "avg_loss": round(float(avg_loss), 2),
         "profit_factor": round(float(gross_win / gross_loss), 3) if gross_loss > 0 else np.inf,
         "max_dd": round(dd, 2),
+        "sharpe": round(sharpe, 3),
+        "sortino": round(sortino, 3),
         "breakeven_acc": round(float(be), 2) if be == be else np.nan,
     }
+
+
+# Ranking criteria → (column, higher_is_better, short explanation)
+SEARCH_RANK_METRICS = {
+    "Expectancy (points per trade)": ("OOS Expectancy", True,
+                                      "average points earned per trade after costs — the single best measure of "
+                                      "whether a configuration makes money"),
+    "Sharpe ratio (consistency)": ("OOS Sharpe", True,
+                                   "return relative to its own volatility; rewards steady results and penalises "
+                                   "profit that came from one freak trade"),
+    "Sortino ratio (downside risk)": ("OOS Sortino", True,
+                                      "like Sharpe but only penalises DOWNSIDE volatility, so big winners are not "
+                                      "counted against the configuration"),
+    "Accuracy (win rate)": ("OOS Accuracy %", True,
+                            "share of winning trades — on its own this says nothing about profit, since a tiny "
+                            "target with a huge stop wins constantly and still loses money"),
+    "Profit factor": ("OOS Profit Factor", True,
+                      "gross profit ÷ gross loss; above 1 means the wins outweigh the losses"),
+    "Total points": ("OOS Points", True, "total points earned across the unseen period"),
+    "Smallest drawdown": ("Max DD (OOS)", True,
+                          "worst peak-to-trough decline (less negative is better) — how much pain the equity curve "
+                          "put you through"),
+    "Most trades": ("OOS Trades", True,
+                    "sample size; more trades make every other number more trustworthy"),
+}
+
+
+def rank_search_results(df, criteria):
+    """
+    Rank results by one or several criteria.
+
+    Combining metrics needs care: expectancy might be 0.4, Sharpe 2.1, accuracy
+    62 and drawdown −380. Averaging those raw numbers would let whichever has
+    the largest units dominate, which is arbitrary. Each selected metric is
+    therefore converted to a PERCENTILE RANK (0–1) across the result set first,
+    so every criterion carries equal weight regardless of its scale, and the
+    composite is the mean of those ranks. Ties fall back to trade count, since
+    the larger sample is the more reliable result.
+    """
+    if df is None or df.empty or not criteria:
+        return df
+    work = df.copy()
+    parts = []
+    for label in criteria:
+        col, higher, _ = SEARCH_RANK_METRICS.get(label, (None, True, ""))
+        if not col or col not in work.columns:
+            continue
+        s = pd.to_numeric(work[col], errors="coerce").replace([np.inf, -np.inf], np.nan)
+        if s.notna().sum() == 0:
+            continue
+        r = s.rank(pct=True, na_option="bottom")
+        parts.append(r if higher else 1.0 - r)
+    if not parts:
+        return work
+    work["Rank Score"] = np.round(pd.concat(parts, axis=1).mean(axis=1), 4)
+    sort_cols = ["Rank Score"] + (["OOS Trades"] if "OOS Trades" in work.columns else [])
+    return work.sort_values(sort_cols, ascending=[False] * len(sort_cols)).reset_index(drop=True)
 
 
 def search_diagnose(is_m, oos_m, min_trades):
@@ -3466,6 +3540,9 @@ def run_strategy_search(ticker, combos, filters, base_params, qty, cost_cfg,
                 "OOS Trades": oos_m["trades"],
                 "OOS Points": oos_m["total_points"],
                 "OOS Profit Factor": oos_m["profit_factor"],
+                "OOS Sharpe": oos_m["sharpe"],
+                "OOS Sortino": oos_m["sortino"],
+                "IS Sharpe": is_m["sharpe"],
                 "IS Expectancy": is_m["expectancy"],
                 "IS Accuracy %": is_m["accuracy"],
                 "IS Trades": is_m["trades"],
@@ -10498,18 +10575,41 @@ also shows the accuracy that its own risk:reward *requires* to break even, so a 
             st.success(f"{len(_promising)} configuration(s) kept a positive expectancy on unseen data. Treat these "
                        "as candidates for further validation (walk-forward, then paper trading) — not as proof.")
 
+        st.markdown("#### 📊 Rank results by")
+        _rank_choice = cfg_multiselect(st, "Ranking criteria (select one or several)", "srch_rank_by",
+                                       list(SEARCH_RANK_METRICS.keys()),
+                                       default=["Expectancy (points per trade)"])
+        if not _rank_choice:
+            st.info("No criterion selected — showing the default ranking by expectancy.")
+            _rank_choice = ["Expectancy (points per trade)"]
+        for _rc in _rank_choice:
+            st.caption(f"• **{_rc}** — {SEARCH_RANK_METRICS[_rc][2]}")
+        if len(_rank_choice) > 1:
+            st.caption("Selected metrics are combined by converting each to a percentile rank across the results "
+                       "first, so every criterion carries equal weight despite their very different scales "
+                       "(expectancy ~0.4, Sharpe ~2.1, accuracy ~62, drawdown ~−380). The **Rank Score** column "
+                       "is the mean of those ranks: 1.00 is best on every selected measure.")
+        if _rank_choice == ["Accuracy (win rate)"]:
+            st.warning("⚠️ Ranking by accuracy ALONE will put the tiny-target/huge-stop configurations at the top — "
+                       "they win constantly and lose money. Pair it with Expectancy or Sharpe, and check the "
+                       "**Breakeven Acc % Needed** column against the accuracy you are seeing.")
+
+        _ranked = rank_search_results(_sres, _rank_choice)
         _show_all = cfg_checkbox(st, "Show rejected and weak configurations too", "srch_show_all", False)
-        _view = _sres if _show_all else _sres[_sres["Verdict"].isin(["PROMISING", "WEAK"])]
-        _cols = ["Verdict", "Strategy", "TF", "Period", "SL Type", "SL", "Target Type", "Target",
-                 "OOS Expectancy", "OOS Accuracy %", "OOS Trades", "OOS Points", "OOS Profit Factor",
-                 "IS Expectancy", "IS Accuracy %", "IS Trades", "Breakeven Acc % Needed",
-                 "Avg Win", "Avg Loss", "Max DD (OOS)"]
+        _view = _ranked if _show_all else _ranked[_ranked["Verdict"].isin(["PROMISING", "WEAK"])]
+        _cols = (["Rank Score"] if "Rank Score" in _view.columns else []) + [
+            "Verdict", "Strategy", "TF", "Period", "SL Type", "SL", "Target Type", "Target",
+            "OOS Expectancy", "OOS Sharpe", "OOS Sortino", "OOS Accuracy %", "OOS Trades",
+            "OOS Points", "OOS Profit Factor", "Max DD (OOS)",
+            "IS Expectancy", "IS Sharpe", "IS Accuracy %", "IS Trades", "Breakeven Acc % Needed",
+            "Avg Win", "Avg Loss"]
         st.dataframe(_view[[c for c in _cols if c in _view.columns]].head(300),
                      hide_index=True, use_container_width=True, height=460)
-        st.caption("Ranked by expectancy per trade on UNSEEN data, after costs. **Breakeven Acc % Needed** is the "
-                   "hit rate that row's own risk:reward requires — compare it against the accuracy columns.")
+        st.caption("Ranked by " + " + ".join(_rank_choice) + " on UNSEEN data, after costs. "
+                   "**Breakeven Acc % Needed** is the hit rate that row's own risk:reward requires — compare it "
+                   "against the accuracy columns.")
 
-        st.download_button("⬇ Download all results (CSV)", _sres.to_csv(index=False).encode(),
+        st.download_button("⬇ Download all results (CSV)", _ranked.to_csv(index=False).encode(),
                            file_name=f"strategy_search_{srch_ticker}.csv", mime="text/csv", key="srch_dl")
 
         st.markdown("#### 🔬 Inspect a configuration")
@@ -10521,10 +10621,18 @@ also shows the accuracy that its own risk:reward *requires* to break even, so a 
             _row = _view.head(60).iloc[_pick_i]
             d1, d2, d3, d4 = st.columns(4)
             d1.metric("OOS Expectancy", f"{_row['OOS Expectancy']:+.3f} pts/trade")
-            d2.metric("OOS Accuracy", f"{_row['OOS Accuracy %']:.1f}%")
-            d3.metric("Breakeven Needed", f"{_row['Breakeven Acc % Needed']:.1f}%"
+            d2.metric("OOS Sharpe", f"{_row.get('OOS Sharpe', float('nan')):.2f}")
+            d3.metric("OOS Accuracy", f"{_row['OOS Accuracy %']:.1f}%")
+            d4.metric("Breakeven Needed", f"{_row['Breakeven Acc % Needed']:.1f}%"
                       if pd.notna(_row["Breakeven Acc % Needed"]) else "n/a")
-            d4.metric("OOS Trades", int(_row["OOS Trades"]))
+            e1, e2, e3, e4 = st.columns(4)
+            e1.metric("OOS Trades", int(_row["OOS Trades"]))
+            e2.metric("OOS Sortino", f"{_row.get('OOS Sortino', float('nan')):.2f}")
+            e3.metric("Profit Factor", f"{_row['OOS Profit Factor']:.2f}"
+                      if pd.notna(_row.get("OOS Profit Factor")) else "n/a")
+            e4.metric("Max Drawdown", f"{_row['Max DD (OOS)']:.1f}")
+            if "Rank Score" in _row.index:
+                st.caption(f"Rank Score {_row['Rank Score']:.3f} across: " + ", ".join(_rank_choice))
             _margin = (_row["OOS Accuracy %"] - _row["Breakeven Acc % Needed"]
                        if pd.notna(_row["Breakeven Acc % Needed"]) else None)
             if _margin is not None:
