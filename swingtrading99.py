@@ -52,11 +52,13 @@ TICKER_MAP = {
 
 TF_PERIOD_MAP = {
     "1m": ["1d", "5d", "7d"],
+    "3m": ["1d", "5d", "7d", "1mo"],
     "5m": ["1d", "5d", "7d", "1mo"],
     "15m": ["1d", "5d", "7d", "1mo"],
     "1h": ["1d", "7d", "1mo", "3mo", "6mo", "1y"],
     "1d": ["7d", "1mo", "6mo", "1y", "2y", "3y", "5y", "10y"],
     "1wk": ["1mo", "3mo", "6mo", "1y", "2y", "5y", "10y", "20y", "30y"],
+    "1mo": ["1y", "2y", "3y", "5y", "10y", "20y", "30y"],
 }
 
 STRATEGIES = [
@@ -240,7 +242,6 @@ DHAN_INTERVAL_CODE = {"1m": "1", "2m": "1", "3m": "1", "5m": "5", "10m": "5",
 # experience is unchanged.
 DHAN_EXTRA_TF_PERIODS = {
     "2m": ["1d", "5d", "7d", "1mo"],
-    "3m": ["1d", "5d", "7d", "1mo"],
     "10m": ["1d", "5d", "7d", "1mo", "3mo"],
     "25m": ["1d", "5d", "7d", "1mo", "3mo"],
     "30m": ["1d", "5d", "7d", "1mo", "3mo", "6mo"],
@@ -252,15 +253,21 @@ DHAN_EXTRA_TF_PERIODS = {
 # Timeframes that Dhan serves by resampling a finer base interval, e.g. a 3m
 # candle is built from 1m data. Keyed by timeframe → (base code, pandas rule).
 DHAN_RESAMPLE_TF = {"2m": "2min", "3m": "3min", "10m": "10min", "30m": "30min",
-                    "45m": "45min", "2h": "2h", "4h": "4h"}
+                    "45m": "45min", "2h": "2h", "4h": "4h", "1mo": "MS"}
 
 
 def available_tf_period_map():
-    """TF_PERIOD_MAP, extended with Dhan-only granularities when that feed is
-    active. Callers keep using one map, so nothing downstream changes."""
+    """
+    TF_PERIOD_MAP, optionally extended with Dhan's finer granularities.
+
+    The extension is now driven by an explicit checkbox ("Use Dhan timeframes
+    and periods") rather than implicitly by the feed being on, so the timeframe
+    list never changes underneath you as a side effect of another setting.
+    Callers keep using one map, so nothing downstream changes.
+    """
     base = {k: list(v) for k, v in TF_PERIOD_MAP.items()}
     try:
-        if dhan_feed_active():
+        if st.session_state.app_cfg.get("use_dhan_timeframes", False):
             for tf, periods in DHAN_EXTRA_TF_PERIODS.items():
                 base.setdefault(tf, list(periods))
     except Exception:
@@ -283,7 +290,7 @@ def available_tf_period_map():
 
 # Rough period-string → number of calendar days to request from Dhan
 PERIOD_TO_DAYS = {
-    "1d": 1, "5d": 5, "7d": 7, "1mo": 31, "3mo": 92, "6mo": 183,
+    "1d": 1, "5d": 5, "7d": 7, "1mo": 31, "3mo": 92, "6mo": 183, "4y": 1461,
     "1y": 366, "2y": 731, "3y": 1096, "5y": 1827, "10y": 3653,
     "20y": 7305, "30y": 10958,
 }
@@ -412,13 +419,37 @@ def _cfg_out(cfg_key, val):
 def cfg_force(cfg_key, value):
     """
     Programmatic write (auto-filled security IDs, exchange auto-flip,
-    apply-optimized-config). Legal because every caller runs BEFORE the
-    corresponding widget is instantiated on this run; Streamlit only forbids
-    assigning to a widget key AFTER its widget has been created in the same
-    run. Used sparingly and only for values the user did not just type.
+    apply-a-configuration buttons).
+
+    Streamlit forbids assigning to a widget key AFTER that widget has been
+    created in the same run. Sidebar-time callers run before their widget
+    exists, so a direct write is fine — but anything living in a TAB runs
+    after the whole sidebar has rendered, and a direct write there raises
+    StreamlitAPIException. Rather than making callers know which case they are
+    in, an illegal write is caught and queued instead; apply_pending_cfg()
+    then applies it at the very top of the next run, before any widget is
+    instantiated. The store is updated either way.
     """
-    st.session_state[_wkey(cfg_key)] = value
     _cfg_store()[cfg_key] = value
+    try:
+        st.session_state[_wkey(cfg_key)] = value
+    except Exception:
+        st.session_state.setdefault("_cfg_pending", {})[cfg_key] = value
+
+
+def apply_pending_cfg():
+    """Flush values queued by cfg_force/cfg_set into their widget keys. Must be
+    called once at the start of a run, before any widget renders."""
+    pending = st.session_state.pop("_cfg_pending", None)
+    if not pending:
+        return
+    store = _cfg_store()
+    for cfg_key, value in pending.items():
+        store[cfg_key] = value
+        try:
+            st.session_state[_wkey(cfg_key)] = value
+        except Exception:
+            pass
 
 
 def cfg_checkbox(ui, label, cfg_key, default=False, prefix="sb", **kw):
@@ -493,8 +524,11 @@ def cfg_time(ui, label, cfg_key, default, prefix="sb", **kw):
 
 
 def cfg_set(cfg_key, value):
-    """Programmatic write used by the Optimization tab's apply-config."""
-    cfg_force(cfg_key, value)
+    """Programmatic write used by the 'apply this configuration' buttons in the
+    Optimization and Strategy Search tabs. Safe from inside a tab: the write is
+    queued and applied at the top of the next run (see cfg_force)."""
+    _cfg_store()[cfg_key] = value
+    st.session_state.setdefault("_cfg_pending", {})[cfg_key] = value
 
 
 # ============================================================================
@@ -951,7 +985,8 @@ def normalize_index_to_ist(df, ticker):
 # the Dhan feed off never leaves a selected timeframe unusable.
 _YF_FALLBACK_TF = {"2m": ("1m", "2min"), "3m": ("1m", "3min"), "10m": ("5m", "10min"),
                    "25m": ("5m", "25min"), "30m": ("15m", "30min"), "45m": ("15m", "45min"),
-                   "60m": ("1h", None), "2h": ("1h", "2h"), "4h": ("1h", "4h")}
+                   "60m": ("1h", None), "2h": ("1h", "2h"), "4h": ("1h", "4h"),
+                   "1mo": ("1d", "MS")}
 
 
 def fetch_data_yf(ticker, interval, period):
@@ -2145,8 +2180,9 @@ TABLE_TIMEFRAMES = ["1m", "2m", "3m", "5m", "10m", "15m", "30m", "60m", "1h", "4
 TABLE_PERIODS = ["1d", "5d", "7d", "1mo", "3mo", "6mo", "1y", "2y", "3y", "4y", "5y",
                  "6y", "7y", "8y", "9y", "10y"]
 _TF_RULE = {"1m": "1min", "2m": "2min", "3m": "3min", "5m": "5min", "10m": "10min",
-            "15m": "15min", "30m": "30min", "60m": "60min", "1h": "1h", "4h": "4h",
-            "1d": "1D", "1wk": "1W"}
+            "15m": "15min", "25m": "25min", "30m": "30min", "45m": "45min",
+            "60m": "60min", "1h": "1h", "2h": "2h", "4h": "4h",
+            "1d": "1D", "1wk": "1W", "1mo": "MS"}
 _PERIOD_DAYS = {"1d": 1, "5d": 5, "7d": 7, "1mo": 31, "3mo": 92, "6mo": 183, "1y": 366,
                 "2y": 731, "3y": 1096, "4y": 1461, "5y": 1827, "6y": 2192, "7y": 2557,
                 "8y": 2922, "9y": 3287, "10y": 3653}
@@ -2179,8 +2215,9 @@ TABLE_DEFAULT_COLUMNS = ["Time", "PCR", "Δ PCR", "Spot", "Δ Spot", "Future", "
 # daily is effectively unlimited. The table fetches at a base interval within
 # those limits and resamples up to the requested timeframe.
 _TF_BASE_INTERVAL = {"1m": "1m", "2m": "2m", "3m": "1m", "5m": "5m", "10m": "5m",
-                     "15m": "15m", "30m": "30m", "60m": "60m", "1h": "60m",
-                     "4h": "60m", "1d": "1d", "1wk": "1d"}
+                     "15m": "15m", "25m": "5m", "30m": "30m", "45m": "15m",
+                     "60m": "60m", "1h": "60m", "2h": "60m", "4h": "60m",
+                     "1d": "1d", "1wk": "1d", "1mo": "1d"}
 _BASE_LIMIT_DAYS = {"1m": 7, "2m": 60, "5m": 60, "15m": 60, "30m": 60, "60m": 60, "1d": 3650}
 _YF_PERIOD_LADDER = [(1, "1d"), (5, "5d"), (7, "7d"), (31, "1mo"), (92, "3mo"),
                      (183, "6mo"), (366, "1y"), (731, "2y"), (1827, "5y"), (3653, "10y")]
@@ -6228,6 +6265,12 @@ def render_config_controls(ui, prefix="sb"):
         ticker = TICKER_MAP[ticker_choice]
         underlying_choice = ticker_choice
 
+    use_dhan_tf = cfg_checkbox(ui, "Use Dhan timeframes and periods (finer granularity)",
+                               "use_dhan_timeframes", False, prefix=prefix)
+    if use_dhan_tf:
+        ui.caption("Adds Dhan-only granularities (2m, 10m, 25m, 30m, 45m, 2h, 4h) on top of the standard list. "
+                   "These are served by Dhan; with the Dhan feed off they fall back to resampling the nearest "
+                   "yfinance interval, so a selection never breaks.")
     _tf_map = available_tf_period_map()
     intervals = list(_tf_map.keys())
     interval = cfg_selectbox(ui, "Timeframe", "interval", intervals, default="1m", prefix=prefix)
@@ -7515,6 +7558,10 @@ def render_config_controls(ui, prefix="sb"):
 # ============================================================================
 # SIDEBAR (one of the two live views of the shared config store)
 # ============================================================================
+
+# Flush any configuration queued by an "apply this configuration" button on a
+# previous run. Must happen before a single widget is instantiated.
+apply_pending_cfg()
 
 config = render_config_controls(st.sidebar, "sb")
 
@@ -10124,14 +10171,48 @@ also shows the accuracy that its own risk:reward *requires* to break even, so a 
 
     sc1, sc2, sc3 = st.columns(3)
     srch_ticker_mode = cfg_selectbox(sc1, "Instrument", "srch_ticker_mode",
-                                     ["Use sidebar ticker", "Custom symbol"], default="Use sidebar ticker")
-    if srch_ticker_mode == "Custom symbol":
+                                     ["Use sidebar ticker", "Index", "Nifty 50 stock",
+                                      "Nifty 100 stock", "Custom symbol"],
+                                     default="Use sidebar ticker")
+    if srch_ticker_mode == "Index":
+        _srch_idx = cfg_selectbox(sc2, "Index", "srch_index",
+                                  ["Nifty50", "BankNifty", "Sensex"], default="Nifty50")
+        srch_ticker = TICKER_MAP.get(_srch_idx, "^NSEI")
+    elif srch_ticker_mode == "Nifty 50 stock":
+        _srch_n50 = cfg_selectbox(sc2, "Stock", "srch_n50", NIFTY50_SYMBOLS, default=NIFTY50_SYMBOLS[0])
+        srch_ticker = f"{_srch_n50}.NS"
+    elif srch_ticker_mode == "Nifty 100 stock":
+        _srch_n100 = cfg_selectbox(sc2, "Stock", "srch_n100", NIFTY100_SYMBOLS, default=NIFTY100_SYMBOLS[0])
+        srch_ticker = f"{_srch_n100}.NS"
+    elif srch_ticker_mode == "Custom symbol":
         _srch_sym = cfg_text(sc2, "Symbol (Yahoo format, e.g. RELIANCE.NS)", "srch_symbol", "RELIANCE.NS")
         srch_ticker = _srch_sym.strip()
     else:
         srch_ticker = ticker
         sc2.text_input("Ticker", value=str(ticker), disabled=True, key="srch_ticker_display")
     srch_oos = cfg_number(sc3, "Out-of-sample share (%)", "srch_oos_pct", 30, 10, 50, is_int=True)
+    st.caption(f"Searching **{srch_ticker}**")
+
+    q1, q2 = st.columns(2)
+    srch_qty = cfg_number(q1, "Quantity (used for cash P&L and brokerage per trade)", "srch_qty",
+                          int(qty) if qty else 1, 1, 1000000, is_int=True)
+    srch_use_sidebar_filters = cfg_checkbox(q2, "Use the sidebar's entry filters", "srch_use_sidebar_filters", True)
+    if srch_use_sidebar_filters:
+        _active_f = [k.replace("_enabled", "") for k, v in (filters or {}).items() if v is True]
+        st.caption("Active filters: " + (", ".join(_active_f) if _active_f else "none"))
+        _srch_filters = filters
+    else:
+        _fl = ["adx", "rsi", "bb", "ema20", "sma20", "smc", "atr", "supertrend", "regime",
+               "angle", "crossover_quality", "vix", "vwap", "macd", "volbreak_nx"]
+        _chosen_f = cfg_multiselect(st, "Entry filters to apply during the search", "srch_filters", _fl, default=[])
+        _srch_filters = {f"{f}_enabled": (f in _chosen_f) for f in _fl}
+        # carry the sidebar's tuning values so an enabled filter behaves the same way
+        for _k, _v in (filters or {}).items():
+            if not _k.endswith("_enabled"):
+                _srch_filters.setdefault(_k, _v)
+        st.caption("These use the sidebar's tuning values (thresholds, periods) — only which filters are ON differs. "
+                   "Note that each additional filter cuts the trade count, and a small sample is the fastest route "
+                   "to a meaningless accuracy figure.")
 
     _tf_all = list(available_tf_period_map().keys())
     srch_tfs = cfg_multiselect(st, "Timeframes to search", "srch_tfs", _tf_all, default=[interval])
@@ -10202,7 +10283,7 @@ also shows the accuracy that its own risk:reward *requires* to break even, so a 
             _pb.progress(min(max(f, 0.0), 1.0), text=f"{int(f*100)}% · {label}")
 
         with st.spinner("Searching…"):
-            _sres = run_strategy_search(srch_ticker, _combos, filters, params, qty, _srch_costs,
+            _sres = run_strategy_search(srch_ticker, _combos, _srch_filters, params, int(srch_qty), _srch_costs,
                                         min_trades=int(srch_min_trades),
                                         oos_fraction=float(srch_oos) / 100.0,
                                         risk_ctrl=risk_ctrl, progress=_scb)
