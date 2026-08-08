@@ -3193,6 +3193,183 @@ def aggregate_chain_history(df, mode, underlying_label=None, expiry=None):
 
 
 # ============================================================================
+# STRATEGY SEARCH — grid search with OUT-OF-SAMPLE validation
+# ----------------------------------------------------------------------------
+# This exists to answer "which configuration should I actually trade?", and it
+# is built to resist the two failure modes that make naive optimisation
+# dangerous:
+#
+#  1. THE ACCURACY TRAP. Accuracy on its own says nothing about profit. A
+#     5-point target with a 200-point stop wins ~97% of the time and still
+#     loses money, because the rare loss is 40× the typical win. Every result
+#     here is therefore ranked by EXPECTANCY AFTER COSTS, with accuracy shown
+#     alongside for context and a breakeven-accuracy column that states
+#     exactly what hit rate the chosen risk:reward actually requires.
+#
+#  2. OVERFITTING / SELECTION BIAS. Search 500 combinations and the best one
+#     is chosen partly by luck; on pure random data a grid search reliably
+#     produces "100% accuracy" configurations that have no predictive power at
+#     all. Defence: every configuration is fitted on the FIRST part of the
+#     data and scored on a LATER, UNSEEN part. Ranking uses the unseen score,
+#     and the in-sample→out-of-sample degradation is reported so a
+#     configuration that only works on the data it was picked on is visible
+#     immediately.
+# ============================================================================
+
+SEARCH_SL_VALUE_GRID = [10, 20, 30, 50, 75, 100, 150, 200]
+SEARCH_TARGET_VALUE_GRID = [10, 20, 30, 50, 75, 100, 150, 200]
+
+
+def _search_metrics(trades_df, qty, cost_cfg=None):
+    """Metrics for one backtest slice, net of costs when a cost model is given."""
+    if trades_df is None or trades_df.empty:
+        return None
+    df = trades_df
+    pts_col = "Points"
+    if cost_cfg:
+        df = apply_cost_model(df, cost_cfg, qty)
+        pts_col = "Points (Net)"
+    pts = pd.to_numeric(df[pts_col], errors="coerce").dropna()
+    if pts.empty:
+        return None
+    wins = int((pts > 0).sum())
+    total = len(pts)
+    avg_win = pts[pts > 0].mean() if wins else 0.0
+    avg_loss = pts[pts <= 0].mean() if (total - wins) else 0.0
+    wr = wins / total
+    expectancy = wr * avg_win + (1 - wr) * avg_loss
+    gross_win = pts[pts > 0].sum()
+    gross_loss = abs(pts[pts <= 0].sum())
+    cum = pts.cumsum()
+    dd = float((cum - cum.cummax()).min())
+    # What hit rate this risk:reward actually needs just to break even.
+    be = (abs(avg_loss) / (avg_win + abs(avg_loss)) * 100) if (avg_win + abs(avg_loss)) else np.nan
+    return {
+        "trades": total,
+        "accuracy": round(wr * 100, 2),
+        "expectancy": round(float(expectancy), 3),
+        "total_points": round(float(pts.sum()), 2),
+        "avg_win": round(float(avg_win), 2),
+        "avg_loss": round(float(avg_loss), 2),
+        "profit_factor": round(float(gross_win / gross_loss), 3) if gross_loss > 0 else np.inf,
+        "max_dd": round(dd, 2),
+        "breakeven_acc": round(float(be), 2) if be == be else np.nan,
+    }
+
+
+def search_diagnose(is_m, oos_m, min_trades):
+    """
+    Plain-language verdict on a configuration. The point is to make an unusable
+    result obvious rather than letting a headline accuracy number speak for
+    itself.
+    """
+    flags = []
+    if not is_m or not oos_m:
+        return "NO DATA", ["Not enough trades to evaluate."]
+    if is_m["trades"] < min_trades:
+        flags.append(f"Only {is_m['trades']} in-sample trades — too few to mean anything "
+                     f"(a handful of lucky trades can show any accuracy).")
+    if oos_m["trades"] < max(5, min_trades // 3):
+        flags.append(f"Only {oos_m['trades']} out-of-sample trades — the unseen-data score is unreliable.")
+    if is_m["accuracy"] >= 99 and is_m["expectancy"] <= 0:
+        flags.append("~100% accuracy with non-positive expectancy — the classic tiny-target/huge-stop "
+                     "configuration. It wins constantly and still loses money.")
+    if is_m["breakeven_acc"] == is_m["breakeven_acc"] and is_m["accuracy"] < is_m["breakeven_acc"]:
+        flags.append(f"Accuracy {is_m['accuracy']:.1f}% is BELOW the {is_m['breakeven_acc']:.1f}% this "
+                     f"risk:reward needs just to break even.")
+    if is_m["expectancy"] > 0 and oos_m["expectancy"] <= 0:
+        flags.append("Profitable in-sample, unprofitable out-of-sample — the hallmark of a curve-fit.")
+    degrade = None
+    if is_m["expectancy"] > 0:
+        degrade = (is_m["expectancy"] - oos_m["expectancy"]) / abs(is_m["expectancy"]) * 100
+        if degrade > 50:
+            flags.append(f"Out-of-sample expectancy is {degrade:.0f}% worse than in-sample — poor robustness.")
+    if oos_m["expectancy"] > 0 and is_m["expectancy"] > 0 and not flags:
+        return "PROMISING", ["Positive expectancy both in-sample and on unseen data, with enough trades "
+                             "to be worth further validation."]
+    if flags:
+        return "REJECT" if (oos_m["expectancy"] <= 0 or is_m["trades"] < min_trades) else "WEAK", flags
+    return "WEAK", ["No disqualifying flag, but the edge is marginal."]
+
+
+def run_strategy_search(ticker, combos, filters, base_params, qty, cost_cfg,
+                        min_trades=30, oos_fraction=0.3, risk_ctrl=None, progress=None):
+    """
+    Grid-search `combos` (each a dict of timeframe/period/strategy/sl/target and
+    values), scoring every one on an out-of-sample split.
+
+    Returns a DataFrame ranked by out-of-sample expectancy after costs.
+    """
+    rows = []
+    total = max(len(combos), 1)
+    data_cache = {}
+
+    for i, combo in enumerate(combos):
+        if progress:
+            progress(i / total, f"{combo['strategy'][:26]} · {combo['interval']}/{combo['period']} "
+                                f"· SL {combo['sl_value']} / TGT {combo['target_value']}")
+        key = (combo["interval"], combo["period"])
+        if key not in data_cache:
+            try:
+                data_cache[key] = fetch_data(ticker, combo["interval"], combo["period"])
+            except Exception:
+                data_cache[key] = pd.DataFrame()
+        raw = data_cache[key]
+        if raw is None or raw.empty or len(raw) < 120:
+            continue
+
+        split = int(len(raw) * (1 - oos_fraction))
+        is_df, oos_df = raw.iloc[:split], raw.iloc[split:]
+        if len(is_df) < 80 or len(oos_df) < 40:
+            continue
+
+        p = dict(base_params)
+        p["sl_points"] = combo["sl_value"]
+        p["target_points"] = combo["target_value"]
+        p["partial_target1_points"] = combo["target_value"]
+
+        try:
+            is_tr, _ = run_backtest(is_df, combo["strategy"], combo["sl_type"], combo["target_type"],
+                                    p, filters, qty, risk_ctrl)
+            oos_tr, _ = run_backtest(oos_df, combo["strategy"], combo["sl_type"], combo["target_type"],
+                                     p, filters, qty, risk_ctrl)
+        except Exception:
+            continue
+
+        is_m = _search_metrics(is_tr, qty, cost_cfg)
+        oos_m = _search_metrics(oos_tr, qty, cost_cfg)
+        if not is_m or not oos_m:
+            continue
+
+        verdict, notes = search_diagnose(is_m, oos_m, min_trades)
+        rows.append({
+            "Verdict": verdict,
+            "Strategy": combo["strategy"], "TF": combo["interval"], "Period": combo["period"],
+            "SL Type": combo["sl_type"], "SL": combo["sl_value"],
+            "Target Type": combo["target_type"], "Target": combo["target_value"],
+            "OOS Expectancy": oos_m["expectancy"],
+            "OOS Accuracy %": oos_m["accuracy"],
+            "OOS Trades": oos_m["trades"],
+            "OOS Points": oos_m["total_points"],
+            "OOS Profit Factor": oos_m["profit_factor"],
+            "IS Expectancy": is_m["expectancy"],
+            "IS Accuracy %": is_m["accuracy"],
+            "IS Trades": is_m["trades"],
+            "Breakeven Acc % Needed": is_m["breakeven_acc"],
+            "Avg Win": is_m["avg_win"], "Avg Loss": is_m["avg_loss"],
+            "Max DD (OOS)": oos_m["max_dd"],
+            "Notes": " ".join(notes),
+        })
+
+    if progress:
+        progress(1.0, "done")
+    if not rows:
+        return pd.DataFrame()
+    out = pd.DataFrame(rows)
+    return out.sort_values(["OOS Expectancy", "OOS Trades"], ascending=[False, False]).reset_index(drop=True)
+
+
+# ============================================================================
 # SCREENER
 # ============================================================================
 
@@ -8651,10 +8828,10 @@ def render_bin_analysis_section(t1, t2, t1_name, t2_name, p1, diff, fetch_interv
 # ============================================================================
 
 (tab_bt, tab_live, tab_hist, tab_heat, tab_opt, tab_spread, tab_ohlc,
- tab_chain, tab_screen, tab_dl, tab_admin) = st.tabs(
+ tab_chain, tab_screen, tab_search, tab_dl, tab_admin) = st.tabs(
     ["📊 Backtest", "🔴 Live Trading", "📜 Trade History", "🔥 Heatmaps", "🧪 Optimization",
      "🔀 Spread Tool", "📅 OHLC & Range", "🔗 Option Chain Analysis", "🔎 Screener",
-     "⬇️ Data Download", "🛠 Admin Panel"]
+     "🧭 Strategy Search", "⬇️ Data Download", "🛠 Admin Panel"]
 )
 
 # ---------------------------------------------------------------- BACKTEST -
@@ -9908,6 +10085,216 @@ with tab_screen:
         st.warning("⚠️ The selected strategy reads a live option chain, which exists per-underlying rather than "
                    "per-candle. Screening many stocks with it is not meaningful — pick a price-based strategy for "
                    "the screener, or use the Option Chain Analysis tab for chain work.")
+
+
+# ------------------------------------------------------- STRATEGY SEARCH ----
+with tab_search:
+    st.subheader("🧭 Strategy Search")
+    st.caption("Searches combinations of timeframe, period, strategy, stoploss and target to find configurations "
+               "worth trading — scored on data the search never saw.")
+
+    with st.expander("⚠️ Read this first — why the highest-accuracy result is usually the wrong one",
+                     expanded=True):
+        st.markdown("""
+**Accuracy alone cannot tell you whether a configuration makes money.**
+
+Take a stoploss of 200 points with a target of 5. That wins about 97% of the time — and still loses,
+because the occasional loss is 40× a typical win:
+
+| Accuracy | Expectancy per trade (SL 200 / Target 5) |
+|---|---|
+| 90% | **−15.50 points** |
+| 95% | **−5.25 points** |
+| 97.5% | **−0.13 points** |
+| 99% | +2.95 points |
+
+That risk:reward needs **97.56%** accuracy just to break even. A 90% hit rate there is a losing system that
+*feels* like a winning one, which is what makes it dangerous.
+
+**And 100% accuracy is not a goal — it is a warning sign.** On a pure random walk with no edge whatsoever,
+searching 144 configurations produced several showing *100% accuracy*, simply because a 1-point target with a
+200-point stop is almost always reached first. Out of sample they still "won" every trade — and after realistic
+slippage, spread and brokerage they lost **1.30 points per trade**. Accuracy that high nearly always means the
+target is trivially small, the sample is tiny, or the search has fitted noise.
+
+**What this tab does instead:** every configuration is fitted on the earlier part of the data and scored on a
+later, unseen part. Ranking is by **expectancy after costs on the unseen data**, never by accuracy. Each row
+also shows the accuracy that its own risk:reward *requires* to break even, so a mismatch is impossible to miss.
+        """)
+
+    sc1, sc2, sc3 = st.columns(3)
+    srch_ticker_mode = cfg_selectbox(sc1, "Instrument", "srch_ticker_mode",
+                                     ["Use sidebar ticker", "Custom symbol"], default="Use sidebar ticker")
+    if srch_ticker_mode == "Custom symbol":
+        _srch_sym = cfg_text(sc2, "Symbol (Yahoo format, e.g. RELIANCE.NS)", "srch_symbol", "RELIANCE.NS")
+        srch_ticker = _srch_sym.strip()
+    else:
+        srch_ticker = ticker
+        sc2.text_input("Ticker", value=str(ticker), disabled=True, key="srch_ticker_display")
+    srch_oos = cfg_number(sc3, "Out-of-sample share (%)", "srch_oos_pct", 30, 10, 50, is_int=True)
+
+    _tf_all = list(available_tf_period_map().keys())
+    srch_tfs = cfg_multiselect(st, "Timeframes to search", "srch_tfs", _tf_all, default=[interval])
+    _periods_all = sorted({p for tf in (srch_tfs or [interval]) for p in available_tf_period_map().get(tf, [])})
+    srch_periods = cfg_multiselect(st, "Periods to search", "srch_periods", _periods_all,
+                                   default=[period] if period in _periods_all else _periods_all[-1:])
+    _strats = [s for s in STRATEGIES if s not in OPTION_CHAIN_STRATEGIES
+               and s not in (ZERO_HERO_STRATEGY, "Hybrid (Combine Strategies)")]
+    srch_strats = cfg_multiselect(st, "Strategies to search", "srch_strats", _strats,
+                                  default=[strategy] if strategy in _strats else _strats[:1])
+    st.caption("Option-chain strategies and Zero Hero are excluded: they depend on a live chain snapshot that "
+               "cannot be reconstructed historically, so a backtest of them would be meaningless.")
+
+    srch_sl_types = cfg_multiselect(st, "Stoploss types", "srch_sl_types", SL_TYPES, default=[sl_type])
+    srch_tgt_types = cfg_multiselect(st, "Target types", "srch_tgt_types", TARGET_TYPES, default=[target_type])
+    v1, v2 = st.columns(2)
+    srch_sl_vals = cfg_multiselect(v1, "SL values", "srch_sl_vals",
+                                   SEARCH_SL_VALUE_GRID, default=[20, 50, 100])
+    srch_tgt_vals = cfg_multiselect(v2, "Target values", "srch_tgt_vals",
+                                    SEARCH_TARGET_VALUE_GRID, default=[20, 50, 100])
+    m1, m2 = st.columns(2)
+    srch_min_trades = cfg_number(m1, "Minimum in-sample trades to trust a result", "srch_min_trades",
+                                 30, 5, 500, is_int=True)
+    srch_max_combos = cfg_number(m2, "Maximum combinations to test", "srch_max_combos",
+                                 400, 10, 5000, is_int=True)
+    st.caption("The minimum-trades filter matters: with 8 trades any accuracy is achievable by luck. Thirty is a "
+               "weak floor and a hundred is better — treat anything below it as an anecdote, not evidence.")
+
+    srch_use_costs = cfg_checkbox(st, "Apply realistic costs (strongly recommended)", "srch_use_costs", True)
+    if srch_use_costs:
+        cc1, cc2, cc3 = st.columns(3)
+        _slip = cfg_number(cc1, "Slippage (points)", "srch_slip", 1.0, 0.0, 1000.0, step=0.25)
+        _spread = cfg_number(cc2, "Spread (points)", "srch_spread", 0.5, 0.0, 1000.0, step=0.25)
+        _brk = cfg_number(cc3, "Brokerage per leg", "srch_brk", 20.0, 0.0, 10000.0, step=5.0)
+        _srch_costs = {"slippage_points": _slip, "spread_points": _spread, "brokerage_flat": _brk}
+        st.caption("Costs are what separate a real edge from a spreadsheet one. A configuration that only profits "
+                   "with costs switched off does not profit.")
+    else:
+        _srch_costs = None
+        st.warning("Costs are OFF — results will overstate every configuration, small-target ones most of all.")
+
+    _combos = [{"interval": tf, "period": pd_, "strategy": s, "sl_type": slt,
+                "target_type": tgt, "sl_value": sv, "target_value": tv}
+               for tf in (srch_tfs or [])
+               for pd_ in (srch_periods or [])
+               if pd_ in available_tf_period_map().get(tf, [])
+               for s in (srch_strats or [])
+               for slt in (srch_sl_types or [])
+               for tgt in (srch_tgt_types or [])
+               for sv in (srch_sl_vals or [])
+               for tv in (srch_tgt_vals or [])]
+    _n_all = len(_combos)
+    _combos = _combos[:int(srch_max_combos)]
+
+    st.info(f"**{_n_all:,}** combinations defined"
+            + (f" — testing the first **{len(_combos):,}** (raise the cap to cover them all)."
+               if _n_all > len(_combos) else ".")
+            + f"  Each is fitted on {100 - int(srch_oos)}% of the data and scored on the unseen {int(srch_oos)}%.")
+    if _n_all > 1000:
+        st.warning(f"⚠️ {_n_all:,} combinations is a very wide search. The more you test, the more likely the "
+                   "winner is simply the luckiest — that is selection bias, and the out-of-sample column is your "
+                   "defence against it, not a cure. Prefer a narrow, reasoned search over an exhaustive one.")
+
+    if st.button("▶ Run Search", type="primary", disabled=not _combos):
+        _pb = st.progress(0.0, text="Starting…")
+
+        def _scb(f, label):
+            _pb.progress(min(max(f, 0.0), 1.0), text=f"{int(f*100)}% · {label}")
+
+        with st.spinner("Searching…"):
+            _sres = run_strategy_search(srch_ticker, _combos, filters, params, qty, _srch_costs,
+                                        min_trades=int(srch_min_trades),
+                                        oos_fraction=float(srch_oos) / 100.0,
+                                        risk_ctrl=risk_ctrl, progress=_scb)
+        _pb.empty()
+        st.session_state["srch_results"] = _sres
+        st.session_state["srch_at"] = ist_now().strftime("%d-%b-%Y %H:%M:%S IST")
+
+    _sres = st.session_state.get("srch_results")
+    if _sres is None:
+        st.caption("Configure the search above and press **Run Search**.")
+    elif _sres.empty:
+        st.warning("No configuration produced enough trades to evaluate. Widen the period, loosen the filters, or "
+                   "lower the minimum-trades requirement.")
+    else:
+        st.caption(f"Last run: {st.session_state.get('srch_at')} · {len(_sres):,} configurations evaluated")
+        _promising = _sres[_sres["Verdict"] == "PROMISING"]
+        _k1, _k2, _k3, _k4 = st.columns(4)
+        _k1.metric("Evaluated", f"{len(_sres):,}")
+        _k2.metric("🟢 Promising", len(_promising))
+        _k3.metric("🟡 Weak", int((_sres["Verdict"] == "WEAK").sum()))
+        _k4.metric("🔴 Rejected", int((_sres["Verdict"] == "REJECT").sum()))
+
+        if _promising.empty:
+            st.error("**No configuration survived out-of-sample validation.** That is a genuine and useful result, "
+                     "not a failure of the search: it means none of the tested combinations showed an edge on data "
+                     "they were not fitted to. Trading any of them because it looked good in-sample is precisely "
+                     "the mistake this tab exists to prevent.")
+        else:
+            st.success(f"{len(_promising)} configuration(s) kept a positive expectancy on unseen data. Treat these "
+                       "as candidates for further validation (walk-forward, then paper trading) — not as proof.")
+
+        _show_all = cfg_checkbox(st, "Show rejected and weak configurations too", "srch_show_all", False)
+        _view = _sres if _show_all else _sres[_sres["Verdict"].isin(["PROMISING", "WEAK"])]
+        _cols = ["Verdict", "Strategy", "TF", "Period", "SL Type", "SL", "Target Type", "Target",
+                 "OOS Expectancy", "OOS Accuracy %", "OOS Trades", "OOS Points", "OOS Profit Factor",
+                 "IS Expectancy", "IS Accuracy %", "IS Trades", "Breakeven Acc % Needed",
+                 "Avg Win", "Avg Loss", "Max DD (OOS)"]
+        st.dataframe(_view[[c for c in _cols if c in _view.columns]].head(300),
+                     hide_index=True, use_container_width=True, height=460)
+        st.caption("Ranked by expectancy per trade on UNSEEN data, after costs. **Breakeven Acc % Needed** is the "
+                   "hit rate that row's own risk:reward requires — compare it against the accuracy columns.")
+
+        st.download_button("⬇ Download all results (CSV)", _sres.to_csv(index=False).encode(),
+                           file_name=f"strategy_search_{srch_ticker}.csv", mime="text/csv", key="srch_dl")
+
+        st.markdown("#### 🔬 Inspect a configuration")
+        _labels = [f"{r['Verdict']} · {r['Strategy'][:30]} · {r['TF']}/{r['Period']} · SL {r['SL']} / TGT {r['Target']}"
+                   for _, r in _view.head(60).iterrows()]
+        if _labels:
+            _pick_i = st.selectbox("Configuration", range(len(_labels)),
+                                   format_func=lambda i: _labels[i], key="srch_pick")
+            _row = _view.head(60).iloc[_pick_i]
+            d1, d2, d3, d4 = st.columns(4)
+            d1.metric("OOS Expectancy", f"{_row['OOS Expectancy']:+.3f} pts/trade")
+            d2.metric("OOS Accuracy", f"{_row['OOS Accuracy %']:.1f}%")
+            d3.metric("Breakeven Needed", f"{_row['Breakeven Acc % Needed']:.1f}%"
+                      if pd.notna(_row["Breakeven Acc % Needed"]) else "n/a")
+            d4.metric("OOS Trades", int(_row["OOS Trades"]))
+            _margin = (_row["OOS Accuracy %"] - _row["Breakeven Acc % Needed"]
+                       if pd.notna(_row["Breakeven Acc % Needed"]) else None)
+            if _margin is not None:
+                if _margin > 0:
+                    st.success(f"Accuracy exceeds its breakeven requirement by {_margin:.1f} points — the edge is "
+                               "real for this sample.")
+                else:
+                    st.error(f"Accuracy is {abs(_margin):.1f} points BELOW what this risk:reward needs to break "
+                             "even. However good the accuracy looks, this configuration loses money.")
+            if str(_row.get("Notes", "")).strip():
+                st.warning("**Diagnostics:** " + str(_row["Notes"]))
+            if st.button("📥 Apply this configuration to the sidebar", key="srch_apply"):
+                cfg_set("interval", _row["TF"])
+                cfg_set("period", _row["Period"])
+                cfg_set("strategy", _row["Strategy"])
+                cfg_set("sl_type", _row["SL Type"])
+                cfg_set("target_type", _row["Target Type"])
+                cfg_set("sl_points", float(_row["SL"]))
+                cfg_set("target_points", float(_row["Target"]))
+                st.session_state["cfg_applied_msg"] = "Search configuration applied ✅"
+                st.rerun()
+
+        st.markdown("#### ✅ Before trading anything from this table")
+        st.markdown("""
+1. **Walk-forward it.** Enable Walk-Forward Validation in the sidebar and confirm the edge holds across several
+   sequential periods, not just one split.
+2. **Check the trade count.** Under ~100 trades, treat the result as a hypothesis rather than a finding.
+3. **Sanity-check the risk:reward.** If the target is far smaller than the stop, high accuracy is arithmetic,
+   not skill.
+4. **Paper trade it.** Live fills, spreads and slippage are the final examiner, and they fail many configurations
+   that look flawless here.
+5. **Expect decay.** Edges erode as conditions change. Re-validate periodically rather than assuming a past
+   result is permanent.
+        """)
 
 
 # --------------------------------------------------------- DATA DOWNLOAD ----
