@@ -3329,80 +3329,178 @@ def search_diagnose(is_m, oos_m, min_trades):
     return "WEAK", ["No disqualifying flag, but the edge is marginal."]
 
 
-def run_strategy_search(ticker, combos, filters, base_params, qty, cost_cfg,
-                        min_trades=30, oos_fraction=0.3, risk_ctrl=None, progress=None):
+def build_value_grid(mode, lo, hi, step_or_count, explicit=None):
     """
-    Grid-search `combos` (each a dict of timeframe/period/strategy/sl/target and
-    values), scoring every one on an out-of-sample split.
+    Turn a range specification into the list of values to test.
+
+    "Step" walks lo→hi in fixed increments (1..200 step 5 → 40 values).
+    "Count" spreads N values evenly across the range, which is usually the
+    better choice for a wide span: 1..500 in 20 steps tells you where the
+    useful region is far faster than 500 single-point tests.
+    """
+    if mode == "Pick from list":
+        return sorted({float(v) for v in (explicit or [])})
+    lo, hi = float(lo), float(hi)
+    if hi < lo:
+        lo, hi = hi, lo
+    if mode == "Range (count)":
+        cnt = max(2, int(step_or_count))
+        return sorted({round(float(v), 4) for v in np.linspace(lo, hi, cnt)})
+    step = float(step_or_count) or 1.0
+    if step <= 0:
+        step = 1.0
+    n = int((hi - lo) / step) + 1
+    n = min(n, 5000)
+    return sorted({round(lo + i * step, 4) for i in range(n) if lo + i * step <= hi + 1e-9})
+
+
+def estimate_search_time(n_combos, n_signal_groups, ms_per_signal=180.0, ms_per_eval=12.0):
+    """Rough wall-clock estimate. Signal preparation happens once per
+    (timeframe, period, strategy) group; each SL/target pair then costs only a
+    trade walk."""
+    secs = (n_signal_groups * ms_per_signal + n_combos * 2 * ms_per_eval) / 1000.0
+    return secs
+
+
+def run_strategy_search(ticker, combos, filters, base_params, qty, cost_cfg,
+                        min_trades=30, oos_fraction=0.3, risk_ctrl=None, progress=None,
+                        refine_rounds=0, refine_width=0.25, refine_points=7,
+                        time_budget_s=None):
+    """
+    Grid-search `combos`, scoring every one on an out-of-sample split.
+
+    Two things make wide SL/target sweeps practical:
+
+      • SIGNAL REUSE. Signals, filters and ATR depend on the data, the strategy
+        and the filter set — never on the SL or target value. They are
+        therefore computed ONCE per (timeframe, period, strategy) group and
+        reused across every SL/target pair in that group, which is roughly a
+        7× saving on a wide sweep since signal preparation is ~87% of the work.
+
+      • OPTIONAL REFINEMENT. With refine_rounds > 0 the search runs coarse
+        first, then re-searches a narrow band around the best result. Two
+        rounds of 7×7 around a coarse 10×10 examines 198 configurations
+        instead of 40,000 and lands in the same region — and because each
+        extra configuration tested also increases the chance the winner is
+        merely lucky, a smaller focused search is often the more trustworthy
+        one, not just the faster one.
 
     Returns a DataFrame ranked by out-of-sample expectancy after costs.
     """
-    rows = []
-    total = max(len(combos), 1)
-    data_cache = {}
+    rows, seen = [], set()
+    data_cache, sig_cache = {}, {}
+    t0 = time.time()
+    stopped_early = False
 
-    for i, combo in enumerate(combos):
-        if progress:
-            progress(i / total, f"{combo['strategy'][:26]} · {combo['interval']}/{combo['period']} "
-                                f"· SL {combo['sl_value']} / TGT {combo['target_value']}")
-        key = (combo["interval"], combo["period"])
+    def _get_data(interval, period):
+        key = (interval, period)
         if key not in data_cache:
             try:
-                data_cache[key] = fetch_data(ticker, combo["interval"], combo["period"])
+                data_cache[key] = fetch_data(ticker, interval, period)
             except Exception:
                 data_cache[key] = pd.DataFrame()
-        raw = data_cache[key]
-        if raw is None or raw.empty or len(raw) < 120:
-            continue
+        return data_cache[key]
 
-        split = int(len(raw) * (1 - oos_fraction))
-        is_df, oos_df = raw.iloc[:split], raw.iloc[split:]
-        if len(is_df) < 80 or len(oos_df) < 40:
-            continue
+    def _evaluate(batch, label_prefix="", offset=0, total=1):
+        nonlocal stopped_early
+        for i, combo in enumerate(batch):
+            sig_key = (combo["strategy"], combo["sl_type"], combo["target_type"],
+                       combo["interval"], combo["period"], combo["sl_value"], combo["target_value"])
+            if sig_key in seen:
+                continue
+            seen.add(sig_key)
 
-        p = dict(base_params)
-        p["sl_points"] = combo["sl_value"]
-        p["target_points"] = combo["target_value"]
-        p["partial_target1_points"] = combo["target_value"]
+            if time_budget_s and (time.time() - t0) > time_budget_s:
+                stopped_early = True
+                return
+            if progress:
+                progress(min((offset + i) / max(total, 1), 0.99),
+                         f"{label_prefix}{combo['strategy'][:24]} · {combo['interval']}/{combo['period']} "
+                         f"· SL {combo['sl_value']:g} / TGT {combo['target_value']:g}")
 
-        try:
-            is_tr, _ = run_backtest(is_df, combo["strategy"], combo["sl_type"], combo["target_type"],
-                                    p, filters, qty, risk_ctrl)
-            oos_tr, _ = run_backtest(oos_df, combo["strategy"], combo["sl_type"], combo["target_type"],
-                                     p, filters, qty, risk_ctrl)
-        except Exception:
-            continue
+            raw = _get_data(combo["interval"], combo["period"])
+            if raw is None or raw.empty or len(raw) < 120:
+                continue
+            split = int(len(raw) * (1 - oos_fraction))
+            is_df, oos_df = raw.iloc[:split], raw.iloc[split:]
+            if len(is_df) < 80 or len(oos_df) < 40:
+                continue
 
-        is_m = _search_metrics(is_tr, qty, cost_cfg)
-        oos_m = _search_metrics(oos_tr, qty, cost_cfg)
-        if not is_m or not oos_m:
-            continue
+            p = dict(base_params)
+            p["sl_points"] = combo["sl_value"]
+            p["target_points"] = combo["target_value"]
+            p["partial_target1_points"] = combo["target_value"]
 
-        verdict, notes = search_diagnose(is_m, oos_m, min_trades)
-        rows.append({
-            "Verdict": verdict,
-            "Strategy": combo["strategy"], "TF": combo["interval"], "Period": combo["period"],
-            "SL Type": combo["sl_type"], "SL": combo["sl_value"],
-            "Target Type": combo["target_type"], "Target": combo["target_value"],
-            "OOS Expectancy": oos_m["expectancy"],
-            "OOS Accuracy %": oos_m["accuracy"],
-            "OOS Trades": oos_m["trades"],
-            "OOS Points": oos_m["total_points"],
-            "OOS Profit Factor": oos_m["profit_factor"],
-            "IS Expectancy": is_m["expectancy"],
-            "IS Accuracy %": is_m["accuracy"],
-            "IS Trades": is_m["trades"],
-            "Breakeven Acc % Needed": is_m["breakeven_acc"],
-            "Avg Win": is_m["avg_win"], "Avg Loss": is_m["avg_loss"],
-            "Max DD (OOS)": oos_m["max_dd"],
-            "Notes": " ".join(notes),
-        })
+            gkey = (combo["interval"], combo["period"], combo["strategy"])
+            if gkey not in sig_cache:
+                try:
+                    sig_cache[gkey] = (prepare_signal_frame(is_df, combo["strategy"], p, filters),
+                                       prepare_signal_frame(oos_df, combo["strategy"], p, filters))
+                except Exception:
+                    sig_cache[gkey] = (None, None)
+            pre_is, pre_oos = sig_cache[gkey]
+            if pre_is is None:
+                continue
+
+            try:
+                is_tr, _ = run_backtest(is_df, combo["strategy"], combo["sl_type"], combo["target_type"],
+                                        p, filters, qty, risk_ctrl, precomputed=pre_is)
+                oos_tr, _ = run_backtest(oos_df, combo["strategy"], combo["sl_type"], combo["target_type"],
+                                         p, filters, qty, risk_ctrl, precomputed=pre_oos)
+            except Exception:
+                continue
+
+            is_m = _search_metrics(is_tr, qty, cost_cfg)
+            oos_m = _search_metrics(oos_tr, qty, cost_cfg)
+            if not is_m or not oos_m:
+                continue
+
+            verdict, notes = search_diagnose(is_m, oos_m, min_trades)
+            rows.append({
+                "Verdict": verdict,
+                "Strategy": combo["strategy"], "TF": combo["interval"], "Period": combo["period"],
+                "SL Type": combo["sl_type"], "SL": combo["sl_value"],
+                "Target Type": combo["target_type"], "Target": combo["target_value"],
+                "OOS Expectancy": oos_m["expectancy"],
+                "OOS Accuracy %": oos_m["accuracy"],
+                "OOS Trades": oos_m["trades"],
+                "OOS Points": oos_m["total_points"],
+                "OOS Profit Factor": oos_m["profit_factor"],
+                "IS Expectancy": is_m["expectancy"],
+                "IS Accuracy %": is_m["accuracy"],
+                "IS Trades": is_m["trades"],
+                "Breakeven Acc % Needed": is_m["breakeven_acc"],
+                "Avg Win": is_m["avg_win"], "Avg Loss": is_m["avg_loss"],
+                "Max DD (OOS)": oos_m["max_dd"],
+                "Round": label_prefix.strip() or "coarse",
+                "Notes": " ".join(notes),
+            })
+
+    _evaluate(combos, "", 0, len(combos))
+
+    # ---- optional refinement around the best coarse result ----
+    for r in range(int(refine_rounds)):
+        if stopped_early or not rows:
+            break
+        best = max(rows, key=lambda x: (x["OOS Expectancy"], x["OOS Trades"]))
+        sl_c, tg_c = float(best["SL"]), float(best["Target"])
+        w = float(refine_width) / (r + 1)
+        pts = max(3, int(refine_points))
+        sl_vals = [v for v in np.linspace(max(sl_c * (1 - w), 0.1), sl_c * (1 + w), pts)]
+        tg_vals = [v for v in np.linspace(max(tg_c * (1 - w), 0.1), tg_c * (1 + w), pts)]
+        batch = [{"interval": best["TF"], "period": best["Period"], "strategy": best["Strategy"],
+                  "sl_type": best["SL Type"], "target_type": best["Target Type"],
+                  "sl_value": round(float(sv), 2), "target_value": round(float(tv), 2)}
+                 for sv in sl_vals for tv in tg_vals]
+        _evaluate(batch, f"refine {r + 1} ", 0, len(batch))
 
     if progress:
         progress(1.0, "done")
     if not rows:
         return pd.DataFrame()
     out = pd.DataFrame(rows)
+    out.attrs["stopped_early"] = stopped_early
+    out.attrs["elapsed_s"] = round(time.time() - t0, 1)
     return out.sort_values(["OOS Expectancy", "OOS Trades"], ascending=[False, False]).reset_index(drop=True)
 
 
@@ -5311,7 +5409,25 @@ def get_live_ltp(ticker):
 # BACKTEST ENGINE
 # ============================================================================
 
-def run_backtest(raw_df, strategy, sl_type, target_type, params, filters, qty, risk_ctrl=None):
+def prepare_signal_frame(raw_df, strategy, params, filters):
+    """
+    Signals + filters + ATR for one (data, strategy, filters) combination.
+
+    Split out because NONE of this depends on the stoploss or target values:
+    generate_signals and apply_filters read strategy parameters and filter
+    settings only. When sweeping SL/target ranges this is ~87% of the work and
+    is otherwise recomputed identically for every pair, so hoisting it out
+    makes a wide search several times faster (see run_strategy_search).
+    """
+    filters = dict(filters or {})
+    filters["current_strategy"] = strategy
+    df = generate_signals(raw_df, strategy, params)
+    df = apply_filters(df, filters, params)
+    return df, atr(df, 14)
+
+
+def run_backtest(raw_df, strategy, sl_type, target_type, params, filters, qty, risk_ctrl=None,
+                 precomputed=None):
     if raw_df.empty or len(raw_df) < 30:
         return pd.DataFrame(), raw_df
 
@@ -5319,9 +5435,12 @@ def run_backtest(raw_df, strategy, sl_type, target_type, params, filters, qty, r
     filters = dict(filters or {})
     filters["current_strategy"] = strategy
 
-    df = generate_signals(raw_df, strategy, params)
-    df = apply_filters(df, filters, params)
-    atr_series = atr(df, 14)
+    if precomputed is not None:
+        # Reuse the signal frame prepared once for this data+strategy+filters.
+        df, atr_series = precomputed
+        df = df.copy()
+    else:
+        df, atr_series = prepare_signal_frame(raw_df, strategy, params, filters)
 
     trades = []
     open_trade = None
@@ -10228,11 +10347,57 @@ also shows the accuracy that its own risk:reward *requires* to break even, so a 
 
     srch_sl_types = cfg_multiselect(st, "Stoploss types", "srch_sl_types", SL_TYPES, default=[sl_type])
     srch_tgt_types = cfg_multiselect(st, "Target types", "srch_tgt_types", TARGET_TYPES, default=[target_type])
-    v1, v2 = st.columns(2)
-    srch_sl_vals = cfg_multiselect(v1, "SL values", "srch_sl_vals",
-                                   SEARCH_SL_VALUE_GRID, default=[20, 50, 100])
-    srch_tgt_vals = cfg_multiselect(v2, "Target values", "srch_tgt_vals",
-                                    SEARCH_TARGET_VALUE_GRID, default=[20, 50, 100])
+    st.markdown("##### Stoploss and target values to test")
+    srch_val_mode = cfg_selectbox(st, "How to specify values", "srch_val_mode",
+                                  ["Pick from list", "Range (step)", "Range (count)"],
+                                  default="Pick from list")
+    if srch_val_mode == "Pick from list":
+        v1, v2 = st.columns(2)
+        srch_sl_vals = cfg_multiselect(v1, "SL values", "srch_sl_vals",
+                                       SEARCH_SL_VALUE_GRID, default=[20, 50, 100])
+        srch_tgt_vals = cfg_multiselect(v2, "Target values", "srch_tgt_vals",
+                                        SEARCH_TARGET_VALUE_GRID, default=[20, 50, 100])
+    else:
+        _is_step = srch_val_mode == "Range (step)"
+        _third = "Step" if _is_step else "How many values"
+        s1, s2, s3 = st.columns(3)
+        _sl_lo = cfg_number(s1, "SL from", "srch_sl_lo", 1.0, 0.1, 1000000.0, step=1.0)
+        _sl_hi = cfg_number(s2, "SL to", "srch_sl_hi", 200.0, 0.1, 1000000.0, step=1.0)
+        _sl_k = cfg_number(s3, f"SL {_third}", "srch_sl_step", 10.0 if _is_step else 12,
+                           0.01 if _is_step else 2, 100000.0 if _is_step else 200,
+                           step=1.0, is_int=not _is_step)
+        t1, t2, t3 = st.columns(3)
+        _tg_lo = cfg_number(t1, "Target from", "srch_tg_lo", 1.0, 0.1, 1000000.0, step=1.0)
+        _tg_hi = cfg_number(t2, "Target to", "srch_tg_hi", 200.0, 0.1, 1000000.0, step=1.0)
+        _tg_k = cfg_number(t3, f"Target {_third}", "srch_tg_step", 10.0 if _is_step else 12,
+                           0.01 if _is_step else 2, 100000.0 if _is_step else 200,
+                           step=1.0, is_int=not _is_step)
+        srch_sl_vals = build_value_grid(srch_val_mode, _sl_lo, _sl_hi, _sl_k)
+        srch_tgt_vals = build_value_grid(srch_val_mode, _tg_lo, _tg_hi, _tg_k)
+        st.caption(f"SL: {len(srch_sl_vals)} values ({', '.join(f'{v:g}' for v in srch_sl_vals[:6])}"
+                   f"{' …' if len(srch_sl_vals) > 6 else ''}) · "
+                   f"Target: {len(srch_tgt_vals)} values ({', '.join(f'{v:g}' for v in srch_tgt_vals[:6])}"
+                   f"{' …' if len(srch_tgt_vals) > 6 else ''})")
+        if _is_step:
+            st.caption("**Range (count)** is usually the better choice for a wide span: 1→500 in 12 evenly spread "
+                       "values locates the useful region far faster than 500 single-point tests, and you can then "
+                       "let refinement zoom in on it.")
+
+    st.markdown("##### Search strategy")
+    r1, r2, r3 = st.columns(3)
+    srch_refine_rounds = cfg_number(r1, "Refinement rounds", "srch_refine_rounds", 2, 0, 5, is_int=True)
+    srch_refine_pts = cfg_number(r2, "Points per refinement axis", "srch_refine_pts", 7, 3, 25, is_int=True)
+    srch_budget_min = cfg_number(r3, "Time budget (minutes, 0 = none)", "srch_budget_min",
+                                 5, 0, 240, is_int=True)
+    if srch_refine_rounds:
+        st.caption(f"**Coarse-to-fine**: after the grid above, the search re-tests a narrow band around the best "
+                   f"result — {int(srch_refine_rounds)} round(s) of {int(srch_refine_pts)}×{int(srch_refine_pts)}, "
+                   "each half as wide as the last. This finds the same region as an exhaustive sweep while testing "
+                   "a tiny fraction of the combinations — and because every extra configuration tested raises the "
+                   "chance the winner is merely lucky, the focused search is often the more trustworthy one too.")
+    if srch_budget_min:
+        st.caption(f"The search stops cleanly after {int(srch_budget_min)} minute(s) and returns whatever it has "
+                   "evaluated so far.")
     m1, m2 = st.columns(2)
     srch_min_trades = cfg_number(m1, "Minimum in-sample trades to trust a result", "srch_min_trades",
                                  30, 5, 500, is_int=True)
@@ -10267,10 +10432,15 @@ also shows the accuracy that its own risk:reward *requires* to break even, so a 
     _n_all = len(_combos)
     _combos = _combos[:int(srch_max_combos)]
 
+    _n_groups = max(1, len(set((c["interval"], c["period"], c["strategy"]) for c in _combos)))
+    _est = estimate_search_time(len(_combos), _n_groups)
+    _est_txt = (f"{_est:.0f}s" if _est < 90 else f"{_est/60:.1f} min")
     st.info(f"**{_n_all:,}** combinations defined"
             + (f" — testing the first **{len(_combos):,}** (raise the cap to cover them all)."
                if _n_all > len(_combos) else ".")
-            + f"  Each is fitted on {100 - int(srch_oos)}% of the data and scored on the unseen {int(srch_oos)}%.")
+            + f"  Each is fitted on {100 - int(srch_oos)}% of the data and scored on the unseen {int(srch_oos)}%."
+            + f"  Estimated time: **~{_est_txt}** ({_n_groups} signal group(s) computed once and reused across "
+              "every SL/target pair).")
     if _n_all > 1000:
         st.warning(f"⚠️ {_n_all:,} combinations is a very wide search. The more you test, the more likely the "
                    "winner is simply the luckiest — that is selection bias, and the out-of-sample column is your "
@@ -10286,7 +10456,10 @@ also shows the accuracy that its own risk:reward *requires* to break even, so a 
             _sres = run_strategy_search(srch_ticker, _combos, _srch_filters, params, int(srch_qty), _srch_costs,
                                         min_trades=int(srch_min_trades),
                                         oos_fraction=float(srch_oos) / 100.0,
-                                        risk_ctrl=risk_ctrl, progress=_scb)
+                                        risk_ctrl=risk_ctrl, progress=_scb,
+                                        refine_rounds=int(srch_refine_rounds),
+                                        refine_points=int(srch_refine_pts),
+                                        time_budget_s=(int(srch_budget_min) * 60 or None))
         _pb.empty()
         st.session_state["srch_results"] = _sres
         st.session_state["srch_at"] = ist_now().strftime("%d-%b-%Y %H:%M:%S IST")
@@ -10298,7 +10471,17 @@ also shows the accuracy that its own risk:reward *requires* to break even, so a 
         st.warning("No configuration produced enough trades to evaluate. Widen the period, loosen the filters, or "
                    "lower the minimum-trades requirement.")
     else:
-        st.caption(f"Last run: {st.session_state.get('srch_at')} · {len(_sres):,} configurations evaluated")
+        _extra = ""
+        if _sres.attrs.get("elapsed_s"):
+            _extra += f" in {_sres.attrs['elapsed_s']}s"
+        st.caption(f"Last run: {st.session_state.get('srch_at')} · {len(_sres):,} configurations evaluated{_extra}")
+        if _sres.attrs.get("stopped_early"):
+            st.warning("⏱ The time budget was reached, so the search stopped early — these results cover only the "
+                       "combinations tested so far. Raise the budget, narrow the grid, or use fewer values per axis.")
+        if "Round" in _sres.columns and (_sres["Round"] != "coarse").any():
+            _rc = _sres["Round"].value_counts().to_dict()
+            st.caption("Rounds: " + " · ".join(f"{k}: {v}" for k, v in _rc.items())
+                       + " — refinement rows come from zooming in around the best coarse result.")
         _promising = _sres[_sres["Verdict"] == "PROMISING"]
         _k1, _k2, _k3, _k4 = st.columns(4)
         _k1.metric("Evaluated", f"{len(_sres):,}")
