@@ -1543,6 +1543,10 @@ def summarise(trades: pd.DataFrame, equity: pd.Series) -> dict:
     rew_d = (trades["Target at entry"] - trades["Entry price"]).abs()
     ok = risk_d.notna() & rew_d.notna() & (risk_d > 0)
     planned_rr = float((rew_d[ok] / risk_d[ok]).median()) if ok.any() else np.nan
+    # The win rate that merely breaks even at this reward-to-risk. Accuracy on
+    # its own says nothing until you know what it has to clear: 52% is superb at
+    # 2:1 and a slow loss at 1:2.
+    breakeven = 100.0 / (1.0 + planned_rr) if planned_rr == planned_rr and planned_rr > 0 else np.nan
     net_points = trades["Gross P&L"].sum() / max(int(trades["Qty"].iloc[0]), 1)
     per_trade_sharpe = net.mean() / net.std(ddof=1) if len(net) > 1 and net.std(ddof=1) > 0 else np.nan
     return {
@@ -1551,6 +1555,9 @@ def summarise(trades: pd.DataFrame, equity: pd.Series) -> dict:
         "Sortino (annualised)": round(sortino, 3) if sortino == sortino else np.nan,
         "Sharpe per trade": round(per_trade_sharpe, 3) if per_trade_sharpe == per_trade_sharpe else np.nan,
         "Planned reward:risk": round(planned_rr, 2) if planned_rr == planned_rr else np.nan,
+        "Breakeven win %": round(breakeven, 1) if breakeven == breakeven else np.nan,
+        "Win rate above breakeven": (round(100 * len(wins) / len(net) - breakeven, 1)
+                                     if breakeven == breakeven else np.nan),
         "Net points per unit": round(net_points, 2),
         "Hit rate %": round(100 * len(wins) / len(net), 2),
         "Net P&L": round(net.sum(), 2), "Gross P&L": round(trades["Gross P&L"].sum(), 2),
@@ -3249,6 +3256,12 @@ def degeneracy_flags(m: dict) -> str:
                      f"reward:risk")
     if m["Trades"] < 30:
         flags.append("thin sample")
+    be = m.get("Breakeven win %")
+    if be == be and m["Trades"]:
+        lo, _ = wilson_interval(m["Wins"], m["Trades"])
+        if lo < be:
+            flags.append(f"pessimistic win rate {lo:.0f}% is below the {be:.0f}% needed to break "
+                         f"even — the sample cannot rule out a losing setup")
     return "; ".join(flags) or "—"
 
 
@@ -5436,6 +5449,308 @@ def render_ideas(base_cfg: dict):
                          width="stretch", hide_index=True)
 
 
+# ------------------------------------------------------- accuracy screener
+# Sweeps every strategy, timeframe, stop and target for the chosen tickers and
+# keeps whatever clears an accuracy threshold — then shows which of those are
+# firing right now.
+#
+# Accuracy is the most requested and most misleading way to rank setups, so the
+# threshold is enforced against the breakeven win rate rather than in a vacuum.
+# 60% accuracy is excellent at 2:1 and a slow bleed at 1:2, and a screener that
+# does not say which is which is worse than no screener.
+
+ACC_COLS = ["Symbol", "Strategy", "Timeframe", "Period", "Stop rule", "Stop settings",
+            "Target rule", "Target settings", "Trades", "Accuracy %", "Win rate low %",
+            "Breakeven %", "Above breakeven", "Reward:risk", "Expectancy", "Net points",
+            "Profit factor", "Sharpe", "Max drawdown", "Live now", "Flags", "Config"]
+
+
+def scan_accuracy(symbols, strategies, tf_pairs, sl_grid, tg_grid, threshold, min_trades,
+                  costs, recent, cap, require_profit=True, progress=None):
+    rows, configs, skipped = [], [], []
+    tally = {"tested": 0, "too few trades": 0, "accuracy below threshold": 0,
+             "below breakeven": 0, "kept": 0}
+    done = 0
+    stop = False
+    for sym in symbols:
+        if stop:
+            break
+        ysym = to_yf_symbol(sym)
+        if progress:
+            progress(min(done / max(cap, 1), 1.0), f"{sym} — {done:,} combinations")
+        for tf, period in tf_pairs:
+            if stop:
+                break
+            try:
+                df = load_candles(ysym, tf, period)
+            except RateLimitError as e:
+                skipped.append((sym, tf, "rate limited — scan stopped"))
+                stop = True
+                break
+            except Exception as e:
+                skipped.append((sym, tf, str(e)[:90]))
+                continue
+            if len(df) < 120:
+                skipped.append((sym, tf, f"only {len(df)} bars"))
+                continue
+            for sname in strategies:
+                params = STRATEGY_DEFAULTS.get(sname, {})
+                try:
+                    sig = STRATEGIES[sname]["compute"](df, params)
+                except Exception:
+                    continue
+                al, as_ = combine_filters(df, {}, "AND")
+                for slc in sl_grid:
+                    for tgc in tg_grid:
+                        if done >= cap:
+                            stop = True
+                            break
+                        done += 1
+                        tally["tested"] += 1
+                        cfg = dict(base_config_stub(), symbol=ysym, name=sym, interval=tf,
+                                   period=period, strategy=sname, strat_params=params,
+                                   sl_cfg=slc, tgt_cfg=tgc, filters={}, sl_mode=slc["mode"],
+                                   tgt_mode=tgc["mode"], costs=costs)
+                        try:
+                            eng = make_engine(cfg, df, sig, al, as_)
+                            trades, eq = eng.run()
+                        except Exception:
+                            continue
+                        m = summarise(trades, eq)
+                        if m.get("Trades", 0) < min_trades:
+                            tally["too few trades"] += 1
+                            continue
+                        acc = m["Hit rate %"]
+                        if acc < threshold:
+                            tally["accuracy below threshold"] += 1
+                            continue
+                        above = m.get("Win rate above breakeven")
+                        if require_profit and (not (above == above) or above <= 0
+                                               or m["Expectancy per trade"] <= 0):
+                            tally["below breakeven"] += 1
+                            continue
+                        lo, _ = wilson_interval(m["Wins"], m["Trades"])
+                        live = ""
+                        dsig = eng.directional_signal()
+                        fresh = np.flatnonzero(dsig.to_numpy()[-(recent + 1):-1] != 0)
+                        if len(fresh):
+                            bar = len(df) - (recent + 1) + int(fresh[-1])
+                            side = int(dsig.iloc[bar])
+                            lv = idea_levels(cfg, df, bar, side)
+                            if lv and not lv["resolved"]:
+                                live = "Long" if side > 0 else "Short"
+                                cfg["_live"] = dict(lv, side=side, bar=int(bar),
+                                                    when=df.index[bar],
+                                                    bars_ago=int(len(df) - 1 - bar))
+                        tally["kept"] += 1
+                        rows.append([sym, sname, tf, period, slc["mode"], describe(slc),
+                                     tgc["mode"], describe(tgc), m["Trades"], acc, round(lo, 1),
+                                     m.get("Breakeven win %"), above, m.get("Planned reward:risk"),
+                                     m["Expectancy per trade"], m["Net points per unit"],
+                                     m["Profit factor"], m.get("Sharpe (annualised)"),
+                                     m["Max drawdown"], live, degeneracy_flags(m), len(configs)])
+                        configs.append(cfg)
+                    if stop:
+                        break
+                if stop:
+                    break
+    return rows, configs, skipped, tally
+
+
+def render_accuracy_screener(base_cfg: dict):
+    ss = st.session_state
+    st.markdown("#### Accuracy screener")
+    st.caption("Sweeps every strategy, timeframe, stop and target for the tickers you choose, and "
+               "keeps whatever clears your accuracy threshold. Accuracy is checked against the "
+               "win rate each setup needs to break even, because the number on its own does not "
+               "tell you whether it makes money.")
+
+    c1, c2 = st.columns([1.3, 1])
+    with c1:
+        uni = st.selectbox("Universe", list(SCAN_UNIVERSES), index=0, key="ac_uni")
+        sync_universe_box("ac_uni", "ac_syms", uni)
+        pasted = st.text_area("Tickers", height=100, key="ac_syms",
+                              help="Edit freely. Choosing a different universe refills this box.")
+        symbols = [t.strip() for t in pasted.replace("\n", ",").split(",") if t.strip()]
+        if ss.get("ac_syms__n") != len(symbols):
+            ss["ac_lim"] = min(len(symbols), 500) if len(symbols) else 1
+            ss["ac_syms__n"] = len(symbols)
+        limit = st.number_input(f"Scan at most (of {len(symbols)} listed)", 1, 500, key="ac_lim")
+        symbols = symbols[:int(limit)]
+    with c2:
+        threshold = st.selectbox("Minimum accuracy", [40, 45, 50, 55, 60, 65, 70, 75, 80, 90],
+                                 index=4, key="ac_thr",
+                                 format_func=lambda v: f"{v}% or better")
+        strategies = st.multiselect("Strategies", SWEEPABLE, default=SWEEPABLE, key="ac_strats")
+        tfs = st.multiselect("Timeframes", list(TF_PERIODS), default=["15m", "1h", "1d"],
+                             key="ac_tfs")
+        period_mode = st.radio("Periods", ["Default for each timeframe", "All allowed periods"],
+                               index=0, key="ac_periods")
+
+    tf_pairs = []
+    for tf in tfs:
+        opts, default = TF_PERIODS[tf]
+        tf_pairs += [(tf, p_) for p_ in (opts if period_mode.startswith("All") else [default])]
+
+    with st.expander("Stop and target grid", expanded=False):
+        g1, g2 = st.columns(2)
+        sl_modes = g1.multiselect("Stop rules", SL_MODES,
+                                  default=["ATR multiple", "Fixed percent"], key="ac_slm")
+        tg_modes = g2.multiselect("Target rules", TGT_MODES,
+                                  default=["Risk:reward multiple"], key="ac_tgm")
+        e1, e2, e3 = st.columns(3)
+        atr_mults = [float(x) for x in e1.text_input("ATR multiples", "1.5, 2, 3",
+                                                     key="ac_atr").replace(",", " ").split()]
+        pcts = [float(x) for x in e2.text_input("Percent values", "0.5, 1, 2",
+                                                key="ac_pct").replace(",", " ").split()]
+        rrs = [float(x) for x in e3.text_input("Reward:risk multiples", "1, 1.5, 2, 3",
+                                               key="ac_rr").replace(",", " ").split()]
+        pts = band_grid(g1.multiselect("Point bands", list(POINT_BANDS), default=[],
+                                       key="ac_bands"), 2)
+        swings = [3, 5]
+    sl_grid = stop_grid(sl_modes, pts, pcts, [14], atr_mults, rrs, swings)
+    tg_grid = target_grid(tg_modes, pts, pcts, [14], atr_mults, rrs, swings)
+
+    m1, m2, m3, m4 = st.columns(4)
+    min_trades = m1.number_input("Minimum trades", 5, 5000, 25, key="ac_mint")
+    recent = m2.number_input("Live if fired within N bars", 1, 30, 3, key="ac_recent")
+    cap = m3.number_input("Stop after N combinations", 100, 200_000, 20_000, step=100, key="ac_cap")
+    require = m4.checkbox("Only keep setups that actually make money", value=True, key="ac_req",
+                          help="Requires the accuracy to clear the breakeven rate and expectancy "
+                               "to be positive. Turning this off shows high-accuracy setups that "
+                               "lose money, which is most of them.")
+    use_costs = st.checkbox("Include brokerage, taxes and slippage", value=True, key="ac_costs")
+    costs = CostModel(instrument="Equity intraday", enabled=use_costs, slippage_unit="Percent",
+                      slippage=0.03, **COST_DEFAULTS["Equity intraday"])
+
+    total = (len(symbols) * max(len(tf_pairs), 1) * max(len(strategies), 1)
+             * max(len(sl_grid), 1) * max(len(tg_grid), 1))
+    e1, e2, e3 = st.columns(3)
+    e1.metric("Combinations", f"{total:,}")
+    e2.metric("Downloads", f"{len(symbols) * max(len(tf_pairs), 1):,}")
+    e3.metric("Rough runtime", _runtime_estimate(min(total, int(cap)),
+                                                 len(symbols) * max(len(tf_pairs), 1)))
+    if not symbols or not strategies or not sl_grid or not tg_grid:
+        st.info("Pick at least one ticker, one strategy, one stop rule and one target rule.")
+        return
+
+    if st.button("Run accuracy scan", type="primary", width="stretch"):
+        bar = st.progress(0.0)
+        status = st.empty()
+        with st.spinner("Sweeping…"):
+            rows, configs, skipped, tally = scan_accuracy(
+                symbols, strategies, tf_pairs, sl_grid, tg_grid, float(threshold),
+                int(min_trades), costs, int(recent), int(cap), require,
+                progress=lambda f, t: (bar.progress(f), status.write(t)))
+        bar.progress(1.0)
+        status.write(f"Finished. {tally['tested']:,} combinations tested, {len(rows):,} kept.")
+        ss["acc"] = {"rows": rows, "configs": configs, "skipped": skipped, "tally": tally,
+                     "threshold": threshold, "recent": recent}
+    _render_accuracy_results()
+
+
+def _render_accuracy_results():
+    ss = st.session_state
+    res = ss.get("acc")
+    if not res:
+        return
+    st.markdown("---")
+    tally = res["tally"]
+    if not res["rows"]:
+        st.error(f"**Nothing cleared {res['threshold']}% accuracy while still making money.** "
+                 f"Of {tally['tested']:,} combinations tested: {tally['too few trades']:,} had too "
+                 f"few trades, {tally['accuracy below threshold']:,} missed the accuracy "
+                 f"threshold, and {tally['below breakeven']:,} hit the accuracy but did not clear "
+                 f"their own breakeven rate. That last group is the important one — they look "
+                 f"accurate and lose money.")
+        return
+    res_df = pd.DataFrame(res["rows"], columns=ACC_COLS)
+    res_df = res_df.sort_values("Expectancy", ascending=False).reset_index(drop=True)
+
+    st.markdown("#### In plain English")
+    b = res_df.iloc[0]
+    st.success(
+        f"**{len(res_df):,} setups cleared {res['threshold']}% accuracy and still made money.** "
+        f"The best is **{b['Symbol']} · {b['Strategy']} · {b['Timeframe']}**, winning "
+        f"{b['Accuracy %']:.0f} out of 100 where it only needed {b['Breakeven %']:.0f} to break "
+        f"even — a cushion of {b['Above breakeven']:.0f} points. Over {int(b['Trades'])} trades it "
+        f"averaged {b['Expectancy']:,.2f} per trade at {b['Reward:risk']:.1f}:1.")
+    st.caption(f"{tally['below breakeven']:,} other combinations hit your accuracy threshold but "
+               f"were dropped because they lose money anyway — accuracy bought with a target "
+               f"tighter than the stop.")
+
+    st.markdown("#### Setups firing right now")
+    live = res_df[res_df["Live now"] != ""]
+    if live.empty:
+        st.info(f"None of these are firing at the moment. A setup only counts as live if it "
+                f"triggered within the last {res['recent']} bars and price has not already "
+                f"reached its stop or target.")
+    else:
+        st.success(f"**{len(live)} of them are live right now.**")
+        for i, r in live.head(12).iterrows():
+            cfg = res["configs"][int(r["Config"])]
+            lvv = cfg.get("_live")
+            with st.container(border=True):
+                st.markdown(
+                    f"**{r['Symbol']} — {r['Live now']} · {r['Strategy']} on {r['Timeframe']}.** "
+                    f"Won {r['Accuracy %']:.0f} out of 100 across {int(r['Trades'])} past trades, "
+                    f"against a breakeven of {r['Breakeven %']:.0f}. Averaged "
+                    f"{r['Expectancy']:,.2f} per trade at {r['Reward:risk']:.1f}:1.")
+                if lvv:
+                    k = st.columns(5)
+                    k[0].metric("Entry", f"{lvv['entry']:,.2f}")
+                    k[1].metric("Stop", f"{lvv['stop']:,.2f}", f"-{lvv['risk']:,.2f}")
+                    k[2].metric("Target", f"{lvv['target']:,.2f}", f"+{lvv['reward']:,.2f}")
+                    k[3].metric("Reward : risk", f"{lvv['rr']:.2f}")
+                    k[4].metric("Fired", f"{lvv['bars_ago']} bars ago")
+                if r["Flags"] != "—":
+                    st.warning(f"Warning: {r['Flags']}")
+                if st.button("Apply to sidebar", key=f"acc_live_{int(r['Config'])}",
+                             width="stretch"):
+                    out = {k_: v for k_, v in cfg.items() if k_ != "_live"}
+                    out["_label"] = f"{r['Symbol']} · {r['Strategy']} · {r['Timeframe']}"
+                    ss["pending_sidebar"] = out
+                    ss.pop("replay_cfg", None)
+                    ss.pop("bt_result", None)
+                    st.rerun()
+
+    st.markdown("#### Everything that cleared the threshold")
+    st.dataframe(res_df.drop(columns=["Config"]), width="stretch", height=420,
+                 hide_index=True)
+    st.download_button("Download as CSV",
+                       res_df.drop(columns=["Config"]).to_csv(index=False).encode(),
+                       "accuracy_scan.csv", "text/csv")
+
+    st.markdown("#### Send any row to the sidebar")
+    labels = [f"#{i} · {r['Symbol']} · {r['Strategy']} · {r['Timeframe']} · "
+              f"acc {r['Accuracy %']:.0f}% vs breakeven {r['Breakeven %']:.0f}% · "
+              f"avg {r['Expectancy']:,.2f}" for i, r in res_df.head(60).iterrows()]
+    pick = st.selectbox("Row", labels, index=0, label_visibility="collapsed", key="ac_pick")
+    if st.button("Apply to the sidebar", type="primary", width="stretch", key="ac_apply"):
+        r = res_df.iloc[labels.index(pick)]
+        out = {k_: v for k_, v in res["configs"][int(r["Config"])].items() if k_ != "_live"}
+        out["_label"] = f"{r['Symbol']} · {r['Strategy']} · {r['Timeframe']}"
+        ss["pending_sidebar"] = out
+        ss.pop("replay_cfg", None)
+        ss.pop("bt_result", None)
+        st.rerun()
+
+    st.markdown(
+        f"- **Accuracy alone is not the point.** Every row shows the win rate it needed just to "
+        f"break even. A 70% setup at 1:2 reward-to-risk needs 67% and is barely ahead; a 45% "
+        f"setup at 2:1 needs 33% and is far stronger.\n"
+        f"- **Win rate low %** is the pessimistic end of the confidence range. If it sits below "
+        f"the breakeven column, the sample cannot rule out a losing setup however good the "
+        f"headline looks.\n"
+        f"- You tested {tally['tested']:,} combinations. Search that many and some will clear any "
+        f"threshold by luck alone. Send the best to the sidebar and run *Is this actually "
+        f"profitable?* in the Backtest tab, which compares it against random entries.")
+    if res["skipped"]:
+        with st.expander(f"{len(res['skipped'])} downloads skipped"):
+            st.dataframe(pd.DataFrame(res["skipped"], columns=["Symbol", "Timeframe", "Reason"]),
+                         width="stretch", hide_index=True)
+
+
 # ------------------------------------------------------------ edge screener
 # Answers questions of the form "how often does this instrument travel more
 # than X% from its anchor before the period ends" — the containment statistics
@@ -6217,9 +6532,11 @@ def main():
     if applied:
         st.success(f"Sidebar loaded with the configuration for {applied}. Every control is still "
                    f"editable.")
-    tab_bt, tab_live, tab_hist, tab_ideas, tab_scan, tab_pat, tab_edge = st.tabs(
+    (tab_bt, tab_live, tab_hist, tab_ideas, tab_acc, tab_scan, tab_pat,
+     tab_edge) = st.tabs(
         ["Backtest", "Live trading", "Trade history", "Screener · what to trade",
-         "Screener · strategies", "Screener · patterns", "Screener · levels"])
+         "Screener · accuracy", "Screener · strategies", "Screener · patterns",
+         "Screener · levels"])
 
     with tab_bt:
         try:
@@ -6235,6 +6552,9 @@ def main():
 
     with tab_ideas:
         render_ideas(cfg)
+
+    with tab_acc:
+        render_accuracy_screener(cfg)
 
     with tab_scan:
         render_search(cfg)
