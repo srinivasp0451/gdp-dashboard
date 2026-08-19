@@ -87,8 +87,8 @@ DEFAULT_QUANTITY = 1
 # ---- CHANGE #4: EMA Crossover defaults -------------------------------------
 DEFAULT_EMA_FAST      = 9
 DEFAULT_EMA_SLOW      = 21
-DEFAULT_EMA_MIN_ANGLE = 0.0      # 0 = angle filter OFF (was 30 which blocked most signals)
-DEFAULT_EMA_USE_ADX   = False    # ADX confirmation filter OFF by default
+DEFAULT_EMA_MIN_ANGLE = 30.0     # your original default (set 0.0 to switch the angle filter OFF)
+DEFAULT_EMA_USE_ADX   = True     # your original default (ADX confirmation filter ON)
 DEFAULT_EMA_ADX_THRESHOLD = 20
 DEFAULT_ADX_PERIOD    = 14
 
@@ -137,7 +137,18 @@ GROQ_MODELS = [
     "moonshotai/kimi-k2-instruct",
     "deepseek-r1-distill-llama-70b",
 ]
-DEFAULT_GROQ_MODEL = "llama-3.3-70b-versatile"
+DEFAULT_GROQ_MODEL = "llama-3.1-8b-instant"     # small + widely available = safest default
+DEFAULT_GROQ_MODELS_URL = "https://api.groq.com/openai/v1/models"
+
+# ---- Groq FREE-TIER RATE LIMIT PROTECTION ----------------------------------
+# The free "on_demand" tier is limited to ~8,000 tokens PER MINUTE for the whole
+# request (system context + chat history + the model's reply). Sending a full
+# trade table blew straight past it -> HTTP 413 "Request too large".
+# We therefore cap how much data is injected, and auto-shrink & retry on 413.
+DEFAULT_GROQ_MAX_CONTEXT_CHARS = 6000    # ~1.5k tokens of your data per question
+DEFAULT_GROQ_MAX_TOKENS = 1024           # cap on the model's reply
+DEFAULT_GROQ_CONTEXT_ROWS = 20           # rows of trades/candles injected
+DEFAULT_GROQ_HISTORY_TURNS = 4           # how many past chat messages are resent
 
 # ---- CHANGE #8: Dhan defaults (leave token blank -> paste it in the UI) -----
 DEFAULT_DHAN_CLIENT_ID    = ""     # <- put your client id here if you want it pre-filled
@@ -379,19 +390,69 @@ def email_trade_event(event, position, config, log_func=None, extra=None):
 # "GROQ CHATBOT"  -  optional AI assistant available on every tab
 # =============================================================================
 
+def groq_list_models(api_key):
+    """
+    Ask Groq which models THIS key can actually use.
+
+    Fixes the "model `x` does not exist or you do not have access to it" (404):
+    model availability differs per account/region, so instead of guessing from a
+    hard-coded list the sidebar can pull the live list from your own account.
+    Returns (list_of_ids, error).
+    """
+    if requests is None:
+        return [], "The `requests` package is not installed."
+    api_key = (api_key or '').strip()
+    if not api_key:
+        return [], "Groq API key is empty."
+
+    try:
+        resp = requests.get(
+            DEFAULT_GROQ_MODELS_URL,
+            headers={"Authorization": f"Bearer {api_key}"},
+            timeout=30,
+        )
+    except Exception as e:
+        return [], f"Network error: {e}"
+
+    if resp.status_code != 200:
+        try:
+            detail = resp.json().get('error', {}).get('message', resp.text[:300])
+        except Exception:
+            detail = resp.text[:300]
+        return [], f"Groq API error {resp.status_code}: {detail}"
+
+    try:
+        data = resp.json().get('data', [])
+        # skip whisper / TTS / guard models - they are not chat completions
+        ids = sorted(
+            m['id'] for m in data
+            if m.get('active', True) and not any(
+                k in m['id'].lower() for k in ('whisper', 'tts', 'guard', 'embed'))
+        )
+        return ids, None
+    except Exception as e:
+        return [], f"Unexpected response: {e}"
+
+
+def estimate_tokens(text):
+    """Rough token estimate (~4 chars per token) used for the TPM budget."""
+    return max(1, len(text) // 4)
+
+
 def groq_chat_completion(messages, config):
     """
     Call the Groq OpenAI-compatible chat endpoint.
-    Returns (text, error). Never raises.
+    Returns (text, error, status_code). Never raises.
     """
     if requests is None:
-        return None, "The `requests` package is not installed."
+        return None, "The `requests` package is not installed.", 0
 
     api_key = (config.get('groq_api_key') or '').strip()
     if not api_key:
-        return None, "Groq API key is empty. Paste it in the sidebar."
+        return None, "Groq API key is empty. Paste it in the sidebar.", 0
 
-    model = config.get('groq_model', DEFAULT_GROQ_MODEL)
+    model = (config.get('groq_model') or DEFAULT_GROQ_MODEL).strip()
+    max_tokens = int(config.get('groq_max_tokens', DEFAULT_GROQ_MAX_TOKENS))
 
     try:
         resp = requests.post(
@@ -404,26 +465,54 @@ def groq_chat_completion(messages, config):
                 "model": model,
                 "messages": messages,
                 "temperature": 0.3,
-                "max_tokens": 2048,
+                "max_tokens": max_tokens,
             },
             timeout=90,
         )
     except Exception as e:
-        return None, f"Network error talking to Groq: {e}"
+        return None, f"Network error talking to Groq: {e}", 0
 
     if resp.status_code != 200:
-        # Groq returns a helpful JSON error body (e.g. model decommissioned)
         try:
             detail = resp.json().get('error', {}).get('message', resp.text[:400])
         except Exception:
             detail = resp.text[:400]
-        return None, f"Groq API error {resp.status_code}: {detail}"
+
+        hint = ""
+        if resp.status_code == 404:
+            hint = ("\n\n👉 This model is not enabled on your account. In the sidebar press "
+                    "**🔄 Fetch models available to my key** and pick one from that list.")
+        elif resp.status_code == 413:
+            hint = ("\n\n👉 Too much data for your tokens-per-minute limit. Lower "
+                    "**Max context size** / **Rows of data sent** in the sidebar.")
+        elif resp.status_code == 429:
+            hint = "\n\n👉 Rate limited - wait a few seconds and ask again."
+        elif resp.status_code == 401:
+            hint = "\n\n👉 The API key was rejected. Re-copy it from console.groq.com."
+
+        return None, f"Groq API error {resp.status_code}: {detail}{hint}", resp.status_code
 
     try:
         data = resp.json()
-        return data['choices'][0]['message']['content'], None
+        return data['choices'][0]['message']['content'], None, 200
     except Exception as e:
-        return None, f"Unexpected Groq response: {e}"
+        return None, f"Unexpected Groq response: {e}", 200
+
+
+def _shrink_context(text, max_chars):
+    """
+    Keep the HEAD (metrics/config summary) and the TAIL (most recent rows) and
+    drop the middle - that is where the least useful data sits.
+    """
+    if len(text) <= max_chars:
+        return text
+
+    marker = (f"\n\n...[{len(text) - max_chars:,} characters trimmed to stay inside "
+              f"the Groq tokens-per-minute limit]...\n\n")
+    budget = max(200, max_chars - len(marker))     # the marker counts too
+    head = int(budget * 0.55)
+    tail = budget - head
+    return text[:head] + marker + (text[-tail:] if tail > 0 else "")
 
 
 def _df_to_context(df, max_rows=40, float_fmt="%.2f"):
@@ -460,18 +549,29 @@ def render_groq_chat(tab_key, context_text, config, title="🤖 Ask the AI about
     if hist_key not in st.session_state:
         st.session_state[hist_key] = []
 
+    # ---- TPM budget: trim BEFORE anything is sent -------------------------
+    max_chars = int(config.get('groq_max_context_chars', DEFAULT_GROQ_MAX_CONTEXT_CHARS))
+    sent_context = _shrink_context(context_text, max_chars)
+    max_tokens = int(config.get('groq_max_tokens', DEFAULT_GROQ_MAX_TOKENS))
+    est = estimate_tokens(sent_context) + max_tokens + 200
+
     col_a, col_b = st.columns([4, 1])
     with col_a:
         st.caption(f"Model: `{config.get('groq_model', DEFAULT_GROQ_MODEL)}` · "
-                   f"context: {len(context_text):,} chars from this tab")
+                   f"context {len(sent_context):,}/{len(context_text):,} chars · "
+                   f"≈{est:,} tokens per question "
+                   f"{'⚠️ above the 8k free-tier limit' if est > 7500 else '✅ within the 8k free-tier limit'}")
     with col_b:
         if st.button("🧹 Clear chat", key=f"clear_chat_{tab_key}"):
             st.session_state[hist_key] = []
             st.rerun()
 
+    if est > 7500:
+        st.warning("Reduce **Max context size** or **Rows of data sent** in the sidebar, "
+                   "or switch to a model with a higher rate limit.")
+
     with st.expander("👁️ View exactly what is sent to the model", expanded=False):
-        st.code(context_text[:12000] + ("\n...[truncated]" if len(context_text) > 12000 else ""),
-                language="text")
+        st.code(sent_context, language="text")
 
     # Replay history
     for msg in st.session_state[hist_key]:
@@ -486,22 +586,34 @@ def render_groq_chat(tab_key, context_text, config, title="🤖 Ask the AI about
         with st.chat_message('user'):
             st.markdown(prompt)
 
-        system_prompt = (
-            "You are a quantitative trading assistant embedded in a Python/Streamlit "
-            "algo-trading application. The user will ask about the data snapshot below, "
-            "which comes from their own backtest / live session. "
-            "Be concise, quantitative and honest. If something cannot be determined from "
-            "the snapshot, say so instead of guessing. Never claim a strategy is guaranteed "
-            "to be profitable; note that past performance does not predict future results.\n\n"
-            f"=== DATA SNAPSHOT ({tab_key}) ===\n{context_text[:24000]}\n=== END SNAPSHOT ==="
-        )
-
-        messages = [{'role': 'system', 'content': system_prompt}]
-        messages += st.session_state[hist_key][-10:]
+        def _build_messages(ctx):
+            system_prompt = (
+                "You are a quantitative trading assistant embedded in a Python/Streamlit "
+                "algo-trading application. Answer using the data snapshot below, which comes "
+                "from the user's own backtest / live session. Be concise, quantitative and "
+                "honest. If something cannot be determined from the snapshot, say so instead "
+                "of guessing. Never claim a strategy is guaranteed to be profitable; note that "
+                "past performance does not predict future results.\n\n"
+                f"=== DATA SNAPSHOT ({tab_key}) ===\n{ctx}\n=== END SNAPSHOT ==="
+            )
+            turns = int(config.get('groq_history_turns', DEFAULT_GROQ_HISTORY_TURNS))
+            return ([{'role': 'system', 'content': system_prompt}]
+                    + st.session_state[hist_key][-turns:])
 
         with st.chat_message('assistant'):
+            ctx = sent_context
+            answer = err = None
             with st.spinner("Thinking..."):
-                answer, err = groq_chat_completion(messages, config)
+                # Auto-shrink & retry: a 413 means we exceeded the tokens-per-minute
+                # budget, so halve the snapshot and try again (up to twice).
+                for attempt in range(3):
+                    answer, err, status = groq_chat_completion(_build_messages(ctx), config)
+                    if status != 413 or attempt == 2:
+                        break
+                    ctx = _shrink_context(ctx, max(1200, len(ctx) // 2))
+                    st.info(f"Request too large - retrying with a smaller snapshot "
+                            f"({len(ctx):,} chars)...")
+
             if err:
                 st.error(err)
                 answer = f"⚠️ {err}"
@@ -4052,15 +4164,60 @@ def render_config_ui():
         config['groq_api_key'] = st.sidebar.text_input(
             "Groq API Key", type="password", value="",
             help="Get one free at console.groq.com → API Keys")
+        # ---- model list: live from your key, with the static list as fallback
+        if st.sidebar.button("🔄 Fetch models available to my key"):
+            ids, merr = groq_list_models(config['groq_api_key'])
+            if merr:
+                st.sidebar.error(merr)
+            elif ids:
+                st.session_state['groq_available_models'] = ids
+                st.sidebar.success(f"Found {len(ids)} chat models on your account")
+            else:
+                st.sidebar.warning("No chat models returned for this key.")
+
+        model_options = st.session_state.get('groq_available_models', GROQ_MODELS)
         config['groq_model'] = st.sidebar.selectbox(
-            "Groq Model", GROQ_MODELS, index=safe_index(GROQ_MODELS, DEFAULT_GROQ_MODEL))
-        st.sidebar.caption(
-            "⚠️ Groq has decommissioned llama3-70b-8192, mixtral-8x7b-32768, "
-            "gemma-7b-it and gemma2-9b-it - only live models are listed above.")
+            "Groq Model", model_options,
+            index=safe_index(model_options, DEFAULT_GROQ_MODEL),
+            help="If you get a 404 'model does not exist or you do not have access', "
+                 "press the Fetch button above - availability differs per account.")
+
+        custom_model = st.sidebar.text_input(
+            "…or type a model id manually", value="",
+            help="Overrides the dropdown when filled in.")
+        if custom_model.strip():
+            config['groq_model'] = custom_model.strip()
+
+        if 'groq_available_models' not in st.session_state:
+            st.sidebar.caption(
+                "⚠️ The list above is a built-in guess. Groq has decommissioned "
+                "llama3-70b-8192, mixtral-8x7b-32768 and gemma models, and newer ones are "
+                "not enabled on every account - use Fetch for the real list.")
+
+        # ---- tokens-per-minute budget --------------------------------------
+        st.sidebar.markdown("**Request size (free tier = 8,000 tokens/min)**")
         config['groq_context_rows'] = st.sidebar.number_input(
-            "Rows of data sent to the model", min_value=10, max_value=200, value=50, step=10)
+            "Rows of data sent to the model", min_value=5, max_value=200,
+            value=DEFAULT_GROQ_CONTEXT_ROWS, step=5)
+        config['groq_max_context_chars'] = st.sidebar.number_input(
+            "Max context size (characters)", min_value=1000, max_value=60000,
+            value=DEFAULT_GROQ_MAX_CONTEXT_CHARS, step=1000,
+            help="~4 characters = 1 token. 6000 chars ≈ 1.5k tokens, which keeps you "
+                 "comfortably under the 8k/min free-tier cap.")
+        config['groq_max_tokens'] = st.sidebar.number_input(
+            "Max reply length (tokens)", min_value=256, max_value=4096,
+            value=DEFAULT_GROQ_MAX_TOKENS, step=256)
+        config['groq_history_turns'] = st.sidebar.number_input(
+            "Chat turns resent each time", min_value=2, max_value=20,
+            value=DEFAULT_GROQ_HISTORY_TURNS, step=2)
+        st.sidebar.caption(
+            f"≈{estimate_tokens(' ' * config['groq_max_context_chars']) + config['groq_max_tokens']:,} "
+            "tokens per question at these settings. Oversized requests are auto-shrunk and retried.")
     else:
-        config['groq_context_rows'] = 50
+        config['groq_context_rows'] = DEFAULT_GROQ_CONTEXT_ROWS
+        config['groq_max_context_chars'] = DEFAULT_GROQ_MAX_CONTEXT_CHARS
+        config['groq_max_tokens'] = DEFAULT_GROQ_MAX_TOKENS
+        config['groq_history_turns'] = DEFAULT_GROQ_HISTORY_TURNS
 
     # =====================================================================
     # STRATEGY
@@ -4854,19 +5011,19 @@ def render_backtest_ui(config):
     col1, col2, col3, col4 = st.columns(4)
     col1.metric("Total Trades", metrics['total_trades'])
     col2.metric("Win Rate", f"{metrics['win_rate']:.2f}%")
-    col3.metric("Total P&L", f"₹{metrics['total_pnl']:,.2f}")
-    col4.metric("Avg Trade", f"₹{metrics['avg_pnl']:,.2f}")
+    col3.metric("Total P&L", f"₹{metrics['total_pnl']:.2f}")
+    col4.metric("Avg Trade", f"₹{metrics['avg_pnl']:.2f}")
 
     if config.get('include_brokerage', False):
         cb1, cb2, cb3, _ = st.columns(4)
-        cb1.metric("Total Brokerage", f"₹{metrics['total_brokerage']:,.2f}")
-        cb2.metric("Net P&L", f"₹{metrics['total_net_pnl']:,.2f}")
-        cb3.metric("Avg Net P&L", f"₹{metrics['avg_net_pnl']:,.2f}")
+        cb1.metric("Total Brokerage", f"₹{metrics['total_brokerage']:.2f}")
+        cb2.metric("Net P&L", f"₹{metrics['total_net_pnl']:.2f}")
+        cb3.metric("Avg Net P&L", f"₹{metrics['avg_net_pnl']:.2f}")
 
     col5, col6, col7 = st.columns(3)
     col5.metric("Winning Trades", metrics['winning_trades'])
     col6.metric("Losing Trades", metrics['losing_trades'])
-    col7.metric("Max Drawdown", f"₹{metrics['max_drawdown']:,.2f}")
+    col7.metric("Max Drawdown", f"₹{metrics['max_drawdown']:.2f}")
 
     # ── chart ─────────────────────────────────────────────────────────────
     if df_chart is not None:
@@ -4932,7 +5089,7 @@ def render_backtest_ui(config):
         sk1, sk2, sk3 = st.columns(3)
         sk1.metric("Skipped Winning", int((df_skipped['pnl'] > 0).sum()))
         sk2.metric("Skipped Losing", int((df_skipped['pnl'] <= 0).sum()))
-        sk3.metric("Skipped Total P&L", f"₹{df_skipped['pnl'].sum():,.2f}")
+        sk3.metric("Skipped Total P&L", f"₹{df_skipped['pnl'].sum():.2f}")
 
     if metrics['total_trades'] == 0:
         st.warning("⚠️ No trades generated. Loosen the filters (angle / ADX) or widen the period.")
@@ -4942,7 +5099,7 @@ def render_backtest_ui(config):
             st.write(f"- **{k.replace('_', ' ').title()}**: {v}")
 
     # ── AI chat ───────────────────────────────────────────────────────────
-    rows = int(config.get('groq_context_rows', 50))
+    rows = int(config.get('groq_context_rows', DEFAULT_GROQ_CONTEXT_ROWS))
     context = (
         f"TAB: BACKTEST\n"
         f"Asset={config.get('asset')} Interval={config.get('interval')} Period={config.get('period')}\n"
@@ -5088,20 +5245,28 @@ def render_live_trading_ui(config):
 
     if current_data is not None:
         st.subheader("📈 Current Market Data (indicators from the last CLOSED candle)")
-        m1, m2, m3, m4, m5, m6 = st.columns(6)
-        m1.metric("Live Price", f"₹{live_price:,.2f}" if live_price else "N/A")
-        m2.metric("Closed Candle", f"₹{current_data['Close']:,.2f}")
-        m3.metric("Fast EMA", f"₹{current_data['EMA_Fast']:,.2f}"
+        # NOTE: 4 metrics per row and NO thousands separator - six narrow columns
+        # with "₹24,051.25" is what made Streamlit truncate the numbers to "₹24,05…"
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Live Price", f"₹{live_price:.2f}" if live_price else "N/A")
+        m2.metric("Closed Candle", f"₹{current_data['Close']:.2f}")
+        m3.metric("Fast EMA", f"₹{current_data['EMA_Fast']:.2f}"
                   if not pd.isna(current_data.get('EMA_Fast')) else "N/A")
-        m4.metric("Slow EMA", f"₹{current_data['EMA_Slow']:,.2f}"
+        m4.metric("Slow EMA", f"₹{current_data['EMA_Slow']:.2f}"
                   if not pd.isna(current_data.get('EMA_Slow')) else "N/A")
+
+        m5, m6, m7, m8 = st.columns(4)
         m5.metric("EMA Angle", f"{current_data['EMA_Fast_Angle']:.2f}°"
                   if not pd.isna(current_data.get('EMA_Fast_Angle')) else "N/A")
         if not pd.isna(current_data.get('EMA_Fast')) and not pd.isna(current_data.get('EMA_Slow')):
-            m6.metric("State", "Bullish ⬆️" if current_data['EMA_Fast'] > current_data['EMA_Slow']
-                      else "Bearish ⬇️")
+            diff = current_data['EMA_Fast'] - current_data['EMA_Slow']
+            m6.metric("State", "Bullish ⬆️" if diff > 0 else "Bearish ⬇️")
+            m7.metric("Fast-Slow Diff", f"{diff:.2f}")
         else:
             m6.metric("State", "N/A")
+            m7.metric("Fast-Slow Diff", "N/A")
+        m8.metric("RSI", f"{current_data['RSI']:.2f}"
+                  if not pd.isna(current_data.get('RSI')) else "N/A")
 
         bt = st.session_state.get('signal_bar_time')
         if bt is not None:
@@ -5113,10 +5278,10 @@ def render_live_trading_ui(config):
         st.subheader("📊 Last Candle Details")
         with st.expander("🔍 Complete candle data with all indicators", expanded=False):
             o1, o2, o3, o4, o5 = st.columns(5)
-            o1.metric("Open", f"₹{current_data.get('Open', 0):,.2f}")
-            o2.metric("High", f"₹{current_data.get('High', 0):,.2f}")
-            o3.metric("Low", f"₹{current_data.get('Low', 0):,.2f}")
-            o4.metric("Close", f"₹{current_data.get('Close', 0):,.2f}")
+            o1.metric("Open", f"₹{current_data.get('Open', 0):.2f}")
+            o2.metric("High", f"₹{current_data.get('High', 0):.2f}")
+            o3.metric("Low", f"₹{current_data.get('Low', 0):.2f}")
+            o4.metric("Close", f"₹{current_data.get('Close', 0):.2f}")
             o5.metric("Volume", f"{int(current_data.get('Volume', 0)):,}")
 
             if 'Datetime' in current_data.index:
@@ -5155,7 +5320,7 @@ def render_live_trading_ui(config):
                                 elif name == 'Volume MA':
                                     st.metric(name, f"{int(value):,}")
                                 else:
-                                    st.metric(name, f"₹{value:,.2f}")
+                                    st.metric(name, f"₹{value:.2f}")
             else:
                 st.info("No indicators calculated yet.")
 
@@ -5166,11 +5331,11 @@ def render_live_trading_ui(config):
     if position:
         c1, c2, c3, c4, c5 = st.columns(5)
         c1.metric("Type", position['type'])
-        c2.metric("Entry Price", f"₹{position['entry_price']:,.2f}")
-        c3.metric("Live Price", f"₹{live_price:,.2f}" if live_price else "N/A")
-        c4.metric("Stop Loss", f"₹{position['sl_price']:,.2f}"
+        c2.metric("Entry Price", f"₹{position['entry_price']:.2f}")
+        c3.metric("Live Price", f"₹{live_price:.2f}" if live_price else "N/A")
+        c4.metric("Stop Loss", f"₹{position['sl_price']:.2f}"
                   if position['sl_price'] is not None else "Not Set")
-        c5.metric("Target", f"₹{position['target_price']:,.2f}"
+        c5.metric("Target", f"₹{position['target_price']:.2f}"
                   if position['target_price'] is not None else "Not Set")
 
         d1, d2, d3, d4, d5 = st.columns(5)
@@ -5181,11 +5346,11 @@ def render_live_trading_ui(config):
                 cur_pnl = (live_price - position['entry_price']) * position['quantity']
             else:
                 cur_pnl = (position['entry_price'] - live_price) * position['quantity']
-            d3.metric("Current P&L", f"₹{cur_pnl:,.2f}", delta=f"₹{cur_pnl:,.2f}")
+            d3.metric("Current P&L", f"₹{cur_pnl:.2f}", delta=f"₹{cur_pnl:.2f}")
         else:
             d3.metric("Current P&L", "N/A")
-        d4.metric("Highest Price", f"₹{position.get('highest_price', 0):,.2f}")
-        d5.metric("Lowest Price", f"₹{position.get('lowest_price', 0):,.2f}")
+        d4.metric("Highest Price", f"₹{position.get('highest_price', 0):.2f}")
+        d5.metric("Lowest Price", f"₹{position.get('lowest_price', 0):.2f}")
 
         if position.get('ticker') != config.get('asset'):
             st.warning(f"⚠️ Position locked to {position.get('ticker')}. "
@@ -5219,8 +5384,8 @@ def render_live_trading_ui(config):
         h1, h2, h3, h4 = st.columns(4)
         h1.metric("Total Trades", len(df_hist))
         h2.metric("Winning", int((df_hist['pnl'] > 0).sum()))
-        h3.metric("Total P&L", f"₹{df_hist['pnl'].sum():,.2f}")
-        h4.metric("Net P&L", f"₹{df_hist['net_pnl'].sum():,.2f}")
+        h3.metric("Total P&L", f"₹{df_hist['pnl'].sum():.2f}")
+        h4.metric("Net P&L", f"₹{df_hist['net_pnl'].sum():.2f}")
 
         df_disp = _format_money_cols(df_hist, [
             'entry_price', 'exit_price', 'highest_price', 'lowest_price',
@@ -5250,7 +5415,7 @@ def render_live_trading_ui(config):
         st.info("No logs yet")
 
     # ── AI chat ───────────────────────────────────────────────────────────
-    rows = int(config.get('groq_context_rows', 50))
+    rows = int(config.get('groq_context_rows', DEFAULT_GROQ_CONTEXT_ROWS))
     hist_df = pd.DataFrame(trade_history) if trade_history else pd.DataFrame()
     context = (
         f"TAB: LIVE TRADING\n"
@@ -5322,18 +5487,18 @@ def render_trade_logs_ui(config):
     s2.metric("Profit Trades", profit_trades)
     s3.metric("Loss Trades", loss_trades)
     s4.metric("Accuracy", f"{accuracy:.2f}%")
-    s5.metric("Total P&L", f"₹{total_pnl:,.2f}", delta=f"₹{total_pnl:,.2f}")
+    s5.metric("Total P&L", f"₹{total_pnl:.2f}", delta=f"₹{total_pnl:.2f}")
 
     t1, t2, t3, t4, t5 = st.columns(5)
-    t1.metric("Avg P&L", f"₹{avg_pnl:,.2f}")
-    t2.metric("Avg Profit", f"₹{avg_profit:,.2f}")
-    t3.metric("Avg Loss", f"₹{avg_loss:,.2f}")
+    t1.metric("Avg P&L", f"₹{avg_pnl:.2f}")
+    t2.metric("Avg Profit", f"₹{avg_profit:.2f}")
+    t3.metric("Avg Loss", f"₹{avg_loss:.2f}")
     t4.metric("Profit Factor", f"{abs(avg_profit / avg_loss):.2f}"
               if profit_trades and loss_trades and avg_loss else "N/A")
-    t5.metric("Max Drawdown", f"₹{max_dd:,.2f}")
+    t5.metric("Max Drawdown", f"₹{max_dd:.2f}")
 
     if 'net_pnl' in df_trades.columns and config.get('include_brokerage', False):
-        st.metric("Net P&L (after brokerage)", f"₹{total_net:,.2f}")
+        st.metric("Net P&L (after brokerage)", f"₹{total_net:.2f}")
 
     # ── table ─────────────────────────────────────────────────────────────
     st.subheader("📋 Detailed Trade History")
@@ -5399,7 +5564,7 @@ def render_trade_logs_ui(config):
         st.plotly_chart(fig_reason, width="stretch")
 
     # ── AI chat ───────────────────────────────────────────────────────────
-    rows = int(config.get('groq_context_rows', 50))
+    rows = int(config.get('groq_context_rows', DEFAULT_GROQ_CONTEXT_ROWS))
     stats = {
         'total_trades': total_trades, 'profit_trades': profit_trades, 'loss_trades': loss_trades,
         'accuracy_pct': round(accuracy, 2), 'total_pnl': round(total_pnl, 2),
