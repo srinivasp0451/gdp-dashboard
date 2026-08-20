@@ -6038,6 +6038,311 @@ def _render_accuracy_results():
                          width="stretch", hide_index=True)
 
 
+# ------------------------------------------------- verified live screener
+# The strictest of the screeners. A ticker only appears if the setup passes the
+# money tests from the reality check AND is firing right now.
+#
+# The gates run cheapest first so the expensive ones only ever see survivors:
+# trade count, then profit after costs, then reward against risk, then whether
+# it is live at all, and only then the held-out slice and the random-entry
+# comparison. Most candidates die in the first three, which is why this can
+# sweep a large grid without taking all afternoon.
+
+VERIFIED_COLS = ["Symbol", "Strategy", "Timeframe", "Direction", "Entry", "Stop", "Target",
+                 "Risk", "Reward:risk", "Bars ago", "Trades", "Win rate %", "Breakeven %",
+                 "Expectancy", "Net points", "Held-out expectancy", "Held-out trades",
+                 "Random-entry percentile", "Sharpe", "Max drawdown", "Flags", "Config"]
+
+
+def verified_stop_grid(use_trailing: bool) -> list[dict]:
+    grid = [{"mode": "ATR multiple", "atr_len": 14, "atr_mult": m, "atr_trail": False,
+             "be": {"on": False}} for m in (1.5, 2.0, 3.0)]
+    if use_trailing:
+        # Trailing is a bar-close rule here: at each close the stop moves to the
+        # best price seen minus the distance, and never loosens. It is the same
+        # rule live, so the two agree.
+        grid += [{"mode": "ATR multiple", "atr_len": 14, "atr_mult": m, "atr_trail": True,
+                  "be": {"on": False}} for m in (2.0, 3.0)]
+        grid += [{"mode": "Trailing previous swing low / high", "swing_n": n_, "buffer": 0.0,
+                  "be": {"on": False}} for n_ in (3, 5)]
+    return grid
+
+
+def scan_verified_live(symbols, strategies, tf_pairs, sl_grid, tg_grid, min_trades, recent,
+                       costs, oos_frac, run_random, random_trials, cap, progress=None):
+    rows, configs, skipped = [], [], []
+    tally = {"tested": 0, "too few trades": 0, "not profitable after costs": 0,
+             "reward below risk": 0, "not firing now": 0, "already hit stop or target": 0,
+             "failed on unseen bars": 0, "no better than random entries": 0, "listed": 0}
+    done, stop_now = 0, False
+    for sym in symbols:
+        if stop_now:
+            break
+        ysym = to_yf_symbol(sym)
+        if progress:
+            progress(min(done / max(cap, 1), 1.0), f"{sym} — {done:,} tested, {len(rows)} found")
+        for tf, period in tf_pairs:
+            if stop_now:
+                break
+            try:
+                df = load_candles(ysym, tf, period)
+            except RateLimitError:
+                skipped.append((sym, tf, "rate limited — scan stopped"))
+                stop_now = True
+                break
+            except Exception as e:
+                skipped.append((sym, tf, str(e)[:90]))
+                continue
+            if len(df) < 200:
+                skipped.append((sym, tf, f"only {len(df)} bars"))
+                continue
+            for sname in strategies:
+                params = STRATEGY_DEFAULTS.get(sname, {})
+                try:
+                    sig = STRATEGIES[sname]["compute"](df, params)
+                except Exception:
+                    continue
+                al, as_ = combine_filters(df, {}, "AND")
+                for slc in sl_grid:
+                    for tgc in tg_grid:
+                        if done >= cap:
+                            stop_now = True
+                            break
+                        done += 1
+                        tally["tested"] += 1
+                        cfg = dict(base_config_stub(), symbol=ysym, name=sym, interval=tf,
+                                   period=period, strategy=sname, strat_params=params,
+                                   sl_cfg=slc, tgt_cfg=tgc, filters={}, sl_mode=slc["mode"],
+                                   tgt_mode=tgc["mode"], costs=costs)
+                        try:
+                            eng = make_engine(cfg, df, sig, al, as_)
+                            trades, eq = eng.run()
+                        except Exception:
+                            continue
+                        m = summarise(trades, eq)
+                        if m.get("Trades", 0) < min_trades:
+                            tally["too few trades"] += 1
+                            continue
+                        if m["Expectancy per trade"] <= 0:
+                            tally["not profitable after costs"] += 1
+                            continue
+                        rr = m.get("Planned reward:risk")
+                        if not (rr == rr) or rr < 1.0:
+                            tally["reward below risk"] += 1
+                            continue
+                        dsig = eng.directional_signal()
+                        fresh = np.flatnonzero(dsig.to_numpy()[-(recent + 1):-1] != 0)
+                        if len(fresh) == 0:
+                            tally["not firing now"] += 1
+                            continue
+                        bar = len(df) - (recent + 1) + int(fresh[-1])
+                        side = int(dsig.iloc[bar])
+                        lv = idea_levels(cfg, df, bar, side)
+                        if lv is None or lv["resolved"]:
+                            tally["already hit stop or target"] += 1
+                            continue
+                        # expensive checks, only on something that is actually live
+                        cut = int(len(df) * (1 - oos_frac))
+                        try:
+                            _, t_out, e_out = run_config(cfg, df.iloc[cut:])
+                            m_out = summarise(t_out, e_out)
+                        except Exception:
+                            m_out = {"Trades": 0}
+                        if m_out.get("Trades", 0) < 3 or m_out.get("Expectancy per trade", 0) <= 0:
+                            tally["failed on unseen bars"] += 1
+                            continue
+                        pctl = np.nan
+                        if run_random:
+                            b = random_entry_benchmark(cfg, df, trades, int(random_trials))
+                            pctl = b["percentile"] if b else np.nan
+                            if pctl == pctl and pctl < 80:
+                                tally["no better than random entries"] += 1
+                                continue
+                        tally["listed"] += 1
+                        cfg["_live"] = dict(lv, side=side, bars_ago=int(len(df) - 1 - bar),
+                                            when=df.index[bar])
+                        rows.append([sym, sname, tf,
+                                     ("Buy CE" if side > 0 else "Buy PE") if cfg["is_options"]
+                                     else ("Long" if side > 0 else "Short"),
+                                     round(lv["entry"], 2), round(lv["stop"], 2),
+                                     round(lv["target"], 2), round(lv["risk"], 2),
+                                     round(lv["rr"], 2), int(len(df) - 1 - bar),
+                                     m["Trades"], m["Hit rate %"], m.get("Breakeven win %"),
+                                     m["Expectancy per trade"], m["Net points per unit"],
+                                     round(m_out.get("Expectancy per trade", 0.0), 2),
+                                     m_out.get("Trades", 0),
+                                     round(pctl, 0) if pctl == pctl else np.nan,
+                                     m.get("Sharpe (annualised)"), m["Max drawdown"],
+                                     degeneracy_flags(m), len(configs)])
+                        configs.append(cfg)
+                    if stop_now:
+                        break
+                if stop_now:
+                    break
+    return rows, configs, skipped, tally
+
+
+def render_verified_screener(base_cfg: dict):
+    ss = st.session_state
+    st.markdown("#### Verified and live")
+    st.caption("The strictest screener here. A ticker only appears if the setup made money after "
+               "costs, kept making it on bars it was never tuned on, risks less than it stands to "
+               "make — and is firing right now with the trade still available.")
+
+    c1, c2 = st.columns([1.3, 1])
+    with c1:
+        uni = st.selectbox("Universe", list(SCAN_UNIVERSES), index=0, key="vf_uni")
+        sync_universe_box("vf_uni", "vf_syms", uni)
+        pasted = st.text_area("Tickers", height=100, key="vf_syms",
+                              help="Edit freely. Choosing a different universe refills this box.")
+        symbols = [t.strip() for t in pasted.replace("\n", ",").split(",") if t.strip()]
+        if ss.get("vf_syms__n") != len(symbols):
+            ss["vf_lim"] = min(len(symbols), 500) if len(symbols) else 1
+            ss["vf_syms__n"] = len(symbols)
+        limit = st.number_input(f"Scan at most (of {len(symbols)} listed)", 1, 500, key="vf_lim")
+        symbols = symbols[:int(limit)]
+    with c2:
+        instrument = st.selectbox("Trading as", ["Equity intraday", "Equity delivery", "Futures",
+                                                 "Options (stock or index)"], key="vf_instr")
+        strategies = st.multiselect("Strategies", SWEEPABLE, default=SWEEPABLE, key="vf_strats")
+        tfs = st.multiselect("Timeframes", list(TF_PERIODS), default=["1h", "1d"], key="vf_tfs")
+        use_trailing = st.checkbox("Include trailing stops", value=True, key="vf_trail",
+                                   help="Trailing here means the stop is moved at each bar close "
+                                        "to the best price minus the distance, and never "
+                                        "loosens. Live trading follows the same rule, so the two "
+                                        "agree.")
+
+    tf_pairs = [(tf, TF_PERIODS[tf][1]) for tf in tfs]
+    m1, m2, m3, m4 = st.columns(4)
+    min_trades = m1.number_input("Minimum past trades", 5, 1000, 25, key="vf_mint")
+    recent = m2.number_input("Firing within last N bars", 1, 20, 3, key="vf_recent")
+    oos = m3.slider("Hold out final %", 10, 50, 30, key="vf_oos") / 100.0
+    cap = m4.number_input("Stop after N tests", 100, 100_000, 8_000, step=100, key="vf_cap")
+    run_random = st.checkbox("Also require it to beat random entries (slow but decisive)",
+                             value=False, key="vf_rand",
+                             help="Re-runs each survivor with random entry bars and the same "
+                                  "exits. Only setups in the top fifth are kept. This is the "
+                                  "strongest filter and the slowest.")
+    trials = st.slider("Random comparison runs", 30, 300, 60, 10, key="vf_trials") if run_random else 0
+
+    inst_key = "Options" if instrument.startswith("Options") else instrument
+    costs = CostModel(instrument=inst_key, enabled=True, slippage_unit="Percent", slippage=0.03,
+                      **COST_DEFAULTS.get(inst_key, COST_DEFAULTS["Equity intraday"]))
+    sl_grid = verified_stop_grid(use_trailing)
+    tg_grid = [{"mode": "Risk:reward multiple", "rr": r} for r in (1.5, 2.0, 3.0)]
+    total = len(symbols) * max(len(tf_pairs), 1) * max(len(strategies), 1) * len(sl_grid) * len(tg_grid)
+
+    e1, e2, e3 = st.columns(3)
+    e1.metric("Tests", f"{total:,}")
+    e2.metric("Downloads", f"{len(symbols) * max(len(tf_pairs), 1):,}")
+    e3.metric("Rough runtime", _runtime_estimate(min(total, int(cap)),
+                                                 len(symbols) * max(len(tf_pairs), 1)))
+    if instrument.startswith("Options"):
+        st.warning("Levels are the underlying's price, not option premium. No greeks, no implied "
+                   "volatility, no decay.", icon="⚠️")
+    if not symbols or not strategies or not tfs:
+        st.info("Pick at least one ticker, one strategy and one timeframe.")
+        return
+
+    if st.button("Find verified live trades", type="primary", width="stretch"):
+        bar = st.progress(0.0)
+        status = st.empty()
+        with st.spinner("Testing, then verifying the survivors…"):
+            rows, configs, skipped, tally = scan_verified_live(
+                symbols, strategies, tf_pairs, sl_grid, tg_grid, int(min_trades), int(recent),
+                costs, oos, run_random, trials, int(cap),
+                progress=lambda f, t: (bar.progress(f), status.write(t)))
+        bar.progress(1.0)
+        status.write(f"Finished. {tally['tested']:,} tested, {len(rows)} verified and live.")
+        ss["vf"] = {"rows": rows, "configs": configs, "skipped": skipped, "tally": tally,
+                    "random": run_random}
+    _render_verified_results()
+
+
+def _render_verified_results():
+    ss = st.session_state
+    res = ss.get("vf")
+    if not res:
+        return
+    st.markdown("---")
+    t = res["tally"]
+    if not res["rows"]:
+        st.error("**Nothing is both verified and live right now.**")
+        order = ["too few trades", "not profitable after costs", "reward below risk",
+                 "not firing now", "already hit stop or target", "failed on unseen bars",
+                 "no better than random entries"]
+        detail = pd.DataFrame([{"Fell out at": k, "Count": t.get(k, 0)} for k in order
+                               if t.get(k, 0)])
+        st.caption(f"{t['tested']:,} combinations tested. Where they dropped out:")
+        st.dataframe(detail, width="stretch", hide_index=True)
+        st.info("The two big buckets are usually *not profitable after costs* — which no setting "
+                "can fix — and *not firing now*, which simply means today is quiet. Re-run "
+                "tomorrow rather than loosening the checks.")
+        return
+
+    df_rows = pd.DataFrame(res["rows"], columns=VERIFIED_COLS)
+    df_rows = df_rows.sort_values("Expectancy", ascending=False).reset_index(drop=True)
+    st.success(f"**{len(df_rows)} verified setup(s) firing right now.** Each one made money after "
+               f"costs, held up on bars it never saw, and risks less than it stands to make."
+               + (" Each also beat at least 80% of random-entry runs." if res["random"] else ""))
+
+    for _, r in df_rows.head(15).iterrows():
+        cfg = res["configs"][int(r["Config"])]
+        with st.container(border=True):
+            st.markdown(
+                f"**{r['Symbol']} — {r['Direction']} · {r['Strategy']} on the {r['Timeframe']} "
+                f"chart.** Fired {r['Bars ago']} bar(s) ago and still available. Enter near "
+                f"**{r['Entry']:,.2f}**, stop **{r['Stop']:,.2f}**, target **{r['Target']:,.2f}** "
+                f"— risking {r['Risk']:,.2f} to make {r['Risk'] * r['Reward:risk']:,.2f} at "
+                f"{r['Reward:risk']:.1f}:1. Across {int(r['Trades'])} past trades it won "
+                f"{r['Win rate %']:.0f} out of 100 where {r['Breakeven %']:.0f} was needed to "
+                f"break even, averaging {r['Expectancy']:,.2f} per trade after costs. On the "
+                f"held-out final slice it still made {r['Held-out expectancy']:,.2f} per trade "
+                f"over {int(r['Held-out trades'])} trades.")
+            k = st.columns(6)
+            k[0].metric("Entry", f"{r['Entry']:,.2f}")
+            k[1].metric("Stop", f"{r['Stop']:,.2f}", f"-{r['Risk']:,.2f}")
+            k[2].metric("Target", f"{r['Target']:,.2f}")
+            k[3].metric("Reward : risk", f"{r['Reward:risk']:.2f}")
+            k[4].metric("Avg per trade", f"{r['Expectancy']:,.2f}")
+            k[5].metric("Unseen slice", f"{r['Held-out expectancy']:,.2f}")
+            if r["Random-entry percentile"] == r["Random-entry percentile"]:
+                st.caption(f"Beat {r['Random-entry percentile']:.0f}% of random-entry runs using "
+                           f"the same exits.")
+            if r["Flags"] != "—":
+                st.warning(f"Warning: {r['Flags']}")
+            if st.button("Apply to sidebar", key=f"vf_{int(r['Config'])}", width="stretch"):
+                out = {k_: v for k_, v in cfg.items() if k_ != "_live"}
+                out["_label"] = f"{r['Symbol']} · {r['Strategy']} · {r['Timeframe']}"
+                ss["pending_sidebar"] = out
+                ss.pop("replay_cfg", None)
+                ss.pop("bt_result", None)
+                st.rerun()
+
+    st.markdown("#### All of them as a table")
+    st.dataframe(df_rows.drop(columns=["Config"]), width="stretch", height=340, hide_index=True)
+    st.download_button("Download as CSV",
+                       df_rows.drop(columns=["Config"]).to_csv(index=False).encode(),
+                       "verified_live.csv", "text/csv")
+    with st.expander(f"Where the other {t['tested'] - len(df_rows):,} tests dropped out"):
+        order = ["too few trades", "not profitable after costs", "reward below risk",
+                 "not firing now", "already hit stop or target", "failed on unseen bars",
+                 "no better than random entries"]
+        st.dataframe(pd.DataFrame([{"Fell out at": k, "Count": t.get(k, 0)} for k in order
+                                   if t.get(k, 0)]), width="stretch", hide_index=True)
+    st.markdown(
+        "- Passing every check here still does not make a trade a good one. It means the setup "
+        "was not obviously broken on the history available, which is the most any backtest can "
+        "say.\n"
+        "- Send one to the sidebar and run *Is this actually profitable?* in the Backtest tab "
+        "before risking money. That runs the random-entry comparison in full.\n"
+        "- An empty list on a quiet day is the normal result, not a fault.")
+    if res["skipped"]:
+        with st.expander(f"{len(res['skipped'])} downloads skipped"):
+            st.dataframe(pd.DataFrame(res["skipped"], columns=["Symbol", "Timeframe", "Reason"]),
+                         width="stretch", hide_index=True)
+
+
 # ------------------------------------------------------------ edge screener
 # Answers questions of the form "how often does this instrument travel more
 # than X% from its anchor before the period ends" — the containment statistics
@@ -6819,11 +7124,11 @@ def main():
     if applied:
         st.success(f"Sidebar loaded with the configuration for {applied}. Every control is still "
                    f"editable.")
-    (tab_bt, tab_live, tab_hist, tab_ideas, tab_acc, tab_scan, tab_pat,
+    (tab_bt, tab_live, tab_hist, tab_verified, tab_ideas, tab_acc, tab_scan, tab_pat,
      tab_edge) = st.tabs(
-        ["Backtest", "Live trading", "Trade history", "Screener · what to trade",
-         "Screener · accuracy", "Screener · strategies", "Screener · patterns",
-         "Screener · levels"])
+        ["Backtest", "Live trading", "Trade history", "Screener · verified live",
+         "Screener · what to trade", "Screener · accuracy", "Screener · strategies",
+         "Screener · patterns", "Screener · levels"])
 
     with tab_bt:
         try:
@@ -6836,6 +7141,9 @@ def main():
             st.stop()
         st.caption(f"{len(df):,} bars · {df.index[0]:%d-%b-%Y %H:%M} to {df.index[-1]:%d-%b-%Y %H:%M}")
         render_backtest(cfg, df)
+
+    with tab_verified:
+        render_verified_screener(cfg)
 
     with tab_ideas:
         render_ideas(cfg)
