@@ -2381,16 +2381,30 @@ def render_backtest(cfg: dict, df: pd.DataFrame):
         weak = sum(1 for r in quick if r["Verdict"] == "weak")
         passes = len(quick) - fails - weak
         failed_names = [r["Check"] for r in quick if r["Verdict"] == "fail"]
+        # Losing money and being unproven are different problems with different
+        # fixes, so they get different verdicts rather than one blanket failure.
+        fatal = [r["Check"] for r in quick if r["Verdict"] == "fail"
+                 and r["Check"] in ("Made money at all", "Survives real costs",
+                                    "Holds up on bars it was not tuned on",
+                                    "Sane reward against risk")]
+        soft = [n_ for n_ in failed_names if n_ not in fatal]
         if fails == 0:
-            st.success(f"**Looks promising so far — {passes} of {len(quick)} quick checks passed.** "
-                       f"Nothing here is disqualifying. The decisive test, whether your signal "
-                       f"beats random entries, has not been run yet — use *Is this actually "
+            st.success(f"**Looks promising — {passes} of {len(quick)} checks passed.** Nothing "
+                       f"here is disqualifying. The decisive test, whether your signal beats "
+                       f"random entries, has not been run yet — use *Is this actually "
                        f"profitable?* just below.")
+        elif not fatal:
+            st.warning(f"**Not disqualified, but not proven either.** The money checks passed — "
+                       f"it made money, survived costs and held up on unseen bars. What failed is "
+                       f"about confidence, not profit: {', '.join(soft)}. "
+                       f"Usually the fix is more data: load a longer period or a faster timeframe "
+                       f"so there are more trades to judge.")
         else:
-            st.error(f"**This does not look profitable — {fails} of {len(quick)} checks failed.** "
-                     f"Failed: {', '.join(failed_names[:4])}"
-                     + (f", and {len(failed_names) - 4} more." if len(failed_names) > 4 else ".")
-                     + " Details in *Is this actually profitable?* just below.")
+            st.error(f"**This one does not work — it fails on money, not on technicalities.** "
+                     f"{', '.join(fatal)}"
+                     + (f" (also {', '.join(soft)})" if soft else "")
+                     + ". Details below. Most setups fail here; that is the screener doing its "
+                       "job rather than the app being broken.")
 
     if not trades.empty:
         worst_net = summary["Net P&L"]
@@ -2601,24 +2615,44 @@ def reality_check(cfg: dict, df: pd.DataFrame, trades: pd.DataFrame, summary: di
                  "What it means": "Nothing was traded, so there is nothing to judge."}]
 
     add("Enough trades to mean anything",
-        "pass" if n >= 100 else ("weak" if n >= 30 else "fail"),
-        f"{n} trades. Under 30 is noise; 100+ before you trust a hit rate. "
-        f"A coin can produce {n} results that look like skill.")
+        "pass" if n >= 100 else ("weak" if n >= 25 else "fail"),
+        f"{n} trades. This is about confidence, not profitability — a good strategy with 20 "
+        f"trades is still a good strategy, you just cannot tell it apart from luck yet. "
+        f"Load a longer period or a faster timeframe to build the count.")
 
     net = summary["Net P&L"]
     add("Made money at all", "pass" if net > 0 else "fail",
         f"Net {net:,.2f} over the window.")
 
+    # Costs and out-of-sample are tested here directly rather than demanded of
+    # the sidebar. Marking a strategy "failed" because an optional toggle was
+    # left off grades the settings, not the strategy, and makes every result
+    # look broken for no reason.
     if cfg["costs"].enabled:
         ch = summary.get("Total charges", 0.0)
         gross = summary.get("Gross P&L", 0.0)
         add("Survives real costs", "pass" if net > 0 else "fail",
-            f"Costs took {ch:,.2f} out of a gross {gross:,.2f}. This result is after brokerage, "
-            f"taxes and slippage.")
+            f"Costs took {ch:,.2f} out of a gross {gross:,.2f}. This result is already after "
+            f"brokerage, taxes and slippage.")
     else:
-        add("Survives real costs", "fail",
-            "Cost modelling is switched OFF, so this P&L is fictional. Turn it on in the sidebar "
-            "— it is the single most common reason a good backtest loses money live.")
+        inst = cfg.get("instrument", "Equity intraday")
+        inst = "Options" if str(inst).startswith("Options") else inst
+        probe = dict(cfg)
+        probe["costs"] = CostModel(instrument=inst, enabled=True, slippage_unit="Percent",
+                                   slippage=0.03,
+                                   **COST_DEFAULTS.get(inst, COST_DEFAULTS["Equity intraday"]))
+        try:
+            _, t_c, e_c = run_config(probe, df)
+            m_c = summarise(t_c, e_c)
+            net_c = m_c.get("Net P&L", 0.0)
+            add("Survives real costs", "pass" if net_c > 0 else "fail",
+                f"You have cost modelling switched off, so this was re-run with standard "
+                f"brokerage, taxes and 0.03% slippage: {net:,.2f} gross becomes {net_c:,.2f} "
+                f"after costs."
+                + ("" if net_c > 0 else " The edge does not survive the friction."))
+        except Exception:
+            add("Survives real costs", "weak",
+                "Could not re-run with costs. Switch cost modelling on in the sidebar to check.")
 
     if bench:
         pctl = bench["percentile"]
@@ -2663,12 +2697,35 @@ def reality_check(cfg: dict, df: pd.DataFrame, trades: pd.DataFrame, summary: di
             f"{pos} of {len(nets)} nearby stop and target values were also profitable. If only the "
             f"exact number you chose works, it was fitted to this history.")
 
-    fwd = cfg.get("forward", {})
-    add("Tested on bars you did not tune on",
-        "pass" if fwd.get("on") else "fail",
-        "Forward testing is on; compare the held-out column." if fwd.get("on")
-        else "Forward testing is OFF. Switch it on in the sidebar — a result you tuned and then "
-             "measured on the same bars proves nothing.")
+    # Hold out the last 30% and re-run, rather than asking whether a toggle is on.
+    try:
+        cut = int(len(df) * 0.7)
+        ins, out = df.iloc[:cut], df.iloc[cut:]
+        if len(ins) > 80 and len(out) > 40:
+            _, t_in, e_in = run_config(cfg, ins)
+            _, t_out, e_out = run_config(cfg, out)
+            m_in, m_out = summarise(t_in, e_in), summarise(t_out, e_out)
+            n_out = m_out.get("Trades", 0)
+            if n_out < 5:
+                add("Holds up on bars it was not tuned on", "weak",
+                    f"Only {n_out} trade(s) in the held-out final 30% — too few to judge. Load a "
+                    f"longer period so the unseen slice has something in it.")
+            else:
+                exp_out = m_out.get("Expectancy per trade", 0.0)
+                exp_in = m_in.get("Expectancy per trade", 0.0)
+                add("Holds up on bars it was not tuned on",
+                    "pass" if exp_out > 0 else "fail",
+                    f"Tuning slice made {exp_in:,.2f} per trade; the unseen final 30% made "
+                    f"{exp_out:,.2f} over {n_out} trades. "
+                    + ("It survived on data it never saw, which is the strongest evidence here."
+                       if exp_out > 0 else
+                       "It made money on the tuning slice and lost on the unseen one — the "
+                       "hallmark of a setting fitted to the past."))
+        else:
+            add("Holds up on bars it was not tuned on", "weak",
+                "Not enough bars to split into a tuning and an unseen slice. Load a longer period.")
+    except Exception:
+        add("Holds up on bars it was not tuned on", "weak", "Could not run the split.")
     return rows
 
 
