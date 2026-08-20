@@ -5140,21 +5140,61 @@ def _render_pattern_results():
                        "the scan to reprice every level.")
 
         st.markdown("##### Fired recently")
-        st.dataframe(view, width="stretch", height=420, hide_index=True)
+        st.caption("Tick a box in any row to act on it. Chart draws the pattern on the candles, "
+                   "Levels opens the full plan with its historical record, Sidebar loads the whole "
+                   "setup ready to backtest. Ticks clear themselves after firing.")
+
+        # st.dataframe cannot hold widgets, but st.data_editor can: checkbox
+        # columns are genuinely interactive cells, so the action controls live in
+        # the row itself rather than in a separate list beneath the table. Every
+        # other column is locked read-only, so the table still behaves like a
+        # table — sortable, scrollable, exportable.
+        ACTIONS = ["Chart", "Levels", "Sidebar"]
+        lead = [c for c in ("Symbol", "Timeframe", "Pattern", "Bias", "Fired at", "Bars ago",
+                            "Entry", "Stop", "Target") if c in view.columns]
+        rest = [c for c in view.columns if c not in lead and c not in ACTIONS]
+        grid = view[lead + rest].copy().reset_index(drop=True)
+        for i, a in enumerate(ACTIONS):
+            grid.insert(len(lead) + i, a, False)      # sit immediately after Stop/Target
+        ver = ss.setdefault("pt_editor_ver", 0)
+        ed_key = f"pt_editor_{ver}"
+        st.data_editor(
+            grid, key=ed_key, width="stretch", height=420, hide_index=True,
+            disabled=[c for c in grid.columns if c not in ACTIONS],
+            column_config={
+                "Chart": st.column_config.CheckboxColumn("Chart", width="small",
+                                                         help="Draw the pattern on the candles"),
+                "Levels": st.column_config.CheckboxColumn("Levels", width="small",
+                                                          help="Entry, stop, target and record"),
+                "Sidebar": st.column_config.CheckboxColumn("Sidebar", width="small",
+                                                           help="Load this setup into the sidebar"),
+            })
+        edits = (st.session_state.get(ed_key) or {}).get("edited_rows") or {}
+        fired_action = None
+        for ridx, changes in edits.items():
+            for action, val in changes.items():
+                if val and action in ACTIONS:
+                    fired_action = (int(ridx), action)
+                    break
+            if fired_action:
+                break
+        if fired_action:
+            ridx, action = fired_action
+            row = view.iloc[ridx].to_dict()
+            ss["pt_editor_ver"] = ver + 1          # a fresh editor next run clears the tick
+            if action == "Sidebar":
+                ss["pending_sidebar"] = _pattern_sidebar_cfg(
+                    row, piv_n, ss.get("pt_rr", 2.0), ss.get("pt_atr", 1.5))
+                ss.pop("replay_cfg", None)
+                ss.pop("bt_result", None)
+                st.rerun()
+            elif action == "Chart":
+                show_pattern_dialog(row, piv_n, horizon)
+            else:
+                show_plan_dialog(row, piv_n)
+
         st.download_button("Download hits as CSV", hits.to_csv(index=False).encode(),
                            "pattern_hits.csv", "text/csv")
-
-        # st.dataframe cannot host widgets, so the same rows are repeated below as
-        # a grid that can. The table above stays exactly as it was for sorting,
-        # scanning and export; this one is for acting on a row.
-        st.markdown("##### The same rows, with buttons")
-        st.caption("Chart draws the pattern on the candles, Levels opens the full plan with its "
-                   "historical record, Sidebar loads the whole setup ready to backtest.")
-        show_n = st.slider("Rows to show here", 5, 60, 15, 5, key="pt_showrows")
-        render_hit_rows(view.head(int(show_n)), piv_n, horizon, "fired", header=True)
-        if len(view) > show_n:
-            st.caption(f"{len(view) - int(show_n)} more — raise the slider, or use *Act on a hit* "
-                       f"below to page through all {len(view)}.")
 
         if not view.empty:
             st.markdown("##### Act on a hit")
