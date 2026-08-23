@@ -2,7 +2,7 @@
 Swing Desk — backtesting, live trading and order routing in one file.
 
     pip install streamlit pandas numpy plotly yfinance
-    streamlit run swing_desk.py
+    streamlit run swingtrading100.py
 
 Optional, only if you switch on broker routing:  pip install dhanhq
 
@@ -3838,16 +3838,51 @@ def pivot_flags(df: pd.DataFrame, left: int = 3, right: int = 3):
     return is_h.fillna(False), is_l.fillna(False)
 
 
-def pivot_series(df: pd.DataFrame, left: int = 3, right: int = 3):
-    """Ordered pivot list as (bar_index, price, 'H'|'L', confirmed_index)."""
+def pivot_series(df: pd.DataFrame, left: int = 3, right: int = 3,
+                 min_move_atr: float = 2.0):
+    """Confirmed pivots, filtered into an alternating zigzag of real swings.
+
+    Raw fractal pivots are far too generous: on random data they produce a
+    "double bottom" out of two meaningless wiggles, and a trendline through any
+    three of them. Charting software does not work that way — it filters swings
+    by size first, which is what makes a pattern a pattern rather than noise.
+
+    So consecutive pivots must alternate high-low-high, and each leg must cover
+    at least `min_move_atr` times ATR. Same-type pivots collapse to the more
+    extreme one. Everything downstream inherits the filter, which is why one
+    change here cuts the false-positive rate across every structural detector.
+
+    Returns (bar_index, price, 'H'|'L', confirmed_index).
+    """
     is_h, is_l = pivot_flags(df, left, right)
-    out = []
+    raw = []
     hi, lo = df["High"].to_numpy(float), df["Low"].to_numpy(float)
     for i in np.flatnonzero(is_h.to_numpy()):
-        out.append((int(i), float(hi[i]), "H", int(i) + right))
+        raw.append((int(i), float(hi[i]), "H", int(i) + right))
     for i in np.flatnonzero(is_l.to_numpy()):
-        out.append((int(i), float(lo[i]), "L", int(i) + right))
-    out.sort(key=lambda t: t[0])
+        raw.append((int(i), float(lo[i]), "L", int(i) + right))
+    raw.sort(key=lambda t: t[0])
+    if not raw or min_move_atr <= 0:
+        return raw
+
+    atr = pine_atr(df, 14).to_numpy(float)
+    med = float(np.nanmedian(atr)) if np.isfinite(np.nanmedian(atr)) else 0.0
+    out: list[tuple] = []
+    for q in raw:
+        thresh = (atr[q[0]] if atr[q[0]] == atr[q[0]] else med) * min_move_atr
+        if not out:
+            out.append(q)
+            continue
+        last = out[-1]
+        if q[2] == last[2]:
+            # same type in a row: keep whichever is the true extreme
+            better = q[1] > last[1] if q[2] == "H" else q[1] < last[1]
+            if better:
+                out[-1] = q
+            continue
+        if abs(q[1] - last[1]) < thresh:
+            continue                      # leg too small to count as a swing
+        out.append(q)
     return out
 
 
@@ -4329,6 +4364,7 @@ def pat_bear_flag(df, cx):
 def _rounding(df, cx, bottom: bool, win: int = 40):
     """Quadratic fit over the window; curvature sign gives the saucer, and the
     break of the rim confirms it."""
+    min_amp = (pine_atr(df, 14) * cx.get("min_move_atr", 2.0)).to_numpy(float)
     out = _blank(df)
     n = len(df)
     if n < win + 5:
@@ -4353,6 +4389,10 @@ def _rounding(df, cx, bottom: bool, win: int = 40):
         if curve < 0.01:
             continue
         rim = max(seg[0], seg[-1]) if bottom else min(seg[0], seg[-1])
+        # the saucer has to be deep enough to be a saucer and not a ripple
+        depth = abs(rim - (seg.min() if bottom else seg.max()))
+        if depth < min_amp[i]:
+            continue
         if bottom and c[i] > rim and c[i - 1] <= rim:
             out.iloc[i] = True
         if (not bottom) and c[i] < rim and c[i - 1] >= rim:
@@ -4386,7 +4426,305 @@ def pat_cup_and_handle(df, cx):
     return out
 
 
+# ------------------------------------------------------- volatility contraction
+def pat_vcp(df, cx):
+    """Volatility contraction: successively shallower pullbacks, then a breakout.
+
+    Minervini's pattern. Each pullback must be meaningfully tighter than the one
+    before — the supply being absorbed — with volume drying up across the
+    contractions. The trigger is the close clearing the most recent pivot high.
+    Requires an uptrend behind it, because a contraction inside a downtrend is
+    just a pause before more selling.
+    """
+    out = _blank(df)
+    piv = cx["pivots"]
+    if len(piv) < 5:
+        return out
+    c = df["Close"].to_numpy(float)
+    v = df["Volume"].to_numpy(float)
+    ema = pine_ema(df["Close"], min(50, max(10, len(df) // 6))).to_numpy(float)
+    # consecutive high->low legs are the pullbacks
+    legs = []
+    for a in range(len(piv) - 1):
+        h, l = piv[a], piv[a + 1]
+        if h[2] == "H" and l[2] == "L" and h[1] > 0:
+            legs.append({"depth": (h[1] - l[1]) / h[1], "hi": h, "lo": l})
+    if len(legs) < 3:
+        return out
+    for a in range(len(legs) - 2):
+        t = legs[a:a + 3]
+        # each contraction at least a fifth tighter than the last
+        if not (t[1]["depth"] < t[0]["depth"] * 0.8 and t[2]["depth"] < t[1]["depth"] * 0.8):
+            continue
+        if t[2]["depth"] > 0.15 or t[0]["depth"] < 0.03:
+            continue                      # too loose to be a contraction, or too shallow overall
+        start = max(t[2]["lo"][3], t[2]["hi"][3])
+        if start >= len(df):
+            continue
+        # volume should dry up through the base
+        v1 = np.nanmean(v[t[0]["hi"][0]:t[0]["lo"][0] + 1]) if t[0]["lo"][0] > t[0]["hi"][0] else np.nan
+        v3 = np.nanmean(v[t[2]["hi"][0]:t[2]["lo"][0] + 1]) if t[2]["lo"][0] > t[2]["hi"][0] else np.nan
+        if v1 == v1 and v3 == v3 and v3 > v1:
+            continue
+        trig = t[2]["hi"][1]
+        for j in range(start, min(len(df), start + 30)):
+            if c[j] > trig and c[j - 1] <= trig and c[j] > ema[j]:
+                out.iloc[j] = True
+                break
+    return out
+
+
+def pat_pennant(df, cx):
+    """A sharp pole, then a small symmetrical triangle, then continuation."""
+    out = _blank(df)
+    piv = cx["pivots"]
+    if len(piv) < 4:
+        return out
+    c = df["Close"].to_numpy(float)
+    atr = pine_atr(df, 14).to_numpy(float)
+    for a in range(len(piv) - 3):
+        p1, p2, p3, p4 = piv[a:a + 4]
+        hs = [q for q in (p1, p2, p3, p4) if q[2] == "H"]
+        ls = [q for q in (p1, p2, p3, p4) if q[2] == "L"]
+        if len(hs) < 2 or len(ls) < 2:
+            continue
+        start = max(p4[3], p4[0] + 1)
+        if start >= len(df) or start < 12:
+            continue
+        pole = (c[p1[0]] - c[max(0, p1[0] - 10)]) / max(atr[p1[0]], 1e-9)
+        if abs(pole) < 4:
+            continue                      # no pole, no pennant
+        mh, bh = _line((hs[0][0], hs[0][1]), (hs[-1][0], hs[-1][1]))
+        ml, bl = _line((ls[0][0], ls[0][1]), (ls[-1][0], ls[-1][1]))
+        if not (mh < 0 and ml > 0):
+            continue                      # must converge from both sides
+        up = pole > 0
+        for j in range(start, min(len(df), start + 25)):
+            lvl = (mh * j + bh) if up else (ml * j + bl)
+            if (c[j] > lvl) if up else (c[j] < lvl):
+                out.iloc[j] = True
+                break
+    return out
+
+
+def _broadening(df, cx, top: bool):
+    """Megaphone: highs rising and lows falling — expanding, not contracting."""
+    out = _blank(df)
+    piv = cx["pivots"]
+    c = df["Close"].to_numpy(float)
+    highs = [q for q in piv if q[2] == "H"]
+    lows = [q for q in piv if q[2] == "L"]
+    for a in range(max(len(highs), len(lows))):
+        hs, ls = highs[a:a + 3], lows[a:a + 3]
+        if len(hs) < 2 or len(ls) < 2:
+            continue
+        mh, bh = _line((hs[0][0], hs[0][1]), (hs[-1][0], hs[-1][1]))
+        ml, bl = _line((ls[0][0], ls[0][1]), (ls[-1][0], ls[-1][1]))
+        # Fitting only the endpoints misreads three points whose middle is the
+        # extreme, so require the progression itself to widen: every high above
+        # the last, every low below it. That is the definition anyway.
+        rising = all(hs[k + 1][1] > hs[k][1] for k in range(len(hs) - 1))
+        falling = all(ls[k + 1][1] < ls[k][1] for k in range(len(ls) - 1))
+        if not (rising and falling and mh > 0 and ml < 0):
+            continue
+        start = max(hs[-1][3], ls[-1][3])
+        for j in range(start, min(len(df), start + 30)):
+            if top and c[j] < ml * j + bl:
+                out.iloc[j] = True
+                break
+            if (not top) and c[j] > mh * j + bh:
+                out.iloc[j] = True
+                break
+    return out
+
+
+def pat_broadening_top(df, cx):
+    return _broadening(df, cx, True)
+
+
+def pat_broadening_bottom(df, cx):
+    return _broadening(df, cx, False)
+
+
+def _diamond(df, cx, top: bool):
+    """Broadening into contracting — a megaphone followed by a triangle."""
+    out = _blank(df)
+    piv = cx["pivots"]
+    highs = [q for q in piv if q[2] == "H"]
+    lows = [q for q in piv if q[2] == "L"]
+    c = df["Close"].to_numpy(float)
+    if len(highs) < 4 or len(lows) < 4:
+        return out
+    for a in range(min(len(highs), len(lows)) - 3):
+        h1, h2, h3, h4 = highs[a:a + 4]
+        l1, l2, l3, l4 = lows[a:a + 4]
+        widening = h2[1] > h1[1] and l2[1] < l1[1]
+        narrowing = h4[1] < h3[1] and l4[1] > l3[1]
+        if not (widening and narrowing):
+            continue
+        start = max(h4[3], l4[3])
+        for j in range(start, min(len(df), start + 25)):
+            if top and c[j] < l4[1]:
+                out.iloc[j] = True
+                break
+            if (not top) and c[j] > h4[1]:
+                out.iloc[j] = True
+                break
+    return out
+
+
+def pat_diamond_top(df, cx):
+    return _diamond(df, cx, True)
+
+
+def pat_diamond_bottom(df, cx):
+    return _diamond(df, cx, False)
+
+
+def pat_three_drives(df, cx):
+    """Three successive higher highs (or lower lows) into exhaustion."""
+    out = _blank(df)
+    piv = cx["pivots"]
+    c = df["Close"].to_numpy(float)
+    for want, bearish in (("H", True), ("L", False)):
+        pts = [q for q in piv if q[2] == want]
+        for a in range(len(pts) - 2):
+            d1, d2, d3 = pts[a:a + 3]
+            if bearish and not (d2[1] > d1[1] and d3[1] > d2[1]):
+                continue
+            if (not bearish) and not (d2[1] < d1[1] and d3[1] < d2[1]):
+                continue
+            start = d3[3]
+            for j in range(start, min(len(df), start + 20)):
+                if bearish and c[j] < d3[1] * 0.99:
+                    out.iloc[j] = True
+                    break
+                if (not bearish) and c[j] > d3[1] * 1.01:
+                    out.iloc[j] = True
+                    break
+    return out
+
+
+def _island(df, cx, bullish: bool):
+    """A gap out, a few bars adrift, then a gap back — an island of trapped trades."""
+    out = _blank(df)
+    o, h, l = (df[x].to_numpy(float) for x in ("Open", "High", "Low"))
+    n = len(df)
+    for i in range(2, n):
+        for span in range(1, 6):
+            a = i - span - 1
+            if a < 1:
+                continue
+            if bullish:
+                gap_down = h[a + 1] < l[a]
+                gap_up = l[i] > h[i - 1]
+                island_low = min(l[a + 1:i]) if i > a + 1 else np.inf
+                if gap_down and gap_up and island_low < min(l[a], l[i]):
+                    out.iloc[i] = True
+                    break
+            else:
+                gap_up = l[a + 1] > h[a]
+                gap_down = h[i] < l[i - 1]
+                island_high = max(h[a + 1:i]) if i > a + 1 else -np.inf
+                if gap_up and gap_down and island_high > max(h[a], h[i]):
+                    out.iloc[i] = True
+                    break
+    return out
+
+
+def pat_island_bottom(df, cx):
+    return _island(df, cx, True)
+
+
+def pat_island_top(df, cx):
+    return _island(df, cx, False)
+
+
+# ------------------------------------------------------ more candlesticks
+def pat_bullish_harami(df, cx):
+    o, c, body, rng, up, lo = _body(df)
+    return ((c.shift(1) < o.shift(1)) & (c > o) & (o > c.shift(1)) & (c < o.shift(1))
+            & (body < body.shift(1) * 0.6)).fillna(False)
+
+
+def pat_bearish_harami(df, cx):
+    o, c, body, rng, up, lo = _body(df)
+    return ((c.shift(1) > o.shift(1)) & (c < o) & (o < c.shift(1)) & (c > o.shift(1))
+            & (body < body.shift(1) * 0.6)).fillna(False)
+
+
+def pat_inverted_hammer(df, cx):
+    o, c, body, rng, up, lo = _body(df)
+    return ((up >= 2 * body) & (lo <= 0.15 * rng) & (body / rng > 0.03) & cx["down"]).fillna(False)
+
+
+def pat_hanging_man(df, cx):
+    o, c, body, rng, up, lo = _body(df)
+    return ((lo >= 2 * body) & (up <= 0.15 * rng) & (body / rng > 0.03) & cx["up"]).fillna(False)
+
+
+def pat_three_inside_up(df, cx):
+    o, c, body, rng, up, lo = _body(df)
+    harami = pat_bullish_harami(df, cx)
+    return (harami.shift(1).fillna(False) & (c > o) & (c > c.shift(1))).fillna(False)
+
+
+def pat_three_inside_down(df, cx):
+    o, c, body, rng, up, lo = _body(df)
+    harami = pat_bearish_harami(df, cx)
+    return (harami.shift(1).fillna(False) & (c < o) & (c < c.shift(1))).fillna(False)
+
+
+def pat_rising_three(df, cx):
+    """A long green bar, three small bars held inside it, then a new high close."""
+    o, c, body, rng, up, lo = _body(df)
+    big = (c.shift(4) > o.shift(4)) & (body.shift(4) > body.rolling(20).mean())
+    inside = pd.Series(True, index=df.index)
+    for k in (1, 2, 3):
+        inside &= (df["High"].shift(k) < df["High"].shift(4)) & (df["Low"].shift(k) > df["Low"].shift(4))
+    return (big & inside & (c > o) & (c > c.shift(4))).fillna(False)
+
+
+def pat_falling_three(df, cx):
+    o, c, body, rng, up, lo = _body(df)
+    big = (c.shift(4) < o.shift(4)) & (body.shift(4) > body.rolling(20).mean())
+    inside = pd.Series(True, index=df.index)
+    for k in (1, 2, 3):
+        inside &= (df["High"].shift(k) < df["High"].shift(4)) & (df["Low"].shift(k) > df["Low"].shift(4))
+    return (big & inside & (c < o) & (c < c.shift(4))).fillna(False)
+
+
+def pat_fvg_bullish(df, cx):
+    """Fair value gap: bar 1's high below bar 3's low, leaving an unfilled window."""
+    return ((df["Low"] > df["High"].shift(2))
+            & (df["Close"].shift(1) > df["Open"].shift(1))).fillna(False)
+
+
+def pat_fvg_bearish(df, cx):
+    return ((df["High"] < df["Low"].shift(2))
+            & (df["Close"].shift(1) < df["Open"].shift(1))).fillna(False)
+
+
 PATTERNS: dict[str, dict] = {
+    "Volatility contraction (VCP)":  {"fn": pat_vcp, "dir": 1, "fam": "Continuation"},
+    "Pennant":                       {"fn": pat_pennant, "dir": 0, "fam": "Continuation"},
+    "Broadening top":                {"fn": pat_broadening_top, "dir": -1, "fam": "Reversal"},
+    "Broadening bottom":             {"fn": pat_broadening_bottom, "dir": 1, "fam": "Reversal"},
+    "Diamond top":                   {"fn": pat_diamond_top, "dir": -1, "fam": "Reversal"},
+    "Diamond bottom":                {"fn": pat_diamond_bottom, "dir": 1, "fam": "Reversal"},
+    "Three drives":                  {"fn": pat_three_drives, "dir": 0, "fam": "Reversal"},
+    "Island reversal bottom":        {"fn": pat_island_bottom, "dir": 1, "fam": "Reversal"},
+    "Island reversal top":           {"fn": pat_island_top, "dir": -1, "fam": "Reversal"},
+    "Bullish harami":                {"fn": pat_bullish_harami, "dir": 1, "fam": "Candlestick"},
+    "Bearish harami":                {"fn": pat_bearish_harami, "dir": -1, "fam": "Candlestick"},
+    "Inverted hammer":               {"fn": pat_inverted_hammer, "dir": 1, "fam": "Candlestick"},
+    "Hanging man":                   {"fn": pat_hanging_man, "dir": -1, "fam": "Candlestick"},
+    "Three inside up":               {"fn": pat_three_inside_up, "dir": 1, "fam": "Candlestick"},
+    "Three inside down":             {"fn": pat_three_inside_down, "dir": -1, "fam": "Candlestick"},
+    "Rising three methods":          {"fn": pat_rising_three, "dir": 1, "fam": "Candlestick"},
+    "Falling three methods":         {"fn": pat_falling_three, "dir": -1, "fam": "Candlestick"},
+    "Fair value gap (bullish)":      {"fn": pat_fvg_bullish, "dir": 1, "fam": "Level"},
+    "Fair value gap (bearish)":      {"fn": pat_fvg_bearish, "dir": -1, "fam": "Level"},
     # name: detector, direction (+1 bullish, -1 bearish, 0 neutral), family
     "Trendline breakout":            {"fn": pat_trendline_breakout, "dir": 1, "fam": "Trendline"},
     "Trendline breakout + retest":   {"fn": pat_trendline_breakout_retest, "dir": 1, "fam": "Trendline"},
@@ -4437,17 +4775,20 @@ PATTERNS: dict[str, dict] = {
 PATTERN_FAMILIES = sorted({v["fam"] for v in PATTERNS.values()})
 
 
-def pattern_context(df: pd.DataFrame, left: int = 3, right: int = 3) -> dict:
-    """Shared inputs so 45 detectors do not each recompute pivots and trend."""
+def pattern_context(df: pd.DataFrame, left: int = 3, right: int = 3,
+                    min_move_atr: float = 2.0) -> dict:
+    """Shared inputs so the detectors do not each recompute pivots and trend."""
     ema50 = pine_ema(df["Close"], min(50, max(5, len(df) // 4)))
-    return {"pivots": pivot_series(df, left, right),
+    return {"pivots": pivot_series(df, left, right, min_move_atr),
+            "min_move_atr": min_move_atr,
             "up": (df["Close"] > ema50).fillna(False),
             "down": (df["Close"] < ema50).fillna(False)}
 
 
-def detect_patterns(df: pd.DataFrame, names: list[str], left: int = 3, right: int = 3):
+def detect_patterns(df: pd.DataFrame, names: list[str], left: int = 3, right: int = 3,
+                    min_move_atr: float = 2.0):
     """Returns {name: boolean Series}. Failures are skipped, never faked."""
-    cx = pattern_context(df, left, right)
+    cx = pattern_context(df, left, right, min_move_atr)
     hits = {}
     for name in names:
         try:
@@ -4845,7 +5186,10 @@ def render_hit_rows(rows: pd.DataFrame, piv_n: int, horizon: int, key_prefix: st
         cols[0].markdown(
             f"**{row['Symbol']}** · {row['Timeframe']} · {row['Pattern']}  \n"
             f"<span style='opacity:.65;font-size:.82rem'>"
-            f"{pd.Timestamp(row['Fired at']):%d-%b %H:%M} · {row['Bars ago']} bars ago · "
+            f"formed {pd.Timestamp(row['Fired at']):%d-%b %H:%M} · {row['Bars ago']} bars ago · "
+            f"moved {row.get('Move since %', 0):+.2f}% since "
+            f"(best {row.get('Best move since %', 0):+.2f}%, worst "
+            f"{row.get('Worst move since %', 0):+.2f}%) · "
             f"{row['Bias']} · past {row['Past occurrences']} hits, win {row['Past win %']}%, "
             f"edge {edge}%</span>", unsafe_allow_html=True)
         entry, stop, tgt = row.get("Entry"), row.get("Stop"), row.get("Target")
@@ -5047,6 +5391,11 @@ def render_patterns(base_cfg: dict):
     min_occ = m3.number_input("Minimum past occurrences", 1, 1000, 15, key="pt_occ")
     piv_n = m4.number_input("Pivot sensitivity (bars each side)", 1, 20, 3, key="pt_piv",
                             help="Smaller finds more, smaller patterns and more noise.")
+    min_swing = st.slider("Minimum swing size, in ATR", 0.0, 5.0, 2.0, 0.5, key="pt_minswing",
+                          help="Legs smaller than this are ignored when building patterns. This "
+                               "is the single biggest lever on reliability: at 0 a pair of "
+                               "meaningless wiggles counts as a double bottom. Raising it finds "
+                               "fewer, larger, more meaningful patterns.")
 
     st.markdown("##### Where to put the stop and target")
     st.caption("These settings decide the levels quoted against every hit below, so you can copy "
@@ -5072,12 +5421,38 @@ def render_patterns(base_cfg: dict):
 
     if st.button("Run pattern scan", type="primary", width="stretch"):
         _execute_pattern_scan(symbols, tfs, chosen, int(recent), int(horizon), int(min_occ),
-                              int(piv_n), float(rr_default), float(atr_default))
+                              int(piv_n), float(rr_default), float(atr_default),
+                              float(min_swing))
     _render_pattern_results()
 
 
+def _move_since(df: pd.DataFrame, i: int, direction: int) -> float:
+    """How far price has travelled since the pattern completed, signed so that a
+    positive number always means the pattern was right so far."""
+    d = direction if direction != 0 else 1
+    then = float(df["Close"].iloc[i])
+    now = float(df["Close"].iloc[-1])
+    return (now - then) / then * 100.0 * d if then else 0.0
+
+
+def _excursion_since(df: pd.DataFrame, i: int, direction: int, best: bool) -> float:
+    """The furthest the trade would have gone in its favour, or against it,
+    between the pattern completing and now — the move you could have caught,
+    and the heat you would have taken to hold it."""
+    d = direction if direction != 0 else 1
+    then = float(df["Close"].iloc[i])
+    seg = df.iloc[i + 1:]
+    if seg.empty or not then:
+        return 0.0
+    if d > 0:
+        val = float(seg["High"].max()) if best else float(seg["Low"].min())
+    else:
+        val = float(seg["Low"].min()) if best else float(seg["High"].max())
+    return (val - then) / then * 100.0 * d
+
+
 def _execute_pattern_scan(symbols, tfs, chosen, recent, horizon, min_occ, piv_n,
-                          rr_default=2.0, atr_default=1.5):
+                          rr_default=2.0, atr_default=1.5, min_swing=2.0):
     ss = st.session_state
     hits_rows, edge_rows, skipped = [], [], []
     bar = st.progress(0.0)
@@ -5107,7 +5482,7 @@ def _execute_pattern_scan(symbols, tfs, chosen, recent, horizon, min_occ, piv_n,
                 skipped.append((sym, tf, f"only {len(df)} bars"))
                 done += 1
                 continue
-            hits = detect_patterns(df, chosen, piv_n, piv_n)
+            hits = detect_patterns(df, chosen, piv_n, piv_n, min_swing)
             last_ts = df.index[-1]
             for name in chosen:
                 h = hits[name]
@@ -5131,9 +5506,12 @@ def _execute_pattern_scan(symbols, tfs, chosen, recent, horizon, min_occ, piv_n,
                         "Symbol": sym, "Timeframe": tf, "Pattern": name,
                         "Family": PATTERNS[name]["fam"],
                         "Bias": {1: "bullish", -1: "bearish", 0: "either"}[d],
-                        "Fired at": ts, "Bars ago": int(len(df) - 1 - i),
+                        "Formed on": ts, "Fired at": ts, "Bars ago": int(len(df) - 1 - i),
                         "Price then": round(float(df["Close"].iloc[int(i)]), 2),
                         "Price now": round(float(df["Close"].iloc[-1]), 2),
+                        "Move since %": round(_move_since(df, int(i), d), 2),
+                        "Best move since %": round(_excursion_since(df, int(i), d, True), 2),
+                        "Worst move since %": round(_excursion_since(df, int(i), d, False), 2),
                         "Past occurrences": edge.get("Occurrences", 0),
                         "Past win %": edge.get("Win rate %"),
                         "Past avg move %": edge.get("Avg move %"),
@@ -5207,7 +5585,8 @@ def _render_pattern_results():
         # other column is locked read-only, so the table still behaves like a
         # table — sortable, scrollable, exportable.
         ACTIONS = ["Chart", "Levels", "Sidebar"]
-        lead = [c for c in ("Symbol", "Timeframe", "Pattern", "Bias", "Fired at", "Bars ago",
+        lead = [c for c in ("Symbol", "Timeframe", "Pattern", "Bias", "Formed on", "Bars ago",
+                            "Move since %", "Best move since %", "Worst move since %",
                             "Entry", "Stop", "Target") if c in view.columns]
         rest = [c for c in view.columns if c not in lead and c not in ACTIONS]
         grid = view[lead + rest].copy().reset_index(drop=True)
@@ -5396,10 +5775,25 @@ def idea_levels(cfg: dict, df: pd.DataFrame, bar: int, side: int) -> dict | None
     last = float(df["Close"].iloc[-1])
     risk = abs(entry - pos.sl)
     reward = abs(pos.target - entry) if not np.isnan(pos.target) else np.nan
+
+    # A signal is computed on one bar's close and assumes you enter at the next
+    # bar's open. If price gapped away overnight, that assumption is gone: the
+    # setup was built around a level price no longer trades near, and the same
+    # strategy will often print the opposite signal once the gap is in the data.
+    # A gap does not have to reach the stop to have destroyed the premise, so it
+    # is tracked separately.
+    signal_close = float(df["Close"].iloc[max(bar, 0)])
+    atr_at = float(pine_atr(df, 14).iloc[max(bar, 0)])
+    gap = entry - signal_close
+    gap_atr = abs(gap) / atr_at if atr_at == atr_at and atr_at > 0 else 0.0
+    against = (gap * side) < 0            # gapped the wrong way for this trade
+    stale = gap_atr > 1.0
     return {"entry": entry, "stop": float(pos.sl), "target": float(pos.target),
             "risk": risk, "reward": reward,
             "rr": (reward / risk) if risk > 0 and reward == reward else np.nan,
             "last": last, "resolved": hit_sl or hit_tg,
+            "gap_atr": round(gap_atr, 2), "gap_against": bool(against and stale),
+            "premise_broken": bool(stale),
             "moved_pct": (last - entry) / entry * 100 * side}
 
 
@@ -5489,6 +5883,9 @@ def scan_trade_ideas(symbols: list[str], horizon: str, instrument: str, recent: 
             tally["listed"] += 1
             ideas.append({
                 "Symbol": sym, "Setup": setup["name"], "Timeframe": tf, "Direction": direction,
+                "Gap since signal (ATR)": lv.get("gap_atr", 0.0),
+                "Premise": ("price gapped away — treat as void" if lv.get("premise_broken")
+                            else "intact"),
                 "Signal bar": df.index[bar], "Bars ago": len(df) - 1 - bar,
                 "Entry": round(lv["entry"], 2), "Last price": round(lv["last"], 2),
                 "Stop": round(lv["stop"], 2), "Target": round(lv["target"], 2),
@@ -6073,7 +6470,8 @@ def scan_verified_live(symbols, strategies, tf_pairs, sl_grid, tg_grid, min_trad
     rows, configs, skipped = [], [], []
     tally = {"tested": 0, "too few trades": 0, "not profitable after costs": 0,
              "reward below risk": 0, "not firing now": 0, "already hit stop or target": 0,
-             "failed on unseen bars": 0, "no better than random entries": 0, "listed": 0}
+             "price gapped away from the setup": 0, "failed on unseen bars": 0,
+             "no better than random entries": 0, "listed": 0}
     done, stop_now = 0, False
     for sym in symbols:
         if stop_now:
@@ -6140,6 +6538,9 @@ def scan_verified_live(symbols, strategies, tf_pairs, sl_grid, tg_grid, min_trad
                         lv = idea_levels(cfg, df, bar, side)
                         if lv is None or lv["resolved"]:
                             tally["already hit stop or target"] += 1
+                            continue
+                        if lv.get("premise_broken"):
+                            tally["price gapped away from the setup"] += 1
                             continue
                         # expensive checks, only on something that is actually live
                         cut = int(len(df) * (1 - oos_frac))
@@ -6269,7 +6670,8 @@ def _render_verified_results():
     if not res["rows"]:
         st.error("**Nothing is both verified and live right now.**")
         order = ["too few trades", "not profitable after costs", "reward below risk",
-                 "not firing now", "already hit stop or target", "failed on unseen bars",
+                 "not firing now", "already hit stop or target",
+                 "price gapped away from the setup", "failed on unseen bars",
                  "no better than random entries"]
         detail = pd.DataFrame([{"Fell out at": k, "Count": t.get(k, 0)} for k in order
                                if t.get(k, 0)])
@@ -6326,7 +6728,8 @@ def _render_verified_results():
                        "verified_live.csv", "text/csv")
     with st.expander(f"Where the other {t['tested'] - len(df_rows):,} tests dropped out"):
         order = ["too few trades", "not profitable after costs", "reward below risk",
-                 "not firing now", "already hit stop or target", "failed on unseen bars",
+                 "not firing now", "already hit stop or target",
+                 "price gapped away from the setup", "failed on unseen bars",
                  "no better than random entries"]
         st.dataframe(pd.DataFrame([{"Fell out at": k, "Count": t.get(k, 0)} for k in order
                                    if t.get(k, 0)]), width="stretch", hide_index=True)
@@ -7117,6 +7520,32 @@ def main():
                        initial_sidebar_state="expanded")
     st.markdown(CSS, unsafe_allow_html=True)
     st.markdown(f"## {APP_TITLE}")
+    with st.expander("Which tab should I use? (read this once)", expanded=False):
+        st.markdown(
+            "**If you want one answer, use `Screener · verified live` and ignore the rest.** "
+            "It is the only tab that applies every check before showing you anything: profitable "
+            "after costs, still profitable on bars it was never tuned on, risking less than it "
+            "stands to make, and firing right now with the trade still available. Everything it "
+            "lists has already survived what the other tabs only measure.\n\n"
+            "The others exist for a different job — exploring, not deciding:\n\n"
+            "| Tab | What it is for | Trust it? |\n|---|---|---|\n"
+            "| **Verified live** | The shortlist to actually trade | Yes — start here |\n"
+            "| Backtest | Judging one setup properly, with the random-entry test | Yes — the final word |\n"
+            "| What to trade | Fixed sensible setups, lighter checks | Only after backtesting it |\n"
+            "| Accuracy | Exploring which win rates are reachable | No — accuracy alone misleads |\n"
+            "| Strategies | Finding candidate settings across a big grid | No — it finds luck too |\n"
+            "| Patterns | Spotting shapes; measures each against a baseline | Only where the edge beats the baseline |\n"
+            "| Levels | Containment statistics and edge hypotheses | Statistics, not trades |\n\n"
+            "**The one rule that matters:** no screener here can tell you something is "
+            "profitable. Screeners narrow thousands of possibilities to a few. The Backtest tab "
+            "decides, and only after *Is this actually profitable?* passes. Anything else is "
+            "browsing.\n\n"
+            "**A signal that flips overnight is not a contradiction.** A signal is calculated on "
+            "one bar's close and assumes you enter at the next open. If price gaps away, that "
+            "assumption is void and the same strategy will often print the opposite signal once "
+            "the gap is in the data. Trust the newer one, and note that setups whose entry has "
+            "gapped more than 1 x ATR from the signal are now dropped automatically rather than "
+            "shown to you.")
     st.markdown('<div class="rule"></div>', unsafe_allow_html=True)
 
     applied = consume_pending_sidebar()
