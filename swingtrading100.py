@@ -4362,9 +4362,9 @@ def pat_bear_flag(df, cx):
 
 
 def _rounding(df, cx, bottom: bool, win: int = 40):
-    min_amp = (pine_atr(df, 14) * cx.get("min_move_atr", 2.0)).to_numpy(float)
     """Quadratic fit over the window; curvature sign gives the saucer, and the
     break of the rim confirms it."""
+    min_amp = (pine_atr(df, 14) * cx.get("min_move_atr", 2.0)).to_numpy(float)
     out = _blank(df)
     n = len(df)
     if n < win + 5:
@@ -5775,10 +5775,25 @@ def idea_levels(cfg: dict, df: pd.DataFrame, bar: int, side: int) -> dict | None
     last = float(df["Close"].iloc[-1])
     risk = abs(entry - pos.sl)
     reward = abs(pos.target - entry) if not np.isnan(pos.target) else np.nan
+
+    # A signal is computed on one bar's close and assumes you enter at the next
+    # bar's open. If price gapped away overnight, that assumption is gone: the
+    # setup was built around a level price no longer trades near, and the same
+    # strategy will often print the opposite signal once the gap is in the data.
+    # A gap does not have to reach the stop to have destroyed the premise, so it
+    # is tracked separately.
+    signal_close = float(df["Close"].iloc[max(bar, 0)])
+    atr_at = float(pine_atr(df, 14).iloc[max(bar, 0)])
+    gap = entry - signal_close
+    gap_atr = abs(gap) / atr_at if atr_at == atr_at and atr_at > 0 else 0.0
+    against = (gap * side) < 0            # gapped the wrong way for this trade
+    stale = gap_atr > 1.0
     return {"entry": entry, "stop": float(pos.sl), "target": float(pos.target),
             "risk": risk, "reward": reward,
             "rr": (reward / risk) if risk > 0 and reward == reward else np.nan,
             "last": last, "resolved": hit_sl or hit_tg,
+            "gap_atr": round(gap_atr, 2), "gap_against": bool(against and stale),
+            "premise_broken": bool(stale),
             "moved_pct": (last - entry) / entry * 100 * side}
 
 
@@ -5868,6 +5883,9 @@ def scan_trade_ideas(symbols: list[str], horizon: str, instrument: str, recent: 
             tally["listed"] += 1
             ideas.append({
                 "Symbol": sym, "Setup": setup["name"], "Timeframe": tf, "Direction": direction,
+                "Gap since signal (ATR)": lv.get("gap_atr", 0.0),
+                "Premise": ("price gapped away — treat as void" if lv.get("premise_broken")
+                            else "intact"),
                 "Signal bar": df.index[bar], "Bars ago": len(df) - 1 - bar,
                 "Entry": round(lv["entry"], 2), "Last price": round(lv["last"], 2),
                 "Stop": round(lv["stop"], 2), "Target": round(lv["target"], 2),
@@ -6452,7 +6470,8 @@ def scan_verified_live(symbols, strategies, tf_pairs, sl_grid, tg_grid, min_trad
     rows, configs, skipped = [], [], []
     tally = {"tested": 0, "too few trades": 0, "not profitable after costs": 0,
              "reward below risk": 0, "not firing now": 0, "already hit stop or target": 0,
-             "failed on unseen bars": 0, "no better than random entries": 0, "listed": 0}
+             "price gapped away from the setup": 0, "failed on unseen bars": 0,
+             "no better than random entries": 0, "listed": 0}
     done, stop_now = 0, False
     for sym in symbols:
         if stop_now:
@@ -6519,6 +6538,9 @@ def scan_verified_live(symbols, strategies, tf_pairs, sl_grid, tg_grid, min_trad
                         lv = idea_levels(cfg, df, bar, side)
                         if lv is None or lv["resolved"]:
                             tally["already hit stop or target"] += 1
+                            continue
+                        if lv.get("premise_broken"):
+                            tally["price gapped away from the setup"] += 1
                             continue
                         # expensive checks, only on something that is actually live
                         cut = int(len(df) * (1 - oos_frac))
@@ -6648,7 +6670,8 @@ def _render_verified_results():
     if not res["rows"]:
         st.error("**Nothing is both verified and live right now.**")
         order = ["too few trades", "not profitable after costs", "reward below risk",
-                 "not firing now", "already hit stop or target", "failed on unseen bars",
+                 "not firing now", "already hit stop or target",
+                 "price gapped away from the setup", "failed on unseen bars",
                  "no better than random entries"]
         detail = pd.DataFrame([{"Fell out at": k, "Count": t.get(k, 0)} for k in order
                                if t.get(k, 0)])
@@ -6705,7 +6728,8 @@ def _render_verified_results():
                        "verified_live.csv", "text/csv")
     with st.expander(f"Where the other {t['tested'] - len(df_rows):,} tests dropped out"):
         order = ["too few trades", "not profitable after costs", "reward below risk",
-                 "not firing now", "already hit stop or target", "failed on unseen bars",
+                 "not firing now", "already hit stop or target",
+                 "price gapped away from the setup", "failed on unseen bars",
                  "no better than random entries"]
         st.dataframe(pd.DataFrame([{"Fell out at": k, "Count": t.get(k, 0)} for k in order
                                    if t.get(k, 0)]), width="stretch", hide_index=True)
@@ -7496,6 +7520,32 @@ def main():
                        initial_sidebar_state="expanded")
     st.markdown(CSS, unsafe_allow_html=True)
     st.markdown(f"## {APP_TITLE}")
+    with st.expander("Which tab should I use? (read this once)", expanded=False):
+        st.markdown(
+            "**If you want one answer, use `Screener · verified live` and ignore the rest.** "
+            "It is the only tab that applies every check before showing you anything: profitable "
+            "after costs, still profitable on bars it was never tuned on, risking less than it "
+            "stands to make, and firing right now with the trade still available. Everything it "
+            "lists has already survived what the other tabs only measure.\n\n"
+            "The others exist for a different job — exploring, not deciding:\n\n"
+            "| Tab | What it is for | Trust it? |\n|---|---|---|\n"
+            "| **Verified live** | The shortlist to actually trade | Yes — start here |\n"
+            "| Backtest | Judging one setup properly, with the random-entry test | Yes — the final word |\n"
+            "| What to trade | Fixed sensible setups, lighter checks | Only after backtesting it |\n"
+            "| Accuracy | Exploring which win rates are reachable | No — accuracy alone misleads |\n"
+            "| Strategies | Finding candidate settings across a big grid | No — it finds luck too |\n"
+            "| Patterns | Spotting shapes; measures each against a baseline | Only where the edge beats the baseline |\n"
+            "| Levels | Containment statistics and edge hypotheses | Statistics, not trades |\n\n"
+            "**The one rule that matters:** no screener here can tell you something is "
+            "profitable. Screeners narrow thousands of possibilities to a few. The Backtest tab "
+            "decides, and only after *Is this actually profitable?* passes. Anything else is "
+            "browsing.\n\n"
+            "**A signal that flips overnight is not a contradiction.** A signal is calculated on "
+            "one bar's close and assumes you enter at the next open. If price gaps away, that "
+            "assumption is void and the same strategy will often print the opposite signal once "
+            "the gap is in the data. Trust the newer one, and note that setups whose entry has "
+            "gapped more than 1 x ATR from the signal are now dropped automatically rather than "
+            "shown to you.")
     st.markdown('<div class="rule"></div>', unsafe_allow_html=True)
 
     applied = consume_pending_sidebar()
