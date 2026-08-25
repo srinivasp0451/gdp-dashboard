@@ -189,298 +189,164 @@ def standardise_upload(raw: pd.DataFrame, tz: str) -> pd.DataFrame:
     return out[["Date", "Open", "High", "Low", "Close", "Volume"]].sort_values("Date").reset_index(drop=True)
 
 
-# ====================== Causal pivots & pattern engine ====================
+# ======================= Indicators (all causal) ==========================
 
-@dataclass
-class Pattern:
-    name: str
-    direction: int          # +1 bullish, -1 bearish
-    known_at: int           # first bar index at which this pattern is knowable
-    trigger: float | None   # neckline / breakout level; None = no confirmation needed
-    weight: float
+def wilder(s: pd.Series, n: int) -> pd.Series:
+    return s.ewm(alpha=1 / n, adjust=False).mean()
 
 
-WEIGHTS = {
-    "double_top": -2.0, "double_bottom": 2.0,
-    "triple_top": -2.5, "triple_bottom": 2.5,
-    "head_and_shoulders": -3.0, "inverse_head_and_shoulders": 3.0,
-    "triangle_break_up": 1.8, "triangle_break_down": -1.8,
-    "bullish_engulfing": 1.5, "bearish_engulfing": -1.5,
-    "flag_breakout": 1.3, "flag_breakdown": -1.3,
-    "breakout": 1.5, "breakdown": -1.5,
-    "support_zone": 1.0, "resistance_zone": -1.0,
-    "lower_wick_trap": 1.2, "upper_wick_trap": -1.2,
-}
+def add_indicators(df: pd.DataFrame, p: dict) -> pd.DataFrame:
+    """Every indicator here reads only bars <= i. No centring, no negative shift.
 
-
-def find_pivots(high: np.ndarray, low: np.ndarray, span: int):
-    """Fractal pivots. Returns (pivot_highs, pivot_lows) as lists of
-    (bar_index, price, known_at) where known_at = bar_index + span.
-
-    known_at is the whole point: a pivot at bar i needs bars i+1..i+span to
-    exist before anyone can call it a pivot. Registering it at bar i, as the
-    original code did, hands the strategy the next `span` bars for free.
+    min_periods is set to the FULL window, unlike the original which used
+    min_periods=1 everywhere. With min_periods=1 a "120-period moving average"
+    equals the first close on bar 0, so the first ~120 bars produce confident
+    looking signals computed from almost no data.
     """
-    ph, pl = [], []
-    n = len(high)
-    for i in range(span, n - span):
-        if high[i] > high[i - span:i].max() and high[i] > high[i + 1:i + 1 + span].max():
-            ph.append((i, high[i], i + span))
-        if low[i] < low[i - span:i].min() and low[i] < low[i + 1:i + 1 + span].min():
-            pl.append((i, low[i], i + span))
-    return ph, pl
+    d = df.copy()
+    c, h, l = d["Close"], d["High"], d["Low"]
+    v = pd.to_numeric(d.get("Volume"), errors="coerce")
+
+    d["ema_fast"] = c.ewm(span=p["ema_fast"], adjust=False, min_periods=p["ema_fast"]).mean()
+    d["ema_slow"] = c.ewm(span=p["ema_slow"], adjust=False, min_periods=p["ema_slow"]).mean()
+    d["ma_short"] = c.rolling(p["short_ma"], min_periods=p["short_ma"]).mean()
+    d["ma_long"] = c.rolling(p["long_ma"], min_periods=p["long_ma"]).mean()
+
+    delta = c.diff()
+    ru = wilder(delta.clip(lower=0), p["rsi_period"])
+    rd = wilder(-delta.clip(upper=0), p["rsi_period"])
+    d["rsi"] = 100 - 100 / (1 + ru / rd.replace(0, np.nan))
+    d["rsi"] = d["rsi"].fillna(50.0)          # assign back; .fillna(inplace=True)
+                                              # on a column is a no-op under
+                                              # copy-on-write and silently did nothing
+    macd = c.ewm(span=12, adjust=False, min_periods=12).mean() - \
+        c.ewm(span=26, adjust=False, min_periods=26).mean()
+    d["macd_hist"] = macd - macd.ewm(span=9, adjust=False, min_periods=9).mean()
+    d["macd_hist_prev"] = d["macd_hist"].shift(1)
+
+    tr = pd.concat([h - l, (h - c.shift()).abs(), (l - c.shift()).abs()], axis=1).max(axis=1)
+    d["atr"] = wilder(tr, p["atr_period"])
+    d["atr_pct"] = d["atr"] / c * 100
+
+    # Proper Wilder ADX. The original zeroed negatives but never suppressed the
+    # smaller of the two directional moves, so +DM and -DM both fired on the
+    # same bar and ADX was meaningless.
+    up, dn = h.diff(), -l.diff()
+    plus_dm = np.where((up > dn) & (up > 0), up, 0.0)
+    minus_dm = np.where((dn > up) & (dn > 0), dn, 0.0)
+    atr14 = wilder(tr, 14)
+    pdi = 100 * wilder(pd.Series(plus_dm, index=d.index), 14) / atr14.replace(0, np.nan)
+    mdi = 100 * wilder(pd.Series(minus_dm, index=d.index), 14) / atr14.replace(0, np.nan)
+    dx = ((pdi - mdi).abs() / (pdi + mdi).replace(0, np.nan)) * 100
+    d["adx"] = wilder(dx.fillna(0), 14)
+
+    mid = c.rolling(p["bb_period"], min_periods=p["bb_period"]).mean()
+    sd = c.rolling(p["bb_period"], min_periods=p["bb_period"]).std()
+    d["bb_upper"] = mid + p["bb_k"] * sd
+    d["bb_lower"] = mid - p["bb_k"] * sd
+
+    d["vol_avg"] = v.rolling(p["vol_period"], min_periods=p["vol_period"]).mean()
+    d["volume_num"] = v
+    return d
 
 
-def cluster_levels(prices, tol):
-    if not prices:
-        return []
-    prices = sorted(prices)
-    clusters, cur = [], [prices[0]]
-    for p in prices[1:]:
-        m = float(np.mean(cur))
-        if abs(p - m) <= tol * m:
-            cur.append(p)
-        else:
-            clusters.append(float(np.mean(cur)))
-            cur = [p]
-    clusters.append(float(np.mean(cur)))
-    return clusters
+# ========================== Confluence engine =============================
 
-
-def build_patterns(ph, pl, high, low, close, p) -> list[Pattern]:
-    """All patterns carry known_at = the last constituent pivot's confirmation
-    bar, and a trigger level that price must break before the pattern scores."""
-    pats: list[Pattern] = []
-    tol = p["pattern_tol"]
-    gap = p["min_bars_between"]
-
-    # --- double top / bottom (trigger = the neckline between the two pivots) ---
-    for i in range(len(ph) - 1):
-        (i1, p1, _), (i2, p2, k2) = ph[i], ph[i + 1]
-        if i2 - i1 >= gap and abs(p1 - p2) <= tol * (p1 + p2) / 2:
-            pats.append(Pattern("double_top", -1, k2, float(low[i1:i2 + 1].min()),
-                                WEIGHTS["double_top"]))
-    for i in range(len(pl) - 1):
-        (i1, p1, _), (i2, p2, k2) = pl[i], pl[i + 1]
-        if i2 - i1 >= gap and abs(p1 - p2) <= tol * (p1 + p2) / 2:
-            pats.append(Pattern("double_bottom", 1, k2, float(high[i1:i2 + 1].max()),
-                                WEIGHTS["double_bottom"]))
-
-    # --- triple top / bottom ---
-    for i in range(len(ph) - 2):
-        (i1, a, _), (i2, b, _), (i3, c, k3) = ph[i], ph[i + 1], ph[i + 2]
-        if i2 - i1 >= gap and i3 - i2 >= gap and \
-           abs(a - b) <= tol * (a + b) / 2 and abs(b - c) <= tol * (b + c) / 2:
-            pats.append(Pattern("triple_top", -1, k3, float(low[i1:i3 + 1].min()),
-                                WEIGHTS["triple_top"]))
-    for i in range(len(pl) - 2):
-        (i1, a, _), (i2, b, _), (i3, c, k3) = pl[i], pl[i + 1], pl[i + 2]
-        if i2 - i1 >= gap and i3 - i2 >= gap and \
-           abs(a - b) <= tol * (a + b) / 2 and abs(b - c) <= tol * (b + c) / 2:
-            pats.append(Pattern("triple_bottom", 1, k3, float(high[i1:i3 + 1].max()),
-                                WEIGHTS["triple_bottom"]))
-
-    # --- head & shoulders (neckline = extreme between the shoulders) ---
-    hs_tol = p["hs_tol"]
-    for i in range(len(ph) - 2):
-        (i1, a, _), (i2, b, _), (i3, c, k3) = ph[i], ph[i + 1], ph[i + 2]
-        if i2 - i1 >= gap and i3 - i2 >= gap:
-            sh = (a + c) / 2
-            if b > sh and abs(a - c) <= hs_tol * sh:
-                pats.append(Pattern("head_and_shoulders", -1, k3, float(low[i1:i3 + 1].min()),
-                                    WEIGHTS["head_and_shoulders"]))
-    for i in range(len(pl) - 2):
-        (i1, a, _), (i2, b, _), (i3, c, k3) = pl[i], pl[i + 1], pl[i + 2]
-        if i2 - i1 >= gap and i3 - i2 >= gap:
-            sh = (a + c) / 2
-            if b < sh and abs(a - c) <= hs_tol * sh:
-                pats.append(Pattern("inverse_head_and_shoulders", 1, k3, float(high[i1:i3 + 1].max()),
-                                    WEIGHTS["inverse_head_and_shoulders"]))
-
-    # --- symmetrical triangle: converging pivots, direction decided by the break ---
-    merged = sorted([(i, v, k, "H") for i, v, k in ph] + [(i, v, k, "L") for i, v, k in pl])
-    ttol = p["triangle_tol"]
-    for w in range(len(merged) - 5):
-        win = merged[w:w + 6]
-        hs = [v for _, v, _, t in win if t == "H"]
-        ls = [v for _, v, _, t in win if t == "L"]
-        if len(hs) >= 3 and len(ls) >= 3:
-            converging = (hs[-1] < hs[0] * (1 - ttol)) and (ls[-1] > ls[0] * (1 + ttol))
-            if converging:
-                known = max(k for _, _, k, _ in win)
-                pats.append(Pattern("triangle_break_up", 1, known, float(max(hs)),
-                                    WEIGHTS["triangle_break_up"]))
-                pats.append(Pattern("triangle_break_down", -1, known, float(min(ls)),
-                                    WEIGHTS["triangle_break_down"]))
-    return pats
-
-
-def candle_patterns(o, h, l, c, p) -> list[Pattern]:
-    """Bar-level patterns. These are already causal: they only read bars <= i."""
-    pats = []
-    n = len(c)
-    for i in range(1, n):
-        if c[i - 1] < o[i - 1] and c[i] > o[i] and (c[i] - o[i]) > (o[i - 1] - c[i - 1]):
-            pats.append(Pattern("bullish_engulfing", 1, i, None, WEIGHTS["bullish_engulfing"]))
-        if c[i - 1] > o[i - 1] and c[i] < o[i] and (o[i] - c[i]) > (c[i - 1] - o[i - 1]):
-            pats.append(Pattern("bearish_engulfing", -1, i, None, WEIGHTS["bearish_engulfing"]))
-
-    tl, fl = p["flag_trend_lookback"], p["flag_lookback"]
-    for i in range(tl + fl, n):
-        prev = c[i - tl - fl:i - fl]
-        flag = c[i - fl:i]
-        pr, fr = prev.max() - prev.min(), flag.max() - flag.min()
-        if pr > 0 and fr < pr * 0.5:
-            if c[i] > flag.max():
-                pats.append(Pattern("flag_breakout", 1, i, None, WEIGHTS["flag_breakout"]))
-            elif c[i] < flag.min():
-                pats.append(Pattern("flag_breakdown", -1, i, None, WEIGHTS["flag_breakdown"]))
-    return pats
-
-
-# ============================ Signal generation ===========================
+ALL_CONFLUENCES = ["ma_cross", "ema_trend", "macd_hist", "bb_breakout",
+                   "rsi_zone", "adx_trend", "vol_spike", "atr_ok"]
 
 DEFAULT_PARAMS = {
-    "pivot_span": 5, "cluster_tol": 0.002, "zone_width": 0.001,
-    "sl_pct": 0.005, "tp_pct": 0.010, "max_hold": 12,
-    "breakout_lookback": 20, "pattern_tol": 0.004, "min_bars_between": 3,
-    "hs_tol": 0.01, "triangle_tol": 0.002,
-    "pattern_memory": 5, "signal_threshold": 2.0,
-    "wick_factor": 1.5, "volume_factor": 1.5, "volume_window": 200,
-    "flag_trend_lookback": 20, "flag_lookback": 8,
-    "allowed_dirs": ["long", "short"],
-    "use_points": False, "target_points": 50.0, "sl_points": 25.0,
+    "short_ma": 10, "long_ma": 50, "ema_fast": 9, "ema_slow": 21,
+    "rsi_period": 14, "rsi_long_min": 50.0, "atr_period": 14,
+    "bb_period": 20, "bb_k": 2.0, "vol_period": 20, "vol_spike_mult": 1.5,
+    "adx_min": 20.0, "atr_min_pct": 0.10,
+    "rule_mode": "any_k", "any_k": 3,
+    "confluences": ["ma_cross", "ema_trend", "macd_hist", "rsi_zone", "adx_trend"],
+    "sl_mode": "pct", "sl_pct": 0.008, "sl_atr_mult": 1.5,
+    "tp_mode": "pct", "tp_pct": 0.016, "tp_atr_mult": 3.0,
+    "max_hold": 12, "allowed_dirs": ["long", "short"],
 }
+
+
+def confluence_frame(d: pd.DataFrame, p: dict, direction: int) -> dict:
+    """Boolean Series per confluence for one direction. Vectorised, causal."""
+    s = direction  # +1 long, -1 short
+    has_vol = d["volume_num"].notna().any() and d["vol_avg"].notna().any()
+    f = {
+        "ma_cross": (d["ma_short"] - d["ma_long"]) * s > 0,
+        "ema_trend": (d["ema_fast"] - d["ema_slow"]) * s > 0,
+        "macd_hist": (d["macd_hist"] * s > 0) & ((d["macd_hist"] - d["macd_hist_prev"]) * s > 0),
+        "bb_breakout": (d["Close"] > d["bb_upper"]) if s > 0 else (d["Close"] < d["bb_lower"]),
+        "rsi_zone": (d["rsi"] > p["rsi_long_min"]) if s > 0 else (d["rsi"] < 100 - p["rsi_long_min"]),
+        "adx_trend": d["adx"] >= p["adx_min"],
+        "atr_ok": d["atr_pct"] >= p["atr_min_pct"],
+    }
+    # If the feed carries no volume (most Yahoo index symbols), vol_spike is
+    # dropped rather than evaluated as permanently False. The original left it
+    # False, so strict mode could never fire a single trade on an index.
+    if has_vol:
+        f["vol_spike"] = d["volume_num"] >= p["vol_spike_mult"] * d["vol_avg"]
+    return {k: v.fillna(False) for k, v in f.items()}
 
 
 def generate_signals(df: pd.DataFrame, params: dict):
-    """Score every bar using only information available at or before that bar.
-
-    Returns (df_with_signal_and_reason, meta).
-    """
+    """Score each bar from indicator confluences. Interface matches the rest of
+    the app: adds score / signal / reason / sl_ref / tp_ref columns."""
     p = {**DEFAULT_PARAMS, **params}
-    o = df["Open"].to_numpy(float)
-    h = df["High"].to_numpy(float)
-    l = df["Low"].to_numpy(float)
-    c = df["Close"].to_numpy(float)
-    v = pd.to_numeric(df["Volume"], errors="coerce").to_numpy(float)
-    n = len(df)
+    d = add_indicators(df, p)
+    n = len(d)
 
-    ph, pl = find_pivots(h, l, p["pivot_span"])
-    pats = build_patterns(ph, pl, h, l, c, p) + candle_patterns(o, h, l, c, p)
+    active = [k for k in p["confluences"] if k in ALL_CONFLUENCES]
+    fl = confluence_frame(d, p, +1)
+    fs = confluence_frame(d, p, -1)
+    active = [k for k in active if k in fl]
+    if not active:
+        active = ["ma_cross"]
 
-    # index patterns by the bar at which they become knowable
-    by_bar: dict[int, list[Pattern]] = {}
-    for pt in pats:
-        if 0 <= pt.known_at < n:
-            by_bar.setdefault(pt.known_at, []).append(pt)
+    hits_l = sum(fl[k].astype(int) for k in active)
+    hits_s = sum(fs[k].astype(int) for k in active)
+    need = len(active) if p["rule_mode"] == "strict" else min(p["any_k"], len(active))
 
-    # ---- causal S/R zones: a pivot only joins the level set once confirmed ----
-    pivot_events: dict[int, list[tuple[float, str]]] = {}
-    for i, price, k in ph:
-        if k < n:
-            pivot_events.setdefault(k, []).append((price, "R"))
-    for i, price, k in pl:
-        if k < n:
-            pivot_events.setdefault(k, []).append((price, "S"))
+    allow_l = "long" in p["allowed_dirs"]
+    allow_s = "short" in p["allowed_dirs"]
+    ok_l = (hits_l >= need) & allow_l
+    ok_s = (hits_s >= need) & allow_s
 
-    MAX_LEVELS = 40
-    sup_hist, res_hist = [], []
-    sup_zones, res_zones = [], []
-    zone_at = [([], [])] * n
+    # Warm-up guard: no signal until every active indicator has a full window.
+    warm = max(p["long_ma"], p["short_ma"], p["ema_slow"], p["bb_period"],
+               p["vol_period"], 26 + 9, p["atr_period"] + 14)
+    valid = np.zeros(n, dtype=bool)
+    valid[warm:] = True
+
+    sig = np.where(ok_l & ~ok_s & valid, 1, np.where(ok_s & ~ok_l & valid, -1, 0))
+    tie = (ok_l & ok_s & valid).to_numpy()
+    if tie.any():  # both sides qualify: take the side with more confluences
+        sig = np.where(tie, np.sign((hits_l - hits_s).to_numpy()), sig)
+
+    reasons = []
+    hl, hs = hits_l.to_numpy(), hits_s.to_numpy()
+    fl_np = {k: fl[k].to_numpy() for k in active}
+    fs_np = {k: fs[k].to_numpy() for k in active}
     for i in range(n):
-        if i in pivot_events:
-            for price, kind in pivot_events[i]:
-                (res_hist if kind == "R" else sup_hist).append(price)
-            res_hist[:] = res_hist[-MAX_LEVELS:]
-            sup_hist[:] = sup_hist[-MAX_LEVELS:]
-            res_zones = [(x * (1 - p["zone_width"]), x * (1 + p["zone_width"]))
-                         for x in cluster_levels(res_hist, p["cluster_tol"])]
-            sup_zones = [(x * (1 - p["zone_width"]), x * (1 + p["zone_width"]))
-                         for x in cluster_levels(sup_hist, p["cluster_tol"])]
-        zone_at[i] = (sup_zones, res_zones)
-
-    # trailing volume median (causal)
-    vol_med = pd.Series(v).rolling(p["volume_window"], min_periods=20).median().shift(1).to_numpy()
-
-    # rolling breakout levels, shifted so bar i sees only bars < i
-    look = p["breakout_lookback"]
-    hi_prev = pd.Series(h).rolling(look).max().shift(1).to_numpy()
-    lo_prev = pd.Series(l).rolling(look).min().shift(1).to_numpy()
-
-    memory = p["pattern_memory"]
-    thresh = p["signal_threshold"]
-    allow_long = "long" in p["allowed_dirs"]
-    allow_short = "short" in p["allowed_dirs"]
-
-    signals = np.zeros(n, dtype=int)
-    scores = np.zeros(n, dtype=float)
-    reasons = [""] * n
-
-    for i in range(n):
-        score, why = 0.0, []
-
-        # patterns confirmed within the memory window, still awaiting their break
-        for j in range(max(0, i - memory), i + 1):
-            for pt in by_bar.get(j, []):
-                if pt.trigger is None:
-                    score += pt.weight
-                    why.append(f"{pt.name}{pt.weight:+.1f}")
-                elif pt.direction > 0 and c[i] > pt.trigger:
-                    score += pt.weight
-                    why.append(f"{pt.name}>{pt.trigger:.2f}{pt.weight:+.1f}")
-                elif pt.direction < 0 and c[i] < pt.trigger:
-                    score += pt.weight
-                    why.append(f"{pt.name}<{pt.trigger:.2f}{pt.weight:+.1f}")
-
-        # nearest zone only — scoring support and resistance simultaneously
-        # just cancels them out, which is what made the original fire constantly
-        sup_z, res_z = zone_at[i]
-        best_s = min((abs(c[i] - (a + b) / 2), (a, b)) for a, b in sup_z) if sup_z else None
-        best_r = min((abs(c[i] - (a + b) / 2), (a, b)) for a, b in res_z) if res_z else None
-        cands = []
-        if best_s and best_s[1][0] <= c[i] <= best_s[1][1]:
-            cands.append((best_s[0], "support_zone"))
-        if best_r and best_r[1][0] <= c[i] <= best_r[1][1]:
-            cands.append((best_r[0], "resistance_zone"))
-        if cands:
-            _, name = min(cands)
-            score += WEIGHTS[name]
-            why.append(f"{name}{WEIGHTS[name]:+.1f}")
-
-        if not np.isnan(hi_prev[i]) and c[i] > hi_prev[i]:
-            score += WEIGHTS["breakout"]
-            why.append(f"breakout>{hi_prev[i]:.2f}")
-        elif not np.isnan(lo_prev[i]) and c[i] < lo_prev[i]:
-            score += WEIGHTS["breakdown"]
-            why.append(f"breakdown<{lo_prev[i]:.2f}")
-
-        if not np.isnan(vol_med[i]) and v[i] > vol_med[i] * p["volume_factor"]:
-            body = abs(c[i] - o[i]) + 1e-9
-            if (h[i] - max(c[i], o[i])) > p["wick_factor"] * body:
-                score += WEIGHTS["upper_wick_trap"]
-                why.append("upper_wick_trap")
-            if (min(c[i], o[i]) - l[i]) > p["wick_factor"] * body:
-                score += WEIGHTS["lower_wick_trap"]
-                why.append("lower_wick_trap")
-
-        scores[i] = score
-        if score >= thresh and allow_long:
-            signals[i] = 1
-        elif score <= -thresh and allow_short:
-            signals[i] = -1
-        reasons[i] = "; ".join(why)
+        if sig[i] == 0:
+            reasons.append(f"{max(hl[i], hs[i])}/{len(active)} confluences, need {need}")
+        else:
+            src_ = fl_np if sig[i] == 1 else fs_np
+            on = [k for k in active if src_[k][i]]
+            reasons.append(f"{len(on)}/{len(active)}: " + ", ".join(on))
 
     out = df.copy()
-    out["score"] = scores
-    out["signal"] = signals
+    out["score"] = np.where(sig >= 0, hl, -hs).astype(float)
+    out["signal"] = sig.astype(int)
     out["reason"] = reasons
-    meta = {
-        "n_pivot_highs": len(ph), "n_pivot_lows": len(pl),
-        "pattern_counts": pd.Series([x.name for x in pats]).value_counts().to_dict() if pats else {},
-        "supports": [round((a + b) / 2, 2) for a, b in sup_zones],
-        "resistances": [round((a + b) / 2, 2) for a, b in res_zones],
-    }
+    out["atr_ref"] = d["atr"].to_numpy()          # ATR of the SIGNAL bar, for SL/TP
+    out["hits"] = np.where(sig >= 0, hl, hs)
+    out["n_confluences"] = len(active)
+
+    meta = {"active_confluences": active, "need_hits": int(need),
+            "rule_mode": p["rule_mode"], "warmup_bars": int(warm),
+            "volume_available": "vol_spike" in fl,
+            "long_signals": int((sig == 1).sum()), "short_signals": int((sig == -1).sum())}
     return out, meta
 
 
@@ -509,6 +375,9 @@ def backtest(df_sig: pd.DataFrame, params: dict, cost_bps: float = 3.0,
     dates = df_sig["Date"].to_numpy()
     days = pd.Series(df_sig["Date"]).dt.date.to_numpy()
     reasons = df_sig["reason"].tolist()
+    atr_ref = df_sig["atr_ref"].to_numpy(float) if "atr_ref" in df_sig else np.full(len(df_sig), np.nan)
+    hits = df_sig["hits"].to_numpy() if "hits" in df_sig else np.zeros(len(df_sig))
+    n_conf = int(df_sig["n_confluences"].iloc[0]) if "n_confluences" in df_sig else 0
     n = len(df_sig)
 
     trades = []
@@ -520,7 +389,9 @@ def backtest(df_sig: pd.DataFrame, params: dict, cost_bps: float = 3.0,
         d = int(sig[i])
         e = i + 1
         entry = o[e] + (slippage_pts * d)
-        sl, tp = compute_levels(entry, d, p)
+        # ATR of the SIGNAL bar (i), not the entry bar. The entry bar's ATR is
+        # only known at its close, which is after the fill.
+        sl, tp = compute_levels(entry, d, p, atr_ref[i])
 
         last_allowed = min(n - 1, e + p["max_hold"])
         if intraday_squareoff:
@@ -571,6 +442,7 @@ def backtest(df_sig: pd.DataFrame, params: dict, cost_bps: float = 3.0,
             "net_points": round(float(net_pts), 4),
             "net_pct": round(float(net_pts / entry * 100), 5),
             "bars_held": int(exit_idx - e),
+            "confluences_hit": int(hits[i]), "confluences_total": n_conf,
             "signal_reason": reasons[i][:160],
         })
         i = exit_idx + 1
@@ -578,13 +450,26 @@ def backtest(df_sig: pd.DataFrame, params: dict, cost_bps: float = 3.0,
     return pd.DataFrame(trades), summarise(pd.DataFrame(trades))
 
 
-def compute_levels(entry: float, d: int, p: dict):
-    if p.get("use_points"):
-        tp = entry + p["target_points"] * d
-        sl = entry - p["sl_points"] * d
+def compute_levels(entry: float, d: int, p: dict, atr: float | None = None):
+    """Stop and target from percent or ATR. Both are forced onto the correct
+    side of entry; a zero or NaN ATR falls back to the percent rule instead of
+    silently placing the stop on top of the entry."""
+    a = float(atr) if atr is not None and np.isfinite(atr) and atr > 0 else None
+
+    if p.get("sl_mode") == "atr" and a:
+        sl = entry - a * p["sl_atr_mult"] * d
+    else:
+        sl = entry * (1 - p["sl_pct"] * d)
+
+    if p.get("tp_mode") == "atr" and a:
+        tp = entry + a * p["tp_atr_mult"] * d
     else:
         tp = entry * (1 + p["tp_pct"] * d)
-        sl = entry * (1 - p["sl_pct"] * d)
+
+    if (sl - entry) * d >= 0:
+        sl = entry * (1 - max(p["sl_pct"], 1e-4) * d)
+    if (tp - entry) * d <= 0:
+        tp = entry * (1 + max(p["tp_pct"], 1e-4) * d)
     return float(sl), float(tp)
 
 
@@ -616,29 +501,63 @@ def summarise(t: pd.DataFrame) -> dict:
 # ===================== Optimiser with a real holdout ======================
 
 PARAM_SPACE = {
-    "pivot_span": [3, 5, 8, 12],
-    "cluster_tol": [0.001, 0.002, 0.004],
-    "zone_width": [0.0005, 0.001, 0.002],
-    "sl_pct": [0.003, 0.005, 0.008, 0.012],
-    "tp_pct": [0.005, 0.008, 0.012, 0.02],
-    "max_hold": [6, 12, 24, 48],
-    "breakout_lookback": [10, 20, 40],
-    "pattern_tol": [0.002, 0.004, 0.008],
-    "min_bars_between": [3, 5, 8],
-    "pattern_memory": [3, 5, 10],
-    "signal_threshold": [1.5, 2.0, 2.5, 3.0],
-    "volume_factor": [1.2, 1.5, 2.0],
+    "short_ma": [5, 10, 15, 20, 30],
+    "long_ma": [30, 50, 80, 100, 120],
+    "ema_fast": [5, 9, 12],
+    "ema_slow": [21, 26, 34],
+    "rsi_period": [14],
+    "rsi_long_min": [45.0, 50.0, 55.0, 60.0],
+    "atr_period": [14],
+    "bb_period": [14, 20],
+    "bb_k": [2.0, 2.5],
+    "vol_period": [10, 20],
+    "vol_spike_mult": [1.2, 1.5, 2.0],
+    "adx_min": [15.0, 20.0, 25.0],
+    "atr_min_pct": [0.05, 0.10, 0.20],
+    "rule_mode": ["strict", "any_k"],
+    "sl_mode": ["pct", "atr"],
+    "tp_mode": ["pct", "atr"],
+    "sl_pct": [0.004, 0.006, 0.010, 0.015],
+    "tp_pct": [0.008, 0.012, 0.020, 0.030],
+    "sl_atr_mult": [1.0, 1.5, 2.0],
+    "tp_atr_mult": [2.0, 3.0, 4.0],
+    "max_hold": [5, 10, 20, 40],
 }
+
+CONFLUENCE_POOL = [
+    ["ma_cross", "ema_trend", "macd_hist"],
+    ["ma_cross", "ema_trend", "macd_hist", "rsi_zone"],
+    ["ma_cross", "ema_trend", "macd_hist", "adx_trend"],
+    ["ma_cross", "ema_trend", "macd_hist", "rsi_zone", "adx_trend"],
+    ["ma_cross", "ema_trend", "macd_hist", "rsi_zone", "adx_trend", "atr_ok"],
+    ["ma_cross", "ema_trend", "macd_hist", "bb_breakout", "rsi_zone", "adx_trend"],
+    ["ema_trend", "macd_hist", "rsi_zone", "adx_trend", "vol_spike"],
+    ["ma_cross", "ema_trend", "macd_hist", "bb_breakout", "rsi_zone", "adx_trend",
+     "vol_spike", "atr_ok"],
+]
+
+
+def sample_params(rng, allowed_dirs):
+    p = {k: rng.choice(v).item() for k, v in PARAM_SPACE.items()}
+    p["confluences"] = list(CONFLUENCE_POOL[int(rng.integers(len(CONFLUENCE_POOL)))])
+    p["any_k"] = int(rng.integers(2, len(p["confluences"]) + 1))
+    p["allowed_dirs"] = allowed_dirs
+    if p["short_ma"] >= p["long_ma"]:          # a "short" MA slower than the long
+        p["short_ma"] = max(5, p["long_ma"] // 4)   # one makes the cross meaningless
+    if p["ema_fast"] >= p["ema_slow"]:
+        p["ema_fast"] = max(3, p["ema_slow"] // 2)
+    return p
 
 
 def score_params(stats: dict, min_trades: int) -> float:
-    """Rank on risk-adjusted expectancy after costs, not on win rate.
-
-    Win rate is trivially gamed by a wide stop and a tight target, which is
-    exactly what a raw-accuracy objective selects for. sqrt(trades) rewards
-    an edge that repeats instead of one lucky trade.
+    """Reject outright instead of scaling. The original multiplied the score by
+    0.4 when trade count was too low, which for a NEGATIVE net PnL makes the
+    number LARGER: -1000 over 2 trades scored -600 and beat -500 over 50 trades,
+    so the optimiser actively preferred the worse, under-traded parameter set.
     """
-    if stats["trades"] < min_trades or stats["expectancy_points"] <= 0:
+    if stats["trades"] < min_trades:
+        return -1e9
+    if stats["expectancy_points"] <= 0:
         return -1e9
     return stats["sharpe_per_trade"] * np.sqrt(stats["trades"])
 
@@ -651,18 +570,18 @@ def optimise(df: pd.DataFrame, n_iter: int, allowed_dirs: list, min_trades: int,
     rng = np.random.default_rng(seed)
     n = len(df)
     cut = int(n * train_frac)
-    purge = max(PARAM_SPACE["max_hold"]) + max(PARAM_SPACE["pivot_span"]) + 5
+    purge = max(PARAM_SPACE["max_hold"]) + max(PARAM_SPACE["long_ma"]) + 5
     train = df.iloc[:cut].reset_index(drop=True)
     test = df.iloc[min(cut + purge, n - 1):].reset_index(drop=True)
 
     best, results = None, []
     for it in range(n_iter):
-        p = {k: rng.choice(v).item() for k, v in PARAM_SPACE.items()}
-        p.update({"allowed_dirs": allowed_dirs, "hs_tol": 0.01, "triangle_tol": 0.002,
-                  "wick_factor": 1.5, "volume_window": 200,
-                  "flag_trend_lookback": 20, "flag_lookback": 8, "use_points": False})
-        if p["tp_pct"] <= p["sl_pct"] * 0.6:
+        p = sample_params(rng, allowed_dirs)
+        if p["tp_mode"] == "pct" and p["sl_mode"] == "pct" and p["tp_pct"] <= p["sl_pct"] * 0.6:
             continue  # reward:risk below 0.6 is a win-rate trap, skip it
+        if p["tp_mode"] == "atr" and p["sl_mode"] == "atr" and \
+                p["tp_atr_mult"] <= p["sl_atr_mult"] * 0.6:
+            continue
         try:
             sig, _ = generate_signals(train, p)
             _, stats = backtest(sig, p, cost_bps, slippage_pts, intraday)
@@ -758,10 +677,11 @@ def detailed_stats(t: pd.DataFrame, qty: int) -> pd.DataFrame:
         ("Winning trades", f"{len(w):,}"),
         ("Losing trades", f"{len(l):,}"),
         ("Accuracy (win rate)", f"{len(w)/len(t)*100:.2f}%"),
-        ("Points won (gross of the winners)", f"{gp:+,.2f}"),
-        ("Points lost (gross of the losers)", f"{-gl:+,.2f}"),
-        ("Costs paid", f"{-t['cost_points'].sum():,.2f}"),
-        ("Net points", f"{t['net_points'].sum():+,.2f}"),
+        ("Points won (sum of winners)", f"{gp:+,.2f}"),
+        ("Points lost (sum of losers)", f"{-gl:+,.2f}"),
+        ("Net points BEFORE charges", f"{t['gross_points'].sum():+,.2f}"),
+        ("Charges paid (cost + slippage)", f"{-t['cost_points'].sum():,.2f}"),
+        ("Net points AFTER charges", f"{t['net_points'].sum():+,.2f}"),
         (f"Net cash (qty {qty})", f"{t['net_points'].sum()*qty:+,.2f}"),
         ("Expectancy per trade", f"{t['net_points'].mean():+,.3f} pts"),
         ("Average win", f"{avg_w:+,.2f} pts"),
@@ -854,29 +774,32 @@ def written_summary(df: pd.DataFrame, interval: str) -> str:
 
 
 def recommendation(df_sig: pd.DataFrame, params: dict, hold_stats: dict,
-                   capital: float, risk_pct: float, qty: int) -> dict | None:
+                   capital: float, risk_pct: float, qty: int) -> dict:
     """Live call from the last CLOSED bar, using the fitted rule set."""
     last = df_sig.iloc[-1]
     d = int(last["signal"])
     if d == 0:
-        return {"direction": "flat", "reason": last["reason"] or "no pattern cleared the threshold",
-                "score": round(float(last["score"]), 2),
-                "threshold": params["signal_threshold"]}
+        return {"direction": "flat", "reason": last["reason"],
+                "confluences_hit": int(last["hits"]),
+                "confluences_total": int(last["n_confluences"])}
     entry = float(last["Close"])
-    sl, tp = compute_levels(entry, d, params)
-    unit_risk = abs(entry - sl)
+    sl, tp = compute_levels(entry, d, params, float(last["atr_ref"]))
+    risk = abs(entry - sl)
     return {
         "direction": "long" if d == 1 else "short",
         "signal_bar": f"{pd.Timestamp(last['Date']):%d %b %Y %H:%M}",
         "reference_price": round(entry, 2),
-        "note": "Backtest fills at the NEXT bar's open, so treat this as the next-bar order.",
-        "stop_loss": round(sl, 2),
-        "target": round(tp, 2),
-        "risk_points": round(unit_risk, 2),
-        "reward_points": round(abs(tp - entry), 2),
-        "reward_risk": round(abs(tp - entry) / unit_risk, 2) if unit_risk else None,
-        "score": round(float(last["score"]), 2),
-        "units_by_risk": int((capital * risk_pct / 100) // unit_risk) if unit_risk else 0,
+        "note": "Backtest fills at the NEXT bar's open, so treat this as a next-bar order.",
+        "stop_loss": round(sl, 2), "target": round(tp, 2),
+        "sl_basis": f"{params['sl_atr_mult']}x ATR({params['atr_period']})"
+                    if params.get("sl_mode") == "atr" else f"{params['sl_pct']*100:.2f}% of entry",
+        "tp_basis": f"{params['tp_atr_mult']}x ATR({params['atr_period']})"
+                    if params.get("tp_mode") == "atr" else f"{params['tp_pct']*100:.2f}% of entry",
+        "risk_points": round(risk, 2), "reward_points": round(abs(tp - entry), 2),
+        "reward_risk": round(abs(tp - entry) / risk, 2) if risk else None,
+        "confluences_hit": int(last["hits"]), "confluences_total": int(last["n_confluences"]),
+        "rule": f"{params['rule_mode']} (need {params.get('any_k')})",
+        "units_by_risk": int((capital * risk_pct / 100) // risk) if risk else 0,
         "sidebar_qty": qty,
         "reason": last["reason"][:300],
         "holdout_win_rate": hold_stats["win_rate"],
@@ -947,14 +870,16 @@ def step_live(df: pd.DataFrame, params: dict, cost_bps: float, slippage_pts: flo
         if ls["pending"] is not None and ls["position"] is None:
             d = ls["pending"]["dir"]
             entry = float(row["Open"]) + slippage_pts * d
-            sl, tp = compute_levels(entry, d, params)
+            sl, tp = compute_levels(entry, d, params, ls["pending"].get("atr"))
             ls["position"] = {
                 "direction": "long" if d == 1 else "short", "dir": d,
                 "entry_time": bar_t, "entry": entry, "sl": sl, "tp": tp,
                 "reason": ls["pending"]["reason"], "bars": 0,
-                "params_used": {k: params[k] for k in
-                                ("sl_pct", "tp_pct", "max_hold", "signal_threshold",
-                                 "pivot_span", "breakout_lookback")},
+                "hits": ls["pending"].get("hits", 0),
+                "params_used": {k: params.get(k) for k in
+                                ("rule_mode", "any_k", "confluences", "sl_mode", "sl_pct",
+                                 "sl_atr_mult", "tp_mode", "tp_pct", "tp_atr_mult",
+                                 "max_hold", "short_ma", "long_ma", "adx_min")},
             }
             ls["pending"] = None
             log(f"ENTRY {ls['position']['direction']} @ {entry:.2f} | SL {sl:.2f} | TP {tp:.2f}")
@@ -988,7 +913,8 @@ def step_live(df: pd.DataFrame, params: dict, cost_bps: float, slippage_pts: flo
         # 3) look for a fresh signal on this closed bar
         if ls["position"] is None and ls["pending"] is None and int(row["signal"]) != 0:
             ls["pending"] = {"dir": int(row["signal"]), "reason": row["reason"],
-                             "signal_time": bar_t}
+                             "signal_time": bar_t, "atr": float(row.get("atr_ref", np.nan)),
+                             "hits": int(row.get("hits", 0))}
             log(f"SIGNAL {'long' if row['signal'] == 1 else 'short'} on bar {pd.Timestamp(bar_t):%H:%M} "
                 f"— fills at next bar's open")
 
@@ -1010,7 +936,8 @@ def close_position(px: float, reason: str, when, cost_bps: float, slippage_pts: 
         "gross_points": round(gross, 2), "cost_points": round(cost, 2),
         "net_points": round(gross - cost, 2),
         "net_pct": round((gross - cost) / pos["entry"] * 100, 4),
-        "bars_held": pos["bars"], "signal_reason": pos["reason"][:160],
+        "bars_held": pos["bars"], "confluences_hit": pos.get("hits", 0),
+        "signal_reason": pos["reason"][:160],
     })
     log(f"EXIT {reason} @ {exit_px:.2f} | net {gross - cost:+.2f} pts")
     ls["position"] = None
@@ -1023,7 +950,7 @@ def live_stats() -> dict:
 
 # ================================== UI ====================================
 
-st.set_page_config(page_title="Price-Action Trader", layout="wide")
+st.set_page_config(page_title="Confluence Trader", layout="wide")
 
 SL_CHOICES = [0.002, 0.003, 0.005, 0.008, 0.010, 0.015, 0.020, 0.030]
 TP_CHOICES = [0.003, 0.005, 0.008, 0.010, 0.015, 0.020, 0.030, 0.050]
@@ -1233,8 +1160,11 @@ def tab_backtest(cfg, df, label):
 
     with st.expander("Fitted parameters"):
         st.json({k: v for k, v in best["params"].items()})
-    with st.expander("Pattern and level counts"):
+    with st.expander("Active confluences and rule"):
         st.json(best["meta"])
+        if not best["meta"].get("volume_available", True):
+            st.caption("This feed carries no volume, so the vol_spike confluence was dropped "
+                       "rather than evaluated as permanently False.")
     with st.expander("Search results (top 25)"):
         t = st.session_state.get("best_table", pd.DataFrame())
         st.dataframe(t.drop(columns=["params"], errors="ignore").head(25), use_container_width=True)
@@ -1403,8 +1333,8 @@ def tab_history(cfg):
 
 
 def main():
-    st.title("Price-Action Trader")
-    st.caption("Causal signals · purged holdout · costs charged · paper trading only")
+    st.title("Confluence Trader")
+    st.caption("MA · EMA · MACD · RSI · ADX · Bollinger · ATR · Volume confluences · purged holdout · charges applied · paper trading only")
     cfg = sidebar()
 
     try:
