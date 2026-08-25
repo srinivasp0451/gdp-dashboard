@@ -773,6 +773,54 @@ def written_summary(df: pd.DataFrame, interval: str) -> str:
     )
 
 
+def benchmark_table(df: pd.DataFrame, trades: pd.DataFrame, qty: int, label: str) -> pd.DataFrame:
+    """Strategy vs buy-and-hold over the SAME bars the strategy was measured on.
+
+    Deliberately reports the difference in points, never a ratio. The original
+    script divided by the absolute buy-and-hold points and printed things like
+    "1393% more points" — when buy-and-hold is near zero that ratio explodes and
+    means nothing.
+    """
+    first, last = float(df["Close"].iloc[0]), float(df["Close"].iloc[-1])
+    bh_pts = last - first
+    bh_pct = bh_pts / first * 100
+
+    gross = float(trades["gross_points"].sum()) if not trades.empty else 0.0
+    charges = float(trades["cost_points"].sum()) if not trades.empty else 0.0
+    net = float(trades["net_points"].sum()) if not trades.empty else 0.0
+    bars_in = int(trades["bars_held"].sum()) if not trades.empty else 0
+    exposure = bars_in / len(df) * 100 if len(df) else 0.0
+
+    if not trades.empty:
+        eq = trades["net_points"].cumsum()
+        s_dd = float((eq - eq.cummax()).min())
+    else:
+        s_dd = 0.0
+    curve = df["Close"] - first
+    bh_dd = float((curve - curve.cummax()).min())
+
+    rows = [
+        ("Period", f"{df['Date'].iloc[0]:%d %b %Y} → {df['Date'].iloc[-1]:%d %b %Y}",
+         f"{df['Date'].iloc[0]:%d %b %Y} → {df['Date'].iloc[-1]:%d %b %Y}"),
+        ("Bars", f"{len(df):,}", f"{len(df):,}"),
+        ("Trades", f"{len(trades):,}", "1"),
+        ("Time in market", f"{exposure:.1f}%", "100.0%"),
+        ("Points before charges", f"{gross:+,.2f}", f"{bh_pts:+,.2f}"),
+        ("Charges", f"{-charges:,.2f}", "0.00"),
+        ("Points after charges", f"{net:+,.2f}", f"{bh_pts:+,.2f}"),
+        ("Return on first close", f"{net/first*100:+.2f}%", f"{bh_pct:+.2f}%"),
+        (f"Cash at qty {qty}", f"{net*qty:+,.2f}", f"{bh_pts*qty:+,.2f}"),
+        ("Max drawdown (points)", f"{s_dd:,.2f}", f"{bh_dd:,.2f}"),
+    ]
+    out = pd.DataFrame(rows, columns=["Metric", f"Strategy ({label})", "Buy and hold"])
+    edge = net - bh_pts
+    out.loc[len(out)] = ["Strategy minus buy-and-hold",
+                         f"{edge:+,.2f} pts", f"{edge*qty:+,.2f} cash"]
+    out.columns = ["Metric", f"Strategy ({label})", "Buy and hold"]
+    return out
+
+
+
 def recommendation(df_sig: pd.DataFrame, params: dict, hold_stats: dict,
                    capital: float, risk_pct: float, qty: int) -> dict:
     """Live call from the last CLOSED bar, using the fitted rule set."""
@@ -1127,8 +1175,7 @@ def tab_backtest(cfg, df, label):
                          best["test_stats"] or best["train_stats"],
                          cfg["capital"], cfg["risk_pct"], cfg["qty"])
     if rec and rec["direction"] == "flat":
-        st.info(f"No trade. Score {rec['score']} did not clear the "
-                f"±{rec['threshold']} threshold.")
+        st.info(f"No trade on the last closed bar — {rec['reason']}.")
     elif rec:
         r1 = st.columns(5)
         r1[0].metric("Direction", rec["direction"].upper())
@@ -1136,6 +1183,9 @@ def tab_backtest(cfg, df, label):
         r1[2].metric("Stop loss", f"{rec['stop_loss']:,.2f}", f"-{rec['risk_points']:,.2f} pts")
         r1[3].metric("Target", f"{rec['target']:,.2f}", f"+{rec['reward_points']:,.2f} pts")
         r1[4].metric("Reward:risk", f"{rec['reward_risk']}")
+        st.caption(f"Stop basis: {rec['sl_basis']} · Target basis: {rec['tp_basis']} · "
+                   f"Rule: {rec['rule']} · "
+                   f"{rec['confluences_hit']}/{rec['confluences_total']} confluences")
         r2 = st.columns(3)
         r2[0].metric("Units by risk budget", f"{rec['units_by_risk']:,}",
                      help=f"{cfg['risk_pct']}% of {cfg['capital']:,.0f} divided by the stop distance.")
@@ -1157,6 +1207,18 @@ def tab_backtest(cfg, df, label):
         st.download_button("Download backtest trades (CSV)", sc.to_csv(index=False),
                            "backtest_trades.csv", "text/csv")
         st.bar_chart(show["exit_reason"].value_counts())
+
+    st.markdown("### Strategy vs buy and hold")
+    if scope == "Holdout only" and best.get("test_rows", 0) > 1:
+        bench_df = df.iloc[-int(best["test_rows"]):].reset_index(drop=True)
+        bench_label = "holdout"
+    else:
+        bench_df, bench_label = df, "full sample"
+    st.dataframe(benchmark_table(bench_df, show, cfg["qty"], bench_label),
+                 use_container_width=True, hide_index=True)
+    st.caption("Compared over the same bars. Time in market matters: a strategy that is "
+               "flat 90% of the time carries far less risk than buy-and-hold for the "
+               "same points, which is why drawdown and exposure are shown alongside.")
 
     with st.expander("Fitted parameters"):
         st.json({k: v for k, v in best["params"].items()})
