@@ -40,7 +40,11 @@ st.set_page_config(page_title="AlgoTrader Pro", layout="wide", page_icon="📈")
 TICKER_MAP = {
     "Nifty50": "^NSEI",
     "BankNifty": "^NSEBANK",
+    "FinNifty": "NIFTY_FIN_SERVICE.NS",
+    "MidcpNifty": "^NSEMDCP50",
+    "NiftyNext50": "^NSMIDCP",
     "Sensex": "^BSESN",
+    "Bankex": "BSE-BANK.BO",
     "BTC-USD": "BTC-USD",
     "ETH-USD": "ETH-USD",
     "USDINR": "USDINR=X",
@@ -74,6 +78,7 @@ STRATEGIES = [
     "Elliott Wave (Zigzag)",
     "OI Based (CE/PE Open Interest)",
     "OI Change Based (ΔOI)",
+    "OI Velocity (ΔOI per N seconds)",
     "OI + Volume Change Based",
     "PCR Based (Put-Call Ratio)",
     "Gamma Blast (Expiry Momentum)",
@@ -129,6 +134,7 @@ STRATEGY_FAMILY = {
     "Elliott Wave (Zigzag)": "trend",
     "OI Based (CE/PE Open Interest)": "neutral",
     "OI Change Based (ΔOI)": "neutral",
+    "OI Velocity (ΔOI per N seconds)": "neutral",
     "OI + Volume Change Based": "neutral",
     "PCR Based (Put-Call Ratio)": "neutral",
     "Gamma Blast (Expiry Momentum)": "neutral",
@@ -163,6 +169,7 @@ STRATEGY_FAMILY = {
 IMMEDIATE_EXECUTION_STRATEGIES = {"Simple Buy Only", "Simple Sell Only", "Threshold Cross",
                                   "OI Based (CE/PE Open Interest)",
                                   "OI Change Based (ΔOI)",
+                                  "OI Velocity (ΔOI per N seconds)",
                                   "OI + Volume Change Based",
                                   "PCR Based (Put-Call Ratio)",
                                   "Gamma Blast (Expiry Momentum)",
@@ -203,10 +210,18 @@ EMAIL_DEFAULT_TO = "srinivasp451@gmail.com"
 
 # Index underlyings Dhan can serve directly (index spot for data, FNO for orders)
 DHAN_INDEX_MAP = {
-    "Nifty50":   {"underlying": "NIFTY",     "security_id": "13", "segment": "IDX_I", "exchange": "NSE", "default_opt_qty": 65},
-    "BankNifty": {"underlying": "BANKNIFTY", "security_id": "25", "segment": "IDX_I", "exchange": "NSE", "default_opt_qty": 35},
-    "Sensex":    {"underlying": "SENSEX",    "security_id": "51", "segment": "IDX_I", "exchange": "BSE", "default_opt_qty": 20},
+    "Nifty50":     {"underlying": "NIFTY",       "security_id": "13", "segment": "IDX_I", "exchange": "NSE", "default_opt_qty": 75},
+    "BankNifty":   {"underlying": "BANKNIFTY",   "security_id": "25", "segment": "IDX_I", "exchange": "NSE", "default_opt_qty": 35},
+    "FinNifty":    {"underlying": "FINNIFTY",    "security_id": "27", "segment": "IDX_I", "exchange": "NSE", "default_opt_qty": 65},
+    "MidcpNifty":  {"underlying": "MIDCPNIFTY",  "security_id": "442", "segment": "IDX_I", "exchange": "NSE", "default_opt_qty": 120},
+    "NiftyNext50": {"underlying": "NIFTYNXT50",  "security_id": "38", "segment": "IDX_I", "exchange": "NSE", "default_opt_qty": 25},
+    "Sensex":      {"underlying": "SENSEX",      "security_id": "51", "segment": "IDX_I", "exchange": "BSE", "default_opt_qty": 20},
+    "Bankex":      {"underlying": "BANKEX",      "security_id": "69", "segment": "IDX_I", "exchange": "BSE", "default_opt_qty": 30},
 }
+# Lot sizes and index security IDs are set by the exchanges and revised
+# periodically. These are the values as configured here; the scrip-master
+# lookup is authoritative for contract lot size, and the app prefers it when
+# a contract resolves. Verify against Dhan before trading a new index.
 
 # Instrument dropdown → (F&O/EQ classification, product) mapping.
 # Exchange (NSE/BSE) is a separate user-editable dropdown; segment resolves as:
@@ -1477,12 +1492,15 @@ def get_chain_snapshot(underlying_name, expiry=None):
 
 
 def get_oi_snapshot():
-    """Resolve the configured OI underlying + expiry and pull a live snapshot.
+    """Resolve the configured OI underlying (index OR stock) + expiry and pull
+    a live snapshot.
     This is the OPTION-CHAIN STRATEGIES' source (oi_underlying). Zero Hero has
     its own underlying selector and must NOT use this one — see
     get_zero_hero_snapshot()."""
     store = st.session_state.app_cfg
-    return get_chain_snapshot(store.get("oi_underlying", "Nifty50"), store.get("oi_expiry"))
+    kind = store.get("oi_kind", "Index")
+    name = store.get("oi_underlying", "Nifty50") if kind == "Index" else store.get("oi_stock", "RELIANCE")
+    return get_chain_snapshot_for(resolve_chain_underlying(kind, name), store.get("oi_expiry"))
 
 
 def get_zero_hero_snapshot(params=None):
@@ -1584,6 +1602,7 @@ def evaluate_oi_signal(params, snap):
 OPTION_CHAIN_STRATEGIES = {
     "OI Based (CE/PE Open Interest)",
     "OI Change Based (ΔOI)",
+    "OI Velocity (ΔOI per N seconds)",
     "OI + Volume Change Based",
     "PCR Based (Put-Call Ratio)",
     "Gamma Blast (Expiry Momentum)",
@@ -1771,6 +1790,25 @@ def days_to_expiry(expiry_str):
 # ---------------------------------------------------------------------------
 # PCR HISTORY TRACKER — feeds the PCR strategy's table and its change columns
 # ---------------------------------------------------------------------------
+
+def _export_buttons(df, filename_stem, key_prefix):
+    """CSV + Excel download pair for any table."""
+    if df is None or df.empty:
+        return
+    c1, c2 = st.columns(2)
+    c1.download_button("⬇ Download CSV", df.to_csv(index=False).encode(),
+                       file_name=f"{filename_stem}.csv", mime="text/csv",
+                       key=f"{key_prefix}_csv", use_container_width=True)
+    try:
+        buf = io.BytesIO()
+        with pd.ExcelWriter(buf, engine="xlsxwriter") as xw:
+            df.to_excel(xw, index=False, sheet_name="Data")
+        c2.download_button("⬇ Download Excel", buf.getvalue(), file_name=f"{filename_stem}.xlsx",
+                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                           key=f"{key_prefix}_xlsx", use_container_width=True)
+    except Exception:
+        c2.caption("Excel export needs the `xlsxwriter` package — CSV is available.")
+
 
 def _atm_row(snap):
     """ATM strike and its per-strike row (nearest strike to spot)."""
@@ -2834,6 +2872,10 @@ def db_init():
                     converted_at TEXT, ticker TEXT, strategy TEXT, instrument TEXT,
                     direction TEXT, entry_price REAL, qty REAL, sl REAL, target REAL,
                     status TEXT, resumed_at TEXT, closed_at TEXT, payload TEXT);
+                CREATE TABLE IF NOT EXISTS config_presets (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    saved_at TEXT, name TEXT, ticker TEXT, strategy TEXT,
+                    interval TEXT, period TEXT, payload TEXT);
                 CREATE TABLE IF NOT EXISTS screener_runs (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     ts TEXT, strategy TEXT, interval TEXT, period TEXT,
@@ -3021,6 +3063,92 @@ def db_update_delivery_status(row_id, status, extra_field=None):
     except Exception as exc:
         st.session_state["db_last_error"] = f"update delivery: {exc}"
         return False
+
+
+# Keys that are runtime bookkeeping rather than user configuration, and must
+# never be restored from a preset (stale IDs and cached signatures would be
+# applied over freshly resolved ones).
+_PRESET_SKIP_PREFIXES = ("_", "w_")
+_PRESET_SKIP_KEYS = {
+    "ce_security_id", "pe_security_id", "dhan_security_id", "prem_security_id",
+    "dhan_access_token", "email_app_password", "groq_api_key", "cfg_applied_msg",
+}
+
+
+def config_preset_payload():
+    """The user-facing sidebar configuration, minus secrets and runtime state."""
+    store = st.session_state.app_cfg or {}
+    out = {}
+    for k, v in store.items():
+        if k in _PRESET_SKIP_KEYS or str(k).startswith(_PRESET_SKIP_PREFIXES):
+            continue
+        if isinstance(v, dtime):
+            out[k] = f"__time__{v.hour:02d}:{v.minute:02d}"
+        elif isinstance(v, (str, int, float, bool)) or v is None:
+            out[k] = v
+        elif isinstance(v, (list, tuple)):
+            out[k] = list(v)
+    return out
+
+
+def db_save_config_preset(name):
+    """Store the current sidebar configuration under a name."""
+    if not db_enabled():
+        return False, "Database is not enabled."
+    payload = config_preset_payload()
+    try:
+        with db_connect() as conn:
+            conn.execute("INSERT INTO config_presets (saved_at, name, ticker, strategy, interval, period, payload) "
+                         "VALUES (?,?,?,?,?,?,?)",
+                         (ist_now().isoformat(), name or ist_now().strftime("Config %d-%b %H:%M"),
+                          str(payload.get("ticker_choice", "")), str(payload.get("strategy", "")),
+                          str(payload.get("interval", "")), str(payload.get("period", "")),
+                          json.dumps(payload, default=str)))
+        return True, f"Saved {len(payload)} settings."
+    except Exception as exc:
+        return False, str(exc)
+
+
+def db_load_config_presets():
+    try:
+        with db_connect() as conn:
+            return [dict(r) for r in conn.execute(
+                "SELECT * FROM config_presets ORDER BY id DESC").fetchall()]
+    except Exception:
+        return []
+
+
+def db_delete_config_preset(row_id):
+    try:
+        with db_connect() as conn:
+            conn.execute("DELETE FROM config_presets WHERE id = ?", (int(row_id),))
+        return True
+    except Exception:
+        return False
+
+
+def apply_config_preset(payload):
+    """
+    Queue every saved setting for the next run.
+
+    Uses cfg_set (the deferred queue) because this is invoked from the Admin
+    Panel — a tab, which renders after the sidebar's widgets already exist, so
+    a direct write would raise. Secrets and runtime IDs were never stored and
+    so are left untouched.
+    """
+    applied = 0
+    for k, v in (payload or {}).items():
+        if k in _PRESET_SKIP_KEYS or str(k).startswith(_PRESET_SKIP_PREFIXES):
+            continue
+        if isinstance(v, str) and v.startswith("__time__"):
+            try:
+                hh, mm = v.replace("__time__", "").split(":")
+                v = dtime(int(hh), int(mm))
+            except Exception:
+                continue
+        cfg_set(k, v)
+        applied += 1
+    return applied
 
 
 def db_save_screener_run(results_df, strategy, interval, period, universe):
@@ -3699,6 +3827,122 @@ def screener_scan(symbols, strategy, params, filters, interval, period,
 # STRATEGY EVALUATORS
 # ---------------------------------------------------------------------------
 
+def record_oi_velocity_sample(snap, key="default"):
+    """
+    Keep a rolling buffer of (timestamp, CE OI, PE OI) samples so the rate of
+    OI change over a short window can be measured.
+
+    Deduped by the snapshot's own fetch timestamp, so repeated reads of the
+    same cached chain do not fabricate extra samples.
+    """
+    if not snap:
+        return
+    buf = st.session_state.setdefault("oi_velocity_buf", {}).setdefault(key, [])
+    stamp = snap.get("fetched_at")
+    if buf and buf[-1][0] == stamp:
+        return
+    buf.append((stamp, time.time(), float(snap.get("ce_oi", 0.0) or 0.0),
+                float(snap.get("pe_oi", 0.0) or 0.0)))
+    if len(buf) > 400:
+        del buf[:-400]
+
+
+def oi_velocity_window(seconds, key="default"):
+    """
+    ΔCE / ΔPE OI across the last `seconds`, measured from the recorded samples.
+
+    Returns (d_ce, d_pe, actual_seconds, n_samples) or None when there is not
+    yet a second sample to measure against.
+
+    IMPORTANT LIMITATION, surfaced rather than hidden: Dhan caches the option
+    chain for 60 seconds and rate-limits that endpoint, so genuinely distinct
+    samples arrive about once a minute. Asking for a 40-second window will
+    therefore usually be answered with the closest span actually available —
+    which this returns as `actual_seconds` so the UI can state the real
+    measurement window instead of implying a precision the feed cannot provide.
+    """
+    buf = st.session_state.get("oi_velocity_buf", {}).get(key, [])
+    if len(buf) < 2:
+        return None
+    now_ts = buf[-1][1]
+    cutoff = now_ts - float(seconds)
+    # earliest sample at or before the cutoff, else the oldest available
+    older = [s for s in buf[:-1] if s[1] <= cutoff]
+    base = older[-1] if older else buf[0]
+    latest = buf[-1]
+    span = latest[1] - base[1]
+    if span <= 0:
+        return None
+    n_in = sum(1 for s in buf if s[1] >= base[1])
+    return (latest[2] - base[2], latest[3] - base[3], span, n_in)
+
+
+def evaluate_oi_velocity_signal(params, snap):
+    """
+    OI VELOCITY — rate of open-interest change over a short window.
+
+    Where "OI Change Based (ΔOI)" compares the day's cumulative OI change,
+    this measures how fast OI is moving RIGHT NOW: writers piling in (or
+    bailing out) within the last N seconds. That burst is what precedes a fast
+    move, and it is invisible in the day-cumulative figure once the day is
+    well advanced.
+
+    Two trigger modes, matching the ΔOI strategy's vocabulary:
+      • Absolute — a side's OI must change by at least X within the window.
+      • N× multiple — one side's change must be at least N times the other's,
+        tested symmetrically in BOTH directions (CE/PE and PE/CE).
+    Direction mapping is the seller-perspective convention with a flip option.
+    """
+    key = f"{params.get('oi_underlying', 'Nifty50')}|{params.get('oi_expiry', '')}"
+    record_oi_velocity_sample(snap, key)
+    win = float(params.get("oivel_seconds", 40))
+    res = oi_velocity_window(win, key)
+    if not snap:
+        return 0, ["OI velocity: no chain snapshot (needs a Dhan token and market hours)."]
+    if res is None:
+        return 0, ["OI velocity: only one sample so far — a rate needs at least two. Samples arrive roughly "
+                   "once a minute (Dhan caches the chain for 60s), so give it another refresh."]
+    d_ce, d_pe, span, n = res
+    mode = params.get("oivel_mode", "N× multiple (must be n times the other)")
+    n_mult = float(params.get("oivel_n", 2.0))
+    abs_min = float(params.get("oivel_abs", 10000.0))
+    flip = bool(params.get("oivel_flip", False))
+
+    lines = [f"OI velocity over the last {span:.0f}s ({n} samples; requested {win:.0f}s): "
+             f"ΔCE {d_ce:+,.0f} · ΔPE {d_pe:+,.0f}"]
+    if span < win * 0.5:
+        lines.append(f"⚠️ Only {span:.0f}s of history available against a {win:.0f}s request — the reading is "
+                     "over a shorter span than configured.")
+
+    if str(mode).startswith("Absolute"):
+        ce_ok, pe_ok = abs(d_ce) >= abs_min, abs(d_pe) >= abs_min
+        lines.append(f"Absolute mode: needs |Δ| ≥ {abs_min:,.0f} → CE {'✅' if ce_ok else '❌'} · "
+                     f"PE {'✅' if pe_ok else '❌'}")
+        if not (ce_ok or pe_ok):
+            lines.append("❌ Neither side moved enough → no signal.")
+            return 0, lines
+        # the side that moved more, and only if it is BUILDING
+        if d_ce > d_pe and ce_ok and d_ce > 0:
+            side = "CE"
+        elif d_pe > d_ce and pe_ok and d_pe > 0:
+            side = "PE"
+        else:
+            lines.append("❌ No side is building decisively → no signal.")
+            return 0, lines
+        lines.append(f"✅ {side} OI building fastest in the window.")
+    else:
+        side, det = _side_dominance(d_ce, d_pe, "N× multiple", n_mult, return_detail=True)
+        lines.append(f"N× mode (needs {n_mult:.1f}×): {det.get('basis', 'no dominance')}")
+        if side is None:
+            lines.append("❌ No side dominant → no signal.")
+            return 0, lines
+
+    sig = _chain_side_to_signal(side, flip)
+    lines.append(f"✅ {side} velocity dominant → {'LONG (BUY CE)' if sig == 1 else 'SHORT (BUY PE)'} "
+                 f"({'flipped' if flip else 'standard seller-perspective'} reading).")
+    return sig, lines
+
+
 def evaluate_oi_change_signal(params, snap):
     """ΔOI dominance, in either Absolute or N× mode."""
     if not snap:
@@ -4017,6 +4261,8 @@ def evaluate_option_chain_signal(strategy, params, df=None):
         return evaluate_oi_signal(params, snap)
     if strategy == "OI Change Based (ΔOI)":
         return evaluate_oi_change_signal(params, snap)
+    if strategy == "OI Velocity (ΔOI per N seconds)":
+        return evaluate_oi_velocity_signal(params, snap)
     if strategy == "OI + Volume Change Based":
         return evaluate_oi_volume_signal(params, snap)
     if strategy == "PCR Based (Put-Call Ratio)":
@@ -4277,7 +4523,7 @@ def zero_hero_state(df, params):
 
     # 2 ── entry window
     start_t = params.get("zh_start_time", dtime(9, 45))
-    end_t = params.get("zh_end_time", dtime(13, 30))
+    end_t = params.get("zh_end_time", dtime(15, 30))
     try:
         tod = pd.Series(pd.DatetimeIndex(idx).time, index=idx)
         out["window"] = tod.apply(lambda t: start_t <= t <= end_t)
@@ -4373,7 +4619,7 @@ def zero_hero_state(df, params):
     out["fresh_long"], out["fresh_short"] = fresh_long.copy(), fresh_short.copy()
 
     # 8 ── cap entries per day so a choppy expiry cannot bleed the account
-    max_per_day = int(params.get("zh_max_per_day", 2))
+    max_per_day = int(params.get("zh_max_per_day", 10000))
     out["used_today"] = 0
     out["cap_blocked"] = False
     if max_per_day > 0:
@@ -6533,10 +6779,23 @@ def render_config_controls(ui, prefix="sb"):
                    "Impulse-only restricts entries to swings that continue the structure.")
     if strategy in OPTION_CHAIN_STRATEGIES:
         # ---- shared chain source (all option-chain strategies use this) ----
-        params["oi_underlying"] = cfg_selectbox(ui, "Option Chain Underlying", "oi_underlying",
-                                                list(DHAN_INDEX_MAP.keys()), default="Nifty50", prefix=prefix)
-        _oi_meta = DHAN_INDEX_MAP[params["oi_underlying"]]
-        _oi_exps = dhan_get_expiries(_oi_meta["underlying"], "OPTIDX", _oi_meta["exchange"])
+        params["oi_kind"] = cfg_selectbox(ui, "Underlying type", "oi_kind", ["Index", "Stock"],
+                                          default="Index", prefix=prefix)
+        if params["oi_kind"] == "Index":
+            params["oi_underlying"] = cfg_selectbox(ui, "Option Chain Underlying", "oi_underlying",
+                                                    list(DHAN_INDEX_MAP.keys()), default="Nifty50", prefix=prefix)
+        else:
+            params["oi_underlying"] = cfg_text(ui, "Stock symbol (NSE F&O, e.g. RELIANCE)",
+                                               "oi_stock", "RELIANCE", prefix=prefix)
+            ui.caption("Only stocks with listed options work here — the chain endpoint returns nothing for "
+                       "non-F&O symbols.")
+        _oi_info = resolve_chain_underlying(params["oi_kind"], params["oi_underlying"])
+        if not _oi_info:
+            ui.warning(f"Could not resolve '{params['oi_underlying']}' in Dhan's scrip master.")
+            _oi_exps = []
+        else:
+            _oi_exps = dhan_get_expiries(_oi_info["underlying"], _oi_info["opt_instrument"],
+                                         _oi_info["exchange"])
         if _oi_exps:
             params["oi_expiry"] = cfg_selectbox(ui, "Chain Expiry (nearest pre-selected)", "oi_expiry",
                                                 _oi_exps, default=_oi_exps[0], prefix=prefix)
@@ -6575,6 +6834,37 @@ def render_config_controls(ui, prefix="sb"):
                    "is unwinding rather than position building; when one side rises while the other is flat or "
                    "falling the ratio is undefined, so that counts as one-sided dominance in its own right and the "
                    "status board says so. Both ratios are always displayed, so you can see exactly what was tested.")
+
+    if strategy == "OI Velocity (ΔOI per N seconds)":
+        params["oivel_seconds"] = cfg_number(ui, "Measurement window (seconds)", "oivel_seconds",
+                                             40, 5, 3600, is_int=True, prefix=prefix)
+        params["oivel_mode"] = cfg_selectbox(ui, "Trigger mode", "oivel_mode",
+                                             ["N× multiple (must be n times the other)", "Absolute change"],
+                                             default="N× multiple (must be n times the other)", prefix=prefix)
+        if str(params["oivel_mode"]).startswith("N"):
+            params["oivel_n"] = cfg_number(ui, "N (either ratio may satisfy it)", "oivel_n",
+                                           2.0, 1.0, 1000.0, step=0.5, prefix=prefix)
+        else:
+            params["oivel_abs"] = cfg_number(ui, "Minimum absolute OI change in the window", "oivel_abs",
+                                             10000.0, 1.0, 1e12, step=1000.0, prefix=prefix)
+        params["oivel_flip"] = cfg_checkbox(ui, "Flip interpretation (buy the other leg)", "oivel_flip",
+                                            False, prefix=prefix)
+        ui.caption("Measures how FAST open interest is moving rather than how far it has moved since the open. "
+                   "A burst of writing or unwinding inside a short window is what precedes a fast move, and it is "
+                   "invisible in the day-cumulative ΔOI once the session is well advanced. N× mode tests both "
+                   "ratios symmetrically, exactly like the ΔOI strategy.")
+        ui.warning("⏱ **Sampling reality:** Dhan caches the option chain for 60 seconds and rate-limits that "
+                   "endpoint, so genuinely new samples arrive roughly once a minute. A 40-second window will "
+                   "usually be answered with the closest span actually available, and the status board reports the "
+                   "REAL measurement window next to your requested one. A window shorter than ~60s cannot be "
+                   "measured more finely than the feed allows — that is a data limit, not a setting to tune.")
+        _ovk = f"{params.get('oi_underlying', 'Nifty50')}|{params.get('oi_expiry', '')}"
+        _ov = oi_velocity_window(params.get("oivel_seconds", 40), _ovk)
+        if _ov:
+            ui.caption(f"Live: ΔCE {_ov[0]:+,.0f} · ΔPE {_ov[1]:+,.0f} over the last {_ov[2]:.0f}s "
+                       f"({_ov[3]} samples)")
+        else:
+            ui.caption("Live: not enough samples yet — run the analysis a couple of times to build the buffer.")
 
     if strategy == "OI + Volume Change Based":
         ui.markdown("**ΔOI condition**")
@@ -6708,16 +6998,17 @@ def render_config_controls(ui, prefix="sb"):
         params["zh_start_time"] = cfg_time(c1, "Entry window start (IST)", "zh_start_time",
                                            dtime(9, 45), prefix=prefix)
         params["zh_end_time"] = cfg_time(c2, "Entry window end (IST)", "zh_end_time",
-                                         dtime(13, 30), prefix=prefix)
+                                         dtime(15, 30), prefix=prefix)
         ui.caption("The window matters more than any other setting. Before ~09:45 no range has formed and premiums "
-                   "still carry morning volatility; after ~13:30 theta decay accelerates so sharply that even a "
-                   "correct directional call often loses money. Entering late is the most common way to lose the "
-                   "whole premium.")
+                   "still carry morning volatility. The default now runs to 15:30 so you control the cut-off "
+                   "yourself — but be aware that after roughly 13:30 theta decay accelerates sharply, and entering "
+                   "in the last hour of expiry is the most common way to lose the entire premium even on a correct "
+                   "directional call. Tighten this back if your results show late entries bleeding.")
         c1, c2 = ui.columns(2)
         params["zh_max_per_day"] = cfg_number(c1, "Maximum entries per day", "zh_max_per_day",
-                                              2, 1, 100, is_int=True, prefix=prefix)
+                                              10000, 1, 100000, is_int=True, prefix=prefix)
         params["zh_cooldown_bars"] = cfg_number(c2, "Cooldown between entries (bars, 0 = off)", "zh_cooldown_bars",
-                                                15, 0, 500, is_int=True, prefix=prefix)
+                                                1, 0, 500, is_int=True, prefix=prefix)
         ui.caption("A breakout condition stays true for as long as price holds beyond the range, so entries fire "
                    "only on the FIRST qualifying bar of each move — a later bar of the same breakout is a "
                    "continuation, not a new setup. The cooldown then keeps the same side from re-triggering "
@@ -7702,6 +7993,25 @@ def render_config_controls(ui, prefix="sb"):
     else:
         ui.caption("Disabled by default. Live trading tab runs in paper/simulation mode until enabled.")
 
+    # -------------------------------------------------- SAVE CONFIG ------
+    ui.markdown("### 💾 Save Configuration")
+    save_cfg_enabled = cfg_checkbox(ui, "Save this configuration to the database", "save_cfg_enabled",
+                                    False, prefix=prefix)
+    if save_cfg_enabled:
+        _pname = cfg_text(ui, "Name for this configuration", "save_cfg_name",
+                          f"{strategy[:18]} {interval}", prefix=prefix)
+        if not db_enabled():
+            ui.warning("Enable **Data Persistence** in the Admin Panel first — presets are stored in the database.")
+        elif ui.button("💾 Save now", key=f"btn_{prefix}_save_cfg"):
+            _ok, _msg = db_save_config_preset(_pname)
+            if _ok:
+                ui.success(f"Saved as “{_pname}”. {_msg} Apply it any time from the Admin Panel.")
+            else:
+                ui.error(f"Could not save: {_msg}")
+        ui.caption("Stores every sidebar setting except secrets (Dhan token, Gmail app password, Groq key) and "
+                   "auto-resolved contract IDs — those are re-resolved live, so restoring a stale one would be "
+                   "wrong. Load a saved configuration from the Admin Panel instead of reconfiguring by hand.")
+
     # ----------------------------------------------------------- EMAIL   --
     ui.markdown("### 📧 Email Notifications")
     email_enabled = cfg_checkbox(ui, "Send Email Notification", "email_enabled", False, prefix=prefix)
@@ -8014,7 +8324,7 @@ def describe_signal_status(df, strategy, params, filters):
                          f"({zh.get('range_label', 'range')} · {zh.get('expiry_note', '')})")
             lines.append(f"   1. Expiry day: {_mark(zh['expiry'].iloc[_i])}")
             _st_t = params.get("zh_start_time", dtime(9, 45))
-            _en_t = params.get("zh_end_time", dtime(13, 30))
+            _en_t = params.get("zh_end_time", dtime(15, 30))
             lines.append(f"   2. Entry window {_st_t.strftime('%H:%M')}–{_en_t.strftime('%H:%M')} IST: "
                          f"{_mark(zh['window'].iloc[_i])}")
             _rh = zh["ref_high"].iloc[_i]
@@ -9071,10 +9381,10 @@ def render_bin_analysis_section(t1, t2, t1_name, t2_name, p1, diff, fetch_interv
 # ============================================================================
 
 (tab_bt, tab_live, tab_hist, tab_heat, tab_opt, tab_spread, tab_ohlc,
- tab_chain, tab_screen, tab_search, tab_dl, tab_admin) = st.tabs(
+ tab_chain, tab_pcr, tab_screen, tab_search, tab_dl, tab_admin) = st.tabs(
     ["📊 Backtest", "🔴 Live Trading", "📜 Trade History", "🔥 Heatmaps", "🧪 Optimization",
-     "🔀 Spread Tool", "📅 OHLC & Range", "🔗 Option Chain Analysis", "🔎 Screener",
-     "🧭 Strategy Search", "⬇️ Data Download", "🛠 Admin Panel"]
+     "🔀 Spread Tool", "📅 OHLC & Range", "🔗 Option Chain Analysis", "📉 PCR Timeline",
+     "🔎 Screener", "🧭 Strategy Search", "⬇️ Data Download", "🛠 Admin Panel"]
 )
 
 # ---------------------------------------------------------------- BACKTEST -
@@ -10330,6 +10640,222 @@ with tab_screen:
                    "the screener, or use the Option Chain Analysis tab for chain work.")
 
 
+# --------------------------------------------------------- PCR TIMELINE ----
+with tab_pcr:
+    st.subheader("📉 PCR Timeline")
+    st.caption("Put-Call Ratio against time for any index or stock option chain — minute-wise for the current "
+               "session, and across previous days from stored history.")
+
+    p1, p2, p3 = st.columns(3)
+    pcr_kind = cfg_selectbox(p1, "Underlying type", "pcr_kind", ["Index", "Stock"], default="Index")
+    if pcr_kind == "Index":
+        pcr_name = cfg_selectbox(p2, "Index", "pcr_index", list(DHAN_INDEX_MAP.keys()), default="Nifty50")
+    else:
+        pcr_name = cfg_text(p2, "Stock symbol (NSE F&O, e.g. RELIANCE)", "pcr_stock", "RELIANCE")
+    _pcr_info = resolve_chain_underlying(pcr_kind, pcr_name)
+    _pcr_label = _pcr_info["label"] if _pcr_info else str(pcr_name)
+    if _pcr_info:
+        _pcr_exps = dhan_get_expiries(_pcr_info["underlying"], _pcr_info["opt_instrument"],
+                                      _pcr_info["exchange"])
+    else:
+        _pcr_exps = []
+        st.warning(f"Could not resolve '{pcr_name}' in Dhan's scrip master — stock chains require listed options.")
+    if _pcr_exps:
+        pcr_expiry = cfg_selectbox(p3, "Expiry", "pcr_expiry", _pcr_exps, default=_pcr_exps[0])
+    else:
+        pcr_expiry = cfg_text(p3, "Expiry (YYYY-MM-DD)", "pcr_expiry_manual", "")
+
+    b1, b2, b3 = st.columns([1, 1, 2])
+    if b1.button("🔍 Capture now", use_container_width=True):
+        _s = get_chain_snapshot_for(_pcr_info, pcr_expiry)
+        record_chain_history(_s, get_futures_price(_pcr_info), _pcr_label)
+        if _s:
+            st.success(f"Captured PCR {_s['pcr']:.4f} at {_s['fetched_at']}." if _s.get("pcr")
+                       else f"Captured at {_s['fetched_at']}.")
+        else:
+            st.warning("No snapshot returned — check the Dhan token, expiry, and that the market is open.")
+    _pcr_live = b2.toggle("▶ Auto-capture", value=False, key="pcr_auto",
+                          help="Keeps capturing every 60s so the intraday line builds itself.")
+    b3.caption("Dhan caches the chain for 60s, so one genuinely new point arrives per minute. "
+               "Enable **Data Persistence** (Admin Panel) to keep history across sessions and days.")
+
+    # =================== SECTION 1 — INTRADAY, MINUTE-WISE ===================
+    st.markdown("---")
+    st.markdown("### 🕐 Intraday — PCR vs time (minute-wise)")
+
+    i1, i2, i3 = st.columns(3)
+    pcr_tf = cfg_selectbox(i1, "Timeframe", "pcr_tf",
+                           ["1m", "2m", "3m", "5m", "10m", "15m", "30m", "60m"], default="1m")
+    pcr_session = cfg_selectbox(i2, "Session", "pcr_session",
+                                ["Today", "Last recorded session"], default="Today")
+    pcr_fill = cfg_selectbox(i3, "Missing minutes", "pcr_fill",
+                             ["Carry last known value (no gaps)", "Leave blank"],
+                             default="Carry last known value (no gaps)")
+
+    @st.fragment(run_every=(60 if _pcr_live else None))
+    def _pcr_intraday():
+        if _pcr_live:
+            _s = get_chain_snapshot_for(_pcr_info, pcr_expiry)
+            record_chain_history(_s, get_futures_price(_pcr_info), _pcr_label)
+
+        hist = chain_history_df()
+        if hist.empty:
+            st.info("No snapshots recorded yet — press **Capture now**, or turn on Auto-capture.")
+            return
+        day = intraday_slice(hist) if pcr_session == "Today" else hist
+        if day.empty:
+            st.info("Nothing recorded for today yet.")
+            return
+
+        # Build a continuous minute grid across the session so the table has no
+        # missing rows, then attach each snapshot's PCR to it.
+        try:
+            ts = _norm_ts(day["Timestamp"])
+            day = day.assign(Timestamp=ts).dropna(subset=["Timestamp"]).sort_values("Timestamp")
+            d0 = ts.dt.normalize().iloc[-1]
+            start = d0 + pd.Timedelta(hours=9, minutes=15)
+            end = min(d0 + pd.Timedelta(hours=15, minutes=30),
+                      _norm_ts(pd.Series([ist_now()])).iloc[0])
+            grid = pd.DataFrame({"Timestamp": pd.date_range(start, end, freq=_TF_RULE.get(pcr_tf, "1min"))})
+            merged = pd.merge_asof(grid, day[[c for c in ["Timestamp", "PCR", "PCR Volume", "Price", "Futures",
+                                                          "CE OI", "PE OI", "Total OI", "CE ΔOI", "PE ΔOI",
+                                                          "CE Volume", "PE Volume", "Max Pain"]
+                                              if c in day.columns]],
+                                   on="Timestamp", direction="backward")
+            if pcr_fill.startswith("Leave"):
+                exact = set(day["Timestamp"])
+                mask = ~merged["Timestamp"].isin(exact)
+                for c in merged.columns:
+                    if c != "Timestamp":
+                        merged.loc[mask, c] = np.nan
+        except Exception as exc:
+            st.warning(f"Could not build the minute grid ({exc}); showing raw snapshots instead.")
+            merged = day.copy()
+
+        merged = merged.dropna(how="all", subset=[c for c in merged.columns if c != "Timestamp"])
+        if merged.empty or "PCR" not in merged.columns or merged["PCR"].notna().sum() == 0:
+            st.info("No PCR values recorded for this session yet.")
+            return
+
+        _real = int(day["PCR"].notna().sum()) if "PCR" in day.columns else 0
+        st.caption(f"{len(merged)} rows on the {pcr_tf} grid · {_real} real snapshot(s) · "
+                   f"{'gaps carried forward' if pcr_fill.startswith('Carry') else 'gaps left blank'} · "
+                   f"all times IST")
+
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=merged["Timestamp"], y=pd.to_numeric(merged["PCR"], errors="coerce"),
+                                 mode="lines+markers", name="PCR",
+                                 line=dict(width=2, color="#4c9be8"), marker=dict(size=4),
+                                 hovertemplate="<b>PCR</b> %{y:.4f}<br>%{x|%d-%b %H:%M} IST<extra></extra>"))
+        fig.add_hline(y=1.0, line_dash="dot", line_color="#888",
+                      annotation_text="PCR = 1.0 (neutral)", annotation_position="top left")
+        fig.update_layout(title=f"{_pcr_label} — PCR vs time ({pcr_tf}, IST)",
+                          height=430, hovermode="x unified",
+                          xaxis_title="Time (IST)", yaxis_title="PCR (OI)",
+                          margin=dict(l=60, r=40, t=60, b=40))
+        st.plotly_chart(fig, use_container_width=True, key="pcr_intraday_plot")
+
+        s = pd.to_numeric(merged["PCR"], errors="coerce").dropna()
+        if len(s):
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("Latest PCR", f"{s.iloc[-1]:.4f}", f"{s.iloc[-1] - s.iloc[0]:+.4f} vs open")
+            m2.metric("Session high", f"{s.max():.4f}")
+            m3.metric("Session low", f"{s.min():.4f}")
+            m4.metric("Average", f"{s.mean():.4f}")
+
+        tbl = merged.copy()
+        tbl.insert(0, "Time (IST)", pd.to_datetime(tbl["Timestamp"]).dt.strftime("%d-%b-%Y %H:%M:%S"))
+        tbl = tbl.drop(columns=["Timestamp"])
+        for c in tbl.columns:
+            if tbl[c].dtype.kind == "f":
+                tbl[c] = tbl[c].round(4)
+        st.dataframe(tbl.iloc[::-1], hide_index=True, use_container_width=True, height=380)
+        _export_buttons(tbl, f"pcr_intraday_{_pcr_label}_{pcr_tf}", "pcr_intra")
+
+    _pcr_intraday()
+
+    # =================== SECTION 2 — MULTI-DAY ===================
+    st.markdown("---")
+    st.markdown("### 📅 Multi-day — PCR vs time")
+
+    d1, d2, d3 = st.columns(3)
+    pcr_days = cfg_selectbox(d1, "Look back", "pcr_days",
+                             [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 15, 20, 30, 90, 120, 180, 360],
+                             default=7)
+    pcr_days_tf = cfg_selectbox(d2, "Aggregate to", "pcr_days_tf",
+                                ["Raw snapshots", "5m", "15m", "30m", "60m", "Daily close", "Daily average"],
+                                default="60m")
+    pcr_days_expiry = cfg_selectbox(d3, "Expiry filter", "pcr_days_expiry_mode",
+                                    ["Selected expiry only", "All expiries"], default="All expiries")
+
+    if not db_enabled():
+        st.warning("Multi-day history needs **Data Persistence** enabled in the Admin Panel — Dhan has no "
+                   "historical option-chain API, so the only multi-day source is what this app has recorded. "
+                   "Turn it on and history accumulates from then on.")
+
+    _mdf = db_load_chain_history(_pcr_label,
+                                pcr_expiry if pcr_days_expiry.startswith("Selected") else None,
+                                since_days=int(pcr_days)) if db_enabled() else pd.DataFrame()
+    if _mdf.empty:
+        st.info(f"No stored snapshots for {_pcr_label} in the last {pcr_days} day(s) yet.")
+    else:
+        _md = _mdf.copy()
+        _md["Timestamp"] = _norm_ts(_md["Timestamp"])
+        _md = _md.dropna(subset=["Timestamp"]).sort_values("Timestamp")
+        if pcr_days_tf == "Daily close":
+            _md = _md.set_index("Timestamp").resample("1D").last().dropna(how="all").reset_index()
+        elif pcr_days_tf == "Daily average":
+            _num = _md.set_index("Timestamp").select_dtypes("number")
+            _md = _num.resample("1D").mean().dropna(how="all").reset_index()
+        elif pcr_days_tf != "Raw snapshots":
+            _agg = {c: "last" for c in _md.columns if c not in ("Timestamp",) and _md[c].dtype.kind == "f"}
+            _md = _md.set_index("Timestamp").resample(_TF_RULE.get(pcr_days_tf, "60min")).agg(_agg)
+            _md = _md.dropna(how="all").reset_index()
+        _md = _md[_md.get("PCR").notna()] if "PCR" in _md.columns else _md
+
+        if _md.empty or "PCR" not in _md.columns:
+            st.info("No PCR values in the selected window.")
+        else:
+            st.caption(f"{len(_md)} points across {int(pcr_days)} day(s) · "
+                       f"{pcr_days_tf} · {'this expiry only' if pcr_days_expiry.startswith('Selected') else 'all expiries'} "
+                       "· all times IST")
+            f2 = go.Figure()
+            f2.add_trace(go.Scatter(x=_md["Timestamp"], y=pd.to_numeric(_md["PCR"], errors="coerce"),
+                                    mode="lines+markers", name="PCR",
+                                    line=dict(width=2, color="#38b000"), marker=dict(size=4),
+                                    hovertemplate="<b>PCR</b> %{y:.4f}<br>%{x|%d-%b-%Y %H:%M} IST<extra></extra>"))
+            if "Price" in _md.columns and _md["Price"].notna().any():
+                f2.add_trace(go.Scatter(x=_md["Timestamp"], y=pd.to_numeric(_md["Price"], errors="coerce"),
+                                        mode="lines", name="Spot", yaxis="y2",
+                                        line=dict(width=1.5, color="#f0a202"),
+                                        hovertemplate="<b>Spot</b> %{y:,.2f}<extra></extra>"))
+                f2.update_layout(yaxis2=dict(title="Spot", overlaying="y", side="right", showgrid=False))
+            f2.add_hline(y=1.0, line_dash="dot", line_color="#888")
+            f2.update_layout(title=f"{_pcr_label} — PCR over the last {int(pcr_days)} day(s)",
+                             height=450, hovermode="x unified",
+                             xaxis_title="Date / time (IST)", yaxis_title="PCR (OI)",
+                             margin=dict(l=60, r=60, t=60, b=40),
+                             legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0))
+            st.plotly_chart(f2, use_container_width=True, key="pcr_multiday_plot")
+
+            _s2 = pd.to_numeric(_md["PCR"], errors="coerce").dropna()
+            if len(_s2):
+                n1, n2, n3, n4 = st.columns(4)
+                n1.metric("Latest", f"{_s2.iloc[-1]:.4f}")
+                n2.metric("High", f"{_s2.max():.4f}")
+                n3.metric("Low", f"{_s2.min():.4f}")
+                n4.metric("Average", f"{_s2.mean():.4f}")
+
+            _t2 = _md.copy()
+            _t2.insert(0, "Time (IST)", pd.to_datetime(_t2["Timestamp"]).dt.strftime("%d-%b-%Y %H:%M:%S"))
+            _t2 = _t2.drop(columns=["Timestamp"])
+            for c in _t2.columns:
+                if _t2[c].dtype.kind == "f":
+                    _t2[c] = _t2[c].round(4)
+            st.dataframe(_t2.iloc[::-1], hide_index=True, use_container_width=True, height=380)
+            _export_buttons(_t2, f"pcr_{int(pcr_days)}d_{_pcr_label}", "pcr_multi")
+
+
 # ------------------------------------------------------- STRATEGY SEARCH ----
 with tab_search:
     st.subheader("🧭 Strategy Search")
@@ -10903,6 +11429,41 @@ with tab_admin:
         st.info("Persistence is OFF (default): everything lives in memory only, so an open position is lost if the "
                 "browser tab is discarded or the machine sleeps. Enable it to survive restarts and to unlock the "
                 "multi-day analysis windows on the Option Chain tab.")
+
+    st.markdown("##### 💾 Saved Configurations")
+    if not _db_on:
+        st.caption("Enable the database above to save and restore sidebar configurations.")
+    else:
+        _presets = db_load_config_presets()
+        if not _presets:
+            st.caption("No configurations saved yet. Tick **Save this configuration to the database** in the "
+                       "sidebar, name it, and press Save now.")
+        else:
+            st.dataframe(pd.DataFrame([{
+                "ID": p["id"], "Name": p["name"],
+                "Saved": str(p["saved_at"])[:19].replace("T", " "),
+                "Ticker": p["ticker"], "Strategy": p["strategy"],
+                "TF": p["interval"], "Period": p["period"],
+            } for p in _presets]), hide_index=True, use_container_width=True)
+            _pmap = {f"#{p['id']} · {p['name']} ({p['strategy'][:24]} {p['interval']})": p for p in _presets}
+            _psel = st.selectbox("Configuration", list(_pmap.keys()), key="cfg_preset_pick")
+            _prow = _pmap[_psel]
+            pc1, pc2, pc3 = st.columns(3)
+            if pc1.button("📥 Apply to sidebar", use_container_width=True, key="cfg_preset_apply"):
+                try:
+                    _n = apply_config_preset(json.loads(_prow["payload"]))
+                    st.session_state["cfg_applied_msg"] = f"Loaded “{_prow['name']}” — {_n} settings applied ✅"
+                    st.rerun()
+                except Exception as exc:
+                    st.error(f"Could not apply: {exc}")
+            if pc2.button("🗑 Delete", use_container_width=True, key="cfg_preset_del"):
+                if db_delete_config_preset(_prow["id"]):
+                    st.success(f"Deleted #{_prow['id']}.")
+                    st.rerun()
+            pc3.caption("Applying overwrites the sidebar on the next run. Secrets and auto-resolved contract IDs "
+                        "are not restored — re-enter the token once and the IDs refill themselves.")
+            with st.expander("View stored settings"):
+                st.json(json.loads(_prow["payload"]))
 
     st.markdown("##### 📦 Delivery Positions (carried over from intraday)")
     if not _db_on:
