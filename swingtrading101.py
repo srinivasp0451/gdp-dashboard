@@ -137,11 +137,17 @@ SL_TYPES = [
     "Trailing Percentage",
     "Trailing ATR (Chandelier)",
     "Step Trail (trigger k, trail N)",
+    # --- candle structure ---
     "Previous Candle Low/High",
-    "Trailing Previous Candle Low/High",
     "Current Candle Low/High",
+    "Trail Previous Candle Low/High",
+    "Trail Current Candle Low/High",
+    # --- swing structure ---
     "Previous Swing Low/High",
-    "Trailing Swing Low/High",
+    "Current Swing Low/High",
+    "Trail Previous Swing Low/High",
+    "Trail Current Swing Low/High",
+    # --- signal driven ---
     "Price Action Structure Break",
     "EMA Reverse Crossover",
     "Strategy Reverse Signal",
@@ -153,24 +159,56 @@ TP_TYPES = [
     "Fixed Points",
     "ATR Multiple",
     "Risk : Reward Multiple",
-    "Previous Swing High/Low",
     "Trailing Target (display only)",
+    # --- candle structure ---
+    "Previous Candle High/Low",
+    "Current Candle High/Low",
+    "Trail Previous Candle High/Low",
+    "Trail Current Candle High/Low",
+    # --- swing structure ---
+    "Previous Swing High/Low",
+    "Current Swing High/Low",
+    "Trail Previous Swing High/Low",
+    "Trail Current Swing High/Low",
+    # --- signal driven ---
     "EMA Reverse Crossover",
     "Strategy Reverse Signal",
     "No Target",
 ]
 
-# Exit types that need no numeric magnitude from the user.
-_SL_NO_VALUE = {"Previous Candle Low/High", "Current Candle Low/High",
-                "Previous Swing Low/High", "Trailing Swing Low/High",
-                "Trailing Previous Candle Low/High", "Price Action Structure Break",
-                "EMA Reverse Crossover", "Strategy Reverse Signal", "No Stop-Loss"}
-_TP_NO_VALUE = {"Previous Swing High/Low", "EMA Reverse Crossover",
-                "Strategy Reverse Signal", "No Target"}
+# Structural exits take their level from the chart, so they need no magnitude.
+_STRUCTURAL_SL = {
+    "Previous Candle Low/High", "Current Candle Low/High",
+    "Trail Previous Candle Low/High", "Trail Current Candle Low/High",
+    "Previous Swing Low/High", "Current Swing Low/High",
+    "Trail Previous Swing Low/High", "Trail Current Swing Low/High",
+    "Price Action Structure Break",
+}
+_STRUCTURAL_TP = {
+    "Previous Candle High/Low", "Current Candle High/Low",
+    "Trail Previous Candle High/Low", "Trail Current Candle High/Low",
+    "Previous Swing High/Low", "Current Swing High/Low",
+    "Trail Previous Swing High/Low", "Trail Current Swing High/Low",
+}
+_SL_NO_VALUE = _STRUCTURAL_SL | {"EMA Reverse Crossover", "Strategy Reverse Signal", "No Stop-Loss"}
+_TP_NO_VALUE = _STRUCTURAL_TP | {"EMA Reverse Crossover", "Strategy Reverse Signal", "No Target"}
 
-TRAILING_SL_TYPES = {"Trailing Points", "Trailing Percentage", "Trailing ATR (Chandelier)",
-                     "Step Trail (trigger k, trail N)", "Trailing Previous Candle Low/High",
-                     "Trailing Swing Low/High", "Price Action Structure Break"}
+TRAILING_SL_TYPES = {
+    "Trailing Points", "Trailing Percentage", "Trailing ATR (Chandelier)",
+    "Step Trail (trigger k, trail N)", "Trail Previous Candle Low/High",
+    "Trail Current Candle Low/High", "Trail Previous Swing Low/High",
+    "Trail Current Swing Low/High", "Price Action Structure Break",
+}
+TRAILING_TP_TYPES = {
+    "Trailing Target (display only)", "Trail Previous Candle High/Low",
+    "Trail Current Candle High/Low", "Trail Previous Swing High/Low",
+    "Trail Current Swing High/Low",
+}
+
+# Wall-clock length of one candle, used to decide whether a feed has gone stale.
+INTERVAL_SECONDS = {"1m": 60, "2m": 120, "3m": 180, "5m": 300, "10m": 600, "15m": 900,
+                    "30m": 1800, "60m": 3600, "4h": 14400, "1d": 86400,
+                    "1wk": 604800, "1mo": 2592000}
 
 DEFAULT_PARAMS: dict[str, float] = {
     "ema_fast": 9, "ema_slow": 21, "ema_mid": 50, "ema_macro": 200,
@@ -459,19 +497,26 @@ def vwap(df: pd.DataFrame, intraday: bool) -> tuple[pd.Series, bool]:
 # ----------------------------------------------------- structure / swings ----
 def swing_levels(high: pd.Series, low: pd.Series, left: int = 3, right: int = 3):
     """
-    Last CONFIRMED swing high / swing low, with no look-ahead.
+    Confirmed swing levels, with no look-ahead.
 
-    A pivot at bar i is only knowable once `right` further bars have printed, so
-    the detected value is shifted forward by `right` before being carried. This
-    is the difference between a usable structural stop and a backtest that
-    quietly cheats.
+    Returns ``(current_high, current_low, previous_high, previous_low)`` where
+    "current" is the most recently confirmed pivot and "previous" is the one
+    before it. A pivot at bar i is only knowable once `right` further bars have
+    printed, so the detected value is shifted forward by `right` before being
+    carried. That shift is the difference between a usable structural stop and a
+    backtest that quietly cheats.
     """
     win = int(left) + int(right) + 1
     is_ph = high == high.rolling(win, center=True, min_periods=win).max()
     is_pl = low == low.rolling(win, center=True, min_periods=win).min()
-    sh = high.where(is_ph).shift(int(right)).ffill().rename("SWING_HIGH")
-    sl_ = low.where(is_pl).shift(int(right)).ffill().rename("SWING_LOW")
-    return sh, sl_
+    ph_raw = high.where(is_ph).shift(int(right))
+    pl_raw = low.where(is_pl).shift(int(right))
+
+    cur_h = ph_raw.ffill().rename("SWING_HIGH")
+    cur_l = pl_raw.ffill().rename("SWING_LOW")
+    prev_h = ph_raw.dropna().shift(1).reindex(high.index).ffill().rename("PREV_SWING_HIGH")
+    prev_l = pl_raw.dropna().shift(1).reindex(low.index).ffill().rename("PREV_SWING_LOW")
+    return cur_h, cur_l, prev_h, prev_l
 
 
 def zigzag_pivots(close: pd.Series, threshold_pct: float = 0.8) -> pd.Series:
@@ -527,7 +572,7 @@ def market_structure(df: pd.DataFrame, left=3, right=3):
     after a bullish break, -1 after a bearish break, carried forward until the
     opposite break occurs.
     """
-    sh, sl_ = swing_levels(df["High"], df["Low"], left, right)
+    sh, sl_, _, _ = swing_levels(df["High"], df["Low"], left, right)
     bull_bos = (df["Close"] > sh) & sh.notna()
     bear_bos = (df["Close"] < sl_) & sl_.notna()
     raw = pd.Series(np.where(bull_bos, 1, np.where(bear_bos, -1, np.nan)), index=df.index)
@@ -1450,8 +1495,8 @@ def s_smc_ob(df, p):
 # ------------------------------------------------ 19 SMC liquidity sweep -----
 def c_smc_sweep(df, p):
     out = df.copy()
-    sh, sl_ = swing_levels(out["High"], out["Low"],
-                           int(_p(p, "pivot_left")), int(_p(p, "pivot_right")))
+    sh, sl_, _, _ = swing_levels(out["High"], out["Low"],
+                                 int(_p(p, "pivot_left")), int(_p(p, "pivot_right")))
     out["swing_high"], out["swing_low"] = sh, sl_
     # Wick takes out the pool of liquidity, body closes back inside the range.
     long = (out["Low"] < sl_) & (out["Close"] > sl_) & (out["Close"] > out["Open"])
@@ -1787,10 +1832,10 @@ def prepare(df: pd.DataFrame, strategy_name: str, params: dict,
         out["ema_slow"] = ema(out["Close"], int(_p(params, "ema_slow")))
     if "atr" not in out:
         out["atr"] = atr(out["High"], out["Low"], out["Close"], int(_p(params, "atr_len")))
-    if "swing_high" not in out or "swing_low" not in out:
-        sh, sl_ = swing_levels(out["High"], out["Low"],
-                               int(_p(params, "pivot_left")), int(_p(params, "pivot_right")))
-        out["swing_high"], out["swing_low"] = sh, sl_
+    sh, sl_, psh, psl = swing_levels(out["High"], out["Low"],
+                                     int(_p(params, "pivot_left")), int(_p(params, "pivot_right")))
+    out["swing_high"], out["swing_low"] = sh, sl_
+    out["prev_swing_high"], out["prev_swing_low"] = psh, psl
     out["prev_high"] = out["High"].shift(1)
     out["prev_low"] = out["Low"].shift(1)
 
@@ -1857,9 +1902,11 @@ class BarCtx:
     atr: float
     ema_fast: float
     ema_slow: float
-    swing_high: float
-    swing_low: float
-    prev_high: float
+    swing_high: float          # most recently CONFIRMED swing high
+    swing_low: float           # most recently CONFIRMED swing low
+    prev_swing_high: float     # the confirmed swing high before that one
+    prev_swing_low: float
+    prev_high: float           # previous candle's high
     prev_low: float
     signal: int
 
@@ -1871,6 +1918,7 @@ def bar_ctx(frame: pd.DataFrame, i: int) -> BarCtx:
         open=_f(row["Open"]), high=_f(row["High"]), low=_f(row["Low"]), close=_f(row["Close"]),
         atr=_f(row.get("atr")), ema_fast=_f(row.get("ema_fast")), ema_slow=_f(row.get("ema_slow")),
         swing_high=_f(row.get("swing_high")), swing_low=_f(row.get("swing_low")),
+        prev_swing_high=_f(row.get("prev_swing_high")), prev_swing_low=_f(row.get("prev_swing_low")),
         prev_high=_f(row.get("prev_high")), prev_low=_f(row.get("prev_low")),
         signal=int(row.get("signal", 0) or 0),
     )
@@ -1923,33 +1971,44 @@ class ExitManager:
         return float(level)
 
     # ------------------------------------------------------------- initial --
+    def _structural_level(self, kind: str, ctx: BarCtx, for_target: bool):
+        """
+        Resolve one structural level for the CURRENT trade direction.
+
+        A long's stop rides lows and its target rides highs; a short is the
+        mirror. `for_target` flips which side of the candle or swing we read.
+        """
+        want_high = (self.d > 0) if for_target else (self.d < 0)
+        if "Candle" in kind:
+            if "Previous" in kind:
+                return ctx.prev_high if want_high else ctx.prev_low
+            return ctx.high if want_high else ctx.low          # current candle
+        if "Swing" in kind or "Structure Break" in kind:
+            if "Previous" in kind:
+                return ctx.prev_swing_high if want_high else ctx.prev_swing_low
+            return ctx.swing_high if want_high else ctx.swing_low
+        return None
+
     def _initial_stop(self, ctx: BarCtx):
         t, v, d, e = self.risk.sl_type, float(self.risk.sl_value), self.d, self.entry
-        if t == "No Stop-Loss" or t in ("EMA Reverse Crossover", "Strategy Reverse Signal"):
+        if t in ("No Stop-Loss", "EMA Reverse Crossover", "Strategy Reverse Signal"):
             return None
-        if t == "Fixed Percentage":
+        if t == "Fixed Percentage" or t == "Trailing Percentage":
             return e - d * e * v / 100.0
         if t in ("Fixed Points", "Trailing Points", "Step Trail (trigger k, trail N)"):
             return e - d * v
-        if t == "Trailing Percentage":
-            return e - d * e * v / 100.0
         if t in ("ATR Multiple", "Trailing ATR (Chandelier)"):
-            atr_v = ctx.atr if np.isfinite(ctx.atr) else np.nan
-            if not np.isfinite(atr_v):
+            if not np.isfinite(ctx.atr):
                 return self._valid_stop(None, ctx, "ATR")
-            return e - d * v * atr_v
-        if t in ("Previous Candle Low/High", "Trailing Previous Candle Low/High"):
-            lvl = ctx.prev_low if d > 0 else ctx.prev_high
-            return self._valid_stop(lvl, ctx, "Previous candle extreme")
-        if t == "Current Candle Low/High":
-            # At entry the current candle has only just opened, so its low is not
-            # yet knowable. The signal candle's extreme is used until this candle
-            # completes, after which the stop rides the latest completed candle.
-            lvl = ctx.prev_low if d > 0 else ctx.prev_high
-            return self._valid_stop(lvl, ctx, "Signal candle extreme")
-        if t in ("Previous Swing Low/High", "Trailing Swing Low/High", "Price Action Structure Break"):
-            lvl = ctx.swing_low if d > 0 else ctx.swing_high
-            return self._valid_stop(lvl, ctx, "Confirmed swing")
+            return e - d * v * ctx.atr
+        if t in _STRUCTURAL_SL:
+            lvl = self._structural_level(t, ctx, for_target=False)
+            if "Current Candle" in t:
+                # At entry the current candle has only just opened, so its low is
+                # not yet knowable. The signal candle's extreme stands in until
+                # this candle completes.
+                lvl = ctx.prev_low if d > 0 else ctx.prev_high
+            return self._valid_stop(lvl, ctx, t)
         return self._valid_stop(None, ctx, t)
 
     def _initial_target(self, ctx: BarCtx):
@@ -1968,9 +2027,11 @@ class ExitManager:
                 risk_pts = self._fallback_distance(ctx)
                 self.notes.append("No measurable stop distance; the R:R target used an ATR proxy.")
             return e + d * v * risk_pts
-        if t == "Previous Swing High/Low":
-            lvl = ctx.swing_high if d > 0 else ctx.swing_low
-            return self._valid_target(lvl, ctx, "Confirmed swing")
+        if t in _STRUCTURAL_TP:
+            lvl = self._structural_level(t, ctx, for_target=True)
+            if "Current Candle" in t:
+                lvl = ctx.prev_high if d > 0 else ctx.prev_low
+            return self._valid_target(lvl, ctx, t)
         return None
 
     # ------------------------------------------------------------- trailing --
@@ -2010,12 +2071,8 @@ class ExitManager:
             if (self.mfe - e) * d >= float(self.risk.step_trigger):
                 raw = self.mfe - d * v
                 cand = max(e, raw) if d > 0 else min(e, raw)
-        elif t == "Trailing Previous Candle Low/High":
-            cand, structural = (ctx.prev_low if d > 0 else ctx.prev_high), True
-        elif t == "Current Candle Low/High":
-            cand, structural = (ctx.low if d > 0 else ctx.high), True
-        elif t in ("Trailing Swing Low/High", "Price Action Structure Break"):
-            cand, structural = (ctx.swing_low if d > 0 else ctx.swing_high), True
+        elif t in TRAILING_SL_TYPES:
+            cand, structural = self._structural_level(t, ctx, for_target=False), True
 
         if cand is not None and np.isfinite(cand):
             if structural:
@@ -2030,8 +2087,19 @@ class ExitManager:
             else:
                 self._ratchet(cand)
 
+        # ---- target trailing ----
+        tt = self.risk.tp_type
         if self.tp_display_only:
             self.tp = self.mfe + d * float(self.risk.tp_value)
+        elif tt in TRAILING_TP_TYPES:
+            # A trailing target may only extend AWAY from entry. Letting it drift
+            # closer would hand the trade an instant, fictitious fill.
+            tcand = self._structural_level(tt, ctx, for_target=True)
+            if tcand is not None and np.isfinite(tcand):
+                if self.tp is None:
+                    self.tp = float(tcand)
+                else:
+                    self.tp = max(self.tp, float(tcand)) if d > 0 else min(self.tp, float(tcand))
 
     # --------------------------------------------------------------- checks --
     @property
@@ -2250,7 +2318,7 @@ def run_backtest(df: pd.DataFrame, strategy_name: str, params: dict, risk: RiskC
     if trades_df.empty:
         warnings.append("This configuration produced no entries. Try a longer period, a faster "
                         "interval, fewer filters, or a strategy whose conditions occur more often.")
-    if risk.sl_type in TRAILING_SL_TYPES:
+    if risk.sl_type in TRAILING_SL_TYPES or risk.tp_type in TRAILING_TP_TYPES:
         warnings.append("A trailing stop is active. Backtested trailing results are APPROXIMATE: "
                         "OHLC candles cannot tell us whether price hit the trailing level before "
                         "or after the extreme that moved it. Treat these numbers as optimistic.")
@@ -2597,6 +2665,8 @@ class LiveSnapshot:
     bars: int
     data_warnings: list[str]
     vix: float | None = None
+    feed_age_seconds: float = 0.0
+    stale: bool = False
 
 
 def poll_market(cfg: dict) -> LiveSnapshot:
@@ -2616,6 +2686,15 @@ def poll_market(cfg: dict) -> LiveSnapshot:
         raise MarketDataError("Not enough candles to evaluate a live signal.")
 
     closed = -2                                     # last FULLY CLOSED candle
+    last_ts = pd.Timestamp(frame.index[-1])
+    now = pd.Timestamp.now(tz=last_ts.tz) if last_ts.tz is not None else pd.Timestamp.now()
+    age = float((now - last_ts).total_seconds())
+    bar_seconds = INTERVAL_SECONDS.get(cfg["interval"], 300)
+    # More than three candles have elapsed with nothing new printing: the venue
+    # is closed, halted, or the feed has stalled. Either way the LTP is frozen
+    # and nothing downstream should pretend otherwise.
+    stale = age > max(3 * bar_seconds, 120)
+
     return LiveSnapshot(
         frame=frame,
         ltp=float(frame["Close"].iloc[-1]),
@@ -2625,7 +2704,8 @@ def poll_market(cfg: dict) -> LiveSnapshot:
         raw_signal=int(frame["raw_signal"].iloc[closed]),
         status=strat.status(frame.iloc[:len(frame) + closed + 1], cfg["params"]),
         filter_reports=reports, fetched_at=pd.Timestamp.now(), bars=len(frame),
-        data_warnings=bundle.warnings, vix=extras.get("vix"))
+        data_warnings=bundle.warnings, vix=extras.get("vix"),
+        feed_age_seconds=age, stale=stale)
 
 
 def _live_close(position: Position, exit_price: float, reason: str) -> dict:
@@ -2760,6 +2840,12 @@ def run_cycle(cfg: dict) -> None:
         return
 
     # ----------------------------------------------------- 2. fresh entries ---
+    # A frozen feed cannot produce a fill worth having: the "live" price is just
+    # the last close from hours ago, so any entry books a fictitious price and
+    # then sits at exactly 0.00 PnL until the venue reopens.
+    if snapshot.stale and not cfg.get("allow_stale_entries"):
+        return
+
     strat = get_strategy(cfg["strategy"])
     if strat.immediate:
         direction = 1 if "Buy" in strat.name else -1
@@ -2966,6 +3052,12 @@ def render_sidebar() -> dict:
     if tp_type == "Trailing Target (display only)":
         sb.caption("Display only: this target trails the best price and never fires an exit. "
                    "The position is resolved by the stop or a strategy exit.")
+    if tp_type in TRAILING_TP_TYPES and tp_type != "Trailing Target (display only)":
+        sb.caption("A trailing target only ever extends AWAY from entry. It never drifts closer, "
+                   "which would hand the trade an instant fictitious fill.")
+    if tp_type in _STRUCTURAL_TP and "Trail" not in tp_type:
+        sb.caption("Structural target. If the level sits the wrong side of entry at fill time, "
+                   "no target is set and the stop or a strategy exit resolves the trade.")
 
     risk = RiskConfig(sl_type=sl_type, sl_value=float(sl_value), tp_type=tp_type,
                       tp_value=float(tp_value), quantity=float(quantity),
@@ -2982,6 +3074,11 @@ def render_sidebar() -> dict:
                  "minute. Yahoo throttles well before that and will return 429s, then block the "
                  "IP for a while. Yahoo index data is also delayed ~15 minutes, so polling faster "
                  "does not make it fresher.")
+    allow_stale = sb.checkbox("Live: allow entries on a frozen feed", value=False,
+                              disabled=live, key="cfg_stale",
+                              help="Off by default. When the venue is closed the LTP is just an "
+                                   "old candle close, so an entry books a fictitious price and "
+                                   "sits at 0.00 PnL until trading resumes.")
     fill_at_ltp = sb.checkbox("Live: fill at LTP instead of the N+1 open", value=False,
                               disabled=live, key="cfg_fill_ltp",
                               help="Default follows the N+1-open rule. Turn this on if you would "
@@ -3015,6 +3112,7 @@ def render_sidebar() -> dict:
             "period": eff_period, "requested_period": period, "strategy": strategy,
             "params": params, "risk": risk, "quantity": float(quantity),
             "poll_seconds": float(poll_seconds), "fill_at_ltp": bool(fill_at_ltp),
+            "allow_stale_entries": bool(allow_stale),
             "filter_cfg": filter_cfg, "filter_extras": filter_extras, "broker": broker,
             "currency": currency_symbol(symbol),
             "hide_weekends": not (symbol.endswith("-USD") or symbol.endswith("=X"))}
@@ -3212,8 +3310,6 @@ def _run_backtest_ui(cfg: dict) -> None:
 
 def _render_backtest(result: BacktestResult, meta: dict) -> None:
     cur, s = meta["currency"], result.stats
-    for w in result.warnings:
-        st.warning(w)
 
     st.markdown("#### Performance Summary")
     a = st.columns(5)
@@ -3229,6 +3325,11 @@ def _render_backtest(result: BacktestResult, meta: dict) -> None:
     b[2].metric("Average Loss", fmt(s["avg_loss"]))
     b[3].metric("Best / Worst", f"{fmt(s['best_trade'], 0)} / {fmt(s['worst_trade'], 0)}")
     b[4].metric("Warm-up Bars", f"{s['warmup_bars']:,}", f"{s['bars_tested']:,} tested")
+
+    if result.warnings:
+        with st.expander(f"Run notes and caveats ({len(result.warnings)})", expanded=False):
+            for w in result.warnings:
+                st.warning(w)
 
     strat = get_strategy(meta["strategy"])
     st.plotly_chart(price_chart(result.frame,
@@ -3321,6 +3422,11 @@ def _idle_panel(cfg: dict) -> None:
             f"`{cfg['symbol']}` every {fmt(cfg['poll_seconds'],1)}s automatically -- no clicking "
             f"required. Live window: `{live_period_for(cfg['interval'])}` of "
             f"{cfg['interval']} candles.")
+    snap = st.session_state.live_snapshot
+    if snap is not None and snap.stale:
+        st.error(f"Heads up: the last poll found the newest `{cfg['symbol']}` candle to be "
+                 f"{_human_age(snap.feed_age_seconds)} old. The venue is closed, so starting the "
+                 "core now will poll a frozen tape until it reopens.")
     if st.session_state.live_position is not None:
         st.warning("A tracked position is still open from the previous run. Square it off below.")
         _position_dashboard(st.session_state.live_position, st.session_state.live_snapshot,
@@ -3350,6 +3456,7 @@ def _live_body() -> None:
     for w in snapshot.data_warnings:
         st.warning(w)
 
+    _feed_banner(cfg, snapshot)
     _heartbeat(cfg, snapshot)
     position = st.session_state.live_position
     if position is not None:
@@ -3362,32 +3469,82 @@ def _live_body() -> None:
     _event_feed()
 
 
+_LIVE_FRAGMENTS: dict[float, Callable] = {}
+
+
 def _mount_live_fragment(poll_seconds: float) -> None:
     """
-    Auto-refresh without any human clicking.
+    Auto-refresh with nobody touching the keyboard.
 
-    The panel is wrapped in a fragment so only this section re-executes; a full
-    app rerun would reset the tab selection and discard the backtest in Tab 1.
-    The tick is the operator's poll interval, floored at the 0.3s API guard.
+    The panel is a fragment so only this section re-executes; a full app rerun
+    would reset the tab selection and discard the backtest in Tab 1.
+
+    The decorated fragment is CACHED per tick length. Re-decorating on every
+    script rerun creates a fresh fragment identity each time, which can orphan
+    the previously scheduled auto-rerun and leave the panel looking frozen.
     """
     tick = max(API_GUARD_DELAY, float(poll_seconds))
-    if hasattr(st, "fragment"):
-        st.fragment(run_every=tick)(_live_body)()
-    else:                                                          # legacy fallback
+    if not hasattr(st, "fragment"):                                # legacy fallback
         _live_body()
         time.sleep(tick)
         st.rerun()
+        return
+    frag = _LIVE_FRAGMENTS.get(tick)
+    if frag is None:
+        frag = st.fragment(run_every=tick)(_live_body)
+        _LIVE_FRAGMENTS[tick] = frag
+    frag()
+
+
+def _feed_banner(cfg: dict, snapshot: LiveSnapshot) -> None:
+    """Say out loud whether the tape is actually moving."""
+    age = snapshot.feed_age_seconds
+    if not snapshot.stale:
+        return
+    hours = age / 3600.0
+    human = f"{hours:.1f} hours" if hours >= 1 else f"{age/60:.0f} minutes"
+    st.error(
+        f"**FEED FROZEN — the venue looks closed.** The newest candle for "
+        f"`{cfg['symbol']}` is {human} old ({fmt_time(snapshot.last_closed_time)}), so the "
+        f"LTP shown below is simply that candle's close and it will not move until trading "
+        f"resumes. The engine is still polling every {fmt(cfg['poll_seconds'],1)}s and will "
+        f"pick up the first live tick automatically. New entries are suppressed while the "
+        f"feed is frozen, because filling at a stale price books a fictitious entry that then "
+        f"sits at exactly 0.00 PnL."
+    )
 
 
 def _heartbeat(cfg: dict, snapshot: LiveSnapshot) -> None:
-    age = (pd.Timestamp.now() - snapshot.fetched_at).total_seconds()
-    c = st.columns(5)
-    c[0].metric("Last Traded Price", fmt(snapshot.ltp))
-    c[1].metric("Candle N+1 Open", fmt(snapshot.next_open),
-                fmt_signed(snapshot.ltp - snapshot.next_open) + " vs LTP")
-    c[2].metric("Last Closed Candle", fmt_time(snapshot.last_closed_time))
-    c[3].metric("Feed Age", f"{age:,.0f}s", f"poll {fmt(cfg['poll_seconds'],1)}s")
-    c[4].metric("Polls", f"{st.session_state.live_poll_count:,}", f"{snapshot.bars:,} candles")
+    now = pd.Timestamp.now()
+    since_poll = (now - snapshot.fetched_at).total_seconds()
+    next_in = max(0.0, float(cfg["poll_seconds"]) - since_poll)
+
+    c = st.columns(6)
+    c[0].metric("LTP", fmt(snapshot.ltp), help="Close of the most recent candle on the feed.")
+    c[1].metric("N+1 Open", fmt(snapshot.next_open),
+                fmt_signed(snapshot.ltp - snapshot.next_open),
+                help="Open of the candle after the signal candle: the backtest-consistent "
+                     "fill price. The delta is LTP minus that open.")
+    c[2].metric("Last Candle", pd.Timestamp(snapshot.last_closed_time).strftime("%d %b %H:%M"),
+                help=fmt_time(snapshot.last_closed_time))
+    c[3].metric("Candle Age", _human_age(snapshot.feed_age_seconds),
+                "FROZEN" if snapshot.stale else "live",
+                help="Wall-clock age of the newest candle. This is what tells you whether the "
+                     "market is open.")
+    c[4].metric("Polls", f"{st.session_state.live_poll_count:,}",
+                f"next in {next_in:0.1f}s", help="Increments on every automatic refresh.")
+    c[5].metric("Clock", now.strftime("%H:%M:%S"),
+                help="Redraws on every tick. If this is moving, the auto-refresh is alive.")
+
+
+def _human_age(seconds: float) -> str:
+    if seconds < 90:
+        return f"{seconds:.0f}s"
+    if seconds < 5400:
+        return f"{seconds/60:.0f}m"
+    if seconds < 172800:
+        return f"{seconds/3600:.1f}h"
+    return f"{seconds/86400:.1f}d"
 
 
 def _position_dashboard(position: Position, snapshot, currency: str) -> None:
@@ -3401,25 +3558,27 @@ def _position_dashboard(position: Position, snapshot, currency: str) -> None:
         f"{side} {position.symbol} :: running {fmt_signed(pnl)} {currency}")
 
     r1 = st.columns(4)
-    r1[0].metric("Strategy Profile", position.strategy.split("· ")[-1])
+    r1[0].metric("Strategy", position.strategy.split("· ")[-1],
+                 help=position.strategy)
     r1[1].metric("Entry Price", fmt(position.entry_price), side)
-    r1[2].metric("Last Traded Price", fmt(ltp))
-    r1[3].metric("Quantity", fmt(position.quantity, 0))
+    r1[2].metric("LTP", fmt(ltp))
+    r1[3].metric("Qty", fmt(position.quantity, 0))
 
     r2 = st.columns(4)
-    tgt_label = "Target (display only)" if mgr.tp_display_only else "Target Price"
+    tgt_label = "Target (display)" if mgr.tp_display_only else "Target"
     r2[0].metric(tgt_label, fmt(mgr.tp) if mgr.tp is not None else "none")
-    r2[1].metric("Stop-Loss Guard", fmt(mgr.sl) if mgr.sl is not None else "none",
+    r2[1].metric("Stop-Loss", fmt(mgr.sl) if mgr.sl is not None else "none",
                  f"initial {fmt(mgr.initial_sl)}" if mgr.initial_sl is not None else None)
-    r2[2].metric("Points Gained / Lost", fmt_signed(points))
+    r2[2].metric("Points +/-", fmt_signed(points))
     r2[3].metric(f"Live PnL ({currency})", fmt_signed(pnl))
 
     r3 = st.columns(4)
-    r3[0].metric("Best Price Seen", fmt(mgr.mfe))
+    r3[0].metric("Best Price", fmt(mgr.mfe), help="Best price seen since entry (drives trails).")
     locked = None if mgr.sl is None else (mgr.sl - position.entry_price) * position.direction
-    r3[1].metric("Locked In by Stop", fmt_signed(locked) if locked is not None else "--")
-    r3[2].metric("Risk at Entry", fmt(mgr.risk_points) if mgr.risk_points else "--")
-    r3[3].metric("Bars Held", f"{mgr.bars_held}")
+    r3[1].metric("Locked In", fmt_signed(locked) if locked is not None else "--",
+                 help="Points the stop now guarantees, positive once the trail passes cost.")
+    r3[2].metric("Entry Risk", fmt(mgr.risk_points) if mgr.risk_points else "--")
+    r3[3].metric("Bars", f"{mgr.bars_held}")
 
     if mgr.sl is not None and mgr.tp is not None and abs(mgr.tp - mgr.sl) > 0:
         span = abs(mgr.tp - mgr.sl)
@@ -3611,12 +3770,14 @@ def _synthetic(n: int = 1600, seed: int = 7) -> pd.DataFrame:
                          "Volume": rng.integers(1_000, 60_000, n).astype(float)}, index=idx)
 
 
-def _ctx(close=100.0, atr=5.0, prev_low=95.0, prev_high=105.0,
-         swing_low=90.0, swing_high=110.0, signal=0, low=None, high=None):
+def _ctx(close=100.0, atr=5.0, prev_low=95.0, prev_high=105.0, swing_low=90.0,
+         swing_high=110.0, prev_swing_low=85.0, prev_swing_high=115.0, signal=0,
+         low=None, high=None):
     return BarCtx(time=pd.Timestamp("2024-01-01"), open=close, high=high or close + 1,
-                  low=low or close - 1, close=close, atr=atr, ema_fast=close, ema_slow=close,
-                  swing_high=swing_high, swing_low=swing_low, prev_high=prev_high,
-                  prev_low=prev_low, signal=signal)
+                  low=low if low is not None else close - 1, close=close, atr=atr,
+                  ema_fast=close, ema_slow=close, swing_high=swing_high, swing_low=swing_low,
+                  prev_swing_high=prev_swing_high, prev_swing_low=prev_swing_low,
+                  prev_high=prev_high, prev_low=prev_low, signal=signal)
 
 
 def _test_step_trail():
@@ -3705,6 +3866,65 @@ def _test_exit_types():
     print(f"   {checks} stop/target permutations: side, ratchet and R:R arithmetic  OK")
 
 
+def _test_structural_matrix():
+    """
+    Every candle/swing stop and target, both directions.
+
+    A long's stop must ride LOWS and its target must ride HIGHS; a short is the
+    mirror. Getting that flip wrong is silent and expensive, so it is asserted
+    for all sixteen structural variants.
+    """
+    ctx = _ctx(close=100.0, atr=5.0, prev_low=95.0, prev_high=105.0,
+               swing_low=90.0, swing_high=110.0, prev_swing_low=85.0, prev_swing_high=115.0,
+               low=97.0, high=103.0)
+    expect_sl = {
+        ("Previous Candle Low/High", 1): 95.0, ("Previous Candle Low/High", -1): 105.0,
+        ("Current Candle Low/High", 1): 95.0, ("Current Candle Low/High", -1): 105.0,
+        ("Trail Previous Candle Low/High", 1): 95.0, ("Trail Previous Candle Low/High", -1): 105.0,
+        ("Trail Current Candle Low/High", 1): 95.0, ("Trail Current Candle Low/High", -1): 105.0,
+        ("Previous Swing Low/High", 1): 85.0, ("Previous Swing Low/High", -1): 115.0,
+        ("Current Swing Low/High", 1): 90.0, ("Current Swing Low/High", -1): 110.0,
+        ("Trail Previous Swing Low/High", 1): 85.0, ("Trail Previous Swing Low/High", -1): 115.0,
+        ("Trail Current Swing Low/High", 1): 90.0, ("Trail Current Swing Low/High", -1): 110.0,
+    }
+    for (kind, d), want in expect_sl.items():
+        m = ExitManager(RiskConfig(kind, 0.0, "No Target", 0.0, 1.0), 100.0, d, ctx)
+        assert m.sl == want, f"SL {kind} d={d}: expected {want}, got {m.sl}"
+
+    expect_tp = {
+        ("Previous Candle High/Low", 1): 105.0, ("Previous Candle High/Low", -1): 95.0,
+        ("Current Candle High/Low", 1): 105.0, ("Current Candle High/Low", -1): 95.0,
+        ("Trail Previous Candle High/Low", 1): 105.0, ("Trail Previous Candle High/Low", -1): 95.0,
+        ("Trail Current Candle High/Low", 1): 105.0, ("Trail Current Candle High/Low", -1): 95.0,
+        ("Previous Swing High/Low", 1): 115.0, ("Previous Swing High/Low", -1): 85.0,
+        ("Current Swing High/Low", 1): 110.0, ("Current Swing High/Low", -1): 90.0,
+        ("Trail Previous Swing High/Low", 1): 115.0, ("Trail Previous Swing High/Low", -1): 85.0,
+        ("Trail Current Swing High/Low", 1): 110.0, ("Trail Current Swing High/Low", -1): 90.0,
+    }
+    for (kind, d), want in expect_tp.items():
+        m = ExitManager(RiskConfig("Fixed Points", 10.0, kind, 0.0, 1.0), 100.0, d, ctx)
+        assert m.tp == want, f"TP {kind} d={d}: expected {want}, got {m.tp}"
+
+    # A trailing target extends away from entry and never drifts back closer.
+    m = ExitManager(RiskConfig("Fixed Points", 10.0, "Trail Current Swing High/Low", 0.0, 1.0),
+                    100.0, 1, ctx)
+    assert m.tp == 110.0
+    m.update(112.0, _ctx(close=112.0, swing_high=125.0, low=108.0, high=113.0))
+    assert m.tp == 125.0, f"trailing target must extend, got {m.tp}"
+    m.update(113.0, _ctx(close=113.0, swing_high=118.0, low=110.0, high=114.0))
+    assert m.tp == 125.0, f"trailing target must not drift closer, got {m.tp}"
+
+    # A trailing structural stop ratchets up and never loosens.
+    m = ExitManager(RiskConfig("Trail Current Swing Low/High", 0.0, "No Target", 0.0, 1.0),
+                    100.0, 1, ctx)
+    assert m.sl == 90.0
+    m.update(120.0, _ctx(close=120.0, swing_low=108.0, low=115.0, high=121.0))
+    assert m.sl == 108.0, f"structural trail must follow the new swing, got {m.sl}"
+    m.update(118.0, _ctx(close=118.0, swing_low=99.0, low=117.0, high=119.0))
+    assert m.sl == 108.0, f"structural trail must not loosen, got {m.sl}"
+    print("   16 structural stop/target variants, both directions, plus ratchets  OK")
+
+
 def _test_fill_semantics():
     """Signal on N must fill at the OPEN of N+1, and the stop is checked before the target."""
     idx = pd.date_range("2024-01-01 09:15", periods=6, freq="5min", tz="Asia/Kolkata")
@@ -3715,6 +3935,7 @@ def _test_fill_semantics():
         "Close": [100, 100, 100, 105, 100, 100],
         "Volume": [1.0] * 6, "atr": [2.0] * 6, "ema_fast": [100.0] * 6, "ema_slow": [100.0] * 6,
         "swing_high": [110.0] * 6, "swing_low": [90.0] * 6,
+        "prev_swing_high": [115.0] * 6, "prev_swing_low": [85.0] * 6,
         "prev_high": [101.0] * 6, "prev_low": [99.0] * 6,
         "signal": [0, 1, 0, 0, 0, 0],
     }, index=idx)
@@ -3812,6 +4033,7 @@ def run_selftest() -> int:
         _test_step_trail()
         _test_trail_uses_live_price()
         _test_exit_types()
+        _test_structural_matrix()
         _test_fill_semantics()
         print("-- filters --")
         _test_filters()
