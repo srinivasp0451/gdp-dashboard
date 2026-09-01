@@ -219,7 +219,19 @@ DEFAULT_PARAMS: dict[str, float] = {
     "adx_len": 14, "bb_len": 20, "bb_mult": 2.0,
     "macd_fast": 12, "macd_slow": 26, "macd_signal": 9,
     "st_len": 10, "st_mult": 3.0, "structure_len": 20,
+    "threshold_price": 0.0, "threshold_pct": 1.0,
+    "threshold_ref": "Previous session close",
+    "threshold_mode": "Cross above = BUY, cross below = SELL",
 }
+
+THRESHOLD_MODES = [
+    "Cross above = BUY, cross below = SELL",
+    "Cross above = BUY only",
+    "Cross below = SELL only",
+    "Cross above = SELL, cross below = BUY (fade)",
+]
+THRESHOLD_REFS = ["Previous session close", "Session open", "Rolling 20-bar mean",
+                  "First candle of the loaded window"]
 
 
 def currency_symbol(ticker: str) -> str:
@@ -704,6 +716,67 @@ def load_market_data(symbol: str, period: str, interval: str,
                         "falls back to a session TWAP.")
     return DataBundle(frame=frame, symbol=symbol, interval=interval,
                       period=eff_period, warnings=warnings)
+
+
+_LAST_QUOTE_CALL = {"t": 0.0}
+
+
+def _space_quote_requests(min_gap: float = API_GUARD_DELAY) -> None:
+    """
+    Enforce the mandatory gap BETWEEN quote requests without double-sleeping.
+
+    The heavy candle download brackets itself with 0.3s on each side. The quote
+    path is hit on every tick, so it instead guarantees a 0.3s spacing measured
+    from the previous call: same protection, but it does not burn 0.6s of every
+    tick doing nothing.
+    """
+    gap = time.time() - _LAST_QUOTE_CALL["t"]
+    if gap < min_gap:
+        time.sleep(min_gap - gap)
+    _LAST_QUOTE_CALL["t"] = time.time()
+
+
+def yahoo_ltp(symbol: str) -> float | None:
+    """
+    Last traded price from Yahoo's QUOTE endpoint, not from a candle close.
+
+    This is the difference between a price that moves and one that steps once
+    per candle. The quote stream updates continuously; a 5m candle's close only
+    changes when the candle rolls. (Yahoo's Indian quotes still carry an
+    exchange delay, but they tick within that delay instead of freezing.)
+    """
+    import yfinance as yf
+
+    _space_quote_requests()
+    try:
+        ticker = yf.Ticker(symbol)
+        fast = getattr(ticker, "fast_info", None)
+        for probe in ("last_price", "lastPrice", "regular_market_price", "regularMarketPrice"):
+            value = None
+            if fast is not None:
+                value = getattr(fast, probe, None)
+                if value is None:
+                    try:
+                        value = fast[probe]
+                    except Exception:                               # noqa: BLE001
+                        value = None
+            if value is not None:
+                price = float(value)
+                if np.isfinite(price) and price > 0:
+                    return price
+    except Exception:                                               # noqa: BLE001
+        pass
+    # Last resort: the freshest 1-minute candle available.
+    try:
+        _space_quote_requests()
+        hist = yf.Ticker(symbol).history(period="1d", interval="1m")
+        if hist is not None and not hist.empty:
+            price = float(hist["Close"].dropna().iloc[-1])
+            if np.isfinite(price) and price > 0:
+                return price
+    except Exception:                                               # noqa: BLE001
+        pass
+    return None
 
 
 def load_vix(freshness_seconds: float = 60.0) -> float | None:
@@ -1798,6 +1871,83 @@ def s_wyckoff(df, p):
                "Price must poke above the range high and close back inside, red.")
 
 
+# ------------------------------------- 28 / 29 Price threshold crossings -----
+def _threshold_signals(out, upper, lower, mode):
+    up = cross_over(out["Close"], upper)
+    dn = cross_under(out["Close"], lower)
+    if mode == "Cross above = BUY only":
+        return up, pd.Series(False, index=out.index)
+    if mode == "Cross below = SELL only":
+        return pd.Series(False, index=out.index), dn
+    if mode.startswith("Cross above = SELL"):
+        return dn, up                       # faded: the break is sold, the breakdown bought
+    return up, dn
+
+
+def c_threshold_abs(df, p):
+    """Cross of a fixed price level the operator types in."""
+    out = df.copy()
+    level = float(_p(p, "threshold_price"))
+    if level <= 0:                          # unset -> anchor on the window's first close
+        level = float(out["Close"].iloc[0])
+    out["threshold"] = level
+    long, short = _threshold_signals(out, out["threshold"], out["threshold"],
+                                     str(_p(p, "threshold_mode")))
+    return _finalise(out, long, short)
+
+
+def s_threshold_abs(df, p):
+    lvl, c = safe_last(df["threshold"]), safe_last(df["Close"])
+    dist = (c - lvl) if (c is not None and lvl is not None) else None
+    return _sr(f"Price is {fmt(abs(dist or 0))} points "
+               f"{'above' if (dist or 0) >= 0 else 'below'} the {fmt(lvl)} threshold.",
+               [("Last price", fmt(c)), ("Threshold", fmt(lvl)), ("Distance", fmt_signed(dist)),
+                ("Mode", str(_p(p, "threshold_mode")))],
+               "Close must cross the threshold in the direction set by the mode.",
+               "Close must cross the threshold in the direction set by the mode.")
+
+
+def c_threshold_pct(df, p):
+    """Cross of a percentage band around a moving reference price."""
+    out = df.copy()
+    pct = abs(float(_p(p, "threshold_pct"))) / 100.0
+    ref_kind = str(_p(p, "threshold_ref"))
+    intraday = bool(p.get("intraday", True))
+    if ref_kind == "Session open" and intraday:
+        k = session_key(out.index)
+        ref = out["Open"].groupby(k).transform("first")
+    elif ref_kind == "Rolling 20-bar mean":
+        ref = sma(out["Close"], 20)
+    elif ref_kind == "First candle of the loaded window":
+        ref = pd.Series(float(out["Close"].iloc[0]), index=out.index)
+    else:                                   # previous session close
+        if intraday:
+            k = session_key(out.index)
+            ref = out["Close"].groupby(k).transform("last").groupby(k).transform("first")
+            ref = ref.shift(1).ffill().fillna(out["Close"].iloc[0])
+        else:
+            ref = out["Close"].shift(1)
+    out["threshold_ref"] = ref
+    out["threshold_up"] = ref * (1 + pct)
+    out["threshold_dn"] = ref * (1 - pct)
+    long, short = _threshold_signals(out, out["threshold_up"], out["threshold_dn"],
+                                     str(_p(p, "threshold_mode")))
+    return _finalise(out, long, short)
+
+
+def s_threshold_pct(df, p):
+    c = safe_last(df["Close"])
+    ref = safe_last(df["threshold_ref"])
+    moved = ((c - ref) / ref * 100.0) if (c and ref) else None
+    return _sr(f"Price is {fmt_signed(moved)}% from the {str(_p(p,'threshold_ref')).lower()} "
+               f"reference of {fmt(ref)}.",
+               [("Last price", fmt(c)), ("Reference", fmt(ref)), ("Move %", fmt_signed(moved)),
+                ("Upper band", fmt(safe_last(df["threshold_up"]))),
+                ("Lower band", fmt(safe_last(df["threshold_dn"])))],
+               f"Close must cross the {fmt(_p(p,'threshold_pct'))}% band per the selected mode.",
+               f"Close must cross the {fmt(_p(p,'threshold_pct'))}% band per the selected mode.")
+
+
 # ------------------------------------------------------------- REGISTRY ------
 _DEFS = [
     ("S01", "01 · Dual EMA Crossover", "9 EMA crossing the 21 EMA.", 40,
@@ -1854,6 +2004,13 @@ _DEFS = [
      c_vwap_reversion, s_vwap_reversion, ("vwap", "vwap_hi", "vwap_lo"), None, False),
     ("S27", "27 · Wyckoff Spring / Upthrust", "Range-edge failures with volume confirmation.", 60,
      c_wyckoff, s_wyckoff, ("range_high", "range_low"), None, False),
+    ("S28", "28 · Price Threshold Cross (absolute level)",
+     "Crosses of a fixed price you type in. Direction is configurable.", 30,
+     c_threshold_abs, s_threshold_abs, ("threshold",), None, False),
+    ("S29", "29 · Price Threshold Cross (% from reference)",
+     "Crosses of a percentage band around a moving reference price.", 30,
+     c_threshold_pct, s_threshold_pct, ("threshold_up", "threshold_dn", "threshold_ref"),
+     None, False),
 ]
 
 STRATEGIES: dict[str, Strategy] = {
@@ -2682,6 +2839,9 @@ _STATE_DEFAULTS = {
     "live_poll_count": 0, "live_fail_streak": 0, "live_backoff_until": 0.0,
     "backtest_result": None, "backtest_meta": None, "backtest_error": None,
     "scrip_master": None, "broker_receipts": [], "feed_log": [],
+    "live_frame": None, "live_frame_at": 0.0, "live_reports": [],
+    "live_frame_warnings": [], "live_vix": None, "candle_refreshes": 0,
+    "ltp_note": None, "screener_results": None, "screener_error": None,
 }
 
 
@@ -2726,6 +2886,10 @@ def reset_live_runtime() -> None:
     st.session_state.live_snapshot = None
     st.session_state.live_error = None
     st.session_state.live_poll_count = 0
+    st.session_state.live_frame = None
+    st.session_state.live_frame_at = 0.0
+    st.session_state.candle_refreshes = 0
+    st.session_state.feed_log = []
     st.session_state.live_fail_streak = 0
     st.session_state.live_backoff_until = 0.0
 
@@ -2757,54 +2921,72 @@ class LiveSnapshot:
     ltp_source: str = "Yahoo (delayed candle close)"
 
 
-def poll_market(cfg: dict) -> LiveSnapshot:
-    strat = get_strategy(cfg["strategy"])
-    period = live_period_for(cfg["interval"])
-    bundle = load_market_data(symbol=cfg["symbol"], period=period, interval=cfg["interval"],
-                              freshness_seconds=max(API_GUARD_DELAY, cfg["poll_seconds"] * 0.9),
-                              min_bars=max(strat.min_bars, 30))
+def refresh_candles(cfg: dict):
+    """
+    The HEAVY leg: download candles and recompute indicators, signals, filters.
 
+    Runs on its own slower cadence. Recomputing 200+ bars of indicators on every
+    0.3s tick would be pointless work -- the candles simply have not changed.
+    """
+    strat = get_strategy(cfg["strategy"])
+    bundle = load_market_data(symbol=cfg["symbol"], period=live_period_for(cfg["interval"]),
+                              interval=cfg["interval"],
+                              freshness_seconds=max(1.0, cfg.get("candle_seconds", 15.0) * 0.9),
+                              min_bars=max(strat.min_bars, 30))
     extras = dict(cfg.get("filter_extras") or {})
     if cfg.get("filter_cfg", {}).get("vix", {}).get("enabled"):
         extras["vix"] = load_vix(freshness_seconds=60)
-
     frame, reports = prepare(bundle.frame, cfg["strategy"], cfg["params"],
                              cfg.get("filter_cfg"), extras)
     if len(frame) < 3:
         raise MarketDataError("Not enough candles to evaluate a live signal.")
+    return frame, reports, bundle.warnings, extras.get("vix")
 
+
+def fetch_live_ltp(cfg: dict, frame: pd.DataFrame) -> tuple[float, str]:
+    """
+    The LIGHT leg: one price, fetched on every tick.
+
+    Order of preference: Dhan real-time quote, then Yahoo's quote endpoint,
+    then -- only if both fail -- the newest candle close, which is the value
+    that cannot move between candles.
+    """
+    broker = cfg.get("broker") or {}
+    if broker.get("use_live_ltp") and broker.get("contract"):
+        try:
+            price = dhan_ltp(broker, broker["contract"])
+            if price and np.isfinite(price) and price > 0:
+                return float(price), "Dhan (real-time quote)"
+        except BrokerError as exc:
+            st.session_state.ltp_note = f"Dhan LTP failed, using Yahoo: {exc}"
+
+    price = yahoo_ltp(cfg["symbol"])
+    if price is not None:
+        return float(price), "Yahoo quote (ticks continuously)"
+    return float(frame["Close"].iloc[-1]), "Candle close (quote unavailable -- steps per candle)"
+
+
+def build_snapshot(cfg: dict, frame: pd.DataFrame, reports, warnings, vix,
+                   ltp: float, ltp_source: str) -> LiveSnapshot:
+    strat = get_strategy(cfg["strategy"])
     closed = -2                                     # last FULLY CLOSED candle
     last_ts = pd.Timestamp(frame.index[-1])
     now = pd.Timestamp.now(tz=last_ts.tz) if last_ts.tz is not None else pd.Timestamp.now()
     age = float((now - last_ts).total_seconds())
     bar_seconds = INTERVAL_SECONDS.get(cfg["interval"], 300)
-    # More than three candles have elapsed with nothing new printing: the venue
-    # is closed, halted, or the feed has stalled. Either way the LTP is frozen
-    # and nothing downstream should pretend otherwise.
+    # More than three candles elapsed with nothing new printing: the venue is
+    # closed, halted, or the feed has stalled.
     stale = age > max(3 * bar_seconds, 120)
 
-    ltp = float(frame["Close"].iloc[-1])
-    ltp_source = "Yahoo (delayed candle close)"
-    broker = cfg.get("broker") or {}
-    if broker.get("use_live_ltp") and broker.get("contract"):
-        try:
-            live_px = dhan_ltp(broker, broker["contract"])
-            if live_px and np.isfinite(live_px) and live_px > 0:
-                ltp, ltp_source = float(live_px), "Dhan (real-time)"
-        except BrokerError as exc:
-            ltp_source = f"Yahoo fallback -- Dhan LTP failed: {exc}"
-
     return LiveSnapshot(
-        frame=frame,
-        ltp=ltp,
-        next_open=float(frame["Open"].iloc[-1]),    # the open of candle N+1
+        frame=frame, ltp=ltp, next_open=float(frame["Open"].iloc[-1]),
         last_closed_time=frame.index[closed],
         last_closed_signal=int(frame["signal"].iloc[closed]),
         raw_signal=int(frame["raw_signal"].iloc[closed]),
         status=strat.status(frame.iloc[:len(frame) + closed + 1], cfg["params"]),
         filter_reports=reports, fetched_at=pd.Timestamp.now(), bars=len(frame),
-        data_warnings=bundle.warnings, vix=extras.get("vix"),
-        feed_age_seconds=age, stale=stale, ltp_source=ltp_source)
+        data_warnings=warnings, vix=vix, feed_age_seconds=age, stale=stale,
+        ltp_source=ltp_source)
 
 
 def _live_close(position: Position, exit_price: float, reason: str) -> dict:
@@ -2891,11 +3073,33 @@ def _open_live_position(cfg: dict, direction: int, price: float, ctx: BarCtx, ba
 
 
 def run_cycle(cfg: dict) -> None:
-    """One iteration: manage open risk first, then look for a new entry."""
+    """
+    One tick.
+
+    Fast leg every tick (price, PnL, stop, target, trailing); slow leg only when
+    the candle cadence is due (download, indicators, signals, filters).
+    """
     if time.time() < st.session_state.get("live_backoff_until", 0.0):
         return
+
+    now = time.time()
+    candle_gap = float(cfg.get("candle_seconds", 15.0))
+    need_candles = (st.session_state.live_frame is None
+                    or (now - st.session_state.live_frame_at) >= candle_gap)
     try:
-        snapshot = poll_market(cfg)
+        if need_candles:
+            frame, reports, warns, vix = refresh_candles(cfg)
+            st.session_state.live_frame = frame
+            st.session_state.live_reports = reports
+            st.session_state.live_frame_warnings = warns
+            st.session_state.live_vix = vix
+            st.session_state.live_frame_at = now
+            st.session_state.candle_refreshes += 1
+        frame = st.session_state.live_frame
+        ltp, ltp_source = fetch_live_ltp(cfg, frame)
+        snapshot = build_snapshot(cfg, frame, st.session_state.live_reports,
+                                  st.session_state.live_frame_warnings,
+                                  st.session_state.live_vix, ltp, ltp_source)
     except Exception as exc:                                        # noqa: BLE001
         st.session_state.live_fail_streak += 1
         streak = st.session_state.live_fail_streak
@@ -2914,7 +3118,7 @@ def run_cycle(cfg: dict) -> None:
     st.session_state.live_poll_count += 1
 
     # Poll-by-poll record. If the LTP column never changes across dozens of
-    # polls, the refresh loop is fine and the FEED is the thing standing still.
+    # ticks, the refresh loop is fine and the FEED is standing still.
     log = st.session_state.feed_log
     prev_ltp = log[0]["LTP"] if log else None
     log.insert(0, {"Polled at": pd.Timestamp.now().strftime("%H:%M:%S.%f")[:-3],
@@ -2925,7 +3129,6 @@ def run_cycle(cfg: dict) -> None:
                    "Source": snapshot.ltp_source})
     del log[60:]
 
-    frame = snapshot.frame
     closed_ctx = bar_ctx(frame, len(frame) - 2)
     position: Position | None = st.session_state.live_position
     new_bar = st.session_state.live_last_bar != snapshot.last_closed_time
@@ -3167,19 +3370,24 @@ def render_sidebar() -> dict:
     # ------------------------------------------------------- execution ------
     sb.subheader("Execution")
     poll_seconds = sb.number_input("Live poll interval (seconds)", min_value=API_GUARD_DELAY,
-                                   max_value=600.0, value=1.0, step=0.1, key="cfg_poll",
-                                   help="Auto-refresh cadence once the core is started. Every "
-                                        "request carries the mandatory 0.3s guard on both sides.")
-    if poll_seconds < 2.0:
-        sb.error(f"At {fmt(poll_seconds,1)}s you will issue ~{60/poll_seconds:.0f} requests a "
-                 "minute. Yahoo throttles well before that and will return 429s, then block the "
-                 "IP for a while. Yahoo index data is also delayed ~15 minutes, so polling faster "
-                 "does not make it fresher.")
+                                   max_value=600.0, value=0.3, step=0.1, key="cfg_poll",
+                                   help="How often the LTP, PnL, stop and target refresh. Quote "
+                                        "requests are spaced by the mandatory 0.3s guard.")
+    if poll_seconds < 1.0:
+        sb.warning(f"At {fmt(poll_seconds,1)}s the tick loop issues ~{60/poll_seconds:.0f} quote "
+                   "requests a minute. Quotes are small, but Yahoo still throttles: if you start "
+                   "seeing backoff messages, ease this up. The heavy candle download runs on its "
+                   "own slower cadence below and is unaffected.")
     allow_stale = sb.checkbox("Live: allow entries on a frozen feed", value=False,
                               disabled=live, key="cfg_stale",
                               help="Off by default. When the venue is closed the LTP is just an "
                                    "old candle close, so an entry books a fictitious price and "
                                    "sits at 0.00 PnL until trading resumes.")
+    candle_seconds = sb.number_input("Candle re-download interval (seconds)", min_value=1.0,
+                                     max_value=900.0, value=15.0, step=1.0, key="cfg_candle",
+                                     help="How often the full candle history is re-downloaded and "
+                                          "indicators recomputed. The price, PnL, stop and target "
+                                          "refresh on every tick regardless of this.")
     fill_at_ltp = sb.checkbox("Live: fill at LTP instead of the N+1 open", value=False,
                               disabled=live, key="cfg_fill_ltp",
                               help="Default follows the N+1-open rule. Turn this on if you would "
@@ -3202,6 +3410,22 @@ def render_sidebar() -> dict:
                                  ("st_mult", 0.5, 10.0, 0.1)):
             params[key] = st.number_input(key, lo, hi, float(DEFAULT_PARAMS[key]), stp,
                                           disabled=live, key=f"pm_{key}")
+    if strategy.startswith(("28 ", "29 ")):
+        sb.subheader("Threshold Settings")
+        params["threshold_mode"] = sb.selectbox("Trigger mode", THRESHOLD_MODES, disabled=live,
+                                                key="cfg_th_mode")
+        if strategy.startswith("28 "):
+            params["threshold_price"] = sb.number_input(
+                "Threshold price (absolute)", min_value=0.0, value=0.0, step=1.0, disabled=live,
+                key="cfg_th_price",
+                help="Leave at 0 to anchor on the first close of the loaded window.")
+        else:
+            params["threshold_pct"] = sb.number_input(
+                "Threshold move (%)", min_value=0.01, value=1.0, step=0.05, disabled=live,
+                key="cfg_th_pct")
+            params["threshold_ref"] = sb.selectbox("Reference price", THRESHOLD_REFS,
+                                                   disabled=live, key="cfg_th_ref")
+
     params["intraday"] = interval in INTRADAY_INTERVALS
     params["symbol"], params["interval"] = symbol, interval
 
@@ -3214,6 +3438,7 @@ def render_sidebar() -> dict:
             "params": params, "risk": risk, "quantity": float(quantity),
             "poll_seconds": float(poll_seconds), "fill_at_ltp": bool(fill_at_ltp),
             "allow_stale_entries": bool(allow_stale),
+            "candle_seconds": float(candle_seconds),
             "filter_cfg": filter_cfg, "filter_extras": filter_extras, "broker": broker,
             "currency": currency_symbol(symbol),
             "hide_weekends": not (symbol.endswith("-USD") or symbol.endswith("=X"))}
@@ -3663,13 +3888,18 @@ def _heartbeat(cfg: dict, snapshot: LiveSnapshot) -> None:
                 "FROZEN" if snapshot.stale else "live",
                 help="Wall-clock age of the newest candle. This is what tells you whether the "
                      "market is open.")
-    c[4].metric("Polls", f"{st.session_state.live_poll_count:,}",
-                f"next in {next_in:0.1f}s", help="Increments on every automatic refresh.")
+    c[4].metric("Ticks", f"{st.session_state.live_poll_count:,}",
+                f"next in {next_in:0.1f}s",
+                help=f"Price ticks. Candle re-downloads so far: "
+                     f"{st.session_state.candle_refreshes:,}.")
     c[5].metric("Clock", now.strftime("%H:%M:%S"),
                 help="Redraws on every tick. If this is moving, the auto-refresh is alive.")
-    st.caption(f"Price source: **{snapshot.ltp_source}** | auto-refresh every "
-               f"{fmt(cfg['poll_seconds'], 1)}s | mandatory {API_GUARD_DELAY}s API guard on both "
-               f"sides of every request.")
+    st.caption(f"Price source: **{snapshot.ltp_source}** | price ticks every "
+               f"{fmt(cfg['poll_seconds'], 1)}s | candles re-downloaded every "
+               f"{fmt(cfg.get('candle_seconds', 15), 0)}s | {API_GUARD_DELAY}s minimum spacing "
+               f"between requests.")
+    if st.session_state.get("ltp_note"):
+        st.caption(":warning: " + str(st.session_state.ltp_note))
 
 
 def _human_age(seconds: float) -> str:
@@ -3832,6 +4062,211 @@ def _event_feed() -> None:
 
 
 # =============================================================================
+# SECTION 14b -- SIGNAL SCREENER
+# =============================================================================
+# HONESTY NOTE ON INDEX MEMBERSHIP
+# --------------------------------
+# NSE index constituents are reviewed periodically, so any list baked into a
+# source file starts drifting the day it is written. The NIFTY 50 and NEXT 50
+# lists below are a snapshot, not a live feed. For NIFTY 200 / 500, or whenever
+# accuracy matters, paste or upload your own list -- that path is authoritative
+# and is offered first in the UI for exactly this reason.
+
+NIFTY_50 = [
+    "ADANIENT", "ADANIPORTS", "APOLLOHOSP", "ASIANPAINT", "AXISBANK", "BAJAJ-AUTO",
+    "BAJAJFINSV", "BAJFINANCE", "BEL", "BHARTIARTL", "BPCL", "BRITANNIA", "CIPLA",
+    "COALINDIA", "DRREDDY", "EICHERMOT", "GRASIM", "HCLTECH", "HDFCBANK", "HDFCLIFE",
+    "HEROMOTOCO", "HINDALCO", "HINDUNILVR", "ICICIBANK", "INDUSINDBK", "INFY", "ITC",
+    "JSWSTEEL", "KOTAKBANK", "LT", "M&M", "MARUTI", "NESTLEIND", "NTPC", "ONGC",
+    "POWERGRID", "RELIANCE", "SBILIFE", "SBIN", "SHRIRAMFIN", "SUNPHARMA", "TATACONSUM",
+    "TATAMOTORS", "TATASTEEL", "TCS", "TECHM", "TITAN", "TRENT", "ULTRACEMCO", "WIPRO",
+]
+
+NIFTY_NEXT_50 = [
+    "ABB", "ADANIENSOL", "ADANIGREEN", "ADANIPOWER", "AMBUJACEM", "BAJAJHLDNG", "BANKBARODA",
+    "BERGEPAINT", "BOSCHLTD", "CANBK", "CGPOWER", "CHOLAFIN", "COLPAL", "DABUR", "DIVISLAB",
+    "DLF", "DMART", "GAIL", "GODREJCP", "HAL", "HAVELLS", "HYUNDAI", "ICICIGI", "ICICIPRULI",
+    "INDHOTEL", "INDIGO", "IOC", "IRFC", "JINDALSTEL", "JIOFIN", "LICI", "LODHA", "LTIM",
+    "MOTHERSON", "NAUKRI", "PFC", "PIDILITIND", "PNB", "RECLTD", "SHREECEM", "SIEMENS",
+    "TATAPOWER", "TORNTPHARM", "TVSMOTOR", "UNITDSPR", "VBL", "VEDL", "ZYDUSLIFE",
+]
+
+SECTOR_INDICES = {
+    "Nifty 50": "^NSEI", "Nifty Bank": "^NSEBANK", "Nifty IT": "^CNXIT",
+    "Nifty Pharma": "^CNXPHARMA", "Nifty Auto": "^CNXAUTO", "Nifty FMCG": "^CNXFMCG",
+    "Nifty Metal": "^CNXMETAL", "Nifty Realty": "^CNXREALTY", "Nifty Energy": "^CNXENERGY",
+    "Nifty Infra": "^CNXINFRA", "Nifty PSU Bank": "^CNXPSUBANK", "Nifty Media": "^CNXMEDIA",
+    "Nifty Fin Service": "NIFTY_FIN_SERVICE.NS", "Nifty Midcap": "^NSMIDCP", "Sensex": "^BSESN",
+}
+
+SCREENER_UNIVERSES = [
+    "Nifty 50", "Nifty Next 50", "Nifty 100 (50 + Next 50)",
+    "Broad indices", "Sector indices", "Custom list (paste or upload)",
+]
+
+
+def _universe_tickers(choice: str, custom_text: str, uploaded) -> tuple[list[str], str | None]:
+    note = None
+    if choice == "Nifty 50":
+        names, note = NIFTY_50, "Snapshot list; verify against the current NSE factsheet."
+    elif choice == "Nifty Next 50":
+        names, note = NIFTY_NEXT_50, "Snapshot list; verify against the current NSE factsheet."
+    elif choice.startswith("Nifty 100"):
+        names = NIFTY_50 + NIFTY_NEXT_50
+        note = "Snapshot list; verify against the current NSE factsheet."
+    elif choice == "Broad indices":
+        return ["^NSEI", "^NSEBANK", "^BSESN", "NIFTY_FIN_SERVICE.NS", "^NSMIDCP"], None
+    elif choice == "Sector indices":
+        return list(SECTOR_INDICES.values()), None
+    else:
+        raw = ""
+        if uploaded is not None:
+            try:
+                raw = uploaded.getvalue().decode("utf-8", errors="ignore")
+            except Exception:                                       # noqa: BLE001
+                raw = ""
+        raw = (raw + "\n" + (custom_text or "")).replace(",", "\n")
+        names = [x.strip().upper() for x in raw.splitlines() if x.strip()]
+        return [n if ("." in n or n.startswith("^") or "=" in n) else f"{n}.NS"
+                for n in names], None
+    return [f"{n}.NS" for n in names], note
+
+
+def screen_universe(tickers: list[str], cfg: dict, lookback_bars: int, progress=None):
+    """
+    Run the sidebar configuration across a list of tickers and report signals.
+
+    Sequential by design: each download carries the mandatory guards, so a wide
+    universe takes real time. That is the honest cost of not getting throttled.
+    """
+    rows, errors = [], []
+    strat = get_strategy(cfg["strategy"])
+    extras = dict(cfg.get("filter_extras") or {})
+    if cfg.get("filter_cfg", {}).get("vix", {}).get("enabled"):
+        extras["vix"] = load_vix()
+
+    for i, ticker in enumerate(tickers):
+        if progress is not None:
+            progress.progress((i + 1) / max(1, len(tickers)), text=f"Scanning {ticker} ...")
+        try:
+            bundle = load_market_data(ticker, live_period_for(cfg["interval"]), cfg["interval"],
+                                      freshness_seconds=120,
+                                      min_bars=max(strat.min_bars, 30))
+            frame, _ = prepare(bundle.frame, cfg["strategy"], cfg["params"],
+                               cfg.get("filter_cfg"), extras)
+        except Exception as exc:                                    # noqa: BLE001
+            errors.append({"Ticker": ticker, "Problem": str(exc)[:140]})
+            continue
+
+        window = frame.iloc[-(lookback_bars + 1):]
+        fired = window[window["signal"] != 0]
+        forming = int(frame["signal"].iloc[-1])
+        last_closed_pos = len(frame) - 2
+
+        if fired.empty and forming == 0:
+            continue
+        if not fired.empty:
+            hit_time = fired.index[-1]
+            direction = int(fired["signal"].iloc[-1])
+            bars_ago = last_closed_pos - frame.index.get_loc(hit_time)
+            when = ("Just now (last closed candle)" if bars_ago <= 0
+                    else f"Just before ({int(bars_ago)} candles ago)")
+        else:
+            hit_time, direction, when = frame.index[-1], forming, "Forming candle (unconfirmed)"
+
+        rows.append({
+            "Ticker": ticker,
+            "Signal": "LONG" if direction > 0 else "SHORT",
+            "When": when,
+            "Signal Time": pd.Timestamp(hit_time),
+            "Close": round(float(frame["Close"].iloc[-1]), 2),
+            "Fast EMA": round(float(frame["ema_fast"].iloc[-1]), 2)
+            if "ema_fast" in frame else None,
+            "Slow EMA": round(float(frame["ema_slow"].iloc[-1]), 2)
+            if "ema_slow" in frame else None,
+            "ATR": round(float(frame["atr"].iloc[-1]), 2) if "atr" in frame else None,
+        })
+    return pd.DataFrame(rows), pd.DataFrame(errors)
+
+
+def tab_screener(cfg: dict) -> None:
+    st.subheader("Signal Screener")
+    st.caption(f"Runs the current sidebar configuration -- **{cfg['strategy']}** at "
+               f"`{cfg['interval']}` with the active filters -- across a universe and lists "
+               "whichever tickers are signalling.")
+
+    c1, c2, c3 = st.columns([2, 1, 1])
+    universe = c1.selectbox("Universe", SCREENER_UNIVERSES, key="scr_universe")
+    lookback = c2.number_input("Signal window (candles)", 1, 20, 3, key="scr_look",
+                               help="How far back a signal still counts as recent.")
+    max_names = c3.number_input("Max tickers", 1, 500, 50, key="scr_max")
+
+    custom_text, uploaded = "", None
+    if universe.startswith("Custom"):
+        custom_text = st.text_area("Tickers (one per line or comma separated)",
+                                   "KAYNES\nRELIANCE\nTATAMOTORS", key="scr_custom",
+                                   help="Bare NSE names get `.NS` appended automatically.")
+        uploaded = st.file_uploader("...or upload a CSV / text file of tickers", type=["csv", "txt"],
+                                    key="scr_upload")
+
+    tickers, note = _universe_tickers(universe, custom_text, uploaded)
+    tickers = tickers[:int(max_names)]
+    if note:
+        st.warning(f"{note} Index membership is reviewed periodically and this list is baked "
+                   "into the file, so it drifts over time. For NIFTY 200 / 500 or anything "
+                   "where accuracy matters, use **Custom list** with your own constituents.")
+
+    est = len(tickers) * 1.2
+    st.caption(f"{len(tickers)} tickers queued. Expect roughly {est:0.0f}s -- each download "
+               f"carries the mandatory {API_GUARD_DELAY}s guard on both sides so the scan does "
+               "not get the IP throttled.")
+
+    if st.button("Run Screener", type="primary", width="stretch"):
+        st.session_state.screener_error = None
+        bar = st.progress(0.0, text="Starting ...")
+        try:
+            results, errors = screen_universe(tickers, cfg, int(lookback), bar)
+            st.session_state.screener_results = (results, errors)
+        except Exception as exc:                                    # noqa: BLE001
+            st.session_state.screener_error = str(exc)
+        bar.empty()
+
+    if st.session_state.screener_error:
+        st.error(st.session_state.screener_error)
+
+    payload = st.session_state.screener_results
+    if payload is None:
+        st.info("Choose a universe and run the screener.")
+        return
+    results, errors = payload
+
+    if results.empty:
+        st.info("No tickers are signalling on this configuration right now.")
+    else:
+        results = results.sort_values(["When", "Signal Time"], ascending=[True, False])
+        st.success(f"{len(results)} ticker(s) signalling.")
+        st.dataframe(results, width="stretch", hide_index=True)
+
+        pick = st.selectbox("Select a ticker", results["Ticker"].tolist(), key="scr_pick")
+        a, b = st.columns([1, 3])
+        if a.button("Apply to sidebar", type="primary", width="stretch"):
+            # Push the choice into the sidebar widgets so backtesting and live
+            # trading pick it up without any retyping.
+            st.session_state.cfg_group = "-- Custom ticker --"
+            st.session_state.cfg_custom = pick
+            st.toast(f"{pick} applied to the sidebar.")
+            st.rerun()
+        b.caption("Applies the ticker to the sidebar so the Backtesting and Live tabs use it. "
+                  "Everything else in your configuration is left untouched.")
+        st.download_button("Download results (CSV)", results.to_csv(index=False).encode(),
+                           f"screener_{pd.Timestamp.now():%Y%m%d_%H%M}.csv", "text/csv")
+
+    if not errors.empty:
+        with st.expander(f"Tickers that could not be scanned ({len(errors)})"):
+            st.dataframe(errors, width="stretch", hide_index=True)
+
+
+# =============================================================================
 # SECTION 15 -- TAB 3: LIVE TRADE LOG LEDGER
 # =============================================================================
 def tab_ledger(cfg: dict) -> None:
@@ -3905,14 +4340,16 @@ def main() -> None:
     (status.success if st.session_state.live_running else status.info)(
         "LIVE CORE: RUNNING" if st.session_state.live_running else "LIVE CORE: IDLE")
 
-    t1, t2, t3 = st.tabs(["Backtesting Engine Studio", "Live Sandbox Operations",
-                          "Live Trade Log Ledger"])
+    t1, t2, t3, t4 = st.tabs(["Backtesting Engine Studio", "Live Sandbox Operations",
+                              "Live Trade Log Ledger", "Signal Screener"])
     with t1:
         tab_backtest(cfg)
     with t2:
         tab_live(cfg)
     with t3:
         tab_ledger(cfg)
+    with t4:
+        tab_screener(cfg)
 
 
 
@@ -4092,6 +4529,56 @@ def _test_structural_matrix():
     print("   16 structural stop/target variants, both directions, plus ratchets  OK")
 
 
+def _test_threshold_strategies():
+    df = _synthetic(500)
+    params = dict(DEFAULT_PARAMS); params["intraday"] = True
+    level = float(df["Close"].iloc[250])
+    params["threshold_price"] = level
+
+    params["threshold_mode"] = "Cross above = BUY, cross below = SELL"
+    both, _ = prepare(df, "28 \u00b7 Price Threshold Cross (absolute level)", params)
+    assert (both["signal"] == 1).any() and (both["signal"] == -1).any()
+
+    params["threshold_mode"] = "Cross above = BUY only"
+    long_only, _ = prepare(df, "28 \u00b7 Price Threshold Cross (absolute level)", params)
+    assert not (long_only["signal"] == -1).any(), "long-only mode must emit no shorts"
+    assert (long_only["signal"] == 1).sum() == (both["signal"] == 1).sum()
+
+    params["threshold_mode"] = "Cross above = SELL, cross below = BUY (fade)"
+    faded, _ = prepare(df, "28 \u00b7 Price Threshold Cross (absolute level)", params)
+    assert (faded["signal"] == -1).sum() == (both["signal"] == 1).sum(), "fade must invert"
+
+    params["threshold_mode"] = "Cross above = BUY, cross below = SELL"
+    params["threshold_pct"] = 0.5
+    for ref in THRESHOLD_REFS:
+        params["threshold_ref"] = ref
+        pct, _ = prepare(df, "29 \u00b7 Price Threshold Cross (% from reference)", params)
+        assert set(pct["signal"].unique()).issubset({-1, 0, 1}), f"{ref}: bad signal domain"
+        up, dn = pct["threshold_up"], pct["threshold_dn"]
+        valid = up.notna() & dn.notna()
+        assert (up[valid] > dn[valid]).all(), f"{ref}: bands inverted"
+    print("   threshold strategies: all 4 trigger modes and all 4 references  OK")
+
+
+def _test_tick_vs_candle_split():
+    """
+    The live loop must recompute PnL from a freshly fetched price, not from the
+    last candle close. A candle close cannot change between candles, which is
+    what made the dashboard look frozen.
+    """
+    risk = RiskConfig("Fixed Points", 50.0, "Fixed Points", 50.0, 3.0)
+    ctx = _ctx(close=100.0)
+    mgr = ExitManager(risk, 100.0, 1, ctx)
+    pos = Position(strategy="t", symbol="T", interval="5m", direction=1, quantity=3.0,
+                   entry_price=100.0, entry_time=None, signal_bar_time=None, manager=mgr)
+    for tick_price, want_pnl in ((100.5, 1.5), (101.25, 3.75), (99.75, -0.75)):
+        assert abs(pos.pnl(tick_price) - want_pnl) < 1e-9, \
+            f"PnL at {tick_price} should be {want_pnl}, got {pos.pnl(tick_price)}"
+        mgr.update(tick_price, ctx)
+    assert abs(mgr.mfe - 101.25) == 0.0, "best price must track intra-candle ticks"
+    print("   PnL and trailing recompute from the tick price, not the candle close  OK")
+
+
 def _test_fill_semantics():
     """Signal on N must fill at the OPEN of N+1, and the stop is checked before the target."""
     idx = pd.date_range("2024-01-01 09:15", periods=6, freq="5min", tz="Asia/Kolkata")
@@ -4243,6 +4730,8 @@ def run_selftest() -> int:
         _test_exit_types()
         _test_structural_matrix()
         _test_fill_semantics()
+        _test_tick_vs_candle_split()
+        _test_threshold_strategies()
         print("-- filters --")
         _test_filters()
         _test_new_filters()
