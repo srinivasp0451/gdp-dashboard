@@ -756,7 +756,13 @@ FILTER_SPECS: list[dict] = [
      "help": "Trade only when trend strength sits inside the band."},
     {"key": "rsi", "label": "RSI band", "kind": "range",
      "min": 40.0, "max": 70.0, "step": 1.0,
-     "help": "Long needs RSI in band; short needs the mirrored band (100 - value)."},
+     "modes": ["Cross min from below = LONG, cross max from above = SHORT",
+               "Inside the band",
+               "Above min = LONG, below max = SHORT"],
+     "help": "Pick how the band is read: a crossing event, a static zone, or a simple side test."},
+    {"key": "crossover", "label": "Crossover quality", "kind": "crossover",
+     "help": "Rejects limp crossovers. Angle is the fast/slow EMA convergence rate normalised "
+             "by ATR, so it does not change when you zoom the chart."},
     {"key": "ema20", "label": "EMA(20) side", "kind": "toggle",
      "help": "Long only above the 20 EMA, short only below."},
     {"key": "sma20", "label": "SMA(20) side", "kind": "toggle",
@@ -813,6 +819,11 @@ def default_filter_config() -> dict:
             entry.update(mode="Absolute change", value=0.0, manual=0.0)
         elif spec["kind"] == "news":
             entry["block"] = False
+        elif spec["kind"] == "crossover":
+            entry.update(min_angle=0.0, mode="Simple crossover (no candle size rule)",
+                         candle_points=10.0, candle_atr=1.0)
+        if spec.get("modes"):
+            entry["mode"] = spec["modes"][0]
         if spec.get("manual"):
             entry["manual"] = entry.get("manual", 0.0)
         cfg[spec["key"]] = entry
@@ -850,8 +861,23 @@ def attach_filter_columns(df: pd.DataFrame, params: dict, intraday: bool) -> pd.
     vw, vol_ok = vwap(out, intraday)
     out["f_vwap"] = vw
     out.attrs["vwap_is_volume_weighted"] = vol_ok
+
+    # Crossover geometry. The raw gradient of an EMA pair is in price units per
+    # bar, which makes any "angle" meaningless across instruments and zoom
+    # levels. Normalising the per-bar change in the fast/slow spread by ATR
+    # gives a dimensionless rate whose arctangent IS comparable everywhere.
+    fast = out["ema_fast"] if "ema_fast" in out.columns else ema(out["Close"], int(p("ema_fast")))
+    slow = out["ema_slow"] if "ema_slow" in out.columns else ema(out["Close"], int(p("ema_slow")))
+    spread = fast - slow
+    rate = (spread - spread.shift(1)) / out["f_atr"].replace(0.0, np.nan)
+    out["f_cross_angle"] = np.degrees(np.arctan(rate)).abs()
+    out["f_candle_range"] = (out["High"] - out["Low"]).abs()
     out["flt_ready"] = True
     return out
+
+
+def _const_like(series: pd.Series, value: float) -> pd.Series:
+    return pd.Series(float(value), index=series.index)
 
 
 @dataclass
@@ -900,9 +926,38 @@ def evaluate_filters(df: pd.DataFrame, fcfg: dict, extras: dict | None = None):
     if on("rsi"):
         cfg = fcfg["rsi"]
         lo, hi = float(cfg["min"]), float(cfg["max"])
-        lm = df["f_rsi"].between(lo, hi)
-        sm = df["f_rsi"].between(100.0 - hi, 100.0 - lo)   # mirrored band for shorts
-        apply("rsi", lm, sm, fmt(safe_last(df["f_rsi"])))
+        mode = cfg.get("mode", "Cross min from below = LONG, cross max from above = SHORT")
+        r = df["f_rsi"]
+        if mode.startswith("Cross"):
+            # The crossing reading: RSI reclaiming the lower level is the long
+            # trigger, losing the upper level is the short trigger.
+            lm = cross_over(r, _const_like(r, lo))
+            sm = cross_under(r, _const_like(r, hi))
+        elif mode.startswith("Inside"):
+            lm = r.between(lo, hi)
+            sm = r.between(100.0 - hi, 100.0 - lo)
+        else:
+            lm, sm = r >= lo, r <= hi
+        apply("rsi", lm, sm, f"{fmt(safe_last(r))} ({mode.split(' =')[0].lower()})")
+
+    if on("crossover"):
+        cfg = fcfg["crossover"]
+        min_angle = abs(float(cfg.get("min_angle", 0.0)))
+        ang_ok = df["f_cross_angle"] >= min_angle
+        mode = cfg.get("mode", "Simple crossover (no candle size rule)")
+        if mode.startswith("Custom"):
+            size_ok = df["f_candle_range"] >= float(cfg.get("candle_points", 0.0))
+            size_txt = f">= {fmt(cfg.get('candle_points'))} pts"
+        elif mode.startswith("ATR"):
+            size_ok = df["f_candle_range"] >= float(cfg.get("candle_atr", 1.0)) * df["f_atr"]
+            size_txt = f">= {fmt(cfg.get('candle_atr'))} x ATR"
+        else:
+            size_ok = pd.Series(True, index=idx)
+            size_txt = "no size rule"
+        m = ang_ok & size_ok
+        apply("crossover", m, m,
+              f"angle {fmt(safe_last(df['f_cross_angle']))}deg vs {fmt(min_angle)}, "
+              f"range {fmt(safe_last(df['f_candle_range']))} {size_txt}")
 
     if on("ema20"):
         apply("ema20", c > df["f_ema20"], c < df["f_ema20"], fmt(safe_last(df["f_ema20"])))
@@ -2538,6 +2593,38 @@ def resolve_instrument(master: pd.DataFrame, underlying: str, instrument: str,
     }
 
 
+def dhan_ltp(broker: dict, contract: dict) -> float | None:
+    """
+    Real-time last traded price from DhanHQ v2 Market Quote.
+
+    This exists because Yahoo's Indian feed is delayed roughly 15 minutes, so on
+    a 5-minute chart the "LTP" can sit unchanged for a quarter of an hour no
+    matter how fast you poll. If you have Dhan credentials, this is the price
+    that actually moves.
+    """
+    token = str(broker.get("access_token", "")).strip()
+    client = str(broker.get("client_id", "")).strip()
+    if not token or not client or not contract:
+        return None
+    import requests
+    seg, sec = contract["exchange_segment"], str(contract["security_id"])
+    try:
+        resp = requests.post(f"{DHAN_BASE}/marketfeed/ltp",
+                             headers={"Content-Type": "application/json",
+                                      "Accept": "application/json",
+                                      "access-token": token, "client-id": client},
+                             data=json.dumps({seg: [int(sec)]}), timeout=10)
+        body = resp.json()
+    except Exception as exc:                                        # noqa: BLE001
+        raise BrokerError(f"Dhan LTP request failed: {exc}") from exc
+    if resp.status_code >= 400:
+        raise BrokerError(f"Dhan LTP rejected (HTTP {resp.status_code}): {str(body)[:200]}")
+    try:
+        return float(body["data"][seg][sec]["last_price"])
+    except (KeyError, TypeError, ValueError):
+        raise BrokerError(f"Unexpected Dhan LTP payload: {str(body)[:200]}")
+
+
 def place_dhan_order(broker: dict, contract: dict, side: str, quantity: float,
                      dry_run: bool = True) -> dict:
     """
@@ -2594,7 +2681,7 @@ _STATE_DEFAULTS = {
     "live_snapshot": None, "live_error": None, "live_started_at": None,
     "live_poll_count": 0, "live_fail_streak": 0, "live_backoff_until": 0.0,
     "backtest_result": None, "backtest_meta": None, "backtest_error": None,
-    "scrip_master": None, "broker_receipts": [],
+    "scrip_master": None, "broker_receipts": [], "feed_log": [],
 }
 
 
@@ -2667,6 +2754,7 @@ class LiveSnapshot:
     vix: float | None = None
     feed_age_seconds: float = 0.0
     stale: bool = False
+    ltp_source: str = "Yahoo (delayed candle close)"
 
 
 def poll_market(cfg: dict) -> LiveSnapshot:
@@ -2695,9 +2783,20 @@ def poll_market(cfg: dict) -> LiveSnapshot:
     # and nothing downstream should pretend otherwise.
     stale = age > max(3 * bar_seconds, 120)
 
+    ltp = float(frame["Close"].iloc[-1])
+    ltp_source = "Yahoo (delayed candle close)"
+    broker = cfg.get("broker") or {}
+    if broker.get("use_live_ltp") and broker.get("contract"):
+        try:
+            live_px = dhan_ltp(broker, broker["contract"])
+            if live_px and np.isfinite(live_px) and live_px > 0:
+                ltp, ltp_source = float(live_px), "Dhan (real-time)"
+        except BrokerError as exc:
+            ltp_source = f"Yahoo fallback -- Dhan LTP failed: {exc}"
+
     return LiveSnapshot(
         frame=frame,
-        ltp=float(frame["Close"].iloc[-1]),
+        ltp=ltp,
         next_open=float(frame["Open"].iloc[-1]),    # the open of candle N+1
         last_closed_time=frame.index[closed],
         last_closed_signal=int(frame["signal"].iloc[closed]),
@@ -2705,7 +2804,7 @@ def poll_market(cfg: dict) -> LiveSnapshot:
         status=strat.status(frame.iloc[:len(frame) + closed + 1], cfg["params"]),
         filter_reports=reports, fetched_at=pd.Timestamp.now(), bars=len(frame),
         data_warnings=bundle.warnings, vix=extras.get("vix"),
-        feed_age_seconds=age, stale=stale)
+        feed_age_seconds=age, stale=stale, ltp_source=ltp_source)
 
 
 def _live_close(position: Position, exit_price: float, reason: str) -> dict:
@@ -2814,6 +2913,18 @@ def run_cycle(cfg: dict) -> None:
     st.session_state.live_last_poll = time.time()
     st.session_state.live_poll_count += 1
 
+    # Poll-by-poll record. If the LTP column never changes across dozens of
+    # polls, the refresh loop is fine and the FEED is the thing standing still.
+    log = st.session_state.feed_log
+    prev_ltp = log[0]["LTP"] if log else None
+    log.insert(0, {"Polled at": pd.Timestamp.now().strftime("%H:%M:%S.%f")[:-3],
+                   "Newest candle": fmt_time(snapshot.frame.index[-1]),
+                   "LTP": round(snapshot.ltp, 4),
+                   "Changed": "-" if prev_ltp is None else
+                              ("yes" if abs(prev_ltp - snapshot.ltp) > 1e-9 else "no"),
+                   "Source": snapshot.ltp_source})
+    del log[60:]
+
     frame = snapshot.frame
     closed_ctx = bar_ctx(frame, len(frame) - 2)
     position: Position | None = st.session_state.live_position
@@ -2895,30 +3006,41 @@ def _label(col: str) -> str:
 
 
 def price_chart(df, title, overlays=("ema_fast", "ema_slow"), trades=None, tail=None,
-                oscillator=None, hide_weekends=True, height=600):
+                hide_weekends=True, height=620):
+    """
+    The single chart used by both tabs: candles plus overlay lines.
+
+    Every overlay carries its latest value in the legend and again as a label
+    pinned at the right edge, so the numbers are readable without hovering.
+    """
     import plotly.graph_objects as go
-    from plotly.subplots import make_subplots
 
     data = df.tail(tail) if tail else df
-    if oscillator and oscillator in data.columns:
-        fig = make_subplots(rows=2, cols=1, shared_xaxes=True,
-                            row_heights=[0.74, 0.26], vertical_spacing=0.04)
-        row = 1
-    else:
-        fig, row = go.Figure(), None
-
-    def add(trace, r=row):
-        fig.add_trace(trace) if r is None else fig.add_trace(trace, row=r, col=1)
-
-    add(go.Candlestick(x=data.index, open=data["Open"], high=data["High"], low=data["Low"],
-                       close=data["Close"], name="Price",
-                       increasing_line_color=_UP, decreasing_line_color=_DOWN,
-                       increasing_fillcolor=_UP, decreasing_fillcolor=_DOWN))
+    fig = go.Figure()
+    fig.add_trace(go.Candlestick(
+        x=data.index, open=data["Open"], high=data["High"], low=data["Low"],
+        close=data["Close"], name="Price",
+        increasing_line_color=_UP, decreasing_line_color=_DOWN,
+        increasing_fillcolor=_UP, decreasing_fillcolor=_DOWN))
 
     for i, col in enumerate(dict.fromkeys(("ema_fast", "ema_slow", *overlays))):
-        if col in data.columns and data[col].notna().sum():
-            add(go.Scatter(x=data.index, y=data[col], mode="lines", name=_label(col),
-                           line=dict(width=1.5, color=_OVERLAY_COLOURS[i % len(_OVERLAY_COLOURS)])))
+        if col not in data.columns or data[col].notna().sum() == 0:
+            continue
+        colour = _OVERLAY_COLOURS[i % len(_OVERLAY_COLOURS)]
+        last = data[col].dropna()
+        value = float(last.iloc[-1]) if len(last) else None
+        name = _label(col) + (f"  {fmt(value)}" if value is not None else "")
+        fig.add_trace(go.Scatter(x=data.index, y=data[col], mode="lines", name=name,
+                                 line=dict(width=1.6, color=colour)))
+        if value is not None:
+            fig.add_annotation(x=last.index[-1], y=value, text=f"{_label(col)} {fmt(value)}",
+                               showarrow=False, xanchor="left", xshift=6, font=dict(size=11,
+                               color=colour), bgcolor="rgba(0,0,0,0.35)")
+
+    close = float(data["Close"].iloc[-1])
+    fig.add_annotation(x=data.index[-1], y=close, text=f"LTP {fmt(close)}", showarrow=False,
+                       xanchor="left", xshift=6, font=dict(size=12, color="#ffffff"),
+                       bgcolor="rgba(38,166,154,0.85)")
 
     if trades is not None and not trades.empty:
         for frame, name, sym, colour in ((trades[trades["Direction"] == "LONG"], "Long entry",
@@ -2926,45 +3048,24 @@ def price_chart(df, title, overlays=("ema_fast", "ema_slow"), trades=None, tail=
                                          (trades[trades["Direction"] == "SHORT"], "Short entry",
                                           "triangle-down", _DOWN)):
             if not frame.empty:
-                add(go.Scatter(x=frame["Entry Time"], y=frame["Entry Price"], mode="markers",
-                               name=name, marker=dict(symbol=sym, size=11, color=colour,
-                                                      line=dict(width=1, color="#fff")),
-                               hovertemplate="%{x}<br>Entry %{y:,.2f}<extra></extra>"))
-        add(go.Scatter(x=trades["Exit Time"], y=trades["Exit Price"], mode="markers", name="Exit",
-                       marker=dict(symbol="x", size=9, color="#8d99ae"),
-                       customdata=trades[["Exit Reason", "PnL"]],
-                       hovertemplate="%{x}<br>Exit %{y:,.2f}<br>%{customdata[0]}"
-                                     "<br>PnL %{customdata[1]:,.2f}<extra></extra>"))
-
-    if row:
-        add(go.Scatter(x=data.index, y=data[oscillator], mode="lines", name=oscillator.upper(),
-                       line=dict(width=1.5, color="#4f9df7")), 2)
-        for lvl, dash in ((70, "dot"), (50, "dash"), (30, "dot")):
-            fig.add_hline(y=lvl, row=2, col=1, line=dict(width=1, dash=dash, color="#8d99ae"))
-        fig.update_yaxes(range=[0, 100], row=2, col=1, title_text=oscillator.upper())
+                fig.add_trace(go.Scatter(
+                    x=frame["Entry Time"], y=frame["Entry Price"], mode="markers", name=name,
+                    marker=dict(symbol=sym, size=11, color=colour,
+                                line=dict(width=1, color="#fff")),
+                    hovertemplate="%{x}<br>Entry %{y:,.2f}<extra></extra>"))
+        fig.add_trace(go.Scatter(
+            x=trades["Exit Time"], y=trades["Exit Price"], mode="markers", name="Exit",
+            marker=dict(symbol="x", size=9, color="#8d99ae"),
+            customdata=trades[["Exit Reason", "PnL"]],
+            hovertemplate="%{x}<br>Exit %{y:,.2f}<br>%{customdata[0]}"
+                          "<br>PnL %{customdata[1]:,.2f}<extra></extra>"))
 
     fig.update_layout(title=dict(text=title, x=0.01, xanchor="left", font=dict(size=15)),
-                      height=height, margin=dict(l=10, r=10, t=46, b=10), hovermode="x unified",
+                      height=height, margin=dict(l=10, r=90, t=46, b=10), hovermode="x unified",
                       legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
                       xaxis_rangeslider_visible=False, dragmode="pan")
     if hide_weekends:
         fig.update_xaxes(rangebreaks=[dict(bounds=["sat", "mon"])])
-    return fig
-
-
-def equity_chart(equity, currency="", height=280):
-    import plotly.graph_objects as go
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(x=equity.index, y=equity.to_numpy(), mode="lines", name="Cumulative",
-                             line=dict(width=2, color="#4f9df7"), fill="tozeroy",
-                             fillcolor="rgba(79,157,247,0.14)"))
-    fig.add_trace(go.Scatter(x=equity.index, y=equity.cummax().to_numpy(), mode="lines",
-                             name="Peak", line=dict(width=1, color="#8d99ae", dash="dot")))
-    fig.add_hline(y=0, line=dict(width=1, color="#8d99ae"))
-    fig.update_layout(title=dict(text=f"Realised Equity Curve ({currency})", x=0.01,
-                                 xanchor="left", font=dict(size=14)),
-                      height=height, margin=dict(l=10, r=10, t=42, b=10),
-                      hovermode="x unified", showlegend=False)
     return fig
 
 
@@ -3066,7 +3167,7 @@ def render_sidebar() -> dict:
     # ------------------------------------------------------- execution ------
     sb.subheader("Execution")
     poll_seconds = sb.number_input("Live poll interval (seconds)", min_value=API_GUARD_DELAY,
-                                   max_value=600.0, value=5.0, step=0.1, key="cfg_poll",
+                                   max_value=600.0, value=1.0, step=0.1, key="cfg_poll",
                                    help="Auto-refresh cadence once the core is started. Every "
                                         "request carries the mandatory 0.3s guard on both sides.")
     if poll_seconds < 2.0:
@@ -3131,6 +3232,28 @@ def _render_filters(sb, live: bool):
             cfg[key]["enabled"] = on
             if not on:
                 continue
+            if spec.get("modes") and spec["kind"] != "mode":
+                cfg[key]["mode"] = st.selectbox(f"{key} reading", spec["modes"], disabled=live,
+                                                key=f"flt_{key}_rmode")
+            if spec["kind"] == "crossover":
+                cfg[key]["min_angle"] = abs(st.number_input(
+                    "Minimum crossover angle (degrees)", min_value=0.0, max_value=89.0,
+                    value=0.0, step=1.0, disabled=live, key="flt_x_angle",
+                    help="Absolute value, 0 disables the angle test. Measured as the ATR-"
+                         "normalised convergence rate of the fast/slow EMA pair, so it is "
+                         "comparable across instruments and zoom levels."))
+                cfg[key]["mode"] = st.selectbox(
+                    "Candle size rule",
+                    ["Simple crossover (no candle size rule)", "Custom candle size (points)",
+                     "ATR based candle size"], disabled=live, key="flt_x_mode")
+                if cfg[key]["mode"].startswith("Custom"):
+                    cfg[key]["candle_points"] = st.number_input(
+                        "Minimum candle size (points)", min_value=0.0, value=10.0, step=1.0,
+                        disabled=live, key="flt_x_pts")
+                elif cfg[key]["mode"].startswith("ATR"):
+                    cfg[key]["candle_atr"] = st.number_input(
+                        "Minimum candle size (x ATR)", min_value=0.0, value=1.0, step=0.1,
+                        disabled=live, key="flt_x_atr")
             if spec["kind"] == "range":
                 c1, c2 = st.columns(2)
                 cfg[key]["min"] = c1.number_input(f"{key} min", value=float(spec["min"]),
@@ -3186,6 +3309,12 @@ def _render_broker(sb, live: bool, symbol: str) -> dict:
 
         broker["dry_run"] = st.checkbox("Dry run (build the payload, transmit nothing)",
                                         value=True, key="brk_dry")
+        broker["use_live_ltp"] = st.checkbox(
+            "Use Dhan for the live LTP (read-only, places no orders)", value=True,
+            key="brk_ltp",
+            help="Yahoo's Indian feed is delayed ~15 minutes, so on a 5m chart the LTP can sit "
+                 "unchanged for a quarter of an hour however fast you poll. This replaces it "
+                 "with Dhan's real-time quote. Requires a Dhan Data API subscription.")
         broker["client_id"] = st.text_input("Dhan client ID", key="brk_cid")
         broker["access_token"] = st.text_input("Dhan access token", type="password", key="brk_tok")
         broker["product_type"] = st.selectbox("Product type", DHAN_PRODUCTS, key="brk_prod")
@@ -3334,15 +3463,12 @@ def _render_backtest(result: BacktestResult, meta: dict) -> None:
     strat = get_strategy(meta["strategy"])
     st.plotly_chart(price_chart(result.frame,
                                 f"{meta['symbol']} | {meta['interval']} | {meta['strategy']}",
-                                strat.overlays, result.trades, oscillator=strat.oscillator,
+                                strat.overlays, result.trades,
                                 hide_weekends=meta["hide_weekends"]),
                     width="stretch", config={"scrollZoom": True})
     st.caption(f"The first {result.warmup_index:,} candles were reserved as the indicator warm-up "
                "window and produced no orders. Signals fire on a candle close and fill at the "
                "next candle's open.")
-    if not result.trades.empty:
-        st.plotly_chart(equity_chart(result.equity, cur), width="stretch")
-
     t1, t2, t3, t4 = st.tabs(["Simulated Trades", "Exit Reasons", "Gap Diagnostics", "Indicator Frame"])
     with t1:
         if result.trades.empty:
@@ -3403,10 +3529,14 @@ def _live_controls(cfg: dict) -> None:
         st.rerun()
 
     if c2.button("Stop Live Processing Engine", disabled=not running, width="stretch"):
+        # Stopping the engine flattens the book. Leaving an untracked position
+        # open after the monitor is switched off is how a stop-loss silently
+        # stops existing.
+        trade = square_off("Squared Off on Engine Stop")
         st.session_state.live_running = False
-        if st.session_state.live_position is not None:
-            log_event("Engine stopped with a position still tracked. The risk stays open until "
-                      "it is squared off.", "warn")
+        if trade:
+            st.toast(f"Position squared off at {fmt(trade['Exit Price'])} "
+                     f"for {fmt_signed(trade['PnL'])} and written to the ledger.")
         log_event("Core stopped.", "info")
         st.rerun()
 
@@ -3464,6 +3594,8 @@ def _live_body() -> None:
     else:
         _searching_widget(cfg, snapshot)
     _live_chart(cfg, snapshot)
+    _recent_trades()
+    _feed_diagnostics()
     _filter_panel(snapshot)
     _broker_panel()
     _event_feed()
@@ -3535,6 +3667,9 @@ def _heartbeat(cfg: dict, snapshot: LiveSnapshot) -> None:
                 f"next in {next_in:0.1f}s", help="Increments on every automatic refresh.")
     c[5].metric("Clock", now.strftime("%H:%M:%S"),
                 help="Redraws on every tick. If this is moving, the auto-refresh is alive.")
+    st.caption(f"Price source: **{snapshot.ltp_source}** | auto-refresh every "
+               f"{fmt(cfg['poll_seconds'], 1)}s | mandatory {API_GUARD_DELAY}s API guard on both "
+               f"sides of every request.")
 
 
 def _human_age(seconds: float) -> str:
@@ -3580,10 +3715,6 @@ def _position_dashboard(position: Position, snapshot, currency: str) -> None:
     r3[2].metric("Entry Risk", fmt(mgr.risk_points) if mgr.risk_points else "--")
     r3[3].metric("Bars", f"{mgr.bars_held}")
 
-    if mgr.sl is not None and mgr.tp is not None and abs(mgr.tp - mgr.sl) > 0:
-        span = abs(mgr.tp - mgr.sl)
-        travelled = ((ltp - mgr.sl) / span) if position.direction > 0 else ((mgr.sl - ltp) / span)
-        st.progress(float(min(max(travelled, 0.0), 1.0)), text="Distance from stop toward target")
     for note in mgr.notes:
         st.warning("Exit engine: " + note)
     st.caption(f"Entered {fmt_time(position.entry_time)} off the signal candle "
@@ -3620,8 +3751,8 @@ def _live_chart(cfg: dict, snapshot: LiveSnapshot) -> None:
     strat = get_strategy(cfg["strategy"])
     st.markdown("#### Live Chart")
     fig = price_chart(snapshot.frame, f"{cfg['symbol']} | {cfg['interval']} | last 100 candles",
-                      strat.overlays, tail=100, oscillator=strat.oscillator,
-                      hide_weekends=cfg.get("hide_weekends", True), height=500)
+                      strat.overlays, tail=120,
+                      hide_weekends=cfg.get("hide_weekends", True), height=520)
     position = st.session_state.live_position
     if position is not None:
         mgr = position.manager
@@ -3634,6 +3765,41 @@ def _live_chart(cfg: dict, snapshot: LiveSnapshot) -> None:
             fig.add_hline(y=mgr.sl, line=dict(width=1.2, dash="dot", color="#ef5350"),
                           annotation_text="Stop")
     st.plotly_chart(fig, width="stretch", config={"scrollZoom": True})
+
+
+def _recent_trades() -> None:
+    """Closed trades, visible without leaving the tab. Tab 3 stays the full ledger."""
+    rows = st.session_state.get("live_trades", [])
+    st.markdown("#### Closed Trades This Session")
+    if not rows:
+        st.caption("Nothing closed yet. Stop-loss and target exits are automatic -- the manual "
+                   "square-off is only for emergencies.")
+        return
+    frame = pd.DataFrame(rows).sort_values("Exit Time", ascending=False).head(8)
+    cols = [c for c in ["Exit Time", "Direction", "Entry Price", "Exit Price", "Exit Reason",
+                        "Points", "PnL"] if c in frame.columns]
+    st.dataframe(frame[cols], width="stretch", hide_index=True)
+    st.caption(f"{len(rows)} closed this session. Full history in the Live Trade Log Ledger tab.")
+
+
+def _feed_diagnostics() -> None:
+    """
+    Proof of what is actually happening on the wire.
+
+    If 'Polled at' keeps advancing while 'LTP' reports 'no' change, the refresh
+    loop is healthy and the data source is the bottleneck.
+    """
+    log = st.session_state.get("feed_log", [])
+    if not log:
+        return
+    changed = sum(1 for r in log if r["Changed"] == "yes")
+    with st.expander(f"Feed diagnostics -- last {len(log)} polls, LTP changed on {changed}"):
+        st.dataframe(pd.DataFrame(log), width="stretch", hide_index=True)
+        if len(log) >= 8 and changed == 0:
+            st.warning("The engine is polling but the price has not moved once. Either the venue "
+                       "is closed, or the source is a delayed candle feed that only updates when "
+                       "a new candle arrives. Polling faster cannot fix either one -- switch the "
+                       "price source to Dhan, or use a 1m interval.")
 
 
 def _filter_panel(snapshot: LiveSnapshot) -> None:
@@ -3758,8 +3924,9 @@ def _synthetic(n: int = 1600, seed: int = 7) -> pd.DataFrame:
     rng = np.random.default_rng(seed)
     steps = rng.normal(0, 1.0, n) * np.where(np.arange(n) > n // 2, 2.2, 1.0)
     close = 20000 + np.cumsum(steps)
-    close[300] += 180
-    close[700] -= 220
+    for pos, shift in ((300, 180.0), (700, -220.0)):        # injected gap events
+        if pos < n:
+            close[pos] += shift
     high = close + np.abs(rng.normal(0, 3, n))
     low = close - np.abs(rng.normal(0, 3, n))
     open_ = np.r_[close[0], close[:-1] + rng.normal(0, 1.5, n - 1)]
@@ -3973,6 +4140,47 @@ def _test_strategies_and_backtest():
     print(f"   OK ({total} trades across {len(STRATEGY_NAMES)} profiles)")
 
 
+def _test_new_filters():
+    """Crossover angle / candle size, and the RSI crossing reading."""
+    df = _synthetic(600)
+    params = dict(DEFAULT_PARAMS); params["intraday"] = True
+    base, _ = prepare(df, "01 \u00b7 Dual EMA Crossover", params)
+    raw = int((base["signal"] != 0).sum())
+
+    fcfg = default_filter_config()
+    fcfg["crossover"]["enabled"] = True
+    fcfg["crossover"]["min_angle"] = 0.0
+    loose, _ = prepare(df, "01 \u00b7 Dual EMA Crossover", params, fcfg, {})
+    assert int((loose["signal"] != 0).sum()) == raw, "a 0-degree angle must veto nothing"
+
+    fcfg["crossover"]["min_angle"] = 45.0
+    steep, _ = prepare(df, "01 \u00b7 Dual EMA Crossover", params, fcfg, {})
+    assert int((steep["signal"] != 0).sum()) <= raw, "a steeper angle must not add signals"
+    assert (steep["f_cross_angle"].dropna() >= 0).all(), "angle must be absolute"
+    assert (steep["f_cross_angle"].dropna() < 90).all(), "arctan keeps the angle under 90 degrees"
+
+    fcfg["crossover"]["mode"] = "Custom candle size (points)"
+    fcfg["crossover"]["candle_points"] = 1e9
+    none_pass, _ = prepare(df, "01 \u00b7 Dual EMA Crossover", params, fcfg, {})
+    assert int((none_pass["signal"] != 0).sum()) == 0, "an impossible candle size must veto all"
+
+    # RSI crossing reading: long on reclaiming the min, short on losing the max.
+    fcfg = default_filter_config()
+    fcfg["rsi"].update(enabled=True, min=40.0, max=70.0,
+                       mode="Cross min from below = LONG, cross max from above = SHORT")
+    frame = attach_filter_columns(prepare(df, "01 \u00b7 Dual EMA Crossover", params)[0],
+                                  params, True)
+    lm, sm, reports = evaluate_filters(frame, fcfg, {})
+    r = frame["f_rsi"]
+    expect_long = cross_over(r, _const_like(r, 40.0))
+    expect_short = cross_under(r, _const_like(r, 70.0))
+    assert lm.equals(expect_long.fillna(False)), "long gate must be the 40-from-below crossing"
+    assert sm.equals(expect_short.fillna(False)), "short gate must be the 70-from-above crossing"
+    assert int(expect_long.sum()) > 0 and int(expect_short.sum()) > 0
+    print(f"   crossover angle/candle-size gates and RSI crossing reading "
+          f"({int(expect_long.sum())} up-crosses, {int(expect_short.sum())} down-crosses)  OK")
+
+
 def _test_filters():
     df = _synthetic(900)
     params = dict(DEFAULT_PARAMS)
@@ -4037,6 +4245,7 @@ def run_selftest() -> int:
         _test_fill_semantics()
         print("-- filters --")
         _test_filters()
+        _test_new_filters()
         print("-- strategies + backtest --")
         _test_strategies_and_backtest()
         print("-- edge cases --")
