@@ -206,6 +206,11 @@ TRAILING_TP_TYPES = {
 }
 
 # Wall-clock length of one candle, used to decide whether a feed has gone stale.
+# How long a quote may sit unchanged before we call the venue closed, and how
+# many ticks of evidence we need before trusting movement either way.
+QUOTE_LIVE_WINDOW = 300.0
+QUOTE_EVIDENCE_TICKS = 3
+
 INTERVAL_SECONDS = {"1m": 60, "2m": 120, "3m": 180, "5m": 300, "10m": 600, "15m": 900,
                     "30m": 1800, "60m": 3600, "4h": 14400, "1d": 86400,
                     "1wk": 604800, "1mo": 2592000}
@@ -2842,6 +2847,7 @@ _STATE_DEFAULTS = {
     "live_frame": None, "live_frame_at": 0.0, "live_reports": [],
     "live_frame_warnings": [], "live_vix": None, "candle_refreshes": 0,
     "ltp_note": None, "screener_results": None, "screener_error": None,
+    "last_seen_ltp": None, "last_ltp_change_ts": 0.0,
 }
 
 
@@ -2890,6 +2896,8 @@ def reset_live_runtime() -> None:
     st.session_state.live_frame_at = 0.0
     st.session_state.candle_refreshes = 0
     st.session_state.feed_log = []
+    st.session_state.last_seen_ltp = None
+    st.session_state.last_ltp_change_ts = 0.0
     st.session_state.live_fail_streak = 0
     st.session_state.live_backoff_until = 0.0
 
@@ -2917,8 +2925,14 @@ class LiveSnapshot:
     data_warnings: list[str]
     vix: float | None = None
     feed_age_seconds: float = 0.0
-    stale: bool = False
+    stale: bool = False                     # candles are lagging (signals may be old)
+    quote_live: bool = True                 # the PRICE is moving (the venue is open)
     ltp_source: str = "Yahoo (delayed candle close)"
+
+    @property
+    def frozen(self) -> bool:
+        """Truly dead: candles lagging AND the price is not moving either."""
+        return self.stale and not self.quote_live
 
 
 def refresh_candles(cfg: dict):
@@ -2974,9 +2988,29 @@ def build_snapshot(cfg: dict, frame: pd.DataFrame, reports, warnings, vix,
     now = pd.Timestamp.now(tz=last_ts.tz) if last_ts.tz is not None else pd.Timestamp.now()
     age = float((now - last_ts).total_seconds())
     bar_seconds = INTERVAL_SECONDS.get(cfg["interval"], 300)
-    # More than three candles elapsed with nothing new printing: the venue is
-    # closed, halted, or the feed has stalled.
+    # Candles lagging by more than three bars. On a delayed feed this is routine
+    # DURING market hours, so on its own it proves nothing about the venue.
     stale = age > max(3 * bar_seconds, 120)
+
+    # Whether the venue is open is a question about the PRICE, not the candles.
+    # The only trustworthy evidence is OBSERVED MOVEMENT: a closed exchange still
+    # serves a quote, and that quote will differ from the last intraday candle
+    # close (official close vs candle close), so "the numbers differ" proves
+    # nothing. We therefore watch for the price actually changing.
+    now_t = time.time()
+    prev_ltp = st.session_state.get("last_seen_ltp")
+    if prev_ltp is not None and abs(float(prev_ltp) - ltp) > 1e-9:
+        st.session_state.last_ltp_change_ts = now_t
+    st.session_state.last_seen_ltp = ltp
+
+    since_change = now_t - float(st.session_state.get("last_ltp_change_ts", 0.0))
+    observed_ticks = int(st.session_state.get("live_poll_count", 0))
+    if not stale:
+        quote_live = True                       # candles are current: the venue is open
+    elif observed_ticks < QUOTE_EVIDENCE_TICKS:
+        quote_live = False                      # not enough evidence yet -- hold entries
+    else:
+        quote_live = since_change <= QUOTE_LIVE_WINDOW
 
     return LiveSnapshot(
         frame=frame, ltp=ltp, next_open=float(frame["Open"].iloc[-1]),
@@ -2986,7 +3020,7 @@ def build_snapshot(cfg: dict, frame: pd.DataFrame, reports, warnings, vix,
         status=strat.status(frame.iloc[:len(frame) + closed + 1], cfg["params"]),
         filter_reports=reports, fetched_at=pd.Timestamp.now(), bars=len(frame),
         data_warnings=warnings, vix=vix, feed_age_seconds=age, stale=stale,
-        ltp_source=ltp_source)
+        quote_live=quote_live, ltp_source=ltp_source)
 
 
 def _live_close(position: Position, exit_price: float, reason: str) -> dict:
@@ -3154,10 +3188,10 @@ def run_cycle(cfg: dict) -> None:
         return
 
     # ----------------------------------------------------- 2. fresh entries ---
-    # A frozen feed cannot produce a fill worth having: the "live" price is just
-    # the last close from hours ago, so any entry books a fictitious price and
-    # then sits at exactly 0.00 PnL until the venue reopens.
-    if snapshot.stale and not cfg.get("allow_stale_entries"):
+    # Only a genuinely DEAD feed blocks entry: candles lagging AND the price not
+    # moving. Lagging candles alone are normal on a delayed feed during market
+    # hours, and blocking on that basis stops live trades for no reason.
+    if snapshot.frozen and not cfg.get("allow_stale_entries"):
         return
 
     strat = get_strategy(cfg["strategy"])
@@ -3778,7 +3812,7 @@ def _idle_panel(cfg: dict) -> None:
             f"required. Live window: `{live_period_for(cfg['interval'])}` of "
             f"{cfg['interval']} candles.")
     snap = st.session_state.live_snapshot
-    if snap is not None and snap.stale:
+    if snap is not None and snap.frozen:
         st.error(f"Heads up: the last poll found the newest `{cfg['symbol']}` candle to be "
                  f"{_human_age(snap.feed_age_seconds)} old. The venue is closed, so starting the "
                  "core now will poll a frozen tape until it reopens.")
@@ -3854,21 +3888,28 @@ def _mount_live_fragment(poll_seconds: float) -> None:
 
 
 def _feed_banner(cfg: dict, snapshot: LiveSnapshot) -> None:
-    """Say out loud whether the tape is actually moving."""
+    """Say plainly which of the three states the feed is in."""
     age = snapshot.feed_age_seconds
-    if not snapshot.stale:
-        return
-    hours = age / 3600.0
-    human = f"{hours:.1f} hours" if hours >= 1 else f"{age/60:.0f} minutes"
-    st.error(
-        f"**FEED FROZEN — the venue looks closed.** The newest candle for "
-        f"`{cfg['symbol']}` is {human} old ({fmt_time(snapshot.last_closed_time)}), so the "
-        f"LTP shown below is simply that candle's close and it will not move until trading "
-        f"resumes. The engine is still polling every {fmt(cfg['poll_seconds'],1)}s and will "
-        f"pick up the first live tick automatically. New entries are suppressed while the "
-        f"feed is frozen, because filling at a stale price books a fictitious entry that then "
-        f"sits at exactly 0.00 PnL."
-    )
+    human = f"{age/3600:.1f} hours" if age >= 3600 else f"{age/60:.0f} minutes"
+
+    if snapshot.frozen and int(st.session_state.get("live_poll_count", 0)) < QUOTE_EVIDENCE_TICKS:
+        st.info(f"Checking whether `{cfg['symbol']}` is actually trading — the candles are "
+                f"{human} old, so the engine is watching the quote for movement before it "
+                f"commits to an entry. This takes about "
+                f"{QUOTE_EVIDENCE_TICKS * cfg['poll_seconds']:.1f}s.")
+    elif snapshot.frozen:
+        st.error(
+            f"**FEED DEAD — the venue looks closed.** The newest candle for `{cfg['symbol']}` is "
+            f"{human} old and the quote has not moved across recent ticks. New entries are "
+            f"suppressed, because filling at a stale price books a fictitious entry that then "
+            f"sits at exactly 0.00 PnL. The engine keeps polling and will pick up the first live "
+            f"tick by itself.")
+    elif snapshot.stale:
+        st.warning(
+            f"**Candles are lagging, but the price is live.** The newest `{cfg['symbol']}` candle "
+            f"is {human} old while the quote is still ticking — normal for a delayed feed during "
+            f"market hours. Trading continues: PnL, stop and target track the live price, but "
+            f"SIGNALS are only as fresh as the candles. Shorten the interval for fresher signals.")
 
 
 def _heartbeat(cfg: dict, snapshot: LiveSnapshot) -> None:
@@ -3964,10 +4005,18 @@ def _searching_widget(cfg: dict, snapshot: LiveSnapshot) -> None:
     else:
         st.info(f"**Searching for Signal** :: {snapshot.status.headline}")
 
-    if snapshot.status.metrics:
-        cols = st.columns(min(len(snapshot.status.metrics), 5))
-        for i, (label, value) in enumerate(snapshot.status.metrics):
-            cols[i % len(cols)].metric(label, value)
+    metrics = [("Live LTP", fmt(snapshot.ltp))] + list(snapshot.status.metrics)
+    cols = st.columns(min(len(metrics), 5))
+    for i, (label, value) in enumerate(metrics):
+        cols[i % len(cols)].metric(label, value)
+    st.caption("Live LTP comes from the quote feed and updates every tick. The remaining values "
+               "are read off the last CLOSED candle, so they step at the candle interval.")
+
+    strat = get_strategy(cfg["strategy"])
+    if strat.immediate and snapshot.frozen:
+        st.error("This profile enters immediately, but entry is held because the feed is dead. "
+                 "It will fill on the first live tick, or enable stale entries in the sidebar "
+                 "to override.")
 
     l, r = st.columns(2)
     l.markdown(f"**Long entry requires**\n\n{snapshot.status.long_condition}")
@@ -4579,6 +4628,36 @@ def _test_tick_vs_candle_split():
     print("   PnL and trailing recompute from the tick price, not the candle close  OK")
 
 
+def _test_liveness_logic():
+    """
+    Regression guard for the worst bug in this file's history.
+
+    Lagging candles were being treated as proof the venue was closed, so live
+    trades were suppressed while the quote was visibly ticking. Liveness is a
+    question about the PRICE, and the only trustworthy evidence is observed
+    movement -- a closed exchange still serves a quote, and that quote differs
+    from the last intraday candle close, so "the numbers differ" proves nothing.
+    """
+    class FakeState(dict):
+        def get(self, k, d=None):
+            return super().get(k, d)
+
+    def liveness(stale, ticks, seconds_since_change):
+        if not stale:
+            return True
+        if ticks < QUOTE_EVIDENCE_TICKS:
+            return False
+        return seconds_since_change <= QUOTE_LIVE_WINDOW
+
+    assert liveness(False, 0, 9e9) is True, "current candles alone mean the venue is open"
+    assert liveness(True, 1, 0.0) is False, "must not trust a quote before it has been watched"
+    assert liveness(True, 25, 1.0) is True, "a recently moving quote means the venue is open"
+    assert liveness(True, 25, 9e9) is False, "a quote frozen for hours means the venue is closed"
+    assert liveness(True, QUOTE_EVIDENCE_TICKS, QUOTE_LIVE_WINDOW - 1) is True
+    assert liveness(True, QUOTE_EVIDENCE_TICKS, QUOTE_LIVE_WINDOW + 1) is False
+    print("   liveness judged on observed price movement, not candle age  OK")
+
+
 def _test_fill_semantics():
     """Signal on N must fill at the OPEN of N+1, and the stop is checked before the target."""
     idx = pd.date_range("2024-01-01 09:15", periods=6, freq="5min", tz="Asia/Kolkata")
@@ -4731,6 +4810,7 @@ def run_selftest() -> int:
         _test_structural_matrix()
         _test_fill_semantics()
         _test_tick_vs_candle_split()
+        _test_liveness_logic()
         _test_threshold_strategies()
         print("-- filters --")
         _test_filters()
